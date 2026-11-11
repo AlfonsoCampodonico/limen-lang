@@ -235,6 +235,40 @@ for s in shapes {
 - To choose between types, say where the `dyn` is expected: `let s: dyn Shape = if big { Circle { r: 1.0 } } else { Square { s: 2.0 } }`. Without an expected type, the branches of an `if` must have the same type.
 - A `dyn` value is boxed and its calls go through a table of methods; a bounded type parameter (`[T: Shape]`) has no such cost.
 
+### Embedding
+
+A struct can embed another struct by writing its type without a field name. The embedded struct's fields and methods can then be used on the outer struct directly:
+
+```
+struct User {
+    name: Str,
+}
+
+fn greet(self: User) -> Str {
+    "hi, {self.name}"
+}
+
+struct Admin {
+    User,
+    level: Int,
+}
+
+let a = Admin { User: User { name: "ana" }, level: 3 }
+a.name           // "ana", the same as a.User.name
+a.greet()        // "hi, ana", the same as a.User.greet()
+```
+
+- An embedded struct is an ordinary field named after its type: `User` (and `auth.User` from a module, or `Box[Int]`, are both named by the last part, `User` and `Box`). Reach it explicitly as `a.User`; set it in a literal as `Admin { User: u, level: 3 }`. A literal sets the embedded struct as a whole, never its fields one by one (`Admin { name: "x" }` is E0103). It is stored inline, copied, compared, ordered and printed like any field: `Admin { User: User { name: "ana" }, level: 3 }`.
+- Only a struct can be embedded, written with a capital first letter (`User`, `auth.User`, `Box[T]`); an `Int`, an enum or a type parameter is E0121. Two embedded structs with the same name, or an embedded struct and a field with its name, are defined twice (E0106).
+- **Lookup.** `a.x` and `a.x()` look at the outer struct's own fields and methods first. Otherwise they look through the embedded structs one depth at a time: first the structs `Admin` embeds, then the ones those embed, and so on, with no limit on depth. The first depth that has `x` wins, so a name nearer the top hides a deeper one. A field access looks for fields and methods; a call looks for methods.
+- **Ambiguity.** If two structs at that nearest depth both have `x`, then `a.x` is ambiguous (E0120). That is an error only where `a.x` is used; name the one you mean, as in `a.Left.x`. A struct may embed two structs that share names as long as nothing uses them unqualified.
+- **Interfaces.** Promoted methods count toward interfaces, both as bounds (`[T: Greeter]`) and as `dyn Greeter` values, so `Admin` satisfies any interface `User` does, unless it has a method of its own with that name (which must then have the right type), or the name is ambiguous.
+- **Composition, not inheritance.** An outer method with the same name as an embedded one (`fn greet(self: Admin)`) hides it on `Admin` values, but does not replace it: `a.User.greet()` still calls `User`'s, and a method of `User` that calls `self.greet()` always calls `User`'s, because its `self` is a `User`. There is no overriding, no `super`, and an `Admin` is not a `User`: pass `a.User` where a `User` is needed.
+- Assignment goes through promotion: `a.name = "eva"` changes `a.User.name` (`a` must be `mut`).
+- Generic structs can embed and be embedded: `struct Labeled[T] { Box[T], label: Str }` promotes `Box`'s fields and its generic methods. A method written for one instantiation only (`fn f(self: Box[Int])`) is promoted for direct calls, but counts toward interfaces only when the outer struct embeds exactly that type.
+- Privacy is unchanged: a promoted method that is private to its module is still private (E0402).
+- Under the hood the checker rewrites `a.name` to `a.User.name`, and for interfaces adds a method `Admin::greet` that calls `self.User.greet()`; both backends see only ordinary fields and methods.
+
 ### main
 
 `main` must be one of:
@@ -902,6 +936,8 @@ Every diagnostic has a stable code. `vela explain CODE` prints its explanation, 
 | E0112 | a value that cannot become `dyn` |
 | E0113 | a map key type that is not `Int`, `Str`, `Bytes`, `Bool`, or a tuple, struct or enum of them |
 | E0114 | a struct that contains itself by value |
+| E0120 | an ambiguous name promoted from two embedded structs at the same depth |
+| E0121 | embedding something that is not a struct |
 | E0201 | type mismatch |
 | E0202 | misuse of `?` |
 | E0203 | `if` without `else` produces a value |
@@ -949,7 +985,7 @@ A panic unwinds the stack up to the boundary: everything the abandoned code owne
 
 ## 16. Grammar
 
-EBNF. `NL` is a newline, as described in section 2. A character-level version for constrained decoding, with the newline rules spelled out, is in [grammar/vela.gbnf](grammar/vela.gbnf). `{ x }` means zero or more, and `[ x ]` means optional.
+EBNF. `NL` is a newline, as described in section 2. `UPPER` is an `IDENT` that starts with a capital letter. A character-level version for constrained decoding, with the newline rules spelled out, is in [grammar/vela.gbnf](grammar/vela.gbnf). `{ x }` means zero or more, and `[ x ]` means optional.
 
 ```
 program    = { "use" IDENT | [ "pub" ] ( fn | struct | enum | interface ) | test | foreign } ;
@@ -963,7 +999,8 @@ generics   = "[" IDENT { "," IDENT } "]" ;
 params     = param { sep param } [ "," ] ;
 param      = IDENT ":" type ;
 struct     = "struct" IDENT [ generics ] "{" [ field { sep field } [ "," ] ] "}" ;
-field      = IDENT ":" type ;
+field      = IDENT ":" type
+           | [ IDENT "." ] UPPER [ "[" typearg { "," typearg } "]" ] ;   (* an embedded struct *)
 enum       = "enum" IDENT [ generics ] "{" [ variant { sep variant } [ "," ] ] "}" ;
 variant    = IDENT [ "(" type { "," type } ")" ] ;
 type       = "dyn" IDENT [ "." IDENT ]               (* an interface value *)
