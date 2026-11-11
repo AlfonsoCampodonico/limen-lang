@@ -102,6 +102,10 @@ type struct_decl = {
   st_span : span;
   st_gen : string list;
   st_fields : (string * span * ty_expr) list;
+  st_embeds : string list;
+      (* the fields written as a bare type, `struct Admin { User, level: Int }`:
+         an embedded struct, stored as a field named after its type (`User`),
+         whose fields and methods the checker promotes onto the outer struct *)
   st_pub : bool;
 }
 

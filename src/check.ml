@@ -388,6 +388,40 @@ let root_fields = [ ("net", TCap Net); ("fs", TCap Fs); ("stdout", TCap Stdout);
 
 (* ---------- expressions ---------- *)
 
+(* ---------- struct embedding (see embed.ml) ---------- *)
+
+(* A method struct [t] declares itself, not one forwarded from an embedded struct. *)
+let own_method ctx t name = Hashtbl.mem ctx.fns (t ^ "::" ^ name) && not (Embed.is_forwarder (t ^ "::" ^ name))
+
+(* Where member [name] of struct [n] lives. A field access (`x.name`) looks
+   for fields and methods; a call (`x.name()`) for methods only. *)
+let promote ctx ~fields n name =
+  Embed.lookup ~structs:(Hashtbl.find_opt ctx.structs)
+    ~has:(fun t -> (fields && List.mem_assoc name (Option.value ~default:[] (Hashtbl.find_opt ctx.sfields t))) || own_method ctx t name)
+    n
+
+(* [recv] (of type [rt], already checked) followed by the embedded fields of
+   [path]: the explicit form of a promoted access, `admin.User`. The added
+   field names get an empty span, so tools see only what was written. *)
+let embed_path ctx (recv : expr) rt path =
+  List.fold_left
+    (fun ((x : expr), t) fld ->
+      let ft =
+        match repr t with
+        | TNamed (n, args) when Hashtbl.mem ctx.sfields n -> Option.value ~default:TErr (List.assoc_opt fld (struct_fields ctx n args))
+        | _ -> TErr
+      in
+      ({ edesc = EField (x, fld, { x.espan with lo = x.espan.hi }); espan = x.espan; ety = ft; einst = [] }, ft))
+    (recv, rt) path
+
+let ambiguity n name paths =
+  sprintf "`%s` is ambiguous in `%s`: it is reached through %s, at the same depth" name n
+    (String.concat " and " (List.map (fun p -> "`" ^ String.concat "." (p @ [ name ]) ^ "`") paths))
+
+let ambiguous ctx sp n name paths =
+  err ctx "E0120" sp (ambiguity n name paths)
+    ~notes:[ sprintf "name the embedded struct you mean: %s" (String.concat " or " (List.map (fun p -> "`." ^ String.concat "." (p @ [ name ]) ^ "`") paths)) ]
+
 (* Does [t] have every method of interface [i], with the same types? *)
 let satisfies ctx t i : string option =
   let ms = Option.value ~default:[] (Hashtbl.find_opt ifaces i) in
@@ -414,6 +448,8 @@ let satisfies ctx t i : string option =
       match ft with
       | TFn (p0 :: rest, r') -> (try unify p0 t; trial (TFn (rest, r')) with Mismatch -> trial (TFn (rest, r')))
       | _ -> Some (sprintf "its `%s` is not a method" m))
+    | TNamed (n, _) when (match promote ctx ~fields:false n m with Embed.Ambiguous _ -> true | _ -> false) -> (
+      match promote ctx ~fields:false n m with Embed.Ambiguous ps -> Some (ambiguity n m ps) | _ -> None)
     | _ -> (
       match List.assoc_opt m (methods t) with
       | Some mk -> let ps', r' = mk () in trial (TFn (ps', r'))
@@ -724,10 +760,21 @@ and check_field ctx f e recv name nsp =
       did_you_mean ctx "E0104" nsp (sprintf "enum `%s` has no variant `%s`" en name) name (List.map fst vs);
       TErr
     end
-  | _ -> (
-    let t = check_expr ctx f recv in
+  | _ -> field_of ctx f e recv (check_expr ctx f recv) name nsp
+
+(* `recv.name` where [recv] is checked and has type [t]. *)
+and field_of ctx f e recv t name nsp =
     let arity = method_arity ~file:nsp.file ctx t name in
     match repr t with
+    | TNamed (n, _) as rt when Hashtbl.mem ctx.sfields n && (match promote ctx ~fields:true n name with Embed.Path _ | Embed.Ambiguous _ -> true | _ -> false) -> (
+      (* promoted from an embedded struct: `admin.name` is `admin.User.name` *)
+      match promote ctx ~fields:true n name with
+      | Embed.Path (path, _) ->
+        let r, rt' = embed_path ctx recv rt path in
+        e.edesc <- EField (r, name, nsp);
+        field_of ctx f e r rt' name nsp
+      | Embed.Ambiguous ps -> ambiguous ctx nsp n name ps; TErr
+      | _ -> TErr)
     | TNamed (n, args) when Hashtbl.mem ctx.sfields n && not (List.mem_assoc name (struct_fields ctx n args)) && arity <> None ->
       method_value ctx f e recv t name nsp (Option.get arity)
     | TNamed (n, args) when Hashtbl.mem ctx.sfields n -> (
@@ -755,7 +802,7 @@ and check_field ctx f e recv name nsp =
         if List.mem_assoc name (methods t) then [ sprintf "`%s` changes its receiver in place, so it cannot be a value; call it as `%s(...)`" name name ] else []
       in
       err ctx ~notes "E0103" nsp (sprintf "`%s` has no field `%s`" (show t) name);
-      TErr)
+      TErr
 
 (* How many arguments (besides the receiver) method [name] of a value of
    type [t] takes, if it has one that can be used as a value. *)
@@ -829,8 +876,9 @@ and check_method ctx f e recv name nsp args =
       TErr)
   | _ -> check_method_value ctx f e recv name nsp args
 
-and check_method_value ctx f e recv name nsp args =
-  let rt = repr (check_expr ctx f recv) in
+(* [rt]: the receiver's type, when [recv] is already checked *)
+and check_method_value ?rt ctx f e recv name nsp args =
+  let rt = repr (match rt with Some t -> t | None -> check_expr ctx f recv) in
   match rt with
   | TErr -> check_args ctx f args; TErr
   | TVar _ ->
@@ -884,6 +932,15 @@ and check_method_value ctx f e recv name nsp args =
       else List.iter2 (fun a p -> expect ctx f a p) args ps;
       e.edesc <- ECall ({ edesc = EVar key; espan = nsp; ety = t; einst = env }, recv :: args);
       r
+    | _ -> check_args ctx f args; TErr)
+  | TNamed (n, _) when Hashtbl.mem ctx.sfields n && (match promote ctx ~fields:false n name with Embed.Path _ | Embed.Ambiguous _ -> true | _ -> false) -> (
+    (* promoted from an embedded struct: `admin.greet()` is `admin.User.greet()` *)
+    match promote ctx ~fields:false n name with
+    | Embed.Path (path, _) ->
+      let r, rt' = embed_path ctx recv rt path in
+      e.edesc <- EMethod (r, name, nsp, args);
+      check_method_value ~rt:rt' ctx f e r name nsp args
+    | Embed.Ambiguous ps -> ambiguous ctx nsp n name ps; check_args ctx f args; TErr
     | _ -> check_args ctx f args; TErr)
   | TNamed (n, _) when Hashtbl.mem ctx.fns (n ^ "::" ^ name) && builtin_tname rt = None -> (
     (* a method: `fn name(self: T, ...)`, called with the receiver first *)
@@ -1140,7 +1197,14 @@ and check_struct_lit ctx f name nsp fields sp =
         match List.assoc_opt fname decl_fields with
         | Some ft -> expect ctx f e (subst env ft)
         | None ->
-          did_you_mean ctx "E0103" fsp
+          let notes =
+            match promote ctx ~fields:true name fname with
+            | Embed.Path (p, _) ->
+              let top = List.hd p in
+              [ sprintf "`%s` belongs to the embedded `%s`; set it there: `%s: %s { %s: ... }`" fname (String.concat "." p) top top fname ]
+            | _ -> []
+          in
+          did_you_mean ctx ~notes "E0103" fsp
             (sprintf "struct `%s` has no field `%s`" name fname)
             fname (List.map fst decl_fields);
           ignore (check_expr ctx f e))
@@ -1643,6 +1707,13 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
                 Hashtbl.replace seen fname ();
                 let t = resolve ctx env te in
                 check_storable ctx te.tspan t;
+                (if List.mem fname s.st_embeds then
+                   match repr t with
+                   | TNamed (n, _) when Hashtbl.mem ctx.structs n && not (is_tuple_name n) -> ()
+                   | TErr -> ()
+                   | t ->
+                     err ctx "E0121" te.tspan (sprintf "only a struct can be embedded, and `%s` is not one" (show t))
+                       ~notes:[ sprintf "give it a field name instead, as in `%s: %s`" (String.lowercase_ascii fname) (show t) ]);
                 Some (fname, t)
               end)
             s.st_fields
@@ -1782,6 +1853,7 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
         { name = d.fn_name; span = d.fn_span;
           caps = List.filter (fun c -> List.mem c found) all_caps;
           callbacks = List.exists has_fn s.ps || d.fn_bounds <> [] })
-      (List.filter (fun ((d : fn_decl), _) -> d.fn_test = None) sigs)
+      (* forwarders only pass their arguments on; the methods they call are reported *)
+      (List.filter (fun ((d : fn_decl), _) -> d.fn_test = None && not (Embed.is_forwarder d.fn_name)) sigs)
   in
   (diags, infos)

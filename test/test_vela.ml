@@ -2531,7 +2531,7 @@ fn main(root: Root) -> Result[(), IoError] {
   errs "int-literal-too-large" (main_wrap "    let x = 9223372036854775808") [ "E0005" ];
 
   (* ---------- select ---------- *)
-  exits "example-tour" (example "tour.vela") "-- language\ncircle 12.57\n[2.25, 12.56636]\n[0, 1, 4, 9, 16] [\"h\", \"o\", \"l\", \"a\"]\nbound method 3.142\nVELA!\n{Point { x: 0, y: 0 }: [\"origin\", \"home\"]} {(1, 2): 2}\n[(1, \"a\"), (1, \"z\"), (2, \"b\")]\n3 bytes: hi!\n-- concurrency\na side task ran\nresults [1, 2]\nwith a deadline [Some(1), None]\nnobody sent anything\n" 3;
+  exits "example-tour" (example "tour.vela") "-- language\ncircle 12.57\n[2.25, 12.56636]\n[0, 1, 4, 9, 16] [\"h\", \"o\", \"l\", \"a\"]\nbound method 3.142\nVELA!\n{Point { x: 0, y: 0 }: [\"origin\", \"home\"]} {(1, 2): 2}\n[(1, \"a\"), (1, \"z\"), (2, \"b\")]\n3 bytes: hi!\n-- embedding\nhome at (5, 2) [\"(5, 2)\", \"(5, 2)\"]\n-- concurrency\na side task ran\nresults [1, 2]\nwith a deadline [Some(1), None]\nnobody sent anything\n" 3;
   out "select" (example "select.vela") "nums done; words done; total 15 letters 3\nnothing ready | sent to c | sent to d | d Some(10)\nafter close: Some(7)\nErr(\"every arm of this `select` is turned off by its guard\")\n";
   out "select-stress" "fn produce(c: Chan[Int], n: Int) -> Int {\n    let mut i = 0\n    while i < n {\n        c.send(i)\n        i = i + 1\n    }\n    c.close()\n    0\n}\n\n// receive from all four until every one is closed\nfn consume(a: Chan[Int], b: Chan[Int], c: Chan[Int], d: Chan[Int]) -> Int {\n    let mut sum = 0\n    let mut on = [true, true, true, true]\n    while on[0] || on[1] || on[2] || on[3] {\n        select {\n            v = a.recv() if on[0] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[0] = false\n                },\n            },\n            v = b.recv() if on[1] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[1] = false\n                },\n            },\n            v = c.recv() if on[2] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[2] = false\n                },\n            },\n            v = d.recv() if on[3] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[3] = false\n                },\n            },\n        }\n    }\n    sum\n}\n\nfn drain(c: Chan[Str]) -> Int {\n    let mut n = 0\n    let mut more = true\n    while more {\n        match c.recv() {\n            Some(s) => {\n                n = n + s.len()\n            },\n            None => {\n                more = false\n            },\n        }\n    }\n    n\n}\n\nfn main(root: Root) {\n    let a: Chan[Int] = channel(1)\n    let b: Chan[Int] = channel(1)\n    let c: Chan[Int] = channel(2)\n    let d: Chan[Int] = channel(1)\n    let sums = group g {\n        g.go(|| produce(a, 500))\n        g.go(|| produce(b, 500))\n        g.go(|| produce(c, 500))\n        g.go(|| produce(d, 500))\n        g.go(|| consume(a, b, c, d))\n        g.go(|| consume(a, b, c, d))\n        g.go(|| consume(a, b, c, d))\n    }\n    root.stdout.print(\"{sums.sum()}\")\n    // select between two sends: a dispatcher feeding two workers\n    let w1: Chan[Str] = channel(1)\n    let w2: Chan[Str] = channel(1)\n    let parts = group g {\n        g.go(|| {\n                let mut i = 0\n                while i < 1000 {\n                    let msg = \"m{i}\"\n                    select {\n                        w1.send(msg) => (),\n                        w2.send(msg) => (),\n                    }\n                    i = i + 1\n                }\n                w1.close()\n                w2.close()\n                0\n            })\n        g.go(|| drain(w1))\n        g.go(|| drain(w2))\n    }\n    root.stdout.print(\"{parts.sum()}\")\n}\n" "499000\n3890\n";
   check_tsan "select-stress-tsan" "fn produce(c: Chan[Int], n: Int) -> Int {\n    let mut i = 0\n    while i < n {\n        c.send(i)\n        i = i + 1\n    }\n    c.close()\n    0\n}\n\n// receive from all four until every one is closed\nfn consume(a: Chan[Int], b: Chan[Int], c: Chan[Int], d: Chan[Int]) -> Int {\n    let mut sum = 0\n    let mut on = [true, true, true, true]\n    while on[0] || on[1] || on[2] || on[3] {\n        select {\n            v = a.recv() if on[0] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[0] = false\n                },\n            },\n            v = b.recv() if on[1] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[1] = false\n                },\n            },\n            v = c.recv() if on[2] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[2] = false\n                },\n            },\n            v = d.recv() if on[3] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[3] = false\n                },\n            },\n        }\n    }\n    sum\n}\n\nfn drain(c: Chan[Str]) -> Int {\n    let mut n = 0\n    let mut more = true\n    while more {\n        match c.recv() {\n            Some(s) => {\n                n = n + s.len()\n            },\n            None => {\n                more = false\n            },\n        }\n    }\n    n\n}\n\nfn main(root: Root) {\n    let a: Chan[Int] = channel(1)\n    let b: Chan[Int] = channel(1)\n    let c: Chan[Int] = channel(2)\n    let d: Chan[Int] = channel(1)\n    let sums = group g {\n        g.go(|| produce(a, 500))\n        g.go(|| produce(b, 500))\n        g.go(|| produce(c, 500))\n        g.go(|| produce(d, 500))\n        g.go(|| consume(a, b, c, d))\n        g.go(|| consume(a, b, c, d))\n        g.go(|| consume(a, b, c, d))\n    }\n    root.stdout.print(\"{sums.sum()}\")\n    // select between two sends: a dispatcher feeding two workers\n    let w1: Chan[Str] = channel(1)\n    let w2: Chan[Str] = channel(1)\n    let parts = group g {\n        g.go(|| {\n                let mut i = 0\n                while i < 1000 {\n                    let msg = \"m{i}\"\n                    select {\n                        w1.send(msg) => (),\n                        w2.send(msg) => (),\n                    }\n                    i = i + 1\n                }\n                w1.close()\n                w2.close()\n                0\n            })\n        g.go(|| drain(w1))\n        g.go(|| drain(w2))\n    }\n    root.stdout.print(\"{parts.sum()}\")\n}\n" "499000\n3890\n";
@@ -4057,6 +4057,291 @@ fn main(root: Root) {
   ok "fmt-every-program" (!fmt_failures = [])
     (String.concat "\n\n" (List.map (fun (n, m) -> n ^ ": " ^ m) (List.rev !fmt_failures)));
   ok "fmt-checked-count" (Hashtbl.length fmt_checked > 90 || Sys.getenv_opt "VELA_TEST_ONLY" <> None) (string_of_int (Hashtbl.length fmt_checked));
+
+  (* ---------- struct embedding ---------- *)
+  let module J = Json in
+  let embed_base =
+    {|struct Person {
+    name: Str,
+}
+
+fn greet(self: Person) -> Str {
+    "hi, {self.name}"
+}
+
+fn hello(self: Person, to: Str) -> Str {
+    "{self.name} says hello to {to}"
+}
+
+// calls greet on a Person: there is no overriding, so an outer struct's
+// greet is never picked here
+fn intro(self: Person) -> Str {
+    "intro: " + self.greet()
+}
+
+struct User {
+    Person,
+    email: Str,
+}
+
+struct Admin {
+    User,
+    level: Int,
+}
+
+fn greet(self: Admin) -> Str {
+    "admin {self.name} (level {self.level})"
+}
+|}
+  in
+  out "embed-promotion"
+    (embed_base
+     ^ {|
+fn main(root: Root) {
+    let out = root.stdout
+    let u = User { Person: Person { name: "ana" }, email: "a@x" }
+    let mut a = Admin { User: u, level: 3 }
+    out.print("{a.name} {a.email} {a.level}")
+    // the outer method wins; the embedded one is still there by name
+    out.print(a.greet())
+    out.print(a.User.greet())
+    out.print(a.User.Person.greet())
+    out.print(a.hello("bo"))
+    out.print(a.intro())
+    // assignment through a promoted field changes the embedded value
+    a.name = "eva"
+    a.User.email = "e@x"
+    out.print("{a.User.Person.name} {a.email}")
+    // a promoted method as a value
+    let h = a.hello
+    out.print(h("cy"))
+    // the embedded value is an ordinary field: a copy
+    let mut p = a.Person
+    p.name = "zed"
+    out.print("{p.name} {a.name}")
+}
+|})
+    "ana a@x 3\nadmin ana (level 3)\nhi, ana\nhi, ana\nana says hello to bo\nintro: hi, ana\neva e@x\neva says hello to cy\nzed eva\n";
+  out "embed-interfaces"
+    (embed_base
+     ^ {|
+interface Greeter {
+    fn greet(self) -> Str
+}
+
+interface Hello {
+    fn hello(self, to: Str) -> Str
+}
+
+fn welcome[T: Greeter](g: T) -> Str {
+    g.greet()
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let a = Admin { User: User { Person: Person { name: "ana" }, email: "a@x" }, level: 3 }
+    // User has greet only through Person; Admin has its own
+    out.print(welcome(a.User))
+    out.print(welcome(a))
+    let gs: List[dyn Greeter] = [a, a.User, a.Person]
+    for g in gs {
+        out.print(g.greet())
+    }
+    let h: dyn Hello = a
+    out.print(h.hello("bo"))
+}
+|})
+    "hi, ana\nadmin ana (level 3)\nadmin ana (level 3)\nhi, ana\nhi, ana\nana says hello to bo\n";
+  out "embed-depth"
+    {|struct Deep {
+    n: Int,
+    d: Str,
+}
+
+fn which(self: Deep) -> Str { "deep" }
+
+struct Mid {
+    Deep,
+}
+
+struct Near {
+    n: Int,
+}
+
+fn which(self: Near) -> Str { "near" }
+
+// Near.n (depth 1) wins over Mid.Deep.n (depth 2); d is only at depth 2
+struct Top {
+    Near,
+    Mid,
+}
+
+fn main(root: Root) {
+    let t = Top { Near: Near { n: 1 }, Mid: Mid { Deep: Deep { n: 2, d: "x" } } }
+    root.stdout.print("{t.n} {t.d} {t.Mid.n} {t.which()} {t.Mid.which()}")
+}
+|}
+    "1 x 2 near deep\n";
+  out "embed-generic"
+    {|interface Getter {
+    fn get(self) -> Int
+}
+
+struct Box[T] {
+    item: T,
+}
+
+fn get[T](self: Box[T]) -> T {
+    self.item
+}
+
+fn apply[T, U](self: Box[T], f: fn(T) -> U) -> U {
+    f(self.item)
+}
+
+struct Labeled[T] {
+    Box[T],
+    label: Str,
+}
+
+struct Ints {
+    Box[Int],
+}
+
+fn read(g: dyn Getter) -> Int {
+    g.get()
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let l = Labeled { Box: Box { item: 41 }, label: "n" }
+    let s = Labeled { Box: Box { item: "s" }, label: "m" }
+    out.print("{l.get()} {l.item} {l.label} {s.get()} {l.apply(|x| x + 1)} {s.apply(|x| x.len())}")
+    out.print("{read(l)} {read(Ints { Box: Box { item: 7 } })}")
+}
+|}
+    "41 41 n s 42 1\n41 7\n";
+  let auth =
+    "pub struct User {\n    name: Str,\n}\n\npub fn greet(self: User) -> Str {\n    \"hi {self.name}\"\n}\n\nfn secret(self: User) -> Str {\n    \"s\"\n}\n"
+  in
+  out "embed-modules" ~modules:[ ("auth", auth) ]
+    {|use auth
+
+interface Greeter {
+    fn greet(self) -> Str
+}
+
+struct Admin {
+    auth.User,
+    level: Int,
+}
+
+fn main(root: Root) {
+    let a = Admin { User: auth.User { name: "x" }, level: 1 }
+    let g: dyn Greeter = a
+    root.stdout.print("{a.greet()} {g.greet()} {a.User.name} {a.name}")
+}
+|}
+    "hi x hi x x x\n";
+  errs "embed-private-method" ~modules:[ ("auth", auth) ]
+    "use auth\n\nstruct Admin {\n    auth.User,\n}\n\nfn main(root: Root) {\n    let a = Admin { User: auth.User { name: \"x\" } }\n    root.stdout.print(a.secret())\n}\n"
+    [ "E0402" ];
+  let two =
+    {|struct A {
+    x: Int,
+}
+
+fn id(self: A) -> Int { 1 }
+
+struct B {
+    x: Int,
+}
+
+fn id(self: B) -> Int { 2 }
+
+interface Ided {
+    fn id(self) -> Int
+}
+
+struct C {
+    A,
+    B,
+}
+|}
+  in
+  (* ambiguity is an error only where the name is used *)
+  out "embed-ambiguous-unused" (two ^ "\nfn main(root: Root) {\n    let c = C { A: A { x: 1 }, B: B { x: 2 } }\n    root.stdout.print(\"{c.A.x + c.B.x} {c.A.id()}\")\n}\n") "3 1\n";
+  errs "embed-ambiguous-field" (two ^ "\nfn main(root: Root) {\n    let c = C { A: A { x: 1 }, B: B { x: 2 } }\n    root.stdout.print(\"{c.x}\")\n}\n") [ "E0120" ];
+  errs "embed-ambiguous-method" (two ^ "\nfn main(root: Root) {\n    let c = C { A: A { x: 1 }, B: B { x: 2 } }\n    root.stdout.print(\"{c.id()}\")\n}\n") [ "E0120" ];
+  errs "embed-ambiguous-interface" (two ^ "\nfn main(root: Root) {\n    let c: dyn Ided = C { A: A { x: 1 }, B: B { x: 2 } }\n}\n") [ "E0111" ];
+  errs "embed-not-struct" "enum E {\n    P,\n}\n\nstruct S[T] {\n    Int,\n    Option[Int],\n    E,\n    T,\n}\n\nfn main(root: Root) {}\n"
+    [ "E0121"; "E0121"; "E0121"; "E0121" ];
+  errs "embed-self" "struct S {\n    S,\n}\n\nfn main(root: Root) {}\n" [ "E0114" ];
+  errs "embed-twice" "struct A {\n    x: Int,\n}\n\nstruct S {\n    A,\n    A,\n}\n\nfn main(root: Root) {}\n" [ "E0106" ];
+  errs "embed-field-named-like-embed" "struct A {\n    x: Int,\n}\n\nstruct S {\n    A,\n    A: Int,\n}\n\nfn main(root: Root) {}\n" [ "E0106" ];
+  (* a literal sets the embedded struct as a whole, not its promoted fields *)
+  errs "embed-literal-promoted" (embed_base ^ "\nfn main(root: Root) {\n    let a = Admin { name: \"x\", level: 1 }\n}\n") [ "E0206"; "E0103" ];
+  ok "embed-literal-promoted-note"
+    (let _, ds, _ = compile "embed-literal-note" (embed_base ^ "\nfn main(root: Root) {\n    let a = Admin { name: \"x\", level: 1 }\n}\n") in
+     List.exists (fun (d : Diag.t) -> List.exists (fun n -> Interp.find_sub n "User.Person" 0 <> None) d.notes) ds)
+    "note names the embedded path";
+  (* forwarders for promoted methods are not reported as functions of their own *)
+  ok "embed-caps"
+    (let _, _, infos = Modules.load_and_check "embed-caps.vela" (embed_base ^ "\nfn main(root: Root) {}\n") in
+     let names = List.map (fun (i : Check.fn_info) -> i.name) infos in
+     List.mem "Admin::greet" names && not (List.mem "Admin::hello" names) && not (List.mem "User::greet" names))
+    "infos";
+  (* a lowercase bare name is still a field missing its type *)
+  errs "embed-lowercase" "struct P {\n    x\n}\n\nfn main(root: Root) {}\n" [ "E0003" ];
+  ok "embed-fmt"
+    (Fmt.format ~file:"emb.vela" "struct A { x: Int }\nstruct S { A, auth.User,   Box[Int], n: Int }\n"
+     = "struct A {\n    x: Int,\n}\n\nstruct S {\n    A,\n    auth.User,\n    Box[Int],\n    n: Int,\n}\n")
+    (Fmt.format ~file:"emb.vela" "struct A { x: Int }\nstruct S { A, auth.User,   Box[Int], n: Int }\n");
+  (* the language server sees through promotion *)
+  let est = Lsp.create () in
+  let euri = "file:///tmp/lsp-embed.vela" in
+  let edoc =
+    embed_base
+    ^ {|
+fn main(root: Root) {
+    let a = Admin { User: User { Person: Person { name: "ana" }, email: "a@x" }, level: 3 }
+    root.stdout.print(a.hello(a.name))
+}
+|}
+  in
+  let epos text needle k =
+    let off = Option.get (Interp.find_sub text needle 0) + k in
+    let line = ref 0 and col = ref 0 in
+    String.iteri (fun i c -> if i < off then if c = '\n' then (incr line; col := 0) else incr col) text;
+    (!line, !col)
+  in
+  let ereq m needle k =
+    let l, c = epos edoc needle k in
+    let params = J.Obj [ ("textDocument", J.Obj [ ("uri", J.String euri) ]); ("position", J.Obj [ ("line", J.Int l); ("character", J.Int c) ]) ] in
+    match Lsp.handle est (J.Obj [ ("jsonrpc", J.String "2.0"); ("id", J.Int 1); ("method", J.String m); ("params", params) ]) with
+    | [ r ] -> J.member "result" r
+    | _ -> J.Null
+  in
+  let enote m params = ignore (Lsp.handle est (J.Obj [ ("jsonrpc", J.String "2.0"); ("method", J.String m); ("params", params) ])) in
+  enote "textDocument/didOpen" (J.Obj [ ("textDocument", J.Obj [ ("uri", J.String euri); ("text", J.String edoc) ]) ]);
+  let edef needle k = match ereq "textDocument/definition" needle k with J.Null -> None | r -> Some (J.to_int (J.path r [ "range"; "start"; "line" ]), J.to_int (J.path r [ "range"; "start"; "character" ])) in
+  ok "embed-lsp-def-method" (edef "a.hello(" 3 = Some (epos edoc "hello(self" 0)) "hello";
+  ok "embed-lsp-def-field" (edef "a.name)" 3 = Some (epos edoc "name: Str" 0)) "name";
+  let ehover needle k = match ereq "textDocument/hover" needle k with J.Null -> "" | r -> J.to_str (J.path r [ "contents"; "value" ]) in
+  ok "embed-lsp-hover-method" (Interp.find_sub (ehover "a.hello(" 3) "fn hello(self: Person, to: Str) -> Str" 0 <> None) (ehover "a.hello(" 3);
+  let ecomplete text needle k =
+    enote "textDocument/didChange"
+      (J.Obj [ ("textDocument", J.Obj [ ("uri", J.String euri) ]); ("contentChanges", J.List [ J.Obj [ ("text", J.String text) ] ]) ]);
+    let l, c = epos text needle k in
+    let params = J.Obj [ ("textDocument", J.Obj [ ("uri", J.String euri) ]); ("position", J.Obj [ ("line", J.Int l); ("character", J.Int c) ]) ] in
+    match Lsp.handle est (J.Obj [ ("jsonrpc", J.String "2.0"); ("id", J.Int 2); ("method", J.String "textDocument/completion"); ("params", params) ]) with
+    | [ r ] -> ( match J.member "result" r with J.List items -> List.map (fun i -> J.to_str (J.member "label" i)) items | _ -> [])
+    | _ -> []
+  in
+  let ec = ecomplete (Interp.replace_all edoc "    root.stdout.print(a.hello(a.name))" "    root.stdout.print(a.hello(a.name))\n    a.") "    a.\n" 6 in
+  ok "embed-lsp-complete"
+    (List.for_all (fun x -> List.mem x ec) [ "User"; "level"; "email"; "name"; "greet"; "hello"; "intro" ])
+    (String.concat "," ec);
 
   drain ();
   Printf.printf "%d/%d passed\n" (!total - !failed) !total;

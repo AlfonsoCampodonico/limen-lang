@@ -17,7 +17,7 @@ let tuples =
       let n = k + 2 in
       let gen = List.init n (fun i -> "T" ^ string_of_int i) in
       Ast.IStruct
-        { st_name = Ast.tuple_name n; st_span = sp; st_gen = gen; st_pub = true;
+        { st_name = Ast.tuple_name n; st_span = sp; st_gen = gen; st_pub = true; st_embeds = [];
           st_fields = List.mapi (fun i g -> (string_of_int i, sp, { Ast.tdesc = Ast.TyName (g, []); tspan = sp })) gen })
 
 let parsed = lazy (Source.add file text; Parser.parse_program file text @ tuples)

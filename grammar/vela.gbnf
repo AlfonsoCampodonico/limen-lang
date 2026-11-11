@@ -39,7 +39,9 @@ bgen     ::= ident (sp ":" sp qident (sp "+" sp qident)*)?
 qident   ::= ident ("." ident)?
 param    ::= ident sp ":" sp type
 struct   ::= "struct" sp1 ident sp generics? sp "{" ws (field (isep field)* (ws ",")?)? ws "}"
-field    ::= ident sp ":" sp type
+field    ::= ident sp ":" sp type | embed
+# an embedded struct: its type alone, starting with a capital (`User`, `auth.User`, `Box[Int]`)
+embed    ::= (ident ".")? upper (sp "[" ws typearg (isep typearg)* (ws ",")? ws "]")?
 enum     ::= "enum" sp1 ident sp generics? sp "{" ws (variant (isep variant)* (ws ",")?)? ws "}"
 variant  ::= ident (sp "(" ws type (isep type)* (ws ",")? ws ")")?
 

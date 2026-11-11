@@ -29,6 +29,19 @@ struct Point {
     y: Int,
 }
 
+// embedding: Labeled has Point's fields and methods, and satisfies the
+// interfaces Point does; Point stays a plain field, `l.Point`
+struct Labeled {
+    Point,
+    label: Str,
+}
+
+fn describe(self: Point) -> Str { "({self.x}, {self.y})" }
+
+interface Described {
+    fn describe(self) -> Str
+}
+
 // a file can add its own methods to built-in types
 fn shout(self: Str) -> Str { self.to_upper() + "!" }
 
@@ -76,6 +89,12 @@ fn main(root: Root) -> Int {
     // binary data
     let b = "hi".to_bytes() + bytes([33])
     out.print("{b.len()} bytes: {b.to_str()}")
+
+    out.print("-- embedding")
+    let mut home = Labeled { Point: Point { x: 1, y: 2 }, label: "home" }
+    home.x = 5
+    let ds: List[dyn Described] = [home, home.Point]
+    out.print("{home.label} at {home.describe()} {ds.map(|d| d.describe())}")
 
     out.print("-- concurrency")
     // tasks returning () run for their effect and add nothing to the list

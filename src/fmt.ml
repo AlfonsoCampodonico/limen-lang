@@ -528,7 +528,8 @@ let item c (it : item) =
       (fun (f, (fsp : Span.t), t) ->
         ignore (leading c 4 ~prev:!prev fsp.lo);
         new_line c 4;
-        add c (f ^ ": " ^ ty t ^ ",");
+        (* an embedded struct is written as its type alone *)
+        add c ((if List.mem f s.st_embeds then ty t else f ^ ": " ^ ty t) ^ ",");
         if not single then trailing c t.tspan.hi;
         prev := t.tspan.hi)
       s.st_fields;

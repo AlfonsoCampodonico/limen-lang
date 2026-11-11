@@ -585,13 +585,33 @@ let parse_item st =
     let name, nsp = expect_ident st in
     let gen = parse_generics st in
     ignore (expect_sym st "{");
+    (* a field is `name: Type`, or a bare struct type that is embedded:
+       `User`, `auth.User`, `Pair[Int]`, stored as a field named `User` *)
+    let embeds = ref [] in
     let fields =
       comma_list st "}" (fun st ->
-          let f, fsp = expect_ident st in
-          ignore (expect_sym st ":");
-          (f, fsp, parse_type st))
+          match ((peek st).tok, (peek2 st).tok) with
+          | IDENT _, SYM ":" ->
+            let f, fsp = expect_ident st in
+            ignore (expect_sym st ":");
+            (f, fsp, parse_type st)
+          | IDENT n, nxt
+            when is_upper n
+                 || (nxt = SYM "." && match (st.toks.(min (st.pos + 2) (Array.length st.toks - 1))).tok with IDENT b -> is_upper b | _ -> false) ->
+            let te = parse_type st in
+            let f =
+              match te.tdesc with
+              | TyName (n, _) -> ( match String.rindex_opt n '.' with Some i -> String.sub n (i + 1) (String.length n - i - 1) | None -> n)
+              | _ -> ""
+            in
+            embeds := f :: !embeds;
+            (f, te.tspan, te)
+          | _ ->
+            let f, fsp = expect_ident st in
+            ignore (expect_sym st ":");
+            (f, fsp, parse_type st))
     in
-    IStruct { st_name = name; st_span = nsp; st_gen = gen; st_fields = fields; st_pub = false }
+    IStruct { st_name = name; st_span = nsp; st_gen = gen; st_fields = fields; st_embeds = List.rev !embeds; st_pub = false }
   | KW "enum" ->
     ignore (advance st);
     let name, nsp = expect_ident st in

@@ -99,7 +99,7 @@ let item = function
     ^ "]("
     ^ String.concat "," (List.map (fun p -> p.prm_name ^ ":" ^ ty p.prm_ty) d.fn_params)
     ^ ")" ^ (match d.fn_ret with Some t -> ty t | None -> "") ^ block d.fn_body
-  | IStruct s -> "struct " ^ s.st_name ^ "[" ^ String.concat "," s.st_gen ^ "]{" ^ String.concat "," (List.map (fun (f, _, t) -> f ^ ":" ^ ty t) s.st_fields) ^ "}"
+  | IStruct s -> "struct " ^ s.st_name ^ "[" ^ String.concat "," s.st_gen ^ "]{" ^ String.concat "," (List.map (fun (f, _, t) -> if List.mem f s.st_embeds then "embed " ^ ty t else f ^ ":" ^ ty t) s.st_fields) ^ "}"
   | IEnum e ->
     "enum " ^ e.en_name ^ "[" ^ String.concat "," e.en_gen ^ "]{"
     ^ String.concat "," (List.map (fun (v, _, ts) -> v ^ "(" ^ String.concat "," (List.map ty ts) ^ ")") e.en_variants)

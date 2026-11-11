@@ -115,7 +115,14 @@ let of_file ?(all = false) name text (f : file) =
       | IFn d ->
         fns := { e_kind = "fn"; e_name = d.fn_name; e_sig = fn_sig text d; e_doc = doc_above text d.fn_span.lo; e_members = []; e_methods = [] } :: !fns
       | IStruct s when shown s.st_pub ->
-        let fields = List.map (fun (f, (fsp : Span.t), te) -> { m_name = f; m_sig = f ^ ": " ^ slice text te.tspan; m_doc = doc_above text fsp.lo }) s.st_fields in
+        let fields =
+          List.map
+            (fun (f, (fsp : Span.t), te) ->
+              (* an embedded struct is written as its type alone *)
+              let sg = if List.mem f s.st_embeds then slice text te.tspan else f ^ ": " ^ slice text te.tspan in
+              { m_name = f; m_sig = sg; m_doc = doc_above text fsp.lo })
+            s.st_fields
+        in
         types :=
           { e_kind = "struct"; e_name = s.st_name;
             e_sig = block_sig (Printf.sprintf "%sstruct %s%s" (pub_kw s.st_pub) s.st_name (generics s.st_gen [])) (List.map (fun m -> m.m_sig) fields);

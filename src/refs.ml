@@ -67,6 +67,7 @@ let find_word (sp : Span.t) w =
     go (max 0 sp.lo)
 
 let index (items : item list) : occ list =
+  let items = Embed.user_items items in
   let acc = ref [] in
   let add ?(def = false) ?(short = Plain) key name sp =
     if name <> "" && not (String.contains name '$') then
@@ -96,6 +97,13 @@ let index (items : item list) : occ list =
     | _ -> None
   in
   let struct_of t = match Types.repr t with Types.TNamed (n, _) when Hashtbl.mem structs n -> Some n | _ -> None in
+  let type_ref_ n sp = if Hashtbl.mem types n then add ("t:" ^ n) (bare n) sp in
+  (* `admin.User`, `Admin { User: u }`: the embedded field named by its type *)
+  let field_ref s f sp =
+    match Embed.embed_type (Hashtbl.find structs s) f with
+    | Some (tn, _) when List.mem f (Hashtbl.find structs s).st_embeds -> type_ref_ tn sp
+    | _ -> add ("d:" ^ s ^ "#" ^ f) f sp
+  in
   let local (sp : Span.t) = "l:" ^ sp.file ^ "#" ^ string_of_int sp.lo in
   let rec ty (te : ty_expr) =
     match te.tdesc with
@@ -139,7 +147,7 @@ let index (items : item list) : occ list =
       (match e.edesc with EMethod (_, _, _, args) -> List.iter x args | _ -> ())
     | EField (r, name, nsp) ->
       x r;
-      (match struct_of r.ety with Some s -> add ("d:" ^ s ^ "#" ^ name) name nsp | None -> ())
+      (match struct_of r.ety with Some s -> field_ref s name nsp | None -> ())
     | ECall (c, args) -> x c; List.iter x args
     | EMethod (r, name, nsp, args) ->
       x r;
@@ -174,7 +182,7 @@ let index (items : item list) : occ list =
             (match List.assoc_opt n env with
              | Some k -> add ~short:(Var_side f) k n fsp
              | None -> if Hashtbl.mem fns n then add ~short:(Var_side f) ("f:" ^ n) n fsp)
-          | _ -> add ("d:" ^ name ^ "#" ^ f) f fsp; x v)
+          | _ -> (if Hashtbl.mem structs name then field_ref name f fsp else add ("d:" ^ name ^ "#" ^ f) f fsp); x v)
         fs
     | EDyn (y, _) -> x y
     | ESelect arms ->
@@ -228,7 +236,8 @@ let index (items : item list) : occ list =
         block env d.fn_body
       | IStruct s ->
         add ~def:true ("t:" ^ s.st_name) (bare s.st_name) s.st_span;
-        List.iter (fun (f, sp, te) -> add ~def:true ("d:" ^ s.st_name ^ "#" ^ f) f sp; ty te) s.st_fields
+        (* an embedded field is named by its type, so its name is a use of the type *)
+        List.iter (fun (f, sp, te) -> if List.mem f s.st_embeds then ty te else (add ~def:true ("d:" ^ s.st_name ^ "#" ^ f) f sp; ty te)) s.st_fields
       | IEnum e ->
         add ~def:true ("t:" ^ e.en_name) (bare e.en_name) e.en_span;
         List.iter (fun (v, sp, tes) -> add ~def:true ("v:" ^ e.en_name ^ "#" ^ v) v sp; List.iter ty tes) e.en_variants
