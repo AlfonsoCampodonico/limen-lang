@@ -83,12 +83,29 @@ let compile ?(modules = []) name src =
 
 let codes ds = List.map (fun (d : Diag.t) -> d.code) ds
 
-let run ?(grants = Interp.no_grants) ?modules name src =
+(* [feed]: a shell command whose output becomes the program's stdin, through
+   a pipe, so input can arrive late. *)
+let with_stdin feed f =
+  match feed with
+  | None -> f ()
+  | Some cmd ->
+    let r, w = Unix.pipe ~cloexec:true () in
+    let pid = Unix.create_process "/bin/sh" [| "/bin/sh"; "-c"; cmd |] Unix.stdin w Unix.stderr in
+    Unix.close w;
+    let saved = Unix.dup Unix.stdin in
+    Unix.dup2 r Unix.stdin;
+    Unix.close r;
+    Fun.protect f ~finally:(fun () ->
+        Unix.dup2 saved Unix.stdin;
+        Unix.close saved;
+        ignore (Unix.waitpid [] pid))
+
+let run ?(grants = Interp.no_grants) ?modules ?feed name src =
   let items, ds, _ = compile ?modules name src in
   if ds <> [] then Error ("diagnostics: " ^ String.concat ", " (List.map (fun (d : Diag.t) -> d.code ^ " " ^ d.message) ds))
   else
     let buf = Buffer.create 64 in
-    match Interp.run ~out:(Buffer.add_string buf) ~grants items with
+    match with_stdin feed (fun () -> Interp.run ~out:(Buffer.add_string buf) ~grants items) with
     | Ok v -> Ok (Buffer.contents buf, v)
     | Error (m, _) -> Error ("panic: " ^ m)
 
@@ -104,7 +121,9 @@ let sanitize = [ "-O1"; "-g"; "-fsanitize=address,undefined"; "-fno-sanitize-rec
 
 let read_file p = In_channel.with_open_bin p In_channel.input_all
 
-let run_native ?(grants = Interp.no_grants) ?modules name src =
+(* With [feed], stdin comes from that shell command, and the program runs on
+   one worker thread, so a task that blocked its thread would stall the rest. *)
+let run_native ?(grants = Interp.no_grants) ?modules ?feed name src =
   let items, ds, _ = compile ?modules name src in
   if ds <> [] then Error "does not compile" else
   let exe = Filename.concat tmpdir name in
@@ -124,12 +143,17 @@ let run_native ?(grants = Interp.no_grants) ?modules name src =
       String.concat " " (List.map Filename.quote (exe :: args))
       ^ sprintf " >%s 2>%s" (Filename.quote o) (Filename.quote e)
     in
-    let code = Sys.command ("ASAN_OPTIONS=detect_leaks=0 VELA_LEAKCHECK=1 " ^ cmd) in
+    let env = "ASAN_OPTIONS=detect_leaks=0 VELA_LEAKCHECK=1 " in
+    let code =
+      match feed with
+      | None -> Sys.command (env ^ cmd)
+      | Some f -> Sys.command (sprintf "(%s) | %sVELA_THREADS=1 %s" f env cmd)
+    in
     Ok (code, read_file o, read_file e)
 
-let check_native name ?grants ?modules src ~want_out ~want_err_prefix =
+let check_native name ?grants ?modules ?feed src ~want_out ~want_err_prefix =
   if native_enabled then
-    match run_native ?grants ?modules name src with
+    match run_native ?grants ?modules ?feed name src with
     | Error m -> ok (name ^ "/native") false m
     | Ok (code, o, e) -> (
       ok (name ^ "/native") (o = want_out) (sprintf "stdout %S, want %S (stderr %S)" o want_out e);
@@ -143,7 +167,7 @@ let check_native name ?grants ?modules src ~want_out ~want_err_prefix =
 (* Concurrency: the same program again under ThreadSanitizer. *)
 let tsan = [ "-O1"; "-g"; "-fsanitize=thread" ]
 
-let check_tsan name ?(grants = Interp.no_grants) src want =
+let check_tsan name ?(grants = Interp.no_grants) ?feed src want =
   if native_enabled && selected name then begin
     let items, ds, _ = compile name src in
     let exe = Filename.concat tmpdir (name ^ "-tsan") in
@@ -161,19 +185,20 @@ let check_tsan name ?(grants = Interp.no_grants) src want =
       let cmd =
         String.concat " " (List.map Filename.quote (exe :: args)) ^ sprintf " >%s 2>%s" (Filename.quote o) (Filename.quote e)
       in
-      let code = Sys.command ("TSAN_OPTIONS=halt_on_error=1 VELA_THREADS=8 VELA_LEAKCHECK=1 " ^ cmd) in
+      let env = "TSAN_OPTIONS=halt_on_error=1 VELA_THREADS=8 VELA_LEAKCHECK=1 " in
+      let code = match feed with None -> Sys.command (env ^ cmd) | Some f -> Sys.command (sprintf "(%s) | %s%s" f env cmd) in
       let o = read_file o and e = read_file e in
       ok (name ^ "/tsan")
         (code = 0 && o = want && e = "vela-leakcheck: 0 live\n")
         (sprintf "exit %d, stdout %S, stderr %S" code o e)
   end
 
-let out name ?grants ?modules src want =
+let out name ?grants ?modules ?feed src want =
   if selected name then begin
-  (match run ?grants ?modules name src with
+  (match run ?grants ?modules ?feed name src with
    | Ok (got, _) -> ok name (got = want) (sprintf "got %S, want %S" got want)
    | Error e -> ok name false e);
-  check_native name ?grants ?modules src ~want_out:want ~want_err_prefix:None
+  check_native name ?grants ?modules ?feed src ~want_out:want ~want_err_prefix:None
   end
 
 let errs ?modules name src want =
@@ -1628,6 +1653,98 @@ fn main(root: Root) {
   errs "group-until-ms-type" (main_wrap "    let r = group g until root.clock.after(true) {\n        g.go(|| 1)\n    }") [ "E0201" ];
   errs "group-until-type" (main_wrap "    let r: List[Int] = group g until root.clock.after(5) {\n        g.go(|| 1)\n    }") [ "E0201" ];
   errs "group-until-bad" (main_wrap "    let r = group g until root.clock.sleep(5) {\n        g.go(|| 1)\n    }") [ "E0003" ];
+
+  (* ---------- stdin through the poller ---------- *)
+  (* input arrives late; the other task keeps ticking meanwhile, natively on one thread *)
+  out "stdin-lines" ~feed:"sleep 0.3; printf 'one\\ntwo\\r\\n'; sleep 0.2; printf three" {|fn main(root: Root) {
+    let out = root.stdout
+    let clock = root.clock
+    let stdin = root.stdin
+    let start = clock.now_ms()
+    // while one task waits for input, the others run
+    let r = group g {
+        g.go(|| {
+            let mut lines = []
+            let mut more = true
+            while more {
+                match stdin.read_line() {
+                    Some(l) => lines.push(l),
+                    None => {
+                        more = false
+                    },
+                }
+            }
+            lines.join("|")
+        })
+        g.go(|| {
+            let mut n = 0
+            while clock.now_ms() - start < 100 {
+                clock.sleep(10)
+                n = n + 1
+            }
+            "ticked {n > 3}"
+        })
+    }
+    out.print("{r}")
+}
+|} "[\"one|two|three\", \"ticked true\"]\n";
+  out "stdin-all" ~feed:"sleep 0.3; printf 'a\\nb'; sleep 0.1; printf 'c\\n'" {|fn main(root: Root) {
+    let clock = root.clock
+    let start = clock.now_ms()
+    let r = group g {
+        g.go(|| root.stdin.read_all())
+        g.go(|| {
+            let mut n = 0
+            while clock.now_ms() - start < 100 {
+                clock.sleep(10)
+                n = n + 1
+            }
+            "{n > 3}"
+        })
+    }
+    root.stdout.print("{r}")
+    root.stdout.print("{root.stdin.read_line()}")
+}
+|} "[\"a\\nbc\\n\", \"true\"]\nNone\n";
+  (* a reader waiting for input is cancelled; the next read still gets the line *)
+  out "stdin-cancel" ~feed:"sleep 0.6; echo late" {|fn main(root: Root) {
+    let stdin = root.stdin
+    let r = group g until root.clock.after(100) {
+        g.go(|| stdin.read_line() ?? "end")
+    }
+    root.stdout.print("{r} {stdin.read_line()}")
+}
+|} "[None] Some(\"late\")\n";
+  let readers = {|fn sum_lines(stdin: Stdin) -> Int {
+    let mut sum = 0
+    let mut more = true
+    while more {
+        match stdin.read_line() {
+            Some(l) => {
+                sum = sum + (l.parse_int() ?? 0)
+            },
+            None => {
+                more = false
+            },
+        }
+    }
+    sum
+}
+
+fn main(root: Root) {
+    let stdin = root.stdin
+    let sums = group g {
+        let mut i = 0
+        while i < 6 {
+            g.go(|| sum_lines(stdin))
+            i = i + 1
+        }
+    }
+    root.stdout.print("{sums.sum()}")
+}
+|} in
+  out "stdin-readers" ~feed:"seq 1 1000; sleep 0.1; seq 1001 2000" readers "2001000\n";
+  check_tsan "stdin-readers" ~feed:"seq 1 1000; sleep 0.1; seq 1001 2000" readers "2001000\n";
 
   (* ---------- unbuffered channels ---------- *)
   out "chan-unbuffered" {|fn main(root: Root) {

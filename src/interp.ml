@@ -572,6 +572,63 @@ module Sock = struct
     end
 end
 
+(* ---------- stdin ----------
+   Read like a socket: a task waiting for input waits in the scheduler, and
+   other tasks keep running. One task reads at a time (each gets whole
+   lines); the others wait their turn. A regular file is read directly. *)
+module Stdin = struct
+  let buf = Buffer.create 4096
+  let eof = ref false
+  let busy = ref false
+  let sk = { fd = Unix.stdin; shut = false }
+  let direct = lazy (try (Unix.fstat Unix.stdin).Unix.st_kind = Unix.S_REG with Unix.Unix_error _ -> true)
+
+  let reset () = Buffer.clear buf; eof := false; busy := false
+
+  (* run [f] as the reader; a task cancelled while it waits lets the next one in *)
+  let exclusive f =
+    wait_until (fun () -> not !busy);
+    busy := true;
+    match f () with
+    | v -> busy := false; v
+    | exception e -> busy := false; raise e
+
+  let rec fill () =
+    let ready () = Lazy.force direct || match Unix.select [ Unix.stdin ] [] [] 0. with r, _, _ -> r <> [] | exception Unix.Unix_error _ -> true in
+    if not (ready ()) then (Sock.wait sk false; fill ())
+    else
+      let b = Bytes.create 65536 in
+      match Unix.read Unix.stdin b 0 65536 with
+      | 0 -> eof := true
+      | n -> Buffer.add_subbytes buf b 0 n
+      | exception Unix.Unix_error (Unix.EINTR, _, _) -> fill ()
+      | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _) -> Sock.wait sk false; fill ()
+      | exception Unix.Unix_error _ -> eof := true
+
+  let take n =
+    let s = Buffer.contents buf in
+    Buffer.clear buf;
+    Buffer.add_string buf (String.sub s n (String.length s - n))
+
+  let read_line () =
+    exclusive (fun () ->
+        let rec go () =
+          let s = Buffer.contents buf in
+          match String.index_opt s '\n' with
+          | Some i -> take (i + 1); Some (String.sub s 0 i)
+          | None when !eof -> if s = "" then None else (take (String.length s); Some s)
+          | None -> fill (); go ()
+        in
+        Option.map (fun l -> if String.ends_with ~suffix:"\r" l then String.sub l 0 (String.length l - 1) else l) (go ()))
+
+  let read_all () =
+    exclusive (fun () ->
+        while not !eof do fill () done;
+        let s = Buffer.contents buf in
+        Buffer.clear buf;
+        s)
+end
+
 let rec pmatch p v binds =
   match (p.pdesc, v) with
   | PWild, _ -> true
@@ -1027,11 +1084,8 @@ and cap_call rt c name args =
   | CClock, "now_ms", [] -> VInt (Int64.of_float (Unix.gettimeofday () *. 1000.))
   | CClock, "sleep", [ VInt ms ] -> sleep_ms ms; VUnit
   | CRand, "float", [] -> VFloat (Int64.to_float (Int64.shift_right_logical (rand_next ()) 11) *. 0x1p-53)
-  | CStdin, "read_line", [] -> (
-    match In_channel.input_line stdin with
-    | Some l -> some (VStr (if String.ends_with ~suffix:"\r" l then String.sub l 0 (String.length l - 1) else l))
-    | None -> none)
-  | CStdin, "read_all", [] -> VStr (In_channel.input_all stdin)
+  | CStdin, "read_line", [] -> ( match Stdin.read_line () with Some l -> some (VStr l) | None -> none)
+  | CStdin, "read_all", [] -> VStr (Stdin.read_all ())
   | CEnv names, "get", [ VStr n ] ->
     if List.mem "*" names || List.mem n names then match Sys.getenv_opt n with Some v -> some (VStr v) | None -> none
     else none
@@ -1083,6 +1137,7 @@ let run ~out ~grants (user_items : item list) : (value, string * Span.t) result 
     let args = match d.fn_params with [] -> [] | _ -> [ VCap CRoot ] in
     (* main is a coroutine too, so it can wait on groups and channels *)
     Queue.clear runq;
+    Stdin.reset ();
     Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
     let result = ref None in
     try

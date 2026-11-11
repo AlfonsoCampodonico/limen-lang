@@ -401,7 +401,7 @@ let results = group g {
 - `g` can only be used as `g.go(...)` directly in the body. It cannot be stored, passed, returned, or used inside a closure (E0310).
 - The body cannot leave early with `return` or `?` (E0311), and `break` and `continue` cannot target loops outside the group.
 - Tasks share data by value, so there are no data races. A task reaches the world only through capabilities its closure captured. Spawning is not a capability.
-- Tasks are lightweight: natively each is a fiber with a small stack, scheduled on one worker thread per core (`VELA_THREADS` overrides this), and a task waiting on a group, a channel, a socket or `clock.sleep(ms)` parks without blocking a thread. The interpreter runs tasks as coroutines. Output printed by tasks may interleave differently between the two.
+- Tasks are lightweight: natively each is a fiber with a small stack, scheduled on one worker thread per core (`VELA_THREADS` overrides this), and a task waiting on a group, a channel, a socket, stdin or `clock.sleep(ms)` parks without blocking a thread. The interpreter runs tasks as coroutines. Output printed by tasks may interleave differently between the two.
 - If every task is waiting and nothing can wake one (no socket and no timer can), the program panics with `all tasks are blocked (deadlock)` instead of hanging.
 - A panic in a task ends only that task. The group still waits for the others, then passes the first panic on (section 15).
 
@@ -627,7 +627,7 @@ Strings compare byte by byte, so `c >= "a" && c <= "z"` tests a one-byte string.
 | `Clock` | `sleep(ms)` | `()`, waits `ms` milliseconds (section 10); returns at once if `ms <= 0` |
 | `Rand` | `int(lo, hi)` | `Int` in `lo` up to but not including `hi`; panics if `hi <= lo` |
 | `Rand` | `float()` | `Float` in [0, 1) |
-| `Stdin` | `read_line()` | `Option[Str]`, without the newline; `None` at the end of input |
+| `Stdin` | `read_line()` | `Option[Str]`, without the newline (or `\r\n`); `None` at the end of input. Waiting for input parks the task; one task reads at a time, so tasks reading together each get whole lines |
 | `Stdin` | `read_all()` | `Str`, the rest of the input |
 | `Env` | `get(name)` | `Option[Str]`; `None` if unset or not granted |
 | `Net` | `get(url)` | `Result[Str, IoError]`, the response body; a non-2xx status is `Failed` |

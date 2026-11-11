@@ -943,25 +943,6 @@ static L_Str *Cap_args(void) {
   for (int i = 0; i < g_nargs; i++) L_Str_push(&out, Str_from(g_args[i], (int64_t)strlen(g_args[i])));
   return out;
 }
-/* Stdin blocks the worker thread while it waits; reading is meant for
-   programs that read their input up front. */
-static WStr *Cap_stdin_line(bool *ok) {
-  char *line = NULL; size_t cap = 0;
-  ssize_t n = getline(&line, &cap, stdin);
-  if (n < 0) { free(line); *ok = false; return NULL; }
-  if (n > 0 && line[n - 1] == '\n') n--;
-  if (n > 0 && line[n - 1] == '\r') n--;
-  WStr *s = Str_from(line, (int64_t)n);
-  free(line);
-  *ok = true;
-  return s;
-}
-static WStr *Cap_stdin_all(void) {
-  WBuf b; buf_init(&b);
-  char t[65536]; size_t k;
-  while ((k = fread(t, 1, sizeof t, stdin)) > 0) buf_putn(&b, t, (int64_t)k);
-  return buf_take(&b);
-}
 static WStr *Cap_env_get(WCap *env, WStr *name, bool *ok) {
   char *n = strndup(name->data, (size_t)name->len);
   bool allowed = false;
@@ -2455,26 +2436,31 @@ static void w_poll_start(void) {
 }
 
 /* Park until fd may be ready in that direction. Returns -1 if another task
-   is already waiting on it in that direction (or fd is out of range), and
-   -2 if the task was cancelled: the caller cleans up, then calls
-   w_cancel_unwind(). */
+   is already waiting on it in that direction (or fd is out of range), -2
+   if the task was cancelled (the caller cleans up, then calls
+   w_cancel_unwind()), and -3 if the poller cannot watch fd. */
 static int w_wait_fd(int fd, int write) {
   if (fd < 0 || fd >= W_MAX_FD) return -1;
   pthread_once(&w_poll_once, w_poll_start);
   WFdState *st = &w_fds[fd];
   pthread_mutex_lock(w_fd_lock(fd));
   if (!st->registered) {
+    int bad;
 #ifdef W_KQUEUE
-    struct kevent ev[2];
-    EV_SET(&ev[0], (uintptr_t)fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, NULL);
-    EV_SET(&ev[1], (uintptr_t)fd, EVFILT_WRITE, EV_ADD | EV_CLEAR, 0, 0, NULL);
-    kevent(w_poll_fd, ev, 2, NULL, 0, NULL);
+    /* one change per call, so a descriptor that cannot be written (stdin)
+       still gets its read filter */
+    struct kevent ev;
+    EV_SET(&ev, (uintptr_t)fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, NULL);
+    bad = kevent(w_poll_fd, &ev, 1, NULL, 0, NULL) < 0;
+    EV_SET(&ev, (uintptr_t)fd, EVFILT_WRITE, EV_ADD | EV_CLEAR, 0, 0, NULL);
+    kevent(w_poll_fd, &ev, 1, NULL, 0, NULL);
 #else
     struct epoll_event ev;
     ev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET;
     ev.data.fd = fd;
-    epoll_ctl(w_poll_fd, EPOLL_CTL_ADD, fd, &ev);
+    bad = epoll_ctl(w_poll_fd, EPOLL_CTL_ADD, fd, &ev) < 0;
 #endif
+    if (bad) { pthread_mutex_unlock(w_fd_lock(fd)); return -3; }   /* the poller cannot watch it */
     st->registered = 1;
   }
   uint8_t *ready = write ? &st->wready : &st->rready;
@@ -2697,4 +2683,100 @@ static WIo Cap_conn_write(WCap *c, WStr *s) {
   }
   w_sock_leave(c);
   return io_ok(NULL);
+}
+
+/* ---------- stdin ----------
+   Read through the poller like a socket: a task waiting for input parks,
+   and no worker thread blocks. Stdin keeps its blocking mode (it is shared
+   with the parent shell), so a task reads only once poll() says input is
+   there. A regular file never makes a reader wait, so it is read directly,
+   and so is anything the poller cannot watch. One task reads at a time,
+   each getting whole lines: the others queue on w_in_lock, a channel
+   holding one token. */
+#include <poll.h>
+static WChan *w_in_lock;
+static char *w_in_buf; static int64_t w_in_len, w_in_cap;
+static int w_in_eof, w_in_direct;
+static pthread_once_t w_in_once = PTHREAD_ONCE_INIT;
+static void w_in_init(void) {
+  /* built by hand, not counted by the leak check: it lives as long as the program */
+  WChan *c = (WChan *)w_raw(sizeof(WChan));
+  memset(c, 0, sizeof *c);
+  c->cap = 1; c->esz = sizeof(int64_t); c->buf = (char *)w_raw(sizeof(int64_t)); c->len = 1;
+  memset(c->buf, 0, sizeof(int64_t));
+  pthread_mutex_init(&c->mu, NULL);
+  w_in_lock = c;
+  struct stat st;
+  w_in_direct = fstat(0, &st) == 0 && S_ISREG(st.st_mode);
+}
+static void w_in_acquire(void) {
+  pthread_once(&w_in_once, w_in_init);
+  int64_t tok;
+  w_chan_recv(w_in_lock, &tok);   /* cancellable, before anything is held */
+}
+static void w_in_release(void) { int64_t tok = 0; w_chan_send(w_in_lock, &tok, "stdin"); }
+/* Read more input into the buffer. Returns 1, 0 at the end of input, or -2
+   if the task was cancelled while it waited. */
+static int w_in_fill(void) {
+  char *tmp = (char *)w_raw(65536);
+  for (;;) {
+    if (!w_in_direct) {
+      struct pollfd p = { 0, POLLIN, 0 };
+      int r = poll(&p, 1, 0);
+      if (r < 0 && errno == EINTR) continue;
+      if (r == 0) {
+        int wr = w_wait_fd(0, 0);
+        if (wr == -2) { free(tmp); return -2; }
+        if (wr < 0) w_in_direct = 1;
+        continue;
+      }
+      if (r < 0 || (p.revents & POLLNVAL)) w_in_direct = 1;
+    }
+    ssize_t n = read(0, tmp, 65536);
+    if (n < 0 && errno == EINTR) continue;
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {   /* inherited a non-blocking stdin */
+      struct pollfd p = { 0, POLLIN, 0 };
+      if (w_in_direct) poll(&p, 1, -1);
+      else { int wr = w_wait_fd(0, 0); if (wr == -2) { free(tmp); return -2; } if (wr < 0) w_in_direct = 1; }
+      continue;
+    }
+    if (n <= 0) { free(tmp); w_in_eof = 1; return 0; }
+    if (w_in_len + n > w_in_cap) {
+      while (w_in_len + n > w_in_cap) w_in_cap = w_in_cap ? w_in_cap * 2 : 65536;
+      w_in_buf = (char *)w_realloc(w_in_buf, (size_t)w_in_cap);
+    }
+    memcpy(w_in_buf + w_in_len, tmp, (size_t)n);
+    w_in_len += n;
+    free(tmp);
+    return 1;
+  }
+}
+static void w_in_consume(int64_t n) { memmove(w_in_buf, w_in_buf + n, (size_t)(w_in_len - n)); w_in_len -= n; }
+static WStr *Cap_stdin_line(bool *ok) {
+  w_in_acquire();
+  int64_t from = 0;
+  for (;;) {
+    char *nl = w_in_len > from ? (char *)memchr(w_in_buf + from, '\n', (size_t)(w_in_len - from)) : NULL;
+    if (nl || w_in_eof) {
+      int64_t end = nl ? nl - w_in_buf : w_in_len;
+      if (!nl && end == 0) { w_in_release(); *ok = false; return NULL; }
+      int64_t n = end;
+      if (n > 0 && w_in_buf[n - 1] == '\r') n--;
+      WStr *s = Str_from(w_in_buf, n);
+      w_in_consume(nl ? end + 1 : end);
+      w_in_release();
+      *ok = true;
+      return s;
+    }
+    from = w_in_len;
+    if (w_in_fill() == -2) { w_in_release(); w_cancel_unwind(); }
+  }
+}
+static WStr *Cap_stdin_all(void) {
+  w_in_acquire();
+  while (!w_in_eof) if (w_in_fill() == -2) { w_in_release(); w_cancel_unwind(); }
+  WStr *s = Str_from(w_in_buf ? w_in_buf : "", w_in_len);
+  w_in_len = 0;
+  w_in_release();
+  return s;
 }
