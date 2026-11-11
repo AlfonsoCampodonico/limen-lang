@@ -12,6 +12,7 @@
 #include <spawn.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <dirent.h>
 #include <sys/time.h>
 #include <errno.h>
 #include <signal.h>
@@ -467,7 +468,7 @@ static void Clo_show(WBuf *b, WClo *c, bool top) { (void)c; (void)top; buf_puts(
 
 /* ---------- capabilities ---------- */
 
-enum { CAP_ROOT, CAP_NET, CAP_FS, CAP_STDOUT, CAP_CLOCK, CAP_LISTEN, CAP_LISTENER, CAP_CONN };
+enum { CAP_ROOT, CAP_NET, CAP_FS, CAP_STDOUT, CAP_CLOCK, CAP_LISTEN, CAP_LISTENER, CAP_CONN, CAP_RAND, CAP_STDIN, CAP_ENV };
 typedef struct WCap WCap;
 struct WCap {
   int64_t rc; int kind;
@@ -486,12 +487,15 @@ static void Cap_drop(WCap *c) {
 static inline bool Cap_eq(WCap *a, WCap *b) { return a == b; }
 static void Cap_show(WBuf *b, WCap *c, bool top) {
   (void)top;
-  static const char *names[] = { "<Root>", "<Net>", "<Fs>", "<Stdout>", "<Clock>", "<Listen>", "<Listener>", "<Conn>" };
+  static const char *names[] = { "<Root>", "<Net>", "<Fs>", "<Stdout>", "<Clock>", "<Listen>", "<Listener>", "<Conn>", "<Rand>", "<Stdin>", "<Env>" };
   buf_puts(b, names[c->kind]);
 }
 
 static char **g_hosts; static int g_nhosts; static char *g_fs_root; static bool g_fs_ro;
 static char **g_listen; static int g_nlisten;
+static char **g_env; static int g_nenv;
+static char **g_args; static int g_nargs;
+static uint64_t g_rand_state;
 
 static void w_usage(const char *m) {
   fprintf(stderr, "%s\nusage: PROGRAM [--grant net=HOST[:PORT]|*]... [--grant fs=DIR[:ro]]\n", m);
@@ -506,7 +510,14 @@ static void w_init(int argc, char **argv) {
       if (rl.rlim_cur < want) { rl.rlim_cur = want; setrlimit(RLIMIT_NOFILE, &rl); }
     }
   }
+  {
+    struct timeval tv; gettimeofday(&tv, NULL);
+    g_rand_state = (uint64_t)tv.tv_sec * 1000000u + (uint64_t)tv.tv_usec;
+    g_rand_state ^= (uint64_t)getpid();
+  }
   for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--") == 0) { g_args = argv + i + 1; g_nargs = argc - i - 1; break; }
+    if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) { g_rand_state = (uint64_t)strtoll(argv[++i], NULL, 10); continue; }
     if (strcmp(argv[i], "--grant") != 0 || i + 1 >= argc) w_usage("unknown argument");
     const char *g = argv[++i];
     if (strncmp(g, "net=", 4) == 0) {
@@ -521,6 +532,9 @@ static void w_init(int argc, char **argv) {
       if (!r || stat(r, &st) != 0 || !S_ISDIR(st.st_mode)) w_usage("fs grant: no such directory");
       free(v);
       g_fs_root = r;
+    } else if (strncmp(g, "env=", 4) == 0) {
+      g_env = (char **)w_realloc(g_env, sizeof(char *) * (size_t)(g_nenv + 1));
+      g_env[g_nenv++] = strdup(g + 4);
     } else if (strncmp(g, "listen=", 7) == 0) {
       g_listen = (char **)w_realloc(g_listen, sizeof(char *) * (size_t)(g_nlisten + 1));
       g_listen[g_nlisten++] = strdup(g + 7);
@@ -551,7 +565,70 @@ static WCap *Cap_root_field(WCap *root, const char *f) {
     c->nhosts = g_nlisten;
     return c;
   }
+  if (strcmp(f, "rand") == 0) return cap_new(CAP_RAND);
+  if (strcmp(f, "stdin") == 0) return cap_new(CAP_STDIN);
+  if (strcmp(f, "env") == 0) {
+    WCap *c = cap_new(CAP_ENV);
+    c->hosts = (char **)w_raw(sizeof(char *) * (size_t)(g_nenv + 1));
+    for (int i = 0; i < g_nenv; i++) c->hosts[i] = strdup(g_env[i]);
+    c->nhosts = g_nenv;
+    return c;
+  }
   return cap_new(CAP_CLOCK);
+}
+
+/* Rand: splitmix64. The state only ever advances by a constant, so an atomic
+   add keeps it correct across threads, and a seed gives the interpreter's
+   sequence too. */
+static uint64_t w_rand_next(void) {
+  uint64_t z = __atomic_add_fetch(&g_rand_state, 0x9E3779B97F4A7C15ULL, __ATOMIC_RELAXED);
+  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+  z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+  return z ^ (z >> 31);
+}
+static int64_t Cap_rand_int(int64_t lo, int64_t hi, const char *where) {
+  if (hi <= lo) {
+    char m[96];
+    snprintf(m, sizeof m, "rand.int: empty range %lld..%lld", (long long)lo, (long long)hi);
+    w_panic_c(m, where);
+  }
+  uint64_t span = (uint64_t)hi - (uint64_t)lo;
+  return (int64_t)((uint64_t)lo + w_rand_next() % span);
+}
+static double Cap_rand_float(void) { return (double)(w_rand_next() >> 11) * 0x1.0p-53; }
+static L_Str *Cap_args(void) {
+  L_Str *out = L_Str_new(g_nargs);
+  for (int i = 0; i < g_nargs; i++) L_Str_push(&out, Str_from(g_args[i], (int64_t)strlen(g_args[i])));
+  return out;
+}
+/* Stdin blocks the worker thread while it waits; reading is meant for
+   programs that read their input up front. */
+static WStr *Cap_stdin_line(bool *ok) {
+  char *line = NULL; size_t cap = 0;
+  ssize_t n = getline(&line, &cap, stdin);
+  if (n < 0) { free(line); *ok = false; return NULL; }
+  if (n > 0 && line[n - 1] == '\n') n--;
+  if (n > 0 && line[n - 1] == '\r') n--;
+  WStr *s = Str_from(line, (int64_t)n);
+  free(line);
+  *ok = true;
+  return s;
+}
+static WStr *Cap_stdin_all(void) {
+  WBuf b; buf_init(&b);
+  char t[65536]; size_t k;
+  while ((k = fread(t, 1, sizeof t, stdin)) > 0) buf_putn(&b, t, (int64_t)k);
+  return buf_take(&b);
+}
+static WStr *Cap_env_get(WCap *env, WStr *name, bool *ok) {
+  char *n = strndup(name->data, (size_t)name->len);
+  bool allowed = false;
+  for (int i = 0; i < env->nhosts; i++) if (strcmp(env->hosts[i], "*") == 0 || strcmp(env->hosts[i], n) == 0) allowed = true;
+  const char *v = allowed ? getenv(n) : NULL;
+  free(n);
+  if (!v) { *ok = false; return NULL; }
+  *ok = true;
+  return Str_from(v, (int64_t)strlen(v));
 }
 
 /* I/O results: kind 0 = ok, 1 = denied, 2 = failed. */
@@ -788,6 +865,70 @@ static bool Cap_fs_exists(WCap *fs, WStr *rel) {
   bool e = stat(p, &st) == 0;
   free(p);
   return e;
+}
+static WIo Cap_fs_append(WCap *fs, WStr *rel, WStr *data) {
+  if (fs->root && fs->ro) return io_err(1, "fs: this capability is read-only");
+  int kind; char msg[1024];
+  char *p = fs_resolve(fs, rel, true, &kind, msg, sizeof msg);
+  if (!p) return io_err(kind, msg);
+  FILE *f = fopen(p, "ab");
+  if (!f) { snprintf(msg, sizeof msg, "%s: %s", p, strerror(errno)); free(p); return io_err(2, msg); }
+  fwrite(data->data, 1, (size_t)data->len, f);
+  fclose(f); free(p);
+  return io_ok(NULL);
+}
+static int w_cmp_cstr(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
+static WIo Cap_fs_list(WCap *fs, WStr *rel) {
+  int kind; char msg[1024];
+  char *p = fs_resolve(fs, rel, false, &kind, msg, sizeof msg);
+  if (!p) return io_err(kind, msg);
+  DIR *d = opendir(p);
+  free(p);
+  if (!d) { snprintf(msg, sizeof msg, "fs: `%.*s` is not a directory", (int)rel->len, rel->data); return io_err(2, msg); }
+  char **names = NULL; int n = 0;
+  struct dirent *e;
+  while ((e = readdir(d))) {
+    if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+    names = (char **)w_realloc(names, sizeof(char *) * (size_t)(n + 1));
+    names[n++] = strdup(e->d_name);
+  }
+  closedir(d);
+  qsort(names, (size_t)n, sizeof(char *), w_cmp_cstr);
+  L_Str *out = L_Str_new(n);
+  for (int i = 0; i < n; i++) { L_Str_push(&out, Str_from(names[i], (int64_t)strlen(names[i]))); free(names[i]); }
+  free(names);
+  return io_ok_ptr(out);
+}
+static bool Cap_fs_is_dir(WCap *fs, WStr *rel) {
+  int kind; char msg[1024];
+  char *p = fs_resolve(fs, rel, false, &kind, msg, sizeof msg);
+  if (!p) return false;
+  struct stat st;
+  bool r = stat(p, &st) == 0 && S_ISDIR(st.st_mode);
+  free(p);
+  return r;
+}
+static WIo Cap_fs_remove(WCap *fs, WStr *rel) {
+  if (fs->root && fs->ro) return io_err(1, "fs: this capability is read-only");
+  int kind; char msg[1024];
+  char *p = fs_resolve(fs, rel, false, &kind, msg, sizeof msg);
+  if (!p) return io_err(kind, msg);
+  if (strcmp(p, fs->root) == 0) { free(p); return io_err(1, "fs: cannot remove the granted directory itself"); }
+  struct stat st;
+  int rc = (lstat(p, &st) == 0 && S_ISDIR(st.st_mode)) ? rmdir(p) : unlink(p);
+  free(p);
+  if (rc != 0) { snprintf(msg, sizeof msg, "fs: `%.*s`: %s", (int)rel->len, rel->data, strerror(errno)); return io_err(2, msg); }
+  return io_ok(NULL);
+}
+static WIo Cap_fs_make_dir(WCap *fs, WStr *rel) {
+  if (fs->root && fs->ro) return io_err(1, "fs: this capability is read-only");
+  int kind; char msg[1024];
+  char *p = fs_resolve(fs, rel, true, &kind, msg, sizeof msg);
+  if (!p) return io_err(kind, msg);
+  int rc = mkdir(p, 0755);
+  free(p);
+  if (rc != 0) { snprintf(msg, sizeof msg, "fs: `%.*s`: %s", (int)rel->len, rel->data, strerror(errno)); return io_err(2, msg); }
+  return io_ok(NULL);
 }
 static void Cap_print(WStr *s, bool nl) {
   flockfile(stdout);

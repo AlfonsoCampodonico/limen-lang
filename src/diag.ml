@@ -28,7 +28,7 @@ let explanations = [
   "E0007", "An interpolation `{...}` cannot be empty. Write `\\{` for a literal brace.";
   "E0008", "Every function parameter needs a type, for example `fn f(x: Int)`. Vela only infers types inside function bodies.";
   "E0101", "A name was used that is not a local variable, function or enum variant in scope.";
-  "E0102", "A type name is not defined. Built-in types: Int, Float, Bool, Str, List, Array[T, N], Option, Result, IoError, Root, Net, Fs, Stdout, Clock.";
+  "E0102", "A type name is not defined. Built-in types: Int, Float, Bool, Str, List, Array[T, N], Option, Result, IoError, Root, Net, Fs, Stdout, Clock, Listen, Listener, Conn, Rand, Stdin, Env.";
   "E0103", "The struct (or Root) has no field with this name.";
   "E0104", "The enum has no such variant, or the variant name is ambiguous. Qualify it as `Enum.Variant`.";
   "E0105", "The type has no method with this name. User-defined types have no methods in phase 1; write a function that takes the value.";

@@ -4,7 +4,7 @@ let usage =
   {|vela: a small language where I/O needs a capability
 
 usage:
-  vela run FILE [--native] [--grant net=HOST[:PORT]|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST:PORT]...
+  vela run FILE [--native] [--grant net=HOST[:PORT]|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST:PORT]... [--grant env=NAME|*]... [--seed N] [-- ARGS...]
   vela build FILE [-o OUT] [--emit-c]
   vela check FILE [--json]
   vela caps FILE [--json]
@@ -15,7 +15,8 @@ usage:
   vela mcp                (MCP server for coding agents, on stdin/stdout)
   vela spec               (print the language specification)
 
-Stdout and Clock are always granted. Net and Fs exist only when granted.
+Stdout, Stdin, Clock and Rand are always granted. Net, Fs, Listen and Env exist only
+when granted. --seed makes Rand repeatable; arguments after -- are root.args().
 |}
 
 let die_usage msg =
@@ -50,6 +51,12 @@ let parse_grants args =
         { g with fs = Some (real, ro) }
       | Some i when String.sub a 0 i = "listen" ->
         { g with listen = g.listen @ [ String.sub a (i + 1) (String.length a - i - 1) ] }
+      | Some i when String.sub a 0 i = "env" ->
+        { g with env = g.env @ [ String.sub a (i + 1) (String.length a - i - 1) ] }
+      | Some i when String.sub a 0 i = "seed" -> (
+        match int_of_string_opt (String.sub a (i + 1) (String.length a - i - 1)) with
+        | Some n -> { g with seed = Some n }
+        | None -> die_usage "--seed needs an integer")
       | _ -> die_usage ("unknown grant `" ^ a ^ "`"))
     Interp.no_grants args
 
@@ -57,6 +64,9 @@ let rec split_grants = function
   | "--grant" :: g :: rest ->
     let gs, others = split_grants rest in
     (g :: gs, others)
+  | "--seed" :: n :: rest ->
+    let gs, others = split_grants rest in
+    (("seed=" ^ n) :: gs, others)
   | "--grant" :: [] -> die_usage "--grant needs a value"
   | x :: rest ->
     let gs, others = split_grants rest in
@@ -203,7 +213,7 @@ let cmd_build file out emit_c =
       prerr_endline "vela: the C compiler failed (this is a bug in vela)";
       exit 1
 
-let cmd_run_native file grant_args =
+let cmd_run_native file grant_args prog_args =
   ignore (parse_grants grant_args);
   let items = checked file in
   let dir = Filename.get_temp_dir_name () in
@@ -211,14 +221,19 @@ let cmd_run_native file grant_args =
   (match Native.build items exe with
    | Ok () -> ()
    | Error m -> prerr_string m; prerr_endline "vela: the C compiler failed (this is a bug in vela)"; exit 1);
-  let args = List.concat_map (fun g -> [ "--grant"; g ]) grant_args in
+  let args =
+    List.concat_map
+      (fun g -> if String.starts_with ~prefix:"seed=" g then [ "--seed"; String.sub g 5 (String.length g - 5) ] else [ "--grant"; g ])
+      grant_args
+    @ ("--" :: prog_args)
+  in
   let pid = Unix.create_process exe (Array.of_list (exe :: args)) Unix.stdin Unix.stdout Unix.stderr in
   let _, status = Unix.waitpid [] pid in
   List.iter (fun f -> try Sys.remove f with Sys_error _ -> ()) [ exe; exe ^ ".c" ];
   exit (match status with Unix.WEXITED n -> n | _ -> 1)
 
-let cmd_run file grant_args =
-  let grants = parse_grants grant_args in
+let cmd_run file grant_args prog_args =
+  let grants = { (parse_grants grant_args) with args = prog_args } in
   let items, diags, _ = load file in
   if diags <> [] then (report diags; exit 1);
   let out s = print_string s; flush stdout in
@@ -256,9 +271,12 @@ let () =
     | Some t -> print_endline (String.uppercase_ascii code ^ ": " ^ t)
     | None -> die_usage ("unknown error code " ^ code))
   | "run" :: rest -> (
+    (* arguments after `--` go to the program, as `root.args()` *)
+    let rec cut acc = function "--" :: r -> (List.rev acc, r) | x :: r -> cut (x :: acc) r | [] -> (List.rev acc, []) in
+    let rest, prog_args = cut [] rest in
     match split_grants rest with
-    | gs, [ file ] -> cmd_run file gs
-    | gs, ([ "--native"; file ] | [ file; "--native" ]) -> cmd_run_native file gs
+    | gs, [ file ] -> cmd_run file gs prog_args
+    | gs, ([ "--native"; file ] | [ file; "--native" ]) -> cmd_run_native file gs prog_args
     | _ -> die_usage "run needs exactly one FILE")
   | "build" :: rest ->
     let rec go file out emit = function

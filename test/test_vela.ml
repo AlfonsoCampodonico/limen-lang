@@ -99,7 +99,10 @@ let run_native ?(grants = Interp.no_grants) ?modules name src =
     let args =
       List.concat_map (fun h -> [ "--grant"; "net=" ^ h ]) grants.Interp.net
       @ List.concat_map (fun h -> [ "--grant"; "listen=" ^ h ]) grants.Interp.listen
-      @ match grants.fs with Some (d, ro) -> [ "--grant"; "fs=" ^ d ^ if ro then ":ro" else "" ] | None -> []
+      @ List.concat_map (fun n -> [ "--grant"; "env=" ^ n ]) grants.Interp.env
+      @ (match grants.seed with Some s -> [ "--seed"; string_of_int s ] | None -> [])
+      @ (match grants.fs with Some (d, ro) -> [ "--grant"; "fs=" ^ d ^ if ro then ":ro" else "" ] | None -> [])
+      @ ("--" :: grants.args)
     in
     let o = exe ^ ".out" and e = exe ^ ".err" in
     let cmd =
@@ -1066,6 +1069,44 @@ fn main(root: Root) {
   out "std-json-errors"
     "use json\n\nfn main(root: Root) {\n    for s in [\"\\{\\\"a\\\": [1, 2.5e1, \\\"\\\\u0041\\\"]\\}\", \"[1 2]\", \"\\\"\\\\x\\\"\"] {\n        match json.parse(s) {\n            Ok(v) => root.stdout.print(json.stringify(v)),\n            Err(e) => root.stdout.print(e),\n        }\n    }\n}\n"
     "{\"a\":[1,25,\"A\"]}\nexpected `,` or `]` at byte 3\nexpected a valid escape at byte 1\n";
+
+  (* ---------- Rand, Env, args and the Fs additions ---------- *)
+  let box = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "vela-box-%d" (Unix.getpid ())) in
+  (try Unix.mkdir box 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+  let box = Unix.realpath box in
+  Unix.putenv "VELA_TEST_VISIBLE" "yes";
+  Unix.putenv "VELA_TEST_HIDDEN" "no";
+  out "caps-rand-env-args-fs"
+    ~grants:{ Interp.no_grants with seed = Some 42; env = [ "VELA_TEST_VISIBLE" ]; args = [ "one"; "two" ]; fs = Some (box, false) }
+    (String.concat "\n"
+       [ "fn main(root: Root) -> Result[(), IoError] {";
+         "    let out = root.stdout";
+         "    let r = root.rand";
+         "    let xs = [r.int(1, 7), r.int(1, 7), r.int(1, 7), r.int(-5, -4), r.int(0, 1000000)]";
+         "    out.print(\"{xs} {r.float() < 1.0}\")";
+         "    out.print(\"{root.args()} {root.env.get(\"VELA_TEST_VISIBLE\")} {root.env.get(\"VELA_TEST_HIDDEN\")}\")";
+         "    let fs = root.fs";
+         "    fs.make_dir(\"d\")?";
+         "    fs.write(\"d/a.txt\", \"a\")?";
+         "    fs.append(\"d/a.txt\", \"b\")?";
+         "    fs.append(\"d/new.txt\", \"n\")?";
+         "    out.print(\"{fs.list(\"d\")?} {fs.read(\"d/a.txt\")?} {fs.is_dir(\"d\")} {fs.is_dir(\"d/a.txt\")}\")";
+         "    out.print(\"{fs.make_dir(\"d\").is_err()} {fs.remove(\"d\").is_err()} {fs.remove(\"\").is_err()} {fs.list(\"d/a.txt\").is_err()}\")";
+         "    fs.remove(\"d/a.txt\")?";
+         "    fs.remove(\"d/new.txt\")?";
+         "    fs.remove(\"d\")?";
+         "    out.print(\"{fs.exists(\"d\")} {fs.read_only().append(\"x\", \"y\")} {fs.remove(\"../x\")}\")";
+         "    Ok(())";
+         "}";
+         "" ])
+    "[2, 2, 1, -5, 963250] true\n[\"one\", \"two\"] Some(\"yes\") None\n[\"a.txt\", \"new.txt\"] ab true false\ntrue true true true\nfalse Err(Denied(\"fs: this capability is read-only\")) Err(Denied(\"fs: path escapes the granted directory\"))\n";
+  panics "rand-empty-range" (main_wrap "    out.print(\"{root.rand.int(3, 3)}\")") "rand.int: empty range 3..3";
+  errs "interp-escaped-quote" (main_wrap "    out.print(\"{\\\"x\\\".len()}\")\n    out.print(\"later\")") [ "E0006" ];
+  ok "unknown-method-lists-methods"
+    (let _, ds, _ = compile "unknown-method" (main_wrap "    let n = [1].size_of()") in
+     List.exists (fun (d : Diag.t) -> List.exists (fun n -> String.starts_with ~prefix:"`List[Int]` has: " n) d.notes) ds)
+    "no method list";
+  errs "ambient-random" (main_wrap "    let x = random(1, 2)") [ "E0302" ];
 
   (* ---------- modules ---------- *)
   let geom =

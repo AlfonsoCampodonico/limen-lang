@@ -13,6 +13,9 @@ type cap =
   | CListen of string list
   | CListener of sock * int
   | CConn of sock
+  | CRand
+  | CStdin
+  | CEnv of string list
 
 (* A socket that knows when it was closed, so a task waiting on it never
    touches a descriptor number that has been reused. *)
@@ -46,9 +49,31 @@ exception Break_
 exception Continue_
 exception Panic of string * Span.t
 
-type grants = { net : string list; fs : (string * bool) option (* realpath, read-only *); listen : string list }
+type grants = {
+  net : string list;
+  fs : (string * bool) option; (* realpath, read-only *)
+  listen : string list;
+  env : string list; (* variable names, or "*" *)
+  seed : int option; (* makes Rand deterministic *)
+  args : string list; (* command-line arguments after `--` *)
+}
 
-let no_grants = { net = []; fs = None; listen = [] }
+let no_grants = { net = []; fs = None; listen = []; env = []; seed = None; args = [] }
+
+(* Rand: splitmix64, the same generator as the native runtime, so a seed
+   gives the same numbers in both backends. *)
+let rand_state = ref 0L
+
+let rand_next () =
+  rand_state := Int64.add !rand_state 0x9E3779B97F4A7C15L;
+  let z = !rand_state in
+  let z = Int64.mul (Int64.logxor z (Int64.shift_right_logical z 30)) 0xBF58476D1CE4E5B9L in
+  let z = Int64.mul (Int64.logxor z (Int64.shift_right_logical z 27)) 0x94D049BB133111EBL in
+  Int64.logxor z (Int64.shift_right_logical z 31)
+
+let seed_rand = function
+  | Some s -> rand_state := Int64.of_int s
+  | None -> rand_state := Int64.of_float (Unix.gettimeofday () *. 1e6) |> Int64.logxor (Int64.of_int (Unix.getpid ()))
 
 type rt = {
   fns : (string, fn_decl) Hashtbl.t;
@@ -67,6 +92,7 @@ let fmt_float x =
 let cap_name = function
   | CRoot -> "Root" | CNet _ -> "Net" | CFs _ -> "Fs" | CStdout -> "Stdout" | CClock -> "Clock"
   | CListen _ -> "Listen" | CListener _ -> "Listener" | CConn _ -> "Conn"
+  | CRand -> "Rand" | CStdin -> "Stdin" | CEnv _ -> "Env"
 
 let rec show ?(top = true) v =
   match v with
@@ -485,6 +511,9 @@ and field rt v name =
   | VCap CRoot, "stdout" -> VCap CStdout
   | VCap CRoot, "clock" -> VCap CClock
   | VCap CRoot, "listen" -> VCap (CListen rt.grants.listen)
+  | VCap CRoot, "rand" -> VCap CRand
+  | VCap CRoot, "stdin" -> VCap CStdin
+  | VCap CRoot, "env" -> VCap (CEnv rt.grants.env)
   | _ -> failwith ("internal: field " ^ name)
 
 and apply rt fv args sp =
@@ -655,6 +684,10 @@ and call_method rt v name args sp =
     if ch.closed then raise (Panic ("close of a closed channel", sp));
     ch.closed <- true;
     VUnit
+  | VCap CRand, "int", [ VInt lo; VInt hi ] ->
+    if hi <= lo then raise (Panic (sprintf "rand.int: empty range %d..%d" lo hi, sp));
+    let span = Int64.sub (Int64.of_int hi) (Int64.of_int lo) in
+    VInt (lo + Int64.to_int (Int64.unsigned_rem (rand_next ()) span))
   | VCap c, _, _ -> cap_call rt c name args
   | _ -> raise (Panic (sprintf "internal: no method `%s` on %s" name (show ~top:false v), sp))
 
@@ -665,6 +698,21 @@ and cap_call rt c name args =
   | CStdout, "print", [ VStr s ] -> rt.out (s ^ "\n"); VUnit
   | CStdout, "write", [ VStr s ] -> rt.out s; VUnit
   | CClock, "now_ms", [] -> VInt (int_of_float (Unix.gettimeofday () *. 1000.))
+  | CRand, "float", [] -> VFloat (Int64.to_float (Int64.shift_right_logical (rand_next ()) 11) *. 0x1p-53)
+  | CStdin, "read_line", [] -> (
+    match In_channel.input_line stdin with
+    | Some l -> some (VStr (if String.ends_with ~suffix:"\r" l then String.sub l 0 (String.length l - 1) else l))
+    | None -> none)
+  | CStdin, "read_all", [] -> VStr (In_channel.input_all stdin)
+  | CEnv names, "get", [ VStr n ] ->
+    if List.mem "*" names || List.mem n names then match Sys.getenv_opt n with Some v -> some (VStr v) | None -> none
+    else none
+  | CRoot, "args", [] -> VList (Array.of_list (List.map (fun a -> VStr a) rt.grants.args))
+  | CFs fs, "append", [ VStr p; VStr data ] -> io_result (fun () -> VUnit) (Caps.append fs p data)
+  | CFs fs, "list", [ VStr p ] -> io_result (fun l -> VList (Array.of_list (List.map (fun s -> VStr s) l))) (Caps.list fs p)
+  | CFs fs, "remove", [ VStr p ] -> io_result (fun () -> VUnit) (Caps.remove fs p)
+  | CFs fs, "make_dir", [ VStr p ] -> io_result (fun () -> VUnit) (Caps.make_dir fs p)
+  | CFs fs, "is_dir", [ VStr p ] -> VBool (Caps.is_dir fs p)
   | CNet allowed, "only", [ VStr h ] -> VCap (CNet (Caps.attenuate allowed h))
   | CNet allowed, "get", [ VStr url ] -> io_result (fun s -> VStr s) (Caps.net_get allowed url)
   | CFs fs, "under", [ VStr p ] -> VCap (CFs (Caps.under fs p))
@@ -683,6 +731,7 @@ and cap_call rt c name args =
 
 (* Run `main`. Returns its value, or the panic message and location. *)
 let run ~out ~grants (user_items : item list) : (value, string * Span.t) result =
+  seed_rand grants.seed;
   let rt =
     { fns = Hashtbl.create 16; structs = Hashtbl.create 16; enums = Hashtbl.create 16;
       ctors = Hashtbl.create 16; out; grants }

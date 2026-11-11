@@ -164,3 +164,46 @@ let write fs rel data : (unit, ioerr) result =
       with Sys_error m -> Error (Failed m))
 
 let exists fs rel = match resolve fs rel ~for_write:false with Ok p -> Sys.file_exists p | Error _ -> false
+
+let read_only_err = Denied "fs: this capability is read-only"
+
+let append fs rel data : (unit, ioerr) result =
+  if fs.root <> None && fs.ro then Error read_only_err
+  else
+    match resolve fs rel ~for_write:true with
+    | Error e -> Error e
+    | Ok p -> (
+      try
+        Ok (Out_channel.with_open_gen [ Open_wronly; Open_append; Open_creat; Open_binary ] 0o644 p (fun oc ->
+                Out_channel.output_string oc data))
+      with Sys_error m -> Error (Failed m))
+
+(* Names in a directory, sorted, without `.` and `..`. *)
+let list fs rel : (string list, ioerr) result =
+  match resolve fs rel ~for_write:false with
+  | Error e -> Error e
+  | Ok p -> (
+    try Ok (List.sort compare (Array.to_list (Sys.readdir p)))
+    with Sys_error _ -> Error (Failed (sprintf "fs: `%s` is not a directory" rel)))
+
+let is_dir fs rel = match resolve fs rel ~for_write:false with Ok p -> (try Sys.is_directory p with Sys_error _ -> false) | Error _ -> false
+
+(* A file or an empty directory; never the granted directory itself. *)
+let remove fs rel : (unit, ioerr) result =
+  if fs.root <> None && fs.ro then Error read_only_err
+  else
+    match resolve fs rel ~for_write:false with
+    | Error e -> Error e
+    | Ok p when Some p = fs.root -> Error (Denied "fs: cannot remove the granted directory itself")
+    | Ok p -> (
+      try if Sys.is_directory p then Unix.rmdir p else Unix.unlink p; Ok ()
+      with Unix.Unix_error (e, _, _) -> Error (Failed (sprintf "fs: `%s`: %s" rel (Unix.error_message e))))
+
+let make_dir fs rel : (unit, ioerr) result =
+  if fs.root <> None && fs.ro then Error read_only_err
+  else
+    match resolve fs rel ~for_write:true with
+    | Error e -> Error e
+    | Ok p -> (
+      try Unix.mkdir p 0o755; Ok ()
+      with Unix.Unix_error (e, _, _) -> Error (Failed (sprintf "fs: `%s`: %s" rel (Unix.error_message e))))

@@ -232,15 +232,20 @@ The native backend implements this with reference counting and copy-on-write. A 
 
 ## 9. Capabilities
 
-`Root` has five fields, each a capability:
+`Root` has eight fields, each a capability, and one method:
 
 | Field | Type | Granted |
 | --- | --- | --- |
 | `root.stdout` | `Stdout` | always |
+| `root.stdin` | `Stdin` | always |
 | `root.clock` | `Clock` | always |
+| `root.rand` | `Rand` | always; `--seed N` makes the numbers repeatable, the same in both backends |
+| `root.env` | `Env` | only with `--grant env=NAME` (repeatable) or `--grant env=*`; other variables read as `None` |
 | `root.net` | `Net` | only with `--grant net=HOST[:PORT]` (repeatable) or `--grant net=*` |
 | `root.fs` | `Fs` | only with `--grant fs=DIR` or `--grant fs=DIR:ro` |
 | `root.listen` | `Listen` | only with `--grant listen=HOST[:PORT]` (repeatable) |
+
+`root.args()` is the `List[Str]` of command-line arguments after `--`: `vela run app.vela -- a b`.
 
 An ungranted `Net`, `Fs` or `Listen` still exists, but every operation on it returns `Err(Denied(...))`. `Listener` and `Conn` are capabilities too: you get them from `Listen.on`, `Listener.accept` and `Net.connect`.
 
@@ -414,6 +419,11 @@ Strings compare byte by byte, so `c >= "a" && c <= "z"` tests a one-byte string.
 | `Stdout` | `print(s)` | `()`, writes `s` and a newline |
 | `Stdout` | `write(s)` | `()`, writes `s` |
 | `Clock` | `now_ms()` | `Int`, milliseconds since the Unix epoch |
+| `Rand` | `int(lo, hi)` | `Int` in `lo` up to but not including `hi`; panics if `hi <= lo` |
+| `Rand` | `float()` | `Float` in [0, 1) |
+| `Stdin` | `read_line()` | `Option[Str]`, without the newline; `None` at the end of input |
+| `Stdin` | `read_all()` | `Str`, the rest of the input |
+| `Env` | `get(name)` | `Option[Str]`; `None` if unset or not granted |
 | `Net` | `get(url)` | `Result[Str, IoError]`, the response body; a non-2xx status is `Failed` |
 | `Net` | `only(host)` | `Net`; `host` is `name`, `name:port` or `*` |
 | `Net` | `connect(addr)` | `Result[Conn, IoError]`; `addr` is `host:port` |
@@ -425,7 +435,11 @@ Strings compare byte by byte, so `c >= "a" && c <= "z"` tests a one-byte string.
 | `Conn` | `write(s)` | `Result[(), IoError]` |
 | `Fs` | `read(path)` | `Result[Str, IoError]` |
 | `Fs` | `write(path, text)` | `Result[(), IoError]` |
-| `Fs` | `exists(path)` | `Bool` |
+| `Fs` | `append(path, text)` | `Result[(), IoError]`, creating the file if needed |
+| `Fs` | `list(dir)` | `Result[List[Str], IoError]`, names sorted, without `.` and `..`; `""` is the granted directory |
+| `Fs` | `make_dir(path)` | `Result[(), IoError]`; the parent must exist |
+| `Fs` | `remove(path)` | `Result[(), IoError]`, a file or an empty directory, never the granted directory itself |
+| `Fs` | `exists(path)`, `is_dir(path)` | `Bool` |
 | `Fs` | `under(dir)`, `read_only()` | `Fs` |
 
 ## 12. Tests
@@ -593,7 +607,7 @@ fetch = { path = "../fetch", caps = ["net"] }
 ```
 
 - A dependency is a directory holding `NAME.vela`, plus any modules that file uses from the same directory.
-- `caps` lists what the dependency may use: `net` (Net and Conn), `listen` (Listen, Listener and Conn), `fs`, `stdout`, `clock`. The default is none. No dependency can take `Root`.
+- `caps` lists what the dependency may use: `net` (Net and Conn), `listen` (Listen, Listener and Conn), `fs`, `stdout`, `stdin`, `clock`, `rand`, `env`. The default is none. No dependency can take `Root`.
 - Vela has no ambient authority, so a function can only use a capability that reaches it as a parameter. The checker therefore knows everything a dependency can ever do from its signatures, and rejects the program (E0320) if a dependency's function takes a capability it was not granted. Granting is still only an upper bound: at run time the dependency gets exactly the capabilities you pass it, which can be narrowed with `only` and `under`.
 - Only local paths are supported; there is no registry, versioning or lock file yet.
 

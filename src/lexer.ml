@@ -163,6 +163,10 @@ let lex ?(base = 0) file (src : string) : token array =
              | '{' -> incr depth; incr i
              | '}' -> decr depth; incr i
              | '"' -> i := skip_string src !i (fun () -> fail "E0002" open_at n "unterminated string literal")
+             | '\\' ->
+               (* code has no backslashes, so this is an escaped quote meant for a nested string *)
+               fail "E0006" !i (!i + 2)
+                 "a `\\` inside `{...}`: an interpolation holds code, so a string in it uses plain quotes, as in `\"{f(\"x\")}\"`"
              | _ -> incr i)
           done;
           let inner = String.sub src start (!i - 1 - start) in

@@ -45,7 +45,7 @@ dune exec vela -- build examples/repos.vela -o repos && ./repos --grant net=api.
 
 | Command | What it does |
 | --- | --- |
-| `vela run FILE [--native] [--grant net=HOST[:PORT]\|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST[:PORT]]...` | Type-check, then run `main` in the interpreter, or compiled with `--native`. Stdout and Clock are always granted; Net, Fs and Listen only when granted. |
+| `vela run FILE [--native] [--grant net=HOST[:PORT]\|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST[:PORT]]... [--grant env=NAME\|*]... [--seed N] [-- ARGS...]` | Type-check, then run `main` in the interpreter, or compiled with `--native`. Stdout, Stdin, Clock and Rand are always granted; Net, Fs, Listen and Env only when granted. `--seed` makes `Rand` repeatable; arguments after `--` are `root.args()`. |
 | `vela build FILE [-o OUT] [--emit-c]` | Compile to a native binary through C. The binary takes the same `--grant` flags. `--emit-c` writes the C instead. |
 | `vela check FILE [--json]` | Type-check only. `--json` emits diagnostics with codes, spans, notes and machine-applicable fixes. |
 | `vela caps FILE [--json]` | List each function's authority: the capabilities in its signature, or `pure`. |
@@ -83,7 +83,7 @@ With VS Code, any generic LSP client extension works: point it at `vela lsp` for
 
 ## Capability rules
 
-- `Root` holds `net`, `fs`, `stdout` and `clock`. Only the runtime creates capabilities.
+- `Root` holds `net`, `fs`, `listen`, `env`, `stdout`, `stdin`, `clock` and `rand`. Only the runtime creates capabilities.
 - Attenuation only narrows: `net.only(host)`, `fs.under(dir)`, `fs.read_only()`. Asking for more than you hold gives an empty capability.
 - Capabilities and function types cannot be stored in struct or enum fields (E0301, E0304), so authority always shows up in signatures. Generic instantiations like `Box[Net]` are allowed because the capability is visible in the type.
 - A function with no capability or function-typed parameters is pure.

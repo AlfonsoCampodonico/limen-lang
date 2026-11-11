@@ -388,6 +388,27 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     | "cap_print", TCap Stdout -> line (sprintf "Cap_print(%s, true);" (arg 1)); set "0"
     | "cap_write", TCap Stdout -> line (sprintf "Cap_print(%s, false);" (arg 1)); set "0"
     | "cap_now_ms", _ -> set "Cap_now_ms()"
+    | "cap_int", TCap Rand -> set (sprintf "Cap_rand_int(%s, %s, %s)" (arg 1) (arg 2) (where sp))
+    | "cap_float", TCap Rand -> set "Cap_rand_float()"
+    | "cap_args", TCap Root -> set "Cap_args()"
+    | "cap_read_line", TCap Stdin ->
+      line "{";
+      line "  bool ok_;";
+      line "  WStr *s_ = Cap_stdin_line(&ok_);";
+      line (sprintf "  %s = ok_ ? %s : %s;" dst (mk_enum c t 0 [ "s_" ]) (mk_enum c t 1 []));
+      line "}"
+    | "cap_read_all", TCap Stdin -> set "Cap_stdin_all()"
+    | "cap_get", TCap Env ->
+      line "{";
+      line "  bool ok_;";
+      line (sprintf "  WStr *s_ = Cap_env_get(%s, %s, &ok_);" (arg 0) (arg 1));
+      line (sprintf "  %s = ok_ ? %s : %s;" dst (mk_enum c t 0 [ "s_" ]) (mk_enum c t 1 []));
+      line "}"
+    | "cap_append", TCap Fs -> io_result (sprintf "Cap_fs_append(%s, %s, %s)" (arg 0) (arg 1) (arg 2)) "0"
+    | "cap_list", TCap Fs -> io_result (sprintf "Cap_fs_list(%s, %s)" (arg 0) (arg 1)) "(L_Str*)r_.ptr"
+    | "cap_remove", TCap Fs -> io_result (sprintf "Cap_fs_remove(%s, %s)" (arg 0) (arg 1)) "0"
+    | "cap_make_dir", TCap Fs -> io_result (sprintf "Cap_fs_make_dir(%s, %s)" (arg 0) (arg 1)) "0"
+    | "cap_is_dir", TCap Fs -> set (sprintf "Cap_fs_is_dir(%s, %s)" (arg 0) (arg 1))
     | "cap_only", _ -> set (sprintf "Cap_net_only(%s, %s)" (arg 0) (arg 1))
     | "cap_get", _ -> io_result (sprintf "Cap_net_get(%s, %s)" (arg 0) (arg 1)) "r_.val"
     | "cap_under", _ -> set (sprintf "Cap_fs_under(%s, %s)" (arg 0) (arg 1))

@@ -1,6 +1,6 @@
 (* vela mcp: a Model Context Protocol server on stdin/stdout (one JSON-RPC
    message per line). Gives a coding agent the compiler's tools and the
-   spec. Programs run with no grants: only Stdout and Clock exist, so code an
+   spec. Programs run with no grants: only Stdout, Clock and Rand are useful (stdin is empty), so code an
    agent just wrote cannot touch files or the network. *)
 module J = Json
 
@@ -23,7 +23,7 @@ let tools =
   [ tool "vela_spec" "The Vela language specification (SPEC.md). Read this before writing Vela." [] [];
     tool "vela_check" "Type-check a Vela program. Returns \"ok\" or diagnostics as JSON, with error codes, positions, notes and machine-applicable fixes." [ source_p ] [ "source" ];
     tool "vela_run"
-      "Run a Vela program and return its exit status, stdout and stderr. The program gets no grants: only root.stdout and root.clock work; file and network access are denied. Stops after timeout_seconds (default 10)."
+      "Run a Vela program and return its exit status, stdout and stderr. The program gets no grants: only root.stdout, root.clock and root.rand work, and stdin is empty; file and network access are denied. Stops after timeout_seconds (default 10)."
       [ source_p; ("native", bool_prop "Compile to native code instead of interpreting (default false)");
         ("timeout_seconds", int_prop "Time limit, 1 to 60") ]
       [ "source" ];

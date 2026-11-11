@@ -74,7 +74,7 @@ let unify_at ctx span want got =
   try unify want got
   with Mismatch -> err ctx "E0201" span (sprintf "expected `%s`, found `%s`" (show want) (show got))
 
-let builtin_types = [ "Int"; "Float"; "Bool"; "Str"; "List"; "Array"; "Chan"; "Root"; "Net"; "Fs"; "Stdout"; "Clock"; "Listen"; "Listener"; "Conn" ]
+let builtin_types = [ "Int"; "Float"; "Bool"; "Str"; "List"; "Array"; "Chan"; "Root"; "Net"; "Fs"; "Stdout"; "Clock"; "Listen"; "Listener"; "Conn"; "Rand"; "Stdin"; "Env" ]
 
 (* Names other languages use for ambient I/O, mapped to the capability way. *)
 let ambient =
@@ -83,7 +83,9 @@ let ambient =
     ("open", "Fs", "fs.read(path)"); ("read_file", "Fs", "fs.read(path)");
     ("write_file", "Fs", "fs.write(path, text)"); ("fetch", "Net", "net.get(url)");
     ("http_get", "Net", "net.get(url)"); ("now", "Clock", "clock.now_ms()");
-    ("time", "Clock", "clock.now_ms()") ]
+    ("time", "Clock", "clock.now_ms()"); ("random", "Rand", "rand.int(lo, hi)");
+    ("rand", "Rand", "rand.int(lo, hi)"); ("input", "Stdin", "stdin.read_line()");
+    ("read_line", "Stdin", "stdin.read_line()"); ("getenv", "Env", "env.get(name)") ]
 
 (* ---------- type expressions ---------- *)
 
@@ -125,6 +127,9 @@ let rec resolve ctx env (te : ty_expr) : ty =
     | "Listen" -> simple (TCap Listen)
     | "Listener" -> simple (TCap Listener)
     | "Conn" -> simple (TCap Conn)
+    | "Rand" -> simple (TCap Rand)
+    | "Stdin" -> simple (TCap Stdin)
+    | "Env" -> simple (TCap Env)
     | "Chan" -> if want 1 then TChan (List.hd args') else TErr
     | _ -> (
       match List.assoc_opt n env with
@@ -240,13 +245,21 @@ let methods (t : ty) : (string * (unit -> ty list * ty)) list =
   | TCap Conn -> [ m "read" [] (res TStr io_err); m "write" [ TStr ] (res TUnit io_err); m "close" [] TUnit ]
   | TCap Fs ->
     [ m "read" [ TStr ] (res TStr io_err); m "write" [ TStr; TStr ] (res TUnit io_err);
+      m "append" [ TStr; TStr ] (res TUnit io_err); m "list" [ TStr ] (res (TList TStr) io_err);
+      m "remove" [ TStr ] (res TUnit io_err); m "make_dir" [ TStr ] (res TUnit io_err);
+      m "is_dir" [ TStr ] TBool;
       m "exists" [ TStr ] TBool; m "under" [ TStr ] (TCap Fs); m "read_only" [] (TCap Fs) ]
   | TCap Stdout -> [ m "print" [ TStr ] TUnit; m "write" [ TStr ] TUnit ]
   | TCap Clock -> [ m "now_ms" [] TInt ]
+  | TCap Rand -> [ m "int" [ TInt; TInt ] TInt; m "float" [] TFloat ]
+  | TCap Stdin -> [ m "read_line" [] (opt TStr); m "read_all" [] TStr ]
+  | TCap Env -> [ m "get" [ TStr ] (opt TStr) ]
+  | TCap Root -> [ m "args" [] (TList TStr) ]
   | TChan a -> [ m "send" [ a ] TUnit; m "recv" [] (opt a); m "close" [] TUnit ]
   | _ -> []
 
-let root_fields = [ ("net", TCap Net); ("fs", TCap Fs); ("stdout", TCap Stdout); ("clock", TCap Clock); ("listen", TCap Listen) ]
+let root_fields = [ ("net", TCap Net); ("fs", TCap Fs); ("stdout", TCap Stdout); ("clock", TCap Clock); ("listen", TCap Listen);
+    ("rand", TCap Rand); ("stdin", TCap Stdin); ("env", TCap Env) ]
 
 (* ---------- expressions ---------- *)
 
@@ -514,9 +527,14 @@ and check_method_value ctx f recv name nsp args =
           [ sprintf "`%s` is a field; access it without parentheses" name ]
         | TCap Root when List.mem_assoc name root_fields ->
           [ sprintf "`%s` is a field of `Root`; write `root.%s`" name name ]
-        | TNamed _ ->
-          [ "user-defined types have no methods in phase 1; write a function that takes the value instead" ]
+        | TNamed _ when ms = [] ->
+          [ "user-defined types have no methods; write a function that takes the value instead" ]
         | _ -> []
+      in
+      let notes =
+        if ms <> [] && suggest name (List.map fst ms) = None then
+          notes @ [ sprintf "`%s` has: %s" (show rt) (String.concat ", " (List.sort_uniq compare (List.map fst ms))) ]
+        else notes
       in
       did_you_mean ctx ~notes "E0105" nsp
         (sprintf "no method `%s` on type `%s`" name (show rt))

@@ -19,7 +19,7 @@
 type dep = { dname : string; dir : string; caps : string list; dspan : Span.t }
 type t = { pname : string; file : string; deps : dep list }
 
-let cap_grants = [ "net"; "fs"; "listen"; "stdout"; "clock" ]
+let cap_grants = [ "net"; "fs"; "listen"; "stdout"; "clock"; "rand"; "stdin"; "env" ]
 
 (* The grant that covers a capability type. *)
 let grant_of (c : Types.cap) =
@@ -30,6 +30,9 @@ let grant_of (c : Types.cap) =
   | Fs -> [ "fs" ]
   | Stdout -> [ "stdout" ]
   | Clock -> [ "clock" ]
+  | Rand -> [ "rand" ]
+  | Stdin -> [ "stdin" ]
+  | Env -> [ "env" ]
   | Root -> []
 
 exception Bad of Span.t * string
