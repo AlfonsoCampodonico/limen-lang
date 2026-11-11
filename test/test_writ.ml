@@ -64,6 +64,7 @@ let run_native ?(grants = Interp.no_grants) name src =
   | Ok () ->
     let args =
       List.concat_map (fun h -> [ "--grant"; "net=" ^ h ]) grants.Interp.net
+      @ List.concat_map (fun h -> [ "--grant"; "listen=" ^ h ]) grants.Interp.listen
       @ match grants.fs with Some (d, ro) -> [ "--grant"; "fs=" ^ d ^ if ro then ":ro" else "" ] | None -> []
     in
     let o = exe ^ ".out" and e = exe ^ ".err" in
@@ -99,7 +100,9 @@ let check_tsan name ?(grants = Interp.no_grants) src want =
     | Error m -> ok (name ^ "/tsan") false ("C compile failed:\n" ^ m)
     | Ok () ->
       let args =
-        match grants.Interp.fs with Some (d, ro) -> [ "--grant"; "fs=" ^ d ^ if ro then ":ro" else "" ] | None -> []
+        (match grants.Interp.fs with Some (d, ro) -> [ "--grant"; "fs=" ^ d ^ if ro then ":ro" else "" ] | None -> [])
+        @ List.concat_map (fun h -> [ "--grant"; "net=" ^ h ]) grants.Interp.net
+        @ List.concat_map (fun h -> [ "--grant"; "listen=" ^ h ]) grants.Interp.listen
       in
       let o = exe ^ ".out" and e = exe ^ ".err" in
       let cmd =
@@ -501,9 +504,83 @@ fn area(s: Shape) -> Float { match s { Dot => 0.0, Box(w, h) => w * h } }
     }
     out.print("{total.sum()}")|})
     "499500\n";
+  (* ---------- sockets: an echo server and 50 clients in one program ---------- *)
+  let sock_grants = { Interp.no_grants with net = [ "127.0.0.1" ]; listen = [ "127.0.0.1" ] } in
+  par "socket-echo" ~grants:sock_grants
+    ({|fn echo(c: Conn) -> Int {
+    let mut total = 0
+    let mut more = true
+    while more {
+        match c.read() {
+            Ok(s) => {
+                if s.is_empty() {
+                    more = false
+                } else {
+                    total = total + s.len()
+                    c.write(s).unwrap_or(())
+                }
+            },
+            Err(_) => { more = false },
+        }
+    }
+    c.close()
+    total
+}
+
+fn client(net: Net, port: Int, k: Int) -> Int {
+    match net.connect("127.0.0.1:{port}") {
+        Ok(c) => {
+            let msg = "hello {k}"
+            c.write(msg).unwrap_or(())
+            let got = c.read().unwrap_or("?")
+            c.close()
+            if got == msg { 1 } else { 0 }
+        },
+        Err(_) => 0,
+    }
+}
+|}
+    ^ main_wrap {|    match root.listen.on("127.0.0.1:0") {
+        Ok(l) => {
+            let port = l.port()
+            let net = root.net.only("127.0.0.1")
+            let n = 50
+            let rs = group g {
+                g.go(|| {
+                    let served = group h {
+                        let mut i = 0
+                        while i < n {
+                            match l.accept() {
+                                Ok(c) => h.go(|| echo(c)),
+                                Err(_) => {},
+                            }
+                            i = i + 1
+                        }
+                    }
+                    served.sum()
+                })
+                let mut k = 0
+                while k < n {
+                    let j = k
+                    g.go(|| client(net, port, j))
+                    k = k + 1
+                }
+            }
+            l.close()
+            out.print("bytes {rs[0]}, echoes {rs.skip(1).sum()}")
+        },
+        Err(e) => out.print("{e}"),
+    }|})
+    "bytes 390, echoes 50\n";
+  out "socket-denied"
+    (main_wrap {|    out.print("{root.listen.on("127.0.0.1:9").is_err()} {root.net.connect("127.0.0.1:9").is_err()}")
+    match root.listen.on("127.0.0.1:9") { Ok(_) => out.print("?"), Err(e) => out.print("{e}") }
+    match root.net.connect("127.0.0.1:9") { Ok(_) => out.print("?"), Err(e) => out.print("{e}") }|})
+    "true true\nDenied(\"listen: 127.0.0.1:9 is not granted\")\nDenied(\"net: 127.0.0.1:9 is not granted\")\n";
   panics "chan-deadlock" (main_wrap "    let c: Chan[Int] = channel(1)\n    c.send(1)\n    c.send(2)") "all tasks are blocked (deadlock)";
   panics "chan-send-closed" (main_wrap "    let c: Chan[Int] = channel(1)\n    c.close()\n    c.send(1)") "send on a closed channel";
   panics "chan-capacity" (main_wrap "    let c: Chan[Int] = channel(0)") "channel capacity must be at least 1";
+  errs "group-handle-assign" (main_wrap "    let r = group g { g = 1 }") [ "E0310" ];
   errs "chan-in-struct" "struct S { c: Chan[Int] }\nfn main(root: Root) {}" [ "E0305" ];
   panics "div-zero" (main_wrap "    let z = 0\n    out.print(\"{1 / z}\")") "division by zero";
   panics "index-oob" (main_wrap "    let xs = [1]\n    out.print(\"{xs[3]}\")") "index 3 is out of range for a list of length 1";

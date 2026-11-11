@@ -74,7 +74,7 @@ let unify_at ctx span want got =
   try unify want got
   with Mismatch -> err ctx "E0201" span (sprintf "expected `%s`, found `%s`" (show want) (show got))
 
-let builtin_types = [ "Int"; "Float"; "Bool"; "Str"; "List"; "Array"; "Chan"; "Root"; "Net"; "Fs"; "Stdout"; "Clock" ]
+let builtin_types = [ "Int"; "Float"; "Bool"; "Str"; "List"; "Array"; "Chan"; "Root"; "Net"; "Fs"; "Stdout"; "Clock"; "Listen"; "Listener"; "Conn" ]
 
 (* Names other languages use for ambient I/O, mapped to the capability way. *)
 let ambient =
@@ -122,6 +122,9 @@ let rec resolve ctx env (te : ty_expr) : ty =
     | "Fs" -> simple (TCap Fs)
     | "Stdout" -> simple (TCap Stdout)
     | "Clock" -> simple (TCap Clock)
+    | "Listen" -> simple (TCap Listen)
+    | "Listener" -> simple (TCap Listener)
+    | "Conn" -> simple (TCap Conn)
     | "Chan" -> if want 1 then TChan (List.hd args') else TErr
     | _ -> (
       match List.assoc_opt n env with
@@ -227,7 +230,10 @@ let methods (t : ty) : (string * (unit -> ty list * ty)) list =
   | TNamed ("Result", [ a; e ]) ->
     [ m "is_ok" [] TBool; m "is_err" [] TBool; m "unwrap_or" [ a ] a;
       ("map_err", fun () -> let u = fresh () in ([ TFn ([ e ], u) ], res a u)) ]
-  | TCap Net -> [ m "get" [ TStr ] (res TStr io_err); m "only" [ TStr ] (TCap Net) ]
+  | TCap Net -> [ m "get" [ TStr ] (res TStr io_err); m "only" [ TStr ] (TCap Net); m "connect" [ TStr ] (res (TCap Conn) io_err) ]
+  | TCap Listen -> [ m "on" [ TStr ] (res (TCap Listener) io_err) ]
+  | TCap Listener -> [ m "accept" [] (res (TCap Conn) io_err); m "port" [] TInt; m "close" [] TUnit ]
+  | TCap Conn -> [ m "read" [] (res TStr io_err); m "write" [ TStr ] (res TUnit io_err); m "close" [] TUnit ]
   | TCap Fs ->
     [ m "read" [ TStr ] (res TStr io_err); m "write" [ TStr; TStr ] (res TUnit io_err);
       m "exists" [ TStr ] TBool; m "under" [ TStr ] (TCap Fs); m "read_only" [] (TCap Fs) ]
@@ -236,7 +242,7 @@ let methods (t : ty) : (string * (unit -> ty list * ty)) list =
   | TChan a -> [ m "send" [ a ] TUnit; m "recv" [] (opt a); m "close" [] TUnit ]
   | _ -> []
 
-let root_fields = [ ("net", TCap Net); ("fs", TCap Fs); ("stdout", TCap Stdout); ("clock", TCap Clock) ]
+let root_fields = [ ("net", TCap Net); ("fs", TCap Fs); ("stdout", TCap Stdout); ("clock", TCap Clock); ("listen", TCap Listen) ]
 
 (* ---------- expressions ---------- *)
 
@@ -539,7 +545,8 @@ and check_place ctx f e =
       | KParam ->
         err ctx "E0205" e.espan (sprintf "cannot modify parameter `%s`" n)
           ~notes:[ sprintf "parameters are immutable; make a copy with `let mut %s = %s`" n n ]
-      | KPat -> err ctx "E0205" e.espan (sprintf "cannot modify `%s`, pattern and loop bindings are immutable" n))
+      | KPat -> err ctx "E0205" e.espan (sprintf "cannot modify `%s`, pattern and loop bindings are immutable" n)
+      | KGroup -> err ctx "E0310" e.espan (sprintf "`%s` is a group handle; the only thing you can do with it is `%s.go(...)`" n n))
     | Some _ -> ()
     | None -> err ctx "E0209" e.espan "this cannot be assigned to")
   | EField (r, _, _) | EIndex (r, _) -> check_place ctx f r
@@ -824,7 +831,8 @@ and check_stmt ctx f s : bool =
     false
   | SAssign (lhs, rhs) ->
     check_place ctx f lhs;
-    let lt = check_expr ctx f lhs in
+    let is_group = match lhs.edesc with EVar n -> (match lookup f n with Some (v, _) -> v.vkind = KGroup | None -> false) | _ -> false in
+    let lt = if is_group then TErr else check_expr ctx f lhs in
     expect ctx f rhs lt;
     false
   | SExpr e -> ignore (check_expr ctx f e); false

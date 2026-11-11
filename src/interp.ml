@@ -4,7 +4,15 @@ open Ast
 
 let sprintf = Printf.sprintf
 
-type cap = CRoot | CNet of string list | CFs of Caps.fs | CStdout | CClock
+type cap =
+  | CRoot
+  | CNet of string list
+  | CFs of Caps.fs
+  | CStdout
+  | CClock
+  | CListen of string list
+  | CListener of Unix.file_descr * int
+  | CConn of Unix.file_descr
 
 type value =
   | VInt of int
@@ -33,9 +41,9 @@ exception Break_
 exception Continue_
 exception Panic of string * Span.t
 
-type grants = { net : string list; fs : (string * bool) option (* realpath, read-only *) }
+type grants = { net : string list; fs : (string * bool) option (* realpath, read-only *); listen : string list }
 
-let no_grants = { net = []; fs = None }
+let no_grants = { net = []; fs = None; listen = [] }
 
 type rt = {
   fns : (string, fn_decl) Hashtbl.t;
@@ -53,6 +61,7 @@ let fmt_float x =
 
 let cap_name = function
   | CRoot -> "Root" | CNet _ -> "Net" | CFs _ -> "Fs" | CStdout -> "Stdout" | CClock -> "Clock"
+  | CListen _ -> "Listen" | CListener _ -> "Listener" | CConn _ -> "Conn"
 
 let rec show ?(top = true) v =
   match v with
@@ -184,6 +193,7 @@ type io_wait = (Unix.file_descr * bool) option (* descriptor, true = wait for wr
 type _ Effect.t += Block : (unit -> bool) * io_wait -> unit Effect.t
 
 let runq : ((unit -> bool) * io_wait * (unit -> unit)) Queue.t = Queue.create ()
+let io_epoch = ref 0 (* advances after each round of waiting for I/O *)
 
 let wait_until ?io cond = if not (cond ()) then Effect.perform (Block (cond, io))
 
@@ -213,12 +223,114 @@ let rec schedule finished sp =
     if not (pick 0) then begin
       let waits = Queue.fold (fun acc (_, io, _) -> match io with Some w -> w :: acc | None -> acc) [] runq in
       if waits = [] then raise (Panic ("all tasks are blocked (deadlock)", sp));
-      let rd = List.filter_map (fun (fd, w) -> if w then None else Some fd) waits in
-      let wr = List.filter_map (fun (fd, w) -> if w then Some fd else None) waits in
-      ignore (Unix.select rd wr [] (-1.))
+      (* select() cannot watch descriptors past FD_SETSIZE; then just pause
+         briefly. Either way, waiting tasks retry their operation. *)
+      let small = List.for_all (fun (fd, _) -> (Obj.magic fd : int) < 1000) waits in
+      (if small then
+         let rd = List.filter_map (fun (fd, w) -> if w then None else Some fd) waits in
+         let wr = List.filter_map (fun (fd, w) -> if w then Some fd else None) waits in
+         ignore (Unix.select rd wr [] (-1.))
+       else Unix.sleepf 0.001);
+      incr io_epoch
     end;
     schedule finished sp
   end
+
+(* ---------- sockets ----------
+   Non-blocking sockets; a task that would block waits in the scheduler. *)
+module Sock = struct
+  (* retry after the scheduler's next round of waiting for I/O *)
+  let wait fd write =
+    let e = !io_epoch in
+    wait_until ~io:(fd, write) (fun () -> !io_epoch > e)
+  let failed e = Error (Caps.Failed (Unix.error_message e))
+
+  (* "host:port" with a host of [A-Za-z0-9.-] and a port 0..65535 *)
+  let parse_addr addr =
+    match String.split_on_char ':' addr with
+    | [ h; p ]
+      when h <> "" && String.for_all (fun c -> (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c = '.' || c = '-') h
+           && p <> "" && String.length p <= 5 && String.for_all (fun c -> c >= '0' && c <= '9') p
+           && int_of_string p <= 65535 ->
+      Some (String.lowercase_ascii h, int_of_string p)
+    | _ -> None
+
+  let resolve h =
+    if h = "localhost" then Some Unix.inet_addr_loopback
+    else
+      try Some (Unix.inet_addr_of_string h)
+      with Failure _ -> ( try Some (Unix.gethostbyname h).Unix.h_addr_list.(0) with Not_found | Invalid_argument _ -> None)
+
+  let listen allowed addr =
+    match parse_addr addr with
+    | None -> Error (Caps.Failed "address must be HOST:PORT")
+    | Some (h, port) ->
+      if not (Caps.permits allowed ~host:h ~port) then Error (Caps.Denied (Printf.sprintf "listen: %s:%d is not granted" h port))
+      else (
+        match resolve h with
+        | None -> Error (Caps.Failed ("cannot resolve " ^ h))
+        | Some ip -> (
+          let fd = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+          try
+            Unix.setsockopt fd Unix.SO_REUSEADDR true;
+            Unix.bind fd (Unix.ADDR_INET (ip, port));
+            Unix.listen fd 4096;
+            Unix.set_nonblock fd;
+            let p = match Unix.getsockname fd with Unix.ADDR_INET (_, p) -> p | _ -> port in
+            Ok (fd, p)
+          with Unix.Unix_error (e, _, _) -> Unix.close fd; failed e))
+
+  let rec accept fd =
+    match Unix.accept ~cloexec:true fd with
+    | c, _ -> Unix.set_nonblock c; Ok c
+    | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EINTR), _, _) -> wait fd false; accept fd
+    | exception Unix.Unix_error (e, _, _) -> failed e
+
+  let connect allowed addr =
+    match parse_addr addr with
+    | None -> Error (Caps.Failed "address must be HOST:PORT")
+    | Some (h, port) -> (
+      if not (Caps.permits allowed ~host:h ~port) then Error (Caps.Denied (Printf.sprintf "net: %s:%d is not granted" h port))
+      else
+        match resolve h with
+        | None -> Error (Caps.Failed ("cannot resolve " ^ h))
+        | Some ip -> (
+          let fd = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+          Unix.set_nonblock fd;
+          (* waits can be woken by any socket, so retry until this one says it is connected *)
+          let rec go () =
+            match Unix.connect fd (Unix.ADDR_INET (ip, port)) with
+            | () -> Ok fd
+            | exception Unix.Unix_error (Unix.EISCONN, _, _) -> Ok fd
+            | exception Unix.Unix_error ((Unix.EINPROGRESS | Unix.EALREADY | Unix.EAGAIN | Unix.EINTR), _, _) ->
+              wait fd true;
+              (match Unix.getsockopt_error fd with
+               | Some e -> Unix.close fd; failed e
+               | None -> go ())
+            | exception Unix.Unix_error (e, _, _) -> Unix.close fd; failed e
+          in
+          go ()))
+
+  let rec read fd =
+    let b = Bytes.create 65536 in
+    match Unix.read fd b 0 65536 with
+    | n -> Ok (Bytes.sub_string b 0 n)
+    | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EINTR), _, _) -> wait fd false; read fd
+    | exception Unix.Unix_error (e, _, _) -> failed e
+
+  let write fd s =
+    let rec go off =
+      if off >= String.length s then Ok ()
+      else
+        match Unix.single_write_substring fd s off (String.length s - off) with
+        | n -> go (off + n)
+        | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EINTR), _, _) -> wait fd true; go off
+        | exception Unix.Unix_error (e, _, _) -> failed e
+    in
+    go 0
+
+  let close fd = try Unix.close fd with Unix.Unix_error _ -> ()
+end
 
 let rec pmatch p v binds =
   match (p.pdesc, v) with
@@ -339,6 +451,7 @@ and field rt v name =
     | None -> VCap (CFs { Caps.root = None; ro = true }))
   | VCap CRoot, "stdout" -> VCap CStdout
   | VCap CRoot, "clock" -> VCap CClock
+  | VCap CRoot, "listen" -> VCap (CListen rt.grants.listen)
   | _ -> failwith ("internal: field " ^ name)
 
 and apply rt fv args sp =
@@ -492,6 +605,8 @@ and call_method rt v name args sp =
   | VCap c, _, _ -> cap_call rt c name args
   | _ -> raise (Panic (sprintf "internal: no method `%s` on %s" name (show ~top:false v), sp))
 
+and sock_result : 'a. ('a, Caps.ioerr) result -> ('a -> value) -> value = fun r f -> io_result f r
+
 and cap_call rt c name args =
   match (c, name, args) with
   | CStdout, "print", [ VStr s ] -> rt.out (s ^ "\n"); VUnit
@@ -504,6 +619,13 @@ and cap_call rt c name args =
   | CFs fs, "read", [ VStr p ] -> io_result (fun s -> VStr s) (Caps.read fs p)
   | CFs fs, "write", [ VStr p; VStr data ] -> io_result (fun () -> VUnit) (Caps.write fs p data)
   | CFs fs, "exists", [ VStr p ] -> VBool (Caps.exists fs p)
+  | CNet allowed, "connect", [ VStr addr ] -> sock_result (Sock.connect allowed addr) (fun fd -> VCap (CConn fd))
+  | CListen allowed, "on", [ VStr addr ] -> sock_result (Sock.listen allowed addr) (fun (fd, port) -> VCap (CListener (fd, port)))
+  | CListener (fd, _), "accept", [] -> sock_result (Sock.accept fd) (fun c -> VCap (CConn c))
+  | CListener (_, port), "port", [] -> VInt port
+  | (CListener (fd, _) | CConn fd), "close", [] -> Sock.close fd; VUnit
+  | CConn fd, "read", [] -> sock_result (Sock.read fd) (fun s -> VStr s)
+  | CConn fd, "write", [ VStr s ] -> sock_result (Sock.write fd s) (fun () -> VUnit)
   | _ -> failwith ("internal: capability method " ^ name)
 
 (* Run `main`. Returns its value, or the panic message and location. *)
@@ -530,6 +652,7 @@ let run ~out ~grants (user_items : item list) : (value, string * Span.t) result 
     let args = match d.fn_params with [] -> [] | _ -> [ VCap CRoot ] in
     (* main is a coroutine too, so it can wait on groups and channels *)
     Queue.clear runq;
+    Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
     let result = ref None in
     try
       spawn_fiber (fun () -> result := Some (call_fn rt d args));

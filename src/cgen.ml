@@ -376,6 +376,13 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     | "cap_get", _ -> io_result (sprintf "Cap_net_get(%s, %s)" (arg 0) (arg 1)) "r_.val"
     | "cap_under", _ -> set (sprintf "Cap_fs_under(%s, %s)" (arg 0) (arg 1))
     | "cap_read_only", _ -> set (sprintf "Cap_fs_read_only(%s)" (arg 0))
+    | "cap_read", TCap Conn -> io_result (sprintf "Cap_conn_read(%s)" (arg 0)) "r_.val"
+    | "cap_write", TCap Conn -> io_result (sprintf "Cap_conn_write(%s, %s)" (arg 0) (arg 1)) "0"
+    | "cap_on", _ -> io_result (sprintf "Cap_listen_on(%s, %s)" (arg 0) (arg 1)) "(WCap*)r_.ptr"
+    | "cap_accept", _ -> io_result (sprintf "Cap_accept(%s)" (arg 0)) "(WCap*)r_.ptr"
+    | "cap_connect", _ -> io_result (sprintf "Cap_net_connect(%s, %s)" (arg 0) (arg 1)) "(WCap*)r_.ptr"
+    | "cap_port", _ -> set (sprintf "(int64_t)(%s)->port" (arg 0))
+    | "cap_close", _ -> line (sprintf "Cap_sock_close(%s);" (arg 0)); set "0"
     | "cap_read", _ -> io_result (sprintf "Cap_fs_read(%s, %s)" (arg 0) (arg 1)) "r_.val"
     | "cap_write", TCap Fs -> io_result (sprintf "Cap_fs_write(%s, %s, %s)" (arg 0) (arg 1) (arg 2)) "0"
     | "cap_exists", _ -> set (sprintf "Cap_fs_exists(%s, %s)" (arg 0) (arg 1))

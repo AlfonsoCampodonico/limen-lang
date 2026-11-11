@@ -14,6 +14,14 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <errno.h>
+#include <signal.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <sys/resource.h>
 #include <pthread.h>
 
 extern char **environ;
@@ -412,33 +420,43 @@ static void Clo_show(WBuf *b, WClo *c, bool top) { (void)c; (void)top; buf_puts(
 
 /* ---------- capabilities ---------- */
 
-enum { CAP_ROOT, CAP_NET, CAP_FS, CAP_STDOUT, CAP_CLOCK };
+enum { CAP_ROOT, CAP_NET, CAP_FS, CAP_STDOUT, CAP_CLOCK, CAP_LISTEN, CAP_LISTENER, CAP_CONN };
 typedef struct WCap WCap;
 struct WCap {
   int64_t rc; int kind;
   char **hosts; int nhosts;   /* Net: allowlist entries */
   char *root; bool ro;        /* Fs: realpath of root, NULL = not granted */
+  int fd; int port;           /* Listener, Conn: the socket */
 };
-static WCap *cap_new(int kind) { WCap *c = (WCap *)w_alloc(sizeof(WCap)); memset(c, 0, sizeof *c); c->rc = 1; c->kind = kind; return c; }
+static WCap *cap_new(int kind) { WCap *c = (WCap *)w_alloc(sizeof(WCap)); memset(c, 0, sizeof *c); c->rc = 1; c->kind = kind; c->fd = -1; return c; }
 static inline WCap *Cap_dup(WCap *c) { w_rc_inc(&c->rc); return c; }
 static inline void Cap_share(WCap *c) { w_rc_share(&c->rc); }
 static void Cap_drop(WCap *c) {
-  if (w_rc_dec(&c->rc)) { for (int i = 0; i < c->nhosts; i++) free(c->hosts[i]); free(c->hosts); free(c->root); w_free(c); }
+  if (w_rc_dec(&c->rc)) { for (int i = 0; i < c->nhosts; i++) free(c->hosts[i]); free(c->hosts); free(c->root); if (c->fd >= 0) close(c->fd); w_free(c); }
 }
 static inline bool Cap_eq(WCap *a, WCap *b) { return a == b; }
 static void Cap_show(WBuf *b, WCap *c, bool top) {
   (void)top;
-  static const char *names[] = { "<Root>", "<Net>", "<Fs>", "<Stdout>", "<Clock>" };
+  static const char *names[] = { "<Root>", "<Net>", "<Fs>", "<Stdout>", "<Clock>", "<Listen>", "<Listener>", "<Conn>" };
   buf_puts(b, names[c->kind]);
 }
 
 static char **g_hosts; static int g_nhosts; static char *g_fs_root; static bool g_fs_ro;
+static char **g_listen; static int g_nlisten;
 
 static void w_usage(const char *m) {
   fprintf(stderr, "%s\nusage: PROGRAM [--grant net=HOST[:PORT]|*]... [--grant fs=DIR[:ro]]\n", m);
   exit(2);
 }
 static void w_init(int argc, char **argv) {
+  signal(SIGPIPE, SIG_IGN);   /* a peer closing a socket is an error value, not a crash */
+  {
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+      rlim_t want = rl.rlim_max < (rlim_t)65536 ? rl.rlim_max : (rlim_t)65536;
+      if (rl.rlim_cur < want) { rl.rlim_cur = want; setrlimit(RLIMIT_NOFILE, &rl); }
+    }
+  }
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--grant") != 0 || i + 1 >= argc) w_usage("unknown argument");
     const char *g = argv[++i];
@@ -454,6 +472,9 @@ static void w_init(int argc, char **argv) {
       if (!r || stat(r, &st) != 0 || !S_ISDIR(st.st_mode)) w_usage("fs grant: no such directory");
       free(v);
       g_fs_root = r;
+    } else if (strncmp(g, "listen=", 7) == 0) {
+      g_listen = (char **)w_realloc(g_listen, sizeof(char *) * (size_t)(g_nlisten + 1));
+      g_listen[g_nlisten++] = strdup(g + 7);
     } else w_usage("unknown grant");
   }
 }
@@ -474,13 +495,21 @@ static WCap *Cap_root_field(WCap *root, const char *f) {
     return c;
   }
   if (strcmp(f, "stdout") == 0) return cap_new(CAP_STDOUT);
+  if (strcmp(f, "listen") == 0) {
+    WCap *c = cap_new(CAP_LISTEN);
+    c->hosts = (char **)w_raw(sizeof(char *) * (size_t)(g_nlisten + 1));
+    for (int i = 0; i < g_nlisten; i++) c->hosts[i] = strdup(g_listen[i]);
+    c->nhosts = g_nlisten;
+    return c;
+  }
   return cap_new(CAP_CLOCK);
 }
 
 /* I/O results: kind 0 = ok, 1 = denied, 2 = failed. */
-typedef struct { int kind; WStr *val; WStr *msg; } WIo;
-static WIo io_ok(WStr *v) { WIo r = { 0, v, NULL }; return r; }
-static WIo io_err(int kind, const char *m) { WIo r = { kind, NULL, Str_from(m, (int64_t)strlen(m)) }; return r; }
+typedef struct { int kind; WStr *val; WStr *msg; void *ptr; } WIo;
+static WIo io_ok(WStr *v) { WIo r = { 0, v, NULL, NULL }; return r; }
+static WIo io_ok_ptr(void *p) { WIo r = { 0, NULL, NULL, p }; return r; }
+static WIo io_err(int kind, const char *m) { WIo r = { kind, NULL, Str_from(m, (int64_t)strlen(m)), NULL }; return r; }
 
 static void lower_ascii(char *s) { for (; *s; s++) if (*s >= 'A' && *s <= 'Z') *s = (char)(*s + 32); }
 
@@ -606,7 +635,7 @@ static WIo Cap_net_get(WCap *n, WStr *url_s) {
   if (WIFEXITED(status) && WEXITSTATUS(status) == 0) { Str_drop(emsg); return io_ok(body); }
   Str_drop(body);
   WStr *t = Str_trim(emsg); Str_drop(emsg);
-  WIo r = { 2, NULL, t };
+  WIo r = { 2, NULL, t, NULL };
   return r;
 }
 
@@ -925,7 +954,7 @@ static void w_ready(WFiber *f) {
     pthread_mutex_unlock(&w->mu);
   } else {
     pthread_mutex_lock(&w_global_mu);
-    if (w_global_tail) w_global_tail->next = f; else w_global_head = f;
+    if (w_global_tail) w_global_tail->next = f; else __atomic_store_n(&w_global_head, f, __ATOMIC_RELEASE);
     w_global_tail = f;
     pthread_mutex_unlock(&w_global_mu);
   }
@@ -951,7 +980,7 @@ static WFiber *w_find_work(WWorker *w) {
   if (__atomic_load_n(&w_global_head, __ATOMIC_RELAXED)) {
     pthread_mutex_lock(&w_global_mu);
     f = w_global_head;
-    if (f) { w_global_head = f->next; if (!w_global_head) w_global_tail = NULL; }
+    if (f) { __atomic_store_n(&w_global_head, f->next, __ATOMIC_RELEASE); if (!f->next) w_global_tail = NULL; }
     pthread_mutex_unlock(&w_global_mu);
     if (f) { __atomic_fetch_sub(&w_queued, 1, __ATOMIC_SEQ_CST); return f; }
   }
@@ -1261,3 +1290,188 @@ static void w_chan_close(WChan *c, const char *where) {
   while (rs) { WChWait *n = rs->next; rs->ok = 0; w_wake(rs->f); rs = n; }
   while (ss) { WChWait *n = ss->next; ss->ok = 0; w_wake(ss->f); ss = n; }
 }
+
+/* ---------- sockets ----------
+   Sockets are non-blocking. A task that would block parks on the poller
+   thread (kqueue on macOS and the BSDs, epoll on Linux), which wakes it
+   when the socket is ready. One task at a time may wait on a given socket
+   in a given direction. */
+
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+#include <sys/event.h>
+#define W_KQUEUE 1
+#else
+#include <sys/epoll.h>
+#endif
+
+static int w_poll_fd = -1;
+static pthread_once_t w_poll_once = PTHREAD_ONCE_INIT;
+
+static void *w_poller(void *arg) {
+  (void)arg;
+  for (;;) {
+#ifdef W_KQUEUE
+    struct kevent evs[256];
+    int n = kevent(w_poll_fd, NULL, 0, evs, 256, NULL);
+    for (int i = 0; i < n; i++) w_wake((WFiber *)evs[i].udata);
+#else
+    struct epoll_event evs[256];
+    int n = epoll_wait(w_poll_fd, evs, 256, -1);
+    for (int i = 0; i < n; i++) w_wake((WFiber *)evs[i].data.ptr);
+#endif
+  }
+  return NULL;
+}
+static void w_poll_start(void) {
+#ifdef W_KQUEUE
+  w_poll_fd = kqueue();
+#else
+  w_poll_fd = epoll_create1(EPOLL_CLOEXEC);
+#endif
+  if (w_poll_fd < 0) { fputs("panic: cannot create the socket poller\n", stderr); exit(1); }
+  pthread_t th;
+  pthread_create(&th, NULL, w_poller, NULL);
+  pthread_detach(th);
+}
+
+/* Park the current task until fd is readable (or writable). */
+static void w_wait_fd(int fd, int write) {
+  pthread_once(&w_poll_once, w_poll_start);
+  WFiber *f = w_current();
+  __atomic_fetch_add(&w_io_waiters, 1, __ATOMIC_SEQ_CST);
+  w_prepare_park();
+#ifdef W_KQUEUE
+  struct kevent ev;
+  EV_SET(&ev, (uintptr_t)fd, write ? EVFILT_WRITE : EVFILT_READ, EV_ADD | EV_ONESHOT, 0, 0, f);
+  if (kevent(w_poll_fd, &ev, 1, NULL, 0, NULL) < 0) { w_wake(f); }
+#else
+  struct epoll_event ev;
+  ev.events = (write ? EPOLLOUT : EPOLLIN) | EPOLLONESHOT;
+  ev.data.ptr = f;
+  if (epoll_ctl(w_poll_fd, EPOLL_CTL_MOD, fd, &ev) < 0 && epoll_ctl(w_poll_fd, EPOLL_CTL_ADD, fd, &ev) < 0) { w_wake(f); }
+#endif
+  w_park_now();
+  __atomic_fetch_sub(&w_io_waiters, 1, __ATOMIC_SEQ_CST);
+}
+
+static void w_nonblock(int fd) {
+  fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+  fcntl(fd, F_SETFD, FD_CLOEXEC);
+#ifdef SO_NOSIGPIPE
+  int one = 1;
+  setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+#endif
+}
+
+/* "host:port", host of [A-Za-z0-9.-], port 0..65535 (same rules as the interpreter). */
+static int w_parse_addr(WStr *a, char *host, size_t hn, int *port) {
+  int64_t colon = -1;
+  for (int64_t i = 0; i < a->len; i++) if (a->data[i] == ':') { if (colon >= 0) return 0; colon = i; }
+  if (colon <= 0 || colon >= a->len - 1 || a->len - colon - 1 > 5 || (size_t)colon >= hn) return 0;
+  for (int64_t i = 0; i < colon; i++) {
+    char ch = a->data[i];
+    if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '.' || ch == '-')) return 0;
+  }
+  int p = 0;
+  for (int64_t i = colon + 1; i < a->len; i++) {
+    if (a->data[i] < '0' || a->data[i] > '9') return 0;
+    p = p * 10 + (a->data[i] - '0');
+  }
+  if (p > 65535) return 0;
+  memcpy(host, a->data, (size_t)colon); host[colon] = 0; lower_ascii(host);
+  *port = p;
+  return 1;
+}
+static int w_resolve(const char *h, struct in_addr *out) {
+  if (strcmp(h, "localhost") == 0) { out->s_addr = htonl(INADDR_LOOPBACK); return 1; }
+  if (inet_pton(AF_INET, h, out) == 1) return 1;
+  struct addrinfo hints, *res = NULL;
+  memset(&hints, 0, sizeof hints);
+  hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
+  if (getaddrinfo(h, NULL, &hints, &res) != 0 || !res) return 0;
+  *out = ((struct sockaddr_in *)res->ai_addr)->sin_addr;
+  freeaddrinfo(res);
+  return 1;
+}
+static WIo w_errno_io(void) { return io_err(2, strerror(errno)); }
+
+static WIo Cap_listen_on(WCap *l, WStr *addr) {
+  char h[256]; int port;
+  if (!w_parse_addr(addr, h, sizeof h, &port)) return io_err(2, "address must be HOST:PORT");
+  if (!net_permits(l, h, port)) { char m[400]; snprintf(m, sizeof m, "listen: %s:%d is not granted", h, port); return io_err(1, m); }
+  struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
+  sa.sin_family = AF_INET; sa.sin_port = htons((uint16_t)port);
+  if (!w_resolve(h, &sa.sin_addr)) { char m[400]; snprintf(m, sizeof m, "cannot resolve %s", h); return io_err(2, m); }
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) return w_errno_io();
+  int one = 1;
+  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+  if (bind(fd, (struct sockaddr *)&sa, sizeof sa) < 0 || listen(fd, 4096) < 0) { WIo r = w_errno_io(); close(fd); return r; }
+  w_nonblock(fd);
+  socklen_t sl = sizeof sa;
+  getsockname(fd, (struct sockaddr *)&sa, &sl);
+  WCap *c = cap_new(CAP_LISTENER);
+  c->fd = fd; c->port = ntohs(sa.sin_port);
+  return io_ok_ptr(c);
+}
+static WIo Cap_accept(WCap *l) {
+  for (;;) {
+    int fd = accept(l->fd, NULL, NULL);
+    if (fd >= 0) {
+      w_nonblock(fd);
+      int one = 1;
+      setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+      WCap *c = cap_new(CAP_CONN);
+      c->fd = fd;
+      return io_ok_ptr(c);
+    }
+    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR || errno == ECONNABORTED) { if (errno != EINTR && errno != ECONNABORTED) w_wait_fd(l->fd, 0); continue; }
+    return w_errno_io();
+  }
+}
+static WIo Cap_net_connect(WCap *n, WStr *addr) {
+  char h[256]; int port;
+  if (!w_parse_addr(addr, h, sizeof h, &port)) return io_err(2, "address must be HOST:PORT");
+  if (!net_permits(n, h, port)) { char m[400]; snprintf(m, sizeof m, "net: %s:%d is not granted", h, port); return io_err(1, m); }
+  struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
+  sa.sin_family = AF_INET; sa.sin_port = htons((uint16_t)port);
+  if (!w_resolve(h, &sa.sin_addr)) { char m[400]; snprintf(m, sizeof m, "cannot resolve %s", h); return io_err(2, m); }
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) return w_errno_io();
+  w_nonblock(fd);
+  if (connect(fd, (struct sockaddr *)&sa, sizeof sa) < 0) {
+    if (errno != EINPROGRESS) { WIo r = w_errno_io(); close(fd); return r; }
+    w_wait_fd(fd, 1);
+    int err = 0; socklen_t el = sizeof err;
+    getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el);
+    if (err) { close(fd); return io_err(2, strerror(err)); }
+  }
+  WCap *c = cap_new(CAP_CONN);
+  c->fd = fd;
+  return io_ok_ptr(c);
+}
+static WIo Cap_conn_read(WCap *c) {
+  if (c->fd < 0) return io_err(2, "connection is closed");
+  char *buf = (char *)w_raw(65536);
+  for (;;) {
+    ssize_t n = read(c->fd, buf, 65536);
+    if (n >= 0) { WStr *s = Str_from(buf, n); free(buf); return io_ok(s); }
+    if (errno == EAGAIN || errno == EWOULDBLOCK) { w_wait_fd(c->fd, 0); continue; }
+    if (errno == EINTR) continue;
+    free(buf);
+    return w_errno_io();
+  }
+}
+static WIo Cap_conn_write(WCap *c, WStr *s) {
+  if (c->fd < 0) return io_err(2, "connection is closed");
+  int64_t off = 0;
+  while (off < s->len) {
+    ssize_t n = write(c->fd, s->data + off, (size_t)(s->len - off));
+    if (n >= 0) { off += n; continue; }
+    if (errno == EAGAIN || errno == EWOULDBLOCK) { w_wait_fd(c->fd, 1); continue; }
+    if (errno == EINTR) continue;
+    return w_errno_io();
+  }
+  return io_ok(NULL);
+}
+static void Cap_sock_close(WCap *c) { if (c->fd >= 0) { close(c->fd); c->fd = -1; } }

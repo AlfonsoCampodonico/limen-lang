@@ -103,6 +103,9 @@ let rec resolve env (te : ty_expr) : ty =
     | "Fs", _ -> TCap Fs
     | "Stdout", _ -> TCap Stdout
     | "Clock", _ -> TCap Clock
+    | "Listen", _ -> TCap Listen
+    | "Listener", _ -> TCap Listener
+    | "Conn", _ -> TCap Conn
     | "Chan", [ x ] -> TChan x
     | _ -> ( match List.assoc_opt n env with Some t -> t | None -> TNamed (n, a)))
 

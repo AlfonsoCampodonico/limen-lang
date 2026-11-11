@@ -4,7 +4,7 @@ let usage =
   {|writ: a small language where I/O needs a capability
 
 usage:
-  writ run FILE [--native] [--grant net=HOST[:PORT]|*]... [--grant fs=DIR[:ro]]
+  writ run FILE [--native] [--grant net=HOST[:PORT]|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST:PORT]...
   writ build FILE [-o OUT] [--emit-c]
   writ check FILE [--json]
   writ caps FILE [--json]
@@ -49,6 +49,8 @@ let parse_grants args =
         let real = try Unix.realpath dir with Unix.Unix_error _ -> die_usage ("fs grant: no such directory " ^ dir) in
         if not (Sys.is_directory real) then die_usage ("fs grant: not a directory " ^ dir);
         { g with fs = Some (real, ro) }
+      | Some i when String.sub a 0 i = "listen" ->
+        { g with listen = g.listen @ [ String.sub a (i + 1) (String.length a - i - 1) ] }
       | _ -> die_usage ("unknown grant `" ^ a ^ "`"))
     Interp.no_grants args
 
