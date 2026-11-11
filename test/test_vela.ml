@@ -976,9 +976,13 @@ fn main(root: Root) {
   if selected "ffi-missing" then (match run ~grants:libc "ffi-missing" "foreign \"c\" {\n    fn vela_no_such_function() -> Int\n}\n\nfn main(root: Root) {\n    root.stdout.print(\"{vela_no_such_function(root.foreign)}\")\n}\n" with
    | Error e -> ok "ffi-missing" (e = "panic: foreign: library `c` has no function `vela_no_such_function`") e
    | Ok _ -> ok "ffi-missing" false "ran");
-  if selected "ffi-no-lib" then (match run ~grants:libc "ffi-no-lib" "foreign \"vela_no_such_lib\" {\n    fn f() -> Int\n}\n\nfn main(root: Root) {\n    root.stdout.print(\"{f(root.foreign)}\")\n}\n" with
+  if selected "ffi-no-lib" then (match run ~grants:{ Interp.no_grants with foreign = [ "*" ] } "ffi-no-lib" "foreign \"vela_no_such_lib\" {\n    fn f() -> Int\n}\n\nfn main(root: Root) {\n    root.stdout.print(\"{f(root.foreign)}\")\n}\n" with
    | Error e -> ok "ffi-no-lib" (String.starts_with ~prefix:"panic: foreign: cannot load library `vela_no_such_lib`" e) e
    | Ok _ -> ok "ffi-no-lib" false "ran");
+  (* a library the grants do not cover is not even loaded: the call panics first *)
+  if selected "ffi-no-lib-ungranted" then (match run ~grants:libc "ffi-no-lib-ungranted" "foreign \"vela_no_such_lib\" {\n    fn f() -> Int\n}\n\nfn main(root: Root) {\n    root.stdout.print(\"before\")\n    root.stdout.print(\"{f(root.foreign)}\")\n}\n" with
+   | Error e -> ok "ffi-no-lib-ungranted" (e = "panic: foreign: library `vela_no_such_lib` is not granted (grant it with --grant foreign=vela_no_such_lib)") e
+   | Ok _ -> ok "ffi-no-lib-ungranted" false "ran");
   if native_for "ffi-missing" && selected "ffi-missing" then
     (match run_native ~grants:libc "ffi-missing-native" "foreign \"c\" {\n    fn vela_no_such_function() -> Int\n}\n\nfn main(root: Root) {\n    root.stdout.print(\"{vela_no_such_function(root.foreign)}\")\n}\n" with
      | Error m -> ok "ffi-missing/native" (Interp_util.find_sub m "vela_no_such_function" 0 <> None) m

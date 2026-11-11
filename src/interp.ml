@@ -747,13 +747,15 @@ module Foreign = struct
       (match r with Ok h -> Hashtbl.replace libs lib h | Error _ -> ());
       r
 
-  (* Resolve every foreign function before the program starts, so a missing
-     library or symbol is an error up front, as a link error is natively. *)
-  let resolve (items : item list) : (unit, string * Span.t) result =
+  (* Resolve the foreign functions of granted libraries before the program
+     starts, so a missing library or symbol is an error up front, as a link
+     error is natively. A library the grants do not cover is never loaded
+     (loading runs its initialisers): calls into it panic before reaching it. *)
+  let resolve granted (items : item list) : (unit, string * Span.t) result =
     List.fold_left
       (fun acc it ->
         match (acc, it) with
-        | Ok (), IFn ({ fn_foreign = Some (lib, sym); _ } as d) -> (
+        | Ok (), IFn ({ fn_foreign = Some (lib, sym); _ } as d) when permits granted lib -> (
           match load lib with
           | Error e -> Error (sprintf "foreign: cannot load library `%s`: %s" lib e, d.fn_span)
           | Ok h ->
@@ -1521,7 +1523,7 @@ let run ~out ~grants (user_items : item list) : (value, string * Span.t) result 
   match Hashtbl.find_opt rt.fns "main" with
   | None -> Error ("no `main` function", Span.dummy)
   | Some d -> (
-    match Foreign.resolve user_items with
+    match Foreign.resolve grants.foreign user_items with
     | Error e -> Error e
     | Ok () ->
     let args = match d.fn_params with [] -> [] | _ -> [ VCap CRoot ] in
@@ -1565,7 +1567,7 @@ let make_rt ~out ~grants (user_items : item list) =
 let run_tests ~out (user_items : item list) : (string * (unit, string * Span.t) result) list =
   let rt = make_rt ~out ~grants:no_grants user_items in
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
-  let resolved = Foreign.resolve user_items in
+  let resolved = Foreign.resolve no_grants.foreign user_items in
   List.filter_map
     (function
       | IFn ({ fn_test = Some name; _ } as d) ->
