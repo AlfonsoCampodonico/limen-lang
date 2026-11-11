@@ -59,6 +59,9 @@ and expr_desc =
          the chain, `name.b.c`, run on that value; and (set by the checker)
          whether that rest is an Option already, so its result is not wrapped
          again. The name ("safe$N") cannot be written in source. *)
+  | ENamed of string * span * expr
+      (* `name: value`, a call argument naming its parameter; only between the
+         parser and the checker, which puts arguments in parameter order *)
 
 and str_part = SPLit of string | SPExpr of expr
 

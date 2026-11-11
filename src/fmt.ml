@@ -152,6 +152,26 @@ let rec bare_struct e =
   | ECall (f, _) -> bare_struct f
   | _ -> false
 
+(* A closure the author wrote after the call's parentheses,
+   `f(a) { |x| ... }`: the arguments before it, and the closure. fmt keeps
+   the form the author chose; both are canonical. *)
+let trailing_arg c args =
+  match List.rev args with
+  | ({ edesc = EClosure (_, { edesc = EBlock _; _ }); espan; _ } as last) :: rest
+    when espan.lo < String.length c.src && c.src.[espan.lo] = '{' ->
+    Some (List.rev rest, last)
+  | _ -> None
+
+(* An expression with a trailing closure, which an `if`/`while`/`for`/`match`
+   head would read as the start of its body. *)
+let rec bare_trailing c e =
+  match e.edesc with
+  | ECall (f, args) -> trailing_arg c args <> None || bare_trailing c f
+  | EMethod (r, _, _, args) -> trailing_arg c args <> None || bare_trailing c r
+  | EBin (_, a, b) -> bare_trailing c a || bare_trailing c b
+  | EUn (_, a) | ETry (a, _) | EField (a, _, _) | EIndex (a, _) -> bare_trailing c a
+  | _ -> false
+
 let rec simple_expr e =
   match e.edesc with
   | EBlock _ | EIf _ | EMatch _ | EGroup _ -> false
@@ -208,11 +228,14 @@ and expr_inner c ind e =
     expr c ind ~min:16 a
   | ECall (f, args) ->
     expr c ind ~min:16 f;
-    seq c ind "(" ")" (breaks_after_open c f.espan.hi '(') ~lo:f.espan.hi ~hi:e.espan.hi (fun x -> expr c (ind + 4) x) (fun x -> x.espan) args
+    call_args c ind f.espan.hi e.espan.hi args
+  | ENamed (n, _, x) ->
+    add c (n ^ ": ");
+    expr c ind x
   | EMethod (r, name, nsp, args) ->
     receiver c ind r nsp;
     add c name;
-    seq c ind "(" ")" (breaks_after_open c nsp.hi '(') ~lo:nsp.hi ~hi:e.espan.hi (fun x -> expr c (ind + 4) x) (fun x -> x.espan) args
+    call_args c ind nsp.hi e.espan.hi args
   | EField (r, name, nsp) ->
     receiver c ind r nsp;
     add c name
@@ -398,8 +421,23 @@ and receiver c ind r nsp =
     if has_newline c r.espan.hi nsp.lo then break_at_comments c (ind + 4) r.espan.hi nsp.lo;
     add c "."
 
+(* `(a, b)`, or `(a) { |x| ... }` / ` { ... }` with a trailing closure;
+   the arguments start after [lo]. *)
+and call_args c ind lo hi args =
+  let plain xs hi = seq c ind "(" ")" (breaks_after_open c lo '(') ~lo ~hi (fun x -> expr c (ind + 4) x) (fun x -> x.espan) xs in
+  match trailing_arg c args with
+  | Some (rest, ({ edesc = EClosure (ps, { edesc = EBlock b; _ }); _ } as clo)) ->
+    if rest <> [] then plain rest clo.espan.lo;
+    add c " ";
+    let params =
+      if ps = [] then ""
+      else "|" ^ String.concat ", " (List.map (fun (n, t, _) -> match t with Some t -> n ^ ": " ^ ty t | None -> n) ps) ^ "|"
+    in
+    block c ind ~params b
+  | _ -> plain args hi
+
 and head c ind e =
-  if bare_struct e then (add c "("; expr c ind e; add c ")") else expr c ind e
+  if bare_struct e || bare_trailing c e then (add c "("; expr c ind e; add c ")") else expr c ind e
 
 and if_chain c ind e =
   match e.edesc with
@@ -443,16 +481,17 @@ and seq : 'a. ctx -> int -> string -> string -> bool -> lo:int -> hi:int -> ('a 
     add c cl
   end
 
-and block c ind b =
+(* [params]: the block is a trailing closure's body, `{ |x| ... }`. *)
+and block c ind ?(params = "") b =
   let inline =
     b.stmts = [] && (match b.tail with None -> true | Some e -> simple_expr e) && not (has_newline c b.bspan.lo b.bspan.hi)
   in
   if inline then
     match b.tail with
-    | None -> add c "{}"
-    | Some e -> add c "{ "; expr c ind e; add c " }"
+    | None -> add c (if params = "" then "{}" else "{ " ^ params ^ " }")
+    | Some e -> add c ("{ " ^ (if params = "" then "" else params ^ " ")); expr c ind e; add c " }"
   else begin
-    add c "{";
+    add c (if params = "" then "{" else "{ " ^ params);
     let prev = ref (-1) in
     let elems = List.map (fun s -> `S s) b.stmts @ (match b.tail with Some e -> [ `E e ] | None -> []) in
     List.iter

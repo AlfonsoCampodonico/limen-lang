@@ -204,7 +204,13 @@ and parse_postfix ?(in_safe = false) st ns e =
       let name, nsp = expect_ident st in
       if is_sym st "(" && not (peek st).nl then begin
         ignore (advance st);
-        let args = comma_list st ")" parse_expr in
+        let args = comma_list st ")" parse_arg in
+        let args = args @ trailing_closure st ns in
+        mk (EMethod (e, name, nsp, args)) (merge e.espan (last_span st))
+      end
+      else if is_sym st "{" && (not (peek st).nl) && starts_trailing st ns then begin
+        (* `items.each { |x| ... }` *)
+        let args = trailing_closure st ns in
         mk (EMethod (e, name, nsp, args)) (merge e.espan (last_span st))
       end
       else mk (EField (e, name, nsp)) (merge e.espan nsp)
@@ -212,7 +218,12 @@ and parse_postfix ?(in_safe = false) st ns e =
   match t.tok with
   | SYM "(" when not t.nl ->
     ignore (advance st);
-    let args = comma_list st ")" parse_expr in
+    let args = comma_list st ")" parse_arg in
+    let args = args @ trailing_closure st ns in
+    continue_ (mk (ECall (e, args)) (merge e.espan (last_span st)))
+  | SYM "{" when (not t.nl) && (match e.edesc with EVar n -> not (is_upper n) | _ -> false) && starts_trailing st ns ->
+    (* `catch { ... }`: a trailing closure and no parentheses *)
+    let args = trailing_closure st ns in
     continue_ (mk (ECall (e, args)) (merge e.espan (last_span st)))
   | SYM "[" when not t.nl ->
     ignore (advance st);
@@ -241,6 +252,58 @@ and parse_postfix ?(in_safe = false) st ns e =
       continue_ (mk (ETry (e, Some c)) (merge e.espan c.espan))
     | _ -> continue_ (mk (ETry (e, None)) (merge e.espan t.span)))
   | _ -> e
+
+(* A call argument: an expression, or `name: expression` naming the
+   parameter it is for. *)
+and parse_arg st =
+  match ((peek st).tok, (peek2 st).tok) with
+  | IDENT n, SYM ":" ->
+    let t = advance st in
+    ignore (advance st);
+    let v = parse_expr st in
+    mk (ENamed (n, t.span, v)) (merge t.span v.espan)
+  | _ -> parse_expr st
+
+(* Is the `{` ahead the start of a trailing closure? Not in the head of an
+   `if`, `while`, `for`, `match` or group deadline, where `{` opens the body;
+   there a closure goes inside the parentheses. A body that starts with
+   closure parameters is reported, since that is a trailing closure written
+   where it cannot go. *)
+and starts_trailing st ns =
+  if not ns then true
+  else begin
+    (match (peek2 st).tok with
+     | SYM "|" | SYM "||" ->
+       raise
+         (Diag.Fatal
+            (Diag.make "E0003" (peek st).span
+               ~notes:[ "in the head of `if`, `while`, `for` and `match`, `{` starts the body; pass the closure in parentheses, as in `xs.filter(|x| x > 0)`, or wrap the whole condition in parentheses" ]
+               "a trailing closure cannot be used in a condition"))
+     | _ -> ());
+    false
+  end
+
+(* `f(a) { |x| ... }`: a closure written after the call's parentheses, passed
+   as its last argument. [] when there is none. *)
+and trailing_closure st ns =
+  let t = peek st in
+  if t.tok = SYM "{" && (not t.nl) && starts_trailing st ns then begin
+    let lb = advance st in
+    let params =
+      match (peek st).tok with
+      | SYM "||" -> ignore (advance st); []
+      | SYM "|" ->
+        ignore (advance st);
+        comma_list st "|" (fun st ->
+            let n, sp = expect_ident st in
+            let ty = if accept_sym st ":" then Some (parse_type st) else None in
+            (n, ty, sp))
+      | _ -> []
+    in
+    let b = parse_block_body st lb in
+    [ mk (EClosure (params, mk (EBlock b) b.bspan)) b.bspan ]
+  end
+  else []
 
 and parse_primary st ns =
   let t = peek st in
@@ -493,6 +556,10 @@ and parse_pat st =
 
 and parse_block st =
   let lb = expect_sym st "{" in
+  parse_block_body st lb
+
+(* The statements of a block whose `{` ([lb]) has been read. *)
+and parse_block_body st (lb : token) =
   let stmts = ref [] and tail = ref None in
   let rec loop () =
     if not (is_sym st "}") then begin

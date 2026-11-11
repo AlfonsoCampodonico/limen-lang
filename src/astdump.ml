@@ -38,6 +38,7 @@ let rec expr e =
   | EUn (Neg, a) -> "(-" ^ expr a ^ ")"
   | EUn (Not, a) -> "(!" ^ expr a ^ ")"
   | ECall (f, a) -> expr f ^ "(" ^ String.concat "," (List.map expr a) ^ ")"
+  | ENamed (n, _, a) -> n ^ ":" ^ expr a
   | EMethod (r, n, _, a) -> expr r ^ "." ^ n ^ "(" ^ String.concat "," (List.map expr a) ^ ")"
   | EField (r, n, _) -> expr r ^ "." ^ n
   | EIndex (a, i) -> expr a ^ "[" ^ expr i ^ "]"

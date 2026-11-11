@@ -77,6 +77,14 @@ fn evens(xs: List[Int]) -> List[Int] { xs.filter(|x| x % 2 == 0) }
 
 fn total(xs: List[Int]) -> Int { xs.fold(0, |a, b| a + b) }
 
+fn label(text: Str, width: Int, fill: Str) -> Str {
+    let mut s = text
+    while s.len() < width {
+        s = fill + s
+    }
+    s
+}
+
 fn slow(clock: Clock, ms: Int, v: Int) -> Int {
     clock.sleep(ms)
     v
@@ -178,6 +186,12 @@ fn main(root: Root) -> Int {
     let corner: Option[Point] = Some(Point { x: 3, y: 4 })
     let nowhere: Option[Point] = None
     out.print("{corner?.x} {nowhere?.y ?? -1}")
+    // named arguments: any order after the positional ones, all required
+    out.print(label("tour", fill: ".", width: 6))
+    // a closure after the call's parentheses is its last argument
+    let tens = [1, 2, 3].map { |x| x * 10 }
+    let failed = catch { panic("oops") }
+    out.print("{tens} {failed}")
 
     out.print("-- concurrency")
     // tasks returning () run for their effect and add nothing to the list

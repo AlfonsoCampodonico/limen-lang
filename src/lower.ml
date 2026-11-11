@@ -252,6 +252,7 @@ let rec lower f (e : expr) : I.atom =
       let x = lower f a in
       tmp f TBool (I.Not x)
     | ECall (callee, args) -> lower_call f e callee args ty
+    | ENamed _ -> failwith "internal: the checker puts named arguments in order"
     | EMethod ({ edesc = EVar en; _ }, name, _, args) when is_enum_name f en ->
       let xs = List.map (lower f) args in
       tmp f ty (I.MkEnum (ty, tag_of f.g ty name, xs))

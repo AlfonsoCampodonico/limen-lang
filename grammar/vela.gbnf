@@ -74,10 +74,13 @@ binop   ::= "??" | "||" | "&&" | "==" | "!=" | "<=" | ">=" | "<" | ">" | "..<" |
 unary   ::= ("-" | "!") sp unary | postfix
 postfix ::= primary suffix*
 # `?.` is safe navigation (a line may start with it, as with `.`)
-suffix  ::= sp "(" ws args? ws ")" | sp "[" ws expr ws "]" | ws "." sp ident | "." [0-9]+ | ws "?." sp ident | "?." [0-9]+ | sp "?" (sp string)?
-args    ::= expr (isep expr)* (ws ",")?
+suffix  ::= sp "(" ws args? ws ")" (sp tclosure)? | sp tclosure | sp "[" ws expr ws "]" | ws "." sp ident | "." [0-9]+ | ws "?." sp ident | "?." [0-9]+ | sp "?" (sp string)?
+args    ::= arg (isep arg)* (ws ",")?
+exprs   ::= expr (isep expr)* (ws ",")?
+# a named argument: `retries: 3`
+arg     ::= (ident sp ":" ws)? expr
 
-primary ::= float | int | string | ident | structlit | withlit | "(" ws ")" | "(" ws expr ws ")" | "(" ws expr (isep expr)+ (ws ",")? ws ")" | "[" ws args? ws "]" | block | if | match | select | closure | group
+primary ::= float | int | string | ident | structlit | withlit | "(" ws ")" | "(" ws expr ws ")" | "(" ws expr (isep expr)+ (ws ",")? ws ")" | "[" ws exprs? ws "]" | block | if | match | select | closure | group
 structlit ::= (ident ".")? upper sp "{" ws (init (isep init)* (ws ",")?)? ws "}"
 init      ::= ident (sp ":" ws expr)?
 # a copy of a struct with fields replaced: `{ p with x: 1 }`; `with` is on the base's line
@@ -89,6 +92,9 @@ selarm    ::= (ident sp "=" ws expr | expr) (sp1 "if" sp1 expr)? sp "=>" ws expr
 arm       ::= pattern (sp1 "if" sp1 expr)? sp "=>" ws expr
 closure   ::= "|" ws (cparam (isep cparam)* ws)? "|" ws expr | "||" ws expr
 cparam    ::= ident (sp ":" sp type)?
+# a trailing closure, `f(a) { |x| ... }`; the grammar does not keep it out
+# of `if`/`while`/`for`/`match` heads as the parser does
+tclosure  ::= "{" ws ("|" ws (cparam (isep cparam)* ws)? "|" ws | "||" ws)? (stmt (stsep stmt)* (sp ";")?)? ws "}"
 group     ::= "group" sp1 ident (sp1 "until" sp1 expr)? sp block
 
 pattern ::= "-"? int | plainstr | ident ("." ident)? (sp "(" ws pattern (isep pattern)* (ws ",")? ws ")")? | tpat
