@@ -166,6 +166,8 @@ let handle (msg : J.t) : J.t option =
     else Some (J.Obj [ ("jsonrpc", J.String "2.0"); ("id", id); ("error", J.Obj [ ("code", J.Int (-32601)); ("message", J.String ("method not supported: " ^ m)) ]) ])
 
 let serve () =
+  (* never run git from here: a git dependency is fetched by the CLI *)
+  Package.offline := true;
   Random.self_init ();
   let rec loop () =
     match In_channel.input_line stdin with

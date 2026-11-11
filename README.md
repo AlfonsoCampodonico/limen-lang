@@ -93,12 +93,15 @@ With VS Code, any generic LSP client extension works: point it at `vela lsp` for
 
 `use json` loads `json.vela` from next to the file, from a dependency, or from the standard library; its `pub` items are then `json.parse(...)`, `json.Value` and so on. Modules are merged into one program before checking, so both backends handle them unchanged.
 
-A `vela.toml` lists dependencies by path, and the capabilities each may use:
+A `vela.toml` lists dependencies, by local path or by git URL at a tag or commit, and the capabilities each may use:
 
 ```
 [dependencies]
 fetch = { path = "../fetch", caps = ["net"] }
+color = { git = "https://example.com/color.git", tag = "v1.2.0" }
 ```
+
+Git dependencies are fetched with `git` into a local cache (`~/.cache/vela`, or `$VELA_CACHE`). `vela.lock` records the exact commit and a hash of the files of each one, and every build checks the cache against it, so a moved tag or a changed copy cannot slip in. There is no central registry.
 
 Since capabilities only arrive as parameters, a dependency's signatures are a complete list of what it can do. If one asks for a capability it was not granted, the program does not compile (E0320).
 

@@ -687,6 +687,8 @@ Every diagnostic has a stable code. `vela explain CODE` prints its explanation, 
 | E0311 | `return` or `?` leaving a group |
 | E0320 | a dependency takes a capability vela.toml does not grant it |
 | E0321 | malformed vela.toml |
+| E0322 | a git dependency could not be fetched |
+| E0323 | vela.lock does not match: a malformed line, or a dependency whose files changed |
 | E0401 | module not found, or a qualified name without `use` |
 | E0402 | item is not `pub` |
 | E0403 | module has no such item |
@@ -807,6 +809,8 @@ env = ["HOME", "LANG"]
 [dependencies]
 json2 = { path = "vendor/json2" }                  # pure: no capabilities
 fetch = { path = "../fetch", caps = ["net"] }
+color = { git = "https://example.com/color.git", tag = "v1.2.0" }
+yaml = { git = "git@example.com:me/yaml.git", commit = "3f9c2e1d7a" }
 ```
 
 - `[grants]` takes `net`, `fs`, `listen` and `env`, each a string or a list of strings written exactly like the text after `--grant KIND=`. `fs` takes one directory, relative to vela.toml, with an optional `:ro`. Stdout, Stdin, Clock and Rand are always granted, so listing them is an error. Flags on the command line add to these grants.
@@ -814,7 +818,16 @@ fetch = { path = "../fetch", caps = ["net"] }
 - A dependency is a directory holding `NAME.vela`, plus any modules that file uses from the same directory.
 - `caps` lists what the dependency may use: `net` (Net and Conn), `listen` (Listen, Listener and Conn), `fs`, `stdout`, `stdin`, `clock`, `rand`, `env`. The default is none. No dependency can take `Root`.
 - Vela has no ambient authority, so a function can only use a capability that reaches it as a parameter. The checker therefore knows everything a dependency can ever do from its signatures, and rejects the program (E0320) if a dependency's function takes a capability it was not granted. Granting is still only an upper bound: at run time the dependency gets exactly the capabilities you pass it, which can be narrowed with `only` and `under`.
-- Only local paths are supported; there is no registry, versioning or lock file yet.
+- A dependency is a local directory (`path`) or a git repository (`git`) at a `tag` or a `commit` (lowercase hex, at least 7 characters). The URL is `https://`, `http://`, `ssh://`, `git://`, `file://` or `user@host:path`. There is no central registry: the URL is the name of the source.
+- A git dependency is fetched with the `git` command into a cache, one directory per commit: `$VELA_CACHE`, else `$XDG_CACHE_HOME/vela`, else `~/.cache/vela`. Fetching needs no grant because it happens in the compiler, before the program exists; `vela lsp` and `vela mcp` never fetch, and report a dependency that is not cached yet (E0322).
+- `vela.lock`, next to vela.toml, is written on the first build and should be committed. It holds one line per git dependency: name, URL, `tag:NAME` or `commit:HASH` as written in vela.toml, the full commit, and a BLAKE2b hash of the dependency's files:
+
+  ```
+  color https://example.com/color.git tag:v1.2.0 8d022128f5f177019f1e6aed46f75c93c90815f1 blake2b:5fea136b...
+  ```
+
+  Every build uses the locked commit, even if the tag has moved since, and checks the cached files against the hash (E0323). To update a dependency, change its `tag` or `commit`, or delete its line; vela fetches it and rewrites the line.
+- Each dependency must be listed in the program's vela.toml, including dependencies of dependencies: a dependency's own vela.toml is not read.
 
 ## 19. Standard library
 

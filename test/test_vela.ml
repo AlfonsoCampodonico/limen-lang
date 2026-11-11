@@ -1317,6 +1317,110 @@ fn main(root: Root) {
   ok "grants-dep-toml-ignored" (code = 0 && o = "none\n") (sprintf "code %d, out %S, err %S" code o e);
   Sys.remove (Filename.concat pdir "grants/vela.toml");
 
+  (* git dependencies: a local file:// repository, fetched into a temporary
+     cache, pinned by vela.lock *)
+  let gdir = Filename.concat pdir "git" in
+  List.iter (fun d -> try Unix.mkdir d 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ()) [ gdir; Filename.concat gdir "repo"; Filename.concat gdir "app" ];
+  Unix.putenv "VELA_CACHE" (Filename.concat gdir "cache");
+  let repo = Filename.concat gdir "repo" in
+  let git args = Sys.command (String.concat " " (List.map Filename.quote ([ "git"; "-C"; repo; "-c"; "user.name=t"; "-c"; "user.email=t@t" ] @ args)) ^ " >/dev/null 2>&1") in
+  let rev_of r =
+    let o = Filename.concat gdir "rev" in
+    ignore (Sys.command (sprintf "git -C %s rev-parse %s >%s" (Filename.quote repo) (Filename.quote r) (Filename.quote o)));
+    String.trim (read_file o)
+  in
+  let version v = Out_channel.with_open_bin (Filename.concat repo "greet.vela") (fun oc -> output_string oc (sprintf "pub fn hi() -> Str {\n    \"%s\"\n}\n" v)) in
+  ok "git-setup"
+    (git [ "init"; "-q" ] = 0
+     && (version "v1"; git [ "add"; "." ] = 0)
+     && git [ "commit"; "-qm"; "one" ] = 0
+     && git [ "tag"; "v1" ] = 0
+     && (version "v2"; git [ "commit"; "-qam"; "two" ] = 0)
+     && git [ "tag"; "v2" ] = 0)
+    "could not create the test repository";
+  let v1 = rev_of "v1" and v2 = rev_of "v2" in
+  let url = "file://" ^ repo in
+  let gapp = "use greet\n\nfn main(root: Root) {\n    root.stdout.print(greet.hi())\n}\n" in
+  let gmain = Filename.concat gdir "app/main.vela" in
+  put "git/app/main.vela" gapp;
+  let lock = Filename.concat gdir "app/vela.lock" in
+  let gtoml dep = put "git/app/vela.toml" (sprintf "[package]\nname = \"app\"\n\n[dependencies]\ngreet = { %s }\n" dep) in
+  let grun name want =
+    match Modules.load_and_check gmain gapp with
+    | items, [], _ -> (
+      let buf = Buffer.create 16 in
+      match Interp.run ~out:(Buffer.add_string buf) ~grants:Interp.no_grants items with
+      | Ok _ -> ok name (Buffer.contents buf = want ^ "\n") (sprintf "got %S, want %S" (Buffer.contents buf) want)
+      | Error (m, _) -> ok name false m)
+    | _, ds, _ -> ok name false (String.concat "; " (List.map (fun (d : Diag.t) -> d.code ^ " " ^ d.message) ds))
+  in
+  let gcodes () = let _, ds, _ = Modules.load_and_check gmain gapp in codes ds in
+  let lock_has s = Sys.file_exists lock && Interp_util.find_sub (read_file lock) s 0 <> None in
+  gtoml (sprintf "git = %S, tag = \"v1\"" url);
+  grun "git-tag" "v1";
+  ok "git-lock-written" (lock_has (sprintf "greet %s tag:v1 %s blake2b:" url v1)) (if Sys.file_exists lock then read_file lock else "no vela.lock");
+  if native_enabled then begin
+    let code, o, e = vela_cli [ "run"; "--native"; gmain ] in
+    ok "git-tag/native" (code = 0 && o = "v1\n") (sprintf "code %d, out %S, err %S" code o e)
+  end;
+  (* the tag moves upstream: the lock still pins the old commit *)
+  ok "git-move-tag" (git [ "tag"; "-f"; "v1"; "v2" ] = 0) "git tag -f";
+  grun "git-locked" "v1";
+  (* the editor and agent servers do not fetch, but use what is cached *)
+  Package.offline := true;
+  grun "git-offline-cached" "v1";
+  (* a changed cached copy no longer matches the lock *)
+  let cached = Filename.concat (Package.commit_dir url v1) "greet.vela" in
+  let orig = read_file cached in
+  Out_channel.with_open_bin cached (fun oc -> output_string oc (orig ^ "// changed\n"));
+  ok "git-hash-mismatch" (gcodes () = [ "E0323" ]) (String.concat "," (gcodes ()));
+  Out_channel.with_open_bin cached (fun oc -> output_string oc orig);
+  grun "git-hash-restored" "v1";
+  (* a changed tag in vela.toml is fetched, except offline *)
+  gtoml (sprintf "git = %S, tag = \"v2\"" url);
+  ok "git-offline-unfetched" (gcodes () = [ "E0322" ]) (String.concat "," (gcodes ()));
+  Package.offline := false;
+  grun "git-retag" "v2";
+  ok "git-lock-updated" (lock_has ("tag:v2 " ^ v2) && not (lock_has "tag:v1")) (read_file lock);
+  (* a commit, abbreviated *)
+  gtoml (sprintf "git = %S, commit = %S" url (String.sub v1 0 10));
+  grun "git-commit" "v1";
+  ok "git-lock-commit" (lock_has (sprintf "commit:%s %s" (String.sub v1 0 10) v1)) (read_file lock);
+  (* a deleted cache is fetched again at the locked commit *)
+  Package.rm_rf (Filename.concat gdir "cache");
+  grun "git-refetch" "v1";
+  (* errors *)
+  gtoml (sprintf "git = %S, tag = \"v9\"" url);
+  ok "git-no-tag" (gcodes () = [ "E0322" ]) (String.concat "," (gcodes ()));
+  gtoml (sprintf "git = %S, commit = \"%s\"" url (String.make 40 'a'));
+  ok "git-no-commit" (gcodes () = [ "E0322" ]) (String.concat "," (gcodes ()));
+  List.iter
+    (fun (name, dep) ->
+      gtoml dep;
+      ok name (gcodes () = [ "E0321" ]) (String.concat "," (gcodes ())))
+    [ ("git-bad-url-dash", "git = \"-uhttps://x\", tag = \"v1\"");
+      ("git-bad-url-ext", "git = \"ext::sh -c touch% /tmp/x\", tag = \"v1\"");
+      ("git-bad-url-scheme", "git = \"ftp://x/y\", tag = \"v1\"");
+      ("git-no-rev", sprintf "git = %S" url);
+      ("git-tag-and-commit", sprintf "git = %S, tag = \"v1\", commit = %S" url v1);
+      ("git-short-commit", sprintf "git = %S, commit = \"abc\"" url);
+      ("git-and-path", sprintf "git = %S, path = \"x\", tag = \"v1\"" url) ];
+  ok "git-url-scp" (Package.git_url_ok "git@github.com:user/repo.git") "scp-like";
+  gtoml (sprintf "git = %S, tag = \"v2\"" url);
+  Out_channel.with_open_bin lock (fun oc -> output_string oc "greet only-two-fields\n");
+  ok "git-bad-lock" (gcodes () = [ "E0323" ]) (String.concat "," (gcodes ()));
+  Sys.remove lock;
+  grun "git-relock" "v2";
+  (* capabilities of a git dependency are checked like any other *)
+  version "v3";
+  Out_channel.with_open_bin (Filename.concat repo "greet.vela") (fun oc ->
+      output_string oc "pub fn hi() -> Str {\n    \"v3\"\n}\n\npub fn peek(fs: Fs) -> Bool {\n    fs.exists(\"x\")\n}\n");
+  ok "git-v3" (git [ "commit"; "-qam"; "three" ] = 0 && git [ "tag"; "v3" ] = 0) "v3";
+  gtoml (sprintf "git = %S, tag = \"v3\"" url);
+  ok "git-caps-denied" (gcodes () = [ "E0320" ]) (String.concat "," (gcodes ()));
+  gtoml (sprintf "git = %S, tag = \"v3\", caps = [\"fs\"]" url);
+  grun "git-caps-granted" "v3";
+
   ok "fmt-use-pub"
     (Fmt.format ~file:"fu.vela" "use geom // g\npub   fn f() -> Int { 1 }\npub struct S { a: Int }\n"
      = "use geom  // g\n\npub fn f() -> Int { 1 }\n\npub struct S {\n    a: Int,\n}\n")

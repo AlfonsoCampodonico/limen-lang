@@ -583,6 +583,8 @@ let write_message oc (j : J.t) =
   flush oc
 
 let serve () =
+  (* never run git from here: a git dependency is fetched by the CLI *)
+  Package.offline := true;
   set_binary_mode_in stdin true;
   set_binary_mode_out stdout true;
   let st = create () in
