@@ -1,10 +1,19 @@
 (library
  (name vela)
  (libraries unix)
+ (foreign_stubs
+  (language c)
+  (names tls_stubs)
+  (extra_deps runtime/vela_tls.h)
+  (flags
+   (:standard
+    (:include tls_cflags.sexp))))
  ; the interpreter's calls into C libraries (foreign blocks)
  (foreign_stubs
   (language c)
   (names ffi_stubs))
+ (c_library_flags
+  (:include tls_libs.sexp))
  (flags
   (:standard -w +a-4-9-40-41-42-44-45-70 -warn-error -a)))
 
@@ -19,6 +28,29 @@
     (echo "let text = {xxrtxx|")
     (cat runtime/vela_rt.h)
     (echo "|xxrtxx}\n")))))
+
+; Find OpenSSL for TLS (see openssl_config.sh); without it vela builds
+; without TLS.
+(rule
+ (targets tls_cflags.sexp tls_libs.sexp openssl_config.ml)
+ (deps
+  openssl_config.sh
+  (env_var VELA_OPENSSL)
+  (env_var CC))
+ (action
+  (run sh %{dep:openssl_config.sh} tls_cflags.sexp tls_libs.sexp openssl_config.ml)))
+
+; Embed the TLS core, pasted into native programs that use TLS.
+(rule
+ (targets tls_text.ml)
+ (deps runtime/vela_tls.h)
+ (action
+  (with-stdout-to
+   tls_text.ml
+   (progn
+    (echo "let text = {xxtlsxx|")
+    (cat runtime/vela_tls.h)
+    (echo "|xxtlsxx}\n")))))
 
 ; Embed SPEC.md for `vela spec` and the MCP server.
 (rule

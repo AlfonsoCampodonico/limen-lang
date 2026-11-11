@@ -23,7 +23,7 @@ fn parse_names(body: Str) -> List[Str] { ... }
 
 ## Build and run
 
-Needs OCaml 5 and dune (`brew install ocaml dune`), plus a C compiler (`cc`, or set `CC`) for the native backend. Nothing else: `Net.get` speaks HTTP/1.1 itself (plain http only, no TLS yet).
+Needs OCaml 5 and dune (`brew install ocaml dune`), plus a C compiler (`cc`, or set `CC`) for the native backend, and OpenSSL for TLS (`brew install openssl@3` on macOS, `libssl-dev` or `openssl-devel` on Linux; `VELA_OPENSSL=PREFIX` points at another install). Without OpenSSL everything but TLS still works. `Net.get` speaks HTTP/1.1 itself, http and https.
 
 ```bash
 dune build
@@ -32,6 +32,8 @@ dune build
 ```bash
 dune test
 ```
+
+`dune test` runs every program in the interpreter and natively under AddressSanitizer (and ThreadSanitizer for the concurrent ones). The native builds and runs go in parallel, one per core (`VELA_JOBS=N` to change that), and compiled test binaries are cached in `~/.cache/vela/test-native` (or `$VELA_CACHE/test-native`), keyed by the compiler, its flags and the C source, so a run that changes no generated C compiles nothing; `VELA_TEST_CACHE=0` turns the cache off. `VELA_TEST_ONLY=prefix,...` runs only the matching program tests, `VELA_SKIP_NATIVE=1` skips the native half, and `VELA_TEST_SLOW=1` lists the slowest native jobs.
 
 ```bash
 dune exec vela -- run examples/repos.vela --grant net=api.github.com
@@ -52,6 +54,7 @@ dune exec vela -- build examples/repos.vela -o repos && ./repos --grant net=api.
 | `vela explain CODE` | Explain an error code, for example `vela explain E0302`. |
 | `vela test FILE [--native]` | Run the file's `test "name" { ... }` blocks, each isolated. A test that declares `(fs: Fs)` gets a fresh temporary directory. |
 | `vela fmt FILE... [--write\|--check]` | Print the canonical formatting, rewrite files, or check them. |
+| `vela doc FILE\|MODULE... [--std] [--all] [--html] [-o OUT]` | Documentation from doc comments (the `//` lines directly above an item) and signatures, as Markdown or one static HTML page. `vela doc --std --html -o std.html` documents the standard library. |
 | `vela lsp` | Language server on stdin/stdout. |
 | `vela mcp` | MCP server for coding agents on stdin/stdout. |
 | `vela spec` | Print the language specification. |
@@ -60,18 +63,20 @@ dune exec vela -- build examples/repos.vela -o repos && ./repos --grant net=api.
 
 - **Language server (`vela lsp`):**
   - diagnostics as you type
-  - hover with types, for example `let total: Int` or `print(Str) -> ()`
-  - go to definition for functions, locals, parameters, fields, types and variants
-  - completion: members after `.` (fields, methods, capabilities on `root`), otherwise locals, functions, types and keywords
+  - hover with types, for example `let total: Int` or `print(Str) -> ()`, and for a function, method or type its declaration and doc comment
+  - go to definition for functions, methods, locals, parameters, fields, types and variants, into other modules too (a standard library module opens as a temporary copy)
+  - find references across the modules the file uses
+  - rename, refused with a reason when it is unsafe: the new name must be a valid name of the right case, the symbol must be defined in the program (not built in or in the standard library), interface methods and methods an interface may rely on are left alone, and the renamed program must check with no new errors and with the new name referring to exactly the renamed places (so a rename never captures or is captured by another name). `S { name }` shorthand is expanded where needed.
+  - completion: members after `.` (fields, methods, capabilities on `root`, and after a module name such as `json.` its public functions, types and variants), otherwise locals, functions, types and keywords
   - the checker's auto-fixes as quick fixes
   - an outline of the file
 
   Positions count bytes, which is exact for ASCII source.
 - **Grammar ([grammar/vela.gbnf](grammar/vela.gbnf)):** in llama.cpp's GBNF format, for constrained decoding. It accepts every example, benchmark and test-suite program, and rejects the hand-written invalid cases. It is slightly more permissive than the parser: keywords aren't excluded from identifiers. It requires a space after keywords (`if x {`), which is the canonical style.
-- **Formatter (`vela fmt`):** keeps comments, number and string spellings, and the author's line breaks in lists and argument lists. The test suite formats every program and checks that the tree is unchanged, a second pass changes nothing, and no comment is lost.
+- **Formatter (`vela fmt`):** keeps comments where they were written, including inside an expression (a comment in a one-line argument list puts it one argument per line; one after a binary operator breaks the line there), number and string spellings, and the author's line breaks in lists and argument lists. The test suite formats every program and checks that the tree is unchanged, a second pass changes nothing, and no comment is lost.
 - **Tests (`vela test`):** `test "name" { assert_eq(...) }` blocks. They get no `root`; a test can declare `(fs: Fs, clock: Clock)` to get a fresh temporary directory, removed afterwards, and the real clock, and nothing else. Each runs isolated in the interpreter, or as its own process with `--native`.
-- **MCP server (`vela mcp`):** tools to check, run, test, format, read a type, list capabilities, explain an error, and read the spec. `vela_run` gives the program no grants, so code an agent just wrote can print but cannot touch files or the network, and it stops at a time limit.
-- **Checking the grammar:** `python3 grammar/gbnf_check.py` checks files against it with an Earley recognizer that follows llama.cpp's grammar syntax and acceptance rule. `grammar/check-suite.sh` runs it over every program in the test suite.
+- **MCP server (`vela mcp`):** tools to check, run, test, format, read a type, find references, rename (with the language server's safety checks), list capabilities, explain an error, and read the spec. `vela_run` gives the program no grants, so code an agent just wrote can print but cannot touch files or the network, and it stops at a time limit.
+- **Checking the grammar:** `python3 grammar/gbnf_check.py` checks files against it with an Earley recognizer that follows llama.cpp's grammar syntax and acceptance rule. `grammar/check-suite.sh` runs it over every program in the test suite. To check with llama.cpp's own GBNF parser and matcher (the code that does the constrained decoding), run `sh grammar/llama-check.sh`: it fetches llama.cpp at a pinned release into `~/.cache/vela` (or `$VELA_CACHE`), builds only its library, and runs the accept and reject cases, the examples, the benchmarks and every test-suite program through [grammar/llama_check.cpp](grammar/llama_check.cpp). It needs git, cmake and a C++ compiler, and is not part of `dune test`. Homebrew's llama.cpp cannot be used for this: it ships no grammar validator and not the internal header one needs.
 
 Neovim:
 
@@ -87,7 +92,7 @@ With VS Code, any generic LSP client extension works: point it at `vela lsp` for
 - Attenuation only narrows: `net.only(host)`, `fs.under(dir)`, `fs.read_only()`. Asking for more than you hold gives an empty capability.
 - Capabilities and function types cannot be stored in struct or enum fields (E0301, E0304), so authority always shows up in signatures. Generic instantiations like `Box[Net]` are allowed because the capability is visible in the type.
 - A function with no capability or function-typed parameters is pure.
-- Runtime enforcement: `Net` is an http/https host allowlist, redirects are not followed, and other schemes are refused. `Fs` resolves paths under its root and refuses absolute paths, `..` escapes and symlinks that lead outside.
+- Runtime enforcement: `Net` is an http/https host allowlist, redirects are not followed, and other schemes are refused. TLS certificates are always verified against the system's trusted certificates (`SSL_CERT_FILE` replaces them, for tests). `listen.on_tls(addr, cert, key)` serves TLS from certificate and key text the program read through its own `Fs` (or `Env`), so no new grant is involved. `Fs` resolves paths under its root and refuses absolute paths, `..` escapes and symlinks that lead outside.
 
 ## Calling C
 
@@ -213,4 +218,4 @@ Tuples `(Int, Str)` and maps `Map[Str, Int]` are built in: `let (q, r) = divmod(
 
 A panic ends only the task it happens in, and `catch(|| ...)` turns one into `Err(message)`, so `http.serve` answers 500 when a handler panics and keeps serving.
 
-Not yet: TLS. `Int` is 64-bit and wraps on overflow, identically in the interpreter and in native code.
+Not yet: nothing big; see the design doc's Known gaps. `Int` is 64-bit and wraps on overflow, identically in the interpreter and in native code.

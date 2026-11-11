@@ -128,50 +128,182 @@ let sanitize = [ "-O1"; "-g"; "-fsanitize=address,undefined"; "-fno-sanitize-rec
 
 let read_file p = In_channel.with_open_bin p In_channel.input_all
 
+(* ---------- running native builds in parallel ----------
+
+   Compiling with a sanitizer and running the result is most of the suite's
+   time, and each program is independent (sockets use port 0), so they run as
+   background jobs, VELA_JOBS at a time (default: one per core). The C source
+   is generated here, in order; the job compiles it and runs the binary, and a
+   callback checks the result when it ends. [drain] waits for all of them
+   before the summary.
+
+   Compiled binaries are cached by a digest of the compiler, its flags and the
+   C source, in $VELA_CACHE/test-native (default ~/.cache/vela), so a run that
+   changes no generated C compiles nothing. VELA_TEST_CACHE=0 turns it off.
+   Entries unused for a week are removed. *)
+
+let jobs_max =
+  match Option.bind (Sys.getenv_opt "VELA_JOBS") int_of_string_opt with
+  | Some n when n > 0 -> n
+  | _ -> (
+    try
+      let ic = Unix.open_process_in "getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null" in
+      let n = Option.bind (In_channel.input_line ic) (fun l -> int_of_string_opt (String.trim l)) in
+      ignore (Unix.close_process_in ic);
+      match n with Some n when n > 0 -> n | _ -> 4
+    with _ -> 4)
+
+let running : (int * (int -> unit)) list ref = ref []
+
+(* VELA_TEST_SLOW=1 lists the slowest jobs at the end. *)
+let job_times : (float * string) list ref = ref []
+let job_started : (int, float * string) Hashtbl.t = Hashtbl.create 64
+
+(* Wait for one job to end and run its callback with the exit code. *)
+let reap () =
+  let rec poll () =
+    let done_ =
+      List.find_map
+        (fun (pid, k) ->
+          match Unix.waitpid [ Unix.WNOHANG ] pid with
+          | 0, _ -> None
+          | _, Unix.WEXITED c -> Some (pid, k, c)
+          | _, (Unix.WSIGNALED s | Unix.WSTOPPED s) -> Some (pid, k, 128 + abs s)
+          | exception Unix.Unix_error (Unix.EINTR, _, _) -> None)
+        !running
+    in
+    match done_ with
+    | Some (pid, k, c) ->
+      running := List.filter (fun (p, _) -> p <> pid) !running;
+      (match Hashtbl.find_opt job_started pid with
+       | Some (t0, what) -> job_times := (Unix.gettimeofday () -. t0, what) :: !job_times; Hashtbl.remove job_started pid
+       | None -> ());
+      k c
+    | None -> Unix.sleepf 0.002; poll ()
+  in
+  poll ()
+
+let devnull = Unix.openfile "/dev/null" [ Unix.O_RDONLY ] 0
+
+(* Run shell command [cmd] as a job; [k] gets its exit status. *)
+let spawn cmd k =
+  while List.length !running >= jobs_max do reap () done;
+  let pid = Unix.create_process "/bin/sh" [| "/bin/sh"; "-c"; cmd |] devnull Unix.stdout Unix.stderr in
+  Hashtbl.replace job_started pid (Unix.gettimeofday (), cmd);
+  running := (pid, k) :: !running
+
+let drain () =
+  while !running <> [] do reap () done;
+  if Sys.getenv_opt "VELA_TEST_SLOW" <> None then
+    List.iteri
+      (fun i (t, cmd) ->
+        if i < 25 then
+          let exe = match String.split_on_char ';' cmd with _ :: _ -> (match List.rev (String.split_on_char '/' (List.hd (List.rev (String.split_on_char ';' cmd)))) with x :: _ -> x | [] -> cmd) | [] -> cmd in
+          Printf.eprintf "%6.2fs %s\n" t (String.sub exe 0 (min 80 (String.length exe))))
+      (List.sort (fun (a, _) (b, _) -> compare b a) !job_times)
+
+let cache_dir =
+  if Sys.getenv_opt "VELA_TEST_CACHE" = Some "0" then None
+  else
+    let base =
+      match Sys.getenv_opt "VELA_CACHE" with
+      | Some d when d <> "" -> Some d
+      | _ -> Option.map (fun h -> Filename.concat (Filename.concat h ".cache") "vela") (Sys.getenv_opt "HOME")
+    in
+    match base with
+    | None -> None
+    | Some base ->
+      let d = Filename.concat base "test-native" in
+      (try ignore (Sys.command (sprintf "mkdir -p %s" (Filename.quote d))) with _ -> ());
+      if Sys.file_exists d then Some d else None
+
+(* The compiler's identity, so a new compiler does not reuse old binaries. *)
+let cc_version =
+  lazy
+    (try
+       let ic = Unix.open_process_in (Native.cc () ^ " --version 2>/dev/null") in
+       let v = In_channel.input_all ic in
+       ignore (Unix.close_process_in ic);
+       v
+     with _ -> "")
+
+let () =
+  (* forget binaries nobody used for a week *)
+  match cache_dir with
+  | Some d -> ignore (Sys.command (sprintf "find %s -type f -mtime +7 -delete 2>/dev/null" (Filename.quote d)))
+  | None -> ()
+
+(* Build [items] into [exe] with [flags] and then run [run_cmd] (which
+   redirects the program's output itself), in the background. [k] gets
+   Ok (exit status) or Error (compiler output). *)
+(* A fresh path in tmpdir for a binary of test [name]: jobs run at the same
+   time, so two runs of one name must not share files. *)
+let job_count = ref 0
+let exe_path name = incr job_count; Filename.concat tmpdir (sprintf "%s-%d" name !job_count)
+
+let native_job ?tests ~flags items exe run_cmd (k : (int, string) result -> unit) =
+  let c_text, cflags, libs = Native.prepare (Native.c_source ?tests items) in
+  let libs = libs @ Native.link_flags (Ffi.libs items) in
+  let c_file = exe ^ ".c" in
+  Out_channel.with_open_bin c_file (fun oc -> output_string oc c_text);
+  let argv = Native.command ~flags ~cflags ~libs c_file exe in
+  let log = exe ^ ".cc" in
+  let q = Filename.quote in
+  let compile = String.concat " " (List.map q argv) ^ " >" ^ q log ^ " 2>&1" in
+  let build =
+    match cache_dir with
+    | None -> compile
+    | Some d ->
+      (* the paths differ from run to run; the command around them does not *)
+      let shape = Native.command ~flags ~cflags ~libs "prog.c" "prog" in
+      let key = Digest.to_hex (Digest.string (String.concat "\000" (Lazy.force cc_version :: shape @ [ c_text ]))) in
+      let cached = Filename.concat d key in
+      (* a hit is copied (and touched, so it stays); a miss is compiled and stored *)
+      sprintf "if [ -f %s ]; then touch %s && cp %s %s; else %s && cp %s %s.$$ && mv -f %s.$$ %s; fi" (q cached) (q cached) (q cached) (q exe)
+        compile (q exe) (q cached) (q cached) (q cached)
+  in
+  let failed = exe ^ ".ccfailed" in
+  (try Sys.remove failed with Sys_error _ -> ());
+  spawn (sprintf "( %s ) || { : > %s; exit 1; }; %s" build (q failed) run_cmd) (fun code ->
+      if Sys.file_exists failed then k (Error (try read_file log with Sys_error _ -> "")) else k (Ok code))
+
+let grant_args (grants : Interp.grants) =
+  List.concat_map (fun h -> [ "--grant"; "net=" ^ h ]) grants.net
+  @ List.concat_map (fun h -> [ "--grant"; "listen=" ^ h ]) grants.listen
+  @ List.concat_map (fun n -> [ "--grant"; "env=" ^ n ]) grants.env
+  @ List.concat_map (fun n -> [ "--grant"; "exec=" ^ n ]) grants.exec
+  @ List.concat_map (fun n -> [ "--grant"; "foreign=" ^ n ]) grants.foreign
+  @ (match grants.seed with Some s -> [ "--seed"; string_of_int s ] | None -> [])
+  @ (match grants.fs with Some (d, ro) -> [ "--grant"; "fs=" ^ d ^ if ro then ":ro" else "" ] | None -> [])
+
 (* With [feed], stdin comes from that shell command, and the program runs on
-   one worker thread, so a task that blocked its thread would stall the rest. *)
-let run_native ?(grants = Interp.no_grants) ?modules ?feed name src =
+   one worker thread, so a task that blocked its thread would stall the rest.
+   [k] gets Ok (exit status, stdout, stderr) or Error. *)
+let run_native ?(grants = Interp.no_grants) ?modules ?feed name src k =
   let items, ds, _ = compile ?modules name src in
-  if ds <> [] then Error "does not compile" else
-  let exe = Filename.concat tmpdir name in
-  match Native.build ~flags:sanitize items exe with
-  | Error m -> Error ("C compile failed:\n" ^ m)
-  | Ok () ->
-    let args =
-      List.concat_map (fun h -> [ "--grant"; "net=" ^ h ]) grants.Interp.net
-      @ List.concat_map (fun h -> [ "--grant"; "listen=" ^ h ]) grants.Interp.listen
-      @ List.concat_map (fun n -> [ "--grant"; "env=" ^ n ]) grants.Interp.env
-      @ List.concat_map (fun n -> [ "--grant"; "exec=" ^ n ]) grants.Interp.exec
-      @ List.concat_map (fun n -> [ "--grant"; "foreign=" ^ n ]) grants.Interp.foreign
-      @ (match grants.seed with Some s -> [ "--seed"; string_of_int s ] | None -> [])
-      @ (match grants.fs with Some (d, ro) -> [ "--grant"; "fs=" ^ d ^ if ro then ":ro" else "" ] | None -> [])
-      @ ("--" :: grants.args)
-    in
-    let o = exe ^ ".out" and e = exe ^ ".err" in
-    let cmd =
-      String.concat " " (List.map Filename.quote (exe :: args))
-      ^ sprintf " >%s 2>%s" (Filename.quote o) (Filename.quote e)
-    in
-    let env = "ASAN_OPTIONS=detect_leaks=0 VELA_LEAKCHECK=1 " in
-    let code =
-      match feed with
-      | None -> Sys.command (env ^ cmd)
-      | Some f -> Sys.command (sprintf "(%s) | %sVELA_THREADS=1 %s" f env cmd)
-    in
-    Ok (code, read_file o, read_file e)
+  if ds <> [] then k (Error "does not compile") else
+  let exe = exe_path name in
+  let args = grant_args grants @ ("--" :: grants.Interp.args) in
+  let o = exe ^ ".out" and e = exe ^ ".err" in
+  let cmd = String.concat " " (List.map Filename.quote (exe :: args)) ^ sprintf " >%s 2>%s" (Filename.quote o) (Filename.quote e) in
+  let env = "ASAN_OPTIONS=detect_leaks=0 VELA_LEAKCHECK=1 " in
+  let run_cmd = match feed with None -> env ^ cmd | Some f -> sprintf "(%s) | %sVELA_THREADS=1 %s" f env cmd in
+  native_job ~flags:sanitize items exe run_cmd (function
+    | Error m -> k (Error ("C compile failed:\n" ^ m))
+    | Ok code -> k (Ok (code, read_file o, read_file e)))
 
 let check_native name ?grants ?modules ?feed src ~want_out ~want_err_prefix =
   if native_for name then
-    match run_native ?grants ?modules ?feed name src with
-    | Error m -> ok (name ^ "/native") false m
-    | Ok (code, o, e) -> (
-      ok (name ^ "/native") (o = want_out) (sprintf "stdout %S, want %S (stderr %S)" o want_out e);
-      match want_err_prefix with
-      | None ->
-        ok (name ^ "/native-clean")
-          (code = 0 && e = "vela-leakcheck: 0 live\n")
-          (sprintf "exit %d, stderr %S" code e)
-      | Some p -> ok (name ^ "/native-panic") (String.starts_with ~prefix:p e) (sprintf "stderr %S" e))
+    run_native ?grants ?modules ?feed name src (function
+      | Error m -> ok (name ^ "/native") false m
+      | Ok (code, o, e) -> (
+        ok (name ^ "/native") (o = want_out) (sprintf "stdout %S, want %S (stderr %S)" o want_out e);
+        match want_err_prefix with
+        | None ->
+          ok (name ^ "/native-clean")
+            (code = 0 && e = "vela-leakcheck: 0 live\n")
+            (sprintf "exit %d, stderr %S" code e)
+        | Some p -> ok (name ^ "/native-panic") (String.starts_with ~prefix:p e) (sprintf "stderr %S" e)))
 
 (* Concurrency: the same program again under ThreadSanitizer. *)
 let tsan = [ "-O1"; "-g"; "-fsanitize=thread" ]
@@ -179,29 +311,31 @@ let tsan = [ "-O1"; "-g"; "-fsanitize=thread" ]
 let check_tsan name ?(grants = Interp.no_grants) ?feed src want =
   if native_for name && selected name then begin
     let items, ds, _ = compile name src in
-    let exe = Filename.concat tmpdir (name ^ "-tsan") in
+    let exe = exe_path (name ^ "-tsan") in
     if ds <> [] then ok (name ^ "/tsan") false "does not compile"
-    else
-    match Native.build ~flags:tsan items exe with
-    | Error m -> ok (name ^ "/tsan") false ("C compile failed:\n" ^ m)
-    | Ok () ->
+    else begin
       let args =
         (match grants.Interp.fs with Some (d, ro) -> [ "--grant"; "fs=" ^ d ^ if ro then ":ro" else "" ] | None -> [])
         @ List.concat_map (fun h -> [ "--grant"; "net=" ^ h ]) grants.Interp.net
         @ List.concat_map (fun h -> [ "--grant"; "listen=" ^ h ]) grants.Interp.listen
         @ List.concat_map (fun h -> [ "--grant"; "exec=" ^ h ]) grants.Interp.exec
         @ List.concat_map (fun h -> [ "--grant"; "foreign=" ^ h ]) grants.Interp.foreign
+        @ ("--" :: grants.Interp.args)
       in
       let o = exe ^ ".out" and e = exe ^ ".err" in
       let cmd =
         String.concat " " (List.map Filename.quote (exe :: args)) ^ sprintf " >%s 2>%s" (Filename.quote o) (Filename.quote e)
       in
       let env = "TSAN_OPTIONS=halt_on_error=1 VELA_THREADS=8 VELA_LEAKCHECK=1 " in
-      let code = match feed with None -> Sys.command (env ^ cmd) | Some f -> Sys.command (sprintf "(%s) | %s%s" f env cmd) in
-      let o = read_file o and e = read_file e in
-      ok (name ^ "/tsan")
-        (code = 0 && o = want && e = "vela-leakcheck: 0 live\n")
-        (sprintf "exit %d, stdout %S, stderr %S" code o e)
+      let run_cmd = match feed with None -> env ^ cmd | Some f -> sprintf "(%s) | %s%s" f env cmd in
+      native_job ~flags:tsan items exe run_cmd (function
+        | Error m -> ok (name ^ "/tsan") false ("C compile failed:\n" ^ m)
+        | Ok code ->
+          let o = read_file o and e = read_file e in
+          ok (name ^ "/tsan")
+            (code = 0 && o = want && e = "vela-leakcheck: 0 live\n")
+            (sprintf "exit %d, stdout %S, stderr %S" code o e))
+    end
   end
 
 let out name ?grants ?modules ?feed src want =
@@ -234,13 +368,13 @@ let exits name ?grants src want_out want_code =
      ok name (got = want_out && code = want_code) (sprintf "got %S exit %d, want %S exit %d" got code want_out want_code)
    | Error e -> ok name false e);
   if native_for name then
-    match run_native ?grants name src with
-    | Error m -> ok (name ^ "/native") false m
-    | Ok (code, o, e) ->
-      ok (name ^ "/native")
-        (o = want_out && code = want_code
-         && (String.ends_with ~suffix:"vela-leakcheck: 0 live\n" e || String.starts_with ~prefix:"error: " e))
-        (sprintf "stdout %S exit %d stderr %S, want %S exit %d" o code e want_out want_code)
+    run_native ?grants name src (function
+      | Error m -> ok (name ^ "/native") false m
+      | Ok (code, o, e) ->
+        ok (name ^ "/native")
+          (o = want_out && code = want_code
+           && (String.ends_with ~suffix:"vela-leakcheck: 0 live\n" e || String.starts_with ~prefix:"error: " e))
+          (sprintf "stdout %S exit %d stderr %S, want %S exit %d" o code e want_out want_code))
 
 (* Apply every fix's edits and return the new source. *)
 let apply_fixes src (ds : Diag.t list) =
@@ -250,6 +384,13 @@ let apply_fixes src (ds : Diag.t list) =
     (fun s (e : Diag.edit) ->
       String.sub s 0 e.at.lo ^ e.replacement ^ String.sub s e.at.hi (String.length s - e.at.hi))
     src edits
+
+(* TLS tests trust only the test CA in test/tls, in this process (the
+   interpreter) and in the native programs it starts. *)
+let tls_dir =
+  let d = Filename.concat (Sys.getcwd ()) "tls" in
+  if Sys.file_exists (Filename.concat d "ca.pem") then d else Filename.concat (Sys.getcwd ()) "test/tls"
+let () = Unix.putenv "SSL_CERT_FILE" (Filename.concat tls_dir "ca.pem")
 
 let main_wrap body = "fn main(root: Root) {\n    let out = root.stdout\n" ^ body ^ "\n}\n"
 
@@ -984,7 +1125,7 @@ fn main(root: Root) {
    | Error e -> ok "ffi-no-lib-ungranted" (e = "panic: foreign: library `vela_no_such_lib` is not granted (grant it with --grant foreign=vela_no_such_lib)") e
    | Ok _ -> ok "ffi-no-lib-ungranted" false "ran");
   if native_for "ffi-missing" && selected "ffi-missing" then
-    (match run_native ~grants:libc "ffi-missing-native" "foreign \"c\" {\n    fn vela_no_such_function() -> Int\n}\n\nfn main(root: Root) {\n    root.stdout.print(\"{vela_no_such_function(root.foreign)}\")\n}\n" with
+    run_native ~grants:libc "ffi-missing-native" "foreign \"c\" {\n    fn vela_no_such_function() -> Int\n}\n\nfn main(root: Root) {\n    root.stdout.print(\"{vela_no_such_function(root.foreign)}\")\n}\n" (function
      | Error m -> ok "ffi-missing/native" (Interp_util.find_sub m "vela_no_such_function" 0 <> None) m
      | Ok _ -> ok "ffi-missing/native" false "linked");
   (* the child sees PATH and only the variables the Env grant names *)
@@ -1104,12 +1245,13 @@ fn main(root: Root) -> Result[(), IoError] {
         })
     }
     out.print("{served}")
+    l.close()
     out.print("{net.get("https://127.0.0.1:{port}/")}")
     Ok(())
 }
 |} in
   let http_want =
-    "200 [\"content-length\"] None GET /a/b?x=1 HTTP/1.1\n200 [\"content-length\"] None GET /?q HTTP/1.1\n404 [\"content-type\", \"x-a\", \"content-length\"] Some(\"1, 2\") nope!\n200 [\"transfer-encoding\"] None Wikipedia\n301 [\"location\"] None until close\nFailed(\"http: incomplete response headers\")\nFailed(\"http: truncated body\")\nFailed(\"http: malformed header line\")\nFailed(\"http: bad chunk size\")\nFailed(\"http: more than 1000 response headers\")\nFailed(\"http: response headers larger than 64 KiB\")\n[11, 0]\nErr(Failed(\"https is not supported yet (vela has no TLS); use an http:// URL\"))\n"
+    "200 [\"content-length\"] None GET /a/b?x=1 HTTP/1.1\n200 [\"content-length\"] None GET /?q HTTP/1.1\n404 [\"content-type\", \"x-a\", \"content-length\"] Some(\"1, 2\") nope!\n200 [\"transfer-encoding\"] None Wikipedia\n301 [\"location\"] None until close\nFailed(\"http: incomplete response headers\")\nFailed(\"http: truncated body\")\nFailed(\"http: malformed header line\")\nFailed(\"http: bad chunk size\")\nFailed(\"http: more than 1000 response headers\")\nFailed(\"http: response headers larger than 64 KiB\")\n[11, 0]\nErr(Failed(\"Connection refused\"))\n"
   in
   let http_grants = { Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] } in
   out "net-get-http" ~grants:http_grants http_src http_want;
@@ -1399,7 +1541,8 @@ fn main(root: Root) {
     J.to_str (J.path (result (Lsp.handle st (req "textDocument/hover" (tdp text needle ?nth k)))) [ "contents"; "value" ])
   in
   ok "lsp-hover-let" (hover doc "total = " 0 = "```vela\nlet total: Int\n```") (hover doc "total = " 0);
-  ok "lsp-hover-call" (hover doc "dist(pt)" 0 = "```vela\nfn(Point) -> Int\n```") (hover doc "dist(pt)" 0);
+  (* a call shows the function's declaration (and its doc comment, if any) *)
+  ok "lsp-hover-call" (hover doc "dist(pt)" 0 = "```vela\nfn dist(p: Point) -> Int\n```") (hover doc "dist(pt)" 0);
   ok "lsp-hover-method" (hover doc "print(\"{" 0 = "```vela\nprint(Str) -> ()\n```") (hover doc "print(\"{" 0);
   ok "lsp-hover-fn" (hover doc "dist(p" 0 = "```vela\nfn dist(p: Point) -> Int\n```") (hover doc "dist(p" 0);
   let def text needle ?nth k =
@@ -1988,6 +2131,266 @@ fn main(root: Root) -> Result[(), IoError] {
 }
 |v}
     "served 6\nHTTP/1.1 200 OK|Content-Type: text/plain; charset=utf-8|Connection: keep-alive|Content-Length: 21||GET /a HTTP/1.1 body=HTTP/1.1 200 OK|Content-Type: text/plain; charset=utf-8|Connection: keep-alive|Content-Length: 27||POST /b HTTP/1.1 body=abcdeHTTP/1.1 500 Internal Server Error|Content-Type: text/plain; charset=utf-8|Connection: keep-alive|Content-Length: 14||internal errorHTTP/1.1 200 OK|Content-Type: text/plain; charset=utf-8|Connection: close|Content-Length: 21||GET /c HTTP/1.1 body=\nHTTP/1.1 200 OK|Content-Type: text/plain; charset=utf-8|Connection: close|Content-Length: 23||GET /old HTTP/1.0 body=\nHTTP/1.1 200 OK|Content-Type: text/plain; charset=utf-8|Connection: close|Content-Length: 22||\nHTTP/1.1 400 Bad Request|Content-Type: text/plain; charset=utf-8|Connection: close|Content-Length: 12||bad request\n\nforever: Failed(\"listener is closed\")\nstream: Failed(\"listener is closed\")\n200 close GET /x HTTP/1.1 body=\n200 POST /y HTTP/1.1 body=hello\n200 chunked one two three\n13 bytes\nFailed(\"http: connection closed before the response\")\n";
+  (* ---------- TLS ----------
+     test/tls holds a test CA (ca.pem, trusted through SSL_CERT_FILE, set at
+     the top of this file), a server certificate for localhost and
+     127.0.0.1, one for another name, and a self-signed one nobody trusts.
+     The programs read them through an Fs grant. *)
+  let tls_grants =
+    { Interp.no_grants with fs = Some (tls_dir, true); listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1"; "localhost" ] }
+  in
+  let tls_conn_src = {v|// Read until a "." arrives, or the peer closes or fails.
+fn read_msg(c: Conn) -> Result[Str, IoError] {
+    let mut got = ""
+    while !got.ends_with(".") {
+        let s = c.read()?
+        if s == "" {
+            return Ok(got)
+        }
+        got = got + s
+    }
+    Ok(got)
+}
+
+fn serve(l: Listener, n: Int) -> Str {
+    let mut log = []
+    let mut i = 0
+    while i < n {
+        match l.accept() {
+            Ok(c) => {
+                match read_msg(c) {
+                    Ok(s) => { let _ = c.write("echo {s.len()}") },
+                    Err(_) => log.push("handshake failed"),
+                }
+                c.close()
+            },
+            Err(e) => log.push("{e}"),
+        }
+        i = i + 1
+    }
+    log.join(", ")
+}
+
+fn big(n: Int) -> Str {
+    let mut s = "x"
+    while s.len() < n {
+        s = s + s
+    }
+    s + "."
+}
+
+fn call(net: Net, addr: Str, msg: Str) -> Str {
+    match net.connect_tls(addr) {
+        Ok(c) => {
+            let r = match c.write(msg) {
+                Ok(_) => "{c.read()}",
+                Err(e) => "{e}",
+            }
+            c.close()
+            r
+        },
+        Err(e) => "{e}",
+    }
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let out = root.stdout
+    let fs = root.fs
+    let net = root.net
+    let l = root.listen.on_tls("127.0.0.1:0", fs.read("server.pem")?, fs.read("server-key.pem")?)?
+    let untrusted = root.listen.on_tls("127.0.0.1:0", fs.read("untrusted.pem")?, fs.read("untrusted-key.pem")?)?
+    let other = root.listen.on_tls("127.0.0.1:0", fs.read("other.pem")?, fs.read("other-key.pem")?)?
+    let plain = root.listen.on("127.0.0.1:0")?
+    let port = l.port()
+    let got = group g {
+        g.go(|| serve(l, 2))
+        g.go(|| serve(untrusted, 1))
+        g.go(|| serve(other, 1))
+        g.go(|| {
+            // read the client's hello first, so closing sends no reset
+            match plain.accept() {
+                Ok(c) => { let _ = c.read(); c.close() },
+                Err(_) => {},
+            }
+            ""
+        })
+        g.go(|| call(net, "127.0.0.1:{port}", "hello."))
+        g.go(|| call(net, "localhost:{port}", big(300000)))
+        g.go(|| call(net, "localhost:{untrusted.port()}", "x."))
+        g.go(|| call(net, "127.0.0.1:{other.port()}", "x."))
+        g.go(|| call(net, "127.0.0.1:{plain.port()}", "x."))
+    }
+    for r in got {
+        out.print(r)
+    }
+    // a read waiting on a TLS connection is cancelled by the group's deadline
+    let quiet = group g {
+        g.go(|| {
+            match l.accept() {
+                Ok(c) => { let _ = read_msg(c); c.close() },
+                Err(_) => {},
+            }
+        })
+        g.go(|| {
+            match net.connect_tls("127.0.0.1:{port}") {
+                Ok(c) => {
+                    let waited = group w until root.clock.after(50) {
+                        w.go(|| "{c.read()}")
+                    }
+                    c.close()
+                    "{waited}"
+                },
+                Err(e) => "{e}",
+            }
+        })
+    }
+    out.print("{quiet}")
+    out.print("{root.listen.on_tls("127.0.0.1:0", "not a certificate", "")}")
+    out.print("{root.listen.on_tls("127.0.0.1:0", fs.read("server.pem")?, fs.read("other-key.pem")?)}")
+    out.print("{root.listen.on_tls("127.0.0.1:1", fs.read("server.pem")?, fs.read("server-key.pem")?)}")
+    out.print("{net.connect_tls("example.com:443")}")
+    out.print("{net.connect_tls("nonsense")}")
+    l.close()
+    Ok(())
+}
+|v} in
+  let tls_conn_want = "\nhandshake failed\nhandshake failed\n\nOk(\"echo 6\")\nOk(\"echo 524289\")\nFailed(\"tls: certificate verify failed: self-signed certificate\")\nFailed(\"tls: certificate verify failed: IP address mismatch\")\nFailed(\"tls: the connection was closed during the handshake\")\n[\"[None]\"]\nErr(Failed(\"tls: no PEM certificate in the certificate text\"))\nErr(Failed(\"tls: the private key does not match the certificate\"))\nErr(Denied(\"listen: 127.0.0.1:1 is not granted\"))\nErr(Denied(\"net: example.com:443 is not granted\"))\nErr(Failed(\"address must be HOST:PORT\"))\n" in
+  out "tls-conn" ~grants:tls_grants tls_conn_src tls_conn_want;
+  check_tsan "tls-conn" ~grants:tls_grants tls_conn_src tls_conn_want;
+  let tls_http_src = {v|use http
+
+fn route(r: http.Request) -> http.Response {
+    http.text(200, "{r.method} {r.path} {r.version} body={r.body}")
+}
+
+fn stream(r: http.Request, c: Conn) -> Result[(), IoError] {
+    http.write_head(c, 200, [http.Header { name: "Content-Type", value: "text/plain" }])?
+    for w in ["one ", "two ", "three"] {
+        http.write_chunk(c, w)?
+    }
+    http.end_body(c)
+}
+
+// Two requests on one kept-alive TLS connection, written at once.
+fn pipelined(net: Net, port: Int) -> Str {
+    match net.connect_tls("localhost:{port}") {
+        Ok(c) => {
+            let _ = c.write("GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nConnection: close\r\n\r\n")
+            let mut got = ""
+            let mut open = true
+            while open {
+                match c.read() {
+                    Ok(s) => if s == "" { open = false } else { got = got + s },
+                    Err(e) => { got = got + "{e}"; open = false },
+                }
+            }
+            c.close()
+            got.split("\r\n\r\n").len().to_str()
+        },
+        Err(e) => "{e}",
+    }
+}
+
+fn client(net: Net, p1: Int, p2: Int) -> Str {
+    let mut log = []
+    match http.get(net, "https://127.0.0.1:{p1}/x") {
+        Ok(r) => log.push("{r.status} {r.body}"),
+        Err(e) => log.push("{e}"),
+    }
+    match http.post(net, "https://localhost:{p1}/y", "text/plain", "hello") {
+        Ok(r) => log.push("{r.status} {r.body}"),
+        Err(e) => log.push("{e}"),
+    }
+    match http.request_fold(net, "GET", "https://127.0.0.1:{p2}/s", [], "", "", |a, s| a + s) {
+        Ok((r, body)) => log.push("{r.status} {r.header("transfer-encoding") ?? "-"} {body}"),
+        Err(e) => log.push("{e}"),
+    }
+    match net.get("https://localhost:{p1}/net?q=1") {
+        Ok(r) => log.push("{r.status} {r.headers.get("content-type")} {r.body}"),
+        Err(e) => log.push("{e}"),
+    }
+    log.push(pipelined(net, p1))
+    match http.get(net, "ftp://127.0.0.1/") {
+        Ok(r) => log.push("{r.status}"),
+        Err(e) => log.push("{e}"),
+    }
+    log.join("\n")
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let cert = root.fs.read("server.pem")?
+    let key = root.fs.read("server-key.pem")?
+    let l1 = root.listen.on_tls("127.0.0.1:0", cert, key)?
+    let l2 = root.listen.on_tls("127.0.0.1:0", cert, key)?
+    let p1 = l1.port()
+    let p2 = l2.port()
+    let net = root.net
+    let done = group g {
+        g.go(|| "forever: {http.serve_forever(l1, route)}")
+        g.go(|| "stream: {http.accept_forever(l2, |c| http.serve_stream(c, stream))}")
+        g.go(|| {
+            let log = client(net, p1, p2)
+            l1.close()
+            l2.close()
+            log
+        })
+    }
+    root.stdout.print(done.join("\n"))
+    Ok(())
+}
+|v} in
+  let tls_http_want = "forever: Failed(\"listener is closed\")\nstream: Failed(\"listener is closed\")\n200 GET /x HTTP/1.1 body=\n200 POST /y HTTP/1.1 body=hello\n200 chunked one two three\n200 Some(\"text/plain; charset=utf-8\") GET /net?q=1 HTTP/1.1 body=\n3\nFailed(\"http: the URL must start with http:// or https://\")\n" in
+  out "tls-http" ~grants:tls_grants tls_http_src tls_http_want;
+  check_tsan "tls-http" ~grants:tls_grants tls_http_src tls_http_want;
+  (* A TLS stream that ends without the close message may have been cut
+     short: Conn.read says so, and Net.get accepts it only when the response
+     is framed (Content-Length or chunked) and complete. *)
+  let tls_cut_src = {v|fn main(root: Root) {
+    let out = root.stdout
+    let port = root.args()[0]
+    let net = root.net
+    match net.get("https://127.0.0.1:{port}/framed") {
+        Ok(r) => out.print("{r.status} {r.body}"),
+        Err(e) => out.print("{e}"),
+    }
+    match net.get("https://127.0.0.1:{port}/close") {
+        Ok(r) => out.print("{r.status} {r.body}"),
+        Err(e) => out.print("{e}"),
+    }
+    match net.connect_tls("127.0.0.1:{port}") {
+        Ok(c) => {
+            let _ = c.write("GET /raw HTTP/1.1\r\n\r\n")
+            let mut got = ""
+            let mut last = Ok("")
+            let mut open = true
+            while open {
+                match c.read() {
+                    Ok(s) => if s == "" { open = false } else { got = got + s },
+                    Err(e) => { last = Err(e); open = false },
+                }
+            }
+            c.close()
+            out.print("{got.len()} {last}")
+        },
+        Err(e) => out.print("{e}"),
+    }
+}
+|v} in
+  let tls_cut_want =
+    "200 hello\nFailed(\"tls: the connection was closed without a TLS close message, so the data may be cut short\")\n30 Err(Failed(\"tls: the connection was closed without a TLS close message, so the data may be cut short\"))\n"
+  in
+  (if selected "tls-cut" then
+     let runs = if native_for "tls-cut" then 9 else 3 in
+     let ic =
+       Unix.open_process_args_in "python3"
+         [| "python3"; Filename.concat tls_dir "cut_server.py"; Filename.concat tls_dir "server.pem";
+            Filename.concat tls_dir "server-key.pem"; string_of_int runs |]
+     in
+     let port = String.trim (input_line ic) in
+     let grants = { Interp.no_grants with net = [ "127.0.0.1" ]; args = [ port ] } in
+     out "tls-cut" ~grants tls_cut_src tls_cut_want;
+     check_tsan "tls-cut" ~grants tls_cut_src tls_cut_want;
+     ignore (Unix.close_process_in ic));
   (* ---------- Rand, Env, args and the Fs additions ---------- *)
   let box = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "vela-box-%d" (Unix.getpid ())) in
   (try Unix.mkdir box 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
@@ -3359,6 +3762,103 @@ fn main(root: Root) {
   let _, ds, _ = Modules.load_and_check "std-http.vela" "use http\nuse json\n\nfn main(root: Root) {\n    root.stdout.print(http.reason(200))\n}\n" in
   ok "std-real-ok" (ds = []) (String.concat "; " (List.map (fun (d : Diag.t) -> d.code ^ " " ^ d.message) ds));
 
+  (* find references and rename on real programs: renaming every function,
+     struct, enum and variant of each example must be accepted (a missed
+     reference would make the renamed program fail to check), and the result
+     must check cleanly *)
+  let refs_failures = ref [] and renamed = ref 0 in
+  Array.iter
+    (fun f ->
+      if Filename.check_suffix f ".vela" then begin
+        let path = Filename.concat "../examples" f in
+        let src = In_channel.with_open_bin path In_channel.input_all in
+        let load overrides =
+          Modules.overlay := List.filter (fun (p, _) -> p <> path) overrides;
+          let text = Option.value ~default:src (List.assoc_opt path overrides) in
+          let r = Lsp.load_program path text in
+          Modules.overlay := [];
+          r
+        in
+        match load [] with
+        | [], _ -> ()
+        | items, ds when ds = [] ->
+          let occs = Refs.index items in
+          List.iter
+            (fun (o : Refs.occ) ->
+              if o.def && o.sp.file = path && (match o.key.[0] with 'f' | 't' | 'v' | 'd' -> true | _ -> false) && o.key <> "f:main" then begin
+                let items, _ = load [] in
+                let nw = if o.name.[0] >= 'A' && o.name.[0] <= 'Z' then o.name ^ "Renamed" else o.name ^ "_renamed" in
+                match Refs.rename ~load items path o.sp.lo nw with
+                | Ok files ->
+                  incr renamed;
+                  let text = Refs.apply_edits src (List.concat_map snd (List.filter (fun (p, _) -> p = path) files)) in
+                  (match load [ (path, text) ] with
+                   | _, [] -> ()
+                   | _, d :: _ -> refs_failures := (f ^ " " ^ o.key ^ ": " ^ d.message) :: !refs_failures)
+                | Error m when Interp_util.find_sub m "interface" 0 <> None -> ()
+                | Error m -> refs_failures := (f ^ " " ^ o.key ^ ": " ^ m) :: !refs_failures
+              end)
+            occs
+        | _ -> ()
+      end)
+    (if Sys.file_exists "../examples" then Sys.readdir "../examples" else [||]);
+  ok "refs-rename-examples" (!refs_failures = [] && (!renamed > 50 || not (Sys.file_exists "../examples"))) (sprintf "%d renamed; %s" !renamed (String.concat "\n" (List.rev !refs_failures)));
+
+  (* vela doc: doc comments directly above items, fields, variants and interface methods *)
+  let doc_src =
+    "// Geometry helpers.\n//\n// Second paragraph.\n\n// A point.\npub struct Point {\n    // Distance from the left.\n    x: Float,\n    y: Float,\n}\n\n// not a doc: a blank line follows\n\n// How far from the origin.\npub fn norm(self: Point) -> Float {\n    self.x\n}\n\npub enum Shape {\n    // A round one.\n    Circle(Float),\n    Dot,\n}\n\n// Things with an area.\npub interface Area {\n    // The area, in square units.\n    fn area(self) -> Float\n}\n\n// Shouts.\npub fn loud(self: Str) -> Str {\n    self.upper()\n}\n\n// Private.\nfn hidden() -> Int {\n    1\n}\n\npub fn pick[T: Area](xs: List[T], i: Int) -> T {\n    xs[i]\n}\n"
+  in
+  let md = Doc.load_source "geom" "geom.vela" doc_src in
+  let mdtext = Doc.markdown [ md ] in
+  let has s = Interp_util.find_sub mdtext s 0 <> None in
+  ok "doc-markdown"
+    (has "# Module `geom`\n\nGeometry helpers.\n\nSecond paragraph.\n"
+     && has "### struct `Point`\n\n```vela\npub struct Point {\n    x: Float,\n    y: Float,\n}\n```\n\nA point.\n\n- `x`: Distance from the left.\n"
+     && has "#### Methods\n\n```vela\npub fn norm(self: Point) -> Float\n```\n\nHow far from the origin.\n"
+     && has "- `Circle`: A round one.\n" && has "Things with an area.\n\n- `area`: The area, in square units.\n"
+     && has "## Methods on `Str`\n\n```vela\npub fn loud(self: Str) -> Str\n```\n\nShouts.\n"
+     && has "pub fn pick[T: Area](xs: List[T], i: Int) -> T\n"
+     && (not (has "hidden")) && not (has "not a doc"))
+    mdtext;
+  let all = Doc.markdown [ Doc.load_source ~all:true "geom" "geom.vela" doc_src ] in
+  ok "doc-all" (Interp_util.find_sub all "fn hidden() -> Int\n```\n\nPrivate.\n" 0 <> None) all;
+  let page = Doc.html [ md ] in
+  let hp s = Interp_util.find_sub page s 0 <> None in
+  ok "doc-html"
+    (hp "<!doctype html>" && hp "<p>How far from the origin.</p>" && hp "<h2>Methods on Str</h2>"
+     && hp "id=\"geom-Point\"" && hp "pick[T: Area](xs: List[T], i: Int) -&gt; T" && hp "<p>Geometry helpers.</p>\n<p>Second paragraph.</p>")
+    page;
+  (* every standard library module documents without error, and its functions have docs *)
+  let std = List.map (fun n -> Doc.load n) (Doc.std_names ()) in
+  let std_md = Doc.markdown std in
+  ok "doc-std" (List.length std = List.length !Modules.std_modules && Interp_util.find_sub std_md "pub fn sort_by[T]" 0 <> None) std_md;
+
+  (* comments inside an expression stay where they were written *)
+  let fmt_case name src want =
+    let got = try Fmt.format ~file:(name ^ ".vela") src with Diag.Fatal d -> "error: " ^ d.message in
+    ok name (got = want) (sprintf "got:\n%s\nwant:\n%s" got want);
+    check_fmt name src ()
+  in
+  let canonical name src = fmt_case name src src in
+  canonical "fmt-comment-chain"
+    "fn main(root: Root) {\n    let n = [1, 2, 3]\n        // keep the odd ones\n        .filter(|x| x % 2 == 1)  // odd\n        .map(|x| x * 10)\n    root.stdout.print(\"{n}\")\n}\n";
+  canonical "fmt-comment-list-end"
+    "fn main(root: Root) {\n    let xs = [\n        1,\n        2,\n        // more later\n    ]\n    root.stdout.print(\"{xs}\")\n}\n";
+  canonical "fmt-comment-call-end"
+    "fn add(a: Int, b: Int) -> Int {\n    a + b\n}\n\nfn main(root: Root) {\n    let s = add(\n        1,\n        2,  // two\n        // that is all\n    )\n    root.stdout.print(\"{s}\")\n}\n";
+  fmt_case "fmt-comment-args"
+    "fn add(a: Int, b: Int) -> Int {\n    a + b\n}\n\nfn main(root: Root) {\n    let s = add(1, // one\n        2)\n    root.stdout.print(\"{s}\")\n}\n"
+    "fn add(a: Int, b: Int) -> Int {\n    a + b\n}\n\nfn main(root: Root) {\n    let s = add(\n        1,  // one\n        2,\n    )\n    root.stdout.print(\"{s}\")\n}\n";
+  fmt_case "fmt-comment-binary"
+    "fn main(root: Root) {\n    let t = 1 + // first\n      2 * // second\n      3\n    root.stdout.print(\"{t}\")\n}\n"
+    "fn main(root: Root) {\n    let t = 1 +  // first\n        2 *  // second\n        3\n    root.stdout.print(\"{t}\")\n}\n";
+  fmt_case "fmt-comment-struct"
+    "struct P {\n    x: Int,\n    y: Int,\n}\n\nfn main(root: Root) {\n    let p = P { x: 1, // the x\n        y: 2 }\n    root.stdout.print(\"{p.x}\")\n}\n"
+    "struct P {\n    x: Int,\n    y: Int,\n}\n\nfn main(root: Root) {\n    let p = P {\n        x: 1,  // the x\n        y: 2,\n    }\n    root.stdout.print(\"{p.x}\")\n}\n";
+  fmt_case "fmt-comment-closure"
+    "fn main(root: Root) {\n    let f = |x: Int| // add one\n        x + 1\n    root.stdout.print(\"{f(1)}\")\n}\n"
+    "fn main(root: Root) {\n    let f = |x: Int|  // add one\n        x + 1\n    root.stdout.print(\"{f(1)}\")\n}\n";
+
   ok "fmt-use-pub"
     (Fmt.format ~file:"fu.vela" "use geom // g\npub   fn f() -> Int { 1 }\npub struct S { a: Int }\n"
      = "use geom  // g\n\npub fn f() -> Int { 1 }\n\npub struct S {\n    a: Int,\n}\n")
@@ -3381,7 +3881,8 @@ fn main(root: Root) {
     [ "../examples"; "../bench" ];
   ok "fmt-every-program" (!fmt_failures = [])
     (String.concat "\n\n" (List.map (fun (n, m) -> n ^ ": " ^ m) (List.rev !fmt_failures)));
-  ok "fmt-checked-count" (Hashtbl.length fmt_checked > 90 || Sys.getenv_opt "VELA_ONLY" <> None) (string_of_int (Hashtbl.length fmt_checked));
+  ok "fmt-checked-count" (Hashtbl.length fmt_checked > 90 || Sys.getenv_opt "VELA_TEST_ONLY" <> None) (string_of_int (Hashtbl.length fmt_checked));
 
+  drain ();
   Printf.printf "%d/%d passed\n" (!total - !failed) !total;
   if !failed > 0 then exit 1

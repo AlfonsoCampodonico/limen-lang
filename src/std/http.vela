@@ -1,6 +1,8 @@
-// HTTP/1.1 over plain TCP: a client on top of Net, and a server on top of
-// Listener and Conn. The server keeps connections alive between requests,
-// and bodies can be streamed in chunks both ways. No TLS yet.
+// HTTP/1.1: a client on top of Net, and a server on top of Listener and
+// Conn. The server keeps connections alive between requests, and bodies can
+// be streamed in chunks both ways. The client speaks TLS for https:// URLs
+// (Net.connect_tls); the server speaks TLS when its listener came from
+// Listen.on_tls, with nothing else to change.
 
 pub struct Header {
     name: Str,
@@ -316,28 +318,27 @@ fn head_text(first: Str, headers: List[Header], body: Str) -> Str {
 // ---------- client ----------
 
 struct Url {
+    tls: Bool,
     host: Str,
     port: Int,
     path: Str,
 }
 
 fn parse_url(url: Str) -> Result[Url, IoError] {
-    if url.starts_with("https://") {
-        return Err(bad("https is not supported yet"))
+    let tls = url.starts_with("https://")
+    if !tls && !url.starts_with("http://") {
+        return Err(bad("the URL must start with http:// or https://"))
     }
-    if !url.starts_with("http://") {
-        return Err(bad("the URL must start with http://"))
-    }
-    let rest = url.slice(7, url.len())
+    let rest = url.slice(if tls { 8 } else { 7 }, url.len())
     let slash = rest.index_of("/") ?? rest.len()
     let authority = rest.slice(0, slash)
     let path = if slash < rest.len() { rest.slice(slash, rest.len()) } else { "/" }
     match authority.index_of(":") {
         Some(k) => match authority.slice(k + 1, authority.len()).parse_int() {
-            Some(p) => Ok(Url { host: authority.slice(0, k), port: p, path }),
+            Some(p) => Ok(Url { tls, host: authority.slice(0, k), port: p, path }),
             None => Err(bad("bad port in URL")),
         },
-        None => Ok(Url { host: authority, port: 80, path }),
+        None => Ok(Url { tls, host: authority, port: if tls { 443 } else { 80 }, path }),
     }
 }
 
@@ -372,7 +373,8 @@ fn read_response[T](c: Conn, method: Str, init: T, f: fn(T, Str) -> T) -> Result
 // Returns the response, with an empty body, and the folded value.
 pub fn request_fold[T](net: Net, method: Str, url: Str, headers: List[Header], body: Str, init: T, f: fn(T, Str) -> T) -> Result[(Response, T), IoError] {
     let u = parse_url(url)?
-    let c = net.connect("{u.host}:{u.port}")?
+    let addr = "{u.host}:{u.port}"
+    let c = if u.tls { net.connect_tls(addr)? } else { net.connect(addr)? }
     let mut all = [Header { name: "Host", value: u.host }, Header { name: "Connection", value: "close" }]
     for h in headers {
         all.push(h)
