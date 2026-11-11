@@ -251,7 +251,9 @@ let apply_fixes src (ds : Diag.t list) =
 
 (* TLS tests trust only the test CA in test/tls, in this process (the
    interpreter) and in the native programs it starts. *)
-let tls_dir = Filename.concat (Sys.getcwd ()) "tls"
+let tls_dir =
+  let d = Filename.concat (Sys.getcwd ()) "tls" in
+  if Sys.file_exists (Filename.concat d "ca.pem") then d else Filename.concat (Sys.getcwd ()) "test/tls"
 let () = Unix.putenv "SSL_CERT_FILE" (Filename.concat tls_dir "ca.pem")
 
 let main_wrap body = "fn main(root: Root) {\n    let out = root.stdout\n" ^ body ^ "\n}\n"
