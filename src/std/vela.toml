@@ -1,0 +1,12 @@
+# The capabilities each standard library module may take. The compiler checks
+# the modules against this like any dependency's caps (E0320), so a std
+# module cannot quietly start taking a capability. A module missing from
+# this list may take none.
+[package]
+name = "std"
+
+[dependencies]
+json = { path = ".", caps = [] }
+list = { path = ".", caps = [] }
+text = { path = ".", caps = [] }
+http = { path = ".", caps = ["net", "listen"] }

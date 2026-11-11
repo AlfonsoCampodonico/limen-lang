@@ -45,7 +45,7 @@ dune exec vela -- build examples/repos.vela -o repos && ./repos --grant net=api.
 
 | Command | What it does |
 | --- | --- |
-| `vela run FILE [--native] [--grant net=HOST[:PORT]\|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST[:PORT]]... [--grant env=NAME\|*]... [--seed N] [-- ARGS...]` | Type-check, then run `main` in the interpreter, or compiled with `--native`. Stdout, Stdin, Clock and Rand are always granted; Net, Fs, Listen and Env only when granted. `--seed` makes `Rand` repeatable; arguments after `--` are `root.args()`. |
+| `vela run FILE [--native] [--grant net=HOST[:PORT]\|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST[:PORT]]... [--grant env=NAME\|*]... [--seed N] [-- ARGS...]` | Type-check, then run `main` in the interpreter, or compiled with `--native`. Stdout, Stdin, Clock and Rand are always granted; Net, Fs, Listen and Env only when granted, by flags or by `[grants]` in vela.toml. `--seed` makes `Rand` repeatable; arguments after `--` are `root.args()`. |
 | `vela build FILE [-o OUT] [--emit-c]` | Compile to a native binary through C. The binary takes the same `--grant` flags. `--emit-c` writes the C instead. |
 | `vela check FILE [--json]` | Type-check only. `--json` emits diagnostics with codes, spans, notes and machine-applicable fixes. |
 | `vela caps FILE [--json]` | List each function's authority: the capabilities in its signature, or `pure`. |
@@ -93,16 +93,27 @@ With VS Code, any generic LSP client extension works: point it at `vela lsp` for
 
 `use json` loads `json.vela` from next to the file, from a dependency, or from the standard library; its `pub` items are then `json.parse(...)`, `json.Value` and so on. Modules are merged into one program before checking, so both backends handle them unchanged.
 
-A `vela.toml` lists dependencies by path, and the capabilities each may use:
+A `vela.toml` lists dependencies, by local path or by git URL at a tag or commit, and the capabilities each may use:
 
 ```
 [dependencies]
 fetch = { path = "../fetch", caps = ["net"] }
+color = { git = "https://example.com/color.git", tag = "v1.2.0" }
 ```
+
+Git dependencies are fetched with `git` into a local cache (`~/.cache/vela`, or `$VELA_CACHE`). `vela.lock` records the exact commit and a hash of the files of each one, and every build checks the cache against it, so a moved tag or a changed copy cannot slip in. There is no central registry.
 
 Since capabilities only arrive as parameters, a dependency's signatures are a complete list of what it can do. If one asks for a capability it was not granted, the program does not compile (E0320).
 
-The standard library is written in Vela: `json` (parse, stringify, field access), `http` (an HTTP/1.1 client over `Net` and a server over `Listener`, one task per connection), `list` (`sort_by` and friends) and `text`. See [examples/http_demo.vela](examples/http_demo.vela) and SPEC.md sections 18 and 19.
+The same file can hold the program's own grants, so they are not retyped on every `vela run` (flags still add to them). A dependency's own vela.toml never grants anything:
+
+```
+[grants]
+fs = "data:ro"
+net = ["api.github.com"]
+```
+
+The standard library is written in Vela: `json` (parse, stringify, field access), `http` (an HTTP/1.1 client over `Net` and a server over `Listener`, one task per connection), `list` (`sort_by` and friends) and `text`. The standard library is checked like a dependency: `src/std/vela.toml` declares what each module may take (only `http` takes any: `net` and `listen`), and a std function that takes more is a compile error. The capability methods themselves (`Net.get`, `Fs.read`, ...) stay trusted, since they are where grants are enforced. See [examples/http_demo.vela](examples/http_demo.vela) and SPEC.md sections 18 and 19.
 
 ## Concurrency
 

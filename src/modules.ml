@@ -21,6 +21,9 @@ type modinfo = {
 (* module name -> dependency, for the last program loaded *)
 let module_pkg : (string * string) list ref = ref []
 
+(* the standard library modules in the last program loaded *)
+let std_loaded : string list ref = ref []
+
 let std_modules : (string * string) list ref = ref Std_text.modules (* name -> source *)
 
 (* A method is a function whose first parameter is `self`; it is named
@@ -370,6 +373,7 @@ let rename_item mods (m : modinfo) own (it : item) : item =
 let load ?(deps = []) path src : item list * Diag.t list =
   errors := [];
   module_pkg := [];
+  std_loaded := [];
   let mods : (string, modinfo) Hashtbl.t = Hashtbl.create 8 in
   match parse path src with
   | exception Diag.Fatal d -> ([], [ d ])
@@ -403,6 +407,7 @@ let load ?(deps = []) path src : item list * Diag.t list =
         let all = main :: List.of_seq (Hashtbl.to_seq_values mods) in
         let all = main :: List.sort (fun a b -> compare a.mname b.mname) (List.tl all) in
         module_pkg := List.filter_map (fun m -> Option.map (fun p -> (m.mname, p)) m.mpkg) all;
+        std_loaded := List.filter_map (fun m -> if String.starts_with ~prefix:"<std>" m.mfile then Some m.mname else None) all;
         let items =
           List.concat_map
             (fun m ->
@@ -415,7 +420,8 @@ let load ?(deps = []) path src : item list * Diag.t list =
       end)
 
 (* Load a program with the vela.toml around it (if any), then type-check it
-   and enforce each dependency's capability grants. *)
+   and enforce the capabilities of each standard library module and each
+   dependency. *)
 let load_and_check path src : item list * Diag.t list * Check.fn_info list =
   match Package.load path with
   | Error d -> ([], [ d ], [])
@@ -425,5 +431,8 @@ let load_and_check path src : item list * Diag.t list * Check.fn_info list =
     | [], (_ :: _ as ds) -> ([], ds, [])
     | items, _ ->
       let ds, infos = Check.check_program items in
+      (* standard library modules are checked against src/std/vela.toml,
+         with or without a vela.toml of the program's own *)
+      let ds = if ds = [] then Package.enforce ~std:true (Lazy.force Package.std_manifest) (List.map (fun m -> (m, m)) !std_loaded) infos else ds in
       let ds = match pkg with Some p when ds = [] -> Package.enforce p !module_pkg infos | _ -> ds in
       (items, ds, infos))

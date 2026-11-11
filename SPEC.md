@@ -373,6 +373,8 @@ The native backend implements this with reference counting and copy-on-write. A 
 
 `root.args()` is the `List[Str]` of command-line arguments after `--`: `vela run app.vela -- a b`.
 
+Grants can also be written once in the `[grants]` table of the program's vela.toml (section 18), so they are not retyped every run. `vela run` applies them first and the `--grant` flags add to them; a `--grant fs=...` flag replaces the fs grant, since there is only one. A binary from `vela build` reads only its flags.
+
 An ungranted `Net`, `Fs` or `Listen` still exists, but every operation on it returns `Err(Denied(...))`. `Listener` and `Conn` are capabilities too: you get them from `Listen.on`, `Listener.accept` and `Net.connect`.
 
 The rules:
@@ -685,6 +687,8 @@ Every diagnostic has a stable code. `vela explain CODE` prints its explanation, 
 | E0311 | `return` or `?` leaving a group |
 | E0320 | a dependency takes a capability vela.toml does not grant it |
 | E0321 | malformed vela.toml |
+| E0322 | a git dependency could not be fetched |
+| E0323 | vela.lock does not match: a malformed line, or a dependency whose files changed |
 | E0401 | module not found, or a qualified name without `use` |
 | E0402 | item is not `pub` |
 | E0403 | module has no such item |
@@ -791,25 +795,57 @@ pub fn load(text: Str) -> Result[json.Value, Str] {
 
 ### Packages and capabilities
 
-A vela.toml next to the program (or in a parent directory) lists its dependencies, and what each may do:
+A vela.toml next to the program (or in a parent directory) lists the program's own grants, its dependencies, and what each may do:
 
 ```
 [package]
 name = "app"
 
+[grants]                                           # what `vela run` grants the program
+fs = "data:ro"
+net = ["api.github.com"]
+env = ["HOME", "LANG"]
+
 [dependencies]
 json2 = { path = "vendor/json2" }                  # pure: no capabilities
 fetch = { path = "../fetch", caps = ["net"] }
+color = { git = "https://example.com/color.git", tag = "v1.2.0" }
+yaml = { git = "git@example.com:me/yaml.git", commit = "3f9c2e1d7a" }
 ```
 
+- `[grants]` takes `net`, `fs`, `listen` and `env`, each a string or a list of strings written exactly like the text after `--grant KIND=`. `fs` takes one directory, relative to vela.toml, with an optional `:ro`. Stdout, Stdin, Clock and Rand are always granted, so listing them is an error. Flags on the command line add to these grants.
+- Grants belong to the program being run: only the vela.toml found for the main file is read for them. A dependency's own vela.toml never grants anything, so adding or updating a dependency cannot widen what the program may do. A dependency gets capabilities in exactly one way: your code passes them to it, and only of the kinds its `caps` allow. `[grants]` decides what reaches `main`; `caps` decides which of those may cross into each dependency.
 - A dependency is a directory holding `NAME.vela`, plus any modules that file uses from the same directory.
 - `caps` lists what the dependency may use: `net` (Net and Conn), `listen` (Listen, Listener and Conn), `fs`, `stdout`, `stdin`, `clock`, `rand`, `env`. The default is none. No dependency can take `Root`.
 - Vela has no ambient authority, so a function can only use a capability that reaches it as a parameter. The checker therefore knows everything a dependency can ever do from its signatures, and rejects the program (E0320) if a dependency's function takes a capability it was not granted. Granting is still only an upper bound: at run time the dependency gets exactly the capabilities you pass it, which can be narrowed with `only` and `under`.
-- Only local paths are supported; there is no registry, versioning or lock file yet.
+- A dependency is a local directory (`path`) or a git repository (`git`) at a `tag` or a `commit` (lowercase hex, at least 7 characters). The URL is `https://`, `http://`, `ssh://`, `git://`, `file://` or `user@host:path`. There is no central registry: the URL is the name of the source.
+- A git dependency is fetched with the `git` command into a cache, one directory per commit: `$VELA_CACHE`, else `$XDG_CACHE_HOME/vela`, else `~/.cache/vela`. Fetching needs no grant because it happens in the compiler, before the program exists; `vela lsp` and `vela mcp` never fetch, and report a dependency that is not cached yet (E0322).
+- `vela.lock`, next to vela.toml, is written on the first build and should be committed. It holds one line per git dependency: name, URL, `tag:NAME` or `commit:HASH` as written in vela.toml, the full commit, and a BLAKE2b hash of the dependency's files:
+
+  ```
+  color https://example.com/color.git tag:v1.2.0 8d022128f5f177019f1e6aed46f75c93c90815f1 blake2b:5fea136b...
+  ```
+
+  Every build uses the locked commit, even if the tag has moved since, and checks the cached files against the hash (E0323). To update a dependency, change its `tag` or `commit`, or delete its line; vela fetches it and rewrites the line.
+- Each dependency must be listed in the program's vela.toml, including dependencies of dependencies: a dependency's own vela.toml is not read.
 
 ## 19. Standard library
 
 Written in Vela and built into the compiler; `use` any of them. They take capabilities only as parameters, like any other code.
+
+The standard library is checked like a dependency. `src/std/vela.toml` lists the capabilities each module may take, and every program that uses a module is checked against it (E0320), with or without a vela.toml of its own:
+
+| Module | May take |
+| --- | --- |
+| `json`, `list`, `text` | nothing: pure |
+| `http` | `net` (Net, Conn) and `listen` (Listener, Conn) |
+
+A module missing from the list may take nothing. `vela caps FILE` shows what each std function takes. What stays trusted, and why:
+
+- The built-in methods of the capabilities themselves (`Net.get`, `Fs.read`, `Listen.on`, ...), written in OCaml for the interpreter and C for the native runtime. They are where the grants are enforced (host allowlists, the fs root, read-only), so there is nothing below them to check them against; they are covered by the tests of both backends.
+- The built-in methods of plain values (`Str`, `List`, `Map`, channels, ...). They take no capability, so they cannot do I/O.
+- The std modules' source. It is embedded in the compiler, not fetched, so it is as trustworthy as the compiler binary; the manifest check makes sure that what it can do stays what it declares.
+- Callbacks. `http.serve(l, n, handler)` calls `handler` inside std code; the handler carries only the capabilities its closure captured from your code, which appear in your signatures, not std's.
 
 ### json
 
