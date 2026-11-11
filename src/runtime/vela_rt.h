@@ -14,6 +14,7 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <sys/time.h>
+#include <time.h>
 #include <errno.h>
 #include <signal.h>
 #include <fcntl.h>
@@ -1376,6 +1377,7 @@ static pthread_mutex_t w_idle_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t w_idle_cv = PTHREAD_COND_INITIALIZER;
 static int64_t w_nidle;
 static int64_t w_io_waiters;                                      /* fibers parked on sockets */
+static int64_t w_tm_count;                                        /* pending timers (sleeps, timeouts, deadlines) */
 static int w_main_done;
 static size_t w_stack_size = 1024 * 1024;                         /* reserved lazily, so 10k tasks are cheap */
 #define W_GUARD_BYTES (64 * 1024)                                 /* larger than any runtime stack frame */
@@ -1517,17 +1519,19 @@ static void w_sched_loop(WWorker *w, int is_main) {
       pthread_mutex_lock(&w_idle_mu);
       int64_t idle = __atomic_add_fetch(&w_nidle, 1, __ATOMIC_SEQ_CST);
       if (__atomic_load_n(&w_queued, __ATOMIC_SEQ_CST) == 0 && !__atomic_load_n(&w_main_done, __ATOMIC_ACQUIRE)) {
-        /* Every worker idle, nothing runnable, nothing waiting on I/O: no
-           task can ever wake another. Confirm after a short wait, then
-           report the deadlock instead of hanging. */
-        if (idle == __atomic_load_n(&w_nworkers, __ATOMIC_ACQUIRE) && __atomic_load_n(&w_io_waiters, __ATOMIC_SEQ_CST) == 0) {
+        /* Every worker idle, nothing runnable, nothing waiting on I/O or a
+           timer: no task can ever wake another. Confirm after a short wait,
+           then report the deadlock instead of hanging. */
+        if (idle == __atomic_load_n(&w_nworkers, __ATOMIC_ACQUIRE) && __atomic_load_n(&w_io_waiters, __ATOMIC_SEQ_CST) == 0
+            && __atomic_load_n(&w_tm_count, __ATOMIC_SEQ_CST) == 0) {
           struct timeval tv; gettimeofday(&tv, NULL);
           struct timespec ts = { tv.tv_sec, (long)tv.tv_usec * 1000 + 100000000L };
           if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
           int rc = pthread_cond_timedwait(&w_idle_cv, &w_idle_mu, &ts);
           if (rc == ETIMEDOUT && __atomic_load_n(&w_queued, __ATOMIC_SEQ_CST) == 0
               && __atomic_load_n(&w_nidle, __ATOMIC_SEQ_CST) == __atomic_load_n(&w_nworkers, __ATOMIC_ACQUIRE)
-              && __atomic_load_n(&w_io_waiters, __ATOMIC_SEQ_CST) == 0 && !__atomic_load_n(&w_main_done, __ATOMIC_ACQUIRE))
+              && __atomic_load_n(&w_io_waiters, __ATOMIC_SEQ_CST) == 0 && __atomic_load_n(&w_tm_count, __ATOMIC_SEQ_CST) == 0
+              && !__atomic_load_n(&w_main_done, __ATOMIC_ACQUIRE))
             w_fatal_c("all tasks are blocked (deadlock)", "every task is waiting");
         } else
           pthread_cond_wait(&w_idle_cv, &w_idle_mu);
@@ -1660,6 +1664,135 @@ static void w_main_finished(void) {
   pthread_mutex_unlock(&w_idle_mu);
 }
 
+/* ---------- timers ----------
+   Sleeps, `select` timeouts and group deadlines. A timer thread keeps a
+   min-heap of deadlines on the monotonic clock and sleeps until the
+   earliest; a sleeping task parks its fiber, so no worker thread waits.
+
+   A timer either wakes a fiber or calls a function. Waking goes through a
+   WSel token that every waker of that wait must claim first (done 0 -> 1),
+   so a fiber is woken once even when a timer races a channel. A function
+   runs on the timer thread with the timer lock held; removing the timer
+   under that lock is therefore enough to know it will not run. */
+
+typedef struct WSel { int done; int fired; } WSel;
+typedef struct WTimer {
+  int64_t at;                           /* monotonic deadline, ns */
+  int64_t pos;                          /* index in the heap, -1 when not in it */
+  WFiber *f; WSel *sel; int idx;        /* claim sel (fired = idx), then wake f */
+  void (*fire)(void *); void *arg;      /* or call fire(arg) */
+} WTimer;
+
+static pthread_mutex_t w_tm_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t w_tm_cv = PTHREAD_COND_INITIALIZER;
+static WTimer **w_tm_heap;
+static int64_t w_tm_n, w_tm_cap;
+static pthread_once_t w_tm_once = PTHREAD_ONCE_INIT;
+
+static int64_t w_mono_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+/* now + ms, saturating: a deadline far in the future never overflows */
+static int64_t w_deadline_ms(int64_t ms) {
+  if (ms > (int64_t)1000000000000) ms = (int64_t)1000000000000;   /* about 31 years */
+  return w_mono_ns() + ms * 1000000;
+}
+
+static void w_tm_swap(int64_t i, int64_t j) {
+  WTimer *t = w_tm_heap[i]; w_tm_heap[i] = w_tm_heap[j]; w_tm_heap[j] = t;
+  w_tm_heap[i]->pos = i; w_tm_heap[j]->pos = j;
+}
+static void w_tm_up(int64_t i) {
+  while (i > 0 && w_tm_heap[(i - 1) / 2]->at > w_tm_heap[i]->at) { w_tm_swap(i, (i - 1) / 2); i = (i - 1) / 2; }
+}
+static void w_tm_down(int64_t i) {
+  for (;;) {
+    int64_t l = 2 * i + 1, r = l + 1, m = i;
+    if (l < w_tm_n && w_tm_heap[l]->at < w_tm_heap[m]->at) m = l;
+    if (r < w_tm_n && w_tm_heap[r]->at < w_tm_heap[m]->at) m = r;
+    if (m == i) return;
+    w_tm_swap(i, m); i = m;
+  }
+}
+/* with w_tm_mu held */
+static void w_tm_unlink(WTimer *t) {
+  int64_t i = t->pos;
+  if (i < 0) return;
+  w_tm_n--;
+  if (i != w_tm_n) { w_tm_heap[i] = w_tm_heap[w_tm_n]; w_tm_heap[i]->pos = i; w_tm_down(i); w_tm_up(i); }
+  t->pos = -1;
+  __atomic_store_n(&w_tm_count, w_tm_n, __ATOMIC_SEQ_CST);
+}
+
+static void *w_timer_thread(void *arg) {
+  (void)arg;
+  pthread_mutex_lock(&w_tm_mu);
+  for (;;) {
+    if (w_tm_n == 0) { pthread_cond_wait(&w_tm_cv, &w_tm_mu); continue; }
+    WTimer *t = w_tm_heap[0];
+    int64_t now = w_mono_ns();
+    if (t->at > now) {
+      /* the condition variable takes wall-clock time; recheck on waking */
+      int64_t d = t->at - now;
+      struct timeval tv; gettimeofday(&tv, NULL);
+      int64_t ns = (int64_t)tv.tv_usec * 1000 + d % 1000000000;
+      struct timespec ts = { tv.tv_sec + (time_t)(d / 1000000000) + (time_t)(ns / 1000000000), (long)(ns % 1000000000) };
+      pthread_cond_timedwait(&w_tm_cv, &w_tm_mu, &ts);
+      continue;
+    }
+    w_tm_unlink(t);
+    if (t->fire) { t->fire(t->arg); continue; }
+    WFiber *f = t->f;
+    int zero = 0;
+    int claimed = __atomic_compare_exchange_n(&t->sel->done, &zero, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+    if (claimed) __atomic_store_n(&t->sel->fired, t->idx, __ATOMIC_RELEASE);
+    /* t lives on the waiting fiber's stack: do not touch it after unlocking */
+    pthread_mutex_unlock(&w_tm_mu);
+    if (claimed) w_wake(f);
+    pthread_mutex_lock(&w_tm_mu);
+  }
+  return NULL;
+}
+static void w_tm_start(void) {
+  pthread_t th;
+  pthread_create(&th, NULL, w_timer_thread, NULL);
+  pthread_detach(th);
+}
+static void w_tm_add(WTimer *t) {
+  pthread_once(&w_tm_once, w_tm_start);
+  pthread_mutex_lock(&w_tm_mu);
+  if (w_tm_n == w_tm_cap) {
+    w_tm_cap = w_tm_cap ? w_tm_cap * 2 : 64;
+    w_tm_heap = (WTimer **)w_realloc(w_tm_heap, sizeof(WTimer *) * (size_t)w_tm_cap);
+  }
+  t->pos = w_tm_n; w_tm_heap[w_tm_n++] = t;
+  w_tm_up(t->pos);
+  __atomic_store_n(&w_tm_count, w_tm_n, __ATOMIC_SEQ_CST);
+  if (t->pos == 0) pthread_cond_signal(&w_tm_cv);   /* a new earliest deadline */
+  pthread_mutex_unlock(&w_tm_mu);
+}
+/* Take a timer out if it has not fired. Once this returns, a fire function
+   is not running and will not run. */
+static void w_tm_remove(WTimer *t) {
+  pthread_mutex_lock(&w_tm_mu);
+  w_tm_unlink(t);
+  pthread_mutex_unlock(&w_tm_mu);
+}
+
+/* Clock.sleep(ms): park until the time has passed. */
+static void Cap_sleep(int64_t ms) {
+  if (ms <= 0) return;
+  WSel tok = { 0, -1 };
+  WTimer t;
+  memset(&t, 0, sizeof t);
+  t.at = w_deadline_ms(ms); t.pos = -1; t.f = w_current(); t.sel = &tok; t.idx = 0;
+  w_prepare_park();
+  w_tm_add(&t);
+  w_park_now();
+}
+
 /* ---------- group / go ---------- */
 
 typedef struct WGroup WGroup;
@@ -1761,7 +1894,6 @@ static inline void Group_share(WGroup *g) { (void)g; }
 /* A waiting task. A `select` puts one on every channel it waits on, all
    pointing to one WSel; the first channel to act claims it (done 0 -> 1) and
    the others then skip those waiters as stale. */
-typedef struct WSel { int done; int fired; } WSel;
 typedef struct WChWait { WFiber *f; void *val; int ok; struct WChWait *next; WSel *sel; int idx; } WChWait;
 typedef struct WChan {
   int64_t rc; pthread_mutex_t mu;

@@ -282,16 +282,20 @@ let binop op a b sp =
 
 (* ---------- cooperative scheduler ----------
    Tasks are coroutines built on OCaml 5 effects. A task that cannot go on
-   performs Block with the condition it waits for (and optionally a socket to
-   poll); the scheduler resumes the first task whose condition holds. *)
+   performs Block with the condition it waits for, optionally a socket to
+   poll and a time to wake up at; the scheduler resumes the first task whose
+   condition holds, and when none can go on it sleeps until a socket is
+   ready or the earliest wake-up time. *)
 
 type io_wait = (sock * bool) option (* socket, true = wait for writing *)
-type _ Effect.t += Block : (unit -> bool) * io_wait -> unit Effect.t
+type _ Effect.t += Block : (unit -> bool) * io_wait * float option -> unit Effect.t
 
-let runq : ((unit -> bool) * io_wait * (unit -> unit)) Queue.t = Queue.create ()
+let runq : ((unit -> bool) * io_wait * float option * (unit -> unit)) Queue.t = Queue.create ()
 let io_epoch = ref 0 (* advances after each round of waiting for I/O *)
 
-let wait_until ?io cond = if not (cond ()) then Effect.perform (Block (cond, io))
+let now () = Unix.gettimeofday ()
+
+let wait_until ?io ?at cond = if not (cond ()) then Effect.perform (Block (cond, io, at))
 
 let rec run_fiber (f : unit -> unit) =
   Effect.Deep.match_with f ()
@@ -300,11 +304,18 @@ let rec run_fiber (f : unit -> unit) =
       effc =
         (fun (type a) (e : a Effect.t) ->
           match e with
-          | Block (cond, io) ->
-            Some (fun (k : (a, unit) Effect.Deep.continuation) -> Queue.push (cond, io, fun () -> Effect.Deep.continue k ()) runq)
+          | Block (cond, io, at) ->
+            Some (fun (k : (a, unit) Effect.Deep.continuation) -> Queue.push (cond, io, at, fun () -> Effect.Deep.continue k ()) runq)
           | _ -> None) }
 
-let spawn_fiber f = Queue.push ((fun () -> true), None, fun () -> run_fiber f) runq
+let spawn_fiber f = Queue.push ((fun () -> true), None, None, fun () -> run_fiber f) runq
+
+(* Clock.sleep: wait without holding up other tasks. *)
+let sleep_ms (ms : int64) =
+  if ms > 0L then begin
+    let at = now () +. (Int64.to_float (min ms 1_000_000_000_000L) /. 1000.) in
+    wait_until ~at (fun () -> now () >= at)
+  end
 
 (* Run tasks until [finished ()]. *)
 let rec schedule finished sp =
@@ -313,22 +324,24 @@ let rec schedule finished sp =
     let rec pick i =
       if i = n then false
       else
-        let ((cond, _, k) as entry) = Queue.pop runq in
+        let ((cond, _, _, k) as entry) = Queue.pop runq in
         if cond () then (k (); true) else (Queue.push entry runq; pick (i + 1))
     in
     if not (pick 0) then begin
       let waits =
-        Queue.fold (fun acc (_, io, _) -> match io with Some ((s : sock), w) when not s.shut -> (s.fd, w) :: acc | _ -> acc) [] runq
+        Queue.fold (fun acc (_, io, _, _) -> match io with Some ((s : sock), w) when not s.shut -> (s.fd, w) :: acc | _ -> acc) [] runq
       in
-      if waits = [] then raise (Panic ("all tasks are blocked (deadlock)", sp));
+      let wake = Queue.fold (fun acc (_, _, at, _) -> match (at, acc) with Some t, Some u -> Some (Float.min t u) | Some t, None -> Some t | None, _ -> acc) None runq in
+      if waits = [] && wake = None then raise (Panic ("all tasks are blocked (deadlock)", sp));
+      let timeout = match wake with Some t -> Float.max 0. (t -. now ()) | None -> -1. in
       (* select() cannot watch descriptors past FD_SETSIZE; then just pause
          briefly. Either way, waiting tasks retry their operation. *)
       let small = List.for_all (fun (fd, _) -> (Obj.magic fd : int) < 1000) waits in
       (if small then
          let rd = List.filter_map (fun (fd, w) -> if w then None else Some fd) waits in
          let wr = List.filter_map (fun (fd, w) -> if w then Some fd else None) waits in
-         ignore (Unix.select rd wr [] (-1.))
-       else Unix.sleepf 0.001);
+         ignore (try Unix.select rd wr [] timeout with Unix.Unix_error (Unix.EINTR, _, _) -> ([], [], []))
+       else Unix.sleepf (if timeout < 0. then 0.001 else Float.min timeout 0.001));
       incr io_epoch
     end;
     schedule finished sp
@@ -836,6 +849,7 @@ and cap_call rt c name args =
   | CStdout, "print", [ VStr s ] -> rt.out (s ^ "\n"); VUnit
   | CStdout, "write", [ VStr s ] -> rt.out s; VUnit
   | CClock, "now_ms", [] -> VInt (Int64.of_float (Unix.gettimeofday () *. 1000.))
+  | CClock, "sleep", [ VInt ms ] -> sleep_ms ms; VUnit
   | CRand, "float", [] -> VFloat (Int64.to_float (Int64.shift_right_logical (rand_next ()) 11) *. 0x1p-53)
   | CStdin, "read_line", [] -> (
     match In_channel.input_line stdin with

@@ -491,6 +491,7 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     | "cap_print", TCap Stdout -> line (sprintf "Cap_print(%s, true);" (arg 1)); set "0"
     | "cap_write", TCap Stdout -> line (sprintf "Cap_print(%s, false);" (arg 1)); set "0"
     | "cap_now_ms", _ -> set "Cap_now_ms()"
+    | "cap_sleep", TCap Clock -> line (sprintf "Cap_sleep(%s);" (arg 1)); set "0"
     | "cap_int", TCap Rand -> set (sprintf "Cap_rand_int(%s, %s, %s)" (arg 1) (arg 2) (where sp))
     | "cap_float", TCap Rand -> set "Cap_rand_float()"
     | "cap_args", TCap Root -> set "Cap_args()"

@@ -4,6 +4,13 @@ let sprintf = Printf.sprintf
 let total = ref 0
 let failed = ref 0
 
+(* VELA_TEST_ONLY=a,b runs only the program tests whose names start with
+   one of those prefixes (for working on a feature; the full run ignores it). *)
+let selected name =
+  match Sys.getenv_opt "VELA_TEST_ONLY" with
+  | None | Some "" -> true
+  | Some ps -> List.exists (fun p -> String.starts_with ~prefix:p name) (String.split_on_char ',' ps)
+
 let ok name cond msg =
   incr total;
   if not cond then begin
@@ -137,7 +144,7 @@ let check_native name ?grants ?modules src ~want_out ~want_err_prefix =
 let tsan = [ "-O1"; "-g"; "-fsanitize=thread" ]
 
 let check_tsan name ?(grants = Interp.no_grants) src want =
-  if native_enabled then begin
+  if native_enabled && selected name then begin
     let items, ds, _ = compile name src in
     let exe = Filename.concat tmpdir (name ^ "-tsan") in
     if ds <> [] then ok (name ^ "/tsan") false "does not compile"
@@ -162,20 +169,24 @@ let check_tsan name ?(grants = Interp.no_grants) src want =
   end
 
 let out name ?grants ?modules src want =
+  if selected name then begin
   (match run ?grants ?modules name src with
    | Ok (got, _) -> ok name (got = want) (sprintf "got %S, want %S" got want)
    | Error e -> ok name false e);
   check_native name ?grants ?modules src ~want_out:want ~want_err_prefix:None
+  end
 
 let errs ?modules name src want =
   let _, ds, _ = compile ?modules name src in
   ok name (codes ds = want) (sprintf "got [%s], want [%s]" (String.concat " " (codes ds)) (String.concat " " want))
 
 let panics name src want =
+  if selected name then begin
   (match run name src with
    | Error e -> ok name (e = "panic: " ^ want) (sprintf "got %S" e)
    | Ok (o, _) -> ok name false ("no panic, output " ^ o));
   check_native name src ~want_out:"" ~want_err_prefix:(Some ("panic: " ^ want ^ "\n"))
+  end
 
 (* Apply every fix's edits and return the new source. *)
 let apply_fixes src (ds : Diag.t list) =
@@ -1177,6 +1188,96 @@ fn main(root: Root) {
   out "catch-frees-abandoned" "fn work(i: Int) -> Int {\n    let mut xs = []\n    let mut m: Map[Str, List[Int]] = map()\n    let mut k = 0\n    while k < 20 {\n        xs.push(\"item {k}\")\n        m[\"k{k}\"] = [k, k + 1]\n        k = k + 1\n    }\n    let f = |n: Int| xs.len() + n\n    if i % 2 == 0 {\n        panic(\"bad {i}\")\n    }\n    f(m.len())\n}\n\nfn main(root: Root) {\n    let mut ok = 0\n    let mut bad = 0\n    let mut i = 0\n    while i < 10000 {\n        match catch(|| work(i)) {\n            Ok(_) => { ok = ok + 1 },\n            Err(_) => { bad = bad + 1 },\n        }\n        i = i + 1\n    }\n    let r = catch(|| group g {\n        for n in [1, 2, 3] {\n            g.go(|| work(n))\n        }\n    })\n    root.stdout.print(\"{ok} {bad} {r.is_err()}\")\n}\n" "5000 5000 true\n";
   out "catch-unwinds-main-loop" "struct Req { path: Str, tags: List[Str] }\n\nfn handle(r: Req) -> Int {\n    let n = r.tags.len()\n    if r.path == \"/bad\" {\n        panic(\"bad path\")\n    }\n    n\n}\n\nfn main(root: Root) {\n    let mut i = 0\n    let mut errs = 0\n    while i < 100 {\n        let req = Req { path: if i % 2 == 0 { \"/bad\" } else { \"/ok\" }, tags: [\"a{i}\", \"b\"] }\n        match catch(|| handle(req)) {\n            Ok(_) => {},\n            Err(_) => { errs = errs + 1 },\n        }\n        i = i + 1\n    }\n    root.stdout.print(\"{errs}\")\n}\n" "50\n";
   check_tsan "group-body-panics-tsan" "fn slow(n: Int) -> Int {\n    let mut i = 0\n    let mut s = 0\n    while i < 20000 {\n        s = s + i % (n + 1)\n        i = i + 1\n    }\n    s\n}\n\nfn main(root: Root) {\n    let mut k = 0\n    let mut errs = 0\n    while k < 50 {\n        let r = catch(|| group g {\n            g.go(|| slow(1))\n            g.go(|| slow(2))\n            panic(\"boom {k}\")\n        })\n        if r.is_err() { errs = errs + 1 }\n        k = k + 1\n    }\n    root.stdout.print(\"{errs}\")\n}\n" "50\n";
+
+  (* ---------- timers ---------- *)
+  let sleepers = {|fn main(root: Root) {
+    let out = root.stdout
+    let clock = root.clock
+    let start = clock.now_ms()
+    // tasks wake in the order of their deadlines
+    let c: Chan[Str] = channel(4)
+    group g {
+        g.go(|| {
+            clock.sleep(300)
+            c.send("c")
+            0
+        })
+        g.go(|| {
+            clock.sleep(150)
+            c.send("b")
+            0
+        })
+        g.go(|| {
+            c.send("a")
+            0
+        })
+        g.go(|| {
+            let mut s = ""
+            let mut i = 0
+            while i < 3 {
+                s = s + (c.recv() ?? "?")
+                i = i + 1
+            }
+            out.print(s)
+            0
+        })
+    }
+    // a sleeping task parks: a thousand 50 ms sleeps take about 50 ms
+    let n = group h {
+        let mut i = 0
+        while i < 1000 {
+            h.go(|| {
+                clock.sleep(50)
+                1
+            })
+            i = i + 1
+        }
+    }
+    clock.sleep(0)
+    clock.sleep(-5)
+    let el = clock.now_ms() - start
+    out.print("{n.sum()} {el >= 350} {el < 3000}")
+}
+|} in
+  out "clock-sleep" sleepers "abc\n1000 true true\n";
+  check_tsan "clock-sleep-tsan" sleepers "abc\n1000 true true\n";
+  (* a task waiting on a channel while another sleeps is not a deadlock *)
+  out "clock-sleep-not-deadlock" {|fn main(root: Root) {
+    let clock = root.clock
+    let c: Chan[Int] = channel(1)
+    let r = group g {
+        g.go(|| c.recv() ?? 0)
+        g.go(|| {
+            clock.sleep(400)
+            c.send(7)
+            0
+        })
+    }
+    root.stdout.print("{r}")
+}
+|} "[7, 0]\n";
+  out "clock-sleep-interface" {|interface Sleeper {
+    fn sleep(self, ms: Int)
+}
+
+struct FakeClock {
+    t: Int,
+}
+
+fn sleep(self: FakeClock, ms: Int) {
+}
+
+fn nap[C: Sleeper](c: C) -> Int {
+    c.sleep(1)
+    c.sleep(1)
+    2
+}
+
+fn main(root: Root) {
+    root.stdout.print("{nap(root.clock) + nap(FakeClock { t: 0 })}")
+}
+|} "4\n";
+  errs "sleep-ambient" (main_wrap "    sleep(10)") [ "E0302" ];
   out "catch-in-task-frees-request" "struct Req {\n    path: Str,\n    hs: List[Str],\n}\n\nfn handler(r: Req) -> Str {\n    let e: List[Str] = []\n    r.path + e[0]\n}\n\nfn serve(n: Int) -> Str {\n    let req = Req { path: \"/p{n}\", hs: [\"a{n}\", \"b\"] }\n    catch(|| handler(req)) ?? \"500\"\n}\n\nfn main(root: Root) {\n    let rs = group g {\n        for n in [1, 2, 3] {\n            g.go(|| serve(n))\n        }\n    }\n    root.stdout.print(\"{rs}\")\n}\n" "[\"500\", \"500\", \"500\"]\n";
   errs "catch-arity" (main_wrap "    let r = catch(1, 2)") [ "E0107" ];
 

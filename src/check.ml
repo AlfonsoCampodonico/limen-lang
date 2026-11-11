@@ -87,7 +87,7 @@ let ambient =
     ("open", "Fs", "fs.read(path)"); ("read_file", "Fs", "fs.read(path)");
     ("write_file", "Fs", "fs.write(path, text)"); ("fetch", "Net", "net.get(url)");
     ("http_get", "Net", "net.get(url)"); ("now", "Clock", "clock.now_ms()");
-    ("time", "Clock", "clock.now_ms()"); ("random", "Rand", "rand.int(lo, hi)");
+    ("time", "Clock", "clock.now_ms()"); ("sleep", "Clock", "clock.sleep(ms)"); ("random", "Rand", "rand.int(lo, hi)");
     ("rand", "Rand", "rand.int(lo, hi)"); ("input", "Stdin", "stdin.read_line()");
     ("read_line", "Stdin", "stdin.read_line()"); ("getenv", "Env", "env.get(name)") ]
 
@@ -303,7 +303,7 @@ let methods (t : ty) : (string * (unit -> ty list * ty)) list =
       m "is_dir" [ TStr ] TBool;
       m "exists" [ TStr ] TBool; m "under" [ TStr ] (TCap Fs); m "read_only" [] (TCap Fs) ]
   | TCap Stdout -> [ m "print" [ TStr ] TUnit; m "write" [ TStr ] TUnit ]
-  | TCap Clock -> [ m "now_ms" [] TInt ]
+  | TCap Clock -> [ m "now_ms" [] TInt; m "sleep" [ TInt ] TUnit ]
   | TCap Rand -> [ m "int" [ TInt; TInt ] TInt; m "float" [] TFloat ]
   | TCap Stdin -> [ m "read_line" [] (opt TStr); m "read_all" [] TStr ]
   | TCap Env -> [ m "get" [ TStr ] (opt TStr) ]

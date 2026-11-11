@@ -401,8 +401,8 @@ let results = group g {
 - `g` can only be used as `g.go(...)` directly in the body. It cannot be stored, passed, returned, or used inside a closure (E0310).
 - The body cannot leave early with `return` or `?` (E0311), and `break` and `continue` cannot target loops outside the group.
 - Tasks share data by value, so there are no data races. A task reaches the world only through capabilities its closure captured. Spawning is not a capability.
-- Tasks are lightweight: natively each is a fiber with a small stack, scheduled on one worker thread per core (`VELA_THREADS` overrides this), and a task waiting on a group, a channel or a socket parks without blocking a thread. The interpreter runs tasks as coroutines. Output printed by tasks may interleave differently between the two.
-- If every task is waiting and nothing can wake one, the program panics with `all tasks are blocked (deadlock)` instead of hanging.
+- Tasks are lightweight: natively each is a fiber with a small stack, scheduled on one worker thread per core (`VELA_THREADS` overrides this), and a task waiting on a group, a channel, a socket or `clock.sleep(ms)` parks without blocking a thread. The interpreter runs tasks as coroutines. Output printed by tasks may interleave differently between the two.
+- If every task is waiting and nothing can wake one (no socket and no timer can), the program panics with `all tasks are blocked (deadlock)` instead of hanging.
 - A panic in a task ends only that task. The group still waits for the others, then passes the first panic on (section 15).
 
 ### Channels
@@ -461,6 +461,15 @@ while nums_open || words_open {
 - A closed channel is always ready to receive (`None`), so turn its arm off with a guard: `if cond` after the operation skips the arm when `cond` is false. If every arm is off and there is no `_`, `select` panics instead of waiting forever.
 - A send arm that is not chosen sends nothing. A send arm on a closed channel panics, as `send` does.
 - There are no timeouts yet.
+
+### Time
+
+```
+clock.sleep(250)                      // wait a quarter of a second
+```
+
+- `clock.sleep(ms)` waits at least `ms` milliseconds; other tasks keep running, and natively no thread waits. Time is measured on a monotonic clock, so changing the system time does not shorten or stretch a sleep.
+- Waiting needs the `Clock` capability like reading the time does, so a pure function cannot depend on timing. For deterministic tests, take the clock through an interface (`interface Sleeper { fn sleep(self, ms: Int) }`) and pass a fake that does not wait; `Clock` satisfies such interfaces (section 4).
 
 ### Sockets
 
@@ -589,6 +598,7 @@ Strings compare byte by byte, so `c >= "a" && c <= "z"` tests a one-byte string.
 | `Stdout` | `print(s)` | `()`, writes `s` and a newline |
 | `Stdout` | `write(s)` | `()`, writes `s` |
 | `Clock` | `now_ms()` | `Int`, milliseconds since the Unix epoch |
+| `Clock` | `sleep(ms)` | `()`, waits `ms` milliseconds (section 10); returns at once if `ms <= 0` |
 | `Rand` | `int(lo, hi)` | `Int` in `lo` up to but not including `hi`; panics if `hi <= lo` |
 | `Rand` | `float()` | `Float` in [0, 1) |
 | `Stdin` | `read_line()` | `Option[Str]`, without the newline; `None` at the end of input |
