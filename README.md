@@ -61,9 +61,11 @@ dune exec vela -- build examples/repos.vela -o repos && ./repos --grant net=api.
 
 - **Language server (`vela lsp`):**
   - diagnostics as you type
-  - hover with types, for example `let total: Int` or `print(Str) -> ()`
-  - go to definition for functions, locals, parameters, fields, types and variants
-  - completion: members after `.` (fields, methods, capabilities on `root`), otherwise locals, functions, types and keywords
+  - hover with types, for example `let total: Int` or `print(Str) -> ()`, and for a function, method or type its declaration and doc comment
+  - go to definition for functions, methods, locals, parameters, fields, types and variants, into other modules too (a standard library module opens as a temporary copy)
+  - find references across the modules the file uses
+  - rename, refused with a reason when it is unsafe: the new name must be a valid name of the right case, the symbol must be defined in the program (not built in or in the standard library), interface methods and methods an interface may rely on are left alone, and the renamed program must check with no new errors and with the new name referring to exactly the renamed places (so a rename never captures or is captured by another name). `S { name }` shorthand is expanded where needed.
+  - completion: members after `.` (fields, methods, capabilities on `root`, and after a module name such as `json.` its public functions, types and variants), otherwise locals, functions, types and keywords
   - the checker's auto-fixes as quick fixes
   - an outline of the file
 

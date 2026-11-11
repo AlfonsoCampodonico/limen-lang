@@ -1,12 +1,15 @@
-(* Language server: diagnostics, hover (types), go to definition, completion,
-   quick fixes from the checker's auto-fixes, and document symbols.
+(* Language server: diagnostics, hover (types and doc comments), go to
+   definition, find references, rename, completion, quick fixes from the
+   checker's auto-fixes, and document symbols. Definitions, references and
+   rename work across the modules the open file uses (see Refs).
    [handle] is pure request -> messages, so it can be tested without stdio.
    Positions: LSP lines and characters are mapped to byte offsets, which is
    exact for ASCII source. *)
 open Ast
 module J = Json
 
-type doc = { path : string; text : string; items : item list option; diags : Diag.t list }
+(* [items]: the whole checked program, every module the file uses included *)
+type doc = { path : string; text : string; items : item list option; diags : Diag.t list; occs : Refs.occ list }
 type state = { docs : (string, doc) Hashtbl.t; mutable shutdown : bool; mutable exit : bool }
 
 let create () = { docs = Hashtbl.create 8; shutdown = false; exit = false }
@@ -45,18 +48,27 @@ let pos_of text off =
 
 let range text lo hi = J.Obj [ ("start", pos_of text lo); ("end", pos_of text hi) ]
 let srange text (sp : Span.t) = range text sp.lo sp.hi
-let slice text (sp : Span.t) = String.sub text sp.lo (max 0 (min sp.hi (String.length text) - sp.lo))
+(* The source of [sp], from its own file when that is another module. *)
+let slice text (sp : Span.t) =
+  let text = match Source.text sp.file with Some t when sp.file <> "" -> t | _ -> text in
+  if sp.lo >= String.length text then "" else String.sub text sp.lo (max 0 (min sp.hi (String.length text) - sp.lo))
 
 (* ---------- analysis ---------- *)
 
-let analyze path text =
+(* The program as loaded from [path], all diagnostics included. *)
+let load_program path text =
   match Modules.load path text with
-  | [], (_ :: _ as ds) -> (None, List.filter (fun (d : Diag.t) -> d.span.file = path) ds)
+  | [], (_ :: _ as ds) -> ([], ds)
   | items, _ ->
     let ds, _ = Check.check_program items in
-    (* hovers and definitions only look at this file's items *)
-    let mine = List.filter (fun it -> (Modules.item_span it).Span.file = path) items in
-    (Some mine, List.filter (fun (d : Diag.t) -> d.span.file = path) ds)
+    (items, ds)
+
+let analyze path text =
+  match load_program path text with
+  | [], ds -> (None, List.filter (fun (d : Diag.t) -> d.span.file = path) ds)
+  | items, ds -> (Some items, List.filter (fun (d : Diag.t) -> d.span.file = path) ds)
+
+let mine path items = List.filter (fun it -> (Modules.item_span it).Span.file = path) items
 
 let diag_json text (d : Diag.t) =
   let msg = String.concat "\n" (d.message :: List.map (fun n -> "note: " ^ n) d.notes) in
@@ -195,130 +207,15 @@ let hover_items text items =
     items;
   !acc
 
-let smallest_at off pairs =
+let smallest_at ?file off pairs =
   List.fold_left
     (fun best ((sp : Span.t), v) ->
-      if sp.lo <= off && off < max sp.hi (sp.lo + 1) then
+      if (match file with Some f -> sp.file = f | None -> true) && sp.lo <= off && off < max sp.hi (sp.lo + 1) then
         match best with
         | Some ((b : Span.t), _) when b.hi - b.lo <= sp.hi - sp.lo -> best
         | _ -> Some (sp, v)
       else best)
     None pairs
-
-(* ---------- definitions ---------- *)
-
-(* All (use span, definition span) pairs in the document. *)
-let definitions items =
-  let acc = ref [] in
-  let add u d = acc := (u, d) :: !acc in
-  let fn_spans = List.map (fun d -> (d.fn_name, d.fn_span)) (fns items) in
-  let type_spans =
-    List.map (fun s -> (s.st_name, s.st_span)) (structs items) @ List.map (fun e -> (e.en_name, e.en_span)) (enums items)
-  in
-  let variant_spans = List.concat_map (fun e -> List.map (fun (v, sp, _) -> (v, sp)) e.en_variants) (enums items) in
-  let rec ty (te : ty_expr) =
-    match te.tdesc with
-    | TyName (n, args) ->
-      (match List.assoc_opt n type_spans with
-       | Some d -> add { te.tspan with Span.hi = te.tspan.lo + String.length n } d
-       | None -> ());
-      List.iter ty args
-    | TyFn (ps, r) -> List.iter ty ps; ty r
-    | TyUnit | TyInt _ -> ()
-  in
-  let rec pat env (p : pat) =
-    match p.pdesc with
-    | PBind n -> (n, p.pspan) :: env
-    | PVariant (_, v, args) ->
-      (match List.assoc_opt v variant_spans with Some d -> add p.pspan d | None -> ());
-      List.fold_left pat env args
-    | PTuple ps -> List.fold_left pat env ps
-    | _ -> env
-  in
-  let rec expr env e =
-    let x = expr env in
-    match e.edesc with
-    | EVar n -> (
-      match List.assoc_opt n env with
-      | Some d -> add e.espan d
-      | None -> (
-        match List.assoc_opt n fn_spans with
-        | Some d -> add e.espan d
-        | None -> ( match List.assoc_opt n variant_spans with Some d -> add e.espan d | None -> ())))
-    | EInt _ | EFloat _ | EBool _ | EUnit -> ()
-    | EStr ps -> List.iter (function SPExpr y -> x y | SPLit _ -> ()) ps
-    | EList es -> List.iter x es
-    | EBin (_, a, b) | EIndex (a, b) -> x a; x b
-    | EUn (_, a) | ETry a -> x a
-    | EField ({ edesc = EVar en; _ }, v, nsp) when not (List.mem_assoc en env) && List.mem_assoc en type_spans ->
-      (match List.assoc_opt en type_spans with Some d -> add { nsp with Span.lo = e.espan.lo; hi = e.espan.lo + String.length en } d | None -> ());
-      (match List.assoc_opt v variant_spans with Some d -> add nsp d | None -> ())
-    | EField (r, name, nsp) ->
-      x r;
-      (match struct_decl items r.ety with
-       | Some s -> ( match List.find_opt (fun (f, _, _) -> f = name) s.st_fields with Some (_, d, _) -> add nsp d | None -> ())
-       | None -> ())
-    | ECall (c, args) -> x c; List.iter x args
-    | EMethod ({ edesc = EVar en; _ }, v, nsp, args) when not (List.mem_assoc en env) && List.mem_assoc en type_spans ->
-      (match List.assoc_opt v variant_spans with Some d -> add nsp d | None -> ());
-      List.iter x args
-    | EMethod (r, _, _, args) -> x r; List.iter x args
-    | EIf (c, b, eo) -> x c; block env b; Option.iter x eo
-    | EMatch (s, arms) -> x s; List.iter (fun a -> expr (pat env a.apat) a.abody) arms
-    | EBlock b -> block env b
-    | EGroup (n, until, b) -> Option.iter (fun (c, ms) -> x c; x ms) until; block ((n, e.espan) :: env) b
-    | EClosure (ps, body) ->
-      List.iter (fun (_, t, _) -> Option.iter ty t) ps;
-      expr (List.map (fun (n, _, sp) -> (n, sp)) ps @ env) body
-    | EStruct (name, nsp, fs) ->
-      (match List.assoc_opt name type_spans with Some d -> add nsp d | None -> ());
-      let decl = List.find_opt (fun s -> s.st_name = name) (structs items) in
-      List.iter
-        (fun (f, fsp, v) ->
-          (match decl with
-           | Some s -> ( match List.find_opt (fun (g, _, _) -> g = f) s.st_fields with Some (_, d, _) -> add fsp d | None -> ())
-           | None -> ());
-          x v)
-        fs
-    | EDyn (y, _) -> x y
-    | ESelect arms ->
-      List.iter
-        (fun a ->
-          Option.iter x a.sguard;
-          match a.sop with
-          | SelRecv (b, c) -> x c; expr (match b with Some (n, sp) -> (n, sp) :: env | None -> env) a.sbody
-          | SelSend (c, v) | SelAfter (c, v) -> x c; x v; x a.sbody
-          | SelDefault -> x a.sbody)
-        arms
-  and block env b =
-    let env =
-      List.fold_left
-        (fun env s ->
-          match s.sdesc with
-          | SLet (_, n, nsp, t, e) -> Option.iter ty t; expr env e; (n, nsp) :: env
-          | SExpr e -> expr env e; env
-          | SAssign (a, v) -> expr env a; expr env v; env
-          | SReturn eo -> Option.iter (expr env) eo; env
-          | SWhile (c, b) -> expr env c; block env b; env
-          | SFor (n, nsp, e, b) -> expr env e; block ((n, nsp) :: env) b; env
-          | SLetPat (p, e) -> expr env e; pat env p
-          | SForPat (p, e, b) -> expr env e; block (pat env p) b; env
-          | SBreak | SContinue -> env)
-        env b.stmts
-    in
-    Option.iter (expr env) b.tail
-  in
-  List.iter
-    (function
-      | IFn d ->
-        List.iter (fun p -> ty p.prm_ty) d.fn_params;
-        Option.iter ty d.fn_ret;
-        block (List.map (fun p -> (p.prm_name, p.prm_span)) d.fn_params) d.fn_body
-      | IStruct s -> List.iter (fun (_, _, te) -> ty te) s.st_fields
-      | IEnum e -> List.iter (fun (_, _, tes) -> List.iter ty tes) e.en_variants
-      | IIface i -> List.iter (fun (_, _, ps, r) -> List.iter (fun p -> ty p.prm_ty) ps; Option.iter ty r) i.if_methods)
-    items;
-  !acc
 
 (* ---------- completion ---------- *)
 
@@ -328,13 +225,59 @@ let item kind label detail = J.Obj [ ("label", J.String label); ("kind", J.Int k
 
 let is_ident_char c = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c = '_'
 
+(* The modules the file names with `use`. *)
+let uses_of text =
+  List.filter_map
+    (fun l ->
+      let l = String.trim l in
+      if String.starts_with ~prefix:"use " l then
+        let r = String.trim (String.sub l 4 (String.length l - 4)) in
+        let n = ref 0 in
+        while !n < String.length r && is_ident_char r.[!n] do incr n done;
+        if !n > 0 then Some (String.sub r 0 !n) else None
+      else None)
+    (String.split_on_char '\n' text)
+
+(* After `json.`: the pub functions, types and variants of module json. *)
+let module_completions path text name =
+  if not (List.mem name (uses_of text)) then None
+  else
+    match Modules.find_module ~deps:[] ~from:path (Filename.dirname path) name with
+    | Some (p, Some src, _) -> (
+      match Parser.parse_file p src with
+      | exception Diag.Fatal _ -> Some []
+      | f ->
+        let documented kind label detail (sp : Span.t) =
+          let d = Doc.doc_above src sp.lo in
+          let base = [ ("label", J.String label); ("kind", J.Int kind); ("detail", J.String detail) ] in
+          J.Obj (if d = "" then base else base @ [ ("documentation", J.Obj [ ("kind", J.String "markdown"); ("value", J.String d) ]) ])
+        in
+        Some
+          (List.concat_map
+             (function
+               | IFn d when d.fn_pub && d.fn_test = None && not (Modules.is_method (IFn d)) -> [ documented 3 d.fn_name (Doc.fn_sig src d) d.fn_span ]
+               | IStruct st when st.st_pub -> [ documented 22 st.st_name "struct" st.st_span ]
+               | IIface i when i.if_pub -> [ documented 8 i.if_name "interface" i.if_span ]
+               | IEnum e when e.en_pub ->
+                 documented 13 e.en_name "enum" e.en_span :: List.map (fun (v, vsp, _) -> documented 20 v e.en_name vsp) e.en_variants
+               | _ -> [])
+             f.items))
+    | _ -> Some []
+
 let member_completions path text off =
   (* cursor after `recv.` or `recv.pre`: drop `.pre`, check, and look up the receiver's type *)
   let start = ref off in
   while !start > 0 && is_ident_char text.[!start - 1] do decr start done;
   if !start = 0 || text.[!start - 1] <> '.' then None
-  else begin
+  else
     let dot = !start - 1 in
+    let w = ref dot in
+    while !w > 0 && is_ident_char text.[!w - 1] do decr w done;
+    let before = String.sub text !w (dot - !w) in
+    let module_name = if before <> "" && (!w = 0 || text.[!w - 1] <> '.') then module_completions path text before else None in
+    match module_name with
+    | Some l -> Some l
+    | None -> begin
     (* Two ways to turn the text into a program where the receiver ends at
        the dot: cut the rest of the line (handles `recv.|name(args)`), or drop
        just the word being completed (handles receivers spanning lines). *)
@@ -354,7 +297,7 @@ let member_completions path text off =
           (fun d ->
             walk_block
               (fun e ->
-                if e.espan.hi = dot then
+                if e.espan.hi = dot && e.espan.file = path then
                   match !best with
                   | Some (b : expr) when b.espan.hi - b.espan.lo <= e.espan.hi - e.espan.lo -> ()
                   | _ -> best := Some e)
@@ -400,6 +343,7 @@ let general_completions doc off =
   match doc.items with
   | None -> kws
   | Some items ->
+    let items = mine doc.path items in
     let globals =
       List.map (fun d -> item 3 d.fn_name (fn_signature doc.text d)) (List.filter (fun d -> d.fn_test = None && not (String.contains d.fn_name ':')) (fns items))
       @ List.map (fun s -> item 22 s.st_name "struct") (structs items)
@@ -447,12 +391,19 @@ let capabilities =
   J.Obj
     [ ("textDocumentSync", J.Int 1); ("hoverProvider", J.Bool true); ("definitionProvider", J.Bool true);
       ("completionProvider", J.Obj [ ("triggerCharacters", J.List [ J.String "." ]) ]);
-      ("codeActionProvider", J.Bool true); ("documentSymbolProvider", J.Bool true) ]
+      ("codeActionProvider", J.Bool true); ("documentSymbolProvider", J.Bool true); ("referencesProvider", J.Bool true);
+      ("renameProvider", J.Obj [ ("prepareProvider", J.Bool true) ]) ]
+
+(* Other open files are read from the editor, not from disk. *)
+let set_overlay st path =
+  Modules.overlay := Hashtbl.fold (fun _ d acc -> if d.path = path then acc else (d.path, d.text) :: acc) st.docs []
 
 let open_doc st uri text =
   let path = path_of_uri uri in
+  set_overlay st path;
   let items, diags = analyze path text in
-  let d = { path; text; items; diags } in
+  let occs = match items with Some it -> Refs.index it | None -> [] in
+  let d = { path; text; items; diags; occs } in
   Hashtbl.replace st.docs uri d;
   [ publish uri d ]
 
@@ -463,6 +414,52 @@ let position st params =
   | Some d ->
     let line = J.to_int (J.path params [ "position"; "line" ]) and ch = J.to_int (J.path params [ "position"; "character" ]) in
     Some (uri, d, offset_of d.text line ch)
+
+(* ---------- locations in any module ---------- *)
+
+let uri_of_path p = if String.starts_with ~prefix:"file://" p then p else "file://" ^ p
+
+(* A standard library module has no file; write its text to a temporary one so
+   an editor can open it. *)
+let std_file p =
+  let name = String.sub p 6 (String.length p - 6) in
+  let dir = Filename.concat (Filename.get_temp_dir_name ()) "vela-std" in
+  (try Unix.mkdir dir 0o755 with Unix.Unix_error _ -> ());
+  let f = Filename.concat dir name in
+  let text = Option.value ~default:"" (Source.text p) in
+  if Modules.read_file f <> Some text then (try Out_channel.with_open_bin f (fun oc -> output_string oc text) with Sys_error _ -> ());
+  f
+
+(* The editor's own URI for an open file, so it matches what the client sent. *)
+let uri_for st path =
+  match Hashtbl.fold (fun uri d acc -> if d.path = path then Some uri else acc) st.docs None with
+  | Some u -> u
+  | None -> uri_of_path (if String.starts_with ~prefix:"<std>/" path then std_file path else path)
+
+let location st (sp : Span.t) =
+  let text = Option.value ~default:"" (Source.text sp.file) in
+  J.Obj [ ("uri", J.String (uri_for st sp.file)); ("range", range text sp.lo sp.hi) ]
+
+(* Hover for a name defined elsewhere: its declaration and doc comment. *)
+let symbol_hover d items off =
+  match Refs.at d.occs d.path off with
+  | Some o when o.key.[0] <> 'l' -> (
+    match Refs.definition d.occs o.key with
+    | Some def -> (
+      let text = Option.value ~default:"" (Source.text def.sp.file) in
+      match smallest_at ~file:def.sp.file def.sp.lo (hover_items text items) with
+      | Some (_, sg) -> Some (o.sp, sg, Doc.doc_above text def.sp.lo)
+      | None -> None)
+    | None -> None)
+  | _ -> None
+
+let rename_load st d overrides =
+  let main = match List.assoc_opt d.path overrides with Some t -> t | None -> d.text in
+  set_overlay st d.path;
+  Modules.overlay := List.filter (fun (p, _) -> p <> d.path) overrides @ !Modules.overlay;
+  let r = load_program d.path main in
+  set_overlay st d.path;
+  r
 
 let handle st (msg : J.t) : J.t list =
   let id = J.member "id" msg in
@@ -489,21 +486,62 @@ let handle st (msg : J.t) : J.t list =
   | "textDocument/hover" -> (
     match position st params with
     | Some (_, ({ items = Some items; _ } as d), off) -> (
-      match smallest_at off (hover_items d.text items) with
-      | Some (sp, s) ->
+      let shown sp s doc =
         reply
           (J.Obj
-             [ ("contents", J.Obj [ ("kind", J.String "markdown"); ("value", J.String ("```vela\n" ^ s ^ "\n```")) ]);
+             [ ("contents", J.Obj [ ("kind", J.String "markdown"); ("value", J.String ("```vela\n" ^ s ^ "\n```" ^ if doc = "" then "" else "\n\n" ^ doc)) ]);
                ("range", srange d.text sp) ])
-      | None -> reply J.Null)
+      in
+      match symbol_hover d items off with
+      | Some (sp, s, doc) -> shown sp s doc
+      | None -> (
+        match smallest_at ~file:d.path off (hover_items d.text items) with
+        | Some (sp, s) -> shown sp s ""
+        | None -> reply J.Null))
     | _ -> reply J.Null)
   | "textDocument/definition" -> (
     match position st params with
-    | Some (uri, ({ items = Some items; _ } as d), off) -> (
-      match smallest_at off (definitions items) with
-      | Some (_, def) -> reply (J.Obj [ ("uri", J.String uri); ("range", srange d.text def) ])
+    | Some (_, d, off) -> (
+      match Refs.at d.occs d.path off with
+      | Some o -> ( match Refs.definition d.occs o.key with Some def -> reply (location st def.sp) | None -> reply J.Null)
       | None -> reply J.Null)
     | _ -> reply J.Null)
+  | "textDocument/references" -> (
+    match position st params with
+    | Some (_, d, off) -> (
+      let with_decl = J.path params [ "context"; "includeDeclaration" ] <> J.Bool false in
+      match Refs.at d.occs d.path off with
+      | Some o ->
+        reply (J.List (List.filter_map (fun (r : Refs.occ) -> if r.def && not with_decl then None else Some (location st r.sp)) (Refs.references d.occs o.key)))
+      | None -> reply J.Null)
+    | None -> reply J.Null)
+  | "textDocument/prepareRename" -> (
+    match position st params with
+    | Some (_, d, off) -> (
+      match Refs.at d.occs d.path off with
+      | Some o -> reply (J.Obj [ ("range", srange d.text o.sp); ("placeholder", J.String o.name) ])
+      | None -> reply J.Null)
+    | None -> reply J.Null)
+  | "textDocument/rename" -> (
+    match position st params with
+    | Some (_, ({ items = Some items; _ } as d), off) -> (
+      let nw = J.to_str (J.member "newName" params) in
+      match Refs.rename ~load:(rename_load st d) items d.path off nw with
+      | Error m -> [ error id (-32803) m ]
+      | Ok files ->
+        Source.add d.path d.text;
+        reply
+          (J.Obj
+             [ ("changes",
+                J.Obj
+                  (List.map
+                     (fun (f, edits) ->
+                       let text = Option.value ~default:"" (Source.text f) in
+                       ( uri_for st f,
+                         J.List (List.map (fun (e : Refs.edit) -> J.Obj [ ("range", srange text e.at); ("newText", J.String e.replacement) ]) edits) ))
+                     files)) ]))
+    | Some _ -> [ error id (-32803) "the file has errors that stop it from loading" ]
+    | None -> reply J.Null)
   | "textDocument/completion" -> (
     match position st params with
     | Some (_, d, off) ->
@@ -542,7 +580,8 @@ let handle st (msg : J.t) : J.t list =
   | "textDocument/documentSymbol" -> (
     let uri = J.to_str (J.path params [ "textDocument"; "uri" ]) in
     match Hashtbl.find_opt st.docs uri with
-    | Some { items = Some items; text; _ } ->
+    | Some { items = Some items; text; path; _ } ->
+      let items = mine path items in
       let sym name kind (sp : Span.t) (whole : Span.t) =
         J.Obj [ ("name", J.String name); ("kind", J.Int kind); ("range", srange text whole); ("selectionRange", srange text sp) ]
       in

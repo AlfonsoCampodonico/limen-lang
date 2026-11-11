@@ -41,7 +41,14 @@ let err ?(notes = []) code sp msg = errors := Diag.make ~notes code sp msg :: !e
 
 (* ---------- loading ---------- *)
 
-let read_file path = try Some (In_channel.with_open_bin path In_channel.input_all) with Sys_error _ -> None
+(* Text to use instead of a file on disk, by path: the editor's unsaved
+   buffers, or a rename being tried out. *)
+let overlay : (string * string) list ref = ref []
+
+let read_file path =
+  match List.assoc_opt path !overlay with
+  | Some t -> Some t
+  | None -> try Some (In_channel.with_open_bin path In_channel.input_all) with Sys_error _ -> None
 
 (* deps: name -> directory holding NAME.vela (from vela.toml) *)
 (* Returns the path, the text, and whether it came from a dependency. *)
@@ -50,7 +57,7 @@ let same_file a b = try Unix.realpath a = Unix.realpath b with Unix.Unix_error _
 let find_module ~deps ~from dir name =
   let local = Filename.concat dir (name ^ ".vela") in
   (* a file never imports itself: `use http` in http.vela means another http *)
-  if dir <> "" && Sys.file_exists local && not (same_file local from) then Some (local, read_file local, false)
+  if dir <> "" && (Sys.file_exists local || List.mem_assoc local !overlay) && not (same_file local from) then Some (local, read_file local, false)
   else
     match List.assoc_opt name deps with
     | Some d ->

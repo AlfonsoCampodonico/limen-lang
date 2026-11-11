@@ -1284,7 +1284,8 @@ fn main(root: Root) {
     J.to_str (J.path (result (Lsp.handle st (req "textDocument/hover" (tdp text needle ?nth k)))) [ "contents"; "value" ])
   in
   ok "lsp-hover-let" (hover doc "total = " 0 = "```vela\nlet total: Int\n```") (hover doc "total = " 0);
-  ok "lsp-hover-call" (hover doc "dist(pt)" 0 = "```vela\nfn(Point) -> Int\n```") (hover doc "dist(pt)" 0);
+  (* a call shows the function's declaration (and its doc comment, if any) *)
+  ok "lsp-hover-call" (hover doc "dist(pt)" 0 = "```vela\nfn dist(p: Point) -> Int\n```") (hover doc "dist(pt)" 0);
   ok "lsp-hover-method" (hover doc "print(\"{" 0 = "```vela\nprint(Str) -> ()\n```") (hover doc "print(\"{" 0);
   ok "lsp-hover-fn" (hover doc "dist(p" 0 = "```vela\nfn dist(p: Point) -> Int\n```") (hover doc "dist(p" 0);
   let def text needle ?nth k =
@@ -3051,6 +3052,48 @@ fn main(root: Root) {
   (* checked without any vela.toml, and fine for the real std *)
   let _, ds, _ = Modules.load_and_check "std-http.vela" "use http\nuse json\n\nfn main(root: Root) {\n    root.stdout.print(http.reason(200))\n}\n" in
   ok "std-real-ok" (ds = []) (String.concat "; " (List.map (fun (d : Diag.t) -> d.code ^ " " ^ d.message) ds));
+
+  (* find references and rename on real programs: renaming every function,
+     struct, enum and variant of each example must be accepted (a missed
+     reference would make the renamed program fail to check), and the result
+     must check cleanly *)
+  let refs_failures = ref [] and renamed = ref 0 in
+  Array.iter
+    (fun f ->
+      if Filename.check_suffix f ".vela" then begin
+        let path = Filename.concat "../examples" f in
+        let src = In_channel.with_open_bin path In_channel.input_all in
+        let load overrides =
+          Modules.overlay := List.filter (fun (p, _) -> p <> path) overrides;
+          let text = Option.value ~default:src (List.assoc_opt path overrides) in
+          let r = Lsp.load_program path text in
+          Modules.overlay := [];
+          r
+        in
+        match load [] with
+        | [], _ -> ()
+        | items, ds when ds = [] ->
+          let occs = Refs.index items in
+          List.iter
+            (fun (o : Refs.occ) ->
+              if o.def && o.sp.file = path && (match o.key.[0] with 'f' | 't' | 'v' | 'd' -> true | _ -> false) && o.key <> "f:main" then begin
+                let items, _ = load [] in
+                let nw = if o.name.[0] >= 'A' && o.name.[0] <= 'Z' then o.name ^ "Renamed" else o.name ^ "_renamed" in
+                match Refs.rename ~load items path o.sp.lo nw with
+                | Ok files ->
+                  incr renamed;
+                  let text = Refs.apply_edits src (List.concat_map snd (List.filter (fun (p, _) -> p = path) files)) in
+                  (match load [ (path, text) ] with
+                   | _, [] -> ()
+                   | _, d :: _ -> refs_failures := (f ^ " " ^ o.key ^ ": " ^ d.message) :: !refs_failures)
+                | Error m when Interp_util.find_sub m "interface" 0 <> None -> ()
+                | Error m -> refs_failures := (f ^ " " ^ o.key ^ ": " ^ m) :: !refs_failures
+              end)
+            occs
+        | _ -> ()
+      end)
+    (Sys.readdir "../examples");
+  ok "refs-rename-examples" (!refs_failures = [] && !renamed > 50) (sprintf "%d renamed; %s" !renamed (String.concat "\n" (List.rev !refs_failures)));
 
   (* vela doc: doc comments directly above items, fields, variants and interface methods *)
   let doc_src =
