@@ -1421,6 +1421,32 @@ fn main(root: Root) {
   gtoml (sprintf "git = %S, tag = \"v3\", caps = [\"fs\"]" url);
   grun "git-caps-granted" "v3";
 
+  (* the standard library declares its capabilities in src/std/vela.toml and is checked against it *)
+  let manifest = Lazy.force Package.std_manifest in
+  let listed = List.sort compare (List.map (fun (d : Package.dep) -> d.dname) manifest.deps) in
+  ok "std-manifest-complete" (listed = List.sort compare (List.map fst Std_text.modules)) (String.concat ", " listed);
+  ok "std-manifest-http" (List.exists (fun (d : Package.dep) -> d.dname = "http" && d.caps = [ "net"; "listen" ]) manifest.deps) "http: net, listen";
+  ok "std-manifest-pure" (List.for_all (fun (d : Package.dep) -> d.dname = "http" || d.caps = []) manifest.deps) "json, list, text are pure";
+  let real_std = !Modules.std_modules in
+  let std_errs name extra src =
+    Modules.std_modules := extra @ real_std;
+    let _, ds, _ = Modules.load_and_check (name ^ ".vela") src in
+    Modules.std_modules := real_std;
+    ds
+  in
+  (* a std module the manifest does not list may take nothing *)
+  let ds = std_errs "std-unlisted" [ ("sneaky", "pub fn peek(fs: Fs) -> Bool {\n    fs.exists(\"x\")\n}\n") ]
+      "use sneaky\n\nfn main(root: Root) {\n    root.stdout.print(\"{sneaky.peek(root.fs)}\")\n}\n" in
+  ok "std-unlisted" (codes ds = [ "E0320" ] && Interp_util.find_sub (List.hd ds).message "standard library module `sneaky`" 0 <> None)
+    (String.concat "; " (List.map (fun (d : Diag.t) -> d.code ^ " " ^ d.message) ds));
+  (* a listed std module taking more than it declares *)
+  let ds = std_errs "std-over" [ ("json", "pub fn leak(net: Net) -> Bool {\n    net.get(\"http://x\").is_ok()\n}\n") ]
+      "use json\n\nfn main(root: Root) {\n    root.stdout.print(\"{json.leak(root.net)}\")\n}\n" in
+  ok "std-over" (codes ds = [ "E0320" ]) (String.concat "; " (List.map (fun (d : Diag.t) -> d.code ^ " " ^ d.message) ds));
+  (* checked without any vela.toml, and fine for the real std *)
+  let _, ds, _ = Modules.load_and_check "std-http.vela" "use http\nuse json\n\nfn main(root: Root) {\n    root.stdout.print(http.reason(200))\n}\n" in
+  ok "std-real-ok" (ds = []) (String.concat "; " (List.map (fun (d : Diag.t) -> d.code ^ " " ^ d.message) ds));
+
   ok "fmt-use-pub"
     (Fmt.format ~file:"fu.vela" "use geom // g\npub   fn f() -> Int { 1 }\npub struct S { a: Int }\n"
      = "use geom  // g\n\npub fn f() -> Int { 1 }\n\npub struct S {\n    a: Int,\n}\n")

@@ -460,9 +460,16 @@ let load main : (t option, Diag.t) result =
       | exception Bad (sp, m) -> Error (Diag.make "E0321" sp m)
       | pkg -> ( try Ok (Some (resolve pkg)) with Lock_error (code, sp, m, notes) -> Error (Diag.make ~notes code sp m))))
 
+(* The standard library's own manifest, src/std/vela.toml: each std module
+   is a "dependency" with the capabilities it may take. *)
+let std_file = "<std>/vela.toml"
+let std_manifest = lazy (parse std_file Std_text.manifest)
+
 (* E0320: every function of a dependency may only take capabilities its
-   package was granted. [module_pkg] maps a module name to its dependency. *)
-let enforce (pkg : t) (module_pkg : (string * string) list) (infos : Check.fn_info list) : Diag.t list =
+   package was granted. [module_pkg] maps a module name to its dependency.
+   With [~std], [pkg] is the standard library's manifest and a module it does
+   not list may take nothing. *)
+let enforce ?(std = false) (pkg : t) (module_pkg : (string * string) list) (infos : Check.fn_info list) : Diag.t list =
   List.filter_map
     (fun (i : Check.fn_info) ->
       match String.index_opt i.name '.' with
@@ -472,13 +479,26 @@ let enforce (pkg : t) (module_pkg : (string * string) list) (infos : Check.fn_in
         match List.assoc_opt m module_pkg with
         | None -> None
         | Some dn -> (
-          let d = List.find (fun d -> d.dname = dn) pkg.deps in
+          let d =
+            match List.find_opt (fun d -> d.dname = dn) pkg.deps with
+            | Some d -> d
+            | None -> { dname = dn; dir = ""; caps = []; dspan = Span.dummy; source = Path }
+          in
           let missing = List.filter (fun c -> c <> Types.Root && not (List.exists (fun g -> List.mem g d.caps) (grant_of c))) i.caps in
           let missing = if List.mem Types.Root i.caps then Types.Root :: missing else missing in
           match missing with
           | [] -> None
           | c :: _ ->
             let need = match grant_of c with [] -> "Root, which no dependency can be granted" | g :: _ -> Printf.sprintf "\"%s\"" g in
+            let where (sp : Span.t) = let l, _ = Source.line_col sp.file sp.lo in Printf.sprintf "%s:%d" sp.file l in
+            if std then
+              Some
+                (Diag.make "E0320" d.dspan
+                   (Printf.sprintf "standard library module `%s` uses capability `%s`, which %s does not declare" dn (Types.cap_name c) std_file)
+                   ~notes:
+                     [ Printf.sprintf "`%s` takes `%s` (%s)" i.name (Types.cap_name c) (where i.span);
+                       "this is a bug in the standard library: declare the capability in src/std/vela.toml, or stop taking it" ])
+            else
             Some
               (Diag.make "E0320" d.dspan
                  (Printf.sprintf "dependency `%s` uses capability `%s`, which vela.toml does not grant it" dn (Types.cap_name c))

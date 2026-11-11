@@ -113,7 +113,7 @@ fs = "data:ro"
 net = ["api.github.com"]
 ```
 
-The standard library is written in Vela: `json` (parse, stringify, field access), `http` (an HTTP/1.1 client over `Net` and a server over `Listener`, one task per connection), `list` (`sort_by` and friends) and `text`. See [examples/http_demo.vela](examples/http_demo.vela) and SPEC.md sections 18 and 19.
+The standard library is written in Vela: `json` (parse, stringify, field access), `http` (an HTTP/1.1 client over `Net` and a server over `Listener`, one task per connection), `list` (`sort_by` and friends) and `text`. The standard library is checked like a dependency: `src/std/vela.toml` declares what each module may take (only `http` takes any: `net` and `listen`), and a std function that takes more is a compile error. The capability methods themselves (`Net.get`, `Fs.read`, ...) stay trusted, since they are where grants are enforced. See [examples/http_demo.vela](examples/http_demo.vela) and SPEC.md sections 18 and 19.
 
 ## Concurrency
 

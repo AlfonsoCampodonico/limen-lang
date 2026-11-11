@@ -833,6 +833,20 @@ yaml = { git = "git@example.com:me/yaml.git", commit = "3f9c2e1d7a" }
 
 Written in Vela and built into the compiler; `use` any of them. They take capabilities only as parameters, like any other code.
 
+The standard library is checked like a dependency. `src/std/vela.toml` lists the capabilities each module may take, and every program that uses a module is checked against it (E0320), with or without a vela.toml of its own:
+
+| Module | May take |
+| --- | --- |
+| `json`, `list`, `text` | nothing: pure |
+| `http` | `net` (Net, Conn) and `listen` (Listener, Conn) |
+
+A module missing from the list may take nothing. `vela caps FILE` shows what each std function takes. What stays trusted, and why:
+
+- The built-in methods of the capabilities themselves (`Net.get`, `Fs.read`, `Listen.on`, ...), written in OCaml for the interpreter and C for the native runtime. They are where the grants are enforced (host allowlists, the fs root, read-only), so there is nothing below them to check them against; they are covered by the tests of both backends.
+- The built-in methods of plain values (`Str`, `List`, `Map`, channels, ...). They take no capability, so they cannot do I/O.
+- The std modules' source. It is embedded in the compiler, not fetched, so it is as trustworthy as the compiler binary; the manifest check makes sure that what it can do stays what it declares.
+- Callbacks. `http.serve(l, n, handler)` calls `handler` inside std code; the handler carries only the capabilities its closure captured from your code, which appear in your signatures, not std's.
+
 ### json
 
 | Item | Meaning |
