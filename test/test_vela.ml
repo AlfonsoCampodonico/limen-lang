@@ -3124,6 +3124,32 @@ fn main(root: Root) {
   let std_md = Doc.markdown std in
   ok "doc-std" (List.length std = List.length !Modules.std_modules && Interp_util.find_sub std_md "pub fn sort_by[T]" 0 <> None) std_md;
 
+  (* comments inside an expression stay where they were written *)
+  let fmt_case name src want =
+    let got = try Fmt.format ~file:(name ^ ".vela") src with Diag.Fatal d -> "error: " ^ d.message in
+    ok name (got = want) (sprintf "got:\n%s\nwant:\n%s" got want);
+    check_fmt name src ()
+  in
+  let canonical name src = fmt_case name src src in
+  canonical "fmt-comment-chain"
+    "fn main(root: Root) {\n    let n = [1, 2, 3]\n        // keep the odd ones\n        .filter(|x| x % 2 == 1)  // odd\n        .map(|x| x * 10)\n    root.stdout.print(\"{n}\")\n}\n";
+  canonical "fmt-comment-list-end"
+    "fn main(root: Root) {\n    let xs = [\n        1,\n        2,\n        // more later\n    ]\n    root.stdout.print(\"{xs}\")\n}\n";
+  canonical "fmt-comment-call-end"
+    "fn add(a: Int, b: Int) -> Int {\n    a + b\n}\n\nfn main(root: Root) {\n    let s = add(\n        1,\n        2,  // two\n        // that is all\n    )\n    root.stdout.print(\"{s}\")\n}\n";
+  fmt_case "fmt-comment-args"
+    "fn add(a: Int, b: Int) -> Int {\n    a + b\n}\n\nfn main(root: Root) {\n    let s = add(1, // one\n        2)\n    root.stdout.print(\"{s}\")\n}\n"
+    "fn add(a: Int, b: Int) -> Int {\n    a + b\n}\n\nfn main(root: Root) {\n    let s = add(\n        1,  // one\n        2,\n    )\n    root.stdout.print(\"{s}\")\n}\n";
+  fmt_case "fmt-comment-binary"
+    "fn main(root: Root) {\n    let t = 1 + // first\n      2 * // second\n      3\n    root.stdout.print(\"{t}\")\n}\n"
+    "fn main(root: Root) {\n    let t = 1 +  // first\n        2 *  // second\n        3\n    root.stdout.print(\"{t}\")\n}\n";
+  fmt_case "fmt-comment-struct"
+    "struct P {\n    x: Int,\n    y: Int,\n}\n\nfn main(root: Root) {\n    let p = P { x: 1, // the x\n        y: 2 }\n    root.stdout.print(\"{p.x}\")\n}\n"
+    "struct P {\n    x: Int,\n    y: Int,\n}\n\nfn main(root: Root) {\n    let p = P {\n        x: 1,  // the x\n        y: 2,\n    }\n    root.stdout.print(\"{p.x}\")\n}\n";
+  fmt_case "fmt-comment-closure"
+    "fn main(root: Root) {\n    let f = |x: Int| // add one\n        x + 1\n    root.stdout.print(\"{f(1)}\")\n}\n"
+    "fn main(root: Root) {\n    let f = |x: Int|  // add one\n        x + 1\n    root.stdout.print(\"{f(1)}\")\n}\n";
+
   ok "fmt-use-pub"
     (Fmt.format ~file:"fu.vela" "use geom // g\npub   fn f() -> Int { 1 }\npub struct S { a: Int }\n"
      = "use geom  // g\n\npub fn f() -> Int { 1 }\n\npub struct S {\n    a: Int,\n}\n")

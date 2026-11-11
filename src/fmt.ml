@@ -9,9 +9,12 @@
      string literals exactly as written, struct field shorthand, and the
      author's choice to break a list, an argument list, a struct literal or a
      method chain over several lines.
-   Comments inside an expression move to the next statement boundary;
-   comments between statements, items, fields, variants, arms and list
-   elements stay where they are. *)
+   Comments stay where they are: between statements, items, fields,
+   variants, arms and list elements, and inside an expression. A comment
+   inside an argument list, list or struct literal written on one line puts
+   that list one element per line; one after a binary operator or a closure's
+   parameters breaks the line there; one in a method chain stays between its
+   links. *)
 open Ast
 
 type out = { mutable lines : (int * Buffer.t) list (* reversed: indent, text *) }
@@ -74,6 +77,16 @@ let trailing c hi =
     | _ -> ()
   in
   go ()
+
+(* Is there a comment not printed yet that starts in [lo, hi)? *)
+let comment_in c lo hi = List.exists (fun (clo, _, _) -> clo >= lo && clo < hi) c.pending
+
+(* The expression goes on past a comment: the comments on this line after
+   [hi], those on their own lines before [lo], then a new line at [ind]. *)
+let break_at_comments c ind hi lo =
+  trailing c hi;
+  ignore (leading c ind ~prev:(-1) lo);
+  new_line c ind
 
 (* After [after], is the next non-space character followed by a newline?
    i.e. did the author break right after this opening bracket? *)
@@ -170,22 +183,27 @@ and expr_inner c ind e =
   | EBin (op, a, b) ->
     let p = prec op in
     expr c ind ~min:p a;
-    add c (if op = Range then op_str op else " " ^ op_str op ^ " ");
+    if comment_in c a.espan.hi b.espan.lo then begin
+      (* `a +  // why` then `b` on the next line: an operator at the end of a line continues it *)
+      add c (if op = Range then op_str op else " " ^ op_str op);
+      break_at_comments c (ind + 4) a.espan.hi b.espan.lo
+    end
+    else add c (if op = Range then op_str op else " " ^ op_str op ^ " ");
     expr c ind ~min:(p + 1) b
   | EUn (op, a) ->
     add c (match op with Neg -> "-" | Not -> "!");
     expr c ind ~min:16 a
   | ECall (f, args) ->
     expr c ind ~min:16 f;
-    seq c ind "(" ")" (breaks_after_open c f.espan.hi '(') (fun x -> expr c (ind + 4) x) (fun x -> x.espan) args
+    seq c ind "(" ")" (breaks_after_open c f.espan.hi '(') ~lo:f.espan.hi ~hi:e.espan.hi (fun x -> expr c (ind + 4) x) (fun x -> x.espan) args
   | EMethod (r, name, nsp, args) ->
     expr c ind ~min:16 r;
-    if has_newline c r.espan.hi nsp.lo then new_line c (ind + 4);
+    if has_newline c r.espan.hi nsp.lo then break_at_comments c (ind + 4) r.espan.hi nsp.lo;
     add c ("." ^ name);
-    seq c ind "(" ")" (breaks_after_open c nsp.hi '(') (fun x -> expr c (ind + 4) x) (fun x -> x.espan) args
+    seq c ind "(" ")" (breaks_after_open c nsp.hi '(') ~lo:nsp.hi ~hi:e.espan.hi (fun x -> expr c (ind + 4) x) (fun x -> x.espan) args
   | EField (r, name, nsp) ->
     expr c ind ~min:16 r;
-    if has_newline c r.espan.hi nsp.lo then new_line c (ind + 4);
+    if has_newline c r.espan.hi nsp.lo then break_at_comments c (ind + 4) r.espan.hi nsp.lo;
     add c ("." ^ name)
   | EIndex (a, i) ->
     expr c ind ~min:16 a;
@@ -195,9 +213,9 @@ and expr_inner c ind e =
   | ETry a ->
     expr c ind ~min:16 a;
     add c "?"
-  | EList es -> seq c ind "[" "]" (breaks_after_open c e.espan.lo '[') (fun x -> expr c (ind + 4) x) (fun x -> x.espan) es
+  | EList es -> seq c ind "[" "]" (breaks_after_open c e.espan.lo '[') ~lo:e.espan.lo ~hi:e.espan.hi (fun x -> expr c (ind + 4) x) (fun x -> x.espan) es
   | EStruct (name, _, fields) when is_tuple_name name ->
-    seq c ind "(" ")" (breaks_after_open c e.espan.lo '(') (fun (_, _, x) -> expr c (ind + 4) x) (fun (_, _, x) -> x.espan) fields
+    seq c ind "(" ")" (breaks_after_open c e.espan.lo '(') ~lo:e.espan.lo ~hi:e.espan.hi (fun (_, _, x) -> expr c (ind + 4) x) (fun (_, _, x) -> x.espan) fields
   | EStruct (name, nsp, fields) ->
     add c (name ^ " ");
     let field (f, fsp, v) =
@@ -205,7 +223,7 @@ and expr_inner c ind e =
       else (add c (f ^ ": "); expr c (ind + 4) v)
     in
     if fields = [] then add c "{}"
-    else if breaks_after_open c nsp.hi '{' then begin
+    else if breaks_after_open c nsp.hi '{' || comment_in c nsp.hi e.espan.hi then begin
       add c "{";
       List.iter
         (fun ((_, (fsp : Span.t), v) as fl) ->
@@ -215,7 +233,7 @@ and expr_inner c ind e =
           add c ",";
           trailing c (if v.espan = fsp then fsp.hi else v.espan.hi))
         fields;
-      ignore (leading c (ind + 4) ~prev:(-1) e.espan.hi);
+      ignore (leading c (ind + 4) ~prev:(-1) (e.espan.hi - 1));
       new_line c ind;
       add c "}"
     end
@@ -282,8 +300,16 @@ and expr_inner c ind e =
     else
       add c
         ("|" ^ String.concat ", " (List.map (fun (n, t, _) -> match t with Some t -> n ^ ": " ^ ty t | None -> n) ps) ^ "|");
-    add c " ";
-    expr c ind body
+    if comment_in c e.espan.lo body.espan.lo then begin
+      (* the body on the next line, after the comment *)
+      let after_params = List.fold_left (fun h (_, t, (sp : Span.t)) -> max h (match t with Some t -> t.tspan.hi | None -> sp.hi)) e.espan.lo ps in
+      break_at_comments c (ind + 4) after_params body.espan.lo;
+      expr c (ind + 4) body
+    end
+    else begin
+      add c " ";
+      expr c ind body
+    end
   | EGroup (name, until, b) ->
     add c ("group " ^ name ^ " ");
     (match until with
@@ -315,8 +341,10 @@ and if_chain c ind e =
 
 (* `( ... )` / `[ ... ]`: on one line, or one item per line with a trailing
    comma when the author broke after the opening bracket. *)
-and seq : 'a. ctx -> int -> string -> string -> bool -> ('a -> unit) -> ('a -> Span.t) -> 'a list -> unit =
- fun c ind op cl multi item span xs ->
+and seq : 'a. ctx -> int -> string -> string -> bool -> lo:int -> hi:int -> ('a -> unit) -> ('a -> Span.t) -> 'a list -> unit =
+ fun c ind op cl multi ~lo ~hi item span xs ->
+  (* a comment inside puts one element per line, so it can stay where it is *)
+  let multi = multi || comment_in c lo hi in
   if multi && xs <> [] then begin
     add c op;
     let prev = ref (-1) in
@@ -330,6 +358,7 @@ and seq : 'a. ctx -> int -> string -> string -> bool -> ('a -> unit) -> ('a -> S
         trailing c sp.hi;
         prev := sp.hi)
       xs;
+    ignore (leading c (ind + 4) ~prev:!prev (hi - 1));
     new_line c ind;
     add c cl
   end
