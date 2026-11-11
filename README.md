@@ -45,7 +45,7 @@ dune exec vela -- build examples/repos.vela -o repos && ./repos --grant net=api.
 
 | Command | What it does |
 | --- | --- |
-| `vela run FILE [--native] [--grant net=HOST[:PORT]\|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST[:PORT]]... [--grant env=NAME\|*]... [--seed N] [-- ARGS...]` | Type-check, then run `main` in the interpreter, or compiled with `--native`. Stdout, Stdin, Clock and Rand are always granted; Net, Fs, Listen and Env only when granted. `--seed` makes `Rand` repeatable; arguments after `--` are `root.args()`. |
+| `vela run FILE [--native] [--grant net=HOST[:PORT]\|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST[:PORT]]... [--grant env=NAME\|*]... [--seed N] [-- ARGS...]` | Type-check, then run `main` in the interpreter, or compiled with `--native`. Stdout, Stdin, Clock and Rand are always granted; Net, Fs, Listen and Env only when granted, by flags or by `[grants]` in vela.toml. `--seed` makes `Rand` repeatable; arguments after `--` are `root.args()`. |
 | `vela build FILE [-o OUT] [--emit-c]` | Compile to a native binary through C. The binary takes the same `--grant` flags. `--emit-c` writes the C instead. |
 | `vela check FILE [--json]` | Type-check only. `--json` emits diagnostics with codes, spans, notes and machine-applicable fixes. |
 | `vela caps FILE [--json]` | List each function's authority: the capabilities in its signature, or `pure`. |
@@ -101,6 +101,14 @@ fetch = { path = "../fetch", caps = ["net"] }
 ```
 
 Since capabilities only arrive as parameters, a dependency's signatures are a complete list of what it can do. If one asks for a capability it was not granted, the program does not compile (E0320).
+
+The same file can hold the program's own grants, so they are not retyped on every `vela run` (flags still add to them). A dependency's own vela.toml never grants anything:
+
+```
+[grants]
+fs = "data:ro"
+net = ["api.github.com"]
+```
 
 The standard library is written in Vela: `json` (parse, stringify, field access), `http` (an HTTP/1.1 client over `Net` and a server over `Listener`, one task per connection), `list` (`sort_by` and friends) and `text`. See [examples/http_demo.vela](examples/http_demo.vela) and SPEC.md sections 18 and 19.
 

@@ -16,7 +16,7 @@ usage:
   vela spec               (print the language specification)
 
 Stdout, Stdin, Clock and Rand are always granted. Net, Fs, Listen and Env exist only
-when granted. --seed makes Rand repeatable; arguments after -- are root.args().
+when granted, by --grant or by the [grants] table of vela.toml. --seed makes Rand repeatable; arguments after -- are root.args().
 |}
 
 let die_usage msg =
@@ -59,6 +59,14 @@ let parse_grants args =
         | None -> die_usage "--seed needs an integer")
       | _ -> die_usage ("unknown grant `" ^ a ^ "`"))
     Interp.no_grants args
+
+(* The [grants] of the program's vela.toml, as `--grant` values. They come
+   first, so flags add to them (and a --grant fs=... replaces the fs one). *)
+let toml_grants file =
+  match Package.load file with
+  | Ok (Some p) -> List.map (fun (k, v) -> k ^ "=" ^ v) p.grants
+  | Ok None -> []
+  | Error d -> report [ d ]; exit 1
 
 let rec split_grants = function
   | "--grant" :: g :: rest ->
@@ -214,6 +222,7 @@ let cmd_build file out emit_c =
       exit 1
 
 let cmd_run_native file grant_args prog_args =
+  let grant_args = toml_grants file @ grant_args in
   ignore (parse_grants grant_args);
   let items = checked file in
   let dir = Filename.get_temp_dir_name () in
@@ -233,6 +242,7 @@ let cmd_run_native file grant_args prog_args =
   exit (match status with Unix.WEXITED n -> n | _ -> 1)
 
 let cmd_run file grant_args prog_args =
+  let grant_args = toml_grants file @ grant_args in
   let grants = { (parse_grants grant_args) with args = prog_args } in
   let items, diags, _ = load file in
   if diags <> [] then (report diags; exit 1);

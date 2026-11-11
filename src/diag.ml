@@ -57,7 +57,7 @@ let explanations = [
   "E0310", "A group handle can only be used as `g.go(closure)`, directly in the group's body: it cannot be stored, passed, returned or captured by a closure.";
   "E0311", "Code inside a `group` block cannot leave it early with `return` or `?`, because every task must finish before the group returns its results.";
   "E0320", "A dependency's functions take a capability that vela.toml does not grant it. Vela has no ambient authority, so the capabilities in a dependency's signatures are all it can ever use. Grant it with `caps = [\"net\"]` (net, fs, listen, stdout, clock) on its line in [dependencies], or use a dependency that needs less. No dependency can take Root.";
-  "E0321", "vela.toml could not be read. It has a [package] table with `name`, and a [dependencies] table with lines like `json = { path = \"vendor/json\", caps = [] }`.";
+  "E0321", "vela.toml could not be read. It has a [package] table with `name`, a [grants] table with the program's own grants (`fs = \"data:ro\"`, `net = [\"api.github.com\"]`; net, fs, listen and env), and a [dependencies] table with lines like `json = { path = \"vendor/json\", caps = [] }`.";
   "E0401", "A module could not be found. `use NAME` looks for NAME.vela next to the importing file, then in the dependencies listed in vela.toml, then in the standard library. A qualified name such as `json.parse` needs `use json` in the same file.";
   "E0402", "The item is private to its module. Only items marked `pub` can be used from another module.";
   "E0403", "The module has no exported item with this name. The note lists what it exports.";

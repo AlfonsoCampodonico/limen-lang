@@ -373,6 +373,8 @@ The native backend implements this with reference counting and copy-on-write. A 
 
 `root.args()` is the `List[Str]` of command-line arguments after `--`: `vela run app.vela -- a b`.
 
+Grants can also be written once in the `[grants]` table of the program's vela.toml (section 18), so they are not retyped every run. `vela run` applies them first and the `--grant` flags add to them; a `--grant fs=...` flag replaces the fs grant, since there is only one. A binary from `vela build` reads only its flags.
+
 An ungranted `Net`, `Fs` or `Listen` still exists, but every operation on it returns `Err(Denied(...))`. `Listener` and `Conn` are capabilities too: you get them from `Listen.on`, `Listener.accept` and `Net.connect`.
 
 The rules:
@@ -791,17 +793,24 @@ pub fn load(text: Str) -> Result[json.Value, Str] {
 
 ### Packages and capabilities
 
-A vela.toml next to the program (or in a parent directory) lists its dependencies, and what each may do:
+A vela.toml next to the program (or in a parent directory) lists the program's own grants, its dependencies, and what each may do:
 
 ```
 [package]
 name = "app"
+
+[grants]                                           # what `vela run` grants the program
+fs = "data:ro"
+net = ["api.github.com"]
+env = ["HOME", "LANG"]
 
 [dependencies]
 json2 = { path = "vendor/json2" }                  # pure: no capabilities
 fetch = { path = "../fetch", caps = ["net"] }
 ```
 
+- `[grants]` takes `net`, `fs`, `listen` and `env`, each a string or a list of strings written exactly like the text after `--grant KIND=`. `fs` takes one directory, relative to vela.toml, with an optional `:ro`. Stdout, Stdin, Clock and Rand are always granted, so listing them is an error. Flags on the command line add to these grants.
+- Grants belong to the program being run: only the vela.toml found for the main file is read for them. A dependency's own vela.toml never grants anything, so adding or updating a dependency cannot widen what the program may do. A dependency gets capabilities in exactly one way: your code passes them to it, and only of the kinds its `caps` allow. `[grants]` decides what reaches `main`; `caps` decides which of those may cross into each dependency.
 - A dependency is a directory holding `NAME.vela`, plus any modules that file uses from the same directory.
 - `caps` lists what the dependency may use: `net` (Net and Conn), `listen` (Listen, Listener and Conn), `fs`, `stdout`, `stdin`, `clock`, `rand`, `env`. The default is none. No dependency can take `Root`.
 - Vela has no ambient authority, so a function can only use a capability that reaches it as a parameter. The checker therefore knows everything a dependency can ever do from its signatures, and rejects the program (E0320) if a dependency's function takes a capability it was not granted. Granting is still only an upper bound: at run time the dependency gets exactly the capabilities you pass it, which can be narrowed with `only` and `under`.

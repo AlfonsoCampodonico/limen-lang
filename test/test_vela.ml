@@ -1265,6 +1265,58 @@ fn main(root: Root) {
   ok "pkg-missing-dir" (pkg_codes "[package]\nname = \"app\"\n[dependencies]\nother = { path = \"../nope\" }\n" = [ "E0401" ]) "fetch not found";
   Sys.remove (Filename.concat pdir "app/vela.toml");
 
+  (* [grants] in vela.toml: the program's own grants, with --grant flags adding to them *)
+  let vela_cli args =
+    let o = Filename.concat pdir "cli.out" and e = Filename.concat pdir "cli.err" in
+    let code =
+      Sys.command
+        (String.concat " " (List.map Filename.quote ("../bin/main.exe" :: args)) ^ sprintf " >%s 2>%s" (Filename.quote o) (Filename.quote e))
+    in
+    (code, read_file o, read_file e)
+  in
+  List.iter (fun d -> try Unix.mkdir (Filename.concat pdir d) 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ()) [ "grants"; "grants/data"; "envy" ];
+  put "grants/data/a.txt" "hi";
+  Unix.putenv "VELA_T_A" "a";
+  Unix.putenv "VELA_T_B" "b";
+  put "grants/vela.toml" "[package]\nname = \"g\"\n\n[grants]\nfs = \"data:ro\"   # read-only\nenv = [\"VELA_T_A\"]\n";
+  put "grants/main.vela"
+    "fn main(root: Root) {\n    root.stdout.print(root.fs.read(\"a.txt\") ?? \"denied\")\n    root.stdout.print(root.env.get(\"VELA_T_A\") ?? \"none\")\n    root.stdout.print(root.env.get(\"VELA_T_B\") ?? \"none\")\n    root.stdout.print(\"{root.fs.write(\"b.txt\", \"x\").is_ok()}\")\n}\n";
+  let gmain = Filename.concat pdir "grants/main.vela" in
+  (match Package.load gmain with
+   | Ok (Some p) ->
+     ok "grants-toml-parse"
+       (p.grants = [ ("fs", Filename.concat (Filename.concat pdir "grants") "data" ^ ":ro"); ("env", "VELA_T_A") ])
+       (String.concat ", " (List.map (fun (k, v) -> k ^ "=" ^ v) p.grants))
+   | _ -> ok "grants-toml-parse" false "no package");
+  List.iter
+    (fun (name, extra) ->
+      let code, o, e = vela_cli ([ "run" ] @ extra @ [ gmain ]) in
+      ok ("grants-toml-" ^ name) (code = 0 && o = "hi\na\nnone\nfalse\n") (sprintf "code %d, out %S, err %S" code o e);
+      let code, o, e = vela_cli ([ "run" ] @ extra @ [ gmain; "--grant"; "env=VELA_T_B" ]) in
+      ok ("grants-toml-flag-adds-" ^ name) (code = 0 && o = "hi\na\nb\nfalse\n") (sprintf "code %d, out %S, err %S" code o e))
+    ([ ("interp", []) ] @ if native_enabled then [ ("native", [ "--native" ]) ] else []);
+  (* a flag's fs replaces the toml's: here a writable one *)
+  let code, o, e = vela_cli [ "run"; gmain; "--grant"; "fs=" ^ Filename.concat pdir "grants/data" ] in
+  ok "grants-toml-fs-flag" (code = 0 && o = "hi\na\nnone\ntrue\n") (sprintf "code %d, out %S, err %S" code o e);
+  let grant_err toml =
+    put "grants/vela.toml" toml;
+    let code, _, e = vela_cli [ "run"; gmain ] in
+    code = 1 && Interp_util.find_sub e "E0321" 0 <> None
+  in
+  ok "grants-toml-always" (grant_err "[grants]\nstdout = \"x\"\n") "stdout is always granted";
+  ok "grants-toml-unknown" (grant_err "[grants]\ndisk = \"x\"\n") "unknown grant";
+  ok "grants-toml-two-fs" (grant_err "[grants]\nfs = [\"a\", \"b\"]\n") "one fs";
+  ok "grants-toml-twice" (grant_err "[grants]\nnet = \"a\"\nnet = \"b\"\n") "listed twice";
+  Sys.remove (Filename.concat pdir "grants/vela.toml");
+  (* a dependency's own vela.toml never grants anything: only the program's does *)
+  put "envy/envy.vela" "pub fn get(env: Env) -> Str {\n    env.get(\"VELA_T_A\") ?? \"none\"\n}\n";
+  put "envy/vela.toml" "[package]\nname = \"envy\"\n\n[grants]\nenv = \"*\"\n";
+  put "grants/vela.toml" "[package]\nname = \"g\"\n\n[dependencies]\nenvy = { path = \"../envy\", caps = [\"env\"] }\n";
+  put "grants/dep.vela" "use envy\n\nfn main(root: Root) {\n    root.stdout.print(envy.get(root.env))\n}\n";
+  let code, o, e = vela_cli [ "run"; Filename.concat pdir "grants/dep.vela" ] in
+  ok "grants-dep-toml-ignored" (code = 0 && o = "none\n") (sprintf "code %d, out %S, err %S" code o e);
+  Sys.remove (Filename.concat pdir "grants/vela.toml");
+
   ok "fmt-use-pub"
     (Fmt.format ~file:"fu.vela" "use geom // g\npub   fn f() -> Int { 1 }\npub struct S { a: Int }\n"
      = "use geom  // g\n\npub fn f() -> Int { 1 }\n\npub struct S {\n    a: Int,\n}\n")

@@ -2,6 +2,7 @@
  (name test_vela)
  (libraries vela unix)
  (deps
+  ../bin/main.exe
   (glob_files %{project_root}/examples/*.vela)
   (glob_files %{project_root}/bench/*.vela)))
 

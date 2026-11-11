@@ -1,8 +1,12 @@
-(* vela.toml: a package's name and its dependencies, each with the
-   capabilities it may use.
+(* vela.toml: a package's name, the program's own grants, and its
+   dependencies, each with the capabilities it may use.
 
      [package]
      name = "app"
+
+     [grants]
+     fs = "data:ro"
+     net = ["api.github.com"]
 
      [dependencies]
      json = { path = "vendor/json" }
@@ -17,7 +21,13 @@
    tables, strings, string arrays and inline tables. *)
 
 type dep = { dname : string; dir : string; caps : string list; dspan : Span.t }
-type t = { pname : string; file : string; deps : dep list }
+(* [grants]: the program's own grants, as (kind, value) pairs written exactly
+   like the text after `--grant KIND=`. An fs directory is made absolute
+   relative to vela.toml. Only the vela.toml of the program being run is read
+   for grants; a dependency's never is. *)
+type t = { pname : string; file : string; deps : dep list; grants : (string * string) list }
+
+let grant_kinds = [ "net"; "fs"; "listen"; "env" ]
 
 let cap_grants = [ "net"; "fs"; "listen"; "stdout"; "clock"; "rand"; "stdin"; "env" ]
 
@@ -115,7 +125,7 @@ let parse file src : t =
     | _ -> fail !pos "expected a string, an array or an inline table"
   in
   let section = ref "" in
-  let name = ref "" and deps = ref [] in
+  let name = ref "" and deps = ref [] and grants = ref [] in
   let dir = Filename.dirname file in
   skip_ws ();
   while !pos < n do
@@ -124,7 +134,8 @@ let parse file src : t =
       let k, _ = key () in
       if peek () <> ']' then fail !pos "expected `]`";
       incr pos;
-      if k <> "package" && k <> "dependencies" then fail (!pos - 1) ("unknown table [" ^ k ^ "]; vela.toml has [package] and [dependencies]");
+      if k <> "package" && k <> "dependencies" && k <> "grants" then
+        fail (!pos - 1) ("unknown table [" ^ k ^ "]; vela.toml has [package], [grants] and [dependencies]");
       section := k;
       end_line ()
     end
@@ -151,11 +162,33 @@ let parse file src : t =
         if List.exists (fun d' -> d'.dname = d) !deps then raise (Bad (sp, "dependency `" ^ d ^ "` is listed twice"));
         deps := { dname = d; dir = path; caps; dspan = sp } :: !deps
       | "dependencies", _, _ -> raise (Bad (sp, "write a dependency as `name = { path = \"DIR\", caps = [...] }`"))
-      | _ -> raise (Bad (sp, "keys belong in [package] or [dependencies]"))
+      | "grants", g, v ->
+        if not (List.mem g grant_kinds) then
+          raise
+            (Bad
+               ( sp,
+                 if List.mem g cap_grants then Printf.sprintf "`%s` is always granted; [grants] lists %s" g (String.concat ", " grant_kinds)
+                 else Printf.sprintf "unknown grant `%s`; [grants] lists %s" g (String.concat ", " grant_kinds) ));
+        if List.mem_assoc g !grants then raise (Bad (sp, Printf.sprintf "grant `%s` is listed twice; give a list instead" g));
+        let vs = match v with VStr s -> [ s ] | VArr l -> l | VTable _ -> raise (Bad (sp, "a grant is a string or a list of strings")) in
+        if vs = [] then raise (Bad (sp, "an empty grant list grants nothing; remove the line"));
+        if g = "fs" && List.length vs > 1 then raise (Bad (sp, "fs takes one directory"));
+        let vs =
+          if g <> "fs" then vs
+          else
+            List.map
+              (fun v ->
+                let d, ro = if String.ends_with ~suffix:":ro" v then (String.sub v 0 (String.length v - 3), ":ro") else (v, "") in
+                (if Filename.is_relative d then Filename.concat dir d else d) ^ ro)
+              vs
+        in
+        List.iter (fun v -> if v = "" then raise (Bad (sp, "a grant cannot be empty"))) vs;
+        grants := !grants @ List.map (fun v -> (g, v)) vs
+      | _ -> raise (Bad (sp, "keys belong in [package], [grants] or [dependencies]"))
     end;
     skip_ws ()
   done;
-  { pname = !name; file; deps = List.rev !deps }
+  { pname = !name; file; deps = List.rev !deps; grants = !grants }
 
 (* vela.toml in the directory of [main] or the nearest parent. *)
 let find main =
