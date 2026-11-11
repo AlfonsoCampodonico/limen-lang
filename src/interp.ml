@@ -25,6 +25,7 @@ and sock = { fd : Unix.file_descr; mutable shut : bool }
 type mkey =
   | KInt of int64
   | KStr of string
+  | KBytes of string
   | KBool of bool
   | KStruct of string * (string * mkey) list
   | KEnum of string * string * mkey list
@@ -40,6 +41,7 @@ type value =
   | VFloat of float
   | VBool of bool
   | VStr of string
+  | VBytes of string
   | VUnit
   | VList of value array
   | VStruct of string * (string * value) list
@@ -117,6 +119,7 @@ let cap_name = function
 let rec key_of = function
   | VInt n -> KInt n
   | VStr s -> KStr s
+  | VBytes s -> KBytes s
   | VBool b -> KBool b
   | VStruct (n, fs) -> KStruct (n, List.map (fun (f, v) -> (f, key_of v)) fs)
   | VEnum (e, v, xs) -> KEnum (e, v, List.map key_of xs)
@@ -125,6 +128,7 @@ let rec key_of = function
 let rec val_of_key = function
   | KInt n -> VInt n
   | KStr s -> VStr s
+  | KBytes s -> VBytes s
   | KBool b -> VBool b
   | KStruct (n, fs) -> VStruct (n, List.map (fun (f, k) -> (f, val_of_key k)) fs)
   | KEnum (e, v, ks) -> VEnum (e, v, List.map val_of_key ks)
@@ -147,6 +151,7 @@ let rec show ?(top = true) v =
   | VFloat x -> fmt_float x
   | VBool b -> string_of_bool b
   | VStr s -> if top then s else "\"" ^ String.escaped s ^ "\""
+  | VBytes s -> "bytes([" ^ String.concat ", " (List.init (String.length s) (fun i -> string_of_int (Char.code s.[i]))) ^ "])"
   | VUnit -> "()"
   | VList a -> "[" ^ String.concat ", " (Array.to_list (Array.map (show ~top:false) a)) ^ "]"
   | VMap mv ->
@@ -168,6 +173,7 @@ let rec equal a b =
   | VFloat x, VFloat y -> x = y
   | VBool x, VBool y -> x = y
   | VStr x, VStr y -> x = y
+  | VBytes x, VBytes y -> x = y
   | VUnit, VUnit -> true
   | VList x, VList y -> Array.length x = Array.length y && Array.for_all2 equal x y
   | VStruct (n, xs), VStruct (m, ys) -> n = m && List.for_all2 (fun (_, x) (_, y) -> equal x y) xs ys
@@ -195,7 +201,7 @@ let rec compare_v a b =
   match (a, b) with
   | VInt x, VInt y -> compare x y
   | VFloat x, VFloat y -> compare x y
-  | VStr x, VStr y -> compare x y
+  | VStr x, VStr y | VBytes x, VBytes y -> compare x y
   | VBool x, VBool y -> compare x y
   | VList x, VList y -> lex (Array.to_list x) (Array.to_list y)
   | VStruct (_, xs), VStruct (_, ys) -> lex (List.map snd xs) (List.map snd ys)
@@ -326,6 +332,7 @@ let binop op a b sp =
   | Mul, VFloat x, VFloat y -> VFloat (x *. y)
   | Div, VFloat x, VFloat y -> VFloat (x /. y)
   | Add, VStr x, VStr y -> VStr (x ^ y)
+  | Add, VBytes x, VBytes y -> VBytes (x ^ y)
   | Lt, VFloat x, VFloat y -> VBool (x < y)
   | Le, VFloat x, VFloat y -> VBool (x <= y)
   | Gt, VFloat x, VFloat y -> VBool (x > y)
@@ -576,6 +583,10 @@ let rec eval rt env e : value =
       if k < 0L || k >= Int64.of_int (Array.length arr) then
         raise (Panic (sprintf "index %Ld is out of range for a list of length %d" k (Array.length arr), e.espan));
       arr.(Int64.to_int k)
+    | VBytes b, VInt k ->
+      if k < 0L || k >= Int64.of_int (String.length b) then
+        raise (Panic (sprintf "index %Ld is out of range for bytes of length %d" k (String.length b), e.espan));
+      vint (Char.code b.[Int64.to_int k])
     | _ -> failwith "internal: index")
   | ETry x -> (
     match eval rt env x with
@@ -667,7 +678,7 @@ and eval_var rt env n sp =
       | None ->
         if n = "panic" then VPanicFn
         else if n = "channel" then VChanFn
-        else if n = "assert" || n = "assert_eq" || n = "map" || n = "catch" then VBuiltin n
+        else if n = "assert" || n = "assert_eq" || n = "map" || n = "catch" || n = "bytes" then VBuiltin n
         else raise (Panic ("internal: unbound name " ^ n, sp)))
 
 and ctor_value rt en vn =
@@ -713,6 +724,16 @@ and apply rt fv args sp =
     match args with
     | [ f ] -> ( try ok (apply rt f [] sp) with Panic (m, _) -> VEnum ("Result", "Err", [ VStr m ]))
     | _ -> failwith "internal: catch")
+  | VBuiltin "bytes" -> (
+    match args with
+    | [ VList xs ] ->
+      VBytes
+        (String.init (Array.length xs) (fun i ->
+             match xs.(i) with
+             | VInt n when n >= 0L && n <= 255L -> Char.chr (Int64.to_int n)
+             | VInt n -> raise (Panic (sprintf "byte %Ld is out of range 0 to 255" n, sp))
+             | _ -> failwith "internal: bytes"))
+    | _ -> failwith "internal: bytes")
   | VBuiltin "map" -> (
     match args with
     | [] -> VMap empty_map
@@ -836,6 +857,17 @@ and call_method rt v name args sp =
     VStr (String.sub s lo (hi - lo))
   | VStr s, "index_of", [ VStr t ] -> ( match find_sub s t 0 with Some i -> some (vint i) | None -> none)
   | VStr s, "chars", [] -> strs (chars s)
+  | VStr s, "to_bytes", [] -> VBytes s
+  | VBytes b, "len", [] -> vint (String.length b)
+  | VBytes b, "is_empty", [] -> VBool (b = "")
+  | VBytes b, "get", [ VInt i ] -> if i >= 0L && i < Int64.of_int (String.length b) then some (vint (Char.code b.[Int64.to_int i])) else none
+  | VBytes b, "slice", [ VInt lo; VInt hi ] ->
+    let n = String.length b in
+    let lo = clamp lo n in
+    let hi = max lo (clamp hi n) in
+    VBytes (String.sub b lo (hi - lo))
+  | VBytes b, "to_list", [] -> VList (Array.init (String.length b) (fun i -> vint (Char.code b.[i])))
+  | VBytes b, "to_str", [] -> VStr b
   | VStr s, "bytes", [] -> VList (Array.init (String.length s) (fun i -> vint (Char.code s.[i])))
   | VInt n, "to_char", [] -> VStr (utf8_of_code (if n < 0L || n > 0x10FFFFL then -1 else Int64.to_int n))
   | VInt a, "min", [ VInt b ] -> VInt (min a b)

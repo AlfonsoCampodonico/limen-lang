@@ -98,6 +98,7 @@ let rec resolve env (te : ty_expr) : ty =
     | "Float", _ -> TFloat
     | "Bool", _ -> TBool
     | "Str", _ -> TStr
+    | "Bytes", _ -> TBytes
     | "List", [ x ] -> TList x
     | "Root", _ -> TCap Root
     | "Net", _ -> TCap Net
@@ -360,6 +361,9 @@ and lower_call f e callee args ty =
     let c = lower f (List.hd args) in
     let inner = match tyof f (List.hd args) with TFn (_, r) -> r | _ -> TUnit in
     tmp f ty (I.Catch (c, inner))
+  | EVar "bytes" when not_local f "bytes" && not (Hashtbl.mem f.g.fns "bytes") ->
+    let xs = List.map (lower f) args in
+    tmp f ty (I.Prim ("bytes_new", TBytes, xs, e.espan))
   | EVar "map" when not_local f "map" && not (Hashtbl.mem f.g.fns "map") ->
     let xs = List.map (lower f) args in
     tmp f ty (I.Prim ((if xs = [] then "map_new" else "map_from"), ty, xs, e.espan))
@@ -389,6 +393,10 @@ and access f e : I.atom * ty * I.step list =
   | EField (r, name, _) when is_struct f.g (tyof f r) ->
     let a, rt, steps = access f r in
     (a, rt, steps @ [ I.PField (field_index f.g (tyof f r) name) ])
+  | EIndex (r, i) when tyof f r = TBytes ->
+    let b = lower f r in
+    let ia = lower f i in
+    (tmp f TInt (I.Prim ("bytes_at", TBytes, [ b; ia ], e.espan)), TInt, [])
   | EIndex (r, k) when (match tyof f r with TMap _ -> true | _ -> false) ->
     (* a map lookup starts a new path: the value it finds *)
     let m = lower f r in
@@ -706,6 +714,7 @@ and lower_method f e recv name args ty =
     let prefix =
       match rt with
       | TStr -> "str_"
+      | TBytes -> "bytes_"
       | TInt -> "int_"
       | TFloat -> "float_"
       | TBool -> "bool_"

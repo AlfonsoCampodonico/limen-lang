@@ -78,7 +78,7 @@ let unify_at ctx span want got =
   try unify want got
   with Mismatch -> err ctx "E0201" span (sprintf "expected `%s`, found `%s`" (show want) (show got))
 
-let builtin_types = [ "Int"; "Float"; "Bool"; "Str"; "List"; "Array"; "Chan"; "Root"; "Net"; "Fs"; "Stdout"; "Clock"; "Listen"; "Listener"; "Conn"; "Rand"; "Stdin"; "Env"; "Map" ]
+let builtin_types = [ "Int"; "Float"; "Bool"; "Str"; "Bytes"; "List"; "Array"; "Chan"; "Root"; "Net"; "Fs"; "Stdout"; "Clock"; "Listen"; "Listener"; "Conn"; "Rand"; "Stdin"; "Env"; "Map" ]
 
 (* Names other languages use for ambient I/O, mapped to the capability way. *)
 let ambient =
@@ -128,6 +128,7 @@ let rec resolve ctx env (te : ty_expr) : ty =
     | "Float" -> simple TFloat
     | "Bool" -> simple TBool
     | "Str" -> simple TStr
+    | "Bytes" -> simple TBytes
     | "List" -> if want 1 then TList (List.hd args') else TErr
     | "Root" -> simple (TCap Root)
     | "Net" -> simple (TCap Net)
@@ -201,7 +202,7 @@ let visible_names ctx f =
   List.concat_map (fun s -> List.of_seq (Hashtbl.to_seq_keys s.vars)) f.scopes
   @ List.of_seq (Hashtbl.to_seq_keys ctx.fns)
   @ List.of_seq (Hashtbl.to_seq_keys ctx.owners)
-  @ [ "panic"; "channel"; "assert"; "assert_eq"; "map"; "catch" ]
+  @ [ "panic"; "channel"; "assert"; "assert_eq"; "map"; "catch"; "bytes" ]
 
 (* Generic functions' bounds: function -> type parameter -> interfaces. *)
 let fn_bounds : (string, (string * string list) list) Hashtbl.t = Hashtbl.create 8
@@ -275,6 +276,7 @@ let builtin_tname t =
   | TFloat -> Some "Float"
   | TBool -> Some "Bool"
   | TStr -> Some "Str"
+  | TBytes -> Some "Bytes"
   | TList _ -> Some "List"
   | TMap _ -> Some "Map"
   | TNamed (("Option" | "Result" | "IoError") as n, _) -> Some n
@@ -289,7 +291,10 @@ let methods (t : ty) : (string * (unit -> ty list * ty)) list =
       m "starts_with" [ TStr ] TBool; m "ends_with" [ TStr ] TBool; m "to_upper" [] TStr;
       m "to_lower" [] TStr; m "replace" [ TStr; TStr ] TStr; m "parse_int" [] (opt TInt);
       m "parse_float" [] (opt TFloat); m "slice" [ TInt; TInt ] TStr; m "index_of" [ TStr ] (opt TInt);
-      m "bytes" [] (TList TInt); m "chars" [] (TList TStr) ]
+      m "bytes" [] (TList TInt); m "chars" [] (TList TStr); m "to_bytes" [] TBytes ]
+  | TBytes ->
+    [ m "len" [] TInt; m "is_empty" [] TBool; m "get" [ TInt ] (opt TInt); m "slice" [ TInt; TInt ] TBytes;
+      m "to_list" [] (TList TInt); m "to_str" [] TStr ]
   | TInt ->
     [ m "to_str" [] TStr; m "to_float" [] TFloat; m "abs" [] TInt; m "to_char" [] TStr; m "min" [ TInt ] TInt;
       m "max" [ TInt ] TInt ]
@@ -342,7 +347,7 @@ let unordered ctx t : ty option =
   let seen = Hashtbl.create 8 in
   let rec go t =
     match repr t with
-    | TInt | TFloat | TStr | TBool | TUnit | TVar _ | TErr -> None
+    | TInt | TFloat | TStr | TBytes | TBool | TUnit | TVar _ | TErr -> None
     | TList a | TArray (a, _) -> go a
     | TNamed (n, args) as nt -> (
       let key = show nt in
@@ -452,6 +457,7 @@ and check_expr_inner ctx f e : ty =
     let t = check_expr ctx f a in
     match repr t with
     | TMap (k, v) -> expect ctx f i k; v
+    | TBytes -> expect ctx f i TInt; TInt
     | _ ->
     expect ctx f i TInt;
     match repr t with
@@ -630,6 +636,12 @@ and check_call ctx f callee args sp =
       err ctx "E0107" sp "`catch` takes 1 argument, a closure with no parameters, as in `catch(|| risky())`";
       check_args ctx f args;
       TErr)
+  | EVar "bytes" when lookup f "bytes" = None && not (Hashtbl.mem ctx.fns "bytes") ->
+    (* bytes([104, 105]): each item 0 to 255, or it panics *)
+    (match args with
+     | [ a ] -> expect ctx f a (TList TInt)
+     | _ -> err ctx "E0107" sp "`bytes` takes 1 argument, a list of Ints from 0 to 255"; check_args ctx f args);
+    TBytes
   | EVar "map" when lookup f "map" = None && not (Hashtbl.mem ctx.fns "map") ->
     let k = fresh () and v = fresh () in
     (match args with
@@ -1032,7 +1044,7 @@ and check_bin ctx f op a b sp =
       err ctx "E0201" sp (sprintf "operator `%s` cannot be applied to `%s`" name (show t))
     in
     match op with
-    | Add -> (match t with TInt | TFloat | TStr | TErr | TVar _ -> t | _ -> bad (); TErr)
+    | Add -> (match t with TInt | TFloat | TStr | TBytes | TErr | TVar _ -> t | _ -> bad (); TErr)
     | Sub | Mul | Div -> (match t with TInt | TFloat | TErr | TVar _ -> t | _ -> bad (); TErr)
     | Mod -> (match t with TInt | TErr | TVar _ -> t | _ -> bad (); TErr)
     | Lt | Le | Gt | Ge -> (match unordered ctx t with None -> () | Some _ -> bad ()); TBool
@@ -1344,6 +1356,9 @@ and check_stmt ctx f s : bool =
     let lt = if is_group then TErr else check_expr ctx f lhs in
     (match lhs.edesc with
      | EBlock _ -> err ctx "E0209" lhs.espan "a method cannot be assigned to"
+     | EIndex (b, _) when repr b.ety = TBytes ->
+       err ctx "E0209" lhs.espan "`Bytes` cannot be changed in place"
+         ~notes:[ "build a new value: `b.slice(0, i) + bytes([x]) + b.slice(i + 1, b.len())`" ]
      | _ -> ());
     expect ctx f rhs lt;
     false
@@ -1409,7 +1424,7 @@ let unkeyable ctx t : ty option =
   let seen = Hashtbl.create 8 in
   let rec go t =
     match repr t with
-    | TInt | TStr | TBool | TVar _ | TErr -> None
+    | TInt | TStr | TBytes | TBool | TVar _ | TErr -> None
     | TNamed (n, args) as nt -> (
       let key = show nt in
       if Hashtbl.mem seen key then None

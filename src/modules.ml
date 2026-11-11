@@ -72,7 +72,7 @@ type env = {
 }
 
 (* Built-in types a file can add methods to. *)
-let builtin_method_types = [ "Int"; "Float"; "Bool"; "Str"; "List"; "Map"; "Option"; "Result"; "IoError" ]
+let builtin_method_types = [ "Int"; "Float"; "Bool"; "Str"; "Bytes"; "List"; "Map"; "Option"; "Result"; "IoError" ]
 
 let qual (m : modinfo) n = if m.mname = "" then n else m.mname ^ "." ^ n
 

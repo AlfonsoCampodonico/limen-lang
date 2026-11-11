@@ -36,6 +36,7 @@ let rec cname c t =
   | TBool -> "Bool"
   | TUnit -> "Unit"
   | TStr -> "Str"
+  | TBytes -> "Bytes"
   | TFn (ps, r) ->
     List.iter (fun p -> ignore (cname c p)) ps;
     ignore (cname c r);
@@ -76,7 +77,7 @@ let ctype c t =
   | TFloat -> "double"
   | TBool -> "bool"
   | TUnit -> "W_Unit"
-  | TStr -> "WStr*"
+  | TStr | TBytes -> "WStr*"
   | TFn _ -> "WClo*"
   | TDyn _ -> "WDyn*"
   | TCap _ -> "WCap*"
@@ -189,6 +190,7 @@ let rec cmp_prefix c t =
   | TInt -> "Int"
   | TFloat -> "Float"
   | TStr -> "Str"
+  | TBytes -> "Bytes"
   | TBool -> "Bool"
   | TUnit -> "Unit"
   | _ ->
@@ -209,6 +211,7 @@ let rec hash_prefix c t =
   match t with
   | TInt -> "Int"
   | TStr -> "Str"
+  | TBytes -> "Bytes"
   | TBool -> "Bool"
   | TUnit -> "Unit"
   | _ ->
@@ -234,7 +237,7 @@ let binop c op t a b sp =
   | TFloat, Sub -> sprintf "(%s - %s)" a b
   | TFloat, Mul -> sprintf "(%s * %s)" a b
   | TFloat, Div -> sprintf "(%s / %s)" a b
-  | TStr, Add -> sprintf "Str_concat(%s, %s)" a b
+  | (TStr | TBytes), Add -> sprintf "Str_concat(%s, %s)" a b
   | (TInt | TFloat | TBool), (Lt | Le | Gt | Ge | Eq | Ne) ->
     let o = match op with Lt -> "<" | Le -> "<=" | Gt -> ">" | Ge -> ">=" | Eq -> "==" | _ -> "!=" in
     sprintf "(%s %s %s)" a o b
@@ -534,6 +537,14 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
       line "}"
     | "str_bytes", _ -> set (sprintf "Str_bytes(%s)" (arg 0))
     | "str_chars", _ -> set (sprintf "Str_chars(%s)" (arg 0))
+    | ("str_to_bytes" | "bytes_to_str"), _ -> set (sprintf "Str_dup(%s)" (arg 0))
+    | "bytes_new", _ -> set (sprintf "Bytes_from_list(%s, %s)" (arg 0) (where sp))
+    | "bytes_at", _ -> set (sprintf "Bytes_at(%s, %s, %s)" (arg 0) (arg 1) (where sp))
+    | "bytes_len", _ -> set (sprintf "(%s)->len" (arg 0))
+    | "bytes_is_empty", _ -> set (sprintf "((%s)->len == 0)" (arg 0))
+    | "bytes_get", _ -> opt_from (sprintf "%s >= 0 && %s < (%s)->len" (arg 1) (arg 1) (arg 0)) (sprintf "(int64_t)(unsigned char)(%s)->data[%s]" (arg 0) (arg 1))
+    | "bytes_slice", _ -> set (sprintf "Str_slice(%s, %s, %s)" (arg 0) (arg 1) (arg 2))
+    | "bytes_to_list", _ -> set (sprintf "Str_bytes(%s)" (arg 0))
     | "int_range", _ -> set (sprintf "L_Int_range(%s, %s)" (arg 0) (arg 1))
     | "int_to_char", _ -> set (sprintf "Int_to_char(%s)" (arg 0))
     | "int_min", _ -> set (sprintf "(%s < %s ? %s : %s)" (arg 0) (arg 1) (arg 0) (arg 1))

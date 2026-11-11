@@ -57,6 +57,7 @@ Statements are separated by a newline or `;`. Two statements on one line without
 | `Float` | IEEE 754 double | No fused multiply-add, so both backends give identical results. |
 | `Bool` | `true`, `false` | |
 | `Str` | immutable byte strings | `len()` counts bytes. |
+| `Bytes` | immutable binary data | Built with `bytes([104, 105])` or `s.to_bytes()`; prints as `bytes([104, 105])`. |
 | `()` | the unit value `()` | Type of statements and of functions without `->`. |
 | `List[T]` | growable sequence | A value: assigning or passing it never shares mutation (section 8). |
 | `Array[T, N]` | exactly `N` elements | A value type stored inline, like a struct. `N` is an integer literal. |
@@ -102,7 +103,7 @@ for (w, n) in counts.entries() { ... }    // in insertion order
 
 `m[k] = v` inserts or replaces and needs a `mut` place, like `push`. An entry can also be changed in place through its key: `m[k].hits = m[k].hits + 1`, `m[k].names.push(n)`, `m[a][b] = v` for a map of maps. Those need the key to be there and panic like `m[k]` when it is not; only `m[k] = v` adds a key.
 
-A key is an `Int`, `Str` or `Bool`, or a tuple, struct or enum made of them, compared by value: `grid[(x, y)]`, `seen[Pos { x, y }]`. `Float` (NaN is not equal to itself), lists and maps cannot be keys (E0113). Iteration (`keys`, `values`, `entries`) and printing follow insertion order, the same in both backends; replacing a value keeps its key's position, and removing then re-inserting moves it to the end. Two maps are equal when they hold the same entries, in any order.
+A key is an `Int`, `Str`, `Bytes` or `Bool`, or a tuple, struct or enum made of them, compared by value: `grid[(x, y)]`, `seen[Pos { x, y }]`. `Float` (NaN is not equal to itself), lists and maps cannot be keys (E0113). Iteration (`keys`, `values`, `entries`) and printing follow insertion order, the same in both backends; replacing a value keeps its key's position, and removing then re-inserting moves it to the end. Two maps are equal when they hold the same entries, in any order.
 
 There is no null and no implicit conversion between types: `Int` and `Float` never mix without `to_float()` or `to_int()`.
 
@@ -157,7 +158,7 @@ let p = a.add(b).add(c)
 ```
 
 - `self` must be the first parameter, and its type a struct or enum declared in the program, generic or not, or one of the built-in types below (E0110).
-- A file can add methods to `Int`, `Float`, `Bool`, `Str`, `List[T]`, `Map[K, V]`, `Option[T]`, `Result[T, E]` and `IoError`: `fn shout(self: Str) -> Str { self.to_upper() + "!" }` makes `"hi".shout()` work **in that file only**. Built-in types belong to no module, so this keeps two modules' helpers from clashing; such a method cannot be `pub` (E0110), and it cannot reuse the name of a built-in method (E0106). Export a plain function to share it. Methods added this way do not count toward interfaces, and capabilities, channels and arrays cannot get methods.
+- A file can add methods to `Int`, `Float`, `Bool`, `Str`, `Bytes`, `List[T]`, `Map[K, V]`, `Option[T]`, `Result[T, E]` and `IoError`: `fn shout(self: Str) -> Str { self.to_upper() + "!" }` makes `"hi".shout()` work **in that file only**. Built-in types belong to no module, so this keeps two modules' helpers from clashing; such a method cannot be `pub` (E0110), and it cannot reuse the name of a built-in method (E0106). Export a plain function to share it. Methods added this way do not count toward interfaces, and capabilities, channels and arrays cannot get methods.
 - A method is only called with a dot: `p.add(q)`, never `add(p, q)`. Its name does not clash with a plain function or with methods of other types, so `fn area(self: Circle)` and `fn area(self: Rect)` can both exist.
 - Methods take `self` by value like any parameter; to "change" a value, return the new one.
 - A method without the call is a value: `p.add` is a function that calls `add` on `p`, the same as `|q| p.add(q)`. Like a closure, it holds a copy of `p` taken when `p.add` is evaluated, so `[a, b].map(origin.add)` works and later changes to `p` do not reach it. This works for every method that can be called with a dot: user methods, `dyn` and interface-bounded methods, and built-in ones (`let say = out.print`), except `push` and `remove`, which change their receiver. (It is `p.add`, as in Go and Swift, and not `Point.add`: the value already knows its type, and `Name.x` is taken by enum variants and modules.)
@@ -264,7 +265,7 @@ From loosest to tightest. All binary operators are left-associative.
 
 | Operator | Operands | Result |
 | --- | --- | --- |
-| `+` | `Int`, `Float`, `Str` (concatenation) | same type |
+| `+` | `Int`, `Float`, `Str`, `Bytes` (concatenation) | same type |
 | `-` `*` `/` | `Int`, `Float` | same type |
 | `%` | `Int` | `Int` |
 | `<` `<=` `>` `>=` | any ordered type (below) | `Bool` |
@@ -274,7 +275,7 @@ From loosest to tightest. All binary operators are left-associative.
 | `-x` | `Int`, `Float` | same type |
 | `!x` | `Bool` | `Bool` |
 
-Both operands must have the same type. The **ordered** types are `Int`, `Float`, `Str` (byte order), `Bool` (`false` first), `()`, and lists, arrays, tuples, structs and enums whose items are ordered. Those compare item by item: lists and arrays lexicographically (a prefix comes first), tuples and structs field by field in declaration order, enums by variant in declaration order and then by payload, so `None` sorts after every `Some`. Maps, functions, capabilities, channels, `dyn` values and type parameters have no order (E0201). On `Int`, `/` truncates toward zero, `%` takes the sign of the dividend, and division or remainder by zero panics. On `Float`, comparisons follow IEEE, so NaN is unequal to everything, and division by zero gives infinity. Inside a list, tuple, struct or enum, and in `sort()`, floats use a total order with NaN first, so sorting never misbehaves.
+Both operands must have the same type. The **ordered** types are `Int`, `Float`, `Str` and `Bytes` (byte order), `Bool` (`false` first), `()`, and lists, arrays, tuples, structs and enums whose items are ordered. Those compare item by item: lists and arrays lexicographically (a prefix comes first), tuples and structs field by field in declaration order, enums by variant in declaration order and then by payload, so `None` sorts after every `Some`. Maps, functions, capabilities, channels, `dyn` values and type parameters have no order (E0201). On `Int`, `/` truncates toward zero, `%` takes the sign of the dividend, and division or remainder by zero panics. On `Float`, comparisons follow IEEE, so NaN is unequal to everything, and division by zero gives infinity. Inside a list, tuple, struct or enum, and in `sort()`, floats use a total order with NaN first, so sorting never misbehaves.
 
 ### Literals and constructors
 
@@ -519,6 +520,22 @@ Methods take the receiver by value and never modify it, except `push`, which nee
 | `index_of(s)` | `Option[Int]`, byte offset of the first occurrence |
 | `bytes()` | `List[Int]`, each byte as 0-255; index it to scan a string fast |
 
+### Bytes
+
+Binary data, kept apart from text so a byte buffer is never printed or concatenated as a string by mistake. Natively it is stored like a `Str`, so conversions cost one reference.
+
+| Method | Result |
+| --- | --- |
+| `bytes(list)` (function) | `Bytes` from a `List[Int]`; an item outside 0 to 255 panics |
+| `s.to_bytes()` (on `Str`) | the string's bytes |
+| `len()`, `is_empty()` | `Int`, `Bool` |
+| `b[i]`, `get(i)` | `Int` (0 to 255; panics out of range), `Option[Int]` |
+| `slice(lo, hi)` | `Bytes`, clamped like `Str.slice` |
+| `to_list()` | `List[Int]` |
+| `to_str()` | `Str` with the same bytes (no check: a `Str` may hold any bytes) |
+
+`+` concatenates, `==` and `<` compare byte by byte, and `Bytes` can be a map key. It cannot be changed in place (`b[i] = x` is E0209). Capabilities still read and write `Str`; convert with `to_bytes()` and `to_str()`.
+
 ### Int, Float, Bool
 
 | Type | Methods |
@@ -590,6 +607,7 @@ Strings compare byte by byte, so `c >= "a" && c <= "z"` tests a one-byte string,
 | `catch(f)` | `Result[T, Str]`: run `f: fn() -> T`; `Err(message)` if it panicked (section 15) |
 | `channel(n)` | a new `Chan[T]` with capacity `n` |
 | `map()`, `map(pairs)` | a new `Map[K, V]`, empty or from a `List[(K, V)]` |
+| `bytes(list)` | a new `Bytes` from a `List[Int]` of values 0 to 255 |
 | `assert(cond)` | panic with `assertion failed` unless `cond` is true |
 | `assert_eq(a, b)` | panic with `assertion failed: <a> != <b>` unless `a == b` |
 

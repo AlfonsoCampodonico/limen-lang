@@ -740,6 +740,45 @@ static L_Int *Str_bytes(WStr *s) {
   for (int64_t i = 0; i < s->len; i++) L_Int_push(&out, (int64_t)(unsigned char)s->data[i]);
   return out;
 }
+/* Bytes: a WStr holding binary data; only printing differs from Str. */
+#define Bytes_dup Str_dup
+#define Bytes_drop Str_drop
+#define Bytes_share Str_share
+#define Bytes_eq Str_eq
+#define Bytes_cmp Str_cmp
+#define Bytes_hash Str_hash
+static void Bytes_show(WBuf *b, WStr *s, bool top) {
+  (void)top;
+  char tmp[8];
+  buf_puts(b, "bytes([");
+  for (int64_t i = 0; i < s->len; i++) {
+    snprintf(tmp, sizeof tmp, i ? ", %u" : "%u", (unsigned)(unsigned char)s->data[i]);
+    buf_puts(b, tmp);
+  }
+  buf_puts(b, "])");
+}
+static WStr *Bytes_from_list(L_Int *l, const char *where) {
+  WStr *s = Str_new(l->len);
+  for (int64_t i = 0; i < l->len; i++) {
+    int64_t v = l->data[i];
+    if (v < 0 || v > 255) {
+      char m[96];
+      snprintf(m, sizeof m, "byte %lld is out of range 0 to 255", (long long)v);
+      Str_drop(s);
+      w_panic_c(m, where);
+    }
+    s->data[i] = (char)v;
+  }
+  return s;
+}
+static int64_t Bytes_at(WStr *s, int64_t i, const char *where) {
+  if (i < 0 || i >= s->len) {
+    char m[128];
+    snprintf(m, sizeof m, "index %lld is out of range for bytes of length %lld", (long long)i, (long long)s->len);
+    w_panic_c(m, where);
+  }
+  return (int64_t)(unsigned char)s->data[i];
+}
 /* The length of the UTF-8 character at s[i], or 1 for a byte that does not
    start a well-formed one (as Interp.utf8_len). */
 static int64_t w_utf8_len(const unsigned char *s, int64_t i, int64_t n) {
