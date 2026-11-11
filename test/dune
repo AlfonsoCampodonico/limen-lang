@@ -4,7 +4,8 @@
  (deps
   ../bin/main.exe
   (glob_files %{project_root}/examples/*.vela)
-  (glob_files %{project_root}/bench/*.vela)))
+  (glob_files %{project_root}/bench/*.vela)
+  (glob_files tls/*.pem)))
 
 ; `vela lsp` end to end over stdio.
 (rule
