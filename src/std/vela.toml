@@ -13,4 +13,10 @@ http = { path = ".", caps = ["net", "listen"] }
 format = { path = ".", caps = [] }
 time = { path = ".", caps = [] }
 regex = { path = ".", caps = [] }
-sql = { path = ".", caps = ["foreign", "fs"] }
+sql = { path = ".", caps = ["fs"] }
+
+# Modules whose foreign blocks are part of the standard library's trusted
+# base: their C calls need no Foreign capability, so a program using them
+# only grants what the module's own functions take (sql: an Fs).
+[trust]
+foreign = ["sql"]

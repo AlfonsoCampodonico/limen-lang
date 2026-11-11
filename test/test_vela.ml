@@ -1111,6 +1111,9 @@ fn main(root: Root) {
     "foreign \"c\" {\n    fn strlen(s: Str) -> Int\n}\n\nfn main(root: Root) {\n    root.stdout.print(\"{strlen(root.fs, \"ab\")}\")\n}\n" [ "E0201" ];
   errs "ffi-body" "foreign \"c\" {\n    fn f() -> Int { 1 }\n}\n\nfn main() {}\n" [ "E0003" ];
   errs "ffi-generic" "foreign \"c\" {\n    fn f[T](x: T)\n}\n\nfn main() {}\n" [ "E0003" ];
+  (* only trusted standard library modules call C without Foreign *)
+  errs "ffi-runtime-lib" "foreign \"vela\" {\n    fn vela_copy(p: Handle, n: Int) -> Bytes\n}\n\nfn main() {}\n" [ "E0330" ];
+  errs "ffi-sql-private" "use sql\n\nfn main() {\n    let x = sql.sqlite3_errstr(1)\n}\n" [ "E0402" ];
   errs "ffi-same-line" "foreign \"c\" {\n    fn a() fn b()\n}\n\nfn main() {}\n" [ "E0003" ];
   errs "ffi-main" "foreign \"c\" {\n    fn main()\n}\n" [ "E0303"; "E0330" ];
   (* a missing symbol is an error before the program runs (natively, a link error) *)
@@ -1625,36 +1628,35 @@ fn main(root: Root) {
     "served 4\n200 text/plain; charset=utf-8 hi GET\n500 text/plain; charset=utf-8 internal error\n404 text/plain; charset=utf-8 no /missing\n201 {\"got\":[1,{\"a\":true}]}\nchunked sent\n200 hello world\n";
   out "example-ffi" ~grants:{ Interp.no_grants with foreign = [ "c" ] } (example "ffi.vela")
     "3.25 kg: 3.25, then [ kg]\n-1e3: -1000.0, then []\n0x1p4!: 16.0, then [!]\nabc: not a number\n: not a number\n";
-  (* ---------- sql: SQLite through the foreign capability ---------- *)
-  let sqlg = { Interp.no_grants with foreign = [ "sqlite3" ] } in
+  (* ---------- sql: SQLite, trusted by the standard library ---------- *)
+  let sqlg = Interp.no_grants in
   let sql_basic = {v|use sql
 
 fn main(root: Root) -> Result[(), IoError] {
     let out = root.stdout
-    let f = root.foreign
-    let db = sql.memory(f)?
-    db.exec(f, "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER, score REAL, photo BLOB)", [])?
+    let db = sql.memory()?
+    db.exec("CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER, score REAL, photo BLOB)", [])?
     let names = ["Ada", "Grace", "it's; DROP TABLE people; --", "é 😀"]
     for i in 0..<names.len() {
         let n = names[i]
-        let changed = db.exec(f, "INSERT INTO people (name, age, score, photo) VALUES (?, ?, ?, ?)",
+        let changed = db.exec("INSERT INTO people (name, age, score, photo) VALUES (?, ?, ?, ?)",
             [sql.Text(n), if i == 1 { sql.Null } else { sql.Int(30 + i) }, sql.Float(i.to_float() / 2.0), sql.Blob(bytes([i, 0, 255]))])?
-        out.print("{changed} {db.last_id(f)}")
+        out.print("{changed} {db.last_id()?}")
     }
-    for row in db.query(f, "SELECT id, name, age, score, photo FROM people WHERE id >= ? ORDER BY id", [sql.Int(2)])? {
+    for row in db.query("SELECT id, name, age, score, photo FROM people WHERE id >= ? ORDER BY id", [sql.Int(2)])? {
         out.print("{row.int("id") ?? -1} {row.text("name") ?? "?"} {row.int("age")} {row.float("score") ?? 0.0} {row.blob("photo")} {row.is_null("age")}")
     }
-    let one = db.query_one(f, "SELECT count(*) AS n, sum(age) AS total, max(score) AS top FROM people", [])?
+    let one = db.query_one("SELECT count(*) AS n, sum(age) AS total, max(score) AS top FROM people", [])?
     match one {
         Some(r) => out.print("{r.int("n")} {r.int("total")} {r.float("top")} {r.float("n")} {r.columns}"),
         None => out.print("none"),
     }
-    out.print("{db.query_one(f, "SELECT name FROM people WHERE name = ?", [sql.Text("nobody")])?}")
-    out.print("{db.exec(f, "UPDATE people SET age = age + 1 WHERE age IS NOT NULL", [])?}")
-    out.print("{db.exec(f, "CREATE TABLE a (x); CREATE TABLE b (y); INSERT INTO a VALUES (1), (2)", [])?}")
-    let r = db.query(f, "SELECT x, NULL AS missing, 'hi' || ? AS greeting FROM a", [sql.Text("!")])?
+    out.print("{db.query_one("SELECT name FROM people WHERE name = ?", [sql.Text("nobody")])?}")
+    out.print("{db.exec("UPDATE people SET age = age + 1 WHERE age IS NOT NULL", [])?}")
+    out.print("{db.exec("CREATE TABLE a (x); CREATE TABLE b (y); INSERT INTO a VALUES (1), (2)", [])?}")
+    let r = db.query("SELECT x, NULL AS missing, 'hi' || ? AS greeting FROM a", [sql.Text("!")])?
     out.print("{r[1].get("x")} {r[1].get("missing")} {r[1].get("greeting")} {r.len()}")
-    db.close(f)
+    db.close()
 }
 |v} in
   let sql_basic_want =
@@ -1665,21 +1667,20 @@ fn main(root: Root) -> Result[(), IoError] {
 
 fn main(root: Root) {
     let out = root.stdout
-    let f = root.foreign
-    match sql.memory(f) {
+    match sql.memory() {
         Ok(db) => {
-            out.print("{db.exec(f, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT UNIQUE)", [])}")
-            out.print("{db.exec(f, "INSERT INTO t (name) VALUES (?)", [sql.Text("a")])}")
-            out.print("{db.exec(f, "INSERT INTO t (name) VALUES (?)", [sql.Text("a")])}")
-            out.print("{db.exec(f, "SELEC 1", [])}")
-            out.print("{db.query(f, "SELECT * FROM nowhere", [])}")
-            out.print("{db.query(f, "SELECT ?", [])}")
-            out.print("{db.query(f, "SELECT ?", [sql.Int(1), sql.Int(2)])}")
-            out.print("{db.exec(f, "INSERT INTO t (name) VALUES (?); DELETE FROM t", [sql.Text("b")])}")
-            out.print("{db.exec(f, "  ", [sql.Int(1)])}")
-            out.print("{db.exec(f, "ATTACH DATABASE '/tmp/vela-sql-attach.db' AS other", [])}")
-            out.print("{db.exec(f, "VACUUM INTO '/tmp/vela-sql-vacuum.db'", [])}")
-            match db.query(f, "SELECT name FROM t", []) {
+            out.print("{db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT UNIQUE)", [])}")
+            out.print("{db.exec("INSERT INTO t (name) VALUES (?)", [sql.Text("a")])}")
+            out.print("{db.exec("INSERT INTO t (name) VALUES (?)", [sql.Text("a")])}")
+            out.print("{db.exec("SELEC 1", [])}")
+            out.print("{db.query("SELECT * FROM nowhere", [])}")
+            out.print("{db.query("SELECT ?", [])}")
+            out.print("{db.query("SELECT ?", [sql.Int(1), sql.Int(2)])}")
+            out.print("{db.exec("INSERT INTO t (name) VALUES (?); DELETE FROM t", [sql.Text("b")])}")
+            out.print("{db.exec("  ", [sql.Int(1)])}")
+            out.print("{db.exec("ATTACH DATABASE '/tmp/vela-sql-attach.db' AS other", [])}")
+            out.print("{db.exec("VACUUM INTO '/tmp/vela-sql-vacuum.db'", [])}")
+            match db.query("SELECT name FROM t", []) {
                 Ok(rows) => {
                     out.print("{rows}")
                     out.print("{catch(|| rows[0].int("name"))}")
@@ -1687,20 +1688,19 @@ fn main(root: Root) {
                 },
                 Err(e) => out.print("{e}"),
             }
-            out.print("{db.close(f)}")
+            out.print("{db.close()}")
         },
         Err(e) => out.print("{e}"),
     }
-    out.print("{sql.memory(f.only("c")).is_ok()}")
 }
 |v} in
   out "sql-errors" ~grants:sqlg sql_errors
-    "Ok(0)\nOk(1)\nErr(Failed(\"sql: exec: UNIQUE constraint failed: t.name\"))\nErr(Failed(\"sql: near \\\"SELEC\\\": syntax error\"))\nErr(Failed(\"sql: prepare: no such table: nowhere\"))\nErr(Failed(\"sql: the statement has 1 parameter, but 0 were given\"))\nErr(Failed(\"sql: the statement has 1 parameter, but 2 were given\"))\nErr(Failed(\"sql: a statement with parameters must be alone; run several with `exec` and no parameters\"))\nErr(Failed(\"sql: no statement in the SQL text\"))\nErr(Failed(\"sql: too many attached databases - max 0\"))\nErr(Failed(\"sql: too many attached databases - max 0\"))\n[sql.Row { columns: [\"name\"], values: [Text(\"a\")] }]\nErr(\"sql: column `name` is not an integer: Text(\\\"a\\\")\")\nErr(\"sql: the row has no column `nope` (it has name)\")\nOk(())\nfalse\n";
+    "Ok(0)\nOk(1)\nErr(Failed(\"sql: exec: UNIQUE constraint failed: t.name\"))\nErr(Failed(\"sql: near \\\"SELEC\\\": syntax error\"))\nErr(Failed(\"sql: prepare: no such table: nowhere\"))\nErr(Failed(\"sql: the statement has 1 parameter, but 0 were given\"))\nErr(Failed(\"sql: the statement has 1 parameter, but 2 were given\"))\nErr(Failed(\"sql: a statement with parameters must be alone; run several with `exec` and no parameters\"))\nErr(Failed(\"sql: no statement in the SQL text\"))\nErr(Failed(\"sql: too many attached databases - max 0\"))\nErr(Failed(\"sql: too many attached databases - max 0\"))\n[sql.Row { columns: [\"name\"], values: [Text(\"a\")] }]\nErr(\"sql: column `name` is not an integer: Text(\\\"a\\\")\")\nErr(\"sql: the row has no column `nope` (it has name)\")\nOk(())\n";
   (* transactions: committed on Ok, rolled back on Err and on a panic *)
   let sql_tx = {v|use sql
 
-fn count(db: sql.Db, f: Foreign) -> Int {
-    match db.query_one(f, "SELECT count(*) AS n FROM t", []) {
+fn count(db: sql.Db) -> Int {
+    match db.query_one("SELECT count(*) AS n FROM t", []) {
         Ok(Some(r)) => r.int("n") ?? -1,
         _ => -1,
     }
@@ -1708,30 +1708,29 @@ fn count(db: sql.Db, f: Foreign) -> Int {
 
 fn main(root: Root) -> Result[(), IoError] {
     let out = root.stdout
-    let f = root.foreign
-    let db = sql.memory(f)?
-    db.exec(f, "CREATE TABLE t (x INTEGER NOT NULL)", [])?
-    let a = db.transaction(f, || {
-        db.exec(f, "INSERT INTO t VALUES (?)", [sql.Int(1)])?
-        db.exec(f, "INSERT INTO t VALUES (?)", [sql.Int(2)])?
+    let db = sql.memory()?
+    db.exec("CREATE TABLE t (x INTEGER NOT NULL)", [])?
+    let a = db.transaction(|| {
+        db.exec("INSERT INTO t VALUES (?)", [sql.Int(1)])?
+        db.exec("INSERT INTO t VALUES (?)", [sql.Int(2)])?
         Ok("committed")
     })
-    out.print("{a} {count(db, f)}")
-    let b = db.transaction(f, || {
-        db.exec(f, "INSERT INTO t VALUES (?)", [sql.Int(3)])?
-        db.exec(f, "INSERT INTO t VALUES (?)", [sql.Null])?
+    out.print("{a} {count(db)}")
+    let b = db.transaction(|| {
+        db.exec("INSERT INTO t VALUES (?)", [sql.Int(3)])?
+        db.exec("INSERT INTO t VALUES (?)", [sql.Null])?
         Ok("not reached")
     })
-    out.print("{b} {count(db, f)}")
-    let c = catch(|| db.transaction(f, || {
-        db.exec(f, "INSERT INTO t VALUES (?)", [sql.Int(4)])?
-        if count(db, f) == 3 { panic("boom") }
+    out.print("{b} {count(db)}")
+    let c = catch(|| db.transaction(|| {
+        db.exec("INSERT INTO t VALUES (?)", [sql.Int(4)])?
+        if count(db) == 3 { panic("boom") }
         Ok(0)
     }))
-    out.print("{c} {count(db, f)}")
-    let d = db.transaction(f, || db.transaction(f, || Ok(1)))
-    out.print("{d} {count(db, f)}")
-    db.close(f)
+    out.print("{c} {count(db)}")
+    let d = db.transaction(|| db.transaction(|| Ok(1)))
+    out.print("{d} {count(db)}")
+    db.close()
 }
 |v} in
   out "sql-transaction" ~grants:sqlg sql_tx
@@ -1744,45 +1743,103 @@ fn main(root: Root) -> Result[(), IoError] {
 
 fn main(root: Root) -> Result[(), IoError] {
     let out = root.stdout
-    let f = root.foreign
     let fs = root.fs
     fs.remove("notes.db")
-    let db = sql.open(f, fs, "notes.db")?
-    db.exec(f, "CREATE TABLE notes (body TEXT)", [])?
-    db.exec(f, "INSERT INTO notes VALUES (?)", [sql.Text("saved")])?
-    db.close(f)?
+    let db = sql.open(fs, "notes.db")?
+    db.exec("CREATE TABLE notes (body TEXT)", [])?
+    db.exec("INSERT INTO notes VALUES (?)", [sql.Text("saved")])?
+    db.close()?
     out.print("{fs.exists("notes.db")}")
-    let ro = sql.open(f, fs.read_only(), "notes.db")?
-    out.print("{ro.query(f, "SELECT body FROM notes", [])?[0].text("body")}")
-    out.print("{ro.exec(f, "INSERT INTO notes VALUES (?)", [sql.Text("no")])}")
-    ro.close(f)?
-    out.print("{sql.open(f, fs.read_only(), "missing.db").is_err()}")
-    out.print("{sql.open(f, fs, "../escape.db")}")
-    out.print("{sql.open(f, fs, "/tmp/abs.db")}")
-    out.print("{sql.open(f, fs, "no/such/dir.db")}")
-    out.print("{sql.open(f.only("c"), fs, "notes.db")}")
+    let ro = sql.open(fs.read_only(), "notes.db")?
+    out.print("{ro.query("SELECT body FROM notes", [])?[0].text("body")}")
+    out.print("{ro.exec("INSERT INTO notes VALUES (?)", [sql.Text("no")])}")
+    ro.close()?
+    out.print("{sql.open(fs.read_only(), "missing.db").is_err()}")
+    out.print("{sql.open(fs, "../escape.db")}")
+    out.print("{sql.open(fs, "/tmp/abs.db")}")
+    out.print("{sql.open(fs, "no/such/dir.db")}")
     fs.remove("notes.db")
     Ok(())
 }
 |v} in
   out "sql-file" ~grants:{ sqlg with fs = Some (sqlreal, false) } sql_file
-    "true\nSome(\"saved\")\nErr(Failed(\"sql: exec: attempt to write a readonly database\"))\ntrue\nErr(Denied(\"fs: path escapes the granted directory\"))\nErr(Denied(\"fs: absolute paths are not allowed; paths are relative to the granted directory\"))\nErr(Failed(\"fs: directory of `no/such/dir.db` does not exist\"))\nErr(Denied(\"sql: calling SQLite needs --grant foreign=sqlite3\"))\n";
+    "true\nSome(\"saved\")\nErr(Failed(\"sql: exec: attempt to write a readonly database\"))\ntrue\nErr(Denied(\"fs: path escapes the granted directory\"))\nErr(Denied(\"fs: absolute paths are not allowed; paths are relative to the granted directory\"))\nErr(Failed(\"fs: directory of `no/such/dir.db` does not exist\"))\n";
+  (* SQLite follows symlinked sidecar files: open refuses ones that leave the grant *)
+  let outside = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "vela-sql-outside-%d" (Unix.getpid ())) in
+  Out_channel.with_open_bin outside (fun oc -> output_string oc "keep");
+  Out_channel.with_open_bin (Filename.concat sqlreal "fine-target") (fun oc -> output_string oc "");
+  List.iter (fun (link, target) -> (try Unix.unlink (Filename.concat sqlreal link) with Unix.Unix_error _ -> ()); Unix.symlink target (Filename.concat sqlreal link))
+    [ ("evil.db-journal", outside); ("broken.db-wal", "/vela-no-such-dir/x"); ("fine.db-shm", "fine-target") ];
+  out "sql-sidecar-links" ~grants:{ sqlg with fs = Some (sqlreal, false) }
+    "use sql\n\nfn main(root: Root) {\n    for name in [\"evil.db\", \"broken.db\"] {\n        root.stdout.print(\"{sql.open(root.fs, name).is_err()}\")\n    }\n    match sql.open(root.fs, \"evil.db\") {\n        Err(Denied(m)) => root.stdout.print(m.slice(0, 50)),\n        _ => root.stdout.print(\"opened\"),\n    }\n    match sql.open(root.fs, \"fine.db\") {\n        Ok(db) => root.stdout.print(\"{db.exec(\"CREATE TABLE IF NOT EXISTS t (x)\", [])} {db.close()}\"),\n        Err(e) => root.stdout.print(\"{e}\"),\n    }\n    let gone = root.fs.remove(\"fine.db\").is_ok()\n}\n"
+    "true\ntrue\nsql: refusing to open `evil.db`: `evil.db-journal`\nOk(0) Ok(())\n";
+  ok "sql-sidecar-untouched" (read_file outside = "keep") (read_file outside);
+  (* a Db holds an id, not a pointer: forged, closed and twice-closed ones are errors *)
+  out "sql-handles"
+    {v|use sql
+
+fn main(root: Root) -> Result[(), IoError] {
+    let out = root.stdout
+    let db = sql.memory()?
+    db.exec("CREATE TABLE t (x)", [])?
+    let fake = sql.Db { id: 12345 }
+    out.print("{fake.exec("DROP TABLE t", [])} {fake.close()}")
+    let copy = db
+    out.print("{db.close()} {copy.exec("SELECT 1", [])} {db.query("SELECT 1", [])} {db.last_id()} {db.close()}")
+    let a = sql.memory()?
+    let b = sql.memory()?
+    out.print("{a.id != b.id} {a.id > 0}")
+    a.close()?
+    b.close()
+}
+|v}
+    "Err(Failed(\"sql: the database is closed\")) Err(Failed(\"sql: the database is closed\"))\nOk(()) Err(Failed(\"sql: the database is closed\")) Err(Failed(\"sql: the database is closed\")) Err(Failed(\"sql: the database is closed\")) Err(Failed(\"sql: the database is closed\"))\ntrue true\n";
+  (* closing while other tasks use the connection waits for them *)
+  let sql_close_race = {v|use sql
+
+fn main(root: Root) -> Result[(), IoError] {
+    let db = sql.memory()?
+    db.exec("CREATE TABLE t (n INTEGER)", [])?
+    let results = group g {
+        for i in 0..<8 {
+            g.go(|| {
+                let mut ok = 0
+                for n in 0..<50 {
+                    if db.exec("INSERT INTO t VALUES (?)", [sql.Int(n)]).is_ok() {
+                        ok = ok + 1
+                    }
+                }
+                ok
+            })
+        }
+        g.go(|| {
+            match db.close() {
+                Ok(_) => 0,
+                Err(_) => -1,
+            }
+        })
+    }
+    root.stdout.print("{results.len()} {results[8]} {db.exec("SELECT 1", [])}")
+    Ok(())
+}
+|v} in
+  out "sql-close-race" sql_close_race "9 0 Err(Failed(\"sql: the database is closed\"))\n";
+  check_tsan "sql-close-race" sql_close_race "9 0 Err(Failed(\"sql: the database is closed\"))\n";
   out "sql-no-fs" ~grants:sqlg
-    "use sql\n\nfn main(root: Root) {\n    root.stdout.print(\"{sql.open(root.foreign, root.fs, \"x.db\")}\")\n}\n"
+    "use sql\n\nfn main(root: Root) {\n    root.stdout.print(\"{sql.open(root.fs, \"x.db\")}\")\n}\n"
     "Err(Denied(\"fs: not granted (run with --grant fs=DIR)\"))\n";
   (* one connection shared by tasks *)
   let sql_group = {v|use sql
 
 fn main(root: Root) -> Result[(), IoError] {
-    let f = root.foreign
-    let db = sql.memory(f)?
-    db.exec(f, "CREATE TABLE t (task INTEGER, n INTEGER)", [])?
+    let db = sql.memory()?
+    db.exec("CREATE TABLE t (task INTEGER, n INTEGER)", [])?
     let done = group g {
         for task in 0..<6 {
             g.go(|| {
                 let mut ok = 0
                 for n in 0..<20 {
-                    if db.exec(f, "INSERT INTO t VALUES (?, ?)", [sql.Int(task), sql.Int(n)]).is_ok() {
+                    if db.exec("INSERT INTO t VALUES (?, ?)", [sql.Int(task), sql.Int(n)]).is_ok() {
                         ok = ok + 1
                     }
                 }
@@ -1790,15 +1847,15 @@ fn main(root: Root) -> Result[(), IoError] {
             })
         }
     }
-    let r = db.query_one(f, "SELECT count(*) AS c, sum(n) AS s FROM t", [])?
+    let r = db.query_one("SELECT count(*) AS c, sum(n) AS s FROM t", [])?
     root.stdout.print("{done} {r}")
-    db.close(f)
+    db.close()
 }
 |v} in
   let sql_group_want = "[20, 20, 20, 20, 20, 20] Some(sql.Row { columns: [\"c\", \"s\"], values: [Int(120), Int(1140)] })\n" in
   out "sql-group" ~grants:sqlg sql_group sql_group_want;
   check_tsan "sql-group" ~grants:sqlg sql_group sql_group_want;
-  out "example-notes" ~grants:sqlg (example "notes.vela")
+  out "example-notes" (example "notes.vela")
     "1. The Left Hand of Darkness\n2. Robert'); DROP TABLE notes; --\n3. Paris, Texas ***\n3 notes\n";
   (* std code is checked like user code: a json error names the byte *)
   out "std-json-errors"
@@ -3563,6 +3620,45 @@ fn main(root: Root) {
   ok "pkg-missing-dir" (pkg_codes "[package]\nname = \"app\"\n[dependencies]\nother = { path = \"../nope\" }\n" = [ "E0401" ]) "fetch not found";
   Sys.remove (Filename.concat pdir "app/vela.toml");
 
+  (* calling C is full trust: a dependency gets it only from [trust], never from caps,
+     and vela.lock records its libraries so a change is noticed *)
+  (try Unix.mkdir (Filename.concat pdir "cdep") 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+  (try Unix.mkdir (Filename.concat pdir "capp") 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+  let cdep_src libs =
+    String.concat "" (List.map (fun (l, fn) -> sprintf "foreign \"%s\" {\n    fn %s() -> Int32\n}\n\n" l fn) libs)
+    ^ "pub fn pid(f: Foreign) -> Int {\n    getpid(f)\n}\n"
+  in
+  put "cdep/cdep.vela" (cdep_src [ ("c", "getpid") ]);
+  let capp = "use cdep\n\nfn main(root: Root) {\n    root.stdout.print(\"{cdep.pid(root.foreign) > 0}\")\n}\n" in
+  put "capp/main.vela" capp;
+  let lock = Filename.concat pdir "capp/vela.lock" in
+  let cpkg toml =
+    put "capp/vela.toml" toml;
+    let _, ds, _ = Modules.load_and_check (Filename.concat pdir "capp/main.vela") capp in
+    ds
+  in
+  let dep = "[package]\nname = \"capp\"\n\n[dependencies]\ncdep = { path = \"../cdep\" }\n" in
+  let show ds = String.concat "; " (List.map (fun (d : Diag.t) -> d.code ^ " " ^ d.message) ds) in
+  (try Sys.remove lock with Sys_error _ -> ());
+  let ds = cpkg dep in
+  ok "trust-required" (codes ds = [ "E0320"; "E0320" ] && List.exists (fun (d : Diag.t) -> List.exists (fun n -> Interp_util.find_sub n "[trust]" 0 <> None) d.notes) ds) (show ds);
+  ok "trust-not-caps" (codes (cpkg "[package]\nname = \"capp\"\n\n[dependencies]\ncdep = { path = \"../cdep\", caps = [\"foreign\"] }\n") = [ "E0321" ]) "caps = [foreign] is refused";
+  ok "trust-unknown" (codes (cpkg (dep ^ "\n[trust]\nforeign = [\"other\"]\n")) = [ "E0321" ]) "trust names a dependency";
+  let trusted = dep ^ "\n[trust]\nforeign = [\"cdep\"]\n" in
+  let ds = cpkg trusted in
+  ok "trust-granted" (ds = []) (show ds);
+  ok "trust-locked" (Sys.file_exists lock && Interp_util.find_sub (read_file lock) "foreign cdep c\n" 0 <> None) (if Sys.file_exists lock then read_file lock else "no lock");
+  ok "trust-stable" (cpkg trusted = []) "same libraries";
+  (* an update that starts calling another library stops the build *)
+  put "cdep/cdep.vela" (cdep_src [ ("c", "getpid"); ("z", "zlibVersion") ]);
+  let ds = cpkg trusted in
+  ok "trust-lock-changed" (codes ds = [ "E0324" ] && Interp_util.find_sub (List.hd ds).message "`z`" 0 <> None) (show ds);
+  (* deleting the line accepts the new libraries *)
+  Out_channel.with_open_bin lock (fun oc -> output_string oc "# reviewed\n");
+  ok "trust-relock" (cpkg trusted = [] && Interp_util.find_sub (read_file lock) "foreign cdep c,z\n" 0 <> None) (read_file lock);
+  put "cdep/cdep.vela" (cdep_src [ ("c", "getpid") ]);
+  Sys.remove (Filename.concat pdir "capp/vela.toml");
+
   (* [grants] in vela.toml: the program's own grants, with --grant flags adding to them *)
   (* the CLI built next to this test binary, wherever it is run from *)
   let vela_exe = Filename.concat (Filename.dirname (Filename.dirname Sys.executable_name)) "bin/main.exe" in
@@ -3575,6 +3671,94 @@ fn main(root: Root) {
     in
     (code, read_file o, read_file e)
   in
+  (* the foreign grant is announced as full access, and `vela check` lists who calls C *)
+  put "capp/vela.toml" "[package]\nname = \"capp\"\n\n[dependencies]\ncdep = { path = \"../cdep\" }\n\n[trust]\nforeign = [\"cdep\"]\n\n[grants]\nforeign = \"c\"\n";
+  let cmain = Filename.concat pdir "capp/main.vela" in
+  (try Sys.remove lock with Sys_error _ -> ());
+  let code, o, e = vela_cli [ "run"; cmain ] in
+  ok "cli-foreign-warning"
+    (code = 0 && o = "true\n" && e = "vela: warning: --grant foreign=c is full access: C code can do anything this process can, past every other grant\n")
+    (sprintf "%d %S %S" code o e);
+  let code, o, _ = vela_cli [ "check"; cmain ] in
+  ok "cli-check-calls-c" (code = 0 && o = "ok\ncalls C: module `cdep` (dependency `cdep`, trusted in vela.toml [trust]): c\n") o;
+  put "capp/sqlmain.vela" "use sql\n\nforeign \"c\" {\n    fn getpid() -> Int32\n}\n\nfn main(root: Root) {\n    root.stdout.print(\"{sql.memory().is_ok()} {getpid(root.foreign) > 0}\")\n}\n";
+  let code, o, _ = vela_cli [ "check"; Filename.concat pdir "capp/sqlmain.vela" ] in
+  ok "cli-check-calls-c-std" (code = 0 && o = "ok\ncalls C: the program itself (needs --grant foreign): c\ncalls C: module `sql` (standard library, trusted by src/std/vela.toml): sqlite3\n") o;
+  (* the operating-system sandbox: even C code stays inside the grants, in
+     both backends, unless --no-sandbox *)
+  List.iter (fun d -> try Unix.mkdir (Filename.concat pdir d) 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ()) [ "sbox"; "sbox/data" ];
+  let secret = Filename.concat pdir "sbox/secret.txt" in
+  put "sbox/secret.txt" "secret";
+  put "sbox/data/a.txt" "granted";
+  let escape_file = Filename.concat pdir "sbox/escaped.txt" in
+  let src =
+    {v|foreign "c" {
+    fn open(path: Str, flags: Int32) -> Int32
+    fn creat(path: Str, mode: Int32) -> Int32
+    fn close(fd: Int32) -> Int32
+    fn system(cmd: Str) -> Int32
+}
+
+// O_RDONLY is 0 everywhere; creating goes through creat(), whose flags C fixes
+fn try_open(c: Foreign, path: Str, create: Bool) -> Bool {
+    let fd = if create { creat(c, path, 420) } else { open(c, path, 0) }
+    if fd >= 0 {
+        let closed = close(c, fd)
+    }
+    fd >= 0
+}
+
+fn main(root: Root) {
+    let c = root.foreign
+    let fs = root.fs
+    let read = try_open(c, "SECRET", false)
+    let write = try_open(c, "ESCAPE", true)
+    let run = system(c, "true") == 0
+    root.stdout.print("{read} {write} {run}")
+    let mine = try_open(c, fs.full_path("a.txt") ?? "", false)
+    root.stdout.print("{fs.read("a.txt")} {fs.write("b.txt", "x").is_ok()} {mine}")
+}
+|v}
+  in
+  let replace_all pat by s =
+    let b = Buffer.create (String.length s) in
+    let n = String.length pat in
+    let i = ref 0 in
+    while !i < String.length s do
+      if !i + n <= String.length s && String.sub s !i n = pat then (Buffer.add_string b by; i := !i + n)
+      else (Buffer.add_char b s.[!i]; incr i)
+    done;
+    Buffer.contents b
+  in
+  put "sbox/main.vela" (replace_all "ESCAPE" escape_file (replace_all "SECRET" secret src));
+  let smain = Filename.concat pdir "sbox/main.vela" in
+  let grant = [ "--grant"; "foreign=c"; "--grant"; "fs=" ^ Filename.concat pdir "sbox/data" ] in
+  List.iter
+    (fun (name, extra, want) ->
+      (try Sys.remove escape_file with Sys_error _ -> ());
+      let code, o, e = vela_cli ((("run" :: extra) @ [ smain ]) @ grant) in
+      ok name (code = 0 && o = want && Sys.file_exists escape_file = (extra = [ "--no-sandbox" ])) (sprintf "%d %S %S" code o e))
+    [ ("sandbox-interp", [], "false false false\nOk(\"granted\") true true\n");
+      ("sandbox-native", [ "--native" ], "false false false\nOk(\"granted\") true true\n");
+      ("sandbox-off", [ "--no-sandbox" ], "true true true\nOk(\"granted\") true true\n") ];
+  (* a built binary takes --no-sandbox too, and refuses unknown arguments *)
+  let sbin = Filename.concat pdir "sbox/prog" in
+  let code, _, _ = vela_cli [ "build"; smain; "-o"; sbin ] in
+  if code = 0 then begin
+    let run args =
+      let o = Filename.concat pdir "sbox/out" in
+      let c = Sys.command (String.concat " " (List.map Filename.quote (sbin :: args @ grant)) ^ " >" ^ Filename.quote o ^ " 2>/dev/null") in
+      (c, read_file o)
+    in
+    let _, o1 = run [] in
+    let _, o2 = run [ "--no-sandbox" ] in
+    ok "sandbox-binary" (String.starts_with ~prefix:"false false false" o1 && String.starts_with ~prefix:"true true true" o2) (o1 ^ o2)
+  end
+  else ok "sandbox-binary" false "vela build failed";
+  (try Sys.remove escape_file with Sys_error _ -> ());
+  Sys.remove (Filename.concat pdir "capp/vela.toml");
+  let _, o, e = vela_cli [ "run"; Filename.concat pdir "capp/sqlmain.vela" ] in
+  ok "cli-no-foreign-no-warning" (o = "" && String.starts_with ~prefix:"panic: foreign: library `c` is not granted" e) (o ^ e);
   List.iter (fun d -> try Unix.mkdir (Filename.concat pdir d) 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ()) [ "grants"; "grants/data"; "envy" ];
   put "grants/data/a.txt" "hi";
   Unix.putenv "VELA_T_A" "a";
@@ -3727,7 +3911,7 @@ fn main(root: Root) {
   let listed = List.sort compare (List.map (fun (d : Package.dep) -> d.dname) manifest.deps) in
   ok "std-manifest-complete" (listed = List.sort compare (List.map fst Std_text.modules)) (String.concat ", " listed);
   ok "std-manifest-http" (List.exists (fun (d : Package.dep) -> d.dname = "http" && d.caps = [ "net"; "listen" ]) manifest.deps) "http: net, listen";
-  ok "std-manifest-sql" (List.exists (fun (d : Package.dep) -> d.dname = "sql" && d.caps = [ "foreign"; "fs" ]) manifest.deps) "sql: foreign, fs";
+  ok "std-manifest-sql" (List.exists (fun (d : Package.dep) -> d.dname = "sql" && d.caps = [ "fs" ]) manifest.deps && manifest.trust = [ "sql" ]) "sql: fs, trusted with C";
   ok "std-manifest-pure" (List.for_all (fun (d : Package.dep) -> d.dname = "http" || d.dname = "sql" || d.caps = []) manifest.deps) "the others are pure";
   let real_std = !Modules.std_modules in
   let std_errs name extra src =

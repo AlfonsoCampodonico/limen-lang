@@ -362,7 +362,13 @@ let rename_item mods (m : modinfo) own (it : item) : item =
         fn_bounds = List.map (fun (g, bs) -> (g, List.map bound bs)) d.fn_bounds;
         fn_params = params;
         fn_ret = Option.map (ty env) d.fn_ret;
-        fn_body = block env locals d.fn_body }
+        fn_body = block env locals d.fn_body;
+        (* a standard library module trusted with C (src/std/vela.toml [trust]) *)
+        fn_foreign =
+          Option.map
+            (fun (fo : foreign) ->
+              { fo with ftrusted = String.starts_with ~prefix:"<std>" m.mfile && List.mem m.mname (Lazy.force Package.std_manifest).trust })
+            d.fn_foreign }
   | IStruct s ->
     let env = { self = m; mods; own; gens = s.st_gen } in
     IStruct { s with st_name = qual m s.st_name; st_fields = List.map (fun (f, sp, t) -> (f, sp, ty env t)) s.st_fields }
@@ -433,6 +439,24 @@ let load ?(deps = []) path src : item list * Diag.t list =
         if !errors <> [] then ([], List.rev !errors) else (items, [])
       end)
 
+(* Who calls C: (dependency, libraries) for each dependency whose modules
+   declare foreign blocks, from the module each declaration came from. *)
+let c_users (items : item list) : (string * string list) list =
+  List.fold_left
+    (fun acc it ->
+      match it with
+      | IFn { fn_name; fn_foreign = Some fo; _ } -> (
+        match String.index_opt fn_name '.' with
+        | Some k -> (
+          match List.assoc_opt (String.sub fn_name 0 k) !module_pkg with
+          | Some dep ->
+            let libs = Option.value ~default:[] (List.assoc_opt dep acc) in
+            if List.mem fo.flib libs then acc else (dep, libs @ [ fo.flib ]) :: List.remove_assoc dep acc
+          | None -> acc)
+        | None -> acc)
+      | _ -> acc)
+    [] items
+
 (* Load a program with the vela.toml around it (if any), then type-check it
    and enforce the capabilities of each standard library module and each
    dependency. *)
@@ -449,4 +473,9 @@ let load_and_check path src : item list * Diag.t list * Check.fn_info list =
          with or without a vela.toml of the program's own *)
       let ds = if ds = [] then Package.enforce ~std:true (Lazy.force Package.std_manifest) (List.map (fun m -> (m, m)) !std_loaded) infos else ds in
       let ds = match pkg with Some p when ds = [] -> Package.enforce p !module_pkg infos | _ -> ds in
+      let ds =
+        match pkg with
+        | Some p when ds = [] -> Package.check_foreign_lock p (c_users items)
+        | _ -> ds
+      in
       (items, ds, infos))

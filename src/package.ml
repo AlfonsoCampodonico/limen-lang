@@ -11,6 +11,10 @@
      [dependencies]
      json = { path = "vendor/json" }
      fetch = { path = "../fetch", caps = ["net"] }
+     zlib = { path = "../zlib" }
+
+     [trust]
+     foreign = ["zlib"]
 
    A dependency is a directory holding NAME.vela (and any modules it uses from
    the same directory). Because Vela has no ambient authority, a function can
@@ -30,11 +34,15 @@ type dep = { dname : string; dir : string; caps : string list; dspan : Span.t; s
    like the text after `--grant KIND=`. An fs directory is made absolute
    relative to vela.toml. Only the vela.toml of the program being run is read
    for grants; a dependency's never is. *)
-type t = { pname : string; file : string; deps : dep list; grants : (string * string) list }
+(* [trust]: `foreign = [...]` names the dependencies that may call C. C code
+   can do anything the process can, so this is full trust, given only here,
+   by the program; `caps` cannot grant it. In src/std/vela.toml it names the
+   standard library modules whose foreign calls need no Foreign capability. *)
+type t = { pname : string; file : string; deps : dep list; grants : (string * string) list; trust : string list }
 
 let grant_kinds = [ "net"; "fs"; "listen"; "env"; "exec"; "foreign" ]
 
-let cap_grants = [ "net"; "fs"; "listen"; "stdout"; "clock"; "rand"; "stdin"; "env"; "exec"; "foreign" ]
+let cap_grants = [ "net"; "fs"; "listen"; "stdout"; "clock"; "rand"; "stdin"; "env"; "exec" ]
 
 (* The grant that covers a capability type. *)
 let grant_of (c : Types.cap) =
@@ -145,7 +153,7 @@ let parse file src : t =
     | _ -> fail !pos "expected a string, an array or an inline table"
   in
   let section = ref "" in
-  let name = ref "" and deps = ref [] and grants = ref [] in
+  let name = ref "" and deps = ref [] and grants = ref [] and trust = ref [] in
   let dir = Filename.dirname file in
   skip_ws ();
   while !pos < n do
@@ -154,8 +162,8 @@ let parse file src : t =
       let k, _ = key () in
       if peek () <> ']' then fail !pos "expected `]`";
       incr pos;
-      if k <> "package" && k <> "dependencies" && k <> "grants" then
-        fail (!pos - 1) ("unknown table [" ^ k ^ "]; vela.toml has [package], [grants] and [dependencies]");
+      if k <> "package" && k <> "dependencies" && k <> "grants" && k <> "trust" then
+        fail (!pos - 1) ("unknown table [" ^ k ^ "]; vela.toml has [package], [grants], [dependencies] and [trust]");
       section := k;
       end_line ()
     end
@@ -198,7 +206,11 @@ let parse file src : t =
         in
         let caps = match List.assoc_opt "caps" fields with Some (VArr cs) -> cs | None -> [] | Some _ -> raise (Bad (sp, "`caps` is a list of strings")) in
         List.iter
-          (fun c -> if not (List.mem c cap_grants) then raise (Bad (sp, Printf.sprintf "unknown capability `%s`; use %s" c (String.concat ", " cap_grants))))
+          (fun c ->
+            if c = "foreign" then
+              raise (Bad (sp, Printf.sprintf "`caps` cannot grant foreign: calling C is full trust; name the dependency in [trust] instead: foreign = [\"%s\"]" d))
+            else if not (List.mem c cap_grants) then
+              raise (Bad (sp, Printf.sprintf "unknown capability `%s`; use %s" c (String.concat ", " cap_grants))))
           caps;
         List.iter
           (fun (f, _) -> if not (List.mem f [ "path"; "git"; "tag"; "commit"; "caps" ]) then raise (Bad (sp, "unknown dependency field `" ^ f ^ "`")))
@@ -230,11 +242,21 @@ let parse file src : t =
         in
         List.iter (fun v -> if v = "" then raise (Bad (sp, "a grant cannot be empty"))) vs;
         grants := !grants @ List.map (fun v -> (g, v)) vs
-      | _ -> raise (Bad (sp, "keys belong in [package], [grants] or [dependencies]"))
+      | "trust", "foreign", VArr names ->
+        if !trust <> [] then raise (Bad (sp, "[trust] foreign is listed twice"));
+        if names = [] then raise (Bad (sp, "an empty trust list trusts nothing; remove the line"));
+        trust := names
+      | "trust", _, _ -> raise (Bad (sp, "[trust] takes `foreign = [\"dependency\", ...]`: the dependencies that may call C"))
+      | _ -> raise (Bad (sp, "keys belong in [package], [grants], [dependencies] or [trust]"))
     end;
     skip_ws ()
   done;
-  { pname = !name; file; deps = List.rev !deps; grants = !grants }
+  List.iter
+    (fun t ->
+      if not (List.exists (fun d -> d.dname = t) !deps) && file <> "<std>/vela.toml" then
+        raise (Bad (span 0 0, Printf.sprintf "[trust] names `%s`, which is not in [dependencies]" t)))
+    !trust;
+  { pname = !name; file; deps = List.rev !deps; grants = !grants; trust = !trust }
 
 (* vela.toml in the directory of [main] or the nearest parent. *)
 let find main =
@@ -367,7 +389,7 @@ let fetch name url rev =
 type lock_line = { lname : string; lurl : string; lrev : string; lcommit : string; lhash : string }
 
 let rev_text = function Tag t -> "tag:" ^ t | Commit c -> "commit:" ^ c
-let lock_header = "# vela.lock: the exact version of each git dependency, written by vela. Commit it.\n"
+let lock_header = "# vela.lock: the exact version of each git dependency, and the C libraries of each trusted one, written by vela. Commit it.\n"
 
 let read_lock path =
   if not (Sys.file_exists path) then []
@@ -381,7 +403,7 @@ let read_lock path =
         let start = !lo in
         lo := !lo + String.length l + 1;
         let t = String.trim l in
-        if t = "" || t.[0] = '#' then None
+        if t = "" || t.[0] = '#' || String.starts_with ~prefix:"foreign " t then None
         else
           match List.filter (( <> ) "") (String.split_on_char ' ' t) with
           | [ lname; lurl; lrev; lcommit; lhash ] -> Some { lname; lurl; lrev; lcommit; lhash }
@@ -391,6 +413,20 @@ let read_lock path =
                  ( { Span.file = path; lo = start; hi = start + String.length l },
                    "malformed line in vela.lock; expected NAME URL REV COMMIT HASH (delete the line to fetch again)" )))
       lines
+
+(* Trusted dependencies that call C: `foreign NAME LIB,LIB` lines in
+   vela.lock, the libraries each one declared when it was trusted. *)
+let foreign_line name libs = Printf.sprintf "foreign %s %s\n" name (String.concat "," libs)
+
+let read_foreign_lock path =
+  if not (Sys.file_exists path) then []
+  else
+    List.filter_map
+      (fun l ->
+        match List.filter (( <> ) "") (String.split_on_char ' ' (String.trim l)) with
+        | [ "foreign"; name; libs ] -> Some (name, String.split_on_char ',' libs)
+        | _ -> None)
+      (String.split_on_char '\n' (In_channel.with_open_bin path In_channel.input_all))
 
 (* Fetch or find each git dependency, check it against vela.lock, and write
    vela.lock if it changed. Errors carry their code: E0322 (fetch), E0323
@@ -444,8 +480,9 @@ let resolve (pkg : t) : t =
   let lines = List.rev !lines in
   if !changed || List.length lines <> List.length locked then begin
     let text = String.concat "" (List.map (fun l -> Printf.sprintf "%s %s %s %s %s\n" l.lname l.lurl l.lrev l.lcommit l.lhash) lines) in
-    if not (lines = [] && not (Sys.file_exists lock_path)) then
-      try Out_channel.with_open_bin lock_path (fun oc -> output_string oc (lock_header ^ text))
+    let keep = List.map (fun (n, ls) -> foreign_line n ls) (read_foreign_lock lock_path) in
+    if not (lines = [] && keep = [] && not (Sys.file_exists lock_path)) then
+      try Out_channel.with_open_bin lock_path (fun oc -> output_string oc (lock_header ^ text ^ String.concat "" keep))
       with Sys_error m -> raise (Lock_error ("E0323", Span.dummy, "cannot write vela.lock: " ^ m, []))
   end;
   { pkg with deps }
@@ -486,7 +523,13 @@ let enforce ?(std = false) (pkg : t) (module_pkg : (string * string) list) (info
             | Some d -> d
             | None -> { dname = dn; dir = ""; caps = []; dspan = Span.dummy; source = Path }
           in
-          let missing = List.filter (fun c -> c <> Types.Root && not (List.exists (fun g -> List.mem g d.caps) (grant_of c))) i.caps in
+          let allowed (c : Types.cap) =
+            match c with
+            | Types.Root -> false
+            | Types.Foreign -> (not std) && List.mem dn pkg.trust
+            | c -> List.exists (fun g -> List.mem g d.caps) (grant_of c)
+          in
+          let missing = List.filter (fun c -> c <> Types.Root && not (allowed c)) i.caps in
           let missing = if List.mem Types.Root i.caps then Types.Root :: missing else missing in
           match missing with
           | [] -> None
@@ -507,5 +550,51 @@ let enforce ?(std = false) (pkg : t) (module_pkg : (string * string) list) (info
                  ~notes:
                    [ Printf.sprintf "`%s` takes `%s` (%s)" i.name (Types.cap_name c) (let l, _ = Source.line_col i.span.file i.span.lo in Printf.sprintf "%s:%d" i.span.file l);
                      (if c = Types.Root then "a dependency can never take Root: pass it the narrower capability it needs"
+                      else if c = Types.Foreign then
+                        Printf.sprintf "calling C is full trust: if you trust `%s` with everything the program can do, add [trust] foreign = [\"%s\"] to vela.toml" dn dn
                       else Printf.sprintf "to allow it, add %s to its caps" need) ]))))
     infos
+
+(* E0324: each trusted dependency's C libraries must match what vela.lock
+   recorded when it was trusted, so an update that starts calling another
+   library (or C at all, for one trusted only in name) stops the build until
+   someone looks. [uses] is (dependency, libraries it declares). The first
+   build records them; a dependency that no longer calls C loses its line. *)
+let check_foreign_lock (pkg : t) (uses : (string * string list) list) : Diag.t list =
+  let lock_path = Filename.concat (Filename.dirname pkg.file) "vela.lock" in
+  let recorded = read_foreign_lock lock_path in
+  let uses = List.filter (fun (d, libs) -> libs <> [] && List.mem d pkg.trust) uses in
+  let span_of d = match List.find_opt (fun x -> x.dname = d) pkg.deps with Some x -> x.dspan | None -> Span.dummy in
+  let errs =
+    List.filter_map
+      (fun (d, libs) ->
+        match List.assoc_opt d recorded with
+        | Some old when List.sort compare old = List.sort compare libs -> None
+        | Some old ->
+          Some
+            (Diag.make "E0324" (span_of d)
+               (Printf.sprintf "trusted dependency `%s` now calls C library %s; vela.lock recorded %s" d
+                  (String.concat ", " (List.map (fun l -> "`" ^ l ^ "`") (List.filter (fun l -> not (List.mem l old)) libs)))
+                  (String.concat ", " old))
+               ~notes:
+                 [ "calling C is full trust: review what changed in the dependency";
+                   Printf.sprintf "then delete the line `foreign %s ...` from vela.lock to record the new libraries" d ])
+        | None -> None)
+      uses
+  in
+  let fresh = List.map (fun (d, libs) -> (d, match List.assoc_opt d recorded with Some old -> old | None -> libs)) uses in
+  if errs = [] && List.sort compare fresh <> List.sort compare recorded then begin
+    let others =
+      if Sys.file_exists lock_path then
+        List.filter
+          (fun l -> let t = String.trim l in t <> "" && not (String.starts_with ~prefix:"foreign " t) && t.[0] <> '#')
+          (String.split_on_char '\n' (In_channel.with_open_bin lock_path In_channel.input_all))
+      else []
+    in
+    if not (fresh = [] && others = [] && not (Sys.file_exists lock_path)) then
+      try
+        Out_channel.with_open_bin lock_path (fun oc ->
+            output_string oc (lock_header ^ String.concat "" (List.map (fun l -> l ^ "\n") others) ^ String.concat "" (List.map (fun (d, ls) -> foreign_line d ls) fresh)))
+      with Sys_error _ -> ()
+  end;
+  errs

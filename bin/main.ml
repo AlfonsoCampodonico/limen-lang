@@ -4,7 +4,7 @@ let usage =
   {|vela: a small language where I/O needs a capability
 
 usage:
-  vela run FILE [--native] [--grant net=HOST[:PORT]|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST:PORT]... [--grant env=NAME|*]... [--grant exec=PROGRAM|*]... [--grant foreign=LIB|*]... [--seed N] [-- ARGS...]
+  vela run FILE [--native] [--grant net=HOST[:PORT]|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST:PORT]... [--grant env=NAME|*]... [--grant exec=PROGRAM|*]... [--grant foreign=LIB|*]... [--seed N] [--no-sandbox] [-- ARGS...]
   vela build FILE [-o OUT] [--emit-c]
   vela check FILE [--json]
   vela caps FILE [--json]
@@ -17,7 +17,8 @@ usage:
   vela spec               (print the language specification)
 
 Stdout, Stdin, Clock and Rand are always granted. Net, Fs, Listen, Env, Exec and Foreign exist only
-when granted, by --grant or by the [grants] table of vela.toml. --seed makes Rand repeatable; arguments after -- are root.args().
+when granted, by --grant or by the [grants] table of vela.toml. --seed makes Rand repeatable; arguments after -- are root.args(). The process runs in an operating-system sandbox
+limited to those grants (macOS; Linux untested); --no-sandbox turns it off, for debugging.
 |}
 
 let die_usage msg =
@@ -58,12 +59,20 @@ let parse_grants args =
         { g with exec = g.exec @ [ String.sub a (i + 1) (String.length a - i - 1) ] }
       | Some i when String.sub a 0 i = "foreign" ->
         { g with foreign = g.foreign @ [ String.sub a (i + 1) (String.length a - i - 1) ] }
+      | None when a = "no-sandbox" -> g
       | Some i when String.sub a 0 i = "seed" -> (
         match int_of_string_opt (String.sub a (i + 1) (String.length a - i - 1)) with
         | Some n -> { g with seed = Some n }
         | None -> die_usage "--seed needs an integer")
       | _ -> die_usage ("unknown grant `" ^ a ^ "`"))
     Interp.no_grants args
+
+(* The foreign grant is full access; say so every time it is given. *)
+let warn_foreign (g : Interp.grants) =
+  if g.foreign <> [] then
+    prerr_endline
+      (Printf.sprintf "vela: warning: --grant foreign=%s is full access: C code can do anything this process can, past every other grant"
+         (String.concat "," g.foreign))
 
 (* The [grants] of the program's vela.toml, as `--grant` values. They come
    first, so flags add to them (and a --grant fs=... replaces the fs one). *)
@@ -80,6 +89,9 @@ let rec split_grants = function
   | "--seed" :: n :: rest ->
     let gs, others = split_grants rest in
     (("seed=" ^ n) :: gs, others)
+  | "--no-sandbox" :: rest ->
+    let gs, others = split_grants rest in
+    ("no-sandbox" :: gs, others)
   | "--grant" :: [] -> die_usage "--grant needs a value"
   | x :: rest ->
     let gs, others = split_grants rest in
@@ -203,10 +215,37 @@ let cmd_doc args =
   | Some o -> Out_channel.with_open_bin o (fun oc -> output_string oc text)
   | None -> print_string text
 
+(* Every part of the program that calls C, so it can be reviewed: C code is
+   outside every capability check. One line each. *)
+let c_callers (items : Ast.item list) =
+  let groups =
+    List.fold_left
+      (fun acc it ->
+        match it with
+        | Ast.IFn { fn_name; fn_foreign = Some fo; _ } ->
+          let m = match String.index_opt fn_name '.' with Some k -> String.sub fn_name 0 k | None -> "" in
+          let libs, trusted = Option.value ~default:([], fo.ftrusted) (List.assoc_opt m acc) in
+          (m, ((if List.mem fo.flib libs || fo.flib = "vela" then libs else libs @ [ fo.flib ]), trusted)) :: List.remove_assoc m acc
+        | _ -> acc)
+      [] items
+  in
+  List.map
+    (fun (m, (libs, trusted)) ->
+      let who =
+        if m = "" then "the program itself (needs --grant foreign)"
+        else if trusted then Printf.sprintf "module `%s` (standard library, trusted by src/std/vela.toml)" m
+        else
+          match List.assoc_opt m !Modules.module_pkg with
+          | Some dep -> Printf.sprintf "module `%s` (dependency `%s`, trusted in vela.toml [trust])" m dep
+          | None -> Printf.sprintf "module `%s` (the program's own, needs --grant foreign)" m
+      in
+      Printf.sprintf "calls C: %s: %s" who (String.concat ", " libs))
+    (List.sort compare groups)
+
 let cmd_check file json =
-  let _, diags, _ = load file in
+  let items, diags, _ = load file in
   if json then print_endline (Diag.list_to_json diags)
-  else if diags = [] then print_endline "ok"
+  else if diags = [] then (print_endline "ok"; List.iter print_endline (c_callers items))
   else report diags;
   exit (if diags = [] then 0 else 1)
 
@@ -260,7 +299,7 @@ let cmd_build file out emit_c =
 
 let cmd_run_native file grant_args prog_args =
   let grant_args = toml_grants file @ grant_args in
-  ignore (parse_grants grant_args);
+  warn_foreign (parse_grants grant_args);
   let items = checked file in
   let dir = Filename.get_temp_dir_name () in
   let exe = Filename.concat dir (Printf.sprintf "vela-%d" (Unix.getpid ())) in
@@ -269,7 +308,10 @@ let cmd_run_native file grant_args prog_args =
    | Error m -> prerr_string m; prerr_endline "vela: the C compiler failed (this is a bug in vela)"; exit 1);
   let args =
     List.concat_map
-      (fun g -> if String.starts_with ~prefix:"seed=" g then [ "--seed"; String.sub g 5 (String.length g - 5) ] else [ "--grant"; g ])
+      (fun g ->
+        if g = "no-sandbox" then [ "--no-sandbox" ]
+        else if String.starts_with ~prefix:"seed=" g then [ "--seed"; String.sub g 5 (String.length g - 5) ]
+        else [ "--grant"; g ])
       grant_args
     @ ("--" :: prog_args)
   in
@@ -281,10 +323,18 @@ let cmd_run_native file grant_args prog_args =
 let cmd_run file grant_args prog_args =
   let grant_args = toml_grants file @ grant_args in
   let grants = { (parse_grants grant_args) with args = prog_args } in
+  warn_foreign grants;
   let items, diags, _ = load file in
   if diags <> [] then (report diags; exit 1);
   let out s = print_string s; flush stdout in
-  match Interp.run ~out ~grants items with
+  (* the operating-system sandbox, once foreign libraries are loaded *)
+  let before_main () =
+    if not (List.mem "no-sandbox" grant_args) then
+      match Interp.sandbox grants with
+      | Ok _ -> ()
+      | Error m -> Printf.eprintf "vela: %s (run with --no-sandbox to go without it)\n" m; exit 1
+  in
+  match Interp.run ~before_main ~out ~grants items with
   | Ok (Interp.VEnum ("Result", "Err", [ e ])) ->
     Printf.eprintf "error: %s\n" (Interp.show e);
     exit 1

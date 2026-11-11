@@ -1,6 +1,8 @@
 /* Vela C runtime. Included verbatim at the top of every generated program.
    Its behaviour mirrors the interpreter (src/interp.ml and src/caps.ml). */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -935,11 +937,12 @@ static char **g_listen; static int g_nlisten;
 static char **g_env; static int g_nenv;
 static char **g_exec; static int g_nexec;
 static char **g_foreign; static int g_nforeign;
+static bool g_no_sandbox;
 static char **g_args; static int g_nargs;
 static uint64_t g_rand_state;
 
 static void w_usage(const char *m) {
-  fprintf(stderr, "%s\nusage: PROGRAM [--grant net=HOST[:PORT]|*]... [--grant fs=DIR[:ro]]\n", m);
+  fprintf(stderr, "%s\nusage: PROGRAM [--grant KIND=VALUE]... [--seed N] [--no-sandbox] [-- ARGS...]\n", m);
   exit(2);
 }
 static void w_init(int argc, char **argv) {
@@ -960,6 +963,7 @@ static void w_init(int argc, char **argv) {
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--") == 0) { g_args = argv + i + 1; g_nargs = argc - i - 1; break; }
     if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) { g_rand_state = (uint64_t)strtoll(argv[++i], NULL, 10); continue; }
+    if (strcmp(argv[i], "--no-sandbox") == 0) { g_no_sandbox = true; continue; }
     if (strcmp(argv[i], "--grant") != 0 || i + 1 >= argc) w_usage("unknown argument");
     const char *g = argv[++i];
     if (strncmp(g, "net=", 4) == 0) {
@@ -987,6 +991,16 @@ static void w_init(int argc, char **argv) {
       g_listen = (char **)w_realloc(g_listen, sizeof(char *) * (size_t)(g_nlisten + 1));
       g_listen[g_nlisten++] = strdup(g + 7);
     } else w_usage("unknown grant");
+  }
+  /* restrict the whole process to the grants (vela_sandbox.h), before any
+     thread starts; --no-sandbox turns it off, for debugging */
+  if (!g_no_sandbox) {
+    WSandboxSpec sb = { g_fs_root, g_fs_root ? (int)g_fs_ro : 0, g_nhosts > 0 || g_nlisten > 0, g_nexec > 0 };
+    char err[512];
+    if (w_sandbox_enter(&sb, err, sizeof err) < 0) {
+      fprintf(stderr, "vela: %s (run with --no-sandbox to go without it)\n", err);
+      exit(1);
+    }
   }
 }
 static WCap *w_root(void) { return cap_new(CAP_ROOT); }
@@ -1274,6 +1288,19 @@ static WIo Cap_fs_full_path(WCap *fs, WStr *rel) {
   int kind; char msg[1024];
   char *p = fs_resolve(fs, rel, true, &kind, msg, sizeof msg);
   if (!p) return io_err(kind, msg);
+  /* the real directory (checked inside the root just now) and the last
+     name, so no symlinked directory on the way can be swapped later */
+  if (strcmp(p, fs->root) != 0) {
+    char *dir = dirname_of(p);
+    char *rd = realpath(dir, NULL);
+    const char *base = strrchr(p, '/') + 1;
+    free(dir);
+    if (!rd || !fs_inside(fs->root, rd)) { free(rd); free(p); return io_err(1, "fs: path resolves outside the granted directory"); }
+    char *q = (char *)w_raw(strlen(rd) + strlen(base) + 2);
+    sprintf(q, "%s%s%s", rd, strcmp(rd, "/") == 0 ? "" : "/", base);
+    free(rd); free(p);
+    p = q;
+  }
   WStr *s = Str_from(p, (int64_t)strlen(p));
   free(p);
   return io_ok(s);
@@ -3070,6 +3097,77 @@ static int32_t w_ffi_i32(int64_t v, const char *arg, const char *where) {
   return (int32_t)v;
 }
 static WStr *w_ffi_str(const char *p) { return p ? Str_from(p, (int64_t)strlen(p)) : Str_new(0); }
+static WStr *w_ffi_copy(int64_t p, int64_t n, const char *where) {
+  if (n < 0) { char m[128]; snprintf(m, sizeof m, "foreign.copy: negative length %lld", (long long)n); w_panic_c(m, where); }
+  if (p == 0 && n > 0) w_panic_c("foreign.copy: null pointer", where);
+  return Str_from((const char *)(intptr_t)p, n);
+}
+/* The handle table for trusted standard library modules (Ffi.runtime_fns):
+   a Vela value holds a random id, never the C pointer, so it cannot be
+   forged, and a pointer is handed back for freeing only once no use of it is
+   in progress. */
+typedef struct { int64_t id, ptr; int64_t uses; bool closed; } WHandleEntry;
+static WHandleEntry *w_handles; static int64_t w_nhandles, w_caphandles;
+static pthread_mutex_t w_handles_mu = PTHREAD_MUTEX_INITIALIZER;
+static int64_t w_handle_random(void) {
+  uint64_t r = 0;
+#if defined(__APPLE__)
+  arc4random_buf(&r, sizeof r);
+#else
+  FILE *f = fopen("/dev/urandom", "rb");
+  if (!f || fread(&r, sizeof r, 1, f) != 1) { struct timeval tv; gettimeofday(&tv, NULL); r ^= (uint64_t)tv.tv_usec * 0x9E3779B97F4A7C15ull ^ (uint64_t)getpid(); }
+  if (f) fclose(f);
+#endif
+  return (int64_t)(r & 0x3FFFFFFFFFFFFFFFull);
+}
+static WHandleEntry *w_handle_find(int64_t id) {
+  for (int64_t i = 0; i < w_nhandles; i++) if (w_handles[i].id == id) return &w_handles[i];
+  return NULL;
+}
+static void w_handle_remove(WHandleEntry *e) { *e = w_handles[--w_nhandles]; }
+static int64_t w_handle_new(int64_t ptr) {
+  pthread_mutex_lock(&w_handles_mu);
+  int64_t id;
+  do id = w_handle_random(); while (id == 0 || w_handle_find(id));
+  if (w_nhandles == w_caphandles) {
+    w_caphandles = w_caphandles ? w_caphandles * 2 : 8;
+    w_handles = (WHandleEntry *)realloc(w_handles, sizeof(WHandleEntry) * (size_t)w_caphandles);
+    if (!w_handles) w_oom();
+  }
+  w_handles[w_nhandles++] = (WHandleEntry){ id, ptr, 0, false };
+  pthread_mutex_unlock(&w_handles_mu);
+  return id;
+}
+static int64_t w_handle_acquire(int64_t id) {
+  pthread_mutex_lock(&w_handles_mu);
+  WHandleEntry *e = w_handle_find(id);
+  int64_t p = 0;
+  if (e && !e->closed) { e->uses++; p = e->ptr; }
+  pthread_mutex_unlock(&w_handles_mu);
+  return p;
+}
+static int64_t w_handle_release(int64_t id) {
+  pthread_mutex_lock(&w_handles_mu);
+  WHandleEntry *e = w_handle_find(id);
+  int64_t p = 0;
+  if (e && e->uses > 0) {
+    e->uses--;
+    if (e->closed && e->uses == 0) { p = e->ptr; w_handle_remove(e); }
+  }
+  pthread_mutex_unlock(&w_handles_mu);
+  return p;
+}
+static int64_t w_handle_close(int64_t id) {
+  pthread_mutex_lock(&w_handles_mu);
+  WHandleEntry *e = w_handle_find(id);
+  int64_t p = 0;
+  if (e && !e->closed) {
+    e->closed = true;
+    if (e->uses == 0) { p = e->ptr; w_handle_remove(e); }
+  }
+  pthread_mutex_unlock(&w_handles_mu);
+  return p;
+}
 static WStr *Cap_foreign_copy(WCap *x, int64_t p, int64_t n, const char *where) {
   if (x->nhosts == 0) w_panic_c("foreign: no library is granted, so C memory cannot be read", where);
   if (n < 0) { char m[128]; snprintf(m, sizeof m, "foreign.copy: negative length %lld", (long long)n); w_panic_c(m, where); }

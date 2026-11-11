@@ -9,6 +9,7 @@
    ones are ignored. This does not hold for variadic functions, which the
    checker never lets through. The native backend calls each function
    through its exact prototype instead. */
+#define _GNU_SOURCE
 #include <dlfcn.h>
 #include <stdint.h>
 #include <string.h>
@@ -104,4 +105,21 @@ value vela_ffi_peek(value p, value n) {
   r = caml_alloc_string((mlsize_t)len);
   if (len > 0) memcpy((char *)Bytes_val(r), s, (size_t)len);
   CAMLreturn(r);
+}
+
+/* The interpreter's way into the operating-system sandbox (vela_sandbox.h),
+   entered by `vela run` once the program is loaded and its granted foreign
+   libraries are resolved, before main starts.
+   vela_sandbox_enter : string -> bool -> bool -> bool -> int
+   (fs root or "", read-only, net, exec) -> 0 enforced, 1 unsupported here;
+   raises Failure with the reason if it could not be entered. */
+#include <caml/fail.h>
+#include "runtime/vela_sandbox.h"
+value vela_sandbox_enter(value root, value ro, value net, value exec) {
+  CAMLparam4(root, ro, net, exec);
+  WSandboxSpec s = { caml_string_length(root) ? String_val(root) : NULL, Bool_val(ro), Bool_val(net), Bool_val(exec) };
+  char err[512];
+  int rc = w_sandbox_enter(&s, err, sizeof err);
+  if (rc < 0) caml_failwith(err);
+  CAMLreturn(Val_int(rc));
 }

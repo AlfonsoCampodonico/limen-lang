@@ -805,6 +805,7 @@ module Foreign = struct
   external call : nativeint -> carg array -> int -> int64 * float * int64 array = "vela_ffi_call"
   external cstr : int64 -> string = "vela_ffi_cstr"
   external peek : int64 -> int -> string = "vela_ffi_peek"
+  external sandbox_enter : string -> bool -> bool -> bool -> int = "vela_sandbox_enter"
 
   let permits allowed lib = List.mem "*" allowed || List.mem lib allowed
   let only allowed l = if (l = "*" && List.mem "*" allowed) || (l <> "*" && permits allowed l) then [ l ] else []
@@ -834,7 +835,7 @@ module Foreign = struct
     List.fold_left
       (fun acc it ->
         match (acc, it) with
-        | Ok (), IFn ({ fn_foreign = Some (lib, sym); _ } as d) when permits granted lib -> (
+        | Ok (), IFn ({ fn_foreign = Some { flib = lib; fsym = sym; ftrusted }; _ } as d) when lib <> "vela" && (ftrusted || permits granted lib) -> (
           match load lib with
           | Error e -> Error (sprintf "foreign: cannot load library `%s`: %s" lib e, d.fn_span)
           | Ok h ->
@@ -846,10 +847,63 @@ module Foreign = struct
 
   let handle v = VStruct ("Handle", [ ("addr", VInt v) ])
 
+  let copy allowed p n sp =
+    if allowed = [] then raise (Panic ("foreign: no library is granted, so C memory cannot be read", sp));
+    if n < 0L then raise (Panic (sprintf "foreign.copy: negative length %Ld" n, sp));
+    if p = 0L && n > 0L then raise (Panic ("foreign.copy: null pointer", sp));
+    if n > Int64.of_int Sys.max_string_length then raise (Panic (sprintf "foreign.copy: length %Ld is too large" n, sp));
+    VBytes (peek p (Int64.to_int n))
+
+  (* The runtime's handle table (Ffi.runtime_fns): id -> pointer, uses in
+     progress, closed. Ids are random so they cannot be guessed. *)
+  type entry = { ptr : int64; mutable uses : int; mutable closed : bool }
+  let handles : (int64, entry) Hashtbl.t = Hashtbl.create 8
+  let id_rng = lazy (Random.State.make_self_init ())
+
+  let runtime_helper sym args sp =
+    let ptr_of = function
+      | Some e -> e.ptr
+      | None -> 0L
+    in
+    match (sym, args) with
+    | "vela_copy", [ VStruct (_, [ (_, VInt p) ]); VInt n ] -> copy [ "vela" ] p n sp
+    | "vela_handle_new", [ VStruct (_, [ (_, VInt p) ]) ] ->
+      let rec fresh () =
+        let id = Int64.logand (Random.State.int64 (Lazy.force id_rng) Int64.max_int) 0x3FFFFFFFFFFFFFFFL in
+        if id = 0L || Hashtbl.mem handles id then fresh () else id
+      in
+      let id = fresh () in
+      Hashtbl.replace handles id { ptr = p; uses = 0; closed = false };
+      VInt id
+    | "vela_handle_acquire", [ VInt id ] -> (
+      match Hashtbl.find_opt handles id with
+      | Some e when not e.closed -> e.uses <- e.uses + 1; handle e.ptr
+      | _ -> handle 0L)
+    | "vela_handle_release", [ VInt id ] -> (
+      match Hashtbl.find_opt handles id with
+      | Some e when e.uses > 0 ->
+        e.uses <- e.uses - 1;
+        if e.closed && e.uses = 0 then (Hashtbl.remove handles id; handle (ptr_of (Some e))) else handle 0L
+      | _ -> handle 0L)
+    | "vela_handle_close", [ VInt id ] -> (
+      match Hashtbl.find_opt handles id with
+      | Some e when not e.closed ->
+        e.closed <- true;
+        if e.uses = 0 then (Hashtbl.remove handles id; handle e.ptr) else handle 0L
+      | _ -> handle 0L)
+    | _ -> failwith ("internal: runtime helper " ^ sym)
+
   let invoke (d : fn_decl) args sp =
     let cs = match Ffi.of_decl d with Ok cs -> cs | Error _ -> failwith "internal: foreign signature" in
-    let allowed, args = match args with VCap (CForeign a) :: rest -> (a, rest) | _ -> failwith "internal: foreign capability" in
-    if not (permits allowed cs.lib) then raise (Panic (Ffi.denied_msg cs.lib, sp));
+    let args =
+      if cs.trusted then args
+      else
+        match args with
+        | VCap (CForeign allowed) :: rest ->
+          if not (permits allowed cs.lib) then raise (Panic (Ffi.denied_msg cs.lib, sp));
+          rest
+        | _ -> failwith "internal: foreign capability"
+    in
     let rec conv ps args =
       match (ps, args) with
       | [], _ -> []
@@ -871,6 +925,9 @@ module Foreign = struct
         c :: conv ps args
       | _ :: _, [] -> failwith "internal: foreign arity"
     in
+    match (cs.lib, args) with
+    | "vela", args -> runtime_helper cs.sym args sp
+    | _ ->
     let cargs = Array.of_list (conv cs.params args) in
     let fp = match Hashtbl.find_opt syms (cs.lib, cs.sym) with Some p -> p | None -> failwith "internal: unresolved foreign function" in
     let ri, rf, outs = call fp cargs (if cs.ret = Ffi.Float then 1 else 0) in
@@ -898,12 +955,6 @@ module Foreign = struct
     | [ v ] -> v
     | vs -> VStruct (Ast.tuple_name (List.length vs), List.mapi (fun i v -> (string_of_int i, v)) vs)
 
-  let copy allowed p n sp =
-    if allowed = [] then raise (Panic ("foreign: no library is granted, so C memory cannot be read", sp));
-    if n < 0L then raise (Panic (sprintf "foreign.copy: negative length %Ld" n, sp));
-    if p = 0L && n > 0L then raise (Panic ("foreign.copy: null pointer", sp));
-    if n > Int64.of_int Sys.max_string_length then raise (Panic (sprintf "foreign.copy: length %Ld is too large" n, sp));
-    VBytes (peek p (Int64.to_int n))
 end
 
 (* ---------- processes ----------
@@ -1584,7 +1635,16 @@ and cap_call rt c name args sp =
 let exit_code n = Int64.to_int (Int64.logand n 255L)
 
 (* Run `main`. Returns its value, or the panic message and location. *)
-let run ~out ~grants (user_items : item list) : (value, string * Span.t) result =
+(* Restrict this process to [grants] (vela_sandbox.h). Ok true when the
+   operating system enforces it, Ok false when it has no sandbox here. *)
+let sandbox (g : grants) : (bool, string) result =
+  let root, ro = match g.fs with Some (r, ro) -> (r, ro) | None -> ("", false) in
+  match Foreign.sandbox_enter root ro (g.net <> [] || g.listen <> []) (g.exec <> []) with
+  | 0 -> Ok true
+  | _ -> Ok false
+  | exception Failure m -> Error m
+
+let run ?(before_main = fun () -> ()) ~out ~grants (user_items : item list) : (value, string * Span.t) result =
   seed_rand grants.seed;
   let rt =
     { fns = Hashtbl.create 16; structs = Hashtbl.create 16; enums = Hashtbl.create 16;
@@ -1610,6 +1670,7 @@ let run ~out ~grants (user_items : item list) : (value, string * Span.t) result 
     match Foreign.resolve grants.foreign user_items with
     | Error e -> Error e
     | Ok () ->
+    before_main ();
     let args = match d.fn_params with [] -> [] | _ -> [ VCap CRoot ] in
     (* main is a coroutine too, so it can wait on groups and channels *)
     Queue.clear runq;

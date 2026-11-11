@@ -21,7 +21,7 @@ let cc () = match Sys.getenv_opt "CC" with Some c when c <> "" -> c | _ -> "cc"
    the extra compiler and linker flags. *)
 let prepare c_text =
   if Openssl_config.found && String.starts_with ~prefix:Cgen.tls_marker c_text then
-    ("#define _GNU_SOURCE\n#define VELA_TLS 1\n" ^ Tls_text.text ^ c_text, Openssl_config.cflags, Openssl_config.libs)
+    ("#ifndef _GNU_SOURCE\n#define _GNU_SOURCE\n#endif\n#define VELA_TLS 1\n" ^ Tls_text.text ^ c_text, Openssl_config.cflags, Openssl_config.libs)
   else (c_text, [], [])
 
 (* The compiler's command line, as argv. *)

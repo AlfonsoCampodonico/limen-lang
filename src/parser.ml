@@ -665,7 +665,7 @@ let parse_foreign st =
     items :=
       IFn
         { fn_name = name; fn_span = nsp; fn_gen = []; fn_params = params; fn_ret = ret; fn_body = body; fn_test = None;
-          fn_pub = pub; fn_bounds = []; fn_foreign = Some (lib, name) }
+          fn_pub = pub; fn_bounds = []; fn_foreign = Some { flib = lib; fsym = name; ftrusted = false } }
       :: !items;
     (* one declaration per line (or separated by `;`) *)
     if not (accept_sym st ";" || is_sym st "}" || (peek st).nl) then fail (peek st) "a new line after a foreign function's signature"

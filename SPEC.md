@@ -434,7 +434,7 @@ foreign "sqlite3" {
 }
 ```
 
-Calling one takes a `Foreign` capability first, then the other arguments: `sqlite3_libversion(root.foreign)`. Each call checks that the `Foreign` value grants the library (`--grant foreign=sqlite3`), and panics if not. So C is reachable only from code that was handed `Foreign`, `vela caps` lists such functions, and a package dependency can use a foreign block only if vela.toml gives it `caps = ["foreign"]` (section 18). The library name is the `-l` name: `foreign "sqlite3"` links `-lsqlite3` natively and loads `libsqlite3.dylib` (macOS) or `libsqlite3.so` in the interpreter; `foreign "c"` is the C library itself, which is always there. The function name is the C symbol. Declarations are one per line; `pub fn` exports one from a module.
+Calling one takes a `Foreign` capability first, then the other arguments: `sqlite3_libversion(root.foreign)`. Each call checks that the `Foreign` value grants the library (`--grant foreign=sqlite3`), and panics if not. So C is reachable only from code that was handed `Foreign`, `vela caps` lists such functions, and a package dependency can use a foreign block only if the program names it in `[trust] foreign = [...]` in vela.toml (section 18). The library name is the `-l` name: `foreign "sqlite3"` links `-lsqlite3` natively and loads `libsqlite3.dylib` (macOS) or `libsqlite3.so` in the interpreter; `foreign "c"` is the C library itself, which is always there. The function name is the C symbol. Declarations are one per line; `pub fn` exports one from a module.
 
 The types that cross the boundary:
 
@@ -457,11 +457,40 @@ Ownership at the boundary:
 - Memory C allocates belongs to C: free it with the library's own function (`sqlite3_finalize`, `free`). Vela never frees a `Handle`, and the leak check does not see C memory.
 - `foreign.copy(p, n)` copies `n` bytes at `p` into new `Bytes`, for results that are a pointer and a length (`sqlite3_column_blob` and `sqlite3_column_bytes`). It reads raw memory, so it needs a `Foreign` that grants at least one library.
 
+The foreign grant is full trust, and Vela treats it that way:
+
+- Only the program grants it: `--grant foreign=LIB` or `[grants] foreign` in the program's own vela.toml. `vela run` prints a one-line warning whenever it is given, since nothing in Vela bounds what C code does; only the operating-system sandbox (below) still does.
+- It does not pass along: a dependency's `caps` cannot include `foreign`. A dependency may declare foreign blocks only when the program names it in `[trust]`, and vela.lock records the C libraries each trusted dependency uses (section 18).
+- `vela check` lists every part of the program that calls C, one line each: the program's own files, trusted dependencies, and trusted standard library modules.
+- The standard library calls C only from modules that its manifest, src/std/vela.toml, trusts in the same way (`sql`). Their foreign functions are private to the module and take no `Foreign`, so a program using `sql` grants only an `Fs`; the module is what keeps SQLite inside that grant.
+
 What the capability lets code do: anything the C functions it declares can do, with the program's full authority, outside every other capability's checks. Vela checks the declared types and the library grant; it cannot check that a declaration matches the C prototype, and a wrong one is undefined behaviour. Keep foreign blocks small, private to a module that wraps them in a safe Vela API (as the `sql` module does), and grant `foreign` only to programs and dependencies you trust.
 
 Limits, the same in both backends: at most 8 integer-like (everything but `Float`, `Out` included) and 8 `Float` parameters; no variadic functions (`printf`), no structs by value, no callbacks from C into Vela. A foreign function can only be called, not used as a value (E0331): wrap it in a closure. A C call blocks its worker thread until it returns, like a busy loop, and C libraries decide their own thread safety.
 
 The backends differ in how they reach the code, not in what a program sees: natively each function is called through its exact prototype and linked with `-l<lib>` (a library outside the C compiler's default paths is found through `LIBRARY_PATH`); the interpreter loads the library with `dlopen` and calls through a generic stub, resolving the declarations of granted libraries before `main` starts. A missing library or symbol is therefore an error before the program runs in both: a link error natively, `foreign: cannot load library ...` or `foreign: library ... has no function ...` in the interpreter. One difference follows from linking: a native binary loads every library it declares when it starts (running the library's initialisers, as any linked library does), granted or not, while the interpreter never loads a library the grants do not cover. In both, a call into an ungranted library panics before it reaches the library.
+
+### The operating-system sandbox
+
+Vela's checks cover Vela code. To cover everything else in the process (C called through `foreign`, and any bug in the runtime), every program also runs in an operating-system sandbox built from its grants. It is on by default, in both backends: `vela run` enters it once the program is loaded (and its granted C libraries with it), and a native binary enters it at startup, before any thread starts. `--no-sandbox` (on `vela run`, or on a built binary) turns it off; it is for debugging, not for production.
+
+What the kernel enforces:
+
+| | Allowed |
+| --- | --- |
+| Writing files | under the `Fs` directory, unless it is read-only; the temporary directory if `Exec` is granted (Exec keeps a child's stderr there); `/dev/null` and the terminal |
+| Reading files | under the `Fs` directory; system locations (`/usr`, `/System`, `/Library`, `/etc`, `/dev`, Homebrew's prefix, ...: libraries, time zones, TLS certificates); the temporary directory with `Exec`. Not home directories, other users' files or anything else |
+| Network | nothing unless `Net` or `Listen` is granted; then any host |
+| Starting programs | only if `Exec` is granted. A started program inherits the sandbox: it can read system locations and the `Fs` directory, and list (not read) the directories above the current one, which shells need |
+
+What stays in Vela's own checks, not the kernel's: which hosts and ports `Net` and `Listen` allow (the kernel allows all networking once either is granted), which programs `Exec` may run, which variables `Env` shows, `Fs`'s refusal of `..` and absolute paths (the kernel sees only the resolved file), and everything inside the process: C code with the foreign grant can still read and corrupt the program's own memory, and through it every capability the program holds.
+
+How:
+
+- macOS: a sandbox profile (`sandbox_init`), allowing by default and denying the above. It also refuses Apple events and LaunchServices opens, so the program cannot have another application act for it. Mach services stay reachable, as for every process.
+- Linux: Landlock (kernel 5.13 or later) for files, and on kernels with Landlock ABI 4 or later for TCP too, plus a seccomp filter that, without `Net` or `Listen`, allows only Unix sockets and refuses io_uring, and without `Exec` refuses `execve`; it also refuses x32 system calls. It has been run on arm64 Linux (kernel 7.0); on x86-64 it compiles but has not been run on a real kernel.
+- A system without a sandbox (another OS, a Linux kernel without Landlock or seccomp filters, an emulator) runs the program without one, silently, as before. A sandbox that exists but cannot be entered stops the program with a message naming `--no-sandbox`.
+- `vela test` runs native tests in the sandbox too (a test that takes `fs: Fs` gets its temporary directory); interpreted tests run inside the `vela` process, unsandboxed.
 
 ## 10. Concurrency
 
@@ -806,7 +835,7 @@ Strings compare byte by byte, so `c >= "a" && c <= "z"` tests a one-byte string,
 | `Fs` | `remove(path)` | `Result[(), IoError]`, a file or an empty directory, never the granted directory itself |
 | `Fs` | `exists(path)`, `is_dir(path)` | `Bool` |
 | `Fs` | `under(dir)`, `read_only()` | `Fs` |
-| `Fs` | `full_path(path)` | `Result[Str, IoError]`: the absolute path, checked as for writing (the file need not exist, its directory must), for handing to C or another program |
+| `Fs` | `full_path(path)` | `Result[Str, IoError]`: the absolute path, checked as for writing (the file need not exist, its directory must), with the directory part resolved to its real path, for handing to C or another program |
 | `Fs` | `is_read_only()` | `Bool`; an ungranted `Fs` is read-only |
 
 ## 12. Tests
@@ -894,6 +923,7 @@ Every diagnostic has a stable code. `vela explain CODE` prints its explanation, 
 | E0321 | malformed vela.toml |
 | E0322 | a git dependency could not be fetched |
 | E0323 | vela.lock does not match: a malformed line, or a dependency whose files changed |
+| E0324 | a trusted dependency calls a C library that vela.lock did not record |
 | E0330 | a foreign function signature with a type that cannot cross to C, too many parameters, or a bad library name |
 | E0331 | a foreign function used as a value instead of called |
 | E0401 | module not found, or a qualified name without `use` |
@@ -1044,7 +1074,8 @@ yaml = { git = "git@example.com:me/yaml.git", commit = "3f9c2e1d7a" }
 - `[grants]` takes `net`, `fs`, `listen`, `env`, `exec` and `foreign`, each a string or a list of strings written exactly like the text after `--grant KIND=`. `fs` takes one directory, relative to vela.toml, with an optional `:ro`. Stdout, Stdin, Clock and Rand are always granted, so listing them is an error. Flags on the command line add to these grants.
 - Grants belong to the program being run: only the vela.toml found for the main file is read for them. A dependency's own vela.toml never grants anything, so adding or updating a dependency cannot widen what the program may do. A dependency gets capabilities in exactly one way: your code passes them to it, and only of the kinds its `caps` allow. `[grants]` decides what reaches `main`; `caps` decides which of those may cross into each dependency.
 - A dependency is a directory holding `NAME.vela`, plus any modules that file uses from the same directory.
-- `caps` lists what the dependency may use: `net` (Net and Conn), `listen` (Listen, Listener and Conn), `fs`, `stdout`, `stdin`, `clock`, `rand`, `env`, `exec`, `foreign`. The default is none. A dependency with a `foreign` block needs `foreign`, since its foreign functions take `Foreign`. No dependency can take `Root`.
+- `caps` lists what the dependency may use: `net` (Net and Conn), `listen` (Listen, Listener and Conn), `fs`, `stdout`, `stdin`, `clock`, `rand`, `env`, `exec`. The default is none. No dependency can take `Root`, and `caps` cannot give `foreign` (E0321).
+- `[trust] foreign = ["name", ...]` names the dependencies that may call C: declare foreign blocks and take `Foreign`. Calling C is full trust, since C code is outside every capability check, so it is a separate, explicit list rather than one more cap, and only the program's vela.toml can hold it. An untrusted dependency that calls C is E0320. vela.lock gets a line per trusted dependency that calls C, `foreign NAME LIB,LIB`, written on the first build; when an update makes the dependency declare a library the line does not have, the build stops (E0324) until you review it and delete the line.
 - Vela has no ambient authority, so a function can only use a capability that reaches it as a parameter. The checker therefore knows everything a dependency can ever do from its signatures, and rejects the program (E0320) if a dependency's function takes a capability it was not granted. Granting is still only an upper bound: at run time the dependency gets exactly the capabilities you pass it, which can be narrowed with `only` and `under`.
 - A dependency is a local directory (`path`) or a git repository (`git`) at a `tag` or a `commit` (lowercase hex, at least 7 characters). The URL is `https://`, `http://`, `ssh://`, `git://`, `file://` or `user@host:path`. There is no central registry: the URL is the name of the source.
 - A git dependency is fetched with the `git` command into a cache, one directory per commit: `$VELA_CACHE`, else `$XDG_CACHE_HOME/vela`, else `~/.cache/vela`. Fetching needs no grant because it happens in the compiler, before the program exists; `vela lsp` and `vela mcp` never fetch, and report a dependency that is not cached yet (E0322).
@@ -1067,14 +1098,14 @@ The standard library is checked like a dependency. `src/std/vela.toml` lists the
 | --- | --- |
 | `json`, `list`, `text`, `format`, `time`, `regex` | nothing: pure |
 | `http` | `net` (Net, Conn) and `listen` (Listener, Conn) |
-| `sql` | `foreign` (to call SQLite) and `fs` (the database file's directory) |
+| `sql` | `fs` (the database file's directory); trusted with C (`[trust] foreign = ["sql"]`) to call SQLite |
 
 A module missing from the list may take nothing. `vela caps FILE` shows what each std function takes. What stays trusted, and why:
 
 - The built-in methods of the capabilities themselves (`Net.get`, `Fs.read`, `Listen.on`, ...), written in OCaml for the interpreter and C for the native runtime. They are where the grants are enforced (host allowlists, the fs root, read-only), so there is nothing below them to check them against; they are covered by the tests of both backends.
 - The built-in methods of plain values (`Str`, `List`, `Map`, channels, ...). They take no capability, so they cannot do I/O.
 - The std modules' source. It is embedded in the compiler, not fetched, so it is as trustworthy as the compiler binary; the manifest check makes sure that what it can do stays what it declares.
-- The C libraries that std modules declare in `foreign` blocks (SQLite for `sql`). The checker sees that `sql` takes `Foreign`, but not what SQLite does with it; the module wraps every call and keeps SQLite inside the `Fs` grant (see `sql` below).
+- The C libraries that std modules trusted in the manifest's `[trust]` declare in `foreign` blocks (SQLite for `sql`). Their calls need no `Foreign`, and the declarations are private to the module; the module wraps every call and keeps SQLite inside the `Fs` grant (see `sql` below). A standard library module that is not trusted cannot call C. Trusted modules may also declare the runtime's own helper library, `foreign "vela"`, which no other code may: `vela_copy(p, n)` copies C memory into `Bytes`, and a handle table (`vela_handle_new`, `_acquire`, `_release`, `_close`) keeps C pointers out of Vela values. A trusted module's values hold a random id from that table instead of a `Handle`, since any code can write `Handle { addr: ... }` but no code can turn an id into a pointer; an unknown or closed id is an error, and a pointer is freed only once no use of it is in progress.
 - Callbacks. `http.serve(l, n, handler)` calls `handler` inside std code; the handler carries only the capabilities its closure captured from your code, which appear in your signatures, not std's.
 
 ### json
@@ -1222,31 +1253,30 @@ fn main(root: Root) {
 
 ### sql
 
-SQL databases through SQLite, built on foreign functions (section 9) and the system's `libsqlite3` (on macOS it is part of the OS; on Linux install the SQLite development package). A program that uses it needs `--grant foreign=sqlite3`, and `--grant fs=DIR` for a database file.
+SQL databases through SQLite, built on foreign functions (section 9) and the system's `libsqlite3` (on macOS it is part of the OS; on Linux install the SQLite development package). The module is trusted to call SQLite itself, so a program needs no foreign grant: `--grant fs=DIR` for a database file, and nothing for `sql.memory()`.
 
 ```
 use sql
 
 fn main(root: Root) -> Result[(), IoError] {
-    let f = root.foreign                              // --grant foreign=sqlite3
-    let db = sql.open(f, root.fs, "app.db")?          // --grant fs=DIR
-    db.exec(f, "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER)", [])?
-    db.exec(f, "INSERT INTO users (name, age) VALUES (?, ?)", [sql.Text("Ada"), sql.Int(36)])?
-    for row in db.query(f, "SELECT id, name, age FROM users WHERE age > ?", [sql.Int(30)])? {
+    let db = sql.open(root.fs, "app.db")?          // --grant fs=DIR
+    db.exec("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER)", [])?
+    db.exec("INSERT INTO users (name, age) VALUES (?, ?)", [sql.Text("Ada"), sql.Int(36)])?
+    for row in db.query("SELECT id, name, age FROM users WHERE age > ?", [sql.Int(30)])? {
         root.stdout.print("{row.int("id") ?? 0} {row.text("name") ?? ""}")
     }
-    db.close(f)
+    db.close()
 }
 ```
 
-- `sql.open(f, fs, name)` opens or creates the database file `name` under the directory `fs` grants (`fs.full_path`), read-only when `fs` is read-only (the file must then exist). `sql.memory(f)` is a fresh in-memory database. Both return `Result[Db, IoError]`: `Denied` when `foreign` does not grant `sqlite3` or the path is outside the grant, `Failed` with SQLite's message otherwise.
-- Every operation takes the `Foreign` capability, since it calls C: `db.exec(f, text, params)`, `db.query(f, text, params)`. `Db` is a plain value holding the connection; it can be passed to tasks, which share the one connection safely (SQLite serialises it). `db.close(f)` closes it; a `Db` must not be used after that, and one that is never closed stays open until the program exits.
+- `sql.open(fs, name)` opens or creates the database file `name` under the directory `fs` grants (`fs.full_path`), read-only when `fs` is read-only (the file must then exist). `sql.memory()` is a fresh in-memory database. Both return `Result[Db, IoError]`: `Denied` when the path is outside the grant, `Failed` with SQLite's message otherwise.
+- `Db` is a plain value naming the connection, so `db.exec(text, params)` and `db.query(text, params)` take nothing else. It holds a random id in the runtime's handle table, not the connection's pointer, so a `Db` cannot be forged; code that holds one can change that database and nothing else. It can be passed to tasks, which share the one connection safely (SQLite serialises it). `db.close()` closes it once operations running in other tasks finish; after that every operation on it, and a second close, is `Err(Failed("sql: the database is closed"))`. One that is never closed stays open until the program exits.
 - Values go in as parameters, never into the SQL text: each `?` takes the next item of `params`, a `List[sql.Value]`, which is `sql.Null`, `sql.Int(n)`, `sql.Float(x)`, `sql.Text(s)` or `sql.Blob(bytes)`. The number of `?`s must match the list.
 - `exec` returns the number of rows changed. With no parameters its text may hold several statements separated by `;` (a schema); with parameters it must be exactly one.
 - `query` runs one statement and returns every row as a `List[sql.Row]`; `query_one` returns the first, as an `Option`. A row holds `columns` (names) and `values`. `row.get(name)` is the `Value`; `row.int(name)`, `row.float(name)` (an integer reads as a float too), `row.text(name)` and `row.blob(name)` are `Option`s, `None` for NULL; `row.is_null(name)`. Asking for a column the row does not have, or reading one as the wrong type, panics: that is a bug in the query or the code, not a condition to handle.
-- `db.transaction(f, || { ...; Ok(v) })` runs the closure between `BEGIN` and `COMMIT`. If it returns `Err` or panics, the transaction is rolled back and the error (or the panic) goes on. Transactions do not nest: starting one inside another is an `Err`.
-- `db.last_id(f)` is the rowid of the last row inserted through the connection.
-- SQLite stays inside the grants. `ATTACH` is turned off, and with it `VACUUM` (which attaches a temporary database; `VACUUM INTO` would write anywhere), so SQL cannot open other files. The database file is not opened through a symlink, URI filenames and extensions are off. SQLite writes its journal next to the database, inside the granted directory. A busy database is waited on for up to 5 seconds; that wait, like every SQLite call, blocks the worker thread.
+- `db.transaction(|| { ...; Ok(v) })` runs the closure between `BEGIN` and `COMMIT`. If it returns `Err` or panics, the transaction is rolled back and the error (or the panic) goes on. Transactions do not nest: starting one inside another is an `Err`.
+- `db.last_id()` is the rowid of the last row inserted through the connection, as a `Result[Int, IoError]`.
+- SQLite stays inside the grants. `ATTACH` is turned off, and with it `VACUUM` (which attaches a temporary database; `VACUUM INTO` would write anywhere), so SQL cannot open other files. The database file is not opened through a symlink, and `open` refuses a database whose `-journal`, `-wal` or `-shm` file is a symlink out of the granted directory (or a broken one), since SQLite follows those. URI filenames and extensions are off (SQLite's defaults, which the module never changes), and temporary tables and sorts stay in memory. What remains is a race no Vela code can cause: another process that can write to the directory swapping in such a symlink while the database is open. SQLite writes its journal next to the database, inside the granted directory. A busy database is waited on for up to 5 seconds; that wait, like every SQLite call, blocks the worker thread.
 
 ## 20. Not yet
 

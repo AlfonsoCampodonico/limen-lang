@@ -220,7 +220,10 @@ let resolve fs rel ~for_write =
     match normalize root rel with
     | Error m -> Error (Denied ("fs: " ^ m))
     | Ok p -> (
-      let target = if for_write && not (Sys.file_exists p) then Filename.dirname p else p in
+      (* lstat, as the C runtime does: a dangling symlink exists, and is
+         checked by where it points, not by its directory *)
+      let present = try ignore (Unix.lstat p); true with Unix.Unix_error _ -> false in
+      let target = if for_write && not present then Filename.dirname p else p in
       match real target with
       | Some rp when inside root rp -> Ok p
       | Some _ -> Error (Denied "fs: path resolves outside the granted directory")
@@ -257,7 +260,16 @@ let write fs rel data : (unit, ioerr) result =
 (* The absolute path of [rel], checked as for writing (the file need not
    exist, its directory must), for handing to C or another program. *)
 let full_path fs rel : (string, ioerr) result =
-  if String.contains rel '\000' then Error (Failed "fs: the path contains a NUL byte") else resolve fs rel ~for_write:true
+  if String.contains rel '\000' then Error (Failed "fs: the path contains a NUL byte")
+  else
+    match resolve fs rel ~for_write:true with
+    | Error e -> Error e
+    | Ok p when Some p = fs.root -> Ok p
+    | Ok p -> (
+      (* the real directory and the last name, as natively *)
+      match (real (Filename.dirname p), fs.root) with
+      | Some rd, Some root when inside root rd -> Ok (Filename.concat rd (Filename.basename p))
+      | _ -> Error (Denied "fs: path resolves outside the granted directory"))
 
 let exists fs rel = match resolve fs rel ~for_write:false with Ok p -> Sys.file_exists p | Error _ -> false
 

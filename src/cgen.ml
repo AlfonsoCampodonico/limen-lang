@@ -354,11 +354,27 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     line (sprintf "    %s = %s;" dst (mk_enum c t 1 [ "m_" ]));
     line "  }";
     line "}"
+  | I.CallC ({ lib = "vela"; sym; _ }, args, sp) -> (
+    (* the runtime's own helpers (Ffi.runtime_fns) *)
+    let hd = cname c Ffi.handle_ty in
+    match (sym, List.map a args) with
+    | "vela_copy", [ p; n ] -> set (sprintf "w_ffi_copy((%s).f0, %s, %s)" p n (where sp))
+    | "vela_handle_new", [ p ] -> set (sprintf "w_handle_new((%s).f0)" p)
+    | ("vela_handle_acquire" | "vela_handle_release" | "vela_handle_close"), [ id ] ->
+      set (sprintf "(%s){ w_%s(%s) }" hd (String.sub sym 5 (String.length sym - 5)) id)
+    | _ -> failwith ("cgen: runtime helper " ^ sym))
   | I.CallC (cs, args, sp) ->
     if not (List.mem cs.sym c.csyms) then c.csyms <- c.csyms @ [ cs.sym ];
-    let cap, vals = match List.map a args with cap :: vs -> (cap, vs) | [] -> failwith "cgen: foreign call" in
     line "{";
-    line (sprintf "  w_foreign_check(%s, %s, %s);" cap (c_string cs.lib) (where sp));
+    let vals =
+      if cs.trusted then List.map a args
+      else
+        match List.map a args with
+        | cap :: vs ->
+          line (sprintf "  w_foreign_check(%s, %s, %s);" cap (c_string cs.lib) (where sp));
+          vs
+        | [] -> failwith "cgen: foreign call"
+    in
     let rest = ref vals and outs = ref [] in
     let cargs =
       List.mapi
