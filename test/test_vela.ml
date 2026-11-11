@@ -3683,6 +3683,78 @@ fn main(root: Root) {
   put "capp/sqlmain.vela" "use sql\n\nforeign \"c\" {\n    fn getpid() -> Int32\n}\n\nfn main(root: Root) {\n    root.stdout.print(\"{sql.memory().is_ok()} {getpid(root.foreign) > 0}\")\n}\n";
   let code, o, _ = vela_cli [ "check"; Filename.concat pdir "capp/sqlmain.vela" ] in
   ok "cli-check-calls-c-std" (code = 0 && o = "ok\ncalls C: the program itself (needs --grant foreign): c\ncalls C: module `sql` (standard library, trusted by src/std/vela.toml): sqlite3\n") o;
+  (* the operating-system sandbox: even C code stays inside the grants, in
+     both backends, unless --no-sandbox *)
+  List.iter (fun d -> try Unix.mkdir (Filename.concat pdir d) 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ()) [ "sbox"; "sbox/data" ];
+  let secret = Filename.concat pdir "sbox/secret.txt" in
+  put "sbox/secret.txt" "secret";
+  put "sbox/data/a.txt" "granted";
+  let escape_file = Filename.concat pdir "sbox/escaped.txt" in
+  let src =
+    {v|foreign "c" {
+    fn open(path: Str, flags: Int32) -> Int32
+    fn creat(path: Str, mode: Int32) -> Int32
+    fn close(fd: Int32) -> Int32
+    fn system(cmd: Str) -> Int32
+}
+
+// O_RDONLY is 0 everywhere; creating goes through creat(), whose flags C fixes
+fn try_open(c: Foreign, path: Str, create: Bool) -> Bool {
+    let fd = if create { creat(c, path, 420) } else { open(c, path, 0) }
+    if fd >= 0 {
+        let closed = close(c, fd)
+    }
+    fd >= 0
+}
+
+fn main(root: Root) {
+    let c = root.foreign
+    let fs = root.fs
+    let read = try_open(c, "SECRET", false)
+    let write = try_open(c, "ESCAPE", true)
+    let run = system(c, "true") == 0
+    root.stdout.print("{read} {write} {run}")
+    let mine = try_open(c, fs.full_path("a.txt") ?? "", false)
+    root.stdout.print("{fs.read("a.txt")} {fs.write("b.txt", "x").is_ok()} {mine}")
+}
+|v}
+  in
+  let replace_all pat by s =
+    let b = Buffer.create (String.length s) in
+    let n = String.length pat in
+    let i = ref 0 in
+    while !i < String.length s do
+      if !i + n <= String.length s && String.sub s !i n = pat then (Buffer.add_string b by; i := !i + n)
+      else (Buffer.add_char b s.[!i]; incr i)
+    done;
+    Buffer.contents b
+  in
+  put "sbox/main.vela" (replace_all "ESCAPE" escape_file (replace_all "SECRET" secret src));
+  let smain = Filename.concat pdir "sbox/main.vela" in
+  let grant = [ "--grant"; "foreign=c"; "--grant"; "fs=" ^ Filename.concat pdir "sbox/data" ] in
+  List.iter
+    (fun (name, extra, want) ->
+      (try Sys.remove escape_file with Sys_error _ -> ());
+      let code, o, e = vela_cli ((("run" :: extra) @ [ smain ]) @ grant) in
+      ok name (code = 0 && o = want && Sys.file_exists escape_file = (extra = [ "--no-sandbox" ])) (sprintf "%d %S %S" code o e))
+    [ ("sandbox-interp", [], "false false false\nOk(\"granted\") true true\n");
+      ("sandbox-native", [ "--native" ], "false false false\nOk(\"granted\") true true\n");
+      ("sandbox-off", [ "--no-sandbox" ], "true true true\nOk(\"granted\") true true\n") ];
+  (* a built binary takes --no-sandbox too, and refuses unknown arguments *)
+  let sbin = Filename.concat pdir "sbox/prog" in
+  let code, _, _ = vela_cli [ "build"; smain; "-o"; sbin ] in
+  if code = 0 then begin
+    let run args =
+      let o = Filename.concat pdir "sbox/out" in
+      let c = Sys.command (String.concat " " (List.map Filename.quote (sbin :: args @ grant)) ^ " >" ^ Filename.quote o ^ " 2>/dev/null") in
+      (c, read_file o)
+    in
+    let _, o1 = run [] in
+    let _, o2 = run [ "--no-sandbox" ] in
+    ok "sandbox-binary" (String.starts_with ~prefix:"false false false" o1 && String.starts_with ~prefix:"true true true" o2) (o1 ^ o2)
+  end
+  else ok "sandbox-binary" false "vela build failed";
+  (try Sys.remove escape_file with Sys_error _ -> ());
   Sys.remove (Filename.concat pdir "capp/vela.toml");
   let _, o, e = vela_cli [ "run"; Filename.concat pdir "capp/sqlmain.vela" ] in
   ok "cli-no-foreign-no-warning" (o = "" && String.starts_with ~prefix:"panic: foreign: library `c` is not granted" e) (o ^ e);

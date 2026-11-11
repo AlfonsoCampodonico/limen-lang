@@ -792,6 +792,7 @@ module Foreign = struct
   external call : nativeint -> carg array -> int -> int64 * float * int64 array = "vela_ffi_call"
   external cstr : int64 -> string = "vela_ffi_cstr"
   external peek : int64 -> int -> string = "vela_ffi_peek"
+  external sandbox_enter : string -> bool -> bool -> bool -> int = "vela_sandbox_enter"
 
   let permits allowed lib = List.mem "*" allowed || List.mem lib allowed
   let only allowed l = if (l = "*" && List.mem "*" allowed) || (l <> "*" && permits allowed l) then [ l ] else []
@@ -1621,7 +1622,16 @@ and cap_call rt c name args sp =
 let exit_code n = Int64.to_int (Int64.logand n 255L)
 
 (* Run `main`. Returns its value, or the panic message and location. *)
-let run ~out ~grants (user_items : item list) : (value, string * Span.t) result =
+(* Restrict this process to [grants] (vela_sandbox.h). Ok true when the
+   operating system enforces it, Ok false when it has no sandbox here. *)
+let sandbox (g : grants) : (bool, string) result =
+  let root, ro = match g.fs with Some (r, ro) -> (r, ro) | None -> ("", false) in
+  match Foreign.sandbox_enter root ro (g.net <> [] || g.listen <> []) (g.exec <> []) with
+  | 0 -> Ok true
+  | _ -> Ok false
+  | exception Failure m -> Error m
+
+let run ?(before_main = fun () -> ()) ~out ~grants (user_items : item list) : (value, string * Span.t) result =
   seed_rand grants.seed;
   let rt =
     { fns = Hashtbl.create 16; structs = Hashtbl.create 16; enums = Hashtbl.create 16;
@@ -1647,6 +1657,7 @@ let run ~out ~grants (user_items : item list) : (value, string * Span.t) result 
     match Foreign.resolve grants.foreign user_items with
     | Error e -> Error e
     | Ok () ->
+    before_main ();
     let args = match d.fn_params with [] -> [] | _ -> [ VCap CRoot ] in
     (* main is a coroutine too, so it can wait on groups and channels *)
     Queue.clear runq;

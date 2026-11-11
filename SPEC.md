@@ -459,7 +459,7 @@ Ownership at the boundary:
 
 The foreign grant is full trust, and Vela treats it that way:
 
-- Only the program grants it: `--grant foreign=LIB` or `[grants] foreign` in the program's own vela.toml. `vela run` prints a one-line warning whenever it is given, since nothing else in the program's grants bounds what C code does (section 21 describes the operating-system sandbox, which still does).
+- Only the program grants it: `--grant foreign=LIB` or `[grants] foreign` in the program's own vela.toml. `vela run` prints a one-line warning whenever it is given, since nothing in Vela bounds what C code does; only the operating-system sandbox (below) still does.
 - It does not pass along: a dependency's `caps` cannot include `foreign`. A dependency may declare foreign blocks only when the program names it in `[trust]`, and vela.lock records the C libraries each trusted dependency uses (section 18).
 - `vela check` lists every part of the program that calls C, one line each: the program's own files, trusted dependencies, and trusted standard library modules.
 - The standard library calls C only from modules that its manifest, src/std/vela.toml, trusts in the same way (`sql`). Their foreign functions are private to the module and take no `Foreign`, so a program using `sql` grants only an `Fs`; the module is what keeps SQLite inside that grant.
@@ -469,6 +469,28 @@ What the capability lets code do: anything the C functions it declares can do, w
 Limits, the same in both backends: at most 8 integer-like (everything but `Float`, `Out` included) and 8 `Float` parameters; no variadic functions (`printf`), no structs by value, no callbacks from C into Vela. A foreign function can only be called, not used as a value (E0331): wrap it in a closure. A C call blocks its worker thread until it returns, like a busy loop, and C libraries decide their own thread safety.
 
 The backends differ in how they reach the code, not in what a program sees: natively each function is called through its exact prototype and linked with `-l<lib>` (a library outside the C compiler's default paths is found through `LIBRARY_PATH`); the interpreter loads the library with `dlopen` and calls through a generic stub, resolving the declarations of granted libraries before `main` starts. A missing library or symbol is therefore an error before the program runs in both: a link error natively, `foreign: cannot load library ...` or `foreign: library ... has no function ...` in the interpreter. One difference follows from linking: a native binary loads every library it declares when it starts (running the library's initialisers, as any linked library does), granted or not, while the interpreter never loads a library the grants do not cover. In both, a call into an ungranted library panics before it reaches the library.
+
+### The operating-system sandbox
+
+Vela's checks cover Vela code. To cover everything else in the process (C called through `foreign`, and any bug in the runtime), every program also runs in an operating-system sandbox built from its grants. It is on by default, in both backends: `vela run` enters it once the program is loaded (and its granted C libraries with it), and a native binary enters it at startup, before any thread starts. `--no-sandbox` (on `vela run`, or on a built binary) turns it off; it is for debugging, not for production.
+
+What the kernel enforces:
+
+| | Allowed |
+| --- | --- |
+| Writing files | under the `Fs` directory, unless it is read-only; the temporary directory if `Exec` is granted (Exec keeps a child's stderr there); `/dev/null` and the terminal |
+| Reading files | under the `Fs` directory; system locations (`/usr`, `/System`, `/Library`, `/etc`, `/dev`, Homebrew's prefix, ...: libraries, time zones, TLS certificates); the temporary directory with `Exec`. Not home directories, other users' files or anything else |
+| Network | nothing unless `Net` or `Listen` is granted; then any host |
+| Starting programs | only if `Exec` is granted. A started program inherits the sandbox: it can read system locations and the `Fs` directory, and list (not read) the directories above the current one, which shells need |
+
+What stays in Vela's own checks, not the kernel's: which hosts and ports `Net` and `Listen` allow (the kernel allows all networking once either is granted), which programs `Exec` may run, which variables `Env` shows, `Fs`'s refusal of `..` and absolute paths (the kernel sees only the resolved file), and everything inside the process: C code with the foreign grant can still read and corrupt the program's own memory, and through it every capability the program holds.
+
+How:
+
+- macOS: a sandbox profile (`sandbox_init`), allowing by default and denying the above. It also refuses Apple events and LaunchServices opens, so the program cannot have another application act for it. Mach services stay reachable, as for every process.
+- Linux: Landlock (kernel 5.13 or later) for files, and on kernels with Landlock ABI 4 or later for TCP too, plus a seccomp filter that, without `Net` or `Listen`, allows only Unix sockets and refuses io_uring, and without `Exec` refuses `execve`; it also refuses x32 system calls. It has been run on arm64 Linux (kernel 7.0); on x86-64 it compiles but has not been run on a real kernel.
+- A system without a sandbox (another OS, a Linux kernel without Landlock or seccomp filters, an emulator) runs the program without one, silently, as before. A sandbox that exists but cannot be entered stops the program with a message naming `--no-sandbox`.
+- `vela test` runs native tests in the sandbox too (a test that takes `fs: Fs` gets its temporary directory); interpreted tests run inside the `vela` process, unsandboxed.
 
 ## 10. Concurrency
 

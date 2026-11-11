@@ -4,7 +4,7 @@ let usage =
   {|vela: a small language where I/O needs a capability
 
 usage:
-  vela run FILE [--native] [--grant net=HOST[:PORT]|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST:PORT]... [--grant env=NAME|*]... [--grant exec=PROGRAM|*]... [--grant foreign=LIB|*]... [--seed N] [-- ARGS...]
+  vela run FILE [--native] [--grant net=HOST[:PORT]|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST:PORT]... [--grant env=NAME|*]... [--grant exec=PROGRAM|*]... [--grant foreign=LIB|*]... [--seed N] [--no-sandbox] [-- ARGS...]
   vela build FILE [-o OUT] [--emit-c]
   vela check FILE [--json]
   vela caps FILE [--json]
@@ -17,7 +17,8 @@ usage:
   vela spec               (print the language specification)
 
 Stdout, Stdin, Clock and Rand are always granted. Net, Fs, Listen, Env, Exec and Foreign exist only
-when granted, by --grant or by the [grants] table of vela.toml. --seed makes Rand repeatable; arguments after -- are root.args().
+when granted, by --grant or by the [grants] table of vela.toml. --seed makes Rand repeatable; arguments after -- are root.args(). The process runs in an operating-system sandbox
+limited to those grants (macOS; Linux untested); --no-sandbox turns it off, for debugging.
 |}
 
 let die_usage msg =
@@ -58,6 +59,7 @@ let parse_grants args =
         { g with exec = g.exec @ [ String.sub a (i + 1) (String.length a - i - 1) ] }
       | Some i when String.sub a 0 i = "foreign" ->
         { g with foreign = g.foreign @ [ String.sub a (i + 1) (String.length a - i - 1) ] }
+      | None when a = "no-sandbox" -> g
       | Some i when String.sub a 0 i = "seed" -> (
         match int_of_string_opt (String.sub a (i + 1) (String.length a - i - 1)) with
         | Some n -> { g with seed = Some n }
@@ -87,6 +89,9 @@ let rec split_grants = function
   | "--seed" :: n :: rest ->
     let gs, others = split_grants rest in
     (("seed=" ^ n) :: gs, others)
+  | "--no-sandbox" :: rest ->
+    let gs, others = split_grants rest in
+    ("no-sandbox" :: gs, others)
   | "--grant" :: [] -> die_usage "--grant needs a value"
   | x :: rest ->
     let gs, others = split_grants rest in
@@ -303,7 +308,10 @@ let cmd_run_native file grant_args prog_args =
    | Error m -> prerr_string m; prerr_endline "vela: the C compiler failed (this is a bug in vela)"; exit 1);
   let args =
     List.concat_map
-      (fun g -> if String.starts_with ~prefix:"seed=" g then [ "--seed"; String.sub g 5 (String.length g - 5) ] else [ "--grant"; g ])
+      (fun g ->
+        if g = "no-sandbox" then [ "--no-sandbox" ]
+        else if String.starts_with ~prefix:"seed=" g then [ "--seed"; String.sub g 5 (String.length g - 5) ]
+        else [ "--grant"; g ])
       grant_args
     @ ("--" :: prog_args)
   in
@@ -319,7 +327,14 @@ let cmd_run file grant_args prog_args =
   let items, diags, _ = load file in
   if diags <> [] then (report diags; exit 1);
   let out s = print_string s; flush stdout in
-  match Interp.run ~out ~grants items with
+  (* the operating-system sandbox, once foreign libraries are loaded *)
+  let before_main () =
+    if not (List.mem "no-sandbox" grant_args) then
+      match Interp.sandbox grants with
+      | Ok _ -> ()
+      | Error m -> Printf.eprintf "vela: %s (run with --no-sandbox to go without it)\n" m; exit 1
+  in
+  match Interp.run ~before_main ~out ~grants items with
   | Ok (Interp.VEnum ("Result", "Err", [ e ])) ->
     Printf.eprintf "error: %s\n" (Interp.show e);
     exit 1

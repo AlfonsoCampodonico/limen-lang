@@ -1,6 +1,8 @@
 /* Vela C runtime. Included verbatim at the top of every generated program.
    Its behaviour mirrors the interpreter (src/interp.ml and src/caps.ml). */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -934,11 +936,12 @@ static char **g_listen; static int g_nlisten;
 static char **g_env; static int g_nenv;
 static char **g_exec; static int g_nexec;
 static char **g_foreign; static int g_nforeign;
+static bool g_no_sandbox;
 static char **g_args; static int g_nargs;
 static uint64_t g_rand_state;
 
 static void w_usage(const char *m) {
-  fprintf(stderr, "%s\nusage: PROGRAM [--grant net=HOST[:PORT]|*]... [--grant fs=DIR[:ro]]\n", m);
+  fprintf(stderr, "%s\nusage: PROGRAM [--grant KIND=VALUE]... [--seed N] [--no-sandbox] [-- ARGS...]\n", m);
   exit(2);
 }
 static void w_init(int argc, char **argv) {
@@ -959,6 +962,7 @@ static void w_init(int argc, char **argv) {
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--") == 0) { g_args = argv + i + 1; g_nargs = argc - i - 1; break; }
     if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) { g_rand_state = (uint64_t)strtoll(argv[++i], NULL, 10); continue; }
+    if (strcmp(argv[i], "--no-sandbox") == 0) { g_no_sandbox = true; continue; }
     if (strcmp(argv[i], "--grant") != 0 || i + 1 >= argc) w_usage("unknown argument");
     const char *g = argv[++i];
     if (strncmp(g, "net=", 4) == 0) {
@@ -986,6 +990,16 @@ static void w_init(int argc, char **argv) {
       g_listen = (char **)w_realloc(g_listen, sizeof(char *) * (size_t)(g_nlisten + 1));
       g_listen[g_nlisten++] = strdup(g + 7);
     } else w_usage("unknown grant");
+  }
+  /* restrict the whole process to the grants (vela_sandbox.h), before any
+     thread starts; --no-sandbox turns it off, for debugging */
+  if (!g_no_sandbox) {
+    WSandboxSpec sb = { g_fs_root, g_fs_root ? (int)g_fs_ro : 0, g_nhosts > 0 || g_nlisten > 0, g_nexec > 0 };
+    char err[512];
+    if (w_sandbox_enter(&sb, err, sizeof err) < 0) {
+      fprintf(stderr, "vela: %s (run with --no-sandbox to go without it)\n", err);
+      exit(1);
+    }
   }
 }
 static WCap *w_root(void) { return cap_new(CAP_ROOT); }
@@ -1326,7 +1340,7 @@ static WIo Cap_fs_list(WCap *fs, WStr *rel) {
     names[n++] = strdup(e->d_name);
   }
   closedir(d);
-  qsort(names, (size_t)n, sizeof(char *), w_cmp_cstr);
+  if (n > 1) qsort(names, (size_t)n, sizeof(char *), w_cmp_cstr);   /* never qsort(NULL, ...) */
   L_Str *out = L_Str_new(n);
   for (int i = 0; i < n; i++) { L_Str_push(&out, Str_from(names[i], (int64_t)strlen(names[i]))); free(names[i]); }
   free(names);

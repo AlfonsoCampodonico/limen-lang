@@ -11,7 +11,8 @@
  ; the interpreter's calls into C libraries (foreign blocks)
  (foreign_stubs
   (language c)
-  (names ffi_stubs))
+  (names ffi_stubs)
+  (extra_deps runtime/vela_sandbox.h))
  (c_library_flags
   (:include tls_libs.sexp))
  (flags
@@ -20,12 +21,13 @@
 ; Embed the C runtime header as an OCaml string.
 (rule
  (targets runtime_text.ml)
- (deps runtime/vela_rt.h)
+ (deps runtime/vela_rt.h runtime/vela_sandbox.h)
  (action
   (with-stdout-to
    runtime_text.ml
    (progn
     (echo "let text = {xxrtxx|")
+    (cat runtime/vela_sandbox.h)
     (cat runtime/vela_rt.h)
     (echo "|xxrtxx}\n")))))
 

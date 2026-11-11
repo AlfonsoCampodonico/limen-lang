@@ -11,7 +11,13 @@
      directory with Exec, and system locations (libraries, /etc,
      certificates, devices);
    - network: none at all unless Net or Listen is granted;
-   - programs: starting another program only if Exec is granted.
+   - programs: starting another program only if Exec is granted. A program
+     started through Exec inherits the same restrictions; it may also list
+     (not read) the directories above the current one, as shells do.
+   macOS also refuses Apple events and LaunchServices opens, so the process
+   cannot have another application act for it. It still reaches the system's
+   Mach services, as every process does; seccomp on Linux refuses x32 system
+   calls and io_uring without Net/Listen.
    What stays in Vela, not the kernel: which hosts and ports Net and Listen
    allow, which programs Exec allows, which environment variables Env shows,
    Fs's refusal of `..` and absolute paths (the kernel only sees the result).
@@ -24,12 +30,17 @@
    w_sandbox_enter returns 0 when restrictions are in place, 1 when this
    system has no sandbox, -1 with a message in err when it failed. Must be
    called while the process has a single thread. */
+/* first in every program (the runtime follows it), so before any header */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 typedef struct {
   const char *fs_root; /* realpath of the Fs grant, or NULL */
@@ -100,7 +111,29 @@ static int w_sandbox_enter(const WSandboxSpec *s, char *err, size_t en) {
   w_sb_subpath(&b, tmp);
   w_sb_subpath(&b, cert_dir);
   if (cert_file) { w_sb_put(&b, " (literal "); w_sb_str(&b, cert_file); w_sb_put(&b, ")"); }
+  if (s->exec) {
+    /* a started program runs in our directory, and a shell lists the
+       directories above it to learn its path: those directories themselves
+       (not what is in them) */
+    char *cwd = getcwd(NULL, 0);
+    char *real = w_sb_real(cwd);
+    free(cwd);
+    if (real) {
+      for (char *q = real + 1;; q++) {
+        if (*q == '/' || *q == 0) {
+          char c = *q;
+          *q = 0;
+          w_sb_put(&b, " (literal "); w_sb_str(&b, real); w_sb_put(&b, ")");
+          *q = c;
+          if (!c) break;
+        }
+      }
+      free(real);
+    }
+  }
   w_sb_put(&b, ")))\n");
+  /* no reaching other applications, which have their own authority */
+  w_sb_put(&b, "(deny appleevent-send)\n(deny lsopen)\n");
   if (!s->net) w_sb_put(&b, "(deny network*)\n");
   if (!s->exec) w_sb_put(&b, "(deny process-exec*)\n(deny process-fork)\n");
   free(tmp); free(cert_file); free(cert_dir);
@@ -128,6 +161,9 @@ static int w_sandbox_enter(const WSandboxSpec *s, char *err, size_t en) {
 #include <linux/filter.h>
 #include <linux/seccomp.h>
 #include <linux/audit.h>
+#ifndef O_PATH
+#define O_PATH 010000000 /* glibc hides it without _GNU_SOURCE */
+#endif
 
 #ifndef __NR_landlock_create_ruleset
 #define __NR_landlock_create_ruleset 444
@@ -147,7 +183,9 @@ static int w_sandbox_enter(const WSandboxSpec *s, char *err, size_t en) {
 #define W_LL_TRUNCATE (1ULL << 14)
 #define W_LL_FILE_ONLY (W_LL_EXECUTE | W_LL_WRITE_FILE | W_LL_READ_FILE | W_LL_TRUNCATE)
 
-struct w_ll_ruleset_attr { uint64_t handled_access_fs; };
+struct w_ll_ruleset_attr { uint64_t handled_access_fs; uint64_t handled_access_net; };
+#define W_LL_NET_BIND_TCP (1ULL << 0)
+#define W_LL_NET_CONNECT_TCP (1ULL << 1)
 struct w_ll_path_beneath { uint64_t allowed_access; int32_t parent_fd; } __attribute__((packed));
 
 static int w_ll_allow(int ruleset, const char *path, uint64_t access, uint64_t handled) {
@@ -166,8 +204,10 @@ static int w_landlock(const WSandboxSpec *s, char *err, size_t en) {
   long abi = syscall(__NR_landlock_create_ruleset, NULL, 0, 1 /* LANDLOCK_CREATE_RULESET_VERSION */);
   if (abi < 1) return 1; /* no Landlock in this kernel */
   uint64_t handled = W_LL_ABI1_ALL | (abi >= 2 ? W_LL_REFER : 0) | (abi >= 3 ? W_LL_TRUNCATE : 0);
-  struct w_ll_ruleset_attr attr = { handled };
-  int rs = (int)syscall(__NR_landlock_create_ruleset, &attr, sizeof attr, 0);
+  /* ABI 4 and later also handle TCP: with no rules, no bind and no connect */
+  struct w_ll_ruleset_attr attr = { handled, (abi >= 4 && !s->net) ? (W_LL_NET_BIND_TCP | W_LL_NET_CONNECT_TCP) : 0 };
+  size_t attr_size = abi >= 4 ? sizeof attr : sizeof attr.handled_access_fs;
+  int rs = (int)syscall(__NR_landlock_create_ruleset, &attr, attr_size, 0);
   if (rs < 0) { snprintf(err, en, "cannot create a Landlock ruleset: %s", strerror(errno)); return -1; }
   uint64_t rd = W_LL_READ_FILE | W_LL_READ_DIR | (s->exec ? W_LL_EXECUTE : 0);
   const char *sys[] = { "/usr", "/lib", "/lib64", "/lib32", "/bin", "/sbin", "/etc", "/proc", "/sys", "/opt", NULL };
@@ -177,6 +217,13 @@ static int w_landlock(const WSandboxSpec *s, char *err, size_t en) {
   bad |= w_ll_allow(rs, "/dev/null", W_LL_READ_FILE | W_LL_WRITE_FILE | W_LL_TRUNCATE, handled);
   bad |= w_ll_allow(rs, "/dev/tty", W_LL_READ_FILE | W_LL_WRITE_FILE, handled);
   if (s->fs_root) bad |= w_ll_allow(rs, s->fs_root, s->fs_ro ? (W_LL_READ_FILE | W_LL_READ_DIR) : handled, handled);
+  /* OpenSSL's trust store may be named by the environment */
+  {
+    char *cf = w_sb_real(getenv("SSL_CERT_FILE")), *cd = w_sb_real(getenv("SSL_CERT_DIR"));
+    bad |= w_ll_allow(rs, cf, W_LL_READ_FILE, handled);
+    bad |= w_ll_allow(rs, cd, W_LL_READ_FILE | W_LL_READ_DIR, handled);
+    free(cf); free(cd);
+  }
   if (s->exec) {
     char *tmp = w_sb_tmpdir();
     bad |= w_ll_allow(rs, tmp, handled, handled);
@@ -212,6 +259,11 @@ static int w_seccomp(const WSandboxSpec *s, char *err, size_t en) {
   W_SB(BPF_JMP | BPF_JEQ | BPF_K, W_SB_ARCH, 1, 0);
   W_SB(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM, 0, 0);
   W_SB(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr), 0, 0);
+#if defined(__x86_64__)
+  /* x32 system calls (numbers with bit 30 set) would get past the checks below */
+  W_SB(BPF_JMP | BPF_JGE | BPF_K, 0x40000000, 0, 1);
+  W_SB(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM, 0, 0);
+#endif
   if (!s->exec) {
     W_SB(BPF_JMP | BPF_JEQ | BPF_K, __NR_execve, 0, 1);
     W_SB(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM, 0, 0);
@@ -221,17 +273,28 @@ static int w_seccomp(const WSandboxSpec *s, char *err, size_t en) {
 #endif
   }
   if (!s->net) {
-    /* socket(domain, ...): refuse AF_INET and AF_INET6; Unix sockets stay */
-    W_SB(BPF_JMP | BPF_JEQ | BPF_K, __NR_socket, 0, 4);
+    /* io_uring can open sockets without the socket system call */
+#ifdef __NR_io_uring_setup
+    W_SB(BPF_JMP | BPF_JEQ | BPF_K, __NR_io_uring_setup, 0, 1);
+    W_SB(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM, 0, 0);
+#endif
+    /* socket(domain, ...) and socketpair: Unix sockets only */
+    W_SB(BPF_JMP | BPF_JEQ | BPF_K, __NR_socket, 1, 0);
+    W_SB(BPF_JMP | BPF_JEQ | BPF_K, __NR_socketpair, 0, 4);
     W_SB(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0]), 0, 0);
-    W_SB(BPF_JMP | BPF_JEQ | BPF_K, AF_INET, 1, 0);
-    W_SB(BPF_JMP | BPF_JEQ | BPF_K, AF_INET6, 0, 1);
+    W_SB(BPF_JMP | BPF_JEQ | BPF_K, AF_UNIX, 1, 0);
     W_SB(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EACCES, 0, 0);
+    W_SB(BPF_RET | BPF_K, SECCOMP_RET_ALLOW, 0, 0);
   }
   W_SB(BPF_RET | BPF_K, SECCOMP_RET_ALLOW, 0, 0);
 #undef W_SB
   struct sock_fprog prog = { (unsigned short)n, f };
-  if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 || prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) != 0) {
+  if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
+    snprintf(err, en, "cannot set no_new_privs: %s", strerror(errno));
+    return -1;
+  }
+  if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) != 0) {
+    if (errno == EINVAL) return 1; /* no seccomp filters here (an emulator, say) */
     snprintf(err, en, "cannot install the seccomp filter: %s", strerror(errno));
     return -1;
   }

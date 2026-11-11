@@ -47,7 +47,7 @@ dune exec vela -- build examples/repos.vela -o repos && ./repos --grant net=api.
 
 | Command | What it does |
 | --- | --- |
-| `vela run FILE [--native] [--grant net=HOST[:PORT]\|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST[:PORT]]... [--grant env=NAME\|*]... [--grant exec=PROGRAM\|*]... [--grant foreign=LIB\|*]... [--seed N] [-- ARGS...]` | Type-check, then run `main` in the interpreter, or compiled with `--native`. Stdout, Stdin, Clock and Rand are always granted; Net, Fs, Listen, Env, Exec and Foreign only when granted, by flags or by `[grants]` in vela.toml. `--seed` makes `Rand` repeatable; arguments after `--` are `root.args()`. The exit status is 0, 1 after a panic or an `Err` from `main`, or the `Int` that `main` returns. |
+| `vela run FILE [--native] [--grant net=HOST[:PORT]\|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST[:PORT]]... [--grant env=NAME\|*]... [--grant exec=PROGRAM\|*]... [--grant foreign=LIB\|*]... [--seed N] [--no-sandbox] [-- ARGS...]` | Type-check, then run `main` in the interpreter, or compiled with `--native`. Stdout, Stdin, Clock and Rand are always granted; Net, Fs, Listen, Env, Exec and Foreign only when granted, by flags or by `[grants]` in vela.toml. `--seed` makes `Rand` repeatable; arguments after `--` are `root.args()`. The exit status is 0, 1 after a panic or an `Err` from `main`, or the `Int` that `main` returns. |
 | `vela build FILE [-o OUT] [--emit-c]` | Compile to a native binary through C. The binary takes the same `--grant` flags. `--emit-c` writes the C instead. |
 | `vela check FILE [--json]` | Type-check only. `--json` emits diagnostics with codes, spans, notes and machine-applicable fixes. |
 | `vela caps FILE [--json]` | List each function's authority: the capabilities in its signature, or `pure`. |
@@ -110,6 +110,10 @@ fn main(root: Root) {
 ```
 
 `Int`, `Int32`, `Float`, `Bool`, `Str` and `Bytes` (a pointer lent for the call), `Handle` (an opaque `void *`) and `Out[T]` out-parameters cross the boundary. Natively the library is linked with `-l<lib>`; the interpreter loads it with `dlopen`, so both backends run the same programs. C code runs with the process's full authority, so the foreign grant is treated as full trust: `vela run` warns when it is given, a dependency may call C only if vela.toml names it in `[trust] foreign = [...]` (recorded in vela.lock, so an update that starts calling new C libraries stops the build), and `vela check` lists every part of the program that calls C. The right shape is a small module that wraps the C calls in a safe API, like the `sql` module, which the standard library trusts with SQLite so programs using it grant only an `Fs`. SPEC.md section 9 has the type table, the ownership rules and the limits (no variadics, callbacks or structs by value).
+
+## The sandbox
+
+Every program also runs in an operating-system sandbox made from its grants, in both backends: files only under the `Fs` directory (plus system locations for reading), no network without `Net` or `Listen`, no other programs without `Exec`. That keeps C code reached through `foreign`, and any runtime bug, inside the grants too. Host and program allowlists stay in Vela; the kernel enforces the coarse lines. macOS uses a sandbox profile and Linux uses Landlock plus seccomp (run on arm64; x86-64 is compiled but not run). `--no-sandbox` turns it off for debugging. SPEC.md section 9 has the details.
 
 ## Modules, packages and the standard library
 
