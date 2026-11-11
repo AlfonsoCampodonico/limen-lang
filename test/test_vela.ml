@@ -2817,7 +2817,7 @@ fn main(root: Root) -> Result[(), IoError] {
   errs "trailing-in-match" (trail "    let xs = [1]\n    match xs.map { |x| x }.len() {\n        _ => out.print(\"no\"),\n    }") [ "E0003" ];
   errs "trailing-extra-arg" (trail "    let k = [1].map(|x| x) { |x| x }") [ "E0107" ];
   errs "trailing-not-closure-param" (trail "    let k = [1].len { 1 }") [ "E0107" ];
-  errs "trailing-after-labels-fills-last" (trail "    let n = apply(times: 1, n: 2) { |v| v }\n    let m = apply(times: 1, |v| v, n: 2)") [ "E0115" ];
+  errs "trailing-after-labels-fills-last" (trail "    let n = apply(times: 1, n: 2) { |v| v }\n    let m = apply(times: 1, |v| v, n: 2)") [ "E0122" ];
   (* fmt keeps the form written; empty parentheses before a trailing closure go *)
   let fmt_case_early name src want =
     let got = try Fmt.format ~file:(name ^ ".vela") src with Diag.Fatal d -> "error: " ^ d.message in
@@ -3930,18 +3930,32 @@ true {"a": 2, "b": 1} [5, 9]
 
   (* ---------- pipes: `x |> f(a)` is `f(x, a)` ---------- *)
   out "pipe-basic" {|use list
+
 struct Acc {
     total: Int,
+}
+
 fn add(self: Acc, n: Int, k: Int) -> Acc { Acc { total: self.total + n * k } }
+
 fn double(x: Int) -> Int { x * 2 }
+
 fn plus(x: Int, y: Int) -> Int { x + y }
+
 fn evens(xs: List[Int]) -> List[Int] { xs.filter(|x| x % 2 == 0) }
+
 fn total(xs: List[Int]) -> Int { xs.fold(0, |a, b| a + b) }
+
 fn parse(s: Str) -> Result[Int, Str] {
     if s == "" { Err("empty") } else { Ok(s.len()) }
+}
+
 fn twice(s: Str) -> Result[Int, Str] {
     let n = s |> parse()?
     Ok(n |> plus(n))
+}
+
+fn main(root: Root) {
+    let out = root.stdout
     out.print("{3 |> double |> plus(1)}")
     let t = [1, 2, 3, 4, 5, 6]
         |> evens
@@ -3957,6 +3971,8 @@ fn twice(s: Str) -> Result[Int, Str] {
     // strings and lists move through the pipeline without leaking
     let s = "a,b,c".split(",") |> evens_str
     out.print(s)
+}
+
 fn evens_str(xs: List[Str]) -> Str { xs.join("+") }
 |} "7\n12 25 6\n50\n[\"fig\", \"pear\", \"apple\"] 1\n40\nOk(6) Err(\"empty\")\na+b+c\n";
   errs "pipe-not-callable" (main_wrap "    let x = 3 |> 4") [ "E0003" ];
@@ -3965,18 +3981,33 @@ fn evens_str(xs: List[Str]) -> Str { xs.join("+") }
   errs "pipe-type" "fn plus(x: Int, y: Int) -> Int { x + y }\n\nfn main(root: Root) {\n    let x = \"a\" |> plus(1)\n}\n" [ "E0201" ];
   (* a line may start with `|>`, but not with another binary operator *)
   errs "pipe-newline" (main_wrap "    let x = 3\n        |> double\n}\n\nfn double(x: Int) -> Int {\n    x * 2") [];
+
   (* ---------- copy with changes: `{ p with x: 1 }` ---------- *)
   let with_src = {|struct User {
+    name: Str,
+    tags: List[Str],
+    age: Int,
+}
+
 struct Pair[A, B] {
     first: A,
     second: B,
+}
+
 fn older(u: User) -> User { { u with age: u.age + 1 } }
+
 fn make(out: Stdout) -> User {
     out.print("make")
     User { name: "m", tags: [], age: 0 }
+}
+
 fn side(out: Stdout, n: Int) -> Int {
     out.print("side {n}")
     n
+}
+
+fn main(root: Root) {
+    let out = root.stdout
     let a = User { name: "ann", tags: ["x"], age: 30 }
     let b = { a with name: "bob" }
     out.print("{a} {b}")
@@ -3995,6 +4026,7 @@ fn side(out: Stdout, n: Int) -> Int {
         let mut t = u.tags
         t.push("t{i}")
         u = { u with age: u.age + i, tags: t }
+    }
     let rename = |n: Str| { u with name: n }
     out.print("{u} {rename("other").name} {u.name}")
     let users = [a, b].map(|x| { x with tags: [] })
@@ -4003,7 +4035,9 @@ fn side(out: Stdout, n: Int) -> Int {
         u with
         name: "multi",
         age: 99,
+    }
     out.print("{multi.name} {multi.age}")
+}
 |} in
   out "with-copy" with_src
     "User { name: \"ann\", tags: [\"x\"], age: 30 } User { name: \"bob\", tags: [\"x\"], age: 30 }\n30 31\nUser { name: \"bob\", tags: [\"y\", \"z\"], age: 1 } User { name: \"cy\", tags: [\"y\", \"z\"], age: 1 }\nmake\nside 7\nPair { first: 1, second: \"uno\" } 7\nUser { name: \"loop\", tags: [\"t0\", \"t1\", \"t2\"], age: 3 } other loop\n[User { name: \"ann\", tags: [], age: 30 }, User { name: \"bob\", tags: [], age: 30 }]\nmulti 99\n";
@@ -4031,28 +4065,41 @@ fn side(out: Stdout, n: Int) -> Int {
   errs "with-unknown-base" (main_wrap "    let q = { nope with x: 1 }") [ "E0101" ];
   (* `with` only starts a copy right after the base, followed by a field *)
   errs "with-not-a-copy" (main_wrap "    let with = 1\n    let x = { with }\n    out.print(\"{x}\")") [];
+
   (* ---------- guards in match arms ---------- *)
   out "match-guard" {|enum Shape {
     Circle(Float),
     Rect(Float, Float),
+}
+
 enum Msg {
     Text(Str),
     Batch(List[Str]),
+}
+
 fn size(o: Option[Int]) -> Str {
     match o {
         Some(n) if n > 10 => "big {n}",
         Some(n) if n < 0 => "negative",
         Some(n) => "small {n}",
         None => "none",
+    }
+}
+
 fn kind(s: Shape) -> Str {
     match s {
         Rect(w, h) if w == h => "square",
         Rect(_, _) => "rect",
         c if false => "never",
         Circle(r) => "circle {r}",
+    }
+}
+
 fn seen(out: Stdout, tag: Str, ok: Bool) -> Bool {
     out.print("guard {tag}")
     ok
+}
+
 // heap payloads bound for a guard that fails are released
 fn describe(m: Msg) -> Str {
     match m {
@@ -4061,6 +4108,11 @@ fn describe(m: Msg) -> Str {
         Batch(xs) if xs.contains("stop") => "stop in {xs}",
         Text(s) => "text {s}",
         Batch(xs) => "batch of {xs.len()}",
+    }
+}
+
+fn main(root: Root) {
+    let out = root.stdout
     out.print("{size(Some(42))} {size(Some(-1))} {size(Some(3))} {size(None)}")
     out.print("{kind(Rect(2.0, 2.0))} {kind(Rect(1.0, 2.0))} {kind(Circle(1.5))}")
     // guards run in order, only until an arm applies
@@ -4069,14 +4121,18 @@ fn describe(m: Msg) -> Str {
         n if seen(out, "b", n > 3) => "b",
         n if seen(out, "c", true) => "c",
         _ => "none",
+    }
     out.print(r)
     for m in [Text("hi"), Text("hello"), Batch([]), Batch(["go", "stop"]), Batch(["x"])] {
         out.print(describe(m))
+    }
     let pair = ("hello", 3)
     let t = match pair {
         (s, k) if s.len() > k => "long {s}",
         (s, _) => "short {s}",
+    }
     out.print(t)
+}
 |} "big 42 negative small 3 none\nsquare rect circle 1.5\nguard a\nguard b\nb\ntext hi\nlong text hello\nempty batch\nstop in [\"go\", \"stop\"]\nbatch of 1\nlong hello\n";
   (* a guarded arm covers nothing, so the match must still be exhaustive *)
   errs "match-guard-not-exhaustive" "fn f(o: Option[Int]) -> Int {\n    match o {\n        Some(n) if n > 0 => n,\n        None => 0,\n    }\n}\n" [ "E0204" ];
@@ -4086,12 +4142,19 @@ fn describe(m: Msg) -> Str {
   errs "match-guard-unbound" "fn f(o: Option[Int]) -> Int {\n    match o {\n        Some(n) if m > 0 => n,\n        _ => 0,\n    }\n}\n" [ "E0101" ];
   (let _, ds, _ = compile "match-guard-fix" "fn f(o: Option[Int]) -> Int {\n    match o {\n        Some(n) if n > 0 => n,\n        None => 0,\n    }\n}\n" in
    ok "match-guard-fix" (List.exists (fun (d : Diag.t) -> d.message = "`match` does not cover `Some(_)`") ds) (String.concat "; " (List.map (fun (d : Diag.t) -> d.message) ds)));
+
   (* ---------- safe navigation: `a?.b` on an Option ---------- *)
   out "safe-nav" {|struct Address {
+    city: Str,
     zip: Option[Str],
     lines: List[Str],
+}
+
 struct User {
+    name: Str,
     address: Option[Address],
+}
+
 fn find(id: Int) -> Option[User] {
     if id == 1 {
         Some(User { name: "ann", address: Some(Address { city: "Rome", zip: None, lines: ["Via Roma 1"] }) })
@@ -4099,24 +4162,41 @@ fn find(id: Int) -> Option[User] {
         Some(User { name: "bob", address: None })
     } else {
         None
+    }
+}
+
 fn shout(self: Str) -> Str { self.to_upper() }
+
 // `?` after a chain applies to the whole chain: None returns early
 fn city_len(id: Int) -> Option[Int] {
     let n = find(id)?.address?.city.len()?
     Some(n * 10)
+}
+
 fn parse(s: Str) -> Result[User, Str] {
     if s == "" { Err("empty") } else { Ok(User { name: s, address: None }) }
+}
+
 // `(e?).name` is try-then-field; `e?.name` would be safe navigation
 fn name_of(s: Str) -> Result[Str, Str] {
     Ok((parse(s)?).name)
+}
+
 fn upto(o: Option[Int]) -> Option[List[Int]] {
     Some(0..<o?)
+}
+
 fn upto2(o: Option[Int]) -> Option[List[Int]] {
     Some(o?..<3)
+}
+
+fn main(root: Root) {
+    let out = root.stdout
     for id in [1, 2, 3] {
         let u = find(id)
         out.print("{u?.name ?? "nobody"} {u?.address?.city ?? "unknown"} {u?.name.shout().len()} {u?.address?.zip ?? "-"} {u?.address?.lines.get(0)}")
         out.print("{city_len(id)}")
+    }
     let t: Option[(Int, Str)] = Some((1, "x"))
     out.print("{t?.1} {t?.0 ?? 0}")
     let xs: Option[List[Int]] = Some([1, 2, 3])
@@ -4130,12 +4210,14 @@ fn upto2(o: Option[Int]) -> Option[List[Int]] {
     let get_city = |id: Int| find(id)?.address?.city ?? "?"
     out.print("{get_city(1)} {get_city(2)}")
     out.print("{name_of("zed")} {name_of("")} {upto(Some(3))} {upto2(Some(1))} {upto(None)}")
+}
 |} "ann Rome Some(3) - Some(\"Via Roma 1\")\nSome(40)\nbob unknown Some(3) - None\nNone\nnobody unknown None - None\nNone\nSome(\"x\") 1\nSome([2, 4, 6]) Some(2) Some(3) None\nSome(\"Rome\")\nRome ?\nOk(\"zed\") Err(\"empty\") Some([0, 1, 2]) Some([1, 2]) None\n";
   errs "safe-nav-not-option" (main_wrap "    let n = 5\n    let x = n?.abs()") [ "E0201" ];
   errs "safe-nav-result" "fn parse(s: Str) -> Result[Int, Str] {\n    Ok(1)\n}\n\nfn f() -> Result[Int, Str] {\n    let n = parse(\"x\")?.abs()\n    Ok(1)\n}\n" [ "E0201" ];
   errs "safe-nav-unknown-field" "struct P {\n    x: Int,\n}\n\nfn main(root: Root) {\n    let p = Some(P { x: 1 })\n    let y = p?.y\n}\n" [ "E0103" ];
   errs "safe-nav-assign" "struct P {\n    x: Int,\n}\n\nfn main(root: Root) {\n    let mut p = Some(P { x: 1 })\n    p?.x = 2\n}\n" [ "E0209"; "E0201" ];
   errs "safe-nav-type" "struct P {\n    x: Int,\n}\n\nfn main(root: Root) {\n    let p = Some(P { x: 1 })\n    let y: Int = p?.x\n}\n" [ "E0201" ];
+
   (* ---------- tuples and maps ---------- *)
   out "tuples" (example "tuples.vela") "3 2 (2, 1)\n(1, \"one\", 1.5) 1 one 1.5 (2, \"a\")\n4 ((1, 2), (3, (4, 5)))\n1 3 4 5\na1 b2 c3 \nyes zero yes no 7\ntrue false 6\n";
   out "maps" (example "maps.vela") "{\"the\": 3, \"cat\": 1, \"and\": 2, \"hat\": 1, \"bat\": 1} 5 3 None\n[\"the\", \"cat\", \"and\", \"hat\", \"bat\"] [3, 1, 2, 1, 1]\nthe=3 and=2 \n{\"the\": 100, \"and\": 2, \"hat\": 1, \"bat\": 1, \"zebra\": 9}\n{\"the\": 3, \"cat\": 1, \"and\": 2, \"hat\": 1, \"bat\": 1}\ntrue false false\n{1: 1, 2: 4, 3: 9} true false 0\n1 {\"a\": 1}\nyes\n";
