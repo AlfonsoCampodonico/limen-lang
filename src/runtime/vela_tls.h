@@ -35,6 +35,12 @@ enum { VTLS_READ, VTLS_WRITE, VTLS_HANDSHAKE };
 #define VTLS_WANT_WRITE (-2)
 #define VTLS_ERROR (-3)
 
+/* A stream that ends without the peer's close message (close_notify) may
+   have been cut short by an attacker, so it is an error with this exact
+   message; Net.get accepts it when the response's own framing shows it is
+   complete. The interpreter has the same text (Caps.tls_cut). */
+#define VTLS_CUT_MSG "tls: the connection was closed without a TLS close message, so the data may be cut short"
+
 static SSL_CTX *vtls_client_ctx;
 static char vtls_client_err[256];
 static pthread_once_t vtls_once = PTHREAD_ONCE_INIT;
@@ -56,10 +62,6 @@ static void vtls_common(SSL_CTX *c) {
   long opts = SSL_OP_NO_COMPRESSION;
 #ifdef SSL_OP_NO_RENEGOTIATION
   opts |= SSL_OP_NO_RENEGOTIATION;
-#endif
-#ifdef SSL_OP_IGNORE_UNEXPECTED_EOF
-  /* many servers close without close_notify; HTTP frames its own bodies */
-  opts |= SSL_OP_IGNORE_UNEXPECTED_EOF;
 #endif
   SSL_CTX_set_options(c, opts);
 }
@@ -168,6 +170,15 @@ static void vtls_fail(VTls *t, int e, char *err, size_t en) {
   ERR_clear_error();
 }
 
+/* The peer closed the socket without a close message (OpenSSL 3 reports
+   it as an error; 1.1.1 as a system error with no errno). */
+static int vtls_is_cut(int e) {
+#ifdef SSL_R_UNEXPECTED_EOF_WHILE_READING
+  if (e == SSL_ERROR_SSL && ERR_GET_REASON(ERR_peek_last_error()) == SSL_R_UNEXPECTED_EOF_WHILE_READING) return 1;
+#endif
+  return e == SSL_ERROR_SYSCALL && errno == 0 && ERR_peek_last_error() == 0;
+}
+
 /* One non-blocking step. VTLS_READ returns the bytes read, 0 at the end of
    the stream; VTLS_WRITE the bytes written (at least 1); VTLS_HANDSHAKE 0
    once the handshake is done. Otherwise VTLS_WANT_READ / VTLS_WANT_WRITE
@@ -185,6 +196,11 @@ static int vtls_step(VTls *t, int op, void *buf, int n, char *err, size_t en) {
     if (e == SSL_ERROR_WANT_READ) res = VTLS_WANT_READ;
     else if (e == SSL_ERROR_WANT_WRITE) res = VTLS_WANT_WRITE;
     else if (e == SSL_ERROR_ZERO_RETURN && op == VTLS_READ) res = 0;
+    else if (vtls_is_cut(e)) {
+      snprintf(err, en, "%s", op == VTLS_HANDSHAKE ? "tls: the connection was closed during the handshake" : VTLS_CUT_MSG);
+      ERR_clear_error();
+      res = VTLS_ERROR;
+    }
     else if (e == SSL_ERROR_ZERO_RETURN) {
       snprintf(err, en, op == VTLS_HANDSHAKE ? "tls: the connection was closed during the handshake" : "tls: the peer closed the connection");
       res = VTLS_ERROR;

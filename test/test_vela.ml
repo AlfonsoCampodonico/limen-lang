@@ -189,6 +189,7 @@ let check_tsan name ?(grants = Interp.no_grants) ?feed src want =
         @ List.concat_map (fun h -> [ "--grant"; "net=" ^ h ]) grants.Interp.net
         @ List.concat_map (fun h -> [ "--grant"; "listen=" ^ h ]) grants.Interp.listen
         @ List.concat_map (fun h -> [ "--grant"; "exec=" ^ h ]) grants.Interp.exec
+        @ ("--" :: grants.Interp.args)
       in
       let o = exe ^ ".out" and e = exe ^ ".err" in
       let cmd =
@@ -1770,8 +1771,9 @@ fn main(root: Root) -> Result[(), IoError] {
         g.go(|| serve(untrusted, 1))
         g.go(|| serve(other, 1))
         g.go(|| {
+            // read the client's hello first, so closing sends no reset
             match plain.accept() {
-                Ok(c) => c.close(),
+                Ok(c) => { let _ = c.read(); c.close() },
                 Err(_) => {},
             }
             ""
@@ -1904,6 +1906,55 @@ fn main(root: Root) -> Result[(), IoError] {
   let tls_http_want = "forever: Failed(\"listener is closed\")\nstream: Failed(\"listener is closed\")\n200 GET /x HTTP/1.1 body=\n200 POST /y HTTP/1.1 body=hello\n200 chunked one two three\n200 Some(\"text/plain; charset=utf-8\") GET /net?q=1 HTTP/1.1 body=\n3\nFailed(\"http: the URL must start with http:// or https://\")\n" in
   out "tls-http" ~grants:tls_grants tls_http_src tls_http_want;
   check_tsan "tls-http" ~grants:tls_grants tls_http_src tls_http_want;
+  (* A TLS stream that ends without the close message may have been cut
+     short: Conn.read says so, and Net.get accepts it only when the response
+     is framed (Content-Length or chunked) and complete. *)
+  let tls_cut_src = {v|fn main(root: Root) {
+    let out = root.stdout
+    let port = root.args()[0]
+    let net = root.net
+    match net.get("https://127.0.0.1:{port}/framed") {
+        Ok(r) => out.print("{r.status} {r.body}"),
+        Err(e) => out.print("{e}"),
+    }
+    match net.get("https://127.0.0.1:{port}/close") {
+        Ok(r) => out.print("{r.status} {r.body}"),
+        Err(e) => out.print("{e}"),
+    }
+    match net.connect_tls("127.0.0.1:{port}") {
+        Ok(c) => {
+            let _ = c.write("GET /raw HTTP/1.1\r\n\r\n")
+            let mut got = ""
+            let mut last = Ok("")
+            let mut open = true
+            while open {
+                match c.read() {
+                    Ok(s) => if s == "" { open = false } else { got = got + s },
+                    Err(e) => { last = Err(e); open = false },
+                }
+            }
+            c.close()
+            out.print("{got.len()} {last}")
+        },
+        Err(e) => out.print("{e}"),
+    }
+}
+|v} in
+  let tls_cut_want =
+    "200 hello\nFailed(\"tls: the connection was closed without a TLS close message, so the data may be cut short\")\n30 Err(Failed(\"tls: the connection was closed without a TLS close message, so the data may be cut short\"))\n"
+  in
+  (if selected "tls-cut" then
+     let runs = if native_for "tls-cut" then 9 else 3 in
+     let ic =
+       Unix.open_process_args_in "python3"
+         [| "python3"; Filename.concat tls_dir "cut_server.py"; Filename.concat tls_dir "server.pem";
+            Filename.concat tls_dir "server-key.pem"; string_of_int runs |]
+     in
+     let port = String.trim (input_line ic) in
+     let grants = { Interp.no_grants with net = [ "127.0.0.1" ]; args = [ port ] } in
+     out "tls-cut" ~grants tls_cut_src tls_cut_want;
+     check_tsan "tls-cut" ~grants tls_cut_src tls_cut_want;
+     ignore (Unix.close_process_in ic));
   (* ---------- Rand, Env, args and the Fs additions ---------- *)
   let box = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "vela-box-%d" (Unix.getpid ())) in
   (try Unix.mkdir box 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());

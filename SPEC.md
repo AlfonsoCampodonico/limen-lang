@@ -574,7 +574,7 @@ let l = root.listen.on_tls("0.0.0.0:8443", cert, key)?
 - How this fits the capabilities: the certificate and key are plain text, so the program reads them with whatever capability holds them (usually `Fs`, or `Env` for secrets passed in the environment) and passes the text on. Serving TLS needs only the `Listen` grant for the address; there is no separate grant and no path the runtime opens behind the program's back.
 - A server connection does its handshake during its first `read` or `write`, so `accept()` never waits for a slow client, and a failed handshake is that `read`'s error. A client connection has done its handshake when `connect_tls` returns.
 - Handshakes, reads and writes park the task like plain socket operations; no worker thread blocks. Cancellation (a group deadline) works the same.
-- TLS 1.2 or later. Clients do not send certificates and servers do not ask for them. `close()` sends the TLS close message; a peer that closes without one reads as the end of the stream.
+- TLS 1.2 or later. Clients do not send certificates and servers do not ask for them. `close()` sends the TLS close message. A peer that closes without one may have been cut off by someone in between, so that `read` is `Err(Failed("tls: the connection was closed without a TLS close message, so the data may be cut short"))` rather than `""`. `Net.get` and the `http` client still accept such a response when its `Content-Length` or chunked body shows it is complete, and refuse one whose body runs until the close.
 - Errors from TLS start with `tls: `. Both backends use the same TLS code, so they verify and fail alike.
 
 #### TLS library

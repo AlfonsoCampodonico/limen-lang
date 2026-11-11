@@ -766,6 +766,7 @@ module Sock = struct
               let b = Buffer.create 4096 in
               let rec go () =
                 match read sk with
+                | Error (Caps.Failed m) when m = Caps.tls_cut -> Caps.parse_http ~cut:true (Buffer.contents b)
                 | Error e -> Error e
                 | Ok "" -> Caps.parse_http (Buffer.contents b)
                 | Ok s ->

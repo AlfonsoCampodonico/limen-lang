@@ -3166,7 +3166,10 @@ static void w_http_free(WHttp *h) {
 }
 static WIo w_http_fail(WHttp *h, const char *m) { w_http_free(h); return io_err(2, m); }
 
-static WIo w_http_parse(const char *d, int64_t n) {
+/* cut: the TLS stream ended without a close message (this is its error
+   text), so a body that runs until the close may be incomplete and is
+   refused; one framed by Content-Length or chunks is checked as usual. */
+static WIo w_http_parse(const char *d, int64_t n, const char *cut) {
   /* bounded, so a hostile server cannot make the header merging quadratic */
   int64_t e = w_find_bytes(d, n < 65536 + 4 ? n : 65536 + 4, "\r\n\r\n", 0);
   if (e > 65536 || (e < 0 && n > 65536)) return io_err(2, "http: response headers larger than 64 KiB");
@@ -3264,7 +3267,8 @@ static WIo w_http_parse(const char *d, int64_t n) {
     if (!ok) return w_http_fail(h, "http: bad Content-Length");
     if (rn < len) return w_http_fail(h, "http: truncated body");
     h->body = Str_from(raw, len);
-  } else h->body = Str_from(raw, rn);
+  } else if (cut) return w_http_fail(h, cut);
+  else h->body = Str_from(raw, rn);
   return io_ok_ptr(h);
 }
 
@@ -3301,11 +3305,18 @@ static WIo Cap_net_get(WCap *n, WStr *url_s) {
     WBuf b; buf_init(&b);
     for (;;) {
       WIo k = Cap_conn_read(conn);
+#ifdef VELA_TLS
+      if (k.kind != 0 && https && k.msg->len == (int64_t)strlen(VTLS_CUT_MSG) && memcmp(k.msg->data, VTLS_CUT_MSG, strlen(VTLS_CUT_MSG)) == 0) {
+        r = w_http_parse(b.p, b.len, VTLS_CUT_MSG);
+        Str_drop(k.msg);
+        break;
+      }
+#endif
       if (k.kind != 0) { r = k; break; }
       int64_t got = k.val->len;
       buf_putn(&b, k.val->data, got);
       Str_drop(k.val);
-      if (got == 0) { r = w_http_parse(b.p, b.len); break; }
+      if (got == 0) { r = w_http_parse(b.p, b.len, NULL); break; }
       if (b.len > W_MAX_RESPONSE) { r = io_err(2, "net: the response is larger than 64 MiB"); break; }
     }
     free(b.p);

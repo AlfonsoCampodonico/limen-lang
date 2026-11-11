@@ -133,7 +133,13 @@ let dechunk data =
   go 0
 
 (* (status, headers in order, body) *)
-let parse_http data : (int * (string * string) list * string, ioerr) result =
+(* The error text of a TLS stream that ended without the peer's close
+   message (VTLS_CUT_MSG in runtime/vela_tls.h). *)
+let tls_cut = "tls: the connection was closed without a TLS close message, so the data may be cut short"
+
+(* [cut]: the stream ended that way, so a body that runs until the close may
+   be incomplete and is refused; a framed one is checked as usual. *)
+let parse_http ?(cut = false) data : (int * (string * string) list * string, ioerr) result =
   match Interp_util.find_sub data "\r\n\r\n" 0 with
   | Some e when e > max_head -> Error (Failed "http: response headers larger than 64 KiB")
   | None when String.length data > max_head -> Error (Failed "http: response headers larger than 64 KiB")
@@ -180,7 +186,7 @@ let parse_http data : (int * (string * string) list * string, ioerr) result =
             else
               let n = int_of_string cl in
               if String.length raw < n then Error (Failed "http: truncated body") else Ok (String.sub raw 0 n)
-          | _ -> Ok raw
+          | _ -> if cut then Error (Failed tls_cut) else Ok raw
         in
         match body with Ok b -> Ok (status, hs, b) | Error e -> Error e)))
 
