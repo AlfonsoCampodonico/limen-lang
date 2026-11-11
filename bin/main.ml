@@ -89,11 +89,15 @@ let run_tests_native items names =
    | Error m -> prerr_string m; prerr_endline "vela: the C compiler failed (this is a bug in vela)"; exit 1);
   let results =
     List.mapi
-      (fun i name ->
+      (fun i (name, takes_fs) ->
         let err = exe ^ ".err" in
         let fd = Unix.openfile err [ Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC ] 0o600 in
-        let pid = Unix.create_process exe [| exe; string_of_int i |] Unix.stdin Unix.stdout fd in
+        (* a test that takes Fs gets a fresh directory, removed afterwards *)
+        let dir = if takes_fs then Some (Caps.test_dir ()) else None in
+        let grant = match dir with Some d -> [| "--grant"; "fs=" ^ d |] | None -> [||] in
+        let pid = Unix.create_process exe (Array.append [| exe; string_of_int i |] grant) Unix.stdin Unix.stdout fd in
         let _, status = Unix.waitpid [] pid in
+        Option.iter Caps.remove_tree dir;
         Unix.close fd;
         let text = In_channel.with_open_bin err In_channel.input_all in
         match status with
@@ -120,10 +124,10 @@ let run_tests_native items names =
 let cmd_test file native =
   let items, diags, _ = load file in
   if diags <> [] then (report diags; exit 1);
-  let names = List.filter_map (function Ast.IFn { fn_test = Some n; _ } -> Some n | _ -> None) items in
-  if names = [] then (print_endline "no tests"; exit 0);
+  let tests = List.filter_map (function Ast.IFn ({ fn_test = Some n; _ } as d) -> Some (n, Caps.takes_fs d) | _ -> None) items in
+  if tests = [] then (print_endline "no tests"; exit 0);
   let results =
-    if native then run_tests_native items names
+    if native then run_tests_native items tests
     else
       List.map
         (fun (n, r) -> (n, match r with Ok () -> Ok () | Error (m, sp) -> Error (m, where_of sp)))

@@ -444,6 +444,7 @@ let item c (it : item) =
   | IFn ({ fn_test = Some name; _ } as d) ->
     new_line c 0;
     add c ("test \"" ^ escape name ^ "\" ");
+    if d.fn_params <> [] then add c ("(" ^ String.concat ", " (List.map (fun p -> p.prm_name ^ ": " ^ ty p.prm_ty) d.fn_params) ^ ") ");
     block c 0 d.fn_body;
     trailing c d.fn_body.bspan.hi
   | IFn d ->

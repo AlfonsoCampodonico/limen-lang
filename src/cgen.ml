@@ -1095,14 +1095,17 @@ let program (g : Lower.gctx) (prog : I.program) : string =
     mp "static void wtest_entry_(void* a) {";
     mp "  (void)a;";
     mp "  switch (wtest_index_) {";
-    List.iteri (fun i t -> mp (sprintf "    case %d: %s(); break;" i t)) prog.tests;
+    List.iteri
+      (fun i (t, fields) ->
+        mp (sprintf "    case %d: %s(%s); break;" i t (String.concat ", " (List.map (sprintf "Cap_root_field(NULL, %S)") fields))))
+      prog.tests;
     mp "  }";
     mp "  w_main_finished();";
     mp "}";
     mp "int main(int argc, char** argv) {";
     mp "  if (argc < 2) return 2;";
     mp "  wtest_index_ = atoi(argv[1]);";
-    mp "  w_seed_hash();";
+    mp "  w_init(argc - 1, argv + 1);   /* `--grant fs=DIR` for a test that takes Fs */";
     mp "  w_run(wtest_entry_, NULL);";
     mp "  fflush(stdout);";
     mp "  w_leakcheck();";

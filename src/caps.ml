@@ -207,3 +207,19 @@ let make_dir fs rel : (unit, ioerr) result =
     | Ok p -> (
       try Unix.mkdir p 0o755; Ok ()
       with Unix.Unix_error (e, _, _) -> Error (Failed (sprintf "fs: `%s`: %s" rel (Unix.error_message e))))
+
+(* ---------- test directories ----------
+   A test that takes `fs: Fs` gets a fresh directory, removed afterwards. *)
+
+let test_dir () = Unix.realpath (Filename.temp_dir "vela-test-" "")
+
+let rec remove_tree p =
+  match Unix.lstat p with
+  | { Unix.st_kind = Unix.S_DIR; _ } ->
+    Array.iter (fun n -> remove_tree (Filename.concat p n)) (try Sys.readdir p with Sys_error _ -> [||]);
+    (try Unix.rmdir p with Unix.Unix_error _ -> ())
+  | _ -> ( try Unix.unlink p with Unix.Unix_error _ -> ())
+  | exception Unix.Unix_error _ -> ()
+
+(* Does the test (its parameter types) take Fs? *)
+let takes_fs (d : Ast.fn_decl) = List.exists (fun (p : Ast.param) -> match p.prm_ty.tdesc with Ast.TyName ("Fs", _) -> true | _ -> false) d.fn_params

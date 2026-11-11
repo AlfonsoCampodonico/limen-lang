@@ -2360,7 +2360,9 @@ static WIo Cap_conn_write(WCap *c, WStr *s) {
 /* ---------- Exec: run another program ----------
    The allowlist holds program names exactly as granted (`git`, `/usr/bin/env`)
    or `*`. Arguments go to the program as a list; no shell is involved. The
-   child gets /dev/null as stdin, our environment and working directory. Its
+   child gets /dev/null as stdin, our working directory, and only the
+   environment variables granted with `--grant env=` (plus PATH), so Exec
+   cannot read past the Env grant. Its
    stdout comes through a pipe the task waits on without blocking a worker;
    its stderr goes to an unlinked temporary file, so a child that fills one
    stream while we wait on the other cannot deadlock. */
@@ -2397,21 +2399,53 @@ static WIo Cap_exec_run(WCap *x, WStr *prog_s, L_Str *args) {
   const char *tmp = getenv("TMPDIR");
   char tpl[1024];
   snprintf(tpl, sizeof tpl, "%s/vela-exec-XXXXXX", tmp && tmp[0] ? tmp : "/tmp");
+  /* Descriptors are close-on-exec from birth where the system allows, so a
+     program spawned at the same moment by another worker cannot inherit our
+     pipe and hold it open; on macOS the spawn closes everything else anyway. */
+#ifdef __APPLE__
   int errfd = mkstemp(tpl);
+#else
+  int errfd = mkostemp(tpl, O_CLOEXEC);
+#endif
   if (errfd >= 0) unlink(tpl);
   int out[2] = { -1, -1 };
+  char **envp = NULL; int nenvp = 0;
   WIo res;
+#ifdef __APPLE__
   if (errfd < 0 || pipe(out) != 0) { res = w_errno_io(); goto done; }
   fcntl(errfd, F_SETFD, FD_CLOEXEC);
   fcntl(out[0], F_SETFD, FD_CLOEXEC);
   fcntl(out[1], F_SETFD, FD_CLOEXEC);
+#else
+  if (errfd < 0 || pipe2(out, O_CLOEXEC) != 0) { res = w_errno_io(); goto done; }
+#endif
+  /* the child's environment: PATH and the variables the Env grant names */
+  for (char **e = environ; *e; e++) nenvp++;
+  envp = (char **)w_raw(sizeof(char *) * (size_t)(nenvp + 1));
+  nenvp = 0;
+  for (char **e = environ; *e; e++) {
+    const char *eq = strchr(*e, '=');
+    if (!eq) continue;
+    size_t kl = (size_t)(eq - *e);
+    bool keep = kl == 4 && strncmp(*e, "PATH", 4) == 0;
+    for (int i = 0; i < g_nenv && !keep; i++)
+      keep = strcmp(g_env[i], "*") == 0 || (strlen(g_env[i]) == kl && strncmp(g_env[i], *e, kl) == 0);
+    if (keep) envp[nenvp++] = *e;
+  }
+  envp[nenvp] = NULL;
   posix_spawn_file_actions_t fa;
   posix_spawn_file_actions_init(&fa);
   posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
   posix_spawn_file_actions_adddup2(&fa, out[1], 1);
   posix_spawn_file_actions_adddup2(&fa, errfd, 2);
+  posix_spawnattr_t sa;
+  posix_spawnattr_init(&sa);
+#ifdef POSIX_SPAWN_CLOEXEC_DEFAULT
+  posix_spawnattr_setflags(&sa, POSIX_SPAWN_CLOEXEC_DEFAULT);
+#endif
   pid_t pid;
-  int rc = posix_spawnp(&pid, prog, &fa, NULL, argv, environ);
+  int rc = posix_spawnp(&pid, prog, &fa, &sa, argv, envp);
+  posix_spawnattr_destroy(&sa);
   posix_spawn_file_actions_destroy(&fa);
   close(out[1]); out[1] = -1;
   if (rc != 0) {
@@ -2451,6 +2485,7 @@ done:
   if (out[0] >= 0) close(out[0]);
   if (out[1] >= 0) close(out[1]);
   if (errfd >= 0) close(errfd);
+  free(envp);
   for (int64_t i = 0; i <= args->len; i++) free(argv[i]);
   free(argv);
   return res;

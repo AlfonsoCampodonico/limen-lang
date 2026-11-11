@@ -826,6 +826,14 @@ fn client(net: Net, port: Int, k: Int) -> Int {
 |} in
   out "exec-group" ~grants:sh exec_group "[17, 27, 37, 47, 57, 67]\n";
   check_tsan "exec-group" ~grants:sh exec_group "[17, 27, 37, 47, 57, 67]\n";
+  (* the child sees PATH and only the variables the Env grant names *)
+  let env_src = main_wrap {|    match root.exec.run("sh", ["-c", "echo $\{HOME:+home\} $\{PATH:+path\} $\{VELA_SECRET_TEST:-none\}"]) {
+        Ok(r) => out.write(r.stdout),
+        Err(e) => out.print("{e}"),
+    }|} in
+  Unix.putenv "VELA_SECRET_TEST" "s3cret";
+  out "exec-env-filtered" ~grants:sh env_src "path none\n";
+  out "exec-env-granted" ~grants:{ sh with env = [ "HOME"; "VELA_SECRET_TEST" ] } env_src "home path s3cret\n";
   errs "exec-ambient" "fn main(root: Root) { system(\"ls\") }" [ "E0302" ];
 
   (* ---------- capabilities at runtime ---------- *)
@@ -1028,6 +1036,67 @@ test "channels" {
       ok "vela-test-native" (got = want) (String.concat "; " (List.map (fun (n, m) -> n ^ "=" ^ Option.value ~default:"ok" m) got))
   end;
   errs "vela-test-duplicate" "test \"a\" {}\ntest \"a\" {}" [ "E0106" ];
+
+  (* tests can ask for a fresh directory as `fs: Fs` and the real clock *)
+  let cap_tests = {|fn save(fs: Fs, name: Str, n: Int) -> Result[(), IoError] {
+    fs.write(name, "{n}")
+}
+
+test "saves a file" (fs: Fs) {
+    assert_eq(fs.list(""), Ok([]))
+    assert(save(fs, "a.txt", 42).is_ok())
+    assert(fs.make_dir("sub").is_ok())
+    assert(fs.write("sub/b.txt", "x").is_ok())
+    assert_eq(fs.read("a.txt"), Ok("42"))
+    assert(fs.read("../escape").is_err())
+}
+
+test "each test starts empty" (fs: Fs, clock: Clock) {
+    assert_eq(fs.list(""), Ok([]))
+    assert(clock.now_ms() > 1700000000000)
+}
+
+test "clock only" (c: Clock) {
+    let a = c.now_ms()
+    assert(c.now_ms() >= a)
+}
+
+test "fails with a dir" (fs: Fs) {
+    assert(fs.write("x", "1").is_ok())
+    assert_eq(fs.list(""), Ok([]))
+}
+|} in
+  let items, ds, _ = compile "vela-test-caps" cap_tests in
+  ok "vela-test-caps-checks" (ds = []) (String.concat "," (codes ds));
+  let want =
+    [ ("saves a file", None); ("each test starts empty", None); ("clock only", None);
+      ("fails with a dir", Some "assertion failed: Ok([\"x\"]) != Ok([])") ]
+  in
+  let before = Array.length (Sys.readdir (Filename.get_temp_dir_name ())) in
+  let got = List.map (fun (n, r) -> (n, match r with Ok () -> None | Error (m, _) -> Some m)) (Interp.run_tests ~out:ignore items) in
+  ok "vela-test-caps-interp" (got = want) (String.concat "; " (List.map (fun (n, m) -> n ^ "=" ^ Option.value ~default:"ok" m) got));
+  ok "vela-test-caps-cleanup" (Array.length (Sys.readdir (Filename.get_temp_dir_name ())) = before) "test directories left behind";
+  if native_for "vela-test-caps" then begin
+    let exe = Filename.concat tmpdir "vela-test-caps" in
+    match Native.build ~flags:sanitize ~tests:true items exe with
+    | Error m -> ok "vela-test-caps-native" false m
+    | Ok () ->
+      List.iteri
+        (fun i (n, w) ->
+          let dir = Caps.test_dir () in
+          let e = exe ^ ".err" in
+          let code =
+            Sys.command
+              (sprintf "ASAN_OPTIONS=detect_leaks=0 VELA_LEAKCHECK=1 %s %d --grant fs=%s 2>%s" (Filename.quote exe) i (Filename.quote dir) (Filename.quote e))
+          in
+          Caps.remove_tree dir;
+          let err = read_file e in
+          match w with
+          | None -> ok ("vela-test-caps-native/" ^ n) (code = 0 && err = "vela-leakcheck: 0 live\n") (sprintf "exit %d, stderr %S" code err)
+          | Some m -> ok ("vela-test-caps-native/" ^ n) (code <> 0 && String.starts_with ~prefix:("panic: " ^ m) err) (sprintf "exit %d, stderr %S" code err))
+        want
+  end;
+  errs "vela-test-bad-cap" "test \"x\" (n: Net) {}\ntest \"y\" (a: Fs, b: Fs) {}\ntest \"z\" (c: Clock, d: Int) {}" [ "E0306"; "E0306"; "E0306" ];
 
   (* ---------- language server ---------- *)
   let module J = Json in

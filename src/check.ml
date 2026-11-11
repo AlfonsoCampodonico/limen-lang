@@ -1317,7 +1317,7 @@ let check_self ctx d ps =
     d.fn_params;
   match (d.fn_params, ps) with
   | { prm_name = "self"; prm_span; _ } :: _, t0 :: _ when d.fn_test = None -> (
-    let builtin n = List.mem n [ "Option"; "Result"; "IoError" ] in
+    let builtin n = List.mem n [ "Option"; "Result"; "IoError"; "ProcessOutput" ] in
     match t0 with
     | TNamed (n, _) when (Hashtbl.mem ctx.structs n || Hashtbl.mem ctx.enums n) && not (builtin n) -> ()
     | TErr -> ()
@@ -1451,6 +1451,24 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
         if Hashtbl.mem seen_tests n then err ctx "E0106" d.fn_span (sprintf "test \"%s\" is defined more than once" n);
         Hashtbl.replace seen_tests n ()
       | None -> ())
+    sigs;
+  (* E0306: a test's parameters are capabilities the runner provides *)
+  List.iter
+    (fun ((d : fn_decl), (s : fsig)) ->
+      if d.fn_test <> None then
+        ignore
+          (List.fold_left2
+             (fun seen (p : param) t ->
+               match repr t with
+               | (TCap Fs | TCap Clock) as c when not (List.mem c seen) -> c :: seen
+               | TErr -> seen
+               | t ->
+                 err ctx "E0306" p.prm_span
+                   (if List.mem t seen then sprintf "a test can take `%s` only once" (show t)
+                    else sprintf "a test cannot take `%s`" (show t))
+                   ~notes:[ "a test can take `fs: Fs` (a fresh temporary directory) and `clock: Clock`; pass anything else through an interface" ];
+                 seen)
+             [] d.fn_params s.ps))
     sigs;
   (* 4. main *)
   List.iter (fun (d, s) -> if d.fn_name = "main" then check_main ctx d s) sigs;

@@ -445,14 +445,15 @@ end
 
 (* ---------- processes ----------
    Same rules as the native runtime: the program name must be granted exactly
-   (or `*`), arguments go as a list with no shell, stdin is /dev/null, stdout
+   (or `*`), arguments go as a list with no shell, the child's environment is
+   PATH plus the variables the Env grant names, stdin is /dev/null, stdout
    comes through a pipe this task waits on, stderr through an unlinked
    temporary file. A child killed by signal N exits with 128 + N. *)
 module Proc = struct
   let permits allowed p = List.mem "*" allowed || List.mem p allowed
   let only allowed p = if (p = "*" && List.mem "*" allowed) || (p <> "*" && permits allowed p) then [ p ] else []
 
-  let run allowed prog args : (int * string * string, Caps.ioerr) result =
+  let run ~env_grant allowed prog args : (int * string * string, Caps.ioerr) result =
     if String.contains prog '\000' then Error (Caps.Failed "exec: the program name contains a NUL byte")
     else if List.exists (fun a -> String.contains a '\000') args then Error (Caps.Failed "exec: an argument contains a NUL byte")
     else if not (permits allowed prog) then Error (Caps.Denied (sprintf "exec: `%s` is not granted" prog))
@@ -465,7 +466,16 @@ module Proc = struct
         let devnull = Unix.openfile "/dev/null" [ Unix.O_RDONLY; Unix.O_CLOEXEC ] 0 in
         let rd, wr = Unix.pipe ~cloexec:true () in
         let close_all fds = List.iter (fun fd -> try Unix.close fd with Unix.Unix_error _ -> ()) fds in
-        match Unix.create_process prog (Array.of_list (prog :: args)) devnull wr errfd with
+        let env =
+          Array.of_list
+            (List.filter
+               (fun kv ->
+                 match String.index_opt kv '=' with
+                 | Some i -> let k = String.sub kv 0 i in k = "PATH" || List.mem "*" env_grant || List.mem k env_grant
+                 | None -> false)
+               (Array.to_list (Unix.environment ())))
+        in
+        match Unix.create_process_env prog (Array.of_list (prog :: args)) env devnull wr errfd with
         | exception Unix.Unix_error (e, _, _) ->
           close_all [ rd; wr; errfd; devnull ];
           Error (Caps.Failed (sprintf "exec: cannot run `%s`: %s" prog (Unix.error_message e)))
@@ -926,7 +936,7 @@ and cap_call rt c name args =
     let args = Array.to_list (Array.map (function VStr a -> a | _ -> failwith "internal: exec argument") args) in
     io_result
       (fun (code, o, e) -> VStruct ("ProcessOutput", [ ("code", vint code); ("stdout", VStr o); ("stderr", VStr e) ]))
-      (Proc.run allowed p args)
+      (Proc.run ~env_grant:rt.grants.env allowed p args)
   | _ -> failwith ("internal: capability method " ^ name)
 
 (* The status a process exits with when `main` returns [n]: the low 8 bits,
@@ -1001,9 +1011,19 @@ let run_tests ~out (user_items : item list) : (string * (unit, string * Span.t) 
       | IFn ({ fn_test = Some name; _ } as d) ->
         Queue.clear runq;
         let finished = ref false in
+        (* capabilities the test asked for: a fresh directory as Fs, the real Clock *)
+        let dir = if Caps.takes_fs d then Some (Caps.test_dir ()) else None in
+        let args =
+          List.map
+            (fun (p : param) ->
+              match (p.prm_ty.tdesc, dir) with
+              | TyName ("Fs", _), Some dir -> VCap (CFs { Caps.root = Some dir; ro = false })
+              | _ -> VCap CClock)
+            d.fn_params
+        in
         let r =
           try
-            spawn_fiber (fun () -> ignore (call_fn rt d []); finished := true);
+            spawn_fiber (fun () -> ignore (call_fn rt d args); finished := true);
             schedule (fun () -> !finished) d.fn_span;
             Ok ()
           with
@@ -1011,6 +1031,7 @@ let run_tests ~out (user_items : item list) : (string * (unit, string * Span.t) 
           | Stack_overflow -> Error ("stack overflow", d.fn_span)
         in
         Queue.clear runq;
+        Option.iter Caps.remove_tree dir;
         Some (name, r)
       | _ -> None)
     user_items

@@ -528,6 +528,13 @@ let parse_generics st =
 
 let test_count = ref 0
 
+let parse_param st =
+  let pn, psp = expect_ident st in
+  if not (is_sym st ":") then
+    raise (Diag.Fatal (Diag.make "E0008" psp (Printf.sprintf "parameter `%s` needs a type, for example `%s: Int`" pn pn)));
+  ignore (advance st);
+  { prm_name = pn; prm_span = psp; prm_ty = parse_type st }
+
 let parse_item st =
   let t = peek st in
   match t.tok with
@@ -540,11 +547,13 @@ let parse_item st =
       | STR [ Lit n ] -> n
       | _ -> raise (Diag.Fatal (Diag.make "E0003" s.span "a test name must be a plain string, without interpolation"))
     in
+    (* optional capabilities the runner hands the test: `(fs: Fs, clock: Clock)` *)
+    let params = if accept_sym st "(" then comma_list st ")" parse_param else [] in
     let body = parse_block st in
     incr test_count;
     (* the generated name cannot be written in source, so tests cannot be called *)
     IFn
-      { fn_name = Printf.sprintf "test#%d" !test_count; fn_span = s.span; fn_gen = []; fn_params = []; fn_ret = None;
+      { fn_name = Printf.sprintf "test#%d" !test_count; fn_span = s.span; fn_gen = []; fn_params = params; fn_ret = None;
         fn_body = body; fn_test = Some name; fn_pub = false; fn_bounds = [] }
   | KW "fn" ->
     ignore (advance st);
@@ -553,17 +562,7 @@ let parse_item st =
     let gen = List.map fst bgen in
     let bounds = List.filter (fun (_, b) -> b <> []) bgen in
     ignore (expect_sym st "(");
-    let params =
-      comma_list st ")" (fun st ->
-          let pn, psp = expect_ident st in
-          if not (is_sym st ":") then
-            raise
-              (Diag.Fatal
-                 (Diag.make "E0008" psp
-                    (Printf.sprintf "parameter `%s` needs a type, for example `%s: Int`" pn pn)));
-          ignore (advance st);
-          { prm_name = pn; prm_span = psp; prm_ty = parse_type st })
-    in
+    let params = comma_list st ")" parse_param in
     let ret = if accept_sym st "->" then Some (parse_type st) else None in
     let body = parse_block st in
     IFn { fn_name = name; fn_span = nsp; fn_gen = gen; fn_params = params; fn_ret = ret; fn_body = body; fn_test = None; fn_pub = false; fn_bounds = bounds }

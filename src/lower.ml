@@ -888,7 +888,11 @@ let lower_program ?(tests = false) (user_items : item list) : I.program * gctx =
     (Prelude.items () @ user_items);
   Hashtbl.iter (fun v ens -> match ens with [ en ] -> Hashtbl.replace g.ctors v en | _ -> ()) owners;
   let test_names =
-    if tests then List.filter_map (function IFn ({ fn_test = Some _; _ } as d) -> Some (instance g d.fn_name []) | _ -> None) user_items
+    let field (p : param) = match p.prm_ty.tdesc with TyName ("Fs", _) -> "fs" | _ -> "clock" in
+    if tests then
+      List.filter_map
+        (function IFn ({ fn_test = Some _; _ } as d) -> Some (instance g d.fn_name [], List.map field d.fn_params) | _ -> None)
+        user_items
     else []
   in
   let main_decl =
