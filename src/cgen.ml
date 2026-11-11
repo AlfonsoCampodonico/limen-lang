@@ -7,6 +7,12 @@ module I = Ir
 
 let sprintf = Printf.sprintf
 
+(* Set when the program calls something that may need TLS (Net.get,
+   Net.connect_tls, Listen.on_tls). The output then starts with
+   [tls_marker], and Native links OpenSSL and pastes in the TLS core. *)
+let uses_tls = ref false
+let tls_marker = "/* vela: uses tls */\n"
+
 type ctx = {
   g : Lower.gctx;
   names : (string, string) Hashtbl.t; (* show t -> C name *)
@@ -603,6 +609,7 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
         (sprintf "({ WProc *p_ = (WProc*)r_.ptr; %s v_ = { p_->code, p_->out, p_->err }; free(p_); v_; })" (ctype c po))
     | "cap_only", _ -> set (sprintf "Cap_net_only(%s, %s)" (arg 0) (arg 1))
     | "cap_get", _ ->
+      uses_tls := true;
       let ht = TNamed ("HttpResponse", []) and mt = TMap (TStr, TStr) in
       io_result
         (sprintf "Cap_net_get(%s, %s)" (arg 0) (arg 1))
@@ -616,6 +623,10 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     | "cap_on", _ -> io_result (sprintf "Cap_listen_on(%s, %s)" (arg 0) (arg 1)) "(WCap*)r_.ptr"
     | "cap_accept", _ -> io_result (sprintf "Cap_accept(%s)" (arg 0)) "(WCap*)r_.ptr"
     | "cap_connect", _ -> io_result (sprintf "Cap_net_connect(%s, %s)" (arg 0) (arg 1)) "(WCap*)r_.ptr"
+    | "cap_connect_tls", _ -> uses_tls := true; io_result (sprintf "Cap_net_connect_tls(%s, %s)" (arg 0) (arg 1)) "(WCap*)r_.ptr"
+    | "cap_on_tls", _ ->
+      uses_tls := true;
+      io_result (sprintf "Cap_listen_on_tls(%s, %s, %s, %s)" (arg 0) (arg 1) (arg 2) (arg 3)) "(WCap*)r_.ptr"
     | "cap_port", _ -> set (sprintf "(int64_t)(%s)->port" (arg 0))
     | "cap_close", _ -> line (sprintf "Cap_sock_close(%s);" (arg 0)); set "0"
     | "cap_read", _ -> io_result (sprintf "Cap_fs_read(%s, %s)" (arg 0) (arg 1)) "r_.val"
@@ -1180,6 +1191,7 @@ and cmp_defs c p =
 (* ---------- program ---------- *)
 
 let program (g : Lower.gctx) (prog : I.program) : string =
+  uses_tls := false;
   let c =
     { g; names = Hashtbl.create 32; types = []; lits = Hashtbl.create 32; lit_order = []; boxed = [];
       envs = Hashtbl.create 16; uniq = []; task_tys = []; inrange = []; chan_tys = []; dyns = []; cell_tys = [];
@@ -1313,7 +1325,8 @@ let program (g : Lower.gctx) (prog : I.program) : string =
   List.iter
     (fun (n, s) -> Buffer.add_string lits (sprintf "static WStr %s = { 0, %d, (char*)%s };\n" n (String.length s) (c_string s)))
     c.lit_order;
-  String.concat "\n"
+  (if !uses_tls then tls_marker else "")
+  ^ String.concat "\n"
     [ Runtime_text.text; "/* ---- types ---- */"; Buffer.contents types; "/* ---- literals ---- */";
       Buffer.contents lits; "/* ---- closures ---- */"; Buffer.contents envs; Buffer.contents tasks; "/* ---- functions ---- */";
       Buffer.contents protos; "/* ---- dyn vtables ---- */"; Buffer.contents dynbuf; Buffer.contents bodies; Buffer.contents main ]

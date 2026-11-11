@@ -98,7 +98,7 @@ let max_head = 65536 (* bytes before the blank line *)
 let max_headers = 1000
 
 let http_request (u : url) =
-  let host = if u.port = 80 then u.host else sprintf "%s:%d" u.host u.port in
+  let host = if u.port = (if u.https then 443 else 80) then u.host else sprintf "%s:%d" u.host u.port in
   sprintf "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: vela\r\nAccept: */*\r\nConnection: close\r\n\r\n" u.path host
 
 let trim_sp s =
