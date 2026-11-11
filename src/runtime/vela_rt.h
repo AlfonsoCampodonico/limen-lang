@@ -762,6 +762,21 @@ static WStr *Int_to_char(int64_t n) {
   else { b[0] = (char)(0xF0 | (n >> 18)); b[1] = (char)(0x80 | ((n >> 12) & 0x3F)); b[2] = (char)(0x80 | ((n >> 6) & 0x3F)); b[3] = (char)(0x80 | (n & 0x3F)); k = 4; }
   return Str_from(b, k);
 }
+/* Fixed-point text with [d] decimals (clamped to 0..30), rounded as printf
+   does; the interpreter uses the same printf. */
+static WStr *Float_to_fixed(double x, int64_t d) {
+  if (isnan(x)) return Str_from("nan", 3);
+  if (isinf(x)) return x > 0 ? Str_from("inf", 3) : Str_from("-inf", 4);
+  if (d < 0) d = 0;
+  if (d > 30) d = 30;
+  int n = snprintf(NULL, 0, "%.*f", (int)d, x);
+  WStr *s = Str_new(n);
+  char *b = (char *)malloc((size_t)n + 1);
+  snprintf(b, (size_t)n + 1, "%.*f", (int)d, x);
+  memcpy(s->data, b, (size_t)n);
+  free(b);
+  return s;
+}
 /* A decimal float: digits with optional sign, point and exponent; no hex, nan or inf. */
 static bool Str_parse_float(WStr *s, double *out) {
   int64_t a = 0, b = s->len;

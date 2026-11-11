@@ -300,6 +300,21 @@ let () =
     ^ main_wrap "    out.print(\"{find([5, 6, 7], 7)} {find([1], 9)}\")")
     "2 -1\n";
   (* ownership stress: each also runs natively under ASan with a leak check *)
+  (* a list made inside a loop (here by a fused filter) is not hoisted out of it *)
+  out "hoist-list-declared-in-loop"
+    {v|fn main(root: Root) {
+    let mut i = 0
+    let mut n = 0
+    while i < 3 {
+        if i > 0 {
+            n = n + "abcd".bytes().filter(|c| c > 97 + i).len()
+        }
+        i = i + 1
+    }
+    root.stdout.print("{n}")
+}
+|v}
+    "3\n";
   out "recursive-enum"
     ({|enum Tree { Leaf, Node(Tree, Int, Tree) }
 fn insert(t: Tree, v: Int) -> Tree {
@@ -1354,6 +1369,322 @@ fn main(root: Root) {
     "use json\n\nfn main(root: Root) {\n    for s in [\"\\{\\\"a\\\": [1, 2.5e1, \\\"\\\\u0041\\\"]\\}\", \"[1 2]\", \"\\\"\\\\x\\\"\"] {\n        match json.parse(s) {\n            Ok(v) => root.stdout.print(json.stringify(v)),\n            Err(e) => root.stdout.print(e),\n        }\n    }\n}\n"
     "{\"a\":[1,25,\"A\"]}\nexpected `,` or `]` at byte 3\nexpected a valid escape at byte 1\n";
 
+  out "std-format"
+    {v|use format
+
+fn main(root: Root) {
+    let out = root.stdout
+    out.print("{3.14159.to_fixed(2)} {2.5.to_fixed(0)} {(-0.001).to_fixed(2)} {1e21.to_fixed(1)} {(0.0 / 0.0).to_fixed(2)} {1.005.to_fixed(2)} {7.0.to_fixed(-3)}")
+    out.print("{format.hex(255)} {format.hex(-1)} {format.base(255, 2)} {format.base(-9223372036854775807 - 1, 16)} {format.base(35, 36)}")
+    out.print("{format.parse_base("ff", 16)} {format.parse_base("-8000000000000000", 16)} {format.parse_base("8000000000000000", 16)} {format.parse_base("12z", 10)} {format.parse_base("-", 10)}")
+    out.print("{format.thousands(1234567)} {format.thousands(-999)} {format.thousands(-1000)} {format.grouped(1234567.891.to_fixed(2), "_")} {format.grouped("12", ",")}")
+    out.print("{format.zero_pad(-7, 4)} {format.zero_pad(42, 5)} {format.zero_pad(12345, 3)} {format.percent(0.4567, 1)}")
+    out.print("[{format.align_left("é", 3)}][{format.align_right("ab", 4)}][{format.align_center("ab", 5)}][{format.align_right("long", 2)}]")
+}
+|v}
+    "3.14 2 -0.00 1000000000000000000000.0 nan 1.00 7\nff -1 11111111 -8000000000000000 z\nSome(255) Some(-9223372036854775808) None None None\n1,234,567 -999 -1,000 1_234_567.89 12\n-007 00042 12345 45.7%\n[\195\169  ][  ab][ ab  ][long]\n";
+  out "std-time"
+    {v|use time
+
+fn show(s: Str) -> Str {
+    match time.parse_iso(s) {
+        Ok(ms) => "{ms} {time.iso(ms)}",
+        Err(e) => e,
+    }
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let t = 1762885325123
+    out.print(time.iso(t))
+    out.print("{time.parts(t)}")
+    out.print(time.iso(0) + " " + time.iso(-1) + " " + time.iso(time.date(2000, 2, 29)) + " " + time.iso(time.date(-1, 12, 31)) + " " + time.iso(time.date(10000, 1, 1)))
+    out.print("{time.parts(-1)}")
+    out.print(time.format(t, "%a %d %b %Y %I:%M %p, day %j, week day %u, %s %z %Z %% %q 100%"))
+    out.print(time.format_at(t, -330, "%Y-%m-%d %H:%M %Z %z") + " " + time.iso_at(t, 60) + " " + time.iso_date(t))
+    out.print(time.iso(time.add_months(time.date(2024, 1, 31) + time.hours(5), 1)) + " " + time.iso(time.add_months(time.date(2024, 3, 15), -14)) + " " + time.iso(time.date(2024, 13, 1)) + " " + time.iso(time.date(2024, 3, 0)))
+    for s in ["2026-11-11", "2026-11-11T18:22:05.123Z", "2026-11-11 19:22:05,123456+01:00", "2026-11-11t13:22-0500", "1969-12-31T23:59:59.999Z", "2024-02-29T00:00+05", "2023-02-29", "2026-13-01", "2026-11-11T24:00", "2026-11-11T18", "2026-11-11T18:22:05.Z", "2026-11-11T18:22Zx", "26-11-11", "2026-11-11T18:22+0130x"] {
+        out.print(show(s))
+    }
+    out.print("{time.is_leap_year(1900)} {time.is_leap_year(2000)} {time.days_in_month(2023, 2)} {time.month_name(13)} {time.weekday_name(7)}")
+    let p = time.parts(t)
+    out.print("{time.from_parts(p) == t} {time.from_parts(time.DateTime { year: 2026, month: 1, day: 1, hour: 25, minute: 0, second: 0, ms: 0, weekday: 0, yday: 0 })}")
+}
+|v}
+    "2025-11-11T18:22:05.123Z\ntime.DateTime { year: 2025, month: 11, day: 11, hour: 18, minute: 22, second: 5, ms: 123, weekday: 2, yday: 315 }\n1970-01-01T00:00:00.000Z 1969-12-31T23:59:59.999Z 2000-02-29T00:00:00.000Z -000001-12-31T00:00:00.000Z +010000-01-01T00:00:00.000Z\ntime.DateTime { year: 1969, month: 12, day: 31, hour: 23, minute: 59, second: 59, ms: 999, weekday: 3, yday: 365 }\nTue 11 Nov 2025 06:22 PM, day 315, week day 2, 1762885325 +0000 UTC % %q 100%\n2025-11-11 12:52 -05:30 -0530 2025-11-11T19:22:05.123+01:00 2025-11-11\n2024-02-29T05:00:00.000Z 2023-01-15T00:00:00.000Z 2025-01-01T00:00:00.000Z 2024-02-29T00:00:00.000Z\n1794355200000 2026-11-11T00:00:00.000Z\n1794421325123 2026-11-11T18:22:05.123Z\n1794421325123 2026-11-11T18:22:05.123Z\n1794421320000 2026-11-11T18:22:00.000Z\n-1 1969-12-31T23:59:59.999Z\n1709146800000 2024-02-28T19:00:00.000Z\ntime: day 29 is out of range for 2023-02\ntime: month 13 is out of range\ntime: 24:00:00 is not a valid time\ntime: expected `:` at byte 13\ntime: expected digits at byte 20\ntime: expected `Z`, an offset or end of input at byte 16\ntime: expected a four-digit year at byte 0\ntime: expected end of input at byte 21\nfalse true 28 ? Sunday\ntrue 1767315600000\n";
+  out "std-report-example" (example "report.vela")
+    "Mon 09 Nov caf\195\169        1,234.50\nTue 10 Nov books          98.12\nWed 11 Nov rent    1,500,000.00\n                   1,501,332.62\norder #000042, id 0xbeef\ndue 2026-12-01T08:30:00.000Z, week 2026-305\nprinted in true\n";
+  out "std-regex"
+    {v|use regex
+
+fn show(p: Str, s: Str) -> Str {
+    match regex.compile(p) {
+        Ok(r) => match r.find(s) {
+            Some(m) => "{p} on {s}: {m.text} at {m.start}..{m.end} {m.groups}",
+            None => "{p} on {s}: no match",
+        },
+        Err(e) => e,
+    }
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    out.print(show("a+b", "xaaab"))
+    out.print(show("(\\d+)-(\\d+)?", "tel 12- or 3-4"))
+    out.print(show("a|ab", "ab"))
+    out.print(show("(?i)hello", "say HeLLo"))
+    out.print(show("x*", "abc"))
+    out.print(show("é+.", "aééz"))
+    out.print(show("[^a]", "aé"))
+    out.print(show("\\bfoo\\b", "foobar foo"))
+    out.print(show("a\{2,3\}?", "aaaa"))
+    out.print(show("(a*)*b", "aaab"))
+    out.print(show("[", "x"))
+    out.print(show("a)", "x"))
+    out.print(show("(?=a)", "x"))
+    out.print(show("*a", "x"))
+    let r = regex.must("(?P<y>\\d\{4\})-(?P<m>\\d\\d)")
+    out.print("{r.matches("2026-11")} {r.matches("2026-11x")} {regex.must("a|ab").matches("ab")}")
+    let m = r.find("on 2026-11-11") ?? regex.Match { text: "", start: 0, end: 0, groups: [], names: [] }
+    out.print("{m.named("y")} {m.named("m")} {m.named("z")} {m.capture(5)}")
+    out.print("{regex.must("\\d+").find_all("a1b22c333").map(|m| m.text)}")
+    out.print("{regex.must("a*").find_all("baaac").map(|m| "{m.start}:{m.text}")}")
+    out.print(r.replace("from 2026-11 to 2027-01", "$\{m\}/$y $$1"))
+    out.print(regex.must("o").replace_first("foo", "0"))
+    out.print(regex.must("\\w+").replace_with("hi there", |m| m.text.to_upper()))
+    out.print("{regex.must(",\\s*").split("a, b,c,")} {regex.must("").split("abc")} {regex.must("x").split("")}")
+    out.print(regex.escape("1+1=2? (yes)"))
+    out.print("{regex.must("(?m)^\\w+$").find_all("one\ntwo\n").map(|m| m.text)} {regex.must("^\\w+$").find_all("one\ntwo").len()}")
+    // no catastrophic backtracking
+    let evil = regex.must("(a+)+$")
+    let mut s = ""
+    let mut i = 0
+    while i < 30 {
+        s = s + "a"
+        i = i + 1
+    }
+    out.print("{evil.matches(s + "b")} {evil.find(s + "b").map(|m| m.end)}")
+}
+|v}
+    "a+b on xaaab: aaab at 1..5 [Some(\"aaab\")]\n(\\d+)-(\\d+)? on tel 12- or 3-4: 12- at 4..7 [Some(\"12-\"), Some(\"12\"), None]\na|ab on ab: a at 0..1 [Some(\"a\")]\n(?i)hello on say HeLLo: HeLLo at 4..9 [Some(\"HeLLo\")]\nx* on abc:  at 0..0 [Some(\"\")]\n\195\169+. on a\195\169\195\169z: \195\169\195\169z at 1..6 [Some(\"\\195\\169\\195\\169z\")]\n[^a] on a\195\169: \195\169 at 1..3 [Some(\"\\195\\169\")]\n\\bfoo\\b on foobar foo: foo at 7..10 [Some(\"foo\")]\na{2,3}? on aaaa: aa at 0..2 [Some(\"aa\")]\n(a*)*b on aaab: aaab at 0..4 [Some(\"aaab\"), Some(\"aaa\")]\nregex: missing `]` at byte 0\nregex: unmatched `)`\nregex: unsupported group syntax (no lookaround or backreferences) at byte 0\nregex: a quantifier with nothing to repeat\ntrue false true\nSome(\"2026\") Some(\"11\") None None\n[\"1\", \"22\", \"333\"]\n[\"0:\", \"1:aaa\", \"5:\"]\nfrom 11/$y $1 to 01/$y $1\nf0o\nHI THERE\n[\"a\", \"b\", \"c\", \"\"] [\"a\", \"b\", \"c\"] [\"\"]\n1\\+1=2\\? \\(yes\\)\n[\"one\", \"two\"] 0\nfalse None\n";
+  out "std-logscan-example" (example "logscan.vela")
+    "09:15:02 GET  /index.html 200     5,120\n09:15:09 GET  /missing    404         0\nskipped: not a log line\n09:01:44 POST /api/orders 201 1,048,576\ntotal 1,053,696 bytes\ndue 01/12/2026, paid 30/11/2026\n[\"a\", \"b\", \"c\", \"d\"]\n";
+  panics "std-regex-must" "use regex\n\nfn main(root: Root) {\n    let r = regex.must(\"(a\")\n    root.stdout.print(r.pattern)\n}\n" "regex: missing `)`";
+  out "std-http-keepalive-stream" ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] }
+    {v|use http
+
+fn route(r: http.Request) -> http.Response {
+    if r.path == "/boom" {
+        let xs: List[Int] = []
+        http.text(200, "{xs[1]}")
+    } else {
+        http.text(200, "{r.method} {r.path} {r.version} body={r.body}")
+    }
+}
+
+fn stream(r: http.Request, c: Conn) -> Result[(), IoError] {
+    if r.path == "/fail" {
+        return Err(Failed("handler gave up"))
+    }
+    http.write_head(c, 200, [http.Header { name: "Content-Type", value: "text/plain" }])?
+    for w in ["one ", "two ", "", "three"] {
+        http.write_chunk(c, w)?
+    }
+    http.end_body(c)
+}
+
+// Send raw bytes, then read until the server closes the connection.
+fn raw(net: Net, port: Int, data: Str) -> Str {
+    match net.connect("127.0.0.1:{port}") {
+        Ok(c) => {
+            let _ = c.write(data)
+            let mut got = ""
+            let mut open = true
+            while open {
+                match c.read() {
+                    Ok(s) => if s == "" { open = false } else { got = got + s },
+                    Err(_) => { open = false },
+                }
+            }
+            c.close()
+            got.replace("\r\n", "|")
+        },
+        Err(e) => "{e}",
+    }
+}
+
+fn raw_client(net: Net, port: Int) -> Str {
+    let pipelined = "GET /a HTTP/1.1\r\nHost: x\r\n\r\nPOST /b HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2;ext=1\r\nde\r\n0\r\nX-Trailer: 1\r\n\r\nGET /boom HTTP/1.1\r\n\r\nGET /c HTTP/1.1\r\nConnection: close\r\n\r\n"
+    [
+        raw(net, port, pipelined),
+        raw(net, port, "GET /old HTTP/1.0\r\n\r\n"),
+        raw(net, port, "HEAD /h HTTP/1.1\r\nConnection: close\r\n\r\n"),
+        raw(net, port, "BAD\r\n\r\n"),
+    ].join("\n")
+}
+
+fn fetch_client(net: Net, p2: Int, p3: Int) -> Str {
+    let mut log = []
+    match http.get(net, "http://127.0.0.1:{p2}/x") {
+        Ok(r) => log.push("{r.status} {r.header("connection") ?? "-"} {r.body}"),
+        Err(e) => log.push("{e}"),
+    }
+    match http.post(net, "http://127.0.0.1:{p2}/y", "text/plain", "hello") {
+        Ok(r) => log.push("{r.status} {r.body}"),
+        Err(e) => log.push("{e}"),
+    }
+    match http.request_fold(net, "GET", "http://127.0.0.1:{p3}/s", [], "", "", |a, s| a + s) {
+        Ok((r, body)) => log.push("{r.status} {r.header("transfer-encoding") ?? "-"} {body}"),
+        Err(e) => log.push("{e}"),
+    }
+    match http.request_fold(net, "GET", "http://127.0.0.1:{p3}/s", [], "", 0, |n, s| n + s.len()) {
+        Ok((_, n)) => log.push("{n} bytes"),
+        Err(e) => log.push("{e}"),
+    }
+    match http.get(net, "http://127.0.0.1:{p3}/fail") {
+        Ok(r) => log.push("{r.status}"),
+        Err(e) => log.push("{e}"),
+    }
+    log.join("\n")
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let out = root.stdout
+    let net = root.net
+    let l = root.listen.on("127.0.0.1:0")?
+    let port = l.port()
+    let first = group g {
+        g.go(|| "served {http.serve(l, 4, route)}")
+        g.go(|| raw_client(net, port))
+    }
+    out.print(first.join("\n"))
+    let l2 = root.listen.on("127.0.0.1:0")?
+    let l3 = root.listen.on("127.0.0.1:0")?
+    let p2 = l2.port()
+    let p3 = l3.port()
+    let second = group g {
+        g.go(|| "forever: {http.serve_forever(l2, route)}")
+        g.go(|| "stream: {http.accept_forever(l3, |c| http.serve_stream(c, stream))}")
+        g.go(|| {
+            let log = fetch_client(net, p2, p3)
+            l2.close()
+            l3.close()
+            log
+        })
+    }
+    out.print(second.join("\n"))
+    Ok(())
+}
+|v}
+    "served 6\nHTTP/1.1 200 OK|Content-Type: text/plain; charset=utf-8|Connection: keep-alive|Content-Length: 21||GET /a HTTP/1.1 body=HTTP/1.1 200 OK|Content-Type: text/plain; charset=utf-8|Connection: keep-alive|Content-Length: 27||POST /b HTTP/1.1 body=abcdeHTTP/1.1 500 Internal Server Error|Content-Type: text/plain; charset=utf-8|Connection: keep-alive|Content-Length: 14||internal errorHTTP/1.1 200 OK|Content-Type: text/plain; charset=utf-8|Connection: close|Content-Length: 21||GET /c HTTP/1.1 body=\nHTTP/1.1 200 OK|Content-Type: text/plain; charset=utf-8|Connection: close|Content-Length: 23||GET /old HTTP/1.0 body=\nHTTP/1.1 200 OK|Content-Type: text/plain; charset=utf-8|Connection: close|Content-Length: 22||\nHTTP/1.1 400 Bad Request|Content-Type: text/plain; charset=utf-8|Connection: close|Content-Length: 12||bad request\n\nforever: Failed(\"listener is closed\")\nstream: Failed(\"listener is closed\")\n200 close GET /x HTTP/1.1 body=\n200 POST /y HTTP/1.1 body=hello\n200 chunked one two three\n13 bytes\nFailed(\"http: connection closed before the response\")\n";
+  check_tsan "std-http-keepalive-stream"
+    ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] }
+    {v|use http
+
+fn route(r: http.Request) -> http.Response {
+    if r.path == "/boom" {
+        let xs: List[Int] = []
+        http.text(200, "{xs[1]}")
+    } else {
+        http.text(200, "{r.method} {r.path} {r.version} body={r.body}")
+    }
+}
+
+fn stream(r: http.Request, c: Conn) -> Result[(), IoError] {
+    if r.path == "/fail" {
+        return Err(Failed("handler gave up"))
+    }
+    http.write_head(c, 200, [http.Header { name: "Content-Type", value: "text/plain" }])?
+    for w in ["one ", "two ", "", "three"] {
+        http.write_chunk(c, w)?
+    }
+    http.end_body(c)
+}
+
+// Send raw bytes, then read until the server closes the connection.
+fn raw(net: Net, port: Int, data: Str) -> Str {
+    match net.connect("127.0.0.1:{port}") {
+        Ok(c) => {
+            let _ = c.write(data)
+            let mut got = ""
+            let mut open = true
+            while open {
+                match c.read() {
+                    Ok(s) => if s == "" { open = false } else { got = got + s },
+                    Err(_) => { open = false },
+                }
+            }
+            c.close()
+            got.replace("\r\n", "|")
+        },
+        Err(e) => "{e}",
+    }
+}
+
+fn raw_client(net: Net, port: Int) -> Str {
+    let pipelined = "GET /a HTTP/1.1\r\nHost: x\r\n\r\nPOST /b HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2;ext=1\r\nde\r\n0\r\nX-Trailer: 1\r\n\r\nGET /boom HTTP/1.1\r\n\r\nGET /c HTTP/1.1\r\nConnection: close\r\n\r\n"
+    [
+        raw(net, port, pipelined),
+        raw(net, port, "GET /old HTTP/1.0\r\n\r\n"),
+        raw(net, port, "HEAD /h HTTP/1.1\r\nConnection: close\r\n\r\n"),
+        raw(net, port, "BAD\r\n\r\n"),
+    ].join("\n")
+}
+
+fn fetch_client(net: Net, p2: Int, p3: Int) -> Str {
+    let mut log = []
+    match http.get(net, "http://127.0.0.1:{p2}/x") {
+        Ok(r) => log.push("{r.status} {r.header("connection") ?? "-"} {r.body}"),
+        Err(e) => log.push("{e}"),
+    }
+    match http.post(net, "http://127.0.0.1:{p2}/y", "text/plain", "hello") {
+        Ok(r) => log.push("{r.status} {r.body}"),
+        Err(e) => log.push("{e}"),
+    }
+    match http.request_fold(net, "GET", "http://127.0.0.1:{p3}/s", [], "", "", |a, s| a + s) {
+        Ok((r, body)) => log.push("{r.status} {r.header("transfer-encoding") ?? "-"} {body}"),
+        Err(e) => log.push("{e}"),
+    }
+    match http.request_fold(net, "GET", "http://127.0.0.1:{p3}/s", [], "", 0, |n, s| n + s.len()) {
+        Ok((_, n)) => log.push("{n} bytes"),
+        Err(e) => log.push("{e}"),
+    }
+    match http.get(net, "http://127.0.0.1:{p3}/fail") {
+        Ok(r) => log.push("{r.status}"),
+        Err(e) => log.push("{e}"),
+    }
+    log.join("\n")
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let out = root.stdout
+    let net = root.net
+    let l = root.listen.on("127.0.0.1:0")?
+    let port = l.port()
+    let first = group g {
+        g.go(|| "served {http.serve(l, 4, route)}")
+        g.go(|| raw_client(net, port))
+    }
+    out.print(first.join("\n"))
+    let l2 = root.listen.on("127.0.0.1:0")?
+    let l3 = root.listen.on("127.0.0.1:0")?
+    let p2 = l2.port()
+    let p3 = l3.port()
+    let second = group g {
+        g.go(|| "forever: {http.serve_forever(l2, route)}")
+        g.go(|| "stream: {http.accept_forever(l3, |c| http.serve_stream(c, stream))}")
+        g.go(|| {
+            let log = fetch_client(net, p2, p3)
+            l2.close()
+            l3.close()
+            log
+        })
+    }
+    out.print(second.join("\n"))
+    Ok(())
+}
+|v}
+    "served 6\nHTTP/1.1 200 OK|Content-Type: text/plain; charset=utf-8|Connection: keep-alive|Content-Length: 21||GET /a HTTP/1.1 body=HTTP/1.1 200 OK|Content-Type: text/plain; charset=utf-8|Connection: keep-alive|Content-Length: 27||POST /b HTTP/1.1 body=abcdeHTTP/1.1 500 Internal Server Error|Content-Type: text/plain; charset=utf-8|Connection: keep-alive|Content-Length: 14||internal errorHTTP/1.1 200 OK|Content-Type: text/plain; charset=utf-8|Connection: close|Content-Length: 21||GET /c HTTP/1.1 body=\nHTTP/1.1 200 OK|Content-Type: text/plain; charset=utf-8|Connection: close|Content-Length: 23||GET /old HTTP/1.0 body=\nHTTP/1.1 200 OK|Content-Type: text/plain; charset=utf-8|Connection: close|Content-Length: 22||\nHTTP/1.1 400 Bad Request|Content-Type: text/plain; charset=utf-8|Connection: close|Content-Length: 12||bad request\n\nforever: Failed(\"listener is closed\")\nstream: Failed(\"listener is closed\")\n200 close GET /x HTTP/1.1 body=\n200 POST /y HTTP/1.1 body=hello\n200 chunked one two three\n13 bytes\nFailed(\"http: connection closed before the response\")\n";
   (* ---------- Rand, Env, args and the Fs additions ---------- *)
   let box = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "vela-box-%d" (Unix.getpid ())) in
   (try Unix.mkdir box 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
@@ -2575,7 +2906,7 @@ fn main(root: Root) {
     [ "../examples"; "../bench" ];
   ok "fmt-every-program" (!fmt_failures = [])
     (String.concat "\n\n" (List.map (fun (n, m) -> n ^ ": " ^ m) (List.rev !fmt_failures)));
-  ok "fmt-checked-count" (Hashtbl.length fmt_checked > 90) (string_of_int (Hashtbl.length fmt_checked));
+  ok "fmt-checked-count" (Hashtbl.length fmt_checked > 90 || Sys.getenv_opt "VELA_ONLY" <> None) (string_of_int (Hashtbl.length fmt_checked));
 
   Printf.printf "%d/%d passed\n" (!total - !failed) !total;
   if !failed > 0 then exit 1

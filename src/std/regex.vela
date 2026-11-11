@@ -1,0 +1,994 @@
+// Regular expressions that never backtrack. A pattern compiles to a small
+// program run by a Pike VM, which follows every way the pattern can match at
+// once, so a search takes time proportional to the pattern's size times the
+// input's length whatever the pattern is: there is no catastrophic case.
+//
+// Syntax (RE2-like, a subset):
+//   literals, `.` (any character but newline), `[abc]`, `[^a-z]`, `[\d_]`
+//   `\d \w \s` and `\D \W \S` (ASCII classes), `\b \B` (word edges)
+//   `^ $` (text start and end; line start and end after `(?m)`), `\A \z`
+//   `*  +  ?  {n}  {n,}  {n,m}`, each lazy with a `?` after it
+//   `( )` capture, `(?: )` group only, `(?P<name> )` or `(?<name> )` named
+//   `a|b`, escapes `\n \t \r \f \v \0 \xHH` and `\` before any punctuation
+//   `(?i)` ASCII case-insensitive, `(?m)` multi-line, `(?s)` `.` matches
+//   newline; a flag applies from where it appears to the end of the pattern.
+// Text is UTF-8: `.` and negated classes match whole characters, and a
+// non-ASCII character in a pattern is one unit for quantifiers. Classes may
+// list non-ASCII characters but not ranges of them. There are no
+// backreferences or lookaround: they cannot be matched without backtracking.
+
+enum Op {
+    OpByte(Int),
+    OpRange(Int, Int),
+    OpSet(List[Bool]),
+    OpSplit(Int, Int),   // continue at both, the first preferred
+    OpJump(Int),
+    OpSave(Int),         // record the position in a capture slot
+    OpAssert(Int),       // 0 text start, 1 text end, 2 line start, 3 line end, 4 word edge, 5 not a word edge
+    OpDone,
+}
+
+pub struct Regex {
+    pattern: Str,
+    ops: List[Op],
+    groups: Int,        // capture groups, not counting the whole match
+    names: List[Str],   // each group's name, "" when unnamed; index 0 is the whole match
+}
+
+pub struct Match {
+    text: Str,                   // the matched text
+    start: Int,                  // byte offsets in the searched text
+    end: Int,
+    groups: List[Option[Str]],   // index 0 is the whole match, then each group; None if it did not take part
+    names: List[Str],
+}
+
+// A capture group's text: 0 is the whole match. None if the group did not
+// take part in the match or does not exist.
+pub fn capture(self: Match, i: Int) -> Option[Str] {
+    self.groups.get(i) ?? None
+}
+
+// A named group's text: `(?P<year>\d+)` is `m.named("year")`.
+pub fn named(self: Match, name: Str) -> Option[Str] {
+    let mut i = 1
+    while i < self.names.len() {
+        if self.names[i] == name {
+            return self.groups[i]
+        }
+        i = i + 1
+    }
+    None
+}
+
+// ---------- reading a pattern ----------
+
+enum Node {
+    NBytes(List[Int]),               // a literal character
+    NSet(List[Bool]),                // one byte from a table of 256
+    NRange(Int, Int),                // one byte in a range
+    NCat(List[Node]),
+    NAlt(List[Node]),
+    NRep(List[Node], Int, Int, Bool), // one node, min, max (-1: no limit), greedy
+    NGroup(List[Node], Int),          // one node, capture index
+    NAssert(Int),
+    NEmpty,
+}
+
+enum Tok {
+    TAtom(Node),
+    TOpen(Int),                       // capture index, 0 for a group that does not capture
+    TClose,
+    TBar,
+    TRep(Int, Int, Bool),
+}
+
+struct Lexed {
+    toks: List[Tok],
+    names: List[Str],
+}
+
+fn fail(msg: Str, at: Int) -> Str {
+    "regex: {msg} at byte {at}"
+}
+
+fn blank() -> List[Bool] {
+    let mut t: List[Bool] = []
+    let mut i = 0
+    while i < 256 {
+        t.push(false)
+        i = i + 1
+    }
+    t
+}
+
+fn is_word(b: Int) -> Bool {
+    (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95
+}
+
+fn is_digit(b: Int) -> Bool {
+    b >= 48 && b <= 57
+}
+
+// The ASCII bytes of `\d` (100), `\w` (119) or `\s` (115), or of their
+// complement when `neg`, added to a table.
+fn add_class(t: List[Bool], kind: Int, neg: Bool) -> List[Bool] {
+    let mut out = t
+    let mut b = 0
+    while b < 128 {
+        let inside = if kind == 100 {
+            is_digit(b)
+        } else if kind == 119 {
+            is_word(b)
+        } else {
+            b == 32 || (b >= 9 && b <= 13)
+        }
+        if inside != neg {
+            out[b] = true
+        }
+        b = b + 1
+    }
+    out
+}
+
+// Any character of two to four bytes.
+fn any_wide() -> Node {
+    let c = NRange(128, 191)
+    NAlt([NCat([NRange(192, 223), c]), NCat([NRange(224, 239), c, c]), NCat([NRange(240, 247), c, c, c])])
+}
+
+fn fold_case(t: List[Bool]) -> List[Bool] {
+    let mut out = t
+    let mut b = 65
+    while b <= 90 {
+        if t[b] || t[b + 32] {
+            out[b] = true
+            out[b + 32] = true
+        }
+        b = b + 1
+    }
+    out
+}
+
+fn literal(b: Int, fold: Bool) -> Node {
+    if fold && ((b >= 65 && b <= 90) || (b >= 97 && b <= 122)) {
+        let mut t = blank()
+        t[b] = true
+        NSet(fold_case(t))
+    } else {
+        NBytes([b])
+    }
+}
+
+// The length of the UTF-8 sequence that a lead byte starts.
+fn wide_len(b: Int) -> Int {
+    if b >= 240 {
+        4
+    } else if b >= 224 {
+        3
+    } else if b >= 192 {
+        2
+    } else {
+        1
+    }
+}
+
+fn hex_digit(b: Int) -> Int {
+    if is_digit(b) {
+        b - 48
+    } else if b >= 97 && b <= 102 {
+        b - 87
+    } else if b >= 65 && b <= 70 {
+        b - 55
+    } else {
+        -1
+    }
+}
+
+// The byte of two hex digits at `at`, or -1.
+fn hex2(bs: List[Int], at: Int) -> Int {
+    if at + 1 >= bs.len() {
+        return -1
+    }
+    let a = hex_digit(bs[at])
+    let b = hex_digit(bs[at + 1])
+    if a < 0 || b < 0 { -1 } else { a * 16 + b }
+}
+
+// The byte an escape such as `\n` or `\.` stands for, or -1 if it is not a
+// literal escape.
+fn escaped_byte(b: Int) -> Int {
+    match b {
+        110 => 10,
+        116 => 9,
+        114 => 13,
+        102 => 12,
+        118 => 11,
+        48 => 0,
+        _ => if is_word(b) || b >= 128 { -1 } else { b },
+    }
+}
+
+// One byte of a class item at `i` (a plain byte or a literal escape): the
+// byte and the index after it, or an error.
+fn class_byte(bs: List[Int], i: Int) -> Result[(Int, Int), Str] {
+    let b = bs[i]
+    if b != 92 {
+        if b >= 128 {
+            return Err(fail("ranges of non-ASCII characters are not supported", i))
+        }
+        return Ok((b, i + 1))
+    }
+    if i + 1 >= bs.len() {
+        return Err(fail("trailing `\\`", i))
+    }
+    let e = bs[i + 1]
+    if e == 120 {
+        let v = hex2(bs, i + 2)
+        if v < 0 {
+            return Err(fail("expected two hex digits after `\\x`", i))
+        }
+        return Ok((v, i + 4))
+    }
+    let v = escaped_byte(e)
+    if v < 0 {
+        return Err(fail("unknown escape in a class", i))
+    }
+    Ok((v, i + 2))
+}
+
+// A class `[...]` starting at `start`: its node and the index after `]`.
+fn lex_class(bs: List[Int], start: Int, fold: Bool) -> Result[(Node, Int), Str] {
+    let mut i = start + 1
+    let neg = i < bs.len() && bs[i] == 94
+    if neg {
+        i = i + 1
+    }
+    let mut t = blank()
+    let mut wide: List[Node] = []
+    let mut wide_all = false   // a \D, \W or \S inside: every wide character is in
+    let mut first = true
+    while true {
+        if i >= bs.len() {
+            return Err(fail("missing `]`", start))
+        }
+        let b = bs[i]
+        if b == 93 && !first {
+            i = i + 1
+            break
+        }
+        first = false
+        if b == 92 && i + 1 < bs.len() {
+            let e = bs[i + 1]
+            if e == 100 || e == 119 || e == 115 {
+                t = add_class(t, e, false)
+                i = i + 2
+                continue
+            }
+            if e == 68 || e == 87 || e == 83 {
+                t = add_class(t, e + 32, true)
+                wide_all = true
+                i = i + 2
+                continue
+            }
+        }
+        if b >= 128 {
+            let n = wide_len(b)
+            if i + n > bs.len() {
+                return Err(fail("invalid UTF-8", i))
+            }
+            wide.push(NBytes(bs.skip(i).take(n)))
+            i = i + n
+            if i + 1 < bs.len() && bs[i] == 45 && bs[i + 1] != 93 {
+                return Err(fail("ranges of non-ASCII characters are not supported", i))
+            }
+            continue
+        }
+        let (lo, after) = class_byte(bs, i)?
+        i = after
+        let mut hi = lo
+        if i + 1 < bs.len() && bs[i] == 45 && bs[i + 1] != 93 {
+            let (h, after2) = class_byte(bs, i + 1)?
+            if h < lo {
+                return Err(fail("range out of order", i))
+            }
+            hi = h
+            i = after2
+        }
+        let mut k = lo
+        while k <= hi {
+            t[k] = true
+            k = k + 1
+        }
+    }
+    if fold {
+        t = fold_case(t)
+    }
+    if neg {
+        if wide.len() > 0 {
+            return Err(fail("a negated class cannot list non-ASCII characters", start))
+        }
+        let mut c = blank()
+        let mut k = 0
+        while k < 128 {
+            c[k] = !t[k]
+            k = k + 1
+        }
+        if wide_all {
+            return Ok((NSet(c), i))
+        }
+        return Ok((NAlt([NSet(c), any_wide()]), i))
+    }
+    let mut alts = [NSet(t)]
+    for w in wide {
+        alts.push(w)
+    }
+    if wide_all {
+        alts.push(any_wide())
+    }
+    Ok((if alts.len() == 1 { alts[0] } else { NAlt(alts) }, i))
+}
+
+// `{n}`, `{n,}` or `{n,m}` at `i`: (min, max, index after `}`), or None when
+// it is not a counted repetition (then `{` is a literal).
+fn counted(bs: List[Int], i: Int) -> Option[(Int, Int, Int)] {
+    let mut j = i + 1
+    let mut lo = 0
+    let from = j
+    while j < bs.len() && is_digit(bs[j]) && j - from < 6 {
+        lo = lo * 10 + bs[j] - 48
+        j = j + 1
+    }
+    if j == from || j >= bs.len() {
+        return None
+    }
+    if bs[j] == 125 {
+        return Some((lo, lo, j + 1))
+    }
+    if bs[j] != 44 {
+        return None
+    }
+    j = j + 1
+    let from2 = j
+    let mut hi = 0
+    while j < bs.len() && is_digit(bs[j]) && j - from2 < 6 {
+        hi = hi * 10 + bs[j] - 48
+        j = j + 1
+    }
+    if j >= bs.len() || bs[j] != 125 {
+        return None
+    }
+    Some((lo, if j == from2 { -1 } else { hi }, j + 1))
+}
+
+fn lex(p: Str) -> Result[Lexed, Str] {
+    let bs = p.bytes()
+    let mut toks: List[Tok] = []
+    let mut names = [""]
+    let mut fold = false
+    let mut multi = false
+    let mut dotall = false
+    let mut i = 0
+    while i < bs.len() {
+        let b = bs[i]
+        if b == 92 {
+            if i + 1 >= bs.len() {
+                return Err(fail("trailing `\\`", i))
+            }
+            let e = bs[i + 1]
+            if e == 100 || e == 119 || e == 115 {
+                toks.push(TAtom(NSet(add_class(blank(), e, false))))
+            } else if e == 68 || e == 87 || e == 83 {
+                toks.push(TAtom(NAlt([NSet(add_class(blank(), e + 32, true)), any_wide()])))
+            } else if e == 98 {
+                toks.push(TAtom(NAssert(4)))
+            } else if e == 66 {
+                toks.push(TAtom(NAssert(5)))
+            } else if e == 65 {
+                toks.push(TAtom(NAssert(0)))
+            } else if e == 122 {
+                toks.push(TAtom(NAssert(1)))
+            } else if e == 120 {
+                let v = hex2(bs, i + 2)
+                if v < 0 {
+                    return Err(fail("expected two hex digits after `\\x`", i))
+                }
+                toks.push(TAtom(literal(v, fold)))
+                i = i + 2
+            } else {
+                let v = escaped_byte(e)
+                if v < 0 {
+                    return Err(fail("unknown escape `\\{p.slice(i + 1, i + 2)}`", i))
+                }
+                toks.push(TAtom(literal(v, fold)))
+            }
+            i = i + 2
+        } else if b == 46 {
+            let mut t = blank()
+            let mut k = 0
+            while k < 128 {
+                t[k] = k != 10 || dotall
+                k = k + 1
+            }
+            toks.push(TAtom(NAlt([NSet(t), any_wide()])))
+            i = i + 1
+        } else if b == 91 {
+            let (n, j) = lex_class(bs, i, fold)?
+            toks.push(TAtom(n))
+            i = j
+        } else if b == 40 {
+            if bs.get(i + 1) != Some(63) {
+                names.push("")
+                toks.push(TOpen(names.len() - 1))
+                i = i + 1
+            } else if bs.get(i + 2) == Some(58) {
+                toks.push(TOpen(0))
+                i = i + 3
+            } else if (bs.get(i + 2) == Some(80) && bs.get(i + 3) == Some(60)) || (bs.get(i + 2) == Some(60) && bs.get(i + 3) != Some(61) && bs.get(i + 3) != Some(33)) {
+                let from = if bs[i + 2] == 80 { i + 4 } else { i + 3 }
+                let close = match p.slice(from, p.len()).index_of(">") {
+                    Some(k) => from + k,
+                    None => { return Err(fail("missing `>` after a group name", i)) },
+                }
+                let name = p.slice(from, close)
+                if name == "" || !name.bytes().filter(|c| !is_word(c)).is_empty() || is_digit(name.bytes()[0]) {
+                    return Err(fail("bad group name `{name}`", i))
+                }
+                if names.contains(name) {
+                    return Err(fail("duplicate group name `{name}`", i))
+                }
+                names.push(name)
+                toks.push(TOpen(names.len() - 1))
+                i = close + 1
+            } else {
+                let mut j = i + 2
+                while j < bs.len() && (bs[j] == 105 || bs[j] == 109 || bs[j] == 115) {
+                    if bs[j] == 105 {
+                        fold = true
+                    } else if bs[j] == 109 {
+                        multi = true
+                    } else {
+                        dotall = true
+                    }
+                    j = j + 1
+                }
+                if j == i + 2 || bs.get(j) != Some(41) {
+                    return Err(fail("unsupported group syntax (no lookaround or backreferences)", i))
+                }
+                i = j + 1
+            }
+        } else if b == 41 {
+            toks.push(TClose)
+            i = i + 1
+        } else if b == 124 {
+            toks.push(TBar)
+            i = i + 1
+        } else if b == 42 || b == 43 || b == 63 || b == 123 {
+            let mut lo = 0
+            let mut hi = -1
+            let mut j = i + 1
+            let mut quant = true
+            if b == 43 {
+                lo = 1
+            } else if b == 63 {
+                hi = 1
+            } else if b == 123 {
+                match counted(bs, i) {
+                    Some((a, z, after)) => {
+                        lo = a
+                        hi = z
+                        j = after
+                    },
+                    None => { quant = false },
+                }
+            }
+            if !quant {
+                toks.push(TAtom(NBytes([123])))
+                i = i + 1
+            } else {
+                if lo > 1000 || hi > 1000 {
+                    return Err(fail("a repetition count above 1000", i))
+                }
+                if hi >= 0 && hi < lo {
+                    return Err(fail("repetition range out of order", i))
+                }
+                let lazy = bs.get(j) == Some(63)
+                toks.push(TRep(lo, hi, !lazy))
+                i = if lazy { j + 1 } else { j }
+            }
+        } else if b == 94 {
+            toks.push(TAtom(NAssert(if multi { 2 } else { 0 })))
+            i = i + 1
+        } else if b == 36 {
+            toks.push(TAtom(NAssert(if multi { 3 } else { 1 })))
+            i = i + 1
+        } else if b >= 128 {
+            let n = wide_len(b)
+            toks.push(TAtom(NBytes(bs.skip(i).take(n))))
+            i = i + n
+        } else {
+            toks.push(TAtom(literal(b, fold)))
+            i = i + 1
+        }
+    }
+    Ok(Lexed { toks, names })
+}
+
+fn parse_alt(ts: List[Tok], i: Int) -> Result[(Node, Int), Str] {
+    let mut branches: List[Node] = []
+    let mut j = i
+    while true {
+        let (n, k) = parse_cat(ts, j)?
+        branches.push(n)
+        j = k
+        match ts.get(j) {
+            Some(TBar) => { j = j + 1 },
+            _ => { break },
+        }
+    }
+    Ok((if branches.len() == 1 { branches[0] } else { NAlt(branches) }, j))
+}
+
+fn parse_cat(ts: List[Tok], i: Int) -> Result[(Node, Int), Str] {
+    let mut items: List[Node] = []
+    let mut j = i
+    while j < ts.len() {
+        match ts[j] {
+            TBar => { break },
+            TClose => { break },
+            TAtom(n) => {
+                items.push(n)
+                j = j + 1
+            },
+            TOpen(k) => {
+                let (inner, e) = parse_alt(ts, j + 1)?
+                match ts.get(e) {
+                    Some(TClose) => (),
+                    _ => { return Err("regex: missing `)`") },
+                }
+                items.push(if k == 0 { inner } else { NGroup([inner], k) })
+                j = e + 1
+            },
+            TRep(lo, hi, greedy) => {
+                if items.is_empty() {
+                    return Err("regex: a quantifier with nothing to repeat")
+                }
+                let last = items.len() - 1
+                items[last] = NRep([items[last]], lo, hi, greedy)
+                j = j + 1
+            },
+        }
+    }
+    Ok((if items.is_empty() { NEmpty } else if items.len() == 1 { items[0] } else { NCat(items) }, j))
+}
+
+// ---------- compiling to a program ----------
+
+// An upper bound on the number of instructions a node compiles to, capped
+// so it cannot overflow.
+fn size(n: Node) -> Int {
+    let cap = 1000000
+    let s = match n {
+        NBytes(bs) => bs.len(),
+        NCat(xs) => xs.fold(0, |a, x| a + size(x)),
+        NAlt(xs) => xs.fold(0, |a, x| a + size(x) + 2),
+        NRep(x, lo, hi, _) => (size(x[0]) + 1) * (if hi < 0 { lo + 1 } else { hi }) + 1,
+        NGroup(x, _) => size(x[0]) + 2,
+        _ => 1,
+    }
+    s.min(cap)
+}
+
+fn emit(ops: List[Op], n: Node) -> List[Op] {
+    let mut o = ops
+    match n {
+        NBytes(bs) => {
+            for b in bs {
+                o.push(OpByte(b))
+            }
+        },
+        NSet(t) => o.push(OpSet(t)),
+        NRange(a, b) => o.push(OpRange(a, b)),
+        NAssert(k) => o.push(OpAssert(k)),
+        NEmpty => (),
+        NCat(xs) => {
+            for x in xs {
+                o = emit(o, x)
+            }
+        },
+        NAlt(xs) => {
+            let mut jumps: List[Int] = []
+            let mut k = 0
+            while k < xs.len() {
+                if k + 1 < xs.len() {
+                    let at = o.len()
+                    o.push(OpSplit(at + 1, -1))
+                    o = emit(o, xs[k])
+                    jumps.push(o.len())
+                    o.push(OpJump(-1))
+                    o[at] = OpSplit(at + 1, o.len())
+                } else {
+                    o = emit(o, xs[k])
+                }
+                k = k + 1
+            }
+            for j in jumps {
+                o[j] = OpJump(o.len())
+            }
+        },
+        NGroup(x, g) => {
+            o.push(OpSave(2 * g))
+            o = emit(o, x[0])
+            o.push(OpSave(2 * g + 1))
+        },
+        NRep(x, lo, hi, greedy) => {
+            let body = x[0]
+            // the required copies; `x+` keeps its last one for the loop
+            let need = if hi < 0 && lo > 0 { lo - 1 } else { lo }
+            let mut k = 0
+            while k < need {
+                o = emit(o, body)
+                k = k + 1
+            }
+            if hi < 0 && lo > 0 {
+                let top = o.len()
+                o = emit(o, body)
+                o.push(if greedy { OpSplit(top, o.len() + 1) } else { OpSplit(o.len() + 1, top) })
+            } else if hi < 0 {
+                let top = o.len()
+                o.push(OpSplit(-1, -1))
+                o = emit(o, body)
+                o.push(OpJump(top))
+                o[top] = if greedy { OpSplit(top + 1, o.len()) } else { OpSplit(o.len(), top + 1) }
+            } else {
+                let mut holes: List[Int] = []
+                while k < hi {
+                    holes.push(o.len())
+                    o.push(OpSplit(-1, -1))
+                    o = emit(o, body)
+                    k = k + 1
+                }
+                for h in holes {
+                    o[h] = if greedy { OpSplit(h + 1, o.len()) } else { OpSplit(o.len(), h + 1) }
+                }
+            }
+        },
+    }
+    o
+}
+
+// Compile a pattern. The error names what is wrong and where.
+pub fn compile(pattern: Str) -> Result[Regex, Str] {
+    let lx = lex(pattern)?
+    let (n, e) = parse_alt(lx.toks, 0)?
+    if e < lx.toks.len() {
+        return Err("regex: unmatched `)`")
+    }
+    if size(n) > 100000 {
+        return Err("regex: the pattern is too large")
+    }
+    let mut ops = emit([OpSave(0)], n)
+    ops.push(OpSave(1))
+    ops.push(OpDone)
+    Ok(Regex { pattern, ops, groups: lx.names.len() - 1, names: lx.names })
+}
+
+// Compile a pattern known to be valid; panics if it is not.
+pub fn must(pattern: Str) -> Regex {
+    match compile(pattern) {
+        Ok(r) => r,
+        Err(e) => panic(e),
+    }
+}
+
+// `s` with every regex metacharacter escaped, to match it literally.
+pub fn escape(s: Str) -> Str {
+    let mut out = ""
+    for c in s.split("") {
+        if "\\.+*?()|[]\{\}^$".contains(c) {
+            out = out + "\\"
+        }
+        out = out + c
+    }
+    out
+}
+
+// ---------- running a program ----------
+
+struct Threads {
+    pcs: List[Int],
+    caps: List[List[Int]],
+}
+
+fn word_at(bs: List[Int], i: Int) -> Bool {
+    i >= 0 && i < bs.len() && is_word(bs[i])
+}
+
+fn assert_ok(kind: Int, bs: List[Int], pos: Int) -> Bool {
+    match kind {
+        0 => pos == 0,
+        1 => pos == bs.len(),
+        2 => pos == 0 || bs[pos - 1] == 10,
+        3 => pos == bs.len() || bs[pos] == 10,
+        4 => word_at(bs, pos - 1) != word_at(bs, pos),
+        _ => word_at(bs, pos - 1) == word_at(bs, pos),
+    }
+}
+
+// Add the thread at `pc`, following jumps, splits, saves and assertions to
+// the instructions that read a byte (or finish), in priority order. `seen`
+// marks the instructions already on the list with `gen`.
+fn add(ops: List[Op], t: Threads, seen: List[Int], gen: Int, pc: Int, caps: List[Int], bs: List[Int], pos: Int) -> (Threads, List[Int]) {
+    let mut t = t
+    let mut seen = seen
+    let mut st_pc = [pc]
+    let mut st_caps = [caps]
+    let mut sp = 1
+    while sp > 0 {
+        sp = sp - 1
+        let p = st_pc[sp]
+        if seen[p] == gen {
+            continue
+        }
+        seen[p] = gen
+        let c = st_caps[sp]
+        // the instructions to continue at, the preferred one last
+        let mut more: List[Int] = []
+        let mut c2 = c
+        match ops[p] {
+            OpJump(to) => more.push(to),
+            OpSplit(a, b) => {
+                more.push(b)
+                more.push(a)
+            },
+            OpSave(k) => {
+                c2[k] = pos
+                more.push(p + 1)
+            },
+            OpAssert(k) => if assert_ok(k, bs, pos) {
+                more.push(p + 1)
+            },
+            _ => {
+                t.pcs.push(p)
+                t.caps.push(c)
+            },
+        }
+        for m in more {
+            if sp < st_pc.len() {
+                st_pc[sp] = m
+                st_caps[sp] = c2
+            } else {
+                st_pc.push(m)
+                st_caps.push(c2)
+            }
+            sp = sp + 1
+        }
+    }
+    (t, seen)
+}
+
+// Run the program over `bs` from `from`: the capture positions of the
+// leftmost match (preferring what the pattern prefers), or None. `anchored`
+// matches only at `from`; `full` only accepts a match that ends at the end.
+fn exec(re: Regex, bs: List[Int], from: Int, anchored: Bool, full: Bool) -> Option[List[Int]] {
+    let ops = re.ops
+    let mut blank_caps: List[Int] = []
+    for _ in re.names {
+        blank_caps.push(-1)
+        blank_caps.push(-1)
+    }
+    let mut seen: List[Int] = []
+    for _ in ops {
+        seen.push(-1)
+    }
+    let mut cur = Threads { pcs: [], caps: [] }
+    let mut found: Option[List[Int]] = None
+    let mut pos = from
+    while true {
+        if found.is_none() && (!anchored || pos == from) {
+            let (t, s) = add(ops, cur, seen, pos + 1, 0, blank_caps, bs, pos)
+            cur = t
+            seen = s
+        }
+        // with no thread left, only an unanchored search that has not
+        // matched yet goes on, to start again at the next byte
+        if cur.pcs.is_empty() && (found.is_some() || anchored) {
+            break
+        }
+        let mut next = Threads { pcs: [], caps: [] }
+        let byte = if pos < bs.len() { bs[pos] } else { -1 }
+        let mut i = 0
+        while i < cur.pcs.len() {
+            let pc = cur.pcs[i]
+            let ok = match ops[pc] {
+                OpByte(b) => byte == b,
+                OpRange(lo, hi) => byte >= lo && byte <= hi,
+                OpSet(table) => byte >= 0 && table[byte],
+                OpDone => {
+                    if !full || pos == bs.len() {
+                        // a match: the threads after this one have lower priority
+                        found = Some(cur.caps[i])
+                        i = cur.pcs.len()
+                    }
+                    false
+                },
+                _ => false,
+            }
+            if ok {
+                let (t, s) = add(ops, next, seen, pos + 2, pc + 1, cur.caps[i], bs, pos + 1)
+                next = t
+                seen = s
+            }
+            i = i + 1
+        }
+        cur = next
+        if pos >= bs.len() {
+            break
+        }
+        pos = pos + 1
+    }
+    found
+}
+
+fn to_match(re: Regex, s: Str, caps: List[Int]) -> Match {
+    let mut groups: List[Option[Str]] = []
+    let mut k = 0
+    while k < re.names.len() {
+        let a = caps[2 * k]
+        let b = caps[2 * k + 1]
+        groups.push(if a >= 0 && b >= 0 { Some(s.slice(a, b)) } else { None })
+        k = k + 1
+    }
+    Match { text: s.slice(caps[0], caps[1]), start: caps[0], end: caps[1], groups, names: re.names }
+}
+
+// Whether the whole of `s` matches.
+pub fn matches(self: Regex, s: Str) -> Bool {
+    exec(self, s.bytes(), 0, true, true).is_some()
+}
+
+// The leftmost match in `s`.
+pub fn find(self: Regex, s: Str) -> Option[Match] {
+    self.find_from(s, 0)
+}
+
+// The leftmost match starting at byte `start` or later. `^` and `\b` still
+// see the text before `start`.
+pub fn find_from(self: Regex, s: Str, start: Int) -> Option[Match] {
+    if start < 0 || start > s.len() {
+        return None
+    }
+    let re = self
+    exec(re, s.bytes(), start, false, false).map(|c| to_match(re, s, c))
+}
+
+fn next_char(bs: List[Int], i: Int) -> Int {
+    let mut j = i + 1
+    while j < bs.len() && bs[j] >= 128 && bs[j] < 192 {
+        j = j + 1
+    }
+    j
+}
+
+// Every match in `s`, left to right, without overlaps. An empty match right
+// after the previous match is skipped.
+pub fn find_all(self: Regex, s: Str) -> List[Match] {
+    let bs = s.bytes()
+    let mut out: List[Match] = []
+    let mut pos = 0
+    let mut last_end = -1
+    while pos <= bs.len() {
+        match exec(self, bs, pos, false, false) {
+            None => { break },
+            Some(c) => {
+                if c[0] == c[1] && c[0] == last_end {
+                    pos = next_char(bs, c[0])
+                } else {
+                    out.push(to_match(self, s, c))
+                    last_end = c[1]
+                    pos = if c[0] == c[1] { next_char(bs, c[1]) } else { c[1] }
+                }
+            },
+        }
+    }
+    out
+}
+
+// The replacement text for a match: `$1` or `${1}` is a group, `${name}` a
+// named group, `$0` the whole match and `$$` a dollar sign. A group that did
+// not take part gives "".
+fn expand(m: Match, template: Str) -> Str {
+    let bs = template.bytes()
+    let mut out = ""
+    let mut start = 0
+    let mut i = 0
+    while i + 1 < bs.len() {
+        if bs[i] != 36 {
+            i = i + 1
+            continue
+        }
+        let nb = bs[i + 1]
+        if nb == 36 {
+            out = out + template.slice(start, i) + "$"
+            i = i + 2
+            start = i
+        } else if nb == 123 {
+            match template.slice(i + 2, template.len()).index_of("}") {
+                Some(k) => {
+                    let name = template.slice(i + 2, i + 2 + k)
+                    let v = if name != "" && name.bytes().filter(|c| !is_digit(c)).is_empty() {
+                        m.capture(name.parse_int() ?? -1)
+                    } else {
+                        m.named(name)
+                    }
+                    out = out + template.slice(start, i) + (v ?? "")
+                    i = i + 3 + k
+                    start = i
+                },
+                None => { i = i + 1 },
+            }
+        } else if is_digit(nb) {
+            let mut j = i + 1
+            let mut g = 0
+            while j < bs.len() && is_digit(bs[j]) {
+                if g < 100000 {
+                    g = g * 10 + bs[j] - 48
+                }
+                j = j + 1
+            }
+            out = out + template.slice(start, i) + (m.capture(g) ?? "")
+            i = j
+            start = j
+        } else {
+            i = i + 1
+        }
+    }
+    out + template.slice(start, template.len())
+}
+
+// `s` with every match replaced by `f(match)`.
+pub fn replace_with(self: Regex, s: Str, f: fn(Match) -> Str) -> Str {
+    let mut out = ""
+    let mut last = 0
+    for m in self.find_all(s) {
+        out = out + s.slice(last, m.start) + f(m)
+        last = m.end
+    }
+    out + s.slice(last, s.len())
+}
+
+// `s` with every match replaced by `template`, where `$1`, `${name}`, `$0`
+// and `$$` stand for groups, the whole match and a dollar sign.
+pub fn replace(self: Regex, s: Str, template: Str) -> Str {
+    self.replace_with(s, |m| expand(m, template))
+}
+
+// `s` with the first match replaced by `template`.
+pub fn replace_first(self: Regex, s: Str, template: Str) -> Str {
+    match self.find(s) {
+        Some(m) => s.slice(0, m.start) + expand(m, template) + s.slice(m.end, s.len()),
+        None => s,
+    }
+}
+
+// The pieces of `s` between matches: `must(",\s*").split("a, b,c")` is
+// ["a", "b", "c"]. An empty pattern splits into characters.
+pub fn split(self: Regex, s: Str) -> List[Str] {
+    if s == "" {
+        return [""]
+    }
+    let mut out: List[Str] = []
+    let mut begin = 0
+    let mut end = 0
+    for m in self.find_all(s) {
+        end = m.start
+        if m.end != 0 {
+            out.push(s.slice(begin, end))
+        }
+        begin = m.end
+    }
+    if end != s.len() {
+        out.push(s.slice(begin, s.len()))
+    }
+    out
+}

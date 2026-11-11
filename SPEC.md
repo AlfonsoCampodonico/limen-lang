@@ -599,7 +599,7 @@ Methods take the receiver by value and never modify it, except `push`, which nee
 | Type | Methods |
 | --- | --- |
 | `Int` | `to_str()`, `to_float()`, `abs()`, `min(n)`, `max(n)`, `to_char()` (the UTF-8 text of a code point, `65.to_char()` is `"A"`; invalid code points give U+FFFD) |
-| `Float` | `to_str()`, `to_int()` (truncates; NaN gives 0), `abs()`, `sqrt()` |
+| `Float` | `to_str()`, `to_int()` (truncates; NaN gives 0), `abs()`, `sqrt()`, `to_fixed(d)` (exactly `d` decimals, 0 to 30, rounded as C's printf rounds: `3.14159.to_fixed(2)` is `"3.14"`; NaN and infinities give `nan`, `inf`, `-inf`) |
 | `Bool` | `to_str()` |
 
 ### List[T]
@@ -959,17 +959,25 @@ A module missing from the list may take nothing. `vela caps FILE` shows what eac
 
 ### http
 
-HTTP/1.1 over plain TCP (no TLS yet). Each message is read whole; bodies up to 8 MiB.
+HTTP/1.1 over plain TCP (no TLS yet). The server keeps connections alive between requests and reads pipelined requests in order; bodies can be streamed in pieces both ways.
 
 | Item | Meaning |
 | --- | --- |
 | `struct Header { name, value }`, `req.header(name)`, `resp.header(name)`, `find_header(headers, name)` | headers; lookup ignores case |
-| `struct Request { method, path, headers, body }` | |
+| `struct Request { method, path, version, headers, body }` | `version` is `"HTTP/1.1"` or `"HTTP/1.0"` |
 | `struct Response { status: Int, headers, body }`, `text(status, body)`, `json(status, body)`, `reason(status)` | |
-| `get(net, url)`, `post(net, url, content_type, body)`, `request(net, method, url, headers, body)` | `Result[Response, IoError]`; `http://host[:port]/path` URLs, chunked responses decoded |
-| `read_request(conn)`, `write_response(conn, r)` | one message on a connection |
-| `handle(conn, handler) -> Bool` | read, answer with `handler` (400 if malformed, 500 if the handler panics), close |
-| `serve(listener, count, handler) -> Int` | accept `count` connections, each handled in its own task; returns how many were answered |
+| `get(net, url)`, `post(net, url, content_type, body)`, `request(net, method, url, headers, body)` | `Result[Response, IoError]`; `http://host[:port]/path` URLs, chunked responses decoded, one connection per request |
+| `request_fold(net, method, url, headers, body, init, f)` | `Result[(Response, T), IoError]`: the body is passed to `f: fn(T, Str) -> T` piece by piece as it arrives instead of being held in memory; the response comes back with an empty body |
+| `serve_forever(listener, handler) -> IoError` | serve every connection in its own task until the listener is closed (by another task holding it) or fails; returns that error |
+| `serve(listener, count, handler) -> Int` | the same for `count` connections; returns how many requests were answered |
+| `serve_conn(conn, handler) -> Int` | answer requests on one connection until the client closes it or asks to (`Connection: close`, or HTTP/1.0 without keep-alive); 400 and close on a malformed request, 500 if the handler panics, headers only for HEAD |
+| `handle(conn, handler) -> Bool` | answer one request, then close |
+| `accept_forever(listener, f) -> IoError` | run `f: fn(Conn) -> Int` on each accepted connection in its own task, until accepting fails |
+| `serve_stream(conn, handler) -> Int` | like `serve_conn` for a handler `fn(Request, Conn) -> Result[(), IoError]` that writes its own response; an error or panic closes the connection |
+| `write_head(conn, status, headers)`, `write_chunk(conn, piece)`, `end_body(conn)` | write a response whose body follows in pieces (`Transfer-Encoding: chunked`) |
+| `read_request(conn)`, `write_response(conn, r)` | one message on a connection; `write_response` says the connection will close |
+
+Limits: request heads up to 64 KiB, request bodies up to 8 MiB (read whole, chunked or not), 1000 requests per connection. There are no timeouts yet, so an idle keep-alive connection holds its task until the client closes it, and `serve_forever` keeps a small record per finished connection until it returns.
 
 ```
 use http
@@ -980,16 +988,101 @@ fn hello(r: http.Request) -> http.Response {
 
 fn main(root: Root) -> Result[(), IoError] {
     let l = root.listen.on("127.0.0.1:8080")?
-    http.serve(l, 100, hello)
-    Ok(())
+    Err(http.serve_forever(l, hello))
 }
 ```
 
-The handler is a plain function value, so it gets no capability unless a closure captures one.
+The handler is a plain function value, so it gets no capability unless a closure captures one. A streamed response:
+
+```
+fn numbers(r: http.Request, c: Conn) -> Result[(), IoError] {
+    http.write_head(c, 200, [http.Header { name: "Content-Type", value: "text/plain" }])?
+    for n in [1, 2, 3] {
+        http.write_chunk(c, "{n}\n")?
+    }
+    http.end_body(c)
+}
+
+// in main: http.accept_forever(l, |c| http.serve_stream(c, numbers))
+```
 
 ### list
 
 `sort_by(xs, less)` (stable merge sort, `less(a, b)` says whether `a` goes first), `index_of(xs, x)`, `find_index(xs, pred)`, `range(lo, hi)`, `remove_at(xs, i)`, `insert_at(xs, i, x)`. All return new lists.
+
+### format
+
+Number formatting. Fixed decimals are the Float method `x.to_fixed(d)`; this module adds the rest. Pure functions.
+
+| Item | Meaning |
+| --- | --- |
+| `thousands(n)` | `"1,234,567"` |
+| `grouped(number, sep)` | `sep` between groups of three digits in the integer part of a number already written out: `grouped(x.to_fixed(2), " ")` is `"1 234 567.89"` |
+| `zero_pad(n, width)` | zeros after the sign up to `width` characters: `zero_pad(-7, 4)` is `"-007"` |
+| `percent(x, decimals)` | `percent(0.4567, 1)` is `"45.7%"` |
+| `hex(n)`, `base(n, radix)` | lowercase digits in base 16 or 2 to 36, with `-` for negatives: `hex(255)` is `"ff"`; another radix panics |
+| `parse_base(s, radix)` | `Option[Int]`: digits in that base (either case) with an optional sign; `None` on anything else or overflow |
+| `align_left(s, w)`, `align_right(s, w)`, `align_center(s, w)` | `s` padded with spaces to `w` characters for table columns; counts code points, not bytes |
+| `width(s)` | the number of code points in `s` |
+
+### regex
+
+Regular expressions that never backtrack: a pattern compiles to a program for a Pike VM, which follows every way the pattern can match at once, so a search takes time proportional to the pattern size times the text length, whatever the pattern. `(a+)+$` on a long run of `a`s is as fast as any other pattern. Written in Vela.
+
+| Item | Meaning |
+| --- | --- |
+| `compile(pattern) -> Result[Regex, Str]`, `must(pattern) -> Regex` | `must` panics on a bad pattern; use it for patterns written in the source |
+| `r.matches(s)` | whether the whole of `s` matches |
+| `r.find(s)`, `r.find_from(s, start)` | `Option[Match]`, the leftmost match (from byte `start`) |
+| `r.find_all(s)` | `List[Match]`, left to right without overlaps; an empty match right after a match is skipped |
+| `r.replace(s, template)`, `r.replace_first(s, template)` | `$1` or `${1}` is a group, `${name}` a named group, `$0` the whole match, `$$` a dollar sign |
+| `r.replace_with(s, f)` | every match replaced by `f(match)` |
+| `r.split(s)` | the pieces between matches; an empty pattern splits into characters |
+| `escape(s)` | `s` with metacharacters escaped, to match it literally |
+| `struct Match { text, start, end, groups, names }`, `m.capture(i)`, `m.named(name)` | `start` and `end` are byte offsets; `capture(0)` is the whole match; a group that did not take part is `None` |
+
+The syntax is a subset of RE2's: literals; `.` (any character but newline); classes `[abc]`, `[^a-z]`, `[\d_]`; `\d \w \s` and `\D \W \S` (ASCII); `\b \B` word edges; `^ $` (text start and end) and `\A \z`; `* + ? {n} {n,} {n,m}` (counts up to 1000), each lazy with a trailing `?`; `( )` captures, `(?: )` groups without capturing, `(?P<name> )` or `(?<name> )` name a capture; `|`; escapes `\n \t \r \f \v \0 \xHH` and `\` before any punctuation. Flags `(?i)` (ASCII case-insensitive), `(?m)` (`^` and `$` match at lines) and `(?s)` (`.` matches newline) apply from where they appear to the end of the pattern. Text is UTF-8: `.` and negated classes match whole characters, and a non-ASCII character is one unit for a quantifier. Classes may list non-ASCII characters but not ranges of them, and a negated class cannot list them. Backreferences and lookaround are not supported, since they need backtracking. A Vela string needs `\{` for a literal brace, so `\d{4}` is written `"\\d\{4\}"`.
+
+```
+use regex
+
+fn main(root: Root) {
+    let date = regex.must("(?P<y>\\d\{4\})-(?P<m>\\d\{2\})-(?P<d>\\d\{2\})")
+    match date.find("due 2026-12-01") {
+        Some(m) => root.stdout.print("{m.named("d") ?? ""}/{m.named("m") ?? ""}"),
+        None => root.stdout.print("no date"),
+    }
+    root.stdout.print(date.replace("2026-12-01", "$3.$2.$1"))
+}
+```
+
+### time
+
+Calendar dates and times as pure functions of epoch milliseconds, the number `Clock.now_ms()` returns. Everything is UTC on the proleptic Gregorian calendar, without leap seconds. Fixed offsets from UTC (in minutes, `60` for +01:00) are supported where a function says so; named time zones with daylight saving rules are not, as they need the system's zone database.
+
+| Item | Meaning |
+| --- | --- |
+| `struct DateTime { year, month, day, hour, minute, second, ms, weekday, yday }` | `month` 1-12, `weekday` 1 (Monday) to 7 (Sunday), `yday` 1-366 |
+| `parts(ms)`, `parts_at(ms, offset_minutes)` | the fields of a moment, in UTC or at an offset |
+| `date(year, month, day)`, `from_parts(p)` | epoch milliseconds; out-of-range months, days and times roll over (`date(2024, 13, 1)` is 2025-01-01) |
+| `iso(ms)` | `"2026-11-11T18:22:05.123Z"`; years outside 0-9999 get a sign and six digits |
+| `iso_at(ms, offset_minutes)`, `iso_date(ms)` | `"2026-11-11T19:22:05.123+01:00"`, `"2026-11-11"` |
+| `parse_iso(s) -> Result[Int, Str]` | a date (midnight UTC) or date and time joined by `T` or a space, with optional seconds and fraction, then `Z`, an offset (`+01:00`, `+0100`, `+01`) or nothing (UTC); the error names the byte |
+| `format(ms, layout)`, `format_at(ms, offset_minutes, layout)` | strftime-style: `%Y %m %d %H %M %S`, `%L` milliseconds, `%j` day of year, `%y`, `%I`, `%p`, `%u`, `%a %A %b %B` (English names), `%s` epoch seconds, `%z` (`+0100`), `%Z` (`UTC` or `+01:00`), `%%` |
+| `seconds(n)`, `minutes(n)`, `hours(n)`, `days(n)` | durations in milliseconds: `now + time.days(3)` |
+| `add_months(ms, n)` | same time of day `n` months later, the day clamped to the month's end |
+| `is_leap_year(y)`, `days_in_month(y, m)`, `month_name(m)`, `weekday_name(d)` | |
+
+```
+use time
+
+fn main(root: Root) {
+    let now = root.clock.now_ms()
+    root.stdout.print(time.format(now, "%A %d %B %Y, %H:%M UTC"))
+    let due = time.parse_iso("2026-12-01T09:00+01:00") ?? 0
+    root.stdout.print("{(due - now) / time.days(1)} days left")
+}
+```
 
 ### text
 

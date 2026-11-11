@@ -1153,6 +1153,13 @@ and call_method rt v name args sp =
   | VFloat x, "to_int", [] -> VInt (float_to_int x)
   | VFloat x, "abs", [] -> VFloat (Float.abs x)
   | VFloat x, "sqrt", [] -> VFloat (Float.sqrt x)
+  | VFloat x, "to_fixed", [ VInt d ] ->
+    let d = Int64.to_int (Int64.max 0L (Int64.min 30L d)) in
+    VStr
+      (if Float.is_nan x then "nan"
+       else if x = Float.infinity then "inf"
+       else if x = Float.neg_infinity then "-inf"
+       else sprintf "%.*f" d x)
   | VBool b, "to_str", [] -> VStr (string_of_bool b)
   | VList a, "len", [] -> vint (Array.length a)
   | VList a, "to_list", [] -> VList a

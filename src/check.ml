@@ -273,7 +273,8 @@ let methods (t : ty) : (string * (unit -> ty list * ty)) list =
   | TInt ->
     [ m "to_str" [] TStr; m "to_float" [] TFloat; m "abs" [] TInt; m "to_char" [] TStr; m "min" [ TInt ] TInt;
       m "max" [ TInt ] TInt ]
-  | TFloat -> [ m "to_str" [] TStr; m "to_int" [] TInt; m "abs" [] TFloat; m "sqrt" [] TFloat ]
+  | TFloat -> [ m "to_str" [] TStr; m "to_int" [] TInt; m "abs" [] TFloat; m "sqrt" [] TFloat;
+      m "to_fixed" [ TInt ] TStr ]
   | TBool -> [ m "to_str" [] TStr ]
   | TList a ->
     [ m "len" [] TInt; m "is_empty" [] TBool; m "get" [ TInt ] (opt a); m "first" [] (opt a);

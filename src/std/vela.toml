@@ -10,3 +10,6 @@ json = { path = ".", caps = [] }
 list = { path = ".", caps = [] }
 text = { path = ".", caps = [] }
 http = { path = ".", caps = ["net", "listen"] }
+format = { path = ".", caps = [] }
+time = { path = ".", caps = [] }
+regex = { path = ".", caps = [] }
