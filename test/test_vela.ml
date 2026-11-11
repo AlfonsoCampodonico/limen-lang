@@ -22,7 +22,7 @@ let ok name cond msg =
    dir/reject (lexer or parser error), for checking grammar/vela.gbnf. *)
 (* Rejected by the parser but within the grammar's documented superset
    (keywords are not excluded from identifiers). *)
-let grammar_superset = [ "tuple-let-refutable"; "select-bad-arm"; "group-until-bad" ]
+let grammar_superset = [ "tuple-let-refutable"; "select-bad-arm"; "group-until-bad"; "pipe-not-callable"; "pipe-binary-rhs" ]
 
 let dump name src parsed =
   match Sys.getenv_opt "VELA_DUMP_DIR" with
@@ -2531,7 +2531,7 @@ fn main(root: Root) -> Result[(), IoError] {
   errs "int-literal-too-large" (main_wrap "    let x = 9223372036854775808") [ "E0005" ];
 
   (* ---------- select ---------- *)
-  exits "example-tour" (example "tour.vela") "-- language\ncircle 12.57\n[2.25, 12.56636]\n[0, 1, 4, 9, 16] [\"h\", \"o\", \"l\", \"a\"]\nbound method 3.142\nVELA!\n{Point { x: 0, y: 0 }: [\"origin\", \"home\"]} {(1, 2): 2}\n[(1, \"a\"), (1, \"z\"), (2, \"b\")]\n3 bytes: hi!\n-- concurrency\na side task ran\nresults [1, 2]\nwith a deadline [Some(1), None]\nnobody sent anything\n" 3;
+  exits "example-tour" (example "tour.vela") "-- language\ncircle 12.57\n[2.25, 12.56636]\n[0, 1, 4, 9, 16] [\"h\", \"o\", \"l\", \"a\"]\nbound method 3.142\nVELA!\n{Point { x: 0, y: 0 }: [\"origin\", \"home\"]} {(1, 2): 2}\n[(1, \"a\"), (1, \"z\"), (2, \"b\")]\n3 bytes: hi!\n-- syntax\npipe 12\n-- concurrency\na side task ran\nresults [1, 2]\nwith a deadline [Some(1), None]\nnobody sent anything\n" 3;
   out "select" (example "select.vela") "nums done; words done; total 15 letters 3\nnothing ready | sent to c | sent to d | d Some(10)\nafter close: Some(7)\nErr(\"every arm of this `select` is turned off by its guard\")\n";
   out "select-stress" "fn produce(c: Chan[Int], n: Int) -> Int {\n    let mut i = 0\n    while i < n {\n        c.send(i)\n        i = i + 1\n    }\n    c.close()\n    0\n}\n\n// receive from all four until every one is closed\nfn consume(a: Chan[Int], b: Chan[Int], c: Chan[Int], d: Chan[Int]) -> Int {\n    let mut sum = 0\n    let mut on = [true, true, true, true]\n    while on[0] || on[1] || on[2] || on[3] {\n        select {\n            v = a.recv() if on[0] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[0] = false\n                },\n            },\n            v = b.recv() if on[1] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[1] = false\n                },\n            },\n            v = c.recv() if on[2] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[2] = false\n                },\n            },\n            v = d.recv() if on[3] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[3] = false\n                },\n            },\n        }\n    }\n    sum\n}\n\nfn drain(c: Chan[Str]) -> Int {\n    let mut n = 0\n    let mut more = true\n    while more {\n        match c.recv() {\n            Some(s) => {\n                n = n + s.len()\n            },\n            None => {\n                more = false\n            },\n        }\n    }\n    n\n}\n\nfn main(root: Root) {\n    let a: Chan[Int] = channel(1)\n    let b: Chan[Int] = channel(1)\n    let c: Chan[Int] = channel(2)\n    let d: Chan[Int] = channel(1)\n    let sums = group g {\n        g.go(|| produce(a, 500))\n        g.go(|| produce(b, 500))\n        g.go(|| produce(c, 500))\n        g.go(|| produce(d, 500))\n        g.go(|| consume(a, b, c, d))\n        g.go(|| consume(a, b, c, d))\n        g.go(|| consume(a, b, c, d))\n    }\n    root.stdout.print(\"{sums.sum()}\")\n    // select between two sends: a dispatcher feeding two workers\n    let w1: Chan[Str] = channel(1)\n    let w2: Chan[Str] = channel(1)\n    let parts = group g {\n        g.go(|| {\n                let mut i = 0\n                while i < 1000 {\n                    let msg = \"m{i}\"\n                    select {\n                        w1.send(msg) => (),\n                        w2.send(msg) => (),\n                    }\n                    i = i + 1\n                }\n                w1.close()\n                w2.close()\n                0\n            })\n        g.go(|| drain(w1))\n        g.go(|| drain(w2))\n    }\n    root.stdout.print(\"{parts.sum()}\")\n}\n" "499000\n3890\n";
   check_tsan "select-stress-tsan" "fn produce(c: Chan[Int], n: Int) -> Int {\n    let mut i = 0\n    while i < n {\n        c.send(i)\n        i = i + 1\n    }\n    c.close()\n    0\n}\n\n// receive from all four until every one is closed\nfn consume(a: Chan[Int], b: Chan[Int], c: Chan[Int], d: Chan[Int]) -> Int {\n    let mut sum = 0\n    let mut on = [true, true, true, true]\n    while on[0] || on[1] || on[2] || on[3] {\n        select {\n            v = a.recv() if on[0] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[0] = false\n                },\n            },\n            v = b.recv() if on[1] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[1] = false\n                },\n            },\n            v = c.recv() if on[2] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[2] = false\n                },\n            },\n            v = d.recv() if on[3] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[3] = false\n                },\n            },\n        }\n    }\n    sum\n}\n\nfn drain(c: Chan[Str]) -> Int {\n    let mut n = 0\n    let mut more = true\n    while more {\n        match c.recv() {\n            Some(s) => {\n                n = n + s.len()\n            },\n            None => {\n                more = false\n            },\n        }\n    }\n    n\n}\n\nfn main(root: Root) {\n    let a: Chan[Int] = channel(1)\n    let b: Chan[Int] = channel(1)\n    let c: Chan[Int] = channel(2)\n    let d: Chan[Int] = channel(1)\n    let sums = group g {\n        g.go(|| produce(a, 500))\n        g.go(|| produce(b, 500))\n        g.go(|| produce(c, 500))\n        g.go(|| produce(d, 500))\n        g.go(|| consume(a, b, c, d))\n        g.go(|| consume(a, b, c, d))\n        g.go(|| consume(a, b, c, d))\n    }\n    root.stdout.print(\"{sums.sum()}\")\n    // select between two sends: a dispatcher feeding two workers\n    let w1: Chan[Str] = channel(1)\n    let w2: Chan[Str] = channel(1)\n    let parts = group g {\n        g.go(|| {\n                let mut i = 0\n                while i < 1000 {\n                    let msg = \"m{i}\"\n                    select {\n                        w1.send(msg) => (),\n                        w2.send(msg) => (),\n                    }\n                    i = i + 1\n                }\n                w1.close()\n                w2.close()\n                0\n            })\n        g.go(|| drain(w1))\n        g.go(|| drain(w2))\n    }\n    root.stdout.print(\"{parts.sum()}\")\n}\n" "499000\n3890\n";
@@ -3397,6 +3397,60 @@ fn main(root: Root) {
    ok "unwrap-or-fixed" (fixed = "fn main(root: Root) {\n    let x = (\"4\".parse_int() ?? 0).to_str() + \"!\"\n    let y = \"4\".parse_int() ?? (1 + 2) * 2\n}\n") fixed;
    let _, ds2, _ = compile "unwrap-or-fixed2" fixed in
    ok "unwrap-or-fixed-checks" (ds2 = []) (String.concat " " (codes ds2)));
+
+  (* ---------- pipes: `x |> f(a)` is `f(x, a)` ---------- *)
+  out "pipe-basic" {|use list
+
+struct Acc {
+    total: Int,
+}
+
+fn add(self: Acc, n: Int, k: Int) -> Acc { Acc { total: self.total + n * k } }
+
+fn double(x: Int) -> Int { x * 2 }
+
+fn plus(x: Int, y: Int) -> Int { x + y }
+
+fn evens(xs: List[Int]) -> List[Int] { xs.filter(|x| x % 2 == 0) }
+
+fn total(xs: List[Int]) -> Int { xs.fold(0, |a, b| a + b) }
+
+fn parse(s: Str) -> Result[Int, Str] {
+    if s == "" { Err("empty") } else { Ok(s.len()) }
+}
+
+fn twice(s: Str) -> Result[Int, Str] {
+    let n = s |> parse()?
+    Ok(n |> plus(n))
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    out.print("{3 |> double |> plus(1)}")
+    let t = [1, 2, 3, 4, 5, 6]
+        |> evens
+        |> total
+    out.print("{t} {(t |> double) + 1} {1 + 2 |> double}")
+    out.print("{5 |> (|x| x * 10)}")
+    let words = ["pear", "fig", "apple"]
+        |> list.sort_by(|a, b| a.len() < b.len())
+    out.print("{words} {(words |> list.index_of("pear")) ?? -1}")
+    let acc = Acc { total: 0 }
+    out.print("{(4 |> acc.add(10)).total}")
+    out.print("{twice("abc")} {twice("")}")
+    // strings and lists move through the pipeline without leaking
+    let s = "a,b,c".split(",") |> evens_str
+    out.print(s)
+}
+
+fn evens_str(xs: List[Str]) -> Str { xs.join("+") }
+|} "7\n12 25 6\n50\n[\"fig\", \"pear\", \"apple\"] 1\n40\nOk(6) Err(\"empty\")\na+b+c\n";
+  errs "pipe-not-callable" (main_wrap "    let x = 3 |> 4") [ "E0003" ];
+  errs "pipe-binary-rhs" (main_wrap "    let x = 3 |> (1 + 2)") [ "E0003" ];
+  errs "pipe-arity" "fn plus(x: Int, y: Int) -> Int { x + y }\n\nfn main(root: Root) {\n    let x = 3 |> plus(1, 2)\n}\n" [ "E0107" ];
+  errs "pipe-type" "fn plus(x: Int, y: Int) -> Int { x + y }\n\nfn main(root: Root) {\n    let x = \"a\" |> plus(1)\n}\n" [ "E0201" ];
+  (* a line may start with `|>`, but not with another binary operator *)
+  errs "pipe-newline" (main_wrap "    let x = 3\n        |> double\n}\n\nfn double(x: Int) -> Int {\n    x * 2") [];
 
   (* ---------- tuples and maps ---------- *)
   out "tuples" (example "tuples.vela") "3 2 (2, 1)\n(1, \"one\", 1.5) 1 one 1.5 (2, \"a\")\n4 ((1, 2), (3, (4, 5)))\n1 3 4 5\na1 b2 c3 \nyes zero yes no 7\ntrue false 6\n";

@@ -33,6 +33,7 @@ let rec expr e =
   | EVar n -> n
   | EList es -> "[" ^ String.concat "," (List.map expr es) ^ "]"
   | EBin (o, a, b) -> "(" ^ expr a ^ op o ^ expr b ^ ")"
+  | EPipe (a, b) -> "(" ^ expr a ^ "|>" ^ expr b ^ ")"
   | EUn (Neg, a) -> "(-" ^ expr a ^ ")"
   | EUn (Not, a) -> "(!" ^ expr a ^ ")"
   | ECall (f, a) -> expr f ^ "(" ^ String.concat "," (List.map expr a) ^ ")"

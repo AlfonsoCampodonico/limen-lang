@@ -146,7 +146,7 @@ let op_str = function
 let rec bare_struct e =
   match e.edesc with
   | EStruct (n, _, _) -> not (is_tuple_name n)
-  | EBin (_, a, b) -> bare_struct a || bare_struct b
+  | EBin (_, a, b) | EPipe (a, b) -> bare_struct a || bare_struct b
   | EUn (_, a) | ETry a | EField (a, _, _) | EIndex (a, _) -> bare_struct a
   | EMethod (r, _, _, _) -> bare_struct r
   | ECall (f, _) -> bare_struct f
@@ -156,7 +156,7 @@ let rec simple_expr e =
   match e.edesc with
   | EBlock _ | EIf _ | EMatch _ | EGroup _ -> false
   | EClosure (_, b) -> simple_expr b
-  | EBin (_, a, b) | EIndex (a, b) -> simple_expr a && simple_expr b
+  | EBin (_, a, b) | EIndex (a, b) | EPipe (a, b) -> simple_expr a && simple_expr b
   | EUn (_, a) | ETry a | EField (a, _, _) -> simple_expr a
   | ECall (f, args) -> simple_expr f && List.for_all simple_expr args
   | EMethod (r, _, _, args) -> simple_expr r && List.for_all simple_expr args
@@ -168,6 +168,7 @@ let rec expr c ind ?(min = 0) e =
   let p =
     match e.edesc with
     | EBin (op, _, _) -> prec op
+    | EPipe _ -> 1
     | EUn _ -> 14
     | EClosure _ -> 0
     | _ -> 18
@@ -190,6 +191,15 @@ and expr_inner c ind e =
     end
     else add c (if op = Range then op_str op else " " ^ op_str op ^ " ");
     expr c ind ~min:(p + 1) b
+  | EPipe (a, b) ->
+    (* a pipeline written one step per line stays that way *)
+    expr c ind ~min:1 a;
+    if has_newline c a.espan.hi b.espan.lo then begin
+      break_at_comments c (ind + 4) a.espan.hi b.espan.lo;
+      add c "|> "
+    end
+    else add c " |> ";
+    expr c ind ~min:2 b
   | EUn (op, a) ->
     add c (match op with Neg -> "-" | Not -> "!");
     expr c ind ~min:16 a

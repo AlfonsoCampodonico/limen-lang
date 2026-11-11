@@ -34,7 +34,7 @@ fn parse_names(body: Str) -> List[Str] {   // no capabilities: cannot do I/O
 - **Floats:** digits with a fraction (`1.5`), an exponent (`1e9`, `2.5E-3`), or both. `_` is allowed. There is no leading-dot form (`.5`).
 - **Strings:** `"..."`, may span lines. Escapes: `\n \t \r \\ \" \{ \} \0`. Any other escape is error E0006.
 - **Interpolation:** `{expr}` inside a string evaluates any expression, including ones with their own strings: `"{xs.join(", ")}"`. An empty `{}` is error E0007; write `\{` for a literal brace.
-- **Symbols:** `( ) { } [ ] , : ; . | + - * / % ! ? = < > -> => == != <= >= && || ..<`.
+- **Symbols:** `( ) { } [ ] , : ; . | + - * / % ! ? = < > -> => == != <= >= && || ..< |>`.
 
 ### Newlines
 
@@ -46,7 +46,13 @@ Statements are separated by a newline or `;`. Two statements on one line without
       .map(|x| x * 2)
       .sum()
   ```
-- A binary operator at the **end** of a line continues the expression; one at the start of a line does not. So `a\n-1` is two statements.
+- A line starting with `|>` continues a pipeline (section 5):
+  ```
+  let line = name
+      |> text.pad_right(12, ".")
+      |> with_price(price)
+  ```
+- Any other binary operator continues the expression only at the **end** of a line; one at the start of a line does not. So `a\n-1` is two statements.
 - `(`, `[` and `?` at the start of a line do not apply to the previous line: `f\n(x)` is two statements.
 - Inside `(...)`, `[...]`, struct literals, parameter lists and match arms, a newline can replace a `,`.
 
@@ -270,16 +276,17 @@ From loosest to tightest. All binary operators are left-associative.
 
 | Level | Operators |
 | --- | --- |
-| 1 | `\|\|` |
-| 2 | `&&` |
-| 3 | `==` `!=` |
-| 4 | `<` `<=` `>` `>=` |
-| 5 | `..<` |
-| 6 | `+` `-` |
-| 7 | `*` `/` `%` |
-| 8 | `??` |
-| 9 | unary `-` `!` |
-| 10 | call `f(x)`, index `a[i]`, field `p.x`, method `s.len()`, `?` |
+| 1 | `\|>` |
+| 2 | `\|\|` |
+| 3 | `&&` |
+| 4 | `==` `!=` |
+| 5 | `<` `<=` `>` `>=` |
+| 6 | `..<` |
+| 7 | `+` `-` |
+| 8 | `*` `/` `%` |
+| 9 | `??` |
+| 10 | unary `-` `!` |
+| 11 | call `f(x)`, index `a[i]`, field `p.x`, method `s.len()`, `?` |
 
 ### Operators
 
@@ -316,6 +323,22 @@ Both operands must have the same type. The **ordered** types are `Int`, `Float`,
 ### The `?` operator
 
 On a `Result[T, E]`, `e?` evaluates to the `Ok` value or returns `Err(e)` from the enclosing function, which must return `Result[_, E]` with the same `E` (E0202). Convert errors with `.map_err(|e| ...)`. On an `Option[T]`, `?` returns `None` from a function returning `Option`.
+
+### Pipes
+
+`x |> f(a, b)` is `f(x, a, b)`: the value on the left goes in as the **first** argument of the call on the right, as in F# and Elixir. A pipeline reads in the order things happen:
+
+```
+let report = read_orders(text)
+    |> list.sort_by(|a, b| a.total > b.total)
+    |> top(10)
+    |> summarize
+```
+
+- The right side is a call `f(a)`, a method or module call `r.m(a)` or `list.sort_by(less)` (the value goes in after the receiver: `x |> r.m(a)` is `r.m(x, a)`), a bare function or closure `f`, `list.sum`, `(|n| n * 2)`, which is called with the value alone, or one of those followed by `?`: `text |> parse()?` is `parse(text)?`. Anything else is error E0003.
+- `|>` is the loosest operator, below `||`, and left-associative: `a + b |> f` is `f(a + b)`, and `x |> f |> g` is `g(f(x))`. To use a pipeline's result in a larger expression, put it in parentheses or a `let`: `(xs |> total) + 1`, `(user |> find) ?? guest`.
+- A line may start with `|>`, so a pipeline can be written one step per line, like a method chain.
+- A pipe is exactly the call it stands for, so it type-checks and evaluates as that call: `x |> r.m(a)` evaluates `r`, then `x`, then `a`.
 
 ### Calls
 
@@ -983,7 +1006,7 @@ stmt       = "let" [ "mut" ] IDENT [ ":" type ] "=" expr
            | "break" | "continue"
            | expr [ "=" expr ] ;
 
-expr       = unary { BINOP unary } ;            (* precedence: section 5 *)
+expr       = unary { BINOP unary | "|>" unary } ; (* precedence: section 5; a line may start with "|>" *)
 expr_ns    = expr ;                             (* no struct literal at the top level *)
 unary      = ( "-" | "!" ) unary | postfix ;
 postfix    = primary { "(" [ args ] ")" | "[" expr "]" | "." IDENT [ "(" [ args ] ")" ] | "." INT | "?" } ;

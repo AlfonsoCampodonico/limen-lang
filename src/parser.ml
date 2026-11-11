@@ -146,12 +146,24 @@ let binop_of = function
 let rec parse_expr st = parse_bin st false 0
 and parse_expr_ns st = parse_bin st true 0
 
+(* `|>` is the loosest binary operator (level 1, left-associative) and may
+   start a line, so a pipeline can be written one step per line. *)
 and parse_bin st ns minp =
   let lhs = ref (parse_unary st ns) in
   let go = ref true in
   while !go do
     let t = peek st in
-    match if t.nl then None else binop_of t.tok with
+    match if t.tok = SYM "|>" then None else if t.nl then None else binop_of t.tok with
+    | _ when t.tok = SYM "|>" && minp < 1 ->
+      ignore (advance st);
+      let rhs = parse_bin st ns 1 in
+      if pipe_call !lhs rhs = None then
+        raise
+          (Diag.Fatal
+             (Diag.make "E0003" rhs.espan
+                ~notes:[ "`x |> f(a)` means `f(x, a)`: the value goes in as the first argument" ]
+                "the right side of `|>` must be a function or a call, as in `x |> f`, `x |> f(a)` or `x |> list.map(g)`"));
+      lhs := mk (EPipe (!lhs, rhs)) (merge (!lhs).espan rhs.espan)
     | Some (p, op) when p > minp ->
       ignore (advance st);
       let rhs = parse_bin st ns p in

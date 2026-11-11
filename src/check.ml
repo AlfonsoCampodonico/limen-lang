@@ -499,6 +499,7 @@ and check_expr_inner ctx f e : ty =
   | EClosure (ps, body) -> check_closure ctx f ps body None
   | EStruct (name, nsp, fields) -> check_struct_lit ctx f name nsp fields e.espan
   | EDyn (x, i) -> ignore (check_expr ctx f x); TDyn i
+  | EPipe _ -> failwith "pipes are expanded when modules load"
   | EGroup (name, until, b) ->
     let t = fresh () in
     Option.iter

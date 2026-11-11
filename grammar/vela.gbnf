@@ -3,11 +3,14 @@
 # It follows SPEC.md section 15 at the character level, including the newline
 # rules: statements are separated by a newline or `;`; inside brackets and
 # after a binary operator a newline is free; a line may start with `.` to
-# continue a method chain; a line may not start with a binary operator, `(`,
-# `[` or `?` that belongs to the previous line.
+# continue a method chain or with `|>` to continue a pipeline; a line may not
+# start with another binary operator, `(`, `[` or `?` that belongs to the
+# previous line.
 #
 # It accepts a slight superset of Vela: keywords are not excluded from
-# identifiers, types are not checked, and integer literals may exceed 64 bits. It requires at least one space or
+# identifiers, types are not checked, integer literals may exceed 64 bits, and
+# the right side of `|>` may be any operand (the parser wants a call or a
+# function). It requires at least one space or
 # tab after a keyword (`if x`, not `if(x)`), which is the canonical style.
 
 root ::= ws (top ws)*
@@ -59,7 +62,8 @@ while  ::= "while" sp1 expr sp block
 for    ::= "for" sp1 (ident sp1 | upat sp) "in" sp1 expr sp block
 
 # ---------- expressions ----------
-expr    ::= unary (sp binop ws unary)*
+# `|>` may also start a line, to continue a pipeline
+expr    ::= unary (sp binop ws unary | ws "|>" ws unary)*
 binop   ::= "??" | "||" | "&&" | "==" | "!=" | "<=" | ">=" | "<" | ">" | "..<" | "+" | "-" | "*" | "/" | "%"
 unary   ::= ("-" | "!") sp unary | postfix
 postfix ::= primary suffix*

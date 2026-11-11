@@ -90,7 +90,7 @@ let rec walk_expr (f : expr -> unit) e =
   | EInt _ | EFloat _ | EBool _ | EUnit | EVar _ -> ()
   | EStr ps -> List.iter (function SPExpr x -> w x | SPLit _ -> ()) ps
   | EList es -> List.iter w es
-  | EBin (_, a, b) | EIndex (a, b) -> w a; w b
+  | EBin (_, a, b) | EIndex (a, b) | EPipe (a, b) -> w a; w b
   | EUn (_, a) | ETry a | EField (a, _, _) -> w a
   | ECall (c, args) -> w c; List.iter w args
   | EMethod (r, _, _, args) -> w r; List.iter w args

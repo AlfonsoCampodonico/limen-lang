@@ -52,6 +52,7 @@ and expr_desc =
       (* `group g until clock.after(ms) { ... }`: the deadline's clock and milliseconds *)
   | EDyn of expr * string (* inserted by the checker: box a value as `dyn Interface` *)
   | ESelect of sel_arm list
+  | EPipe of expr * expr (* `x |> f(a)`: becomes `f(x, a)` when modules load *)
 
 and str_part = SPLit of string | SPExpr of expr
 
@@ -128,6 +129,22 @@ type item = IFn of fn_decl | IStruct of struct_decl | IEnum of enum_decl | IIfac
    the name cannot be written in source. *)
 let tuple_name n = "#tuple" ^ string_of_int n
 let is_tuple_name s = String.length s > 6 && String.sub s 0 6 = "#tuple"
+
+(* `x |> rhs`: the call it stands for, with [x] as the first argument.
+   `f(a)` and `r.m(a)` get it in front of their arguments, `f` and `r.m`
+   become one-argument calls, and `rhs?` pipes into the call inside the `?`.
+   None: the right side is not something a value can be piped into. *)
+let rec pipe_call (x : expr) (rhs : expr) : expr_desc option =
+  match rhs.edesc with
+  | ECall (f, args) -> Some (ECall (f, x :: args))
+  | EMethod (r, m, msp, args) -> Some (EMethod (r, m, msp, x :: args))
+  | EField (r, m, msp) when not (String.length m > 0 && m.[0] >= '0' && m.[0] <= '9') -> Some (EMethod (r, m, msp, [ x ]))
+  | EVar _ | EClosure _ -> Some (ECall (rhs, [ x ]))
+  | ETry inner -> (
+    match pipe_call x inner with
+    | Some d -> Some (ETry { inner with edesc = d; espan = Span.merge x.espan inner.espan })
+    | None -> None)
+  | _ -> None
 
 (* A parsed file: its `use` declarations and its items. *)
 type file = { uses : (string * span) list; items : item list }

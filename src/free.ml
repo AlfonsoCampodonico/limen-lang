@@ -18,7 +18,7 @@ let rec fv bound acc e =
     fv_block (n :: bound) acc b
   | EStr ps -> List.fold_left (fun acc -> function SPExpr x -> go acc x | SPLit _ -> acc) acc ps
   | EList es -> List.fold_left go acc es
-  | EBin (_, a, b) | EIndex (a, b) -> go (go acc a) b
+  | EBin (_, a, b) | EIndex (a, b) | EPipe (a, b) -> go (go acc a) b
   | EUn (_, a) | ETry a | EField (a, _, _) -> go acc a
   | ECall (c, args) -> List.fold_left go (go acc c) args
   | EMethod (r, _, _, args) -> List.fold_left go (go acc r) args
@@ -69,7 +69,7 @@ let rec has_escape e =
   | EGroup (_, until, b) -> (match until with Some (c, ms) -> has_escape c || has_escape ms | None -> false) || block_escape b
   | EStr ps -> List.exists (function SPExpr x -> has_escape x | SPLit _ -> false) ps
   | EList es -> List.exists has_escape es
-  | EBin (_, a, b) | EIndex (a, b) -> has_escape a || has_escape b
+  | EBin (_, a, b) | EIndex (a, b) | EPipe (a, b) -> has_escape a || has_escape b
   | EUn (_, a) | EField (a, _, _) -> has_escape a
   | ECall (c, args) -> has_escape c || List.exists has_escape args
   | EMethod (r, _, _, args) -> has_escape r || List.exists has_escape args

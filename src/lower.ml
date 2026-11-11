@@ -293,6 +293,7 @@ let rec lower f (e : expr) : I.atom =
     | ESelect arms -> lower_select f e arms ty
     | EBlock b -> lower_block f b
     | EClosure (ps, body) -> lower_closure f ps body ty
+    | EPipe _ -> failwith "pipes are expanded when modules load"
     | EStruct (name, _, fields) ->
       let vals = List.map (fun (fname, _, x) -> (fname, lower f x)) fields in
       let decl = Hashtbl.find f.g.structs name in

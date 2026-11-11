@@ -180,6 +180,11 @@ let rec expr env locals (e : expr) : expr =
         | Some (IFn _) -> EVar (qual env.self n)
         | _ -> if is_module env locals n then (err "E0404" e.espan (Printf.sprintf "module `%s` is not a value; use one of its items, such as `%s.name`" n n); e.edesc) else e.edesc)
     | EList es -> EList (List.map ex es)
+    | EPipe (x, rhs) -> (
+      (* `x |> f(a)` is `f(x, a)` from here on *)
+      match pipe_call x rhs with
+      | Some d -> (ex { e with edesc = d }).edesc
+      | None -> e.edesc (* the parser rejects it *))
     | EBin (op, a, b) -> EBin (op, ex a, ex b)
     | EUn (op, a) -> EUn (op, ex a)
     | ECall (c, args) -> ECall (ex c, List.map ex args)

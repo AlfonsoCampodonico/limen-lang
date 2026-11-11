@@ -130,7 +130,7 @@ let index (items : item list) : occ list =
     | EInt _ | EFloat _ | EBool _ | EUnit -> ()
     | EStr ps -> List.iter (function SPExpr y -> x y | SPLit _ -> ()) ps
     | EList es -> List.iter x es
-    | EBin (_, a, b) | EIndex (a, b) -> x a; x b
+    | EBin (_, a, b) | EIndex (a, b) | EPipe (a, b) -> x a; x b
     | EUn (_, a) | ETry a -> x a
     | (EField ({ edesc = EVar en; espan; _ }, v, nsp) | EMethod ({ edesc = EVar en; espan; _ }, v, nsp, _))
       when (not (List.mem_assoc en env)) && List.exists (fun d -> d.en_name = en) !enums ->

@@ -18,7 +18,7 @@ let keywords =
   [ "fn"; "let"; "mut"; "if"; "else"; "match"; "for"; "in"; "while"; "return"; "struct";
     "enum"; "true"; "false"; "group"; "break"; "continue"; "pub"; "use"; "interface"; "dyn"; "select" ]
 
-let syms2 = [ "->"; "=>"; "=="; "!="; "<="; ">="; "&&"; "||"; "??" ]
+let syms2 = [ "->"; "=>"; "=="; "!="; "<="; ">="; "&&"; "||"; "??"; "|>" ]
 let syms1 = "(){}[],:;.|+-*/%!?=<>"
 
 let describe = function
