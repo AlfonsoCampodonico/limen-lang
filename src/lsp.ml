@@ -87,6 +87,7 @@ let rec walk_expr (f : expr -> unit) e =
   | EBlock b | EGroup (_, b) -> walk_block f b
   | EClosure (_, body) -> w body
   | EStruct (_, _, fs) -> List.iter (fun (_, _, x) -> w x) fs
+  | EDyn (x, _) -> w x
 
 and walk_block f b =
   List.iter
@@ -267,6 +268,7 @@ let definitions items =
            | None -> ());
           x v)
         fs
+    | EDyn (y, _) -> x y
   and block env b =
     let env =
       List.fold_left

@@ -470,6 +470,7 @@ let rec eval rt env e : value =
     let decl = Hashtbl.find rt.structs name in
     let vals = List.map (fun (f, _, x) -> (f, eval rt env x)) fields in
     VStruct (name, List.map (fun (f, _, _) -> (f, List.assoc f vals)) decl.st_fields)
+  | EDyn (x, _) -> eval rt env x (* values carry their type, so methods dispatch on it *)
   | EGroup (name, b) ->
     (* tasks are coroutines; the group waits until every one has a result *)
     let tasks = ref [] in

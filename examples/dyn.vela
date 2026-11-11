@@ -1,0 +1,110 @@
+// dyn: values of different types that satisfy one interface, in one list.
+
+interface Shape {
+    fn area(self) -> Float
+    fn name(self) -> Str
+}
+
+struct Circle {
+    r: Float,
+}
+
+struct Square {
+    s: Float,
+}
+
+enum Tri {
+    Right(Float, Float),
+}
+
+struct Labeled[T] {
+    label: Str,
+    inner: T,
+}
+
+struct Scene {
+    title: Str,
+    shapes: List[dyn Shape],
+}
+
+fn area(self: Circle) -> Float {
+    3.0 * self.r * self.r
+}
+
+fn name(self: Circle) -> Str {
+    "circle"
+}
+
+fn area(self: Square) -> Float {
+    self.s * self.s
+}
+
+fn name(self: Square) -> Str {
+    "square"
+}
+
+fn area(self: Tri) -> Float {
+    match self {
+        Right(a, b) => a * b / 2.0,
+    }
+}
+
+fn name(self: Tri) -> Str {
+    "triangle"
+}
+
+// a generic type's methods work through dyn as well
+fn area[T](self: Labeled[T]) -> Float {
+    self.label.len().to_float()
+}
+
+fn name[T](self: Labeled[T]) -> Str {
+    self.label
+}
+
+fn biggest(xs: List[dyn Shape]) -> Str {
+    let mut best = ""
+    let mut most = -1.0
+    for s in xs {
+        if s.area() > most {
+            most = s.area()
+            best = s.name()
+        }
+    }
+    best
+}
+
+fn make(k: Int) -> dyn Shape {
+    if k == 0 {
+        return Circle { r: 1.0 }
+    }
+    Square { s: k.to_float() }
+}
+
+// a generic function works with dyn values too
+fn total[T: Shape](xs: List[T]) -> Float {
+    xs.map(|s| s.area()).fold(0.0, |a, b| a + b)
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let shapes: List[dyn Shape] = [Circle { r: 1.0 }, Square { s: 2.0 }, Right(3.0, 4.0)]
+    let mut more = shapes
+    more.push(make(0))
+    more.push(make(5))
+    out.print("{shapes.len()} {more.len()} {biggest(shapes)} {biggest(more)}")
+    out.print(more.map(|s| s.name()).join(","))
+    out.print("{total(more)}")
+    let sc = Scene { title: "demo", shapes: more }
+    out.print("{sc.title}: {sc.shapes.len()} {sc.shapes[1]}")
+    let one: dyn Shape = Square { s: 1.5 }
+    out.print("{one.area()} {one}")
+    let mixed: List[dyn Shape] = [Labeled { label: "abcd", inner: 1 }, Labeled { label: "xy", inner: "s" }, one]
+    // dyn values handed to concurrent tasks
+    let areas = group g {
+        for s in mixed {
+            g.go(|| s.area())
+        }
+    }
+    out.print("{areas} {biggest(mixed)}")
+}

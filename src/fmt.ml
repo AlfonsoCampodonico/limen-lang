@@ -91,6 +91,7 @@ let rec ty (t : ty_expr) =
   match t.tdesc with
   | TyUnit -> "()"
   | TyInt n -> string_of_int n
+  | TyName ("dyn", [ i ]) -> "dyn " ^ ty i
   | TyName (n, []) -> n
   | TyName (n, args) -> n ^ "[" ^ String.concat ", " (List.map ty args) ^ "]"
   | TyFn (ps, r) -> "fn(" ^ String.concat ", " (List.map ty ps) ^ ") -> " ^ ty r
@@ -248,6 +249,7 @@ and expr_inner c ind e =
   | EGroup (name, b) ->
     add c ("group " ^ name ^ " ");
     block c ind b
+  | EDyn (x, _) -> expr c ind x
 
 and head c ind e =
   if bare_struct e then (add c "("; expr c ind e; add c ")") else expr c ind e

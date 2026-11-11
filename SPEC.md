@@ -176,6 +176,23 @@ test "elapsed" {
 
 `vela caps` reports a function with bounded type parameters like one that takes callbacks: what it can do depends on the type it is called with.
 
+### Interface values: `dyn`
+
+`dyn Shape` is a type: a value of any type that satisfies `Shape`, called through the interface's methods. A list of them can mix types:
+
+```
+let shapes: List[dyn Shape] = [Circle { r: 1.0 }, Square { s: 2.0 }]
+for s in shapes {
+    out.print("{s.name()}: {s.area()}")
+}
+```
+
+- A struct or enum value becomes `dyn Shape` where one is expected: an annotated `let`, a function argument, a list literal of that type, a struct field, a `return`, the last expression of a function returning `dyn Shape`, or `push`. Its type must satisfy the interface (E0111).
+- Only struct and enum values can become `dyn`, and only if they hold no capability, function or channel (E0112), so a `dyn` value never hides authority. To work with capabilities through an interface, use a bounded type parameter instead.
+- Only the interface's methods can be called on a `dyn` value. It prints like the value inside. `==` is not allowed.
+- Both branches of an `if` must have the same type, so to choose between types, return early or annotate a `let`: `let s: dyn Shape = if big { ... } else { ... }` does not work yet; write `return` in one branch.
+- A `dyn` value is boxed and its calls go through a table of methods; a bounded type parameter (`[T: Shape]`) has no such cost.
+
 ### main
 
 `main` must be one of:
@@ -568,7 +585,8 @@ Every diagnostic has a stable code. `vela explain CODE` prints its explanation, 
 | E0108 | not callable |
 | E0109 | wrong number of type arguments |
 | E0110 | misplaced `self`, or a method on a built-in type |
-| E0111 | a type does not satisfy an interface bound |
+| E0111 | a type does not satisfy an interface |
+| E0112 | a value that cannot become `dyn` |
 | E0201 | type mismatch |
 | E0202 | misuse of `?` |
 | E0203 | `if` without `else` produces a value |
@@ -612,7 +630,8 @@ struct     = "struct" IDENT [ generics ] "{" [ field { sep field } [ "," ] ] "}"
 field      = IDENT ":" type ;
 enum       = "enum" IDENT [ generics ] "{" [ variant { sep variant } [ "," ] ] "}" ;
 variant    = IDENT [ "(" type { "," type } ")" ] ;
-type       = IDENT [ "." IDENT ] [ "[" typearg { "," typearg } "]" ]
+type       = "dyn" IDENT [ "." IDENT ]               (* an interface value *)
+           | IDENT [ "." IDENT ] [ "[" typearg { "," typearg } "]" ]
            | "(" ")"
            | "fn" "(" [ type { "," type } ] ")" "->" type ;
 typearg    = type | INT ;                       (* INT only as Array's size *)
@@ -746,4 +765,4 @@ The handler is a plain function value, so it gets no capability unless a closure
 
 ## 20. Not yet
 
-Interface values (`dyn`, for lists of mixed types), unbuffered (capacity 0) channels, `select` over several channels, TLS, SQL, a package registry, and a Cranelift backend. See the design doc's Known gaps for the full list.
+Unbuffered (capacity 0) channels, `select` over several channels, TLS, SQL, a package registry, and a Cranelift backend. See the design doc's Known gaps for the full list.

@@ -90,6 +90,7 @@ let rec resolve env (te : ty_expr) : ty =
   | TyFn (ps, r) -> TFn (List.map (resolve env) ps, resolve env r)
   | TyInt _ -> TUnit
   | TyName ("Array", [ elt; { tdesc = TyInt n; _ } ]) -> TArray (resolve env elt, n)
+  | TyName ("dyn", [ { tdesc = TyName (i, []); _ } ]) -> TDyn i
   | TyName (n, args) -> (
     let a = List.map (resolve env) args in
     match (n, a) with
@@ -270,6 +271,20 @@ let rec lower f (e : expr) : I.atom =
       let vals = List.map (fun (fname, _, x) -> (fname, lower f x)) fields in
       let decl = Hashtbl.find f.g.structs name in
       tmp f ty (I.MkStruct (ty, List.map (fun (fn, _, _) -> List.assoc fn vals) decl.st_fields))
+    | EDyn (x, i) ->
+      let t = tyof f x in
+      let a = lower f x in
+      let n = match t with TNamed (n, _) -> n | _ -> failwith "dyn of a non-named type" in
+      let ms = Option.value ~default:[] (Hashtbl.find_opt Check.ifaces i) in
+      let entries =
+        List.map
+          (fun (m, (ps, r)) ->
+            let key = n ^ "::" ^ m in
+            let d = Hashtbl.find f.g.fns key in
+            (instance f.g key (derive_targs d (t :: ps)), ps, r))
+          ms
+      in
+      tmp f ty (I.MkDyn (t, i, a, entries))
     | EGroup (name, b) ->
       let t = match ty with TList t -> t | _ -> TUnit in
       let g = fresh_var name (TGroup t) in
@@ -440,9 +455,34 @@ and bind_pat f a t (p : pat) =
       (List.combine args ptys)
   | _ -> ()
 
+(* The type arguments of generic function [d] called with arguments of the
+   given concrete types. *)
+and derive_targs d act =
+  let found = ref [] in
+  let rec m decl act =
+    match (decl, act) with
+    | TParam g, t -> if not (List.mem_assoc g !found) then found := (g, t) :: !found
+    | TList a, TList b | TChan a, TChan b | TArray (a, _), TArray (b, _) -> m a b
+    | TNamed (_, xs), TNamed (_, ys) when List.length xs = List.length ys -> List.iter2 m xs ys
+    | TFn (xs, r1), TFn (ys, r2) when List.length xs = List.length ys -> List.iter2 m xs ys; m r1 r2
+    | _ -> ()
+  in
+  let genv = List.map (fun g -> (g, TParam g)) d.fn_gen in
+  let decl = List.map (fun p -> resolve genv p.prm_ty) d.fn_params in
+  if List.length decl = List.length act then List.iter2 m decl act;
+  List.map (fun g -> (g, Option.value ~default:TUnit (List.assoc_opt g !found))) d.fn_gen
+
 and lower_method f e recv name args ty =
   let rt = tyof f recv in
   match rt with
+  | TDyn i ->
+    (* through the vtable *)
+    let ms = Option.value ~default:[] (Hashtbl.find_opt Check.ifaces i) in
+    let rec index k = function [] -> failwith "dyn method" | (m, sg) :: rest -> if m = name then (k, sg) else index (k + 1) rest in
+    let k, (ps, r) = index 0 ms in
+    let ra = lower f recv in
+    let xs = List.map (lower f) args in
+    tmp f ty (I.CallDyn (k, ps, r, ra, xs))
   | TNamed (n, _) when Hashtbl.mem f.g.fns (n ^ "::" ^ name) ->
     (* a method on a user type: a call with the receiver first *)
     let key = n ^ "::" ^ name in
@@ -453,20 +493,7 @@ and lower_method f e recv name args ty =
       else begin
         (* reached through an interface bound, where the checker only knew a
            type parameter: read the instantiation off the actual types *)
-        let found = ref [] in
-        let rec m decl act =
-          match (decl, act) with
-          | TParam g, t -> if not (List.mem_assoc g !found) then found := (g, t) :: !found
-          | TList a, TList b | TChan a, TChan b | TArray (a, _), TArray (b, _) -> m a b
-          | TNamed (_, xs), TNamed (_, ys) when List.length xs = List.length ys -> List.iter2 m xs ys
-          | TFn (xs, r1), TFn (ys, r2) when List.length xs = List.length ys -> List.iter2 m xs ys; m r1 r2
-          | _ -> ()
-        in
-        let genv = List.map (fun g -> (g, TParam g)) d.fn_gen in
-        let decl = List.map (fun p -> resolve genv p.prm_ty) d.fn_params in
-        let act = List.map (tyof f) (recv :: args) in
-        if List.length decl = List.length act then List.iter2 m decl act;
-        List.map (fun g -> (g, Option.value ~default:TUnit (List.assoc_opt g !found))) d.fn_gen
+        derive_targs d (List.map (tyof f) (recv :: args))
       end
     in
     let c = instance f.g key targs in

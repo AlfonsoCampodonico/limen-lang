@@ -22,7 +22,7 @@ and pat_desc =
 (* [ety] and [einst] are filled in by the checker: the expression's type, and
    for a reference to a generic function, the type arguments it was used at. *)
 type expr = {
-  edesc : expr_desc;
+  mutable edesc : expr_desc; (* the checker wraps a value in EDyn where a `dyn` is expected *)
   espan : span;
   mutable ety : Types.ty;
   mutable einst : (string * Types.ty) list;
@@ -48,6 +48,7 @@ and expr_desc =
   | EClosure of (string * ty_expr option * span) list * expr
   | EStruct of string * span * (string * span * expr) list
   | EGroup of string * block
+  | EDyn of expr * string (* inserted by the checker: box a value as `dyn Interface` *)
 
 and str_part = SPLit of string | SPExpr of expr
 and arm = { apat : pat; abody : expr }

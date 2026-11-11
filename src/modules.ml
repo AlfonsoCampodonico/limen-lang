@@ -113,12 +113,12 @@ let rec ty env (t : ty_expr) : ty_expr =
         match module_of env a t.tspan with
         | Some m -> (
           match member env m b t.tspan with
-          | Some (IStruct _ | IEnum _) -> qual m b
+          | Some (IStruct _ | IEnum _ | IIface _) -> qual m b
           | _ -> no_member m b t.tspan; n)
         | None -> err "E0401" t.tspan (Printf.sprintf "unknown module `%s`; add `use %s` at the top of the file" a a); n)
       | None -> (
         if List.mem n env.gens then n
-        else match Hashtbl.find_opt env.own n with Some (IStruct _ | IEnum _) -> qual env.self n | _ -> n)
+        else match Hashtbl.find_opt env.own n with Some (IStruct _ | IEnum _ | IIface _) -> qual env.self n | _ -> n)
     in
     { t with tdesc = TyName (n, args) }
   | TyFn (ps, r) -> { t with tdesc = TyFn (List.map (ty env) ps, ty env r) }
@@ -231,6 +231,7 @@ let rec expr env locals (e : expr) : expr =
       in
       EStruct (n, sp, List.map (fun (f, fsp, x) -> (f, fsp, ex x)) fields)
     | EGroup (g, b) -> EGroup (g, block env (g :: locals) b)
+    | EDyn (x, i) -> EDyn (ex x, i)
   in
   { e with edesc = d }
 

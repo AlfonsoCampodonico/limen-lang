@@ -19,6 +19,7 @@ type ctx = {
   mutable task_tys : ty list; (* result types of spawned tasks *)
   mutable inrange : (int * int) list; (* (list var, index var): index proven in range *)
   mutable chan_tys : ty list; (* element types of channels *)
+  mutable dyns : (string * ty * (string * ty list * ty) list) list; (* vtables: C name, boxed type, methods *)
 }
 
 let is_enum c = function TNamed (n, _) -> Hashtbl.mem c.g.enums n | _ -> false
@@ -36,6 +37,7 @@ let rec cname c t =
     ignore (cname c r);
     "Clo"
   | TCap _ -> "Cap"
+  | TDyn _ -> "Dyn"
   | TGroup a ->
     ignore (cname c a);
     "Group"
@@ -71,6 +73,7 @@ let ctype c t =
   | TUnit -> "W_Unit"
   | TStr -> "WStr*"
   | TFn _ -> "WClo*"
+  | TDyn _ -> "WDyn*"
   | TCap _ -> "WCap*"
   | TGroup _ -> "WGroup*"
   | TChan _ -> "WChan*"
@@ -230,6 +233,17 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     let ps, r = match fv.ty with TFn (ps, r) -> (ps, r) | _ -> failwith "callclo type" in
     let sigt = sprintf "%s (*)(%s)" (ctype c r) (String.concat ", " ("WClo*" :: List.map (ctype c) ps)) in
     set (sprintf "((%s)(%s)->fn)(%s)" sigt (var fv) (String.concat ", " (var fv :: List.map a args)))
+  | I.MkDyn (t, i, x, ms) ->
+    let key = cname c t ^ "_as_" ^ String.map (fun ch -> if ch = '.' then '_' else ch) i in
+    if not (List.exists (fun (k, _, _) -> k = key) c.dyns) then c.dyns <- c.dyns @ [ (key, t, ms) ];
+    line "{";
+    line (sprintf "  struct Dyn_%s* d_ = (struct Dyn_%s*)w_alloc(sizeof(struct Dyn_%s));" key key key);
+    line (sprintf "  d_->base.rc = 1; d_->base.vt = (const WVt*)&Dyn_%s_vt; d_->val = %s;" key (a x));
+    line (sprintf "  %s = (WDyn*)d_;" dst);
+    line "}"
+  | I.CallDyn (k, ps, r, recv, args) ->
+    let sigt = sprintf "%s (*)(%s)" (ctype c r) (String.concat ", " ("WDyn*" :: List.map (ctype c) ps)) in
+    set (sprintf "((%s)(%s)->vt->m[%d])(%s)" sigt (a recv) k (String.concat ", " (a recv :: List.map a args)))
   | I.MkStruct (ty, args) ->
     set (if args = [] then sprintf "(%s){0}" (cname c ty) else sprintf "(%s){ %s }" (cname c ty) (String.concat ", " (List.map a args)))
   | I.MkEnum (ty, k, args) -> set (mk_enum c ty k (List.map a args))
@@ -836,7 +850,7 @@ let type_defs c (out : Buffer.t) =
 let program (g : Lower.gctx) (prog : I.program) : string =
   let c =
     { g; names = Hashtbl.create 32; types = []; lits = Hashtbl.create 32; lit_order = []; boxed = [];
-      envs = Hashtbl.create 16; uniq = []; task_tys = []; inrange = []; chan_tys = [] }
+      envs = Hashtbl.create 16; uniq = []; task_tys = []; inrange = []; chan_tys = []; dyns = [] }
   in
   (* bodies first: this discovers every type and literal *)
   let bodies = Buffer.create 65536 in
@@ -862,6 +876,29 @@ let program (g : Lower.gctx) (prog : I.program) : string =
         Buffer.add_string envs "}\n"
       end)
     prog.fns;
+  let dynbuf = Buffer.create 1024 in
+  List.iter
+    (fun (key, t, ms) ->
+      let ct = ctype c t and cn = cname c t in
+      let p = sprintf "((struct Dyn_%s*)d)->val" key in
+      Buffer.add_string dynbuf (sprintf "struct Dyn_%s { WDyn base; %s val; };\n" key ct);
+      Buffer.add_string dynbuf (sprintf "static void Dyn_%s_drop(WDyn* d) { %s }\n" key (if is_scalar t then "(void)d;" else sprintf "%s_drop(%s);" cn p));
+      Buffer.add_string dynbuf (sprintf "static void Dyn_%s_share(WDyn* d) { %s }\n" key (if is_scalar t then "(void)d;" else sprintf "%s_share(%s);" cn p));
+      Buffer.add_string dynbuf (sprintf "static void Dyn_%s_show(WBuf* b, WDyn* d, bool top) { %s_show(b, %s, top); }\n" key cn p);
+      List.iteri
+        (fun k (fn, ps, r) ->
+          let params = List.mapi (fun j pt -> sprintf "%s a%d" (ctype c pt) j) ps in
+          let self = if is_scalar t then p else sprintf "%s_dup(%s)" cn p in
+          Buffer.add_string dynbuf
+            (sprintf "static %s Dyn_%s_m%d(%s) { return %s(%s); }\n" (ctype c r) key k
+               (String.concat ", " ("WDyn* d" :: params)) fn
+               (String.concat ", " (self :: List.mapi (fun j _ -> sprintf "a%d" j) ps))))
+        ms;
+      Buffer.add_string dynbuf
+        (sprintf "static const struct { WVtHead h; void *m[%d]; } Dyn_%s_vt = { { Dyn_%s_drop, Dyn_%s_share, Dyn_%s_show }, { %s } };\n"
+           (max 1 (List.length ms)) key key key key
+           (if ms = [] then "NULL" else String.concat ", " (List.mapi (fun k _ -> sprintf "(void*)Dyn_%s_m%d" key k) ms))))
+    c.dyns;
   let tasks = Buffer.create 1024 in
   List.iter
     (fun t ->
@@ -930,4 +967,4 @@ let program (g : Lower.gctx) (prog : I.program) : string =
   String.concat "\n"
     [ Runtime_text.text; "/* ---- types ---- */"; Buffer.contents types; "/* ---- literals ---- */";
       Buffer.contents lits; "/* ---- closures ---- */"; Buffer.contents envs; Buffer.contents tasks; "/* ---- functions ---- */";
-      Buffer.contents protos; Buffer.contents bodies; Buffer.contents main ]
+      Buffer.contents protos; "/* ---- dyn vtables ---- */"; Buffer.contents dynbuf; Buffer.contents bodies; Buffer.contents main ]

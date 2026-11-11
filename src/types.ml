@@ -14,6 +14,7 @@ type ty =
   | TGroup of ty (* handle of a `group` block whose tasks return ty *)
   | TArray of ty * int (* fixed-size array, a value type *)
   | TChan of ty (* channel between tasks *)
+  | TDyn of string (* a value of any type that satisfies the interface, boxed with its methods *)
   | TParam of string (* a generic parameter inside its own definition *)
   | TVar of tvar ref
   | TErr (* already reported; unifies with anything *)
@@ -64,6 +65,7 @@ let rec show t =
   | TGroup a -> "Group[" ^ show a ^ "]"
   | TArray (a, n) -> "Array[" ^ show a ^ ", " ^ string_of_int n ^ "]"
   | TChan a -> "Chan[" ^ show a ^ "]"
+  | TDyn i -> "dyn " ^ i
   | TParam n -> n
   | TVar _ -> "_"
   | TErr -> "?"
@@ -96,6 +98,7 @@ let rec unify a b =
     List.iter2 unify a1 a2
   | TCap c1, TCap c2 when c1 = c2 -> ()
   | TParam x, TParam y when x = y -> ()
+  | TDyn x, TDyn y when x = y -> ()
   | _ -> raise Mismatch
 
 let rec subst env t =

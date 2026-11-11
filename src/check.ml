@@ -106,6 +106,12 @@ let rec resolve ctx env (te : ty_expr) : ty =
   | TyName ("Array", _) ->
     err ctx "E0109" te.tspan "`Array` takes an element type and a size, as in `Array[Float, 4]`";
     TErr
+  | TyName ("dyn", [ { tdesc = TyName (i, []); tspan } ]) ->
+    if Hashtbl.mem ifaces i then TDyn i
+    else begin
+      did_you_mean ctx "E0102" tspan (sprintf "unknown interface `%s`" i) i (List.of_seq (Hashtbl.to_seq_keys ifaces));
+      TErr
+    end
   | TyName (n, args) -> (
     let args' = List.map (resolve ctx env) args in
     let want k =
@@ -301,6 +307,39 @@ let root_fields = [ ("net", TCap Net); ("fs", TCap Fs); ("stdout", TCap Stdout);
 
 (* ---------- expressions ---------- *)
 
+(* Does [t] have every method of interface [i], with the same types? *)
+let satisfies ctx t i : string option =
+  let ms = Option.value ~default:[] (Hashtbl.find_opt ifaces i) in
+  let t = repr t in
+  let check (m, (ps, r)) =
+    let want = TFn (ps, r) in
+    let trial got = try unify want got; None with Mismatch -> Some (sprintf "its `%s` has type `%s`, but `%s` needs `%s`" m (show got) i (show want)) in
+    match t with
+    | TVar _ | TErr -> None
+    | TDyn j when j = i -> None
+    | TDyn j -> (
+      match Option.bind (Hashtbl.find_opt ifaces j) (List.assoc_opt m) with
+      | Some (ps', r') -> trial (TFn (ps', r'))
+      | None -> Some (sprintf "`dyn %s` has no method `%s`" j m))
+    | TParam g ->
+      let bs = Option.value ~default:[] (List.assoc_opt g !cur_bounds) in
+      if List.mem i bs then None
+      else (
+        match List.find_map (fun b -> Option.bind (Hashtbl.find_opt ifaces b) (List.assoc_opt m)) bs with
+        | Some (ps', r') -> trial (TFn (ps', r'))
+        | None -> Some (sprintf "type parameter `%s` is not bounded by `%s`; add it: `[%s: %s]`" g i g i))
+    | TNamed (n, _) when Hashtbl.mem ctx.fns (n ^ "::" ^ m) -> (
+      let _, ft = instantiate (Hashtbl.find ctx.fns (n ^ "::" ^ m)) in
+      match ft with
+      | TFn (p0 :: rest, r') -> (try unify p0 t; trial (TFn (rest, r')) with Mismatch -> trial (TFn (rest, r')))
+      | _ -> Some (sprintf "its `%s` is not a method" m))
+    | _ -> (
+      match List.assoc_opt m (methods t) with
+      | Some mk -> let ps', r' = mk () in trial (TFn (ps', r'))
+      | None -> Some (sprintf "`%s` has no method `%s`" (show t) m))
+  in
+  List.find_map check ms
+
 let rec check_expr ctx f e : ty =
   let t = check_expr_inner ctx f e in
   e.ety <- t;
@@ -373,6 +412,7 @@ and check_expr_inner ctx f e : ty =
   | EBlock b -> check_block ctx f b
   | EClosure (ps, body) -> check_closure ctx f ps body None
   | EStruct (name, nsp, fields) -> check_struct_lit ctx f name nsp fields e.espan
+  | EDyn (x, i) -> ignore (check_expr ctx f x); TDyn i
   | EGroup (name, b) ->
     let t = fresh () in
     push f;
@@ -395,7 +435,36 @@ and expect ctx f e want =
       err ctx "E0201" e.espan
         (sprintf "expected %d element%s for `%s`, found %d" n (plural n) (show want) (List.length es));
     e.ety <- want
+  | EList es, TList el when (match repr el with TDyn _ -> true | _ -> false) ->
+    (* each element is boxed on its own, so a list can mix types *)
+    List.iter (fun x -> expect ctx f x el) es;
+    e.ety <- want
+  | _, TDyn i -> coerce ctx e (check_expr ctx f e) i
   | _ -> expect_plain ctx f e want
+
+(* A value used where `dyn I` is expected: box it if its type satisfies I. *)
+and coerce ctx e t i =
+  match repr t with
+  | TDyn j when j = i -> ()
+  | TVar _ -> unify_at ctx e.espan (TDyn i) t
+  | TErr -> ()
+  | TNamed (n, _) as ct when (Hashtbl.mem ctx.structs n || Hashtbl.mem ctx.enums n) && not (List.mem n [ "Option"; "Result"; "IoError" ]) ->
+    if caps_in ct [] <> [] || has_fn ct || has_chan ct then
+      err ctx "E0112" e.espan
+        (sprintf "`%s` holds a capability, function or channel, so it cannot become `dyn %s`" (show ct) i)
+        ~notes:[ "authority must stay visible in types; pass it with a type parameter, as in `[T: " ^ i ^ "]`" ]
+    else begin
+      match satisfies ctx ct i with
+      | Some why -> err ctx "E0111" e.espan (sprintf "`%s` does not satisfy interface `%s`" (show ct) i) ~notes:[ why ]
+      | None ->
+        let inner = { e with edesc = e.edesc } in
+        e.edesc <- EDyn (inner, i);
+        e.ety <- TDyn i
+    end
+  | t ->
+    err ctx "E0112" e.espan
+      (sprintf "only struct and enum values can become `dyn %s`, not `%s`" i (show t))
+      ~notes:[ "wrap the value in a struct that has the interface's methods" ]
 
 and expect_plain ctx f e want =
   match e.edesc with
@@ -464,7 +533,7 @@ and check_call ctx f callee args sp =
        let t = check_expr ctx f a in
        expect ctx f b t;
        match repr t with
-       | TFn _ | TCap _ | TChan _ -> err ctx "E0201" sp (sprintf "values of type `%s` cannot be compared" (show t))
+       | TFn _ | TCap _ | TChan _ | TDyn _ -> err ctx "E0201" sp (sprintf "values of type `%s` cannot be compared" (show t))
        | _ -> ())
      | _ -> err ctx "E0107" sp "`assert_eq` takes 2 arguments"; check_args ctx f args);
     TUnit
@@ -565,9 +634,15 @@ and check_method_value ctx f e recv name nsp args =
     err ctx "E0207" recv.espan "the type of this value is not known here; add a type annotation";
     check_args ctx f args;
     TErr
-  | TParam g -> (
-    (* `x.m(...)` where `x: T` and `T` is bounded by interfaces that declare `m` *)
-    let bs = Option.value ~default:[] (List.assoc_opt g !cur_bounds) in
+  | TDyn _ | TParam _ -> (
+    (* `x.m(...)` where `x: T` and `T` is bounded by interfaces that declare
+       `m`, or `x: dyn I` *)
+    let g, bs =
+      match rt with
+      | TDyn i -> ("dyn " ^ i, [ i ])
+      | TParam g -> (g, Option.value ~default:[] (List.assoc_opt g !cur_bounds))
+      | _ -> ("", [])
+    in
     let found = List.find_map (fun b -> Option.bind (Hashtbl.find_opt ifaces b) (List.assoc_opt name)) bs in
     match found with
     | Some (ps, r) ->
@@ -585,7 +660,7 @@ and check_method_value ctx f e recv name nsp args =
         if bs = [] then [ sprintf "`%s` is a type parameter with no bounds; add one, as in `[%s: Interface]`, whose interface declares `fn %s(self, ...)`" g g name ]
         else [ sprintf "the bounds of `%s` (%s) declare: %s" g (String.concat ", " bs) (if declared = [] then "nothing" else String.concat ", " declared) ]
       in
-      did_you_mean ctx ~notes "E0105" nsp (sprintf "no method `%s` on type parameter `%s`" name g) name declared;
+      did_you_mean ctx ~notes "E0105" nsp (sprintf "no method `%s` on `%s`" name g) name declared;
       check_args ctx f args;
       TErr)
   | TNamed (n, _) when Hashtbl.mem ctx.fns (n ^ "::" ^ name) -> (
@@ -745,7 +820,7 @@ and check_bin ctx f op a b sp =
     | Sub | Mul | Div -> (match t with TInt | TFloat | TErr | TVar _ -> t | _ -> bad (); TErr)
     | Mod -> (match t with TInt | TErr | TVar _ -> t | _ -> bad (); TErr)
     | Lt | Le | Gt | Ge -> (match t with TInt | TFloat | TStr | TErr | TVar _ -> () | _ -> bad ()); TBool
-    | _ -> (match t with TFn _ | TCap _ | TChan _ -> bad () | _ -> ()); TBool)
+    | _ -> (match t with TFn _ | TCap _ | TChan _ | TDyn _ -> bad () | _ -> ()); TBool)
 
 and check_closure ctx f ps body want =
   let want_ps, want_ret =
@@ -1022,34 +1097,6 @@ let check_main ctx (d : fn_decl) (s : fsig) =
     err ctx "E0303" d.fn_span "`main` has the wrong signature"
       ~notes:[ "write `fn main(root: Root)` or `fn main(root: Root) -> Result[(), E]`" ]
 
-(* Does [t] have every method of interface [i], with the same types? *)
-let satisfies ctx t i : string option =
-  let ms = Option.value ~default:[] (Hashtbl.find_opt ifaces i) in
-  let t = repr t in
-  let check (m, (ps, r)) =
-    let want = TFn (ps, r) in
-    let trial got = try unify want got; None with Mismatch -> Some (sprintf "its `%s` has type `%s`, but `%s` needs `%s`" m (show got) i (show want)) in
-    match t with
-    | TVar _ | TErr -> None
-    | TParam g ->
-      let bs = Option.value ~default:[] (List.assoc_opt g !cur_bounds) in
-      if List.mem i bs then None
-      else (
-        match List.find_map (fun b -> Option.bind (Hashtbl.find_opt ifaces b) (List.assoc_opt m)) bs with
-        | Some (ps', r') -> trial (TFn (ps', r'))
-        | None -> Some (sprintf "type parameter `%s` is not bounded by `%s`; add it: `[%s: %s]`" g i g i))
-    | TNamed (n, _) when Hashtbl.mem ctx.fns (n ^ "::" ^ m) -> (
-      let _, ft = instantiate (Hashtbl.find ctx.fns (n ^ "::" ^ m)) in
-      match ft with
-      | TFn (p0 :: rest, r') -> (try unify p0 t; trial (TFn (rest, r')) with Mismatch -> trial (TFn (rest, r')))
-      | _ -> Some (sprintf "its `%s` is not a method" m))
-    | _ -> (
-      match List.assoc_opt m (methods t) with
-      | Some mk -> let ps', r' = mk () in trial (TFn (ps', r'))
-      | None -> Some (sprintf "`%s` has no method `%s`" (show t) m))
-  in
-  List.find_map check ms
-
 let check_pending ctx =
   let ps = List.rev !pending in
   pending := [];
@@ -1074,6 +1121,10 @@ let check_fn ctx (d : fn_decl) (s : fsig) =
     d.fn_params s.ps;
   let f = { ret_ty = s.ret; scopes = [ scope ]; loops = 0; genv; in_group = 0 } in
   let bt = check_block ctx f d.fn_body in
+  (match (repr s.ret, d.fn_body.tail) with
+   | TDyn i, Some e when (match repr bt with TDyn _ -> false | _ -> true) -> coerce ctx e bt i
+   | _ -> ());
+  let bt = match (repr s.ret, d.fn_body.tail) with TDyn _, Some e -> e.ety | _ -> bt in
   try unify s.ret bt
   with Mismatch ->
     let b = d.fn_body in

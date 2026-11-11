@@ -38,6 +38,7 @@ let explanations = [
   "E0109", "A generic type was given the wrong number of type arguments, for example `List` instead of `List[Int]`.";
   "E0110", "`self` names the receiver of a method: `fn area(self: Shape) -> Float` is called as `shape.area()`. It must be the first parameter, and its type a struct or enum declared in the program (not a built-in type such as Int, List, Option or Result).";
   "E0111", "A type used for a bounded type parameter does not satisfy the interface. Interfaces are satisfied structurally: the type needs every method the interface declares, with the same parameter and result types. Define the missing method as `fn name(self: T, ...)`.";
+  "E0112", "Only struct and enum values can become `dyn Interface`, and only if they hold no capability, function or channel. A `dyn` value hides its concrete type, so it must not hide authority either; pass capabilities with a type parameter bounded by the interface instead.";
   "E0201", "Type mismatch. The message shows the expected and the actual type.";
   "E0202", "`?` returns early with the error, so the enclosing function must return `Result` (or `Option`) with the same error type. Convert errors with `.map_err(...)`.";
   "E0203", "An `if` without `else` is a statement, so its block must have type `()`.";

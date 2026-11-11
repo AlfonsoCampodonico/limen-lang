@@ -60,6 +60,19 @@ let comma_list st close f =
 let rec parse_type st : ty_expr =
   let t = peek st in
   match t.tok with
+  | KW "dyn" ->
+    (* `dyn Shape` is written in the AST as `dyn[Shape]` *)
+    ignore (advance st);
+    let a, asp = expect_ident st in
+    let name, nsp =
+      if is_sym st "." then begin
+        ignore (advance st);
+        let b, bsp = expect_ident st in
+        (a ^ "." ^ b, merge asp bsp)
+      end
+      else (a, asp)
+    in
+    { tdesc = TyName ("dyn", [ { tdesc = TyName (name, []); tspan = nsp } ]); tspan = merge t.span nsp }
   | SYM "(" ->
     ignore (advance st);
     let r = expect_sym st ")" in

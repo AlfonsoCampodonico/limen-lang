@@ -41,7 +41,7 @@ enum     ::= "enum" sp1 ident sp generics? sp "{" ws (variant (isep variant)* (w
 variant  ::= ident (sp "(" ws type (isep type)* (ws ",")? ws ")")?
 
 # ---------- types ----------
-type    ::= ident ("." ident)? (sp "[" ws typearg (isep typearg)* (ws ",")? ws "]")? | "(" ws ")" | "fn" sp "(" ws (type (isep type)* (ws ",")?)? ws ")" sp "->" sp type
+type    ::= "dyn" sp1 qident | ident ("." ident)? (sp "[" ws typearg (isep typearg)* (ws ",")? ws "]")? | "(" ws ")" | "fn" sp "(" ws (type (isep type)* (ws ",")?)? ws ")" sp "->" sp type
 typearg ::= type | int
 
 # ---------- blocks and statements ----------

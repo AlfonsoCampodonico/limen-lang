@@ -466,6 +466,18 @@ static void Clo_share(WClo *c) { if (w_rc_share(&c->rc) && c->share) c->share(c)
 static inline bool Clo_eq(WClo *a, WClo *b) { return a == b; }
 static void Clo_show(WBuf *b, WClo *c, bool top) { (void)c; (void)top; buf_puts(b, "<fn>"); }
 
+/* `dyn I`: a boxed value with a vtable generated per (type, interface):
+   drop, share and show for the value, then one entry per method. */
+typedef struct WDyn WDyn;
+typedef struct { void (*drop)(WDyn *); void (*share)(WDyn *); void (*show)(WBuf *, WDyn *, bool); } WVtHead;
+typedef struct { WVtHead h; void *m[]; } WVt;
+struct WDyn { int64_t rc; const WVt *vt; };
+static inline WDyn *Dyn_dup(WDyn *d) { w_rc_inc(&d->rc); return d; }
+static void Dyn_drop(WDyn *d) { if (w_rc_dec(&d->rc)) { d->vt->h.drop(d); w_free(d); } }
+static void Dyn_share(WDyn *d) { if (w_rc_share(&d->rc)) d->vt->h.share(d); }
+static inline bool Dyn_eq(WDyn *a, WDyn *b) { return a == b; }
+static void Dyn_show(WBuf *b, WDyn *d, bool top) { d->vt->h.show(b, d, top); }
+
 /* ---------- capabilities ---------- */
 
 enum { CAP_ROOT, CAP_NET, CAP_FS, CAP_STDOUT, CAP_CLOCK, CAP_LISTEN, CAP_LISTENER, CAP_CONN, CAP_RAND, CAP_STDIN, CAP_ENV };

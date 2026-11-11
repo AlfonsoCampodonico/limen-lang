@@ -44,6 +44,11 @@ type rhs =
   | GroupJoin of atom * ty (* wait for every task; result list type *)
   | ChanNew of ty * atom * Span.t (* channel type, capacity *)
   | ChanSend of atom * atom * Span.t (* channel (borrowed), value (consumed) *)
+  | MkDyn of ty * string * atom * (string * ty list * ty) list
+      (* box a value of a concrete type as `dyn I` (consumed); one entry per
+         interface method: the C function implementing it, its parameter
+         types after self, and its result type *)
+  | CallDyn of int * ty list * ty * atom * atom list (* method index, params, result, receiver (borrowed), args (consumed) *)
 
 and ipart = IStr of string | IVal of atom * ty | IValQ of atom * ty (* printed as inside a container *)
 
@@ -81,11 +86,15 @@ let consumed = function
   | MkStruct (_, xs) | MkEnum (_, _, xs) | MkList (_, xs) | MkClosure (_, _, xs) -> xs
   | Spawn (_, c, _) -> [ c ]
   | ChanSend (_, v, _) -> [ v ]
+  | MkDyn (_, _, a, _) -> [ a ]
+  | CallDyn (_, _, _, _, args) -> args
   | _ -> []
 
 let borrowed = function
   | Atom _ | Call _ | MkStruct _ | MkEnum _ | MkList _ | MkClosure _ -> []
   | CallClo (c, _) -> [ c ]
+  | CallDyn (_, _, _, r, _) -> [ r ]
+  | MkDyn _ -> []
   | Bin (_, _, a, b, _) -> [ a; b ]
   | Neg (_, a) | Not a -> [ a ]
   | Prim (_, _, xs, _) -> xs

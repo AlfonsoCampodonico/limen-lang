@@ -16,7 +16,7 @@ type token = { tok : tok; span : Span.t; nl : bool }
 
 let keywords =
   [ "fn"; "let"; "mut"; "if"; "else"; "match"; "for"; "in"; "while"; "return"; "struct";
-    "enum"; "true"; "false"; "group"; "break"; "continue"; "pub"; "use"; "interface" ]
+    "enum"; "true"; "false"; "group"; "break"; "continue"; "pub"; "use"; "interface"; "dyn" ]
 
 let syms2 = [ "->"; "=>"; "=="; "!="; "<="; ">="; "&&"; "||" ]
 let syms1 = "(){}[],:;.|+-*/%!?=<>"

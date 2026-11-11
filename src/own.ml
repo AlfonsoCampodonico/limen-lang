@@ -111,6 +111,12 @@ let rewrite_rhs r ~live_after ~owned =
   | ChanSend (ch, v, sp) ->
     let xs, o = c [ v ] in
     (ChanSend (ch, List.hd xs, sp), o)
+  | MkDyn (t, i, v, ms) ->
+    let xs, o = c [ v ] in
+    (MkDyn (t, i, List.hd xs, ms), o)
+  | CallDyn (k, ps, r, recv, args) ->
+    let xs, o = c args in
+    (CallDyn (k, ps, r, recv, xs), o)
   | r -> (r, owned)
 
 let rec fwd_block (b : ablock) owned ~brk ~cont : stmt list * S.t =
