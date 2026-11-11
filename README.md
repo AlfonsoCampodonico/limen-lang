@@ -43,6 +43,31 @@ dune exec vela -- run examples/repos.vela --grant net=api.github.com
 dune exec vela -- build examples/repos.vela -o repos && ./repos --grant net=api.github.com
 ```
 
+## Try it
+
+Put `vela` on your PATH once (`dune install` copies it into your opam switch), or alias it to the build:
+
+```bash
+alias vela="$PWD/_build/default/bin/main.exe"
+```
+
+Then work through the examples. Every one runs the same in the interpreter and natively (add `--native`):
+
+| Example | Shows | Run |
+| --- | --- | --- |
+| `tour.vela` | the newest features in one file: `dyn` branches, ranges, method values, struct map keys, `Bytes`, groups with deadlines, `select` timeouts, exit codes, tests | `vela run examples/tour.vela; echo $?` and `vela test examples/tour.vela` |
+| `hello.vela`, `wordcount.vela` | capabilities: nothing touches the outside world without a grant | `vela run examples/wordcount.vela --grant fs=examples:ro` |
+| `methods.vela`, `interfaces.vela`, `dyn.vela`, `shapes.vela` | methods, structural interfaces, `dyn` values | `vela run examples/dyn.vela` |
+| `tuples.vela`, `maps.vela` | tuples, destructuring, maps | `vela run examples/maps.vela` |
+| `parallel.vela`, `select.vela` | tasks, groups, channels, `select` | `vela run examples/select.vela` |
+| `stdlib.vela`, `report.vela`, `logscan.vela` | `json`, `format`, `time`, `regex` | `vela run examples/logscan.vela` |
+| `http_demo.vela` | an HTTP server and client in one program | `vela run examples/http_demo.vela --grant listen=127.0.0.1:0 --grant net=127.0.0.1` |
+| `repos.vela` | HTTPS to a real API | `vela run examples/repos.vela --grant net=api.github.com` |
+| `notes.vela` | SQLite through `sql` | see the comment at the top of the file |
+| `ffi.vela` | calling C | `vela run examples/ffi.vela --grant foreign=c` |
+
+To write your own: `vela check` gives errors with fixes, `vela explain E0302` explains a code, `vela fmt --write` formats, `vela caps` lists what each function can touch, and `vela doc --std --html -o std.html` documents the standard library. For an editor, point it at `vela lsp`.
+
 ## Commands
 
 | Command | What it does |
