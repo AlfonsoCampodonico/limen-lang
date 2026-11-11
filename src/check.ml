@@ -242,6 +242,16 @@ let instantiate s =
   let env = List.map (fun g -> (g, fresh ())) s.gen in
   (env, TFn (List.map (subst env) s.ps, subst env s.ret))
 
+(* The enums a bare variant name can mean in [file]: the file's own enums
+   shadow the prelude's, which shadow other modules'. More than one at the
+   nearest level is ambiguous. *)
+let variant_scope ctx v file =
+  let ens = Option.value ~default:[] (Hashtbl.find_opt ctx.owners v) in
+  let from fl = List.filter (fun en -> (Hashtbl.find ctx.enums en).en_span.file = fl) ens in
+  match from file with
+  | [] -> ( match from Prelude.file with [] -> ens | p -> p)
+  | own -> own
+
 let ctor_ty ctx en v =
   let e = Hashtbl.find ctx.enums en in
   let targs = List.map (fun _ -> fresh ()) e.en_gen in
@@ -555,8 +565,12 @@ and check_var ctx f e n sp =
       add_bounds n env sp;
       t
     | None -> (
-      match Hashtbl.find_opt ctx.owners n with
-      | Some [ en ] -> ctor_ty ctx en n
+      match Option.map (fun _ -> variant_scope ctx n sp.file) (Hashtbl.find_opt ctx.owners n) with
+      | Some [ en ] ->
+        (* name the enum when the variant name alone would be ambiguous to the backends *)
+        if List.length (Hashtbl.find ctx.owners n) > 1 then
+          e.edesc <- EField ({ edesc = EVar en; espan = sp; ety = TErr; einst = [] }, n, sp);
+        ctor_ty ctx en n
       | Some ens ->
         err ctx "E0104" sp
           (sprintf "`%s` is a variant of several enums (%s); qualify it, for example `%s.%s`" n
@@ -1153,7 +1167,7 @@ and check_pat ctx f t p =
         match rt with
         | TNamed (n, _) when Hashtbl.mem ctx.variants n && List.mem_assoc v (Hashtbl.find ctx.variants n) -> Some n
         | _ -> (
-          match Hashtbl.find_opt ctx.owners v with
+          match Option.map (fun _ -> variant_scope ctx v p.pspan.file) (Hashtbl.find_opt ctx.owners v) with
           | Some [ e ] -> Some e
           | Some (e :: _ as es) ->
             err ctx "E0104" p.pspan
