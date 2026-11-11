@@ -11,6 +11,11 @@ let sprintf = Printf.sprintf
 (* Interfaces: name -> methods (parameter types without `self`, result). *)
 let ifaces : (string, (string * (ty list * ty)) list) Hashtbl.t = Hashtbl.create 8
 
+(* Built-in bounds with no methods: `Ordered` (the type has `<`) and `Key`
+   (the type can be a map key; keys are ordered too). *)
+let builtin_bounds = [ "Ordered"; "Key" ]
+
+
 
 type var_kind = KLet | KParam | KPat | KGroup
 type var_info = { vty : ty; vmut : bool; vspan : Span.t; vkind : var_kind }
@@ -108,6 +113,10 @@ let rec resolve ctx env (te : ty_expr) : ty =
     else TArray (resolve ctx env elt, n)
   | TyName ("Array", _) ->
     err ctx "E0109" te.tspan "`Array` takes an element type and a size, as in `Array[Float, 4]`";
+    TErr
+  | TyName ("dyn", [ { tdesc = TyName (i, []); tspan } ]) when List.mem i builtin_bounds ->
+    err ctx "E0102" tspan (sprintf "`%s` is a built-in bound, not an interface with methods; it cannot be `dyn`" i)
+      ~notes:[ sprintf "use it on a type parameter: `fn f[T: %s](x: T)`" i ];
     TErr
   | TyName ("dyn", [ { tdesc = TyName (i, []); tspan } ]) ->
     if Hashtbl.mem ifaces i then TDyn i
@@ -215,6 +224,11 @@ let fn_bounds : (string, (string * string list) list) Hashtbl.t = Hashtbl.create
 (* Bounds of the type parameters of the function being checked. *)
 let cur_bounds : (string * string list) list ref = ref []
 
+(* Whether type parameter [g] of the function being checked has bound [b]. *)
+let bounded g b =
+  let bs = Option.value ~default:[] (List.assoc_opt g !cur_bounds) in
+  List.mem b bs || (b = "Ordered" && List.mem "Key" bs)
+
 (* Instantiations to check against their bounds once the body's types are
    known: (where, the type used, the interface, the type parameter). *)
 let pending : (Span.t * ty * string * string) list ref = ref []
@@ -230,6 +244,10 @@ let add_bounds fname env sp =
     List.iter
       (fun (g, ifs) -> match List.assoc_opt g env with Some t -> List.iter (fun i -> pending := (sp, t, i, g) :: !pending) ifs | None -> ())
       bs
+
+(* The built-in methods written in Vela that the program calls: only their
+   bodies are checked (and only they are compiled). *)
+let used_methods : (string, unit) Hashtbl.t = Hashtbl.create 16
 
 (* Methods by `Type::name`: whether they are `pub`, and the file (module)
    that defines them. A private method can only be called from its own file. *)
@@ -362,6 +380,7 @@ let unordered ctx t : ty option =
   let rec go t =
     match repr t with
     | TInt | TFloat | TStr | TBytes | TBool | TUnit | TVar _ | TErr -> None
+    | TParam g when bounded g "Ordered" -> None
     | TList a | TArray (a, _) -> go a
     | TNamed (n, args) as nt -> (
       let key = show nt in
@@ -796,13 +815,20 @@ and builtin_method ctx t name file =
   | None -> None
   | Some tn ->
     let suffix = tn ^ "::" ^ name in
-    Hashtbl.fold
-      (fun k _ acc ->
-        if acc = None && (k = suffix || String.ends_with ~suffix:("." ^ suffix) k)
-           && (match Hashtbl.find_opt method_owner k with Some (_, fl) -> fl = file | None -> false)
-        then Some k
-        else acc)
-      ctx.fns None
+    let own =
+      Hashtbl.fold
+        (fun k _ acc ->
+          if acc = None && (k = suffix || String.ends_with ~suffix:("." ^ suffix) k)
+             && (match Hashtbl.find_opt method_owner k with Some (_, fl) -> fl = file | None -> false)
+          then Some k
+          else acc)
+        ctx.fns None
+    in
+    (* the built-in methods written in Vela (std/methods.vela) *)
+    if own = None && Hashtbl.mem ctx.fns suffix
+       && (match Hashtbl.find_opt method_owner suffix with Some (_, fl) -> fl = Prelude.methods_file | None -> false)
+    then (Hashtbl.replace used_methods suffix (); Some suffix)
+    else own
 
 and check_method ctx f e recv name nsp args =
   match recv.edesc with
@@ -951,12 +977,13 @@ and check_method_value ctx f e recv name nsp args =
       in
       let notes =
         if ms <> [] && suggest name (List.map fst ms) = None then
-          notes @ [ sprintf "`%s` has: %s" (show rt) (String.concat ", " (List.sort_uniq compare (List.map fst ms))) ]
+          notes @ [ sprintf "`%s` has: %s" (show rt) (String.concat ", " (List.sort_uniq compare (List.map fst ms @ match builtin_tname rt with Some tn -> Prelude.method_names tn | None -> []))) ]
         else notes
       in
       did_you_mean ctx ~notes "E0105" nsp
         (sprintf "no method `%s` on type `%s`" name (show rt))
-        name (List.map fst ms @ match rt with TNamed (n, _) -> user_methods ctx n | _ -> []);
+        name (List.map fst ms @ (match rt with TNamed (n, _) -> user_methods ctx n | _ -> [])
+              @ match builtin_tname rt with Some tn -> Prelude.method_names tn | None -> []);
       check_args ctx f args;
       TErr
     | Some mk ->
@@ -980,7 +1007,7 @@ and check_method_value ctx f e recv name nsp args =
          | None -> ()
          | Some t ->
            err ctx "E0201" nsp (sprintf "`List[%s]` cannot be sorted: `%s` has no order" (show a) (show t))
-             ~notes:[ "numbers, strings, Bool, and lists, tuples, structs and enums of them are ordered; for another order use `list.sort_by(xs, less)`" ])
+             ~notes:[ "numbers, strings, Bool, and lists, tuples, structs and enums of them are ordered; to sort by a key use `xs.sort_by(key)`, for another order `list.sort_by(xs, less)`" ])
        | _ -> ());
       r)
 
@@ -1502,6 +1529,7 @@ let unkeyable ctx t : ty option =
   let rec go t =
     match repr t with
     | TInt | TStr | TBytes | TBool | TVar _ | TErr -> None
+    | TParam g when bounded g "Key" -> None
     | TNamed (n, args) as nt -> (
       let key = show nt in
       if Hashtbl.mem seen key then None
@@ -1530,19 +1558,27 @@ let check_pending ctx =
       | Some t ->
         let inner = if show t = show (repr k) then "" else sprintf " (it holds `%s`)" (show t) in
         err ctx "E0113" sp (sprintf "`%s` cannot be a map key%s" (show (repr k)) inner)
-          ~notes:[ "keys are Int, Str, Bool, and tuples, structs and enums made of them; Float, List and Map cannot be keys" ])
+          ~notes:("keys are Int, Str, Bool, and tuples, structs and enums made of them; Float, List and Map cannot be keys"
+                  :: match t with TParam g -> [ sprintf "a type parameter can be a key with the bound `[%s: Key]`" g ] | _ -> []))
     !map_keys;
   map_keys := [];
   let ps = List.rev !pending in
   pending := [];
   List.iter
     (fun (sp, t, i, g) ->
-      match satisfies ctx t i with
+      let why =
+        match i with
+        | "Ordered" -> Option.map (fun u -> sprintf "`%s` has no order: numbers, strings, Bool, and lists, tuples, structs and enums of them are ordered" (show u)) (unordered ctx t)
+        | "Key" -> Option.map (fun u -> sprintf "`%s` cannot be a map key: keys are Int, Str, Bytes, Bool, and tuples, structs and enums of them" (show u)) (unkeyable ctx t)
+        | _ -> satisfies ctx t i
+      in
+      match why with
       | None -> ()
       | Some why ->
         err ctx "E0111" sp
-          (sprintf "`%s` does not satisfy interface `%s`, required of `%s`" (show (repr t)) i g)
-          ~notes:[ why ])
+          (if List.mem i builtin_bounds then sprintf "`%s` does not satisfy `%s`, required of `%s`" (show (repr t)) i g
+           else sprintf "`%s` does not satisfy interface `%s`, required of `%s`" (show (repr t)) i g)
+          ~notes:(why :: match repr t with TParam p when List.mem i builtin_bounds -> [ sprintf "add the bound: `[%s: %s]`" p i ] | _ -> []))
     ps
 
 let check_fn ctx (d : fn_decl) (s : fsig) =
@@ -1590,10 +1626,11 @@ let check_self ctx d ps =
     match t0 with
     | TNamed (n, _) when (Hashtbl.mem ctx.structs n || Hashtbl.mem ctx.enums n) && not (builtin n) -> ()
     | TErr -> ()
+    | _ when d.fn_span.file = Prelude.methods_file -> ()
     | t when builtin_tname t <> None ->
       (* a method on a built-in type: private to its file, and no clash with a built-in method *)
       let name = match String.rindex_opt d.fn_name ':' with Some i -> String.sub d.fn_name (i + 1) (String.length d.fn_name - i - 1) | None -> d.fn_name in
-      if List.mem_assoc name (methods t) then
+      if List.mem_assoc name (methods t) || List.mem name (Prelude.method_names (Option.get (builtin_tname t))) then
         err ctx "E0106" d.fn_span (sprintf "`%s` already has a built-in method `%s`" (show t) name)
       else if d.fn_pub then
         err ctx "E0110" d.fn_span (sprintf "a method on built-in type `%s` cannot be `pub`: it is private to the file that defines it" (show t))
@@ -1610,8 +1647,10 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
       variants = Hashtbl.create 16; owners = Hashtbl.create 16; fns = Hashtbl.create 16; diags = [] }
   in
   Hashtbl.reset method_owner;
+  Hashtbl.reset used_methods;
   Hashtbl.reset foreign_fns;
   Hashtbl.reset ifaces;
+  List.iter (fun b -> Hashtbl.replace ifaces b []) builtin_bounds;
   Hashtbl.reset fn_bounds;
   let items = Prelude.items () @ user_items in
   let type_defined n = Hashtbl.mem ctx.structs n || Hashtbl.mem ctx.enums n || List.mem n builtin_types in
@@ -1625,7 +1664,9 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
         if type_defined e.en_name then err ctx "E0106" e.en_span (sprintf "type `%s` is defined more than once" e.en_name)
         else Hashtbl.replace ctx.enums e.en_name e
       | IIface i ->
-        if type_defined i.if_name || Hashtbl.mem ifaces i.if_name then
+        if List.mem i.if_name builtin_bounds then
+          err ctx "E0106" i.if_span (sprintf "`%s` is a built-in bound; name the interface something else" i.if_name)
+        else if type_defined i.if_name || Hashtbl.mem ifaces i.if_name then
           err ctx "E0106" i.if_span (sprintf "`%s` is defined more than once" i.if_name)
         else Hashtbl.replace ifaces i.if_name []
       | IFn _ -> ())
@@ -1753,9 +1794,13 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
                 bs)
             d.fn_bounds;
           if d.fn_bounds <> [] then Hashtbl.replace fn_bounds d.fn_name (List.map (fun (g, bs) -> (g, List.map fst bs)) d.fn_bounds);
-          if String.contains d.fn_name ':' then Hashtbl.replace method_owner d.fn_name (d.fn_pub, d.fn_span.file);
-          if Hashtbl.mem ctx.fns d.fn_name then
-            err ctx "E0106" d.fn_span (sprintf "function `%s` is defined more than once" d.fn_name)
+          (* a clash with a built-in method written in Vela is reported by check_self *)
+          let builtin_clash = match Hashtbl.find_opt method_owner d.fn_name with Some (_, fl) -> fl = Prelude.methods_file | None -> false in
+          if String.contains d.fn_name ':' && not builtin_clash then Hashtbl.replace method_owner d.fn_name (d.fn_pub, d.fn_span.file);
+          if Hashtbl.mem ctx.fns d.fn_name then begin
+            if not builtin_clash then
+              err ctx "E0106" d.fn_span (sprintf "function `%s` is defined more than once" d.fn_name)
+          end
           else Hashtbl.replace ctx.fns d.fn_name s;
           Some (d, s)
         | _ -> None)
@@ -1792,7 +1837,18 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
   (* 4. main *)
   List.iter (fun (d, s) -> if d.fn_name = "main" then check_main ctx d s) sigs;
   (* 5. bodies *)
-  List.iter (fun (d, s) -> if d.fn_foreign = None then check_fn ctx d s) sigs;
+  let builtin (d : fn_decl) = d.fn_span.file = Prelude.methods_file in
+  List.iter (fun (d, s) -> if d.fn_foreign = None && not (builtin d) then check_fn ctx d s) sigs;
+  (* the built-in methods written in Vela that were called, and those they call *)
+  let checked = Hashtbl.create 16 in
+  let rec more () =
+    let todo = List.filter (fun ((d : fn_decl), _) -> builtin d && Hashtbl.mem used_methods d.fn_name && not (Hashtbl.mem checked d.fn_name)) sigs in
+    if todo <> [] then begin
+      List.iter (fun ((d : fn_decl), s) -> Hashtbl.replace checked d.fn_name (); check_fn ctx d s) todo;
+      more ()
+    end
+  in
+  more ();
   let diags =
     List.sort
       (fun (a : Diag.t) (b : Diag.t) -> compare (a.span.file, a.span.lo) (b.span.file, b.span.lo))
@@ -1805,6 +1861,6 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
         { name = d.fn_name; span = d.fn_span;
           caps = List.filter (fun c -> List.mem c found) all_caps;
           callbacks = List.exists has_fn s.ps || d.fn_bounds <> [] })
-      (List.filter (fun ((d : fn_decl), _) -> d.fn_test = None) sigs)
+      (List.filter (fun ((d : fn_decl), _) -> d.fn_test = None && d.fn_span.file <> Prelude.methods_file) sigs)
   in
   (diags, infos)

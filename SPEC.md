@@ -188,6 +188,7 @@ total([Circle { r: 1.0 }, Circle { r: 2.0 }])   // Circle has `area` and `name`
 
 - Inside the function, a value of type `T` has exactly the methods its bounds declare. Several bounds are joined with `+`: `[T: Shape + Named]`.
 - At each call the compiler checks that the type used for `T` has every method with the same parameter and result types (E0111). Built-in types count with their built-in methods, so `Clock` satisfies `interface Ticker { fn now_ms(self) -> Int }`.
+- Two bounds are built in and have no methods. `Ordered`: the type has `<` (section 5), so `fn lowest[T: Ordered](xs: List[T])` can compare items and call `xs.min()` or `xs.sort()`. `Key`: the type can be a map key (`Int`, `Str`, `Bytes`, `Bool`, and tuples, structs and enums of them), so `fn index[K: Key, V](xs: List[V], key: fn(V) -> K) -> Map[K, V]` can build a map keyed by `K`; keys are ordered too, so `Key` includes `Ordered`. A type that is not ordered or not a key is E0111 at the call. They cannot be `dyn`, and no interface can take their names.
 - Code is generated separately for each type used, so a call through an interface costs the same as a direct call.
 - An interface is not a type: `fn f(s: Shape)` is E0102; write `fn f[T: Shape](s: T)`. A list holds one type, so `List[T]` cannot mix `Circle` and `Square` values.
 - Bounds go only on functions, not on structs or enums.
@@ -295,7 +296,7 @@ From loosest to tightest. All binary operators are left-associative.
 | `-x` | `Int`, `Float` | same type |
 | `!x` | `Bool` | `Bool` |
 
-Both operands must have the same type. The **ordered** types are `Int`, `Float`, `Str` and `Bytes` (byte order), `Bool` (`false` first), `()`, and lists, arrays, tuples, structs and enums whose items are ordered. Those compare item by item: lists and arrays lexicographically (a prefix comes first), tuples and structs field by field in declaration order, enums by variant in declaration order and then by payload, so `None` sorts after every `Some`. Maps, functions, capabilities, channels, `dyn` values and type parameters have no order (E0201). On `Int`, `/` truncates toward zero, `%` takes the sign of the dividend, and division or remainder by zero panics. On `Float`, comparisons follow IEEE, so NaN is unequal to everything, and division by zero gives infinity. Inside a list, tuple, struct or enum, and in `sort()`, floats use a total order with NaN first, so sorting never misbehaves.
+Both operands must have the same type. The **ordered** types are `Int`, `Float`, `Str` and `Bytes` (byte order), `Bool` (`false` first), `()`, and lists, arrays, tuples, structs and enums whose items are ordered. Those compare item by item: lists and arrays lexicographically (a prefix comes first), tuples and structs field by field in declaration order, enums by variant in declaration order and then by payload, so `None` sorts after every `Some`. Maps, functions, capabilities, channels, `dyn` values and type parameters have no order (E0201), unless the type parameter has the bound `Ordered` or `Key` (section 4). On `Int`, `/` truncates toward zero, `%` takes the sign of the dividend, and division or remainder by zero panics. On `Float`, comparisons follow IEEE, so NaN is unequal to everything, and division by zero gives infinity. Inside a list, tuple, struct or enum, and in `sort()`, floats use a total order with NaN first, so sorting never misbehaves.
 
 ### Literals and constructors
 
@@ -769,10 +770,31 @@ Binary data, kept apart from text so a byte buffer is never printed or concatena
 | `sort()` | `List[T]`, stable, in the order of `<`; `T` must be ordered (section 5) |
 | `map(f)`, `filter(p)` | `List[U]`, `List[T]` |
 | `fold(init, f)` | `U`, with `f: fn(U, T) -> U` |
-| `join(sep)` | `Str`; `List[Str]` only |
+| `join(sep)` | `Str`; `List[Str]` only (for other items, `xs.map(\|x\| "{x}").join(sep)`) |
 | `sum()` | `Int`; `List[Int]` only |
+| `any(p)`, `all(p)` | `Bool`: `p` holds for some item, for every item (`true` on an empty list) |
+| `count(p)` | `Int`, the items for which `p` holds |
+| `find(p)` | `Option[T]`, the first item for which `p` holds |
+| `sum_by(f)` | `Int`, the sum of `f(x)` with `f: fn(T) -> Int` |
+| `min()`, `max()` | `Option[T]`, `None` when empty; `T` must be ordered |
+| `min_by(key)`, `max_by(key)` | `Option[T]`, the first item with the smallest or largest `key(x)`; the key must be ordered |
+| `flat_map(f)` | `List[U]`, the lists `f(x)` joined, with `f: fn(T) -> List[U]` |
+| `take_while(p)`, `skip_while(p)` | `List[T]`, the items before the first one for which `p` fails, and the rest |
+| `with_index()` | `List[(Int, T)]`, each item with its position: `for p in xs.with_index() { ... p.0 ... p.1 }` |
+| `zip(ys)` | `List[(T, U)]`, pairs up to the shorter list's length |
+| `distinct()`, `distinct_by(key)` | `List[T]`, the first item of each value (or key), in order; the value or key must be a map key type |
+| `sort_by(key)` | `List[T]`, stable, in the order of `key(x)`, which is computed once per item; the key must be ordered |
+| `partition(p)` | `(List[T], List[T])`, the items for which `p` holds and the others, each in order |
+| `chunks(n)` | `List[List[T]]`, consecutive pieces of `n` items, the last one shorter; `[]` when `n` is below 1 |
+| `windows(n)` | `List[List[T]]`, every run of `n` neighbors, in order: `[1, 2, 3].windows(2)` is `[[1, 2], [2, 3]]`; `[]` when `n` is below 1 or above the length |
+| `chunk_by(key)` | `List[List[T]]`, runs of neighbors with equal `key(x)`: `[1, 1, 2, 1].chunk_by(\|x\| x)` is `[[1, 1], [2], [1]]` |
+| `group_by(key)` | `Map[K, List[T]]`, the items by `key(x)`, keys in order of first appearance; the key must be a map key type |
+| `count_by(key)` | `Map[K, Int]`, how many items have each key |
+| `tally()` | `Map[T, Int]`, how many times each item occurs: `"hello".chars().tally()` is `{"h": 1, "e": 1, "l": 2, "o": 1}` |
 
-`xs[i]` panics when `i` is out of range; `xs.get(i)` returns `None` instead. Writes go through index and field paths: `groups[i].words.push(w)` and `items[i].qty = 3` both work on a `mut` list. `sort()` uses the order of `<`, so it sorts tuples by their first item, then the second, and structs by their fields in declaration order; for another order and for inserting or removing at a position, use the `list` module (`sort_by`, `insert_at`, `remove_at`, section 19).
+None of these panic, except when a function passed to them does. The methods from `any` on take functions and are written in Vela; they work the same as the others (a file cannot define a method with one of their names, E0106), and natively they compile like your own code, so a call through a closure literal costs a function call per item. A pipeline of `map` and `filter` before one of them still runs as one loop.
+
+`xs[i]` panics when `i` is out of range; `xs.get(i)` returns `None` instead. Writes go through index and field paths: `groups[i].words.push(w)` and `items[i].qty = 3` both work on a `mut` list. `sort()` uses the order of `<`, so it sorts tuples by their first item, then the second, and structs by their fields in declaration order; `sort_by(key)` sorts by a key; for another order and for inserting or removing at a position, use the `list` module (`list.sort_by(xs, less)`, `insert_at`, `remove_at`, section 19).
 
 Strings compare byte by byte, so `c >= "a" && c <= "z"` tests a one-byte string, such as a character from `chars()`. `slice`, `index_of` and `bytes()` give positions and byte codes.
 
@@ -789,6 +811,11 @@ Strings compare byte by byte, so `c >= "a" && c <= "z"` tests a one-byte string,
 | `remove(k)` | `()`, removes the entry if present (needs `mut`) |
 | `keys()`, `values()` | `List[K]`, `List[V]`, in insertion order |
 | `entries()` | `List[(K, V)]`, in insertion order |
+| `map_values(f)` | `Map[K, U]`, the same keys with `f(v)`, with `f: fn(V) -> U` |
+| `filter(p)` | `Map[K, V]`, the entries for which `p(k, v)` holds, with `p: fn(K, V) -> Bool` |
+| `merge(other)` | `Map[K, V]`, this map's entries, then `other`'s: a key in both takes `other`'s value and keeps its place here |
+
+For a missing key with a default, write `m.get(k) ?? default`.
 
 ### Array[T, N]
 
@@ -1199,7 +1226,7 @@ fn numbers(r: http.Request, c: Conn) -> Result[(), IoError] {
 
 ### list
 
-`sort_by(xs, less)` (stable merge sort, `less(a, b)` says whether `a` goes first), `index_of(xs, x)`, `find_index(xs, pred)`, `range(lo, hi)`, `remove_at(xs, i)`, `insert_at(xs, i, x)`. All return new lists.
+`sort_by(xs, less)` (stable merge sort, `less(a, b)` says whether `a` goes first; to sort by a key, use the method `xs.sort_by(key)`), `index_of(xs, x)`, `find_index(xs, pred)`, `range(lo, hi)`, `remove_at(xs, i)`, `insert_at(xs, i, x)`. All return new lists.
 
 ### format
 

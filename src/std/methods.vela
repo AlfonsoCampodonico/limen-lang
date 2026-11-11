@@ -1,0 +1,336 @@
+// Built-in methods of List and Map written in Vela. Every file sees them,
+// like the methods in SPEC.md section 11 that are written in OCaml and C.
+// They never panic, so a panic location never points in here.
+// Plain Vela: no destructuring (it is expanded when modules load, and this
+// file is not a module), and every method is generic, so a program only
+// compiles the ones it calls.
+
+// ---------- List: tests and searches ----------
+
+fn any[T](self: List[T], pred: fn(T) -> Bool) -> Bool {
+    for x in self {
+        if pred(x) {
+            return true
+        }
+    }
+    false
+}
+
+fn all[T](self: List[T], pred: fn(T) -> Bool) -> Bool {
+    for x in self {
+        if !pred(x) {
+            return false
+        }
+    }
+    true
+}
+
+fn count[T](self: List[T], pred: fn(T) -> Bool) -> Int {
+    let mut n = 0
+    for x in self {
+        if pred(x) {
+            n = n + 1
+        }
+    }
+    n
+}
+
+fn find[T](self: List[T], pred: fn(T) -> Bool) -> Option[T] {
+    for x in self {
+        if pred(x) {
+            return Some(x)
+        }
+    }
+    None
+}
+
+fn sum_by[T](self: List[T], f: fn(T) -> Int) -> Int {
+    let mut s = 0
+    for x in self {
+        s = s + f(x)
+    }
+    s
+}
+
+fn min[T: Ordered](self: List[T]) -> Option[T] {
+    if self.is_empty() {
+        return None
+    }
+    let mut best = self[0]
+    for x in self {
+        if x < best {
+            best = x
+        }
+    }
+    Some(best)
+}
+
+fn max[T: Ordered](self: List[T]) -> Option[T] {
+    if self.is_empty() {
+        return None
+    }
+    let mut best = self[0]
+    for x in self {
+        if x > best {
+            best = x
+        }
+    }
+    Some(best)
+}
+
+fn min_by[T, K: Ordered](self: List[T], key: fn(T) -> K) -> Option[T] {
+    if self.is_empty() {
+        return None
+    }
+    let mut best = self[0]
+    let mut bk = key(best)
+    let mut i = 1
+    while i < self.len() {
+        let k = key(self[i])
+        if k < bk {
+            best = self[i]
+            bk = k
+        }
+        i = i + 1
+    }
+    Some(best)
+}
+
+fn max_by[T, K: Ordered](self: List[T], key: fn(T) -> K) -> Option[T] {
+    if self.is_empty() {
+        return None
+    }
+    let mut best = self[0]
+    let mut bk = key(best)
+    let mut i = 1
+    while i < self.len() {
+        let k = key(self[i])
+        if k > bk {
+            best = self[i]
+            bk = k
+        }
+        i = i + 1
+    }
+    Some(best)
+}
+
+// ---------- List: new lists ----------
+
+fn flat_map[T, U](self: List[T], f: fn(T) -> List[U]) -> List[U] {
+    let mut out = []
+    for x in self {
+        for y in f(x) {
+            out.push(y)
+        }
+    }
+    out
+}
+
+fn take_while[T](self: List[T], pred: fn(T) -> Bool) -> List[T] {
+    let mut out = []
+    for x in self {
+        if !pred(x) {
+            return out
+        }
+        out.push(x)
+    }
+    out
+}
+
+fn skip_while[T](self: List[T], pred: fn(T) -> Bool) -> List[T] {
+    let mut i = 0
+    while i < self.len() && pred(self[i]) {
+        i = i + 1
+    }
+    self.skip(i)
+}
+
+fn with_index[T](self: List[T]) -> List[(Int, T)] {
+    let mut out = []
+    let mut i = 0
+    for x in self {
+        out.push((i, x))
+        i = i + 1
+    }
+    out
+}
+
+fn zip[T, U](self: List[T], other: List[U]) -> List[(T, U)] {
+    let n = self.len().min(other.len())
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out.push((self[i], other[i]))
+        i = i + 1
+    }
+    out
+}
+
+fn distinct[T: Key](self: List[T]) -> List[T] {
+    let mut seen: Map[T, Bool] = map()
+    let mut out = []
+    for x in self {
+        if !seen.contains(x) {
+            seen[x] = true
+            out.push(x)
+        }
+    }
+    out
+}
+
+fn distinct_by[T, K: Key](self: List[T], key: fn(T) -> K) -> List[T] {
+    let mut seen: Map[K, Bool] = map()
+    let mut out = []
+    for x in self {
+        let k = key(x)
+        if !seen.contains(k) {
+            seen[k] = true
+            out.push(x)
+        }
+    }
+    out
+}
+
+fn sort_by[T, K: Ordered](self: List[T], key: fn(T) -> K) -> List[T] {
+    let mut keyed = []
+    let mut i = 0
+    for x in self {
+        keyed.push((key(x), i))
+        i = i + 1
+    }
+    let mut out = []
+    for p in keyed.sort() {
+        out.push(self[p.1])
+    }
+    out
+}
+
+// ---------- List: splitting ----------
+
+fn partition[T](self: List[T], pred: fn(T) -> Bool) -> (List[T], List[T]) {
+    let mut yes = []
+    let mut no = []
+    for x in self {
+        if pred(x) {
+            yes.push(x)
+        } else {
+            no.push(x)
+        }
+    }
+    (yes, no)
+}
+
+fn chunks[T](self: List[T], n: Int) -> List[List[T]] {
+    if n < 1 {
+        return []
+    }
+    let mut out = []
+    let mut cur = []
+    for x in self {
+        cur.push(x)
+        if cur.len() == n {
+            out.push(cur)
+            cur = []
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur)
+    }
+    out
+}
+
+fn windows[T](self: List[T], n: Int) -> List[List[T]] {
+    if n < 1 {
+        return []
+    }
+    let mut out = []
+    let mut i = 0
+    while i + n <= self.len() {
+        out.push(self.skip(i).take(n))
+        i = i + 1
+    }
+    out
+}
+
+fn chunk_by[T, K](self: List[T], key: fn(T) -> K) -> List[List[T]] {
+    let mut out = []
+    if self.is_empty() {
+        return out
+    }
+    let mut cur = [self[0]]
+    let mut ck = key(self[0])
+    let mut i = 1
+    while i < self.len() {
+        let k = key(self[i])
+        if k == ck {
+            cur.push(self[i])
+        } else {
+            out.push(cur)
+            cur = [self[i]]
+            ck = k
+        }
+        i = i + 1
+    }
+    out.push(cur)
+    out
+}
+
+// ---------- List: into maps ----------
+
+fn group_by[T, K: Key](self: List[T], key: fn(T) -> K) -> Map[K, List[T]] {
+    let mut m: Map[K, List[T]] = map()
+    for x in self {
+        let k = key(x)
+        if m.contains(k) {
+            m[k].push(x)
+        } else {
+            m[k] = [x]
+        }
+    }
+    m
+}
+
+fn count_by[T, K: Key](self: List[T], key: fn(T) -> K) -> Map[K, Int] {
+    let mut m: Map[K, Int] = map()
+    for x in self {
+        let k = key(x)
+        m[k] = m.get(k) ?? 0 + 1
+    }
+    m
+}
+
+fn tally[T: Key](self: List[T]) -> Map[T, Int] {
+    let mut m: Map[T, Int] = map()
+    for x in self {
+        m[x] = m.get(x) ?? 0 + 1
+    }
+    m
+}
+
+// ---------- Map ----------
+
+fn map_values[K: Key, V, U](self: Map[K, V], f: fn(V) -> U) -> Map[K, U] {
+    let mut m: Map[K, U] = map()
+    for e in self.entries() {
+        m[e.0] = f(e.1)
+    }
+    m
+}
+
+fn filter[K: Key, V](self: Map[K, V], keep: fn(K, V) -> Bool) -> Map[K, V] {
+    let mut m: Map[K, V] = map()
+    for e in self.entries() {
+        if keep(e.0, e.1) {
+            m[e.0] = e.1
+        }
+    }
+    m
+}
+
+fn merge[K: Key, V](self: Map[K, V], other: Map[K, V]) -> Map[K, V] {
+    let mut m = self
+    for e in other.entries() {
+        m[e.0] = e.1
+    }
+    m
+}
