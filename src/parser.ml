@@ -202,7 +202,7 @@ and parse_postfix st ns e =
     else parse_postfix st ns (mk (EField (e, name, nsp)) (merge e.espan nsp))
   | SYM "?" when not t.nl ->
     ignore (advance st);
-    parse_postfix st ns (mk (ETry e) (merge e.espan t.span))
+    parse_postfix st ns (mk (ETry (e, None)) (merge e.espan t.span))
   | _ -> e
 
 and parse_primary st ns =

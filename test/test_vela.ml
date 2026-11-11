@@ -3460,6 +3460,186 @@ fn main(root: Root) {
   errs "dyn-branch-not-satisfied" (dshape ^ "fn main() {\n    let s: dyn Shape = if true { C { r: 1.0 } } else { Bad { n: 1 } }\n}\n") [ "E0111" ];
   errs "if-branches-still-agree" "fn main() {\n    let x = if true { 1 } else { \"a\" }\n}\n" [ "E0201" ];
 
+  (* ---------- the Error interface and `?` into `dyn Error` ---------- *)
+  let perr = "struct ParseError {\n    line: Int,\n}\n\nfn message(self: ParseError) -> Str {\n    \"bad line {self.line}\"\n}\n\n" in
+  out "error-dyn-try" (perr ^ {|enum Problem {
+    Missing(Str),
+    Late,
+}
+
+fn message(self: Problem) -> Str {
+    match self {
+        Missing(what) => "missing {what}",
+        Late => "late",
+    }
+}
+
+fn parse(s: Str) -> Result[Int, ParseError] {
+    match s.parse_int() {
+        Some(n) => Ok(n),
+        None => Err(ParseError { line: 3 }),
+    }
+}
+
+fn risky() -> Result[Int, Str] {
+    Err("boom")
+}
+
+fn check(n: Int) -> Result[Int, Problem] {
+    if n > 10 {
+        Err(Late)
+    } else if n < 0 {
+        Err(Missing("sign"))
+    } else {
+        Ok(n)
+    }
+}
+
+fn step(s: Str, fail: Bool) -> Result[Int, dyn Error] {
+    let n = parse(s)?
+    let m = check(n)?
+    let r = if fail { risky()? } else { 0 }
+    let caught = catch(|| [1][m])?
+    Ok(m + r + caught)
+}
+
+fn describe(r: Result[Int, dyn Error]) -> Str {
+    match r {
+        Ok(n) => "ok {n}",
+        Err(e) => "err {e.message()} cause {e.cause().is_some()}",
+    }
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    out.print(describe(step("x", false)))
+    out.print(describe(step("20", false)))
+    out.print(describe(step("-1", false)))
+    out.print(describe(step("0", true)))
+    out.print(describe(step("2", false)))
+    out.print(describe(step("0", false)))
+    let errs: List[dyn Error] = ["plain", ParseError { line: 7 }, Denied("no")]
+    out.print(errs.map(|e| e.message()).join(" | "))
+}
+|}) "err bad line 3 cause false\nerr late cause false\nerr missing sign cause false\nerr boom cause false\nerr index 2 is out of range for a list of length 1 cause false\nok 1\nplain | bad line 7 | denied: no\n";
+  out "error-io" {|fn load(fs: Fs) -> Result[Str, dyn Error] {
+    let text = fs.read("no-such-file.txt")?
+    Ok(text)
+}
+
+fn main(root: Root) {
+    match load(root.fs) {
+        Ok(t) => root.stdout.print(t),
+        Err(e) => root.stdout.print("failed: {e.message()}"),
+    }
+    let d: IoError = Denied("x")
+    root.stdout.print("{d.message()} {Failed("y").message()} {"z".message()}")
+}
+|} "failed: denied: fs: not granted (run with --grant fs=DIR)\ndenied: x y z\n";
+  (* a type with its own cause, and a generic function bounded by Error *)
+  out "error-own-cause" (perr ^ {|struct ConfigError {
+    file: Str,
+    why: ParseError,
+}
+
+fn message(self: ConfigError) -> Str {
+    "in {self.file}"
+}
+
+fn cause(self: ConfigError) -> Option[dyn Error] {
+    Some(self.why)
+}
+
+fn show_all[E: Error](e: E) -> Str {
+    let tail = match e.cause() {
+        Some(c) => " <- {c.message()}",
+        None => "",
+    }
+    e.message() + tail
+}
+
+fn load() -> Result[(), ConfigError] {
+    Err(ConfigError { file: "app.toml", why: ParseError { line: 2 } })
+}
+
+fn run() -> Result[(), dyn Error] {
+    load()?
+    Ok(())
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    out.print(show_all(ConfigError { file: "a", why: ParseError { line: 1 } }))
+    out.print(show_all(ParseError { line: 9 }))
+    out.print(show_all("text"))
+    match run() {
+        Err(e) => out.print("{e.message()}; {e.cause().map(|c| c.message()) ?? "-"}"),
+        Ok(_) => out.print("ok"),
+    }
+}
+|}) "in a <- bad line 1\nbad line 9\ntext\nin app.toml; bad line 2\n";
+  (let src = {|fn fail() -> Result[Int, Str] {
+    Err("disk full")
+}
+
+fn main() -> Result[(), dyn Error] {
+    fail()?
+    Ok(())
+}
+|} in
+   if selected "error-main" then begin
+     (match run "error-main" src with
+      | Ok (_, Interp.VEnum ("Result", "Err", [ Interp.VStr m ])) -> ok "error-main" (m = "disk full") m
+      | Ok (_, v) -> ok "error-main" false (Interp.show v)
+      | Error e -> ok "error-main" false e);
+     if native_for "error-main" then
+       run_native "error-main" src (function
+         | Ok (code, _, e) -> ok "error-main/native" (code = 1 && e = "error: disk full\n") (sprintf "exit %d stderr %S" code e)
+         | Error m -> ok "error-main/native" false m)
+   end);
+  let noerr = "struct Quiet {\n    n: Int,\n}\n\nfn source() -> Result[Int, Quiet] {\n    Err(Quiet { n: 1 })\n}\n\n" in
+  errs "error-not-satisfied" (noerr ^ "fn f() -> Result[Int, dyn Error] {\n    let x = source()?\n    Ok(x)\n}\n\nfn main() {}\n") [ "E0202" ];
+  errs "error-quiet-not-error" (noerr ^ "fn main() {\n    let e: dyn Error = Quiet { n: 1 }\n}\n") [ "E0111" ];
+  errs "error-int-not-error" "fn main() {\n    let e: dyn Error = 3\n}\n" [ "E0112" ];
+  errs "error-str-not-other-dyn" "interface Named {\n    fn message(self) -> Str\n}\n\nfn main() {\n    let e: dyn Named = \"x\"\n}\n" [ "E0112" ];
+  errs "error-bad-cause" (noerr ^ "fn message(self: Quiet) -> Str {\n    \"q\"\n}\n\nfn cause(self: Quiet) -> Str {\n    \"no\"\n}\n\nfn main() {\n    let e: dyn Error = Quiet { n: 1 }\n}\n") [ "E0111" ];
+  errs "error-capability" "struct Holds[T] {\n    c: T,\n}\n\nfn message[T](self: Holds[T]) -> Str {\n    \"h\"\n}\n\nfn get(c: Clock) -> Result[Int, Holds[Clock]] {\n    Err(Holds { c: c })\n}\n\nfn f(c: Clock) -> Result[Int, dyn Error] {\n    let x = get(c)?\n    Ok(x)\n}\n\nfn main() {}\n" [ "E0202" ];
+  out "error-constructors" (perr ^ {|fn check(n: Int) -> Result[Int, dyn Error] {
+    if n < 0 {
+        return Err("negative")
+    }
+    if n > 9 {
+        Err(ParseError { line: n })
+    } else {
+        Ok(n)
+    }
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    for n in [-1, 12, 3] {
+        out.print(match check(n) {
+            Ok(v) => "ok {v}",
+            Err(e) => e.message(),
+        })
+    }
+    let maybe: Option[dyn Error] = Some(Failed("io"))
+    out.print(maybe.map(|e| e.message()) ?? "")
+}
+|}) "negative\nbad line 12\nok 3\nio\n";
+  errs "error-str-message-taken" "fn message(self: Str) -> Str {\n    self\n}\n\nfn main() {}\n" [ "E0106" ];
+  (* E0202 offers `dyn Error` when both error types could convert to it *)
+  (let src = "fn a() -> Result[Int, Str] {\n    Ok(1)\n}\n\nfn b() -> Result[Int, IoError] {\n    let x = a()?\n    Ok(x)\n}\n\nfn main() {}\n" in
+   let _, ds, _ = compile "error-fix" src in
+   ok "error-fix-offered" (codes ds = [ "E0202" ] && List.exists (fun (d : Diag.t) -> d.fix <> None) ds) (String.concat " " (codes ds));
+   let fixed = apply_fixes src ds in
+   ok "error-fix-text" (fixed = "fn a() -> Result[Int, Str] {\n    Ok(1)\n}\n\nfn b() -> Result[Int, dyn Error] {\n    let x = a()?\n    Ok(x)\n}\n\nfn main() {}\n") fixed;
+   let _, ds2, _ = compile "error-fix-fixed" fixed in
+   ok "error-fix-checks" (ds2 = []) (String.concat " " (codes ds2)));
+  (let src = "struct Quiet {\n    n: Int,\n}\n\nfn a() -> Result[Int, Quiet] {\n    Ok(1)\n}\n\nfn b() -> Result[Int, Str] {\n    let x = a()?\n    Ok(x)\n}\n\nfn main() {}\n" in
+   let _, ds, _ = compile "error-nofix" src in
+   ok "error-no-fix-when-not-error" (codes ds = [ "E0202" ] && List.for_all (fun (d : Diag.t) -> d.fix = None) ds) (String.concat " " (codes ds)));
+
   (* ---------- ordering: sort() and < on any ordered type ---------- *)
   out "sort-any"
     ("struct P {\n    x: Int,\n    name: Str,\n}\n\nenum Tree {\n    Leaf,\n    Node(Tree, Int, Tree),\n}\n\nenum Size {\n    Small,\n    Big(Int),\n}\n\n"

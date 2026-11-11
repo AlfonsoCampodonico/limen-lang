@@ -147,7 +147,7 @@ let rec bare_struct e =
   match e.edesc with
   | EStruct (n, _, _) -> not (is_tuple_name n)
   | EBin (_, a, b) -> bare_struct a || bare_struct b
-  | EUn (_, a) | ETry a | EField (a, _, _) | EIndex (a, _) -> bare_struct a
+  | EUn (_, a) | ETry (a, _) | EField (a, _, _) | EIndex (a, _) -> bare_struct a
   | EMethod (r, _, _, _) -> bare_struct r
   | ECall (f, _) -> bare_struct f
   | _ -> false
@@ -157,7 +157,8 @@ let rec simple_expr e =
   | EBlock _ | EIf _ | EMatch _ | EGroup _ -> false
   | EClosure (_, b) -> simple_expr b
   | EBin (_, a, b) | EIndex (a, b) -> simple_expr a && simple_expr b
-  | EUn (_, a) | ETry a | EField (a, _, _) -> simple_expr a
+  | EUn (_, a) | ETry (a, None) | EField (a, _, _) -> simple_expr a
+  | ETry (a, Some c) -> simple_expr a && simple_expr c
   | ECall (f, args) -> simple_expr f && List.for_all simple_expr args
   | EMethod (r, _, _, args) -> simple_expr r && List.for_all simple_expr args
   | EList es -> List.for_all simple_expr es
@@ -210,9 +211,10 @@ and expr_inner c ind e =
     add c "[";
     expr c ind i;
     add c "]"
-  | ETry a ->
+  | ETry (a, ctx) ->
     expr c ind ~min:16 a;
-    add c "?"
+    add c "?";
+    Option.iter (fun x -> add c " "; expr c ind x) ctx
   | EList es -> seq c ind "[" "]" (breaks_after_open c e.espan.lo '[') ~lo:e.espan.lo ~hi:e.espan.hi (fun x -> expr c (ind + 4) x) (fun x -> x.espan) es
   | EStruct (name, _, fields) when is_tuple_name name ->
     seq c ind "(" ")" (breaks_after_open c e.espan.lo '(') ~lo:e.espan.lo ~hi:e.espan.hi (fun (_, _, x) -> expr c (ind + 4) x) (fun (_, _, x) -> x.espan) fields

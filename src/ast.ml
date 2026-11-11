@@ -42,7 +42,7 @@ and expr_desc =
   | EMethod of expr * string * span * expr list
   | EField of expr * string * span
   | EIndex of expr * expr
-  | ETry of expr
+  | ETry of expr * expr option (* `x?`, or `x? "context"` *)
   | EIf of expr * block * expr option
   | EMatch of expr * arm list
   | EBlock of block

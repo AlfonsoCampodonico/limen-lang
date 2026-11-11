@@ -220,7 +220,7 @@ let rec expr env locals (e : expr) : expr =
       EField ({ r with edesc = EVar (qual env.self en) }, name, nsp)
     | EField (r, name, nsp) -> EField (ex r, name, nsp)
     | EIndex (a, i) -> EIndex (ex a, ex i)
-    | ETry a -> ETry (ex a)
+    | ETry (a, c) -> ETry (ex a, Option.map ex c)
     | EIf (c, b, el) -> EIf (ex c, block env locals b, Option.map ex el)
     | EMatch (s, arms) ->
       EMatch

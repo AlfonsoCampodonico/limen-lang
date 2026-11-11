@@ -229,11 +229,43 @@ for s in shapes {
 }
 ```
 
-- A struct or enum value becomes `dyn Shape` where one is expected: an annotated `let`, a function argument, a list literal of that type, a struct field, a `return`, the last expression of a function returning `dyn Shape`, or `push`. The expected type reaches into each branch of an `if`, a `match` and a block, so the branches can hold different types. Its type must satisfy the interface (E0111).
-- Only struct and enum values can become `dyn`, and only if they hold no capability, function or channel (E0112), so a `dyn` value never hides authority. To work with capabilities through an interface, use a bounded type parameter instead.
+- A struct or enum value becomes `dyn Shape` where one is expected: an annotated `let`, a function argument, a list literal of that type, a struct field, a `return`, the last expression of a function returning `dyn Shape`, `push`, or the argument of a constructor whose type is expected, as `Some(x)` where an `Option[dyn Shape]` is expected and `Err(x)` in a function returning `Result[T, dyn Error]`. The expected type reaches into each branch of an `if`, a `match` and a block, so the branches can hold different types. Its type must satisfy the interface (E0111).
+- Only struct and enum values can become `dyn`, and only if they hold no capability, function or channel (E0112), so a `dyn` value never hides authority. To work with capabilities through an interface, use a bounded type parameter instead. The one exception is `dyn Error` (below), which `Str` and `IoError` values can become too.
 - Only the interface's methods can be called on a `dyn` value. It prints like the value inside. `==` is not allowed.
 - To choose between types, say where the `dyn` is expected: `let s: dyn Shape = if big { Circle { r: 1.0 } } else { Square { s: 2.0 } }`. Without an expected type, the branches of an `if` must have the same type.
 - A `dyn` value is boxed and its calls go through a table of methods; a bounded type parameter (`[T: Shape]`) has no such cost.
+
+### Errors: the `Error` interface
+
+Every program can use this interface without declaring it:
+
+```
+interface Error {
+    fn message(self) -> Str
+    fn cause(self) -> Option[dyn Error]
+}
+```
+
+- `cause` is optional: a type with a `message` method and no `cause` satisfies `Error`, and its `cause()` is `None`. Define `cause` to point at the error underneath, as in `fn cause(self: ConfigError) -> Option[dyn Error] { Some(self.why) }`.
+- `Str` (the error of `catch`, and of the `json`, `time` and `regex` modules) and `IoError` (the error of every capability and of `http`) satisfy it. `IoError`'s message is `denied: <text>` for `Denied(text)` and `<text>` for `Failed(text)`.
+- `Result[T, dyn Error]` holds any error. In a function that returns it, `?` takes a `Result[_, E]` for any `E` that satisfies `Error` and converts the error to `dyn Error` (section 5). A function can mix `IoError`, `Str` and its own error types without converting them by hand.
+- `main` returning `Result[_, dyn Error]` reports an error by its message: `error: reading config: denied: fs: not granted`.
+
+```
+struct ParseError {
+    line: Int,
+}
+
+fn message(self: ParseError) -> Str {
+    "bad line {self.line}"
+}
+
+fn load(fs: Fs) -> Result[Config, dyn Error] {
+    let text = fs.read("app.toml")?       // IoError
+    let cfg = parse(text)?                 // ParseError
+    Ok(cfg)
+}
+```
 
 ### main
 
@@ -247,7 +279,7 @@ fn main(root: Root) -> Result[Int, E]
 fn main()
 ```
 
-`root` may be left out of any of them. When `main` returns, the program exits with status 0, or with the `Int` it returned (directly or as `Ok(n)`). The operating system keeps only the low 8 bits, so use 0 to 255: `-> Int { 256 + 7 }` exits with 7. If `main` returns `Err(e)`, the program prints `error: <e>` to stderr and exits with status 1.
+`root` may be left out of any of them. When `main` returns, the program exits with status 0, or with the `Int` it returned (directly or as `Ok(n)`). The operating system keeps only the low 8 bits, so use 0 to 255: `-> Int { 256 + 7 }` exits with 7. If `main` returns `Err(e)`, the program prints `error: <e>` to stderr and exits with status 1; a `dyn Error` prints its `message()`.
 
 ```
 fn main(root: Root) -> Int {
@@ -315,7 +347,7 @@ Both operands must have the same type. The **ordered** types are `Int`, `Float`,
 
 ### The `?` operator
 
-On a `Result[T, E]`, `e?` evaluates to the `Ok` value or returns `Err(e)` from the enclosing function, which must return `Result[_, E]` with the same `E` (E0202). Convert errors with `.map_err(|e| ...)`. On an `Option[T]`, `?` returns `None` from a function returning `Option`.
+On a `Result[T, E]`, `e?` evaluates to the `Ok` value or returns `Err(e)` from the enclosing function, which must return `Result[_, E]` with the same `E`, or `Result[_, dyn Error]` when `E` satisfies `Error` (section 4); then the error converts to `dyn Error`. Any other error type is E0202, which offers to change the function's error type to `dyn Error` when both types satisfy `Error`. Convert errors by hand with `.map_err(|e| ...)`. On an `Option[T]`, `?` returns `None` from a function returning `Option`.
 
 ### Calls
 
@@ -777,6 +809,8 @@ Strings compare byte by byte, so `c >= "a" && c <= "z"` tests a one-byte string,
 | `is_some()`, `is_none()` / `is_ok()`, `is_err()` | `Bool` |
 | `map(f)` (Option) | `Option[U]` |
 | `map_err(f)` (Result) | `Result[T, F]` |
+
+`Str` and `IoError` also have `message()`, from the `Error` interface (section 4): the string itself, and the text of the `IoError`.
 
 ### Chan[T]
 

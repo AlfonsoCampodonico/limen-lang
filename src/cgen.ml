@@ -1372,7 +1372,13 @@ let program (g : Lower.gctx) (prog : I.program) : string =
    | TNamed ("Result", [ _; et ]) ->
      mp (sprintf "  if (%s == 1) {" (tag_expr c rt "r_"));
      mp "    WBuf b_; buf_init(&b_); buf_puts(&b_, \"error: \");";
-     mp (sprintf "    %s_show(&b_, %s, true);" (cname c et) (payload_expr c rt "r_" 1 0));
+     (match et with
+      | TDyn "Error" ->
+        (* a `dyn Error` is reported by its message: method 0 of its vtable *)
+        let d = payload_expr c rt "r_" 1 0 in
+        mp (sprintf "    WStr* m_ = ((WStr* (*)(WDyn*))(%s)->vt->m[0])(%s);" d d);
+        mp "    Str_show(&b_, m_, true); Str_drop(m_);"
+      | _ -> mp (sprintf "    %s_show(&b_, %s, true);" (cname c et) (payload_expr c rt "r_" 1 0)));
      mp "    buf_puts(&b_, \"\\n\"); fflush(stdout); fwrite(b_.p, 1, (size_t)b_.len, stderr); return 1;";
      mp "  }"
    | _ -> ());
