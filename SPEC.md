@@ -579,7 +579,7 @@ let l = root.listen.on_tls("0.0.0.0:8443", cert, key)?
 
 #### TLS library
 
-TLS is OpenSSL (1.1.1 or later), in both backends: the interpreter is linked with it, and native programs that use `Net.get`, `connect_tls` or `on_tls` are linked with it. It is found when vela is built: `$VELA_OPENSSL` (an install prefix) if set, else `pkg-config openssl` (looking in Homebrew's `openssl@3` first), else the system headers. On macOS that is Homebrew's `openssl@3` (`brew install openssl@3`), whose trusted certificates are Homebrew's `cert.pem` bundle; on Linux it is the distribution's libssl (`libssl-dev` or `openssl-devel` to build), trusting the distribution's certificate store. If OpenSSL is not found, vela still builds and runs everything else, and every TLS operation fails with `Failed("tls: ... built without TLS ...")`.
+TLS is OpenSSL (1.1.1 or later), in both backends: the interpreter is linked with it, and native programs that use `Net.get`, `connect_tls` or `on_tls` are linked with it. It is found when vela is built: `$VELA_OPENSSL` (an install prefix) if set, else `pkg-config openssl` (looking in Homebrew's `openssl@3` first), else the system headers. On macOS that is Homebrew's `openssl@3` (`brew install openssl@3`), whose trusted certificates are Homebrew's `cert.pem` bundle; on Linux it is the distribution's libssl (`libssl-dev` or `openssl-devel` to build), trusting the distribution's certificate store. Native programs link OpenSSL's shared libraries, so a binary from `vela build` that uses TLS needs them where it runs. If OpenSSL is not found, vela still builds and runs everything else, and every TLS operation fails with `Failed("tls: ... built without TLS ...")`.
 
 ### Running programs
 
