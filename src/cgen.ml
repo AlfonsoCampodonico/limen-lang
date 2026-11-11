@@ -510,6 +510,8 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
       line (sprintf "  %s = i_ >= 0 ? %s : %s;" dst (mk_enum c t 0 [ "i_" ]) (mk_enum c t 1 []));
       line "}"
     | "str_bytes", _ -> set (sprintf "Str_bytes(%s)" (arg 0))
+    | "str_chars", _ -> set (sprintf "Str_chars(%s)" (arg 0))
+    | "int_range", _ -> set (sprintf "L_Int_range(%s, %s)" (arg 0) (arg 1))
     | "int_to_char", _ -> set (sprintf "Int_to_char(%s)" (arg 0))
     | "int_min", _ -> set (sprintf "(%s < %s ? %s : %s)" (arg 0) (arg 1) (arg 0) (arg 1))
     | "int_max", _ -> set (sprintf "(%s > %s ? %s : %s)" (arg 0) (arg 1) (arg 0) (arg 1))

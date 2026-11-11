@@ -120,22 +120,25 @@ let rec parse_type st : ty_expr =
     else { tdesc = TyName (n, []); tspan = merge t.span (last_span st) }
   | _ -> fail t "a type"
 
+(* Precedence levels are doubled so a range fits between comparison and
+   arithmetic: `0..<n + 1` is `0..<(n + 1)`. *)
 let binop_of = function
-  | SYM "||" -> Some (1, Or)
-  | SYM "&&" -> Some (2, And)
-  | SYM "==" -> Some (3, Eq)
-  | SYM "!=" -> Some (3, Ne)
-  | SYM "<" -> Some (4, Lt)
-  | SYM "<=" -> Some (4, Le)
-  | SYM ">" -> Some (4, Gt)
-  | SYM ">=" -> Some (4, Ge)
-  | SYM "+" -> Some (5, Add)
-  | SYM "-" -> Some (5, Sub)
-  | SYM "*" -> Some (6, Mul)
-  | SYM "/" -> Some (6, Div)
-  | SYM "%" -> Some (6, Mod)
+  | SYM "||" -> Some (2, Or)
+  | SYM "&&" -> Some (4, And)
+  | SYM "==" -> Some (6, Eq)
+  | SYM "!=" -> Some (6, Ne)
+  | SYM "<" -> Some (8, Lt)
+  | SYM "<=" -> Some (8, Le)
+  | SYM ">" -> Some (8, Gt)
+  | SYM ">=" -> Some (8, Ge)
+  | SYM "..<" -> Some (9, Range)
+  | SYM "+" -> Some (10, Add)
+  | SYM "-" -> Some (10, Sub)
+  | SYM "*" -> Some (12, Mul)
+  | SYM "/" -> Some (12, Div)
+  | SYM "%" -> Some (12, Mod)
   (* tighter than arithmetic: `m.get(k) ?? 0 + 1` is `(m.get(k) ?? 0) + 1` *)
-  | SYM "??" -> Some (7, Else)
+  | SYM "??" -> Some (14, Else)
   | _ -> None
 
 (* [ns] = "no struct literal": set in `if`/`while`/`for`/`match` heads so that

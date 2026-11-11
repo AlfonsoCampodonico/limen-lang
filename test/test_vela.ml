@@ -1263,6 +1263,21 @@ fn main(root: Root) {
   errs "less-unordered" "fn main() {\n    let a: Map[Int, Int] = map()\n    let b = a < a\n}\n" [ "E0201" ];
   errs "sort-generic" "fn f[T](xs: List[T]) -> List[T] {\n    xs.sort()\n}\n\nfn main() {}\n" [ "E0201" ];
 
+  (* ---------- ranges and characters ---------- *)
+  out "range-for"
+    (main_wrap
+       "    let n = 6\n    let mut total = 0\n    for i in 0..<n {\n        if i == 1 {\n            continue\n        }\n        if i == 5 {\n            break\n        }\n        total = total + i\n    }\n    out.print(\"{total} {0..<4} {(2..<n + 1).map(|x| x * x)} {5..<2} {(0..<0).len()} {-2..<1}\")\n    let xs = [\"a\", \"b\"]\n    for k in 0..<xs.len() {\n        out.write(\"{k}={xs[k]} \")\n    }\n    let mut big = 0\n    for i in 9223372036854775805..<9223372036854775807 {\n        big = big + 1\n    }\n    let r = 1..<3\n    for x in r {\n        out.write(\"{x}\")\n    }\n    out.print(\" {big} {(0..<3) == [0, 1, 2]}\")")
+    "9 [0, 1, 2, 3] [4, 9, 16, 25, 36] [] 0 [-2, -1, 0]\n0=a 1=b 12 2 true\n";
+  out "range-in-closure-and-task"
+    (main_wrap "    let r = group g {\n        for i in 0..<3 {\n            g.go(|| (0..<i + 1).fold(0, |a, b| a + b))\n        }\n    }\n    out.print(\"{r}\")")
+    "[0, 1, 3]\n";
+  errs "range-not-int" "fn main() {\n    let r = 0..<2.5\n}\n" [ "E0201" ];
+  errs "range-not-int-lo" "fn main() {\n    for i in \"a\"..<3 {\n    }\n}\n" [ "E0201" ];
+  out "str-chars"
+    (main_wrap
+       "    let mut seen = \"\"\n    for c in \"h\u{e9}llo, \u{4e16}\u{754c}!\".chars() {\n        seen = seen + \"[\" + c + \"]\"\n    }\n    out.print(seen)\n    let broken = \"\u{e9}\".slice(0, 1) + \"x\" + \"\u{4e16}\".slice(0, 2) + \"\u{1f600}\"\n    out.print(\"{broken.chars().map(|c| c.len())} {\"\".chars()} {\"ab\".chars()} {broken.chars().join(\"\") == broken}\")")
+    "[h][\u{e9}][l][l][o][,][ ][\u{4e16}][\u{754c}][!]\n[1, 1, 1, 1, 4] [] [\"a\", \"b\"] true\n";
+
   (* ---------- modules ---------- *)
   let geom =
     "// geometry\npub struct Point {\n    x: Int,\n    y: Int,\n}\n\npub enum Shape {\n    Dot(Point),\n    Box(Point, Point),\n}\n\n"

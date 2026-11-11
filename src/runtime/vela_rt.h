@@ -737,6 +737,41 @@ static L_Int *Str_bytes(WStr *s) {
   for (int64_t i = 0; i < s->len; i++) L_Int_push(&out, (int64_t)(unsigned char)s->data[i]);
   return out;
 }
+/* The length of the UTF-8 character at s[i], or 1 for a byte that does not
+   start a well-formed one (as Interp.utf8_len). */
+static int64_t w_utf8_len(const unsigned char *s, int64_t i, int64_t n) {
+  unsigned char b = s[i];
+  int64_t k;
+  unsigned char lo = 0x80, hi = 0xBF;
+  if (b < 0x80) return 1;
+  else if (b >= 0xC2 && b <= 0xDF) k = 2;
+  else if (b >= 0xE0 && b <= 0xEF) { k = 3; if (b == 0xE0) lo = 0xA0; if (b == 0xED) hi = 0x9F; }
+  else if (b >= 0xF0 && b <= 0xF4) { k = 4; if (b == 0xF0) lo = 0x90; if (b == 0xF4) hi = 0x8F; }
+  else return 1;
+  if (i + k > n) return 1;
+  if (s[i + 1] < lo || s[i + 1] > hi) return 1;
+  for (int64_t j = 2; j < k; j++) if (s[i + j] < 0x80 || s[i + j] > 0xBF) return 1;
+  return k;
+}
+/* The characters (UTF-8 code points) of a string, each as a string. */
+static L_Str *Str_chars(WStr *s) {
+  L_Str *out = L_Str_new(s->len);
+  for (int64_t i = 0; i < s->len;) {
+    int64_t k = w_utf8_len((const unsigned char *)s->data, i, s->len);
+    L_Str_push(&out, Str_from(s->data + i, k));
+    i += k;
+  }
+  return out;
+}
+/* lo..<hi as a list */
+static L_Int *L_Int_range(int64_t lo, int64_t hi) {
+  int64_t n = 0;
+  if (hi > lo && __builtin_sub_overflow(hi, lo, &n)) w_oom();
+  L_Int *out = L_Int_new(n);
+  for (int64_t i = 0; i < n; i++) out->data[i] = lo + i;
+  out->len = n;
+  return out;
+}
 /* The UTF-8 encoding of a code point; U+FFFD for anything that is not one. */
 static WStr *Int_to_char(int64_t n) {
   if (n < 0 || n > 0x10FFFF || (n >= 0xD800 && n <= 0xDFFF)) n = 0xFFFD;

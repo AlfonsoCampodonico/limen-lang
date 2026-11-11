@@ -220,6 +220,10 @@ let rec lower f (e : expr) : I.atom =
       let none_b, _, _ = in_block f (fun () -> let y = lower f b in emit f (I.Init (r, I.Atom y))) in
       emit f (I.If (has, some_b, none_b));
       I.V r
+    | EBin (Range, a, b) ->
+      let x = lower f a in
+      let y = lower f b in
+      tmp f ty (I.Prim ("int_range", TInt, [ x; y ], e.espan))
     | EBin (op, a, b) ->
       let x = lower f a in
       let y = lower f b in
@@ -845,6 +849,27 @@ and lower_stmt f s =
             ignore (lower_block f b))
       in
       emit f (I.Loop body)
+    | SFor (n, _, { edesc = EBin (Range, lo, hi); espan; _ }, b) ->
+      (* count from lo while below hi; the list is never built *)
+      let la = lower f lo in
+      let ha = lower f hi in
+      let i = fresh_var "i" TInt in
+      emit f (I.Let (i, I.Atom la));
+      let h = fresh_var "hi" TInt in
+      emit f (I.Let (h, I.Atom ha));
+      let stmts, _, _ =
+        in_block f (fun () ->
+            let c = tmp f TBool (I.Bin (Ge, TInt, I.V i, I.V h, espan)) in
+            let brk, _, _ = in_block f (fun () -> emit f I.Break; f.dead <- true) in
+            emit f (I.If (c, brk, []));
+            let x = fresh_var n TInt in
+            emit f (I.Let (x, I.Atom (I.V i)));
+            (* i < hi, so i + 1 cannot overflow *)
+            emit f (I.Set (i, I.Bin (Add, TInt, I.V i, I.AInt 1L, espan), ref false));
+            bind f n x;
+            ignore (lower_block f b))
+      in
+      emit f (I.Loop stmts)
     | SFor (n, _, e, b) ->
       let la = lower f e in
       emit_for f la (tyof f e) e.espan (fun x ->

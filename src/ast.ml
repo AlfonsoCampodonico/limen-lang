@@ -7,7 +7,7 @@ and ty_desc =
   | TyFn of ty_expr list * ty_expr
   | TyInt of int (* a size, as in Array[Int, 3] *)
 
-type binop = Add | Sub | Mul | Div | Mod | Eq | Ne | Lt | Le | Gt | Ge | And | Or | Else (* `??` *)
+type binop = Add | Sub | Mul | Div | Mod | Eq | Ne | Lt | Le | Gt | Ge | And | Or | Else (* `??` *) | Range (* `a..<b` *)
 type unop = Neg | Not
 
 type pat = { pdesc : pat_desc; pspan : span }

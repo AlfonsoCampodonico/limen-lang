@@ -266,7 +266,7 @@ let methods (t : ty) : (string * (unit -> ty list * ty)) list =
       m "starts_with" [ TStr ] TBool; m "ends_with" [ TStr ] TBool; m "to_upper" [] TStr;
       m "to_lower" [] TStr; m "replace" [ TStr; TStr ] TStr; m "parse_int" [] (opt TInt);
       m "parse_float" [] (opt TFloat); m "slice" [ TInt; TInt ] TStr; m "index_of" [ TStr ] (opt TInt);
-      m "bytes" [] (TList TInt) ]
+      m "bytes" [] (TList TInt); m "chars" [] (TList TStr) ]
   | TInt ->
     [ m "to_str" [] TStr; m "to_float" [] TFloat; m "abs" [] TInt; m "to_char" [] TStr; m "min" [ TInt ] TInt;
       m "max" [ TInt ] TInt ]
@@ -897,6 +897,11 @@ and check_bin ctx f op a b sp =
     unify_at ctx a.espan TBool ta;
     expect ctx f b TBool;
     TBool
+  | Range ->
+    (* `lo..<hi`: the Ints from lo up to but not including hi *)
+    unify_at ctx a.espan TInt ta;
+    expect ctx f b TInt;
+    TList TInt
   | Else -> (
     (* `opt ?? default`: the value inside, or the default when there is none *)
     match repr ta with
@@ -916,7 +921,7 @@ and check_bin ctx f op a b sp =
     let name =
       match op with
       | Add -> "+" | Sub -> "-" | Mul -> "*" | Div -> "/" | Mod -> "%" | Eq -> "==" | Ne -> "!="
-      | Lt -> "<" | Le -> "<=" | Gt -> ">" | Ge -> ">=" | And -> "&&" | Or -> "||" | Else -> "??"
+      | Lt -> "<" | Le -> "<=" | Gt -> ">" | Ge -> ">=" | And -> "&&" | Or -> "||" | Else -> "??" | Range -> "..<"
     in
     let bad () =
       err ctx "E0201" sp (sprintf "operator `%s` cannot be applied to `%s`" name (show t))

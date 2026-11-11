@@ -33,7 +33,7 @@ fn parse_names(body: Str) -> List[Str] {   // no capabilities: cannot do I/O
 - **Floats:** digits with a fraction (`1.5`), an exponent (`1e9`, `2.5E-3`), or both. `_` is allowed. There is no leading-dot form (`.5`).
 - **Strings:** `"..."`, may span lines. Escapes: `\n \t \r \\ \" \{ \} \0`. Any other escape is error E0006.
 - **Interpolation:** `{expr}` inside a string evaluates any expression, including ones with their own strings: `"{xs.join(", ")}"`. An empty `{}` is error E0007; write `\{` for a literal brace.
-- **Symbols:** `( ) { } [ ] , : ; . | + - * / % ! ? = < > -> => == != <= >= && ||`.
+- **Symbols:** `( ) { } [ ] , : ; . | + - * / % ! ? = < > -> => == != <= >= && || ..<`.
 
 ### Newlines
 
@@ -70,7 +70,9 @@ Statements are separated by a newline or `;`. Two statements on one line without
 | `Root`, `Net`, `Fs`, `Stdout`, `Clock`, `Listen`, `Listener`, `Conn` | capabilities | Cannot be created by programs (section 9). |
 | user `struct` and `enum` | | Optionally generic (section 4). |
 
-There is no character type: use one-byte strings (`s.split("")`) or bytes (`s.bytes()`), see section 11. There is no range syntax; count with `while` and a `mut` counter, or use `list.range(lo, hi)` from the standard library.
+There is no separate character type: a character is a `Str` holding one UTF-8 code point. `s.chars()` gives them as a `List[Str]`, `for c in s.chars() { ... }` visits them, and `s.bytes()` gives the bytes (section 11). One type for text keeps the API small; `len()` still counts bytes.
+
+`lo..<hi` is the `List[Int]` from `lo` up to but not including `hi`, empty when `hi <= lo`. It counts in loops, `for i in 0..<n { ... }`, without building the list, and is a list everywhere else: `(1..<4).map(|x| x * x)`. There is one form, exclusive, spelled `..<` as in Swift and Kotlin so it cannot be misread; for an inclusive end write `0..<n + 1`.
 
 ### Tuples
 
@@ -247,11 +249,12 @@ From loosest to tightest. All binary operators are left-associative.
 | 2 | `&&` |
 | 3 | `==` `!=` |
 | 4 | `<` `<=` `>` `>=` |
-| 5 | `+` `-` |
-| 6 | `*` `/` `%` |
-| 7 | `??` |
-| 8 | unary `-` `!` |
-| 9 | call `f(x)`, index `a[i]`, field `p.x`, method `s.len()`, `?` |
+| 5 | `..<` |
+| 6 | `+` `-` |
+| 7 | `*` `/` `%` |
+| 8 | `??` |
+| 9 | unary `-` `!` |
+| 10 | call `f(x)`, index `a[i]`, field `p.x`, method `s.len()`, `?` |
 
 ### Operators
 
@@ -263,6 +266,7 @@ From loosest to tightest. All binary operators are left-associative.
 | `<` `<=` `>` `>=` | any ordered type (below) | `Bool` |
 | `==` `!=` | any type except functions and capabilities; structural equality | `Bool` |
 | `&&` `\|\|` | `Bool`, short-circuit | `Bool` |
+| `..<` | `Int` | `List[Int]`: `lo..<hi` counts up from `lo`, stopping before `hi` |
 | `-x` | `Int`, `Float` | same type |
 | `!x` | `Bool` | `Bool` |
 
@@ -307,6 +311,7 @@ xs.push(4)                // also needs mut
 return value
 while cond { ... }
 for x in list_or_array { ... }
+for i in 0..<n { ... }    // 0, 1, ..., n - 1
 let (a, b) = pair         // unpack a tuple
 for (k, v) in m.entries() { ... }
 m[key] = value            // insert into a map (needs mut)
@@ -316,7 +321,7 @@ expr
 ```
 
 - Parameters and pattern bindings are immutable. Use `let mut y = y` to get a mutable copy.
-- `for` iterates over a snapshot: changing the list inside the loop does not affect the iteration.
+- `for` iterates over a snapshot: changing the list inside the loop does not affect the iteration. Over a range, both bounds are evaluated once, before the first iteration.
 - `break` and `continue` only work inside loops, not across closures (E0208).
 - Only variables, fields, list or array elements and map entries can be assigned (E0209).
 
@@ -498,7 +503,8 @@ Methods take the receiver by value and never modify it, except `push`, which nee
 | `len()` | `Int`, bytes |
 | `is_empty()` | `Bool` |
 | `lines()` | `List[Str]`, split on `\n`, stripping a trailing `\r` and dropping one final empty line |
-| `split(sep)` | `List[Str]`, keeping empty pieces (`"a,,b".split(",")` is `["a", "", "b"]`); `split("")` splits into single bytes, which is how to get characters |
+| `split(sep)` | `List[Str]`, keeping empty pieces (`"a,,b".split(",")` is `["a", "", "b"]`); `split("")` splits into single bytes |
+| `chars()` | `List[Str]`, one string per UTF-8 code point; a byte that does not start a well-formed one is a piece of its own, so `s.chars().join("") == s` always |
 | `trim()` | `Str` without leading and trailing spaces, tabs, newlines, `\r` and form feeds |
 | `contains(s)`, `starts_with(s)`, `ends_with(s)` | `Bool` |
 | `to_upper()`, `to_lower()` | `Str`, ASCII only |
@@ -534,7 +540,7 @@ Methods take the receiver by value and never modify it, except `push`, which nee
 
 `xs[i]` panics when `i` is out of range; `xs.get(i)` returns `None` instead. Writes go through index and field paths: `groups[i].words.push(w)` and `items[i].qty = 3` both work on a `mut` list. `sort()` uses the order of `<`, so it sorts tuples by their first item, then the second, and structs by their fields in declaration order; for another order and for inserting or removing at a position, use the `list` module (`sort_by`, `insert_at`, `remove_at`, section 19).
 
-Strings compare byte by byte, so `c >= "a" && c <= "z"` tests a one-byte string. `slice`, `index_of` and `bytes()` give positions and byte codes.
+Strings compare byte by byte, so `c >= "a" && c <= "z"` tests a one-byte string, such as a character from `chars()`. `slice`, `index_of` and `bytes()` give positions and byte codes.
 
 ### Map[K, V]
 

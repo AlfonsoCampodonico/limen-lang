@@ -235,6 +235,28 @@ let utf8_of_code n =
   Buffer.add_utf_8_uchar b (Uchar.of_int n);
   Buffer.contents b
 
+(* The length of the UTF-8 character at s.[i], or 1 for a byte that does not
+   start a well-formed one (as the native w_utf8_len). *)
+let utf8_len s i =
+  let n = String.length s in
+  let b = Char.code s.[i] in
+  let byte j = Char.code s.[j] in
+  let cont k lo hi =
+    if i + k > n then 1
+    else if byte (i + 1) < lo || byte (i + 1) > hi then 1
+    else if List.for_all (fun j -> byte (i + j) >= 0x80 && byte (i + j) <= 0xBF) (List.init (k - 2) (fun j -> j + 2)) then k
+    else 1
+  in
+  if b < 0x80 then 1
+  else if b >= 0xC2 && b <= 0xDF then cont 2 0x80 0xBF
+  else if b >= 0xE0 && b <= 0xEF then cont 3 (if b = 0xE0 then 0xA0 else 0x80) (if b = 0xED then 0x9F else 0xBF)
+  else if b >= 0xF0 && b <= 0xF4 then cont 4 (if b = 0xF0 then 0x90 else 0x80) (if b = 0xF4 then 0x8F else 0xBF)
+  else 1
+
+let chars s =
+  let rec go i acc = if i >= String.length s then List.rev acc else let k = utf8_len s i in go (i + k) (String.sub s i k :: acc) in
+  go 0 []
+
 let parse_decimal s =
   let s = String.trim s in
   let n = String.length s in
@@ -290,6 +312,10 @@ let binop op a b sp =
   | Le, VFloat x, VFloat y -> VBool (x <= y)
   | Gt, VFloat x, VFloat y -> VBool (x > y)
   | Ge, VFloat x, VFloat y -> VBool (x >= y)
+  | Range, VInt lo, VInt hi ->
+    if hi <= lo then VList [||]
+    else if Int64.sub hi lo < 0L || Int64.sub hi lo > Int64.of_int Sys.max_array_length then raise (Panic ("out of memory", sp))
+    else VList (Array.init (Int64.to_int (Int64.sub hi lo)) (fun i -> VInt (Int64.add lo (Int64.of_int i))))
   | Eq, _, _ -> VBool (equal a b)
   | Ne, _, _ -> VBool (not (equal a b))
   | Lt, _, _ -> VBool (compare_v a b < 0)
@@ -710,6 +736,18 @@ and exec rt env s =
         try ignore (eval_block rt env b) with Continue_ -> ()
       done
     with Break_ -> ())
+  | SFor (n, _, { edesc = EBin (Range, lo, hi); _ }, b) -> (
+    let lo = match eval rt env lo with VInt x -> x | _ -> failwith "internal: range" in
+    let hi = match eval rt env hi with VInt x -> x | _ -> failwith "internal: range" in
+    let i = ref lo in
+    try
+      while !i < hi do
+        let sc = Hashtbl.create 1 in
+        Hashtbl.replace sc n (ref (VInt !i));
+        i := Int64.add !i 1L;
+        try ignore (eval_block rt (sc :: env) b) with Continue_ -> ()
+      done
+    with Break_ -> ())
   | SFor (n, _, e, b) -> (
     match eval rt env e with
     | VList arr -> (
@@ -779,6 +817,7 @@ and call_method rt v name args sp =
     let hi = max lo (clamp hi n) in
     VStr (String.sub s lo (hi - lo))
   | VStr s, "index_of", [ VStr t ] -> ( match find_sub s t 0 with Some i -> some (vint i) | None -> none)
+  | VStr s, "chars", [] -> strs (chars s)
   | VStr s, "bytes", [] -> VList (Array.init (String.length s) (fun i -> vint (Char.code s.[i])))
   | VInt n, "to_char", [] -> VStr (utf8_of_code (if n < 0L || n > 0x10FFFFL then -1 else Int64.to_int n))
   | VInt a, "min", [ VInt b ] -> VInt (min a b)

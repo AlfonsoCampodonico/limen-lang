@@ -120,12 +120,13 @@ let rec pat (p : pat) =
 
 (* ---------- expressions ---------- *)
 
+(* doubled, so a range fits between comparison and arithmetic *)
 let prec = function
-  | Or -> 1 | And -> 2 | Eq | Ne -> 3 | Lt | Le | Gt | Ge -> 4 | Add | Sub -> 5 | Mul | Div | Mod -> 6 | Else -> 7
+  | Or -> 2 | And -> 4 | Eq | Ne -> 6 | Lt | Le | Gt | Ge -> 8 | Range -> 9 | Add | Sub -> 10 | Mul | Div | Mod -> 12 | Else -> 14
 
 let op_str = function
   | Or -> "||" | And -> "&&" | Eq -> "==" | Ne -> "!=" | Lt -> "<" | Le -> "<=" | Gt -> ">" | Ge -> ">="
-  | Add -> "+" | Sub -> "-" | Mul -> "*" | Div -> "/" | Mod -> "%" | Else -> "??"
+  | Add -> "+" | Sub -> "-" | Mul -> "*" | Div -> "/" | Mod -> "%" | Else -> "??" | Range -> "..<"
 
 (* A struct literal that would be read as the start of a block in an
    `if`/`while`/`for`/`match` head. *)
@@ -154,9 +155,9 @@ let rec expr c ind ?(min = 0) e =
   let p =
     match e.edesc with
     | EBin (op, _, _) -> prec op
-    | EUn _ -> 7
+    | EUn _ -> 14
     | EClosure _ -> 0
-    | _ -> 9
+    | _ -> 18
   in
   if p < min then (add c "("; expr_inner c ind e; add c ")") else expr_inner c ind e
 
@@ -169,30 +170,30 @@ and expr_inner c ind e =
   | EBin (op, a, b) ->
     let p = prec op in
     expr c ind ~min:p a;
-    add c (" " ^ op_str op ^ " ");
+    add c (if op = Range then op_str op else " " ^ op_str op ^ " ");
     expr c ind ~min:(p + 1) b
   | EUn (op, a) ->
     add c (match op with Neg -> "-" | Not -> "!");
-    expr c ind ~min:8 a
+    expr c ind ~min:16 a
   | ECall (f, args) ->
-    expr c ind ~min:8 f;
+    expr c ind ~min:16 f;
     seq c ind "(" ")" (breaks_after_open c f.espan.hi '(') (fun x -> expr c (ind + 4) x) (fun x -> x.espan) args
   | EMethod (r, name, nsp, args) ->
-    expr c ind ~min:8 r;
+    expr c ind ~min:16 r;
     if has_newline c r.espan.hi nsp.lo then new_line c (ind + 4);
     add c ("." ^ name);
     seq c ind "(" ")" (breaks_after_open c nsp.hi '(') (fun x -> expr c (ind + 4) x) (fun x -> x.espan) args
   | EField (r, name, nsp) ->
-    expr c ind ~min:8 r;
+    expr c ind ~min:16 r;
     if has_newline c r.espan.hi nsp.lo then new_line c (ind + 4);
     add c ("." ^ name)
   | EIndex (a, i) ->
-    expr c ind ~min:8 a;
+    expr c ind ~min:16 a;
     add c "[";
     expr c ind i;
     add c "]"
   | ETry a ->
-    expr c ind ~min:8 a;
+    expr c ind ~min:16 a;
     add c "?"
   | EList es -> seq c ind "[" "]" (breaks_after_open c e.espan.lo '[') (fun x -> expr c (ind + 4) x) (fun x -> x.espan) es
   | EStruct (name, _, fields) when is_tuple_name name ->
