@@ -31,7 +31,7 @@
 ; Embed the standard library modules (written in Vela).
 (rule
  (targets std_text.ml)
- (deps std/json.vela std/list.vela std/text.vela std/http.vela)
+ (deps std/json.vela std/list.vela std/text.vela std/http.vela std/format.vela)
  (action
   (with-stdout-to
    std_text.ml
@@ -45,4 +45,6 @@
     (cat std/text.vela)
     (echo "|xxstdxx});\n(\"http\", {xxstdxx|")
     (cat std/http.vela)
+    (echo "|xxstdxx});\n(\"format\", {xxstdxx|")
+    (cat std/format.vela)
     (echo "|xxstdxx}) ]\n")))))

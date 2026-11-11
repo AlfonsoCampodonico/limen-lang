@@ -514,7 +514,7 @@ Methods take the receiver by value and never modify it, except `push`, which nee
 | Type | Methods |
 | --- | --- |
 | `Int` | `to_str()`, `to_float()`, `abs()`, `min(n)`, `max(n)`, `to_char()` (the UTF-8 text of a code point, `65.to_char()` is `"A"`; invalid code points give U+FFFD) |
-| `Float` | `to_str()`, `to_int()` (truncates; NaN gives 0), `abs()`, `sqrt()` |
+| `Float` | `to_str()`, `to_int()` (truncates; NaN gives 0), `abs()`, `sqrt()`, `to_fixed(d)` (exactly `d` decimals, 0 to 30, rounded as C's printf rounds: `3.14159.to_fixed(2)` is `"3.14"`; NaN and infinities give `nan`, `inf`, `-inf`) |
 | `Bool` | `to_str()` |
 
 ### List[T]
@@ -856,6 +856,21 @@ The handler is a plain function value, so it gets no capability unless a closure
 ### list
 
 `sort_by(xs, less)` (stable merge sort, `less(a, b)` says whether `a` goes first), `index_of(xs, x)`, `find_index(xs, pred)`, `range(lo, hi)`, `remove_at(xs, i)`, `insert_at(xs, i, x)`. All return new lists.
+
+### format
+
+Number formatting. Fixed decimals are the Float method `x.to_fixed(d)`; this module adds the rest. Pure functions.
+
+| Item | Meaning |
+| --- | --- |
+| `thousands(n)` | `"1,234,567"` |
+| `grouped(number, sep)` | `sep` between groups of three digits in the integer part of a number already written out: `grouped(x.to_fixed(2), " ")` is `"1 234 567.89"` |
+| `zero_pad(n, width)` | zeros after the sign up to `width` characters: `zero_pad(-7, 4)` is `"-007"` |
+| `percent(x, decimals)` | `percent(0.4567, 1)` is `"45.7%"` |
+| `hex(n)`, `base(n, radix)` | lowercase digits in base 16 or 2 to 36, with `-` for negatives: `hex(255)` is `"ff"`; another radix panics |
+| `parse_base(s, radix)` | `Option[Int]`: digits in that base (either case) with an optional sign; `None` on anything else or overflow |
+| `align_left(s, w)`, `align_right(s, w)`, `align_center(s, w)` | `s` padded with spaces to `w` characters for table columns; counts code points, not bytes |
+| `width(s)` | the number of code points in `s` |
 
 ### text
 

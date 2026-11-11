@@ -1,0 +1,176 @@
+// Number formatting beyond `to_str()`: digit grouping, zero padding, other
+// bases and aligned columns. For a fixed number of decimals use the Float
+// method `x.to_fixed(2)`; it rounds exactly as C's printf does.
+
+fn digit_text(d: Int) -> Str {
+    "0123456789abcdefghijklmnopqrstuvwxyz".slice(d, d + 1)
+}
+
+// `n` written in base `radix` (2 to 36), lowercase, with a leading `-` when
+// negative: `base(255, 2)` is "11111111". Panics on another radix.
+pub fn base(n: Int, radix: Int) -> Str {
+    if radix < 2 || radix > 36 {
+        panic("format.base: radix {radix} is not between 2 and 36")
+    }
+    if n == 0 {
+        return "0"
+    }
+    // work on the remainders directly so the smallest Int needs no negation
+    let mut digits: List[Str] = []
+    let mut m = n
+    while m != 0 {
+        digits.push(digit_text((m % radix).abs()))
+        m = m / radix
+    }
+    let sign = if n < 0 { "-" } else { "" }
+    sign + digits.reverse().join("")
+}
+
+// `n` in lowercase hexadecimal: `hex(255)` is "ff", `hex(-1)` is "-1".
+pub fn hex(n: Int) -> Str {
+    base(n, 16)
+}
+
+fn digit_value(b: Int) -> Int {
+    if b >= 48 && b <= 57 {
+        b - 48
+    } else if b >= 97 && b <= 122 {
+        b - 87
+    } else if b >= 65 && b <= 90 {
+        b - 55
+    } else {
+        99
+    }
+}
+
+// Parse digits in base `radix` (2 to 36, either case) with an optional sign.
+// None for anything else, including a number that does not fit in an Int.
+pub fn parse_base(s: Str, radix: Int) -> Option[Int] {
+    if radix < 2 || radix > 36 {
+        return None
+    }
+    let bs = s.trim().bytes()
+    let mut i = 0
+    let mut neg = false
+    if bs.len() > 0 && (bs[0] == 45 || bs[0] == 43) {
+        neg = bs[0] == 45
+        i = 1
+    }
+    if i >= bs.len() {
+        return None
+    }
+    // accumulate as a negative number: it has room for the smallest Int
+    let lowest = -9223372036854775807 - 1
+    let mut n = 0
+    while i < bs.len() {
+        let d = digit_value(bs[i])
+        if d >= radix {
+            return None
+        }
+        if n < (lowest + d) / radix {
+            return None
+        }
+        n = n * radix - d
+        i = i + 1
+    }
+    if neg {
+        Some(n)
+    } else if n == lowest {
+        None
+    } else {
+        Some(-n)
+    }
+}
+
+// Put `sep` between groups of three digits in the integer part of a number
+// already written out: `grouped("-1234567.891", ",")` is "-1,234,567.891".
+pub fn grouped(number: Str, sep: Str) -> Str {
+    let bs = number.bytes()
+    let mut start = 0
+    if bs.len() > 0 && (bs[0] == 45 || bs[0] == 43) {
+        start = 1
+    }
+    let mut end = start
+    while end < bs.len() && bs[end] >= 48 && bs[end] <= 57 {
+        end = end + 1
+    }
+    let mut out = number.slice(0, start)
+    let mut i = start
+    while i < end {
+        if i > start && (end - i) % 3 == 0 {
+            out = out + sep
+        }
+        out = out + number.slice(i, i + 1)
+        i = i + 1
+    }
+    out + number.slice(end, number.len())
+}
+
+// `n` with commas between thousands: `thousands(1234567)` is "1,234,567".
+pub fn thousands(n: Int) -> Str {
+    grouped(n.to_str(), ",")
+}
+
+// `n` padded with zeros to at least `width` characters, after any sign:
+// `zero_pad(-7, 4)` is "-007".
+pub fn zero_pad(n: Int, width: Int) -> Str {
+    let s = n.to_str()
+    let neg = s.starts_with("-")
+    let digits = if neg { s.slice(1, s.len()) } else { s }
+    let mut zeros = ""
+    let mut k = digits.len() + if neg { 1 } else { 0 }
+    while k < width {
+        zeros = zeros + "0"
+        k = k + 1
+    }
+    if neg {
+        "-" + zeros + digits
+    } else {
+        zeros + digits
+    }
+}
+
+// `x` as a percentage with `decimals` digits: `percent(0.4567, 1)` is "45.7%".
+pub fn percent(x: Float, decimals: Int) -> Str {
+    (x * 100.0).to_fixed(decimals) + "%"
+}
+
+// How many characters (UTF-8 code points) `s` holds; continuation bytes do
+// not count.
+pub fn width(s: Str) -> Int {
+    let mut n = 0
+    for b in s.bytes() {
+        if b < 128 || b >= 192 {
+            n = n + 1
+        }
+    }
+    n
+}
+
+fn spaces(n: Int) -> Str {
+    let mut out = ""
+    let mut i = 0
+    while i < n {
+        out = out + " "
+        i = i + 1
+    }
+    out
+}
+
+// `s` padded with spaces to `w` characters, for columns of text. A longer
+// `s` is returned as it is.
+pub fn align_left(s: Str, w: Int) -> Str {
+    s + spaces(w - width(s))
+}
+
+pub fn align_right(s: Str, w: Int) -> Str {
+    spaces(w - width(s)) + s
+}
+
+pub fn align_center(s: Str, w: Int) -> Str {
+    let gap = w - width(s)
+    if gap <= 0 {
+        return s
+    }
+    spaces(gap / 2) + s + spaces(gap - gap / 2)
+}

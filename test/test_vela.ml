@@ -91,6 +91,9 @@ let tmpdir = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "vela-nati
 let () = try Unix.mkdir tmpdir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ()
 let native_enabled = Sys.getenv_opt "VELA_SKIP_NATIVE" = None
 
+(* VELA_ONLY=prefix runs only the programs whose name starts with it. *)
+let selected name = match Sys.getenv_opt "VELA_ONLY" with None -> true | Some p -> String.starts_with ~prefix:p name
+
 (* AddressSanitizer catches use-after-free and double free in the reference
    counting; VELA_LEAKCHECK reports objects still alive at exit. *)
 let sanitize = [ "-O1"; "-g"; "-fsanitize=address,undefined"; "-fno-sanitize-recover=all" ]
@@ -137,7 +140,7 @@ let check_native name ?grants ?modules src ~want_out ~want_err_prefix =
 let tsan = [ "-O1"; "-g"; "-fsanitize=thread" ]
 
 let check_tsan name ?(grants = Interp.no_grants) src want =
-  if native_enabled then begin
+  if native_enabled && selected name then begin
     let items, ds, _ = compile name src in
     let exe = Filename.concat tmpdir (name ^ "-tsan") in
     if ds <> [] then ok (name ^ "/tsan") false "does not compile"
@@ -162,20 +165,24 @@ let check_tsan name ?(grants = Interp.no_grants) src want =
   end
 
 let out name ?grants ?modules src want =
+  if selected name then begin
   (match run ?grants ?modules name src with
    | Ok (got, _) -> ok name (got = want) (sprintf "got %S, want %S" got want)
    | Error e -> ok name false e);
   check_native name ?grants ?modules src ~want_out:want ~want_err_prefix:None
+  end
 
 let errs ?modules name src want =
   let _, ds, _ = compile ?modules name src in
   ok name (codes ds = want) (sprintf "got [%s], want [%s]" (String.concat " " (codes ds)) (String.concat " " want))
 
 let panics name src want =
+  if selected name then begin
   (match run name src with
    | Error e -> ok name (e = "panic: " ^ want) (sprintf "got %S" e)
    | Ok (o, _) -> ok name false ("no panic, output " ^ o));
   check_native name src ~want_out:"" ~want_err_prefix:(Some ("panic: " ^ want ^ "\n"))
+  end
 
 (* Apply every fix's edits and return the new source. *)
 let apply_fixes src (ds : Diag.t list) =
@@ -1081,6 +1088,20 @@ fn main(root: Root) {
     "use json\n\nfn main(root: Root) {\n    for s in [\"\\{\\\"a\\\": [1, 2.5e1, \\\"\\\\u0041\\\"]\\}\", \"[1 2]\", \"\\\"\\\\x\\\"\"] {\n        match json.parse(s) {\n            Ok(v) => root.stdout.print(json.stringify(v)),\n            Err(e) => root.stdout.print(e),\n        }\n    }\n}\n"
     "{\"a\":[1,25,\"A\"]}\nexpected `,` or `]` at byte 3\nexpected a valid escape at byte 1\n";
 
+  out "std-format"
+    {v|use format
+
+fn main(root: Root) {
+    let out = root.stdout
+    out.print("{3.14159.to_fixed(2)} {2.5.to_fixed(0)} {(-0.001).to_fixed(2)} {1e21.to_fixed(1)} {(0.0 / 0.0).to_fixed(2)} {1.005.to_fixed(2)} {7.0.to_fixed(-3)}")
+    out.print("{format.hex(255)} {format.hex(-1)} {format.base(255, 2)} {format.base(-9223372036854775807 - 1, 16)} {format.base(35, 36)}")
+    out.print("{format.parse_base("ff", 16)} {format.parse_base("-8000000000000000", 16)} {format.parse_base("8000000000000000", 16)} {format.parse_base("12z", 10)} {format.parse_base("-", 10)}")
+    out.print("{format.thousands(1234567)} {format.thousands(-999)} {format.thousands(-1000)} {format.grouped(1234567.891.to_fixed(2), "_")} {format.grouped("12", ",")}")
+    out.print("{format.zero_pad(-7, 4)} {format.zero_pad(42, 5)} {format.zero_pad(12345, 3)} {format.percent(0.4567, 1)}")
+    out.print("[{format.align_left("é", 3)}][{format.align_right("ab", 4)}][{format.align_center("ab", 5)}][{format.align_right("long", 2)}]")
+}
+|v}
+    "3.14 2 -0.00 1000000000000000000000.0 nan 1.00 7\nff -1 11111111 -8000000000000000 z\nSome(255) Some(-9223372036854775808) None None None\n1,234,567 -999 -1,000 1_234_567.89 12\n-007 00042 12345 45.7%\n[\195\169  ][  ab][ ab  ][long]\n";
   (* ---------- Rand, Env, args and the Fs additions ---------- *)
   let box = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "vela-box-%d" (Unix.getpid ())) in
   (try Unix.mkdir box 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
@@ -1287,7 +1308,7 @@ fn main(root: Root) {
     [ "../examples"; "../bench" ];
   ok "fmt-every-program" (!fmt_failures = [])
     (String.concat "\n\n" (List.map (fun (n, m) -> n ^ ": " ^ m) (List.rev !fmt_failures)));
-  ok "fmt-checked-count" (Hashtbl.length fmt_checked > 90) (string_of_int (Hashtbl.length fmt_checked));
+  ok "fmt-checked-count" (Hashtbl.length fmt_checked > 90 || Sys.getenv_opt "VELA_ONLY" <> None) (string_of_int (Hashtbl.length fmt_checked));
 
   Printf.printf "%d/%d passed\n" (!total - !failed) !total;
   if !failed > 0 then exit 1

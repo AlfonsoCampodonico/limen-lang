@@ -488,6 +488,7 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     | "float_to_int", _ -> set (sprintf "w_f2i(%s)" (arg 0))
     | "float_abs", _ -> set (sprintf "fabs(%s)" (arg 0))
     | "float_sqrt", _ -> set (sprintf "sqrt(%s)" (arg 0))
+    | "float_to_fixed", _ -> set (sprintf "Float_to_fixed(%s, %s)" (arg 0) (arg 1))
     | "cap_print", TCap Stdout -> line (sprintf "Cap_print(%s, true);" (arg 1)); set "0"
     | "cap_write", TCap Stdout -> line (sprintf "Cap_print(%s, false);" (arg 1)); set "0"
     | "cap_now_ms", _ -> set "Cap_now_ms()"
