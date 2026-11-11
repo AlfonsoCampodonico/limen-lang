@@ -62,7 +62,7 @@ Statements are separated by a newline or `;`. Two statements on one line without
 | `List[T]` | growable sequence | A value: assigning or passing it never shares mutation (section 8). |
 | `Array[T, N]` | exactly `N` elements | A value type stored inline, like a struct. `N` is an integer literal. |
 | `(A, B)`, `(A, B, C)`, ... | tuples of 2 to 8 values | Written `(1, "a")`, read with `.0`, `.1`, unpacked with patterns. |
-| `Map[K, V]` | keys to values | Keys are `Int`, `Str`, `Bool`, or tuples, structs and enums made of them (E0113). A value, like `List`; iterates in insertion order. |
+| `Map[K, V]` | keys to values | Keys are `Int`, `Str`, `Bytes`, `Bool`, or tuples, structs and enums made of them (E0113). A value, like `List`; iterates in insertion order. |
 | `Option[T]` | `Some(T)`, `None` | From the prelude. |
 | `Result[T, E]` | `Ok(T)`, `Err(E)` | From the prelude. |
 | `IoError` | `Denied(Str)`, `Failed(Str)` | Error type of every capability operation. |
@@ -696,7 +696,7 @@ Every diagnostic has a stable code. `vela explain CODE` prints its explanation, 
 | E0110 | misplaced `self`, a method on a type that cannot have them, or a `pub` method on a built-in type |
 | E0111 | a type does not satisfy an interface |
 | E0112 | a value that cannot become `dyn` |
-| E0113 | a map key type that is not `Int`, `Str`, `Bool`, or a tuple, struct or enum of them |
+| E0113 | a map key type that is not `Int`, `Str`, `Bytes`, `Bool`, or a tuple, struct or enum of them |
 | E0114 | a struct that contains itself by value |
 | E0201 | type mismatch |
 | E0202 | misuse of `?` |
