@@ -1113,6 +1113,7 @@ let rec eval rt env e : value =
   | EUn (Neg, a) -> (
     match eval rt env a with VInt n -> VInt (Int64.neg n) | VFloat x -> VFloat (-.x) | _ -> failwith "internal: neg")
   | EUn (Not, a) -> VBool (not (as_bool (eval rt env a)))
+  | ENamed _ -> failwith "internal: the checker puts named arguments in order"
   | ECall (c, args) ->
     let fv = eval rt env c in
     let avs = List.map (eval rt env) args in

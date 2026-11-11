@@ -183,6 +183,7 @@ let rec expr env locals (e : expr) : expr =
     | EBin (op, a, b) -> EBin (op, ex a, ex b)
     | EUn (op, a) -> EUn (op, ex a)
     | ECall (c, args) -> ECall (ex c, List.map ex args)
+    | ENamed (n, sp, a) -> ENamed (n, sp, ex a)
     | EMethod ({ edesc = EVar a; espan = asp; _ }, name, nsp, args) when is_module env locals a -> (
       let args = List.map ex args in
       match Hashtbl.find_opt env.mods a with

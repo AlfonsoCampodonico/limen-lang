@@ -178,7 +178,7 @@ and parse_postfix st ns e =
   match t.tok with
   | SYM "(" when not t.nl ->
     ignore (advance st);
-    let args = comma_list st ")" parse_expr in
+    let args = comma_list st ")" parse_arg in
     parse_postfix st ns (mk (ECall (e, args)) (merge e.espan (last_span st)))
   | SYM "[" when not t.nl ->
     ignore (advance st);
@@ -196,7 +196,7 @@ and parse_postfix st ns e =
     let name, nsp = expect_ident st in
     if is_sym st "(" && not (peek st).nl then begin
       ignore (advance st);
-      let args = comma_list st ")" parse_expr in
+      let args = comma_list st ")" parse_arg in
       parse_postfix st ns (mk (EMethod (e, name, nsp, args)) (merge e.espan (last_span st)))
     end
     else parse_postfix st ns (mk (EField (e, name, nsp)) (merge e.espan nsp))
@@ -204,6 +204,17 @@ and parse_postfix st ns e =
     ignore (advance st);
     parse_postfix st ns (mk (ETry e) (merge e.espan t.span))
   | _ -> e
+
+(* A call argument: an expression, or `name: expression` naming the
+   parameter it is for. *)
+and parse_arg st =
+  match ((peek st).tok, (peek2 st).tok) with
+  | IDENT n, SYM ":" ->
+    let t = advance st in
+    ignore (advance st);
+    let v = parse_expr st in
+    mk (ENamed (n, t.span, v)) (merge t.span v.espan)
+  | _ -> parse_expr st
 
 and parse_primary st ns =
   let t = peek st in

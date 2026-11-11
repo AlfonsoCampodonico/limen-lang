@@ -141,6 +141,7 @@ let index (items : item list) : occ list =
       x r;
       (match struct_of r.ety with Some s -> add ("d:" ^ s ^ "#" ^ name) name nsp | None -> ())
     | ECall (c, args) -> x c; List.iter x args
+    | ENamed (_, _, a) -> x a
     | EMethod (r, name, nsp, args) ->
       x r;
       (match Types.repr r.ety with

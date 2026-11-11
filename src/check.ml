@@ -236,6 +236,17 @@ let method_owner : (string, bool * string) Hashtbl.t = Hashtbl.create 16
 
 (* Foreign functions can only be called directly, not used as values. *)
 let foreign_fns : (string, unit) Hashtbl.t = Hashtbl.create 8
+
+(* Parameter names, for calls with named arguments: declared functions and
+   methods (keyed like [ctx.fns], `self` included) and interface methods
+   (keyed `Interface::method`, without `self`). *)
+let param_names : (string, string list) Hashtbl.t = Hashtbl.create 64
+
+let is_named (a : expr) = match a.edesc with ENamed _ -> true | _ -> false
+
+let unlabel (a : expr) = match a.edesc with ENamed (_, _, v) -> v | _ -> a
+
+let arg_counter = ref 0
 let calling = ref false
 
 (* The methods defined on user type [n], by name. *)
@@ -459,12 +470,12 @@ and check_expr_inner ctx f e : ty =
       err ctx "E0201" a.espan (sprintf "cannot negate a value of type `%s`" (show t));
       TErr)
   | EUn (Not, a) -> expect ctx f a TBool; TBool
-  | ECall (callee, args) -> check_call ctx f callee args e.espan
+  | ECall (callee, args) -> check_call ctx f e callee args e.espan
   | EMethod (({ edesc = EVar en; _ } as recv), name, nsp, args)
     when lookup f en = None && Hashtbl.mem ctx.enums en ->
     (* `Enum.Variant(args)` is a constructor call, not a method call. *)
     let callee = { edesc = EField (recv, name, nsp); espan = Span.merge recv.espan nsp; ety = TErr; einst = [] } in
-    check_call ctx f callee args e.espan
+    check_call ctx f e callee args e.espan
   | EMethod (recv, name, nsp, args) -> check_method ctx f e recv name nsp args
   | EField (recv, name, nsp) -> check_field ctx f e recv name nsp
   | EIndex (a, i) -> (
@@ -499,6 +510,11 @@ and check_expr_inner ctx f e : ty =
   | EClosure (ps, body) -> check_closure ctx f ps body None
   | EStruct (name, nsp, fields) -> check_struct_lit ctx f name nsp fields e.espan
   | EDyn (x, i) -> ignore (check_expr ctx f x); TDyn i
+  | ENamed (n, nsp, x) ->
+    (* a label the call did not take away: the callee has no parameter names *)
+    err ctx "E0115" nsp (sprintf "`%s:` names a parameter, but this call takes its arguments by position" n)
+      ~fix:{ Diag.fmsg = "remove the label"; edits = [ { Diag.at = { nsp with hi = x.espan.lo }; replacement = "" } ] };
+    check_expr ctx f x
   | EGroup (name, until, b) ->
     let t = fresh () in
     Option.iter
@@ -635,9 +651,133 @@ and check_var ctx f e n sp =
           did_you_mean ctx ~notes "E0101" sp (sprintf "unknown name `%s`" n) n (visible_names ctx f);
           TErr)))
 
-and check_args ctx f args = List.iter (fun a -> ignore (check_expr ctx f a)) args
+and check_args ctx f args = List.iter (fun a -> ignore (check_expr ctx f (unlabel a))) args
 
-and check_call ctx f callee args sp =
+(* Named arguments, `connect(host, retries: 3)`: positional arguments first,
+   then named ones in any order, every parameter passed exactly once (there
+   are no default values). Returns
+   the arguments in parameter order without their labels, or None after
+   reporting what is wrong. [names] are the callee's parameter names, or why
+   it has none. *)
+and order_args ctx ~what ~sp names args =
+  if not (List.exists is_named args) then Some args
+  else
+    match names with
+    | Error why ->
+      (match (List.find is_named args).edesc with
+       | ENamed (l, lsp, v) ->
+         err ctx "E0115" lsp (sprintf "`%s:` names a parameter, but %s" l why)
+           ~fix:{ Diag.fmsg = "remove the label"; edits = [ { Diag.at = { lsp with hi = v.espan.lo }; replacement = "" } ] }
+       | _ -> ());
+      None
+    | Ok names ->
+      let n = List.length names in
+      let slots = Array.make n None in
+      let ok = ref true in
+      let total = List.length args in
+      let named_seen = ref false and misplaced = ref [] and extra = ref 0 and unknown = ref [] and dup = ref false in
+      List.iteri
+        (fun i (a : expr) ->
+          match a.edesc with
+          | ENamed (l, lsp, v) -> (
+            named_seen := true;
+            match List.find_index (( = ) l) names with
+            | None -> ok := false; unknown := (l, lsp) :: !unknown
+            | Some j -> (
+              match slots.(j) with
+              | Some _ ->
+                ok := false;
+                dup := true;
+                err ctx "E0115" lsp (sprintf "parameter `%s` is passed twice" l)
+                  ~notes:[ "positional arguments fill the parameters in order, before the named ones" ]
+              | None -> slots.(j) <- Some v))
+          | _ when !named_seen -> misplaced := a :: !misplaced
+          | _ -> if i < n then slots.(i) <- Some a else incr extra)
+        args;
+      if !extra > 0 then begin
+        ok := false;
+        err ctx "E0107" sp
+          (sprintf "%s takes %d argument%s but %d %s supplied" what n (plural n) total (if total = 1 then "was" else "were"))
+      end;
+      let missing = ref (List.filteri (fun j _ -> slots.(j) = None) names) in
+      let notes = [ sprintf "its parameters are: %s" (if names = [] then "none" else String.concat ", " names) ] in
+      (match (!unknown, !missing) with
+       | [ (l, lsp) ], [ m ] ->
+         (* one wrong label and one parameter left: that must be the one *)
+         missing := [];
+         err ctx ~notes "E0115" lsp (sprintf "%s has no parameter `%s`" what l)
+           ~fix:{ Diag.fmsg = sprintf "did you mean `%s`?" m; edits = [ { Diag.at = lsp; replacement = m } ] }
+       | us, _ ->
+         if us <> [] then missing := [];
+         List.iter (fun (l, lsp) -> did_you_mean ctx ~notes "E0115" lsp (sprintf "%s has no parameter `%s`" what l) l names) (List.rev us));
+      List.iter
+        (fun (a : expr) ->
+          ok := false;
+          let fix =
+            match !missing with
+            | m :: rest ->
+              missing := rest;
+              Some { Diag.fmsg = sprintf "name it: `%s: ...`" m; edits = [ { Diag.at = Span.at_start a.espan; replacement = m ^ ": " } ] }
+            | [] -> None
+          in
+          err ctx ?fix "E0115" a.espan "a positional argument cannot come after a named one"
+            ~notes:[ "write the positional arguments first, or name this one too" ])
+        (List.rev !misplaced);
+      if !misplaced = [] && !extra = 0 && not !dup then
+        List.iter
+          (fun m ->
+            ok := false;
+            err ctx "E0107" sp (sprintf "%s is missing the argument for parameter `%s`" what m)
+              ~notes:[ "every parameter must be passed; Vela has no default values" ])
+          !missing;
+      if !ok then Some (List.map Option.get (Array.to_list slots)) else None
+
+(* Arguments run in the order they are written. When labels moved one that
+   has an effect past another, the checked call [e] becomes
+   `{ let $arg1 = first; let $arg2 = second; call($arg2, $arg1) }`, the lets
+   in written order. Literals, names, closures and field reads have no
+   effect, so they stay in place. [written] is the arguments as written,
+   after the receiver if there is one. *)
+and keep_order e written r =
+  let rec pure (x : expr) =
+    match x.edesc with
+    | EInt _ | EFloat _ | EBool _ | EUnit | EVar _ | EClosure _ -> true
+    | EStr ps -> List.for_all (function SPLit _ -> true | SPExpr _ -> false) ps
+    | EField (a, _, _) | EDyn (a, _) -> pure a
+    | _ -> false
+  in
+  let effects = List.filter (fun x -> not (pure x)) written in
+  let final = match e.edesc with ECall (_, xs) -> xs | EMethod (rv, _, _, xs) -> rv :: xs | _ -> [] in
+  let in_final = List.filter (fun x -> List.memq x effects) final in
+  if List.length in_final = List.length effects && not (List.for_all2 ( == ) in_final effects) then begin
+    let temps =
+      List.map (fun (x : expr) -> incr arg_counter; (x, sprintf "$arg%d" !arg_counter)) effects
+    in
+    let var (x : expr) =
+      match List.assq_opt x temps with
+      | Some n -> { edesc = EVar n; espan = x.espan; ety = x.ety; einst = [] }
+      | None -> x
+    in
+    let desc =
+      match e.edesc with
+      | ECall (c, xs) -> ECall (c, List.map var xs)
+      | EMethod (rv, m, nsp, xs) -> EMethod (var rv, m, nsp, List.map var xs)
+      | d -> d
+    in
+    let call = { edesc = desc; espan = e.espan; ety = r; einst = e.einst } in
+    e.edesc <-
+      EBlock
+        { stmts = List.map (fun ((x : expr), n) -> { sdesc = SLet (false, n, x.espan, None, x); sspan = x.espan }) temps;
+          tail = Some call; bspan = e.espan }
+  end
+
+(* Parameter names of the method [key] (`Type::name`), without `self`. *)
+and method_params key =
+  match Hashtbl.find_opt param_names key with
+  | Some (_ :: ps) -> Ok ps
+  | _ -> Error "this method takes its arguments by position"
+
+and check_call ctx f e callee args sp =
   match callee.edesc with
   | EVar "assert" when lookup f "assert" = None && not (Hashtbl.mem ctx.fns "assert") ->
     (match args with
@@ -693,8 +833,22 @@ and check_call ctx f callee args sp =
       | EVar _ -> calling := true; Fun.protect ~finally:(fun () -> calling := false) (fun () -> check_expr ctx f callee)
       | _ -> check_expr ctx f callee
     in
+    let what, names =
+      match callee.edesc with
+      | EVar n when lookup f n = None && Hashtbl.mem param_names n -> (sprintf "function `%s`" n, Ok (Hashtbl.find param_names n))
+      | EVar n when lookup f n = None && Hashtbl.mem foreign_fns n -> ("", Error (sprintf "foreign function `%s` takes its arguments by position" n))
+      | EVar n when lookup f n <> None -> ("", Error (sprintf "`%s` is a function value, and function values have no parameter names" n))
+      | EVar n when Hashtbl.mem ctx.owners n -> ("", Error "an enum variant takes its payload by position")
+      | EField _ -> ("", Error "an enum variant takes its payload by position")
+      | _ -> ("", Error "a function value has no parameter names")
+    in
     match repr ct with
-    | TFn (ps, r) ->
+    | TFn (ps, r) -> (
+      match order_args ctx ~what ~sp names args with
+      | None -> check_args ctx f args; r
+      | Some args' ->
+      let labelled = List.exists is_named args in
+      let args, written = (args', List.map unlabel args) in
       if List.length ps <> List.length args then begin
         err ctx "E0107" sp
           (sprintf "this function takes %d argument%s but %d %s supplied" (List.length ps)
@@ -703,7 +857,11 @@ and check_call ctx f callee args sp =
         check_args ctx f args
       end
       else List.iter2 (fun a p -> expect ctx f a p) args ps;
-      r
+      if labelled then begin
+        e.edesc <- ECall (callee, args);
+        keep_order e written r
+      end;
+      r)
     | TErr -> check_args ctx f args; TErr
     | TVar _ ->
       let ps = List.map (fun _ -> fresh ()) args and r = fresh () in
@@ -846,9 +1004,17 @@ and check_method_value ctx f e recv name nsp args =
       | TParam g -> (g, Option.value ~default:[] (List.assoc_opt g !cur_bounds))
       | _ -> ("", [])
     in
-    let found = List.find_map (fun b -> Option.bind (Hashtbl.find_opt ifaces b) (List.assoc_opt name)) bs in
+    let found =
+      List.find_map (fun b -> Option.map (fun m -> (b, m)) (Option.bind (Hashtbl.find_opt ifaces b) (List.assoc_opt name))) bs
+    in
     match found with
-    | Some (ps, r) ->
+    | Some (b, (ps, r)) -> (
+      let names = Option.to_result ~none:"" (Hashtbl.find_opt param_names (b ^ "::" ^ name)) in
+      match order_args ctx ~what:(sprintf "method `%s`" name) ~sp:nsp names args with
+      | None -> check_args ctx f args; r
+      | Some args' ->
+      let labelled = List.exists is_named args in
+      let args, written = (args', recv :: List.map unlabel args) in
       if List.length ps <> List.length args then begin
         err ctx "E0107" nsp
           (sprintf "method `%s` takes %d argument%s besides `self`, but %d %s supplied" name (List.length ps)
@@ -856,7 +1022,11 @@ and check_method_value ctx f e recv name nsp args =
         check_args ctx f args
       end
       else List.iter2 (fun a p -> expect ctx f a p) args ps;
-      r
+      if labelled then begin
+        e.edesc <- EMethod (recv, name, nsp, args);
+        keep_order e written r
+      end;
+      r)
     | None ->
       let declared = List.concat_map (fun b -> List.map fst (Option.value ~default:[] (Hashtbl.find_opt ifaces b))) bs in
       let notes =
@@ -873,8 +1043,13 @@ and check_method_value ctx f e recv name nsp args =
     let env, t = instantiate (Hashtbl.find ctx.fns key) in
     add_bounds key env nsp;
     match t with
-    | TFn (p0 :: ps, r) ->
+    | TFn (p0 :: ps, r) -> (
       unify_at ctx recv.espan p0 rt;
+      match order_args ctx ~what:(sprintf "method `%s`" name) ~sp:nsp (method_params key) args with
+      | None -> check_args ctx f args; r
+      | Some args' ->
+      let labelled = List.exists is_named args in
+      let args, written = (args', recv :: List.map unlabel args) in
       if List.length ps <> List.length args then begin
         err ctx "E0107" nsp
           (sprintf "method `%s` takes %d argument%s besides `self`, but %d %s supplied" name (List.length ps)
@@ -883,7 +1058,8 @@ and check_method_value ctx f e recv name nsp args =
       end
       else List.iter2 (fun a p -> expect ctx f a p) args ps;
       e.edesc <- ECall ({ edesc = EVar key; espan = nsp; ety = t; einst = env }, recv :: args);
-      r
+      if labelled then keep_order e written r;
+      r)
     | _ -> check_args ctx f args; TErr)
   | TNamed (n, _) when Hashtbl.mem ctx.fns (n ^ "::" ^ name) && builtin_tname rt = None -> (
     (* a method: `fn name(self: T, ...)`, called with the receiver first *)
@@ -896,8 +1072,13 @@ and check_method_value ctx f e recv name nsp args =
          ~notes:[ sprintf "mark it `pub fn` in %s to use it here" file ]
      | _ -> ());
     match t with
-    | TFn (p0 :: ps, r) ->
+    | TFn (p0 :: ps, r) -> (
       unify_at ctx recv.espan p0 rt;
+      match order_args ctx ~what:(sprintf "method `%s`" name) ~sp:nsp (method_params (n ^ "::" ^ name)) args with
+      | None -> check_args ctx f args; r
+      | Some args' ->
+      let labelled = List.exists is_named args in
+      let args, written = (args', recv :: List.map unlabel args) in
       if List.length ps <> List.length args then begin
         err ctx "E0107" nsp
           (sprintf "method `%s` takes %d argument%s besides `self`, but %d %s supplied" name (List.length ps)
@@ -905,7 +1086,11 @@ and check_method_value ctx f e recv name nsp args =
         check_args ctx f args
       end
       else List.iter2 (fun a p -> expect ctx f a p) args ps;
-      r
+      if labelled then begin
+        e.edesc <- EMethod (recv, name, nsp, args);
+        keep_order e written r
+      end;
+      r)
     | _ -> check_args ctx f args; TErr)
   | _ -> (
     let ms = methods rt in
@@ -1588,6 +1773,7 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
   in
   Hashtbl.reset method_owner;
   Hashtbl.reset foreign_fns;
+  Hashtbl.reset param_names;
   Hashtbl.reset ifaces;
   Hashtbl.reset fn_bounds;
   let items = Prelude.items () @ user_items in
@@ -1618,6 +1804,7 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
               if Hashtbl.mem seen m then (err ctx "E0106" msp (sprintf "method `%s` is declared twice in `%s`" m i.if_name); None)
               else begin
                 Hashtbl.replace seen m ();
+                Hashtbl.replace param_names (i.if_name ^ "::" ^ m) (List.map (fun p -> p.prm_name) ps);
                 Some (m, (List.map (fun p -> resolve ctx [] p.prm_ty) ps, match r with Some te -> resolve ctx [] te | None -> TUnit))
               end)
             i.if_methods
@@ -1720,6 +1907,8 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
                 (TCap Foreign :: List.map (fun _ -> TErr) d.fn_params, TErr))
           in
           let s = { gen = d.fn_gen; ps; ret } in
+          if d.fn_foreign = None && not (Hashtbl.mem ctx.fns d.fn_name) then
+            Hashtbl.replace param_names d.fn_name (List.map (fun p -> p.prm_name) d.fn_params);
           check_self ctx d ps;
           List.iter
             (fun (_, bs) ->

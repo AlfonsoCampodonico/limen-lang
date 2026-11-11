@@ -52,6 +52,9 @@ and expr_desc =
       (* `group g until clock.after(ms) { ... }`: the deadline's clock and milliseconds *)
   | EDyn of expr * string (* inserted by the checker: box a value as `dyn Interface` *)
   | ESelect of sel_arm list
+  | ENamed of string * span * expr
+      (* `name: value`, a call argument naming its parameter; only between the
+         parser and the checker, which puts arguments in parameter order *)
 
 and str_part = SPLit of string | SPExpr of expr
 

@@ -93,6 +93,7 @@ let rec walk_expr (f : expr -> unit) e =
   | EBin (_, a, b) | EIndex (a, b) -> w a; w b
   | EUn (_, a) | ETry a | EField (a, _, _) -> w a
   | ECall (c, args) -> w c; List.iter w args
+  | ENamed (_, _, a) -> w a
   | EMethod (r, _, _, args) -> w r; List.iter w args
   | EIf (c, b, eo) -> w c; walk_block f b; Option.iter w eo
   | EMatch (s, arms) -> w s; List.iter (fun a -> w a.abody) arms
@@ -338,10 +339,61 @@ let member_completions path text off =
       Some (fields @ methods)
   end
 
+(* Inside the parentheses of `f(` or `x.m(`: the parameter names of [f] (or
+   of the methods named [m]) as named-argument labels, `retries: `. When the
+   file does not parse (the call is not closed yet), the call is closed
+   right after its `(` and the rest of the line dropped. *)
+let label_completions path text off items =
+  let rec back i depth =
+    if i < 0 then None
+    else
+      match text.[i] with
+      | ')' | ']' | '}' -> back (i - 1) (depth + 1)
+      | '(' when depth = 0 -> Some i
+      | '(' | '[' | '{' -> if depth = 0 then None else back (i - 1) (depth - 1)
+      | _ -> back (i - 1) depth
+  in
+  match back (min off (String.length text) - 1) 0 with
+  | None -> []
+  | Some p ->
+    let s = ref p in
+    while !s > 0 && is_ident_char text.[!s - 1] do decr s done;
+    let name = String.sub text !s (p - !s) in
+    let is_method = !s > 0 && text.[!s - 1] = '.' in
+    let ends_with n = String.ends_with ~suffix:("::" ^ name) n in
+    let items =
+      match items with
+      | Some items -> Some items
+      | None ->
+        let eol = match String.index_from_opt text p '\n' with Some i -> i | None -> String.length text in
+        fst (analyze path (String.sub text 0 p ^ "()" ^ String.sub text eol (String.length text - eol)))
+    in
+    match items with
+    | None -> []
+    | Some items ->
+    let items = mine path items in
+    if name = "" then []
+    else
+      List.concat_map
+        (fun d ->
+          if d.fn_test = None && (if is_method then ends_with d.fn_name else d.fn_name = name) then
+            List.filter_map
+              (fun p ->
+                if p.prm_name = "self" then None
+                else
+                  Some
+                    (J.Obj
+                       [ ("label", J.String (p.prm_name ^ ":")); ("kind", J.Int 5);
+                         ("detail", J.String (slice text p.prm_ty.tspan)); ("insertText", J.String (p.prm_name ^ ": ")) ]))
+              d.fn_params
+          else [])
+        (fns items)
+
 let general_completions doc off =
   let kws = List.map (fun k -> item 14 k "keyword") keywords in
+  let labels = label_completions doc.path doc.text off doc.items in
   match doc.items with
-  | None -> kws
+  | None -> labels @ kws
   | Some items ->
     let items = mine doc.path items in
     let globals =
@@ -376,7 +428,7 @@ let general_completions doc off =
           else [])
         (fns items)
     in
-    locals @ globals @ kws
+    labels @ locals @ globals @ kws
     @ [ item 3 "panic" "panic(Str)"; item 3 "assert" "assert(Bool)"; item 3 "assert_eq" "assert_eq(T, T)";
         item 3 "channel" "channel(Int) -> Chan[T]" ]
 

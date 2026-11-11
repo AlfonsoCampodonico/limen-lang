@@ -321,7 +321,22 @@ On a `Result[T, E]`, `e?` evaluates to the `Ok` value or returns `Err(e)` from t
 
 `f(a, b)` calls a function or closure. The number of arguments must match (E0107). `panic(msg: Str)` aborts the program with a message and source location; it can be used where any type is expected.
 
-Evaluation order is left to right: the callee, then the arguments in order. For assignment, the right-hand side is evaluated before the target's indexes.
+Evaluation order is left to right: the callee (or a method's receiver), then the arguments in the order they are written. For assignment, the right-hand side is evaluated before the target's indexes.
+
+**Named arguments.** An argument can name the parameter it is for, which reads better than a row of bare numbers and booleans:
+
+```
+fn connect(host: Str, port: Int, retries: Int) -> Conn { ... }
+
+connect(host, retries: 3, port: 443)
+server.describe(prefix: "to", upper: true)
+```
+
+- Positional arguments come first, then named ones in any order. A named argument is `name: expr`, with the parameter's name as declared.
+- Every parameter is passed exactly once. Labels only say which is which: Vela has no default values, so leaving one out is still E0107.
+- They work for functions and methods declared with `fn`, generic ones included, for methods called through an interface bound or a `dyn` value (the names are the interface's), and for functions of other modules. They do not work where the callee has no parameter names: closures and other function values (a type like `fn(Int) -> Int` has none), enum variants, built-in methods and functions, and foreign functions. A label there is E0115, with a fix that removes it.
+- An unknown name, a parameter passed twice, and a positional argument after a named one are E0115. When the right name is clear (one unknown label and one parameter left over, or a positional argument where one parameter is missing) the error carries a fix.
+- The arguments run in the order they are written, not in the parameter order, so `connect(retries: next(), port: other())` calls `next` first. Renaming a parameter changes the labels callers can use: it is part of the function's interface, like its types.
 
 ## 6. Statements
 
@@ -902,6 +917,7 @@ Every diagnostic has a stable code. `vela explain CODE` prints its explanation, 
 | E0112 | a value that cannot become `dyn` |
 | E0113 | a map key type that is not `Int`, `Str`, `Bytes`, `Bool`, or a tuple, struct or enum of them |
 | E0114 | a struct that contains itself by value |
+| E0115 | a named argument that names no parameter, names one twice, comes before a positional argument, or is given to a callee without parameter names |
 | E0201 | type mismatch |
 | E0202 | misuse of `?` |
 | E0203 | `if` without `else` produces a value |
@@ -987,11 +1003,12 @@ expr       = unary { BINOP unary } ;            (* precedence: section 5 *)
 expr_ns    = expr ;                             (* no struct literal at the top level *)
 unary      = ( "-" | "!" ) unary | postfix ;
 postfix    = primary { "(" [ args ] ")" | "[" expr "]" | "." IDENT [ "(" [ args ] ")" ] | "." INT | "?" } ;
-args       = expr { sep expr } [ "," ] ;
+args       = arg { sep arg } [ "," ] ;
+arg        = [ IDENT ":" ] expr ;                 (* a named argument *)
 primary    = INT | FLOAT | STRING | "true" | "false"
            | [ IDENT "." ] IDENT [ "{" [ init { sep init } [ "," ] ] "}" ]   (* struct literal *)
            | "(" ")" | "(" expr ")" | "(" expr "," expr { "," expr } ")"   (* tuple *)
-           | "[" [ args ] "]"
+           | "[" [ expr { sep expr } [ "," ] ] "]"
            | block
            | "if" expr_ns block [ "else" ( block | if ) ]
            | "match" expr_ns "{" { pattern "=>" expr ( "," | NL ) } "}"

@@ -195,12 +195,15 @@ and expr_inner c ind e =
     expr c ind ~min:16 a
   | ECall (f, args) ->
     expr c ind ~min:16 f;
-    seq c ind "(" ")" (breaks_after_open c f.espan.hi '(') ~lo:f.espan.hi ~hi:e.espan.hi (fun x -> expr c (ind + 4) x) (fun x -> x.espan) args
+    call_args c ind f.espan.hi e.espan.hi args
+  | ENamed (n, _, x) ->
+    add c (n ^ ": ");
+    expr c ind x
   | EMethod (r, name, nsp, args) ->
     expr c ind ~min:16 r;
     if has_newline c r.espan.hi nsp.lo then break_at_comments c (ind + 4) r.espan.hi nsp.lo;
     add c ("." ^ name);
-    seq c ind "(" ")" (breaks_after_open c nsp.hi '(') ~lo:nsp.hi ~hi:e.espan.hi (fun x -> expr c (ind + 4) x) (fun x -> x.espan) args
+    call_args c ind nsp.hi e.espan.hi args
   | EField (r, name, nsp) ->
     expr c ind ~min:16 r;
     if has_newline c r.espan.hi nsp.lo then break_at_comments c (ind + 4) r.espan.hi nsp.lo;
@@ -322,6 +325,10 @@ and expr_inner c ind e =
      | None -> ());
     block c ind b
   | EDyn (x, _) -> expr c ind x
+
+(* `(a, b)`; the arguments start after [lo]. *)
+and call_args c ind lo hi args =
+  seq c ind "(" ")" (breaks_after_open c lo '(') ~lo ~hi (fun x -> expr c (ind + 4) x) (fun x -> x.espan) args
 
 and head c ind e =
   if bare_struct e then (add c "("; expr c ind e; add c ")") else expr c ind e

@@ -1578,6 +1578,10 @@ fn main(root: Root) {
   ok "lsp-complete-root" (List.mem "net" c3 && List.mem "fs" c3 && List.mem "stdout" c3) (String.concat "," c3);
   let c4 = complete doc "    let n" 4 in
   ok "lsp-complete-general" (List.mem "total" c4 && List.mem "dist" c4 && List.mem "while" c4) (String.concat "," c4);
+  (* inside a call's parentheses: the parameter names, as named-argument labels *)
+  let d5 = with_line "    let q = dist(" in
+  let c5 = complete d5 "    let q = dist(" 17 in
+  ok "lsp-complete-labels" (List.mem "p:" c5) (String.concat "," c5);
   (* quick fix: make n mutable *)
   ignore (complete doc "    let n" 4);
   let l, c = at doc "n = 4" 0 in
@@ -2525,13 +2529,87 @@ fn main(root: Root) -> Result[(), IoError] {
     "use geo\n\nstruct Sq {\n    s: Int,\n}\n\nfn area(self: Sq) -> Int {\n    self.s * self.s\n}\n\nfn show[T: geo.Area](x: T) -> Int {\n    geo.twice(x) + x.area()\n}\n\nfn main(root: Root) {\n    root.stdout.print(\"{show(Sq { s: 3 })}\")\n}\n"
     "27\n";
 
+  (* ---------- named arguments ---------- *)
+  let named_prelude =
+    "struct Server { host: Str, port: Int }\n\
+     fn connect(host: Str, port: Int, retries: Int) -> Str { \"{host}:{port} x{retries}\" }\n\
+     fn describe(self: Server, prefix: Str, upper: Bool) -> Str {\n\
+    \    let s = \"{prefix} {self.host}:{self.port}\"\n\
+    \    if upper { s.to_upper() } else { s }\n\
+     }\n\
+     fn pad(self: Str, width: Int, fill: Str) -> Str {\n\
+    \    let mut s = self\n\
+    \    while s.len() < width { s = fill + s }\n\
+    \    s\n\
+     }\n\
+     fn noisy(out: Stdout, label: Str, v: Int) -> Int {\n\
+    \    out.print(label)\n\
+    \    v\n\
+     }\n\
+     fn pair[A, B](first: A, second: B) -> (A, B) { (first, second) }\n\
+     fn server(out: Stdout, host: Str) -> Server { out.print(\"server\"); Server { host, port: 1 } }\n\
+     interface Scaler { fn scale(self, by: Int, plus: Int) -> Int }\n\
+     struct Num { v: Int }\n\
+     fn scale(self: Num, by: Int, plus: Int) -> Int { self.v * by + plus }\n\
+     fn run[T: Scaler](s: T) -> Int { s.scale(plus: 1, by: 10) }\n"
+  in
+  let named body = named_prelude ^ main_wrap body in
+  out "named-args"
+    (named
+       "    out.print(connect(\"a\", 1, 2))\n\
+       \    out.print(connect(\"a\", retries: 3, port: 80))\n\
+       \    out.print(connect(port: 1, retries: 2, host: \"h\"))\n\
+       \    let s = Server { host: \"x\", port: 9 }\n\
+       \    out.print(s.describe(upper: true, prefix: \"to\"))\n\
+       \    out.print(\"7\".pad(fill: \"0\", width: 3))\n\
+       \    let p = pair(second: \"two\", first: [1])\n\
+       \    out.print(\"{p.0} {p.1}\")\n\
+       \    out.print(\"{run(Num { v: 2 })}\")\n\
+       \    let d: dyn Scaler = Num { v: 3 }\n\
+       \    out.print(\"{d.scale(plus: 5, by: 2)}\")")
+    "a:1 x2\na:80 x3\nh:1 x2\nTO X:9\n007\n[1] two\n21\n11\n";
+  (* arguments run in the order they are written, receiver first *)
+  out "named-args-order"
+    (named
+       "    out.print(connect(retries: noisy(out, \"a\", 1), port: noisy(out, \"b\", 2), host: \"z\"))\n\
+       \    out.print(server(out, \"h\").describe(upper: noisy(out, \"c\", 0) == 1, prefix: \"p{noisy(out, \"d\", 0)}\"))\n\
+       \    let xs = [\"x\"]\n\
+       \    out.print(connect(port: xs.len(), host: xs[0], retries: noisy(out, \"e\", 3)))")
+    "a\nb\nz:2 x1\nserver\nc\nd\np0 h:1\ne\nx:1 x3\n";
+  out "named-args-module"
+    ~modules:[ ("net2", "pub fn dial(host: Str, port: Int) -> Str { \"{host}:{port}\" }\n") ]
+    "use net2\nfn main(root: Root) { root.stdout.print(net2.dial(port: 8, host: \"h\")) }\n" "h:8\n";
+  errs "named-unknown" (named "    let a = connect(\"a\", 1, retry: 3)") [ "E0115" ];
+  errs "named-unknown-many" (named "    let a = connect(\"a\", prt: 1, retry: 3)") [ "E0115"; "E0115" ];
+  errs "named-positional-after" (named "    let a = connect(port: 1, \"h\", retries: 2)") [ "E0115" ];
+  errs "named-twice" (named "    let a = connect(\"a\", host: \"b\", port: 1, retries: 2)") [ "E0115" ];
+  errs "named-twice-label" (named "    let a = connect(\"a\", port: 1, port: 2)") [ "E0115" ];
+  errs "named-missing" (named "    let a = connect(\"a\", port: 1)") [ "E0107" ];
+  errs "named-too-many" (named "    let a = connect(\"a\", 1, 2, 3, retries: 3)") [ "E0107"; "E0115" ];
+  errs "named-closure-value" (named "    let f = |x: Int| x\n    let g = f(x: 1)") [ "E0115" ];
+  errs "named-variant" (named "    let h = Some(value: 1)") [ "E0115" ];
+  errs "named-builtin-method" (named "    let i = \"a,b\".split(sep: \",\")") [ "E0115" ];
+  errs "named-builtin-fn" (named "    assert(cond: true)") [ "E0115" ];
+  errs "named-method-unknown" (named "    let s = Server { host: \"x\", port: 9 }\n    out.print(s.describe(\"p\", loud: true))") [ "E0115" ];
+  errs "named-type" (named "    let a = connect(\"a\", retries: \"3\", port: 1)") [ "E0201" ];
+  List.iter
+    (fun (name, src) ->
+      let _, ds, _ = compile name src in
+      ok (name ^ "-has-fix") (List.exists (fun (d : Diag.t) -> d.fix <> None) ds) "no fix offered";
+      let fixed = apply_fixes src ds in
+      let _, ds2, _ = compile (name ^ "-fixed") fixed in
+      ok (name ^ "-applies") (ds2 = []) (sprintf "still [%s] after fix:\n%s" (String.concat " " (codes ds2)) fixed))
+    [ ("fix-named-label", named "    out.print(connect(\"a\", retry: 3, port: 80))");
+      ("fix-named-positional", named "    out.print(connect(port: 1, \"h\", retries: 2))");
+      ("fix-named-value", named "    let f = |x: Int| x\n    out.print(\"{f(x: 1)}\")") ];
+
   (* ---------- 64-bit Int, identical in both backends ---------- *)
   out "int64" "fn main(root: Root) {\n    let out = root.stdout\n    let max = 9223372036854775807\n    let min = -max - 1\n    out.print(\"{max} {min} {max + 1} {min - 1} {max * 2} {min / -1} {min % -1}\")\n    out.print(\"{min.abs()} {(-7) / 2} {(-7) % 2} {7 % -2}\")\n    out.print(\"{4611686018427387904 * 2} {3037000500 * 3037000500}\")\n    out.print(\"{1.0e19.to_int()} {(-1.0e19).to_int()} {9.0e18.to_int()} {(0.0 / 0.0).to_int()}\")\n    out.print(\"{\"9223372036854775807\".parse_int()} {\"-9223372036854775808\".parse_int()} {\"9223372036854775808\".parse_int()}\")\n    out.print(\"{max.to_float()} {[1, 2, 3].get(max)} {\"abc\".slice(-max, max)} {[max, max].sum()}\")\n    match max {\n        9223372036854775807 => out.print(\"matched max\"),\n        _ => out.print(\"no\"),\n    }\n}\n"
     "9223372036854775807 -9223372036854775808 -9223372036854775808 9223372036854775807 -2 -9223372036854775808 0\n-9223372036854775808 -3 -1 1\n-9223372036854775808 -9223372036709301616\n9223372036854775807 -9223372036854775808 9000000000000000000 0\nSome(9223372036854775807) Some(-9223372036854775808) None\n9.22337203685478e+18 None abc -2\nmatched max\n";
   errs "int-literal-too-large" (main_wrap "    let x = 9223372036854775808") [ "E0005" ];
 
   (* ---------- select ---------- *)
-  exits "example-tour" (example "tour.vela") "-- language\ncircle 12.57\n[2.25, 12.56636]\n[0, 1, 4, 9, 16] [\"h\", \"o\", \"l\", \"a\"]\nbound method 3.142\nVELA!\n{Point { x: 0, y: 0 }: [\"origin\", \"home\"]} {(1, 2): 2}\n[(1, \"a\"), (1, \"z\"), (2, \"b\")]\n3 bytes: hi!\n-- concurrency\na side task ran\nresults [1, 2]\nwith a deadline [Some(1), None]\nnobody sent anything\n" 3;
+  exits "example-tour" (example "tour.vela") "-- language\ncircle 12.57\n[2.25, 12.56636]\n[0, 1, 4, 9, 16] [\"h\", \"o\", \"l\", \"a\"]\nbound method 3.142\nVELA!\n{Point { x: 0, y: 0 }: [\"origin\", \"home\"]} {(1, 2): 2}\n[(1, \"a\"), (1, \"z\"), (2, \"b\")]\n3 bytes: hi!\n..tour\n-- concurrency\na side task ran\nresults [1, 2]\nwith a deadline [Some(1), None]\nnobody sent anything\n" 3;
   out "select" (example "select.vela") "nums done; words done; total 15 letters 3\nnothing ready | sent to c | sent to d | d Some(10)\nafter close: Some(7)\nErr(\"every arm of this `select` is turned off by its guard\")\n";
   out "select-stress" "fn produce(c: Chan[Int], n: Int) -> Int {\n    let mut i = 0\n    while i < n {\n        c.send(i)\n        i = i + 1\n    }\n    c.close()\n    0\n}\n\n// receive from all four until every one is closed\nfn consume(a: Chan[Int], b: Chan[Int], c: Chan[Int], d: Chan[Int]) -> Int {\n    let mut sum = 0\n    let mut on = [true, true, true, true]\n    while on[0] || on[1] || on[2] || on[3] {\n        select {\n            v = a.recv() if on[0] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[0] = false\n                },\n            },\n            v = b.recv() if on[1] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[1] = false\n                },\n            },\n            v = c.recv() if on[2] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[2] = false\n                },\n            },\n            v = d.recv() if on[3] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[3] = false\n                },\n            },\n        }\n    }\n    sum\n}\n\nfn drain(c: Chan[Str]) -> Int {\n    let mut n = 0\n    let mut more = true\n    while more {\n        match c.recv() {\n            Some(s) => {\n                n = n + s.len()\n            },\n            None => {\n                more = false\n            },\n        }\n    }\n    n\n}\n\nfn main(root: Root) {\n    let a: Chan[Int] = channel(1)\n    let b: Chan[Int] = channel(1)\n    let c: Chan[Int] = channel(2)\n    let d: Chan[Int] = channel(1)\n    let sums = group g {\n        g.go(|| produce(a, 500))\n        g.go(|| produce(b, 500))\n        g.go(|| produce(c, 500))\n        g.go(|| produce(d, 500))\n        g.go(|| consume(a, b, c, d))\n        g.go(|| consume(a, b, c, d))\n        g.go(|| consume(a, b, c, d))\n    }\n    root.stdout.print(\"{sums.sum()}\")\n    // select between two sends: a dispatcher feeding two workers\n    let w1: Chan[Str] = channel(1)\n    let w2: Chan[Str] = channel(1)\n    let parts = group g {\n        g.go(|| {\n                let mut i = 0\n                while i < 1000 {\n                    let msg = \"m{i}\"\n                    select {\n                        w1.send(msg) => (),\n                        w2.send(msg) => (),\n                    }\n                    i = i + 1\n                }\n                w1.close()\n                w2.close()\n                0\n            })\n        g.go(|| drain(w1))\n        g.go(|| drain(w2))\n    }\n    root.stdout.print(\"{parts.sum()}\")\n}\n" "499000\n3890\n";
   check_tsan "select-stress-tsan" "fn produce(c: Chan[Int], n: Int) -> Int {\n    let mut i = 0\n    while i < n {\n        c.send(i)\n        i = i + 1\n    }\n    c.close()\n    0\n}\n\n// receive from all four until every one is closed\nfn consume(a: Chan[Int], b: Chan[Int], c: Chan[Int], d: Chan[Int]) -> Int {\n    let mut sum = 0\n    let mut on = [true, true, true, true]\n    while on[0] || on[1] || on[2] || on[3] {\n        select {\n            v = a.recv() if on[0] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[0] = false\n                },\n            },\n            v = b.recv() if on[1] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[1] = false\n                },\n            },\n            v = c.recv() if on[2] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[2] = false\n                },\n            },\n            v = d.recv() if on[3] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[3] = false\n                },\n            },\n        }\n    }\n    sum\n}\n\nfn drain(c: Chan[Str]) -> Int {\n    let mut n = 0\n    let mut more = true\n    while more {\n        match c.recv() {\n            Some(s) => {\n                n = n + s.len()\n            },\n            None => {\n                more = false\n            },\n        }\n    }\n    n\n}\n\nfn main(root: Root) {\n    let a: Chan[Int] = channel(1)\n    let b: Chan[Int] = channel(1)\n    let c: Chan[Int] = channel(2)\n    let d: Chan[Int] = channel(1)\n    let sums = group g {\n        g.go(|| produce(a, 500))\n        g.go(|| produce(b, 500))\n        g.go(|| produce(c, 500))\n        g.go(|| produce(d, 500))\n        g.go(|| consume(a, b, c, d))\n        g.go(|| consume(a, b, c, d))\n        g.go(|| consume(a, b, c, d))\n    }\n    root.stdout.print(\"{sums.sum()}\")\n    // select between two sends: a dispatcher feeding two workers\n    let w1: Chan[Str] = channel(1)\n    let w2: Chan[Str] = channel(1)\n    let parts = group g {\n        g.go(|| {\n                let mut i = 0\n                while i < 1000 {\n                    let msg = \"m{i}\"\n                    select {\n                        w1.send(msg) => (),\n                        w2.send(msg) => (),\n                    }\n                    i = i + 1\n                }\n                w1.close()\n                w2.close()\n                0\n            })\n        g.go(|| drain(w1))\n        g.go(|| drain(w2))\n    }\n    root.stdout.print(\"{parts.sum()}\")\n}\n" "499000\n3890\n";

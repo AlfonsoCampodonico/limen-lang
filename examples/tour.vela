@@ -37,6 +37,14 @@ fn pick(big: Bool) -> dyn Shape {
     if big { Circle { r: 2.0 } } else { Square { side: 1.5 } }
 }
 
+fn label(text: Str, width: Int, fill: Str) -> Str {
+    let mut s = text
+    while s.len() < width {
+        s = fill + s
+    }
+    s
+}
+
 fn slow(clock: Clock, ms: Int, v: Int) -> Int {
     clock.sleep(ms)
     v
@@ -76,6 +84,8 @@ fn main(root: Root) -> Int {
     // binary data
     let b = "hi".to_bytes() + bytes([33])
     out.print("{b.len()} bytes: {b.to_str()}")
+    // named arguments: any order after the positional ones, all required
+    out.print(label("tour", fill: ".", width: 6))
 
     out.print("-- concurrency")
     // tasks returning () run for their effect and add nothing to the list
