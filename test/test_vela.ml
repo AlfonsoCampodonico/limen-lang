@@ -1382,6 +1382,18 @@ fn main(root: Root) {
   errs "bytes-from-str" "fn main() {\n    let b = bytes(\"x\")\n}\n" [ "E0201" ];
   errs "bytes-not-str" "fn main() {\n    let b: Str = bytes([1])\n}\n" [ "E0201" ];
 
+  (* ---------- recursive structs: through an enum or a list, never inline ---------- *)
+  errs "struct-contains-itself" "struct Pair {\n    a: Int,\n    rest: Wrap,\n}\n\nstruct Wrap {\n    p: Pair,\n}\n\nfn main() {}\n" [ "E0114"; "E0114" ];
+  errs "struct-contains-itself-generic" "struct Holder[A] {\n    x: A,\n}\n\nstruct T {\n    h: Holder[(Int, T)],\n}\n\nfn main() {}\n" [ "E0114" ];
+  errs "struct-contains-itself-array" "struct G {\n    cells: Array[G, 2],\n}\n\nfn main() {}\n" [ "E0114" ];
+  out "struct-recursive-indirect"
+    ("struct Node {\n    v: Int,\n    next: Option[Node],\n}\n\nstruct Tree {\n    v: Int,\n    kids: List[Tree],\n}\n\n"
+     ^ "fn sum(t: Tree) -> Int {\n    t.kids.fold(t.v, |a, k| a + sum(k))\n}\n\n"
+     ^ "fn main(root: Root) {\n    let n = Node { v: 1, next: Some(Node { v: 2, next: None }) }\n"
+     ^ "    let t = Tree { v: 1, kids: [Tree { v: 2, kids: [] }, Tree { v: 3, kids: [Tree { v: 4, kids: [] }] }] }\n"
+     ^ "    root.stdout.print(\"{n} {sum(t)}\")\n}\n")
+    "Node { v: 1, next: Some(Node { v: 2, next: None }) } 10\n";
+
   (* ---------- modules ---------- *)
   let geom =
     "// geometry\npub struct Point {\n    x: Int,\n    y: Int,\n}\n\npub enum Shape {\n    Dot(Point),\n    Box(Point, Point),\n}\n\n"

@@ -135,6 +135,7 @@ fn swap[A, B](p: Pair[A, B]) -> Pair[B, A] {
 - Generic parameters go in `[...]` after the name. They are instantiated at each use and are never written at call sites: `swap(p)`.
 - Struct fields and enum payloads cannot hold a capability (E0301), a channel (E0305) or a function type (E0304). That keeps authority visible in signatures. A generic instantiation like `Pair[Net, Int]` is allowed, because the capability is visible in the type.
 - Defining the same type, function, field or variant twice is error E0106.
+- Types can be recursive through an enum, a `List` or a `Map`, which hold their contents indirectly: `struct Node { value: Int, next: Option[Node] }`, `enum Tree { Leaf, Node(Tree, Tree) }`, `struct Dir { files: List[Dir] }`. A struct stores its fields inline, so one that contains itself through structs, tuples or arrays alone would be infinitely large (E0114). There is no `box`: those types are the indirection.
 
 ### Methods
 
@@ -696,6 +697,7 @@ Every diagnostic has a stable code. `vela explain CODE` prints its explanation, 
 | E0111 | a type does not satisfy an interface |
 | E0112 | a value that cannot become `dyn` |
 | E0113 | a map key type that is not `Int`, `Str`, `Bool`, or a tuple, struct or enum of them |
+| E0114 | a struct that contains itself by value |
 | E0201 | type mismatch |
 | E0202 | misuse of `?` |
 | E0203 | `if` without `else` produces a value |

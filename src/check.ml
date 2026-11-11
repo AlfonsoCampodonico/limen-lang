@@ -1615,6 +1615,34 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
         end
       | IFn _ | IIface _ -> ())
     items;
+  (* 2b. a struct cannot hold itself by value (it would be infinitely large);
+     enums, lists and maps hold their contents indirectly, so recursion goes
+     through them: `next: Option[Node]` *)
+  List.iter
+    (function
+      | IStruct s when registered ctx.structs s.st_name s ->
+        let seen = Hashtbl.create 8 in
+        let rec reaches path t =
+          match repr t with
+          | TArray (a, _) -> reaches path a
+          | TNamed (n, args) when Hashtbl.mem ctx.sfields n ->
+            if n = s.st_name && path <> [] then Some path
+            else if Hashtbl.mem seen (show t) then None
+            else begin
+              Hashtbl.replace seen (show t) ();
+              let env = List.combine (Hashtbl.find ctx.structs n).st_gen args in
+              List.find_map (fun (fname, ft) -> reaches (path @ [ fname ]) (subst env ft)) (Hashtbl.find ctx.sfields n)
+            end
+          | _ -> None
+        in
+        (match reaches [] (TNamed (s.st_name, List.map (fun g -> TParam g) s.st_gen)) with
+         | Some path ->
+           err ctx "E0114" s.st_span
+             (sprintf "struct `%s` contains itself through `%s`, so it would be infinitely large" s.st_name (String.concat "." path))
+             ~notes:[ sprintf "hold the inner value in an `Option`, an enum or a `List`, as in `next: Option[%s]`; those store it indirectly" s.st_name ]
+         | None -> ())
+      | _ -> ())
+    items;
   (* 3. function signatures *)
   let sigs =
     List.filter_map
