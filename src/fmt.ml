@@ -147,7 +147,7 @@ let rec bare_struct e =
   match e.edesc with
   | EStruct (n, _, _) -> not (is_tuple_name n)
   | EBin (_, a, b) | EPipe (a, b) -> bare_struct a || bare_struct b
-  | EUn (_, a) | ETry a | EField (a, _, _) | EIndex (a, _) -> bare_struct a
+  | EUn (_, a) | ETry a | EField (a, _, _) | EIndex (a, _) | ESafe (a, _, _, _) -> bare_struct a
   | EMethod (r, _, _, _) -> bare_struct r
   | ECall (f, _) -> bare_struct f
   | _ -> false
@@ -163,6 +163,7 @@ let rec simple_expr e =
   | EList es -> List.for_all simple_expr es
   | EStruct (_, _, fs) -> List.for_all (fun (_, _, x) -> simple_expr x) fs
   | EWith (b, fs) -> simple_expr b && List.for_all (fun (_, _, x) -> simple_expr x) fs
+  | ESafe (b, _, rest, _) -> simple_expr b && simple_expr rest
   | _ -> true
 
 let rec expr c ind ?(min = 0) e =
@@ -208,14 +209,12 @@ and expr_inner c ind e =
     expr c ind ~min:16 f;
     seq c ind "(" ")" (breaks_after_open c f.espan.hi '(') ~lo:f.espan.hi ~hi:e.espan.hi (fun x -> expr c (ind + 4) x) (fun x -> x.espan) args
   | EMethod (r, name, nsp, args) ->
-    expr c ind ~min:16 r;
-    if has_newline c r.espan.hi nsp.lo then break_at_comments c (ind + 4) r.espan.hi nsp.lo;
-    add c ("." ^ name);
+    receiver c ind r nsp;
+    add c name;
     seq c ind "(" ")" (breaks_after_open c nsp.hi '(') ~lo:nsp.hi ~hi:e.espan.hi (fun x -> expr c (ind + 4) x) (fun x -> x.espan) args
   | EField (r, name, nsp) ->
-    expr c ind ~min:16 r;
-    if has_newline c r.espan.hi nsp.lo then break_at_comments c (ind + 4) r.espan.hi nsp.lo;
-    add c ("." ^ name)
+    receiver c ind r nsp;
+    add c name
   | EIndex (a, i) ->
     expr c ind ~min:16 a;
     add c "[";
@@ -253,6 +252,24 @@ and expr_inner c ind e =
       List.iteri (fun i fl -> if i > 0 then add c ", "; field fl) fields;
       add c " }"
     end
+  | ESafe (base, x, rest, _) ->
+    (* `rest` starts from the value inside the Option: print it with that
+       value written as `base?`, so `.b` after it reads `base?.b` *)
+    let rec fill (e : expr) =
+      let d =
+        match e.edesc with
+        | EVar n when n = x -> ETry base
+        | EField (r, n, sp) -> EField (fill r, n, sp)
+        | EMethod (r, n, sp, args) -> EMethod (fill r, n, sp, args)
+        | ECall (g, args) -> ECall (fill g, args)
+        | EIndex (a, i) -> EIndex (fill a, i)
+        | ESafe (b, y, r, fl) -> ESafe (fill b, y, r, fl)
+        | d -> d
+      in
+      (* the filled-in `base?` keeps the span of the `?.`; [receiver] knows it by that *)
+      { e with edesc = d }
+    in
+    expr_inner c ind (fill rest)
   | EWith (base, fields) ->
     (* like a struct literal: one line, or one field per line if written so *)
     let field (f, fsp, v) =
@@ -363,6 +380,21 @@ and expr_inner c ind e =
      | None -> ());
     block c ind b
   | EDyn (x, _) -> expr c ind x
+
+(* The receiver of `.name`, then the dot: on the next line if the author
+   broke the chain there. A `base?` whose span starts after its operand is
+   the start of a safe-navigation chain (see ESafe), printed `base?.`. *)
+and receiver c ind r nsp =
+  match r.edesc with
+  | ETry b when r.espan.lo >= b.espan.hi ->
+    expr c ind ~min:16 b;
+    if has_newline c b.espan.hi nsp.lo then break_at_comments c (ind + 4) b.espan.hi r.espan.lo;
+    add c "?."
+  | _ ->
+    (* `(e?).name`: without the parentheses it would read as `e?.name` *)
+    (match r.edesc with ETry _ -> add c "("; expr c ind r; add c ")" | _ -> expr c ind ~min:16 r);
+    if has_newline c r.espan.hi nsp.lo then break_at_comments c (ind + 4) r.espan.hi nsp.lo;
+    add c "."
 
 and head c ind e =
   if bare_struct e then (add c "("; expr c ind e; add c ")") else expr c ind e

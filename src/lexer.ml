@@ -90,7 +90,7 @@ let lex ?(base = 0) file (src : string) : token array =
     else if is_digit c then begin
       let lo = !i in
       (* `t.0.1` is two tuple fields, not the float 0.1 *)
-      let after_dot = match !toks with { tok = SYM "."; span; _ } :: _ -> span.hi = base + lo | _ -> false in
+      let after_dot = match !toks with { tok = SYM ("." | "?."); span; _ } :: _ -> span.hi = base + lo | _ -> false in
       while !i < n && (is_digit src.[!i] || src.[!i] = '_') do incr i done;
       let is_float = (not after_dot) && !i + 1 < n && src.[!i] = '.' && is_digit src.[!i + 1] in
       if is_float then begin
@@ -185,6 +185,8 @@ let lex ?(base = 0) file (src : string) : token array =
       let lo = !i in
       let two = if !i + 1 < n then String.sub src !i 2 else "" in
       if !i + 2 < n && String.sub src !i 3 = "..<" then (i := !i + 3; push (SYM "..<") lo !i)
+        (* `?.` is safe navigation, unless it is `?` before a range: `x?..<n` *)
+      else if two = "?." && not (!i + 2 < n && src.[!i + 2] = '.') then (i := !i + 2; push (SYM "?.") lo !i)
       else if List.mem two syms2 then (i := !i + 2; push (SYM two) lo !i)
       else if String.contains syms1 c then (incr i; push (SYM (String.make 1 c)) lo !i)
       else fail "E0001" lo (lo + 1) (Printf.sprintf "unexpected character `%c`" c)

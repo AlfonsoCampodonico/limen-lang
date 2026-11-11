@@ -1250,6 +1250,14 @@ let rec eval rt env e : value =
     VStruct (name, List.map (fun (f, _, _) -> (f, List.assoc f vals)) decl.st_fields)
   | EDyn (x, _) -> eval rt env x (* values carry their type, so methods dispatch on it *)
   | EPipe _ -> failwith "pipes are expanded when modules load"
+  | ESafe (base, x, rest, flat) -> (
+    match eval rt env base with
+    | VEnum (_, "Some", [ v ]) ->
+      let b = Hashtbl.create 1 in
+      Hashtbl.replace b x (ref v);
+      let r = eval rt (b :: env) rest in
+      if flat then r else some r
+    | _ -> none)
   | EWith (base, fields) -> (
     (* the base first, then the new values; a plain variable is read last,
        as the native backend does to reuse it in place *)

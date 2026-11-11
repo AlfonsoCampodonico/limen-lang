@@ -1576,6 +1576,10 @@ fn main(root: Root) {
   let d3 = with_line "    root." in
   let c3 = complete d3 "    root." 9 in
   ok "lsp-complete-root" (List.mem "net" c3 && List.mem "fs" c3 && List.mem "stdout" c3) (String.concat "," c3);
+  (* after `?.`, the members of the value inside the Option *)
+  let d5 = with_line "    let op = Some(pt)\n    op?." in
+  let c5 = complete d5 "    op?." 8 in
+  ok "lsp-complete-safe" (List.mem "x" c5 && List.mem "y" c5 && not (List.mem "is_some" c5)) (String.concat "," c5);
   let c4 = complete doc "    let n" 4 in
   ok "lsp-complete-general" (List.mem "total" c4 && List.mem "dist" c4 && List.mem "while" c4) (String.concat "," c4);
   (* quick fix: make n mutable *)
@@ -2531,7 +2535,7 @@ fn main(root: Root) -> Result[(), IoError] {
   errs "int-literal-too-large" (main_wrap "    let x = 9223372036854775808") [ "E0005" ];
 
   (* ---------- select ---------- *)
-  exits "example-tour" (example "tour.vela") "-- language\ncircle 12.57\n[2.25, 12.56636]\n[0, 1, 4, 9, 16] [\"h\", \"o\", \"l\", \"a\"]\nbound method 3.142\nVELA!\n{Point { x: 0, y: 0 }: [\"origin\", \"home\"]} {(1, 2): 2}\n[(1, \"a\"), (1, \"z\"), (2, \"b\")]\n3 bytes: hi!\n-- syntax\npipe 12\nPoint { x: 0, y: 0 } Point { x: 0, y: 5 }\nbig\nsmall\nnothing\n-- concurrency\na side task ran\nresults [1, 2]\nwith a deadline [Some(1), None]\nnobody sent anything\n" 3;
+  exits "example-tour" (example "tour.vela") "-- language\ncircle 12.57\n[2.25, 12.56636]\n[0, 1, 4, 9, 16] [\"h\", \"o\", \"l\", \"a\"]\nbound method 3.142\nVELA!\n{Point { x: 0, y: 0 }: [\"origin\", \"home\"]} {(1, 2): 2}\n[(1, \"a\"), (1, \"z\"), (2, \"b\")]\n3 bytes: hi!\n-- syntax\npipe 12\nPoint { x: 0, y: 0 } Point { x: 0, y: 5 }\nbig\nsmall\nnothing\nSome(3) -1\n-- concurrency\na side task ran\nresults [1, 2]\nwith a deadline [Some(1), None]\nnobody sent anything\n" 3;
   out "select" (example "select.vela") "nums done; words done; total 15 letters 3\nnothing ready | sent to c | sent to d | d Some(10)\nafter close: Some(7)\nErr(\"every arm of this `select` is turned off by its guard\")\n";
   out "select-stress" "fn produce(c: Chan[Int], n: Int) -> Int {\n    let mut i = 0\n    while i < n {\n        c.send(i)\n        i = i + 1\n    }\n    c.close()\n    0\n}\n\n// receive from all four until every one is closed\nfn consume(a: Chan[Int], b: Chan[Int], c: Chan[Int], d: Chan[Int]) -> Int {\n    let mut sum = 0\n    let mut on = [true, true, true, true]\n    while on[0] || on[1] || on[2] || on[3] {\n        select {\n            v = a.recv() if on[0] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[0] = false\n                },\n            },\n            v = b.recv() if on[1] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[1] = false\n                },\n            },\n            v = c.recv() if on[2] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[2] = false\n                },\n            },\n            v = d.recv() if on[3] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[3] = false\n                },\n            },\n        }\n    }\n    sum\n}\n\nfn drain(c: Chan[Str]) -> Int {\n    let mut n = 0\n    let mut more = true\n    while more {\n        match c.recv() {\n            Some(s) => {\n                n = n + s.len()\n            },\n            None => {\n                more = false\n            },\n        }\n    }\n    n\n}\n\nfn main(root: Root) {\n    let a: Chan[Int] = channel(1)\n    let b: Chan[Int] = channel(1)\n    let c: Chan[Int] = channel(2)\n    let d: Chan[Int] = channel(1)\n    let sums = group g {\n        g.go(|| produce(a, 500))\n        g.go(|| produce(b, 500))\n        g.go(|| produce(c, 500))\n        g.go(|| produce(d, 500))\n        g.go(|| consume(a, b, c, d))\n        g.go(|| consume(a, b, c, d))\n        g.go(|| consume(a, b, c, d))\n    }\n    root.stdout.print(\"{sums.sum()}\")\n    // select between two sends: a dispatcher feeding two workers\n    let w1: Chan[Str] = channel(1)\n    let w2: Chan[Str] = channel(1)\n    let parts = group g {\n        g.go(|| {\n                let mut i = 0\n                while i < 1000 {\n                    let msg = \"m{i}\"\n                    select {\n                        w1.send(msg) => (),\n                        w2.send(msg) => (),\n                    }\n                    i = i + 1\n                }\n                w1.close()\n                w2.close()\n                0\n            })\n        g.go(|| drain(w1))\n        g.go(|| drain(w2))\n    }\n    root.stdout.print(\"{parts.sum()}\")\n}\n" "499000\n3890\n";
   check_tsan "select-stress-tsan" "fn produce(c: Chan[Int], n: Int) -> Int {\n    let mut i = 0\n    while i < n {\n        c.send(i)\n        i = i + 1\n    }\n    c.close()\n    0\n}\n\n// receive from all four until every one is closed\nfn consume(a: Chan[Int], b: Chan[Int], c: Chan[Int], d: Chan[Int]) -> Int {\n    let mut sum = 0\n    let mut on = [true, true, true, true]\n    while on[0] || on[1] || on[2] || on[3] {\n        select {\n            v = a.recv() if on[0] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[0] = false\n                },\n            },\n            v = b.recv() if on[1] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[1] = false\n                },\n            },\n            v = c.recv() if on[2] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[2] = false\n                },\n            },\n            v = d.recv() if on[3] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[3] = false\n                },\n            },\n        }\n    }\n    sum\n}\n\nfn drain(c: Chan[Str]) -> Int {\n    let mut n = 0\n    let mut more = true\n    while more {\n        match c.recv() {\n            Some(s) => {\n                n = n + s.len()\n            },\n            None => {\n                more = false\n            },\n        }\n    }\n    n\n}\n\nfn main(root: Root) {\n    let a: Chan[Int] = channel(1)\n    let b: Chan[Int] = channel(1)\n    let c: Chan[Int] = channel(2)\n    let d: Chan[Int] = channel(1)\n    let sums = group g {\n        g.go(|| produce(a, 500))\n        g.go(|| produce(b, 500))\n        g.go(|| produce(c, 500))\n        g.go(|| produce(d, 500))\n        g.go(|| consume(a, b, c, d))\n        g.go(|| consume(a, b, c, d))\n        g.go(|| consume(a, b, c, d))\n    }\n    root.stdout.print(\"{sums.sum()}\")\n    // select between two sends: a dispatcher feeding two workers\n    let w1: Chan[Str] = channel(1)\n    let w2: Chan[Str] = channel(1)\n    let parts = group g {\n        g.go(|| {\n                let mut i = 0\n                while i < 1000 {\n                    let msg = \"m{i}\"\n                    select {\n                        w1.send(msg) => (),\n                        w2.send(msg) => (),\n                    }\n                    i = i + 1\n                }\n                w1.close()\n                w2.close()\n                0\n            })\n        g.go(|| drain(w1))\n        g.go(|| drain(w2))\n    }\n    root.stdout.print(\"{parts.sum()}\")\n}\n" "499000\n3890\n";
@@ -3612,6 +3616,81 @@ fn main(root: Root) {
   errs "match-guard-unbound" "fn f(o: Option[Int]) -> Int {\n    match o {\n        Some(n) if m > 0 => n,\n        _ => 0,\n    }\n}\n" [ "E0101" ];
   (let _, ds, _ = compile "match-guard-fix" "fn f(o: Option[Int]) -> Int {\n    match o {\n        Some(n) if n > 0 => n,\n        None => 0,\n    }\n}\n" in
    ok "match-guard-fix" (List.exists (fun (d : Diag.t) -> d.message = "`match` does not cover `Some(_)`") ds) (String.concat "; " (List.map (fun (d : Diag.t) -> d.message) ds)));
+
+  (* ---------- safe navigation: `a?.b` on an Option ---------- *)
+  out "safe-nav" {|struct Address {
+    city: Str,
+    zip: Option[Str],
+    lines: List[Str],
+}
+
+struct User {
+    name: Str,
+    address: Option[Address],
+}
+
+fn find(id: Int) -> Option[User] {
+    if id == 1 {
+        Some(User { name: "ann", address: Some(Address { city: "Rome", zip: None, lines: ["Via Roma 1"] }) })
+    } else if id == 2 {
+        Some(User { name: "bob", address: None })
+    } else {
+        None
+    }
+}
+
+fn shout(self: Str) -> Str { self.to_upper() }
+
+// `?` after a chain applies to the whole chain: None returns early
+fn city_len(id: Int) -> Option[Int] {
+    let n = find(id)?.address?.city.len()?
+    Some(n * 10)
+}
+
+fn parse(s: Str) -> Result[User, Str] {
+    if s == "" { Err("empty") } else { Ok(User { name: s, address: None }) }
+}
+
+// `(e?).name` is try-then-field; `e?.name` would be safe navigation
+fn name_of(s: Str) -> Result[Str, Str] {
+    Ok((parse(s)?).name)
+}
+
+fn upto(o: Option[Int]) -> Option[List[Int]] {
+    Some(0..<o?)
+}
+
+fn upto2(o: Option[Int]) -> Option[List[Int]] {
+    Some(o?..<3)
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    for id in [1, 2, 3] {
+        let u = find(id)
+        out.print("{u?.name ?? "nobody"} {u?.address?.city ?? "unknown"} {u?.name.shout().len()} {u?.address?.zip ?? "-"} {u?.address?.lines.get(0)}")
+        out.print("{city_len(id)}")
+    }
+    let t: Option[(Int, Str)] = Some((1, "x"))
+    out.print("{t?.1} {t?.0 ?? 0}")
+    let xs: Option[List[Int]] = Some([1, 2, 3])
+    let none: Option[List[Int]] = None
+    // an Option result is not wrapped again
+    out.print("{xs?.map(|x| x * 2)} {xs?.get(1)} {xs?.len()} {none?.get(0)}")
+    let deep = find(1)
+        ?.address
+        ?.city
+    out.print("{deep}")
+    let get_city = |id: Int| find(id)?.address?.city ?? "?"
+    out.print("{get_city(1)} {get_city(2)}")
+    out.print("{name_of("zed")} {name_of("")} {upto(Some(3))} {upto2(Some(1))} {upto(None)}")
+}
+|} "ann Rome Some(3) - Some(\"Via Roma 1\")\nSome(40)\nbob unknown Some(3) - None\nNone\nnobody unknown None - None\nNone\nSome(\"x\") 1\nSome([2, 4, 6]) Some(2) Some(3) None\nSome(\"Rome\")\nRome ?\nOk(\"zed\") Err(\"empty\") Some([0, 1, 2]) Some([1, 2]) None\n";
+  errs "safe-nav-not-option" (main_wrap "    let n = 5\n    let x = n?.abs()") [ "E0201" ];
+  errs "safe-nav-result" "fn parse(s: Str) -> Result[Int, Str] {\n    Ok(1)\n}\n\nfn f() -> Result[Int, Str] {\n    let n = parse(\"x\")?.abs()\n    Ok(1)\n}\n" [ "E0201" ];
+  errs "safe-nav-unknown-field" "struct P {\n    x: Int,\n}\n\nfn main(root: Root) {\n    let p = Some(P { x: 1 })\n    let y = p?.y\n}\n" [ "E0103" ];
+  errs "safe-nav-assign" "struct P {\n    x: Int,\n}\n\nfn main(root: Root) {\n    let mut p = Some(P { x: 1 })\n    p?.x = 2\n}\n" [ "E0209"; "E0201" ];
+  errs "safe-nav-type" "struct P {\n    x: Int,\n}\n\nfn main(root: Root) {\n    let p = Some(P { x: 1 })\n    let y: Int = p?.x\n}\n" [ "E0201" ];
 
   (* ---------- tuples and maps ---------- *)
   out "tuples" (example "tuples.vela") "3 2 (2, 1)\n(1, \"one\", 1.5) 1 one 1.5 (2, \"a\")\n4 ((1, 2), (3, (4, 5)))\n1 3 4 5\na1 b2 c3 \nyes zero yes no 7\ntrue false 6\n";

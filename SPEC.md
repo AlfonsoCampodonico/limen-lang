@@ -34,13 +34,13 @@ fn parse_names(body: Str) -> List[Str] {   // no capabilities: cannot do I/O
 - **Floats:** digits with a fraction (`1.5`), an exponent (`1e9`, `2.5E-3`), or both. `_` is allowed. There is no leading-dot form (`.5`).
 - **Strings:** `"..."`, may span lines. Escapes: `\n \t \r \\ \" \{ \} \0`. Any other escape is error E0006.
 - **Interpolation:** `{expr}` inside a string evaluates any expression, including ones with their own strings: `"{xs.join(", ")}"`. An empty `{}` is error E0007; write `\{` for a literal brace.
-- **Symbols:** `( ) { } [ ] , : ; . | + - * / % ! ? = < > -> => == != <= >= && || ..< |>`.
+- **Symbols:** `( ) { } [ ] , : ; . | + - * / % ! ? = < > -> => == != <= >= && || ..< |> ?.`. `?.` is one symbol (safe navigation), so `e?.name` is never `?` followed by `.name`; write `(e?).name` for that.
 
 ### Newlines
 
 Statements are separated by a newline or `;`. Two statements on one line without `;` is error E0004. An expression continues onto the next line only in these cases:
 
-- A line starting with `.` continues a method chain:
+- A line starting with `.` (or `?.`) continues a method chain:
   ```
   let n = xs
       .map(|x| x * 2)
@@ -286,7 +286,7 @@ From loosest to tightest. All binary operators are left-associative.
 | 8 | `*` `/` `%` |
 | 9 | `??` |
 | 10 | unary `-` `!` |
-| 11 | call `f(x)`, index `a[i]`, field `p.x`, method `s.len()`, `?` |
+| 11 | call `f(x)`, index `a[i]`, field `p.x`, method `s.len()`, safe navigation `a?.b`, `?` |
 
 ### Operators
 
@@ -324,6 +324,19 @@ Both operands must have the same type. The **ordered** types are `Int`, `Float`,
 ### The `?` operator
 
 On a `Result[T, E]`, `e?` evaluates to the `Ok` value or returns `Err(e)` from the enclosing function, which must return `Result[_, E]` with the same `E` (E0202). Convert errors with `.map_err(|e| ...)`. On an `Option[T]`, `?` returns `None` from a function returning `Option`.
+
+### Safe navigation: `?.`
+
+On an `Option`, `a?.b` reaches into the value if there is one: it is `None` when `a` is `None`, and otherwise `Some` of `.b` on the value inside. It works with fields, methods and tuple fields (`a?.len()`, `t?.0`), and `None` short-circuits **the whole chain** to its right, as in C# and TypeScript: in `user?.name.len()`, `.len()` runs only when there is a user, and the result is an `Option[Int]`.
+
+```
+let city = user?.address?.city ?? "unknown"
+```
+
+- The result is an `Option` once, never nested: if the chain's own result is already an `Option` (here `address` is an `Option[Address]`, and `xs?.get(0)` returns one), it is the result as is, as in Swift and Kotlin. So `user?.address?.city` is an `Option[Str]`.
+- The left side must be an `Option` (E0201 otherwise; a value that is always there takes a plain `.`). On a `Result`, `e?.name` is E0201 too: `?.` is one symbol, so to return early on `Err` and then use the value write `(e?).name`.
+- The chain is the postfix operations after `?.`: fields, method calls, calls, indexes and further `?.`. It ends at a binary operator, so `??` (which binds tighter than arithmetic) applies to the whole chain, and it ends at a postfix `?`, which applies to the whole chain too: `find(id)?.address?.city?` returns `None` from the function when any step is missing.
+- `?.` can start a line, like `.`. It cannot be assigned to (E0209).
 
 ### Pipes
 
@@ -1023,7 +1036,7 @@ stmt       = "let" [ "mut" ] IDENT [ ":" type ] "=" expr
 expr       = unary { BINOP unary | "|>" unary } ; (* precedence: section 5; a line may start with "|>" *)
 expr_ns    = expr ;                             (* no struct literal at the top level *)
 unary      = ( "-" | "!" ) unary | postfix ;
-postfix    = primary { "(" [ args ] ")" | "[" expr "]" | "." IDENT [ "(" [ args ] ")" ] | "." INT | "?" } ;
+postfix    = primary { "(" [ args ] ")" | "[" expr "]" | ( "." | "?." ) IDENT [ "(" [ args ] ")" ] | ( "." | "?." ) INT | "?" } ;
 args       = expr { sep expr } [ "," ] ;
 primary    = INT | FLOAT | STRING | "true" | "false"
            | [ IDENT "." ] IDENT [ "{" [ init { sep init } [ "," ] ] "}" ]   (* struct literal *)

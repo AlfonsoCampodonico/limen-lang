@@ -35,6 +35,7 @@ let rec fv bound acc e =
   | EClosure (ps, body) -> fv (List.map (fun (n, _, _) -> n) ps @ bound) acc body
   | EStruct (_, _, fs) -> List.fold_left (fun acc (_, _, x) -> go acc x) acc fs
   | EWith (b, fs) -> List.fold_left (fun acc (_, _, x) -> go acc x) (go acc b) fs
+  | ESafe (b, x, rest, _) -> fv (x :: bound) (go acc b) rest
   | EDyn (x, _) -> go acc x
   | ESelect arms ->
     List.fold_left
@@ -84,6 +85,7 @@ let rec has_escape e =
   | EBlock b -> block_escape b
   | EStruct (_, _, fs) -> List.exists (fun (_, _, x) -> has_escape x) fs
   | EWith (b, fs) -> has_escape b || List.exists (fun (_, _, x) -> has_escape x) fs
+  | ESafe (b, _, rest, _) -> has_escape b || has_escape rest
   | EDyn (x, _) -> has_escape x
   | ESelect arms ->
     List.exists

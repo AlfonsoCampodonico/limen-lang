@@ -100,6 +100,10 @@ fn main(root: Root) -> Int {
         }
         out.print(size)
     }
+    // safe navigation: None anywhere ends the chain
+    let corner: Option[Point] = Some(Point { x: 3, y: 4 })
+    let nowhere: Option[Point] = None
+    out.print("{corner?.x} {nowhere?.y ?? -1}")
 
     out.print("-- concurrency")
     // tasks returning () run for their effect and add nothing to the list

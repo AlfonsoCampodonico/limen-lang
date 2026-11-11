@@ -101,6 +101,7 @@ let rec walk_expr (f : expr -> unit) e =
   | EClosure (_, body) -> w body
   | EStruct (_, _, fs) -> List.iter (fun (_, _, x) -> w x) fs
   | EWith (b, fs) -> w b; List.iter (fun (_, _, x) -> w x) fs
+  | ESafe (b, _, rest, _) -> w b; w rest
   | EDyn (x, _) -> w x
   | ESelect arms ->
     List.iter
@@ -272,6 +273,9 @@ let member_completions path text off =
   if !start = 0 || text.[!start - 1] <> '.' then None
   else
     let dot = !start - 1 in
+    (* after `recv?.`, the receiver ends before the `?` and the members are those of the value in the Option *)
+    let safe = dot > 0 && text.[dot - 1] = '?' in
+    let recv_end = if safe then dot - 1 else dot in
     let w = ref dot in
     while !w > 0 && is_ident_char text.[!w - 1] do decr w done;
     let before = String.sub text !w (dot - !w) in
@@ -286,8 +290,8 @@ let member_completions path text off =
     while !stop < String.length text && is_ident_char text.[!stop] do incr stop done;
     let eol = match String.index_from_opt text off '\n' with Some i -> i | None -> String.length text in
     let candidates =
-      [ String.sub text 0 dot ^ String.sub text eol (String.length text - eol);
-        String.sub text 0 dot ^ String.sub text !stop (String.length text - !stop) ]
+      [ String.sub text 0 recv_end ^ String.sub text eol (String.length text - eol);
+        String.sub text 0 recv_end ^ String.sub text !stop (String.length text - !stop) ]
     in
     let receiver patched =
       match analyze path patched with
@@ -298,7 +302,7 @@ let member_completions path text off =
           (fun d ->
             walk_block
               (fun e ->
-                if e.espan.hi = dot && e.espan.file = path then
+                if e.espan.hi = recv_end && e.espan.file = path then
                   match !best with
                   | Some (b : expr) when b.espan.hi - b.espan.lo <= e.espan.hi - e.espan.lo -> ()
                   | _ -> best := Some e)
@@ -310,6 +314,7 @@ let member_completions path text off =
     | None -> Some []
     | Some (e, items, patched) ->
       let t = Types.repr e.ety in
+      let t = match t with Types.TNamed ("Option", [ inner ]) when safe -> Types.repr inner | _ -> t in
       let fields =
         match t with
         | Types.TCap Types.Root -> List.map (fun (f, ft) -> item 5 f (show ft)) Check.root_fields

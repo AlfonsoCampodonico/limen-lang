@@ -249,6 +249,8 @@ Tuples `(Int, Str)` and maps `Map[Str, Int]` are built in: `let (q, r) = divmod(
 
 `select { v = jobs.recv() if open => ..., out.send(x) => ..., clock.after(500) => ... }` waits on several channels, with guards to turn arms off and an optional timeout (or `_` to not wait at all; see [examples/select.vela](examples/select.vela)). `clock.sleep(ms)` parks a task without blocking a thread.
 
+`user?.address?.city ?? "unknown"` navigates through `Option`s: `None` anywhere short-circuits the rest of the chain, and the result is a single `Option`.
+
 `match` arms take guards, as `select` arms do: `Some(n) if n > 10 => ...`. A guarded arm does not count toward exhaustiveness.
 
 `{ p with x: 3, y: 4 }` copies a struct with some fields replaced; natively, when `p` is not used again its storage is reused in place.

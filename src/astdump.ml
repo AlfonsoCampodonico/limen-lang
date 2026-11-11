@@ -30,6 +30,7 @@ let rec expr e =
   | EBool b -> string_of_bool b
   | EUnit -> "()"
   | EStr ps -> "\"" ^ String.concat "" (List.map (function SPLit s -> String.escaped s | SPExpr x -> "{" ^ expr x ^ "}") ps) ^ "\""
+  | EVar n when String.starts_with ~prefix:"safe$" n -> "$"
   | EVar n -> n
   | EList es -> "[" ^ String.concat "," (List.map expr es) ^ "]"
   | EBin (o, a, b) -> "(" ^ expr a ^ op o ^ expr b ^ ")"
@@ -47,6 +48,7 @@ let rec expr e =
   | EClosure (ps, b) ->
     "|" ^ String.concat "," (List.map (fun (n, t, _) -> n ^ match t with Some t -> ":" ^ ty t | None -> "") ps) ^ "|" ^ expr b
   | EStruct (n, _, fs) -> n ^ "{" ^ String.concat "," (List.map (fun (f, _, x) -> f ^ ":" ^ expr x) fs) ^ "}"
+  | ESafe (b, _, rest, _) -> "safe(" ^ expr b ^ "," ^ expr rest ^ ")"
   | EWith (b, fs) -> "{" ^ expr b ^ " with " ^ String.concat "," (List.map (fun (f, _, x) -> f ^ ":" ^ expr x) fs) ^ "}"
   | EGroup (n, None, b) -> "group " ^ n ^ block b
   | EGroup (n, Some (c, ms), b) -> "group " ^ n ^ " until " ^ expr c ^ ".after(" ^ expr ms ^ ")" ^ block b

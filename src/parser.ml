@@ -46,6 +46,10 @@ let mk d sp = { edesc = d; espan = sp; ety = Types.TErr; einst = [] }
 (* Comma-separated list up to [close]; a newline also separates items. *)
 let peek2 st = st.toks.(min (st.pos + 1) (Array.length st.toks - 1))
 
+(* names for the value inside an Option in `a?.b`; reset per file so a
+   formatted file parses to the same tree *)
+let safe_count = ref 0
+
 let rec irrefutable_tuple (p : pat) =
   match p.pdesc with PBind _ | PWild -> true | PTuple ps -> List.for_all irrefutable_tuple ps | _ -> false
 
@@ -185,36 +189,52 @@ and parse_unary st ns =
     mk (EUn (Not, e)) (merge t.span e.espan)
   | _ -> parse_postfix st ns (parse_primary st ns)
 
-and parse_postfix st ns e =
+(* [in_safe]: parsing the rest of a `?.` chain, which takes every postfix
+   operation up to a `?` (that one applies to the whole chain). *)
+and parse_postfix ?(in_safe = false) st ns e =
   let t = peek st in
+  let continue_ = parse_postfix ~in_safe st ns in
+  (* `.name`, `.name(args)` or `.0` after the dot *)
+  let member e =
+    match (peek st).tok with
+    | INT k ->
+      let it = advance st in
+      mk (EField (e, Int64.to_string k, it.span)) (merge e.espan it.span)
+    | _ ->
+      let name, nsp = expect_ident st in
+      if is_sym st "(" && not (peek st).nl then begin
+        ignore (advance st);
+        let args = comma_list st ")" parse_expr in
+        mk (EMethod (e, name, nsp, args)) (merge e.espan (last_span st))
+      end
+      else mk (EField (e, name, nsp)) (merge e.espan nsp)
+  in
   match t.tok with
   | SYM "(" when not t.nl ->
     ignore (advance st);
     let args = comma_list st ")" parse_expr in
-    parse_postfix st ns (mk (ECall (e, args)) (merge e.espan (last_span st)))
+    continue_ (mk (ECall (e, args)) (merge e.espan (last_span st)))
   | SYM "[" when not t.nl ->
     ignore (advance st);
     let i = parse_expr st in
     let r = expect_sym st "]" in
-    parse_postfix st ns (mk (EIndex (e, i)) (merge e.espan r.span))
-  | SYM "." when (match (peek2 st).tok with INT _ -> true | _ -> false) ->
-    (* tuple field: `t.0` *)
-    ignore (advance st);
-    let it = advance st in
-    let k = match it.tok with INT k -> Int64.to_string k | _ -> "0" in
-    parse_postfix st ns (mk (EField (e, k, it.span)) (merge e.espan it.span))
+    continue_ (mk (EIndex (e, i)) (merge e.espan r.span))
   | SYM "." ->
     ignore (advance st);
-    let name, nsp = expect_ident st in
-    if is_sym st "(" && not (peek st).nl then begin
-      ignore (advance st);
-      let args = comma_list st ")" parse_expr in
-      parse_postfix st ns (mk (EMethod (e, name, nsp, args)) (merge e.espan (last_span st)))
-    end
-    else parse_postfix st ns (mk (EField (e, name, nsp)) (merge e.espan nsp))
-  | SYM "?" when not t.nl ->
+    continue_ (member e)
+  | SYM "?." ->
+    (* safe navigation: the rest of the chain runs on the value inside the
+       Option, and None short-circuits all of it *)
     ignore (advance st);
-    parse_postfix st ns (mk (ETry e) (merge e.espan t.span))
+    incr safe_count;
+    let x = Printf.sprintf "safe$%d" !safe_count in
+    let hole = mk (EVar x) t.span in
+    let rest = parse_postfix ~in_safe:true st ns (member hole) in
+    let node = mk (ESafe (e, x, rest, false)) (merge e.espan rest.espan) in
+    if in_safe then node else continue_ node
+  | SYM "?" when not t.nl && not in_safe ->
+    ignore (advance st);
+    continue_ (mk (ETry e) (merge e.espan t.span))
   | _ -> e
 
 and parse_primary st ns =
@@ -730,6 +750,7 @@ let set_pub = function
 
 let parse_file file src : file =
   test_count := 0;
+  safe_count := 0;
   let toks = Lexer.lex file src in
   let st = { toks; pos = 0; file } in
   let items = ref [] and uses = ref [] in

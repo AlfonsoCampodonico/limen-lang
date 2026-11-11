@@ -294,6 +294,27 @@ let rec lower f (e : expr) : I.atom =
     | EBlock b -> lower_block f b
     | EClosure (ps, body) -> lower_closure f ps body ty
     | EPipe _ -> failwith "pipes are expanded when modules load"
+    | ESafe (base, x, rest, flat) ->
+      (* `a?.b`: if a is Some(v), the rest of the chain on v (wrapped in Some
+         unless it is an Option already), else None *)
+      let a = lower f base in
+      let bt = tyof f base in
+      let inner = match bt with TNamed ("Option", [ t ]) -> t | _ -> TUnit in
+      let r = fresh_var "safe" ty in
+      emit f (I.Decl r);
+      let has = tmp f TBool (I.IsTag (a, bt, 0)) in
+      let some_b, _, d =
+        in_block f (fun () ->
+            let v = fresh_var x inner in
+            emit f (I.Let (v, I.Payload (a, bt, 0, 0)));
+            bind f x v;
+            let c = lower f rest in
+            emit f (I.Init (r, if flat then I.Atom c else I.MkEnum (ty, 0, [ c ]))))
+      in
+      let none_b, _, _ = in_block f (fun () -> emit f (I.Init (r, I.MkEnum (ty, 1, [])))) in
+      emit f (I.If (has, some_b, none_b));
+      ignore d;
+      I.V r
     | EWith (base, fields) ->
       (* Take the base, then overwrite the fields in place. When the base is
          not used afterwards it is moved, so its storage is reused and the

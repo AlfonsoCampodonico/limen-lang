@@ -120,6 +120,7 @@ let index (items : item list) : occ list =
   let rec expr env e =
     let x = expr env in
     match e.edesc with
+    | EVar n when String.contains n '$' -> () (* a name the compiler made up *)
     | EVar n -> (
       match List.assoc_opt n env with
       | Some k -> add k n e.espan
@@ -183,6 +184,7 @@ let index (items : item list) : occ list =
              | None -> if Hashtbl.mem fns n then add ~short:(Var_side f) ("f:" ^ n) n fsp)
           | _ -> add ("d:" ^ name ^ "#" ^ f) f fsp; x v)
         fs
+    | ESafe (b, _, rest, _) -> x b; x rest
     | EWith (b, fs) ->
       x b;
       List.iter

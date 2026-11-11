@@ -501,6 +501,7 @@ and check_expr_inner ctx f e : ty =
   | EDyn (x, i) -> ignore (check_expr ctx f x); TDyn i
   | EPipe _ -> failwith "pipes are expanded when modules load"
   | EWith (base, fields) -> check_with ctx f base fields e.espan
+  | ESafe (base, x, rest, _) -> check_safe ctx f e base x rest
   | EGroup (name, until, b) ->
     let t = fresh () in
     Option.iter
@@ -1154,6 +1155,42 @@ and check_struct_lit ctx f name nsp fields sp =
            (String.concat ", " (List.map (fun (n, _) -> "`" ^ n ^ "`") missing))
            name);
     TNamed (name, targs)
+
+(* `a?.b`: [rest] runs on the value inside the Option [a], bound to [x].
+   The result is an Option: the rest's own when it is one already (so
+   `a?.b?.c` is not nested), otherwise the rest wrapped in Some. *)
+and check_safe ctx f e base x rest =
+  let bt = check_expr ctx f base in
+  let inner =
+    match repr bt with
+    | TNamed ("Option", [ t ]) -> t
+    | TErr -> TErr
+    | TVar _ ->
+      err ctx "E0207" base.espan "the type of this value is not known here; add a type annotation";
+      TErr
+    | TNamed ("Result", _) as t ->
+      err ctx "E0201" base.espan
+        (sprintf "`?.` works on an `Option`, but this is `%s`" (show t))
+        ~notes:
+          [ "`?.` is safe navigation; to return early on `Err` and then use the value, write `(e?).name`" ];
+      TErr
+    | t ->
+      err ctx "E0201" base.espan
+        (sprintf "`?.` needs an `Option` on its left, found `%s`" (show t))
+        ~notes:[ "a value that is always there takes a plain `.`" ];
+      TErr
+  in
+  push f;
+  bind f x { vty = inner; vmut = false; vspan = base.espan; vkind = KPat };
+  let rt = check_expr ctx f rest in
+  pop f;
+  match (repr bt, repr rt) with
+  | TNamed ("Option", _), TNamed ("Option", _) ->
+    e.edesc <- ESafe (base, x, rest, true);
+    rt
+  | TNamed ("Option", _), TErr -> TErr
+  | TNamed ("Option", _), _ -> opt rt
+  | _ -> TErr
 
 (* `{ base with x: 1, y }`: a copy of a struct value with some fields
    replaced; the same field errors as a struct literal, minus "missing". *)

@@ -3,7 +3,7 @@
 # It follows SPEC.md section 15 at the character level, including the newline
 # rules: statements are separated by a newline or `;`; inside brackets and
 # after a binary operator a newline is free; a line may start with `.` to
-# continue a method chain or with `|>` to continue a pipeline; a line may not
+# continue a method chain (also `?.`) or with `|>` to continue a pipeline; a line may not
 # start with another binary operator, `(`, `[` or `?` that belongs to the
 # previous line.
 #
@@ -67,7 +67,8 @@ expr    ::= unary (sp binop ws unary | ws "|>" ws unary)*
 binop   ::= "??" | "||" | "&&" | "==" | "!=" | "<=" | ">=" | "<" | ">" | "..<" | "+" | "-" | "*" | "/" | "%"
 unary   ::= ("-" | "!") sp unary | postfix
 postfix ::= primary suffix*
-suffix  ::= sp "(" ws args? ws ")" | sp "[" ws expr ws "]" | ws "." sp ident | "." [0-9]+ | sp "?"
+# `?.` is safe navigation (a line may start with it, as with `.`)
+suffix  ::= sp "(" ws args? ws ")" | sp "[" ws expr ws "]" | ws "." sp ident | "." [0-9]+ | ws "?." sp ident | "?." [0-9]+ | sp "?"
 args    ::= expr (isep expr)* (ws ",")?
 
 primary ::= float | int | string | ident | structlit | withlit | "(" ws ")" | "(" ws expr ws ")" | "(" ws expr (isep expr)+ (ws ",")? ws ")" | "[" ws args? ws "]" | block | if | match | select | closure | group

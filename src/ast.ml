@@ -54,6 +54,11 @@ and expr_desc =
   | ESelect of sel_arm list
   | EPipe of expr * expr (* `x |> f(a)`: becomes `f(x, a)` when modules load *)
   | EWith of expr * (string * span * expr) list (* `{ p with x: 1 }`: a copy of a struct with fields replaced *)
+  | ESafe of expr * string * expr * bool
+      (* `a?.b.c`: the Option [a]; a name for the value inside it; the rest of
+         the chain, `name.b.c`, run on that value; and (set by the checker)
+         whether that rest is an Option already, so its result is not wrapped
+         again. The name ("safe$N") cannot be written in source. *)
 
 and str_part = SPLit of string | SPExpr of expr
 
