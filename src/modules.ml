@@ -439,6 +439,24 @@ let load ?(deps = []) path src : item list * Diag.t list =
         if !errors <> [] then ([], List.rev !errors) else (items, [])
       end)
 
+(* Who calls C: (dependency, libraries) for each dependency whose modules
+   declare foreign blocks, from the module each declaration came from. *)
+let c_users (items : item list) : (string * string list) list =
+  List.fold_left
+    (fun acc it ->
+      match it with
+      | IFn { fn_name; fn_foreign = Some fo; _ } -> (
+        match String.index_opt fn_name '.' with
+        | Some k -> (
+          match List.assoc_opt (String.sub fn_name 0 k) !module_pkg with
+          | Some dep ->
+            let libs = Option.value ~default:[] (List.assoc_opt dep acc) in
+            if List.mem fo.flib libs then acc else (dep, libs @ [ fo.flib ]) :: List.remove_assoc dep acc
+          | None -> acc)
+        | None -> acc)
+      | _ -> acc)
+    [] items
+
 (* Load a program with the vela.toml around it (if any), then type-check it
    and enforce the capabilities of each standard library module and each
    dependency. *)
@@ -455,4 +473,9 @@ let load_and_check path src : item list * Diag.t list * Check.fn_info list =
          with or without a vela.toml of the program's own *)
       let ds = if ds = [] then Package.enforce ~std:true (Lazy.force Package.std_manifest) (List.map (fun m -> (m, m)) !std_loaded) infos else ds in
       let ds = match pkg with Some p when ds = [] -> Package.enforce p !module_pkg infos | _ -> ds in
+      let ds =
+        match pkg with
+        | Some p when ds = [] -> Package.check_foreign_lock p (c_users items)
+        | _ -> ds
+      in
       (items, ds, infos))

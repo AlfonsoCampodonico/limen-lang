@@ -65,6 +65,13 @@ let parse_grants args =
       | _ -> die_usage ("unknown grant `" ^ a ^ "`"))
     Interp.no_grants args
 
+(* The foreign grant is full access; say so every time it is given. *)
+let warn_foreign (g : Interp.grants) =
+  if g.foreign <> [] then
+    prerr_endline
+      (Printf.sprintf "vela: warning: --grant foreign=%s is full access: C code can do anything this process can, past every other grant"
+         (String.concat "," g.foreign))
+
 (* The [grants] of the program's vela.toml, as `--grant` values. They come
    first, so flags add to them (and a --grant fs=... replaces the fs one). *)
 let toml_grants file =
@@ -203,10 +210,37 @@ let cmd_doc args =
   | Some o -> Out_channel.with_open_bin o (fun oc -> output_string oc text)
   | None -> print_string text
 
+(* Every part of the program that calls C, so it can be reviewed: C code is
+   outside every capability check. One line each. *)
+let c_callers (items : Ast.item list) =
+  let groups =
+    List.fold_left
+      (fun acc it ->
+        match it with
+        | Ast.IFn { fn_name; fn_foreign = Some fo; _ } ->
+          let m = match String.index_opt fn_name '.' with Some k -> String.sub fn_name 0 k | None -> "" in
+          let libs, trusted = Option.value ~default:([], fo.ftrusted) (List.assoc_opt m acc) in
+          (m, ((if List.mem fo.flib libs || fo.flib = "vela" then libs else libs @ [ fo.flib ]), trusted)) :: List.remove_assoc m acc
+        | _ -> acc)
+      [] items
+  in
+  List.map
+    (fun (m, (libs, trusted)) ->
+      let who =
+        if m = "" then "the program itself (needs --grant foreign)"
+        else if trusted then Printf.sprintf "module `%s` (standard library, trusted by src/std/vela.toml)" m
+        else
+          match List.assoc_opt m !Modules.module_pkg with
+          | Some dep -> Printf.sprintf "module `%s` (dependency `%s`, trusted in vela.toml [trust])" m dep
+          | None -> Printf.sprintf "module `%s` (the program's own, needs --grant foreign)" m
+      in
+      Printf.sprintf "calls C: %s: %s" who (String.concat ", " libs))
+    (List.sort compare groups)
+
 let cmd_check file json =
-  let _, diags, _ = load file in
+  let items, diags, _ = load file in
   if json then print_endline (Diag.list_to_json diags)
-  else if diags = [] then print_endline "ok"
+  else if diags = [] then (print_endline "ok"; List.iter print_endline (c_callers items))
   else report diags;
   exit (if diags = [] then 0 else 1)
 
@@ -260,7 +294,7 @@ let cmd_build file out emit_c =
 
 let cmd_run_native file grant_args prog_args =
   let grant_args = toml_grants file @ grant_args in
-  ignore (parse_grants grant_args);
+  warn_foreign (parse_grants grant_args);
   let items = checked file in
   let dir = Filename.get_temp_dir_name () in
   let exe = Filename.concat dir (Printf.sprintf "vela-%d" (Unix.getpid ())) in
@@ -281,6 +315,7 @@ let cmd_run_native file grant_args prog_args =
 let cmd_run file grant_args prog_args =
   let grant_args = toml_grants file @ grant_args in
   let grants = { (parse_grants grant_args) with args = prog_args } in
+  warn_foreign grants;
   let items, diags, _ = load file in
   if diags <> [] then (report diags; exit 1);
   let out s = print_string s; flush stdout in

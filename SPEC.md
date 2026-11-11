@@ -434,7 +434,7 @@ foreign "sqlite3" {
 }
 ```
 
-Calling one takes a `Foreign` capability first, then the other arguments: `sqlite3_libversion(root.foreign)`. Each call checks that the `Foreign` value grants the library (`--grant foreign=sqlite3`), and panics if not. So C is reachable only from code that was handed `Foreign`, `vela caps` lists such functions, and a package dependency can use a foreign block only if vela.toml gives it `caps = ["foreign"]` (section 18). The library name is the `-l` name: `foreign "sqlite3"` links `-lsqlite3` natively and loads `libsqlite3.dylib` (macOS) or `libsqlite3.so` in the interpreter; `foreign "c"` is the C library itself, which is always there. The function name is the C symbol. Declarations are one per line; `pub fn` exports one from a module.
+Calling one takes a `Foreign` capability first, then the other arguments: `sqlite3_libversion(root.foreign)`. Each call checks that the `Foreign` value grants the library (`--grant foreign=sqlite3`), and panics if not. So C is reachable only from code that was handed `Foreign`, `vela caps` lists such functions, and a package dependency can use a foreign block only if the program names it in `[trust] foreign = [...]` in vela.toml (section 18). The library name is the `-l` name: `foreign "sqlite3"` links `-lsqlite3` natively and loads `libsqlite3.dylib` (macOS) or `libsqlite3.so` in the interpreter; `foreign "c"` is the C library itself, which is always there. The function name is the C symbol. Declarations are one per line; `pub fn` exports one from a module.
 
 The types that cross the boundary:
 
@@ -456,6 +456,13 @@ Ownership at the boundary:
 - Arguments are lent to C for the duration of the call, never moved. A `Str` or `Bytes` pointer is valid only until the call returns: C must copy what it keeps (SQLite's `SQLITE_TRANSIENT`, a destructor argument of `-1`, does this). A `Handle` that C returns pointing into a Vela string is dangling once that string is freed.
 - Memory C allocates belongs to C: free it with the library's own function (`sqlite3_finalize`, `free`). Vela never frees a `Handle`, and the leak check does not see C memory.
 - `foreign.copy(p, n)` copies `n` bytes at `p` into new `Bytes`, for results that are a pointer and a length (`sqlite3_column_blob` and `sqlite3_column_bytes`). It reads raw memory, so it needs a `Foreign` that grants at least one library.
+
+The foreign grant is full trust, and Vela treats it that way:
+
+- Only the program grants it: `--grant foreign=LIB` or `[grants] foreign` in the program's own vela.toml. `vela run` prints a one-line warning whenever it is given, since nothing else in the program's grants bounds what C code does (section 21 describes the operating-system sandbox, which still does).
+- It does not pass along: a dependency's `caps` cannot include `foreign`. A dependency may declare foreign blocks only when the program names it in `[trust]`, and vela.lock records the C libraries each trusted dependency uses (section 18).
+- `vela check` lists every part of the program that calls C, one line each: the program's own files, trusted dependencies, and trusted standard library modules.
+- The standard library calls C only from modules that its manifest, src/std/vela.toml, trusts in the same way (`sql`). Their foreign functions are private to the module and take no `Foreign`, so a program using `sql` grants only an `Fs`; the module is what keeps SQLite inside that grant.
 
 What the capability lets code do: anything the C functions it declares can do, with the program's full authority, outside every other capability's checks. Vela checks the declared types and the library grant; it cannot check that a declaration matches the C prototype, and a wrong one is undefined behaviour. Keep foreign blocks small, private to a module that wraps them in a safe Vela API (as the `sql` module does), and grant `foreign` only to programs and dependencies you trust.
 
@@ -894,6 +901,7 @@ Every diagnostic has a stable code. `vela explain CODE` prints its explanation, 
 | E0321 | malformed vela.toml |
 | E0322 | a git dependency could not be fetched |
 | E0323 | vela.lock does not match: a malformed line, or a dependency whose files changed |
+| E0324 | a trusted dependency calls a C library that vela.lock did not record |
 | E0330 | a foreign function signature with a type that cannot cross to C, too many parameters, or a bad library name |
 | E0331 | a foreign function used as a value instead of called |
 | E0401 | module not found, or a qualified name without `use` |
@@ -1044,7 +1052,8 @@ yaml = { git = "git@example.com:me/yaml.git", commit = "3f9c2e1d7a" }
 - `[grants]` takes `net`, `fs`, `listen`, `env`, `exec` and `foreign`, each a string or a list of strings written exactly like the text after `--grant KIND=`. `fs` takes one directory, relative to vela.toml, with an optional `:ro`. Stdout, Stdin, Clock and Rand are always granted, so listing them is an error. Flags on the command line add to these grants.
 - Grants belong to the program being run: only the vela.toml found for the main file is read for them. A dependency's own vela.toml never grants anything, so adding or updating a dependency cannot widen what the program may do. A dependency gets capabilities in exactly one way: your code passes them to it, and only of the kinds its `caps` allow. `[grants]` decides what reaches `main`; `caps` decides which of those may cross into each dependency.
 - A dependency is a directory holding `NAME.vela`, plus any modules that file uses from the same directory.
-- `caps` lists what the dependency may use: `net` (Net and Conn), `listen` (Listen, Listener and Conn), `fs`, `stdout`, `stdin`, `clock`, `rand`, `env`, `exec`, `foreign`. The default is none. A dependency with a `foreign` block needs `foreign`, since its foreign functions take `Foreign`. No dependency can take `Root`.
+- `caps` lists what the dependency may use: `net` (Net and Conn), `listen` (Listen, Listener and Conn), `fs`, `stdout`, `stdin`, `clock`, `rand`, `env`, `exec`. The default is none. No dependency can take `Root`, and `caps` cannot give `foreign` (E0321).
+- `[trust] foreign = ["name", ...]` names the dependencies that may call C: declare foreign blocks and take `Foreign`. Calling C is full trust, since C code is outside every capability check, so it is a separate, explicit list rather than one more cap, and only the program's vela.toml can hold it. An untrusted dependency that calls C is E0320. vela.lock gets a line per trusted dependency that calls C, `foreign NAME LIB,LIB`, written on the first build; when an update makes the dependency declare a library the line does not have, the build stops (E0324) until you review it and delete the line.
 - Vela has no ambient authority, so a function can only use a capability that reaches it as a parameter. The checker therefore knows everything a dependency can ever do from its signatures, and rejects the program (E0320) if a dependency's function takes a capability it was not granted. Granting is still only an upper bound: at run time the dependency gets exactly the capabilities you pass it, which can be narrowed with `only` and `under`.
 - A dependency is a local directory (`path`) or a git repository (`git`) at a `tag` or a `commit` (lowercase hex, at least 7 characters). The URL is `https://`, `http://`, `ssh://`, `git://`, `file://` or `user@host:path`. There is no central registry: the URL is the name of the source.
 - A git dependency is fetched with the `git` command into a cache, one directory per commit: `$VELA_CACHE`, else `$XDG_CACHE_HOME/vela`, else `~/.cache/vela`. Fetching needs no grant because it happens in the compiler, before the program exists; `vela lsp` and `vela mcp` never fetch, and report a dependency that is not cached yet (E0322).

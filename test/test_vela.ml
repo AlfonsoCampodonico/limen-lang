@@ -3568,6 +3568,45 @@ fn main(root: Root) {
   ok "pkg-missing-dir" (pkg_codes "[package]\nname = \"app\"\n[dependencies]\nother = { path = \"../nope\" }\n" = [ "E0401" ]) "fetch not found";
   Sys.remove (Filename.concat pdir "app/vela.toml");
 
+  (* calling C is full trust: a dependency gets it only from [trust], never from caps,
+     and vela.lock records its libraries so a change is noticed *)
+  (try Unix.mkdir (Filename.concat pdir "cdep") 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+  (try Unix.mkdir (Filename.concat pdir "capp") 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+  let cdep_src libs =
+    String.concat "" (List.map (fun (l, fn) -> sprintf "foreign \"%s\" {\n    fn %s() -> Int32\n}\n\n" l fn) libs)
+    ^ "pub fn pid(f: Foreign) -> Int {\n    getpid(f)\n}\n"
+  in
+  put "cdep/cdep.vela" (cdep_src [ ("c", "getpid") ]);
+  let capp = "use cdep\n\nfn main(root: Root) {\n    root.stdout.print(\"{cdep.pid(root.foreign) > 0}\")\n}\n" in
+  put "capp/main.vela" capp;
+  let lock = Filename.concat pdir "capp/vela.lock" in
+  let cpkg toml =
+    put "capp/vela.toml" toml;
+    let _, ds, _ = Modules.load_and_check (Filename.concat pdir "capp/main.vela") capp in
+    ds
+  in
+  let dep = "[package]\nname = \"capp\"\n\n[dependencies]\ncdep = { path = \"../cdep\" }\n" in
+  let show ds = String.concat "; " (List.map (fun (d : Diag.t) -> d.code ^ " " ^ d.message) ds) in
+  (try Sys.remove lock with Sys_error _ -> ());
+  let ds = cpkg dep in
+  ok "trust-required" (codes ds = [ "E0320"; "E0320" ] && List.exists (fun (d : Diag.t) -> List.exists (fun n -> Interp_util.find_sub n "[trust]" 0 <> None) d.notes) ds) (show ds);
+  ok "trust-not-caps" (codes (cpkg "[package]\nname = \"capp\"\n\n[dependencies]\ncdep = { path = \"../cdep\", caps = [\"foreign\"] }\n") = [ "E0321" ]) "caps = [foreign] is refused";
+  ok "trust-unknown" (codes (cpkg (dep ^ "\n[trust]\nforeign = [\"other\"]\n")) = [ "E0321" ]) "trust names a dependency";
+  let trusted = dep ^ "\n[trust]\nforeign = [\"cdep\"]\n" in
+  let ds = cpkg trusted in
+  ok "trust-granted" (ds = []) (show ds);
+  ok "trust-locked" (Sys.file_exists lock && Interp_util.find_sub (read_file lock) "foreign cdep c\n" 0 <> None) (if Sys.file_exists lock then read_file lock else "no lock");
+  ok "trust-stable" (cpkg trusted = []) "same libraries";
+  (* an update that starts calling another library stops the build *)
+  put "cdep/cdep.vela" (cdep_src [ ("c", "getpid"); ("z", "zlibVersion") ]);
+  let ds = cpkg trusted in
+  ok "trust-lock-changed" (codes ds = [ "E0324" ] && Interp_util.find_sub (List.hd ds).message "`z`" 0 <> None) (show ds);
+  (* deleting the line accepts the new libraries *)
+  Out_channel.with_open_bin lock (fun oc -> output_string oc "# reviewed\n");
+  ok "trust-relock" (cpkg trusted = [] && Interp_util.find_sub (read_file lock) "foreign cdep c,z\n" 0 <> None) (read_file lock);
+  put "cdep/cdep.vela" (cdep_src [ ("c", "getpid") ]);
+  Sys.remove (Filename.concat pdir "capp/vela.toml");
+
   (* [grants] in vela.toml: the program's own grants, with --grant flags adding to them *)
   (* the CLI built next to this test binary, wherever it is run from *)
   let vela_exe = Filename.concat (Filename.dirname (Filename.dirname Sys.executable_name)) "bin/main.exe" in
@@ -3580,6 +3619,22 @@ fn main(root: Root) {
     in
     (code, read_file o, read_file e)
   in
+  (* the foreign grant is announced as full access, and `vela check` lists who calls C *)
+  put "capp/vela.toml" "[package]\nname = \"capp\"\n\n[dependencies]\ncdep = { path = \"../cdep\" }\n\n[trust]\nforeign = [\"cdep\"]\n\n[grants]\nforeign = \"c\"\n";
+  let cmain = Filename.concat pdir "capp/main.vela" in
+  (try Sys.remove lock with Sys_error _ -> ());
+  let code, o, e = vela_cli [ "run"; cmain ] in
+  ok "cli-foreign-warning"
+    (code = 0 && o = "true\n" && e = "vela: warning: --grant foreign=c is full access: C code can do anything this process can, past every other grant\n")
+    (sprintf "%d %S %S" code o e);
+  let code, o, _ = vela_cli [ "check"; cmain ] in
+  ok "cli-check-calls-c" (code = 0 && o = "ok\ncalls C: module `cdep` (dependency `cdep`, trusted in vela.toml [trust]): c\n") o;
+  put "capp/sqlmain.vela" "use sql\n\nforeign \"c\" {\n    fn getpid() -> Int32\n}\n\nfn main(root: Root) {\n    root.stdout.print(\"{sql.memory().is_ok()} {getpid(root.foreign) > 0}\")\n}\n";
+  let code, o, _ = vela_cli [ "check"; Filename.concat pdir "capp/sqlmain.vela" ] in
+  ok "cli-check-calls-c-std" (code = 0 && o = "ok\ncalls C: the program itself (needs --grant foreign): c\ncalls C: module `sql` (standard library, trusted by src/std/vela.toml): sqlite3\n") o;
+  Sys.remove (Filename.concat pdir "capp/vela.toml");
+  let _, o, e = vela_cli [ "run"; Filename.concat pdir "capp/sqlmain.vela" ] in
+  ok "cli-no-foreign-no-warning" (o = "" && String.starts_with ~prefix:"panic: foreign: library `c` is not granted" e) (o ^ e);
   List.iter (fun d -> try Unix.mkdir (Filename.concat pdir d) 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ()) [ "grants"; "grants/data"; "envy" ];
   put "grants/data/a.txt" "hi";
   Unix.putenv "VELA_T_A" "a";

@@ -109,7 +109,7 @@ fn main(root: Root) {
 }
 ```
 
-`Int`, `Int32`, `Float`, `Bool`, `Str` and `Bytes` (a pointer lent for the call), `Handle` (an opaque `void *`) and `Out[T]` out-parameters cross the boundary. Natively the library is linked with `-l<lib>`; the interpreter loads it with `dlopen`, so both backends run the same programs. A dependency needs `caps = ["foreign"]` to declare a foreign block, and C code runs with the process's full authority, so the right shape is a small module that wraps the C calls in a safe API, like the `sql` module. SPEC.md section 9 has the type table, the ownership rules and the limits (no variadics, callbacks or structs by value).
+`Int`, `Int32`, `Float`, `Bool`, `Str` and `Bytes` (a pointer lent for the call), `Handle` (an opaque `void *`) and `Out[T]` out-parameters cross the boundary. Natively the library is linked with `-l<lib>`; the interpreter loads it with `dlopen`, so both backends run the same programs. C code runs with the process's full authority, so the foreign grant is treated as full trust: `vela run` warns when it is given, a dependency may call C only if vela.toml names it in `[trust] foreign = [...]` (recorded in vela.lock, so an update that starts calling new C libraries stops the build), and `vela check` lists every part of the program that calls C. The right shape is a small module that wraps the C calls in a safe API, like the `sql` module, which the standard library trusts with SQLite so programs using it grant only an `Fs`. SPEC.md section 9 has the type table, the ownership rules and the limits (no variadics, callbacks or structs by value).
 
 ## Modules, packages and the standard library
 
