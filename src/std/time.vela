@@ -1,0 +1,345 @@
+// Dates and times as pure functions of epoch milliseconds, the number
+// `Clock.now_ms()` returns. Everything is UTC (proleptic Gregorian calendar,
+// no leap seconds). Fixed offsets such as +01:00 are supported where noted;
+// named zones with daylight saving rules (Europe/Madrid) are not, since they
+// need the system's zone database.
+
+// A moment split into calendar fields.
+pub struct DateTime {
+    year: Int,
+    month: Int,     // 1 to 12
+    day: Int,       // 1 to 31
+    hour: Int,      // 0 to 23
+    minute: Int,
+    second: Int,
+    ms: Int,        // 0 to 999
+    weekday: Int,   // 1 (Monday) to 7 (Sunday), as in ISO 8601
+    yday: Int,      // day of the year, 1 to 366
+}
+
+// Durations in milliseconds: `now + time.days(3)`.
+pub fn seconds(n: Int) -> Int {
+    n * 1000
+}
+
+pub fn minutes(n: Int) -> Int {
+    n * 60000
+}
+
+pub fn hours(n: Int) -> Int {
+    n * 3600000
+}
+
+pub fn days(n: Int) -> Int {
+    n * 86400000
+}
+
+// Division and remainder rounding toward negative infinity, so moments
+// before 1970 work.
+fn floor_div(a: Int, b: Int) -> Int {
+    let q = a / b
+    if (a % b != 0) && ((a < 0) != (b < 0)) { q - 1 } else { q }
+}
+
+fn floor_mod(a: Int, b: Int) -> Int {
+    a - floor_div(a, b) * b
+}
+
+pub fn is_leap_year(y: Int) -> Bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+// The number of days in a month (1 to 12) of a year.
+pub fn days_in_month(year: Int, month: Int) -> Int {
+    match month {
+        2 => if is_leap_year(year) { 29 } else { 28 },
+        4 => 30,
+        6 => 30,
+        9 => 30,
+        11 => 30,
+        _ => 31,
+    }
+}
+
+// Days since 1970-01-01 of a calendar date (H. Hinnant's algorithm).
+fn days_from_civil(year: Int, month: Int, day: Int) -> Int {
+    let y = if month <= 2 { year - 1 } else { year }
+    let era = floor_div(y, 400)
+    let yoe = y - era * 400
+    let mp = if month > 2 { month - 3 } else { month + 9 }
+    let doy = (153 * mp + 2) / 5 + day - 1
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    era * 146097 + doe - 719468
+}
+
+// Epoch milliseconds of midnight UTC on a date. Months and days outside
+// their range roll over: `date(2024, 13, 1)` is 2025-01-01.
+pub fn date(year: Int, month: Int, day: Int) -> Int {
+    let y = year + floor_div(month - 1, 12)
+    let m = floor_mod(month - 1, 12) + 1
+    days(days_from_civil(y, m, 1) + day - 1)
+}
+
+// Epoch milliseconds of the calendar fields of `p` (weekday and yday are
+// ignored). Out-of-range fields roll over, as in `date`.
+pub fn from_parts(p: DateTime) -> Int {
+    date(p.year, p.month, p.day) + hours(p.hour) + minutes(p.minute) + seconds(p.second) + p.ms
+}
+
+// The calendar fields of a moment, in UTC.
+pub fn parts(ms: Int) -> DateTime {
+    let z = floor_div(ms, 86400000)
+    let in_day = ms - z * 86400000
+    let zz = z + 719468
+    let era = floor_div(zz, 146097)
+    let doe = zz - era * 146097
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp = (5 * doy + 2) / 153
+    let day = doy - (153 * mp + 2) / 5 + 1
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }
+    let year = yoe + era * 400 + if month <= 2 { 1 } else { 0 }
+    DateTime {
+        year,
+        month,
+        day,
+        hour: in_day / 3600000,
+        minute: in_day / 60000 % 60,
+        second: in_day / 1000 % 60,
+        ms: in_day % 1000,
+        weekday: floor_mod(z + 3, 7) + 1,
+        yday: z - days_from_civil(year, 1, 1) + 1,
+    }
+}
+
+// The calendar fields of a moment as seen at a fixed offset from UTC, in
+// minutes (+60 for UTC+01:00).
+pub fn parts_at(ms: Int, offset_minutes: Int) -> DateTime {
+    parts(ms + minutes(offset_minutes))
+}
+
+// The moment `n` calendar months later (or earlier, for a negative `n`),
+// keeping the time of day; the day is clamped to the end of a shorter month,
+// so one month after January 31 is the last day of February.
+pub fn add_months(ms: Int, n: Int) -> Int {
+    let p = parts(ms)
+    let total = p.year * 12 + p.month - 1 + n
+    let y = floor_div(total, 12)
+    let m = floor_mod(total, 12) + 1
+    let d = p.day.min(days_in_month(y, m))
+    date(y, m, d) + floor_mod(ms, 86400000)
+}
+
+fn pad(n: Int, width: Int) -> Str {
+    let mut s = n.abs().to_str()
+    while s.len() < width {
+        s = "0" + s
+    }
+    if n < 0 { "-" + s } else { s }
+}
+
+pub fn month_name(month: Int) -> Str {
+    ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"].get(month - 1) ?? "?"
+}
+
+// The name of an ISO weekday, 1 (Monday) to 7 (Sunday).
+pub fn weekday_name(weekday: Int) -> Str {
+    ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"].get(weekday - 1) ?? "?"
+}
+
+fn year_text(y: Int) -> Str {
+    if y >= 0 && y <= 9999 {
+        pad(y, 4)
+    } else if y < 0 {
+        "-" + pad(-y, 6)
+    } else {
+        "+" + pad(y, 6)
+    }
+}
+
+fn offset_text(offset_minutes: Int, colon: Bool) -> Str {
+    let sign = if offset_minutes < 0 { "-" } else { "+" }
+    let a = offset_minutes.abs()
+    sign + pad(a / 60, 2) + (if colon { ":" } else { "" }) + pad(a % 60, 2)
+}
+
+// Format a moment in UTC. `layout` is text with these directives:
+//   %Y year   %m month 01-12   %d day 01-31   %H hour 00-23   %M minute
+//   %S second   %L milliseconds 000-999   %j day of the year 001-366
+//   %y two-digit year   %I hour 01-12   %p AM or PM   %u weekday 1-7
+//   %a Mon   %A Monday   %b Jan   %B January   %s epoch seconds
+//   %z +0000   %Z UTC   %% a percent sign
+// Anything else is copied as it is.
+pub fn format(ms: Int, layout: Str) -> Str {
+    format_at(ms, 0, layout)
+}
+
+// `format` at a fixed offset from UTC in minutes; `%z` shows the offset and
+// `%Z` shows it as +hh:mm.
+pub fn format_at(ms: Int, offset_minutes: Int, layout: Str) -> Str {
+    let p = parts_at(ms, offset_minutes)
+    let bs = layout.bytes()
+    let mut out = ""
+    let mut start = 0
+    let mut i = 0
+    while i < bs.len() {
+        if bs[i] != 37 || i + 1 >= bs.len() {
+            i = i + 1
+            continue
+        }
+        out = out + layout.slice(start, i)
+        let piece = match layout.slice(i + 1, i + 2) {
+            "Y" => year_text(p.year),
+            "m" => pad(p.month, 2),
+            "d" => pad(p.day, 2),
+            "H" => pad(p.hour, 2),
+            "M" => pad(p.minute, 2),
+            "S" => pad(p.second, 2),
+            "L" => pad(p.ms, 3),
+            "j" => pad(p.yday, 3),
+            "y" => pad(floor_mod(p.year, 100), 2),
+            "I" => pad(if p.hour % 12 == 0 { 12 } else { p.hour % 12 }, 2),
+            "p" => if p.hour < 12 { "AM" } else { "PM" },
+            "u" => p.weekday.to_str(),
+            "a" => weekday_name(p.weekday).slice(0, 3),
+            "A" => weekday_name(p.weekday),
+            "b" => month_name(p.month).slice(0, 3),
+            "B" => month_name(p.month),
+            "s" => floor_div(ms, 1000).to_str(),
+            "z" => offset_text(offset_minutes, false),
+            "Z" => if offset_minutes == 0 { "UTC" } else { offset_text(offset_minutes, true) },
+            "%" => "%",
+            other => "%" + other,
+        }
+        out = out + piece
+        i = i + 2
+        start = i
+    }
+    out + layout.slice(start, layout.len())
+}
+
+// ISO 8601 in UTC with milliseconds: "2026-11-11T18:22:05.123Z".
+pub fn iso(ms: Int) -> Str {
+    format(ms, "%Y-%m-%dT%H:%M:%S.%LZ")
+}
+
+// ISO 8601 at a fixed offset from UTC: "2026-11-11T19:22:05.123+01:00".
+pub fn iso_at(ms: Int, offset_minutes: Int) -> Str {
+    format_at(ms, offset_minutes, "%Y-%m-%dT%H:%M:%S.%L") + offset_text(offset_minutes, true)
+}
+
+// The UTC date alone: "2026-11-11".
+pub fn iso_date(ms: Int) -> Str {
+    format(ms, "%Y-%m-%d")
+}
+
+// ---------- parsing ----------
+
+fn num_at(bs: List[Int], at: Int, n: Int) -> Option[Int] {
+    if at + n > bs.len() {
+        return None
+    }
+    let mut v = 0
+    let mut k = 0
+    while k < n {
+        let b = bs[at + k]
+        if b < 48 || b > 57 {
+            return None
+        }
+        v = v * 10 + b - 48
+        k = k + 1
+    }
+    Some(v)
+}
+
+fn expect(what: Str, at: Int) -> Result[Int, Str] {
+    Err("time: expected {what} at byte {at}")
+}
+
+// Parse ISO 8601 text into epoch milliseconds. Accepts a date
+// ("2026-11-11", midnight UTC) or a date and time joined by `T` or a space:
+// "2026-11-11T18:22", "2026-11-11T18:22:05", "2026-11-11T18:22:05.123456",
+// followed by `Z`, an offset (+01:00, +0100, +01) or nothing (read as UTC).
+// Fractions finer than a millisecond are dropped.
+pub fn parse_iso(s: Str) -> Result[Int, Str] {
+    let bs = s.trim().bytes()
+    let year = num_at(bs, 0, 4) ?? { return expect("a four-digit year", 0) }
+    if bs.get(4) != Some(45) {
+        return expect("`-`", 4)
+    }
+    let month = num_at(bs, 5, 2) ?? { return expect("a two-digit month", 5) }
+    if bs.get(7) != Some(45) {
+        return expect("`-`", 7)
+    }
+    let day = num_at(bs, 8, 2) ?? { return expect("a two-digit day", 8) }
+    if month < 1 || month > 12 {
+        return Err("time: month {month} is out of range")
+    }
+    if day < 1 || day > days_in_month(year, month) {
+        return Err("time: day {day} is out of range for {year}-{pad(month, 2)}")
+    }
+    let base = date(year, month, day)
+    if bs.len() == 10 {
+        return Ok(base)
+    }
+    let sep = bs[10]
+    if sep != 84 && sep != 116 && sep != 32 {
+        return expect("`T` or end of input", 10)
+    }
+    let hour = num_at(bs, 11, 2) ?? { return expect("a two-digit hour", 11) }
+    if bs.get(13) != Some(58) {
+        return expect("`:`", 13)
+    }
+    let minute = num_at(bs, 14, 2) ?? { return expect("two-digit minutes", 14) }
+    let mut i = 16
+    let mut second = 0
+    let mut ms = 0
+    if bs.get(i) == Some(58) {
+        second = num_at(bs, i + 1, 2) ?? { return expect("two-digit seconds", i + 1) }
+        i = i + 3
+        if bs.get(i) == Some(46) || bs.get(i) == Some(44) {
+            i = i + 1
+            let from = i
+            let mut scale = 100
+            while i < bs.len() && bs[i] >= 48 && bs[i] <= 57 {
+                ms = ms + (bs[i] - 48) * scale
+                scale = scale / 10
+                i = i + 1
+            }
+            if i == from {
+                return expect("digits", from)
+            }
+        }
+    }
+    if hour > 23 || minute > 59 || second > 59 {
+        return Err("time: {pad(hour, 2)}:{pad(minute, 2)}:{pad(second, 2)} is not a valid time")
+    }
+    let local = base + hours(hour) + minutes(minute) + seconds(second) + ms
+    if i == bs.len() {
+        return Ok(local)
+    }
+    let z = bs[i]
+    if (z == 90 || z == 122) && i + 1 == bs.len() {
+        return Ok(local)
+    }
+    if z != 43 && z != 45 {
+        return expect("`Z`, an offset or end of input", i)
+    }
+    let oh = num_at(bs, i + 1, 2) ?? { return expect("a two-digit offset hour", i + 1) }
+    let mut j = i + 3
+    if bs.get(j) == Some(58) {
+        j = j + 1
+    }
+    let om = if j == bs.len() { 0 } else { num_at(bs, j, 2) ?? { return expect("two-digit offset minutes", j) } }
+    if j < bs.len() {
+        j = j + 2
+    }
+    if j != bs.len() {
+        return expect("end of input", j)
+    }
+    if oh > 23 || om > 59 {
+        return Err("time: offset {pad(oh, 2)}:{pad(om, 2)} is out of range")
+    }
+    let off = minutes(oh * 60 + om)
+    Ok(if z == 43 { local - off } else { local + off })
+}

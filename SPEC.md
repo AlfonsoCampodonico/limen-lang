@@ -872,6 +872,34 @@ Number formatting. Fixed decimals are the Float method `x.to_fixed(d)`; this mod
 | `align_left(s, w)`, `align_right(s, w)`, `align_center(s, w)` | `s` padded with spaces to `w` characters for table columns; counts code points, not bytes |
 | `width(s)` | the number of code points in `s` |
 
+### time
+
+Calendar dates and times as pure functions of epoch milliseconds, the number `Clock.now_ms()` returns. Everything is UTC on the proleptic Gregorian calendar, without leap seconds. Fixed offsets from UTC (in minutes, `60` for +01:00) are supported where a function says so; named time zones with daylight saving rules are not, as they need the system's zone database.
+
+| Item | Meaning |
+| --- | --- |
+| `struct DateTime { year, month, day, hour, minute, second, ms, weekday, yday }` | `month` 1-12, `weekday` 1 (Monday) to 7 (Sunday), `yday` 1-366 |
+| `parts(ms)`, `parts_at(ms, offset_minutes)` | the fields of a moment, in UTC or at an offset |
+| `date(year, month, day)`, `from_parts(p)` | epoch milliseconds; out-of-range months, days and times roll over (`date(2024, 13, 1)` is 2025-01-01) |
+| `iso(ms)` | `"2026-11-11T18:22:05.123Z"`; years outside 0-9999 get a sign and six digits |
+| `iso_at(ms, offset_minutes)`, `iso_date(ms)` | `"2026-11-11T19:22:05.123+01:00"`, `"2026-11-11"` |
+| `parse_iso(s) -> Result[Int, Str]` | a date (midnight UTC) or date and time joined by `T` or a space, with optional seconds and fraction, then `Z`, an offset (`+01:00`, `+0100`, `+01`) or nothing (UTC); the error names the byte |
+| `format(ms, layout)`, `format_at(ms, offset_minutes, layout)` | strftime-style: `%Y %m %d %H %M %S`, `%L` milliseconds, `%j` day of year, `%y`, `%I`, `%p`, `%u`, `%a %A %b %B` (English names), `%s` epoch seconds, `%z` (`+0100`), `%Z` (`UTC` or `+01:00`), `%%` |
+| `seconds(n)`, `minutes(n)`, `hours(n)`, `days(n)` | durations in milliseconds: `now + time.days(3)` |
+| `add_months(ms, n)` | same time of day `n` months later, the day clamped to the month's end |
+| `is_leap_year(y)`, `days_in_month(y, m)`, `month_name(m)`, `weekday_name(d)` | |
+
+```
+use time
+
+fn main(root: Root) {
+    let now = root.clock.now_ms()
+    root.stdout.print(time.format(now, "%A %d %B %Y, %H:%M UTC"))
+    let due = time.parse_iso("2026-12-01T09:00+01:00") ?? 0
+    root.stdout.print("{(due - now) / time.days(1)} days left")
+}
+```
+
 ### text
 
 `repeat(s, n)`, `pad_left(s, width, fill)`, `pad_right(s, width, fill)`, `count(s, sub)`, `words(s)`, and byte tests `is_digit(b)`, `is_alpha(b)`, `is_space(b)` for use with `bytes()`.
