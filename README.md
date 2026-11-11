@@ -6,15 +6,15 @@ The full language reference is [SPEC.md](SPEC.md). The compiler is written in OC
 
 ```
 fn main(root: Root) -> Result[(), IoError] {
-    let gh = root.net.only("api.github.com:443")   // narrower capability
+    let gh = root.net.only("api.example.com")   // narrower capability
     let names = fetch_repos(gh, "rust-lang")?
     root.stdout.print("{names.len()} repos")
     Ok(())
 }
 
 fn fetch_repos(net: Net, org: Str) -> Result[List[Str], IoError] {
-    let body = net.get("https://api.github.com/orgs/{org}/repos")?
-    Ok(parse_names(body))
+    let resp = net.get("http://api.example.com/orgs/{org}/repos")?
+    Ok(parse_names(resp.body))
 }
 
 // No capability parameters: this function cannot do I/O.
@@ -23,7 +23,7 @@ fn parse_names(body: Str) -> List[Str] { ... }
 
 ## Build and run
 
-Needs OCaml 5 and dune (`brew install ocaml dune`), plus a C compiler (`cc`, or set `CC`) for the native backend. `curl` is used for `Net.get`.
+Needs OCaml 5 and dune (`brew install ocaml dune`), plus a C compiler (`cc`, or set `CC`) for the native backend. Nothing else: `Net.get` speaks HTTP/1.1 itself (plain http only, no TLS yet).
 
 ```bash
 dune build
@@ -45,12 +45,12 @@ dune exec vela -- build examples/repos.vela -o repos && ./repos --grant net=api.
 
 | Command | What it does |
 | --- | --- |
-| `vela run FILE [--native] [--grant net=HOST[:PORT]\|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST[:PORT]]... [--grant env=NAME\|*]... [--seed N] [-- ARGS...]` | Type-check, then run `main` in the interpreter, or compiled with `--native`. Stdout, Stdin, Clock and Rand are always granted; Net, Fs, Listen and Env only when granted. `--seed` makes `Rand` repeatable; arguments after `--` are `root.args()`. |
+| `vela run FILE [--native] [--grant net=HOST[:PORT]\|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST[:PORT]]... [--grant env=NAME\|*]... [--grant exec=PROGRAM\|*]... [--seed N] [-- ARGS...]` | Type-check, then run `main` in the interpreter, or compiled with `--native`. Stdout, Stdin, Clock and Rand are always granted; Net, Fs, Listen, Env and Exec only when granted. `--seed` makes `Rand` repeatable; arguments after `--` are `root.args()`. The exit status is 0, 1 after a panic or an `Err` from `main`, or the `Int` that `main` returns. |
 | `vela build FILE [-o OUT] [--emit-c]` | Compile to a native binary through C. The binary takes the same `--grant` flags. `--emit-c` writes the C instead. |
 | `vela check FILE [--json]` | Type-check only. `--json` emits diagnostics with codes, spans, notes and machine-applicable fixes. |
 | `vela caps FILE [--json]` | List each function's authority: the capabilities in its signature, or `pure`. |
 | `vela explain CODE` | Explain an error code, for example `vela explain E0302`. |
-| `vela test FILE [--native]` | Run the file's `test "name" { ... }` blocks, each isolated. |
+| `vela test FILE [--native]` | Run the file's `test "name" { ... }` blocks, each isolated. A test that declares `(fs: Fs)` gets a fresh temporary directory. |
 | `vela fmt FILE... [--write\|--check]` | Print the canonical formatting, rewrite files, or check them. |
 | `vela lsp` | Language server on stdin/stdout. |
 | `vela mcp` | MCP server for coding agents on stdin/stdout. |
@@ -69,7 +69,7 @@ dune exec vela -- build examples/repos.vela -o repos && ./repos --grant net=api.
   Positions count bytes, which is exact for ASCII source.
 - **Grammar ([grammar/vela.gbnf](grammar/vela.gbnf)):** in llama.cpp's GBNF format, for constrained decoding. It accepts every example, benchmark and test-suite program, and rejects the hand-written invalid cases. It is slightly more permissive than the parser: keywords aren't excluded from identifiers. It requires a space after keywords (`if x {`), which is the canonical style.
 - **Formatter (`vela fmt`):** keeps comments, number and string spellings, and the author's line breaks in lists and argument lists. The test suite formats every program and checks that the tree is unchanged, a second pass changes nothing, and no comment is lost.
-- **Tests (`vela test`):** `test "name" { assert_eq(...) }` blocks. They get no `root`, so they cannot do I/O. Each runs isolated in the interpreter, or as its own process with `--native`.
+- **Tests (`vela test`):** `test "name" { assert_eq(...) }` blocks. They get no `root`; a test can declare `(fs: Fs, clock: Clock)` to get a fresh temporary directory, removed afterwards, and the real clock, and nothing else. Each runs isolated in the interpreter, or as its own process with `--native`.
 - **MCP server (`vela mcp`):** tools to check, run, test, format, read a type, list capabilities, explain an error, and read the spec. `vela_run` gives the program no grants, so code an agent just wrote can print but cannot touch files or the network, and it stops at a time limit.
 - **Checking the grammar:** `python3 grammar/gbnf_check.py` checks files against it with an Earley recognizer that follows llama.cpp's grammar syntax and acceptance rule. `grammar/check-suite.sh` runs it over every program in the test suite.
 

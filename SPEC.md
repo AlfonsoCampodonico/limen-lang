@@ -8,15 +8,15 @@ Vela code can only touch the outside world through **capabilities**: values that
 
 ```
 fn main(root: Root) -> Result[(), IoError] {
-    let gh = root.net.only("api.github.com")   // narrower capability
+    let gh = root.net.only("api.example.com")   // narrower capability
     let names = fetch_repos(gh, "rust-lang")?
     root.stdout.print("{names.len()} repos")
     Ok(())
 }
 
 fn fetch_repos(net: Net, org: Str) -> Result[List[Str], IoError] {
-    let body = net.get("https://api.github.com/orgs/{org}/repos")?
-    Ok(parse_names(body))
+    let resp = net.get("http://api.example.com/orgs/{org}/repos")?
+    Ok(parse_names(resp.body))
 }
 
 fn parse_names(body: Str) -> List[Str] {   // no capabilities: cannot do I/O
@@ -65,9 +65,11 @@ Statements are separated by a newline or `;`. Two statements on one line without
 | `Option[T]` | `Some(T)`, `None` | From the prelude. |
 | `Result[T, E]` | `Ok(T)`, `Err(E)` | From the prelude. |
 | `IoError` | `Denied(Str)`, `Failed(Str)` | Error type of every capability operation. |
+| `HttpResponse` | `{ status: Int, headers: Map[Str, Str], body: Str }` | From the prelude; returned by `Net.get`. |
+| `ProcessOutput` | `{ code: Int, stdout: Str, stderr: Str }` | From the prelude; returned by `Exec.run`. |
 | `fn(A, B) -> R` | functions and closures | |
 | `Chan[T]` | a channel between tasks | Created with `channel(capacity)` (section 10). |
-| `Root`, `Net`, `Fs`, `Stdout`, `Clock`, `Listen`, `Listener`, `Conn` | capabilities | Cannot be created by programs (section 9). |
+| `Root`, `Net`, `Fs`, `Stdout`, `Clock`, `Listen`, `Listener`, `Conn`, `Rand`, `Stdin`, `Env`, `Exec` | capabilities | Cannot be created by programs (section 9). |
 | user `struct` and `enum` | | Optionally generic (section 4). |
 
 There is no character type: use one-byte strings (`s.split("")`) or bytes (`s.bytes()`), see section 11. There is no range syntax; count with `while` and a `mut` counter, or use `list.range(lo, hi)` from the standard library.
@@ -229,11 +231,26 @@ for s in shapes {
 
 ```
 fn main(root: Root)
+fn main(root: Root) -> Int
 fn main(root: Root) -> Result[(), E]
+fn main(root: Root) -> Result[Int, E]
 fn main()
 ```
 
-If `main` returns `Err(e)`, the program prints `error: <e>` to stderr and exits with status 1.
+`root` may be left out of any of them. When `main` returns, the program exits with status 0, or with the `Int` it returned (directly or as `Ok(n)`). The operating system keeps only the low 8 bits, so use 0 to 255: `-> Int { 256 + 7 }` exits with 7. If `main` returns `Err(e)`, the program prints `error: <e>` to stderr and exits with status 1.
+
+```
+fn main(root: Root) -> Int {
+    let bad = check(root.stdin.read_all())
+    if bad > 0 {
+        root.stdout.print("{bad} problems")
+        return 2
+    }
+    0
+}
+```
+
+There is no `exit` function: the exit code is what `main` returns, so groups finish, everything is freed, and no function deep in the program can end it.
 
 ## 5. Expressions
 
@@ -358,7 +375,7 @@ The native backend implements this with reference counting and copy-on-write. A 
 
 ## 9. Capabilities
 
-`Root` has eight fields, each a capability, and one method:
+`Root` has nine fields, each a capability, and one method:
 
 | Field | Type | Granted |
 | --- | --- | --- |
@@ -370,19 +387,21 @@ The native backend implements this with reference counting and copy-on-write. A 
 | `root.net` | `Net` | only with `--grant net=HOST[:PORT]` (repeatable) or `--grant net=*` |
 | `root.fs` | `Fs` | only with `--grant fs=DIR` or `--grant fs=DIR:ro` |
 | `root.listen` | `Listen` | only with `--grant listen=HOST[:PORT]` (repeatable) |
+| `root.exec` | `Exec` | only with `--grant exec=PROGRAM` (repeatable) or `--grant exec=*` |
 
 `root.args()` is the `List[Str]` of command-line arguments after `--`: `vela run app.vela -- a b`.
 
-An ungranted `Net`, `Fs` or `Listen` still exists, but every operation on it returns `Err(Denied(...))`. `Listener` and `Conn` are capabilities too: you get them from `Listen.on`, `Listener.accept` and `Net.connect`.
+An ungranted `Net`, `Fs`, `Listen` or `Exec` still exists, but every operation on it returns `Err(Denied(...))`. `Listener` and `Conn` are capabilities too: you get them from `Listen.on`, `Listener.accept` and `Net.connect`.
 
 The rules:
 
 1. Programs cannot create capabilities. They come only from `root`.
-2. Attenuation only narrows. `net.only(host)` returns a `Net` limited to that host, and it is empty if you didn't hold that host. `fs.under(dir)` limits to a subdirectory; `fs.read_only()` removes writing.
+2. Attenuation only narrows. `net.only(host)` returns a `Net` limited to that host, and it is empty if you didn't hold that host. `fs.under(dir)` limits to a subdirectory; `fs.read_only()` removes writing. `exec.only(program)` limits `Exec` to one program.
 3. There is no ambient I/O. Using `print`, `open`, `fetch` and similar names is error E0302, which explains the capability to use instead.
 4. A function whose parameters contain no capability and no function type is **pure**: it can only compute (and panic). `vela caps FILE` lists each function's authority.
 5. Enforcement at runtime:
-   - `Net`: http and https only, host allowlist, redirects not followed. `Net.connect` uses the same allowlist.
+   - `Net`: http URLs only for now, host allowlist, redirects not followed. `Net.connect` uses the same allowlist.
+   - `Exec`: the program name must match a grant exactly (`git` and `/usr/bin/git` are different grants), or the grant is `*`. Arguments are passed as a list, never through a shell. The child gets `/dev/null` as stdin, the working directory, `PATH`, and only the environment variables granted with `--grant env=`. A program name without `/` is looked up in `PATH`, as a shell would. Granting a program grants everything that program can do with any arguments, so `exec=sh` is as good as every other grant.
    - `Listen`: binding is allowed only for granted `host` or `host:port` entries.
    - `Fs`: paths are relative to the granted directory; absolute paths, `..` escapes and symlinks pointing outside are refused.
 
@@ -486,6 +505,35 @@ fn main(root: Root) -> Result[(), IoError] {
 - `Conn.read()` waits for data and returns what arrived; `""` means the peer closed. `Conn.write(s)` sends all of `s`. Both return `Result`.
 - `close()` on a `Listener` or `Conn` makes any task waiting on it get `Err(Failed("... is closed"))`.
 - Use one task at a time to read a given connection (and one to write it).
+
+### Running programs
+
+```
+fn main(root: Root) -> Result[Int, IoError] {
+    let r = root.exec.run("git", ["status", "--short"])?    // --grant exec=git
+    root.stdout.write(r.stdout)
+    Ok(r.code)
+}
+```
+
+- `Exec.run(program, args)` runs `program` with the list `args`, waits for it to finish, and returns `Ok(ProcessOutput { code, stdout, stderr })` with its exit status and everything it wrote. A child killed by signal N has code 128 + N.
+- It is `Err(Denied(...))` if the program is not granted, and `Err(Failed(...))` if it cannot be started (for example, not found). A non-zero exit status is not an error; check `code`.
+- Waiting for the child parks only the calling task, so a group can run several programs at once.
+
+### HTTP
+
+```
+let resp = net.get("http://127.0.0.1:8080/status")?
+if resp.status == 200 {
+    out.print(resp.headers.get("content-type") ?? "no type")
+    out.print(resp.body)
+}
+```
+
+- `Net.get(url)` sends one HTTP/1.1 `GET` (with `Host`, `User-Agent: vela`, `Accept: */*` and `Connection: close`), reads until the server closes, and returns `HttpResponse { status, headers, body }`.
+- Every status is `Ok`, including 404 and 500; redirects are returned, not followed. `Err(Failed(...))` means the server could not be reached or the response was not valid HTTP; responses over 64 MiB are refused.
+- `headers` is a `Map[Str, Str]` with lowercased names, in the order they arrived; a repeated header's values are joined with `", "`. The body is decoded from chunked transfer encoding or cut to `Content-Length`.
+- `https://` URLs are checked against the grant like any other, then fail with `Failed("https is not supported yet ...")`: there is no TLS yet. There is no timeout yet either. For other methods, request headers or bodies, use `http.request` from the `http` module, which works over `Net.connect`.
 
 ## 11. Built-in methods
 
@@ -594,9 +642,11 @@ Strings compare byte by byte, so `c >= "a" && c <= "z"` tests a one-byte string.
 | `Stdin` | `read_line()` | `Option[Str]`, without the newline; `None` at the end of input |
 | `Stdin` | `read_all()` | `Str`, the rest of the input |
 | `Env` | `get(name)` | `Option[Str]`; `None` if unset or not granted |
-| `Net` | `get(url)` | `Result[Str, IoError]`, the response body; a non-2xx status is `Failed` |
+| `Net` | `get(url)` | `Result[HttpResponse, IoError]`: `status`, `headers` (`Map[Str, Str]`, lowercased names), `body`; http only (section 10) |
 | `Net` | `only(host)` | `Net`; `host` is `name`, `name:port` or `*` |
 | `Net` | `connect(addr)` | `Result[Conn, IoError]`; `addr` is `host:port` |
+| `Exec` | `run(program, args)` | `Result[ProcessOutput, IoError]`: `code`, `stdout`, `stderr` (section 10) |
+| `Exec` | `only(program)` | `Exec`; `program` is a name or `*` |
 | `Listen` | `on(addr)` | `Result[Listener, IoError]` |
 | `Listener` | `accept()` | `Result[Conn, IoError]` |
 | `Listener` | `port()` | `Int` |
@@ -623,7 +673,15 @@ test "adds small numbers" {
 }
 ```
 
-- `test "name" { ... }` is a top-level item. Tests take no arguments and get no `root`, so they cannot do I/O; they can use groups and channels.
+- `test "name" { ... }` is a top-level item. Tests get no `root`, so by default they cannot do I/O; they can use groups and channels, and fakes through interfaces.
+- A test can ask the runner for two real capabilities, by declaring them like parameters: `fs: Fs` is a fresh, empty, writable temporary directory, removed when the test ends, and `clock: Clock` is the real clock. Each at most once; anything else is E0306.
+
+```
+test "saves the config" (fs: Fs) {
+    assert(save(fs, "app.conf", 3).is_ok())
+    assert_eq(fs.read("app.conf"), Ok("3"))
+}
+```
 - `vela test FILE` runs every test, each isolated, and prints `ok` or `FAIL` with the panic message and location; it exits with status 1 if any test fails. `--native` runs them as native code.
 - Test names must be unique (E0106). Tests are type-checked by `vela check` and ignored by `vela run` and `vela build`.
 
@@ -681,6 +739,7 @@ Every diagnostic has a stable code. `vela explain CODE` prints its explanation, 
 | E0303 | bad `main` signature |
 | E0304 | function stored in a field |
 | E0305 | channel stored in a field |
+| E0306 | a test parameter that is not `fs: Fs` or `clock: Clock` |
 | E0310 | misuse of a group handle |
 | E0311 | `return` or `?` leaving a group |
 | E0320 | a dependency takes a capability vela.toml does not grant it |

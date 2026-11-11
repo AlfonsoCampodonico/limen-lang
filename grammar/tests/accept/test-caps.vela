@@ -1,0 +1,20 @@
+fn save(fs: Fs, n: Int) -> Result[(), IoError] {
+    fs.write("n.txt", "{n}")
+}
+
+test "saves" (fs: Fs) {
+    assert(save(fs, 3).is_ok())
+}
+
+test "clock and dir" (fs: Fs, clock: Clock,) {
+    assert(clock.now_ms() > 0)
+}
+
+test "empty list" () {
+    assert(true)
+}
+
+fn main(root: Root) -> Int {
+    root.stdout.print("bye")
+    3
+}
