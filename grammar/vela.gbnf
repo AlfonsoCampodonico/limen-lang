@@ -63,7 +63,7 @@ expr    ::= unary (sp binop ws unary)*
 binop   ::= "??" | "||" | "&&" | "==" | "!=" | "<=" | ">=" | "<" | ">" | "..<" | "+" | "-" | "*" | "/" | "%"
 unary   ::= ("-" | "!") sp unary | postfix
 postfix ::= primary suffix*
-suffix  ::= sp "(" ws args? ws ")" | sp "[" ws expr ws "]" | ws "." sp ident | "." [0-9]+ | sp "?"
+suffix  ::= sp "(" ws args? ws ")" (sp tclosure)? | sp tclosure | sp "[" ws expr ws "]" | ws "." sp ident | "." [0-9]+ | sp "?"
 args    ::= arg (isep arg)* (ws ",")?
 exprs   ::= expr (isep expr)* (ws ",")?
 # a named argument: `retries: 3`
@@ -79,6 +79,9 @@ selarm    ::= (ident sp "=" ws expr | expr) (sp1 "if" sp1 expr)? sp "=>" ws expr
 arm       ::= pattern sp "=>" ws expr
 closure   ::= "|" ws (cparam (isep cparam)* ws)? "|" ws expr | "||" ws expr
 cparam    ::= ident (sp ":" sp type)?
+# a trailing closure, `f(a) { |x| ... }`; the grammar does not keep it out
+# of `if`/`while`/`for`/`match` heads as the parser does
+tclosure  ::= "{" ws ("|" ws (cparam (isep cparam)* ws)? "|" ws | "||" ws)? (stmt (stsep stmt)* (sp ";")?)? ws "}"
 group     ::= "group" sp1 ident (sp1 "until" sp1 expr)? sp block
 
 pattern ::= "-"? int | plainstr | ident ("." ident)? (sp "(" ws pattern (isep pattern)* (ws ",")? ws ")")? | tpat

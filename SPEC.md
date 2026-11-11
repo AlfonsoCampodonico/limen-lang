@@ -313,6 +313,25 @@ Both operands must have the same type. The **ordered** types are `Int`, `Float`,
 
 `|x, y: Int| expr` or `|| expr`. Parameter types are optional when the context gives them (`xs.map(|x| x + 1)`). A closure captures the variables it uses **by value**, when it is created, and it cannot assign to them (E0205). Inside a closure, `return` and `?` leave the closure, not the enclosing function.
 
+**Trailing closures.** A block written right after a call's parentheses, on the same line, is a closure passed as the last argument. Its parameters, if any, come first inside the braces:
+
+```
+let big = xs.filter { |x| x > 10 }        // xs.filter(|x| x > 10)
+each(rows) { |row|                        // each(rows, |row| { ... })
+    out.print(row.name)
+}
+let r = catch { risky() }                 // catch(|| { risky() })
+group g {
+    g.go { fetch(net, url) }              // g.go(|| { fetch(net, url) })
+}
+```
+
+- With no other arguments the parentheses can go: `catch { ... }`, `xs.map { |x| x * 2 }`. After a plain name, only a lowercase one: `Point { x: 1 }` is still a struct literal.
+- The closure is always the last argument, after named ones too: `retry(times: 3) { |n| attempt(n) }` (a closure written last after named arguments fills the last parameter).
+- **Not in a condition.** In the head of `if`, `while`, `for` and `match` (and a group's `until`), `{` starts the body, as with struct literals, so a trailing closure there is error E0003. Pass the closure in the parentheses, `if xs.filter(|x| x > 1).len() > 0 {`, or wrap the whole condition in parentheses.
+- It is the same closure as `|x| { ... }`: same types, same captures. `vela fmt` keeps whichever form was written (and drops the empty `()` in `f() { ... }`).
+- There is one trailing closure per call; `f(a) { ... } { ... }` is not two.
+
 ### The `?` operator
 
 On a `Result[T, E]`, `e?` evaluates to the `Ok` value or returns `Err(e)` from the enclosing function, which must return `Result[_, E]` with the same `E` (E0202). Convert errors with `.map_err(|e| ...)`. On an `Option[T]`, `?` returns `None` from a function returning `Option`.
@@ -335,7 +354,7 @@ server.describe(prefix: "to", upper: true)
 - Positional arguments come first, then named ones in any order. A named argument is `name: expr`, with the parameter's name as declared.
 - Every parameter is passed exactly once. Labels only say which is which: Vela has no default values, so leaving one out is still E0107.
 - They work for functions and methods declared with `fn`, generic ones included, for methods called through an interface bound or a `dyn` value (the names are the interface's), and for functions of other modules. They do not work where the callee has no parameter names: closures and other function values (a type like `fn(Int) -> Int` has none), enum variants, built-in methods and functions, and foreign functions. A label there is E0115, with a fix that removes it.
-- An unknown name, a parameter passed twice, and a positional argument after a named one are E0115. When the right name is clear (one unknown label and one parameter left over, or a positional argument where one parameter is missing) the error carries a fix.
+- An unknown name, a parameter passed twice, and a positional argument after a named one are E0115 (except a closure written last, which fills the last parameter: that is how a trailing closure combines with labels). When the right name is clear (one unknown label and one parameter left over, or a positional argument where one parameter is missing) the error carries a fix.
 - The arguments run in the order they are written, not in the parameter order, so `connect(retries: next(), port: other())` calls `next` first. Renaming a parameter changes the labels callers can use: it is part of the function's interface, like its types.
 
 ## 6. Statements
@@ -1002,7 +1021,9 @@ stmt       = "let" [ "mut" ] IDENT [ ":" type ] "=" expr
 expr       = unary { BINOP unary } ;            (* precedence: section 5 *)
 expr_ns    = expr ;                             (* no struct literal at the top level *)
 unary      = ( "-" | "!" ) unary | postfix ;
-postfix    = primary { "(" [ args ] ")" | "[" expr "]" | "." IDENT [ "(" [ args ] ")" ] | "." INT | "?" } ;
+postfix    = primary { "(" [ args ] ")" [ trailing ] | trailing | "[" expr "]" | "." IDENT [ "(" [ args ] ")" ] [ trailing ] | "." INT | "?" } ;
+trailing   = "{" [ "|" [ cparam { "," cparam } ] "|" ] { stmt ( NL | ";" ) } [ expr ] "}" ;
+                                                (* same line; not in expr_ns; bare only after a lowercase name or method *)
 args       = arg { sep arg } [ "," ] ;
 arg        = [ IDENT ":" ] expr ;                 (* a named argument *)
 primary    = INT | FLOAT | STRING | "true" | "false"

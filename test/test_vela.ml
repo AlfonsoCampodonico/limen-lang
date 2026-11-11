@@ -22,7 +22,7 @@ let ok name cond msg =
    dir/reject (lexer or parser error), for checking grammar/vela.gbnf. *)
 (* Rejected by the parser but within the grammar's documented superset
    (keywords are not excluded from identifiers). *)
-let grammar_superset = [ "tuple-let-refutable"; "select-bad-arm"; "group-until-bad" ]
+let grammar_superset = [ "tuple-let-refutable"; "select-bad-arm"; "group-until-bad"; "trailing-in-if"; "trailing-in-while"; "trailing-in-for"; "trailing-in-match" ]
 
 let dump name src parsed =
   match Sys.getenv_opt "VELA_DUMP_DIR" with
@@ -2603,13 +2603,74 @@ fn main(root: Root) -> Result[(), IoError] {
       ("fix-named-positional", named "    out.print(connect(port: 1, \"h\", retries: 2))");
       ("fix-named-value", named "    let f = |x: Int| x\n    out.print(\"{f(x: 1)}\")") ];
 
+  (* ---------- trailing closures ---------- *)
+  let trail_prelude =
+    "fn each_twice(xs: List[Int], f: fn(Int) -> ()) {\n\
+    \    for x in xs {\n\
+    \        f(x)\n\
+    \        f(x)\n\
+    \    }\n\
+     }\n\
+     fn apply(n: Int, times: Int, f: fn(Int) -> Int) -> Int {\n\
+    \    let mut v = n\n\
+    \    for i in 0..<times {\n\
+    \        v = f(v)\n\
+    \    }\n\
+    \    v\n\
+     }\n\
+     struct P { x: Int }\n"
+  in
+  let trail body = trail_prelude ^ main_wrap body in
+  out "trailing-closures"
+    (trail
+       "    let xs = [1, 2, 3]\n\
+       \    out.print(\"{xs.filter { |x| x > 1 }.map { |x| x * 10 }}\")\n\
+       \    each_twice([7]) { |x|\n\
+       \        out.print(\"{x}\")\n\
+       \    }\n\
+       \    out.print(\"{apply(1, times: 3) { |v| v * 2 }}\")\n\
+       \    out.print(\"{apply(f: |v| v + 1, n: 1, times: 2)}\")\n\
+       \    let r = catch { panic(\"boom\") }\n\
+       \    let ok = catch { 5 }\n\
+       \    out.print(\"{r} {ok}\")\n\
+       \    out.print(\"{xs.fold(0) { |a: Int, b: Int| a + b }}\")\n\
+       \    if (xs.filter { |x| x > 2 }.len() > 0) {\n\
+       \        out.print(\"in parens\")\n\
+       \    }\n\
+       \    let p = P { x: 1 }\n\
+       \    if p.x == 1 {\n\
+       \        out.print(\"struct still fine\")\n\
+       \    }\n\
+       \    let rs = group g {\n\
+       \        g.go { out.print(\"side\") }\n\
+       \        g.go { 41 + 1 }\n\
+       \    }\n\
+       \    out.print(\"{rs}\")")
+    "[20, 30]\n7\n7\n8\n3\nErr(\"boom\") Ok(5)\n6\nin parens\nstruct still fine\nside\n[42]\n";
+  errs "trailing-in-if" (trail "    let xs = [1]\n    if xs.filter { |x| x > 1 }.len() > 0 {\n        out.print(\"no\")\n    }") [ "E0003" ];
+  errs "trailing-in-while" (trail "    let xs = [1]\n    while xs.map { |x| x }.len() > 9 {\n    }") [ "E0003" ];
+  errs "trailing-in-for" (trail "    let xs = [1]\n    for y in xs.map { |x| x } {\n    }") [ "E0003" ];
+  errs "trailing-in-match" (trail "    let xs = [1]\n    match xs.map { |x| x }.len() {\n        _ => out.print(\"no\"),\n    }") [ "E0003" ];
+  errs "trailing-extra-arg" (trail "    let k = [1].map(|x| x) { |x| x }") [ "E0107" ];
+  errs "trailing-not-closure-param" (trail "    let k = [1].len { 1 }") [ "E0107" ];
+  errs "trailing-after-labels-fills-last" (trail "    let n = apply(times: 1, n: 2) { |v| v }\n    let m = apply(times: 1, |v| v, n: 2)") [ "E0115" ];
+  (* fmt keeps the form written; empty parentheses before a trailing closure go *)
+  let fmt_case_early name src want =
+    let got = try Fmt.format ~file:(name ^ ".vela") src with Diag.Fatal d -> "error: " ^ d.message in
+    ok name (got = want) (sprintf "got:\n%s\nwant:\n%s" got want);
+    check_fmt name src ()
+  in
+  fmt_case_early "fmt-trailing"
+    "fn main(root: Root) {\n    let xs = [1, 2]\n    let ys = xs.map() { |x| x * 2 }\n    let r = catch() {\n        let a = 1\n        a + 1\n    }\n    let zs = xs.map(|x| { x + 1 })\n    if (xs.map { |x| x }.len() > 0) {\n        root.stdout.print(\"{ys} {r} {zs}\")\n    }\n}\n"
+    "fn main(root: Root) {\n    let xs = [1, 2]\n    let ys = xs.map { |x| x * 2 }\n    let r = catch {\n        let a = 1\n        a + 1\n    }\n    let zs = xs.map(|x| { x + 1 })\n    if (xs.map { |x| x }.len() > 0) {\n        root.stdout.print(\"{ys} {r} {zs}\")\n    }\n}\n";
+
   (* ---------- 64-bit Int, identical in both backends ---------- *)
   out "int64" "fn main(root: Root) {\n    let out = root.stdout\n    let max = 9223372036854775807\n    let min = -max - 1\n    out.print(\"{max} {min} {max + 1} {min - 1} {max * 2} {min / -1} {min % -1}\")\n    out.print(\"{min.abs()} {(-7) / 2} {(-7) % 2} {7 % -2}\")\n    out.print(\"{4611686018427387904 * 2} {3037000500 * 3037000500}\")\n    out.print(\"{1.0e19.to_int()} {(-1.0e19).to_int()} {9.0e18.to_int()} {(0.0 / 0.0).to_int()}\")\n    out.print(\"{\"9223372036854775807\".parse_int()} {\"-9223372036854775808\".parse_int()} {\"9223372036854775808\".parse_int()}\")\n    out.print(\"{max.to_float()} {[1, 2, 3].get(max)} {\"abc\".slice(-max, max)} {[max, max].sum()}\")\n    match max {\n        9223372036854775807 => out.print(\"matched max\"),\n        _ => out.print(\"no\"),\n    }\n}\n"
     "9223372036854775807 -9223372036854775808 -9223372036854775808 9223372036854775807 -2 -9223372036854775808 0\n-9223372036854775808 -3 -1 1\n-9223372036854775808 -9223372036709301616\n9223372036854775807 -9223372036854775808 9000000000000000000 0\nSome(9223372036854775807) Some(-9223372036854775808) None\n9.22337203685478e+18 None abc -2\nmatched max\n";
   errs "int-literal-too-large" (main_wrap "    let x = 9223372036854775808") [ "E0005" ];
 
   (* ---------- select ---------- *)
-  exits "example-tour" (example "tour.vela") "-- language\ncircle 12.57\n[2.25, 12.56636]\n[0, 1, 4, 9, 16] [\"h\", \"o\", \"l\", \"a\"]\nbound method 3.142\nVELA!\n{Point { x: 0, y: 0 }: [\"origin\", \"home\"]} {(1, 2): 2}\n[(1, \"a\"), (1, \"z\"), (2, \"b\")]\n3 bytes: hi!\n..tour\n-- concurrency\na side task ran\nresults [1, 2]\nwith a deadline [Some(1), None]\nnobody sent anything\n" 3;
+  exits "example-tour" (example "tour.vela") "-- language\ncircle 12.57\n[2.25, 12.56636]\n[0, 1, 4, 9, 16] [\"h\", \"o\", \"l\", \"a\"]\nbound method 3.142\nVELA!\n{Point { x: 0, y: 0 }: [\"origin\", \"home\"]} {(1, 2): 2}\n[(1, \"a\"), (1, \"z\"), (2, \"b\")]\n3 bytes: hi!\n..tour\n[10, 20, 30] Err(\"oops\")\n-- concurrency\na side task ran\nresults [1, 2]\nwith a deadline [Some(1), None]\nnobody sent anything\n" 3;
   out "select" (example "select.vela") "nums done; words done; total 15 letters 3\nnothing ready | sent to c | sent to d | d Some(10)\nafter close: Some(7)\nErr(\"every arm of this `select` is turned off by its guard\")\n";
   out "select-stress" "fn produce(c: Chan[Int], n: Int) -> Int {\n    let mut i = 0\n    while i < n {\n        c.send(i)\n        i = i + 1\n    }\n    c.close()\n    0\n}\n\n// receive from all four until every one is closed\nfn consume(a: Chan[Int], b: Chan[Int], c: Chan[Int], d: Chan[Int]) -> Int {\n    let mut sum = 0\n    let mut on = [true, true, true, true]\n    while on[0] || on[1] || on[2] || on[3] {\n        select {\n            v = a.recv() if on[0] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[0] = false\n                },\n            },\n            v = b.recv() if on[1] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[1] = false\n                },\n            },\n            v = c.recv() if on[2] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[2] = false\n                },\n            },\n            v = d.recv() if on[3] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[3] = false\n                },\n            },\n        }\n    }\n    sum\n}\n\nfn drain(c: Chan[Str]) -> Int {\n    let mut n = 0\n    let mut more = true\n    while more {\n        match c.recv() {\n            Some(s) => {\n                n = n + s.len()\n            },\n            None => {\n                more = false\n            },\n        }\n    }\n    n\n}\n\nfn main(root: Root) {\n    let a: Chan[Int] = channel(1)\n    let b: Chan[Int] = channel(1)\n    let c: Chan[Int] = channel(2)\n    let d: Chan[Int] = channel(1)\n    let sums = group g {\n        g.go(|| produce(a, 500))\n        g.go(|| produce(b, 500))\n        g.go(|| produce(c, 500))\n        g.go(|| produce(d, 500))\n        g.go(|| consume(a, b, c, d))\n        g.go(|| consume(a, b, c, d))\n        g.go(|| consume(a, b, c, d))\n    }\n    root.stdout.print(\"{sums.sum()}\")\n    // select between two sends: a dispatcher feeding two workers\n    let w1: Chan[Str] = channel(1)\n    let w2: Chan[Str] = channel(1)\n    let parts = group g {\n        g.go(|| {\n                let mut i = 0\n                while i < 1000 {\n                    let msg = \"m{i}\"\n                    select {\n                        w1.send(msg) => (),\n                        w2.send(msg) => (),\n                    }\n                    i = i + 1\n                }\n                w1.close()\n                w2.close()\n                0\n            })\n        g.go(|| drain(w1))\n        g.go(|| drain(w2))\n    }\n    root.stdout.print(\"{parts.sum()}\")\n}\n" "499000\n3890\n";
   check_tsan "select-stress-tsan" "fn produce(c: Chan[Int], n: Int) -> Int {\n    let mut i = 0\n    while i < n {\n        c.send(i)\n        i = i + 1\n    }\n    c.close()\n    0\n}\n\n// receive from all four until every one is closed\nfn consume(a: Chan[Int], b: Chan[Int], c: Chan[Int], d: Chan[Int]) -> Int {\n    let mut sum = 0\n    let mut on = [true, true, true, true]\n    while on[0] || on[1] || on[2] || on[3] {\n        select {\n            v = a.recv() if on[0] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[0] = false\n                },\n            },\n            v = b.recv() if on[1] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[1] = false\n                },\n            },\n            v = c.recv() if on[2] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[2] = false\n                },\n            },\n            v = d.recv() if on[3] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[3] = false\n                },\n            },\n        }\n    }\n    sum\n}\n\nfn drain(c: Chan[Str]) -> Int {\n    let mut n = 0\n    let mut more = true\n    while more {\n        match c.recv() {\n            Some(s) => {\n                n = n + s.len()\n            },\n            None => {\n                more = false\n            },\n        }\n    }\n    n\n}\n\nfn main(root: Root) {\n    let a: Chan[Int] = channel(1)\n    let b: Chan[Int] = channel(1)\n    let c: Chan[Int] = channel(2)\n    let d: Chan[Int] = channel(1)\n    let sums = group g {\n        g.go(|| produce(a, 500))\n        g.go(|| produce(b, 500))\n        g.go(|| produce(c, 500))\n        g.go(|| produce(d, 500))\n        g.go(|| consume(a, b, c, d))\n        g.go(|| consume(a, b, c, d))\n        g.go(|| consume(a, b, c, d))\n    }\n    root.stdout.print(\"{sums.sum()}\")\n    // select between two sends: a dispatcher feeding two workers\n    let w1: Chan[Str] = channel(1)\n    let w2: Chan[Str] = channel(1)\n    let parts = group g {\n        g.go(|| {\n                let mut i = 0\n                while i < 1000 {\n                    let msg = \"m{i}\"\n                    select {\n                        w1.send(msg) => (),\n                        w2.send(msg) => (),\n                    }\n                    i = i + 1\n                }\n                w1.close()\n                w2.close()\n                0\n            })\n        g.go(|| drain(w1))\n        g.go(|| drain(w2))\n    }\n    root.stdout.print(\"{parts.sum()}\")\n}\n" "499000\n3890\n";

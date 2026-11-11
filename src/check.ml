@@ -655,7 +655,8 @@ and check_args ctx f args = List.iter (fun a -> ignore (check_expr ctx f (unlabe
 
 (* Named arguments, `connect(host, retries: 3)`: positional arguments first,
    then named ones in any order, every parameter passed exactly once (there
-   are no default values). Returns
+   are no default values). A closure written last, after named arguments,
+   fills the last parameter: that is where a trailing closure goes. Returns
    the arguments in parameter order without their labels, or None after
    reporting what is wrong. [names] are the callee's parameter names, or why
    it has none. *)
@@ -691,6 +692,7 @@ and order_args ctx ~what ~sp names args =
                 err ctx "E0115" lsp (sprintf "parameter `%s` is passed twice" l)
                   ~notes:[ "positional arguments fill the parameters in order, before the named ones" ]
               | None -> slots.(j) <- Some v))
+          | EClosure _ when !named_seen && i = total - 1 && n > 0 && slots.(n - 1) = None -> slots.(n - 1) <- Some a
           | _ when !named_seen -> misplaced := a :: !misplaced
           | _ -> if i < n then slots.(i) <- Some a else incr extra)
         args;
