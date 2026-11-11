@@ -283,8 +283,16 @@ and expr_inner c ind e =
         ("|" ^ String.concat ", " (List.map (fun (n, t, _) -> match t with Some t -> n ^ ": " ^ ty t | None -> n) ps) ^ "|");
     add c " ";
     expr c ind body
-  | EGroup (name, b) ->
+  | EGroup (name, until, b) ->
     add c ("group " ^ name ^ " ");
+    (match until with
+     | Some (clk, ms) ->
+       add c "until ";
+       expr c ind clk;
+       add c ".after(";
+       expr c ind ms;
+       add c ") "
+     | None -> ());
     block c ind b
   | EDyn (x, _) -> expr c ind x
 

@@ -13,7 +13,9 @@ let rec fv bound acc e =
   match e.edesc with
   | EVar n -> if List.mem n bound || List.mem n acc then acc else n :: acc
   | EInt _ | EFloat _ | EBool _ | EUnit -> acc
-  | EGroup (n, b) -> fv_block (n :: bound) acc b
+  | EGroup (n, until, b) ->
+    let acc = match until with Some (c, ms) -> go (go acc c) ms | None -> acc in
+    fv_block (n :: bound) acc b
   | EStr ps -> List.fold_left (fun acc -> function SPExpr x -> go acc x | SPLit _ -> acc) acc ps
   | EList es -> List.fold_left go acc es
   | EBin (_, a, b) | EIndex (a, b) -> go (go acc a) b
@@ -64,7 +66,7 @@ let rec has_escape e =
   | ETry _ -> true
   | EClosure _ -> false
   | EVar _ | EInt _ | EFloat _ | EBool _ | EUnit -> false
-  | EGroup (_, b) -> block_escape b
+  | EGroup (_, until, b) -> (match until with Some (c, ms) -> has_escape c || has_escape ms | None -> false) || block_escape b
   | EStr ps -> List.exists (function SPExpr x -> has_escape x | SPLit _ -> false) ps
   | EList es -> List.exists has_escape es
   | EBin (_, a, b) | EIndex (a, b) -> has_escape a || has_escape b

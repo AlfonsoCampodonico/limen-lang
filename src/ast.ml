@@ -48,7 +48,8 @@ and expr_desc =
   | EBlock of block
   | EClosure of (string * ty_expr option * span) list * expr
   | EStruct of string * span * (string * span * expr) list
-  | EGroup of string * block
+  | EGroup of string * (expr * expr) option * block
+      (* `group g until clock.after(ms) { ... }`: the deadline's clock and milliseconds *)
   | EDyn of expr * string (* inserted by the checker: box a value as `dyn Interface` *)
   | ESelect of sel_arm list
 

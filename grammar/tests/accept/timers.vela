@@ -5,3 +5,10 @@ fn wait(c: Chan[Int], clock: Clock) -> Int {
         clock.after(500) => -1,
     }
 }
+
+fn fetch_all(c: Chan[Int], clock: Clock) -> List[Option[Int]] {
+    group g until clock.after(2000) {
+        g.go(|| c.recv() ?? 0)
+        g.go(|| wait(c, clock))
+    }
+}

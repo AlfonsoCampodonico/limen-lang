@@ -269,8 +269,18 @@ and parse_primary st ns =
   | KW "group" ->
     ignore (advance st);
     let name, _ = expect_ident st in
+    let until =
+      match (peek st).tok with
+      | IDENT "until" -> (
+        ignore (advance st);
+        let d = parse_expr_ns st in
+        match d.edesc with
+        | EMethod (clk, "after", _, [ ms ]) -> Some (clk, ms)
+        | _ -> raise (Diag.Fatal (Diag.make "E0003" d.espan "a group deadline is `group g until clock.after(ms) { ... }`")))
+      | _ -> None
+    in
     let b = parse_block st in
-    mk (EGroup (name, b)) (merge t.span b.bspan)
+    mk (EGroup (name, until, b)) (merge t.span b.bspan)
   | _ -> fail t "an expression"
 
 and str_part st = function

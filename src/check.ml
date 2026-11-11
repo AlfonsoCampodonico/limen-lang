@@ -426,8 +426,19 @@ and check_expr_inner ctx f e : ty =
   | EClosure (ps, body) -> check_closure ctx f ps body None
   | EStruct (name, nsp, fields) -> check_struct_lit ctx f name nsp fields e.espan
   | EDyn (x, i) -> ignore (check_expr ctx f x); TDyn i
-  | EGroup (name, b) ->
+  | EGroup (name, until, b) ->
     let t = fresh () in
+    Option.iter
+      (fun (clk, ms) ->
+        (match repr (check_expr ctx f clk) with
+         | TCap Clock | TErr -> ()
+         | TVar _ as ct -> unify_at ctx clk.espan (TCap Clock) ct
+         | ct ->
+           err ctx "E0201" clk.espan
+             ~notes:[ "a group deadline is `group g until clock.after(ms) { ... }`, with the `Clock` from `root.clock`" ]
+             (sprintf "`after` in a group deadline needs a `Clock`, found `%s`" (show ct)));
+        expect ctx f ms TInt)
+      until;
     push f;
     bind f name { vty = TGroup t; vmut = false; vspan = e.espan; vkind = KGroup };
     let saved_loops = f.loops in
@@ -437,7 +448,8 @@ and check_expr_inner ctx f e : ty =
     f.in_group <- f.in_group - 1;
     f.loops <- saved_loops;
     pop f;
-    TList t
+    (* with a deadline, a task cancelled by it has no result: None *)
+    if until = None then TList t else TList (opt t)
 
 (* Check [e] against an expected type; closures get their parameter types from it. *)
 and expect ctx f e want =
@@ -748,7 +760,8 @@ and check_method_value ctx f e recv name nsp args =
         | TCap Root when List.mem_assoc name root_fields ->
           [ sprintf "`%s` is a field of `Root`; write `root.%s`" name name ]
         | TCap Clock when name = "after" ->
-          [ "`clock.after(ms)` is a timeout: use it as a `select` arm, `clock.after(ms) => ...`"; "to wait, call `clock.sleep(ms)`" ]
+          [ "`clock.after(ms)` is a timeout: use it as a `select` arm, `clock.after(ms) => ...`, or as a group deadline, `group g until clock.after(ms) { ... }`";
+            "to wait, call `clock.sleep(ms)`" ]
         | TNamed (n, _) when ms = [] -> (
           match user_methods ctx n with
           | [] -> [ sprintf "`%s` has no methods; define one as `fn %s(self: %s) { ... }`" n name n ]

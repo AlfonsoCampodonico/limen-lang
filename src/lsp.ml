@@ -84,7 +84,8 @@ let rec walk_expr (f : expr -> unit) e =
   | EMethod (r, _, _, args) -> w r; List.iter w args
   | EIf (c, b, eo) -> w c; walk_block f b; Option.iter w eo
   | EMatch (s, arms) -> w s; List.iter (fun a -> w a.abody) arms
-  | EBlock b | EGroup (_, b) -> walk_block f b
+  | EBlock b -> walk_block f b
+  | EGroup (_, until, b) -> Option.iter (fun (c, ms) -> w c; w ms) until; walk_block f b
   | EClosure (_, body) -> w body
   | EStruct (_, _, fs) -> List.iter (fun (_, _, x) -> w x) fs
   | EDyn (x, _) -> w x
@@ -172,7 +173,7 @@ let hover_items text items =
             b.stmts
         in
         stmts d.fn_body;
-        walk_block (fun e -> match e.edesc with EBlock b | EGroup (_, b) -> stmts b | EIf (_, b, _) -> stmts b | EClosure (_, { edesc = EBlock b; _ }) -> stmts b | _ -> ()) d.fn_body
+        walk_block (fun e -> match e.edesc with EBlock b | EGroup (_, _, b) -> stmts b | EIf (_, b, _) -> stmts b | EClosure (_, { edesc = EBlock b; _ }) -> stmts b | _ -> ()) d.fn_body
       | IIface i ->
         add i.if_span ("interface " ^ i.if_name);
         List.iter
@@ -264,7 +265,7 @@ let definitions items =
     | EIf (c, b, eo) -> x c; block env b; Option.iter x eo
     | EMatch (s, arms) -> x s; List.iter (fun a -> expr (pat env a.apat) a.abody) arms
     | EBlock b -> block env b
-    | EGroup (n, b) -> block ((n, e.espan) :: env) b
+    | EGroup (n, until, b) -> Option.iter (fun (c, ms) -> x c; x ms) until; block ((n, e.espan) :: env) b
     | EClosure (ps, body) ->
       List.iter (fun (_, t, _) -> Option.iter ty t) ps;
       expr (List.map (fun (n, _, sp) -> (n, sp)) ps @ env) body
@@ -424,7 +425,7 @@ let general_completions doc off =
                 b.stmts
             in
             stmts d.fn_body;
-            walk_block (fun e -> match e.edesc with EBlock b | EIf (_, b, _) | EGroup (_, b) -> stmts b | _ -> ()) d.fn_body;
+            walk_block (fun e -> match e.edesc with EBlock b | EIf (_, b, _) | EGroup (_, _, b) -> stmts b | _ -> ()) d.fn_body;
             List.rev !out
           end
           else [])

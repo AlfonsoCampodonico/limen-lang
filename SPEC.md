@@ -480,6 +480,22 @@ clock.sleep(250)                      // wait a quarter of a second
 - `clock.sleep(ms)` waits at least `ms` milliseconds; other tasks keep running, and natively no thread waits. Time is measured on a monotonic clock, so changing the system time does not shorten or stretch a sleep.
 - Waiting needs the `Clock` capability like reading the time does, so a pure function cannot depend on timing. For deterministic tests, take the clock through an interface (`interface Sleeper { fn sleep(self, ms: Int) }`) and pass a fake that does not wait; `Clock` satisfies such interfaces (section 4).
 
+### Deadlines and cancellation
+
+```
+let pages = group g until clock.after(2000) {
+    for u in urls {
+        g.go(|| fetch(net, u))
+    }
+}
+// pages: List[Option[Str]], None for each fetch still running at the deadline
+```
+
+- `group g until clock.after(ms) { body }` gives the group a deadline `ms` milliseconds after it starts. Its value is a `List[Option[T]]`, in start order: `Some(v)` for a task that finished, `None` for a task the deadline cancelled.
+- At the deadline every task still running is cancelled. A cancelled task stops at a wait: if it is waiting (on a channel, a `select`, `clock.sleep`, a socket, stdin or a group) it stops at once; otherwise it stops when it next has to wait. Code that does not wait cannot be stopped, and a task that finishes without waiting again keeps its result. A task started after the deadline never runs, and `ms <= 0` cancels every task before it starts.
+- A cancelled task unwinds as a panic does: everything it owns is freed and sockets it holds are closed. A group the task is running cancels its own tasks too and waits for them. `catch` inside the task does not stop a cancellation, and a cancellation is not a panic: the group passes nothing on for it. A panic in another task of the group is still passed on once every task has stopped.
+- The deadline cancels the tasks, not the body: keep the body to starting tasks and do blocking work, like `accept`, inside a task.
+
 ### Sockets
 
 ```
@@ -774,7 +790,7 @@ primary    = INT | FLOAT | STRING | "true" | "false"
            | "match" expr_ns "{" { pattern "=>" expr ( "," | NL ) } "}"
            | "select" "{" { selarm ( "," | NL ) } "}"
            | "|" [ cparam { "," cparam } ] "|" expr | "||" expr
-           | "group" IDENT block ;
+           | "group" IDENT [ "until" expr ] block ;   (* until clock.after(ms) *)
 selarm     = ( IDENT "=" expr | expr | "_" ) [ "if" expr ] "=>" expr ;
                                                 (* ch.recv(), ch.send(v) or clock.after(ms) *)
 init       = IDENT [ ":" expr ] ;

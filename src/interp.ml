@@ -44,13 +44,21 @@ type value =
   | VCtor of string * string
   | VPanicFn
   | VCap of cap
-  | VGroup of (value, string * Span.t) result option ref list ref
-      (* outcomes of spawned tasks, newest first: a value, or the panic that ended the task *)
+  | VGroup of group
   | VChan of chan
   | VChanFn
   | VBuiltin of string (* assert, assert_eq *)
 
 and chan = { q : value Queue.t; cap : int; mutable closed : bool }
+
+(* A task's cancel flag: set by its group's deadline, seen at its next wait. *)
+and task = { mutable cancelled : bool }
+
+(* How a task ended: its value, the panic that ended it, or cancellation. *)
+and outcome = Done of value | Failed of string * Span.t | Stopped
+
+(* The tasks of a group, newest first, and whether its deadline has passed. *)
+and group = { mutable tasks : (task * outcome option ref) list; mutable gcancelled : bool }
 
 (* A persistent map, so updates are cheap and values stay values. Each entry
    remembers when its key was first inserted, for insertion-order iteration. *)
@@ -62,6 +70,9 @@ exception Return of value
 exception Break_
 exception Continue_
 exception Panic of string * Span.t
+
+(* A cancelled task stopping at a wait. `catch` does not catch it. *)
+exception Cancelled
 
 type grants = {
   net : string list;
@@ -295,20 +306,44 @@ let io_epoch = ref 0 (* advances after each round of waiting for I/O *)
 
 let now () = Unix.gettimeofday ()
 
-let wait_until ?io ?at cond = if not (cond ()) then Effect.perform (Block (cond, io, at))
+(* The task running now; main and tests run as tasks nobody cancels. *)
+let current = ref { cancelled = false }
 
-let rec run_fiber (f : unit -> unit) =
-  Effect.Deep.match_with f ()
+(* Wait until [cond] holds. A cancelled task stops instead (raising
+   Cancelled) unless [cancellable] is false, which is only for joining the
+   tasks of a group that is being abandoned. As natively, an operation that
+   can go on at once does not look at the cancel flag. *)
+let wait_until ?io ?at ?(cancellable = true) cond =
+  if not (cond ()) then begin
+    let t = !current in
+    if cancellable && t.cancelled then raise Cancelled;
+    let c = if cancellable then fun () -> cond () || t.cancelled else cond in
+    Effect.perform (Block (c, io, at));
+    if cancellable && not (cond ()) then raise Cancelled
+  end
+
+let rec run_fiber t (f : unit -> unit) =
+  Effect.Deep.match_with (fun () -> current := t; f ()) ()
     { retc = (fun () -> ());
       exnc = raise;
       effc =
         (fun (type a) (e : a Effect.t) ->
           match e with
           | Block (cond, io, at) ->
-            Some (fun (k : (a, unit) Effect.Deep.continuation) -> Queue.push (cond, io, at, fun () -> Effect.Deep.continue k ()) runq)
+            Some
+              (fun (k : (a, unit) Effect.Deep.continuation) ->
+                Queue.push (cond, io, at, fun () -> current := t; Effect.Deep.continue k ()) runq)
           | _ -> None) }
 
-let spawn_fiber f = Queue.push ((fun () -> true), None, None, fun () -> run_fiber f) runq
+let spawn_fiber t f = Queue.push ((fun () -> true), None, None, fun () -> run_fiber t f) runq
+
+(* The deadline passed: cancel every task still running, and every task
+   started from now on. *)
+let cancel_group g =
+  g.gcancelled <- true;
+  List.iter (fun (t, r) -> if !r = None then t.cancelled <- true) g.tasks
+
+let group_finished g = List.for_all (fun (_, r) -> !r <> None) g.tasks
 
 (* Clock.sleep: wait without holding up other tasks. *)
 let sleep_ms (ms : int64) =
@@ -604,17 +639,47 @@ let rec eval rt env e : value =
     let vals = List.map (fun (f, _, x) -> (f, eval rt env x)) fields in
     VStruct (name, List.map (fun (f, _, _) -> (f, List.assoc f vals)) decl.st_fields)
   | EDyn (x, _) -> eval rt env x (* values carry their type, so methods dispatch on it *)
-  | EGroup (name, b) ->
+  | EGroup (name, until, b) ->
     (* tasks are coroutines; the group waits until every one has a result *)
-    let tasks = ref [] in
+    let g = { tasks = []; gcancelled = false } in
+    let joined = ref false in
+    (match until with
+     | None -> ()
+     | Some (clk, ms) ->
+       ignore (eval rt env clk);
+       let ms = match eval rt env ms with VInt n -> n | _ -> 0L in
+       if ms <= 0L then g.gcancelled <- true
+       else begin
+         (* the deadline: a coroutine of its own that cancels the tasks when the time comes *)
+         let at = now () +. (Int64.to_float (min ms 1_000_000_000_000L) /. 1000.) in
+         spawn_fiber { cancelled = false } (fun () ->
+             wait_until ~at ~cancellable:false (fun () -> !joined || now () >= at);
+             if not !joined then cancel_group g)
+       end);
     let sc = Hashtbl.create 1 in
-    Hashtbl.replace sc name (ref (VGroup tasks));
-    ignore (eval_block rt (sc :: env) b);
-    let results = List.rev !tasks in
-    wait_until (fun () -> List.for_all (fun r -> !r <> None) results);
+    Hashtbl.replace sc name (ref (VGroup g));
+    (try
+       ignore (eval_block rt (sc :: env) b);
+       wait_until (fun () -> group_finished g)
+     with e ->
+       (* abandoned (a panic, or this task was cancelled): a cancellation
+          reaches the group's tasks too; either way wait for them *)
+       if !current.cancelled then cancel_group g;
+       wait_until ~cancellable:false (fun () -> group_finished g);
+       joined := true;
+       raise e);
+    joined := true;
+    let results = List.rev_map snd g.tasks in
     (* a panic ended only its task; the group passes the first one on *)
-    List.iter (fun r -> match !r with Some (Error (m, s)) -> raise (Panic (m, s)) | _ -> ()) results;
-    VList (Array.of_list (List.map (fun r -> match !r with Some (Ok v) -> v | _ -> VUnit) results))
+    List.iter (fun r -> match !r with Some (Failed (m, s)) -> raise (Panic (m, s)) | _ -> ()) results;
+    let result r =
+      match (!r, until) with
+      | Some (Done v), None -> v
+      | Some (Done v), Some _ -> some v
+      | _, Some _ -> none (* cancelled *)
+      | _ -> VUnit
+    in
+    VList (Array.of_list (List.map result results))
 
 and eval_var rt env n sp =
   match find_var env n with
@@ -826,10 +891,17 @@ and call_method rt v name args sp =
   | VEnum ("Result", vn, _), "is_err", [] -> VBool (vn = "Err")
   | VEnum ("Result", "Err", [ e ]), "map_err", [ f ] -> VEnum ("Result", "Err", [ call f [ e ] ])
   | (VEnum ("Result", _, _) as r), "map_err", [ _ ] -> r
-  | VGroup r, "go", [ c ] ->
-    let res = ref None in
-    r := res :: !r;
-    spawn_fiber (fun () -> res := Some (try Ok (apply rt c [] sp) with Panic (m, s) -> Error (m, s)));
+  | VGroup g, "go", [ c ] ->
+    let t = { cancelled = g.gcancelled } in
+    let res = ref (if g.gcancelled then Some Stopped else None) in
+    g.tasks <- (t, res) :: g.tasks;
+    (* a task cancelled before it started never runs *)
+    if not g.gcancelled then
+      spawn_fiber t (fun () ->
+          res :=
+            Some
+              (if t.cancelled then Stopped
+               else try Done (apply rt c [] sp) with Panic (m, s) -> Failed (m, s) | Cancelled -> Stopped));
     VUnit
   | VChan ch, "send", [ v ] ->
     if ch.closed then raise (Panic ("send on a closed channel", sp));
@@ -919,7 +991,7 @@ let run ~out ~grants (user_items : item list) : (value, string * Span.t) result 
     Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
     let result = ref None in
     try
-      spawn_fiber (fun () -> result := Some (call_fn rt d args));
+      spawn_fiber { cancelled = false } (fun () -> result := Some (call_fn rt d args));
       schedule (fun () -> !result <> None) d.fn_span;
       Queue.clear runq;
       Ok (Option.get !result)
@@ -959,7 +1031,7 @@ let run_tests ~out (user_items : item list) : (string * (unit, string * Span.t) 
         let finished = ref false in
         let r =
           try
-            spawn_fiber (fun () -> ignore (call_fn rt d []); finished := true);
+            spawn_fiber { cancelled = false } (fun () -> ignore (call_fn rt d []); finished := true);
             schedule (fun () -> !finished) d.fn_span;
             Ok ()
           with

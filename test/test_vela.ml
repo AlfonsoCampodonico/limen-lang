@@ -22,7 +22,7 @@ let ok name cond msg =
    dir/reject (lexer or parser error), for checking grammar/vela.gbnf. *)
 (* Rejected by the parser but within the grammar's documented superset
    (keywords are not excluded from identifiers). *)
-let grammar_superset = [ "tuple-let-refutable"; "select-bad-arm" ]
+let grammar_superset = [ "tuple-let-refutable"; "select-bad-arm"; "group-until-bad" ]
 
 let dump name src parsed =
   match Sys.getenv_opt "VELA_DUMP_DIR" with
@@ -1414,6 +1414,220 @@ fn main(root: Root) {
   errs "select-after-not-clock" (main_wrap (tchans ^ "    let x = select {\n        v = c.recv() => 1,\n        c.after(1) => 2,\n    }")) [ "E0201" ];
   errs "select-after-ms-type" (main_wrap (tchans ^ "    let x = select {\n        v = c.recv() => 1,\n        clock.after(\"soon\") => 2,\n    }")) [ "E0201" ];
   errs "after-outside-select" (main_wrap (tchans ^ "    clock.after(10)")) [ "E0105" ];
+
+  (* ---------- group deadlines and cancellation ---------- *)
+  out "group-until" {|fn stuck(c: Chan[Int]) -> Int {
+    c.recv() ?? -1
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let clock = root.clock
+    let start = clock.now_ms()
+    let never: Chan[Int] = channel(1)
+    let full: Chan[Str] = channel(1)
+    full.send("x")
+    let r = group g until clock.after(100) {
+        g.go(|| 1)
+        g.go(|| stuck(never))
+        g.go(|| {
+            clock.sleep(10000)
+            2
+        })
+        g.go(|| {
+            let mut words = ["a", "b"]
+            words.push("c")
+            let r = catch(|| stuck(never))
+            words.len() + r.is_ok().to_str().len()
+        })
+        g.go(|| {
+            full.send("y {start}")
+            3
+        })
+        g.go(|| {
+            select {
+                full.send("z {start}") => 4,
+                v = never.recv() => 5,
+            }
+        })
+        g.go(|| {
+            let inner = group h {
+                h.go(|| stuck(never))
+                h.go(|| 6)
+            }
+            inner.len()
+        })
+        g.go(|| {
+            let mut i = 0
+            while clock.now_ms() - start < 200 {
+                i = i + 1
+            }
+            7
+        })
+    }
+    out.print("{r}")
+    let el = clock.now_ms() - start
+    out.print("{el < 2000}")
+    // a deadline already passed: no task runs
+    let z = group g until clock.after(0) {
+        g.go(|| {
+            out.print("ran")
+            1
+        })
+    }
+    out.print("{z}")
+    // tasks started after the deadline never run
+    let late = group g until clock.after(30) {
+        g.go(|| 1)
+        clock.sleep(100)
+        g.go(|| {
+            out.print("ran late")
+            2
+        })
+    }
+    out.print("{late}")
+    // a panic still passes on, after the stuck task is cancelled
+    let p = catch(|| group g until clock.after(50) {
+        g.go(|| stuck(never))
+        g.go(|| {
+            panic("boom")
+            1
+        })
+    })
+    out.print("{p}")
+}
+|} "[Some(1), None, None, None, None, None, None, Some(7)]\ntrue\n[None]\n[Some(1), None]\nErr(\"boom\")\n";
+  check_tsan "group-until-tsan" {|fn stuck(c: Chan[Int]) -> Int {
+    c.recv() ?? -1
+}
+
+fn produce(c: Chan[Str]) -> Int {
+    let mut i = 0
+    while i < 1000000 {
+        c.send("v{i}")
+        i = i + 1
+    }
+    0
+}
+
+fn consume(c: Chan[Str], clock: Clock) -> Int {
+    let mut more = true
+    while more {
+        match c.recv() {
+            Some(_) => clock.sleep(1),
+            None => {
+                more = false
+            },
+        }
+    }
+    0
+}
+
+fn main(root: Root) {
+    let clock = root.clock
+    let never: Chan[Int] = channel(1)
+    let busy: Chan[Str] = channel(2)
+    let mut total = 0
+    let mut k = 0
+    while k < 15 {
+        let r = group g until clock.after(150) {
+            let mut i = 0
+            while i < 10 {
+                g.go(|| 1)
+                g.go(|| stuck(never))
+                g.go(|| {
+                    clock.sleep(5000)
+                    1
+                })
+                g.go(|| {
+                    let inner = group h {
+                        h.go(|| stuck(never))
+                        h.go(|| 1)
+                    }
+                    inner.len()
+                })
+                g.go(|| select {
+                    v = never.recv() => 1,
+                    clock.after(5000) => 2,
+                })
+                // racing with the deadline: counted as 0 either way
+                g.go(|| produce(busy))
+                g.go(|| consume(busy, clock))
+                g.go(|| {
+                    let mut n = 0
+                    while n < 100000 {
+                        select {
+                            busy.send("s{n}") => (),
+                            clock.after(1) => (),
+                        }
+                        n = n + 1
+                    }
+                    0
+                })
+                i = i + 1
+            }
+        }
+        for x in r {
+            total = total + (x ?? 0)
+        }
+        k = k + 1
+    }
+    root.stdout.print("{total}")
+}
+|} "150\n";
+  out "group-until-sockets" ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] } {|fn main(root: Root) -> Result[(), IoError] {
+    let clock = root.clock
+    let net = root.net
+    let l = root.listen.on("127.0.0.1:0")?
+    let port = l.port()
+    // a read and a sleep that holds a connection, both cancelled
+    let a = group g until clock.after(150) {
+        g.go(|| match l.accept() {
+            Ok(c) => match c.read() {
+                Ok(s) => s.len(),
+                Err(_) => -1,
+            },
+            Err(_) => -2,
+        })
+        g.go(|| match net.connect("127.0.0.1:{port}") {
+            Ok(c) => {
+                clock.sleep(10000)
+                c.close()
+                0
+            },
+            Err(_) => -3,
+        })
+    }
+    // an accept with nobody connecting, cancelled
+    let b = group g until clock.after(50) {
+        g.go(|| match l.accept() {
+            Ok(_) => 1,
+            Err(_) => 2,
+        })
+    }
+    // the listener still works
+    let c = group g {
+        g.go(|| match l.accept() {
+            Ok(c) => (c.read() ?? "?").len(),
+            Err(_) => -1,
+        })
+        g.go(|| match net.connect("127.0.0.1:{port}") {
+            Ok(c) => {
+                c.write("hello") ?? ()
+                c.close()
+                0
+            },
+            Err(_) => -3,
+        })
+    }
+    root.stdout.print("{a} {b} {c}")
+    Ok(())
+}
+|} "[None, None] [None] [5, 0]\n";
+  errs "group-until-not-clock" (main_wrap "    let c: Chan[Int] = channel(1)\n    let r = group g until c.after(5) {\n        g.go(|| 1)\n    }") [ "E0201" ];
+  errs "group-until-ms-type" (main_wrap "    let r = group g until root.clock.after(true) {\n        g.go(|| 1)\n    }") [ "E0201" ];
+  errs "group-until-type" (main_wrap "    let r: List[Int] = group g until root.clock.after(5) {\n        g.go(|| 1)\n    }") [ "E0201" ];
+  errs "group-until-bad" (main_wrap "    let r = group g until root.clock.sleep(5) {\n        g.go(|| 1)\n    }") [ "E0003" ];
   out "catch-in-task-frees-request" "struct Req {\n    path: Str,\n    hs: List[Str],\n}\n\nfn handler(r: Req) -> Str {\n    let e: List[Str] = []\n    r.path + e[0]\n}\n\nfn serve(n: Int) -> Str {\n    let req = Req { path: \"/p{n}\", hs: [\"a{n}\", \"b\"] }\n    catch(|| handler(req)) ?? \"500\"\n}\n\nfn main(root: Root) {\n    let rs = group g {\n        for n in [1, 2, 3] {\n            g.go(|| serve(n))\n        }\n    }\n    root.stdout.print(\"{rs}\")\n}\n" "[\"500\", \"500\", \"500\"]\n";
   errs "catch-arity" (main_wrap "    let r = catch(1, 2)") [ "E0107" ];
 

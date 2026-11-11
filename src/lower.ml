@@ -303,15 +303,17 @@ let rec lower f (e : expr) : I.atom =
           ms
       in
       tmp f ty (I.MkDyn (t, i, a, entries))
-    | EGroup (name, b) ->
-      let t = match ty with TList t -> t | _ -> TUnit in
+    | EGroup (name, until, b) ->
+      (* with a deadline, each result is an Option: None for a cancelled task *)
+      let t = match (ty, until) with TList (TNamed ("Option", [ t ])), Some _ -> t | TList t, None -> t | _ -> TUnit in
+      let dl = Option.map (fun (clk, ms) -> let c = lower f clk in (c, lower f ms)) until in
       let g = fresh_var name (TGroup t) in
-      emit f (I.Let (g, I.GroupNew));
+      emit f (I.Let (g, I.GroupNew dl));
       f.scopes <- Hashtbl.create 8 :: f.scopes;
       bind f name g;
       ignore (lower_block f b);
       f.scopes <- List.tl f.scopes;
-      tmp f ty (I.GroupJoin (I.V g, ty))
+      tmp f ty (I.GroupJoin (I.V g, ty, until <> None))
 
 and global_value f e n ty =
   if Hashtbl.mem f.g.fns n then

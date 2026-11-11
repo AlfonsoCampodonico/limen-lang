@@ -39,9 +39,10 @@ type rhs =
   | Interp of ipart list
   | RootField of atom * string
   | Panic of atom * Span.t
-  | GroupNew
+  | GroupNew of (atom * atom) option (* `until clock.after(ms)`: clock, milliseconds *)
   | Spawn of atom * atom * ty (* group (borrowed), task closure (consumed), result type *)
-  | GroupJoin of atom * ty (* wait for every task; result list type *)
+  | GroupJoin of atom * ty * bool
+      (* wait for every task; result list type; with a deadline (each result an Option) *)
   | ChanNew of ty * atom * Span.t (* channel type, capacity *)
   | ChanSend of atom * atom * Span.t (* channel (borrowed), value (consumed) *)
   | MkDyn of ty * string * atom * (string * ty list * ty) list
@@ -124,8 +125,9 @@ let borrowed = function
   | Interp ps -> List.filter_map (function IVal (a, _) | IValQ (a, _) -> Some a | IStr _ -> None) ps
   | RootField (a, _) -> [ a ]
   | Panic (a, _) -> [ a ]
-  | Spawn (g, _, _) | GroupJoin (g, _) -> [ g ]
-  | GroupNew -> []
+  | Spawn (g, _, _) | GroupJoin (g, _, _) -> [ g ]
+  | GroupNew None -> []
+  | GroupNew (Some (c, ms)) -> [ c; ms ]
   | ChanNew (_, cap, _) -> [ cap ]
   | ChanSend (c, _, _) -> [ c ]
 
