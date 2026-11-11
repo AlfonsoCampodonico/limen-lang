@@ -94,6 +94,8 @@ let attenuate allowed req =
      bytes if given, else everything until the server closes. *)
 
 let max_response = 64 * 1024 * 1024
+let max_head = 65536 (* bytes before the blank line *)
+let max_headers = 1000
 
 let http_request (u : url) =
   let host = if u.port = 80 then u.host else sprintf "%s:%d" u.host u.port in
@@ -133,7 +135,11 @@ let dechunk data =
 (* (status, headers in order, body) *)
 let parse_http data : (int * (string * string) list * string, ioerr) result =
   match Interp_util.find_sub data "\r\n\r\n" 0 with
+  | Some e when e > max_head -> Error (Failed "http: response headers larger than 64 KiB")
+  | None when String.length data > max_head -> Error (Failed "http: response headers larger than 64 KiB")
   | None -> Error (Failed "http: incomplete response headers")
+  | Some e when List.length (String.split_on_char '\n' (String.sub data 0 e)) > max_headers + 1 ->
+    Error (Failed "http: more than 1000 response headers")
   | Some e -> (
     let lines = String.split_on_char '\n' (String.sub data 0 e) in
     let lines = List.map (fun l -> if String.ends_with ~suffix:"\r" l then String.sub l 0 (String.length l - 1) else l) lines in

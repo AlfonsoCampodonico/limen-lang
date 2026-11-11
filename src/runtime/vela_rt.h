@@ -2487,8 +2487,13 @@ static void w_http_free(WHttp *h) {
 static WIo w_http_fail(WHttp *h, const char *m) { w_http_free(h); return io_err(2, m); }
 
 static WIo w_http_parse(const char *d, int64_t n) {
-  int64_t e = w_find_bytes(d, n, "\r\n\r\n", 0);
+  /* bounded, so a hostile server cannot make the header merging quadratic */
+  int64_t e = w_find_bytes(d, n < 65536 + 4 ? n : 65536 + 4, "\r\n\r\n", 0);
+  if (e > 65536 || (e < 0 && n > 65536)) return io_err(2, "http: response headers larger than 64 KiB");
   if (e < 0) return io_err(2, "http: incomplete response headers");
+  int64_t lines = 1;
+  for (int64_t k = 0; k < e; k++) if (d[k] == '\n') lines++;
+  if (lines > 1000 + 1) return io_err(2, "http: more than 1000 response headers");
   WHttp *h = (WHttp *)w_raw(sizeof(WHttp));
   memset(h, 0, sizeof *h);
   /* lines of the head, split on \n with a trailing \r removed */

@@ -531,7 +531,7 @@ if resp.status == 200 {
 ```
 
 - `Net.get(url)` sends one HTTP/1.1 `GET` (with `Host`, `User-Agent: vela`, `Accept: */*` and `Connection: close`), reads until the server closes, and returns `HttpResponse { status, headers, body }`.
-- Every status is `Ok`, including 404 and 500; redirects are returned, not followed. `Err(Failed(...))` means the server could not be reached or the response was not valid HTTP; responses over 64 MiB are refused.
+- Every status is `Ok`, including 404 and 500; redirects are returned, not followed. `Err(Failed(...))` means the server could not be reached or the response was not valid HTTP; responses over 64 MiB, with more than 64 KiB of headers or with more than 1000 header lines are refused.
 - `headers` is a `Map[Str, Str]` with lowercased names, in the order they arrived; a repeated header's values are joined with `", "`. The body is decoded from chunked transfer encoding or cut to `Content-Length`.
 - `https://` URLs are checked against the grant like any other, then fail with `Failed("https is not supported yet ...")`: there is no TLS yet. There is no timeout yet either. For other methods, request headers or bodies, use `http.request` from the `http` module, which works over `Net.connect`.
 

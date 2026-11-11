@@ -905,6 +905,14 @@ fn main(root: Root) -> Result[(), IoError] {
     let l = root.listen.on("127.0.0.1:0")?
     let port = l.port()
     let net = root.net.only("127.0.0.1")
+    let mut many = ""
+    let mut big = ""
+    let mut i = 0
+    while i < 1001 {
+        many = many + "X-N: {i}\r\n"
+        big = big + "0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz"
+        i = i + 1
+    }
     let replies = [
         "echo",
         "echo",
@@ -915,8 +923,10 @@ fn main(root: Root) -> Result[(), IoError] {
         "HTTP/1.1 200 OK\r\nContent-Length: 50\r\n\r\nshort",
         "HTTP/1.1 200 OK\r\nbad header\r\n\r\n",
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n",
+        "HTTP/1.1 200 OK\r\n" + many + "\r\nok",
+        "HTTP/1.1 200 OK\r\nX-Big: " + big + "\r\n\r\nok",
     ]
-    let paths = ["/a/b?x=1#frag", "?q", "/", "/", "/", "/", "/", "/", "/"]
+    let paths = ["/a/b?x=1#frag", "?q", "/", "/", "/", "/", "/", "/", "/", "/", "/"]
     let served = group g {
         g.go(|| serve(l, replies))
         g.go(|| {
@@ -938,7 +948,7 @@ fn main(root: Root) -> Result[(), IoError] {
 }
 |} in
   let http_want =
-    "200 [\"content-length\"] None GET /a/b?x=1 HTTP/1.1\n200 [\"content-length\"] None GET /?q HTTP/1.1\n404 [\"content-type\", \"x-a\", \"content-length\"] Some(\"1, 2\") nope!\n200 [\"transfer-encoding\"] None Wikipedia\n301 [\"location\"] None until close\nFailed(\"http: incomplete response headers\")\nFailed(\"http: truncated body\")\nFailed(\"http: malformed header line\")\nFailed(\"http: bad chunk size\")\n[9, 0]\nErr(Failed(\"https is not supported yet (vela has no TLS); use an http:// URL\"))\n"
+    "200 [\"content-length\"] None GET /a/b?x=1 HTTP/1.1\n200 [\"content-length\"] None GET /?q HTTP/1.1\n404 [\"content-type\", \"x-a\", \"content-length\"] Some(\"1, 2\") nope!\n200 [\"transfer-encoding\"] None Wikipedia\n301 [\"location\"] None until close\nFailed(\"http: incomplete response headers\")\nFailed(\"http: truncated body\")\nFailed(\"http: malformed header line\")\nFailed(\"http: bad chunk size\")\nFailed(\"http: more than 1000 response headers\")\nFailed(\"http: response headers larger than 64 KiB\")\n[11, 0]\nErr(Failed(\"https is not supported yet (vela has no TLS); use an http:// URL\"))\n"
   in
   let http_grants = { Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] } in
   out "net-get-http" ~grants:http_grants http_src http_want;
