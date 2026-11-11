@@ -1,0 +1,30 @@
+// The phase 1 gate: main narrows its network grant to one host, hands it to
+// fetch_repos, and parsing stays pure.
+//
+//   writ run examples/repos.wr --grant net=api.github.com
+//   writ caps examples/repos.wr
+
+fn main(root: Root) -> Result[(), IoError] {
+    let gh = root.net.only("api.github.com:443")
+    let names = fetch_repos(gh, "rust-lang")?
+    root.stdout.print("{names.len()} repos")
+    for name in names.take(5) {
+        root.stdout.print("  {name}")
+    }
+    Ok(())
+}
+
+fn fetch_repos(net: Net, org: Str) -> Result[List[Str], IoError] {
+    let body = net.get("https://api.github.com/orgs/{org}/repos?per_page=100")?
+    Ok(parse_names(body))
+}
+
+// No capability parameters: this function cannot do I/O.
+fn parse_names(body: Str) -> List[Str] {
+    let mut names = []
+    for chunk in body.split("\"full_name\":").skip(1) {
+        let quoted = chunk.trim().split("\"")
+        names.push(quoted.get(1).unwrap_or("?"))
+    }
+    names
+}

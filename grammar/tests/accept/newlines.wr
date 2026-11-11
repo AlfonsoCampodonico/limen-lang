@@ -1,0 +1,10 @@
+// comment only
+fn main(root: Root) {
+    let x = 1 +
+        2
+    let y = [
+        1,
+        2
+    ]
+    root.stdout.print("{x} {y}") ; let z = 3
+}

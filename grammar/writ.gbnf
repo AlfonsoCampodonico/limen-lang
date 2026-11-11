@@ -1,0 +1,77 @@
+# Writ grammar in GBNF (llama.cpp grammar format), for constrained decoding.
+#
+# It follows SPEC.md section 15 at the character level, including the newline
+# rules: statements are separated by a newline or `;`; inside brackets and
+# after a binary operator a newline is free; a line may start with `.` to
+# continue a method chain; a line may not start with a binary operator, `(`,
+# `[` or `?` that belongs to the previous line.
+#
+# It accepts a slight superset of Writ: keywords are not excluded from
+# identifiers, and types are not checked. It requires at least one space or
+# tab after a keyword (`if x`, not `if(x)`), which is the canonical style.
+
+root ::= ws (item ws)*
+
+# ---------- whitespace ----------
+comment ::= "//" [^\n]*
+sp      ::= ([ \t\r] | comment)*
+sp1     ::= [ \t]+ sp
+ws      ::= ([ \t\r\n] | comment)*
+# separator inside brackets: a comma, or a newline
+isep    ::= ws "," ws | sp "\n" ws
+# separator between statements
+stsep   ::= sp (";" | "\n") ws
+
+# ---------- items ----------
+item     ::= fn | struct | enum
+fn       ::= "fn" sp1 ident sp generics? sp "(" ws (param (isep param)* (ws ",")?)? ws ")" (sp "->" sp type)? sp block
+generics ::= "[" ws ident (isep ident)* (ws ",")? ws "]"
+param    ::= ident sp ":" sp type
+struct   ::= "struct" sp1 ident sp generics? sp "{" ws (field (isep field)* (ws ",")?)? ws "}"
+field    ::= ident sp ":" sp type
+enum     ::= "enum" sp1 ident sp generics? sp "{" ws (variant (isep variant)* (ws ",")?)? ws "}"
+variant  ::= ident (sp "(" ws type (isep type)* (ws ",")? ws ")")?
+
+# ---------- types ----------
+type    ::= ident (sp "[" ws typearg (isep typearg)* (ws ",")? ws "]")? | "(" ws ")" | "fn" sp "(" ws (type (isep type)* (ws ",")?)? ws ")" sp "->" sp type
+typearg ::= type | int
+
+# ---------- blocks and statements ----------
+block ::= "{" ws (stmt (stsep stmt)* (sp ";")?)? ws "}"
+stmt  ::= let | return | while | for | "break" | "continue" | expr (sp "=" ws expr)?
+let    ::= "let" sp1 ("mut" sp1)? ident sp (":" sp type sp)? "=" ws expr
+return ::= "return" (sp1 expr)?
+while  ::= "while" sp1 expr sp block
+for    ::= "for" sp1 ident sp1 "in" sp1 expr sp block
+
+# ---------- expressions ----------
+expr    ::= unary (sp binop ws unary)*
+binop   ::= "||" | "&&" | "==" | "!=" | "<=" | ">=" | "<" | ">" | "+" | "-" | "*" | "/" | "%"
+unary   ::= ("-" | "!") sp unary | postfix
+postfix ::= primary suffix*
+suffix  ::= sp "(" ws args? ws ")" | sp "[" ws expr ws "]" | ws "." sp ident | sp "?"
+args    ::= expr (isep expr)* (ws ",")?
+
+primary ::= float | int | string | ident | structlit | "(" ws ")" | "(" ws expr ws ")" | "[" ws args? ws "]" | block | if | match | closure | group
+structlit ::= upper sp "{" ws (init (isep init)* (ws ",")?)? ws "}"
+init      ::= ident (sp ":" ws expr)?
+if        ::= "if" sp1 expr sp block (ws "else" (sp block | sp1 if))?
+match     ::= "match" sp1 expr sp "{" ws (arm (isep arm)* (ws ",")?)? ws "}"
+arm       ::= pattern sp "=>" ws expr
+closure   ::= "|" ws (cparam (isep cparam)* ws)? "|" ws expr | "||" ws expr
+cparam    ::= ident (sp ":" sp type)?
+group     ::= "group" sp1 ident sp block
+
+pattern ::= "-"? int | plainstr | ident ("." ident)? (sp "(" ws pattern (isep pattern)* (ws ",")? ws ")")?
+
+# ---------- tokens ----------
+ident  ::= [A-Za-z_] [A-Za-z0-9_]*
+upper  ::= [A-Z] [A-Za-z0-9_]*
+int    ::= [0-9] [0-9_]*
+float  ::= [0-9] [0-9_]* ("." [0-9] [0-9_]* exp? | exp)
+exp    ::= [eE] [+-]? [0-9]+
+string ::= "\"" (strchar | escape | interp)* "\""
+plainstr ::= "\"" (strchar | escape)* "\""
+strchar ::= [^"\\{]
+escape  ::= "\\" [ntr\\"{}0]
+interp  ::= "{" ws expr ws "}"

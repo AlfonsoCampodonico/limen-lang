@@ -1,0 +1,14 @@
+; `dune test` also checks that the GBNF grammar accepts every example and
+; benchmark, and accepts or rejects the hand-written cases as labelled.
+(rule
+ (alias runtest)
+ (deps
+  writ.gbnf
+  gbnf_check.py
+  (glob_files tests/accept/*.wr)
+  (glob_files tests/reject/*.wr)
+  (glob_files %{project_root}/examples/*.wr)
+  (glob_files %{project_root}/bench/*.wr))
+ (action
+  (system
+   "python3 gbnf_check.py writ.gbnf tests/accept/*.wr ../examples/*.wr ../bench/*.wr --reject tests/reject/*.wr")))

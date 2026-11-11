@@ -1,0 +1,425 @@
+(* Recursive-descent parser with Pratt-style binary expressions.
+
+   Newline rule: a newline ends an expression unless the next line starts
+   with `.` (method chains). So `f\n(x)` is two statements, not a call. *)
+open Ast
+open Lexer
+
+type st = { toks : token array; mutable pos : int; file : string }
+
+let peek st = st.toks.(st.pos)
+
+let advance st =
+  let t = st.toks.(st.pos) in
+  if t.tok <> EOF then st.pos <- st.pos + 1;
+  t
+
+let fail (t : token) expected =
+  raise
+    (Diag.Fatal
+       (Diag.make "E0003" t.span (Printf.sprintf "expected %s, found %s" expected (describe t.tok))))
+
+let is_sym st s = (peek st).tok = SYM s
+let is_kw st s = (peek st).tok = KW s
+let accept_sym st s = if is_sym st s then (ignore (advance st); true) else false
+let expect_sym st s = if is_sym st s then advance st else fail (peek st) (Printf.sprintf "`%s`" s)
+let expect_kw st s = if is_kw st s then advance st else fail (peek st) (Printf.sprintf "`%s`" s)
+
+let expect_ident st =
+  match (peek st).tok with
+  | IDENT s ->
+    let t = advance st in
+    (s, t.span)
+  | _ -> fail (peek st) "a name"
+
+let last_span st = st.toks.(max 0 (st.pos - 1)).span
+let merge = Span.merge
+let is_upper s = s <> "" && s.[0] >= 'A' && s.[0] <= 'Z'
+let mk d sp = { edesc = d; espan = sp; ety = Types.TErr; einst = [] }
+
+(* Comma-separated list up to [close]; a newline also separates items. *)
+let comma_list st close f =
+  let rec go acc =
+    if accept_sym st close then List.rev acc
+    else begin
+      let x = f st in
+      if accept_sym st "," then go (x :: acc)
+      else if accept_sym st close then List.rev (x :: acc)
+      else if (peek st).nl then go (x :: acc)
+      else fail (peek st) (Printf.sprintf "`,` or `%s`" close)
+    end
+  in
+  go []
+
+let rec parse_type st : ty_expr =
+  let t = peek st in
+  match t.tok with
+  | SYM "(" ->
+    ignore (advance st);
+    let r = expect_sym st ")" in
+    { tdesc = TyUnit; tspan = merge t.span r.span }
+  | KW "fn" ->
+    ignore (advance st);
+    ignore (expect_sym st "(");
+    let ps = comma_list st ")" parse_type in
+    ignore (expect_sym st "->");
+    let r = parse_type st in
+    { tdesc = TyFn (ps, r); tspan = merge t.span r.tspan }
+  | INT n ->
+    ignore (advance st);
+    { tdesc = TyInt n; tspan = t.span }
+  | IDENT n ->
+    ignore (advance st);
+    if is_sym st "[" && not (peek st).nl then begin
+      ignore (advance st);
+      let args = comma_list st "]" parse_type in
+      { tdesc = TyName (n, args); tspan = merge t.span (last_span st) }
+    end
+    else { tdesc = TyName (n, []); tspan = t.span }
+  | _ -> fail t "a type"
+
+let binop_of = function
+  | SYM "||" -> Some (1, Or)
+  | SYM "&&" -> Some (2, And)
+  | SYM "==" -> Some (3, Eq)
+  | SYM "!=" -> Some (3, Ne)
+  | SYM "<" -> Some (4, Lt)
+  | SYM "<=" -> Some (4, Le)
+  | SYM ">" -> Some (4, Gt)
+  | SYM ">=" -> Some (4, Ge)
+  | SYM "+" -> Some (5, Add)
+  | SYM "-" -> Some (5, Sub)
+  | SYM "*" -> Some (6, Mul)
+  | SYM "/" -> Some (6, Div)
+  | SYM "%" -> Some (6, Mod)
+  | _ -> None
+
+(* [ns] = "no struct literal": set in `if`/`while`/`for`/`match` heads so that
+   `if x == y {` does not parse `y { ... }` as a struct literal. *)
+let rec parse_expr st = parse_bin st false 0
+and parse_expr_ns st = parse_bin st true 0
+
+and parse_bin st ns minp =
+  let lhs = ref (parse_unary st ns) in
+  let go = ref true in
+  while !go do
+    let t = peek st in
+    match if t.nl then None else binop_of t.tok with
+    | Some (p, op) when p > minp ->
+      ignore (advance st);
+      let rhs = parse_bin st ns p in
+      lhs := mk (EBin (op, !lhs, rhs)) (merge (!lhs).espan rhs.espan)
+    | _ -> go := false
+  done;
+  !lhs
+
+and parse_unary st ns =
+  let t = peek st in
+  match t.tok with
+  | SYM "-" ->
+    ignore (advance st);
+    let e = parse_unary st ns in
+    mk (EUn (Neg, e)) (merge t.span e.espan)
+  | SYM "!" ->
+    ignore (advance st);
+    let e = parse_unary st ns in
+    mk (EUn (Not, e)) (merge t.span e.espan)
+  | _ -> parse_postfix st ns (parse_primary st ns)
+
+and parse_postfix st ns e =
+  let t = peek st in
+  match t.tok with
+  | SYM "(" when not t.nl ->
+    ignore (advance st);
+    let args = comma_list st ")" parse_expr in
+    parse_postfix st ns (mk (ECall (e, args)) (merge e.espan (last_span st)))
+  | SYM "[" when not t.nl ->
+    ignore (advance st);
+    let i = parse_expr st in
+    let r = expect_sym st "]" in
+    parse_postfix st ns (mk (EIndex (e, i)) (merge e.espan r.span))
+  | SYM "." ->
+    ignore (advance st);
+    let name, nsp = expect_ident st in
+    if is_sym st "(" && not (peek st).nl then begin
+      ignore (advance st);
+      let args = comma_list st ")" parse_expr in
+      parse_postfix st ns (mk (EMethod (e, name, nsp, args)) (merge e.espan (last_span st)))
+    end
+    else parse_postfix st ns (mk (EField (e, name, nsp)) (merge e.espan nsp))
+  | SYM "?" when not t.nl ->
+    ignore (advance st);
+    parse_postfix st ns (mk (ETry e) (merge e.espan t.span))
+  | _ -> e
+
+and parse_primary st ns =
+  let t = peek st in
+  match t.tok with
+  | INT n -> ignore (advance st); mk (EInt n) t.span
+  | FLOAT f -> ignore (advance st); mk (EFloat f) t.span
+  | KW "true" -> ignore (advance st); mk (EBool true) t.span
+  | KW "false" -> ignore (advance st); mk (EBool false) t.span
+  | STR parts ->
+    ignore (advance st);
+    mk (EStr (List.map (str_part st) parts)) t.span
+  | IDENT name ->
+    ignore (advance st);
+    if (not ns) && is_upper name && is_sym st "{" then parse_struct_lit st name t.span
+    else mk (EVar name) t.span
+  | SYM "(" ->
+    ignore (advance st);
+    if is_sym st ")" then
+      let r = advance st in
+      mk EUnit (merge t.span r.span)
+    else
+      let e = parse_expr st in
+      let r = expect_sym st ")" in
+      { e with espan = merge t.span r.span }
+  | SYM "[" ->
+    ignore (advance st);
+    let es = comma_list st "]" parse_expr in
+    mk (EList es) (merge t.span (last_span st))
+  | SYM "{" ->
+    let b = parse_block st in
+    mk (EBlock b) b.bspan
+  | KW "if" -> parse_if st
+  | KW "match" -> parse_match st
+  | SYM "|" ->
+    ignore (advance st);
+    let params =
+      comma_list st "|" (fun st ->
+          let n, sp = expect_ident st in
+          let ty = if accept_sym st ":" then Some (parse_type st) else None in
+          (n, ty, sp))
+    in
+    let body = parse_expr st in
+    mk (EClosure (params, body)) (merge t.span body.espan)
+  | SYM "||" ->
+    ignore (advance st);
+    let body = parse_expr st in
+    mk (EClosure ([], body)) (merge t.span body.espan)
+  | KW "group" ->
+    ignore (advance st);
+    let name, _ = expect_ident st in
+    let b = parse_block st in
+    mk (EGroup (name, b)) (merge t.span b.bspan)
+  | _ -> fail t "an expression"
+
+and str_part st = function
+  | Lit s -> SPLit s
+  | Interp (src, off) ->
+    let toks = Lexer.lex ~base:off st.file src in
+    let sub = { toks; pos = 0; file = st.file } in
+    let e = parse_expr sub in
+    if (peek sub).tok <> EOF then fail (peek sub) "`}` to close the interpolation";
+    SPExpr e
+
+and parse_struct_lit st name nsp =
+  ignore (expect_sym st "{");
+  let fields =
+    comma_list st "}" (fun st ->
+        let f, fsp = expect_ident st in
+        if accept_sym st ":" then (f, fsp, parse_expr st) else (f, fsp, mk (EVar f) fsp))
+  in
+  mk (EStruct (name, nsp, fields)) (merge nsp (last_span st))
+
+and parse_if st =
+  let t = expect_kw st "if" in
+  let c = parse_expr_ns st in
+  let b = parse_block st in
+  if is_kw st "else" then begin
+    ignore (advance st);
+    let e =
+      if is_kw st "if" then parse_if st
+      else
+        let b2 = parse_block st in
+        mk (EBlock b2) b2.bspan
+    in
+    mk (EIf (c, b, Some e)) (merge t.span e.espan)
+  end
+  else mk (EIf (c, b, None)) (merge t.span b.bspan)
+
+and parse_match st =
+  let t = expect_kw st "match" in
+  let s = parse_expr_ns st in
+  ignore (expect_sym st "{");
+  let arms = ref [] in
+  while not (accept_sym st "}") do
+    let p = parse_pat st in
+    ignore (expect_sym st "=>");
+    let body = parse_expr st in
+    arms := { apat = p; abody = body } :: !arms;
+    if (not (accept_sym st ",")) && (not (is_sym st "}")) && not (peek st).nl then
+      fail (peek st) "`,` or a new line between match arms"
+  done;
+  mk (EMatch (s, List.rev !arms)) (merge t.span (last_span st))
+
+and parse_pat st =
+  let t = peek st in
+  let mkp d sp = { pdesc = d; pspan = sp } in
+  match t.tok with
+  | IDENT "_" -> ignore (advance st); mkp PWild t.span
+  | INT n -> ignore (advance st); mkp (PInt n) t.span
+  | SYM "-" -> (
+    ignore (advance st);
+    match (peek st).tok with
+    | INT n ->
+      let t2 = advance st in
+      mkp (PInt (-n)) (merge t.span t2.span)
+    | _ -> fail (peek st) "a number")
+  | STR [] -> ignore (advance st); mkp (PStr "") t.span
+  | STR [ Lit s ] -> ignore (advance st); mkp (PStr s) t.span
+  | STR _ -> fail t "a plain string (no interpolation) in a pattern"
+  | KW "true" -> ignore (advance st); mkp (PBool true) t.span
+  | KW "false" -> ignore (advance st); mkp (PBool false) t.span
+  | IDENT a ->
+    ignore (advance st);
+    let q, v, vsp =
+      if is_sym st "." then begin
+        ignore (advance st);
+        let v, vsp = expect_ident st in
+        (Some a, v, vsp)
+      end
+      else (None, a, t.span)
+    in
+    if is_sym st "(" then begin
+      ignore (advance st);
+      let args = comma_list st ")" parse_pat in
+      mkp (PVariant (q, v, args)) (merge t.span (last_span st))
+    end
+    else if q <> None || is_upper v then mkp (PVariant (q, v, [])) (merge t.span vsp)
+    else mkp (PBind v) t.span
+  | _ -> fail t "a pattern"
+
+and parse_block st =
+  let lb = expect_sym st "{" in
+  let stmts = ref [] and tail = ref None in
+  let rec loop () =
+    if not (is_sym st "}") then begin
+      let s = parse_stmt st in
+      let semi = accept_sym st ";" in
+      if is_sym st "}" then begin
+        match s.sdesc with
+        | SExpr e when not semi -> tail := Some e
+        | _ -> stmts := s :: !stmts
+      end
+      else begin
+        if (not semi) && not (peek st).nl then
+          raise
+            (Diag.Fatal
+               (Diag.make "E0004" (peek st).span
+                  (Printf.sprintf "expected a new line or `;` before %s" (describe (peek st).tok))));
+        stmts := s :: !stmts;
+        loop ()
+      end
+    end
+  in
+  loop ();
+  let rb = expect_sym st "}" in
+  { stmts = List.rev !stmts; tail = !tail; bspan = merge lb.span rb.span }
+
+and parse_stmt st =
+  let t = peek st in
+  let mks d sp = { sdesc = d; sspan = sp } in
+  match t.tok with
+  | KW "let" ->
+    ignore (advance st);
+    let m = if is_kw st "mut" then (ignore (advance st); true) else false in
+    let n, nsp = expect_ident st in
+    let ann = if accept_sym st ":" then Some (parse_type st) else None in
+    ignore (expect_sym st "=");
+    let e = parse_expr st in
+    mks (SLet (m, n, nsp, ann, e)) (merge t.span e.espan)
+  | KW "return" ->
+    ignore (advance st);
+    let nt = peek st in
+    if nt.nl || nt.tok = SYM "}" || nt.tok = SYM ";" then mks (SReturn None) t.span
+    else
+      let e = parse_expr st in
+      mks (SReturn (Some e)) (merge t.span e.espan)
+  | KW "while" ->
+    ignore (advance st);
+    let c = parse_expr_ns st in
+    let b = parse_block st in
+    mks (SWhile (c, b)) (merge t.span b.bspan)
+  | KW "for" ->
+    ignore (advance st);
+    let n, nsp = expect_ident st in
+    ignore (expect_kw st "in");
+    let e = parse_expr_ns st in
+    let b = parse_block st in
+    mks (SFor (n, nsp, e, b)) (merge t.span b.bspan)
+  | KW "break" -> ignore (advance st); mks SBreak t.span
+  | KW "continue" -> ignore (advance st); mks SContinue t.span
+  | _ ->
+    let e = parse_expr st in
+    if is_sym st "=" then begin
+      ignore (advance st);
+      let r = parse_expr st in
+      mks (SAssign (e, r)) (merge e.espan r.espan)
+    end
+    else mks (SExpr e) e.espan
+
+let parse_generics st =
+  if is_sym st "[" then begin
+    ignore (advance st);
+    comma_list st "]" (fun st -> fst (expect_ident st))
+  end
+  else []
+
+let parse_item st =
+  let t = peek st in
+  match t.tok with
+  | KW "fn" ->
+    ignore (advance st);
+    let name, nsp = expect_ident st in
+    let gen = parse_generics st in
+    ignore (expect_sym st "(");
+    let params =
+      comma_list st ")" (fun st ->
+          let pn, psp = expect_ident st in
+          if not (is_sym st ":") then
+            raise
+              (Diag.Fatal
+                 (Diag.make "E0008" psp
+                    (Printf.sprintf "parameter `%s` needs a type, for example `%s: Int`" pn pn)));
+          ignore (advance st);
+          { prm_name = pn; prm_span = psp; prm_ty = parse_type st })
+    in
+    let ret = if accept_sym st "->" then Some (parse_type st) else None in
+    let body = parse_block st in
+    IFn { fn_name = name; fn_span = nsp; fn_gen = gen; fn_params = params; fn_ret = ret; fn_body = body }
+  | KW "struct" ->
+    ignore (advance st);
+    let name, nsp = expect_ident st in
+    let gen = parse_generics st in
+    ignore (expect_sym st "{");
+    let fields =
+      comma_list st "}" (fun st ->
+          let f, fsp = expect_ident st in
+          ignore (expect_sym st ":");
+          (f, fsp, parse_type st))
+    in
+    IStruct { st_name = name; st_span = nsp; st_gen = gen; st_fields = fields }
+  | KW "enum" ->
+    ignore (advance st);
+    let name, nsp = expect_ident st in
+    let gen = parse_generics st in
+    ignore (expect_sym st "{");
+    let variants =
+      comma_list st "}" (fun st ->
+          let v, vsp = expect_ident st in
+          let payload = if accept_sym st "(" then comma_list st ")" parse_type else [] in
+          (v, vsp, payload))
+    in
+    IEnum { en_name = name; en_span = nsp; en_gen = gen; en_variants = variants }
+  | _ -> fail t "an item (`fn`, `struct` or `enum`)"
+
+let parse_program file src : item list =
+  let toks = Lexer.lex file src in
+  let st = { toks; pos = 0; file } in
+  let items = ref [] in
+  while (peek st).tok <> EOF do
+    items := parse_item st :: !items
+  done;
+  List.rev !items

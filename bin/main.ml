@@ -1,0 +1,178 @@
+open Writ
+
+let usage =
+  {|writ: a small language where I/O needs a capability
+
+usage:
+  writ run FILE [--native] [--grant net=HOST[:PORT]|*]... [--grant fs=DIR[:ro]]
+  writ build FILE [-o OUT] [--emit-c]
+  writ check FILE [--json]
+  writ caps FILE [--json]
+  writ explain CODE
+  writ lsp                (language server on stdin/stdout)
+
+Stdout and Clock are always granted. Net and Fs exist only when granted.
+|}
+
+let die_usage msg =
+  prerr_string (if msg = "" then usage else "writ: " ^ msg ^ "\n\n" ^ usage);
+  exit 2
+
+let load file =
+  let src =
+    try In_channel.with_open_bin file In_channel.input_all
+    with Sys_error m -> prerr_endline ("writ: " ^ m); exit 2
+  in
+  Source.add file src;
+  match Parser.parse_program file src with
+  | exception Diag.Fatal d -> ([], [ d ], [])
+  | items ->
+    let diags, infos = Check.check_program items in
+    (items, diags, infos)
+
+let report diags =
+  List.iter (fun d -> prerr_string (Diag.render d); prerr_newline ()) diags;
+  let n = List.length diags in
+  Printf.eprintf "%d error%s\n" n (if n = 1 then "" else "s")
+
+let parse_grants args =
+  List.fold_left
+    (fun (g : Interp.grants) a ->
+      match String.index_opt a '=' with
+      | Some i when String.sub a 0 i = "net" ->
+        { g with net = g.net @ [ String.sub a (i + 1) (String.length a - i - 1) ] }
+      | Some i when String.sub a 0 i = "fs" ->
+        let v = String.sub a (i + 1) (String.length a - i - 1) in
+        let dir, ro =
+          if String.ends_with ~suffix:":ro" v then (String.sub v 0 (String.length v - 3), true) else (v, false)
+        in
+        let real = try Unix.realpath dir with Unix.Unix_error _ -> die_usage ("fs grant: no such directory " ^ dir) in
+        if not (Sys.is_directory real) then die_usage ("fs grant: not a directory " ^ dir);
+        { g with fs = Some (real, ro) }
+      | _ -> die_usage ("unknown grant `" ^ a ^ "`"))
+    Interp.no_grants args
+
+let rec split_grants = function
+  | "--grant" :: g :: rest ->
+    let gs, others = split_grants rest in
+    (g :: gs, others)
+  | "--grant" :: [] -> die_usage "--grant needs a value"
+  | x :: rest ->
+    let gs, others = split_grants rest in
+    (gs, x :: others)
+  | [] -> ([], [])
+
+let cmd_check file json =
+  let _, diags, _ = load file in
+  if json then print_endline (Diag.list_to_json diags)
+  else if diags = [] then print_endline "ok"
+  else report diags;
+  exit (if diags = [] then 0 else 1)
+
+let cmd_caps file json =
+  let _, diags, infos = load file in
+  if diags <> [] then (report diags; exit 1);
+  let caps_str (i : Check.fn_info) = List.map Types.cap_name i.caps in
+  if json then begin
+    let one (i : Check.fn_info) =
+      Printf.sprintf {|{"name":%s,"caps":[%s],"callbacks":%b,"pure":%b}|} (Diag.jstr i.name)
+        (String.concat "," (List.map Diag.jstr (caps_str i)))
+        i.callbacks
+        (i.caps = [] && not i.callbacks)
+    in
+    print_endline ("{\"functions\":[" ^ String.concat "," (List.map one infos) ^ "]}")
+  end
+  else begin
+    let width = List.fold_left (fun w (i : Check.fn_info) -> max w (String.length i.name)) 0 infos in
+    List.iter
+      (fun (i : Check.fn_info) ->
+        let what =
+          match (caps_str i, i.callbacks) with
+          | [], false -> "pure"
+          | [], true -> "pure itself, runs callbacks"
+          | cs, cb -> String.concat ", " cs ^ if cb then " + callbacks" else ""
+        in
+        Printf.printf "%-*s  %s\n" width i.name what)
+      infos
+  end
+
+let checked file =
+  let items, diags, _ = load file in
+  if diags <> [] then (report diags; exit 1);
+  if not (List.exists (function Ast.IFn d -> d.fn_name = "main" | _ -> false) items) then begin
+    prerr_endline "error: no `main` function";
+    exit 1
+  end;
+  items
+
+let cmd_build file out emit_c =
+  let items = checked file in
+  let out = match out with Some o -> o | None -> Filename.remove_extension (Filename.basename file) in
+  if emit_c then Out_channel.with_open_bin (out ^ ".c") (fun oc -> output_string oc (Native.c_source items))
+  else
+    match Native.build items out with
+    | Ok () -> (try Sys.remove (out ^ ".c") with Sys_error _ -> ())
+    | Error m ->
+      prerr_string m;
+      prerr_endline "writ: the C compiler failed (this is a bug in writ)";
+      exit 1
+
+let cmd_run_native file grant_args =
+  ignore (parse_grants grant_args);
+  let items = checked file in
+  let dir = Filename.get_temp_dir_name () in
+  let exe = Filename.concat dir (Printf.sprintf "writ-%d" (Unix.getpid ())) in
+  (match Native.build items exe with
+   | Ok () -> ()
+   | Error m -> prerr_string m; prerr_endline "writ: the C compiler failed (this is a bug in writ)"; exit 1);
+  let args = List.concat_map (fun g -> [ "--grant"; g ]) grant_args in
+  let pid = Unix.create_process exe (Array.of_list (exe :: args)) Unix.stdin Unix.stdout Unix.stderr in
+  let _, status = Unix.waitpid [] pid in
+  List.iter (fun f -> try Sys.remove f with Sys_error _ -> ()) [ exe; exe ^ ".c" ];
+  exit (match status with Unix.WEXITED n -> n | _ -> 1)
+
+let cmd_run file grant_args =
+  let grants = parse_grants grant_args in
+  let items, diags, _ = load file in
+  if diags <> [] then (report diags; exit 1);
+  let out s = print_string s; flush stdout in
+  match Interp.run ~out ~grants items with
+  | Ok (Interp.VEnum ("Result", "Err", [ e ])) ->
+    Printf.eprintf "error: %s\n" (Interp.show e);
+    exit 1
+  | Ok _ -> exit 0
+  | Error (m, sp) ->
+    Printf.eprintf "panic: %s\n" m;
+    if sp.Span.file <> "" then begin
+      let l, c = Source.line_col sp.file sp.lo in
+      Printf.eprintf "  --> %s:%d:%d\n" sp.file l c
+    end;
+    exit 1
+
+let () =
+  match List.tl (Array.to_list Sys.argv) with
+  | [ "check"; file ] -> cmd_check file false
+  | [ "check"; file; "--json" ] | [ "check"; "--json"; file ] -> cmd_check file true
+  | [ "caps"; file ] -> cmd_caps file false
+  | [ "caps"; file; "--json" ] | [ "caps"; "--json"; file ] -> cmd_caps file true
+  | [ "lsp" ] -> Lsp.serve ()
+  | [ "explain"; code ] -> (
+    match Diag.explain (String.uppercase_ascii code) with
+    | Some t -> print_endline (String.uppercase_ascii code ^ ": " ^ t)
+    | None -> die_usage ("unknown error code " ^ code))
+  | "run" :: rest -> (
+    match split_grants rest with
+    | gs, [ file ] -> cmd_run file gs
+    | gs, ([ "--native"; file ] | [ file; "--native" ]) -> cmd_run_native file gs
+    | _ -> die_usage "run needs exactly one FILE")
+  | "build" :: rest ->
+    let rec go file out emit = function
+      | "-o" :: o :: r -> go file (Some o) emit r
+      | "--emit-c" :: r -> go file out true r
+      | f :: r when file = None -> go (Some f) out emit r
+      | [] -> ( match file with Some f -> cmd_build f out emit | None -> die_usage "build needs a FILE")
+      | _ -> die_usage "bad build arguments"
+    in
+    go None None false rest
+  | [] | [ ("-h" | "--help" | "help") ] -> print_string usage
+  | _ -> die_usage ""

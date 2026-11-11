@@ -1,0 +1,41 @@
+// Points of a 4000x4000 grid inside the Mandelbrot set (500 iterations).
+// One task per row; the group runs them on every core.
+fn row_count(y: Int, size: Int, iters: Int) -> Int {
+    let ci = 2.0 * y.to_float() / size.to_float() - 1.0
+    let mut count = 0
+    let mut x = 0
+    while x < size {
+        let cr = 2.0 * x.to_float() / size.to_float() - 1.5
+        let mut zr = 0.0
+        let mut zi = 0.0
+        let mut i = 0
+        let mut inside = true
+        while i < iters {
+            let zr2 = zr * zr
+            let zi2 = zi * zi
+            if zr2 + zi2 > 4.0 {
+                inside = false
+                break
+            }
+            zi = 2.0 * zr * zi + ci
+            zr = zr2 - zi2 + cr
+            i = i + 1
+        }
+        if inside { count = count + 1 }
+        x = x + 1
+    }
+    count
+}
+
+fn main(root: Root) {
+    let size = 4000
+    let counts = group g {
+        let mut y = 0
+        while y < size {
+            let row = y
+            g.go(|| row_count(row, size, 500))
+            y = y + 1
+        }
+    }
+    root.stdout.print("{counts.sum()}")
+}

@@ -1,0 +1,10 @@
+(test
+ (name test_writ)
+ (libraries writ unix))
+
+; `writ lsp` end to end over stdio.
+(rule
+ (alias runtest)
+ (deps lsp_stdio.py %{exe:../bin/main.exe})
+ (action
+  (run python3 lsp_stdio.py %{exe:../bin/main.exe})))

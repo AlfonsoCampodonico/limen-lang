@@ -1,0 +1,37 @@
+// Longest Collatz chain for a starting value below 5 million.
+// 50 tasks of 100k numbers each.
+fn chain(n: Int) -> Int {
+    let mut x = n
+    let mut steps = 0
+    while x != 1 {
+        if x % 2 == 0 { x = x / 2 } else { x = 3 * x + 1 }
+        steps = steps + 1
+    }
+    steps
+}
+
+fn best(lo: Int, hi: Int) -> Int {
+    let mut top = 0
+    let mut n = lo
+    while n < hi {
+        let c = chain(n)
+        if c > top { top = c }
+        n = n + 1
+    }
+    top
+}
+
+fn main(root: Root) {
+    let limit = 5000000
+    let chunk = 100000
+    let tops = group g {
+        let mut lo = 1
+        while lo < limit {
+            let a = lo
+            let b = if lo + chunk < limit { lo + chunk } else { limit }
+            g.go(|| best(a, b))
+            lo = lo + chunk
+        }
+    }
+    root.stdout.print("{tops.fold(0, |m, t| if t > m { t } else { m })}")
+}

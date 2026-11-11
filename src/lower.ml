@@ -1,0 +1,709 @@
+(* Typed AST -> IR. Generic functions are instantiated per concrete type
+   arguments (monomorphization); closures are lifted to top-level functions
+   that receive their captured values; list map/filter/fold and the Option and
+   Result helpers become plain loops and branches. *)
+open Ast
+open Types
+module I = Ir
+
+let sprintf = Printf.sprintf
+
+type gctx = {
+  fns : (string, fn_decl) Hashtbl.t;
+  structs : (string, struct_decl) Hashtbl.t;
+  enums : (string, enum_decl) Hashtbl.t;
+  ctors : (string, string) Hashtbl.t; (* variant -> enum, when unambiguous *)
+  instances : (string, string) Hashtbl.t; (* "name[args]" -> C name *)
+  mutable queue : (string * fn_decl * (string * ty) list) list;
+  mutable out : I.fn list;
+  mutable counter : int;
+}
+
+type fctx = {
+  g : gctx;
+  genv : (string * ty) list;
+  mutable scopes : (string, I.var) Hashtbl.t list;
+  mutable buf : I.stmt list; (* reversed *)
+  mutable dead : bool; (* control cannot reach this point *)
+  ret : ty;
+  parent : fctx option;
+  caps : (I.var * I.var) list ref; (* captured: outer var, inner var *)
+}
+
+let var_counter = ref 0
+
+let fresh_var name ty =
+  incr var_counter;
+  { I.id = !var_counter; name; ty }
+
+let new_fctx g genv ret parent =
+  { g; genv; scopes = [ Hashtbl.create 8 ]; buf = []; dead = false; ret; parent; caps = ref [] }
+
+let emit f s = if not f.dead then f.buf <- s :: f.buf
+
+let tmp f ty rhs =
+  let v = fresh_var "t" ty in
+  emit f (I.Let (v, rhs));
+  I.V v
+
+let bind f n v = Hashtbl.replace (List.hd f.scopes) n v
+
+(* Run [k] collecting its statements into a separate block with its own scope. *)
+let in_block f k =
+  let saved = f.buf and saved_dead = f.dead in
+  f.buf <- [];
+  f.dead <- false;
+  f.scopes <- Hashtbl.create 8 :: f.scopes;
+  let r = k () in
+  let stmts = List.rev f.buf and d = f.dead in
+  f.scopes <- List.tl f.scopes;
+  f.buf <- saved;
+  f.dead <- saved_dead;
+  (stmts, r, d)
+
+let rec lookup f n =
+  let rec local = function
+    | [] -> None
+    | s :: rest -> ( match Hashtbl.find_opt s n with Some v -> Some v | None -> local rest)
+  in
+  match local f.scopes with
+  | Some v -> Some v
+  | None -> (
+    match f.parent with
+    | None -> None
+    | Some p -> (
+      match lookup p n with
+      | None -> None
+      | Some outer -> (
+        match List.find_opt (fun ((o : I.var), _) -> o.id = outer.id) !(f.caps) with
+        | Some (_, inner) -> Some inner
+        | None ->
+          let inner = fresh_var n outer.ty in
+          f.caps := !(f.caps) @ [ (outer, inner) ];
+          Some inner)))
+
+(* ---------- types ---------- *)
+
+let rec resolve env (te : ty_expr) : ty =
+  match te.tdesc with
+  | TyUnit -> TUnit
+  | TyFn (ps, r) -> TFn (List.map (resolve env) ps, resolve env r)
+  | TyInt _ -> TUnit
+  | TyName ("Array", [ elt; { tdesc = TyInt n; _ } ]) -> TArray (resolve env elt, n)
+  | TyName (n, args) -> (
+    let a = List.map (resolve env) args in
+    match (n, a) with
+    | "Int", _ -> TInt
+    | "Float", _ -> TFloat
+    | "Bool", _ -> TBool
+    | "Str", _ -> TStr
+    | "List", [ x ] -> TList x
+    | "Root", _ -> TCap Root
+    | "Net", _ -> TCap Net
+    | "Fs", _ -> TCap Fs
+    | "Stdout", _ -> TCap Stdout
+    | "Clock", _ -> TCap Clock
+    | _ -> ( match List.assoc_opt n env with Some t -> t | None -> TNamed (n, a)))
+
+let field_types g = function
+  | TNamed (n, args) ->
+    let s = Hashtbl.find g.structs n in
+    let env = List.combine s.st_gen args in
+    List.map (fun (f, _, te) -> (f, resolve env te)) s.st_fields
+  | _ -> failwith "field_types"
+
+let variants g = function
+  | TNamed (n, args) ->
+    let e = Hashtbl.find g.enums n in
+    let env = List.combine e.en_gen args in
+    List.map (fun (v, _, tes) -> (v, List.map (resolve env) tes)) e.en_variants
+  | _ -> failwith "variants"
+
+let index_of x l =
+  let rec go i = function [] -> failwith ("index_of " ^ x) | y :: r -> if y = x then i else go (i + 1) r in
+  go 0 l
+
+let field_index g t name = index_of name (List.map fst (field_types g t))
+let tag_of g t v = index_of v (List.map fst (variants g t))
+let tyof f (e : expr) = zonk f.genv e.ety
+let is_struct g = function TNamed (n, _) -> Hashtbl.mem g.structs n | _ -> false
+
+(* ---------- function instances ---------- *)
+
+let instance g name (targs : (string * ty) list) =
+  let key = name ^ "[" ^ String.concat "," (List.map (fun (_, t) -> show t) targs) ^ "]" in
+  match Hashtbl.find_opt g.instances key with
+  | Some c -> c
+  | None ->
+    let c = if targs = [] then "wf_" ^ name else sprintf "wf_%s_%d" name (Hashtbl.length g.instances) in
+    Hashtbl.replace g.instances key c;
+    g.queue <- g.queue @ [ (c, Hashtbl.find g.fns name, targs) ];
+    c
+
+let lift g ~params ~ret ~body =
+  g.counter <- g.counter + 1;
+  let name = sprintf "wf_lift%d" g.counter in
+  g.out <- { I.fname = name; params; captures = []; is_closure = true; ret; body } :: g.out;
+  name
+
+(* A top-level function or a variant constructor used as a value. *)
+let wrapper g ty make =
+  match ty with
+  | TFn (ps, r) ->
+    let params = List.map (fun t -> fresh_var "a" t) ps in
+    let res = fresh_var "r" r in
+    let body = [ I.Let (res, make (List.map (fun v -> I.V v) params)); I.Return (I.V res) ] in
+    lift g ~params ~ret:r ~body
+  | _ -> failwith "wrapper"
+
+let not_local f n = lookup f n = None
+let is_enum_name f n = not_local f n && Hashtbl.mem f.g.enums n
+
+(* ---------- expressions ---------- *)
+
+let rec lower f (e : expr) : I.atom =
+  if f.dead then I.AUnit
+  else
+    let ty = tyof f e in
+    match e.edesc with
+    | EInt n -> I.AInt n
+    | EFloat x -> I.AFloat x
+    | EBool b -> I.ABool b
+    | EUnit -> I.AUnit
+    | EStr [] -> I.AStr ""
+    | EStr [ SPLit s ] -> I.AStr s
+    | EStr parts ->
+      let ps =
+        List.map
+          (function
+            | SPLit s -> I.IStr s
+            | SPExpr x ->
+              let a = lower f x in
+              I.IVal (a, tyof f x))
+          parts
+      in
+      tmp f TStr (I.Interp ps)
+    | EVar n -> ( match lookup f n with Some v -> I.V v | None -> global_value f e n ty)
+    | EList es ->
+      let xs = List.map (lower f) es in
+      tmp f ty (I.MkList (ty, xs))
+    | EBin (((And | Or) as op), a, b) ->
+      let x = lower f a in
+      let r = fresh_var "b" TBool in
+      emit f (I.Decl r);
+      let rhs_branch, _, _ =
+        in_block f (fun () ->
+            let y = lower f b in
+            emit f (I.Init (r, I.Atom y)))
+      in
+      let const_branch = [ I.Init (r, I.Atom (I.ABool (op = Or))) ] in
+      emit f (if op = And then I.If (x, rhs_branch, const_branch) else I.If (x, const_branch, rhs_branch));
+      I.V r
+    | EBin (op, a, b) ->
+      let x = lower f a in
+      let y = lower f b in
+      tmp f ty (I.Bin (op, tyof f a, x, y, e.espan))
+    | EUn (Neg, a) ->
+      let x = lower f a in
+      tmp f ty (I.Neg (ty, x))
+    | EUn (Not, a) ->
+      let x = lower f a in
+      tmp f TBool (I.Not x)
+    | ECall (callee, args) -> lower_call f e callee args ty
+    | EMethod ({ edesc = EVar en; _ }, name, _, args) when is_enum_name f en ->
+      let xs = List.map (lower f) args in
+      tmp f ty (I.MkEnum (ty, tag_of f.g ty name, xs))
+    | EMethod (recv, "push", _, [ a ]) when (match tyof f recv with TList _ -> true | _ -> false) ->
+      let v, steps = lower_place f recv in
+      let x = lower f a in
+      emit f (I.Mutate (v, steps, I.MPush x));
+      I.AUnit
+    | EMethod (recv, "go", _, [ task ]) when (match tyof f recv with TGroup _ -> true | _ -> false) ->
+      let g = lower f recv in
+      let c = lower f task in
+      let t = match tyof f recv with TGroup t -> t | _ -> TUnit in
+      ignore (tmp f TUnit (I.Spawn (g, c, t)));
+      I.AUnit
+    | EMethod (recv, name, _, args) -> lower_method f e recv name args ty
+    | EField ({ edesc = EVar en; _ }, name, _) when is_enum_name f en -> ctor_value f name ty
+    | EField _ | EIndex _ -> (
+      let root, rty, steps = access f e in
+      match steps with [] -> root | _ -> tmp f ty (I.Get (root, rty, steps)))
+    | ETry x -> lower_try f x
+    | EIf (c, b, els) ->
+      let ca = lower f c in
+      let r = fresh_var "if" ty in
+      emit f (I.Decl r);
+      let s1, _, d1 =
+        in_block f (fun () ->
+            let a = lower_block_inner f b in
+            emit f (I.Init (r, I.Atom a)))
+      in
+      let s2, _, d2 =
+        in_block f (fun () ->
+            match els with
+            | Some x ->
+              let a = lower f x in
+              emit f (I.Init (r, I.Atom a))
+            | None -> emit f (I.Init (r, I.Atom I.AUnit)))
+      in
+      emit f (I.If (ca, s1, s2));
+      if d1 && d2 then f.dead <- true;
+      I.V r
+    | EMatch (s, arms) -> lower_match f e s arms ty
+    | EBlock b -> lower_block f b
+    | EClosure (ps, body) -> lower_closure f ps body ty
+    | EStruct (name, _, fields) ->
+      let vals = List.map (fun (fname, _, x) -> (fname, lower f x)) fields in
+      let decl = Hashtbl.find f.g.structs name in
+      tmp f ty (I.MkStruct (ty, List.map (fun (fn, _, _) -> List.assoc fn vals) decl.st_fields))
+    | EGroup (name, b) ->
+      let t = match ty with TList t -> t | _ -> TUnit in
+      let g = fresh_var name (TGroup t) in
+      emit f (I.Let (g, I.GroupNew));
+      f.scopes <- Hashtbl.create 8 :: f.scopes;
+      bind f name g;
+      ignore (lower_block f b);
+      f.scopes <- List.tl f.scopes;
+      tmp f ty (I.GroupJoin (I.V g, ty))
+
+and global_value f e n ty =
+  if Hashtbl.mem f.g.fns n then
+    let c = instance f.g n (List.map (fun (k, t) -> (k, zonk f.genv t)) e.einst) in
+    let w = wrapper f.g ty (fun args -> I.Call (c, args)) in
+    tmp f ty (I.MkClosure (w, ty, []))
+  else ctor_value f n ty
+
+and ctor_value f vname ty =
+  match ty with
+  | TFn (_, rt) ->
+    let tag = tag_of f.g rt vname in
+    let w = wrapper f.g ty (fun args -> I.MkEnum (rt, tag, args)) in
+    tmp f ty (I.MkClosure (w, ty, []))
+  | _ -> tmp f ty (I.MkEnum (ty, tag_of f.g ty vname, []))
+
+and lower_call f e callee args ty =
+  match callee.edesc with
+  | EVar "panic" when not_local f "panic" && not (Hashtbl.mem f.g.fns "panic") ->
+    let m = lower f (List.hd args) in
+    let r = tmp f ty (I.Panic (m, e.espan)) in
+    f.dead <- true;
+    r
+  | EVar n when not_local f n && Hashtbl.mem f.g.fns n ->
+    let c = instance f.g n (List.map (fun (k, t) -> (k, zonk f.genv t)) callee.einst) in
+    let xs = List.map (lower f) args in
+    tmp f ty (I.Call (c, xs))
+  | EVar n when not_local f n && Hashtbl.mem f.g.ctors n ->
+    let xs = List.map (lower f) args in
+    tmp f ty (I.MkEnum (ty, tag_of f.g ty n, xs))
+  | EField ({ edesc = EVar en; _ }, v, _) when is_enum_name f en ->
+    let xs = List.map (lower f) args in
+    tmp f ty (I.MkEnum (ty, tag_of f.g ty v, xs))
+  | _ ->
+    let c = lower f callee in
+    let xs = List.map (lower f) args in
+    tmp f ty (I.CallClo (c, xs))
+
+(* A chain of field and index reads, so `a[i].x` is one Get, not two copies. *)
+and access f e : I.atom * ty * I.step list =
+  match e.edesc with
+  | EField (r, name, _) when is_struct f.g (tyof f r) ->
+    let a, rt, steps = access f r in
+    (a, rt, steps @ [ I.PField (field_index f.g (tyof f r) name) ])
+  | EIndex (r, i) ->
+    let a, rt, steps = access f r in
+    let ia = lower f i in
+    (a, rt, steps @ [ I.PIndex (ia, e.espan) ])
+  | EField (r, name, _) when tyof f r = TCap Root ->
+    let a = lower f r in
+    (tmp f (tyof f e) (I.RootField (a, name)), tyof f e, [])
+  | _ -> (lower f e, tyof f e, [])
+
+and lower_place f e : I.var * I.step list =
+  match e.edesc with
+  | EVar n -> ( match lookup f n with Some v -> (v, []) | None -> failwith ("place " ^ n))
+  | EField (r, name, _) ->
+    let v, s = lower_place f r in
+    (v, s @ [ I.PField (field_index f.g (tyof f r) name) ])
+  | EIndex (r, i) ->
+    let v, s = lower_place f r in
+    let ia = lower f i in
+    (v, s @ [ I.PIndex (ia, e.espan) ])
+  | _ -> failwith "place"
+
+and lower_try f x =
+  let a = lower f x in
+  let xt = tyof f x in
+  let ok_ty, fail =
+    match xt with
+    | TNamed ("Result", [ t; et ]) ->
+      ( t,
+        fun () ->
+          let ev = tmp f et (I.Payload (a, xt, 1, 0)) in
+          tmp f f.ret (I.MkEnum (f.ret, 1, [ ev ])) )
+    | TNamed ("Option", [ t ]) -> (t, fun () -> tmp f f.ret (I.MkEnum (f.ret, 1, [])))
+    | _ -> failwith "try"
+  in
+  let ok = tmp f TBool (I.IsTag (a, xt, 0)) in
+  let fail_block, _, _ =
+    in_block f (fun () ->
+        let r = fail () in
+        emit f (I.Return r);
+        f.dead <- true)
+  in
+  emit f (I.If (ok, [], fail_block));
+  tmp f ok_ty (I.Payload (a, xt, 0, 0))
+
+and lower_match f e s arms ty =
+  let sa = lower f s in
+  let st = tyof f s in
+  let r = fresh_var "m" ty in
+  emit f (I.Decl r);
+  let irrefutable p = match p.pdesc with PWild | PBind _ -> true | _ -> false in
+  let rec chain = function
+    | [] ->
+      ignore (tmp f TUnit (I.Panic (I.AStr "no `match` arm matched", e.espan)));
+      f.dead <- true
+    | arm :: rest ->
+      let body () =
+        bind_pat f sa st arm.apat;
+        let a = lower f arm.abody in
+        emit f (I.Init (r, I.Atom a))
+      in
+      if irrefutable arm.apat then begin
+        let b, _, d = in_block f body in
+        List.iter (emit f) b;
+        if d then f.dead <- true
+      end
+      else begin
+        let t = tmp f TBool (I.PatTest (sa, st, arm.apat)) in
+        let b1, _, d1 = in_block f body in
+        let b2, _, d2 = in_block f (fun () -> chain rest) in
+        emit f (I.If (t, b1, b2));
+        if d1 && d2 then f.dead <- true
+      end
+  in
+  chain arms;
+  I.V r
+
+and bind_pat f a t (p : pat) =
+  let rec has_bind p =
+    match p.pdesc with PBind _ -> true | PVariant (_, _, args) -> List.exists has_bind args | _ -> false
+  in
+  match p.pdesc with
+  | PBind n ->
+    let v = fresh_var n t in
+    emit f (I.Let (v, I.Atom a));
+    bind f n v
+  | PVariant (_, vn, args) ->
+    let tag = tag_of f.g t vn in
+    let ptys = List.assoc vn (variants f.g t) in
+    List.iteri
+      (fun i (sub, pt) ->
+        if has_bind sub then
+          let pv = tmp f pt (I.Payload (a, t, tag, i)) in
+          bind_pat f pv pt sub)
+      (List.combine args ptys)
+  | _ -> ()
+
+and lower_method f e recv name args ty =
+  let rt = tyof f recv in
+  let sp = e.espan in
+  let branch_init r cond then_ else_ =
+    let s1, _, _ = in_block f (fun () -> emit f (I.Init (r, then_ ()))) in
+    let s2, _, _ = in_block f (fun () -> emit f (I.Init (r, else_ ()))) in
+    emit f (I.If (cond, s1, s2));
+    I.V r
+  in
+  match (rt, name, args) with
+  | TNamed ("Option", _), "is_some", [] -> tmp f TBool (I.IsTag (lower f recv, rt, 0))
+  | TNamed ("Option", _), "is_none", [] -> tmp f TBool (I.IsTag (lower f recv, rt, 1))
+  | TNamed ("Result", _), "is_ok", [] -> tmp f TBool (I.IsTag (lower f recv, rt, 0))
+  | TNamed ("Result", _), "is_err", [] -> tmp f TBool (I.IsTag (lower f recv, rt, 1))
+  | TNamed (("Option" | "Result"), _), "unwrap_or", [ d ] ->
+    let ra = lower f recv in
+    let da = lower f d in
+    let c = tmp f TBool (I.IsTag (ra, rt, 0)) in
+    let r = fresh_var "u" ty in
+    emit f (I.Decl r);
+    branch_init r c (fun () -> I.Payload (ra, rt, 0, 0)) (fun () -> I.Atom da)
+  | TNamed ("Option", [ _ ]), "map", [ fn ] ->
+    let ra = lower f recv in
+    let ca = lower f fn in
+    let c = tmp f TBool (I.IsTag (ra, rt, 0)) in
+    let r = fresh_var "u" ty in
+    emit f (I.Decl r);
+    let ut = match ty with TNamed (_, [ u ]) -> u | _ -> TUnit in
+    let xt = match rt with TNamed (_, [ x ]) -> x | _ -> TUnit in
+    branch_init r c
+      (fun () ->
+        let p = tmp f xt (I.Payload (ra, rt, 0, 0)) in
+        let y = tmp f ut (I.CallClo (ca, [ p ])) in
+        I.MkEnum (ty, 0, [ y ]))
+      (fun () -> I.MkEnum (ty, 1, []))
+  | TNamed ("Result", [ at; et ]), "map_err", [ fn ] ->
+    let ra = lower f recv in
+    let ca = lower f fn in
+    let c = tmp f TBool (I.IsTag (ra, rt, 1)) in
+    let r = fresh_var "u" ty in
+    emit f (I.Decl r);
+    let ut = match ty with TNamed (_, [ _; u ]) -> u | _ -> TUnit in
+    branch_init r c
+      (fun () ->
+        let p = tmp f et (I.Payload (ra, rt, 1, 0)) in
+        let y = tmp f ut (I.CallClo (ca, [ p ])) in
+        I.MkEnum (ty, 1, [ y ]))
+      (fun () ->
+        let p = tmp f at (I.Payload (ra, rt, 0, 0)) in
+        I.MkEnum (ty, 0, [ p ]))
+  | TList _, ("map" | "filter" | "fold"), _ ->
+    (* Fuse a chain like xs.filter(p).map(g).fold(z, h) into one loop. Only
+       pure closure literals are fused into earlier stages: they capture no
+       capability and no function, so running them interleaved instead of
+       stage by stage cannot be observed (except which panic comes first). *)
+    let src_e, stages = stages_of f recv in
+    let src = lower f src_e in
+    let stages = List.map (fun (k, fn, t) -> (k, prepare f fn, t)) stages in
+    let elem = function TList t -> t | _ -> TUnit in
+    let run_stages x terminal =
+      let rec go (v : I.atom) vty = function
+        | [] -> terminal v vty
+        | ("map", p, t) :: rest ->
+          let y = apply f p [ v ] (elem t) in
+          go y (elem t) rest
+        | (_, p, _) :: rest ->
+          let keep = apply f p [ v ] TBool in
+          let blk, _, _ = in_block f (fun () -> go v vty rest) in
+          emit f (I.If (keep, blk, []))
+      in
+      go (I.V x) (elem (tyof f src_e)) stages
+    in
+    (match (name, args) with
+     | "fold", [ init; fn ] ->
+       let ia = lower f init in
+       let p = prepare f fn in
+       let acc = fresh_var "acc" ty in
+       emit f (I.Let (acc, I.Atom ia));
+       emit_for f src (tyof f src_e) sp (fun x ->
+           run_stages x (fun v _ ->
+               let r = apply f p [ I.V acc; v ] ty in
+               emit f (I.Set (acc, I.Atom r, ref false))));
+       I.V acc
+     | _, [ fn ] ->
+       let p = prepare f fn in
+       let out = fresh_var "out" ty in
+       emit f (I.Let (out, I.MkList (ty, [])));
+       emit_for f src (tyof f src_e) sp (fun x ->
+           run_stages x (fun v _ ->
+               if name = "map" then begin
+                 let y = apply f p [ v ] (elem ty) in
+                 emit f (I.Mutate (out, [], I.MPush y))
+               end
+               else begin
+                 let keep = apply f p [ v ] TBool in
+                 let push, _, _ = in_block f (fun () -> emit f (I.Mutate (out, [], I.MPush v))) in
+                 emit f (I.If (keep, push, []))
+               end));
+       I.V out
+     | _ -> failwith "list method arity")
+  | _ ->
+    let ra = lower f recv in
+    let xs = List.map (lower f) args in
+    let prefix =
+      match rt with
+      | TStr -> "str_"
+      | TInt -> "int_"
+      | TFloat -> "float_"
+      | TBool -> "bool_"
+      | TList _ -> "list_"
+      | TArray _ -> "array_"
+      | TCap _ -> "cap_"
+      | _ -> failwith ("method on " ^ show rt)
+    in
+    tmp f ty (I.Prim (prefix ^ name, rt, ra :: xs, sp))
+
+(* Split `src.filter(a).map(b)` into the source and its fusable stages. *)
+and stages_of f e =
+  match e.edesc with
+  | EMethod (r, (("map" | "filter") as k), _, [ fn ])
+    when (match tyof f r with TList _ -> true | _ -> false) && pure_closure f fn ->
+    let src, st = stages_of f r in
+    (src, st @ [ (k, fn, tyof f e) ])
+  | _ -> (e, [])
+
+(* A closure literal is inlined where it is applied (no closure object, no
+   indirect call) unless its body can return early from itself. *)
+and prepare f fn =
+  match fn.edesc with
+  | EClosure (ps, body) when not (has_escape body) -> `Inline (List.map (fun (n, _, _) -> n) ps, body)
+  | _ -> `Value (lower f fn)
+
+and apply f prep args ret_ty =
+  match prep with
+  | `Value c -> tmp f ret_ty (I.CallClo (c, args))
+  | `Inline (ps, body) ->
+    f.scopes <- Hashtbl.create 8 :: f.scopes;
+    List.iter2
+      (fun n a ->
+        let ty = match a with I.V v | I.VDup v -> v.ty | I.AInt _ -> TInt | I.AFloat _ -> TFloat | I.ABool _ -> TBool | I.AUnit -> TUnit | I.AStr _ -> TStr in
+        let v = fresh_var n ty in
+        emit f (I.Let (v, I.Atom a));
+        bind f n v)
+      ps args;
+    let r = lower f body in
+    f.scopes <- List.tl f.scopes;
+    r
+
+(* Pure: a closure literal whose free variables hold no capability and no
+   function value. It can then only compute, which is what fusion needs. *)
+and pure_closure f fn =
+  match fn.edesc with
+  | EClosure (ps, body) when not (has_escape body) ->
+    let free = Free.expr (List.map (fun (n, _, _) -> n) ps) body in
+    List.for_all
+      (fun n ->
+        match lookup f n with
+        | Some (v : I.var) -> caps_in v.ty [] = [] && not (has_fn v.ty)
+        | None -> true (* top-level function or constructor *))
+      free
+  | _ -> false
+
+and has_escape body = Free.has_escape body
+
+(* for x in list: iterate over a snapshot of the list by index. *)
+and emit_for f la lty sp body =
+  let elt = match lty with TList t | TArray (t, _) -> t | _ -> TUnit in
+  let it = fresh_var "it" lty in
+  emit f (I.Let (it, I.Atom la));
+  let i = fresh_var "i" TInt in
+  emit f (I.Let (i, I.Atom (I.AInt 0)));
+  let stmts, _, _ =
+    in_block f (fun () ->
+        let n = tmp f TInt (I.Prim ("list_len", lty, [ I.V it ], sp)) in
+        let c = tmp f TBool (I.Bin (Ge, TInt, I.V i, n, sp)) in
+        let brk, _, _ = in_block f (fun () -> emit f I.Break; f.dead <- true) in
+        emit f (I.If (c, brk, []));
+        let x = fresh_var "x" elt in
+        (* i < len was checked just above, on a snapshot nothing else can change *)
+        emit f (I.Let (x, I.Get (I.V it, lty, [ I.PIndexU (I.V i) ])));
+        emit f (I.Set (i, I.Bin (Add, TInt, I.V i, I.AInt 1, sp), ref false));
+        body x)
+  in
+  emit f (I.Loop stmts)
+
+and lower_closure f ps body ty =
+  let pts, rt = match ty with TFn (a, b) -> (a, b) | _ -> failwith "closure type" in
+  let cf = new_fctx f.g f.genv rt (Some f) in
+  let params =
+    List.map2
+      (fun (n, _, _) t ->
+        let v = fresh_var n t in
+        bind cf n v;
+        v)
+      ps pts
+  in
+  let a = lower cf body in
+  emit cf (I.Return a);
+  f.g.counter <- f.g.counter + 1;
+  let name = sprintf "wf_clo%d" f.g.counter in
+  let caps = !(cf.caps) in
+  f.g.out <-
+    { I.fname = name; params; captures = List.map snd caps; is_closure = true; ret = rt; body = List.rev cf.buf }
+    :: f.g.out;
+  tmp f ty (I.MkClosure (name, ty, List.map (fun ((o : I.var), _) -> I.V o) caps))
+
+and lower_block f b =
+  f.scopes <- Hashtbl.create 8 :: f.scopes;
+  let a = lower_block_inner f b in
+  f.scopes <- List.tl f.scopes;
+  a
+
+and lower_block_inner f b =
+  List.iter (lower_stmt f) b.stmts;
+  match b.tail with Some e -> lower f e | None -> I.AUnit
+
+and lower_stmt f s =
+  if not f.dead then
+    match s.sdesc with
+    | SLet (_, n, _, _, e) ->
+      let a = lower f e in
+      let v = fresh_var n (tyof f e) in
+      emit f (I.Let (v, I.Atom a));
+      bind f n v
+    | SAssign ({ edesc = EVar n; _ }, rhs) ->
+      let a = lower f rhs in
+      let v = match lookup f n with Some v -> v | None -> failwith "assign" in
+      emit f (I.Set (v, I.Atom a, ref false))
+    | SAssign (lhs, rhs) ->
+      let a = lower f rhs in
+      let v, steps = lower_place f lhs in
+      emit f (I.Mutate (v, steps, I.MSet a))
+    | SExpr e -> ignore (lower f e)
+    | SReturn eo ->
+      let a = match eo with Some e -> lower f e | None -> I.AUnit in
+      emit f (I.Return a);
+      f.dead <- true
+    | SWhile (c, b) ->
+      let body, _, _ =
+        in_block f (fun () ->
+            let ca = lower f c in
+            let brk, _, _ = in_block f (fun () -> emit f I.Break; f.dead <- true) in
+            emit f (I.If (ca, [], brk));
+            ignore (lower_block f b))
+      in
+      emit f (I.Loop body)
+    | SFor (n, _, e, b) ->
+      let la = lower f e in
+      emit_for f la (tyof f e) e.espan (fun x ->
+          bind f n x;
+          ignore (lower_block f b))
+    | SBreak -> emit f I.Break; f.dead <- true
+    | SContinue -> emit f I.Continue; f.dead <- true
+
+let lower_fn g c (d : fn_decl) env =
+  let ret = match d.fn_ret with Some te -> resolve env te | None -> TUnit in
+  let f = new_fctx g env ret None in
+  let params =
+    List.map
+      (fun p ->
+        let v = fresh_var p.prm_name (resolve env p.prm_ty) in
+        bind f p.prm_name v;
+        v)
+      d.fn_params
+  in
+  let a = lower_block_inner f d.fn_body in
+  emit f (I.Return a);
+  { I.fname = c; params; captures = []; is_closure = false; ret; body = List.rev f.buf }
+
+let lower_program (user_items : item list) : I.program * gctx =
+  let g =
+    { fns = Hashtbl.create 16; structs = Hashtbl.create 16; enums = Hashtbl.create 16;
+      ctors = Hashtbl.create 16; instances = Hashtbl.create 16; queue = []; out = []; counter = 0 }
+  in
+  let owners = Hashtbl.create 16 in
+  List.iter
+    (function
+      | IFn d -> Hashtbl.replace g.fns d.fn_name d
+      | IStruct s -> Hashtbl.replace g.structs s.st_name s
+      | IEnum e ->
+        Hashtbl.replace g.enums e.en_name e;
+        List.iter
+          (fun (v, _, _) -> Hashtbl.replace owners v (e.en_name :: Option.value ~default:[] (Hashtbl.find_opt owners v)))
+          e.en_variants)
+    (Prelude.items () @ user_items);
+  Hashtbl.iter (fun v ens -> match ens with [ en ] -> Hashtbl.replace g.ctors v en | _ -> ()) owners;
+  let main_decl = match Hashtbl.find_opt g.fns "main" with Some d -> d | None -> failwith "no main" in
+  let main = instance g "main" [] in
+  let rec drain () =
+    match g.queue with
+    | (c, d, env) :: rest ->
+      g.queue <- rest;
+      let f = lower_fn g c d env in
+      (* lowering may have added lifted closures to g.out; read it afterwards *)
+      g.out <- f :: g.out;
+      drain ()
+    | [] -> ()
+  in
+  drain ();
+  let main_ret = match main_decl.fn_ret with Some te -> resolve [] te | None -> TUnit in
+  ({ I.fns = List.rev g.out; main; main_takes_root = main_decl.fn_params <> []; main_ret }, g)
