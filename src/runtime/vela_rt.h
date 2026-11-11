@@ -1271,6 +1271,19 @@ static WIo Cap_fs_full_path(WCap *fs, WStr *rel) {
   int kind; char msg[1024];
   char *p = fs_resolve(fs, rel, true, &kind, msg, sizeof msg);
   if (!p) return io_err(kind, msg);
+  /* the real directory (checked inside the root just now) and the last
+     name, so no symlinked directory on the way can be swapped later */
+  if (strcmp(p, fs->root) != 0) {
+    char *dir = dirname_of(p);
+    char *rd = realpath(dir, NULL);
+    const char *base = strrchr(p, '/') + 1;
+    free(dir);
+    if (!rd || !fs_inside(fs->root, rd)) { free(rd); free(p); return io_err(1, "fs: path resolves outside the granted directory"); }
+    char *q = (char *)w_raw(strlen(rd) + strlen(base) + 2);
+    sprintf(q, "%s%s%s", rd, strcmp(rd, "/") == 0 ? "" : "/", base);
+    free(rd); free(p);
+    p = q;
+  }
   WStr *s = Str_from(p, (int64_t)strlen(p));
   free(p);
   return io_ok(s);

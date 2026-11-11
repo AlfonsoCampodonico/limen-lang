@@ -776,7 +776,7 @@ Strings compare byte by byte, so `c >= "a" && c <= "z"` tests a one-byte string,
 | `Fs` | `remove(path)` | `Result[(), IoError]`, a file or an empty directory, never the granted directory itself |
 | `Fs` | `exists(path)`, `is_dir(path)` | `Bool` |
 | `Fs` | `under(dir)`, `read_only()` | `Fs` |
-| `Fs` | `full_path(path)` | `Result[Str, IoError]`: the absolute path, checked as for writing (the file need not exist, its directory must), for handing to C or another program |
+| `Fs` | `full_path(path)` | `Result[Str, IoError]`: the absolute path, checked as for writing (the file need not exist, its directory must), with the directory part resolved to its real path, for handing to C or another program |
 | `Fs` | `is_read_only()` | `Bool`; an ungranted `Fs` is read-only |
 
 ## 12. Tests
@@ -1199,7 +1199,7 @@ fn main(root: Root) -> Result[(), IoError] {
 - `query` runs one statement and returns every row as a `List[sql.Row]`; `query_one` returns the first, as an `Option`. A row holds `columns` (names) and `values`. `row.get(name)` is the `Value`; `row.int(name)`, `row.float(name)` (an integer reads as a float too), `row.text(name)` and `row.blob(name)` are `Option`s, `None` for NULL; `row.is_null(name)`. Asking for a column the row does not have, or reading one as the wrong type, panics: that is a bug in the query or the code, not a condition to handle.
 - `db.transaction(f, || { ...; Ok(v) })` runs the closure between `BEGIN` and `COMMIT`. If it returns `Err` or panics, the transaction is rolled back and the error (or the panic) goes on. Transactions do not nest: starting one inside another is an `Err`.
 - `db.last_id(f)` is the rowid of the last row inserted through the connection.
-- SQLite stays inside the grants. `ATTACH` is turned off, and with it `VACUUM` (which attaches a temporary database; `VACUUM INTO` would write anywhere), so SQL cannot open other files. The database file is not opened through a symlink, URI filenames and extensions are off. SQLite writes its journal next to the database, inside the granted directory. A busy database is waited on for up to 5 seconds; that wait, like every SQLite call, blocks the worker thread.
+- SQLite stays inside the grants. `ATTACH` is turned off, and with it `VACUUM` (which attaches a temporary database; `VACUUM INTO` would write anywhere), so SQL cannot open other files. The database file is not opened through a symlink, and `open` refuses a database whose `-journal`, `-wal` or `-shm` file is a symlink out of the granted directory (or a broken one), since SQLite follows those. URI filenames and extensions are off. What remains is a race no Vela code can cause: another process that can write to the directory swapping in such a symlink while the database is open. SQLite writes its journal next to the database, inside the granted directory. A busy database is waited on for up to 5 seconds; that wait, like every SQLite call, blocks the worker thread.
 
 ## 20. Not yet
 

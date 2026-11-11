@@ -118,6 +118,13 @@ fn connect(f: Foreign, path: Str, read_only: Bool) -> Result[Db, IoError] {
 pub fn open(f: Foreign, fs: Fs, name: Str) -> Result[Db, IoError] {
     need(f)?
     let path = fs.full_path(name)?
+    // SQLite also opens `-journal`, `-wal` and `-shm` files next to the
+    // database, following symlinks: refuse one that leads out of the grant
+    for suffix in ["-journal", "-wal", "-shm"] {
+        if fs.full_path(name + suffix).is_err() {
+            return Err(Denied("sql: refusing to open `{name}`: `{name}{suffix}` is a link out of the granted directory or a broken one"))
+        }
+    }
     connect(f, path, fs.is_read_only())
 }
 

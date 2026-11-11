@@ -1624,6 +1624,16 @@ fn main(root: Root) -> Result[(), IoError] {
 |v} in
   out "sql-file" ~grants:{ sqlg with fs = Some (sqlreal, false) } sql_file
     "true\nSome(\"saved\")\nErr(Failed(\"sql: exec: attempt to write a readonly database\"))\ntrue\nErr(Denied(\"fs: path escapes the granted directory\"))\nErr(Denied(\"fs: absolute paths are not allowed; paths are relative to the granted directory\"))\nErr(Failed(\"fs: directory of `no/such/dir.db` does not exist\"))\nErr(Denied(\"sql: calling SQLite needs --grant foreign=sqlite3\"))\n";
+  (* SQLite follows symlinked sidecar files: open refuses ones that leave the grant *)
+  let outside = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "vela-sql-outside-%d" (Unix.getpid ())) in
+  Out_channel.with_open_bin outside (fun oc -> output_string oc "keep");
+  Out_channel.with_open_bin (Filename.concat sqlreal "fine-target") (fun oc -> output_string oc "");
+  List.iter (fun (link, target) -> (try Unix.unlink (Filename.concat sqlreal link) with Unix.Unix_error _ -> ()); Unix.symlink target (Filename.concat sqlreal link))
+    [ ("evil.db-journal", outside); ("broken.db-wal", "/vela-no-such-dir/x"); ("fine.db-shm", "fine-target") ];
+  out "sql-sidecar-links" ~grants:{ sqlg with fs = Some (sqlreal, false) }
+    "use sql\n\nfn main(root: Root) {\n    let f = root.foreign\n    for name in [\"evil.db\", \"broken.db\"] {\n        root.stdout.print(\"{sql.open(f, root.fs, name).is_err()}\")\n    }\n    match sql.open(f, root.fs, \"evil.db\") {\n        Err(Denied(m)) => root.stdout.print(m.slice(0, 50)),\n        _ => root.stdout.print(\"opened\"),\n    }\n    match sql.open(f, root.fs, \"fine.db\") {\n        Ok(db) => root.stdout.print(\"{db.exec(f, \"CREATE TABLE IF NOT EXISTS t (x)\", [])} {db.close(f)}\"),\n        Err(e) => root.stdout.print(\"{e}\"),\n    }\n    let gone = root.fs.remove(\"fine.db\").is_ok()\n}\n"
+    "true\ntrue\nsql: refusing to open `evil.db`: `evil.db-journal`\nOk(0) Ok(())\n";
+  ok "sql-sidecar-untouched" (read_file outside = "keep") (read_file outside);
   out "sql-no-fs" ~grants:sqlg
     "use sql\n\nfn main(root: Root) {\n    root.stdout.print(\"{sql.open(root.foreign, root.fs, \"x.db\")}\")\n}\n"
     "Err(Denied(\"fs: not granted (run with --grant fs=DIR)\"))\n";
