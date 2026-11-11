@@ -1555,8 +1555,8 @@ and call_method rt v name args sp =
   | VEnum ("Option", _, _), "map", [ _ ] -> none
   | VEnum ("Result", vn, _), "is_ok", [] -> VBool (vn = "Ok")
   | VEnum ("Result", vn, _), "is_err", [] -> VBool (vn = "Err")
-  | VEnum ("Result", "Err", [ e ]), "map_err", [ f ] -> VEnum ("Result", "Err", [ call f [ e ] ])
-  | (VEnum ("Result", _, _) as r), "map_err", [ _ ] -> r
+  | VEnum ("Result", "Err", [ e ]), "map_error", [ f ] -> VEnum ("Result", "Err", [ call f [ e ] ])
+  | (VEnum ("Result", _, _) as r), "map_error", [ _ ] -> r
   | VGroup g, (("go" | "#go") as go), [ c ] ->
     let t = { cancelled = g.gcancelled } in
     let res = ref (if g.gcancelled then Some Stopped else None) in

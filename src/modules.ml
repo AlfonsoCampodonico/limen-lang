@@ -471,6 +471,8 @@ let load_and_check path src : item list * Diag.t list * Check.fn_info list =
       let ds, infos = Check.check_program items in
       (* standard library modules are checked against src/std/vela.toml,
          with or without a vela.toml of the program's own *)
+      let warnings = Diag.warnings ds in
+      let ds = Diag.errors ds in
       let ds = if ds = [] then Package.enforce ~std:true (Lazy.force Package.std_manifest) (List.map (fun m -> (m, m)) !std_loaded) infos else ds in
       let ds = match pkg with Some p when ds = [] -> Package.enforce p !module_pkg infos | _ -> ds in
       let ds =
@@ -478,4 +480,4 @@ let load_and_check path src : item list * Diag.t list * Check.fn_info list =
         | Some p when ds = [] -> Package.check_foreign_lock p (c_users items)
         | _ -> ds
       in
-      (items, ds, infos))
+      (items, ds @ warnings, infos))

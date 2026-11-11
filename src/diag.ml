@@ -18,6 +18,10 @@ exception Fatal of t
 let make ?(severity = Error) ?(notes = []) ?fix code span message =
   { code; severity; message; span; notes; fix }
 
+(* Warnings are reported but do not stop a program from building or running. *)
+let errors ds = List.filter (fun d -> d.severity = Error) ds
+let warnings ds = List.filter (fun d -> d.severity = Warning) ds
+
 let explanations = [
   "E0001", "The lexer found a character that is not part of Vela's syntax.";
   "E0002", "A string literal or interpolation was not closed before the end of the file.";
@@ -42,7 +46,8 @@ let explanations = [
   "E0114", "A struct holds its fields inline, so a struct that contains itself, directly or through other structs, tuples or arrays, would be infinitely large. Put the recursive part in an `Option`, an enum or a `List`, which store their contents indirectly: `struct Node { value: Int, next: Option[Node] }`. Vela has no `box`: those types already are the indirection.";
   "E0113", "Map keys must be Int, Str or Bool, or tuples, structs and enums made of them, so they hash and compare by value the same way in both backends. Float (NaN is not equal to itself), lists and maps cannot be keys; key the map by an id or a name instead.";
   "E0201", "Type mismatch. The message shows the expected and the actual type.";
-  "E0202", "`?` returns early with the error, so the enclosing function must return `Result` (or `Option`) with the same error type, or `Result[_, dyn Error]`, which any error type with a `message` method converts to (Str and IoError included). Convert errors by hand with `.map_err(...)`.";
+  "W0001", "A built-in method was renamed: `map_err` is now `map_error`. The old name still works for now; `vela check --json` and the editor offer a fix that renames it.";
+  "E0202", "`?` returns early with the error, so the enclosing function must return `Result` (or `Option`) with the same error type, or `Result[_, dyn Error]`, which any error type with a `message` method converts to (Str and IoError included). Convert errors by hand with `.map_error(...)`.";
   "E0203", "An `if` without `else` is a statement, so its block must have type `()`.";
   "E0204", "A `match` must cover every possible value. Add the missing arms or a `_` arm.";
   "E0205", "Variables are immutable unless declared with `let mut`. Parameters and pattern bindings are always immutable, and closures cannot modify captured variables because they capture by value.";

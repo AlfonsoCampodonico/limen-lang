@@ -102,7 +102,7 @@ let with_stdin feed f =
 
 let run ?(grants = Interp.no_grants) ?modules ?feed name src =
   let items, ds, _ = compile ?modules name src in
-  if ds <> [] then Error ("diagnostics: " ^ String.concat ", " (List.map (fun (d : Diag.t) -> d.code ^ " " ^ d.message) ds))
+  if Diag.errors ds <> [] then Error ("diagnostics: " ^ String.concat ", " (List.map (fun (d : Diag.t) -> d.code ^ " " ^ d.message) ds))
   else
     let buf = Buffer.create 64 in
     match with_stdin feed (fun () -> Interp.run ~out:(Buffer.add_string buf) ~grants items) with
@@ -281,7 +281,7 @@ let grant_args (grants : Interp.grants) =
    [k] gets Ok (exit status, stdout, stderr) or Error. *)
 let run_native ?(grants = Interp.no_grants) ?modules ?feed name src k =
   let items, ds, _ = compile ?modules name src in
-  if ds <> [] then k (Error "does not compile") else
+  if Diag.errors ds <> [] then k (Error "does not compile") else
   let exe = exe_path name in
   let args = grant_args grants @ ("--" :: grants.Interp.args) in
   let o = exe ^ ".out" and e = exe ^ ".err" in
@@ -312,7 +312,7 @@ let check_tsan name ?(grants = Interp.no_grants) ?feed src want =
   if native_for name && selected name then begin
     let items, ds, _ = compile name src in
     let exe = exe_path (name ^ "-tsan") in
-    if ds <> [] then ok (name ^ "/tsan") false "does not compile"
+    if Diag.errors ds <> [] then ok (name ^ "/tsan") false "does not compile"
     else begin
       let args =
         (match grants.Interp.fs with Some (d, ro) -> [ "--grant"; "fs=" ^ d ^ if ro then ":ro" else "" ] | None -> [])
@@ -534,7 +534,7 @@ fn walk(t: Tree) -> List[Int] {
 |}
     ^ main_wrap {|    let rs = ["1", "x", " 42 ", "-7", "0x10"].map(parse)
     let oks = rs.filter(|r| r.is_ok()).map(|r| r ?? 0)
-    let errs = rs.filter(|r| r.is_err()).map(|r| r.map_err(|e| e.to_upper()))
+    let errs = rs.filter(|r| r.is_err()).map(|r| r.map_error(|e| e.to_upper()))
     let o = Some("hi").map(|s| s + "!")
     out.print("{oks} {errs} {o} {None ?? 5}")|})
     "[1, 42, -7] [Err(\"BAD: X\"), Err(\"BAD: 0X10\")] Some(\"hi!\") 5\n";
@@ -1001,7 +1001,7 @@ fn client(net: Net, port: Int, k: Int) -> Int {
     (main_wrap "    out.print(\"{root.exec.run(\"vela-no-such-program\", [])}\")")
     "Err(Failed(\"exec: cannot run `vela-no-such-program`: No such file or directory\"))\n";
   out "exec-signal" ~grants:sh
-    (main_wrap "    out.print(\"{root.exec.run(\"sh\", [\"-c\", \"kill -9 $$\"]).map_err(|e| 0)}\")")
+    (main_wrap "    out.print(\"{root.exec.run(\"sh\", [\"-c\", \"kill -9 $$\"]).map_error(|e| 0)}\")")
     "Ok(ProcessOutput { code: 137, stdout: \"\", stderr: \"\" })\n";
   out "exec-nul" ~grants:sh
     (main_wrap "    out.print(\"{root.exec.run(\"sh\", [\"a\" + 0.to_char()])}\")")
@@ -3751,6 +3751,29 @@ fn main() -> Result[(), dyn Error] {
      | [ Ast.IFn { fn_body = { tail = Some { edesc = Ast.ETry (_, Some _); _ }; _ }; _ } ] -> true
      | _ -> false)
     "context not parsed";
+
+  (* ---------- map_error, and the old name map_err ---------- *)
+  let mapsrc m = sprintf {|fn half(n: Int) -> Result[Int, Str] {
+    if n %% 2 == 0 { Ok(n / 2) } else { Err("odd {n}") }
+}
+
+fn main(root: Root) {
+    let codes = [4, 5].map(|n| half(n).%s(|e| e.len()))
+    root.stdout.print("{codes}")
+}
+|} m in
+  out "error-map-error" (mapsrc "map_error") "[Ok(2), Err(5)]\n";
+  (* the old name still runs, with a warning whose fix renames it *)
+  out "error-map-err-still-works" (mapsrc "map_err") "[Ok(2), Err(5)]\n";
+  (let src = mapsrc "map_err" in
+   let _, ds, _ = compile "error-map-err-warns" src in
+   ok "error-map-err-warns" (codes ds = [ "W0001" ] && List.for_all (fun (d : Diag.t) -> d.severity = Diag.Warning && d.fix <> None) ds) (String.concat " " (codes ds));
+   let fixed = apply_fixes src ds in
+   ok "error-map-err-fixed" (fixed = mapsrc "map_error") fixed;
+   let _, ds2, _ = compile "error-map-err-fixed2" fixed in
+   ok "error-map-err-fixed-clean" (ds2 = []) (String.concat " " (codes ds2)));
+  errs "error-map-err-not-on-option" (main_wrap "    let x = Some(1).map_err(|e| e)") [ "E0105" ];
+  ok "error-w0001-explained" (List.mem_assoc "W0001" Diag.explanations) "no explanation";
 
   (* ---------- ordering: sort() and < on any ordered type ---------- *)
   out "sort-any"

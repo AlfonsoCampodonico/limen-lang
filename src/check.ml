@@ -330,7 +330,7 @@ let methods (t : ty) : (string * (unit -> ty list * ty)) list =
   | TNamed ("IoError", []) -> [ m "message" [] TStr ]
   | TNamed ("Result", [ a; e ]) ->
     [ m "is_ok" [] TBool; m "is_err" [] TBool;
-      ("map_err", fun () -> let u = fresh () in ([ TFn ([ e ], u) ], res a u)) ]
+      ("map_error", fun () -> let u = fresh () in ([ TFn ([ e ], u) ], res a u)) ]
   | TCap Net -> [ m "get" [ TStr ] (res (TNamed ("HttpResponse", [])) io_err); m "only" [ TStr ] (TCap Net); m "connect" [ TStr ] (res (TCap Conn) io_err); m "connect_tls" [ TStr ] (res (TCap Conn) io_err) ]
   | TCap Listen -> [ m "on" [ TStr ] (res (TCap Listener) io_err); m "on_tls" [ TStr; TStr; TStr ] (res (TCap Listener) io_err) ]
   | TCap Listener -> [ m "accept" [] (res (TCap Conn) io_err); m "port" [] TInt; m "close" [] TUnit ]
@@ -854,6 +854,18 @@ and check_method ctx f e recv name nsp args =
 
 and check_method_value ctx f e recv name nsp args =
   let rt = repr (check_expr ctx f recv) in
+  let name =
+    match rt with
+    | TNamed ("Result", _) when name = "map_err" ->
+      (* the old name still works, with a warning and a fix that renames it *)
+      ctx.diags <-
+        Diag.make ~severity:Diag.Warning "W0001" nsp "`map_err` is now called `map_error`"
+          ~fix:{ Diag.fmsg = "rename it to `map_error`"; edits = [ { Diag.at = nsp; replacement = "map_error" } ] }
+        :: ctx.diags;
+      (match e.edesc with EMethod (r, _, sp, a) -> e.edesc <- EMethod (r, "map_error", sp, a) | _ -> ());
+      "map_error"
+    | _ -> name
+  in
   match rt with
   | TErr -> check_args ctx f args; TErr
   | TVar _ ->
@@ -1096,7 +1108,7 @@ and check_try ctx f x context sp =
            (sprintf "`?` would return an error of type `%s`, but this function returns errors of type `%s`"
               (show e) (show fe))
            ?fix
-           ~notes:[ "convert the error first with `.map_err(|e| ...)`, or return `dyn Error`, which any error type with a `message` method converts to" ])
+           ~notes:[ "convert the error first with `.map_error(|e| ...)`, or return `dyn Error`, which any error type with a `message` method converts to" ])
      | TVar _ -> if not ctxd then unify_at ctx sp f.ret_ty (res (fresh ()) e)
      | TErr -> ()
      | rt -> if not ctxd then wrong_fn rt "Result");

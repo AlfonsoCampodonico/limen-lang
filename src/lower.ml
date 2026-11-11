@@ -686,7 +686,7 @@ and lower_method f e recv name args ty =
         let y = tmp f ut (I.CallClo (ca, [ p ])) in
         I.MkEnum (ty, 0, [ y ]))
       (fun () -> I.MkEnum (ty, 1, []))
-  | TNamed ("Result", [ at; et ]), "map_err", [ fn ] ->
+  | TNamed ("Result", [ at; et ]), "map_error", [ fn ] ->
     let ra = lower f recv in
     let ca = lower f fn in
     let c = tmp f TBool (I.IsTag (ra, rt, 1)) in

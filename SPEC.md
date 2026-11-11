@@ -347,7 +347,7 @@ Both operands must have the same type. The **ordered** types are `Int`, `Float`,
 
 ### The `?` operator
 
-On a `Result[T, E]`, `e?` evaluates to the `Ok` value or returns `Err(e)` from the enclosing function, which must return `Result[_, E]` with the same `E`, or `Result[_, dyn Error]` when `E` satisfies `Error` (section 4); then the error converts to `dyn Error`. Any other error type is E0202, which offers to change the function's error type to `dyn Error` when both types satisfy `Error`. Convert errors by hand with `.map_err(|e| ...)`. On an `Option[T]`, `?` returns `None` from a function returning `Option`.
+On a `Result[T, E]`, `e?` evaluates to the `Ok` value or returns `Err(e)` from the enclosing function, which must return `Result[_, E]` with the same `E`, or `Result[_, dyn Error]` when `E` satisfies `Error` (section 4); then the error converts to `dyn Error`. Any other error type is E0202, which offers to change the function's error type to `dyn Error` when both types satisfy `Error`. Convert errors by hand with `.map_error(|e| ...)`. On an `Option[T]`, `?` returns `None` from a function returning `Option`.
 
 A string after `?` on the same line adds context: `x? "reading config"` returns early with an error whose message is `reading config: <the error's message>` and whose `cause()` is the original error. The function must return `Result[_, dyn Error]` (E0202, with a fix that changes its error type), and the error must satisfy `Error`. The string can interpolate (`"reading {path}"`) and is built only when there is an error. On an `Option`, `opt? "no port set"` returns an error with that message and no cause, so a missing value becomes an error in one step. The wrapper is the prelude struct `WrappedError { context: Str, inner: dyn Error }`; the `errors` module (section 19) walks and prints the chain.
 
@@ -821,7 +821,9 @@ Strings compare byte by byte, so `c >= "a" && c <= "z"` tests a one-byte string,
 | --- | --- |
 | `is_some()`, `is_none()` / `is_ok()`, `is_err()` | `Bool` |
 | `map(f)` (Option) | `Option[U]` |
-| `map_err(f)` (Result) | `Result[T, F]` |
+| `map_error(f)` (Result) | `Result[T, F]`: the error passed through `f`, an `Ok` unchanged |
+
+`map_error` was called `map_err`. The old name still works, with warning W0001 and a fix that renames it; it will be removed.
 
 `Str` and `IoError` also have `message()`, from the `Error` interface (section 4): the string itself, and the text of the `IoError`.
 
@@ -930,10 +932,11 @@ The native backend may run a chain like `xs.filter(p).map(f).fold(z, g)` as one 
 
 ## 15. Errors
 
-Every diagnostic has a stable code. `vela explain CODE` prints its explanation, and `vela check --json` emits code, span, notes and an auto-fix when there is one.
+Every diagnostic has a stable code. `vela explain CODE` prints its explanation, and `vela check --json` emits code, span, notes and an auto-fix when there is one. Codes starting with W are warnings: they are printed, but the program still builds and runs.
 
 | Code | Meaning |
 | --- | --- |
+| W0001 | a renamed built-in method (`map_err`, now `map_error`) |
 | E0001-E0008 | lexing and parsing: bad character, unclosed string, unexpected token, missing newline, integer too large, bad escape, empty interpolation, untyped parameter |
 | E0101 | unknown name (with a suggestion) |
 | E0102 | unknown type |
