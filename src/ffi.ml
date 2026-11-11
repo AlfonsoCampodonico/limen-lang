@@ -83,6 +83,20 @@ let ident_ok s =
 
 let boundary_types = "Int, Int32, Float, Bool, Str, Bytes, Handle, or Out[Int | Int32 | Float | Handle] for a parameter"
 
+(* The runtime's helpers for trusted standard library modules, with the
+   signature each must be declared with.
+   - vela_copy(p, n): n bytes of C memory at p, as Bytes.
+   - vela_handle_new(p) -> id: put a C pointer in the runtime's handle table
+     under a fresh random id, so Vela values hold an id that cannot be forged
+     into a pointer. vela_handle_acquire(id) gives the pointer back (NULL if
+     the id is unknown or closed) and counts a use in progress;
+     vela_handle_release(id) ends that use. vela_handle_close(id) closes the
+     id; the pointer comes back (to free) from whichever of close and the
+     last release happens last, and NULL from the others. *)
+let runtime_fns =
+  [ ("vela_copy", ([ Handle; Int ], Bytes)); ("vela_handle_new", ([ Handle ], Int)); ("vela_handle_acquire", ([ Int ], Handle));
+    ("vela_handle_release", ([ Int ], Handle)); ("vela_handle_close", ([ Int ], Handle)) ]
+
 (* The C signature of a foreign declaration, or the errors in it. *)
 let of_decl (d : Ast.fn_decl) : (csig, (Span.t * string) list) result =
   let lib, sym, trusted = match d.fn_foreign with Some fo -> (fo.flib, fo.fsym, fo.ftrusted) | None -> invalid_arg "Ffi.of_decl" in
@@ -119,11 +133,12 @@ let of_decl (d : Ast.fn_decl) : (csig, (Span.t * string) list) result =
       d.fn_params
   in
   (* "vela" is the runtime's own library of helpers for trusted standard
-     library modules; it has one function, vela_copy(p, n) -> Bytes *)
+     library modules (see runtime_fns) *)
   let runtime_lib = lib = "vela" in
   if runtime_lib then begin
     if not trusted then err d.fn_span "library `vela` is the runtime's own, for the standard library; use `foreign.copy(p, n)` instead";
-    if sym <> "vela_copy" then err d.fn_span "library `vela` has only `vela_copy(p: Handle, n: Int) -> Bytes`"
+    if not (List.mem_assoc sym runtime_fns) then
+      err d.fn_span (Printf.sprintf "library `vela` has no function `%s`; it has %s" sym (String.concat ", " (List.map fst runtime_fns)))
   end;
   let ret =
     match d.fn_ret with
@@ -148,6 +163,10 @@ let of_decl (d : Ast.fn_decl) : (csig, (Span.t * string) list) result =
     err d.fn_span
       (Printf.sprintf "a foreign function takes at most %d integer-like and %d Float parameters (an Out counts as integer-like)" max_ints
          max_floats);
+  (match List.assoc_opt sym runtime_fns with
+   | Some (ps, r) when runtime_lib && (List.map (fun p -> if p.out then Unit else p.cty) params <> ps || ret <> r) ->
+     err d.fn_span (Printf.sprintf "`%s` is declared with the wrong types for the runtime's helper" sym)
+   | _ -> ());
   match !errs with [] -> Ok { lib; sym; params; ret; trusted } | es -> Error (List.rev es)
 
 (* Libraries a program's foreign declarations name, each once, in order. *)

@@ -840,6 +840,45 @@ module Foreign = struct
     if n > Int64.of_int Sys.max_string_length then raise (Panic (sprintf "foreign.copy: length %Ld is too large" n, sp));
     VBytes (peek p (Int64.to_int n))
 
+  (* The runtime's handle table (Ffi.runtime_fns): id -> pointer, uses in
+     progress, closed. Ids are random so they cannot be guessed. *)
+  type entry = { ptr : int64; mutable uses : int; mutable closed : bool }
+  let handles : (int64, entry) Hashtbl.t = Hashtbl.create 8
+  let id_rng = lazy (Random.State.make_self_init ())
+
+  let runtime_helper sym args sp =
+    let ptr_of = function
+      | Some e -> e.ptr
+      | None -> 0L
+    in
+    match (sym, args) with
+    | "vela_copy", [ VStruct (_, [ (_, VInt p) ]); VInt n ] -> copy [ "vela" ] p n sp
+    | "vela_handle_new", [ VStruct (_, [ (_, VInt p) ]) ] ->
+      let rec fresh () =
+        let id = Int64.logand (Random.State.int64 (Lazy.force id_rng) Int64.max_int) 0x3FFFFFFFFFFFFFFFL in
+        if id = 0L || Hashtbl.mem handles id then fresh () else id
+      in
+      let id = fresh () in
+      Hashtbl.replace handles id { ptr = p; uses = 0; closed = false };
+      VInt id
+    | "vela_handle_acquire", [ VInt id ] -> (
+      match Hashtbl.find_opt handles id with
+      | Some e when not e.closed -> e.uses <- e.uses + 1; handle e.ptr
+      | _ -> handle 0L)
+    | "vela_handle_release", [ VInt id ] -> (
+      match Hashtbl.find_opt handles id with
+      | Some e when e.uses > 0 ->
+        e.uses <- e.uses - 1;
+        if e.closed && e.uses = 0 then (Hashtbl.remove handles id; handle (ptr_of (Some e))) else handle 0L
+      | _ -> handle 0L)
+    | "vela_handle_close", [ VInt id ] -> (
+      match Hashtbl.find_opt handles id with
+      | Some e when not e.closed ->
+        e.closed <- true;
+        if e.uses = 0 then (Hashtbl.remove handles id; handle e.ptr) else handle 0L
+      | _ -> handle 0L)
+    | _ -> failwith ("internal: runtime helper " ^ sym)
+
   let invoke (d : fn_decl) args sp =
     let cs = match Ffi.of_decl d with Ok cs -> cs | Error _ -> failwith "internal: foreign signature" in
     let args =
@@ -873,7 +912,7 @@ module Foreign = struct
       | _ :: _, [] -> failwith "internal: foreign arity"
     in
     match (cs.lib, args) with
-    | "vela", [ VStruct (_, [ (_, VInt p) ]); VInt n ] -> copy [ "vela" ] p n sp
+    | "vela", args -> runtime_helper cs.sym args sp
     | _ ->
     let cargs = Array.of_list (conv cs.params args) in
     let fp = match Hashtbl.find_opt syms (cs.lib, cs.sym) with Some p -> p | None -> failwith "internal: unresolved foreign function" in

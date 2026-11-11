@@ -354,9 +354,15 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     line (sprintf "    %s = %s;" dst (mk_enum c t 1 [ "m_" ]));
     line "  }";
     line "}"
-  | I.CallC ({ lib = "vela"; _ }, [ p; n ], sp) ->
-    (* the runtime's own helper: copy n bytes of C memory *)
-    set (sprintf "w_ffi_copy((%s).f0, %s, %s)" (a p) (a n) (where sp))
+  | I.CallC ({ lib = "vela"; sym; _ }, args, sp) -> (
+    (* the runtime's own helpers (Ffi.runtime_fns) *)
+    let hd = cname c Ffi.handle_ty in
+    match (sym, List.map a args) with
+    | "vela_copy", [ p; n ] -> set (sprintf "w_ffi_copy((%s).f0, %s, %s)" p n (where sp))
+    | "vela_handle_new", [ p ] -> set (sprintf "w_handle_new((%s).f0)" p)
+    | ("vela_handle_acquire" | "vela_handle_release" | "vela_handle_close"), [ id ] ->
+      set (sprintf "(%s){ w_%s(%s) }" hd (String.sub sym 5 (String.length sym - 5)) id)
+    | _ -> failwith ("cgen: runtime helper " ^ sym))
   | I.CallC (cs, args, sp) ->
     if not (List.mem cs.sym c.csyms) then c.csyms <- c.csyms @ [ cs.sym ];
     line "{";

@@ -16,7 +16,7 @@ fn setup(db: sql.Db) -> Result[(), IoError] {
 
 fn add(db: sql.Db, tag: Str, body: Str) -> Result[Int, IoError] {
     db.exec("INSERT INTO notes (tag, body) VALUES (?, ?)", [sql.Text(tag), sql.Text(body)])?
-    Ok(db.last_id())
+    db.last_id()
 }
 
 fn list(db: sql.Db, out: Stdout, tag: Str) -> Result[(), IoError] {

@@ -3082,6 +3082,72 @@ static WStr *w_ffi_copy(int64_t p, int64_t n, const char *where) {
   if (p == 0 && n > 0) w_panic_c("foreign.copy: null pointer", where);
   return Str_from((const char *)(intptr_t)p, n);
 }
+/* The handle table for trusted standard library modules (Ffi.runtime_fns):
+   a Vela value holds a random id, never the C pointer, so it cannot be
+   forged, and a pointer is handed back for freeing only once no use of it is
+   in progress. */
+typedef struct { int64_t id, ptr; int64_t uses; bool closed; } WHandleEntry;
+static WHandleEntry *w_handles; static int64_t w_nhandles, w_caphandles;
+static pthread_mutex_t w_handles_mu = PTHREAD_MUTEX_INITIALIZER;
+static int64_t w_handle_random(void) {
+  uint64_t r = 0;
+#if defined(__APPLE__)
+  arc4random_buf(&r, sizeof r);
+#else
+  FILE *f = fopen("/dev/urandom", "rb");
+  if (!f || fread(&r, sizeof r, 1, f) != 1) { struct timeval tv; gettimeofday(&tv, NULL); r ^= (uint64_t)tv.tv_usec * 0x9E3779B97F4A7C15ull ^ (uint64_t)getpid(); }
+  if (f) fclose(f);
+#endif
+  return (int64_t)(r & 0x3FFFFFFFFFFFFFFFull);
+}
+static WHandleEntry *w_handle_find(int64_t id) {
+  for (int64_t i = 0; i < w_nhandles; i++) if (w_handles[i].id == id) return &w_handles[i];
+  return NULL;
+}
+static void w_handle_remove(WHandleEntry *e) { *e = w_handles[--w_nhandles]; }
+static int64_t w_handle_new(int64_t ptr) {
+  pthread_mutex_lock(&w_handles_mu);
+  int64_t id;
+  do id = w_handle_random(); while (id == 0 || w_handle_find(id));
+  if (w_nhandles == w_caphandles) {
+    w_caphandles = w_caphandles ? w_caphandles * 2 : 8;
+    w_handles = (WHandleEntry *)realloc(w_handles, sizeof(WHandleEntry) * (size_t)w_caphandles);
+    if (!w_handles) w_oom();
+  }
+  w_handles[w_nhandles++] = (WHandleEntry){ id, ptr, 0, false };
+  pthread_mutex_unlock(&w_handles_mu);
+  return id;
+}
+static int64_t w_handle_acquire(int64_t id) {
+  pthread_mutex_lock(&w_handles_mu);
+  WHandleEntry *e = w_handle_find(id);
+  int64_t p = 0;
+  if (e && !e->closed) { e->uses++; p = e->ptr; }
+  pthread_mutex_unlock(&w_handles_mu);
+  return p;
+}
+static int64_t w_handle_release(int64_t id) {
+  pthread_mutex_lock(&w_handles_mu);
+  WHandleEntry *e = w_handle_find(id);
+  int64_t p = 0;
+  if (e && e->uses > 0) {
+    e->uses--;
+    if (e->closed && e->uses == 0) { p = e->ptr; w_handle_remove(e); }
+  }
+  pthread_mutex_unlock(&w_handles_mu);
+  return p;
+}
+static int64_t w_handle_close(int64_t id) {
+  pthread_mutex_lock(&w_handles_mu);
+  WHandleEntry *e = w_handle_find(id);
+  int64_t p = 0;
+  if (e && !e->closed) {
+    e->closed = true;
+    if (e->uses == 0) { p = e->ptr; w_handle_remove(e); }
+  }
+  pthread_mutex_unlock(&w_handles_mu);
+  return p;
+}
 static WStr *Cap_foreign_copy(WCap *x, int64_t p, int64_t n, const char *where) {
   if (x->nhosts == 0) w_panic_c("foreign: no library is granted, so C memory cannot be read", where);
   if (n < 0) { char m[128]; snprintf(m, sizeof m, "foreign.copy: negative length %lld", (long long)n); w_panic_c(m, where); }

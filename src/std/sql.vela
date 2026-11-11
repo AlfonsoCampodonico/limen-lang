@@ -53,9 +53,14 @@ foreign "sqlite3" {
     fn sqlite3_column_bytes(stmt: Handle, i: Int32) -> Int32
 }
 
-// the runtime's helper: copy n bytes of C memory into Bytes
+// the runtime's helpers: copy C memory into Bytes, and the handle table
+// that keeps connection pointers out of Vela values
 foreign "vela" {
     fn vela_copy(p: Handle, n: Int) -> Bytes
+    fn vela_handle_new(p: Handle) -> Int
+    fn vela_handle_acquire(id: Int) -> Handle
+    fn vela_handle_release(id: Int) -> Handle
+    fn vela_handle_close(id: Int) -> Handle
 }
 
 // result codes and flags from sqlite3.h
@@ -77,9 +82,12 @@ fn transient() -> Int { -1 }
 
 // ---------- values ----------
 
-// A database connection. Close it with `db.close()`.
+// A database connection. Close it with `db.close()`. It holds an id in the
+// runtime's handle table, not the connection's pointer, so a Db cannot be
+// forged, and one that was closed gives an error instead of touching freed
+// memory.
 pub struct Db {
-    handle: Handle,
+    id: Int,
 }
 
 // One SQL value: a parameter, or a column of a row.
@@ -114,7 +122,7 @@ fn connect(path: Str, read_only: Bool) -> Result[Db, IoError] {
     sqlite3_busy_timeout(h, 5000)
     // no temporary files outside the grant: temp tables and sorts stay in memory
     sqlite3_exec(h, "PRAGMA temp_store = MEMORY", 0, 0)
-    Ok(Db { handle: h })
+    Ok(Db { id: vela_handle_new(h) })
 }
 
 // Open (or create) the database file `name` under the directory `fs` grants.
@@ -136,9 +144,42 @@ pub fn memory() -> Result[Db, IoError] {
     connect(":memory:", false)
 }
 
-// Close the connection. A Db must not be used after this.
+fn closed() -> IoError {
+    Failed("sql: the database is closed")
+}
+
+// Run `body` with the connection, counted as in use so a close in another
+// task waits for it; the connection is closed here if a close came meanwhile.
+fn using[T](self: Db, body: fn(Handle) -> Result[T, IoError]) -> Result[T, IoError] {
+    let h = vela_handle_acquire(self.id)
+    if h.addr == 0 {
+        return Err(closed())
+    }
+    let r = catch(|| body(h))
+    let last = vela_handle_release(self.id)
+    if last.addr != 0 {
+        // the last use after a close: the connection goes now
+        let rc = sqlite3_close_v2(last)
+    }
+    match r {
+        Ok(v) => v,
+        Err(msg) => panic(msg),
+    }
+}
+
+// Close the connection; using the Db afterwards gives an error. Operations
+// still running in other tasks finish first.
 pub fn close(self: Db) -> Result[(), IoError] {
-    let rc = sqlite3_close_v2(self.handle)
+    let h = vela_handle_acquire(self.id)
+    if h.addr == 0 {
+        return Err(closed())
+    }
+    vela_handle_close(self.id)
+    let last = vela_handle_release(self.id)
+    if last.addr == 0 {
+        return Ok(())
+    }
+    let rc = sqlite3_close_v2(last)
     if rc == ok_code() { Ok(()) } else { Err(Failed("sql: close: {sqlite3_errstr(rc)}")) }
 }
 
@@ -211,25 +252,33 @@ fn column(st: Handle, i: Int) -> Value {
 // (a schema, say). With parameters it must be exactly one statement, and
 // each `?` takes the next value of `params`.
 pub fn exec(self: Db, text: Str, params: List[Value]) -> Result[Int, IoError] {
+    self.using(|db| exec_on(db, text, params))
+}
+
+fn exec_on(db: Handle, text: Str, params: List[Value]) -> Result[Int, IoError] {
     if params.is_empty() {
-        let (rc, err) = sqlite3_exec(self.handle, text, 0, 0)
+        let (rc, err) = sqlite3_exec(db, text, 0, 0)
         if rc != ok_code() {
-            let msg = if err.addr == 0 { sqlite3_errstr(rc) } else { sqlite3_errmsg(self.handle) }
+            let msg = if err.addr == 0 { sqlite3_errstr(rc) } else { sqlite3_errmsg(db) }
             sqlite3_free(err)
             return Err(Failed("sql: {msg}"))
         }
-        return Ok(sqlite3_changes64(self.handle))
+        return Ok(sqlite3_changes64(db))
     }
-    let st = prepare(self.handle, text, params)?
+    let st = prepare(db, text, params)?
     let rc = sqlite3_step(st)
-    let result = if rc == done_code() || rc == row_code() { Ok(sqlite3_changes64(self.handle)) } else { Err(fail(self.handle, "exec")) }
+    let result = if rc == done_code() || rc == row_code() { Ok(sqlite3_changes64(db)) } else { Err(fail(db, "exec")) }
     sqlite3_finalize(st)
     result
 }
 
 // Run one statement and collect every row it returns.
 pub fn query(self: Db, text: Str, params: List[Value]) -> Result[List[Row], IoError] {
-    let st = prepare(self.handle, text, params)?
+    self.using(|db| query_on(db, text, params))
+}
+
+fn query_on(db: Handle, text: Str, params: List[Value]) -> Result[List[Row], IoError] {
+    let st = prepare(db, text, params)?
     let n = sqlite3_column_count(st)
     let names = (0..<n).map(|i| sqlite3_column_name(st, i))
     let mut rows = []
@@ -238,7 +287,7 @@ pub fn query(self: Db, text: Str, params: List[Value]) -> Result[List[Row], IoEr
         rows.push(Row { columns: names, values: (0..<n).map(|i| column(st, i)) })
         rc = sqlite3_step(st)
     }
-    let result = if rc == done_code() { Ok(rows) } else { Err(fail(self.handle, "query")) }
+    let result = if rc == done_code() { Ok(rows) } else { Err(fail(db, "query")) }
     sqlite3_finalize(st)
     result
 }
@@ -250,14 +299,14 @@ pub fn query_one(self: Db, text: Str, params: List[Value]) -> Result[Option[Row]
 }
 
 // The rowid of the last row inserted through this connection.
-pub fn last_id(self: Db) -> Int {
-    sqlite3_last_insert_rowid(self.handle)
+pub fn last_id(self: Db) -> Result[Int, IoError] {
+    self.using(|db| Ok(sqlite3_last_insert_rowid(db)))
 }
 
 // Run `body` in a transaction: committed if it returns Ok, rolled back if it
 // returns Err or panics (the panic then goes on). Transactions do not nest.
 pub fn transaction[T](self: Db, body: fn() -> Result[T, IoError]) -> Result[T, IoError] {
-    if !sqlite3_get_autocommit(self.handle) {
+    if !self.using(|db| Ok(sqlite3_get_autocommit(db)))? {
         return Err(Failed("sql: a transaction is already open on this connection"))
     }
     self.exec("BEGIN", [])?

@@ -1641,7 +1641,7 @@ fn main(root: Root) -> Result[(), IoError] {
         let n = names[i]
         let changed = db.exec("INSERT INTO people (name, age, score, photo) VALUES (?, ?, ?, ?)",
             [sql.Text(n), if i == 1 { sql.Null } else { sql.Int(30 + i) }, sql.Float(i.to_float() / 2.0), sql.Blob(bytes([i, 0, 255]))])?
-        out.print("{changed} {db.last_id()}")
+        out.print("{changed} {db.last_id()?}")
     }
     for row in db.query("SELECT id, name, age, score, photo FROM people WHERE id >= ? ORDER BY id", [sql.Int(2)])? {
         out.print("{row.int("id") ?? -1} {row.text("name") ?? "?"} {row.int("age")} {row.float("score") ?? 0.0} {row.blob("photo")} {row.is_null("age")}")
@@ -1774,6 +1774,57 @@ fn main(root: Root) -> Result[(), IoError] {
     "use sql\n\nfn main(root: Root) {\n    for name in [\"evil.db\", \"broken.db\"] {\n        root.stdout.print(\"{sql.open(root.fs, name).is_err()}\")\n    }\n    match sql.open(root.fs, \"evil.db\") {\n        Err(Denied(m)) => root.stdout.print(m.slice(0, 50)),\n        _ => root.stdout.print(\"opened\"),\n    }\n    match sql.open(root.fs, \"fine.db\") {\n        Ok(db) => root.stdout.print(\"{db.exec(\"CREATE TABLE IF NOT EXISTS t (x)\", [])} {db.close()}\"),\n        Err(e) => root.stdout.print(\"{e}\"),\n    }\n    let gone = root.fs.remove(\"fine.db\").is_ok()\n}\n"
     "true\ntrue\nsql: refusing to open `evil.db`: `evil.db-journal`\nOk(0) Ok(())\n";
   ok "sql-sidecar-untouched" (read_file outside = "keep") (read_file outside);
+  (* a Db holds an id, not a pointer: forged, closed and twice-closed ones are errors *)
+  out "sql-handles"
+    {v|use sql
+
+fn main(root: Root) -> Result[(), IoError] {
+    let out = root.stdout
+    let db = sql.memory()?
+    db.exec("CREATE TABLE t (x)", [])?
+    let fake = sql.Db { id: 12345 }
+    out.print("{fake.exec("DROP TABLE t", [])} {fake.close()}")
+    let copy = db
+    out.print("{db.close()} {copy.exec("SELECT 1", [])} {db.query("SELECT 1", [])} {db.last_id()} {db.close()}")
+    let a = sql.memory()?
+    let b = sql.memory()?
+    out.print("{a.id != b.id} {a.id > 0}")
+    a.close()?
+    b.close()
+}
+|v}
+    "Err(Failed(\"sql: the database is closed\")) Err(Failed(\"sql: the database is closed\"))\nOk(()) Err(Failed(\"sql: the database is closed\")) Err(Failed(\"sql: the database is closed\")) Err(Failed(\"sql: the database is closed\")) Err(Failed(\"sql: the database is closed\"))\ntrue true\n";
+  (* closing while other tasks use the connection waits for them *)
+  let sql_close_race = {v|use sql
+
+fn main(root: Root) -> Result[(), IoError] {
+    let db = sql.memory()?
+    db.exec("CREATE TABLE t (n INTEGER)", [])?
+    let results = group g {
+        for i in 0..<8 {
+            g.go(|| {
+                let mut ok = 0
+                for n in 0..<50 {
+                    if db.exec("INSERT INTO t VALUES (?)", [sql.Int(n)]).is_ok() {
+                        ok = ok + 1
+                    }
+                }
+                ok
+            })
+        }
+        g.go(|| {
+            match db.close() {
+                Ok(_) => 0,
+                Err(_) => -1,
+            }
+        })
+    }
+    root.stdout.print("{results.len()} {results[8]} {db.exec("SELECT 1", [])}")
+    Ok(())
+}
+|v} in
+  out "sql-close-race" sql_close_race "9 0 Err(Failed(\"sql: the database is closed\"))\n";
+  check_tsan "sql-close-race" sql_close_race "9 0 Err(Failed(\"sql: the database is closed\"))\n";
   out "sql-no-fs" ~grants:sqlg
     "use sql\n\nfn main(root: Root) {\n    root.stdout.print(\"{sql.open(root.fs, \"x.db\")}\")\n}\n"
     "Err(Denied(\"fs: not granted (run with --grant fs=DIR)\"))\n";
