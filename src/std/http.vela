@@ -1,5 +1,6 @@
 // HTTP/1.1 over plain TCP: a client on top of Net, and a server on top of
-// Listener and Conn. No TLS yet.
+// Listener and Conn. The server keeps connections alive between requests,
+// and bodies can be streamed in chunks both ways. No TLS yet.
 
 pub struct Header {
     name: Str,
@@ -9,6 +10,7 @@ pub struct Header {
 pub struct Request {
     method: Str,
     path: Str,
+    version: Str,   // "HTTP/1.1" or "HTTP/1.0"
     headers: List[Header],
     body: Str,
 }
@@ -68,25 +70,35 @@ pub fn reason(status: Int) -> Str {
     }
 }
 
+// ---------- limits ----------
+
+fn max_head() -> Int {
+    65536
+}
+
+fn max_body() -> Int {
+    8388608
+}
+
+// Requests answered on one connection before the server closes it.
+fn max_requests() -> Int {
+    1000
+}
+
 // ---------- message parsing, shared by client and server ----------
 
 struct Head {
     first: Str,
     headers: List[Header],
-    rest: Str,
 }
 
 fn bad(msg: Str) -> IoError {
     Failed("http: " + msg)
 }
 
-// Split a message at the blank line after its headers.
-fn split_head(data: Str) -> Result[Head, IoError] {
-    let end = match data.index_of("\r\n\r\n") {
-        Some(i) => i,
-        None => { return Err(bad("incomplete headers")) },
-    }
-    let lines = data.slice(0, end).split("\r\n")
+// The start line and headers of a message (without the blank line).
+fn parse_head(text: Str) -> Result[Head, IoError] {
+    let lines = text.split("\r\n")
     let mut headers = []
     let mut i = 1
     while i < lines.len() {
@@ -97,7 +109,31 @@ fn split_head(data: Str) -> Result[Head, IoError] {
         }
         i = i + 1
     }
-    Ok(Head { first: lines[0], headers, rest: data.slice(end + 4, data.len()) })
+    Ok(Head { first: lines[0], headers })
+}
+
+// Read from `c` until `buf` holds a whole head: its text and the bytes after
+// the blank line. None if the peer closed before sending anything.
+fn read_head(c: Conn, buf: Str) -> Result[Option[(Str, Str)], IoError] {
+    let mut data = buf
+    while true {
+        match data.index_of("\r\n\r\n") {
+            Some(i) => { return Ok(Some((data.slice(0, i), data.slice(i + 4, data.len())))) },
+            None => (),
+        }
+        if data.len() > max_head() {
+            return Err(bad("headers too large"))
+        }
+        let chunk = c.read()?
+        if chunk == "" {
+            if data == "" {
+                return Ok(None)
+            }
+            return Err(bad("connection closed before the headers were complete"))
+        }
+        data = data + chunk
+    }
+    Ok(None)
 }
 
 fn content_length(headers: List[Header]) -> Result[Int, IoError] {
@@ -108,6 +144,18 @@ fn content_length(headers: List[Header]) -> Result[Int, IoError] {
         },
         None => Ok(0),
     }
+}
+
+// Whether a comma-separated header such as Connection lists `token`.
+fn has_token(headers: List[Header], name: Str, token: Str) -> Bool {
+    match find_header(headers, name) {
+        Some(v) => v.to_lower().split(",").map(|t| t.trim()).contains(token),
+        None => false,
+    }
+}
+
+fn is_chunked(headers: List[Header]) -> Bool {
+    has_token(headers, "Transfer-Encoding", "chunked")
 }
 
 fn hex_value(s: Str) -> Option[Int] {
@@ -134,35 +182,120 @@ fn hex_value(s: Str) -> Option[Int] {
     Some(n)
 }
 
-// Decode a `Transfer-Encoding: chunked` body.
-fn dechunk(data: Str) -> Result[Str, IoError] {
-    let mut out = ""
-    let mut rest = data
+fn hex_text(n: Int) -> Str {
+    let digits = "0123456789abcdef"
+    let mut s = ""
+    let mut m = n
+    while m > 0 || s == "" {
+        s = digits.slice(m % 16, m % 16 + 1) + s
+        m = m / 16
+    }
+    s
+}
+
+// Read `n` bytes of body, the first ones already in `buf`, passing each
+// piece to `f` as it arrives. The folded value and the bytes after the body.
+fn read_sized[T](c: Conn, buf: Str, n: Int, init: T, f: fn(T, Str) -> T) -> Result[(T, Str), IoError] {
+    let mut acc = init
+    let mut left = n
+    let mut data = buf
     while true {
-        let eol = match rest.index_of("\r\n") {
-            Some(i) => i,
-            None => { return Err(bad("truncated chunk")) },
+        if data.len() >= left {
+            if left > 0 {
+                acc = f(acc, data.slice(0, left))
+            }
+            return Ok((acc, data.slice(left, data.len())))
+        }
+        if data != "" {
+            acc = f(acc, data)
+            left = left - data.len()
+        }
+        data = c.read()?
+        if data == "" {
+            return Err(bad("connection closed before the body was complete"))
+        }
+    }
+    Ok((acc, ""))
+}
+
+// Read a body that ends when the peer closes the connection.
+fn read_to_end[T](c: Conn, buf: Str, init: T, f: fn(T, Str) -> T) -> Result[T, IoError] {
+    let mut acc = if buf == "" { init } else { f(init, buf) }
+    while true {
+        let data = c.read()?
+        if data == "" {
+            return Ok(acc)
+        }
+        acc = f(acc, data)
+    }
+    Ok(acc)
+}
+
+// Read more of a chunked body into `data`, failing if the peer closed.
+fn more(c: Conn, data: Str) -> Result[Str, IoError] {
+    let chunk = c.read()?
+    if chunk == "" {
+        return Err(bad("truncated chunk"))
+    }
+    Ok(data + chunk)
+}
+
+// Read a `Transfer-Encoding: chunked` body, decoding it as it arrives and
+// passing each piece to `f`. `limit` caps the decoded size (-1: no cap).
+// The folded value and the bytes after the body and its trailers.
+fn read_chunked[T](c: Conn, buf: Str, limit: Int, init: T, f: fn(T, Str) -> T) -> Result[(T, Str), IoError] {
+    let mut acc = init
+    let mut data = buf
+    let mut total = 0
+    while true {
+        let eol = data.index_of("\r\n") ?? -1
+        if eol < 0 {
+            if data.len() > 4096 {
+                return Err(bad("bad chunk size"))
+            }
+            data = more(c, data)?
+            continue
         }
         // a chunk size may carry `;extensions`
-        let size_text = match rest.slice(0, eol).index_of(";") {
-            Some(k) => rest.slice(0, k),
-            None => rest.slice(0, eol),
+        let line = data.slice(0, eol)
+        let size_text = match line.index_of(";") {
+            Some(k) => line.slice(0, k),
+            None => line,
         }
-        let size = match hex_value(size_text) {
-            Some(n) => n,
-            None => { return Err(bad("bad chunk size")) },
-        }
+        let size = hex_value(size_text) ?? { return Err(bad("bad chunk size")) }
+        data = data.slice(eol + 2, data.len())
         if size == 0 {
-            return Ok(out)
+            // trailer lines, up to a blank line
+            while true {
+                let e = data.index_of("\r\n") ?? -1
+                if e == 0 {
+                    return Ok((acc, data.slice(2, data.len())))
+                }
+                if e > 0 {
+                    data = data.slice(e + 2, data.len())
+                } else if data.len() > max_head() {
+                    return Err(bad("trailers too large"))
+                } else {
+                    data = more(c, data)?
+                }
+            }
         }
-        let start = eol + 2
-        if start + size > rest.len() {
-            return Err(bad("truncated chunk"))
+        total = total + size
+        if limit >= 0 && total > limit {
+            return Err(bad("body too large"))
         }
-        out = out + rest.slice(start, start + size)
-        rest = rest.slice(start + size + 2, rest.len())
+        let (a, rest) = read_sized(c, data, size, acc, f)?
+        acc = a
+        data = rest
+        while data.len() < 2 {
+            data = more(c, data)?
+        }
+        if !data.starts_with("\r\n") {
+            return Err(bad("missing CRLF after a chunk"))
+        }
+        data = data.slice(2, data.len())
     }
-    Ok(out)
+    Ok((acc, data))
 }
 
 fn head_text(first: Str, headers: List[Header], body: Str) -> Str {
@@ -208,46 +341,56 @@ fn parse_url(url: Str) -> Result[Url, IoError] {
     }
 }
 
-// Send a request and read the whole response. The connection is closed
-// afterwards. `net` must allow the URL's host.
-pub fn request(net: Net, method: Str, url: Str, headers: List[Header], body: Str) -> Result[Response, IoError] {
+fn read_response[T](c: Conn, method: Str, init: T, f: fn(T, Str) -> T) -> Result[(Response, T), IoError] {
+    let (text, rest) = read_head(c, "")? ?? { return Err(bad("connection closed before the response")) }
+    let h = parse_head(text)?
+    let parts = h.first.split(" ")
+    if parts.len() < 2 || !parts[0].starts_with("HTTP/") {
+        return Err(bad("malformed status line"))
+    }
+    let status = parts[1].parse_int() ?? { return Err(bad("malformed status line")) }
+    let resp = Response { status, headers: h.headers, body: "" }
+    if method == "HEAD" || status == 204 || status == 304 || (status >= 100 && status < 200) {
+        return Ok((resp, init))
+    }
+    if is_chunked(h.headers) {
+        let (acc, _) = read_chunked(c, rest, -1, init, f)?
+        return Ok((resp, acc))
+    }
+    match find_header(h.headers, "Content-Length") {
+        Some(_) => {
+            let (acc, _) = read_sized(c, rest, content_length(h.headers)?, init, f)?
+            Ok((resp, acc))
+        },
+        None => Ok((resp, read_to_end(c, rest, init, f)?)),
+    }
+}
+
+// Send a request and pass the response body to `f` piece by piece as it
+// arrives, folding it into a value, so a large body need not be held in
+// memory: `request_fold(net, "GET", url, [], "", 0, |n, s| n + s.len())`.
+// Returns the response, with an empty body, and the folded value.
+pub fn request_fold[T](net: Net, method: Str, url: Str, headers: List[Header], body: Str, init: T, f: fn(T, Str) -> T) -> Result[(Response, T), IoError] {
     let u = parse_url(url)?
     let c = net.connect("{u.host}:{u.port}")?
     let mut all = [Header { name: "Host", value: u.host }, Header { name: "Connection", value: "close" }]
     for h in headers {
         all.push(h)
     }
-    c.write(head_text("{method} {u.path} HTTP/1.1", all, body))?
-    let mut data = ""
-    let mut more = true
-    while more {
-        let chunk = c.read()?
-        if chunk == "" {
-            more = false
-        } else {
-            data = data + chunk
-        }
+    let sent = c.write(head_text("{method} {u.path} HTTP/1.1", all, body))
+    let r = match sent {
+        Ok(_) => read_response(c, method, init, f),
+        Err(e) => Err(e),
     }
     c.close()
-    let h = split_head(data)?
-    let parts = h.first.split(" ")
-    if parts.len() < 2 || !parts[0].starts_with("HTTP/") {
-        return Err(bad("malformed status line"))
-    }
-    let status = match parts[1].parse_int() {
-        Some(n) => n,
-        None => { return Err(bad("malformed status line")) },
-    }
-    let chunked = find_header(h.headers, "Transfer-Encoding").map(|v| v.to_lower().contains("chunked")) ?? false
-    let body = if chunked {
-        dechunk(h.rest)?
-    } else {
-        match find_header(h.headers, "Content-Length") {
-            Some(_) => h.rest.slice(0, content_length(h.headers)?),
-            None => h.rest,
-        }
-    }
-    Ok(Response { status, headers: h.headers, body })
+    r
+}
+
+// Send a request and read the whole response. The connection is closed
+// afterwards. `net` must allow the URL's host.
+pub fn request(net: Net, method: Str, url: Str, headers: List[Header], body: Str) -> Result[Response, IoError] {
+    let (r, text) = request_fold(net, method, url, headers, body, "", |a, s| a + s)?
+    Ok(Response { status: r.status, headers: r.headers, body: text })
 }
 
 pub fn get(net: Net, url: Str) -> Result[Response, IoError] {
@@ -260,57 +403,91 @@ pub fn post(net: Net, url: Str, content_type: Str, body: Str) -> Result[Response
 
 // ---------- server ----------
 
-fn max_head() -> Int {
-    65536
-}
-
-fn max_body() -> Int {
-    8388608
-}
-
-// Read one request from a connection. Errors if the peer closes first or
-// sends more than 64 KiB of headers or 8 MiB of body.
-pub fn read_request(c: Conn) -> Result[Request, IoError] {
-    let mut data = ""
-    while !data.contains("\r\n\r\n") {
-        if data.len() > max_head() {
-            return Err(bad("request headers too large"))
-        }
-        let chunk = c.read()?
-        if chunk == "" {
-            return Err(bad("connection closed before the request was complete"))
-        }
-        data = data + chunk
-    }
-    let h = split_head(data)?
+// Read one request, the first bytes already in `buf`: the request and the
+// bytes after it (the start of the next one). None if the peer closed
+// before sending anything.
+fn read_message(c: Conn, buf: Str) -> Result[Option[(Request, Str)], IoError] {
+    let (text, rest) = read_head(c, buf)? ?? { return Ok(None) }
+    let h = parse_head(text)?
     let parts = h.first.split(" ")
     if parts.len() != 3 || !parts[2].starts_with("HTTP/1.") {
         return Err(bad("malformed request line"))
     }
-    let n = content_length(h.headers)?
-    if n > max_body() {
-        return Err(bad("request body too large"))
-    }
-    let mut body = h.rest
-    while body.len() < n {
-        let chunk = c.read()?
-        if chunk == "" {
-            return Err(bad("connection closed before the body was complete"))
+    let (body, after) = if is_chunked(h.headers) {
+        read_chunked(c, rest, max_body(), "", |a, s| a + s)?
+    } else {
+        let n = content_length(h.headers)?
+        if n > max_body() {
+            return Err(bad("request body too large"))
         }
-        body = body + chunk
+        read_sized(c, rest, n, "", |a, s| a + s)?
     }
-    Ok(Request { method: parts[0], path: parts[1], headers: h.headers, body: body.slice(0, n) })
+    Ok(Some((Request { method: parts[0], path: parts[1], version: parts[2], headers: h.headers, body }, after)))
 }
 
-pub fn write_response(c: Conn, r: Response) -> Result[(), IoError] {
+// Read one request from a connection. Errors if the peer closes first or
+// sends more than 64 KiB of headers or 8 MiB of body. Chunked request
+// bodies are decoded.
+pub fn read_request(c: Conn) -> Result[Request, IoError] {
+    match read_message(c, "")? {
+        Some((r, _)) => Ok(r),
+        None => Err(bad("connection closed before the request was complete")),
+    }
+}
+
+// Whether the client wants the connection kept open after this request.
+fn keeps_alive(r: Request) -> Bool {
+    if has_token(r.headers, "Connection", "close") {
+        return false
+    }
+    if r.version == "HTTP/1.0" {
+        return has_token(r.headers, "Connection", "keep-alive")
+    }
+    true
+}
+
+fn send(c: Conn, r: Response, keep: Bool, head_only: Bool) -> Result[(), IoError] {
     let mut hs = r.headers
-    hs.push(Header { name: "Connection", value: "close" })
-    c.write(head_text("HTTP/1.1 {r.status} {reason(r.status)}", hs, r.body))
+    if find_header(hs, "Connection").is_none() {
+        hs.push(Header { name: "Connection", value: if keep { "keep-alive" } else { "close" } })
+    }
+    let t = head_text("HTTP/1.1 {r.status} {reason(r.status)}", hs, r.body)
+    c.write(if head_only { t.slice(0, t.len() - r.body.len()) } else { t })
 }
 
-// Answer one connection: read a request, reply with `handler`'s response,
-// then close. A malformed request gets 400; a handler that panics gets 500,
-// and the server keeps running. True if it was answered.
+// Write a whole response, saying the connection will close.
+pub fn write_response(c: Conn, r: Response) -> Result[(), IoError] {
+    send(c, r, false, false)
+}
+
+// Start a response whose body follows in pieces: the status line and
+// headers, with `Transfer-Encoding: chunked`. Then call `write_chunk` for
+// each piece and `end_body` once.
+pub fn write_head(c: Conn, status: Int, headers: List[Header]) -> Result[(), IoError] {
+    let mut s = "HTTP/1.1 {status} {reason(status)}\r\n"
+    for h in headers {
+        s = s + h.name + ": " + h.value + "\r\n"
+    }
+    c.write(s + "Transfer-Encoding: chunked\r\n\r\n")
+}
+
+// Send one piece of a body started with `write_head`. An empty piece sends
+// nothing (an empty chunk would end the body).
+pub fn write_chunk(c: Conn, data: Str) -> Result[(), IoError] {
+    if data == "" {
+        return Ok(())
+    }
+    c.write(hex_text(data.len()) + "\r\n" + data + "\r\n")
+}
+
+// End a body started with `write_head`.
+pub fn end_body(c: Conn) -> Result[(), IoError] {
+    c.write("0\r\n\r\n")
+}
+
+// Answer one request on a connection with `handler`'s response, then
+// close it. A malformed request gets 400; a handler that panics gets 500.
+// True if it was answered.
 pub fn handle(c: Conn, handler: fn(Request) -> Response) -> Bool {
     let r = match read_request(c) {
         Ok(req) => catch(|| handler(req)) ?? text(500, "internal error"),
@@ -321,19 +498,115 @@ pub fn handle(c: Conn, handler: fn(Request) -> Response) -> Bool {
     ok
 }
 
-// Accept `count` connections, each answered by `handler` in its own task,
-// and return how many got a response. The handler gets no capabilities
-// unless its closure captures them.
+// Answer requests on a connection until the client closes it or asks to
+// (`Connection: close`, or HTTP/1.0 without keep-alive), then close it.
+// Requests may be pipelined. A malformed request gets 400 and ends the
+// connection; a handler that panics gets 500 and the connection goes on.
+// HEAD requests get the headers only. Returns how many were answered.
+pub fn serve_conn(c: Conn, handler: fn(Request) -> Response) -> Int {
+    let mut buf = ""
+    let mut n = 0
+    let mut open = true
+    while open {
+        match read_message(c, buf) {
+            Ok(Some((req, rest))) => {
+                let r = catch(|| handler(req)) ?? text(500, "internal error")
+                let keep = keeps_alive(req) && n + 1 < max_requests() && !has_token(r.headers, "Connection", "close")
+                if send(c, r, keep, req.method == "HEAD").is_ok() {
+                    n = n + 1
+                } else {
+                    open = false
+                }
+                if !keep {
+                    open = false
+                }
+                buf = rest
+            },
+            Ok(None) => { open = false },
+            Err(_) => {
+                let _ = send(c, text(400, "bad request\n"), false, false)
+                open = false
+            },
+        }
+    }
+    c.close()
+    n
+}
+
+// Like `serve_conn`, for handlers that write the response themselves: a
+// streamed one with `write_head`, `write_chunk` and `end_body`, or
+// `write_response`. The request body is read whole first. A handler that
+// returns an error or panics closes the connection. Returns how many
+// requests were handled.
+pub fn serve_stream(c: Conn, handler: fn(Request, Conn) -> Result[(), IoError]) -> Int {
+    let mut buf = ""
+    let mut n = 0
+    let mut open = true
+    while open {
+        match read_message(c, buf) {
+            Ok(Some((req, rest))) => {
+                let ok = match catch(|| handler(req, c)) {
+                    Ok(Ok(_)) => true,
+                    _ => false,
+                }
+                if ok {
+                    n = n + 1
+                }
+                if !ok || !keeps_alive(req) || n >= max_requests() {
+                    open = false
+                }
+                buf = rest
+            },
+            Ok(None) => { open = false },
+            Err(_) => {
+                let _ = send(c, text(400, "bad request\n"), false, false)
+                open = false
+            },
+        }
+    }
+    c.close()
+    n
+}
+
+// Accept `count` connections, each served by `serve_conn` in its own task,
+// and return how many requests were answered. The handler gets no
+// capabilities unless its closure captures them.
 pub fn serve(l: Listener, count: Int, handler: fn(Request) -> Response) -> Int {
     let answered = group g {
         let mut i = 0
         while i < count {
             match l.accept() {
-                Ok(c) => g.go(|| if handle(c, handler) { 1 } else { 0 }),
+                Ok(c) => g.go(|| serve_conn(c, handler)),
                 Err(_) => { i = count },
             }
             i = i + 1
         }
     }
     answered.sum()
+}
+
+// Accept connections until accepting fails, typically because the listener
+// was closed, running `f` on each in its own task. Waits for those tasks,
+// then returns the error that stopped it.
+pub fn accept_forever(l: Listener, f: fn(Conn) -> Int) -> IoError {
+    let mut stop = Failed("")
+    let _ = group g {
+        let mut open = true
+        while open {
+            match l.accept() {
+                Ok(c) => g.go(|| f(c)),
+                Err(e) => {
+                    stop = e
+                    open = false
+                },
+            }
+        }
+    }
+    stop
+}
+
+// Serve every connection with `serve_conn` until the listener is closed
+// (by another task holding it) or fails; returns that error.
+pub fn serve_forever(l: Listener, handler: fn(Request) -> Response) -> IoError {
+    accept_forever(l, |c| serve_conn(c, handler))
 }

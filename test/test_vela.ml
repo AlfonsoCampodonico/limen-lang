@@ -1204,6 +1204,221 @@ fn main(root: Root) {
   out "std-logscan-example" (example "logscan.vela")
     "09:15:02 GET  /index.html 200     5,120\n09:15:09 GET  /missing    404         0\nskipped: not a log line\n09:01:44 POST /api/orders 201 1,048,576\ntotal 1,053,696 bytes\ndue 01/12/2026, paid 30/11/2026\n[\"a\", \"b\", \"c\", \"d\"]\n";
   panics "std-regex-must" "use regex\n\nfn main(root: Root) {\n    let r = regex.must(\"(a\")\n    root.stdout.print(r.pattern)\n}\n" "regex: missing `)`";
+  out "std-http-keepalive-stream" ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] }
+    {v|use http
+
+fn route(r: http.Request) -> http.Response {
+    if r.path == "/boom" {
+        let xs: List[Int] = []
+        http.text(200, "{xs[1]}")
+    } else {
+        http.text(200, "{r.method} {r.path} {r.version} body={r.body}")
+    }
+}
+
+fn stream(r: http.Request, c: Conn) -> Result[(), IoError] {
+    if r.path == "/fail" {
+        return Err(Failed("handler gave up"))
+    }
+    http.write_head(c, 200, [http.Header { name: "Content-Type", value: "text/plain" }])?
+    for w in ["one ", "two ", "", "three"] {
+        http.write_chunk(c, w)?
+    }
+    http.end_body(c)
+}
+
+// Send raw bytes, then read until the server closes the connection.
+fn raw(net: Net, port: Int, data: Str) -> Str {
+    match net.connect("127.0.0.1:{port}") {
+        Ok(c) => {
+            let _ = c.write(data)
+            let mut got = ""
+            let mut open = true
+            while open {
+                match c.read() {
+                    Ok(s) => if s == "" { open = false } else { got = got + s },
+                    Err(_) => { open = false },
+                }
+            }
+            c.close()
+            got.replace("\r\n", "|")
+        },
+        Err(e) => "{e}",
+    }
+}
+
+fn raw_client(net: Net, port: Int) -> Str {
+    let pipelined = "GET /a HTTP/1.1\r\nHost: x\r\n\r\nPOST /b HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2;ext=1\r\nde\r\n0\r\nX-Trailer: 1\r\n\r\nGET /boom HTTP/1.1\r\n\r\nGET /c HTTP/1.1\r\nConnection: close\r\n\r\n"
+    [
+        raw(net, port, pipelined),
+        raw(net, port, "GET /old HTTP/1.0\r\n\r\n"),
+        raw(net, port, "HEAD /h HTTP/1.1\r\nConnection: close\r\n\r\n"),
+        raw(net, port, "BAD\r\n\r\n"),
+    ].join("\n")
+}
+
+fn fetch_client(net: Net, p2: Int, p3: Int) -> Str {
+    let mut log = []
+    match http.get(net, "http://127.0.0.1:{p2}/x") {
+        Ok(r) => log.push("{r.status} {r.header("connection") ?? "-"} {r.body}"),
+        Err(e) => log.push("{e}"),
+    }
+    match http.post(net, "http://127.0.0.1:{p2}/y", "text/plain", "hello") {
+        Ok(r) => log.push("{r.status} {r.body}"),
+        Err(e) => log.push("{e}"),
+    }
+    match http.request_fold(net, "GET", "http://127.0.0.1:{p3}/s", [], "", "", |a, s| a + s) {
+        Ok((r, body)) => log.push("{r.status} {r.header("transfer-encoding") ?? "-"} {body}"),
+        Err(e) => log.push("{e}"),
+    }
+    match http.request_fold(net, "GET", "http://127.0.0.1:{p3}/s", [], "", 0, |n, s| n + s.len()) {
+        Ok((_, n)) => log.push("{n} bytes"),
+        Err(e) => log.push("{e}"),
+    }
+    match http.get(net, "http://127.0.0.1:{p3}/fail") {
+        Ok(r) => log.push("{r.status}"),
+        Err(e) => log.push("{e}"),
+    }
+    log.join("\n")
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let out = root.stdout
+    let net = root.net
+    let l = root.listen.on("127.0.0.1:0")?
+    let port = l.port()
+    let first = group g {
+        g.go(|| "served {http.serve(l, 4, route)}")
+        g.go(|| raw_client(net, port))
+    }
+    out.print(first.join("\n"))
+    let l2 = root.listen.on("127.0.0.1:0")?
+    let l3 = root.listen.on("127.0.0.1:0")?
+    let p2 = l2.port()
+    let p3 = l3.port()
+    let second = group g {
+        g.go(|| "forever: {http.serve_forever(l2, route)}")
+        g.go(|| "stream: {http.accept_forever(l3, |c| http.serve_stream(c, stream))}")
+        g.go(|| {
+            let log = fetch_client(net, p2, p3)
+            l2.close()
+            l3.close()
+            log
+        })
+    }
+    out.print(second.join("\n"))
+    Ok(())
+}
+|v}
+    "served 6\nHTTP/1.1 200 OK|Content-Type: text/plain; charset=utf-8|Connection: keep-alive|Content-Length: 21||GET /a HTTP/1.1 body=HTTP/1.1 200 OK|Content-Type: text/plain; charset=utf-8|Connection: keep-alive|Content-Length: 27||POST /b HTTP/1.1 body=abcdeHTTP/1.1 500 Internal Server Error|Content-Type: text/plain; charset=utf-8|Connection: keep-alive|Content-Length: 14||internal errorHTTP/1.1 200 OK|Content-Type: text/plain; charset=utf-8|Connection: close|Content-Length: 21||GET /c HTTP/1.1 body=\nHTTP/1.1 200 OK|Content-Type: text/plain; charset=utf-8|Connection: close|Content-Length: 23||GET /old HTTP/1.0 body=\nHTTP/1.1 200 OK|Content-Type: text/plain; charset=utf-8|Connection: close|Content-Length: 22||\nHTTP/1.1 400 Bad Request|Content-Type: text/plain; charset=utf-8|Connection: close|Content-Length: 12||bad request\n\nforever: Failed(\"listener is closed\")\nstream: Failed(\"listener is closed\")\n200 close GET /x HTTP/1.1 body=\n200 POST /y HTTP/1.1 body=hello\n200 chunked one two three\n13 bytes\nFailed(\"http: connection closed before the response\")\n";
+  check_tsan "std-http-keepalive-stream"
+    ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] }
+    {v|use http
+
+fn route(r: http.Request) -> http.Response {
+    if r.path == "/boom" {
+        let xs: List[Int] = []
+        http.text(200, "{xs[1]}")
+    } else {
+        http.text(200, "{r.method} {r.path} {r.version} body={r.body}")
+    }
+}
+
+fn stream(r: http.Request, c: Conn) -> Result[(), IoError] {
+    if r.path == "/fail" {
+        return Err(Failed("handler gave up"))
+    }
+    http.write_head(c, 200, [http.Header { name: "Content-Type", value: "text/plain" }])?
+    for w in ["one ", "two ", "", "three"] {
+        http.write_chunk(c, w)?
+    }
+    http.end_body(c)
+}
+
+// Send raw bytes, then read until the server closes the connection.
+fn raw(net: Net, port: Int, data: Str) -> Str {
+    match net.connect("127.0.0.1:{port}") {
+        Ok(c) => {
+            let _ = c.write(data)
+            let mut got = ""
+            let mut open = true
+            while open {
+                match c.read() {
+                    Ok(s) => if s == "" { open = false } else { got = got + s },
+                    Err(_) => { open = false },
+                }
+            }
+            c.close()
+            got.replace("\r\n", "|")
+        },
+        Err(e) => "{e}",
+    }
+}
+
+fn raw_client(net: Net, port: Int) -> Str {
+    let pipelined = "GET /a HTTP/1.1\r\nHost: x\r\n\r\nPOST /b HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2;ext=1\r\nde\r\n0\r\nX-Trailer: 1\r\n\r\nGET /boom HTTP/1.1\r\n\r\nGET /c HTTP/1.1\r\nConnection: close\r\n\r\n"
+    [
+        raw(net, port, pipelined),
+        raw(net, port, "GET /old HTTP/1.0\r\n\r\n"),
+        raw(net, port, "HEAD /h HTTP/1.1\r\nConnection: close\r\n\r\n"),
+        raw(net, port, "BAD\r\n\r\n"),
+    ].join("\n")
+}
+
+fn fetch_client(net: Net, p2: Int, p3: Int) -> Str {
+    let mut log = []
+    match http.get(net, "http://127.0.0.1:{p2}/x") {
+        Ok(r) => log.push("{r.status} {r.header("connection") ?? "-"} {r.body}"),
+        Err(e) => log.push("{e}"),
+    }
+    match http.post(net, "http://127.0.0.1:{p2}/y", "text/plain", "hello") {
+        Ok(r) => log.push("{r.status} {r.body}"),
+        Err(e) => log.push("{e}"),
+    }
+    match http.request_fold(net, "GET", "http://127.0.0.1:{p3}/s", [], "", "", |a, s| a + s) {
+        Ok((r, body)) => log.push("{r.status} {r.header("transfer-encoding") ?? "-"} {body}"),
+        Err(e) => log.push("{e}"),
+    }
+    match http.request_fold(net, "GET", "http://127.0.0.1:{p3}/s", [], "", 0, |n, s| n + s.len()) {
+        Ok((_, n)) => log.push("{n} bytes"),
+        Err(e) => log.push("{e}"),
+    }
+    match http.get(net, "http://127.0.0.1:{p3}/fail") {
+        Ok(r) => log.push("{r.status}"),
+        Err(e) => log.push("{e}"),
+    }
+    log.join("\n")
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let out = root.stdout
+    let net = root.net
+    let l = root.listen.on("127.0.0.1:0")?
+    let port = l.port()
+    let first = group g {
+        g.go(|| "served {http.serve(l, 4, route)}")
+        g.go(|| raw_client(net, port))
+    }
+    out.print(first.join("\n"))
+    let l2 = root.listen.on("127.0.0.1:0")?
+    let l3 = root.listen.on("127.0.0.1:0")?
+    let p2 = l2.port()
+    let p3 = l3.port()
+    let second = group g {
+        g.go(|| "forever: {http.serve_forever(l2, route)}")
+        g.go(|| "stream: {http.accept_forever(l3, |c| http.serve_stream(c, stream))}")
+        g.go(|| {
+            let log = fetch_client(net, p2, p3)
+            l2.close()
+            l3.close()
+            log
+        })
+    }
+    out.print(second.join("\n"))
+    Ok(())
+}
+|v}
+    "served 6\nHTTP/1.1 200 OK|Content-Type: text/plain; charset=utf-8|Connection: keep-alive|Content-Length: 21||GET /a HTTP/1.1 body=HTTP/1.1 200 OK|Content-Type: text/plain; charset=utf-8|Connection: keep-alive|Content-Length: 27||POST /b HTTP/1.1 body=abcdeHTTP/1.1 500 Internal Server Error|Content-Type: text/plain; charset=utf-8|Connection: keep-alive|Content-Length: 14||internal errorHTTP/1.1 200 OK|Content-Type: text/plain; charset=utf-8|Connection: close|Content-Length: 21||GET /c HTTP/1.1 body=\nHTTP/1.1 200 OK|Content-Type: text/plain; charset=utf-8|Connection: close|Content-Length: 23||GET /old HTTP/1.0 body=\nHTTP/1.1 200 OK|Content-Type: text/plain; charset=utf-8|Connection: close|Content-Length: 22||\nHTTP/1.1 400 Bad Request|Content-Type: text/plain; charset=utf-8|Connection: close|Content-Length: 12||bad request\n\nforever: Failed(\"listener is closed\")\nstream: Failed(\"listener is closed\")\n200 close GET /x HTTP/1.1 body=\n200 POST /y HTTP/1.1 body=hello\n200 chunked one two three\n13 bytes\nFailed(\"http: connection closed before the response\")\n";
   (* ---------- Rand, Env, args and the Fs additions ---------- *)
   let box = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "vela-box-%d" (Unix.getpid ())) in
   (try Unix.mkdir box 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());

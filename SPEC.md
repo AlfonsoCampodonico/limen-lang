@@ -825,17 +825,25 @@ Written in Vela and built into the compiler; `use` any of them. They take capabi
 
 ### http
 
-HTTP/1.1 over plain TCP (no TLS yet). Each message is read whole; bodies up to 8 MiB.
+HTTP/1.1 over plain TCP (no TLS yet). The server keeps connections alive between requests and reads pipelined requests in order; bodies can be streamed in pieces both ways.
 
 | Item | Meaning |
 | --- | --- |
 | `struct Header { name, value }`, `req.header(name)`, `resp.header(name)`, `find_header(headers, name)` | headers; lookup ignores case |
-| `struct Request { method, path, headers, body }` | |
+| `struct Request { method, path, version, headers, body }` | `version` is `"HTTP/1.1"` or `"HTTP/1.0"` |
 | `struct Response { status: Int, headers, body }`, `text(status, body)`, `json(status, body)`, `reason(status)` | |
-| `get(net, url)`, `post(net, url, content_type, body)`, `request(net, method, url, headers, body)` | `Result[Response, IoError]`; `http://host[:port]/path` URLs, chunked responses decoded |
-| `read_request(conn)`, `write_response(conn, r)` | one message on a connection |
-| `handle(conn, handler) -> Bool` | read, answer with `handler` (400 if malformed, 500 if the handler panics), close |
-| `serve(listener, count, handler) -> Int` | accept `count` connections, each handled in its own task; returns how many were answered |
+| `get(net, url)`, `post(net, url, content_type, body)`, `request(net, method, url, headers, body)` | `Result[Response, IoError]`; `http://host[:port]/path` URLs, chunked responses decoded, one connection per request |
+| `request_fold(net, method, url, headers, body, init, f)` | `Result[(Response, T), IoError]`: the body is passed to `f: fn(T, Str) -> T` piece by piece as it arrives instead of being held in memory; the response comes back with an empty body |
+| `serve_forever(listener, handler) -> IoError` | serve every connection in its own task until the listener is closed (by another task holding it) or fails; returns that error |
+| `serve(listener, count, handler) -> Int` | the same for `count` connections; returns how many requests were answered |
+| `serve_conn(conn, handler) -> Int` | answer requests on one connection until the client closes it or asks to (`Connection: close`, or HTTP/1.0 without keep-alive); 400 and close on a malformed request, 500 if the handler panics, headers only for HEAD |
+| `handle(conn, handler) -> Bool` | answer one request, then close |
+| `accept_forever(listener, f) -> IoError` | run `f: fn(Conn) -> Int` on each accepted connection in its own task, until accepting fails |
+| `serve_stream(conn, handler) -> Int` | like `serve_conn` for a handler `fn(Request, Conn) -> Result[(), IoError]` that writes its own response; an error or panic closes the connection |
+| `write_head(conn, status, headers)`, `write_chunk(conn, piece)`, `end_body(conn)` | write a response whose body follows in pieces (`Transfer-Encoding: chunked`) |
+| `read_request(conn)`, `write_response(conn, r)` | one message on a connection; `write_response` says the connection will close |
+
+Limits: request heads up to 64 KiB, request bodies up to 8 MiB (read whole, chunked or not), 1000 requests per connection. There are no timeouts yet, so an idle keep-alive connection holds its task until the client closes it, and `serve_forever` keeps a small record per finished connection until it returns.
 
 ```
 use http
@@ -846,12 +854,23 @@ fn hello(r: http.Request) -> http.Response {
 
 fn main(root: Root) -> Result[(), IoError] {
     let l = root.listen.on("127.0.0.1:8080")?
-    http.serve(l, 100, hello)
-    Ok(())
+    Err(http.serve_forever(l, hello))
 }
 ```
 
-The handler is a plain function value, so it gets no capability unless a closure captures one.
+The handler is a plain function value, so it gets no capability unless a closure captures one. A streamed response:
+
+```
+fn numbers(r: http.Request, c: Conn) -> Result[(), IoError] {
+    http.write_head(c, 200, [http.Header { name: "Content-Type", value: "text/plain" }])?
+    for n in [1, 2, 3] {
+        http.write_chunk(c, "{n}\n")?
+    }
+    http.end_body(c)
+}
+
+// in main: http.accept_forever(l, |c| http.serve_stream(c, numbers))
+```
 
 ### list
 
