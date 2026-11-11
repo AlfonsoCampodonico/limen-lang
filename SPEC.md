@@ -872,6 +872,37 @@ Number formatting. Fixed decimals are the Float method `x.to_fixed(d)`; this mod
 | `align_left(s, w)`, `align_right(s, w)`, `align_center(s, w)` | `s` padded with spaces to `w` characters for table columns; counts code points, not bytes |
 | `width(s)` | the number of code points in `s` |
 
+### regex
+
+Regular expressions that never backtrack: a pattern compiles to a program for a Pike VM, which follows every way the pattern can match at once, so a search takes time proportional to the pattern size times the text length, whatever the pattern. `(a+)+$` on a long run of `a`s is as fast as any other pattern. Written in Vela.
+
+| Item | Meaning |
+| --- | --- |
+| `compile(pattern) -> Result[Regex, Str]`, `must(pattern) -> Regex` | `must` panics on a bad pattern; use it for patterns written in the source |
+| `r.matches(s)` | whether the whole of `s` matches |
+| `r.find(s)`, `r.find_from(s, start)` | `Option[Match]`, the leftmost match (from byte `start`) |
+| `r.find_all(s)` | `List[Match]`, left to right without overlaps; an empty match right after a match is skipped |
+| `r.replace(s, template)`, `r.replace_first(s, template)` | `$1` or `${1}` is a group, `${name}` a named group, `$0` the whole match, `$$` a dollar sign |
+| `r.replace_with(s, f)` | every match replaced by `f(match)` |
+| `r.split(s)` | the pieces between matches; an empty pattern splits into characters |
+| `escape(s)` | `s` with metacharacters escaped, to match it literally |
+| `struct Match { text, start, end, groups, names }`, `m.capture(i)`, `m.named(name)` | `start` and `end` are byte offsets; `capture(0)` is the whole match; a group that did not take part is `None` |
+
+The syntax is a subset of RE2's: literals; `.` (any character but newline); classes `[abc]`, `[^a-z]`, `[\d_]`; `\d \w \s` and `\D \W \S` (ASCII); `\b \B` word edges; `^ $` (text start and end) and `\A \z`; `* + ? {n} {n,} {n,m}` (counts up to 1000), each lazy with a trailing `?`; `( )` captures, `(?: )` groups without capturing, `(?P<name> )` or `(?<name> )` name a capture; `|`; escapes `\n \t \r \f \v \0 \xHH` and `\` before any punctuation. Flags `(?i)` (ASCII case-insensitive), `(?m)` (`^` and `$` match at lines) and `(?s)` (`.` matches newline) apply from where they appear to the end of the pattern. Text is UTF-8: `.` and negated classes match whole characters, and a non-ASCII character is one unit for a quantifier. Classes may list non-ASCII characters but not ranges of them, and a negated class cannot list them. Backreferences and lookaround are not supported, since they need backtracking. A Vela string needs `\{` for a literal brace, so `\d{4}` is written `"\\d\{4\}"`.
+
+```
+use regex
+
+fn main(root: Root) {
+    let date = regex.must("(?P<y>\\d\{4\})-(?P<m>\\d\{2\})-(?P<d>\\d\{2\})")
+    match date.find("due 2026-12-01") {
+        Some(m) => root.stdout.print("{m.named("d") ?? ""}/{m.named("m") ?? ""}"),
+        None => root.stdout.print("no date"),
+    }
+    root.stdout.print(date.replace("2026-12-01", "$3.$2.$1"))
+}
+```
+
 ### time
 
 Calendar dates and times as pure functions of epoch milliseconds, the number `Clock.now_ms()` returns. Everything is UTC on the proleptic Gregorian calendar, without leap seconds. Fixed offsets from UTC (in minutes, `60` for +01:00) are supported where a function says so; named time zones with daylight saving rules are not, as they need the system's zone database.

@@ -102,7 +102,7 @@ fetch = { path = "../fetch", caps = ["net"] }
 
 Since capabilities only arrive as parameters, a dependency's signatures are a complete list of what it can do. If one asks for a capability it was not granted, the program does not compile (E0320).
 
-The standard library is written in Vela: `json` (parse, stringify, field access), `http` (an HTTP/1.1 client over `Net` and a server over `Listener`, one task per connection), `list` (`sort_by` and friends), `text`, `format` (thousands separators, zero padding, hex and other bases, aligned columns; fixed decimals are `x.to_fixed(2)`) and `time` (UTC dates from epoch milliseconds, ISO 8601 formatting and parsing, strftime-style layouts). See [examples/http_demo.vela](examples/http_demo.vela), [examples/report.vela](examples/report.vela) and SPEC.md sections 18 and 19.
+The standard library is written in Vela: `json` (parse, stringify, field access), `http` (an HTTP/1.1 client over `Net` and a server over `Listener`, one task per connection), `list` (`sort_by` and friends), `text`, `format` (thousands separators, zero padding, hex and other bases, aligned columns; fixed decimals are `x.to_fixed(2)`) and `time` (UTC dates from epoch milliseconds, ISO 8601 formatting and parsing, strftime-style layouts) and `regex` (a Pike VM: no catastrophic backtracking; match, find, find all, captures, replace, split). See [examples/http_demo.vela](examples/http_demo.vela), [examples/report.vela](examples/report.vela), [examples/logscan.vela](examples/logscan.vela) and SPEC.md sections 18 and 19.
 
 ## Concurrency
 

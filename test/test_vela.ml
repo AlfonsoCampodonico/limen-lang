@@ -1148,6 +1148,62 @@ fn main(root: Root) {
     "2025-11-11T18:22:05.123Z\ntime.DateTime { year: 2025, month: 11, day: 11, hour: 18, minute: 22, second: 5, ms: 123, weekday: 2, yday: 315 }\n1970-01-01T00:00:00.000Z 1969-12-31T23:59:59.999Z 2000-02-29T00:00:00.000Z -000001-12-31T00:00:00.000Z +010000-01-01T00:00:00.000Z\ntime.DateTime { year: 1969, month: 12, day: 31, hour: 23, minute: 59, second: 59, ms: 999, weekday: 3, yday: 365 }\nTue 11 Nov 2025 06:22 PM, day 315, week day 2, 1762885325 +0000 UTC % %q 100%\n2025-11-11 12:52 -05:30 -0530 2025-11-11T19:22:05.123+01:00 2025-11-11\n2024-02-29T05:00:00.000Z 2023-01-15T00:00:00.000Z 2025-01-01T00:00:00.000Z 2024-02-29T00:00:00.000Z\n1794355200000 2026-11-11T00:00:00.000Z\n1794421325123 2026-11-11T18:22:05.123Z\n1794421325123 2026-11-11T18:22:05.123Z\n1794421320000 2026-11-11T18:22:00.000Z\n-1 1969-12-31T23:59:59.999Z\n1709146800000 2024-02-28T19:00:00.000Z\ntime: day 29 is out of range for 2023-02\ntime: month 13 is out of range\ntime: 24:00:00 is not a valid time\ntime: expected `:` at byte 13\ntime: expected digits at byte 20\ntime: expected `Z`, an offset or end of input at byte 16\ntime: expected a four-digit year at byte 0\ntime: expected end of input at byte 21\nfalse true 28 ? Sunday\ntrue 1767315600000\n";
   out "std-report-example" (example "report.vela")
     "Mon 09 Nov caf\195\169        1,234.50\nTue 10 Nov books          98.12\nWed 11 Nov rent    1,500,000.00\n                   1,501,332.62\norder #000042, id 0xbeef\ndue 2026-12-01T08:30:00.000Z, week 2026-305\nprinted in true\n";
+  out "std-regex"
+    {v|use regex
+
+fn show(p: Str, s: Str) -> Str {
+    match regex.compile(p) {
+        Ok(r) => match r.find(s) {
+            Some(m) => "{p} on {s}: {m.text} at {m.start}..{m.end} {m.groups}",
+            None => "{p} on {s}: no match",
+        },
+        Err(e) => e,
+    }
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    out.print(show("a+b", "xaaab"))
+    out.print(show("(\\d+)-(\\d+)?", "tel 12- or 3-4"))
+    out.print(show("a|ab", "ab"))
+    out.print(show("(?i)hello", "say HeLLo"))
+    out.print(show("x*", "abc"))
+    out.print(show("é+.", "aééz"))
+    out.print(show("[^a]", "aé"))
+    out.print(show("\\bfoo\\b", "foobar foo"))
+    out.print(show("a\{2,3\}?", "aaaa"))
+    out.print(show("(a*)*b", "aaab"))
+    out.print(show("[", "x"))
+    out.print(show("a)", "x"))
+    out.print(show("(?=a)", "x"))
+    out.print(show("*a", "x"))
+    let r = regex.must("(?P<y>\\d\{4\})-(?P<m>\\d\\d)")
+    out.print("{r.matches("2026-11")} {r.matches("2026-11x")} {regex.must("a|ab").matches("ab")}")
+    let m = r.find("on 2026-11-11") ?? regex.Match { text: "", start: 0, end: 0, groups: [], names: [] }
+    out.print("{m.named("y")} {m.named("m")} {m.named("z")} {m.capture(5)}")
+    out.print("{regex.must("\\d+").find_all("a1b22c333").map(|m| m.text)}")
+    out.print("{regex.must("a*").find_all("baaac").map(|m| "{m.start}:{m.text}")}")
+    out.print(r.replace("from 2026-11 to 2027-01", "$\{m\}/$y $$1"))
+    out.print(regex.must("o").replace_first("foo", "0"))
+    out.print(regex.must("\\w+").replace_with("hi there", |m| m.text.to_upper()))
+    out.print("{regex.must(",\\s*").split("a, b,c,")} {regex.must("").split("abc")} {regex.must("x").split("")}")
+    out.print(regex.escape("1+1=2? (yes)"))
+    out.print("{regex.must("(?m)^\\w+$").find_all("one\ntwo\n").map(|m| m.text)} {regex.must("^\\w+$").find_all("one\ntwo").len()}")
+    // no catastrophic backtracking
+    let evil = regex.must("(a+)+$")
+    let mut s = ""
+    let mut i = 0
+    while i < 30 {
+        s = s + "a"
+        i = i + 1
+    }
+    out.print("{evil.matches(s + "b")} {evil.find(s + "b").map(|m| m.end)}")
+}
+|v}
+    "a+b on xaaab: aaab at 1..5 [Some(\"aaab\")]\n(\\d+)-(\\d+)? on tel 12- or 3-4: 12- at 4..7 [Some(\"12-\"), Some(\"12\"), None]\na|ab on ab: a at 0..1 [Some(\"a\")]\n(?i)hello on say HeLLo: HeLLo at 4..9 [Some(\"HeLLo\")]\nx* on abc:  at 0..0 [Some(\"\")]\n\195\169+. on a\195\169\195\169z: \195\169\195\169z at 1..6 [Some(\"\\195\\169\\195\\169z\")]\n[^a] on a\195\169: \195\169 at 1..3 [Some(\"\\195\\169\")]\n\\bfoo\\b on foobar foo: foo at 7..10 [Some(\"foo\")]\na{2,3}? on aaaa: aa at 0..2 [Some(\"aa\")]\n(a*)*b on aaab: aaab at 0..4 [Some(\"aaab\"), Some(\"aaa\")]\nregex: missing `]` at byte 0\nregex: unmatched `)`\nregex: unsupported group syntax (no lookaround or backreferences) at byte 0\nregex: a quantifier with nothing to repeat\ntrue false true\nSome(\"2026\") Some(\"11\") None None\n[\"1\", \"22\", \"333\"]\n[\"0:\", \"1:aaa\", \"5:\"]\nfrom 11/$y $1 to 01/$y $1\nf0o\nHI THERE\n[\"a\", \"b\", \"c\", \"\"] [\"a\", \"b\", \"c\"] [\"\"]\n1\\+1=2\\? \\(yes\\)\n[\"one\", \"two\"] 0\nfalse None\n";
+  out "std-logscan-example" (example "logscan.vela")
+    "09:15:02 GET  /index.html 200     5,120\n09:15:09 GET  /missing    404         0\nskipped: not a log line\n09:01:44 POST /api/orders 201 1,048,576\ntotal 1,053,696 bytes\ndue 01/12/2026, paid 30/11/2026\n[\"a\", \"b\", \"c\", \"d\"]\n";
+  panics "std-regex-must" "use regex\n\nfn main(root: Root) {\n    let r = regex.must(\"(a\")\n    root.stdout.print(r.pattern)\n}\n" "regex: missing `)`";
   (* ---------- Rand, Env, args and the Fs additions ---------- *)
   let box = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "vela-box-%d" (Unix.getpid ())) in
   (try Unix.mkdir box 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());

@@ -31,7 +31,7 @@
 ; Embed the standard library modules (written in Vela).
 (rule
  (targets std_text.ml)
- (deps std/json.vela std/list.vela std/text.vela std/http.vela std/format.vela std/time.vela)
+ (deps std/json.vela std/list.vela std/text.vela std/http.vela std/format.vela std/time.vela std/regex.vela)
  (action
   (with-stdout-to
    std_text.ml
@@ -49,4 +49,6 @@
     (cat std/format.vela)
     (echo "|xxstdxx});\n(\"time\", {xxstdxx|")
     (cat std/time.vela)
+    (echo "|xxstdxx});\n(\"regex\", {xxstdxx|")
+    (cat std/regex.vela)
     (echo "|xxstdxx}) ]\n")))))
