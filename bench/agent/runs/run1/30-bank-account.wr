@@ -1,0 +1,22 @@
+fn withdraw(balance: Int, amount: Int) -> Result[Int, Str] {
+    if amount <= 0 {
+        Err("invalid amount")
+    } else if amount > balance {
+        Err("insufficient funds")
+    } else {
+        Ok(balance - amount)
+    }
+}
+
+fn main(root: Root) {
+    let mut balance = 100
+    for a in [30, -5, 80, 70] {
+        let r = withdraw(balance, a)
+        root.stdout.print("{r}")
+        match r {
+            Ok(b) => { balance = b },
+            Err(_) => (),
+        }
+    }
+    root.stdout.print("final: {balance}")
+}

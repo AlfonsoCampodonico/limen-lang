@@ -1,0 +1,10 @@
+fn main(root: Root) {
+    let xs = [3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5]
+    let mut out: List[Int] = []
+    for x in xs {
+        if !out.contains(x) {
+            out.push(x)
+        }
+    }
+    root.stdout.print("{out}")
+}

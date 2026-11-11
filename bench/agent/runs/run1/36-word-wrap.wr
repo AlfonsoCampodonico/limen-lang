@@ -1,0 +1,25 @@
+fn wrap(text: Str, width: Int) -> List[Str] {
+    let mut lines: List[Str] = []
+    let mut cur = ""
+    for w in text.split(" ") {
+        if cur.is_empty() {
+            cur = w
+        } else if cur.len() + 1 + w.len() <= width {
+            cur = cur + " " + w
+        } else {
+            lines.push(cur)
+            cur = w
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur)
+    }
+    lines
+}
+
+fn main(root: Root) {
+    let text = "Writ is a small statically typed language where code can only touch the outside world through capabilities"
+    for line in wrap(text, 30) {
+        root.stdout.print(line)
+    }
+}

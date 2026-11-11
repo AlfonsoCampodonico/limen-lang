@@ -1,0 +1,19 @@
+fn parse(s: Str) -> Result[Int, Str] {
+    match s.parse_int() {
+        Some(n) => Ok(n),
+        None => Err("bad: {s}"),
+    }
+}
+
+fn sum_all(xs: List[Str]) -> Result[Int, Str] {
+    let mut total = 0
+    for s in xs {
+        total = total + parse(s)?
+    }
+    Ok(total)
+}
+
+fn main(root: Root) {
+    root.stdout.print("{sum_all(["1", "2", "3"])}")
+    root.stdout.print("{sum_all(["4", "five", "6"])}")
+}

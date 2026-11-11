@@ -1,0 +1,12 @@
+fn classify(r: Result[Str, IoError]) -> Str {
+    match r {
+        Ok(_) => "ok",
+        Err(Failed(_)) => "missing",
+        Err(Denied(_)) => "denied",
+    }
+}
+
+fn main(root: Root) {
+    root.stdout.print(classify(root.fs.read("nope.txt")))
+    root.stdout.print(classify(root.fs.read("../poem.txt")))
+}

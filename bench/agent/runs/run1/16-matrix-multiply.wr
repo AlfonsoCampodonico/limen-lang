@@ -1,0 +1,29 @@
+fn matmul(a: List[List[Int]], b: List[List[Int]]) -> List[List[Int]] {
+    let mut out: List[List[Int]] = []
+    let mut i = 0
+    while i < a.len() {
+        let mut row: List[Int] = []
+        let mut j = 0
+        while j < b[0].len() {
+            let mut s = 0
+            let mut k = 0
+            while k < b.len() {
+                s = s + a[i][k] * b[k][j]
+                k = k + 1
+            }
+            row.push(s)
+            j = j + 1
+        }
+        out.push(row)
+        i = i + 1
+    }
+    out
+}
+
+fn main(root: Root) {
+    let a: List[List[Int]] = [[1, 2], [3, 4]]
+    let b: List[List[Int]] = [[5, 6], [7, 8]]
+    for row in matmul(a, b) {
+        root.stdout.print("{row}")
+    }
+}

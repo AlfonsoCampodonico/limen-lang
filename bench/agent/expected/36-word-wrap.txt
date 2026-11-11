@@ -1,0 +1,4 @@
+Writ is a small statically
+typed language where code can
+only touch the outside world
+through capabilities

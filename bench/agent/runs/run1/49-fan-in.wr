@@ -1,0 +1,36 @@
+fn main(root: Root) {
+    let c: Chan[Str] = channel(4)
+    let results = group g {
+        g.go(|| {
+            let done = group h {
+                for k in [1, 2, 3] {
+                    h.go(|| {
+                        for i in [1, 2, 3, 4, 5] {
+                            c.send("w{k}-{i}")
+                        }
+                        0
+                    })
+                }
+            }
+            c.close()
+            let none: List[Str] = []
+            none
+        })
+        g.go(|| {
+            let mut got: List[Str] = []
+            let mut more = true
+            while more {
+                match c.recv() {
+                    Some(m) => { got.push(m) },
+                    None => { more = false },
+                }
+            }
+            got
+        })
+    }
+    let msgs = results[1]
+    root.stdout.print("{msgs.len()}")
+    for m in msgs.sort() {
+        root.stdout.print(m)
+    }
+}

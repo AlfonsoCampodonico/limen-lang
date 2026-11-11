@@ -1,0 +1,9 @@
+fn main(root: Root) {
+    let mut line = ""
+    let mut i = 1
+    while i <= 5 {
+        line = line + "*"
+        root.stdout.print(line)
+        i = i + 1
+    }
+}

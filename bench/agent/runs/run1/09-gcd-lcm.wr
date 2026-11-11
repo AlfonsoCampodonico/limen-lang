@@ -1,0 +1,16 @@
+fn gcd(a: Int, b: Int) -> Int {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
+fn lcm(a: Int, b: Int) -> Int {
+    a / gcd(a, b) * b
+}
+
+fn main(root: Root) {
+    let pairs = [[12, 18], [17, 5], [100, 75]]
+    for p in pairs {
+        let a = p[0]
+        let b = p[1]
+        root.stdout.print("{a} {b} {gcd(a, b)} {lcm(a, b)}")
+    }
+}

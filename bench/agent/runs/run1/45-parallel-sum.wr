@@ -1,0 +1,19 @@
+fn range_sum(lo: Int, hi: Int) -> Int {
+    let mut s = 0
+    let mut i = lo
+    while i <= hi {
+        s = s + i
+        i = i + 1
+    }
+    s
+}
+
+fn main(root: Root) {
+    let parts = group g {
+        for k in [0, 1, 2, 3] {
+            g.go(|| range_sum(k * 250000 + 1, (k + 1) * 250000))
+        }
+    }
+    root.stdout.print("{parts}")
+    root.stdout.print("{parts.sum()}")
+}

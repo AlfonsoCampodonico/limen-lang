@@ -1,0 +1,14 @@
+fn report(xs: List[Int]) -> Str {
+    let first = xs.first().unwrap_or(0)
+    let mn = xs.fold(first, |a, x| if x < a { x } else { a })
+    let mx = xs.fold(first, |a, x| if x > a { x } else { a })
+    "min={mn} max={mx} sum={xs.sum()}"
+}
+
+fn show(out: Stdout, xs: List[Int]) {
+    out.print(report(xs))
+}
+
+fn main(root: Root) {
+    show(root.stdout, [7, 2, 9, 4])
+}

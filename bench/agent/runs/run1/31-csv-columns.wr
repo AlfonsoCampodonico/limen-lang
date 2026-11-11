@@ -1,0 +1,20 @@
+fn main(root: Root) {
+    let csv = "name,age,score\nann,31,88\nbo,25,92\ncid,40,75\n"
+    let rows = csv.lines().skip(1)
+    let mut total = 0
+    let mut best = ""
+    let mut best_score = -1
+    for row in rows {
+        let cols = row.split(",")
+        let name = cols[0]
+        let age = cols[1].parse_int().unwrap_or(0)
+        let score = cols[2].parse_int().unwrap_or(0)
+        total = total + age
+        if score > best_score {
+            best_score = score
+            best = name
+        }
+    }
+    root.stdout.print("avg_age: {total / rows.len()}")
+    root.stdout.print("best: {best}")
+}

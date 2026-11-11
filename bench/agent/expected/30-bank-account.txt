@@ -1,0 +1,5 @@
+Ok(70)
+Err("invalid amount")
+Err("insufficient funds")
+Ok(0)
+final: 0

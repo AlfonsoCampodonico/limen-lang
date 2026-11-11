@@ -30,6 +30,12 @@ let expect_ident st =
   | IDENT s ->
     let t = advance st in
     (s, t.span)
+  | KW k ->
+    raise
+      (Diag.Fatal
+         (Diag.make ~notes:[ "keywords cannot be used as names; pick another name, for example `" ^ k ^ "s` or `my_" ^ k ^ "`" ]
+            "E0003" (peek st).span
+            (Printf.sprintf "expected a name, found keyword `%s`" k)))
   | _ -> fail (peek st) "a name"
 
 let last_span st = st.toks.(max 0 (st.pos - 1)).span

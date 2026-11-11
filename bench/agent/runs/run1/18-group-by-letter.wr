@@ -1,0 +1,14 @@
+fn main(root: Root) {
+    let names = ["alice", "bob", "anna", "carl", "beth", "cara", "dan"]
+    let mut letters: List[Str] = []
+    for n in names {
+        let l = n.split("")[0]
+        if !letters.contains(l) {
+            letters.push(l)
+        }
+    }
+    for l in letters {
+        let members = names.filter(|n| n.starts_with(l))
+        root.stdout.print("{l}: {members.join(", ")}")
+    }
+}

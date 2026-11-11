@@ -1,0 +1,17 @@
+fn main(root: Root) -> Result[(), IoError] {
+    let text = root.fs.read("poem.txt")?
+    let lines = text.lines()
+    let mut words = 0
+    for line in lines {
+        for part in line.split(" ") {
+            let t = part.trim()
+            if !t.is_empty() {
+                words = words + 1
+            }
+        }
+    }
+    root.stdout.print("lines: {lines.len()}")
+    root.stdout.print("words: {words}")
+    root.stdout.print("chars: {text.len()}")
+    Ok(())
+}

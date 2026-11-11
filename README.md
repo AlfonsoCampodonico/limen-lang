@@ -45,12 +45,16 @@ dune exec writ -- build examples/repos.wr -o repos && ./repos --grant net=api.gi
 
 | Command | What it does |
 | --- | --- |
-| `writ run FILE [--native] [--grant net=HOST[:PORT]\|*]... [--grant fs=DIR[:ro]]` | Type-check, then run `main` in the interpreter, or compiled with `--native`. Stdout and Clock are always granted; Net and Fs only when granted. |
+| `writ run FILE [--native] [--grant net=HOST[:PORT]\|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST[:PORT]]...` | Type-check, then run `main` in the interpreter, or compiled with `--native`. Stdout and Clock are always granted; Net, Fs and Listen only when granted. |
 | `writ build FILE [-o OUT] [--emit-c]` | Compile to a native binary through C. The binary takes the same `--grant` flags. `--emit-c` writes the C instead. |
 | `writ check FILE [--json]` | Type-check only. `--json` emits diagnostics with codes, spans, notes and machine-applicable fixes. |
 | `writ caps FILE [--json]` | List each function's authority: the capabilities in its signature, or `pure`. |
 | `writ explain CODE` | Explain an error code, for example `writ explain E0302`. |
+| `writ test FILE [--native]` | Run the file's `test "name" { ... }` blocks, each isolated. |
+| `writ fmt FILE... [--write\|--check]` | Print the canonical formatting, rewrite files, or check them. |
 | `writ lsp` | Language server on stdin/stdout. |
+| `writ mcp` | MCP server for coding agents on stdin/stdout. |
+| `writ spec` | Print the language specification. |
 
 ## Tooling for editors and models
 
@@ -64,6 +68,9 @@ dune exec writ -- build examples/repos.wr -o repos && ./repos --grant net=api.gi
 
   Positions count bytes, which is exact for ASCII source.
 - **Grammar ([grammar/writ.gbnf](grammar/writ.gbnf)):** in llama.cpp's GBNF format, for constrained decoding. It accepts every example, benchmark and test-suite program, and rejects the hand-written invalid cases. It is slightly more permissive than the parser: keywords aren't excluded from identifiers. It requires a space after keywords (`if x {`), which is the canonical style.
+- **Formatter (`writ fmt`):** keeps comments, number and string spellings, and the author's line breaks in lists and argument lists. The test suite formats every program and checks that the tree is unchanged, a second pass changes nothing, and no comment is lost.
+- **Tests (`writ test`):** `test "name" { assert_eq(...) }` blocks. They get no `root`, so they cannot do I/O. Each runs isolated in the interpreter, or as its own process with `--native`.
+- **MCP server (`writ mcp`):** tools to check, run, test, format, read a type, list capabilities, explain an error, and read the spec. `writ_run` gives the program no grants, so code an agent just wrote can print but cannot touch files or the network, and it stops at a time limit.
 - **Checking the grammar:** `python3 grammar/gbnf_check.py` checks files against it with an Earley recognizer that follows llama.cpp's grammar syntax and acceptance rule. `grammar/check-suite.sh` runs it over every program in the test suite.
 
 Neovim:
@@ -84,6 +91,8 @@ With VS Code, any generic LSP client extension works: point it at `writ lsp` for
 
 ## Concurrency
 
+Tasks are fibers: small stacks scheduled by worker threads, one per core, with work stealing. A task waiting on a group, a channel or a socket parks without blocking a thread. If every task is waiting and nothing can wake one, the program panics with a deadlock message instead of hanging.
+
 A `group` block starts tasks with `g.go(closure)` and evaluates to the list of their results, in the order they were started. Every task has finished when the block ends, so nothing outlives it.
 
 ```
@@ -95,7 +104,10 @@ let counts = group g {
 - Tasks share data by value. A value handed to a task is switched to atomic reference counting, together with everything it references. Values that stay on one thread keep plain counts, so single-threaded code pays nothing.
 - A task can only touch the world through capabilities it captured. Spawning is not a capability, because it has no effect outside the program.
 - The handle `g` can only be used as `g.go(...)` in the block's own body (E0310), and the body cannot `return` or use `?` to leave early (E0311).
-- Native code runs tasks on one worker per core (`WRIT_THREADS` overrides this). A thread waiting on a group runs queued tasks itself, so nested groups don't deadlock. The interpreter runs tasks one after another.
+- **Channels:** `channel(n)` makes a `Chan[T]` with `send`, `recv` (returning `None` once closed and drained) and `close`. Values sent are shared, not copied, across threads.
+- **Sockets:** `root.listen.on("host:port")` (granted with `--grant listen=...`) gives a `Listener`; `accept` and `Net.connect` give a `Conn` with `read`, `write` and `close`. The native poller is kqueue on macOS and epoll on Linux (Linux untested).
+- **Echo server:** [examples/echo.wr](examples/echo.wr) serves 10,000 concurrent connections, each kept open until all are connected, with every echo correct. Natively that takes about 2 s and 335 MB peak. Reproduce with `bench/echo_load.py`.
+- **Interpreter:** runs tasks as coroutines on OCaml 5 effect handlers, so the same programs behave the same way.
 
 ## Native backend
 
@@ -142,4 +154,4 @@ On one thread Writ is level with C on these workloads. With `group` it runs abou
 
 Types: `Int`, `Float`, `Bool`, `Str`, `()`, `List[T]`, fixed-size `Array[T, N]` (a value type), structs, enums with payloads, generics on functions, structs and enums, and closures. `Option`, `Result` and `IoError` come from the prelude. Control flow: `if`/`else`, exhaustive `match`, `while`, `for x in list`, `break`, `continue`, `return` and `?`. Statements end at a newline; a line starting with `.` continues a method chain. String interpolation takes any expression: `"{xs.join(", ")}"`.
 
-Not yet: channels, methods on user types, and modules. `Int` is 64-bit in native code but 63-bit in the interpreter, because OCaml reserves one bit of its native int; the two only differ on overflow.
+Not yet: methods on user types, modules, tuples and maps, and `select` over channels. `Int` is 64-bit in native code but 63-bit in the interpreter, because OCaml reserves one bit of its native int; the two only differ on overflow.

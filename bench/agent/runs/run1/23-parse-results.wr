@@ -1,0 +1,12 @@
+fn main(root: Root) {
+    let mut ok: List[Int] = []
+    let mut errors = 0
+    for s in ["12", "x7", "-3", "", "40"] {
+        match s.parse_int() {
+            Some(n) => ok.push(n),
+            None => { errors = errors + 1 },
+        }
+    }
+    root.stdout.print("ok: {ok}")
+    root.stdout.print("errors: {errors}")
+}

@@ -1,0 +1,41 @@
+struct WC {
+    word: Str,
+    count: Int,
+}
+
+fn before(a: WC, b: WC) -> Bool {
+    if a.count != b.count { a.count > b.count } else { a.word < b.word }
+}
+
+fn main(root: Root) {
+    let words = "the cat and the dog and the bird".split(" ")
+    let mut counts: List[WC] = []
+    for w in words {
+        let mut found = false
+        let mut i = 0
+        while i < counts.len() {
+            if counts[i].word == w {
+                counts[i].count = counts[i].count + 1
+                found = true
+            }
+            i = i + 1
+        }
+        if !found {
+            counts.push(WC { word: w, count: 1 })
+        }
+    }
+    let mut i = 1
+    while i < counts.len() {
+        let cur = counts[i]
+        let mut j = i - 1
+        while j >= 0 && before(cur, counts[j]) {
+            counts[j + 1] = counts[j]
+            j = j - 1
+        }
+        counts[j + 1] = cur
+        i = i + 1
+    }
+    for c in counts {
+        root.stdout.print("{c.word} {c.count}")
+    }
+}

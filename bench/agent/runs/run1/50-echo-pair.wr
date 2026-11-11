@@ -1,0 +1,37 @@
+fn serve(l: Listener) -> Result[Str, IoError] {
+    let c = l.accept()?
+    let mut more = true
+    while more {
+        let data = c.read()?
+        if data == "" {
+            more = false
+        } else {
+            c.write(data)?
+        }
+    }
+    c.close()
+    Ok("")
+}
+
+fn client(net: Net, port: Int) -> Result[Str, IoError] {
+    let c = net.connect("127.0.0.1:{port}")?
+    c.write("ping")?
+    let reply = c.read()?
+    c.close()
+    Ok(reply)
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let l = root.listen.on("127.0.0.1:0")?
+    let port = l.port()
+    let net = root.net
+    let results = group g {
+        g.go(|| serve(l))
+        g.go(|| client(net, port))
+    }
+    l.close()
+    let reply = results[1]?
+    let ignored = results[0]?
+    root.stdout.print(reply)
+    Ok(())
+}

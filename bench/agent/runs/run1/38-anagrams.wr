@@ -1,0 +1,31 @@
+struct Group {
+    key: Str,
+    words: List[Str],
+}
+
+fn key_of(w: Str) -> Str {
+    w.split("").sort().join("")
+}
+
+fn main(root: Root) {
+    let words = ["listen", "silent", "enlist", "google", "gooegl", "cat", "act", "tac", "dog"]
+    let mut groups: List[Group] = []
+    for w in words {
+        let k = key_of(w)
+        let mut found = false
+        let mut i = 0
+        while i < groups.len() {
+            if groups[i].key == k {
+                groups[i].words.push(w)
+                found = true
+            }
+            i = i + 1
+        }
+        if !found {
+            groups.push(Group { key: k, words: [w] })
+        }
+    }
+    for g in groups {
+        root.stdout.print(g.words.join(" "))
+    }
+}

@@ -1,0 +1,45 @@
+enum Tree {
+    Leaf,
+    Node(Tree, Int, Tree),
+}
+
+fn insert(t: Tree, v: Int) -> Tree {
+    match t {
+        Leaf => Node(Leaf, v, Leaf),
+        Node(l, x, r) => if v < x { Node(insert(l, v), x, r) } else { Node(l, x, insert(r, v)) },
+    }
+}
+
+fn inorder(t: Tree) -> List[Int] {
+    match t {
+        Leaf => [],
+        Node(l, x, r) => {
+            let mut out = inorder(l)
+            out.push(x)
+            for y in inorder(r) {
+                out.push(y)
+            }
+            out
+        },
+    }
+}
+
+fn height(t: Tree) -> Int {
+    match t {
+        Leaf => 0,
+        Node(l, _, r) => {
+            let a = height(l)
+            let b = height(r)
+            if a > b { a + 1 } else { b + 1 }
+        },
+    }
+}
+
+fn main(root: Root) {
+    let mut t = Leaf
+    for v in [50, 30, 70, 20, 40, 60, 80, 35] {
+        t = insert(t, v)
+    }
+    root.stdout.print("{inorder(t)}")
+    root.stdout.print("{height(t)}")
+}

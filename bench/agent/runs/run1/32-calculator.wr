@@ -1,0 +1,103 @@
+enum Tok {
+    Num(Int),
+    Op(Str),
+    LParen,
+    RParen,
+}
+
+struct Res {
+    value: Int,
+    pos: Int,
+}
+
+fn is_digit(c: Str) -> Bool {
+    c >= "0" && c <= "9"
+}
+
+fn tokenize(s: Str) -> List[Tok] {
+    let mut toks: List[Tok] = []
+    let mut num = ""
+    for c in s.split("") {
+        if is_digit(c) {
+            num = num + c
+        } else {
+            if !num.is_empty() {
+                toks.push(Num(num.parse_int().unwrap_or(0)))
+                num = ""
+            }
+            if c == "(" {
+                toks.push(LParen)
+            } else if c == ")" {
+                toks.push(RParen)
+            } else if c == "+" || c == "-" || c == "*" || c == "/" {
+                toks.push(Op(c))
+            } else if c != " " {
+                panic("bad char {c}")
+            }
+        }
+    }
+    if !num.is_empty() {
+        toks.push(Num(num.parse_int().unwrap_or(0)))
+    }
+    toks
+}
+
+fn op_at(toks: List[Tok], pos: Int) -> Str {
+    match toks.get(pos) {
+        Some(Op(o)) => o,
+        _ => "",
+    }
+}
+
+fn parse_expr(toks: List[Tok], pos: Int) -> Res {
+    let mut r = parse_term(toks, pos)
+    let mut op = op_at(toks, r.pos)
+    while op == "+" || op == "-" {
+        let rhs = parse_term(toks, r.pos + 1)
+        let v = if op == "+" { r.value + rhs.value } else { r.value - rhs.value }
+        r = Res { value: v, pos: rhs.pos }
+        op = op_at(toks, r.pos)
+    }
+    r
+}
+
+fn parse_term(toks: List[Tok], pos: Int) -> Res {
+    let mut r = parse_atom(toks, pos)
+    let mut op = op_at(toks, r.pos)
+    while op == "*" || op == "/" {
+        let rhs = parse_atom(toks, r.pos + 1)
+        let v = if op == "*" { r.value * rhs.value } else { r.value / rhs.value }
+        r = Res { value: v, pos: rhs.pos }
+        op = op_at(toks, r.pos)
+    }
+    r
+}
+
+fn parse_atom(toks: List[Tok], pos: Int) -> Res {
+    match toks[pos] {
+        Num(n) => Res { value: n, pos: pos + 1 },
+        LParen => {
+            let inner = parse_expr(toks, pos + 1)
+            Res { value: inner.value, pos: inner.pos + 1 }
+        }
+        Op(o) => {
+            if o == "-" {
+                let a = parse_atom(toks, pos + 1)
+                Res { value: -a.value, pos: a.pos }
+            } else {
+                panic("unexpected op {o}")
+            }
+        }
+        RParen => panic("unexpected )"),
+    }
+}
+
+fn eval(s: Str) -> Int {
+    parse_expr(tokenize(s), 0).value
+}
+
+fn main(root: Root) {
+    for e in ["2 + 3 * 4", "(2 + 3) * 4", "100 / 7 - 2", "2 * (3 + (4 - 1)) * 5"] {
+        root.stdout.print("{eval(e)}")
+    }
+}

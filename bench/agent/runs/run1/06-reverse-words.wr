@@ -1,0 +1,5 @@
+fn main(root: Root) {
+    let s = "the quick brown fox jumps"
+    let words = s.split(" ").filter(|w| !w.is_empty())
+    root.stdout.print(words.reverse().join(" "))
+}

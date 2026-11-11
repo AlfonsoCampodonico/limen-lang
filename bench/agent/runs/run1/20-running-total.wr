@@ -1,0 +1,10 @@
+fn main(root: Root) {
+    let xs = [4, 8, 15, 16, 23, 42]
+    let mut out: List[Int] = []
+    let mut total = 0
+    for x in xs {
+        total = total + x
+        out.push(total)
+    }
+    root.stdout.print("{out}")
+}

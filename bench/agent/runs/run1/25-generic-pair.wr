@@ -1,0 +1,13 @@
+struct Pair[A, B] {
+    first: A,
+    second: B,
+}
+
+fn swap[A, B](p: Pair[A, B]) -> Pair[B, A] {
+    Pair { first: p.second, second: p.first }
+}
+
+fn main(root: Root) {
+    root.stdout.print("{swap(Pair { first: 1, second: "one" })}")
+    root.stdout.print("{swap(Pair { first: true, second: [2.5] })}")
+}

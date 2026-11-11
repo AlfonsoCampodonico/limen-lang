@@ -1,0 +1,21 @@
+fn to_roman(n: Int) -> Str {
+    let vals = [1000, 900, 500, 400, 100, 90, 50, 40, 10, 9, 5, 4, 1]
+    let syms = ["M", "CM", "D", "CD", "C", "XC", "L", "XL", "X", "IX", "V", "IV", "I"]
+    let mut rest = n
+    let mut out = ""
+    let mut i = 0
+    while i < vals.len() {
+        while rest >= vals[i] {
+            out = out + syms[i]
+            rest = rest - vals[i]
+        }
+        i = i + 1
+    }
+    out
+}
+
+fn main(root: Root) {
+    for n in [1994, 2024, 4, 3999, 58] {
+        root.stdout.print(to_roman(n))
+    }
+}

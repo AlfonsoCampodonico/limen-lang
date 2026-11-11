@@ -1,0 +1,45 @@
+fn encode(s: Str) -> Str {
+    let mut out = ""
+    let mut prev = ""
+    let mut count = 0
+    for c in s.split("") {
+        if c == prev {
+            count = count + 1
+        } else {
+            if count > 0 {
+                out = out + "{count}{prev}"
+            }
+            prev = c
+            count = 1
+        }
+    }
+    if count > 0 {
+        out = out + "{count}{prev}"
+    }
+    out
+}
+
+fn decode(s: Str) -> Str {
+    let mut out = ""
+    let mut num = ""
+    for c in s.split("") {
+        if c >= "0" && c <= "9" {
+            num = num + c
+        } else {
+            let n = num.parse_int().unwrap_or(1)
+            let mut i = 0
+            while i < n {
+                out = out + c
+                i = i + 1
+            }
+            num = ""
+        }
+    }
+    out
+}
+
+fn main(root: Root) {
+    let enc = encode("aaabccddddde")
+    root.stdout.print(enc)
+    root.stdout.print(decode(enc))
+}

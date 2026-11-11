@@ -1,0 +1,19 @@
+fn is_prime(n: Int) -> Bool {
+    if n < 2 { return false }
+    let mut d = 2
+    while d * d <= n {
+        if n % d == 0 { return false }
+        d = d + 1
+    }
+    true
+}
+
+fn main(root: Root) {
+    let mut ps: List[Str] = []
+    let mut n = 2
+    while n < 100 {
+        if is_prime(n) { ps.push(n.to_str()) }
+        n = n + 1
+    }
+    root.stdout.print(ps.join(" "))
+}

@@ -1,0 +1,22 @@
+fn search(xs: List[Int], target: Int) -> Int {
+    let mut lo = 0
+    let mut hi = xs.len() - 1
+    while lo <= hi {
+        let mid = (lo + hi) / 2
+        if xs[mid] == target {
+            return mid
+        } else if xs[mid] < target {
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    -1
+}
+
+fn main(root: Root) {
+    let xs = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29]
+    for t in [2, 13, 29, 4] {
+        root.stdout.print("{t}: {search(xs, t)}")
+    }
+}

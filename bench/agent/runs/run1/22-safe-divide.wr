@@ -1,0 +1,9 @@
+fn divide(a: Int, b: Int) -> Option[Int] {
+    if b == 0 { None } else { Some(a / b) }
+}
+
+fn main(root: Root) {
+    root.stdout.print("{divide(10, 2)}")
+    root.stdout.print("{divide(7, 0)}")
+    root.stdout.print("{divide(9, 3)}")
+}

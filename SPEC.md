@@ -64,8 +64,11 @@ Statements are separated by a newline or `;`. Two statements on one line without
 | `Result[T, E]` | `Ok(T)`, `Err(E)` | From the prelude. |
 | `IoError` | `Denied(Str)`, `Failed(Str)` | Error type of every capability operation. |
 | `fn(A, B) -> R` | functions and closures | |
-| `Root`, `Net`, `Fs`, `Stdout`, `Clock` | capabilities | Cannot be created by programs (section 9). |
+| `Chan[T]` | a channel between tasks | Created with `channel(capacity)` (section 10). |
+| `Root`, `Net`, `Fs`, `Stdout`, `Clock`, `Listen`, `Listener`, `Conn` | capabilities | Cannot be created by programs (section 9). |
 | user `struct` and `enum` | | Optionally generic (section 4). |
+
+There is no tuple, map or character type. Use a struct for pairs, a list of structs (with a linear search) for a small map, and one-byte strings for characters (`s.split("")`, see section 11). There is no range syntax; count with `while` and a `mut` counter.
 
 There is no null and no implicit conversion between types: `Int` and `Float` never mix without `to_float()` or `to_int()`.
 
@@ -95,7 +98,7 @@ fn swap[A, B](p: Pair[A, B]) -> Pair[B, A] {
 - A function without `-> T` returns `()`.
 - The body's last expression, without `;`, is the return value. `return e` returns early.
 - Generic parameters go in `[...]` after the name. They are instantiated at each use and are never written at call sites: `swap(p)`.
-- Struct fields and enum payloads cannot hold a capability (E0301) or a function type (E0304). That keeps authority visible in signatures. A generic instantiation like `Pair[Net, Int]` is allowed, because the capability is visible in the type.
+- Struct fields and enum payloads cannot hold a capability (E0301), a channel (E0305) or a function type (E0304). That keeps authority visible in signatures. A generic instantiation like `Pair[Net, Int]` is allowed, because the capability is visible in the type.
 - Defining the same type, function, field or variant twice is error E0106.
 - User types have no methods. Write functions that take the value.
 
@@ -213,7 +216,7 @@ match shape {
 }
 ```
 
-Arms are separated by `,` or a newline. A `match` must be exhaustive (E0204); the error comes with an auto-fix that adds the missing arms. Matching on `Int` or `Str` needs a `_` or binding arm.
+Arms are separated by `,` or a newline. An arm's body is an expression, so a statement such as an assignment needs a block: `None => { more = false },`. Patterns nest: `Err(Failed(msg))`, `Some(Some(n))`. A `match` must be exhaustive (E0204); the error comes with an auto-fix that adds the missing arms. Matching on `Int` or `Str` needs a `_` or binding arm.
 
 ## 8. Value semantics
 
@@ -229,7 +232,7 @@ The native backend implements this with reference counting and copy-on-write. A 
 
 ## 9. Capabilities
 
-`Root` has four fields, each a capability:
+`Root` has five fields, each a capability:
 
 | Field | Type | Granted |
 | --- | --- | --- |
@@ -237,8 +240,9 @@ The native backend implements this with reference counting and copy-on-write. A 
 | `root.clock` | `Clock` | always |
 | `root.net` | `Net` | only with `--grant net=HOST[:PORT]` (repeatable) or `--grant net=*` |
 | `root.fs` | `Fs` | only with `--grant fs=DIR` or `--grant fs=DIR:ro` |
+| `root.listen` | `Listen` | only with `--grant listen=HOST[:PORT]` (repeatable) |
 
-An ungranted `Net` or `Fs` still exists, but every operation on it returns `Err(Denied(...))`.
+An ungranted `Net`, `Fs` or `Listen` still exists, but every operation on it returns `Err(Denied(...))`. `Listener` and `Conn` are capabilities too: you get them from `Listen.on`, `Listener.accept` and `Net.connect`.
 
 The rules:
 
@@ -247,7 +251,8 @@ The rules:
 3. There is no ambient I/O. Using `print`, `open`, `fetch` and similar names is error E0302, which explains the capability to use instead.
 4. A function whose parameters contain no capability and no function type is **pure**: it can only compute (and panic). `writ caps FILE` lists each function's authority.
 5. Enforcement at runtime:
-   - `Net`: http and https only, host allowlist, redirects not followed.
+   - `Net`: http and https only, host allowlist, redirects not followed. `Net.connect` uses the same allowlist.
+   - `Listen`: binding is allowed only for granted `host` or `host:port` entries.
    - `Fs`: paths are relative to the granted directory; absolute paths, `..` escapes and symlinks pointing outside are refused.
 
 ## 10. Concurrency
@@ -265,7 +270,63 @@ let results = group g {
 - `g` can only be used as `g.go(...)` directly in the body. It cannot be stored, passed, returned, or used inside a closure (E0310).
 - The body cannot leave early with `return` or `?` (E0311), and `break` and `continue` cannot target loops outside the group.
 - Tasks share data by value, so there are no data races. A task reaches the world only through capabilities its closure captured. Spawning is not a capability.
-- Native code runs tasks on one worker per core (`WRIT_THREADS` overrides this). The interpreter runs them one after another in start order. Output printed by tasks may interleave differently between the two.
+- Tasks are lightweight: natively each is a fiber with a small stack, scheduled on one worker thread per core (`WRIT_THREADS` overrides this), and a task waiting on a group, a channel or a socket parks without blocking a thread. The interpreter runs tasks as coroutines. Output printed by tasks may interleave differently between the two.
+- If every task is waiting and nothing can wake one, the program panics with `all tasks are blocked (deadlock)` instead of hanging.
+
+### Channels
+
+```
+let c: Chan[Int] = channel(8)        // capacity at least 1
+let total = group g {
+    g.go(|| {
+        for i in [1, 2, 3] { c.send(i) }
+        c.close()
+        0
+    })
+    g.go(|| {
+        let mut sum = 0
+        let mut more = true
+        while more {
+            match c.recv() {
+                Some(v) => { sum = sum + v },
+                None => { more = false },
+            }
+        }
+        sum
+    })
+}
+```
+
+- `channel(n)` creates a `Chan[T]` holding up to `n` values; `T` comes from the annotation or from use. A capacity below 1 panics.
+- `c.send(v)` waits while the channel is full; sending on a closed channel panics.
+- `c.recv()` waits while the channel is empty and returns `Some(v)`; once the channel is closed and drained it returns `None`.
+- `c.close()` closes it; closing twice panics.
+- A channel is shared, not copied: tasks that capture the same channel talk through it.
+
+### Sockets
+
+```
+fn main(root: Root) -> Result[(), IoError] {
+    let l = root.listen.on("127.0.0.1:9000")?     // --grant listen=127.0.0.1:9000
+    let served = group g {
+        let mut i = 0
+        while i < 100 {
+            match l.accept() {
+                Ok(c) => g.go(|| echo(c)),
+                Err(e) => root.stdout.print("{e}"),
+            }
+            i = i + 1
+        }
+    }
+    Ok(())
+}
+```
+
+- `Listen.on("host:port")` binds; port `0` picks a free port, which `Listener.port()` reports.
+- `Listener.accept()` waits for a connection. `Net.connect("host:port")` opens one.
+- `Conn.read()` waits for data and returns what arrived; `""` means the peer closed. `Conn.write(s)` sends all of `s`. Both return `Result`.
+- `close()` on a `Listener` or `Conn` makes any task waiting on it get `Err(Failed("... is closed"))`.
+- Use one task at a time to read a given connection (and one to write it).
 
 ## 11. Built-in methods
 
@@ -278,7 +339,7 @@ Methods take the receiver by value and never modify it, except `push`, which nee
 | `len()` | `Int`, bytes |
 | `is_empty()` | `Bool` |
 | `lines()` | `List[Str]`, split on `\n`, stripping a trailing `\r` and dropping one final empty line |
-| `split(sep)` | `List[Str]`; `split("")` splits into single bytes |
+| `split(sep)` | `List[Str]`, keeping empty pieces (`"a,,b".split(",")` is `["a", "", "b"]`); `split("")` splits into single bytes, which is how to get characters |
 | `trim()` | `Str` without leading and trailing spaces, tabs, newlines, `\r` and form feeds |
 | `contains(s)`, `starts_with(s)`, `ends_with(s)` | `Bool` |
 | `to_upper()`, `to_lower()` | `Str`, ASCII only |
@@ -308,7 +369,9 @@ Methods take the receiver by value and never modify it, except `push`, which nee
 | `join(sep)` | `Str`; `List[Str]` only |
 | `sum()` | `Int`; `List[Int]` only |
 
-`xs[i]` panics when `i` is out of range; `xs.get(i)` returns `None` instead.
+`xs[i]` panics when `i` is out of range; `xs.get(i)` returns `None` instead. There is no `remove` or `insert`: build a new list (`filter`, or a loop with `push`). Writes go through index and field paths: `groups[i].words.push(w)` and `items[i].qty = 3` both work on a `mut` list. To sort by a key or with tie-breaking, write the sort yourself; `sort()` orders `Int`, `Float` and `Str` only.
+
+Strings compare byte by byte, so `c >= "a" && c <= "z"` tests a one-byte string. There is no `index_of`, `substring` or character code; search a list such as `"abcdefghijklmnopqrstuvwxyz".split("")` for positions.
 
 ### Array[T, N]
 
@@ -323,6 +386,23 @@ Methods take the receiver by value and never modify it, except `push`, which nee
 | `map(f)` (Option) | `Option[U]` |
 | `map_err(f)` (Result) | `Result[T, F]` |
 
+### Chan[T]
+
+| Method | Result |
+| --- | --- |
+| `send(v)` | `()` |
+| `recv()` | `Option[T]` |
+| `close()` | `()` |
+
+### Built-in functions
+
+| Function | Meaning |
+| --- | --- |
+| `panic(msg)` | abort with a message and source location |
+| `channel(n)` | a new `Chan[T]` with capacity `n` |
+| `assert(cond)` | panic with `assertion failed` unless `cond` is true |
+| `assert_eq(a, b)` | panic with `assertion failed: <a> != <b>` unless `a == b` |
+
 ### Capabilities
 
 | Capability | Method | Result |
@@ -332,12 +412,34 @@ Methods take the receiver by value and never modify it, except `push`, which nee
 | `Clock` | `now_ms()` | `Int`, milliseconds since the Unix epoch |
 | `Net` | `get(url)` | `Result[Str, IoError]`, the response body; a non-2xx status is `Failed` |
 | `Net` | `only(host)` | `Net`; `host` is `name`, `name:port` or `*` |
+| `Net` | `connect(addr)` | `Result[Conn, IoError]`; `addr` is `host:port` |
+| `Listen` | `on(addr)` | `Result[Listener, IoError]` |
+| `Listener` | `accept()` | `Result[Conn, IoError]` |
+| `Listener` | `port()` | `Int` |
+| `Listener`, `Conn` | `close()` | `()` |
+| `Conn` | `read()` | `Result[Str, IoError]`; `""` when the peer closed |
+| `Conn` | `write(s)` | `Result[(), IoError]` |
 | `Fs` | `read(path)` | `Result[Str, IoError]` |
 | `Fs` | `write(path, text)` | `Result[(), IoError]` |
 | `Fs` | `exists(path)` | `Bool` |
 | `Fs` | `under(dir)`, `read_only()` | `Fs` |
 
-## 12. How values print
+## 12. Tests
+
+```
+fn add(a: Int, b: Int) -> Int { a + b }
+
+test "adds small numbers" {
+    assert_eq(add(2, 3), 5)
+    assert(add(-1, 1) == 0)
+}
+```
+
+- `test "name" { ... }` is a top-level item. Tests take no arguments and get no `root`, so they cannot do I/O; they can use groups and channels.
+- `writ test FILE` runs every test, each isolated, and prints `ok` or `FAIL` with the panic message and location; it exits with status 1 if any test fails. `--native` runs them as native code.
+- Test names must be unique (E0106). Tests are type-checked by `writ check` and ignored by `writ run` and `writ build`.
+
+## 13. How values print
 
 String interpolation and `to_str()` use these rules. At the top level a `Str` prints raw; inside a container it prints quoted, with `"`, `\`, newline, tab, `\r` and `\b` escaped and other non-printable bytes as `\ddd`.
 
@@ -353,11 +455,11 @@ String interpolation and `to_str()` use these rules. At the top level a `Str` pr
 | function | `<fn>` |
 | capability | `<Net>` |
 
-## 13. Optimizations that affect observable behavior
+## 14. Optimizations that affect observable behavior
 
 The native backend may run a chain like `xs.filter(p).map(f).fold(z, g)` as one fused loop, interleaving the stages per element. It does this only when the earlier stages are pure closure literals, which capture no capability and no function. The only observable difference is **which panic happens first** when more than one stage would panic. Everything else (results, output order, values) is the same.
 
-## 14. Errors
+## 15. Errors
 
 Every diagnostic has a stable code. `writ explain CODE` prints its explanation, and `writ check --json` emits code, span, notes and an auto-fix when there is one.
 
@@ -386,18 +488,20 @@ Every diagnostic has a stable code. `writ explain CODE` prints its explanation, 
 | E0302 | ambient I/O name such as `print` |
 | E0303 | bad `main` signature |
 | E0304 | function stored in a field |
+| E0305 | channel stored in a field |
 | E0310 | misuse of a group handle |
 | E0311 | `return` or `?` leaving a group |
 
 A **panic** (division by zero, index out of range, `panic(...)`, no matching arm) prints `panic: message` and the source location to stderr, then exits with status 1.
 
-## 15. Grammar
+## 16. Grammar
 
 EBNF. `NL` is a newline, as described in section 2. A character-level version for constrained decoding, with the newline rules spelled out, is in [grammar/writ.gbnf](grammar/writ.gbnf). `{ x }` means zero or more, and `[ x ]` means optional.
 
 ```
 program    = { item } ;
-item       = fn | struct | enum ;
+item       = fn | struct | enum | test ;
+test       = "test" STRING block ;
 fn         = "fn" IDENT [ generics ] "(" [ params ] ")" [ "->" type ] block ;
 generics   = "[" IDENT { "," IDENT } "]" ;
 params     = param { sep param } [ "," ] ;
@@ -440,6 +544,12 @@ pattern    = "_" | IDENT | [ "-" ] INT | STRING | "true" | "false"
            | IDENT [ "." IDENT ] [ "(" pattern { "," pattern } ")" ] ;
 ```
 
-## 16. Not yet
+## 17. Tools
 
-Channels, methods on user types, modules and imports, and a capability for listening on the network. `group` exists; channels are planned.
+- `writ fmt FILE` prints the canonical formatting (`--write` rewrites, `--check` verifies).
+- `writ lsp` is a language server; `writ mcp` is an MCP server exposing check, run, test, format, caps, type-at and the spec to coding agents.
+- `writ caps FILE` lists each function's authority; `writ explain CODE` explains an error.
+
+## 18. Not yet
+
+Methods on user types, modules and imports, unbuffered (capacity 0) channels, and `select` over several channels.

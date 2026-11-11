@@ -1,0 +1,4 @@
+fn main(root: Root) {
+    let r = root.net.get("https://example.com/")
+    root.stdout.print("{r}")
+}

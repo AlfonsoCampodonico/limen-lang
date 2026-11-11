@@ -1,0 +1,9 @@
+fn main(root: Root) {
+    let mut total = 0
+    let mut i = 1
+    while i <= 100 {
+        total = total + i * i
+        i = i + 1
+    }
+    root.stdout.print(total.to_str())
+}

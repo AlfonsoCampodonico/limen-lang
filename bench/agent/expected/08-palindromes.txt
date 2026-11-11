@@ -1,0 +1,5 @@
+level: yes
+writ: no
+racecar: yes
+noon: yes
+capability: no

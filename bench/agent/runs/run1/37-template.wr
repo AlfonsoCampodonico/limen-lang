@@ -1,0 +1,17 @@
+struct Pair {
+    key: Str,
+    value: Str,
+}
+
+fn render(tpl: Str, pairs: List[Pair]) -> Str {
+    pairs.fold(tpl, |acc, p| acc.replace("\{" + p.key + "\}", p.value))
+}
+
+fn main(root: Root) {
+    let pairs = [
+        Pair { key: "name", value: "Ada" },
+        Pair { key: "count", value: "3" },
+        Pair { key: "thing", value: "messages" },
+    ]
+    root.stdout.print(render("Hello \{name\}, you have \{count\} new \{thing\}.", pairs))
+}

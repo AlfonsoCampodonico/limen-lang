@@ -1,0 +1,15 @@
+fn transpose(m: List[List[Int]]) -> List[List[Int]] {
+    let mut out: List[List[Int]] = []
+    let mut j = 0
+    while j < m[0].len() {
+        out.push(m.map(|r| r[j]))
+        j = j + 1
+    }
+    out
+}
+
+fn main(root: Root) {
+    for row in transpose([[1, 2, 3], [4, 5, 6]]) {
+        root.stdout.print("{row}")
+    }
+}

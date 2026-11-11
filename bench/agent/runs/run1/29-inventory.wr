@@ -1,0 +1,21 @@
+struct Item {
+    name: Str,
+    qty: Int,
+}
+
+fn main(root: Root) {
+    let mut items = [
+        Item { name: "apple", qty: 3 },
+        Item { name: "pear", qty: 0 },
+        Item { name: "plum", qty: 5 },
+    ]
+    let mut i = 0
+    while i < items.len() {
+        items[i].qty = items[i].qty + 2
+        i = i + 1
+    }
+    items = items.filter(|it| it.qty >= 3)
+    for it in items {
+        root.stdout.print("{it.name} {it.qty}")
+    }
+}

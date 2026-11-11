@@ -1,0 +1,24 @@
+fn index_of(xs: List[Str], x: Str) -> Int {
+    let mut i = 0
+    while i < xs.len() {
+        if xs[i] == x {
+            return i
+        }
+        i = i + 1
+    }
+    -1
+}
+
+fn shift(s: Str, k: Int) -> Str {
+    let alpha = "abcdefghijklmnopqrstuvwxyz".split("")
+    s.split("").map(|c| {
+        let i = index_of(alpha, c)
+        if i < 0 { c } else { alpha[((i + k) % 26 + 26) % 26] }
+    }).join("")
+}
+
+fn main(root: Root) {
+    let enc = shift("attack at dawn", 3)
+    root.stdout.print(enc)
+    root.stdout.print(shift(enc, -3))
+}

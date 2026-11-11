@@ -1,0 +1,2 @@
+Pair { first: "one", second: 1 }
+Pair { first: [2.5], second: true }

@@ -1,0 +1,17 @@
+fn steps(n: Int) -> Int {
+    let mut x = n
+    let mut c = 0
+    while x != 1 {
+        x = if x % 2 == 0 { x / 2 } else { 3 * x + 1 }
+        c = c + 1
+    }
+    c
+}
+
+fn main(root: Root) {
+    let mut n = 1
+    while n <= 10 {
+        root.stdout.print("{n}: {steps(n)}")
+        n = n + 1
+    }
+}

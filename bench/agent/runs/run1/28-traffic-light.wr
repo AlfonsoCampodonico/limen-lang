@@ -1,0 +1,23 @@
+enum Light {
+    Red,
+    Green,
+    Yellow,
+}
+
+fn next(l: Light) -> Light {
+    match l {
+        Red => Green,
+        Green => Yellow,
+        Yellow => Red,
+    }
+}
+
+fn main(root: Root) {
+    let mut l = Red
+    let mut i = 0
+    while i < 7 {
+        root.stdout.print("{l}")
+        l = next(l)
+        i = i + 1
+    }
+}

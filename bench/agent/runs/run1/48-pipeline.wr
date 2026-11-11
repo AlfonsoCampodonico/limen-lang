@@ -1,0 +1,36 @@
+fn main(root: Root) {
+    let words: Chan[Str] = channel(4)
+    let lens: Chan[Int] = channel(4)
+    let results = group g {
+        g.go(|| {
+            for w in "alpha beta gamma delta".split(" ") {
+                words.send(w)
+            }
+            words.close()
+            0
+        })
+        g.go(|| {
+            let mut more = true
+            while more {
+                match words.recv() {
+                    Some(w) => { lens.send(w.len()) },
+                    None => { more = false },
+                }
+            }
+            lens.close()
+            0
+        })
+        g.go(|| {
+            let mut total = 0
+            let mut more = true
+            while more {
+                match lens.recv() {
+                    Some(n) => { total = total + n },
+                    None => { more = false },
+                }
+            }
+            total
+        })
+    }
+    root.stdout.print("{results[2]}")
+}
