@@ -74,6 +74,7 @@ type fn_decl = {
   fn_body : block;
   fn_test : string option; (* Some name: a `test "name" { ... }` block *)
   fn_pub : bool;
+  fn_bounds : (string * (string * span) list) list; (* type parameter -> interfaces it must satisfy *)
 }
 
 type struct_decl = {
@@ -92,7 +93,16 @@ type enum_decl = {
   en_pub : bool;
 }
 
-type item = IFn of fn_decl | IStruct of struct_decl | IEnum of enum_decl
+(* `interface Shape { fn area(self) -> Float }`: the methods a type needs.
+   Satisfied structurally, by any type that has those methods. *)
+type iface_decl = {
+  if_name : string;
+  if_span : span;
+  if_methods : (string * span * param list * ty_expr option) list; (* `self` is left out of the params *)
+  if_pub : bool;
+}
+
+type item = IFn of fn_decl | IStruct of struct_decl | IEnum of enum_decl | IIface of iface_decl
 
 (* A parsed file: its `use` declarations and its items. *)
 type file = { uses : (string * span) list; items : item list }

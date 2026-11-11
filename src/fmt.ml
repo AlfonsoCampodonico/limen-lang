@@ -369,8 +369,36 @@ let enum_close c (e : enum_decl) =
      | (_, vsp, ts) :: _ -> (match List.rev ts with t :: _ -> t.tspan.hi + 1 | [] -> vsp.hi)
      | [] -> e.en_span.hi)
 
+let iface_last_hi (i : iface_decl) =
+  match List.rev i.if_methods with
+  | (_, msp, ps, r) :: _ -> (
+    match r with Some t -> t.tspan.hi | None -> ( match List.rev ps with p :: _ -> p.prm_ty.tspan.hi | [] -> msp.hi))
+  | [] -> i.if_span.hi
+
 let item c (it : item) =
   match it with
+  | IIface i ->
+    new_line c 0;
+    add c ((if i.if_pub then "pub " else "") ^ "interface " ^ i.if_name ^ " {");
+    let close = closing_brace c (iface_last_hi i) in
+    let prev = ref (-1) in
+    List.iter
+      (fun (m, (msp : Span.t), ps, r) ->
+        ignore (leading c 4 ~prev:!prev msp.lo);
+        new_line c 4;
+        let params = "self" :: List.map (fun p -> p.prm_name ^ ": " ^ ty p.prm_ty) ps in
+        add c ("fn " ^ m ^ "(" ^ String.concat ", " params ^ ")" ^ match r with Some t -> " -> " ^ ty t | None -> "");
+        let hi = match r with Some t -> t.tspan.hi | None -> ( match List.rev ps with p :: _ -> p.prm_ty.tspan.hi + 1 | [] -> msp.hi) in
+        trailing c hi;
+        prev := hi)
+      i.if_methods;
+    if i.if_methods = [] then add c "}"
+    else begin
+      ignore (leading c 4 ~prev:!prev close);
+      new_line c 0;
+      add c "}"
+    end;
+    trailing c (close + 1)
   | IFn ({ fn_test = Some name; _ } as d) ->
     new_line c 0;
     add c ("test \"" ^ escape name ^ "\" ");
@@ -379,7 +407,15 @@ let item c (it : item) =
   | IFn d ->
     new_line c 0;
     let params = List.map (fun p -> p.prm_name ^ ": " ^ ty p.prm_ty) d.fn_params in
-    add c ((if d.fn_pub then "pub " else "") ^ "fn " ^ d.fn_name ^ gens d.fn_gen);
+    let bgens =
+      match d.fn_gen with
+      | [] -> ""
+      | gs ->
+        "[" ^ String.concat ", "
+          (List.map (fun g -> match List.assoc_opt g d.fn_bounds with Some bs -> g ^ ": " ^ String.concat " + " (List.map fst bs) | None -> g) gs)
+        ^ "]"
+    in
+    add c ((if d.fn_pub then "pub " else "") ^ "fn " ^ d.fn_name ^ bgens);
     if breaks_after_open c d.fn_span.hi '(' && params <> [] then begin
       add c "(";
       List.iter (fun p -> new_line c 4; add c (p ^ ",")) params;
@@ -440,6 +476,7 @@ let item_span c = function
   | IFn d -> (d.fn_span.lo, d.fn_body.bspan.hi)
   | IStruct s -> (s.st_span.lo, struct_close c s + 1)
   | IEnum e -> (e.en_span.lo, enum_close c e + 1)
+  | IIface i -> (i.if_span.lo, closing_brace c (iface_last_hi i) + 1)
 
 (* Format [src]; raises Diag.Fatal if it does not parse. *)
 let format ~file src =

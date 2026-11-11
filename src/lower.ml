@@ -445,7 +445,31 @@ and lower_method f e recv name args ty =
   match rt with
   | TNamed (n, _) when Hashtbl.mem f.g.fns (n ^ "::" ^ name) ->
     (* a method on a user type: a call with the receiver first *)
-    let c = instance f.g (n ^ "::" ^ name) (List.map (fun (k, t) -> (k, zonk f.genv t)) e.einst) in
+    let key = n ^ "::" ^ name in
+    let d = Hashtbl.find f.g.fns key in
+    let env = List.map (fun (k, t) -> (k, zonk f.genv t)) e.einst in
+    let targs =
+      if List.for_all (fun g -> List.mem_assoc g env) d.fn_gen then env
+      else begin
+        (* reached through an interface bound, where the checker only knew a
+           type parameter: read the instantiation off the actual types *)
+        let found = ref [] in
+        let rec m decl act =
+          match (decl, act) with
+          | TParam g, t -> if not (List.mem_assoc g !found) then found := (g, t) :: !found
+          | TList a, TList b | TChan a, TChan b | TArray (a, _), TArray (b, _) -> m a b
+          | TNamed (_, xs), TNamed (_, ys) when List.length xs = List.length ys -> List.iter2 m xs ys
+          | TFn (xs, r1), TFn (ys, r2) when List.length xs = List.length ys -> List.iter2 m xs ys; m r1 r2
+          | _ -> ()
+        in
+        let genv = List.map (fun g -> (g, TParam g)) d.fn_gen in
+        let decl = List.map (fun p -> resolve genv p.prm_ty) d.fn_params in
+        let act = List.map (tyof f) (recv :: args) in
+        if List.length decl = List.length act then List.iter2 m decl act;
+        List.map (fun g -> (g, Option.value ~default:TUnit (List.assoc_opt g !found))) d.fn_gen
+      end
+    in
+    let c = instance f.g key targs in
     let xs = List.map (lower f) (recv :: args) in
     tmp f ty (I.Call (c, xs))
   | _ ->
@@ -725,6 +749,7 @@ let lower_program ?(tests = false) (user_items : item list) : I.program * gctx =
   let owners = Hashtbl.create 16 in
   List.iter
     (function
+      | IIface _ -> ()
       | IFn d -> Hashtbl.replace g.fns d.fn_name d
       | IStruct s -> Hashtbl.replace g.structs s.st_name s
       | IEnum e ->

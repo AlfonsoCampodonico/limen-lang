@@ -8,6 +8,10 @@ open Types
 
 let sprintf = Printf.sprintf
 
+(* Interfaces: name -> methods (parameter types without `self`, result). *)
+let ifaces : (string, (string * (ty list * ty)) list) Hashtbl.t = Hashtbl.create 8
+
+
 type var_kind = KLet | KParam | KPat | KGroup
 type var_info = { vty : ty; vmut : bool; vspan : Span.t; vkind : var_kind }
 type fsig = { gen : string list; ps : ty list; ret : ty }
@@ -149,7 +153,10 @@ let rec resolve ctx env (te : ty_expr) : ty =
             @ List.of_seq (Hashtbl.to_seq_keys ctx.enums)
             @ List.map fst env
           in
-          did_you_mean ctx "E0102" te.tspan (sprintf "unknown type `%s`" n) n cands;
+          if Hashtbl.mem ifaces n then
+            err ctx "E0102" te.tspan (sprintf "`%s` is an interface, not a type" n)
+              ~notes:[ sprintf "take a type parameter bounded by it: `fn f[T: %s](x: T)`" n ]
+          else did_you_mean ctx "E0102" te.tspan (sprintf "unknown type `%s`" n) n cands;
           TErr)))
 
 let check_storable ctx span t =
@@ -188,6 +195,24 @@ let visible_names ctx f =
   @ List.of_seq (Hashtbl.to_seq_keys ctx.fns)
   @ List.of_seq (Hashtbl.to_seq_keys ctx.owners)
   @ [ "panic"; "channel"; "assert"; "assert_eq" ]
+
+(* Generic functions' bounds: function -> type parameter -> interfaces. *)
+let fn_bounds : (string, (string * string list) list) Hashtbl.t = Hashtbl.create 8
+
+(* Bounds of the type parameters of the function being checked. *)
+let cur_bounds : (string * string list) list ref = ref []
+
+(* Instantiations to check against their bounds once the body's types are
+   known: (where, the type used, the interface, the type parameter). *)
+let pending : (Span.t * ty * string * string) list ref = ref []
+
+let add_bounds fname env sp =
+  match Hashtbl.find_opt fn_bounds fname with
+  | None -> ()
+  | Some bs ->
+    List.iter
+      (fun (g, ifs) -> match List.assoc_opt g env with Some t -> List.iter (fun i -> pending := (sp, t, i, g) :: !pending) ifs | None -> ())
+      bs
 
 (* Methods by `Type::name`: whether they are `pub`, and the file (module)
    that defines them. A private method can only be called from its own file. *)
@@ -393,6 +418,7 @@ and check_var ctx f e n sp =
     | Some s ->
       let env, t = instantiate s in
       e.einst <- env;
+      add_bounds n env sp;
       t
     | None -> (
       match Hashtbl.find_opt ctx.owners n with
@@ -539,10 +565,34 @@ and check_method_value ctx f e recv name nsp args =
     err ctx "E0207" recv.espan "the type of this value is not known here; add a type annotation";
     check_args ctx f args;
     TErr
+  | TParam g -> (
+    (* `x.m(...)` where `x: T` and `T` is bounded by interfaces that declare `m` *)
+    let bs = Option.value ~default:[] (List.assoc_opt g !cur_bounds) in
+    let found = List.find_map (fun b -> Option.bind (Hashtbl.find_opt ifaces b) (List.assoc_opt name)) bs in
+    match found with
+    | Some (ps, r) ->
+      if List.length ps <> List.length args then begin
+        err ctx "E0107" nsp
+          (sprintf "method `%s` takes %d argument%s besides `self`, but %d %s supplied" name (List.length ps)
+             (plural (List.length ps)) (List.length args) (if List.length args = 1 then "was" else "were"));
+        check_args ctx f args
+      end
+      else List.iter2 (fun a p -> expect ctx f a p) args ps;
+      r
+    | None ->
+      let declared = List.concat_map (fun b -> List.map fst (Option.value ~default:[] (Hashtbl.find_opt ifaces b))) bs in
+      let notes =
+        if bs = [] then [ sprintf "`%s` is a type parameter with no bounds; add one, as in `[%s: Interface]`, whose interface declares `fn %s(self, ...)`" g g name ]
+        else [ sprintf "the bounds of `%s` (%s) declare: %s" g (String.concat ", " bs) (if declared = [] then "nothing" else String.concat ", " declared) ]
+      in
+      did_you_mean ctx ~notes "E0105" nsp (sprintf "no method `%s` on type parameter `%s`" name g) name declared;
+      check_args ctx f args;
+      TErr)
   | TNamed (n, _) when Hashtbl.mem ctx.fns (n ^ "::" ^ name) -> (
     (* a method: `fn name(self: T, ...)`, called with the receiver first *)
     let env, t = instantiate (Hashtbl.find ctx.fns (n ^ "::" ^ name)) in
     e.einst <- env;
+    add_bounds (n ^ "::" ^ name) env nsp;
     (match Hashtbl.find_opt method_owner (n ^ "::" ^ name) with
      | Some (false, file) when file <> nsp.file ->
        err ctx "E0402" nsp (sprintf "method `%s` is private to the module that defines `%s`" name n)
@@ -972,7 +1022,51 @@ let check_main ctx (d : fn_decl) (s : fsig) =
     err ctx "E0303" d.fn_span "`main` has the wrong signature"
       ~notes:[ "write `fn main(root: Root)` or `fn main(root: Root) -> Result[(), E]`" ]
 
+(* Does [t] have every method of interface [i], with the same types? *)
+let satisfies ctx t i : string option =
+  let ms = Option.value ~default:[] (Hashtbl.find_opt ifaces i) in
+  let t = repr t in
+  let check (m, (ps, r)) =
+    let want = TFn (ps, r) in
+    let trial got = try unify want got; None with Mismatch -> Some (sprintf "its `%s` has type `%s`, but `%s` needs `%s`" m (show got) i (show want)) in
+    match t with
+    | TVar _ | TErr -> None
+    | TParam g ->
+      let bs = Option.value ~default:[] (List.assoc_opt g !cur_bounds) in
+      if List.mem i bs then None
+      else (
+        match List.find_map (fun b -> Option.bind (Hashtbl.find_opt ifaces b) (List.assoc_opt m)) bs with
+        | Some (ps', r') -> trial (TFn (ps', r'))
+        | None -> Some (sprintf "type parameter `%s` is not bounded by `%s`; add it: `[%s: %s]`" g i g i))
+    | TNamed (n, _) when Hashtbl.mem ctx.fns (n ^ "::" ^ m) -> (
+      let _, ft = instantiate (Hashtbl.find ctx.fns (n ^ "::" ^ m)) in
+      match ft with
+      | TFn (p0 :: rest, r') -> (try unify p0 t; trial (TFn (rest, r')) with Mismatch -> trial (TFn (rest, r')))
+      | _ -> Some (sprintf "its `%s` is not a method" m))
+    | _ -> (
+      match List.assoc_opt m (methods t) with
+      | Some mk -> let ps', r' = mk () in trial (TFn (ps', r'))
+      | None -> Some (sprintf "`%s` has no method `%s`" (show t) m))
+  in
+  List.find_map check ms
+
+let check_pending ctx =
+  let ps = List.rev !pending in
+  pending := [];
+  List.iter
+    (fun (sp, t, i, g) ->
+      match satisfies ctx t i with
+      | None -> ()
+      | Some why ->
+        err ctx "E0111" sp
+          (sprintf "`%s` does not satisfy interface `%s`, required of `%s`" (show (repr t)) i g)
+          ~notes:[ why ])
+    ps
+
 let check_fn ctx (d : fn_decl) (s : fsig) =
+  cur_bounds := List.map (fun (g, bs) -> (g, List.map fst bs)) d.fn_bounds;
+  pending := [];
+  Fun.protect ~finally:(fun () -> check_pending ctx) @@ fun () ->
   let genv = List.map (fun g -> (g, TParam g)) d.fn_gen in
   let scope = { vars = Hashtbl.create 8; barrier = false } in
   List.iter2
@@ -1022,6 +1116,8 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
       variants = Hashtbl.create 16; owners = Hashtbl.create 16; fns = Hashtbl.create 16; diags = [] }
   in
   Hashtbl.reset method_owner;
+  Hashtbl.reset ifaces;
+  Hashtbl.reset fn_bounds;
   let items = Prelude.items () @ user_items in
   let type_defined n = Hashtbl.mem ctx.structs n || Hashtbl.mem ctx.enums n || List.mem n builtin_types in
   (* 1. register type names *)
@@ -1033,7 +1129,29 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
       | IEnum e ->
         if type_defined e.en_name then err ctx "E0106" e.en_span (sprintf "type `%s` is defined more than once" e.en_name)
         else Hashtbl.replace ctx.enums e.en_name e
+      | IIface i ->
+        if type_defined i.if_name || Hashtbl.mem ifaces i.if_name then
+          err ctx "E0106" i.if_span (sprintf "`%s` is defined more than once" i.if_name)
+        else Hashtbl.replace ifaces i.if_name []
       | IFn _ -> ())
+    items;
+  (* 1b. interface methods *)
+  List.iter
+    (function
+      | IIface i ->
+        let seen = Hashtbl.create 8 in
+        let ms =
+          List.filter_map
+            (fun (m, msp, ps, r) ->
+              if Hashtbl.mem seen m then (err ctx "E0106" msp (sprintf "method `%s` is declared twice in `%s`" m i.if_name); None)
+              else begin
+                Hashtbl.replace seen m ();
+                Some (m, (List.map (fun p -> resolve ctx [] p.prm_ty) ps, match r with Some te -> resolve ctx [] te | None -> TUnit))
+              end)
+            i.if_methods
+        in
+        Hashtbl.replace ifaces i.if_name ms
+      | _ -> ())
     items;
   (* 2. resolve field and payload types *)
   List.iter
@@ -1078,7 +1196,7 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
           in
           Hashtbl.replace ctx.variants e.en_name vs
         end
-      | IFn _ -> ())
+      | IFn _ | IIface _ -> ())
     items;
   (* 3. function signatures *)
   let sigs =
@@ -1090,6 +1208,15 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
           let ret = match d.fn_ret with Some te -> resolve ctx env te | None -> TUnit in
           let s = { gen = d.fn_gen; ps; ret } in
           check_self ctx d ps;
+          List.iter
+            (fun (_, bs) ->
+              List.iter
+                (fun (b, bsp) ->
+                  if not (Hashtbl.mem ifaces b) then
+                    did_you_mean ctx "E0102" bsp (sprintf "unknown interface `%s`" b) b (List.of_seq (Hashtbl.to_seq_keys ifaces)))
+                bs)
+            d.fn_bounds;
+          if d.fn_bounds <> [] then Hashtbl.replace fn_bounds d.fn_name (List.map (fun (g, bs) -> (g, List.map fst bs)) d.fn_bounds);
           if String.contains d.fn_name ':' then Hashtbl.replace method_owner d.fn_name (d.fn_pub, d.fn_span.file);
           if Hashtbl.mem ctx.fns d.fn_name then
             err ctx "E0106" d.fn_span (sprintf "function `%s` is defined more than once" d.fn_name)
@@ -1123,7 +1250,7 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
         let found = List.fold_left (fun acc t -> caps_in t acc) [] s.ps in
         { name = d.fn_name; span = d.fn_span;
           caps = List.filter (fun c -> List.mem c found) all_caps;
-          callbacks = List.exists has_fn s.ps })
+          callbacks = List.exists has_fn s.ps || d.fn_bounds <> [] })
       (List.filter (fun ((d : fn_decl), _) -> d.fn_test = None) sigs)
   in
   (diags, infos)

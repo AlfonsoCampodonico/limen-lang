@@ -1,0 +1,80 @@
+// Interfaces: a type satisfies one by having its methods, with no declaration.
+
+interface Shape {
+    fn area(self) -> Float
+    fn name(self) -> Str
+}
+
+interface Ticker {
+    fn now_ms(self) -> Int
+}
+
+struct Circle {
+    r: Float,
+}
+
+struct Square {
+    s: Float,
+}
+
+struct Box[T] {
+    item: T,
+}
+
+fn area(self: Circle) -> Float {
+    3.0 * self.r * self.r
+}
+
+fn name(self: Circle) -> Str {
+    "circle"
+}
+
+fn area(self: Square) -> Float {
+    self.s * self.s
+}
+
+fn name(self: Square) -> Str {
+    "square"
+}
+
+fn area[T](self: Box[T]) -> Float {
+    1.0
+}
+
+fn name[T](self: Box[T]) -> Str {
+    "box"
+}
+
+fn total[T: Shape](xs: List[T]) -> Float {
+    xs.map(|s| s.area()).fold(0.0, |a, b| a + b)
+}
+
+fn describe[T: Shape](s: T) -> Str {
+    "{s.name()} of area {s.area()}"
+}
+
+// forwarding a bound to another generic function
+fn describe_all[T: Shape](xs: List[T]) -> Str {
+    xs.map(|s| describe(s)).join(", ")
+}
+
+struct FakeClock {
+    t: Int,
+}
+
+fn now_ms(self: FakeClock) -> Int {
+    self.t
+}
+
+// works with the real Clock capability or a fake one
+fn elapsed[C: Ticker](c: C, since: Int) -> Int {
+    c.now_ms() - since
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    out.print("{total([Circle { r: 1.0 }, Circle { r: 2.0 }])} {total([Square { s: 3.0 }])}")
+    out.print(describe(Square { s: 2.0 }))
+    out.print(describe_all([Box { item: 1 }, Box { item: 2 }]))
+    out.print("{elapsed(FakeClock { t: 1500 }, 1000)} {elapsed(root.clock, 0) > 0}")
+}

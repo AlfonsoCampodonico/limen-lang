@@ -1,0 +1,7 @@
+// shapes
+pub interface S { // trailing
+  fn a(self)->Float
+  // between
+  fn b(self, x: Int) -> Str
+}
+fn f[T: S+Q, U](x: T) {}

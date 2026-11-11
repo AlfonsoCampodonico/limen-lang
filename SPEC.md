@@ -127,6 +127,55 @@ let p = a.add(b).add(c)
 - Methods take `self` by value like any parameter; to "change" a value, return the new one.
 - In a module, only `pub fn` methods can be called from other modules (E0402).
 
+### Interfaces
+
+An interface lists methods. Any type that has them satisfies it; there is no declaration that it does. Interfaces are used as bounds on a function's type parameters:
+
+```
+interface Shape {
+    fn area(self) -> Float
+    fn name(self) -> Str
+}
+
+fn total[T: Shape](xs: List[T]) -> Float {
+    xs.map(|s| s.area()).fold(0.0, |a, b| a + b)
+}
+
+total([Circle { r: 1.0 }, Circle { r: 2.0 }])   // Circle has `area` and `name`
+```
+
+- Inside the function, a value of type `T` has exactly the methods its bounds declare. Several bounds are joined with `+`: `[T: Shape + Named]`.
+- At each call the compiler checks that the type used for `T` has every method with the same parameter and result types (E0111). Built-in types count with their built-in methods, so `Clock` satisfies `interface Ticker { fn now_ms(self) -> Int }`.
+- Code is generated separately for each type used, so a call through an interface costs the same as a direct call.
+- An interface is not a type: `fn f(s: Shape)` is E0102; write `fn f[T: Shape](s: T)`. A list holds one type, so `List[T]` cannot mix `Circle` and `Square` values.
+- Bounds go only on functions, not on structs or enums.
+- Because built-in capabilities satisfy interfaces too, tests can pass a fake:
+
+```
+interface Ticker {
+    fn now_ms(self) -> Int
+}
+
+struct FakeClock {
+    t: Int,
+}
+
+fn now_ms(self: FakeClock) -> Int {
+    self.t
+}
+
+fn elapsed[C: Ticker](c: C, since: Int) -> Int {
+    c.now_ms() - since
+}
+
+test "elapsed" {
+    assert_eq(elapsed(FakeClock { t: 1500 }, 1000), 500)
+}
+// in main: elapsed(root.clock, start)
+```
+
+`vela caps` reports a function with bounded type parameters like one that takes callbacks: what it can do depends on the type it is called with.
+
 ### main
 
 `main` must be one of:
@@ -519,6 +568,7 @@ Every diagnostic has a stable code. `vela explain CODE` prints its explanation, 
 | E0108 | not callable |
 | E0109 | wrong number of type arguments |
 | E0110 | misplaced `self`, or a method on a built-in type |
+| E0111 | a type does not satisfy an interface bound |
 | E0201 | type mismatch |
 | E0202 | misuse of `?` |
 | E0203 | `if` without `else` produces a value |
@@ -549,9 +599,12 @@ A **panic** (division by zero, index out of range, `panic(...)`, no matching arm
 EBNF. `NL` is a newline, as described in section 2. A character-level version for constrained decoding, with the newline rules spelled out, is in [grammar/vela.gbnf](grammar/vela.gbnf). `{ x }` means zero or more, and `[ x ]` means optional.
 
 ```
-program    = { "use" IDENT | [ "pub" ] ( fn | struct | enum ) | test } ;
+program    = { "use" IDENT | [ "pub" ] ( fn | struct | enum | interface ) | test } ;
+interface  = "interface" IDENT "{" { "fn" IDENT "(" "self" { "," param } ")" [ "->" type ] ( "," | NL ) } "}" ;
 test       = "test" STRING block ;
-fn         = "fn" IDENT [ generics ] "(" [ params ] ")" [ "->" type ] block ;
+fn         = "fn" IDENT [ bgenerics ] "(" [ params ] ")" [ "->" type ] block ;
+bgenerics  = "[" IDENT [ ":" bound { "+" bound } ] { "," IDENT [ ":" bound { "+" bound } ] } "]" ;
+bound      = IDENT [ "." IDENT ] ;                (* an interface *)
 generics   = "[" IDENT { "," IDENT } "]" ;
 params     = param { sep param } [ "," ] ;
 param      = IDENT ":" type ;
@@ -693,4 +746,4 @@ The handler is a plain function value, so it gets no capability unless a closure
 
 ## 20. Not yet
 
-Interfaces, unbuffered (capacity 0) channels, `select` over several channels, TLS, SQL, a package registry, and a Cranelift backend. See the design doc's Known gaps for the full list.
+Interface values (`dyn`, for lists of mixed types), unbuffered (capacity 0) channels, `select` over several channels, TLS, SQL, a package registry, and a Cranelift backend. See the design doc's Known gaps for the full list.

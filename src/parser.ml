@@ -383,12 +383,40 @@ and parse_stmt st =
     end
     else mks (SExpr e) e.espan
 
-let parse_generics st =
+(* `[A, B: Shape + Show]`: names, and the interfaces each must satisfy. *)
+let parse_bounded_generics st =
   if is_sym st "[" then begin
     ignore (advance st);
-    comma_list st "]" (fun st -> fst (expect_ident st))
+    comma_list st "]" (fun st ->
+        let g, _ = expect_ident st in
+        let bounds =
+          if accept_sym st ":" then begin
+            let one () =
+              let a, asp = expect_ident st in
+              if is_sym st "." then begin
+                ignore (advance st);
+                let b, bsp = expect_ident st in
+                (a ^ "." ^ b, merge asp bsp)
+              end
+              else (a, asp)
+            in
+            let first = one () in
+            let rest = ref [] in
+            while accept_sym st "+" do rest := one () :: !rest done;
+            first :: List.rev !rest
+          end
+          else []
+        in
+        (g, bounds))
   end
   else []
+
+let parse_generics st =
+  let t = peek st in
+  let gs = parse_bounded_generics st in
+  if List.exists (fun (_, b) -> b <> []) gs then
+    raise (Diag.Fatal (Diag.make "E0003" t.span "interface bounds go on a function's type parameters, not on a struct or enum"));
+  List.map fst gs
 
 let test_count = ref 0
 
@@ -409,11 +437,13 @@ let parse_item st =
     (* the generated name cannot be written in source, so tests cannot be called *)
     IFn
       { fn_name = Printf.sprintf "test#%d" !test_count; fn_span = s.span; fn_gen = []; fn_params = []; fn_ret = None;
-        fn_body = body; fn_test = Some name; fn_pub = false }
+        fn_body = body; fn_test = Some name; fn_pub = false; fn_bounds = [] }
   | KW "fn" ->
     ignore (advance st);
     let name, nsp = expect_ident st in
-    let gen = parse_generics st in
+    let bgen = parse_bounded_generics st in
+    let gen = List.map fst bgen in
+    let bounds = List.filter (fun (_, b) -> b <> []) bgen in
     ignore (expect_sym st "(");
     let params =
       comma_list st ")" (fun st ->
@@ -428,7 +458,7 @@ let parse_item st =
     in
     let ret = if accept_sym st "->" then Some (parse_type st) else None in
     let body = parse_block st in
-    IFn { fn_name = name; fn_span = nsp; fn_gen = gen; fn_params = params; fn_ret = ret; fn_body = body; fn_test = None; fn_pub = false }
+    IFn { fn_name = name; fn_span = nsp; fn_gen = gen; fn_params = params; fn_ret = ret; fn_body = body; fn_test = None; fn_pub = false; fn_bounds = bounds }
   | KW "struct" ->
     ignore (advance st);
     let name, nsp = expect_ident st in
@@ -453,12 +483,39 @@ let parse_item st =
           (v, vsp, payload))
     in
     IEnum { en_name = name; en_span = nsp; en_gen = gen; en_variants = variants; en_pub = false }
-  | _ -> fail t "an item (`fn`, `struct` or `enum`)"
+  | KW "interface" ->
+    ignore (advance st);
+    let name, nsp = expect_ident st in
+    ignore (expect_sym st "{");
+    let methods =
+      comma_list st "}" (fun st ->
+          if not (is_kw st "fn") then fail (peek st) "`fn name(self, ...)` in an interface";
+          ignore (advance st);
+          let m, msp = expect_ident st in
+          ignore (expect_sym st "(");
+          let selft = peek st in
+          (match selft.tok with
+           | IDENT "self" -> ignore (advance st)
+           | _ -> raise (Diag.Fatal (Diag.make "E0003" selft.span "an interface method's first parameter is `self`, without a type")));
+          let params =
+            if accept_sym st "," then
+              comma_list st ")" (fun st ->
+                  let pn, psp = expect_ident st in
+                  ignore (expect_sym st ":");
+                  { prm_name = pn; prm_span = psp; prm_ty = parse_type st })
+            else (ignore (expect_sym st ")"); [])
+          in
+          let ret = if accept_sym st "->" then Some (parse_type st) else None in
+          (m, msp, params, ret))
+    in
+    IIface { if_name = name; if_span = nsp; if_methods = methods; if_pub = false }
+  | _ -> fail t "an item (`fn`, `struct`, `enum` or `interface`)"
 
 let set_pub = function
   | IFn d -> IFn { d with fn_pub = true }
   | IStruct s -> IStruct { s with st_pub = true }
   | IEnum e -> IEnum { e with en_pub = true }
+  | IIface i -> IIface { i with if_pub = true }
 
 let parse_file file src : file =
   test_count := 0;
@@ -474,7 +531,7 @@ let parse_file file src : file =
     else if is_kw st "pub" then begin
       ignore (advance st);
       match (peek st).tok with
-      | KW ("fn" | "struct" | "enum") -> items := set_pub (parse_item st) :: !items
+      | KW ("fn" | "struct" | "enum" | "interface") -> items := set_pub (parse_item st) :: !items
       | _ -> fail (peek st) "`fn`, `struct` or `enum` after `pub`"
     end
     else items := parse_item st :: !items

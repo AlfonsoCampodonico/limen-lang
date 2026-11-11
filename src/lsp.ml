@@ -163,6 +163,14 @@ let hover_items text items =
         in
         stmts d.fn_body;
         walk_block (fun e -> match e.edesc with EBlock b | EGroup (_, b) -> stmts b | EIf (_, b, _) -> stmts b | EClosure (_, { edesc = EBlock b; _ }) -> stmts b | _ -> ()) d.fn_body
+      | IIface i ->
+        add i.if_span ("interface " ^ i.if_name);
+        List.iter
+          (fun (m, sp, ps, r) ->
+            add sp
+              ("fn " ^ m ^ "(" ^ String.concat ", " ("self" :: List.map (fun p -> p.prm_name ^ ": " ^ slice text p.prm_ty.tspan) ps) ^ ")"
+              ^ match r with Some t -> " -> " ^ slice text t.tspan | None -> ""))
+          i.if_methods
       | IStruct s ->
         add s.st_span ("struct " ^ s.st_name);
         List.iter (fun (f, sp, te) -> add sp (f ^ ": " ^ slice text te.tspan)) s.st_fields
@@ -282,7 +290,8 @@ let definitions items =
         Option.iter ty d.fn_ret;
         block (List.map (fun p -> (p.prm_name, p.prm_span)) d.fn_params) d.fn_body
       | IStruct s -> List.iter (fun (_, _, te) -> ty te) s.st_fields
-      | IEnum e -> List.iter (fun (_, _, tes) -> List.iter ty tes) e.en_variants)
+      | IEnum e -> List.iter (fun (_, _, tes) -> List.iter ty tes) e.en_variants
+      | IIface i -> List.iter (fun (_, _, ps, r) -> List.iter (fun p -> ty p.prm_ty) ps; Option.iter ty r) i.if_methods)
     items;
   !acc
 
@@ -520,7 +529,8 @@ let handle st (msg : J.t) : J.t list =
                   let name = match d.fn_test with Some n -> "test \"" ^ n ^ "\"" | None -> d.fn_name in
                   sym name 12 d.fn_span (Span.merge d.fn_span d.fn_body.bspan)
                 | IStruct s -> sym s.st_name 23 s.st_span s.st_span
-                | IEnum e -> sym e.en_name 10 e.en_span e.en_span)
+                | IEnum e -> sym e.en_name 10 e.en_span e.en_span
+                | IIface i -> sym i.if_name 11 i.if_span i.if_span)
               items))
     | _ -> reply (J.List []))
   | m -> if id = J.Null then [] else [ error id (-32601) ("method not supported: " ^ m) ]

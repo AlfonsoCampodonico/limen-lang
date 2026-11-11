@@ -23,12 +23,17 @@ isep    ::= ws "," ws | sp "\n" ws
 stsep   ::= sp (";" | "\n") ws
 
 # ---------- items ----------
-top      ::= use | "pub" sp1 (fn | struct | enum) | item
+top      ::= use | "pub" sp1 (fn | struct | enum | interface) | item
 use      ::= "use" sp1 ident
-item     ::= fn | struct | enum | test
+item     ::= fn | struct | enum | test | interface
+interface ::= "interface" sp1 ident sp "{" ws (imethod (isep imethod)* (ws ",")?)? ws "}"
+imethod  ::= "fn" sp1 ident sp "(" ws "self" (isep param)* (ws ",")? ws ")" (sp "->" sp type)?
 test     ::= "test" sp1 plainstr sp block
-fn       ::= "fn" sp1 ident sp generics? sp "(" ws (param (isep param)* (ws ",")?)? ws ")" (sp "->" sp type)? sp block
+fn       ::= "fn" sp1 ident sp bgenerics? sp "(" ws (param (isep param)* (ws ",")?)? ws ")" (sp "->" sp type)? sp block
 generics ::= "[" ws ident (isep ident)* (ws ",")? ws "]"
+bgenerics ::= "[" ws bgen (isep bgen)* (ws ",")? ws "]"
+bgen     ::= ident (sp ":" sp qident (sp "+" sp qident)*)?
+qident   ::= ident ("." ident)?
 param    ::= ident sp ":" sp type
 struct   ::= "struct" sp1 ident sp generics? sp "{" ws (field (isep field)* (ws ",")?)? ws "}"
 field    ::= ident sp ":" sp type

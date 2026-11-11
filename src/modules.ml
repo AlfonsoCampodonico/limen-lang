@@ -29,9 +29,9 @@ let is_method = function
   | IFn { fn_test = None; fn_params = { prm_name = "self"; _ } :: _; _ } -> true
   | _ -> false
 
-let item_name = function IFn d -> d.fn_name | IStruct s -> s.st_name | IEnum e -> e.en_name
-let item_span = function IFn d -> d.fn_span | IStruct s -> s.st_span | IEnum e -> e.en_span
-let item_pub = function IFn d -> d.fn_pub | IStruct s -> s.st_pub | IEnum e -> e.en_pub
+let item_name = function IFn d -> d.fn_name | IStruct s -> s.st_name | IEnum e -> e.en_name | IIface i -> i.if_name
+let item_span = function IFn d -> d.fn_span | IStruct s -> s.st_span | IEnum e -> e.en_span | IIface i -> i.if_span
+let item_pub = function IFn d -> d.fn_pub | IStruct s -> s.st_pub | IEnum e -> e.en_pub | IIface i -> i.if_pub
 
 let errors : Diag.t list ref = ref []
 let err ?(notes = []) code sp msg = errors := Diag.make ~notes code sp msg :: !errors
@@ -271,15 +271,38 @@ let rename_item mods (m : modinfo) own (it : item) : item =
         | _ -> qual m d.fn_name (* the checker reports the bad `self` *)
       else qual m d.fn_name
     in
+    (* bounds name interfaces, qualified like types *)
+    let bound (b, sp) =
+      match String.index_opt b '.' with
+      | Some i -> (
+        let a = String.sub b 0 i and n = String.sub b (i + 1) (String.length b - i - 1) in
+        match module_of env a sp with
+        | Some md -> (
+          match member env md n sp with
+          | Some (IIface _) -> (qual md n, sp)
+          | _ -> no_member md n sp; (b, sp))
+        | None -> err "E0401" sp (Printf.sprintf "unknown module `%s`; add `use %s` at the top of the file" a a); (b, sp))
+      | None -> ( match Hashtbl.find_opt own b with Some (IIface _) -> (qual m b, sp) | _ -> (b, sp))
+    in
     IFn
       { d with
         fn_name = name;
+        fn_bounds = List.map (fun (g, bs) -> (g, List.map bound bs)) d.fn_bounds;
         fn_params = params;
         fn_ret = Option.map (ty env) d.fn_ret;
         fn_body = block env locals d.fn_body }
   | IStruct s ->
     let env = { self = m; mods; own; gens = s.st_gen } in
     IStruct { s with st_name = qual m s.st_name; st_fields = List.map (fun (f, sp, t) -> (f, sp, ty env t)) s.st_fields }
+  | IIface i ->
+    let env = { self = m; mods; own; gens = [] } in
+    IIface
+      { i with
+        if_name = qual m i.if_name;
+        if_methods =
+          List.map
+            (fun (n, sp, ps, r) -> (n, sp, List.map (fun p -> { p with prm_ty = ty env p.prm_ty }) ps, Option.map (ty env) r))
+            i.if_methods }
   | IEnum e ->
     let env = { self = m; mods; own; gens = e.en_gen } in
     IEnum

@@ -63,8 +63,18 @@ and stmt s =
 
 let item = function
   | IFn { fn_test = Some n; fn_body; _ } -> "test " ^ String.escaped n ^ block fn_body
+  | IIface i ->
+    "interface " ^ i.if_name ^ "{"
+    ^ String.concat ";"
+        (List.map
+           (fun (m, _, ps, r) ->
+             m ^ "(" ^ String.concat "," (List.map (fun p -> p.prm_name ^ ":" ^ ty p.prm_ty) ps) ^ ")" ^ (match r with Some t -> ty t | None -> ""))
+           i.if_methods)
+    ^ "}"
   | IFn d ->
-    "fn " ^ d.fn_name ^ "[" ^ String.concat "," d.fn_gen ^ "]("
+    "fn " ^ d.fn_name ^ "["
+    ^ String.concat "," (List.map (fun g -> g ^ (match List.assoc_opt g d.fn_bounds with Some bs -> ":" ^ String.concat "+" (List.map fst bs) | None -> "")) d.fn_gen)
+    ^ "]("
     ^ String.concat "," (List.map (fun p -> p.prm_name ^ ":" ^ ty p.prm_ty) d.fn_params)
     ^ ")" ^ (match d.fn_ret with Some t -> ty t | None -> "") ^ block d.fn_body
   | IStruct s -> "struct " ^ s.st_name ^ "[" ^ String.concat "," s.st_gen ^ "]{" ^ String.concat "," (List.map (fun (f, _, t) -> f ^ ":" ^ ty t) s.st_fields) ^ "}"
@@ -73,6 +83,6 @@ let item = function
     ^ String.concat "," (List.map (fun (v, _, ts) -> v ^ "(" ^ String.concat "," (List.map ty ts) ^ ")") e.en_variants)
     ^ "}"
 
-let pub_of = function IFn d -> d.fn_pub | IStruct s -> s.st_pub | IEnum e -> e.en_pub
+let pub_of = function IFn d -> d.fn_pub | IStruct s -> s.st_pub | IEnum e -> e.en_pub | IIface i -> i.if_pub
 let items is = String.concat "\n" (List.map (fun i -> (if pub_of i then "pub " else "") ^ item i) is)
 let file (f : file) = String.concat "\n" (List.map (fun (u, _) -> "use " ^ u) f.uses) ^ "\n" ^ items f.items

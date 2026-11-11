@@ -171,4 +171,6 @@ Types: `Int`, `Float`, `Bool`, `Str`, `()`, `List[T]`, fixed-size `Array[T, N]` 
 
 Methods: a function whose first parameter is `self: T` is called as `value.name(...)` (see [examples/methods.vela](examples/methods.vela)).
 
-Not yet: interfaces, tuples and maps, `select` over channels, TLS and SQL. `Int` is 64-bit in native code but 63-bit in the interpreter, because OCaml reserves one bit of its native int; the two only differ on overflow.
+Interfaces: `interface Shape { fn area(self) -> Float }` bounds a generic parameter, `fn total[T: Shape](xs: List[T])`, and any type with those methods satisfies it, built-in capabilities included, so tests can pass a fake `Clock` (see [examples/interfaces.vela](examples/interfaces.vela)).
+
+Not yet: interface values (`dyn`), tuples and maps, `select` over channels, TLS and SQL. `Int` is 64-bit in native code but 63-bit in the interpreter, because OCaml reserves one bit of its native int; the two only differ on overflow.
