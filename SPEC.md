@@ -349,6 +349,19 @@ Both operands must have the same type. The **ordered** types are `Int`, `Float`,
 
 On a `Result[T, E]`, `e?` evaluates to the `Ok` value or returns `Err(e)` from the enclosing function, which must return `Result[_, E]` with the same `E`, or `Result[_, dyn Error]` when `E` satisfies `Error` (section 4); then the error converts to `dyn Error`. Any other error type is E0202, which offers to change the function's error type to `dyn Error` when both types satisfy `Error`. Convert errors by hand with `.map_err(|e| ...)`. On an `Option[T]`, `?` returns `None` from a function returning `Option`.
 
+A string after `?` on the same line adds context: `x? "reading config"` returns early with an error whose message is `reading config: <the error's message>` and whose `cause()` is the original error. The function must return `Result[_, dyn Error]` (E0202, with a fix that changes its error type), and the error must satisfy `Error`. The string can interpolate (`"reading {path}"`) and is built only when there is an error. On an `Option`, `opt? "no port set"` returns an error with that message and no cause, so a missing value becomes an error in one step. The wrapper is the prelude struct `WrappedError { context: Str, inner: dyn Error }`; the `errors` module (section 19) walks and prints the chain.
+
+```
+fn start(fs: Fs, all: Map[Str, Str]) -> Result[Server, dyn Error] {
+    let text = fs.read("app.toml")? "reading config"
+    let port = all.get("port")? "no port set"
+    let cfg = parse(text)? "parsing config"
+    ...
+}
+```
+
+The context is a string after `?`, rather than a method such as `.context("...")?`, so the common case stays one short step that reads like the comment it replaces, and the string is evaluated only on the error path.
+
 ### Calls
 
 `f(a, b)` calls a function or closure. The number of arguments must match (E0107). `panic(msg: Str)` aborts the program with a message and source location; it can be used where any type is expected.
@@ -1020,7 +1033,7 @@ stmt       = "let" [ "mut" ] IDENT [ ":" type ] "=" expr
 expr       = unary { BINOP unary } ;            (* precedence: section 5 *)
 expr_ns    = expr ;                             (* no struct literal at the top level *)
 unary      = ( "-" | "!" ) unary | postfix ;
-postfix    = primary { "(" [ args ] ")" | "[" expr "]" | "." IDENT [ "(" [ args ] ")" ] | "." INT | "?" } ;
+postfix    = primary { "(" [ args ] ")" | "[" expr "]" | "." IDENT [ "(" [ args ] ")" ] | "." INT | "?" [ STRING ] } ;
 args       = expr { sep expr } [ "," ] ;
 primary    = INT | FLOAT | STRING | "true" | "false"
            | [ IDENT "." ] IDENT [ "{" [ init { sep init } [ "," ] ] "}" ]   (* struct literal *)
@@ -1130,7 +1143,7 @@ The standard library is checked like a dependency. `src/std/vela.toml` lists the
 
 | Module | May take |
 | --- | --- |
-| `json`, `list`, `text`, `format`, `time`, `regex` | nothing: pure |
+| `json`, `list`, `text`, `format`, `time`, `regex`, `errors` | nothing: pure |
 | `http` | `net` (Net, Conn) and `listen` (Listener, Conn) |
 | `sql` | `fs` (the database file's directory); trusted with C (`[trust] foreign = ["sql"]`) to call SQLite |
 
@@ -1141,6 +1154,30 @@ A module missing from the list may take nothing. `vela caps FILE` shows what eac
 - The std modules' source. It is embedded in the compiler, not fetched, so it is as trustworthy as the compiler binary; the manifest check makes sure that what it can do stays what it declares.
 - The C libraries that std modules trusted in the manifest's `[trust]` declare in `foreign` blocks (SQLite for `sql`). Their calls need no `Foreign`, and the declarations are private to the module; the module wraps every call and keeps SQLite inside the `Fs` grant (see `sql` below). A standard library module that is not trusted cannot call C. Trusted modules may also declare the runtime's own helper library, `foreign "vela"`, which no other code may: `vela_copy(p, n)` copies C memory into `Bytes`, and a handle table (`vela_handle_new`, `_acquire`, `_release`, `_close`) keeps C pointers out of Vela values. A trusted module's values hold a random id from that table instead of a `Handle`, since any code can write `Handle { addr: ... }` but no code can turn an id into a pointer; an unknown or closed id is an error, and a pointer is freed only once no use of it is in progress.
 - Callbacks. `http.serve(l, n, handler)` calls `handler` inside std code; the handler carries only the capabilities its closure captured from your code, which appear in your signatures, not std's.
+
+### errors
+
+Walking and printing the chain of causes of a `dyn Error` (section 4).
+
+| Function | Result |
+| --- | --- |
+| `chain(e)` | `List[dyn Error]`: `e`, its cause, that one's cause, ... |
+| `root(e)` | `dyn Error`: the innermost cause, the error that started it |
+| `wrap(e, context)` | `dyn Error`: `e` with context, as `x? "context"` makes it |
+| `own_message(e)` | `Str`: what this link adds, its message without its cause's message at the end |
+| `report(e)` | `Str`: the chain, one link per line, each after the first marked `caused by:` |
+
+```
+use errors
+
+match start(root.fs) {
+    Ok(s) => run(s),
+    Err(e) => root.stdout.print(errors.report(e)),
+}
+// starting
+// caused by: reading config
+// caused by: denied: fs: not granted (run with --grant fs=DIR)
+```
 
 ### json
 

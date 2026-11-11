@@ -2531,7 +2531,7 @@ fn main(root: Root) -> Result[(), IoError] {
   errs "int-literal-too-large" (main_wrap "    let x = 9223372036854775808") [ "E0005" ];
 
   (* ---------- select ---------- *)
-  exits "example-tour" (example "tour.vela") "-- language\ncircle 12.57\n[2.25, 12.56636]\n[0, 1, 4, 9, 16] [\"h\", \"o\", \"l\", \"a\"]\nbound method 3.142\nVELA!\n{Point { x: 0, y: 0 }: [\"origin\", \"home\"]} {(1, 2): 2}\n[(1, \"a\"), (1, \"z\"), (2, \"b\")]\n3 bytes: hi!\n-- concurrency\na side task ran\nresults [1, 2]\nwith a deadline [Some(1), None]\nnobody sent anything\n" 3;
+  exits "example-tour" (example "tour.vela") "-- language\ncircle 12.57\n[2.25, 12.56636]\n[0, 1, 4, 9, 16] [\"h\", \"o\", \"l\", \"a\"]\nbound method 3.142\nVELA!\n{Point { x: 0, y: 0 }: [\"origin\", \"home\"]} {(1, 2): 2}\n[(1, \"a\"), (1, \"z\"), (2, \"b\")]\n3 bytes: hi!\nreading settings\ncaused by: not a port: 80x\n8080\n-- concurrency\na side task ran\nresults [1, 2]\nwith a deadline [Some(1), None]\nnobody sent anything\n" 3;
   out "select" (example "select.vela") "nums done; words done; total 15 letters 3\nnothing ready | sent to c | sent to d | d Some(10)\nafter close: Some(7)\nErr(\"every arm of this `select` is turned off by its guard\")\n";
   out "select-stress" "fn produce(c: Chan[Int], n: Int) -> Int {\n    let mut i = 0\n    while i < n {\n        c.send(i)\n        i = i + 1\n    }\n    c.close()\n    0\n}\n\n// receive from all four until every one is closed\nfn consume(a: Chan[Int], b: Chan[Int], c: Chan[Int], d: Chan[Int]) -> Int {\n    let mut sum = 0\n    let mut on = [true, true, true, true]\n    while on[0] || on[1] || on[2] || on[3] {\n        select {\n            v = a.recv() if on[0] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[0] = false\n                },\n            },\n            v = b.recv() if on[1] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[1] = false\n                },\n            },\n            v = c.recv() if on[2] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[2] = false\n                },\n            },\n            v = d.recv() if on[3] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[3] = false\n                },\n            },\n        }\n    }\n    sum\n}\n\nfn drain(c: Chan[Str]) -> Int {\n    let mut n = 0\n    let mut more = true\n    while more {\n        match c.recv() {\n            Some(s) => {\n                n = n + s.len()\n            },\n            None => {\n                more = false\n            },\n        }\n    }\n    n\n}\n\nfn main(root: Root) {\n    let a: Chan[Int] = channel(1)\n    let b: Chan[Int] = channel(1)\n    let c: Chan[Int] = channel(2)\n    let d: Chan[Int] = channel(1)\n    let sums = group g {\n        g.go(|| produce(a, 500))\n        g.go(|| produce(b, 500))\n        g.go(|| produce(c, 500))\n        g.go(|| produce(d, 500))\n        g.go(|| consume(a, b, c, d))\n        g.go(|| consume(a, b, c, d))\n        g.go(|| consume(a, b, c, d))\n    }\n    root.stdout.print(\"{sums.sum()}\")\n    // select between two sends: a dispatcher feeding two workers\n    let w1: Chan[Str] = channel(1)\n    let w2: Chan[Str] = channel(1)\n    let parts = group g {\n        g.go(|| {\n                let mut i = 0\n                while i < 1000 {\n                    let msg = \"m{i}\"\n                    select {\n                        w1.send(msg) => (),\n                        w2.send(msg) => (),\n                    }\n                    i = i + 1\n                }\n                w1.close()\n                w2.close()\n                0\n            })\n        g.go(|| drain(w1))\n        g.go(|| drain(w2))\n    }\n    root.stdout.print(\"{parts.sum()}\")\n}\n" "499000\n3890\n";
   check_tsan "select-stress-tsan" "fn produce(c: Chan[Int], n: Int) -> Int {\n    let mut i = 0\n    while i < n {\n        c.send(i)\n        i = i + 1\n    }\n    c.close()\n    0\n}\n\n// receive from all four until every one is closed\nfn consume(a: Chan[Int], b: Chan[Int], c: Chan[Int], d: Chan[Int]) -> Int {\n    let mut sum = 0\n    let mut on = [true, true, true, true]\n    while on[0] || on[1] || on[2] || on[3] {\n        select {\n            v = a.recv() if on[0] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[0] = false\n                },\n            },\n            v = b.recv() if on[1] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[1] = false\n                },\n            },\n            v = c.recv() if on[2] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[2] = false\n                },\n            },\n            v = d.recv() if on[3] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[3] = false\n                },\n            },\n        }\n    }\n    sum\n}\n\nfn drain(c: Chan[Str]) -> Int {\n    let mut n = 0\n    let mut more = true\n    while more {\n        match c.recv() {\n            Some(s) => {\n                n = n + s.len()\n            },\n            None => {\n                more = false\n            },\n        }\n    }\n    n\n}\n\nfn main(root: Root) {\n    let a: Chan[Int] = channel(1)\n    let b: Chan[Int] = channel(1)\n    let c: Chan[Int] = channel(2)\n    let d: Chan[Int] = channel(1)\n    let sums = group g {\n        g.go(|| produce(a, 500))\n        g.go(|| produce(b, 500))\n        g.go(|| produce(c, 500))\n        g.go(|| produce(d, 500))\n        g.go(|| consume(a, b, c, d))\n        g.go(|| consume(a, b, c, d))\n        g.go(|| consume(a, b, c, d))\n    }\n    root.stdout.print(\"{sums.sum()}\")\n    // select between two sends: a dispatcher feeding two workers\n    let w1: Chan[Str] = channel(1)\n    let w2: Chan[Str] = channel(1)\n    let parts = group g {\n        g.go(|| {\n                let mut i = 0\n                while i < 1000 {\n                    let msg = \"m{i}\"\n                    select {\n                        w1.send(msg) => (),\n                        w2.send(msg) => (),\n                    }\n                    i = i + 1\n                }\n                w1.close()\n                w2.close()\n                0\n            })\n        g.go(|| drain(w1))\n        g.go(|| drain(w2))\n    }\n    root.stdout.print(\"{parts.sum()}\")\n}\n" "499000\n3890\n";
@@ -3639,6 +3639,118 @@ fn main(root: Root) {
   (let src = "struct Quiet {\n    n: Int,\n}\n\nfn a() -> Result[Int, Quiet] {\n    Ok(1)\n}\n\nfn b() -> Result[Int, Str] {\n    let x = a()?\n    Ok(x)\n}\n\nfn main() {}\n" in
    let _, ds, _ = compile "error-nofix" src in
    ok "error-no-fix-when-not-error" (codes ds = [ "E0202" ] && List.for_all (fun (d : Diag.t) -> d.fix = None) ds) (String.concat " " (codes ds)));
+
+  (* ---------- error context: `x? "context"`, and the errors module ---------- *)
+  out "error-context" (perr ^ {|use errors
+
+fn parse(s: Str) -> Result[Int, ParseError] {
+    match s.parse_int() {
+        Some(n) => Ok(n),
+        None => Err(ParseError { line: 4 }),
+    }
+}
+
+fn read(fs: Fs, name: Str) -> Result[Int, dyn Error] {
+    let text = fs.read(name)? "reading {name}"
+    Ok(text.len())
+}
+
+fn setting(s: Str, all: Map[Str, Str]) -> Result[Int, dyn Error] {
+    let raw = all.get(s)? "no setting {s}"
+    let n = parse(raw)? "parsing {s}"
+    let checked = catch(|| [10, 20][n])? "looking up {s}"
+    Ok(checked)
+}
+
+fn start(fs: Fs) -> Result[Int, dyn Error] {
+    let n = read(fs, "app.toml")? "starting"
+    Ok(n)
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let all = map([("a", "1"), ("b", "x"), ("c", "7")])
+    for s in ["a", "b", "c", "d"] {
+        match setting(s, all) {
+            Ok(n) => out.print("{s} = {n}"),
+            Err(e) => out.print("{e.message()} [{errors.chain(e).len()}]"),
+        }
+    }
+    match start(root.fs) {
+        Ok(_) => out.print("read it"),
+        Err(e) => {
+            out.print(errors.report(e))
+            out.print(errors.root(e).message())
+            out.print(errors.chain(e).map(|x| errors.own_message(x)).join(" / "))
+            out.print(errors.wrap(e, "outer").message())
+            out.print(errors.report("plain"))
+        },
+    }
+}
+|})
+    ("a = 20\nparsing b: bad line 4 [2]\nlooking up c: index 7 is out of range for a list of length 2 [2]\nno setting d [1]\n"
+     ^ "starting\ncaused by: reading app.toml\ncaused by: denied: fs: not granted (run with --grant fs=DIR)\n"
+     ^ "denied: fs: not granted (run with --grant fs=DIR)\nstarting / reading app.toml / denied: fs: not granted (run with --grant fs=DIR)\n"
+     ^ "outer: starting: reading app.toml: denied: fs: not granted (run with --grant fs=DIR)\nplain\n");
+  (* the context is evaluated only on the error path, and in a loop its strings are freed *)
+  out "error-context-loop" {|fn get(i: Int) -> Result[Int, Str] {
+    if i % 3 == 0 { Err("bad {i}") } else { Ok(i) }
+}
+
+fn tally(n: Int) -> Result[Int, dyn Error] {
+    let mut sum = 0
+    for i in 1..<n {
+        sum = sum + get(i)? "item {i} of {n}"
+    }
+    Ok(sum)
+}
+
+fn main(root: Root) {
+    let mut errs = 0
+    for n in 0..<200 {
+        match tally(n) {
+            Ok(_) => {},
+            Err(e) => {
+                errs = errs + e.message().len()
+            },
+        }
+    }
+    root.stdout.print("{errs} {tally(3).is_ok()} {tally(4).is_err()}")
+}
+|} "3818 true true\n";
+  (let src = {|fn fail() -> Result[Int, Str] {
+    Err("disk full")
+}
+
+fn main() -> Result[(), dyn Error] {
+    fail()? "saving"
+    Ok(())
+}
+|} in
+   if selected "error-context-main" && native_for "error-context-main" then
+     run_native "error-context-main" src (function
+       | Ok (code, _, e) -> ok "error-context-main/native" (code = 1 && e = "error: saving: disk full\n") (sprintf "exit %d stderr %S" code e)
+       | Error m -> ok "error-context-main/native" false m));
+  errs "error-context-not-str" "fn f(fs: Fs) -> Result[Str, dyn Error] {\n    let t = fs.read(\"a\")? 3\n    Ok(t)\n}\n\nfn main() {}\n" [ "E0004" ];
+  errs "error-context-option-fn" "fn f(xs: List[Int]) -> Option[Int] {\n    let x = xs.first()? \"empty\"\n    Some(x)\n}\n\nfn main() {}\n" [ "E0202" ];
+  errs "error-context-in-unit" (main_wrap "    let x = root.fs.read(\"a\")? \"reading\"") [ "E0202" ];
+  errs "error-context-not-error" (noerr ^ "fn f() -> Result[Int, dyn Error] {\n    let x = source()? \"getting\"\n    Ok(x)\n}\n\nfn main() {}\n") [ "E0202" ];
+  errs "error-context-interp-type" "fn f(fs: Fs) -> Result[Str, dyn Error] {\n    let t = fs.read(\"a\")? \"reading {nope}\"\n    Ok(t)\n}\n\nfn main() {}\n" [ "E0101" ];
+  (let src = "fn f(fs: Fs) -> Result[Str, IoError] {\n    let t = fs.read(\"a\")? \"reading\"\n    Ok(t)\n}\n\nfn main() {}\n" in
+   let _, ds, _ = compile "error-context-fix" src in
+   ok "error-context-fix" (codes ds = [ "E0202" ]) (String.concat " " (codes ds));
+   let fixed = apply_fixes src ds in
+   let _, ds2, _ = compile "error-context-fixed" fixed in
+   ok "error-context-fix-applies" (ds2 = [] && fixed = "fn f(fs: Fs) -> Result[Str, dyn Error] {\n    let t = fs.read(\"a\")? \"reading\"\n    Ok(t)\n}\n\nfn main() {}\n") fixed);
+  ok "error-context-fmt" (Fmt.format ~file:"ec.vela" "fn f(fs: Fs) -> Result[Str, dyn Error] {\n    let t = fs.read(\"a\")?\"reading {1}\"\n    Ok(t)\n}\n"
+     = "fn f(fs: Fs) -> Result[Str, dyn Error] {\n    let t = fs.read(\"a\")? \"reading {1}\"\n    Ok(t)\n}\n")
+    (Fmt.format ~file:"ec.vela" "fn f(fs: Fs) -> Result[Str, dyn Error] {\n    let t = fs.read(\"a\")?\"reading {1}\"\n    Ok(t)\n}\n");
+  ok "error-context-astdump"
+    (let items = Parser.parse_program "ad.vela" "fn f() {\n    g()? \"c\"\n}\n" in
+     match items with
+     | [ Ast.IFn { fn_body = { tail = Some { edesc = Ast.ETry (_, Some _); _ }; _ }; _ } ] -> true
+     | _ -> false)
+    "context not parsed";
 
   (* ---------- ordering: sort() and < on any ordered type ---------- *)
   out "sort-any"

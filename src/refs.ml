@@ -308,7 +308,8 @@ let rename ~(load : (string * string) list -> item list * Diag.t list) items fil
     | Some d ->
       let upper = nw <> "" && nw.[0] >= 'A' && nw.[0] <= 'Z' in
       let iface_methods =
-        List.concat_map (function IIface i -> List.map (fun (m, _, _, _) -> (m, i.if_name)) i.if_methods | _ -> []) items
+        (* the prelude's `Error` counts too *)
+        List.concat_map (function IIface i -> List.map (fun (m, _, _, _) -> (m, i.if_name)) i.if_methods | _ -> []) (Prelude.items () @ items)
       in
       if not (valid_ident nw) then Error (Printf.sprintf "`%s` is not a valid name" nw)
       else if nw = o.name then Ok []

@@ -12,6 +12,9 @@ interface Error {
     fn message(self) -> Str
     fn cause(self) -> Option[dyn Error]
 }
+struct WrappedError { context: Str, inner: dyn Error }
+fn message(self: WrappedError) -> Str { "{self.context}: {self.inner.message()}" }
+fn cause(self: WrappedError) -> Option[dyn Error] { Some(self.inner) }
 fn str_message(s: Str) -> Str { s }
 fn ioerror_message(e: IoError) -> Str { match e { Denied(m) => "denied: {m}", Failed(m) => m } }
 fn no_cause[T](x: T) -> Option[dyn Error] { None }
