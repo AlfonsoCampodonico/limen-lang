@@ -23,7 +23,7 @@ fn parse_names(body: Str) -> List[Str] { ... }
 
 ## Build and run
 
-Needs OCaml 5 and dune (`brew install ocaml dune`), plus a C compiler (`cc`, or set `CC`) for the native backend. Nothing else: `Net.get` speaks HTTP/1.1 itself (plain http only, no TLS yet).
+Needs OCaml 5 and dune (`brew install ocaml dune`), plus a C compiler (`cc`, or set `CC`) for the native backend, and OpenSSL for TLS (`brew install openssl@3` on macOS, `libssl-dev` or `openssl-devel` on Linux; `VELA_OPENSSL=PREFIX` points at another install). Without OpenSSL everything but TLS still works. `Net.get` speaks HTTP/1.1 itself, http and https.
 
 ```bash
 dune build
@@ -87,7 +87,7 @@ With VS Code, any generic LSP client extension works: point it at `vela lsp` for
 - Attenuation only narrows: `net.only(host)`, `fs.under(dir)`, `fs.read_only()`. Asking for more than you hold gives an empty capability.
 - Capabilities and function types cannot be stored in struct or enum fields (E0301, E0304), so authority always shows up in signatures. Generic instantiations like `Box[Net]` are allowed because the capability is visible in the type.
 - A function with no capability or function-typed parameters is pure.
-- Runtime enforcement: `Net` is an http/https host allowlist, redirects are not followed, and other schemes are refused. `Fs` resolves paths under its root and refuses absolute paths, `..` escapes and symlinks that lead outside.
+- Runtime enforcement: `Net` is an http/https host allowlist, redirects are not followed, and other schemes are refused. TLS certificates are always verified against the system's trusted certificates (`SSL_CERT_FILE` replaces them, for tests). `listen.on_tls(addr, cert, key)` serves TLS from certificate and key text the program read through its own `Fs` (or `Env`), so no new grant is involved. `Fs` resolves paths under its root and refuses absolute paths, `..` escapes and symlinks that lead outside.
 
 ## Modules, packages and the standard library
 
@@ -196,4 +196,4 @@ Tuples `(Int, Str)` and maps `Map[Str, Int]` are built in: `let (q, r) = divmod(
 
 A panic ends only the task it happens in, and `catch(|| ...)` turns one into `Err(message)`, so `http.serve` answers 500 when a handler panics and keeps serving.
 
-Not yet: TLS and SQL. `Int` is 64-bit and wraps on overflow, identically in the interpreter and in native code.
+Not yet: SQL. `Int` is 64-bit and wraps on overflow, identically in the interpreter and in native code.
