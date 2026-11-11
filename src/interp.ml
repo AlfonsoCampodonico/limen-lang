@@ -20,9 +20,10 @@ type cap =
 
 (* A socket that knows when it was closed, so a task waiting on it never
    touches a descriptor number that has been reused. *)
-and sock = { fd : Unix.file_descr; mutable shut : bool; mutable reading : bool; mutable writing : bool }
+and sock = { fd : Unix.file_descr; mutable shut : bool; mutable reading : bool; mutable writing : bool; mutable tls : Tls.side }
 (* reading / writing: a task is in a read (or accept) / a write that has had
-   to wait; as natively, another that has to wait meanwhile fails *)
+   to wait; as natively, another that has to wait meanwhile fails. tls: a
+   TLS connection's session, or a TLS listener's context. *)
 
 (* Map keys: Int, Str, Bool, and tuples, structs and enums of them. *)
 type mkey =
@@ -603,7 +604,7 @@ module Sock = struct
             Unix.listen fd 4096;
             Unix.set_nonblock fd;
             let p = match Unix.getsockname fd with Unix.ADDR_INET (_, p) -> p | _ -> port in
-            Ok ({ fd; shut = false; reading = false; writing = false }, p)
+            Ok ({ fd; shut = false; reading = false; writing = false; tls = Tls.Plain }, p)
           with Unix.Unix_error (e, _, _) -> Unix.close fd; failed e))
 
   let accept sk =
@@ -612,7 +613,15 @@ module Sock = struct
           if sk.shut then closed_err "listener"
           else
             match Unix.accept ~cloexec:true sk.fd with
-            | c, _ -> Unix.set_nonblock c; Ok { fd = c; shut = false; reading = false; writing = false }
+            | c, _ -> (
+              Unix.set_nonblock c;
+              let conn = { fd = c; shut = false; reading = false; writing = false; tls = Tls.Plain } in
+              match sk.tls with
+              | Tls.Server ctx -> (
+                match Tls.server ctx c with
+                | s -> conn.tls <- Tls.Session s; Ok conn
+                | exception Failure m -> Unix.close c; Error (Caps.Failed m))
+              | _ -> Ok conn)
             | exception Unix.Unix_error ((Unix.EINTR | Unix.ECONNABORTED), _, _) -> go ()
             | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _) ->
               if claim () then (wait sk false; go ()) else busy "accepting on this listener"
@@ -629,7 +638,7 @@ module Sock = struct
         match resolve h with
         | None -> Error (Caps.Failed ("cannot resolve " ^ h))
         | Some ip -> (
-          let sk = { fd = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0; shut = false; reading = false; writing = false } in
+          let sk = { fd = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0; shut = false; reading = false; writing = false; tls = Tls.Plain } in
           Unix.set_nonblock sk.fd;
           (* waits can be woken by any socket, so retry until this one says it is connected *)
           let rec go () =
@@ -645,12 +654,27 @@ module Sock = struct
           in
           go ()))
 
+  (* One TLS read or write step: Ok n, or Error (Some write) when the socket
+     must be ready that way first, or Error None with the message in [m]. *)
+  let tls_step s op b off len =
+    match Tls.step s op b off len with
+    | n when n >= 0 -> `Done n
+    | n -> `Wait (n = Tls.want_write)
+    | exception Failure m -> `Failed m
+
   let read sk =
     one_at_a_time sk false (fun claim ->
         let b = Bytes.create 65536 in
         let rec go () =
           if sk.shut then closed_err "connection"
           else
+            match sk.tls with
+            | Tls.Session s -> (
+              match tls_step s 0 b 0 65536 with
+              | `Done n -> Ok (Bytes.sub_string b 0 n)
+              | `Wait w -> if claim () then (wait sk w; go ()) else busy "reading this connection"
+              | `Failed m -> Error (Caps.Failed m))
+            | _ ->
             match Unix.read sk.fd b 0 65536 with
             | n -> Ok (Bytes.sub_string b 0 n)
             | exception Unix.Unix_error (Unix.EINTR, _, _) -> go ()
@@ -666,6 +690,13 @@ module Sock = struct
           if sk.shut then closed_err "connection"
           else if off >= String.length s then Ok ()
           else
+            match sk.tls with
+            | Tls.Session t -> (
+              match tls_step t 1 (Bytes.unsafe_of_string s) off (min (String.length s - off) 0x3fffffff) with
+              | `Done n -> go (off + n)
+              | `Wait w -> if claim () then (wait sk w; go off) else busy "writing this connection"
+              | `Failed m -> Error (Caps.Failed m))
+            | _ ->
             match Unix.single_write_substring sk.fd s off (String.length s - off) with
             | n -> go (off + n)
             | exception Unix.Unix_error (Unix.EINTR, _, _) -> go off
@@ -678,8 +709,43 @@ module Sock = struct
   let close sk =
     if not sk.shut then begin
       sk.shut <- true;
+      (match sk.tls with
+       | Tls.Session s -> Tls.close s
+       | Tls.Server c -> Tls.ctx_free c
+       | Tls.Plain -> ());
       try Unix.close sk.fd with Unix.Unix_error _ -> ()
     end
+
+  (* Net.connect_tls: connect, then run the client handshake, which checks
+     the server's certificate against the host. *)
+  let connect_tls allowed addr =
+    match parse_addr addr with
+    | None -> Error (Caps.Failed "address must be HOST:PORT")
+    | Some (h, _) -> (
+      match connect allowed addr with
+      | Error e -> Error e
+      | Ok sk -> (
+        match Tls.client sk.fd h with
+        | exception Failure m -> close sk; Error (Caps.Failed m)
+        | s ->
+          sk.tls <- Tls.Session s;
+          let rec go () =
+            match tls_step s 2 Bytes.empty 0 0 with
+            | `Done _ -> Ok sk
+            | `Wait w -> (match wait sk w with () -> go () | exception e -> close sk; raise e)
+            | `Failed m -> close sk; Error (Caps.Failed m)
+          in
+          go ()))
+
+  (* Listen.on_tls: a listener whose connections speak TLS with this
+     certificate and key (PEM text). *)
+  let listen_tls allowed addr cert key =
+    match listen allowed addr with
+    | Error e -> Error e
+    | Ok (sk, p) -> (
+      match Tls.server_ctx cert key with
+      | c -> sk.tls <- Tls.Server c; Ok (sk, p)
+      | exception Failure m -> close sk; Error (Caps.Failed m))
 
   (* Net.get: one plain HTTP/1.1 GET over a socket, read until the server
      closes. Redirects are returned, not followed. *)
@@ -689,9 +755,8 @@ module Sock = struct
     | Ok u ->
       if not (Caps.permits allowed ~host:u.host ~port:u.port) then
         Error (Caps.Denied (Printf.sprintf "net: %s:%d is not granted" u.host u.port))
-      else if u.https then Error (Caps.Failed "https is not supported yet (vela has no TLS); use an http:// URL")
       else
-        match connect allowed (Printf.sprintf "%s:%d" u.host u.port) with
+        match (if u.https then connect_tls else connect) allowed (Printf.sprintf "%s:%d" u.host u.port) with
         | Error e -> Error e
         | Ok sk ->
           let result =
@@ -701,6 +766,7 @@ module Sock = struct
               let b = Buffer.create 4096 in
               let rec go () =
                 match read sk with
+                | Error (Caps.Failed m) when m = Caps.tls_cut -> Caps.parse_http ~cut:true (Buffer.contents b)
                 | Error e -> Error e
                 | Ok "" -> Caps.parse_http (Buffer.contents b)
                 | Ok s ->
@@ -752,7 +818,7 @@ module Proc = struct
         | pid ->
           close_all [ wr; devnull ];
           Unix.set_nonblock rd;
-          let sk = { fd = rd; shut = false; reading = false; writing = false } in
+          let sk = { fd = rd; shut = false; reading = false; writing = false; tls = Tls.Plain } in
           let b = Buffer.create 4096 and chunk = Bytes.create 65536 in
           let rec drain () =
             match Unix.read rd chunk 0 65536 with
@@ -784,7 +850,7 @@ module Stdin = struct
   let buf = Buffer.create 4096
   let eof = ref false
   let busy = ref false
-  let sk = { fd = Unix.stdin; shut = false; reading = false; writing = false }
+  let sk = { fd = Unix.stdin; shut = false; reading = false; writing = false; tls = Tls.Plain }
   let direct = lazy (try (Unix.fstat Unix.stdin).Unix.st_kind = Unix.S_REG with Unix.Unix_error _ -> true)
 
   let reset () = Buffer.clear buf; eof := false; busy := false
@@ -1360,6 +1426,9 @@ and cap_call rt c name args =
   | CFs fs, "write", [ VStr p; VStr data ] -> io_result (fun () -> VUnit) (Caps.write fs p data)
   | CFs fs, "exists", [ VStr p ] -> VBool (Caps.exists fs p)
   | CNet allowed, "connect", [ VStr addr ] -> sock_result (Sock.connect allowed addr) (fun fd -> VCap (CConn fd))
+  | CNet allowed, "connect_tls", [ VStr addr ] -> sock_result (Sock.connect_tls allowed addr) (fun fd -> VCap (CConn fd))
+  | CListen allowed, "on_tls", [ VStr addr; VStr cert; VStr key ] ->
+    sock_result (Sock.listen_tls allowed addr cert key) (fun (fd, port) -> VCap (CListener (fd, port)))
   | CListen allowed, "on", [ VStr addr ] -> sock_result (Sock.listen allowed addr) (fun (fd, port) -> VCap (CListener (fd, port)))
   | CListener (fd, _), "accept", [] -> sock_result (Sock.accept fd) (fun c -> VCap (CConn c))
   | CListener (_, port), "port", [] -> vint port

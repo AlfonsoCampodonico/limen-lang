@@ -2,9 +2,6 @@
 // capability; the group returns results in the order the tasks were started.
 //
 //   vela run --native examples/parallel.vela --grant net=api.github.com
-//
-// Net.get has no TLS yet, so against GitHub (https only) each org prints
-// `Failed("https is not supported yet ...")`.
 
 fn main(root: Root) {
     let gh = root.net.only("api.github.com")

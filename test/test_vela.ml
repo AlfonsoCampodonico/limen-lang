@@ -242,10 +242,10 @@ let job_count = ref 0
 let exe_path name = incr job_count; Filename.concat tmpdir (sprintf "%s-%d" name !job_count)
 
 let native_job ?tests ~flags items exe run_cmd (k : (int, string) result -> unit) =
-  let c_text = Native.c_source ?tests items in
+  let c_text, cflags, libs = Native.prepare (Native.c_source ?tests items) in
   let c_file = exe ^ ".c" in
   Out_channel.with_open_bin c_file (fun oc -> output_string oc c_text);
-  let argv = Native.command ~flags c_file exe in
+  let argv = Native.command ~flags ~cflags ~libs c_file exe in
   let log = exe ^ ".cc" in
   let q = Filename.quote in
   let compile = String.concat " " (List.map q argv) ^ " >" ^ q log ^ " 2>&1" in
@@ -254,7 +254,7 @@ let native_job ?tests ~flags items exe run_cmd (k : (int, string) result -> unit
     | None -> compile
     | Some d ->
       (* the paths differ from run to run; the command around them does not *)
-      let shape = Native.command ~flags "prog.c" "prog" in
+      let shape = Native.command ~flags ~cflags ~libs "prog.c" "prog" in
       let key = Digest.to_hex (Digest.string (String.concat "\000" (Lazy.force cc_version :: shape @ [ c_text ]))) in
       let cached = Filename.concat d key in
       (* a hit is copied (and touched, so it stays); a miss is compiled and stored *)
@@ -317,6 +317,7 @@ let check_tsan name ?(grants = Interp.no_grants) ?feed src want =
         @ List.concat_map (fun h -> [ "--grant"; "net=" ^ h ]) grants.Interp.net
         @ List.concat_map (fun h -> [ "--grant"; "listen=" ^ h ]) grants.Interp.listen
         @ List.concat_map (fun h -> [ "--grant"; "exec=" ^ h ]) grants.Interp.exec
+        @ ("--" :: grants.Interp.args)
       in
       let o = exe ^ ".out" and e = exe ^ ".err" in
       let cmd =
@@ -380,6 +381,13 @@ let apply_fixes src (ds : Diag.t list) =
     (fun s (e : Diag.edit) ->
       String.sub s 0 e.at.lo ^ e.replacement ^ String.sub s e.at.hi (String.length s - e.at.hi))
     src edits
+
+(* TLS tests trust only the test CA in test/tls, in this process (the
+   interpreter) and in the native programs it starts. *)
+let tls_dir =
+  let d = Filename.concat (Sys.getcwd ()) "tls" in
+  if Sys.file_exists (Filename.concat d "ca.pem") then d else Filename.concat (Sys.getcwd ()) "test/tls"
+let () = Unix.putenv "SSL_CERT_FILE" (Filename.concat tls_dir "ca.pem")
 
 let main_wrap body = "fn main(root: Root) {\n    let out = root.stdout\n" ^ body ^ "\n}\n"
 
@@ -1127,12 +1135,13 @@ fn main(root: Root) -> Result[(), IoError] {
         })
     }
     out.print("{served}")
+    l.close()
     out.print("{net.get("https://127.0.0.1:{port}/")}")
     Ok(())
 }
 |} in
   let http_want =
-    "200 [\"content-length\"] None GET /a/b?x=1 HTTP/1.1\n200 [\"content-length\"] None GET /?q HTTP/1.1\n404 [\"content-type\", \"x-a\", \"content-length\"] Some(\"1, 2\") nope!\n200 [\"transfer-encoding\"] None Wikipedia\n301 [\"location\"] None until close\nFailed(\"http: incomplete response headers\")\nFailed(\"http: truncated body\")\nFailed(\"http: malformed header line\")\nFailed(\"http: bad chunk size\")\nFailed(\"http: more than 1000 response headers\")\nFailed(\"http: response headers larger than 64 KiB\")\n[11, 0]\nErr(Failed(\"https is not supported yet (vela has no TLS); use an http:// URL\"))\n"
+    "200 [\"content-length\"] None GET /a/b?x=1 HTTP/1.1\n200 [\"content-length\"] None GET /?q HTTP/1.1\n404 [\"content-type\", \"x-a\", \"content-length\"] Some(\"1, 2\") nope!\n200 [\"transfer-encoding\"] None Wikipedia\n301 [\"location\"] None until close\nFailed(\"http: incomplete response headers\")\nFailed(\"http: truncated body\")\nFailed(\"http: malformed header line\")\nFailed(\"http: bad chunk size\")\nFailed(\"http: more than 1000 response headers\")\nFailed(\"http: response headers larger than 64 KiB\")\n[11, 0]\nErr(Failed(\"Connection refused\"))\n"
   in
   let http_grants = { Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] } in
   out "net-get-http" ~grants:http_grants http_src http_want;
@@ -1819,6 +1828,266 @@ fn main(root: Root) -> Result[(), IoError] {
 }
 |v}
     "served 6\nHTTP/1.1 200 OK|Content-Type: text/plain; charset=utf-8|Connection: keep-alive|Content-Length: 21||GET /a HTTP/1.1 body=HTTP/1.1 200 OK|Content-Type: text/plain; charset=utf-8|Connection: keep-alive|Content-Length: 27||POST /b HTTP/1.1 body=abcdeHTTP/1.1 500 Internal Server Error|Content-Type: text/plain; charset=utf-8|Connection: keep-alive|Content-Length: 14||internal errorHTTP/1.1 200 OK|Content-Type: text/plain; charset=utf-8|Connection: close|Content-Length: 21||GET /c HTTP/1.1 body=\nHTTP/1.1 200 OK|Content-Type: text/plain; charset=utf-8|Connection: close|Content-Length: 23||GET /old HTTP/1.0 body=\nHTTP/1.1 200 OK|Content-Type: text/plain; charset=utf-8|Connection: close|Content-Length: 22||\nHTTP/1.1 400 Bad Request|Content-Type: text/plain; charset=utf-8|Connection: close|Content-Length: 12||bad request\n\nforever: Failed(\"listener is closed\")\nstream: Failed(\"listener is closed\")\n200 close GET /x HTTP/1.1 body=\n200 POST /y HTTP/1.1 body=hello\n200 chunked one two three\n13 bytes\nFailed(\"http: connection closed before the response\")\n";
+  (* ---------- TLS ----------
+     test/tls holds a test CA (ca.pem, trusted through SSL_CERT_FILE, set at
+     the top of this file), a server certificate for localhost and
+     127.0.0.1, one for another name, and a self-signed one nobody trusts.
+     The programs read them through an Fs grant. *)
+  let tls_grants =
+    { Interp.no_grants with fs = Some (tls_dir, true); listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1"; "localhost" ] }
+  in
+  let tls_conn_src = {v|// Read until a "." arrives, or the peer closes or fails.
+fn read_msg(c: Conn) -> Result[Str, IoError] {
+    let mut got = ""
+    while !got.ends_with(".") {
+        let s = c.read()?
+        if s == "" {
+            return Ok(got)
+        }
+        got = got + s
+    }
+    Ok(got)
+}
+
+fn serve(l: Listener, n: Int) -> Str {
+    let mut log = []
+    let mut i = 0
+    while i < n {
+        match l.accept() {
+            Ok(c) => {
+                match read_msg(c) {
+                    Ok(s) => { let _ = c.write("echo {s.len()}") },
+                    Err(_) => log.push("handshake failed"),
+                }
+                c.close()
+            },
+            Err(e) => log.push("{e}"),
+        }
+        i = i + 1
+    }
+    log.join(", ")
+}
+
+fn big(n: Int) -> Str {
+    let mut s = "x"
+    while s.len() < n {
+        s = s + s
+    }
+    s + "."
+}
+
+fn call(net: Net, addr: Str, msg: Str) -> Str {
+    match net.connect_tls(addr) {
+        Ok(c) => {
+            let r = match c.write(msg) {
+                Ok(_) => "{c.read()}",
+                Err(e) => "{e}",
+            }
+            c.close()
+            r
+        },
+        Err(e) => "{e}",
+    }
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let out = root.stdout
+    let fs = root.fs
+    let net = root.net
+    let l = root.listen.on_tls("127.0.0.1:0", fs.read("server.pem")?, fs.read("server-key.pem")?)?
+    let untrusted = root.listen.on_tls("127.0.0.1:0", fs.read("untrusted.pem")?, fs.read("untrusted-key.pem")?)?
+    let other = root.listen.on_tls("127.0.0.1:0", fs.read("other.pem")?, fs.read("other-key.pem")?)?
+    let plain = root.listen.on("127.0.0.1:0")?
+    let port = l.port()
+    let got = group g {
+        g.go(|| serve(l, 2))
+        g.go(|| serve(untrusted, 1))
+        g.go(|| serve(other, 1))
+        g.go(|| {
+            // read the client's hello first, so closing sends no reset
+            match plain.accept() {
+                Ok(c) => { let _ = c.read(); c.close() },
+                Err(_) => {},
+            }
+            ""
+        })
+        g.go(|| call(net, "127.0.0.1:{port}", "hello."))
+        g.go(|| call(net, "localhost:{port}", big(300000)))
+        g.go(|| call(net, "localhost:{untrusted.port()}", "x."))
+        g.go(|| call(net, "127.0.0.1:{other.port()}", "x."))
+        g.go(|| call(net, "127.0.0.1:{plain.port()}", "x."))
+    }
+    for r in got {
+        out.print(r)
+    }
+    // a read waiting on a TLS connection is cancelled by the group's deadline
+    let quiet = group g {
+        g.go(|| {
+            match l.accept() {
+                Ok(c) => { let _ = read_msg(c); c.close() },
+                Err(_) => {},
+            }
+        })
+        g.go(|| {
+            match net.connect_tls("127.0.0.1:{port}") {
+                Ok(c) => {
+                    let waited = group w until root.clock.after(50) {
+                        w.go(|| "{c.read()}")
+                    }
+                    c.close()
+                    "{waited}"
+                },
+                Err(e) => "{e}",
+            }
+        })
+    }
+    out.print("{quiet}")
+    out.print("{root.listen.on_tls("127.0.0.1:0", "not a certificate", "")}")
+    out.print("{root.listen.on_tls("127.0.0.1:0", fs.read("server.pem")?, fs.read("other-key.pem")?)}")
+    out.print("{root.listen.on_tls("127.0.0.1:1", fs.read("server.pem")?, fs.read("server-key.pem")?)}")
+    out.print("{net.connect_tls("example.com:443")}")
+    out.print("{net.connect_tls("nonsense")}")
+    l.close()
+    Ok(())
+}
+|v} in
+  let tls_conn_want = "\nhandshake failed\nhandshake failed\n\nOk(\"echo 6\")\nOk(\"echo 524289\")\nFailed(\"tls: certificate verify failed: self-signed certificate\")\nFailed(\"tls: certificate verify failed: IP address mismatch\")\nFailed(\"tls: the connection was closed during the handshake\")\n[\"[None]\"]\nErr(Failed(\"tls: no PEM certificate in the certificate text\"))\nErr(Failed(\"tls: the private key does not match the certificate\"))\nErr(Denied(\"listen: 127.0.0.1:1 is not granted\"))\nErr(Denied(\"net: example.com:443 is not granted\"))\nErr(Failed(\"address must be HOST:PORT\"))\n" in
+  out "tls-conn" ~grants:tls_grants tls_conn_src tls_conn_want;
+  check_tsan "tls-conn" ~grants:tls_grants tls_conn_src tls_conn_want;
+  let tls_http_src = {v|use http
+
+fn route(r: http.Request) -> http.Response {
+    http.text(200, "{r.method} {r.path} {r.version} body={r.body}")
+}
+
+fn stream(r: http.Request, c: Conn) -> Result[(), IoError] {
+    http.write_head(c, 200, [http.Header { name: "Content-Type", value: "text/plain" }])?
+    for w in ["one ", "two ", "three"] {
+        http.write_chunk(c, w)?
+    }
+    http.end_body(c)
+}
+
+// Two requests on one kept-alive TLS connection, written at once.
+fn pipelined(net: Net, port: Int) -> Str {
+    match net.connect_tls("localhost:{port}") {
+        Ok(c) => {
+            let _ = c.write("GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nConnection: close\r\n\r\n")
+            let mut got = ""
+            let mut open = true
+            while open {
+                match c.read() {
+                    Ok(s) => if s == "" { open = false } else { got = got + s },
+                    Err(e) => { got = got + "{e}"; open = false },
+                }
+            }
+            c.close()
+            got.split("\r\n\r\n").len().to_str()
+        },
+        Err(e) => "{e}",
+    }
+}
+
+fn client(net: Net, p1: Int, p2: Int) -> Str {
+    let mut log = []
+    match http.get(net, "https://127.0.0.1:{p1}/x") {
+        Ok(r) => log.push("{r.status} {r.body}"),
+        Err(e) => log.push("{e}"),
+    }
+    match http.post(net, "https://localhost:{p1}/y", "text/plain", "hello") {
+        Ok(r) => log.push("{r.status} {r.body}"),
+        Err(e) => log.push("{e}"),
+    }
+    match http.request_fold(net, "GET", "https://127.0.0.1:{p2}/s", [], "", "", |a, s| a + s) {
+        Ok((r, body)) => log.push("{r.status} {r.header("transfer-encoding") ?? "-"} {body}"),
+        Err(e) => log.push("{e}"),
+    }
+    match net.get("https://localhost:{p1}/net?q=1") {
+        Ok(r) => log.push("{r.status} {r.headers.get("content-type")} {r.body}"),
+        Err(e) => log.push("{e}"),
+    }
+    log.push(pipelined(net, p1))
+    match http.get(net, "ftp://127.0.0.1/") {
+        Ok(r) => log.push("{r.status}"),
+        Err(e) => log.push("{e}"),
+    }
+    log.join("\n")
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let cert = root.fs.read("server.pem")?
+    let key = root.fs.read("server-key.pem")?
+    let l1 = root.listen.on_tls("127.0.0.1:0", cert, key)?
+    let l2 = root.listen.on_tls("127.0.0.1:0", cert, key)?
+    let p1 = l1.port()
+    let p2 = l2.port()
+    let net = root.net
+    let done = group g {
+        g.go(|| "forever: {http.serve_forever(l1, route)}")
+        g.go(|| "stream: {http.accept_forever(l2, |c| http.serve_stream(c, stream))}")
+        g.go(|| {
+            let log = client(net, p1, p2)
+            l1.close()
+            l2.close()
+            log
+        })
+    }
+    root.stdout.print(done.join("\n"))
+    Ok(())
+}
+|v} in
+  let tls_http_want = "forever: Failed(\"listener is closed\")\nstream: Failed(\"listener is closed\")\n200 GET /x HTTP/1.1 body=\n200 POST /y HTTP/1.1 body=hello\n200 chunked one two three\n200 Some(\"text/plain; charset=utf-8\") GET /net?q=1 HTTP/1.1 body=\n3\nFailed(\"http: the URL must start with http:// or https://\")\n" in
+  out "tls-http" ~grants:tls_grants tls_http_src tls_http_want;
+  check_tsan "tls-http" ~grants:tls_grants tls_http_src tls_http_want;
+  (* A TLS stream that ends without the close message may have been cut
+     short: Conn.read says so, and Net.get accepts it only when the response
+     is framed (Content-Length or chunked) and complete. *)
+  let tls_cut_src = {v|fn main(root: Root) {
+    let out = root.stdout
+    let port = root.args()[0]
+    let net = root.net
+    match net.get("https://127.0.0.1:{port}/framed") {
+        Ok(r) => out.print("{r.status} {r.body}"),
+        Err(e) => out.print("{e}"),
+    }
+    match net.get("https://127.0.0.1:{port}/close") {
+        Ok(r) => out.print("{r.status} {r.body}"),
+        Err(e) => out.print("{e}"),
+    }
+    match net.connect_tls("127.0.0.1:{port}") {
+        Ok(c) => {
+            let _ = c.write("GET /raw HTTP/1.1\r\n\r\n")
+            let mut got = ""
+            let mut last = Ok("")
+            let mut open = true
+            while open {
+                match c.read() {
+                    Ok(s) => if s == "" { open = false } else { got = got + s },
+                    Err(e) => { last = Err(e); open = false },
+                }
+            }
+            c.close()
+            out.print("{got.len()} {last}")
+        },
+        Err(e) => out.print("{e}"),
+    }
+}
+|v} in
+  let tls_cut_want =
+    "200 hello\nFailed(\"tls: the connection was closed without a TLS close message, so the data may be cut short\")\n30 Err(Failed(\"tls: the connection was closed without a TLS close message, so the data may be cut short\"))\n"
+  in
+  (if selected "tls-cut" then
+     let runs = if native_for "tls-cut" then 9 else 3 in
+     let ic =
+       Unix.open_process_args_in "python3"
+         [| "python3"; Filename.concat tls_dir "cut_server.py"; Filename.concat tls_dir "server.pem";
+            Filename.concat tls_dir "server-key.pem"; string_of_int runs |]
+     in
+     let port = String.trim (input_line ic) in
+     let grants = { Interp.no_grants with net = [ "127.0.0.1" ]; args = [ port ] } in
+     out "tls-cut" ~grants tls_cut_src tls_cut_want;
+     check_tsan "tls-cut" ~grants tls_cut_src tls_cut_want;
+     ignore (Unix.close_process_in ic));
   (* ---------- Rand, Env, args and the Fs additions ---------- *)
   let box = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "vela-box-%d" (Unix.getpid ())) in
   (try Unix.mkdir box 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());

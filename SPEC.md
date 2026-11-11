@@ -414,9 +414,9 @@ The rules:
 3. There is no ambient I/O. Using `print`, `open`, `fetch` and similar names is error E0302, which explains the capability to use instead.
 4. A function whose parameters contain no capability and no function type is **pure**: it can only compute (and panic). `vela caps FILE` lists each function's authority.
 5. Enforcement at runtime:
-   - `Net`: http URLs only for now, host allowlist, redirects not followed. `Net.connect` uses the same allowlist.
+   - `Net`: http and https URLs only, host allowlist, redirects not followed. `Net.connect` and `Net.connect_tls` use the same allowlist. TLS certificates are always verified (section 10).
    - `Exec`: the program name must match a grant exactly (`git` and `/usr/bin/git` are different grants), or the grant is `*`. Arguments are passed as a list, never through a shell. The child gets `/dev/null` as stdin, the working directory, `PATH`, and only the environment variables granted with `--grant env=`. A program name without `/` is looked up in `PATH`, as a shell would. Granting a program grants everything that program can do with any arguments, so `exec=sh` is as good as every other grant.
-   - `Listen`: binding is allowed only for granted `host` or `host:port` entries.
+   - `Listen`: binding is allowed only for granted `host` or `host:port` entries, with or without TLS.
    - `Fs`: paths are relative to the granted directory; absolute paths, `..` escapes and symlinks pointing outside are refused.
 
 ## 10. Concurrency
@@ -555,6 +555,33 @@ fn main(root: Root) -> Result[(), IoError] {
 - `close()` on a `Listener` or `Conn` makes any task waiting on it get `Err(Failed("... is closed"))`.
 - One task at a time reads a connection or accepts on a listener, and one writes a connection. A `read`, `accept` or `write` that has to wait while another task is already waiting for the same thing returns `Err(Failed("another task is already reading this connection"))` (or `accepting on this listener`, `writing this connection`) instead of mixing their data; one that can go on at once is not refused. Both backends behave alike.
 
+### TLS
+
+```
+// client: --grant net=api.example.com
+let c = root.net.connect_tls("api.example.com:443")?
+c.write("GET / HTTP/1.1\r\nHost: api.example.com\r\nConnection: close\r\n\r\n")?
+
+// server: --grant listen=0.0.0.0:8443 --grant fs=/etc/myapp:ro
+let cert = root.fs.read("cert.pem")?
+let key = root.fs.read("key.pem")?
+let l = root.listen.on_tls("0.0.0.0:8443", cert, key)?
+```
+
+- `Net.connect_tls("host:port")` connects like `connect`, then does the TLS handshake and returns a `Conn`. Everything that works on a `Conn` works on it unchanged: `read`, `write`, `close`, the one-reader-one-writer rule, and the `http` module.
+- The server's certificate is always verified: its chain against the trusted certificates, and its name (or IP address, when `host` is one) against `host`. There is no switch to turn this off. A failure is `Err(Failed("tls: certificate verify failed: ..."))`, for example `self-signed certificate` or `hostname mismatch`.
+- The trusted certificates are the system's (see "TLS library" below). Whoever starts the program can replace them with the standard `SSL_CERT_FILE` (a PEM file) or `SSL_CERT_DIR` environment variables, as for curl, Python or Go; this is how tests trust a locally made certificate. The program itself cannot change what is trusted.
+- `Listen.on_tls("host:port", cert, key)` binds like `on`; `accept()` then returns TLS connections. `cert` is the PEM text of the certificate, optionally followed by the intermediate certificates of its chain, and `key` the PEM text of its unencrypted private key. A certificate that cannot be parsed or a key that does not match it is `Err(Failed("tls: ..."))`, and nothing stays bound.
+- How this fits the capabilities: the certificate and key are plain text, so the program reads them with whatever capability holds them (usually `Fs`, or `Env` for secrets passed in the environment) and passes the text on. Serving TLS needs only the `Listen` grant for the address; there is no separate grant and no path the runtime opens behind the program's back.
+- A server connection does its handshake during its first `read` or `write`, so `accept()` never waits for a slow client, and a failed handshake is that `read`'s error. A client connection has done its handshake when `connect_tls` returns.
+- Handshakes, reads and writes park the task like plain socket operations; no worker thread blocks. Cancellation (a group deadline) works the same.
+- TLS 1.2 or later. Clients do not send certificates and servers do not ask for them. `close()` sends the TLS close message. A peer that closes without one may have been cut off by someone in between, so that `read` is `Err(Failed("tls: the connection was closed without a TLS close message, so the data may be cut short"))` rather than `""`. `Net.get` and the `http` client still accept such a response when its `Content-Length` or chunked body shows it is complete, and refuse one whose body runs until the close.
+- Errors from TLS start with `tls: `. Both backends use the same TLS code, so they verify and fail alike.
+
+#### TLS library
+
+TLS is OpenSSL (1.1.1 or later), in both backends: the interpreter is linked with it, and native programs that use `Net.get`, `connect_tls` or `on_tls` are linked with it. It is found when vela is built: `$VELA_OPENSSL` (an install prefix) if set, else `pkg-config openssl` (looking in Homebrew's `openssl@3` first), else the system headers. On macOS that is Homebrew's `openssl@3` (`brew install openssl@3`), whose trusted certificates are Homebrew's `cert.pem` bundle; on Linux it is the distribution's libssl (`libssl-dev` or `openssl-devel` to build), trusting the distribution's certificate store. Native programs link OpenSSL's shared libraries, so a binary from `vela build` that uses TLS needs them where it runs. If OpenSSL is not found, vela still builds and runs everything else, and every TLS operation fails with `Failed("tls: ... built without TLS ...")`.
+
 ### Running programs
 
 ```
@@ -582,7 +609,7 @@ if resp.status == 200 {
 - `Net.get(url)` sends one HTTP/1.1 `GET` (with `Host`, `User-Agent: vela`, `Accept: */*` and `Connection: close`), reads until the server closes, and returns `HttpResponse { status, headers, body }`.
 - Every status is `Ok`, including 404 and 500; redirects are returned, not followed. `Err(Failed(...))` means the server could not be reached or the response was not valid HTTP; responses over 64 MiB, with more than 64 KiB of headers or with more than 1000 header lines are refused.
 - `headers` is a `Map[Str, Str]` with lowercased names, in the order they arrived; a repeated header's values are joined with `", "`. The body is decoded from chunked transfer encoding or cut to `Content-Length`.
-- `https://` URLs are checked against the grant like any other, then fail with `Failed("https is not supported yet ...")`: there is no TLS yet. There is no timeout yet either. For other methods, request headers or bodies, use `http.request` from the `http` module, which works over `Net.connect`.
+- `https://` URLs go over `Net.connect_tls` (port 443 unless given), with the certificate checks described under TLS. There is no timeout yet. For other methods, request headers or bodies, use `http.request` from the `http` module, which works over `Net.connect` and `Net.connect_tls`.
 
 ## 11. Built-in methods
 
@@ -711,12 +738,14 @@ Strings compare byte by byte, so `c >= "a" && c <= "z"` tests a one-byte string,
 | `Stdin` | `read_line()` | `Option[Str]`, without the newline (or `\r\n`); `None` at the end of input. Waiting for input parks the task; one task reads at a time, so tasks reading together each get whole lines |
 | `Stdin` | `read_all()` | `Str`, the rest of the input |
 | `Env` | `get(name)` | `Option[Str]`; `None` if unset or not granted |
-| `Net` | `get(url)` | `Result[HttpResponse, IoError]`: `status`, `headers` (`Map[Str, Str]`, lowercased names), `body`; http only (section 10) |
+| `Net` | `get(url)` | `Result[HttpResponse, IoError]`: `status`, `headers` (`Map[Str, Str]`, lowercased names), `body`; http and https (section 10) |
 | `Net` | `only(host)` | `Net`; `host` is `name`, `name:port` or `*` |
 | `Net` | `connect(addr)` | `Result[Conn, IoError]`; `addr` is `host:port` |
+| `Net` | `connect_tls(addr)` | `Result[Conn, IoError]`, a TLS connection whose certificate was verified for `host` |
 | `Exec` | `run(program, args)` | `Result[ProcessOutput, IoError]`: `code`, `stdout`, `stderr` (section 10) |
 | `Exec` | `only(program)` | `Exec`; `program` is a name or `*` |
 | `Listen` | `on(addr)` | `Result[Listener, IoError]` |
+| `Listen` | `on_tls(addr, cert, key)` | `Result[Listener, IoError]` whose connections speak TLS; `cert` and `key` are PEM text |
 | `Listener` | `accept()` | `Result[Conn, IoError]` |
 | `Listener` | `port()` | `Int` |
 | `Listener`, `Conn` | `close()` | `()` |
@@ -1008,14 +1037,14 @@ A module missing from the list may take nothing. `vela caps FILE` shows what eac
 
 ### http
 
-HTTP/1.1 over plain TCP (no TLS yet). The server keeps connections alive between requests and reads pipelined requests in order; bodies can be streamed in pieces both ways.
+HTTP/1.1, plain or over TLS. The server keeps connections alive between requests and reads pipelined requests in order; bodies can be streamed in pieces both ways. The client uses TLS for `https://` URLs; the server uses TLS when its listener came from `Listen.on_tls`, and nothing else changes.
 
 | Item | Meaning |
 | --- | --- |
 | `struct Header { name, value }`, `req.header(name)`, `resp.header(name)`, `find_header(headers, name)` | headers; lookup ignores case |
 | `struct Request { method, path, version, headers, body }` | `version` is `"HTTP/1.1"` or `"HTTP/1.0"` |
 | `struct Response { status: Int, headers, body }`, `text(status, body)`, `json(status, body)`, `reason(status)` | |
-| `get(net, url)`, `post(net, url, content_type, body)`, `request(net, method, url, headers, body)` | `Result[Response, IoError]`; `http://host[:port]/path` URLs, chunked responses decoded, one connection per request |
+| `get(net, url)`, `post(net, url, content_type, body)`, `request(net, method, url, headers, body)` | `Result[Response, IoError]`; `http://host[:port]/path` and `https://host[:port]/path` URLs, chunked responses decoded, one connection per request |
 | `request_fold(net, method, url, headers, body, init, f)` | `Result[(Response, T), IoError]`: the body is passed to `f: fn(T, Str) -> T` piece by piece as it arrives instead of being held in memory; the response comes back with an empty body |
 | `serve_forever(listener, handler) -> IoError` | serve every connection in its own task until the listener is closed (by another task holding it) or fails; returns that error |
 | `serve(listener, count, handler) -> Int` | the same for `count` connections; returns how many requests were answered |
@@ -1139,4 +1168,4 @@ fn main(root: Root) {
 
 ## 20. Not yet
 
-TLS, SQL, a package registry, and a Cranelift backend. See the design doc's Known gaps for the full list.
+SQL, a package registry, and a Cranelift backend. See the design doc's Known gaps for the full list.

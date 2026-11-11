@@ -913,12 +913,14 @@ struct WCap {
   int fd; int port;           /* Listener, Conn: the socket */
   int64_t inflight; int closing; /* operations in progress; close requested */
   int reading, writing;          /* a task is in a read (or accept) / a write that has had to wait */
+  void *tls;                     /* Listener: its SSL_CTX; Conn: its VTls (NULL for plain TCP) */
 };
 static WCap *cap_new(int kind) { WCap *c = (WCap *)w_alloc_k(sizeof(WCap), WK_CAP); memset(c, 0, sizeof *c); c->rc = 1; c->kind = kind; c->fd = -1; return c; }
 static void w_sock_release_fd(int fd);
+static void w_tls_release(WCap *c);
 static inline WCap *Cap_dup(WCap *c) { w_rc_inc(&c->rc); return c; }
 static inline void Cap_share(WCap *c) { w_rc_share(&c->rc); }
-static void Cap_release(WCap *c) { for (int i = 0; i < c->nhosts; i++) free(c->hosts[i]); free(c->hosts); free(c->root); if (c->fd >= 0) w_sock_release_fd(c->fd); w_free(c); }
+static void Cap_release(WCap *c) { for (int i = 0; i < c->nhosts; i++) free(c->hosts[i]); free(c->hosts); free(c->root); if (c->tls) w_tls_release(c); if (c->fd >= 0) w_sock_release_fd(c->fd); w_free(c); }
 static void Cap_drop(WCap *c) { if (w_rc_dec(&c->rc)) Cap_release(c); }
 static inline bool Cap_eq(WCap *a, WCap *b) { return a == b; }
 static void Cap_show(WBuf *b, WCap *c, bool top) {
@@ -1901,19 +1903,24 @@ static void w_tm_remove(WTimer *t) {
   pthread_mutex_unlock(&w_tm_mu);
 }
 
-/* Clock.sleep(ms): park until the time has passed. */
-static void Cap_sleep(int64_t ms) {
-  if (ms <= 0) return;
+/* Park until ms milliseconds have passed. Returns -2 if the task was
+   cancelled (the caller cleans up, then calls w_cancel_unwind()). */
+static int w_nap(int64_t ms) {
+  if (ms <= 0) return 0;
   WSel tok;
   WTimer t;
   memset(&t, 0, sizeof t);
   t.at = w_deadline_ms(ms); t.pos = -1; t.f = w_current(); t.sel = &tok; t.idx = 0;
-  if (!w_wait_begin(&tok)) w_cancel_unwind();
+  if (!w_wait_begin(&tok)) return -2;
   w_tm_add(&t);
   w_park_now();
   w_wait_end();
-  if (w_tok_fired(&tok) == W_CANCEL) { w_tm_remove(&t); w_cancel_unwind(); }
+  if (w_tok_fired(&tok) == W_CANCEL) { w_tm_remove(&t); return -2; }
+  return 0;
 }
+
+/* Clock.sleep(ms): park until the time has passed. */
+static void Cap_sleep(int64_t ms) { if (w_nap(ms) < 0) w_cancel_unwind(); }
 
 /* ---------- group / go ---------- */
 
@@ -2593,10 +2600,12 @@ static void w_sock_leave(WCap *c) {
     w_sock_really_close(c);
 }
 static int w_sock_closing(WCap *c) { return __atomic_load_n(&c->closing, __ATOMIC_SEQ_CST); }
+static void w_tls_close_notify(WCap *c);
 static void Cap_sock_close(WCap *c) {
   if (__atomic_exchange_n(&c->closing, 1, __ATOMIC_SEQ_CST)) return;
   int fd = __atomic_load_n(&c->fd, __ATOMIC_SEQ_CST);
   if (fd >= 0) {
+    if (c->tls && c->kind == CAP_CONN) w_tls_close_notify(c);
     shutdown(fd, SHUT_RDWR);
     if (fd < W_MAX_FD && __atomic_load_n(&w_poll_fd, __ATOMIC_ACQUIRE) >= 0) w_fd_wake_all(fd);
   }
@@ -2676,6 +2685,7 @@ static int w_sock_claim(int *slot, int *held) {
 }
 static void w_sock_unclaim(int *slot, int held) { if (held) __atomic_store_n(slot, 0, __ATOMIC_RELEASE); }
 
+static int w_tls_accept(WCap *l, WCap *conn, WIo *err);
 static WIo Cap_accept(WCap *l) {
   int fd = w_sock_enter(l);
   if (fd < 0) return io_err(2, "listener is closed");
@@ -2689,6 +2699,7 @@ static WIo Cap_accept(WCap *l) {
       setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
       WCap *conn = cap_new(CAP_CONN);
       conn->fd = c;
+      if (l->tls && !w_tls_accept(l, conn, &r)) break;
       r = io_ok_ptr(conn);
       break;
     }
@@ -2737,24 +2748,50 @@ static WIo Cap_net_connect(WCap *n, WStr *addr) {
   c->fd = fd;
   return io_ok_ptr(c);
 }
+/* One read or write on a connection, plain or TLS: the bytes moved (0 at
+   the end of a read stream), or -1 if the socket must first be ready in
+   direction *dir (0 read, 1 write; TLS may need to write while reading and
+   the other way round), or -2 with a message in err. */
+static int w_tls_step(WCap *c, int wr, char *buf, size_t n, int *dir, char *err, size_t en);
+static ssize_t w_conn_step(WCap *c, int fd, int wr, char *buf, size_t n, int *dir, char *err, size_t en) {
+  if (c->tls) return w_tls_step(c, wr, buf, n, dir, err, en);
+  for (;;) {
+    ssize_t k = wr ? write(fd, buf, n) : read(fd, buf, n);
+    if (k >= 0) return k;
+    if (errno == EINTR) continue;
+    if (errno == EAGAIN || errno == EWOULDBLOCK) { *dir = wr; return -1; }
+    snprintf(err, en, "%s", strerror(errno));
+    return -2;
+  }
+}
+/* Park a connection's reader (or writer) until the socket is ready in
+   direction dir: 0 when it is, -1 if another task holds that side, -2 if
+   cancelled. When TLS has to wait on the other side, which that side's
+   task may already be waiting on, it naps briefly instead. */
+static int w_conn_wait(int fd, int own, int dir) {
+  int wr = w_wait_fd(fd, dir);
+  if (wr == -1 && dir != own) return w_nap(1);
+  return wr == -2 ? -2 : wr < 0 ? -1 : 0;
+}
 static WIo Cap_conn_read(WCap *c) {
   int fd = w_sock_enter(c);
   if (fd < 0) return io_err(2, "connection is closed");
   char *buf = (char *)w_raw(65536);
   int held = 0, cancelled = 0;
   WIo r;
+  char err[300];
   for (;;) {
-    ssize_t n = read(fd, buf, 65536);
+    int dir = 0;
+    ssize_t n = w_conn_step(c, fd, 0, buf, 65536, &dir, err, sizeof err);
     if (n >= 0 && !w_sock_closing(c)) { r = io_ok(Str_from(buf, n)); break; }
-    if (n < 0 && errno == EINTR) continue;
-    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && !w_sock_closing(c)) {
+    if (n == -1 && !w_sock_closing(c)) {
       if (!w_sock_claim(&c->reading, &held)) { r = io_err(2, "another task is already reading this connection"); break; }
-      int wr = w_wait_fd(fd, 0);
+      int wr = w_conn_wait(fd, 0, dir);
       if (wr == -2) { cancelled = 1; break; }
       if (wr < 0) { r = io_err(2, "another task is already reading this connection"); break; }
       continue;
     }
-    r = w_sock_closing(c) ? io_err(2, "connection is closed") : w_errno_io();
+    r = w_sock_closing(c) ? io_err(2, "connection is closed") : io_err(2, err);
     break;
   }
   free(buf);
@@ -2769,19 +2806,20 @@ static WIo Cap_conn_write(WCap *c, WStr *s) {
   int64_t off = 0;
   int held = 0, cancelled = 0;
   WIo r = io_ok(NULL);
+  char err[300];
   while (off < s->len) {
     if (w_sock_closing(c)) { r = io_err(2, "connection is closed"); break; }
-    ssize_t n = write(fd, s->data + off, (size_t)(s->len - off));
+    int dir = 1;
+    ssize_t n = w_conn_step(c, fd, 1, s->data + off, (size_t)(s->len - off), &dir, err, sizeof err);
     if (n >= 0) { off += n; continue; }
-    if (errno == EINTR) continue;
-    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+    if (n == -1) {
       if (!w_sock_claim(&c->writing, &held)) { r = io_err(2, "another task is already writing this connection"); break; }
-      int wr = w_wait_fd(fd, 1);
+      int wr = w_conn_wait(fd, 1, dir);
       if (wr == -2) { cancelled = 1; break; }
       if (wr < 0) { r = io_err(2, "another task is already writing this connection"); break; }
       continue;
     }
-    r = w_errno_io();
+    r = io_err(2, err);
     break;
   }
   w_sock_unclaim(&c->writing, held);
@@ -2789,6 +2827,87 @@ static WIo Cap_conn_write(WCap *c, WStr *s) {
   if (cancelled) w_cancel_unwind();
   return r;
 }
+
+/* ---------- TLS ----------
+   On the core in vela_tls.h, pasted ahead of this header (with VELA_TLS
+   defined) when a program can use TLS and OpenSSL was found. A TLS Conn is
+   a plain Conn whose reads and writes go through its session; waits park
+   the task on the poller exactly as for plain sockets. A server session
+   does its handshake inside the first read or write, so accept() never
+   waits for a slow client. */
+#ifdef VELA_TLS
+static void w_tls_release(WCap *c) {
+  if (c->kind == CAP_LISTENER) SSL_CTX_free((SSL_CTX *)c->tls);
+  else vtls_free((VTls *)c->tls);
+  c->tls = NULL;
+}
+static void w_tls_close_notify(WCap *c) { vtls_close_notify((VTls *)c->tls); }
+static int w_tls_step(WCap *c, int wr, char *buf, size_t n, int *dir, char *err, size_t en) {
+  int k = vtls_step((VTls *)c->tls, wr ? VTLS_WRITE : VTLS_READ, buf, n > (size_t)INT_MAX ? INT_MAX : (int)n, err, en);
+  if (k >= 0) return k;
+  if (k == VTLS_WANT_READ) { *dir = 0; return -1; }
+  if (k == VTLS_WANT_WRITE) { *dir = 1; return -1; }
+  return -2;
+}
+static int w_tls_accept(WCap *l, WCap *conn, WIo *r) {
+  char err[300];
+  conn->tls = vtls_new((SSL_CTX *)l->tls, conn->fd, 1, err, sizeof err);
+  if (conn->tls) return 1;
+  Cap_sock_close(conn); Cap_drop(conn);
+  *r = io_err(2, err);
+  return 0;
+}
+static WIo Cap_net_connect_tls(WCap *n, WStr *addr) {
+  char h[256]; int port;
+  if (!w_parse_addr(addr, h, sizeof h, &port)) return io_err(2, "address must be HOST:PORT");
+  WIo r = Cap_net_connect(n, addr);
+  if (r.kind != 0) return r;
+  WCap *c = (WCap *)r.ptr;
+  char err[300];
+  VTls *t = vtls_client(c->fd, h, err, sizeof err);
+  if (!t) { Cap_sock_close(c); Cap_drop(c); return io_err(2, err); }
+  c->tls = t;
+  for (;;) {
+    int k = vtls_step(t, VTLS_HANDSHAKE, NULL, 0, err, sizeof err);
+    if (k == 0) return io_ok_ptr(c);
+    if (k == VTLS_ERROR) { Cap_sock_close(c); Cap_drop(c); return io_err(2, err); }
+    int wr = w_wait_fd(c->fd, k == VTLS_WANT_WRITE);
+    if (wr == -2) { Cap_sock_close(c); Cap_drop(c); w_cancel_unwind(); }
+    if (wr < 0) { Cap_sock_close(c); Cap_drop(c); return io_err(2, "cannot wait on socket"); }
+  }
+}
+static WIo Cap_listen_on_tls(WCap *l, WStr *addr, WStr *cert, WStr *key) {
+  WIo r = Cap_listen_on(l, addr);
+  if (r.kind != 0) return r;
+  char err[300];
+  SSL_CTX *ctx = vtls_server_ctx(cert->data, (size_t)cert->len, key->data, (size_t)key->len, err, sizeof err);
+  WCap *c = (WCap *)r.ptr;
+  if (!ctx) { Cap_sock_close(c); Cap_drop(c); return io_err(2, err); }
+  c->tls = ctx;
+  return r;
+}
+#else
+#define W_NO_TLS "tls: this program was built without TLS (OpenSSL was not found when it was compiled)"
+static void w_tls_release(WCap *c) { c->tls = NULL; }
+static void w_tls_close_notify(WCap *c) { (void)c; }
+static int w_tls_step(WCap *c, int wr, char *buf, size_t n, int *dir, char *err, size_t en) {
+  (void)c; (void)wr; (void)buf; (void)n; (void)dir; snprintf(err, en, W_NO_TLS); return -2;
+}
+static int w_tls_accept(WCap *l, WCap *conn, WIo *r) { (void)l; (void)conn; (void)r; return 1; }
+static WIo Cap_net_connect_tls(WCap *n, WStr *addr) {
+  char h[256]; int port;
+  if (!w_parse_addr(addr, h, sizeof h, &port)) return io_err(2, "address must be HOST:PORT");
+  if (!net_permits(n, h, port)) { char m[400]; snprintf(m, sizeof m, "net: %s:%d is not granted", h, port); return io_err(1, m); }
+  return io_err(2, W_NO_TLS);
+}
+static WIo Cap_listen_on_tls(WCap *l, WStr *addr, WStr *cert, WStr *key) {
+  (void)cert; (void)key;
+  char h[256]; int port;
+  if (!w_parse_addr(addr, h, sizeof h, &port)) return io_err(2, "address must be HOST:PORT");
+  if (!net_permits(l, h, port)) { char m[400]; snprintf(m, sizeof m, "listen: %s:%d is not granted", h, port); return io_err(1, m); }
+  return io_err(2, W_NO_TLS);
+}
+#endif
 
 /* ---------- stdin ----------
    Read through the poller like a socket: a task waiting for input parks,
@@ -3026,7 +3145,7 @@ done:
    spaces and tabs, a repeated header's values joined with ", "; the body
    chunked if Transfer-Encoding mentions chunked, else Content-Length bytes
    if given, else everything until the server closes. Redirects are
-   returned, not followed. There is no TLS yet, so https is refused. */
+   returned, not followed. https goes over Net.connect_tls. */
 typedef struct { int64_t status; int n; WStr **names; WStr **values; WStr *body; } WHttp;
 #define W_MAX_RESPONSE ((int64_t)64 * 1024 * 1024)
 
@@ -3047,7 +3166,10 @@ static void w_http_free(WHttp *h) {
 }
 static WIo w_http_fail(WHttp *h, const char *m) { w_http_free(h); return io_err(2, m); }
 
-static WIo w_http_parse(const char *d, int64_t n) {
+/* cut: the TLS stream ended without a close message (this is its error
+   text), so a body that runs until the close may be incomplete and is
+   refused; one framed by Content-Length or chunks is checked as usual. */
+static WIo w_http_parse(const char *d, int64_t n, const char *cut) {
   /* bounded, so a hostile server cannot make the header merging quadratic */
   int64_t e = w_find_bytes(d, n < 65536 + 4 ? n : 65536 + 4, "\r\n\r\n", 0);
   if (e > 65536 || (e < 0 && n > 65536)) return io_err(2, "http: response headers larger than 64 KiB");
@@ -3145,7 +3267,8 @@ static WIo w_http_parse(const char *d, int64_t n) {
     if (!ok) return w_http_fail(h, "http: bad Content-Length");
     if (rn < len) return w_http_fail(h, "http: truncated body");
     h->body = Str_from(raw, len);
-  } else h->body = Str_from(raw, rn);
+  } else if (cut) return w_http_fail(h, cut);
+  else h->body = Str_from(raw, rn);
   return io_ok_ptr(h);
 }
 
@@ -3158,7 +3281,6 @@ static WIo Cap_net_get(WCap *n, WStr *url_s) {
     char m[700]; snprintf(m, sizeof m, "net: %s:%d is not granted", host, port);
     free(url); return io_err(1, m);
   }
-  if (https) { free(url); return io_err(2, "https is not supported yet (vela has no TLS); use an http:// URL"); }
   /* the request: the path without any #fragment, `/` if empty, `/?q` for a bare query */
   WBuf req; buf_init(&req);
   buf_puts(&req, "GET ");
@@ -3167,13 +3289,13 @@ static WIo Cap_net_get(WCap *n, WStr *url_s) {
   buf_putn(&req, path, (int64_t)pl);
   buf_puts(&req, " HTTP/1.1\r\nHost: ");
   buf_puts(&req, host);
-  if (port != 80) { char pb[16]; snprintf(pb, sizeof pb, ":%d", port); buf_puts(&req, pb); }
+  if (port != (https ? 443 : 80)) { char pb[16]; snprintf(pb, sizeof pb, ":%d", port); buf_puts(&req, pb); }
   buf_puts(&req, "\r\nUser-Agent: vela\r\nAccept: */*\r\nConnection: close\r\n\r\n");
   WStr *reqs = buf_take(&req);
   char addr[600]; snprintf(addr, sizeof addr, "%s:%d", host, port);
   free(url);
   WStr *addrs = Str_from(addr, (int64_t)strlen(addr));
-  WIo c = Cap_net_connect(n, addrs);
+  WIo c = https ? Cap_net_connect_tls(n, addrs) : Cap_net_connect(n, addrs);
   Str_drop(addrs);
   if (c.kind != 0) { Str_drop(reqs); return c; }
   WCap *conn = (WCap *)c.ptr;
@@ -3183,11 +3305,18 @@ static WIo Cap_net_get(WCap *n, WStr *url_s) {
     WBuf b; buf_init(&b);
     for (;;) {
       WIo k = Cap_conn_read(conn);
+#ifdef VELA_TLS
+      if (k.kind != 0 && https && k.msg->len == (int64_t)strlen(VTLS_CUT_MSG) && memcmp(k.msg->data, VTLS_CUT_MSG, strlen(VTLS_CUT_MSG)) == 0) {
+        r = w_http_parse(b.p, b.len, VTLS_CUT_MSG);
+        Str_drop(k.msg);
+        break;
+      }
+#endif
       if (k.kind != 0) { r = k; break; }
       int64_t got = k.val->len;
       buf_putn(&b, k.val->data, got);
       Str_drop(k.val);
-      if (got == 0) { r = w_http_parse(b.p, b.len); break; }
+      if (got == 0) { r = w_http_parse(b.p, b.len, NULL); break; }
       if (b.len > W_MAX_RESPONSE) { r = io_err(2, "net: the response is larger than 64 MiB"); break; }
     }
     free(b.p);
