@@ -11,6 +11,7 @@ usage:
   vela explain CODE
   vela test FILE [--native]
   vela fmt FILE... [--write | --check]
+  vela doc FILE|MODULE... [--std] [--all] [--html] [-o OUT]
   vela lsp                (language server on stdin/stdout)
   vela mcp                (MCP server for coding agents, on stdin/stdout)
   vela spec               (print the language specification)
@@ -172,6 +173,34 @@ let cmd_fmt files mode =
     exit 1
   end
 
+(* vela doc: Markdown (or with --html, one static page) from doc comments. *)
+let cmd_doc args =
+  let rec go srcs std all html out = function
+    | "--std" :: r -> go srcs true all html out r
+    | "--all" :: r -> go srcs std true html out r
+    | "--html" :: r -> go srcs std all true out r
+    | "-o" :: o :: r -> go srcs std all html (Some o) r
+    | "-o" :: [] -> die_usage "-o needs a file"
+    | a :: _ when String.length a > 1 && a.[0] = '-' -> die_usage ("unknown doc option " ^ a)
+    | a :: r -> go (srcs @ [ a ]) std all html out r
+    | [] -> (srcs, std, all, html, out)
+  in
+  let srcs, std, all, html, out = go [] false false false None args in
+  let srcs = srcs @ if std then Doc.std_names () else [] in
+  if srcs = [] then die_usage "doc needs a FILE, a standard library module name, or --std";
+  let mods =
+    List.map
+      (fun a ->
+        try Doc.load ~all a with
+        | Sys_error m -> prerr_endline ("vela: " ^ m); exit 2
+        | Diag.Fatal d -> prerr_string (Diag.render d); exit 1)
+      srcs
+  in
+  let text = if html then Doc.html mods else Doc.markdown mods in
+  match out with
+  | Some o -> Out_channel.with_open_bin o (fun oc -> output_string oc text)
+  | None -> print_string text
+
 let cmd_check file json =
   let _, diags, _ = load file in
   if json then print_endline (Diag.list_to_json diags)
@@ -278,6 +307,7 @@ let () =
   | [ "spec" ] -> print_string Spec_text.text
   | [ "test"; file ] -> cmd_test file false
   | [ "test"; file; "--native" ] | [ "test"; "--native"; file ] -> cmd_test file true
+  | "doc" :: rest -> cmd_doc rest
   | "fmt" :: rest -> (
     let mode = if List.mem "--write" rest then `Write else if List.mem "--check" rest then `Check else `Print in
     match List.filter (fun a -> a <> "--write" && a <> "--check") rest with

@@ -27,6 +27,7 @@ fn parse_names(body: Str) -> List[Str] {   // no capabilities: cannot do I/O
 ## 2. Lexical structure
 
 - **Comments:** `//` to the end of the line. There are no block comments.
+- **Doc comments:** the `//` lines directly above an item, a struct field, an enum variant or an interface method, with no blank line in between, document it. The comment block at the very top of a file, followed by a blank line, documents the module. `vela doc` reads them; there is no special marker.
 - **Identifiers:** `[A-Za-z_][A-Za-z0-9_]*`. By convention types and enum variants start with an uppercase letter, everything else lowercase. Patterns rely on this (section 7).
 - **Keywords:** `fn let mut if else match for in while return struct enum true false group break continue`.
 - **Integers:** decimal digits, `_` allowed as a separator (`1_000_000`). A literal must fit in 64 bits: up to `9223372036854775807` (E0005).
@@ -899,8 +900,25 @@ tuplepat   = "(" pattern "," pattern { "," pattern } ")" ;
 ## 17. Tools
 
 - `vela fmt FILE` prints the canonical formatting (`--write` rewrites, `--check` verifies).
-- `vela lsp` is a language server; `vela mcp` is an MCP server exposing check, run, test, format, caps, type-at and the spec to coding agents.
+- `vela lsp` is a language server (diagnostics, hover, definition, references, rename, completion, quick fixes, outline); `vela mcp` is an MCP server exposing check, run, test, format, caps, type-at, references, rename and the spec to coding agents. Rename is refused when it is unsafe: the renamed program must check with no new errors, and the new name must refer to exactly the renamed places.
 - `vela caps FILE` lists each function's authority; `vela explain CODE` explains an error.
+- `vela doc FILE|MODULE... [--std] [--all] [--html] [-o OUT]` prints documentation built from doc comments (section 2) and signatures, as Markdown, or with `--html` as one static page. An argument that is not a file names a standard library module; `--std` documents all of them. It lists `pub` items (everything with `--all`); methods appear under their type, and methods on a type the module does not declare (such as `Str`) get their own section. Files are parsed, not type-checked.
+
+```vela
+// Geometry helpers.
+
+// A point on the plane.
+pub struct Point {
+    // Distance from the left edge.
+    x: Float,
+    y: Float,
+}
+
+// How far `self` is from the origin.
+pub fn norm(self: Point) -> Float {
+    (self.x * self.x + self.y * self.y).sqrt()
+}
+```
 
 ## 18. Modules and packages
 

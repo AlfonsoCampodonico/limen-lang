@@ -128,49 +128,180 @@ let sanitize = [ "-O1"; "-g"; "-fsanitize=address,undefined"; "-fno-sanitize-rec
 
 let read_file p = In_channel.with_open_bin p In_channel.input_all
 
+(* ---------- running native builds in parallel ----------
+
+   Compiling with a sanitizer and running the result is most of the suite's
+   time, and each program is independent (sockets use port 0), so they run as
+   background jobs, VELA_JOBS at a time (default: one per core). The C source
+   is generated here, in order; the job compiles it and runs the binary, and a
+   callback checks the result when it ends. [drain] waits for all of them
+   before the summary.
+
+   Compiled binaries are cached by a digest of the compiler, its flags and the
+   C source, in $VELA_CACHE/test-native (default ~/.cache/vela), so a run that
+   changes no generated C compiles nothing. VELA_TEST_CACHE=0 turns it off.
+   Entries unused for a week are removed. *)
+
+let jobs_max =
+  match Option.bind (Sys.getenv_opt "VELA_JOBS") int_of_string_opt with
+  | Some n when n > 0 -> n
+  | _ -> (
+    try
+      let ic = Unix.open_process_in "getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null" in
+      let n = Option.bind (In_channel.input_line ic) (fun l -> int_of_string_opt (String.trim l)) in
+      ignore (Unix.close_process_in ic);
+      match n with Some n when n > 0 -> n | _ -> 4
+    with _ -> 4)
+
+let running : (int * (int -> unit)) list ref = ref []
+
+(* VELA_TEST_SLOW=1 lists the slowest jobs at the end. *)
+let job_times : (float * string) list ref = ref []
+let job_started : (int, float * string) Hashtbl.t = Hashtbl.create 64
+
+(* Wait for one job to end and run its callback with the exit code. *)
+let reap () =
+  let rec poll () =
+    let done_ =
+      List.find_map
+        (fun (pid, k) ->
+          match Unix.waitpid [ Unix.WNOHANG ] pid with
+          | 0, _ -> None
+          | _, Unix.WEXITED c -> Some (pid, k, c)
+          | _, (Unix.WSIGNALED s | Unix.WSTOPPED s) -> Some (pid, k, 128 + abs s)
+          | exception Unix.Unix_error (Unix.EINTR, _, _) -> None)
+        !running
+    in
+    match done_ with
+    | Some (pid, k, c) ->
+      running := List.filter (fun (p, _) -> p <> pid) !running;
+      (match Hashtbl.find_opt job_started pid with
+       | Some (t0, what) -> job_times := (Unix.gettimeofday () -. t0, what) :: !job_times; Hashtbl.remove job_started pid
+       | None -> ());
+      k c
+    | None -> Unix.sleepf 0.002; poll ()
+  in
+  poll ()
+
+let devnull = Unix.openfile "/dev/null" [ Unix.O_RDONLY ] 0
+
+(* Run shell command [cmd] as a job; [k] gets its exit status. *)
+let spawn cmd k =
+  while List.length !running >= jobs_max do reap () done;
+  let pid = Unix.create_process "/bin/sh" [| "/bin/sh"; "-c"; cmd |] devnull Unix.stdout Unix.stderr in
+  Hashtbl.replace job_started pid (Unix.gettimeofday (), cmd);
+  running := (pid, k) :: !running
+
+let drain () =
+  while !running <> [] do reap () done;
+  if Sys.getenv_opt "VELA_TEST_SLOW" <> None then
+    List.iteri
+      (fun i (t, cmd) ->
+        if i < 25 then
+          let exe = match String.split_on_char ';' cmd with _ :: _ -> (match List.rev (String.split_on_char '/' (List.hd (List.rev (String.split_on_char ';' cmd)))) with x :: _ -> x | [] -> cmd) | [] -> cmd in
+          Printf.eprintf "%6.2fs %s\n" t (String.sub exe 0 (min 80 (String.length exe))))
+      (List.sort (fun (a, _) (b, _) -> compare b a) !job_times)
+
+let cache_dir =
+  if Sys.getenv_opt "VELA_TEST_CACHE" = Some "0" then None
+  else
+    let base =
+      match Sys.getenv_opt "VELA_CACHE" with
+      | Some d when d <> "" -> Some d
+      | _ -> Option.map (fun h -> Filename.concat (Filename.concat h ".cache") "vela") (Sys.getenv_opt "HOME")
+    in
+    match base with
+    | None -> None
+    | Some base ->
+      let d = Filename.concat base "test-native" in
+      (try ignore (Sys.command (sprintf "mkdir -p %s" (Filename.quote d))) with _ -> ());
+      if Sys.file_exists d then Some d else None
+
+(* The compiler's identity, so a new compiler does not reuse old binaries. *)
+let cc_version =
+  lazy
+    (try
+       let ic = Unix.open_process_in (Native.cc () ^ " --version 2>/dev/null") in
+       let v = In_channel.input_all ic in
+       ignore (Unix.close_process_in ic);
+       v
+     with _ -> "")
+
+let () =
+  (* forget binaries nobody used for a week *)
+  match cache_dir with
+  | Some d -> ignore (Sys.command (sprintf "find %s -type f -mtime +7 -delete 2>/dev/null" (Filename.quote d)))
+  | None -> ()
+
+(* Build [items] into [exe] with [flags] and then run [run_cmd] (which
+   redirects the program's output itself), in the background. [k] gets
+   Ok (exit status) or Error (compiler output). *)
+(* A fresh path in tmpdir for a binary of test [name]: jobs run at the same
+   time, so two runs of one name must not share files. *)
+let job_count = ref 0
+let exe_path name = incr job_count; Filename.concat tmpdir (sprintf "%s-%d" name !job_count)
+
+let native_job ?tests ~flags items exe run_cmd (k : (int, string) result -> unit) =
+  let c_text = Native.c_source ?tests items in
+  let c_file = exe ^ ".c" in
+  Out_channel.with_open_bin c_file (fun oc -> output_string oc c_text);
+  let argv = Native.command ~flags c_file exe in
+  let log = exe ^ ".cc" in
+  let q = Filename.quote in
+  let compile = String.concat " " (List.map q argv) ^ " >" ^ q log ^ " 2>&1" in
+  let build =
+    match cache_dir with
+    | None -> compile
+    | Some d ->
+      (* the paths differ from run to run; the command around them does not *)
+      let shape = Native.command ~flags "prog.c" "prog" in
+      let key = Digest.to_hex (Digest.string (String.concat "\000" (Lazy.force cc_version :: shape @ [ c_text ]))) in
+      let cached = Filename.concat d key in
+      (* a hit is copied (and touched, so it stays); a miss is compiled and stored *)
+      sprintf "if [ -f %s ]; then touch %s && cp %s %s; else %s && cp %s %s.$$ && mv -f %s.$$ %s; fi" (q cached) (q cached) (q cached) (q exe)
+        compile (q exe) (q cached) (q cached) (q cached)
+  in
+  let failed = exe ^ ".ccfailed" in
+  (try Sys.remove failed with Sys_error _ -> ());
+  spawn (sprintf "( %s ) || { : > %s; exit 1; }; %s" build (q failed) run_cmd) (fun code ->
+      if Sys.file_exists failed then k (Error (try read_file log with Sys_error _ -> "")) else k (Ok code))
+
+let grant_args (grants : Interp.grants) =
+  List.concat_map (fun h -> [ "--grant"; "net=" ^ h ]) grants.net
+  @ List.concat_map (fun h -> [ "--grant"; "listen=" ^ h ]) grants.listen
+  @ List.concat_map (fun n -> [ "--grant"; "env=" ^ n ]) grants.env
+  @ List.concat_map (fun n -> [ "--grant"; "exec=" ^ n ]) grants.exec
+  @ (match grants.seed with Some s -> [ "--seed"; string_of_int s ] | None -> [])
+  @ (match grants.fs with Some (d, ro) -> [ "--grant"; "fs=" ^ d ^ if ro then ":ro" else "" ] | None -> [])
+
 (* With [feed], stdin comes from that shell command, and the program runs on
-   one worker thread, so a task that blocked its thread would stall the rest. *)
-let run_native ?(grants = Interp.no_grants) ?modules ?feed name src =
+   one worker thread, so a task that blocked its thread would stall the rest.
+   [k] gets Ok (exit status, stdout, stderr) or Error. *)
+let run_native ?(grants = Interp.no_grants) ?modules ?feed name src k =
   let items, ds, _ = compile ?modules name src in
-  if ds <> [] then Error "does not compile" else
-  let exe = Filename.concat tmpdir name in
-  match Native.build ~flags:sanitize items exe with
-  | Error m -> Error ("C compile failed:\n" ^ m)
-  | Ok () ->
-    let args =
-      List.concat_map (fun h -> [ "--grant"; "net=" ^ h ]) grants.Interp.net
-      @ List.concat_map (fun h -> [ "--grant"; "listen=" ^ h ]) grants.Interp.listen
-      @ List.concat_map (fun n -> [ "--grant"; "env=" ^ n ]) grants.Interp.env
-      @ List.concat_map (fun n -> [ "--grant"; "exec=" ^ n ]) grants.Interp.exec
-      @ (match grants.seed with Some s -> [ "--seed"; string_of_int s ] | None -> [])
-      @ (match grants.fs with Some (d, ro) -> [ "--grant"; "fs=" ^ d ^ if ro then ":ro" else "" ] | None -> [])
-      @ ("--" :: grants.args)
-    in
-    let o = exe ^ ".out" and e = exe ^ ".err" in
-    let cmd =
-      String.concat " " (List.map Filename.quote (exe :: args))
-      ^ sprintf " >%s 2>%s" (Filename.quote o) (Filename.quote e)
-    in
-    let env = "ASAN_OPTIONS=detect_leaks=0 VELA_LEAKCHECK=1 " in
-    let code =
-      match feed with
-      | None -> Sys.command (env ^ cmd)
-      | Some f -> Sys.command (sprintf "(%s) | %sVELA_THREADS=1 %s" f env cmd)
-    in
-    Ok (code, read_file o, read_file e)
+  if ds <> [] then k (Error "does not compile") else
+  let exe = exe_path name in
+  let args = grant_args grants @ ("--" :: grants.Interp.args) in
+  let o = exe ^ ".out" and e = exe ^ ".err" in
+  let cmd = String.concat " " (List.map Filename.quote (exe :: args)) ^ sprintf " >%s 2>%s" (Filename.quote o) (Filename.quote e) in
+  let env = "ASAN_OPTIONS=detect_leaks=0 VELA_LEAKCHECK=1 " in
+  let run_cmd = match feed with None -> env ^ cmd | Some f -> sprintf "(%s) | %sVELA_THREADS=1 %s" f env cmd in
+  native_job ~flags:sanitize items exe run_cmd (function
+    | Error m -> k (Error ("C compile failed:\n" ^ m))
+    | Ok code -> k (Ok (code, read_file o, read_file e)))
 
 let check_native name ?grants ?modules ?feed src ~want_out ~want_err_prefix =
   if native_for name then
-    match run_native ?grants ?modules ?feed name src with
-    | Error m -> ok (name ^ "/native") false m
-    | Ok (code, o, e) -> (
-      ok (name ^ "/native") (o = want_out) (sprintf "stdout %S, want %S (stderr %S)" o want_out e);
-      match want_err_prefix with
-      | None ->
-        ok (name ^ "/native-clean")
-          (code = 0 && e = "vela-leakcheck: 0 live\n")
-          (sprintf "exit %d, stderr %S" code e)
-      | Some p -> ok (name ^ "/native-panic") (String.starts_with ~prefix:p e) (sprintf "stderr %S" e))
+    run_native ?grants ?modules ?feed name src (function
+      | Error m -> ok (name ^ "/native") false m
+      | Ok (code, o, e) -> (
+        ok (name ^ "/native") (o = want_out) (sprintf "stdout %S, want %S (stderr %S)" o want_out e);
+        match want_err_prefix with
+        | None ->
+          ok (name ^ "/native-clean")
+            (code = 0 && e = "vela-leakcheck: 0 live\n")
+            (sprintf "exit %d, stderr %S" code e)
+        | Some p -> ok (name ^ "/native-panic") (String.starts_with ~prefix:p e) (sprintf "stderr %S" e)))
 
 (* Concurrency: the same program again under ThreadSanitizer. *)
 let tsan = [ "-O1"; "-g"; "-fsanitize=thread" ]
@@ -178,12 +309,9 @@ let tsan = [ "-O1"; "-g"; "-fsanitize=thread" ]
 let check_tsan name ?(grants = Interp.no_grants) ?feed src want =
   if native_for name && selected name then begin
     let items, ds, _ = compile name src in
-    let exe = Filename.concat tmpdir (name ^ "-tsan") in
+    let exe = exe_path (name ^ "-tsan") in
     if ds <> [] then ok (name ^ "/tsan") false "does not compile"
-    else
-    match Native.build ~flags:tsan items exe with
-    | Error m -> ok (name ^ "/tsan") false ("C compile failed:\n" ^ m)
-    | Ok () ->
+    else begin
       let args =
         (match grants.Interp.fs with Some (d, ro) -> [ "--grant"; "fs=" ^ d ^ if ro then ":ro" else "" ] | None -> [])
         @ List.concat_map (fun h -> [ "--grant"; "net=" ^ h ]) grants.Interp.net
@@ -195,11 +323,15 @@ let check_tsan name ?(grants = Interp.no_grants) ?feed src want =
         String.concat " " (List.map Filename.quote (exe :: args)) ^ sprintf " >%s 2>%s" (Filename.quote o) (Filename.quote e)
       in
       let env = "TSAN_OPTIONS=halt_on_error=1 VELA_THREADS=8 VELA_LEAKCHECK=1 " in
-      let code = match feed with None -> Sys.command (env ^ cmd) | Some f -> Sys.command (sprintf "(%s) | %s%s" f env cmd) in
-      let o = read_file o and e = read_file e in
-      ok (name ^ "/tsan")
-        (code = 0 && o = want && e = "vela-leakcheck: 0 live\n")
-        (sprintf "exit %d, stdout %S, stderr %S" code o e)
+      let run_cmd = match feed with None -> env ^ cmd | Some f -> sprintf "(%s) | %s%s" f env cmd in
+      native_job ~flags:tsan items exe run_cmd (function
+        | Error m -> ok (name ^ "/tsan") false ("C compile failed:\n" ^ m)
+        | Ok code ->
+          let o = read_file o and e = read_file e in
+          ok (name ^ "/tsan")
+            (code = 0 && o = want && e = "vela-leakcheck: 0 live\n")
+            (sprintf "exit %d, stdout %S, stderr %S" code o e))
+    end
   end
 
 let out name ?grants ?modules ?feed src want =
@@ -232,13 +364,13 @@ let exits name ?grants src want_out want_code =
      ok name (got = want_out && code = want_code) (sprintf "got %S exit %d, want %S exit %d" got code want_out want_code)
    | Error e -> ok name false e);
   if native_for name then
-    match run_native ?grants name src with
-    | Error m -> ok (name ^ "/native") false m
-    | Ok (code, o, e) ->
-      ok (name ^ "/native")
-        (o = want_out && code = want_code
-         && (String.ends_with ~suffix:"vela-leakcheck: 0 live\n" e || String.starts_with ~prefix:"error: " e))
-        (sprintf "stdout %S exit %d stderr %S, want %S exit %d" o code e want_out want_code)
+    run_native ?grants name src (function
+      | Error m -> ok (name ^ "/native") false m
+      | Ok (code, o, e) ->
+        ok (name ^ "/native")
+          (o = want_out && code = want_code
+           && (String.ends_with ~suffix:"vela-leakcheck: 0 live\n" e || String.starts_with ~prefix:"error: " e))
+          (sprintf "stdout %S exit %d stderr %S, want %S exit %d" o code e want_out want_code))
 
 (* Apply every fix's edits and return the new source. *)
 let apply_fixes src (ds : Diag.t list) =
@@ -1284,7 +1416,8 @@ fn main(root: Root) {
     J.to_str (J.path (result (Lsp.handle st (req "textDocument/hover" (tdp text needle ?nth k)))) [ "contents"; "value" ])
   in
   ok "lsp-hover-let" (hover doc "total = " 0 = "```vela\nlet total: Int\n```") (hover doc "total = " 0);
-  ok "lsp-hover-call" (hover doc "dist(pt)" 0 = "```vela\nfn(Point) -> Int\n```") (hover doc "dist(pt)" 0);
+  (* a call shows the function's declaration (and its doc comment, if any) *)
+  ok "lsp-hover-call" (hover doc "dist(pt)" 0 = "```vela\nfn dist(p: Point) -> Int\n```") (hover doc "dist(pt)" 0);
   ok "lsp-hover-method" (hover doc "print(\"{" 0 = "```vela\nprint(Str) -> ()\n```") (hover doc "print(\"{" 0);
   ok "lsp-hover-fn" (hover doc "dist(p" 0 = "```vela\nfn dist(p: Point) -> Int\n```") (hover doc "dist(p" 0);
   let def text needle ?nth k =
@@ -3052,6 +3185,103 @@ fn main(root: Root) {
   let _, ds, _ = Modules.load_and_check "std-http.vela" "use http\nuse json\n\nfn main(root: Root) {\n    root.stdout.print(http.reason(200))\n}\n" in
   ok "std-real-ok" (ds = []) (String.concat "; " (List.map (fun (d : Diag.t) -> d.code ^ " " ^ d.message) ds));
 
+  (* find references and rename on real programs: renaming every function,
+     struct, enum and variant of each example must be accepted (a missed
+     reference would make the renamed program fail to check), and the result
+     must check cleanly *)
+  let refs_failures = ref [] and renamed = ref 0 in
+  Array.iter
+    (fun f ->
+      if Filename.check_suffix f ".vela" then begin
+        let path = Filename.concat "../examples" f in
+        let src = In_channel.with_open_bin path In_channel.input_all in
+        let load overrides =
+          Modules.overlay := List.filter (fun (p, _) -> p <> path) overrides;
+          let text = Option.value ~default:src (List.assoc_opt path overrides) in
+          let r = Lsp.load_program path text in
+          Modules.overlay := [];
+          r
+        in
+        match load [] with
+        | [], _ -> ()
+        | items, ds when ds = [] ->
+          let occs = Refs.index items in
+          List.iter
+            (fun (o : Refs.occ) ->
+              if o.def && o.sp.file = path && (match o.key.[0] with 'f' | 't' | 'v' | 'd' -> true | _ -> false) && o.key <> "f:main" then begin
+                let items, _ = load [] in
+                let nw = if o.name.[0] >= 'A' && o.name.[0] <= 'Z' then o.name ^ "Renamed" else o.name ^ "_renamed" in
+                match Refs.rename ~load items path o.sp.lo nw with
+                | Ok files ->
+                  incr renamed;
+                  let text = Refs.apply_edits src (List.concat_map snd (List.filter (fun (p, _) -> p = path) files)) in
+                  (match load [ (path, text) ] with
+                   | _, [] -> ()
+                   | _, d :: _ -> refs_failures := (f ^ " " ^ o.key ^ ": " ^ d.message) :: !refs_failures)
+                | Error m when Interp_util.find_sub m "interface" 0 <> None -> ()
+                | Error m -> refs_failures := (f ^ " " ^ o.key ^ ": " ^ m) :: !refs_failures
+              end)
+            occs
+        | _ -> ()
+      end)
+    (if Sys.file_exists "../examples" then Sys.readdir "../examples" else [||]);
+  ok "refs-rename-examples" (!refs_failures = [] && (!renamed > 50 || not (Sys.file_exists "../examples"))) (sprintf "%d renamed; %s" !renamed (String.concat "\n" (List.rev !refs_failures)));
+
+  (* vela doc: doc comments directly above items, fields, variants and interface methods *)
+  let doc_src =
+    "// Geometry helpers.\n//\n// Second paragraph.\n\n// A point.\npub struct Point {\n    // Distance from the left.\n    x: Float,\n    y: Float,\n}\n\n// not a doc: a blank line follows\n\n// How far from the origin.\npub fn norm(self: Point) -> Float {\n    self.x\n}\n\npub enum Shape {\n    // A round one.\n    Circle(Float),\n    Dot,\n}\n\n// Things with an area.\npub interface Area {\n    // The area, in square units.\n    fn area(self) -> Float\n}\n\n// Shouts.\npub fn loud(self: Str) -> Str {\n    self.upper()\n}\n\n// Private.\nfn hidden() -> Int {\n    1\n}\n\npub fn pick[T: Area](xs: List[T], i: Int) -> T {\n    xs[i]\n}\n"
+  in
+  let md = Doc.load_source "geom" "geom.vela" doc_src in
+  let mdtext = Doc.markdown [ md ] in
+  let has s = Interp_util.find_sub mdtext s 0 <> None in
+  ok "doc-markdown"
+    (has "# Module `geom`\n\nGeometry helpers.\n\nSecond paragraph.\n"
+     && has "### struct `Point`\n\n```vela\npub struct Point {\n    x: Float,\n    y: Float,\n}\n```\n\nA point.\n\n- `x`: Distance from the left.\n"
+     && has "#### Methods\n\n```vela\npub fn norm(self: Point) -> Float\n```\n\nHow far from the origin.\n"
+     && has "- `Circle`: A round one.\n" && has "Things with an area.\n\n- `area`: The area, in square units.\n"
+     && has "## Methods on `Str`\n\n```vela\npub fn loud(self: Str) -> Str\n```\n\nShouts.\n"
+     && has "pub fn pick[T: Area](xs: List[T], i: Int) -> T\n"
+     && (not (has "hidden")) && not (has "not a doc"))
+    mdtext;
+  let all = Doc.markdown [ Doc.load_source ~all:true "geom" "geom.vela" doc_src ] in
+  ok "doc-all" (Interp_util.find_sub all "fn hidden() -> Int\n```\n\nPrivate.\n" 0 <> None) all;
+  let page = Doc.html [ md ] in
+  let hp s = Interp_util.find_sub page s 0 <> None in
+  ok "doc-html"
+    (hp "<!doctype html>" && hp "<p>How far from the origin.</p>" && hp "<h2>Methods on Str</h2>"
+     && hp "id=\"geom-Point\"" && hp "pick[T: Area](xs: List[T], i: Int) -&gt; T" && hp "<p>Geometry helpers.</p>\n<p>Second paragraph.</p>")
+    page;
+  (* every standard library module documents without error, and its functions have docs *)
+  let std = List.map (fun n -> Doc.load n) (Doc.std_names ()) in
+  let std_md = Doc.markdown std in
+  ok "doc-std" (List.length std = List.length !Modules.std_modules && Interp_util.find_sub std_md "pub fn sort_by[T]" 0 <> None) std_md;
+
+  (* comments inside an expression stay where they were written *)
+  let fmt_case name src want =
+    let got = try Fmt.format ~file:(name ^ ".vela") src with Diag.Fatal d -> "error: " ^ d.message in
+    ok name (got = want) (sprintf "got:\n%s\nwant:\n%s" got want);
+    check_fmt name src ()
+  in
+  let canonical name src = fmt_case name src src in
+  canonical "fmt-comment-chain"
+    "fn main(root: Root) {\n    let n = [1, 2, 3]\n        // keep the odd ones\n        .filter(|x| x % 2 == 1)  // odd\n        .map(|x| x * 10)\n    root.stdout.print(\"{n}\")\n}\n";
+  canonical "fmt-comment-list-end"
+    "fn main(root: Root) {\n    let xs = [\n        1,\n        2,\n        // more later\n    ]\n    root.stdout.print(\"{xs}\")\n}\n";
+  canonical "fmt-comment-call-end"
+    "fn add(a: Int, b: Int) -> Int {\n    a + b\n}\n\nfn main(root: Root) {\n    let s = add(\n        1,\n        2,  // two\n        // that is all\n    )\n    root.stdout.print(\"{s}\")\n}\n";
+  fmt_case "fmt-comment-args"
+    "fn add(a: Int, b: Int) -> Int {\n    a + b\n}\n\nfn main(root: Root) {\n    let s = add(1, // one\n        2)\n    root.stdout.print(\"{s}\")\n}\n"
+    "fn add(a: Int, b: Int) -> Int {\n    a + b\n}\n\nfn main(root: Root) {\n    let s = add(\n        1,  // one\n        2,\n    )\n    root.stdout.print(\"{s}\")\n}\n";
+  fmt_case "fmt-comment-binary"
+    "fn main(root: Root) {\n    let t = 1 + // first\n      2 * // second\n      3\n    root.stdout.print(\"{t}\")\n}\n"
+    "fn main(root: Root) {\n    let t = 1 +  // first\n        2 *  // second\n        3\n    root.stdout.print(\"{t}\")\n}\n";
+  fmt_case "fmt-comment-struct"
+    "struct P {\n    x: Int,\n    y: Int,\n}\n\nfn main(root: Root) {\n    let p = P { x: 1, // the x\n        y: 2 }\n    root.stdout.print(\"{p.x}\")\n}\n"
+    "struct P {\n    x: Int,\n    y: Int,\n}\n\nfn main(root: Root) {\n    let p = P {\n        x: 1,  // the x\n        y: 2,\n    }\n    root.stdout.print(\"{p.x}\")\n}\n";
+  fmt_case "fmt-comment-closure"
+    "fn main(root: Root) {\n    let f = |x: Int| // add one\n        x + 1\n    root.stdout.print(\"{f(1)}\")\n}\n"
+    "fn main(root: Root) {\n    let f = |x: Int|  // add one\n        x + 1\n    root.stdout.print(\"{f(1)}\")\n}\n";
+
   ok "fmt-use-pub"
     (Fmt.format ~file:"fu.vela" "use geom // g\npub   fn f() -> Int { 1 }\npub struct S { a: Int }\n"
      = "use geom  // g\n\npub fn f() -> Int { 1 }\n\npub struct S {\n    a: Int,\n}\n")
@@ -3074,7 +3304,8 @@ fn main(root: Root) {
     [ "../examples"; "../bench" ];
   ok "fmt-every-program" (!fmt_failures = [])
     (String.concat "\n\n" (List.map (fun (n, m) -> n ^ ": " ^ m) (List.rev !fmt_failures)));
-  ok "fmt-checked-count" (Hashtbl.length fmt_checked > 90 || Sys.getenv_opt "VELA_ONLY" <> None) (string_of_int (Hashtbl.length fmt_checked));
+  ok "fmt-checked-count" (Hashtbl.length fmt_checked > 90 || Sys.getenv_opt "VELA_TEST_ONLY" <> None) (string_of_int (Hashtbl.length fmt_checked));
 
+  drain ();
   Printf.printf "%d/%d passed\n" (!total - !failed) !total;
   if !failed > 0 then exit 1
