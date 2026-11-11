@@ -49,8 +49,9 @@ type value =
   | VCtor of string * string
   | VPanicFn
   | VCap of cap
-  | VGroup of (value, string * Span.t) result option ref list ref
-      (* outcomes of spawned tasks, newest first: a value, or the panic that ended the task *)
+  | VGroup of (bool * (value, string * Span.t) result option ref) list ref
+      (* spawned tasks, newest first: whether the result goes in the group's
+         list, and the outcome: a value, or the panic that ended the task *)
   | VChan of chan
   | VChanFn
   | VBuiltin of string (* assert, assert_eq *)
@@ -650,10 +651,10 @@ let rec eval rt env e : value =
     Hashtbl.replace sc name (ref (VGroup tasks));
     ignore (eval_block rt (sc :: env) b);
     let results = List.rev !tasks in
-    wait_until (fun () -> List.for_all (fun r -> !r <> None) results);
+    wait_until (fun () -> List.for_all (fun (_, r) -> !r <> None) results);
     (* a panic ended only its task; the group passes the first one on *)
-    List.iter (fun r -> match !r with Some (Error (m, s)) -> raise (Panic (m, s)) | _ -> ()) results;
-    VList (Array.of_list (List.map (fun r -> match !r with Some (Ok v) -> v | _ -> VUnit) results))
+    List.iter (fun (_, r) -> match !r with Some (Error (m, s)) -> raise (Panic (m, s)) | _ -> ()) results;
+    VList (Array.of_list (List.filter_map (fun (keep, r) -> if not keep then None else match !r with Some (Ok v) -> Some v | _ -> Some VUnit) results))
 
 and eval_var rt env n sp =
   match find_var env n with
@@ -878,9 +879,9 @@ and call_method rt v name args sp =
   | VEnum ("Result", vn, _), "is_err", [] -> VBool (vn = "Err")
   | VEnum ("Result", "Err", [ e ]), "map_err", [ f ] -> VEnum ("Result", "Err", [ call f [ e ] ])
   | (VEnum ("Result", _, _) as r), "map_err", [ _ ] -> r
-  | VGroup r, "go", [ c ] ->
+  | VGroup r, (("go" | "#go") as go), [ c ] ->
     let res = ref None in
-    r := res :: !r;
+    r := (go = "go", res) :: !r;
     spawn_fiber (fun () -> res := Some (try Ok (apply rt c [] sp) with Panic (m, s) -> Error (m, s)));
     VUnit
   | VChan ch, "send", [ v ] ->

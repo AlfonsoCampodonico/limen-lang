@@ -248,11 +248,12 @@ let rec lower f (e : expr) : I.atom =
       let x = lower f a in
       emit f (I.Mutate (v, steps, I.MPush x));
       I.AUnit
-    | EMethod (recv, "go", _, [ task ]) when (match tyof f recv with TGroup _ -> true | _ -> false) ->
+    | EMethod (recv, (("go" | "#go") as go), _, [ task ]) when (match tyof f recv with TGroup _ -> true | _ -> false) ->
       let g = lower f recv in
       let c = lower f task in
-      let t = match tyof f recv with TGroup t -> t | _ -> TUnit in
-      ignore (tmp f TUnit (I.Spawn (g, c, t)));
+      let keep = go = "go" in
+      let t = match tyof f recv with TGroup t when keep -> t | _ -> TUnit in
+      ignore (tmp f TUnit (I.Spawn (g, c, t, keep)));
       I.AUnit
     | EMethod (recv, "send", _, [ v ]) when (match tyof f recv with TChan _ -> true | _ -> false) ->
       let c = lower f recv in

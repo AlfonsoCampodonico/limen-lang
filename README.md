@@ -108,7 +108,7 @@ The standard library is written in Vela: `json` (parse, stringify, field access)
 
 Tasks are fibers: small stacks scheduled by worker threads, one per core, with work stealing. A task waiting on a group, a channel or a socket parks without blocking a thread. If every task is waiting and nothing can wake one, the program panics with a deadlock message instead of hanging.
 
-A `group` block starts tasks with `g.go(closure)` and evaluates to the list of their results, in the order they were started. Every task has finished when the block ends, so nothing outlives it.
+A `group` block starts tasks with `g.go(closure)` and evaluates to the list of their results, in the order they were started. Tasks that return `()` run for their effect and add no item, so a group can mix them with tasks that compute a value. Every task has finished when the block ends, so nothing outlives it.
 
 ```
 let counts = group g {

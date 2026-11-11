@@ -152,7 +152,8 @@ let hover_items text items =
             | EClosure (ps, _) -> (
               match Types.repr e.ety with
               | Types.TFn (pts, _) when List.length pts = List.length ps ->
-                List.iter2 (fun (n, _, sp) t -> add sp (n ^ ": " ^ show t)) ps pts
+                (* `$` names come from method values (`p.area`), which the checker rewrites *)
+                List.iter2 (fun (n, _, sp) t -> if n.[0] <> '$' then add sp (n ^ ": " ^ show t)) ps pts
               | _ -> ())
             | _ -> ())
           d.fn_body;
@@ -161,7 +162,7 @@ let hover_items text items =
           List.iter
             (fun s ->
               match s.sdesc with
-              | SLet (m, n, nsp, _, e) -> add nsp (Printf.sprintf "let %s%s: %s" (if m then "mut " else "") n (show e.ety))
+              | SLet (m, n, nsp, _, e) when n.[0] <> '$' -> add nsp (Printf.sprintf "let %s%s: %s" (if m then "mut " else "") n (show e.ety))
               | SFor (n, nsp, e, b) ->
                 (match Types.repr e.ety with
                  | Types.TList t | Types.TArray (t, _) -> add nsp (n ^ ": " ^ show t)
@@ -415,7 +416,7 @@ let general_completions doc off =
               List.iter
                 (fun s ->
                   match s.sdesc with
-                  | SLet (_, n, nsp, _, e) when nsp.lo < off && not (Hashtbl.mem seen n) ->
+                  | SLet (_, n, nsp, _, e) when nsp.lo < off && not (Hashtbl.mem seen n) && n.[0] <> '$' ->
                     Hashtbl.replace seen n ();
                     out := item 6 n (show e.ety) :: !out
                   | SFor (n, nsp, _, b) -> if nsp.lo < off && not (Hashtbl.mem seen n) then (Hashtbl.replace seen n (); out := item 6 n "" :: !out); stmts b

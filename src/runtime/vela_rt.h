@@ -1704,7 +1704,7 @@ static void w_main_finished(void) {
 
 typedef struct WGroup WGroup;
 typedef struct WTask WTask;
-struct WTask { WClo *fn; void (*run)(WTask *); WGroup *g; char *pmsg; char *pwhere; max_align_t slot[]; };
+struct WTask { WClo *fn; void (*run)(WTask *); WGroup *g; char *pmsg; char *pwhere; bool keep; max_align_t slot[]; };
 struct WGroup { int64_t rc; pthread_mutex_t mu; int64_t pending; WFiber *waiter; int64_t n, cap; WTask **tasks; };
 
 static WGroup *w_group_new(void) {
@@ -1744,11 +1744,12 @@ static void w_task_entry(void *p) {
 }
 /* The closure and everything it references become shared before any other
    thread can see them. */
-static void w_spawn(WGroup *g, WClo *fn, void (*run)(WTask *), size_t slot) {
+/* keep: the task's result goes in the group's list (false for a task that returns ()) */
+static void w_spawn(WGroup *g, WClo *fn, void (*run)(WTask *), size_t slot, bool keep) {
   pthread_once(&w_pool_once, w_pool_start);
   Clo_share(fn);
   WTask *t = (WTask *)w_alloc(sizeof(WTask) + slot);
-  t->fn = fn; t->run = run; t->g = g; t->pmsg = NULL; t->pwhere = NULL;
+  t->fn = fn; t->run = run; t->g = g; t->pmsg = NULL; t->pwhere = NULL; t->keep = keep;
   if (g->n == g->cap) { g->cap *= 2; g->tasks = (WTask **)w_realloc(g->tasks, w_bytes(g->cap, sizeof(WTask *))); }
   g->tasks[g->n++] = t;
   pthread_mutex_lock(&g->mu);

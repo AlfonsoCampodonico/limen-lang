@@ -41,7 +41,7 @@ type rhs =
   | RootField of atom * string
   | Panic of atom * Span.t
   | GroupNew
-  | Spawn of atom * atom * ty (* group (borrowed), task closure (consumed), result type *)
+  | Spawn of atom * atom * ty * bool (* group (borrowed), task closure (consumed), result type, whether its result goes in the group's list *)
   | GroupJoin of atom * ty (* wait for every task; result list type *)
   | ChanNew of ty * atom * Span.t (* channel type, capacity *)
   | ChanSend of atom * atom * Span.t (* channel (borrowed), value (consumed) *)
@@ -100,7 +100,7 @@ let consumed = function
   | Call (_, args) -> args
   | CallClo (_, args) -> args
   | MkStruct (_, xs) | MkEnum (_, _, xs) | MkList (_, xs) | MkClosure (_, _, xs) -> xs
-  | Spawn (_, c, _) -> [ c ]
+  | Spawn (_, c, _, _) -> [ c ]
   | ChanSend (_, v, _) -> [ v ]
   | MkDyn (_, _, a, _) -> [ a ]
   | Select (_, ops, _, _) -> List.filter_map (function SSend (_, v, _, _) -> Some v | SRecv _ -> None) ops
@@ -123,7 +123,7 @@ let borrowed = function
   | Interp ps -> List.filter_map (function IVal (a, _) | IValQ (a, _) -> Some a | IStr _ -> None) ps
   | RootField (a, _) -> [ a ]
   | Panic (a, _) -> [ a ]
-  | Spawn (g, _, _) | GroupJoin (g, _) -> [ g ]
+  | Spawn (g, _, _, _) | GroupJoin (g, _) -> [ g ]
   | GroupNew -> []
   | ChanNew (_, cap, _) -> [ cap ]
   | ChanSend (c, _, _) -> [ c ]

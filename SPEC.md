@@ -405,6 +405,7 @@ let results = group g {
 ```
 
 - `group g { body }` runs `body`, in which `g.go(f)` starts `f: fn() -> T` as a task. The group evaluates to a `List[T]` of the task results **in the order the tasks were started**.
+- A task whose closure returns `()` runs for its effect and adds nothing to the list, so one group can mix them with tasks that return a value: the list holds the results of the value tasks, which must all have one type. A group of only `()` tasks evaluates to an empty list. To drop a value a task would return, end its body with a statement: `g.go(|| { log(x); })`. The rule is decided by the closure's type as written, so in generic code a task returning `T` always adds an item, even when `T` is `()`.
 - When the block ends, every task has finished. Nothing outlives the group.
 - `g` can only be used as `g.go(...)` directly in the body. It cannot be stored, passed, returned, or used inside a closure (E0310).
 - The body cannot leave early with `return` or `?` (E0311), and `break` and `continue` cannot target loops outside the group.
@@ -418,10 +419,9 @@ let results = group g {
 ```
 let c: Chan[Int] = channel(8)        // capacity at least 1
 let total = group g {
-    g.go(|| {
+    g.go(|| {                         // returns (): adds no item
         for i in [1, 2, 3] { c.send(i) }
         c.close()
-        0
     })
     g.go(|| {
         let mut sum = 0
@@ -434,7 +434,7 @@ let total = group g {
         }
         sum
     })
-}
+}                                    // [6]
 ```
 
 - `channel(n)` creates a `Chan[T]` holding up to `n` values; `T` comes from the annotation or from use. A capacity below 1 panics.

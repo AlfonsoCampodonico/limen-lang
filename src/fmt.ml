@@ -345,6 +345,10 @@ and block c ind b =
         if after_comments >= 0 && blank_between c after_comments lo then blank c;
         new_line c (ind + 4);
         (match el with `S s -> stmt c (ind + 4) s | `E e -> expr c (ind + 4) e);
+        (* `{ f(); }` is a block of type (), unlike `{ f() }`: keep the `;` *)
+        (match (el, b.tail, List.rev b.stmts) with
+         | `S ({ sdesc = SExpr _; _ } as s), None, last :: _ when s == last -> add c ";"
+         | _ -> ());
         trailing c hi;
         prev := hi)
       elems;

@@ -1317,6 +1317,18 @@ fn main(root: Root) {
   errs "method-value-assign" "struct P {\n    x: Int,\n}\n\nfn get(self: P) -> Int {\n    self.x\n}\n\nfn main() {\n    let mut p = P { x: 1 }\n    p.get = p.get\n}\n" [ "E0209" ];
   errs "method-value-unknown" "struct P {\n    x: Int,\n}\n\nfn main() {\n    let p = P { x: 1 }\n    let f = p.nope\n}\n" [ "E0103" ];
 
+  (* ---------- groups mixing () tasks with value tasks ---------- *)
+  let mixed =
+    "fn work(n: Int) -> Int {\n    n * n\n}\n\nfn spawn_all[T](fs: List[fn() -> T]) -> List[T] {\n    group g {\n        for f in fs {\n            g.go(f)\n        }\n    }\n}\n\n"
+    ^ "fn main(root: Root) {\n    let out = root.stdout\n    let c: Chan[Str] = channel(4)\n    let squares = group g {\n        g.go(|| work(2))\n        g.go(|| {\n            c.send(\"hello\")\n            c.close()\n        })\n        g.go(|| work(3))\n        g.go(|| {\n            work(5);\n        })\n    }\n"
+    ^ "    out.print(\"{squares} {c.recv()}\")\n    let none = group g {\n        g.go(|| out.print(\"a\"))\n        g.go(|| out.print(\"a\"))\n    }\n"
+    ^ "    out.print(\"{none.len()} {spawn_all([|| (), || ()]).len()} {spawn_all([|| 1, || 2])}\")\n"
+    ^ "    let r = catch(|| group g {\n        g.go(|| {\n            let x: Int = panic(\"first\")\n        })\n        g.go(|| panic(\"second\"))\n        g.go(|| work(4))\n    })\n    out.print(\"{r}\")\n}\n"
+  in
+  out "group-mixed-tasks" mixed "[4, 9] Some(\"hello\")\na\na\n0 2 [1, 2]\nErr(\"first\")\n";
+  check_tsan "group-mixed-tasks" mixed "[4, 9] Some(\"hello\")\na\na\n0 2 [1, 2]\nErr(\"first\")\n";
+  errs "group-mixed-values" "fn main() {\n    let r = group g {\n        g.go(|| 1)\n        g.go(|| \"a\")\n    }\n}\n" [ "E0201" ];
+
   (* ---------- modules ---------- *)
   let geom =
     "// geometry\npub struct Point {\n    x: Int,\n    y: Int,\n}\n\npub enum Shape {\n    Dot(Point),\n    Box(Point, Point),\n}\n\n"

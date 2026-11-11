@@ -721,8 +721,16 @@ and check_method ctx f e recv name nsp args =
       err ctx "E0310" recv.espan (sprintf "cannot spawn into `%s` from inside a closure" g)
         ~notes:[ "call `go` directly in the group's body" ];
     match (name, args) with
-    | "go", [ a ] -> expect ctx f a (TFn ([], t)); TUnit
-    | "go", _ -> err ctx "E0107" nsp "`go` takes 1 argument, a closure with no parameters"; check_args ctx f args; TUnit
+    | ("go" | "#go"), [ a ] ->
+      (* a task that returns () runs for its effect and adds no item to the
+         group's list (the backends see it as `#go`); the others share one type *)
+      let r = fresh () in
+      expect ctx f a (TFn ([], r));
+      (match repr r with
+       | TUnit -> e.edesc <- EMethod (recv, "#go", nsp, args)
+       | _ -> unify_at ctx a.espan t r);
+      TUnit
+    | ("go" | "#go"), _ -> err ctx "E0107" nsp "`go` takes 1 argument, a closure with no parameters"; check_args ctx f args; TUnit
     | _ ->
       err ctx "E0105" nsp (sprintf "a group handle only has `go`, not `%s`" name);
       check_args ctx f args;
