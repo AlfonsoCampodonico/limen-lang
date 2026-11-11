@@ -33,7 +33,7 @@ fn parse_names(body: Str) -> List[Str] {   // no capabilities: cannot do I/O
 - **Floats:** digits with a fraction (`1.5`), an exponent (`1e9`, `2.5E-3`), or both. `_` is allowed. There is no leading-dot form (`.5`).
 - **Strings:** `"..."`, may span lines. Escapes: `\n \t \r \\ \" \{ \} \0`. Any other escape is error E0006.
 - **Interpolation:** `{expr}` inside a string evaluates any expression, including ones with their own strings: `"{xs.join(", ")}"`. An empty `{}` is error E0007; write `\{` for a literal brace.
-- **Symbols:** `( ) { } [ ] , : ; . | + - * / % ! ? = < > -> => == != <= >= && ||`.
+- **Symbols:** `( ) { } [ ] , : ; . | + - * / % ! ? = < > -> => == != <= >= && || ..<`.
 
 ### Newlines
 
@@ -57,11 +57,12 @@ Statements are separated by a newline or `;`. Two statements on one line without
 | `Float` | IEEE 754 double | No fused multiply-add, so both backends give identical results. |
 | `Bool` | `true`, `false` | |
 | `Str` | immutable byte strings | `len()` counts bytes. |
+| `Bytes` | immutable binary data | Built with `bytes([104, 105])` or `s.to_bytes()`; prints as `bytes([104, 105])`. |
 | `()` | the unit value `()` | Type of statements and of functions without `->`. |
 | `List[T]` | growable sequence | A value: assigning or passing it never shares mutation (section 8). |
 | `Array[T, N]` | exactly `N` elements | A value type stored inline, like a struct. `N` is an integer literal. |
 | `(A, B)`, `(A, B, C)`, ... | tuples of 2 to 8 values | Written `(1, "a")`, read with `.0`, `.1`, unpacked with patterns. |
-| `Map[K, V]` | keys to values | Keys are `Int`, `Str` or `Bool` (E0113). A value, like `List`; iterates in insertion order. |
+| `Map[K, V]` | keys to values | Keys are `Int`, `Str`, `Bytes`, `Bool`, or tuples, structs and enums made of them (E0113). A value, like `List`; iterates in insertion order. |
 | `Option[T]` | `Some(T)`, `None` | From the prelude. |
 | `Result[T, E]` | `Ok(T)`, `Err(E)` | From the prelude. |
 | `IoError` | `Denied(Str)`, `Failed(Str)` | Error type of every capability operation. |
@@ -72,7 +73,9 @@ Statements are separated by a newline or `;`. Two statements on one line without
 | `Root`, `Net`, `Fs`, `Stdout`, `Clock`, `Listen`, `Listener`, `Conn`, `Rand`, `Stdin`, `Env`, `Exec` | capabilities | Cannot be created by programs (section 9). |
 | user `struct` and `enum` | | Optionally generic (section 4). |
 
-There is no character type: use one-byte strings (`s.split("")`) or bytes (`s.bytes()`), see section 11. There is no range syntax; count with `while` and a `mut` counter, or use `list.range(lo, hi)` from the standard library.
+There is no separate character type: a character is a `Str` holding one UTF-8 code point. `s.chars()` gives them as a `List[Str]`, `for c in s.chars() { ... }` visits them, and `s.bytes()` gives the bytes (section 11). One type for text keeps the API small; `len()` still counts bytes.
+
+`lo..<hi` is the `List[Int]` from `lo` up to but not including `hi`, empty when `hi <= lo`. It counts in loops, `for i in 0..<n { ... }`, without building the list, and is a list everywhere else: `(1..<4).map(|x| x * x)`. There is one form, exclusive, spelled `..<` as in Swift and Kotlin so it cannot be misread; for an inclusive end write `0..<n + 1`.
 
 ### Tuples
 
@@ -100,7 +103,9 @@ counts["the"]                             // panics if the key is missing
 for (w, n) in counts.entries() { ... }    // in insertion order
 ```
 
-`m[k] = v` inserts or replaces and needs a `mut` place, like `push`. A map entry is replaced whole: `m[k].field = x` is E0209, so read the value, change the copy, and store it back. Iteration (`keys`, `values`, `entries`) and printing follow insertion order, the same in both backends; replacing a value keeps its key's position, and removing then re-inserting moves it to the end. Two maps are equal when they hold the same entries, in any order.
+`m[k] = v` inserts or replaces and needs a `mut` place, like `push`. An entry can also be changed in place through its key: `m[k].hits = m[k].hits + 1`, `m[k].names.push(n)`, `m[a][b] = v` for a map of maps. Those need the key to be there and panic like `m[k]` when it is not; only `m[k] = v` adds a key.
+
+A key is an `Int`, `Str`, `Bytes` or `Bool`, or a tuple, struct or enum made of them, compared by value: `grid[(x, y)]`, `seen[Pos { x, y }]`. `Float` (NaN is not equal to itself), lists and maps cannot be keys (E0113). Iteration (`keys`, `values`, `entries`) and printing follow insertion order, the same in both backends; replacing a value keeps its key's position, and removing then re-inserting moves it to the end. Two maps are equal when they hold the same entries, in any order.
 
 There is no null and no implicit conversion between types: `Int` and `Float` never mix without `to_float()` or `to_int()`.
 
@@ -132,6 +137,7 @@ fn swap[A, B](p: Pair[A, B]) -> Pair[B, A] {
 - Generic parameters go in `[...]` after the name. They are instantiated at each use and are never written at call sites: `swap(p)`.
 - Struct fields and enum payloads cannot hold a capability (E0301), a channel (E0305) or a function type (E0304). That keeps authority visible in signatures. A generic instantiation like `Pair[Net, Int]` is allowed, because the capability is visible in the type.
 - Defining the same type, function, field or variant twice is error E0106.
+- Types can be recursive through an enum, a `List` or a `Map`, which hold their contents indirectly: `struct Node { value: Int, next: Option[Node] }`, `enum Tree { Leaf, Node(Tree, Tree) }`, `struct Dir { files: List[Dir] }`. A struct stores its fields inline, so one that contains itself through structs, tuples or arrays alone would be infinitely large (E0114). There is no `box`: those types are the indirection.
 
 ### Methods
 
@@ -154,9 +160,11 @@ fn swap[A, B](self: Pair[A, B]) -> Pair[B, A] {
 let p = a.add(b).add(c)
 ```
 
-- `self` must be the first parameter, and its type a struct or enum declared in the program, generic or not (E0110). Built-in types, `Option`, `Result` and `IoError` cannot get new methods.
+- `self` must be the first parameter, and its type a struct or enum declared in the program, generic or not, or one of the built-in types below (E0110).
+- A file can add methods to `Int`, `Float`, `Bool`, `Str`, `Bytes`, `List[T]`, `Map[K, V]`, `Option[T]`, `Result[T, E]` and `IoError`: `fn shout(self: Str) -> Str { self.to_upper() + "!" }` makes `"hi".shout()` work **in that file only**. Built-in types belong to no module, so this keeps two modules' helpers from clashing; such a method cannot be `pub` (E0110), and it cannot reuse the name of a built-in method (E0106). Export a plain function to share it. Methods added this way do not count toward interfaces, and capabilities, channels and arrays cannot get methods.
 - A method is only called with a dot: `p.add(q)`, never `add(p, q)`. Its name does not clash with a plain function or with methods of other types, so `fn area(self: Circle)` and `fn area(self: Rect)` can both exist.
 - Methods take `self` by value like any parameter; to "change" a value, return the new one.
+- A method without the call is a value: `p.add` is a function that calls `add` on `p`, the same as `|q| p.add(q)`. Like a closure, it holds a copy of `p` taken when `p.add` is evaluated, so `[a, b].map(origin.add)` works and later changes to `p` do not reach it. This works for every method that can be called with a dot: user methods, `dyn` and interface-bounded methods, and built-in ones (`let say = out.print`), except `push` and `remove`, which change their receiver. (It is `p.add`, as in Go and Swift, and not `Point.add`: the value already knows its type, and `Name.x` is taken by enum variants and modules.)
 - In a module, only `pub fn` methods can be called from other modules (E0402).
 
 ### Interfaces
@@ -219,10 +227,10 @@ for s in shapes {
 }
 ```
 
-- A struct or enum value becomes `dyn Shape` where one is expected: an annotated `let`, a function argument, a list literal of that type, a struct field, a `return`, the last expression of a function returning `dyn Shape`, or `push`. Its type must satisfy the interface (E0111).
+- A struct or enum value becomes `dyn Shape` where one is expected: an annotated `let`, a function argument, a list literal of that type, a struct field, a `return`, the last expression of a function returning `dyn Shape`, or `push`. The expected type reaches into each branch of an `if`, a `match` and a block, so the branches can hold different types. Its type must satisfy the interface (E0111).
 - Only struct and enum values can become `dyn`, and only if they hold no capability, function or channel (E0112), so a `dyn` value never hides authority. To work with capabilities through an interface, use a bounded type parameter instead.
 - Only the interface's methods can be called on a `dyn` value. It prints like the value inside. `==` is not allowed.
-- Both branches of an `if` must have the same type, so to choose between types, return early or annotate a `let`: `let s: dyn Shape = if big { ... } else { ... }` does not work yet; write `return` in one branch.
+- To choose between types, say where the `dyn` is expected: `let s: dyn Shape = if big { Circle { r: 1.0 } } else { Square { s: 2.0 } }`. Without an expected type, the branches of an `if` must have the same type.
 - A `dyn` value is boxed and its calls go through a table of methods; a bounded type parameter (`[T: Shape]`) has no such cost.
 
 ### main
@@ -264,32 +272,34 @@ From loosest to tightest. All binary operators are left-associative.
 | 2 | `&&` |
 | 3 | `==` `!=` |
 | 4 | `<` `<=` `>` `>=` |
-| 5 | `+` `-` |
-| 6 | `*` `/` `%` |
-| 7 | `??` |
-| 8 | unary `-` `!` |
-| 9 | call `f(x)`, index `a[i]`, field `p.x`, method `s.len()`, `?` |
+| 5 | `..<` |
+| 6 | `+` `-` |
+| 7 | `*` `/` `%` |
+| 8 | `??` |
+| 9 | unary `-` `!` |
+| 10 | call `f(x)`, index `a[i]`, field `p.x`, method `s.len()`, `?` |
 
 ### Operators
 
 | Operator | Operands | Result |
 | --- | --- | --- |
-| `+` | `Int`, `Float`, `Str` (concatenation) | same type |
+| `+` | `Int`, `Float`, `Str`, `Bytes` (concatenation) | same type |
 | `-` `*` `/` | `Int`, `Float` | same type |
 | `%` | `Int` | `Int` |
-| `<` `<=` `>` `>=` | `Int`, `Float`, `Str` (byte order) | `Bool` |
+| `<` `<=` `>` `>=` | any ordered type (below) | `Bool` |
 | `==` `!=` | any type except functions and capabilities; structural equality | `Bool` |
 | `&&` `\|\|` | `Bool`, short-circuit | `Bool` |
+| `..<` | `Int` | `List[Int]`: `lo..<hi` counts up from `lo`, stopping before `hi` |
 | `-x` | `Int`, `Float` | same type |
 | `!x` | `Bool` | `Bool` |
 
-Both operands must have the same type. On `Int`, `/` truncates toward zero, `%` takes the sign of the dividend, and division or remainder by zero panics. On `Float`, comparisons follow IEEE, so NaN is unequal to everything, and division by zero gives infinity.
+Both operands must have the same type. The **ordered** types are `Int`, `Float`, `Str` and `Bytes` (byte order), `Bool` (`false` first), `()`, and lists, arrays, tuples, structs and enums whose items are ordered. Those compare item by item: lists and arrays lexicographically (a prefix comes first), tuples and structs field by field in declaration order, enums by variant in declaration order and then by payload, so `None` sorts after every `Some`. Maps, functions, capabilities, channels, `dyn` values and type parameters have no order (E0201). On `Int`, `/` truncates toward zero, `%` takes the sign of the dividend, and division or remainder by zero panics. On `Float`, comparisons follow IEEE, so NaN is unequal to everything, and division by zero gives infinity. Inside a list, tuple, struct or enum, and in `sort()`, floats use a total order with NaN first, so sorting never misbehaves.
 
 ### Literals and constructors
 
 - `[1, 2, 3]` is a `List[Int]`. Where an `Array[T, N]` is expected (an annotated `let`, an argument, a field), a list literal of exactly `N` elements builds the array. A wrong count is error E0201.
 - Struct literal: `Pair { first: 1, second: "a" }`. Every field must be set (E0206). `Pair { first, second }` is shorthand for `first: first`. A struct literal cannot appear directly as the condition of `if`, `while`, `for` or `match`; wrap it in parentheses.
-- Enum variants are built by name: `Some(3)`, `None`, `Circle(1.0)`, `Point`. If several enums define the same variant name, qualify it: `Shape.Point` (E0104).
+- Enum variants are built by name: `Some(3)`, `None`, `Circle(1.0)`, `Point`. A bare name means a variant of the file's own enums first, then of the prelude (`Some`, `None`, `Ok`, `Err`, `Denied`, `Failed`), then of other modules' enums, so a module's `Num` never clashes with `json.Num`, and a file that defines its own `Some` shadows the prelude's. If two enums at the nearest of those levels define the name, qualify it: `Shape.Point` or `json.Num(1.0)` (E0104). In patterns the type being matched decides, so qualifying is rarely needed there.
 
 ### Blocks, if and match
 
@@ -324,6 +334,7 @@ xs.push(4)                // also needs mut
 return value
 while cond { ... }
 for x in list_or_array { ... }
+for i in 0..<n { ... }    // 0, 1, ..., n - 1
 let (a, b) = pair         // unpack a tuple
 for (k, v) in m.entries() { ... }
 m[key] = value            // insert into a map (needs mut)
@@ -333,9 +344,9 @@ expr
 ```
 
 - Parameters and pattern bindings are immutable. Use `let mut y = y` to get a mutable copy.
-- `for` iterates over a snapshot: changing the list inside the loop does not affect the iteration.
+- `for` iterates over a snapshot: changing the list inside the loop does not affect the iteration. Over a range, both bounds are evaluated once, before the first iteration.
 - `break` and `continue` only work inside loops, not across closures (E0208).
-- Only variables, fields, list or array elements and map entries can be assigned (E0209).
+- Only variables, fields, list or array elements and map entries, and paths through them such as `m[k].x` or `xs[i].tags[j]`, can be assigned (E0209).
 
 ## 7. Patterns
 
@@ -418,6 +429,7 @@ let results = group g {
 ```
 
 - `group g { body }` runs `body`, in which `g.go(f)` starts `f: fn() -> T` as a task. The group evaluates to a `List[T]` of the task results **in the order the tasks were started**.
+- A task whose closure returns `()` runs for its effect and adds nothing to the list, so one group can mix them with tasks that return a value: the list holds the results of the value tasks, which must all have one type. A group of only `()` tasks evaluates to an empty list. To drop a value a task would return, end its body with a statement: `g.go(|| { log(x); })`. The rule is decided by the closure's type as written, so in generic code a task returning `T` always adds an item, even when `T` is `()`.
 - When the block ends, every task has finished. Nothing outlives the group.
 - `g` can only be used as `g.go(...)` directly in the body. It cannot be stored, passed, returned, or used inside a closure (E0310).
 - The body cannot leave early with `return` or `?` (E0311), and `break` and `continue` cannot target loops outside the group.
@@ -431,10 +443,9 @@ let results = group g {
 ```
 let c: Chan[Int] = channel(8)        // holds up to 8 values; channel(0) holds none
 let total = group g {
-    g.go(|| {
+    g.go(|| {                         // returns (): adds no item
         for i in [1, 2, 3] { c.send(i) }
         c.close()
-        0
     })
     g.go(|| {
         let mut sum = 0
@@ -447,7 +458,7 @@ let total = group g {
         }
         sum
     })
-}
+}                                    // [6]
 ```
 
 - `channel(n)` creates a `Chan[T]` holding up to `n` values; `T` comes from the annotation or from use. A negative capacity panics.
@@ -513,7 +524,7 @@ let pages = group g until clock.after(2000) {
 // pages: List[Option[Str]], None for each fetch still running at the deadline
 ```
 
-- `group g until clock.after(ms) { body }` gives the group a deadline `ms` milliseconds after it starts. Its value is a `List[Option[T]]`, in start order: `Some(v)` for a task that finished, `None` for a task the deadline cancelled.
+- `group g until clock.after(ms) { body }` gives the group a deadline `ms` milliseconds after it starts. Its value is a `List[Option[T]]`, in start order: `Some(v)` for a task that finished, `None` for a task the deadline cancelled. As in any group, tasks that return `()` are left out of the list.
 - At the deadline every task still running is cancelled. A cancelled task stops at a wait: if it is waiting (on a channel, a `select`, `clock.sleep`, a socket, stdin or a group) it stops at once; otherwise it stops when it next has to wait. Code that does not wait cannot be stopped, and a task that finishes without waiting again keeps its result. A task started after the deadline never runs, and `ms <= 0` cancels every task before it starts.
 - A cancelled task unwinds as a panic does: everything it owns is freed and sockets it holds are closed. A group the task is running cancels its own tasks too and waits for them. `catch` inside the task does not stop a cancellation, and a cancellation is not a panic: the group passes nothing on for it. A panic in another task of the group is still passed on once every task has stopped.
 - The deadline cancels the tasks, not the body: keep the body to starting tasks and do blocking work, like `accept`, inside a task.
@@ -583,7 +594,8 @@ Methods take the receiver by value and never modify it, except `push`, which nee
 | `len()` | `Int`, bytes |
 | `is_empty()` | `Bool` |
 | `lines()` | `List[Str]`, split on `\n`, stripping a trailing `\r` and dropping one final empty line |
-| `split(sep)` | `List[Str]`, keeping empty pieces (`"a,,b".split(",")` is `["a", "", "b"]`); `split("")` splits into single bytes, which is how to get characters |
+| `split(sep)` | `List[Str]`, keeping empty pieces (`"a,,b".split(",")` is `["a", "", "b"]`); `split("")` splits into single bytes |
+| `chars()` | `List[Str]`, one string per UTF-8 code point; a byte that does not start a well-formed one is a piece of its own, so `s.chars().join("") == s` always |
 | `trim()` | `Str` without leading and trailing spaces, tabs, newlines, `\r` and form feeds |
 | `contains(s)`, `starts_with(s)`, `ends_with(s)` | `Bool` |
 | `to_upper()`, `to_lower()` | `Str`, ASCII only |
@@ -593,6 +605,22 @@ Methods take the receiver by value and never modify it, except `push`, which nee
 | `slice(lo, hi)` | `Str`, bytes `lo` up to `hi`; out-of-range bounds are clamped, so it never panics |
 | `index_of(s)` | `Option[Int]`, byte offset of the first occurrence |
 | `bytes()` | `List[Int]`, each byte as 0-255; index it to scan a string fast |
+
+### Bytes
+
+Binary data, kept apart from text so a byte buffer is never printed or concatenated as a string by mistake. Natively it is stored like a `Str`, so conversions cost one reference.
+
+| Method | Result |
+| --- | --- |
+| `bytes(list)` (function) | `Bytes` from a `List[Int]`; an item outside 0 to 255 panics |
+| `s.to_bytes()` (on `Str`) | the string's bytes |
+| `len()`, `is_empty()` | `Int`, `Bool` |
+| `b[i]`, `get(i)` | `Int` (0 to 255; panics out of range), `Option[Int]` |
+| `slice(lo, hi)` | `Bytes`, clamped like `Str.slice` |
+| `to_list()` | `List[Int]` |
+| `to_str()` | `Str` with the same bytes (no check: a `Str` may hold any bytes) |
+
+`+` concatenates, `==` and `<` compare byte by byte, and `Bytes` can be a map key. It cannot be changed in place (`b[i] = x` is E0209). Capabilities still read and write `Str`; convert with `to_bytes()` and `to_str()`.
 
 ### Int, Float, Bool
 
@@ -611,15 +639,15 @@ Methods take the receiver by value and never modify it, except `push`, which nee
 | `push(x)` | `()`, appends in place (needs `mut`) |
 | `contains(x)` | `Bool` |
 | `reverse()`, `take(n)`, `skip(n)` | `List[T]`; `take` and `skip` clamp out-of-range counts |
-| `sort()` | `List[T]`, stable; only for `Int`, `Float` and `Str` elements |
+| `sort()` | `List[T]`, stable, in the order of `<`; `T` must be ordered (section 5) |
 | `map(f)`, `filter(p)` | `List[U]`, `List[T]` |
 | `fold(init, f)` | `U`, with `f: fn(U, T) -> U` |
 | `join(sep)` | `Str`; `List[Str]` only |
 | `sum()` | `Int`; `List[Int]` only |
 
-`xs[i]` panics when `i` is out of range; `xs.get(i)` returns `None` instead. Writes go through index and field paths: `groups[i].words.push(w)` and `items[i].qty = 3` both work on a `mut` list. `sort()` orders `Int`, `Float` and `Str` only; for other orders and for inserting or removing at a position, use the `list` module (`sort_by`, `insert_at`, `remove_at`, section 19).
+`xs[i]` panics when `i` is out of range; `xs.get(i)` returns `None` instead. Writes go through index and field paths: `groups[i].words.push(w)` and `items[i].qty = 3` both work on a `mut` list. `sort()` uses the order of `<`, so it sorts tuples by their first item, then the second, and structs by their fields in declaration order; for another order and for inserting or removing at a position, use the `list` module (`sort_by`, `insert_at`, `remove_at`, section 19).
 
-Strings compare byte by byte, so `c >= "a" && c <= "z"` tests a one-byte string. `slice`, `index_of` and `bytes()` give positions and byte codes.
+Strings compare byte by byte, so `c >= "a" && c <= "z"` tests a one-byte string, such as a character from `chars()`. `slice`, `index_of` and `bytes()` give positions and byte codes.
 
 ### Map[K, V]
 
@@ -630,6 +658,7 @@ Strings compare byte by byte, so `c >= "a" && c <= "z"` tests a one-byte string.
 | `get(k)` | `Option[V]` |
 | `contains(k)` | `Bool` |
 | `m[k] = v` | inserts or replaces (needs `mut`) |
+| `m[k].field = v`, `m[k].push(x)`, ... | changes the entry in place (needs `mut`); panics if `k` is missing |
 | `remove(k)` | `()`, removes the entry if present (needs `mut`) |
 | `keys()`, `values()` | `List[K]`, `List[V]`, in insertion order |
 | `entries()` | `List[(K, V)]`, in insertion order |
@@ -664,6 +693,7 @@ Strings compare byte by byte, so `c >= "a" && c <= "z"` tests a one-byte string.
 | `catch(f)` | `Result[T, Str]`: run `f: fn() -> T`; `Err(message)` if it panicked (section 15) |
 | `channel(n)` | a new `Chan[T]` with capacity `n` |
 | `map()`, `map(pairs)` | a new `Map[K, V]`, empty or from a `List[(K, V)]` |
+| `bytes(list)` | a new `Bytes` from a `List[Int]` of values 0 to 255 |
 | `assert(cond)` | panic with `assertion failed` unless `cond` is true |
 | `assert_eq(a, b)` | panic with `assertion failed: <a> != <b>` unless `a == b` |
 
@@ -759,10 +789,11 @@ Every diagnostic has a stable code. `vela explain CODE` prints its explanation, 
 | E0107 | wrong number of arguments |
 | E0108 | not callable |
 | E0109 | wrong number of type arguments |
-| E0110 | misplaced `self`, or a method on a built-in type |
+| E0110 | misplaced `self`, a method on a type that cannot have them, or a `pub` method on a built-in type |
 | E0111 | a type does not satisfy an interface |
 | E0112 | a value that cannot become `dyn` |
-| E0113 | a map key type other than `Int`, `Str` or `Bool` |
+| E0113 | a map key type that is not `Int`, `Str`, `Bytes`, `Bool`, or a tuple, struct or enum of them |
+| E0114 | a struct that contains itself by value |
 | E0201 | type mismatch |
 | E0202 | misuse of `?` |
 | E0203 | `if` without `else` produces a value |

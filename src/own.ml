@@ -16,7 +16,7 @@ and sub = NoSub | IfSub of ablock * ablock | LoopSub of ablock
 and ablock = { stmts : ann list; lin : S.t }
 
 let ids atoms = List.fold_left (fun acc a -> match atom_var a with Some v -> S.add v.id acc | None -> acc) S.empty atoms
-let step_atoms steps = List.filter_map (function PIndex (a, _) | PIndexU a -> Some a | PField _ -> None) steps
+let step_atoms steps = List.filter_map (function PIndex (a, _) | PIndexU a | PKey (a, _) -> Some a | PField _ -> None) steps
 
 let rhs_uses r = ids (consumed r @ borrowed r)
 
@@ -105,9 +105,9 @@ let rewrite_rhs r ~live_after ~owned =
   | MkClosure (n, t, args) ->
     let xs, o = c args in
     (MkClosure (n, t, xs), o)
-  | Spawn (g, task, t) ->
+  | Spawn (g, task, t, keep) ->
     let xs, o = c [ task ] in
-    (Spawn (g, List.hd xs, t), o)
+    (Spawn (g, List.hd xs, t, keep), o)
   | ChanSend (ch, v, sp) ->
     let xs, o = c [ v ] in
     (ChanSend (ch, List.hd xs, sp), o)

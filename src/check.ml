@@ -78,7 +78,7 @@ let unify_at ctx span want got =
   try unify want got
   with Mismatch -> err ctx "E0201" span (sprintf "expected `%s`, found `%s`" (show want) (show got))
 
-let builtin_types = [ "Int"; "Float"; "Bool"; "Str"; "List"; "Array"; "Chan"; "Root"; "Net"; "Fs"; "Stdout"; "Clock"; "Listen"; "Listener"; "Conn"; "Rand"; "Stdin"; "Env"; "Exec"; "Map" ]
+let builtin_types = [ "Int"; "Float"; "Bool"; "Str"; "Bytes"; "List"; "Array"; "Chan"; "Root"; "Net"; "Fs"; "Stdout"; "Clock"; "Listen"; "Listener"; "Conn"; "Rand"; "Stdin"; "Env"; "Exec"; "Map" ]
 
 (* Names other languages use for ambient I/O, mapped to the capability way. *)
 let ambient =
@@ -130,6 +130,7 @@ let rec resolve ctx env (te : ty_expr) : ty =
     | "Float" -> simple TFloat
     | "Bool" -> simple TBool
     | "Str" -> simple TStr
+    | "Bytes" -> simple TBytes
     | "List" -> if want 1 then TList (List.hd args') else TErr
     | "Root" -> simple (TCap Root)
     | "Net" -> simple (TCap Net)
@@ -204,7 +205,7 @@ let visible_names ctx f =
   List.concat_map (fun s -> List.of_seq (Hashtbl.to_seq_keys s.vars)) f.scopes
   @ List.of_seq (Hashtbl.to_seq_keys ctx.fns)
   @ List.of_seq (Hashtbl.to_seq_keys ctx.owners)
-  @ [ "panic"; "channel"; "assert"; "assert_eq"; "map"; "catch" ]
+  @ [ "panic"; "channel"; "assert"; "assert_eq"; "map"; "catch"; "bytes" ]
 
 (* Generic functions' bounds: function -> type parameter -> interfaces. *)
 let fn_bounds : (string, (string * string list) list) Hashtbl.t = Hashtbl.create 8
@@ -245,6 +246,16 @@ let instantiate s =
   let env = List.map (fun g -> (g, fresh ())) s.gen in
   (env, TFn (List.map (subst env) s.ps, subst env s.ret))
 
+(* The enums a bare variant name can mean in [file]: the file's own enums
+   shadow the prelude's, which shadow other modules'. More than one at the
+   nearest level is ambiguous. *)
+let variant_scope ctx v file =
+  let ens = Option.value ~default:[] (Hashtbl.find_opt ctx.owners v) in
+  let from fl = List.filter (fun en -> (Hashtbl.find ctx.enums en).en_span.file = fl) ens in
+  match from file with
+  | [] -> ( match from Prelude.file with [] -> ens | p -> p)
+  | own -> own
+
 let ctor_ty ctx en v =
   let e = Hashtbl.find ctx.enums en in
   let targs = List.map (fun _ -> fresh ()) e.en_gen in
@@ -260,6 +271,20 @@ let struct_fields ctx n args =
 
 (* ---------- builtin methods ---------- *)
 
+(* The name a built-in type's methods are keyed by (`Str::shout`), if a
+   program can add methods to it. *)
+let builtin_tname t =
+  match repr t with
+  | TInt -> Some "Int"
+  | TFloat -> Some "Float"
+  | TBool -> Some "Bool"
+  | TStr -> Some "Str"
+  | TBytes -> Some "Bytes"
+  | TList _ -> Some "List"
+  | TMap _ -> Some "Map"
+  | TNamed (("Option" | "Result" | "IoError") as n, _) -> Some n
+  | _ -> None
+
 let methods (t : ty) : (string * (unit -> ty list * ty)) list =
   let m name ps r = (name, fun () -> (ps, r)) in
   match t with
@@ -269,7 +294,10 @@ let methods (t : ty) : (string * (unit -> ty list * ty)) list =
       m "starts_with" [ TStr ] TBool; m "ends_with" [ TStr ] TBool; m "to_upper" [] TStr;
       m "to_lower" [] TStr; m "replace" [ TStr; TStr ] TStr; m "parse_int" [] (opt TInt);
       m "parse_float" [] (opt TFloat); m "slice" [ TInt; TInt ] TStr; m "index_of" [ TStr ] (opt TInt);
-      m "bytes" [] (TList TInt) ]
+      m "bytes" [] (TList TInt); m "chars" [] (TList TStr); m "to_bytes" [] TBytes ]
+  | TBytes ->
+    [ m "len" [] TInt; m "is_empty" [] TBool; m "get" [ TInt ] (opt TInt); m "slice" [ TInt; TInt ] TBytes;
+      m "to_list" [] (TList TInt); m "to_str" [] TStr ]
   | TInt ->
     [ m "to_str" [] TStr; m "to_float" [] TFloat; m "abs" [] TInt; m "to_char" [] TStr; m "min" [ TInt ] TInt;
       m "max" [ TInt ] TInt ]
@@ -316,6 +344,36 @@ let methods (t : ty) : (string * (unit -> ty list * ty)) list =
   | TCap Root -> [ m "args" [] (TList TStr) ]
   | TChan a -> [ m "send" [ a ] TUnit; m "recv" [] (opt a); m "close" [] TUnit ]
   | _ -> []
+
+(* Types with an order, for `<` and `sort()`: numbers, strings (bytes),
+   Bool (false first), (), and lists, arrays, tuples, structs and enums of
+   ordered types, compared item by item (enum variants in declaration order).
+   Returns the first type in the way, if any. *)
+let unordered ctx t : ty option =
+  let seen = Hashtbl.create 8 in
+  let rec go t =
+    match repr t with
+    | TInt | TFloat | TStr | TBytes | TBool | TUnit | TVar _ | TErr -> None
+    | TList a | TArray (a, _) -> go a
+    | TNamed (n, args) as nt -> (
+      let key = show nt in
+      if Hashtbl.mem seen key then None
+      else begin
+        Hashtbl.replace seen key ();
+        match Hashtbl.find_opt ctx.structs n with
+        | Some s ->
+          let env = List.combine s.st_gen args in
+          List.find_map (fun (_, ft) -> go (subst env ft)) (Option.value ~default:[] (Hashtbl.find_opt ctx.sfields n))
+        | None -> (
+          match Hashtbl.find_opt ctx.enums n with
+          | Some e ->
+            let env = List.combine e.en_gen args in
+            List.find_map (fun (_, ps) -> List.find_map (fun p -> go (subst env p)) ps) (Option.value ~default:[] (Hashtbl.find_opt ctx.variants n))
+          | None -> Some nt)
+      end)
+    | t -> Some t
+  in
+  go t
 
 let root_fields = [ ("net", TCap Net); ("fs", TCap Fs); ("stdout", TCap Stdout); ("clock", TCap Clock); ("listen", TCap Listen);
     ("rand", TCap Rand); ("stdin", TCap Stdin); ("env", TCap Env); ("exec", TCap Exec) ]
@@ -400,11 +458,12 @@ and check_expr_inner ctx f e : ty =
     let callee = { edesc = EField (recv, name, nsp); espan = Span.merge recv.espan nsp; ety = TErr; einst = [] } in
     check_call ctx f callee args e.espan
   | EMethod (recv, name, nsp, args) -> check_method ctx f e recv name nsp args
-  | EField (recv, name, nsp) -> check_field ctx f recv name nsp
+  | EField (recv, name, nsp) -> check_field ctx f e recv name nsp
   | EIndex (a, i) -> (
     let t = check_expr ctx f a in
     match repr t with
     | TMap (k, v) -> expect ctx f i k; v
+    | TBytes -> expect ctx f i TInt; TInt
     | _ ->
     expect ctx f i TInt;
     match repr t with
@@ -470,6 +529,15 @@ and expect ctx f e want =
     (* each element is boxed on its own, so a list can mix types *)
     List.iter (fun x -> expect ctx f x el) es;
     e.ety <- want
+  (* the expected type reaches each branch, so `if` and `match` arms can
+     become `dyn` one by one, and closures in them get their types *)
+  | EIf (c, b, Some els), _ ->
+    expect ctx f c TBool;
+    expect_block ctx f b want;
+    expect ctx f els want;
+    e.ety <- want
+  | EMatch (s, arms), _ -> e.ety <- check_match ~want ctx f s arms e.espan
+  | EBlock b, _ -> expect_block ctx f b want; e.ety <- want
   | _, TDyn i -> coerce ctx e (check_expr ctx f e) i
   | _ -> expect_plain ctx f e want
 
@@ -521,8 +589,12 @@ and check_var ctx f e n sp =
       add_bounds n env sp;
       t
     | None -> (
-      match Hashtbl.find_opt ctx.owners n with
-      | Some [ en ] -> ctor_ty ctx en n
+      match Option.map (fun _ -> variant_scope ctx n sp.file) (Hashtbl.find_opt ctx.owners n) with
+      | Some [ en ] ->
+        (* name the enum when the variant name alone would be ambiguous to the backends *)
+        if List.length (Hashtbl.find ctx.owners n) > 1 then
+          e.edesc <- EField ({ edesc = EVar en; espan = sp; ety = TErr; einst = [] }, n, sp);
+        ctor_ty ctx en n
       | Some ens ->
         err ctx "E0104" sp
           (sprintf "`%s` is a variant of several enums (%s); qualify it, for example `%s.%s`" n
@@ -582,6 +654,12 @@ and check_call ctx f callee args sp =
       err ctx "E0107" sp "`catch` takes 1 argument, a closure with no parameters, as in `catch(|| risky())`";
       check_args ctx f args;
       TErr)
+  | EVar "bytes" when lookup f "bytes" = None && not (Hashtbl.mem ctx.fns "bytes") ->
+    (* bytes([104, 105]): each item 0 to 255, or it panics *)
+    (match args with
+     | [ a ] -> expect ctx f a (TList TInt)
+     | _ -> err ctx "E0107" sp "`bytes` takes 1 argument, a list of Ints from 0 to 255"; check_args ctx f args);
+    TBytes
   | EVar "map" when lookup f "map" = None && not (Hashtbl.mem ctx.fns "map") ->
     let k = fresh () and v = fresh () in
     (match args with
@@ -619,7 +697,7 @@ and check_call ctx f callee args sp =
       check_args ctx f args;
       TErr)
 
-and check_field ctx f recv name nsp =
+and check_field ctx f e recv name nsp =
   match recv.edesc with
   | EVar en when lookup f en = None && Hashtbl.mem ctx.enums en ->
     let vs = Hashtbl.find ctx.variants en in
@@ -630,7 +708,10 @@ and check_field ctx f recv name nsp =
     end
   | _ -> (
     let t = check_expr ctx f recv in
+    let arity = method_arity ~file:nsp.file ctx t name in
     match repr t with
+    | TNamed (n, args) when Hashtbl.mem ctx.sfields n && not (List.mem_assoc name (struct_fields ctx n args)) && arity <> None ->
+      method_value ctx f e recv t name nsp (Option.get arity)
     | TNamed (n, args) when Hashtbl.mem ctx.sfields n -> (
       let fs = struct_fields ctx n args in
       match List.assoc_opt name fs with
@@ -639,6 +720,7 @@ and check_field ctx f recv name nsp =
         let notes = if Hashtbl.mem ctx.fns (n ^ "::" ^ name) then [ sprintf "`%s` is a method; call it with parentheses: `.%s()`" name name ] else [] in
         did_you_mean ctx ~notes "E0103" nsp (sprintf "struct `%s` has no field `%s`" n name) name (List.map fst fs);
         TErr)
+    | TCap Root when (not (List.mem_assoc name root_fields)) && arity <> None -> method_value ctx f e recv t name nsp (Option.get arity)
     | TCap Root -> (
       match List.assoc_opt name root_fields with
       | Some ft -> ft
@@ -649,12 +731,59 @@ and check_field ctx f recv name nsp =
     | TVar _ ->
       err ctx "E0207" recv.espan "the type of this value is not known here; add a type annotation";
       TErr
+    | _ when arity <> None -> method_value ctx f e recv t name nsp (Option.get arity)
     | t ->
       let notes =
-        if List.mem_assoc name (methods t) then [ sprintf "`%s` is a method; call it as `%s()`" name name ] else []
+        if List.mem_assoc name (methods t) then [ sprintf "`%s` changes its receiver in place, so it cannot be a value; call it as `%s(...)`" name name ] else []
       in
       err ctx ~notes "E0103" nsp (sprintf "`%s` has no field `%s`" (show t) name);
       TErr)
+
+(* How many arguments (besides the receiver) method [name] of a value of
+   type [t] takes, if it has one that can be used as a value. *)
+and method_arity ?(file = "") ctx t name =
+  match builtin_method ctx t name file with
+  | Some key -> Some (List.length (Hashtbl.find ctx.fns key).ps - 1)
+  | None ->
+  match repr t with
+  | TNamed (n, _) when Hashtbl.mem ctx.fns (n ^ "::" ^ name) && builtin_tname t = None -> Some (List.length (Hashtbl.find ctx.fns (n ^ "::" ^ name)).ps - 1)
+  | TDyn i -> Option.map (fun (ps, _) -> List.length ps) (Option.bind (Hashtbl.find_opt ifaces i) (List.assoc_opt name))
+  | TParam g ->
+    let bs = Option.value ~default:[] (List.assoc_opt g !cur_bounds) in
+    List.find_map (fun b -> Option.map (fun (ps, _) -> List.length ps) (Option.bind (Hashtbl.find_opt ifaces b) (List.assoc_opt name))) bs
+  | (TList _ | TMap _) when name = "push" || name = "remove" -> None (* they change the receiver *)
+  | t -> Option.map (fun mk -> List.length (fst (mk ()))) (List.assoc_opt name (methods t))
+
+(* `x.name` without a call, where `name` is a method: a closure that calls it
+   on the value `x` had when the expression ran, as if written
+   `{ let $recv = x; |a, b| $recv.name(a, b) }`. The rewritten tree is what
+   both backends see; [recv] is already checked. *)
+and method_value ctx f e recv rt name nsp arity =
+  let sp = e.espan in
+  let mk d = { edesc = d; espan = sp; ety = TErr; einst = [] } in
+  let params = List.init arity (fun i -> ("$a" ^ string_of_int i, None, sp)) in
+  let call = mk (EMethod (mk (EVar "$recv"), name, nsp, List.map (fun (n, _, _) -> mk (EVar n)) params)) in
+  let clo = mk (EClosure (params, call)) in
+  e.edesc <- EBlock { stmts = [ { sdesc = SLet (false, "$recv", recv.espan, None, recv); sspan = sp } ]; tail = Some clo; bspan = sp };
+  push f;
+  bind f "$recv" { vty = rt; vmut = false; vspan = recv.espan; vkind = KLet };
+  let t = check_expr ctx f clo in
+  pop f;
+  t
+
+(* The method [name] that file [file] added to built-in type [t], if any. *)
+and builtin_method ctx t name file =
+  match builtin_tname t with
+  | None -> None
+  | Some tn ->
+    let suffix = tn ^ "::" ^ name in
+    Hashtbl.fold
+      (fun k _ acc ->
+        if acc = None && (k = suffix || String.ends_with ~suffix:("." ^ suffix) k)
+           && (match Hashtbl.find_opt method_owner k with Some (_, fl) -> fl = file | None -> false)
+        then Some k
+        else acc)
+      ctx.fns None
 
 and check_method ctx f e recv name nsp args =
   match recv.edesc with
@@ -666,8 +795,16 @@ and check_method ctx f e recv name nsp args =
       err ctx "E0310" recv.espan (sprintf "cannot spawn into `%s` from inside a closure" g)
         ~notes:[ "call `go` directly in the group's body" ];
     match (name, args) with
-    | "go", [ a ] -> expect ctx f a (TFn ([], t)); TUnit
-    | "go", _ -> err ctx "E0107" nsp "`go` takes 1 argument, a closure with no parameters"; check_args ctx f args; TUnit
+    | ("go" | "#go"), [ a ] ->
+      (* a task that returns () runs for its effect and adds no item to the
+         group's list (the backends see it as `#go`); the others share one type *)
+      let r = fresh () in
+      expect ctx f a (TFn ([], r));
+      (match repr r with
+       | TUnit -> e.edesc <- EMethod (recv, "#go", nsp, args)
+       | _ -> unify_at ctx a.espan t r);
+      TUnit
+    | ("go" | "#go"), _ -> err ctx "E0107" nsp "`go` takes 1 argument, a closure with no parameters"; check_args ctx f args; TUnit
     | _ ->
       err ctx "E0105" nsp (sprintf "a group handle only has `go`, not `%s`" name);
       check_args ctx f args;
@@ -711,7 +848,26 @@ and check_method_value ctx f e recv name nsp args =
       did_you_mean ctx ~notes "E0105" nsp (sprintf "no method `%s` on `%s`" name g) name declared;
       check_args ctx f args;
       TErr)
-  | TNamed (n, _) when Hashtbl.mem ctx.fns (n ^ "::" ^ name) -> (
+  | _ when builtin_method ctx rt name nsp.file <> None -> (
+    (* a method this file added to a built-in type: rewritten to a plain call
+       of `Str::name` (or `mod.Str::name`), receiver first *)
+    let key = Option.get (builtin_method ctx rt name nsp.file) in
+    let env, t = instantiate (Hashtbl.find ctx.fns key) in
+    add_bounds key env nsp;
+    match t with
+    | TFn (p0 :: ps, r) ->
+      unify_at ctx recv.espan p0 rt;
+      if List.length ps <> List.length args then begin
+        err ctx "E0107" nsp
+          (sprintf "method `%s` takes %d argument%s besides `self`, but %d %s supplied" name (List.length ps)
+             (plural (List.length ps)) (List.length args) (if List.length args = 1 then "was" else "were"));
+        check_args ctx f args
+      end
+      else List.iter2 (fun a p -> expect ctx f a p) args ps;
+      e.edesc <- ECall ({ edesc = EVar key; espan = nsp; ety = t; einst = env }, recv :: args);
+      r
+    | _ -> check_args ctx f args; TErr)
+  | TNamed (n, _) when Hashtbl.mem ctx.fns (n ^ "::" ^ name) && builtin_tname rt = None -> (
     (* a method: `fn name(self: T, ...)`, called with the receiver first *)
     let env, t = instantiate (Hashtbl.find ctx.fns (n ^ "::" ^ name)) in
     e.einst <- env;
@@ -801,9 +957,11 @@ and check_method_value ctx f e recv name nsp args =
       else List.iter2 (fun a p -> expect ctx f a p) args ps;
       (match (name, rt) with
        | "sort", TList a -> (
-         match repr a with
-         | TInt | TFloat | TStr | TVar _ | TErr -> ()
-         | t -> err ctx "E0201" nsp (sprintf "only lists of Int, Float or Str can be sorted, found `List[%s]`" (show t)))
+         match unordered ctx a with
+         | None -> ()
+         | Some t ->
+           err ctx "E0201" nsp (sprintf "`List[%s]` cannot be sorted: `%s` has no order" (show a) (show t))
+             ~notes:[ "numbers, strings, Bool, and lists, tuples, structs and enums of them are ordered; for another order use `list.sort_by(xs, less)`" ])
        | _ -> ());
       r)
 
@@ -877,6 +1035,11 @@ and check_bin ctx f op a b sp =
     unify_at ctx a.espan TBool ta;
     expect ctx f b TBool;
     TBool
+  | Range ->
+    (* `lo..<hi`: the Ints from lo up to but not including hi *)
+    unify_at ctx a.espan TInt ta;
+    expect ctx f b TInt;
+    TList TInt
   | Else -> (
     (* `opt ?? default`: the value inside, or the default when there is none *)
     match repr ta with
@@ -896,16 +1059,16 @@ and check_bin ctx f op a b sp =
     let name =
       match op with
       | Add -> "+" | Sub -> "-" | Mul -> "*" | Div -> "/" | Mod -> "%" | Eq -> "==" | Ne -> "!="
-      | Lt -> "<" | Le -> "<=" | Gt -> ">" | Ge -> ">=" | And -> "&&" | Or -> "||" | Else -> "??"
+      | Lt -> "<" | Le -> "<=" | Gt -> ">" | Ge -> ">=" | And -> "&&" | Or -> "||" | Else -> "??" | Range -> "..<"
     in
     let bad () =
       err ctx "E0201" sp (sprintf "operator `%s` cannot be applied to `%s`" name (show t))
     in
     match op with
-    | Add -> (match t with TInt | TFloat | TStr | TErr | TVar _ -> t | _ -> bad (); TErr)
+    | Add -> (match t with TInt | TFloat | TStr | TBytes | TErr | TVar _ -> t | _ -> bad (); TErr)
     | Sub | Mul | Div -> (match t with TInt | TFloat | TErr | TVar _ -> t | _ -> bad (); TErr)
     | Mod -> (match t with TInt | TErr | TVar _ -> t | _ -> bad (); TErr)
-    | Lt | Le | Gt | Ge -> (match t with TInt | TFloat | TStr | TErr | TVar _ -> () | _ -> bad ()); TBool
+    | Lt | Le | Gt | Ge -> (match unordered ctx t with None -> () | Some _ -> bad ()); TBool
     | _ -> (match t with TFn _ | TCap _ | TChan _ | TDyn _ -> bad () | _ -> ()); TBool)
 
 and check_closure ctx f ps body want =
@@ -972,15 +1135,18 @@ and check_struct_lit ctx f name nsp fields sp =
            name);
     TNamed (name, targs)
 
-and check_match ctx f s arms sp =
+and check_match ?want ctx f s arms sp =
   let st = check_expr ctx f s in
-  let result = fresh () in
+  let result = match want with Some w -> w | None -> fresh () in
   List.iter
     (fun arm ->
       push f;
       check_pat ctx f st arm.apat;
-      let bt = check_expr ctx f arm.abody in
-      unify_at ctx arm.abody.espan result bt;
+      (match want with
+       | Some w -> expect ctx f arm.abody w
+       | None ->
+         let bt = check_expr ctx f arm.abody in
+         unify_at ctx arm.abody.espan result bt);
       pop f)
     arms;
   (match arms with
@@ -1034,7 +1200,7 @@ and check_pat ctx f t p =
         match rt with
         | TNamed (n, _) when Hashtbl.mem ctx.variants n && List.mem_assoc v (Hashtbl.find ctx.variants n) -> Some n
         | _ -> (
-          match Hashtbl.find_opt ctx.owners v with
+          match Option.map (fun _ -> variant_scope ctx v p.pspan.file) (Hashtbl.find_opt ctx.owners v) with
           | Some [ e ] -> Some e
           | Some (e :: _ as es) ->
             err ctx "E0104" p.pspan
@@ -1197,6 +1363,15 @@ and check_block ctx f b =
   pop f;
   t
 
+(* A block checked against the type its value must have. *)
+and expect_block ctx f b want =
+  push f;
+  let diverges = List.fold_left (fun d s -> check_stmt ctx f s || d) false b.stmts in
+  (match b.tail with
+   | Some e -> expect ctx f e want
+   | None -> if not diverges then unify_at ctx { b.bspan with lo = max b.bspan.lo (b.bspan.hi - 1) } want TUnit);
+  pop f
+
 (* Returns true when the statement never falls through. *)
 and check_stmt ctx f s : bool =
   match s.sdesc with
@@ -1213,19 +1388,14 @@ and check_stmt ctx f s : bool =
     false
   | SAssign (lhs, rhs) ->
     check_place ctx f lhs;
-    let rec through_map_entry (e : expr) =
-      match e.edesc with
-      | EField (r, _, _) | EIndex (r, _) -> (
-        match r.edesc with
-        | EIndex (m, _) when (match repr m.ety with TMap _ -> true | _ -> false) -> true
-        | _ -> through_map_entry r)
-      | _ -> false
-    in
     let is_group = match lhs.edesc with EVar n -> (match lookup f n with Some (v, _) -> v.vkind = KGroup | None -> false) | _ -> false in
     let lt = if is_group then TErr else check_expr ctx f lhs in
-    if through_map_entry lhs then
-      err ctx "E0209" lhs.espan "a map entry can only be replaced whole"
-        ~notes:[ "read it, change the copy, and store it back: `let mut e = m[k]` ... `m[k] = e`" ];
+    (match lhs.edesc with
+     | EBlock _ -> err ctx "E0209" lhs.espan "a method cannot be assigned to"
+     | EIndex (b, _) when repr b.ety = TBytes ->
+       err ctx "E0209" lhs.espan "`Bytes` cannot be changed in place"
+         ~notes:[ "build a new value: `b.slice(0, i) + bytes([x]) + b.slice(i + 1, b.len())`" ]
+     | _ -> ());
     expect ctx f rhs lt;
     false
   | SExpr e -> ignore (check_expr ctx f e); false
@@ -1284,14 +1454,42 @@ let check_main ctx (d : fn_decl) (s : fsig) =
     err ctx "E0303" d.fn_span "`main` has the wrong signature"
       ~notes:[ "write `fn main(root: Root)`, `fn main(root: Root) -> Int` (the exit code) or `fn main(root: Root) -> Result[(), E]`" ]
 
+(* Map keys: Int, Str, Bool, and tuples, structs and enums made of them.
+   Returns the first type in the way, if any. *)
+let unkeyable ctx t : ty option =
+  let seen = Hashtbl.create 8 in
+  let rec go t =
+    match repr t with
+    | TInt | TStr | TBytes | TBool | TVar _ | TErr -> None
+    | TNamed (n, args) as nt -> (
+      let key = show nt in
+      if Hashtbl.mem seen key then None
+      else begin
+        Hashtbl.replace seen key ();
+        match Hashtbl.find_opt ctx.structs n with
+        | Some s ->
+          let env = List.combine s.st_gen args in
+          List.find_map (fun (_, ft) -> go (subst env ft)) (Option.value ~default:[] (Hashtbl.find_opt ctx.sfields n))
+        | None -> (
+          match Hashtbl.find_opt ctx.enums n with
+          | Some e ->
+            let env = List.combine e.en_gen args in
+            List.find_map (fun (_, ps) -> List.find_map (fun p -> go (subst env p)) ps) (Option.value ~default:[] (Hashtbl.find_opt ctx.variants n))
+          | None -> Some nt)
+      end)
+    | t -> Some t
+  in
+  go t
+
 let check_pending ctx =
   List.iter
     (fun (sp, k) ->
-      match repr k with
-      | TInt | TStr | TBool | TVar _ | TErr -> ()
-      | t ->
-        err ctx "E0113" sp (sprintf "map keys must be Int, Str or Bool, not `%s`" (show t))
-          ~notes:[ "use a string or number that identifies the value, for example its name or id" ])
+      match unkeyable ctx k with
+      | None -> ()
+      | Some t ->
+        let inner = if show t = show (repr k) then "" else sprintf " (it holds `%s`)" (show t) in
+        err ctx "E0113" sp (sprintf "`%s` cannot be a map key%s" (show (repr k)) inner)
+          ~notes:[ "keys are Int, Str, Bool, and tuples, structs and enums made of them; Float, List and Map cannot be keys" ])
     !map_keys;
   map_keys := [];
   let ps = List.rev !pending in
@@ -1317,11 +1515,10 @@ let check_fn ctx (d : fn_decl) (s : fsig) =
     (fun p t -> Hashtbl.replace scope.vars p.prm_name { vty = t; vmut = false; vspan = p.prm_span; vkind = KParam })
     d.fn_params s.ps;
   let f = { ret_ty = s.ret; scopes = [ scope ]; loops = 0; genv; in_group = 0 } in
+  match repr s.ret with
+  | TDyn _ -> expect_block ctx f d.fn_body s.ret (* the body's value becomes `dyn`, branch by branch *)
+  | _ ->
   let bt = check_block ctx f d.fn_body in
-  (match (repr s.ret, d.fn_body.tail) with
-   | TDyn i, Some e when (match repr bt with TDyn _ -> false | _ -> true) -> coerce ctx e bt i
-   | _ -> ());
-  let bt = match (repr s.ret, d.fn_body.tail) with TDyn _, Some e -> e.ety | _ -> bt in
   try unify s.ret bt
   with Mismatch ->
     let b = d.fn_body in
@@ -1352,9 +1549,17 @@ let check_self ctx d ps =
     match t0 with
     | TNamed (n, _) when (Hashtbl.mem ctx.structs n || Hashtbl.mem ctx.enums n) && not (builtin n) -> ()
     | TErr -> ()
+    | t when builtin_tname t <> None ->
+      (* a method on a built-in type: private to its file, and no clash with a built-in method *)
+      let name = match String.rindex_opt d.fn_name ':' with Some i -> String.sub d.fn_name (i + 1) (String.length d.fn_name - i - 1) | None -> d.fn_name in
+      if List.mem_assoc name (methods t) then
+        err ctx "E0106" d.fn_span (sprintf "`%s` already has a built-in method `%s`" (show t) name)
+      else if d.fn_pub then
+        err ctx "E0110" d.fn_span (sprintf "a method on built-in type `%s` cannot be `pub`: it is private to the file that defines it" (show t))
+          ~notes:[ "export a plain function instead, as in `pub fn shout(s: Str) -> Str`" ]
     | t ->
       err ctx "E0110" prm_span
-        (sprintf "methods can only be defined on struct and enum types declared in the program, not on `%s`" (show t))
+        (sprintf "methods can only be defined on struct and enum types and on Int, Float, Bool, Str, List, Map, Option, Result and IoError, not on `%s`" (show t))
         ~notes:[ "write a plain function that takes the value instead, and rename the parameter" ])
   | _ -> ()
 
@@ -1445,6 +1650,34 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
           Hashtbl.replace ctx.variants e.en_name vs
         end
       | IFn _ | IIface _ -> ())
+    items;
+  (* 2b. a struct cannot hold itself by value (it would be infinitely large);
+     enums, lists and maps hold their contents indirectly, so recursion goes
+     through them: `next: Option[Node]` *)
+  List.iter
+    (function
+      | IStruct s when registered ctx.structs s.st_name s ->
+        let seen = Hashtbl.create 8 in
+        let rec reaches path t =
+          match repr t with
+          | TArray (a, _) -> reaches path a
+          | TNamed (n, args) when Hashtbl.mem ctx.sfields n ->
+            if n = s.st_name && path <> [] then Some path
+            else if Hashtbl.mem seen (show t) then None
+            else begin
+              Hashtbl.replace seen (show t) ();
+              let env = List.combine (Hashtbl.find ctx.structs n).st_gen args in
+              List.find_map (fun (fname, ft) -> reaches (path @ [ fname ]) (subst env ft)) (Hashtbl.find ctx.sfields n)
+            end
+          | _ -> None
+        in
+        (match reaches [] (TNamed (s.st_name, List.map (fun g -> TParam g) s.st_gen)) with
+         | Some path ->
+           err ctx "E0114" s.st_span
+             (sprintf "struct `%s` contains itself through `%s`, so it would be infinitely large" s.st_name (String.concat "." path))
+             ~notes:[ sprintf "hold the inner value in an `Option`, an enum or a `List`, as in `next: Option[%s]`; those store it indirectly" s.st_name ]
+         | None -> ())
+      | _ -> ())
     items;
   (* 3. function signatures *)
   let sigs =

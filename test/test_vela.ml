@@ -211,6 +211,7 @@ let out name ?grants ?modules ?feed src want =
   end
 
 let errs ?modules name src want =
+  if selected name then
   let _, ds, _ = compile ?modules name src in
   ok name (codes ds = want) (sprintf "got [%s], want [%s]" (String.concat " " (codes ds)) (String.concat " " want))
 
@@ -1725,9 +1726,28 @@ fn main(root: Root) -> Result[(), IoError] {
 
   (* ---------- methods ---------- *)
   out "methods" (example "methods.vela") "8.0 12.0\ncircle at 8.0,12.0 with area 3.0\nrect with area 96.0\none 1 1\n10 25\n";
-  errs "method-on-builtin" "fn double(self: Int) -> Int {\n    self * 2\n}\n\nfn main() {}\n" [ "E0110" ];
+  errs "method-on-capability" "fn twice(self: Clock) -> Int {\n    self.now_ms() * 2\n}\n\nfn main() {}\n" [ "E0110" ];
   errs "method-self-not-first" "struct P {\n    a: Int,\n}\n\nfn f(x: Int, self: P) -> Int {\n    x\n}\n\nfn main() {}\n" [ "E0110" ];
-  errs "method-on-option" "fn f(self: Option[Int]) -> Int {\n    1\n}\n\nfn main() {}\n" [ "E0110" ];
+  errs "method-on-builtin-pub" "pub fn double(self: Int) -> Int {\n    self * 2\n}\n\nfn main() {}\n" [ "E0110" ];
+  errs "method-on-builtin-clash" "fn len(self: Str) -> Int {\n    0\n}\n\nfn main() {}\n" [ "E0106" ];
+  out "methods-on-builtins"
+    ("fn shout(self: Str) -> Str {\n    self.to_upper() + \"!\"\n}\n\nfn double(self: Int) -> Int {\n    self * 2\n}\n\n"
+     ^ "fn second[T](self: List[T]) -> Option[T] {\n    self.get(1)\n}\n\nfn or_zero(self: Option[Int]) -> Int {\n    self ?? 0\n}\n\n"
+     ^ "fn total[K](self: Map[K, Int]) -> Int {\n    self.values().sum()\n}\n\n"
+     ^ "fn describe(self: IoError) -> Str {\n    match self {\n        Denied(m) => \"denied: \" + m,\n        Failed(m) => \"failed: \" + m,\n    }\n}\n\n"
+     ^ "fn half(self: Float) -> Float {\n    self / 2.0\n}\n\nfn flip(self: Bool) -> Bool {\n    !self\n}\n\n"
+     ^ "fn main(root: Root) {\n    let out = root.stdout\n    let f = \"hi\".shout\n"
+     ^ "    out.print(\"{\"hey\".shout()} {21.double().double()} {[1, 2, 3].second()} {[\"a\"].second()} {f()}\")\n"
+     ^ "    out.print(\"{Some(4).or_zero()} {None.or_zero()} {map([(\"a\", 1), (\"b\", 2)]).total()} {Denied(\"x\").describe()}\")\n"
+     ^ "    out.print(\"{[1, 2].map(|x| x.double())} {3.0.half()} {true.flip()}\")\n}\n")
+    "HEY! 84 Some(2) None HI!\n4 0 3 denied: x\n[2, 4] 1.5 false\n";
+  (* each file's methods on built-in types are its own *)
+  let strs = "pub fn yell(s: Str) -> Str {\n    s.shout()\n}\n\nfn shout(self: Str) -> Str {\n    self + \"!!\"\n}\n" in
+  out "methods-on-builtins-per-module" ~modules:[ ("strs", strs) ]
+    "use strs\n\nfn shout(self: Str) -> Str {\n    self + \"?\"\n}\n\nfn main(root: Root) {\n    root.stdout.print(\"{\"a\".shout()} {strs.yell(\"b\")}\")\n}\n"
+    "a? b!!\n";
+  errs "methods-on-builtins-not-imported" ~modules:[ ("strs", strs) ]
+    "use strs\n\nfn main(root: Root) {\n    root.stdout.print(\"a\".shout())\n}\n" [ "E0105" ];
   let pdecl = "struct P {\n    a: Int,\n}\n\nfn g(self: P) -> Int {\n    self.a\n}\n\n" in
   errs "method-unknown" (pdecl ^ "fn main() {\n    let x = P { a: 1 }.h()\n}\n") [ "E0105" ];
   errs "method-arity" (pdecl ^ "fn main() {\n    let x = P { a: 1 }.g(2)\n}\n") [ "E0107" ];
@@ -1779,6 +1799,7 @@ fn main(root: Root) -> Result[(), IoError] {
   panics "task-panic-uncaught" "fn main(root: Root) {\n    let xs = group g {\n        g.go(|| 1)\n        g.go(|| [1][3])\n    }\n}\n" "index 3 is out of range for a list of length 1";
   (* what a panic abandons is freed: these must end with 0 objects alive *)
   out "catch-frees-abandoned" "fn work(i: Int) -> Int {\n    let mut xs = []\n    let mut m: Map[Str, List[Int]] = map()\n    let mut k = 0\n    while k < 20 {\n        xs.push(\"item {k}\")\n        m[\"k{k}\"] = [k, k + 1]\n        k = k + 1\n    }\n    let f = |n: Int| xs.len() + n\n    if i % 2 == 0 {\n        panic(\"bad {i}\")\n    }\n    f(m.len())\n}\n\nfn main(root: Root) {\n    let mut ok = 0\n    let mut bad = 0\n    let mut i = 0\n    while i < 10000 {\n        match catch(|| work(i)) {\n            Ok(_) => { ok = ok + 1 },\n            Err(_) => { bad = bad + 1 },\n        }\n        i = i + 1\n    }\n    let r = catch(|| group g {\n        for n in [1, 2, 3] {\n            g.go(|| work(n))\n        }\n    })\n    root.stdout.print(\"{ok} {bad} {r.is_err()}\")\n}\n" "5000 5000 true\n";
+  out "group-deadline-skips-unit-tasks" "fn main(root: Root) {\n    let out = root.stdout\n    let clock = root.clock\n    let rs = group g until clock.after(200) {\n        g.go(|| 1)\n        g.go(|| out.print(\"side\"))\n        g.go(|| {\n            clock.sleep(5000)\n            3\n        })\n        g.go(|| 4)\n    }\n    out.print(\"{rs}\")\n    let plain = group g {\n        g.go(|| out.print(\"a\"))\n        g.go(|| 7)\n    }\n    out.print(\"{plain}\")\n}\n" "side\n[Some(1), None, Some(4)]\na\n[7]\n";
   out "catch-unwinds-main-loop" "struct Req { path: Str, tags: List[Str] }\n\nfn handle(r: Req) -> Int {\n    let n = r.tags.len()\n    if r.path == \"/bad\" {\n        panic(\"bad path\")\n    }\n    n\n}\n\nfn main(root: Root) {\n    let mut i = 0\n    let mut errs = 0\n    while i < 100 {\n        let req = Req { path: if i % 2 == 0 { \"/bad\" } else { \"/ok\" }, tags: [\"a{i}\", \"b\"] }\n        match catch(|| handle(req)) {\n            Ok(_) => {},\n            Err(_) => { errs = errs + 1 },\n        }\n        i = i + 1\n    }\n    root.stdout.print(\"{errs}\")\n}\n" "50\n";
   check_tsan "group-body-panics-tsan" "fn slow(n: Int) -> Int {\n    let mut i = 0\n    let mut s = 0\n    while i < 20000 {\n        s = s + i % (n + 1)\n        i = i + 1\n    }\n    s\n}\n\nfn main(root: Root) {\n    let mut k = 0\n    let mut errs = 0\n    while k < 50 {\n        let r = catch(|| group g {\n            g.go(|| slow(1))\n            g.go(|| slow(2))\n            panic(\"boom {k}\")\n        })\n        if r.is_err() { errs = errs + 1 }\n        k = k + 1\n    }\n    root.stdout.print(\"{errs}\")\n}\n" "50\n";
 
@@ -2630,7 +2651,29 @@ fn main(root: Root) {
   panics "map-missing-key" (main_wrap "    let m = map([(\"a\", 1)])\n    out.print(\"{m[\"b\"]}\")") "key \"b\" is not in the map";
   out "maps-stress" ~grants:{ Interp.no_grants with seed = Some 7 } "fn main(root: Root) {\n    let out = root.stdout\n    let r = root.rand\n    let mut m: Map[Int, Str] = map()\n    let mut sum = 0\n    let mut i = 0\n    while i < 20000 {\n        let k = r.int(0, 500)\n        let op = r.int(0, 3)\n        if op == 0 {\n            m[k] = \"v{k}\"\n        } else if op == 1 {\n            m.remove(k)\n        } else {\n            sum = sum + m.get(k).map(|s| s.len()) ?? 0\n        }\n        i = i + 1\n    }\n    out.print(\"{m.len()} {sum} {m.keys().take(8)} {m.values().take(3)}\")\n    let copy = m\n    m.remove(m.keys()[0])\n    out.print(\"{copy.len()} {m.len()} {copy == m}\")\n    // maps handed to concurrent tasks\n    let parts = group g {\n        for d in [0, 1, 2, 3] {\n            g.go(|| copy.keys().filter(|k| k % 4 == d).len())\n        }\n    }\n    out.print(\"{parts} {parts.sum() == copy.len()}\")\n}\n" "273 12086 [461, 206, 21, 361, 292, 414, 473, 199] [\"v461\", \"v206\", \"v21\"]\n273 272 false\n[76, 71, 63, 63] true\n";
   errs "map-key-type" (main_wrap "    let mut m = map()\n    m[1.5] = 1") [ "E0113" ];
-  errs "map-entry-field" "struct P {\n    x: Int,\n}\n\nfn main() {\n    let mut m = map([(1, P { x: 1 })])\n    m[1].x = 2\n}\n" [ "E0209" ];
+  errs "map-key-list" (main_wrap "    let mut m = map()\n    m[[1]] = 1") [ "E0113" ];
+  errs "map-key-struct-float" "struct P {\n    x: Float,\n}\n\nfn main() {\n    let mut m = map()\n    m[P { x: 1.0 }] = 1\n}\n" [ "E0113" ];
+  errs "map-entry-immutable" "struct P {\n    x: Int,\n}\n\nfn main() {\n    let m = map([(1, P { x: 1 })])\n    m[1].x = 2\n}\n" [ "E0205" ];
+  out "map-keys-composite"
+    ("struct Pos {\n    x: Int,\n    y: Int,\n}\n\nenum Color {\n    Red,\n    Rgb(Int, Int, Int),\n}\n\nenum Path {\n    End,\n    Step(Str, Path),\n}\n\n"
+     ^ "fn main(root: Root) {\n    let out = root.stdout\n    let mut grid: Map[Pos, Str] = map()\n    grid[Pos { x: 1, y: 2 }] = \"a\"\n    grid[Pos { x: 0, y: 0 }] = \"b\"\n    grid[Pos { x: 1, y: 2 }] = \"c\"\n"
+     ^ "    out.print(\"{grid} {grid.get(Pos { x: 0, y: 0 })} {grid.contains(Pos { x: 5, y: 5 })}\")\n"
+     ^ "    let mut pairs = map([((1, \"a\"), 10), ((2, \"b\"), 20)])\n    pairs[(1, \"a\")] = pairs[(1, \"a\")] + 1\n    pairs.remove((2, \"b\"))\n    out.print(\"{pairs} {pairs.keys()}\")\n"
+     ^ "    let mut colors = map([(Red, \"red\"), (Rgb(0, 0, 255), \"blue\")])\n    colors[Rgb(0, 255, 0)] = \"green\"\n    out.print(\"{colors[Rgb(0, 0, 255)]} {colors.entries()}\")\n"
+     ^ "    let mut paths = map()\n    paths[Step(\"a\", Step(\"b\", End))] = 1\n    paths[Step(\"a\", End)] = 2\n    out.print(\"{paths[Step(\"a\", Step(\"b\", End))]} {paths.get(End)} {paths == map([(Step(\"a\", End), 2), (Step(\"a\", Step(\"b\", End)), 1)])}\")\n"
+     ^ "    let mut big: Map[(Int, Int), Int] = map()\n    for i in 0..<1000 {\n        big[(i % 37, i % 11)] = i\n    }\n    out.print(\"{big.len()} {big[(5, 6)]}\")\n}\n")
+    ("{Pos { x: 1, y: 2 }: \"c\", Pos { x: 0, y: 0 }: \"b\"} Some(\"b\") false\n{(1, \"a\"): 11} [(1, \"a\")]\n"
+     ^ "blue [(Red, \"red\"), (Rgb(0, 0, 255), \"blue\"), (Rgb(0, 255, 0), \"green\")]\n1 None true\n407 930\n");
+  out "map-entry-update"
+    ("struct Stats {\n    hits: Int,\n    names: List[Str],\n}\n\n"
+     ^ "fn main(root: Root) {\n    let out = root.stdout\n    let mut st: Map[Str, Stats] = map()\n    st[\"a\"] = Stats { hits: 0, names: [] }\n"
+     ^ "    st[\"a\"].hits = st[\"a\"].hits + 5\n    st[\"a\"].names.push(\"x\")\n    st[\"a\"].names.push(\"y\")\n    st[\"a\"].names[0] = \"z\"\n"
+     ^ "    let copy = st\n    st[\"a\"].hits = 99\n    out.print(\"{st} {copy}\")\n"
+     ^ "    let mut nested: Map[Str, Map[(Int, Bool), List[Int]]] = map()\n    nested[\"n\"] = map()\n    nested[\"n\"][(3, true)] = [1]\n    nested[\"n\"][(3, true)].push(2)\n    nested[\"n\"].remove((4, false))\n"
+     ^ "    let mut lists = [map([(1, Stats { hits: 1, names: [] })])]\n    lists[0][1].hits = 7\n    out.print(\"{nested} {lists}\")\n}\n")
+    ("{\"a\": Stats { hits: 99, names: [\"z\", \"y\"] }} {\"a\": Stats { hits: 5, names: [\"z\", \"y\"] }}\n"
+     ^ "{\"n\": {(3, true): [1, 2]}} [{1: Stats { hits: 7, names: [] }}]\n");
+  panics "map-entry-missing" "struct P {\n    x: Int,\n}\n\nfn main() {\n    let mut m = map([(\"a\", P { x: 1 })])\n    m[\"b\"].x = 2\n}\n" "key \"b\" is not in the map";
   errs "map-remove-immutable" (main_wrap "    let m = map([(1, 2)])\n    m.remove(1)") [ "E0205" ];
   errs "tuple-match-not-exhaustive" "fn f(p: (Bool, Bool)) -> Int {\n    match p {\n        (true, _) => 1,\n        (false, true) => 2,\n    }\n}\n\nfn main() {}\n" [ "E0204" ];
   errs "tuple-let-refutable" "fn main() {\n    let (1, b) = (1, 2)\n}\n" [ "E0003" ];
@@ -2649,6 +2692,131 @@ fn main(root: Root) {
   out "dyn-across-modules" ~modules:[ ("geo", geo) ]
     "use geo\n\nstruct Sq {\n    s: Int,\n}\n\nstruct Ln {\n    n: Int,\n}\n\nfn area(self: Sq) -> Int {\n    self.s * self.s\n}\n\nfn area(self: Ln) -> Int {\n    self.n\n}\n\nfn main(root: Root) {\n    let xs: List[dyn geo.Area] = [Sq { s: 3 }, Ln { n: 4 }]\n    root.stdout.print(\"{geo.sum(xs)} {geo.sum([Ln { n: 1 }])}\")\n}\n"
     "13 1\n";
+
+  (* the expected `dyn` type reaches every branch of `if` and `match` *)
+  out "dyn-branches"
+    (dshape ^ "struct Sq {\n    s: Float,\n}\n\nfn area(self: Sq) -> Float {\n    self.s * self.s\n}\n\n"
+     ^ "fn pick(n: Int) -> dyn Shape {\n    if n > 1 { C { r: 1.5 } } else { Sq { s: 2.0 } }\n}\n\n"
+     ^ "fn by_match(n: Int) -> dyn Shape {\n    match n {\n        0 => Sq { s: 3.0 },\n        _ => {\n            let r = 0.5\n            C { r }\n        },\n    }\n}\n\n"
+     ^ "fn main(root: Root) {\n    let big = false\n    let s: dyn Shape = if big { C { r: 2.0 } } else { Sq { s: 1.0 } }\n"
+     ^ "    let t: dyn Shape = match 3 {\n        1 => Sq { s: 1.5 },\n        _ => C { r: 7.0 },\n    }\n"
+     ^ "    let xs: List[dyn Shape] = [s, t, pick(0), pick(2), by_match(0), by_match(1)]\n"
+     ^ "    let ys: List[dyn Shape] = if big { [C { r: 1.0 }] } else { [Sq { s: 4.0 }, C { r: 9.0 }] }\n"
+     ^ "    root.stdout.print(\"{xs.map(|x| x.area())} {ys} {ys.map(|y| y.area())}\")\n}\n")
+    "[1.0, 7.0, 4.0, 1.5, 9.0, 0.5] [Sq { s: 4.0 }, C { r: 9.0 }] [16.0, 9.0]\n";
+  errs "dyn-branch-not-satisfied" (dshape ^ "fn main() {\n    let s: dyn Shape = if true { C { r: 1.0 } } else { Bad { n: 1 } }\n}\n") [ "E0111" ];
+  errs "if-branches-still-agree" "fn main() {\n    let x = if true { 1 } else { \"a\" }\n}\n" [ "E0201" ];
+
+  (* ---------- ordering: sort() and < on any ordered type ---------- *)
+  out "sort-any"
+    ("struct P {\n    x: Int,\n    name: Str,\n}\n\nenum Tree {\n    Leaf,\n    Node(Tree, Int, Tree),\n}\n\nenum Size {\n    Small,\n    Big(Int),\n}\n\n"
+     ^ "fn main(root: Root) {\n    let out = root.stdout\n"
+     ^ "    out.print(\"{[(2, \"b\"), (1, \"z\"), (2, \"a\"), (1, \"a\")].sort()}\")\n"
+     ^ "    out.print(\"{[P { x: 2, name: \"a\" }, P { x: 1, name: \"b\" }, P { x: 1, name: \"a\" }].sort()}\")\n"
+     ^ "    out.print(\"{[Big(3), Small, Big(1), Small].sort()} {Small < Big(0)} {Big(2) >= Big(2)}\")\n"
+     ^ "    out.print(\"{[[3, 1], [2], [], [3]].sort()} {[true, false].sort()} {[[\"b\"], [\"a\", \"c\"]].sort()}\")\n"
+     ^ "    out.print(\"{[Some(2.5), None, Some(-1.0)].sort()} {(1, \"b\") < (1, \"c\")} {[(), ()].sort()}\")\n"
+     ^ "    let t = Node(Leaf, 2, Leaf)\n    out.print(\"{[t, Leaf, Node(t, 1, Leaf), Node(Leaf, 1, t)].sort()}\")\n"
+     ^ "    let a: Array[(Int, Str), 2] = [(2, \"x\"), (1, \"y\")]\n    out.print(\"{[a, [(1, \"z\"), (5, \"q\")]].sort()}\")\n}\n")
+    ("[(1, \"a\"), (1, \"z\"), (2, \"a\"), (2, \"b\")]\n[P { x: 1, name: \"a\" }, P { x: 1, name: \"b\" }, P { x: 2, name: \"a\" }]\n"
+     ^ "[Small, Small, Big(1), Big(3)] true true\n[[], [2], [3], [3, 1]] [false, true] [[\"a\", \"c\"], [\"b\"]]\n"
+     ^ "[Some(-1.0), Some(2.5), None] true [(), ()]\n"
+     ^ "[Leaf, Node(Leaf, 1, Node(Leaf, 2, Leaf)), Node(Leaf, 2, Leaf), Node(Node(Leaf, 2, Leaf), 1, Leaf)]\n"
+     ^ "[[(1, \"z\"), (5, \"q\")], [(2, \"x\"), (1, \"y\")]]\n");
+  errs "sort-unordered" "fn main() {\n    let m: Map[Int, Int] = map()\n    let xs = [m].sort()\n}\n" [ "E0201" ];
+  errs "sort-unordered-field" "struct H {\n    m: Map[Str, Int],\n}\n\nfn main() {\n    let xs = [H { m: map() }].sort()\n}\n" [ "E0201" ];
+  errs "less-unordered" "fn main() {\n    let a: Map[Int, Int] = map()\n    let b = a < a\n}\n" [ "E0201" ];
+  errs "sort-generic" "fn f[T](xs: List[T]) -> List[T] {\n    xs.sort()\n}\n\nfn main() {}\n" [ "E0201" ];
+
+  (* ---------- ranges and characters ---------- *)
+  out "range-for"
+    (main_wrap
+       "    let n = 6\n    let mut total = 0\n    for i in 0..<n {\n        if i == 1 {\n            continue\n        }\n        if i == 5 {\n            break\n        }\n        total = total + i\n    }\n    out.print(\"{total} {0..<4} {(2..<n + 1).map(|x| x * x)} {5..<2} {(0..<0).len()} {-2..<1}\")\n    let xs = [\"a\", \"b\"]\n    for k in 0..<xs.len() {\n        out.write(\"{k}={xs[k]} \")\n    }\n    let mut big = 0\n    for i in 9223372036854775805..<9223372036854775807 {\n        big = big + 1\n    }\n    let r = 1..<3\n    for x in r {\n        out.write(\"{x}\")\n    }\n    out.print(\" {big} {(0..<3) == [0, 1, 2]}\")")
+    "9 [0, 1, 2, 3] [4, 9, 16, 25, 36] [] 0 [-2, -1, 0]\n0=a 1=b 12 2 true\n";
+  out "range-in-closure-and-task"
+    (main_wrap "    let r = group g {\n        for i in 0..<3 {\n            g.go(|| (0..<i + 1).fold(0, |a, b| a + b))\n        }\n    }\n    out.print(\"{r}\")")
+    "[0, 1, 3]\n";
+  errs "range-not-int" "fn main() {\n    let r = 0..<2.5\n}\n" [ "E0201" ];
+  errs "range-not-int-lo" "fn main() {\n    for i in \"a\"..<3 {\n    }\n}\n" [ "E0201" ];
+  out "str-chars"
+    (main_wrap
+       "    let mut seen = \"\"\n    for c in \"h\u{e9}llo, \u{4e16}\u{754c}!\".chars() {\n        seen = seen + \"[\" + c + \"]\"\n    }\n    out.print(seen)\n    let broken = \"\u{e9}\".slice(0, 1) + \"x\" + \"\u{4e16}\".slice(0, 2) + \"\u{1f600}\"\n    out.print(\"{broken.chars().map(|c| c.len())} {\"\".chars()} {\"ab\".chars()} {broken.chars().join(\"\") == broken}\")")
+    "[h][\u{e9}][l][l][o][,][ ][\u{4e16}][\u{754c}][!]\n[1, 1, 1, 1, 4] [] [\"a\", \"b\"] true\n";
+
+  (* ---------- methods as values ---------- *)
+  out "method-values"
+    ("interface Shape {\n    fn area(self) -> Float\n}\n\nstruct Circle {\n    r: Float,\n}\n\nstruct Counter {\n    n: Int,\n    name: Str,\n}\n\nenum Op {\n    Add(Int),\n    Neg,\n}\n\n"
+     ^ "fn area(self: Circle) -> Float {\n    3.0 * self.r * self.r\n}\n\nfn plus(self: Counter, k: Int) -> Int {\n    self.n + k\n}\n\n"
+     ^ "fn apply(self: Op, x: Int) -> Int {\n    match self {\n        Add(k) => x + k,\n        Neg => -x,\n    }\n}\n\n"
+     ^ "fn run_all(fs: List[fn() -> Float]) -> List[Float] {\n    fs.map(|f| f())\n}\n\nfn later[T: Shape](x: T) -> fn() -> Float {\n    x.area\n}\n\n"
+     ^ "fn main(root: Root) {\n    let out = root.stdout\n    let mut c = Counter { n: 10, name: \"c\" }\n    let add = c.plus\n    c.n = 100\n"
+     ^ "    out.print(\"{add(1)} {[1, 2, 3].map(c.plus)} {[1, 2].map(Add(5).apply)} {[3].map(Neg.apply)}\")\n"
+     ^ "    let a = Circle { r: 1.0 }.area\n    let d: dyn Shape = Circle { r: 2.0 }\n    out.print(\"{run_all([a, d.area, later(Circle { r: 3.0 })])}\")\n"
+     ^ "    let say = out.print\n    say(\"said\")\n    let up = \"abc\".to_upper\n    let n = c.name.len\n    let get = [5, 6].get\n"
+     ^ "    let tasks = group g {\n        g.go(c.name.to_upper)\n        g.go(up)\n    }\n"
+     ^ "    out.print(\"{up()} {n()} {get(1)} {get(7)} {tasks}\")\n}\n")
+    "11 [101, 102, 103] [6, 7] [-3]\n[3.0, 12.0, 27.0]\nsaid\nABC 1 Some(6) None [\"C\", \"ABC\"]\n";
+  errs "method-value-push" "fn main() {\n    let mut xs = [1]\n    let p = xs.push\n}\n" [ "E0103" ];
+  errs "method-value-assign" "struct P {\n    x: Int,\n}\n\nfn get(self: P) -> Int {\n    self.x\n}\n\nfn main() {\n    let mut p = P { x: 1 }\n    p.get = p.get\n}\n" [ "E0209" ];
+  errs "method-value-unknown" "struct P {\n    x: Int,\n}\n\nfn main() {\n    let p = P { x: 1 }\n    let f = p.nope\n}\n" [ "E0103" ];
+
+  (* ---------- groups mixing () tasks with value tasks ---------- *)
+  let mixed =
+    "fn work(n: Int) -> Int {\n    n * n\n}\n\nfn spawn_all[T](fs: List[fn() -> T]) -> List[T] {\n    group g {\n        for f in fs {\n            g.go(f)\n        }\n    }\n}\n\n"
+    ^ "fn main(root: Root) {\n    let out = root.stdout\n    let c: Chan[Str] = channel(4)\n    let squares = group g {\n        g.go(|| work(2))\n        g.go(|| {\n            c.send(\"hello\")\n            c.close()\n        })\n        g.go(|| work(3))\n        g.go(|| {\n            work(5);\n        })\n    }\n"
+    ^ "    out.print(\"{squares} {c.recv()}\")\n    let none = group g {\n        g.go(|| out.print(\"a\"))\n        g.go(|| out.print(\"a\"))\n    }\n"
+    ^ "    out.print(\"{none.len()} {spawn_all([|| (), || ()]).len()} {spawn_all([|| 1, || 2])}\")\n"
+    ^ "    let r = catch(|| group g {\n        g.go(|| {\n            let x: Int = panic(\"first\")\n        })\n        g.go(|| panic(\"second\"))\n        g.go(|| work(4))\n    })\n    out.print(\"{r}\")\n}\n"
+  in
+  out "group-mixed-tasks" mixed "[4, 9] Some(\"hello\")\na\na\n0 2 [1, 2]\nErr(\"first\")\n";
+  check_tsan "group-mixed-tasks" mixed "[4, 9] Some(\"hello\")\na\na\n0 2 [1, 2]\nErr(\"first\")\n";
+  errs "group-mixed-values" "fn main() {\n    let r = group g {\n        g.go(|| 1)\n        g.go(|| \"a\")\n    }\n}\n" [ "E0201" ];
+
+  (* ---------- variant names: the file's own enums first ---------- *)
+  let tok =
+    "pub enum Tok {\n    Num(Int),\n    Word(Str),\n    End,\n}\n\npub fn first() -> Tok {\n    Num(7)\n}\n\n"
+    ^ "pub fn show(t: Tok) -> Str {\n    match t {\n        Num(n) => \"num {n}\",\n        Word(w) => \"word {w}\",\n        End => \"end\",\n    }\n}\n"
+  in
+  out "variant-scope" ~modules:[ ("tok", tok) ]
+    ("use tok\nuse json\n\nenum Val {\n    Num(Float),\n    Null,\n    Some(Int),\n}\n\n"
+     ^ "fn main(root: Root) {\n    let out = root.stdout\n    let a = Num(1.5)\n    let b = tok.Num(2)\n    let c = json.Num(3.0)\n    let d = Word(\"w\")\n"
+     ^ "    let e: Option[Int] = None\n    let f = Some(3)\n    let g = Option.Some(4)\n"
+     ^ "    out.print(\"{a} {tok.show(b)} {json.stringify(c)} {tok.show(d)} {tok.show(tok.first())} {e} {f} {g}\")\n"
+     ^ "    let r = match a {\n        Num(x) => x,\n        Null => 0.0,\n        Some(_) => 1.0,\n    }\n"
+     ^ "    let fs = [Num, Val.Num].map(|k| k(1.0))\n    out.print(\"{r} {[Null, Num(2.0)]} {[End, tok.End].len()} {fs}\")\n}\n")
+    "Num(1.5) num 2 3 word w num 7 None Some(3) Some(4)\n1.5 [Null, Num(2.0)] 2 [Num(1.0), Num(1.0)]\n";
+  errs "variant-scope-ambiguous" ~modules:[ ("tok", tok); ("tok2", "pub enum T2 {\n    Word(Int),\n}\n") ]
+    "use tok\nuse tok2\n\nfn main() {\n    let w = Word(1)\n}\n" [ "E0104" ];
+
+  (* ---------- Bytes ---------- *)
+  out "bytes"
+    ("fn checksum(self: Bytes) -> Int {\n    self.to_list().fold(0, |a, b| (a + b) % 256)\n}\n\n"
+     ^ "fn main(root: Root) {\n    let out = root.stdout\n    let b = bytes([104, 105, 0, 255])\n    let s = \"h\u{e9}\".to_bytes()\n"
+     ^ "    out.print(\"{b} {b.len()} {b[1]} {b.get(9)} {b.slice(1, 3)} {s} {s.to_str()} {b.is_empty()}\")\n"
+     ^ "    let c = b + s\n    out.print(\"{c.len()} {c == b + s} {b < s} {[s, b].sort()} {c.checksum()}\")\n"
+     ^ "    let mut seen: Map[Bytes, Int] = map()\n    seen[b] = 1\n    seen[bytes([1])] = 2\n    seen[b] = seen[b] + 10\n"
+     ^ "    let ch: Chan[Bytes] = channel(1)\n    let got = group g {\n        g.go(|| ch.send(bytes([7])))\n        g.go(|| ch.recv() ?? bytes([]))\n    }\n"
+     ^ "    out.print(\"{seen} {bytes([]).to_str() == \"\"} {got}\")\n"
+     ^ "    out.print(\"{catch(|| bytes([1, 256]))} {catch(|| b[4])}\")\n}\n")
+    ("bytes([104, 105, 0, 255]) 4 105 None bytes([105, 0]) bytes([104, 195, 169]) h\u{e9} false\n"
+     ^ "7 true true [bytes([104, 105, 0, 255]), bytes([104, 195, 169])] 164\n"
+     ^ "{bytes([104, 105, 0, 255]): 11, bytes([1]): 2} true [bytes([7])]\n"
+     ^ "Err(\"byte 256 is out of range 0 to 255\") Err(\"index 4 is out of range for bytes of length 4\")\n");
+  errs "bytes-immutable" "fn main() {\n    let mut b = bytes([1])\n    b[0] = 2\n}\n" [ "E0209" ];
+  errs "bytes-from-str" "fn main() {\n    let b = bytes(\"x\")\n}\n" [ "E0201" ];
+  errs "bytes-not-str" "fn main() {\n    let b: Str = bytes([1])\n}\n" [ "E0201" ];
+
+  (* ---------- recursive structs: through an enum or a list, never inline ---------- *)
+  errs "struct-contains-itself" "struct Pair {\n    a: Int,\n    rest: Wrap,\n}\n\nstruct Wrap {\n    p: Pair,\n}\n\nfn main() {}\n" [ "E0114"; "E0114" ];
+  errs "struct-contains-itself-generic" "struct Holder[A] {\n    x: A,\n}\n\nstruct T {\n    h: Holder[(Int, T)],\n}\n\nfn main() {}\n" [ "E0114" ];
+  errs "struct-contains-itself-array" "struct G {\n    cells: Array[G, 2],\n}\n\nfn main() {}\n" [ "E0114" ];
+  out "struct-recursive-indirect"
+    ("struct Node {\n    v: Int,\n    next: Option[Node],\n}\n\nstruct Tree {\n    v: Int,\n    kids: List[Tree],\n}\n\n"
+     ^ "fn sum(t: Tree) -> Int {\n    t.kids.fold(t.v, |a, k| a + sum(k))\n}\n\n"
+     ^ "fn main(root: Root) {\n    let n = Node { v: 1, next: Some(Node { v: 2, next: None }) }\n"
+     ^ "    let t = Tree { v: 1, kids: [Tree { v: 2, kids: [] }, Tree { v: 3, kids: [Tree { v: 4, kids: [] }] }] }\n"
+     ^ "    root.stdout.print(\"{n} {sum(t)}\")\n}\n")
+    "Node { v: 1, next: Some(Node { v: 2, next: None }) } 10\n";
 
   (* ---------- modules ---------- *)
   let geom =

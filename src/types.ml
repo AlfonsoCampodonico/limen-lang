@@ -6,6 +6,7 @@ type ty =
   | TFloat
   | TBool
   | TStr
+  | TBytes (* immutable bytes; natively a WStr *)
   | TUnit
   | TList of ty
   | TFn of ty list * ty
@@ -14,7 +15,7 @@ type ty =
   | TGroup of ty (* handle of a `group` block whose tasks return ty *)
   | TArray of ty * int (* fixed-size array, a value type *)
   | TChan of ty (* channel between tasks *)
-  | TMap of ty * ty (* keys (Int, Str or Bool) to values, in insertion order *)
+  | TMap of ty * ty (* keys (Int, Str, Bool, or tuples, structs and enums of them) to values, in insertion order *)
   | TDyn of string (* a value of any type that satisfies the interface, boxed with its methods *)
   | TParam of string (* a generic parameter inside its own definition *)
   | TVar of tvar ref
@@ -58,6 +59,7 @@ let rec show t =
   | TFloat -> "Float"
   | TBool -> "Bool"
   | TStr -> "Str"
+  | TBytes -> "Bytes"
   | TUnit -> "()"
   | TList a -> "List[" ^ show a ^ "]"
   | TFn (ps, r) -> "fn(" ^ String.concat ", " (List.map show ps) ^ ") -> " ^ show r
@@ -91,7 +93,7 @@ let rec unify a b =
   | TErr, _ | _, TErr -> ()
   | TVar r1, TVar r2 when r1 == r2 -> ()
   | TVar r, t | t, TVar r -> if occurs r t then raise Mismatch else r := Link t
-  | TInt, TInt | TFloat, TFloat | TBool, TBool | TStr, TStr | TUnit, TUnit -> ()
+  | TInt, TInt | TFloat, TFloat | TBool, TBool | TStr, TStr | TBytes, TBytes | TUnit, TUnit -> ()
   | TList x, TList y | TGroup x, TGroup y -> unify x y
   | TArray (x, n), TArray (y, m) when n = m -> unify x y
   | TChan x, TChan y -> unify x y

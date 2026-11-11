@@ -98,6 +98,7 @@ let rec resolve env (te : ty_expr) : ty =
     | "Float", _ -> TFloat
     | "Bool", _ -> TBool
     | "Str", _ -> TStr
+    | "Bytes", _ -> TBytes
     | "List", [ x ] -> TList x
     | "Root", _ -> TCap Root
     | "Net", _ -> TCap Net
@@ -221,6 +222,10 @@ let rec lower f (e : expr) : I.atom =
       let none_b, _, _ = in_block f (fun () -> let y = lower f b in emit f (I.Init (r, I.Atom y))) in
       emit f (I.If (has, some_b, none_b));
       I.V r
+    | EBin (Range, a, b) ->
+      let x = lower f a in
+      let y = lower f b in
+      tmp f ty (I.Prim ("int_range", TInt, [ x; y ], e.espan))
     | EBin (op, a, b) ->
       let x = lower f a in
       let y = lower f b in
@@ -245,11 +250,12 @@ let rec lower f (e : expr) : I.atom =
       let x = lower f a in
       emit f (I.Mutate (v, steps, I.MPush x));
       I.AUnit
-    | EMethod (recv, "go", _, [ task ]) when (match tyof f recv with TGroup _ -> true | _ -> false) ->
+    | EMethod (recv, (("go" | "#go") as go), _, [ task ]) when (match tyof f recv with TGroup _ -> true | _ -> false) ->
       let g = lower f recv in
       let c = lower f task in
-      let t = match tyof f recv with TGroup t -> t | _ -> TUnit in
-      ignore (tmp f TUnit (I.Spawn (g, c, t)));
+      let keep = go = "go" in
+      let t = match tyof f recv with TGroup t when keep -> t | _ -> TUnit in
+      ignore (tmp f TUnit (I.Spawn (g, c, t, keep)));
       I.AUnit
     | EMethod (recv, "send", _, [ v ]) when (match tyof f recv with TChan _ -> true | _ -> false) ->
       let c = lower f recv in
@@ -358,6 +364,9 @@ and lower_call f e callee args ty =
     let c = lower f (List.hd args) in
     let inner = match tyof f (List.hd args) with TFn (_, r) -> r | _ -> TUnit in
     tmp f ty (I.Catch (c, inner))
+  | EVar "bytes" when not_local f "bytes" && not (Hashtbl.mem f.g.fns "bytes") ->
+    let xs = List.map (lower f) args in
+    tmp f ty (I.Prim ("bytes_new", TBytes, xs, e.espan))
   | EVar "map" when not_local f "map" && not (Hashtbl.mem f.g.fns "map") ->
     let xs = List.map (lower f) args in
     tmp f ty (I.Prim ((if xs = [] then "map_new" else "map_from"), ty, xs, e.espan))
@@ -387,6 +396,10 @@ and access f e : I.atom * ty * I.step list =
   | EField (r, name, _) when is_struct f.g (tyof f r) ->
     let a, rt, steps = access f r in
     (a, rt, steps @ [ I.PField (field_index f.g (tyof f r) name) ])
+  | EIndex (r, i) when tyof f r = TBytes ->
+    let b = lower f r in
+    let ia = lower f i in
+    (tmp f TInt (I.Prim ("bytes_at", TBytes, [ b; ia ], e.espan)), TInt, [])
   | EIndex (r, k) when (match tyof f r with TMap _ -> true | _ -> false) ->
     (* a map lookup starts a new path: the value it finds *)
     let m = lower f r in
@@ -408,6 +421,11 @@ and lower_place f e : I.var * I.step list =
   | EField (r, name, _) ->
     let v, s = lower_place f r in
     (v, s @ [ I.PField (field_index f.g (tyof f r) name) ])
+  | EIndex (r, k) when (match tyof f r with TMap _ -> true | _ -> false) ->
+    (* `m[k].x = v`: the entry, changed in place *)
+    let v, s = lower_place f r in
+    let ka = lower f k in
+    (v, s @ [ I.PKey (ka, e.espan) ])
   | EIndex (r, i) ->
     let v, s = lower_place f r in
     let ia = lower f i in
@@ -702,6 +720,7 @@ and lower_method f e recv name args ty =
     let prefix =
       match rt with
       | TStr -> "str_"
+      | TBytes -> "bytes_"
       | TInt -> "int_"
       | TFloat -> "float_"
       | TBool -> "bool_"
@@ -851,6 +870,27 @@ and lower_stmt f s =
             ignore (lower_block f b))
       in
       emit f (I.Loop body)
+    | SFor (n, _, { edesc = EBin (Range, lo, hi); espan; _ }, b) ->
+      (* count from lo while below hi; the list is never built *)
+      let la = lower f lo in
+      let ha = lower f hi in
+      let i = fresh_var "i" TInt in
+      emit f (I.Let (i, I.Atom la));
+      let h = fresh_var "hi" TInt in
+      emit f (I.Let (h, I.Atom ha));
+      let stmts, _, _ =
+        in_block f (fun () ->
+            let c = tmp f TBool (I.Bin (Ge, TInt, I.V i, I.V h, espan)) in
+            let brk, _, _ = in_block f (fun () -> emit f I.Break; f.dead <- true) in
+            emit f (I.If (c, brk, []));
+            let x = fresh_var n TInt in
+            emit f (I.Let (x, I.Atom (I.V i)));
+            (* i < hi, so i + 1 cannot overflow *)
+            emit f (I.Set (i, I.Bin (Add, TInt, I.V i, I.AInt 1L, espan), ref false));
+            bind f n x;
+            ignore (lower_block f b))
+      in
+      emit f (I.Loop stmts)
     | SFor (n, _, e, b) ->
       let la = lower f e in
       emit_for f la (tyof f e) e.espan (fun x ->

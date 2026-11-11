@@ -21,6 +21,9 @@ type ctx = {
   mutable chan_tys : ty list; (* element types of channels *)
   mutable dyns : (string * ty * (string * ty list * ty) list) list; (* vtables: C name, boxed type, methods *)
   mutable cell_tys : ty list; (* types of owned locals, which need a drop-through-pointer function *)
+  mutable cmp_tys : ty list; (* composite types that need a <CName>_cmp order function *)
+  mutable sort_tys : ty list; (* list types that need <CName>_sort *)
+  mutable hash_tys : ty list; (* composite map key types that need <CName>_hash *)
 }
 
 let is_enum c = function TNamed (n, _) -> Hashtbl.mem c.g.enums n | _ -> false
@@ -33,6 +36,7 @@ let rec cname c t =
   | TBool -> "Bool"
   | TUnit -> "Unit"
   | TStr -> "Str"
+  | TBytes -> "Bytes"
   | TFn (ps, r) ->
     List.iter (fun p -> ignore (cname c p)) ps;
     ignore (cname c r);
@@ -73,7 +77,7 @@ let ctype c t =
   | TFloat -> "double"
   | TBool -> "bool"
   | TUnit -> "W_Unit"
-  | TStr -> "WStr*"
+  | TStr | TBytes -> "WStr*"
   | TFn _ -> "WClo*"
   | TDyn _ -> "WDyn*"
   | TCap _ -> "WCap*"
@@ -156,7 +160,11 @@ let walk c root rty steps =
         match t with
         | TList el -> (sprintf "(%s)->data[%s]" e (atom c i), el)
         | TArray (el, _) -> (sprintf "(%s).a[%s]" e (atom c i), el)
-        | _ -> failwith "walk index"))
+        | _ -> failwith "walk index")
+      | I.PKey (k, sp) -> (
+        match t with
+        | TMap (_, vt) -> (sprintf "(*%s_slot(%s, %s, %s))" (cname c t) e (atom c k) (where sp), vt)
+        | _ -> failwith "walk key"))
     (root, rty) steps
 
 let rec pat_cond c e t (p : Ast.pat) =
@@ -175,6 +183,48 @@ let rec pat_cond c e t (p : Ast.pat) =
     let subs = List.mapi (fun i (p, (_, ft)) -> pat_cond c (sprintf "(%s).f%d" e i) ft p) (List.combine ps fts) in
     (match List.filter (fun s -> s <> "true") subs with [] -> "true" | xs -> String.concat " && " xs)
 
+(* The prefix of the order function for [t] (used as <prefix>_cmp); composite
+   types get one generated, with the types inside them. *)
+let rec cmp_prefix c t =
+  match t with
+  | TInt -> "Int"
+  | TFloat -> "Float"
+  | TStr -> "Str"
+  | TBytes -> "Bytes"
+  | TBool -> "Bool"
+  | TUnit -> "Unit"
+  | _ ->
+    let n = cname c t in
+    if not (List.exists (fun u -> cname c u = n) c.cmp_tys) then begin
+      c.cmp_tys <- c.cmp_tys @ [ t ];
+      match t with
+      | TList e | TArray (e, _) -> ignore (cmp_prefix c e)
+      | TNamed _ when is_enum c t -> List.iter (fun (_, ps) -> List.iter (fun p -> ignore (cmp_prefix c p)) ps) (Lower.variants c.g t)
+      | TNamed _ -> List.iter (fun (_, ft) -> ignore (cmp_prefix c ft)) (Lower.field_types c.g t)
+      | _ -> failwith ("cgen: no order on " ^ show t)
+    end;
+    n
+
+(* The prefix of the hash function for map key type [t]; tuple, struct and
+   enum keys get one generated, with the types inside them. *)
+let rec hash_prefix c t =
+  match t with
+  | TInt -> "Int"
+  | TStr -> "Str"
+  | TBytes -> "Bytes"
+  | TBool -> "Bool"
+  | TUnit -> "Unit"
+  | _ ->
+    let n = cname c t in
+    if not (List.exists (fun u -> cname c u = n) c.hash_tys) then begin
+      c.hash_tys <- c.hash_tys @ [ t ];
+      match t with
+      | TNamed _ when is_enum c t -> List.iter (fun (_, ps) -> List.iter (fun p -> ignore (hash_prefix c p)) ps) (Lower.variants c.g t)
+      | TNamed _ -> List.iter (fun (_, ft) -> ignore (hash_prefix c ft)) (Lower.field_types c.g t)
+      | _ -> failwith ("cgen: no hash for " ^ show t)
+    end;
+    n
+
 let binop c op t a b sp =
   let open Ast in
   match (t, op) with
@@ -187,7 +237,7 @@ let binop c op t a b sp =
   | TFloat, Sub -> sprintf "(%s - %s)" a b
   | TFloat, Mul -> sprintf "(%s * %s)" a b
   | TFloat, Div -> sprintf "(%s / %s)" a b
-  | TStr, Add -> sprintf "Str_concat(%s, %s)" a b
+  | (TStr | TBytes), Add -> sprintf "Str_concat(%s, %s)" a b
   | (TInt | TFloat | TBool), (Lt | Le | Gt | Ge | Eq | Ne) ->
     let o = match op with Lt -> "<" | Le -> "<=" | Gt -> ">" | Ge -> ">=" | Eq -> "==" | _ -> "!=" in
     sprintf "(%s %s %s)" a o b
@@ -196,6 +246,9 @@ let binop c op t a b sp =
     sprintf "(Str_cmp(%s, %s) %s 0)" a b o
   | _, Eq -> sprintf "%s_eq(%s, %s)" (cname c t) a b
   | _, Ne -> sprintf "(!%s_eq(%s, %s))" (cname c t) a b
+  | _, (Lt | Le | Gt | Ge) ->
+    let o = match op with Lt -> "<" | Le -> "<=" | Gt -> ">" | _ -> ">=" in
+    sprintf "(%s_cmp(%s, %s) %s 0)" (cmp_prefix c t) a b o
   | _ -> failwith ("cgen binop on " ^ show t)
 
 (* Emit statements that store [rhs] into the C lvalue [dst] of type [t]. *)
@@ -342,9 +395,9 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
   | I.RootField (x, f) -> set (sprintf "Cap_root_field(%s, %s)" (a x) (c_string f))
   | I.GroupNew None -> set "w_group_new()"
   | I.GroupNew (Some (_, ms)) -> set (sprintf "w_group_new_until(%s)" (a ms))
-  | I.Spawn (g, task, rt) ->
+  | I.Spawn (g, task, rt, keep) ->
     if not (List.mem rt c.task_tys) then c.task_tys <- c.task_tys @ [ rt ];
-    line (sprintf "w_spawn(%s, %s, wtask_%s, sizeof(%s));" (a g) (a task) (cname c rt) (ctype c rt));
+    line (sprintf "w_spawn(%s, %s, wtask_%s, sizeof(%s), %s);" (a g) (a task) (cname c rt) (ctype c rt) (if keep then "true" else "false"));
     set "0"
   | I.GroupJoin (g, lty, until) ->
     let el = match lty with TList e -> e | _ -> TUnit in
@@ -354,17 +407,18 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     line "  w_group_wait(g_, 1);";
     line "  w_group_reraise(g_);";
     line (sprintf "  %s* l_ = %s_new(g_->n);" n n);
+    (* tasks that return () are not kept: the list holds the others' results *)
     if until then begin
       (* a cancelled task has no result: None *)
       let rt = match el with TNamed ("Option", [ r ]) -> r | _ -> TUnit in
       line "  for (int64_t i_ = 0; i_ < g_->n; i_++) {";
-      line (sprintf "    if (g_->tasks[i_]->cancelled) l_->data[i_] = %s;" (mk_enum c el 1 []));
-      line (sprintf "    else { %s r_; memcpy(&r_, g_->tasks[i_]->slot, sizeof(%s)); l_->data[i_] = %s; }" (ctype c rt) (ctype c rt) (mk_enum c el 0 [ "r_" ]));
+      line "    if (!g_->tasks[i_]->keep) continue;";
+      line (sprintf "    if (g_->tasks[i_]->cancelled) l_->data[l_->len++] = %s;" (mk_enum c el 1 []));
+      line (sprintf "    else { %s r_; memcpy(&r_, g_->tasks[i_]->slot, sizeof(%s)); l_->data[l_->len++] = %s; }" (ctype c rt) (ctype c rt) (mk_enum c el 0 [ "r_" ]));
       line "  }"
     end
     else
-      line (sprintf "  for (int64_t i_ = 0; i_ < g_->n; i_++) memcpy(&l_->data[i_], g_->tasks[i_]->slot, sizeof(%s));" (ctype c el));
-    line "  l_->len = g_->n;";
+      line (sprintf "  for (int64_t i_ = 0; i_ < g_->n; i_++) if (g_->tasks[i_]->keep) memcpy(&l_->data[l_->len++], g_->tasks[i_]->slot, sizeof(%s));" (ctype c el));
     line "  w_group_release_tasks(g_);";
     line (sprintf "  %s = l_;" dst);
     line "}"
@@ -460,7 +514,12 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
       opt_from (sprintf "(%s)->len > 0" (arg 0)) (dup_of c el (sprintf "(%s)->data[(%s)->len - 1]" (arg 0) (arg 0)))
     | "list_contains", _ -> set (sprintf "%s_contains(%s, %s)" (cname c rt) (arg 0) (arg 1))
     | "list_reverse", _ -> set (sprintf "%s_reverse(%s)" (cname c rt) (arg 0))
-    | "list_sort", _ -> set (sprintf "%s_sort(%s)" (cname c rt) (arg 0))
+    | "list_sort", TList el ->
+      ignore (cmp_prefix c el);
+      (match el with
+       | TInt | TStr | TFloat -> ()
+       | _ -> if not (List.exists (fun u -> cname c u = cname c rt) c.sort_tys) then c.sort_tys <- c.sort_tys @ [ rt ]);
+      set (sprintf "%s_sort(%s)" (cname c rt) (arg 0))
     | "list_take", _ -> set (sprintf "%s_slice(%s, 0, %s)" (cname c rt) (arg 0) (arg 1))
     | "list_skip", _ -> set (sprintf "%s_slice(%s, %s, (%s)->len)" (cname c rt) (arg 0) (arg 1) (arg 0))
     | "list_join", _ -> set (sprintf "L_Str_join(%s, %s)" (arg 0) (arg 1))
@@ -491,6 +550,16 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
       line (sprintf "  %s = i_ >= 0 ? %s : %s;" dst (mk_enum c t 0 [ "i_" ]) (mk_enum c t 1 []));
       line "}"
     | "str_bytes", _ -> set (sprintf "Str_bytes(%s)" (arg 0))
+    | "str_chars", _ -> set (sprintf "Str_chars(%s)" (arg 0))
+    | ("str_to_bytes" | "bytes_to_str"), _ -> set (sprintf "Str_dup(%s)" (arg 0))
+    | "bytes_new", _ -> set (sprintf "Bytes_from_list(%s, %s)" (arg 0) (where sp))
+    | "bytes_at", _ -> set (sprintf "Bytes_at(%s, %s, %s)" (arg 0) (arg 1) (where sp))
+    | "bytes_len", _ -> set (sprintf "(%s)->len" (arg 0))
+    | "bytes_is_empty", _ -> set (sprintf "((%s)->len == 0)" (arg 0))
+    | "bytes_get", _ -> opt_from (sprintf "%s >= 0 && %s < (%s)->len" (arg 1) (arg 1) (arg 0)) (sprintf "(int64_t)(unsigned char)(%s)->data[%s]" (arg 0) (arg 1))
+    | "bytes_slice", _ -> set (sprintf "Str_slice(%s, %s, %s)" (arg 0) (arg 1) (arg 2))
+    | "bytes_to_list", _ -> set (sprintf "Str_bytes(%s)" (arg 0))
+    | "int_range", _ -> set (sprintf "L_Int_range(%s, %s)" (arg 0) (arg 1))
     | "int_to_char", _ -> set (sprintf "Int_to_char(%s)" (arg 0))
     | "int_min", _ -> set (sprintf "(%s < %s ? %s : %s)" (arg 0) (arg 1) (arg 0) (arg 1))
     | "int_max", _ -> set (sprintf "(%s > %s ? %s : %s)" (arg 0) (arg 1) (arg 0) (arg 1))
@@ -633,6 +702,13 @@ and stmt c out ind (s : I.stmt) =
               line (sprintf "  %s* %s = &(%s->a[w_idx(%s, %d, %s)]);" (ctype c el) q p (atom c ia) n (where sp));
               (q, el)
             | _ -> failwith "mutate index")
+          | I.PKey (k, sp) -> (
+            match t with
+            | TMap (_, vt) ->
+              line (sprintf "  %s_unique(%s);" (cname c t) p);
+              line (sprintf "  %s* %s = %s_slot(*%s, %s, %s);" (ctype c vt) q (cname c t) p (atom c k) (where sp));
+              (q, vt)
+            | _ -> failwith "mutate key")
           | I.PIndexU _ -> failwith "mutate through unchecked index")
         ("p0_", v.ty)
         (List.mapi (fun i s -> (i, s)) steps)
@@ -799,7 +875,7 @@ let topo c =
 let named_decl c t =
   match t with TNamed (n, _) -> n | _ -> ""
 
-let type_defs c (out : Buffer.t) =
+let rec type_defs c (out : Buffer.t) =
   let p s = Buffer.add_string out (s ^ "\n") in
   compute_boxed c;
   let lists = List.filter (function TList _ -> true | _ -> false) c.types in
@@ -902,6 +978,8 @@ let type_defs c (out : Buffer.t) =
         if e = TFloat then p (sprintf "VELA_LIST_SORT(%s, double, Float)" (cname c t))
       | _ -> ())
     (List.stable_sort (fun a b -> compare (depth a) (depth b)) lists);
+  List.iter (fun t -> match t with TMap (k, _) -> ignore (hash_prefix c k) | _ -> ()) maps;
+  List.iter (fun t -> p (sprintf "static uint64_t %s_hash(%s v);" (cname c t) (ctype c t))) c.hash_tys;
   List.iter
     (fun t ->
       match t with
@@ -1033,13 +1111,79 @@ let type_defs c (out : Buffer.t) =
         p (if tuple then "  buf_puts(b, \")\");\n}" else "  buf_puts(b, \" }\");\n}")
       end)
     named
+  ;
+  cmp_defs c p
+
+(* Order functions: item by item, as Interp.compare_v; and hash functions
+   for tuple, struct and enum map keys. *)
+and cmp_defs c p =
+  List.iter
+    (fun t ->
+      let n = cname c t and ct = ctype c t in
+      let item e x = p (sprintf "  h = w_hash_mix(h, %s_hash(%s));" (hash_prefix c e) x) in
+      p (sprintf "static uint64_t %s_hash(%s v) {" n ct);
+      p "  uint64_t h = 0x2545F4914F6CDD1DULL; (void)v;";
+      (match t with
+       | TNamed _ when is_enum c t ->
+         let acc = if is_boxed c t then "->" else "." in
+         p (sprintf "  h = w_hash_mix(h, Int_hash(v%stag));" acc);
+         p (sprintf "  switch (v%stag) {" acc);
+         List.iteri
+           (fun k (_, ps) ->
+             p (sprintf "    case %d:" k);
+             List.iteri (fun i pt -> item pt (sprintf "v%su.v%d.f%d" acc k i)) ps;
+             p "      break;")
+           (Lower.variants c.g t);
+         p "  }"
+       | _ -> List.iteri (fun i (_, ft) -> item ft (sprintf "v.f%d" i)) (Lower.field_types c.g t));
+      p "  return h;";
+      p "}")
+    c.hash_tys;
+  List.iter (fun t -> p (sprintf "static int %s_cmp(%s a, %s b);" (cname c t) (ctype c t) (ctype c t))) c.cmp_tys;
+  List.iter
+    (fun t ->
+      let n = cname c t and ct = ctype c t in
+      let item e x y = p (sprintf "  { int r_ = %s_cmp(%s, %s); if (r_) return r_; }" (cmp_prefix c e) x y) in
+      p (sprintf "static int %s_cmp(%s a, %s b) {" n ct ct);
+      p "  (void)a; (void)b;";
+      (match t with
+       | TList e ->
+         p "  int64_t n_ = a->len < b->len ? a->len : b->len;";
+         p "  for (int64_t i = 0; i < n_; i++)";
+         item e "a->data[i]" "b->data[i]";
+         p "  return a->len < b->len ? -1 : a->len > b->len;"
+       | TArray (e, k) ->
+         p (sprintf "  for (int64_t i = 0; i < %d; i++)" k);
+         item e "a.a[i]" "b.a[i]";
+         p "  return 0;"
+       | TNamed _ when is_enum c t ->
+         let acc = if is_boxed c t then "->" else "." in
+         p (sprintf "  if (a%stag != b%stag) return a%stag < b%stag ? -1 : 1;" acc acc acc acc);
+         p (sprintf "  switch (a%stag) {" acc);
+         List.iteri
+           (fun k (_, ps) ->
+             p (sprintf "    case %d:" k);
+             List.iteri (fun i pt -> item pt (sprintf "a%su.v%d.f%d" acc k i) (sprintf "b%su.v%d.f%d" acc k i)) ps;
+             p "      break;")
+           (Lower.variants c.g t);
+         p "  }";
+         p "  return 0;"
+       | _ ->
+         List.iteri (fun i (_, ft) -> item ft (sprintf "a.f%d" i) (sprintf "b.f%d" i)) (Lower.field_types c.g t);
+         p "  return 0;");
+      p "}")
+    c.cmp_tys;
+  List.iter
+    (fun t -> match t with TList e -> p (sprintf "VELA_LIST_SORT(%s, %s, %s)" (cname c t) (ctype c e) (cmp_prefix c e)) | _ -> ())
+    c.sort_tys
 
 (* ---------- program ---------- *)
 
 let program (g : Lower.gctx) (prog : I.program) : string =
   let c =
     { g; names = Hashtbl.create 32; types = []; lits = Hashtbl.create 32; lit_order = []; boxed = [];
-      envs = Hashtbl.create 16; uniq = []; task_tys = []; inrange = []; chan_tys = []; dyns = []; cell_tys = [] }
+      envs = Hashtbl.create 16; uniq = []; task_tys = []; inrange = []; chan_tys = []; dyns = []; cell_tys = [];
+      cmp_tys = []; sort_tys = []; hash_tys = [] }
   in
   (* bodies first: this discovers every type and literal *)
   let bodies = Buffer.create 65536 in

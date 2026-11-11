@@ -119,7 +119,7 @@ The standard library is written in Vela: `json` (parse, stringify, field access)
 
 Tasks are fibers: small stacks scheduled by worker threads, one per core, with work stealing. A task waiting on a group, a channel, a socket, stdin or `clock.sleep(ms)` parks without blocking a thread. If every task is waiting and nothing can wake one, the program panics with a deadlock message instead of hanging.
 
-A `group` block starts tasks with `g.go(closure)` and evaluates to the list of their results, in the order they were started. Every task has finished when the block ends, so nothing outlives it.
+A `group` block starts tasks with `g.go(closure)` and evaluates to the list of their results, in the order they were started. Tasks that return `()` run for their effect and add no item, so a group can mix them with tasks that compute a value. Every task has finished when the block ends, so nothing outlives it.
 
 ```
 let counts = group g {
@@ -178,15 +178,17 @@ On one thread Vela is level with C on these workloads. With `group` it runs abou
 
 ## Language
 
-Types: `Int`, `Float`, `Bool`, `Str`, `()`, `List[T]`, fixed-size `Array[T, N]` (a value type), structs, enums with payloads, generics on functions, structs and enums, and closures. `Option`, `Result` and `IoError` come from the prelude. Control flow: `if`/`else`, exhaustive `match`, `while`, `for x in list`, `break`, `continue`, `return` and `?`. Statements end at a newline; a line starting with `.` continues a method chain. String interpolation takes any expression: `"{xs.join(", ")}"`.
+Types: `Int`, `Float`, `Bool`, `Str`, `Bytes` (binary data), `()`, `List[T]`, fixed-size `Array[T, N]` (a value type), structs, enums with payloads, generics on functions, structs and enums, and closures. `Option`, `Result` and `IoError` come from the prelude. Control flow: `if`/`else`, exhaustive `match`, `while`, `for x in list`, `for i in 0..<n` (counts without building a list), `break`, `continue`, `return` and `?`. Text is `Str`; `s.chars()` gives its characters as one-character strings. Statements end at a newline; a line starting with `.` continues a method chain. String interpolation takes any expression: `"{xs.join(", ")}"`.
 
-Methods: a function whose first parameter is `self: T` is called as `value.name(...)` (see [examples/methods.vela](examples/methods.vela)).
+Methods: a function whose first parameter is `self: T` is called as `value.name(...)`, a file can add its own methods to built-in types (`fn shout(self: Str) -> Str`), and `value.name` without the call is a function bound to that value: `xs.map(origin.add)`, `let say = out.print` (see [examples/methods.vela](examples/methods.vela)).
 
 Interfaces: `interface Shape { fn area(self) -> Float }` bounds a generic parameter, `fn total[T: Shape](xs: List[T])`, and any type with those methods satisfies it, built-in capabilities included, so tests can pass a fake `Clock` (see [examples/interfaces.vela](examples/interfaces.vela)).
 
-`dyn Shape` is a value of any type that satisfies `Shape`, so `List[dyn Shape]` can mix types (see [examples/dyn.vela](examples/dyn.vela)).
+`dyn Shape` is a value of any type that satisfies `Shape`, so `List[dyn Shape]` can mix types, and `let s: dyn Shape = if big { Circle { r: 1.0 } } else { Square { s: 2.0 } }` picks one (see [examples/dyn.vela](examples/dyn.vela)).
 
-Tuples `(Int, Str)` and maps `Map[Str, Int]` are built in: `let (q, r) = divmod(17, 5)`, `counts[w] = counts.get(w) ?? 0 + 1`. Maps iterate in insertion order, the same in both backends (see [examples/tuples.vela](examples/tuples.vela) and [examples/maps.vela](examples/maps.vela)).
+Ordering is structural: `<` and `sort()` work on numbers, strings, `Bool`, and on lists, tuples, structs and enums of them, item by item, so `[(2, "b"), (1, "z")].sort()` sorts by the first item, then the second.
+
+Tuples `(Int, Str)` and maps `Map[Str, Int]` are built in: `let (q, r) = divmod(17, 5)`, `counts[w] = counts.get(w) ?? 0 + 1`. Keys can be tuples, structs and enums (`grid[(x, y)]`), and entries change in place: `stats[name].hits = stats[name].hits + 1`. Maps iterate in insertion order, the same in both backends (see [examples/tuples.vela](examples/tuples.vela) and [examples/maps.vela](examples/maps.vela)).
 
 `group g until clock.after(2000) { ... }` gives a group a deadline: tasks still running then are cancelled (freeing what they own) and the group evaluates to a `List[Option[T]]` with `None` for each of them.
 

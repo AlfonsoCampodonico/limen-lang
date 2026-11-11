@@ -184,7 +184,8 @@ let lex ?(base = 0) file (src : string) : token array =
     else begin
       let lo = !i in
       let two = if !i + 1 < n then String.sub src !i 2 else "" in
-      if List.mem two syms2 then (i := !i + 2; push (SYM two) lo !i)
+      if !i + 2 < n && String.sub src !i 3 = "..<" then (i := !i + 3; push (SYM "..<") lo !i)
+      else if List.mem two syms2 then (i := !i + 2; push (SYM two) lo !i)
       else if String.contains syms1 c then (incr i; push (SYM (String.make 1 c)) lo !i)
       else fail "E0001" lo (lo + 1) (Printf.sprintf "unexpected character `%c`" c)
     end

@@ -19,6 +19,7 @@ type step =
   | PField of int
   | PIndex of atom * Span.t
   | PIndexU of atom (* index already proven in range (compiler-generated loops) *)
+  | PKey of atom * Span.t (* map entry by key; panics when the key is missing *)
 
 type rhs =
   | Atom of atom (* consumed *)
@@ -40,7 +41,8 @@ type rhs =
   | RootField of atom * string
   | Panic of atom * Span.t
   | GroupNew of (atom * atom) option (* `until clock.after(ms)`: clock, milliseconds *)
-  | Spawn of atom * atom * ty (* group (borrowed), task closure (consumed), result type *)
+  | Spawn of atom * atom * ty * bool
+      (* group (borrowed), task closure (consumed), result type, whether its result goes in the group's list *)
   | GroupJoin of atom * ty * bool
       (* wait for every task; result list type; with a deadline (each result an Option) *)
   | ChanNew of ty * atom * Span.t (* channel type, capacity *)
@@ -101,7 +103,7 @@ let consumed = function
   | Call (_, args) -> args
   | CallClo (_, args) -> args
   | MkStruct (_, xs) | MkEnum (_, _, xs) | MkList (_, xs) | MkClosure (_, _, xs) -> xs
-  | Spawn (_, c, _) -> [ c ]
+  | Spawn (_, c, _, _) -> [ c ]
   | ChanSend (_, v, _) -> [ v ]
   | MkDyn (_, _, a, _) -> [ a ]
   | Select (_, ops, _, _) -> List.filter_map (function SSend (_, v, _, _) -> Some v | SRecv _ | SAfter _ -> None) ops
@@ -120,12 +122,12 @@ let borrowed = function
   | Bin (_, _, a, b, _) -> [ a; b ]
   | Neg (_, a) | Not a -> [ a ]
   | Prim (_, _, xs, _) -> xs
-  | Get (a, _, steps) -> a :: List.filter_map (function PIndex (i, _) | PIndexU i -> Some i | PField _ -> None) steps
+  | Get (a, _, steps) -> a :: List.filter_map (function PIndex (i, _) | PIndexU i | PKey (i, _) -> Some i | PField _ -> None) steps
   | Payload (a, _, _, _) | IsTag (a, _, _) | PatTest (a, _, _) -> [ a ]
   | Interp ps -> List.filter_map (function IVal (a, _) | IValQ (a, _) -> Some a | IStr _ -> None) ps
   | RootField (a, _) -> [ a ]
   | Panic (a, _) -> [ a ]
-  | Spawn (g, _, _) | GroupJoin (g, _, _) -> [ g ]
+  | Spawn (g, _, _, _) | GroupJoin (g, _, _) -> [ g ]
   | GroupNew None -> []
   | GroupNew (Some (c, ms)) -> [ c; ms ]
   | ChanNew (_, cap, _) -> [ cap ]

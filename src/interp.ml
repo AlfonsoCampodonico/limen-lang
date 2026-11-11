@@ -24,8 +24,14 @@ and sock = { fd : Unix.file_descr; mutable shut : bool; mutable reading : bool; 
 (* reading / writing: a task is in a read (or accept) / a write that has had
    to wait; as natively, another that has to wait meanwhile fails *)
 
-(* Map keys: Int, Str or Bool. *)
-type mkey = KInt of int64 | KStr of string | KBool of bool
+(* Map keys: Int, Str, Bool, and tuples, structs and enums of them. *)
+type mkey =
+  | KInt of int64
+  | KStr of string
+  | KBytes of string
+  | KBool of bool
+  | KStruct of string * (string * mkey) list
+  | KEnum of string * string * mkey list
 
 module KM = Map.Make (struct
   type t = mkey
@@ -38,6 +44,7 @@ type value =
   | VFloat of float
   | VBool of bool
   | VStr of string
+  | VBytes of string
   | VUnit
   | VList of value array
   | VStruct of string * (string * value) list
@@ -70,7 +77,9 @@ and task = { mutable cancelled : bool }
 and outcome = Done of value | Failed of string * Span.t | Stopped
 
 (* The tasks of a group, newest first, and whether its deadline has passed. *)
-and group = { mutable tasks : (task * outcome option ref) list; mutable gcancelled : bool }
+and group = { mutable tasks : (task * outcome option ref) list; mutable kept : bool list; mutable gcancelled : bool }
+(* kept: per task, newest first like tasks, whether its result goes in the
+   group's list (a task that returns () is not kept) *)
 
 (* A persistent map, so updates are cheap and values stay values. Each entry
    remembers when its key was first inserted, for insertion-order iteration. *)
@@ -132,8 +141,22 @@ let cap_name = function
   | CListen _ -> "Listen" | CListener _ -> "Listener" | CConn _ -> "Conn"
   | CRand -> "Rand" | CStdin -> "Stdin" | CEnv _ -> "Env" | CExec _ -> "Exec"
 
-let key_of = function VInt n -> KInt n | VStr s -> KStr s | VBool b -> KBool b | _ -> failwith "internal: map key"
-let val_of_key = function KInt n -> VInt n | KStr s -> VStr s | KBool b -> VBool b
+let rec key_of = function
+  | VInt n -> KInt n
+  | VStr s -> KStr s
+  | VBytes s -> KBytes s
+  | VBool b -> KBool b
+  | VStruct (n, fs) -> KStruct (n, List.map (fun (f, v) -> (f, key_of v)) fs)
+  | VEnum (e, v, xs) -> KEnum (e, v, List.map key_of xs)
+  | _ -> failwith "internal: map key"
+
+let rec val_of_key = function
+  | KInt n -> VInt n
+  | KStr s -> VStr s
+  | KBytes s -> VBytes s
+  | KBool b -> VBool b
+  | KStruct (n, fs) -> VStruct (n, List.map (fun (f, k) -> (f, val_of_key k)) fs)
+  | KEnum (e, v, ks) -> VEnum (e, v, List.map val_of_key ks)
 let empty_map = { m = KM.empty; next = 0 }
 
 let map_entries mv =
@@ -153,6 +176,7 @@ let rec show ?(top = true) v =
   | VFloat x -> fmt_float x
   | VBool b -> string_of_bool b
   | VStr s -> if top then s else "\"" ^ String.escaped s ^ "\""
+  | VBytes s -> "bytes([" ^ String.concat ", " (List.init (String.length s) (fun i -> string_of_int (Char.code s.[i]))) ^ "])"
   | VUnit -> "()"
   | VList a -> "[" ^ String.concat ", " (Array.to_list (Array.map (show ~top:false) a)) ^ "]"
   | VMap mv ->
@@ -174,6 +198,7 @@ let rec equal a b =
   | VFloat x, VFloat y -> x = y
   | VBool x, VBool y -> x = y
   | VStr x, VStr y -> x = y
+  | VBytes x, VBytes y -> x = y
   | VUnit, VUnit -> true
   | VList x, VList y -> Array.length x = Array.length y && Array.for_all2 equal x y
   | VStruct (n, xs), VStruct (m, ys) -> n = m && List.for_all2 (fun (_, x) (_, y) -> equal x y) xs ys
@@ -185,11 +210,29 @@ let rec equal a b =
     && KM.for_all (fun k (_, v) -> match KM.find_opt k b.m with Some (_, w) -> equal v w | None -> false) a.m
   | _ -> false
 
-let compare_v a b =
+(* (enum, variant) -> position in the declaration, for ordering enum values *)
+let variant_pos : (string * string, int) Hashtbl.t = Hashtbl.create 32
+
+(* The order of `<` and `sort()`: item by item, as the native `_cmp` functions.
+   Floats use a total order (NaN first) inside containers and in sort. *)
+let rec compare_v a b =
+  let rec lex xs ys =
+    match (xs, ys) with
+    | [], [] -> 0
+    | [], _ -> -1
+    | _, [] -> 1
+    | x :: xs, y :: ys -> ( match compare_v x y with 0 -> lex xs ys | c -> c)
+  in
   match (a, b) with
   | VInt x, VInt y -> compare x y
   | VFloat x, VFloat y -> compare x y
-  | VStr x, VStr y -> compare x y
+  | VStr x, VStr y | VBytes x, VBytes y -> compare x y
+  | VBool x, VBool y -> compare x y
+  | VList x, VList y -> lex (Array.to_list x) (Array.to_list y)
+  | VStruct (_, xs), VStruct (_, ys) -> lex (List.map snd xs) (List.map snd ys)
+  | VEnum (e, v, xs), VEnum (_, w, ys) ->
+    let pos v = Option.value ~default:0 (Hashtbl.find_opt variant_pos (e, v)) in
+    if v = w then lex xs ys else compare (pos v) (pos w)
   | _ -> 0
 
 let as_bool = function VBool b -> b | _ -> failwith "internal: expected Bool"
@@ -240,6 +283,28 @@ let utf8_of_code n =
   let b = Buffer.create 4 in
   Buffer.add_utf_8_uchar b (Uchar.of_int n);
   Buffer.contents b
+
+(* The length of the UTF-8 character at s.[i], or 1 for a byte that does not
+   start a well-formed one (as the native w_utf8_len). *)
+let utf8_len s i =
+  let n = String.length s in
+  let b = Char.code s.[i] in
+  let byte j = Char.code s.[j] in
+  let cont k lo hi =
+    if i + k > n then 1
+    else if byte (i + 1) < lo || byte (i + 1) > hi then 1
+    else if List.for_all (fun j -> byte (i + j) >= 0x80 && byte (i + j) <= 0xBF) (List.init (k - 2) (fun j -> j + 2)) then k
+    else 1
+  in
+  if b < 0x80 then 1
+  else if b >= 0xC2 && b <= 0xDF then cont 2 0x80 0xBF
+  else if b >= 0xE0 && b <= 0xEF then cont 3 (if b = 0xE0 then 0xA0 else 0x80) (if b = 0xED then 0x9F else 0xBF)
+  else if b >= 0xF0 && b <= 0xF4 then cont 4 (if b = 0xF0 then 0x90 else 0x80) (if b = 0xF4 then 0x8F else 0xBF)
+  else 1
+
+let chars s =
+  let rec go i acc = if i >= String.length s then List.rev acc else let k = utf8_len s i in go (i + k) (String.sub s i k :: acc) in
+  go 0 []
 
 let parse_decimal s =
   let s = String.trim s in
@@ -292,10 +357,15 @@ let binop op a b sp =
   | Mul, VFloat x, VFloat y -> VFloat (x *. y)
   | Div, VFloat x, VFloat y -> VFloat (x /. y)
   | Add, VStr x, VStr y -> VStr (x ^ y)
+  | Add, VBytes x, VBytes y -> VBytes (x ^ y)
   | Lt, VFloat x, VFloat y -> VBool (x < y)
   | Le, VFloat x, VFloat y -> VBool (x <= y)
   | Gt, VFloat x, VFloat y -> VBool (x > y)
   | Ge, VFloat x, VFloat y -> VBool (x >= y)
+  | Range, VInt lo, VInt hi ->
+    if hi <= lo then VList [||]
+    else if Int64.sub hi lo < 0L || Int64.sub hi lo > Int64.of_int Sys.max_array_length then raise (Panic ("out of memory", sp))
+    else VList (Array.init (Int64.to_int (Int64.sub hi lo)) (fun i -> VInt (Int64.add lo (Int64.of_int i))))
   | Eq, _, _ -> VBool (equal a b)
   | Ne, _, _ -> VBool (not (equal a b))
   | Lt, _, _ -> VBool (compare_v a b < 0)
@@ -836,6 +906,10 @@ let rec eval rt env e : value =
       if k < 0L || k >= Int64.of_int (Array.length arr) then
         raise (Panic (sprintf "index %Ld is out of range for a list of length %d" k (Array.length arr), e.espan));
       arr.(Int64.to_int k)
+    | VBytes b, VInt k ->
+      if k < 0L || k >= Int64.of_int (String.length b) then
+        raise (Panic (sprintf "index %Ld is out of range for bytes of length %d" k (String.length b), e.espan));
+      vint (Char.code b.[Int64.to_int k])
     | _ -> failwith "internal: index")
   | ETry x -> (
     match eval rt env x with
@@ -931,7 +1005,7 @@ let rec eval rt env e : value =
   | EDyn (x, _) -> eval rt env x (* values carry their type, so methods dispatch on it *)
   | EGroup (name, until, b) ->
     (* tasks are coroutines; the group waits until every one has a result *)
-    let g = { tasks = []; gcancelled = false } in
+    let g = { tasks = []; kept = []; gcancelled = false } in
     let joined = ref false in
     (match until with
      | None -> ()
@@ -969,7 +1043,8 @@ let rec eval rt env e : value =
       | _, Some _ -> none (* cancelled *)
       | _ -> VUnit
     in
-    VList (Array.of_list (List.map result results))
+    let kept = List.rev g.kept in
+    VList (Array.of_list (List.concat (List.map2 (fun keep r -> if keep then [ result r ] else []) kept results)))
 
 and eval_var rt env n sp =
   match find_var env n with
@@ -982,7 +1057,7 @@ and eval_var rt env n sp =
       | None ->
         if n = "panic" then VPanicFn
         else if n = "channel" then VChanFn
-        else if n = "assert" || n = "assert_eq" || n = "map" || n = "catch" then VBuiltin n
+        else if n = "assert" || n = "assert_eq" || n = "map" || n = "catch" || n = "bytes" then VBuiltin n
         else raise (Panic ("internal: unbound name " ^ n, sp)))
 
 and ctor_value rt en vn =
@@ -1029,6 +1104,16 @@ and apply rt fv args sp =
     match args with
     | [ f ] -> ( try ok (apply rt f [] sp) with Panic (m, _) -> VEnum ("Result", "Err", [ VStr m ]))
     | _ -> failwith "internal: catch")
+  | VBuiltin "bytes" -> (
+    match args with
+    | [ VList xs ] ->
+      VBytes
+        (String.init (Array.length xs) (fun i ->
+             match xs.(i) with
+             | VInt n when n >= 0L && n <= 255L -> Char.chr (Int64.to_int n)
+             | VInt n -> raise (Panic (sprintf "byte %Ld is out of range 0 to 255" n, sp))
+             | _ -> failwith "internal: bytes"))
+    | _ -> failwith "internal: bytes")
   | VBuiltin "map" -> (
     match args with
     | [] -> VMap empty_map
@@ -1071,6 +1156,18 @@ and exec rt env s =
     try
       while as_bool (eval rt env c) do
         try ignore (eval_block rt env b) with Continue_ -> ()
+      done
+    with Break_ -> ())
+  | SFor (n, _, { edesc = EBin (Range, lo, hi); _ }, b) -> (
+    let lo = match eval rt env lo with VInt x -> x | _ -> failwith "internal: range" in
+    let hi = match eval rt env hi with VInt x -> x | _ -> failwith "internal: range" in
+    let i = ref lo in
+    try
+      while !i < hi do
+        let sc = Hashtbl.create 1 in
+        Hashtbl.replace sc n (ref (VInt !i));
+        i := Int64.add !i 1L;
+        try ignore (eval_block rt (sc :: env) b) with Continue_ -> ()
       done
     with Break_ -> ())
   | SFor (n, _, e, b) -> (
@@ -1142,6 +1239,18 @@ and call_method rt v name args sp =
     let hi = max lo (clamp hi n) in
     VStr (String.sub s lo (hi - lo))
   | VStr s, "index_of", [ VStr t ] -> ( match find_sub s t 0 with Some i -> some (vint i) | None -> none)
+  | VStr s, "chars", [] -> strs (chars s)
+  | VStr s, "to_bytes", [] -> VBytes s
+  | VBytes b, "len", [] -> vint (String.length b)
+  | VBytes b, "is_empty", [] -> VBool (b = "")
+  | VBytes b, "get", [ VInt i ] -> if i >= 0L && i < Int64.of_int (String.length b) then some (vint (Char.code b.[Int64.to_int i])) else none
+  | VBytes b, "slice", [ VInt lo; VInt hi ] ->
+    let n = String.length b in
+    let lo = clamp lo n in
+    let hi = max lo (clamp hi n) in
+    VBytes (String.sub b lo (hi - lo))
+  | VBytes b, "to_list", [] -> VList (Array.init (String.length b) (fun i -> vint (Char.code b.[i])))
+  | VBytes b, "to_str", [] -> VStr b
   | VStr s, "bytes", [] -> VList (Array.init (String.length s) (fun i -> vint (Char.code s.[i])))
   | VInt n, "to_char", [] -> VStr (utf8_of_code (if n < 0L || n > 0x10FFFFL then -1 else Int64.to_int n))
   | VInt a, "min", [ VInt b ] -> VInt (min a b)
@@ -1192,10 +1301,11 @@ and call_method rt v name args sp =
   | VEnum ("Result", vn, _), "is_err", [] -> VBool (vn = "Err")
   | VEnum ("Result", "Err", [ e ]), "map_err", [ f ] -> VEnum ("Result", "Err", [ call f [ e ] ])
   | (VEnum ("Result", _, _) as r), "map_err", [ _ ] -> r
-  | VGroup g, "go", [ c ] ->
+  | VGroup g, (("go" | "#go") as go), [ c ] ->
     let t = { cancelled = g.gcancelled } in
     let res = ref (if g.gcancelled then Some Stopped else None) in
     g.tasks <- (t, res) :: g.tasks;
+    g.kept <- (go = "go") :: g.kept;
     (* a task cancelled before it started never runs *)
     if not g.gcancelled then
       spawn_fiber t (fun () ->
@@ -1284,6 +1394,7 @@ let run ~out ~grants (user_items : item list) : (value, string * Span.t) result 
       | IStruct s -> Hashtbl.replace rt.structs s.st_name s
       | IEnum e ->
         Hashtbl.replace rt.enums e.en_name e;
+        List.iteri (fun i (v, _, _) -> Hashtbl.replace variant_pos (e.en_name, v) i) e.en_variants;
         List.iter
           (fun (v, _, _) -> Hashtbl.replace owners v (e.en_name :: Option.value ~default:[] (Hashtbl.find_opt owners v)))
           e.en_variants)
@@ -1320,6 +1431,7 @@ let make_rt ~out ~grants (user_items : item list) =
       | IStruct s -> Hashtbl.replace rt.structs s.st_name s
       | IEnum e ->
         Hashtbl.replace rt.enums e.en_name e;
+        List.iteri (fun i (v, _, _) -> Hashtbl.replace variant_pos (e.en_name, v) i) e.en_variants;
         List.iter
           (fun (v, _, _) -> Hashtbl.replace owners v (e.en_name :: Option.value ~default:[] (Hashtbl.find_opt owners v)))
           e.en_variants)

@@ -302,9 +302,11 @@ static void buf_escaped(WBuf *b, WStr *s) {
 #define Bool_dup(x) (x)
 #define Bool_drop(x) ((void)0)
 #define Bool_eq(a, b) ((a) == (b))
+#define Bool_cmp(a, b) ((int)(a) - (int)(b))
 #define Unit_dup(x) (x)
 #define Unit_drop(x) ((void)0)
 #define Unit_eq(a, b) true
+#define Unit_cmp(a, b) 0
 #define Int_share(x) ((void)0)
 #define Float_share(x) ((void)0)
 #define Bool_share(x) ((void)0)
@@ -433,7 +435,7 @@ static inline int64_t w_idx(int64_t i, int64_t n, const char *where) {
     return false;                                                                             \
   }
 
-/* Stable merge sort, for lists of Int, Float and Str. */
+/* Stable merge sort, by the element type's P##_cmp order. */
 #define VELA_LIST_SORT(L, T, P)                                                               \
   static L *L##_sort(L *l) {                                                                  \
     L *c = L##_slice(l, 0, l->len);                                                           \
@@ -510,6 +512,8 @@ static uint64_t w_siphash13(const unsigned char *in, size_t len) {
 static inline uint64_t Int_hash(int64_t x) { return w_siphash13((const unsigned char *)&x, sizeof x); }
 static inline uint64_t Unit_hash(W_Unit u) { (void)u; return 0; }
 static inline uint64_t Bool_hash(bool b) { return b ? 0x51ED27F1ULL : 0x2545F491ULL; }
+/* Combine the hashes of a struct's fields (boost's hash_combine). */
+static inline uint64_t w_hash_mix(uint64_t h, uint64_t x) { return h ^ (x + 0x9E3779B97F4A7C15ULL + (h << 6) + (h >> 2)); }
 static inline uint64_t Str_hash(WStr *s) { return w_siphash13((const unsigned char *)s->data, (size_t)s->len); }
 __attribute__((noreturn)) static void w_panic_key(WBuf *key, const char *where) {
   WBuf m; buf_init(&m);
@@ -637,11 +641,12 @@ __attribute__((noreturn)) static void w_panic_key(WBuf *key, const char *where) 
       }                                                                                       \
     buf_puts(b, "}");                                                                         \
   }                                                                                           \
-  static V M##_at(M *m, K k, const char *where) {                                             \
+  static V *M##_slot(M *m, K k, const char *where) {                                         \
     V *v = M##_get(m, k);                                                                     \
     if (!v) { WBuf kb; buf_init(&kb); KN##_show(&kb, k, false); w_panic_key(&kb, where); }   \
-    return VN##_dup(*v);                                                                      \
-  }
+    return v;                                                                                 \
+  }                                                                                           \
+  static V M##_at(M *m, K k, const char *where) { return VN##_dup(*M##_slot(m, k, where)); }
 
 typedef struct L_Int L_Int;
 typedef struct L_Str L_Str;
@@ -749,6 +754,80 @@ static WStr *Str_slice(WStr *s, int64_t lo, int64_t hi) {
 static L_Int *Str_bytes(WStr *s) {
   L_Int *out = L_Int_new(s->len);
   for (int64_t i = 0; i < s->len; i++) L_Int_push(&out, (int64_t)(unsigned char)s->data[i]);
+  return out;
+}
+/* Bytes: a WStr holding binary data; only printing differs from Str. */
+#define Bytes_dup Str_dup
+#define Bytes_drop Str_drop
+#define Bytes_share Str_share
+#define Bytes_eq Str_eq
+#define Bytes_cmp Str_cmp
+#define Bytes_hash Str_hash
+static void Bytes_show(WBuf *b, WStr *s, bool top) {
+  (void)top;
+  char tmp[8];
+  buf_puts(b, "bytes([");
+  for (int64_t i = 0; i < s->len; i++) {
+    snprintf(tmp, sizeof tmp, i ? ", %u" : "%u", (unsigned)(unsigned char)s->data[i]);
+    buf_puts(b, tmp);
+  }
+  buf_puts(b, "])");
+}
+static WStr *Bytes_from_list(L_Int *l, const char *where) {
+  WStr *s = Str_new(l->len);
+  for (int64_t i = 0; i < l->len; i++) {
+    int64_t v = l->data[i];
+    if (v < 0 || v > 255) {
+      char m[96];
+      snprintf(m, sizeof m, "byte %lld is out of range 0 to 255", (long long)v);
+      Str_drop(s);
+      w_panic_c(m, where);
+    }
+    s->data[i] = (char)v;
+  }
+  return s;
+}
+static int64_t Bytes_at(WStr *s, int64_t i, const char *where) {
+  if (i < 0 || i >= s->len) {
+    char m[128];
+    snprintf(m, sizeof m, "index %lld is out of range for bytes of length %lld", (long long)i, (long long)s->len);
+    w_panic_c(m, where);
+  }
+  return (int64_t)(unsigned char)s->data[i];
+}
+/* The length of the UTF-8 character at s[i], or 1 for a byte that does not
+   start a well-formed one (as Interp.utf8_len). */
+static int64_t w_utf8_len(const unsigned char *s, int64_t i, int64_t n) {
+  unsigned char b = s[i];
+  int64_t k;
+  unsigned char lo = 0x80, hi = 0xBF;
+  if (b < 0x80) return 1;
+  else if (b >= 0xC2 && b <= 0xDF) k = 2;
+  else if (b >= 0xE0 && b <= 0xEF) { k = 3; if (b == 0xE0) lo = 0xA0; if (b == 0xED) hi = 0x9F; }
+  else if (b >= 0xF0 && b <= 0xF4) { k = 4; if (b == 0xF0) lo = 0x90; if (b == 0xF4) hi = 0x8F; }
+  else return 1;
+  if (i + k > n) return 1;
+  if (s[i + 1] < lo || s[i + 1] > hi) return 1;
+  for (int64_t j = 2; j < k; j++) if (s[i + j] < 0x80 || s[i + j] > 0xBF) return 1;
+  return k;
+}
+/* The characters (UTF-8 code points) of a string, each as a string. */
+static L_Str *Str_chars(WStr *s) {
+  L_Str *out = L_Str_new(s->len);
+  for (int64_t i = 0; i < s->len;) {
+    int64_t k = w_utf8_len((const unsigned char *)s->data, i, s->len);
+    L_Str_push(&out, Str_from(s->data + i, k));
+    i += k;
+  }
+  return out;
+}
+/* lo..<hi as a list */
+static L_Int *L_Int_range(int64_t lo, int64_t hi) {
+  int64_t n = 0;
+  if (hi > lo && __builtin_sub_overflow(hi, lo, &n)) w_oom();
+  L_Int *out = L_Int_new(n);
+  for (int64_t i = 0; i < n; i++) out->data[i] = lo + i;
+  out->len = n;
   return out;
 }
 /* The UTF-8 encoding of a code point; U+FFFD for anything that is not one. */
@@ -1844,6 +1923,7 @@ struct WTask {
   WClo *fn; void (*run)(WTask *); WGroup *g; char *pmsg; char *pwhere;
   WFiber *f;                            /* its fiber while it runs (under g->mu) */
   int done, cancelled;                  /* finished; ended by cancellation (no result) */
+  bool keep;                            /* its result goes in the group's list (not a () task) */
   max_align_t slot[];
 };
 struct WGroup {
@@ -1917,11 +1997,12 @@ static void w_task_entry(void *p) {
 }
 /* The closure and everything it references become shared before any other
    thread can see them. */
-static void w_spawn(WGroup *g, WClo *fn, void (*run)(WTask *), size_t slot) {
+/* keep: the task's result goes in the group's list (false for a task that returns ()) */
+static void w_spawn(WGroup *g, WClo *fn, void (*run)(WTask *), size_t slot, bool keep) {
   pthread_once(&w_pool_once, w_pool_start);
   Clo_share(fn);
   WTask *t = (WTask *)w_alloc(sizeof(WTask) + slot);
-  t->fn = fn; t->run = run; t->g = g; t->pmsg = NULL; t->pwhere = NULL; t->f = NULL; t->done = 0; t->cancelled = 0;
+  t->fn = fn; t->run = run; t->g = g; t->pmsg = NULL; t->pwhere = NULL; t->f = NULL; t->done = 0; t->cancelled = 0; t->keep = keep;
   WFiber *f = w_fiber_new(w_task_entry, t, w_stack_size);
   pthread_mutex_lock(&g->mu);
   if (g->n == g->cap) { g->cap *= 2; g->tasks = (WTask **)w_realloc(g->tasks, w_bytes(g->cap, sizeof(WTask *))); }
