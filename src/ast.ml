@@ -18,6 +18,7 @@ and pat_desc =
   | PStr of string
   | PBool of bool
   | PVariant of string option * string * pat list (* qualifier, variant, payload *)
+  | PTuple of pat list
 
 (* [ety] and [einst] are filled in by the checker: the expression's type, and
    for a reference to a generic function, the type arguments it was used at. *)
@@ -61,6 +62,8 @@ and stmt_desc =
   | SReturn of expr option
   | SWhile of expr * block
   | SFor of string * span * expr * block
+  | SLetPat of pat * expr (* `let (a, b) = e`; expanded into plain lets when modules load *)
+  | SForPat of pat * expr * block (* `for (k, v) in xs { ... }`; expanded likewise *)
   | SBreak
   | SContinue
 
@@ -104,6 +107,11 @@ type iface_decl = {
 }
 
 type item = IFn of fn_decl | IStruct of struct_decl | IEnum of enum_decl | IIface of iface_decl
+
+(* Tuples are built-in generic structs named `#tupleN` with fields `0`, `1`, ...;
+   the name cannot be written in source. *)
+let tuple_name n = "#tuple" ^ string_of_int n
+let is_tuple_name s = String.length s > 6 && String.sub s 0 6 = "#tuple"
 
 (* A parsed file: its `use` declarations and its items. *)
 type file = { uses : (string * span) list; items : item list }

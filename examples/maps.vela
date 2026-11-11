@@ -1,0 +1,38 @@
+// Maps: Map[K, V] with value semantics and insertion-order iteration.
+
+struct Stats {
+    count: Int,
+    names: Map[Str, Int],
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let mut counts = map()
+    for w in "the cat and the hat and the bat".split(" ") {
+        counts[w] = counts.get(w).unwrap_or(0) + 1
+    }
+    out.print("{counts} {counts.len()} {counts["the"]} {counts.get("dog")}")
+    out.print("{counts.keys()} {counts.values()}")
+    for (w, n) in counts.entries() {
+        if n > 1 {
+            out.write("{w}={n} ")
+        }
+    }
+    out.print("")
+    let snapshot = counts
+    counts.remove("cat")
+    counts["zebra"] = 9
+    counts["the"] = 100
+    out.print("{counts}")
+    out.print("{snapshot}")
+    out.print("{snapshot.contains("cat")} {counts.contains("cat")} {snapshot == counts}")
+    let squares: Map[Int, Int] = map([(1, 1), (2, 4), (3, 9)])
+    let again = map([(3, 9), (2, 4), (1, 1)])
+    out.print("{squares} {squares == again} {squares.is_empty()} {map().len()}")
+    let mut s = Stats { count: 0, names: map() }
+    s.names["a"] = 1
+    s.count = s.names.len()
+    out.print("{s.count} {s.names}")
+    let flags = map([(true, "yes"), (false, "no")])
+    out.print(flags[1 > 0])
+}

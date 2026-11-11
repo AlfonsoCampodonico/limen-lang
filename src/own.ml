@@ -17,7 +17,7 @@ and ablock = { stmts : ann list; lin : S.t }
 
 let ids atoms = List.fold_left (fun acc a -> match atom_var a with Some v -> S.add v.id acc | None -> acc) S.empty atoms
 let step_atoms steps = List.filter_map (function PIndex (a, _) | PIndexU a -> Some a | PField _ -> None) steps
-let mut_atom = function MSet a | MPush a -> a
+
 let rhs_uses r = ids (consumed r @ borrowed r)
 
 let rec live_block stmts out ~brk ~cont : ablock =
@@ -35,7 +35,7 @@ and live_stmt s out ~brk ~cont : ann * S.t =
   match s with
   | Let (v, r) | Init (v, r) | Set (v, r, _) -> plain (S.union (S.remove v.id out) (rhs_uses r))
   | Decl v -> plain (S.remove v.id out)
-  | Mutate (v, steps, m) -> plain (S.add v.id (S.union out (ids (mut_atom m :: step_atoms steps))))
+  | Mutate (v, steps, m) -> plain (S.add v.id (S.union out (ids (mut_atoms m @ step_atoms steps))))
   | If (c, a, b) ->
     let ba = live_block a out ~brk ~cont and bb = live_block b out ~brk ~cont in
     ({ s; out; sub = IfSub (ba, bb) }, S.union (ids [ c ]) (S.union ba.lin bb.lin))
@@ -150,8 +150,15 @@ and fwd_stmt (a : ann) owned ~brk ~cont : stmt list * S.t =
   | Decl v, _ -> ([ Decl v ], owned)
   | Mutate (v, steps, m), _ ->
     let borrowed = S.add v.id (ids (step_atoms steps)) in
-    let xs, o = consume [ mut_atom m ] ~live_after:a.out ~borrowed ~owned in
-    let m = match m with MSet _ -> MSet (List.hd xs) | MPush _ -> MPush (List.hd xs) in
+    let xs, o = consume (mut_atoms m) ~live_after:a.out ~borrowed ~owned in
+    let m =
+      match (m, xs) with
+      | MSet _, [ x ] -> MSet x
+      | MPush _, [ x ] -> MPush x
+      | MRemove _, [ x ] -> MRemove x
+      | MPut _, [ k; x ] -> MPut (k, x)
+      | _ -> failwith "mutate atoms"
+    in
     after (Mutate (v, steps, m)) o
   | If (c, _, _), IfSub (ba, bb) ->
     let sa, oa = fwd_block ba owned ~brk ~cont in

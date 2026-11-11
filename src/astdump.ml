@@ -17,6 +17,7 @@ let rec pat (p : pat) =
   | PStr s -> String.escaped s
   | PBool b -> string_of_bool b
   | PVariant (q, v, a) -> Option.value ~default:"" q ^ "." ^ v ^ "(" ^ String.concat "," (List.map pat a) ^ ")"
+  | PTuple ps -> "(" ^ String.concat "," (List.map pat ps) ^ ")"
 
 let op = function
   | Add -> "+" | Sub -> "-" | Mul -> "*" | Div -> "/" | Mod -> "%" | Eq -> "==" | Ne -> "!=" | Lt -> "<"
@@ -59,6 +60,8 @@ and stmt s =
   | SReturn e -> "return " ^ (match e with Some e -> expr e | None -> "")
   | SWhile (c, b) -> "while(" ^ expr c ^ ")" ^ block b
   | SFor (n, _, e, b) -> "for " ^ n ^ " in " ^ expr e ^ block b
+  | SLetPat (p, e) -> "let " ^ pat p ^ "=" ^ expr e
+  | SForPat (p, e, b) -> "for " ^ pat p ^ " in " ^ expr e ^ block b
   | SBreak -> "break"
   | SContinue -> "continue"
 

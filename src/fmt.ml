@@ -92,6 +92,7 @@ let rec ty (t : ty_expr) =
   | TyUnit -> "()"
   | TyInt n -> string_of_int n
   | TyName ("dyn", [ i ]) -> "dyn " ^ ty i
+  | TyName (n, args) when is_tuple_name n -> "(" ^ String.concat ", " (List.map ty args) ^ ")"
   | TyName (n, []) -> n
   | TyName (n, args) -> n ^ "[" ^ String.concat ", " (List.map ty args) ^ "]"
   | TyFn (ps, r) -> "fn(" ^ String.concat ", " (List.map ty ps) ^ ") -> " ^ ty r
@@ -115,6 +116,7 @@ let rec pat (p : pat) =
   | PBool b -> string_of_bool b
   | PVariant (q, v, args) ->
     (match q with Some e -> e ^ "." ^ v | None -> v) ^ if args = [] then "" else "(" ^ String.concat ", " (List.map pat args) ^ ")"
+  | PTuple ps -> "(" ^ String.concat ", " (List.map pat ps) ^ ")"
 
 (* ---------- expressions ---------- *)
 
@@ -129,7 +131,7 @@ let op_str = function
    `if`/`while`/`for`/`match` head. *)
 let rec bare_struct e =
   match e.edesc with
-  | EStruct _ -> true
+  | EStruct (n, _, _) -> not (is_tuple_name n)
   | EBin (_, a, b) -> bare_struct a || bare_struct b
   | EUn (_, a) | ETry a | EField (a, _, _) | EIndex (a, _) -> bare_struct a
   | EMethod (r, _, _, _) -> bare_struct r
@@ -193,6 +195,8 @@ and expr_inner c ind e =
     expr c ind ~min:8 a;
     add c "?"
   | EList es -> seq c ind "[" "]" (breaks_after_open c e.espan.lo '[') (fun x -> expr c (ind + 4) x) (fun x -> x.espan) es
+  | EStruct (name, _, fields) when is_tuple_name name ->
+    seq c ind "(" ")" (breaks_after_open c e.espan.lo '(') (fun (_, _, x) -> expr c (ind + 4) x) (fun (_, _, x) -> x.espan) fields
   | EStruct (name, nsp, fields) ->
     add c (name ^ " ");
     let field (f, fsp, v) =
@@ -339,6 +343,14 @@ and stmt c ind s =
     block c ind b
   | SFor (n, _, e, b) ->
     add c ("for " ^ n ^ " in ");
+    head c ind e;
+    add c " ";
+    block c ind b
+  | SLetPat (p, e) ->
+    add c ("let " ^ pat p ^ " = ");
+    expr c ind e
+  | SForPat (p, e, b) ->
+    add c ("for " ^ pat p ^ " in ");
     head c ind e;
     add c " ";
     block c ind b

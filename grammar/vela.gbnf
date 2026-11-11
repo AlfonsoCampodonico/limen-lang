@@ -41,26 +41,29 @@ enum     ::= "enum" sp1 ident sp generics? sp "{" ws (variant (isep variant)* (w
 variant  ::= ident (sp "(" ws type (isep type)* (ws ",")? ws ")")?
 
 # ---------- types ----------
-type    ::= "dyn" sp1 qident | ident ("." ident)? (sp "[" ws typearg (isep typearg)* (ws ",")? ws "]")? | "(" ws ")" | "fn" sp "(" ws (type (isep type)* (ws ",")?)? ws ")" sp "->" sp type
+type    ::= "dyn" sp1 qident | ident ("." ident)? (sp "[" ws typearg (isep typearg)* (ws ",")? ws "]")? | "(" ws ")" | "(" ws type (isep type)* (ws ",")? ws ")" | "fn" sp "(" ws (type (isep type)* (ws ",")?)? ws ")" sp "->" sp type
 typearg ::= type | int
 
 # ---------- blocks and statements ----------
 block ::= "{" ws (stmt (stsep stmt)* (sp ";")?)? ws "}"
 stmt  ::= let | return | while | for | "break" | "continue" | expr (sp "=" ws expr)?
-let    ::= "let" sp1 ("mut" sp1)? ident sp (":" sp type sp)? "=" ws expr
+let    ::= "let" sp1 ("mut" sp1)? (ident sp (":" sp type sp)? | upat sp) "=" ws expr
+tpat   ::= "(" ws pattern (isep pattern)* (ws ",")? ws ")"
+# unpacking in `let` and `for`: names, `_` and nested tuples only
+upat   ::= "(" ws (ident | upat) (isep (ident | upat))* (ws ",")? ws ")"
 return ::= "return" (sp1 expr)?
 while  ::= "while" sp1 expr sp block
-for    ::= "for" sp1 ident sp1 "in" sp1 expr sp block
+for    ::= "for" sp1 (ident sp1 | upat sp) "in" sp1 expr sp block
 
 # ---------- expressions ----------
 expr    ::= unary (sp binop ws unary)*
 binop   ::= "||" | "&&" | "==" | "!=" | "<=" | ">=" | "<" | ">" | "+" | "-" | "*" | "/" | "%"
 unary   ::= ("-" | "!") sp unary | postfix
 postfix ::= primary suffix*
-suffix  ::= sp "(" ws args? ws ")" | sp "[" ws expr ws "]" | ws "." sp ident | sp "?"
+suffix  ::= sp "(" ws args? ws ")" | sp "[" ws expr ws "]" | ws "." sp ident | "." [0-9]+ | sp "?"
 args    ::= expr (isep expr)* (ws ",")?
 
-primary ::= float | int | string | ident | structlit | "(" ws ")" | "(" ws expr ws ")" | "[" ws args? ws "]" | block | if | match | closure | group
+primary ::= float | int | string | ident | structlit | "(" ws ")" | "(" ws expr ws ")" | "(" ws expr (isep expr)+ (ws ",")? ws ")" | "[" ws args? ws "]" | block | if | match | closure | group
 structlit ::= (ident ".")? upper sp "{" ws (init (isep init)* (ws ",")?)? ws "}"
 init      ::= ident (sp ":" ws expr)?
 if        ::= "if" sp1 expr sp block (ws "else" (sp block | sp1 if))?
@@ -70,7 +73,7 @@ closure   ::= "|" ws (cparam (isep cparam)* ws)? "|" ws expr | "||" ws expr
 cparam    ::= ident (sp ":" sp type)?
 group     ::= "group" sp1 ident sp block
 
-pattern ::= "-"? int | plainstr | ident ("." ident)? (sp "(" ws pattern (isep pattern)* (ws ",")? ws ")")?
+pattern ::= "-"? int | plainstr | ident ("." ident)? (sp "(" ws pattern (isep pattern)* (ws ",")? ws ")")? | tpat
 
 # ---------- tokens ----------
 ident  ::= [A-Za-z_] [A-Za-z0-9_]*

@@ -22,7 +22,7 @@ let escapes (v : var) body =
   let rec go = function
     | Let (_, r) | Init (_, r) -> mentions v (consumed r)
     | Set (w, r, _) -> w.id = v.id || mentions v (consumed r)
-    | Mutate (_, _, (MSet a | MPush a)) -> mentions v [ a ]
+    | Mutate (_, _, m) -> mentions v (mut_atoms m)
     | Return a -> mentions v [ a ]
     | If (_, a, b) -> List.exists go a || List.exists go b
     | Loop b -> List.exists go b

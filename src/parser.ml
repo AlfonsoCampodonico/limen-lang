@@ -44,6 +44,11 @@ let is_upper s = s <> "" && s.[0] >= 'A' && s.[0] <= 'Z'
 let mk d sp = { edesc = d; espan = sp; ety = Types.TErr; einst = [] }
 
 (* Comma-separated list up to [close]; a newline also separates items. *)
+let peek2 st = st.toks.(min (st.pos + 1) (Array.length st.toks - 1))
+
+let rec irrefutable_tuple (p : pat) =
+  match p.pdesc with PBind _ | PWild -> true | PTuple ps -> List.for_all irrefutable_tuple ps | _ -> false
+
 let comma_list st close f =
   let rec go acc =
     if accept_sym st close then List.rev acc
@@ -75,8 +80,17 @@ let rec parse_type st : ty_expr =
     { tdesc = TyName ("dyn", [ { tdesc = TyName (name, []); tspan = nsp } ]); tspan = merge t.span nsp }
   | SYM "(" ->
     ignore (advance st);
-    let r = expect_sym st ")" in
-    { tdesc = TyUnit; tspan = merge t.span r.span }
+    if is_sym st ")" then
+      let r = advance st in
+      { tdesc = TyUnit; tspan = merge t.span r.span }
+    else begin
+      (* `(A, B)` is a tuple type; `(A)` is just A *)
+      let ts = comma_list st ")" parse_type in
+      let sp = merge t.span (last_span st) in
+      match ts with
+      | [ one ] -> { one with tspan = sp }
+      | _ -> { tdesc = TyName (tuple_name (List.length ts), ts); tspan = sp }
+    end
   | KW "fn" ->
     ignore (advance st);
     ignore (expect_sym st "(");
@@ -166,6 +180,12 @@ and parse_postfix st ns e =
     let i = parse_expr st in
     let r = expect_sym st "]" in
     parse_postfix st ns (mk (EIndex (e, i)) (merge e.espan r.span))
+  | SYM "." when (match (peek2 st).tok with INT _ -> true | _ -> false) ->
+    (* tuple field: `t.0` *)
+    ignore (advance st);
+    let it = advance st in
+    let k = match it.tok with INT k -> Int64.to_string k | _ -> "0" in
+    parse_postfix st ns (mk (EField (e, k, it.span)) (merge e.espan it.span))
   | SYM "." ->
     ignore (advance st);
     let name, nsp = expect_ident st in
@@ -209,8 +229,17 @@ and parse_primary st ns =
       mk EUnit (merge t.span r.span)
     else
       let e = parse_expr st in
-      let r = expect_sym st ")" in
-      { e with espan = merge t.span r.span }
+      if is_sym st "," then begin
+        (* a tuple: `(a, b)` *)
+        ignore (advance st);
+        let rest = comma_list st ")" parse_expr in
+        let es = e :: rest in
+        let sp = merge t.span (last_span st) in
+        mk (EStruct (tuple_name (List.length es), t.span, List.mapi (fun i x -> (string_of_int i, x.espan, x)) es)) sp
+      end
+      else
+        let r = expect_sym st ")" in
+        { e with espan = merge t.span r.span }
   | SYM "[" ->
     ignore (advance st);
     let es = comma_list st "]" parse_expr in
@@ -325,6 +354,13 @@ and parse_pat st =
     end
     else if q <> None || is_upper v then mkp (PVariant (q, v, [])) (merge t.span vsp)
     else mkp (PBind v) t.span
+  | SYM "(" ->
+    ignore (advance st);
+    let ps = comma_list st ")" parse_pat in
+    let sp = merge t.span (last_span st) in
+    (match ps with
+     | [ one ] -> { one with pspan = sp }
+     | _ -> mkp (PTuple ps) sp)
   | _ -> fail t "a pattern"
 
 and parse_block st =
@@ -361,6 +397,16 @@ and parse_stmt st =
   | KW "let" ->
     ignore (advance st);
     let m = if is_kw st "mut" then (ignore (advance st); true) else false in
+    if is_sym st "(" then begin
+      (* `let (a, b) = e` *)
+      let p = parse_pat st in
+      if not (irrefutable_tuple p) then
+        raise (Diag.Fatal (Diag.make "E0003" p.pspan "`let` can only unpack a tuple into names and `_`, as in `let (a, _) = t`"));
+      ignore (expect_sym st "=");
+      let e = parse_expr st in
+      mks (SLetPat (p, e)) (merge t.span e.espan)
+    end
+    else
     let n, nsp = expect_ident st in
     let ann = if accept_sym st ":" then Some (parse_type st) else None in
     ignore (expect_sym st "=");
@@ -378,6 +424,15 @@ and parse_stmt st =
     let c = parse_expr_ns st in
     let b = parse_block st in
     mks (SWhile (c, b)) (merge t.span b.bspan)
+  | KW "for" when (match (peek2 st).tok with SYM "(" -> true | _ -> false) ->
+    ignore (advance st);
+    let p = parse_pat st in
+    if not (irrefutable_tuple p) then
+      raise (Diag.Fatal (Diag.make "E0003" p.pspan "`for` can only unpack a tuple into names and `_`, as in `for (k, v) in m.entries()`"));
+    ignore (expect_kw st "in");
+    let e = parse_expr_ns st in
+    let b = parse_block st in
+    mks (SForPat (p, e, b)) (merge t.span b.bspan)
   | KW "for" ->
     ignore (advance st);
     let n, nsp = expect_ident st in

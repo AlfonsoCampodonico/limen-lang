@@ -78,7 +78,7 @@ let unify_at ctx span want got =
   try unify want got
   with Mismatch -> err ctx "E0201" span (sprintf "expected `%s`, found `%s`" (show want) (show got))
 
-let builtin_types = [ "Int"; "Float"; "Bool"; "Str"; "List"; "Array"; "Chan"; "Root"; "Net"; "Fs"; "Stdout"; "Clock"; "Listen"; "Listener"; "Conn"; "Rand"; "Stdin"; "Env" ]
+let builtin_types = [ "Int"; "Float"; "Bool"; "Str"; "List"; "Array"; "Chan"; "Root"; "Net"; "Fs"; "Stdout"; "Clock"; "Listen"; "Listener"; "Conn"; "Rand"; "Stdin"; "Env"; "Map" ]
 
 (* Names other languages use for ambient I/O, mapped to the capability way. *)
 let ambient =
@@ -141,6 +141,7 @@ let rec resolve ctx env (te : ty_expr) : ty =
     | "Stdin" -> simple (TCap Stdin)
     | "Env" -> simple (TCap Env)
     | "Chan" -> if want 1 then TChan (List.hd args') else TErr
+    | "Map" -> if want 2 then TMap (List.nth args' 0, List.nth args' 1) else TErr
     | _ -> (
       match List.assoc_opt n env with
       | Some t -> simple t
@@ -212,6 +213,10 @@ let cur_bounds : (string * string list) list ref = ref []
    known: (where, the type used, the interface, the type parameter). *)
 let pending : (Span.t * ty * string * string) list ref = ref []
 
+(* Key types of maps created in the function being checked: they must end
+   up Int, Str or Bool. *)
+let map_keys : (Span.t * ty) list ref = ref []
+
 let add_bounds fname env sp =
   match Hashtbl.find_opt fn_bounds fname with
   | None -> ()
@@ -275,6 +280,10 @@ let methods (t : ty) : (string * (unit -> ty list * ty)) list =
       ("map", fun () -> let u = fresh () in ([ TFn ([ a ], u) ], TList u));
       ("fold", fun () -> let u = fresh () in ([ u; TFn ([ u; a ], u) ], u));
       m "join" [ TStr ] TStr; m "sum" [] TInt ]
+  | TMap (k, v) ->
+    [ m "len" [] TInt; m "is_empty" [] TBool; m "get" [ k ] (opt v); m "contains" [ k ] TBool;
+      m "remove" [ k ] TUnit; m "keys" [] (TList k); m "values" [] (TList v);
+      m "entries" [] (TList (TNamed (Ast.tuple_name 2, [ k; v ]))) ]
   | TArray (a, _) ->
     [ m "len" [] TInt; m "get" [ TInt ] (opt a); m "to_list" [] (TList a); m "contains" [ a ] TBool ]
   | TNamed ("Option", [ a ]) ->
@@ -388,12 +397,15 @@ and check_expr_inner ctx f e : ty =
   | EField (recv, name, nsp) -> check_field ctx f recv name nsp
   | EIndex (a, i) -> (
     let t = check_expr ctx f a in
+    match repr t with
+    | TMap (k, v) -> expect ctx f i k; v
+    | _ ->
     expect ctx f i TInt;
     match repr t with
     | TList el | TArray (el, _) -> el
     | TErr -> TErr
     | _ ->
-      err ctx "E0201" a.espan (sprintf "only lists and arrays can be indexed, found `%s`" (show t));
+      err ctx "E0201" a.espan (sprintf "only lists, arrays and maps can be indexed, found `%s`" (show t));
       TErr)
   | ETry x -> check_try ctx f x e.espan
   | EIf (c, b, els) -> (
@@ -542,6 +554,14 @@ and check_call ctx f callee args sp =
      | [ a ] -> expect ctx f a TInt
      | _ -> err ctx "E0107" sp "`channel` takes 1 argument, its capacity"; check_args ctx f args);
     TChan (fresh ())
+  | EVar "map" when lookup f "map" = None && not (Hashtbl.mem ctx.fns "map") ->
+    let k = fresh () and v = fresh () in
+    (match args with
+     | [] -> ()
+     | [ a ] -> expect ctx f a (TList (TNamed (tuple_name 2, [ k; v ])))
+     | _ -> err ctx "E0107" sp "`map` takes no arguments, or a list of (key, value) pairs"; check_args ctx f args);
+    map_keys := (sp, k) :: !map_keys;
+    TMap (k, v)
   | EVar "panic" when lookup f "panic" = None && not (Hashtbl.mem ctx.fns "panic") ->
     (match args with
      | [ a ] -> expect ctx f a TStr
@@ -716,7 +736,7 @@ and check_method_value ctx f e recv name nsp args =
       (match (name, rt) with
        | "join", TList a -> unify_at ctx recv.espan TStr a
        | "sum", TList a -> unify_at ctx recv.espan TInt a
-       | "push", TList _ -> check_place ctx f recv
+       | "push", TList _ | "remove", TMap _ -> check_place ctx f recv
        | _ -> ());
       if List.length ps <> List.length args then begin
         err ctx "E0107" nsp
@@ -928,6 +948,10 @@ and check_pat ctx f t p =
   | PInt _ -> unify_at ctx p.pspan t TInt
   | PStr _ -> unify_at ctx p.pspan t TStr
   | PBool _ -> unify_at ctx p.pspan t TBool
+  | PTuple ps ->
+    let ts = List.map (fun _ -> fresh ()) ps in
+    unify_at ctx p.pspan (TNamed (tuple_name (List.length ps), ts)) t;
+    List.iter2 (check_pat ctx f) ts ps
   | PVariant (q, v, args) -> (
     let rt = repr t in
     let skip () = List.iter (fun a -> check_pat ctx f TErr a) args in
@@ -985,10 +1009,11 @@ and check_pat ctx f t p =
 (* Patterns still unmatched, as source text. Single-field payloads are
    checked recursively; multi-field payloads only need one arm each. *)
 and missing_arms ctx t pats =
-  let irrefutable p = match p.pdesc with PWild | PBind _ -> true | _ -> false in
+  let rec irrefutable p = match p.pdesc with PWild | PBind _ -> true | PTuple ps -> List.for_all irrefutable ps | _ -> false in
   if List.exists irrefutable pats then []
   else
     match repr t with
+    | TNamed (n, _) when is_tuple_name n -> if exhaustive ctx (List.map (fun p -> [ p ]) pats) [ t ] then [] else [ "_" ]
     | TBool ->
       List.filter_map
         (fun b -> if List.exists (fun p -> p.pdesc = PBool b) pats then None else Some (string_of_bool b))
@@ -1015,6 +1040,43 @@ and missing_arms ctx t pats =
     | TErr | TVar _ -> []
     | _ -> [ "_" ]
 
+(* Do the rows of patterns cover every value of the column types? The
+   classic matrix check: split on the first column's constructors. *)
+and exhaustive ctx (rows : pat list list) (tys : ty list) : bool =
+  match tys with
+  | [] -> rows <> []
+  | t :: rest_tys -> (
+    let wild p = match p.pdesc with PWild | PBind _ -> true | _ -> false in
+    let wild_p = { pdesc = PWild; pspan = Span.dummy } in
+    let default () = exhaustive ctx (List.filter_map (function p :: r when wild p -> Some r | _ -> None) rows) rest_tys in
+    (* rows specialised to a constructor with these argument types *)
+    let special matches args =
+      List.filter_map
+        (function
+          | p :: r when wild p -> Some (List.map (fun _ -> wild_p) args @ r)
+          | p :: r -> ( match matches p with Some ps -> Some (ps @ r) | None -> None)
+          | [] -> None)
+        rows
+    in
+    match repr t with
+    | TNamed (n, args) when is_tuple_name n ->
+      exhaustive ctx (special (fun p -> match p.pdesc with PTuple ps -> Some ps | _ -> None) args) (args @ rest_tys)
+    | TBool ->
+      List.for_all
+        (fun b -> exhaustive ctx (special (fun p -> if p.pdesc = PBool b then Some [] else None) []) rest_tys)
+        [ true; false ]
+    | TNamed (n, targs) when Hashtbl.mem ctx.variants n ->
+      let env = List.combine (Hashtbl.find ctx.enums n).en_gen targs in
+      List.for_all
+        (fun (v, payload) ->
+          let ptys = List.map (subst env) payload in
+          exhaustive ctx
+            (special (fun p -> match p.pdesc with PVariant (_, v', a) when v' = v -> Some a | _ -> None) ptys)
+            (ptys @ rest_tys))
+        (Hashtbl.find ctx.variants n)
+    | TErr | TVar _ -> true
+    | _ -> default ())
+
 and check_block ctx f b =
   push f;
   let diverges = List.fold_left (fun d s -> check_stmt ctx f s || d) false b.stmts in
@@ -1038,8 +1100,19 @@ and check_stmt ctx f s : bool =
     false
   | SAssign (lhs, rhs) ->
     check_place ctx f lhs;
+    let rec through_map_entry (e : expr) =
+      match e.edesc with
+      | EField (r, _, _) | EIndex (r, _) -> (
+        match r.edesc with
+        | EIndex (m, _) when (match repr m.ety with TMap _ -> true | _ -> false) -> true
+        | _ -> through_map_entry r)
+      | _ -> false
+    in
     let is_group = match lhs.edesc with EVar n -> (match lookup f n with Some (v, _) -> v.vkind = KGroup | None -> false) | _ -> false in
     let lt = if is_group then TErr else check_expr ctx f lhs in
+    if through_map_entry lhs then
+      err ctx "E0209" lhs.espan "a map entry can only be replaced whole"
+        ~notes:[ "read it, change the copy, and store it back: `let mut e = m[k]` ... `m[k] = e`" ];
     expect ctx f rhs lt;
     false
   | SExpr e -> ignore (check_expr ctx f e); false
@@ -1056,6 +1129,7 @@ and check_stmt ctx f s : bool =
     ignore (check_block ctx f b);
     f.loops <- f.loops - 1;
     false
+  | SLetPat _ | SForPat _ -> failwith "destructuring is expanded when modules load"
   | SFor (n, nsp, e, b) ->
     let t = check_expr ctx f e in
     let el =
@@ -1098,6 +1172,15 @@ let check_main ctx (d : fn_decl) (s : fsig) =
       ~notes:[ "write `fn main(root: Root)` or `fn main(root: Root) -> Result[(), E]`" ]
 
 let check_pending ctx =
+  List.iter
+    (fun (sp, k) ->
+      match repr k with
+      | TInt | TStr | TBool | TVar _ | TErr -> ()
+      | t ->
+        err ctx "E0113" sp (sprintf "map keys must be Int, Str or Bool, not `%s`" (show t))
+          ~notes:[ "use a string or number that identifies the value, for example its name or id" ])
+    !map_keys;
+  map_keys := [];
   let ps = List.rev !pending in
   pending := [];
   List.iter
@@ -1113,6 +1196,7 @@ let check_pending ctx =
 let check_fn ctx (d : fn_decl) (s : fsig) =
   cur_bounds := List.map (fun (g, bs) -> (g, List.map fst bs)) d.fn_bounds;
   pending := [];
+  map_keys := [];
   Fun.protect ~finally:(fun () -> check_pending ctx) @@ fun () ->
   let genv = List.map (fun g -> (g, TParam g)) d.fn_gen in
   let scope = { vars = Hashtbl.create 8; barrier = false } in

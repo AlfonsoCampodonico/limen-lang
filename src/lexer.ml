@@ -89,15 +89,17 @@ let lex ?(base = 0) file (src : string) : token array =
     end
     else if is_digit c then begin
       let lo = !i in
+      (* `t.0.1` is two tuple fields, not the float 0.1 *)
+      let after_dot = match !toks with { tok = SYM "."; span; _ } :: _ -> span.hi = base + lo | _ -> false in
       while !i < n && (is_digit src.[!i] || src.[!i] = '_') do incr i done;
-      let is_float = !i + 1 < n && src.[!i] = '.' && is_digit src.[!i + 1] in
+      let is_float = (not after_dot) && !i + 1 < n && src.[!i] = '.' && is_digit src.[!i + 1] in
       if is_float then begin
         incr i;
         while !i < n && (is_digit src.[!i] || src.[!i] = '_') do incr i done
       end;
       (* exponent: 1e9, 2.5E-3 *)
       let has_exp =
-        !i < n
+        (not after_dot) && !i < n
         && (src.[!i] = 'e' || src.[!i] = 'E')
         && (( !i + 1 < n && is_digit src.[!i + 1])
            || (!i + 2 < n && (src.[!i + 1] = '+' || src.[!i + 1] = '-') && is_digit src.[!i + 2]))

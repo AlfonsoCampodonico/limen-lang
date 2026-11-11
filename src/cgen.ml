@@ -47,7 +47,7 @@ let rec cname c t =
     "Chan"
   | TList TInt -> "L_Int"
   | TList TStr -> "L_Str"
-  | TList _ | TNamed _ | TArray _ -> (
+  | TList _ | TNamed _ | TArray _ | TMap _ -> (
     let k = show t in
     match Hashtbl.find_opt c.names k with
     | Some n -> n
@@ -57,6 +57,7 @@ let rec cname c t =
       (* register components first so they get definitions too *)
       (match t with
        | TList e | TArray (e, _) -> ignore (cname c e)
+       | TMap (k, v) -> ignore (cname c k); ignore (cname c v)
        | TNamed _ when is_enum c t ->
          List.iter (fun (_, ps) -> List.iter (fun p -> ignore (cname c p)) ps) (Lower.variants c.g t)
        | TNamed _ -> List.iter (fun (_, ft) -> ignore (cname c ft)) (Lower.field_types c.g t)
@@ -77,7 +78,7 @@ let ctype c t =
   | TCap _ -> "WCap*"
   | TGroup _ -> "WGroup*"
   | TChan _ -> "WChan*"
-  | TList _ -> cname c t ^ "*"
+  | TList _ | TMap _ -> cname c t ^ "*"
   | _ -> cname c t (* structs, enums and arrays are C values *)
 
 (* ---------- literals ---------- *)
@@ -168,6 +169,10 @@ let rec pat_cond c e t (p : Ast.pat) =
     let ptys = List.assoc vn (Lower.variants c.g t) in
     let subs = List.mapi (fun i (a, pt) -> pat_cond c (payload_expr c t e k i) pt a) (List.combine args ptys) in
     String.concat " && " (sprintf "(%s == %d)" (tag_expr c t e) k :: List.filter (fun s -> s <> "true") subs)
+  | Ast.PTuple ps ->
+    let fts = Lower.field_types c.g t in
+    let subs = List.mapi (fun i (p, (_, ft)) -> pat_cond c (sprintf "(%s).f%d" e i) ft p) (List.combine ps fts) in
+    (match List.filter (fun s -> s <> "true") subs with [] -> "true" | xs -> String.concat " && " xs)
 
 let binop c op t a b sp =
   let open Ast in
@@ -348,6 +353,42 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
       line (sprintf "  %s = w_chan_recv(%s, &v_) ? %s : %s;" dst (arg 0) (mk_enum c t 0 [ "v_" ]) (mk_enum c t 1 []));
       line "}"
     | "chan_close", _ -> line (sprintf "w_chan_close(%s, %s);" (arg 0) (where sp)); set "0"
+    | "map_new", TMap _ -> set (sprintf "%s_new()" (cname c rt))
+    | "map_from", TMap (k, v) ->
+      let lt = TList (TNamed (Ast.tuple_name 2, [ k; v ])) in
+      line "{";
+      line (sprintf "  %s* m_ = %s_new();" (cname c rt) (cname c rt));
+      line (sprintf "  for (int64_t i_ = 0; i_ < (%s)->len; i_++) %s_put(&m_, %s, %s);" (arg 0) (cname c rt)
+              (dup_of c k (sprintf "(%s)->data[i_].f0" (arg 0))) (dup_of c v (sprintf "(%s)->data[i_].f1" (arg 0))));
+      ignore (cname c lt);
+      line (sprintf "  %s = m_;" dst);
+      line "}"
+    | "map_at", TMap _ -> set (sprintf "%s_at(%s, %s, %s)" (cname c rt) (arg 0) (arg 1) (where sp))
+    | "map_get", TMap (_, v) ->
+      line "{";
+      line (sprintf "  %s* p_ = %s_get(%s, %s);" (ctype c v) (cname c rt) (arg 0) (arg 1));
+      line (sprintf "  %s = p_ ? %s : %s;" dst (mk_enum c t 0 [ dup_of c v "*p_" ]) (mk_enum c t 1 []));
+      line "}"
+    | "map_contains", TMap _ -> set (sprintf "(%s_find(%s, %s) >= 0)" (cname c rt) (arg 0) (arg 1))
+    | "map_len", _ -> set (sprintf "(%s)->len" (arg 0))
+    | "map_is_empty", _ -> set (sprintf "((%s)->len == 0)" (arg 0))
+    | ("map_keys" | "map_values" | "map_entries"), TMap (k, v) ->
+      let lt = t in
+      let ln = cname c lt in
+      let item =
+        match name with
+        | "map_keys" -> dup_of c k "(m_)->keys[i_]"
+        | "map_values" -> dup_of c v "(m_)->vals[i_]"
+        | _ ->
+          let tt = TNamed (Ast.tuple_name 2, [ k; v ]) in
+          sprintf "(%s){ %s, %s }" (cname c tt) (dup_of c k "(m_)->keys[i_]") (dup_of c v "(m_)->vals[i_]")
+      in
+      line "{";
+      line (sprintf "  %s* m_ = %s;" (cname c rt) (arg 0));
+      line (sprintf "  %s* l_ = %s_new(m_->len);" ln ln);
+      line (sprintf "  for (int64_t i_ = 0; i_ < m_->n; i_++) if (m_->live[i_]) %s_push_u(&l_, %s);" ln item);
+      line (sprintf "  %s = l_;" dst);
+      line "}"
     | "list_len", _ | "str_len", _ -> set (sprintf "(%s)->len" (arg 0))
     | "list_is_empty", _ | "str_is_empty", _ -> set (sprintf "((%s)->len == 0)" (arg 0))
     | "list_get", TList el ->
@@ -494,7 +535,9 @@ and stmt c out ind (s : I.stmt) =
        line (sprintf "  *%s = %s;" p (atom c x))
      | I.MPush x ->
        let unchecked = steps = [] && List.mem v.id c.uniq in
-       line (sprintf "  %s_push%s(%s, %s);" (cname c t) (if unchecked then "_u" else "") p (atom c x)));
+       line (sprintf "  %s_push%s(%s, %s);" (cname c t) (if unchecked then "_u" else "") p (atom c x))
+     | I.MPut (k, x) -> line (sprintf "  %s_put(%s, %s, %s);" (cname c t) p (atom c k) (atom c x))
+     | I.MRemove k -> line (sprintf "  %s_remove(%s, %s);" (cname c t) p (atom c k)));
     line "}"
   | I.If (cond, a, b) ->
     line (sprintf "if (%s) {" (atom c cond));
@@ -642,7 +685,8 @@ let type_defs c (out : Buffer.t) =
   let p s = Buffer.add_string out (s ^ "\n") in
   compute_boxed c;
   let lists = List.filter (function TList _ -> true | _ -> false) c.types in
-  let named = topo c in
+  let maps = List.filter (function TMap _ -> true | _ -> false) c.types in
+  let named = List.filter (function TMap _ -> false | _ -> true) (topo c) in
   (* forward typedefs *)
   List.iter
     (fun t ->
@@ -651,7 +695,18 @@ let type_defs c (out : Buffer.t) =
       | TList _ -> p (sprintf "typedef struct %s %s;" n n)
       | _ -> if is_boxed c t then p (sprintf "typedef struct %s_box* %s;" n n) else p (sprintf "typedef struct %s %s;" n n))
     (lists @ named);
+  List.iter (fun t -> p (sprintf "typedef struct %s %s;" (cname c t) (cname c t))) maps;
   List.iter (fun t -> match t with TList e -> p (sprintf "VELA_LIST_STRUCT(%s, %s)" (cname c t) (ctype c e)) | _ -> ()) lists;
+  List.iter
+    (fun t -> match t with TMap (k, v) -> p (sprintf "VELA_MAP_STRUCT(%s, %s, %s)" (cname c t) (ctype c k) (ctype c v)) | _ -> ())
+    maps;
+  (* map prototypes: lists and structs of maps refer to them *)
+  List.iter
+    (fun t ->
+      let n = cname c t in
+      p (sprintf "static %s* %s_dup(%s* m);\nstatic void %s_drop(%s* m);\nstatic void %s_share(%s* m);\nstatic bool %s_eq(%s* a, %s* b);\nstatic void %s_show(WBuf* b, %s* m, bool top);"
+           n n n n n n n n n n n n))
+    maps;
   (* struct bodies *)
   List.iter
     (fun t ->
@@ -728,6 +783,12 @@ let type_defs c (out : Buffer.t) =
         if e = TFloat then p (sprintf "VELA_LIST_SORT(%s, double, Float)" (cname c t))
       | _ -> ())
     (List.stable_sort (fun a b -> compare (depth a) (depth b)) lists);
+  List.iter
+    (fun t ->
+      match t with
+      | TMap (k, v) -> p (sprintf "VELA_MAP_FUNCS(%s, %s, %s, %s, %s)" (cname c t) (ctype c k) (cname c k) (ctype c v) (cname c v))
+      | _ -> ())
+    maps;
   (* dup/drop/eq/show definitions *)
   List.iter
     (fun t ->
@@ -835,13 +896,14 @@ let type_defs c (out : Buffer.t) =
         p "  return true;\n}";
         p (sprintf "static void %s_show(WBuf* b, %s v, bool top) {" n ct);
         p "  (void)top; (void)v;";
-        p (sprintf "  buf_puts(b, %s);" (c_string (name ^ " { ")));
+        let tuple = Ast.is_tuple_name name in
+        p (sprintf "  buf_puts(b, %s);" (c_string (if tuple then "(" else name ^ " { ")));
         List.iteri
           (fun i (fname, ft) ->
-            p (sprintf "  buf_puts(b, %s);" (c_string ((if i > 0 then ", " else "") ^ fname ^ ": ")));
+            p (sprintf "  buf_puts(b, %s);" (c_string ((if i > 0 then ", " else "") ^ if tuple then "" else fname ^ ": ")));
             p (sprintf "  %s_show(b, v.f%d, false);" (cname c ft) i))
           fs;
-        p "  buf_puts(b, \" }\");\n}"
+        p (if tuple then "  buf_puts(b, \")\");\n}" else "  buf_puts(b, \" }\");\n}")
       end)
     named
 

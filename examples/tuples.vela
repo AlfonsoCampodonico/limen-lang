@@ -1,0 +1,36 @@
+// Tuples: (Int, Str) values, .0 access, destructuring and patterns.
+
+fn divmod(a: Int, b: Int) -> (Int, Int) {
+    (a / b, a % b)
+}
+
+fn swap[A, B](p: (A, B)) -> (B, A) {
+    (p.1, p.0)
+}
+
+fn classify(p: (Bool, Int)) -> Str {
+    match p {
+        (true, 0) => "yes zero",
+        (true, _) => "yes",
+        (false, n) => "no {n}",
+    }
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let (q, r) = divmod(17, 5)
+    out.print("{q} {r} {divmod(9, 4)}")
+    let t = (1, "one", 1.5)
+    out.print("{t} {t.0} {t.1} {t.2} {swap(("a", 2))}")
+    let nested = ((1, 2), (3, (4, 5)))
+    out.print("{nested.1.1.0} {nested}")
+    let ((a, _), (c, (d, e))) = nested
+    out.print("{a} {c} {d} {e}")
+    let pairs = [(1, "a"), (2, "b"), (3, "c")]
+    for (n, s) in pairs {
+        out.write("{s}{n} ")
+    }
+    out.print("")
+    out.print("{classify((true, 0))} {classify((true, 3))} {classify((false, 7))}")
+    out.print("{(1, 2) == (1, 2)} {(1, 2) == (2, 1)} {pairs.map(|p| p.0).sum()}")
+}

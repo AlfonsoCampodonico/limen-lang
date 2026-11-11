@@ -314,6 +314,151 @@ static inline int64_t w_idx(int64_t i, int64_t n, const char *where) {
     return c;                                                                                 \
   }
 
+/* ---------- maps: insertion-ordered hash tables with copy-on-write ----------
+   Entries live in arrays in insertion order; removed entries stay as holes
+   (live = 0) until the next rehash compacts them. idx is an open-addressing
+   table of entry positions, at most half full. */
+
+static inline uint64_t Int_hash(int64_t x) {
+  uint64_t z = (uint64_t)x + 0x9E3779B97F4A7C15ULL;
+  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+  z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+  return z ^ (z >> 31);
+}
+static inline uint64_t Unit_hash(W_Unit u) { (void)u; return 0; }
+static inline uint64_t Bool_hash(bool b) { return b ? 0x51ED27F1ULL : 0x2545F491ULL; }
+static inline uint64_t Str_hash(WStr *s) {
+  uint64_t h = 1469598103934665603ULL;
+  for (int64_t i = 0; i < s->len; i++) { h ^= (unsigned char)s->data[i]; h *= 1099511628211ULL; }
+  return h;
+}
+__attribute__((noreturn)) static void w_panic_key(WBuf *key, const char *where) {
+  WBuf m; buf_init(&m);
+  buf_puts(&m, "key "); buf_putn(&m, key->p, key->len); buf_puts(&m, " is not in the map");
+  buf_putn(&m, "", 1);
+  w_panic_c(m.p, where);
+}
+
+#define VELA_MAP_STRUCT(M, K, V) \
+  struct M { int64_t rc; int64_t len, n, cap, icap; K *keys; V *vals; uint8_t *live; int64_t *idx; };
+
+#define VELA_MAP_FUNCS(M, K, KN, V, VN)                                                       \
+  static M *M##_new(void) {                                                                   \
+    M *m = (M *)w_alloc(sizeof(M));                                                           \
+    m->rc = 1; m->len = 0; m->n = 0; m->cap = 8; m->icap = 16;                                \
+    m->keys = (K *)w_alloc(w_bytes(m->cap, sizeof(K)));                                       \
+    m->vals = (V *)w_alloc(w_bytes(m->cap, sizeof(V)));                                       \
+    m->live = (uint8_t *)w_alloc((size_t)m->cap);                                             \
+    m->idx = (int64_t *)w_alloc(w_bytes(m->icap, sizeof(int64_t)));                           \
+    for (int64_t i = 0; i < m->icap; i++) m->idx[i] = -1;                                     \
+    return m;                                                                                 \
+  }                                                                                           \
+  static inline M *M##_dup(M *m) { w_rc_inc(&m->rc); return m; }                              \
+  static void M##_drop(M *m) {                                                                \
+    if (w_rc_dec(&m->rc)) {                                                                   \
+      for (int64_t i = 0; i < m->n; i++) if (m->live[i]) { KN##_drop(m->keys[i]); VN##_drop(m->vals[i]); } \
+      w_free(m->keys); w_free(m->vals); w_free(m->live); w_free(m->idx); w_free(m);           \
+    }                                                                                         \
+  }                                                                                           \
+  static void M##_share(M *m) {                                                               \
+    if (w_rc_share(&m->rc))                                                                   \
+      for (int64_t i = 0; i < m->n; i++) if (m->live[i]) { KN##_share(m->keys[i]); VN##_share(m->vals[i]); } \
+  }                                                                                           \
+  static int64_t M##_find(M *m, K k) {                                                        \
+    uint64_t mask = (uint64_t)m->icap - 1;                                                    \
+    for (uint64_t h = KN##_hash(k) & mask;; h = (h + 1) & mask) {                             \
+      int64_t j = m->idx[h];                                                                  \
+      if (j < 0) return -1;                                                                   \
+      if (m->live[j] && KN##_eq(m->keys[j], k)) return j;                                    \
+    }                                                                                         \
+  }                                                                                           \
+  /* compact the holes away and rebuild idx, sized for cap entries */                         \
+  static void M##_rehash(M *m, int64_t cap) {                                                 \
+    int64_t w = 0;                                                                            \
+    for (int64_t i = 0; i < m->n; i++)                                                        \
+      if (m->live[i]) { m->keys[w] = m->keys[i]; m->vals[w] = m->vals[i]; m->live[w] = 1; w++; } \
+    m->n = w;                                                                                 \
+    if (cap != m->cap) {                                                                      \
+      m->keys = (K *)w_realloc(m->keys, w_bytes(cap, sizeof(K)));                             \
+      m->vals = (V *)w_realloc(m->vals, w_bytes(cap, sizeof(V)));                             \
+      m->live = (uint8_t *)w_realloc(m->live, (size_t)cap);                                   \
+      m->cap = cap;                                                                           \
+    }                                                                                         \
+    int64_t icap = 16;                                                                        \
+    while (icap < 2 * cap) icap *= 2;                                                         \
+    w_free(m->idx);                                                                           \
+    m->idx = (int64_t *)w_alloc(w_bytes(icap, sizeof(int64_t)));                              \
+    m->icap = icap;                                                                           \
+    for (int64_t i = 0; i < icap; i++) m->idx[i] = -1;                                        \
+    uint64_t mask = (uint64_t)icap - 1;                                                       \
+    for (int64_t j = 0; j < m->n; j++) {                                                      \
+      uint64_t h = KN##_hash(m->keys[j]) & mask;                                              \
+      while (m->idx[h] >= 0) h = (h + 1) & mask;                                              \
+      m->idx[h] = j;                                                                          \
+    }                                                                                         \
+  }                                                                                           \
+  static void M##_insert_new(M *m, K k, V v) {                                                \
+    if (m->n == m->cap) {                                                                     \
+      if (m->cap > INT64_MAX / 4) w_oom();                                                    \
+      M##_rehash(m, m->len * 2 < m->cap ? m->cap : m->cap * 2);                               \
+    }                                                                                         \
+    int64_t j = m->n++;                                                                       \
+    m->keys[j] = k; m->vals[j] = v; m->live[j] = 1; m->len++;                                 \
+    uint64_t mask = (uint64_t)m->icap - 1;                                                    \
+    uint64_t h = KN##_hash(k) & mask;                                                         \
+    while (m->idx[h] >= 0) h = (h + 1) & mask;                                                \
+    m->idx[h] = j;                                                                            \
+  }                                                                                           \
+  __attribute__((noinline, cold)) static void M##_copy(M **p) {                              \
+    M *m = *p;                                                                                \
+    M *c = M##_new();                                                                         \
+    for (int64_t i = 0; i < m->n; i++)                                                        \
+      if (m->live[i]) M##_insert_new(c, KN##_dup(m->keys[i]), VN##_dup(m->vals[i]));          \
+    *p = c;                                                                                   \
+    M##_drop(m);                                                                              \
+  }                                                                                           \
+  static inline void M##_unique(M **p) { if (__builtin_expect(!w_rc_unique(&(*p)->rc), 0)) M##_copy(p); } \
+  /* m[k] = v: consumes k and v */                                                            \
+  static void M##_put(M **p, K k, V v) {                                                      \
+    M##_unique(p);                                                                            \
+    M *m = *p;                                                                                \
+    int64_t j = M##_find(m, k);                                                               \
+    if (j >= 0) { KN##_drop(k); VN##_drop(m->vals[j]); m->vals[j] = v; return; }             \
+    M##_insert_new(m, k, v);                                                                  \
+  }                                                                                           \
+  /* consumes k */                                                                            \
+  static void M##_remove(M **p, K k) {                                                        \
+    M##_unique(p);                                                                            \
+    M *m = *p;                                                                                \
+    int64_t j = M##_find(m, k);                                                               \
+    if (j >= 0) { KN##_drop(m->keys[j]); VN##_drop(m->vals[j]); m->live[j] = 0; m->len--; }   \
+    KN##_drop(k);                                                                             \
+  }                                                                                           \
+  static inline V *M##_get(M *m, K k) { int64_t j = M##_find(m, k); return j < 0 ? NULL : &m->vals[j]; } \
+  static bool M##_eq(M *a, M *b) {                                                            \
+    if (a->len != b->len) return false;                                                       \
+    for (int64_t i = 0; i < a->n; i++)                                                        \
+      if (a->live[i]) { V *w = M##_get(b, a->keys[i]); if (!w || !VN##_eq(a->vals[i], *w)) return false; } \
+    return true;                                                                              \
+  }                                                                                           \
+  static void M##_show(WBuf *b, M *m, bool top) {                                             \
+    (void)top;                                                                                \
+    buf_puts(b, "{");                                                                         \
+    bool first = true;                                                                        \
+    for (int64_t i = 0; i < m->n; i++)                                                        \
+      if (m->live[i]) {                                                                       \
+        if (!first) buf_puts(b, ", ");                                                        \
+        first = false;                                                                        \
+        KN##_show(b, m->keys[i], false); buf_puts(b, ": "); VN##_show(b, m->vals[i], false);  \
+      }                                                                                       \
+    buf_puts(b, "}");                                                                         \
+  }                                                                                           \
+  static V M##_at(M *m, K k, const char *where) {                                             \
+    V *v = M##_get(m, k);                                                                     \
+    if (!v) { WBuf kb; buf_init(&kb); KN##_show(&kb, k, false); w_panic_key(&kb, where); }   \
+    return VN##_dup(*v);                                                                      \
+  }
+
 typedef struct L_Int L_Int;
 typedef struct L_Str L_Str;
 VELA_LIST_STRUCT(L_Int, int64_t)

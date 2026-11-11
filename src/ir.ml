@@ -65,7 +65,13 @@ type stmt =
   | Return of atom
   | Drop of var
 
-and mutation = MSet of atom | MPush of atom
+and mutation =
+  | MSet of atom
+  | MPush of atom
+  | MPut of atom * atom (* map: key, value *)
+  | MRemove of atom (* map: key *)
+
+let mut_atoms = function MSet a | MPush a | MRemove a -> [ a ] | MPut (k, v) -> [ k; v ]
 
 type fn = {
   fname : string;

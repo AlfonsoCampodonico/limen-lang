@@ -98,6 +98,8 @@ and walk_block f b =
       | SReturn eo -> Option.iter (walk_expr f) eo
       | SWhile (c, b) -> walk_expr f c; walk_block f b
       | SFor (_, _, e, b) -> walk_expr f e; walk_block f b
+      | SLetPat (_, e) -> walk_expr f e
+      | SForPat (_, e, b) -> walk_expr f e; walk_block f b
       | SBreak | SContinue -> ())
     b.stmts;
   Option.iter (walk_expr f) b.tail
@@ -221,6 +223,7 @@ let definitions items =
     | PVariant (_, v, args) ->
       (match List.assoc_opt v variant_spans with Some d -> add p.pspan d | None -> ());
       List.fold_left pat env args
+    | PTuple ps -> List.fold_left pat env ps
     | _ -> env
   in
   let rec expr env e =
@@ -280,6 +283,8 @@ let definitions items =
           | SReturn eo -> Option.iter (expr env) eo; env
           | SWhile (c, b) -> expr env c; block env b; env
           | SFor (n, nsp, e, b) -> expr env e; block ((n, nsp) :: env) b; env
+          | SLetPat (p, e) -> expr env e; pat env p
+          | SForPat (p, e, b) -> expr env e; block (pat env p) b; env
           | SBreak | SContinue -> env)
         env b.stmts
     in

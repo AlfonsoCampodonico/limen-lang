@@ -111,6 +111,7 @@ let rec resolve env (te : ty_expr) : ty =
     | "Stdin", _ -> TCap Stdin
     | "Env", _ -> TCap Env
     | "Chan", [ x ] -> TChan x
+    | "Map", [ k; v ] -> TMap (k, v)
     | _ -> ( match List.assoc_opt n env with Some t -> t | None -> TNamed (n, a)))
 
 let field_types g = function
@@ -222,6 +223,11 @@ let rec lower f (e : expr) : I.atom =
     | EMethod ({ edesc = EVar en; _ }, name, _, args) when is_enum_name f en ->
       let xs = List.map (lower f) args in
       tmp f ty (I.MkEnum (ty, tag_of f.g ty name, xs))
+    | EMethod (recv, "remove", _, [ k ]) when (match tyof f recv with TMap _ -> true | _ -> false) ->
+      let v, steps = lower_place f recv in
+      let ka = lower f k in
+      emit f (I.Mutate (v, steps, I.MRemove ka));
+      I.AUnit
     | EMethod (recv, "push", _, [ a ]) when (match tyof f recv with TList _ -> true | _ -> false) ->
       let v, steps = lower_place f recv in
       let x = lower f a in
@@ -333,6 +339,9 @@ and lower_call f e callee args ty =
   | EVar "channel" when not_local f "channel" && not (Hashtbl.mem f.g.fns "channel") ->
     let cap = lower f (List.hd args) in
     tmp f ty (I.ChanNew (ty, cap, e.espan))
+  | EVar "map" when not_local f "map" && not (Hashtbl.mem f.g.fns "map") ->
+    let xs = List.map (lower f) args in
+    tmp f ty (I.Prim ((if xs = [] then "map_new" else "map_from"), ty, xs, e.espan))
   | EVar "panic" when not_local f "panic" && not (Hashtbl.mem f.g.fns "panic") ->
     let m = lower f (List.hd args) in
     let r = tmp f ty (I.Panic (m, e.espan)) in
@@ -359,6 +368,12 @@ and access f e : I.atom * ty * I.step list =
   | EField (r, name, _) when is_struct f.g (tyof f r) ->
     let a, rt, steps = access f r in
     (a, rt, steps @ [ I.PField (field_index f.g (tyof f r) name) ])
+  | EIndex (r, k) when (match tyof f r with TMap _ -> true | _ -> false) ->
+    (* a map lookup starts a new path: the value it finds *)
+    let m = lower f r in
+    let ka = lower f k in
+    let vt = tyof f e in
+    (tmp f vt (I.Prim ("map_at", tyof f r, [ m; ka ], e.espan)), vt, [])
   | EIndex (r, i) ->
     let a, rt, steps = access f r in
     let ia = lower f i in
@@ -408,7 +423,7 @@ and lower_match f e s arms ty =
   let st = tyof f s in
   let r = fresh_var "m" ty in
   emit f (I.Decl r);
-  let irrefutable p = match p.pdesc with PWild | PBind _ -> true | _ -> false in
+  let rec irrefutable p = match p.pdesc with PWild | PBind _ -> true | PTuple ps -> List.for_all irrefutable ps | _ -> false in
   let rec chain = function
     | [] ->
       ignore (tmp f TUnit (I.Panic (I.AStr "no `match` arm matched", e.espan)));
@@ -437,7 +452,7 @@ and lower_match f e s arms ty =
 
 and bind_pat f a t (p : pat) =
   let rec has_bind p =
-    match p.pdesc with PBind _ -> true | PVariant (_, _, args) -> List.exists has_bind args | _ -> false
+    match p.pdesc with PBind _ -> true | PVariant (_, _, args) | PTuple args -> List.exists has_bind args | _ -> false
   in
   match p.pdesc with
   | PBind n ->
@@ -453,6 +468,14 @@ and bind_pat f a t (p : pat) =
           let pv = tmp f pt (I.Payload (a, t, tag, i)) in
           bind_pat f pv pt sub)
       (List.combine args ptys)
+  | PTuple ps ->
+    let fts = field_types f.g t in
+    List.iteri
+      (fun i (sub, (_, ft)) ->
+        if has_bind sub then
+          let pv = tmp f ft (I.Get (a, t, [ I.PField i ])) in
+          bind_pat f pv ft sub)
+      (List.combine ps fts)
   | _ -> ()
 
 (* The type arguments of generic function [d] called with arguments of the
@@ -608,6 +631,7 @@ and lower_method f e recv name args ty =
       | TFloat -> "float_"
       | TBool -> "bool_"
       | TList _ -> "list_"
+      | TMap _ -> "map_"
       | TArray _ -> "array_"
       | TChan _ -> "chan_"
       | TCap _ -> "cap_"
@@ -718,6 +742,7 @@ and lower_block_inner f b =
 and lower_stmt f s =
   if not f.dead then
     match s.sdesc with
+    | SLetPat _ | SForPat _ -> failwith "destructuring is expanded when modules load"
     | SLet (_, n, _, _, e) ->
       let a = lower f e in
       let v = fresh_var n (tyof f e) in
@@ -727,6 +752,12 @@ and lower_stmt f s =
       let a = lower f rhs in
       let v = match lookup f n with Some v -> v | None -> failwith "assign" in
       emit f (I.Set (v, I.Atom a, ref false))
+    | SAssign ({ edesc = EIndex (m, k); _ }, rhs) when (match tyof f m with TMap _ -> true | _ -> false) ->
+      (* `m[k] = v` inserts or replaces *)
+      let a = lower f rhs in
+      let ka = lower f k in
+      let v, steps = lower_place f m in
+      emit f (I.Mutate (v, steps, I.MPut (ka, a)))
     | SAssign (lhs, rhs) ->
       let a = lower f rhs in
       let v, steps = lower_place f lhs in

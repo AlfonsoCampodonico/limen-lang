@@ -21,8 +21,17 @@ type cap =
    touches a descriptor number that has been reused. *)
 and sock = { fd : Unix.file_descr; mutable shut : bool }
 
+(* Map keys: Int, Str or Bool. *)
+type mkey = KInt of int64 | KStr of string | KBool of bool
+
+module KM = Map.Make (struct
+  type t = mkey
+  let compare = compare
+end)
+
 type value =
   | VInt of int64 (* 64-bit and wrapping, as in native code *)
+  | VMap of vmap
   | VFloat of float
   | VBool of bool
   | VStr of string
@@ -41,6 +50,10 @@ type value =
   | VBuiltin of string (* assert, assert_eq *)
 
 and chan = { q : value Queue.t; cap : int; mutable closed : bool }
+
+(* A persistent map, so updates are cheap and values stay values. Each entry
+   remembers when its key was first inserted, for insertion-order iteration. *)
+and vmap = { m : (int * value) KM.t; next : int }
 
 and env = (string, value ref) Hashtbl.t list
 
@@ -94,6 +107,21 @@ let cap_name = function
   | CListen _ -> "Listen" | CListener _ -> "Listener" | CConn _ -> "Conn"
   | CRand -> "Rand" | CStdin -> "Stdin" | CEnv _ -> "Env"
 
+let key_of = function VInt n -> KInt n | VStr s -> KStr s | VBool b -> KBool b | _ -> failwith "internal: map key"
+let val_of_key = function KInt n -> VInt n | KStr s -> VStr s | KBool b -> VBool b
+let empty_map = { m = KM.empty; next = 0 }
+
+let map_entries mv =
+  KM.bindings mv.m
+  |> List.sort (fun (_, (a, _)) (_, (b, _)) -> compare a b)
+  |> List.map (fun (k, (_, v)) -> (val_of_key k, v))
+
+let map_put mv k v =
+  let k = key_of k in
+  match KM.find_opt k mv.m with
+  | Some (o, _) -> { mv with m = KM.add k (o, v) mv.m }
+  | None -> { m = KM.add k (mv.next, v) mv.m; next = mv.next + 1 }
+
 let rec show ?(top = true) v =
   match v with
   | VInt n -> Int64.to_string n
@@ -102,6 +130,9 @@ let rec show ?(top = true) v =
   | VStr s -> if top then s else "\"" ^ String.escaped s ^ "\""
   | VUnit -> "()"
   | VList a -> "[" ^ String.concat ", " (Array.to_list (Array.map (show ~top:false) a)) ^ "]"
+  | VMap mv ->
+    "{" ^ String.concat ", " (List.map (fun (k, v) -> show ~top:false k ^ ": " ^ show ~top:false v) (map_entries mv)) ^ "}"
+  | VStruct (n, fs) when Ast.is_tuple_name n -> "(" ^ String.concat ", " (List.map (fun (_, x) -> show ~top:false x) fs) ^ ")"
   | VStruct (n, fs) ->
     n ^ " { " ^ String.concat ", " (List.map (fun (k, x) -> k ^ ": " ^ show ~top:false x) fs) ^ " }"
   | VEnum (_, vn, []) -> vn
@@ -123,6 +154,10 @@ let rec equal a b =
   | VStruct (n, xs), VStruct (m, ys) -> n = m && List.for_all2 (fun (_, x) (_, y) -> equal x y) xs ys
   | VEnum (e, v, xs), VEnum (f, w, ys) ->
     e = f && v = w && List.length xs = List.length ys && List.for_all2 equal xs ys
+  | VMap a, VMap b ->
+    (* the same entries, in any order *)
+    KM.cardinal a.m = KM.cardinal b.m
+    && KM.for_all (fun k (_, v) -> match KM.find_opt k b.m with Some (_, w) -> equal v w | None -> false) a.m
   | _ -> false
 
 let compare_v a b =
@@ -414,6 +449,8 @@ let rec pmatch p v binds =
   | PBool b, VBool c -> b = c
   | PVariant (_, vn, args), VEnum (_, vn', vals) ->
     vn = vn' && List.length args = List.length vals && List.for_all2 (fun p v -> pmatch p v binds) args vals
+  | PTuple ps, VStruct (_, fs) when List.length ps = List.length fs ->
+    List.for_all2 (fun p (_, v) -> pmatch p v binds) ps fs
   | _ -> false
 
 let rec eval rt env e : value =
@@ -439,6 +476,13 @@ let rec eval rt env e : value =
     let fv = eval rt env c in
     let avs = List.map (eval rt env) args in
     apply rt fv avs e.espan
+  | EMethod (recv, "remove", _, [ arg ]) when (match eval rt env recv with VMap _ -> true | _ -> false) -> (
+    match eval rt env recv with
+    | VMap mv ->
+      let k = key_of (eval rt env arg) in
+      assign rt env recv (VMap { mv with m = KM.remove k mv.m });
+      VUnit
+    | _ -> failwith "internal: remove")
   | EMethod (recv, "push", _, [ arg ]) -> (
     match eval rt env recv with
     | VList arr ->
@@ -457,6 +501,10 @@ let rec eval rt env e : value =
   | EField (recv, name, _) -> field rt (eval rt env recv) name
   | EIndex (a, i) -> (
     match (eval rt env a, eval rt env i) with
+    | VMap mv, k -> (
+      match KM.find_opt (key_of k) mv.m with
+      | Some (_, v) -> v
+      | None -> raise (Panic (sprintf "key %s is not in the map" (show ~top:false k), e.espan)))
     | VList arr, VInt k ->
       if k < 0L || k >= Int64.of_int (Array.length arr) then
         raise (Panic (sprintf "index %Ld is out of range for a list of length %d" k (Array.length arr), e.espan));
@@ -507,7 +555,7 @@ and eval_var rt env n sp =
       | None ->
         if n = "panic" then VPanicFn
         else if n = "channel" then VChanFn
-        else if n = "assert" || n = "assert_eq" then VBuiltin n
+        else if n = "assert" || n = "assert_eq" || n = "map" then VBuiltin n
         else raise (Panic ("internal: unbound name " ^ n, sp)))
 
 and ctor_value rt en vn =
@@ -549,6 +597,15 @@ and apply rt fv args sp =
     | [ a; b ] when equal a b -> VUnit
     | [ a; b ] -> raise (Panic (sprintf "assertion failed: %s != %s" (show ~top:false a) (show ~top:false b), sp))
     | _ -> raise (Panic ("assertion failed", sp)))
+  | VBuiltin "map" -> (
+    match args with
+    | [] -> VMap empty_map
+    | [ VList pairs ] ->
+      VMap
+        (Array.fold_left
+           (fun mv p -> match p with VStruct (_, [ (_, k); (_, v) ]) -> map_put mv k v | _ -> mv)
+           empty_map pairs)
+    | _ -> failwith "internal: map")
   | VChanFn -> (
     match args with
     | [ VInt n ] when n >= 1L -> VChan { q = Queue.create (); cap = (if n > Int64.of_int max_int then max_int else Int64.to_int n); closed = false }
@@ -606,6 +663,7 @@ and assign rt env lhs v =
     | _ -> failwith "internal: assign field")
   | EIndex (r, i) -> (
     match (eval rt env r, eval rt env i) with
+    | VMap mv, k -> assign rt env r (VMap (map_put mv k v))
     | VList arr, VInt k ->
       if k < 0L || k >= Int64.of_int (Array.length arr) then
         raise (Panic (sprintf "index %Ld is out of range for a list of length %d" k (Array.length arr), lhs.espan));
@@ -622,6 +680,14 @@ and call_method rt v name args sp =
   | Some d -> call_fn rt d (v :: args)
   | None ->
   match (v, name, args) with
+  | VMap mv, "len", [] -> vint (KM.cardinal mv.m)
+  | VMap mv, "is_empty", [] -> VBool (KM.is_empty mv.m)
+  | VMap mv, "get", [ k ] -> ( match KM.find_opt (key_of k) mv.m with Some (_, v) -> some v | None -> none)
+  | VMap mv, "contains", [ k ] -> VBool (KM.mem (key_of k) mv.m)
+  | VMap mv, "keys", [] -> VList (Array.of_list (List.map fst (map_entries mv)))
+  | VMap mv, "values", [] -> VList (Array.of_list (List.map snd (map_entries mv)))
+  | VMap mv, "entries", [] ->
+    VList (Array.of_list (List.map (fun (k, v) -> VStruct (Ast.tuple_name 2, [ ("0", k); ("1", v) ])) (map_entries mv)))
   | VStr s, "len", [] -> vint (String.length s)
   | VStr s, "is_empty", [] -> VBool (s = "")
   | VStr s, "lines", [] -> strs (lines s)

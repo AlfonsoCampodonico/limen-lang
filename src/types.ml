@@ -14,6 +14,7 @@ type ty =
   | TGroup of ty (* handle of a `group` block whose tasks return ty *)
   | TArray of ty * int (* fixed-size array, a value type *)
   | TChan of ty (* channel between tasks *)
+  | TMap of ty * ty (* keys (Int, Str or Bool) to values, in insertion order *)
   | TDyn of string (* a value of any type that satisfies the interface, boxed with its methods *)
   | TParam of string (* a generic parameter inside its own definition *)
   | TVar of tvar ref
@@ -59,6 +60,7 @@ let rec show t =
   | TUnit -> "()"
   | TList a -> "List[" ^ show a ^ "]"
   | TFn (ps, r) -> "fn(" ^ String.concat ", " (List.map show ps) ^ ") -> " ^ show r
+  | TNamed (n, args) when String.length n > 6 && String.sub n 0 6 = "#tuple" -> "(" ^ String.concat ", " (List.map show args) ^ ")"
   | TNamed (n, []) -> n
   | TNamed (n, args) -> n ^ "[" ^ String.concat ", " (List.map show args) ^ "]"
   | TCap c -> cap_name c
@@ -66,6 +68,7 @@ let rec show t =
   | TArray (a, n) -> "Array[" ^ show a ^ ", " ^ string_of_int n ^ "]"
   | TChan a -> "Chan[" ^ show a ^ "]"
   | TDyn i -> "dyn " ^ i
+  | TMap (k, v) -> "Map[" ^ show k ^ ", " ^ show v ^ "]"
   | TParam n -> n
   | TVar _ -> "_"
   | TErr -> "?"
@@ -74,6 +77,7 @@ let rec occurs r t =
   match repr t with
   | TVar r' -> r == r'
   | TList a | TGroup a | TArray (a, _) | TChan a -> occurs r a
+  | TMap (k, v) -> occurs r k || occurs r v
   | TFn (ps, b) -> List.exists (occurs r) ps || occurs r b
   | TNamed (_, a) -> List.exists (occurs r) a
   | _ -> false
@@ -90,6 +94,7 @@ let rec unify a b =
   | TList x, TList y | TGroup x, TGroup y -> unify x y
   | TArray (x, n), TArray (y, m) when n = m -> unify x y
   | TChan x, TChan y -> unify x y
+  | TMap (k1, v1), TMap (k2, v2) -> unify k1 k2; unify v1 v2
   | TFn (p1, r1), TFn (p2, r2) ->
     if List.length p1 <> List.length p2 then raise Mismatch;
     List.iter2 unify p1 p2;
@@ -107,6 +112,7 @@ let rec subst env t =
   | TList a -> TList (subst env a)
   | TArray (a, n) -> TArray (subst env a, n)
   | TChan a -> TChan (subst env a)
+  | TMap (k, v) -> TMap (subst env k, subst env v)
   | TGroup a -> TGroup (subst env a)
   | TFn (ps, r) -> TFn (List.map (subst env) ps, subst env r)
   | TNamed (n, args) -> TNamed (n, List.map (subst env) args)
@@ -117,6 +123,7 @@ let rec caps_in t acc =
   match repr t with
   | TCap c -> if List.mem c acc then acc else c :: acc
   | TList a | TArray (a, _) -> caps_in a acc
+  | TMap (k, v) -> caps_in v (caps_in k acc)
   | TFn (ps, r) -> List.fold_left (fun acc p -> caps_in p acc) (caps_in r acc) ps
   | TNamed (_, args) -> List.fold_left (fun acc a -> caps_in a acc) acc args
   | _ -> acc
@@ -126,6 +133,7 @@ let rec has_chan t =
   match repr t with
   | TChan _ -> true
   | TList a | TArray (a, _) -> has_chan a
+  | TMap (k, v) -> has_chan k || has_chan v
   | TFn (ps, r) -> List.exists has_chan ps || has_chan r
   | TNamed (_, args) -> List.exists has_chan args
   | _ -> false
@@ -134,6 +142,7 @@ let rec has_fn t =
   match repr t with
   | TFn _ -> true
   | TList a | TArray (a, _) -> has_fn a
+  | TMap (k, v) -> has_fn k || has_fn v
   | TNamed (_, args) -> List.exists has_fn args
   | _ -> false
 
@@ -146,6 +155,7 @@ let rec zonk env t =
   | TList a -> TList (zonk env a)
   | TArray (a, n) -> TArray (zonk env a, n)
   | TChan a -> TChan (zonk env a)
+  | TMap (k, v) -> TMap (zonk env k, zonk env v)
   | TGroup a -> TGroup (zonk env a)
   | TFn (ps, r) -> TFn (List.map (zonk env) ps, zonk env r)
   | TNamed (n, args) -> TNamed (n, List.map (zonk env) args)

@@ -60,6 +60,8 @@ Statements are separated by a newline or `;`. Two statements on one line without
 | `()` | the unit value `()` | Type of statements and of functions without `->`. |
 | `List[T]` | growable sequence | A value: assigning or passing it never shares mutation (section 8). |
 | `Array[T, N]` | exactly `N` elements | A value type stored inline, like a struct. `N` is an integer literal. |
+| `(A, B)`, `(A, B, C)`, ... | tuples of 2 to 8 values | Written `(1, "a")`, read with `.0`, `.1`, unpacked with patterns. |
+| `Map[K, V]` | keys to values | Keys are `Int`, `Str` or `Bool` (E0113). A value, like `List`; iterates in insertion order. |
 | `Option[T]` | `Some(T)`, `None` | From the prelude. |
 | `Result[T, E]` | `Ok(T)`, `Err(E)` | From the prelude. |
 | `IoError` | `Denied(Str)`, `Failed(Str)` | Error type of every capability operation. |
@@ -68,7 +70,35 @@ Statements are separated by a newline or `;`. Two statements on one line without
 | `Root`, `Net`, `Fs`, `Stdout`, `Clock`, `Listen`, `Listener`, `Conn` | capabilities | Cannot be created by programs (section 9). |
 | user `struct` and `enum` | | Optionally generic (section 4). |
 
-There is no tuple, map or character type. Use a struct for pairs, a list of structs (with a linear search) for a small map, and one-byte strings for characters (`s.split("")`, see section 11). There is no range syntax; count with `while` and a `mut` counter.
+There is no character type: use one-byte strings (`s.split("")`) or bytes (`s.bytes()`), see section 11. There is no range syntax; count with `while` and a `mut` counter, or use `list.range(lo, hi)` from the standard library.
+
+### Tuples
+
+```
+fn divmod(a: Int, b: Int) -> (Int, Int) {
+    (a / b, a % b)
+}
+
+let (q, r) = divmod(17, 5)        // unpack into names; `_` skips one
+let t = (1, "one", 1.5)
+t.0 + 1                           // fields by position
+for (n, s) in [(1, "a"), (2, "b")] { ... }
+```
+
+Tuples compare and print like structs: `(1, "a") == (1, "a")`, and `(1, "a")` prints as `(1, "a")`. `let` and `for` can only unpack into names and `_`; `match` takes any patterns, such as `(true, 0)`.
+
+### Maps
+
+```
+let mut counts = map()                    // or map([("a", 1), ("b", 2)])
+for w in words {
+    counts[w] = counts.get(w).unwrap_or(0) + 1
+}
+counts["the"]                             // panics if the key is missing
+for (w, n) in counts.entries() { ... }    // in insertion order
+```
+
+`m[k] = v` inserts or replaces and needs a `mut` place, like `push`. A map entry is replaced whole: `m[k].field = x` is E0209, so read the value, change the copy, and store it back. Iteration (`keys`, `values`, `entries`) and printing follow insertion order, the same in both backends; replacing a value keeps its key's position, and removing then re-inserting moves it to the end. Two maps are equal when they hold the same entries, in any order.
 
 There is no null and no implicit conversion between types: `Int` and `Float` never mix without `to_float()` or `to_int()`.
 
@@ -276,6 +306,9 @@ xs.push(4)                // also needs mut
 return value
 while cond { ... }
 for x in list_or_array { ... }
+let (a, b) = pair         // unpack a tuple
+for (k, v) in m.entries() { ... }
+m[key] = value            // insert into a map (needs mut)
 break
 continue
 expr
@@ -284,7 +317,7 @@ expr
 - Parameters and pattern bindings are immutable. Use `let mut y = y` to get a mutable copy.
 - `for` iterates over a snapshot: changing the list inside the loop does not affect the iteration.
 - `break` and `continue` only work inside loops, not across closures (E0208).
-- Only variables, fields and list or array elements can be assigned (E0209).
+- Only variables, fields, list or array elements and map entries can be assigned (E0209).
 
 ## 7. Patterns
 
@@ -298,6 +331,7 @@ Used in `match` arms:
 | `Variant` (uppercase) | a payload-less variant |
 | `Variant(p1, p2)` | a variant, matching its payload against sub-patterns |
 | `Enum.Variant(...)` | a variant, qualified |
+| `(p1, p2)` | a tuple, matching each item |
 
 ```
 match shape {
@@ -307,7 +341,7 @@ match shape {
 }
 ```
 
-Arms are separated by `,` or a newline. An arm's body is an expression, so a statement such as an assignment needs a block: `None => { more = false },`. Patterns nest: `Err(Failed(msg))`, `Some(Some(n))`. A `match` must be exhaustive (E0204); the error comes with an auto-fix that adds the missing arms. Matching on `Int` or `Str` needs a `_` or binding arm.
+Arms are separated by `,` or a newline. An arm's body is an expression, so a statement such as an assignment needs a block: `None => { more = false },`. Patterns nest: `Err(Failed(msg))`, `Some(Some(n))`. A `match` must be exhaustive (E0204); the error comes with an auto-fix that adds the missing arms. Matching on `Int` or `Str` needs a `_` or binding arm. Tuples are checked column by column, so `(true, _)` and `(false, _)` together are exhaustive.
 
 ## 8. Value semantics
 
@@ -469,9 +503,22 @@ Methods take the receiver by value and never modify it, except `push`, which nee
 | `join(sep)` | `Str`; `List[Str]` only |
 | `sum()` | `Int`; `List[Int]` only |
 
-`xs[i]` panics when `i` is out of range; `xs.get(i)` returns `None` instead. There is no `remove` or `insert`: build a new list (`filter`, or a loop with `push`). Writes go through index and field paths: `groups[i].words.push(w)` and `items[i].qty = 3` both work on a `mut` list. To sort by a key or with tie-breaking, write the sort yourself; `sort()` orders `Int`, `Float` and `Str` only.
+`xs[i]` panics when `i` is out of range; `xs.get(i)` returns `None` instead. Writes go through index and field paths: `groups[i].words.push(w)` and `items[i].qty = 3` both work on a `mut` list. `sort()` orders `Int`, `Float` and `Str` only; for other orders and for inserting or removing at a position, use the `list` module (`sort_by`, `insert_at`, `remove_at`, section 19).
 
-Strings compare byte by byte, so `c >= "a" && c <= "z"` tests a one-byte string. There is no `index_of`, `substring` or character code; search a list such as `"abcdefghijklmnopqrstuvwxyz".split("")` for positions.
+Strings compare byte by byte, so `c >= "a" && c <= "z"` tests a one-byte string. `slice`, `index_of` and `bytes()` give positions and byte codes.
+
+### Map[K, V]
+
+| Method | Result |
+| --- | --- |
+| `len()`, `is_empty()` | `Int`, `Bool` |
+| `m[k]` | `V`; panics if `k` is missing |
+| `get(k)` | `Option[V]` |
+| `contains(k)` | `Bool` |
+| `m[k] = v` | inserts or replaces (needs `mut`) |
+| `remove(k)` | `()`, removes the entry if present (needs `mut`) |
+| `keys()`, `values()` | `List[K]`, `List[V]`, in insertion order |
+| `entries()` | `List[(K, V)]`, in insertion order |
 
 ### Array[T, N]
 
@@ -500,6 +547,7 @@ Strings compare byte by byte, so `c >= "a" && c <= "z"` tests a one-byte string.
 | --- | --- |
 | `panic(msg)` | abort with a message and source location |
 | `channel(n)` | a new `Chan[T]` with capacity `n` |
+| `map()`, `map(pairs)` | a new `Map[K, V]`, empty or from a `List[(K, V)]` |
 | `assert(cond)` | panic with `assertion failed` unless `cond` is true |
 | `assert_eq(a, b)` | panic with `assertion failed: <a> != <b>` unless `a == b` |
 
@@ -587,6 +635,7 @@ Every diagnostic has a stable code. `vela explain CODE` prints its explanation, 
 | E0110 | misplaced `self`, or a method on a built-in type |
 | E0111 | a type does not satisfy an interface |
 | E0112 | a value that cannot become `dyn` |
+| E0113 | a map key type other than `Int`, `Str` or `Bool` |
 | E0201 | type mismatch |
 | E0202 | misuse of `?` |
 | E0203 | `if` without `else` produces a value |
@@ -631,6 +680,7 @@ field      = IDENT ":" type ;
 enum       = "enum" IDENT [ generics ] "{" [ variant { sep variant } [ "," ] ] "}" ;
 variant    = IDENT [ "(" type { "," type } ")" ] ;
 type       = "dyn" IDENT [ "." IDENT ]               (* an interface value *)
+           | "(" type "," type { "," type } ")"     (* a tuple *)
            | IDENT [ "." IDENT ] [ "[" typearg { "," typearg } "]" ]
            | "(" ")"
            | "fn" "(" [ type { "," type } ] ")" "->" type ;
@@ -639,20 +689,21 @@ sep        = "," | NL ;
 
 block      = "{" { stmt ( NL | ";" ) } [ expr ] "}" ;
 stmt       = "let" [ "mut" ] IDENT [ ":" type ] "=" expr
+           | "let" tuplepat "=" expr
            | "return" [ expr ]
            | "while" expr_ns block
-           | "for" IDENT "in" expr_ns block
+           | "for" ( IDENT | tuplepat ) "in" expr_ns block
            | "break" | "continue"
            | expr [ "=" expr ] ;
 
 expr       = unary { BINOP unary } ;            (* precedence: section 5 *)
 expr_ns    = expr ;                             (* no struct literal at the top level *)
 unary      = ( "-" | "!" ) unary | postfix ;
-postfix    = primary { "(" [ args ] ")" | "[" expr "]" | "." IDENT [ "(" [ args ] ")" ] | "?" } ;
+postfix    = primary { "(" [ args ] ")" | "[" expr "]" | "." IDENT [ "(" [ args ] ")" ] | "." INT | "?" } ;
 args       = expr { sep expr } [ "," ] ;
 primary    = INT | FLOAT | STRING | "true" | "false"
            | [ IDENT "." ] IDENT [ "{" [ init { sep init } [ "," ] ] "}" ]   (* struct literal *)
-           | "(" ")" | "(" expr ")"
+           | "(" ")" | "(" expr ")" | "(" expr "," expr { "," expr } ")"   (* tuple *)
            | "[" [ args ] "]"
            | block
            | "if" expr_ns block [ "else" ( block | if ) ]
@@ -662,7 +713,9 @@ primary    = INT | FLOAT | STRING | "true" | "false"
 init       = IDENT [ ":" expr ] ;
 cparam     = IDENT [ ":" type ] ;
 pattern    = "_" | IDENT | [ "-" ] INT | STRING | "true" | "false"
-           | IDENT [ "." IDENT ] [ "(" pattern { "," pattern } ")" ] ;
+           | IDENT [ "." IDENT ] [ "(" pattern { "," pattern } ")" ]
+           | tuplepat ;
+tuplepat   = "(" pattern "," pattern { "," pattern } ")" ;
 ```
 
 ## 17. Tools

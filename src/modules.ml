@@ -129,7 +129,7 @@ let mk d sp = { edesc = d; espan = sp; ety = Types.TErr; einst = [] }
 let rec pat_binds (p : pat) acc =
   match p.pdesc with
   | PBind n -> n :: acc
-  | PVariant (_, _, ps) -> List.fold_left (fun acc p -> pat_binds p acc) acc ps
+  | PVariant (_, _, ps) | PTuple ps -> List.fold_left (fun acc p -> pat_binds p acc) acc ps
   | _ -> acc
 
 let rec pat env locals (p : pat) : pat =
@@ -151,6 +151,7 @@ let rec pat env locals (p : pat) : pat =
     in
     { p with pdesc = PVariant (q, v, ps) }
   | PVariant (None, v, ps) -> { p with pdesc = PVariant (None, v, List.map (pat env locals) ps) }
+  | PTuple ps -> { p with pdesc = PTuple (List.map (pat env locals) ps) }
   | _ -> p
 
 let rec expr env locals (e : expr) : expr =
@@ -235,7 +236,47 @@ let rec expr env locals (e : expr) : expr =
   in
   { e with edesc = d }
 
+(* `let (a, (b, _)) = e` becomes `let t = e; let a = t.0; let u = t.1; let b = u.0`,
+   and `for (k, v) in xs { body }` becomes `for t in xs { let (k, v) = t; body }`. *)
+and unpack_counter = ref 0
+
+and unpack (p : pat) (e : expr) : stmt list =
+  incr unpack_counter;
+  let tmp = "tuple$" ^ string_of_int !unpack_counter in
+  let mk d = { edesc = d; espan = p.pspan; ety = Types.TErr; einst = [] } in
+  let first = { sdesc = SLet (false, tmp, p.pspan, None, e); sspan = p.pspan } in
+  let rest =
+    match p.pdesc with
+    | PTuple ps ->
+      List.concat
+        (List.mapi
+           (fun i (sub : pat) ->
+             let field = mk (EField (mk (EVar tmp), string_of_int i, sub.pspan)) in
+             match sub.pdesc with
+             | PBind n -> [ { sdesc = SLet (false, n, sub.pspan, None, field); sspan = sub.pspan } ]
+             | PWild -> []
+             | _ -> unpack sub field)
+           ps)
+    | PBind n -> [ { sdesc = SLet (false, n, p.pspan, None, mk (EVar tmp)); sspan = p.pspan } ]
+    | _ -> []
+  in
+  first :: rest
+
+and expand_stmts (ss : stmt list) : stmt list =
+  List.concat_map
+    (fun (s : stmt) ->
+      match s.sdesc with
+      | SLetPat (p, e) -> unpack p e
+      | SForPat (p, it, body) ->
+        incr unpack_counter;
+        let tmp = "item$" ^ string_of_int !unpack_counter in
+        let v = { edesc = EVar tmp; espan = p.pspan; ety = Types.TErr; einst = [] } in
+        [ { s with sdesc = SFor (tmp, p.pspan, it, { body with stmts = unpack p v @ body.stmts }) } ]
+      | _ -> [ s ])
+    ss
+
 and block env locals (b : block) : block =
+  let b = { b with stmts = expand_stmts b.stmts } in
   let locals = ref locals in
   let stmts =
     List.map
@@ -252,6 +293,7 @@ and block env locals (b : block) : block =
           | SWhile (c, body) -> SWhile (expr env !locals c, block env !locals body)
           | SFor (n, sp, it, body) -> SFor (n, sp, expr env !locals it, block env (n :: !locals) body)
           | SBreak | SContinue -> s.sdesc
+          | SLetPat _ | SForPat _ -> s.sdesc (* already expanded *)
         in
         { s with sdesc = d })
       b.stmts

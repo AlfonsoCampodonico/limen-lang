@@ -5,7 +5,7 @@ open Ast
 let rec pat_binds p acc =
   match p.pdesc with
   | PBind n -> n :: acc
-  | PVariant (_, _, args) -> List.fold_left (fun acc a -> pat_binds a acc) acc args
+  | PVariant (_, _, args) | PTuple args -> List.fold_left (fun acc a -> pat_binds a acc) acc args
   | _ -> acc
 
 let rec fv bound acc e =
@@ -41,7 +41,8 @@ and fv_block bound acc b =
         | SReturn (Some e) -> (bound, fv bound acc e)
         | SReturn None | SBreak | SContinue -> (bound, acc)
         | SWhile (c, body) -> (bound, fv_block bound (fv bound acc c) body)
-        | SFor (n, _, e, body) -> (bound, fv_block (n :: bound) (fv bound acc e) body))
+        | SFor (n, _, e, body) -> (bound, fv_block (n :: bound) (fv bound acc e) body)
+        | SLetPat _ | SForPat _ -> failwith "destructuring is expanded when modules load")
       (bound, acc) b.stmts
   in
   match b.tail with Some e -> fv bound acc e | None -> acc
@@ -76,6 +77,7 @@ and block_escape b =
       | SAssign (l, r) -> has_escape l || has_escape r
       | SWhile (c, body) -> has_escape c || block_escape body
       | SFor (_, _, e, body) -> has_escape e || block_escape body
+      | SLetPat _ | SForPat _ -> failwith "destructuring is expanded when modules load"
       | SBreak | SContinue -> false)
     b.stmts
   || match b.tail with Some e -> has_escape e | None -> false
