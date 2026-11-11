@@ -57,7 +57,7 @@ for    ::= "for" sp1 (ident sp1 | upat sp) "in" sp1 expr sp block
 
 # ---------- expressions ----------
 expr    ::= unary (sp binop ws unary)*
-binop   ::= "||" | "&&" | "==" | "!=" | "<=" | ">=" | "<" | ">" | "+" | "-" | "*" | "/" | "%"
+binop   ::= "??" | "||" | "&&" | "==" | "!=" | "<=" | ">=" | "<" | ">" | "+" | "-" | "*" | "/" | "%"
 unary   ::= ("-" | "!") sp unary | postfix
 postfix ::= primary suffix*
 suffix  ::= sp "(" ws args? ws ")" | sp "[" ws expr ws "]" | ws "." sp ident | "." [0-9]+ | sp "?"

@@ -175,6 +175,6 @@ Interfaces: `interface Shape { fn area(self) -> Float }` bounds a generic parame
 
 `dyn Shape` is a value of any type that satisfies `Shape`, so `List[dyn Shape]` can mix types (see [examples/dyn.vela](examples/dyn.vela)).
 
-Tuples `(Int, Str)` and maps `Map[Str, Int]` are built in: `let (q, r) = divmod(17, 5)`, `counts[w] = counts.get(w).unwrap_or(0) + 1`. Maps iterate in insertion order, the same in both backends (see [examples/tuples.vela](examples/tuples.vela) and [examples/maps.vela](examples/maps.vela)).
+Tuples `(Int, Str)` and maps `Map[Str, Int]` are built in: `let (q, r) = divmod(17, 5)`, `counts[w] = counts.get(w) ?? 0 + 1`. Maps iterate in insertion order, the same in both backends (see [examples/tuples.vela](examples/tuples.vela) and [examples/maps.vela](examples/maps.vela)).
 
 Not yet: `select` over channels, TLS and SQL. `Int` is 64-bit and wraps on overflow, identically in the interpreter and in native code.

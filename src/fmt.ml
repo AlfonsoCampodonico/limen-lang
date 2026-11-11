@@ -121,11 +121,11 @@ let rec pat (p : pat) =
 (* ---------- expressions ---------- *)
 
 let prec = function
-  | Or -> 1 | And -> 2 | Eq | Ne -> 3 | Lt | Le | Gt | Ge -> 4 | Add | Sub -> 5 | Mul | Div | Mod -> 6
+  | Or -> 1 | And -> 2 | Eq | Ne -> 3 | Lt | Le | Gt | Ge -> 4 | Add | Sub -> 5 | Mul | Div | Mod -> 6 | Else -> 7
 
 let op_str = function
   | Or -> "||" | And -> "&&" | Eq -> "==" | Ne -> "!=" | Lt -> "<" | Le -> "<=" | Gt -> ">" | Ge -> ">="
-  | Add -> "+" | Sub -> "-" | Mul -> "*" | Div -> "/" | Mod -> "%"
+  | Add -> "+" | Sub -> "-" | Mul -> "*" | Div -> "/" | Mod -> "%" | Else -> "??"
 
 (* A struct literal that would be read as the start of a block in an
    `if`/`while`/`for`/`match` head. *)

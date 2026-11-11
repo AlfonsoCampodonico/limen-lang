@@ -196,7 +196,7 @@ fn parse_url(url: Str) -> Result[Url, IoError] {
         return Err(bad("the URL must start with http://"))
     }
     let rest = url.slice(7, url.len())
-    let slash = rest.index_of("/").unwrap_or(rest.len())
+    let slash = rest.index_of("/") ?? rest.len()
     let authority = rest.slice(0, slash)
     let path = if slash < rest.len() { rest.slice(slash, rest.len()) } else { "/" }
     match authority.index_of(":") {
@@ -238,7 +238,7 @@ pub fn request(net: Net, method: Str, url: Str, headers: List[Header], body: Str
         Some(n) => n,
         None => { return Err(bad("malformed status line")) },
     }
-    let chunked = find_header(h.headers, "Transfer-Encoding").map(|v| v.to_lower().contains("chunked")).unwrap_or(false)
+    let chunked = find_header(h.headers, "Transfer-Encoding").map(|v| v.to_lower().contains("chunked")) ?? false
     let body = if chunked {
         dechunk(h.rest)?
     } else {

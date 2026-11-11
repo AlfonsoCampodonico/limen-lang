@@ -21,7 +21,7 @@ let rec pat (p : pat) =
 
 let op = function
   | Add -> "+" | Sub -> "-" | Mul -> "*" | Div -> "/" | Mod -> "%" | Eq -> "==" | Ne -> "!=" | Lt -> "<"
-  | Le -> "<=" | Gt -> ">" | Ge -> ">=" | And -> "&&" | Or -> "||"
+  | Le -> "<=" | Gt -> ">" | Ge -> ">=" | And -> "&&" | Or -> "||" | Else -> "??"
 
 let rec expr e =
   match e.edesc with

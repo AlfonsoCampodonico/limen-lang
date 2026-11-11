@@ -209,6 +209,17 @@ let rec lower f (e : expr) : I.atom =
       let const_branch = [ I.Init (r, I.Atom (I.ABool (op = Or))) ] in
       emit f (if op = And then I.If (x, rhs_branch, const_branch) else I.If (x, const_branch, rhs_branch));
       I.V r
+    | EBin (Else, a, b) ->
+      (* `a ?? b`: the payload of Some/Ok (tag 0), else b, evaluated only then *)
+      let x = lower f a in
+      let at = tyof f a in
+      let r = fresh_var "v" ty in
+      emit f (I.Decl r);
+      let has = tmp f TBool (I.IsTag (x, at, 0)) in
+      let some_b, _, _ = in_block f (fun () -> emit f (I.Init (r, I.Payload (x, at, 0, 0)))) in
+      let none_b, _, _ = in_block f (fun () -> let y = lower f b in emit f (I.Init (r, I.Atom y))) in
+      emit f (I.If (has, some_b, none_b));
+      I.V r
     | EBin (op, a, b) ->
       let x = lower f a in
       let y = lower f b in
@@ -535,13 +546,6 @@ and lower_method f e recv name args ty =
   | TNamed ("Option", _), "is_none", [] -> tmp f TBool (I.IsTag (lower f recv, rt, 1))
   | TNamed ("Result", _), "is_ok", [] -> tmp f TBool (I.IsTag (lower f recv, rt, 0))
   | TNamed ("Result", _), "is_err", [] -> tmp f TBool (I.IsTag (lower f recv, rt, 1))
-  | TNamed (("Option" | "Result"), _), "unwrap_or", [ d ] ->
-    let ra = lower f recv in
-    let da = lower f d in
-    let c = tmp f TBool (I.IsTag (ra, rt, 0)) in
-    let r = fresh_var "u" ty in
-    emit f (I.Decl r);
-    branch_init r c (fun () -> I.Payload (ra, rt, 0, 0)) (fun () -> I.Atom da)
   | TNamed ("Option", [ _ ]), "map", [ fn ] ->
     let ra = lower f recv in
     let ca = lower f fn in

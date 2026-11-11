@@ -465,6 +465,10 @@ let rec eval rt env e : value =
   | EList es -> VList (Array.of_list (List.map (eval rt env) es))
   | EBin (And, a, b) -> if as_bool (eval rt env a) then eval rt env b else VBool false
   | EBin (Or, a, b) -> if as_bool (eval rt env a) then VBool true else eval rt env b
+  | EBin (Else, a, b) -> (
+    match eval rt env a with
+    | VEnum (_, ("Some" | "Ok"), [ x ]) -> x
+    | _ -> eval rt env b)
   | EBin (op, a, b) ->
     let x = eval rt env a in
     let y = eval rt env b in
@@ -744,8 +748,6 @@ and call_method rt v name args sp =
   | VList a, "sum", [] -> VInt (Array.fold_left (fun acc x -> match x with VInt n -> Int64.add acc n | _ -> acc) 0L a)
   | VEnum ("Option", vn, _), "is_some", [] -> VBool (vn = "Some")
   | VEnum ("Option", vn, _), "is_none", [] -> VBool (vn = "None")
-  | VEnum (("Option" | "Result"), ("Some" | "Ok"), [ x ]), "unwrap_or", [ _ ] -> x
-  | VEnum (("Option" | "Result"), _, _), "unwrap_or", [ d ] -> d
   | VEnum ("Option", "Some", [ x ]), "map", [ f ] -> some (call f [ x ])
   | VEnum ("Option", _, _), "map", [ _ ] -> none
   | VEnum ("Result", vn, _), "is_ok", [] -> VBool (vn = "Ok")

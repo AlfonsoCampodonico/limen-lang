@@ -134,6 +134,8 @@ let binop_of = function
   | SYM "*" -> Some (6, Mul)
   | SYM "/" -> Some (6, Div)
   | SYM "%" -> Some (6, Mod)
+  (* tighter than arithmetic: `m.get(k) ?? 0 + 1` is `(m.get(k) ?? 0) + 1` *)
+  | SYM "??" -> Some (7, Else)
   | _ -> None
 
 (* [ns] = "no struct literal": set in `if`/`while`/`for`/`match` heads so that

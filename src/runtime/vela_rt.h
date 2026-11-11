@@ -319,18 +319,36 @@ static inline int64_t w_idx(int64_t i, int64_t n, const char *where) {
    (live = 0) until the next rehash compacts them. idx is an open-addressing
    table of entry positions, at most half full. */
 
-static inline uint64_t Int_hash(int64_t x) {
-  uint64_t z = (uint64_t)x + 0x9E3779B97F4A7C15ULL;
+/* A random seed per process, so nobody can choose keys that collide (hash
+   flooding). Iteration follows insertion order, so output never depends on it. */
+static uint64_t g_hash_seed;
+static void w_seed_hash(void) {
+  uint64_t s = 0;
+  int fd = open("/dev/urandom", O_RDONLY);
+  if (fd >= 0) { if (read(fd, &s, sizeof s) != (ssize_t)sizeof s) s = 0; close(fd); }
+  if (s == 0) { struct timeval tv; gettimeofday(&tv, NULL); s = (uint64_t)tv.tv_usec * 0x9E3779B97F4A7C15ULL ^ (uint64_t)getpid(); }
+  g_hash_seed = s | 1;
+}
+static inline uint64_t w_mix64(uint64_t z) {
   z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
   z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
   return z ^ (z >> 31);
 }
+static inline uint64_t Int_hash(int64_t x) { return w_mix64((uint64_t)x + g_hash_seed); }
 static inline uint64_t Unit_hash(W_Unit u) { (void)u; return 0; }
 static inline uint64_t Bool_hash(bool b) { return b ? 0x51ED27F1ULL : 0x2545F491ULL; }
 static inline uint64_t Str_hash(WStr *s) {
-  uint64_t h = 1469598103934665603ULL;
-  for (int64_t i = 0; i < s->len; i++) { h ^= (unsigned char)s->data[i]; h *= 1099511628211ULL; }
-  return h;
+  /* 8 bytes at a time, each step keyed by the seed, then a final mix */
+  uint64_t h = g_hash_seed ^ ((uint64_t)s->len * 0x9E3779B97F4A7C15ULL);
+  int64_t i = 0;
+  for (; i + 8 <= s->len; i += 8) {
+    uint64_t w;
+    memcpy(&w, s->data + i, 8);
+    h = w_mix64(h ^ w ^ g_hash_seed);
+  }
+  uint64_t tail = 0;
+  for (int64_t k = 0; i < s->len; i++, k++) tail |= (uint64_t)(unsigned char)s->data[i] << (8 * k);
+  return w_mix64(h ^ tail ^ (g_hash_seed >> 1));
 }
 __attribute__((noreturn)) static void w_panic_key(WBuf *key, const char *where) {
   WBuf m; buf_init(&m);
@@ -660,6 +678,7 @@ static void w_usage(const char *m) {
 }
 static void w_init(int argc, char **argv) {
   signal(SIGPIPE, SIG_IGN);   /* a peer closing a socket is an error value, not a crash */
+  w_seed_hash();
   {
     struct rlimit rl;
     if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {

@@ -991,6 +991,7 @@ let program (g : Lower.gctx) (prog : I.program) : string =
     mp "int main(int argc, char** argv) {";
     mp "  if (argc < 2) return 2;";
     mp "  wtest_index_ = atoi(argv[1]);";
+    mp "  w_seed_hash();";
     mp "  w_run(wtest_entry_, NULL);";
     mp "  fflush(stdout);";
     mp "  w_leakcheck();";

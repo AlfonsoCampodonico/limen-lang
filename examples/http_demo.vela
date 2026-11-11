@@ -21,7 +21,7 @@ fn client(net: Net, port: Int) -> Str {
     let mut log = []
     for u in ["/hello", "/missing"] {
         match http.get(net, base + u) {
-            Ok(r) => log.push("{r.status} {r.header("content-type").unwrap_or("-")} {r.body}"),
+            Ok(r) => log.push("{r.status} {r.header("content-type") ?? "-"} {r.body}"),
             Err(e) => log.push("{e}"),
         }
     }

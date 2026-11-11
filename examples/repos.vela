@@ -24,7 +24,7 @@ fn parse_names(body: Str) -> List[Str] {
     let mut names = []
     for chunk in body.split("\"full_name\":").skip(1) {
         let quoted = chunk.trim().split("\"")
-        names.push(quoted.get(1).unwrap_or("?"))
+        names.push(quoted.get(1) ?? "?")
     }
     names
 }

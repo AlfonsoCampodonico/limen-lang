@@ -287,10 +287,10 @@ let methods (t : ty) : (string * (unit -> ty list * ty)) list =
   | TArray (a, _) ->
     [ m "len" [] TInt; m "get" [ TInt ] (opt a); m "to_list" [] (TList a); m "contains" [ a ] TBool ]
   | TNamed ("Option", [ a ]) ->
-    [ m "is_some" [] TBool; m "is_none" [] TBool; m "unwrap_or" [ a ] a;
+    [ m "is_some" [] TBool; m "is_none" [] TBool;
       ("map", fun () -> let u = fresh () in ([ TFn ([ a ], u) ], opt u)) ]
   | TNamed ("Result", [ a; e ]) ->
-    [ m "is_ok" [] TBool; m "is_err" [] TBool; m "unwrap_or" [ a ] a;
+    [ m "is_ok" [] TBool; m "is_err" [] TBool;
       ("map_err", fun () -> let u = fresh () in ([ TFn ([ e ], u) ], res a u)) ]
   | TCap Net -> [ m "get" [ TStr ] (res TStr io_err); m "only" [ TStr ] (TCap Net); m "connect" [ TStr ] (res (TCap Conn) io_err) ]
   | TCap Listen -> [ m "on" [ TStr ] (res (TCap Listener) io_err) ]
@@ -708,6 +708,28 @@ and check_method_value ctx f e recv name nsp args =
   | _ -> (
     let ms = methods rt in
     match List.assoc_opt name ms with
+    | None when name = "unwrap_or" && (match rt with TNamed (("Option" | "Result"), _) -> true | _ -> false) ->
+      (* `x.unwrap_or(d)` is written `x ?? d` *)
+      let fix =
+        match args with
+        | [ d ] ->
+          let src = Option.value ~default:"" (Source.text recv.espan.file) in
+          let text (sp : Span.t) = if sp.hi <= String.length src then String.sub src sp.lo (sp.hi - sp.lo) else "" in
+          (* parenthesize where `??` would bind differently from the method call *)
+          let simple (x : expr) = match x.edesc with EBin _ | EIf _ | EMatch _ | EClosure _ -> false | _ -> true in
+          let dflt = if simple d then text d.espan else "(" ^ text d.espan ^ ")" in
+          let recv_t = if simple recv then text recv.espan else "(" ^ text recv.espan ^ ")" in
+          let next = if e.espan.hi < String.length src then src.[e.espan.hi] else ' ' in
+          let prev = if recv.espan.lo > 0 then src.[recv.espan.lo - 1] else ' ' in
+          let core = recv_t ^ " ?? " ^ dflt in
+          let core = if next = '.' || next = '[' || next = '?' || prev = '-' || prev = '!' then "(" ^ core ^ ")" else core in
+          Some { Diag.fmsg = "write it with `??`"; edits = [ { Diag.at = Span.merge recv.espan e.espan; replacement = core } ] }
+        | _ -> None
+      in
+      err ctx ?fix "E0105" nsp "there is no `unwrap_or`; write `value ?? default`"
+        ~notes:[ "`??` gives the value inside a `Some` or `Ok`, or the default otherwise, evaluating the default only then" ];
+      check_args ctx f args;
+      TErr
     | None ->
       let notes =
         match rt with
@@ -824,13 +846,26 @@ and check_bin ctx f op a b sp =
     unify_at ctx a.espan TBool ta;
     expect ctx f b TBool;
     TBool
+  | Else -> (
+    (* `opt ?? default`: the value inside, or the default when there is none *)
+    match repr ta with
+    | TNamed ("Option", [ t ]) | TNamed ("Result", [ t; _ ]) -> expect ctx f b t; t
+    | TErr -> ignore (check_expr ctx f b); TErr
+    | TVar _ ->
+      err ctx "E0207" a.espan "the type of this value is not known here; add a type annotation";
+      ignore (check_expr ctx f b);
+      TErr
+    | t ->
+      err ctx "E0201" sp (sprintf "`??` needs an `Option` or `Result` on its left, found `%s`" (show t));
+      ignore (check_expr ctx f b);
+      TErr)
   | _ -> (
     expect ctx f b ta;
     let t = repr ta in
     let name =
       match op with
       | Add -> "+" | Sub -> "-" | Mul -> "*" | Div -> "/" | Mod -> "%" | Eq -> "==" | Ne -> "!="
-      | Lt -> "<" | Le -> "<=" | Gt -> ">" | Ge -> ">=" | And -> "&&" | Or -> "||"
+      | Lt -> "<" | Le -> "<=" | Gt -> ">" | Ge -> ">=" | And -> "&&" | Or -> "||" | Else -> "??"
     in
     let bad () =
       err ctx "E0201" sp (sprintf "operator `%s` cannot be applied to `%s`" name (show t))

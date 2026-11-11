@@ -20,6 +20,8 @@ Two solutions contain their output literally, and both are legitimate: task 01 a
 
 The agents for tasks 41-50 started on an older `SPEC.md` that did not document channels or sockets yet. It was updated during the run, and those agents were told to re-read it.
 
+Four run 1 solutions (31, 32, 35, 44) call `unwrap_or`, which was later replaced by the `??` operator. They are kept as the agents wrote them, so they no longer compile; `vela check --json` offers the rewrite as an automatic fix.
+
 ## What the agents reported
 
 Their notes became spec clarifications or tracked gaps:

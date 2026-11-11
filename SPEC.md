@@ -20,7 +20,7 @@ fn fetch_repos(net: Net, org: Str) -> Result[List[Str], IoError] {
 }
 
 fn parse_names(body: Str) -> List[Str] {   // no capabilities: cannot do I/O
-    body.split("\"full_name\":").skip(1).map(|c| c.trim().split("\"").get(1).unwrap_or("?"))
+    body.split("\"full_name\":").skip(1).map(|c| c.trim().split("\"").get(1) ?? "?")
 }
 ```
 
@@ -92,7 +92,7 @@ Tuples compare and print like structs: `(1, "a") == (1, "a")`, and `(1, "a")` pr
 ```
 let mut counts = map()                    // or map([("a", 1), ("b", 2)])
 for w in words {
-    counts[w] = counts.get(w).unwrap_or(0) + 1
+    counts[w] = counts.get(w) ?? 0 + 1
 }
 counts["the"]                             // panics if the key is missing
 for (w, n) in counts.entries() { ... }    // in insertion order
@@ -249,8 +249,9 @@ From loosest to tightest. All binary operators are left-associative.
 | 4 | `<` `<=` `>` `>=` |
 | 5 | `+` `-` |
 | 6 | `*` `/` `%` |
-| 7 | unary `-` `!` |
-| 8 | call `f(x)`, index `a[i]`, field `p.x`, method `s.len()`, `?` |
+| 7 | `??` |
+| 8 | unary `-` `!` |
+| 9 | call `f(x)`, index `a[i]`, field `p.x`, method `s.len()`, `?` |
 
 ### Operators
 
@@ -526,10 +527,11 @@ Strings compare byte by byte, so `c >= "a" && c <= "z"` tests a one-byte string.
 
 ### Option[T] and Result[T, E]
 
+`x ?? default` is the value inside `Some` or `Ok`, or `default` otherwise; `default` is evaluated only when it is needed. `??` binds tighter than arithmetic, so `counts.get(w) ?? 0 + 1` adds 1 to the count. There is no `unwrap_or`; using it is error E0105 with a fix that rewrites it.
+
 | Method | Result |
 | --- | --- |
 | `is_some()`, `is_none()` / `is_ok()`, `is_err()` | `Bool` |
-| `unwrap_or(default)` | `T` |
 | `map(f)` (Option) | `Option[U]` |
 | `map_err(f)` (Result) | `Result[T, F]` |
 

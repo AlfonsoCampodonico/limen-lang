@@ -309,10 +309,10 @@ fn walk(t: Tree) -> List[Int] {
     ({|fn parse(s: Str) -> Result[Int, Str] { match s.parse_int() { Some(n) => Ok(n), None => Err("bad: " + s) } }
 |}
     ^ main_wrap {|    let rs = ["1", "x", " 42 ", "-7", "0x10"].map(parse)
-    let oks = rs.filter(|r| r.is_ok()).map(|r| r.unwrap_or(0))
+    let oks = rs.filter(|r| r.is_ok()).map(|r| r ?? 0)
     let errs = rs.filter(|r| r.is_err()).map(|r| r.map_err(|e| e.to_upper()))
     let o = Some("hi").map(|s| s + "!")
-    out.print("{oks} {errs} {o} {None.unwrap_or(5)}")|})
+    out.print("{oks} {errs} {o} {None ?? 5}")|})
     "[1, 42, -7] [Err(\"BAD: X\"), Err(\"BAD: 0X10\")] Some(\"hi!\") 5\n";
   out "list-builtins"
     (main_wrap {|    let xs = [3, 1, 2, 3]
@@ -534,7 +534,7 @@ fn area(s: Shape) -> Float { match s { Dot => 0.0, Box(w, h) => w * h } }
             let mut s = 0
             let mut n = 0
             while n < 1000 {
-                s = s + c.recv().unwrap_or(0)
+                s = s + c.recv() ?? 0
                 n = n + 1
             }
             s
@@ -562,7 +562,7 @@ fn area(s: Shape) -> Float { match s { Dot => 0.0, Box(w, h) => w * h } }
                     more = false
                 } else {
                     total = total + s.len()
-                    c.write(s).unwrap_or(())
+                    c.write(s) ?? ()
                 }
             },
             Err(_) => { more = false },
@@ -576,8 +576,8 @@ fn client(net: Net, port: Int, k: Int) -> Int {
     match net.connect("127.0.0.1:{port}") {
         Ok(c) => {
             let msg = "hello {k}"
-            c.write(msg).unwrap_or(())
-            let got = c.read().unwrap_or("?")
+            c.write(msg) ?? ()
+            let got = c.read() ?? "?"
             c.close()
             if got == msg { 1 } else { 0 }
         },
@@ -665,7 +665,7 @@ fn client(net: Net, port: Int, k: Int) -> Int {
                     more = false
                 } else {
                     n = n + s.len()
-                    c.write(s).unwrap_or(())
+                    c.write(s) ?? ()
                 }
             },
             Err(_) => {
@@ -708,7 +708,7 @@ fn client(net: Net, port: Int, k: Int) -> Int {
                                 })
                                 h.go(|| {
                                     for m in ["0123456789", "abcdefghij", "ABCDEFGHIJ"] {
-                                        c.write(m).unwrap_or(())
+                                        c.write(m) ?? ()
                                     }
                                     0
                                 })
@@ -908,7 +908,7 @@ test "channels" {
             c.send(7)
             0
         })
-        g.go(|| c.recv().unwrap_or(0))
+        g.go(|| c.recv() ?? 0)
     }
     assert_eq(r, [0, 7])
 }
@@ -1056,9 +1056,9 @@ fn main(root: Root) {
   out "str-builtins"
     (main_wrap
        ("    let s = \"héllo, world\"\n    out.print(s.slice(0, 6) + \"|\" + s.slice(8, 100) + \"|\" + s.slice(5, 2) + \"|\" + s.slice(-3, 1))\n"
-       ^ "    out.print(\"{s.index_of(\"world\").unwrap_or(-1)} {s.index_of(\"xyz\").unwrap_or(-1)}\")\n"
+       ^ "    out.print(\"{s.index_of(\"world\") ?? -1} {s.index_of(\"xyz\") ?? -1}\")\n"
        ^ "    out.print(\"{\"Ab\".bytes()} {\"é\".bytes().len()}\")\n"
-       ^ "    out.print(\"{\" 2.5e3 \".parse_float().unwrap_or(0.0)} {\"-1\".parse_float().unwrap_or(0.0)} {\"nan\".parse_float().is_none()} {\"1x\".parse_float().is_none()}\")\n"
+       ^ "    out.print(\"{\" 2.5e3 \".parse_float() ?? 0.0} {\"-1\".parse_float() ?? 0.0} {\"nan\".parse_float().is_none()} {\"1x\".parse_float().is_none()}\")\n"
        ^ "    out.print(65.to_char() + 233.to_char() + 8364.to_char() + 128512.to_char() + (-1).to_char().len().to_str())\n"
        ^ "    out.print(\"{3.min(5)} {3.max(5)} {(-2).min(-7)}\")"))
     "h\195\169llo|world||h\n8 -1\n[65, 98] 2\n2500.0 -1.0 true true\nAé€\240\159\152\1283\n3 5 -7\n";
@@ -1151,11 +1151,21 @@ fn main(root: Root) {
     "9223372036854775807 -9223372036854775808 -9223372036854775808 9223372036854775807 -2 -9223372036854775808 0\n-9223372036854775808 -3 -1 1\n-9223372036854775808 -9223372036709301616\n9223372036854775807 -9223372036854775808 9000000000000000000 0\nSome(9223372036854775807) Some(-9223372036854775808) None\n9.22337203685478e+18 None abc -2\nmatched max\n";
   errs "int-literal-too-large" (main_wrap "    let x = 9223372036854775808") [ "E0005" ];
 
+  (* ---------- `??` ---------- *)
+  out "else-operator" "fn find(xs: List[Int], x: Int) -> Option[Int] {\n    let mut i = 0\n    while i < xs.len() {\n        if xs[i] == x {\n            return Some(i)\n        }\n        i = i + 1\n    }\n    None\n}\n\nfn boom() -> Int {\n    panic(\"evaluated\")\n}\n\nfn main(root: Root) {\n    let out = root.stdout\n    let xs = [5, 6, 7]\n    out.print(\"{find(xs, 6) ?? -1} {find(xs, 9) ?? -1} {(find(xs, 7) ?? 0) + 10}\")\n    out.print(\"{\"42\".parse_int() ?? 0} {\"x\".parse_int() ?? 0 + 1} {find(xs, 5) ?? boom()}\")\n    let r: Result[Str, Str] = Err(\"no\")\n    out.print(r ?? \"fallback\")\n    let nested: Option[Option[Int]] = Some(None)\n    out.print(\"{nested ?? Some(3) ?? 4}\")\n}\n" "1 -1 12\n42 1 0\nfallback\n4\n";
+  (let src = "fn main(root: Root) {\n    let x = \"4\".parse_int().unwrap_or(0).to_str() + \"!\"\n    let y = \"4\".parse_int().unwrap_or(1 + 2) * 2\n}\n" in
+   let _, ds, _ = compile "unwrap-or-fix" src in
+   ok "unwrap-or-gone" (codes ds = [ "E0105"; "E0105" ]) (String.concat " " (codes ds));
+   let fixed = apply_fixes src ds in
+   ok "unwrap-or-fixed" (fixed = "fn main(root: Root) {\n    let x = (\"4\".parse_int() ?? 0).to_str() + \"!\"\n    let y = \"4\".parse_int() ?? (1 + 2) * 2\n}\n") fixed;
+   let _, ds2, _ = compile "unwrap-or-fixed2" fixed in
+   ok "unwrap-or-fixed-checks" (ds2 = []) (String.concat " " (codes ds2)));
+
   (* ---------- tuples and maps ---------- *)
   out "tuples" (example "tuples.vela") "3 2 (2, 1)\n(1, \"one\", 1.5) 1 one 1.5 (2, \"a\")\n4 ((1, 2), (3, (4, 5)))\n1 3 4 5\na1 b2 c3 \nyes zero yes no 7\ntrue false 6\n";
   out "maps" (example "maps.vela") "{\"the\": 3, \"cat\": 1, \"and\": 2, \"hat\": 1, \"bat\": 1} 5 3 None\n[\"the\", \"cat\", \"and\", \"hat\", \"bat\"] [3, 1, 2, 1, 1]\nthe=3 and=2 \n{\"the\": 100, \"and\": 2, \"hat\": 1, \"bat\": 1, \"zebra\": 9}\n{\"the\": 3, \"cat\": 1, \"and\": 2, \"hat\": 1, \"bat\": 1}\ntrue false false\n{1: 1, 2: 4, 3: 9} true false 0\n1 {\"a\": 1}\nyes\n";
   panics "map-missing-key" (main_wrap "    let m = map([(\"a\", 1)])\n    out.print(\"{m[\"b\"]}\")") "key \"b\" is not in the map";
-  out "maps-stress" ~grants:{ Interp.no_grants with seed = Some 7 } "fn main(root: Root) {\n    let out = root.stdout\n    let r = root.rand\n    let mut m: Map[Int, Str] = map()\n    let mut sum = 0\n    let mut i = 0\n    while i < 20000 {\n        let k = r.int(0, 500)\n        let op = r.int(0, 3)\n        if op == 0 {\n            m[k] = \"v{k}\"\n        } else if op == 1 {\n            m.remove(k)\n        } else {\n            sum = sum + m.get(k).map(|s| s.len()).unwrap_or(0)\n        }\n        i = i + 1\n    }\n    out.print(\"{m.len()} {sum} {m.keys().take(8)} {m.values().take(3)}\")\n    let copy = m\n    m.remove(m.keys()[0])\n    out.print(\"{copy.len()} {m.len()} {copy == m}\")\n    // maps handed to concurrent tasks\n    let parts = group g {\n        for d in [0, 1, 2, 3] {\n            g.go(|| copy.keys().filter(|k| k % 4 == d).len())\n        }\n    }\n    out.print(\"{parts} {parts.sum() == copy.len()}\")\n}\n" "273 12086 [461, 206, 21, 361, 292, 414, 473, 199] [\"v461\", \"v206\", \"v21\"]\n273 272 false\n[76, 71, 63, 63] true\n";
+  out "maps-stress" ~grants:{ Interp.no_grants with seed = Some 7 } "fn main(root: Root) {\n    let out = root.stdout\n    let r = root.rand\n    let mut m: Map[Int, Str] = map()\n    let mut sum = 0\n    let mut i = 0\n    while i < 20000 {\n        let k = r.int(0, 500)\n        let op = r.int(0, 3)\n        if op == 0 {\n            m[k] = \"v{k}\"\n        } else if op == 1 {\n            m.remove(k)\n        } else {\n            sum = sum + m.get(k).map(|s| s.len()) ?? 0\n        }\n        i = i + 1\n    }\n    out.print(\"{m.len()} {sum} {m.keys().take(8)} {m.values().take(3)}\")\n    let copy = m\n    m.remove(m.keys()[0])\n    out.print(\"{copy.len()} {m.len()} {copy == m}\")\n    // maps handed to concurrent tasks\n    let parts = group g {\n        for d in [0, 1, 2, 3] {\n            g.go(|| copy.keys().filter(|k| k % 4 == d).len())\n        }\n    }\n    out.print(\"{parts} {parts.sum() == copy.len()}\")\n}\n" "273 12086 [461, 206, 21, 361, 292, 414, 473, 199] [\"v461\", \"v206\", \"v21\"]\n273 272 false\n[76, 71, 63, 63] true\n";
   errs "map-key-type" (main_wrap "    let mut m = map()\n    m[1.5] = 1") [ "E0113" ];
   errs "map-entry-field" "struct P {\n    x: Int,\n}\n\nfn main() {\n    let mut m = map([(1, P { x: 1 })])\n    m[1].x = 2\n}\n" [ "E0209" ];
   errs "map-remove-immutable" (main_wrap "    let m = map([(1, 2)])\n    m.remove(1)") [ "E0205" ];
@@ -1209,8 +1219,8 @@ fn main(root: Root) {
   List.iter (fun d -> try Unix.mkdir d 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ())
     [ pdir; Filename.concat pdir "app"; Filename.concat pdir "fetch" ];
   let put f s = Out_channel.with_open_bin (Filename.concat pdir f) (fun oc -> output_string oc s) in
-  put "fetch/fetch.vela" "use util\n\npub fn get(net: Net, u: Str) -> Str {\n    util.first(net.get(u).unwrap_or(\"none\"))\n}\n";
-  put "fetch/util.vela" "pub fn first(s: Str) -> Str {\n    s.lines().first().unwrap_or(\"\")\n}\n\npub fn sneaky(fs: Fs) -> Bool {\n    fs.exists(\"x\")\n}\n";
+  put "fetch/fetch.vela" "use util\n\npub fn get(net: Net, u: Str) -> Str {\n    util.first(net.get(u) ?? \"none\")\n}\n";
+  put "fetch/util.vela" "pub fn first(s: Str) -> Str {\n    s.lines().first() ?? \"\"\n}\n\npub fn sneaky(fs: Fs) -> Bool {\n    fs.exists(\"x\")\n}\n";
   let app = "use fetch\n\nfn main(root: Root) {\n    root.stdout.print(fetch.get(root.net, \"http://h\"))\n}\n" in
   put "app/main.vela" app;
   let pkg_codes toml =

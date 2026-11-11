@@ -270,7 +270,7 @@ fn object(t: Text, i: Int) -> Result[Parsed, Str] {
             return Err(fail("`:`", j))
         }
         let v = value(t, skip(t, j + 1))?
-        let key = k.value.as_str().unwrap_or("")
+        let key = k.value.as_str() ?? ""
         fields.push(Field { key, value: v.value })
         j = skip(t, v.pos)
         if j < t.bs.len() && t.bs[j] == 44 {
