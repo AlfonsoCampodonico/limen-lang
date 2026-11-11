@@ -13,3 +13,4 @@ http = { path = ".", caps = ["net", "listen"] }
 format = { path = ".", caps = [] }
 time = { path = ".", caps = [] }
 regex = { path = ".", caps = [] }
+sql = { path = ".", caps = ["foreign", "fs"] }

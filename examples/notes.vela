@@ -1,0 +1,74 @@
+// A tiny notebook in SQLite: add notes, tag them, list them by tag.
+//
+//   vela run examples/notes.vela --grant foreign=sqlite3 --grant fs=. -- add groceries "oat milk"
+//   vela run examples/notes.vela --grant foreign=sqlite3 --grant fs=. -- list groceries
+//
+// With no arguments it runs a short demo in memory. Values always go in as
+// parameters (`?`), never pasted into the SQL text.
+use sql
+use text
+
+fn setup(db: sql.Db, f: Foreign) -> Result[(), IoError] {
+    db.exec(f, "CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, tag TEXT NOT NULL, body TEXT NOT NULL, stars INTEGER)
+        ; CREATE INDEX IF NOT EXISTS notes_tag ON notes (tag)", [])?
+    Ok(())
+}
+
+fn add(db: sql.Db, f: Foreign, tag: Str, body: Str) -> Result[Int, IoError] {
+    db.exec(f, "INSERT INTO notes (tag, body) VALUES (?, ?)", [sql.Text(tag), sql.Text(body)])?
+    Ok(db.last_id(f))
+}
+
+fn list(db: sql.Db, f: Foreign, out: Stdout, tag: Str) -> Result[(), IoError] {
+    let rows = db.query(f, "SELECT id, body, stars FROM notes WHERE tag = ? ORDER BY id", [sql.Text(tag)])?
+    for row in rows {
+        let stars = match row.int("stars") {
+            Some(n) => " " + text.repeat("*", n),
+            None => "",
+        }
+        out.print("{row.int("id") ?? 0}. {row.text("body") ?? ""}{stars}")
+    }
+    if rows.is_empty() {
+        out.print("no notes tagged {tag}")
+    }
+    Ok(())
+}
+
+fn demo(f: Foreign, out: Stdout) -> Result[(), IoError] {
+    let db = sql.memory(f)?
+    setup(db, f)?
+    add(db, f, "books", "The Left Hand of Darkness")?
+    add(db, f, "books", "Robert'); DROP TABLE notes; --")?
+    let id = add(db, f, "films", "Paris, Texas")?
+    // star a note and move the others in one transaction: all or nothing
+    db.transaction(f, || {
+            db.exec(f, "UPDATE notes SET stars = ? WHERE id = ?", [sql.Int(3), sql.Int(id)])?
+            db.exec(f, "UPDATE notes SET tag = ? WHERE tag = ?", [sql.Text("reading"), sql.Text("books")])
+        })?
+    list(db, f, out, "reading")?
+    list(db, f, out, "films")?
+    match db.query_one(f, "SELECT count(*) AS n FROM notes", [])? {
+        Some(row) => out.print("{row.int("n") ?? 0} notes"),
+        None => (),
+    }
+    db.close(f)
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let out = root.stdout
+    let f = root.foreign
+    let args = root.args()
+    if args.is_empty() {
+        return demo(f, out)
+    }
+    let db = sql.open(f, root.fs, "notes.db")?
+    setup(db, f)?
+    if args.len() == 3 && args[0] == "add" {
+        out.print("added {add(db, f, args[1], args[2])?}")
+    } else if args.len() == 2 && args[0] == "list" {
+        list(db, f, out, args[1])?
+    } else {
+        out.print("usage: add TAG TEXT | list TAG")
+    }
+    db.close(f)
+}

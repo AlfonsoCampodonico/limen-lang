@@ -112,6 +112,7 @@ let rec resolve env (te : ty_expr) : ty =
     | "Stdin", _ -> TCap Stdin
     | "Env", _ -> TCap Env
     | "Exec", _ -> TCap Exec
+    | "Foreign", _ -> TCap Foreign
     | "Chan", [ x ] -> TChan x
     | "Map", [ k; v ] -> TMap (k, v)
     | _ -> ( match List.assoc_opt n env with Some t -> t | None -> TNamed (n, a)))
@@ -375,6 +376,10 @@ and lower_call f e callee args ty =
     let r = tmp f ty (I.Panic (m, e.espan)) in
     f.dead <- true;
     r
+  | EVar n when not_local f n && (match Hashtbl.find_opt f.g.fns n with Some { fn_foreign = Some _; _ } -> true | _ -> false) ->
+    let cs = match Ffi.of_decl (Hashtbl.find f.g.fns n) with Ok cs -> cs | Error _ -> failwith "lower: foreign signature" in
+    let xs = List.map (lower f) args in
+    tmp f ty (I.CallC (cs, xs, e.espan))
   | EVar n when not_local f n && Hashtbl.mem f.g.fns n ->
     let c = instance f.g n (List.map (fun (k, t) -> (k, zonk f.genv t)) callee.einst) in
     let xs = List.map (lower f) args in

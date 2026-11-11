@@ -7,6 +7,7 @@ enum Result[T, E] { Ok(T), Err(E) }
 enum IoError { Denied(Str), Failed(Str) }
 struct ProcessOutput { code: Int, stdout: Str, stderr: Str }
 struct HttpResponse { status: Int, headers: Map[Str, Str], body: Str }
+struct Handle { addr: Int }
 |}
 
 (* Tuples of 2 to 8 items: generic structs with fields `0`, `1`, ... *)

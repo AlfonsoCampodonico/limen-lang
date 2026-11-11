@@ -89,6 +89,8 @@ type fn_decl = {
   fn_test : string option; (* Some name: a `test "name" { ... }` block *)
   fn_pub : bool;
   fn_bounds : (string * (string * span) list) list; (* type parameter -> interfaces it must satisfy *)
+  fn_foreign : (string * string) option;
+      (* Some (library, C symbol): declared in a `foreign "lib" { ... }` block; no body *)
 }
 
 type struct_decl = {

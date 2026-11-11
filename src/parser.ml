@@ -568,7 +568,7 @@ let parse_item st =
     (* the generated name cannot be written in source, so tests cannot be called *)
     IFn
       { fn_name = Printf.sprintf "test#%d" !test_count; fn_span = s.span; fn_gen = []; fn_params = params; fn_ret = None;
-        fn_body = body; fn_test = Some name; fn_pub = false; fn_bounds = [] }
+        fn_body = body; fn_test = Some name; fn_pub = false; fn_bounds = []; fn_foreign = None }
   | KW "fn" ->
     ignore (advance st);
     let name, nsp = expect_ident st in
@@ -579,7 +579,7 @@ let parse_item st =
     let params = comma_list st ")" parse_param in
     let ret = if accept_sym st "->" then Some (parse_type st) else None in
     let body = parse_block st in
-    IFn { fn_name = name; fn_span = nsp; fn_gen = gen; fn_params = params; fn_ret = ret; fn_body = body; fn_test = None; fn_pub = false; fn_bounds = bounds }
+    IFn { fn_name = name; fn_span = nsp; fn_gen = gen; fn_params = params; fn_ret = ret; fn_body = body; fn_test = None; fn_pub = false; fn_bounds = bounds; fn_foreign = None }
   | KW "struct" ->
     ignore (advance st);
     let name, nsp = expect_ident st in
@@ -632,6 +632,47 @@ let parse_item st =
     IIface { if_name = name; if_span = nsp; if_methods = methods; if_pub = false }
   | _ -> fail t "an item (`fn`, `struct`, `enum` or `interface`)"
 
+(* `foreign "lib" { fn name(p: T, ...) -> R  ... }`: C functions from library
+   [lib], each with a signature and no body. `pub fn` exports one. *)
+let parse_foreign st =
+  ignore (advance st);
+  let s = advance st in
+  let lib =
+    match s.tok with
+    | STR [ Lit n ] -> n
+    | _ -> raise (Diag.Fatal (Diag.make "E0003" s.span "a foreign library name must be a plain string, as in `foreign \"sqlite3\" { ... }`"))
+  in
+  ignore (expect_sym st "{");
+  let items = ref [] in
+  while not (is_sym st "}") do
+    if (peek st).tok = EOF then fail (peek st) "`}` to end the foreign block";
+    let pub = if is_kw st "pub" then (ignore (advance st); true) else false in
+    if not (is_kw st "fn") then fail (peek st) "`fn name(...) -> Type` in a foreign block";
+    ignore (advance st);
+    let name, nsp = expect_ident st in
+    if is_sym st "[" then
+      raise (Diag.Fatal (Diag.make "E0003" (peek st).span "a foreign function cannot have type parameters"));
+    ignore (expect_sym st "(");
+    let params = comma_list st ")" parse_param in
+    List.iter
+      (fun p -> if p.prm_name = "self" then raise (Diag.Fatal (Diag.make "E0003" p.prm_span "a foreign function is not a method: name the parameter something other than `self`")))
+      params;
+    let ret = if accept_sym st "->" then Some (parse_type st) else None in
+    if is_sym st "{" then
+      raise (Diag.Fatal (Diag.make "E0003" (peek st).span "a foreign function has no body: its code is in the C library"));
+    let hi = match ret with Some t -> t.tspan.hi | None -> nsp.hi in
+    let body = { stmts = []; tail = None; bspan = { nsp with hi } } in
+    items :=
+      IFn
+        { fn_name = name; fn_span = nsp; fn_gen = []; fn_params = params; fn_ret = ret; fn_body = body; fn_test = None;
+          fn_pub = pub; fn_bounds = []; fn_foreign = Some (lib, name) }
+      :: !items;
+    (* one declaration per line (or separated by `;`) *)
+    if not (accept_sym st ";" || is_sym st "}" || (peek st).nl) then fail (peek st) "a new line after a foreign function's signature"
+  done;
+  ignore (advance st);
+  List.rev !items
+
 let set_pub = function
   | IFn d -> IFn { d with fn_pub = true }
   | IStruct s -> IStruct { s with st_pub = true }
@@ -655,6 +696,8 @@ let parse_file file src : file =
       | KW ("fn" | "struct" | "enum" | "interface") -> items := set_pub (parse_item st) :: !items
       | _ -> fail (peek st) "`fn`, `struct` or `enum` after `pub`"
     end
+    else if (match (peek st).tok with IDENT "foreign" -> (match (peek2 st).tok with STR _ -> true | _ -> false) | _ -> false) then
+      items := List.rev_append (parse_foreign st) !items
     else items := parse_item st :: !items
   done;
   { uses = List.rev !uses; items = List.rev !items }

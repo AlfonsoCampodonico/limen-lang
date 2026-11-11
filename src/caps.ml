@@ -254,6 +254,11 @@ let write fs rel data : (unit, ioerr) result =
       try Ok (Out_channel.with_open_bin p (fun oc -> Out_channel.output_string oc data))
       with Sys_error m -> Error (Failed m))
 
+(* The absolute path of [rel], checked as for writing (the file need not
+   exist, its directory must), for handing to C or another program. *)
+let full_path fs rel : (string, ioerr) result =
+  if String.contains rel '\000' then Error (Failed "fs: the path contains a NUL byte") else resolve fs rel ~for_write:true
+
 let exists fs rel = match resolve fs rel ~for_write:false with Ok p -> Sys.file_exists p | Error _ -> false
 
 let read_only_err = Denied "fs: this capability is read-only"

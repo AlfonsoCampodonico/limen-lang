@@ -30,6 +30,7 @@ type ctx = {
   mutable cmp_tys : ty list; (* composite types that need a <CName>_cmp order function *)
   mutable sort_tys : ty list; (* list types that need <CName>_sort *)
   mutable hash_tys : ty list; (* composite map key types that need <CName>_hash *)
+  mutable csyms : string list; (* C functions that foreign calls name *)
 }
 
 let is_enum c = function TNamed (n, _) -> Hashtbl.mem c.g.enums n | _ -> false
@@ -353,6 +354,55 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     line (sprintf "    %s = %s;" dst (mk_enum c t 1 [ "m_" ]));
     line "  }";
     line "}"
+  | I.CallC (cs, args, sp) ->
+    if not (List.mem cs.sym c.csyms) then c.csyms <- c.csyms @ [ cs.sym ];
+    let cap, vals = match List.map a args with cap :: vs -> (cap, vs) | [] -> failwith "cgen: foreign call" in
+    line "{";
+    line (sprintf "  w_foreign_check(%s, %s, %s);" cap (c_string cs.lib) (where sp));
+    let rest = ref vals and outs = ref [] in
+    let cargs =
+      List.mapi
+        (fun i (p : Ffi.param) ->
+          if p.out then begin
+            let o = sprintf "o%d_" i in
+            line (sprintf "  %s %s = 0;" (Ffi.c_name p.cty) o);
+            outs := (o, p.cty) :: !outs;
+            "&" ^ o
+          end
+          else
+            let v = match !rest with v :: r -> rest := r; v | [] -> failwith "cgen: foreign arity" in
+            match p.cty with
+            | Ffi.Int | Ffi.Float -> v
+            | Ffi.Int32 -> sprintf "w_ffi_i32(%s, %s, %s)" v (c_string (sprintf "argument `%s` of `%s`" p.name cs.sym)) (where sp)
+            | Ffi.Bool -> sprintf "(%s ? 1 : 0)" v
+            | Ffi.Str | Ffi.Bytes -> sprintf "(%s)->data" v
+            | Ffi.Handle -> sprintf "(void *)(intptr_t)(%s).f0" v
+            | Ffi.Unit -> "0")
+        cs.params
+    in
+    let outs = List.rev !outs in
+    let proto =
+      sprintf "%s (*)(%s)" (Ffi.c_name cs.ret)
+        (if cs.params = [] then "void"
+         else String.concat ", " (List.map (fun (p : Ffi.param) -> Ffi.c_name p.cty ^ if p.out then " *" else "") cs.params))
+    in
+    let call = sprintf "((%s)vf_%s)(%s)" proto cs.sym (String.concat ", " cargs) in
+    if cs.ret = Ffi.Unit then line (sprintf "  %s;" call) else line (sprintf "  %s r_ = %s;" (Ffi.c_name cs.ret) call);
+    let conv (t : Ffi.cty) e =
+      match t with
+      | Ffi.Int | Ffi.Float -> e
+      | Ffi.Int32 -> sprintf "(int64_t)%s" e
+      | Ffi.Bool -> sprintf "(%s != 0)" e
+      | Ffi.Str -> sprintf "w_ffi_str(%s)" e
+      | Ffi.Handle -> sprintf "(%s){ (int64_t)(intptr_t)%s }" (cname c Ffi.handle_ty) e
+      | Ffi.Bytes | Ffi.Unit -> "0"
+    in
+    let vals = (if cs.ret = Ffi.Unit then [] else [ conv cs.ret "r_" ]) @ List.map (fun (o, t) -> conv t o) outs in
+    (match vals with
+     | [] -> line (sprintf "  %s = 0;" dst)
+     | [ v ] -> line (sprintf "  %s = %s;" dst v)
+     | vs -> line (sprintf "  %s = (%s){ %s };" dst (cname c t) (String.concat ", " vs)));
+    line "}"
   | I.CallDyn (k, ps, r, recv, args) ->
     let sigt = sprintf "%s (*)(%s)" (ctype c r) (String.concat ", " ("WDyn*" :: List.map (ctype c) ps)) in
     set (sprintf "((%s)(%s)->vt->m[%d])(%s)" sigt (a recv) k (String.concat ", " (a recv :: List.map a args)))
@@ -602,6 +652,9 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     | "cap_make_dir", TCap Fs -> io_result (sprintf "Cap_fs_make_dir(%s, %s)" (arg 0) (arg 1)) "0"
     | "cap_is_dir", TCap Fs -> set (sprintf "Cap_fs_is_dir(%s, %s)" (arg 0) (arg 1))
     | "cap_only", TCap Exec -> set (sprintf "Cap_exec_only(%s, %s)" (arg 0) (arg 1))
+    | "cap_only", TCap Foreign -> set (sprintf "Cap_foreign_only(%s, %s)" (arg 0) (arg 1))
+    | "cap_allows", TCap Foreign -> set (sprintf "Cap_foreign_allows(%s, %s)" (arg 0) (arg 1))
+    | "cap_copy", TCap Foreign -> set (sprintf "Cap_foreign_copy(%s, (%s).f0, %s, %s)" (arg 0) (arg 1) (arg 2) (where sp))
     | "cap_run", TCap Exec ->
       let po = TNamed ("ProcessOutput", []) in
       io_result
@@ -632,6 +685,8 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     | "cap_read", _ -> io_result (sprintf "Cap_fs_read(%s, %s)" (arg 0) (arg 1)) "r_.val"
     | "cap_write", TCap Fs -> io_result (sprintf "Cap_fs_write(%s, %s, %s)" (arg 0) (arg 1) (arg 2)) "0"
     | "cap_exists", _ -> set (sprintf "Cap_fs_exists(%s, %s)" (arg 0) (arg 1))
+    | "cap_full_path", TCap Fs -> io_result (sprintf "Cap_fs_full_path(%s, %s)" (arg 0) (arg 1)) "r_.val"
+    | "cap_is_read_only", TCap Fs -> set (sprintf "(%s)->ro" (arg 0))
     | _ ->
       ignore sp;
       failwith (sprintf "cgen: unknown primitive %s on %s" name (show rt)))
@@ -1195,7 +1250,7 @@ let program (g : Lower.gctx) (prog : I.program) : string =
   let c =
     { g; names = Hashtbl.create 32; types = []; lits = Hashtbl.create 32; lit_order = []; boxed = [];
       envs = Hashtbl.create 16; uniq = []; task_tys = []; inrange = []; chan_tys = []; dyns = []; cell_tys = [];
-      cmp_tys = []; sort_tys = []; hash_tys = [] }
+      cmp_tys = []; sort_tys = []; hash_tys = []; csyms = [] }
   in
   (* bodies first: this discovers every type and literal *)
   let bodies = Buffer.create 65536 in
@@ -1329,4 +1384,8 @@ let program (g : Lower.gctx) (prog : I.program) : string =
   ^ String.concat "\n"
     [ Runtime_text.text; "/* ---- types ---- */"; Buffer.contents types; "/* ---- literals ---- */";
       Buffer.contents lits; "/* ---- closures ---- */"; Buffer.contents envs; Buffer.contents tasks; "/* ---- functions ---- */";
-      Buffer.contents protos; "/* ---- dyn vtables ---- */"; Buffer.contents dynbuf; Buffer.contents bodies; Buffer.contents main ]
+      Buffer.contents protos;
+      (* each foreign C function under a private name, bound to its symbol by
+         an asm label, so it clashes with no header's declaration of it *)
+      String.concat "" (List.map (fun sym -> sprintf "extern void vf_%s(void) __asm__(W_CSYM(\"%s\"));\n" sym sym) c.csyms);
+      "/* ---- dyn vtables ---- */"; Buffer.contents dynbuf; Buffer.contents bodies; Buffer.contents main ]
