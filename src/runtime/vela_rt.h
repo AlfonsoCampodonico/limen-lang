@@ -33,13 +33,76 @@ typedef uint8_t W_Unit;
    capabilities, boxed enums) goes through w_alloc/w_free, so tests can check
    that reference counting frees everything (VELA_LEAKCHECK=1). */
 static int64_t w_live;
-static void *w_alloc(size_t n) {
-  void *p = malloc(n ? n : 1);
-  if (!p) { fputs("panic: out of memory\n", stderr); exit(1); }
-  __atomic_fetch_add(&w_live, 1, __ATOMIC_RELAXED);
-  return p;
+
+/* Every allocation has a header. While a panic boundary (a `catch` or a
+   task) is active, each object the task allocates is linked into the
+   boundary's list until it is freed or shared. Code a panic abandons can
+   only have left unshared objects nothing outside refers to (closures
+   capture by value, and anything another task can see is shared first), so
+   on a panic the boundary frees everything still on its list, by kind:
+   lists their data, maps their tables, sockets their descriptors. */
+typedef struct WHdr { struct WHdr *prev, *next; int64_t kind; void (*kids)(void *); } WHdr;
+/* kids: drops what the object refers to, without freeing the object; used
+   when a panic abandons it. */
+enum { WK_BUF, WK_PLAIN, WK_LIST, WK_MAP, WK_CAP, WK_CHAN, WK_GROUP };
+typedef struct WCatch { jmp_buf jb; struct WCatch *prev; char *msg; char *where; WHdr objs; } WCatch;
+static WCatch **w_catch_slot(void); /* the current fiber's innermost boundary, or NULL outside fibers */
+
+static inline void w_hdr_unlink(WHdr *h) {
+  if (h->prev) { h->prev->next = h->next; h->next->prev = h->prev; h->prev = h->next = NULL; }
 }
-static void w_free(void *p) { if (p) { __atomic_fetch_sub(&w_live, 1, __ATOMIC_RELAXED); free(p); } }
+static inline void w_hdr_link(WHdr *list, WHdr *h) {
+  h->next = list->next; h->prev = list; list->next->prev = h; list->next = h;
+}
+static void *w_alloc_k(size_t n, int kind) {
+  WHdr *h = (WHdr *)malloc(sizeof(WHdr) + (n ? n : 1));
+  if (!h) { fputs("panic: out of memory\n", stderr); exit(1); }
+  h->prev = h->next = NULL; h->kind = kind; h->kids = NULL;
+  __atomic_fetch_add(&w_live, 1, __ATOMIC_RELAXED);
+  if (kind != WK_BUF) {
+    WCatch **slot = w_catch_slot();
+    if (slot && *slot) w_hdr_link(&(*slot)->objs, h);
+  }
+  return h + 1;
+}
+static inline void w_set_kids(void *o, void (*k)(void *)) { ((WHdr *)o - 1)->kids = k; }
+/* a buffer owned by an object (list data, map tables): never on a list */
+static void *w_alloc(size_t n) { return w_alloc_k(n, WK_BUF); }
+static void w_free(void *p) {
+  if (!p) return;
+  WHdr *h = (WHdr *)p - 1;
+  w_hdr_unlink(h);
+  __atomic_fetch_sub(&w_live, 1, __ATOMIC_RELAXED);
+  free(h);
+}
+/* Start a boundary's list; its parent is the current innermost boundary. */
+static void w_catch_init(WCatch *c) {
+  c->msg = NULL; c->where = NULL;
+  c->objs.prev = c->objs.next = &c->objs;
+  WCatch **slot = w_catch_slot();
+  c->prev = slot ? *slot : NULL;
+}
+/* Normal exit: what the boundary allocated and still lives now belongs to
+   the enclosing boundary, or to nobody. */
+static void w_catch_end(WCatch *c) {
+  if (c->objs.next == &c->objs) return;
+  if (c->prev) {
+    WHdr *first = c->objs.next, *last = c->objs.prev, *p = &c->prev->objs;
+    last->next = p->next; p->next->prev = last; p->next = first; first->prev = p;
+  } else {
+    WHdr *h = c->objs.next;
+    while (h != &c->objs) { WHdr *n = h->next; h->prev = h->next = NULL; h = n; }
+  }
+  c->objs.prev = c->objs.next = &c->objs;
+}
+static void w_catch_release(WCatch *c); /* after a panic: free what the abandoned code left */
+
+/* realloc for a buffer from w_alloc */
+static void *w_brealloc(void *p, size_t n) {
+  WHdr *h = (WHdr *)realloc((WHdr *)p - 1, sizeof(WHdr) + (n ? n : 1));
+  if (!h) { fputs("panic: out of memory\n", stderr); exit(1); }
+  return h + 1;
+}
 
 /* Reference counts. rc > 0: owned by one thread, plain arithmetic.
    rc < 0: shared between threads (count is -rc), atomic arithmetic.
@@ -61,7 +124,13 @@ static inline bool w_rc_unique(int64_t *rc) { return __atomic_load_n(rc, __ATOMI
 /* Switch to shared; returns true if it was owned (so children need sharing too). */
 static inline bool w_rc_share(int64_t *rc) {
   int64_t r = __atomic_load_n(rc, __ATOMIC_RELAXED);
-  if (r > 0) { __atomic_store_n(rc, -r, __ATOMIC_RELAXED); return true; }
+  if (r > 0) {
+    /* another task may hold it now, so it is no longer this boundary's to free
+       (every shared object has its count first, right after the header) */
+    w_hdr_unlink((WHdr *)rc - 1);
+    __atomic_store_n(rc, -r, __ATOMIC_RELAXED);
+    return true;
+  }
   return false;
 }
 static void *w_raw(size_t n) {
@@ -93,8 +162,7 @@ static void w_leakcheck(void) {
    checks happen before any write; channel send/close release the channel
    lock first. A failure that cannot meet this (the deadlock detector) calls
    w_fatal_c instead. Keep it that way when adding a w_panic_c call. */
-typedef struct WCatch { jmp_buf jb; struct WCatch *prev; char *msg; char *where; } WCatch;
-static WCatch **w_catch_slot(void); /* the current fiber's innermost boundary, or NULL outside fibers */
+
 
 /* Errors no boundary can handle: report and exit. */
 __attribute__((noreturn)) static void w_fatal_c(const char *msg, const char *where) {
@@ -121,7 +189,7 @@ typedef struct WStr { int64_t rc; int64_t len; char *data; } WStr; /* rc == 0: i
 
 static WStr *Str_new(int64_t len) {
   if (len < 0 || (uint64_t)len > SIZE_MAX - sizeof(WStr) - 1) w_oom();
-  WStr *s = (WStr *)w_alloc(sizeof(WStr) + (size_t)len + 1);
+  WStr *s = (WStr *)w_alloc_k(sizeof(WStr) + (size_t)len + 1, WK_PLAIN);
   s->rc = 1; s->len = len; s->data = (char *)(s + 1); s->data[len] = 0;
   return s;
 }
@@ -249,8 +317,10 @@ static inline int64_t w_idx(int64_t i, int64_t n, const char *where) {
 #define VELA_LIST_STRUCT(L, T) struct L { int64_t rc; int64_t len; int64_t cap; T *data; };
 
 #define VELA_LIST_FUNCS(L, T, P)                                                              \
+  static void L##_kids(void *o) { L *l = (L *)o; for (int64_t i = 0; i < l->len; i++) P##_drop(l->data[i]); } \
   static L *L##_new(int64_t cap) {                                                            \
-    L *l = (L *)w_alloc(sizeof(L));                                                           \
+    L *l = (L *)w_alloc_k(sizeof(L), WK_LIST);                                                \
+    w_set_kids(l, L##_kids);                                                                  \
     l->rc = 1; l->len = 0; l->cap = cap > 4 ? cap : 4;                                        \
     l->data = (T *)w_alloc(w_bytes(l->cap, sizeof(T)));                                       \
     return l;                                                                                 \
@@ -276,7 +346,7 @@ static inline int64_t w_idx(int64_t i, int64_t n, const char *where) {
   static inline void L##_unique(L **p) { if (__builtin_expect(!w_rc_unique(&(*p)->rc), 0)) L##_copy(p); } \
   __attribute__((noinline)) static void L##_grow(L *l) {                                     \
     if (l->cap > INT64_MAX / 2) w_oom();                                                      \
-    l->cap *= 2; l->data = (T *)w_realloc(l->data, w_bytes(l->cap, sizeof(T)));               \
+    l->cap *= 2; l->data = (T *)w_brealloc(l->data, w_bytes(l->cap, sizeof(T)));              \
   }                                                                                           \
   static inline void L##_push_u(L **p, T v) {                                                 \
     L *l = *p;                                                                                \
@@ -287,7 +357,7 @@ static inline int64_t w_idx(int64_t i, int64_t n, const char *where) {
   static void L##_reserve(L **p, int64_t cap) {                                               \
     L##_unique(p);                                                                            \
     L *l = *p;                                                                                \
-    if (l->cap < cap) { l->data = (T *)w_realloc(l->data, w_bytes(cap, sizeof(T))); l->cap = cap; } \
+    if (l->cap < cap) { l->data = (T *)w_brealloc(l->data, w_bytes(cap, sizeof(T))); l->cap = cap; } \
   }                                                                                           \
   static inline T *L##_at(L *l, int64_t i, const char *where) {                               \
     if (i < 0 || i >= l->len) w_panic_index(i, l->len, where);                                \
@@ -408,8 +478,13 @@ __attribute__((noreturn)) static void w_panic_key(WBuf *key, const char *where) 
   struct M { int64_t rc; int64_t len, n, cap, icap; K *keys; V *vals; uint8_t *live; int64_t *idx; };
 
 #define VELA_MAP_FUNCS(M, K, KN, V, VN)                                                       \
+  static void M##_kids(void *o) {                                                             \
+    M *m = (M *)o;                                                                            \
+    for (int64_t i = 0; i < m->n; i++) if (m->live[i]) { KN##_drop(m->keys[i]); VN##_drop(m->vals[i]); } \
+  }                                                                                           \
   static M *M##_new(void) {                                                                   \
-    M *m = (M *)w_alloc(sizeof(M));                                                           \
+    M *m = (M *)w_alloc_k(sizeof(M), WK_MAP);                                                 \
+    w_set_kids(m, M##_kids);                                                                  \
     m->rc = 1; m->len = 0; m->n = 0; m->cap = 8; m->icap = 16;                                \
     m->keys = (K *)w_alloc(w_bytes(m->cap, sizeof(K)));                                       \
     m->vals = (V *)w_alloc(w_bytes(m->cap, sizeof(V)));                                       \
@@ -444,9 +519,9 @@ __attribute__((noreturn)) static void w_panic_key(WBuf *key, const char *where) 
       if (m->live[i]) { m->keys[w] = m->keys[i]; m->vals[w] = m->vals[i]; m->live[w] = 1; w++; } \
     m->n = w;                                                                                 \
     if (cap != m->cap) {                                                                      \
-      m->keys = (K *)w_realloc(m->keys, w_bytes(cap, sizeof(K)));                             \
-      m->vals = (V *)w_realloc(m->vals, w_bytes(cap, sizeof(V)));                             \
-      m->live = (uint8_t *)w_realloc(m->live, (size_t)cap);                                   \
+      m->keys = (K *)w_brealloc(m->keys, w_bytes(cap, sizeof(K)));                            \
+      m->vals = (V *)w_brealloc(m->vals, w_bytes(cap, sizeof(V)));                            \
+      m->live = (uint8_t *)w_brealloc(m->live, (size_t)cap);                                  \
       m->cap = cap;                                                                           \
     }                                                                                         \
     int64_t icap = 16;                                                                        \
@@ -687,6 +762,7 @@ static void Dyn_drop(WDyn *d) { if (w_rc_dec(&d->rc)) { d->vt->h.drop(d); w_free
 static void Dyn_share(WDyn *d) { if (w_rc_share(&d->rc)) d->vt->h.share(d); }
 static inline bool Dyn_eq(WDyn *a, WDyn *b) { return a == b; }
 static void Dyn_show(WBuf *b, WDyn *d, bool top) { d->vt->h.show(b, d, top); }
+static void w_dyn_kids(void *o) { WDyn *d = (WDyn *)o; d->vt->h.drop(d); }
 
 /* ---------- capabilities ---------- */
 
@@ -699,13 +775,12 @@ struct WCap {
   int fd; int port;           /* Listener, Conn: the socket */
   int64_t inflight; int closing; /* operations in progress; close requested */
 };
-static WCap *cap_new(int kind) { WCap *c = (WCap *)w_alloc(sizeof(WCap)); memset(c, 0, sizeof *c); c->rc = 1; c->kind = kind; c->fd = -1; return c; }
+static WCap *cap_new(int kind) { WCap *c = (WCap *)w_alloc_k(sizeof(WCap), WK_CAP); memset(c, 0, sizeof *c); c->rc = 1; c->kind = kind; c->fd = -1; return c; }
 static void w_sock_release_fd(int fd);
 static inline WCap *Cap_dup(WCap *c) { w_rc_inc(&c->rc); return c; }
 static inline void Cap_share(WCap *c) { w_rc_share(&c->rc); }
-static void Cap_drop(WCap *c) {
-  if (w_rc_dec(&c->rc)) { for (int i = 0; i < c->nhosts; i++) free(c->hosts[i]); free(c->hosts); free(c->root); if (c->fd >= 0) w_sock_release_fd(c->fd); w_free(c); }
-}
+static void Cap_release(WCap *c) { for (int i = 0; i < c->nhosts; i++) free(c->hosts[i]); free(c->hosts); free(c->root); if (c->fd >= 0) w_sock_release_fd(c->fd); w_free(c); }
+static void Cap_drop(WCap *c) { if (w_rc_dec(&c->rc)) Cap_release(c); }
 static inline bool Cap_eq(WCap *a, WCap *b) { return a == b; }
 static void Cap_show(WBuf *b, WCap *c, bool top) {
   (void)top;
@@ -1565,7 +1640,7 @@ struct WTask { WClo *fn; void (*run)(WTask *); WGroup *g; char *pmsg; char *pwhe
 struct WGroup { int64_t rc; pthread_mutex_t mu; int64_t pending; WFiber *waiter; int64_t n, cap; WTask **tasks; };
 
 static WGroup *w_group_new(void) {
-  WGroup *g = (WGroup *)w_alloc(sizeof(WGroup));
+  WGroup *g = (WGroup *)w_alloc_k(sizeof(WGroup), WK_GROUP);
   g->rc = 1; g->pending = 0; g->waiter = NULL; g->n = 0; g->cap = 8;
   pthread_mutex_init(&g->mu, NULL);
   g->tasks = (WTask **)w_raw(sizeof(WTask *) * (size_t)g->cap);
@@ -1576,13 +1651,19 @@ static void w_task_entry(void *p) {
   WGroup *g = t->g;
   /* a panic ends only this task; the group passes it on when it finishes */
   WCatch c;
-  c.prev = NULL; c.msg = NULL; c.where = NULL;
+  w_catch_init(&c);
+  c.prev = NULL;
   WCatch **slot = w_catch_slot();
   if (_setjmp(c.jb) == 0) {
     *slot = &c;
     t->run(t);
     *slot = NULL;
+    /* the result was shared by run(); anything else this task allocated and
+       that is still alive is garbage (a panic it caught may have left some) */
+    w_catch_release(&c);
   } else {
+    w_catch_release(&c);
+    Clo_drop(t->fn);   /* run() did not get to drop it */
     t->pmsg = c.msg;
     t->pwhere = c.where;
   }
@@ -1654,7 +1735,7 @@ typedef struct WChan {
 
 static WChan *w_chan_new(int64_t cap, size_t esz, void (*edrop)(void *), void (*eshare)(void *), const char *where) {
   if (cap < 1) w_panic_c("channel capacity must be at least 1", where);
-  WChan *c = (WChan *)w_alloc(sizeof(WChan));
+  WChan *c = (WChan *)w_alloc_k(sizeof(WChan), WK_CHAN);
   memset(c, 0, sizeof *c);
   c->rc = 1; c->cap = cap; c->esz = esz ? esz : 1;
   c->buf = (char *)w_raw(w_bytes(cap, c->esz));
@@ -1760,6 +1841,61 @@ static void w_chan_close(WChan *c, const char *where) {
   while ((w = w_chq_pop_live(&c->sq, &c->sq_t))) { w->ok = 0; w->next = wake; wake = w; }
   pthread_mutex_unlock(&c->mu);
   while (wake) { WChWait *n = wake->next; w_wake(wake->f); wake = n; }
+}
+
+/* ---------- releasing what a panic abandoned ---------- */
+
+typedef struct { int64_t rc, len, cap; void *data; } WListAny;
+typedef struct { int64_t rc, len, n, cap, icap; void *keys, *vals, *live, *idx; } WMapAny;
+
+#define W_DYING (INT64_MAX / 4)
+
+static void w_catch_release(WCatch *c) {
+  WHdr *end = &c->objs;
+  /* 1. nothing abandoned may be freed by the decrements below */
+  for (WHdr *h = end->next; h != end; h = h->next) *(int64_t *)(h + 1) = W_DYING;
+  /* 2. give back the references they hold, the normal way: outside objects
+     get their counts back (and may be freed), abandoned ones stay */
+  for (WHdr *h = end->next; h != end; h = h->next) {
+    void *o = h + 1;
+    if (h->kids) h->kids(o);
+    if (h->kind == WK_CHAN) {
+      WChan *ch = (WChan *)o;
+      if (ch->edrop) for (int64_t i = 0; i < ch->len; i++) ch->edrop(ch->buf + ((ch->head + i) % ch->cap) * ch->esz);
+    }
+    if (h->kind == WK_GROUP) w_group_wait((WGroup *)o); /* its tasks still run: let them finish */
+  }
+  /* 3. free them */
+  while (end->next != end) {
+    WHdr *h = end->next;
+    w_hdr_unlink(h);
+    void *o = h + 1;
+    switch (h->kind) {
+      case WK_LIST: w_free(((WListAny *)o)->data); w_free(o); break;
+      case WK_MAP: {
+        WMapAny *m = (WMapAny *)o;
+        w_free(m->keys); w_free(m->vals); w_free(m->live); w_free(m->idx); w_free(o);
+        break;
+      }
+      case WK_CAP: Cap_release((WCap *)o); break;
+      case WK_CHAN: {
+        WChan *ch = (WChan *)o;
+        free(ch->buf);
+        pthread_mutex_destroy(&ch->mu);
+        w_free(o);
+        break;
+      }
+      case WK_GROUP: {
+        WGroup *g = (WGroup *)o;
+        w_group_release_tasks(g);
+        pthread_mutex_destroy(&g->mu);
+        free(g->tasks);
+        w_free(o);
+        break;
+      }
+      default: w_free(o); break;
+    }
+  }
 }
 
 /* ---------- select ----------

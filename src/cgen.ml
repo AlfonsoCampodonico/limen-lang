@@ -242,8 +242,9 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     let key = cname c t ^ "_as_" ^ String.map (fun ch -> if ch = '.' then '_' else ch) i in
     if not (List.exists (fun (k, _, _) -> k = key) c.dyns) then c.dyns <- c.dyns @ [ (key, t, ms) ];
     line "{";
-    line (sprintf "  struct Dyn_%s* d_ = (struct Dyn_%s*)w_alloc(sizeof(struct Dyn_%s));" key key key);
+    line (sprintf "  struct Dyn_%s* d_ = (struct Dyn_%s*)w_alloc_k(sizeof(struct Dyn_%s), WK_PLAIN);" key key key);
     line (sprintf "  d_->base.rc = 1; d_->base.vt = (const WVt*)&Dyn_%s_vt; d_->val = %s;" key (a x));
+    line "  w_set_kids(d_, w_dyn_kids);";
     line (sprintf "  %s = (WDyn*)d_;" dst);
     line "}"
   | I.Select (id, ops, has_default, sp) ->
@@ -273,15 +274,17 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     (* run the closure under a panic boundary: Ok(value), or Err(message) *)
     let fv = match clo with I.V v | I.VDup v -> var v | _ -> failwith "catch closure" in
     line "{";
-    line "  WCatch c_; c_.msg = NULL; c_.where = NULL;";
+    line "  WCatch c_;";
+    line "  w_catch_init(&c_);";
     line "  WCatch **slot_ = w_catch_slot();";
-    line "  c_.prev = *slot_;";
     line "  if (_setjmp(c_.jb) == 0) {";
     line "    *slot_ = &c_;";
     line (sprintf "    %s r_ = ((%s (*)(WClo*))(%s)->fn)(%s);" (ctype c rt) (ctype c rt) fv fv);
     line "    *slot_ = c_.prev;";
+    line "    w_catch_end(&c_);";
     line (sprintf "    %s = %s;" dst (mk_enum c t 0 [ "r_" ]));
     line "  } else {";
+    line "    w_catch_release(&c_);";
     line "    WStr *m_ = Str_from(c_.msg, (int64_t)strlen(c_.msg));";
     line "    free(c_.msg); free(c_.where);";
     line (sprintf "    %s = %s;" dst (mk_enum c t 1 [ "m_" ]));
@@ -305,14 +308,15 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     line "}"
   | I.MkClosure (fname, _, []) ->
     line "{";
-    line "  WClo* k_ = (WClo*)w_alloc(sizeof(WClo));";
+    line "  WClo* k_ = (WClo*)w_alloc_k(sizeof(WClo), WK_PLAIN);";
     line (sprintf "  k_->rc = 1; k_->fn = (void*)%s; k_->drop = NULL; k_->share = NULL;" fname);
     line (sprintf "  %s = k_;" dst);
     line "}"
   | I.MkClosure (fname, _, args) ->
     line "{";
-    line (sprintf "  struct Env_%s* e_ = (struct Env_%s*)w_alloc(sizeof(struct Env_%s));" fname fname fname);
+    line (sprintf "  struct Env_%s* e_ = (struct Env_%s*)w_alloc_k(sizeof(struct Env_%s), WK_PLAIN);" fname fname fname);
     line (sprintf "  e_->base.rc = 1; e_->base.fn = (void*)%s; e_->base.drop = Env_%s_drop; e_->base.share = Env_%s_share;" fname fname fname);
+    line (sprintf "  w_set_kids(e_, (void (*)(void*))Env_%s_drop);" fname);
     List.iteri (fun i x -> line (sprintf "  e_->c%d = %s;" i (a x))) args;
     line (sprintf "  %s = (WClo*)e_;" dst);
     line "}"
@@ -791,7 +795,8 @@ let type_defs c (out : Buffer.t) =
         p (sprintf "static void %s_drop(%s v);" n ct);
         p (sprintf "static bool %s_eq(%s a, %s b);" n ct ct);
         p (sprintf "static void %s_show(WBuf* b, %s v, bool top);" n ct);
-        p (sprintf "static void %s_share(%s v);" n ct))
+        p (sprintf "static void %s_share(%s v);" n ct);
+        if is_boxed c t then p (sprintf "static void %s_kids(void* o);" n))
     named;
   (* enum constructors and accessors *)
   List.iter
@@ -806,7 +811,7 @@ let type_defs c (out : Buffer.t) =
             List.iteri (fun i _ -> p (sprintf "#define %s_p_%d_%d(v) ((v)%su.v%d.f%d)" n k i acc k i)) ps;
             let params = List.mapi (fun i pt -> sprintf "%s a%d" (ctype c pt) i) ps in
             p (sprintf "static inline %s %s_mk_%d(%s) {" n n k (if params = [] then "void" else String.concat ", " params));
-            if boxed then p (sprintf "  %s r = (%s)w_alloc(sizeof(struct %s_box)); r->rc = 1;" n n n)
+            if boxed then p (sprintf "  %s r = (%s)w_alloc_k(sizeof(struct %s_box), WK_PLAIN); r->rc = 1; w_set_kids(r, %s_kids);" n n n n)
             else p (sprintf "  %s r;" n);
             p (sprintf "  r%stag = %d;" acc k);
             List.iteri (fun i _ -> p (sprintf "  r%su.v%d.f%d = a%d;" acc k i i)) ps;
@@ -879,6 +884,14 @@ let type_defs c (out : Buffer.t) =
           p "  }"
         end;
         p "  return v;\n}";
+        if boxed then begin
+          p (sprintf "static void %s_kids(void* o) {" n);
+          p (sprintf "  %s v = (%s)o;" n n);
+          p (sprintf "  switch (v->tag) {");
+          cases (fun _ k i pt -> if not (is_scalar pt) then p (sprintf "      %s_drop(v->u.v%d.f%d);" (cname c pt) k i));
+          p "  }";
+          p "}"
+        end;
         p (sprintf "static void %s_drop(%s v) {" n ct);
         if boxed then p "  if (!w_rc_dec(&v->rc)) return;";
         p (sprintf "  switch (v%stag) {" acc);
@@ -1014,8 +1027,8 @@ let program (g : Lower.gctx) (prog : I.program) : string =
   List.iter
     (fun t ->
       Buffer.add_string tasks
-        (sprintf "static void wtask_%s(WTask* t) {\n  %s r = ((%s (*)(WClo*))t->fn->fn)(t->fn);\n  memcpy(t->slot, &r, sizeof r);\n  Clo_drop(t->fn);\n}\n"
-           (cname c t) (ctype c t) (ctype c t)))
+        (sprintf "static void wtask_%s(WTask* t) {\n  %s r = ((%s (*)(WClo*))t->fn->fn)(t->fn);\n  %s\n  memcpy(t->slot, &r, sizeof r);\n  Clo_drop(t->fn);\n}\n"
+           (cname c t) (ctype c t) (ctype c t) (if is_scalar t then "" else sprintf "%s_share(r);" (cname c t))))
     c.task_tys;
   let main = Buffer.create 1024 in
   let mp s = Buffer.add_string main (s ^ "\n") in
