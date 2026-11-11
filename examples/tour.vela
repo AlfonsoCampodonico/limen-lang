@@ -42,6 +42,19 @@ fn slow(clock: Clock, ms: Int, v: Int) -> Int {
     v
 }
 
+// `defer` runs when its block is left: here by `return`, or by a panic
+fn checked(out: Stdout, s: Str) -> Result[Int, Str] {
+    defer out.print("checked {s}")
+    let n = s.parse_int() ?? (-1)
+    if n < 0 {
+        return Err("not a number")
+    }
+    if n == 0 {
+        panic("zero")
+    }
+    Ok(n)
+}
+
 // main can return the program's exit code
 fn main(root: Root) -> Int {
     let out = root.stdout
@@ -76,6 +89,15 @@ fn main(root: Root) -> Int {
     // binary data
     let b = "hi".to_bytes() + bytes([33])
     out.print("{b.len()} bytes: {b.to_str()}")
+
+    out.print("-- defer")
+    {
+        defer out.print("cleanup: runs last")
+        defer out.print("cleanup: runs first")
+        out.print("in the block")
+    }
+    out.print("{checked(out, "7")} {checked(out, "x")}")
+    out.print("{catch(|| checked(out, "0"))}")
 
     out.print("-- concurrency")
     // tasks returning () run for their effect and add nothing to the list

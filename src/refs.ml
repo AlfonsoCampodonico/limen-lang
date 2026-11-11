@@ -206,6 +206,7 @@ let index (items : item list) : occ list =
             env
           | SLetPat (p, e) -> expr env e; pat env p
           | SForPat (p, e, b) -> expr env e; block (pat env p) b; env
+          | SDefer b -> block env b; env
           | SBreak | SContinue -> env)
         env b.stmts
     in

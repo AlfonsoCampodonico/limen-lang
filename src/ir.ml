@@ -80,6 +80,11 @@ type stmt =
   | Continue
   | Return of atom
   | Drop of var
+  | Guard of int * stmt list * stmt list
+      (* a `defer`: guard number, the deferred body to run when a panic or a
+         cancellation leaves the protected statements, and those statements.
+         Normal exits run the body themselves, after a GuardEnd. *)
+  | GuardEnd of int (* leave guard [n] normally: pop its panic boundary *)
 
 and mutation =
   | MSet of atom

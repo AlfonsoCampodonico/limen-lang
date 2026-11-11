@@ -12,7 +12,7 @@ open Ir
 module S = Set.Make (Int)
 
 type ann = { s : stmt; out : S.t; sub : sub }
-and sub = NoSub | IfSub of ablock * ablock | LoopSub of ablock
+and sub = NoSub | IfSub of ablock * ablock | LoopSub of ablock | GuardSub of ablock * ablock (* handler, body *)
 and ablock = { stmts : ann list; lin : S.t }
 
 let ids atoms = List.fold_left (fun acc a -> match atom_var a with Some v -> S.add v.id acc | None -> acc) S.empty atoms
@@ -20,36 +20,47 @@ let step_atoms steps = List.filter_map (function PIndex (a, _) | PIndexU a | PKe
 
 let rhs_uses r = ids (consumed r @ borrowed r)
 
-let rec live_block stmts out ~brk ~cont : ablock =
+(* [pin]: variables a defer's handler reads; they stay live at every point
+   of its guarded statements, since a panic can leave them anywhere. *)
+let rec live_block ?(pin = S.empty) stmts out ~brk ~cont : ablock =
   let anns, lin =
     List.fold_right
       (fun s (acc, live) ->
-        let a, l = live_stmt s live ~brk ~cont in
+        let a, l = live_stmt ~pin s live ~brk ~cont in
         (a :: acc, l))
-      stmts ([], out)
+      stmts ([], S.union out pin)
   in
   { stmts = anns; lin }
 
-and live_stmt s out ~brk ~cont : ann * S.t =
-  let plain l = ({ s; out; sub = NoSub }, l) in
+and live_stmt ?(pin = S.empty) s out ~brk ~cont : ann * S.t =
+  let out = S.union out pin in
+  let plain l = ({ s; out; sub = NoSub }, S.union l pin) in
   match s with
   | Let (v, r) | Init (v, r) | Set (v, r, _) -> plain (S.union (S.remove v.id out) (rhs_uses r))
   | Decl v -> plain (S.remove v.id out)
   | Mutate (v, steps, m) -> plain (S.add v.id (S.union out (ids (mut_atoms m @ step_atoms steps))))
   | If (c, a, b) ->
-    let ba = live_block a out ~brk ~cont and bb = live_block b out ~brk ~cont in
-    ({ s; out; sub = IfSub (ba, bb) }, S.union (ids [ c ]) (S.union ba.lin bb.lin))
+    let ba = live_block ~pin a out ~brk ~cont and bb = live_block ~pin b out ~brk ~cont in
+    ({ s; out; sub = IfSub (ba, bb) }, S.union pin (S.union (ids [ c ]) (S.union ba.lin bb.lin)))
   | Loop body ->
     let rec fix l =
-      let b = live_block body l ~brk:out ~cont:l in
+      let b = live_block ~pin body l ~brk:out ~cont:l in
       if S.equal b.lin l then b else fix (S.union l b.lin)
     in
     let b = fix S.empty in
-    ({ s; out; sub = LoopSub b }, b.lin)
+    ({ s; out; sub = LoopSub b }, S.union pin b.lin)
   | Break -> plain brk
   | Continue -> plain cont
   | Return a -> plain (ids [ a ])
-  | Drop _ -> plain out
+  | Drop _ | GuardEnd _ -> plain out
+  | Guard (_, h, b) ->
+    (* A panic can leave the body anywhere, and the handler then reads what
+       it uses: those variables stay live, so retained and never moved or
+       dropped, all through the body. *)
+    let hb = live_block h S.empty ~brk:S.empty ~cont:S.empty in
+    let pin = S.union pin hb.lin in
+    let bb = live_block ~pin b out ~brk ~cont in
+    ({ s; out; sub = GuardSub (hb, bb) }, S.union pin bb.lin)
 
 (* ---------- forward pass ---------- *)
 
@@ -179,6 +190,14 @@ and fwd_stmt (a : ann) owned ~brk ~cont : stmt list * S.t =
   | Loop _, LoopSub b ->
     let body, _ = fwd_block b owned ~brk:a.out ~cont:b.lin in
     ([ Loop body ], S.inter owned a.out)
+  | Guard (n, _, _), GuardSub (hb, bb) ->
+    (* the handler owns nothing from outside: its uses retain, and the frame's
+       cleanups drop the variables as the panic goes on *)
+    let sh, _ = fwd_block hb S.empty ~brk:S.empty ~cont:S.empty in
+    let sb, ob = fwd_block bb owned ~brk ~cont in
+    (* what the handler kept alive and nothing after needs *)
+    let left = S.diff ob a.out in
+    (Guard (n, sh, sb) :: drops left, S.inter a.out ob)
   | Break, _ -> (drops (S.diff owned brk) @ [ Break ], S.empty)
   | Continue, _ -> (drops (S.diff owned cont) @ [ Continue ], S.empty)
   | Return x, _ ->
@@ -194,6 +213,7 @@ let rec collect_vars stmts =
       | Let (v, _) | Decl v | Init (v, _) | Set (v, _, _) | Mutate (v, _, _) | Drop v -> add v
       | If (_, a, b) -> collect_vars a; collect_vars b
       | Loop b -> collect_vars b
+      | Guard (_, h, b) -> collect_vars h; collect_vars b
       | _ -> ())
     stmts
 

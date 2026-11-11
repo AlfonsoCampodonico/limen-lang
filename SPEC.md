@@ -29,7 +29,7 @@ fn parse_names(body: Str) -> List[Str] {   // no capabilities: cannot do I/O
 - **Comments:** `//` to the end of the line. There are no block comments.
 - **Doc comments:** the `//` lines directly above an item, a struct field, an enum variant or an interface method, with no blank line in between, document it. The comment block at the very top of a file, followed by a blank line, documents the module. `vela doc` reads them; there is no special marker.
 - **Identifiers:** `[A-Za-z_][A-Za-z0-9_]*`. By convention types and enum variants start with an uppercase letter, everything else lowercase. Patterns rely on this (section 7).
-- **Keywords:** `fn let mut if else match for in while return struct enum true false group break continue`.
+- **Keywords:** `fn let mut if else match for in while return struct enum true false group break continue pub use interface dyn select defer`.
 - **Integers:** decimal digits, `_` allowed as a separator (`1_000_000`). A literal must fit in 64 bits: up to `9223372036854775807` (E0005).
 - **Floats:** digits with a fraction (`1.5`), an exponent (`1e9`, `2.5E-3`), or both. `_` is allowed. There is no leading-dot form (`.5`).
 - **Strings:** `"..."`, may span lines. Escapes: `\n \t \r \\ \" \{ \} \0`. Any other escape is error E0006.
@@ -342,6 +342,8 @@ for (k, v) in m.entries() { ... }
 m[key] = value            // insert into a map (needs mut)
 break
 continue
+defer f.close()           // runs when the enclosing block is left
+defer { ... }
 expr
 ```
 
@@ -349,6 +351,30 @@ expr
 - `for` iterates over a snapshot: changing the list inside the loop does not affect the iteration. Over a range, both bounds are evaluated once, before the first iteration.
 - `break` and `continue` only work inside loops, not across closures (E0208).
 - Only variables, fields, list or array elements and map entries, and paths through them such as `m[k].x` or `xs[i].tags[j]`, can be assigned (E0209).
+
+### defer
+
+`defer` takes a block, or one statement other than `let` (`defer f.close()`, `defer count = count + 1`), and runs it when the enclosing block is left, however it is left:
+
+```
+fn copy(fs: Fs, from: Str, to: Str) -> Result[(), IoError] {
+    let log = Logger { lines: [] }
+    defer log.flush()                       // runs last
+    let data = fs.read(from)?               // `?` leaving early runs it too
+    defer {
+        log.add("copied {data.len()} bytes")  // runs first
+    }
+    fs.write(to, data)
+}
+```
+
+- It is scoped to its block, like Swift's and unlike Go's (which waits for the function): a `defer` inside a loop body runs at the end of every iteration, and one inside an `if` branch when that branch ends.
+- It runs on every way out: the end of the block, `return`, `?`, a `break` or `continue` that leaves the block, a panic, and a task's cancellation. After a panic or a cancellation the deferred body runs and the panic or cancellation then carries on, so `catch` still sees the panic and cancelled tasks still end.
+- Several defers in one block run in reverse order: the last one written runs first.
+- The body sees the names in scope at the `defer`, with their values at the time it runs: a variable assigned after the `defer` is seen with its new value, but a `let` after the `defer` that reuses a name does not change what the body refers to.
+- The body cannot leave: no `return`, no `?`, and no `break` or `continue` for a loop outside it (E0115). Its value is discarded.
+- A panic inside a deferred body replaces the one that was leaving the block, if any.
+- In a native build, the variables a deferred body reads, and those declared before the `defer` that the code after it changes, are kept in memory rather than registers, so after a panic the body sees their latest values. Everything else compiles as usual; a cleanup `defer` costs nothing measurable in a hot loop.
 
 ## 7. Patterns
 
@@ -902,6 +928,7 @@ Every diagnostic has a stable code. `vela explain CODE` prints its explanation, 
 | E0112 | a value that cannot become `dyn` |
 | E0113 | a map key type that is not `Int`, `Str`, `Bytes`, `Bool`, or a tuple, struct or enum of them |
 | E0114 | a struct that contains itself by value |
+| E0115 | `return`, `?`, `break` or `continue` that would leave a `defer` body |
 | E0201 | type mismatch |
 | E0202 | misuse of `?` |
 | E0203 | `if` without `else` produces a value |
@@ -981,6 +1008,7 @@ stmt       = "let" [ "mut" ] IDENT [ ":" type ] "=" expr
            | "while" expr_ns block
            | "for" ( IDENT | tuplepat ) "in" expr_ns block
            | "break" | "continue"
+           | "defer" ( block | stmt )             (* not a `let` *)
            | expr [ "=" expr ] ;
 
 expr       = unary { BINOP unary } ;            (* precedence: section 5 *)

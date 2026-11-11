@@ -8,7 +8,7 @@ let mutated_lists body =
     | Mutate (v, (PIndex _ :: _ | []), _) when not (List.exists (fun (w : var) -> w.id = v.id) !acc) -> (
       match v.ty with Types.TList _ -> acc := v :: !acc | _ -> ())
     | If (_, a, b) -> List.iter go a; List.iter go b
-    | Loop b -> List.iter go b
+    | Loop b | Guard (_, _, b) -> List.iter go b
     | _ -> ()
   in
   List.iter go body;
@@ -29,7 +29,8 @@ let escapes (v : var) body =
     | Return a -> mentions v [ a ]
     | If (_, a, b) -> List.exists go a || List.exists go b
     | Loop b -> List.exists go b
-    | Decl _ | Break | Continue | Drop _ -> false
+    | Guard _ -> true (* a defer's handler can see the list after a panic: keep the checks *)
+    | Decl _ | Break | Continue | Drop _ | GuardEnd _ -> false
   in
   List.exists go body
 
@@ -67,7 +68,13 @@ let fill_loop body =
    fast version guarded by: m >= 0, step >= 0, n + step does not overflow, and
    n < len (or n <= len) for every list. *)
 let rec all_stmts body =
-  List.concat_map (function If (_, a, b) as s -> s :: all_stmts a @ all_stmts b | Loop b as s -> s :: all_stmts b | s -> [ s ]) body
+  List.concat_map
+    (function
+      | If (_, a, b) as s -> s :: all_stmts a @ all_stmts b
+      | Loop b as s -> s :: all_stmts b
+      | Guard (_, h, b) as s -> s :: all_stmts h @ all_stmts b
+      | s -> [ s ])
+    body
 
 let versionable body =
   match body with

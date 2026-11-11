@@ -76,6 +76,7 @@ and stmt_desc =
   | SForPat of pat * expr * block (* `for (k, v) in xs { ... }`; expanded likewise *)
   | SBreak
   | SContinue
+  | SDefer of block (* runs when the enclosing block is left, in reverse order of the defers *)
 
 type param = { prm_name : string; prm_span : span; prm_ty : ty_expr }
 
