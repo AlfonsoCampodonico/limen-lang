@@ -57,6 +57,9 @@ type rhs =
   | SelGot of int * int * ty (* the Option a receive in select [n], operation [i], produced *)
   | Catch of atom * ty (* call a closure (borrowed) under a panic boundary; ty is its result type *)
   | CallDyn of int * ty list * ty * atom * atom list (* method index, params, result, receiver (borrowed), args (consumed) *)
+  | CallC of Ffi.csig * atom list * Span.t
+      (* a foreign C function; the Foreign capability first, then the
+         non-Out arguments; all borrowed *)
 
 and sel_op =
   | SRecv of atom * ty * atom (* channel, element type, enabled (its guard) *)
@@ -122,6 +125,7 @@ let borrowed = function
   | Bin (_, _, a, b, _) -> [ a; b ]
   | Neg (_, a) | Not a -> [ a ]
   | Prim (_, _, xs, _) -> xs
+  | CallC (_, xs, _) -> xs
   | Get (a, _, steps) -> a :: List.filter_map (function PIndex (i, _) | PIndexU i | PKey (i, _) -> Some i | PField _ -> None) steps
   | Payload (a, _, _, _) | IsTag (a, _, _) | PatTest (a, _, _) -> [ a ]
   | Interp ps -> List.filter_map (function IVal (a, _) | IValQ (a, _) -> Some a | IStr _ -> None) ps

@@ -78,7 +78,7 @@ let unify_at ctx span want got =
   try unify want got
   with Mismatch -> err ctx "E0201" span (sprintf "expected `%s`, found `%s`" (show want) (show got))
 
-let builtin_types = [ "Int"; "Float"; "Bool"; "Str"; "Bytes"; "List"; "Array"; "Chan"; "Root"; "Net"; "Fs"; "Stdout"; "Clock"; "Listen"; "Listener"; "Conn"; "Rand"; "Stdin"; "Env"; "Exec"; "Map" ]
+let builtin_types = [ "Int"; "Float"; "Bool"; "Str"; "Bytes"; "List"; "Array"; "Chan"; "Root"; "Net"; "Fs"; "Stdout"; "Clock"; "Listen"; "Listener"; "Conn"; "Rand"; "Stdin"; "Env"; "Exec"; "Foreign"; "Map" ]
 
 (* Names other languages use for ambient I/O, mapped to the capability way. *)
 let ambient =
@@ -144,6 +144,7 @@ let rec resolve ctx env (te : ty_expr) : ty =
     | "Stdin" -> simple (TCap Stdin)
     | "Env" -> simple (TCap Env)
     | "Exec" -> simple (TCap Exec)
+    | "Foreign" -> simple (TCap Foreign)
     | "Chan" -> if want 1 then TChan (List.hd args') else TErr
     | "Map" -> if want 2 then TMap (List.nth args' 0, List.nth args' 1) else TErr
     | _ -> (
@@ -232,6 +233,10 @@ let add_bounds fname env sp =
 (* Methods by `Type::name`: whether they are `pub`, and the file (module)
    that defines them. A private method can only be called from its own file. *)
 let method_owner : (string, bool * string) Hashtbl.t = Hashtbl.create 16
+
+(* Foreign functions can only be called directly, not used as values. *)
+let foreign_fns : (string, unit) Hashtbl.t = Hashtbl.create 8
+let calling = ref false
 
 (* The methods defined on user type [n], by name. *)
 let user_methods ctx n =
@@ -341,6 +346,8 @@ let methods (t : ty) : (string * (unit -> ty list * ty)) list =
   | TCap Env -> [ m "get" [ TStr ] (opt TStr) ]
   | TCap Exec ->
     [ m "run" [ TStr; TList TStr ] (res (TNamed ("ProcessOutput", [])) io_err); m "only" [ TStr ] (TCap Exec) ]
+  | TCap Foreign ->
+    [ m "only" [ TStr ] (TCap Foreign); m "allows" [ TStr ] TBool; m "copy" [ TNamed ("Handle", []); TInt ] TBytes ]
   | TCap Root -> [ m "args" [] (TList TStr) ]
   | TChan a -> [ m "send" [ a ] TUnit; m "recv" [] (opt a); m "close" [] TUnit ]
   | _ -> []
@@ -376,7 +383,8 @@ let unordered ctx t : ty option =
   go t
 
 let root_fields = [ ("net", TCap Net); ("fs", TCap Fs); ("stdout", TCap Stdout); ("clock", TCap Clock); ("listen", TCap Listen);
-    ("rand", TCap Rand); ("stdin", TCap Stdin); ("env", TCap Env); ("exec", TCap Exec) ]
+    ("rand", TCap Rand); ("stdin", TCap Stdin); ("env", TCap Env); ("exec", TCap Exec);
+    ("foreign", TCap Foreign) ]
 
 (* ---------- expressions ---------- *)
 
@@ -582,7 +590,13 @@ and check_var ctx f e n sp =
     TErr
   | Some (v, _) -> v.vty
   | None -> (
+    let direct = !calling in
+    calling := false;
     match Hashtbl.find_opt ctx.fns n with
+    | Some _ when Hashtbl.mem foreign_fns n && not direct ->
+      err ctx "E0331" sp (sprintf "foreign function `%s` can only be called, not used as a value" n)
+        ~notes:[ sprintf "wrap it in a closure, as in `|x| %s(foreign, x)`" n ];
+      TErr
     | Some s ->
       let env, t = instantiate s in
       e.einst <- env;
@@ -674,7 +688,11 @@ and check_call ctx f callee args sp =
      | _ -> err ctx "E0107" sp "`panic` takes 1 argument (a message)"; check_args ctx f args);
     fresh ()
   | _ -> (
-    let ct = check_expr ctx f callee in
+    let ct =
+      match callee.edesc with
+      | EVar _ -> calling := true; Fun.protect ~finally:(fun () -> calling := false) (fun () -> check_expr ctx f callee)
+      | _ -> check_expr ctx f callee
+    in
     match repr ct with
     | TFn (ps, r) ->
       if List.length ps <> List.length args then begin
@@ -1545,7 +1563,7 @@ let check_self ctx d ps =
     d.fn_params;
   match (d.fn_params, ps) with
   | { prm_name = "self"; prm_span; _ } :: _, t0 :: _ when d.fn_test = None -> (
-    let builtin n = List.mem n [ "Option"; "Result"; "IoError"; "ProcessOutput"; "HttpResponse" ] in
+    let builtin n = List.mem n [ "Option"; "Result"; "IoError"; "ProcessOutput"; "HttpResponse"; "Handle" ] in
     match t0 with
     | TNamed (n, _) when (Hashtbl.mem ctx.structs n || Hashtbl.mem ctx.enums n) && not (builtin n) -> ()
     | TErr -> ()
@@ -1569,6 +1587,7 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
       variants = Hashtbl.create 16; owners = Hashtbl.create 16; fns = Hashtbl.create 16; diags = [] }
   in
   Hashtbl.reset method_owner;
+  Hashtbl.reset foreign_fns;
   Hashtbl.reset ifaces;
   Hashtbl.reset fn_bounds;
   let items = Prelude.items () @ user_items in
@@ -1685,8 +1704,21 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
       (function
         | IFn d ->
           let env = List.map (fun g -> (g, TParam g)) d.fn_gen in
-          let ps = List.map (fun p -> resolve ctx env p.prm_ty) d.fn_params in
-          let ret = match d.fn_ret with Some te -> resolve ctx env te | None -> TUnit in
+          let ps, ret =
+            match d.fn_foreign with
+            | None ->
+              let ps = List.map (fun p -> resolve ctx env p.prm_ty) d.fn_params in
+              (ps, match d.fn_ret with Some te -> resolve ctx env te | None -> TUnit)
+            | Some _ -> (
+              Hashtbl.replace foreign_fns d.fn_name ();
+              (* the Vela type of a C function: Foreign first, Out parameters moved to the result *)
+              if d.fn_name = "main" then err ctx "E0330" d.fn_span "`main` cannot be a foreign function";
+              match Ffi.of_decl d with
+              | Ok cs -> (Ffi.visible_params cs, Ffi.result_ty cs)
+              | Error es ->
+                List.iter (fun (sp, m) -> err ctx "E0330" sp m) es;
+                (TCap Foreign :: List.map (fun _ -> TErr) d.fn_params, TErr))
+          in
           let s = { gen = d.fn_gen; ps; ret } in
           check_self ctx d ps;
           List.iter
@@ -1737,7 +1769,7 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
   (* 4. main *)
   List.iter (fun (d, s) -> if d.fn_name = "main" then check_main ctx d s) sigs;
   (* 5. bodies *)
-  List.iter (fun (d, s) -> check_fn ctx d s) sigs;
+  List.iter (fun (d, s) -> if d.fn_foreign = None then check_fn ctx d s) sigs;
   let diags =
     List.sort
       (fun (a : Diag.t) (b : Diag.t) -> compare (a.span.file, a.span.lo) (b.span.file, b.span.lo))

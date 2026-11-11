@@ -92,7 +92,9 @@ let item = function
            i.if_methods)
     ^ "}"
   | IFn d ->
-    "fn " ^ d.fn_name ^ "["
+    (match d.fn_foreign with Some (l, _) -> "foreign " ^ String.escaped l ^ " " | None -> "")
+    ^ (if d.fn_pub then "pub " else "")
+    ^ "fn " ^ d.fn_name ^ "["
     ^ String.concat "," (List.map (fun g -> g ^ (match List.assoc_opt g d.fn_bounds with Some bs -> ":" ^ String.concat "+" (List.map fst bs) | None -> "")) d.fn_gen)
     ^ "]("
     ^ String.concat "," (List.map (fun p -> p.prm_name ^ ":" ^ ty p.prm_ty) d.fn_params)

@@ -45,7 +45,7 @@ dune exec vela -- build examples/repos.vela -o repos && ./repos --grant net=api.
 
 | Command | What it does |
 | --- | --- |
-| `vela run FILE [--native] [--grant net=HOST[:PORT]\|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST[:PORT]]... [--grant env=NAME\|*]... [--grant exec=PROGRAM\|*]... [--seed N] [-- ARGS...]` | Type-check, then run `main` in the interpreter, or compiled with `--native`. Stdout, Stdin, Clock and Rand are always granted; Net, Fs, Listen, Env and Exec only when granted, by flags or by `[grants]` in vela.toml. `--seed` makes `Rand` repeatable; arguments after `--` are `root.args()`. The exit status is 0, 1 after a panic or an `Err` from `main`, or the `Int` that `main` returns. |
+| `vela run FILE [--native] [--grant net=HOST[:PORT]\|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST[:PORT]]... [--grant env=NAME\|*]... [--grant exec=PROGRAM\|*]... [--grant foreign=LIB\|*]... [--seed N] [-- ARGS...]` | Type-check, then run `main` in the interpreter, or compiled with `--native`. Stdout, Stdin, Clock and Rand are always granted; Net, Fs, Listen, Env, Exec and Foreign only when granted, by flags or by `[grants]` in vela.toml. `--seed` makes `Rand` repeatable; arguments after `--` are `root.args()`. The exit status is 0, 1 after a panic or an `Err` from `main`, or the `Int` that `main` returns. |
 | `vela build FILE [-o OUT] [--emit-c]` | Compile to a native binary through C. The binary takes the same `--grant` flags. `--emit-c` writes the C instead. |
 | `vela check FILE [--json]` | Type-check only. `--json` emits diagnostics with codes, spans, notes and machine-applicable fixes. |
 | `vela caps FILE [--json]` | List each function's authority: the capabilities in its signature, or `pure`. |
@@ -83,11 +83,28 @@ With VS Code, any generic LSP client extension works: point it at `vela lsp` for
 
 ## Capability rules
 
-- `Root` holds `net`, `fs`, `listen`, `env`, `stdout`, `stdin`, `clock` and `rand`. Only the runtime creates capabilities.
+- `Root` holds `net`, `fs`, `listen`, `env`, `exec`, `foreign`, `stdout`, `stdin`, `clock` and `rand`. Only the runtime creates capabilities.
 - Attenuation only narrows: `net.only(host)`, `fs.under(dir)`, `fs.read_only()`. Asking for more than you hold gives an empty capability.
 - Capabilities and function types cannot be stored in struct or enum fields (E0301, E0304), so authority always shows up in signatures. Generic instantiations like `Box[Net]` are allowed because the capability is visible in the type.
 - A function with no capability or function-typed parameters is pure.
 - Runtime enforcement: `Net` is an http/https host allowlist, redirects are not followed, and other schemes are refused. `Fs` resolves paths under its root and refuses absolute paths, `..` escapes and symlinks that lead outside.
+
+## Calling C
+
+A `foreign` block declares C functions, and calling one takes the `Foreign` capability, which exists only with `--grant foreign=LIB` (per library, or `*`):
+
+```
+foreign "c" {
+    fn strtol(s: Str, end: Out[Handle], base: Int32) -> Int
+}
+
+fn main(root: Root) {
+    let (n, _) = strtol(root.foreign, "42 apples", 10)    // --grant foreign=c
+    root.stdout.print("{n}")
+}
+```
+
+`Int`, `Int32`, `Float`, `Bool`, `Str` and `Bytes` (a pointer lent for the call), `Handle` (an opaque `void *`) and `Out[T]` out-parameters cross the boundary. Natively the library is linked with `-l<lib>`; the interpreter loads it with `dlopen`, so both backends run the same programs. A dependency needs `caps = ["foreign"]` to declare a foreign block, and C code runs with the process's full authority, so the right shape is a small module that wraps the C calls in a safe API, like the `sql` module. SPEC.md section 9 has the type table, the ownership rules and the limits (no variadics, callbacks or structs by value).
 
 ## Modules, packages and the standard library
 

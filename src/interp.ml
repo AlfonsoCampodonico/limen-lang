@@ -17,6 +17,7 @@ type cap =
   | CStdin
   | CEnv of string list
   | CExec of string list
+  | CForeign of string list (* libraries, or "*" *)
 
 (* A socket that knows when it was closed, so a task waiting on it never
    touches a descriptor number that has been reused. *)
@@ -101,11 +102,12 @@ type grants = {
   listen : string list;
   env : string list; (* variable names, or "*" *)
   exec : string list; (* program names, or "*" *)
+  foreign : string list; (* C libraries, or "*" *)
   seed : int option; (* makes Rand deterministic *)
   args : string list; (* command-line arguments after `--` *)
 }
 
-let no_grants = { net = []; fs = None; listen = []; env = []; exec = []; seed = None; args = [] }
+let no_grants = { net = []; fs = None; listen = []; env = []; exec = []; foreign = []; seed = None; args = [] }
 
 (* Rand: splitmix64, the same generator as the native runtime, so a seed
    gives the same numbers in both backends. *)
@@ -139,7 +141,7 @@ let fmt_float x =
 let cap_name = function
   | CRoot -> "Root" | CNet _ -> "Net" | CFs _ -> "Fs" | CStdout -> "Stdout" | CClock -> "Clock"
   | CListen _ -> "Listen" | CListener _ -> "Listener" | CConn _ -> "Conn"
-  | CRand -> "Rand" | CStdin -> "Stdin" | CEnv _ -> "Env" | CExec _ -> "Exec"
+  | CRand -> "Rand" | CStdin -> "Stdin" | CEnv _ -> "Env" | CExec _ -> "Exec" | CForeign _ -> "Foreign"
 
 let rec key_of = function
   | VInt n -> KInt n
@@ -713,6 +715,116 @@ module Sock = struct
           result
 end
 
+(* Foreign functions: C libraries loaded with dlopen, called through the
+   generic stub in ffi_stubs.c. The native backend links the same libraries
+   and calls each function through its prototype. *)
+module Foreign = struct
+  type carg = AInt of int64 | AFloat of float | APtr of string | AOut
+
+  external dl_open : string -> nativeint * string = "vela_ffi_open"
+  external dl_sym : nativeint -> string -> nativeint = "vela_ffi_sym"
+  external call : nativeint -> carg array -> int -> int64 * float * int64 array = "vela_ffi_call"
+  external cstr : int64 -> string = "vela_ffi_cstr"
+  external peek : int64 -> int -> string = "vela_ffi_peek"
+
+  let permits allowed lib = List.mem "*" allowed || List.mem lib allowed
+  let only allowed l = if (l = "*" && List.mem "*" allowed) || (l <> "*" && permits allowed l) then [ l ] else []
+
+  let libs : (string, nativeint) Hashtbl.t = Hashtbl.create 4
+  let syms : (string * string, nativeint) Hashtbl.t = Hashtbl.create 16
+
+  (* lib<name>.dylib on macOS, lib<name>.so elsewhere; "c" is the program itself *)
+  let load lib : (nativeint, string) result =
+    match Hashtbl.find_opt libs lib with
+    | Some h -> Ok h
+    | None ->
+      let try_open names =
+        List.fold_left
+          (fun acc n -> match acc with Ok _ -> acc | Error _ -> let h, e = dl_open n in if h <> 0n then Ok h else Error e)
+          (Error "") names
+      in
+      let r = if lib = "c" then try_open [ "" ] else try_open [ "lib" ^ lib ^ ".dylib"; "lib" ^ lib ^ ".so" ] in
+      (match r with Ok h -> Hashtbl.replace libs lib h | Error _ -> ());
+      r
+
+  (* Resolve every foreign function before the program starts, so a missing
+     library or symbol is an error up front, as a link error is natively. *)
+  let resolve (items : item list) : (unit, string * Span.t) result =
+    List.fold_left
+      (fun acc it ->
+        match (acc, it) with
+        | Ok (), IFn ({ fn_foreign = Some (lib, sym); _ } as d) -> (
+          match load lib with
+          | Error e -> Error (sprintf "foreign: cannot load library `%s`: %s" lib e, d.fn_span)
+          | Ok h ->
+            let p = dl_sym (if lib = "c" then 0n else h) sym in
+            if p = 0n then Error (sprintf "foreign: library `%s` has no function `%s`" lib sym, d.fn_span)
+            else (Hashtbl.replace syms (lib, sym) p; Ok ()))
+        | _ -> acc)
+      (Ok ()) items
+
+  let handle v = VStruct ("Handle", [ ("addr", VInt v) ])
+
+  let invoke (d : fn_decl) args sp =
+    let cs = match Ffi.of_decl d with Ok cs -> cs | Error _ -> failwith "internal: foreign signature" in
+    let allowed, args = match args with VCap (CForeign a) :: rest -> (a, rest) | _ -> failwith "internal: foreign capability" in
+    if not (permits allowed cs.lib) then raise (Panic (Ffi.denied_msg cs.lib, sp));
+    let rec conv ps args =
+      match (ps, args) with
+      | [], _ -> []
+      | (p : Ffi.param) :: ps, _ when p.out -> AOut :: conv ps args
+      | p :: ps, a :: args ->
+        let c =
+          match (p.cty, a) with
+          | Ffi.Int, VInt n -> AInt n
+          | Ffi.Int32, VInt n ->
+            if n < -2147483648L || n > 2147483647L then
+              raise (Panic (sprintf "foreign: %Ld does not fit in Int32 (argument `%s` of `%s`)" n p.name cs.sym, sp));
+            AInt n
+          | Ffi.Float, VFloat x -> AFloat x
+          | Ffi.Bool, VBool b -> AInt (if b then 1L else 0L)
+          | (Ffi.Str | Ffi.Bytes), (VStr s | VBytes s) -> APtr s
+          | Ffi.Handle, VStruct (_, [ (_, VInt n) ]) -> AInt n
+          | _ -> failwith "internal: foreign argument"
+        in
+        c :: conv ps args
+      | _ :: _, [] -> failwith "internal: foreign arity"
+    in
+    let cargs = Array.of_list (conv cs.params args) in
+    let fp = match Hashtbl.find_opt syms (cs.lib, cs.sym) with Some p -> p | None -> failwith "internal: unresolved foreign function" in
+    let ri, rf, outs = call fp cargs (if cs.ret = Ffi.Float then 1 else 0) in
+    let int32 n = Int64.of_int32 (Int64.to_int32 n) in
+    let of_raw (t : Ffi.cty) n =
+      match t with
+      | Ffi.Int -> VInt n
+      | Ffi.Int32 -> VInt (int32 n)
+      | Ffi.Float -> VFloat (Int64.float_of_bits n)
+      | Ffi.Bool -> VBool (int32 n <> 0L)
+      | Ffi.Handle -> handle n
+      | Ffi.Str -> VStr (cstr n)
+      | Ffi.Bytes | Ffi.Unit -> VUnit
+    in
+    let ret =
+      match cs.ret with
+      | Ffi.Unit -> []
+      | Ffi.Float -> [ VFloat rf ]
+      | t -> [ of_raw t ri ]
+    in
+    let out_tys = List.filter_map (fun (p : Ffi.param) -> if p.out then Some p.cty else None) cs.params in
+    let outs = List.mapi (fun i t -> of_raw t outs.(i)) out_tys in
+    match ret @ outs with
+    | [] -> VUnit
+    | [ v ] -> v
+    | vs -> VStruct (Ast.tuple_name (List.length vs), List.mapi (fun i v -> (string_of_int i, v)) vs)
+
+  let copy allowed p n sp =
+    if allowed = [] then raise (Panic ("foreign: no library is granted, so C memory cannot be read", sp));
+    if n < 0L then raise (Panic (sprintf "foreign.copy: negative length %Ld" n, sp));
+    if p = 0L && n > 0L then raise (Panic ("foreign.copy: null pointer", sp));
+    if n > Int64.of_int Sys.max_string_length then raise (Panic (sprintf "foreign.copy: length %Ld is too large" n, sp));
+    VBytes (peek p (Int64.to_int n))
+end
+
 (* ---------- processes ----------
    Same rules as the native runtime: the program name must be granted exactly
    (or `*`), arguments go as a list with no shell, the child's environment is
@@ -1081,11 +1193,14 @@ and field rt v name =
   | VCap CRoot, "stdin" -> VCap CStdin
   | VCap CRoot, "env" -> VCap (CEnv rt.grants.env)
   | VCap CRoot, "exec" -> VCap (CExec rt.grants.exec)
+  | VCap CRoot, "foreign" -> VCap (CForeign rt.grants.foreign)
   | _ -> failwith ("internal: field " ^ name)
 
 and apply rt fv args sp =
   match fv with
-  | VFn n -> call_fn rt (Hashtbl.find rt.fns n) args
+  | VFn n ->
+    let d = Hashtbl.find rt.fns n in
+    if d.fn_foreign <> None then Foreign.invoke d args sp else call_fn rt d args
   | VClosure (ps, body, cenv) -> (
     let sc = Hashtbl.create 8 in
     List.iter2 (fun p a -> Hashtbl.replace sc p (ref a)) ps args;
@@ -1324,12 +1439,12 @@ and call_method rt v name args sp =
     if hi <= lo then raise (Panic (sprintf "rand.int: empty range %Ld..%Ld" lo hi, sp));
     let span = Int64.sub hi lo in
     VInt (Int64.add lo (Int64.unsigned_rem (rand_next ()) span))
-  | VCap c, _, _ -> cap_call rt c name args
+  | VCap c, _, _ -> cap_call rt c name args sp
   | _ -> raise (Panic (sprintf "internal: no method `%s` on %s" name (show ~top:false v), sp))
 
 and sock_result : 'a. ('a, Caps.ioerr) result -> ('a -> value) -> value = fun r f -> io_result f r
 
-and cap_call rt c name args =
+and cap_call rt c name args sp =
   match (c, name, args) with
   | CStdout, "print", [ VStr s ] -> rt.out (s ^ "\n"); VUnit
   | CStdout, "write", [ VStr s ] -> rt.out s; VUnit
@@ -1366,6 +1481,9 @@ and cap_call rt c name args =
   | (CListener (fd, _) | CConn fd), "close", [] -> Sock.close fd; VUnit
   | CConn fd, "read", [] -> sock_result (Sock.read fd) (fun s -> VStr s)
   | CConn fd, "write", [ VStr s ] -> sock_result (Sock.write fd s) (fun () -> VUnit)
+  | CForeign allowed, "only", [ VStr l ] -> VCap (CForeign (Foreign.only allowed l))
+  | CForeign allowed, "allows", [ VStr l ] -> VBool (Foreign.permits allowed l)
+  | CForeign allowed, "copy", [ VStruct (_, [ (_, VInt p) ]); VInt n ] -> Foreign.copy allowed p n sp
   | CExec allowed, "only", [ VStr p ] -> VCap (CExec (Proc.only allowed p))
   | CExec allowed, "run", [ VStr p; VList args ] ->
     let args = Array.to_list (Array.map (function VStr a -> a | _ -> failwith "internal: exec argument") args) in
@@ -1403,6 +1521,9 @@ let run ~out ~grants (user_items : item list) : (value, string * Span.t) result 
   match Hashtbl.find_opt rt.fns "main" with
   | None -> Error ("no `main` function", Span.dummy)
   | Some d -> (
+    match Foreign.resolve user_items with
+    | Error e -> Error e
+    | Ok () ->
     let args = match d.fn_params with [] -> [] | _ -> [ VCap CRoot ] in
     (* main is a coroutine too, so it can wait on groups and channels *)
     Queue.clear runq;
@@ -1444,6 +1565,7 @@ let make_rt ~out ~grants (user_items : item list) =
 let run_tests ~out (user_items : item list) : (string * (unit, string * Span.t) result) list =
   let rt = make_rt ~out ~grants:no_grants user_items in
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
+  let resolved = Foreign.resolve user_items in
   List.filter_map
     (function
       | IFn ({ fn_test = Some name; _ } as d) ->
@@ -1460,6 +1582,9 @@ let run_tests ~out (user_items : item list) : (string * (unit, string * Span.t) 
             d.fn_params
         in
         let r =
+          match resolved with
+          | Error e -> Error e
+          | Ok () ->
           try
             spawn_fiber { cancelled = false } (fun () -> ignore (call_fn rt d args); finished := true);
             schedule (fun () -> !finished) d.fn_span;

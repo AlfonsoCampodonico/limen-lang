@@ -533,6 +533,45 @@ let item c (it : item) =
     end;
     trailing c (close + 1)
 
+(* A `foreign "lib" { ... }` block: its declarations are consecutive items. *)
+let foreign_sig (d : fn_decl) =
+  (if d.fn_pub then "pub " else "") ^ "fn " ^ d.fn_name ^ "(" ^ String.concat ", " (List.map (fun p -> p.prm_name ^ ": " ^ ty p.prm_ty) d.fn_params) ^ ")"
+  ^ match d.fn_ret with Some t -> " -> " ^ ty t | None -> ""
+
+(* where the block's `foreign` keyword starts: the nearest line before [lo] that begins with it *)
+let foreign_open c lo =
+  let rec go k =
+    if k <= 0 then 0
+    else
+      let ls = match String.rindex_from_opt c.src (k - 1) '\n' with Some j -> j + 1 | None -> 0 in
+      let line = String.trim (String.sub c.src ls (min (String.length c.src - ls) 9)) in
+      if String.starts_with ~prefix:"foreign" line then ls else if ls = 0 then 0 else go (ls - 1)
+  in
+  go lo
+
+let foreign_block c lib (ds : fn_decl list) =
+  new_line c 0;
+  add c ("foreign \"" ^ escape lib ^ "\" {");
+  let prev = ref (-1) in
+  List.iter
+    (fun (d : fn_decl) ->
+      let k = ref d.fn_span.lo in
+      while !k > 0 && c.src.[!k - 1] <> '\n' do decr k done;
+      if !prev >= 0 && blank_between c !prev !k then blank c;
+      let after = leading c 4 ~prev:!prev !k in
+      if after >= 0 && !prev >= 0 && blank_between c after !k then blank c;
+      new_line c 4;
+      add c (foreign_sig d);
+      trailing c d.fn_body.bspan.hi;
+      prev := d.fn_body.bspan.hi)
+    ds;
+  let close = closing_brace c !prev in
+  ignore (leading c 4 ~prev:!prev close);
+  new_line c 0;
+  add c "}";
+  trailing c (close + 1);
+  close + 1
+
 let item_span c = function
   | IFn d -> (d.fn_span.lo, d.fn_body.bspan.hi)
   | IStruct s -> (s.st_span.lo, struct_close c s + 1)
@@ -555,9 +594,29 @@ let format ~file src =
       prev := sp.hi)
     uses;
   let nuses = List.length uses in
+  (* consecutive declarations of one foreign block print as that block *)
+  let rec groups = function
+    | [] -> []
+    | IFn ({ fn_foreign = Some (lib, _); _ } as d) :: rest ->
+      let rec take acc = function
+        | IFn ({ fn_foreign = Some (l, _); _ } as d) :: r when l = lib -> take (d :: acc) r
+        | r -> (List.rev acc, r)
+      in
+      let ds, rest = take [ d ] rest in
+      `Foreign (lib, ds) :: groups rest
+    | it :: rest -> `Item it :: groups rest
+  in
   List.iteri
-    (fun i it ->
+    (fun i g ->
       let i = i + nuses in
+      match g with
+      | `Foreign (lib, (ds : fn_decl list)) ->
+        let kw_lo = foreign_open c (List.hd ds).fn_span.lo in
+        if i > 0 then blank c;
+        let after = leading c 0 ~prev:!prev kw_lo in
+        if after >= 0 && List.length c.o.lines > 0 && blank_between c after kw_lo then blank c;
+        prev := foreign_block c lib ds
+      | `Item it ->
       let lo, _ = item_span c it in
       (* the item keyword starts a little before its name span *)
       let kw_lo =
@@ -570,7 +629,7 @@ let format ~file src =
       if after >= 0 && List.length c.o.lines > 0 && blank_between c after kw_lo then blank c;
       item c it;
       prev := snd (item_span c it))
-    items;
+    (groups items);
   (* comments after the last item *)
   ignore (leading c 0 ~prev:!prev max_int);
   let lines = List.rev_map (fun (ind, b) -> (ind, Buffer.contents b)) c.o.lines in

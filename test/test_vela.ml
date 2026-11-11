@@ -142,6 +142,7 @@ let run_native ?(grants = Interp.no_grants) ?modules ?feed name src =
       @ List.concat_map (fun h -> [ "--grant"; "listen=" ^ h ]) grants.Interp.listen
       @ List.concat_map (fun n -> [ "--grant"; "env=" ^ n ]) grants.Interp.env
       @ List.concat_map (fun n -> [ "--grant"; "exec=" ^ n ]) grants.Interp.exec
+      @ List.concat_map (fun n -> [ "--grant"; "foreign=" ^ n ]) grants.Interp.foreign
       @ (match grants.seed with Some s -> [ "--seed"; string_of_int s ] | None -> [])
       @ (match grants.fs with Some (d, ro) -> [ "--grant"; "fs=" ^ d ^ if ro then ":ro" else "" ] | None -> [])
       @ ("--" :: grants.args)
@@ -189,6 +190,7 @@ let check_tsan name ?(grants = Interp.no_grants) ?feed src want =
         @ List.concat_map (fun h -> [ "--grant"; "net=" ^ h ]) grants.Interp.net
         @ List.concat_map (fun h -> [ "--grant"; "listen=" ^ h ]) grants.Interp.listen
         @ List.concat_map (fun h -> [ "--grant"; "exec=" ^ h ]) grants.Interp.exec
+        @ List.concat_map (fun h -> [ "--grant"; "foreign=" ^ h ]) grants.Interp.foreign
       in
       let o = exe ^ ".out" and e = exe ^ ".err" in
       let cmd =
@@ -215,12 +217,12 @@ let errs ?modules name src want =
   let _, ds, _ = compile ?modules name src in
   ok name (codes ds = want) (sprintf "got [%s], want [%s]" (String.concat " " (codes ds)) (String.concat " " want))
 
-let panics name src want =
+let panics ?grants name src want =
   if selected name then begin
-  (match run name src with
+  (match run ?grants name src with
    | Error e -> ok name (e = "panic: " ^ want) (sprintf "got %S" e)
    | Ok (o, _) -> ok name false ("no panic, output " ^ o));
-  check_native name src ~want_out:"" ~want_err_prefix:(Some ("panic: " ^ want ^ "\n"))
+  check_native name ?grants src ~want_out:"" ~want_err_prefix:(Some ("panic: " ^ want ^ "\n"))
   end
 
 (* A program that chooses its exit status: the same stdout and status from
@@ -878,6 +880,109 @@ fn client(net: Net, port: Int, k: Int) -> Int {
 |} in
   out "exec-group" ~grants:sh exec_group "[17, 27, 37, 47, 57, 67]\n";
   check_tsan "exec-group" ~grants:sh exec_group "[17, 27, 37, 47, 57, 67]\n";
+
+  (* ---------- foreign functions (C libraries) ---------- *)
+  let libc = { Interp.no_grants with foreign = [ "c" ] } in
+  let cdecls = {|foreign "c" {
+    fn strlen(s: Str) -> Int
+    fn abs(n: Int32) -> Int32
+    fn atof(s: Str) -> Float
+    fn ldexp(x: Float, e: Int32) -> Float
+    fn strtol(s: Str, end: Out[Handle], base: Int32) -> Int
+    fn strtod(s: Str, end: Out[Handle]) -> Float
+    fn strchr(s: Str, c: Int32) -> Str
+    fn isdigit(c: Int32) -> Bool
+    fn getenv(name: Str) -> Handle
+    fn memcmp(a: Bytes, b: Bytes, n: Int) -> Int32
+    fn labs(n: Int) -> Int
+}
+|} in
+  out "ffi-libc" ~grants:libc
+    (cdecls ^ {|
+fn main(root: Root) {
+    let out = root.stdout
+    let c = root.foreign
+    out.print("{strlen(c, "hello")} {abs(c, -5)} {labs(c, -9000000000)} {atof(c, "2.5")} {ldexp(c, 1.5, 3)}")
+    let (n, end) = strtol(c, "42xyz", 10)
+    out.print("{n} {c.copy(end, 3).to_str()}")
+    let (x, rest) = strtod(c, "1.25e2!")
+    out.print("{x} {c.copy(rest, 1).to_str()}")
+    out.print("{strchr(c, "hello", 108)} [{strchr(c, "hello", 122)}] {isdigit(c, 55)} {isdigit(c, 65)}")
+    out.print("{getenv(c, "VELA_NO_SUCH_VARIABLE").addr == 0}")
+    let b = bytes([1, 0, 7, 9])
+    out.print("{memcmp(c, b, bytes([1, 0, 7, 8]), 4) > 0} {memcmp(c, b, b, 4)} {c.copy(end, 0).len()}")
+    out.print("{strlen(c, "")} {c.allows("c")} {c.allows("sqlite3")}")
+}
+|})
+    "5 5 9000000000 2.5 12.0\n42 xyz\n125.0 !\nllo [] true false\ntrue\ntrue 0 0\n0 true false\n";
+  (* the Foreign value names the libraries it may call *)
+  panics "ffi-denied"
+    (cdecls ^ "\nfn main(root: Root) {\n    root.stdout.print(\"{strlen(root.foreign, \"x\")}\")\n}\n")
+    "foreign: library `c` is not granted (grant it with --grant foreign=c)";
+  panics "ffi-only" ~grants:{ Interp.no_grants with foreign = [ "*" ] }
+    (cdecls
+     ^ "\nfn main(root: Root) {\n    let all = root.foreign\n    let some = all.only(\"sqlite3\")\n    root.stdout.print(\"{strlen(some, \"x\")}\")\n}\n")
+    "foreign: library `c` is not granted (grant it with --grant foreign=c)";
+  out "ffi-only-print" ~grants:{ Interp.no_grants with foreign = [ "*" ] }
+    (cdecls
+     ^ "\nfn main(root: Root) {\n    let all = root.foreign\n    let some = all.only(\"sqlite3\")\n    root.stdout.print(\"{all.allows(\"c\")} {some.allows(\"c\")} {some.allows(\"sqlite3\")} {all.only(\"*\").allows(\"zlib\")} {some.only(\"*\").allows(\"sqlite3\")} {strlen(all, \"abc\")}\")\n}\n")
+    "true false true true false 3\n";
+  panics "ffi-int32-range" ~grants:libc
+    (cdecls ^ "\nfn main(root: Root) {\n    root.stdout.print(\"{abs(root.foreign, 3000000000)}\")\n}\n")
+    "foreign: 3000000000 does not fit in Int32 (argument `n` of `abs`)";
+  panics "ffi-copy-ungranted"
+    (cdecls ^ "\nfn main(root: Root) {\n    root.stdout.print(\"{root.foreign.copy(Handle { addr: 1 }, 1)}\")\n}\n")
+    "foreign: no library is granted, so C memory cannot be read";
+  panics "ffi-copy-null" ~grants:libc
+    (cdecls ^ "\nfn main(root: Root) {\n    root.stdout.print(\"{root.foreign.copy(Handle { addr: 0 }, 1)}\")\n}\n")
+    "foreign.copy: null pointer";
+  (* a panic in a foreign call is caught like any other, and frees what it should *)
+  out "ffi-catch" ~grants:libc
+    (cdecls ^ "\nfn main(root: Root) {\n    let f = root.foreign\n    let s = \"abc\" + \"def\"\n    root.stdout.print(\"{catch(|| abs(f.only(\"zlib\"), -1))} {strlen(f, s)}\")\n}\n")
+    "Err(\"foreign: library `c` is not granted (grant it with --grant foreign=c)\") 6\n";
+  (* foreign calls from many tasks at once *)
+  let ffi_group = cdecls ^ {|
+fn main(root: Root) {
+    let f = root.foreign
+    let lens = group g {
+        for i in 0..<8 {
+            g.go(|| strlen(f, "abcdefgh".slice(0, i)) + abs(f, -i))
+        }
+    }
+    root.stdout.print("{lens}")
+}
+|} in
+  out "ffi-group" ~grants:libc ffi_group "[0, 2, 4, 6, 8, 10, 12, 14]\n";
+  check_tsan "ffi-group" ~grants:libc ffi_group "[0, 2, 4, 6, 8, 10, 12, 14]\n";
+  (* declaration errors *)
+  errs "ffi-bad-types"
+    "foreign \"c\" {\n    fn a(x: List[Int]) -> Int\n    fn b(x: Out[Str])\n    fn c2() -> Bytes\n    fn d(x: Int) -> Option[Int]\n}\n\nfn main() {}\n"
+    [ "E0330"; "E0330"; "E0330"; "E0330" ];
+  errs "ffi-too-many"
+    "foreign \"c\" {\n    fn f(a: Int, b: Int, c: Int, d: Int, e: Int, f: Int, g: Int, h: Int, i: Int)\n}\n\nfn main() {}\n" [ "E0330" ];
+  errs "ffi-bad-lib" "foreign \"-lfoo\" {\n    fn f()\n}\n\nfn main() {}\n" [ "E0330" ];
+  errs "ffi-as-value"
+    "foreign \"c\" {\n    fn strlen(s: Str) -> Int\n}\n\nfn main(root: Root) {\n    let f = strlen\n    let g = |s: Str| strlen(root.foreign, s)\n    root.stdout.print(\"{g(\"ab\")}\")\n}\n"
+    [ "E0331" ];
+  errs "ffi-needs-cap"
+    "foreign \"c\" {\n    fn strlen(s: Str) -> Int\n}\n\nfn main(root: Root) {\n    root.stdout.print(\"{strlen(\"ab\")}\")\n}\n" [ "E0107" ];
+  errs "ffi-wrong-cap"
+    "foreign \"c\" {\n    fn strlen(s: Str) -> Int\n}\n\nfn main(root: Root) {\n    root.stdout.print(\"{strlen(root.fs, \"ab\")}\")\n}\n" [ "E0201" ];
+  errs "ffi-body" "foreign \"c\" {\n    fn f() -> Int { 1 }\n}\n\nfn main() {}\n" [ "E0003" ];
+  errs "ffi-generic" "foreign \"c\" {\n    fn f[T](x: T)\n}\n\nfn main() {}\n" [ "E0003" ];
+  errs "ffi-same-line" "foreign \"c\" {\n    fn a() fn b()\n}\n\nfn main() {}\n" [ "E0003" ];
+  errs "ffi-main" "foreign \"c\" {\n    fn main()\n}\n" [ "E0303"; "E0330" ];
+  (* a missing symbol is an error before the program runs (natively, a link error) *)
+  if selected "ffi-missing" then (match run ~grants:libc "ffi-missing" "foreign \"c\" {\n    fn vela_no_such_function() -> Int\n}\n\nfn main(root: Root) {\n    root.stdout.print(\"{vela_no_such_function(root.foreign)}\")\n}\n" with
+   | Error e -> ok "ffi-missing" (e = "panic: foreign: library `c` has no function `vela_no_such_function`") e
+   | Ok _ -> ok "ffi-missing" false "ran");
+  if selected "ffi-no-lib" then (match run ~grants:libc "ffi-no-lib" "foreign \"vela_no_such_lib\" {\n    fn f() -> Int\n}\n\nfn main(root: Root) {\n    root.stdout.print(\"{f(root.foreign)}\")\n}\n" with
+   | Error e -> ok "ffi-no-lib" (String.starts_with ~prefix:"panic: foreign: cannot load library `vela_no_such_lib`" e) e
+   | Ok _ -> ok "ffi-no-lib" false "ran");
+  if native_for "ffi-missing" && selected "ffi-missing" then
+    (match run_native ~grants:libc "ffi-missing-native" "foreign \"c\" {\n    fn vela_no_such_function() -> Int\n}\n\nfn main(root: Root) {\n    root.stdout.print(\"{vela_no_such_function(root.foreign)}\")\n}\n" with
+     | Error m -> ok "ffi-missing/native" (Interp_util.find_sub m "vela_no_such_function" 0 <> None) m
+     | Ok _ -> ok "ffi-missing/native" false "linked");
   (* the child sees PATH and only the variables the Env grant names *)
   let env_src = main_wrap {|    match root.exec.run("sh", ["-c", "echo $\{HOME:+home\} $\{PATH:+path\} $\{VELA_SECRET_TEST:-none\}"]) {
         Ok(r) => out.write(r.stdout),
@@ -1365,6 +1470,8 @@ fn main(root: Root) {
     ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] }
     (example "http_demo.vela")
     "served 4\n200 text/plain; charset=utf-8 hi GET\n500 text/plain; charset=utf-8 internal error\n404 text/plain; charset=utf-8 no /missing\n201 {\"got\":[1,{\"a\":true}]}\nchunked sent\n200 hello world\n";
+  out "example-ffi" ~grants:{ Interp.no_grants with foreign = [ "c" ] } (example "ffi.vela")
+    "3.25 kg: 3.25, then [ kg]\n-1e3: -1000.0, then []\n0x1p4!: 16.0, then [!]\nabc: not a number\n: not a number\n";
   (* std code is checked like user code: a json error names the byte *)
   out "std-json-errors"
     "use json\n\nfn main(root: Root) {\n    for s in [\"\\{\\\"a\\\": [1, 2.5e1, \\\"\\\\u0041\\\"]\\}\", \"[1 2]\", \"\\\"\\\\x\\\"\"] {\n        match json.parse(s) {\n            Ok(v) => root.stdout.print(json.stringify(v)),\n            Err(e) => root.stdout.print(e),\n        }\n    }\n}\n"
@@ -3048,6 +3155,10 @@ fn main(root: Root) {
   let ds = std_errs "std-over" [ ("json", "pub fn leak(net: Net) -> Bool {\n    net.get(\"http://x\").is_ok()\n}\n") ]
       "use json\n\nfn main(root: Root) {\n    root.stdout.print(\"{json.leak(root.net)}\")\n}\n" in
   ok "std-over" (codes ds = [ "E0320" ]) (String.concat "; " (List.map (fun (d : Diag.t) -> d.code ^ " " ^ d.message) ds));
+  (* a foreign block is a capability use: a module not granted `foreign` cannot declare one *)
+  let ds = std_errs "std-foreign" [ ("sneakyc", "foreign \"c\" {\n    fn getpid() -> Int32\n}\n\npub fn pid(f: Foreign) -> Int {\n    getpid(f)\n}\n") ]
+      "use sneakyc\n\nfn main(root: Root) {\n    root.stdout.print(\"{sneakyc.pid(root.foreign)}\")\n}\n" in
+  ok "std-foreign" (codes ds = [ "E0320"; "E0320" ]) (String.concat "; " (List.map (fun (d : Diag.t) -> d.code ^ " " ^ d.message) ds));
   (* checked without any vela.toml, and fine for the real std *)
   let _, ds, _ = Modules.load_and_check "std-http.vela" "use http\nuse json\n\nfn main(root: Root) {\n    root.stdout.print(http.reason(200))\n}\n" in
   ok "std-real-ok" (ds = []) (String.concat "; " (List.map (fun (d : Diag.t) -> d.code ^ " " ^ d.message) ds));

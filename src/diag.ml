@@ -28,7 +28,7 @@ let explanations = [
   "E0007", "An interpolation `{...}` cannot be empty. Write `\\{` for a literal brace.";
   "E0008", "Every function parameter needs a type, for example `fn f(x: Int)`. Vela only infers types inside function bodies.";
   "E0101", "A name was used that is not a local variable, function or enum variant in scope.";
-  "E0102", "A type name is not defined. Built-in types: Int, Float, Bool, Str, List, Array[T, N], Option, Result, IoError, Root, Net, Fs, Stdout, Clock, Listen, Listener, Conn, Rand, Stdin, Env, Exec.";
+  "E0102", "A type name is not defined. Built-in types: Int, Float, Bool, Str, List, Array[T, N], Option, Result, IoError, Root, Net, Fs, Stdout, Clock, Listen, Listener, Conn, Rand, Stdin, Env, Exec, Foreign, Handle.";
   "E0103", "The struct (or Root) has no field with this name.";
   "E0104", "The enum has no such variant, or the variant name is ambiguous. Qualify it as `Enum.Variant`.";
   "E0105", "The type has no method with this name. User-defined types have no methods in phase 1; write a function that takes the value.";
@@ -58,6 +58,8 @@ let explanations = [
   "E0306", "A test can ask the runner for capabilities, and only these: `fs: Fs` (a fresh, writable temporary directory, removed after the test) and `clock: Clock`. Each at most once, for example `test \"saves\" (fs: Fs) { ... }`. For anything else, pass a fake through an interface.";
   "E0310", "A group handle can only be used as `g.go(closure)`, directly in the group's body: it cannot be stored, passed, returned or captured by a closure.";
   "E0311", "Code inside a `group` block cannot leave it early with `return` or `?`, because every task must finish before the group returns its results.";
+  "E0330", "A foreign function's signature can only use types that cross to C: Int (int64_t), Int32 (int32_t), Float (double), Bool (int), Str and Bytes (a pointer to the bytes, valid during the call), Handle (void *), and Out[Int | Int32 | Float | Handle] for an out-parameter. It returns one of those (not Bytes) or nothing. At most 8 integer-like and 8 Float parameters; no variadic functions.";
+  "E0331", "A foreign function can only be called directly, as in `strlen(foreign, s)`; it cannot be stored, passed or returned as a value. Wrap it in a closure when you need one: `|s| strlen(foreign, s)`.";
   "E0320", "A dependency's functions take a capability that vela.toml does not grant it. Vela has no ambient authority, so the capabilities in a dependency's signatures are all it can ever use. Grant it with `caps = [\"net\"]` (net, fs, listen, stdout, clock) on its line in [dependencies], or use a dependency that needs less. No dependency can take Root. Standard library modules are checked the same way against src/std/vela.toml; an error there is a bug in the standard library.";
   "E0321", "vela.toml could not be read. It has a [package] table with `name`, a [grants] table with the program's own grants (`fs = \"data:ro\"`, `net = [\"api.github.com\"]`; net, fs, listen and env), and a [dependencies] table with lines like `json = { path = \"vendor/json\", caps = [] }`.";
   "E0322", "A git dependency could not be fetched. Vela runs `git clone` on the URL in vela.toml and checks out its `tag` or `commit`; the message has git's own error. Check the URL, that the tag or commit exists, and that git is installed. The editor and agent servers never fetch: run `vela check FILE` once to fill the cache.";

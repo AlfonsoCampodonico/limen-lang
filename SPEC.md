@@ -70,7 +70,8 @@ Statements are separated by a newline or `;`. Two statements on one line without
 | `ProcessOutput` | `{ code: Int, stdout: Str, stderr: Str }` | From the prelude; returned by `Exec.run`. |
 | `fn(A, B) -> R` | functions and closures | |
 | `Chan[T]` | a channel between tasks | Created with `channel(capacity)` (section 10). |
-| `Root`, `Net`, `Fs`, `Stdout`, `Clock`, `Listen`, `Listener`, `Conn`, `Rand`, `Stdin`, `Env`, `Exec` | capabilities | Cannot be created by programs (section 9). |
+| `Handle` | `{ addr: Int }` | From the prelude: an opaque C pointer, for foreign functions (section 9). |
+| `Root`, `Net`, `Fs`, `Stdout`, `Clock`, `Listen`, `Listener`, `Conn`, `Rand`, `Stdin`, `Env`, `Exec`, `Foreign` | capabilities | Cannot be created by programs (section 9). |
 | user `struct` and `enum` | | Optionally generic (section 4). |
 
 There is no separate character type: a character is a `Str` holding one UTF-8 code point. `s.chars()` gives them as a `List[Str]`, `for c in s.chars() { ... }` visits them, and `s.bytes()` gives the bytes (section 11). One type for text keeps the API small; `len()` still counts bytes.
@@ -386,7 +387,7 @@ The native backend implements this with reference counting and copy-on-write. A 
 
 ## 9. Capabilities
 
-`Root` has nine fields, each a capability, and one method:
+`Root` has ten fields, each a capability, and one method:
 
 | Field | Type | Granted |
 | --- | --- | --- |
@@ -399,17 +400,18 @@ The native backend implements this with reference counting and copy-on-write. A 
 | `root.fs` | `Fs` | only with `--grant fs=DIR` or `--grant fs=DIR:ro` |
 | `root.listen` | `Listen` | only with `--grant listen=HOST[:PORT]` (repeatable) |
 | `root.exec` | `Exec` | only with `--grant exec=PROGRAM` (repeatable) or `--grant exec=*` |
+| `root.foreign` | `Foreign` | only with `--grant foreign=LIB` (repeatable) or `--grant foreign=*`: calls into C libraries |
 
 `root.args()` is the `List[Str]` of command-line arguments after `--`: `vela run app.vela -- a b`.
 
 Grants can also be written once in the `[grants]` table of the program's vela.toml (section 18), so they are not retyped every run. `vela run` applies them first and the `--grant` flags add to them; a `--grant fs=...` flag replaces the fs grant, since there is only one. A binary from `vela build` reads only its flags.
 
-An ungranted `Net`, `Fs`, `Listen` or `Exec` still exists, but every operation on it returns `Err(Denied(...))`. `Listener` and `Conn` are capabilities too: you get them from `Listen.on`, `Listener.accept` and `Net.connect`.
+An ungranted `Net`, `Fs`, `Listen` or `Exec` still exists, but every operation on it returns `Err(Denied(...))`. An ungranted `Foreign` exists too; calling a foreign function through it panics (`foreign.allows(lib)` checks first). `Listener` and `Conn` are capabilities too: you get them from `Listen.on`, `Listener.accept` and `Net.connect`.
 
 The rules:
 
 1. Programs cannot create capabilities. They come only from `root`.
-2. Attenuation only narrows. `net.only(host)` returns a `Net` limited to that host, and it is empty if you didn't hold that host. `fs.under(dir)` limits to a subdirectory; `fs.read_only()` removes writing. `exec.only(program)` limits `Exec` to one program.
+2. Attenuation only narrows. `net.only(host)` returns a `Net` limited to that host, and it is empty if you didn't hold that host. `fs.under(dir)` limits to a subdirectory; `fs.read_only()` removes writing. `exec.only(program)` limits `Exec` to one program; `foreign.only(lib)` limits `Foreign` to one library.
 3. There is no ambient I/O. Using `print`, `open`, `fetch` and similar names is error E0302, which explains the capability to use instead.
 4. A function whose parameters contain no capability and no function type is **pure**: it can only compute (and panic). `vela caps FILE` lists each function's authority.
 5. Enforcement at runtime:
@@ -417,6 +419,48 @@ The rules:
    - `Exec`: the program name must match a grant exactly (`git` and `/usr/bin/git` are different grants), or the grant is `*`. Arguments are passed as a list, never through a shell. The child gets `/dev/null` as stdin, the working directory, `PATH`, and only the environment variables granted with `--grant env=`. A program name without `/` is looked up in `PATH`, as a shell would. Granting a program grants everything that program can do with any arguments, so `exec=sh` is as good as every other grant.
    - `Listen`: binding is allowed only for granted `host` or `host:port` entries.
    - `Fs`: paths are relative to the granted directory; absolute paths, `..` escapes and symlinks pointing outside are refused.
+   - `Foreign`: a call checks that the function's library is on the `Foreign` value's list (or the list holds `*`). C code runs with the whole process's authority, so granting a library grants everything that library can do; see below.
+
+### Foreign functions (C)
+
+A `foreign` block declares functions of a C library. Each has a signature and no body:
+
+```
+foreign "sqlite3" {
+    fn sqlite3_libversion() -> Str
+    fn sqlite3_open_v2(path: Str, db: Out[Handle], flags: Int32, vfs: Int) -> Int32
+    pub fn sqlite3_close_v2(db: Handle) -> Int32
+}
+```
+
+Calling one takes a `Foreign` capability first, then the other arguments: `sqlite3_libversion(root.foreign)`. Each call checks that the `Foreign` value grants the library (`--grant foreign=sqlite3`), and panics if not. So C is reachable only from code that was handed `Foreign`, `vela caps` lists such functions, and a package dependency can use a foreign block only if vela.toml gives it `caps = ["foreign"]` (section 18). The library name is the `-l` name: `foreign "sqlite3"` links `-lsqlite3` natively and loads `libsqlite3.dylib` (macOS) or `libsqlite3.so` in the interpreter; `foreign "c"` is the C library itself, which is always there. The function name is the C symbol. Declarations are one per line; `pub fn` exports one from a module.
+
+The types that cross the boundary:
+
+| Vela | C | Notes |
+| --- | --- | --- |
+| `Int` | `int64_t` | |
+| `Int32` | `int32_t` (C `int`) | an `Int` in Vela; an argument outside the 32-bit range panics |
+| `Float` | `double` | |
+| `Bool` | `int` | 0 is `false`; any other value is `true` |
+| `Str` | `const char *` | the string's bytes followed by a NUL; pass the length yourself if C wants it (`s.len()`) |
+| `Bytes` | `const void *` | the bytes; pass the length yourself |
+| `Handle` | `void *` | an opaque pointer, `Handle { addr: Int }` in Vela; `addr == 0` is NULL |
+| `Out[T]` | `T *` | an out-parameter of `Int`, `Int32`, `Float` or `Handle`: C writes it, Vela returns it |
+
+The result is one of the same types (not `Bytes`: C gives no length) or nothing. A `Str` result is copied from a NUL-terminated C string at once (NULL gives `""`); C keeps ownership of the original. `Out` parameters are not passed by the caller: they come back after the result, so `sqlite3_open_v2` above has the Vela type `fn(Foreign, Str, Int, Int) -> (Int, Handle)`, called as `let (rc, db) = sqlite3_open_v2(f, path, flags, 0)`. A function with no result and one `Out` returns that value alone.
+
+Ownership at the boundary:
+
+- Arguments are lent to C for the duration of the call, never moved. A `Str` or `Bytes` pointer is valid only until the call returns: C must copy what it keeps (SQLite's `SQLITE_TRANSIENT`, a destructor argument of `-1`, does this). A `Handle` that C returns pointing into a Vela string is dangling once that string is freed.
+- Memory C allocates belongs to C: free it with the library's own function (`sqlite3_finalize`, `free`). Vela never frees a `Handle`, and the leak check does not see C memory.
+- `foreign.copy(p, n)` copies `n` bytes at `p` into new `Bytes`, for results that are a pointer and a length (`sqlite3_column_blob` and `sqlite3_column_bytes`). It reads raw memory, so it needs a `Foreign` that grants at least one library.
+
+What the capability lets code do: anything the C functions it declares can do, with the program's full authority, outside every other capability's checks. Vela checks the declared types and the library grant; it cannot check that a declaration matches the C prototype, and a wrong one is undefined behaviour. Keep foreign blocks small, private to a module that wraps them in a safe Vela API (as the `sql` module does), and grant `foreign` only to programs and dependencies you trust.
+
+Limits, the same in both backends: at most 8 integer-like (everything but `Float`, `Out` included) and 8 `Float` parameters; no variadic functions (`printf`), no structs by value, no callbacks from C into Vela. A foreign function can only be called, not used as a value (E0331): wrap it in a closure. A C call blocks its worker thread until it returns, like a busy loop, and C libraries decide their own thread safety.
+
+The backends differ in how they reach the code, not in what a program sees: natively each function is called through its exact prototype and linked with `-l<lib>` (a library outside the C compiler's default paths is found through `LIBRARY_PATH`); the interpreter loads the library with `dlopen` and calls through a generic stub, resolving every declaration before `main` starts. A missing library or symbol is therefore an error before the program runs in both: a link error natively, `foreign: cannot load library ...` or `foreign: library ... has no function ...` in the interpreter.
 
 ## 10. Concurrency
 
@@ -715,6 +759,9 @@ Strings compare byte by byte, so `c >= "a" && c <= "z"` tests a one-byte string,
 | `Net` | `connect(addr)` | `Result[Conn, IoError]`; `addr` is `host:port` |
 | `Exec` | `run(program, args)` | `Result[ProcessOutput, IoError]`: `code`, `stdout`, `stderr` (section 10) |
 | `Exec` | `only(program)` | `Exec`; `program` is a name or `*` |
+| `Foreign` | `only(lib)` | `Foreign`; `lib` is a library name or `*` |
+| `Foreign` | `allows(lib)` | `Bool`: whether calls into `lib` are granted |
+| `Foreign` | `copy(p, n)` | `Bytes`: `n` bytes of C memory at `Handle` `p` (section 9) |
 | `Listen` | `on(addr)` | `Result[Listener, IoError]` |
 | `Listener` | `accept()` | `Result[Conn, IoError]` |
 | `Listener` | `port()` | `Int` |
@@ -815,6 +862,8 @@ Every diagnostic has a stable code. `vela explain CODE` prints its explanation, 
 | E0321 | malformed vela.toml |
 | E0322 | a git dependency could not be fetched |
 | E0323 | vela.lock does not match: a malformed line, or a dependency whose files changed |
+| E0330 | a foreign function signature with a type that cannot cross to C, too many parameters, or a bad library name |
+| E0331 | a foreign function used as a value instead of called |
 | E0401 | module not found, or a qualified name without `use` |
 | E0402 | item is not `pub` |
 | E0403 | module has no such item |
@@ -841,7 +890,8 @@ A panic unwinds the stack up to the boundary: everything the abandoned code owne
 EBNF. `NL` is a newline, as described in section 2. A character-level version for constrained decoding, with the newline rules spelled out, is in [grammar/vela.gbnf](grammar/vela.gbnf). `{ x }` means zero or more, and `[ x ]` means optional.
 
 ```
-program    = { "use" IDENT | [ "pub" ] ( fn | struct | enum | interface ) | test } ;
+program    = { "use" IDENT | [ "pub" ] ( fn | struct | enum | interface ) | test | foreign } ;
+foreign    = "foreign" STRING "{" { [ "pub" ] "fn" IDENT "(" [ params ] ")" [ "->" type ] ( NL | ";" ) } "}" ;
 interface  = "interface" IDENT "{" { "fn" IDENT "(" "self" { "," param } ")" [ "->" type ] ( "," | NL ) } "}" ;
 test       = "test" STRING block ;
 fn         = "fn" IDENT [ bgenerics ] "(" [ params ] ")" [ "->" type ] block ;
@@ -942,10 +992,10 @@ color = { git = "https://example.com/color.git", tag = "v1.2.0" }
 yaml = { git = "git@example.com:me/yaml.git", commit = "3f9c2e1d7a" }
 ```
 
-- `[grants]` takes `net`, `fs`, `listen`, `env` and `exec`, each a string or a list of strings written exactly like the text after `--grant KIND=`. `fs` takes one directory, relative to vela.toml, with an optional `:ro`. Stdout, Stdin, Clock and Rand are always granted, so listing them is an error. Flags on the command line add to these grants.
+- `[grants]` takes `net`, `fs`, `listen`, `env`, `exec` and `foreign`, each a string or a list of strings written exactly like the text after `--grant KIND=`. `fs` takes one directory, relative to vela.toml, with an optional `:ro`. Stdout, Stdin, Clock and Rand are always granted, so listing them is an error. Flags on the command line add to these grants.
 - Grants belong to the program being run: only the vela.toml found for the main file is read for them. A dependency's own vela.toml never grants anything, so adding or updating a dependency cannot widen what the program may do. A dependency gets capabilities in exactly one way: your code passes them to it, and only of the kinds its `caps` allow. `[grants]` decides what reaches `main`; `caps` decides which of those may cross into each dependency.
 - A dependency is a directory holding `NAME.vela`, plus any modules that file uses from the same directory.
-- `caps` lists what the dependency may use: `net` (Net and Conn), `listen` (Listen, Listener and Conn), `fs`, `stdout`, `stdin`, `clock`, `rand`, `env`. The default is none. No dependency can take `Root`.
+- `caps` lists what the dependency may use: `net` (Net and Conn), `listen` (Listen, Listener and Conn), `fs`, `stdout`, `stdin`, `clock`, `rand`, `env`, `exec`, `foreign`. The default is none. A dependency with a `foreign` block needs `foreign`, since its foreign functions take `Foreign`. No dependency can take `Root`.
 - Vela has no ambient authority, so a function can only use a capability that reaches it as a parameter. The checker therefore knows everything a dependency can ever do from its signatures, and rejects the program (E0320) if a dependency's function takes a capability it was not granted. Granting is still only an upper bound: at run time the dependency gets exactly the capabilities you pass it, which can be narrowed with `only` and `under`.
 - A dependency is a local directory (`path`) or a git repository (`git`) at a `tag` or a `commit` (lowercase hex, at least 7 characters). The URL is `https://`, `http://`, `ssh://`, `git://`, `file://` or `user@host:path`. There is no central registry: the URL is the name of the source.
 - A git dependency is fetched with the `git` command into a cache, one directory per commit: `$VELA_CACHE`, else `$XDG_CACHE_HOME/vela`, else `~/.cache/vela`. Fetching needs no grant because it happens in the compiler, before the program exists; `vela lsp` and `vela mcp` never fetch, and report a dependency that is not cached yet (E0322).

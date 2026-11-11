@@ -904,7 +904,7 @@ static void w_dyn_kids(void *o) { WDyn *d = (WDyn *)o; d->vt->h.drop(d); }
 
 /* ---------- capabilities ---------- */
 
-enum { CAP_ROOT, CAP_NET, CAP_FS, CAP_STDOUT, CAP_CLOCK, CAP_LISTEN, CAP_LISTENER, CAP_CONN, CAP_RAND, CAP_STDIN, CAP_ENV, CAP_EXEC };
+enum { CAP_ROOT, CAP_NET, CAP_FS, CAP_STDOUT, CAP_CLOCK, CAP_LISTEN, CAP_LISTENER, CAP_CONN, CAP_RAND, CAP_STDIN, CAP_ENV, CAP_EXEC, CAP_FOREIGN };
 typedef struct WCap WCap;
 struct WCap {
   int64_t rc; int kind;
@@ -923,7 +923,7 @@ static void Cap_drop(WCap *c) { if (w_rc_dec(&c->rc)) Cap_release(c); }
 static inline bool Cap_eq(WCap *a, WCap *b) { return a == b; }
 static void Cap_show(WBuf *b, WCap *c, bool top) {
   (void)top;
-  static const char *names[] = { "<Root>", "<Net>", "<Fs>", "<Stdout>", "<Clock>", "<Listen>", "<Listener>", "<Conn>", "<Rand>", "<Stdin>", "<Env>", "<Exec>" };
+  static const char *names[] = { "<Root>", "<Net>", "<Fs>", "<Stdout>", "<Clock>", "<Listen>", "<Listener>", "<Conn>", "<Rand>", "<Stdin>", "<Env>", "<Exec>", "<Foreign>" };
   buf_puts(b, names[c->kind]);
 }
 
@@ -931,6 +931,7 @@ static char **g_hosts; static int g_nhosts; static char *g_fs_root; static bool 
 static char **g_listen; static int g_nlisten;
 static char **g_env; static int g_nenv;
 static char **g_exec; static int g_nexec;
+static char **g_foreign; static int g_nforeign;
 static char **g_args; static int g_nargs;
 static uint64_t g_rand_state;
 
@@ -976,6 +977,9 @@ static void w_init(int argc, char **argv) {
     } else if (strncmp(g, "exec=", 5) == 0) {
       g_exec = (char **)w_realloc(g_exec, sizeof(char *) * (size_t)(g_nexec + 1));
       g_exec[g_nexec++] = strdup(g + 5);
+    } else if (strncmp(g, "foreign=", 8) == 0) {
+      g_foreign = (char **)w_realloc(g_foreign, sizeof(char *) * (size_t)(g_nforeign + 1));
+      g_foreign[g_nforeign++] = strdup(g + 8);
     } else if (strncmp(g, "listen=", 7) == 0) {
       g_listen = (char **)w_realloc(g_listen, sizeof(char *) * (size_t)(g_nlisten + 1));
       g_listen[g_nlisten++] = strdup(g + 7);
@@ -1011,6 +1015,13 @@ static WCap *Cap_root_field(WCap *root, const char *f) {
     c->hosts = (char **)w_raw(sizeof(char *) * (size_t)(g_nexec + 1));
     for (int i = 0; i < g_nexec; i++) c->hosts[i] = strdup(g_exec[i]);
     c->nhosts = g_nexec;
+    return c;
+  }
+  if (strcmp(f, "foreign") == 0) {
+    WCap *c = cap_new(CAP_FOREIGN);
+    c->hosts = (char **)w_raw(sizeof(char *) * (size_t)(g_nforeign + 1));
+    for (int i = 0; i < g_nforeign; i++) c->hosts[i] = strdup(g_foreign[i]);
+    c->nhosts = g_nforeign;
     return c;
   }
   if (strcmp(f, "rand") == 0) return cap_new(CAP_RAND);
@@ -2884,6 +2895,51 @@ static WStr *Cap_stdin_all(void) {
   w_in_len = 0;
   w_in_release();
   return s;
+}
+
+/* ---------- Foreign: calls into C libraries ----------
+   The allowlist holds library names as granted (`sqlite3`) or `*`. Every
+   call of a foreign function checks that its library is on the list of the
+   Foreign value it was given; the call itself goes through the function's
+   exact prototype (see cgen), to a symbol the linker resolved from -l<lib>. */
+#define W_STR2_(x) #x
+#define W_STR_(x) W_STR2_(x)
+#define W_CSYM(s) W_STR_(__USER_LABEL_PREFIX__) s
+static bool Cap_foreign_allows(WCap *x, WStr *lib_s) {
+  if (memchr(lib_s->data, 0, (size_t)lib_s->len)) return false;
+  for (int i = 0; i < x->nhosts; i++)
+    if (strcmp(x->hosts[i], "*") == 0 || ((size_t)lib_s->len == strlen(x->hosts[i]) && memcmp(x->hosts[i], lib_s->data, (size_t)lib_s->len) == 0)) return true;
+  return false;
+}
+static WCap *Cap_foreign_only(WCap *x, WStr *lib_s) {
+  char *lib = strndup(lib_s->data, (size_t)lib_s->len);
+  bool covered;
+  if (strcmp(lib, "*") == 0) { covered = false; for (int i = 0; i < x->nhosts; i++) if (strcmp(x->hosts[i], "*") == 0) covered = true; }
+  else covered = Cap_foreign_allows(x, lib_s);
+  WCap *c = cap_new(CAP_FOREIGN);
+  c->hosts = (char **)w_raw(sizeof(char *));
+  if (covered) { c->hosts[0] = lib; c->nhosts = 1; } else free(lib);
+  return c;
+}
+static void w_foreign_check(WCap *x, const char *lib, const char *where) {
+  for (int i = 0; i < x->nhosts; i++) if (strcmp(x->hosts[i], "*") == 0 || strcmp(x->hosts[i], lib) == 0) return;
+  char msg[512];
+  snprintf(msg, sizeof msg, "foreign: library `%s` is not granted (grant it with --grant foreign=%s)", lib, lib);
+  w_panic_c(msg, where);
+}
+static int32_t w_ffi_i32(int64_t v, const char *arg, const char *where) {
+  if (v < INT32_MIN || v > INT32_MAX) {
+    char msg[256]; snprintf(msg, sizeof msg, "foreign: %lld does not fit in Int32 (%s)", (long long)v, arg);
+    w_panic_c(msg, where);
+  }
+  return (int32_t)v;
+}
+static WStr *w_ffi_str(const char *p) { return p ? Str_from(p, (int64_t)strlen(p)) : Str_new(0); }
+static WStr *Cap_foreign_copy(WCap *x, int64_t p, int64_t n, const char *where) {
+  if (x->nhosts == 0) w_panic_c("foreign: no library is granted, so C memory cannot be read", where);
+  if (n < 0) { char m[128]; snprintf(m, sizeof m, "foreign.copy: negative length %lld", (long long)n); w_panic_c(m, where); }
+  if (p == 0 && n > 0) w_panic_c("foreign.copy: null pointer", where);
+  return Str_from((const char *)(intptr_t)p, n);
 }
 
 /* ---------- Exec: run another program ----------

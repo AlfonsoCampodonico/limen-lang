@@ -1,6 +1,10 @@
 (library
  (name vela)
  (libraries unix)
+ ; the interpreter's calls into C libraries (foreign blocks)
+ (foreign_stubs
+  (language c)
+  (names ffi_stubs))
  (flags
   (:standard -w +a-4-9-40-41-42-44-45-70 -warn-error -a)))
 
