@@ -100,7 +100,32 @@ fn swap[A, B](p: Pair[A, B]) -> Pair[B, A] {
 - Generic parameters go in `[...]` after the name. They are instantiated at each use and are never written at call sites: `swap(p)`.
 - Struct fields and enum payloads cannot hold a capability (E0301), a channel (E0305) or a function type (E0304). That keeps authority visible in signatures. A generic instantiation like `Pair[Net, Int]` is allowed, because the capability is visible in the type.
 - Defining the same type, function, field or variant twice is error E0106.
-- User types have no methods. Write functions that take the value.
+
+### Methods
+
+A function whose first parameter is named `self` is a method of that parameter's type, and is called with a dot:
+
+```
+struct Point {
+    x: Float,
+    y: Float,
+}
+
+fn add(self: Point, o: Point) -> Point {
+    Point { x: self.x + o.x, y: self.y + o.y }
+}
+
+fn swap[A, B](self: Pair[A, B]) -> Pair[B, A] {
+    Pair { first: self.second, second: self.first }
+}
+
+let p = a.add(b).add(c)
+```
+
+- `self` must be the first parameter, and its type a struct or enum declared in the program, generic or not (E0110). Built-in types, `Option`, `Result` and `IoError` cannot get new methods.
+- A method is only called with a dot: `p.add(q)`, never `add(p, q)`. Its name does not clash with a plain function or with methods of other types, so `fn area(self: Circle)` and `fn area(self: Rect)` can both exist.
+- Methods take `self` by value like any parameter; to "change" a value, return the new one.
+- In a module, only `pub fn` methods can be called from other modules (E0402).
 
 ### main
 
@@ -493,6 +518,7 @@ Every diagnostic has a stable code. `vela explain CODE` prints its explanation, 
 | E0107 | wrong number of arguments |
 | E0108 | not callable |
 | E0109 | wrong number of type arguments |
+| E0110 | misplaced `self`, or a method on a built-in type |
 | E0201 | type mismatch |
 | E0202 | misuse of `?` |
 | E0203 | `if` without `else` produces a value |
@@ -624,8 +650,8 @@ Written in Vela and built into the compiler; `use` any of them. They take capabi
 | `parse(s) -> Result[Value, Str]` | the error names what was expected and the byte offset |
 | `stringify(v) -> Str` | compact JSON; integral numbers print without `.0` |
 | `quote(s) -> Str` | a JSON string literal |
-| `get(v, key)`, `at(v, i)` | `Option[Value]`: an object member, an array item |
-| `as_str`, `as_num`, `as_int`, `as_bool`, `as_list` | `Option` of the payload, `None` for another kind |
+| `v.get(key)`, `v.at(i)` | methods: `Option[Value]`, an object member or an array item |
+| `v.as_str()`, `as_num()`, `as_int()`, `as_bool()`, `as_list()` | methods: `Option` of the payload, `None` for another kind |
 
 ### http
 
@@ -633,7 +659,7 @@ HTTP/1.1 over plain TCP (no TLS yet). Each message is read whole; bodies up to 8
 
 | Item | Meaning |
 | --- | --- |
-| `struct Header { name, value }`, `header(headers, name)` | headers; lookup ignores case |
+| `struct Header { name, value }`, `req.header(name)`, `resp.header(name)`, `find_header(headers, name)` | headers; lookup ignores case |
 | `struct Request { method, path, headers, body }` | |
 | `struct Response { status: Int, headers, body }`, `text(status, body)`, `json(status, body)`, `reason(status)` | |
 | `get(net, url)`, `post(net, url, content_type, body)`, `request(net, method, url, headers, body)` | `Result[Response, IoError]`; `http://host[:port]/path` URLs, chunked responses decoded |
@@ -667,4 +693,4 @@ The handler is a plain function value, so it gets no capability unless a closure
 
 ## 20. Not yet
 
-Methods on user types, unbuffered (capacity 0) channels, `select` over several channels, TLS, SQL, a package registry, and a Cranelift backend. See the design doc's Known gaps for the full list.
+Interfaces, unbuffered (capacity 0) channels, `select` over several channels, TLS, SQL, a package registry, and a Cranelift backend. See the design doc's Known gaps for the full list.

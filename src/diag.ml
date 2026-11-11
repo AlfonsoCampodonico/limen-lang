@@ -36,6 +36,7 @@ let explanations = [
   "E0107", "A function, variant or pattern was given the wrong number of arguments.";
   "E0108", "Only functions and closures can be called.";
   "E0109", "A generic type was given the wrong number of type arguments, for example `List` instead of `List[Int]`.";
+  "E0110", "`self` names the receiver of a method: `fn area(self: Shape) -> Float` is called as `shape.area()`. It must be the first parameter, and its type a struct or enum declared in the program (not a built-in type such as Int, List, Option or Result).";
   "E0201", "Type mismatch. The message shows the expected and the actual type.";
   "E0202", "`?` returns early with the error, so the enclosing function must return `Result` (or `Option`) with the same error type. Convert errors with `.map_err(...)`.";
   "E0203", "An `if` without `else` is a statement, so its block must have type `()`.";

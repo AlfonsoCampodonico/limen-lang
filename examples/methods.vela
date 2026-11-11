@@ -1,0 +1,72 @@
+// Methods: a function whose first parameter is `self` is called as `value.name(...)`.
+
+struct Point {
+    x: Float,
+    y: Float,
+}
+
+enum Shape {
+    Circle(Point, Float),
+    Rect(Point, Point),
+}
+
+struct Pair[A, B] {
+    first: A,
+    second: B,
+}
+
+enum Tree {
+    Leaf,
+    Node(List[Tree], Int),
+}
+
+fn add(self: Point, o: Point) -> Point {
+    Point { x: self.x + o.x, y: self.y + o.y }
+}
+
+fn scale(self: Point, k: Float) -> Point {
+    Point { x: self.x * k, y: self.y * k }
+}
+
+fn area(self: Shape) -> Float {
+    match self {
+        Circle(_, r) => 3.0 * r * r,
+        Rect(a, b) => (b.x - a.x) * (b.y - a.y),
+    }
+}
+
+fn describe(self: Shape) -> Str {
+    match self {
+        Circle(c, _) => "circle at {c.x},{c.y} with area {self.area()}",
+        Rect(_, _) => "rect with area {self.area()}",
+    }
+}
+
+fn swap[A, B](self: Pair[A, B]) -> Pair[B, A] {
+    Pair { first: self.second, second: self.first }
+}
+
+fn sum(self: Tree) -> Int {
+    match self {
+        Leaf => 0,
+        Node(kids, v) => v + kids.map(|k| k.sum()).sum(),
+    }
+}
+
+// a plain function with the same name as a method does not clash
+fn area(n: Int) -> Int {
+    n * n
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let p = Point { x: 1.0, y: 2.0 }.add(Point { x: 3.0, y: 4.0 }).scale(2.0)
+    out.print("{p.x} {p.y}")
+    for s in [Circle(p, 1.0), Rect(Point { x: 0.0, y: 0.0 }, p)] {
+        out.print(s.describe())
+    }
+    let q = Pair { first: 1, second: "one" }.swap()
+    out.print("{q.first} {q.second} {q.swap().first}")
+    let t = Node([Node([], 2), Leaf, Node([Node([], 4)], 3)], 1)
+    out.print("{t.sum()} {area(5)}")
+}

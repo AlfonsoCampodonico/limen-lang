@@ -23,6 +23,12 @@ let module_pkg : (string * string) list ref = ref []
 
 let std_modules : (string * string) list ref = ref Std_text.modules (* name -> source *)
 
+(* A method is a function whose first parameter is `self`; it is named
+   `Type::name` and called as `value.name(...)`, never by its bare name. *)
+let is_method = function
+  | IFn { fn_test = None; fn_params = { prm_name = "self"; _ } :: _; _ } -> true
+  | _ -> false
+
 let item_name = function IFn d -> d.fn_name | IStruct s -> s.st_name | IEnum e -> e.en_name
 let item_span = function IFn d -> d.fn_span | IStruct s -> s.st_span | IEnum e -> e.en_span
 let item_pub = function IFn d -> d.fn_pub | IStruct s -> s.st_pub | IEnum e -> e.en_pub
@@ -78,7 +84,7 @@ let is_module env locals a = (not (List.mem a locals)) && List.exists (fun (u, _
 
 (* Look up item [n] of module [m] from another module, checking it is pub. *)
 let member _env (m : modinfo) n sp =
-  match List.find_opt (fun i -> item_name i = n) m.mitems with
+  match List.find_opt (fun i -> item_name i = n && not (is_method i)) m.mitems with
   | Some i ->
     if not (item_pub i) then err "E0402" sp (Printf.sprintf "`%s` is private to module `%s`" n m.mname)
         ~notes:[ Printf.sprintf "mark it `pub fn`, `pub struct` or `pub enum` in %s to export it" m.mfile ];
@@ -92,7 +98,7 @@ let variant_enum (m : modinfo) v =
     m.mitems
 
 let no_member (m : modinfo) n sp =
-  let names = List.filter_map (fun i -> if item_pub i then Some (item_name i) else None) m.mitems in
+  let names = List.filter_map (fun i -> if item_pub i && not (is_method i) then Some (item_name i) else None) m.mitems in
   err "E0403" sp (Printf.sprintf "module `%s` has no `%s`" m.mname n)
     ~notes:(if names = [] then [] else [ "it exports: " ^ String.concat ", " (List.sort compare names) ])
 
@@ -256,10 +262,19 @@ let rename_item mods (m : modinfo) own (it : item) : item =
   | IFn d ->
     let env = { self = m; mods; own; gens = d.fn_gen } in
     let locals = List.map (fun p -> p.prm_name) d.fn_params in
+    let params = List.map (fun p -> { p with prm_ty = ty env p.prm_ty }) d.fn_params in
+    let name =
+      if d.fn_test <> None then d.fn_name
+      else if is_method it then
+        match params with
+        | { prm_ty = { tdesc = TyName (tn, _); _ }; _ } :: _ -> tn ^ "::" ^ d.fn_name
+        | _ -> qual m d.fn_name (* the checker reports the bad `self` *)
+      else qual m d.fn_name
+    in
     IFn
       { d with
-        fn_name = (if d.fn_test = None then qual m d.fn_name else d.fn_name);
-        fn_params = List.map (fun p -> { p with prm_ty = ty env p.prm_ty }) d.fn_params;
+        fn_name = name;
+        fn_params = params;
         fn_ret = Option.map (ty env) d.fn_ret;
         fn_body = block env locals d.fn_body }
   | IStruct s ->
@@ -314,7 +329,7 @@ let load ?(deps = []) path src : item list * Diag.t list =
           List.concat_map
             (fun m ->
               let own = Hashtbl.create 16 in
-              List.iter (fun i -> Hashtbl.replace own (item_name i) i) m.mitems;
+              List.iter (fun i -> if not (is_method i) then Hashtbl.replace own (item_name i) i) m.mitems;
               List.map (rename_item mods m own) m.mitems)
             (List.rev all)
         in

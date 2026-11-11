@@ -14,8 +14,8 @@ fn main(root: Root) {
     match json.parse(src) {
         Ok(v) => {
             out.print(json.stringify(v))
-            out.print(json.get(v, "name").map(|n| json.as_str(n).unwrap_or("?")).unwrap_or("missing"))
-            out.print("{json.get(v, "n").map(|n| json.as_num(n).unwrap_or(0.0)).unwrap_or(0.0)}")
+            out.print(v.get("name").map(|n| n.as_str().unwrap_or("?")).unwrap_or("missing"))
+            out.print("{v.get("n").map(|n| n.as_num().unwrap_or(0.0)).unwrap_or(0.0)}")
         },
         Err(e) => out.print("error: " + e),
     }

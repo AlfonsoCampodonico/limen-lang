@@ -601,6 +601,10 @@ and assign rt env lhs v =
 
 and call_method rt v name args sp =
   let call f xs = apply rt f xs sp in
+  let user_method = match v with VStruct (n, _) | VEnum (n, _, _) -> Hashtbl.find_opt rt.fns (n ^ "::" ^ name) | _ -> None in
+  match user_method with
+  | Some d -> call_fn rt d (v :: args)
+  | None ->
   match (v, name, args) with
   | VStr s, "len", [] -> VInt (String.length s)
   | VStr s, "is_empty", [] -> VBool (s = "")

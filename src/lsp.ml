@@ -119,7 +119,9 @@ let fn_signature text (d : fn_decl) =
   let gens = if d.fn_gen = [] then "" else "[" ^ String.concat ", " d.fn_gen ^ "]" in
   let ps = List.map (fun p -> p.prm_name ^ ": " ^ slice text p.prm_ty.tspan) d.fn_params in
   let ret = match d.fn_ret with Some te -> " -> " ^ slice text te.tspan | None -> "" in
-  Printf.sprintf "fn %s%s(%s)%s" d.fn_name gens (String.concat ", " ps) ret
+  (* a method `Shape::area` is written `fn area(self: Shape)` *)
+  let name = match String.rindex_opt d.fn_name ':' with Some i -> String.sub d.fn_name (i + 1) (String.length d.fn_name - i - 1) | None -> d.fn_name in
+  Printf.sprintf "fn %s%s(%s)%s" name gens (String.concat ", " ps) ret
 
 let hover_items text items =
   let acc = ref [] in
@@ -341,6 +343,19 @@ let member_completions path text off =
       let methods =
         match t with
         | Types.TGroup r -> [ item 2 "go" (Printf.sprintf "go(fn() -> %s) -> ()" (show r)) ]
+        | Types.TNamed (n, _) ->
+          (* methods declared with `self: n`, in this file or another module *)
+          let pre = n ^ "::" in
+          Hashtbl.fold
+            (fun k _ acc ->
+              if String.starts_with ~prefix:pre k then begin
+                let m = String.sub k (String.length pre) (String.length k - String.length pre) in
+                let sg = match List.find_opt (fun d -> d.fn_name = k) (fns items) with Some d -> fn_signature patched d | None -> "method" in
+                item 2 m sg :: acc
+              end
+              else acc)
+            Check.method_owner []
+          @ List.map (fun (m, mk) -> item 2 m (method_sig m (mk ()))) (Check.methods t)
         | _ -> List.map (fun (m, mk) -> item 2 m (method_sig m (mk ()))) (Check.methods t)
       in
       Some (fields @ methods)
@@ -352,7 +367,7 @@ let general_completions doc off =
   | None -> kws
   | Some items ->
     let globals =
-      List.map (fun d -> item 3 d.fn_name (fn_signature doc.text d)) (List.filter (fun d -> d.fn_test = None) (fns items))
+      List.map (fun d -> item 3 d.fn_name (fn_signature doc.text d)) (List.filter (fun d -> d.fn_test = None && not (String.contains d.fn_name ':')) (fns items))
       @ List.map (fun s -> item 22 s.st_name "struct") (structs items)
       @ List.concat_map (fun e -> item 13 e.en_name "enum" :: List.map (fun (v, _, _) -> item 20 v e.en_name) e.en_variants) (enums items)
     in

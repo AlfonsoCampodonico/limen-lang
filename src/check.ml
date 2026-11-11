@@ -189,6 +189,19 @@ let visible_names ctx f =
   @ List.of_seq (Hashtbl.to_seq_keys ctx.owners)
   @ [ "panic"; "channel"; "assert"; "assert_eq" ]
 
+(* Methods by `Type::name`: whether they are `pub`, and the file (module)
+   that defines them. A private method can only be called from its own file. *)
+let method_owner : (string, bool * string) Hashtbl.t = Hashtbl.create 16
+
+(* The methods defined on user type [n], by name. *)
+let user_methods ctx n =
+  let pre = n ^ "::" in
+  Hashtbl.fold
+    (fun k _ acc ->
+      if String.starts_with ~prefix:pre k then String.sub k (String.length pre) (String.length k - String.length pre) :: acc else acc)
+    ctx.fns []
+  |> List.sort compare
+
 let instantiate s =
   let env = List.map (fun g -> (g, fresh ())) s.gen in
   (env, TFn (List.map (subst env) s.ps, subst env s.ret))
@@ -307,7 +320,7 @@ and check_expr_inner ctx f e : ty =
     (* `Enum.Variant(args)` is a constructor call, not a method call. *)
     let callee = { edesc = EField (recv, name, nsp); espan = Span.merge recv.espan nsp; ety = TErr; einst = [] } in
     check_call ctx f callee args e.espan
-  | EMethod (recv, name, nsp, args) -> check_method ctx f recv name nsp args
+  | EMethod (recv, name, nsp, args) -> check_method ctx f e recv name nsp args
   | EField (recv, name, nsp) -> check_field ctx f recv name nsp
   | EIndex (a, i) -> (
     let t = check_expr ctx f a in
@@ -399,7 +412,15 @@ and check_var ctx f e n sp =
                 "in `main`, the capabilities live on `root`, for example `root.stdout.print(\"hi\")`" ];
           TErr
         | None ->
-          did_you_mean ctx "E0101" sp (sprintf "unknown name `%s`" n) n (visible_names ctx f);
+          let owners = Hashtbl.fold (fun k _ acc -> if String.ends_with ~suffix:("::" ^ n) k then k :: acc else acc) ctx.fns [] in
+          let notes =
+            match owners with
+            | [] -> []
+            | k :: _ ->
+              let tn = String.sub k 0 (String.length k - String.length n - 2) in
+              [ sprintf "`%s` is a method of `%s`; call it on a value: `x.%s(...)`" n tn n ]
+          in
+          did_you_mean ctx ~notes "E0101" sp (sprintf "unknown name `%s`" n) n (visible_names ctx f);
           TErr)))
 
 and check_args ctx f args = List.iter (fun a -> ignore (check_expr ctx f a)) args
@@ -472,7 +493,8 @@ and check_field ctx f recv name nsp =
       match List.assoc_opt name fs with
       | Some ft -> ft
       | None ->
-        did_you_mean ctx "E0103" nsp (sprintf "struct `%s` has no field `%s`" n name) name (List.map fst fs);
+        let notes = if Hashtbl.mem ctx.fns (n ^ "::" ^ name) then [ sprintf "`%s` is a method; call it with parentheses: `.%s()`" name name ] else [] in
+        did_you_mean ctx ~notes "E0103" nsp (sprintf "struct `%s` has no field `%s`" n name) name (List.map fst fs);
         TErr)
     | TCap Root -> (
       match List.assoc_opt name root_fields with
@@ -491,7 +513,7 @@ and check_field ctx f recv name nsp =
       err ctx ~notes "E0103" nsp (sprintf "`%s` has no field `%s`" (show t) name);
       TErr)
 
-and check_method ctx f recv name nsp args =
+and check_method ctx f e recv name nsp args =
   match recv.edesc with
   | EVar g when (match lookup f g with Some (v, _) -> v.vkind = KGroup | None -> false) -> (
     let v, crossed = Option.get (lookup f g) in
@@ -507,9 +529,9 @@ and check_method ctx f recv name nsp args =
       err ctx "E0105" nsp (sprintf "a group handle only has `go`, not `%s`" name);
       check_args ctx f args;
       TErr)
-  | _ -> check_method_value ctx f recv name nsp args
+  | _ -> check_method_value ctx f e recv name nsp args
 
-and check_method_value ctx f recv name nsp args =
+and check_method_value ctx f e recv name nsp args =
   let rt = repr (check_expr ctx f recv) in
   match rt with
   | TErr -> check_args ctx f args; TErr
@@ -517,6 +539,27 @@ and check_method_value ctx f recv name nsp args =
     err ctx "E0207" recv.espan "the type of this value is not known here; add a type annotation";
     check_args ctx f args;
     TErr
+  | TNamed (n, _) when Hashtbl.mem ctx.fns (n ^ "::" ^ name) -> (
+    (* a method: `fn name(self: T, ...)`, called with the receiver first *)
+    let env, t = instantiate (Hashtbl.find ctx.fns (n ^ "::" ^ name)) in
+    e.einst <- env;
+    (match Hashtbl.find_opt method_owner (n ^ "::" ^ name) with
+     | Some (false, file) when file <> nsp.file ->
+       err ctx "E0402" nsp (sprintf "method `%s` is private to the module that defines `%s`" name n)
+         ~notes:[ sprintf "mark it `pub fn` in %s to use it here" file ]
+     | _ -> ());
+    match t with
+    | TFn (p0 :: ps, r) ->
+      unify_at ctx recv.espan p0 rt;
+      if List.length ps <> List.length args then begin
+        err ctx "E0107" nsp
+          (sprintf "method `%s` takes %d argument%s besides `self`, but %d %s supplied" name (List.length ps)
+             (plural (List.length ps)) (List.length args) (if List.length args = 1 then "was" else "were"));
+        check_args ctx f args
+      end
+      else List.iter2 (fun a p -> expect ctx f a p) args ps;
+      r
+    | _ -> check_args ctx f args; TErr)
   | _ -> (
     let ms = methods rt in
     match List.assoc_opt name ms with
@@ -527,8 +570,10 @@ and check_method_value ctx f recv name nsp args =
           [ sprintf "`%s` is a field; access it without parentheses" name ]
         | TCap Root when List.mem_assoc name root_fields ->
           [ sprintf "`%s` is a field of `Root`; write `root.%s`" name name ]
-        | TNamed _ when ms = [] ->
-          [ "user-defined types have no methods; write a function that takes the value instead" ]
+        | TNamed (n, _) when ms = [] -> (
+          match user_methods ctx n with
+          | [] -> [ sprintf "`%s` has no methods; define one as `fn %s(self: %s) { ... }`" n name n ]
+          | us -> [ sprintf "`%s` has: %s" n (String.concat ", " us) ])
         | _ -> []
       in
       let notes =
@@ -538,7 +583,7 @@ and check_method_value ctx f recv name nsp args =
       in
       did_you_mean ctx ~notes "E0105" nsp
         (sprintf "no method `%s` on type `%s`" name (show rt))
-        name (List.map fst ms);
+        name (List.map fst ms @ match rt with TNamed (n, _) -> user_methods ctx n | _ -> []);
       check_args ctx f args;
       TErr
     | Some mk ->
@@ -951,11 +996,32 @@ let check_fn ctx (d : fn_decl) (s : fsig) =
 (* True when [x] is the declaration registered under [name] (not a duplicate). *)
 let registered tbl name x = match Hashtbl.find_opt tbl name with Some y -> y == x | None -> false
 
+(* E0110: `self` is only the first parameter of a method on a struct or enum
+   declared in the program. *)
+let check_self ctx d ps =
+  List.iteri
+    (fun i p ->
+      if p.prm_name = "self" && i > 0 then
+        err ctx "E0110" p.prm_span "`self` can only be the first parameter, which makes the function a method")
+    d.fn_params;
+  match (d.fn_params, ps) with
+  | { prm_name = "self"; prm_span; _ } :: _, t0 :: _ when d.fn_test = None -> (
+    let builtin n = List.mem n [ "Option"; "Result"; "IoError" ] in
+    match t0 with
+    | TNamed (n, _) when (Hashtbl.mem ctx.structs n || Hashtbl.mem ctx.enums n) && not (builtin n) -> ()
+    | TErr -> ()
+    | t ->
+      err ctx "E0110" prm_span
+        (sprintf "methods can only be defined on struct and enum types declared in the program, not on `%s`" (show t))
+        ~notes:[ "write a plain function that takes the value instead, and rename the parameter" ])
+  | _ -> ()
+
 let check_program (user_items : item list) : Diag.t list * fn_info list =
   let ctx =
     { structs = Hashtbl.create 16; enums = Hashtbl.create 16; sfields = Hashtbl.create 16;
       variants = Hashtbl.create 16; owners = Hashtbl.create 16; fns = Hashtbl.create 16; diags = [] }
   in
+  Hashtbl.reset method_owner;
   let items = Prelude.items () @ user_items in
   let type_defined n = Hashtbl.mem ctx.structs n || Hashtbl.mem ctx.enums n || List.mem n builtin_types in
   (* 1. register type names *)
@@ -1023,6 +1089,8 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
           let ps = List.map (fun p -> resolve ctx env p.prm_ty) d.fn_params in
           let ret = match d.fn_ret with Some te -> resolve ctx env te | None -> TUnit in
           let s = { gen = d.fn_gen; ps; ret } in
+          check_self ctx d ps;
+          if String.contains d.fn_name ':' then Hashtbl.replace method_owner d.fn_name (d.fn_pub, d.fn_span.file);
           if Hashtbl.mem ctx.fns d.fn_name then
             err ctx "E0106" d.fn_span (sprintf "function `%s` is defined more than once" d.fn_name)
           else Hashtbl.replace ctx.fns d.fn_name s;

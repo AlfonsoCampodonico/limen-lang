@@ -20,7 +20,7 @@ pub struct Response {
 }
 
 // The value of a header, matching its name without regard to case.
-pub fn header(headers: List[Header], name: Str) -> Option[Str] {
+pub fn find_header(headers: List[Header], name: Str) -> Option[Str] {
     let want = name.to_lower()
     for h in headers {
         if h.name.to_lower() == want {
@@ -28,6 +28,15 @@ pub fn header(headers: List[Header], name: Str) -> Option[Str] {
         }
     }
     None
+}
+
+// A header of a request or response: `req.header("content-type")`.
+pub fn header(self: Request, name: Str) -> Option[Str] {
+    find_header(self.headers, name)
+}
+
+pub fn header(self: Response, name: Str) -> Option[Str] {
+    find_header(self.headers, name)
 }
 
 // A response with a body of plain text.
@@ -92,7 +101,7 @@ fn split_head(data: Str) -> Result[Head, IoError] {
 }
 
 fn content_length(headers: List[Header]) -> Result[Int, IoError] {
-    match header(headers, "Content-Length") {
+    match find_header(headers, "Content-Length") {
         Some(v) => match v.parse_int() {
             Some(n) => if n >= 0 { Ok(n) } else { Err(bad("negative Content-Length")) },
             None => Err(bad("bad Content-Length")),
@@ -229,11 +238,11 @@ pub fn request(net: Net, method: Str, url: Str, headers: List[Header], body: Str
         Some(n) => n,
         None => { return Err(bad("malformed status line")) },
     }
-    let chunked = header(h.headers, "Transfer-Encoding").map(|v| v.to_lower().contains("chunked")).unwrap_or(false)
+    let chunked = find_header(h.headers, "Transfer-Encoding").map(|v| v.to_lower().contains("chunked")).unwrap_or(false)
     let body = if chunked {
         dechunk(h.rest)?
     } else {
-        match header(h.headers, "Content-Length") {
+        match find_header(h.headers, "Content-Length") {
             Some(_) => h.rest.slice(0, content_length(h.headers)?),
             None => h.rest,
         }

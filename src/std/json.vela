@@ -20,11 +20,11 @@ pub fn field(key: Str, value: Value) -> Field {
     Field { key, value }
 }
 
-// ---------- reading values ----------
+// ---------- reading values (methods on Value) ----------
 
-// The value of `key` in an object (the first one, if repeated).
-pub fn get(v: Value, key: Str) -> Option[Value] {
-    match v {
+// The value of `key` in an object (the first one, if repeated): `v.get("name")`.
+pub fn get(self: Value, key: Str) -> Option[Value] {
+    match self {
         Obj(fields) => {
             for f in fields {
                 if f.key == key {
@@ -38,43 +38,43 @@ pub fn get(v: Value, key: Str) -> Option[Value] {
 }
 
 // Item `i` of an array.
-pub fn at(v: Value, i: Int) -> Option[Value] {
-    match v {
+pub fn at(self: Value, i: Int) -> Option[Value] {
+    match self {
         Arr(items) => items.get(i),
         _ => None,
     }
 }
 
-pub fn as_str(v: Value) -> Option[Str] {
-    match v {
+pub fn as_str(self: Value) -> Option[Str] {
+    match self {
         Str(s) => Some(s),
         _ => None,
     }
 }
 
-pub fn as_num(v: Value) -> Option[Float] {
-    match v {
+pub fn as_num(self: Value) -> Option[Float] {
+    match self {
         Num(x) => Some(x),
         _ => None,
     }
 }
 
-pub fn as_int(v: Value) -> Option[Int] {
-    match v {
+pub fn as_int(self: Value) -> Option[Int] {
+    match self {
         Num(x) => if x == x.to_int().to_float() { Some(x.to_int()) } else { None },
         _ => None,
     }
 }
 
-pub fn as_bool(v: Value) -> Option[Bool] {
-    match v {
+pub fn as_bool(self: Value) -> Option[Bool] {
+    match self {
         Bool(b) => Some(b),
         _ => None,
     }
 }
 
-pub fn as_list(v: Value) -> Option[List[Value]] {
-    match v {
+pub fn as_list(self: Value) -> Option[List[Value]] {
+    match self {
         Arr(items) => Some(items),
         _ => None,
     }
@@ -270,7 +270,7 @@ fn object(t: Text, i: Int) -> Result[Parsed, Str] {
             return Err(fail("`:`", j))
         }
         let v = value(t, skip(t, j + 1))?
-        let key = as_str(k.value).unwrap_or("")
+        let key = k.value.as_str().unwrap_or("")
         fields.push(Field { key, value: v.value })
         j = skip(t, v.pos)
         if j < t.bs.len() && t.bs[j] == 44 {

@@ -442,6 +442,13 @@ and bind_pat f a t (p : pat) =
 
 and lower_method f e recv name args ty =
   let rt = tyof f recv in
+  match rt with
+  | TNamed (n, _) when Hashtbl.mem f.g.fns (n ^ "::" ^ name) ->
+    (* a method on a user type: a call with the receiver first *)
+    let c = instance f.g (n ^ "::" ^ name) (List.map (fun (k, t) -> (k, zonk f.genv t)) e.einst) in
+    let xs = List.map (lower f) (recv :: args) in
+    tmp f ty (I.Call (c, xs))
+  | _ ->
   let sp = e.espan in
   let branch_init r cond then_ else_ =
     let s1, _, _ = in_block f (fun () -> emit f (I.Init (r, then_ ()))) in
