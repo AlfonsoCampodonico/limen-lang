@@ -85,7 +85,14 @@ static void w_leakcheck(void) {
 }
 
 /* A panic boundary: `catch(|| ...)`, and every task. A panic inside one
-   jumps back to it; memory the abandoned code owned is not freed. */
+   jumps back to it; memory and OS handles the abandoned code owned are not
+   freed.
+
+   Invariant for jumping out safely: the runtime only panics where no runtime
+   structure is half-updated and no lock is held. Range, division and map-key
+   checks happen before any write; channel send/close release the channel
+   lock first. A failure that cannot meet this (the deadlock detector) calls
+   w_fatal_c instead. Keep it that way when adding a w_panic_c call. */
 typedef struct WCatch { jmp_buf jb; struct WCatch *prev; char *msg; char *where; } WCatch;
 static WCatch **w_catch_slot(void); /* the current fiber's innermost boundary, or NULL outside fibers */
 
@@ -1633,7 +1640,11 @@ static inline void Group_share(WGroup *g) { (void)g; }
    then returns nothing, and send panics. Values are switched to shared
    before they enter, because the receiver may be on another thread. */
 
-typedef struct WChWait { WFiber *f; void *val; int ok; struct WChWait *next; } WChWait;
+/* A waiting task. A `select` puts one on every channel it waits on, all
+   pointing to one WSel; the first channel to act claims it (done 0 -> 1) and
+   the others then skip those waiters as stale. */
+typedef struct WSel { int done; int fired; } WSel;
+typedef struct WChWait { WFiber *f; void *val; int ok; struct WChWait *next; WSel *sel; int idx; } WChWait;
 typedef struct WChan {
   int64_t rc; pthread_mutex_t mu;
   int64_t cap, len, head; size_t esz; char *buf; int closed;
@@ -1665,12 +1676,35 @@ static void Chan_show(WBuf *b, WChan *c, bool top) { (void)c; (void)top; buf_put
 
 static void w_chq_push(WChWait **h, WChWait **t, WChWait *w) { w->next = NULL; if (*t) (*t)->next = w; else *h = w; *t = w; }
 static WChWait *w_chq_pop(WChWait **h, WChWait **t) { WChWait *w = *h; if (w) { *h = w->next; if (!*h) *t = NULL; } return w; }
+/* The next waiter that can still be woken: a plain one, or a select this
+   call manages to claim. Stale select waiters are dropped. */
+static WChWait *w_chq_pop_live(WChWait **h, WChWait **t) {
+  WChWait *w;
+  while ((w = w_chq_pop(h, t))) {
+    if (!w->sel) return w;
+    int zero = 0;
+    if (__atomic_compare_exchange_n(&w->sel->done, &zero, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+      w->sel->fired = w->idx;
+      return w;
+    }
+  }
+  return NULL;
+}
+static void w_chq_remove(WChWait **h, WChWait **t, WChWait *w) {
+  WChWait *prev = NULL;
+  for (WChWait *p = *h; p; prev = p, p = p->next)
+    if (p == w) {
+      if (prev) prev->next = p->next; else *h = p->next;
+      if (*t == p) *t = prev;
+      return;
+    }
+}
 
 static void w_chan_send(WChan *c, void *v, const char *where) {
   if (c->eshare) c->eshare(v);
   pthread_mutex_lock(&c->mu);
   if (c->closed) { pthread_mutex_unlock(&c->mu); w_panic_c("send on a closed channel", where); }
-  WChWait *r = w_chq_pop(&c->rq, &c->rq_t);
+  WChWait *r = w_chq_pop_live(&c->rq, &c->rq_t);
   if (r) {                                       /* a receiver is waiting: hand the value over */
     memcpy(r->val, v, c->esz); r->ok = 1;
     pthread_mutex_unlock(&c->mu);
@@ -1683,7 +1717,7 @@ static void w_chan_send(WChan *c, void *v, const char *where) {
     pthread_mutex_unlock(&c->mu);
     return;
   }
-  WChWait me = { w_current(), v, 0, NULL };
+  WChWait me = { w_current(), v, 0, NULL, NULL, 0 };
   w_prepare_park();
   w_chq_push(&c->sq, &c->sq_t, &me);
   pthread_mutex_unlock(&c->mu);
@@ -1696,7 +1730,7 @@ static bool w_chan_recv(WChan *c, void *out) {
   if (c->len > 0) {
     memcpy(out, c->buf + c->head * c->esz, c->esz);
     c->head = (c->head + 1) % c->cap; c->len--;
-    WChWait *s = w_chq_pop(&c->sq, &c->sq_t);
+    WChWait *s = w_chq_pop_live(&c->sq, &c->sq_t);
     if (s) {                                     /* a sender was waiting for room */
       memcpy(c->buf + ((c->head + c->len) % c->cap) * c->esz, s->val, c->esz);
       c->len++; s->ok = 1;
@@ -1708,7 +1742,7 @@ static bool w_chan_recv(WChan *c, void *out) {
     return true;
   }
   if (c->closed) { pthread_mutex_unlock(&c->mu); return false; }
-  WChWait me = { w_current(), out, 0, NULL };
+  WChWait me = { w_current(), out, 0, NULL, NULL, 0 };
   w_prepare_park();
   w_chq_push(&c->rq, &c->rq_t, &me);
   pthread_mutex_unlock(&c->mu);
@@ -1720,11 +1754,123 @@ static void w_chan_close(WChan *c, const char *where) {
   pthread_mutex_lock(&c->mu);
   if (c->closed) { pthread_mutex_unlock(&c->mu); w_panic_c("close of a closed channel", where); }
   c->closed = 1;
-  WChWait *rs = c->rq, *ss = c->sq;
-  c->rq = c->rq_t = c->sq = c->sq_t = NULL;
+  /* claim every waiter now, under the lock; wake them after it */
+  WChWait *wake = NULL, *w;
+  while ((w = w_chq_pop_live(&c->rq, &c->rq_t))) { w->ok = 0; w->next = wake; wake = w; }
+  while ((w = w_chq_pop_live(&c->sq, &c->sq_t))) { w->ok = 0; w->next = wake; wake = w; }
   pthread_mutex_unlock(&c->mu);
-  while (rs) { WChWait *n = rs->next; rs->ok = 0; w_wake(rs->f); rs = n; }
-  while (ss) { WChWait *n = ss->next; ss->ok = 0; w_wake(ss->f); ss = n; }
+  while (wake) { WChWait *n = wake->next; w_wake(wake->f); wake = n; }
+}
+
+/* ---------- select ----------
+   ops[i] is a receive (val: where to store the value) or a send (val: the
+   value). Returns the index of the operation done, with ops[i].ok set (a
+   receive: 1 if a value came, 0 if the channel is closed and empty), or -1
+   when nothing was ready and the select has a `_` arm. The first ready
+   operation in order wins. */
+typedef struct WSelOp { WChan *c; int send; void *val; int ok; int on; } WSelOp;
+
+/* Try one operation with its channel locked. Returns 1 if done; *wake gets
+   a fiber to wake after unlocking. A send on a closed channel returns -1. */
+static int w_sel_try(WSelOp *op, WFiber **wake) {
+  WChan *c = op->c;
+  if (op->send) {
+    if (c->closed) return -1;
+    WChWait *r = w_chq_pop_live(&c->rq, &c->rq_t);
+    if (r) { memcpy(r->val, op->val, c->esz); r->ok = 1; *wake = r->f; op->ok = 1; return 1; }
+    if (c->len < c->cap) {
+      memcpy(c->buf + ((c->head + c->len) % c->cap) * c->esz, op->val, c->esz);
+      c->len++; op->ok = 1;
+      return 1;
+    }
+    return 0;
+  }
+  if (c->len > 0) {
+    memcpy(op->val, c->buf + c->head * c->esz, c->esz);
+    c->head = (c->head + 1) % c->cap; c->len--;
+    WChWait *s = w_chq_pop_live(&c->sq, &c->sq_t);
+    if (s) {
+      memcpy(c->buf + ((c->head + c->len) % c->cap) * c->esz, s->val, c->esz);
+      c->len++; s->ok = 1; *wake = s->f;
+    }
+    op->ok = 1;
+    return 1;
+  }
+  if (c->closed) { op->ok = 0; return 1; }
+  return 0;
+}
+static int w_chan_cmp(const void *a, const void *b) {
+  uintptr_t x = (uintptr_t)*(WChan *const *)a, y = (uintptr_t)*(WChan *const *)b;
+  return x < y ? -1 : x > y;
+}
+/* every distinct channel of the select, locked in address order */
+static int w_sel_lock(WSelOp *ops, int n, WChan **cs) {
+  int m = 0;
+  for (int i = 0; i < n; i++) if (ops[i].on) cs[m++] = ops[i].c;
+  qsort(cs, (size_t)m, sizeof(WChan *), w_chan_cmp);
+  int k = 0;
+  for (int i = 0; i < m; i++) if (k == 0 || cs[k - 1] != cs[i]) cs[k++] = cs[i];
+  for (int i = 0; i < k; i++) pthread_mutex_lock(&cs[i]->mu);
+  return k;
+}
+static void w_sel_unlock(WChan **cs, int k) { for (int i = k - 1; i >= 0; i--) pthread_mutex_unlock(&cs[i]->mu); }
+
+static int w_select(WSelOp *ops, int n, int has_default, const char *where) {
+  int any = 0;
+  for (int i = 0; i < n; i++) if (ops[i].on) any = 1;
+  if (!any && !has_default) w_panic_c("every arm of this `select` is turned off by its guard", where);
+  for (int i = 0; i < n; i++) if (ops[i].on && ops[i].send && ops[i].c->eshare) ops[i].c->eshare(ops[i].val);
+  /* fast path: one channel at a time, in order */
+  for (int i = 0; i < n; i++) {
+    if (!ops[i].on) continue;
+    WFiber *wake = NULL;
+    pthread_mutex_lock(&ops[i].c->mu);
+    int r = w_sel_try(&ops[i], &wake);
+    pthread_mutex_unlock(&ops[i].c->mu);
+    if (r < 0) w_panic_c("send on a closed channel", where);
+    if (r) { if (wake) w_wake(wake); return i; }
+  }
+  if (has_default) return -1;
+  /* slow path: lock them all, try once more, else wait on every one */
+  WChan **cs = (WChan **)w_raw(sizeof(WChan *) * (size_t)n);
+  WChWait *ws = (WChWait *)w_raw(sizeof(WChWait) * (size_t)n);
+  int k = w_sel_lock(ops, n, cs);
+  for (int i = 0; i < n; i++) {
+    if (!ops[i].on) continue;
+    WFiber *wake = NULL;
+    int r = w_sel_try(&ops[i], &wake);
+    if (r != 0) {
+      w_sel_unlock(cs, k);
+      free(cs); free(ws);
+      if (r < 0) w_panic_c("send on a closed channel", where);
+      if (wake) w_wake(wake);
+      return i;
+    }
+  }
+  WSel sel = { 0, -1 };
+  WFiber *me = w_current();
+  w_prepare_park();
+  for (int i = 0; i < n; i++) {
+    if (!ops[i].on) continue;
+    ws[i].f = me; ws[i].val = ops[i].val; ws[i].ok = 0; ws[i].sel = &sel; ws[i].idx = i;
+    if (ops[i].send) w_chq_push(&ops[i].c->sq, &ops[i].c->sq_t, &ws[i]);
+    else w_chq_push(&ops[i].c->rq, &ops[i].c->rq_t, &ws[i]);
+  }
+  w_sel_unlock(cs, k);
+  w_park_now();
+  /* woken by the channel that claimed us; take our other waiters back */
+  k = w_sel_lock(ops, n, cs);
+  for (int i = 0; i < n; i++) {
+    if (!ops[i].on) continue;
+    if (ops[i].send) w_chq_remove(&ops[i].c->sq, &ops[i].c->sq_t, &ws[i]);
+    else w_chq_remove(&ops[i].c->rq, &ops[i].c->rq_t, &ws[i]);
+  }
+  w_sel_unlock(cs, k);
+  int i = __atomic_load_n(&sel.fired, __ATOMIC_ACQUIRE);
+  ops[i].ok = ws[i].ok;
+  free(cs); free(ws);
+  if (ops[i].send && !ops[i].ok) w_panic_c("send on a closed channel", where);
+  return i;
 }
 
 /* ---------- sockets ----------

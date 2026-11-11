@@ -50,8 +50,16 @@ and expr_desc =
   | EStruct of string * span * (string * span * expr) list
   | EGroup of string * block
   | EDyn of expr * string (* inserted by the checker: box a value as `dyn Interface` *)
+  | ESelect of sel_arm list
 
 and str_part = SPLit of string | SPExpr of expr
+
+(* `select { v = c.recv() => ..., c.send(x) => ..., _ => ... }` *)
+and sel_arm = { sop : sel_op; sguard : expr option (* `if cond`: skip the arm when false *); sbody : expr; sspan_ : span }
+and sel_op =
+  | SelRecv of (string * span) option * expr (* binding (None: `_ =` or no binding), channel *)
+  | SelSend of expr * expr (* channel, value *)
+  | SelDefault
 and arm = { apat : pat; abody : expr }
 and block = { stmts : stmt list; tail : expr option; bspan : span }
 and stmt = { sdesc : stmt_desc; sspan : span }

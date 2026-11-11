@@ -421,6 +421,7 @@ and check_expr_inner ctx f e : ty =
         TErr)
     | Some x -> expect ctx f x tt; tt)
   | EMatch (s, arms) -> check_match ctx f s arms e.espan
+  | ESelect arms -> check_select ctx f arms e.espan
   | EBlock b -> check_block ctx f b
   | EClosure (ps, body) -> check_closure ctx f ps body None
   | EStruct (name, nsp, fields) -> check_struct_lit ctx f name nsp fields e.espan
@@ -1120,6 +1121,38 @@ and exhaustive ctx (rows : pat list list) (tys : ty list) : bool =
         (Hashtbl.find ctx.variants n)
     | TErr | TVar _ -> true
     | _ -> default ())
+
+and check_select ctx f arms sp =
+  let defaults = List.filter (fun a -> a.sop = SelDefault) arms in
+  if List.length defaults > 1 then err ctx "E0106" sp "`select` has more than one `_` arm";
+  List.iter
+    (fun a -> if a.sop = SelDefault && a.sguard <> None then err ctx "E0003" a.sspan_ "the `_` arm of a `select` cannot have a guard")
+    arms;
+  if List.length defaults = List.length arms then
+    err ctx "E0003" sp "`select` needs at least one channel arm: `v = ch.recv() => ...` or `ch.send(x) => ...`";
+  let rt = fresh () in
+  let chan_el ch =
+    let ct = check_expr ctx f ch in
+    match repr ct with
+    | TChan el -> el
+    | TErr -> TErr
+    | TVar _ -> let el = fresh () in unify_at ctx ch.espan (TChan el) ct; el
+    | t -> err ctx "E0201" ch.espan (sprintf "`select` works on channels, found `%s`" (show t)); TErr
+  in
+  List.iter
+    (fun a ->
+      Option.iter (fun g -> expect ctx f g TBool) a.sguard;
+      push f;
+      (match a.sop with
+       | SelRecv (b, ch) ->
+         let el = chan_el ch in
+         Option.iter (fun (n, nsp) -> bind f n { vty = opt el; vmut = false; vspan = nsp; vkind = KPat }) b
+       | SelSend (ch, v) -> let el = chan_el ch in expect ctx f v el
+       | SelDefault -> ());
+      expect ctx f a.sbody rt;
+      pop f)
+    arms;
+  rt
 
 and check_block ctx f b =
   push f;

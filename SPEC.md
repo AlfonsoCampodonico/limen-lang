@@ -435,6 +435,33 @@ let total = group g {
 - `c.close()` closes it; closing twice panics.
 - A channel is shared, not copied: tasks that capture the same channel talk through it.
 
+### select
+
+`select` waits on several channel operations and runs the arm of the one that happens:
+
+```
+while nums_open || words_open {
+    select {
+        n = nums.recv() if nums_open => match n {
+            Some(x) => { total = total + x },
+            None => { nums_open = false },      // nums is closed and empty
+        },
+        w = words.recv() if words_open => match w {
+            Some(s) => { letters = letters + s },
+            None => { words_open = false },
+        },
+        results.send(total) => (),
+        _ => (),                                 // optional: do not wait
+    }
+}
+```
+
+- An arm is `name = ch.recv()` (the name gets `Option[T]`; `None` means closed and empty), `ch.send(value)`, or `_`. Like `match`, `select` is an expression and every arm has the same type.
+- All channels, values and guards are evaluated first, in order. Then the first ready operation in the order written runs, so list the channel you want served first first. With no ready operation, `_` runs if there is one; otherwise `select` waits until one is ready.
+- A closed channel is always ready to receive (`None`), so turn its arm off with a guard: `if cond` after the operation skips the arm when `cond` is false. If every arm is off and there is no `_`, `select` panics instead of waiting forever.
+- A send arm that is not chosen sends nothing. A send arm on a closed channel panics, as `send` does.
+- There are no timeouts yet.
+
 ### Sockets
 
 ```
@@ -836,4 +863,4 @@ The handler is a plain function value, so it gets no capability unless a closure
 
 ## 20. Not yet
 
-Unbuffered (capacity 0) channels, `select` over several channels, TLS, SQL, a package registry, and a Cranelift backend. See the design doc's Known gaps for the full list.
+Unbuffered (capacity 0) channels, timeouts in `select`, TLS, SQL, a package registry, and a Cranelift backend. See the design doc's Known gaps for the full list.

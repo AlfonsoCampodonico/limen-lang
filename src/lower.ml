@@ -282,6 +282,7 @@ let rec lower f (e : expr) : I.atom =
       if d1 && d2 then f.dead <- true;
       I.V r
     | EMatch (s, arms) -> lower_match f e s arms ty
+    | ESelect arms -> lower_select f e arms ty
     | EBlock b -> lower_block f b
     | EClosure (ps, body) -> lower_closure f ps body ty
     | EStruct (name, _, fields) ->
@@ -463,6 +464,66 @@ and lower_match f e s arms ty =
       end
   in
   chain arms;
+  I.V r
+
+and lower_select f e arms ty =
+  f.g.counter <- f.g.counter + 1;
+  let id = f.g.counter in
+  (* channels and send values first, in order *)
+  let ops =
+    List.filter_map
+      (fun a ->
+        let on = match a.sguard with Some g -> lower f g | None -> I.ABool true in
+        match a.sop with
+        | SelRecv (_, ch) ->
+          let el = match tyof f ch with TChan t -> t | _ -> TUnit in
+          Some (I.SRecv (lower f ch, el, on))
+        | SelSend (ch, v) ->
+          let el = match tyof f ch with TChan t -> t | _ -> TUnit in
+          let ca = lower f ch in
+          Some (I.SSend (ca, lower f v, el, on))
+        | SelDefault -> None)
+      arms
+  in
+  let has_default = List.exists (fun a -> a.sop = SelDefault) arms in
+  let k = tmp f TInt (I.Select (id, ops, has_default, e.espan)) in
+  let r = fresh_var "s" ty in
+  emit f (I.Decl r);
+  (* number the channel arms; `_` is -1 *)
+  let numbered =
+    let n = ref 0 in
+    List.map (fun a -> if a.sop = SelDefault then (-1, a) else (let i = !n in incr n; (i, a))) arms
+  in
+  let rec chain = function
+    | [] -> ()
+    | (i, a) :: rest ->
+      let body () =
+        (match a.sop with
+         | SelRecv (b, ch) ->
+           (* always take the value out, so an unnamed one is released *)
+           let el = match tyof f ch with TChan t -> t | _ -> TUnit in
+           let ot = TNamed ("Option", [ el ]) in
+           let v = fresh_var (match b with Some (n, _) -> n | None -> "got") ot in
+           emit f (I.Let (v, I.SelGot (id, i, ot)));
+           Option.iter (fun (name, _) -> bind f name v) b
+         | _ -> ());
+        let x = lower f a.sbody in
+        emit f (I.Init (r, I.Atom x))
+      in
+      if rest = [] then begin
+        let b, _, d = in_block f body in
+        List.iter (emit f) b;
+        if d then f.dead <- true
+      end
+      else begin
+        let t = tmp f TBool (I.Bin (Eq, TInt, k, I.AInt (Int64.of_int i), e.espan)) in
+        let b1, _, d1 = in_block f body in
+        let b2, _, d2 = in_block f (fun () -> chain rest) in
+        emit f (I.If (t, b1, b2));
+        if d1 && d2 then f.dead <- true
+      end
+  in
+  chain numbered;
   I.V r
 
 and bind_pat f a t (p : pat) =

@@ -88,6 +88,13 @@ let rec walk_expr (f : expr -> unit) e =
   | EClosure (_, body) -> w body
   | EStruct (_, _, fs) -> List.iter (fun (_, _, x) -> w x) fs
   | EDyn (x, _) -> w x
+  | ESelect arms ->
+    List.iter
+      (fun a ->
+        (match a.sop with SelRecv (_, c) -> w c | SelSend (c, v) -> w c; w v | SelDefault -> ());
+        Option.iter w a.sguard;
+        w a.sbody)
+      arms
 
 and walk_block f b =
   List.iter
@@ -272,6 +279,15 @@ let definitions items =
           x v)
         fs
     | EDyn (y, _) -> x y
+    | ESelect arms ->
+      List.iter
+        (fun a ->
+          Option.iter x a.sguard;
+          match a.sop with
+          | SelRecv (b, c) -> x c; expr (match b with Some (n, sp) -> (n, sp) :: env | None -> env) a.sbody
+          | SelSend (c, v) -> x c; x v; x a.sbody
+          | SelDefault -> x a.sbody)
+        arms
   and block env b =
     let env =
       List.fold_left

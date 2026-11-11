@@ -532,6 +532,49 @@ let rec eval rt env e : value =
         if pmatch a.apat v binds then eval rt (binds :: env) a.abody else go rest
     in
     go arms
+  | ESelect arms ->
+    (* evaluate every channel and value first, in order; then run the first
+       ready arm, or `_`, or wait until one is ready *)
+    let ops =
+      List.map
+        (fun a ->
+          let on = match a.sguard with Some g -> as_bool (eval rt env g) | None -> true in
+          match a.sop with
+          | SelRecv (b, ch) -> let c = eval rt env ch in if on then `Recv (b, c) else `Off
+          | SelSend (ch, v) ->
+            let c = eval rt env ch in
+            let x = eval rt env v in
+            if on then `Send (c, x) else `Off
+          | SelDefault -> `Default)
+        arms
+    in
+    if (not (List.exists (function `Recv _ | `Send _ | `Default -> true | `Off -> false) ops)) then
+      raise (Panic ("every arm of this `select` is turned off by its guard", e.espan));
+    let ready = function
+      | `Recv (_, VChan ch) -> ch.closed || not (Queue.is_empty ch.q)
+      | `Send (VChan ch, _) -> ch.closed || Queue.length ch.q < ch.cap
+      | _ -> false
+    in
+    let rec first i = function [] -> None | op :: rest -> if ready op then Some i else first (i + 1) rest in
+    let default = List.find_index (fun op -> op = `Default) ops in
+    let i =
+      match (first 0 ops, default) with
+      | Some i, _ -> i
+      | None, Some d -> d
+      | None, None ->
+        wait_until (fun () -> first 0 ops <> None);
+        Option.get (first 0 ops)
+    in
+    let binds = Hashtbl.create 1 in
+    (match List.nth ops i with
+     | `Recv (b, VChan ch) ->
+       let v = if Queue.is_empty ch.q then none else some (Queue.pop ch.q) in
+       Option.iter (fun (n, _) -> Hashtbl.replace binds n (ref v)) b
+     | `Send (VChan ch, x) ->
+       if ch.closed then raise (Panic ("send on a closed channel", e.espan));
+       Queue.push x ch.q
+     | _ -> ());
+    eval rt (binds :: env) (List.nth arms i).sbody
   | EBlock b -> eval_block rt env b
   | EClosure (ps, body) -> VClosure (List.map (fun (n, _, _) -> n) ps, body, [ snapshot env ])
   | EStruct (name, _, fields) ->

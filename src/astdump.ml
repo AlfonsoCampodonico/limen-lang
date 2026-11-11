@@ -48,6 +48,19 @@ let rec expr e =
   | EStruct (n, _, fs) -> n ^ "{" ^ String.concat "," (List.map (fun (f, _, x) -> f ^ ":" ^ expr x) fs) ^ "}"
   | EGroup (n, b) -> "group " ^ n ^ block b
   | EDyn (x, _) -> expr x
+  | ESelect arms ->
+    "select{"
+    ^ String.concat ";"
+        (List.map
+           (fun a ->
+             (match a.sop with
+              | SelRecv (b, c) -> (match b with Some (n, _) -> n | None -> "_") ^ "=" ^ expr c ^ ".recv()"
+              | SelSend (c, v) -> expr c ^ ".send(" ^ expr v ^ ")"
+              | SelDefault -> "_")
+             ^ (match a.sguard with Some g -> " if " ^ expr g | None -> "")
+             ^ "=>" ^ expr a.sbody)
+           arms)
+    ^ "}"
 
 and block b =
   "{" ^ String.concat ";" (List.map stmt b.stmts) ^ (match b.tail with Some e -> "|tail " ^ expr e | None -> "") ^ "}"

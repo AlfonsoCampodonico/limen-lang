@@ -111,6 +111,18 @@ let rewrite_rhs r ~live_after ~owned =
   | ChanSend (ch, v, sp) ->
     let xs, o = c [ v ] in
     (ChanSend (ch, List.hd xs, sp), o)
+  | Select (id, ops, d, sp) ->
+    let sends = List.filter_map (function SSend (_, v, _, _) -> Some v | SRecv _ -> None) ops in
+    let xs, o = c sends in
+    let rest = ref xs in
+    let ops =
+      List.map
+        (function
+          | SSend (ch, _, t, g) -> ( match !rest with x :: r -> rest := r; SSend (ch, x, t, g) | [] -> failwith "select atoms")
+          | op -> op)
+        ops
+    in
+    (Select (id, ops, d, sp), o)
   | MkDyn (t, i, v, ms) ->
     let xs, o = c [ v ] in
     (MkDyn (t, i, List.hd xs, ms), o)

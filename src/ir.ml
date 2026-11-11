@@ -48,8 +48,16 @@ type rhs =
       (* box a value of a concrete type as `dyn I` (consumed); one entry per
          interface method: the C function implementing it, its parameter
          types after self, and its result type *)
+  | Select of int * sel_op list * bool * Span.t
+      (* select number, operations, has a `_` arm; result: the index of the
+         operation done, or -1 for `_`. Channels borrowed, send values consumed. *)
+  | SelGot of int * int * ty (* the Option a receive in select [n], operation [i], produced *)
   | Catch of atom * ty (* call a closure (borrowed) under a panic boundary; ty is its result type *)
   | CallDyn of int * ty list * ty * atom * atom list (* method index, params, result, receiver (borrowed), args (consumed) *)
+
+and sel_op =
+  | SRecv of atom * ty * atom (* channel, element type, enabled (its guard) *)
+  | SSend of atom * atom * ty * atom (* channel, value, element type, enabled *)
 
 and ipart = IStr of string | IVal of atom * ty | IValQ of atom * ty (* printed as inside a container *)
 
@@ -94,6 +102,7 @@ let consumed = function
   | Spawn (_, c, _) -> [ c ]
   | ChanSend (_, v, _) -> [ v ]
   | MkDyn (_, _, a, _) -> [ a ]
+  | Select (_, ops, _, _) -> List.filter_map (function SSend (_, v, _, _) -> Some v | SRecv _ -> None) ops
   | CallDyn (_, _, _, _, args) -> args
   | _ -> []
 
@@ -102,6 +111,8 @@ let borrowed = function
   | CallClo (c, _) -> [ c ]
   | CallDyn (_, _, _, r, _) -> [ r ]
   | Catch (c, _) -> [ c ]
+  | Select (_, ops, _, _) -> List.concat_map (function SSend (c, _, _, g) | SRecv (c, _, g) -> [ c; g ]) ops
+  | SelGot _ -> []
   | MkDyn _ -> []
   | Bin (_, _, a, b, _) -> [ a; b ]
   | Neg (_, a) | Not a -> [ a ]

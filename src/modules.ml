@@ -233,6 +233,18 @@ let rec expr env locals (e : expr) : expr =
       EStruct (n, sp, List.map (fun (f, fsp, x) -> (f, fsp, ex x)) fields)
     | EGroup (g, b) -> EGroup (g, block env (g :: locals) b)
     | EDyn (x, i) -> EDyn (ex x, i)
+    | ESelect arms ->
+      ESelect
+        (List.map
+           (fun a ->
+             let a = { a with sguard = Option.map ex a.sguard } in
+             match a.sop with
+             | SelRecv (b, c) ->
+               let locals' = match b with Some (n, _) -> n :: locals | None -> locals in
+               { a with sop = SelRecv (b, ex c); sbody = expr env locals' a.sbody }
+             | SelSend (c, v) -> { a with sop = SelSend (ex c, ex v); sbody = ex a.sbody }
+             | SelDefault -> { a with sbody = ex a.sbody })
+           arms)
   in
   { e with edesc = d }
 

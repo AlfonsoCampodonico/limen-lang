@@ -243,6 +243,34 @@ and expr_inner c ind e =
     ignore (leading c (ind + 4) ~prev:!prev (e.espan.hi - 1));
     new_line c ind;
     add c "}"
+  | ESelect arms ->
+    add c "select {";
+    let prev = ref (-1) in
+    List.iter
+      (fun a ->
+        ignore (leading c (ind + 4) ~prev:!prev a.sspan_.lo);
+        new_line c (ind + 4);
+        (match a.sop with
+         | SelRecv (b, ch) ->
+           (match b with Some (n, _) -> add c (n ^ " = ") | None -> ());
+           expr c (ind + 4) ch;
+           add c ".recv()"
+         | SelSend (ch, v) ->
+           expr c (ind + 4) ch;
+           add c ".send(";
+           expr c (ind + 4) v;
+           add c ")"
+         | SelDefault -> add c "_");
+        (match a.sguard with Some g -> add c " if "; expr c (ind + 4) g | None -> ());
+        add c " => ";
+        expr c (ind + 4) a.sbody;
+        add c ",";
+        trailing c a.sbody.espan.hi;
+        prev := a.sbody.espan.hi)
+      arms;
+    ignore (leading c (ind + 4) ~prev:!prev (e.espan.hi - 1));
+    new_line c ind;
+    add c "}"
   | EClosure (ps, body) ->
     if ps = [] then add c "||"
     else

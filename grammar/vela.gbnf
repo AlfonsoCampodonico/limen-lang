@@ -63,11 +63,13 @@ postfix ::= primary suffix*
 suffix  ::= sp "(" ws args? ws ")" | sp "[" ws expr ws "]" | ws "." sp ident | "." [0-9]+ | sp "?"
 args    ::= expr (isep expr)* (ws ",")?
 
-primary ::= float | int | string | ident | structlit | "(" ws ")" | "(" ws expr ws ")" | "(" ws expr (isep expr)+ (ws ",")? ws ")" | "[" ws args? ws "]" | block | if | match | closure | group
+primary ::= float | int | string | ident | structlit | "(" ws ")" | "(" ws expr ws ")" | "(" ws expr (isep expr)+ (ws ",")? ws ")" | "[" ws args? ws "]" | block | if | match | select | closure | group
 structlit ::= (ident ".")? upper sp "{" ws (init (isep init)* (ws ",")?)? ws "}"
 init      ::= ident (sp ":" ws expr)?
 if        ::= "if" sp1 expr sp block (ws "else" (sp block | sp1 if))?
 match     ::= "match" sp1 expr sp "{" ws (arm (isep arm)* (ws ",")?)? ws "}"
+select    ::= "select" sp "{" ws (selarm (isep selarm)* (ws ",")?)? ws "}"
+selarm    ::= (ident sp "=" ws expr | expr) (sp1 "if" sp1 expr)? sp "=>" ws expr
 arm       ::= pattern sp "=>" ws expr
 closure   ::= "|" ws (cparam (isep cparam)* ws)? "|" ws expr | "||" ws expr
 cparam    ::= ident (sp ":" sp type)?

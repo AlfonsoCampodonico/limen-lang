@@ -251,6 +251,7 @@ and parse_primary st ns =
     mk (EBlock b) b.bspan
   | KW "if" -> parse_if st
   | KW "match" -> parse_match st
+  | KW "select" -> parse_select st
   | SYM "|" ->
     ignore (advance st);
     let params =
@@ -320,6 +321,43 @@ and parse_match st =
       fail (peek st) "`,` or a new line between match arms"
   done;
   mk (EMatch (s, List.rev !arms)) (merge t.span (last_span st))
+
+and parse_select st =
+  let t = expect_kw st "select" in
+  ignore (expect_sym st "{");
+  let arms = ref [] in
+  while not (accept_sym st "}") do
+    let a = peek st in
+    let op =
+      match (a.tok, (peek2 st).tok) with
+      | IDENT "_", SYM "=>" -> ignore (advance st); SelDefault
+      | IDENT n, SYM "=" ->
+        (* `v = ch.recv()` *)
+        ignore (advance st);
+        ignore (advance st);
+        let e = parse_expr st in
+        (match e.edesc with
+         | EMethod (ch, "recv", _, []) -> SelRecv ((if n = "_" then None else Some (n, a.span)), ch)
+         | _ -> raise (Diag.Fatal (Diag.make "E0003" e.espan "a `select` arm receives with `name = ch.recv()`")))
+      | _ -> (
+        let e = parse_expr st in
+        match e.edesc with
+        | EMethod (ch, "recv", _, []) -> SelRecv (None, ch)
+        | EMethod (ch, "send", _, [ v ]) -> SelSend (ch, v)
+        | _ ->
+          raise
+            (Diag.Fatal
+               (Diag.make "E0003" e.espan
+                  "a `select` arm is `name = ch.recv()`, `ch.send(value)` or `_` (when nothing is ready)")))
+    in
+    let guard = if is_kw st "if" then (ignore (advance st); Some (parse_expr st)) else None in
+    ignore (expect_sym st "=>");
+    let body = parse_expr st in
+    arms := { sop = op; sguard = guard; sbody = body; sspan_ = merge a.span body.espan } :: !arms;
+    if (not (accept_sym st ",")) && (not (is_sym st "}")) && not (peek st).nl then
+      fail (peek st) "`,` or a new line between select arms"
+  done;
+  mk (ESelect (List.rev !arms)) (merge t.span (last_span st))
 
 and parse_pat st =
   let t = peek st in

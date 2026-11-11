@@ -246,6 +246,29 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     line (sprintf "  d_->base.rc = 1; d_->base.vt = (const WVt*)&Dyn_%s_vt; d_->val = %s;" key (a x));
     line (sprintf "  %s = (WDyn*)d_;" dst);
     line "}"
+  | I.Select (id, ops, has_default, sp) ->
+    let n = List.length ops in
+    line (sprintf "WSelOp sel%d_ops[%d];" id n);
+    List.iteri
+      (fun i op ->
+        match op with
+        | I.SRecv (ch, el, on) ->
+          line (sprintf "%s sel%d_v%d;" (ctype c el) id i);
+          line (sprintf "sel%d_ops[%d] = (WSelOp){ %s, 0, &sel%d_v%d, 0, %s };" id i (a ch) id i (a on))
+        | I.SSend (ch, v, el, on) ->
+          line (sprintf "%s sel%d_s%d = %s;" (ctype c el) id i (a v));
+          line (sprintf "sel%d_ops[%d] = (WSelOp){ %s, 1, &sel%d_s%d, 0, %s };" id i (a ch) id i (a on)))
+      ops;
+    set (sprintf "w_select(sel%d_ops, %d, %d, %s)" id n (if has_default then 1 else 0) (where sp));
+    (* a value that was not sent is still ours *)
+    List.iteri
+      (fun i op ->
+        match op with
+        | I.SSend (_, _, el, _) when not (is_scalar el) -> line (sprintf "if (%s != %d) %s_drop(sel%d_s%d);" dst i (cname c el) id i)
+        | _ -> ())
+      ops
+  | I.SelGot (id, i, ot) ->
+    set (sprintf "(sel%d_ops[%d].ok ? %s : %s)" id i (mk_enum c ot 0 [ sprintf "sel%d_v%d" id i ]) (mk_enum c ot 1 []))
   | I.Catch (clo, rt) ->
     (* run the closure under a panic boundary: Ok(value), or Err(message) *)
     let fv = match clo with I.V v | I.VDup v -> var v | _ -> failwith "catch closure" in
