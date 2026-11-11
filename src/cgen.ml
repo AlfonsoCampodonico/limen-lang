@@ -519,7 +519,13 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
         (sprintf "Cap_exec_run(%s, %s, %s)" (arg 0) (arg 1) (arg 2))
         (sprintf "({ WProc *p_ = (WProc*)r_.ptr; %s v_ = { p_->code, p_->out, p_->err }; free(p_); v_; })" (ctype c po))
     | "cap_only", _ -> set (sprintf "Cap_net_only(%s, %s)" (arg 0) (arg 1))
-    | "cap_get", _ -> io_result (sprintf "Cap_net_get(%s, %s)" (arg 0) (arg 1)) "r_.val"
+    | "cap_get", _ ->
+      let ht = TNamed ("HttpResponse", []) and mt = TMap (TStr, TStr) in
+      io_result
+        (sprintf "Cap_net_get(%s, %s)" (arg 0) (arg 1))
+        (sprintf
+           "({ WHttp *h_ = (WHttp*)r_.ptr; %s* m_ = %s_new(); for (int i_ = 0; i_ < h_->n; i_++) %s_put(&m_, h_->names[i_], h_->values[i_]); %s v_ = { h_->status, m_, h_->body }; free(h_->names); free(h_->values); free(h_); v_; })"
+           (cname c mt) (cname c mt) (cname c mt) (ctype c ht))
     | "cap_under", _ -> set (sprintf "Cap_fs_under(%s, %s)" (arg 0) (arg 1))
     | "cap_read_only", _ -> set (sprintf "Cap_fs_read_only(%s)" (arg 0))
     | "cap_read", TCap Conn -> io_result (sprintf "Cap_conn_read(%s)" (arg 0)) "r_.val"

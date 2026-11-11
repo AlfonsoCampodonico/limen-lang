@@ -3,6 +3,9 @@
 //
 //   vela run examples/repos.vela --grant net=api.github.com
 //   vela caps examples/repos.vela
+//
+// Net.get has no TLS yet, so against GitHub (https only) this stops with
+// `error: Failed("https is not supported yet ...")`.
 
 fn main(root: Root) -> Result[(), IoError] {
     let gh = root.net.only("api.github.com:443")
@@ -15,8 +18,11 @@ fn main(root: Root) -> Result[(), IoError] {
 }
 
 fn fetch_repos(net: Net, org: Str) -> Result[List[Str], IoError] {
-    let body = net.get("https://api.github.com/orgs/{org}/repos?per_page=100")?
-    Ok(parse_names(body))
+    let resp = net.get("https://api.github.com/orgs/{org}/repos?per_page=100")?
+    if resp.status != 200 {
+        return Err(Failed("GitHub answered {resp.status}"))
+    }
+    Ok(parse_names(resp.body))
 }
 
 // No capability parameters: this function cannot do I/O.

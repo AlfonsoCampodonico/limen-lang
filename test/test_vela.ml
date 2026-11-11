@@ -874,6 +874,75 @@ fn client(net: Net, port: Int, k: Int) -> Int {
         }
     }|})
     "failed: URL host may only contain letters, digits, `.` and `-`\nfailed: URL host may only contain letters, digits, `.` and `-`\nfailed: URL host may only contain letters, digits, `.` and `-`\nfailed: bad port in URL\nfailed: bad port in URL\nfailed: URL host may only contain letters, digits, `.` and `-`\nfailed: URL contains spaces or non-ASCII characters\ndenied: net: evil.example:443 is not granted\n";
+  (* Net.get speaks HTTP/1.1 itself: a server task answers with canned responses *)
+  let http_src = {|fn serve(l: Listener, replies: List[Str]) -> Int {
+    let mut n = 0
+    for r in replies {
+        match l.accept() {
+            Ok(c) => {
+                let mut req = ""
+                while !req.contains("\r\n\r\n") {
+                    let chunk = c.read() ?? ""
+                    if chunk == "" {
+                        break
+                    }
+                    req = req + chunk
+                }
+                let reply = if r == "echo" { "HTTP/1.1 200 OK\r\nContent-Length: {req.len()}\r\n\r\n{req}" } else { r }
+                if c.write(reply).is_ok() {
+                    n = n + 1
+                }
+                c.close()
+            },
+            Err(_) => (),
+        }
+    }
+    n
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let out = root.stdout
+    let l = root.listen.on("127.0.0.1:0")?
+    let port = l.port()
+    let net = root.net.only("127.0.0.1")
+    let replies = [
+        "echo",
+        "echo",
+        "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nX-A: 1\r\nx-a:  2 \r\nContent-Length: 5\r\n\r\nnope!extra",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: Chunked\r\n\r\n4;ext=1\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n",
+        "HTTP/1.0 301 Moved\r\nLocation: http://elsewhere/\r\n\r\nuntil close",
+        "garbage",
+        "HTTP/1.1 200 OK\r\nContent-Length: 50\r\n\r\nshort",
+        "HTTP/1.1 200 OK\r\nbad header\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n",
+    ]
+    let paths = ["/a/b?x=1#frag", "?q", "/", "/", "/", "/", "/", "/", "/"]
+    let served = group g {
+        g.go(|| serve(l, replies))
+        g.go(|| {
+            for p in paths {
+                match net.get("http://127.0.0.1:{port}" + p) {
+                    Ok(r) => {
+                        let first = r.body.lines().first() ?? ""
+                        out.print("{r.status} {r.headers.keys()} {r.headers.get("x-a")} {first}")
+                    },
+                    Err(e) => out.print("{e}"),
+                }
+            }
+            0
+        })
+    }
+    out.print("{served}")
+    out.print("{net.get("https://127.0.0.1:{port}/")}")
+    Ok(())
+}
+|} in
+  let http_want =
+    "200 [\"content-length\"] None GET /a/b?x=1 HTTP/1.1\n200 [\"content-length\"] None GET /?q HTTP/1.1\n404 [\"content-type\", \"x-a\", \"content-length\"] Some(\"1, 2\") nope!\n200 [\"transfer-encoding\"] None Wikipedia\n301 [\"location\"] None until close\nFailed(\"http: incomplete response headers\")\nFailed(\"http: truncated body\")\nFailed(\"http: malformed header line\")\nFailed(\"http: bad chunk size\")\n[9, 0]\nErr(Failed(\"https is not supported yet (vela has no TLS); use an http:// URL\"))\n"
+  in
+  let http_grants = { Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] } in
+  out "net-get-http" ~grants:http_grants http_src http_want;
+  check_tsan "net-get-http" ~grants:http_grants http_src http_want;
   let dir = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "vela-test-%d" (Unix.getpid ())) in
   (try Unix.mkdir dir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
   (try Unix.mkdir (Filename.concat dir "sub") 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
@@ -1072,10 +1141,13 @@ test "fails with a dir" (fs: Fs) {
     [ ("saves a file", None); ("each test starts empty", None); ("clock only", None);
       ("fails with a dir", Some "assertion failed: Ok([\"x\"]) != Ok([])") ]
   in
-  let before = Array.length (Sys.readdir (Filename.get_temp_dir_name ())) in
+  let test_dirs () =
+    List.filter (String.starts_with ~prefix:"vela-test-") (Array.to_list (Sys.readdir (Filename.get_temp_dir_name ())))
+  in
+  let before = test_dirs () in
   let got = List.map (fun (n, r) -> (n, match r with Ok () -> None | Error (m, _) -> Some m)) (Interp.run_tests ~out:ignore items) in
   ok "vela-test-caps-interp" (got = want) (String.concat "; " (List.map (fun (n, m) -> n ^ "=" ^ Option.value ~default:"ok" m) got));
-  ok "vela-test-caps-cleanup" (Array.length (Sys.readdir (Filename.get_temp_dir_name ())) = before) "test directories left behind";
+  ok "vela-test-caps-cleanup" (List.for_all (fun d -> List.mem d before) (test_dirs ())) "test directories left behind";
   if native_for "vela-test-caps" then begin
     let exe = Filename.concat tmpdir "vela-test-caps" in
     match Native.build ~flags:sanitize ~tests:true items exe with
@@ -1403,7 +1475,7 @@ fn main(root: Root) {
   List.iter (fun d -> try Unix.mkdir d 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ())
     [ pdir; Filename.concat pdir "app"; Filename.concat pdir "fetch" ];
   let put f s = Out_channel.with_open_bin (Filename.concat pdir f) (fun oc -> output_string oc s) in
-  put "fetch/fetch.vela" "use util\n\npub fn get(net: Net, u: Str) -> Str {\n    util.first(net.get(u) ?? \"none\")\n}\n";
+  put "fetch/fetch.vela" "use util\n\npub fn get(net: Net, u: Str) -> Str {\n    match net.get(u) {\n        Ok(r) => util.first(r.body),\n        Err(_) => \"none\",\n    }\n}\n";
   put "fetch/util.vela" "pub fn first(s: Str) -> Str {\n    s.lines().first() ?? \"\"\n}\n\npub fn sneaky(fs: Fs) -> Bool {\n    fs.exists(\"x\")\n}\n";
   let app = "use fetch\n\nfn main(root: Root) {\n    root.stdout.print(fetch.get(root.net, \"http://h\"))\n}\n" in
   put "app/main.vela" app;

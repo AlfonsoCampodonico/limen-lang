@@ -441,6 +441,37 @@ module Sock = struct
       sk.shut <- true;
       try Unix.close sk.fd with Unix.Unix_error _ -> ()
     end
+
+  (* Net.get: one plain HTTP/1.1 GET over a socket, read until the server
+     closes. Redirects are returned, not followed. *)
+  let http_get allowed url =
+    match Caps.parse_url url with
+    | Error m -> Error (Caps.Failed m)
+    | Ok u ->
+      if not (Caps.permits allowed ~host:u.host ~port:u.port) then
+        Error (Caps.Denied (Printf.sprintf "net: %s:%d is not granted" u.host u.port))
+      else if u.https then Error (Caps.Failed "https is not supported yet (vela has no TLS); use an http:// URL")
+      else
+        match connect allowed (Printf.sprintf "%s:%d" u.host u.port) with
+        | Error e -> Error e
+        | Ok sk ->
+          let result =
+            match write sk (Caps.http_request u) with
+            | Error e -> Error e
+            | Ok () ->
+              let b = Buffer.create 4096 in
+              let rec go () =
+                match read sk with
+                | Error e -> Error e
+                | Ok "" -> Caps.parse_http (Buffer.contents b)
+                | Ok s ->
+                  Buffer.add_string b s;
+                  if Buffer.length b > Caps.max_response then Error (Caps.Failed "net: the response is larger than 64 MiB") else go ()
+              in
+              go ()
+          in
+          close sk;
+          result
 end
 
 (* ---------- processes ----------
@@ -918,7 +949,12 @@ and cap_call rt c name args =
   | CFs fs, "make_dir", [ VStr p ] -> io_result (fun () -> VUnit) (Caps.make_dir fs p)
   | CFs fs, "is_dir", [ VStr p ] -> VBool (Caps.is_dir fs p)
   | CNet allowed, "only", [ VStr h ] -> VCap (CNet (Caps.attenuate allowed h))
-  | CNet allowed, "get", [ VStr url ] -> io_result (fun s -> VStr s) (Caps.net_get allowed url)
+  | CNet allowed, "get", [ VStr url ] ->
+    io_result
+      (fun (status, hs, body) ->
+        let headers = List.fold_left (fun m (k, v) -> map_put m (VStr k) (VStr v)) empty_map hs in
+        VStruct ("HttpResponse", [ ("status", vint status); ("headers", VMap headers); ("body", VStr body) ]))
+      (Sock.http_get allowed url)
   | CFs fs, "under", [ VStr p ] -> VCap (CFs (Caps.under fs p))
   | CFs fs, "read_only", [] -> VCap (CFs { fs with ro = true })
   | CFs fs, "read", [ VStr p ] -> io_result (fun s -> VStr s) (Caps.read fs p)

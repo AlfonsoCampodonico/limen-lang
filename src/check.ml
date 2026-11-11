@@ -295,7 +295,7 @@ let methods (t : ty) : (string * (unit -> ty list * ty)) list =
   | TNamed ("Result", [ a; e ]) ->
     [ m "is_ok" [] TBool; m "is_err" [] TBool;
       ("map_err", fun () -> let u = fresh () in ([ TFn ([ e ], u) ], res a u)) ]
-  | TCap Net -> [ m "get" [ TStr ] (res TStr io_err); m "only" [ TStr ] (TCap Net); m "connect" [ TStr ] (res (TCap Conn) io_err) ]
+  | TCap Net -> [ m "get" [ TStr ] (res (TNamed ("HttpResponse", [])) io_err); m "only" [ TStr ] (TCap Net); m "connect" [ TStr ] (res (TCap Conn) io_err) ]
   | TCap Listen -> [ m "on" [ TStr ] (res (TCap Listener) io_err) ]
   | TCap Listener -> [ m "accept" [] (res (TCap Conn) io_err); m "port" [] TInt; m "close" [] TUnit ]
   | TCap Conn -> [ m "read" [] (res TStr io_err); m "write" [ TStr ] (res TUnit io_err); m "close" [] TUnit ]
@@ -1317,7 +1317,7 @@ let check_self ctx d ps =
     d.fn_params;
   match (d.fn_params, ps) with
   | { prm_name = "self"; prm_span; _ } :: _, t0 :: _ when d.fn_test = None -> (
-    let builtin n = List.mem n [ "Option"; "Result"; "IoError"; "ProcessOutput" ] in
+    let builtin n = List.mem n [ "Option"; "Result"; "IoError"; "ProcessOutput"; "HttpResponse" ] in
     match t0 with
     | TNamed (n, _) when (Hashtbl.mem ctx.structs n || Hashtbl.mem ctx.enums n) && not (builtin n) -> ()
     | TErr -> ()
