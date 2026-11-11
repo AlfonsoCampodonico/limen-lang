@@ -71,6 +71,9 @@ type env = {
   gens : string list; (* type parameters in scope *)
 }
 
+(* Built-in types a file can add methods to. *)
+let builtin_method_types = [ "Int"; "Float"; "Bool"; "Str"; "List"; "Map"; "Option"; "Result"; "IoError" ]
+
 let qual (m : modinfo) n = if m.mname = "" then n else m.mname ^ "." ^ n
 
 let module_of env a sp =
@@ -322,6 +325,9 @@ let rename_item mods (m : modinfo) own (it : item) : item =
       if d.fn_test <> None then d.fn_name
       else if is_method it then
         match params with
+        | { prm_ty = { tdesc = TyName (tn, _); _ }; _ } :: _ when List.mem tn builtin_method_types ->
+          (* a method on a built-in type belongs to its file: keyed by module *)
+          qual m (tn ^ "::" ^ d.fn_name)
         | { prm_ty = { tdesc = TyName (tn, _); _ }; _ } :: _ -> tn ^ "::" ^ d.fn_name
         | _ -> qual m d.fn_name (* the checker reports the bad `self` *)
       else qual m d.fn_name

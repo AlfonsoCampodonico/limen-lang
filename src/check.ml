@@ -257,6 +257,19 @@ let struct_fields ctx n args =
 
 (* ---------- builtin methods ---------- *)
 
+(* The name a built-in type's methods are keyed by (`Str::shout`), if a
+   program can add methods to it. *)
+let builtin_tname t =
+  match repr t with
+  | TInt -> Some "Int"
+  | TFloat -> Some "Float"
+  | TBool -> Some "Bool"
+  | TStr -> Some "Str"
+  | TList _ -> Some "List"
+  | TMap _ -> Some "Map"
+  | TNamed (("Option" | "Result" | "IoError") as n, _) -> Some n
+  | _ -> None
+
 let methods (t : ty) : (string * (unit -> ty list * ty)) list =
   let m name ps r = (name, fun () -> (ps, r)) in
   match t with
@@ -651,7 +664,7 @@ and check_field ctx f e recv name nsp =
     end
   | _ -> (
     let t = check_expr ctx f recv in
-    let arity = method_arity ctx t name in
+    let arity = method_arity ~file:nsp.file ctx t name in
     match repr t with
     | TNamed (n, args) when Hashtbl.mem ctx.sfields n && not (List.mem_assoc name (struct_fields ctx n args)) && arity <> None ->
       method_value ctx f e recv t name nsp (Option.get arity)
@@ -684,9 +697,12 @@ and check_field ctx f e recv name nsp =
 
 (* How many arguments (besides the receiver) method [name] of a value of
    type [t] takes, if it has one that can be used as a value. *)
-and method_arity ctx t name =
+and method_arity ?(file = "") ctx t name =
+  match builtin_method ctx t name file with
+  | Some key -> Some (List.length (Hashtbl.find ctx.fns key).ps - 1)
+  | None ->
   match repr t with
-  | TNamed (n, _) when Hashtbl.mem ctx.fns (n ^ "::" ^ name) -> Some (List.length (Hashtbl.find ctx.fns (n ^ "::" ^ name)).ps - 1)
+  | TNamed (n, _) when Hashtbl.mem ctx.fns (n ^ "::" ^ name) && builtin_tname t = None -> Some (List.length (Hashtbl.find ctx.fns (n ^ "::" ^ name)).ps - 1)
   | TDyn i -> Option.map (fun (ps, _) -> List.length ps) (Option.bind (Hashtbl.find_opt ifaces i) (List.assoc_opt name))
   | TParam g ->
     let bs = Option.value ~default:[] (List.assoc_opt g !cur_bounds) in
@@ -710,6 +726,20 @@ and method_value ctx f e recv rt name nsp arity =
   let t = check_expr ctx f clo in
   pop f;
   t
+
+(* The method [name] that file [file] added to built-in type [t], if any. *)
+and builtin_method ctx t name file =
+  match builtin_tname t with
+  | None -> None
+  | Some tn ->
+    let suffix = tn ^ "::" ^ name in
+    Hashtbl.fold
+      (fun k _ acc ->
+        if acc = None && (k = suffix || String.ends_with ~suffix:("." ^ suffix) k)
+           && (match Hashtbl.find_opt method_owner k with Some (_, fl) -> fl = file | None -> false)
+        then Some k
+        else acc)
+      ctx.fns None
 
 and check_method ctx f e recv name nsp args =
   match recv.edesc with
@@ -774,7 +804,26 @@ and check_method_value ctx f e recv name nsp args =
       did_you_mean ctx ~notes "E0105" nsp (sprintf "no method `%s` on `%s`" name g) name declared;
       check_args ctx f args;
       TErr)
-  | TNamed (n, _) when Hashtbl.mem ctx.fns (n ^ "::" ^ name) -> (
+  | _ when builtin_method ctx rt name nsp.file <> None -> (
+    (* a method this file added to a built-in type: rewritten to a plain call
+       of `Str::name` (or `mod.Str::name`), receiver first *)
+    let key = Option.get (builtin_method ctx rt name nsp.file) in
+    let env, t = instantiate (Hashtbl.find ctx.fns key) in
+    add_bounds key env nsp;
+    match t with
+    | TFn (p0 :: ps, r) ->
+      unify_at ctx recv.espan p0 rt;
+      if List.length ps <> List.length args then begin
+        err ctx "E0107" nsp
+          (sprintf "method `%s` takes %d argument%s besides `self`, but %d %s supplied" name (List.length ps)
+             (plural (List.length ps)) (List.length args) (if List.length args = 1 then "was" else "were"));
+        check_args ctx f args
+      end
+      else List.iter2 (fun a p -> expect ctx f a p) args ps;
+      e.edesc <- ECall ({ edesc = EVar key; espan = nsp; ety = t; einst = env }, recv :: args);
+      r
+    | _ -> check_args ctx f args; TErr)
+  | TNamed (n, _) when Hashtbl.mem ctx.fns (n ^ "::" ^ name) && builtin_tname rt = None -> (
     (* a method: `fn name(self: T, ...)`, called with the receiver first *)
     let env, t = instantiate (Hashtbl.find ctx.fns (n ^ "::" ^ name)) in
     e.einst <- env;
@@ -1435,9 +1484,17 @@ let check_self ctx d ps =
     match t0 with
     | TNamed (n, _) when (Hashtbl.mem ctx.structs n || Hashtbl.mem ctx.enums n) && not (builtin n) -> ()
     | TErr -> ()
+    | t when builtin_tname t <> None ->
+      (* a method on a built-in type: private to its file, and no clash with a built-in method *)
+      let name = match String.rindex_opt d.fn_name ':' with Some i -> String.sub d.fn_name (i + 1) (String.length d.fn_name - i - 1) | None -> d.fn_name in
+      if List.mem_assoc name (methods t) then
+        err ctx "E0106" d.fn_span (sprintf "`%s` already has a built-in method `%s`" (show t) name)
+      else if d.fn_pub then
+        err ctx "E0110" d.fn_span (sprintf "a method on built-in type `%s` cannot be `pub`: it is private to the file that defines it" (show t))
+          ~notes:[ "export a plain function instead, as in `pub fn shout(s: Str) -> Str`" ]
     | t ->
       err ctx "E0110" prm_span
-        (sprintf "methods can only be defined on struct and enum types declared in the program, not on `%s`" (show t))
+        (sprintf "methods can only be defined on struct and enum types and on Int, Float, Bool, Str, List, Map, Option, Result and IoError, not on `%s`" (show t))
         ~notes:[ "write a plain function that takes the value instead, and rename the parameter" ])
   | _ -> ()
 

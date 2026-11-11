@@ -156,7 +156,8 @@ fn swap[A, B](self: Pair[A, B]) -> Pair[B, A] {
 let p = a.add(b).add(c)
 ```
 
-- `self` must be the first parameter, and its type a struct or enum declared in the program, generic or not (E0110). Built-in types, `Option`, `Result` and `IoError` cannot get new methods.
+- `self` must be the first parameter, and its type a struct or enum declared in the program, generic or not, or one of the built-in types below (E0110).
+- A file can add methods to `Int`, `Float`, `Bool`, `Str`, `List[T]`, `Map[K, V]`, `Option[T]`, `Result[T, E]` and `IoError`: `fn shout(self: Str) -> Str { self.to_upper() + "!" }` makes `"hi".shout()` work **in that file only**. Built-in types belong to no module, so this keeps two modules' helpers from clashing; such a method cannot be `pub` (E0110), and it cannot reuse the name of a built-in method (E0106). Export a plain function to share it. Methods added this way do not count toward interfaces, and capabilities, channels and arrays cannot get methods.
 - A method is only called with a dot: `p.add(q)`, never `add(p, q)`. Its name does not clash with a plain function or with methods of other types, so `fn area(self: Circle)` and `fn area(self: Rect)` can both exist.
 - Methods take `self` by value like any parameter; to "change" a value, return the new one.
 - A method without the call is a value: `p.add` is a function that calls `add` on `p`, the same as `|q| p.add(q)`. Like a closure, it holds a copy of `p` taken when `p.add` is evaluated, so `[a, b].map(origin.add)` works and later changes to `p` do not reach it. This works for every method that can be called with a dot: user methods, `dyn` and interface-bounded methods, and built-in ones (`let say = out.print`), except `push` and `remove`, which change their receiver. (It is `p.add`, as in Go and Swift, and not `Point.add`: the value already knows its type, and `Name.x` is taken by enum variants and modules.)
@@ -673,7 +674,7 @@ Every diagnostic has a stable code. `vela explain CODE` prints its explanation, 
 | E0107 | wrong number of arguments |
 | E0108 | not callable |
 | E0109 | wrong number of type arguments |
-| E0110 | misplaced `self`, or a method on a built-in type |
+| E0110 | misplaced `self`, a method on a type that cannot have them, or a `pub` method on a built-in type |
 | E0111 | a type does not satisfy an interface |
 | E0112 | a value that cannot become `dyn` |
 | E0113 | a map key type that is not `Int`, `Str`, `Bool`, or a tuple, struct or enum of them |

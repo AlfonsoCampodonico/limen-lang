@@ -1133,9 +1133,28 @@ fn main(root: Root) {
 
   (* ---------- methods ---------- *)
   out "methods" (example "methods.vela") "8.0 12.0\ncircle at 8.0,12.0 with area 3.0\nrect with area 96.0\none 1 1\n10 25\n";
-  errs "method-on-builtin" "fn double(self: Int) -> Int {\n    self * 2\n}\n\nfn main() {}\n" [ "E0110" ];
+  errs "method-on-capability" "fn twice(self: Clock) -> Int {\n    self.now_ms() * 2\n}\n\nfn main() {}\n" [ "E0110" ];
   errs "method-self-not-first" "struct P {\n    a: Int,\n}\n\nfn f(x: Int, self: P) -> Int {\n    x\n}\n\nfn main() {}\n" [ "E0110" ];
-  errs "method-on-option" "fn f(self: Option[Int]) -> Int {\n    1\n}\n\nfn main() {}\n" [ "E0110" ];
+  errs "method-on-builtin-pub" "pub fn double(self: Int) -> Int {\n    self * 2\n}\n\nfn main() {}\n" [ "E0110" ];
+  errs "method-on-builtin-clash" "fn len(self: Str) -> Int {\n    0\n}\n\nfn main() {}\n" [ "E0106" ];
+  out "methods-on-builtins"
+    ("fn shout(self: Str) -> Str {\n    self.to_upper() + \"!\"\n}\n\nfn double(self: Int) -> Int {\n    self * 2\n}\n\n"
+     ^ "fn second[T](self: List[T]) -> Option[T] {\n    self.get(1)\n}\n\nfn or_zero(self: Option[Int]) -> Int {\n    self ?? 0\n}\n\n"
+     ^ "fn total[K](self: Map[K, Int]) -> Int {\n    self.values().sum()\n}\n\n"
+     ^ "fn describe(self: IoError) -> Str {\n    match self {\n        Denied(m) => \"denied: \" + m,\n        Failed(m) => \"failed: \" + m,\n    }\n}\n\n"
+     ^ "fn half(self: Float) -> Float {\n    self / 2.0\n}\n\nfn flip(self: Bool) -> Bool {\n    !self\n}\n\n"
+     ^ "fn main(root: Root) {\n    let out = root.stdout\n    let f = \"hi\".shout\n"
+     ^ "    out.print(\"{\"hey\".shout()} {21.double().double()} {[1, 2, 3].second()} {[\"a\"].second()} {f()}\")\n"
+     ^ "    out.print(\"{Some(4).or_zero()} {None.or_zero()} {map([(\"a\", 1), (\"b\", 2)]).total()} {Denied(\"x\").describe()}\")\n"
+     ^ "    out.print(\"{[1, 2].map(|x| x.double())} {3.0.half()} {true.flip()}\")\n}\n")
+    "HEY! 84 Some(2) None HI!\n4 0 3 denied: x\n[2, 4] 1.5 false\n";
+  (* each file's methods on built-in types are its own *)
+  let strs = "pub fn yell(s: Str) -> Str {\n    s.shout()\n}\n\nfn shout(self: Str) -> Str {\n    self + \"!!\"\n}\n" in
+  out "methods-on-builtins-per-module" ~modules:[ ("strs", strs) ]
+    "use strs\n\nfn shout(self: Str) -> Str {\n    self + \"?\"\n}\n\nfn main(root: Root) {\n    root.stdout.print(\"{\"a\".shout()} {strs.yell(\"b\")}\")\n}\n"
+    "a? b!!\n";
+  errs "methods-on-builtins-not-imported" ~modules:[ ("strs", strs) ]
+    "use strs\n\nfn main(root: Root) {\n    root.stdout.print(\"a\".shout())\n}\n" [ "E0105" ];
   let pdecl = "struct P {\n    a: Int,\n}\n\nfn g(self: P) -> Int {\n    self.a\n}\n\n" in
   errs "method-unknown" (pdecl ^ "fn main() {\n    let x = P { a: 1 }.h()\n}\n") [ "E0105" ];
   errs "method-arity" (pdecl ^ "fn main() {\n    let x = P { a: 1 }.g(2)\n}\n") [ "E0107" ];

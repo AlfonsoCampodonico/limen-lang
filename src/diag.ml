@@ -36,7 +36,7 @@ let explanations = [
   "E0107", "A function, variant or pattern was given the wrong number of arguments.";
   "E0108", "Only functions and closures can be called.";
   "E0109", "A generic type was given the wrong number of type arguments, for example `List` instead of `List[Int]`.";
-  "E0110", "`self` names the receiver of a method: `fn area(self: Shape) -> Float` is called as `shape.area()`. It must be the first parameter, and its type a struct or enum declared in the program (not a built-in type such as Int, List, Option or Result).";
+  "E0110", "`self` names the receiver of a method: `fn area(self: Shape) -> Float` is called as `shape.area()`. It must be the first parameter, and its type a struct or enum declared in the program, or Int, Float, Bool, Str, List, Map, Option, Result or IoError. A method on one of those built-in types is private to its file, so it cannot be `pub`; capabilities, channels and arrays cannot get methods.";
   "E0111", "A type used for a bounded type parameter does not satisfy the interface. Interfaces are satisfied structurally: the type needs every method the interface declares, with the same parameter and result types. Define the missing method as `fn name(self: T, ...)`.";
   "E0112", "Only struct and enum values can become `dyn Interface`, and only if they hold no capability, function or channel. A `dyn` value hides its concrete type, so it must not hide authority either; pass capabilities with a type parameter bounded by the interface instead.";
   "E0113", "Map keys must be Int, Str or Bool, or tuples, structs and enums made of them, so they hash and compare by value the same way in both backends. Float (NaN is not equal to itself), lists and maps cannot be keys; key the map by an id or a name instead.";
