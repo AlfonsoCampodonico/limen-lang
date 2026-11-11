@@ -16,6 +16,7 @@ type cap =
   | CRand
   | CStdin
   | CEnv of string list
+  | CExec of string list
 
 (* A socket that knows when it was closed, so a task waiting on it never
    touches a descriptor number that has been reused. *)
@@ -68,11 +69,12 @@ type grants = {
   fs : (string * bool) option; (* realpath, read-only *)
   listen : string list;
   env : string list; (* variable names, or "*" *)
+  exec : string list; (* program names, or "*" *)
   seed : int option; (* makes Rand deterministic *)
   args : string list; (* command-line arguments after `--` *)
 }
 
-let no_grants = { net = []; fs = None; listen = []; env = []; seed = None; args = [] }
+let no_grants = { net = []; fs = None; listen = []; env = []; exec = []; seed = None; args = [] }
 
 (* Rand: splitmix64, the same generator as the native runtime, so a seed
    gives the same numbers in both backends. *)
@@ -106,7 +108,7 @@ let fmt_float x =
 let cap_name = function
   | CRoot -> "Root" | CNet _ -> "Net" | CFs _ -> "Fs" | CStdout -> "Stdout" | CClock -> "Clock"
   | CListen _ -> "Listen" | CListener _ -> "Listener" | CConn _ -> "Conn"
-  | CRand -> "Rand" | CStdin -> "Stdin" | CEnv _ -> "Env"
+  | CRand -> "Rand" | CStdin -> "Stdin" | CEnv _ -> "Env" | CExec _ -> "Exec"
 
 let key_of = function VInt n -> KInt n | VStr s -> KStr s | VBool b -> KBool b | _ -> failwith "internal: map key"
 let val_of_key = function KInt n -> VInt n | KStr s -> VStr s | KBool b -> VBool b
@@ -441,6 +443,59 @@ module Sock = struct
     end
 end
 
+(* ---------- processes ----------
+   Same rules as the native runtime: the program name must be granted exactly
+   (or `*`), arguments go as a list with no shell, stdin is /dev/null, stdout
+   comes through a pipe this task waits on, stderr through an unlinked
+   temporary file. A child killed by signal N exits with 128 + N. *)
+module Proc = struct
+  let permits allowed p = List.mem "*" allowed || List.mem p allowed
+  let only allowed p = if (p = "*" && List.mem "*" allowed) || (p <> "*" && permits allowed p) then [ p ] else []
+
+  let run allowed prog args : (int * string * string, Caps.ioerr) result =
+    if String.contains prog '\000' then Error (Caps.Failed "exec: the program name contains a NUL byte")
+    else if List.exists (fun a -> String.contains a '\000') args then Error (Caps.Failed "exec: an argument contains a NUL byte")
+    else if not (permits allowed prog) then Error (Caps.Denied (sprintf "exec: `%s` is not granted" prog))
+    else
+      match Filename.temp_file "vela-exec-" "" with
+      | exception Sys_error m -> Error (Caps.Failed m)
+      | tmp -> (
+        let errfd = Unix.openfile tmp [ Unix.O_RDWR; Unix.O_CLOEXEC ] 0o600 in
+        Sys.remove tmp;
+        let devnull = Unix.openfile "/dev/null" [ Unix.O_RDONLY; Unix.O_CLOEXEC ] 0 in
+        let rd, wr = Unix.pipe ~cloexec:true () in
+        let close_all fds = List.iter (fun fd -> try Unix.close fd with Unix.Unix_error _ -> ()) fds in
+        match Unix.create_process prog (Array.of_list (prog :: args)) devnull wr errfd with
+        | exception Unix.Unix_error (e, _, _) ->
+          close_all [ rd; wr; errfd; devnull ];
+          Error (Caps.Failed (sprintf "exec: cannot run `%s`: %s" prog (Unix.error_message e)))
+        | pid ->
+          close_all [ wr; devnull ];
+          Unix.set_nonblock rd;
+          let sk = { fd = rd; shut = false } in
+          let b = Buffer.create 4096 and chunk = Bytes.create 65536 in
+          let rec drain () =
+            match Unix.read rd chunk 0 65536 with
+            | 0 -> ()
+            | n -> Buffer.add_subbytes b chunk 0 n; drain ()
+            | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EINTR), _, _) -> Sock.wait sk false; drain ()
+            | exception Unix.Unix_error _ -> ()
+          in
+          drain ();
+          Unix.close rd;
+          let rec reap () = try snd (Unix.waitpid [] pid) with Unix.Unix_error (Unix.EINTR, _, _) -> reap () in
+          let code =
+            match reap () with
+            | Unix.WEXITED n -> n
+            | Unix.WSIGNALED s | Unix.WSTOPPED s -> 128 + Sys.signal_to_int s
+          in
+          ignore (Unix.lseek errfd 0 Unix.SEEK_SET);
+          let ic = Unix.in_channel_of_descr errfd in
+          let err = In_channel.input_all ic in
+          close_in ic;
+          Ok (code, Buffer.contents b, err))
+end
+
 let rec pmatch p v binds =
   match (p.pdesc, v) with
   | PWild, _ -> true
@@ -628,6 +683,7 @@ and field rt v name =
   | VCap CRoot, "rand" -> VCap CRand
   | VCap CRoot, "stdin" -> VCap CStdin
   | VCap CRoot, "env" -> VCap (CEnv rt.grants.env)
+  | VCap CRoot, "exec" -> VCap (CExec rt.grants.exec)
   | _ -> failwith ("internal: field " ^ name)
 
 and apply rt fv args sp =
@@ -865,6 +921,12 @@ and cap_call rt c name args =
   | (CListener (fd, _) | CConn fd), "close", [] -> Sock.close fd; VUnit
   | CConn fd, "read", [] -> sock_result (Sock.read fd) (fun s -> VStr s)
   | CConn fd, "write", [ VStr s ] -> sock_result (Sock.write fd s) (fun () -> VUnit)
+  | CExec allowed, "only", [ VStr p ] -> VCap (CExec (Proc.only allowed p))
+  | CExec allowed, "run", [ VStr p; VList args ] ->
+    let args = Array.to_list (Array.map (function VStr a -> a | _ -> failwith "internal: exec argument") args) in
+    io_result
+      (fun (code, o, e) -> VStruct ("ProcessOutput", [ ("code", vint code); ("stdout", VStr o); ("stderr", VStr e) ]))
+      (Proc.run allowed p args)
   | _ -> failwith ("internal: capability method " ^ name)
 
 (* The status a process exits with when `main` returns [n]: the low 8 bits,

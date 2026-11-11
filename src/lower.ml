@@ -110,6 +110,7 @@ let rec resolve env (te : ty_expr) : ty =
     | "Rand", _ -> TCap Rand
     | "Stdin", _ -> TCap Stdin
     | "Env", _ -> TCap Env
+    | "Exec", _ -> TCap Exec
     | "Chan", [ x ] -> TChan x
     | "Map", [ k; v ] -> TMap (k, v)
     | _ -> ( match List.assoc_opt n env with Some t -> t | None -> TNamed (n, a)))

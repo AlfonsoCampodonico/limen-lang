@@ -115,6 +115,7 @@ let run_native ?(grants = Interp.no_grants) ?modules name src =
       List.concat_map (fun h -> [ "--grant"; "net=" ^ h ]) grants.Interp.net
       @ List.concat_map (fun h -> [ "--grant"; "listen=" ^ h ]) grants.Interp.listen
       @ List.concat_map (fun n -> [ "--grant"; "env=" ^ n ]) grants.Interp.env
+      @ List.concat_map (fun n -> [ "--grant"; "exec=" ^ n ]) grants.Interp.exec
       @ (match grants.seed with Some s -> [ "--seed"; string_of_int s ] | None -> [])
       @ (match grants.fs with Some (d, ro) -> [ "--grant"; "fs=" ^ d ^ if ro then ":ro" else "" ] | None -> [])
       @ ("--" :: grants.args)
@@ -156,6 +157,7 @@ let check_tsan name ?(grants = Interp.no_grants) src want =
         (match grants.Interp.fs with Some (d, ro) -> [ "--grant"; "fs=" ^ d ^ if ro then ":ro" else "" ] | None -> [])
         @ List.concat_map (fun h -> [ "--grant"; "net=" ^ h ]) grants.Interp.net
         @ List.concat_map (fun h -> [ "--grant"; "listen=" ^ h ]) grants.Interp.listen
+        @ List.concat_map (fun h -> [ "--grant"; "exec=" ^ h ]) grants.Interp.exec
       in
       let o = exe ^ ".out" and e = exe ^ ".err" in
       let cmd =
@@ -779,6 +781,52 @@ fn client(net: Net, port: Int, k: Int) -> Int {
     "fn main(root: Root) -> Int {\n    let r = group g {\n        g.go(|| 40)\n        g.go(|| 2)\n    }\n    root.stdout.print(\"{r.sum()}\")\n    r.sum() - 30\n}\n" "42\n" 12;
   errs "main-returns-str" "fn main(root: Root) -> Str { \"x\" }" [ "E0303" ];
   errs "main-returns-result-str" "fn main(root: Root) -> Result[Str, Str] { Ok(\"x\") }" [ "E0303" ];
+
+  (* ---------- Exec: running other programs ---------- *)
+  let sh = { Interp.no_grants with exec = [ "sh" ] } in
+  out "exec-run" ~grants:sh
+    (main_wrap {|    match root.exec.run("sh", ["-c", "echo hi $0; echo oops >&2; exit 7", "a b; rm -rf x"]) {
+        Ok(r) => out.print("{r.code} {r.stdout.trim()} {r.stderr.trim()} {r}"),
+        Err(e) => out.print("{e}"),
+    }|})
+    "7 hi a b; rm -rf x oops ProcessOutput { code: 7, stdout: \"hi a b; rm -rf x\\n\", stderr: \"oops\\n\" }\n";
+  out "exec-big-output" ~grants:sh
+    (main_wrap {|    let r = root.exec.run("sh", ["-c", "i=0; while [ $i -lt 3000 ]; do echo line $i; echo err $i >&2; i=$((i+1)); done"])
+    match r {
+        Ok(p) => out.print("{p.stdout.lines().len()} {p.stderr.lines().len()} {p.code}"),
+        Err(e) => out.print("{e}"),
+    }|})
+    "3000 3000 0\n";
+  out "exec-denied" ~grants:sh
+    (main_wrap "    out.print(\"{root.exec.run(\"ls\", [])}\")\n    out.print(\"{root.exec.only(\"ls\").run(\"sh\", [])}\")")
+    "Err(Denied(\"exec: `ls` is not granted\"))\nErr(Denied(\"exec: `sh` is not granted\"))\n";
+  out "exec-not-granted" (main_wrap "    out.print(\"{root.exec.run(\"sh\", [\"-c\", \"true\"])}\")")
+    "Err(Denied(\"exec: `sh` is not granted\"))\n";
+  out "exec-missing" ~grants:{ Interp.no_grants with exec = [ "*" ] }
+    (main_wrap "    out.print(\"{root.exec.run(\"vela-no-such-program\", [])}\")")
+    "Err(Failed(\"exec: cannot run `vela-no-such-program`: No such file or directory\"))\n";
+  out "exec-signal" ~grants:sh
+    (main_wrap "    out.print(\"{root.exec.run(\"sh\", [\"-c\", \"kill -9 $$\"]).map_err(|e| 0)}\")")
+    "Ok(ProcessOutput { code: 137, stdout: \"\", stderr: \"\" })\n";
+  out "exec-nul" ~grants:sh
+    (main_wrap "    out.print(\"{root.exec.run(\"sh\", [\"a\" + 0.to_char()])}\")")
+    "Err(Failed(\"exec: an argument contains a NUL byte\"))\n";
+  let exec_group = {|fn main(root: Root) {
+    let x = root.exec
+    let codes = group g {
+        for i in [1, 2, 3, 4, 5, 6] {
+            g.go(|| match x.run("sh", ["-c", "echo task $0; exit $0", i.to_str()]) {
+                Ok(r) => r.code * 10 + r.stdout.len(),
+                Err(_) => -1,
+            })
+        }
+    }
+    root.stdout.print("{codes}")
+}
+|} in
+  out "exec-group" ~grants:sh exec_group "[17, 27, 37, 47, 57, 67]\n";
+  check_tsan "exec-group" ~grants:sh exec_group "[17, 27, 37, 47, 57, 67]\n";
+  errs "exec-ambient" "fn main(root: Root) { system(\"ls\") }" [ "E0302" ];
 
   (* ---------- capabilities at runtime ---------- *)
   out "net-not-granted" (main_wrap "    out.print(\"{root.net.get(\"https://example.com/\")}\")")

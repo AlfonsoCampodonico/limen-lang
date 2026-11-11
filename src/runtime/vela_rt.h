@@ -794,7 +794,7 @@ static void w_dyn_kids(void *o) { WDyn *d = (WDyn *)o; d->vt->h.drop(d); }
 
 /* ---------- capabilities ---------- */
 
-enum { CAP_ROOT, CAP_NET, CAP_FS, CAP_STDOUT, CAP_CLOCK, CAP_LISTEN, CAP_LISTENER, CAP_CONN, CAP_RAND, CAP_STDIN, CAP_ENV };
+enum { CAP_ROOT, CAP_NET, CAP_FS, CAP_STDOUT, CAP_CLOCK, CAP_LISTEN, CAP_LISTENER, CAP_CONN, CAP_RAND, CAP_STDIN, CAP_ENV, CAP_EXEC };
 typedef struct WCap WCap;
 struct WCap {
   int64_t rc; int kind;
@@ -812,13 +812,14 @@ static void Cap_drop(WCap *c) { if (w_rc_dec(&c->rc)) Cap_release(c); }
 static inline bool Cap_eq(WCap *a, WCap *b) { return a == b; }
 static void Cap_show(WBuf *b, WCap *c, bool top) {
   (void)top;
-  static const char *names[] = { "<Root>", "<Net>", "<Fs>", "<Stdout>", "<Clock>", "<Listen>", "<Listener>", "<Conn>", "<Rand>", "<Stdin>", "<Env>" };
+  static const char *names[] = { "<Root>", "<Net>", "<Fs>", "<Stdout>", "<Clock>", "<Listen>", "<Listener>", "<Conn>", "<Rand>", "<Stdin>", "<Env>", "<Exec>" };
   buf_puts(b, names[c->kind]);
 }
 
 static char **g_hosts; static int g_nhosts; static char *g_fs_root; static bool g_fs_ro;
 static char **g_listen; static int g_nlisten;
 static char **g_env; static int g_nenv;
+static char **g_exec; static int g_nexec;
 static char **g_args; static int g_nargs;
 static uint64_t g_rand_state;
 
@@ -861,6 +862,9 @@ static void w_init(int argc, char **argv) {
     } else if (strncmp(g, "env=", 4) == 0) {
       g_env = (char **)w_realloc(g_env, sizeof(char *) * (size_t)(g_nenv + 1));
       g_env[g_nenv++] = strdup(g + 4);
+    } else if (strncmp(g, "exec=", 5) == 0) {
+      g_exec = (char **)w_realloc(g_exec, sizeof(char *) * (size_t)(g_nexec + 1));
+      g_exec[g_nexec++] = strdup(g + 5);
     } else if (strncmp(g, "listen=", 7) == 0) {
       g_listen = (char **)w_realloc(g_listen, sizeof(char *) * (size_t)(g_nlisten + 1));
       g_listen[g_nlisten++] = strdup(g + 7);
@@ -889,6 +893,13 @@ static WCap *Cap_root_field(WCap *root, const char *f) {
     c->hosts = (char **)w_raw(sizeof(char *) * (size_t)(g_nlisten + 1));
     for (int i = 0; i < g_nlisten; i++) c->hosts[i] = strdup(g_listen[i]);
     c->nhosts = g_nlisten;
+    return c;
+  }
+  if (strcmp(f, "exec") == 0) {
+    WCap *c = cap_new(CAP_EXEC);
+    c->hosts = (char **)w_raw(sizeof(char *) * (size_t)(g_nexec + 1));
+    for (int i = 0; i < g_nexec; i++) c->hosts[i] = strdup(g_exec[i]);
+    c->nhosts = g_nexec;
     return c;
   }
   if (strcmp(f, "rand") == 0) return cap_new(CAP_RAND);
@@ -2344,4 +2355,103 @@ static WIo Cap_conn_write(WCap *c, WStr *s) {
   }
   w_sock_leave(c);
   return io_ok(NULL);
+}
+
+/* ---------- Exec: run another program ----------
+   The allowlist holds program names exactly as granted (`git`, `/usr/bin/env`)
+   or `*`. Arguments go to the program as a list; no shell is involved. The
+   child gets /dev/null as stdin, our environment and working directory. Its
+   stdout comes through a pipe the task waits on without blocking a worker;
+   its stderr goes to an unlinked temporary file, so a child that fills one
+   stream while we wait on the other cannot deadlock. */
+static bool exec_permits(WCap *x, const char *prog) {
+  for (int i = 0; i < x->nhosts; i++) if (strcmp(x->hosts[i], "*") == 0 || strcmp(x->hosts[i], prog) == 0) return true;
+  return false;
+}
+static WCap *Cap_exec_only(WCap *x, WStr *prog_s) {
+  char *prog = strndup(prog_s->data, (size_t)prog_s->len);
+  bool covered = (size_t)prog_s->len == strlen(prog) && exec_permits(x, prog);
+  if (strcmp(prog, "*") == 0) { covered = false; for (int i = 0; i < x->nhosts; i++) if (strcmp(x->hosts[i], "*") == 0) covered = true; }
+  WCap *c = cap_new(CAP_EXEC);
+  c->hosts = (char **)w_raw(sizeof(char *));
+  if (covered) { c->hosts[0] = prog; c->nhosts = 1; } else free(prog);
+  return c;
+}
+typedef struct { int64_t code; WStr *out; WStr *err; } WProc;
+static WIo Cap_exec_run(WCap *x, WStr *prog_s, L_Str *args) {
+  if (memchr(prog_s->data, 0, (size_t)prog_s->len)) return io_err(2, "exec: the program name contains a NUL byte");
+  for (int64_t i = 0; i < args->len; i++)
+    if (memchr(args->data[i]->data, 0, (size_t)args->data[i]->len)) return io_err(2, "exec: an argument contains a NUL byte");
+  char *prog = strndup(prog_s->data, (size_t)prog_s->len);
+  if (!exec_permits(x, prog)) {
+    WBuf b; buf_init(&b);
+    buf_puts(&b, "exec: `"); buf_puts(&b, prog); buf_puts(&b, "` is not granted");
+    free(prog);
+    WIo r = { 1, NULL, buf_take(&b), NULL };
+    return r;
+  }
+  char **argv = (char **)w_raw(sizeof(char *) * (size_t)(args->len + 2));
+  argv[0] = prog;
+  for (int64_t i = 0; i < args->len; i++) argv[i + 1] = strndup(args->data[i]->data, (size_t)args->data[i]->len);
+  argv[args->len + 1] = NULL;
+  const char *tmp = getenv("TMPDIR");
+  char tpl[1024];
+  snprintf(tpl, sizeof tpl, "%s/vela-exec-XXXXXX", tmp && tmp[0] ? tmp : "/tmp");
+  int errfd = mkstemp(tpl);
+  if (errfd >= 0) unlink(tpl);
+  int out[2] = { -1, -1 };
+  WIo res;
+  if (errfd < 0 || pipe(out) != 0) { res = w_errno_io(); goto done; }
+  fcntl(errfd, F_SETFD, FD_CLOEXEC);
+  fcntl(out[0], F_SETFD, FD_CLOEXEC);
+  fcntl(out[1], F_SETFD, FD_CLOEXEC);
+  posix_spawn_file_actions_t fa;
+  posix_spawn_file_actions_init(&fa);
+  posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
+  posix_spawn_file_actions_adddup2(&fa, out[1], 1);
+  posix_spawn_file_actions_adddup2(&fa, errfd, 2);
+  pid_t pid;
+  int rc = posix_spawnp(&pid, prog, &fa, NULL, argv, environ);
+  posix_spawn_file_actions_destroy(&fa);
+  close(out[1]); out[1] = -1;
+  if (rc != 0) {
+    WBuf b; buf_init(&b);
+    buf_puts(&b, "exec: cannot run `"); buf_puts(&b, prog); buf_puts(&b, "`: "); buf_puts(&b, strerror(rc));
+    res = (WIo){ 2, NULL, buf_take(&b), NULL };
+    goto done;
+  }
+  {
+    WBuf ob; buf_init(&ob);
+    char *chunk = (char *)w_raw(65536);   /* on the heap: task stacks are small */
+    fcntl(out[0], F_SETFL, fcntl(out[0], F_GETFL) | O_NONBLOCK);
+    for (;;) {
+      ssize_t n = read(out[0], chunk, 65536);
+      if (n > 0) { buf_putn(&ob, chunk, n); continue; }
+      if (n == 0) break;
+      if (errno == EINTR) continue;
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        if (w_wait_fd(out[0], 0) < 0) fcntl(out[0], F_SETFL, fcntl(out[0], F_GETFL) & ~O_NONBLOCK);
+        continue;
+      }
+      break;
+    }
+    free(chunk);
+    w_sock_release_fd(out[0]); out[0] = -1;
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    lseek(errfd, 0, SEEK_SET);
+    WStr *e = read_fd(errfd);
+    WProc *p = (WProc *)w_raw(sizeof(WProc));
+    p->code = WIFEXITED(status) ? WEXITSTATUS(status) : WIFSIGNALED(status) ? 128 + WTERMSIG(status) : 1;
+    p->out = buf_take(&ob);
+    p->err = e;
+    res = io_ok_ptr(p);
+  }
+done:
+  if (out[0] >= 0) close(out[0]);
+  if (out[1] >= 0) close(out[1]);
+  if (errfd >= 0) close(errfd);
+  for (int64_t i = 0; i <= args->len; i++) free(argv[i]);
+  free(argv);
+  return res;
 }

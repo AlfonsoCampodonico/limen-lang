@@ -4,7 +4,7 @@ let usage =
   {|vela: a small language where I/O needs a capability
 
 usage:
-  vela run FILE [--native] [--grant net=HOST[:PORT]|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST:PORT]... [--grant env=NAME|*]... [--seed N] [-- ARGS...]
+  vela run FILE [--native] [--grant net=HOST[:PORT]|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST:PORT]... [--grant env=NAME|*]... [--grant exec=PROGRAM|*]... [--seed N] [-- ARGS...]
   vela build FILE [-o OUT] [--emit-c]
   vela check FILE [--json]
   vela caps FILE [--json]
@@ -15,8 +15,8 @@ usage:
   vela mcp                (MCP server for coding agents, on stdin/stdout)
   vela spec               (print the language specification)
 
-Stdout, Stdin, Clock and Rand are always granted. Net, Fs, Listen and Env exist only
-when granted. --seed makes Rand repeatable; arguments after -- are root.args().
+Stdout, Stdin, Clock and Rand are always granted. Net, Fs, Listen, Env and Exec exist
+only when granted. --seed makes Rand repeatable; arguments after -- are root.args().
 |}
 
 let die_usage msg =
@@ -53,6 +53,8 @@ let parse_grants args =
         { g with listen = g.listen @ [ String.sub a (i + 1) (String.length a - i - 1) ] }
       | Some i when String.sub a 0 i = "env" ->
         { g with env = g.env @ [ String.sub a (i + 1) (String.length a - i - 1) ] }
+      | Some i when String.sub a 0 i = "exec" ->
+        { g with exec = g.exec @ [ String.sub a (i + 1) (String.length a - i - 1) ] }
       | Some i when String.sub a 0 i = "seed" -> (
         match int_of_string_opt (String.sub a (i + 1) (String.length a - i - 1)) with
         | Some n -> { g with seed = Some n }

@@ -78,7 +78,7 @@ let unify_at ctx span want got =
   try unify want got
   with Mismatch -> err ctx "E0201" span (sprintf "expected `%s`, found `%s`" (show want) (show got))
 
-let builtin_types = [ "Int"; "Float"; "Bool"; "Str"; "List"; "Array"; "Chan"; "Root"; "Net"; "Fs"; "Stdout"; "Clock"; "Listen"; "Listener"; "Conn"; "Rand"; "Stdin"; "Env"; "Map" ]
+let builtin_types = [ "Int"; "Float"; "Bool"; "Str"; "List"; "Array"; "Chan"; "Root"; "Net"; "Fs"; "Stdout"; "Clock"; "Listen"; "Listener"; "Conn"; "Rand"; "Stdin"; "Env"; "Exec"; "Map" ]
 
 (* Names other languages use for ambient I/O, mapped to the capability way. *)
 let ambient =
@@ -89,7 +89,9 @@ let ambient =
     ("http_get", "Net", "net.get(url)"); ("now", "Clock", "clock.now_ms()");
     ("time", "Clock", "clock.now_ms()"); ("random", "Rand", "rand.int(lo, hi)");
     ("rand", "Rand", "rand.int(lo, hi)"); ("input", "Stdin", "stdin.read_line()");
-    ("read_line", "Stdin", "stdin.read_line()"); ("getenv", "Env", "env.get(name)") ]
+    ("read_line", "Stdin", "stdin.read_line()"); ("getenv", "Env", "env.get(name)");
+    ("system", "Exec", "exec.run(program, args)"); ("spawn", "Exec", "exec.run(program, args)");
+    ("popen", "Exec", "exec.run(program, args)") ]
 
 (* ---------- type expressions ---------- *)
 
@@ -140,6 +142,7 @@ let rec resolve ctx env (te : ty_expr) : ty =
     | "Rand" -> simple (TCap Rand)
     | "Stdin" -> simple (TCap Stdin)
     | "Env" -> simple (TCap Env)
+    | "Exec" -> simple (TCap Exec)
     | "Chan" -> if want 1 then TChan (List.hd args') else TErr
     | "Map" -> if want 2 then TMap (List.nth args' 0, List.nth args' 1) else TErr
     | _ -> (
@@ -307,12 +310,14 @@ let methods (t : ty) : (string * (unit -> ty list * ty)) list =
   | TCap Rand -> [ m "int" [ TInt; TInt ] TInt; m "float" [] TFloat ]
   | TCap Stdin -> [ m "read_line" [] (opt TStr); m "read_all" [] TStr ]
   | TCap Env -> [ m "get" [ TStr ] (opt TStr) ]
+  | TCap Exec ->
+    [ m "run" [ TStr; TList TStr ] (res (TNamed ("ProcessOutput", [])) io_err); m "only" [ TStr ] (TCap Exec) ]
   | TCap Root -> [ m "args" [] (TList TStr) ]
   | TChan a -> [ m "send" [ a ] TUnit; m "recv" [] (opt a); m "close" [] TUnit ]
   | _ -> []
 
 let root_fields = [ ("net", TCap Net); ("fs", TCap Fs); ("stdout", TCap Stdout); ("clock", TCap Clock); ("listen", TCap Listen);
-    ("rand", TCap Rand); ("stdin", TCap Stdin); ("env", TCap Env) ]
+    ("rand", TCap Rand); ("stdin", TCap Stdin); ("env", TCap Env); ("exec", TCap Exec) ]
 
 (* ---------- expressions ---------- *)
 

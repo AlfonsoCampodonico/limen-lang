@@ -5,6 +5,7 @@ let text =
   {|enum Option[T] { Some(T), None }
 enum Result[T, E] { Ok(T), Err(E) }
 enum IoError { Denied(Str), Failed(Str) }
+struct ProcessOutput { code: Int, stdout: Str, stderr: Str }
 |}
 
 (* Tuples of 2 to 8 items: generic structs with fields `0`, `1`, ... *)
