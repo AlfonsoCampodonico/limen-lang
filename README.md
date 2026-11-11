@@ -59,7 +59,7 @@ Then work through the examples. Every one runs the same in the interpreter and n
 
 | Example | Shows | Run |
 | --- | --- | --- |
-| `tour.vela` | the newest features in one file: `dyn` branches, ranges, method values, struct map keys, `Bytes`, groups with deadlines, `select` timeouts, exit codes, tests | `vela run examples/tour.vela; echo $?` and `vela test examples/tour.vela` |
+| `tour.vela` | the newest features in one file: `dyn` branches, ranges, method values, struct map keys, `Bytes`, `defer`, groups with deadlines, `select` timeouts, exit codes, tests | `vela run examples/tour.vela; echo $?` and `vela test examples/tour.vela` |
 | `hello.vela`, `wordcount.vela` | capabilities: nothing touches the outside world without a grant | `vela run examples/wordcount.vela --grant fs=examples:ro` |
 | `methods.vela`, `interfaces.vela`, `dyn.vela`, `shapes.vela` | methods, structural interfaces, `dyn` values | `vela run examples/dyn.vela` |
 | `tuples.vela`, `maps.vela` | tuples, destructuring, maps | `vela run examples/maps.vela` |
@@ -233,7 +233,7 @@ On one thread Vela is level with C on these workloads. With `group` it runs abou
 
 ## Language
 
-Types: `Int`, `Float`, `Bool`, `Str`, `Bytes` (binary data), `()`, `List[T]`, fixed-size `Array[T, N]` (a value type), structs, enums with payloads, generics on functions, structs and enums, and closures. `Option`, `Result` and `IoError` come from the prelude. Control flow: `if`/`else`, exhaustive `match`, `while`, `for x in list`, `for i in 0..<n` (counts without building a list), `break`, `continue`, `return` and `?`. Text is `Str`; `s.chars()` gives its characters as one-character strings. Statements end at a newline; a line starting with `.` continues a method chain. String interpolation takes any expression: `"{xs.join(", ")}"`.
+Types: `Int`, `Float`, `Bool`, `Str`, `Bytes` (binary data), `()`, `List[T]`, fixed-size `Array[T, N]` (a value type), structs, enums with payloads, generics on functions, structs and enums, and closures. `Option`, `Result` and `IoError` come from the prelude. Control flow: `if`/`else`, exhaustive `match`, `while`, `for x in list`, `for i in 0..<n` (counts without building a list), `break`, `continue`, `return`, `?`, and `defer` (runs when its block is left, by any exit including a panic; last written runs first). Text is `Str`; `s.chars()` gives its characters as one-character strings. Statements end at a newline; a line starting with `.` continues a method chain. String interpolation takes any expression: `"{xs.join(", ")}"`.
 
 Methods: a function whose first parameter is `self: T` is called as `value.name(...)`, a file can add its own methods to built-in types (`fn shout(self: Str) -> Str`), and `value.name` without the call is a function bound to that value: `xs.map(origin.add)`, `let say = out.print` (see [examples/methods.vela](examples/methods.vela)).
 

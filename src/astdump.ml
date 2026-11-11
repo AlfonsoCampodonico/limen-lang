@@ -79,6 +79,7 @@ and stmt s =
   | SForPat (p, e, b) -> "for " ^ pat p ^ " in " ^ expr e ^ block b
   | SBreak -> "break"
   | SContinue -> "continue"
+  | SDefer b -> "defer" ^ block b
 
 let item = function
   | IFn { fn_test = Some n; fn_body; fn_params; _ } ->

@@ -19,6 +19,10 @@ type gctx = {
   mutable counter : int;
 }
 
+(* A `defer` being lowered: its body, the names in scope at the defer, the
+   loop depth there, its guard number and the defers around it. *)
+type dframe = { dbody : block; dscopes : (string, I.var) Hashtbl.t list; dloop : int; did : int; douter : dframe list }
+
 type fctx = {
   g : gctx;
   genv : (string * ty) list;
@@ -28,7 +32,11 @@ type fctx = {
   ret : ty;
   parent : fctx option;
   caps : (I.var * I.var) list ref; (* captured: outer var, inner var *)
+  mutable defers : dframe list; (* innermost first *)
+  mutable loop_depth : int;
 }
+
+let guard_counter = ref 0
 
 let var_counter = ref 0
 
@@ -37,7 +45,7 @@ let fresh_var name ty =
   { I.id = !var_counter; name; ty }
 
 let new_fctx g genv ret parent =
-  { g; genv; scopes = [ Hashtbl.create 8 ]; buf = []; dead = false; ret; parent; caps = ref [] }
+  { g; genv; scopes = [ Hashtbl.create 8 ]; buf = []; dead = false; ret; parent; caps = ref []; defers = []; loop_depth = 0 }
 
 let emit f s = if not f.dead then f.buf <- s :: f.buf
 
@@ -47,6 +55,12 @@ let tmp f ty rhs =
   I.V v
 
 let bind f n v = Hashtbl.replace (List.hd f.scopes) n v
+
+(* Lower a loop body one loop deeper. *)
+let in_loop f k =
+  f.loop_depth <- f.loop_depth + 1;
+  k ();
+  f.loop_depth <- f.loop_depth - 1
 
 (* Run [k] collecting its statements into a separate block with its own scope. *)
 let in_block f k =
@@ -454,6 +468,7 @@ and lower_try f x =
   let fail_block, _, _ =
     in_block f (fun () ->
         let r = fail () in
+        run_defers f f.defers;
         emit f (I.Return r);
         f.dead <- true)
   in
@@ -834,9 +849,62 @@ and lower_block f b =
   f.scopes <- List.tl f.scopes;
   a
 
-and lower_block_inner f b =
-  List.iter (lower_stmt f) b.stmts;
-  match b.tail with Some e -> lower f e | None -> I.AUnit
+and lower_block_inner f b = lower_stmts f b.stmts b.tail
+
+and lower_stmts f ss tail =
+  match ss with
+  | [] -> ( match tail with Some e -> lower f e | None -> I.AUnit)
+  | { sdesc = SDefer d; _ } :: rest when not f.dead -> lower_defer f d rest tail
+  | s :: rest ->
+    lower_stmt f s;
+    lower_stmts f rest tail
+
+(* `defer d` followed by [rest]: the rest runs under a guard whose handler is
+   [d] (for panics and cancellations); every normal way out of the rest runs
+   [d] itself after popping the guard: the end of the block here, and
+   return, `?`, break and continue through run_defers. *)
+and lower_defer f d rest tail =
+  incr guard_counter;
+  let fr = { dbody = d; dscopes = List.map Hashtbl.copy f.scopes; dloop = f.loop_depth; did = !guard_counter; douter = f.defers } in
+  let r = fresh_var "dr" (match tail with Some e -> tyof f e | None -> TUnit) in
+  emit f (I.Decl r);
+  let handler, _, _ = in_block f (fun () -> lower_defer_body f fr) in
+  let body, _, dead =
+    in_block f (fun () ->
+        f.defers <- fr :: f.defers;
+        let a = lower_stmts f rest tail in
+        f.defers <- fr.douter;
+        if not f.dead then begin
+          emit f (I.GuardEnd fr.did);
+          lower_defer_body f fr;
+          emit f (I.Init (r, I.Atom a))
+        end)
+  in
+  emit f (I.Guard (fr.did, handler, body));
+  if dead then f.dead <- true;
+  I.V r
+
+(* The deferred body, in the scope of its defer, with only the defers
+   around it still pending. *)
+and lower_defer_body f fr =
+  let saved_scopes = f.scopes and saved_defers = f.defers in
+  f.scopes <- fr.dscopes;
+  f.defers <- fr.douter;
+  ignore (lower_block f fr.dbody);
+  f.scopes <- saved_scopes;
+  f.defers <- saved_defers
+
+(* Leaving the given defers' blocks normally: innermost first, pop each
+   guard and run its body. *)
+and run_defers f frames =
+  List.iter
+    (fun fr ->
+      emit f (I.GuardEnd fr.did);
+      lower_defer_body f fr)
+    frames
+
+(* the defers inside the innermost loop, which break and continue leave *)
+and loop_defers f = List.filter (fun fr -> fr.dloop >= f.loop_depth) f.defers
 
 and lower_stmt f s =
   if not f.dead then
@@ -864,6 +932,7 @@ and lower_stmt f s =
     | SExpr e -> ignore (lower f e)
     | SReturn eo ->
       let a = match eo with Some e -> lower f e | None -> I.AUnit in
+      run_defers f f.defers;
       emit f (I.Return a);
       f.dead <- true
     | SWhile (c, b) ->
@@ -872,7 +941,7 @@ and lower_stmt f s =
             let ca = lower f c in
             let brk, _, _ = in_block f (fun () -> emit f I.Break; f.dead <- true) in
             emit f (I.If (ca, [], brk));
-            ignore (lower_block f b))
+            in_loop f (fun () -> ignore (lower_block f b)))
       in
       emit f (I.Loop body)
     | SFor (n, _, { edesc = EBin (Range, lo, hi); espan; _ }, b) ->
@@ -893,16 +962,17 @@ and lower_stmt f s =
             (* i < hi, so i + 1 cannot overflow *)
             emit f (I.Set (i, I.Bin (Add, TInt, I.V i, I.AInt 1L, espan), ref false));
             bind f n x;
-            ignore (lower_block f b))
+            in_loop f (fun () -> ignore (lower_block f b)))
       in
       emit f (I.Loop stmts)
     | SFor (n, _, e, b) ->
       let la = lower f e in
       emit_for f la (tyof f e) e.espan (fun x ->
           bind f n x;
-          ignore (lower_block f b))
-    | SBreak -> emit f I.Break; f.dead <- true
-    | SContinue -> emit f I.Continue; f.dead <- true
+          in_loop f (fun () -> ignore (lower_block f b)))
+    | SBreak -> run_defers f (loop_defers f); emit f I.Break; f.dead <- true
+    | SContinue -> run_defers f (loop_defers f); emit f I.Continue; f.dead <- true
+    | SDefer _ -> failwith "defer is lowered with its block"
 
 let lower_fn g c (d : fn_decl) env =
   let ret = match d.fn_ret with Some te -> resolve env te | None -> TUnit in

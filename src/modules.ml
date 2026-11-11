@@ -319,6 +319,7 @@ and block env locals (b : block) : block =
           | SWhile (c, body) -> SWhile (expr env !locals c, block env !locals body)
           | SFor (n, sp, it, body) -> SFor (n, sp, expr env !locals it, block env (n :: !locals) body)
           | SBreak | SContinue -> s.sdesc
+          | SDefer body -> SDefer (block env !locals body)
           | SLetPat _ | SForPat _ -> s.sdesc (* already expanded *)
         in
         { s with sdesc = d })

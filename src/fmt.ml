@@ -431,6 +431,9 @@ and stmt c ind s =
     block c ind b
   | SBreak -> add c "break"
   | SContinue -> add c "continue"
+  | SDefer { stmts = []; tail = Some e; _ } -> add c "defer "; expr c ind e
+  | SDefer { stmts = [ ({ sdesc = SAssign _ | SReturn _ | SBreak | SContinue; _ } as s) ]; tail = None; _ } -> add c "defer "; stmt c ind s
+  | SDefer b -> add c "defer "; block c ind b
 
 (* ---------- items ---------- *)
 

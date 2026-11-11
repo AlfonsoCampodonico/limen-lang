@@ -49,7 +49,9 @@ typearg ::= type | int
 
 # ---------- blocks and statements ----------
 block ::= "{" ws (stmt (stsep stmt)* (sp ";")?)? ws "}"
-stmt  ::= let | return | while | for | "break" | "continue" | expr (sp "=" ws expr)?
+stmt  ::= let | return | while | for | defer | "break" | "continue" | expr (sp "=" ws expr)?
+# `defer` takes a block, or one statement other than `let`
+defer  ::= "defer" sp1 (block | return | while | for | "break" | "continue" | expr (sp "=" ws expr)?)
 let    ::= "let" sp1 ("mut" sp1)? (ident sp (":" sp type sp)? | upat sp) "=" ws expr
 tpat   ::= "(" ws pattern (isep pattern)* (ws ",")? ws ")"
 # unpacking in `let` and `for`: names, `_` and nested tuples only

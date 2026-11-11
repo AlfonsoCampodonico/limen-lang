@@ -496,6 +496,22 @@ and parse_stmt st =
     mks (SFor (n, nsp, e, b)) (merge t.span b.bspan)
   | KW "break" -> ignore (advance st); mks SBreak t.span
   | KW "continue" -> ignore (advance st); mks SContinue t.span
+  | KW "defer" ->
+    ignore (advance st);
+    if is_sym st "{" then
+      let b = parse_block st in
+      mks (SDefer b) (merge t.span b.bspan)
+    else
+      (* one expression or assignment: `defer f.close()`, `defer n = n + 1` *)
+      let s = parse_stmt st in
+      (match s.sdesc with
+       | SExpr e -> mks (SDefer { stmts = []; tail = Some e; bspan = e.espan }) (merge t.span e.espan)
+       | SLet _ | SLetPat _ ->
+         raise
+           (Diag.Fatal
+              (Diag.make "E0003" s.sspan "a `let` after `defer` would bind a name nothing can use"
+                 ~notes:[ "wrap statements in braces: `defer { ... }`" ]))
+       | _ -> mks (SDefer { stmts = [ s ]; tail = None; bspan = s.sspan }) (merge t.span s.sspan))
   | _ ->
     let e = parse_expr st in
     if is_sym st "=" then begin

@@ -33,6 +33,7 @@ type fctx = {
   mutable loops : int;
   genv : (string * ty) list;
   mutable in_group : int; (* inside a group body: no return, no `?` *)
+  mutable in_defer : int; (* inside a deferred body: nothing may leave it *)
 }
 
 type fn_info = { name : string; span : Span.t; caps : cap list; callbacks : bool }
@@ -1009,6 +1010,15 @@ and check_place ctx f e =
   | _ -> err ctx "E0209" e.espan "only variables, fields and list elements can be assigned to"
 
 and check_try ctx f x sp =
+  if f.in_defer > 0 then begin
+    err ctx "E0115" sp "`?` cannot leave a `defer` body"
+      ~notes:[ "handle the error inside it, for example with `??` or a `match`" ];
+    ignore (check_expr ctx f x);
+    TErr
+  end
+  else check_try_ok ctx f x sp
+
+and check_try_ok ctx f x sp =
   if f.in_group > 0 then
     err ctx "E0311" sp "`?` cannot leave a `group` block early; every task must finish first"
       ~notes:[ "handle the error inside the task, or after the group returns its results" ];
@@ -1113,7 +1123,7 @@ and check_closure ctx f ps body want =
       ps
   in
   let ret = match want_ret with Some r -> r | None -> fresh () in
-  let cf = { ret_ty = ret; scopes = scope :: f.scopes; loops = 0; genv = f.genv; in_group = 0 } in
+  let cf = { ret_ty = ret; scopes = scope :: f.scopes; loops = 0; genv = f.genv; in_group = 0; in_defer = 0 } in
   let bt = check_expr ctx cf body in
   unify_at ctx body.espan ret bt;
   TFn (pts, ret)
@@ -1418,7 +1428,8 @@ and check_stmt ctx f s : bool =
     false
   | SExpr e -> ignore (check_expr ctx f e); false
   | SReturn eo ->
-    if f.in_group > 0 then
+    if f.in_defer > 0 then err ctx "E0115" s.sspan "`return` cannot leave a `defer` body"
+    else if f.in_group > 0 then
       err ctx "E0311" s.sspan "`return` cannot leave a `group` block early; every task must finish first";
     (match eo with
      | Some e -> expect ctx f e f.ret_ty
@@ -1455,8 +1466,20 @@ and check_stmt ctx f s : bool =
     pop f;
     false
   | SBreak | SContinue ->
-    if f.loops = 0 then err ctx "E0208" s.sspan "`break` and `continue` can only be used inside a loop";
+    if f.loops = 0 then
+      if f.in_defer > 0 then err ctx "E0115" s.sspan "`break` and `continue` cannot leave a `defer` body"
+      else err ctx "E0208" s.sspan "`break` and `continue` can only be used inside a loop";
     true
+  | SDefer b ->
+    (* the body runs when the block is left: it sees the names in scope here,
+       and nothing in it may leave it; its value is dropped *)
+    let saved = f.loops in
+    f.loops <- 0;
+    f.in_defer <- f.in_defer + 1;
+    ignore (check_block ctx f b);
+    f.in_defer <- f.in_defer - 1;
+    f.loops <- saved;
+    false
 
 (* ---------- program ---------- *)
 
@@ -1532,7 +1555,7 @@ let check_fn ctx (d : fn_decl) (s : fsig) =
   List.iter2
     (fun p t -> Hashtbl.replace scope.vars p.prm_name { vty = t; vmut = false; vspan = p.prm_span; vkind = KParam })
     d.fn_params s.ps;
-  let f = { ret_ty = s.ret; scopes = [ scope ]; loops = 0; genv; in_group = 0 } in
+  let f = { ret_ty = s.ret; scopes = [ scope ]; loops = 0; genv; in_group = 0; in_defer = 0 } in
   match repr s.ret with
   | TDyn _ -> expect_block ctx f d.fn_body s.ret (* the body's value becomes `dyn`, branch by branch *)
   | _ ->

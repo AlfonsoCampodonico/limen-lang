@@ -31,6 +31,10 @@ type ctx = {
   mutable sort_tys : ty list; (* list types that need <CName>_sort *)
   mutable hash_tys : ty list; (* composite map key types that need <CName>_hash *)
   mutable csyms : string list; (* C functions that foreign calls name *)
+  mutable vols : int list;
+      (* variables of the current function a `defer` needs volatile: a panic
+         longjmps back into the function, and the deferred body (and the
+         cleanups after it) must see their latest values and owned flags *)
 }
 
 let is_enum c = function TNamed (n, _) -> Hashtbl.mem c.g.enums n | _ -> false
@@ -719,11 +723,13 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
    stays on the boundary's list, and w_catch_release waits for them first. *)
 let owns_memory _c t = not (is_scalar t) && (match t with TGroup _ -> false | _ -> true)
 
+let vol c (v : I.var) = if List.mem v.id c.vols then " volatile" else ""
+
 let cell_decl c line (v : I.var) on =
   if owns_memory c v.ty then begin
     if not (List.exists (fun t -> cname c t = cname c v.ty) c.cell_tys) then c.cell_tys <- c.cell_tys @ [ v.ty ];
-    line (sprintf "uint8_t %s_o = %d;" (var v) (if on then 1 else 0));
-    line (sprintf "WCl %s_cl __attribute__((cleanup(w_cl_run))) = { &%s, &%s_o, w_dp_%s };" (var v) (var v) (var v) (cname c v.ty))
+    line (sprintf "uint8_t%s %s_o = %d;" (vol c v) (var v) (if on then 1 else 0));
+    line (sprintf "WCl %s_cl __attribute__((cleanup(w_cl_run))) = { (void*)&%s, (uint8_t*)&%s_o, w_dp_%s };" (var v) (var v) (var v) (cname c v.ty))
   end
 
 let set_owned c line (v : I.var) on = if owns_memory c v.ty then line (sprintf "%s_o = %d;" (var v) (if on then 1 else 0))
@@ -738,13 +744,13 @@ and stmt c out ind (s : I.stmt) =
   let line s = Buffer.add_string out (ind ^ s ^ "\n") in
   match s with
   | I.Let (v, r) ->
-    line (sprintf "%s %s;" (ctype c v.ty) (var v));
+    line (sprintf "%s%s %s;" (ctype c v.ty) (vol c v) (var v));
     cell_decl c line v false;
     release_moved c line (I.consumed r);
     rhs_into c out ind (var v) v.ty r;
     set_owned c line v true
   | I.Decl v ->
-    line (sprintf "%s %s;" (ctype c v.ty) (var v));
+    line (sprintf "%s%s %s;" (ctype c v.ty) (vol c v) (var v));
     cell_decl c line v false
   | I.Init (v, r) ->
     release_moved c line (I.consumed r);
@@ -762,7 +768,7 @@ and stmt c out ind (s : I.stmt) =
   | I.Mutate (v, steps, m) ->
     release_moved c line (I.mut_atoms m);
     line "{";
-    line (sprintf "  %s* p0_ = &%s;" (ctype c v.ty) (var v));
+    line (sprintf "  %s* p0_ = (%s*)&%s;" (ctype c v.ty) (ctype c v.ty) (var v));
     let p, t =
       List.fold_left
         (fun (p, t) (i, step) ->
@@ -878,13 +884,93 @@ and stmt c out ind (s : I.stmt) =
       set_owned c line v false;
       line (sprintf "%s_drop(%s);" (cname c v.ty) (var v))
     end
+  | I.Guard (n, handler, body) ->
+    (* A defer. The rest of its block runs under a panic boundary; normal
+       exits pop it (GuardEnd) and run the deferred body themselves. A panic
+       or a cancellation lands here (the guard cleanup is declared after this
+       frame's other locals, so it jumps back before they are touched), runs
+       the deferred body, and passes the panic or the cancellation on. What
+       the rest allocated stays with the enclosing boundary: an outer
+       variable may now point at it. *)
+    let g = sprintf "g%d_" n in
+    line "{";
+    line (sprintf "  WCatch %s;" g);
+    line (sprintf "  w_catch_init(&%s);" g);
+    line (sprintf "  WCatch **%sslot = w_catch_slot();" g);
+    line (sprintf "  if (_setjmp(%s.jb) == 0) {" g);
+    line (sprintf "    WCatch *%sland __attribute__((cleanup(w_catch_land))) = &%s;" g g);
+    line (sprintf "    if (%sslot) *%sslot = &%s;" g g g);
+    stmts c out (ind ^ "    ") body;
+    line "  } else {";
+    line (sprintf "    w_catch_end(&%s);" g);
+    line (sprintf "    int cancel_ = %s.cancel;" g);
+    line "    char m_[1024] = \"\", w_[512] = \"\";";
+    line (sprintf "    if (!cancel_) { snprintf(m_, sizeof m_, \"%%s\", %s.msg); snprintf(w_, sizeof w_, \"%%s\", %s.where); free(%s.msg); free(%s.where); }" g g g g);
+    stmts c out (ind ^ "    ") handler;
+    line "    if (cancel_) w_cancel_unwind();";
+    line "    w_panic_c(m_, w_);";
+    line "  }";
+    line "}"
+  | I.GuardEnd n ->
+    let g = sprintf "g%d_" n in
+    line (sprintf "if (%sslot) *%sslot = %s.prev;" g g g);
+    line (sprintf "w_catch_end(&%s);" g)
 
 let signature c (f : I.fn) =
-  let ps = List.map (fun (v : I.var) -> sprintf "%s %s" (ctype c v.ty) (var v)) f.params in
+  let ps = List.map (fun (v : I.var) -> sprintf "%s%s %s" (ctype c v.ty) (vol c v) (var v)) f.params in
   let ps = if f.is_closure then "WClo* self_" :: ps else ps in
   sprintf "static %s %s(%s)" (ctype c f.ret) f.fname (if ps = [] then "void" else String.concat ", " ps)
 
+(* The variables a guard needs volatile (see ctx.vols): those its deferred
+   body uses, and those declared outside its guarded statements that those
+   statements use (a write there changes a value or an owned flag that the
+   frame's cleanups read after the longjmp). Variables declared inside the
+   guarded statements are cleaned up by unwinding itself, before the jump. *)
+let guard_vols (body : I.stmt list) =
+  let module S = Set.Make (Int) in
+  let atoms_ids xs = List.filter_map (fun a -> Option.map (fun (v : I.var) -> v.id) (I.atom_var a)) xs in
+  let rhs_ids r = atoms_ids (I.consumed r @ I.borrowed r) in
+  let step_ids steps = atoms_ids (List.filter_map (function I.PIndex (a, _) | I.PIndexU a | I.PKey (a, _) -> Some a | I.PField _ -> None) steps) in
+  (* (declared, used) in a statement list *)
+  let rec scan ss =
+    List.fold_left
+      (fun (d, u) s ->
+        let d', u' = scan1 s in
+        (S.union d d', S.union u u'))
+      (S.empty, S.empty) ss
+  and scan1 = function
+    | I.Let (v, r) -> (S.singleton v.id, S.of_list (rhs_ids r))
+    | I.Decl v -> (S.singleton v.id, S.empty)
+    | I.Init (v, r) | I.Set (v, r, _) -> (S.empty, S.add v.id (S.of_list (rhs_ids r)))
+    | I.Mutate (v, steps, m) -> (S.empty, S.add v.id (S.of_list (step_ids steps @ atoms_ids (I.mut_atoms m))))
+    | I.If (cnd, a, b) ->
+      let d1, u1 = scan a and d2, u2 = scan b in
+      (S.union d1 d2, S.union (S.of_list (atoms_ids [ cnd ])) (S.union u1 u2))
+    | I.Loop b -> scan b
+    | I.Return a -> (S.empty, S.of_list (atoms_ids [ a ]))
+    | I.Drop v -> (S.empty, S.singleton v.id)
+    | I.Guard (_, h, b) ->
+      let d1, u1 = scan h and d2, u2 = scan b in
+      (S.union d1 d2, S.union u1 u2)
+    | I.Break | I.Continue | I.GuardEnd _ -> (S.empty, S.empty)
+  in
+  let rec walk acc ss =
+    List.fold_left
+      (fun acc s ->
+        match s with
+        | I.Guard (_, h, b) ->
+          let _, hu = scan h in
+          let bd, bu = scan b in
+          walk (walk (S.union acc (S.union hu (S.diff bu bd))) h) b
+        | I.If (_, a, b) -> walk (walk acc a) b
+        | I.Loop b -> walk acc b
+        | _ -> acc)
+      acc ss
+  in
+  S.elements (walk S.empty body)
+
 let fn_body c out (f : I.fn) =
+  c.vols <- guard_vols f.body;
   Buffer.add_string out (signature c f ^ " {\n");
   let line s = Buffer.add_string out ("  " ^ s ^ "\n") in
   (* parameters are owned by the function *)
@@ -893,12 +979,13 @@ let fn_body c out (f : I.fn) =
     Buffer.add_string out (sprintf "  struct Env_%s* env_ = (struct Env_%s*)self_;\n" f.fname f.fname);
     List.iteri
       (fun i (v : I.var) ->
-        Buffer.add_string out (sprintf "  %s %s = %s;\n" (ctype c v.ty) (var v) (dup_of c v.ty (sprintf "env_->c%d" i)));
+        Buffer.add_string out (sprintf "  %s%s %s = %s;\n" (ctype c v.ty) (vol c v) (var v) (dup_of c v.ty (sprintf "env_->c%d" i)));
         cell_decl c line v true)
       f.captures
   end;
   stmts c out "  " f.body;
-  Buffer.add_string out "  w_unreachable();\n}\n\n"
+  Buffer.add_string out "  w_unreachable();\n}\n\n";
+  c.vols <- []
 
 (* ---------- type definitions ---------- *)
 
@@ -1265,7 +1352,7 @@ let program (g : Lower.gctx) (prog : I.program) : string =
   uses_tls := false;
   let c =
     { g; names = Hashtbl.create 32; types = []; lits = Hashtbl.create 32; lit_order = []; boxed = [];
-      envs = Hashtbl.create 16; uniq = []; task_tys = []; inrange = []; chan_tys = []; dyns = []; cell_tys = [];
+      envs = Hashtbl.create 16; uniq = []; task_tys = []; inrange = []; chan_tys = []; dyns = []; cell_tys = []; vols = [];
       cmp_tys = []; sort_tys = []; hash_tys = []; csyms = [] }
   in
   (* bodies first: this discovers every type and literal *)

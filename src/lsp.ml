@@ -120,6 +120,7 @@ and walk_block f b =
       | SFor (_, _, e, b) -> walk_expr f e; walk_block f b
       | SLetPat (_, e) -> walk_expr f e
       | SForPat (_, e, b) -> walk_expr f e; walk_block f b
+      | SDefer b -> walk_block f b
       | SBreak | SContinue -> ())
     b.stmts;
   Option.iter (walk_expr f) b.tail

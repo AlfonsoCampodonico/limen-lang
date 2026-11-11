@@ -53,6 +53,7 @@ and fv_block bound acc b =
         | SReturn None | SBreak | SContinue -> (bound, acc)
         | SWhile (c, body) -> (bound, fv_block bound (fv bound acc c) body)
         | SFor (n, _, e, body) -> (bound, fv_block (n :: bound) (fv bound acc e) body)
+        | SDefer body -> (bound, fv_block bound acc body)
         | SLetPat _ | SForPat _ -> failwith "destructuring is expanded when modules load")
       (bound, acc) b.stmts
   in
@@ -96,6 +97,7 @@ and block_escape b =
       | SWhile (c, body) -> has_escape c || block_escape body
       | SFor (_, _, e, body) -> has_escape e || block_escape body
       | SLetPat _ | SForPat _ -> failwith "destructuring is expanded when modules load"
-      | SBreak | SContinue -> false)
+      | SBreak | SContinue -> false
+      | SDefer _ -> false (* a deferred body cannot leave (E0115) *))
     b.stmts
   || match b.tail with Some e -> has_escape e | None -> false

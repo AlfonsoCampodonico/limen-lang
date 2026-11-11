@@ -1388,8 +1388,23 @@ and call_fn rt d args =
 
 and eval_block rt env b =
   let env = Hashtbl.create 8 :: env in
-  List.iter (exec rt env) b.stmts;
-  match b.tail with Some e -> eval rt env e | None -> VUnit
+  run_stmts rt env b.stmts b.tail
+
+(* A `defer` runs the rest of its block, then its own body however that rest
+   ends: a value, return, break, continue, a panic or a cancellation. The body
+   sees the names in scope at the defer (later `let`s do not shadow them) and
+   their values when it runs. A panic in the body replaces whatever was
+   leaving the block. *)
+and run_stmts rt env ss tail =
+  match ss with
+  | [] -> ( match tail with Some e -> eval rt env e | None -> VUnit)
+  | { sdesc = SDefer d; _ } :: rest -> (
+    let at_defer = List.map Hashtbl.copy env in
+    let run_defer () = ignore (eval_block rt at_defer d) in
+    match run_stmts rt env rest tail with
+    | v -> run_defer (); v
+    | exception e -> run_defer (); raise e)
+  | s :: rest -> exec rt env s; run_stmts rt env rest tail
 
 and exec rt env s =
   match s.sdesc with
@@ -1431,6 +1446,7 @@ and exec rt env s =
     | _ -> failwith "internal: for")
   | SBreak -> raise Break_
   | SContinue -> raise Continue_
+  | SDefer _ -> failwith "internal: defer outside a block"
 
 (* Value semantics: assigning into a field or element rebuilds the container. *)
 and assign rt env lhs v =
