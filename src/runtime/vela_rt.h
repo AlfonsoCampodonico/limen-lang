@@ -1741,7 +1741,15 @@ static void w_group_reraise(WGroup *g) {
     }
 }
 static inline WGroup *Group_dup(WGroup *g) { g->rc++; return g; }
-static void Group_drop(WGroup *g) { if (--g->rc == 0) { pthread_mutex_destroy(&g->mu); free(g->tasks); w_free(g); } }
+/* The last reference can go before the join when the group's body panics:
+   its tasks may still be running, so wait for them before freeing. */
+static void Group_drop(WGroup *g) {
+  if (--g->rc == 0) {
+    w_group_wait(g);
+    w_group_release_tasks(g);
+    pthread_mutex_destroy(&g->mu); free(g->tasks); w_free(g);
+  }
+}
 static inline void Group_share(WGroup *g) { (void)g; }
 
 /* ---------- channels ----------

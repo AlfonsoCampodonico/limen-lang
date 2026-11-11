@@ -538,7 +538,9 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
    cleanup that drops it when the flag is set as its scope is left. Normal
    code clears the flag before moving or dropping the value, so the cleanup
    only acts during unwinding. *)
-let owns_memory _c t = not (is_scalar t)
+(* A group is left out: unwinding must not free it while its tasks run. It
+   stays on the boundary's list, and w_catch_release waits for them first. *)
+let owns_memory _c t = not (is_scalar t) && (match t with TGroup _ -> false | _ -> true)
 
 let cell_decl c line (v : I.var) on =
   if owns_memory c v.ty then begin
