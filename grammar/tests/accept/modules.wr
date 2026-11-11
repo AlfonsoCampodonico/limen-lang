@@ -1,0 +1,11 @@
+// use and pub
+use json
+
+pub struct P {
+    v: json.Value,
+}
+
+pub fn f(p: P) -> json.Value {
+    let q = json.Field { key: "k", value: p.v }
+    q.value
+}

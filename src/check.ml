@@ -210,8 +210,12 @@ let methods (t : ty) : (string * (unit -> ty list * ty)) list =
     [ m "len" [] TInt; m "is_empty" [] TBool; m "lines" [] (TList TStr);
       m "split" [ TStr ] (TList TStr); m "trim" [] TStr; m "contains" [ TStr ] TBool;
       m "starts_with" [ TStr ] TBool; m "ends_with" [ TStr ] TBool; m "to_upper" [] TStr;
-      m "to_lower" [] TStr; m "replace" [ TStr; TStr ] TStr; m "parse_int" [] (opt TInt) ]
-  | TInt -> [ m "to_str" [] TStr; m "to_float" [] TFloat; m "abs" [] TInt ]
+      m "to_lower" [] TStr; m "replace" [ TStr; TStr ] TStr; m "parse_int" [] (opt TInt);
+      m "parse_float" [] (opt TFloat); m "slice" [ TInt; TInt ] TStr; m "index_of" [ TStr ] (opt TInt);
+      m "bytes" [] (TList TInt) ]
+  | TInt ->
+    [ m "to_str" [] TStr; m "to_float" [] TFloat; m "abs" [] TInt; m "to_char" [] TStr; m "min" [ TInt ] TInt;
+      m "max" [ TInt ] TInt ]
   | TFloat -> [ m "to_str" [] TStr; m "to_int" [] TInt; m "abs" [] TFloat; m "sqrt" [] TFloat ]
   | TBool -> [ m "to_str" [] TStr ]
   | TList a ->

@@ -141,6 +141,20 @@ let lines s =
   match List.rev ls with "" :: rest -> List.rev rest | _ -> ls
 
 (* Decimal only, optional sign, surrounding whitespace allowed (same as the C runtime). *)
+(* A decimal float: digits with optional sign, point and exponent; no hex, nan or inf. *)
+let parse_float s =
+  let s = String.trim s in
+  let ok_char c = (c >= '0' && c <= '9') || c = '.' || c = '-' || c = '+' || c = 'e' || c = 'E' in
+  if s = "" || (not (String.for_all ok_char s)) || not (String.exists (fun c -> c >= '0' && c <= '9') s) then None
+  else float_of_string_opt s
+
+(* The UTF-8 encoding of a code point; U+FFFD for anything that is not one. *)
+let utf8_of_code n =
+  let n = if n < 0 || n > 0x10FFFF || (n >= 0xD800 && n <= 0xDFFF) then 0xFFFD else n in
+  let b = Buffer.create 4 in
+  Buffer.add_utf_8_uchar b (Uchar.of_int n);
+  Buffer.contents b
+
 let parse_decimal s =
   let s = String.trim s in
   let n = String.length s in
@@ -571,6 +585,17 @@ and call_method rt v name args sp =
   | VStr s, "to_lower", [] -> VStr (String.lowercase_ascii s)
   | VStr s, "replace", [ VStr a; VStr b ] -> VStr (replace_all s a b)
   | VStr s, "parse_int", [] -> ( match parse_decimal s with Some n -> some (VInt n) | None -> none)
+  | VStr s, "parse_float", [] -> ( match parse_float s with Some x -> some (VFloat x) | None -> none)
+  | VStr s, "slice", [ VInt lo; VInt hi ] ->
+    let n = String.length s in
+    let lo = max 0 (min lo n) in
+    let hi = max lo (min hi n) in
+    VStr (String.sub s lo (hi - lo))
+  | VStr s, "index_of", [ VStr t ] -> ( match find_sub s t 0 with Some i -> some (VInt i) | None -> none)
+  | VStr s, "bytes", [] -> VList (Array.init (String.length s) (fun i -> VInt (Char.code s.[i])))
+  | VInt n, "to_char", [] -> VStr (utf8_of_code n)
+  | VInt a, "min", [ VInt b ] -> VInt (min a b)
+  | VInt a, "max", [ VInt b ] -> VInt (max a b)
   | VInt n, "to_str", [] -> VStr (string_of_int n)
   | VInt n, "to_float", [] -> VFloat (float_of_int n)
   | VInt n, "abs", [] -> VInt (abs n)

@@ -73,4 +73,6 @@ let item = function
     ^ String.concat "," (List.map (fun (v, _, ts) -> v ^ "(" ^ String.concat "," (List.map ty ts) ^ ")") e.en_variants)
     ^ "}"
 
-let items is = String.concat "\n" (List.map item is)
+let pub_of = function IFn d -> d.fn_pub | IStruct s -> s.st_pub | IEnum e -> e.en_pub
+let items is = String.concat "\n" (List.map (fun i -> (if pub_of i then "pub " else "") ^ item i) is)
+let file (f : file) = String.concat "\n" (List.map (fun (u, _) -> "use " ^ u) f.uses) ^ "\n" ^ items f.items

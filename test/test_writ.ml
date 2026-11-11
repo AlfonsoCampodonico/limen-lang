@@ -28,7 +28,7 @@ let dump name src parsed =
 let fmt_checked : (string, unit) Hashtbl.t = Hashtbl.create 64
 let fmt_failures = ref []
 
-let check_fmt name src items =
+let check_fmt name src () =
   if not (Hashtbl.mem fmt_checked name) then begin
     Hashtbl.replace fmt_checked name ();
     let file = name ^ ".wr" in
@@ -37,32 +37,39 @@ let check_fmt name src items =
     match Fmt.format ~file:("fmt-" ^ file) src with
     | exception Diag.Fatal d -> fmt_failures := (name, "formatting failed: " ^ d.message) :: !fmt_failures
     | out -> (
-      match Parser.parse_program ("fmt-out-" ^ file) out with
+      match Parser.parse_file ("fmt-out-" ^ file) out with
       | exception Diag.Fatal d -> fmt_failures := (name, "output does not parse: " ^ d.message ^ "\n" ^ out) :: !fmt_failures
-      | items2 ->
-        if Astdump.items items <> Astdump.items items2 then
+      | f2 ->
+        if Astdump.file (Parser.parse_file ("fmt-in-" ^ file) src) <> Astdump.file f2 then
           fmt_failures := (name, "tree changed:\n" ^ out) :: !fmt_failures
         else if Fmt.format ~file:("fmt2-" ^ file) out <> out then
           fmt_failures := (name, "not idempotent:\n" ^ out ^ "---\n" ^ Fmt.format ~file:("fmt3-" ^ file) out) :: !fmt_failures
         else if comments_of out <> before then fmt_failures := (name, "comments changed:\n" ^ out) :: !fmt_failures)
   end
 
-let compile name src =
+(* [modules]: other files (name, source) written next to the program, for `use`. *)
+let compile ?(modules = []) name src =
   let file = name ^ ".wr" in
-  Source.add file src;
-  match Parser.parse_program file src with
+  let file =
+    if modules = [] then file
+    else begin
+      let dir = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "writ-mods-%d-%s" (Unix.getpid ()) name) in
+      (try Unix.mkdir dir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+      List.iter (fun (m, s) -> Out_channel.with_open_bin (Filename.concat dir (m ^ ".wr")) (fun oc -> output_string oc s)) modules;
+      Filename.concat dir file
+    end
+  in
+  match Parser.parse_file file src with
   | exception Diag.Fatal d -> dump name src false; ([], [ d ], [])
-  | items ->
+  | _ -> (
     dump name src true;
-    check_fmt name src items;
-    Source.add file src;
-    let ds, infos = Check.check_program items in
-    (items, ds, infos)
+    check_fmt name src ();
+    Modules.load_and_check file src)
 
 let codes ds = List.map (fun (d : Diag.t) -> d.code) ds
 
-let run ?(grants = Interp.no_grants) name src =
-  let items, ds, _ = compile name src in
+let run ?(grants = Interp.no_grants) ?modules name src =
+  let items, ds, _ = compile ?modules name src in
   if ds <> [] then Error ("diagnostics: " ^ String.concat ", " (List.map (fun (d : Diag.t) -> d.code ^ " " ^ d.message) ds))
   else
     let buf = Buffer.create 64 in
@@ -82,8 +89,8 @@ let sanitize = [ "-O1"; "-g"; "-fsanitize=address,undefined"; "-fno-sanitize-rec
 
 let read_file p = In_channel.with_open_bin p In_channel.input_all
 
-let run_native ?(grants = Interp.no_grants) name src =
-  let items, ds, _ = compile name src in
+let run_native ?(grants = Interp.no_grants) ?modules name src =
+  let items, ds, _ = compile ?modules name src in
   if ds <> [] then Error "does not compile" else
   let exe = Filename.concat tmpdir name in
   match Native.build ~flags:sanitize items exe with
@@ -102,9 +109,9 @@ let run_native ?(grants = Interp.no_grants) name src =
     let code = Sys.command ("ASAN_OPTIONS=detect_leaks=0 WRIT_LEAKCHECK=1 " ^ cmd) in
     Ok (code, read_file o, read_file e)
 
-let check_native name ?grants src ~want_out ~want_err_prefix =
+let check_native name ?grants ?modules src ~want_out ~want_err_prefix =
   if native_enabled then
-    match run_native ?grants name src with
+    match run_native ?grants ?modules name src with
     | Error m -> ok (name ^ "/native") false m
     | Ok (code, o, e) -> (
       ok (name ^ "/native") (o = want_out) (sprintf "stdout %S, want %S (stderr %S)" o want_out e);
@@ -140,14 +147,14 @@ let check_tsan name ?(grants = Interp.no_grants) src want =
       ok (name ^ "/tsan") (code = 0 && o = want && e = "writ-leakcheck: 0 live\n") (sprintf "exit %d, stdout %S, stderr %S" code o e)
   end
 
-let out name ?grants src want =
-  (match run ?grants name src with
+let out name ?grants ?modules src want =
+  (match run ?grants ?modules name src with
    | Ok (got, _) -> ok name (got = want) (sprintf "got %S, want %S" got want)
    | Error e -> ok name false e);
-  check_native name ?grants src ~want_out:want ~want_err_prefix:None
+  check_native name ?grants ?modules src ~want_out:want ~want_err_prefix:None
 
-let errs name src want =
-  let _, ds, _ = compile name src in
+let errs ?modules name src want =
+  let _, ds, _ = compile ?modules name src in
   ok name (codes ds = want) (sprintf "got [%s], want [%s]" (String.concat " " (codes ds)) (String.concat " " want))
 
 let panics name src want =
@@ -1034,6 +1041,86 @@ fn main(root: Root) {
      J.parse (J.to_string j) = j)
     "json";
 
+  (* ---------- string and int built-ins ---------- *)
+  out "str-builtins"
+    (main_wrap
+       ("    let s = \"héllo, world\"\n    out.print(s.slice(0, 6) + \"|\" + s.slice(8, 100) + \"|\" + s.slice(5, 2) + \"|\" + s.slice(-3, 1))\n"
+       ^ "    out.print(\"{s.index_of(\"world\").unwrap_or(-1)} {s.index_of(\"xyz\").unwrap_or(-1)}\")\n"
+       ^ "    out.print(\"{\"Ab\".bytes()} {\"é\".bytes().len()}\")\n"
+       ^ "    out.print(\"{\" 2.5e3 \".parse_float().unwrap_or(0.0)} {\"-1\".parse_float().unwrap_or(0.0)} {\"nan\".parse_float().is_none()} {\"1x\".parse_float().is_none()}\")\n"
+       ^ "    out.print(65.to_char() + 233.to_char() + 8364.to_char() + 128512.to_char() + (-1).to_char().len().to_str())\n"
+       ^ "    out.print(\"{3.min(5)} {3.max(5)} {(-2).min(-7)}\")"))
+    "h\195\169llo|world||h\n8 -1\n[65, 98] 2\n2500.0 -1.0 true true\nAé€\240\159\152\1283\n3 5 -7\n";
+
+  (* ---------- the standard library ---------- *)
+  let example f =
+    let dir = if Sys.file_exists "../examples/stdlib.wr" then "../examples" else "examples" in
+    In_channel.with_open_bin (Filename.concat dir f) In_channel.input_all
+  in
+  out "std-json-list-text" (example "stdlib.wr") "{\"name\":\"Ada\",\"tags\":[\"x\",\"yé😀\"],\"n\":-125,\"ok\":true,\"none\":null,\"nested\":{\"a\":[1,2,{}]}}\nAda\n-125.0\nexpected a value at byte 3\nexpected `:` at byte 5\nexpected a value at byte 0\nexpected a closing `\"` at byte 4\nexpected end of input at byte 4\nexpected a value at byte 0\n{\"q\":\"a\\\"b\\n\\u0001\",\"xs\":[1,null,false]}\na,b,c\n[0, 1, 2, 3, 4] 2 [1, 3] [1, 2, 3] [1, 2]\n007|ab..|---|2|[\"hi\", \"there\", \"you\"]\n";
+  out "std-http"
+    ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] }
+    (example "http_demo.wr")
+    "served 3\n200 text/plain; charset=utf-8 hi GET\n404 text/plain; charset=utf-8 no /missing\n201 {\"got\":[1,{\"a\":true}]}\nchunked sent\n200 hello world\n";
+  (* std code is checked like user code: a json error names the byte *)
+  out "std-json-errors"
+    "use json\n\nfn main(root: Root) {\n    for s in [\"\\{\\\"a\\\": [1, 2.5e1, \\\"\\\\u0041\\\"]\\}\", \"[1 2]\", \"\\\"\\\\x\\\"\"] {\n        match json.parse(s) {\n            Ok(v) => root.stdout.print(json.stringify(v)),\n            Err(e) => root.stdout.print(e),\n        }\n    }\n}\n"
+    "{\"a\":[1,25,\"A\"]}\nexpected `,` or `]` at byte 3\nexpected a valid escape at byte 1\n";
+
+  (* ---------- modules ---------- *)
+  let geom =
+    "// geometry\npub struct Point {\n    x: Int,\n    y: Int,\n}\n\npub enum Shape {\n    Dot(Point),\n    Box(Point, Point),\n}\n\n"
+    ^ "fn sq(n: Int) -> Int {\n    n * n\n}\n\npub fn dist2(a: Point, b: Point) -> Int {\n    sq(a.x - b.x) + sq(a.y - b.y)\n}\n\n"
+    ^ "pub fn origin() -> Point {\n    Point { x: 0, y: 0 }\n}\n\n"
+    ^ "pub fn area(s: Shape) -> Int {\n    match s {\n        Shape.Dot(_) => 0,\n        Box(a, b) => (b.x - a.x) * (b.y - a.y),\n    }\n}\n\n"
+    ^ "test \"ignored when imported\" {\n    assert(false)\n}\n"
+  in
+  let modules = [ ("geom", geom) ] in
+  out "modules" ~modules
+    ("use geom\n\nfn describe(s: geom.Shape) -> Str {\n    match s {\n        geom.Dot(p) => \"dot at {p.x},{p.y}\",\n        geom.Box(_, _) => \"box of area {geom.area(s)}\",\n    }\n}\n\n"
+     ^ "fn sq(s: Str) -> Str {\n    s + s\n}\n\n"
+     ^ "fn main(root: Root) {\n    let p = geom.Point { x: 3, y: 4 }\n    let o = geom.origin()\n    root.stdout.print(\"d2 = {geom.dist2(p, o)} {sq(\"ab\")}\")\n"
+     ^ "    for s in [geom.Dot(p), geom.Box(o, p)] {\n        root.stdout.print(describe(s))\n    }\n    let f = geom.dist2\n    root.stdout.print(\"{f(o, p)}\")\n}\n")
+    "d2 = 25 abab\ndot at 3,4\nbox of area 12\n25\n";
+  (* a local variable shadows a module name *)
+  out "modules-shadow" ~modules "use geom\n\nfn main(root: Root) {\n    let geom = [1, 2]\n    root.stdout.print(\"{geom.len()}\")\n}\n" "2\n";
+  (* a module that uses another module *)
+  out "modules-nested"
+    ~modules:[ ("a", "use b\n\npub fn twice(n: Int) -> Int {\n    b.inc(b.inc(n))\n}\n"); ("b", "pub fn inc(n: Int) -> Int {\n    n + 1\n}\n") ]
+    "use a\n\nfn main(root: Root) {\n    root.stdout.print(\"{a.twice(1)}\")\n}\n" "3\n";
+  errs "modules-private" ~modules "use geom\n\nfn main(root: Root) {\n    root.stdout.print(\"{geom.sq(2)}\")\n}\n" [ "E0402" ];
+  errs "modules-missing-member" ~modules "use geom\n\nfn main(root: Root) {\n    geom.nope()\n}\n" [ "E0403" ];
+  errs "modules-not-found" "use nowhere\n\nfn main(root: Root) {}\n" [ "E0401" ];
+  errs "modules-no-use" ~modules "fn main(root: Root) {\n    let p: geom.Point = geom.origin()\n}\n" [ "E0401" ];
+  errs "modules-type-check" ~modules "use geom\n\nfn main(root: Root) {\n    let p: geom.Point = 1\n}\n" [ "E0201" ];
+  errs "modules-not-value" ~modules "use geom\n\nfn main(root: Root) {\n    let g = geom\n}\n" [ "E0404" ];
+  (* packages: each dependency may only use the capabilities writ.toml grants it *)
+  let pdir = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "writ-pkg-%d" (Unix.getpid ())) in
+  List.iter (fun d -> try Unix.mkdir d 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ())
+    [ pdir; Filename.concat pdir "app"; Filename.concat pdir "fetch" ];
+  let put f s = Out_channel.with_open_bin (Filename.concat pdir f) (fun oc -> output_string oc s) in
+  put "fetch/fetch.wr" "use util\n\npub fn get(net: Net, u: Str) -> Str {\n    util.first(net.get(u).unwrap_or(\"none\"))\n}\n";
+  put "fetch/util.wr" "pub fn first(s: Str) -> Str {\n    s.lines().first().unwrap_or(\"\")\n}\n\npub fn sneaky(fs: Fs) -> Bool {\n    fs.exists(\"x\")\n}\n";
+  let app = "use fetch\n\nfn main(root: Root) {\n    root.stdout.print(fetch.get(root.net, \"http://h\"))\n}\n" in
+  put "app/main.wr" app;
+  let pkg_codes toml =
+    put "app/writ.toml" toml;
+    let path = Filename.concat pdir "app/main.wr" in
+    let _, ds, _ = Modules.load_and_check path app in
+    codes ds
+  in
+  ok "pkg-denied" (pkg_codes "[package]\nname = \"app\"\n\n[dependencies]\nfetch = { path = \"../fetch\" }\n" = [ "E0320"; "E0320" ]) "two functions over their grant";
+  ok "pkg-partial" (pkg_codes "[package]\nname = \"app\"\n[dependencies]\nfetch = { path = \"../fetch\", caps = [\"net\"] }\n" = [ "E0320" ]) "util.sneaky takes Fs";
+  ok "pkg-granted" (pkg_codes "[package]\nname = \"app\"\n[dependencies]\nfetch = { path = \"../fetch\", caps = [\"net\", \"fs\"] }  # both\n" = []) "granted";
+  ok "pkg-bad-toml" (pkg_codes "[package]\nname = \"app\"\n[dependencies]\nfetch = { path = \"../fetch\", caps = [\"disk\"] }\n" = [ "E0321" ]) "bad cap";
+  ok "pkg-missing-dir" (pkg_codes "[package]\nname = \"app\"\n[dependencies]\nother = { path = \"../nope\" }\n" = [ "E0401" ]) "fetch not found";
+  Sys.remove (Filename.concat pdir "app/writ.toml");
+
+  ok "fmt-use-pub"
+    (Fmt.format ~file:"fu.wr" "use geom // g\npub   fn f() -> Int { 1 }\npub struct S { a: Int }\n"
+     = "use geom  // g\n\npub fn f() -> Int { 1 }\n\npub struct S {\n    a: Int,\n}\n")
+    (Fmt.format ~file:"fu.wr" "use geom // g\npub   fn f() -> Int { 1 }\npub struct S { a: Int }\n");
+
   (* the formatter on the examples and benchmarks too (with their comments) *)
   List.iter
     (fun dir ->
@@ -1044,7 +1131,7 @@ fn main(root: Root) {
               let path = Filename.concat dir f in
               let src = In_channel.with_open_bin path In_channel.input_all in
               match Parser.parse_program path src with
-              | items -> check_fmt ("file-" ^ f) src items
+              | _ -> check_fmt ("file-" ^ f) src ()
               | exception Diag.Fatal _ -> ()
             end)
           (Sys.readdir dir))

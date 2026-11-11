@@ -364,6 +364,21 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
       line "  int64_t n_;";
       line (sprintf "  %s = Str_parse_int(%s, &n_) ? %s : %s;" dst (arg 0) (mk_enum c t 0 [ "n_" ]) (mk_enum c t 1 []));
       line "}"
+    | "str_parse_float", _ ->
+      line "{";
+      line "  double x_;";
+      line (sprintf "  %s = Str_parse_float(%s, &x_) ? %s : %s;" dst (arg 0) (mk_enum c t 0 [ "x_" ]) (mk_enum c t 1 []));
+      line "}"
+    | "str_slice", _ -> set (sprintf "Str_slice(%s, %s, %s)" (arg 0) (arg 1) (arg 2))
+    | "str_index_of", _ ->
+      line "{";
+      line (sprintf "  int64_t i_ = Str_find(%s, %s, 0);" (arg 0) (arg 1));
+      line (sprintf "  %s = i_ >= 0 ? %s : %s;" dst (mk_enum c t 0 [ "i_" ]) (mk_enum c t 1 []));
+      line "}"
+    | "str_bytes", _ -> set (sprintf "Str_bytes(%s)" (arg 0))
+    | "int_to_char", _ -> set (sprintf "Int_to_char(%s)" (arg 0))
+    | "int_min", _ -> set (sprintf "(%s < %s ? %s : %s)" (arg 0) (arg 1) (arg 0) (arg 1))
+    | "int_max", _ -> set (sprintf "(%s > %s ? %s : %s)" (arg 0) (arg 1) (arg 0) (arg 1))
     | ("int_to_str" | "float_to_str" | "bool_to_str"), _ -> show_into [ `Val (arg 0, rt) ]
     | "int_to_float", _ -> set (sprintf "(double)%s" (arg 0))
     | "int_abs", _ -> set (sprintf "w_abs(%s)" (arg 0))

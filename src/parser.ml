@@ -74,14 +74,23 @@ let rec parse_type st : ty_expr =
   | INT n ->
     ignore (advance st);
     { tdesc = TyInt n; tspan = t.span }
-  | IDENT n ->
+  | IDENT n0 ->
     ignore (advance st);
+    (* a type from another module: `json.Value` *)
+    let n =
+      if is_sym st "." then begin
+        ignore (advance st);
+        let m, _ = expect_ident st in
+        n0 ^ "." ^ m
+      end
+      else n0
+    in
     if is_sym st "[" && not (peek st).nl then begin
       ignore (advance st);
       let args = comma_list st "]" parse_type in
       { tdesc = TyName (n, args); tspan = merge t.span (last_span st) }
     end
-    else { tdesc = TyName (n, []); tspan = t.span }
+    else { tdesc = TyName (n, []); tspan = merge t.span (last_span st) }
   | _ -> fail t "a type"
 
 let binop_of = function
@@ -170,7 +179,15 @@ and parse_primary st ns =
     mk (EStr (List.map (str_part st) parts)) t.span
   | IDENT name ->
     ignore (advance st);
+    let tok k = st.toks.(min (st.pos + k) (Array.length st.toks - 1)) in
     if (not ns) && is_upper name && is_sym st "{" then parse_struct_lit st name t.span
+    else if (not ns) && is_sym st "." && (match (tok 1).tok with IDENT b -> is_upper b | _ -> false) && (tok 2).tok = SYM "{"
+            && not (tok 1).nl then begin
+      (* a struct from another module: `json.Field { ... }` *)
+      ignore (advance st);
+      let b, bsp = expect_ident st in
+      parse_struct_lit st (name ^ "." ^ b) (merge t.span bsp)
+    end
     else mk (EVar name) t.span
   | SYM "(" ->
     ignore (advance st);
@@ -392,7 +409,7 @@ let parse_item st =
     (* the generated name cannot be written in source, so tests cannot be called *)
     IFn
       { fn_name = Printf.sprintf "test#%d" !test_count; fn_span = s.span; fn_gen = []; fn_params = []; fn_ret = None;
-        fn_body = body; fn_test = Some name }
+        fn_body = body; fn_test = Some name; fn_pub = false }
   | KW "fn" ->
     ignore (advance st);
     let name, nsp = expect_ident st in
@@ -411,7 +428,7 @@ let parse_item st =
     in
     let ret = if accept_sym st "->" then Some (parse_type st) else None in
     let body = parse_block st in
-    IFn { fn_name = name; fn_span = nsp; fn_gen = gen; fn_params = params; fn_ret = ret; fn_body = body; fn_test = None }
+    IFn { fn_name = name; fn_span = nsp; fn_gen = gen; fn_params = params; fn_ret = ret; fn_body = body; fn_test = None; fn_pub = false }
   | KW "struct" ->
     ignore (advance st);
     let name, nsp = expect_ident st in
@@ -423,7 +440,7 @@ let parse_item st =
           ignore (expect_sym st ":");
           (f, fsp, parse_type st))
     in
-    IStruct { st_name = name; st_span = nsp; st_gen = gen; st_fields = fields }
+    IStruct { st_name = name; st_span = nsp; st_gen = gen; st_fields = fields; st_pub = false }
   | KW "enum" ->
     ignore (advance st);
     let name, nsp = expect_ident st in
@@ -435,15 +452,33 @@ let parse_item st =
           let payload = if accept_sym st "(" then comma_list st ")" parse_type else [] in
           (v, vsp, payload))
     in
-    IEnum { en_name = name; en_span = nsp; en_gen = gen; en_variants = variants }
+    IEnum { en_name = name; en_span = nsp; en_gen = gen; en_variants = variants; en_pub = false }
   | _ -> fail t "an item (`fn`, `struct` or `enum`)"
 
-let parse_program file src : item list =
+let set_pub = function
+  | IFn d -> IFn { d with fn_pub = true }
+  | IStruct s -> IStruct { s with st_pub = true }
+  | IEnum e -> IEnum { e with en_pub = true }
+
+let parse_file file src : file =
   test_count := 0;
   let toks = Lexer.lex file src in
   let st = { toks; pos = 0; file } in
-  let items = ref [] in
+  let items = ref [] and uses = ref [] in
   while (peek st).tok <> EOF do
-    items := parse_item st :: !items
+    if is_kw st "use" then begin
+      ignore (advance st);
+      let m, msp = expect_ident st in
+      uses := (m, msp) :: !uses
+    end
+    else if is_kw st "pub" then begin
+      ignore (advance st);
+      match (peek st).tok with
+      | KW ("fn" | "struct" | "enum") -> items := set_pub (parse_item st) :: !items
+      | _ -> fail (peek st) "`fn`, `struct` or `enum` after `pub`"
+    end
+    else items := parse_item st :: !items
   done;
-  List.rev !items
+  { uses = List.rev !uses; items = List.rev !items }
+
+let parse_program file src : item list = (parse_file file src).items

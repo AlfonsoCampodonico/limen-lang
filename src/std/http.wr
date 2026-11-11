@@ -1,0 +1,329 @@
+// HTTP/1.1 over plain TCP: a client on top of Net, and a server on top of
+// Listener and Conn. No TLS yet.
+
+pub struct Header {
+    name: Str,
+    value: Str,
+}
+
+pub struct Request {
+    method: Str,
+    path: Str,
+    headers: List[Header],
+    body: Str,
+}
+
+pub struct Response {
+    status: Int,
+    headers: List[Header],
+    body: Str,
+}
+
+// The value of a header, matching its name without regard to case.
+pub fn header(headers: List[Header], name: Str) -> Option[Str] {
+    let want = name.to_lower()
+    for h in headers {
+        if h.name.to_lower() == want {
+            return Some(h.value)
+        }
+    }
+    None
+}
+
+// A response with a body of plain text.
+pub fn text(status: Int, body: Str) -> Response {
+    Response { status, headers: [Header { name: "Content-Type", value: "text/plain; charset=utf-8" }], body }
+}
+
+// A response with a JSON body (already serialized).
+pub fn json(status: Int, body: Str) -> Response {
+    Response { status, headers: [Header { name: "Content-Type", value: "application/json" }], body }
+}
+
+pub fn reason(status: Int) -> Str {
+    match status {
+        200 => "OK",
+        201 => "Created",
+        204 => "No Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        304 => "Not Modified",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        413 => "Payload Too Large",
+        500 => "Internal Server Error",
+        _ => "Status",
+    }
+}
+
+// ---------- message parsing, shared by client and server ----------
+
+struct Head {
+    first: Str,
+    headers: List[Header],
+    rest: Str,
+}
+
+fn bad(msg: Str) -> IoError {
+    Failed("http: " + msg)
+}
+
+// Split a message at the blank line after its headers.
+fn split_head(data: Str) -> Result[Head, IoError] {
+    let end = match data.index_of("\r\n\r\n") {
+        Some(i) => i,
+        None => { return Err(bad("incomplete headers")) },
+    }
+    let lines = data.slice(0, end).split("\r\n")
+    let mut headers = []
+    let mut i = 1
+    while i < lines.len() {
+        let l = lines[i]
+        match l.index_of(":") {
+            Some(k) => headers.push(Header { name: l.slice(0, k).trim(), value: l.slice(k + 1, l.len()).trim() }),
+            None => { return Err(bad("malformed header line")) },
+        }
+        i = i + 1
+    }
+    Ok(Head { first: lines[0], headers, rest: data.slice(end + 4, data.len()) })
+}
+
+fn content_length(headers: List[Header]) -> Result[Int, IoError] {
+    match header(headers, "Content-Length") {
+        Some(v) => match v.parse_int() {
+            Some(n) => if n >= 0 { Ok(n) } else { Err(bad("negative Content-Length")) },
+            None => Err(bad("bad Content-Length")),
+        },
+        None => Ok(0),
+    }
+}
+
+fn hex_value(s: Str) -> Option[Int] {
+    let t = s.trim()
+    if t == "" || t.len() > 15 {
+        return None
+    }
+    let mut n = 0
+    for b in t.bytes() {
+        let d = if b >= 48 && b <= 57 {
+            b - 48
+        } else if b >= 97 && b <= 102 {
+            b - 87
+        } else if b >= 65 && b <= 70 {
+            b - 55
+        } else {
+            -1
+        }
+        if d < 0 {
+            return None
+        }
+        n = n * 16 + d
+    }
+    Some(n)
+}
+
+// Decode a `Transfer-Encoding: chunked` body.
+fn dechunk(data: Str) -> Result[Str, IoError] {
+    let mut out = ""
+    let mut rest = data
+    while true {
+        let eol = match rest.index_of("\r\n") {
+            Some(i) => i,
+            None => { return Err(bad("truncated chunk")) },
+        }
+        // a chunk size may carry `;extensions`
+        let size_text = match rest.slice(0, eol).index_of(";") {
+            Some(k) => rest.slice(0, k),
+            None => rest.slice(0, eol),
+        }
+        let size = match hex_value(size_text) {
+            Some(n) => n,
+            None => { return Err(bad("bad chunk size")) },
+        }
+        if size == 0 {
+            return Ok(out)
+        }
+        let start = eol + 2
+        if start + size > rest.len() {
+            return Err(bad("truncated chunk"))
+        }
+        out = out + rest.slice(start, start + size)
+        rest = rest.slice(start + size + 2, rest.len())
+    }
+    Ok(out)
+}
+
+fn head_text(first: Str, headers: List[Header], body: Str) -> Str {
+    let mut s = first + "\r\n"
+    let mut has_len = false
+    for h in headers {
+        if h.name.to_lower() == "content-length" {
+            has_len = true
+        }
+        s = s + h.name + ": " + h.value + "\r\n"
+    }
+    if !has_len {
+        s = s + "Content-Length: {body.len()}\r\n"
+    }
+    s + "\r\n" + body
+}
+
+// ---------- client ----------
+
+struct Url {
+    host: Str,
+    port: Int,
+    path: Str,
+}
+
+fn parse_url(url: Str) -> Result[Url, IoError] {
+    if url.starts_with("https://") {
+        return Err(bad("https is not supported yet"))
+    }
+    if !url.starts_with("http://") {
+        return Err(bad("the URL must start with http://"))
+    }
+    let rest = url.slice(7, url.len())
+    let slash = rest.index_of("/").unwrap_or(rest.len())
+    let authority = rest.slice(0, slash)
+    let path = if slash < rest.len() { rest.slice(slash, rest.len()) } else { "/" }
+    match authority.index_of(":") {
+        Some(k) => match authority.slice(k + 1, authority.len()).parse_int() {
+            Some(p) => Ok(Url { host: authority.slice(0, k), port: p, path }),
+            None => Err(bad("bad port in URL")),
+        },
+        None => Ok(Url { host: authority, port: 80, path }),
+    }
+}
+
+// Send a request and read the whole response. The connection is closed
+// afterwards. `net` must allow the URL's host.
+pub fn request(net: Net, method: Str, url: Str, headers: List[Header], body: Str) -> Result[Response, IoError] {
+    let u = parse_url(url)?
+    let c = net.connect("{u.host}:{u.port}")?
+    let mut all = [Header { name: "Host", value: u.host }, Header { name: "Connection", value: "close" }]
+    for h in headers {
+        all.push(h)
+    }
+    c.write(head_text("{method} {u.path} HTTP/1.1", all, body))?
+    let mut data = ""
+    let mut more = true
+    while more {
+        let chunk = c.read()?
+        if chunk == "" {
+            more = false
+        } else {
+            data = data + chunk
+        }
+    }
+    c.close()
+    let h = split_head(data)?
+    let parts = h.first.split(" ")
+    if parts.len() < 2 || !parts[0].starts_with("HTTP/") {
+        return Err(bad("malformed status line"))
+    }
+    let status = match parts[1].parse_int() {
+        Some(n) => n,
+        None => { return Err(bad("malformed status line")) },
+    }
+    let chunked = header(h.headers, "Transfer-Encoding").map(|v| v.to_lower().contains("chunked")).unwrap_or(false)
+    let body = if chunked {
+        dechunk(h.rest)?
+    } else {
+        match header(h.headers, "Content-Length") {
+            Some(_) => h.rest.slice(0, content_length(h.headers)?),
+            None => h.rest,
+        }
+    }
+    Ok(Response { status, headers: h.headers, body })
+}
+
+pub fn get(net: Net, url: Str) -> Result[Response, IoError] {
+    request(net, "GET", url, [], "")
+}
+
+pub fn post(net: Net, url: Str, content_type: Str, body: Str) -> Result[Response, IoError] {
+    request(net, "POST", url, [Header { name: "Content-Type", value: content_type }], body)
+}
+
+// ---------- server ----------
+
+fn max_head() -> Int {
+    65536
+}
+
+fn max_body() -> Int {
+    8388608
+}
+
+// Read one request from a connection. Errors if the peer closes first or
+// sends more than 64 KiB of headers or 8 MiB of body.
+pub fn read_request(c: Conn) -> Result[Request, IoError] {
+    let mut data = ""
+    while !data.contains("\r\n\r\n") {
+        if data.len() > max_head() {
+            return Err(bad("request headers too large"))
+        }
+        let chunk = c.read()?
+        if chunk == "" {
+            return Err(bad("connection closed before the request was complete"))
+        }
+        data = data + chunk
+    }
+    let h = split_head(data)?
+    let parts = h.first.split(" ")
+    if parts.len() != 3 || !parts[2].starts_with("HTTP/1.") {
+        return Err(bad("malformed request line"))
+    }
+    let n = content_length(h.headers)?
+    if n > max_body() {
+        return Err(bad("request body too large"))
+    }
+    let mut body = h.rest
+    while body.len() < n {
+        let chunk = c.read()?
+        if chunk == "" {
+            return Err(bad("connection closed before the body was complete"))
+        }
+        body = body + chunk
+    }
+    Ok(Request { method: parts[0], path: parts[1], headers: h.headers, body: body.slice(0, n) })
+}
+
+pub fn write_response(c: Conn, r: Response) -> Result[(), IoError] {
+    let mut hs = r.headers
+    hs.push(Header { name: "Connection", value: "close" })
+    c.write(head_text("HTTP/1.1 {r.status} {reason(r.status)}", hs, r.body))
+}
+
+// Answer one connection: read a request, reply with `handler`'s response
+// (or 400 if the request is malformed), then close. True if it was answered.
+pub fn handle(c: Conn, handler: fn(Request) -> Response) -> Bool {
+    let r = match read_request(c) {
+        Ok(req) => handler(req),
+        Err(_) => text(400, "bad request\n"),
+    }
+    let ok = write_response(c, r).is_ok()
+    c.close()
+    ok
+}
+
+// Accept `count` connections, each answered by `handler` in its own task,
+// and return how many got a response. The handler gets no capabilities
+// unless its closure captures them.
+pub fn serve(l: Listener, count: Int, handler: fn(Request) -> Response) -> Int {
+    let answered = group g {
+        let mut i = 0
+        while i < count {
+            match l.accept() {
+                Ok(c) => g.go(|| if handle(c, handler) { 1 } else { 0 }),
+                Err(_) => { i = count },
+            }
+            i = i + 1
+        }
+    }
+    answered.sum()
+}

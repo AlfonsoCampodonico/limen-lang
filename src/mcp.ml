@@ -40,10 +40,9 @@ let tools =
 let file = "input.wr"
 
 let analyze src =
-  Source.add file src;
-  match Parser.parse_program file src with
-  | exception Diag.Fatal d -> (None, [ d ], [])
-  | items ->
+  match Modules.load file src with
+  | [], (_ :: _ as ds) -> (None, ds, [])
+  | items, _ ->
     let ds, infos = Check.check_program items in
     (Some items, ds, infos)
 

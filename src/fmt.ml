@@ -379,7 +379,7 @@ let item c (it : item) =
   | IFn d ->
     new_line c 0;
     let params = List.map (fun p -> p.prm_name ^ ": " ^ ty p.prm_ty) d.fn_params in
-    add c ("fn " ^ d.fn_name ^ gens d.fn_gen);
+    add c ((if d.fn_pub then "pub " else "") ^ "fn " ^ d.fn_name ^ gens d.fn_gen);
     if breaks_after_open c d.fn_span.hi '(' && params <> [] then begin
       add c "(";
       List.iter (fun p -> new_line c 4; add c (p ^ ",")) params;
@@ -393,7 +393,7 @@ let item c (it : item) =
     trailing c d.fn_body.bspan.hi
   | IStruct s ->
     new_line c 0;
-    add c ("struct " ^ s.st_name ^ gens s.st_gen ^ " {");
+    add c ((if s.st_pub then "pub " else "") ^ "struct " ^ s.st_name ^ gens s.st_gen ^ " {");
     let close = struct_close c s in
     (* a struct written on one line keeps its trailing comment after the brace *)
     let single = not (has_newline c s.st_span.lo close) in
@@ -415,7 +415,7 @@ let item c (it : item) =
     trailing c (close + 1)
   | IEnum e ->
     new_line c 0;
-    add c ("enum " ^ e.en_name ^ gens e.en_gen ^ " {");
+    add c ((if e.en_pub then "pub " else "") ^ "enum " ^ e.en_name ^ gens e.en_gen ^ " {");
     let close = enum_close c e in
     let single = not (has_newline c e.en_span.lo close) in
     let prev = ref (-1) in
@@ -444,12 +444,22 @@ let item_span c = function
 (* Format [src]; raises Diag.Fatal if it does not parse. *)
 let format ~file src =
   Source.add file src;
-  let items = Parser.parse_program file src in
+  let { uses; items } : file = Parser.parse_file file src in
   let comments = List.sort compare !Lexer.comments in
   let c = { src; o = { lines = [] }; pending = comments } in
   let prev = ref (-1) in
+  List.iter
+    (fun (name, (sp : Span.t)) ->
+      ignore (leading c 0 ~prev:!prev sp.lo);
+      new_line c 0;
+      add c ("use " ^ name);
+      trailing c sp.hi;
+      prev := sp.hi)
+    uses;
+  let nuses = List.length uses in
   List.iteri
     (fun i it ->
+      let i = i + nuses in
       let lo, _ = item_span c it in
       (* the item keyword starts a little before its name span *)
       let kw_lo =

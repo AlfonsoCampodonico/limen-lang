@@ -10,7 +10,7 @@
 # identifiers, and types are not checked. It requires at least one space or
 # tab after a keyword (`if x`, not `if(x)`), which is the canonical style.
 
-root ::= ws (item ws)*
+root ::= ws (top ws)*
 
 # ---------- whitespace ----------
 comment ::= "//" [^\n]*
@@ -23,6 +23,8 @@ isep    ::= ws "," ws | sp "\n" ws
 stsep   ::= sp (";" | "\n") ws
 
 # ---------- items ----------
+top      ::= use | "pub" sp1 (fn | struct | enum) | item
+use      ::= "use" sp1 ident
 item     ::= fn | struct | enum | test
 test     ::= "test" sp1 plainstr sp block
 fn       ::= "fn" sp1 ident sp generics? sp "(" ws (param (isep param)* (ws ",")?)? ws ")" (sp "->" sp type)? sp block
@@ -34,7 +36,7 @@ enum     ::= "enum" sp1 ident sp generics? sp "{" ws (variant (isep variant)* (w
 variant  ::= ident (sp "(" ws type (isep type)* (ws ",")? ws ")")?
 
 # ---------- types ----------
-type    ::= ident (sp "[" ws typearg (isep typearg)* (ws ",")? ws "]")? | "(" ws ")" | "fn" sp "(" ws (type (isep type)* (ws ",")?)? ws ")" sp "->" sp type
+type    ::= ident ("." ident)? (sp "[" ws typearg (isep typearg)* (ws ",")? ws "]")? | "(" ws ")" | "fn" sp "(" ws (type (isep type)* (ws ",")?)? ws ")" sp "->" sp type
 typearg ::= type | int
 
 # ---------- blocks and statements ----------
@@ -54,7 +56,7 @@ suffix  ::= sp "(" ws args? ws ")" | sp "[" ws expr ws "]" | ws "." sp ident | s
 args    ::= expr (isep expr)* (ws ",")?
 
 primary ::= float | int | string | ident | structlit | "(" ws ")" | "(" ws expr ws ")" | "[" ws args? ws "]" | block | if | match | closure | group
-structlit ::= upper sp "{" ws (init (isep init)* (ws ",")?)? ws "}"
+structlit ::= (ident ".")? upper sp "{" ws (init (isep init)* (ws ",")?)? ws "}"
 init      ::= ident (sp ":" ws expr)?
 if        ::= "if" sp1 expr sp block (ws "else" (sp block | sp1 if))?
 match     ::= "match" sp1 expr sp "{" ws (arm (isep arm)* (ws ",")?)? ws "}"

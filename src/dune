@@ -27,3 +27,22 @@
     (echo "let text = {xxspecxx|")
     (cat %{project_root}/SPEC.md)
     (echo "|xxspecxx}\n")))))
+
+; Embed the standard library modules (written in Writ).
+(rule
+ (targets std_text.ml)
+ (deps std/json.wr std/list.wr std/text.wr std/http.wr)
+ (action
+  (with-stdout-to
+   std_text.ml
+   (progn
+    (echo "let modules = [\n")
+    (echo "(\"json\", {xxstdxx|")
+    (cat std/json.wr)
+    (echo "|xxstdxx});\n(\"list\", {xxstdxx|")
+    (cat std/list.wr)
+    (echo "|xxstdxx});\n(\"text\", {xxstdxx|")
+    (cat std/text.wr)
+    (echo "|xxstdxx});\n(\"http\", {xxstdxx|")
+    (cat std/http.wr)
+    (echo "|xxstdxx}) ]\n")))))

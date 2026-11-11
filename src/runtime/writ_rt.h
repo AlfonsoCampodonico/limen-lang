@@ -408,6 +408,53 @@ static bool Str_parse_int(WStr *s, int64_t *out) {
   return true;
 }
 
+/* Byte offsets, clamped to the string. */
+static WStr *Str_slice(WStr *s, int64_t lo, int64_t hi) {
+  if (lo < 0) lo = 0;
+  if (lo > s->len) lo = s->len;
+  if (hi > s->len) hi = s->len;
+  if (hi < lo) hi = lo;
+  return Str_from(s->data + lo, hi - lo);
+}
+static L_Int *Str_bytes(WStr *s) {
+  L_Int *out = L_Int_new(s->len);
+  for (int64_t i = 0; i < s->len; i++) L_Int_push(&out, (int64_t)(unsigned char)s->data[i]);
+  return out;
+}
+/* The UTF-8 encoding of a code point; U+FFFD for anything that is not one. */
+static WStr *Int_to_char(int64_t n) {
+  if (n < 0 || n > 0x10FFFF || (n >= 0xD800 && n <= 0xDFFF)) n = 0xFFFD;
+  char b[4];
+  int k;
+  if (n < 0x80) { b[0] = (char)n; k = 1; }
+  else if (n < 0x800) { b[0] = (char)(0xC0 | (n >> 6)); b[1] = (char)(0x80 | (n & 0x3F)); k = 2; }
+  else if (n < 0x10000) { b[0] = (char)(0xE0 | (n >> 12)); b[1] = (char)(0x80 | ((n >> 6) & 0x3F)); b[2] = (char)(0x80 | (n & 0x3F)); k = 3; }
+  else { b[0] = (char)(0xF0 | (n >> 18)); b[1] = (char)(0x80 | ((n >> 12) & 0x3F)); b[2] = (char)(0x80 | ((n >> 6) & 0x3F)); b[3] = (char)(0x80 | (n & 0x3F)); k = 4; }
+  return Str_from(b, k);
+}
+/* A decimal float: digits with optional sign, point and exponent; no hex, nan or inf. */
+static bool Str_parse_float(WStr *s, double *out) {
+  int64_t a = 0, b = s->len;
+  while (a < b && is_ws(s->data[a])) a++;
+  while (b > a && is_ws(s->data[b - 1])) b--;
+  if (a == b || b - a > 400) return false;
+  bool digit = false;
+  for (int64_t i = a; i < b; i++) {
+    char c = s->data[i];
+    if (c >= '0' && c <= '9') digit = true;
+    else if (!(c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E')) return false;
+  }
+  if (!digit) return false;
+  char t[408];
+  memcpy(t, s->data + a, (size_t)(b - a));
+  t[b - a] = 0;
+  char *end;
+  double x = strtod(t, &end);
+  if (end != t + (b - a)) return false;
+  *out = x;
+  return true;
+}
+
 /* ---------- closures ---------- */
 
 typedef struct WClo WClo;

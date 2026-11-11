@@ -27,12 +27,7 @@ let load file =
     try In_channel.with_open_bin file In_channel.input_all
     with Sys_error m -> prerr_endline ("writ: " ^ m); exit 2
   in
-  Source.add file src;
-  match Parser.parse_program file src with
-  | exception Diag.Fatal d -> ([], [ d ], [])
-  | items ->
-    let diags, infos = Check.check_program items in
-    (items, diags, infos)
+  Modules.load_and_check file src
 
 let report diags =
   List.iter (fun d -> prerr_string (Diag.render d); prerr_newline ()) diags;

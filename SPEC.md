@@ -76,7 +76,7 @@ Inference is local. Function parameters always carry types, and a missing parame
 
 ## 4. Declarations
 
-A file is a sequence of `fn`, `struct` and `enum` declarations, in any order.
+A file is a sequence of `use` lines and `fn`, `struct` and `enum` declarations, in any order (put `use` first by convention). Section 18 covers modules.
 
 ```
 struct Pair[A, B] {
@@ -345,12 +345,16 @@ Methods take the receiver by value and never modify it, except `push`, which nee
 | `to_upper()`, `to_lower()` | `Str`, ASCII only |
 | `replace(a, b)` | `Str`, every occurrence |
 | `parse_int()` | `Option[Int]`, decimal with an optional sign, surrounding whitespace allowed |
+| `parse_float()` | `Option[Float]`, decimal with optional sign, point and exponent (`"2.5e3"`); no hex, `nan` or `inf` |
+| `slice(lo, hi)` | `Str`, bytes `lo` up to `hi`; out-of-range bounds are clamped, so it never panics |
+| `index_of(s)` | `Option[Int]`, byte offset of the first occurrence |
+| `bytes()` | `List[Int]`, each byte as 0-255; index it to scan a string fast |
 
 ### Int, Float, Bool
 
 | Type | Methods |
 | --- | --- |
-| `Int` | `to_str()`, `to_float()`, `abs()` |
+| `Int` | `to_str()`, `to_float()`, `abs()`, `min(n)`, `max(n)`, `to_char()` (the UTF-8 text of a code point, `65.to_char()` is `"A"`; invalid code points give U+FFFD) |
 | `Float` | `to_str()`, `to_int()` (truncates; NaN gives 0), `abs()`, `sqrt()` |
 | `Bool` | `to_str()` |
 
@@ -491,6 +495,12 @@ Every diagnostic has a stable code. `writ explain CODE` prints its explanation, 
 | E0305 | channel stored in a field |
 | E0310 | misuse of a group handle |
 | E0311 | `return` or `?` leaving a group |
+| E0320 | a dependency takes a capability writ.toml does not grant it |
+| E0321 | malformed writ.toml |
+| E0401 | module not found, or a qualified name without `use` |
+| E0402 | item is not `pub` |
+| E0403 | module has no such item |
+| E0404 | module name used as a value |
 
 A **panic** (division by zero, index out of range, `panic(...)`, no matching arm) prints `panic: message` and the source location to stderr, then exits with status 1.
 
@@ -499,8 +509,7 @@ A **panic** (division by zero, index out of range, `panic(...)`, no matching arm
 EBNF. `NL` is a newline, as described in section 2. A character-level version for constrained decoding, with the newline rules spelled out, is in [grammar/writ.gbnf](grammar/writ.gbnf). `{ x }` means zero or more, and `[ x ]` means optional.
 
 ```
-program    = { item } ;
-item       = fn | struct | enum | test ;
+program    = { "use" IDENT | [ "pub" ] ( fn | struct | enum ) | test } ;
 test       = "test" STRING block ;
 fn         = "fn" IDENT [ generics ] "(" [ params ] ")" [ "->" type ] block ;
 generics   = "[" IDENT { "," IDENT } "]" ;
@@ -510,7 +519,7 @@ struct     = "struct" IDENT [ generics ] "{" [ field { sep field } [ "," ] ] "}"
 field      = IDENT ":" type ;
 enum       = "enum" IDENT [ generics ] "{" [ variant { sep variant } [ "," ] ] "}" ;
 variant    = IDENT [ "(" type { "," type } ")" ] ;
-type       = IDENT [ "[" typearg { "," typearg } "]" ]
+type       = IDENT [ "." IDENT ] [ "[" typearg { "," typearg } "]" ]
            | "(" ")"
            | "fn" "(" [ type { "," type } ] ")" "->" type ;
 typearg    = type | INT ;                       (* INT only as Array's size *)
@@ -530,7 +539,7 @@ unary      = ( "-" | "!" ) unary | postfix ;
 postfix    = primary { "(" [ args ] ")" | "[" expr "]" | "." IDENT [ "(" [ args ] ")" ] | "?" } ;
 args       = expr { sep expr } [ "," ] ;
 primary    = INT | FLOAT | STRING | "true" | "false"
-           | IDENT [ "{" [ init { sep init } [ "," ] ] "}" ]      (* struct literal *)
+           | [ IDENT "." ] IDENT [ "{" [ init { sep init } [ "," ] ] "}" ]   (* struct literal *)
            | "(" ")" | "(" expr ")"
            | "[" [ args ] "]"
            | block
@@ -550,6 +559,98 @@ pattern    = "_" | IDENT | [ "-" ] INT | STRING | "true" | "false"
 - `writ lsp` is a language server; `writ mcp` is an MCP server exposing check, run, test, format, caps, type-at and the spec to coding agents.
 - `writ caps FILE` lists each function's authority; `writ explain CODE` explains an error.
 
-## 18. Not yet
+## 18. Modules and packages
 
-Methods on user types, modules and imports, unbuffered (capacity 0) channels, and `select` over several channels.
+### Modules
+
+```
+use json                  // json.wr next to this file, a dependency, or the standard library
+
+pub fn load(text: Str) -> Result[json.Value, Str] {
+    json.parse(text)
+}
+```
+
+- `use NAME` makes module `NAME` available in this file. It looks for `NAME.wr` next to the file, then a dependency named `NAME` in writ.toml, then the standard library. A file never imports itself.
+- Refer to a module's items as `NAME.item`: functions `json.parse(s)`, types `json.Value`, struct literals `json.Field { key, value }`, variants `json.Num(1.0)` and patterns `json.Num(x)`. A function can be used as a value: `let f = json.parse`.
+- Only items marked `pub` (`pub fn`, `pub struct`, `pub enum`) can be used from another module (E0402). Struct fields and enum variants of a `pub` type are all visible.
+- Inside a module, its own items are used unqualified. A local variable shadows a module name.
+- Variants are matched by name, so `match v { Num(x) => ... }` works without the module prefix when the type is known.
+- `test` blocks in a used module are not run; `writ test` runs the tests of the file you give it.
+- Modules can use each other, including in cycles. Type names print with their module: `json.Value`.
+
+### Packages and capabilities
+
+A writ.toml next to the program (or in a parent directory) lists its dependencies, and what each may do:
+
+```
+[package]
+name = "app"
+
+[dependencies]
+json2 = { path = "vendor/json2" }                  # pure: no capabilities
+fetch = { path = "../fetch", caps = ["net"] }
+```
+
+- A dependency is a directory holding `NAME.wr`, plus any modules that file uses from the same directory.
+- `caps` lists what the dependency may use: `net` (Net and Conn), `listen` (Listen, Listener and Conn), `fs`, `stdout`, `clock`. The default is none. No dependency can take `Root`.
+- Writ has no ambient authority, so a function can only use a capability that reaches it as a parameter. The checker therefore knows everything a dependency can ever do from its signatures, and rejects the program (E0320) if a dependency's function takes a capability it was not granted. Granting is still only an upper bound: at run time the dependency gets exactly the capabilities you pass it, which can be narrowed with `only` and `under`.
+- Only local paths are supported; there is no registry, versioning or lock file yet.
+
+## 19. Standard library
+
+Written in Writ and built into the compiler; `use` any of them. They take capabilities only as parameters, like any other code.
+
+### json
+
+| Item | Meaning |
+| --- | --- |
+| `enum Value { Null, Bool(Bool), Num(Float), Str(Str), Arr(List[Value]), Obj(List[Field]) }` | a JSON value; objects keep their fields in order |
+| `struct Field { key: Str, value: Value }`, `field(key, value)` | an object member |
+| `parse(s) -> Result[Value, Str]` | the error names what was expected and the byte offset |
+| `stringify(v) -> Str` | compact JSON; integral numbers print without `.0` |
+| `quote(s) -> Str` | a JSON string literal |
+| `get(v, key)`, `at(v, i)` | `Option[Value]`: an object member, an array item |
+| `as_str`, `as_num`, `as_int`, `as_bool`, `as_list` | `Option` of the payload, `None` for another kind |
+
+### http
+
+HTTP/1.1 over plain TCP (no TLS yet). Each message is read whole; bodies up to 8 MiB.
+
+| Item | Meaning |
+| --- | --- |
+| `struct Header { name, value }`, `header(headers, name)` | headers; lookup ignores case |
+| `struct Request { method, path, headers, body }` | |
+| `struct Response { status: Int, headers, body }`, `text(status, body)`, `json(status, body)`, `reason(status)` | |
+| `get(net, url)`, `post(net, url, content_type, body)`, `request(net, method, url, headers, body)` | `Result[Response, IoError]`; `http://host[:port]/path` URLs, chunked responses decoded |
+| `read_request(conn)`, `write_response(conn, r)` | one message on a connection |
+| `handle(conn, handler) -> Bool` | read, answer with `handler` (400 if malformed), close |
+| `serve(listener, count, handler) -> Int` | accept `count` connections, each handled in its own task; returns how many were answered |
+
+```
+use http
+
+fn hello(r: http.Request) -> http.Response {
+    http.text(200, "hello from {r.path}")
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let l = root.listen.on("127.0.0.1:8080")?
+    http.serve(l, 100, hello)
+    Ok(())
+}
+```
+
+The handler is a plain function value, so it gets no capability unless a closure captures one.
+
+### list
+
+`sort_by(xs, less)` (stable merge sort, `less(a, b)` says whether `a` goes first), `index_of(xs, x)`, `find_index(xs, pred)`, `range(lo, hi)`, `remove_at(xs, i)`, `insert_at(xs, i, x)`. All return new lists.
+
+### text
+
+`repeat(s, n)`, `pad_left(s, width, fill)`, `pad_right(s, width, fill)`, `count(s, sub)`, `words(s)`, and byte tests `is_digit(b)`, `is_alpha(b)`, `is_space(b)` for use with `bytes()`.
+
+## 20. Not yet
+
+Methods on user types, unbuffered (capacity 0) channels, `select` over several channels, TLS, SQL, a package registry, and a Cranelift backend. See the design doc's Known gaps for the full list.

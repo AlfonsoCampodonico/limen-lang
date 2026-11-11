@@ -73,6 +73,7 @@ type fn_decl = {
   fn_ret : ty_expr option;
   fn_body : block;
   fn_test : string option; (* Some name: a `test "name" { ... }` block *)
+  fn_pub : bool;
 }
 
 type struct_decl = {
@@ -80,6 +81,7 @@ type struct_decl = {
   st_span : span;
   st_gen : string list;
   st_fields : (string * span * ty_expr) list;
+  st_pub : bool;
 }
 
 type enum_decl = {
@@ -87,6 +89,10 @@ type enum_decl = {
   en_span : span;
   en_gen : string list;
   en_variants : (string * span * ty_expr list) list;
+  en_pub : bool;
 }
 
 type item = IFn of fn_decl | IStruct of struct_decl | IEnum of enum_decl
+
+(* A parsed file: its `use` declarations and its items. *)
+type file = { uses : (string * span) list; items : item list }

@@ -1,0 +1,371 @@
+// JSON: parse text into a Value, turn a Value back into text, and read
+// fields out of it.
+
+pub enum Value {
+    Null,
+    Bool(Bool),
+    Num(Float),
+    Str(Str),
+    Arr(List[Value]),
+    Obj(List[Field]),
+}
+
+// One member of an object, in source order.
+pub struct Field {
+    key: Str,
+    value: Value,
+}
+
+pub fn field(key: Str, value: Value) -> Field {
+    Field { key, value }
+}
+
+// ---------- reading values ----------
+
+// The value of `key` in an object (the first one, if repeated).
+pub fn get(v: Value, key: Str) -> Option[Value] {
+    match v {
+        Obj(fields) => {
+            for f in fields {
+                if f.key == key {
+                    return Some(f.value)
+                }
+            }
+            None
+        },
+        _ => None,
+    }
+}
+
+// Item `i` of an array.
+pub fn at(v: Value, i: Int) -> Option[Value] {
+    match v {
+        Arr(items) => items.get(i),
+        _ => None,
+    }
+}
+
+pub fn as_str(v: Value) -> Option[Str] {
+    match v {
+        Str(s) => Some(s),
+        _ => None,
+    }
+}
+
+pub fn as_num(v: Value) -> Option[Float] {
+    match v {
+        Num(x) => Some(x),
+        _ => None,
+    }
+}
+
+pub fn as_int(v: Value) -> Option[Int] {
+    match v {
+        Num(x) => if x == x.to_int().to_float() { Some(x.to_int()) } else { None },
+        _ => None,
+    }
+}
+
+pub fn as_bool(v: Value) -> Option[Bool] {
+    match v {
+        Bool(b) => Some(b),
+        _ => None,
+    }
+}
+
+pub fn as_list(v: Value) -> Option[List[Value]] {
+    match v {
+        Arr(items) => Some(items),
+        _ => None,
+    }
+}
+
+// ---------- writing ----------
+
+// Compact JSON text for `v`.
+pub fn stringify(v: Value) -> Str {
+    match v {
+        Null => "null",
+        Bool(b) => b.to_str(),
+        Num(x) => num_text(x),
+        Str(s) => quote(s),
+        Arr(items) => "[" + items.map(|x| stringify(x)).join(",") + "]",
+        Obj(fields) => "\{" + fields.map(|f| quote(f.key) + ":" + stringify(f.value)).join(",") + "\}",
+    }
+}
+
+fn num_text(x: Float) -> Str {
+    if x == x.to_int().to_float() && x.abs() < 1000000000000000.0 {
+        x.to_int().to_str()
+    } else {
+        x.to_str()
+    }
+}
+
+fn hex4(n: Int) -> Str {
+    let digits = "0123456789abcdef"
+    let mut out = ""
+    let mut k = 12
+    while k >= 0 {
+        let d = (n / pow2(k)) % 16
+        out = out + digits.slice(d, d + 1)
+        k = k - 4
+    }
+    out
+}
+
+fn pow2(k: Int) -> Int {
+    let mut p = 1
+    let mut i = 0
+    while i < k {
+        p = p * 2
+        i = i + 1
+    }
+    p
+}
+
+// `s` as a JSON string literal, with quotes.
+pub fn quote(s: Str) -> Str {
+    let bs = s.bytes()
+    let mut out = "\""
+    let mut start = 0
+    let mut i = 0
+    while i < bs.len() {
+        let b = bs[i]
+        let esc = if b == 34 {
+            "\\\""
+        } else if b == 92 {
+            "\\\\"
+        } else if b == 10 {
+            "\\n"
+        } else if b == 13 {
+            "\\r"
+        } else if b == 9 {
+            "\\t"
+        } else if b < 32 {
+            "\\u" + hex4(b)
+        } else {
+            ""
+        }
+        if esc != "" {
+            out = out + s.slice(start, i) + esc
+            start = i + 1
+        }
+        i = i + 1
+    }
+    out + s.slice(start, bs.len()) + "\""
+}
+
+// ---------- parsing ----------
+
+struct Parsed {
+    value: Value,
+    pos: Int,
+}
+
+struct Text {
+    s: Str,
+    bs: List[Int],
+}
+
+// Parse JSON text. The error says what was expected and at which byte.
+pub fn parse(s: Str) -> Result[Value, Str] {
+    let t = Text { s, bs: s.bytes() }
+    let p = value(t, skip(t, 0))?
+    let end = skip(t, p.pos)
+    if end < t.bs.len() {
+        return Err(fail("end of input", end))
+    }
+    Ok(p.value)
+}
+
+fn fail(what: Str, at: Int) -> Str {
+    "expected {what} at byte {at}"
+}
+
+fn skip(t: Text, i: Int) -> Int {
+    let mut j = i
+    while j < t.bs.len() && (t.bs[j] == 32 || t.bs[j] == 9 || t.bs[j] == 10 || t.bs[j] == 13) {
+        j = j + 1
+    }
+    j
+}
+
+fn lit(t: Text, i: Int, word: Str, v: Value) -> Result[Parsed, Str] {
+    if t.s.slice(i, i + word.len()) == word {
+        Ok(Parsed { value: v, pos: i + word.len() })
+    } else {
+        Err(fail("a value", i))
+    }
+}
+
+fn value(t: Text, i: Int) -> Result[Parsed, Str] {
+    if i >= t.bs.len() {
+        return Err(fail("a value", i))
+    }
+    let b = t.bs[i]
+    if b == 123 {
+        object(t, i + 1)
+    } else if b == 91 {
+        array(t, i + 1)
+    } else if b == 34 {
+        let p = string(t, i + 1)?
+        Ok(p)
+    } else if b == 116 {
+        lit(t, i, "true", Bool(true))
+    } else if b == 102 {
+        lit(t, i, "false", Bool(false))
+    } else if b == 110 {
+        lit(t, i, "null", Null)
+    } else {
+        number(t, i)
+    }
+}
+
+fn number(t: Text, i: Int) -> Result[Parsed, Str] {
+    let mut j = i
+    while j < t.bs.len() && ((t.bs[j] >= 48 && t.bs[j] <= 57) || t.bs[j] == 45 || t.bs[j] == 43 || t.bs[j] == 46 || t.bs[j] == 101 || t.bs[j] == 69) {
+        j = j + 1
+    }
+    match t.s.slice(i, j).parse_float() {
+        Some(x) => Ok(Parsed { value: Num(x), pos: j }),
+        None => Err(fail("a value", i)),
+    }
+}
+
+fn array(t: Text, i: Int) -> Result[Parsed, Str] {
+    let mut items = []
+    let mut j = skip(t, i)
+    if j < t.bs.len() && t.bs[j] == 93 {
+        return Ok(Parsed { value: Arr(items), pos: j + 1 })
+    }
+    while true {
+        let p = value(t, j)?
+        items.push(p.value)
+        j = skip(t, p.pos)
+        if j < t.bs.len() && t.bs[j] == 44 {
+            j = skip(t, j + 1)
+        } else if j < t.bs.len() && t.bs[j] == 93 {
+            return Ok(Parsed { value: Arr(items), pos: j + 1 })
+        } else {
+            return Err(fail("`,` or `]`", j))
+        }
+    }
+    Err(fail("`]`", j))
+}
+
+fn object(t: Text, i: Int) -> Result[Parsed, Str] {
+    let mut fields = []
+    let mut j = skip(t, i)
+    if j < t.bs.len() && t.bs[j] == 125 {
+        return Ok(Parsed { value: Obj(fields), pos: j + 1 })
+    }
+    while true {
+        if j >= t.bs.len() || t.bs[j] != 34 {
+            return Err(fail("a string key", j))
+        }
+        let k = string(t, j + 1)?
+        j = skip(t, k.pos)
+        if j >= t.bs.len() || t.bs[j] != 58 {
+            return Err(fail("`:`", j))
+        }
+        let v = value(t, skip(t, j + 1))?
+        let key = as_str(k.value).unwrap_or("")
+        fields.push(Field { key, value: v.value })
+        j = skip(t, v.pos)
+        if j < t.bs.len() && t.bs[j] == 44 {
+            j = skip(t, j + 1)
+        } else if j < t.bs.len() && t.bs[j] == 125 {
+            return Ok(Parsed { value: Obj(fields), pos: j + 1 })
+        } else {
+            return Err(fail("`,` or `\}`", j))
+        }
+    }
+    Err(fail("`\}`", j))
+}
+
+fn hex_digit(b: Int) -> Int {
+    if b >= 48 && b <= 57 {
+        b - 48
+    } else if b >= 97 && b <= 102 {
+        b - 87
+    } else if b >= 65 && b <= 70 {
+        b - 55
+    } else {
+        -1
+    }
+}
+
+// Four hex digits at `i`, or -1.
+fn hex_at(t: Text, i: Int) -> Int {
+    if i + 4 > t.bs.len() {
+        return -1
+    }
+    let mut n = 0
+    let mut k = 0
+    while k < 4 {
+        let d = hex_digit(t.bs[i + k])
+        if d < 0 {
+            return -1
+        }
+        n = n * 16 + d
+        k = k + 1
+    }
+    n
+}
+
+// A string body starting after its opening quote.
+fn string(t: Text, i: Int) -> Result[Parsed, Str] {
+    let mut out = ""
+    let mut start = i
+    let mut j = i
+    while j < t.bs.len() {
+        let b = t.bs[j]
+        if b == 34 {
+            return Ok(Parsed { value: Str(out + t.s.slice(start, j)), pos: j + 1 })
+        } else if b < 32 {
+            return Err(fail("no control characters in a string", j))
+        } else if b == 92 {
+            out = out + t.s.slice(start, j)
+            if j + 1 >= t.bs.len() {
+                return Err(fail("an escape", j))
+            }
+            let e = t.bs[j + 1]
+            j = j + 2
+            if e == 34 || e == 92 || e == 47 {
+                out = out + e.to_char()
+            } else if e == 110 {
+                out = out + "\n"
+            } else if e == 116 {
+                out = out + "\t"
+            } else if e == 114 {
+                out = out + "\r"
+            } else if e == 98 {
+                out = out + 8.to_char()
+            } else if e == 102 {
+                out = out + 12.to_char()
+            } else if e == 117 {
+                let mut c = hex_at(t, j)
+                if c < 0 {
+                    return Err(fail("four hex digits", j))
+                }
+                j = j + 4
+                // a surrogate pair
+                if c >= 55296 && c <= 56319 && j + 6 <= t.bs.len() && t.bs[j] == 92 && t.bs[j + 1] == 117 {
+                    let lo = hex_at(t, j + 2)
+                    if lo >= 56320 && lo <= 57343 {
+                        c = 65536 + (c - 55296) * 1024 + (lo - 56320)
+                        j = j + 6
+                    }
+                }
+                out = out + c.to_char()
+            } else {
+                return Err(fail("a valid escape", j - 2))
+            }
+            start = j
+        } else {
+            j = j + 1
+        }
+    }
+    Err(fail("a closing `\"`", j))
+}

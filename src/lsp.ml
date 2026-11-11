@@ -50,12 +50,13 @@ let slice text (sp : Span.t) = String.sub text sp.lo (max 0 (min sp.hi (String.l
 (* ---------- analysis ---------- *)
 
 let analyze path text =
-  Source.add path text;
-  match Parser.parse_program path text with
-  | exception Diag.Fatal d -> (None, [ d ])
-  | items ->
+  match Modules.load path text with
+  | [], (_ :: _ as ds) -> (None, List.filter (fun (d : Diag.t) -> d.span.file = path) ds)
+  | items, _ ->
     let ds, _ = Check.check_program items in
-    (Some items, List.filter (fun (d : Diag.t) -> d.span.file = path) ds)
+    (* hovers and definitions only look at this file's items *)
+    let mine = List.filter (fun it -> (Modules.item_span it).Span.file = path) items in
+    (Some mine, List.filter (fun (d : Diag.t) -> d.span.file = path) ds)
 
 let diag_json text (d : Diag.t) =
   let msg = String.concat "\n" (d.message :: List.map (fun n -> "note: " ^ n) d.notes) in

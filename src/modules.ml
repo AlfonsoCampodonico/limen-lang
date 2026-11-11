@@ -1,0 +1,336 @@
+(* Modules: `use NAME` loads NAME.wr (next to the importing file, then a
+   writ.toml dependency, then the standard library) and merges everything into
+   one flat program. Every item of module M is renamed `M.item`; the main file
+   keeps its names. References are rewritten scope-aware, so the checker and
+   both backends see a single program with qualified names.
+
+   Inside module M, an unqualified name that is one of M's items means that
+   item. `m.f(...)`, `m.f`, `m.Type`, `m.Type { ... }`, `m.Variant(...)` and the
+   pattern `m.Variant(...)` refer to module m, which the file must `use`. Only
+   `pub` items can be used from another module. *)
+open Ast
+
+type modinfo = {
+  mname : string; (* "" for the main file *)
+  mfile : string;
+  mitems : item list;
+  muses : (string * span) list;
+  mpkg : string option; (* the writ.toml dependency it belongs to *)
+}
+
+(* module name -> dependency, for the last program loaded *)
+let module_pkg : (string * string) list ref = ref []
+
+let std_modules : (string * string) list ref = ref Std_text.modules (* name -> source *)
+
+let item_name = function IFn d -> d.fn_name | IStruct s -> s.st_name | IEnum e -> e.en_name
+let item_span = function IFn d -> d.fn_span | IStruct s -> s.st_span | IEnum e -> e.en_span
+let item_pub = function IFn d -> d.fn_pub | IStruct s -> s.st_pub | IEnum e -> e.en_pub
+
+let errors : Diag.t list ref = ref []
+let err ?(notes = []) code sp msg = errors := Diag.make ~notes code sp msg :: !errors
+
+(* ---------- loading ---------- *)
+
+let read_file path = try Some (In_channel.with_open_bin path In_channel.input_all) with Sys_error _ -> None
+
+(* deps: name -> directory holding NAME.wr (from writ.toml) *)
+(* Returns the path, the text, and whether it came from a dependency. *)
+let same_file a b = try Unix.realpath a = Unix.realpath b with Unix.Unix_error _ -> false
+
+let find_module ~deps ~from dir name =
+  let local = Filename.concat dir (name ^ ".wr") in
+  (* a file never imports itself: `use http` in http.wr means another http *)
+  if dir <> "" && Sys.file_exists local && not (same_file local from) then Some (local, read_file local, false)
+  else
+    match List.assoc_opt name deps with
+    | Some d ->
+      let p = Filename.concat d (name ^ ".wr") in
+      Some (p, read_file p, true)
+    | None -> (
+      match List.assoc_opt name !std_modules with
+      | Some src -> Some ("<std>/" ^ name ^ ".wr", Some src, false)
+      | None -> None)
+
+let parse path src =
+  Source.add path src;
+  Parser.parse_file path src
+
+(* ---------- renaming ---------- *)
+
+type env = {
+  self : modinfo;
+  mods : (string, modinfo) Hashtbl.t;
+  own : (string, item) Hashtbl.t; (* this module's items by bare name *)
+  gens : string list; (* type parameters in scope *)
+}
+
+let qual (m : modinfo) n = if m.mname = "" then n else m.mname ^ "." ^ n
+
+let module_of env a sp =
+  if List.exists (fun (u, _) -> u = a) env.self.muses then Hashtbl.find_opt env.mods a
+  else begin
+    ignore sp;
+    None
+  end
+
+let is_module env locals a = (not (List.mem a locals)) && List.exists (fun (u, _) -> u = a) env.self.muses
+
+(* Look up item [n] of module [m] from another module, checking it is pub. *)
+let member _env (m : modinfo) n sp =
+  match List.find_opt (fun i -> item_name i = n) m.mitems with
+  | Some i ->
+    if not (item_pub i) then err "E0402" sp (Printf.sprintf "`%s` is private to module `%s`" n m.mname)
+        ~notes:[ Printf.sprintf "mark it `pub fn`, `pub struct` or `pub enum` in %s to export it" m.mfile ];
+    Some i
+  | None -> None
+
+(* A pub enum of [m] that has variant [v]. *)
+let variant_enum (m : modinfo) v =
+  List.find_map
+    (function IEnum e when List.exists (fun (n, _, _) -> n = v) e.en_variants -> Some e | _ -> None)
+    m.mitems
+
+let no_member (m : modinfo) n sp =
+  let names = List.filter_map (fun i -> if item_pub i then Some (item_name i) else None) m.mitems in
+  err "E0403" sp (Printf.sprintf "module `%s` has no `%s`" m.mname n)
+    ~notes:(if names = [] then [] else [ "it exports: " ^ String.concat ", " (List.sort compare names) ])
+
+let rec ty env (t : ty_expr) : ty_expr =
+  match t.tdesc with
+  | TyName (n, args) ->
+    let args = List.map (ty env) args in
+    let n =
+      match String.index_opt n '.' with
+      | Some i -> (
+        let a = String.sub n 0 i and b = String.sub n (i + 1) (String.length n - i - 1) in
+        match module_of env a t.tspan with
+        | Some m -> (
+          match member env m b t.tspan with
+          | Some (IStruct _ | IEnum _) -> qual m b
+          | _ -> no_member m b t.tspan; n)
+        | None -> err "E0401" t.tspan (Printf.sprintf "unknown module `%s`; add `use %s` at the top of the file" a a); n)
+      | None -> (
+        if List.mem n env.gens then n
+        else match Hashtbl.find_opt env.own n with Some (IStruct _ | IEnum _) -> qual env.self n | _ -> n)
+    in
+    { t with tdesc = TyName (n, args) }
+  | TyFn (ps, r) -> { t with tdesc = TyFn (List.map (ty env) ps, ty env r) }
+  | TyUnit | TyInt _ -> t
+
+let mk d sp = { edesc = d; espan = sp; ety = Types.TErr; einst = [] }
+
+let rec pat_binds (p : pat) acc =
+  match p.pdesc with
+  | PBind n -> n :: acc
+  | PVariant (_, _, ps) -> List.fold_left (fun acc p -> pat_binds p acc) acc ps
+  | _ -> acc
+
+let rec pat env locals (p : pat) : pat =
+  match p.pdesc with
+  | PVariant (Some q, v, ps) ->
+    let ps = List.map (pat env locals) ps in
+    let q =
+      if is_module env locals q then
+        match Hashtbl.find_opt env.mods q with
+        | Some m -> (
+          match variant_enum m v with
+          | Some e ->
+            ignore (member env m e.en_name p.pspan);
+            Some (qual m e.en_name)
+          | None -> no_member m v p.pspan; Some q)
+        | None -> Some q
+      else
+        match Hashtbl.find_opt env.own q with Some (IEnum _) -> Some (qual env.self q) | _ -> Some q
+    in
+    { p with pdesc = PVariant (q, v, ps) }
+  | PVariant (None, v, ps) -> { p with pdesc = PVariant (None, v, List.map (pat env locals) ps) }
+  | _ -> p
+
+let rec expr env locals (e : expr) : expr =
+  let ex = expr env locals in
+  let d =
+    match e.edesc with
+    | EInt _ | EFloat _ | EBool _ | EUnit -> e.edesc
+    | EStr parts -> EStr (List.map (function SPLit s -> SPLit s | SPExpr x -> SPExpr (ex x)) parts)
+    | EVar n ->
+      if List.mem n locals then e.edesc
+      else (
+        match Hashtbl.find_opt env.own n with
+        | Some (IFn _) -> EVar (qual env.self n)
+        | _ -> if is_module env locals n then (err "E0404" e.espan (Printf.sprintf "module `%s` is not a value; use one of its items, such as `%s.name`" n n); e.edesc) else e.edesc)
+    | EList es -> EList (List.map ex es)
+    | EBin (op, a, b) -> EBin (op, ex a, ex b)
+    | EUn (op, a) -> EUn (op, ex a)
+    | ECall (c, args) -> ECall (ex c, List.map ex args)
+    | EMethod ({ edesc = EVar a; espan = asp; _ }, name, nsp, args) when is_module env locals a -> (
+      let args = List.map ex args in
+      match Hashtbl.find_opt env.mods a with
+      | None -> e.edesc
+      | Some m -> (
+        let sp = Span.merge asp nsp in
+        match member env m name nsp with
+        | Some (IFn _) -> ECall (mk (EVar (qual m name)) sp, args)
+        | Some _ -> err "E0108" sp (Printf.sprintf "`%s.%s` is a type, not a function" a name); e.edesc
+        | None -> (
+          match variant_enum m name with
+          | Some en ->
+            ignore (member env m en.en_name nsp);
+            EMethod (mk (EVar (qual m en.en_name)) asp, name, nsp, args)
+          | None -> no_member m name nsp; e.edesc)))
+    | EMethod (({ edesc = EVar en; _ } as r), name, nsp, args)
+      when (not (List.mem en locals)) && (match Hashtbl.find_opt env.own en with Some (IEnum _) -> true | _ -> false) ->
+      EMethod ({ r with edesc = EVar (qual env.self en) }, name, nsp, List.map ex args)
+    | EMethod (r, name, nsp, args) -> EMethod (ex r, name, nsp, List.map ex args)
+    | EField ({ edesc = EVar a; espan = asp; _ }, name, nsp) when is_module env locals a -> (
+      match Hashtbl.find_opt env.mods a with
+      | None -> e.edesc
+      | Some m -> (
+        match member env m name nsp with
+        | Some (IFn _) -> EVar (qual m name)
+        | Some _ -> err "E0404" (Span.merge asp nsp) (Printf.sprintf "`%s.%s` is a type, not a value" a name); e.edesc
+        | None -> (
+          match variant_enum m name with
+          | Some en ->
+            ignore (member env m en.en_name nsp);
+            EField (mk (EVar (qual m en.en_name)) asp, name, nsp)
+          | None -> no_member m name nsp; e.edesc)))
+    | EField (({ edesc = EVar en; _ } as r), name, nsp)
+      when (not (List.mem en locals)) && (match Hashtbl.find_opt env.own en with Some (IEnum _) -> true | _ -> false) ->
+      EField ({ r with edesc = EVar (qual env.self en) }, name, nsp)
+    | EField (r, name, nsp) -> EField (ex r, name, nsp)
+    | EIndex (a, i) -> EIndex (ex a, ex i)
+    | ETry a -> ETry (ex a)
+    | EIf (c, b, el) -> EIf (ex c, block env locals b, Option.map ex el)
+    | EMatch (s, arms) ->
+      EMatch
+        ( ex s,
+          List.map (fun a -> { apat = pat env locals a.apat; abody = expr env (pat_binds a.apat locals) a.abody }) arms )
+    | EBlock b -> EBlock (block env locals b)
+    | EClosure (ps, body) ->
+      let locals' = List.fold_left (fun acc (n, _, _) -> n :: acc) locals ps in
+      EClosure (List.map (fun (n, t, sp) -> (n, Option.map (ty env) t, sp)) ps, expr env locals' body)
+    | EStruct (n, sp, fields) ->
+      let n =
+        match String.index_opt n '.' with
+        | Some i -> (
+          let a = String.sub n 0 i and b = String.sub n (i + 1) (String.length n - i - 1) in
+          match if List.mem a locals then None else module_of env a sp with
+          | Some m -> (
+            match member env m b sp with
+            | Some (IStruct _) -> qual m b
+            | _ -> no_member m b sp; n)
+          | None -> err "E0401" sp (Printf.sprintf "unknown module `%s`; add `use %s` at the top of the file" a a); n)
+        | None -> ( match Hashtbl.find_opt env.own n with Some (IStruct _) -> qual env.self n | _ -> n)
+      in
+      EStruct (n, sp, List.map (fun (f, fsp, x) -> (f, fsp, ex x)) fields)
+    | EGroup (g, b) -> EGroup (g, block env (g :: locals) b)
+  in
+  { e with edesc = d }
+
+and block env locals (b : block) : block =
+  let locals = ref locals in
+  let stmts =
+    List.map
+      (fun (s : stmt) ->
+        let d =
+          match s.sdesc with
+          | SLet (m, n, sp, t, x) ->
+            let x = expr env !locals x in
+            locals := n :: !locals;
+            SLet (m, n, sp, Option.map (ty env) t, x)
+          | SAssign (a, b) -> SAssign (expr env !locals a, expr env !locals b)
+          | SExpr x -> SExpr (expr env !locals x)
+          | SReturn x -> SReturn (Option.map (expr env !locals) x)
+          | SWhile (c, body) -> SWhile (expr env !locals c, block env !locals body)
+          | SFor (n, sp, it, body) -> SFor (n, sp, expr env !locals it, block env (n :: !locals) body)
+          | SBreak | SContinue -> s.sdesc
+        in
+        { s with sdesc = d })
+      b.stmts
+  in
+  { b with stmts; tail = Option.map (expr env !locals) b.tail }
+
+let rename_item mods (m : modinfo) own (it : item) : item =
+  match it with
+  | IFn d ->
+    let env = { self = m; mods; own; gens = d.fn_gen } in
+    let locals = List.map (fun p -> p.prm_name) d.fn_params in
+    IFn
+      { d with
+        fn_name = (if d.fn_test = None then qual m d.fn_name else d.fn_name);
+        fn_params = List.map (fun p -> { p with prm_ty = ty env p.prm_ty }) d.fn_params;
+        fn_ret = Option.map (ty env) d.fn_ret;
+        fn_body = block env locals d.fn_body }
+  | IStruct s ->
+    let env = { self = m; mods; own; gens = s.st_gen } in
+    IStruct { s with st_name = qual m s.st_name; st_fields = List.map (fun (f, sp, t) -> (f, sp, ty env t)) s.st_fields }
+  | IEnum e ->
+    let env = { self = m; mods; own; gens = e.en_gen } in
+    IEnum
+      { e with en_name = qual m e.en_name; en_variants = List.map (fun (v, sp, ts) -> (v, sp, List.map (ty env) ts)) e.en_variants }
+
+(* ---------- entry point ---------- *)
+
+(* Load the main file at [path] (whose text is [src]) and every module it uses.
+   Returns the flat program, or the diagnostics. *)
+let load ?(deps = []) path src : item list * Diag.t list =
+  errors := [];
+  module_pkg := [];
+  let mods : (string, modinfo) Hashtbl.t = Hashtbl.create 8 in
+  match parse path src with
+  | exception Diag.Fatal d -> ([], [ d ])
+  | f -> (
+    let main = { mname = ""; mfile = path; mitems = f.items; muses = f.uses; mpkg = None } in
+    let rec visit (m : modinfo) =
+      let dir = if String.starts_with ~prefix:"<std>" m.mfile then "" else Filename.dirname m.mfile in
+      List.iter
+        (fun (name, sp) ->
+          if not (Hashtbl.mem mods name) then
+            match find_module ~deps ~from:m.mfile dir name with
+            | None ->
+              err "E0401" sp (Printf.sprintf "cannot find module `%s`" name)
+                ~notes:[ Printf.sprintf "looked for %s, the dependencies in writ.toml and the standard library" (Filename.concat dir (name ^ ".wr")) ]
+            | Some (p, None, _) -> err "E0401" sp (Printf.sprintf "cannot read module `%s` at %s" name p)
+            | Some (p, Some src, from_dep) ->
+              let f = parse p src in
+              (* tests and main belong to the program being run, not its modules *)
+              let items = List.filter (function IFn { fn_test = Some _; _ } -> false | _ -> true) f.items in
+              let mpkg = if from_dep then Some name else if String.starts_with ~prefix:"<std>" p then None else m.mpkg in
+              let mi = { mname = name; mfile = p; mitems = items; muses = f.uses; mpkg } in
+              Hashtbl.replace mods name mi;
+              visit mi)
+        m.muses
+    in
+    match visit main with
+    | exception Diag.Fatal d -> ([], [ d ])
+    | () ->
+      if !errors <> [] then ([], List.rev !errors)
+      else begin
+        let all = main :: List.of_seq (Hashtbl.to_seq_values mods) in
+        let all = main :: List.sort (fun a b -> compare a.mname b.mname) (List.tl all) in
+        module_pkg := List.filter_map (fun m -> Option.map (fun p -> (m.mname, p)) m.mpkg) all;
+        let items =
+          List.concat_map
+            (fun m ->
+              let own = Hashtbl.create 16 in
+              List.iter (fun i -> Hashtbl.replace own (item_name i) i) m.mitems;
+              List.map (rename_item mods m own) m.mitems)
+            (List.rev all)
+        in
+        if !errors <> [] then ([], List.rev !errors) else (items, [])
+      end)
+
+(* Load a program with the writ.toml around it (if any), then type-check it
+   and enforce each dependency's capability grants. *)
+let load_and_check path src : item list * Diag.t list * Check.fn_info list =
+  match Package.load path with
+  | Error d -> ([], [ d ], [])
+  | Ok pkg -> (
+    let deps = match pkg with Some p -> List.map (fun (d : Package.dep) -> (d.dname, d.dir)) p.deps | None -> [] in
+    match load ~deps path src with
+    | [], (_ :: _ as ds) -> ([], ds, [])
+    | items, _ ->
+      let ds, infos = Check.check_program items in
+      let ds = match pkg with Some p when ds = [] -> Package.enforce p !module_pkg infos | _ -> ds in
+      (items, ds, infos))

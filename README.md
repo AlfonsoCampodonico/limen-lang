@@ -89,6 +89,21 @@ With VS Code, any generic LSP client extension works: point it at `writ lsp` for
 - A function with no capability or function-typed parameters is pure.
 - Runtime enforcement: `Net` is an http/https host allowlist, redirects are not followed, and other schemes are refused. `Fs` resolves paths under its root and refuses absolute paths, `..` escapes and symlinks that lead outside.
 
+## Modules, packages and the standard library
+
+`use json` loads `json.wr` from next to the file, from a dependency, or from the standard library; its `pub` items are then `json.parse(...)`, `json.Value` and so on. Modules are merged into one program before checking, so both backends handle them unchanged.
+
+A `writ.toml` lists dependencies by path, and the capabilities each may use:
+
+```
+[dependencies]
+fetch = { path = "../fetch", caps = ["net"] }
+```
+
+Since capabilities only arrive as parameters, a dependency's signatures are a complete list of what it can do. If one asks for a capability it was not granted, the program does not compile (E0320).
+
+The standard library is written in Writ: `json` (parse, stringify, field access), `http` (an HTTP/1.1 client over `Net` and a server over `Listener`, one task per connection), `list` (`sort_by` and friends) and `text`. See [examples/http_demo.wr](examples/http_demo.wr) and SPEC.md sections 18 and 19.
+
 ## Concurrency
 
 Tasks are fibers: small stacks scheduled by worker threads, one per core, with work stealing. A task waiting on a group, a channel or a socket parks without blocking a thread. If every task is waiting and nothing can wake one, the program panics with a deadlock message instead of hanging.
@@ -154,4 +169,4 @@ On one thread Writ is level with C on these workloads. With `group` it runs abou
 
 Types: `Int`, `Float`, `Bool`, `Str`, `()`, `List[T]`, fixed-size `Array[T, N]` (a value type), structs, enums with payloads, generics on functions, structs and enums, and closures. `Option`, `Result` and `IoError` come from the prelude. Control flow: `if`/`else`, exhaustive `match`, `while`, `for x in list`, `break`, `continue`, `return` and `?`. Statements end at a newline; a line starting with `.` continues a method chain. String interpolation takes any expression: `"{xs.join(", ")}"`.
 
-Not yet: methods on user types, modules, tuples and maps, and `select` over channels. `Int` is 64-bit in native code but 63-bit in the interpreter, because OCaml reserves one bit of its native int; the two only differ on overflow.
+Not yet: methods on user types, tuples and maps, `select` over channels, TLS and SQL. `Int` is 64-bit in native code but 63-bit in the interpreter, because OCaml reserves one bit of its native int; the two only differ on overflow.
