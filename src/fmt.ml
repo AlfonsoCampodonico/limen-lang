@@ -110,7 +110,7 @@ let rec pat (p : pat) =
   match p.pdesc with
   | PWild -> "_"
   | PBind n -> n
-  | PInt n -> string_of_int n
+  | PInt n -> Int64.to_string n
   | PStr s -> "\"" ^ escape s ^ "\""
   | PBool b -> string_of_bool b
   | PVariant (q, v, args) ->

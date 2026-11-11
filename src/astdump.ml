@@ -13,7 +13,7 @@ let rec pat (p : pat) =
   match p.pdesc with
   | PWild -> "_"
   | PBind n -> "b:" ^ n
-  | PInt n -> string_of_int n
+  | PInt n -> Int64.to_string n
   | PStr s -> String.escaped s
   | PBool b -> string_of_bool b
   | PVariant (q, v, a) -> Option.value ~default:"" q ^ "." ^ v ^ "(" ^ String.concat "," (List.map pat a) ^ ")"
@@ -24,7 +24,7 @@ let op = function
 
 let rec expr e =
   match e.edesc with
-  | EInt n -> string_of_int n
+  | EInt n -> Int64.to_string n
   | EFloat f -> Printf.sprintf "%h" f
   | EBool b -> string_of_bool b
   | EUnit -> "()"

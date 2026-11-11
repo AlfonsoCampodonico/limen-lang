@@ -8,7 +8,7 @@ type var = { id : int; name : string; ty : ty }
 type atom =
   | V of var (* use of a variable; a move when consumed *)
   | VDup of var (* consumed while still live elsewhere: retain first *)
-  | AInt of int
+  | AInt of int64
   | AFloat of float
   | ABool of bool
   | AUnit

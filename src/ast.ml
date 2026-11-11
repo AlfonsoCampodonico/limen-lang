@@ -14,7 +14,7 @@ type pat = { pdesc : pat_desc; pspan : span }
 and pat_desc =
   | PWild
   | PBind of string
-  | PInt of int
+  | PInt of int64
   | PStr of string
   | PBool of bool
   | PVariant of string option * string * pat list (* qualifier, variant, payload *)
@@ -28,7 +28,7 @@ type expr = {
   mutable einst : (string * Types.ty) list;
 }
 and expr_desc =
-  | EInt of int
+  | EInt of int64
   | EFloat of float
   | EBool of bool
   | EUnit

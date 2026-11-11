@@ -29,7 +29,7 @@ fn parse_names(body: Str) -> List[Str] {   // no capabilities: cannot do I/O
 - **Comments:** `//` to the end of the line. There are no block comments.
 - **Identifiers:** `[A-Za-z_][A-Za-z0-9_]*`. By convention types and enum variants start with an uppercase letter, everything else lowercase. Patterns rely on this (section 7).
 - **Keywords:** `fn let mut if else match for in while return struct enum true false group break continue`.
-- **Integers:** decimal digits, `_` allowed as a separator (`1_000_000`). A literal must fit in 63 bits.
+- **Integers:** decimal digits, `_` allowed as a separator (`1_000_000`). A literal must fit in 64 bits: up to `9223372036854775807` (E0005).
 - **Floats:** digits with a fraction (`1.5`), an exponent (`1e9`, `2.5E-3`), or both. `_` is allowed. There is no leading-dot form (`.5`).
 - **Strings:** `"..."`, may span lines. Escapes: `\n \t \r \\ \" \{ \} \0`. Any other escape is error E0006.
 - **Interpolation:** `{expr}` inside a string evaluates any expression, including ones with their own strings: `"{xs.join(", ")}"`. An empty `{}` is error E0007; write `\{` for a literal brace.
@@ -53,7 +53,7 @@ Statements are separated by a newline or `;`. Two statements on one line without
 
 | Type | Values | Notes |
 | --- | --- | --- |
-| `Int` | 64-bit signed integers | Arithmetic wraps on overflow. The interpreter uses 63 bits; the backends only differ on overflow. |
+| `Int` | 64-bit signed integers | Arithmetic wraps on overflow, the same in both backends. `x / -1` and `x % -1` wrap too instead of trapping, `abs()` of the smallest Int is itself, and `Float.to_int()` saturates (NaN gives 0). |
 | `Float` | IEEE 754 double | No fused multiply-add, so both backends give identical results. |
 | `Bool` | `true`, `false` | |
 | `Str` | immutable byte strings | `len()` counts bytes. |

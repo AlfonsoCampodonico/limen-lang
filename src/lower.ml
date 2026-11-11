@@ -669,7 +669,7 @@ and emit_for f la lty sp body =
   let it = fresh_var "it" lty in
   emit f (I.Let (it, I.Atom la));
   let i = fresh_var "i" TInt in
-  emit f (I.Let (i, I.Atom (I.AInt 0)));
+  emit f (I.Let (i, I.Atom (I.AInt 0L)));
   let stmts, _, _ =
     in_block f (fun () ->
         let n = tmp f TInt (I.Prim ("list_len", lty, [ I.V it ], sp)) in
@@ -679,7 +679,7 @@ and emit_for f la lty sp body =
         let x = fresh_var "x" elt in
         (* i < len was checked just above, on a snapshot nothing else can change *)
         emit f (I.Let (x, I.Get (I.V it, lty, [ I.PIndexU (I.V i) ])));
-        emit f (I.Set (i, I.Bin (Add, TInt, I.V i, I.AInt 1, sp), ref false));
+        emit f (I.Set (i, I.Bin (Add, TInt, I.V i, I.AInt 1L, sp), ref false));
         body x)
   in
   emit f (I.Loop stmts)

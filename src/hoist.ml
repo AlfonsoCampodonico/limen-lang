@@ -47,7 +47,7 @@ let fill_loop body =
   | [ Let (c, Bin (((Ast.Lt | Ast.Le) as cmp), Types.TInt, V i, n, _));
       If (V c', yes, brk);
       Mutate (v, [], MPush x);
-      Let (t, Bin (Ast.Add, Types.TInt, V i', AInt 1, _));
+      Let (t, Bin (Ast.Add, Types.TInt, V i', AInt 1L, _));
       Set (i'', Atom (V t'), _) ]
     when c.id = c'.id && i.id = i'.id && i.id = i''.id && t.id = t'.id && only_drops yes
          && (match List.rev brk with Break :: rest -> only_drops rest | _ -> false)

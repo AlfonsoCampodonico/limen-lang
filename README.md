@@ -175,4 +175,4 @@ Interfaces: `interface Shape { fn area(self) -> Float }` bounds a generic parame
 
 `dyn Shape` is a value of any type that satisfies `Shape`, so `List[dyn Shape]` can mix types (see [examples/dyn.vela](examples/dyn.vela)).
 
-Not yet: tuples and maps, `select` over channels, TLS and SQL. `Int` is 64-bit in native code but 63-bit in the interpreter, because OCaml reserves one bit of its native int; the two only differ on overflow.
+Not yet: tuples and maps, `select` over channels, TLS and SQL. `Int` is 64-bit and wraps on overflow, identically in the interpreter and in native code.

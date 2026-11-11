@@ -4,7 +4,7 @@
 type strpart = Lit of string | Interp of string * int (* source text, absolute offset *)
 
 type tok =
-  | INT of int
+  | INT of int64
   | FLOAT of float
   | STR of strpart list
   | IDENT of string
@@ -22,7 +22,7 @@ let syms2 = [ "->"; "=>"; "=="; "!="; "<="; ">="; "&&"; "||" ]
 let syms1 = "(){}[],:;.|+-*/%!?=<>"
 
 let describe = function
-  | INT n -> Printf.sprintf "number `%d`" n
+  | INT n -> Printf.sprintf "number `%Ld`" n
   | FLOAT f -> Printf.sprintf "number `%g`" f
   | STR _ -> "a string"
   | IDENT s -> Printf.sprintf "`%s`" s
@@ -110,7 +110,7 @@ let lex ?(base = 0) file (src : string) : token array =
       let text = String.concat "" (String.split_on_char '_' (String.sub src lo (!i - lo))) in
       if is_float then push (FLOAT (float_of_string text)) lo !i
       else
-        match int_of_string_opt text with
+        match Int64.of_string_opt text with
         | Some v -> push (INT v) lo !i
         | None -> fail "E0005" lo !i (Printf.sprintf "integer literal `%s` is too large" text)
     end

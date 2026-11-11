@@ -7,7 +7,7 @@
 # `[` or `?` that belongs to the previous line.
 #
 # It accepts a slight superset of Vela: keywords are not excluded from
-# identifiers, and types are not checked. It requires at least one space or
+# identifiers, types are not checked, and integer literals may exceed 64 bits. It requires at least one space or
 # tab after a keyword (`if x`, not `if(x)`), which is the canonical style.
 
 root ::= ws (top ws)*

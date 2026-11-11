@@ -119,7 +119,7 @@ let atom c (a : I.atom) =
   match a with
   | I.V v -> var v
   | I.VDup v -> if is_scalar v.ty then var v else sprintf "%s_dup(%s)" (cname c v.ty) (var v)
-  | I.AInt n -> sprintf "INT64_C(%d)" n
+  | I.AInt n -> if n = Int64.min_int then "INT64_MIN" else sprintf "INT64_C(%Ld)" n
   | I.AFloat x -> float_lit x
   | I.ABool b -> if b then "true" else "false"
   | I.AUnit -> "0"
@@ -160,7 +160,7 @@ let walk c root rty steps =
 let rec pat_cond c e t (p : Ast.pat) =
   match p.pdesc with
   | Ast.PWild | Ast.PBind _ -> "true"
-  | Ast.PInt n -> sprintf "(%s == INT64_C(%d))" e n
+  | Ast.PInt n -> if n = Int64.min_int then sprintf "(%s == INT64_MIN)" e else sprintf "(%s == INT64_C(%Ld))" e n
   | Ast.PBool b -> sprintf "(%s == %s)" e (if b then "true" else "false")
   | Ast.PStr s -> sprintf "Str_eq(%s, &%s)" e (lit c s)
   | Ast.PVariant (_, vn, args) ->

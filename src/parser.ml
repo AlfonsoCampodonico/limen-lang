@@ -86,7 +86,7 @@ let rec parse_type st : ty_expr =
     { tdesc = TyFn (ps, r); tspan = merge t.span r.tspan }
   | INT n ->
     ignore (advance st);
-    { tdesc = TyInt n; tspan = t.span }
+    { tdesc = TyInt (if n > Int64.of_int max_int then max_int else Int64.to_int n); tspan = t.span }
   | IDENT n0 ->
     ignore (advance st);
     (* a type from another module: `json.Value` *)
@@ -301,7 +301,7 @@ and parse_pat st =
     match (peek st).tok with
     | INT n ->
       let t2 = advance st in
-      mkp (PInt (-n)) (merge t.span t2.span)
+      mkp (PInt (Int64.neg n)) (merge t.span t2.span)
     | _ -> fail (peek st) "a number")
   | STR [] -> ignore (advance st); mkp (PStr "") t.span
   | STR [ Lit s ] -> ignore (advance st); mkp (PStr s) t.span

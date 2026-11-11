@@ -22,7 +22,7 @@ type cap =
 and sock = { fd : Unix.file_descr; mutable shut : bool }
 
 type value =
-  | VInt of int
+  | VInt of int64 (* 64-bit and wrapping, as in native code *)
   | VFloat of float
   | VBool of bool
   | VStr of string
@@ -96,7 +96,7 @@ let cap_name = function
 
 let rec show ?(top = true) v =
   match v with
-  | VInt n -> string_of_int n
+  | VInt n -> Int64.to_string n
   | VFloat x -> fmt_float x
   | VBool b -> string_of_bool b
   | VStr s -> if top then s else "\"" ^ String.escaped s ^ "\""
@@ -187,7 +187,19 @@ let parse_decimal s =
   let start = if n > 0 && (s.[0] = '-' || s.[0] = '+') then 1 else 0 in
   if n = start then None
   else if String.exists (fun c -> c < '0' || c > '9') (String.sub s start (n - start)) then None
-  else int_of_string_opt s
+  else Int64.of_string_opt s
+
+let vint n = VInt (Int64.of_int n)
+
+(* An Int used as a count or position, clamped to 0..n. *)
+let clamp (k : int64) n = if k < 0L then 0 else if k > Int64.of_int n then n else Int64.to_int k
+
+(* Float to Int as the native w_f2i: NaN is 0, out of range saturates. *)
+let float_to_int x =
+  if Float.is_nan x then 0L
+  else if x >= 9.2e18 then Int64.max_int
+  else if x <= -9.2e18 then Int64.min_int
+  else Int64.of_float x
 
 let strs l = VList (Array.of_list (List.map (fun s -> VStr s) l))
 
@@ -206,12 +218,15 @@ let snapshot env =
 
 let binop op a b sp =
   match (op, a, b) with
-  | Add, VInt x, VInt y -> VInt (x + y)
-  | Sub, VInt x, VInt y -> VInt (x - y)
-  | Mul, VInt x, VInt y -> VInt (x * y)
-  | (Div | Mod), VInt _, VInt 0 -> raise (Panic ("division by zero", sp))
-  | Div, VInt x, VInt y -> VInt (x / y)
-  | Mod, VInt x, VInt y -> VInt (x mod y)
+  | Add, VInt x, VInt y -> VInt (Int64.add x y)
+  | Sub, VInt x, VInt y -> VInt (Int64.sub x y)
+  | Mul, VInt x, VInt y -> VInt (Int64.mul x y)
+  | (Div | Mod), VInt _, VInt 0L -> raise (Panic ("division by zero", sp))
+  (* as the native w_div/w_mod: dividing by -1 wraps instead of trapping *)
+  | Div, VInt x, VInt -1L -> VInt (Int64.neg x)
+  | Mod, VInt _, VInt -1L -> VInt 0L
+  | Div, VInt x, VInt y -> VInt (Int64.div x y)
+  | Mod, VInt x, VInt y -> VInt (Int64.rem x y)
   | Add, VFloat x, VFloat y -> VFloat (x +. y)
   | Sub, VFloat x, VFloat y -> VFloat (x -. y)
   | Mul, VFloat x, VFloat y -> VFloat (x *. y)
@@ -394,7 +409,7 @@ let rec pmatch p v binds =
   match (p.pdesc, v) with
   | PWild, _ -> true
   | PBind n, _ -> Hashtbl.replace binds n (ref v); true
-  | PInt n, VInt m -> n = m
+  | PInt n, VInt m -> Int64.equal n m
   | PStr s, VStr t -> s = t
   | PBool b, VBool c -> b = c
   | PVariant (_, vn, args), VEnum (_, vn', vals) ->
@@ -418,7 +433,7 @@ let rec eval rt env e : value =
     let y = eval rt env b in
     binop op x y e.espan
   | EUn (Neg, a) -> (
-    match eval rt env a with VInt n -> VInt (-n) | VFloat x -> VFloat (-.x) | _ -> failwith "internal: neg")
+    match eval rt env a with VInt n -> VInt (Int64.neg n) | VFloat x -> VFloat (-.x) | _ -> failwith "internal: neg")
   | EUn (Not, a) -> VBool (not (as_bool (eval rt env a)))
   | ECall (c, args) ->
     let fv = eval rt env c in
@@ -443,9 +458,9 @@ let rec eval rt env e : value =
   | EIndex (a, i) -> (
     match (eval rt env a, eval rt env i) with
     | VList arr, VInt k ->
-      if k < 0 || k >= Array.length arr then
-        raise (Panic (sprintf "index %d is out of range for a list of length %d" k (Array.length arr), e.espan));
-      arr.(k)
+      if k < 0L || k >= Int64.of_int (Array.length arr) then
+        raise (Panic (sprintf "index %Ld is out of range for a list of length %d" k (Array.length arr), e.espan));
+      arr.(Int64.to_int k)
     | _ -> failwith "internal: index")
   | ETry x -> (
     match eval rt env x with
@@ -536,7 +551,7 @@ and apply rt fv args sp =
     | _ -> raise (Panic ("assertion failed", sp)))
   | VChanFn -> (
     match args with
-    | [ VInt n ] when n >= 1 -> VChan { q = Queue.create (); cap = n; closed = false }
+    | [ VInt n ] when n >= 1L -> VChan { q = Queue.create (); cap = (if n > Int64.of_int max_int then max_int else Int64.to_int n); closed = false }
     | _ -> raise (Panic ("channel capacity must be at least 1", sp)))
   | VPanicFn -> (
     match args with [ VStr m ] -> raise (Panic (m, sp)) | _ -> raise (Panic ("panic", sp)))
@@ -592,10 +607,10 @@ and assign rt env lhs v =
   | EIndex (r, i) -> (
     match (eval rt env r, eval rt env i) with
     | VList arr, VInt k ->
-      if k < 0 || k >= Array.length arr then
-        raise (Panic (sprintf "index %d is out of range for a list of length %d" k (Array.length arr), lhs.espan));
+      if k < 0L || k >= Int64.of_int (Array.length arr) then
+        raise (Panic (sprintf "index %Ld is out of range for a list of length %d" k (Array.length arr), lhs.espan));
       let a = Array.copy arr in
-      a.(k) <- v;
+      a.(Int64.to_int k) <- v;
       assign rt env r (VList a)
     | _ -> failwith "internal: assign index")
   | _ -> failwith "internal: assign target"
@@ -607,7 +622,7 @@ and call_method rt v name args sp =
   | Some d -> call_fn rt d (v :: args)
   | None ->
   match (v, name, args) with
-  | VStr s, "len", [] -> VInt (String.length s)
+  | VStr s, "len", [] -> vint (String.length s)
   | VStr s, "is_empty", [] -> VBool (s = "")
   | VStr s, "lines", [] -> strs (lines s)
   | VStr s, "split", [ VStr sep ] -> strs (split_on s sep)
@@ -622,26 +637,26 @@ and call_method rt v name args sp =
   | VStr s, "parse_float", [] -> ( match parse_float s with Some x -> some (VFloat x) | None -> none)
   | VStr s, "slice", [ VInt lo; VInt hi ] ->
     let n = String.length s in
-    let lo = max 0 (min lo n) in
-    let hi = max lo (min hi n) in
+    let lo = clamp lo n in
+    let hi = max lo (clamp hi n) in
     VStr (String.sub s lo (hi - lo))
-  | VStr s, "index_of", [ VStr t ] -> ( match find_sub s t 0 with Some i -> some (VInt i) | None -> none)
-  | VStr s, "bytes", [] -> VList (Array.init (String.length s) (fun i -> VInt (Char.code s.[i])))
-  | VInt n, "to_char", [] -> VStr (utf8_of_code n)
+  | VStr s, "index_of", [ VStr t ] -> ( match find_sub s t 0 with Some i -> some (vint i) | None -> none)
+  | VStr s, "bytes", [] -> VList (Array.init (String.length s) (fun i -> vint (Char.code s.[i])))
+  | VInt n, "to_char", [] -> VStr (utf8_of_code (if n < 0L || n > 0x10FFFFL then -1 else Int64.to_int n))
   | VInt a, "min", [ VInt b ] -> VInt (min a b)
   | VInt a, "max", [ VInt b ] -> VInt (max a b)
-  | VInt n, "to_str", [] -> VStr (string_of_int n)
-  | VInt n, "to_float", [] -> VFloat (float_of_int n)
-  | VInt n, "abs", [] -> VInt (abs n)
+  | VInt n, "to_str", [] -> VStr (Int64.to_string n)
+  | VInt n, "to_float", [] -> VFloat (Int64.to_float n)
+  | VInt n, "abs", [] -> VInt (if n < 0L then Int64.neg n else n)
   | VFloat x, "to_str", [] -> VStr (fmt_float x)
-  | VFloat x, "to_int", [] -> VInt (int_of_float x)
+  | VFloat x, "to_int", [] -> VInt (float_to_int x)
   | VFloat x, "abs", [] -> VFloat (Float.abs x)
   | VFloat x, "sqrt", [] -> VFloat (Float.sqrt x)
   | VBool b, "to_str", [] -> VStr (string_of_bool b)
-  | VList a, "len", [] -> VInt (Array.length a)
+  | VList a, "len", [] -> vint (Array.length a)
   | VList a, "to_list", [] -> VList a
   | VList a, "is_empty", [] -> VBool (Array.length a = 0)
-  | VList a, "get", [ VInt i ] -> if i >= 0 && i < Array.length a then some a.(i) else none
+  | VList a, "get", [ VInt i ] -> if i >= 0L && i < Int64.of_int (Array.length a) then some a.(Int64.to_int i) else none
   | VList a, "first", [] -> if Array.length a > 0 then some a.(0) else none
   | VList a, "last", [] -> if Array.length a > 0 then some a.(Array.length a - 1) else none
   | VList a, "contains", [ x ] -> VBool (Array.exists (equal x) a)
@@ -652,15 +667,15 @@ and call_method rt v name args sp =
     let c = Array.copy a in
     Array.stable_sort compare_v c;
     VList c
-  | VList a, "take", [ VInt k ] -> VList (Array.sub a 0 (max 0 (min k (Array.length a))))
+  | VList a, "take", [ VInt k ] -> VList (Array.sub a 0 (clamp k (Array.length a)))
   | VList a, "skip", [ VInt k ] ->
-    let k = max 0 (min k (Array.length a)) in
+    let k = clamp k (Array.length a) in
     VList (Array.sub a k (Array.length a - k))
   | VList a, "filter", [ f ] -> VList (Array.of_list (List.filter (fun x -> as_bool (call f [ x ])) (Array.to_list a)))
   | VList a, "map", [ f ] -> VList (Array.map (fun x -> call f [ x ]) a)
   | VList a, "fold", [ init; f ] -> Array.fold_left (fun acc x -> call f [ acc; x ]) init a
   | VList a, "join", [ VStr sep ] -> VStr (String.concat sep (List.map (fun x -> show x) (Array.to_list a)))
-  | VList a, "sum", [] -> VInt (Array.fold_left (fun acc x -> match x with VInt n -> acc + n | _ -> acc) 0 a)
+  | VList a, "sum", [] -> VInt (Array.fold_left (fun acc x -> match x with VInt n -> Int64.add acc n | _ -> acc) 0L a)
   | VEnum ("Option", vn, _), "is_some", [] -> VBool (vn = "Some")
   | VEnum ("Option", vn, _), "is_none", [] -> VBool (vn = "None")
   | VEnum (("Option" | "Result"), ("Some" | "Ok"), [ x ]), "unwrap_or", [ _ ] -> x
@@ -690,9 +705,9 @@ and call_method rt v name args sp =
     ch.closed <- true;
     VUnit
   | VCap CRand, "int", [ VInt lo; VInt hi ] ->
-    if hi <= lo then raise (Panic (sprintf "rand.int: empty range %d..%d" lo hi, sp));
-    let span = Int64.sub (Int64.of_int hi) (Int64.of_int lo) in
-    VInt (lo + Int64.to_int (Int64.unsigned_rem (rand_next ()) span))
+    if hi <= lo then raise (Panic (sprintf "rand.int: empty range %Ld..%Ld" lo hi, sp));
+    let span = Int64.sub hi lo in
+    VInt (Int64.add lo (Int64.unsigned_rem (rand_next ()) span))
   | VCap c, _, _ -> cap_call rt c name args
   | _ -> raise (Panic (sprintf "internal: no method `%s` on %s" name (show ~top:false v), sp))
 
@@ -702,7 +717,7 @@ and cap_call rt c name args =
   match (c, name, args) with
   | CStdout, "print", [ VStr s ] -> rt.out (s ^ "\n"); VUnit
   | CStdout, "write", [ VStr s ] -> rt.out s; VUnit
-  | CClock, "now_ms", [] -> VInt (int_of_float (Unix.gettimeofday () *. 1000.))
+  | CClock, "now_ms", [] -> VInt (Int64.of_float (Unix.gettimeofday () *. 1000.))
   | CRand, "float", [] -> VFloat (Int64.to_float (Int64.shift_right_logical (rand_next ()) 11) *. 0x1p-53)
   | CStdin, "read_line", [] -> (
     match In_channel.input_line stdin with
@@ -728,7 +743,7 @@ and cap_call rt c name args =
   | CNet allowed, "connect", [ VStr addr ] -> sock_result (Sock.connect allowed addr) (fun fd -> VCap (CConn fd))
   | CListen allowed, "on", [ VStr addr ] -> sock_result (Sock.listen allowed addr) (fun (fd, port) -> VCap (CListener (fd, port)))
   | CListener (fd, _), "accept", [] -> sock_result (Sock.accept fd) (fun c -> VCap (CConn c))
-  | CListener (_, port), "port", [] -> VInt port
+  | CListener (_, port), "port", [] -> vint port
   | (CListener (fd, _) | CConn fd), "close", [] -> Sock.close fd; VUnit
   | CConn fd, "read", [] -> sock_result (Sock.read fd) (fun s -> VStr s)
   | CConn fd, "write", [ VStr s ] -> sock_result (Sock.write fd s) (fun () -> VUnit)
