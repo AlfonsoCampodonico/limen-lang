@@ -46,6 +46,10 @@ let mk d sp = { edesc = d; espan = sp; ety = Types.TErr; einst = [] }
 (* Comma-separated list up to [close]; a newline also separates items. *)
 let peek2 st = st.toks.(min (st.pos + 1) (Array.length st.toks - 1))
 
+(* names for the value inside an Option in `a?.b`; reset per file so a
+   formatted file parses to the same tree *)
+let safe_count = ref 0
+
 let rec irrefutable_tuple (p : pat) =
   match p.pdesc with PBind _ | PWild -> true | PTuple ps -> List.for_all irrefutable_tuple ps | _ -> false
 
@@ -146,12 +150,24 @@ let binop_of = function
 let rec parse_expr st = parse_bin st false 0
 and parse_expr_ns st = parse_bin st true 0
 
+(* `|>` is the loosest binary operator (level 1, left-associative) and may
+   start a line, so a pipeline can be written one step per line. *)
 and parse_bin st ns minp =
   let lhs = ref (parse_unary st ns) in
   let go = ref true in
   while !go do
     let t = peek st in
-    match if t.nl then None else binop_of t.tok with
+    match if t.tok = SYM "|>" then None else if t.nl then None else binop_of t.tok with
+    | _ when t.tok = SYM "|>" && minp < 1 ->
+      ignore (advance st);
+      let rhs = parse_bin st ns 1 in
+      if pipe_call !lhs rhs = None then
+        raise
+          (Diag.Fatal
+             (Diag.make "E0003" rhs.espan
+                ~notes:[ "`x |> f(a)` means `f(x, a)`: the value goes in as the first argument" ]
+                "the right side of `|>` must be a function or a call, as in `x |> f`, `x |> f(a)` or `x |> list.map(g)`"));
+      lhs := mk (EPipe (!lhs, rhs)) (merge (!lhs).espan rhs.espan)
     | Some (p, op) when p > minp ->
       ignore (advance st);
       let rhs = parse_bin st ns p in
@@ -173,41 +189,57 @@ and parse_unary st ns =
     mk (EUn (Not, e)) (merge t.span e.espan)
   | _ -> parse_postfix st ns (parse_primary st ns)
 
-and parse_postfix st ns e =
+(* [in_safe]: parsing the rest of a `?.` chain, which takes every postfix
+   operation up to a `?` (that one applies to the whole chain). *)
+and parse_postfix ?(in_safe = false) st ns e =
   let t = peek st in
+  let continue_ = parse_postfix ~in_safe st ns in
+  (* `.name`, `.name(args)` or `.0` after the dot *)
+  let member e =
+    match (peek st).tok with
+    | INT k ->
+      let it = advance st in
+      mk (EField (e, Int64.to_string k, it.span)) (merge e.espan it.span)
+    | _ ->
+      let name, nsp = expect_ident st in
+      if is_sym st "(" && not (peek st).nl then begin
+        ignore (advance st);
+        let args = comma_list st ")" parse_expr in
+        mk (EMethod (e, name, nsp, args)) (merge e.espan (last_span st))
+      end
+      else mk (EField (e, name, nsp)) (merge e.espan nsp)
+  in
   match t.tok with
   | SYM "(" when not t.nl ->
     ignore (advance st);
     let args = comma_list st ")" parse_expr in
-    parse_postfix st ns (mk (ECall (e, args)) (merge e.espan (last_span st)))
+    continue_ (mk (ECall (e, args)) (merge e.espan (last_span st)))
   | SYM "[" when not t.nl ->
     ignore (advance st);
     let i = parse_expr st in
     let r = expect_sym st "]" in
-    parse_postfix st ns (mk (EIndex (e, i)) (merge e.espan r.span))
-  | SYM "." when (match (peek2 st).tok with INT _ -> true | _ -> false) ->
-    (* tuple field: `t.0` *)
-    ignore (advance st);
-    let it = advance st in
-    let k = match it.tok with INT k -> Int64.to_string k | _ -> "0" in
-    parse_postfix st ns (mk (EField (e, k, it.span)) (merge e.espan it.span))
+    continue_ (mk (EIndex (e, i)) (merge e.espan r.span))
   | SYM "." ->
     ignore (advance st);
-    let name, nsp = expect_ident st in
-    if is_sym st "(" && not (peek st).nl then begin
-      ignore (advance st);
-      let args = comma_list st ")" parse_expr in
-      parse_postfix st ns (mk (EMethod (e, name, nsp, args)) (merge e.espan (last_span st)))
-    end
-    else parse_postfix st ns (mk (EField (e, name, nsp)) (merge e.espan nsp))
-  | SYM "?" when not t.nl -> (
+    continue_ (member e)
+  | SYM "?." ->
+    (* safe navigation: the rest of the chain runs on the value inside the
+       Option, and None short-circuits all of it *)
+    ignore (advance st);
+    incr safe_count;
+    let x = Printf.sprintf "safe$%d" !safe_count in
+    let hole = mk (EVar x) t.span in
+    let rest = parse_postfix ~in_safe:true st ns (member hole) in
+    let node = mk (ESafe (e, x, rest, false)) (merge e.espan rest.espan) in
+    if in_safe then node else continue_ node
+  | SYM "?" when not t.nl && not in_safe -> (
     ignore (advance st);
     (* `x? "reading config"`: a string on the same line adds context to the error *)
     match (peek st).tok with
     | STR _ when not (peek st).nl ->
       let c = parse_primary st ns in
-      parse_postfix st ns (mk (ETry (e, Some c)) (merge e.espan c.espan))
-    | _ -> parse_postfix st ns (mk (ETry (e, None)) (merge e.espan t.span)))
+      continue_ (mk (ETry (e, Some c)) (merge e.espan c.espan))
+    | _ -> continue_ (mk (ETry (e, None)) (merge e.espan t.span)))
   | _ -> e
 
 and parse_primary st ns =
@@ -254,6 +286,7 @@ and parse_primary st ns =
     ignore (advance st);
     let es = comma_list st "]" parse_expr in
     mk (EList es) (merge t.span (last_span st))
+  | SYM "{" when is_with_lit st -> parse_with st
   | SYM "{" ->
     let b = parse_block st in
     mk (EBlock b) b.bspan
@@ -300,6 +333,41 @@ and str_part st = function
     if (peek sub).tok <> EOF then fail (peek sub) "`}` to close the interpolation";
     SPExpr e
 
+(* At a `{`: is this `{ base with field: ... }` rather than a block? It is
+   when `with` follows the base on the first line, outside any brackets, and
+   is followed by a field: `with x:`, `with x,` or `with x }`. *)
+and is_with_lit st =
+  let n = Array.length st.toks in
+  let rec scan i depth =
+    if i >= n then false
+    else
+      let t = st.toks.(i) in
+      if depth = 0 && t.nl && i > st.pos + 1 then false
+      else
+        match t.tok with
+        | EOF -> false
+        | SYM ("(" | "[" | "{") -> scan (i + 1) (depth + 1)
+        | SYM (")" | "]" | "}") -> if depth = 0 then false else scan (i + 1) (depth - 1)
+        | SYM ";" when depth = 0 -> false
+        | IDENT "with" when depth = 0 && i > st.pos + 1 && i + 2 < n -> (
+          match (st.toks.(i + 1).tok, st.toks.(i + 2).tok) with
+          | IDENT _, SYM (":" | "," | "}") -> true
+          | _ -> scan (i + 1) depth)
+        | _ -> scan (i + 1) depth
+  in
+  scan (st.pos + 1) 0
+
+and parse_with st =
+  let lb = expect_sym st "{" in
+  let base = parse_expr st in
+  (match (peek st).tok with IDENT "with" -> ignore (advance st) | _ -> fail (peek st) "`with`");
+  let fields =
+    comma_list st "}" (fun st ->
+        let f, fsp = expect_ident st in
+        if accept_sym st ":" then (f, fsp, parse_expr st) else (f, fsp, mk (EVar f) fsp))
+  in
+  mk (EWith (base, fields)) (merge lb.span (last_span st))
+
 and parse_struct_lit st name nsp =
   ignore (expect_sym st "{");
   let fields =
@@ -332,9 +400,10 @@ and parse_match st =
   let arms = ref [] in
   while not (accept_sym st "}") do
     let p = parse_pat st in
+    let guard = if is_kw st "if" then (ignore (advance st); Some (parse_expr st)) else None in
     ignore (expect_sym st "=>");
     let body = parse_expr st in
-    arms := { apat = p; abody = body } :: !arms;
+    arms := { apat = p; aguard = guard; abody = body } :: !arms;
     if (not (accept_sym st ",")) && (not (is_sym st "}")) && not (peek st).nl then
       fail (peek st) "`,` or a new line between match arms"
   done;
@@ -744,6 +813,7 @@ let set_pub = function
 
 let parse_file file src : file =
   test_count := 0;
+  safe_count := 0;
   let toks = Lexer.lex file src in
   let st = { toks; pos = 0; file } in
   let items = ref [] and uses = ref [] in

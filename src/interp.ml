@@ -1175,7 +1175,9 @@ let rec eval rt env e : value =
       | [] -> raise (Panic ("no `match` arm matched " ^ show ~top:false v, e.espan))
       | a :: rest ->
         let binds = Hashtbl.create 4 in
-        if pmatch a.apat v binds then eval rt (binds :: env) a.abody else go rest
+        if pmatch a.apat v binds && (match a.aguard with Some g -> as_bool (eval rt (binds :: env) g) | None -> true) then
+          eval rt (binds :: env) a.abody
+        else go rest
     in
     go arms
   | ESelect arms ->
@@ -1253,6 +1255,23 @@ let rec eval rt env e : value =
     let vals = List.map (fun (f, _, x) -> (f, eval rt env x)) fields in
     VStruct (name, List.map (fun (f, _, _) -> (f, List.assoc f vals)) decl.st_fields)
   | EDyn (x, _) -> eval rt env x (* values carry their type, so methods dispatch on it *)
+  | EPipe _ -> failwith "pipes are expanded when modules load"
+  | ESafe (base, x, rest, flat) -> (
+    match eval rt env base with
+    | VEnum (_, "Some", [ v ]) ->
+      let b = Hashtbl.create 1 in
+      Hashtbl.replace b x (ref v);
+      let r = eval rt (b :: env) rest in
+      if flat then r else some r
+    | _ -> none)
+  | EWith (base, fields) -> (
+    (* the base first, then the new values; a plain variable is read last,
+       as the native backend does to reuse it in place *)
+    let early = match base.edesc with EVar _ -> None | _ -> Some (eval rt env base) in
+    let vals = List.map (fun (fname, _, x) -> (fname, eval rt env x)) fields in
+    match (match early with Some v -> v | None -> eval rt env base) with
+    | VStruct (n, fs) -> VStruct (n, List.map (fun (k, v) -> (k, Option.value ~default:v (List.assoc_opt k vals))) fs)
+    | _ -> failwith "internal: with on a non-struct")
   | EGroup (name, until, b) ->
     (* tasks are coroutines; the group waits until every one has a result *)
     let g = { tasks = []; kept = []; gcancelled = false } in

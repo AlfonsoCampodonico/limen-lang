@@ -307,6 +307,42 @@ let rec lower f (e : expr) : I.atom =
     | ESelect arms -> lower_select f e arms ty
     | EBlock b -> lower_block f b
     | EClosure (ps, body) -> lower_closure f ps body ty
+    | EPipe _ -> failwith "pipes are expanded when modules load"
+    | ESafe (base, x, rest, flat) ->
+      (* `a?.b`: if a is Some(v), the rest of the chain on v (wrapped in Some
+         unless it is an Option already), else None *)
+      let a = lower f base in
+      let bt = tyof f base in
+      let inner = match bt with TNamed ("Option", [ t ]) -> t | _ -> TUnit in
+      let r = fresh_var "safe" ty in
+      emit f (I.Decl r);
+      let has = tmp f TBool (I.IsTag (a, bt, 0)) in
+      let some_b, _, d =
+        in_block f (fun () ->
+            let v = fresh_var x inner in
+            emit f (I.Let (v, I.Payload (a, bt, 0, 0)));
+            bind f x v;
+            let c = lower f rest in
+            emit f (I.Init (r, if flat then I.Atom c else I.MkEnum (ty, 0, [ c ]))))
+      in
+      let none_b, _, _ = in_block f (fun () -> emit f (I.Init (r, I.MkEnum (ty, 1, [])))) in
+      emit f (I.If (has, some_b, none_b));
+      ignore d;
+      I.V r
+    | EWith (base, fields) ->
+      (* Take the base, then overwrite the fields in place. When the base is
+         not used afterwards it is moved, so its storage is reused and the
+         unchanged fields are not touched; otherwise the ownership pass
+         retains it (a copy) first. A plain variable is read after the new
+         values, so `p = { p with x: p.x + 1 }` still moves `p`. *)
+      let bt = tyof f base in
+      let early = match base.edesc with EVar _ -> None | _ -> Some (lower f base) in
+      let vals = List.map (fun (fname, _, x) -> (field_index f.g bt fname, lower f x)) fields in
+      let b = match early with Some a -> a | None -> lower f base in
+      let v = fresh_var "with" bt in
+      emit f (I.Let (v, I.Atom b));
+      List.iter (fun (k, a) -> emit f (I.Mutate (v, [ I.PField k ], I.MSet a))) vals;
+      I.V v
     | EStruct (name, _, fields) ->
       let vals = List.map (fun (fname, _, x) -> (fname, lower f x)) fields in
       let decl = Hashtbl.find f.g.structs name in
@@ -532,7 +568,58 @@ and lower_match f e s arms ty =
         if d1 && d2 then f.dead <- true
       end
   in
-  chain arms;
+  if List.for_all (fun a -> a.aguard = None) arms then chain arms
+  else begin
+    (* With guards, first find the arm: [k] is the index of the first arm
+       whose pattern matches and whose guard holds (-1 for none), trying
+       each arm only while none has been found. Then run that arm's body.
+       Each arm's bindings are made again for its body; this keeps the
+       code linear in the number of arms. *)
+    let k = fresh_var "arm" TInt in
+    emit f (I.Let (k, I.Atom (I.AInt (-1L))));
+    List.iteri
+      (fun i arm ->
+        let set () = emit f (I.Set (k, I.Atom (I.AInt (Int64.of_int i)), ref false)) in
+        let applies () =
+          match arm.aguard with
+          | None -> set ()
+          | Some g ->
+            bind_pat f sa st arm.apat;
+            let ga = lower f g in
+            let yes, _, _ = in_block f set in
+            emit f (I.If (ga, yes, []))
+        in
+        let try_arm () =
+          let b, _, _ = in_block f applies in
+          if irrefutable arm.apat then List.iter (emit f) b
+          else
+            let t = tmp f TBool (I.PatTest (sa, st, arm.apat)) in
+            emit f (I.If (t, b, []))
+        in
+        if i = 0 then try_arm ()
+        else
+          let pending = tmp f TBool (I.Bin (Eq, TInt, I.V k, I.AInt (-1L), e.espan)) in
+          let b, _, _ = in_block f try_arm in
+          emit f (I.If (pending, b, [])))
+      arms;
+    let rec dispatch i = function
+      | [] ->
+        ignore (tmp f TUnit (I.Panic (I.AStr "no `match` arm matched", e.espan)));
+        f.dead <- true
+      | arm :: rest ->
+        let t = tmp f TBool (I.Bin (Eq, TInt, I.V k, I.AInt (Int64.of_int i), e.espan)) in
+        let b1, _, d1 =
+          in_block f (fun () ->
+              bind_pat f sa st arm.apat;
+              let a = lower f arm.abody in
+              emit f (I.Init (r, I.Atom a)))
+        in
+        let b2, _, d2 = in_block f (fun () -> dispatch (i + 1) rest) in
+        emit f (I.If (t, b1, b2));
+        if d1 && d2 then f.dead <- true
+    in
+    dispatch 0 arms
+  end;
   I.V r
 
 and lower_select f e arms ty =

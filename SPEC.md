@@ -34,19 +34,25 @@ fn parse_names(body: Str) -> List[Str] {   // no capabilities: cannot do I/O
 - **Floats:** digits with a fraction (`1.5`), an exponent (`1e9`, `2.5E-3`), or both. `_` is allowed. There is no leading-dot form (`.5`).
 - **Strings:** `"..."`, may span lines. Escapes: `\n \t \r \\ \" \{ \} \0`. Any other escape is error E0006.
 - **Interpolation:** `{expr}` inside a string evaluates any expression, including ones with their own strings: `"{xs.join(", ")}"`. An empty `{}` is error E0007; write `\{` for a literal brace.
-- **Symbols:** `( ) { } [ ] , : ; . | + - * / % ! ? = < > -> => == != <= >= && || ..<`.
+- **Symbols:** `( ) { } [ ] , : ; . | + - * / % ! ? = < > -> => == != <= >= && || ..< |> ?.`. `?.` is one symbol (safe navigation), so `e?.name` is never `?` followed by `.name`; write `(e?).name` for that.
 
 ### Newlines
 
 Statements are separated by a newline or `;`. Two statements on one line without `;` is error E0004. An expression continues onto the next line only in these cases:
 
-- A line starting with `.` continues a method chain:
+- A line starting with `.` (or `?.`) continues a method chain:
   ```
   let n = xs
       .map(|x| x * 2)
       .sum()
   ```
-- A binary operator at the **end** of a line continues the expression; one at the start of a line does not. So `a\n-1` is two statements.
+- A line starting with `|>` continues a pipeline (section 5):
+  ```
+  let line = name
+      |> text.pad_right(12, ".")
+      |> with_price(price)
+  ```
+- Any other binary operator continues the expression only at the **end** of a line; one at the start of a line does not. So `a\n-1` is two statements.
 - `(`, `[` and `?` at the start of a line do not apply to the previous line: `f\n(x)` is two statements.
 - Inside `(...)`, `[...]`, struct literals, parameter lists and match arms, a newline can replace a `,`.
 
@@ -337,16 +343,17 @@ From loosest to tightest. All binary operators are left-associative.
 
 | Level | Operators |
 | --- | --- |
-| 1 | `\|\|` |
-| 2 | `&&` |
-| 3 | `==` `!=` |
-| 4 | `<` `<=` `>` `>=` |
-| 5 | `..<` |
-| 6 | `+` `-` |
-| 7 | `*` `/` `%` |
-| 8 | `??` |
-| 9 | unary `-` `!` |
-| 10 | call `f(x)`, index `a[i]`, field `p.x`, method `s.len()`, `?` |
+| 1 | `\|>` |
+| 2 | `\|\|` |
+| 3 | `&&` |
+| 4 | `==` `!=` |
+| 5 | `<` `<=` `>` `>=` |
+| 6 | `..<` |
+| 7 | `+` `-` |
+| 8 | `*` `/` `%` |
+| 9 | `??` |
+| 10 | unary `-` `!` |
+| 11 | call `f(x)`, index `a[i]`, field `p.x`, method `s.len()`, safe navigation `a?.b`, `?` |
 
 ### Operators
 
@@ -368,6 +375,7 @@ Both operands must have the same type. The **ordered** types are `Int`, `Float`,
 
 - `[1, 2, 3]` is a `List[Int]`. Where an `Array[T, N]` is expected (an annotated `let`, an argument, a field), a list literal of exactly `N` elements builds the array. A wrong count is error E0201.
 - Struct literal: `Pair { first: 1, second: "a" }`. Every field must be set (E0206). `Pair { first, second }` is shorthand for `first: first`. A struct literal cannot appear directly as the condition of `if`, `while`, `for` or `match`; wrap it in parentheses.
+- Copy with changes: `{ p with x: 3, y: 4 }` is a new struct value equal to `p` except for the fields named, as in F# and C#'s `with`. The base is any expression of a struct type (E0201 otherwise); each field must exist (E0103), appear once (E0106) and have the field's type, and the shorthand `{ p with name }` works as in a literal. The fields not named are kept, so nothing is "missing". `with` must follow the base on the same line; the fields may go on their own lines. The base is evaluated first, then the new values in order, except that a base that is just a variable is read after them, which only matters if a field expression assigns to that variable. Natively, when the base is not used afterwards (`p = { p with x: p.x + 1 }`, or a parameter returned changed), its storage is reused: the replaced fields are overwritten in place and the others are not touched; otherwise the struct is copied first.
 - Enum variants are built by name: `Some(3)`, `None`, `Circle(1.0)`, `Point`. A bare name means a variant of the file's own enums first, then of the prelude (`Some`, `None`, `Ok`, `Err`, `Denied`, `Failed`), then of other modules' enums, so a module's `Num` never clashes with `json.Num`, and a file that defines its own `Some` shadows the prelude's. If two enums at the nearest of those levels define the name, qualify it: `Shape.Point` or `json.Num(1.0)` (E0104). In patterns the type being matched decides, so qualifying is rarely needed there.
 
 ### Blocks, if and match
@@ -396,6 +404,35 @@ fn start(fs: Fs, all: Map[Str, Str]) -> Result[Server, dyn Error] {
 ```
 
 The context is a string after `?`, rather than a method such as `.context("...")?`, so the common case stays one short step that reads like the comment it replaces, and the string is evaluated only on the error path.
+
+### Safe navigation: `?.`
+
+On an `Option`, `a?.b` reaches into the value if there is one: it is `None` when `a` is `None`, and otherwise `Some` of `.b` on the value inside. It works with fields, methods and tuple fields (`a?.len()`, `t?.0`), and `None` short-circuits **the whole chain** to its right, as in C# and TypeScript: in `user?.name.len()`, `.len()` runs only when there is a user, and the result is an `Option[Int]`.
+
+```
+let city = user?.address?.city ?? "unknown"
+```
+
+- The result is an `Option` once, never nested: if the chain's own result is already an `Option` (here `address` is an `Option[Address]`, and `xs?.get(0)` returns one), it is the result as is, as in Swift and Kotlin. So `user?.address?.city` is an `Option[Str]`.
+- The left side must be an `Option` (E0201 otherwise; a value that is always there takes a plain `.`). On a `Result`, `e?.name` is E0201 too: `?.` is one symbol, so to return early on `Err` and then use the value write `(e?).name`.
+- The chain is the postfix operations after `?.`: fields, method calls, calls, indexes and further `?.`. It ends at a binary operator, so `??` (which binds tighter than arithmetic) applies to the whole chain, and it ends at a postfix `?`, which applies to the whole chain too: `find(id)?.address?.city?` returns `None` from the function when any step is missing.
+- `?.` can start a line, like `.`. It cannot be assigned to (E0209).
+
+### Pipes
+
+`x |> f(a, b)` is `f(x, a, b)`: the value on the left goes in as the **first** argument of the call on the right, as in F# and Elixir. A pipeline reads in the order things happen:
+
+```
+let report = read_orders(text)
+    |> list.sort_by(|a, b| a.total > b.total)
+    |> top(10)
+    |> summarize
+```
+
+- The right side is a call `f(a)`, a method or module call `r.m(a)` or `list.sort_by(less)` (the value goes in after the receiver: `x |> r.m(a)` is `r.m(x, a)`), a bare function or closure `f`, `list.sum`, `(|n| n * 2)`, which is called with the value alone, or one of those followed by `?`: `text |> parse()?` is `parse(text)?`. Anything else is error E0003.
+- `|>` is the loosest operator, below `||`, and left-associative: `a + b |> f` is `f(a + b)`, and `x |> f |> g` is `g(f(x))`. To use a pipeline's result in a larger expression, put it in parentheses or a `let`: `(xs |> total) + 1`, `(user |> find) ?? guest`.
+- A line may start with `|>`, so a pipeline can be written one step per line, like a method chain.
+- A pipe is exactly the call it stands for, so it type-checks and evaluates as that call: `x |> r.m(a)` evaluates `r`, then `x`, then `a`.
 
 ### Calls
 
@@ -477,6 +514,19 @@ match shape {
     Point => 0.0,
 }
 ```
+
+An arm can have a guard, `if cond` after the pattern, as in a `select`: the arm applies only when its pattern matches **and** the guard is true, otherwise matching goes on with the next arm. The guard sees the pattern's bindings and must be a `Bool` (E0201). Guards run in order, only until an arm applies.
+
+```
+match order {
+    Some(o) if o.total > 1000 => "large",
+    Some(o) if o.paid => "paid",
+    Some(_) => "open",
+    None => "none",
+}
+```
+
+A guarded arm counts for nothing when checking that a `match` is exhaustive, since its guard may be false: above, `Some(_)` is still needed.
 
 Arms are separated by `,` or a newline. An arm's body is an expression, so a statement such as an assignment needs a block: `None => { more = false },`. Patterns nest: `Err(Failed(msg))`, `Some(Some(n))`. A `match` must be exhaustive (E0204); the error comes with an auto-fix that adds the missing arms. Matching on `Int` or `Str` needs a `_` or binding arm. Tuples are checked column by column, so `(true, _)` and `(false, _)` together are exhaustive.
 
@@ -1162,18 +1212,19 @@ stmt       = "let" [ "mut" ] IDENT [ ":" type ] "=" expr
            | "defer" ( block | stmt )             (* not a `let` *)
            | expr [ "=" expr ] ;
 
-expr       = unary { BINOP unary } ;            (* precedence: section 5 *)
+expr       = unary { BINOP unary | "|>" unary } ; (* precedence: section 5; a line may start with "|>" *)
 expr_ns    = expr ;                             (* no struct literal at the top level *)
 unary      = ( "-" | "!" ) unary | postfix ;
-postfix    = primary { "(" [ args ] ")" | "[" expr "]" | "." IDENT [ "(" [ args ] ")" ] | "." INT | "?" [ STRING ] } ;
+postfix    = primary { "(" [ args ] ")" | "[" expr "]" | ( "." | "?." ) IDENT [ "(" [ args ] ")" ] | ( "." | "?." ) INT | "?" [ STRING ] } ;
 args       = expr { sep expr } [ "," ] ;
 primary    = INT | FLOAT | STRING | "true" | "false"
            | [ IDENT "." ] IDENT [ "{" [ init { sep init } [ "," ] ] "}" ]   (* struct literal *)
            | "(" ")" | "(" expr ")" | "(" expr "," expr { "," expr } ")"   (* tuple *)
            | "[" [ args ] "]"
+           | "{" expr "with" init { sep init } [ "," ] "}"            (* copy with changes *)
            | block
            | "if" expr_ns block [ "else" ( block | if ) ]
-           | "match" expr_ns "{" { pattern "=>" expr ( "," | NL ) } "}"
+           | "match" expr_ns "{" { pattern [ "if" expr ] "=>" expr ( "," | NL ) } "}"
            | "select" "{" { selarm ( "," | NL ) } "}"
            | "|" [ cparam { "," cparam } ] "|" expr | "||" expr
            | "group" IDENT [ "until" expr ] block ;   (* until clock.after(ms) *)

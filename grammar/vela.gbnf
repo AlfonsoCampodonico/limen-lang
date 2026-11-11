@@ -3,11 +3,14 @@
 # It follows SPEC.md section 15 at the character level, including the newline
 # rules: statements are separated by a newline or `;`; inside brackets and
 # after a binary operator a newline is free; a line may start with `.` to
-# continue a method chain; a line may not start with a binary operator, `(`,
-# `[` or `?` that belongs to the previous line.
+# continue a method chain (also `?.`) or with `|>` to continue a pipeline; a line may not
+# start with another binary operator, `(`, `[` or `?` that belongs to the
+# previous line.
 #
 # It accepts a slight superset of Vela: keywords are not excluded from
-# identifiers, types are not checked, and integer literals may exceed 64 bits. It requires at least one space or
+# identifiers, types are not checked, integer literals may exceed 64 bits, and
+# the right side of `|>` may be any operand (the parser wants a call or a
+# function). It requires at least one space or
 # tab after a keyword (`if x`, not `if(x)`), which is the canonical style.
 
 root ::= ws (top ws)*
@@ -65,21 +68,25 @@ while  ::= "while" sp1 expr sp block
 for    ::= "for" sp1 (ident sp1 | upat sp) "in" sp1 expr sp block
 
 # ---------- expressions ----------
-expr    ::= unary (sp binop ws unary)*
+# `|>` may also start a line, to continue a pipeline
+expr    ::= unary (sp binop ws unary | ws "|>" ws unary)*
 binop   ::= "??" | "||" | "&&" | "==" | "!=" | "<=" | ">=" | "<" | ">" | "..<" | "+" | "-" | "*" | "/" | "%"
 unary   ::= ("-" | "!") sp unary | postfix
 postfix ::= primary suffix*
-suffix  ::= sp "(" ws args? ws ")" | sp "[" ws expr ws "]" | ws "." sp ident | "." [0-9]+ | sp "?" (sp string)?
+# `?.` is safe navigation (a line may start with it, as with `.`)
+suffix  ::= sp "(" ws args? ws ")" | sp "[" ws expr ws "]" | ws "." sp ident | "." [0-9]+ | ws "?." sp ident | "?." [0-9]+ | sp "?" (sp string)?
 args    ::= expr (isep expr)* (ws ",")?
 
-primary ::= float | int | string | ident | structlit | "(" ws ")" | "(" ws expr ws ")" | "(" ws expr (isep expr)+ (ws ",")? ws ")" | "[" ws args? ws "]" | block | if | match | select | closure | group
+primary ::= float | int | string | ident | structlit | withlit | "(" ws ")" | "(" ws expr ws ")" | "(" ws expr (isep expr)+ (ws ",")? ws ")" | "[" ws args? ws "]" | block | if | match | select | closure | group
 structlit ::= (ident ".")? upper sp "{" ws (init (isep init)* (ws ",")?)? ws "}"
 init      ::= ident (sp ":" ws expr)?
+# a copy of a struct with fields replaced: `{ p with x: 1 }`; `with` is on the base's line
+withlit   ::= "{" ws expr sp1 "with" (sp1 | sp "\n" ws) init (isep init)* (ws ",")? ws "}"
 if        ::= "if" sp1 expr sp block (ws "else" (sp block | sp1 if))?
 match     ::= "match" sp1 expr sp "{" ws (arm (isep arm)* (ws ",")?)? ws "}"
 select    ::= "select" sp "{" ws (selarm (isep selarm)* (ws ",")?)? ws "}"
 selarm    ::= (ident sp "=" ws expr | expr) (sp1 "if" sp1 expr)? sp "=>" ws expr
-arm       ::= pattern sp "=>" ws expr
+arm       ::= pattern (sp1 "if" sp1 expr)? sp "=>" ws expr
 closure   ::= "|" ws (cparam (isep cparam)* ws)? "|" ws expr | "||" ws expr
 cparam    ::= ident (sp ":" sp type)?
 group     ::= "group" sp1 ident (sp1 "until" sp1 expr)? sp block

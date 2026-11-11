@@ -562,6 +562,9 @@ and check_expr_inner ctx f e : ty =
   | EClosure (ps, body) -> check_closure ctx f ps body None
   | EStruct (name, nsp, fields) -> check_struct_lit ctx f name nsp fields e.espan
   | EDyn (x, i) -> ignore (check_expr ctx f x); TDyn i
+  | EPipe _ -> failwith "pipes are expanded when modules load"
+  | EWith (base, fields) -> check_with ctx f base fields e.espan
+  | ESafe (base, x, rest, _) -> check_safe ctx f e base x rest
   | EGroup (name, until, b) ->
     let t = fresh () in
     Option.iter
@@ -1342,6 +1345,75 @@ and check_struct_lit ctx f name nsp fields sp =
            name);
     TNamed (name, targs)
 
+(* `a?.b`: [rest] runs on the value inside the Option [a], bound to [x].
+   The result is an Option: the rest's own when it is one already (so
+   `a?.b?.c` is not nested), otherwise the rest wrapped in Some. *)
+and check_safe ctx f e base x rest =
+  let bt = check_expr ctx f base in
+  let inner =
+    match repr bt with
+    | TNamed ("Option", [ t ]) -> t
+    | TErr -> TErr
+    | TVar _ ->
+      err ctx "E0207" base.espan "the type of this value is not known here; add a type annotation";
+      TErr
+    | TNamed ("Result", _) as t ->
+      err ctx "E0201" base.espan
+        (sprintf "`?.` works on an `Option`, but this is `%s`" (show t))
+        ~notes:
+          [ "`?.` is safe navigation; to return early on `Err` and then use the value, write `(e?).name`" ];
+      TErr
+    | t ->
+      err ctx "E0201" base.espan
+        (sprintf "`?.` needs an `Option` on its left, found `%s`" (show t))
+        ~notes:[ "a value that is always there takes a plain `.`" ];
+      TErr
+  in
+  push f;
+  bind f x { vty = inner; vmut = false; vspan = base.espan; vkind = KPat };
+  let rt = check_expr ctx f rest in
+  pop f;
+  match (repr bt, repr rt) with
+  | TNamed ("Option", _), TNamed ("Option", _) ->
+    e.edesc <- ESafe (base, x, rest, true);
+    rt
+  | TNamed ("Option", _), TErr -> TErr
+  | TNamed ("Option", _), _ -> opt rt
+  | _ -> TErr
+
+(* `{ base with x: 1, y }`: a copy of a struct value with some fields
+   replaced; the same field errors as a struct literal, minus "missing". *)
+and check_with ctx f base fields sp =
+  let bt = check_expr ctx f base in
+  let others () = List.iter (fun (_, _, x) -> ignore (check_expr ctx f x)) fields in
+  match repr bt with
+  | TNamed (name, targs) when Hashtbl.mem ctx.sfields name && not (is_tuple_name name) ->
+    let decl_fields = Hashtbl.find ctx.sfields name in
+    let env = List.combine (Hashtbl.find ctx.structs name).st_gen targs in
+    let seen = Hashtbl.create 8 in
+    List.iter
+      (fun (fname, fsp, x) ->
+        if Hashtbl.mem seen fname then err ctx "E0106" fsp (sprintf "field `%s` is set twice" fname);
+        Hashtbl.replace seen fname ();
+        match List.assoc_opt fname decl_fields with
+        | Some ft -> expect ctx f x (subst env ft)
+        | None ->
+          did_you_mean ctx "E0103" fsp (sprintf "struct `%s` has no field `%s`" name fname) fname (List.map fst decl_fields);
+          ignore (check_expr ctx f x))
+      fields;
+    bt
+  | TErr -> others (); TErr
+  | TVar _ ->
+    err ctx "E0207" base.espan "the type of this value is not known here; add a type annotation";
+    others ();
+    TErr
+  | t ->
+    err ctx "E0201" base.espan
+      (sprintf "`{ ... with ... }` copies a struct, but this is `%s`" (show t))
+      ~notes:[ "only struct values have named fields to replace" ];
+    others ();
+    TErr
+
 and check_match ?want ctx f s arms sp =
   let st = check_expr ctx f s in
   let result = match want with Some w -> w | None -> fresh () in
@@ -1349,6 +1421,7 @@ and check_match ?want ctx f s arms sp =
     (fun arm ->
       push f;
       check_pat ctx f st arm.apat;
+      Option.iter (fun g -> expect ctx f g TBool) arm.aguard;
       (match want with
        | Some w -> expect ctx f arm.abody w
        | None ->
@@ -1359,7 +1432,8 @@ and check_match ?want ctx f s arms sp =
   (match arms with
    | [] -> err ctx "E0204" sp "`match` needs at least one arm"
    | _ -> (
-     match missing_arms ctx st (List.map (fun a -> a.apat) arms) with
+     (* a guarded arm may not apply, so it covers nothing *)
+     match missing_arms ctx st (List.filter_map (fun a -> if a.aguard = None then Some a.apat else None) arms) with
      | [] -> ()
      | missing ->
        (* Insert new arms on their own lines just above the closing brace. *)

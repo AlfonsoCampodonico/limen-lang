@@ -22,7 +22,7 @@ let ok name cond msg =
    dir/reject (lexer or parser error), for checking grammar/vela.gbnf. *)
 (* Rejected by the parser but within the grammar's documented superset
    (keywords are not excluded from identifiers). *)
-let grammar_superset = [ "tuple-let-refutable"; "select-bad-arm"; "group-until-bad" ]
+let grammar_superset = [ "tuple-let-refutable"; "select-bad-arm"; "group-until-bad"; "pipe-not-callable"; "pipe-binary-rhs" ]
 
 let dump name src parsed =
   match Sys.getenv_opt "VELA_DUMP_DIR" with
@@ -1734,6 +1734,10 @@ fn main(root: Root) {
   let d5 = with_line "    let ys = [1, 2]\n    ys." in
   let c5 = complete d5 "    ys." 7 in
   ok "lsp-complete-list" (List.mem "len" c5 && List.mem "group_by" c5 && List.mem "tally" c5) (String.concat "," c5);
+  (* after `?.`, the members of the value inside the Option *)
+  let d5 = with_line "    let op = Some(pt)\n    op?." in
+  let c5 = complete d5 "    op?." 8 in
+  ok "lsp-complete-safe" (List.mem "x" c5 && List.mem "y" c5 && not (List.mem "is_some" c5)) (String.concat "," c5);
   let c4 = complete doc "    let n" 4 in
   ok "lsp-complete-general" (List.mem "total" c4 && List.mem "dist" c4 && List.mem "while" c4) (String.concat "," c4);
   (* quick fix: make n mutable *)
@@ -3783,6 +3787,214 @@ true {"a": 2, "b": 1} [5, 9]
   let _, _, infos = compile "collections-caps" (main_wrap "    out.print(\"{[1].any(|x| x > 0)}\")") in
   ok "collections-caps" (List.for_all (fun (i : Check.fn_info) -> i.span.file <> Prelude.methods_file) infos) "a built-in method is listed";
 
+  (* ---------- pipes: `x |> f(a)` is `f(x, a)` ---------- *)
+  out "pipe-basic" {|use list
+struct Acc {
+    total: Int,
+fn add(self: Acc, n: Int, k: Int) -> Acc { Acc { total: self.total + n * k } }
+fn double(x: Int) -> Int { x * 2 }
+fn plus(x: Int, y: Int) -> Int { x + y }
+fn evens(xs: List[Int]) -> List[Int] { xs.filter(|x| x % 2 == 0) }
+fn total(xs: List[Int]) -> Int { xs.fold(0, |a, b| a + b) }
+fn parse(s: Str) -> Result[Int, Str] {
+    if s == "" { Err("empty") } else { Ok(s.len()) }
+fn twice(s: Str) -> Result[Int, Str] {
+    let n = s |> parse()?
+    Ok(n |> plus(n))
+    out.print("{3 |> double |> plus(1)}")
+    let t = [1, 2, 3, 4, 5, 6]
+        |> evens
+        |> total
+    out.print("{t} {(t |> double) + 1} {1 + 2 |> double}")
+    out.print("{5 |> (|x| x * 10)}")
+    let words = ["pear", "fig", "apple"]
+        |> list.sort_by(|a, b| a.len() < b.len())
+    out.print("{words} {(words |> list.index_of("pear")) ?? -1}")
+    let acc = Acc { total: 0 }
+    out.print("{(4 |> acc.add(10)).total}")
+    out.print("{twice("abc")} {twice("")}")
+    // strings and lists move through the pipeline without leaking
+    let s = "a,b,c".split(",") |> evens_str
+    out.print(s)
+fn evens_str(xs: List[Str]) -> Str { xs.join("+") }
+|} "7\n12 25 6\n50\n[\"fig\", \"pear\", \"apple\"] 1\n40\nOk(6) Err(\"empty\")\na+b+c\n";
+  errs "pipe-not-callable" (main_wrap "    let x = 3 |> 4") [ "E0003" ];
+  errs "pipe-binary-rhs" (main_wrap "    let x = 3 |> (1 + 2)") [ "E0003" ];
+  errs "pipe-arity" "fn plus(x: Int, y: Int) -> Int { x + y }\n\nfn main(root: Root) {\n    let x = 3 |> plus(1, 2)\n}\n" [ "E0107" ];
+  errs "pipe-type" "fn plus(x: Int, y: Int) -> Int { x + y }\n\nfn main(root: Root) {\n    let x = \"a\" |> plus(1)\n}\n" [ "E0201" ];
+  (* a line may start with `|>`, but not with another binary operator *)
+  errs "pipe-newline" (main_wrap "    let x = 3\n        |> double\n}\n\nfn double(x: Int) -> Int {\n    x * 2") [];
+  (* ---------- copy with changes: `{ p with x: 1 }` ---------- *)
+  let with_src = {|struct User {
+struct Pair[A, B] {
+    first: A,
+    second: B,
+fn older(u: User) -> User { { u with age: u.age + 1 } }
+fn make(out: Stdout) -> User {
+    out.print("make")
+    User { name: "m", tags: [], age: 0 }
+fn side(out: Stdout, n: Int) -> Int {
+    out.print("side {n}")
+    n
+    let a = User { name: "ann", tags: ["x"], age: 30 }
+    let b = { a with name: "bob" }
+    out.print("{a} {b}")
+    // the original is used again, so this one is a copy
+    let mut c = older(b)
+    out.print("{b.age} {c.age}")
+    c = { c with tags: ["y", "z"], age: 1 }
+    let name = "cy"
+    out.print("{c} {{ c with name }}")
+    // generic structs, and a base that is not a variable: evaluated first
+    let p = Pair { first: 1, second: "one" }
+    out.print("{{ p with second: "uno" }} {{ make(out) with age: side(out, 7) }.age}")
+    // in a loop, and captured by a closure
+    let mut u = User { name: "loop", tags: [], age: 0 }
+    for i in 0..<3 {
+        let mut t = u.tags
+        t.push("t{i}")
+        u = { u with age: u.age + i, tags: t }
+    let rename = |n: Str| { u with name: n }
+    out.print("{u} {rename("other").name} {u.name}")
+    let users = [a, b].map(|x| { x with tags: [] })
+    out.print("{users}")
+    let multi = {
+        u with
+        name: "multi",
+        age: 99,
+    out.print("{multi.name} {multi.age}")
+|} in
+  out "with-copy" with_src
+    "User { name: \"ann\", tags: [\"x\"], age: 30 } User { name: \"bob\", tags: [\"x\"], age: 30 }\n30 31\nUser { name: \"bob\", tags: [\"y\", \"z\"], age: 1 } User { name: \"cy\", tags: [\"y\", \"z\"], age: 1 }\nmake\nside 7\nPair { first: 1, second: \"uno\" } 7\nUser { name: \"loop\", tags: [\"t0\", \"t1\", \"t2\"], age: 3 } other loop\n[User { name: \"ann\", tags: [], age: 30 }, User { name: \"bob\", tags: [], age: 30 }]\nmulti 99\n";
+  (* natively, a base that is not used afterwards is reused in place: moved,
+     with only the replaced field written, never copied *)
+  (let items, ds, _ = compile "with-reuse" with_src in
+   let c = if ds = [] then Native.c_source items else "" in
+   let has s sub =
+     let n = String.length s and m = String.length sub in
+     let rec go i = i + m <= n && (String.sub s i m = sub || go (i + 1)) in
+     go 0
+   in
+   let rec from = function
+     | [] -> []
+     | l :: r -> if String.starts_with ~prefix:"static" l && String.ends_with ~suffix:"{" l && has l "wf_older(" then upto r else from r
+   and upto = function [] | "}" :: _ -> [] | l :: r -> l :: upto r in
+   let body = String.concat "\n" (from (String.split_on_char '\n' c)) in
+   ok "with-reuse" (body <> "" && not (has body "_dup(")) body);
+  errs "with-unknown-field" "struct P {\n    x: Int,\n}\n\nfn main(root: Root) {\n    let p = P { x: 1 }\n    let q = { p with y: 2 }\n}\n" [ "E0103" ];
+  errs "with-twice" "struct P {\n    x: Int,\n}\n\nfn main(root: Root) {\n    let p = P { x: 1 }\n    let q = { p with x: 2, x: 3 }\n}\n" [ "E0106" ];
+  errs "with-field-type" "struct P {\n    x: Int,\n}\n\nfn main(root: Root) {\n    let p = P { x: 1 }\n    let q = { p with x: \"a\" }\n}\n" [ "E0201" ];
+  errs "with-not-struct" (main_wrap "    let n = 5\n    let q = { n with x: 1 }") [ "E0201" ];
+  errs "with-option" (main_wrap "    let o = Some(1)\n    let q = { o with x: 1 }") [ "E0201" ];
+  errs "with-tuple" (main_wrap "    let t = (1, 2)\n    let q = { t with x: 1 }") [ "E0201" ];
+  errs "with-unknown-base" (main_wrap "    let q = { nope with x: 1 }") [ "E0101" ];
+  (* `with` only starts a copy right after the base, followed by a field *)
+  errs "with-not-a-copy" (main_wrap "    let with = 1\n    let x = { with }\n    out.print(\"{x}\")") [];
+  (* ---------- guards in match arms ---------- *)
+  out "match-guard" {|enum Shape {
+    Circle(Float),
+    Rect(Float, Float),
+enum Msg {
+    Text(Str),
+    Batch(List[Str]),
+fn size(o: Option[Int]) -> Str {
+    match o {
+        Some(n) if n > 10 => "big {n}",
+        Some(n) if n < 0 => "negative",
+        Some(n) => "small {n}",
+        None => "none",
+fn kind(s: Shape) -> Str {
+    match s {
+        Rect(w, h) if w == h => "square",
+        Rect(_, _) => "rect",
+        c if false => "never",
+        Circle(r) => "circle {r}",
+fn seen(out: Stdout, tag: Str, ok: Bool) -> Bool {
+    out.print("guard {tag}")
+    ok
+// heap payloads bound for a guard that fails are released
+fn describe(m: Msg) -> Str {
+    match m {
+        Text(s) if s.len() > 3 => "long text {s}",
+        Batch(xs) if xs.len() == 0 => "empty batch",
+        Batch(xs) if xs.contains("stop") => "stop in {xs}",
+        Text(s) => "text {s}",
+        Batch(xs) => "batch of {xs.len()}",
+    out.print("{size(Some(42))} {size(Some(-1))} {size(Some(3))} {size(None)}")
+    out.print("{kind(Rect(2.0, 2.0))} {kind(Rect(1.0, 2.0))} {kind(Circle(1.5))}")
+    // guards run in order, only until an arm applies
+    let r = match 5 {
+        n if seen(out, "a", n > 7) => "a",
+        n if seen(out, "b", n > 3) => "b",
+        n if seen(out, "c", true) => "c",
+        _ => "none",
+    out.print(r)
+    for m in [Text("hi"), Text("hello"), Batch([]), Batch(["go", "stop"]), Batch(["x"])] {
+        out.print(describe(m))
+    let pair = ("hello", 3)
+    let t = match pair {
+        (s, k) if s.len() > k => "long {s}",
+        (s, _) => "short {s}",
+    out.print(t)
+|} "big 42 negative small 3 none\nsquare rect circle 1.5\nguard a\nguard b\nb\ntext hi\nlong text hello\nempty batch\nstop in [\"go\", \"stop\"]\nbatch of 1\nlong hello\n";
+  (* a guarded arm covers nothing, so the match must still be exhaustive *)
+  errs "match-guard-not-exhaustive" "fn f(o: Option[Int]) -> Int {\n    match o {\n        Some(n) if n > 0 => n,\n        None => 0,\n    }\n}\n" [ "E0204" ];
+  errs "match-guard-all-guarded" "fn f(n: Int) -> Int {\n    match n {\n        k if k > 0 => 1,\n        k if k <= 0 => 0,\n    }\n}\n" [ "E0204" ];
+  errs "match-guard-exhaustive" "fn f(o: Option[Int]) -> Int {\n    match o {\n        Some(n) if n > 0 => n,\n        Some(_) => 0,\n        None => -1,\n    }\n}\n" [];
+  errs "match-guard-type" "fn f(o: Option[Int]) -> Int {\n    match o {\n        Some(n) if n => n,\n        _ => 0,\n    }\n}\n" [ "E0201" ];
+  errs "match-guard-unbound" "fn f(o: Option[Int]) -> Int {\n    match o {\n        Some(n) if m > 0 => n,\n        _ => 0,\n    }\n}\n" [ "E0101" ];
+  (let _, ds, _ = compile "match-guard-fix" "fn f(o: Option[Int]) -> Int {\n    match o {\n        Some(n) if n > 0 => n,\n        None => 0,\n    }\n}\n" in
+   ok "match-guard-fix" (List.exists (fun (d : Diag.t) -> d.message = "`match` does not cover `Some(_)`") ds) (String.concat "; " (List.map (fun (d : Diag.t) -> d.message) ds)));
+  (* ---------- safe navigation: `a?.b` on an Option ---------- *)
+  out "safe-nav" {|struct Address {
+    zip: Option[Str],
+    lines: List[Str],
+struct User {
+    address: Option[Address],
+fn find(id: Int) -> Option[User] {
+    if id == 1 {
+        Some(User { name: "ann", address: Some(Address { city: "Rome", zip: None, lines: ["Via Roma 1"] }) })
+    } else if id == 2 {
+        Some(User { name: "bob", address: None })
+    } else {
+        None
+fn shout(self: Str) -> Str { self.to_upper() }
+// `?` after a chain applies to the whole chain: None returns early
+fn city_len(id: Int) -> Option[Int] {
+    let n = find(id)?.address?.city.len()?
+    Some(n * 10)
+fn parse(s: Str) -> Result[User, Str] {
+    if s == "" { Err("empty") } else { Ok(User { name: s, address: None }) }
+// `(e?).name` is try-then-field; `e?.name` would be safe navigation
+fn name_of(s: Str) -> Result[Str, Str] {
+    Ok((parse(s)?).name)
+fn upto(o: Option[Int]) -> Option[List[Int]] {
+    Some(0..<o?)
+fn upto2(o: Option[Int]) -> Option[List[Int]] {
+    Some(o?..<3)
+    for id in [1, 2, 3] {
+        let u = find(id)
+        out.print("{u?.name ?? "nobody"} {u?.address?.city ?? "unknown"} {u?.name.shout().len()} {u?.address?.zip ?? "-"} {u?.address?.lines.get(0)}")
+        out.print("{city_len(id)}")
+    let t: Option[(Int, Str)] = Some((1, "x"))
+    out.print("{t?.1} {t?.0 ?? 0}")
+    let xs: Option[List[Int]] = Some([1, 2, 3])
+    let none: Option[List[Int]] = None
+    // an Option result is not wrapped again
+    out.print("{xs?.map(|x| x * 2)} {xs?.get(1)} {xs?.len()} {none?.get(0)}")
+    let deep = find(1)
+        ?.address
+        ?.city
+    out.print("{deep}")
+    let get_city = |id: Int| find(id)?.address?.city ?? "?"
+    out.print("{get_city(1)} {get_city(2)}")
+    out.print("{name_of("zed")} {name_of("")} {upto(Some(3))} {upto2(Some(1))} {upto(None)}")
+|} "ann Rome Some(3) - Some(\"Via Roma 1\")\nSome(40)\nbob unknown Some(3) - None\nNone\nnobody unknown None - None\nNone\nSome(\"x\") 1\nSome([2, 4, 6]) Some(2) Some(3) None\nSome(\"Rome\")\nRome ?\nOk(\"zed\") Err(\"empty\") Some([0, 1, 2]) Some([1, 2]) None\n";
+  errs "safe-nav-not-option" (main_wrap "    let n = 5\n    let x = n?.abs()") [ "E0201" ];
+  errs "safe-nav-result" "fn parse(s: Str) -> Result[Int, Str] {\n    Ok(1)\n}\n\nfn f() -> Result[Int, Str] {\n    let n = parse(\"x\")?.abs()\n    Ok(1)\n}\n" [ "E0201" ];
+  errs "safe-nav-unknown-field" "struct P {\n    x: Int,\n}\n\nfn main(root: Root) {\n    let p = Some(P { x: 1 })\n    let y = p?.y\n}\n" [ "E0103" ];
+  errs "safe-nav-assign" "struct P {\n    x: Int,\n}\n\nfn main(root: Root) {\n    let mut p = Some(P { x: 1 })\n    p?.x = 2\n}\n" [ "E0209"; "E0201" ];
+  errs "safe-nav-type" "struct P {\n    x: Int,\n}\n\nfn main(root: Root) {\n    let p = Some(P { x: 1 })\n    let y: Int = p?.x\n}\n" [ "E0201" ];
   (* ---------- tuples and maps ---------- *)
   out "tuples" (example "tuples.vela") "3 2 (2, 1)\n(1, \"one\", 1.5) 1 one 1.5 (2, \"a\")\n4 ((1, 2), (3, (4, 5)))\n1 3 4 5\na1 b2 c3 \nyes zero yes no 7\ntrue false 6\n";
   out "maps" (example "maps.vela") "{\"the\": 3, \"cat\": 1, \"and\": 2, \"hat\": 1, \"bat\": 1} 5 3 None\n[\"the\", \"cat\", \"and\", \"hat\", \"bat\"] [3, 1, 2, 1, 1]\nthe=3 and=2 \n{\"the\": 100, \"and\": 2, \"hat\": 1, \"bat\": 1, \"zebra\": 9}\n{\"the\": 3, \"cat\": 1, \"and\": 2, \"hat\": 1, \"bat\": 1}\ntrue false false\n{1: 1, 2: 4, 3: 9} true false 0\n1 {\"a\": 1}\nyes\n";

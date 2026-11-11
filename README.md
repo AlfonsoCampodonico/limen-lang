@@ -258,6 +258,14 @@ Tuples `(Int, Str)` and maps `Map[Str, Int]` are built in: `let (q, r) = divmod(
 
 Errors: any type with `fn message(self: T) -> Str` satisfies the prelude's `Error` interface (as do `Str` and `IoError`), and in a function returning `Result[T, dyn Error]`, `?` converts each of them, so one function can mix file, parse and its own errors. A string after `?` adds context: `fs.read(path)? "reading config"` fails with `reading config: <the error>`, keeping the original as its `cause()`; `opt? "no port set"` turns a missing value into an error. The `errors` module walks the chain (`errors.report(e)` prints one cause per line), and `main` returning a `dyn Error` prints its message. `.map_error(f)` converts an error by hand (the old `map_err` still works, with warning W0001 and a fix that renames it).
 
+`user?.address?.city ?? "unknown"` navigates through `Option`s: `None` anywhere short-circuits the rest of the chain, and the result is a single `Option`.
+
+`match` arms take guards, as `select` arms do: `Some(n) if n > 10 => ...`. A guarded arm does not count toward exhaustiveness.
+
+`{ p with x: 3, y: 4 }` copies a struct with some fields replaced; natively, when `p` is not used again its storage is reused in place.
+
+`x |> f(a)` is `f(x, a)`: a pipeline reads in the order things happen, one step per line if you like (`lines |> parse_all |> list.sort_by(less) |> top(10)`). It is the loosest operator, so `a + b |> f` is `f(a + b)`.
+
 A panic ends only the task it happens in, and `catch(|| ...)` turns one into `Err(message)`, so `http.serve` answers 500 when a handler panics and keeps serving.
 
 Not yet: nothing big; see the design doc's Known gaps. `Int` is 64-bit and wraps on overflow, identically in the interpreter and in native code.

@@ -73,6 +73,10 @@ fn port(settings: Map[Str, Str]) -> Result[Int, dyn Error] {
     Ok(n)
 }
 
+fn evens(xs: List[Int]) -> List[Int] { xs.filter(|x| x % 2 == 0) }
+
+fn total(xs: List[Int]) -> Int { xs.fold(0, |a, b| a + b) }
+
 fn slow(clock: Clock, ms: Int, v: Int) -> Int {
     clock.sleep(ms)
     v
@@ -151,6 +155,30 @@ fn main(root: Root) -> Int {
     home.x = 5
     let ds: List[dyn Described] = [home, home.Point]
     out.print("{home.label} at {home.describe()} {ds.map(|d| d.describe())}")
+    out.print("-- syntax")
+    // pipes: the value goes in as the first argument
+    let sum = 1..<7
+        |> evens
+        |> total
+    out.print("pipe {sum}")
+    // copy with changes: the other fields are kept
+    let origin = Point { x: 0, y: 0 }
+    let moved = { origin with y: 5 }
+    out.print("{origin} {moved}")
+    // guards in match arms; a guarded arm does not count as covering its pattern
+    for o in [Some(42), Some(3), None] {
+        let size = match o {
+            Some(n) if n > 10 => "big",
+            Some(_) => "small",
+            None => "nothing",
+        }
+        out.print(size)
+    }
+    // safe navigation: None anywhere ends the chain
+    let corner: Option[Point] = Some(Point { x: 3, y: 4 })
+    let nowhere: Option[Point] = None
+    out.print("{corner?.x} {nowhere?.y ?? -1}")
+
     out.print("-- concurrency")
     // tasks returning () run for their effect and add nothing to the list
     let rs = group g {

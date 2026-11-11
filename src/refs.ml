@@ -128,6 +128,7 @@ let index (items : item list) : occ list =
   let rec expr env e =
     let x = expr env in
     match e.edesc with
+    | EVar n when String.contains n '$' -> () (* a name the compiler made up *)
     | EVar n -> (
       match List.assoc_opt n env with
       | Some k -> add k n e.espan
@@ -138,7 +139,7 @@ let index (items : item list) : occ list =
     | EInt _ | EFloat _ | EBool _ | EUnit -> ()
     | EStr ps -> List.iter (function SPExpr y -> x y | SPLit _ -> ()) ps
     | EList es -> List.iter x es
-    | EBin (_, a, b) | EIndex (a, b) -> x a; x b
+    | EBin (_, a, b) | EIndex (a, b) | EPipe (a, b) -> x a; x b
     | EUn (_, a) | ETry (a, None) -> x a
     | ETry (a, Some c) -> x a; x c
     | (EField ({ edesc = EVar en; espan; _ }, v, nsp) | EMethod ({ edesc = EVar en; espan; _ }, v, nsp, _))
@@ -158,7 +159,14 @@ let index (items : item list) : occ list =
        | _ -> ());
       List.iter x args
     | EIf (c, b, eo) -> x c; block env b; Option.iter x eo
-    | EMatch (s, arms) -> x s; List.iter (fun a -> expr (pat env a.apat) a.abody) arms
+    | EMatch (s, arms) ->
+      x s;
+      List.iter
+        (fun a ->
+          let env = pat env a.apat in
+          Option.iter (expr env) a.aguard;
+          expr env a.abody)
+        arms
     | EBlock b -> block env b
     | EGroup (n, until, b) ->
       Option.iter (fun (c, ms) -> x c; x ms) until;
@@ -184,6 +192,19 @@ let index (items : item list) : occ list =
              | Some k -> add ~short:(Var_side f) k n fsp
              | None -> if Hashtbl.mem fns n then add ~short:(Var_side f) ("f:" ^ n) n fsp)
           | _ -> (if Hashtbl.mem structs name then field_ref name f fsp else add ("d:" ^ name ^ "#" ^ f) f fsp); x v)
+        fs
+    | ESafe (b, _, rest, _) -> x b; x rest
+    | EWith (b, fs) ->
+      x b;
+      List.iter
+        (fun (f, (fsp : Span.t), v) ->
+          match v.edesc with
+          | EVar n when n = f && v.espan = fsp ->
+            (match struct_of e.ety with Some s -> add ~short:Field_side ("d:" ^ s ^ "#" ^ f) f fsp | None -> ());
+            (match List.assoc_opt n env with
+             | Some k -> add ~short:(Var_side f) k n fsp
+             | None -> if Hashtbl.mem fns n then add ~short:(Var_side f) ("f:" ^ n) n fsp)
+          | _ -> (match struct_of e.ety with Some s -> add ("d:" ^ s ^ "#" ^ f) f fsp | None -> ()); x v)
         fs
     | EDyn (y, _) -> x y
     | ESelect arms ->

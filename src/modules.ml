@@ -180,6 +180,11 @@ let rec expr env locals (e : expr) : expr =
         | Some (IFn _) -> EVar (qual env.self n)
         | _ -> if is_module env locals n then (err "E0404" e.espan (Printf.sprintf "module `%s` is not a value; use one of its items, such as `%s.name`" n n); e.edesc) else e.edesc)
     | EList es -> EList (List.map ex es)
+    | EPipe (x, rhs) -> (
+      (* `x |> f(a)` is `f(x, a)` from here on *)
+      match pipe_call x rhs with
+      | Some d -> (ex { e with edesc = d }).edesc
+      | None -> e.edesc (* the parser rejects it *))
     | EBin (op, a, b) -> EBin (op, ex a, ex b)
     | EUn (op, a) -> EUn (op, ex a)
     | ECall (c, args) -> ECall (ex c, List.map ex args)
@@ -225,7 +230,11 @@ let rec expr env locals (e : expr) : expr =
     | EMatch (s, arms) ->
       EMatch
         ( ex s,
-          List.map (fun a -> { apat = pat env locals a.apat; abody = expr env (pat_binds a.apat locals) a.abody }) arms )
+          List.map
+            (fun a ->
+              let inner = pat_binds a.apat locals in
+              { apat = pat env locals a.apat; aguard = Option.map (expr env inner) a.aguard; abody = expr env inner a.abody })
+            arms )
     | EBlock b -> EBlock (block env locals b)
     | EClosure (ps, body) ->
       let locals' = List.fold_left (fun acc (n, _, _) -> n :: acc) locals ps in
@@ -245,6 +254,8 @@ let rec expr env locals (e : expr) : expr =
       in
       EStruct (n, sp, List.map (fun (f, fsp, x) -> (f, fsp, ex x)) fields)
     | EGroup (g, until, b) -> EGroup (g, Option.map (fun (c, ms) -> (ex c, ex ms)) until, block env (g :: locals) b)
+    | EWith (b, fields) -> EWith (ex b, List.map (fun (f, fsp, x) -> (f, fsp, ex x)) fields)
+    | ESafe (b, x, rest, flat) -> ESafe (ex b, x, expr env (x :: locals) rest, flat)
     | EDyn (x, i) -> EDyn (ex x, i)
     | ESelect arms ->
       ESelect

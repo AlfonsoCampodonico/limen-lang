@@ -18,7 +18,7 @@ let rec fv bound acc e =
     fv_block (n :: bound) acc b
   | EStr ps -> List.fold_left (fun acc -> function SPExpr x -> go acc x | SPLit _ -> acc) acc ps
   | EList es -> List.fold_left go acc es
-  | EBin (_, a, b) | EIndex (a, b) -> go (go acc a) b
+  | EBin (_, a, b) | EIndex (a, b) | EPipe (a, b) -> go (go acc a) b
   | EUn (_, a) | ETry (a, None) | EField (a, _, _) -> go acc a
   | ETry (a, Some c) -> go (go acc a) c
   | ECall (c, args) -> List.fold_left go (go acc c) args
@@ -27,10 +27,16 @@ let rec fv bound acc e =
     let acc = fv_block bound (go acc c) b in
     (match eo with Some x -> go acc x | None -> acc)
   | EMatch (s, arms) ->
-    List.fold_left (fun acc a -> fv (pat_binds a.apat bound) acc a.abody) (go acc s) arms
+    List.fold_left
+      (fun acc a ->
+        let bound = pat_binds a.apat bound in
+        fv bound (match a.aguard with Some g -> fv bound acc g | None -> acc) a.abody)
+      (go acc s) arms
   | EBlock b -> fv_block bound acc b
   | EClosure (ps, body) -> fv (List.map (fun (n, _, _) -> n) ps @ bound) acc body
   | EStruct (_, _, fs) -> List.fold_left (fun acc (_, _, x) -> go acc x) acc fs
+  | EWith (b, fs) -> List.fold_left (fun acc (_, _, x) -> go acc x) (go acc b) fs
+  | ESafe (b, x, rest, _) -> fv (x :: bound) (go acc b) rest
   | EDyn (x, _) -> go acc x
   | ESelect arms ->
     List.fold_left
@@ -71,14 +77,17 @@ let rec has_escape e =
   | EGroup (_, until, b) -> (match until with Some (c, ms) -> has_escape c || has_escape ms | None -> false) || block_escape b
   | EStr ps -> List.exists (function SPExpr x -> has_escape x | SPLit _ -> false) ps
   | EList es -> List.exists has_escape es
-  | EBin (_, a, b) | EIndex (a, b) -> has_escape a || has_escape b
+  | EBin (_, a, b) | EIndex (a, b) | EPipe (a, b) -> has_escape a || has_escape b
   | EUn (_, a) | EField (a, _, _) -> has_escape a
   | ECall (c, args) -> has_escape c || List.exists has_escape args
   | EMethod (r, _, _, args) -> has_escape r || List.exists has_escape args
   | EIf (c, b, eo) -> has_escape c || block_escape b || (match eo with Some x -> has_escape x | None -> false)
-  | EMatch (s, arms) -> has_escape s || List.exists (fun a -> has_escape a.abody) arms
+  | EMatch (s, arms) ->
+    has_escape s || List.exists (fun a -> has_escape a.abody || match a.aguard with Some g -> has_escape g | None -> false) arms
   | EBlock b -> block_escape b
   | EStruct (_, _, fs) -> List.exists (fun (_, _, x) -> has_escape x) fs
+  | EWith (b, fs) -> has_escape b || List.exists (fun (_, _, x) -> has_escape x) fs
+  | ESafe (b, _, rest, _) -> has_escape b || has_escape rest
   | EDyn (x, _) -> has_escape x
   | ESelect arms ->
     List.exists
