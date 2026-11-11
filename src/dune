@@ -66,6 +66,18 @@
     (cat %{project_root}/SPEC.md)
     (echo "|xxspecxx}\n")))))
 
+; Embed the built-in List and Map methods written in Vela (see prelude.ml).
+(rule
+ (targets methods_text.ml)
+ (deps std/methods.vela)
+ (action
+  (with-stdout-to
+   methods_text.ml
+   (progn
+    (echo "let text = {xxmethodsxx|")
+    (cat std/methods.vela)
+    (echo "|xxmethodsxx}\n")))))
+
 ; Embed the standard library modules (written in Vela).
 (rule
  (targets std_text.ml)

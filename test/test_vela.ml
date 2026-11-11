@@ -1576,6 +1576,9 @@ fn main(root: Root) {
   let d3 = with_line "    root." in
   let c3 = complete d3 "    root." 9 in
   ok "lsp-complete-root" (List.mem "net" c3 && List.mem "fs" c3 && List.mem "stdout" c3) (String.concat "," c3);
+  let d5 = with_line "    let ys = [1, 2]\n    ys." in
+  let c5 = complete d5 "    ys." 7 in
+  ok "lsp-complete-list" (List.mem "len" c5 && List.mem "group_by" c5 && List.mem "tally" c5) (String.concat "," c5);
   let c4 = complete doc "    let n" 4 in
   ok "lsp-complete-general" (List.mem "total" c4 && List.mem "dist" c4 && List.mem "while" c4) (String.concat "," c4);
   (* quick fix: make n mutable *)
@@ -2531,7 +2534,7 @@ fn main(root: Root) -> Result[(), IoError] {
   errs "int-literal-too-large" (main_wrap "    let x = 9223372036854775808") [ "E0005" ];
 
   (* ---------- select ---------- *)
-  exits "example-tour" (example "tour.vela") "-- language\ncircle 12.57\n[2.25, 12.56636]\n[0, 1, 4, 9, 16] [\"h\", \"o\", \"l\", \"a\"]\nbound method 3.142\nVELA!\n{Point { x: 0, y: 0 }: [\"origin\", \"home\"]} {(1, 2): 2}\n[(1, \"a\"), (1, \"z\"), (2, \"b\")]\n3 bytes: hi!\n-- concurrency\na side task ran\nresults [1, 2]\nwith a deadline [Some(1), None]\nnobody sent anything\n" 3;
+  exits "example-tour" (example "tour.vela") "-- language\ncircle 12.57\n[2.25, 12.56636]\n[0, 1, 4, 9, 16] [\"h\", \"o\", \"l\", \"a\"]\nbound method 3.142\nVELA!\n{Point { x: 0, y: 0 }: [\"origin\", \"home\"]} {(1, 2): 2}\n[(1, \"a\"), (1, \"z\"), (2, \"b\")]\n{\"the\": 3, \"and\": 2} {\"he\": [\"the\"], \"at\": [\"cat\", \"hat\", \"bat\"], \"nd\": [\"and\"]}\n[\"cat\", \"hat\", \"bat\"] 3 [[1, 2], [2, 3]]\n[\"and\", \"the\", \"cat\", \"hat\", \"bat\"] 3 Some((4, \"hat\"))\n3 bytes: hi!\n-- concurrency\na side task ran\nresults [1, 2]\nwith a deadline [Some(1), None]\nnobody sent anything\n" 3;
   out "select" (example "select.vela") "nums done; words done; total 15 letters 3\nnothing ready | sent to c | sent to d | d Some(10)\nafter close: Some(7)\nErr(\"every arm of this `select` is turned off by its guard\")\n";
   out "select-stress" "fn produce(c: Chan[Int], n: Int) -> Int {\n    let mut i = 0\n    while i < n {\n        c.send(i)\n        i = i + 1\n    }\n    c.close()\n    0\n}\n\n// receive from all four until every one is closed\nfn consume(a: Chan[Int], b: Chan[Int], c: Chan[Int], d: Chan[Int]) -> Int {\n    let mut sum = 0\n    let mut on = [true, true, true, true]\n    while on[0] || on[1] || on[2] || on[3] {\n        select {\n            v = a.recv() if on[0] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[0] = false\n                },\n            },\n            v = b.recv() if on[1] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[1] = false\n                },\n            },\n            v = c.recv() if on[2] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[2] = false\n                },\n            },\n            v = d.recv() if on[3] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[3] = false\n                },\n            },\n        }\n    }\n    sum\n}\n\nfn drain(c: Chan[Str]) -> Int {\n    let mut n = 0\n    let mut more = true\n    while more {\n        match c.recv() {\n            Some(s) => {\n                n = n + s.len()\n            },\n            None => {\n                more = false\n            },\n        }\n    }\n    n\n}\n\nfn main(root: Root) {\n    let a: Chan[Int] = channel(1)\n    let b: Chan[Int] = channel(1)\n    let c: Chan[Int] = channel(2)\n    let d: Chan[Int] = channel(1)\n    let sums = group g {\n        g.go(|| produce(a, 500))\n        g.go(|| produce(b, 500))\n        g.go(|| produce(c, 500))\n        g.go(|| produce(d, 500))\n        g.go(|| consume(a, b, c, d))\n        g.go(|| consume(a, b, c, d))\n        g.go(|| consume(a, b, c, d))\n    }\n    root.stdout.print(\"{sums.sum()}\")\n    // select between two sends: a dispatcher feeding two workers\n    let w1: Chan[Str] = channel(1)\n    let w2: Chan[Str] = channel(1)\n    let parts = group g {\n        g.go(|| {\n                let mut i = 0\n                while i < 1000 {\n                    let msg = \"m{i}\"\n                    select {\n                        w1.send(msg) => (),\n                        w2.send(msg) => (),\n                    }\n                    i = i + 1\n                }\n                w1.close()\n                w2.close()\n                0\n            })\n        g.go(|| drain(w1))\n        g.go(|| drain(w2))\n    }\n    root.stdout.print(\"{parts.sum()}\")\n}\n" "499000\n3890\n";
   check_tsan "select-stress-tsan" "fn produce(c: Chan[Int], n: Int) -> Int {\n    let mut i = 0\n    while i < n {\n        c.send(i)\n        i = i + 1\n    }\n    c.close()\n    0\n}\n\n// receive from all four until every one is closed\nfn consume(a: Chan[Int], b: Chan[Int], c: Chan[Int], d: Chan[Int]) -> Int {\n    let mut sum = 0\n    let mut on = [true, true, true, true]\n    while on[0] || on[1] || on[2] || on[3] {\n        select {\n            v = a.recv() if on[0] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[0] = false\n                },\n            },\n            v = b.recv() if on[1] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[1] = false\n                },\n            },\n            v = c.recv() if on[2] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[2] = false\n                },\n            },\n            v = d.recv() if on[3] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[3] = false\n                },\n            },\n        }\n    }\n    sum\n}\n\nfn drain(c: Chan[Str]) -> Int {\n    let mut n = 0\n    let mut more = true\n    while more {\n        match c.recv() {\n            Some(s) => {\n                n = n + s.len()\n            },\n            None => {\n                more = false\n            },\n        }\n    }\n    n\n}\n\nfn main(root: Root) {\n    let a: Chan[Int] = channel(1)\n    let b: Chan[Int] = channel(1)\n    let c: Chan[Int] = channel(2)\n    let d: Chan[Int] = channel(1)\n    let sums = group g {\n        g.go(|| produce(a, 500))\n        g.go(|| produce(b, 500))\n        g.go(|| produce(c, 500))\n        g.go(|| produce(d, 500))\n        g.go(|| consume(a, b, c, d))\n        g.go(|| consume(a, b, c, d))\n        g.go(|| consume(a, b, c, d))\n    }\n    root.stdout.print(\"{sums.sum()}\")\n    // select between two sends: a dispatcher feeding two workers\n    let w1: Chan[Str] = channel(1)\n    let w2: Chan[Str] = channel(1)\n    let parts = group g {\n        g.go(|| {\n                let mut i = 0\n                while i < 1000 {\n                    let msg = \"m{i}\"\n                    select {\n                        w1.send(msg) => (),\n                        w2.send(msg) => (),\n                    }\n                    i = i + 1\n                }\n                w1.close()\n                w2.close()\n                0\n            })\n        g.go(|| drain(w1))\n        g.go(|| drain(w2))\n    }\n    root.stdout.print(\"{parts.sum()}\")\n}\n" "499000\n3890\n";
@@ -3397,6 +3400,228 @@ fn main(root: Root) {
    ok "unwrap-or-fixed" (fixed = "fn main(root: Root) {\n    let x = (\"4\".parse_int() ?? 0).to_str() + \"!\"\n    let y = \"4\".parse_int() ?? (1 + 2) * 2\n}\n") fixed;
    let _, ds2, _ = compile "unwrap-or-fixed2" fixed in
    ok "unwrap-or-fixed-checks" (ds2 = []) (String.concat " " (codes ds2)));
+
+  (* ---------- collection methods (std/methods.vela) ---------- *)
+  out "collections-search"
+    {|struct P {
+    name: Str,
+    age: Int,
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let xs = [3, 1, 4, 1, 5, 9, 2, 6]
+    let none: List[Int] = []
+    out.print("{xs.any(|x| x > 8)} {xs.any(|x| x > 9)} {none.any(|x| true)}")
+    out.print("{xs.all(|x| x > 0)} {xs.all(|x| x > 1)} {none.all(|x| false)}")
+    out.print("{xs.count(|x| x % 2 == 0)} {none.count(|x| true)}")
+    out.print("{xs.find(|x| x > 3)} {xs.find(|x| x > 30)} {none.find(|x| true)}")
+    out.print("{xs.sum_by(|x| x * 2)} {none.sum_by(|x| x)}")
+    out.print("{xs.min()} {xs.max()} {none.min()} {none.max()} {["pear", "fig", "apple"].min()} {[2.5, -1.0].max()}")
+    let ps = [P { name: "ann", age: 30 }, P { name: "bob", age: 25 }, P { name: "cy", age: 30 }, P { name: "di", age: 25 }]
+    out.print("{ps.min_by(|p| p.age).map(|p| p.name)} {ps.max_by(|p| p.age).map(|p| p.name)}")
+    out.print("{ps.min_by(|p| p.name.len())} {none.min_by(|x| x)} {none.max_by(|x| x)}")
+    out.print("{ps.max_by(|p| (p.age, p.name)).map(|p| p.name)}")
+}
+|}
+    {|true false false
+true false true
+3 0
+Some(4) None None
+62 0
+Some(1) Some(9) None None Some("apple") Some(2.5)
+Some("bob") Some("ann")
+Some(P { name: "cy", age: 30 }) None None
+Some("cy")
+|};
+  out "collections-reshape"
+    {|fn main(root: Root) {
+    let out = root.stdout
+    let xs = [3, 1, 4, 1, 5, 9, 2, 6]
+    let none: List[Int] = []
+    out.print("{xs.flat_map(|x| [x, x * 10]).take(6)} {none.flat_map(|x| [x])} {xs.flat_map(|x| if x > 4 { [x] } else { [] })}")
+    out.print("{["a b", "c", ""].flat_map(|s| s.split(" "))}")
+    out.print("{xs.take_while(|x| x < 5)} {xs.take_while(|x| x < 100)} {xs.take_while(|x| x > 100)} {none.take_while(|x| true)}")
+    out.print("{xs.skip_while(|x| x < 5)} {xs.skip_while(|x| x < 100)} {xs.skip_while(|x| x > 100)} {none.skip_while(|x| true)}")
+    out.print("{["a", "b"].with_index()} {none.with_index()}")
+    for p in ["x", "y"].with_index() {
+        out.print("{p.0}={p.1}")
+    }
+    out.print("{xs.zip(["a", "b", "c"])} {["a"].zip(xs)} {none.zip(xs)} {xs.zip(none)}")
+    out.print("{xs.distinct()} {["b", "a", "b", "c", "a"].distinct()} {[(1, "x"), (1, "y"), (1, "x")].distinct()} {none.distinct()}")
+    out.print("{["apple", "avocado", "banana", "blueberry", "cherry"].distinct_by(|s| s.slice(0, 1))} {none.distinct_by(|x| x)}")
+    out.print("{xs.sort_by(|x| -x)} {["ccc", "a", "bb", "dd", "e"].sort_by(|s| s.len())} {none.sort_by(|x| x)}")
+    out.print("{[(2, "b"), (1, "z"), (2, "a"), (1, "y")].sort_by(|p| p.0)} {[1.5, -0.5, 0.0].sort_by(|x| x)}")
+    out.print("{xs.reverse()}")
+}
+|}
+    {|[3, 30, 1, 10, 4, 40] [] [5, 9, 6]
+["a", "b", "c", ""]
+[3, 1, 4, 1] [3, 1, 4, 1, 5, 9, 2, 6] [] []
+[5, 9, 2, 6] [] [3, 1, 4, 1, 5, 9, 2, 6] []
+[(0, "a"), (1, "b")] []
+0=x
+1=y
+[(3, "a"), (1, "b"), (4, "c")] [("a", 3)] [] []
+[3, 1, 4, 5, 9, 2, 6] ["b", "a", "c"] [(1, "x"), (1, "y")] []
+["apple", "banana", "cherry"] []
+[9, 6, 5, 4, 3, 2, 1, 1] ["a", "e", "bb", "dd", "ccc"] []
+[(1, "z"), (1, "y"), (2, "b"), (2, "a")] [-0.5, 0.0, 1.5]
+[6, 2, 9, 5, 1, 4, 1, 3]
+|};
+  out "collections-split"
+    {|fn main(root: Root) {
+    let out = root.stdout
+    let xs = [1, 2, 3, 4, 5, 6, 7]
+    let none: List[Int] = []
+    out.print("{xs.partition(|x| x % 2 == 0)} {none.partition(|x| true)} {xs.partition(|x| true).1}")
+    let halves = xs.partition(|x| x <= 3)
+    out.print("{halves.0.len()} {halves.1.sum()}")
+    out.print("{xs.chunks(3)} {xs.chunks(7)} {xs.chunks(10)} {xs.chunks(1).len()}")
+    out.print("{xs.chunks(0)} {xs.chunks(-2)} {none.chunks(2)}")
+    out.print("{xs.windows(3)} {xs.windows(7)} {xs.windows(8)} {xs.windows(0)} {none.windows(1)}")
+    out.print("{[1, 1, 2, 3, 3, 3, 1].chunk_by(|x| x)} {xs.chunk_by(|x| x <= 4)} {none.chunk_by(|x| x)} {[5].chunk_by(|x| x)}")
+    let words = ["apple", "avocado", "banana", "cherry", "cranberry", "apricot"]
+    out.print("{words.chunk_by(|w| w.slice(0, 1)).map(|run| "{run.len()}{run[0].slice(0, 1)}")}")
+}
+|}
+    {|([2, 4, 6], [1, 3, 5, 7]) ([], []) []
+3 22
+[[1, 2, 3], [4, 5, 6], [7]] [[1, 2, 3, 4, 5, 6, 7]] [[1, 2, 3, 4, 5, 6, 7]] 7
+[] [] []
+[[1, 2, 3], [2, 3, 4], [3, 4, 5], [4, 5, 6], [5, 6, 7]] [[1, 2, 3, 4, 5, 6, 7]] [] [] []
+[[1, 1], [2], [3, 3, 3], [1]] [[1, 2, 3, 4], [5, 6, 7]] [] [[5]]
+["2a", "1b", "2c", "1a"]
+|};
+  out "collections-maps"
+    {|struct Sale {
+    city: Str,
+    amount: Int,
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let none: List[Int] = []
+    let sales = [Sale { city: "Oslo", amount: 10 }, Sale { city: "Rome", amount: 5 }, Sale { city: "Oslo", amount: 7 }]
+    let by_city = sales.group_by(|s| s.city)
+    out.print("{by_city.keys()} {by_city["Oslo"].map(|s| s.amount)} {none.group_by(|x| x)}")
+    out.print("{[1, 2, 3, 4, 5, 6].group_by(|x| x % 3)}")
+    out.print("{[1, 2, 3, 4, 5, 6].group_by(|x| (x % 2 == 0, x > 3))}")
+    out.print("{["a", "bb", "cc", "d", "eee"].count_by(|s| s.len())} {none.count_by(|x| x)}")
+    out.print("{"mississippi".chars().tally()} {none.tally()} {[true, false, true].tally()}")
+    let totals = by_city.map_values(|ss| ss.sum_by(|s| s.amount))
+    out.print("{totals} {totals.map_values(|n| "{n}!")}")
+    let counts = "the cat and the hat and the bat".split(" ").tally()
+    out.print("{counts.filter(|w, n| n > 1)} {counts.filter(|w, n| w.len() > 5)} {counts.filter(|w, n| true).len()}")
+    let a = map([("x", 1), ("y", 2)])
+    let b = map([("y", 20), ("z", 30)])
+    let e: Map[Str, Int] = map()
+    out.print("{a.merge(b)} {b.merge(a)} {a.merge(e)} {e.merge(a)} {a}")
+}
+|}
+    {|["Oslo", "Rome"] [10, 7] {}
+{1: [1, 4], 2: [2, 5], 0: [3, 6]}
+{(false, false): [1, 3], (true, false): [2], (true, true): [4, 6], (false, true): [5]}
+{1: 2, 2: 2, 3: 1} {}
+{"m": 1, "i": 4, "s": 4, "p": 2} {} {true: 2, false: 1}
+{"Oslo": 17, "Rome": 5} {"Oslo": "17!", "Rome": "5!"}
+{"the": 3, "and": 2} {} 5
+{"x": 1, "y": 20, "z": 30} {"y": 2, "z": 30, "x": 1} {"x": 1, "y": 2} {"x": 1, "y": 2} {"x": 1, "y": 2}
+|};
+  out "collections-heap"
+    {|struct Item {
+    name: Str,
+    tags: List[Str],
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let words = "one two three four five six seven eight nine ten".split(" ")
+    let items = words.map(|w| Item { name: w + "!", tags: w.chars() })
+    out.print("{words.group_by(|w| w.len()).values()}")
+    out.print("{words.chunks(4)} {words.windows(9).len()} {words.windows(2)[0]}")
+    out.print("{words.flat_map(|w| [w, w.to_upper()]).take(4)} {words.zip(items.map(|i| i.tags.len())).take(3)}")
+    out.print("{items.partition(|i| i.tags.contains("e")).0.map(|i| i.name)}")
+    out.print("{items.sort_by(|i| i.name).map(|i| i.name).take(3)} {items.max_by(|i| i.tags.len()).map(|i| i.tags)}")
+    out.print("{items.min_by(|i| i.name).map(|i| i.name)} {items.find(|i| i.tags.len() == 5).map(|i| i.name)}")
+    out.print("{words.distinct_by(|w| w.len())} {words.chunk_by(|w| w.len()).len()} {words.tally().len()}")
+    let groups = items.group_by(|i| i.tags.len())
+    let names = groups.map_values(|is| is.map(|i| i.name))
+    out.print("{names} {names.filter(|k, v| v.len() > 2)}")
+    out.print("{names.merge(map([(3, ["x"]), (9, ["y"])]))}")
+    out.print("{words.with_index().filter(|p| p.0 % 4 == 0).map(|p| p.1)} {words.take_while(|w| w.len() == 3)} {words.skip_while(|w| w != "eight")}")
+}
+|}
+    {|[["one", "two", "six", "ten"], ["three", "seven", "eight"], ["four", "five", "nine"]]
+[["one", "two", "three", "four"], ["five", "six", "seven", "eight"], ["nine", "ten"]] 2 ["one", "two"]
+["one", "ONE", "two", "TWO"] [("one", 3), ("two", 3), ("three", 5)]
+["one!", "three!", "five!", "seven!", "eight!", "nine!", "ten!"]
+["eight!", "five!", "four!"] Some(["t", "h", "r", "e", "e"])
+Some("eight!") Some("three!")
+["one", "three", "four"] 7 10
+{3: ["one!", "two!", "six!", "ten!"], 5: ["three!", "seven!", "eight!"], 4: ["four!", "five!", "nine!"]} {3: ["one!", "two!", "six!", "ten!"], 5: ["three!", "seven!", "eight!"], 4: ["four!", "five!", "nine!"]}
+{3: ["x"], 5: ["three!", "seven!", "eight!"], 4: ["four!", "five!", "nine!"], 9: ["y"]}
+["one", "five", "nine"] ["one", "two"] ["eight", "nine", "ten"]
+|};
+  out "collections-generic"
+    {|fn lowest[T: Ordered](xs: List[T]) -> Option[T] {
+    let mut best = None
+    for x in xs {
+        best = match best {
+            Some(b) => if x < b { Some(x) } else { Some(b) },
+            None => Some(x),
+        }
+    }
+    best
+}
+
+fn index[K: Key, V](xs: List[V], key: fn(V) -> K) -> Map[K, V] {
+    let mut m: Map[K, V] = map()
+    for x in xs {
+        m[key(x)] = x
+    }
+    m
+}
+
+fn biggest_key[K: Key, V](m: Map[K, V]) -> Option[K] {
+    m.keys().max()
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    out.print("{lowest([3, 1, 2])} {lowest(["b", "a"])} {lowest([(2, "x"), (1, "y")])}")
+    let byname = index(["ann", "bob", "al"], |s| s.slice(0, 1))
+    out.print("{byname} {biggest_key(byname)}")
+    let any = [1, 2, 3].any
+    let tally = ["a", "b", "a"].tally
+    out.print("{any(|x| x > 2)} {tally()} {[[1, 2], [3]].map(|l| l.sum_by(|x| x * x))}")
+    let n = [1, 2, 3, 4, 5, 6].filter(|x| x > 1).map(|x| x * 10).count(|x| x > 30)
+    out.print("{n} {[1, 2, 3].map(|x| x + 1).zip([1, 2, 3].filter(|x| x > 1))}")
+}
+|}
+    {|Some(1) Some("a") Some((1, "y"))
+{"a": "al", "b": "bob"} Some("b")
+true {"a": 2, "b": 1} [5, 9]
+3 [(2, 2), (3, 3)]
+|};
+  errs "collections-distinct-float" (main_wrap "    let a = [1.5].distinct()") [ "E0111" ];
+  errs "collections-tally-list" (main_wrap "    let a = [[1]].tally()") [ "E0111" ];
+  errs "collections-group-by-float" (main_wrap "    let a = [1.5, 2.0].group_by(|x| x)") [ "E0111" ];
+  errs "collections-min-unordered" (main_wrap "    let a = [map([(1, 2)])].min()") [ "E0111" ];
+  errs "collections-sort-by-less" (main_wrap "    let a = [1].sort_by(|a, b| a < b)") [ "E0201" ];
+  errs "collections-count-arity" (main_wrap "    let a = [1].count()") [ "E0107" ];
+  errs "collections-map-filter-pair" (main_wrap "    let m = map([(1, 2)]).filter(|e| true)") [ "E0201" ];
+  errs "collections-clash" "fn tally(self: List[Int]) -> Int {\n    0\n}\n\nfn main() {\n}\n" [ "E0106" ];
+  errs "bound-ordered-missing" "fn f[T](xs: List[T]) -> Option[T] {\n    xs.max()\n}\n\nfn main() {\n}\n" [ "E0111" ];
+  errs "bound-ordered-lt" "fn f[T](a: T, b: T) -> Bool {\n    a < b\n}\n\nfn main() {\n}\n" [ "E0201" ];
+  errs "bound-key-missing" "fn f[K, V](k: K, v: V) -> Map[K, V] {\n    map([(k, v)])\n}\n\nfn main() {\n}\n" [ "E0113" ];
+  errs "bound-key-float" "fn f[K: Key](k: K) -> Map[K, Int] {\n    map([(k, 1)])\n}\n\nfn main() {\n    let m = f(1.5)\n}\n" [ "E0111" ];
+  errs "bound-dyn" (main_wrap "    let d: dyn Key = 1") [ "E0102" ];
+  errs "bound-iface-name" "interface Ordered {\n    fn k(self) -> Int\n}\n\nfn main() {\n}\n" [ "E0106" ];
+  panics "collections-callback-panic" (main_wrap "    let xs = [1, 0]\n    out.print(\"{xs.find(|x| 10 / x > 100)}\")") "division by zero";
+  (* the methods written in Vela stay out of `vela caps` *)
+  let _, _, infos = compile "collections-caps" (main_wrap "    out.print(\"{[1].any(|x| x > 0)}\")") in
+  ok "collections-caps" (List.for_all (fun (i : Check.fn_info) -> i.span.file <> Prelude.methods_file) infos) "a built-in method is listed";
 
   (* ---------- tuples and maps ---------- *)
   out "tuples" (example "tuples.vela") "3 2 (2, 1)\n(1, \"one\", 1.5) 1 one 1.5 (2, \"a\")\n4 ((1, 2), (3, (4, 5)))\n1 3 4 5\na1 b2 c3 \nyes zero yes no 7\ntrue false 6\n";

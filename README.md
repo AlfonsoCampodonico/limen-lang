@@ -237,7 +237,9 @@ Types: `Int`, `Float`, `Bool`, `Str`, `Bytes` (binary data), `()`, `List[T]`, fi
 
 Methods: a function whose first parameter is `self: T` is called as `value.name(...)`, a file can add its own methods to built-in types (`fn shout(self: Str) -> Str`), and `value.name` without the call is a function bound to that value: `xs.map(origin.add)`, `let say = out.print` (see [examples/methods.vela](examples/methods.vela)).
 
-Interfaces: `interface Shape { fn area(self) -> Float }` bounds a generic parameter, `fn total[T: Shape](xs: List[T])`, and any type with those methods satisfies it, built-in capabilities included, so tests can pass a fake `Clock` (see [examples/interfaces.vela](examples/interfaces.vela)).
+Collections: lists have `map`, `filter`, `fold`, `sort` and the rest, plus `any`, `all`, `count`, `find`, `sum_by`, `min`/`max`, `min_by`/`max_by`, `flat_map`, `take_while`/`skip_while`, `with_index`, `zip`, `distinct`/`distinct_by`, `sort_by(key)`, `partition`, `chunks(n)`, `windows(n)`, `chunk_by`, and `group_by`, `count_by` and `tally`, which build insertion-ordered maps. Maps add `map_values`, `filter` and `merge`. `words.tally().filter(|w, n| n > 1)` keeps the repeated words. The newer list and map methods are written in Vela (`src/std/methods.vela`), so the native backend compiles them like your own code.
+
+Interfaces: `interface Shape { fn area(self) -> Float }` bounds a generic parameter, `fn total[T: Shape](xs: List[T])`, and any type with those methods satisfies it, built-in capabilities included, so tests can pass a fake `Clock` (see [examples/interfaces.vela](examples/interfaces.vela)). Two bounds are built in: `Ordered` (the type has `<`) and `Key` (it can be a map key), as in `fn index[K: Key, V](xs: List[V], key: fn(V) -> K) -> Map[K, V]`.
 
 `dyn Shape` is a value of any type that satisfies `Shape`, so `List[dyn Shape]` can mix types, and `let s: dyn Shape = if big { Circle { r: 1.0 } } else { Square { s: 2.0 } }` picks one (see [examples/dyn.vela](examples/dyn.vela)).
 

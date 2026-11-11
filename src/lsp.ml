@@ -335,7 +335,20 @@ let member_completions path text off =
           @ List.map (fun (m, mk) -> item 2 m (method_sig m (mk ()))) (Check.methods t)
         | _ -> List.map (fun (m, mk) -> item 2 m (method_sig m (mk ()))) (Check.methods t)
       in
-      Some (fields @ methods)
+      (* the built-in methods written in Vela (std/methods.vela) *)
+      let vela_methods =
+        match Check.builtin_tname t with
+        | None -> []
+        | Some tn ->
+          let pre = tn ^ "::" in
+          List.filter_map
+            (function
+              | IFn d when String.starts_with ~prefix:pre d.fn_name ->
+                Some (item 2 (String.sub d.fn_name (String.length pre) (String.length d.fn_name - String.length pre)) (fn_signature Methods_text.text d))
+              | _ -> None)
+            (Lazy.force Prelude.methods)
+      in
+      Some (fields @ methods @ vela_methods)
   end
 
 let general_completions doc off =

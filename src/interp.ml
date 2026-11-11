@@ -1330,6 +1330,9 @@ and field rt v name =
 
 and apply rt fv args sp =
   match fv with
+  | VFn n when String.length n > 5 && (String.sub n 0 6 = "List::" || String.sub n 0 5 = "Map::")
+               && (match Hashtbl.find_opt rt.fns n with Some d -> d.fn_span.file = Prelude.methods_file | None -> false) ->
+    vela_method rt n args sp
   | VFn n ->
     let d = Hashtbl.find rt.fns n in
     if d.fn_foreign <> None then Foreign.invoke d args sp else call_fn rt d args
@@ -1451,6 +1454,102 @@ and assign rt env lhs v =
       assign rt env r (VList a)
     | _ -> failwith "internal: assign index")
   | _ -> failwith "internal: assign target"
+
+(* The built-in methods written in Vela (std/methods.vela), done directly:
+   pushing onto a list copies it here, so the Vela loops would be quadratic.
+   Same results as the Vela source, which the native backend compiles. *)
+and vela_method rt n args sp =
+  let call f xs = apply rt f xs sp in
+  let lt a b = as_bool (binop Lt a b sp) in
+  let tup a b = VStruct (Ast.tuple_name 2, [ ("0", a); ("1", b) ]) in
+  let lst l = VList (Array.of_list l) in
+  let pick better a key =
+    if Array.length a = 0 then none
+    else begin
+      let best = ref a.(0) and bk = ref (key a.(0)) in
+      for i = 1 to Array.length a - 1 do
+        let k = key a.(i) in
+        if better k !bk then (best := a.(i); bk := k)
+      done;
+      some !best
+    end
+  in
+  (* entries grouped by key in order of first appearance *)
+  let grouped a key init add fin =
+    let tbl = Hashtbl.create 16 and order = ref [] in
+    Array.iter
+      (fun x ->
+        let k = key x in
+        let kk = key_of k in
+        match Hashtbl.find_opt tbl kk with
+        | Some (k, acc) -> Hashtbl.replace tbl kk (k, add acc x)
+        | None -> Hashtbl.replace tbl kk (k, init x); order := kk :: !order)
+      a;
+    VMap (List.fold_left (fun mv kk -> let k, acc = Hashtbl.find tbl kk in map_put mv k (fin acc)) empty_map (List.rev !order))
+  in
+  let distinct a key =
+    let seen = Hashtbl.create 16 in
+    lst (List.filter (fun x -> let k = key_of (key x) in if Hashtbl.mem seen k then false else (Hashtbl.replace seen k (); true)) (Array.to_list a))
+  in
+  let sized a k f = if k < 1L then VList [||] else f (Int64.to_int (Int64.min k (Int64.of_int max_int))) in
+  match (n, args) with
+  | "List::any", [ VList a; f ] -> VBool (Array.exists (fun x -> as_bool (call f [ x ])) a)
+  | "List::all", [ VList a; f ] -> VBool (Array.for_all (fun x -> as_bool (call f [ x ])) a)
+  | "List::count", [ VList a; f ] -> vint (Array.fold_left (fun n x -> if as_bool (call f [ x ]) then n + 1 else n) 0 a)
+  | "List::find", [ VList a; f ] -> ( match Array.find_opt (fun x -> as_bool (call f [ x ])) a with Some x -> some x | None -> none)
+  | "List::sum_by", [ VList a; f ] ->
+    VInt (Array.fold_left (fun s x -> match call f [ x ] with VInt n -> Int64.add s n | _ -> s) 0L a)
+  | "List::min", [ VList a ] -> pick lt a Fun.id
+  | "List::max", [ VList a ] -> pick (fun x y -> lt y x) a Fun.id
+  | "List::min_by", [ VList a; f ] -> pick lt a (fun x -> call f [ x ])
+  | "List::max_by", [ VList a; f ] -> pick (fun x y -> lt y x) a (fun x -> call f [ x ])
+  | "List::flat_map", [ VList a; f ] ->
+    VList (Array.concat (List.map (fun x -> match call f [ x ] with VList b -> b | _ -> [||]) (Array.to_list a)))
+  | "List::take_while", [ VList a; f ] ->
+    let i = ref 0 in
+    while !i < Array.length a && as_bool (call f [ a.(!i) ]) do incr i done;
+    VList (Array.sub a 0 !i)
+  | "List::skip_while", [ VList a; f ] ->
+    let i = ref 0 in
+    while !i < Array.length a && as_bool (call f [ a.(!i) ]) do incr i done;
+    VList (Array.sub a !i (Array.length a - !i))
+  | "List::with_index", [ VList a ] -> VList (Array.mapi (fun i x -> tup (vint i) x) a)
+  | "List::zip", [ VList a; VList b ] -> VList (Array.init (min (Array.length a) (Array.length b)) (fun i -> tup a.(i) b.(i)))
+  | "List::distinct", [ VList a ] -> distinct a Fun.id
+  | "List::distinct_by", [ VList a; f ] -> distinct a (fun x -> call f [ x ])
+  | "List::sort_by", [ VList a; f ] ->
+    let keyed = Array.map (fun x -> (call f [ x ], x)) a in
+    Array.stable_sort (fun (k1, _) (k2, _) -> compare_v k1 k2) keyed;
+    VList (Array.map snd keyed)
+  | "List::partition", [ VList a; f ] ->
+    let yes, no = List.partition (fun x -> as_bool (call f [ x ])) (Array.to_list a) in
+    tup (lst yes) (lst no)
+  | "List::chunks", [ VList a; VInt k ] ->
+    sized a k (fun k ->
+        let len = Array.length a in
+        VList (Array.init ((len + k - 1) / k) (fun i -> VList (Array.sub a (i * k) (min k (len - (i * k)))))))
+  | "List::windows", [ VList a; VInt k ] ->
+    sized a k (fun k -> VList (Array.init (max 0 (Array.length a - k + 1)) (fun i -> VList (Array.sub a i k))))
+  | "List::chunk_by", [ VList a; f ] ->
+    let runs = ref [] and cur = ref [] and ck = ref VUnit in
+    Array.iteri
+      (fun i x ->
+        let k = call f [ x ] in
+        if i > 0 && not (as_bool (binop Eq k !ck sp)) then (runs := lst (List.rev !cur) :: !runs; cur := []);
+        cur := x :: !cur;
+        ck := k)
+      a;
+    if !cur <> [] then runs := lst (List.rev !cur) :: !runs;
+    lst (List.rev !runs)
+  | "List::group_by", [ VList a; f ] -> grouped a (fun x -> call f [ x ]) (fun x -> [ x ]) (fun l x -> x :: l) (fun l -> lst (List.rev l))
+  | "List::count_by", [ VList a; f ] -> grouped a (fun x -> call f [ x ]) (fun _ -> 1) (fun n _ -> n + 1) vint
+  | "List::tally", [ VList a ] -> grouped a Fun.id (fun _ -> 1) (fun n _ -> n + 1) vint
+  | "Map::map_values", [ VMap mv; f ] ->
+    VMap (List.fold_left (fun m (k, v) -> map_put m k (call f [ v ])) empty_map (map_entries mv))
+  | "Map::filter", [ VMap mv; f ] ->
+    VMap (List.fold_left (fun m (k, v) -> if as_bool (call f [ k; v ]) then map_put m k v else m) empty_map (map_entries mv))
+  | "Map::merge", [ VMap mv; VMap other ] -> VMap (List.fold_left (fun m (k, v) -> map_put m k v) mv (map_entries other))
+  | _ -> call_fn rt (Hashtbl.find rt.fns n) args
 
 and call_method rt v name args sp =
   let call f xs = apply rt f xs sp in
