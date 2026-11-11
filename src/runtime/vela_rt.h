@@ -319,37 +319,57 @@ static inline int64_t w_idx(int64_t i, int64_t n, const char *where) {
    (live = 0) until the next rehash compacts them. idx is an open-addressing
    table of entry positions, at most half full. */
 
-/* A random seed per process, so nobody can choose keys that collide (hash
-   flooding). Iteration follows insertion order, so output never depends on it. */
-static uint64_t g_hash_seed;
+/* SipHash-1-3 with a 128-bit key from /dev/urandom: a keyed hash, so keys
+   cannot be chosen to collide without knowing the key. */
+static uint64_t g_hash_k0, g_hash_k1;
 static void w_seed_hash(void) {
-  uint64_t s = 0;
+  uint64_t k[2] = { 0, 0 };
   int fd = open("/dev/urandom", O_RDONLY);
-  if (fd >= 0) { if (read(fd, &s, sizeof s) != (ssize_t)sizeof s) s = 0; close(fd); }
-  if (s == 0) { struct timeval tv; gettimeofday(&tv, NULL); s = (uint64_t)tv.tv_usec * 0x9E3779B97F4A7C15ULL ^ (uint64_t)getpid(); }
-  g_hash_seed = s | 1;
+  if (fd >= 0) { if (read(fd, k, sizeof k) != (ssize_t)sizeof k) { k[0] = 0; k[1] = 0; } close(fd); }
+  if (k[0] == 0 && k[1] == 0) {
+    struct timeval tv; gettimeofday(&tv, NULL);
+    k[0] = (uint64_t)tv.tv_usec * 0x9E3779B97F4A7C15ULL ^ (uint64_t)getpid();
+    k[1] = (uint64_t)tv.tv_sec * 0xBF58476D1CE4E5B9ULL ^ (uint64_t)(uintptr_t)&k;
+  }
+  g_hash_k0 = k[0]; g_hash_k1 = k[1];
 }
-static inline uint64_t w_mix64(uint64_t z) {
-  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-  z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-  return z ^ (z >> 31);
+#define W_ROTL(x, b) (uint64_t)(((x) << (b)) | ((x) >> (64 - (b))))
+#define W_SIPROUND                                                          \
+  do {                                                                      \
+    v0 += v1; v1 = W_ROTL(v1, 13); v1 ^= v0; v0 = W_ROTL(v0, 32);           \
+    v2 += v3; v3 = W_ROTL(v3, 16); v3 ^= v2;                                \
+    v0 += v3; v3 = W_ROTL(v3, 21); v3 ^= v0;                                \
+    v2 += v1; v1 = W_ROTL(v1, 17); v1 ^= v2; v2 = W_ROTL(v2, 32);           \
+  } while (0)
+static uint64_t w_siphash13(const unsigned char *in, size_t len) {
+  uint64_t v0 = 0x736f6d6570736575ULL ^ g_hash_k0, v1 = 0x646f72616e646f6dULL ^ g_hash_k1;
+  uint64_t v2 = 0x6c7967656e657261ULL ^ g_hash_k0, v3 = 0x7465646279746573ULL ^ g_hash_k1;
+  const unsigned char *end = in + (len - len % 8);
+  for (; in != end; in += 8) {
+    uint64_t m;
+    memcpy(&m, in, 8);
+    v3 ^= m; W_SIPROUND; v0 ^= m;
+  }
+  uint64_t b = (uint64_t)len << 56;
+  switch (len & 7) {
+    case 7: b |= (uint64_t)in[6] << 48; /* fallthrough */
+    case 6: b |= (uint64_t)in[5] << 40; /* fallthrough */
+    case 5: b |= (uint64_t)in[4] << 32; /* fallthrough */
+    case 4: b |= (uint64_t)in[3] << 24; /* fallthrough */
+    case 3: b |= (uint64_t)in[2] << 16; /* fallthrough */
+    case 2: b |= (uint64_t)in[1] << 8; /* fallthrough */
+    case 1: b |= (uint64_t)in[0]; break;
+    default: break;
+  }
+  v3 ^= b; W_SIPROUND; v0 ^= b;
+  v2 ^= 0xff;
+  W_SIPROUND; W_SIPROUND; W_SIPROUND;
+  return v0 ^ v1 ^ v2 ^ v3;
 }
-static inline uint64_t Int_hash(int64_t x) { return w_mix64((uint64_t)x + g_hash_seed); }
+static inline uint64_t Int_hash(int64_t x) { return w_siphash13((const unsigned char *)&x, sizeof x); }
 static inline uint64_t Unit_hash(W_Unit u) { (void)u; return 0; }
 static inline uint64_t Bool_hash(bool b) { return b ? 0x51ED27F1ULL : 0x2545F491ULL; }
-static inline uint64_t Str_hash(WStr *s) {
-  /* 8 bytes at a time, each step keyed by the seed, then a final mix */
-  uint64_t h = g_hash_seed ^ ((uint64_t)s->len * 0x9E3779B97F4A7C15ULL);
-  int64_t i = 0;
-  for (; i + 8 <= s->len; i += 8) {
-    uint64_t w;
-    memcpy(&w, s->data + i, 8);
-    h = w_mix64(h ^ w ^ g_hash_seed);
-  }
-  uint64_t tail = 0;
-  for (int64_t k = 0; i < s->len; i++, k++) tail |= (uint64_t)(unsigned char)s->data[i] << (8 * k);
-  return w_mix64(h ^ tail ^ (g_hash_seed >> 1));
-}
+static inline uint64_t Str_hash(WStr *s) { return w_siphash13((const unsigned char *)s->data, (size_t)s->len); }
 __attribute__((noreturn)) static void w_panic_key(WBuf *key, const char *where) {
   WBuf m; buf_init(&m);
   buf_puts(&m, "key "); buf_putn(&m, key->p, key->len); buf_puts(&m, " is not in the map");
