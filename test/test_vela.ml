@@ -746,7 +746,7 @@ fn client(net: Net, port: Int, k: Int) -> Int {
     "true true\nDenied(\"listen: 127.0.0.1:9 is not granted\")\nDenied(\"net: 127.0.0.1:9 is not granted\")\n";
   panics "chan-deadlock" (main_wrap "    let c: Chan[Int] = channel(1)\n    c.send(1)\n    c.send(2)") "all tasks are blocked (deadlock)";
   panics "chan-send-closed" (main_wrap "    let c: Chan[Int] = channel(1)\n    c.close()\n    c.send(1)") "send on a closed channel";
-  panics "chan-capacity" (main_wrap "    let c: Chan[Int] = channel(0)") "channel capacity must be at least 1";
+  panics "chan-capacity" (main_wrap "    let c: Chan[Int] = channel(-1)") "channel capacity cannot be negative";
   errs "group-handle-assign" (main_wrap "    let r = group g { g = 1 }") [ "E0310" ];
   errs "chan-in-struct" "struct S { c: Chan[Int] }\nfn main(root: Root) {}" [ "E0305" ];
   panics "div-zero" (main_wrap "    let z = 0\n    out.print(\"{1 / z}\")") "division by zero";
@@ -1362,7 +1362,7 @@ fn main(root: Root) {
     out.print("{got[0]}")
 }
 |} "timed out, hello, not sent, again, zero, guarded\n3\n";
-  check_tsan "select-timeout-tsan" {|fn produce(c: Chan[Int], clock: Clock) -> Int {
+  par "select-timeout-stress" {|fn produce(c: Chan[Int], clock: Clock) -> Int {
     let mut i = 0
     while i < 2000 {
         c.send(i)
@@ -1497,7 +1497,7 @@ fn main(root: Root) {
     out.print("{p}")
 }
 |} "[Some(1), None, None, None, None, None, None, Some(7)]\ntrue\n[None]\n[Some(1), None]\nErr(\"boom\")\n";
-  check_tsan "group-until-tsan" {|fn stuck(c: Chan[Int]) -> Int {
+  par "group-until-stress" {|fn stuck(c: Chan[Int]) -> Int {
     c.recv() ?? -1
 }
 
@@ -1628,6 +1628,182 @@ fn main(root: Root) {
   errs "group-until-ms-type" (main_wrap "    let r = group g until root.clock.after(true) {\n        g.go(|| 1)\n    }") [ "E0201" ];
   errs "group-until-type" (main_wrap "    let r: List[Int] = group g until root.clock.after(5) {\n        g.go(|| 1)\n    }") [ "E0201" ];
   errs "group-until-bad" (main_wrap "    let r = group g until root.clock.sleep(5) {\n        g.go(|| 1)\n    }") [ "E0003" ];
+
+  (* ---------- unbuffered channels ---------- *)
+  out "chan-unbuffered" {|fn main(root: Root) {
+    let out = root.stdout
+    let clock = root.clock
+    let c: Chan[Int] = channel(0)
+    let log: Chan[Str] = channel(10)
+    // a send waits for the receiver
+    let r = group g {
+        g.go(|| {
+            c.send(1)
+            log.send("sent")
+            0
+        })
+        g.go(|| {
+            clock.sleep(100)
+            log.send("receiving")
+            c.recv() ?? 0
+        })
+    }
+    out.print("{r} {log.recv() ?? ""} then {log.recv() ?? ""}")
+    // nobody on the other side: neither arm is ready
+    let a = select {
+        c.send(1) => "sent",
+        _ => "nobody receiving",
+    }
+    let b = select {
+        v = c.recv() => "got",
+        _ => "nobody sending",
+    }
+    out.print("{a}, {b}")
+    // a select send meets a waiting receiver, and a select receive a waiting sender
+    let s = group g {
+        g.go(|| c.recv() ?? 0)
+        g.go(|| {
+            clock.sleep(50)
+            select {
+                c.send(5) => 1,
+                clock.after(5000) => 0,
+            }
+        })
+    }
+    let t = group g {
+        g.go(|| {
+            c.send(6)
+            0
+        })
+        g.go(|| {
+            clock.sleep(50)
+            select {
+                v = c.recv() => v ?? -1,
+                clock.after(5000) => -2,
+            }
+        })
+    }
+    out.print("{s} {t}")
+    // closing wakes a waiting receiver with None
+    let u = group g {
+        g.go(|| c.recv() ?? -1)
+        g.go(|| {
+            clock.sleep(50)
+            c.close()
+            0
+        })
+    }
+    out.print("{u}")
+    // and makes a waiting sender panic
+    let d: Chan[Str] = channel(0)
+    let p = catch(|| group g {
+        g.go(|| {
+            d.send("lost")
+            0
+        })
+        g.go(|| {
+            clock.sleep(50)
+            d.close()
+            0
+        })
+    })
+    out.print("{p}")
+}
+|} "[0, 1] receiving then sent\nnobody receiving, nobody sending\n[5, 1] [0, 6]\n[-1, 0]\nErr(\"send on a closed channel\")\n";
+  par "chan-unbuffered-stress" {|fn produce(c: Chan[Int], n: Int) -> Int {
+    let mut i = 0
+    while i < n {
+        c.send(i)
+        i = i + 1
+    }
+    0
+}
+
+fn consume(c: Chan[Int], done: Chan[Int], clock: Clock) -> Int {
+    let mut sum = 0
+    let mut more = true
+    while more {
+        select {
+            v = c.recv() => {
+                sum = sum + (v ?? 0)
+            },
+            v = done.recv() => {
+                more = false
+            },
+            clock.after(1) => (),
+        }
+    }
+    sum
+}
+
+fn main(root: Root) {
+    let clock = root.clock
+    let c: Chan[Int] = channel(0)
+    let done: Chan[Int] = channel(0)
+    let w1: Chan[Str] = channel(0)
+    let w2: Chan[Str] = channel(0)
+    let lonely: Chan[Str] = channel(0)
+    let never: Chan[Int] = channel(0)
+    let sums = group g {
+        g.go(|| {
+            let sent = group h {
+                h.go(|| produce(c, 1000))
+                h.go(|| produce(c, 1000))
+                h.go(|| produce(c, 1000))
+            }
+            done.close()
+            0
+        })
+        g.go(|| consume(c, done, clock))
+        g.go(|| consume(c, done, clock))
+        // a dispatcher choosing between two unbuffered workers
+        g.go(|| {
+            let mut i = 0
+            while i < 1000 {
+                select {
+                    w1.send("m{i}") => (),
+                    w2.send("m{i}") => (),
+                }
+                i = i + 1
+            }
+            w1.close()
+            w2.close()
+            0
+        })
+        g.go(|| {
+            let mut n = 0
+            while w1.recv().is_some() {
+                n = n + 1
+            }
+            n
+        })
+        g.go(|| {
+            let mut n = 0
+            while w2.recv().is_some() {
+                n = n + 1
+            }
+            n
+        })
+        // cancelled while waiting to hand over a string
+        g.go(|| {
+            let r = group h until clock.after(20) {
+                h.go(|| {
+                    lonely.send("never taken")
+                    0
+                })
+                h.go(|| {
+                    select {
+                        d = never.recv() => 0,
+                        lonely.send("nor this") => 0,
+                    }
+                })
+            }
+            0
+        })
+    }
+    root.stdout.print("{sums[1] + sums[2]} {sums[4] + sums[5]}")
+}
+|} "1498500 1000\n";
   out "catch-in-task-frees-request" "struct Req {\n    path: Str,\n    hs: List[Str],\n}\n\nfn handler(r: Req) -> Str {\n    let e: List[Str] = []\n    r.path + e[0]\n}\n\nfn serve(n: Int) -> Str {\n    let req = Req { path: \"/p{n}\", hs: [\"a{n}\", \"b\"] }\n    catch(|| handler(req)) ?? \"500\"\n}\n\nfn main(root: Root) {\n    let rs = group g {\n        for n in [1, 2, 3] {\n            g.go(|| serve(n))\n        }\n    }\n    root.stdout.print(\"{rs}\")\n}\n" "[\"500\", \"500\", \"500\"]\n";
   errs "catch-arity" (main_wrap "    let r = catch(1, 2)") [ "E0107" ];
 

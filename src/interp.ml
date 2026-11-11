@@ -49,7 +49,16 @@ type value =
   | VChanFn
   | VBuiltin of string (* assert, assert_eq *)
 
-and chan = { q : value Queue.t; cap : int; mutable closed : bool }
+(* A channel as natively: a buffer of up to [cap] values (none when cap is
+   0), and queues of tasks waiting to send and to receive. *)
+and chan = { q : value Queue.t; cap : int; mutable closed : bool; rq : waiter Queue.t; sq : waiter Queue.t }
+
+(* A waiting task. A `select` puts one on every channel it waits on, all
+   sharing one claim; the first operation to happen sets [fired] to its
+   index, and the other waiters are then stale. -1: still waiting; -2:
+   given up (cancelled). [v] is the value to send, or the value received. *)
+and claim = { mutable fired : int }
+and waiter = { claim : claim; idx : int; mutable v : value; mutable ok : bool }
 
 (* A task's cancel flag: set by its group's deadline, seen at its next wait. *)
 and task = { mutable cancelled : bool }
@@ -345,6 +354,80 @@ let cancel_group g =
 
 let group_finished g = List.for_all (fun (_, r) -> !r <> None) g.tasks
 
+(* ---------- channels ---------- *)
+
+(* The next waiter that can still be woken; claim it for operation [w.idx]. *)
+let rec pop_live q =
+  match Queue.take_opt q with
+  | None -> None
+  | Some w when w.claim.fired = -1 -> w.claim.fired <- w.idx; Some w
+  | Some _ -> pop_live q
+
+let remove_waiter q w =
+  let keep = Queue.fold (fun acc x -> if x == w then acc else x :: acc) [] q in
+  Queue.clear q;
+  List.iter (fun x -> Queue.push x q) (List.rev keep)
+
+(* Try a send without waiting: handed to a waiting receiver, or buffered. *)
+let try_send ch v =
+  if ch.closed then `Closed
+  else
+    match pop_live ch.rq with
+    | Some r -> r.v <- v; r.ok <- true; `Done
+    | None -> if Queue.length ch.q < ch.cap then (Queue.push v ch.q; `Done) else `Blocked
+
+(* Try a receive without waiting: from the buffer (then a waiting sender
+   refills it), or straight from a waiting sender (unbuffered). *)
+let try_recv ch =
+  if not (Queue.is_empty ch.q) then begin
+    let v = Queue.pop ch.q in
+    (match pop_live ch.sq with Some s -> Queue.push s.v ch.q; s.ok <- true | None -> ());
+    `Got v
+  end
+  else
+    match pop_live ch.sq with
+    | Some s -> s.ok <- true; `Got s.v
+    | None -> if ch.closed then `Closed else `Blocked
+
+(* Wait until a waker claims [cl], or until [at]. A cancelled task gives up:
+   its waiters become stale and are taken off their queues. *)
+let wait_claim ?at cl (queued : (waiter Queue.t * waiter) list) =
+  (try wait_until ?at (fun () -> cl.fired <> -1 || match at with Some t -> now () >= t | None -> false)
+   with Cancelled ->
+     cl.fired <- -2;
+     List.iter (fun (q, w) -> remove_waiter q w) queued;
+     raise Cancelled);
+  (* woken: take back the waiters nobody claimed *)
+  List.iter (fun (q, w) -> if cl.fired <> w.idx then remove_waiter q w) queued
+
+let chan_send ch v sp =
+  match try_send ch v with
+  | `Done -> ()
+  | `Closed -> raise (Panic ("send on a closed channel", sp))
+  | `Blocked ->
+    let w = { claim = { fired = -1 }; idx = 0; v; ok = false } in
+    Queue.push w ch.sq;
+    wait_claim w.claim [ (ch.sq, w) ];
+    if not w.ok then raise (Panic ("send on a closed channel", sp))
+
+let chan_recv ch =
+  match try_recv ch with
+  | `Got v -> Some v
+  | `Closed -> None
+  | `Blocked ->
+    let w = { claim = { fired = -1 }; idx = 0; v = VUnit; ok = false } in
+    Queue.push w ch.rq;
+    wait_claim w.claim [ (ch.rq, w) ];
+    if w.ok then Some w.v else None
+
+(* Waiting senders and receivers are woken with nothing: senders panic,
+   receivers get None. *)
+let chan_close ch =
+  ch.closed <- true;
+  let rec drain q = match pop_live q with Some w -> w.ok <- false; drain q | None -> () in
+  drain ch.rq;
+  drain ch.sq
+
 (* Clock.sleep: wait without holding up other tasks. *)
 let sleep_ms (ms : int64) =
   if ms > 0L then begin
@@ -602,34 +685,50 @@ let rec eval rt env e : value =
     in
     if (not (List.exists (function `Recv _ | `Send _ | `After _ | `Default -> true | `Off -> false) ops)) then
       raise (Panic ("every arm of this `select` is turned off by its guard", e.espan));
+    let closed_send () = raise (Panic ("send on a closed channel", e.espan)) in
     (* a timeout counts from now, after every operand was evaluated *)
     let start = now () in
-    let deadline ms = start +. (Int64.to_float (min ms 1_000_000_000_000L) /. 1000.) in
-    let ready = function
-      | `Recv (_, VChan ch) -> ch.closed || not (Queue.is_empty ch.q)
-      | `Send (VChan ch, _) -> ch.closed || Queue.length ch.q < ch.cap
-      | `After ms -> ms <= 0L || now () >= deadline ms
-      | _ -> false
+    let ops = List.mapi (fun i op -> (i, op)) ops in
+    (* the first operation that can happen now, in order: (arm, received) *)
+    let rec first = function
+      | [] -> None
+      | (i, `Recv (_, VChan ch)) :: rest -> (
+        match try_recv ch with `Got v -> Some (i, Some v) | `Closed -> Some (i, None) | `Blocked -> first rest)
+      | (i, `Send (VChan ch, x)) :: rest -> (
+        match try_send ch x with `Done -> Some (i, None) | `Closed -> closed_send () | `Blocked -> first rest)
+      | (i, `After ms) :: _ when ms <= 0L -> Some (i, None)
+      | _ :: rest -> first rest
     in
-    let at = List.find_map (function `After ms when ms > 0L -> Some (deadline ms) | _ -> None) ops in
-    let rec first i = function [] -> None | op :: rest -> if ready op then Some i else first (i + 1) rest in
-    let default = List.find_index (fun op -> op = `Default) ops in
-    let i =
-      match (first 0 ops, default) with
-      | Some i, _ -> i
-      | None, Some d -> d
+    let i, got =
+      match (first ops, List.find_opt (fun (_, op) -> op = `Default) ops) with
+      | Some r, _ -> r
+      | None, Some (d, _) -> (d, None)
       | None, None ->
-        wait_until ?at (fun () -> first 0 ops <> None);
-        Option.get (first 0 ops)
+        (* wait on every channel at once; the first to act claims the select *)
+        let cl = { fired = -1 } in
+        let queued =
+          List.filter_map
+            (fun (i, op) ->
+              match op with
+              | `Recv (_, VChan ch) -> let w = { claim = cl; idx = i; v = VUnit; ok = false } in Queue.push w ch.rq; Some (ch.rq, w)
+              | `Send (VChan ch, x) -> let w = { claim = cl; idx = i; v = x; ok = false } in Queue.push w ch.sq; Some (ch.sq, w)
+              | _ -> None)
+            ops
+        in
+        let after = List.find_map (function i, `After ms -> Some (i, start +. (Int64.to_float (min ms 1_000_000_000_000L) /. 1000.)) | _ -> None) ops in
+        wait_claim ?at:(Option.map snd after) cl queued;
+        if cl.fired = -1 then cl.fired <- fst (Option.get after); (* the timeout *)
+        let i = cl.fired in
+        match List.find_opt (fun (_, w) -> w.idx = i) queued with
+        | Some (_, w) -> (
+          match List.assoc i ops with
+          | `Recv _ -> (i, if w.ok then Some w.v else None)
+          | _ -> if w.ok then (i, None) else closed_send ())
+        | None -> (i, None)
     in
     let binds = Hashtbl.create 1 in
-    (match List.nth ops i with
-     | `Recv (b, VChan ch) ->
-       let v = if Queue.is_empty ch.q then none else some (Queue.pop ch.q) in
-       Option.iter (fun (n, _) -> Hashtbl.replace binds n (ref v)) b
-     | `Send (VChan ch, x) ->
-       if ch.closed then raise (Panic ("send on a closed channel", e.espan));
-       Queue.push x ch.q
+    (match List.assoc i ops with
+     | `Recv (b, _) -> Option.iter (fun (n, _) -> Hashtbl.replace binds n (ref (match got with Some v -> some v | None -> none))) b
      | _ -> ());
     eval rt (binds :: env) (List.nth arms i).sbody
   | EBlock b -> eval_block rt env b
@@ -749,8 +848,11 @@ and apply rt fv args sp =
     | _ -> failwith "internal: map")
   | VChanFn -> (
     match args with
-    | [ VInt n ] when n >= 1L -> VChan { q = Queue.create (); cap = (if n > Int64.of_int max_int then max_int else Int64.to_int n); closed = false }
-    | _ -> raise (Panic ("channel capacity must be at least 1", sp)))
+    | [ VInt n ] when n >= 0L ->
+      VChan
+        { q = Queue.create (); cap = (if n > Int64.of_int max_int then max_int else Int64.to_int n); closed = false;
+          rq = Queue.create (); sq = Queue.create () }
+    | _ -> raise (Panic ("channel capacity cannot be negative", sp)))
   | VPanicFn -> (
     match args with [ VStr m ] -> raise (Panic (m, sp)) | _ -> raise (Panic ("panic", sp)))
   | _ -> failwith "internal: not callable"
@@ -903,18 +1005,11 @@ and call_method rt v name args sp =
               (if t.cancelled then Stopped
                else try Done (apply rt c [] sp) with Panic (m, s) -> Failed (m, s) | Cancelled -> Stopped));
     VUnit
-  | VChan ch, "send", [ v ] ->
-    if ch.closed then raise (Panic ("send on a closed channel", sp));
-    wait_until (fun () -> ch.closed || Queue.length ch.q < ch.cap);
-    if ch.closed then raise (Panic ("send on a closed channel", sp));
-    Queue.push v ch.q;
-    VUnit
-  | VChan ch, "recv", [] ->
-    wait_until (fun () -> ch.closed || not (Queue.is_empty ch.q));
-    if Queue.is_empty ch.q then none else some (Queue.pop ch.q)
+  | VChan ch, "send", [ v ] -> chan_send ch v sp; VUnit
+  | VChan ch, "recv", [] -> ( match chan_recv ch with Some v -> some v | None -> none)
   | VChan ch, "close", [] ->
     if ch.closed then raise (Panic ("close of a closed channel", sp));
-    ch.closed <- true;
+    chan_close ch;
     VUnit
   | VCap CRand, "int", [ VInt lo; VInt hi ] ->
     if hi <= lo then raise (Panic (sprintf "rand.int: empty range %Ld..%Ld" lo hi, sp));

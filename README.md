@@ -119,7 +119,7 @@ let counts = group g {
 - Tasks share data by value. A value handed to a task is switched to atomic reference counting, together with everything it references. Values that stay on one thread keep plain counts, so single-threaded code pays nothing.
 - A task can only touch the world through capabilities it captured. Spawning is not a capability, because it has no effect outside the program.
 - The handle `g` can only be used as `g.go(...)` in the block's own body (E0310), and the body cannot `return` or use `?` to leave early (E0311).
-- **Channels:** `channel(n)` makes a `Chan[T]` with `send`, `recv` (returning `None` once closed and drained) and `close`. Values sent are shared, not copied, across threads.
+- **Channels:** `channel(n)` makes a `Chan[T]` with `send`, `recv` (returning `None` once closed and drained) and `close`; `channel(0)` is unbuffered, so a send waits for its receiver. Values sent are shared, not copied, across threads.
 - **Sockets:** `root.listen.on("host:port")` (granted with `--grant listen=...`) gives a `Listener`; `accept` and `Net.connect` give a `Conn` with `read`, `write` and `close`. The native poller is kqueue on macOS and epoll on Linux (Linux untested).
 - **Echo server:** [examples/echo.vela](examples/echo.vela) serves 10,000 concurrent connections, each kept open until all are connected, with every echo correct. Natively that takes about 2 s and 335 MB peak. Reproduce with `bench/echo_load.py`.
 - **Interpreter:** runs tasks as coroutines on OCaml 5 effect handlers, so the same programs behave the same way.

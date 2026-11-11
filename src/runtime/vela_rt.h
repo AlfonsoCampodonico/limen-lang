@@ -2030,7 +2030,10 @@ static inline void Group_share(WGroup *g) { (void)g; }
    A bounded queue between tasks. send blocks while the channel is full,
    recv blocks while it is empty; after close, recv drains what is left and
    then returns nothing, and send panics. Values are switched to shared
-   before they enter, because the receiver may be on another thread. */
+   before they enter, because the receiver may be on another thread.
+   With capacity 0 there is no buffer: a sender waits until a receiver takes
+   its value from it (or a waiting receiver is handed it), so send and recv
+   meet. */
 
 /* A waiting task. A `select` puts one on every channel it waits on, all
    pointing to one WSel; the first channel to act claims it (done 0 -> 1) and
@@ -2044,7 +2047,7 @@ typedef struct WChan {
 } WChan;
 
 static WChan *w_chan_new(int64_t cap, size_t esz, void (*edrop)(void *), void (*eshare)(void *), const char *where) {
-  if (cap < 1) w_panic_c("channel capacity must be at least 1", where);
+  if (cap < 0) w_panic_c("channel capacity cannot be negative", where);
   WChan *c = (WChan *)w_alloc_k(sizeof(WChan), WK_CHAN);
   memset(c, 0, sizeof *c);
   c->rc = 1; c->cap = cap; c->esz = esz ? esz : 1;
@@ -2139,6 +2142,13 @@ static bool w_chan_recv(WChan *c, void *out) {
       return true;
     }
     pthread_mutex_unlock(&c->mu);
+    return true;
+  }
+  WChWait *s = w_chq_pop_live(&c->sq, &c->sq_t);
+  if (s) {                                       /* unbuffered: take it from a waiting sender */
+    memcpy(out, s->val, c->esz); s->ok = 1;
+    pthread_mutex_unlock(&c->mu);
+    w_wake(s->f);
     return true;
   }
   if (c->closed) { pthread_mutex_unlock(&c->mu); return false; }
@@ -2260,6 +2270,11 @@ static int w_sel_try(WSelOp *op, WFiber **wake) {
       c->len++; s->ok = 1; *wake = s->f;
     }
     op->ok = 1;
+    return 1;
+  }
+  WChWait *s = w_chq_pop_live(&c->sq, &c->sq_t);
+  if (s) {                                       /* unbuffered: take it from a waiting sender */
+    memcpy(op->val, s->val, c->esz); s->ok = 1; *wake = s->f; op->ok = 1;
     return 1;
   }
   if (c->closed) { op->ok = 0; return 1; }

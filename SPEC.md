@@ -408,7 +408,7 @@ let results = group g {
 ### Channels
 
 ```
-let c: Chan[Int] = channel(8)        // capacity at least 1
+let c: Chan[Int] = channel(8)        // holds up to 8 values; channel(0) holds none
 let total = group g {
     g.go(|| {
         for i in [1, 2, 3] { c.send(i) }
@@ -429,8 +429,9 @@ let total = group g {
 }
 ```
 
-- `channel(n)` creates a `Chan[T]` holding up to `n` values; `T` comes from the annotation or from use. A capacity below 1 panics.
-- `c.send(v)` waits while the channel is full; sending on a closed channel panics.
+- `channel(n)` creates a `Chan[T]` holding up to `n` values; `T` comes from the annotation or from use. A negative capacity panics.
+- `channel(0)` is unbuffered: `send` waits until a receiver takes the value, so sender and receiver meet. In a `select`, an unbuffered send arm is ready only while a receiver is waiting, and a receive arm only while a sender is waiting (or the channel is closed).
+- `c.send(v)` waits while the channel is full; sending on a closed channel panics, and so does a send that is waiting when the channel is closed.
 - `c.recv()` waits while the channel is empty and returns `Some(v)`; once the channel is closed and drained it returns `None`.
 - `c.close()` closes it; closing twice panics.
 - A channel is shared, not copied: tasks that capture the same channel talk through it.
@@ -901,4 +902,4 @@ The handler is a plain function value, so it gets no capability unless a closure
 
 ## 20. Not yet
 
-Unbuffered (capacity 0) channels, TLS, SQL, a package registry, and a Cranelift backend. See the design doc's Known gaps for the full list.
+TLS, SQL, a package registry, and a Cranelift backend. See the design doc's Known gaps for the full list.
