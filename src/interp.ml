@@ -408,6 +408,15 @@ let wait_until ?io ?at ?(cancellable = true) cond =
     if cancellable && not (cond ()) then raise Cancelled
   end
 
+(* The POSIX number of an OCaml signal, for exit statuses (128 + n). OCaml
+   numbers signals itself; Sys.signal_to_int only exists from 5.4. *)
+let signal_number s =
+  let table =
+    [ (Sys.sighup, 1); (Sys.sigint, 2); (Sys.sigquit, 3); (Sys.sigill, 4); (Sys.sigabrt, 6); (Sys.sigfpe, 8);
+      (Sys.sigkill, 9); (Sys.sigsegv, 11); (Sys.sigpipe, 13); (Sys.sigalrm, 14); (Sys.sigterm, 15) ]
+  in
+  match List.assoc_opt s table with Some n -> n | None -> if s > 0 then s else 0
+
 let rec run_fiber t (f : unit -> unit) =
   Effect.Deep.match_with (fun () -> current := t; f ()) ()
     { retc = (fun () -> ());
@@ -551,8 +560,9 @@ module Sock = struct
     wait_until ~io:(sk, write) (fun () -> sk.shut || !io_epoch > e)
 
   (* Run [op] as this socket's reader (or writer): [op claim] calls [claim ()]
-     before each wait, which is false if another task holds the slot; the
-     slot is held from the first wait until [op] returns. *)
+     before each wait (a writer also before its first byte), which is false
+     if another task holds the slot; the slot is held from then until [op]
+     returns. *)
   let one_at_a_time sk write op =
     let held = ref false in
     let claim () =
@@ -706,7 +716,10 @@ module Sock = struct
               if claim () then (wait sk true; go off) else busy "writing this connection"
             | exception Unix.Unix_error (e, _, _) -> failed e
         in
-        go 0)
+        (* a writer holds the slot from its first byte: a second writer that
+           sent part of its data before finding the slot taken would mix
+           the two into the stream *)
+        if claim () then go 0 else busy "writing this connection")
 
   let close sk =
     if not sk.shut then begin
@@ -947,7 +960,7 @@ module Proc = struct
           let code =
             match reap () with
             | Unix.WEXITED n -> n
-            | Unix.WSIGNALED s | Unix.WSTOPPED s -> 128 + Sys.signal_to_int s
+            | Unix.WSIGNALED s | Unix.WSTOPPED s -> 128 + signal_number s
           in
           ignore (Unix.lseek errfd 0 Unix.SEEK_SET);
           let ic = Unix.in_channel_of_descr errfd in

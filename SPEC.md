@@ -597,7 +597,7 @@ fn main(root: Root) -> Result[(), IoError] {
 - `Listener.accept()` waits for a connection. `Net.connect("host:port")` opens one.
 - `Conn.read()` waits for data and returns what arrived; `""` means the peer closed. `Conn.write(s)` sends all of `s`. Both return `Result`.
 - `close()` on a `Listener` or `Conn` makes any task waiting on it get `Err(Failed("... is closed"))`.
-- One task at a time reads a connection or accepts on a listener, and one writes a connection. A `read`, `accept` or `write` that has to wait while another task is already waiting for the same thing returns `Err(Failed("another task is already reading this connection"))` (or `accepting on this listener`, `writing this connection`) instead of mixing their data; one that can go on at once is not refused. Both backends behave alike.
+- One task at a time reads a connection or accepts on a listener, and one writes a connection. A `read` or `accept` that has to wait while another task is already waiting for the same thing, or a `write` that starts while another task's write on that connection is still going, returns `Err(Failed("another task is already reading this connection"))` (or `accepting on this listener`, `writing this connection`) instead of mixing their data; a read or accept that can go on at once is not refused, and a refused write sends nothing. Both backends behave alike.
 
 ### TLS
 

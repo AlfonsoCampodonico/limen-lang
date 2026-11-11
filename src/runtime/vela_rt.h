@@ -1,6 +1,7 @@
 /* Vela C runtime. Included verbatim at the top of every generated program.
    Its behaviour mirrors the interpreter (src/interp.ml and src/caps.ml). */
 #define _GNU_SOURCE
+#include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -1313,7 +1314,7 @@ static WIo Cap_fs_list(WCap *fs, WStr *rel) {
     names[n++] = strdup(e->d_name);
   }
   closedir(d);
-  qsort(names, (size_t)n, sizeof(char *), w_cmp_cstr);
+  if (n > 1) qsort(names, (size_t)n, sizeof(char *), w_cmp_cstr); /* never qsort(NULL, 0): glibc marks it nonnull */
   L_Str *out = L_Str_new(n);
   for (int i = 0; i < n; i++) { L_Str_push(&out, Str_from(names[i], (int64_t)strlen(names[i]))); free(names[i]); }
   free(names);
@@ -2529,11 +2530,13 @@ static void *w_poller(void *arg) {
 static void w_poll_start(void) {
   for (int i = 0; i < W_FD_LOCKS; i++) pthread_mutex_init(&w_fd_mu[i], NULL);
 #ifdef W_KQUEUE
-  w_poll_fd = kqueue();
+  int pfd = kqueue();
 #else
-  w_poll_fd = epoll_create1(EPOLL_CLOEXEC);
+  int pfd = epoll_create1(EPOLL_CLOEXEC);
 #endif
-  if (w_poll_fd < 0) { fputs("panic: cannot create the socket poller\n", stderr); exit(1); }
+  if (pfd < 0) { fputs("panic: cannot create the socket poller\n", stderr); exit(1); }
+  /* published atomically: closing a socket reads it without pthread_once */
+  __atomic_store_n(&w_poll_fd, pfd, __ATOMIC_RELEASE);
   pthread_t th;
   pthread_create(&th, NULL, w_poller, NULL);
   pthread_detach(th);
@@ -2828,6 +2831,9 @@ static WIo Cap_conn_write(WCap *c, WStr *s) {
   int held = 0, cancelled = 0;
   WIo r = io_ok(NULL);
   char err[300];
+  /* a writer holds the slot from its first byte: a second writer that sent
+     part of its data before finding the slot taken would mix the two */
+  if (!w_sock_claim(&c->writing, &held)) { w_sock_leave(c); return io_err(2, "another task is already writing this connection"); }
   while (off < s->len) {
     if (w_sock_closing(c)) { r = io_err(2, "connection is closed"); break; }
     int dir = 1;

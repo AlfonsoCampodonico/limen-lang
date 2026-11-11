@@ -43,6 +43,10 @@ dune exec vela -- run examples/repos.vela --grant net=api.github.com
 dune exec vela -- build examples/repos.vela -o repos && ./repos --grant net=api.github.com
 ```
 
+## Linux
+
+`dev/linux/run.sh` builds Vela in a Debian container (OCaml 5.3, gcc, OpenSSL, SQLite) and runs the full test suite and grammar check there; `dev/linux/run.sh amd64` does the same for x86-64. Linux on arm64 passes everything. On an arm64 Mac, amd64 runs under emulation, where the native programs, fibers and epoll work but ThreadSanitizer cannot start and a missing program run through `Exec` exits 127 instead of failing; those checks need real x86-64 hardware.
+
 ## Try it
 
 Put `vela` on your PATH once (`dune install` copies it into your opam switch), or alias it to the build:
