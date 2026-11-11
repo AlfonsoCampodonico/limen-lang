@@ -19,7 +19,9 @@ type cap =
 
 (* A socket that knows when it was closed, so a task waiting on it never
    touches a descriptor number that has been reused. *)
-and sock = { fd : Unix.file_descr; mutable shut : bool }
+and sock = { fd : Unix.file_descr; mutable shut : bool; mutable reading : bool; mutable writing : bool }
+(* reading / writing: a task is in a read (or accept) / a write that has had
+   to wait; as natively, another that has to wait meanwhile fails *)
 
 (* Map keys: Int, Str or Bool. *)
 type mkey = KInt of int64 | KStr of string | KBool of bool
@@ -473,6 +475,27 @@ module Sock = struct
     let e = !io_epoch in
     wait_until ~io:(sk, write) (fun () -> sk.shut || !io_epoch > e)
 
+  (* Run [op] as this socket's reader (or writer): [op claim] calls [claim ()]
+     before each wait, which is false if another task holds the slot; the
+     slot is held from the first wait until [op] returns. *)
+  let one_at_a_time sk write op =
+    let held = ref false in
+    let claim () =
+      if !held then true
+      else if (if write then sk.writing else sk.reading) then false
+      else begin
+        if write then sk.writing <- true else sk.reading <- true;
+        held := true;
+        true
+      end
+    in
+    let release () = if !held then (if write then sk.writing <- false else sk.reading <- false) in
+    match op claim with
+    | r -> release (); r
+    | exception e -> release (); raise e
+
+  let busy what = Error (Caps.Failed ("another task is already " ^ what))
+
   let failed e = Error (Caps.Failed (Unix.error_message e))
   let closed_err what = Error (Caps.Failed (what ^ " is closed"))
 
@@ -508,16 +531,22 @@ module Sock = struct
             Unix.listen fd 4096;
             Unix.set_nonblock fd;
             let p = match Unix.getsockname fd with Unix.ADDR_INET (_, p) -> p | _ -> port in
-            Ok ({ fd; shut = false }, p)
+            Ok ({ fd; shut = false; reading = false; writing = false }, p)
           with Unix.Unix_error (e, _, _) -> Unix.close fd; failed e))
 
-  let rec accept sk =
-    if sk.shut then closed_err "listener"
-    else
-      match Unix.accept ~cloexec:true sk.fd with
-      | c, _ -> Unix.set_nonblock c; Ok { fd = c; shut = false }
-      | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EINTR | Unix.ECONNABORTED), _, _) -> wait sk false; accept sk
-      | exception Unix.Unix_error (e, _, _) -> failed e
+  let accept sk =
+    one_at_a_time sk false (fun claim ->
+        let rec go () =
+          if sk.shut then closed_err "listener"
+          else
+            match Unix.accept ~cloexec:true sk.fd with
+            | c, _ -> Unix.set_nonblock c; Ok { fd = c; shut = false; reading = false; writing = false }
+            | exception Unix.Unix_error ((Unix.EINTR | Unix.ECONNABORTED), _, _) -> go ()
+            | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _) ->
+              if claim () then (wait sk false; go ()) else busy "accepting on this listener"
+            | exception Unix.Unix_error (e, _, _) -> failed e
+        in
+        go ())
 
   let connect allowed addr =
     match parse_addr addr with
@@ -528,7 +557,7 @@ module Sock = struct
         match resolve h with
         | None -> Error (Caps.Failed ("cannot resolve " ^ h))
         | Some ip -> (
-          let sk = { fd = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0; shut = false } in
+          let sk = { fd = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0; shut = false; reading = false; writing = false } in
           Unix.set_nonblock sk.fd;
           (* waits can be woken by any socket, so retry until this one says it is connected *)
           let rec go () =
@@ -544,26 +573,35 @@ module Sock = struct
           in
           go ()))
 
-  let rec read sk =
-    if sk.shut then closed_err "connection"
-    else
-      let b = Bytes.create 65536 in
-      match Unix.read sk.fd b 0 65536 with
-      | n -> Ok (Bytes.sub_string b 0 n)
-      | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EINTR), _, _) -> wait sk false; read sk
-      | exception Unix.Unix_error (e, _, _) -> failed e
+  let read sk =
+    one_at_a_time sk false (fun claim ->
+        let b = Bytes.create 65536 in
+        let rec go () =
+          if sk.shut then closed_err "connection"
+          else
+            match Unix.read sk.fd b 0 65536 with
+            | n -> Ok (Bytes.sub_string b 0 n)
+            | exception Unix.Unix_error (Unix.EINTR, _, _) -> go ()
+            | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _) ->
+              if claim () then (wait sk false; go ()) else busy "reading this connection"
+            | exception Unix.Unix_error (e, _, _) -> failed e
+        in
+        go ())
 
   let write sk s =
-    let rec go off =
-      if sk.shut then closed_err "connection"
-      else if off >= String.length s then Ok ()
-      else
-        match Unix.single_write_substring sk.fd s off (String.length s - off) with
-        | n -> go (off + n)
-        | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EINTR), _, _) -> wait sk true; go off
-        | exception Unix.Unix_error (e, _, _) -> failed e
-    in
-    go 0
+    one_at_a_time sk true (fun claim ->
+        let rec go off =
+          if sk.shut then closed_err "connection"
+          else if off >= String.length s then Ok ()
+          else
+            match Unix.single_write_substring sk.fd s off (String.length s - off) with
+            | n -> go (off + n)
+            | exception Unix.Unix_error (Unix.EINTR, _, _) -> go off
+            | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _) ->
+              if claim () then (wait sk true; go off) else busy "writing this connection"
+            | exception Unix.Unix_error (e, _, _) -> failed e
+        in
+        go 0)
 
   let close sk =
     if not sk.shut then begin
@@ -580,7 +618,7 @@ module Stdin = struct
   let buf = Buffer.create 4096
   let eof = ref false
   let busy = ref false
-  let sk = { fd = Unix.stdin; shut = false }
+  let sk = { fd = Unix.stdin; shut = false; reading = false; writing = false }
   let direct = lazy (try (Unix.fstat Unix.stdin).Unix.st_kind = Unix.S_REG with Unix.Unix_error _ -> true)
 
   let reset () = Buffer.clear buf; eof := false; busy := false

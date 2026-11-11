@@ -1746,6 +1746,128 @@ fn main(root: Root) {
   out "stdin-readers" ~feed:"seq 1 1000; sleep 0.1; seq 1001 2000" readers "2001000\n";
   check_tsan "stdin-readers" ~feed:"seq 1 1000; sleep 0.1; seq 1001 2000" readers "2001000\n";
 
+  (* ---------- one reader and one writer per connection, in both backends ---------- *)
+  par "socket-one-at-a-time" ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] } {|fn show(r: Result[Str, IoError]) -> Str {
+    match r {
+        Ok(s) => "read {s.len()}",
+        Err(e) => "{e}",
+    }
+}
+
+fn wrote(r: Result[(), IoError]) -> Str {
+    match r {
+        Ok(_) => "wrote",
+        Err(e) => "{e}",
+    }
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let clock = root.clock
+    let net = root.net
+    let l = root.listen.on("127.0.0.1:0")?
+    let port = l.port()
+    let mut chunk = "0123456789abcdef"
+    let mut i = 0
+    while i < 18 {
+        chunk = chunk + chunk
+        i = i + 1
+    }
+    // two readers at once: one waits for data, the other is refused
+    let r = group g {
+        g.go(|| match l.accept() {
+            Ok(c) => {
+                let rs = group h {
+                    h.go(|| show(c.read()))
+                    h.go(|| show(c.read()))
+                }
+                c.close()
+                rs.sort().join(" / ")
+            },
+            Err(e) => "{e}",
+        })
+        g.go(|| match net.connect("127.0.0.1:{port}") {
+            Ok(c) => {
+                clock.sleep(200)
+                c.write("hi") ?? ()
+                c.read() ?? ""
+                c.close()
+                ""
+            },
+            Err(e) => "{e}",
+        })
+    }
+    root.stdout.print(r[0])
+    // two accepts at once
+    let a = group g {
+        g.go(|| match l.accept() {
+            Ok(c) => {
+                c.close()
+                "accepted"
+            },
+            Err(e) => "{e}",
+        })
+        g.go(|| match l.accept() {
+            Ok(c) => {
+                c.close()
+                "accepted"
+            },
+            Err(e) => "{e}",
+        })
+        g.go(|| {
+            clock.sleep(200)
+            match net.connect("127.0.0.1:{port}") {
+                Ok(c) => {
+                    c.close()
+                    ""
+                },
+                Err(e) => "{e}",
+            }
+        })
+    }
+    root.stdout.print(a.take(2).sort().join(" / "))
+    // two writers at once, while the peer is not reading yet
+    let w = group g {
+        g.go(|| match l.accept() {
+            Ok(c) => {
+                let ws = group h {
+                    h.go(|| wrote(c.write(chunk)))
+                    h.go(|| {
+                        clock.sleep(50)
+                        wrote(c.write(chunk))
+                    })
+                }
+                c.close()
+                ws.sort().join(" / ")
+            },
+            Err(e) => "{e}",
+        })
+        g.go(|| match net.connect("127.0.0.1:{port}") {
+            Ok(c) => {
+                clock.sleep(300)
+                let mut got = 0
+                let mut more = true
+                while more {
+                    match c.read() {
+                        Ok(s) => {
+                            got = got + s.len()
+                            more = !s.is_empty()
+                        },
+                        Err(_) => {
+                            more = false
+                        },
+                    }
+                }
+                c.close()
+                "{got}"
+            },
+            Err(e) => "{e}",
+        })
+    }
+    root.stdout.print("{w[0]}; peer got {w[1]}")
+    Ok(())
+}
+|} "Failed(\"another task is already reading this connection\") / read 2\nFailed(\"another task is already accepting on this listener\") / accepted\nFailed(\"another task is already writing this connection\") / wrote; peer got 4194304\n";
+
   (* ---------- unbuffered channels ---------- *)
   out "chan-unbuffered" {|fn main(root: Root) {
     let out = root.stdout

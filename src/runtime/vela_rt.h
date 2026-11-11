@@ -818,6 +818,7 @@ struct WCap {
   char *root; bool ro;        /* Fs: realpath of root, NULL = not granted */
   int fd; int port;           /* Listener, Conn: the socket */
   int64_t inflight; int closing; /* operations in progress; close requested */
+  int reading, writing;          /* a task is in a read (or accept) / a write that has had to wait */
 };
 static WCap *cap_new(int kind) { WCap *c = (WCap *)w_alloc_k(sizeof(WCap), WK_CAP); memset(c, 0, sizeof *c); c->rc = 1; c->kind = kind; c->fd = -1; return c; }
 static void w_sock_release_fd(int fd);
@@ -2587,9 +2588,24 @@ static WIo Cap_listen_on(WCap *l, WStr *addr) {
   c->fd = fd; c->port = ntohs(sa.sin_port);
   return io_ok_ptr(c);
 }
+/* One task at a time may wait to read (or accept) and one to write: an
+   operation takes the slot when it first has to wait and keeps it until it
+   returns, and another that has to wait meanwhile fails. The interpreter
+   does the same, so both backends give the same error. */
+static int w_sock_claim(int *slot, int *held) {
+  if (*held) return 1;
+  int zero = 0;
+  if (!__atomic_compare_exchange_n(slot, &zero, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return 0;
+  *held = 1;
+  return 1;
+}
+static void w_sock_unclaim(int *slot, int held) { if (held) __atomic_store_n(slot, 0, __ATOMIC_RELEASE); }
+
 static WIo Cap_accept(WCap *l) {
   int fd = w_sock_enter(l);
   if (fd < 0) return io_err(2, "listener is closed");
+  int held = 0, cancelled = 0;
+  WIo r;
   for (;;) {
     int c = accept(fd, NULL, NULL);
     if (c >= 0) {
@@ -2598,21 +2614,25 @@ static WIo Cap_accept(WCap *l) {
       setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
       WCap *conn = cap_new(CAP_CONN);
       conn->fd = c;
-      w_sock_leave(l);
-      return io_ok_ptr(conn);
+      r = io_ok_ptr(conn);
+      break;
     }
     if (errno == EINTR || errno == ECONNABORTED) continue;
     if ((errno == EAGAIN || errno == EWOULDBLOCK) && !w_sock_closing(l)) {
+      if (!w_sock_claim(&l->reading, &held)) { r = io_err(2, "another task is already accepting on this listener"); break; }
       int wr = w_wait_fd(fd, 0);
-      if (wr == -2) { w_sock_leave(l); w_cancel_unwind(); }
-      if (wr < 0) { w_sock_leave(l); return io_err(2, "another task is already accepting on this listener"); }
-      if (w_sock_closing(l)) { w_sock_leave(l); return io_err(2, "listener is closed"); }
+      if (wr == -2) { cancelled = 1; break; }
+      if (wr < 0) { r = io_err(2, "another task is already accepting on this listener"); break; }
+      if (w_sock_closing(l)) { r = io_err(2, "listener is closed"); break; }
       continue;
     }
-    WIo r = w_sock_closing(l) ? io_err(2, "listener is closed") : w_errno_io();
-    w_sock_leave(l);
-    return r;
+    r = w_sock_closing(l) ? io_err(2, "listener is closed") : w_errno_io();
+    break;
   }
+  w_sock_unclaim(&l->reading, held);
+  w_sock_leave(l);
+  if (cancelled) w_cancel_unwind();
+  return r;
 }
 static WIo Cap_net_connect(WCap *n, WStr *addr) {
   char h[256]; int port;
@@ -2646,43 +2666,53 @@ static WIo Cap_conn_read(WCap *c) {
   int fd = w_sock_enter(c);
   if (fd < 0) return io_err(2, "connection is closed");
   char *buf = (char *)w_raw(65536);
+  int held = 0, cancelled = 0;
+  WIo r;
   for (;;) {
     ssize_t n = read(fd, buf, 65536);
-    if (n >= 0 && !w_sock_closing(c)) { WStr *s = Str_from(buf, n); free(buf); w_sock_leave(c); return io_ok(s); }
+    if (n >= 0 && !w_sock_closing(c)) { r = io_ok(Str_from(buf, n)); break; }
     if (n < 0 && errno == EINTR) continue;
     if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && !w_sock_closing(c)) {
+      if (!w_sock_claim(&c->reading, &held)) { r = io_err(2, "another task is already reading this connection"); break; }
       int wr = w_wait_fd(fd, 0);
-      if (wr == -2) { free(buf); w_sock_leave(c); w_cancel_unwind(); }
-      if (wr < 0) { free(buf); w_sock_leave(c); return io_err(2, "another task is already reading this connection"); }
+      if (wr == -2) { cancelled = 1; break; }
+      if (wr < 0) { r = io_err(2, "another task is already reading this connection"); break; }
       continue;
     }
-    WIo r = w_sock_closing(c) ? io_err(2, "connection is closed") : w_errno_io();
-    free(buf);
-    w_sock_leave(c);
-    return r;
+    r = w_sock_closing(c) ? io_err(2, "connection is closed") : w_errno_io();
+    break;
   }
+  free(buf);
+  w_sock_unclaim(&c->reading, held);
+  w_sock_leave(c);
+  if (cancelled) w_cancel_unwind();
+  return r;
 }
 static WIo Cap_conn_write(WCap *c, WStr *s) {
   int fd = w_sock_enter(c);
   if (fd < 0) return io_err(2, "connection is closed");
   int64_t off = 0;
+  int held = 0, cancelled = 0;
+  WIo r = io_ok(NULL);
   while (off < s->len) {
-    if (w_sock_closing(c)) { w_sock_leave(c); return io_err(2, "connection is closed"); }
+    if (w_sock_closing(c)) { r = io_err(2, "connection is closed"); break; }
     ssize_t n = write(fd, s->data + off, (size_t)(s->len - off));
     if (n >= 0) { off += n; continue; }
     if (errno == EINTR) continue;
     if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      if (!w_sock_claim(&c->writing, &held)) { r = io_err(2, "another task is already writing this connection"); break; }
       int wr = w_wait_fd(fd, 1);
-      if (wr == -2) { w_sock_leave(c); w_cancel_unwind(); }
-      if (wr < 0) { w_sock_leave(c); return io_err(2, "another task is already writing this connection"); }
+      if (wr == -2) { cancelled = 1; break; }
+      if (wr < 0) { r = io_err(2, "another task is already writing this connection"); break; }
       continue;
     }
-    WIo r = w_errno_io();
-    w_sock_leave(c);
-    return r;
+    r = w_errno_io();
+    break;
   }
+  w_sock_unclaim(&c->writing, held);
   w_sock_leave(c);
-  return io_ok(NULL);
+  if (cancelled) w_cancel_unwind();
+  return r;
 }
 
 /* ---------- stdin ----------
