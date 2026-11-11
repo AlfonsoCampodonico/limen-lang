@@ -59,7 +59,7 @@ Then work through the examples. Every one runs the same in the interpreter and n
 
 | Example | Shows | Run |
 | --- | --- | --- |
-| `tour.vela` | the newest features in one file: `dyn` branches, ranges, method values, struct map keys, `Bytes`, groups with deadlines, `select` timeouts, exit codes, tests, table tests | `vela run examples/tour.vela; echo $?` and `vela test examples/tour.vela` |
+| `tour.vela` | the newest features in one file: `dyn` branches, ranges, method values, struct map keys, `Bytes`, groups with deadlines, `select` timeouts, exit codes, tests, table tests, benchmarks | `vela run examples/tour.vela; echo $?`, `vela test examples/tour.vela` and `vela test examples/tour.vela --bench` |
 | `hello.vela`, `wordcount.vela` | capabilities: nothing touches the outside world without a grant | `vela run examples/wordcount.vela --grant fs=examples:ro` |
 | `methods.vela`, `interfaces.vela`, `dyn.vela`, `shapes.vela` | methods, structural interfaces, `dyn` values | `vela run examples/dyn.vela` |
 | `tuples.vela`, `maps.vela` | tuples, destructuring, maps | `vela run examples/maps.vela` |
@@ -82,6 +82,7 @@ To write your own: `vela check` gives errors with fixes, `vela explain E0302` ex
 | `vela caps FILE [--json]` | List each function's authority: the capabilities in its signature, or `pure`. |
 | `vela explain CODE` | Explain an error code, for example `vela explain E0302`. |
 | `vela test FILE [--native]` | Run the file's `test "name" { ... }` blocks, each isolated. A test that declares `(fs: Fs)` gets a fresh temporary directory. |
+| `vela test FILE --bench [--bench-time 1s\|100x]` | Also run the `bench "name" { ... }` blocks, natively, and report ns/op and allocations/op. |
 | `vela fmt FILE... [--write\|--check]` | Print the canonical formatting, rewrite files, or check them. |
 | `vela doc FILE\|MODULE... [--std] [--all] [--html] [-o OUT]` | Documentation from doc comments (the `//` lines directly above an item) and signatures, as Markdown or one static HTML page. `vela doc --std --html -o std.html` documents the standard library. |
 | `vela lsp` | Language server on stdin/stdout. |
@@ -105,6 +106,7 @@ To write your own: `vela check` gives errors with fixes, `vela explain E0302` ex
 - **Formatter (`vela fmt`):** keeps comments where they were written, including inside an expression (a comment in a one-line argument list puts it one argument per line; one after a binary operator breaks the line there), number and string spellings, and the author's line breaks in lists and argument lists. The test suite formats every program and checks that the tree is unchanged, a second pass changes nothing, and no comment is lost.
 - **Tests (`vela test`):** `test "name" { assert_eq(...) }` blocks. They get no `root`; a test can declare `(fs: Fs, clock: Clock)` to get a fresh temporary directory, removed afterwards, and the real clock, and nothing else. Each runs isolated in the interpreter, or as its own process with `--native`.
 - **Table tests:** `test "add" for (a, b, want) in [(1, 2, 3), (2, 2, 4)] { assert_eq(a + b, want) }` runs the body once per case, each case its own isolated test named by its text (`add (2, 2, 4)`), so a failure says which case. The cases are written out in place, which is what lets every case be named before anything runs.
+- **Benchmarks:** `bench "name" { ... }` blocks, skipped by `vela test` and run natively by `vela test --bench`. As in Go, the iteration count grows until a round fills the time budget (`--bench-time 1s` by default, or `100x` for a fixed count); the report gives ns/op and allocations/op from the runtime's allocation counter. The body's value goes to `keep(x)`, which the C compiler cannot see through, so the work is not optimized away.
 - **MCP server (`vela mcp`):** tools to check, run, test, format, read a type, find references, rename (with the language server's safety checks), list capabilities, explain an error, and read the spec. `vela_run` gives the program no grants, so code an agent just wrote can print but cannot touch files or the network, and it stops at a time limit.
 - **Checking the grammar:** `python3 grammar/gbnf_check.py` checks files against it with an Earley recognizer that follows llama.cpp's grammar syntax and acceptance rule. `grammar/check-suite.sh` runs it over every program in the test suite. To check with llama.cpp's own GBNF parser and matcher (the code that does the constrained decoding), run `sh grammar/llama-check.sh`: it fetches llama.cpp at a pinned release into `~/.cache/vela` (or `$VELA_CACHE`), builds only its library, and runs the accept and reject cases, the examples, the benchmarks and every test-suite program through [grammar/llama_check.cpp](grammar/llama_check.cpp). It needs git, cmake and a C++ compiler, and is not part of `dune test`. Homebrew's llama.cpp cannot be used for this: it ships no grammar validator and not the internal header one needs.
 

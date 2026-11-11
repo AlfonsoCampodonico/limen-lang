@@ -206,7 +206,7 @@ let visible_names ctx f =
   List.concat_map (fun s -> List.of_seq (Hashtbl.to_seq_keys s.vars)) f.scopes
   @ List.of_seq (Hashtbl.to_seq_keys ctx.fns)
   @ List.of_seq (Hashtbl.to_seq_keys ctx.owners)
-  @ [ "panic"; "channel"; "assert"; "assert_eq"; "map"; "catch"; "bytes" ]
+  @ [ "panic"; "channel"; "assert"; "assert_eq"; "map"; "catch"; "bytes"; "keep" ]
 
 (* Generic functions' bounds: function -> type parameter -> interfaces. *)
 let fn_bounds : (string, (string * string list) list) Hashtbl.t = Hashtbl.create 8
@@ -653,6 +653,12 @@ and check_call ctx f callee args sp =
        | TFn _ | TCap _ | TChan _ | TDyn _ -> err ctx "E0201" sp (sprintf "values of type `%s` cannot be compared" (show t))
        | _ -> ())
      | _ -> err ctx "E0107" sp "`assert_eq` takes 2 arguments"; check_args ctx f args);
+    TUnit
+  | EVar "keep" when lookup f "keep" = None && not (Hashtbl.mem ctx.fns "keep") ->
+    (* `keep(x)`: x counts as used, so a benchmark's work is not optimized away *)
+    (match args with
+     | [ a ] -> ignore (check_expr ctx f a)
+     | _ -> err ctx "E0107" sp "`keep` takes 1 argument"; check_args ctx f args);
     TUnit
   | EVar "channel" when lookup f "channel" = None && not (Hashtbl.mem ctx.fns "channel") ->
     (match args with
@@ -1746,8 +1752,9 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
     (fun (d, _) ->
       match d.fn_test with
       | Some n ->
-        if Hashtbl.mem seen_tests n then err ctx "E0106" d.fn_span (sprintf "test \"%s\" is defined more than once" n);
-        Hashtbl.replace seen_tests n ()
+        let kind = if d.fn_bench then "bench" else "test" in
+        if Hashtbl.mem seen_tests (kind, n) then err ctx "E0106" d.fn_span (sprintf "%s \"%s\" is defined more than once" kind n);
+        Hashtbl.replace seen_tests (kind, n) ()
       | None -> ())
     sigs;
   (* E0306: a test's parameters are capabilities the runner provides *)

@@ -1,0 +1,13 @@
+bench "sum" {
+    let mut t = 0
+    for i in 0..<100 {
+        t = t + i
+    }
+    t
+}
+
+bench "write" (fs: Fs) {
+    keep(fs.write("a.txt", "x"))
+}
+
+bench "empty" {}

@@ -38,6 +38,7 @@ typedef uint8_t W_Unit;
    capabilities, boxed enums) goes through w_alloc/w_free, so tests can check
    that reference counting frees everything (VELA_LEAKCHECK=1). */
 static int64_t w_live;
+static int64_t w_allocs;   /* allocations ever made: `vela test --bench` reports them per operation */
 
 /* Every allocation has a header. While a panic boundary (a `catch` or a
    task) is active, each object the task allocates is linked into the
@@ -75,6 +76,7 @@ static void *w_alloc_k(size_t n, int kind) {
   if (!h) { fputs("panic: out of memory\n", stderr); exit(1); }
   h->prev = h->next = NULL; h->kind = kind; h->kids = NULL;
   __atomic_fetch_add(&w_live, 1, __ATOMIC_RELAXED);
+  __atomic_fetch_add(&w_allocs, 1, __ATOMIC_RELAXED);
   if (kind != WK_BUF) {
     WCatch **slot = w_catch_slot();
     if (slot && *slot) w_hdr_link(&(*slot)->objs, h);

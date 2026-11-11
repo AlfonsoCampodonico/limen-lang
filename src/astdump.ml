@@ -81,8 +81,8 @@ and stmt s =
   | SContinue -> "continue"
 
 let item = function
-  | IFn { fn_test = Some n; fn_body; fn_params; fn_table; _ } ->
-    "test " ^ String.escaped n ^ "("
+  | IFn { fn_test = Some n; fn_body; fn_params; fn_bench; fn_table; _ } ->
+    (if fn_bench then "bench " else "test ") ^ String.escaped n ^ "("
     ^ String.concat "," (List.map (fun p -> p.prm_name ^ ":" ^ ty p.prm_ty) fn_params)
     ^ ")" ^ (match fn_table with Some (p, e) -> "for " ^ pat p ^ " in " ^ expr e | None -> "") ^ block fn_body
   | IIface i ->

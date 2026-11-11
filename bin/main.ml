@@ -9,7 +9,7 @@ usage:
   vela check FILE [--json]
   vela caps FILE [--json]
   vela explain CODE
-  vela test FILE [--native]
+  vela test FILE [--native] [--bench] [--bench-time 1s|100x]
   vela fmt FILE... [--write | --check]
   vela doc FILE|MODULE... [--std] [--all] [--html] [-o OUT]
   vela lsp                (language server on stdin/stdout)
@@ -105,69 +105,141 @@ let where_of (sp : Span.t) =
     let l, c = Source.line_col sp.file sp.lo in
     Printf.sprintf "%s:%d:%d" sp.file l c
 
-let run_tests_native items names =
+(* Run the native test binary [exe] with [args] (plus an fs grant to a fresh
+   directory when [takes_fs]). Returns the exit status, stderr and seconds. *)
+let run_test_binary exe args takes_fs =
+  let err = exe ^ ".err" in
+  let fd = Unix.openfile err [ Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC ] 0o600 in
+  (* a test that takes Fs gets a fresh directory, removed afterwards *)
+  let dir = if takes_fs then Some (Caps.test_dir ()) else None in
+  let grant = match dir with Some d -> [| "--grant"; "fs=" ^ d |] | None -> [||] in
+  let start = Unix.gettimeofday () in
+  let pid = Unix.create_process exe (Array.concat [ [| exe |]; args; grant ]) Unix.stdin Unix.stdout fd in
+  let _, status = Unix.waitpid [] pid in
+  let secs = Unix.gettimeofday () -. start in
+  Option.iter Caps.remove_tree dir;
+  Unix.close fd;
+  (status, In_channel.with_open_bin err In_channel.input_all, secs)
+
+(* A failed run's message and location, from the panic it printed. *)
+let failure text =
+  let lines = String.split_on_char '\n' text in
+  let msg =
+    match lines with
+    | l :: _ when String.starts_with ~prefix:"panic: " l -> String.sub l 7 (String.length l - 7)
+    | l :: _ when l <> "" -> l
+    | _ -> "crashed"
+  in
+  let where =
+    match lines with
+    | _ :: w :: _ when String.starts_with ~prefix:"-->" (String.trim w) ->
+      let w = String.trim w in
+      String.trim (String.sub w 3 (String.length w - 3))
+    | _ -> ""
+  in
+  (msg, where)
+
+type bench_result = { iters : int; ns : int; allocs : int }
+
+(* Build the test binary once; run the selected tests (and, with [bench],
+   the selected benches) each in its own process. [tests] and [benches] are
+   (index, name, takes_fs). *)
+let run_native_tests items tests benches bench =
   let exe = Filename.concat (Filename.get_temp_dir_name ()) (Printf.sprintf "vela-test-%d" (Unix.getpid ())) in
   (match Native.build ~tests:true items exe with
    | Ok () -> ()
    | Error m -> prerr_string m; prerr_endline "vela: the C compiler failed (this is a bug in vela)"; exit 1);
-  let results =
-    List.mapi
-      (fun i (name, takes_fs) ->
-        let err = exe ^ ".err" in
-        let fd = Unix.openfile err [ Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC ] 0o600 in
-        (* a test that takes Fs gets a fresh directory, removed afterwards *)
-        let dir = if takes_fs then Some (Caps.test_dir ()) else None in
-        let grant = match dir with Some d -> [| "--grant"; "fs=" ^ d |] | None -> [||] in
-        let pid = Unix.create_process exe (Array.append [| exe; string_of_int i |] grant) Unix.stdin Unix.stdout fd in
-        let _, status = Unix.waitpid [] pid in
-        Option.iter Caps.remove_tree dir;
-        Unix.close fd;
-        let text = In_channel.with_open_bin err In_channel.input_all in
+  let test_results =
+    List.map
+      (fun (i, name, takes_fs) ->
+        let status, text, secs = run_test_binary exe [| string_of_int i |] takes_fs in
         match status with
-        | Unix.WEXITED 0 -> (name, Ok ())
-        | _ ->
-          let lines = String.split_on_char '\n' text in
-          let msg =
-            match lines with
-            | l :: _ when String.starts_with ~prefix:"panic: " l -> String.sub l 7 (String.length l - 7)
-            | l :: _ when l <> "" -> l
-            | _ -> "crashed"
+        | Unix.WEXITED 0 -> (name, Ok (), secs)
+        | _ -> (name, Error (failure text), secs))
+      tests
+  in
+  let bench_results =
+    match bench with
+    | None -> []
+    | Some (budget_ns, fixed) ->
+      List.map
+        (fun (i, name, takes_fs) ->
+          let args = [| "bench"; string_of_int i; string_of_int budget_ns; string_of_int fixed |] in
+          let status, text, _ = run_test_binary exe args takes_fs in
+          let report =
+            List.find_map
+              (fun l -> if String.starts_with ~prefix:"vela-bench: " l then Some (String.sub l 12 (String.length l - 12)) else None)
+              (String.split_on_char '\n' text)
           in
-          let where =
-            match lines with
-            | _ :: w :: _ when String.starts_with ~prefix:"-->" (String.trim w) -> String.trim (String.sub (String.trim w) 3 (String.length (String.trim w) - 3))
-            | _ -> ""
-          in
-          (name, Error (msg, where)))
-      names
+          match (status, report) with
+          | Unix.WEXITED 0, Some r -> (
+            match List.map int_of_string_opt (String.split_on_char ' ' r) with
+            | [ Some iters; Some ns; Some allocs ] -> (name, Ok { iters; ns; allocs })
+            | _ -> (name, Error ("bad benchmark report: " ^ r, "")))
+          | _ -> (name, Error (failure text)))
+        benches
   in
   List.iter (fun f -> try Sys.remove f with Sys_error _ -> ()) [ exe; exe ^ ".c"; exe ^ ".err" ];
-  results
+  (test_results, bench_results)
 
-let cmd_test file native =
+(* `--bench-time`: `1s`, `500ms`, `2m`, or `100x` for an exact count.
+   Returns (budget in nanoseconds, fixed count or 0). *)
+let parse_bench_time s =
+  let num k = match float_of_string_opt k with Some f when f > 0. -> f | _ -> die_usage ("bad --bench-time " ^ s) in
+  let cut n = String.sub s 0 (String.length s - n) in
+  if String.ends_with ~suffix:"x" s then
+    match int_of_string_opt (cut 1) with Some n when n > 0 -> (0, n) | _ -> die_usage ("bad --bench-time " ^ s)
+  else if String.ends_with ~suffix:"ms" s then (int_of_float (num (cut 2) *. 1e6), 0)
+  else if String.ends_with ~suffix:"s" s then (int_of_float (num (cut 1) *. 1e9), 0)
+  else if String.ends_with ~suffix:"m" s then (int_of_float (num (cut 1) *. 60e9), 0)
+  else die_usage ("--bench-time takes a duration such as 1s or 200ms, or a count such as 100x, not " ^ s)
+
+let ns_per_op b =
+  let v = float_of_int b.ns /. float_of_int (max 1 b.iters) in
+  if v < 10. then Printf.sprintf "%.2f" v else if v < 100. then Printf.sprintf "%.1f" v else Printf.sprintf "%.0f" v
+
+type test_opts = { native : bool; bench : (int * int) option }
+
+let cmd_test file (o : test_opts) =
   let items, diags, _ = load file in
   if diags <> [] then (report diags; exit 1);
-  let tests = List.filter_map (function Ast.IFn ({ fn_test = Some n; _ } as d) -> Some (n, Caps.takes_fs d) | _ -> None) items in
-  if tests = [] then (print_endline "no tests"; exit 0);
-  let results =
-    if native then run_tests_native items tests
-    else
-      List.map
-        (fun (n, r) -> (n, match r with Ok () -> Ok () | Error (m, sp) -> Error (m, where_of sp)))
-        (Interp.run_tests ~out:(fun s -> print_string s; flush stdout) items)
+  (* tests and benches are numbered in order, as the test binary numbers them *)
+  let numbered bench =
+    List.mapi (fun i (n, d) -> (i, n, Caps.takes_fs d))
+      (List.filter_map (function Ast.IFn ({ fn_test = Some n; fn_bench = b; _ } as d) when b = bench -> Some (n, d) | _ -> None) items)
   in
-  let failed = ref 0 in
+  let tests = numbered false and benches = if o.bench <> None then numbered true else [] in
+  if tests = [] && benches = [] then (print_endline "no tests"; exit 0);
+  let test_results, bench_results =
+    if o.native || o.bench <> None then
+      let ts, bs = run_native_tests items tests benches o.bench in
+      (List.map (fun (n, r, _) -> (n, r)) ts, bs)
+    else
+      ( List.map
+          (fun (n, r) -> (n, match r with Ok () -> Ok () | Error (m, sp) -> Error (m, where_of sp)))
+          (Interp.run_tests ~out:(fun s -> print_string s; flush stdout) items),
+        [] )
+  in
+  let failed = List.length (List.filter (fun (_, r) -> Result.is_error r) test_results)
+               + List.length (List.filter (fun (_, r) -> Result.is_error r) bench_results) in
+  let fail name (m, w) =
+    Printf.printf "FAIL  %s\n      %s\n" name m;
+    if w <> "" then Printf.printf "      --> %s\n" w
+  in
+  List.iter (fun (name, r) -> match r with Ok () -> Printf.printf "ok    %s\n" name | Error e -> fail name e) test_results;
+  let width = List.fold_left (fun w (n, _) -> max w (String.length n)) 0 bench_results in
   List.iter
     (fun (name, r) ->
       match r with
-      | Ok () -> Printf.printf "ok    %s\n" name
-      | Error (m, w) ->
-        incr failed;
-        Printf.printf "FAIL  %s\n      %s\n" name m;
-        if w <> "" then Printf.printf "      --> %s\n" w)
-    results;
-  Printf.printf "%d test%s, %d failed\n" (List.length results) (if List.length results = 1 then "" else "s") !failed;
-  exit (if !failed = 0 then 0 else 1)
+      | Ok b -> Printf.printf "bench %-*s %12d %12s ns/op %8d allocs/op\n" width name b.iters (ns_per_op b) (b.allocs / max 1 b.iters)
+      | Error e -> fail name e)
+    bench_results;
+  let count n what = Printf.sprintf "%d %s%s" n what (if n = 1 then "" else if what = "bench" then "es" else "s") in
+  Printf.printf "%s%s, %d failed\n"
+    (count (List.length test_results) "test")
+    (if bench_results = [] then "" else ", " ^ count (List.length bench_results) "bench")
+    failed;
+  exit (if failed = 0 then 0 else 1)
 
 let cmd_fmt files mode =
   let changed = ref [] in
@@ -357,8 +429,18 @@ let () =
   | [ "lsp" ] -> Lsp.serve ()
   | [ "mcp" ] -> Mcp.serve ()
   | [ "spec" ] -> print_string Spec_text.text
-  | [ "test"; file ] -> cmd_test file false
-  | [ "test"; file; "--native" ] | [ "test"; "--native"; file ] -> cmd_test file true
+  | "test" :: rest ->
+    let rec go file (o : test_opts) = function
+      | "--native" :: r -> go file { o with native = true } r
+      | "--bench" :: r -> go file { o with bench = Some (Option.value o.bench ~default:(1_000_000_000, 0)) } r
+      | "--bench-time" :: t :: r -> go file { o with bench = Some (parse_bench_time t) } r
+      | "--bench-time" :: [] -> die_usage "--bench-time needs a value"
+      | a :: _ when String.length a > 1 && a.[0] = '-' -> die_usage ("unknown test option " ^ a)
+      | f :: r when file = None -> go (Some f) o r
+      | _ :: _ -> die_usage "test takes one FILE"
+      | [] -> ( match file with Some f -> cmd_test f o | None -> die_usage "test needs a FILE")
+    in
+    go None { native = false; bench = None } rest
   | "doc" :: rest -> cmd_doc rest
   | "fmt" :: rest -> (
     let mode = if List.mem "--write" rest then `Write else if List.mem "--check" rest then `Check else `Print in

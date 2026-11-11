@@ -797,6 +797,7 @@ Strings compare byte by byte, so `c >= "a" && c <= "z"` tests a one-byte string,
 | `bytes(list)` | a new `Bytes` from a `List[Int]` of values 0 to 255 |
 | `assert(cond)` | panic with `assertion failed` unless `cond` is true |
 | `assert_eq(a, b)` | panic with `assertion failed: <a> != <b>` unless `a == b` |
+| `keep(x)` | `()`; `x` counts as used, so the work that made it is not optimized away (for benchmarks, section 12) |
 
 ### Capabilities
 
@@ -876,6 +877,24 @@ test "add" for (a, b, want) in [(1, 2, 3), (2, 2, 4), (-1, 1, 0)] {
 - The cases must be a list literal with at least one case (E0003), so every case is known, and named, before anything runs. To share cases between tests, write the list twice or loop inside one test.
 - Capabilities go before `for`: `test "save" (fs: Fs) for name in ["a.txt", "b.txt"] { ... }`. Each case gets its own fresh directory.
 - The body is type-checked for every case. A problem shows once; when only some cases have it, a note names the case. Two cases with the same text are E0106.
+
+### Benchmarks
+
+```
+bench "sum to 100" {
+    let mut t = 0
+    for i in 0..<100 {
+        t = t + i
+    }
+    t
+}
+```
+
+- `bench "name" { ... }` is a top-level item like `test`, and can take `fs: Fs` and `clock: Clock` the same way (one directory for the whole run). Its body is one operation.
+- `vela test FILE` skips benchmarks. `vela test FILE --bench` runs the tests and then every benchmark, always as native code: each benchmark runs in its own process, first once, then with more and more iterations (at most 100 times more per round), until one round takes at least the time budget, one second by default. `--bench-time 200ms` (or `2s`, `1m`) sets the budget, and `--bench-time 100x` runs exactly 100 iterations.
+- It reports the iterations of the last round, the time per operation, and the runtime's allocations per operation (strings, lists, maps, closures and other objects made, whether or not they were freed). A panic fails the benchmark like a test.
+- The value of the body's last expression is passed to `keep`, so the C compiler cannot drop the work that made it. Inside a loop, call `keep(x)` on values that are otherwise unused. A constant result (`1 + 2`) is still computed at compile time, as in any program.
+- Benchmark names must be unique among benchmarks (E0106); a test and a benchmark may share a name.
 
 ## 13. How values print
 
@@ -968,10 +987,11 @@ A panic unwinds the stack up to the boundary: everything the abandoned code owne
 EBNF. `NL` is a newline, as described in section 2. A character-level version for constrained decoding, with the newline rules spelled out, is in [grammar/vela.gbnf](grammar/vela.gbnf). `{ x }` means zero or more, and `[ x ]` means optional.
 
 ```
-program    = { "use" IDENT | [ "pub" ] ( fn | struct | enum | interface ) | test | foreign } ;
+program    = { "use" IDENT | [ "pub" ] ( fn | struct | enum | interface ) | test | bench | foreign } ;
 foreign    = "foreign" STRING "{" { [ "pub" ] "fn" IDENT "(" [ params ] ")" [ "->" type ] ( NL | ";" ) } "}" ;
 interface  = "interface" IDENT "{" { "fn" IDENT "(" "self" { "," param } ")" [ "->" type ] ( "," | NL ) } "}" ;
 test       = "test" STRING [ "(" [ params ] ")" ] [ "for" ( IDENT | tuplepat ) "in" "[" expr { "," expr } [ "," ] "]" ] block ;
+bench      = "bench" STRING [ "(" [ params ] ")" ] block ;
 fn         = "fn" IDENT [ bgenerics ] "(" [ params ] ")" [ "->" type ] block ;
 bgenerics  = "[" IDENT [ ":" bound { "+" bound } ] { "," IDENT [ ":" bound { "+" bound } ] } "]" ;
 bound      = IDENT [ "." IDENT ] ;                (* an interface *)

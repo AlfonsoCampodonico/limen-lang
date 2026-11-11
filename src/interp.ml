@@ -1301,7 +1301,7 @@ and eval_var rt env n sp =
       | None ->
         if n = "panic" then VPanicFn
         else if n = "channel" then VChanFn
-        else if n = "assert" || n = "assert_eq" || n = "map" || n = "catch" || n = "bytes" then VBuiltin n
+        else if n = "assert" || n = "assert_eq" || n = "map" || n = "catch" || n = "bytes" || n = "keep" then VBuiltin n
         else raise (Panic ("internal: unbound name " ^ n, sp)))
 
 and ctor_value rt en vn =
@@ -1347,6 +1347,7 @@ and apply rt fv args sp =
     | [ a; b ] when equal a b -> VUnit
     | [ a; b ] -> raise (Panic (sprintf "assertion failed: %s != %s" (show ~top:false a) (show ~top:false b), sp))
     | _ -> raise (Panic ("assertion failed", sp)))
+  | VBuiltin "keep" -> VUnit
   | VBuiltin "catch" -> (
     match args with
     | [ f ] -> ( try ok (apply rt f [] sp) with Panic (m, _) -> VEnum ("Result", "Err", [ VStr m ]))
@@ -1715,7 +1716,7 @@ let run_tests ~out (user_items : item list) : (string * (unit, string * Span.t) 
   let resolved = Foreign.resolve no_grants.foreign user_items in
   List.filter_map
     (function
-      | IFn ({ fn_test = Some name; _ } as d) ->
+      | IFn ({ fn_test = Some name; fn_bench = false; _ } as d) ->
         Queue.clear runq;
         let finished = ref false in
         (* capabilities the test asked for: a fresh directory as Fs, the real Clock *)

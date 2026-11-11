@@ -146,13 +146,16 @@ let fn_signature text (d : fn_decl) =
   let name = match String.rindex_opt d.fn_name ':' with Some i -> String.sub d.fn_name (i + 1) (String.length d.fn_name - i - 1) | None -> d.fn_name in
   Printf.sprintf "fn %s%s(%s)%s" name gens (String.concat ", " ps) ret
 
+(* `test "name"` or `bench "name"` *)
+let test_label (d : fn_decl) n = (if d.fn_bench then "bench" else "test") ^ " \"" ^ n ^ "\""
+
 let hover_items text items =
   let acc = ref [] in
   let add (sp : Span.t) s = acc := (sp, s) :: !acc in
   List.iter
     (function
       | IFn d ->
-        add d.fn_span (match d.fn_test with Some n -> "test \"" ^ n ^ "\"" | None -> fn_signature text d);
+        add d.fn_span (match d.fn_test with Some n -> test_label d n | None -> fn_signature text d);
         List.iter (fun p -> add p.prm_span (p.prm_name ^ ": " ^ slice text p.prm_ty.tspan)) d.fn_params;
         walk_block
           (fun e ->
@@ -377,7 +380,7 @@ let general_completions doc off =
         (fns items)
     in
     locals @ globals @ kws
-    @ [ item 3 "panic" "panic(Str)"; item 3 "assert" "assert(Bool)"; item 3 "assert_eq" "assert_eq(T, T)";
+    @ [ item 3 "panic" "panic(Str)"; item 3 "assert" "assert(Bool)"; item 3 "assert_eq" "assert_eq(T, T)"; item 3 "keep" "keep(T)";
         item 3 "channel" "channel(Int) -> Chan[T]" ]
 
 (* ---------- protocol ---------- *)
@@ -590,7 +593,7 @@ let handle st (msg : J.t) : J.t list =
            (List.map
               (function
                 | IFn d ->
-                  let name = match d.fn_test with Some n -> "test \"" ^ n ^ "\"" | None -> d.fn_name in
+                  let name = match d.fn_test with Some n -> test_label d n | None -> d.fn_name in
                   (* a table test's case selects its own text *)
                   let sel = match d.fn_table with Some (_, c) -> c.espan | None -> d.fn_span in
                   sym name 12 sel (Span.merge d.fn_span d.fn_body.bspan)

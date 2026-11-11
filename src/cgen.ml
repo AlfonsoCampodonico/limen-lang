@@ -538,6 +538,10 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
       line (sprintf "  %s v_;" (ctype c el));
       line (sprintf "  %s = w_chan_recv(%s, &v_) ? %s : %s;" dst (arg 0) (mk_enum c t 0 [ "v_" ]) (mk_enum c t 1 []));
       line "}"
+    | "keep", _ ->
+      (* the value escapes into an empty asm statement the compiler cannot see through *)
+      line (sprintf "{ __typeof__(%s) k_ = %s; __asm__ volatile(\"\" : : \"r\"(&k_) : \"memory\"); }" (arg 0) (arg 0));
+      set "0"
     | "chan_close", _ -> line (sprintf "w_chan_close(%s, %s);" (arg 0) (where sp)); set "0"
     | "map_new", TMap _ -> set (sprintf "%s_new()" (cname c rt))
     | "map_from", TMap (k, v) ->
@@ -1336,23 +1340,77 @@ let program (g : Lower.gctx) (prog : I.program) : string =
   let main = Buffer.create 1024 in
   let mp s = Buffer.add_string main (s ^ "\n") in
   let rt = prog.main_ret in
-  if prog.tests <> [] then begin
-    (* test binary: `PROGRAM N` runs test N (each test in its own process) *)
-    mp "static int wtest_index_;";
+  if prog.tests <> [] || prog.benches <> [] then begin
+    (* test binary: `PROGRAM N` runs test N (each test in its own process);
+       `PROGRAM bench N NS ITERS` runs bench N, ITERS times, or (ITERS = 0)
+       as many times as fit in NS nanoseconds, and reports on stderr *)
+    let cap_args fields = String.concat ", " (List.map (sprintf "Cap_root_field(NULL, %S)") fields) in
+    mp "static int wtest_index_, wtest_bench_;";
+    mp "static int64_t wbench_budget_, wbench_fixed_;";
+    if prog.benches <> [] then begin
+      mp "static WCap* wbench_caps_[2];";
+      List.iteri
+        (fun i (t, fields) ->
+          mp (sprintf "static void wbench_%d_(void) {" i);
+          List.iteri (fun k _ -> mp (sprintf "  Cap_dup(wbench_caps_[%d]);" k)) fields;
+          mp (sprintf "  %s(%s);" t (String.concat ", " (List.mapi (fun k _ -> sprintf "wbench_caps_[%d]" k) fields)));
+          mp "}")
+        prog.benches;
+      (* Go's scaling: run once, then grow the count toward the time budget,
+         at most 100 times per round, until one round fills the budget *)
+      mp "static void wbench_loop_(void (*body)(void)) {";
+      mp "  int64_t n = wbench_fixed_ > 0 ? wbench_fixed_ : 1;";
+      mp "  for (;;) {";
+      mp "    int64_t a0 = __atomic_load_n(&w_allocs, __ATOMIC_RELAXED);";
+      mp "    int64_t t0 = w_mono_ns();";
+      mp "    for (int64_t i = 0; i < n; i++) body();";
+      mp "    int64_t ns = w_mono_ns() - t0;";
+      mp "    int64_t al = __atomic_load_n(&w_allocs, __ATOMIC_RELAXED) - a0;";
+      mp "    if (wbench_fixed_ > 0 || ns >= wbench_budget_ || n >= 1000000000) {";
+      mp "      fflush(stdout);";
+      mp "      fprintf(stderr, \"vela-bench: %lld %lld %lld\\n\", (long long)n, (long long)ns, (long long)al);";
+      mp "      return;";
+      mp "    }";
+      mp "    int64_t next = ns > 0 ? (int64_t)(1.2 * (double)wbench_budget_ * (double)n / (double)ns) : n * 100;";
+      mp "    if (next > n * 100) next = n * 100;";
+      mp "    if (next <= n) next = n + 1;";
+      mp "    if (next > 1000000000) next = 1000000000;";
+      mp "    n = next;";
+      mp "  }";
+      mp "}"
+    end;
     mp "static void wtest_entry_(void* a) {";
     mp "  (void)a;";
-    mp "  switch (wtest_index_) {";
-    List.iteri
-      (fun i (t, fields) ->
-        mp (sprintf "    case %d: %s(%s); break;" i t (String.concat ", " (List.map (sprintf "Cap_root_field(NULL, %S)") fields))))
-      prog.tests;
+    mp "  if (!wtest_bench_) switch (wtest_index_) {";
+    List.iteri (fun i (t, fields) -> mp (sprintf "    case %d: %s(%s); break;" i t (cap_args fields))) prog.tests;
     mp "  }";
+    if prog.benches <> [] then begin
+      mp "  else switch (wtest_index_) {";
+      List.iteri
+        (fun i (_, fields) ->
+          mp (sprintf "    case %d:" i);
+          List.iteri (fun k f -> mp (sprintf "      wbench_caps_[%d] = Cap_root_field(NULL, %S);" k f)) fields;
+          mp (sprintf "      wbench_loop_(wbench_%d_);" i);
+          List.iteri (fun k _ -> mp (sprintf "      Cap_drop(wbench_caps_[%d]);" k)) fields;
+          mp "      break;")
+        prog.benches;
+      mp "  }"
+    end;
     mp "  w_main_finished();";
     mp "}";
     mp "int main(int argc, char** argv) {";
     mp "  if (argc < 2) return 2;";
-    mp "  wtest_index_ = atoi(argv[1]);";
-    mp "  w_init(argc - 1, argv + 1);   /* `--grant fs=DIR` for a test that takes Fs */";
+    mp "  if (strcmp(argv[1], \"bench\") == 0) {";
+    mp "    if (argc < 5) return 2;";
+    mp "    wtest_bench_ = 1;";
+    mp "    wtest_index_ = atoi(argv[2]);";
+    mp "    wbench_budget_ = atoll(argv[3]);";
+    mp "    wbench_fixed_ = atoll(argv[4]);";
+    mp "    w_init(argc - 4, argv + 4);   /* then `--grant fs=DIR` for a bench that takes Fs */";
+    mp "  } else {";
+    mp "    wtest_index_ = atoi(argv[1]);";
+    mp "    w_init(argc - 1, argv + 1);   /* `--grant fs=DIR` for a test that takes Fs */";
+    mp "  }";
     mp "  w_run(wtest_entry_, NULL);";
     mp "  fflush(stdout);";
     mp "  w_leakcheck();";

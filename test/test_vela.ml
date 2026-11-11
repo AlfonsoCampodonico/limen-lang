@@ -1492,7 +1492,8 @@ test "fails with a dir" (fs: Fs) {
   end;
   errs "vela-test-bad-cap" "test \"x\" (n: Net) {}\ntest \"y\" (a: Fs, b: Fs) {}\ntest \"z\" (c: Clock, d: Int) {}" [ "E0306"; "E0306"; "E0306" ];
 
-  (* table tests: one isolated run per case, named by the case's text *)
+  (* table tests: one isolated run per case, named by the case's text;
+     benches: skipped by tests, run natively by `vela test --bench` *)
   let table_src = {|fn add(a: Int, b: Int) -> Int {
     a + b
 }
@@ -1510,6 +1511,23 @@ test "with a dir" (fs: Fs, clock: Clock) for (name, (body, _)) in [("a.txt", ("x
     assert_eq(fs.list(""), Ok([]))
     assert(fs.write(name, body).is_ok())
     assert(clock.now_ms() > 0)
+}
+
+bench "sum" {
+    let mut t = 0
+    for i in 0..<100 {
+        t = t + i
+    }
+    t
+}
+
+bench "strings" (fs: Fs) {
+    keep(fs.read("missing").is_err())
+    "a" + "{40 + 2}"
+}
+
+bench "boom" {
+    [1][3]
 }
 |} in
   let items, ds, _ = compile "vela-table-tests" table_src in
@@ -1541,7 +1559,25 @@ test "with a dir" (fs: Fs, clock: Clock) for (name, (body, _)) in [("a.txt", ("x
           match w with
           | None -> ok ("vela-table-native/" ^ n) (code = 0 && err = "vela-leakcheck: 0 live\n") (sprintf "exit %d, stderr %S" code err)
           | Some m -> ok ("vela-table-native/" ^ n) (code <> 0 && String.starts_with ~prefix:("panic: " ^ m) err) (sprintf "exit %d, stderr %S" code err))
-        want
+        want;
+      (* `bench N NS ITERS`: a fixed count reports it, its time and allocations *)
+      let report err = match String.split_on_char ' ' (List.hd (String.split_on_char '\n' err)) with
+        | [ "vela-bench:"; n; ns; al ] -> Some (int_of_string n, int_of_string ns, int_of_string al)
+        | _ -> None
+      in
+      let code, err = run "bench 0 0 7" false in
+      ok "vela-bench-native/sum"
+        (code = 0 && (match report err with Some (7, ns, 0) -> ns >= 0 | _ -> false) && String.ends_with ~suffix:"\nvela-leakcheck: 0 live\n" err)
+        (sprintf "exit %d, stderr %S" code err);
+      let code, err = run "bench 1 0 5" true in
+      ok "vela-bench-native/strings"
+        (code = 0 && (match report err with Some (5, _, al) -> al >= 10 | _ -> false) && String.ends_with ~suffix:"\nvela-leakcheck: 0 live\n" err)
+        (sprintf "exit %d, stderr %S" code err);
+      (* a time budget: the count grows until a round fills it *)
+      let code, err = run "bench 0 20000000 0" false in
+      ok "vela-bench-native/scaled" (code = 0 && match report err with Some (n, ns, _) -> n > 1000 && ns >= 20000000 | None -> false) (sprintf "exit %d, stderr %S" code err);
+      let code, err = run "bench 2 0 3" false in
+      ok "vela-bench-native/boom" (code <> 0 && String.starts_with ~prefix:"panic: index 3 is out of range" err) (sprintf "exit %d, stderr %S" code err)
   end;
   errs "vela-table-not-literal" "fn cases() -> List[Int] { [1] }\ntest \"t\" for x in cases() {}" [ "E0003" ];
   errs "vela-table-empty" "test \"t\" for x in [] {}" [ "E0003" ];
@@ -1550,6 +1586,35 @@ test "with a dir" (fs: Fs, clock: Clock) for (name, (body, _)) in [("a.txt", ("x
   (* the body is checked once per case, and each problem is reported once *)
   errs "vela-table-error-once" "test \"t\" for (a, b) in [(1, 2), (3, 4), (5, 6)] {\n    let s: Str = a\n}" [ "E0201" ];
   errs "vela-table-case-types" "test \"t\" for (a, b) in [(1, 2), (\"x\", 4)] {\n    assert(a + 1 > b)\n}" [ "E0201"; "E0201" ];
+  errs "vela-bench-duplicate" "bench \"a\" {}\nbench \"a\" {}\ntest \"a\" {}" [ "E0106" ];
+  errs "vela-bench-bad-cap" "bench \"x\" (n: Net) {}" [ "E0306" ];
+  errs "keep-arity" "fn main() {\n    keep(1, 2)\n}" [ "E0107" ];
+  (* the `vela test` command with --bench *)
+  let cli_exe =
+    let e = Filename.concat (Filename.dirname (Filename.dirname Sys.executable_name)) "bin/main.exe" in
+    if Filename.is_relative e then Filename.concat (Sys.getcwd ()) e else e
+  in
+  let table_file = Filename.concat tmpdir "table-tests.vela" in
+  Out_channel.with_open_bin table_file (fun oc -> output_string oc table_src);
+  let cli args =
+    let o = table_file ^ ".out" and e = table_file ^ ".err" in
+    let code = Sys.command (String.concat " " (List.map Filename.quote (cli_exe :: args)) ^ sprintf " >%s 2>%s" (Filename.quote o) (Filename.quote e)) in
+    (code, read_file o, read_file e)
+  in
+  if native_for "cli-test-bench" then begin
+    let code, o, _ = cli [ "test"; table_file; "--bench-time"; "3x" ] in
+    let lines = String.split_on_char '\n' o in
+    let has p = List.exists (fun l -> String.starts_with ~prefix:p l) lines in
+    ok "cli-test-bench"
+      (code = 1 && has "ok    one name \"bb\"" && has "bench sum " && has "bench strings " && has "FAIL  boom"
+      && List.exists (fun l -> String.starts_with ~prefix:"bench sum " l && Interp_util.find_sub l "           3 " 0 <> None && String.ends_with ~suffix:" 0 allocs/op" l) lines
+      && has "7 tests, 3 benches, 2 failed")
+      o;
+    ok "cli-test-bench-fail" (Interp_util.find_sub o "FAIL  boom\n      index 3 is out of range" 0 <> None) o
+  end;
+  let code, _, e = cli [ "test"; table_file; "--bench-time"; "fast" ] in
+  ok "cli-test-bench-time-bad" (code = 2 && String.starts_with ~prefix:"vela: --bench-time" e) e;
+  out "keep" "fn main(root: Root) {\n    keep(1 + 2)\n    keep(\"s\" + \"t\")\n    keep([1, 2])\n    root.stdout.print(\"kept\")\n}" "kept\n";
 
   (* ---------- language server ---------- *)
   let module J = Json in

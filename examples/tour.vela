@@ -2,6 +2,7 @@
 // Run: vela run examples/tour.vela
 // Native: vela run examples/tour.vela --native
 // Tests: vela test examples/tour.vela
+// Benchmarks: vela test examples/tour.vela --bench
 
 interface Shape {
     fn area(self) -> Float
@@ -119,4 +120,13 @@ test "ranges" {
 // a table test: one isolated run per case, named by the case, as in `square sides (3.0, 9.0)`
 test "square sides" for (side, want) in [(1.0, 1.0), (2.0, 4.0), (3.0, 9.0)] {
     assert_eq(Square { side: side }.area(), want)
+}
+
+// a benchmark: the body is one operation; its value is kept, so it is not optimized away
+bench "build a list" {
+    let mut xs: List[Int] = []
+    for i in 0..<100 {
+        xs.push(i * i)
+    }
+    xs.len()
 }

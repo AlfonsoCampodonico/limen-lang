@@ -389,7 +389,8 @@ let rename_item mods (m : modinfo) own (it : item) : item =
 (* A table test, `test "add" for (a, b, want) in [(1, 2, 3), (2, 2, 4)] { body }`,
    becomes one test per case, named by the case's text ("add (1, 2, 3)"),
    whose body starts with `let (a, b, want) = (1, 2, 3)`. Each copy is renamed
-   on its own afterwards, which gives every copy fresh expression nodes. *)
+   on its own afterwards, which gives every copy fresh expression nodes. A
+   bench's value is passed to `keep`. *)
 let expand_table (it : item) : item list =
   match it with
   | IFn ({ fn_table = Some (p, { edesc = EList cases; _ }); fn_test = Some base; _ } as d) ->
@@ -405,6 +406,10 @@ let expand_table (it : item) : item list =
             fn_table = Some (p, c); (* the one case this copy runs, for the checker's notes *)
             fn_body = { d.fn_body with stmts = unpack :: d.fn_body.stmts } })
       cases
+  | IFn ({ fn_bench = true; fn_body = { tail = Some e; _ }; _ } as d) ->
+    (* a benchmark's value is kept, so the work that made it is not optimized away *)
+    let keep = mk (ECall (mk (EVar "keep") e.espan, [ e ])) e.espan in
+    [ IFn { d with fn_body = { d.fn_body with tail = Some keep } } ]
   | _ -> [ it ]
 
 (* ---------- entry point ---------- *)
