@@ -1,6 +1,9 @@
 (test
  (name test_writ)
- (libraries writ unix))
+ (libraries writ unix)
+ (deps
+  (glob_files %{project_root}/examples/*.wr)
+  (glob_files %{project_root}/bench/*.wr)))
 
 ; `writ lsp` end to end over stdio.
 (rule

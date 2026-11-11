@@ -22,6 +22,31 @@ let dump name src parsed =
     (try Unix.mkdir sub 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
     Out_channel.with_open_bin (Filename.concat sub (name ^ ".wr")) (fun oc -> output_string oc src)
 
+(* writ fmt on every program that parses: the result must parse to the same
+   tree (ignoring positions), formatting again must not change it, and no
+   comment may be lost. Checked once per program. *)
+let fmt_checked : (string, unit) Hashtbl.t = Hashtbl.create 64
+let fmt_failures = ref []
+
+let check_fmt name src items =
+  if not (Hashtbl.mem fmt_checked name) then begin
+    Hashtbl.replace fmt_checked name ();
+    let file = name ^ ".wr" in
+    let comments_of s = (try ignore (Lexer.lex "c.wr" s) with Diag.Fatal _ -> ()); List.sort compare (List.map (fun (_, _, t) -> t) !Lexer.comments) in
+    let before = comments_of src in
+    match Fmt.format ~file:("fmt-" ^ file) src with
+    | exception Diag.Fatal d -> fmt_failures := (name, "formatting failed: " ^ d.message) :: !fmt_failures
+    | out -> (
+      match Parser.parse_program ("fmt-out-" ^ file) out with
+      | exception Diag.Fatal d -> fmt_failures := (name, "output does not parse: " ^ d.message ^ "\n" ^ out) :: !fmt_failures
+      | items2 ->
+        if Astdump.items items <> Astdump.items items2 then
+          fmt_failures := (name, "tree changed:\n" ^ out) :: !fmt_failures
+        else if Fmt.format ~file:("fmt2-" ^ file) out <> out then
+          fmt_failures := (name, "not idempotent:\n" ^ out ^ "---\n" ^ Fmt.format ~file:("fmt3-" ^ file) out) :: !fmt_failures
+        else if comments_of out <> before then fmt_failures := (name, "comments changed:\n" ^ out) :: !fmt_failures)
+  end
+
 let compile name src =
   let file = name ^ ".wr" in
   Source.add file src;
@@ -29,6 +54,8 @@ let compile name src =
   | exception Diag.Fatal d -> dump name src false; ([], [ d ], [])
   | items ->
     dump name src true;
+    check_fmt name src items;
+    Source.add file src;
     let ds, infos = Check.check_program items in
     (items, ds, infos)
 
@@ -841,6 +868,25 @@ fn main(root: Root) {
     (let j = J.Obj [ ("a", J.List [ J.Int 1; J.Float 2.5; J.String "q\"\n\u{e9}"; J.Bool true; J.Null ]) ] in
      J.parse (J.to_string j) = j)
     "json";
+
+  (* the formatter on the examples and benchmarks too (with their comments) *)
+  List.iter
+    (fun dir ->
+      if Sys.file_exists dir then
+        Array.iter
+          (fun f ->
+            if Filename.check_suffix f ".wr" then begin
+              let path = Filename.concat dir f in
+              let src = In_channel.with_open_bin path In_channel.input_all in
+              match Parser.parse_program path src with
+              | items -> check_fmt ("file-" ^ f) src items
+              | exception Diag.Fatal _ -> ()
+            end)
+          (Sys.readdir dir))
+    [ "../examples"; "../bench" ];
+  ok "fmt-every-program" (!fmt_failures = [])
+    (String.concat "\n\n" (List.map (fun (n, m) -> n ^ ": " ^ m) (List.rev !fmt_failures)));
+  ok "fmt-checked-count" (Hashtbl.length fmt_checked > 90) (string_of_int (Hashtbl.length fmt_checked));
 
   Printf.printf "%d/%d passed\n" (!total - !failed) !total;
   if !failed > 0 then exit 1

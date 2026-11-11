@@ -21,7 +21,9 @@ fn row_count(y: Int, size: Int, iters: Int) -> Int {
             zr = zr2 - zi2 + cr
             i = i + 1
         }
-        if inside { count = count + 1 }
+        if inside {
+            count = count + 1
+        }
         x = x + 1
     }
     count

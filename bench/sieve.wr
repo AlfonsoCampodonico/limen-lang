@@ -23,7 +23,9 @@ fn main(root: Root) {
     }
     let mut count = 0
     for b in is_prime {
-        if b { count = count + 1 }
+        if b {
+            count = count + 1
+        }
     }
     root.stdout.print("{count}")
 }

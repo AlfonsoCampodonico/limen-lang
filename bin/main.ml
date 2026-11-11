@@ -9,6 +9,7 @@ usage:
   writ check FILE [--json]
   writ caps FILE [--json]
   writ explain CODE
+  writ fmt FILE... [--write | --check]
   writ lsp                (language server on stdin/stdout)
 
 Stdout and Clock are always granted. Net and Fs exist only when granted.
@@ -63,6 +64,24 @@ let rec split_grants = function
     let gs, others = split_grants rest in
     (gs, x :: others)
   | [] -> ([], [])
+
+let cmd_fmt files mode =
+  let changed = ref [] in
+  List.iter
+    (fun file ->
+      let src = try In_channel.with_open_bin file In_channel.input_all with Sys_error m -> prerr_endline ("writ: " ^ m); exit 2 in
+      match Fmt.format ~file src with
+      | exception Diag.Fatal d -> prerr_string (Diag.render d); exit 1
+      | out -> (
+        match mode with
+        | `Print -> print_string out
+        | `Write -> if out <> src then Out_channel.with_open_bin file (fun oc -> output_string oc out)
+        | `Check -> if out <> src then changed := file :: !changed))
+    files;
+  if mode = `Check && !changed <> [] then begin
+    List.iter (fun f -> prerr_endline ("not formatted: " ^ f)) (List.rev !changed);
+    exit 1
+  end
 
 let cmd_check file json =
   let _, diags, _ = load file in
@@ -158,6 +177,11 @@ let () =
   | [ "caps"; file ] -> cmd_caps file false
   | [ "caps"; file; "--json" ] | [ "caps"; "--json"; file ] -> cmd_caps file true
   | [ "lsp" ] -> Lsp.serve ()
+  | "fmt" :: rest -> (
+    let mode = if List.mem "--write" rest then `Write else if List.mem "--check" rest then `Check else `Print in
+    match List.filter (fun a -> a <> "--write" && a <> "--check") rest with
+    | [] -> die_usage "fmt needs at least one FILE"
+    | files -> cmd_fmt files mode)
   | [ "explain"; code ] -> (
     match Diag.explain (String.uppercase_ascii code) with
     | Some t -> print_endline (String.uppercase_ascii code ^ ": " ^ t)

@@ -15,10 +15,14 @@ fn echo(c: Conn) -> Int {
                     more = false
                 } else {
                     total = total + s.len()
-                    if c.write(s).is_err() { more = false }
+                    if c.write(s).is_err() {
+                        more = false
+                    }
                 }
             },
-            Err(_) => { more = false },
+            Err(_) => {
+                more = false
+            },
         }
     }
     c.close()

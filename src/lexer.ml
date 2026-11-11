@@ -63,7 +63,12 @@ and skip_braces src i on_eof =
   in
   go i 0
 
+(* Comments seen by the last top-level lex, as (start, end, text); the
+   formatter puts them back. *)
+let comments : (int * int * string) list ref = ref []
+
 let lex ?(base = 0) file (src : string) : token array =
+  if base = 0 then comments := [];
   let n = String.length src in
   let toks = ref [] in
   let i = ref 0 in
@@ -77,8 +82,11 @@ let lex ?(base = 0) file (src : string) : token array =
     let c = src.[!i] in
     if c = '\n' then (nl := true; incr i)
     else if c = ' ' || c = '\t' || c = '\r' then incr i
-    else if c = '/' && !i + 1 < n && src.[!i + 1] = '/' then
-      while !i < n && src.[!i] <> '\n' do incr i done
+    else if c = '/' && !i + 1 < n && src.[!i + 1] = '/' then begin
+      let lo = !i in
+      while !i < n && src.[!i] <> '\n' do incr i done;
+      if base = 0 then comments := (lo, !i, String.trim (String.sub src lo (!i - lo))) :: !comments
+    end
     else if is_digit c then begin
       let lo = !i in
       while !i < n && (is_digit src.[!i] || src.[!i] = '_') do incr i done;
