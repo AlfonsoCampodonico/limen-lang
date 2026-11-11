@@ -1,0 +1,19 @@
+fn add(a: Int, b: Int) -> Int {
+    a + b
+}
+
+test "add" for (a, b, want) in [(1, 2, 3), (2, 2, 4)] {
+    assert_eq(add(a, b), want)
+}
+
+test "names" for w in ["a", "bb"] {
+    assert(w.len() > 0)
+}
+
+// cases on their own lines, a trailing comma, and capabilities
+test "files" (fs: Fs, clock: Clock) for (name, (body, _)) in [
+    ("a.txt", ("one", 1)), // first
+    ("b.txt", ("two", 2)),
+] {
+    assert(fs.write(name, body).is_ok())
+}

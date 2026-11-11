@@ -591,7 +591,9 @@ let handle st (msg : J.t) : J.t list =
               (function
                 | IFn d ->
                   let name = match d.fn_test with Some n -> "test \"" ^ n ^ "\"" | None -> d.fn_name in
-                  sym name 12 d.fn_span (Span.merge d.fn_span d.fn_body.bspan)
+                  (* a table test's case selects its own text *)
+                  let sel = match d.fn_table with Some (_, c) -> c.espan | None -> d.fn_span in
+                  sym name 12 sel (Span.merge d.fn_span d.fn_body.bspan)
                 | IStruct s -> sym s.st_name 23 s.st_span s.st_span
                 | IEnum e -> sym e.en_name 10 e.en_span e.en_span
                 | IIface i -> sym i.if_name 11 i.if_span i.if_span)

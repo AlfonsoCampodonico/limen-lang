@@ -115,3 +115,8 @@ test "ranges" {
     }
     assert(n == 6)
 }
+
+// a table test: one isolated run per case, named by the case, as in `square sides (3.0, 9.0)`
+test "square sides" for (side, want) in [(1.0, 1.0), (2.0, 4.0), (3.0, 9.0)] {
+    assert_eq(Square { side: side }.area(), want)
+}

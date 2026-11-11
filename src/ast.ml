@@ -87,6 +87,9 @@ type fn_decl = {
   fn_ret : ty_expr option;
   fn_body : block;
   fn_test : string option; (* Some name: a `test "name" { ... }` block *)
+  fn_table : (pat * expr) option;
+      (* a table test, `for PAT in [case, ...]` (the expression is that list): one isolated run per
+         case. Expanded when modules load into one test per case, each keeping its own case here. *)
   fn_pub : bool;
   fn_bounds : (string * (string * span) list) list; (* type parameter -> interfaces it must satisfy *)
   fn_foreign : foreign option; (* declared in a `foreign "lib" { ... }` block; no body *)

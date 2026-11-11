@@ -861,6 +861,22 @@ test "saves the config" (fs: Fs) {
 - `vela test FILE` runs every test, each isolated, and prints `ok` or `FAIL` with the panic message and location; it exits with status 1 if any test fails. `--native` runs them as native code.
 - Test names must be unique (E0106). Tests are type-checked by `vela check` and ignored by `vela run` and `vela build`.
 
+### Table tests
+
+One test body can run over a list of cases, written out in place after `for`:
+
+```
+test "add" for (a, b, want) in [(1, 2, 3), (2, 2, 4), (-1, 1, 0)] {
+    assert_eq(add(a, b), want)
+}
+```
+
+- Each case is a test of its own: it runs isolated, and it is named by the test's name and the case's text, as in `add (2, 2, 4)`. A failure names the case.
+- The pattern after `for` unpacks each case like `let` does: a name, `_`, or a tuple of those, nested as needed (`for (name, (input, want)) in [...]`).
+- The cases must be a list literal with at least one case (E0003), so every case is known, and named, before anything runs. To share cases between tests, write the list twice or loop inside one test.
+- Capabilities go before `for`: `test "save" (fs: Fs) for name in ["a.txt", "b.txt"] { ... }`. Each case gets its own fresh directory.
+- The body is type-checked for every case. A problem shows once; when only some cases have it, a note names the case. Two cases with the same text are E0106.
+
 ## 13. How values print
 
 String interpolation and `to_str()` use these rules. At the top level a `Str` prints raw; inside a container it prints quoted, with `"`, `\`, newline, tab, `\r` and `\b` escaped and other non-printable bytes as `\ddd`.
@@ -955,7 +971,7 @@ EBNF. `NL` is a newline, as described in section 2. A character-level version fo
 program    = { "use" IDENT | [ "pub" ] ( fn | struct | enum | interface ) | test | foreign } ;
 foreign    = "foreign" STRING "{" { [ "pub" ] "fn" IDENT "(" [ params ] ")" [ "->" type ] ( NL | ";" ) } "}" ;
 interface  = "interface" IDENT "{" { "fn" IDENT "(" "self" { "," param } ")" [ "->" type ] ( "," | NL ) } "}" ;
-test       = "test" STRING block ;
+test       = "test" STRING [ "(" [ params ] ")" ] [ "for" ( IDENT | tuplepat ) "in" "[" expr { "," expr } [ "," ] "]" ] block ;
 fn         = "fn" IDENT [ bgenerics ] "(" [ params ] ")" [ "->" type ] block ;
 bgenerics  = "[" IDENT [ ":" bound { "+" bound } ] { "," IDENT [ ":" bound { "+" bound } ] } "]" ;
 bound      = IDENT [ "." IDENT ] ;                (* an interface *)

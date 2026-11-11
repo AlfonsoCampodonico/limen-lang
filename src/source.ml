@@ -21,3 +21,21 @@ let line_text file ln =
     (match List.nth_opt (String.split_on_char '\n' s) (ln - 1) with
      | Some l -> l
      | None -> "")
+
+(* The text of [sp] on one line: runs of spaces and newlines become one space. *)
+let one_line (sp : Span.t) =
+  match text sp.file with
+  | Some src when sp.lo >= 0 && sp.hi <= String.length src && sp.lo < sp.hi ->
+    let b = Buffer.create (sp.hi - sp.lo) in
+    let space = ref false in
+    String.iter
+      (fun ch ->
+        match ch with
+        | ' ' | '\n' | '\t' | '\r' -> space := true
+        | _ ->
+          if !space && Buffer.length b > 0 then Buffer.add_char b ' ';
+          space := false;
+          Buffer.add_char b ch)
+      (String.sub src sp.lo (sp.hi - sp.lo));
+    Buffer.contents b
+  | _ -> "?"

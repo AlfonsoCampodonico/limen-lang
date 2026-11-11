@@ -1581,6 +1581,8 @@ let check_self ctx d ps =
         ~notes:[ "write a plain function that takes the value instead, and rename the parameter" ])
   | _ -> ()
 
+let case_note = "in the table case "
+
 let check_program (user_items : item list) : Diag.t list * fn_info list =
   let ctx =
     { structs = Hashtbl.create 16; enums = Hashtbl.create 16; sfields = Hashtbl.create 16;
@@ -1769,11 +1771,39 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
   (* 4. main *)
   List.iter (fun (d, s) -> if d.fn_name = "main" then check_main ctx d s) sigs;
   (* 5. bodies *)
-  List.iter (fun (d, s) -> if d.fn_foreign = None then check_fn ctx d s) sigs;
+  List.iter
+    (fun ((d : fn_decl), s) ->
+      if d.fn_foreign = None then begin
+        let before = List.length ctx.diags in
+        check_fn ctx d s;
+        (* a table test's copy: say which case a problem comes from *)
+        match d.fn_table with
+        | Some (_, c) ->
+          let fresh = List.length ctx.diags - before in
+          let note = case_note ^ Source.one_line c.espan in
+          ctx.diags <- List.mapi (fun i (x : Diag.t) -> if i < fresh then { x with notes = x.notes @ [ note ] } else x) ctx.diags
+        | _ -> ()
+      end)
+    sigs;
   let diags =
     List.sort
       (fun (a : Diag.t) (b : Diag.t) -> compare (a.span.file, a.span.lo) (b.span.file, b.span.lo))
       ctx.diags
+  in
+  (* a table test's body is checked once per case: say each problem once,
+     naming the case only when just one has it *)
+  let diags =
+    List.rev
+      (List.fold_left
+         (fun acc (d : Diag.t) ->
+           let same (e : Diag.t) = e.span = d.span && e.code = d.code && e.message = d.message in
+           if List.exists same acc then
+             List.map
+               (fun (e : Diag.t) ->
+                 if same e then { e with notes = List.filter (fun n -> not (String.starts_with ~prefix:case_note n)) e.notes } else e)
+               acc
+           else d :: acc)
+         [] diags)
   in
   let infos =
     List.map

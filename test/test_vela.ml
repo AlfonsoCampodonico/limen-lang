@@ -1492,6 +1492,65 @@ test "fails with a dir" (fs: Fs) {
   end;
   errs "vela-test-bad-cap" "test \"x\" (n: Net) {}\ntest \"y\" (a: Fs, b: Fs) {}\ntest \"z\" (c: Clock, d: Int) {}" [ "E0306"; "E0306"; "E0306" ];
 
+  (* table tests: one isolated run per case, named by the case's text *)
+  let table_src = {|fn add(a: Int, b: Int) -> Int {
+    a + b
+}
+
+test "add" for (a, b, want) in [(1, 2, 3), (2, 2, 4), (2, 2,
+        5)] {
+    assert_eq(add(a, b), want)
+}
+
+test "one name" for w in ["a", "bb"] {
+    assert(w.len() > 0)
+}
+
+test "with a dir" (fs: Fs, clock: Clock) for (name, (body, _)) in [("a.txt", ("x", 1)), ("b.txt", ("y", 2))] {
+    assert_eq(fs.list(""), Ok([]))
+    assert(fs.write(name, body).is_ok())
+    assert(clock.now_ms() > 0)
+}
+|} in
+  let items, ds, _ = compile "vela-table-tests" table_src in
+  ok "vela-table-checks" (ds = []) (String.concat "," (codes ds));
+  let want =
+    [ ("add (1, 2, 3)", None); ("add (2, 2, 4)", None); ("add (2, 2, 5)", Some "assertion failed: 4 != 5"); ("one name \"a\"", None);
+      ("one name \"bb\"", None); ("with a dir (\"a.txt\", (\"x\", 1))", None); ("with a dir (\"b.txt\", (\"y\", 2))", None) ]
+  in
+  let got = List.map (fun (n, r) -> (n, match r with Ok () -> None | Error (m, _) -> Some m)) (Interp.run_tests ~out:ignore items) in
+  ok "vela-table-interp" (got = want) (String.concat "; " (List.map (fun (n, m) -> n ^ "=" ^ Option.value ~default:"ok" m) got));
+  if native_for "vela-table" then begin
+    let exe = Filename.concat tmpdir "vela-table-tests" in
+    match Native.build ~flags:sanitize ~tests:true items exe with
+    | Error m -> ok "vela-table-native" false m
+    | Ok () ->
+      let run args fs =
+        let dir = if fs then Some (Caps.test_dir ()) else None in
+        let e = exe ^ ".err" in
+        let grant = match dir with Some d -> sprintf " --grant fs=%s" (Filename.quote d) | None -> "" in
+        let code =
+          Sys.command (sprintf "ASAN_OPTIONS=detect_leaks=0 VELA_LEAKCHECK=1 %s %s%s >/dev/null 2>%s" (Filename.quote exe) args grant (Filename.quote e))
+        in
+        Option.iter Caps.remove_tree dir;
+        (code, read_file e)
+      in
+      List.iteri
+        (fun i (n, w) ->
+          let code, err = run (string_of_int i) (i >= 5) in
+          match w with
+          | None -> ok ("vela-table-native/" ^ n) (code = 0 && err = "vela-leakcheck: 0 live\n") (sprintf "exit %d, stderr %S" code err)
+          | Some m -> ok ("vela-table-native/" ^ n) (code <> 0 && String.starts_with ~prefix:("panic: " ^ m) err) (sprintf "exit %d, stderr %S" code err))
+        want
+  end;
+  errs "vela-table-not-literal" "fn cases() -> List[Int] { [1] }\ntest \"t\" for x in cases() {}" [ "E0003" ];
+  errs "vela-table-empty" "test \"t\" for x in [] {}" [ "E0003" ];
+  errs "vela-table-refutable" "test \"t\" for Some(x) in [Some(1)] {}" [ "E0003" ];
+  errs "vela-table-duplicate-case" "test \"t\" for x in [1, 2, 1] {\n    assert(x > 0)\n}" [ "E0106" ];
+  (* the body is checked once per case, and each problem is reported once *)
+  errs "vela-table-error-once" "test \"t\" for (a, b) in [(1, 2), (3, 4), (5, 6)] {\n    let s: Str = a\n}" [ "E0201" ];
+  errs "vela-table-case-types" "test \"t\" for (a, b) in [(1, 2), (\"x\", 4)] {\n    assert(a + 1 > b)\n}" [ "E0201"; "E0201" ];
+
   (* ---------- language server ---------- *)
   let module J = Json in
   let st = Lsp.create () in

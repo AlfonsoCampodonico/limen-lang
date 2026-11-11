@@ -492,6 +492,12 @@ let item c (it : item) =
     new_line c 0;
     add c ("test \"" ^ escape name ^ "\" ");
     if d.fn_params <> [] then add c ("(" ^ String.concat ", " (List.map (fun p -> p.prm_name ^ ": " ^ ty p.prm_ty) d.fn_params) ^ ") ");
+    (match d.fn_table with
+     | Some (p, cases) ->
+       add c ("for " ^ pat p ^ " in ");
+       head c 0 cases;
+       add c " "
+     | None -> ());
     block c 0 d.fn_body;
     trailing c d.fn_body.bspan.hi
   | IFn d ->
