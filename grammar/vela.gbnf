@@ -25,10 +25,12 @@ stsep   ::= sp (";" | "\n") ws
 # ---------- items ----------
 top      ::= use | "pub" sp1 (fn | struct | enum | interface) | item | foreign
 use      ::= "use" sp1 ident
-item     ::= fn | struct | enum | test | interface
+item     ::= fn | struct | enum | test | bench | interface
 interface ::= "interface" sp1 ident sp "{" ws (imethod (isep imethod)* (ws ",")?)? ws "}"
 imethod  ::= "fn" sp1 ident sp "(" ws "self" (isep param)* (ws ",")? ws ")" (sp "->" sp type)?
-test     ::= "test" sp1 plainstr sp ("(" ws (param (isep param)* (ws ",")?)? ws ")" sp)? block
+test     ::= "test" sp1 plainstr sp tparams? ("for" sp1 (ident sp1 | upat sp) "in" sp1 "[" ws args ws "]" sp)? block
+bench    ::= "bench" sp1 plainstr sp tparams? block
+tparams  ::= "(" ws (param (isep param)* (ws ",")?)? ws ")" sp
 fn       ::= "fn" sp1 ident sp bgenerics? sp "(" ws (param (isep param)* (ws ",")?)? ws ")" (sp "->" sp type)? sp block
 # C functions from a library: signatures only, one per line
 foreign  ::= "foreign" sp1 plainstr sp "{" ws (ffn (stsep ffn)* stsep?)? ws "}"

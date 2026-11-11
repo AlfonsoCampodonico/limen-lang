@@ -568,23 +568,45 @@ let parse_param st =
 let parse_item st =
   let t = peek st in
   match t.tok with
-  | IDENT "test" when (match st.toks.(min (st.pos + 1) (Array.length st.toks - 1)).tok with STR _ -> true | _ -> false) ->
+  | IDENT (("test" | "bench") as kind) when (match st.toks.(min (st.pos + 1) (Array.length st.toks - 1)).tok with STR _ -> true | _ -> false) ->
     ignore (advance st);
     let s = advance st in
     let name =
       match s.tok with
       | STR [] -> ""
       | STR [ Lit n ] -> n
-      | _ -> raise (Diag.Fatal (Diag.make "E0003" s.span "a test name must be a plain string, without interpolation"))
+      | _ -> raise (Diag.Fatal (Diag.make "E0003" s.span (Printf.sprintf "a %s name must be a plain string, without interpolation" kind)))
     in
     (* optional capabilities the runner hands the test: `(fs: Fs, clock: Clock)` *)
     let params = if accept_sym st "(" then comma_list st ")" parse_param else [] in
+    (* a table test: `for (a, b, want) in [(1, 2, 3), (2, 2, 4)]`, each case run on its own *)
+    let table =
+      if kind = "test" && is_kw st "for" then begin
+        let ft = advance st in
+        let p = parse_pat st in
+        if not (irrefutable_tuple p) then
+          raise (Diag.Fatal (Diag.make "E0003" p.pspan "a table test names each case's parts, as in `for (a, b, want) in [(1, 2, 3)]`"));
+        ignore (expect_kw st "in");
+        let e = parse_expr_ns st in
+        match e.edesc with
+        | EList (_ :: _) -> Some (p, e)
+        | EList [] -> raise (Diag.Fatal (Diag.make "E0003" (merge ft.span e.espan) "a table test needs at least one case"))
+        | _ ->
+          raise
+            (Diag.Fatal
+               (Diag.make "E0003" e.espan
+                  ~notes:[ "each case runs on its own and is named by its text, so the cases must be written out" ]
+                  "a table test lists its cases in place, as in `for (a, want) in [(1, 2), (2, 4)]`"))
+      end
+      else None
+    in
     let body = parse_block st in
     incr test_count;
     (* the generated name cannot be written in source, so tests cannot be called *)
     IFn
-      { fn_name = Printf.sprintf "test#%d" !test_count; fn_span = s.span; fn_gen = []; fn_params = params; fn_ret = None;
-        fn_body = body; fn_test = Some name; fn_pub = false; fn_bounds = []; fn_foreign = None }
+      { fn_name = Printf.sprintf "%s#%d" kind !test_count; fn_span = s.span; fn_gen = []; fn_params = params; fn_ret = None;
+        fn_body = body; fn_test = Some name; fn_bench = kind = "bench"; fn_table = table; fn_pub = false; fn_bounds = [];
+        fn_foreign = None }
   | KW "fn" ->
     ignore (advance st);
     let name, nsp = expect_ident st in
@@ -595,7 +617,7 @@ let parse_item st =
     let params = comma_list st ")" parse_param in
     let ret = if accept_sym st "->" then Some (parse_type st) else None in
     let body = parse_block st in
-    IFn { fn_name = name; fn_span = nsp; fn_gen = gen; fn_params = params; fn_ret = ret; fn_body = body; fn_test = None; fn_pub = false; fn_bounds = bounds; fn_foreign = None }
+    IFn { fn_name = name; fn_span = nsp; fn_gen = gen; fn_params = params; fn_ret = ret; fn_body = body; fn_test = None; fn_bench = false; fn_table = None; fn_pub = false; fn_bounds = bounds; fn_foreign = None }
   | KW "struct" ->
     ignore (advance st);
     let name, nsp = expect_ident st in
@@ -680,7 +702,7 @@ let parse_foreign st =
     let body = { stmts = []; tail = None; bspan = { nsp with hi } } in
     items :=
       IFn
-        { fn_name = name; fn_span = nsp; fn_gen = []; fn_params = params; fn_ret = ret; fn_body = body; fn_test = None;
+        { fn_name = name; fn_span = nsp; fn_gen = []; fn_params = params; fn_ret = ret; fn_body = body; fn_test = None; fn_bench = false; fn_table = None;
           fn_pub = pub; fn_bounds = []; fn_foreign = Some { flib = lib; fsym = name; ftrusted = false } }
       :: !items;
     (* one declaration per line (or separated by `;`) *)

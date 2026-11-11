@@ -216,7 +216,7 @@ let visible_names ctx f =
   List.concat_map (fun s -> List.of_seq (Hashtbl.to_seq_keys s.vars)) f.scopes
   @ List.of_seq (Hashtbl.to_seq_keys ctx.fns)
   @ List.of_seq (Hashtbl.to_seq_keys ctx.owners)
-  @ [ "panic"; "channel"; "assert"; "assert_eq"; "map"; "catch"; "bytes" ]
+  @ [ "panic"; "channel"; "assert"; "assert_eq"; "map"; "catch"; "bytes"; "keep" ]
 
 (* Generic functions' bounds: function -> type parameter -> interfaces. *)
 let fn_bounds : (string, (string * string list) list) Hashtbl.t = Hashtbl.create 8
@@ -673,6 +673,12 @@ and check_call ctx f callee args sp =
        | TFn _ | TCap _ | TChan _ | TDyn _ -> err ctx "E0201" sp (sprintf "values of type `%s` cannot be compared" (show t))
        | _ -> ())
      | _ -> err ctx "E0107" sp "`assert_eq` takes 2 arguments"; check_args ctx f args);
+    TUnit
+  | EVar "keep" when lookup f "keep" = None && not (Hashtbl.mem ctx.fns "keep") ->
+    (* `keep(x)`: x counts as used, so a benchmark's work is not optimized away *)
+    (match args with
+     | [ a ] -> ignore (check_expr ctx f a)
+     | _ -> err ctx "E0107" sp "`keep` takes 1 argument"; check_args ctx f args);
     TUnit
   | EVar "channel" when lookup f "channel" = None && not (Hashtbl.mem ctx.fns "channel") ->
     (match args with
@@ -1641,6 +1647,8 @@ let check_self ctx d ps =
         ~notes:[ "write a plain function that takes the value instead, and rename the parameter" ])
   | _ -> ()
 
+let case_note = "in the table case "
+
 let check_program (user_items : item list) : Diag.t list * fn_info list =
   let ctx =
     { structs = Hashtbl.create 16; enums = Hashtbl.create 16; sfields = Hashtbl.create 16;
@@ -1812,8 +1820,9 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
     (fun (d, _) ->
       match d.fn_test with
       | Some n ->
-        if Hashtbl.mem seen_tests n then err ctx "E0106" d.fn_span (sprintf "test \"%s\" is defined more than once" n);
-        Hashtbl.replace seen_tests n ()
+        let kind = if d.fn_bench then "bench" else "test" in
+        if Hashtbl.mem seen_tests (kind, n) then err ctx "E0106" d.fn_span (sprintf "%s \"%s\" is defined more than once" kind n);
+        Hashtbl.replace seen_tests (kind, n) ()
       | None -> ())
     sigs;
   (* E0306: a test's parameters are capabilities the runner provides *)
@@ -1837,14 +1846,25 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
   (* 4. main *)
   List.iter (fun (d, s) -> if d.fn_name = "main" then check_main ctx d s) sigs;
   (* 5. bodies *)
+  (* a table test's copy: say which case a problem comes from *)
+  let check_one (d : fn_decl) s =
+    let before = List.length ctx.diags in
+    check_fn ctx d s;
+    match d.fn_table with
+    | Some (_, c) ->
+      let fresh = List.length ctx.diags - before in
+      let note = case_note ^ Source.one_line c.espan in
+      ctx.diags <- List.mapi (fun i (x : Diag.t) -> if i < fresh then { x with notes = x.notes @ [ note ] } else x) ctx.diags
+    | _ -> ()
+  in
   let builtin (d : fn_decl) = d.fn_span.file = Prelude.methods_file in
-  List.iter (fun (d, s) -> if d.fn_foreign = None && not (builtin d) then check_fn ctx d s) sigs;
+  List.iter (fun (d, s) -> if d.fn_foreign = None && not (builtin d) then check_one d s) sigs;
   (* the built-in methods written in Vela that were called, and those they call *)
   let checked = Hashtbl.create 16 in
   let rec more () =
     let todo = List.filter (fun ((d : fn_decl), _) -> builtin d && Hashtbl.mem used_methods d.fn_name && not (Hashtbl.mem checked d.fn_name)) sigs in
     if todo <> [] then begin
-      List.iter (fun ((d : fn_decl), s) -> Hashtbl.replace checked d.fn_name (); check_fn ctx d s) todo;
+      List.iter (fun ((d : fn_decl), s) -> Hashtbl.replace checked d.fn_name (); check_one d s) todo;
       more ()
     end
   in
@@ -1853,6 +1873,21 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
     List.sort
       (fun (a : Diag.t) (b : Diag.t) -> compare (a.span.file, a.span.lo) (b.span.file, b.span.lo))
       ctx.diags
+  in
+  (* a table test's body is checked once per case: say each problem once,
+     naming the case only when just one has it *)
+  let diags =
+    List.rev
+      (List.fold_left
+         (fun acc (d : Diag.t) ->
+           let same (e : Diag.t) = e.span = d.span && e.code = d.code && e.message = d.message in
+           if List.exists same acc then
+             List.map
+               (fun (e : Diag.t) ->
+                 if same e then { e with notes = List.filter (fun n -> not (String.starts_with ~prefix:case_note n)) e.notes } else e)
+               acc
+           else d :: acc)
+         [] diags)
   in
   let infos =
     List.map

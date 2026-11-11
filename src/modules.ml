@@ -387,6 +387,32 @@ let rename_item mods (m : modinfo) own (it : item) : item =
     IEnum
       { e with en_name = qual m e.en_name; en_variants = List.map (fun (v, sp, ts) -> (v, sp, List.map (ty env) ts)) e.en_variants }
 
+(* A table test, `test "add" for (a, b, want) in [(1, 2, 3), (2, 2, 4)] { body }`,
+   becomes one test per case, named by the case's text ("add (1, 2, 3)"),
+   whose body starts with `let (a, b, want) = (1, 2, 3)`. Each copy is renamed
+   on its own afterwards, which gives every copy fresh expression nodes. A
+   bench's value is passed to `keep`. *)
+let expand_table (it : item) : item list =
+  match it with
+  | IFn ({ fn_table = Some (p, { edesc = EList cases; _ }); fn_test = Some base; _ } as d) ->
+    List.mapi
+      (fun i (c : expr) ->
+        let text = Source.one_line c.espan in
+        let name = if base = "" then text else base ^ " " ^ text in
+        let unpack = { sdesc = SLetPat (p, c); sspan = c.espan } in
+        IFn
+          { d with
+            fn_name = Printf.sprintf "%s/%d" d.fn_name i;
+            fn_test = Some name;
+            fn_table = Some (p, c); (* the one case this copy runs, for the checker's notes *)
+            fn_body = { d.fn_body with stmts = unpack :: d.fn_body.stmts } })
+      cases
+  | IFn ({ fn_bench = true; fn_body = { tail = Some e; _ }; _ } as d) ->
+    (* a benchmark's value is kept, so the work that made it is not optimized away *)
+    let keep = mk (ECall (mk (EVar "keep") e.espan, [ e ])) e.espan in
+    [ IFn { d with fn_body = { d.fn_body with tail = Some keep } } ]
+  | _ -> [ it ]
+
 (* ---------- entry point ---------- *)
 
 (* Load the main file at [path] (whose text is [src]) and every module it uses.
@@ -434,7 +460,7 @@ let load ?(deps = []) path src : item list * Diag.t list =
             (fun m ->
               let own = Hashtbl.create 16 in
               List.iter (fun i -> if not (is_method i) then Hashtbl.replace own (item_name i) i) m.mitems;
-              List.map (rename_item mods m own) m.mitems)
+              List.map (rename_item mods m own) (List.concat_map expand_table m.mitems))
             (List.rev all)
         in
         if !errors <> [] then ([], List.rev !errors) else (items, [])

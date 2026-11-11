@@ -82,8 +82,10 @@ and stmt s =
   | SDefer b -> "defer" ^ block b
 
 let item = function
-  | IFn { fn_test = Some n; fn_body; fn_params; _ } ->
-    "test " ^ String.escaped n ^ "(" ^ String.concat "," (List.map (fun p -> p.prm_name ^ ":" ^ ty p.prm_ty) fn_params) ^ ")" ^ block fn_body
+  | IFn { fn_test = Some n; fn_body; fn_params; fn_bench; fn_table; _ } ->
+    (if fn_bench then "bench " else "test ") ^ String.escaped n ^ "("
+    ^ String.concat "," (List.map (fun p -> p.prm_name ^ ":" ^ ty p.prm_ty) fn_params)
+    ^ ")" ^ (match fn_table with Some (p, e) -> "for " ^ pat p ^ " in " ^ expr e | None -> "") ^ block fn_body
   | IIface i ->
     "interface " ^ i.if_name ^ "{"
     ^ String.concat ";"

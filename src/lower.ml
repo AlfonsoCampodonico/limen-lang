@@ -379,6 +379,9 @@ and lower_call f e callee args ty =
     let c = lower f (List.hd args) in
     let inner = match tyof f (List.hd args) with TFn (_, r) -> r | _ -> TUnit in
     tmp f ty (I.Catch (c, inner))
+  | EVar "keep" when not_local f "keep" && not (Hashtbl.mem f.g.fns "keep") ->
+    let x = lower f (List.hd args) in
+    tmp f TUnit (I.Prim ("keep", tyof f (List.hd args), [ x ], e.espan))
   | EVar "bytes" when not_local f "bytes" && not (Hashtbl.mem f.g.fns "bytes") ->
     let xs = List.map (lower f) args in
     tmp f ty (I.Prim ("bytes_new", TBytes, xs, e.espan))
@@ -1011,7 +1014,19 @@ let lower_program ?(tests = false) (user_items : item list) : I.program * gctx =
     let field (p : param) = match p.prm_ty.tdesc with TyName ("Fs", _) -> "fs" | _ -> "clock" in
     if tests then
       List.filter_map
-        (function IFn ({ fn_test = Some _; _ } as d) -> Some (instance g d.fn_name [], List.map field d.fn_params) | _ -> None)
+        (function
+          | IFn ({ fn_test = Some _; fn_bench = false; _ } as d) -> Some (instance g d.fn_name [], List.map field d.fn_params)
+          | _ -> None)
+        user_items
+    else []
+  in
+  let bench_names =
+    let field (p : param) = match p.prm_ty.tdesc with TyName ("Fs", _) -> "fs" | _ -> "clock" in
+    if tests then
+      List.filter_map
+        (function
+          | IFn ({ fn_test = Some _; fn_bench = true; _ } as d) -> Some (instance g d.fn_name [], List.map field d.fn_params)
+          | _ -> None)
         user_items
     else []
   in
@@ -1034,4 +1049,4 @@ let lower_program ?(tests = false) (user_items : item list) : I.program * gctx =
   drain ();
   let main_ret = match main_decl with Some { fn_ret = Some te; _ } -> resolve [] te | _ -> TUnit in
   let takes_root = match main_decl with Some d -> d.fn_params <> [] | None -> false in
-  ({ I.fns = List.rev g.out; main; main_takes_root = takes_root; main_ret; tests = test_names }, g)
+  ({ I.fns = List.rev g.out; main; main_takes_root = takes_root; main_ret; tests = test_names; benches = bench_names }, g)

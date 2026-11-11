@@ -1,0 +1,7 @@
+fn cases() -> List[Int] {
+    [1]
+}
+
+test "t" for x in cases() {
+    assert(x > 0)
+}

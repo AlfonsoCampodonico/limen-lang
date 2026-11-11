@@ -1301,7 +1301,7 @@ and eval_var rt env n sp =
       | None ->
         if n = "panic" then VPanicFn
         else if n = "channel" then VChanFn
-        else if n = "assert" || n = "assert_eq" || n = "map" || n = "catch" || n = "bytes" then VBuiltin n
+        else if n = "assert" || n = "assert_eq" || n = "map" || n = "catch" || n = "bytes" || n = "keep" then VBuiltin n
         else raise (Panic ("internal: unbound name " ^ n, sp)))
 
 and ctor_value rt en vn =
@@ -1350,6 +1350,7 @@ and apply rt fv args sp =
     | [ a; b ] when equal a b -> VUnit
     | [ a; b ] -> raise (Panic (sprintf "assertion failed: %s != %s" (show ~top:false a) (show ~top:false b), sp))
     | _ -> raise (Panic ("assertion failed", sp)))
+  | VBuiltin "keep" -> VUnit
   | VBuiltin "catch" -> (
     match args with
     | [ f ] -> ( try ok (apply rt f [] sp) with Panic (m, _) -> VEnum ("Result", "Err", [ VStr m ]))
@@ -1823,14 +1824,17 @@ let make_rt ~out ~grants (user_items : item list) =
   rt
 
 (* Run every `test` block in its own coroutine scheduler; a panic fails
-   only that test. Returns (name, Ok () | Error (message, location)). *)
-let run_tests ~out (user_items : item list) : (string * (unit, string * Span.t) result) list =
+   only that test. Returns (name, Ok () | Error (message, location), seconds)
+   for the tests [select] picks. *)
+let run_tests_timed ?(select = fun _ -> true) ~out (user_items : item list) :
+    (string * (unit, string * Span.t) result * float) list =
   let rt = make_rt ~out ~grants:no_grants user_items in
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
   let resolved = Foreign.resolve no_grants.foreign user_items in
   List.filter_map
     (function
-      | IFn ({ fn_test = Some name; _ } as d) ->
+      | IFn ({ fn_test = Some name; fn_bench = false; _ } as d) when select name ->
+        let start = Unix.gettimeofday () in
         Queue.clear runq;
         let finished = ref false in
         (* capabilities the test asked for: a fresh directory as Fs, the real Clock *)
@@ -1857,6 +1861,8 @@ let run_tests ~out (user_items : item list) : (string * (unit, string * Span.t) 
         in
         Queue.clear runq;
         Option.iter Caps.remove_tree dir;
-        Some (name, r)
+        Some (name, r, Unix.gettimeofday () -. start)
       | _ -> None)
     user_items
+
+let run_tests ~out user_items = List.map (fun (n, r, _) -> (n, r)) (run_tests_timed ~out user_items)
