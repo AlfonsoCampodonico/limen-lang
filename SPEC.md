@@ -230,8 +230,8 @@ for s in shapes {
 }
 ```
 
-- A struct or enum value becomes `dyn Shape` where one is expected: an annotated `let`, a function argument, a list literal of that type, a struct field, a `return`, the last expression of a function returning `dyn Shape`, or `push`. The expected type reaches into each branch of an `if`, a `match` and a block, so the branches can hold different types. Its type must satisfy the interface (E0111).
-- Only struct and enum values can become `dyn`, and only if they hold no capability, function or channel (E0112), so a `dyn` value never hides authority. To work with capabilities through an interface, use a bounded type parameter instead.
+- A struct or enum value becomes `dyn Shape` where one is expected: an annotated `let`, a function argument, a list literal of that type, a struct field, a `return`, the last expression of a function returning `dyn Shape`, `push`, or the argument of a constructor whose type is expected, as `Some(x)` where an `Option[dyn Shape]` is expected and `Err(x)` in a function returning `Result[T, dyn Error]`. The expected type reaches into each branch of an `if`, a `match` and a block, so the branches can hold different types. Its type must satisfy the interface (E0111).
+- Only struct and enum values can become `dyn`, and only if they hold no capability, function or channel (E0112), so a `dyn` value never hides authority. To work with capabilities through an interface, use a bounded type parameter instead. The one exception is `dyn Error` (below), which `Str` and `IoError` values can become too.
 - Only the interface's methods can be called on a `dyn` value. It prints like the value inside. `==` is not allowed.
 - To choose between types, say where the `dyn` is expected: `let s: dyn Shape = if big { Circle { r: 1.0 } } else { Square { s: 2.0 } }`. Without an expected type, the branches of an `if` must have the same type.
 - A `dyn` value is boxed and its calls go through a table of methods; a bounded type parameter (`[T: Shape]`) has no such cost.
@@ -270,6 +270,38 @@ a.greet()        // "hi, ana", the same as a.User.greet()
 - Privacy is unchanged: a promoted method that is private to its module is still private (E0402).
 - Under the hood the checker rewrites `a.name` to `a.User.name`, and for interfaces adds a method `Admin::greet` that calls `self.User.greet()`; both backends see only ordinary fields and methods.
 
+### Errors: the `Error` interface
+
+Every program can use this interface without declaring it:
+
+```
+interface Error {
+    fn message(self) -> Str
+    fn cause(self) -> Option[dyn Error]
+}
+```
+
+- `cause` is optional: a type with a `message` method and no `cause` satisfies `Error`, and its `cause()` is `None`. Define `cause` to point at the error underneath, as in `fn cause(self: ConfigError) -> Option[dyn Error] { Some(self.why) }`.
+- `Str` (the error of `catch`, and of the `json`, `time` and `regex` modules) and `IoError` (the error of every capability and of `http`) satisfy it. `IoError`'s message is `denied: <text>` for `Denied(text)` and `<text>` for `Failed(text)`.
+- `Result[T, dyn Error]` holds any error. In a function that returns it, `?` takes a `Result[_, E]` for any `E` that satisfies `Error` and converts the error to `dyn Error` (section 5). A function can mix `IoError`, `Str` and its own error types without converting them by hand.
+- `main` returning `Result[_, dyn Error]` reports an error by its message: `error: reading config: denied: fs: not granted`.
+
+```
+struct ParseError {
+    line: Int,
+}
+
+fn message(self: ParseError) -> Str {
+    "bad line {self.line}"
+}
+
+fn load(fs: Fs) -> Result[Config, dyn Error] {
+    let text = fs.read("app.toml")?       // IoError
+    let cfg = parse(text)?                 // ParseError
+    Ok(cfg)
+}
+```
+
 ### main
 
 `main` must be one of:
@@ -282,7 +314,7 @@ fn main(root: Root) -> Result[Int, E]
 fn main()
 ```
 
-`root` may be left out of any of them. When `main` returns, the program exits with status 0, or with the `Int` it returned (directly or as `Ok(n)`). The operating system keeps only the low 8 bits, so use 0 to 255: `-> Int { 256 + 7 }` exits with 7. If `main` returns `Err(e)`, the program prints `error: <e>` to stderr and exits with status 1.
+`root` may be left out of any of them. When `main` returns, the program exits with status 0, or with the `Int` it returned (directly or as `Ok(n)`). The operating system keeps only the low 8 bits, so use 0 to 255: `-> Int { 256 + 7 }` exits with 7. If `main` returns `Err(e)`, the program prints `error: <e>` to stderr and exits with status 1; a `dyn Error` prints its `message()`.
 
 ```
 fn main(root: Root) -> Int {
@@ -350,7 +382,20 @@ Both operands must have the same type. The **ordered** types are `Int`, `Float`,
 
 ### The `?` operator
 
-On a `Result[T, E]`, `e?` evaluates to the `Ok` value or returns `Err(e)` from the enclosing function, which must return `Result[_, E]` with the same `E` (E0202). Convert errors with `.map_err(|e| ...)`. On an `Option[T]`, `?` returns `None` from a function returning `Option`.
+On a `Result[T, E]`, `e?` evaluates to the `Ok` value or returns `Err(e)` from the enclosing function, which must return `Result[_, E]` with the same `E`, or `Result[_, dyn Error]` when `E` satisfies `Error` (section 4); then the error converts to `dyn Error`. Any other error type is E0202, which offers to change the function's error type to `dyn Error` when both types satisfy `Error`. Convert errors by hand with `.map_error(|e| ...)`. On an `Option[T]`, `?` returns `None` from a function returning `Option`.
+
+A string after `?` on the same line adds context: `x? "reading config"` returns early with an error whose message is `reading config: <the error's message>` and whose `cause()` is the original error. The function must return `Result[_, dyn Error]` (E0202, with a fix that changes its error type), and the error must satisfy `Error`. The string can interpolate (`"reading {path}"`) and is built only when there is an error. On an `Option`, `opt? "no port set"` returns an error with that message and no cause, so a missing value becomes an error in one step. The wrapper is the prelude struct `WrappedError { context: Str, inner: dyn Error }`; the `errors` module (section 19) walks and prints the chain.
+
+```
+fn start(fs: Fs, all: Map[Str, Str]) -> Result[Server, dyn Error] {
+    let text = fs.read("app.toml")? "reading config"
+    let port = all.get("port")? "no port set"
+    let cfg = parse(text)? "parsing config"
+    ...
+}
+```
+
+The context is a string after `?`, rather than a method such as `.context("...")?`, so the common case stays one short step that reads like the comment it replaces, and the string is evaluated only on the error path.
 
 ### Calls
 
@@ -863,7 +908,11 @@ For a missing key with a default, write `m.get(k) ?? default`.
 | --- | --- |
 | `is_some()`, `is_none()` / `is_ok()`, `is_err()` | `Bool` |
 | `map(f)` (Option) | `Option[U]` |
-| `map_err(f)` (Result) | `Result[T, F]` |
+| `map_error(f)` (Result) | `Result[T, F]`: the error passed through `f`, an `Ok` unchanged |
+
+`map_error` was called `map_err`. The old name still works, with warning W0001 and a fix that renames it; it will be removed.
+
+`Str` and `IoError` also have `message()`, from the `Error` interface (section 4): the string itself, and the text of the `IoError`.
 
 ### Chan[T]
 
@@ -1006,10 +1055,11 @@ The native backend may run a chain like `xs.filter(p).map(f).fold(z, g)` as one 
 
 ## 15. Errors
 
-Every diagnostic has a stable code. `vela explain CODE` prints its explanation, and `vela check --json` emits code, span, notes and an auto-fix when there is one.
+Every diagnostic has a stable code. `vela explain CODE` prints its explanation, and `vela check --json` emits code, span, notes and an auto-fix when there is one. Codes starting with W are warnings: they are printed, but the program still builds and runs.
 
 | Code | Meaning |
 | --- | --- |
+| W0001 | a renamed built-in method (`map_err`, now `map_error`) |
 | E0001-E0008 | lexing and parsing: bad character, unclosed string, unexpected token, missing newline, integer too large, bad escape, empty interpolation, untyped parameter |
 | E0101 | unknown name (with a suggestion) |
 | E0102 | unknown type |
@@ -1115,7 +1165,7 @@ stmt       = "let" [ "mut" ] IDENT [ ":" type ] "=" expr
 expr       = unary { BINOP unary } ;            (* precedence: section 5 *)
 expr_ns    = expr ;                             (* no struct literal at the top level *)
 unary      = ( "-" | "!" ) unary | postfix ;
-postfix    = primary { "(" [ args ] ")" | "[" expr "]" | "." IDENT [ "(" [ args ] ")" ] | "." INT | "?" } ;
+postfix    = primary { "(" [ args ] ")" | "[" expr "]" | "." IDENT [ "(" [ args ] ")" ] | "." INT | "?" [ STRING ] } ;
 args       = expr { sep expr } [ "," ] ;
 primary    = INT | FLOAT | STRING | "true" | "false"
            | [ IDENT "." ] IDENT [ "{" [ init { sep init } [ "," ] ] "}" ]   (* struct literal *)
@@ -1225,7 +1275,7 @@ The standard library is checked like a dependency. `src/std/vela.toml` lists the
 
 | Module | May take |
 | --- | --- |
-| `json`, `list`, `text`, `format`, `time`, `regex` | nothing: pure |
+| `json`, `list`, `text`, `format`, `time`, `regex`, `errors` | nothing: pure |
 | `http` | `net` (Net, Conn) and `listen` (Listener, Conn) |
 | `sql` | `fs` (the database file's directory); trusted with C (`[trust] foreign = ["sql"]`) to call SQLite |
 
@@ -1236,6 +1286,30 @@ A module missing from the list may take nothing. `vela caps FILE` shows what eac
 - The std modules' source. It is embedded in the compiler, not fetched, so it is as trustworthy as the compiler binary; the manifest check makes sure that what it can do stays what it declares.
 - The C libraries that std modules trusted in the manifest's `[trust]` declare in `foreign` blocks (SQLite for `sql`). Their calls need no `Foreign`, and the declarations are private to the module; the module wraps every call and keeps SQLite inside the `Fs` grant (see `sql` below). A standard library module that is not trusted cannot call C. Trusted modules may also declare the runtime's own helper library, `foreign "vela"`, which no other code may: `vela_copy(p, n)` copies C memory into `Bytes`, and a handle table (`vela_handle_new`, `_acquire`, `_release`, `_close`) keeps C pointers out of Vela values. A trusted module's values hold a random id from that table instead of a `Handle`, since any code can write `Handle { addr: ... }` but no code can turn an id into a pointer; an unknown or closed id is an error, and a pointer is freed only once no use of it is in progress.
 - Callbacks. `http.serve(l, n, handler)` calls `handler` inside std code; the handler carries only the capabilities its closure captured from your code, which appear in your signatures, not std's.
+
+### errors
+
+Walking and printing the chain of causes of a `dyn Error` (section 4).
+
+| Function | Result |
+| --- | --- |
+| `chain(e)` | `List[dyn Error]`: `e`, its cause, that one's cause, ... |
+| `root(e)` | `dyn Error`: the innermost cause, the error that started it |
+| `wrap(e, context)` | `dyn Error`: `e` with context, as `x? "context"` makes it |
+| `own_message(e)` | `Str`: what this link adds, its message without its cause's message at the end |
+| `report(e)` | `Str`: the chain, one link per line, each after the first marked `caused by:` |
+
+```
+use errors
+
+match start(root.fs) {
+    Ok(s) => run(s),
+    Err(e) => root.stdout.print(errors.report(e)),
+}
+// starting
+// caused by: reading config
+// caused by: denied: fs: not granted (run with --grant fs=DIR)
+```
 
 ### json
 

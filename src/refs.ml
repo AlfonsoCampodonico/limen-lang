@@ -139,7 +139,8 @@ let index (items : item list) : occ list =
     | EStr ps -> List.iter (function SPExpr y -> x y | SPLit _ -> ()) ps
     | EList es -> List.iter x es
     | EBin (_, a, b) | EIndex (a, b) -> x a; x b
-    | EUn (_, a) | ETry a -> x a
+    | EUn (_, a) | ETry (a, None) -> x a
+    | ETry (a, Some c) -> x a; x c
     | (EField ({ edesc = EVar en; espan; _ }, v, nsp) | EMethod ({ edesc = EVar en; espan; _ }, v, nsp, _))
       when (not (List.mem_assoc en env)) && List.exists (fun d -> d.en_name = en) !enums ->
       type_ref en espan;
@@ -317,7 +318,8 @@ let rename ~(load : (string * string) list -> item list * Diag.t list) items fil
     | Some d ->
       let upper = nw <> "" && nw.[0] >= 'A' && nw.[0] <= 'Z' in
       let iface_methods =
-        List.concat_map (function IIface i -> List.map (fun (m, _, _, _) -> (m, i.if_name)) i.if_methods | _ -> []) items
+        (* the prelude's `Error` counts too *)
+        List.concat_map (function IIface i -> List.map (fun (m, _, _, _) -> (m, i.if_name)) i.if_methods | _ -> []) (Prelude.items () @ items)
       in
       if not (valid_ident nw) then Error (Printf.sprintf "`%s` is not a valid name" nw)
       else if nw = o.name then Ok []

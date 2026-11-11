@@ -39,6 +39,7 @@ type fctx = {
   genv : (string * ty) list;
   mutable in_group : int; (* inside a group body: no return, no `?` *)
   mutable in_defer : int; (* inside a deferred body: nothing may leave it *)
+  ret_te : ty_expr option; (* the declared result type, for fix-its *)
 }
 
 type fn_info = { name : string; span : Span.t; caps : cap list; callbacks : bool }
@@ -318,7 +319,7 @@ let methods (t : ty) : (string * (unit -> ty list * ty)) list =
       m "starts_with" [ TStr ] TBool; m "ends_with" [ TStr ] TBool; m "to_upper" [] TStr;
       m "to_lower" [] TStr; m "replace" [ TStr; TStr ] TStr; m "parse_int" [] (opt TInt);
       m "parse_float" [] (opt TFloat); m "slice" [ TInt; TInt ] TStr; m "index_of" [ TStr ] (opt TInt);
-      m "bytes" [] (TList TInt); m "chars" [] (TList TStr); m "to_bytes" [] TBytes ]
+      m "bytes" [] (TList TInt); m "chars" [] (TList TStr); m "to_bytes" [] TBytes; m "message" [] TStr ]
   | TBytes ->
     [ m "len" [] TInt; m "is_empty" [] TBool; m "get" [ TInt ] (opt TInt); m "slice" [ TInt; TInt ] TBytes;
       m "to_list" [] (TList TInt); m "to_str" [] TStr ]
@@ -345,9 +346,10 @@ let methods (t : ty) : (string * (unit -> ty list * ty)) list =
   | TNamed ("Option", [ a ]) ->
     [ m "is_some" [] TBool; m "is_none" [] TBool;
       ("map", fun () -> let u = fresh () in ([ TFn ([ a ], u) ], opt u)) ]
+  | TNamed ("IoError", []) -> [ m "message" [] TStr ]
   | TNamed ("Result", [ a; e ]) ->
     [ m "is_ok" [] TBool; m "is_err" [] TBool;
-      ("map_err", fun () -> let u = fresh () in ([ TFn ([ e ], u) ], res a u)) ]
+      ("map_error", fun () -> let u = fresh () in ([ TFn ([ e ], u) ], res a u)) ]
   | TCap Net -> [ m "get" [ TStr ] (res (TNamed ("HttpResponse", [])) io_err); m "only" [ TStr ] (TCap Net); m "connect" [ TStr ] (res (TCap Conn) io_err); m "connect_tls" [ TStr ] (res (TCap Conn) io_err) ]
   | TCap Listen -> [ m "on" [ TStr ] (res (TCap Listener) io_err); m "on_tls" [ TStr; TStr; TStr ] (res (TCap Listener) io_err) ]
   | TCap Listener -> [ m "accept" [] (res (TCap Conn) io_err); m "port" [] TInt; m "close" [] TUnit ]
@@ -475,6 +477,11 @@ let satisfies ctx t i : string option =
       | Some mk -> let ps', r' = mk () in trial (TFn (ps', r'))
       | None -> Some (sprintf "`%s` has no method `%s`" (show t) m))
   in
+  (* `cause` is optional in `Error`: a type without one has no cause *)
+  let check (m, sg) =
+    let own = match t with TNamed (n, _) -> Hashtbl.mem ctx.fns (n ^ "::" ^ m) || List.mem_assoc m (methods t) | TParam _ | TDyn _ -> true | _ -> List.mem_assoc m (methods t) in
+    if i = "Error" && m = "cause" && not own then None else check (m, sg)
+  in
   List.find_map check ms
 
 let rec check_expr ctx f e : ty =
@@ -536,7 +543,7 @@ and check_expr_inner ctx f e : ty =
     | _ ->
       err ctx "E0201" a.espan (sprintf "only lists, arrays and maps can be indexed, found `%s`" (show t));
       TErr)
-  | ETry x -> check_try ctx f x e.espan
+  | ETry (x, c) -> check_try ctx f x c e.espan
   | EIf (c, b, els) -> (
     expect ctx f c TBool;
     let tt = check_block ctx f b in
@@ -601,6 +608,12 @@ and expect ctx f e want =
     expect ctx f els want;
     e.ety <- want
   | EMatch (s, arms), _ -> e.ety <- check_match ~want ctx f s arms e.espan
+  (* `Err(x)` or `Some(x)` where a `dyn` payload is expected: the expected
+     type reaches the arguments, so `x` becomes `dyn` *)
+  | ECall (callee, args), TNamed (_, targs) when List.exists has_dyn targs ->
+    let t = check_call ~want ctx f callee args e.espan in
+    e.ety <- t;
+    unify_at ctx e.espan want t
   | EBlock b, _ -> expect_block ctx f b want; e.ety <- want
   | _, TDyn i -> coerce ctx e (check_expr ctx f e) i
   | _ -> expect_plain ctx f e want
@@ -611,6 +624,11 @@ and coerce ctx e t i =
   | TDyn j when j = i -> ()
   | TVar _ -> unify_at ctx e.espan (TDyn i) t
   | TErr -> ()
+  | TStr | TNamed ("IoError", _) when i = "Error" ->
+    (* the built-in errors: a message, no cause *)
+    let inner = { e with edesc = e.edesc } in
+    e.edesc <- EDyn (inner, i);
+    e.ety <- TDyn i
   | TNamed (n, _) as ct when (Hashtbl.mem ctx.structs n || Hashtbl.mem ctx.enums n) && not (List.mem n [ "Option"; "Result"; "IoError" ]) ->
     if caps_in ct [] <> [] || has_fn ct || has_chan ct then
       err ctx "E0112" e.espan
@@ -693,7 +711,7 @@ and check_var ctx f e n sp =
 
 and check_args ctx f args = List.iter (fun a -> ignore (check_expr ctx f a)) args
 
-and check_call ctx f callee args sp =
+and check_call ?want ctx f callee args sp =
   match callee.edesc with
   | EVar "assert" when lookup f "assert" = None && not (Hashtbl.mem ctx.fns "assert") ->
     (match args with
@@ -757,6 +775,11 @@ and check_call ctx f callee args sp =
     in
     match repr ct with
     | TFn (ps, r) ->
+      (* a constructor's type parameters come from the expected type first *)
+      (match (want, callee.edesc) with
+       | Some w, (EVar _ | EField _) when (match repr r with TNamed (n, _) -> Hashtbl.mem ctx.enums n | _ -> false) ->
+         (try unify r w with Mismatch -> ())
+       | _ -> ());
       if List.length ps <> List.length args then begin
         err ctx "E0107" sp
           (sprintf "this function takes %d argument%s but %d %s supplied" (List.length ps)
@@ -912,6 +935,18 @@ and check_method ctx f e recv name nsp args =
 (* [rt]: the receiver's type, when [recv] is already checked *)
 and check_method_value ?rt ctx f e recv name nsp args =
   let rt = repr (match rt with Some t -> t | None -> check_expr ctx f recv) in
+  let name =
+    match rt with
+    | TNamed ("Result", _) when name = "map_err" ->
+      (* the old name still works, with a warning and a fix that renames it *)
+      ctx.diags <-
+        Diag.make ~severity:Diag.Warning "W0001" nsp "`map_err` is now called `map_error`"
+          ~fix:{ Diag.fmsg = "rename it to `map_error`"; edits = [ { Diag.at = nsp; replacement = "map_error" } ] }
+        :: ctx.diags;
+      (match e.edesc with EMethod (r, _, sp, a) -> e.edesc <- EMethod (r, "map_error", sp, a) | _ -> ());
+      "map_error"
+    | _ -> name
+  in
   match rt with
   | TErr -> check_args ctx f args; TErr
   | TVar _ ->
@@ -1099,45 +1134,92 @@ and check_place ctx f e =
   | EField (r, _, _) | EIndex (r, _) -> check_place ctx f r
   | _ -> err ctx "E0209" e.espan "only variables, fields and list elements can be assigned to"
 
-and check_try ctx f x sp =
+(* Can errors of type [e] become `dyn Error`? None if so, else why not. *)
+and error_conversion ctx e =
+  match repr e with
+  | TDyn "Error" | TErr | TStr | TNamed ("IoError", _) -> None
+  | TVar _ -> unify e (TDyn "Error"); None
+  | TNamed (n, _) as ct when (Hashtbl.mem ctx.structs n || Hashtbl.mem ctx.enums n) && not (List.mem n [ "Option"; "Result" ]) ->
+    if caps_in ct [] <> [] || has_fn ct || has_chan ct then Some (sprintf "`%s` holds a capability, function or channel" (show ct))
+    else satisfies ctx ct "Error"
+  | t -> Some (sprintf "`%s` does not satisfy `Error`" (show t))
+
+(* The fix-it that changes the function's error type to `dyn Error`. *)
+and dyn_error_fix f =
+  match f.ret_te with
+  | Some { tdesc = TyName ("Result", [ _; et ]); _ } ->
+    Some { Diag.fmsg = "return `dyn Error`, which any error converts to"; edits = [ { Diag.at = et.tspan; replacement = "dyn Error" } ] }
+  | _ -> None
+
+and check_try ctx f x context sp =
   if f.in_defer > 0 then begin
     err ctx "E0115" sp "`?` cannot leave a `defer` body"
       ~notes:[ "handle the error inside it, for example with `??` or a `match`" ];
     ignore (check_expr ctx f x);
     TErr
   end
-  else check_try_ok ctx f x sp
+  else check_try_ok ctx f x context sp
 
-and check_try_ok ctx f x sp =
+and check_try_ok ctx f x context sp =
   if f.in_group > 0 then
     err ctx "E0311" sp "`?` cannot leave a `group` block early; every task must finish first"
       ~notes:[ "handle the error inside the task, or after the group returns its results" ];
   let t = repr (check_expr ctx f x) in
+  let is_dyn_error t = match repr t with TDyn "Error" -> true | _ -> false in
   let wrong_fn rt kind =
     err ctx "E0202" sp
       (sprintf "`?` can only be used in a function that returns `%s`, this one returns `%s`" kind (show rt))
       ~notes:[ "for main, write `fn main(root: Root) -> Result[(), IoError]`" ]
   in
+  (* `x? "context"` wraps the error, so the function must return `dyn Error` *)
+  let with_context () =
+    match context with
+    | None -> false
+    | Some c ->
+      expect ctx f c TStr;
+      (match repr f.ret_ty with
+       | TNamed ("Result", [ _; fe ]) when is_dyn_error fe -> ()
+       | TNamed ("Result", [ _; fe ]) ->
+         err ctx "E0202" sp
+           (sprintf "`?` with context returns a `dyn Error`, but this function returns errors of type `%s`" (show fe))
+           ?fix:(dyn_error_fix f)
+       | TVar _ -> unify_at ctx sp f.ret_ty (res (fresh ()) (TDyn "Error"))
+       | TErr -> ()
+       | rt -> wrong_fn rt "Result[_, dyn Error]");
+      true
+  in
   match t with
-  | TErr -> TErr
+  | TErr -> Option.iter (fun c -> ignore (check_expr ctx f c)) context; TErr
   | TNamed ("Result", [ a; e ]) ->
+    let ctxd = with_context () in
     (match repr f.ret_ty with
+     | TNamed ("Result", [ _; fe ]) when is_dyn_error fe || ctxd -> (
+       if is_dyn_error fe then
+         match error_conversion ctx e with
+         | None -> ()
+         | Some why ->
+           err ctx "E0202" sp (sprintf "`?` cannot turn an error of type `%s` into `dyn Error`" (show e))
+             ~notes:[ why; "give it a method `fn message(self: " ^ show e ^ ") -> Str`" ])
      | TNamed ("Result", [ _; fe ]) -> (
        try unify fe e
        with Mismatch ->
+         let fix = if error_conversion ctx e = None && error_conversion ctx fe = None then dyn_error_fix f else None in
          err ctx "E0202" sp
            (sprintf "`?` would return an error of type `%s`, but this function returns errors of type `%s`"
               (show e) (show fe))
-           ~notes:[ "convert the error first with `.map_err(|e| ...)`" ])
-     | TVar _ -> unify_at ctx sp f.ret_ty (res (fresh ()) e)
+           ?fix
+           ~notes:[ "convert the error first with `.map_error(|e| ...)`, or return `dyn Error`, which any error type with a `message` method converts to" ])
+     | TVar _ -> if not ctxd then unify_at ctx sp f.ret_ty (res (fresh ()) e)
      | TErr -> ()
-     | rt -> wrong_fn rt "Result");
+     | rt -> if not ctxd then wrong_fn rt "Result");
     a
   | TNamed ("Option", [ a ]) ->
-    (match repr f.ret_ty with
-     | TNamed ("Option", _) | TErr -> ()
-     | TVar _ -> unify_at ctx sp f.ret_ty (opt (fresh ()))
-     | rt -> wrong_fn rt "Option");
+    (* with context, a None becomes an error whose message is the context *)
+    if not (with_context ()) then
+      (match repr f.ret_ty with
+       | TNamed ("Option", _) | TErr -> ()
+       | TVar _ -> unify_at ctx sp f.ret_ty (opt (fresh ()))
+       | rt -> wrong_fn rt "Option");
     a
   | TVar _ ->
     err ctx "E0207" x.espan "the type of this value is not known here; add a type annotation";
@@ -1213,7 +1295,7 @@ and check_closure ctx f ps body want =
       ps
   in
   let ret = match want_ret with Some r -> r | None -> fresh () in
-  let cf = { ret_ty = ret; scopes = scope :: f.scopes; loops = 0; genv = f.genv; in_group = 0; in_defer = 0 } in
+  let cf = { ret_ty = ret; scopes = scope :: f.scopes; loops = 0; genv = f.genv; in_group = 0; in_defer = 0; ret_te = None } in
   let bt = check_expr ctx cf body in
   unify_at ctx body.espan ret bt;
   TFn (pts, ret)
@@ -1661,9 +1743,9 @@ let check_fn ctx (d : fn_decl) (s : fsig) =
   List.iter2
     (fun p t -> Hashtbl.replace scope.vars p.prm_name { vty = t; vmut = false; vspan = p.prm_span; vkind = KParam })
     d.fn_params s.ps;
-  let f = { ret_ty = s.ret; scopes = [ scope ]; loops = 0; genv; in_group = 0; in_defer = 0 } in
+  let f = { ret_ty = s.ret; scopes = [ scope ]; loops = 0; genv; in_group = 0; in_defer = 0; ret_te = d.fn_ret } in
   match repr s.ret with
-  | TDyn _ -> expect_block ctx f d.fn_body s.ret (* the body's value becomes `dyn`, branch by branch *)
+  | t when has_dyn t -> expect_block ctx f d.fn_body s.ret (* the body's value becomes `dyn`, branch by branch *)
   | _ ->
   let bt = check_block ctx f d.fn_body in
   try unify s.ret bt
@@ -1968,6 +2050,6 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
           caps = List.filter (fun c -> List.mem c found) all_caps;
           callbacks = List.exists has_fn s.ps || d.fn_bounds <> [] })
       (* forwarders only pass their arguments on; the methods they call are reported *)
-      (List.filter (fun ((d : fn_decl), _) -> d.fn_test = None && d.fn_span.file <> Prelude.methods_file && not (Embed.is_forwarder d.fn_name)) sigs)
+      (List.filter (fun ((d : fn_decl), _) -> d.fn_test = None && d.fn_span.file <> Prelude.methods_file && d.fn_span.Span.file <> Prelude.file && not (Embed.is_forwarder d.fn_name)) sigs)
   in
   (diags, infos)

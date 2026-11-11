@@ -59,7 +59,7 @@ Then work through the examples. Every one runs the same in the interpreter and n
 
 | Example | Shows | Run |
 | --- | --- | --- |
-| `tour.vela` | the newest features in one file: `dyn` branches, ranges, method values, struct map keys, `Bytes`, `defer`, groups with deadlines, `select` timeouts, exit codes, tests, table tests, benchmarks | `vela run examples/tour.vela; echo $?`, `vela test examples/tour.vela` and `vela test examples/tour.vela --bench` |
+| `tour.vela` | the newest features in one file: `dyn` branches, ranges, method values, struct map keys, `Bytes`, `defer`, `dyn Error` and `?` with context, groups with deadlines, `select` timeouts, exit codes, tests, table tests, benchmarks | `vela run examples/tour.vela; echo $?`, `vela test examples/tour.vela` and `vela test examples/tour.vela --bench` |
 | `hello.vela`, `wordcount.vela` | capabilities: nothing touches the outside world without a grant | `vela run examples/wordcount.vela --grant fs=examples:ro` |
 | `methods.vela`, `interfaces.vela`, `dyn.vela`, `shapes.vela` | methods, structural interfaces, `dyn` values | `vela run examples/dyn.vela` |
 | `tuples.vela`, `maps.vela` | tuples, destructuring, maps | `vela run examples/maps.vela` |
@@ -255,6 +255,8 @@ Tuples `(Int, Str)` and maps `Map[Str, Int]` are built in: `let (q, r) = divmod(
 `group g until clock.after(2000) { ... }` gives a group a deadline: tasks still running then are cancelled (freeing what they own) and the group evaluates to a `List[Option[T]]` with `None` for each of them.
 
 `select { v = jobs.recv() if open => ..., out.send(x) => ..., clock.after(500) => ... }` waits on several channels, with guards to turn arms off and an optional timeout (or `_` to not wait at all; see [examples/select.vela](examples/select.vela)). `clock.sleep(ms)` parks a task without blocking a thread.
+
+Errors: any type with `fn message(self: T) -> Str` satisfies the prelude's `Error` interface (as do `Str` and `IoError`), and in a function returning `Result[T, dyn Error]`, `?` converts each of them, so one function can mix file, parse and its own errors. A string after `?` adds context: `fs.read(path)? "reading config"` fails with `reading config: <the error>`, keeping the original as its `cause()`; `opt? "no port set"` turns a missing value into an error. The `errors` module walks the chain (`errors.report(e)` prints one cause per line), and `main` returning a `dyn Error` prints its message. `.map_error(f)` converts an error by hand (the old `map_err` still works, with warning W0001 and a fix that renames it).
 
 A panic ends only the task it happens in, and `catch(|| ...)` turns one into `Err(message)`, so `http.serve` answers 500 when a handler panics and keeps serving.
 

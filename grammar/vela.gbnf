@@ -69,7 +69,7 @@ expr    ::= unary (sp binop ws unary)*
 binop   ::= "??" | "||" | "&&" | "==" | "!=" | "<=" | ">=" | "<" | ">" | "..<" | "+" | "-" | "*" | "/" | "%"
 unary   ::= ("-" | "!") sp unary | postfix
 postfix ::= primary suffix*
-suffix  ::= sp "(" ws args? ws ")" | sp "[" ws expr ws "]" | ws "." sp ident | "." [0-9]+ | sp "?"
+suffix  ::= sp "(" ws args? ws ")" | sp "[" ws expr ws "]" | ws "." sp ident | "." [0-9]+ | sp "?" (sp string)?
 args    ::= expr (isep expr)* (ws ",")?
 
 primary ::= float | int | string | ident | structlit | "(" ws ")" | "(" ws expr ws ")" | "(" ws expr (isep expr)+ (ws ",")? ws ")" | "[" ws args? ws "]" | block | if | match | select | closure | group

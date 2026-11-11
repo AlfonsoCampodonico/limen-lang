@@ -142,6 +142,15 @@ let rec has_chan t =
   | TNamed (_, args) -> List.exists has_chan args
   | _ -> false
 
+(* Does [t] mention a `dyn` type? *)
+let rec has_dyn t =
+  match repr t with
+  | TDyn _ -> true
+  | TList a | TChan a | TArray (a, _) -> has_dyn a
+  | TMap (k, v) -> has_dyn k || has_dyn v
+  | TNamed (_, xs) -> List.exists has_dyn xs
+  | _ -> false
+
 let rec has_fn t =
   match repr t with
   | TFn _ -> true

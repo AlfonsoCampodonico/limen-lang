@@ -81,7 +81,7 @@
 ; Embed the standard library modules (written in Vela).
 (rule
  (targets std_text.ml)
- (deps std/json.vela std/list.vela std/text.vela std/http.vela std/format.vela std/time.vela std/regex.vela std/sql.vela std/vela.toml)
+ (deps std/json.vela std/list.vela std/text.vela std/http.vela std/format.vela std/time.vela std/regex.vela std/sql.vela std/errors.vela std/vela.toml)
  (action
   (with-stdout-to
    std_text.ml
@@ -103,6 +103,8 @@
     (cat std/regex.vela)
     (echo "|xxstdxx});\n(\"sql\", {xxstdxx|")
     (cat std/sql.vela)
+    (echo "|xxstdxx});\n(\"errors\", {xxstdxx|")
+    (cat std/errors.vela)
     (echo "|xxstdxx}) ]\n")
     (echo "let manifest = {xxstdxx|")
     (cat std/vela.toml)

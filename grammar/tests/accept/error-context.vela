@@ -1,0 +1,9 @@
+fn load(fs: Fs, name: Str) -> Result[Int, dyn Error] {
+    let text = fs.read(name)? "reading {name}"
+    let n = text.parse_int()?"parsing"
+    let m = [n].first()? "empty" + 1
+    // a string on the next line is a statement of its own
+    let k = fs.read(name)?
+    "unused"
+    Ok(m + k.len())
+}

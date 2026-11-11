@@ -39,7 +39,8 @@ let rec expr e =
   | EMethod (r, n, _, a) -> expr r ^ "." ^ n ^ "(" ^ String.concat "," (List.map expr a) ^ ")"
   | EField (r, n, _) -> expr r ^ "." ^ n
   | EIndex (a, i) -> expr a ^ "[" ^ expr i ^ "]"
-  | ETry a -> expr a ^ "?"
+  | ETry (a, None) -> expr a ^ "?"
+  | ETry (a, Some c) -> expr a ^ "?" ^ expr c
   | EIf (c, b, e) -> "if(" ^ expr c ^ ")" ^ block b ^ (match e with Some x -> "else" ^ expr x | None -> "")
   | EMatch (s, arms) -> "match(" ^ expr s ^ "){" ^ String.concat ";" (List.map (fun a -> pat a.apat ^ "=>" ^ expr a.abody) arms) ^ "}"
   | EBlock b -> block b

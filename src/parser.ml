@@ -200,9 +200,14 @@ and parse_postfix st ns e =
       parse_postfix st ns (mk (EMethod (e, name, nsp, args)) (merge e.espan (last_span st)))
     end
     else parse_postfix st ns (mk (EField (e, name, nsp)) (merge e.espan nsp))
-  | SYM "?" when not t.nl ->
+  | SYM "?" when not t.nl -> (
     ignore (advance st);
-    parse_postfix st ns (mk (ETry e) (merge e.espan t.span))
+    (* `x? "reading config"`: a string on the same line adds context to the error *)
+    match (peek st).tok with
+    | STR _ when not (peek st).nl ->
+      let c = parse_primary st ns in
+      parse_postfix st ns (mk (ETry (e, Some c)) (merge e.espan c.espan))
+    | _ -> parse_postfix st ns (mk (ETry (e, None)) (merge e.espan t.span)))
   | _ -> e
 
 and parse_primary st ns =

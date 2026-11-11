@@ -25,12 +25,19 @@ let die_usage msg =
   prerr_string (if msg = "" then usage else "vela: " ^ msg ^ "\n\n" ^ usage);
   exit 2
 
-let load file =
+(* Warnings go to stderr here, unless [keep_warnings]; the diagnostics
+   returned are the errors, which stop the command. *)
+let load ?(keep_warnings = false) file =
   let src =
     try In_channel.with_open_bin file In_channel.input_all
     with Sys_error m -> prerr_endline ("vela: " ^ m); exit 2
   in
-  Modules.load_and_check file src
+  let items, ds, infos = Modules.load_and_check file src in
+  if keep_warnings then (items, ds, infos)
+  else begin
+    List.iter (fun d -> prerr_string (Diag.render d); prerr_newline ()) (Diag.warnings ds);
+    (items, Diag.errors ds, infos)
+  end
 
 let report diags =
   List.iter (fun d -> prerr_string (Diag.render d); prerr_newline ()) diags;
@@ -360,11 +367,11 @@ let c_callers (items : Ast.item list) =
     (List.sort compare groups)
 
 let cmd_check file json =
-  let items, diags, _ = load file in
+  let items, diags, _ = load ~keep_warnings:json file in
   if json then print_endline (Diag.list_to_json diags)
   else if diags = [] then (print_endline "ok"; List.iter print_endline (c_callers items))
   else report diags;
-  exit (if diags = [] then 0 else 1)
+  exit (if Diag.errors diags = [] then 0 else 1)
 
 let cmd_caps file json =
   let _, diags, infos = load file in

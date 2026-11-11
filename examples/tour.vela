@@ -3,6 +3,7 @@
 // Native: vela run examples/tour.vela --native
 // Tests: vela test examples/tour.vela
 // Benchmarks: vela test examples/tour.vela --bench
+use errors
 
 interface Shape {
     fn area(self) -> Float
@@ -49,6 +50,27 @@ fn shout(self: Str) -> Str { self.to_upper() + "!" }
 fn pick(big: Bool) -> dyn Shape {
     // branches of different types become `dyn` where one is expected
     if big { Circle { r: 2.0 } } else { Square { side: 1.5 } }
+}
+
+// any type with a `message` method is an Error
+struct BadPort {
+    text: Str,
+}
+
+fn message(self: BadPort) -> Str { "not a port: {self.text}" }
+
+fn parse_port(s: Str) -> Result[Int, BadPort] {
+    match s.parse_int() {
+        Some(n) => Ok(n),
+        None => Err(BadPort { text: s }),
+    }
+}
+
+// `?` converts any Error to `dyn Error`, and a string after it adds context
+fn port(settings: Map[Str, Str]) -> Result[Int, dyn Error] {
+    let raw = settings.get("port")? "no port set"
+    let n = parse_port(raw)? "reading settings"
+    Ok(n)
 }
 
 fn slow(clock: Clock, ms: Int, v: Int) -> Int {
@@ -108,6 +130,12 @@ fn main(root: Root) -> Int {
     // binary data
     let b = "hi".to_bytes() + bytes([33])
     out.print("{b.len()} bytes: {b.to_str()}")
+    // errors from different types, with context, walked with the errors module
+    match port(map([("port", "80x")])) {
+        Ok(n) => out.print("port {n}"),
+        Err(e) => out.print(errors.report(e)),
+    }
+    out.print("{port(map([("port", "8080")])) ?? 0}")
 
     out.print("-- defer")
     {

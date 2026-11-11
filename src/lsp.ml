@@ -91,7 +91,8 @@ let rec walk_expr (f : expr -> unit) e =
   | EStr ps -> List.iter (function SPExpr x -> w x | SPLit _ -> ()) ps
   | EList es -> List.iter w es
   | EBin (_, a, b) | EIndex (a, b) -> w a; w b
-  | EUn (_, a) | ETry a | EField (a, _, _) -> w a
+  | EUn (_, a) | ETry (a, None) | EField (a, _, _) -> w a
+  | ETry (a, Some c) -> w a; w c
   | ECall (c, args) -> w c; List.iter w args
   | EMethod (r, _, _, args) -> w r; List.iter w args
   | EIf (c, b, eo) -> w c; walk_block f b; Option.iter w eo

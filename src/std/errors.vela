@@ -1,0 +1,57 @@
+// Errors: walking the chain of causes, and reporting it.
+//
+// Any type with `fn message(self: T) -> Str` is an `Error`, and one with
+// `fn cause(self: T) -> Option[dyn Error]` points at the error underneath.
+// `x? "reading config"` wraps an error with context, so its message reads
+// `reading config: <the error underneath>` and its cause is that error.
+
+// The error and its causes, outermost first.
+pub fn chain(e: dyn Error) -> List[dyn Error] {
+    let mut links: List[dyn Error] = [e]
+    let mut next = e.cause()
+    while next.is_some() {
+        let c = next ?? e
+        links.push(c)
+        next = c.cause()
+    }
+    links
+}
+
+// The innermost cause: the error that started it all.
+pub fn root(e: dyn Error) -> dyn Error {
+    match e.cause() {
+        Some(c) => root(c),
+        None => e,
+    }
+}
+
+// `e` with `context` around it, as `x? "context"` makes it: the message is
+// `context: <e's message>`, and the cause is `e`.
+pub fn wrap(e: dyn Error, context: Str) -> dyn Error {
+    WrappedError { context, inner: e }
+}
+
+// What this link of the chain adds: its message without the cause's message
+// at the end (`reading config` for `reading config: denied: ...`).
+pub fn own_message(e: dyn Error) -> Str {
+    let m = e.message()
+    match e.cause() {
+        Some(c) => {
+            let tail = ": " + c.message()
+            if m.len() > tail.len() && m.ends_with(tail) {
+                m.slice(0, m.len() - tail.len())
+            } else {
+                m
+            }
+        },
+        None => m,
+    }
+}
+
+// The chain, one link per line, for logs and for people:
+//
+//     reading config
+//     caused by: denied: fs: not granted
+pub fn report(e: dyn Error) -> Str {
+    chain(e).map(|x| own_message(x)).join("\ncaused by: ")
+}

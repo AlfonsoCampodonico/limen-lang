@@ -18,6 +18,10 @@ exception Fatal of t
 let make ?(severity = Error) ?(notes = []) ?fix code span message =
   { code; severity; message; span; notes; fix }
 
+(* Warnings are reported but do not stop a program from building or running. *)
+let errors ds = List.filter (fun d -> d.severity = Error) ds
+let warnings ds = List.filter (fun d -> d.severity = Warning) ds
+
 let explanations = [
   "E0001", "The lexer found a character that is not part of Vela's syntax.";
   "E0002", "A string literal or interpolation was not closed before the end of the file.";
@@ -45,7 +49,8 @@ let explanations = [
   "E0120", "A name is promoted from two embedded structs at the same depth, so `x.name` could mean either. In `struct C { A, B }` where both A and B have `name`, write `c.A.name` or `c.B.name`. Ambiguity is only an error where the name is used; the outer struct can also declare its own `name`, which comes first.";
   "E0121", "Only a struct can be embedded: `struct Admin { User, level: Int }`. An `Int`, an enum, a list or a type parameter needs a field name, as in `count: Int`.";
   "E0201", "Type mismatch. The message shows the expected and the actual type.";
-  "E0202", "`?` returns early with the error, so the enclosing function must return `Result` (or `Option`) with the same error type. Convert errors with `.map_err(...)`.";
+  "W0001", "A built-in method was renamed: `map_err` is now `map_error`. The old name still works for now; `vela check --json` and the editor offer a fix that renames it.";
+  "E0202", "`?` returns early with the error, so the enclosing function must return `Result` (or `Option`) with the same error type, or `Result[_, dyn Error]`, which any error type with a `message` method converts to (Str and IoError included). Convert errors by hand with `.map_error(...)`.";
   "E0203", "An `if` without `else` is a statement, so its block must have type `()`.";
   "E0204", "A `match` must cover every possible value. Add the missing arms or a `_` arm.";
   "E0205", "Variables are immutable unless declared with `let mut`. Parameters and pattern bindings are always immutable, and closures cannot modify captured variables because they capture by value.";

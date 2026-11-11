@@ -19,7 +19,8 @@ let rec fv bound acc e =
   | EStr ps -> List.fold_left (fun acc -> function SPExpr x -> go acc x | SPLit _ -> acc) acc ps
   | EList es -> List.fold_left go acc es
   | EBin (_, a, b) | EIndex (a, b) -> go (go acc a) b
-  | EUn (_, a) | ETry a | EField (a, _, _) -> go acc a
+  | EUn (_, a) | ETry (a, None) | EField (a, _, _) -> go acc a
+  | ETry (a, Some c) -> go (go acc a) c
   | ECall (c, args) -> List.fold_left go (go acc c) args
   | EMethod (r, _, _, args) -> List.fold_left go (go acc r) args
   | EIf (c, b, eo) ->

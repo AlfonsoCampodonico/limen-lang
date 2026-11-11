@@ -282,7 +282,7 @@ let rec lower f (e : expr) : I.atom =
     | EField _ | EIndex _ -> (
       let root, rty, steps = access f e in
       match steps with [] -> root | _ -> tmp f ty (I.Get (root, rty, steps)))
-    | ETry x -> lower_try f x
+    | ETry (x, c) -> lower_try f x c
     | EIf (c, b, els) ->
       let ca = lower f c in
       let r = fresh_var "if" ty in
@@ -314,17 +314,7 @@ let rec lower f (e : expr) : I.atom =
     | EDyn (x, i) ->
       let t = tyof f x in
       let a = lower f x in
-      let n = match t with TNamed (n, _) -> n | _ -> failwith "dyn of a non-named type" in
-      let ms = Option.value ~default:[] (Hashtbl.find_opt Check.ifaces i) in
-      let entries =
-        List.map
-          (fun (m, (ps, r)) ->
-            let key = n ^ "::" ^ m in
-            let d = Hashtbl.find f.g.fns key in
-            (instance f.g key (derive_targs d (t :: ps)), ps, r))
-          ms
-      in
-      tmp f ty (I.MkDyn (t, i, a, entries))
+      mk_dyn f t i a
     | EGroup (name, until, b) ->
       (* with a deadline, each result is an Option: None for a cancelled task *)
       let t = match (ty, until) with TList (TNamed ("Option", [ t ])), Some _ -> t | TList t, None -> t | _ -> TUnit in
@@ -454,16 +444,51 @@ and lower_place f e : I.var * I.step list =
     (v, s @ [ I.PIndex (ia, e.espan) ])
   | _ -> failwith "place"
 
-and lower_try f x =
+(* Box [a] of type [t] as `dyn i`: a vtable of t's methods. *)
+and mk_dyn f t i a =
+  let ms = Option.value ~default:[] (Hashtbl.find_opt Check.ifaces i) in
+  let entries = List.map (fun (m, (ps, r)) -> (method_fn f t m ps, ps, r)) ms in
+  tmp f (TDyn i) (I.MkDyn (t, i, a, entries))
+
+(* The function that is method [m] of type [t], receiver first. *)
+and method_fn f t m ps =
+  let key =
+    match t with
+    | TNamed (n, _) when Hashtbl.mem f.g.fns (n ^ "::" ^ m) -> n ^ "::" ^ m
+    | TStr when m = "message" -> "$Str::message"
+    | TNamed ("IoError", _) when m = "message" -> "$IoError::message"
+    | _ when m = "cause" -> "$no_cause" (* `cause` is optional in `Error` *)
+    | _ -> failwith ("no method " ^ m)
+  in
+  let d = Hashtbl.find f.g.fns key in
+  instance f.g key (derive_targs d (t :: ps))
+
+and lower_try f x context =
   let a = lower f x in
   let xt = tyof f x in
+  let fn_err = match f.ret with TNamed ("Result", [ _; e ]) -> Some e | _ -> None in
+  (* the error the function returns: converted to `dyn Error` if it returns
+     one, and wrapped with the context if there is one *)
+  let to_ret_err ev et =
+    let ev = match (fn_err, et) with Some (TDyn "Error"), TDyn "Error" -> ev | Some (TDyn "Error"), _ -> mk_dyn f et "Error" ev | _ -> ev in
+    match context with
+    | None -> ev
+    | Some c ->
+      let ca = lower f c in
+      let wt = TNamed ("WrappedError", []) in
+      mk_dyn f wt "Error" (tmp f wt (I.MkStruct (wt, [ ca; ev ])))
+  in
   let ok_ty, fail =
     match xt with
     | TNamed ("Result", [ t; et ]) ->
       ( t,
         fun () ->
           let ev = tmp f et (I.Payload (a, xt, 1, 0)) in
-          tmp f f.ret (I.MkEnum (f.ret, 1, [ ev ])) )
+          tmp f f.ret (I.MkEnum (f.ret, 1, [ to_ret_err ev et ])) )
+    | TNamed ("Option", [ t ]) when context <> None ->
+      (* `opt? "context"`: the context is the error *)
+      let c = Option.get context in
+      (t, fun () -> let ca = lower f c in tmp f f.ret (I.MkEnum (f.ret, 1, [ mk_dyn f TStr "Error" ca ])))
     | TNamed ("Option", [ t ]) -> (t, fun () -> tmp f f.ret (I.MkEnum (f.ret, 1, [])))
     | _ -> failwith "try"
   in
@@ -629,6 +654,13 @@ and lower_method f e recv name args ty =
     let ra = lower f recv in
     let xs = List.map (lower f) args in
     tmp f ty (I.CallDyn (k, ps, r, ra, xs))
+  | (TStr | TNamed ("IoError", _)) when name = "message" ->
+    let c = method_fn f rt name [] in
+    tmp f ty (I.Call (c, [ lower f recv ]))
+  | (TStr | TNamed _) when name = "cause" && args = [] && (match rt with TNamed (n, _) -> not (Hashtbl.mem f.g.fns (n ^ "::cause")) | _ -> true) ->
+    (* reached through an `Error` bound on a type without a `cause` *)
+    let c = method_fn f rt name [] in
+    tmp f ty (I.Call (c, [ lower f recv ]))
   | TNamed (n, _) when Hashtbl.mem f.g.fns (n ^ "::" ^ name) ->
     (* a method on a user type: a call with the receiver first *)
     let key = n ^ "::" ^ name in
@@ -672,7 +704,7 @@ and lower_method f e recv name args ty =
         let y = tmp f ut (I.CallClo (ca, [ p ])) in
         I.MkEnum (ty, 0, [ y ]))
       (fun () -> I.MkEnum (ty, 1, []))
-  | TNamed ("Result", [ at; et ]), "map_err", [ fn ] ->
+  | TNamed ("Result", [ at; et ]), "map_error", [ fn ] ->
     let ra = lower f recv in
     let ca = lower f fn in
     let c = tmp f TBool (I.IsTag (ra, rt, 1)) in

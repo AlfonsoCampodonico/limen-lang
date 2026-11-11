@@ -1155,10 +1155,16 @@ let rec eval rt env e : value =
         raise (Panic (sprintf "index %Ld is out of range for bytes of length %d" k (String.length b), e.espan));
       vint (Char.code b.[Int64.to_int k])
     | _ -> failwith "internal: index")
-  | ETry x -> (
+  | ETry (x, ctx) -> (
     match eval rt env x with
     | VEnum (_, ("Ok" | "Some"), [ v ]) -> v
-    | VEnum (_, ("Err" | "None"), _) as r -> raise (Return r)
+    | VEnum (_, ("Err" | "None"), _) as r when ctx = None -> raise (Return r)
+    | VEnum (_, ("Err" | "None"), cause) -> (
+      (* `x? "context"`: the error becomes `dyn Error` (values carry their
+         type, so that changes nothing here), wrapped with the context *)
+      let text = eval rt env (Option.get ctx) in
+      let err = match cause with [ c ] -> VStruct ("WrappedError", [ ("context", text); ("inner", c) ]) | _ -> text in
+      raise (Return (VEnum ("Result", "Err", [ err ]))))
     | _ -> failwith "internal: try")
   | EIf (c, b, els) -> (
     if as_bool (eval rt env c) then eval_block rt env b
@@ -1575,6 +1581,9 @@ and call_method rt v name args sp =
   | Some d -> call_fn rt d (v :: args)
   | None ->
   match (v, name, args) with
+  | VStr _, "message", [] -> call_fn rt (Hashtbl.find rt.fns "$Str::message") [ v ]
+  | VEnum ("IoError", _, _), "message", [] -> call_fn rt (Hashtbl.find rt.fns "$IoError::message") [ v ]
+  | _, "cause", [] -> none (* `cause` is optional in `Error` *)
   | VMap mv, "len", [] -> vint (KM.cardinal mv.m)
   | VMap mv, "is_empty", [] -> VBool (KM.is_empty mv.m)
   | VMap mv, "get", [ k ] -> ( match KM.find_opt (key_of k) mv.m with Some (_, v) -> some v | None -> none)
@@ -1662,8 +1671,8 @@ and call_method rt v name args sp =
   | VEnum ("Option", _, _), "map", [ _ ] -> none
   | VEnum ("Result", vn, _), "is_ok", [] -> VBool (vn = "Ok")
   | VEnum ("Result", vn, _), "is_err", [] -> VBool (vn = "Err")
-  | VEnum ("Result", "Err", [ e ]), "map_err", [ f ] -> VEnum ("Result", "Err", [ call f [ e ] ])
-  | (VEnum ("Result", _, _) as r), "map_err", [ _ ] -> r
+  | VEnum ("Result", "Err", [ e ]), "map_error", [ f ] -> VEnum ("Result", "Err", [ call f [ e ] ])
+  | (VEnum ("Result", _, _) as r), "map_error", [ _ ] -> r
   | VGroup g, (("go" | "#go") as go), [ c ] ->
     let t = { cancelled = g.gcancelled } in
     let res = ref (if g.gcancelled then Some Stopped else None) in
@@ -1797,7 +1806,16 @@ let run ?(before_main = fun () -> ()) ~out ~grants (user_items : item list) : (v
       spawn_fiber { cancelled = false } (fun () -> result := Some (call_fn rt d args));
       schedule (fun () -> !result <> None) d.fn_span;
       Queue.clear runq;
-      Ok (Option.get !result)
+      (* a `dyn Error` from main is reported by its message *)
+      match (Option.get !result, d.fn_ret) with
+      | ( VEnum ("Result", "Err", [ e ]),
+          Some { tdesc = TyName ("Result", [ _; { tdesc = TyName ("dyn", [ { tdesc = TyName ("Error", []); _ } ]); _ } ]); _ } ) ->
+        let m = ref None in
+        spawn_fiber { cancelled = false } (fun () -> m := Some (call_method rt e "message" [] d.fn_span));
+        schedule (fun () -> !m <> None) d.fn_span;
+        Queue.clear runq;
+        Ok (VEnum ("Result", "Err", [ Option.get !m ]))
+      | r, _ -> Ok r
     with
     | Panic (m, sp) -> Queue.clear runq; Error (m, sp)
     | Stack_overflow -> Queue.clear runq; Error ("stack overflow", d.fn_span))
