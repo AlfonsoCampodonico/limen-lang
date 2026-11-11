@@ -27,7 +27,13 @@ let tools =
       [ source_p; ("native", bool_prop "Compile to native code instead of interpreting (default false)");
         ("timeout_seconds", int_prop "Time limit, 1 to 60") ]
       [ "source" ];
-    tool "vela_test" "Run the `test \"name\" { ... }` blocks in a Vela program and report each result. A test that declares `(fs: Fs)` gets a fresh, empty temporary directory." [ source_p; ("native", bool_prop "Run natively (default false)") ] [ "source" ];
+    tool "vela_test"
+      "Run the `test \"name\" { ... }` blocks in a Vela program and report each result. A test that declares `(fs: Fs)` gets a fresh, empty temporary directory. A table test `test \"add\" for (a, b, want) in [(1, 2, 3)] { ... }` runs once per case, named by the case. With bench, also runs the `bench \"name\" { ... }` blocks natively and reports ns/op and allocs/op."
+      [ source_p; ("native", bool_prop "Run natively (default false)"); ("run", str_prop "Only tests and benches whose name contains this text");
+        ("bench", bool_prop "Also run the benchmarks, natively, for 200ms each (default false)");
+        ("json", bool_prop "Report as JSON: {tests: [{name, ok, message?, where?, seconds}], benches: [{name, ok, iterations, ns_per_op, allocs_per_op}], passed, failed, seconds}");
+        ("timeout_seconds", int_prop "Time limit, 1 to 60") ]
+      [ "source" ];
     tool "vela_format" "Format a Vela program in the canonical style." [ source_p ] [ "source" ];
     tool "vela_caps" "List each function and the capabilities in its signature (its authority), or `pure`." [ source_p ] [ "source" ];
     tool "vela_type_at" "The type (or signature) at a position in a Vela program. line and character are 0-based."
@@ -104,7 +110,14 @@ let call name args =
   | "vela_run" | "vela_test" ->
     let native = arg args "native" = J.Bool true in
     let timeout = match arg args "timeout_seconds" with J.Int n -> max 1 (min 60 n) | _ -> 10 in
-    let base = if name = "vela_run" then [ "run" ] else [ "test" ] in
+    let base =
+      if name = "vela_run" then [ "run" ]
+      else
+        [ "test" ]
+        @ (match arg args "run" with J.String p -> [ "--run"; p ] | _ -> [])
+        @ (if arg args "bench" = J.Bool true then [ "--bench-time"; "200ms" ] else [])
+        @ if arg args "json" = J.Bool true then [ "--json" ] else []
+    in
     let status, o, e = run_cli (base @ if native then [ "--native" ] else []) src timeout in
     let head = match status with `Exit n -> Printf.sprintf "exit %d" n | `Timeout -> Printf.sprintf "timed out after %d s" timeout in
     text_result ~is_error:(status <> `Exit 0) (Printf.sprintf "%s\nstdout:\n%s\nstderr:\n%s" head o e)

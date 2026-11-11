@@ -9,7 +9,7 @@ usage:
   vela check FILE [--json]
   vela caps FILE [--json]
   vela explain CODE
-  vela test FILE [--native] [--bench] [--bench-time 1s|100x]
+  vela test FILE [--native] [--run TEXT] [--bench] [--bench-time 1s|100x] [--json]
   vela fmt FILE... [--write | --check]
   vela doc FILE|MODULE... [--std] [--all] [--html] [-o OUT]
   vela lsp                (language server on stdin/stdout)
@@ -194,51 +194,96 @@ let parse_bench_time s =
   else if String.ends_with ~suffix:"m" s then (int_of_float (num (cut 1) *. 60e9), 0)
   else die_usage ("--bench-time takes a duration such as 1s or 200ms, or a count such as 100x, not " ^ s)
 
+let fmt_secs s = if s < 1.0 then Printf.sprintf "%.0fms" (s *. 1000.) else Printf.sprintf "%.2fs" s
+
 let ns_per_op b =
   let v = float_of_int b.ns /. float_of_int (max 1 b.iters) in
   if v < 10. then Printf.sprintf "%.2f" v else if v < 100. then Printf.sprintf "%.1f" v else Printf.sprintf "%.0f" v
 
-type test_opts = { native : bool; bench : (int * int) option }
+type test_opts = { native : bool; bench : (int * int) option; pattern : string option; json : bool }
 
 let cmd_test file (o : test_opts) =
   let items, diags, _ = load file in
-  if diags <> [] then (report diags; exit 1);
+  if diags <> [] then begin
+    if o.json then print_endline (Diag.list_to_json diags) else report diags;
+    exit 1
+  end;
+  let selected n = match o.pattern with None -> true | Some p -> Interp_util.find_sub n p 0 <> None in
   (* tests and benches are numbered in order, as the test binary numbers them *)
   let numbered bench =
     List.mapi (fun i (n, d) -> (i, n, Caps.takes_fs d))
       (List.filter_map (function Ast.IFn ({ fn_test = Some n; fn_bench = b; _ } as d) when b = bench -> Some (n, d) | _ -> None) items)
+    |> List.filter (fun (_, n, _) -> selected n)
   in
   let tests = numbered false and benches = if o.bench <> None then numbered true else [] in
-  if tests = [] && benches = [] then (print_endline "no tests"; exit 0);
+  if tests = [] && benches = [] then begin
+    if o.json then print_endline {|{"tests":[],"benches":[],"passed":0,"failed":0}|}
+    else print_endline (if o.pattern = None then "no tests" else "no tests match");
+    exit 0
+  end;
+  let start = Unix.gettimeofday () in
+  (* a test's own output goes to stdout; with --json, it would break the JSON *)
+  let out s = if not o.json then (print_string s; flush stdout) in
   let test_results, bench_results =
-    if o.native || o.bench <> None then
-      let ts, bs = run_native_tests items tests benches o.bench in
-      (List.map (fun (n, r, _) -> (n, r)) ts, bs)
+    if o.native || o.bench <> None then run_native_tests items tests benches o.bench
     else
       ( List.map
-          (fun (n, r) -> (n, match r with Ok () -> Ok () | Error (m, sp) -> Error (m, where_of sp)))
-          (Interp.run_tests ~out:(fun s -> print_string s; flush stdout) items),
+          (fun (n, r, t) -> (n, (match r with Ok () -> Ok () | Error (m, sp) -> Error (m, where_of sp)), t))
+          (Interp.run_tests_timed ~select:selected ~out items),
         [] )
   in
-  let failed = List.length (List.filter (fun (_, r) -> Result.is_error r) test_results)
+  let total = Unix.gettimeofday () -. start in
+  let failed = List.length (List.filter (fun (_, r, _) -> Result.is_error r) test_results)
                + List.length (List.filter (fun (_, r) -> Result.is_error r) bench_results) in
-  let fail name (m, w) =
-    Printf.printf "FAIL  %s\n      %s\n" name m;
-    if w <> "" then Printf.printf "      --> %s\n" w
-  in
-  List.iter (fun (name, r) -> match r with Ok () -> Printf.printf "ok    %s\n" name | Error e -> fail name e) test_results;
-  let width = List.fold_left (fun w (n, _) -> max w (String.length n)) 0 bench_results in
-  List.iter
-    (fun (name, r) ->
-      match r with
-      | Ok b -> Printf.printf "bench %-*s %12d %12s ns/op %8d allocs/op\n" width name b.iters (ns_per_op b) (b.allocs / max 1 b.iters)
-      | Error e -> fail name e)
-    bench_results;
-  let count n what = Printf.sprintf "%d %s%s" n what (if n = 1 then "" else if what = "bench" then "es" else "s") in
-  Printf.printf "%s%s, %d failed\n"
-    (count (List.length test_results) "test")
-    (if bench_results = [] then "" else ", " ^ count (List.length bench_results) "bench")
-    failed;
+  let passed = List.length test_results + List.length bench_results - failed in
+  if o.json then begin
+    let open Json in
+    let micro t = Float.round (t *. 1e6) /. 1e6 in
+    let fail_fields (m, w) = [ ("ok", Bool false); ("message", String m) ] @ if w = "" then [] else [ ("where", String w) ] in
+    let tests =
+      List.map
+        (fun (n, r, t) ->
+          Obj ([ ("name", String n) ] @ (match r with Ok () -> [ ("ok", Bool true) ] | Error e -> fail_fields e) @ [ ("seconds", Float (micro t)) ]))
+        test_results
+    in
+    let benches =
+      List.map
+        (fun (n, r) ->
+          Obj
+            (( "name", String n )
+            :: (match r with
+               | Ok b ->
+                 [ ("ok", Bool true); ("iterations", Int b.iters); ("ns_per_op", Float (float_of_int b.ns /. float_of_int (max 1 b.iters)));
+                   ("allocs_per_op", Int (b.allocs / max 1 b.iters)) ]
+               | Error e -> fail_fields e)))
+        bench_results
+    in
+    print_endline
+      (to_string
+         (Obj [ ("tests", List tests); ("benches", List benches); ("passed", Int passed); ("failed", Int failed); ("seconds", Float (micro total)) ]))
+  end
+  else begin
+    let fail name (m, w) =
+      Printf.printf "FAIL  %s\n      %s\n" name m;
+      if w <> "" then Printf.printf "      --> %s\n" w
+    in
+    List.iter
+      (fun (name, r, t) -> match r with Ok () -> Printf.printf "ok    %s (%s)\n" name (fmt_secs t) | Error e -> fail name e)
+      test_results;
+    let width = List.fold_left (fun w (n, _) -> max w (String.length n)) 0 bench_results in
+    List.iter
+      (fun (name, r) ->
+        match r with
+        | Ok b ->
+          Printf.printf "bench %-*s %12d %12s ns/op %8d allocs/op\n" width name b.iters (ns_per_op b) (b.allocs / max 1 b.iters)
+        | Error e -> fail name e)
+      bench_results;
+    let count n what = Printf.sprintf "%d %s%s" n what (if n = 1 then "" else if what = "bench" then "es" else "s") in
+    Printf.printf "%s%s, %d failed (%s)\n"
+      (count (List.length test_results) "test")
+      (if bench_results = [] then "" else ", " ^ count (List.length bench_results) "bench")
+      failed (fmt_secs total)
+  end;
   exit (if failed = 0 then 0 else 1)
 
 let cmd_fmt files mode =
@@ -434,13 +479,15 @@ let () =
       | "--native" :: r -> go file { o with native = true } r
       | "--bench" :: r -> go file { o with bench = Some (Option.value o.bench ~default:(1_000_000_000, 0)) } r
       | "--bench-time" :: t :: r -> go file { o with bench = Some (parse_bench_time t) } r
-      | "--bench-time" :: [] -> die_usage "--bench-time needs a value"
+      | "--run" :: p :: r -> go file { o with pattern = Some p } r
+      | "--json" :: r -> go file { o with json = true } r
+      | ("--bench-time" | "--run") :: [] -> die_usage "--bench-time and --run need a value"
       | a :: _ when String.length a > 1 && a.[0] = '-' -> die_usage ("unknown test option " ^ a)
       | f :: r when file = None -> go (Some f) o r
       | _ :: _ -> die_usage "test takes one FILE"
       | [] -> ( match file with Some f -> cmd_test f o | None -> die_usage "test needs a FILE")
     in
-    go None { native = false; bench = None } rest
+    go None { native = false; bench = None; pattern = None; json = false } rest
   | "doc" :: rest -> cmd_doc rest
   | "fmt" :: rest -> (
     let mode = if List.mem "--write" rest then `Write else if List.mem "--check" rest then `Check else `Print in

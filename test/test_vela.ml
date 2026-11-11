@@ -1538,6 +1538,8 @@ bench "boom" {
   in
   let got = List.map (fun (n, r) -> (n, match r with Ok () -> None | Error (m, _) -> Some m)) (Interp.run_tests ~out:ignore items) in
   ok "vela-table-interp" (got = want) (String.concat "; " (List.map (fun (n, m) -> n ^ "=" ^ Option.value ~default:"ok" m) got));
+  let only = List.map (fun (n, _, _) -> n) (Interp.run_tests_timed ~select:(fun n -> String.starts_with ~prefix:"one" n) ~out:ignore items) in
+  ok "vela-table-select" (only = [ "one name \"a\""; "one name \"bb\"" ]) (String.concat "; " only);
   if native_for "vela-table" then begin
     let exe = Filename.concat tmpdir "vela-table-tests" in
     match Native.build ~flags:sanitize ~tests:true items exe with
@@ -1589,7 +1591,7 @@ bench "boom" {
   errs "vela-bench-duplicate" "bench \"a\" {}\nbench \"a\" {}\ntest \"a\" {}" [ "E0106" ];
   errs "vela-bench-bad-cap" "bench \"x\" (n: Net) {}" [ "E0306" ];
   errs "keep-arity" "fn main() {\n    keep(1, 2)\n}" [ "E0107" ];
-  (* the `vela test` command with --bench *)
+  (* the `vela test` command: --run, --json, --bench *)
   let cli_exe =
     let e = Filename.concat (Filename.dirname (Filename.dirname Sys.executable_name)) "bin/main.exe" in
     if Filename.is_relative e then Filename.concat (Sys.getcwd ()) e else e
@@ -1601,6 +1603,32 @@ bench "boom" {
     let code = Sys.command (String.concat " " (List.map Filename.quote (cli_exe :: args)) ^ sprintf " >%s 2>%s" (Filename.quote o) (Filename.quote e)) in
     (code, read_file o, read_file e)
   in
+  (* the time in parentheses varies; drop it *)
+  let untimed o =
+    String.concat "\n"
+      (List.map
+         (fun l -> match String.rindex_opt l '(' with Some i when String.ends_with ~suffix:"s)" l -> String.sub l 0 (max 0 (i - 1)) | _ -> l)
+         (String.split_on_char '\n' o))
+  in
+  let code, o, _ = cli [ "test"; table_file; "--run"; "add (2" ] in
+  ok "cli-test-run"
+    (code = 1
+    && untimed o
+       = sprintf "ok    add (2, 2, 4)\nFAIL  add (2, 2, 5)\n      assertion failed: 4 != 5\n      --> %s:7:5\n2 tests, 1 failed\n" table_file)
+    (sprintf "%d %S" code o);
+  let code, o, _ = cli [ "test"; table_file; "--run"; "nothing like this" ] in
+  ok "cli-test-run-none" (code = 0 && o = "no tests match\n") o;
+  let code, o, _ = cli [ "test"; table_file; "--json"; "--run"; "one name" ] in
+  let j = try Json.parse o with Json.Error _ -> Json.Null in
+  let names = match Json.member "tests" j with Json.List ts -> List.map (fun t -> Json.to_str (Json.member "name" t)) ts | _ -> [] in
+  ok "cli-test-json" (code = 0 && names = [ "one name \"a\""; "one name \"bb\"" ] && Json.member "failed" j = Json.Int 0) o;
+  let code, o, _ = cli [ "test"; table_file; "--json"; "--run"; "add (2, 2, 5)" ] in
+  let j = try Json.parse o with Json.Error _ -> Json.Null in
+  let t = match Json.member "tests" j with Json.List [ t ] -> t | _ -> Json.Null in
+  ok "cli-test-json-fail"
+    (code = 1 && Json.member "ok" t = Json.Bool false && Json.to_str (Json.member "message" t) = "assertion failed: 4 != 5"
+    && Json.to_str (Json.member "where" t) = table_file ^ ":7:5")
+    o;
   if native_for "cli-test-bench" then begin
     let code, o, _ = cli [ "test"; table_file; "--bench-time"; "3x" ] in
     let lines = String.split_on_char '\n' o in
@@ -1610,7 +1638,10 @@ bench "boom" {
       && List.exists (fun l -> String.starts_with ~prefix:"bench sum " l && Interp_util.find_sub l "           3 " 0 <> None && String.ends_with ~suffix:" 0 allocs/op" l) lines
       && has "7 tests, 3 benches, 2 failed")
       o;
-    ok "cli-test-bench-fail" (Interp_util.find_sub o "FAIL  boom\n      index 3 is out of range" 0 <> None) o
+    let code, o, _ = cli [ "test"; table_file; "--bench-time"; "2x"; "--json"; "--run"; "boom" ] in
+    let j = try Json.parse o with Json.Error _ -> Json.Null in
+    let b = match Json.member "benches" j with Json.List [ b ] -> b | _ -> Json.Null in
+    ok "cli-test-bench-fail" (code = 1 && Json.member "ok" b = Json.Bool false && String.starts_with ~prefix:"index 3" (Json.to_str (Json.member "message" b))) o
   end;
   let code, _, e = cli [ "test"; table_file; "--bench-time"; "fast" ] in
   ok "cli-test-bench-time-bad" (code = 2 && String.starts_with ~prefix:"vela: --bench-time" e) e;

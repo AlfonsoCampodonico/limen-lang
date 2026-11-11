@@ -97,7 +97,10 @@ let rec to_string = function
   | Null -> "null"
   | Bool b -> string_of_bool b
   | Int k -> string_of_int k
-  | Float f -> Printf.sprintf "%.17g" f
+  | Float f ->
+    (* the shortest text that reads back as the same number *)
+    let s = Printf.sprintf "%.15g" f in
+    if float_of_string s = f then s else Printf.sprintf "%.17g" f
   | String s -> Diag.jstr s
   | List l -> "[" ^ String.concat "," (List.map to_string l) ^ "]"
   | Obj fs -> "{" ^ String.concat "," (List.map (fun (k, v) -> Diag.jstr k ^ ":" ^ to_string v) fs) ^ "}"

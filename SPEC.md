@@ -859,7 +859,8 @@ test "saves the config" (fs: Fs) {
     assert_eq(fs.read("app.conf"), Ok("3"))
 }
 ```
-- `vela test FILE` runs every test, each isolated, and prints `ok` or `FAIL` with the panic message and location; it exits with status 1 if any test fails. `--native` runs them as native code.
+- `vela test FILE` runs every test, each isolated, and prints `ok` (with the time it took) or `FAIL` with the panic message and location; it exits with status 1 if any test fails. `--native` runs them as native code.
+- `--run TEXT` runs only the tests (and benchmarks) whose name contains `TEXT`. `--json` prints one JSON object instead, for tools and agents: `{"tests": [{"name", "ok", "message"?, "where"?, "seconds"}], "benches": [...], "passed", "failed", "seconds"}`; a test's own output is left out of it.
 - Test names must be unique (E0106). Tests are type-checked by `vela check` and ignored by `vela run` and `vela build`.
 
 ### Table tests
@@ -872,7 +873,7 @@ test "add" for (a, b, want) in [(1, 2, 3), (2, 2, 4), (-1, 1, 0)] {
 }
 ```
 
-- Each case is a test of its own: it runs isolated, and it is named by the test's name and the case's text, as in `add (2, 2, 4)`. A failure names the case.
+- Each case is a test of its own: it runs isolated, and it is named by the test's name and the case's text, as in `add (2, 2, 4)`. A failure names the case, and `--run "add (2"` picks cases by their text.
 - The pattern after `for` unpacks each case like `let` does: a name, `_`, or a tuple of those, nested as needed (`for (name, (input, want)) in [...]`).
 - The cases must be a list literal with at least one case (E0003), so every case is known, and named, before anything runs. To share cases between tests, write the list twice or loop inside one test.
 - Capabilities go before `for`: `test "save" (fs: Fs) for name in ["a.txt", "b.txt"] { ... }`. Each case gets its own fresh directory.
