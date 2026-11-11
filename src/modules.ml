@@ -230,7 +230,11 @@ let rec expr env locals (e : expr) : expr =
     | EMatch (s, arms) ->
       EMatch
         ( ex s,
-          List.map (fun a -> { apat = pat env locals a.apat; abody = expr env (pat_binds a.apat locals) a.abody }) arms )
+          List.map
+            (fun a ->
+              let inner = pat_binds a.apat locals in
+              { apat = pat env locals a.apat; aguard = Option.map (expr env inner) a.aguard; abody = expr env inner a.abody })
+            arms )
     | EBlock b -> EBlock (block env locals b)
     | EClosure (ps, body) ->
       let locals' = List.fold_left (fun acc (n, _, _) -> n :: acc) locals ps in

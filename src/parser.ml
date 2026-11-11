@@ -375,9 +375,10 @@ and parse_match st =
   let arms = ref [] in
   while not (accept_sym st "}") do
     let p = parse_pat st in
+    let guard = if is_kw st "if" then (ignore (advance st); Some (parse_expr st)) else None in
     ignore (expect_sym st "=>");
     let body = parse_expr st in
-    arms := { apat = p; abody = body } :: !arms;
+    arms := { apat = p; aguard = guard; abody = body } :: !arms;
     if (not (accept_sym st ",")) && (not (is_sym st "}")) && not (peek st).nl then
       fail (peek st) "`,` or a new line between match arms"
   done;

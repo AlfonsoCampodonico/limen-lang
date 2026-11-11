@@ -44,7 +44,7 @@ let explanations = [
   "E0201", "Type mismatch. The message shows the expected and the actual type.";
   "E0202", "`?` returns early with the error, so the enclosing function must return `Result` (or `Option`) with the same error type. Convert errors with `.map_err(...)`.";
   "E0203", "An `if` without `else` is a statement, so its block must have type `()`.";
-  "E0204", "A `match` must cover every possible value. Add the missing arms or a `_` arm.";
+  "E0204", "A `match` must cover every possible value. Add the missing arms or a `_` arm. An arm with an `if` guard covers nothing, because its guard may be false.";
   "E0205", "Variables are immutable unless declared with `let mut`. Parameters and pattern bindings are always immutable, and closures cannot modify captured variables because they capture by value.";
   "E0206", "A struct literal must set every field.";
   "E0207", "The type of this value is not known at this point. Add a type annotation, for example `let xs: List[Int] = []`.";

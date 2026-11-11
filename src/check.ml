@@ -1195,6 +1195,7 @@ and check_match ?want ctx f s arms sp =
     (fun arm ->
       push f;
       check_pat ctx f st arm.apat;
+      Option.iter (fun g -> expect ctx f g TBool) arm.aguard;
       (match want with
        | Some w -> expect ctx f arm.abody w
        | None ->
@@ -1205,7 +1206,8 @@ and check_match ?want ctx f s arms sp =
   (match arms with
    | [] -> err ctx "E0204" sp "`match` needs at least one arm"
    | _ -> (
-     match missing_arms ctx st (List.map (fun a -> a.apat) arms) with
+     (* a guarded arm may not apply, so it covers nothing *)
+     match missing_arms ctx st (List.filter_map (fun a -> if a.aguard = None then Some a.apat else None) arms) with
      | [] -> ()
      | missing ->
        (* Insert new arms on their own lines just above the closing brace. *)

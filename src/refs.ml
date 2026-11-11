@@ -149,7 +149,14 @@ let index (items : item list) : occ list =
        | _ -> ());
       List.iter x args
     | EIf (c, b, eo) -> x c; block env b; Option.iter x eo
-    | EMatch (s, arms) -> x s; List.iter (fun a -> expr (pat env a.apat) a.abody) arms
+    | EMatch (s, arms) ->
+      x s;
+      List.iter
+        (fun a ->
+          let env = pat env a.apat in
+          Option.iter (expr env) a.aguard;
+          expr env a.abody)
+        arms
     | EBlock b -> block env b
     | EGroup (n, until, b) ->
       Option.iter (fun (c, ms) -> x c; x ms) until;

@@ -396,6 +396,19 @@ match shape {
 }
 ```
 
+An arm can have a guard, `if cond` after the pattern, as in a `select`: the arm applies only when its pattern matches **and** the guard is true, otherwise matching goes on with the next arm. The guard sees the pattern's bindings and must be a `Bool` (E0201). Guards run in order, only until an arm applies.
+
+```
+match order {
+    Some(o) if o.total > 1000 => "large",
+    Some(o) if o.paid => "paid",
+    Some(_) => "open",
+    None => "none",
+}
+```
+
+A guarded arm counts for nothing when checking that a `match` is exhaustive, since its guard may be false: above, `Some(_)` is still needed.
+
 Arms are separated by `,` or a newline. An arm's body is an expression, so a statement such as an assignment needs a block: `None => { more = false },`. Patterns nest: `Err(Failed(msg))`, `Some(Some(n))`. A `match` must be exhaustive (E0204); the error comes with an auto-fix that adds the missing arms. Matching on `Int` or `Str` needs a `_` or binding arm. Tuples are checked column by column, so `(true, _)` and `(false, _)` together are exhaustive.
 
 ## 8. Value semantics
@@ -1019,7 +1032,7 @@ primary    = INT | FLOAT | STRING | "true" | "false"
            | "{" expr "with" init { sep init } [ "," ] "}"            (* copy with changes *)
            | block
            | "if" expr_ns block [ "else" ( block | if ) ]
-           | "match" expr_ns "{" { pattern "=>" expr ( "," | NL ) } "}"
+           | "match" expr_ns "{" { pattern [ "if" expr ] "=>" expr ( "," | NL ) } "}"
            | "select" "{" { selarm ( "," | NL ) } "}"
            | "|" [ cparam { "," cparam } ] "|" expr | "||" expr
            | "group" IDENT [ "until" expr ] block ;   (* until clock.after(ms) *)

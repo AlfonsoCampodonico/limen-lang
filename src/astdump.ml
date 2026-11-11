@@ -42,7 +42,7 @@ let rec expr e =
   | EIndex (a, i) -> expr a ^ "[" ^ expr i ^ "]"
   | ETry a -> expr a ^ "?"
   | EIf (c, b, e) -> "if(" ^ expr c ^ ")" ^ block b ^ (match e with Some x -> "else" ^ expr x | None -> "")
-  | EMatch (s, arms) -> "match(" ^ expr s ^ "){" ^ String.concat ";" (List.map (fun a -> pat a.apat ^ "=>" ^ expr a.abody) arms) ^ "}"
+  | EMatch (s, arms) -> "match(" ^ expr s ^ "){" ^ String.concat ";" (List.map (fun a -> pat a.apat ^ (match a.aguard with Some g -> " if " ^ expr g | None -> "") ^ "=>" ^ expr a.abody) arms) ^ "}"
   | EBlock b -> block b
   | EClosure (ps, b) ->
     "|" ^ String.concat "," (List.map (fun (n, t, _) -> n ^ match t with Some t -> ":" ^ ty t | None -> "") ps) ^ "|" ^ expr b

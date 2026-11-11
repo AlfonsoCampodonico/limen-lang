@@ -91,6 +91,15 @@ fn main(root: Root) -> Int {
     let origin = Point { x: 0, y: 0 }
     let moved = { origin with y: 5 }
     out.print("{origin} {moved}")
+    // guards in match arms; a guarded arm does not count as covering its pattern
+    for o in [Some(42), Some(3), None] {
+        let size = match o {
+            Some(n) if n > 10 => "big",
+            Some(_) => "small",
+            None => "nothing",
+        }
+        out.print(size)
+    }
 
     out.print("-- concurrency")
     // tasks returning () run for their effect and add nothing to the list

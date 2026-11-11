@@ -504,7 +504,58 @@ and lower_match f e s arms ty =
         if d1 && d2 then f.dead <- true
       end
   in
-  chain arms;
+  if List.for_all (fun a -> a.aguard = None) arms then chain arms
+  else begin
+    (* With guards, first find the arm: [k] is the index of the first arm
+       whose pattern matches and whose guard holds (-1 for none), trying
+       each arm only while none has been found. Then run that arm's body.
+       Each arm's bindings are made again for its body; this keeps the
+       code linear in the number of arms. *)
+    let k = fresh_var "arm" TInt in
+    emit f (I.Let (k, I.Atom (I.AInt (-1L))));
+    List.iteri
+      (fun i arm ->
+        let set () = emit f (I.Set (k, I.Atom (I.AInt (Int64.of_int i)), ref false)) in
+        let applies () =
+          match arm.aguard with
+          | None -> set ()
+          | Some g ->
+            bind_pat f sa st arm.apat;
+            let ga = lower f g in
+            let yes, _, _ = in_block f set in
+            emit f (I.If (ga, yes, []))
+        in
+        let try_arm () =
+          let b, _, _ = in_block f applies in
+          if irrefutable arm.apat then List.iter (emit f) b
+          else
+            let t = tmp f TBool (I.PatTest (sa, st, arm.apat)) in
+            emit f (I.If (t, b, []))
+        in
+        if i = 0 then try_arm ()
+        else
+          let pending = tmp f TBool (I.Bin (Eq, TInt, I.V k, I.AInt (-1L), e.espan)) in
+          let b, _, _ = in_block f try_arm in
+          emit f (I.If (pending, b, [])))
+      arms;
+    let rec dispatch i = function
+      | [] ->
+        ignore (tmp f TUnit (I.Panic (I.AStr "no `match` arm matched", e.espan)));
+        f.dead <- true
+      | arm :: rest ->
+        let t = tmp f TBool (I.Bin (Eq, TInt, I.V k, I.AInt (Int64.of_int i), e.espan)) in
+        let b1, _, d1 =
+          in_block f (fun () ->
+              bind_pat f sa st arm.apat;
+              let a = lower f arm.abody in
+              emit f (I.Init (r, I.Atom a)))
+        in
+        let b2, _, d2 = in_block f (fun () -> dispatch (i + 1) rest) in
+        emit f (I.If (t, b1, b2));
+        if d1 && d2 then f.dead <- true
+    in
+    dispatch 0 arms
+  end;
   I.V r
 
 and lower_select f e arms ty =

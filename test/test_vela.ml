@@ -2531,7 +2531,7 @@ fn main(root: Root) -> Result[(), IoError] {
   errs "int-literal-too-large" (main_wrap "    let x = 9223372036854775808") [ "E0005" ];
 
   (* ---------- select ---------- *)
-  exits "example-tour" (example "tour.vela") "-- language\ncircle 12.57\n[2.25, 12.56636]\n[0, 1, 4, 9, 16] [\"h\", \"o\", \"l\", \"a\"]\nbound method 3.142\nVELA!\n{Point { x: 0, y: 0 }: [\"origin\", \"home\"]} {(1, 2): 2}\n[(1, \"a\"), (1, \"z\"), (2, \"b\")]\n3 bytes: hi!\n-- syntax\npipe 12\nPoint { x: 0, y: 0 } Point { x: 0, y: 5 }\n-- concurrency\na side task ran\nresults [1, 2]\nwith a deadline [Some(1), None]\nnobody sent anything\n" 3;
+  exits "example-tour" (example "tour.vela") "-- language\ncircle 12.57\n[2.25, 12.56636]\n[0, 1, 4, 9, 16] [\"h\", \"o\", \"l\", \"a\"]\nbound method 3.142\nVELA!\n{Point { x: 0, y: 0 }: [\"origin\", \"home\"]} {(1, 2): 2}\n[(1, \"a\"), (1, \"z\"), (2, \"b\")]\n3 bytes: hi!\n-- syntax\npipe 12\nPoint { x: 0, y: 0 } Point { x: 0, y: 5 }\nbig\nsmall\nnothing\n-- concurrency\na side task ran\nresults [1, 2]\nwith a deadline [Some(1), None]\nnobody sent anything\n" 3;
   out "select" (example "select.vela") "nums done; words done; total 15 letters 3\nnothing ready | sent to c | sent to d | d Some(10)\nafter close: Some(7)\nErr(\"every arm of this `select` is turned off by its guard\")\n";
   out "select-stress" "fn produce(c: Chan[Int], n: Int) -> Int {\n    let mut i = 0\n    while i < n {\n        c.send(i)\n        i = i + 1\n    }\n    c.close()\n    0\n}\n\n// receive from all four until every one is closed\nfn consume(a: Chan[Int], b: Chan[Int], c: Chan[Int], d: Chan[Int]) -> Int {\n    let mut sum = 0\n    let mut on = [true, true, true, true]\n    while on[0] || on[1] || on[2] || on[3] {\n        select {\n            v = a.recv() if on[0] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[0] = false\n                },\n            },\n            v = b.recv() if on[1] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[1] = false\n                },\n            },\n            v = c.recv() if on[2] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[2] = false\n                },\n            },\n            v = d.recv() if on[3] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[3] = false\n                },\n            },\n        }\n    }\n    sum\n}\n\nfn drain(c: Chan[Str]) -> Int {\n    let mut n = 0\n    let mut more = true\n    while more {\n        match c.recv() {\n            Some(s) => {\n                n = n + s.len()\n            },\n            None => {\n                more = false\n            },\n        }\n    }\n    n\n}\n\nfn main(root: Root) {\n    let a: Chan[Int] = channel(1)\n    let b: Chan[Int] = channel(1)\n    let c: Chan[Int] = channel(2)\n    let d: Chan[Int] = channel(1)\n    let sums = group g {\n        g.go(|| produce(a, 500))\n        g.go(|| produce(b, 500))\n        g.go(|| produce(c, 500))\n        g.go(|| produce(d, 500))\n        g.go(|| consume(a, b, c, d))\n        g.go(|| consume(a, b, c, d))\n        g.go(|| consume(a, b, c, d))\n    }\n    root.stdout.print(\"{sums.sum()}\")\n    // select between two sends: a dispatcher feeding two workers\n    let w1: Chan[Str] = channel(1)\n    let w2: Chan[Str] = channel(1)\n    let parts = group g {\n        g.go(|| {\n                let mut i = 0\n                while i < 1000 {\n                    let msg = \"m{i}\"\n                    select {\n                        w1.send(msg) => (),\n                        w2.send(msg) => (),\n                    }\n                    i = i + 1\n                }\n                w1.close()\n                w2.close()\n                0\n            })\n        g.go(|| drain(w1))\n        g.go(|| drain(w2))\n    }\n    root.stdout.print(\"{parts.sum()}\")\n}\n" "499000\n3890\n";
   check_tsan "select-stress-tsan" "fn produce(c: Chan[Int], n: Int) -> Int {\n    let mut i = 0\n    while i < n {\n        c.send(i)\n        i = i + 1\n    }\n    c.close()\n    0\n}\n\n// receive from all four until every one is closed\nfn consume(a: Chan[Int], b: Chan[Int], c: Chan[Int], d: Chan[Int]) -> Int {\n    let mut sum = 0\n    let mut on = [true, true, true, true]\n    while on[0] || on[1] || on[2] || on[3] {\n        select {\n            v = a.recv() if on[0] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[0] = false\n                },\n            },\n            v = b.recv() if on[1] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[1] = false\n                },\n            },\n            v = c.recv() if on[2] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[2] = false\n                },\n            },\n            v = d.recv() if on[3] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[3] = false\n                },\n            },\n        }\n    }\n    sum\n}\n\nfn drain(c: Chan[Str]) -> Int {\n    let mut n = 0\n    let mut more = true\n    while more {\n        match c.recv() {\n            Some(s) => {\n                n = n + s.len()\n            },\n            None => {\n                more = false\n            },\n        }\n    }\n    n\n}\n\nfn main(root: Root) {\n    let a: Chan[Int] = channel(1)\n    let b: Chan[Int] = channel(1)\n    let c: Chan[Int] = channel(2)\n    let d: Chan[Int] = channel(1)\n    let sums = group g {\n        g.go(|| produce(a, 500))\n        g.go(|| produce(b, 500))\n        g.go(|| produce(c, 500))\n        g.go(|| produce(d, 500))\n        g.go(|| consume(a, b, c, d))\n        g.go(|| consume(a, b, c, d))\n        g.go(|| consume(a, b, c, d))\n    }\n    root.stdout.print(\"{sums.sum()}\")\n    // select between two sends: a dispatcher feeding two workers\n    let w1: Chan[Str] = channel(1)\n    let w2: Chan[Str] = channel(1)\n    let parts = group g {\n        g.go(|| {\n                let mut i = 0\n                while i < 1000 {\n                    let msg = \"m{i}\"\n                    select {\n                        w1.send(msg) => (),\n                        w2.send(msg) => (),\n                    }\n                    i = i + 1\n                }\n                w1.close()\n                w2.close()\n                0\n            })\n        g.go(|| drain(w1))\n        g.go(|| drain(w2))\n    }\n    root.stdout.print(\"{parts.sum()}\")\n}\n" "499000\n3890\n";
@@ -3535,6 +3535,83 @@ fn main(root: Root) {
   errs "with-unknown-base" (main_wrap "    let q = { nope with x: 1 }") [ "E0101" ];
   (* `with` only starts a copy right after the base, followed by a field *)
   errs "with-not-a-copy" (main_wrap "    let with = 1\n    let x = { with }\n    out.print(\"{x}\")") [];
+
+  (* ---------- guards in match arms ---------- *)
+  out "match-guard" {|enum Shape {
+    Circle(Float),
+    Rect(Float, Float),
+}
+
+enum Msg {
+    Text(Str),
+    Batch(List[Str]),
+}
+
+fn size(o: Option[Int]) -> Str {
+    match o {
+        Some(n) if n > 10 => "big {n}",
+        Some(n) if n < 0 => "negative",
+        Some(n) => "small {n}",
+        None => "none",
+    }
+}
+
+fn kind(s: Shape) -> Str {
+    match s {
+        Rect(w, h) if w == h => "square",
+        Rect(_, _) => "rect",
+        c if false => "never",
+        Circle(r) => "circle {r}",
+    }
+}
+
+fn seen(out: Stdout, tag: Str, ok: Bool) -> Bool {
+    out.print("guard {tag}")
+    ok
+}
+
+// heap payloads bound for a guard that fails are released
+fn describe(m: Msg) -> Str {
+    match m {
+        Text(s) if s.len() > 3 => "long text {s}",
+        Batch(xs) if xs.len() == 0 => "empty batch",
+        Batch(xs) if xs.contains("stop") => "stop in {xs}",
+        Text(s) => "text {s}",
+        Batch(xs) => "batch of {xs.len()}",
+    }
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    out.print("{size(Some(42))} {size(Some(-1))} {size(Some(3))} {size(None)}")
+    out.print("{kind(Rect(2.0, 2.0))} {kind(Rect(1.0, 2.0))} {kind(Circle(1.5))}")
+    // guards run in order, only until an arm applies
+    let r = match 5 {
+        n if seen(out, "a", n > 7) => "a",
+        n if seen(out, "b", n > 3) => "b",
+        n if seen(out, "c", true) => "c",
+        _ => "none",
+    }
+    out.print(r)
+    for m in [Text("hi"), Text("hello"), Batch([]), Batch(["go", "stop"]), Batch(["x"])] {
+        out.print(describe(m))
+    }
+    let pair = ("hello", 3)
+    let t = match pair {
+        (s, k) if s.len() > k => "long {s}",
+        (s, _) => "short {s}",
+    }
+    out.print(t)
+}
+|} "big 42 negative small 3 none\nsquare rect circle 1.5\nguard a\nguard b\nb\ntext hi\nlong text hello\nempty batch\nstop in [\"go\", \"stop\"]\nbatch of 1\nlong hello\n";
+  (* a guarded arm covers nothing, so the match must still be exhaustive *)
+  errs "match-guard-not-exhaustive" "fn f(o: Option[Int]) -> Int {\n    match o {\n        Some(n) if n > 0 => n,\n        None => 0,\n    }\n}\n" [ "E0204" ];
+  errs "match-guard-all-guarded" "fn f(n: Int) -> Int {\n    match n {\n        k if k > 0 => 1,\n        k if k <= 0 => 0,\n    }\n}\n" [ "E0204" ];
+  errs "match-guard-exhaustive" "fn f(o: Option[Int]) -> Int {\n    match o {\n        Some(n) if n > 0 => n,\n        Some(_) => 0,\n        None => -1,\n    }\n}\n" [];
+  errs "match-guard-type" "fn f(o: Option[Int]) -> Int {\n    match o {\n        Some(n) if n => n,\n        _ => 0,\n    }\n}\n" [ "E0201" ];
+  errs "match-guard-unbound" "fn f(o: Option[Int]) -> Int {\n    match o {\n        Some(n) if m > 0 => n,\n        _ => 0,\n    }\n}\n" [ "E0101" ];
+  (let _, ds, _ = compile "match-guard-fix" "fn f(o: Option[Int]) -> Int {\n    match o {\n        Some(n) if n > 0 => n,\n        None => 0,\n    }\n}\n" in
+   ok "match-guard-fix" (List.exists (fun (d : Diag.t) -> d.message = "`match` does not cover `Some(_)`") ds) (String.concat "; " (List.map (fun (d : Diag.t) -> d.message) ds)));
 
   (* ---------- tuples and maps ---------- *)
   out "tuples" (example "tuples.vela") "3 2 (2, 1)\n(1, \"one\", 1.5) 1 one 1.5 (2, \"a\")\n4 ((1, 2), (3, (4, 5)))\n1 3 4 5\na1 b2 c3 \nyes zero yes no 7\ntrue false 6\n";

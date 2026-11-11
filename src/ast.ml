@@ -64,7 +64,7 @@ and sel_op =
   | SelSend of expr * expr (* channel, value *)
   | SelAfter of expr * expr (* `clock.after(ms)`: clock, milliseconds *)
   | SelDefault
-and arm = { apat : pat; abody : expr }
+and arm = { apat : pat; aguard : expr option (* `if cond`: the arm applies only when true *); abody : expr }
 and block = { stmts : stmt list; tail : expr option; bspan : span }
 and stmt = { sdesc : stmt_desc; sspan : span }
 and stmt_desc =

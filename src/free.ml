@@ -26,7 +26,11 @@ let rec fv bound acc e =
     let acc = fv_block bound (go acc c) b in
     (match eo with Some x -> go acc x | None -> acc)
   | EMatch (s, arms) ->
-    List.fold_left (fun acc a -> fv (pat_binds a.apat bound) acc a.abody) (go acc s) arms
+    List.fold_left
+      (fun acc a ->
+        let bound = pat_binds a.apat bound in
+        fv bound (match a.aguard with Some g -> fv bound acc g | None -> acc) a.abody)
+      (go acc s) arms
   | EBlock b -> fv_block bound acc b
   | EClosure (ps, body) -> fv (List.map (fun (n, _, _) -> n) ps @ bound) acc body
   | EStruct (_, _, fs) -> List.fold_left (fun acc (_, _, x) -> go acc x) acc fs
@@ -75,7 +79,8 @@ let rec has_escape e =
   | ECall (c, args) -> has_escape c || List.exists has_escape args
   | EMethod (r, _, _, args) -> has_escape r || List.exists has_escape args
   | EIf (c, b, eo) -> has_escape c || block_escape b || (match eo with Some x -> has_escape x | None -> false)
-  | EMatch (s, arms) -> has_escape s || List.exists (fun a -> has_escape a.abody) arms
+  | EMatch (s, arms) ->
+    has_escape s || List.exists (fun a -> has_escape a.abody || match a.aguard with Some g -> has_escape g | None -> false) arms
   | EBlock b -> block_escape b
   | EStruct (_, _, fs) -> List.exists (fun (_, _, x) -> has_escape x) fs
   | EWith (b, fs) -> has_escape b || List.exists (fun (_, _, x) -> has_escape x) fs

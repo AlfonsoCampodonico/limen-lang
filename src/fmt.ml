@@ -292,7 +292,9 @@ and expr_inner c ind e =
       (fun a ->
         ignore (leading c (ind + 4) ~prev:!prev a.apat.pspan.lo);
         new_line c (ind + 4);
-        add c (pat a.apat ^ " => ");
+        add c (pat a.apat);
+        (match a.aguard with Some g -> add c " if "; expr c (ind + 4) g | None -> ());
+        add c " => ";
         expr c (ind + 4) a.abody;
         add c ",";
         trailing c a.abody.espan.hi;

@@ -1169,7 +1169,9 @@ let rec eval rt env e : value =
       | [] -> raise (Panic ("no `match` arm matched " ^ show ~top:false v, e.espan))
       | a :: rest ->
         let binds = Hashtbl.create 4 in
-        if pmatch a.apat v binds then eval rt (binds :: env) a.abody else go rest
+        if pmatch a.apat v binds && (match a.aguard with Some g -> as_bool (eval rt (binds :: env) g) | None -> true) then
+          eval rt (binds :: env) a.abody
+        else go rest
     in
     go arms
   | ESelect arms ->

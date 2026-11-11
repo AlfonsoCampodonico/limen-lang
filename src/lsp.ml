@@ -95,7 +95,7 @@ let rec walk_expr (f : expr -> unit) e =
   | ECall (c, args) -> w c; List.iter w args
   | EMethod (r, _, _, args) -> w r; List.iter w args
   | EIf (c, b, eo) -> w c; walk_block f b; Option.iter w eo
-  | EMatch (s, arms) -> w s; List.iter (fun a -> w a.abody) arms
+  | EMatch (s, arms) -> w s; List.iter (fun a -> Option.iter w a.aguard; w a.abody) arms
   | EBlock b -> walk_block f b
   | EGroup (_, until, b) -> Option.iter (fun (c, ms) -> w c; w ms) until; walk_block f b
   | EClosure (_, body) -> w body
