@@ -23,7 +23,8 @@ isep    ::= ws "," ws | sp "\n" ws
 stsep   ::= sp (";" | "\n") ws
 
 # ---------- items ----------
-item     ::= fn | struct | enum
+item     ::= fn | struct | enum | test
+test     ::= "test" sp1 plainstr sp block
 fn       ::= "fn" sp1 ident sp generics? sp "(" ws (param (isep param)* (ws ",")?)? ws ")" (sp "->" sp type)? sp block
 generics ::= "[" ws ident (isep ident)* (ws ",")? ws "]"
 param    ::= ident sp ":" sp type

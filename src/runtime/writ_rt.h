@@ -427,12 +427,14 @@ struct WCap {
   char **hosts; int nhosts;   /* Net: allowlist entries */
   char *root; bool ro;        /* Fs: realpath of root, NULL = not granted */
   int fd; int port;           /* Listener, Conn: the socket */
+  int64_t inflight; int closing; /* operations in progress; close requested */
 };
 static WCap *cap_new(int kind) { WCap *c = (WCap *)w_alloc(sizeof(WCap)); memset(c, 0, sizeof *c); c->rc = 1; c->kind = kind; c->fd = -1; return c; }
+static void w_sock_release_fd(int fd);
 static inline WCap *Cap_dup(WCap *c) { w_rc_inc(&c->rc); return c; }
 static inline void Cap_share(WCap *c) { w_rc_share(&c->rc); }
 static void Cap_drop(WCap *c) {
-  if (w_rc_dec(&c->rc)) { for (int i = 0; i < c->nhosts; i++) free(c->hosts[i]); free(c->hosts); free(c->root); if (c->fd >= 0) close(c->fd); w_free(c); }
+  if (w_rc_dec(&c->rc)) { for (int i = 0; i < c->nhosts; i++) free(c->hosts[i]); free(c->hosts); free(c->root); if (c->fd >= 0) w_sock_release_fd(c->fd); w_free(c); }
 }
 static inline bool Cap_eq(WCap *a, WCap *b) { return a == b; }
 static void Cap_show(WBuf *b, WCap *c, bool top) {
@@ -1307,22 +1309,53 @@ static void w_chan_close(WChan *c, const char *where) {
 static int w_poll_fd = -1;
 static pthread_once_t w_poll_once = PTHREAD_ONCE_INIT;
 
+/* Per-descriptor waiters: one reader slot and one writer slot. Each
+   descriptor is registered once, edge-triggered, for both directions; an
+   event with nobody waiting sets a ready flag, so a task that registers
+   just after the event still sees it. */
+#define W_MAX_FD 65536
+typedef struct { WFiber *r, *w; uint8_t rready, wready, registered; } WFdState;
+static WFdState w_fds[W_MAX_FD];
+#define W_FD_LOCKS 64
+static pthread_mutex_t w_fd_mu[W_FD_LOCKS];
+static pthread_mutex_t *w_fd_lock(int fd) { return &w_fd_mu[fd % W_FD_LOCKS]; }
+
+static void w_fd_event(int fd, int readable, int writable) {
+  if (fd < 0 || fd >= W_MAX_FD) return;
+  WFdState *st = &w_fds[fd];
+  WFiber *wr = NULL, *ww = NULL;
+  pthread_mutex_lock(w_fd_lock(fd));
+  if (readable) { if (st->r) { wr = st->r; st->r = NULL; } else st->rready = 1; }
+  if (writable) { if (st->w) { ww = st->w; st->w = NULL; } else st->wready = 1; }
+  pthread_mutex_unlock(w_fd_lock(fd));
+  if (wr) w_wake(wr);
+  if (ww) w_wake(ww);
+}
+
 static void *w_poller(void *arg) {
   (void)arg;
   for (;;) {
 #ifdef W_KQUEUE
     struct kevent evs[256];
     int n = kevent(w_poll_fd, NULL, 0, evs, 256, NULL);
-    for (int i = 0; i < n; i++) w_wake((WFiber *)evs[i].udata);
+    for (int i = 0; i < n; i++) {
+      int fd = (int)evs[i].ident;
+      int bad = (evs[i].flags & (EV_EOF | EV_ERROR)) != 0;
+      w_fd_event(fd, evs[i].filter == EVFILT_READ || bad, evs[i].filter == EVFILT_WRITE || bad);
+    }
 #else
     struct epoll_event evs[256];
     int n = epoll_wait(w_poll_fd, evs, 256, -1);
-    for (int i = 0; i < n; i++) w_wake((WFiber *)evs[i].data.ptr);
+    for (int i = 0; i < n; i++) {
+      uint32_t e = evs[i].events;
+      w_fd_event(evs[i].data.fd, (e & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR)) != 0, (e & (EPOLLOUT | EPOLLHUP | EPOLLERR)) != 0);
+    }
 #endif
   }
   return NULL;
 }
 static void w_poll_start(void) {
+  for (int i = 0; i < W_FD_LOCKS; i++) pthread_mutex_init(&w_fd_mu[i], NULL);
 #ifdef W_KQUEUE
   w_poll_fd = kqueue();
 #else
@@ -1334,24 +1367,80 @@ static void w_poll_start(void) {
   pthread_detach(th);
 }
 
-/* Park the current task until fd is readable (or writable). */
-static void w_wait_fd(int fd, int write) {
+/* Park until fd may be ready in that direction. Returns -1 if another task
+   is already waiting on it in that direction (or fd is out of range). */
+static int w_wait_fd(int fd, int write) {
+  if (fd < 0 || fd >= W_MAX_FD) return -1;
   pthread_once(&w_poll_once, w_poll_start);
-  WFiber *f = w_current();
+  WFdState *st = &w_fds[fd];
+  pthread_mutex_lock(w_fd_lock(fd));
+  if (!st->registered) {
+#ifdef W_KQUEUE
+    struct kevent ev[2];
+    EV_SET(&ev[0], (uintptr_t)fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, NULL);
+    EV_SET(&ev[1], (uintptr_t)fd, EVFILT_WRITE, EV_ADD | EV_CLEAR, 0, 0, NULL);
+    kevent(w_poll_fd, ev, 2, NULL, 0, NULL);
+#else
+    struct epoll_event ev;
+    ev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET;
+    ev.data.fd = fd;
+    epoll_ctl(w_poll_fd, EPOLL_CTL_ADD, fd, &ev);
+#endif
+    st->registered = 1;
+  }
+  uint8_t *ready = write ? &st->wready : &st->rready;
+  WFiber **slot = write ? &st->w : &st->r;
+  if (*ready) { *ready = 0; pthread_mutex_unlock(w_fd_lock(fd)); return 0; }
+  if (*slot) { pthread_mutex_unlock(w_fd_lock(fd)); return -1; }
   __atomic_fetch_add(&w_io_waiters, 1, __ATOMIC_SEQ_CST);
   w_prepare_park();
-#ifdef W_KQUEUE
-  struct kevent ev;
-  EV_SET(&ev, (uintptr_t)fd, write ? EVFILT_WRITE : EVFILT_READ, EV_ADD | EV_ONESHOT, 0, 0, f);
-  if (kevent(w_poll_fd, &ev, 1, NULL, 0, NULL) < 0) { w_wake(f); }
-#else
-  struct epoll_event ev;
-  ev.events = (write ? EPOLLOUT : EPOLLIN) | EPOLLONESHOT;
-  ev.data.ptr = f;
-  if (epoll_ctl(w_poll_fd, EPOLL_CTL_MOD, fd, &ev) < 0 && epoll_ctl(w_poll_fd, EPOLL_CTL_ADD, fd, &ev) < 0) { w_wake(f); }
-#endif
+  *slot = w_current();
+  pthread_mutex_unlock(w_fd_lock(fd));
   w_park_now();
   __atomic_fetch_sub(&w_io_waiters, 1, __ATOMIC_SEQ_CST);
+  return 0;
+}
+
+/* Wake whoever waits on fd (used when a socket is closed under them). */
+static void w_fd_wake_all(int fd) { w_fd_event(fd, 1, 1); }
+
+/* Forget fd's waiter state and close it, so a new socket that reuses the
+   number starts clean. */
+static void w_sock_release_fd(int fd) {
+  if (fd >= 0 && fd < W_MAX_FD && __atomic_load_n(&w_poll_fd, __ATOMIC_ACQUIRE) >= 0) {
+    pthread_mutex_lock(w_fd_lock(fd));
+    memset(&w_fds[fd], 0, sizeof(WFdState));
+    pthread_mutex_unlock(w_fd_lock(fd));
+  }
+  if (fd >= 0) close(fd);
+}
+
+/* Socket operations are bracketed by enter/leave. close() shuts the socket
+   down at once (waking blocked tasks, which then see `closing`), but the
+   descriptor is only released when no operation is in progress, so its
+   number cannot be reused while a task still holds it. */
+static int w_sock_enter(WCap *c) {
+  __atomic_fetch_add(&c->inflight, 1, __ATOMIC_SEQ_CST);
+  if (__atomic_load_n(&c->closing, __ATOMIC_SEQ_CST)) { __atomic_fetch_sub(&c->inflight, 1, __ATOMIC_SEQ_CST); return -1; }
+  return __atomic_load_n(&c->fd, __ATOMIC_SEQ_CST);
+}
+static void w_sock_really_close(WCap *c) {
+  int fd = __atomic_exchange_n(&c->fd, -1, __ATOMIC_SEQ_CST);
+  if (fd >= 0) w_sock_release_fd(fd);
+}
+static void w_sock_leave(WCap *c) {
+  if (__atomic_sub_fetch(&c->inflight, 1, __ATOMIC_SEQ_CST) == 0 && __atomic_load_n(&c->closing, __ATOMIC_SEQ_CST))
+    w_sock_really_close(c);
+}
+static int w_sock_closing(WCap *c) { return __atomic_load_n(&c->closing, __ATOMIC_SEQ_CST); }
+static void Cap_sock_close(WCap *c) {
+  if (__atomic_exchange_n(&c->closing, 1, __ATOMIC_SEQ_CST)) return;
+  int fd = __atomic_load_n(&c->fd, __ATOMIC_SEQ_CST);
+  if (fd >= 0) {
+    shutdown(fd, SHUT_RDWR);
+    if (fd < W_MAX_FD && __atomic_load_n(&w_poll_fd, __ATOMIC_ACQUIRE) >= 0) w_fd_wake_all(fd);
+  }
+  if (__atomic_load_n(&c->inflight, __ATOMIC_SEQ_CST) == 0) w_sock_really_close(c);
 }
 
 static void w_nonblock(int fd) {
@@ -1415,18 +1504,28 @@ static WIo Cap_listen_on(WCap *l, WStr *addr) {
   return io_ok_ptr(c);
 }
 static WIo Cap_accept(WCap *l) {
+  int fd = w_sock_enter(l);
+  if (fd < 0) return io_err(2, "listener is closed");
   for (;;) {
-    int fd = accept(l->fd, NULL, NULL);
-    if (fd >= 0) {
-      w_nonblock(fd);
+    int c = accept(fd, NULL, NULL);
+    if (c >= 0) {
+      w_nonblock(c);
       int one = 1;
-      setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-      WCap *c = cap_new(CAP_CONN);
-      c->fd = fd;
-      return io_ok_ptr(c);
+      setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+      WCap *conn = cap_new(CAP_CONN);
+      conn->fd = c;
+      w_sock_leave(l);
+      return io_ok_ptr(conn);
     }
-    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR || errno == ECONNABORTED) { if (errno != EINTR && errno != ECONNABORTED) w_wait_fd(l->fd, 0); continue; }
-    return w_errno_io();
+    if (errno == EINTR || errno == ECONNABORTED) continue;
+    if ((errno == EAGAIN || errno == EWOULDBLOCK) && !w_sock_closing(l)) {
+      if (w_wait_fd(fd, 0) < 0) { w_sock_leave(l); return io_err(2, "another task is already accepting on this listener"); }
+      if (w_sock_closing(l)) { w_sock_leave(l); return io_err(2, "listener is closed"); }
+      continue;
+    }
+    WIo r = w_sock_closing(l) ? io_err(2, "listener is closed") : w_errno_io();
+    w_sock_leave(l);
+    return r;
   }
 }
 static WIo Cap_net_connect(WCap *n, WStr *addr) {
@@ -1441,37 +1540,55 @@ static WIo Cap_net_connect(WCap *n, WStr *addr) {
   w_nonblock(fd);
   if (connect(fd, (struct sockaddr *)&sa, sizeof sa) < 0) {
     if (errno != EINPROGRESS) { WIo r = w_errno_io(); close(fd); return r; }
-    w_wait_fd(fd, 1);
-    int err = 0; socklen_t el = sizeof err;
-    getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el);
-    if (err) { close(fd); return io_err(2, strerror(err)); }
+    for (;;) {
+      if (w_wait_fd(fd, 1) < 0) { w_sock_release_fd(fd); return io_err(2, "cannot wait on socket"); }
+      int err = 0; socklen_t el = sizeof err;
+      getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el);
+      if (err) { w_sock_release_fd(fd); return io_err(2, strerror(err)); }
+      struct sockaddr_in peer; socklen_t pl = sizeof peer;
+      if (getpeername(fd, (struct sockaddr *)&peer, &pl) == 0) break;   /* connected */
+      if (errno != ENOTCONN) { WIo r = w_errno_io(); w_sock_release_fd(fd); return r; }
+    }
   }
   WCap *c = cap_new(CAP_CONN);
   c->fd = fd;
   return io_ok_ptr(c);
 }
 static WIo Cap_conn_read(WCap *c) {
-  if (c->fd < 0) return io_err(2, "connection is closed");
+  int fd = w_sock_enter(c);
+  if (fd < 0) return io_err(2, "connection is closed");
   char *buf = (char *)w_raw(65536);
   for (;;) {
-    ssize_t n = read(c->fd, buf, 65536);
-    if (n >= 0) { WStr *s = Str_from(buf, n); free(buf); return io_ok(s); }
-    if (errno == EAGAIN || errno == EWOULDBLOCK) { w_wait_fd(c->fd, 0); continue; }
-    if (errno == EINTR) continue;
+    ssize_t n = read(fd, buf, 65536);
+    if (n >= 0 && !w_sock_closing(c)) { WStr *s = Str_from(buf, n); free(buf); w_sock_leave(c); return io_ok(s); }
+    if (n < 0 && errno == EINTR) continue;
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && !w_sock_closing(c)) {
+      if (w_wait_fd(fd, 0) < 0) { free(buf); w_sock_leave(c); return io_err(2, "another task is already reading this connection"); }
+      continue;
+    }
+    WIo r = w_sock_closing(c) ? io_err(2, "connection is closed") : w_errno_io();
     free(buf);
-    return w_errno_io();
+    w_sock_leave(c);
+    return r;
   }
 }
 static WIo Cap_conn_write(WCap *c, WStr *s) {
-  if (c->fd < 0) return io_err(2, "connection is closed");
+  int fd = w_sock_enter(c);
+  if (fd < 0) return io_err(2, "connection is closed");
   int64_t off = 0;
   while (off < s->len) {
-    ssize_t n = write(c->fd, s->data + off, (size_t)(s->len - off));
+    if (w_sock_closing(c)) { w_sock_leave(c); return io_err(2, "connection is closed"); }
+    ssize_t n = write(fd, s->data + off, (size_t)(s->len - off));
     if (n >= 0) { off += n; continue; }
-    if (errno == EAGAIN || errno == EWOULDBLOCK) { w_wait_fd(c->fd, 1); continue; }
     if (errno == EINTR) continue;
-    return w_errno_io();
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      if (w_wait_fd(fd, 1) < 0) { w_sock_leave(c); return io_err(2, "another task is already writing this connection"); }
+      continue;
+    }
+    WIo r = w_errno_io();
+    w_sock_leave(c);
+    return r;
   }
+  w_sock_leave(c);
   return io_ok(NULL);
 }
-static void Cap_sock_close(WCap *c) { if (c->fd >= 0) { close(c->fd); c->fd = -1; } }

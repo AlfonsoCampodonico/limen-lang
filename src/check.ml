@@ -182,7 +182,7 @@ let visible_names ctx f =
   List.concat_map (fun s -> List.of_seq (Hashtbl.to_seq_keys s.vars)) f.scopes
   @ List.of_seq (Hashtbl.to_seq_keys ctx.fns)
   @ List.of_seq (Hashtbl.to_seq_keys ctx.owners)
-  @ [ "panic"; "channel" ]
+  @ [ "panic"; "channel"; "assert"; "assert_eq" ]
 
 let instantiate s =
   let env = List.map (fun g -> (g, fresh ())) s.gen in
@@ -389,6 +389,21 @@ and check_args ctx f args = List.iter (fun a -> ignore (check_expr ctx f a)) arg
 
 and check_call ctx f callee args sp =
   match callee.edesc with
+  | EVar "assert" when lookup f "assert" = None && not (Hashtbl.mem ctx.fns "assert") ->
+    (match args with
+     | [ a ] -> expect ctx f a TBool
+     | _ -> err ctx "E0107" sp "`assert` takes 1 argument, a Bool"; check_args ctx f args);
+    TUnit
+  | EVar "assert_eq" when lookup f "assert_eq" = None && not (Hashtbl.mem ctx.fns "assert_eq") ->
+    (match args with
+     | [ a; b ] -> (
+       let t = check_expr ctx f a in
+       expect ctx f b t;
+       match repr t with
+       | TFn _ | TCap _ | TChan _ -> err ctx "E0201" sp (sprintf "values of type `%s` cannot be compared" (show t))
+       | _ -> ())
+     | _ -> err ctx "E0107" sp "`assert_eq` takes 2 arguments"; check_args ctx f args);
+    TUnit
   | EVar "channel" when lookup f "channel" = None && not (Hashtbl.mem ctx.fns "channel") ->
     (match args with
      | [ a ] -> expect ctx f a TInt
@@ -993,6 +1008,16 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
         | _ -> None)
       items
   in
+  (* test names are unique *)
+  let seen_tests = Hashtbl.create 8 in
+  List.iter
+    (fun (d, _) ->
+      match d.fn_test with
+      | Some n ->
+        if Hashtbl.mem seen_tests n then err ctx "E0106" d.fn_span (sprintf "test \"%s\" is defined more than once" n);
+        Hashtbl.replace seen_tests n ()
+      | None -> ())
+    sigs;
   (* 4. main *)
   List.iter (fun (d, s) -> if d.fn_name = "main" then check_main ctx d s) sigs;
   (* 5. bodies *)
@@ -1004,11 +1029,11 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
   in
   let infos =
     List.map
-      (fun (d, s) ->
+      (fun ((d : fn_decl), s) ->
         let found = List.fold_left (fun acc t -> caps_in t acc) [] s.ps in
         { name = d.fn_name; span = d.fn_span;
           caps = List.filter (fun c -> List.mem c found) all_caps;
           callbacks = List.exists has_fn s.ps })
-      sigs
+      (List.filter (fun ((d : fn_decl), _) -> d.fn_test = None) sigs)
   in
   (diags, infos)

@@ -126,7 +126,7 @@ let hover_items text items =
   List.iter
     (function
       | IFn d ->
-        add d.fn_span (fn_signature text d);
+        add d.fn_span (match d.fn_test with Some n -> "test \"" ^ n ^ "\"" | None -> fn_signature text d);
         List.iter (fun p -> add p.prm_span (p.prm_name ^ ": " ^ slice text p.prm_ty.tspan)) d.fn_params;
         walk_block
           (fun e ->
@@ -351,7 +351,7 @@ let general_completions doc off =
   | None -> kws
   | Some items ->
     let globals =
-      List.map (fun d -> item 3 d.fn_name (fn_signature doc.text d)) (fns items)
+      List.map (fun d -> item 3 d.fn_name (fn_signature doc.text d)) (List.filter (fun d -> d.fn_test = None) (fns items))
       @ List.map (fun s -> item 22 s.st_name "struct") (structs items)
       @ List.concat_map (fun e -> item 13 e.en_name "enum" :: List.map (fun (v, _, _) -> item 20 v e.en_name) e.en_variants) (enums items)
     in
@@ -382,7 +382,9 @@ let general_completions doc off =
           else [])
         (fns items)
     in
-    locals @ globals @ kws @ [ item 3 "panic" "panic(Str)" ]
+    locals @ globals @ kws
+    @ [ item 3 "panic" "panic(Str)"; item 3 "assert" "assert(Bool)"; item 3 "assert_eq" "assert_eq(T, T)";
+        item 3 "channel" "channel(Int) -> Chan[T]" ]
 
 (* ---------- protocol ---------- *)
 
@@ -498,7 +500,9 @@ let handle st (msg : J.t) : J.t list =
         (J.List
            (List.map
               (function
-                | IFn d -> sym d.fn_name 12 d.fn_span (Span.merge d.fn_span d.fn_body.bspan)
+                | IFn d ->
+                  let name = match d.fn_test with Some n -> "test \"" ^ n ^ "\"" | None -> d.fn_name in
+                  sym name 12 d.fn_span (Span.merge d.fn_span d.fn_body.bspan)
                 | IStruct s -> sym s.st_name 23 s.st_span s.st_span
                 | IEnum e -> sym e.en_name 10 e.en_span e.en_span)
               items))

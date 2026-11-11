@@ -72,6 +72,7 @@ type fn_decl = {
   fn_params : param list;
   fn_ret : ty_expr option;
   fn_body : block;
+  fn_test : string option; (* Some name: a `test "name" { ... }` block *)
 }
 
 type struct_decl = {

@@ -9,6 +9,7 @@ usage:
   writ check FILE [--json]
   writ caps FILE [--json]
   writ explain CODE
+  writ test FILE [--native]
   writ fmt FILE... [--write | --check]
   writ lsp                (language server on stdin/stdout)
 
@@ -64,6 +65,73 @@ let rec split_grants = function
     let gs, others = split_grants rest in
     (gs, x :: others)
   | [] -> ([], [])
+
+(* writ test: run every `test "name" { ... }` block, each isolated. *)
+let where_of (sp : Span.t) =
+  if sp.file = "" then ""
+  else
+    let l, c = Source.line_col sp.file sp.lo in
+    Printf.sprintf "%s:%d:%d" sp.file l c
+
+let run_tests_native items names =
+  let exe = Filename.concat (Filename.get_temp_dir_name ()) (Printf.sprintf "writ-test-%d" (Unix.getpid ())) in
+  (match Native.build ~tests:true items exe with
+   | Ok () -> ()
+   | Error m -> prerr_string m; prerr_endline "writ: the C compiler failed (this is a bug in writ)"; exit 1);
+  let results =
+    List.mapi
+      (fun i name ->
+        let err = exe ^ ".err" in
+        let fd = Unix.openfile err [ Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC ] 0o600 in
+        let pid = Unix.create_process exe [| exe; string_of_int i |] Unix.stdin Unix.stdout fd in
+        let _, status = Unix.waitpid [] pid in
+        Unix.close fd;
+        let text = In_channel.with_open_bin err In_channel.input_all in
+        match status with
+        | Unix.WEXITED 0 -> (name, Ok ())
+        | _ ->
+          let lines = String.split_on_char '\n' text in
+          let msg =
+            match lines with
+            | l :: _ when String.starts_with ~prefix:"panic: " l -> String.sub l 7 (String.length l - 7)
+            | l :: _ when l <> "" -> l
+            | _ -> "crashed"
+          in
+          let where =
+            match lines with
+            | _ :: w :: _ when String.starts_with ~prefix:"-->" (String.trim w) -> String.trim (String.sub (String.trim w) 3 (String.length (String.trim w) - 3))
+            | _ -> ""
+          in
+          (name, Error (msg, where)))
+      names
+  in
+  List.iter (fun f -> try Sys.remove f with Sys_error _ -> ()) [ exe; exe ^ ".c"; exe ^ ".err" ];
+  results
+
+let cmd_test file native =
+  let items, diags, _ = load file in
+  if diags <> [] then (report diags; exit 1);
+  let names = List.filter_map (function Ast.IFn { fn_test = Some n; _ } -> Some n | _ -> None) items in
+  if names = [] then (print_endline "no tests"; exit 0);
+  let results =
+    if native then run_tests_native items names
+    else
+      List.map
+        (fun (n, r) -> (n, match r with Ok () -> Ok () | Error (m, sp) -> Error (m, where_of sp)))
+        (Interp.run_tests ~out:(fun s -> print_string s; flush stdout) items)
+  in
+  let failed = ref 0 in
+  List.iter
+    (fun (name, r) ->
+      match r with
+      | Ok () -> Printf.printf "ok    %s\n" name
+      | Error (m, w) ->
+        incr failed;
+        Printf.printf "FAIL  %s\n      %s\n" name m;
+        if w <> "" then Printf.printf "      --> %s\n" w)
+    results;
+  Printf.printf "%d test%s, %d failed\n" (List.length results) (if List.length results = 1 then "" else "s") !failed;
+  exit (if !failed = 0 then 0 else 1)
 
 let cmd_fmt files mode =
   let changed = ref [] in
@@ -177,6 +245,8 @@ let () =
   | [ "caps"; file ] -> cmd_caps file false
   | [ "caps"; file; "--json" ] | [ "caps"; "--json"; file ] -> cmd_caps file true
   | [ "lsp" ] -> Lsp.serve ()
+  | [ "test"; file ] -> cmd_test file false
+  | [ "test"; file; "--native" ] | [ "test"; "--native"; file ] -> cmd_test file true
   | "fmt" :: rest -> (
     let mode = if List.mem "--write" rest then `Write else if List.mem "--check" rest then `Check else `Print in
     match List.filter (fun a -> a <> "--write" && a <> "--check") rest with

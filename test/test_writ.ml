@@ -599,6 +599,114 @@ fn client(net: Net, port: Int, k: Int) -> Int {
         Err(e) => out.print("{e}"),
     }|})
     "bytes 390, echoes 50\n";
+  par "socket-close-while-reading" ~grants:sock_grants
+    (main_wrap {|    match root.listen.on("127.0.0.1:0") {
+        Ok(l) => {
+            let port = l.port()
+            let net = root.net.only("127.0.0.1")
+            let rs = group g {
+                g.go(|| {
+                    match l.accept() {
+                        Ok(c) => {
+                            let done = group h {
+                                h.go(|| "{c.read()}")
+                                h.go(|| {
+                                    c.close()
+                                    "closed"
+                                })
+                            }
+                            done.join(", ")
+                        },
+                        Err(e) => "{e}",
+                    }
+                })
+                g.go(|| {
+                    match net.connect("127.0.0.1:{port}") {
+                        Ok(c) => {
+                            let r = "{c.read()}"
+                            c.close()
+                            r
+                        },
+                        Err(e) => "{e}",
+                    }
+                })
+            }
+            out.print(rs.join(" | "))
+        },
+        Err(e) => out.print("{e}"),
+    }|})
+    "Err(Failed(\"connection is closed\")), closed | Ok(\"\")\n";
+  par "socket-read-and-write-together" ~grants:sock_grants
+    ({|fn echo(c: Conn) -> Int {
+    let mut n = 0
+    let mut more = true
+    while more {
+        match c.read() {
+            Ok(s) => {
+                if s.is_empty() {
+                    more = false
+                } else {
+                    n = n + s.len()
+                    c.write(s).unwrap_or(())
+                }
+            },
+            Err(_) => {
+                more = false
+            },
+        }
+    }
+    c.close()
+    n
+}
+|}
+    ^ main_wrap {|    match root.listen.on("127.0.0.1:0") {
+        Ok(l) => {
+            let port = l.port()
+            let net = root.net.only("127.0.0.1")
+            let rs = group g {
+                g.go(|| {
+                    match l.accept() {
+                        Ok(c) => echo(c),
+                        Err(_) => 0,
+                    }
+                })
+                g.go(|| {
+                    match net.connect("127.0.0.1:{port}") {
+                        Ok(c) => {
+                            let parts = group h {
+                                h.go(|| {
+                                    let mut got = 0
+                                    while got < 30 {
+                                        match c.read() {
+                                            Ok(s) => {
+                                                got = got + s.len()
+                                            },
+                                            Err(_) => {
+                                                got = 1000
+                                            },
+                                        }
+                                    }
+                                    got
+                                })
+                                h.go(|| {
+                                    for m in ["0123456789", "abcdefghij", "ABCDEFGHIJ"] {
+                                        c.write(m).unwrap_or(())
+                                    }
+                                    0
+                                })
+                            }
+                            c.close()
+                            parts[0]
+                        },
+                        Err(_) => 0,
+                    }
+                })
+            }
+            out.print("{rs}")
+        },
+        Err(e) => out.print("{e}"),
+    }|})
+    "[30, 30]\n";
   out "socket-denied"
     (main_wrap {|    out.print("{root.listen.on("127.0.0.1:9").is_err()} {root.net.connect("127.0.0.1:9").is_err()}")
     match root.listen.on("127.0.0.1:9") { Ok(_) => out.print("?"), Err(e) => out.print("{e}") }
@@ -756,6 +864,63 @@ fn client(net: Net, port: Int, k: Int) -> Int {
   let _, ds, _ = compile "json" (main_wrap "    print(\"a \\\"quoted\\\"\\n\")") in
   let j = Diag.list_to_json ds in
   ok "json-shape" (String.starts_with ~prefix:"{\"diagnostics\":[{\"code\":\"E0302\"" j) j;
+
+  (* ---------- writ test ---------- *)
+  let test_src =
+    {|fn add(a: Int, b: Int) -> Int { a + b }
+
+test "adds" {
+    assert_eq(add(2, 3), 5)
+    assert(add(-1, 1) == 0)
+}
+
+test "fails on a list" {
+    assert_eq(["a", "b"], ["a", "b", "c"])
+}
+
+test "panics are failures" {
+    let xs = [1]
+    let x = xs[5]
+}
+
+test "channels" {
+    let c: Chan[Int] = channel(1)
+    let r = group g {
+        g.go(|| {
+            c.send(7)
+            0
+        })
+        g.go(|| c.recv().unwrap_or(0))
+    }
+    assert_eq(r, [0, 7])
+}
+|}
+  in
+  let items, ds, _ = compile "writ-test" test_src in
+  ok "writ-test-checks" (ds = []) (String.concat "," (codes ds));
+  let want =
+    [ ("adds", None); ("fails on a list", Some "assertion failed: [\"a\", \"b\"] != [\"a\", \"b\", \"c\"]");
+      ("panics are failures", Some "index 5 is out of range for a list of length 1"); ("channels", None) ]
+  in
+  let got = List.map (fun (n, r) -> (n, match r with Ok () -> None | Error (m, _) -> Some m)) (Interp.run_tests ~out:ignore items) in
+  ok "writ-test-interp" (got = want) (String.concat "; " (List.map (fun (n, m) -> n ^ "=" ^ Option.value ~default:"ok" m) got));
+  if native_enabled then begin
+    let exe = Filename.concat tmpdir "writ-test-native" in
+    match Native.build ~flags:sanitize ~tests:true items exe with
+    | Error m -> ok "writ-test-native" false m
+    | Ok () ->
+      let got =
+        List.mapi
+          (fun i (n, _) ->
+            let e = exe ^ ".err" in
+            let code = Sys.command (sprintf "ASAN_OPTIONS=detect_leaks=0 %s %d 2>%s" (Filename.quote exe) i (Filename.quote e)) in
+            let first = match String.split_on_char '\n' (read_file e) with l :: _ -> l | [] -> "" in
+            (n, if code = 0 then None else Some (if String.starts_with ~prefix:"panic: " first then String.sub first 7 (String.length first - 7) else first)))
+          want
+      in
+      ok "writ-test-native" (got = want) (String.concat "; " (List.map (fun (n, m) -> n ^ "=" ^ Option.value ~default:"ok" m) got))
+  end;
+  errs "writ-test-duplicate" "test \"a\" {}\ntest \"a\" {}" [ "E0106" ];
 
   (* ---------- language server ---------- *)
   let module J = Json in

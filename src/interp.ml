@@ -11,8 +11,12 @@ type cap =
   | CStdout
   | CClock
   | CListen of string list
-  | CListener of Unix.file_descr * int
-  | CConn of Unix.file_descr
+  | CListener of sock * int
+  | CConn of sock
+
+(* A socket that knows when it was closed, so a task waiting on it never
+   touches a descriptor number that has been reused. *)
+and sock = { fd : Unix.file_descr; mutable shut : bool }
 
 type value =
   | VInt of int
@@ -31,6 +35,7 @@ type value =
   | VGroup of value option ref list ref (* results of spawned tasks, newest first *)
   | VChan of chan
   | VChanFn
+  | VBuiltin of string (* assert, assert_eq *)
 
 and chan = { q : value Queue.t; cap : int; mutable closed : bool }
 
@@ -79,7 +84,7 @@ let rec show ?(top = true) v =
   | VCap c -> "<" ^ cap_name c ^ ">"
   | VGroup _ -> "<group>"
   | VChan _ -> "<chan>"
-  | VChanFn -> "<fn>"
+  | VChanFn | VBuiltin _ -> "<fn>"
 
 let rec equal a b =
   match (a, b) with
@@ -189,7 +194,7 @@ let binop op a b sp =
    performs Block with the condition it waits for (and optionally a socket to
    poll); the scheduler resumes the first task whose condition holds. *)
 
-type io_wait = (Unix.file_descr * bool) option (* descriptor, true = wait for writing *)
+type io_wait = (sock * bool) option (* socket, true = wait for writing *)
 type _ Effect.t += Block : (unit -> bool) * io_wait -> unit Effect.t
 
 let runq : ((unit -> bool) * io_wait * (unit -> unit)) Queue.t = Queue.create ()
@@ -221,7 +226,9 @@ let rec schedule finished sp =
         if cond () then (k (); true) else (Queue.push entry runq; pick (i + 1))
     in
     if not (pick 0) then begin
-      let waits = Queue.fold (fun acc (_, io, _) -> match io with Some w -> w :: acc | None -> acc) [] runq in
+      let waits =
+        Queue.fold (fun acc (_, io, _) -> match io with Some ((s : sock), w) when not s.shut -> (s.fd, w) :: acc | _ -> acc) [] runq
+      in
       if waits = [] then raise (Panic ("all tasks are blocked (deadlock)", sp));
       (* select() cannot watch descriptors past FD_SETSIZE; then just pause
          briefly. Either way, waiting tasks retry their operation. *)
@@ -239,11 +246,13 @@ let rec schedule finished sp =
 (* ---------- sockets ----------
    Non-blocking sockets; a task that would block waits in the scheduler. *)
 module Sock = struct
-  (* retry after the scheduler's next round of waiting for I/O *)
-  let wait fd write =
+  (* retry after the scheduler's next round of waiting for I/O, or as soon as the socket is closed *)
+  let wait sk write =
     let e = !io_epoch in
-    wait_until ~io:(fd, write) (fun () -> !io_epoch > e)
+    wait_until ~io:(sk, write) (fun () -> sk.shut || !io_epoch > e)
+
   let failed e = Error (Caps.Failed (Unix.error_message e))
+  let closed_err what = Error (Caps.Failed (what ^ " is closed"))
 
   (* "host:port" with a host of [A-Za-z0-9.-] and a port 0..65535 *)
   let parse_addr addr =
@@ -277,14 +286,16 @@ module Sock = struct
             Unix.listen fd 4096;
             Unix.set_nonblock fd;
             let p = match Unix.getsockname fd with Unix.ADDR_INET (_, p) -> p | _ -> port in
-            Ok (fd, p)
+            Ok ({ fd; shut = false }, p)
           with Unix.Unix_error (e, _, _) -> Unix.close fd; failed e))
 
-  let rec accept fd =
-    match Unix.accept ~cloexec:true fd with
-    | c, _ -> Unix.set_nonblock c; Ok c
-    | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EINTR), _, _) -> wait fd false; accept fd
-    | exception Unix.Unix_error (e, _, _) -> failed e
+  let rec accept sk =
+    if sk.shut then closed_err "listener"
+    else
+      match Unix.accept ~cloexec:true sk.fd with
+      | c, _ -> Unix.set_nonblock c; Ok { fd = c; shut = false }
+      | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EINTR | Unix.ECONNABORTED), _, _) -> wait sk false; accept sk
+      | exception Unix.Unix_error (e, _, _) -> failed e
 
   let connect allowed addr =
     match parse_addr addr with
@@ -295,41 +306,48 @@ module Sock = struct
         match resolve h with
         | None -> Error (Caps.Failed ("cannot resolve " ^ h))
         | Some ip -> (
-          let fd = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
-          Unix.set_nonblock fd;
+          let sk = { fd = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0; shut = false } in
+          Unix.set_nonblock sk.fd;
           (* waits can be woken by any socket, so retry until this one says it is connected *)
           let rec go () =
-            match Unix.connect fd (Unix.ADDR_INET (ip, port)) with
-            | () -> Ok fd
-            | exception Unix.Unix_error (Unix.EISCONN, _, _) -> Ok fd
-            | exception Unix.Unix_error ((Unix.EINPROGRESS | Unix.EALREADY | Unix.EAGAIN | Unix.EINTR), _, _) ->
-              wait fd true;
-              (match Unix.getsockopt_error fd with
-               | Some e -> Unix.close fd; failed e
-               | None -> go ())
-            | exception Unix.Unix_error (e, _, _) -> Unix.close fd; failed e
+            match Unix.connect sk.fd (Unix.ADDR_INET (ip, port)) with
+            | () -> Ok sk
+            | exception Unix.Unix_error (Unix.EISCONN, _, _) -> Ok sk
+            | exception Unix.Unix_error ((Unix.EINPROGRESS | Unix.EALREADY | Unix.EAGAIN | Unix.EINTR), _, _) -> (
+              wait sk true;
+              match Unix.getsockopt_error sk.fd with
+              | Some e -> Unix.close sk.fd; failed e
+              | None -> go ())
+            | exception Unix.Unix_error (e, _, _) -> Unix.close sk.fd; failed e
           in
           go ()))
 
-  let rec read fd =
-    let b = Bytes.create 65536 in
-    match Unix.read fd b 0 65536 with
-    | n -> Ok (Bytes.sub_string b 0 n)
-    | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EINTR), _, _) -> wait fd false; read fd
-    | exception Unix.Unix_error (e, _, _) -> failed e
+  let rec read sk =
+    if sk.shut then closed_err "connection"
+    else
+      let b = Bytes.create 65536 in
+      match Unix.read sk.fd b 0 65536 with
+      | n -> Ok (Bytes.sub_string b 0 n)
+      | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EINTR), _, _) -> wait sk false; read sk
+      | exception Unix.Unix_error (e, _, _) -> failed e
 
-  let write fd s =
+  let write sk s =
     let rec go off =
-      if off >= String.length s then Ok ()
+      if sk.shut then closed_err "connection"
+      else if off >= String.length s then Ok ()
       else
-        match Unix.single_write_substring fd s off (String.length s - off) with
+        match Unix.single_write_substring sk.fd s off (String.length s - off) with
         | n -> go (off + n)
-        | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EINTR), _, _) -> wait fd true; go off
+        | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EINTR), _, _) -> wait sk true; go off
         | exception Unix.Unix_error (e, _, _) -> failed e
     in
     go 0
 
-  let close fd = try Unix.close fd with Unix.Unix_error _ -> ()
+  let close sk =
+    if not sk.shut then begin
+      sk.shut <- true;
+      try Unix.close sk.fd with Unix.Unix_error _ -> ()
+    end
 end
 
 let rec pmatch p v binds =
@@ -433,6 +451,7 @@ and eval_var rt env n sp =
       | None ->
         if n = "panic" then VPanicFn
         else if n = "channel" then VChanFn
+        else if n = "assert" || n = "assert_eq" then VBuiltin n
         else raise (Panic ("internal: unbound name " ^ n, sp)))
 
 and ctor_value rt en vn =
@@ -462,6 +481,15 @@ and apply rt fv args sp =
     List.iter2 (fun p a -> Hashtbl.replace sc p (ref a)) ps args;
     try eval rt (sc :: cenv) body with Return v -> v)
   | VCtor (en, vn) -> VEnum (en, vn, args)
+  | VBuiltin "assert" -> (
+    match args with
+    | [ VBool true ] -> VUnit
+    | _ -> raise (Panic ("assertion failed", sp)))
+  | VBuiltin "assert_eq" -> (
+    match args with
+    | [ a; b ] when equal a b -> VUnit
+    | [ a; b ] -> raise (Panic (sprintf "assertion failed: %s != %s" (show ~top:false a) (show ~top:false b), sp))
+    | _ -> raise (Panic ("assertion failed", sp)))
   | VChanFn -> (
     match args with
     | [ VInt n ] when n >= 1 -> VChan { q = Queue.create (); cap = n; closed = false }
@@ -662,3 +690,46 @@ let run ~out ~grants (user_items : item list) : (value, string * Span.t) result 
     with
     | Panic (m, sp) -> Queue.clear runq; Error (m, sp)
     | Stack_overflow -> Queue.clear runq; Error ("stack overflow", d.fn_span))
+
+let make_rt ~out ~grants (user_items : item list) =
+  let rt =
+    { fns = Hashtbl.create 16; structs = Hashtbl.create 16; enums = Hashtbl.create 16;
+      ctors = Hashtbl.create 16; out; grants }
+  in
+  let owners = Hashtbl.create 16 in
+  List.iter
+    (function
+      | IFn d -> Hashtbl.replace rt.fns d.fn_name d
+      | IStruct s -> Hashtbl.replace rt.structs s.st_name s
+      | IEnum e ->
+        Hashtbl.replace rt.enums e.en_name e;
+        List.iter
+          (fun (v, _, _) -> Hashtbl.replace owners v (e.en_name :: Option.value ~default:[] (Hashtbl.find_opt owners v)))
+          e.en_variants)
+    (Prelude.items () @ user_items);
+  Hashtbl.iter (fun v ens -> match ens with [ en ] -> Hashtbl.replace rt.ctors v en | _ -> ()) owners;
+  rt
+
+(* Run every `test` block in its own coroutine scheduler; a panic fails
+   only that test. Returns (name, Ok () | Error (message, location)). *)
+let run_tests ~out (user_items : item list) : (string * (unit, string * Span.t) result) list =
+  let rt = make_rt ~out ~grants:no_grants user_items in
+  Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
+  List.filter_map
+    (function
+      | IFn ({ fn_test = Some name; _ } as d) ->
+        Queue.clear runq;
+        let finished = ref false in
+        let r =
+          try
+            spawn_fiber (fun () -> ignore (call_fn rt d []); finished := true);
+            schedule (fun () -> !finished) d.fn_span;
+            Ok ()
+          with
+          | Panic (m, sp) -> Error (m, sp)
+          | Stack_overflow -> Error ("stack overflow", d.fn_span)
+        in
+        Queue.clear runq;
+        Some (name, r)
+      | _ -> None)
+    user_items

@@ -139,7 +139,8 @@ let instance g name (targs : (string * ty) list) =
   match Hashtbl.find_opt g.instances key with
   | Some c -> c
   | None ->
-    let c = if targs = [] then "wf_" ^ name else sprintf "wf_%s_%d" name (Hashtbl.length g.instances) in
+    let safe = String.map (fun ch -> if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch = '_' then ch else '_') name in
+    let c = if targs = [] then "wf_" ^ safe else sprintf "wf_%s_%d" safe (Hashtbl.length g.instances) in
     Hashtbl.replace g.instances key c;
     g.queue <- g.queue @ [ (c, Hashtbl.find g.fns name, targs) ];
     c
@@ -293,6 +294,24 @@ and ctor_value f vname ty =
 
 and lower_call f e callee args ty =
   match callee.edesc with
+  | EVar "assert" when not_local f "assert" && not (Hashtbl.mem f.g.fns "assert") ->
+    let c = lower f (List.hd args) in
+    let fail, _, _ = in_block f (fun () -> ignore (tmp f TUnit (I.Panic (I.AStr "assertion failed", e.espan))); f.dead <- true) in
+    emit f (I.If (c, [], fail));
+    I.AUnit
+  | EVar "assert_eq" when not_local f "assert_eq" && not (Hashtbl.mem f.g.fns "assert_eq") ->
+    let x = lower f (List.nth args 0) in
+    let y = lower f (List.nth args 1) in
+    let t = tyof f (List.nth args 0) in
+    let same = tmp f TBool (I.Bin (Eq, t, x, y, e.espan)) in
+    let fail, _, _ =
+      in_block f (fun () ->
+          let msg = tmp f TStr (I.Interp [ I.IStr "assertion failed: "; I.IValQ (x, t); I.IStr " != "; I.IValQ (y, t) ]) in
+          ignore (tmp f TUnit (I.Panic (msg, e.espan)));
+          f.dead <- true)
+    in
+    emit f (I.If (same, [], fail));
+    I.AUnit
   | EVar "channel" when not_local f "channel" && not (Hashtbl.mem f.g.fns "channel") ->
     let cap = lower f (List.hd args) in
     tmp f ty (I.ChanNew (ty, cap, e.espan))
@@ -688,7 +707,7 @@ let lower_fn g c (d : fn_decl) env =
   emit f (I.Return a);
   { I.fname = c; params; captures = []; is_closure = false; ret; body = List.rev f.buf }
 
-let lower_program (user_items : item list) : I.program * gctx =
+let lower_program ?(tests = false) (user_items : item list) : I.program * gctx =
   let g =
     { fns = Hashtbl.create 16; structs = Hashtbl.create 16; enums = Hashtbl.create 16;
       ctors = Hashtbl.create 16; instances = Hashtbl.create 16; queue = []; out = []; counter = 0 }
@@ -705,8 +724,16 @@ let lower_program (user_items : item list) : I.program * gctx =
           e.en_variants)
     (Prelude.items () @ user_items);
   Hashtbl.iter (fun v ens -> match ens with [ en ] -> Hashtbl.replace g.ctors v en | _ -> ()) owners;
-  let main_decl = match Hashtbl.find_opt g.fns "main" with Some d -> d | None -> failwith "no main" in
-  let main = instance g "main" [] in
+  let test_names =
+    if tests then List.filter_map (function IFn ({ fn_test = Some _; _ } as d) -> Some (instance g d.fn_name []) | _ -> None) user_items
+    else []
+  in
+  let main_decl =
+    match Hashtbl.find_opt g.fns "main" with
+    | Some d when not tests -> Some d
+    | _ -> None
+  in
+  let main = match main_decl with Some _ -> instance g "main" [] | None -> "" in
   let rec drain () =
     match g.queue with
     | (c, d, env) :: rest ->
@@ -718,5 +745,6 @@ let lower_program (user_items : item list) : I.program * gctx =
     | [] -> ()
   in
   drain ();
-  let main_ret = match main_decl.fn_ret with Some te -> resolve [] te | None -> TUnit in
-  ({ I.fns = List.rev g.out; main; main_takes_root = main_decl.fn_params <> []; main_ret }, g)
+  let main_ret = match main_decl with Some { fn_ret = Some te; _ } -> resolve [] te | _ -> TUnit in
+  let takes_root = match main_decl with Some d -> d.fn_params <> [] | None -> false in
+  ({ I.fns = List.rev g.out; main; main_takes_root = takes_root; main_ret; tests = test_names }, g)

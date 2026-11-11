@@ -367,9 +367,26 @@ let parse_generics st =
   end
   else []
 
+let test_count = ref 0
+
 let parse_item st =
   let t = peek st in
   match t.tok with
+  | IDENT "test" when (match st.toks.(min (st.pos + 1) (Array.length st.toks - 1)).tok with STR _ -> true | _ -> false) ->
+    ignore (advance st);
+    let s = advance st in
+    let name =
+      match s.tok with
+      | STR [] -> ""
+      | STR [ Lit n ] -> n
+      | _ -> raise (Diag.Fatal (Diag.make "E0003" s.span "a test name must be a plain string, without interpolation"))
+    in
+    let body = parse_block st in
+    incr test_count;
+    (* the generated name cannot be written in source, so tests cannot be called *)
+    IFn
+      { fn_name = Printf.sprintf "test#%d" !test_count; fn_span = s.span; fn_gen = []; fn_params = []; fn_ret = None;
+        fn_body = body; fn_test = Some name }
   | KW "fn" ->
     ignore (advance st);
     let name, nsp = expect_ident st in
@@ -388,7 +405,7 @@ let parse_item st =
     in
     let ret = if accept_sym st "->" then Some (parse_type st) else None in
     let body = parse_block st in
-    IFn { fn_name = name; fn_span = nsp; fn_gen = gen; fn_params = params; fn_ret = ret; fn_body = body }
+    IFn { fn_name = name; fn_span = nsp; fn_gen = gen; fn_params = params; fn_ret = ret; fn_body = body; fn_test = None }
   | KW "struct" ->
     ignore (advance st);
     let name, nsp = expect_ident st in
@@ -416,6 +433,7 @@ let parse_item st =
   | _ -> fail t "an item (`fn`, `struct` or `enum`)"
 
 let parse_program file src : item list =
+  test_count := 0;
   let toks = Lexer.lex file src in
   let st = { toks; pos = 0; file } in
   let items = ref [] in

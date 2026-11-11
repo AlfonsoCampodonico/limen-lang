@@ -1,7 +1,7 @@
 (* Checked program -> C source -> native binary (via the system C compiler). *)
 
-let c_source items =
-  let prog, g = Lower.lower_program items in
+let c_source ?(tests = false) items =
+  let prog, g = Lower.lower_program ~tests items in
   let prog = Own.program prog in
   Cgen.program g prog
 
@@ -21,4 +21,4 @@ let compile_c ?(flags = [ "-O2" ]) c_text exe : (unit, string) result =
   | Unix.WEXITED 0 -> Ok ()
   | _ -> Error (o ^ e)
 
-let build ?flags items exe = compile_c ?flags (c_source items) exe
+let build ?flags ?tests items exe = compile_c ?flags (c_source ?tests items) exe

@@ -15,3 +15,4 @@
     (echo "let text = {xxrtxx|")
     (cat runtime/writ_rt.h)
     (echo "|xxrtxx}\n")))))
+

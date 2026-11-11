@@ -1,0 +1,5 @@
+fn sq(x: Int) -> Int { x * x }
+
+test "squares" {
+    assert_eq(sq(3), 9)
+}

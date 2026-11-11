@@ -371,6 +371,11 @@ let enum_close c (e : enum_decl) =
 
 let item c (it : item) =
   match it with
+  | IFn ({ fn_test = Some name; _ } as d) ->
+    new_line c 0;
+    add c ("test \"" ^ escape name ^ "\" ");
+    block c 0 d.fn_body;
+    trailing c d.fn_body.bspan.hi
   | IFn d ->
     new_line c 0;
     let params = List.map (fun p -> p.prm_name ^ ": " ^ ty p.prm_ty) d.fn_params in

@@ -45,7 +45,7 @@ type rhs =
   | ChanNew of ty * atom * Span.t (* channel type, capacity *)
   | ChanSend of atom * atom * Span.t (* channel (borrowed), value (consumed) *)
 
-and ipart = IStr of string | IVal of atom * ty
+and ipart = IStr of string | IVal of atom * ty | IValQ of atom * ty (* printed as inside a container *)
 
 type stmt =
   | Let of var * rhs
@@ -71,7 +71,7 @@ type fn = {
   body : stmt list;
 }
 
-type program = { fns : fn list; main : string; main_takes_root : bool; main_ret : ty }
+type program = { fns : fn list; main : string; main_takes_root : bool; main_ret : ty; tests : string list (* C names, in order *) }
 
 (* Which atoms of an rhs are consumed (ownership moves) and which are only read. *)
 let consumed = function
@@ -91,7 +91,7 @@ let borrowed = function
   | Prim (_, _, xs, _) -> xs
   | Get (a, _, steps) -> a :: List.filter_map (function PIndex (i, _) | PIndexU i -> Some i | PField _ -> None) steps
   | Payload (a, _, _, _) | IsTag (a, _, _) | PatTest (a, _, _) -> [ a ]
-  | Interp ps -> List.filter_map (function IVal (a, _) -> Some a | IStr _ -> None) ps
+  | Interp ps -> List.filter_map (function IVal (a, _) | IValQ (a, _) -> Some a | IStr _ -> None) ps
   | RootField (a, _) -> [ a ]
   | Panic (a, _) -> [ a ]
   | Spawn (g, _, _) | GroupJoin (g, _) -> [ g ]

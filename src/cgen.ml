@@ -212,7 +212,8 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     List.iter
       (function
         | `Lit s -> line (sprintf "  buf_putn(&b_, %s, %d);" (c_string s) (String.length s))
-        | `Val (e, ty) -> line (sprintf "  %s_show(&b_, %s, true);" (cname c ty) e))
+        | `Val (e, ty) -> line (sprintf "  %s_show(&b_, %s, true);" (cname c ty) e)
+        | `ValQ (e, ty) -> line (sprintf "  %s_show(&b_, %s, false);" (cname c ty) e))
       parts;
     line (sprintf "  %s = buf_take(&b_);" dst);
     line "}"
@@ -269,7 +270,7 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
   | I.IsTag (x, ety, k) -> set (sprintf "(%s == %d)" (tag_expr c ety (a x)) k)
   | I.PatTest (x, ty, p) -> set (pat_cond c (a x) ty p)
   | I.Interp parts ->
-    show_into (List.map (function I.IStr s -> `Lit s | I.IVal (x, ty) -> `Val (a x, ty)) parts)
+    show_into (List.map (function I.IStr s -> `Lit s | I.IVal (x, ty) -> `Val (a x, ty) | I.IValQ (x, ty) -> `ValQ (a x, ty)) parts)
   | I.RootField (x, f) -> set (sprintf "Cap_root_field(%s, %s)" (a x) (c_string f))
   | I.GroupNew -> set "w_group_new()"
   | I.Spawn (g, task, rt) ->
@@ -842,6 +843,26 @@ let program (g : Lower.gctx) (prog : I.program) : string =
   let main = Buffer.create 1024 in
   let mp s = Buffer.add_string main (s ^ "\n") in
   let rt = prog.main_ret in
+  if prog.tests <> [] then begin
+    (* test binary: `PROGRAM N` runs test N (each test in its own process) *)
+    mp "static int wtest_index_;";
+    mp "static void wtest_entry_(void* a) {";
+    mp "  (void)a;";
+    mp "  switch (wtest_index_) {";
+    List.iteri (fun i t -> mp (sprintf "    case %d: %s(); break;" i t)) prog.tests;
+    mp "  }";
+    mp "  w_main_finished();";
+    mp "}";
+    mp "int main(int argc, char** argv) {";
+    mp "  if (argc < 2) return 2;";
+    mp "  wtest_index_ = atoi(argv[1]);";
+    mp "  w_run(wtest_entry_, NULL);";
+    mp "  fflush(stdout);";
+    mp "  w_leakcheck();";
+    mp "  return 0;";
+    mp "}"
+  end
+  else begin
   (* main runs as the main fiber, so it can wait on groups, channels and sockets *)
   mp (sprintf "static %s wmain_result_;" (ctype c rt));
   mp (sprintf "static void wmain_entry_(void* a) { (void)a; wmain_result_ = %s(%s); w_main_finished(); }" prog.main
@@ -862,7 +883,8 @@ let program (g : Lower.gctx) (prog : I.program) : string =
   mp "  fflush(stdout);";
   mp "  w_leakcheck();";
   mp "  return 0;";
-  mp "}";
+  mp "}"
+  end;
   let types = Buffer.create 16384 in
   type_defs c types;
   let lits = Buffer.create 4096 in

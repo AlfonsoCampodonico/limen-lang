@@ -62,6 +62,7 @@ and stmt s =
   | SContinue -> "continue"
 
 let item = function
+  | IFn { fn_test = Some n; fn_body; _ } -> "test " ^ String.escaped n ^ block fn_body
   | IFn d ->
     "fn " ^ d.fn_name ^ "[" ^ String.concat "," d.fn_gen ^ "]("
     ^ String.concat "," (List.map (fun p -> p.prm_name ^ ":" ^ ty p.prm_ty) d.fn_params)
