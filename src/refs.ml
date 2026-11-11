@@ -176,6 +176,18 @@ let index (items : item list) : occ list =
              | None -> if Hashtbl.mem fns n then add ~short:(Var_side f) ("f:" ^ n) n fsp)
           | _ -> add ("d:" ^ name ^ "#" ^ f) f fsp; x v)
         fs
+    | EWith (b, fs) ->
+      x b;
+      List.iter
+        (fun (f, (fsp : Span.t), v) ->
+          match v.edesc with
+          | EVar n when n = f && v.espan = fsp ->
+            (match struct_of e.ety with Some s -> add ~short:Field_side ("d:" ^ s ^ "#" ^ f) f fsp | None -> ());
+            (match List.assoc_opt n env with
+             | Some k -> add ~short:(Var_side f) k n fsp
+             | None -> if Hashtbl.mem fns n then add ~short:(Var_side f) ("f:" ^ n) n fsp)
+          | _ -> (match struct_of e.ety with Some s -> add ("d:" ^ s ^ "#" ^ f) f fsp | None -> ()); x v)
+        fs
     | EDyn (y, _) -> x y
     | ESelect arms ->
       List.iter

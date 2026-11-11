@@ -294,6 +294,20 @@ let rec lower f (e : expr) : I.atom =
     | EBlock b -> lower_block f b
     | EClosure (ps, body) -> lower_closure f ps body ty
     | EPipe _ -> failwith "pipes are expanded when modules load"
+    | EWith (base, fields) ->
+      (* Take the base, then overwrite the fields in place. When the base is
+         not used afterwards it is moved, so its storage is reused and the
+         unchanged fields are not touched; otherwise the ownership pass
+         retains it (a copy) first. A plain variable is read after the new
+         values, so `p = { p with x: p.x + 1 }` still moves `p`. *)
+      let bt = tyof f base in
+      let early = match base.edesc with EVar _ -> None | _ -> Some (lower f base) in
+      let vals = List.map (fun (fname, _, x) -> (field_index f.g bt fname, lower f x)) fields in
+      let b = match early with Some a -> a | None -> lower f base in
+      let v = fresh_var "with" bt in
+      emit f (I.Let (v, I.Atom b));
+      List.iter (fun (k, a) -> emit f (I.Mutate (v, [ I.PField k ], I.MSet a))) vals;
+      I.V v
     | EStruct (name, _, fields) ->
       let vals = List.map (fun (fname, _, x) -> (fname, lower f x)) fields in
       let decl = Hashtbl.find f.g.structs name in

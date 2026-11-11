@@ -308,6 +308,7 @@ Both operands must have the same type. The **ordered** types are `Int`, `Float`,
 
 - `[1, 2, 3]` is a `List[Int]`. Where an `Array[T, N]` is expected (an annotated `let`, an argument, a field), a list literal of exactly `N` elements builds the array. A wrong count is error E0201.
 - Struct literal: `Pair { first: 1, second: "a" }`. Every field must be set (E0206). `Pair { first, second }` is shorthand for `first: first`. A struct literal cannot appear directly as the condition of `if`, `while`, `for` or `match`; wrap it in parentheses.
+- Copy with changes: `{ p with x: 3, y: 4 }` is a new struct value equal to `p` except for the fields named, as in F# and C#'s `with`. The base is any expression of a struct type (E0201 otherwise); each field must exist (E0103), appear once (E0106) and have the field's type, and the shorthand `{ p with name }` works as in a literal. The fields not named are kept, so nothing is "missing". `with` must follow the base on the same line; the fields may go on their own lines. The base is evaluated first, then the new values in order, except that a base that is just a variable is read after them, which only matters if a field expression assigns to that variable. Natively, when the base is not used afterwards (`p = { p with x: p.x + 1 }`, or a parameter returned changed), its storage is reused: the replaced fields are overwritten in place and the others are not touched; otherwise the struct is copied first.
 - Enum variants are built by name: `Some(3)`, `None`, `Circle(1.0)`, `Point`. A bare name means a variant of the file's own enums first, then of the prelude (`Some`, `None`, `Ok`, `Err`, `Denied`, `Failed`), then of other modules' enums, so a module's `Num` never clashes with `json.Num`, and a file that defines its own `Some` shadows the prelude's. If two enums at the nearest of those levels define the name, qualify it: `Shape.Point` or `json.Num(1.0)` (E0104). In patterns the type being matched decides, so qualifying is rarely needed there.
 
 ### Blocks, if and match
@@ -1015,6 +1016,7 @@ primary    = INT | FLOAT | STRING | "true" | "false"
            | [ IDENT "." ] IDENT [ "{" [ init { sep init } [ "," ] ] "}" ]   (* struct literal *)
            | "(" ")" | "(" expr ")" | "(" expr "," expr { "," expr } ")"   (* tuple *)
            | "[" [ args ] "]"
+           | "{" expr "with" init { sep init } [ "," ] "}"            (* copy with changes *)
            | block
            | "if" expr_ns block [ "else" ( block | if ) ]
            | "match" expr_ns "{" { pattern "=>" expr ( "," | NL ) } "}"

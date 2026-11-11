@@ -162,6 +162,7 @@ let rec simple_expr e =
   | EMethod (r, _, _, args) -> simple_expr r && List.for_all simple_expr args
   | EList es -> List.for_all simple_expr es
   | EStruct (_, _, fs) -> List.for_all (fun (_, _, x) -> simple_expr x) fs
+  | EWith (b, fs) -> simple_expr b && List.for_all (fun (_, _, x) -> simple_expr x) fs
   | _ -> true
 
 let rec expr c ind ?(min = 0) e =
@@ -249,6 +250,34 @@ and expr_inner c ind e =
     end
     else begin
       add c "{ ";
+      List.iteri (fun i fl -> if i > 0 then add c ", "; field fl) fields;
+      add c " }"
+    end
+  | EWith (base, fields) ->
+    (* like a struct literal: one line, or one field per line if written so *)
+    let field (f, fsp, v) =
+      if v.espan = fsp then add c f (* shorthand *)
+      else (add c (f ^ ": "); expr c (ind + 4) v)
+    in
+    add c "{ ";
+    expr c ind base;
+    add c " with";
+    let first = match fields with (_, (fsp : Span.t), _) :: _ -> fsp.lo | [] -> e.espan.hi in
+    if has_newline c base.espan.hi first || comment_in c base.espan.hi e.espan.hi then begin
+      List.iter
+        (fun ((_, (fsp : Span.t), v) as fl) ->
+          ignore (leading c (ind + 4) ~prev:(-1) fsp.lo);
+          new_line c (ind + 4);
+          field fl;
+          add c ",";
+          trailing c (if v.espan = fsp then fsp.hi else v.espan.hi))
+        fields;
+      ignore (leading c (ind + 4) ~prev:(-1) (e.espan.hi - 1));
+      new_line c ind;
+      add c "}"
+    end
+    else begin
+      add c " ";
       List.iteri (fun i fl -> if i > 0 then add c ", "; field fl) fields;
       add c " }"
     end

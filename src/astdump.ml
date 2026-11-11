@@ -47,6 +47,7 @@ let rec expr e =
   | EClosure (ps, b) ->
     "|" ^ String.concat "," (List.map (fun (n, t, _) -> n ^ match t with Some t -> ":" ^ ty t | None -> "") ps) ^ "|" ^ expr b
   | EStruct (n, _, fs) -> n ^ "{" ^ String.concat "," (List.map (fun (f, _, x) -> f ^ ":" ^ expr x) fs) ^ "}"
+  | EWith (b, fs) -> "{" ^ expr b ^ " with " ^ String.concat "," (List.map (fun (f, _, x) -> f ^ ":" ^ expr x) fs) ^ "}"
   | EGroup (n, None, b) -> "group " ^ n ^ block b
   | EGroup (n, Some (c, ms), b) -> "group " ^ n ^ " until " ^ expr c ^ ".after(" ^ expr ms ^ ")" ^ block b
   | EDyn (x, _) -> expr x

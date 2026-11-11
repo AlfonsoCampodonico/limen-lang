@@ -250,6 +250,7 @@ let rec expr env locals (e : expr) : expr =
       in
       EStruct (n, sp, List.map (fun (f, fsp, x) -> (f, fsp, ex x)) fields)
     | EGroup (g, until, b) -> EGroup (g, Option.map (fun (c, ms) -> (ex c, ex ms)) until, block env (g :: locals) b)
+    | EWith (b, fields) -> EWith (ex b, List.map (fun (f, fsp, x) -> (f, fsp, ex x)) fields)
     | EDyn (x, i) -> EDyn (ex x, i)
     | ESelect arms ->
       ESelect

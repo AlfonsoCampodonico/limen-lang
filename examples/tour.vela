@@ -87,6 +87,10 @@ fn main(root: Root) -> Int {
         |> evens
         |> total
     out.print("pipe {sum}")
+    // copy with changes: the other fields are kept
+    let origin = Point { x: 0, y: 0 }
+    let moved = { origin with y: 5 }
+    out.print("{origin} {moved}")
 
     out.print("-- concurrency")
     // tasks returning () run for their effect and add nothing to the list

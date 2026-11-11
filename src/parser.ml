@@ -261,6 +261,7 @@ and parse_primary st ns =
     ignore (advance st);
     let es = comma_list st "]" parse_expr in
     mk (EList es) (merge t.span (last_span st))
+  | SYM "{" when is_with_lit st -> parse_with st
   | SYM "{" ->
     let b = parse_block st in
     mk (EBlock b) b.bspan
@@ -306,6 +307,41 @@ and str_part st = function
     let e = parse_expr sub in
     if (peek sub).tok <> EOF then fail (peek sub) "`}` to close the interpolation";
     SPExpr e
+
+(* At a `{`: is this `{ base with field: ... }` rather than a block? It is
+   when `with` follows the base on the first line, outside any brackets, and
+   is followed by a field: `with x:`, `with x,` or `with x }`. *)
+and is_with_lit st =
+  let n = Array.length st.toks in
+  let rec scan i depth =
+    if i >= n then false
+    else
+      let t = st.toks.(i) in
+      if depth = 0 && t.nl && i > st.pos + 1 then false
+      else
+        match t.tok with
+        | EOF -> false
+        | SYM ("(" | "[" | "{") -> scan (i + 1) (depth + 1)
+        | SYM (")" | "]" | "}") -> if depth = 0 then false else scan (i + 1) (depth - 1)
+        | SYM ";" when depth = 0 -> false
+        | IDENT "with" when depth = 0 && i > st.pos + 1 && i + 2 < n -> (
+          match (st.toks.(i + 1).tok, st.toks.(i + 2).tok) with
+          | IDENT _, SYM (":" | "," | "}") -> true
+          | _ -> scan (i + 1) depth)
+        | _ -> scan (i + 1) depth
+  in
+  scan (st.pos + 1) 0
+
+and parse_with st =
+  let lb = expect_sym st "{" in
+  let base = parse_expr st in
+  (match (peek st).tok with IDENT "with" -> ignore (advance st) | _ -> fail (peek st) "`with`");
+  let fields =
+    comma_list st "}" (fun st ->
+        let f, fsp = expect_ident st in
+        if accept_sym st ":" then (f, fsp, parse_expr st) else (f, fsp, mk (EVar f) fsp))
+  in
+  mk (EWith (base, fields)) (merge lb.span (last_span st))
 
 and parse_struct_lit st name nsp =
   ignore (expect_sym st "{");

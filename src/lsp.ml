@@ -100,6 +100,7 @@ let rec walk_expr (f : expr -> unit) e =
   | EGroup (_, until, b) -> Option.iter (fun (c, ms) -> w c; w ms) until; walk_block f b
   | EClosure (_, body) -> w body
   | EStruct (_, _, fs) -> List.iter (fun (_, _, x) -> w x) fs
+  | EWith (b, fs) -> w b; List.iter (fun (_, _, x) -> w x) fs
   | EDyn (x, _) -> w x
   | ESelect arms ->
     List.iter

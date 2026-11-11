@@ -53,6 +53,7 @@ and expr_desc =
   | EDyn of expr * string (* inserted by the checker: box a value as `dyn Interface` *)
   | ESelect of sel_arm list
   | EPipe of expr * expr (* `x |> f(a)`: becomes `f(x, a)` when modules load *)
+  | EWith of expr * (string * span * expr) list (* `{ p with x: 1 }`: a copy of a struct with fields replaced *)
 
 and str_part = SPLit of string | SPExpr of expr
 

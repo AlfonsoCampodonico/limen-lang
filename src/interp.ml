@@ -1248,6 +1248,14 @@ let rec eval rt env e : value =
     VStruct (name, List.map (fun (f, _, _) -> (f, List.assoc f vals)) decl.st_fields)
   | EDyn (x, _) -> eval rt env x (* values carry their type, so methods dispatch on it *)
   | EPipe _ -> failwith "pipes are expanded when modules load"
+  | EWith (base, fields) -> (
+    (* the base first, then the new values; a plain variable is read last,
+       as the native backend does to reuse it in place *)
+    let early = match base.edesc with EVar _ -> None | _ -> Some (eval rt env base) in
+    let vals = List.map (fun (fname, _, x) -> (fname, eval rt env x)) fields in
+    match (match early with Some v -> v | None -> eval rt env base) with
+    | VStruct (n, fs) -> VStruct (n, List.map (fun (k, v) -> (k, Option.value ~default:v (List.assoc_opt k vals))) fs)
+    | _ -> failwith "internal: with on a non-struct")
   | EGroup (name, until, b) ->
     (* tasks are coroutines; the group waits until every one has a result *)
     let g = { tasks = []; kept = []; gcancelled = false } in
