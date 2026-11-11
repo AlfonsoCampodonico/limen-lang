@@ -674,6 +674,8 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     | "cap_read", _ -> io_result (sprintf "Cap_fs_read(%s, %s)" (arg 0) (arg 1)) "r_.val"
     | "cap_write", TCap Fs -> io_result (sprintf "Cap_fs_write(%s, %s, %s)" (arg 0) (arg 1) (arg 2)) "0"
     | "cap_exists", _ -> set (sprintf "Cap_fs_exists(%s, %s)" (arg 0) (arg 1))
+    | "cap_full_path", TCap Fs -> io_result (sprintf "Cap_fs_full_path(%s, %s)" (arg 0) (arg 1)) "r_.val"
+    | "cap_is_read_only", TCap Fs -> set (sprintf "(%s)->ro" (arg 0))
     | _ ->
       ignore sp;
       failwith (sprintf "cgen: unknown primitive %s on %s" name (show rt)))

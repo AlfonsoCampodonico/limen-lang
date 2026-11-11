@@ -1476,6 +1476,8 @@ and cap_call rt c name args sp =
   | CFs fs, "read", [ VStr p ] -> io_result (fun s -> VStr s) (Caps.read fs p)
   | CFs fs, "write", [ VStr p; VStr data ] -> io_result (fun () -> VUnit) (Caps.write fs p data)
   | CFs fs, "exists", [ VStr p ] -> VBool (Caps.exists fs p)
+  | CFs fs, "full_path", [ VStr p ] -> io_result (fun s -> VStr s) (Caps.full_path fs p)
+  | CFs fs, "is_read_only", [] -> VBool fs.ro
   | CNet allowed, "connect", [ VStr addr ] -> sock_result (Sock.connect allowed addr) (fun fd -> VCap (CConn fd))
   | CListen allowed, "on", [ VStr addr ] -> sock_result (Sock.listen allowed addr) (fun (fd, port) -> VCap (CListener (fd, port)))
   | CListener (fd, _), "accept", [] -> sock_result (Sock.accept fd) (fun c -> VCap (CConn c))

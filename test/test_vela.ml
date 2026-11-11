@@ -1123,6 +1123,12 @@ fn main(root: Root) -> Result[(), IoError] {
   let rw = { Interp.no_grants with fs = Some (real, false) } in
   let ro = { Interp.no_grants with fs = Some (real, true) } in
   out "fs-read" ~grants:ro (main_wrap "    out.print(\"{root.fs.read(\"a.txt\")}\")") "Ok(\"alpha\")\n";
+  out "fs-full-path" ~grants:ro
+    (main_wrap
+       (sprintf "    let fs = root.fs\n    out.print(\"{fs.full_path(\"sub/new.db\") == Ok(%S + \"/sub/new.db\")} {fs.full_path(\"./a.txt\") == Ok(%S + \"/a.txt\")} {fs.is_read_only()}\")\n    out.print(\"{fs.full_path(\"../x\")} {fs.full_path(\"nodir/x\")} {fs.full_path(\"a\" + 0.to_char())}\")\n    out.print(\"{fs.under(\"sub\").full_path(\"b.txt\").is_ok()} {fs.under(\"..\").full_path(\"a.txt\")}\")"
+          real real))
+    "true true true\nErr(Denied(\"fs: path escapes the granted directory\")) Err(Failed(\"fs: directory of `nodir/x` does not exist\")) Err(Failed(\"fs: the path contains a NUL byte\"))\ntrue Err(Denied(\"fs: not granted (run with --grant fs=DIR)\"))\n";
+  out "fs-rw-flag" ~grants:rw (main_wrap "    out.print(\"{root.fs.is_read_only()} {root.fs.read_only().is_read_only()}\")") "false true\n";
   out "fs-dotdot" ~grants:ro
     (main_wrap "    out.print(\"{root.fs.read(\"../a.txt\")}\")")
     "Err(Denied(\"fs: path escapes the granted directory\"))\n";
@@ -1476,6 +1482,181 @@ fn main(root: Root) {
     "served 4\n200 text/plain; charset=utf-8 hi GET\n500 text/plain; charset=utf-8 internal error\n404 text/plain; charset=utf-8 no /missing\n201 {\"got\":[1,{\"a\":true}]}\nchunked sent\n200 hello world\n";
   out "example-ffi" ~grants:{ Interp.no_grants with foreign = [ "c" ] } (example "ffi.vela")
     "3.25 kg: 3.25, then [ kg]\n-1e3: -1000.0, then []\n0x1p4!: 16.0, then [!]\nabc: not a number\n: not a number\n";
+  (* ---------- sql: SQLite through the foreign capability ---------- *)
+  let sqlg = { Interp.no_grants with foreign = [ "sqlite3" ] } in
+  let sql_basic = {v|use sql
+
+fn main(root: Root) -> Result[(), IoError] {
+    let out = root.stdout
+    let f = root.foreign
+    let db = sql.memory(f)?
+    db.exec(f, "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER, score REAL, photo BLOB)", [])?
+    let names = ["Ada", "Grace", "it's; DROP TABLE people; --", "é 😀"]
+    for i in 0..<names.len() {
+        let n = names[i]
+        let changed = db.exec(f, "INSERT INTO people (name, age, score, photo) VALUES (?, ?, ?, ?)",
+            [sql.Text(n), if i == 1 { sql.Null } else { sql.Int(30 + i) }, sql.Float(i.to_float() / 2.0), sql.Blob(bytes([i, 0, 255]))])?
+        out.print("{changed} {db.last_id(f)}")
+    }
+    for row in db.query(f, "SELECT id, name, age, score, photo FROM people WHERE id >= ? ORDER BY id", [sql.Int(2)])? {
+        out.print("{row.int("id") ?? -1} {row.text("name") ?? "?"} {row.int("age")} {row.float("score") ?? 0.0} {row.blob("photo")} {row.is_null("age")}")
+    }
+    let one = db.query_one(f, "SELECT count(*) AS n, sum(age) AS total, max(score) AS top FROM people", [])?
+    match one {
+        Some(r) => out.print("{r.int("n")} {r.int("total")} {r.float("top")} {r.float("n")} {r.columns}"),
+        None => out.print("none"),
+    }
+    out.print("{db.query_one(f, "SELECT name FROM people WHERE name = ?", [sql.Text("nobody")])?}")
+    out.print("{db.exec(f, "UPDATE people SET age = age + 1 WHERE age IS NOT NULL", [])?}")
+    out.print("{db.exec(f, "CREATE TABLE a (x); CREATE TABLE b (y); INSERT INTO a VALUES (1), (2)", [])?}")
+    let r = db.query(f, "SELECT x, NULL AS missing, 'hi' || ? AS greeting FROM a", [sql.Text("!")])?
+    out.print("{r[1].get("x")} {r[1].get("missing")} {r[1].get("greeting")} {r.len()}")
+    db.close(f)
+}
+|v} in
+  let sql_basic_want =
+    "1 1\n1 2\n1 3\n1 4\n2 Grace None 0.5 Some(bytes([1, 0, 255])) true\n3 it's; DROP TABLE people; -- Some(32) 1.0 Some(bytes([2, 0, 255])) false\n4 é 😀 Some(33) 1.5 Some(bytes([3, 0, 255])) false\nSome(4) Some(95) Some(1.5) Some(4.0) [\"n\", \"total\", \"top\"]\nNone\n3\n2\nInt(2) Null Text(\"hi!\") 2\n"
+  in
+  out "sql-basic" ~grants:sqlg sql_basic sql_basic_want;
+  let sql_errors = {v|use sql
+
+fn main(root: Root) {
+    let out = root.stdout
+    let f = root.foreign
+    match sql.memory(f) {
+        Ok(db) => {
+            out.print("{db.exec(f, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT UNIQUE)", [])}")
+            out.print("{db.exec(f, "INSERT INTO t (name) VALUES (?)", [sql.Text("a")])}")
+            out.print("{db.exec(f, "INSERT INTO t (name) VALUES (?)", [sql.Text("a")])}")
+            out.print("{db.exec(f, "SELEC 1", [])}")
+            out.print("{db.query(f, "SELECT * FROM nowhere", [])}")
+            out.print("{db.query(f, "SELECT ?", [])}")
+            out.print("{db.query(f, "SELECT ?", [sql.Int(1), sql.Int(2)])}")
+            out.print("{db.exec(f, "INSERT INTO t (name) VALUES (?); DELETE FROM t", [sql.Text("b")])}")
+            out.print("{db.exec(f, "  ", [sql.Int(1)])}")
+            out.print("{db.exec(f, "ATTACH DATABASE '/tmp/vela-sql-attach.db' AS other", [])}")
+            out.print("{db.exec(f, "VACUUM INTO '/tmp/vela-sql-vacuum.db'", [])}")
+            match db.query(f, "SELECT name FROM t", []) {
+                Ok(rows) => {
+                    out.print("{rows}")
+                    out.print("{catch(|| rows[0].int("name"))}")
+                    out.print("{catch(|| rows[0].text("nope"))}")
+                },
+                Err(e) => out.print("{e}"),
+            }
+            out.print("{db.close(f)}")
+        },
+        Err(e) => out.print("{e}"),
+    }
+    out.print("{sql.memory(f.only("c")).is_ok()}")
+}
+|v} in
+  out "sql-errors" ~grants:sqlg sql_errors
+    "Ok(0)\nOk(1)\nErr(Failed(\"sql: exec: UNIQUE constraint failed: t.name\"))\nErr(Failed(\"sql: near \\\"SELEC\\\": syntax error\"))\nErr(Failed(\"sql: prepare: no such table: nowhere\"))\nErr(Failed(\"sql: the statement has 1 parameter, but 0 were given\"))\nErr(Failed(\"sql: the statement has 1 parameter, but 2 were given\"))\nErr(Failed(\"sql: a statement with parameters must be alone; run several with `exec` and no parameters\"))\nErr(Failed(\"sql: no statement in the SQL text\"))\nErr(Failed(\"sql: too many attached databases - max 0\"))\nErr(Failed(\"sql: too many attached databases - max 0\"))\n[sql.Row { columns: [\"name\"], values: [Text(\"a\")] }]\nErr(\"sql: column `name` is not an integer: Text(\\\"a\\\")\")\nErr(\"sql: the row has no column `nope` (it has name)\")\nOk(())\nfalse\n";
+  (* transactions: committed on Ok, rolled back on Err and on a panic *)
+  let sql_tx = {v|use sql
+
+fn count(db: sql.Db, f: Foreign) -> Int {
+    match db.query_one(f, "SELECT count(*) AS n FROM t", []) {
+        Ok(Some(r)) => r.int("n") ?? -1,
+        _ => -1,
+    }
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let out = root.stdout
+    let f = root.foreign
+    let db = sql.memory(f)?
+    db.exec(f, "CREATE TABLE t (x INTEGER NOT NULL)", [])?
+    let a = db.transaction(f, || {
+        db.exec(f, "INSERT INTO t VALUES (?)", [sql.Int(1)])?
+        db.exec(f, "INSERT INTO t VALUES (?)", [sql.Int(2)])?
+        Ok("committed")
+    })
+    out.print("{a} {count(db, f)}")
+    let b = db.transaction(f, || {
+        db.exec(f, "INSERT INTO t VALUES (?)", [sql.Int(3)])?
+        db.exec(f, "INSERT INTO t VALUES (?)", [sql.Null])?
+        Ok("not reached")
+    })
+    out.print("{b} {count(db, f)}")
+    let c = catch(|| db.transaction(f, || {
+        db.exec(f, "INSERT INTO t VALUES (?)", [sql.Int(4)])?
+        if count(db, f) == 3 { panic("boom") }
+        Ok(0)
+    }))
+    out.print("{c} {count(db, f)}")
+    let d = db.transaction(f, || db.transaction(f, || Ok(1)))
+    out.print("{d} {count(db, f)}")
+    db.close(f)
+}
+|v} in
+  out "sql-transaction" ~grants:sqlg sql_tx
+    "Ok(\"committed\") 2\nErr(Failed(\"sql: exec: NOT NULL constraint failed: t.x\")) 2\nErr(\"boom\") 2\nErr(Failed(\"sql: a transaction is already open on this connection\")) 2\n";
+  (* a file under the Fs grant; read-only when the Fs is *)
+  let sqldir = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "vela-sql-%d" (Unix.getpid ())) in
+  (try Unix.mkdir sqldir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+  let sqlreal = Unix.realpath sqldir in
+  let sql_file = {v|use sql
+
+fn main(root: Root) -> Result[(), IoError] {
+    let out = root.stdout
+    let f = root.foreign
+    let fs = root.fs
+    fs.remove("notes.db")
+    let db = sql.open(f, fs, "notes.db")?
+    db.exec(f, "CREATE TABLE notes (body TEXT)", [])?
+    db.exec(f, "INSERT INTO notes VALUES (?)", [sql.Text("saved")])?
+    db.close(f)?
+    out.print("{fs.exists("notes.db")}")
+    let ro = sql.open(f, fs.read_only(), "notes.db")?
+    out.print("{ro.query(f, "SELECT body FROM notes", [])?[0].text("body")}")
+    out.print("{ro.exec(f, "INSERT INTO notes VALUES (?)", [sql.Text("no")])}")
+    ro.close(f)?
+    out.print("{sql.open(f, fs.read_only(), "missing.db").is_err()}")
+    out.print("{sql.open(f, fs, "../escape.db")}")
+    out.print("{sql.open(f, fs, "/tmp/abs.db")}")
+    out.print("{sql.open(f, fs, "no/such/dir.db")}")
+    out.print("{sql.open(f.only("c"), fs, "notes.db")}")
+    fs.remove("notes.db")
+    Ok(())
+}
+|v} in
+  out "sql-file" ~grants:{ sqlg with fs = Some (sqlreal, false) } sql_file
+    "true\nSome(\"saved\")\nErr(Failed(\"sql: exec: attempt to write a readonly database\"))\ntrue\nErr(Denied(\"fs: path escapes the granted directory\"))\nErr(Denied(\"fs: absolute paths are not allowed; paths are relative to the granted directory\"))\nErr(Failed(\"fs: directory of `no/such/dir.db` does not exist\"))\nErr(Denied(\"sql: calling SQLite needs --grant foreign=sqlite3\"))\n";
+  out "sql-no-fs" ~grants:sqlg
+    "use sql\n\nfn main(root: Root) {\n    root.stdout.print(\"{sql.open(root.foreign, root.fs, \"x.db\")}\")\n}\n"
+    "Err(Denied(\"fs: not granted (run with --grant fs=DIR)\"))\n";
+  (* one connection shared by tasks *)
+  let sql_group = {v|use sql
+
+fn main(root: Root) -> Result[(), IoError] {
+    let f = root.foreign
+    let db = sql.memory(f)?
+    db.exec(f, "CREATE TABLE t (task INTEGER, n INTEGER)", [])?
+    let done = group g {
+        for task in 0..<6 {
+            g.go(|| {
+                let mut ok = 0
+                for n in 0..<20 {
+                    if db.exec(f, "INSERT INTO t VALUES (?, ?)", [sql.Int(task), sql.Int(n)]).is_ok() {
+                        ok = ok + 1
+                    }
+                }
+                ok
+            })
+        }
+    }
+    let r = db.query_one(f, "SELECT count(*) AS c, sum(n) AS s FROM t", [])?
+    root.stdout.print("{done} {r}")
+    db.close(f)
+}
+|v} in
+  let sql_group_want = "[20, 20, 20, 20, 20, 20] Some(sql.Row { columns: [\"c\", \"s\"], values: [Int(120), Int(1140)] })\n" in
+  out "sql-group" ~grants:sqlg sql_group sql_group_want;
+  check_tsan "sql-group" ~grants:sqlg sql_group sql_group_want;
+  out "example-notes" ~grants:sqlg (example "notes.vela")
+    "1. The Left Hand of Darkness\n2. Robert'); DROP TABLE notes; --\n3. Paris, Texas ***\n3 notes\n";
   (* std code is checked like user code: a json error names the byte *)
   out "std-json-errors"
     "use json\n\nfn main(root: Root) {\n    for s in [\"\\{\\\"a\\\": [1, 2.5e1, \\\"\\\\u0041\\\"]\\}\", \"[1 2]\", \"\\\"\\\\x\\\"\"] {\n        match json.parse(s) {\n            Ok(v) => root.stdout.print(json.stringify(v)),\n            Err(e) => root.stdout.print(e),\n        }\n    }\n}\n"
@@ -3142,7 +3323,8 @@ fn main(root: Root) {
   let listed = List.sort compare (List.map (fun (d : Package.dep) -> d.dname) manifest.deps) in
   ok "std-manifest-complete" (listed = List.sort compare (List.map fst Std_text.modules)) (String.concat ", " listed);
   ok "std-manifest-http" (List.exists (fun (d : Package.dep) -> d.dname = "http" && d.caps = [ "net"; "listen" ]) manifest.deps) "http: net, listen";
-  ok "std-manifest-pure" (List.for_all (fun (d : Package.dep) -> d.dname = "http" || d.caps = []) manifest.deps) "json, list, text are pure";
+  ok "std-manifest-sql" (List.exists (fun (d : Package.dep) -> d.dname = "sql" && d.caps = [ "foreign"; "fs" ]) manifest.deps) "sql: foreign, fs";
+  ok "std-manifest-pure" (List.for_all (fun (d : Package.dep) -> d.dname = "http" || d.dname = "sql" || d.caps = []) manifest.deps) "the others are pure";
   let real_std = !Modules.std_modules in
   let std_errs name extra src =
     Modules.std_modules := extra @ real_std;

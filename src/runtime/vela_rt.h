@@ -1265,6 +1265,16 @@ static WIo Cap_fs_write(WCap *fs, WStr *rel, WStr *data) {
   fclose(f); free(p);
   return io_ok(NULL);
 }
+/* The absolute path of `rel`, checked as for writing: for handing to C. */
+static WIo Cap_fs_full_path(WCap *fs, WStr *rel) {
+  if (memchr(rel->data, 0, (size_t)rel->len)) return io_err(2, "fs: the path contains a NUL byte");
+  int kind; char msg[1024];
+  char *p = fs_resolve(fs, rel, true, &kind, msg, sizeof msg);
+  if (!p) return io_err(kind, msg);
+  WStr *s = Str_from(p, (int64_t)strlen(p));
+  free(p);
+  return io_ok(s);
+}
 static bool Cap_fs_exists(WCap *fs, WStr *rel) {
   int kind; char msg[1024];
   char *p = fs_resolve(fs, rel, false, &kind, msg, sizeof msg);
