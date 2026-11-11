@@ -49,6 +49,7 @@ let explanations = [
   "E0302", "Writ has no ambient I/O: there is no global print, open, http or clock. I/O goes through capability values. `main` receives `root: Root`; pass `root.stdout`, `root.fs`, `root.net` or `root.clock` to the functions that need them.";
   "E0303", "`main` must be `fn main(root: Root)` or `fn main(root: Root) -> Result[(), E]`, with no type parameters.";
   "E0304", "Functions cannot be stored in struct or enum fields, because a stored closure could carry a capability out of sight.";
+  "E0305", "Channels cannot be stored in struct or enum fields: like capabilities, they are passed as parameters or captured by a task's closure.";
   "E0310", "A group handle can only be used as `g.go(closure)`, directly in the group's body: it cannot be stored, passed, returned or captured by a closure.";
   "E0311", "Code inside a `group` block cannot leave it early with `return` or `?`, because every task must finish before the group returns its results.";
   "E0901", "This feature is designed but not implemented yet.";

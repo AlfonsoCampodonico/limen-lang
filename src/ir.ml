@@ -42,6 +42,8 @@ type rhs =
   | GroupNew
   | Spawn of atom * atom * ty (* group (borrowed), task closure (consumed), result type *)
   | GroupJoin of atom * ty (* wait for every task; result list type *)
+  | ChanNew of ty * atom * Span.t (* channel type, capacity *)
+  | ChanSend of atom * atom * Span.t (* channel (borrowed), value (consumed) *)
 
 and ipart = IStr of string | IVal of atom * ty
 
@@ -78,6 +80,7 @@ let consumed = function
   | CallClo (_, args) -> args
   | MkStruct (_, xs) | MkEnum (_, _, xs) | MkList (_, xs) | MkClosure (_, _, xs) -> xs
   | Spawn (_, c, _) -> [ c ]
+  | ChanSend (_, v, _) -> [ v ]
   | _ -> []
 
 let borrowed = function
@@ -93,5 +96,7 @@ let borrowed = function
   | Panic (a, _) -> [ a ]
   | Spawn (g, _, _) | GroupJoin (g, _) -> [ g ]
   | GroupNew -> []
+  | ChanNew (_, cap, _) -> [ cap ]
+  | ChanSend (c, _, _) -> [ c ]
 
 let atom_var = function V v | VDup v -> Some v | _ -> None

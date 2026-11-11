@@ -108,6 +108,9 @@ let rewrite_rhs r ~live_after ~owned =
   | Spawn (g, task, t) ->
     let xs, o = c [ task ] in
     (Spawn (g, List.hd xs, t), o)
+  | ChanSend (ch, v, sp) ->
+    let xs, o = c [ v ] in
+    (ChanSend (ch, List.hd xs, sp), o)
   | r -> (r, owned)
 
 let rec fwd_block (b : ablock) owned ~brk ~cont : stmt list * S.t =

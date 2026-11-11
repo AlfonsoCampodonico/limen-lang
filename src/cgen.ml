@@ -18,6 +18,7 @@ type ctx = {
   mutable uniq : int list; (* list vars known unique inside the current loop *)
   mutable task_tys : ty list; (* result types of spawned tasks *)
   mutable inrange : (int * int) list; (* (list var, index var): index proven in range *)
+  mutable chan_tys : ty list; (* element types of channels *)
 }
 
 let is_enum c = function TNamed (n, _) -> Hashtbl.mem c.g.enums n | _ -> false
@@ -38,6 +39,10 @@ let rec cname c t =
   | TGroup a ->
     ignore (cname c a);
     "Group"
+  | TChan a ->
+    ignore (cname c a);
+    if not (List.mem a c.chan_tys) then c.chan_tys <- c.chan_tys @ [ a ];
+    "Chan"
   | TList TInt -> "L_Int"
   | TList TStr -> "L_Str"
   | TList _ | TNamed _ | TArray _ -> (
@@ -68,6 +73,7 @@ let ctype c t =
   | TFn _ -> "WClo*"
   | TCap _ -> "WCap*"
   | TGroup _ -> "WGroup*"
+  | TChan _ -> "WChan*"
   | TList _ -> cname c t ^ "*"
   | _ -> cname c t (* structs, enums and arrays are C values *)
 
@@ -282,6 +288,19 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     line "  w_group_release_tasks(g_);";
     line (sprintf "  %s = l_;" dst);
     line "}"
+  | I.ChanNew (TChan el, cap, sp) ->
+    ignore (cname c (TChan el));
+    set (sprintf "w_chan_new(%s, sizeof(%s), %s, %s, %s)" (a cap) (ctype c el)
+           (if is_scalar el then "NULL" else "chdrop_" ^ cname c el)
+           (if is_scalar el then "NULL" else "chshare_" ^ cname c el) (where sp))
+  | I.ChanNew _ -> failwith "channel type"
+  | I.ChanSend (ch, v, sp) ->
+    let el = match (match ch with I.V x | I.VDup x -> x.ty | _ -> TUnit) with TChan e -> e | _ -> TUnit in
+    line "{";
+    line (sprintf "  %s v_ = %s;" (ctype c el) (a v));
+    line (sprintf "  w_chan_send(%s, &v_, %s);" (a ch) (where sp));
+    line "}";
+    set "0"
   | I.Panic (m, sp) ->
     line (sprintf "memset(&%s, 0, sizeof %s);" dst dst);
     line (sprintf "w_panic_c((%s)->data, %s);" (a m) (where sp))
@@ -308,6 +327,12 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
       line (sprintf "  l_->len = %d;" n);
       line (sprintf "  %s = l_;" dst);
       line "}"
+    | "chan_recv", TChan el ->
+      line "{";
+      line (sprintf "  %s v_;" (ctype c el));
+      line (sprintf "  %s = w_chan_recv(%s, &v_) ? %s : %s;" dst (arg 0) (mk_enum c t 0 [ "v_" ]) (mk_enum c t 1 []));
+      line "}"
+    | "chan_close", _ -> line (sprintf "w_chan_close(%s, %s);" (arg 0) (where sp)); set "0"
     | "list_len", _ | "str_len", _ -> set (sprintf "(%s)->len" (arg 0))
     | "list_is_empty", _ | "str_is_empty", _ -> set (sprintf "((%s)->len == 0)" (arg 0))
     | "list_get", TList el ->
@@ -767,7 +792,7 @@ let type_defs c (out : Buffer.t) =
 let program (g : Lower.gctx) (prog : I.program) : string =
   let c =
     { g; names = Hashtbl.create 32; types = []; lits = Hashtbl.create 32; lit_order = []; boxed = [];
-      envs = Hashtbl.create 16; uniq = []; task_tys = []; inrange = [] }
+      envs = Hashtbl.create 16; uniq = []; task_tys = []; inrange = []; chan_tys = [] }
   in
   (* bodies first: this discovers every type and literal *)
   let bodies = Buffer.create 65536 in
@@ -794,6 +819,13 @@ let program (g : Lower.gctx) (prog : I.program) : string =
       end)
     prog.fns;
   let tasks = Buffer.create 1024 in
+  List.iter
+    (fun t ->
+      if not (is_scalar t) then
+        Buffer.add_string tasks
+          (sprintf "static void chdrop_%s(void* p) { %s_drop(*(%s*)p); }\nstatic void chshare_%s(void* p) { %s_share(*(%s*)p); }\n"
+             (cname c t) (cname c t) (ctype c t) (cname c t) (cname c t) (ctype c t)))
+    c.chan_tys;
   List.iter
     (fun t ->
       Buffer.add_string tasks

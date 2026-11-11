@@ -20,7 +20,11 @@ type value =
   | VCtor of string * string
   | VPanicFn
   | VCap of cap
-  | VGroup of value list ref (* closures spawned so far, newest first *)
+  | VGroup of value option ref list ref (* results of spawned tasks, newest first *)
+  | VChan of chan
+  | VChanFn
+
+and chan = { q : value Queue.t; cap : int; mutable closed : bool }
 
 and env = (string, value ref) Hashtbl.t list
 
@@ -65,6 +69,8 @@ let rec show ?(top = true) v =
   | VClosure _ | VFn _ | VCtor _ | VPanicFn -> "<fn>"
   | VCap c -> "<" ^ cap_name c ^ ">"
   | VGroup _ -> "<group>"
+  | VChan _ -> "<chan>"
+  | VChanFn -> "<fn>"
 
 let rec equal a b =
   match (a, b) with
@@ -169,6 +175,51 @@ let binop op a b sp =
   | Ge, _, _ -> VBool (compare_v a b >= 0)
   | _ -> failwith "internal: bad operands"
 
+(* ---------- cooperative scheduler ----------
+   Tasks are coroutines built on OCaml 5 effects. A task that cannot go on
+   performs Block with the condition it waits for (and optionally a socket to
+   poll); the scheduler resumes the first task whose condition holds. *)
+
+type io_wait = (Unix.file_descr * bool) option (* descriptor, true = wait for writing *)
+type _ Effect.t += Block : (unit -> bool) * io_wait -> unit Effect.t
+
+let runq : ((unit -> bool) * io_wait * (unit -> unit)) Queue.t = Queue.create ()
+
+let wait_until ?io cond = if not (cond ()) then Effect.perform (Block (cond, io))
+
+let rec run_fiber (f : unit -> unit) =
+  Effect.Deep.match_with f ()
+    { retc = (fun () -> ());
+      exnc = raise;
+      effc =
+        (fun (type a) (e : a Effect.t) ->
+          match e with
+          | Block (cond, io) ->
+            Some (fun (k : (a, unit) Effect.Deep.continuation) -> Queue.push (cond, io, fun () -> Effect.Deep.continue k ()) runq)
+          | _ -> None) }
+
+let spawn_fiber f = Queue.push ((fun () -> true), None, fun () -> run_fiber f) runq
+
+(* Run tasks until [finished ()]. *)
+let rec schedule finished sp =
+  if not (finished ()) then begin
+    let n = Queue.length runq in
+    let rec pick i =
+      if i = n then false
+      else
+        let ((cond, _, k) as entry) = Queue.pop runq in
+        if cond () then (k (); true) else (Queue.push entry runq; pick (i + 1))
+    in
+    if not (pick 0) then begin
+      let waits = Queue.fold (fun acc (_, io, _) -> match io with Some w -> w :: acc | None -> acc) [] runq in
+      if waits = [] then raise (Panic ("all tasks are blocked (deadlock)", sp));
+      let rd = List.filter_map (fun (fd, w) -> if w then None else Some fd) waits in
+      let wr = List.filter_map (fun (fd, w) -> if w then Some fd else None) waits in
+      ignore (Unix.select rd wr [] (-1.))
+    end;
+    schedule finished sp
+  end
+
 let rec pmatch p v binds =
   match (p.pdesc, v) with
   | PWild, _ -> true
@@ -250,12 +301,14 @@ let rec eval rt env e : value =
     let vals = List.map (fun (f, _, x) -> (f, eval rt env x)) fields in
     VStruct (name, List.map (fun (f, _, _) -> (f, List.assoc f vals)) decl.st_fields)
   | EGroup (name, b) ->
-    (* The interpreter runs tasks one after another, in spawn order. *)
+    (* tasks are coroutines; the group waits until every one has a result *)
     let tasks = ref [] in
     let sc = Hashtbl.create 1 in
     Hashtbl.replace sc name (ref (VGroup tasks));
     ignore (eval_block rt (sc :: env) b);
-    VList (Array.of_list (List.map (fun c -> apply rt c [] e.espan) (List.rev !tasks)))
+    let results = List.rev !tasks in
+    wait_until (fun () -> List.for_all (fun r -> !r <> None) results);
+    VList (Array.of_list (List.map (fun r -> Option.get !r) results))
 
 and eval_var rt env n sp =
   match find_var env n with
@@ -265,7 +318,10 @@ and eval_var rt env n sp =
     else
       match Hashtbl.find_opt rt.ctors n with
       | Some en -> ctor_value rt en n
-      | None -> if n = "panic" then VPanicFn else raise (Panic ("internal: unbound name " ^ n, sp)))
+      | None ->
+        if n = "panic" then VPanicFn
+        else if n = "channel" then VChanFn
+        else raise (Panic ("internal: unbound name " ^ n, sp)))
 
 and ctor_value rt en vn =
   let e = Hashtbl.find rt.enums en in
@@ -293,6 +349,10 @@ and apply rt fv args sp =
     List.iter2 (fun p a -> Hashtbl.replace sc p (ref a)) ps args;
     try eval rt (sc :: cenv) body with Return v -> v)
   | VCtor (en, vn) -> VEnum (en, vn, args)
+  | VChanFn -> (
+    match args with
+    | [ VInt n ] when n >= 1 -> VChan { q = Queue.create (); cap = n; closed = false }
+    | _ -> raise (Panic ("channel capacity must be at least 1", sp)))
   | VPanicFn -> (
     match args with [ VStr m ] -> raise (Panic (m, sp)) | _ -> raise (Panic ("panic", sp)))
   | _ -> failwith "internal: not callable"
@@ -411,7 +471,24 @@ and call_method rt v name args sp =
   | VEnum ("Result", vn, _), "is_err", [] -> VBool (vn = "Err")
   | VEnum ("Result", "Err", [ e ]), "map_err", [ f ] -> VEnum ("Result", "Err", [ call f [ e ] ])
   | (VEnum ("Result", _, _) as r), "map_err", [ _ ] -> r
-  | VGroup r, "go", [ c ] -> r := c :: !r; VUnit
+  | VGroup r, "go", [ c ] ->
+    let res = ref None in
+    r := res :: !r;
+    spawn_fiber (fun () -> res := Some (apply rt c [] sp));
+    VUnit
+  | VChan ch, "send", [ v ] ->
+    if ch.closed then raise (Panic ("send on a closed channel", sp));
+    wait_until (fun () -> ch.closed || Queue.length ch.q < ch.cap);
+    if ch.closed then raise (Panic ("send on a closed channel", sp));
+    Queue.push v ch.q;
+    VUnit
+  | VChan ch, "recv", [] ->
+    wait_until (fun () -> ch.closed || not (Queue.is_empty ch.q));
+    if Queue.is_empty ch.q then none else some (Queue.pop ch.q)
+  | VChan ch, "close", [] ->
+    if ch.closed then raise (Panic ("close of a closed channel", sp));
+    ch.closed <- true;
+    VUnit
   | VCap c, _, _ -> cap_call rt c name args
   | _ -> raise (Panic (sprintf "internal: no method `%s` on %s" name (show ~top:false v), sp))
 
@@ -451,6 +528,14 @@ let run ~out ~grants (user_items : item list) : (value, string * Span.t) result 
   | None -> Error ("no `main` function", Span.dummy)
   | Some d -> (
     let args = match d.fn_params with [] -> [] | _ -> [ VCap CRoot ] in
-    try Ok (call_fn rt d args) with
-    | Panic (m, sp) -> Error (m, sp)
-    | Stack_overflow -> Error ("stack overflow", d.fn_span))
+    (* main is a coroutine too, so it can wait on groups and channels *)
+    Queue.clear runq;
+    let result = ref None in
+    try
+      spawn_fiber (fun () -> result := Some (call_fn rt d args));
+      schedule (fun () -> !result <> None) d.fn_span;
+      Queue.clear runq;
+      Ok (Option.get !result)
+    with
+    | Panic (m, sp) -> Queue.clear runq; Error (m, sp)
+    | Stack_overflow -> Queue.clear runq; Error ("stack overflow", d.fn_span))

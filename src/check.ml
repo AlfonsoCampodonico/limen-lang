@@ -74,7 +74,7 @@ let unify_at ctx span want got =
   try unify want got
   with Mismatch -> err ctx "E0201" span (sprintf "expected `%s`, found `%s`" (show want) (show got))
 
-let builtin_types = [ "Int"; "Float"; "Bool"; "Str"; "List"; "Array"; "Root"; "Net"; "Fs"; "Stdout"; "Clock" ]
+let builtin_types = [ "Int"; "Float"; "Bool"; "Str"; "List"; "Array"; "Chan"; "Root"; "Net"; "Fs"; "Stdout"; "Clock" ]
 
 (* Names other languages use for ambient I/O, mapped to the capability way. *)
 let ambient =
@@ -122,6 +122,7 @@ let rec resolve ctx env (te : ty_expr) : ty =
     | "Fs" -> simple (TCap Fs)
     | "Stdout" -> simple (TCap Stdout)
     | "Clock" -> simple (TCap Clock)
+    | "Chan" -> if want 1 then TChan (List.hd args') else TErr
     | _ -> (
       match List.assoc_opt n env with
       | Some t -> simple t
@@ -148,6 +149,10 @@ let check_storable ctx span t =
     err ctx "E0301" span
       (sprintf "capability type `%s` cannot be stored in a struct or enum field" (show t))
       ~notes:[ "pass the capability as a function parameter instead, so it stays visible in signatures" ]
+  else if has_chan t then
+    err ctx "E0305" span
+      (sprintf "channel type `%s` cannot be stored in a struct or enum field" (show t))
+      ~notes:[ "pass the channel as a parameter or capture it in a task's closure instead" ]
   else if has_fn t then
     err ctx "E0304" span
       (sprintf "function type `%s` cannot be stored in a struct or enum field" (show t))
@@ -174,7 +179,7 @@ let visible_names ctx f =
   List.concat_map (fun s -> List.of_seq (Hashtbl.to_seq_keys s.vars)) f.scopes
   @ List.of_seq (Hashtbl.to_seq_keys ctx.fns)
   @ List.of_seq (Hashtbl.to_seq_keys ctx.owners)
-  @ [ "panic" ]
+  @ [ "panic"; "channel" ]
 
 let instantiate s =
   let env = List.map (fun g -> (g, fresh ())) s.gen in
@@ -228,6 +233,7 @@ let methods (t : ty) : (string * (unit -> ty list * ty)) list =
       m "exists" [ TStr ] TBool; m "under" [ TStr ] (TCap Fs); m "read_only" [] (TCap Fs) ]
   | TCap Stdout -> [ m "print" [ TStr ] TUnit; m "write" [ TStr ] TUnit ]
   | TCap Clock -> [ m "now_ms" [] TInt ]
+  | TChan a -> [ m "send" [ a ] TUnit; m "recv" [] (opt a); m "close" [] TUnit ]
   | _ -> []
 
 let root_fields = [ ("net", TCap Net); ("fs", TCap Fs); ("stdout", TCap Stdout); ("clock", TCap Clock) ]
@@ -252,7 +258,7 @@ and check_expr_inner ctx f e : ty =
         | SPExpr x -> (
           let t = check_expr ctx f x in
           match repr t with
-          | TFn _ | TCap _ ->
+          | TFn _ | TCap _ | TChan _ ->
             err ctx "E0201" x.espan (sprintf "cannot interpolate a value of type `%s`" (show t))
           | _ -> ()))
       parts;
@@ -377,6 +383,11 @@ and check_args ctx f args = List.iter (fun a -> ignore (check_expr ctx f a)) arg
 
 and check_call ctx f callee args sp =
   match callee.edesc with
+  | EVar "channel" when lookup f "channel" = None && not (Hashtbl.mem ctx.fns "channel") ->
+    (match args with
+     | [ a ] -> expect ctx f a TInt
+     | _ -> err ctx "E0107" sp "`channel` takes 1 argument, its capacity"; check_args ctx f args);
+    TChan (fresh ())
   | EVar "panic" when lookup f "panic" = None && not (Hashtbl.mem ctx.fns "panic") ->
     (match args with
      | [ a ] -> expect ctx f a TStr
@@ -595,7 +606,7 @@ and check_bin ctx f op a b sp =
     | Sub | Mul | Div -> (match t with TInt | TFloat | TErr | TVar _ -> t | _ -> bad (); TErr)
     | Mod -> (match t with TInt | TErr | TVar _ -> t | _ -> bad (); TErr)
     | Lt | Le | Gt | Ge -> (match t with TInt | TFloat | TStr | TErr | TVar _ -> () | _ -> bad ()); TBool
-    | _ -> (match t with TFn _ | TCap _ -> bad () | _ -> ()); TBool)
+    | _ -> (match t with TFn _ | TCap _ | TChan _ -> bad () | _ -> ()); TBool)
 
 and check_closure ctx f ps body want =
   let want_ps, want_ret =

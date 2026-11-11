@@ -569,8 +569,10 @@ static int parse_url(const char *u, char *host, size_t hn, int *port, char *err,
 
 static WStr *read_fd(int fd) {
   WBuf b; buf_init(&b);
-  char tmp[65536]; ssize_t n;
-  while ((n = read(fd, tmp, sizeof tmp)) > 0) buf_putn(&b, tmp, n);
+  char *tmp = (char *)w_raw(65536);   /* on the heap: task stacks are small */
+  ssize_t n;
+  while ((n = read(fd, tmp, 65536)) > 0) buf_putn(&b, tmp, n);
+  free(tmp);
   return buf_take(&b);
 }
 
@@ -827,8 +829,10 @@ static int64_t w_queued;                                          /* runnable fi
 static pthread_mutex_t w_idle_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t w_idle_cv = PTHREAD_COND_INITIALIZER;
 static int64_t w_nidle;
+static int64_t w_io_waiters;                                      /* fibers parked on sockets */
 static int w_main_done;
-static size_t w_stack_size = 256 * 1024;
+static size_t w_stack_size = 1024 * 1024;                         /* reserved lazily, so 10k tasks are cheap */
+#define W_GUARD_BYTES (64 * 1024)                                 /* larger than any runtime stack frame */
 static int64_t w_fibers_alive;                                    /* created and not yet freed */
 
 /* A fiber may resume on another thread, so the worker is never cached
@@ -862,10 +866,11 @@ static void w_switch(WFiber *from, WFiber *to, int from_exiting) {
 static WFiber *w_fiber_new(void (*entry)(void *), void *arg, size_t size) {
   long page = sysconf(_SC_PAGESIZE);
   size = (size + (size_t)page - 1) / (size_t)page * (size_t)page;
-  size_t total = size + (size_t)page;   /* plus a guard page at the low end */
+  size_t guard = (W_GUARD_BYTES + (size_t)page - 1) / (size_t)page * (size_t)page;
+  size_t total = size + guard;          /* guard region at the low end */
   char *map = (char *)mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
   if (map == MAP_FAILED) { fputs("panic: cannot allocate a task stack\n", stderr); exit(1); }
-  mprotect(map, (size_t)page, PROT_NONE);
+  if (mprotect(map, guard, PROT_NONE) != 0) { fputs("panic: cannot protect a task stack\n", stderr); exit(1); }
   WFiber *f = (WFiber *)w_alloc(sizeof(WFiber));
   memset(f, 0, sizeof *f);
   f->map = map; f->map_size = total; f->entry = entry; f->arg = arg;
@@ -876,7 +881,7 @@ static WFiber *w_fiber_new(void (*entry)(void *), void *arg, size_t size) {
   w_frame_init(frame, f);
   f->sp = frame;
 #ifdef W_ASAN
-  f->asan_bottom = map + page; f->asan_size = size;
+  f->asan_bottom = map + guard; f->asan_size = size;
 #endif
 #ifdef W_TSAN
   f->tsan = __tsan_create_fiber(0);
@@ -964,9 +969,23 @@ static void w_sched_loop(WWorker *w, int is_main) {
     WFiber *f = w_find_work(w);
     if (!f) {
       pthread_mutex_lock(&w_idle_mu);
-      __atomic_fetch_add(&w_nidle, 1, __ATOMIC_SEQ_CST);
-      if (__atomic_load_n(&w_queued, __ATOMIC_SEQ_CST) == 0 && !(is_main && __atomic_load_n(&w_main_done, __ATOMIC_ACQUIRE)))
-        pthread_cond_wait(&w_idle_cv, &w_idle_mu);
+      int64_t idle = __atomic_add_fetch(&w_nidle, 1, __ATOMIC_SEQ_CST);
+      if (__atomic_load_n(&w_queued, __ATOMIC_SEQ_CST) == 0 && !__atomic_load_n(&w_main_done, __ATOMIC_ACQUIRE)) {
+        /* Every worker idle, nothing runnable, nothing waiting on I/O: no
+           task can ever wake another. Confirm after a short wait, then
+           report the deadlock instead of hanging. */
+        if (idle == __atomic_load_n(&w_nworkers, __ATOMIC_ACQUIRE) && __atomic_load_n(&w_io_waiters, __ATOMIC_SEQ_CST) == 0) {
+          struct timeval tv; gettimeofday(&tv, NULL);
+          struct timespec ts = { tv.tv_sec, (long)tv.tv_usec * 1000 + 100000000L };
+          if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+          int rc = pthread_cond_timedwait(&w_idle_cv, &w_idle_mu, &ts);
+          if (rc == ETIMEDOUT && __atomic_load_n(&w_queued, __ATOMIC_SEQ_CST) == 0
+              && __atomic_load_n(&w_nidle, __ATOMIC_SEQ_CST) == __atomic_load_n(&w_nworkers, __ATOMIC_ACQUIRE)
+              && __atomic_load_n(&w_io_waiters, __ATOMIC_SEQ_CST) == 0 && !__atomic_load_n(&w_main_done, __ATOMIC_ACQUIRE))
+            w_panic_c("all tasks are blocked (deadlock)", "every task is waiting");
+        } else
+          pthread_cond_wait(&w_idle_cv, &w_idle_mu);
+      }
       __atomic_fetch_sub(&w_nidle, 1, __ATOMIC_SEQ_CST);
       pthread_mutex_unlock(&w_idle_mu);
       continue;
@@ -1142,3 +1161,103 @@ static void w_group_release_tasks(WGroup *g) {
 static inline WGroup *Group_dup(WGroup *g) { g->rc++; return g; }
 static void Group_drop(WGroup *g) { if (--g->rc == 0) { pthread_mutex_destroy(&g->mu); free(g->tasks); w_free(g); } }
 static inline void Group_share(WGroup *g) { (void)g; }
+
+/* ---------- channels ----------
+   A bounded queue between tasks. send blocks while the channel is full,
+   recv blocks while it is empty; after close, recv drains what is left and
+   then returns nothing, and send panics. Values are switched to shared
+   before they enter, because the receiver may be on another thread. */
+
+typedef struct WChWait { WFiber *f; void *val; int ok; struct WChWait *next; } WChWait;
+typedef struct WChan {
+  int64_t rc; pthread_mutex_t mu;
+  int64_t cap, len, head; size_t esz; char *buf; int closed;
+  WChWait *sq, *sq_t, *rq, *rq_t;                       /* waiting senders and receivers */
+  void (*edrop)(void *); void (*eshare)(void *);
+} WChan;
+
+static WChan *w_chan_new(int64_t cap, size_t esz, void (*edrop)(void *), void (*eshare)(void *), const char *where) {
+  if (cap < 1) w_panic_c("channel capacity must be at least 1", where);
+  WChan *c = (WChan *)w_alloc(sizeof(WChan));
+  memset(c, 0, sizeof *c);
+  c->rc = 1; c->cap = cap; c->esz = esz ? esz : 1;
+  c->buf = (char *)w_raw(w_bytes(cap, c->esz));
+  c->edrop = edrop; c->eshare = eshare;
+  pthread_mutex_init(&c->mu, NULL);
+  return c;
+}
+static inline WChan *Chan_dup(WChan *c) { w_rc_inc(&c->rc); return c; }
+static void Chan_drop(WChan *c) {
+  if (!w_rc_dec(&c->rc)) return;
+  if (c->edrop) for (int64_t i = 0; i < c->len; i++) c->edrop(c->buf + ((c->head + i) % c->cap) * c->esz);
+  free(c->buf);
+  pthread_mutex_destroy(&c->mu);
+  w_free(c);
+}
+static inline void Chan_share(WChan *c) { w_rc_share(&c->rc); }
+static inline bool Chan_eq(WChan *a, WChan *b) { return a == b; }
+static void Chan_show(WBuf *b, WChan *c, bool top) { (void)c; (void)top; buf_puts(b, "<chan>"); }
+
+static void w_chq_push(WChWait **h, WChWait **t, WChWait *w) { w->next = NULL; if (*t) (*t)->next = w; else *h = w; *t = w; }
+static WChWait *w_chq_pop(WChWait **h, WChWait **t) { WChWait *w = *h; if (w) { *h = w->next; if (!*h) *t = NULL; } return w; }
+
+static void w_chan_send(WChan *c, void *v, const char *where) {
+  if (c->eshare) c->eshare(v);
+  pthread_mutex_lock(&c->mu);
+  if (c->closed) { pthread_mutex_unlock(&c->mu); w_panic_c("send on a closed channel", where); }
+  WChWait *r = w_chq_pop(&c->rq, &c->rq_t);
+  if (r) {                                       /* a receiver is waiting: hand the value over */
+    memcpy(r->val, v, c->esz); r->ok = 1;
+    pthread_mutex_unlock(&c->mu);
+    w_wake(r->f);
+    return;
+  }
+  if (c->len < c->cap) {
+    memcpy(c->buf + ((c->head + c->len) % c->cap) * c->esz, v, c->esz);
+    c->len++;
+    pthread_mutex_unlock(&c->mu);
+    return;
+  }
+  WChWait me = { w_current(), v, 0, NULL };
+  w_prepare_park();
+  w_chq_push(&c->sq, &c->sq_t, &me);
+  pthread_mutex_unlock(&c->mu);
+  w_park_now();
+  if (!me.ok) w_panic_c("send on a closed channel", where);
+}
+
+static bool w_chan_recv(WChan *c, void *out) {
+  pthread_mutex_lock(&c->mu);
+  if (c->len > 0) {
+    memcpy(out, c->buf + c->head * c->esz, c->esz);
+    c->head = (c->head + 1) % c->cap; c->len--;
+    WChWait *s = w_chq_pop(&c->sq, &c->sq_t);
+    if (s) {                                     /* a sender was waiting for room */
+      memcpy(c->buf + ((c->head + c->len) % c->cap) * c->esz, s->val, c->esz);
+      c->len++; s->ok = 1;
+      pthread_mutex_unlock(&c->mu);
+      w_wake(s->f);
+      return true;
+    }
+    pthread_mutex_unlock(&c->mu);
+    return true;
+  }
+  if (c->closed) { pthread_mutex_unlock(&c->mu); return false; }
+  WChWait me = { w_current(), out, 0, NULL };
+  w_prepare_park();
+  w_chq_push(&c->rq, &c->rq_t, &me);
+  pthread_mutex_unlock(&c->mu);
+  w_park_now();
+  return me.ok;
+}
+
+static void w_chan_close(WChan *c, const char *where) {
+  pthread_mutex_lock(&c->mu);
+  if (c->closed) { pthread_mutex_unlock(&c->mu); w_panic_c("close of a closed channel", where); }
+  c->closed = 1;
+  WChWait *rs = c->rq, *ss = c->sq;
+  c->rq = c->rq_t = c->sq = c->sq_t = NULL;
+  pthread_mutex_unlock(&c->mu);
+  while (rs) { WChWait *n = rs->next; rs->ok = 0; w_wake(rs->f); rs = n; }
+  while (ss) { WChWait *n = ss->next; ss->ok = 0; w_wake(ss->f); ss = n; }
+}

@@ -103,6 +103,7 @@ let rec resolve env (te : ty_expr) : ty =
     | "Fs", _ -> TCap Fs
     | "Stdout", _ -> TCap Stdout
     | "Clock", _ -> TCap Clock
+    | "Chan", [ x ] -> TChan x
     | _ -> ( match List.assoc_opt n env with Some t -> t | None -> TNamed (n, a)))
 
 let field_types g = function
@@ -224,6 +225,11 @@ let rec lower f (e : expr) : I.atom =
       let t = match tyof f recv with TGroup t -> t | _ -> TUnit in
       ignore (tmp f TUnit (I.Spawn (g, c, t)));
       I.AUnit
+    | EMethod (recv, "send", _, [ v ]) when (match tyof f recv with TChan _ -> true | _ -> false) ->
+      let c = lower f recv in
+      let x = lower f v in
+      ignore (tmp f TUnit (I.ChanSend (c, x, e.espan)));
+      I.AUnit
     | EMethod (recv, name, _, args) -> lower_method f e recv name args ty
     | EField ({ edesc = EVar en; _ }, name, _) when is_enum_name f en -> ctor_value f name ty
     | EField _ | EIndex _ -> (
@@ -284,6 +290,9 @@ and ctor_value f vname ty =
 
 and lower_call f e callee args ty =
   match callee.edesc with
+  | EVar "channel" when not_local f "channel" && not (Hashtbl.mem f.g.fns "channel") ->
+    let cap = lower f (List.hd args) in
+    tmp f ty (I.ChanNew (ty, cap, e.espan))
   | EVar "panic" when not_local f "panic" && not (Hashtbl.mem f.g.fns "panic") ->
     let m = lower f (List.hd args) in
     let r = tmp f ty (I.Panic (m, e.espan)) in
@@ -517,6 +526,7 @@ and lower_method f e recv name args ty =
       | TBool -> "bool_"
       | TList _ -> "list_"
       | TArray _ -> "array_"
+      | TChan _ -> "chan_"
       | TCap _ -> "cap_"
       | _ -> failwith ("method on " ^ show rt)
     in
@@ -563,7 +573,7 @@ and pure_closure f fn =
     List.for_all
       (fun n ->
         match lookup f n with
-        | Some (v : I.var) -> caps_in v.ty [] = [] && not (has_fn v.ty)
+        | Some (v : I.var) -> caps_in v.ty [] = [] && not (has_fn v.ty) && not (has_chan v.ty)
         | None -> true (* top-level function or constructor *))
       free
   | _ -> false

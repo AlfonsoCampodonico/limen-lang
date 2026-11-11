@@ -13,6 +13,7 @@ type ty =
   | TCap of cap
   | TGroup of ty (* handle of a `group` block whose tasks return ty *)
   | TArray of ty * int (* fixed-size array, a value type *)
+  | TChan of ty (* channel between tasks *)
   | TParam of string (* a generic parameter inside its own definition *)
   | TVar of tvar ref
   | TErr (* already reported; unifies with anything *)
@@ -56,6 +57,7 @@ let rec show t =
   | TCap c -> cap_name c
   | TGroup a -> "Group[" ^ show a ^ "]"
   | TArray (a, n) -> "Array[" ^ show a ^ ", " ^ string_of_int n ^ "]"
+  | TChan a -> "Chan[" ^ show a ^ "]"
   | TParam n -> n
   | TVar _ -> "_"
   | TErr -> "?"
@@ -63,7 +65,7 @@ let rec show t =
 let rec occurs r t =
   match repr t with
   | TVar r' -> r == r'
-  | TList a | TGroup a | TArray (a, _) -> occurs r a
+  | TList a | TGroup a | TArray (a, _) | TChan a -> occurs r a
   | TFn (ps, b) -> List.exists (occurs r) ps || occurs r b
   | TNamed (_, a) -> List.exists (occurs r) a
   | _ -> false
@@ -79,6 +81,7 @@ let rec unify a b =
   | TInt, TInt | TFloat, TFloat | TBool, TBool | TStr, TStr | TUnit, TUnit -> ()
   | TList x, TList y | TGroup x, TGroup y -> unify x y
   | TArray (x, n), TArray (y, m) when n = m -> unify x y
+  | TChan x, TChan y -> unify x y
   | TFn (p1, r1), TFn (p2, r2) ->
     if List.length p1 <> List.length p2 then raise Mismatch;
     List.iter2 unify p1 p2;
@@ -94,6 +97,7 @@ let rec subst env t =
   | TParam n -> ( match List.assoc_opt n env with Some t' -> t' | None -> t)
   | TList a -> TList (subst env a)
   | TArray (a, n) -> TArray (subst env a, n)
+  | TChan a -> TChan (subst env a)
   | TGroup a -> TGroup (subst env a)
   | TFn (ps, r) -> TFn (List.map (subst env) ps, subst env r)
   | TNamed (n, args) -> TNamed (n, List.map (subst env) args)
@@ -107,6 +111,15 @@ let rec caps_in t acc =
   | TFn (ps, r) -> List.fold_left (fun acc p -> caps_in p acc) (caps_in r acc) ps
   | TNamed (_, args) -> List.fold_left (fun acc a -> caps_in a acc) acc args
   | _ -> acc
+
+(* Channels: shared communication, so values holding one are never pure. *)
+let rec has_chan t =
+  match repr t with
+  | TChan _ -> true
+  | TList a | TArray (a, _) -> has_chan a
+  | TFn (ps, r) -> List.exists has_chan ps || has_chan r
+  | TNamed (_, args) -> List.exists has_chan args
+  | _ -> false
 
 let rec has_fn t =
   match repr t with
@@ -123,6 +136,7 @@ let rec zonk env t =
   | TVar _ -> TUnit
   | TList a -> TList (zonk env a)
   | TArray (a, n) -> TArray (zonk env a, n)
+  | TChan a -> TChan (zonk env a)
   | TGroup a -> TGroup (zonk env a)
   | TFn (ps, r) -> TFn (List.map (zonk env) ps, zonk env r)
   | TNamed (n, args) -> TNamed (n, List.map (zonk env) args)

@@ -425,6 +425,86 @@ fn area(s: Shape) -> Float { match s { Dot => 0.0, Box(w, h) => w * h } }
         g.go(|| None) }
     out.print("{none.len()} {strs} {opts}")|})
     "0 [\"xx\", \"yy\"] [Some([1]), None]\n";
+  (* ---------- channels ---------- *)
+  par "chan-producer-consumer"
+    (main_wrap {|    let c: Chan[Int] = channel(2)
+    let done: Chan[Str] = channel(1)
+    let rs = group g {
+        g.go(|| {
+            let mut sum = 0
+            let mut more = true
+            while more {
+                match c.recv() {
+                    Some(v) => { sum = sum + v },
+                    None => { more = false },
+                }
+            }
+            done.send("consumer saw {sum}")
+            sum
+        })
+        g.go(|| {
+            for i in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] { c.send(i) }
+            c.close()
+            0
+        })
+    }
+    out.print("{rs} {done.recv()}")|})
+    "[55, 0] Some(\"consumer saw 55\")\n";
+  par "chan-fan-in"
+    (main_wrap {|    let c: Chan[List[Str]] = channel(1)
+    let rs = group g {
+        g.go(|| {
+            let parts = group h {
+                for k in [1, 2, 3] {
+                    h.go(|| {
+                        for i in [1, 2, 3] { c.send(["{k}", "{i}"]) }
+                        k
+                    })
+                }
+            }
+            c.close()
+            parts.sum()
+        })
+        g.go(|| {
+            let mut got = []
+            let mut more = true
+            while more {
+                match c.recv() {
+                    Some(pair) => { got.push(pair.join("-")) },
+                    None => { more = false },
+                }
+            }
+            got.len()
+        })
+    }
+    out.print("{rs}")|})
+    "[6, 9]\n";
+  par "chan-many-tasks"
+    (main_wrap {|    let c: Chan[Int] = channel(1)
+    let total = group g {
+        g.go(|| {
+            let mut s = 0
+            let mut n = 0
+            while n < 1000 {
+                s = s + c.recv().unwrap_or(0)
+                n = n + 1
+            }
+            s
+        })
+        let mut i = 0
+        while i < 1000 {
+            let k = i
+            g.go(|| { c.send(k)
+ 0 })
+            i = i + 1
+        }
+    }
+    out.print("{total.sum()}")|})
+    "499500\n";
+  panics "chan-deadlock" (main_wrap "    let c: Chan[Int] = channel(1)\n    c.send(1)\n    c.send(2)") "all tasks are blocked (deadlock)";
+  panics "chan-send-closed" (main_wrap "    let c: Chan[Int] = channel(1)\n    c.close()\n    c.send(1)") "send on a closed channel";
+  panics "chan-capacity" (main_wrap "    let c: Chan[Int] = channel(0)") "channel capacity must be at least 1";
+  errs "chan-in-struct" "struct S { c: Chan[Int] }\nfn main(root: Root) {}" [ "E0305" ];
   panics "div-zero" (main_wrap "    let z = 0\n    out.print(\"{1 / z}\")") "division by zero";
   panics "index-oob" (main_wrap "    let xs = [1]\n    out.print(\"{xs[3]}\")") "index 3 is out of range for a list of length 1";
   panics "panic-fn" (main_wrap "    panic(\"boom\")") "boom";
