@@ -11,3 +11,10 @@
  (deps lsp_stdio.py %{exe:../bin/main.exe})
  (action
   (run python3 lsp_stdio.py %{exe:../bin/main.exe})))
+
+; `writ mcp` end to end over stdio.
+(rule
+ (alias runtest)
+ (deps mcp_stdio.py %{exe:../bin/main.exe})
+ (action
+  (run python3 mcp_stdio.py %{exe:../bin/main.exe})))

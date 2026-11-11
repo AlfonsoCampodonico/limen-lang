@@ -16,3 +16,14 @@
     (cat runtime/writ_rt.h)
     (echo "|xxrtxx}\n")))))
 
+; Embed SPEC.md for `writ spec` and the MCP server.
+(rule
+ (targets spec_text.ml)
+ (deps %{project_root}/SPEC.md)
+ (action
+  (with-stdout-to
+   spec_text.ml
+   (progn
+    (echo "let text = {xxspecxx|")
+    (cat %{project_root}/SPEC.md)
+    (echo "|xxspecxx}\n")))))

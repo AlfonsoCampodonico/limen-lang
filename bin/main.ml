@@ -12,6 +12,8 @@ usage:
   writ test FILE [--native]
   writ fmt FILE... [--write | --check]
   writ lsp                (language server on stdin/stdout)
+  writ mcp                (MCP server for coding agents, on stdin/stdout)
+  writ spec               (print the language specification)
 
 Stdout and Clock are always granted. Net and Fs exist only when granted.
 |}
@@ -245,6 +247,8 @@ let () =
   | [ "caps"; file ] -> cmd_caps file false
   | [ "caps"; file; "--json" ] | [ "caps"; "--json"; file ] -> cmd_caps file true
   | [ "lsp" ] -> Lsp.serve ()
+  | [ "mcp" ] -> Mcp.serve ()
+  | [ "spec" ] -> print_string Spec_text.text
   | [ "test"; file ] -> cmd_test file false
   | [ "test"; file; "--native" ] | [ "test"; "--native"; file ] -> cmd_test file true
   | "fmt" :: rest -> (
