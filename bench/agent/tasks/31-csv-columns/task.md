@@ -1,8 +1,8 @@
 # Task 31-csv-columns
 
-Write a complete Writ program (`fn main`) for this task. Output must match exactly, including the final newline.
+Write a complete Vela program (`fn main`) for this task. Output must match exactly, including the final newline.
 
-Run it as: `writ run solution.wr` (from this task's directory).
+Run it as: `vela run solution.vela` (from this task's directory).
 
 The program contains this CSV as a string:
 

@@ -5,6 +5,6 @@ set -e
 cd "$(dirname "$0")/.."
 dir=$(mktemp -d)
 dune build
-WRIT_SKIP_NATIVE=1 WRIT_DUMP_DIR="$dir" ./_build/default/test/test_writ.exe > /dev/null
-python3 grammar/gbnf_check.py grammar/writ.gbnf "$dir"/accept/*.wr --reject "$dir"/reject/*.wr
+VELA_SKIP_NATIVE=1 VELA_DUMP_DIR="$dir" ./_build/default/test/test_vela.exe > /dev/null
+python3 grammar/gbnf_check.py grammar/vela.gbnf "$dir"/accept/*.vela --reject "$dir"/reject/*.vela
 rm -rf "$dir"

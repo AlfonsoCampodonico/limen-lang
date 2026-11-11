@@ -1,4 +1,4 @@
-(* writ mcp: a Model Context Protocol server on stdin/stdout (one JSON-RPC
+(* vela mcp: a Model Context Protocol server on stdin/stdout (one JSON-RPC
    message per line). Gives a coding agent the compiler's tools and the
    spec. Programs run with no grants: only Stdout and Clock exist, so code an
    agent just wrote cannot touch files or the network. *)
@@ -17,27 +17,27 @@ let tool name desc props required =
       ("inputSchema",
        J.Obj [ ("type", J.String "object"); ("properties", J.Obj props); ("required", J.List (List.map (fun r -> J.String r) required)) ]) ]
 
-let source_p = ("source", str_prop "Complete Writ program text")
+let source_p = ("source", str_prop "Complete Vela program text")
 
 let tools =
-  [ tool "writ_spec" "The Writ language specification (SPEC.md). Read this before writing Writ." [] [];
-    tool "writ_check" "Type-check a Writ program. Returns \"ok\" or diagnostics as JSON, with error codes, positions, notes and machine-applicable fixes." [ source_p ] [ "source" ];
-    tool "writ_run"
-      "Run a Writ program and return its exit status, stdout and stderr. The program gets no grants: only root.stdout and root.clock work; file and network access are denied. Stops after timeout_seconds (default 10)."
+  [ tool "vela_spec" "The Vela language specification (SPEC.md). Read this before writing Vela." [] [];
+    tool "vela_check" "Type-check a Vela program. Returns \"ok\" or diagnostics as JSON, with error codes, positions, notes and machine-applicable fixes." [ source_p ] [ "source" ];
+    tool "vela_run"
+      "Run a Vela program and return its exit status, stdout and stderr. The program gets no grants: only root.stdout and root.clock work; file and network access are denied. Stops after timeout_seconds (default 10)."
       [ source_p; ("native", bool_prop "Compile to native code instead of interpreting (default false)");
         ("timeout_seconds", int_prop "Time limit, 1 to 60") ]
       [ "source" ];
-    tool "writ_test" "Run the `test \"name\" { ... }` blocks in a Writ program and report each result." [ source_p; ("native", bool_prop "Run natively (default false)") ] [ "source" ];
-    tool "writ_format" "Format a Writ program in the canonical style." [ source_p ] [ "source" ];
-    tool "writ_caps" "List each function and the capabilities in its signature (its authority), or `pure`." [ source_p ] [ "source" ];
-    tool "writ_type_at" "The type (or signature) at a position in a Writ program. line and character are 0-based."
+    tool "vela_test" "Run the `test \"name\" { ... }` blocks in a Vela program and report each result." [ source_p; ("native", bool_prop "Run natively (default false)") ] [ "source" ];
+    tool "vela_format" "Format a Vela program in the canonical style." [ source_p ] [ "source" ];
+    tool "vela_caps" "List each function and the capabilities in its signature (its authority), or `pure`." [ source_p ] [ "source" ];
+    tool "vela_type_at" "The type (or signature) at a position in a Vela program. line and character are 0-based."
       [ source_p; ("line", int_prop "0-based line"); ("character", int_prop "0-based column") ]
       [ "source"; "line"; "character" ];
-    tool "writ_explain" "Explain a Writ error code such as E0302." [ ("code", str_prop "Error code") ] [ "code" ] ]
+    tool "vela_explain" "Explain a Vela error code such as E0302." [ ("code", str_prop "Error code") ] [ "code" ] ]
 
 (* ---------- helpers ---------- *)
 
-let file = "input.wr"
+let file = "input.vela"
 
 let analyze src =
   match Modules.load file src with
@@ -48,11 +48,11 @@ let analyze src =
 
 let truncate s = if String.length s > 65536 then String.sub s 0 65536 ^ "\n[output truncated]" else s
 
-(* Run `writ ARGS` on the source in a fresh directory, with a time limit. *)
+(* Run `vela ARGS` on the source in a fresh directory, with a time limit. *)
 let run_cli args src timeout =
-  let dir = Filename.concat (Filename.get_temp_dir_name ()) (Printf.sprintf "writ-mcp-%d-%d" (Unix.getpid ()) (Random.bits ())) in
+  let dir = Filename.concat (Filename.get_temp_dir_name ()) (Printf.sprintf "vela-mcp-%d-%d" (Unix.getpid ()) (Random.bits ())) in
   Unix.mkdir dir 0o700;
-  let path = Filename.concat dir "main.wr" in
+  let path = Filename.concat dir "main.vela" in
   Out_channel.with_open_bin path (fun oc -> output_string oc src);
   let out = Filename.concat dir "out" and err = Filename.concat dir "err" in
   let fo = Unix.openfile out [ Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC ] 0o600 in
@@ -87,23 +87,23 @@ let arg args k = J.member k args
 let call name args =
   let src = J.to_str (arg args "source") in
   match name with
-  | "writ_spec" -> text_result Spec_text.text
-  | "writ_check" -> (
+  | "vela_spec" -> text_result Spec_text.text
+  | "vela_check" -> (
     match analyze src with
     | _, [], _ -> text_result "ok"
     | _, ds, _ -> text_result (Diag.list_to_json ds))
-  | "writ_run" | "writ_test" ->
+  | "vela_run" | "vela_test" ->
     let native = arg args "native" = J.Bool true in
     let timeout = match arg args "timeout_seconds" with J.Int n -> max 1 (min 60 n) | _ -> 10 in
-    let base = if name = "writ_run" then [ "run" ] else [ "test" ] in
+    let base = if name = "vela_run" then [ "run" ] else [ "test" ] in
     let status, o, e = run_cli (base @ if native then [ "--native" ] else []) src timeout in
     let head = match status with `Exit n -> Printf.sprintf "exit %d" n | `Timeout -> Printf.sprintf "timed out after %d s" timeout in
     text_result ~is_error:(status <> `Exit 0) (Printf.sprintf "%s\nstdout:\n%s\nstderr:\n%s" head o e)
-  | "writ_format" -> (
+  | "vela_format" -> (
     match Fmt.format ~file src with
     | out -> text_result out
     | exception Diag.Fatal d -> text_result ~is_error:true (Diag.render d))
-  | "writ_caps" -> (
+  | "vela_caps" -> (
     match analyze src with
     | _, [], infos ->
       text_result
@@ -114,7 +114,7 @@ let call name args =
                 i.name ^ ": " ^ (match (caps, i.callbacks) with [], false -> "pure" | [], true -> "pure itself, runs callbacks" | cs, cb -> String.concat ", " cs ^ if cb then " + callbacks" else ""))
               infos))
     | _, ds, _ -> text_result ~is_error:true (Diag.list_to_json ds))
-  | "writ_type_at" -> (
+  | "vela_type_at" -> (
     match analyze src with
     | Some items, _, _ -> (
       let off = Lsp.offset_of src (J.to_int (arg args "line")) (J.to_int (arg args "character")) in
@@ -122,7 +122,7 @@ let call name args =
       | Some (_, s) -> text_result s
       | None -> text_result "nothing typed at that position")
     | None, ds, _ -> text_result ~is_error:true (Diag.list_to_json ds))
-  | "writ_explain" -> (
+  | "vela_explain" -> (
     let code = String.uppercase_ascii (J.to_str (arg args "code")) in
     match Diag.explain code with Some t -> text_result (code ^ ": " ^ t) | None -> text_result ~is_error:true ("unknown error code " ^ code))
   | n -> text_result ~is_error:true ("unknown tool " ^ n)
@@ -140,9 +140,9 @@ let handle (msg : J.t) : J.t option =
       (J.Obj
          [ ("protocolVersion", J.String version);
            ("capabilities", J.Obj [ ("tools", J.Obj [ ("listChanged", J.Bool false) ]); ("resources", J.Obj []) ]);
-           ("serverInfo", J.Obj [ ("name", J.String "writ"); ("version", J.String "0.4") ]);
+           ("serverInfo", J.Obj [ ("name", J.String "vela"); ("version", J.String "0.4") ]);
            ("instructions",
-            J.String "Writ compiler tools. Read the spec (writ_spec or the writ://spec resource) first, then use writ_check after every edit and writ_run or writ_test to try programs.") ])
+            J.String "Vela compiler tools. Read the spec (vela_spec or the vela://spec resource) first, then use vela_check after every edit and vela_run or vela_test to try programs.") ])
   | "ping" -> reply (J.Obj [])
   | "tools/list" -> reply (J.Obj [ ("tools", J.List tools) ])
   | "tools/call" -> reply (call (J.to_str (J.member "name" params)) (J.member "arguments" params))
@@ -152,14 +152,14 @@ let handle (msg : J.t) : J.t option =
          [ ("resources",
             J.List
               [ J.Obj
-                  [ ("uri", J.String "writ://spec"); ("name", J.String "Writ language specification");
+                  [ ("uri", J.String "vela://spec"); ("name", J.String "Vela language specification");
                     ("mimeType", J.String "text/markdown") ] ]) ])
   | "resources/read" ->
-    if J.to_str (J.member "uri" params) = "writ://spec" then
+    if J.to_str (J.member "uri" params) = "vela://spec" then
       reply
         (J.Obj
            [ ("contents",
-              J.List [ J.Obj [ ("uri", J.String "writ://spec"); ("mimeType", J.String "text/markdown"); ("text", J.String Spec_text.text) ] ]) ])
+              J.List [ J.Obj [ ("uri", J.String "vela://spec"); ("mimeType", J.String "text/markdown"); ("text", J.String Spec_text.text) ] ]) ])
     else Some (J.Obj [ ("jsonrpc", J.String "2.0"); ("id", id); ("error", J.Obj [ ("code", J.Int (-32002)); ("message", J.String "resource not found") ]) ])
   | m ->
     if id = J.Null then None
@@ -177,7 +177,7 @@ let serve () =
           match handle msg with
           | Some r -> print_string (J.to_string r ^ "\n"); flush stdout
           | None -> ())
-        | exception J.Error m -> prerr_endline ("writ mcp: bad JSON: " ^ m)
+        | exception J.Error m -> prerr_endline ("vela mcp: bad JSON: " ^ m)
       end;
       loop ()
   in

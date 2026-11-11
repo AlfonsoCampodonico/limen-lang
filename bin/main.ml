@@ -1,31 +1,31 @@
-open Writ
+open Vela
 
 let usage =
-  {|writ: a small language where I/O needs a capability
+  {|vela: a small language where I/O needs a capability
 
 usage:
-  writ run FILE [--native] [--grant net=HOST[:PORT]|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST:PORT]...
-  writ build FILE [-o OUT] [--emit-c]
-  writ check FILE [--json]
-  writ caps FILE [--json]
-  writ explain CODE
-  writ test FILE [--native]
-  writ fmt FILE... [--write | --check]
-  writ lsp                (language server on stdin/stdout)
-  writ mcp                (MCP server for coding agents, on stdin/stdout)
-  writ spec               (print the language specification)
+  vela run FILE [--native] [--grant net=HOST[:PORT]|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST:PORT]...
+  vela build FILE [-o OUT] [--emit-c]
+  vela check FILE [--json]
+  vela caps FILE [--json]
+  vela explain CODE
+  vela test FILE [--native]
+  vela fmt FILE... [--write | --check]
+  vela lsp                (language server on stdin/stdout)
+  vela mcp                (MCP server for coding agents, on stdin/stdout)
+  vela spec               (print the language specification)
 
 Stdout and Clock are always granted. Net and Fs exist only when granted.
 |}
 
 let die_usage msg =
-  prerr_string (if msg = "" then usage else "writ: " ^ msg ^ "\n\n" ^ usage);
+  prerr_string (if msg = "" then usage else "vela: " ^ msg ^ "\n\n" ^ usage);
   exit 2
 
 let load file =
   let src =
     try In_channel.with_open_bin file In_channel.input_all
-    with Sys_error m -> prerr_endline ("writ: " ^ m); exit 2
+    with Sys_error m -> prerr_endline ("vela: " ^ m); exit 2
   in
   Modules.load_and_check file src
 
@@ -63,7 +63,7 @@ let rec split_grants = function
     (gs, x :: others)
   | [] -> ([], [])
 
-(* writ test: run every `test "name" { ... }` block, each isolated. *)
+(* vela test: run every `test "name" { ... }` block, each isolated. *)
 let where_of (sp : Span.t) =
   if sp.file = "" then ""
   else
@@ -71,10 +71,10 @@ let where_of (sp : Span.t) =
     Printf.sprintf "%s:%d:%d" sp.file l c
 
 let run_tests_native items names =
-  let exe = Filename.concat (Filename.get_temp_dir_name ()) (Printf.sprintf "writ-test-%d" (Unix.getpid ())) in
+  let exe = Filename.concat (Filename.get_temp_dir_name ()) (Printf.sprintf "vela-test-%d" (Unix.getpid ())) in
   (match Native.build ~tests:true items exe with
    | Ok () -> ()
-   | Error m -> prerr_string m; prerr_endline "writ: the C compiler failed (this is a bug in writ)"; exit 1);
+   | Error m -> prerr_string m; prerr_endline "vela: the C compiler failed (this is a bug in vela)"; exit 1);
   let results =
     List.mapi
       (fun i name ->
@@ -134,7 +134,7 @@ let cmd_fmt files mode =
   let changed = ref [] in
   List.iter
     (fun file ->
-      let src = try In_channel.with_open_bin file In_channel.input_all with Sys_error m -> prerr_endline ("writ: " ^ m); exit 2 in
+      let src = try In_channel.with_open_bin file In_channel.input_all with Sys_error m -> prerr_endline ("vela: " ^ m); exit 2 in
       match Fmt.format ~file src with
       | exception Diag.Fatal d -> prerr_string (Diag.render d); exit 1
       | out -> (
@@ -200,17 +200,17 @@ let cmd_build file out emit_c =
     | Ok () -> (try Sys.remove (out ^ ".c") with Sys_error _ -> ())
     | Error m ->
       prerr_string m;
-      prerr_endline "writ: the C compiler failed (this is a bug in writ)";
+      prerr_endline "vela: the C compiler failed (this is a bug in vela)";
       exit 1
 
 let cmd_run_native file grant_args =
   ignore (parse_grants grant_args);
   let items = checked file in
   let dir = Filename.get_temp_dir_name () in
-  let exe = Filename.concat dir (Printf.sprintf "writ-%d" (Unix.getpid ())) in
+  let exe = Filename.concat dir (Printf.sprintf "vela-%d" (Unix.getpid ())) in
   (match Native.build items exe with
    | Ok () -> ()
-   | Error m -> prerr_string m; prerr_endline "writ: the C compiler failed (this is a bug in writ)"; exit 1);
+   | Error m -> prerr_string m; prerr_endline "vela: the C compiler failed (this is a bug in vela)"; exit 1);
   let args = List.concat_map (fun g -> [ "--grant"; g ]) grant_args in
   let pid = Unix.create_process exe (Array.of_list (exe :: args)) Unix.stdin Unix.stdout Unix.stderr in
   let _, status = Unix.waitpid [] pid in

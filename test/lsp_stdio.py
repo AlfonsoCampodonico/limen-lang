@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""End-to-end check of `writ lsp` over stdio: framing, diagnostics, hover,
-completion, shutdown and exit.  Usage: python3 test/lsp_stdio.py WRIT_EXE"""
+"""End-to-end check of `vela lsp` over stdio: framing, diagnostics, hover,
+completion, shutdown and exit.  Usage: python3 test/lsp_stdio.py VELA_EXE"""
 import json, subprocess, sys
 
 exe = sys.argv[1]
@@ -25,13 +25,13 @@ def recv():
     return json.loads(p.stdout.read(length))
 
 
-uri = "file:///tmp/e2e.wr"
+uri = "file:///tmp/e2e.vela"
 text = 'fn main(root: Root) {\n    let n = 41 + 1\n    print("x")\n    root.stdout.print("{n}")\n}\n'
 send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
 init = recv()
 assert init["result"]["capabilities"]["completionProvider"]["triggerCharacters"] == ["."], init
 send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
-send({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {"textDocument": {"uri": uri, "languageId": "writ", "version": 1, "text": text}}})
+send({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {"textDocument": {"uri": uri, "languageId": "vela", "version": 1, "text": text}}})
 diags = recv()
 assert diags["method"] == "textDocument/publishDiagnostics", diags
 assert [d["code"] for d in diags["params"]["diagnostics"]] == ["E0302"], diags

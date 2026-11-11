@@ -1,8 +1,8 @@
 // The phase 1 gate: main narrows its network grant to one host, hands it to
 // fetch_repos, and parsing stays pure.
 //
-//   writ run examples/repos.wr --grant net=api.github.com
-//   writ caps examples/repos.wr
+//   vela run examples/repos.vela --grant net=api.github.com
+//   vela caps examples/repos.vela
 
 fn main(root: Root) -> Result[(), IoError] {
     let gh = root.net.only("api.github.com:443")

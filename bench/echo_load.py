@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Load test for examples/echo.wr: open N connections and keep them all open,
+"""Load test for examples/echo.vela: open N connections and keep them all open,
 then echo one message on each and check every reply.
 Usage: python3 bench/echo_load.py PORT [N]"""
 import asyncio, resource, sys, time

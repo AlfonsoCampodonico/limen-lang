@@ -1,5 +1,5 @@
 // An HTTP server and client talking over loopback, with the json module.
-// Run: writ run examples/http_demo.wr --grant listen=127.0.0.1:0 --grant net=127.0.0.1
+// Run: vela run examples/http_demo.vela --grant listen=127.0.0.1:0 --grant net=127.0.0.1
 use http
 use json
 

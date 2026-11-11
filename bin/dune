@@ -1,4 +1,4 @@
 (executable
  (name main)
- (public_name writ)
- (libraries writ unix))
+ (public_name vela)
+ (libraries vela unix))

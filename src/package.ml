@@ -1,4 +1,4 @@
-(* writ.toml: a package's name and its dependencies, each with the
+(* vela.toml: a package's name and its dependencies, each with the
    capabilities it may use.
 
      [package]
@@ -8,8 +8,8 @@
      json = { path = "vendor/json" }
      fetch = { path = "../fetch", caps = ["net"] }
 
-   A dependency is a directory holding NAME.wr (and any modules it uses from
-   the same directory). Because Writ has no ambient authority, a function can
+   A dependency is a directory holding NAME.vela (and any modules it uses from
+   the same directory). Because Vela has no ambient authority, a function can
    only use a capability that reaches it as a parameter, so the capabilities a
    dependency can ever use are exactly those in its functions' signatures. The
    checker compares them with `caps` and rejects the program if a dependency
@@ -121,7 +121,7 @@ let parse file src : t =
       let k, _ = key () in
       if peek () <> ']' then fail !pos "expected `]`";
       incr pos;
-      if k <> "package" && k <> "dependencies" then fail (!pos - 1) ("unknown table [" ^ k ^ "]; writ.toml has [package] and [dependencies]");
+      if k <> "package" && k <> "dependencies" then fail (!pos - 1) ("unknown table [" ^ k ^ "]; vela.toml has [package] and [dependencies]");
       section := k;
       end_line ()
     end
@@ -154,21 +154,21 @@ let parse file src : t =
   done;
   { pname = !name; file; deps = List.rev !deps }
 
-(* writ.toml in the directory of [main] or the nearest parent. *)
+(* vela.toml in the directory of [main] or the nearest parent. *)
 let find main =
   let rec up d =
-    let p = Filename.concat d "writ.toml" in
+    let p = Filename.concat d "vela.toml" in
     if Sys.file_exists p then Some p
     else
       let parent = Filename.dirname d in
       if parent = d then None else up parent
   in
   let d = Filename.dirname main in
-  let beside = Filename.concat d "writ.toml" in
+  let beside = Filename.concat d "vela.toml" in
   if Sys.file_exists beside then Some beside
   else up (if Filename.is_relative d then Filename.concat (Sys.getcwd ()) d else d)
 
-(* Load the package around [main]: Ok None when there is no writ.toml. *)
+(* Load the package around [main]: Ok None when there is no vela.toml. *)
 let load main : (t option, Diag.t) result =
   match find main with
   | None -> Ok None
@@ -198,7 +198,7 @@ let enforce (pkg : t) (module_pkg : (string * string) list) (infos : Check.fn_in
             let need = match grant_of c with [] -> "Root, which no dependency can be granted" | g :: _ -> Printf.sprintf "\"%s\"" g in
             Some
               (Diag.make "E0320" d.dspan
-                 (Printf.sprintf "dependency `%s` uses capability `%s`, which writ.toml does not grant it" dn (Types.cap_name c))
+                 (Printf.sprintf "dependency `%s` uses capability `%s`, which vela.toml does not grant it" dn (Types.cap_name c))
                  ~notes:
                    [ Printf.sprintf "`%s` takes `%s` (%s)" i.name (Types.cap_name c) (let l, _ = Source.line_col i.span.file i.span.lo in Printf.sprintf "%s:%d" i.span.file l);
                      (if c = Types.Root then "a dependency can never take Root: pass it the narrower capability it needs"

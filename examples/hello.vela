@@ -1,0 +1,3 @@
+fn main(root: Root) {
+    root.stdout.print("hello, vela")
+}

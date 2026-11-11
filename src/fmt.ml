@@ -1,4 +1,4 @@
-(* writ fmt: print a program in the canonical style.
+(* vela fmt: print a program in the canonical style.
 
    - 4-space indentation, one struct field / enum variant / match arm per line.
    - Statements one per line (`;` separators are dropped); a single blank line

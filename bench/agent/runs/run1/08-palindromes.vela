@@ -4,7 +4,7 @@ fn is_pal(w: Str) -> Bool {
 }
 
 fn main(root: Root) {
-    for w in ["level", "writ", "racecar", "noon", "capability"] {
+    for w in ["level", "vela", "racecar", "noon", "capability"] {
         let ans = if is_pal(w) { "yes" } else { "no" }
         root.stdout.print("{w}: {ans}")
     }

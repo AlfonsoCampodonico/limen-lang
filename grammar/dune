@@ -3,12 +3,12 @@
 (rule
  (alias runtest)
  (deps
-  writ.gbnf
+  vela.gbnf
   gbnf_check.py
-  (glob_files tests/accept/*.wr)
-  (glob_files tests/reject/*.wr)
-  (glob_files %{project_root}/examples/*.wr)
-  (glob_files %{project_root}/bench/*.wr))
+  (glob_files tests/accept/*.vela)
+  (glob_files tests/reject/*.vela)
+  (glob_files %{project_root}/examples/*.vela)
+  (glob_files %{project_root}/bench/*.vela))
  (action
   (system
-   "python3 gbnf_check.py writ.gbnf tests/accept/*.wr ../examples/*.wr ../bench/*.wr --reject tests/reject/*.wr")))
+   "python3 gbnf_check.py vela.gbnf tests/accept/*.vela ../examples/*.vela ../bench/*.vela --reject tests/reject/*.vela")))

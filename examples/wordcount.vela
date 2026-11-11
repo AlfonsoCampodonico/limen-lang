@@ -1,4 +1,4 @@
-// writ run examples/wordcount.wr --grant fs=examples:ro
+// vela run examples/wordcount.vela --grant fs=examples:ro
 
 struct Count {
     word: Str,

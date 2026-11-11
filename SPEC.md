@@ -1,10 +1,10 @@
-# Writ language specification
+# Vela language specification
 
-This document describes Writ as implemented by this repository's compiler: interpreter (`writ run`) and native backend (`writ build`, `writ run --native`). It is meant to be read whole, by people and by models writing Writ. Where the two backends differ, the difference is stated.
+This document describes Vela as implemented by this repository's compiler: interpreter (`vela run`) and native backend (`vela build`, `vela run --native`). It is meant to be read whole, by people and by models writing Vela. Where the two backends differ, the difference is stated.
 
 ## 1. The idea
 
-Writ code can only touch the outside world through **capabilities**: values that grant authority. There is no global `print`, `open`, `http.get` or clock. The program starts with one capability, `root: Root`, and passes narrower ones to the functions that need them. A function's parameter types therefore say everything it can do.
+Vela code can only touch the outside world through **capabilities**: values that grant authority. There is no global `print`, `open`, `http.get` or clock. The program starts with one capability, `root: Root`, and passes narrower ones to the functions that need them. A function's parameter types therefore say everything it can do.
 
 ```
 fn main(root: Root) -> Result[(), IoError] {
@@ -249,7 +249,7 @@ The rules:
 1. Programs cannot create capabilities. They come only from `root`.
 2. Attenuation only narrows. `net.only(host)` returns a `Net` limited to that host, and it is empty if you didn't hold that host. `fs.under(dir)` limits to a subdirectory; `fs.read_only()` removes writing.
 3. There is no ambient I/O. Using `print`, `open`, `fetch` and similar names is error E0302, which explains the capability to use instead.
-4. A function whose parameters contain no capability and no function type is **pure**: it can only compute (and panic). `writ caps FILE` lists each function's authority.
+4. A function whose parameters contain no capability and no function type is **pure**: it can only compute (and panic). `vela caps FILE` lists each function's authority.
 5. Enforcement at runtime:
    - `Net`: http and https only, host allowlist, redirects not followed. `Net.connect` uses the same allowlist.
    - `Listen`: binding is allowed only for granted `host` or `host:port` entries.
@@ -270,7 +270,7 @@ let results = group g {
 - `g` can only be used as `g.go(...)` directly in the body. It cannot be stored, passed, returned, or used inside a closure (E0310).
 - The body cannot leave early with `return` or `?` (E0311), and `break` and `continue` cannot target loops outside the group.
 - Tasks share data by value, so there are no data races. A task reaches the world only through capabilities its closure captured. Spawning is not a capability.
-- Tasks are lightweight: natively each is a fiber with a small stack, scheduled on one worker thread per core (`WRIT_THREADS` overrides this), and a task waiting on a group, a channel or a socket parks without blocking a thread. The interpreter runs tasks as coroutines. Output printed by tasks may interleave differently between the two.
+- Tasks are lightweight: natively each is a fiber with a small stack, scheduled on one worker thread per core (`VELA_THREADS` overrides this), and a task waiting on a group, a channel or a socket parks without blocking a thread. The interpreter runs tasks as coroutines. Output printed by tasks may interleave differently between the two.
 - If every task is waiting and nothing can wake one, the program panics with `all tasks are blocked (deadlock)` instead of hanging.
 
 ### Channels
@@ -440,8 +440,8 @@ test "adds small numbers" {
 ```
 
 - `test "name" { ... }` is a top-level item. Tests take no arguments and get no `root`, so they cannot do I/O; they can use groups and channels.
-- `writ test FILE` runs every test, each isolated, and prints `ok` or `FAIL` with the panic message and location; it exits with status 1 if any test fails. `--native` runs them as native code.
-- Test names must be unique (E0106). Tests are type-checked by `writ check` and ignored by `writ run` and `writ build`.
+- `vela test FILE` runs every test, each isolated, and prints `ok` or `FAIL` with the panic message and location; it exits with status 1 if any test fails. `--native` runs them as native code.
+- Test names must be unique (E0106). Tests are type-checked by `vela check` and ignored by `vela run` and `vela build`.
 
 ## 13. How values print
 
@@ -465,7 +465,7 @@ The native backend may run a chain like `xs.filter(p).map(f).fold(z, g)` as one 
 
 ## 15. Errors
 
-Every diagnostic has a stable code. `writ explain CODE` prints its explanation, and `writ check --json` emits code, span, notes and an auto-fix when there is one.
+Every diagnostic has a stable code. `vela explain CODE` prints its explanation, and `vela check --json` emits code, span, notes and an auto-fix when there is one.
 
 | Code | Meaning |
 | --- | --- |
@@ -495,8 +495,8 @@ Every diagnostic has a stable code. `writ explain CODE` prints its explanation, 
 | E0305 | channel stored in a field |
 | E0310 | misuse of a group handle |
 | E0311 | `return` or `?` leaving a group |
-| E0320 | a dependency takes a capability writ.toml does not grant it |
-| E0321 | malformed writ.toml |
+| E0320 | a dependency takes a capability vela.toml does not grant it |
+| E0321 | malformed vela.toml |
 | E0401 | module not found, or a qualified name without `use` |
 | E0402 | item is not `pub` |
 | E0403 | module has no such item |
@@ -506,7 +506,7 @@ A **panic** (division by zero, index out of range, `panic(...)`, no matching arm
 
 ## 16. Grammar
 
-EBNF. `NL` is a newline, as described in section 2. A character-level version for constrained decoding, with the newline rules spelled out, is in [grammar/writ.gbnf](grammar/writ.gbnf). `{ x }` means zero or more, and `[ x ]` means optional.
+EBNF. `NL` is a newline, as described in section 2. A character-level version for constrained decoding, with the newline rules spelled out, is in [grammar/vela.gbnf](grammar/vela.gbnf). `{ x }` means zero or more, and `[ x ]` means optional.
 
 ```
 program    = { "use" IDENT | [ "pub" ] ( fn | struct | enum ) | test } ;
@@ -555,33 +555,33 @@ pattern    = "_" | IDENT | [ "-" ] INT | STRING | "true" | "false"
 
 ## 17. Tools
 
-- `writ fmt FILE` prints the canonical formatting (`--write` rewrites, `--check` verifies).
-- `writ lsp` is a language server; `writ mcp` is an MCP server exposing check, run, test, format, caps, type-at and the spec to coding agents.
-- `writ caps FILE` lists each function's authority; `writ explain CODE` explains an error.
+- `vela fmt FILE` prints the canonical formatting (`--write` rewrites, `--check` verifies).
+- `vela lsp` is a language server; `vela mcp` is an MCP server exposing check, run, test, format, caps, type-at and the spec to coding agents.
+- `vela caps FILE` lists each function's authority; `vela explain CODE` explains an error.
 
 ## 18. Modules and packages
 
 ### Modules
 
 ```
-use json                  // json.wr next to this file, a dependency, or the standard library
+use json                  // json.vela next to this file, a dependency, or the standard library
 
 pub fn load(text: Str) -> Result[json.Value, Str] {
     json.parse(text)
 }
 ```
 
-- `use NAME` makes module `NAME` available in this file. It looks for `NAME.wr` next to the file, then a dependency named `NAME` in writ.toml, then the standard library. A file never imports itself.
+- `use NAME` makes module `NAME` available in this file. It looks for `NAME.vela` next to the file, then a dependency named `NAME` in vela.toml, then the standard library. A file never imports itself.
 - Refer to a module's items as `NAME.item`: functions `json.parse(s)`, types `json.Value`, struct literals `json.Field { key, value }`, variants `json.Num(1.0)` and patterns `json.Num(x)`. A function can be used as a value: `let f = json.parse`.
 - Only items marked `pub` (`pub fn`, `pub struct`, `pub enum`) can be used from another module (E0402). Struct fields and enum variants of a `pub` type are all visible.
 - Inside a module, its own items are used unqualified. A local variable shadows a module name.
 - Variants are matched by name, so `match v { Num(x) => ... }` works without the module prefix when the type is known.
-- `test` blocks in a used module are not run; `writ test` runs the tests of the file you give it.
+- `test` blocks in a used module are not run; `vela test` runs the tests of the file you give it.
 - Modules can use each other, including in cycles. Type names print with their module: `json.Value`.
 
 ### Packages and capabilities
 
-A writ.toml next to the program (or in a parent directory) lists its dependencies, and what each may do:
+A vela.toml next to the program (or in a parent directory) lists its dependencies, and what each may do:
 
 ```
 [package]
@@ -592,14 +592,14 @@ json2 = { path = "vendor/json2" }                  # pure: no capabilities
 fetch = { path = "../fetch", caps = ["net"] }
 ```
 
-- A dependency is a directory holding `NAME.wr`, plus any modules that file uses from the same directory.
+- A dependency is a directory holding `NAME.vela`, plus any modules that file uses from the same directory.
 - `caps` lists what the dependency may use: `net` (Net and Conn), `listen` (Listen, Listener and Conn), `fs`, `stdout`, `clock`. The default is none. No dependency can take `Root`.
-- Writ has no ambient authority, so a function can only use a capability that reaches it as a parameter. The checker therefore knows everything a dependency can ever do from its signatures, and rejects the program (E0320) if a dependency's function takes a capability it was not granted. Granting is still only an upper bound: at run time the dependency gets exactly the capabilities you pass it, which can be narrowed with `only` and `under`.
+- Vela has no ambient authority, so a function can only use a capability that reaches it as a parameter. The checker therefore knows everything a dependency can ever do from its signatures, and rejects the program (E0320) if a dependency's function takes a capability it was not granted. Granting is still only an upper bound: at run time the dependency gets exactly the capabilities you pass it, which can be narrowed with `only` and `under`.
 - Only local paths are supported; there is no registry, versioning or lock file yet.
 
 ## 19. Standard library
 
-Written in Writ and built into the compiler; `use` any of them. They take capabilities only as parameters, like any other code.
+Written in Vela and built into the compiler; `use` any of them. They take capabilities only as parameters, like any other code.
 
 ### json
 

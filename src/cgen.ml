@@ -616,7 +616,7 @@ let type_defs c (out : Buffer.t) =
       | TList _ -> p (sprintf "typedef struct %s %s;" n n)
       | _ -> if is_boxed c t then p (sprintf "typedef struct %s_box* %s;" n n) else p (sprintf "typedef struct %s %s;" n n))
     (lists @ named);
-  List.iter (fun t -> match t with TList e -> p (sprintf "WRIT_LIST_STRUCT(%s, %s)" (cname c t) (ctype c e)) | _ -> ()) lists;
+  List.iter (fun t -> match t with TList e -> p (sprintf "VELA_LIST_STRUCT(%s, %s)" (cname c t) (ctype c e)) | _ -> ()) lists;
   (* struct bodies *)
   List.iter
     (fun t ->
@@ -689,8 +689,8 @@ let type_defs c (out : Buffer.t) =
     (fun t ->
       match t with
       | TList e ->
-        p (sprintf "WRIT_LIST_FUNCS(%s, %s, %s)" (cname c t) (ctype c e) (cname c e));
-        if e = TFloat then p (sprintf "WRIT_LIST_SORT(%s, double, Float)" (cname c t))
+        p (sprintf "VELA_LIST_FUNCS(%s, %s, %s)" (cname c t) (ctype c e) (cname c e));
+        if e = TFloat then p (sprintf "VELA_LIST_SORT(%s, double, Float)" (cname c t))
       | _ -> ())
     (List.stable_sort (fun a b -> compare (depth a) (depth b)) lists);
   (* dup/drop/eq/show definitions *)

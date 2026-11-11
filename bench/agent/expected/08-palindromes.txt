@@ -1,5 +1,5 @@
 level: yes
-writ: no
+vela: no
 racecar: yes
 noon: yes
 capability: no

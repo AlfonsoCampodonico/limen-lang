@@ -380,7 +380,7 @@ and check_var ctx f e n sp =
         match List.find_opt (fun (a, _, _) -> a = n) ambient with
         | Some (_, cap, how) ->
           err ctx "E0302" sp
-            (sprintf "`%s` does not exist: Writ has no ambient I/O" n)
+            (sprintf "`%s` does not exist: Vela has no ambient I/O" n)
             ~notes:
               [ sprintf "I/O goes through capabilities: take a `%s` parameter and call `%s`" cap how;
                 "in `main`, the capabilities live on `root`, for example `root.stdout.print(\"hi\")`" ];

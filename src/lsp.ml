@@ -62,7 +62,7 @@ let diag_json text (d : Diag.t) =
   let msg = String.concat "\n" (d.message :: List.map (fun n -> "note: " ^ n) d.notes) in
   J.Obj
     [ ("range", srange text d.span); ("severity", J.Int (match d.severity with Diag.Error -> 1 | Diag.Warning -> 2));
-      ("code", J.String d.code); ("source", J.String "writ"); ("message", J.String msg) ]
+      ("code", J.String d.code); ("source", J.String "vela"); ("message", J.String msg) ]
 
 let publish uri doc =
   J.Obj
@@ -421,7 +421,7 @@ let handle st (msg : J.t) : J.t list =
   let reply r = if id = J.Null then [] else [ response id r ] in
   match J.to_str (J.member "method" msg) with
   | "initialize" ->
-    reply (J.Obj [ ("capabilities", capabilities); ("serverInfo", J.Obj [ ("name", J.String "writ"); ("version", J.String "0.3") ]) ])
+    reply (J.Obj [ ("capabilities", capabilities); ("serverInfo", J.Obj [ ("name", J.String "vela"); ("version", J.String "0.3") ]) ])
   | "initialized" -> []
   | "shutdown" -> st.shutdown <- true; reply J.Null
   | "exit" -> st.exit <- true; []
@@ -444,7 +444,7 @@ let handle st (msg : J.t) : J.t list =
       | Some (sp, s) ->
         reply
           (J.Obj
-             [ ("contents", J.Obj [ ("kind", J.String "markdown"); ("value", J.String ("```writ\n" ^ s ^ "\n```")) ]);
+             [ ("contents", J.Obj [ ("kind", J.String "markdown"); ("value", J.String ("```vela\n" ^ s ^ "\n```")) ]);
                ("range", srange d.text sp) ])
       | None -> reply J.Null)
     | _ -> reply J.Null)
@@ -545,7 +545,7 @@ let serve () =
       | Some body ->
         (match J.parse body with
          | msg -> List.iter (write_message stdout) (handle st msg)
-         | exception J.Error m -> prerr_endline ("writ lsp: bad JSON: " ^ m));
+         | exception J.Error m -> prerr_endline ("vela lsp: bad JSON: " ^ m));
         loop ()
   in
   loop ();

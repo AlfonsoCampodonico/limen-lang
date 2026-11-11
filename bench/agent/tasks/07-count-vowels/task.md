@@ -1,7 +1,7 @@
 # Task 07-count-vowels
 
-Write a complete Writ program (`fn main`) for this task. Output must match exactly, including the final newline.
+Write a complete Vela program (`fn main`) for this task. Output must match exactly, including the final newline.
 
-Run it as: `writ run solution.wr` (from this task's directory).
+Run it as: `vela run solution.vela` (from this task's directory).
 
-Count the vowels (a, e, i, o, u, case-insensitive) in `"Programming In Writ Is Fun"` and print the count.
+Count the vowels (a, e, i, o, u, case-insensitive) in `"Programming In Vela Is Fun"` and print the count.

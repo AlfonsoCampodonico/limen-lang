@@ -19,14 +19,14 @@ let make ?(severity = Error) ?(notes = []) ?fix code span message =
   { code; severity; message; span; notes; fix }
 
 let explanations = [
-  "E0001", "The lexer found a character that is not part of Writ's syntax.";
+  "E0001", "The lexer found a character that is not part of Vela's syntax.";
   "E0002", "A string literal or interpolation was not closed before the end of the file.";
   "E0003", "The parser expected a different token here. The message names what it expected.";
   "E0004", "Statements are separated by a newline or `;`. Two statements were found on the same line.";
   "E0005", "An integer literal does not fit in Int.";
   "E0006", "Unknown escape in a string. Valid escapes: \\n \\t \\r \\\\ \\\" \\{ \\} \\0.";
   "E0007", "An interpolation `{...}` cannot be empty. Write `\\{` for a literal brace.";
-  "E0008", "Every function parameter needs a type, for example `fn f(x: Int)`. Writ only infers types inside function bodies.";
+  "E0008", "Every function parameter needs a type, for example `fn f(x: Int)`. Vela only infers types inside function bodies.";
   "E0101", "A name was used that is not a local variable, function or enum variant in scope.";
   "E0102", "A type name is not defined. Built-in types: Int, Float, Bool, Str, List, Array[T, N], Option, Result, IoError, Root, Net, Fs, Stdout, Clock.";
   "E0103", "The struct (or Root) has no field with this name.";
@@ -46,15 +46,15 @@ let explanations = [
   "E0208", "`break` and `continue` only work inside `while` and `for` loops (not inside closures).";
   "E0209", "Only variables, struct fields and list elements can be assigned to.";
   "E0301", "Capabilities (Root, Net, Fs, Stdout, Clock) cannot be stored in struct or enum fields. Authority must stay visible in function signatures, so pass capabilities as parameters.";
-  "E0302", "Writ has no ambient I/O: there is no global print, open, http or clock. I/O goes through capability values. `main` receives `root: Root`; pass `root.stdout`, `root.fs`, `root.net` or `root.clock` to the functions that need them.";
+  "E0302", "Vela has no ambient I/O: there is no global print, open, http or clock. I/O goes through capability values. `main` receives `root: Root`; pass `root.stdout`, `root.fs`, `root.net` or `root.clock` to the functions that need them.";
   "E0303", "`main` must be `fn main(root: Root)` or `fn main(root: Root) -> Result[(), E]`, with no type parameters.";
   "E0304", "Functions cannot be stored in struct or enum fields, because a stored closure could carry a capability out of sight.";
   "E0305", "Channels cannot be stored in struct or enum fields: like capabilities, they are passed as parameters or captured by a task's closure.";
   "E0310", "A group handle can only be used as `g.go(closure)`, directly in the group's body: it cannot be stored, passed, returned or captured by a closure.";
   "E0311", "Code inside a `group` block cannot leave it early with `return` or `?`, because every task must finish before the group returns its results.";
-  "E0320", "A dependency's functions take a capability that writ.toml does not grant it. Writ has no ambient authority, so the capabilities in a dependency's signatures are all it can ever use. Grant it with `caps = [\"net\"]` (net, fs, listen, stdout, clock) on its line in [dependencies], or use a dependency that needs less. No dependency can take Root.";
-  "E0321", "writ.toml could not be read. It has a [package] table with `name`, and a [dependencies] table with lines like `json = { path = \"vendor/json\", caps = [] }`.";
-  "E0401", "A module could not be found. `use NAME` looks for NAME.wr next to the importing file, then in the dependencies listed in writ.toml, then in the standard library. A qualified name such as `json.parse` needs `use json` in the same file.";
+  "E0320", "A dependency's functions take a capability that vela.toml does not grant it. Vela has no ambient authority, so the capabilities in a dependency's signatures are all it can ever use. Grant it with `caps = [\"net\"]` (net, fs, listen, stdout, clock) on its line in [dependencies], or use a dependency that needs less. No dependency can take Root.";
+  "E0321", "vela.toml could not be read. It has a [package] table with `name`, and a [dependencies] table with lines like `json = { path = \"vendor/json\", caps = [] }`.";
+  "E0401", "A module could not be found. `use NAME` looks for NAME.vela next to the importing file, then in the dependencies listed in vela.toml, then in the standard library. A qualified name such as `json.parse` needs `use json` in the same file.";
   "E0402", "The item is private to its module. Only items marked `pub` can be used from another module.";
   "E0403", "The module has no exported item with this name. The note lists what it exports.";
   "E0404", "A module name is not a value. Use one of its items, such as `json.parse(text)`.";
@@ -105,7 +105,7 @@ let to_json d =
     (jstr d.message) (jspan d.span)
     (String.concat "," (List.map jstr d.notes))
     fix
-    (jstr ("writ explain " ^ d.code))
+    (jstr ("vela explain " ^ d.code))
 
 let list_to_json ds = "{\"diagnostics\":[" ^ String.concat "," (List.map to_json ds) ^ "]}"
 

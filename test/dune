@@ -1,18 +1,18 @@
 (test
- (name test_writ)
- (libraries writ unix)
+ (name test_vela)
+ (libraries vela unix)
  (deps
-  (glob_files %{project_root}/examples/*.wr)
-  (glob_files %{project_root}/bench/*.wr)))
+  (glob_files %{project_root}/examples/*.vela)
+  (glob_files %{project_root}/bench/*.vela)))
 
-; `writ lsp` end to end over stdio.
+; `vela lsp` end to end over stdio.
 (rule
  (alias runtest)
  (deps lsp_stdio.py %{exe:../bin/main.exe})
  (action
   (run python3 lsp_stdio.py %{exe:../bin/main.exe})))
 
-; `writ mcp` end to end over stdio.
+; `vela mcp` end to end over stdio.
 (rule
  (alias runtest)
  (deps mcp_stdio.py %{exe:../bin/main.exe})

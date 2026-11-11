@@ -1,4 +1,4 @@
-# Writ
+# Vela
 
 A small, statically typed language where code can only touch the outside world through capabilities it was handed. There is no global `print`, `open`, `http.get` or `time.now`; `main` receives a `Root` value and passes narrower capabilities to the functions that need them.
 
@@ -34,31 +34,31 @@ dune test
 ```
 
 ```bash
-dune exec writ -- run examples/repos.wr --grant net=api.github.com
+dune exec vela -- run examples/repos.vela --grant net=api.github.com
 ```
 
 ```bash
-dune exec writ -- build examples/repos.wr -o repos && ./repos --grant net=api.github.com
+dune exec vela -- build examples/repos.vela -o repos && ./repos --grant net=api.github.com
 ```
 
 ## Commands
 
 | Command | What it does |
 | --- | --- |
-| `writ run FILE [--native] [--grant net=HOST[:PORT]\|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST[:PORT]]...` | Type-check, then run `main` in the interpreter, or compiled with `--native`. Stdout and Clock are always granted; Net, Fs and Listen only when granted. |
-| `writ build FILE [-o OUT] [--emit-c]` | Compile to a native binary through C. The binary takes the same `--grant` flags. `--emit-c` writes the C instead. |
-| `writ check FILE [--json]` | Type-check only. `--json` emits diagnostics with codes, spans, notes and machine-applicable fixes. |
-| `writ caps FILE [--json]` | List each function's authority: the capabilities in its signature, or `pure`. |
-| `writ explain CODE` | Explain an error code, for example `writ explain E0302`. |
-| `writ test FILE [--native]` | Run the file's `test "name" { ... }` blocks, each isolated. |
-| `writ fmt FILE... [--write\|--check]` | Print the canonical formatting, rewrite files, or check them. |
-| `writ lsp` | Language server on stdin/stdout. |
-| `writ mcp` | MCP server for coding agents on stdin/stdout. |
-| `writ spec` | Print the language specification. |
+| `vela run FILE [--native] [--grant net=HOST[:PORT]\|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST[:PORT]]...` | Type-check, then run `main` in the interpreter, or compiled with `--native`. Stdout and Clock are always granted; Net, Fs and Listen only when granted. |
+| `vela build FILE [-o OUT] [--emit-c]` | Compile to a native binary through C. The binary takes the same `--grant` flags. `--emit-c` writes the C instead. |
+| `vela check FILE [--json]` | Type-check only. `--json` emits diagnostics with codes, spans, notes and machine-applicable fixes. |
+| `vela caps FILE [--json]` | List each function's authority: the capabilities in its signature, or `pure`. |
+| `vela explain CODE` | Explain an error code, for example `vela explain E0302`. |
+| `vela test FILE [--native]` | Run the file's `test "name" { ... }` blocks, each isolated. |
+| `vela fmt FILE... [--write\|--check]` | Print the canonical formatting, rewrite files, or check them. |
+| `vela lsp` | Language server on stdin/stdout. |
+| `vela mcp` | MCP server for coding agents on stdin/stdout. |
+| `vela spec` | Print the language specification. |
 
 ## Tooling for editors and models
 
-- **Language server (`writ lsp`):**
+- **Language server (`vela lsp`):**
   - diagnostics as you type
   - hover with types, for example `let total: Int` or `print(Str) -> ()`
   - go to definition for functions, locals, parameters, fields, types and variants
@@ -67,19 +67,19 @@ dune exec writ -- build examples/repos.wr -o repos && ./repos --grant net=api.gi
   - an outline of the file
 
   Positions count bytes, which is exact for ASCII source.
-- **Grammar ([grammar/writ.gbnf](grammar/writ.gbnf)):** in llama.cpp's GBNF format, for constrained decoding. It accepts every example, benchmark and test-suite program, and rejects the hand-written invalid cases. It is slightly more permissive than the parser: keywords aren't excluded from identifiers. It requires a space after keywords (`if x {`), which is the canonical style.
-- **Formatter (`writ fmt`):** keeps comments, number and string spellings, and the author's line breaks in lists and argument lists. The test suite formats every program and checks that the tree is unchanged, a second pass changes nothing, and no comment is lost.
-- **Tests (`writ test`):** `test "name" { assert_eq(...) }` blocks. They get no `root`, so they cannot do I/O. Each runs isolated in the interpreter, or as its own process with `--native`.
-- **MCP server (`writ mcp`):** tools to check, run, test, format, read a type, list capabilities, explain an error, and read the spec. `writ_run` gives the program no grants, so code an agent just wrote can print but cannot touch files or the network, and it stops at a time limit.
+- **Grammar ([grammar/vela.gbnf](grammar/vela.gbnf)):** in llama.cpp's GBNF format, for constrained decoding. It accepts every example, benchmark and test-suite program, and rejects the hand-written invalid cases. It is slightly more permissive than the parser: keywords aren't excluded from identifiers. It requires a space after keywords (`if x {`), which is the canonical style.
+- **Formatter (`vela fmt`):** keeps comments, number and string spellings, and the author's line breaks in lists and argument lists. The test suite formats every program and checks that the tree is unchanged, a second pass changes nothing, and no comment is lost.
+- **Tests (`vela test`):** `test "name" { assert_eq(...) }` blocks. They get no `root`, so they cannot do I/O. Each runs isolated in the interpreter, or as its own process with `--native`.
+- **MCP server (`vela mcp`):** tools to check, run, test, format, read a type, list capabilities, explain an error, and read the spec. `vela_run` gives the program no grants, so code an agent just wrote can print but cannot touch files or the network, and it stops at a time limit.
 - **Checking the grammar:** `python3 grammar/gbnf_check.py` checks files against it with an Earley recognizer that follows llama.cpp's grammar syntax and acceptance rule. `grammar/check-suite.sh` runs it over every program in the test suite.
 
 Neovim:
 
 ```
-vim.lsp.start({ name = "writ", cmd = { "writ", "lsp" }, root_dir = vim.fn.getcwd() })
+vim.lsp.start({ name = "vela", cmd = { "vela", "lsp" }, root_dir = vim.fn.getcwd() })
 ```
 
-With VS Code, any generic LSP client extension works: point it at `writ lsp` for `*.wr` files.
+With VS Code, any generic LSP client extension works: point it at `vela lsp` for `*.vela` files.
 
 ## Capability rules
 
@@ -91,9 +91,9 @@ With VS Code, any generic LSP client extension works: point it at `writ lsp` for
 
 ## Modules, packages and the standard library
 
-`use json` loads `json.wr` from next to the file, from a dependency, or from the standard library; its `pub` items are then `json.parse(...)`, `json.Value` and so on. Modules are merged into one program before checking, so both backends handle them unchanged.
+`use json` loads `json.vela` from next to the file, from a dependency, or from the standard library; its `pub` items are then `json.parse(...)`, `json.Value` and so on. Modules are merged into one program before checking, so both backends handle them unchanged.
 
-A `writ.toml` lists dependencies by path, and the capabilities each may use:
+A `vela.toml` lists dependencies by path, and the capabilities each may use:
 
 ```
 [dependencies]
@@ -102,7 +102,7 @@ fetch = { path = "../fetch", caps = ["net"] }
 
 Since capabilities only arrive as parameters, a dependency's signatures are a complete list of what it can do. If one asks for a capability it was not granted, the program does not compile (E0320).
 
-The standard library is written in Writ: `json` (parse, stringify, field access), `http` (an HTTP/1.1 client over `Net` and a server over `Listener`, one task per connection), `list` (`sort_by` and friends) and `text`. See [examples/http_demo.wr](examples/http_demo.wr) and SPEC.md sections 18 and 19.
+The standard library is written in Vela: `json` (parse, stringify, field access), `http` (an HTTP/1.1 client over `Net` and a server over `Listener`, one task per connection), `list` (`sort_by` and friends) and `text`. See [examples/http_demo.vela](examples/http_demo.vela) and SPEC.md sections 18 and 19.
 
 ## Concurrency
 
@@ -121,12 +121,12 @@ let counts = group g {
 - The handle `g` can only be used as `g.go(...)` in the block's own body (E0310), and the body cannot `return` or use `?` to leave early (E0311).
 - **Channels:** `channel(n)` makes a `Chan[T]` with `send`, `recv` (returning `None` once closed and drained) and `close`. Values sent are shared, not copied, across threads.
 - **Sockets:** `root.listen.on("host:port")` (granted with `--grant listen=...`) gives a `Listener`; `accept` and `Net.connect` give a `Conn` with `read`, `write` and `close`. The native poller is kqueue on macOS and epoll on Linux (Linux untested).
-- **Echo server:** [examples/echo.wr](examples/echo.wr) serves 10,000 concurrent connections, each kept open until all are connected, with every echo correct. Natively that takes about 2 s and 335 MB peak. Reproduce with `bench/echo_load.py`.
+- **Echo server:** [examples/echo.vela](examples/echo.vela) serves 10,000 concurrent connections, each kept open until all are connected, with every echo correct. Natively that takes about 2 s and 335 MB peak. Reproduce with `bench/echo_load.py`.
 - **Interpreter:** runs tasks as coroutines on OCaml 5 effect handlers, so the same programs behave the same way.
 
 ## Native backend
 
-`writ build` lowers the typed program to a small IR, instantiates generics per concrete type, inserts reference counting, and emits C compiled with `cc -O2 -fwrapv -ffp-contract=off`.
+`vela build` lowers the typed program to a small IR, instantiates generics per concrete type, inserts reference counting, and emits C compiled with `cc -O2 -fwrapv -ffp-contract=off`.
 
 - **Memory:** Perceus-style reference counting without a GC. A use that is a variable's last use becomes a move instead of a retain, so counts usually stay at 1 and `xs.push(v)` or `xs[i] = v` mutate in place. Shared values are copied on write, which keeps value semantics.
 - **Layout:** Int, Float, Bool, structs and non-recursive enums are plain C values. Strings, lists, closures, capabilities and recursive enums are reference-counted pointers.
@@ -146,7 +146,7 @@ Best of 5 on an Apple Silicon Mac with 12 cores, against C compiled with `-O2 -f
 
 Single-threaded:
 
-| Benchmark | C | Writ | Writ / C |
+| Benchmark | C | Vela | Vela / C |
 | --- | --- | --- | --- |
 | filter/map/fold pipeline, 30 x 3M | 0.037 s | 0.034 s | 0.93x |
 | fib(40), recursion | 0.198 s | 0.185 s | 0.94x |
@@ -154,16 +154,16 @@ Single-threaded:
 | sieve to 100M, list mutated by index | 0.325 s | 0.327 s | 1.01x |
 | n-body, 15M steps, `List[Body]` | 0.508 s | 0.558 s | 1.10x |
 
-The C n-body passes the body count as the literal `5`, so clang unrolls its loops at compile time. Writ matches it when the program states the size too, with `Array[Body, 5]`. With a `List`, the length is only known at runtime.
+The C n-body passes the body count as the literal `5`, so clang unrolls its loops at compile time. Vela matches it when the program states the size too, with `Array[Body, 5]`. With a `List`, the length is only known at runtime.
 
-Parallel, with `group` (Writ on one thread uses `WRIT_THREADS=1`):
+Parallel, with `group` (Vela on one thread uses `VELA_THREADS=1`):
 
-| Benchmark | C sequential | C pthreads | Writ, 1 thread | Writ, all cores | Writ / C sequential |
+| Benchmark | C sequential | C pthreads | Vela, 1 thread | Vela, all cores | Vela / C sequential |
 | --- | --- | --- | --- | --- | --- |
 | Mandelbrot 4000x4000 | 6.719 s | 0.791 s | 6.718 s | 0.778 s | 0.12x |
 | longest Collatz chain below 5M | 0.586 s | 0.074 s | 0.597 s | 0.076 s | 0.13x |
 
-On one thread Writ is level with C on these workloads. With `group` it runs about 8x faster than the sequential C program and matches C that was parallelised by hand with pthreads.
+On one thread Vela is level with C on these workloads. With `group` it runs about 8x faster than the sequential C program and matches C that was parallelised by hand with pthreads.
 
 ## Language
 

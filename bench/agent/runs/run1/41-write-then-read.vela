@@ -1,5 +1,5 @@
 fn main(root: Root) -> Result[(), IoError] {
-    root.fs.write("out.txt", "hello from writ")?
+    root.fs.write("out.txt", "hello from vela")?
     let text = root.fs.read("out.txt")?
     root.stdout.print(text)
     Ok(())

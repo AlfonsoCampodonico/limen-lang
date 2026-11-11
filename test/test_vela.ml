@@ -1,4 +1,4 @@
-open Writ
+open Vela
 
 let sprintf = Printf.sprintf
 let total = ref 0
@@ -11,18 +11,18 @@ let ok name cond msg =
     Printf.printf "FAIL %s: %s\n" name msg
   end
 
-(* WRIT_DUMP_DIR=dir writes every program into dir/accept (it parses) or
-   dir/reject (lexer or parser error), for checking grammar/writ.gbnf. *)
+(* VELA_DUMP_DIR=dir writes every program into dir/accept (it parses) or
+   dir/reject (lexer or parser error), for checking grammar/vela.gbnf. *)
 let dump name src parsed =
-  match Sys.getenv_opt "WRIT_DUMP_DIR" with
+  match Sys.getenv_opt "VELA_DUMP_DIR" with
   | None -> ()
   | Some dir ->
     let sub = Filename.concat dir (if parsed then "accept" else "reject") in
     (try Unix.mkdir dir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
     (try Unix.mkdir sub 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
-    Out_channel.with_open_bin (Filename.concat sub (name ^ ".wr")) (fun oc -> output_string oc src)
+    Out_channel.with_open_bin (Filename.concat sub (name ^ ".vela")) (fun oc -> output_string oc src)
 
-(* writ fmt on every program that parses: the result must parse to the same
+(* vela fmt on every program that parses: the result must parse to the same
    tree (ignoring positions), formatting again must not change it, and no
    comment may be lost. Checked once per program. *)
 let fmt_checked : (string, unit) Hashtbl.t = Hashtbl.create 64
@@ -31,8 +31,8 @@ let fmt_failures = ref []
 let check_fmt name src () =
   if not (Hashtbl.mem fmt_checked name) then begin
     Hashtbl.replace fmt_checked name ();
-    let file = name ^ ".wr" in
-    let comments_of s = (try ignore (Lexer.lex "c.wr" s) with Diag.Fatal _ -> ()); List.sort compare (List.map (fun (_, _, t) -> t) !Lexer.comments) in
+    let file = name ^ ".vela" in
+    let comments_of s = (try ignore (Lexer.lex "c.vela" s) with Diag.Fatal _ -> ()); List.sort compare (List.map (fun (_, _, t) -> t) !Lexer.comments) in
     let before = comments_of src in
     match Fmt.format ~file:("fmt-" ^ file) src with
     | exception Diag.Fatal d -> fmt_failures := (name, "formatting failed: " ^ d.message) :: !fmt_failures
@@ -49,13 +49,13 @@ let check_fmt name src () =
 
 (* [modules]: other files (name, source) written next to the program, for `use`. *)
 let compile ?(modules = []) name src =
-  let file = name ^ ".wr" in
+  let file = name ^ ".vela" in
   let file =
     if modules = [] then file
     else begin
-      let dir = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "writ-mods-%d-%s" (Unix.getpid ()) name) in
+      let dir = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "vela-mods-%d-%s" (Unix.getpid ()) name) in
       (try Unix.mkdir dir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
-      List.iter (fun (m, s) -> Out_channel.with_open_bin (Filename.concat dir (m ^ ".wr")) (fun oc -> output_string oc s)) modules;
+      List.iter (fun (m, s) -> Out_channel.with_open_bin (Filename.concat dir (m ^ ".vela")) (fun oc -> output_string oc s)) modules;
       Filename.concat dir file
     end
   in
@@ -79,12 +79,12 @@ let run ?(grants = Interp.no_grants) ?modules name src =
 
 (* ---------- native backend: same program, compiled to C ---------- *)
 
-let tmpdir = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "writ-native-%d" (Unix.getpid ()))
+let tmpdir = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "vela-native-%d" (Unix.getpid ()))
 let () = try Unix.mkdir tmpdir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ()
-let native_enabled = Sys.getenv_opt "WRIT_SKIP_NATIVE" = None
+let native_enabled = Sys.getenv_opt "VELA_SKIP_NATIVE" = None
 
 (* AddressSanitizer catches use-after-free and double free in the reference
-   counting; WRIT_LEAKCHECK reports objects still alive at exit. *)
+   counting; VELA_LEAKCHECK reports objects still alive at exit. *)
 let sanitize = [ "-O1"; "-g"; "-fsanitize=address,undefined"; "-fno-sanitize-recover=all" ]
 
 let read_file p = In_channel.with_open_bin p In_channel.input_all
@@ -106,7 +106,7 @@ let run_native ?(grants = Interp.no_grants) ?modules name src =
       String.concat " " (List.map Filename.quote (exe :: args))
       ^ sprintf " >%s 2>%s" (Filename.quote o) (Filename.quote e)
     in
-    let code = Sys.command ("ASAN_OPTIONS=detect_leaks=0 WRIT_LEAKCHECK=1 " ^ cmd) in
+    let code = Sys.command ("ASAN_OPTIONS=detect_leaks=0 VELA_LEAKCHECK=1 " ^ cmd) in
     Ok (code, read_file o, read_file e)
 
 let check_native name ?grants ?modules src ~want_out ~want_err_prefix =
@@ -117,7 +117,7 @@ let check_native name ?grants ?modules src ~want_out ~want_err_prefix =
       ok (name ^ "/native") (o = want_out) (sprintf "stdout %S, want %S (stderr %S)" o want_out e);
       match want_err_prefix with
       | None ->
-        ok (name ^ "/native-clean") (code = 0 && e = "writ-leakcheck: 0 live\n")
+        ok (name ^ "/native-clean") (code = 0 && e = "vela-leakcheck: 0 live\n")
           (sprintf "exit %d, stderr %S" code e)
       | Some p -> ok (name ^ "/native-panic") (String.starts_with ~prefix:p e) (sprintf "stderr %S" e))
 
@@ -142,9 +142,9 @@ let check_tsan name ?(grants = Interp.no_grants) src want =
       let cmd =
         String.concat " " (List.map Filename.quote (exe :: args)) ^ sprintf " >%s 2>%s" (Filename.quote o) (Filename.quote e)
       in
-      let code = Sys.command ("TSAN_OPTIONS=halt_on_error=1 WRIT_THREADS=8 WRIT_LEAKCHECK=1 " ^ cmd) in
+      let code = Sys.command ("TSAN_OPTIONS=halt_on_error=1 VELA_THREADS=8 VELA_LEAKCHECK=1 " ^ cmd) in
       let o = read_file o and e = read_file e in
-      ok (name ^ "/tsan") (code = 0 && o = want && e = "writ-leakcheck: 0 live\n") (sprintf "exit %d, stdout %S, stderr %S" code o e)
+      ok (name ^ "/tsan") (code = 0 && o = want && e = "vela-leakcheck: 0 live\n") (sprintf "exit %d, stdout %S, stderr %S" code o e)
   end
 
 let out name ?grants ?modules src want =
@@ -766,7 +766,7 @@ fn client(net: Net, port: Int, k: Int) -> Int {
         }
     }|})
     "failed: URL host may only contain letters, digits, `.` and `-`\nfailed: URL host may only contain letters, digits, `.` and `-`\nfailed: URL host may only contain letters, digits, `.` and `-`\nfailed: bad port in URL\nfailed: bad port in URL\nfailed: URL host may only contain letters, digits, `.` and `-`\nfailed: URL contains spaces or non-ASCII characters\ndenied: net: evil.example:443 is not granted\n";
-  let dir = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "writ-test-%d" (Unix.getpid ())) in
+  let dir = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "vela-test-%d" (Unix.getpid ())) in
   (try Unix.mkdir dir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
   (try Unix.mkdir (Filename.concat dir "sub") 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
   Out_channel.with_open_bin (Filename.concat dir "a.txt") (fun oc -> output_string oc "alpha");
@@ -872,7 +872,7 @@ fn client(net: Net, port: Int, k: Int) -> Int {
   let j = Diag.list_to_json ds in
   ok "json-shape" (String.starts_with ~prefix:"{\"diagnostics\":[{\"code\":\"E0302\"" j) j;
 
-  (* ---------- writ test ---------- *)
+  (* ---------- vela test ---------- *)
   let test_src =
     {|fn add(a: Int, b: Int) -> Int { a + b }
 
@@ -903,18 +903,18 @@ test "channels" {
 }
 |}
   in
-  let items, ds, _ = compile "writ-test" test_src in
-  ok "writ-test-checks" (ds = []) (String.concat "," (codes ds));
+  let items, ds, _ = compile "vela-test" test_src in
+  ok "vela-test-checks" (ds = []) (String.concat "," (codes ds));
   let want =
     [ ("adds", None); ("fails on a list", Some "assertion failed: [\"a\", \"b\"] != [\"a\", \"b\", \"c\"]");
       ("panics are failures", Some "index 5 is out of range for a list of length 1"); ("channels", None) ]
   in
   let got = List.map (fun (n, r) -> (n, match r with Ok () -> None | Error (m, _) -> Some m)) (Interp.run_tests ~out:ignore items) in
-  ok "writ-test-interp" (got = want) (String.concat "; " (List.map (fun (n, m) -> n ^ "=" ^ Option.value ~default:"ok" m) got));
+  ok "vela-test-interp" (got = want) (String.concat "; " (List.map (fun (n, m) -> n ^ "=" ^ Option.value ~default:"ok" m) got));
   if native_enabled then begin
-    let exe = Filename.concat tmpdir "writ-test-native" in
+    let exe = Filename.concat tmpdir "vela-test-native" in
     match Native.build ~flags:sanitize ~tests:true items exe with
-    | Error m -> ok "writ-test-native" false m
+    | Error m -> ok "vela-test-native" false m
     | Ok () ->
       let got =
         List.mapi
@@ -925,14 +925,14 @@ test "channels" {
             (n, if code = 0 then None else Some (if String.starts_with ~prefix:"panic: " first then String.sub first 7 (String.length first - 7) else first)))
           want
       in
-      ok "writ-test-native" (got = want) (String.concat "; " (List.map (fun (n, m) -> n ^ "=" ^ Option.value ~default:"ok" m) got))
+      ok "vela-test-native" (got = want) (String.concat "; " (List.map (fun (n, m) -> n ^ "=" ^ Option.value ~default:"ok" m) got))
   end;
-  errs "writ-test-duplicate" "test \"a\" {}\ntest \"a\" {}" [ "E0106" ];
+  errs "vela-test-duplicate" "test \"a\" {}\ntest \"a\" {}" [ "E0106" ];
 
   (* ---------- language server ---------- *)
   let module J = Json in
   let st = Lsp.create () in
-  let uri = "file:///tmp/lsp-test.wr" in
+  let uri = "file:///tmp/lsp-test.vela" in
   let doc =
     {|struct Point { x: Int, y: Int }
 
@@ -980,10 +980,10 @@ fn main(root: Root) {
   let hover text needle ?nth k =
     J.to_str (J.path (result (Lsp.handle st (req "textDocument/hover" (tdp text needle ?nth k)))) [ "contents"; "value" ])
   in
-  ok "lsp-hover-let" (hover doc "total = " 0 = "```writ\nlet total: Int\n```") (hover doc "total = " 0);
-  ok "lsp-hover-call" (hover doc "dist(pt)" 0 = "```writ\nfn(Point) -> Int\n```") (hover doc "dist(pt)" 0);
-  ok "lsp-hover-method" (hover doc "print(\"{" 0 = "```writ\nprint(Str) -> ()\n```") (hover doc "print(\"{" 0);
-  ok "lsp-hover-fn" (hover doc "dist(p" 0 = "```writ\nfn dist(p: Point) -> Int\n```") (hover doc "dist(p" 0);
+  ok "lsp-hover-let" (hover doc "total = " 0 = "```vela\nlet total: Int\n```") (hover doc "total = " 0);
+  ok "lsp-hover-call" (hover doc "dist(pt)" 0 = "```vela\nfn(Point) -> Int\n```") (hover doc "dist(pt)" 0);
+  ok "lsp-hover-method" (hover doc "print(\"{" 0 = "```vela\nprint(Str) -> ()\n```") (hover doc "print(\"{" 0);
+  ok "lsp-hover-fn" (hover doc "dist(p" 0 = "```vela\nfn dist(p: Point) -> Int\n```") (hover doc "dist(p" 0);
   let def text needle ?nth k =
     match result (Lsp.handle st (req "textDocument/definition" (tdp text needle ?nth k))) with
     | J.Null -> None
@@ -1054,13 +1054,13 @@ fn main(root: Root) {
 
   (* ---------- the standard library ---------- *)
   let example f =
-    let dir = if Sys.file_exists "../examples/stdlib.wr" then "../examples" else "examples" in
+    let dir = if Sys.file_exists "../examples/stdlib.vela" then "../examples" else "examples" in
     In_channel.with_open_bin (Filename.concat dir f) In_channel.input_all
   in
-  out "std-json-list-text" (example "stdlib.wr") "{\"name\":\"Ada\",\"tags\":[\"x\",\"yé😀\"],\"n\":-125,\"ok\":true,\"none\":null,\"nested\":{\"a\":[1,2,{}]}}\nAda\n-125.0\nexpected a value at byte 3\nexpected `:` at byte 5\nexpected a value at byte 0\nexpected a closing `\"` at byte 4\nexpected end of input at byte 4\nexpected a value at byte 0\n{\"q\":\"a\\\"b\\n\\u0001\",\"xs\":[1,null,false]}\na,b,c\n[0, 1, 2, 3, 4] 2 [1, 3] [1, 2, 3] [1, 2]\n007|ab..|---|2|[\"hi\", \"there\", \"you\"]\n";
+  out "std-json-list-text" (example "stdlib.vela") "{\"name\":\"Ada\",\"tags\":[\"x\",\"yé😀\"],\"n\":-125,\"ok\":true,\"none\":null,\"nested\":{\"a\":[1,2,{}]}}\nAda\n-125.0\nexpected a value at byte 3\nexpected `:` at byte 5\nexpected a value at byte 0\nexpected a closing `\"` at byte 4\nexpected end of input at byte 4\nexpected a value at byte 0\n{\"q\":\"a\\\"b\\n\\u0001\",\"xs\":[1,null,false]}\na,b,c\n[0, 1, 2, 3, 4] 2 [1, 3] [1, 2, 3] [1, 2]\n007|ab..|---|2|[\"hi\", \"there\", \"you\"]\n";
   out "std-http"
     ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] }
-    (example "http_demo.wr")
+    (example "http_demo.vela")
     "served 3\n200 text/plain; charset=utf-8 hi GET\n404 text/plain; charset=utf-8 no /missing\n201 {\"got\":[1,{\"a\":true}]}\nchunked sent\n200 hello world\n";
   (* std code is checked like user code: a json error names the byte *)
   out "std-json-errors"
@@ -1094,18 +1094,18 @@ fn main(root: Root) {
   errs "modules-no-use" ~modules "fn main(root: Root) {\n    let p: geom.Point = geom.origin()\n}\n" [ "E0401" ];
   errs "modules-type-check" ~modules "use geom\n\nfn main(root: Root) {\n    let p: geom.Point = 1\n}\n" [ "E0201" ];
   errs "modules-not-value" ~modules "use geom\n\nfn main(root: Root) {\n    let g = geom\n}\n" [ "E0404" ];
-  (* packages: each dependency may only use the capabilities writ.toml grants it *)
-  let pdir = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "writ-pkg-%d" (Unix.getpid ())) in
+  (* packages: each dependency may only use the capabilities vela.toml grants it *)
+  let pdir = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "vela-pkg-%d" (Unix.getpid ())) in
   List.iter (fun d -> try Unix.mkdir d 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ())
     [ pdir; Filename.concat pdir "app"; Filename.concat pdir "fetch" ];
   let put f s = Out_channel.with_open_bin (Filename.concat pdir f) (fun oc -> output_string oc s) in
-  put "fetch/fetch.wr" "use util\n\npub fn get(net: Net, u: Str) -> Str {\n    util.first(net.get(u).unwrap_or(\"none\"))\n}\n";
-  put "fetch/util.wr" "pub fn first(s: Str) -> Str {\n    s.lines().first().unwrap_or(\"\")\n}\n\npub fn sneaky(fs: Fs) -> Bool {\n    fs.exists(\"x\")\n}\n";
+  put "fetch/fetch.vela" "use util\n\npub fn get(net: Net, u: Str) -> Str {\n    util.first(net.get(u).unwrap_or(\"none\"))\n}\n";
+  put "fetch/util.vela" "pub fn first(s: Str) -> Str {\n    s.lines().first().unwrap_or(\"\")\n}\n\npub fn sneaky(fs: Fs) -> Bool {\n    fs.exists(\"x\")\n}\n";
   let app = "use fetch\n\nfn main(root: Root) {\n    root.stdout.print(fetch.get(root.net, \"http://h\"))\n}\n" in
-  put "app/main.wr" app;
+  put "app/main.vela" app;
   let pkg_codes toml =
-    put "app/writ.toml" toml;
-    let path = Filename.concat pdir "app/main.wr" in
+    put "app/vela.toml" toml;
+    let path = Filename.concat pdir "app/main.vela" in
     let _, ds, _ = Modules.load_and_check path app in
     codes ds
   in
@@ -1114,12 +1114,12 @@ fn main(root: Root) {
   ok "pkg-granted" (pkg_codes "[package]\nname = \"app\"\n[dependencies]\nfetch = { path = \"../fetch\", caps = [\"net\", \"fs\"] }  # both\n" = []) "granted";
   ok "pkg-bad-toml" (pkg_codes "[package]\nname = \"app\"\n[dependencies]\nfetch = { path = \"../fetch\", caps = [\"disk\"] }\n" = [ "E0321" ]) "bad cap";
   ok "pkg-missing-dir" (pkg_codes "[package]\nname = \"app\"\n[dependencies]\nother = { path = \"../nope\" }\n" = [ "E0401" ]) "fetch not found";
-  Sys.remove (Filename.concat pdir "app/writ.toml");
+  Sys.remove (Filename.concat pdir "app/vela.toml");
 
   ok "fmt-use-pub"
-    (Fmt.format ~file:"fu.wr" "use geom // g\npub   fn f() -> Int { 1 }\npub struct S { a: Int }\n"
+    (Fmt.format ~file:"fu.vela" "use geom // g\npub   fn f() -> Int { 1 }\npub struct S { a: Int }\n"
      = "use geom  // g\n\npub fn f() -> Int { 1 }\n\npub struct S {\n    a: Int,\n}\n")
-    (Fmt.format ~file:"fu.wr" "use geom // g\npub   fn f() -> Int { 1 }\npub struct S { a: Int }\n");
+    (Fmt.format ~file:"fu.vela" "use geom // g\npub   fn f() -> Int { 1 }\npub struct S { a: Int }\n");
 
   (* the formatter on the examples and benchmarks too (with their comments) *)
   List.iter
@@ -1127,7 +1127,7 @@ fn main(root: Root) {
       if Sys.file_exists dir then
         Array.iter
           (fun f ->
-            if Filename.check_suffix f ".wr" then begin
+            if Filename.check_suffix f ".vela" then begin
               let path = Filename.concat dir f in
               let src = In_channel.with_open_bin path In_channel.input_all in
               match Parser.parse_program path src with

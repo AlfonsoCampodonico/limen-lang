@@ -1,4 +1,4 @@
-/* Writ C runtime. Included verbatim at the top of every generated program.
+/* Vela C runtime. Included verbatim at the top of every generated program.
    Its behaviour mirrors the interpreter (src/interp.ml and src/caps.ml). */
 #define _GNU_SOURCE
 #include <stdint.h>
@@ -29,7 +29,7 @@ typedef uint8_t W_Unit;
 
 /* Counted allocations: every runtime object (strings, lists, closures,
    capabilities, boxed enums) goes through w_alloc/w_free, so tests can check
-   that reference counting frees everything (WRIT_LEAKCHECK=1). */
+   that reference counting frees everything (VELA_LEAKCHECK=1). */
 static int64_t w_live;
 static void *w_alloc(size_t n) {
   void *p = malloc(n ? n : 1);
@@ -79,7 +79,7 @@ static void *w_realloc(void *p, size_t n) {
   return q;
 }
 static void w_leakcheck(void) {
-  if (getenv("WRIT_LEAKCHECK")) fprintf(stderr, "writ-leakcheck: %lld live\n", (long long)__atomic_load_n(&w_live, __ATOMIC_ACQUIRE));
+  if (getenv("VELA_LEAKCHECK")) fprintf(stderr, "vela-leakcheck: %lld live\n", (long long)__atomic_load_n(&w_live, __ATOMIC_ACQUIRE));
 }
 
 __attribute__((noreturn)) static void w_panic_c(const char *msg, const char *where) {
@@ -220,9 +220,9 @@ static inline int64_t w_idx(int64_t i, int64_t n, const char *where) {
 
 /* ---------- lists ---------- */
 
-#define WRIT_LIST_STRUCT(L, T) struct L { int64_t rc; int64_t len; int64_t cap; T *data; };
+#define VELA_LIST_STRUCT(L, T) struct L { int64_t rc; int64_t len; int64_t cap; T *data; };
 
-#define WRIT_LIST_FUNCS(L, T, P)                                                              \
+#define VELA_LIST_FUNCS(L, T, P)                                                              \
   static L *L##_new(int64_t cap) {                                                            \
     L *l = (L *)w_alloc(sizeof(L));                                                           \
     l->rc = 1; l->len = 0; l->cap = cap > 4 ? cap : 4;                                        \
@@ -294,7 +294,7 @@ static inline int64_t w_idx(int64_t i, int64_t n, const char *where) {
   }
 
 /* Stable merge sort, for lists of Int, Float and Str. */
-#define WRIT_LIST_SORT(L, T, P)                                                               \
+#define VELA_LIST_SORT(L, T, P)                                                               \
   static L *L##_sort(L *l) {                                                                  \
     L *c = L##_slice(l, 0, l->len);                                                           \
     int64_t n = c->len;                                                                       \
@@ -315,12 +315,12 @@ static inline int64_t w_idx(int64_t i, int64_t n, const char *where) {
 
 typedef struct L_Int L_Int;
 typedef struct L_Str L_Str;
-WRIT_LIST_STRUCT(L_Int, int64_t)
-WRIT_LIST_STRUCT(L_Str, WStr *)
-WRIT_LIST_FUNCS(L_Int, int64_t, Int)
-WRIT_LIST_FUNCS(L_Str, WStr *, Str)
-WRIT_LIST_SORT(L_Int, int64_t, Int)
-WRIT_LIST_SORT(L_Str, WStr *, Str)
+VELA_LIST_STRUCT(L_Int, int64_t)
+VELA_LIST_STRUCT(L_Str, WStr *)
+VELA_LIST_FUNCS(L_Int, int64_t, Int)
+VELA_LIST_FUNCS(L_Str, WStr *, Str)
+VELA_LIST_SORT(L_Int, int64_t, Int)
+VELA_LIST_SORT(L_Str, WStr *, Str)
 
 static int64_t L_Int_sum(L_Int *l) { int64_t s = 0; for (int64_t i = 0; i < l->len; i++) s += l->data[i]; return s; }
 static WStr *L_Str_join(L_Str *l, WStr *sep) {
@@ -798,8 +798,8 @@ static void Cap_print(WStr *s, bool nl) {
 static int64_t Cap_now_ms(void) { struct timeval tv; gettimeofday(&tv, NULL); return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000; }
 
 /* ---------- fibers and the work-stealing scheduler ----------
-   Every Writ task, and main itself, runs as a fiber: a small mmap'd stack
-   plus saved registers. Worker threads (one per core, WRIT_THREADS to
+   Every Vela task, and main itself, runs as a fiber: a small mmap'd stack
+   plus saved registers. Worker threads (one per core, VELA_THREADS to
    override) each keep a local run queue; an idle worker steals from the
    others. A fiber that must wait (for a group, a channel or a socket)
    parks: it switches back to its worker's scheduler, which then runs the
@@ -885,7 +885,7 @@ static void w_frame_init(void **frame, WFiber *f) {
   frame[6] = (void *)w_ctx_tramp;       /* return address */
 }
 #else
-#error "Writ fibers need arm64 or x86_64"
+#error "Vela fibers need arm64 or x86_64"
 #endif
 
 typedef struct WWorker {
@@ -1107,7 +1107,7 @@ static void *w_worker_thread(void *arg) {
 static pthread_once_t w_pool_once = PTHREAD_ONCE_INIT;
 static void w_pool_start(void) {
   long n = sysconf(_SC_NPROCESSORS_ONLN);
-  const char *e = getenv("WRIT_THREADS");
+  const char *e = getenv("VELA_THREADS");
   if (e) n = atol(e);
   if (n > W_MAX_WORKERS) n = W_MAX_WORKERS;
   for (long i = 1; i < n; i++) {
@@ -1166,7 +1166,7 @@ void w_fiber_main(WFiber *f) {
 
 /* Run [entry] as the main fiber; return when it finishes. */
 static void w_run(void (*entry)(void *), void *arg) {
-  const char *e = getenv("WRIT_STACK_KB");
+  const char *e = getenv("VELA_STACK_KB");
   if (e && atol(e) > 0) w_stack_size = (size_t)atol(e) * 1024;
   pthread_mutex_lock(&w_global_mu);
   WWorker *w = w_worker_new();

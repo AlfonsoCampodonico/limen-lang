@@ -1,5 +1,5 @@
-(* Modules: `use NAME` loads NAME.wr (next to the importing file, then a
-   writ.toml dependency, then the standard library) and merges everything into
+(* Modules: `use NAME` loads NAME.vela (next to the importing file, then a
+   vela.toml dependency, then the standard library) and merges everything into
    one flat program. Every item of module M is renamed `M.item`; the main file
    keeps its names. References are rewritten scope-aware, so the checker and
    both backends see a single program with qualified names.
@@ -15,7 +15,7 @@ type modinfo = {
   mfile : string;
   mitems : item list;
   muses : (string * span) list;
-  mpkg : string option; (* the writ.toml dependency it belongs to *)
+  mpkg : string option; (* the vela.toml dependency it belongs to *)
 }
 
 (* module name -> dependency, for the last program loaded *)
@@ -34,22 +34,22 @@ let err ?(notes = []) code sp msg = errors := Diag.make ~notes code sp msg :: !e
 
 let read_file path = try Some (In_channel.with_open_bin path In_channel.input_all) with Sys_error _ -> None
 
-(* deps: name -> directory holding NAME.wr (from writ.toml) *)
+(* deps: name -> directory holding NAME.vela (from vela.toml) *)
 (* Returns the path, the text, and whether it came from a dependency. *)
 let same_file a b = try Unix.realpath a = Unix.realpath b with Unix.Unix_error _ -> false
 
 let find_module ~deps ~from dir name =
-  let local = Filename.concat dir (name ^ ".wr") in
-  (* a file never imports itself: `use http` in http.wr means another http *)
+  let local = Filename.concat dir (name ^ ".vela") in
+  (* a file never imports itself: `use http` in http.vela means another http *)
   if dir <> "" && Sys.file_exists local && not (same_file local from) then Some (local, read_file local, false)
   else
     match List.assoc_opt name deps with
     | Some d ->
-      let p = Filename.concat d (name ^ ".wr") in
+      let p = Filename.concat d (name ^ ".vela") in
       Some (p, read_file p, true)
     | None -> (
       match List.assoc_opt name !std_modules with
-      | Some src -> Some ("<std>/" ^ name ^ ".wr", Some src, false)
+      | Some src -> Some ("<std>/" ^ name ^ ".vela", Some src, false)
       | None -> None)
 
 let parse path src =
@@ -290,7 +290,7 @@ let load ?(deps = []) path src : item list * Diag.t list =
             match find_module ~deps ~from:m.mfile dir name with
             | None ->
               err "E0401" sp (Printf.sprintf "cannot find module `%s`" name)
-                ~notes:[ Printf.sprintf "looked for %s, the dependencies in writ.toml and the standard library" (Filename.concat dir (name ^ ".wr")) ]
+                ~notes:[ Printf.sprintf "looked for %s, the dependencies in vela.toml and the standard library" (Filename.concat dir (name ^ ".vela")) ]
             | Some (p, None, _) -> err "E0401" sp (Printf.sprintf "cannot read module `%s` at %s" name p)
             | Some (p, Some src, from_dep) ->
               let f = parse p src in
@@ -321,7 +321,7 @@ let load ?(deps = []) path src : item list * Diag.t list =
         if !errors <> [] then ([], List.rev !errors) else (items, [])
       end)
 
-(* Load a program with the writ.toml around it (if any), then type-check it
+(* Load a program with the vela.toml around it (if any), then type-check it
    and enforce each dependency's capability grants. *)
 let load_and_check path src : item list * Diag.t list * Check.fn_info list =
   match Package.load path with

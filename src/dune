@@ -1,5 +1,5 @@
 (library
- (name writ)
+ (name vela)
  (libraries unix)
  (flags
   (:standard -w +a-4-9-40-41-42-44-45-70 -warn-error -a)))
@@ -7,16 +7,16 @@
 ; Embed the C runtime header as an OCaml string.
 (rule
  (targets runtime_text.ml)
- (deps runtime/writ_rt.h)
+ (deps runtime/vela_rt.h)
  (action
   (with-stdout-to
    runtime_text.ml
    (progn
     (echo "let text = {xxrtxx|")
-    (cat runtime/writ_rt.h)
+    (cat runtime/vela_rt.h)
     (echo "|xxrtxx}\n")))))
 
-; Embed SPEC.md for `writ spec` and the MCP server.
+; Embed SPEC.md for `vela spec` and the MCP server.
 (rule
  (targets spec_text.ml)
  (deps %{project_root}/SPEC.md)
@@ -28,21 +28,21 @@
     (cat %{project_root}/SPEC.md)
     (echo "|xxspecxx}\n")))))
 
-; Embed the standard library modules (written in Writ).
+; Embed the standard library modules (written in Vela).
 (rule
  (targets std_text.ml)
- (deps std/json.wr std/list.wr std/text.wr std/http.wr)
+ (deps std/json.vela std/list.vela std/text.vela std/http.vela)
  (action
   (with-stdout-to
    std_text.ml
    (progn
     (echo "let modules = [\n")
     (echo "(\"json\", {xxstdxx|")
-    (cat std/json.wr)
+    (cat std/json.vela)
     (echo "|xxstdxx});\n(\"list\", {xxstdxx|")
-    (cat std/list.wr)
+    (cat std/list.vela)
     (echo "|xxstdxx});\n(\"text\", {xxstdxx|")
-    (cat std/text.wr)
+    (cat std/text.vela)
     (echo "|xxstdxx});\n(\"http\", {xxstdxx|")
-    (cat std/http.wr)
+    (cat std/http.vela)
     (echo "|xxstdxx}) ]\n")))))

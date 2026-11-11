@@ -1,7 +1,7 @@
 // Fetch several GitHub orgs at once. Each task gets the same narrowed Net
 // capability; the group returns results in the order the tasks were started.
 //
-//   writ run --native examples/parallel.wr --grant net=api.github.com
+//   vela run --native examples/parallel.vela --grant net=api.github.com
 
 fn main(root: Root) {
     let gh = root.net.only("api.github.com")
