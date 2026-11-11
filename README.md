@@ -33,6 +33,8 @@ dune build
 dune test
 ```
 
+`dune test` runs every program in the interpreter and natively under AddressSanitizer (and ThreadSanitizer for the concurrent ones). The native builds and runs go in parallel, one per core (`VELA_JOBS=N` to change that), and compiled test binaries are cached in `~/.cache/vela/test-native` (or `$VELA_CACHE/test-native`), keyed by the compiler, its flags and the C source, so a run that changes no generated C compiles nothing; `VELA_TEST_CACHE=0` turns the cache off. `VELA_TEST_ONLY=prefix,...` runs only the matching program tests, `VELA_SKIP_NATIVE=1` skips the native half, and `VELA_TEST_SLOW=1` lists the slowest native jobs.
+
 ```bash
 dune exec vela -- run examples/repos.vela --grant net=api.github.com
 ```

@@ -286,10 +286,9 @@ let apply_edits text edits =
   Buffer.contents b
 
 (* Where the renamed name sits after the edits: the start of its text. *)
-let new_position edits (o : occ) nw =
+let new_position edits (o : occ) =
   let shift = List.fold_left (fun s e -> if e.at.Span.file = o.sp.file && e.at.hi <= o.sp.lo then s + String.length e.replacement - (e.at.hi - e.at.lo) else s) 0 edits in
   let lo = o.sp.lo + shift in
-  ignore nw;
   match o.short with Var_side f -> lo + String.length f + 2 | _ -> lo
 
 (* Rename the symbol at [off] in [file] to [nw]. [load] type-checks the
@@ -340,8 +339,8 @@ let rename ~(load : (string * string) list -> item list * Diag.t list) items fil
             begin
               (* the new name must refer to exactly the renamed places, no more and no fewer *)
               let new_occs = index after_items in
-              let def_pos = new_position edits d nw in
-              let want = List.sort compare (List.map (fun r -> (r.sp.Span.file, new_position edits r nw)) refs) in
+              let def_pos = new_position edits d in
+              let want = List.sort compare (List.map (fun r -> (r.sp.Span.file, new_position edits r)) refs) in
               let got =
                 match List.find_opt (fun n -> n.def && n.sp.Span.file = d.sp.file && n.sp.lo = def_pos) new_occs with
                 | Some nd -> List.sort compare (List.map (fun r -> (r.sp.Span.file, r.sp.lo)) (references new_occs nd.key))

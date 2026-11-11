@@ -128,49 +128,180 @@ let sanitize = [ "-O1"; "-g"; "-fsanitize=address,undefined"; "-fno-sanitize-rec
 
 let read_file p = In_channel.with_open_bin p In_channel.input_all
 
+(* ---------- running native builds in parallel ----------
+
+   Compiling with a sanitizer and running the result is most of the suite's
+   time, and each program is independent (sockets use port 0), so they run as
+   background jobs, VELA_JOBS at a time (default: one per core). The C source
+   is generated here, in order; the job compiles it and runs the binary, and a
+   callback checks the result when it ends. [drain] waits for all of them
+   before the summary.
+
+   Compiled binaries are cached by a digest of the compiler, its flags and the
+   C source, in $VELA_CACHE/test-native (default ~/.cache/vela), so a run that
+   changes no generated C compiles nothing. VELA_TEST_CACHE=0 turns it off.
+   Entries unused for a week are removed. *)
+
+let jobs_max =
+  match Option.bind (Sys.getenv_opt "VELA_JOBS") int_of_string_opt with
+  | Some n when n > 0 -> n
+  | _ -> (
+    try
+      let ic = Unix.open_process_in "getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null" in
+      let n = Option.bind (In_channel.input_line ic) (fun l -> int_of_string_opt (String.trim l)) in
+      ignore (Unix.close_process_in ic);
+      match n with Some n when n > 0 -> n | _ -> 4
+    with _ -> 4)
+
+let running : (int * (int -> unit)) list ref = ref []
+
+(* VELA_TEST_SLOW=1 lists the slowest jobs at the end. *)
+let job_times : (float * string) list ref = ref []
+let job_started : (int, float * string) Hashtbl.t = Hashtbl.create 64
+
+(* Wait for one job to end and run its callback with the exit code. *)
+let reap () =
+  let rec poll () =
+    let done_ =
+      List.find_map
+        (fun (pid, k) ->
+          match Unix.waitpid [ Unix.WNOHANG ] pid with
+          | 0, _ -> None
+          | _, Unix.WEXITED c -> Some (pid, k, c)
+          | _, (Unix.WSIGNALED s | Unix.WSTOPPED s) -> Some (pid, k, 128 + abs s)
+          | exception Unix.Unix_error (Unix.EINTR, _, _) -> None)
+        !running
+    in
+    match done_ with
+    | Some (pid, k, c) ->
+      running := List.filter (fun (p, _) -> p <> pid) !running;
+      (match Hashtbl.find_opt job_started pid with
+       | Some (t0, what) -> job_times := (Unix.gettimeofday () -. t0, what) :: !job_times; Hashtbl.remove job_started pid
+       | None -> ());
+      k c
+    | None -> Unix.sleepf 0.002; poll ()
+  in
+  poll ()
+
+let devnull = Unix.openfile "/dev/null" [ Unix.O_RDONLY ] 0
+
+(* Run shell command [cmd] as a job; [k] gets its exit status. *)
+let spawn cmd k =
+  while List.length !running >= jobs_max do reap () done;
+  let pid = Unix.create_process "/bin/sh" [| "/bin/sh"; "-c"; cmd |] devnull Unix.stdout Unix.stderr in
+  Hashtbl.replace job_started pid (Unix.gettimeofday (), cmd);
+  running := (pid, k) :: !running
+
+let drain () =
+  while !running <> [] do reap () done;
+  if Sys.getenv_opt "VELA_TEST_SLOW" <> None then
+    List.iteri
+      (fun i (t, cmd) ->
+        if i < 25 then
+          let exe = match String.split_on_char ';' cmd with _ :: _ -> (match List.rev (String.split_on_char '/' (List.hd (List.rev (String.split_on_char ';' cmd)))) with x :: _ -> x | [] -> cmd) | [] -> cmd in
+          Printf.eprintf "%6.2fs %s\n" t (String.sub exe 0 (min 80 (String.length exe))))
+      (List.sort (fun (a, _) (b, _) -> compare b a) !job_times)
+
+let cache_dir =
+  if Sys.getenv_opt "VELA_TEST_CACHE" = Some "0" then None
+  else
+    let base =
+      match Sys.getenv_opt "VELA_CACHE" with
+      | Some d when d <> "" -> Some d
+      | _ -> Option.map (fun h -> Filename.concat (Filename.concat h ".cache") "vela") (Sys.getenv_opt "HOME")
+    in
+    match base with
+    | None -> None
+    | Some base ->
+      let d = Filename.concat base "test-native" in
+      (try ignore (Sys.command (sprintf "mkdir -p %s" (Filename.quote d))) with _ -> ());
+      if Sys.file_exists d then Some d else None
+
+(* The compiler's identity, so a new compiler does not reuse old binaries. *)
+let cc_version =
+  lazy
+    (try
+       let ic = Unix.open_process_in (Native.cc () ^ " --version 2>/dev/null") in
+       let v = In_channel.input_all ic in
+       ignore (Unix.close_process_in ic);
+       v
+     with _ -> "")
+
+let () =
+  (* forget binaries nobody used for a week *)
+  match cache_dir with
+  | Some d -> ignore (Sys.command (sprintf "find %s -type f -mtime +7 -delete 2>/dev/null" (Filename.quote d)))
+  | None -> ()
+
+(* Build [items] into [exe] with [flags] and then run [run_cmd] (which
+   redirects the program's output itself), in the background. [k] gets
+   Ok (exit status) or Error (compiler output). *)
+(* A fresh path in tmpdir for a binary of test [name]: jobs run at the same
+   time, so two runs of one name must not share files. *)
+let job_count = ref 0
+let exe_path name = incr job_count; Filename.concat tmpdir (sprintf "%s-%d" name !job_count)
+
+let native_job ?tests ~flags items exe run_cmd (k : (int, string) result -> unit) =
+  let c_text = Native.c_source ?tests items in
+  let c_file = exe ^ ".c" in
+  Out_channel.with_open_bin c_file (fun oc -> output_string oc c_text);
+  let argv = Native.command ~flags c_file exe in
+  let log = exe ^ ".cc" in
+  let q = Filename.quote in
+  let compile = String.concat " " (List.map q argv) ^ " >" ^ q log ^ " 2>&1" in
+  let build =
+    match cache_dir with
+    | None -> compile
+    | Some d ->
+      (* the paths differ from run to run; the command around them does not *)
+      let shape = Native.command ~flags "prog.c" "prog" in
+      let key = Digest.to_hex (Digest.string (String.concat "\000" (Lazy.force cc_version :: shape @ [ c_text ]))) in
+      let cached = Filename.concat d key in
+      (* a hit is copied (and touched, so it stays); a miss is compiled and stored *)
+      sprintf "if [ -f %s ]; then touch %s && cp %s %s; else %s && cp %s %s.$$ && mv -f %s.$$ %s; fi" (q cached) (q cached) (q cached) (q exe)
+        compile (q exe) (q cached) (q cached) (q cached)
+  in
+  let failed = exe ^ ".ccfailed" in
+  (try Sys.remove failed with Sys_error _ -> ());
+  spawn (sprintf "( %s ) || { : > %s; exit 1; }; %s" build (q failed) run_cmd) (fun code ->
+      if Sys.file_exists failed then k (Error (try read_file log with Sys_error _ -> "")) else k (Ok code))
+
+let grant_args (grants : Interp.grants) =
+  List.concat_map (fun h -> [ "--grant"; "net=" ^ h ]) grants.net
+  @ List.concat_map (fun h -> [ "--grant"; "listen=" ^ h ]) grants.listen
+  @ List.concat_map (fun n -> [ "--grant"; "env=" ^ n ]) grants.env
+  @ List.concat_map (fun n -> [ "--grant"; "exec=" ^ n ]) grants.exec
+  @ (match grants.seed with Some s -> [ "--seed"; string_of_int s ] | None -> [])
+  @ (match grants.fs with Some (d, ro) -> [ "--grant"; "fs=" ^ d ^ if ro then ":ro" else "" ] | None -> [])
+
 (* With [feed], stdin comes from that shell command, and the program runs on
-   one worker thread, so a task that blocked its thread would stall the rest. *)
-let run_native ?(grants = Interp.no_grants) ?modules ?feed name src =
+   one worker thread, so a task that blocked its thread would stall the rest.
+   [k] gets Ok (exit status, stdout, stderr) or Error. *)
+let run_native ?(grants = Interp.no_grants) ?modules ?feed name src k =
   let items, ds, _ = compile ?modules name src in
-  if ds <> [] then Error "does not compile" else
-  let exe = Filename.concat tmpdir name in
-  match Native.build ~flags:sanitize items exe with
-  | Error m -> Error ("C compile failed:\n" ^ m)
-  | Ok () ->
-    let args =
-      List.concat_map (fun h -> [ "--grant"; "net=" ^ h ]) grants.Interp.net
-      @ List.concat_map (fun h -> [ "--grant"; "listen=" ^ h ]) grants.Interp.listen
-      @ List.concat_map (fun n -> [ "--grant"; "env=" ^ n ]) grants.Interp.env
-      @ List.concat_map (fun n -> [ "--grant"; "exec=" ^ n ]) grants.Interp.exec
-      @ (match grants.seed with Some s -> [ "--seed"; string_of_int s ] | None -> [])
-      @ (match grants.fs with Some (d, ro) -> [ "--grant"; "fs=" ^ d ^ if ro then ":ro" else "" ] | None -> [])
-      @ ("--" :: grants.args)
-    in
-    let o = exe ^ ".out" and e = exe ^ ".err" in
-    let cmd =
-      String.concat " " (List.map Filename.quote (exe :: args))
-      ^ sprintf " >%s 2>%s" (Filename.quote o) (Filename.quote e)
-    in
-    let env = "ASAN_OPTIONS=detect_leaks=0 VELA_LEAKCHECK=1 " in
-    let code =
-      match feed with
-      | None -> Sys.command (env ^ cmd)
-      | Some f -> Sys.command (sprintf "(%s) | %sVELA_THREADS=1 %s" f env cmd)
-    in
-    Ok (code, read_file o, read_file e)
+  if ds <> [] then k (Error "does not compile") else
+  let exe = exe_path name in
+  let args = grant_args grants @ ("--" :: grants.Interp.args) in
+  let o = exe ^ ".out" and e = exe ^ ".err" in
+  let cmd = String.concat " " (List.map Filename.quote (exe :: args)) ^ sprintf " >%s 2>%s" (Filename.quote o) (Filename.quote e) in
+  let env = "ASAN_OPTIONS=detect_leaks=0 VELA_LEAKCHECK=1 " in
+  let run_cmd = match feed with None -> env ^ cmd | Some f -> sprintf "(%s) | %sVELA_THREADS=1 %s" f env cmd in
+  native_job ~flags:sanitize items exe run_cmd (function
+    | Error m -> k (Error ("C compile failed:\n" ^ m))
+    | Ok code -> k (Ok (code, read_file o, read_file e)))
 
 let check_native name ?grants ?modules ?feed src ~want_out ~want_err_prefix =
   if native_for name then
-    match run_native ?grants ?modules ?feed name src with
-    | Error m -> ok (name ^ "/native") false m
-    | Ok (code, o, e) -> (
-      ok (name ^ "/native") (o = want_out) (sprintf "stdout %S, want %S (stderr %S)" o want_out e);
-      match want_err_prefix with
-      | None ->
-        ok (name ^ "/native-clean")
-          (code = 0 && e = "vela-leakcheck: 0 live\n")
-          (sprintf "exit %d, stderr %S" code e)
-      | Some p -> ok (name ^ "/native-panic") (String.starts_with ~prefix:p e) (sprintf "stderr %S" e))
+    run_native ?grants ?modules ?feed name src (function
+      | Error m -> ok (name ^ "/native") false m
+      | Ok (code, o, e) -> (
+        ok (name ^ "/native") (o = want_out) (sprintf "stdout %S, want %S (stderr %S)" o want_out e);
+        match want_err_prefix with
+        | None ->
+          ok (name ^ "/native-clean")
+            (code = 0 && e = "vela-leakcheck: 0 live\n")
+            (sprintf "exit %d, stderr %S" code e)
+        | Some p -> ok (name ^ "/native-panic") (String.starts_with ~prefix:p e) (sprintf "stderr %S" e)))
 
 (* Concurrency: the same program again under ThreadSanitizer. *)
 let tsan = [ "-O1"; "-g"; "-fsanitize=thread" ]
@@ -178,12 +309,9 @@ let tsan = [ "-O1"; "-g"; "-fsanitize=thread" ]
 let check_tsan name ?(grants = Interp.no_grants) ?feed src want =
   if native_for name && selected name then begin
     let items, ds, _ = compile name src in
-    let exe = Filename.concat tmpdir (name ^ "-tsan") in
+    let exe = exe_path (name ^ "-tsan") in
     if ds <> [] then ok (name ^ "/tsan") false "does not compile"
-    else
-    match Native.build ~flags:tsan items exe with
-    | Error m -> ok (name ^ "/tsan") false ("C compile failed:\n" ^ m)
-    | Ok () ->
+    else begin
       let args =
         (match grants.Interp.fs with Some (d, ro) -> [ "--grant"; "fs=" ^ d ^ if ro then ":ro" else "" ] | None -> [])
         @ List.concat_map (fun h -> [ "--grant"; "net=" ^ h ]) grants.Interp.net
@@ -195,11 +323,15 @@ let check_tsan name ?(grants = Interp.no_grants) ?feed src want =
         String.concat " " (List.map Filename.quote (exe :: args)) ^ sprintf " >%s 2>%s" (Filename.quote o) (Filename.quote e)
       in
       let env = "TSAN_OPTIONS=halt_on_error=1 VELA_THREADS=8 VELA_LEAKCHECK=1 " in
-      let code = match feed with None -> Sys.command (env ^ cmd) | Some f -> Sys.command (sprintf "(%s) | %s%s" f env cmd) in
-      let o = read_file o and e = read_file e in
-      ok (name ^ "/tsan")
-        (code = 0 && o = want && e = "vela-leakcheck: 0 live\n")
-        (sprintf "exit %d, stdout %S, stderr %S" code o e)
+      let run_cmd = match feed with None -> env ^ cmd | Some f -> sprintf "(%s) | %s%s" f env cmd in
+      native_job ~flags:tsan items exe run_cmd (function
+        | Error m -> ok (name ^ "/tsan") false ("C compile failed:\n" ^ m)
+        | Ok code ->
+          let o = read_file o and e = read_file e in
+          ok (name ^ "/tsan")
+            (code = 0 && o = want && e = "vela-leakcheck: 0 live\n")
+            (sprintf "exit %d, stdout %S, stderr %S" code o e))
+    end
   end
 
 let out name ?grants ?modules ?feed src want =
@@ -232,13 +364,13 @@ let exits name ?grants src want_out want_code =
      ok name (got = want_out && code = want_code) (sprintf "got %S exit %d, want %S exit %d" got code want_out want_code)
    | Error e -> ok name false e);
   if native_for name then
-    match run_native ?grants name src with
-    | Error m -> ok (name ^ "/native") false m
-    | Ok (code, o, e) ->
-      ok (name ^ "/native")
-        (o = want_out && code = want_code
-         && (String.ends_with ~suffix:"vela-leakcheck: 0 live\n" e || String.starts_with ~prefix:"error: " e))
-        (sprintf "stdout %S exit %d stderr %S, want %S exit %d" o code e want_out want_code)
+    run_native ?grants name src (function
+      | Error m -> ok (name ^ "/native") false m
+      | Ok (code, o, e) ->
+        ok (name ^ "/native")
+          (o = want_out && code = want_code
+           && (String.ends_with ~suffix:"vela-leakcheck: 0 live\n" e || String.starts_with ~prefix:"error: " e))
+          (sprintf "stdout %S exit %d stderr %S, want %S exit %d" o code e want_out want_code))
 
 (* Apply every fix's edits and return the new source. *)
 let apply_fixes src (ds : Diag.t list) =
@@ -3172,7 +3304,8 @@ fn main(root: Root) {
     [ "../examples"; "../bench" ];
   ok "fmt-every-program" (!fmt_failures = [])
     (String.concat "\n\n" (List.map (fun (n, m) -> n ^ ": " ^ m) (List.rev !fmt_failures)));
-  ok "fmt-checked-count" (Hashtbl.length fmt_checked > 90 || Sys.getenv_opt "VELA_ONLY" <> None) (string_of_int (Hashtbl.length fmt_checked));
+  ok "fmt-checked-count" (Hashtbl.length fmt_checked > 90 || Sys.getenv_opt "VELA_TEST_ONLY" <> None) (string_of_int (Hashtbl.length fmt_checked));
 
+  drain ();
   Printf.printf "%d/%d passed\n" (!total - !failed) !total;
   if !failed > 0 then exit 1

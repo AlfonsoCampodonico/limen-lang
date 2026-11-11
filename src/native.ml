@@ -9,10 +9,14 @@ let cc () = match Sys.getenv_opt "CC" with Some c when c <> "" -> c | _ -> "cc"
 
 (* Compile [c_text] to [exe]. Returns the compiler's output on failure. *)
 (* No FMA contraction: float results must not depend on the C compiler. *)
-let compile_c ?(flags = [ "-O2" ]) c_text exe : (unit, string) result =
+(* The compiler's command line, as argv. *)
+let command ?(flags = [ "-O2" ]) c_file exe =
+  (cc () :: flags) @ [ "-fwrapv"; "-ffp-contract=off"; "-fstack-clash-protection"; "-fexceptions"; "-w"; "-o"; exe; c_file; "-lm" ]
+
+let compile_c ?flags c_text exe : (unit, string) result =
   let c_file = exe ^ ".c" in
   Out_channel.with_open_bin c_file (fun oc -> output_string oc c_text);
-  let argv = Array.of_list ((cc () :: flags) @ [ "-fwrapv"; "-ffp-contract=off"; "-fstack-clash-protection"; "-fexceptions"; "-w"; "-o"; exe; c_file; "-lm" ]) in
+  let argv = Array.of_list (command ?flags c_file exe) in
   let out, inp, err = Unix.open_process_args_full (cc ()) argv (Unix.environment ()) in
   close_out inp;
   let o = In_channel.input_all out in
