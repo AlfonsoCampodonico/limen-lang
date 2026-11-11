@@ -456,11 +456,20 @@ while nums_open || words_open {
 }
 ```
 
-- An arm is `name = ch.recv()` (the name gets `Option[T]`; `None` means closed and empty), `ch.send(value)`, or `_`. Like `match`, `select` is an expression and every arm has the same type.
+- An arm is `name = ch.recv()` (the name gets `Option[T]`; `None` means closed and empty), `ch.send(value)`, a timeout `clock.after(ms)`, or `_`. Like `match`, `select` is an expression and every arm has the same type.
 - All channels, values and guards are evaluated first, in order. Then the first ready operation in the order written runs, so list the channel you want served first first. With no ready operation, `_` runs if there is one; otherwise `select` waits until one is ready.
 - A closed channel is always ready to receive (`None`), so turn its arm off with a guard: `if cond` after the operation skips the arm when `cond` is false. If every arm is off and there is no `_`, `select` panics instead of waiting forever.
 - A send arm that is not chosen sends nothing. A send arm on a closed channel panics, as `send` does.
-- There are no timeouts yet.
+- `clock.after(ms)` is ready once `ms` milliseconds have passed since the `select` started (after its operands were evaluated); `ms <= 0` is ready at once. It takes its place in the order like any arm, so a channel arm written before it still wins when both are ready. A `select` has at most one timeout (E0106), and not together with `_`, which never waits (E0003). `clock` must be the `Clock` capability itself; `after` exists only as a `select` arm.
+
+```
+let reply = select {
+    r = replies.recv() => r ?? "closed",
+    clock.after(500) => "timed out",
+}
+```
+
+To wait for something until a deadline across a loop, compute the remaining time each round: `clock.after(deadline - clock.now_ms())`.
 
 ### Time
 
@@ -763,8 +772,11 @@ primary    = INT | FLOAT | STRING | "true" | "false"
            | block
            | "if" expr_ns block [ "else" ( block | if ) ]
            | "match" expr_ns "{" { pattern "=>" expr ( "," | NL ) } "}"
+           | "select" "{" { selarm ( "," | NL ) } "}"
            | "|" [ cparam { "," cparam } ] "|" expr | "||" expr
            | "group" IDENT block ;
+selarm     = ( IDENT "=" expr | expr | "_" ) [ "if" expr ] "=>" expr ;
+                                                (* ch.recv(), ch.send(v) or clock.after(ms) *)
 init       = IDENT [ ":" expr ] ;
 cparam     = IDENT [ ":" type ] ;
 pattern    = "_" | IDENT | [ "-" ] INT | STRING | "true" | "false"
@@ -873,4 +885,4 @@ The handler is a plain function value, so it gets no capability unless a closure
 
 ## 20. Not yet
 
-Unbuffered (capacity 0) channels, timeouts in `select`, TLS, SQL, a package registry, and a Cranelift backend. See the design doc's Known gaps for the full list.
+Unbuffered (capacity 0) channels, TLS, SQL, a package registry, and a Cranelift backend. See the design doc's Known gaps for the full list.

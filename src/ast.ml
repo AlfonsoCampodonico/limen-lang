@@ -59,6 +59,7 @@ and sel_arm = { sop : sel_op; sguard : expr option (* `if cond`: skip the arm wh
 and sel_op =
   | SelRecv of (string * span) option * expr (* binding (None: `_ =` or no binding), channel *)
   | SelSend of expr * expr (* channel, value *)
+  | SelAfter of expr * expr (* `clock.after(ms)`: clock, milliseconds *)
   | SelDefault
 and arm = { apat : pat; abody : expr }
 and block = { stmts : stmt list; tail : expr option; bspan : span }

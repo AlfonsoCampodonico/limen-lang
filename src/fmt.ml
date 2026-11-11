@@ -260,6 +260,11 @@ and expr_inner c ind e =
            add c ".send(";
            expr c (ind + 4) v;
            add c ")"
+         | SelAfter (clk, ms) ->
+           expr c (ind + 4) clk;
+           add c ".after(";
+           expr c (ind + 4) ms;
+           add c ")"
          | SelDefault -> add c "_");
         (match a.sguard with Some g -> add c " if "; expr c (ind + 4) g | None -> ());
         add c " => ";

@@ -1,0 +1,7 @@
+fn wait(c: Chan[Int], clock: Clock) -> Int {
+    clock.sleep(10)
+    select {
+        v = c.recv() => v ?? 0,
+        clock.after(500) => -1,
+    }
+}

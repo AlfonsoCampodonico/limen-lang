@@ -558,16 +558,25 @@ let rec eval rt env e : value =
             let c = eval rt env ch in
             let x = eval rt env v in
             if on then `Send (c, x) else `Off
+          | SelAfter (clk, ms) ->
+            ignore (eval rt env clk);
+            let ms = match eval rt env ms with VInt n -> n | _ -> 0L in
+            if on then `After ms else `Off
           | SelDefault -> `Default)
         arms
     in
-    if (not (List.exists (function `Recv _ | `Send _ | `Default -> true | `Off -> false) ops)) then
+    if (not (List.exists (function `Recv _ | `Send _ | `After _ | `Default -> true | `Off -> false) ops)) then
       raise (Panic ("every arm of this `select` is turned off by its guard", e.espan));
+    (* a timeout counts from now, after every operand was evaluated *)
+    let start = now () in
+    let deadline ms = start +. (Int64.to_float (min ms 1_000_000_000_000L) /. 1000.) in
     let ready = function
       | `Recv (_, VChan ch) -> ch.closed || not (Queue.is_empty ch.q)
       | `Send (VChan ch, _) -> ch.closed || Queue.length ch.q < ch.cap
+      | `After ms -> ms <= 0L || now () >= deadline ms
       | _ -> false
     in
+    let at = List.find_map (function `After ms when ms > 0L -> Some (deadline ms) | _ -> None) ops in
     let rec first i = function [] -> None | op :: rest -> if ready op then Some i else first (i + 1) rest in
     let default = List.find_index (fun op -> op = `Default) ops in
     let i =
@@ -575,7 +584,7 @@ let rec eval rt env e : value =
       | Some i, _ -> i
       | None, Some d -> d
       | None, None ->
-        wait_until (fun () -> first 0 ops <> None);
+        wait_until ?at (fun () -> first 0 ops <> None);
         Option.get (first 0 ops)
     in
     let binds = Hashtbl.create 1 in

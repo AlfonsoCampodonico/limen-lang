@@ -259,7 +259,8 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
           line (sprintf "sel%d_ops[%d] = (WSelOp){ %s, 0, &sel%d_v%d, 0, %s };" id i (a ch) id i (a on))
         | I.SSend (ch, v, el, on) ->
           line (sprintf "%s sel%d_s%d = %s;" (ctype c el) id i (a v));
-          line (sprintf "sel%d_ops[%d] = (WSelOp){ %s, 1, &sel%d_s%d, 0, %s };" id i (a ch) id i (a on)))
+          line (sprintf "sel%d_ops[%d] = (WSelOp){ %s, 1, &sel%d_s%d, 0, %s };" id i (a ch) id i (a on))
+        | I.SAfter (_, ms, on) -> line (sprintf "sel%d_ops[%d] = (WSelOp){ NULL, 2, NULL, 0, %s, %s };" id i (a on) (a ms)))
       ops;
     set (sprintf "w_select(sel%d_ops, %d, %d, %s)" id n (if has_default then 1 else 0) (where sp));
     (* a value that was not sent is still ours *)

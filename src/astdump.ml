@@ -56,6 +56,7 @@ let rec expr e =
              (match a.sop with
               | SelRecv (b, c) -> (match b with Some (n, _) -> n | None -> "_") ^ "=" ^ expr c ^ ".recv()"
               | SelSend (c, v) -> expr c ^ ".send(" ^ expr v ^ ")"
+              | SelAfter (c, ms) -> expr c ^ ".after(" ^ expr ms ^ ")"
               | SelDefault -> "_")
              ^ (match a.sguard with Some g -> " if " ^ expr g | None -> "")
              ^ "=>" ^ expr a.sbody)

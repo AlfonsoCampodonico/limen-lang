@@ -2068,16 +2068,19 @@ static void w_catch_release(WCatch *c) {
 }
 
 /* ---------- select ----------
-   ops[i] is a receive (val: where to store the value) or a send (val: the
-   value). Returns the index of the operation done, with ops[i].ok set (a
-   receive: 1 if a value came, 0 if the channel is closed and empty), or -1
-   when nothing was ready and the select has a `_` arm. The first ready
-   operation in order wins. */
-typedef struct WSelOp { WChan *c; int send; void *val; int ok; int on; } WSelOp;
+   ops[i] is a receive (send 0; val: where to store the value), a send
+   (send 1; val: the value) or a timeout (send 2, no channel; ready ms
+   milliseconds after the select starts). Returns the index of the
+   operation done, with ops[i].ok set (a receive: 1 if a value came, 0 if
+   the channel is closed and empty), or -1 when nothing was ready and the
+   select has a `_` arm. The first ready operation in order wins. */
+enum { W_SEL_RECV = 0, W_SEL_SEND = 1, W_SEL_AFTER = 2 };
+typedef struct WSelOp { WChan *c; int send; void *val; int ok; int on; int64_t ms; } WSelOp;
 
 /* Try one operation with its channel locked. Returns 1 if done; *wake gets
    a fiber to wake after unlocking. A send on a closed channel returns -1. */
 static int w_sel_try(WSelOp *op, WFiber **wake) {
+  if (op->send == W_SEL_AFTER) return op->ms <= 0;
   WChan *c = op->c;
   if (op->send) {
     if (c->closed) return -1;
@@ -2111,7 +2114,7 @@ static int w_chan_cmp(const void *a, const void *b) {
 /* every distinct channel of the select, locked in address order */
 static int w_sel_lock(WSelOp *ops, int n, WChan **cs) {
   int m = 0;
-  for (int i = 0; i < n; i++) if (ops[i].on) cs[m++] = ops[i].c;
+  for (int i = 0; i < n; i++) if (ops[i].on && ops[i].c) cs[m++] = ops[i].c;
   qsort(cs, (size_t)m, sizeof(WChan *), w_chan_cmp);
   int k = 0;
   for (int i = 0; i < m; i++) if (k == 0 || cs[k - 1] != cs[i]) cs[k++] = cs[i];
@@ -2124,14 +2127,18 @@ static int w_select(WSelOp *ops, int n, int has_default, const char *where) {
   int any = 0;
   for (int i = 0; i < n; i++) if (ops[i].on) any = 1;
   if (!any && !has_default) w_panic_c("every arm of this `select` is turned off by its guard", where);
-  for (int i = 0; i < n; i++) if (ops[i].on && ops[i].send && ops[i].c->eshare) ops[i].c->eshare(ops[i].val);
+  int64_t start = 0;
+  for (int i = 0; i < n; i++) {
+    if (ops[i].on && ops[i].send == W_SEL_SEND && ops[i].c->eshare) ops[i].c->eshare(ops[i].val);
+    if (ops[i].on && ops[i].send == W_SEL_AFTER && ops[i].ms > 0 && !start) start = w_mono_ns();
+  }
   /* fast path: one channel at a time, in order */
   for (int i = 0; i < n; i++) {
     if (!ops[i].on) continue;
     WFiber *wake = NULL;
-    pthread_mutex_lock(&ops[i].c->mu);
+    if (ops[i].c) pthread_mutex_lock(&ops[i].c->mu);
     int r = w_sel_try(&ops[i], &wake);
-    pthread_mutex_unlock(&ops[i].c->mu);
+    if (ops[i].c) pthread_mutex_unlock(&ops[i].c->mu);
     if (r < 0) w_panic_c("send on a closed channel", where);
     if (r) { if (wake) w_wake(wake); return i; }
   }
@@ -2154,25 +2161,35 @@ static int w_select(WSelOp *ops, int n, int has_default, const char *where) {
   }
   WSel sel = { 0, -1 };
   WFiber *me = w_current();
+  WTimer tm;
+  memset(&tm, 0, sizeof tm);
+  tm.pos = -1;
   w_prepare_park();
   for (int i = 0; i < n; i++) {
     if (!ops[i].on) continue;
+    if (ops[i].send == W_SEL_AFTER) {   /* the checker allows one timeout per select */
+      int64_t ms = ops[i].ms > (int64_t)1000000000000 ? (int64_t)1000000000000 : ops[i].ms;
+      tm.at = start + ms * 1000000; tm.f = me; tm.sel = &sel; tm.idx = i;
+      continue;
+    }
     ws[i].f = me; ws[i].val = ops[i].val; ws[i].ok = 0; ws[i].sel = &sel; ws[i].idx = i;
     if (ops[i].send) w_chq_push(&ops[i].c->sq, &ops[i].c->sq_t, &ws[i]);
     else w_chq_push(&ops[i].c->rq, &ops[i].c->rq_t, &ws[i]);
   }
   w_sel_unlock(cs, k);
+  if (tm.f) w_tm_add(&tm);
   w_park_now();
-  /* woken by the channel that claimed us; take our other waiters back */
+  /* woken by the channel or timer that claimed us; take our other waiters back */
+  if (tm.f) w_tm_remove(&tm);
   k = w_sel_lock(ops, n, cs);
   for (int i = 0; i < n; i++) {
-    if (!ops[i].on) continue;
+    if (!ops[i].on || ops[i].send == W_SEL_AFTER) continue;
     if (ops[i].send) w_chq_remove(&ops[i].c->sq, &ops[i].c->sq_t, &ws[i]);
     else w_chq_remove(&ops[i].c->rq, &ops[i].c->rq_t, &ws[i]);
   }
   w_sel_unlock(cs, k);
   int i = __atomic_load_n(&sel.fired, __ATOMIC_ACQUIRE);
-  ops[i].ok = ws[i].ok;
+  ops[i].ok = ops[i].send == W_SEL_AFTER ? 1 : ws[i].ok;
   free(cs); free(ws);
   if (ops[i].send && !ops[i].ok) w_panic_c("send on a closed channel", where);
   return i;

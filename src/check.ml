@@ -747,6 +747,8 @@ and check_method_value ctx f e recv name nsp args =
           [ sprintf "`%s` is a field; access it without parentheses" name ]
         | TCap Root when List.mem_assoc name root_fields ->
           [ sprintf "`%s` is a field of `Root`; write `root.%s`" name name ]
+        | TCap Clock when name = "after" ->
+          [ "`clock.after(ms)` is a timeout: use it as a `select` arm, `clock.after(ms) => ...`"; "to wait, call `clock.sleep(ms)`" ]
         | TNamed (n, _) when ms = [] -> (
           match user_methods ctx n with
           | [] -> [ sprintf "`%s` has no methods; define one as `fn %s(self: %s) { ... }`" n name n ]
@@ -1130,6 +1132,12 @@ and check_select ctx f arms sp =
     arms;
   if List.length defaults = List.length arms then
     err ctx "E0003" sp "`select` needs at least one channel arm: `v = ch.recv() => ...` or `ch.send(x) => ...`";
+  let afters = List.filter (fun a -> match a.sop with SelAfter _ -> true | _ -> false) arms in
+  (match afters with
+   | _ :: second :: _ -> err ctx "E0106" second.sspan_ "`select` has more than one `clock.after` arm"
+   | _ -> ());
+  if afters <> [] && defaults <> [] then
+    err ctx "E0003" (List.hd afters).sspan_ "a `select` with a `_` arm never waits, so it cannot also have a `clock.after` timeout";
   let rt = fresh () in
   let chan_el ch =
     let ct = check_expr ctx f ch in
@@ -1148,6 +1156,15 @@ and check_select ctx f arms sp =
          let el = chan_el ch in
          Option.iter (fun (n, nsp) -> bind f n { vty = opt el; vmut = false; vspan = nsp; vkind = KPat }) b
        | SelSend (ch, v) -> let el = chan_el ch in expect ctx f v el
+       | SelAfter (clk, ms) ->
+         (match repr (check_expr ctx f clk) with
+          | TCap Clock | TErr -> ()
+          | TVar _ as t -> unify_at ctx clk.espan (TCap Clock) t
+          | t ->
+            err ctx "E0201" clk.espan
+              ~notes:[ "a timeout arm is `clock.after(ms) => ...`, with the `Clock` from `root.clock`" ]
+              (sprintf "`after` in a `select` needs a `Clock`, found `%s`" (show t)));
+         expect ctx f ms TInt
        | SelDefault -> ());
       expect ctx f a.sbody rt;
       pop f)

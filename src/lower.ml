@@ -482,6 +482,9 @@ and lower_select f e arms ty =
           let el = match tyof f ch with TChan t -> t | _ -> TUnit in
           let ca = lower f ch in
           Some (I.SSend (ca, lower f v, el, on))
+        | SelAfter (clk, ms) ->
+          let ca = lower f clk in
+          Some (I.SAfter (ca, lower f ms, on))
         | SelDefault -> None)
       arms
   in

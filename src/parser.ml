@@ -344,11 +344,12 @@ and parse_select st =
         match e.edesc with
         | EMethod (ch, "recv", _, []) -> SelRecv (None, ch)
         | EMethod (ch, "send", _, [ v ]) -> SelSend (ch, v)
+        | EMethod (clk, "after", _, [ ms ]) -> SelAfter (clk, ms)
         | _ ->
           raise
             (Diag.Fatal
                (Diag.make "E0003" e.espan
-                  "a `select` arm is `name = ch.recv()`, `ch.send(value)` or `_` (when nothing is ready)")))
+                  "a `select` arm is `name = ch.recv()`, `ch.send(value)`, `clock.after(ms)` (a timeout) or `_` (when nothing is ready)")))
     in
     let guard = if is_kw st "if" then (ignore (advance st); Some (parse_expr st)) else None in
     ignore (expect_sym st "=>");

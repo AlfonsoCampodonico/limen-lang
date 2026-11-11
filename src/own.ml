@@ -112,7 +112,7 @@ let rewrite_rhs r ~live_after ~owned =
     let xs, o = c [ v ] in
     (ChanSend (ch, List.hd xs, sp), o)
   | Select (id, ops, d, sp) ->
-    let sends = List.filter_map (function SSend (_, v, _, _) -> Some v | SRecv _ -> None) ops in
+    let sends = List.filter_map (function SSend (_, v, _, _) -> Some v | SRecv _ | SAfter _ -> None) ops in
     let xs, o = c sends in
     let rest = ref xs in
     let ops =

@@ -243,6 +243,7 @@ let rec expr env locals (e : expr) : expr =
                let locals' = match b with Some (n, _) -> n :: locals | None -> locals in
                { a with sop = SelRecv (b, ex c); sbody = expr env locals' a.sbody }
              | SelSend (c, v) -> { a with sop = SelSend (ex c, ex v); sbody = ex a.sbody }
+             | SelAfter (c, ms) -> { a with sop = SelAfter (ex c, ex ms); sbody = ex a.sbody }
              | SelDefault -> { a with sbody = ex a.sbody })
            arms)
   in

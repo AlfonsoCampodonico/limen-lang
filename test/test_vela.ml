@@ -1278,6 +1278,142 @@ fn main(root: Root) {
 }
 |} "4\n";
   errs "sleep-ambient" (main_wrap "    sleep(10)") [ "E0302" ];
+  out "select-timeout" {|fn main(root: Root) {
+    let out = root.stdout
+    let clock = root.clock
+    let quiet: Chan[Str] = channel(1)
+    let busy: Chan[Str] = channel(1)
+    let full: Chan[Str] = channel(1)
+    full.send("taken")
+    let r = group g {
+        g.go(|| {
+            // nobody sends on quiet: the timeout fires
+            let a = select {
+                m = quiet.recv() => m ?? "closed",
+                clock.after(100) => "timed out",
+            }
+            // a value comes long before the timeout
+            let b = select {
+                m = busy.recv() => m ?? "closed",
+                clock.after(5000) => "timed out",
+            }
+            // full stays full: the value is not sent, and is freed
+            let c = select {
+                full.send("never {a}") => "sent",
+                clock.after(50) => "not sent",
+            }
+            // after(0) is ready at once, but an earlier ready arm wins
+            busy.send("again")
+            let d = select {
+                m = busy.recv() => m ?? "closed",
+                clock.after(0) => "zero",
+            }
+            let e = select {
+                m = quiet.recv() => m ?? "closed",
+                clock.after(-1) => "zero",
+            }
+            // a guard turns the timeout off
+            let on = false
+            busy.send("guarded")
+            let f = select {
+                m = busy.recv() => m ?? "closed",
+                clock.after(1) if on => "timed out",
+            }
+            "{a}, {b}, {c}, {d}, {e}, {f}"
+        })
+        g.go(|| {
+            clock.sleep(20)
+            busy.send("hello")
+            ""
+        })
+    }
+    out.print(r[0])
+    // gather until a deadline
+    let ticks: Chan[Int] = channel(1)
+    let got = group g {
+        g.go(|| {
+            let deadline = clock.now_ms() + 300
+            let mut n = 0
+            let mut more = true
+            while more {
+                select {
+                    t = ticks.recv() => match t {
+                        Some(_) => {
+                            n = n + 1
+                        },
+                        None => {
+                            more = false
+                        },
+                    },
+                    clock.after(deadline - clock.now_ms()) => {
+                        more = false
+                    },
+                }
+            }
+            n
+        })
+        g.go(|| {
+            ticks.send(1)
+            ticks.send(2)
+            ticks.send(3)
+            0
+        })
+    }
+    out.print("{got[0]}")
+}
+|} "timed out, hello, not sent, again, zero, guarded\n3\n";
+  check_tsan "select-timeout-tsan" {|fn produce(c: Chan[Int], clock: Clock) -> Int {
+    let mut i = 0
+    while i < 2000 {
+        c.send(i)
+        if i % 100 == 0 {
+            clock.sleep(2)
+        }
+        i = i + 1
+    }
+    c.close()
+    0
+}
+
+fn consume(c: Chan[Int], clock: Clock) -> Int {
+    let mut sum = 0
+    let mut more = true
+    while more {
+        select {
+            v = c.recv() => match v {
+                Some(x) => {
+                    sum = sum + x
+                },
+                None => {
+                    more = false
+                },
+            },
+            clock.after(1) => (),
+        }
+    }
+    sum
+}
+
+fn main(root: Root) {
+    let clock = root.clock
+    let c: Chan[Int] = channel(4)
+    let sums = group g {
+        g.go(|| produce(c, clock))
+        let mut k = 0
+        while k < 8 {
+            g.go(|| consume(c, clock))
+            k = k + 1
+        }
+    }
+    root.stdout.print("{sums.sum()}")
+}
+|} "1999000\n";
+  let tchans = "    let c: Chan[Int] = channel(1)\n    let clock = root.clock\n" in
+  errs "select-two-afters" (main_wrap (tchans ^ "    let x = select {\n        v = c.recv() => 1,\n        clock.after(1) => 2,\n        clock.after(2) => 3,\n    }")) [ "E0106" ];
+  errs "select-after-and-default" (main_wrap (tchans ^ "    let x = select {\n        v = c.recv() => 1,\n        clock.after(1) => 2,\n        _ => 3,\n    }")) [ "E0003" ];
+  errs "select-after-not-clock" (main_wrap (tchans ^ "    let x = select {\n        v = c.recv() => 1,\n        c.after(1) => 2,\n    }")) [ "E0201" ];
+  errs "select-after-ms-type" (main_wrap (tchans ^ "    let x = select {\n        v = c.recv() => 1,\n        clock.after(\"soon\") => 2,\n    }")) [ "E0201" ];
+  errs "after-outside-select" (main_wrap (tchans ^ "    clock.after(10)")) [ "E0105" ];
   out "catch-in-task-frees-request" "struct Req {\n    path: Str,\n    hs: List[Str],\n}\n\nfn handler(r: Req) -> Str {\n    let e: List[Str] = []\n    r.path + e[0]\n}\n\nfn serve(n: Int) -> Str {\n    let req = Req { path: \"/p{n}\", hs: [\"a{n}\", \"b\"] }\n    catch(|| handler(req)) ?? \"500\"\n}\n\nfn main(root: Root) {\n    let rs = group g {\n        for n in [1, 2, 3] {\n            g.go(|| serve(n))\n        }\n    }\n    root.stdout.print(\"{rs}\")\n}\n" "[\"500\", \"500\", \"500\"]\n";
   errs "catch-arity" (main_wrap "    let r = catch(1, 2)") [ "E0107" ];
 

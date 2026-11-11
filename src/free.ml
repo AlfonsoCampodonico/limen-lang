@@ -35,7 +35,7 @@ let rec fv bound acc e =
         let acc = match a.sguard with Some g -> go acc g | None -> acc in
         match a.sop with
         | SelRecv (b, c) -> fv (match b with Some (n, _) -> n :: bound | None -> bound) (go acc c) a.sbody
-        | SelSend (c, v) -> go (go (go acc c) v) a.sbody
+        | SelSend (c, v) | SelAfter (c, v) -> go (go (go acc c) v) a.sbody
         | SelDefault -> go acc a.sbody)
       acc arms
 
@@ -81,7 +81,7 @@ let rec has_escape e =
       (fun a ->
         has_escape a.sbody
         || (match a.sguard with Some g -> has_escape g | None -> false)
-        || match a.sop with SelRecv (_, c) -> has_escape c | SelSend (c, v) -> has_escape c || has_escape v | SelDefault -> false)
+        || match a.sop with SelRecv (_, c) -> has_escape c | SelSend (c, v) | SelAfter (c, v) -> has_escape c || has_escape v | SelDefault -> false)
       arms
 
 and block_escape b =
