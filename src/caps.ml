@@ -9,32 +9,41 @@ type ioerr = Denied of string | Failed of string
 
 type url = { host : string; port : int }
 
+(* Strict, so the host we allow is the host curl connects to: http or https
+   only; no userinfo; host made of [A-Za-z0-9.-]; port plain digits in
+   1..65535; no spaces or control characters. Mirrors parse_url in the C
+   runtime. *)
 let parse_url u : (url, string) result =
-  match String.index_opt u ':' with
-  | None -> Error "URL has no scheme"
-  | Some i ->
-    let scheme = String.lowercase_ascii (String.sub u 0 i) in
-    if not (String.length u >= i + 3 && String.sub u i 3 = "://") then Error "malformed URL"
-    else if scheme <> "http" && scheme <> "https" then
-      Error (sprintf "scheme `%s` is not allowed, only http and https" scheme)
-    else begin
-      let rest = String.sub u (i + 3) (String.length u - i - 3) in
-      let stop = ref (String.length rest) in
-      String.iteri (fun j c -> if (c = '/' || c = '?' || c = '#') && j < !stop then stop := j) rest;
-      let hp = String.sub rest 0 !stop in
-      let hp =
-        match String.rindex_opt hp '@' with
-        | Some k -> String.sub hp (k + 1) (String.length hp - k - 1)
-        | None -> hp
-      in
-      let default = if scheme = "https" then 443 else 80 in
-      match String.rindex_opt hp ':' with
-      | Some k -> (
-        match int_of_string_opt (String.sub hp (k + 1) (String.length hp - k - 1)) with
-        | Some p -> Ok { host = String.lowercase_ascii (String.sub hp 0 k); port = p }
-        | None -> Error "bad port in URL")
-      | None -> if hp = "" then Error "URL has no host" else Ok { host = String.lowercase_ascii hp; port = default }
-    end
+  if String.exists (fun c -> Char.code c <= 0x20 || Char.code c >= 0x7f) u then
+    Error "URL contains spaces or non-ASCII characters"
+  else
+    match Interp_util.find_sub u "://" 0 with
+    | None -> Error "URL has no scheme"
+    | Some i -> (
+      let scheme = String.lowercase_ascii (String.sub u 0 i) in
+      if scheme <> "http" && scheme <> "https" then
+        Error (sprintf "scheme `%s` is not allowed, only http and https" (if String.length scheme > 32 then String.sub scheme 0 32 else scheme))
+      else
+        let rest = String.sub u (i + 3) (String.length u - i - 3) in
+        let stop = ref (String.length rest) in
+        String.iteri (fun j c -> if (c = '/' || c = '?' || c = '#') && j < !stop then stop := j) rest;
+        let auth = String.sub rest 0 !stop in
+        let host_ok c = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c = '.' || c = '-' in
+        let host, port =
+          match String.split_on_char ':' auth with
+          | [ h ] -> (h, Some (if scheme = "https" then 443 else 80))
+          | [ h; p ] ->
+            let digits = p <> "" && String.length p <= 5 && String.for_all (fun c -> c >= '0' && c <= '9') p in
+            (h, if digits then match int_of_string_opt p with Some n when n >= 1 && n <= 65535 -> Some n | _ -> None else None)
+          | _ -> ("", None)
+        in
+        if String.contains auth '@' || not (String.for_all (fun c -> host_ok c || c = ':') auth) then
+          Error "URL host may only contain letters, digits, `.` and `-`"
+        else if host = "" then Error "URL has no host"
+        else
+          match port with
+          | None -> Error "bad port in URL"
+          | Some p -> Ok { host = String.lowercase_ascii host; port = p })
 
 (* A grant entry: "*", "host" (any port) or "host:port". *)
 type entry = Any | Host of string * int option

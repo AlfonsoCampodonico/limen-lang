@@ -437,8 +437,10 @@ and stmt c out ind (s : I.stmt) =
        line (sprintf "  int64_t cnt_;");
        line (sprintf "  if (!__builtin_sub_overflow(%s, %s, &cnt_) && cnt_ < INT64_MAX - 1) {" (atom c n) (var i));
        line (sprintf "    cnt_ += %d;" (if inclusive then 1 else 0));
+       line "    int64_t want_;";
+       line (sprintf "    if (cnt_ > 0 && __builtin_add_overflow(%s->len, cnt_, &want_)) w_oom();" (var v));
        line "    if (cnt_ > 0) {";
-       line (sprintf "      %s_reserve(&%s, %s->len + cnt_);" ln (var v) (var v));
+       line (sprintf "      %s_reserve(&%s, want_);" ln (var v));
        line (sprintf "      %s* d_ = %s->data + %s->len;" (ctype c (match v.ty with TList e -> e | _ -> TUnit)) (var v) (var v));
        line (sprintf "      for (int64_t k_ = 0; k_ < cnt_; k_++) d_[k_] = %s;" (atom c x));
        line (sprintf "      %s->len += cnt_; %s += cnt_;" (var v) (var i));
@@ -801,9 +803,14 @@ let program (g : Lower.gctx) (prog : I.program) : string =
   let main = Buffer.create 1024 in
   let mp s = Buffer.add_string main (s ^ "\n") in
   let rt = prog.main_ret in
+  (* main runs as the main fiber, so it can wait on groups, channels and sockets *)
+  mp (sprintf "static %s wmain_result_;" (ctype c rt));
+  mp (sprintf "static void wmain_entry_(void* a) { (void)a; wmain_result_ = %s(%s); w_main_finished(); }" prog.main
+        (if prog.main_takes_root then "w_root()" else ""));
   mp "int main(int argc, char** argv) {";
   mp "  w_init(argc, argv);";
-  mp (sprintf "  %s r_ = %s(%s);" (ctype c rt) prog.main (if prog.main_takes_root then "w_root()" else ""));
+  mp "  w_run(wmain_entry_, NULL);";
+  mp (sprintf "  %s r_ = wmain_result_;" (ctype c rt));
   (match rt with
    | TNamed ("Result", [ _; et ]) ->
      mp (sprintf "  if (%s == 1) {" (tag_expr c rt "r_"));

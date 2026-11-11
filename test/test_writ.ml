@@ -441,6 +441,32 @@ fn area(s: Shape) -> Float { match s { Dot => 0.0, Box(w, h) => w * h } }
   out "net-file-scheme" ~grants:{ Interp.no_grants with net = [ "*" ] }
     (main_wrap "    out.print(\"{root.net.get(\"file:///etc/passwd\")}\")")
     "Err(Failed(\"scheme `file` is not allowed, only http and https\"))\n";
+  (* URL checks must not let a crafted URL reach a host other than the one allowed *)
+  out "net-url-strict" ~grants:{ Interp.no_grants with net = [ "api.example.com" ] }
+    (main_wrap {|    let mut pad = ""
+    let mut i = 0
+    while i < 600 {
+        pad = pad + "a"
+        i = i + 1
+    }
+    let urls = [
+        "https://api.example.com" + pad + "@evil.example/",
+        "https://user@api.example.com/",
+        "http://api.example.com:+80/",
+        "http://api.example.com:0x50/",
+        "http://api.example.com:70000/",
+        "http://api.example.com\\@evil.example/",
+        "http://api.example.com /",
+        "HTTPS://evil.example/",
+    ]
+    for u in urls {
+        match root.net.get(u) {
+            Ok(_) => out.print("ok?!"),
+            Err(Denied(m)) => out.print("denied: {m}"),
+            Err(Failed(m)) => out.print("failed: {m}"),
+        }
+    }|})
+    "failed: URL host may only contain letters, digits, `.` and `-`\nfailed: URL host may only contain letters, digits, `.` and `-`\nfailed: URL host may only contain letters, digits, `.` and `-`\nfailed: bad port in URL\nfailed: bad port in URL\nfailed: URL host may only contain letters, digits, `.` and `-`\nfailed: URL contains spaces or non-ASCII characters\ndenied: net: evil.example:443 is not granted\n";
   let dir = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "writ-test-%d" (Unix.getpid ())) in
   (try Unix.mkdir dir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
   (try Unix.mkdir (Filename.concat dir "sub") 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
