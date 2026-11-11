@@ -78,7 +78,7 @@ let unify_at ctx span want got =
   try unify want got
   with Mismatch -> err ctx "E0201" span (sprintf "expected `%s`, found `%s`" (show want) (show got))
 
-let builtin_types = [ "Int"; "Float"; "Bool"; "Str"; "List"; "Array"; "Chan"; "Root"; "Net"; "Fs"; "Stdout"; "Clock"; "Listen"; "Listener"; "Conn"; "Rand"; "Stdin"; "Env"; "Map" ]
+let builtin_types = [ "Int"; "Float"; "Bool"; "Str"; "List"; "Array"; "Chan"; "Root"; "Net"; "Fs"; "Stdout"; "Clock"; "Listen"; "Listener"; "Conn"; "Rand"; "Stdin"; "Env"; "Exec"; "Map" ]
 
 (* Names other languages use for ambient I/O, mapped to the capability way. *)
 let ambient =
@@ -89,7 +89,9 @@ let ambient =
     ("http_get", "Net", "net.get(url)"); ("now", "Clock", "clock.now_ms()");
     ("time", "Clock", "clock.now_ms()"); ("random", "Rand", "rand.int(lo, hi)");
     ("rand", "Rand", "rand.int(lo, hi)"); ("input", "Stdin", "stdin.read_line()");
-    ("read_line", "Stdin", "stdin.read_line()"); ("getenv", "Env", "env.get(name)") ]
+    ("read_line", "Stdin", "stdin.read_line()"); ("getenv", "Env", "env.get(name)");
+    ("system", "Exec", "exec.run(program, args)"); ("spawn", "Exec", "exec.run(program, args)");
+    ("popen", "Exec", "exec.run(program, args)") ]
 
 (* ---------- type expressions ---------- *)
 
@@ -140,6 +142,7 @@ let rec resolve ctx env (te : ty_expr) : ty =
     | "Rand" -> simple (TCap Rand)
     | "Stdin" -> simple (TCap Stdin)
     | "Env" -> simple (TCap Env)
+    | "Exec" -> simple (TCap Exec)
     | "Chan" -> if want 1 then TChan (List.hd args') else TErr
     | "Map" -> if want 2 then TMap (List.nth args' 0, List.nth args' 1) else TErr
     | _ -> (
@@ -292,7 +295,7 @@ let methods (t : ty) : (string * (unit -> ty list * ty)) list =
   | TNamed ("Result", [ a; e ]) ->
     [ m "is_ok" [] TBool; m "is_err" [] TBool;
       ("map_err", fun () -> let u = fresh () in ([ TFn ([ e ], u) ], res a u)) ]
-  | TCap Net -> [ m "get" [ TStr ] (res TStr io_err); m "only" [ TStr ] (TCap Net); m "connect" [ TStr ] (res (TCap Conn) io_err) ]
+  | TCap Net -> [ m "get" [ TStr ] (res (TNamed ("HttpResponse", [])) io_err); m "only" [ TStr ] (TCap Net); m "connect" [ TStr ] (res (TCap Conn) io_err) ]
   | TCap Listen -> [ m "on" [ TStr ] (res (TCap Listener) io_err) ]
   | TCap Listener -> [ m "accept" [] (res (TCap Conn) io_err); m "port" [] TInt; m "close" [] TUnit ]
   | TCap Conn -> [ m "read" [] (res TStr io_err); m "write" [ TStr ] (res TUnit io_err); m "close" [] TUnit ]
@@ -307,12 +310,14 @@ let methods (t : ty) : (string * (unit -> ty list * ty)) list =
   | TCap Rand -> [ m "int" [ TInt; TInt ] TInt; m "float" [] TFloat ]
   | TCap Stdin -> [ m "read_line" [] (opt TStr); m "read_all" [] TStr ]
   | TCap Env -> [ m "get" [ TStr ] (opt TStr) ]
+  | TCap Exec ->
+    [ m "run" [ TStr; TList TStr ] (res (TNamed ("ProcessOutput", [])) io_err); m "only" [ TStr ] (TCap Exec) ]
   | TCap Root -> [ m "args" [] (TList TStr) ]
   | TChan a -> [ m "send" [ a ] TUnit; m "recv" [] (opt a); m "close" [] TUnit ]
   | _ -> []
 
 let root_fields = [ ("net", TCap Net); ("fs", TCap Fs); ("stdout", TCap Stdout); ("clock", TCap Clock); ("listen", TCap Listen);
-    ("rand", TCap Rand); ("stdin", TCap Stdin); ("env", TCap Env) ]
+    ("rand", TCap Rand); ("stdin", TCap Stdin); ("env", TCap Env); ("exec", TCap Exec) ]
 
 (* ---------- expressions ---------- *)
 
@@ -1240,13 +1245,13 @@ let check_main ctx (d : fn_decl) (s : fsig) =
   let ok_params = match s.ps with [] -> true | [ t ] -> repr t = TCap Root | _ -> false in
   let ok_ret =
     match repr s.ret with
-    | TUnit -> true
-    | TNamed ("Result", [ t; _ ]) -> repr t = TUnit
+    | TUnit | TInt -> true
+    | TNamed ("Result", [ t; _ ]) -> (match repr t with TUnit | TInt -> true | _ -> false)
     | _ -> false
   in
   if s.gen <> [] || not (ok_params && ok_ret) then
     err ctx "E0303" d.fn_span "`main` has the wrong signature"
-      ~notes:[ "write `fn main(root: Root)` or `fn main(root: Root) -> Result[(), E]`" ]
+      ~notes:[ "write `fn main(root: Root)`, `fn main(root: Root) -> Int` (the exit code) or `fn main(root: Root) -> Result[(), E]`" ]
 
 let check_pending ctx =
   List.iter
@@ -1312,7 +1317,7 @@ let check_self ctx d ps =
     d.fn_params;
   match (d.fn_params, ps) with
   | { prm_name = "self"; prm_span; _ } :: _, t0 :: _ when d.fn_test = None -> (
-    let builtin n = List.mem n [ "Option"; "Result"; "IoError" ] in
+    let builtin n = List.mem n [ "Option"; "Result"; "IoError"; "ProcessOutput"; "HttpResponse" ] in
     match t0 with
     | TNamed (n, _) when (Hashtbl.mem ctx.structs n || Hashtbl.mem ctx.enums n) && not (builtin n) -> ()
     | TErr -> ()
@@ -1446,6 +1451,24 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
         if Hashtbl.mem seen_tests n then err ctx "E0106" d.fn_span (sprintf "test \"%s\" is defined more than once" n);
         Hashtbl.replace seen_tests n ()
       | None -> ())
+    sigs;
+  (* E0306: a test's parameters are capabilities the runner provides *)
+  List.iter
+    (fun ((d : fn_decl), (s : fsig)) ->
+      if d.fn_test <> None then
+        ignore
+          (List.fold_left2
+             (fun seen (p : param) t ->
+               match repr t with
+               | (TCap Fs | TCap Clock) as c when not (List.mem c seen) -> c :: seen
+               | TErr -> seen
+               | t ->
+                 err ctx "E0306" p.prm_span
+                   (if List.mem t seen then sprintf "a test can take `%s` only once" (show t)
+                    else sprintf "a test cannot take `%s`" (show t))
+                   ~notes:[ "a test can take `fs: Fs` (a fresh temporary directory) and `clock: Clock`; pass anything else through an interface" ];
+                 seen)
+             [] d.fn_params s.ps))
     sigs;
   (* 4. main *)
   List.iter (fun (d, s) -> if d.fn_name = "main" then check_main ctx d s) sigs;

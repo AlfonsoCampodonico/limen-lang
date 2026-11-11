@@ -512,8 +512,20 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     | "cap_remove", TCap Fs -> io_result (sprintf "Cap_fs_remove(%s, %s)" (arg 0) (arg 1)) "0"
     | "cap_make_dir", TCap Fs -> io_result (sprintf "Cap_fs_make_dir(%s, %s)" (arg 0) (arg 1)) "0"
     | "cap_is_dir", TCap Fs -> set (sprintf "Cap_fs_is_dir(%s, %s)" (arg 0) (arg 1))
+    | "cap_only", TCap Exec -> set (sprintf "Cap_exec_only(%s, %s)" (arg 0) (arg 1))
+    | "cap_run", TCap Exec ->
+      let po = TNamed ("ProcessOutput", []) in
+      io_result
+        (sprintf "Cap_exec_run(%s, %s, %s)" (arg 0) (arg 1) (arg 2))
+        (sprintf "({ WProc *p_ = (WProc*)r_.ptr; %s v_ = { p_->code, p_->out, p_->err }; free(p_); v_; })" (ctype c po))
     | "cap_only", _ -> set (sprintf "Cap_net_only(%s, %s)" (arg 0) (arg 1))
-    | "cap_get", _ -> io_result (sprintf "Cap_net_get(%s, %s)" (arg 0) (arg 1)) "r_.val"
+    | "cap_get", _ ->
+      let ht = TNamed ("HttpResponse", []) and mt = TMap (TStr, TStr) in
+      io_result
+        (sprintf "Cap_net_get(%s, %s)" (arg 0) (arg 1))
+        (sprintf
+           "({ WHttp *h_ = (WHttp*)r_.ptr; %s* m_ = %s_new(); for (int i_ = 0; i_ < h_->n; i_++) %s_put(&m_, h_->names[i_], h_->values[i_]); %s v_ = { h_->status, m_, h_->body }; free(h_->names); free(h_->values); free(h_); v_; })"
+           (cname c mt) (cname c mt) (cname c mt) (ctype c ht))
     | "cap_under", _ -> set (sprintf "Cap_fs_under(%s, %s)" (arg 0) (arg 1))
     | "cap_read_only", _ -> set (sprintf "Cap_fs_read_only(%s)" (arg 0))
     | "cap_read", TCap Conn -> io_result (sprintf "Cap_conn_read(%s)" (arg 0)) "r_.val"
@@ -1089,14 +1101,17 @@ let program (g : Lower.gctx) (prog : I.program) : string =
     mp "static void wtest_entry_(void* a) {";
     mp "  (void)a;";
     mp "  switch (wtest_index_) {";
-    List.iteri (fun i t -> mp (sprintf "    case %d: %s(); break;" i t)) prog.tests;
+    List.iteri
+      (fun i (t, fields) ->
+        mp (sprintf "    case %d: %s(%s); break;" i t (String.concat ", " (List.map (sprintf "Cap_root_field(NULL, %S)") fields))))
+      prog.tests;
     mp "  }";
     mp "  w_main_finished();";
     mp "}";
     mp "int main(int argc, char** argv) {";
     mp "  if (argc < 2) return 2;";
     mp "  wtest_index_ = atoi(argv[1]);";
-    mp "  w_seed_hash();";
+    mp "  w_init(argc - 1, argv + 1);   /* `--grant fs=DIR` for a test that takes Fs */";
     mp "  w_run(wtest_entry_, NULL);";
     mp "  fflush(stdout);";
     mp "  w_leakcheck();";
@@ -1120,10 +1135,18 @@ let program (g : Lower.gctx) (prog : I.program) : string =
      mp "    buf_puts(&b_, \"\\n\"); fflush(stdout); fwrite(b_.p, 1, (size_t)b_.len, stderr); return 1;";
      mp "  }"
    | _ -> ());
+  (* `main` returning Int (or Ok(Int)) chooses the exit status; the OS keeps its low 8 bits *)
+  let code =
+    match rt with
+    | TInt -> "(int)(r_ & 255)"
+    | TNamed ("Result", [ TInt; _ ]) -> sprintf "(int)(%s & 255)" (payload_expr c rt "r_" 0 0)
+    | _ -> "0"
+  in
+  mp (sprintf "  int code_ = %s;" code);
   if not (is_scalar rt) then mp (sprintf "  %s_drop(r_);" (cname c rt)) else mp "  (void)r_;";
   mp "  fflush(stdout);";
   mp "  w_leakcheck();";
-  mp "  return 0;";
+  mp "  return code_;";
   mp "}"
   end;
   let types = Buffer.create 16384 in

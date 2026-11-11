@@ -4,7 +4,7 @@ let usage =
   {|vela: a small language where I/O needs a capability
 
 usage:
-  vela run FILE [--native] [--grant net=HOST[:PORT]|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST:PORT]... [--grant env=NAME|*]... [--seed N] [-- ARGS...]
+  vela run FILE [--native] [--grant net=HOST[:PORT]|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST:PORT]... [--grant env=NAME|*]... [--grant exec=PROGRAM|*]... [--seed N] [-- ARGS...]
   vela build FILE [-o OUT] [--emit-c]
   vela check FILE [--json]
   vela caps FILE [--json]
@@ -15,7 +15,7 @@ usage:
   vela mcp                (MCP server for coding agents, on stdin/stdout)
   vela spec               (print the language specification)
 
-Stdout, Stdin, Clock and Rand are always granted. Net, Fs, Listen and Env exist only
+Stdout, Stdin, Clock and Rand are always granted. Net, Fs, Listen, Env and Exec exist only
 when granted, by --grant or by the [grants] table of vela.toml. --seed makes Rand repeatable; arguments after -- are root.args().
 |}
 
@@ -53,6 +53,8 @@ let parse_grants args =
         { g with listen = g.listen @ [ String.sub a (i + 1) (String.length a - i - 1) ] }
       | Some i when String.sub a 0 i = "env" ->
         { g with env = g.env @ [ String.sub a (i + 1) (String.length a - i - 1) ] }
+      | Some i when String.sub a 0 i = "exec" ->
+        { g with exec = g.exec @ [ String.sub a (i + 1) (String.length a - i - 1) ] }
       | Some i when String.sub a 0 i = "seed" -> (
         match int_of_string_opt (String.sub a (i + 1) (String.length a - i - 1)) with
         | Some n -> { g with seed = Some n }
@@ -95,11 +97,15 @@ let run_tests_native items names =
    | Error m -> prerr_string m; prerr_endline "vela: the C compiler failed (this is a bug in vela)"; exit 1);
   let results =
     List.mapi
-      (fun i name ->
+      (fun i (name, takes_fs) ->
         let err = exe ^ ".err" in
         let fd = Unix.openfile err [ Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC ] 0o600 in
-        let pid = Unix.create_process exe [| exe; string_of_int i |] Unix.stdin Unix.stdout fd in
+        (* a test that takes Fs gets a fresh directory, removed afterwards *)
+        let dir = if takes_fs then Some (Caps.test_dir ()) else None in
+        let grant = match dir with Some d -> [| "--grant"; "fs=" ^ d |] | None -> [||] in
+        let pid = Unix.create_process exe (Array.append [| exe; string_of_int i |] grant) Unix.stdin Unix.stdout fd in
         let _, status = Unix.waitpid [] pid in
+        Option.iter Caps.remove_tree dir;
         Unix.close fd;
         let text = In_channel.with_open_bin err In_channel.input_all in
         match status with
@@ -126,10 +132,10 @@ let run_tests_native items names =
 let cmd_test file native =
   let items, diags, _ = load file in
   if diags <> [] then (report diags; exit 1);
-  let names = List.filter_map (function Ast.IFn { fn_test = Some n; _ } -> Some n | _ -> None) items in
-  if names = [] then (print_endline "no tests"; exit 0);
+  let tests = List.filter_map (function Ast.IFn ({ fn_test = Some n; _ } as d) -> Some (n, Caps.takes_fs d) | _ -> None) items in
+  if tests = [] then (print_endline "no tests"; exit 0);
   let results =
-    if native then run_tests_native items names
+    if native then run_tests_native items tests
     else
       List.map
         (fun (n, r) -> (n, match r with Ok () -> Ok () | Error (m, sp) -> Error (m, where_of sp)))
@@ -251,6 +257,7 @@ let cmd_run file grant_args prog_args =
   | Ok (Interp.VEnum ("Result", "Err", [ e ])) ->
     Printf.eprintf "error: %s\n" (Interp.show e);
     exit 1
+  | Ok (Interp.VInt n | Interp.VEnum ("Result", "Ok", [ Interp.VInt n ])) -> exit (Interp.exit_code n)
   | Ok _ -> exit 0
   | Error (m, sp) ->
     Printf.eprintf "panic: %s\n" m;

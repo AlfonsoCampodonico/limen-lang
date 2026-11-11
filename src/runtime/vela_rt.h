@@ -794,7 +794,7 @@ static void w_dyn_kids(void *o) { WDyn *d = (WDyn *)o; d->vt->h.drop(d); }
 
 /* ---------- capabilities ---------- */
 
-enum { CAP_ROOT, CAP_NET, CAP_FS, CAP_STDOUT, CAP_CLOCK, CAP_LISTEN, CAP_LISTENER, CAP_CONN, CAP_RAND, CAP_STDIN, CAP_ENV };
+enum { CAP_ROOT, CAP_NET, CAP_FS, CAP_STDOUT, CAP_CLOCK, CAP_LISTEN, CAP_LISTENER, CAP_CONN, CAP_RAND, CAP_STDIN, CAP_ENV, CAP_EXEC };
 typedef struct WCap WCap;
 struct WCap {
   int64_t rc; int kind;
@@ -812,13 +812,14 @@ static void Cap_drop(WCap *c) { if (w_rc_dec(&c->rc)) Cap_release(c); }
 static inline bool Cap_eq(WCap *a, WCap *b) { return a == b; }
 static void Cap_show(WBuf *b, WCap *c, bool top) {
   (void)top;
-  static const char *names[] = { "<Root>", "<Net>", "<Fs>", "<Stdout>", "<Clock>", "<Listen>", "<Listener>", "<Conn>", "<Rand>", "<Stdin>", "<Env>" };
+  static const char *names[] = { "<Root>", "<Net>", "<Fs>", "<Stdout>", "<Clock>", "<Listen>", "<Listener>", "<Conn>", "<Rand>", "<Stdin>", "<Env>", "<Exec>" };
   buf_puts(b, names[c->kind]);
 }
 
 static char **g_hosts; static int g_nhosts; static char *g_fs_root; static bool g_fs_ro;
 static char **g_listen; static int g_nlisten;
 static char **g_env; static int g_nenv;
+static char **g_exec; static int g_nexec;
 static char **g_args; static int g_nargs;
 static uint64_t g_rand_state;
 
@@ -861,6 +862,9 @@ static void w_init(int argc, char **argv) {
     } else if (strncmp(g, "env=", 4) == 0) {
       g_env = (char **)w_realloc(g_env, sizeof(char *) * (size_t)(g_nenv + 1));
       g_env[g_nenv++] = strdup(g + 4);
+    } else if (strncmp(g, "exec=", 5) == 0) {
+      g_exec = (char **)w_realloc(g_exec, sizeof(char *) * (size_t)(g_nexec + 1));
+      g_exec[g_nexec++] = strdup(g + 5);
     } else if (strncmp(g, "listen=", 7) == 0) {
       g_listen = (char **)w_realloc(g_listen, sizeof(char *) * (size_t)(g_nlisten + 1));
       g_listen[g_nlisten++] = strdup(g + 7);
@@ -889,6 +893,13 @@ static WCap *Cap_root_field(WCap *root, const char *f) {
     c->hosts = (char **)w_raw(sizeof(char *) * (size_t)(g_nlisten + 1));
     for (int i = 0; i < g_nlisten; i++) c->hosts[i] = strdup(g_listen[i]);
     c->nhosts = g_nlisten;
+    return c;
+  }
+  if (strcmp(f, "exec") == 0) {
+    WCap *c = cap_new(CAP_EXEC);
+    c->hosts = (char **)w_raw(sizeof(char *) * (size_t)(g_nexec + 1));
+    for (int i = 0; i < g_nexec; i++) c->hosts[i] = strdup(g_exec[i]);
+    c->nhosts = g_nexec;
     return c;
   }
   if (strcmp(f, "rand") == 0) return cap_new(CAP_RAND);
@@ -1007,11 +1018,11 @@ static WCap *Cap_net_only(WCap *n, WStr *req_s) {
   return c;
 }
 
-/* Strict URL check, so the host we allow is the host curl connects to:
+/* Strict URL check, so the host we allow is the host we connect to:
    http or https only; no userinfo (`@`); host made of [A-Za-z0-9.-];
    port plain digits in 1..65535; no spaces or control characters anywhere.
    Mirrors Caps.parse_url in the interpreter. */
-static int parse_url(const char *u, char *host, size_t hn, int *port, char *err, size_t en) {
+static int parse_url(const char *u, char *host, size_t hn, int *port, int *is_https, const char **path, char *err, size_t en) {
   for (const unsigned char *k = (const unsigned char *)u; *k; k++)
     if (*k <= 0x20 || *k >= 0x7f) { snprintf(err, en, "URL contains spaces or non-ASCII characters"); return 0; }
   const char *c = strstr(u, "://");
@@ -1045,6 +1056,8 @@ static int parse_url(const char *u, char *host, size_t hn, int *port, char *err,
     *port = p;
   }
   memcpy(host, auth, hl); host[hl] = 0; lower_ascii(host);
+  *is_https = https;
+  *path = auth + alen;
   return 1;
 }
 
@@ -1055,40 +1068,6 @@ static WStr *read_fd(int fd) {
   while ((n = read(fd, tmp, 65536)) > 0) buf_putn(&b, tmp, n);
   free(tmp);
   return buf_take(&b);
-}
-
-static WIo Cap_net_get(WCap *n, WStr *url_s) {
-  char *url = strndup(url_s->data, (size_t)url_s->len);
-  char host[512], err[256]; int port;
-  if (!parse_url(url, host, sizeof host, &port, err, sizeof err)) { free(url); return io_err(2, err); }
-  if (!net_permits(n, host, port)) {
-    char m[700]; snprintf(m, sizeof m, "net: %s:%d is not granted", host, port);
-    free(url); return io_err(1, m);
-  }
-  int out[2], er[2];
-  if (pipe(out) || pipe(er)) { free(url); return io_err(2, "pipe failed"); }
-  posix_spawn_file_actions_t fa;
-  posix_spawn_file_actions_init(&fa);
-  posix_spawn_file_actions_adddup2(&fa, out[1], 1);
-  posix_spawn_file_actions_adddup2(&fa, er[1], 2);
-  posix_spawn_file_actions_addclose(&fa, out[0]);
-  posix_spawn_file_actions_addclose(&fa, er[0]);
-  char *argv[] = { "curl", "-sS", "--fail", "--max-time", "20", "--proto", "=http,https", "--", url, NULL };
-  pid_t pid;
-  int rc = posix_spawnp(&pid, "curl", &fa, NULL, argv, environ);
-  posix_spawn_file_actions_destroy(&fa);
-  close(out[1]); close(er[1]);
-  if (rc != 0) { close(out[0]); close(er[0]); free(url); return io_err(2, "could not run curl"); }
-  WStr *body = read_fd(out[0]);
-  WStr *emsg = read_fd(er[0]);
-  close(out[0]); close(er[0]);
-  int status; waitpid(pid, &status, 0);
-  free(url);
-  if (WIFEXITED(status) && WEXITSTATUS(status) == 0) { Str_drop(emsg); return io_ok(body); }
-  Str_drop(body);
-  WStr *t = Str_trim(emsg); Str_drop(emsg);
-  WIo r = { 2, NULL, t, NULL };
-  return r;
 }
 
 /* Normalise `rel` under `root`; returns malloc'd path or NULL with err set. */
@@ -2344,4 +2323,315 @@ static WIo Cap_conn_write(WCap *c, WStr *s) {
   }
   w_sock_leave(c);
   return io_ok(NULL);
+}
+
+/* ---------- Exec: run another program ----------
+   The allowlist holds program names exactly as granted (`git`, `/usr/bin/env`)
+   or `*`. Arguments go to the program as a list; no shell is involved. The
+   child gets /dev/null as stdin, our working directory, and only the
+   environment variables granted with `--grant env=` (plus PATH), so Exec
+   cannot read past the Env grant. Its
+   stdout comes through a pipe the task waits on without blocking a worker;
+   its stderr goes to an unlinked temporary file, so a child that fills one
+   stream while we wait on the other cannot deadlock. */
+static bool exec_permits(WCap *x, const char *prog) {
+  for (int i = 0; i < x->nhosts; i++) if (strcmp(x->hosts[i], "*") == 0 || strcmp(x->hosts[i], prog) == 0) return true;
+  return false;
+}
+static WCap *Cap_exec_only(WCap *x, WStr *prog_s) {
+  char *prog = strndup(prog_s->data, (size_t)prog_s->len);
+  bool covered = (size_t)prog_s->len == strlen(prog) && exec_permits(x, prog);
+  if (strcmp(prog, "*") == 0) { covered = false; for (int i = 0; i < x->nhosts; i++) if (strcmp(x->hosts[i], "*") == 0) covered = true; }
+  WCap *c = cap_new(CAP_EXEC);
+  c->hosts = (char **)w_raw(sizeof(char *));
+  if (covered) { c->hosts[0] = prog; c->nhosts = 1; } else free(prog);
+  return c;
+}
+typedef struct { int64_t code; WStr *out; WStr *err; } WProc;
+static WIo Cap_exec_run(WCap *x, WStr *prog_s, L_Str *args) {
+  if (memchr(prog_s->data, 0, (size_t)prog_s->len)) return io_err(2, "exec: the program name contains a NUL byte");
+  for (int64_t i = 0; i < args->len; i++)
+    if (memchr(args->data[i]->data, 0, (size_t)args->data[i]->len)) return io_err(2, "exec: an argument contains a NUL byte");
+  char *prog = strndup(prog_s->data, (size_t)prog_s->len);
+  if (!exec_permits(x, prog)) {
+    WBuf b; buf_init(&b);
+    buf_puts(&b, "exec: `"); buf_puts(&b, prog); buf_puts(&b, "` is not granted");
+    free(prog);
+    WIo r = { 1, NULL, buf_take(&b), NULL };
+    return r;
+  }
+  char **argv = (char **)w_raw(sizeof(char *) * (size_t)(args->len + 2));
+  argv[0] = prog;
+  for (int64_t i = 0; i < args->len; i++) argv[i + 1] = strndup(args->data[i]->data, (size_t)args->data[i]->len);
+  argv[args->len + 1] = NULL;
+  const char *tmp = getenv("TMPDIR");
+  char tpl[1024];
+  snprintf(tpl, sizeof tpl, "%s/vela-exec-XXXXXX", tmp && tmp[0] ? tmp : "/tmp");
+  /* Descriptors are close-on-exec from birth where the system allows, so a
+     program spawned at the same moment by another worker cannot inherit our
+     pipe and hold it open; on macOS the spawn closes everything else anyway. */
+#ifdef __APPLE__
+  int errfd = mkstemp(tpl);
+#else
+  int errfd = mkostemp(tpl, O_CLOEXEC);
+#endif
+  if (errfd >= 0) unlink(tpl);
+  int out[2] = { -1, -1 };
+  char **envp = NULL; int nenvp = 0;
+  WIo res;
+#ifdef __APPLE__
+  if (errfd < 0 || pipe(out) != 0) { res = w_errno_io(); goto done; }
+  fcntl(errfd, F_SETFD, FD_CLOEXEC);
+  fcntl(out[0], F_SETFD, FD_CLOEXEC);
+  fcntl(out[1], F_SETFD, FD_CLOEXEC);
+#else
+  if (errfd < 0 || pipe2(out, O_CLOEXEC) != 0) { res = w_errno_io(); goto done; }
+#endif
+  /* the child's environment: PATH and the variables the Env grant names */
+  for (char **e = environ; *e; e++) nenvp++;
+  envp = (char **)w_raw(sizeof(char *) * (size_t)(nenvp + 1));
+  nenvp = 0;
+  for (char **e = environ; *e; e++) {
+    const char *eq = strchr(*e, '=');
+    if (!eq) continue;
+    size_t kl = (size_t)(eq - *e);
+    bool keep = kl == 4 && strncmp(*e, "PATH", 4) == 0;
+    for (int i = 0; i < g_nenv && !keep; i++)
+      keep = strcmp(g_env[i], "*") == 0 || (strlen(g_env[i]) == kl && strncmp(g_env[i], *e, kl) == 0);
+    if (keep) envp[nenvp++] = *e;
+  }
+  envp[nenvp] = NULL;
+  posix_spawn_file_actions_t fa;
+  posix_spawn_file_actions_init(&fa);
+  posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
+  posix_spawn_file_actions_adddup2(&fa, out[1], 1);
+  posix_spawn_file_actions_adddup2(&fa, errfd, 2);
+  posix_spawnattr_t sa;
+  posix_spawnattr_init(&sa);
+#ifdef POSIX_SPAWN_CLOEXEC_DEFAULT
+  posix_spawnattr_setflags(&sa, POSIX_SPAWN_CLOEXEC_DEFAULT);
+#endif
+  pid_t pid;
+  int rc = posix_spawnp(&pid, prog, &fa, &sa, argv, envp);
+  posix_spawnattr_destroy(&sa);
+  posix_spawn_file_actions_destroy(&fa);
+  close(out[1]); out[1] = -1;
+  if (rc != 0) {
+    WBuf b; buf_init(&b);
+    buf_puts(&b, "exec: cannot run `"); buf_puts(&b, prog); buf_puts(&b, "`: "); buf_puts(&b, strerror(rc));
+    res = (WIo){ 2, NULL, buf_take(&b), NULL };
+    goto done;
+  }
+  {
+    WBuf ob; buf_init(&ob);
+    char *chunk = (char *)w_raw(65536);   /* on the heap: task stacks are small */
+    fcntl(out[0], F_SETFL, fcntl(out[0], F_GETFL) | O_NONBLOCK);
+    for (;;) {
+      ssize_t n = read(out[0], chunk, 65536);
+      if (n > 0) { buf_putn(&ob, chunk, n); continue; }
+      if (n == 0) break;
+      if (errno == EINTR) continue;
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        if (w_wait_fd(out[0], 0) < 0) fcntl(out[0], F_SETFL, fcntl(out[0], F_GETFL) & ~O_NONBLOCK);
+        continue;
+      }
+      break;
+    }
+    free(chunk);
+    w_sock_release_fd(out[0]); out[0] = -1;
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    lseek(errfd, 0, SEEK_SET);
+    WStr *e = read_fd(errfd);
+    WProc *p = (WProc *)w_raw(sizeof(WProc));
+    p->code = WIFEXITED(status) ? WEXITSTATUS(status) : WIFSIGNALED(status) ? 128 + WTERMSIG(status) : 1;
+    p->out = buf_take(&ob);
+    p->err = e;
+    res = io_ok_ptr(p);
+  }
+done:
+  if (out[0] >= 0) close(out[0]);
+  if (out[1] >= 0) close(out[1]);
+  if (errfd >= 0) close(errfd);
+  free(envp);
+  for (int64_t i = 0; i <= args->len; i++) free(argv[i]);
+  free(argv);
+  return res;
+}
+
+/* ---------- Net.get: plain HTTP/1.1 over a socket ----------
+   The same rules as Caps.parse_http in the interpreter: status line
+   `HTTP/1.x NNN ...`; header names lowercased, names and values trimmed of
+   spaces and tabs, a repeated header's values joined with ", "; the body
+   chunked if Transfer-Encoding mentions chunked, else Content-Length bytes
+   if given, else everything until the server closes. Redirects are
+   returned, not followed. There is no TLS yet, so https is refused. */
+typedef struct { int64_t status; int n; WStr **names; WStr **values; WStr *body; } WHttp;
+#define W_MAX_RESPONSE ((int64_t)64 * 1024 * 1024)
+
+static int64_t w_find_bytes(const char *d, int64_t n, const char *pat, int64_t from) {
+  int64_t m = (int64_t)strlen(pat);
+  for (int64_t i = from; i + m <= n; i++) if (memcmp(d + i, pat, (size_t)m) == 0) return i;
+  return -1;
+}
+static void w_trim_sp(const char *d, int64_t *a, int64_t *b) {
+  while (*a < *b && (d[*a] == ' ' || d[*a] == '\t')) (*a)++;
+  while (*b > *a && (d[*b - 1] == ' ' || d[*b - 1] == '\t')) (*b)--;
+}
+static void w_http_free(WHttp *h) {
+  for (int i = 0; i < h->n; i++) { Str_drop(h->names[i]); Str_drop(h->values[i]); }
+  free(h->names); free(h->values);
+  if (h->body) Str_drop(h->body);
+  free(h);
+}
+static WIo w_http_fail(WHttp *h, const char *m) { w_http_free(h); return io_err(2, m); }
+
+static WIo w_http_parse(const char *d, int64_t n) {
+  /* bounded, so a hostile server cannot make the header merging quadratic */
+  int64_t e = w_find_bytes(d, n < 65536 + 4 ? n : 65536 + 4, "\r\n\r\n", 0);
+  if (e > 65536 || (e < 0 && n > 65536)) return io_err(2, "http: response headers larger than 64 KiB");
+  if (e < 0) return io_err(2, "http: incomplete response headers");
+  int64_t lines = 1;
+  for (int64_t k = 0; k < e; k++) if (d[k] == '\n') lines++;
+  if (lines > 1000 + 1) return io_err(2, "http: more than 1000 response headers");
+  WHttp *h = (WHttp *)w_raw(sizeof(WHttp));
+  memset(h, 0, sizeof *h);
+  /* lines of the head, split on \n with a trailing \r removed */
+  int64_t pos = 0; bool first = true;
+  while (pos <= e) {
+    int64_t nl = w_find_bytes(d, e, "\n", pos);
+    int64_t end = nl < 0 ? e : nl;
+    int64_t le = end;
+    if (le > pos && d[le - 1] == '\r') le--;
+    const char *l = d + pos; int64_t ll = le - pos;
+    if (first) {
+      bool ok = ll >= 12 && memcmp(l, "HTTP/1.", 7) == 0 && l[8] == ' ' && (ll == 12 || l[12] == ' ');
+      for (int k = 9; ok && k < 12; k++) ok = l[k] >= '0' && l[k] <= '9';
+      if (!ok) return w_http_fail(h, "http: malformed status line");
+      h->status = (l[9] - '0') * 100 + (l[10] - '0') * 10 + (l[11] - '0');
+      first = false;
+    } else {
+      const char *colon = memchr(l, ':', (size_t)ll);
+      if (!colon) return w_http_fail(h, "http: malformed header line");
+      int64_t na = 0, nb = colon - l, va = nb + 1, vb = ll;
+      w_trim_sp(l, &na, &nb); w_trim_sp(l, &va, &vb);
+      WStr *name = Str_from(l + na, nb - na);
+      for (int64_t k = 0; k < name->len; k++) if (name->data[k] >= 'A' && name->data[k] <= 'Z') name->data[k] = (char)(name->data[k] + 32);
+      int found = -1;
+      for (int k = 0; k < h->n; k++) if (h->names[k]->len == name->len && memcmp(h->names[k]->data, name->data, (size_t)name->len) == 0) found = k;
+      if (found >= 0) {
+        WBuf b; buf_init(&b);
+        buf_putn(&b, h->values[found]->data, h->values[found]->len);
+        buf_puts(&b, ", ");
+        buf_putn(&b, l + va, vb - va);
+        Str_drop(h->values[found]);
+        h->values[found] = buf_take(&b);
+        Str_drop(name);
+      } else {
+        h->names = (WStr **)w_realloc(h->names, sizeof(WStr *) * (size_t)(h->n + 1));
+        h->values = (WStr **)w_realloc(h->values, sizeof(WStr *) * (size_t)(h->n + 1));
+        h->names[h->n] = name;
+        h->values[h->n] = Str_from(l + va, vb - va);
+        h->n++;
+      }
+    }
+    if (nl < 0) break;
+    pos = nl + 1;
+  }
+  const char *raw = d + e + 4; int64_t rn = n - e - 4;
+  WStr *te = NULL, *cl = NULL;
+  for (int k = 0; k < h->n; k++) {
+    if (h->names[k]->len == 17 && memcmp(h->names[k]->data, "transfer-encoding", 17) == 0) te = h->values[k];
+    if (h->names[k]->len == 14 && memcmp(h->names[k]->data, "content-length", 14) == 0) cl = h->values[k];
+  }
+  bool chunked = false;
+  if (te) {
+    char *low = strndup(te->data, (size_t)te->len);
+    lower_ascii(low);
+    chunked = w_find_bytes(low, (int64_t)strlen(low), "chunked", 0) >= 0;
+    free(low);
+  }
+  if (chunked) {
+    WBuf b; buf_init(&b);
+    int64_t p = 0;
+    for (;;) {
+      int64_t eol = w_find_bytes(raw, rn, "\r\n", p);
+      if (eol < 0) { free(b.p); return w_http_fail(h, "http: truncated chunked body"); }
+      int64_t sa = p, sb = eol;
+      const char *semi = memchr(raw + p, ';', (size_t)(eol - p));
+      if (semi) sb = semi - raw;
+      w_trim_sp(raw, &sa, &sb);
+      int64_t size = 0; bool ok = sb > sa && sb - sa <= 15;
+      for (int64_t k = sa; ok && k < sb; k++) {
+        char c = raw[k];
+        int v = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 87 : c >= 'A' && c <= 'F' ? c - 55 : -1;
+        if (v < 0) ok = false; else size = size * 16 + v;
+      }
+      if (!ok) { free(b.p); return w_http_fail(h, "http: bad chunk size"); }
+      if (size == 0) break;
+      int64_t start = eol + 2;
+      if (start + size > rn) { free(b.p); return w_http_fail(h, "http: truncated chunked body"); }
+      buf_putn(&b, raw + start, size);
+      p = start + size + 2;
+    }
+    h->body = buf_take(&b);
+  } else if (cl) {
+    int64_t a = 0, b = cl->len;
+    w_trim_sp(cl->data, &a, &b);
+    bool ok = b > a && b - a <= 15;
+    int64_t len = 0;
+    for (int64_t k = a; ok && k < b; k++) { if (cl->data[k] < '0' || cl->data[k] > '9') ok = false; else len = len * 10 + (cl->data[k] - '0'); }
+    if (!ok) return w_http_fail(h, "http: bad Content-Length");
+    if (rn < len) return w_http_fail(h, "http: truncated body");
+    h->body = Str_from(raw, len);
+  } else h->body = Str_from(raw, rn);
+  return io_ok_ptr(h);
+}
+
+static WIo Cap_net_get(WCap *n, WStr *url_s) {
+  if (memchr(url_s->data, 0, (size_t)url_s->len)) return io_err(2, "URL contains spaces or non-ASCII characters");
+  char *url = strndup(url_s->data, (size_t)url_s->len);
+  char host[512], err[256]; int port, https; const char *path;
+  if (!parse_url(url, host, sizeof host, &port, &https, &path, err, sizeof err)) { free(url); return io_err(2, err); }
+  if (!net_permits(n, host, port)) {
+    char m[700]; snprintf(m, sizeof m, "net: %s:%d is not granted", host, port);
+    free(url); return io_err(1, m);
+  }
+  if (https) { free(url); return io_err(2, "https is not supported yet (vela has no TLS); use an http:// URL"); }
+  /* the request: the path without any #fragment, `/` if empty, `/?q` for a bare query */
+  WBuf req; buf_init(&req);
+  buf_puts(&req, "GET ");
+  size_t pl = strcspn(path, "#");
+  if (pl == 0 || path[0] == '?') buf_puts(&req, "/");
+  buf_putn(&req, path, (int64_t)pl);
+  buf_puts(&req, " HTTP/1.1\r\nHost: ");
+  buf_puts(&req, host);
+  if (port != 80) { char pb[16]; snprintf(pb, sizeof pb, ":%d", port); buf_puts(&req, pb); }
+  buf_puts(&req, "\r\nUser-Agent: vela\r\nAccept: */*\r\nConnection: close\r\n\r\n");
+  WStr *reqs = buf_take(&req);
+  char addr[600]; snprintf(addr, sizeof addr, "%s:%d", host, port);
+  free(url);
+  WStr *addrs = Str_from(addr, (int64_t)strlen(addr));
+  WIo c = Cap_net_connect(n, addrs);
+  Str_drop(addrs);
+  if (c.kind != 0) { Str_drop(reqs); return c; }
+  WCap *conn = (WCap *)c.ptr;
+  WIo r = Cap_conn_write(conn, reqs);
+  Str_drop(reqs);
+  if (r.kind == 0) {
+    WBuf b; buf_init(&b);
+    for (;;) {
+      WIo k = Cap_conn_read(conn);
+      if (k.kind != 0) { r = k; break; }
+      int64_t got = k.val->len;
+      buf_putn(&b, k.val->data, got);
+      Str_drop(k.val);
+      if (got == 0) { r = w_http_parse(b.p, b.len); break; }
+      if (b.len > W_MAX_RESPONSE) { r = io_err(2, "net: the response is larger than 64 MiB"); break; }
+    }
+    free(b.p);
+  }
+  Cap_sock_close(conn);
+  Cap_drop(conn);
+  return r;
 }

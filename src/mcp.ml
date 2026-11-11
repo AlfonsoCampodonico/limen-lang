@@ -27,7 +27,7 @@ let tools =
       [ source_p; ("native", bool_prop "Compile to native code instead of interpreting (default false)");
         ("timeout_seconds", int_prop "Time limit, 1 to 60") ]
       [ "source" ];
-    tool "vela_test" "Run the `test \"name\" { ... }` blocks in a Vela program and report each result." [ source_p; ("native", bool_prop "Run natively (default false)") ] [ "source" ];
+    tool "vela_test" "Run the `test \"name\" { ... }` blocks in a Vela program and report each result. A test that declares `(fs: Fs)` gets a fresh, empty temporary directory." [ source_p; ("native", bool_prop "Run natively (default false)") ] [ "source" ];
     tool "vela_format" "Format a Vela program in the canonical style." [ source_p ] [ "source" ];
     tool "vela_caps" "List each function and the capabilities in its signature (its authority), or `pure`." [ source_p ] [ "source" ];
     tool "vela_type_at" "The type (or signature) at a position in a Vela program. line and character are 0-based."

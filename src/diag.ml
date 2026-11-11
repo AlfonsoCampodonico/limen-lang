@@ -28,7 +28,7 @@ let explanations = [
   "E0007", "An interpolation `{...}` cannot be empty. Write `\\{` for a literal brace.";
   "E0008", "Every function parameter needs a type, for example `fn f(x: Int)`. Vela only infers types inside function bodies.";
   "E0101", "A name was used that is not a local variable, function or enum variant in scope.";
-  "E0102", "A type name is not defined. Built-in types: Int, Float, Bool, Str, List, Array[T, N], Option, Result, IoError, Root, Net, Fs, Stdout, Clock, Listen, Listener, Conn, Rand, Stdin, Env.";
+  "E0102", "A type name is not defined. Built-in types: Int, Float, Bool, Str, List, Array[T, N], Option, Result, IoError, Root, Net, Fs, Stdout, Clock, Listen, Listener, Conn, Rand, Stdin, Env, Exec.";
   "E0103", "The struct (or Root) has no field with this name.";
   "E0104", "The enum has no such variant, or the variant name is ambiguous. Qualify it as `Enum.Variant`.";
   "E0105", "The type has no method with this name. User-defined types have no methods in phase 1; write a function that takes the value.";
@@ -51,9 +51,10 @@ let explanations = [
   "E0209", "Only variables, struct fields and list elements can be assigned to.";
   "E0301", "Capabilities (Root, Net, Fs, Stdout, Clock) cannot be stored in struct or enum fields. Authority must stay visible in function signatures, so pass capabilities as parameters.";
   "E0302", "Vela has no ambient I/O: there is no global print, open, http or clock. I/O goes through capability values. `main` receives `root: Root`; pass `root.stdout`, `root.fs`, `root.net` or `root.clock` to the functions that need them.";
-  "E0303", "`main` must be `fn main(root: Root)` or `fn main(root: Root) -> Result[(), E]`, with no type parameters.";
+  "E0303", "`main` must be `fn main(root: Root)`, `fn main(root: Root) -> Int` (the exit code), `fn main(root: Root) -> Result[(), E]` or `fn main(root: Root) -> Result[Int, E]`, with no type parameters. `root` may be left out.";
   "E0304", "Functions cannot be stored in struct or enum fields, because a stored closure could carry a capability out of sight.";
   "E0305", "Channels cannot be stored in struct or enum fields: like capabilities, they are passed as parameters or captured by a task's closure.";
+  "E0306", "A test can ask the runner for capabilities, and only these: `fs: Fs` (a fresh, writable temporary directory, removed after the test) and `clock: Clock`. Each at most once, for example `test \"saves\" (fs: Fs) { ... }`. For anything else, pass a fake through an interface.";
   "E0310", "A group handle can only be used as `g.go(closure)`, directly in the group's body: it cannot be stored, passed, returned or captured by a closure.";
   "E0311", "Code inside a `group` block cannot leave it early with `return` or `?`, because every task must finish before the group returns its results.";
   "E0320", "A dependency's functions take a capability that vela.toml does not grant it. Vela has no ambient authority, so the capabilities in a dependency's signatures are all it can ever use. Grant it with `caps = [\"net\"]` (net, fs, listen, stdout, clock) on its line in [dependencies], or use a dependency that needs less. No dependency can take Root. Standard library modules are checked the same way against src/std/vela.toml; an error there is a bug in the standard library.";

@@ -91,7 +91,7 @@ type fn = {
   body : stmt list;
 }
 
-type program = { fns : fn list; main : string; main_takes_root : bool; main_ret : ty; tests : string list (* C names, in order *) }
+type program = { fns : fn list; main : string; main_takes_root : bool; main_ret : ty; tests : (string * string list) list (* C names, in order, and the root fields each takes *) }
 
 (* Which atoms of an rhs are consumed (ownership moves) and which are only read. *)
 let consumed = function

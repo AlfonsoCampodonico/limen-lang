@@ -91,6 +91,13 @@ let tmpdir = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "vela-nati
 let () = try Unix.mkdir tmpdir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ()
 let native_enabled = Sys.getenv_opt "VELA_SKIP_NATIVE" = None
 
+(* VELA_NATIVE_ONLY=a,b runs the native half only for tests whose name starts with a or b. *)
+let native_for name =
+  native_enabled
+  && match Sys.getenv_opt "VELA_NATIVE_ONLY" with
+     | None | Some "" -> true
+     | Some l -> List.exists (fun p -> String.starts_with ~prefix:p name) (String.split_on_char ',' l)
+
 (* AddressSanitizer catches use-after-free and double free in the reference
    counting; VELA_LEAKCHECK reports objects still alive at exit. *)
 let sanitize = [ "-O1"; "-g"; "-fsanitize=address,undefined"; "-fno-sanitize-recover=all" ]
@@ -108,6 +115,7 @@ let run_native ?(grants = Interp.no_grants) ?modules name src =
       List.concat_map (fun h -> [ "--grant"; "net=" ^ h ]) grants.Interp.net
       @ List.concat_map (fun h -> [ "--grant"; "listen=" ^ h ]) grants.Interp.listen
       @ List.concat_map (fun n -> [ "--grant"; "env=" ^ n ]) grants.Interp.env
+      @ List.concat_map (fun n -> [ "--grant"; "exec=" ^ n ]) grants.Interp.exec
       @ (match grants.seed with Some s -> [ "--seed"; string_of_int s ] | None -> [])
       @ (match grants.fs with Some (d, ro) -> [ "--grant"; "fs=" ^ d ^ if ro then ":ro" else "" ] | None -> [])
       @ ("--" :: grants.args)
@@ -121,7 +129,7 @@ let run_native ?(grants = Interp.no_grants) ?modules name src =
     Ok (code, read_file o, read_file e)
 
 let check_native name ?grants ?modules src ~want_out ~want_err_prefix =
-  if native_enabled then
+  if native_for name then
     match run_native ?grants ?modules name src with
     | Error m -> ok (name ^ "/native") false m
     | Ok (code, o, e) -> (
@@ -137,7 +145,7 @@ let check_native name ?grants ?modules src ~want_out ~want_err_prefix =
 let tsan = [ "-O1"; "-g"; "-fsanitize=thread" ]
 
 let check_tsan name ?(grants = Interp.no_grants) src want =
-  if native_enabled then begin
+  if native_for name then begin
     let items, ds, _ = compile name src in
     let exe = Filename.concat tmpdir (name ^ "-tsan") in
     if ds <> [] then ok (name ^ "/tsan") false "does not compile"
@@ -149,6 +157,7 @@ let check_tsan name ?(grants = Interp.no_grants) src want =
         (match grants.Interp.fs with Some (d, ro) -> [ "--grant"; "fs=" ^ d ^ if ro then ":ro" else "" ] | None -> [])
         @ List.concat_map (fun h -> [ "--grant"; "net=" ^ h ]) grants.Interp.net
         @ List.concat_map (fun h -> [ "--grant"; "listen=" ^ h ]) grants.Interp.listen
+        @ List.concat_map (fun h -> [ "--grant"; "exec=" ^ h ]) grants.Interp.exec
       in
       let o = exe ^ ".out" and e = exe ^ ".err" in
       let cmd =
@@ -176,6 +185,23 @@ let panics name src want =
    | Error e -> ok name (e = "panic: " ^ want) (sprintf "got %S" e)
    | Ok (o, _) -> ok name false ("no panic, output " ^ o));
   check_native name src ~want_out:"" ~want_err_prefix:(Some ("panic: " ^ want ^ "\n"))
+
+(* A program that chooses its exit status: the same stdout and status from
+   both backends, and nothing leaked natively. *)
+let exits name ?grants src want_out want_code =
+  (match run ?grants name src with
+   | Ok (got, v) ->
+     let code = match v with Interp.VInt n | Interp.VEnum ("Result", "Ok", [ Interp.VInt n ]) -> Interp.exit_code n | Interp.VEnum ("Result", "Err", _) -> 1 | _ -> 0 in
+     ok name (got = want_out && code = want_code) (sprintf "got %S exit %d, want %S exit %d" got code want_out want_code)
+   | Error e -> ok name false e);
+  if native_for name then
+    match run_native ?grants name src with
+    | Error m -> ok (name ^ "/native") false m
+    | Ok (code, o, e) ->
+      ok (name ^ "/native")
+        (o = want_out && code = want_code
+         && (String.ends_with ~suffix:"vela-leakcheck: 0 live\n" e || String.starts_with ~prefix:"error: " e))
+        (sprintf "stdout %S exit %d stderr %S, want %S exit %d" o code e want_out want_code)
 
 (* Apply every fix's edits and return the new source. *)
 let apply_fixes src (ds : Diag.t list) =
@@ -742,6 +768,74 @@ fn client(net: Net, port: Int, k: Int) -> Int {
   panics "index-oob" (main_wrap "    let xs = [1]\n    out.print(\"{xs[3]}\")") "index 3 is out of range for a list of length 1";
   panics "panic-fn" (main_wrap "    panic(\"boom\")") "boom";
 
+  (* ---------- exit codes ---------- *)
+  exits "exit-int" "fn main(root: Root) -> Int {\n    root.stdout.print(\"bye\")\n    3\n}\n" "bye\n" 3;
+  exits "exit-zero" "fn main() -> Int { 0 }" "" 0;
+  exits "exit-low-bits" "fn main() -> Int { 256 + 7 }" "" 7;
+  exits "exit-result-ok"
+    "fn half(n: Int) -> Result[Int, Str] { if n % 2 == 0 { Ok(n / 2) } else { Err(\"odd\") } }\nfn main(root: Root) -> Result[Int, Str] {\n    let h = half(root.args().len() + 4)?\n    Ok(h)\n}\n"
+    "" 2;
+  exits "exit-result-err"
+    "fn main(root: Root) -> Result[Int, Str] {\n    let words = [\"a\"]\n    if words.len() == 1 { return Err(\"no\") }\n    Ok(4)\n}\n" "" 1;
+  exits "exit-after-group"
+    "fn main(root: Root) -> Int {\n    let r = group g {\n        g.go(|| 40)\n        g.go(|| 2)\n    }\n    root.stdout.print(\"{r.sum()}\")\n    r.sum() - 30\n}\n" "42\n" 12;
+  errs "main-returns-str" "fn main(root: Root) -> Str { \"x\" }" [ "E0303" ];
+  errs "main-returns-result-str" "fn main(root: Root) -> Result[Str, Str] { Ok(\"x\") }" [ "E0303" ];
+
+  (* ---------- Exec: running other programs ---------- *)
+  let sh = { Interp.no_grants with exec = [ "sh" ] } in
+  out "exec-run" ~grants:sh
+    (main_wrap {|    match root.exec.run("sh", ["-c", "echo hi $0; echo oops >&2; exit 7", "a b; rm -rf x"]) {
+        Ok(r) => out.print("{r.code} {r.stdout.trim()} {r.stderr.trim()} {r}"),
+        Err(e) => out.print("{e}"),
+    }|})
+    "7 hi a b; rm -rf x oops ProcessOutput { code: 7, stdout: \"hi a b; rm -rf x\\n\", stderr: \"oops\\n\" }\n";
+  out "exec-big-output" ~grants:sh
+    (main_wrap {|    let r = root.exec.run("sh", ["-c", "i=0; while [ $i -lt 3000 ]; do echo line $i; echo err $i >&2; i=$((i+1)); done"])
+    match r {
+        Ok(p) => out.print("{p.stdout.lines().len()} {p.stderr.lines().len()} {p.code}"),
+        Err(e) => out.print("{e}"),
+    }|})
+    "3000 3000 0\n";
+  out "exec-denied" ~grants:sh
+    (main_wrap "    out.print(\"{root.exec.run(\"ls\", [])}\")\n    out.print(\"{root.exec.only(\"ls\").run(\"sh\", [])}\")")
+    "Err(Denied(\"exec: `ls` is not granted\"))\nErr(Denied(\"exec: `sh` is not granted\"))\n";
+  out "exec-not-granted" (main_wrap "    out.print(\"{root.exec.run(\"sh\", [\"-c\", \"true\"])}\")")
+    "Err(Denied(\"exec: `sh` is not granted\"))\n";
+  out "exec-missing" ~grants:{ Interp.no_grants with exec = [ "*" ] }
+    (main_wrap "    out.print(\"{root.exec.run(\"vela-no-such-program\", [])}\")")
+    "Err(Failed(\"exec: cannot run `vela-no-such-program`: No such file or directory\"))\n";
+  out "exec-signal" ~grants:sh
+    (main_wrap "    out.print(\"{root.exec.run(\"sh\", [\"-c\", \"kill -9 $$\"]).map_err(|e| 0)}\")")
+    "Ok(ProcessOutput { code: 137, stdout: \"\", stderr: \"\" })\n";
+  out "exec-nul" ~grants:sh
+    (main_wrap "    out.print(\"{root.exec.run(\"sh\", [\"a\" + 0.to_char()])}\")")
+    "Err(Failed(\"exec: an argument contains a NUL byte\"))\n";
+  let exec_group = {|fn main(root: Root) {
+    let x = root.exec
+    let codes = group g {
+        for i in [1, 2, 3, 4, 5, 6] {
+            g.go(|| match x.run("sh", ["-c", "echo task $0; exit $0", i.to_str()]) {
+                Ok(r) => r.code * 10 + r.stdout.len(),
+                Err(_) => -1,
+            })
+        }
+    }
+    root.stdout.print("{codes}")
+}
+|} in
+  out "exec-group" ~grants:sh exec_group "[17, 27, 37, 47, 57, 67]\n";
+  check_tsan "exec-group" ~grants:sh exec_group "[17, 27, 37, 47, 57, 67]\n";
+  (* the child sees PATH and only the variables the Env grant names *)
+  let env_src = main_wrap {|    match root.exec.run("sh", ["-c", "echo $\{HOME:+home\} $\{PATH:+path\} $\{VELA_SECRET_TEST:-none\}"]) {
+        Ok(r) => out.write(r.stdout),
+        Err(e) => out.print("{e}"),
+    }|} in
+  Unix.putenv "VELA_SECRET_TEST" "s3cret";
+  out "exec-env-filtered" ~grants:sh env_src "path none\n";
+  out "exec-env-granted" ~grants:{ sh with env = [ "HOME"; "VELA_SECRET_TEST" ] } env_src "home path s3cret\n";
+  errs "exec-ambient" "fn main(root: Root) { system(\"ls\") }" [ "E0302" ];
+
   (* ---------- capabilities at runtime ---------- *)
   out "net-not-granted" (main_wrap "    out.print(\"{root.net.get(\"https://example.com/\")}\")")
     "Err(Denied(\"net: example.com:443 is not granted\"))\n";
@@ -780,6 +874,85 @@ fn client(net: Net, port: Int, k: Int) -> Int {
         }
     }|})
     "failed: URL host may only contain letters, digits, `.` and `-`\nfailed: URL host may only contain letters, digits, `.` and `-`\nfailed: URL host may only contain letters, digits, `.` and `-`\nfailed: bad port in URL\nfailed: bad port in URL\nfailed: URL host may only contain letters, digits, `.` and `-`\nfailed: URL contains spaces or non-ASCII characters\ndenied: net: evil.example:443 is not granted\n";
+  (* Net.get speaks HTTP/1.1 itself: a server task answers with canned responses *)
+  let http_src = {|fn serve(l: Listener, replies: List[Str]) -> Int {
+    let mut n = 0
+    for r in replies {
+        match l.accept() {
+            Ok(c) => {
+                let mut req = ""
+                while !req.contains("\r\n\r\n") {
+                    let chunk = c.read() ?? ""
+                    if chunk == "" {
+                        break
+                    }
+                    req = req + chunk
+                }
+                let reply = if r == "echo" { "HTTP/1.1 200 OK\r\nContent-Length: {req.len()}\r\n\r\n{req}" } else { r }
+                if c.write(reply).is_ok() {
+                    n = n + 1
+                }
+                c.close()
+            },
+            Err(_) => (),
+        }
+    }
+    n
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let out = root.stdout
+    let l = root.listen.on("127.0.0.1:0")?
+    let port = l.port()
+    let net = root.net.only("127.0.0.1")
+    let mut many = ""
+    let mut big = ""
+    let mut i = 0
+    while i < 1001 {
+        many = many + "X-N: {i}\r\n"
+        big = big + "0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz"
+        i = i + 1
+    }
+    let replies = [
+        "echo",
+        "echo",
+        "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nX-A: 1\r\nx-a:  2 \r\nContent-Length: 5\r\n\r\nnope!extra",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: Chunked\r\n\r\n4;ext=1\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n",
+        "HTTP/1.0 301 Moved\r\nLocation: http://elsewhere/\r\n\r\nuntil close",
+        "garbage",
+        "HTTP/1.1 200 OK\r\nContent-Length: 50\r\n\r\nshort",
+        "HTTP/1.1 200 OK\r\nbad header\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n",
+        "HTTP/1.1 200 OK\r\n" + many + "\r\nok",
+        "HTTP/1.1 200 OK\r\nX-Big: " + big + "\r\n\r\nok",
+    ]
+    let paths = ["/a/b?x=1#frag", "?q", "/", "/", "/", "/", "/", "/", "/", "/", "/"]
+    let served = group g {
+        g.go(|| serve(l, replies))
+        g.go(|| {
+            for p in paths {
+                match net.get("http://127.0.0.1:{port}" + p) {
+                    Ok(r) => {
+                        let first = r.body.lines().first() ?? ""
+                        out.print("{r.status} {r.headers.keys()} {r.headers.get("x-a")} {first}")
+                    },
+                    Err(e) => out.print("{e}"),
+                }
+            }
+            0
+        })
+    }
+    out.print("{served}")
+    out.print("{net.get("https://127.0.0.1:{port}/")}")
+    Ok(())
+}
+|} in
+  let http_want =
+    "200 [\"content-length\"] None GET /a/b?x=1 HTTP/1.1\n200 [\"content-length\"] None GET /?q HTTP/1.1\n404 [\"content-type\", \"x-a\", \"content-length\"] Some(\"1, 2\") nope!\n200 [\"transfer-encoding\"] None Wikipedia\n301 [\"location\"] None until close\nFailed(\"http: incomplete response headers\")\nFailed(\"http: truncated body\")\nFailed(\"http: malformed header line\")\nFailed(\"http: bad chunk size\")\nFailed(\"http: more than 1000 response headers\")\nFailed(\"http: response headers larger than 64 KiB\")\n[11, 0]\nErr(Failed(\"https is not supported yet (vela has no TLS); use an http:// URL\"))\n"
+  in
+  let http_grants = { Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] } in
+  out "net-get-http" ~grants:http_grants http_src http_want;
+  check_tsan "net-get-http" ~grants:http_grants http_src http_want;
   let dir = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "vela-test-%d" (Unix.getpid ())) in
   (try Unix.mkdir dir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
   (try Unix.mkdir (Filename.concat dir "sub") 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
@@ -942,6 +1115,70 @@ test "channels" {
       ok "vela-test-native" (got = want) (String.concat "; " (List.map (fun (n, m) -> n ^ "=" ^ Option.value ~default:"ok" m) got))
   end;
   errs "vela-test-duplicate" "test \"a\" {}\ntest \"a\" {}" [ "E0106" ];
+
+  (* tests can ask for a fresh directory as `fs: Fs` and the real clock *)
+  let cap_tests = {|fn save(fs: Fs, name: Str, n: Int) -> Result[(), IoError] {
+    fs.write(name, "{n}")
+}
+
+test "saves a file" (fs: Fs) {
+    assert_eq(fs.list(""), Ok([]))
+    assert(save(fs, "a.txt", 42).is_ok())
+    assert(fs.make_dir("sub").is_ok())
+    assert(fs.write("sub/b.txt", "x").is_ok())
+    assert_eq(fs.read("a.txt"), Ok("42"))
+    assert(fs.read("../escape").is_err())
+}
+
+test "each test starts empty" (fs: Fs, clock: Clock) {
+    assert_eq(fs.list(""), Ok([]))
+    assert(clock.now_ms() > 1700000000000)
+}
+
+test "clock only" (c: Clock) {
+    let a = c.now_ms()
+    assert(c.now_ms() >= a)
+}
+
+test "fails with a dir" (fs: Fs) {
+    assert(fs.write("x", "1").is_ok())
+    assert_eq(fs.list(""), Ok([]))
+}
+|} in
+  let items, ds, _ = compile "vela-test-caps" cap_tests in
+  ok "vela-test-caps-checks" (ds = []) (String.concat "," (codes ds));
+  let want =
+    [ ("saves a file", None); ("each test starts empty", None); ("clock only", None);
+      ("fails with a dir", Some "assertion failed: Ok([\"x\"]) != Ok([])") ]
+  in
+  let test_dirs () =
+    List.filter (String.starts_with ~prefix:"vela-test-") (Array.to_list (Sys.readdir (Filename.get_temp_dir_name ())))
+  in
+  let before = test_dirs () in
+  let got = List.map (fun (n, r) -> (n, match r with Ok () -> None | Error (m, _) -> Some m)) (Interp.run_tests ~out:ignore items) in
+  ok "vela-test-caps-interp" (got = want) (String.concat "; " (List.map (fun (n, m) -> n ^ "=" ^ Option.value ~default:"ok" m) got));
+  ok "vela-test-caps-cleanup" (List.for_all (fun d -> List.mem d before) (test_dirs ())) "test directories left behind";
+  if native_for "vela-test-caps" then begin
+    let exe = Filename.concat tmpdir "vela-test-caps" in
+    match Native.build ~flags:sanitize ~tests:true items exe with
+    | Error m -> ok "vela-test-caps-native" false m
+    | Ok () ->
+      List.iteri
+        (fun i (n, w) ->
+          let dir = Caps.test_dir () in
+          let e = exe ^ ".err" in
+          let code =
+            Sys.command
+              (sprintf "ASAN_OPTIONS=detect_leaks=0 VELA_LEAKCHECK=1 %s %d --grant fs=%s 2>%s" (Filename.quote exe) i (Filename.quote dir) (Filename.quote e))
+          in
+          Caps.remove_tree dir;
+          let err = read_file e in
+          match w with
+          | None -> ok ("vela-test-caps-native/" ^ n) (code = 0 && err = "vela-leakcheck: 0 live\n") (sprintf "exit %d, stderr %S" code err)
+          | Some m -> ok ("vela-test-caps-native/" ^ n) (code <> 0 && String.starts_with ~prefix:("panic: " ^ m) err) (sprintf "exit %d, stderr %S" code err))
+        want
+  end;
+  errs "vela-test-bad-cap" "test \"x\" (n: Net) {}\ntest \"y\" (a: Fs, b: Fs) {}\ntest \"z\" (c: Clock, d: Int) {}" [ "E0306"; "E0306"; "E0306" ];
 
   (* ---------- language server ---------- *)
   let module J = Json in
@@ -1248,7 +1485,7 @@ fn main(root: Root) {
   List.iter (fun d -> try Unix.mkdir d 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ())
     [ pdir; Filename.concat pdir "app"; Filename.concat pdir "fetch" ];
   let put f s = Out_channel.with_open_bin (Filename.concat pdir f) (fun oc -> output_string oc s) in
-  put "fetch/fetch.vela" "use util\n\npub fn get(net: Net, u: Str) -> Str {\n    util.first(net.get(u) ?? \"none\")\n}\n";
+  put "fetch/fetch.vela" "use util\n\npub fn get(net: Net, u: Str) -> Str {\n    match net.get(u) {\n        Ok(r) => util.first(r.body),\n        Err(_) => \"none\",\n    }\n}\n";
   put "fetch/util.vela" "pub fn first(s: Str) -> Str {\n    s.lines().first() ?? \"\"\n}\n\npub fn sneaky(fs: Fs) -> Bool {\n    fs.exists(\"x\")\n}\n";
   let app = "use fetch\n\nfn main(root: Root) {\n    root.stdout.print(fetch.get(root.net, \"http://h\"))\n}\n" in
   put "app/main.vela" app;

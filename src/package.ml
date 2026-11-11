@@ -32,9 +32,9 @@ type dep = { dname : string; dir : string; caps : string list; dspan : Span.t; s
    for grants; a dependency's never is. *)
 type t = { pname : string; file : string; deps : dep list; grants : (string * string) list }
 
-let grant_kinds = [ "net"; "fs"; "listen"; "env" ]
+let grant_kinds = [ "net"; "fs"; "listen"; "env"; "exec" ]
 
-let cap_grants = [ "net"; "fs"; "listen"; "stdout"; "clock"; "rand"; "stdin"; "env" ]
+let cap_grants = [ "net"; "fs"; "listen"; "stdout"; "clock"; "rand"; "stdin"; "env"; "exec" ]
 
 (* The grant that covers a capability type. *)
 let grant_of (c : Types.cap) =
@@ -48,6 +48,7 @@ let grant_of (c : Types.cap) =
   | Rand -> [ "rand" ]
   | Stdin -> [ "stdin" ]
   | Env -> [ "env" ]
+  | Exec -> [ "exec" ]
   | Root -> []
 
 exception Bad of Span.t * string
