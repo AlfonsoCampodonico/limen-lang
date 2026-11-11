@@ -14,7 +14,7 @@ type ty =
   | TGroup of ty (* handle of a `group` block whose tasks return ty *)
   | TArray of ty * int (* fixed-size array, a value type *)
   | TChan of ty (* channel between tasks *)
-  | TMap of ty * ty (* keys (Int, Str or Bool) to values, in insertion order *)
+  | TMap of ty * ty (* keys (Int, Str, Bool, or tuples, structs and enums of them) to values, in insertion order *)
   | TDyn of string (* a value of any type that satisfies the interface, boxed with its methods *)
   | TParam of string (* a generic parameter inside its own definition *)
   | TVar of tvar ref
