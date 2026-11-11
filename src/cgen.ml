@@ -1120,10 +1120,18 @@ let program (g : Lower.gctx) (prog : I.program) : string =
      mp "    buf_puts(&b_, \"\\n\"); fflush(stdout); fwrite(b_.p, 1, (size_t)b_.len, stderr); return 1;";
      mp "  }"
    | _ -> ());
+  (* `main` returning Int (or Ok(Int)) chooses the exit status; the OS keeps its low 8 bits *)
+  let code =
+    match rt with
+    | TInt -> "(int)(r_ & 255)"
+    | TNamed ("Result", [ TInt; _ ]) -> sprintf "(int)(%s & 255)" (payload_expr c rt "r_" 0 0)
+    | _ -> "0"
+  in
+  mp (sprintf "  int code_ = %s;" code);
   if not (is_scalar rt) then mp (sprintf "  %s_drop(r_);" (cname c rt)) else mp "  (void)r_;";
   mp "  fflush(stdout);";
   mp "  w_leakcheck();";
-  mp "  return 0;";
+  mp "  return code_;";
   mp "}"
   end;
   let types = Buffer.create 16384 in

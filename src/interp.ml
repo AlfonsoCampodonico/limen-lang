@@ -867,6 +867,11 @@ and cap_call rt c name args =
   | CConn fd, "write", [ VStr s ] -> sock_result (Sock.write fd s) (fun () -> VUnit)
   | _ -> failwith ("internal: capability method " ^ name)
 
+(* The status a process exits with when `main` returns [n]: the low 8 bits,
+   as the operating system keeps them (the native backend gets the same from
+   returning n from C's main). *)
+let exit_code n = Int64.to_int (Int64.logand n 255L)
+
 (* Run `main`. Returns its value, or the panic message and location. *)
 let run ~out ~grants (user_items : item list) : (value, string * Span.t) result =
   seed_rand grants.seed;

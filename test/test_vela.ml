@@ -91,6 +91,13 @@ let tmpdir = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "vela-nati
 let () = try Unix.mkdir tmpdir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ()
 let native_enabled = Sys.getenv_opt "VELA_SKIP_NATIVE" = None
 
+(* VELA_NATIVE_ONLY=a,b runs the native half only for tests whose name starts with a or b. *)
+let native_for name =
+  native_enabled
+  && match Sys.getenv_opt "VELA_NATIVE_ONLY" with
+     | None | Some "" -> true
+     | Some l -> List.exists (fun p -> String.starts_with ~prefix:p name) (String.split_on_char ',' l)
+
 (* AddressSanitizer catches use-after-free and double free in the reference
    counting; VELA_LEAKCHECK reports objects still alive at exit. *)
 let sanitize = [ "-O1"; "-g"; "-fsanitize=address,undefined"; "-fno-sanitize-recover=all" ]
@@ -121,7 +128,7 @@ let run_native ?(grants = Interp.no_grants) ?modules name src =
     Ok (code, read_file o, read_file e)
 
 let check_native name ?grants ?modules src ~want_out ~want_err_prefix =
-  if native_enabled then
+  if native_for name then
     match run_native ?grants ?modules name src with
     | Error m -> ok (name ^ "/native") false m
     | Ok (code, o, e) -> (
@@ -137,7 +144,7 @@ let check_native name ?grants ?modules src ~want_out ~want_err_prefix =
 let tsan = [ "-O1"; "-g"; "-fsanitize=thread" ]
 
 let check_tsan name ?(grants = Interp.no_grants) src want =
-  if native_enabled then begin
+  if native_for name then begin
     let items, ds, _ = compile name src in
     let exe = Filename.concat tmpdir (name ^ "-tsan") in
     if ds <> [] then ok (name ^ "/tsan") false "does not compile"
@@ -176,6 +183,23 @@ let panics name src want =
    | Error e -> ok name (e = "panic: " ^ want) (sprintf "got %S" e)
    | Ok (o, _) -> ok name false ("no panic, output " ^ o));
   check_native name src ~want_out:"" ~want_err_prefix:(Some ("panic: " ^ want ^ "\n"))
+
+(* A program that chooses its exit status: the same stdout and status from
+   both backends, and nothing leaked natively. *)
+let exits name ?grants src want_out want_code =
+  (match run ?grants name src with
+   | Ok (got, v) ->
+     let code = match v with Interp.VInt n | Interp.VEnum ("Result", "Ok", [ Interp.VInt n ]) -> Interp.exit_code n | Interp.VEnum ("Result", "Err", _) -> 1 | _ -> 0 in
+     ok name (got = want_out && code = want_code) (sprintf "got %S exit %d, want %S exit %d" got code want_out want_code)
+   | Error e -> ok name false e);
+  if native_for name then
+    match run_native ?grants name src with
+    | Error m -> ok (name ^ "/native") false m
+    | Ok (code, o, e) ->
+      ok (name ^ "/native")
+        (o = want_out && code = want_code
+         && (String.ends_with ~suffix:"vela-leakcheck: 0 live\n" e || String.starts_with ~prefix:"error: " e))
+        (sprintf "stdout %S exit %d stderr %S, want %S exit %d" o code e want_out want_code)
 
 (* Apply every fix's edits and return the new source. *)
 let apply_fixes src (ds : Diag.t list) =
@@ -741,6 +765,20 @@ fn client(net: Net, port: Int, k: Int) -> Int {
   panics "div-zero" (main_wrap "    let z = 0\n    out.print(\"{1 / z}\")") "division by zero";
   panics "index-oob" (main_wrap "    let xs = [1]\n    out.print(\"{xs[3]}\")") "index 3 is out of range for a list of length 1";
   panics "panic-fn" (main_wrap "    panic(\"boom\")") "boom";
+
+  (* ---------- exit codes ---------- *)
+  exits "exit-int" "fn main(root: Root) -> Int {\n    root.stdout.print(\"bye\")\n    3\n}\n" "bye\n" 3;
+  exits "exit-zero" "fn main() -> Int { 0 }" "" 0;
+  exits "exit-low-bits" "fn main() -> Int { 256 + 7 }" "" 7;
+  exits "exit-result-ok"
+    "fn half(n: Int) -> Result[Int, Str] { if n % 2 == 0 { Ok(n / 2) } else { Err(\"odd\") } }\nfn main(root: Root) -> Result[Int, Str] {\n    let h = half(root.args().len() + 4)?\n    Ok(h)\n}\n"
+    "" 2;
+  exits "exit-result-err"
+    "fn main(root: Root) -> Result[Int, Str] {\n    let words = [\"a\"]\n    if words.len() == 1 { return Err(\"no\") }\n    Ok(4)\n}\n" "" 1;
+  exits "exit-after-group"
+    "fn main(root: Root) -> Int {\n    let r = group g {\n        g.go(|| 40)\n        g.go(|| 2)\n    }\n    root.stdout.print(\"{r.sum()}\")\n    r.sum() - 30\n}\n" "42\n" 12;
+  errs "main-returns-str" "fn main(root: Root) -> Str { \"x\" }" [ "E0303" ];
+  errs "main-returns-result-str" "fn main(root: Root) -> Result[Str, Str] { Ok(\"x\") }" [ "E0303" ];
 
   (* ---------- capabilities at runtime ---------- *)
   out "net-not-granted" (main_wrap "    out.print(\"{root.net.get(\"https://example.com/\")}\")")

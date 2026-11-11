@@ -1240,13 +1240,13 @@ let check_main ctx (d : fn_decl) (s : fsig) =
   let ok_params = match s.ps with [] -> true | [ t ] -> repr t = TCap Root | _ -> false in
   let ok_ret =
     match repr s.ret with
-    | TUnit -> true
-    | TNamed ("Result", [ t; _ ]) -> repr t = TUnit
+    | TUnit | TInt -> true
+    | TNamed ("Result", [ t; _ ]) -> (match repr t with TUnit | TInt -> true | _ -> false)
     | _ -> false
   in
   if s.gen <> [] || not (ok_params && ok_ret) then
     err ctx "E0303" d.fn_span "`main` has the wrong signature"
-      ~notes:[ "write `fn main(root: Root)` or `fn main(root: Root) -> Result[(), E]`" ]
+      ~notes:[ "write `fn main(root: Root)`, `fn main(root: Root) -> Int` (the exit code) or `fn main(root: Root) -> Result[(), E]`" ]
 
 let check_pending ctx =
   List.iter

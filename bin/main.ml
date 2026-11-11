@@ -241,6 +241,7 @@ let cmd_run file grant_args prog_args =
   | Ok (Interp.VEnum ("Result", "Err", [ e ])) ->
     Printf.eprintf "error: %s\n" (Interp.show e);
     exit 1
+  | Ok (Interp.VInt n | Interp.VEnum ("Result", "Ok", [ Interp.VInt n ])) -> exit (Interp.exit_code n)
   | Ok _ -> exit 0
   | Error (m, sp) ->
     Printf.eprintf "panic: %s\n" m;
