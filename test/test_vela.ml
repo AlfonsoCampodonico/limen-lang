@@ -3052,6 +3052,35 @@ fn main(root: Root) {
   let _, ds, _ = Modules.load_and_check "std-http.vela" "use http\nuse json\n\nfn main(root: Root) {\n    root.stdout.print(http.reason(200))\n}\n" in
   ok "std-real-ok" (ds = []) (String.concat "; " (List.map (fun (d : Diag.t) -> d.code ^ " " ^ d.message) ds));
 
+  (* vela doc: doc comments directly above items, fields, variants and interface methods *)
+  let doc_src =
+    "// Geometry helpers.\n//\n// Second paragraph.\n\n// A point.\npub struct Point {\n    // Distance from the left.\n    x: Float,\n    y: Float,\n}\n\n// not a doc: a blank line follows\n\n// How far from the origin.\npub fn norm(self: Point) -> Float {\n    self.x\n}\n\npub enum Shape {\n    // A round one.\n    Circle(Float),\n    Dot,\n}\n\n// Things with an area.\npub interface Area {\n    // The area, in square units.\n    fn area(self) -> Float\n}\n\n// Shouts.\npub fn loud(self: Str) -> Str {\n    self.upper()\n}\n\n// Private.\nfn hidden() -> Int {\n    1\n}\n\npub fn pick[T: Area](xs: List[T], i: Int) -> T {\n    xs[i]\n}\n"
+  in
+  let md = Doc.load_source "geom" "geom.vela" doc_src in
+  let mdtext = Doc.markdown [ md ] in
+  let has s = Interp_util.find_sub mdtext s 0 <> None in
+  ok "doc-markdown"
+    (has "# Module `geom`\n\nGeometry helpers.\n\nSecond paragraph.\n"
+     && has "### struct `Point`\n\n```vela\npub struct Point {\n    x: Float,\n    y: Float,\n}\n```\n\nA point.\n\n- `x`: Distance from the left.\n"
+     && has "#### Methods\n\n```vela\npub fn norm(self: Point) -> Float\n```\n\nHow far from the origin.\n"
+     && has "- `Circle`: A round one.\n" && has "Things with an area.\n\n- `area`: The area, in square units.\n"
+     && has "## Methods on `Str`\n\n```vela\npub fn loud(self: Str) -> Str\n```\n\nShouts.\n"
+     && has "pub fn pick[T: Area](xs: List[T], i: Int) -> T\n"
+     && (not (has "hidden")) && not (has "not a doc"))
+    mdtext;
+  let all = Doc.markdown [ Doc.load_source ~all:true "geom" "geom.vela" doc_src ] in
+  ok "doc-all" (Interp_util.find_sub all "fn hidden() -> Int\n```\n\nPrivate.\n" 0 <> None) all;
+  let page = Doc.html [ md ] in
+  let hp s = Interp_util.find_sub page s 0 <> None in
+  ok "doc-html"
+    (hp "<!doctype html>" && hp "<p>How far from the origin.</p>" && hp "<h2>Methods on Str</h2>"
+     && hp "id=\"geom-Point\"" && hp "pick[T: Area](xs: List[T], i: Int) -&gt; T" && hp "<p>Geometry helpers.</p>\n<p>Second paragraph.</p>")
+    page;
+  (* every standard library module documents without error, and its functions have docs *)
+  let std = List.map (fun n -> Doc.load n) (Doc.std_names ()) in
+  let std_md = Doc.markdown std in
+  ok "doc-std" (List.length std = List.length !Modules.std_modules && Interp_util.find_sub std_md "pub fn sort_by[T]" 0 <> None) std_md;
+
   ok "fmt-use-pub"
     (Fmt.format ~file:"fu.vela" "use geom // g\npub   fn f() -> Int { 1 }\npub struct S { a: Int }\n"
      = "use geom  // g\n\npub fn f() -> Int { 1 }\n\npub struct S {\n    a: Int,\n}\n")

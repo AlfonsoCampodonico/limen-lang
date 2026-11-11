@@ -52,6 +52,7 @@ dune exec vela -- build examples/repos.vela -o repos && ./repos --grant net=api.
 | `vela explain CODE` | Explain an error code, for example `vela explain E0302`. |
 | `vela test FILE [--native]` | Run the file's `test "name" { ... }` blocks, each isolated. A test that declares `(fs: Fs)` gets a fresh temporary directory. |
 | `vela fmt FILE... [--write\|--check]` | Print the canonical formatting, rewrite files, or check them. |
+| `vela doc FILE\|MODULE... [--std] [--all] [--html] [-o OUT]` | Documentation from doc comments (the `//` lines directly above an item) and signatures, as Markdown or one static HTML page. `vela doc --std --html -o std.html` documents the standard library. |
 | `vela lsp` | Language server on stdin/stdout. |
 | `vela mcp` | MCP server for coding agents on stdin/stdout. |
 | `vela spec` | Print the language specification. |
