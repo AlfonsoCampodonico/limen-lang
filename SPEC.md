@@ -157,6 +157,7 @@ let p = a.add(b).add(c)
 - `self` must be the first parameter, and its type a struct or enum declared in the program, generic or not (E0110). Built-in types, `Option`, `Result` and `IoError` cannot get new methods.
 - A method is only called with a dot: `p.add(q)`, never `add(p, q)`. Its name does not clash with a plain function or with methods of other types, so `fn area(self: Circle)` and `fn area(self: Rect)` can both exist.
 - Methods take `self` by value like any parameter; to "change" a value, return the new one.
+- A method without the call is a value: `p.add` is a function that calls `add` on `p`, the same as `|q| p.add(q)`. Like a closure, it holds a copy of `p` taken when `p.add` is evaluated, so `[a, b].map(origin.add)` works and later changes to `p` do not reach it. This works for every method that can be called with a dot: user methods, `dyn` and interface-bounded methods, and built-in ones (`let say = out.print`), except `push` and `remove`, which change their receiver. (It is `p.add`, as in Go and Swift, and not `Point.add`: the value already knows its type, and `Name.x` is taken by enum variants and modules.)
 - In a module, only `pub fn` methods can be called from other modules (E0402).
 
 ### Interfaces

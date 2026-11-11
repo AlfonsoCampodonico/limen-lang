@@ -424,7 +424,7 @@ and check_expr_inner ctx f e : ty =
     let callee = { edesc = EField (recv, name, nsp); espan = Span.merge recv.espan nsp; ety = TErr; einst = [] } in
     check_call ctx f callee args e.espan
   | EMethod (recv, name, nsp, args) -> check_method ctx f e recv name nsp args
-  | EField (recv, name, nsp) -> check_field ctx f recv name nsp
+  | EField (recv, name, nsp) -> check_field ctx f e recv name nsp
   | EIndex (a, i) -> (
     let t = check_expr ctx f a in
     match repr t with
@@ -640,7 +640,7 @@ and check_call ctx f callee args sp =
       check_args ctx f args;
       TErr)
 
-and check_field ctx f recv name nsp =
+and check_field ctx f e recv name nsp =
   match recv.edesc with
   | EVar en when lookup f en = None && Hashtbl.mem ctx.enums en ->
     let vs = Hashtbl.find ctx.variants en in
@@ -651,7 +651,10 @@ and check_field ctx f recv name nsp =
     end
   | _ -> (
     let t = check_expr ctx f recv in
+    let arity = method_arity ctx t name in
     match repr t with
+    | TNamed (n, args) when Hashtbl.mem ctx.sfields n && not (List.mem_assoc name (struct_fields ctx n args)) && arity <> None ->
+      method_value ctx f e recv t name nsp (Option.get arity)
     | TNamed (n, args) when Hashtbl.mem ctx.sfields n -> (
       let fs = struct_fields ctx n args in
       match List.assoc_opt name fs with
@@ -660,6 +663,7 @@ and check_field ctx f recv name nsp =
         let notes = if Hashtbl.mem ctx.fns (n ^ "::" ^ name) then [ sprintf "`%s` is a method; call it with parentheses: `.%s()`" name name ] else [] in
         did_you_mean ctx ~notes "E0103" nsp (sprintf "struct `%s` has no field `%s`" n name) name (List.map fst fs);
         TErr)
+    | TCap Root when (not (List.mem_assoc name root_fields)) && arity <> None -> method_value ctx f e recv t name nsp (Option.get arity)
     | TCap Root -> (
       match List.assoc_opt name root_fields with
       | Some ft -> ft
@@ -670,12 +674,42 @@ and check_field ctx f recv name nsp =
     | TVar _ ->
       err ctx "E0207" recv.espan "the type of this value is not known here; add a type annotation";
       TErr
+    | _ when arity <> None -> method_value ctx f e recv t name nsp (Option.get arity)
     | t ->
       let notes =
-        if List.mem_assoc name (methods t) then [ sprintf "`%s` is a method; call it as `%s()`" name name ] else []
+        if List.mem_assoc name (methods t) then [ sprintf "`%s` changes its receiver in place, so it cannot be a value; call it as `%s(...)`" name name ] else []
       in
       err ctx ~notes "E0103" nsp (sprintf "`%s` has no field `%s`" (show t) name);
       TErr)
+
+(* How many arguments (besides the receiver) method [name] of a value of
+   type [t] takes, if it has one that can be used as a value. *)
+and method_arity ctx t name =
+  match repr t with
+  | TNamed (n, _) when Hashtbl.mem ctx.fns (n ^ "::" ^ name) -> Some (List.length (Hashtbl.find ctx.fns (n ^ "::" ^ name)).ps - 1)
+  | TDyn i -> Option.map (fun (ps, _) -> List.length ps) (Option.bind (Hashtbl.find_opt ifaces i) (List.assoc_opt name))
+  | TParam g ->
+    let bs = Option.value ~default:[] (List.assoc_opt g !cur_bounds) in
+    List.find_map (fun b -> Option.map (fun (ps, _) -> List.length ps) (Option.bind (Hashtbl.find_opt ifaces b) (List.assoc_opt name))) bs
+  | (TList _ | TMap _) when name = "push" || name = "remove" -> None (* they change the receiver *)
+  | t -> Option.map (fun mk -> List.length (fst (mk ()))) (List.assoc_opt name (methods t))
+
+(* `x.name` without a call, where `name` is a method: a closure that calls it
+   on the value `x` had when the expression ran, as if written
+   `{ let $recv = x; |a, b| $recv.name(a, b) }`. The rewritten tree is what
+   both backends see; [recv] is already checked. *)
+and method_value ctx f e recv rt name nsp arity =
+  let sp = e.espan in
+  let mk d = { edesc = d; espan = sp; ety = TErr; einst = [] } in
+  let params = List.init arity (fun i -> ("$a" ^ string_of_int i, None, sp)) in
+  let call = mk (EMethod (mk (EVar "$recv"), name, nsp, List.map (fun (n, _, _) -> mk (EVar n)) params)) in
+  let clo = mk (EClosure (params, call)) in
+  e.edesc <- EBlock { stmts = [ { sdesc = SLet (false, "$recv", recv.espan, None, recv); sspan = sp } ]; tail = Some clo; bspan = sp };
+  push f;
+  bind f "$recv" { vty = rt; vmut = false; vspan = recv.espan; vkind = KLet };
+  let t = check_expr ctx f clo in
+  pop f;
+  t
 
 and check_method ctx f e recv name nsp args =
   match recv.edesc with
@@ -1245,6 +1279,9 @@ and check_stmt ctx f s : bool =
     in
     let is_group = match lhs.edesc with EVar n -> (match lookup f n with Some (v, _) -> v.vkind = KGroup | None -> false) | _ -> false in
     let lt = if is_group then TErr else check_expr ctx f lhs in
+    (match lhs.edesc with
+     | EBlock _ -> err ctx "E0209" lhs.espan "a method cannot be assigned to"
+     | _ -> ());
     if through_map_entry lhs then
       err ctx "E0209" lhs.espan "a map entry can only be replaced whole"
         ~notes:[ "read it, change the copy, and store it back: `let mut e = m[k]` ... `m[k] = e`" ];
