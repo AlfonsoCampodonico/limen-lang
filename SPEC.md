@@ -422,14 +422,14 @@ let results = group g {
 - `g` can only be used as `g.go(...)` directly in the body. It cannot be stored, passed, returned, or used inside a closure (E0310).
 - The body cannot leave early with `return` or `?` (E0311), and `break` and `continue` cannot target loops outside the group.
 - Tasks share data by value, so there are no data races. A task reaches the world only through capabilities its closure captured. Spawning is not a capability.
-- Tasks are lightweight: natively each is a fiber with a small stack, scheduled on one worker thread per core (`VELA_THREADS` overrides this), and a task waiting on a group, a channel or a socket parks without blocking a thread. The interpreter runs tasks as coroutines. Output printed by tasks may interleave differently between the two.
-- If every task is waiting and nothing can wake one, the program panics with `all tasks are blocked (deadlock)` instead of hanging.
+- Tasks are lightweight: natively each is a fiber with a small stack, scheduled on one worker thread per core (`VELA_THREADS` overrides this), and a task waiting on a group, a channel, a socket, stdin or `clock.sleep(ms)` parks without blocking a thread. The interpreter runs tasks as coroutines. Output printed by tasks may interleave differently between the two.
+- If every task is waiting and nothing can wake one (no socket and no timer can), the program panics with `all tasks are blocked (deadlock)` instead of hanging.
 - A panic in a task ends only that task. The group still waits for the others, then passes the first panic on (section 15).
 
 ### Channels
 
 ```
-let c: Chan[Int] = channel(8)        // capacity at least 1
+let c: Chan[Int] = channel(8)        // holds up to 8 values; channel(0) holds none
 let total = group g {
     g.go(|| {
         for i in [1, 2, 3] { c.send(i) }
@@ -450,8 +450,9 @@ let total = group g {
 }
 ```
 
-- `channel(n)` creates a `Chan[T]` holding up to `n` values; `T` comes from the annotation or from use. A capacity below 1 panics.
-- `c.send(v)` waits while the channel is full; sending on a closed channel panics.
+- `channel(n)` creates a `Chan[T]` holding up to `n` values; `T` comes from the annotation or from use. A negative capacity panics.
+- `channel(0)` is unbuffered: `send` waits until a receiver takes the value, so sender and receiver meet. In a `select`, an unbuffered send arm is ready only while a receiver is waiting, and a receive arm only while a sender is waiting (or the channel is closed).
+- `c.send(v)` waits while the channel is full; sending on a closed channel panics, and so does a send that is waiting when the channel is closed.
 - `c.recv()` waits while the channel is empty and returns `Some(v)`; once the channel is closed and drained it returns `None`.
 - `c.close()` closes it; closing twice panics.
 - A channel is shared, not copied: tasks that capture the same channel talk through it.
@@ -477,11 +478,45 @@ while nums_open || words_open {
 }
 ```
 
-- An arm is `name = ch.recv()` (the name gets `Option[T]`; `None` means closed and empty), `ch.send(value)`, or `_`. Like `match`, `select` is an expression and every arm has the same type.
+- An arm is `name = ch.recv()` (the name gets `Option[T]`; `None` means closed and empty), `ch.send(value)`, a timeout `clock.after(ms)`, or `_`. Like `match`, `select` is an expression and every arm has the same type.
 - All channels, values and guards are evaluated first, in order. Then the first ready operation in the order written runs, so list the channel you want served first first. With no ready operation, `_` runs if there is one; otherwise `select` waits until one is ready.
 - A closed channel is always ready to receive (`None`), so turn its arm off with a guard: `if cond` after the operation skips the arm when `cond` is false. If every arm is off and there is no `_`, `select` panics instead of waiting forever.
 - A send arm that is not chosen sends nothing. A send arm on a closed channel panics, as `send` does.
-- There are no timeouts yet.
+- `clock.after(ms)` is ready once `ms` milliseconds have passed since the `select` started (after its operands were evaluated); `ms <= 0` is ready at once. It takes its place in the order like any arm, so a channel arm written before it still wins when both are ready. A `select` has at most one timeout (E0106), and not together with `_`, which never waits (E0003). `clock` must be the `Clock` capability itself; `after` exists only as a `select` arm.
+
+```
+let reply = select {
+    r = replies.recv() => r ?? "closed",
+    clock.after(500) => "timed out",
+}
+```
+
+To wait for something until a deadline across a loop, compute the remaining time each round: `clock.after(deadline - clock.now_ms())`.
+
+### Time
+
+```
+clock.sleep(250)                      // wait a quarter of a second
+```
+
+- `clock.sleep(ms)` waits at least `ms` milliseconds; other tasks keep running, and natively no thread waits. Time is measured on a monotonic clock, so changing the system time does not shorten or stretch a sleep.
+- Waiting needs the `Clock` capability like reading the time does, so a pure function cannot depend on timing. For deterministic tests, take the clock through an interface (`interface Sleeper { fn sleep(self, ms: Int) }`) and pass a fake that does not wait; `Clock` satisfies such interfaces (section 4).
+
+### Deadlines and cancellation
+
+```
+let pages = group g until clock.after(2000) {
+    for u in urls {
+        g.go(|| fetch(net, u))
+    }
+}
+// pages: List[Option[Str]], None for each fetch still running at the deadline
+```
+
+- `group g until clock.after(ms) { body }` gives the group a deadline `ms` milliseconds after it starts. Its value is a `List[Option[T]]`, in start order: `Some(v)` for a task that finished, `None` for a task the deadline cancelled.
+- At the deadline every task still running is cancelled. A cancelled task stops at a wait: if it is waiting (on a channel, a `select`, `clock.sleep`, a socket, stdin or a group) it stops at once; otherwise it stops when it next has to wait. Code that does not wait cannot be stopped, and a task that finishes without waiting again keeps its result. A task started after the deadline never runs, and `ms <= 0` cancels every task before it starts.
+- A cancelled task unwinds as a panic does: everything it owns is freed and sockets it holds are closed. A group the task is running cancels its own tasks too and waits for them. `catch` inside the task does not stop a cancellation, and a cancellation is not a panic: the group passes nothing on for it. A panic in another task of the group is still passed on once every task has stopped.
+- The deadline cancels the tasks, not the body: keep the body to starting tasks and do blocking work, like `accept`, inside a task.
 
 ### Sockets
 
@@ -506,7 +541,7 @@ fn main(root: Root) -> Result[(), IoError] {
 - `Listener.accept()` waits for a connection. `Net.connect("host:port")` opens one.
 - `Conn.read()` waits for data and returns what arrived; `""` means the peer closed. `Conn.write(s)` sends all of `s`. Both return `Result`.
 - `close()` on a `Listener` or `Conn` makes any task waiting on it get `Err(Failed("... is closed"))`.
-- Use one task at a time to read a given connection (and one to write it).
+- One task at a time reads a connection or accepts on a listener, and one writes a connection. A `read`, `accept` or `write` that has to wait while another task is already waiting for the same thing returns `Err(Failed("another task is already reading this connection"))` (or `accepting on this listener`, `writing this connection`) instead of mixing their data; one that can go on at once is not refused. Both backends behave alike.
 
 ### Running programs
 
@@ -639,9 +674,10 @@ Strings compare byte by byte, so `c >= "a" && c <= "z"` tests a one-byte string.
 | `Stdout` | `print(s)` | `()`, writes `s` and a newline |
 | `Stdout` | `write(s)` | `()`, writes `s` |
 | `Clock` | `now_ms()` | `Int`, milliseconds since the Unix epoch |
+| `Clock` | `sleep(ms)` | `()`, waits `ms` milliseconds (section 10); returns at once if `ms <= 0` |
 | `Rand` | `int(lo, hi)` | `Int` in `lo` up to but not including `hi`; panics if `hi <= lo` |
 | `Rand` | `float()` | `Float` in [0, 1) |
-| `Stdin` | `read_line()` | `Option[Str]`, without the newline; `None` at the end of input |
+| `Stdin` | `read_line()` | `Option[Str]`, without the newline (or `\r\n`); `None` at the end of input. Waiting for input parks the task; one task reads at a time, so tasks reading together each get whole lines |
 | `Stdin` | `read_all()` | `Str`, the rest of the input |
 | `Env` | `get(name)` | `Option[Str]`; `None` if unset or not granted |
 | `Net` | `get(url)` | `Result[HttpResponse, IoError]`: `status`, `headers` (`Map[Str, Str]`, lowercased names), `body`; http only (section 10) |
@@ -816,8 +852,11 @@ primary    = INT | FLOAT | STRING | "true" | "false"
            | block
            | "if" expr_ns block [ "else" ( block | if ) ]
            | "match" expr_ns "{" { pattern "=>" expr ( "," | NL ) } "}"
+           | "select" "{" { selarm ( "," | NL ) } "}"
            | "|" [ cparam { "," cparam } ] "|" expr | "||" expr
-           | "group" IDENT block ;
+           | "group" IDENT [ "until" expr ] block ;   (* until clock.after(ms) *)
+selarm     = ( IDENT "=" expr | expr | "_" ) [ "if" expr ] "=>" expr ;
+                                                (* ch.recv(), ch.send(v) or clock.after(ms) *)
 init       = IDENT [ ":" expr ] ;
 cparam     = IDENT [ ":" type ] ;
 pattern    = "_" | IDENT | [ "-" ] INT | STRING | "true" | "false"
@@ -958,4 +997,4 @@ The handler is a plain function value, so it gets no capability unless a closure
 
 ## 20. Not yet
 
-Unbuffered (capacity 0) channels, timeouts in `select`, TLS, SQL, a package registry, and a Cranelift backend. See the design doc's Known gaps for the full list.
+TLS, SQL, a package registry, and a Cranelift backend. See the design doc's Known gaps for the full list.

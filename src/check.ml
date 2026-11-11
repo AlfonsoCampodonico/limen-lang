@@ -87,7 +87,7 @@ let ambient =
     ("open", "Fs", "fs.read(path)"); ("read_file", "Fs", "fs.read(path)");
     ("write_file", "Fs", "fs.write(path, text)"); ("fetch", "Net", "net.get(url)");
     ("http_get", "Net", "net.get(url)"); ("now", "Clock", "clock.now_ms()");
-    ("time", "Clock", "clock.now_ms()"); ("random", "Rand", "rand.int(lo, hi)");
+    ("time", "Clock", "clock.now_ms()"); ("sleep", "Clock", "clock.sleep(ms)"); ("random", "Rand", "rand.int(lo, hi)");
     ("rand", "Rand", "rand.int(lo, hi)"); ("input", "Stdin", "stdin.read_line()");
     ("read_line", "Stdin", "stdin.read_line()"); ("getenv", "Env", "env.get(name)");
     ("system", "Exec", "exec.run(program, args)"); ("spawn", "Exec", "exec.run(program, args)");
@@ -306,7 +306,7 @@ let methods (t : ty) : (string * (unit -> ty list * ty)) list =
       m "is_dir" [ TStr ] TBool;
       m "exists" [ TStr ] TBool; m "under" [ TStr ] (TCap Fs); m "read_only" [] (TCap Fs) ]
   | TCap Stdout -> [ m "print" [ TStr ] TUnit; m "write" [ TStr ] TUnit ]
-  | TCap Clock -> [ m "now_ms" [] TInt ]
+  | TCap Clock -> [ m "now_ms" [] TInt; m "sleep" [ TInt ] TUnit ]
   | TCap Rand -> [ m "int" [ TInt; TInt ] TInt; m "float" [] TFloat ]
   | TCap Stdin -> [ m "read_line" [] (opt TStr); m "read_all" [] TStr ]
   | TCap Env -> [ m "get" [ TStr ] (opt TStr) ]
@@ -431,8 +431,19 @@ and check_expr_inner ctx f e : ty =
   | EClosure (ps, body) -> check_closure ctx f ps body None
   | EStruct (name, nsp, fields) -> check_struct_lit ctx f name nsp fields e.espan
   | EDyn (x, i) -> ignore (check_expr ctx f x); TDyn i
-  | EGroup (name, b) ->
+  | EGroup (name, until, b) ->
     let t = fresh () in
+    Option.iter
+      (fun (clk, ms) ->
+        (match repr (check_expr ctx f clk) with
+         | TCap Clock | TErr -> ()
+         | TVar _ as ct -> unify_at ctx clk.espan (TCap Clock) ct
+         | ct ->
+           err ctx "E0201" clk.espan
+             ~notes:[ "a group deadline is `group g until clock.after(ms) { ... }`, with the `Clock` from `root.clock`" ]
+             (sprintf "`after` in a group deadline needs a `Clock`, found `%s`" (show ct)));
+        expect ctx f ms TInt)
+      until;
     push f;
     bind f name { vty = TGroup t; vmut = false; vspan = e.espan; vkind = KGroup };
     let saved_loops = f.loops in
@@ -442,7 +453,8 @@ and check_expr_inner ctx f e : ty =
     f.in_group <- f.in_group - 1;
     f.loops <- saved_loops;
     pop f;
-    TList t
+    (* with a deadline, a task cancelled by it has no result: None *)
+    if until = None then TList t else TList (opt t)
 
 (* Check [e] against an expected type; closures get their parameter types from it. *)
 and expect ctx f e want =
@@ -752,6 +764,9 @@ and check_method_value ctx f e recv name nsp args =
           [ sprintf "`%s` is a field; access it without parentheses" name ]
         | TCap Root when List.mem_assoc name root_fields ->
           [ sprintf "`%s` is a field of `Root`; write `root.%s`" name name ]
+        | TCap Clock when name = "after" ->
+          [ "`clock.after(ms)` is a timeout: use it as a `select` arm, `clock.after(ms) => ...`, or as a group deadline, `group g until clock.after(ms) { ... }`";
+            "to wait, call `clock.sleep(ms)`" ]
         | TNamed (n, _) when ms = [] -> (
           match user_methods ctx n with
           | [] -> [ sprintf "`%s` has no methods; define one as `fn %s(self: %s) { ... }`" n name n ]
@@ -1135,6 +1150,12 @@ and check_select ctx f arms sp =
     arms;
   if List.length defaults = List.length arms then
     err ctx "E0003" sp "`select` needs at least one channel arm: `v = ch.recv() => ...` or `ch.send(x) => ...`";
+  let afters = List.filter (fun a -> match a.sop with SelAfter _ -> true | _ -> false) arms in
+  (match afters with
+   | _ :: second :: _ -> err ctx "E0106" second.sspan_ "`select` has more than one `clock.after` arm"
+   | _ -> ());
+  if afters <> [] && defaults <> [] then
+    err ctx "E0003" (List.hd afters).sspan_ "a `select` with a `_` arm never waits, so it cannot also have a `clock.after` timeout";
   let rt = fresh () in
   let chan_el ch =
     let ct = check_expr ctx f ch in
@@ -1153,6 +1174,15 @@ and check_select ctx f arms sp =
          let el = chan_el ch in
          Option.iter (fun (n, nsp) -> bind f n { vty = opt el; vmut = false; vspan = nsp; vkind = KPat }) b
        | SelSend (ch, v) -> let el = chan_el ch in expect ctx f v el
+       | SelAfter (clk, ms) ->
+         (match repr (check_expr ctx f clk) with
+          | TCap Clock | TErr -> ()
+          | TVar _ as t -> unify_at ctx clk.espan (TCap Clock) t
+          | t ->
+            err ctx "E0201" clk.espan
+              ~notes:[ "a timeout arm is `clock.after(ms) => ...`, with the `Clock` from `root.clock`" ]
+              (sprintf "`after` in a `select` needs a `Clock`, found `%s`" (show t)));
+         expect ctx f ms TInt
        | SelDefault -> ());
       expect ctx f a.sbody rt;
       pop f)

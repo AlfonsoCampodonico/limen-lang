@@ -260,6 +260,11 @@ and expr_inner c ind e =
            add c ".send(";
            expr c (ind + 4) v;
            add c ")"
+         | SelAfter (clk, ms) ->
+           expr c (ind + 4) clk;
+           add c ".after(";
+           expr c (ind + 4) ms;
+           add c ")"
          | SelDefault -> add c "_");
         (match a.sguard with Some g -> add c " if "; expr c (ind + 4) g | None -> ());
         add c " => ";
@@ -278,8 +283,16 @@ and expr_inner c ind e =
         ("|" ^ String.concat ", " (List.map (fun (n, t, _) -> match t with Some t -> n ^ ": " ^ ty t | None -> n) ps) ^ "|");
     add c " ";
     expr c ind body
-  | EGroup (name, b) ->
+  | EGroup (name, until, b) ->
     add c ("group " ^ name ^ " ");
+    (match until with
+     | Some (clk, ms) ->
+       add c "until ";
+       expr c ind clk;
+       add c ".after(";
+       expr c ind ms;
+       add c ") "
+     | None -> ());
     block c ind b
   | EDyn (x, _) -> expr c ind x
 

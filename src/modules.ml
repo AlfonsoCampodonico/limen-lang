@@ -234,7 +234,7 @@ let rec expr env locals (e : expr) : expr =
         | None -> ( match Hashtbl.find_opt env.own n with Some (IStruct _) -> qual env.self n | _ -> n)
       in
       EStruct (n, sp, List.map (fun (f, fsp, x) -> (f, fsp, ex x)) fields)
-    | EGroup (g, b) -> EGroup (g, block env (g :: locals) b)
+    | EGroup (g, until, b) -> EGroup (g, Option.map (fun (c, ms) -> (ex c, ex ms)) until, block env (g :: locals) b)
     | EDyn (x, i) -> EDyn (ex x, i)
     | ESelect arms ->
       ESelect
@@ -246,6 +246,7 @@ let rec expr env locals (e : expr) : expr =
                let locals' = match b with Some (n, _) -> n :: locals | None -> locals in
                { a with sop = SelRecv (b, ex c); sbody = expr env locals' a.sbody }
              | SelSend (c, v) -> { a with sop = SelSend (ex c, ex v); sbody = ex a.sbody }
+             | SelAfter (c, ms) -> { a with sop = SelAfter (ex c, ex ms); sbody = ex a.sbody }
              | SelDefault -> { a with sbody = ex a.sbody })
            arms)
   in

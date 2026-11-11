@@ -259,7 +259,8 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
           line (sprintf "sel%d_ops[%d] = (WSelOp){ %s, 0, &sel%d_v%d, 0, %s };" id i (a ch) id i (a on))
         | I.SSend (ch, v, el, on) ->
           line (sprintf "%s sel%d_s%d = %s;" (ctype c el) id i (a v));
-          line (sprintf "sel%d_ops[%d] = (WSelOp){ %s, 1, &sel%d_s%d, 0, %s };" id i (a ch) id i (a on)))
+          line (sprintf "sel%d_ops[%d] = (WSelOp){ %s, 1, &sel%d_s%d, 0, %s };" id i (a ch) id i (a on))
+        | I.SAfter (_, ms, on) -> line (sprintf "sel%d_ops[%d] = (WSelOp){ NULL, 2, NULL, 0, %s, %s };" id i (a on) (a ms)))
       ops;
     set (sprintf "w_select(sel%d_ops, %d, %d, %s)" id n (if has_default then 1 else 0) (where sp));
     (* a value that was not sent is still ours *)
@@ -287,6 +288,7 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     line (sprintf "    %s = %s;" dst (mk_enum c t 0 [ "r_" ]));
     line "  } else {";
     line "    w_catch_release(&c_);";
+    line "    if (c_.cancel) w_cancel_unwind();   /* a cancellation passes through `catch` */";
     line "    WStr *m_ = Str_from(c_.msg, (int64_t)strlen(c_.msg));";
     line "    free(c_.msg); free(c_.where);";
     line (sprintf "    %s = %s;" dst (mk_enum c t 1 [ "m_" ]));
@@ -338,20 +340,30 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
   | I.Interp parts ->
     show_into (List.map (function I.IStr s -> `Lit s | I.IVal (x, ty) -> `Val (a x, ty) | I.IValQ (x, ty) -> `ValQ (a x, ty)) parts)
   | I.RootField (x, f) -> set (sprintf "Cap_root_field(%s, %s)" (a x) (c_string f))
-  | I.GroupNew -> set "w_group_new()"
+  | I.GroupNew None -> set "w_group_new()"
+  | I.GroupNew (Some (_, ms)) -> set (sprintf "w_group_new_until(%s)" (a ms))
   | I.Spawn (g, task, rt) ->
     if not (List.mem rt c.task_tys) then c.task_tys <- c.task_tys @ [ rt ];
     line (sprintf "w_spawn(%s, %s, wtask_%s, sizeof(%s));" (a g) (a task) (cname c rt) (ctype c rt));
     set "0"
-  | I.GroupJoin (g, lty) ->
+  | I.GroupJoin (g, lty, until) ->
     let el = match lty with TList e -> e | _ -> TUnit in
     let n = cname c lty in
     line "{";
     line (sprintf "  WGroup* g_ = %s;" (a g));
-    line "  w_group_wait(g_);";
+    line "  w_group_wait(g_, 1);";
     line "  w_group_reraise(g_);";
     line (sprintf "  %s* l_ = %s_new(g_->n);" n n);
-    line (sprintf "  for (int64_t i_ = 0; i_ < g_->n; i_++) memcpy(&l_->data[i_], g_->tasks[i_]->slot, sizeof(%s));" (ctype c el));
+    if until then begin
+      (* a cancelled task has no result: None *)
+      let rt = match el with TNamed ("Option", [ r ]) -> r | _ -> TUnit in
+      line "  for (int64_t i_ = 0; i_ < g_->n; i_++) {";
+      line (sprintf "    if (g_->tasks[i_]->cancelled) l_->data[i_] = %s;" (mk_enum c el 1 []));
+      line (sprintf "    else { %s r_; memcpy(&r_, g_->tasks[i_]->slot, sizeof(%s)); l_->data[i_] = %s; }" (ctype c rt) (ctype c rt) (mk_enum c el 0 [ "r_" ]));
+      line "  }"
+    end
+    else
+      line (sprintf "  for (int64_t i_ = 0; i_ < g_->n; i_++) memcpy(&l_->data[i_], g_->tasks[i_]->slot, sizeof(%s));" (ctype c el));
     line "  l_->len = g_->n;";
     line "  w_group_release_tasks(g_);";
     line (sprintf "  %s = l_;" dst);
@@ -491,6 +503,7 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     | "cap_print", TCap Stdout -> line (sprintf "Cap_print(%s, true);" (arg 1)); set "0"
     | "cap_write", TCap Stdout -> line (sprintf "Cap_print(%s, false);" (arg 1)); set "0"
     | "cap_now_ms", _ -> set "Cap_now_ms()"
+    | "cap_sleep", TCap Clock -> line (sprintf "Cap_sleep(%s);" (arg 1)); set "0"
     | "cap_int", TCap Rand -> set (sprintf "Cap_rand_int(%s, %s, %s)" (arg 1) (arg 2) (where sp))
     | "cap_float", TCap Rand -> set "Cap_rand_float()"
     | "cap_args", TCap Root -> set "Cap_args()"

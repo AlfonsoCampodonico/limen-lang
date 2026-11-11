@@ -73,7 +73,7 @@ selarm    ::= (ident sp "=" ws expr | expr) (sp1 "if" sp1 expr)? sp "=>" ws expr
 arm       ::= pattern sp "=>" ws expr
 closure   ::= "|" ws (cparam (isep cparam)* ws)? "|" ws expr | "||" ws expr
 cparam    ::= ident (sp ":" sp type)?
-group     ::= "group" sp1 ident sp block
+group     ::= "group" sp1 ident (sp1 "until" sp1 expr)? sp block
 
 pattern ::= "-"? int | plainstr | ident ("." ident)? (sp "(" ws pattern (isep pattern)* (ws ",")? ws ")")? | tpat
 

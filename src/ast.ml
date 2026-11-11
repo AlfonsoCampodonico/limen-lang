@@ -48,7 +48,8 @@ and expr_desc =
   | EBlock of block
   | EClosure of (string * ty_expr option * span) list * expr
   | EStruct of string * span * (string * span * expr) list
-  | EGroup of string * block
+  | EGroup of string * (expr * expr) option * block
+      (* `group g until clock.after(ms) { ... }`: the deadline's clock and milliseconds *)
   | EDyn of expr * string (* inserted by the checker: box a value as `dyn Interface` *)
   | ESelect of sel_arm list
 
@@ -59,6 +60,7 @@ and sel_arm = { sop : sel_op; sguard : expr option (* `if cond`: skip the arm wh
 and sel_op =
   | SelRecv of (string * span) option * expr (* binding (None: `_ =` or no binding), channel *)
   | SelSend of expr * expr (* channel, value *)
+  | SelAfter of expr * expr (* `clock.after(ms)`: clock, milliseconds *)
   | SelDefault
 and arm = { apat : pat; abody : expr }
 and block = { stmts : stmt list; tail : expr option; bspan : span }

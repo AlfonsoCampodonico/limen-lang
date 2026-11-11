@@ -20,7 +20,9 @@ type cap =
 
 (* A socket that knows when it was closed, so a task waiting on it never
    touches a descriptor number that has been reused. *)
-and sock = { fd : Unix.file_descr; mutable shut : bool }
+and sock = { fd : Unix.file_descr; mutable shut : bool; mutable reading : bool; mutable writing : bool }
+(* reading / writing: a task is in a read (or accept) / a write that has had
+   to wait; as natively, another that has to wait meanwhile fails *)
 
 (* Map keys: Int, Str or Bool. *)
 type mkey = KInt of int64 | KStr of string | KBool of bool
@@ -45,13 +47,30 @@ type value =
   | VCtor of string * string
   | VPanicFn
   | VCap of cap
-  | VGroup of (value, string * Span.t) result option ref list ref
-      (* outcomes of spawned tasks, newest first: a value, or the panic that ended the task *)
+  | VGroup of group
   | VChan of chan
   | VChanFn
   | VBuiltin of string (* assert, assert_eq *)
 
-and chan = { q : value Queue.t; cap : int; mutable closed : bool }
+(* A channel as natively: a buffer of up to [cap] values (none when cap is
+   0), and queues of tasks waiting to send and to receive. *)
+and chan = { q : value Queue.t; cap : int; mutable closed : bool; rq : waiter Queue.t; sq : waiter Queue.t }
+
+(* A waiting task. A `select` puts one on every channel it waits on, all
+   sharing one claim; the first operation to happen sets [fired] to its
+   index, and the other waiters are then stale. -1: still waiting; -2:
+   given up (cancelled). [v] is the value to send, or the value received. *)
+and claim = { mutable fired : int }
+and waiter = { claim : claim; idx : int; mutable v : value; mutable ok : bool }
+
+(* A task's cancel flag: set by its group's deadline, seen at its next wait. *)
+and task = { mutable cancelled : bool }
+
+(* How a task ended: its value, the panic that ended it, or cancellation. *)
+and outcome = Done of value | Failed of string * Span.t | Stopped
+
+(* The tasks of a group, newest first, and whether its deadline has passed. *)
+and group = { mutable tasks : (task * outcome option ref) list; mutable gcancelled : bool }
 
 (* A persistent map, so updates are cheap and values stay values. Each entry
    remembers when its key was first inserted, for insertion-order iteration. *)
@@ -63,6 +82,9 @@ exception Return of value
 exception Break_
 exception Continue_
 exception Panic of string * Span.t
+
+(* A cancelled task stopping at a wait. `catch` does not catch it. *)
+exception Cancelled
 
 type grants = {
   net : string list;
@@ -284,29 +306,138 @@ let binop op a b sp =
 
 (* ---------- cooperative scheduler ----------
    Tasks are coroutines built on OCaml 5 effects. A task that cannot go on
-   performs Block with the condition it waits for (and optionally a socket to
-   poll); the scheduler resumes the first task whose condition holds. *)
+   performs Block with the condition it waits for, optionally a socket to
+   poll and a time to wake up at; the scheduler resumes the first task whose
+   condition holds, and when none can go on it sleeps until a socket is
+   ready or the earliest wake-up time. *)
 
 type io_wait = (sock * bool) option (* socket, true = wait for writing *)
-type _ Effect.t += Block : (unit -> bool) * io_wait -> unit Effect.t
+type _ Effect.t += Block : (unit -> bool) * io_wait * float option -> unit Effect.t
 
-let runq : ((unit -> bool) * io_wait * (unit -> unit)) Queue.t = Queue.create ()
+let runq : ((unit -> bool) * io_wait * float option * (unit -> unit)) Queue.t = Queue.create ()
 let io_epoch = ref 0 (* advances after each round of waiting for I/O *)
 
-let wait_until ?io cond = if not (cond ()) then Effect.perform (Block (cond, io))
+let now () = Unix.gettimeofday ()
 
-let rec run_fiber (f : unit -> unit) =
-  Effect.Deep.match_with f ()
+(* The task running now; main and tests run as tasks nobody cancels. *)
+let current = ref { cancelled = false }
+
+(* Wait until [cond] holds. A cancelled task stops instead (raising
+   Cancelled) unless [cancellable] is false, which is only for joining the
+   tasks of a group that is being abandoned. As natively, an operation that
+   can go on at once does not look at the cancel flag. *)
+let wait_until ?io ?at ?(cancellable = true) cond =
+  if not (cond ()) then begin
+    let t = !current in
+    if cancellable && t.cancelled then raise Cancelled;
+    let c = if cancellable then fun () -> cond () || t.cancelled else cond in
+    Effect.perform (Block (c, io, at));
+    if cancellable && not (cond ()) then raise Cancelled
+  end
+
+let rec run_fiber t (f : unit -> unit) =
+  Effect.Deep.match_with (fun () -> current := t; f ()) ()
     { retc = (fun () -> ());
       exnc = raise;
       effc =
         (fun (type a) (e : a Effect.t) ->
           match e with
-          | Block (cond, io) ->
-            Some (fun (k : (a, unit) Effect.Deep.continuation) -> Queue.push (cond, io, fun () -> Effect.Deep.continue k ()) runq)
+          | Block (cond, io, at) ->
+            Some
+              (fun (k : (a, unit) Effect.Deep.continuation) ->
+                Queue.push (cond, io, at, fun () -> current := t; Effect.Deep.continue k ()) runq)
           | _ -> None) }
 
-let spawn_fiber f = Queue.push ((fun () -> true), None, fun () -> run_fiber f) runq
+let spawn_fiber t f = Queue.push ((fun () -> true), None, None, fun () -> run_fiber t f) runq
+
+(* The deadline passed: cancel every task still running, and every task
+   started from now on. *)
+let cancel_group g =
+  g.gcancelled <- true;
+  List.iter (fun (t, r) -> if !r = None then t.cancelled <- true) g.tasks
+
+let group_finished g = List.for_all (fun (_, r) -> !r <> None) g.tasks
+
+(* ---------- channels ---------- *)
+
+(* The next waiter that can still be woken; claim it for operation [w.idx]. *)
+let rec pop_live q =
+  match Queue.take_opt q with
+  | None -> None
+  | Some w when w.claim.fired = -1 -> w.claim.fired <- w.idx; Some w
+  | Some _ -> pop_live q
+
+let remove_waiter q w =
+  let keep = Queue.fold (fun acc x -> if x == w then acc else x :: acc) [] q in
+  Queue.clear q;
+  List.iter (fun x -> Queue.push x q) (List.rev keep)
+
+(* Try a send without waiting: handed to a waiting receiver, or buffered. *)
+let try_send ch v =
+  if ch.closed then `Closed
+  else
+    match pop_live ch.rq with
+    | Some r -> r.v <- v; r.ok <- true; `Done
+    | None -> if Queue.length ch.q < ch.cap then (Queue.push v ch.q; `Done) else `Blocked
+
+(* Try a receive without waiting: from the buffer (then a waiting sender
+   refills it), or straight from a waiting sender (unbuffered). *)
+let try_recv ch =
+  if not (Queue.is_empty ch.q) then begin
+    let v = Queue.pop ch.q in
+    (match pop_live ch.sq with Some s -> Queue.push s.v ch.q; s.ok <- true | None -> ());
+    `Got v
+  end
+  else
+    match pop_live ch.sq with
+    | Some s -> s.ok <- true; `Got s.v
+    | None -> if ch.closed then `Closed else `Blocked
+
+(* Wait until a waker claims [cl], or until [at]. A cancelled task gives up:
+   its waiters become stale and are taken off their queues. *)
+let wait_claim ?at cl (queued : (waiter Queue.t * waiter) list) =
+  (try wait_until ?at (fun () -> cl.fired <> -1 || match at with Some t -> now () >= t | None -> false)
+   with Cancelled ->
+     cl.fired <- -2;
+     List.iter (fun (q, w) -> remove_waiter q w) queued;
+     raise Cancelled);
+  (* woken: take back the waiters nobody claimed *)
+  List.iter (fun (q, w) -> if cl.fired <> w.idx then remove_waiter q w) queued
+
+let chan_send ch v sp =
+  match try_send ch v with
+  | `Done -> ()
+  | `Closed -> raise (Panic ("send on a closed channel", sp))
+  | `Blocked ->
+    let w = { claim = { fired = -1 }; idx = 0; v; ok = false } in
+    Queue.push w ch.sq;
+    wait_claim w.claim [ (ch.sq, w) ];
+    if not w.ok then raise (Panic ("send on a closed channel", sp))
+
+let chan_recv ch =
+  match try_recv ch with
+  | `Got v -> Some v
+  | `Closed -> None
+  | `Blocked ->
+    let w = { claim = { fired = -1 }; idx = 0; v = VUnit; ok = false } in
+    Queue.push w ch.rq;
+    wait_claim w.claim [ (ch.rq, w) ];
+    if w.ok then Some w.v else None
+
+(* Waiting senders and receivers are woken with nothing: senders panic,
+   receivers get None. *)
+let chan_close ch =
+  ch.closed <- true;
+  let rec drain q = match pop_live q with Some w -> w.ok <- false; drain q | None -> () in
+  drain ch.rq;
+  drain ch.sq
+
+(* Clock.sleep: wait without holding up other tasks. *)
+let sleep_ms (ms : int64) =
+  if ms > 0L then begin
+    let at = now () +. (Int64.to_float (min ms 1_000_000_000_000L) /. 1000.) in
+    wait_until ~at (fun () -> now () >= at)
+  end
 
 (* Run tasks until [finished ()]. *)
 let rec schedule finished sp =
@@ -315,22 +446,24 @@ let rec schedule finished sp =
     let rec pick i =
       if i = n then false
       else
-        let ((cond, _, k) as entry) = Queue.pop runq in
+        let ((cond, _, _, k) as entry) = Queue.pop runq in
         if cond () then (k (); true) else (Queue.push entry runq; pick (i + 1))
     in
     if not (pick 0) then begin
       let waits =
-        Queue.fold (fun acc (_, io, _) -> match io with Some ((s : sock), w) when not s.shut -> (s.fd, w) :: acc | _ -> acc) [] runq
+        Queue.fold (fun acc (_, io, _, _) -> match io with Some ((s : sock), w) when not s.shut -> (s.fd, w) :: acc | _ -> acc) [] runq
       in
-      if waits = [] then raise (Panic ("all tasks are blocked (deadlock)", sp));
+      let wake = Queue.fold (fun acc (_, _, at, _) -> match (at, acc) with Some t, Some u -> Some (Float.min t u) | Some t, None -> Some t | None, _ -> acc) None runq in
+      if waits = [] && wake = None then raise (Panic ("all tasks are blocked (deadlock)", sp));
+      let timeout = match wake with Some t -> Float.max 0. (t -. now ()) | None -> -1. in
       (* select() cannot watch descriptors past FD_SETSIZE; then just pause
          briefly. Either way, waiting tasks retry their operation. *)
       let small = List.for_all (fun (fd, _) -> (Obj.magic fd : int) < 1000) waits in
       (if small then
          let rd = List.filter_map (fun (fd, w) -> if w then None else Some fd) waits in
          let wr = List.filter_map (fun (fd, w) -> if w then Some fd else None) waits in
-         ignore (Unix.select rd wr [] (-1.))
-       else Unix.sleepf 0.001);
+         ignore (try Unix.select rd wr [] timeout with Unix.Unix_error (Unix.EINTR, _, _) -> ([], [], []))
+       else Unix.sleepf (if timeout < 0. then 0.001 else Float.min timeout 0.001));
       incr io_epoch
     end;
     schedule finished sp
@@ -343,6 +476,27 @@ module Sock = struct
   let wait sk write =
     let e = !io_epoch in
     wait_until ~io:(sk, write) (fun () -> sk.shut || !io_epoch > e)
+
+  (* Run [op] as this socket's reader (or writer): [op claim] calls [claim ()]
+     before each wait, which is false if another task holds the slot; the
+     slot is held from the first wait until [op] returns. *)
+  let one_at_a_time sk write op =
+    let held = ref false in
+    let claim () =
+      if !held then true
+      else if (if write then sk.writing else sk.reading) then false
+      else begin
+        if write then sk.writing <- true else sk.reading <- true;
+        held := true;
+        true
+      end
+    in
+    let release () = if !held then (if write then sk.writing <- false else sk.reading <- false) in
+    match op claim with
+    | r -> release (); r
+    | exception e -> release (); raise e
+
+  let busy what = Error (Caps.Failed ("another task is already " ^ what))
 
   let failed e = Error (Caps.Failed (Unix.error_message e))
   let closed_err what = Error (Caps.Failed (what ^ " is closed"))
@@ -379,16 +533,22 @@ module Sock = struct
             Unix.listen fd 4096;
             Unix.set_nonblock fd;
             let p = match Unix.getsockname fd with Unix.ADDR_INET (_, p) -> p | _ -> port in
-            Ok ({ fd; shut = false }, p)
+            Ok ({ fd; shut = false; reading = false; writing = false }, p)
           with Unix.Unix_error (e, _, _) -> Unix.close fd; failed e))
 
-  let rec accept sk =
-    if sk.shut then closed_err "listener"
-    else
-      match Unix.accept ~cloexec:true sk.fd with
-      | c, _ -> Unix.set_nonblock c; Ok { fd = c; shut = false }
-      | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EINTR | Unix.ECONNABORTED), _, _) -> wait sk false; accept sk
-      | exception Unix.Unix_error (e, _, _) -> failed e
+  let accept sk =
+    one_at_a_time sk false (fun claim ->
+        let rec go () =
+          if sk.shut then closed_err "listener"
+          else
+            match Unix.accept ~cloexec:true sk.fd with
+            | c, _ -> Unix.set_nonblock c; Ok { fd = c; shut = false; reading = false; writing = false }
+            | exception Unix.Unix_error ((Unix.EINTR | Unix.ECONNABORTED), _, _) -> go ()
+            | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _) ->
+              if claim () then (wait sk false; go ()) else busy "accepting on this listener"
+            | exception Unix.Unix_error (e, _, _) -> failed e
+        in
+        go ())
 
   let connect allowed addr =
     match parse_addr addr with
@@ -399,7 +559,7 @@ module Sock = struct
         match resolve h with
         | None -> Error (Caps.Failed ("cannot resolve " ^ h))
         | Some ip -> (
-          let sk = { fd = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0; shut = false } in
+          let sk = { fd = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0; shut = false; reading = false; writing = false } in
           Unix.set_nonblock sk.fd;
           (* waits can be woken by any socket, so retry until this one says it is connected *)
           let rec go () =
@@ -415,26 +575,35 @@ module Sock = struct
           in
           go ()))
 
-  let rec read sk =
-    if sk.shut then closed_err "connection"
-    else
-      let b = Bytes.create 65536 in
-      match Unix.read sk.fd b 0 65536 with
-      | n -> Ok (Bytes.sub_string b 0 n)
-      | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EINTR), _, _) -> wait sk false; read sk
-      | exception Unix.Unix_error (e, _, _) -> failed e
+  let read sk =
+    one_at_a_time sk false (fun claim ->
+        let b = Bytes.create 65536 in
+        let rec go () =
+          if sk.shut then closed_err "connection"
+          else
+            match Unix.read sk.fd b 0 65536 with
+            | n -> Ok (Bytes.sub_string b 0 n)
+            | exception Unix.Unix_error (Unix.EINTR, _, _) -> go ()
+            | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _) ->
+              if claim () then (wait sk false; go ()) else busy "reading this connection"
+            | exception Unix.Unix_error (e, _, _) -> failed e
+        in
+        go ())
 
   let write sk s =
-    let rec go off =
-      if sk.shut then closed_err "connection"
-      else if off >= String.length s then Ok ()
-      else
-        match Unix.single_write_substring sk.fd s off (String.length s - off) with
-        | n -> go (off + n)
-        | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EINTR), _, _) -> wait sk true; go off
-        | exception Unix.Unix_error (e, _, _) -> failed e
-    in
-    go 0
+    one_at_a_time sk true (fun claim ->
+        let rec go off =
+          if sk.shut then closed_err "connection"
+          else if off >= String.length s then Ok ()
+          else
+            match Unix.single_write_substring sk.fd s off (String.length s - off) with
+            | n -> go (off + n)
+            | exception Unix.Unix_error (Unix.EINTR, _, _) -> go off
+            | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _) ->
+              if claim () then (wait sk true; go off) else busy "writing this connection"
+            | exception Unix.Unix_error (e, _, _) -> failed e
+        in
+        go 0)
 
   let close sk =
     if not sk.shut then begin
@@ -513,7 +682,7 @@ module Proc = struct
         | pid ->
           close_all [ wr; devnull ];
           Unix.set_nonblock rd;
-          let sk = { fd = rd; shut = false } in
+          let sk = { fd = rd; shut = false; reading = false; writing = false } in
           let b = Buffer.create 4096 and chunk = Bytes.create 65536 in
           let rec drain () =
             match Unix.read rd chunk 0 65536 with
@@ -535,6 +704,63 @@ module Proc = struct
           let err = In_channel.input_all ic in
           close_in ic;
           Ok (code, Buffer.contents b, err))
+end
+
+(* ---------- stdin ----------
+   Read like a socket: a task waiting for input waits in the scheduler, and
+   other tasks keep running. One task reads at a time (each gets whole
+   lines); the others wait their turn. A regular file is read directly. *)
+module Stdin = struct
+  let buf = Buffer.create 4096
+  let eof = ref false
+  let busy = ref false
+  let sk = { fd = Unix.stdin; shut = false; reading = false; writing = false }
+  let direct = lazy (try (Unix.fstat Unix.stdin).Unix.st_kind = Unix.S_REG with Unix.Unix_error _ -> true)
+
+  let reset () = Buffer.clear buf; eof := false; busy := false
+
+  (* run [f] as the reader; a task cancelled while it waits lets the next one in *)
+  let exclusive f =
+    wait_until (fun () -> not !busy);
+    busy := true;
+    match f () with
+    | v -> busy := false; v
+    | exception e -> busy := false; raise e
+
+  let rec fill () =
+    let ready () = Lazy.force direct || match Unix.select [ Unix.stdin ] [] [] 0. with r, _, _ -> r <> [] | exception Unix.Unix_error _ -> true in
+    if not (ready ()) then (Sock.wait sk false; fill ())
+    else
+      let b = Bytes.create 65536 in
+      match Unix.read Unix.stdin b 0 65536 with
+      | 0 -> eof := true
+      | n -> Buffer.add_subbytes buf b 0 n
+      | exception Unix.Unix_error (Unix.EINTR, _, _) -> fill ()
+      | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _) -> Sock.wait sk false; fill ()
+      | exception Unix.Unix_error _ -> eof := true
+
+  let take n =
+    let s = Buffer.contents buf in
+    Buffer.clear buf;
+    Buffer.add_string buf (String.sub s n (String.length s - n))
+
+  let read_line () =
+    exclusive (fun () ->
+        let rec go () =
+          let s = Buffer.contents buf in
+          match String.index_opt s '\n' with
+          | Some i -> take (i + 1); Some (String.sub s 0 i)
+          | None when !eof -> if s = "" then None else (take (String.length s); Some s)
+          | None -> fill (); go ()
+        in
+        Option.map (fun l -> if String.ends_with ~suffix:"\r" l then String.sub l 0 (String.length l - 1) else l) (go ()))
+
+  let read_all () =
+    exclusive (fun () ->
+        while not !eof do fill () done;
+        let s = Buffer.contents buf in
+        Buffer.clear buf;
+        s)
 end
 
 let rec pmatch p v binds =
@@ -641,34 +867,59 @@ let rec eval rt env e : value =
             let c = eval rt env ch in
             let x = eval rt env v in
             if on then `Send (c, x) else `Off
+          | SelAfter (clk, ms) ->
+            ignore (eval rt env clk);
+            let ms = match eval rt env ms with VInt n -> n | _ -> 0L in
+            if on then `After ms else `Off
           | SelDefault -> `Default)
         arms
     in
-    if (not (List.exists (function `Recv _ | `Send _ | `Default -> true | `Off -> false) ops)) then
+    if (not (List.exists (function `Recv _ | `Send _ | `After _ | `Default -> true | `Off -> false) ops)) then
       raise (Panic ("every arm of this `select` is turned off by its guard", e.espan));
-    let ready = function
-      | `Recv (_, VChan ch) -> ch.closed || not (Queue.is_empty ch.q)
-      | `Send (VChan ch, _) -> ch.closed || Queue.length ch.q < ch.cap
-      | _ -> false
+    let closed_send () = raise (Panic ("send on a closed channel", e.espan)) in
+    (* a timeout counts from now, after every operand was evaluated *)
+    let start = now () in
+    let ops = List.mapi (fun i op -> (i, op)) ops in
+    (* the first operation that can happen now, in order: (arm, received) *)
+    let rec first = function
+      | [] -> None
+      | (i, `Recv (_, VChan ch)) :: rest -> (
+        match try_recv ch with `Got v -> Some (i, Some v) | `Closed -> Some (i, None) | `Blocked -> first rest)
+      | (i, `Send (VChan ch, x)) :: rest -> (
+        match try_send ch x with `Done -> Some (i, None) | `Closed -> closed_send () | `Blocked -> first rest)
+      | (i, `After ms) :: _ when ms <= 0L -> Some (i, None)
+      | _ :: rest -> first rest
     in
-    let rec first i = function [] -> None | op :: rest -> if ready op then Some i else first (i + 1) rest in
-    let default = List.find_index (fun op -> op = `Default) ops in
-    let i =
-      match (first 0 ops, default) with
-      | Some i, _ -> i
-      | None, Some d -> d
+    let i, got =
+      match (first ops, List.find_opt (fun (_, op) -> op = `Default) ops) with
+      | Some r, _ -> r
+      | None, Some (d, _) -> (d, None)
       | None, None ->
-        wait_until (fun () -> first 0 ops <> None);
-        Option.get (first 0 ops)
+        (* wait on every channel at once; the first to act claims the select *)
+        let cl = { fired = -1 } in
+        let queued =
+          List.filter_map
+            (fun (i, op) ->
+              match op with
+              | `Recv (_, VChan ch) -> let w = { claim = cl; idx = i; v = VUnit; ok = false } in Queue.push w ch.rq; Some (ch.rq, w)
+              | `Send (VChan ch, x) -> let w = { claim = cl; idx = i; v = x; ok = false } in Queue.push w ch.sq; Some (ch.sq, w)
+              | _ -> None)
+            ops
+        in
+        let after = List.find_map (function i, `After ms -> Some (i, start +. (Int64.to_float (min ms 1_000_000_000_000L) /. 1000.)) | _ -> None) ops in
+        wait_claim ?at:(Option.map snd after) cl queued;
+        if cl.fired = -1 then cl.fired <- fst (Option.get after); (* the timeout *)
+        let i = cl.fired in
+        match List.find_opt (fun (_, w) -> w.idx = i) queued with
+        | Some (_, w) -> (
+          match List.assoc i ops with
+          | `Recv _ -> (i, if w.ok then Some w.v else None)
+          | _ -> if w.ok then (i, None) else closed_send ())
+        | None -> (i, None)
     in
     let binds = Hashtbl.create 1 in
-    (match List.nth ops i with
-     | `Recv (b, VChan ch) ->
-       let v = if Queue.is_empty ch.q then none else some (Queue.pop ch.q) in
-       Option.iter (fun (n, _) -> Hashtbl.replace binds n (ref v)) b
-     | `Send (VChan ch, x) ->
-       if ch.closed then raise (Panic ("send on a closed channel", e.espan));
-       Queue.push x ch.q
+    (match List.assoc i ops with
+     | `Recv (b, _) -> Option.iter (fun (n, _) -> Hashtbl.replace binds n (ref (match got with Some v -> some v | None -> none))) b
      | _ -> ());
     eval rt (binds :: env) (List.nth arms i).sbody
   | EBlock b -> eval_block rt env b
@@ -678,17 +929,47 @@ let rec eval rt env e : value =
     let vals = List.map (fun (f, _, x) -> (f, eval rt env x)) fields in
     VStruct (name, List.map (fun (f, _, _) -> (f, List.assoc f vals)) decl.st_fields)
   | EDyn (x, _) -> eval rt env x (* values carry their type, so methods dispatch on it *)
-  | EGroup (name, b) ->
+  | EGroup (name, until, b) ->
     (* tasks are coroutines; the group waits until every one has a result *)
-    let tasks = ref [] in
+    let g = { tasks = []; gcancelled = false } in
+    let joined = ref false in
+    (match until with
+     | None -> ()
+     | Some (clk, ms) ->
+       ignore (eval rt env clk);
+       let ms = match eval rt env ms with VInt n -> n | _ -> 0L in
+       if ms <= 0L then g.gcancelled <- true
+       else begin
+         (* the deadline: a coroutine of its own that cancels the tasks when the time comes *)
+         let at = now () +. (Int64.to_float (min ms 1_000_000_000_000L) /. 1000.) in
+         spawn_fiber { cancelled = false } (fun () ->
+             wait_until ~at ~cancellable:false (fun () -> !joined || now () >= at);
+             if not !joined then cancel_group g)
+       end);
     let sc = Hashtbl.create 1 in
-    Hashtbl.replace sc name (ref (VGroup tasks));
-    ignore (eval_block rt (sc :: env) b);
-    let results = List.rev !tasks in
-    wait_until (fun () -> List.for_all (fun r -> !r <> None) results);
+    Hashtbl.replace sc name (ref (VGroup g));
+    (try
+       ignore (eval_block rt (sc :: env) b);
+       wait_until (fun () -> group_finished g)
+     with e ->
+       (* abandoned (a panic, or this task was cancelled): a cancellation
+          reaches the group's tasks too; either way wait for them *)
+       if !current.cancelled then cancel_group g;
+       wait_until ~cancellable:false (fun () -> group_finished g);
+       joined := true;
+       raise e);
+    joined := true;
+    let results = List.rev_map snd g.tasks in
     (* a panic ended only its task; the group passes the first one on *)
-    List.iter (fun r -> match !r with Some (Error (m, s)) -> raise (Panic (m, s)) | _ -> ()) results;
-    VList (Array.of_list (List.map (fun r -> match !r with Some (Ok v) -> v | _ -> VUnit) results))
+    List.iter (fun r -> match !r with Some (Failed (m, s)) -> raise (Panic (m, s)) | _ -> ()) results;
+    let result r =
+      match (!r, until) with
+      | Some (Done v), None -> v
+      | Some (Done v), Some _ -> some v
+      | _, Some _ -> none (* cancelled *)
+      | _ -> VUnit
+    in
+    VList (Array.of_list (List.map result results))
 
 and eval_var rt env n sp =
   match find_var env n with
@@ -759,8 +1040,11 @@ and apply rt fv args sp =
     | _ -> failwith "internal: map")
   | VChanFn -> (
     match args with
-    | [ VInt n ] when n >= 1L -> VChan { q = Queue.create (); cap = (if n > Int64.of_int max_int then max_int else Int64.to_int n); closed = false }
-    | _ -> raise (Panic ("channel capacity must be at least 1", sp)))
+    | [ VInt n ] when n >= 0L ->
+      VChan
+        { q = Queue.create (); cap = (if n > Int64.of_int max_int then max_int else Int64.to_int n); closed = false;
+          rq = Queue.create (); sq = Queue.create () }
+    | _ -> raise (Panic ("channel capacity cannot be negative", sp)))
   | VPanicFn -> (
     match args with [ VStr m ] -> raise (Panic (m, sp)) | _ -> raise (Panic ("panic", sp)))
   | _ -> failwith "internal: not callable"
@@ -901,23 +1185,23 @@ and call_method rt v name args sp =
   | VEnum ("Result", vn, _), "is_err", [] -> VBool (vn = "Err")
   | VEnum ("Result", "Err", [ e ]), "map_err", [ f ] -> VEnum ("Result", "Err", [ call f [ e ] ])
   | (VEnum ("Result", _, _) as r), "map_err", [ _ ] -> r
-  | VGroup r, "go", [ c ] ->
-    let res = ref None in
-    r := res :: !r;
-    spawn_fiber (fun () -> res := Some (try Ok (apply rt c [] sp) with Panic (m, s) -> Error (m, s)));
+  | VGroup g, "go", [ c ] ->
+    let t = { cancelled = g.gcancelled } in
+    let res = ref (if g.gcancelled then Some Stopped else None) in
+    g.tasks <- (t, res) :: g.tasks;
+    (* a task cancelled before it started never runs *)
+    if not g.gcancelled then
+      spawn_fiber t (fun () ->
+          res :=
+            Some
+              (if t.cancelled then Stopped
+               else try Done (apply rt c [] sp) with Panic (m, s) -> Failed (m, s) | Cancelled -> Stopped));
     VUnit
-  | VChan ch, "send", [ v ] ->
-    if ch.closed then raise (Panic ("send on a closed channel", sp));
-    wait_until (fun () -> ch.closed || Queue.length ch.q < ch.cap);
-    if ch.closed then raise (Panic ("send on a closed channel", sp));
-    Queue.push v ch.q;
-    VUnit
-  | VChan ch, "recv", [] ->
-    wait_until (fun () -> ch.closed || not (Queue.is_empty ch.q));
-    if Queue.is_empty ch.q then none else some (Queue.pop ch.q)
+  | VChan ch, "send", [ v ] -> chan_send ch v sp; VUnit
+  | VChan ch, "recv", [] -> ( match chan_recv ch with Some v -> some v | None -> none)
   | VChan ch, "close", [] ->
     if ch.closed then raise (Panic ("close of a closed channel", sp));
-    ch.closed <- true;
+    chan_close ch;
     VUnit
   | VCap CRand, "int", [ VInt lo; VInt hi ] ->
     if hi <= lo then raise (Panic (sprintf "rand.int: empty range %Ld..%Ld" lo hi, sp));
@@ -933,12 +1217,10 @@ and cap_call rt c name args =
   | CStdout, "print", [ VStr s ] -> rt.out (s ^ "\n"); VUnit
   | CStdout, "write", [ VStr s ] -> rt.out s; VUnit
   | CClock, "now_ms", [] -> VInt (Int64.of_float (Unix.gettimeofday () *. 1000.))
+  | CClock, "sleep", [ VInt ms ] -> sleep_ms ms; VUnit
   | CRand, "float", [] -> VFloat (Int64.to_float (Int64.shift_right_logical (rand_next ()) 11) *. 0x1p-53)
-  | CStdin, "read_line", [] -> (
-    match In_channel.input_line stdin with
-    | Some l -> some (VStr (if String.ends_with ~suffix:"\r" l then String.sub l 0 (String.length l - 1) else l))
-    | None -> none)
-  | CStdin, "read_all", [] -> VStr (In_channel.input_all stdin)
+  | CStdin, "read_line", [] -> ( match Stdin.read_line () with Some l -> some (VStr l) | None -> none)
+  | CStdin, "read_all", [] -> VStr (Stdin.read_all ())
   | CEnv names, "get", [ VStr n ] ->
     if List.mem "*" names || List.mem n names then match Sys.getenv_opt n with Some v -> some (VStr v) | None -> none
     else none
@@ -1006,10 +1288,11 @@ let run ~out ~grants (user_items : item list) : (value, string * Span.t) result 
     let args = match d.fn_params with [] -> [] | _ -> [ VCap CRoot ] in
     (* main is a coroutine too, so it can wait on groups and channels *)
     Queue.clear runq;
+    Stdin.reset ();
     Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
     let result = ref None in
     try
-      spawn_fiber (fun () -> result := Some (call_fn rt d args));
+      spawn_fiber { cancelled = false } (fun () -> result := Some (call_fn rt d args));
       schedule (fun () -> !result <> None) d.fn_span;
       Queue.clear runq;
       Ok (Option.get !result)
@@ -1059,7 +1342,7 @@ let run_tests ~out (user_items : item list) : (string * (unit, string * Span.t) 
         in
         let r =
           try
-            spawn_fiber (fun () -> ignore (call_fn rt d args); finished := true);
+            spawn_fiber { cancelled = false } (fun () -> ignore (call_fn rt d args); finished := true);
             schedule (fun () -> !finished) d.fn_span;
             Ok ()
           with

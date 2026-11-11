@@ -4,6 +4,13 @@ let sprintf = Printf.sprintf
 let total = ref 0
 let failed = ref 0
 
+(* VELA_TEST_ONLY=a,b runs only the program tests whose names start with
+   one of those prefixes (for working on a feature; the full run ignores it). *)
+let selected name =
+  match Sys.getenv_opt "VELA_TEST_ONLY" with
+  | None | Some "" -> true
+  | Some ps -> List.exists (fun p -> String.starts_with ~prefix:p name) (String.split_on_char ',' ps)
+
 let ok name cond msg =
   incr total;
   if not cond then begin
@@ -15,7 +22,7 @@ let ok name cond msg =
    dir/reject (lexer or parser error), for checking grammar/vela.gbnf. *)
 (* Rejected by the parser but within the grammar's documented superset
    (keywords are not excluded from identifiers). *)
-let grammar_superset = [ "tuple-let-refutable"; "select-bad-arm" ]
+let grammar_superset = [ "tuple-let-refutable"; "select-bad-arm"; "group-until-bad" ]
 
 let dump name src parsed =
   match Sys.getenv_opt "VELA_DUMP_DIR" with
@@ -76,12 +83,29 @@ let compile ?(modules = []) name src =
 
 let codes ds = List.map (fun (d : Diag.t) -> d.code) ds
 
-let run ?(grants = Interp.no_grants) ?modules name src =
+(* [feed]: a shell command whose output becomes the program's stdin, through
+   a pipe, so input can arrive late. *)
+let with_stdin feed f =
+  match feed with
+  | None -> f ()
+  | Some cmd ->
+    let r, w = Unix.pipe ~cloexec:true () in
+    let pid = Unix.create_process "/bin/sh" [| "/bin/sh"; "-c"; cmd |] Unix.stdin w Unix.stderr in
+    Unix.close w;
+    let saved = Unix.dup Unix.stdin in
+    Unix.dup2 r Unix.stdin;
+    Unix.close r;
+    Fun.protect f ~finally:(fun () ->
+        Unix.dup2 saved Unix.stdin;
+        Unix.close saved;
+        ignore (Unix.waitpid [] pid))
+
+let run ?(grants = Interp.no_grants) ?modules ?feed name src =
   let items, ds, _ = compile ?modules name src in
   if ds <> [] then Error ("diagnostics: " ^ String.concat ", " (List.map (fun (d : Diag.t) -> d.code ^ " " ^ d.message) ds))
   else
     let buf = Buffer.create 64 in
-    match Interp.run ~out:(Buffer.add_string buf) ~grants items with
+    match with_stdin feed (fun () -> Interp.run ~out:(Buffer.add_string buf) ~grants items) with
     | Ok v -> Ok (Buffer.contents buf, v)
     | Error (m, _) -> Error ("panic: " ^ m)
 
@@ -104,7 +128,9 @@ let sanitize = [ "-O1"; "-g"; "-fsanitize=address,undefined"; "-fno-sanitize-rec
 
 let read_file p = In_channel.with_open_bin p In_channel.input_all
 
-let run_native ?(grants = Interp.no_grants) ?modules name src =
+(* With [feed], stdin comes from that shell command, and the program runs on
+   one worker thread, so a task that blocked its thread would stall the rest. *)
+let run_native ?(grants = Interp.no_grants) ?modules ?feed name src =
   let items, ds, _ = compile ?modules name src in
   if ds <> [] then Error "does not compile" else
   let exe = Filename.concat tmpdir name in
@@ -125,12 +151,17 @@ let run_native ?(grants = Interp.no_grants) ?modules name src =
       String.concat " " (List.map Filename.quote (exe :: args))
       ^ sprintf " >%s 2>%s" (Filename.quote o) (Filename.quote e)
     in
-    let code = Sys.command ("ASAN_OPTIONS=detect_leaks=0 VELA_LEAKCHECK=1 " ^ cmd) in
+    let env = "ASAN_OPTIONS=detect_leaks=0 VELA_LEAKCHECK=1 " in
+    let code =
+      match feed with
+      | None -> Sys.command (env ^ cmd)
+      | Some f -> Sys.command (sprintf "(%s) | %sVELA_THREADS=1 %s" f env cmd)
+    in
     Ok (code, read_file o, read_file e)
 
-let check_native name ?grants ?modules src ~want_out ~want_err_prefix =
+let check_native name ?grants ?modules ?feed src ~want_out ~want_err_prefix =
   if native_for name then
-    match run_native ?grants ?modules name src with
+    match run_native ?grants ?modules ?feed name src with
     | Error m -> ok (name ^ "/native") false m
     | Ok (code, o, e) -> (
       ok (name ^ "/native") (o = want_out) (sprintf "stdout %S, want %S (stderr %S)" o want_out e);
@@ -144,8 +175,8 @@ let check_native name ?grants ?modules src ~want_out ~want_err_prefix =
 (* Concurrency: the same program again under ThreadSanitizer. *)
 let tsan = [ "-O1"; "-g"; "-fsanitize=thread" ]
 
-let check_tsan name ?(grants = Interp.no_grants) src want =
-  if native_for name then begin
+let check_tsan name ?(grants = Interp.no_grants) ?feed src want =
+  if native_for name && selected name then begin
     let items, ds, _ = compile name src in
     let exe = Filename.concat tmpdir (name ^ "-tsan") in
     if ds <> [] then ok (name ^ "/tsan") false "does not compile"
@@ -163,28 +194,33 @@ let check_tsan name ?(grants = Interp.no_grants) src want =
       let cmd =
         String.concat " " (List.map Filename.quote (exe :: args)) ^ sprintf " >%s 2>%s" (Filename.quote o) (Filename.quote e)
       in
-      let code = Sys.command ("TSAN_OPTIONS=halt_on_error=1 VELA_THREADS=8 VELA_LEAKCHECK=1 " ^ cmd) in
+      let env = "TSAN_OPTIONS=halt_on_error=1 VELA_THREADS=8 VELA_LEAKCHECK=1 " in
+      let code = match feed with None -> Sys.command (env ^ cmd) | Some f -> Sys.command (sprintf "(%s) | %s%s" f env cmd) in
       let o = read_file o and e = read_file e in
       ok (name ^ "/tsan")
         (code = 0 && o = want && e = "vela-leakcheck: 0 live\n")
         (sprintf "exit %d, stdout %S, stderr %S" code o e)
   end
 
-let out name ?grants ?modules src want =
-  (match run ?grants ?modules name src with
+let out name ?grants ?modules ?feed src want =
+  if selected name then begin
+  (match run ?grants ?modules ?feed name src with
    | Ok (got, _) -> ok name (got = want) (sprintf "got %S, want %S" got want)
    | Error e -> ok name false e);
-  check_native name ?grants ?modules src ~want_out:want ~want_err_prefix:None
+  check_native name ?grants ?modules ?feed src ~want_out:want ~want_err_prefix:None
+  end
 
 let errs ?modules name src want =
   let _, ds, _ = compile ?modules name src in
   ok name (codes ds = want) (sprintf "got [%s], want [%s]" (String.concat " " (codes ds)) (String.concat " " want))
 
 let panics name src want =
+  if selected name then begin
   (match run name src with
    | Error e -> ok name (e = "panic: " ^ want) (sprintf "got %S" e)
    | Ok (o, _) -> ok name false ("no panic, output " ^ o));
   check_native name src ~want_out:"" ~want_err_prefix:(Some ("panic: " ^ want ^ "\n"))
+  end
 
 (* A program that chooses its exit status: the same stdout and status from
    both backends, and nothing leaked natively. *)
@@ -761,7 +797,7 @@ fn client(net: Net, port: Int, k: Int) -> Int {
     "true true\nDenied(\"listen: 127.0.0.1:9 is not granted\")\nDenied(\"net: 127.0.0.1:9 is not granted\")\n";
   panics "chan-deadlock" (main_wrap "    let c: Chan[Int] = channel(1)\n    c.send(1)\n    c.send(2)") "all tasks are blocked (deadlock)";
   panics "chan-send-closed" (main_wrap "    let c: Chan[Int] = channel(1)\n    c.close()\n    c.send(1)") "send on a closed channel";
-  panics "chan-capacity" (main_wrap "    let c: Chan[Int] = channel(0)") "channel capacity must be at least 1";
+  panics "chan-capacity" (main_wrap "    let c: Chan[Int] = channel(-1)") "channel capacity cannot be negative";
   errs "group-handle-assign" (main_wrap "    let r = group g { g = 1 }") [ "E0310" ];
   errs "chan-in-struct" "struct S { c: Chan[Int] }\nfn main(root: Root) {}" [ "E0305" ];
   panics "div-zero" (main_wrap "    let z = 0\n    out.print(\"{1 / z}\")") "division by zero";
@@ -1414,6 +1450,836 @@ fn main(root: Root) {
   out "catch-frees-abandoned" "fn work(i: Int) -> Int {\n    let mut xs = []\n    let mut m: Map[Str, List[Int]] = map()\n    let mut k = 0\n    while k < 20 {\n        xs.push(\"item {k}\")\n        m[\"k{k}\"] = [k, k + 1]\n        k = k + 1\n    }\n    let f = |n: Int| xs.len() + n\n    if i % 2 == 0 {\n        panic(\"bad {i}\")\n    }\n    f(m.len())\n}\n\nfn main(root: Root) {\n    let mut ok = 0\n    let mut bad = 0\n    let mut i = 0\n    while i < 10000 {\n        match catch(|| work(i)) {\n            Ok(_) => { ok = ok + 1 },\n            Err(_) => { bad = bad + 1 },\n        }\n        i = i + 1\n    }\n    let r = catch(|| group g {\n        for n in [1, 2, 3] {\n            g.go(|| work(n))\n        }\n    })\n    root.stdout.print(\"{ok} {bad} {r.is_err()}\")\n}\n" "5000 5000 true\n";
   out "catch-unwinds-main-loop" "struct Req { path: Str, tags: List[Str] }\n\nfn handle(r: Req) -> Int {\n    let n = r.tags.len()\n    if r.path == \"/bad\" {\n        panic(\"bad path\")\n    }\n    n\n}\n\nfn main(root: Root) {\n    let mut i = 0\n    let mut errs = 0\n    while i < 100 {\n        let req = Req { path: if i % 2 == 0 { \"/bad\" } else { \"/ok\" }, tags: [\"a{i}\", \"b\"] }\n        match catch(|| handle(req)) {\n            Ok(_) => {},\n            Err(_) => { errs = errs + 1 },\n        }\n        i = i + 1\n    }\n    root.stdout.print(\"{errs}\")\n}\n" "50\n";
   check_tsan "group-body-panics-tsan" "fn slow(n: Int) -> Int {\n    let mut i = 0\n    let mut s = 0\n    while i < 20000 {\n        s = s + i % (n + 1)\n        i = i + 1\n    }\n    s\n}\n\nfn main(root: Root) {\n    let mut k = 0\n    let mut errs = 0\n    while k < 50 {\n        let r = catch(|| group g {\n            g.go(|| slow(1))\n            g.go(|| slow(2))\n            panic(\"boom {k}\")\n        })\n        if r.is_err() { errs = errs + 1 }\n        k = k + 1\n    }\n    root.stdout.print(\"{errs}\")\n}\n" "50\n";
+
+  (* ---------- timers ---------- *)
+  let sleepers = {|fn main(root: Root) {
+    let out = root.stdout
+    let clock = root.clock
+    let start = clock.now_ms()
+    // tasks wake in the order of their deadlines
+    let c: Chan[Str] = channel(4)
+    group g {
+        g.go(|| {
+            clock.sleep(300)
+            c.send("c")
+            0
+        })
+        g.go(|| {
+            clock.sleep(150)
+            c.send("b")
+            0
+        })
+        g.go(|| {
+            c.send("a")
+            0
+        })
+        g.go(|| {
+            let mut s = ""
+            let mut i = 0
+            while i < 3 {
+                s = s + (c.recv() ?? "?")
+                i = i + 1
+            }
+            out.print(s)
+            0
+        })
+    }
+    // a sleeping task parks: a thousand 50 ms sleeps take about 50 ms
+    let n = group h {
+        let mut i = 0
+        while i < 1000 {
+            h.go(|| {
+                clock.sleep(50)
+                1
+            })
+            i = i + 1
+        }
+    }
+    clock.sleep(0)
+    clock.sleep(-5)
+    let el = clock.now_ms() - start
+    out.print("{n.sum()} {el >= 350} {el < 3000}")
+}
+|} in
+  out "clock-sleep" sleepers "abc\n1000 true true\n";
+  check_tsan "clock-sleep-tsan" sleepers "abc\n1000 true true\n";
+  (* a task waiting on a channel while another sleeps is not a deadlock *)
+  out "clock-sleep-not-deadlock" {|fn main(root: Root) {
+    let clock = root.clock
+    let c: Chan[Int] = channel(1)
+    let r = group g {
+        g.go(|| c.recv() ?? 0)
+        g.go(|| {
+            clock.sleep(400)
+            c.send(7)
+            0
+        })
+    }
+    root.stdout.print("{r}")
+}
+|} "[7, 0]\n";
+  out "clock-sleep-interface" {|interface Sleeper {
+    fn sleep(self, ms: Int)
+}
+
+struct FakeClock {
+    t: Int,
+}
+
+fn sleep(self: FakeClock, ms: Int) {
+}
+
+fn nap[C: Sleeper](c: C) -> Int {
+    c.sleep(1)
+    c.sleep(1)
+    2
+}
+
+fn main(root: Root) {
+    root.stdout.print("{nap(root.clock) + nap(FakeClock { t: 0 })}")
+}
+|} "4\n";
+  errs "sleep-ambient" (main_wrap "    sleep(10)") [ "E0302" ];
+  out "select-timeout" {|fn main(root: Root) {
+    let out = root.stdout
+    let clock = root.clock
+    let quiet: Chan[Str] = channel(1)
+    let busy: Chan[Str] = channel(1)
+    let full: Chan[Str] = channel(1)
+    full.send("taken")
+    let r = group g {
+        g.go(|| {
+            // nobody sends on quiet: the timeout fires
+            let a = select {
+                m = quiet.recv() => m ?? "closed",
+                clock.after(100) => "timed out",
+            }
+            // a value comes long before the timeout
+            let b = select {
+                m = busy.recv() => m ?? "closed",
+                clock.after(5000) => "timed out",
+            }
+            // full stays full: the value is not sent, and is freed
+            let c = select {
+                full.send("never {a}") => "sent",
+                clock.after(50) => "not sent",
+            }
+            // after(0) is ready at once, but an earlier ready arm wins
+            busy.send("again")
+            let d = select {
+                m = busy.recv() => m ?? "closed",
+                clock.after(0) => "zero",
+            }
+            let e = select {
+                m = quiet.recv() => m ?? "closed",
+                clock.after(-1) => "zero",
+            }
+            // a guard turns the timeout off
+            let on = false
+            busy.send("guarded")
+            let f = select {
+                m = busy.recv() => m ?? "closed",
+                clock.after(1) if on => "timed out",
+            }
+            "{a}, {b}, {c}, {d}, {e}, {f}"
+        })
+        g.go(|| {
+            clock.sleep(20)
+            busy.send("hello")
+            ""
+        })
+    }
+    out.print(r[0])
+    // gather until a deadline
+    let ticks: Chan[Int] = channel(1)
+    let got = group g {
+        g.go(|| {
+            let deadline = clock.now_ms() + 300
+            let mut n = 0
+            let mut more = true
+            while more {
+                select {
+                    t = ticks.recv() => match t {
+                        Some(_) => {
+                            n = n + 1
+                        },
+                        None => {
+                            more = false
+                        },
+                    },
+                    clock.after(deadline - clock.now_ms()) => {
+                        more = false
+                    },
+                }
+            }
+            n
+        })
+        g.go(|| {
+            ticks.send(1)
+            ticks.send(2)
+            ticks.send(3)
+            0
+        })
+    }
+    out.print("{got[0]}")
+}
+|} "timed out, hello, not sent, again, zero, guarded\n3\n";
+  par "select-timeout-stress" {|fn produce(c: Chan[Int], clock: Clock) -> Int {
+    let mut i = 0
+    while i < 2000 {
+        c.send(i)
+        if i % 100 == 0 {
+            clock.sleep(2)
+        }
+        i = i + 1
+    }
+    c.close()
+    0
+}
+
+fn consume(c: Chan[Int], clock: Clock) -> Int {
+    let mut sum = 0
+    let mut more = true
+    while more {
+        select {
+            v = c.recv() => match v {
+                Some(x) => {
+                    sum = sum + x
+                },
+                None => {
+                    more = false
+                },
+            },
+            clock.after(1) => (),
+        }
+    }
+    sum
+}
+
+fn main(root: Root) {
+    let clock = root.clock
+    let c: Chan[Int] = channel(4)
+    let sums = group g {
+        g.go(|| produce(c, clock))
+        let mut k = 0
+        while k < 8 {
+            g.go(|| consume(c, clock))
+            k = k + 1
+        }
+    }
+    root.stdout.print("{sums.sum()}")
+}
+|} "1999000\n";
+  let tchans = "    let c: Chan[Int] = channel(1)\n    let clock = root.clock\n" in
+  errs "select-two-afters" (main_wrap (tchans ^ "    let x = select {\n        v = c.recv() => 1,\n        clock.after(1) => 2,\n        clock.after(2) => 3,\n    }")) [ "E0106" ];
+  errs "select-after-and-default" (main_wrap (tchans ^ "    let x = select {\n        v = c.recv() => 1,\n        clock.after(1) => 2,\n        _ => 3,\n    }")) [ "E0003" ];
+  errs "select-after-not-clock" (main_wrap (tchans ^ "    let x = select {\n        v = c.recv() => 1,\n        c.after(1) => 2,\n    }")) [ "E0201" ];
+  errs "select-after-ms-type" (main_wrap (tchans ^ "    let x = select {\n        v = c.recv() => 1,\n        clock.after(\"soon\") => 2,\n    }")) [ "E0201" ];
+  errs "after-outside-select" (main_wrap (tchans ^ "    clock.after(10)")) [ "E0105" ];
+
+  (* ---------- group deadlines and cancellation ---------- *)
+  out "group-until" {|fn stuck(c: Chan[Int]) -> Int {
+    c.recv() ?? -1
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let clock = root.clock
+    let start = clock.now_ms()
+    let never: Chan[Int] = channel(1)
+    let full: Chan[Str] = channel(1)
+    full.send("x")
+    let r = group g until clock.after(100) {
+        g.go(|| 1)
+        g.go(|| stuck(never))
+        g.go(|| {
+            clock.sleep(10000)
+            2
+        })
+        g.go(|| {
+            let mut words = ["a", "b"]
+            words.push("c")
+            let r = catch(|| stuck(never))
+            words.len() + r.is_ok().to_str().len()
+        })
+        g.go(|| {
+            full.send("y {start}")
+            3
+        })
+        g.go(|| {
+            select {
+                full.send("z {start}") => 4,
+                v = never.recv() => 5,
+            }
+        })
+        g.go(|| {
+            let inner = group h {
+                h.go(|| stuck(never))
+                h.go(|| 6)
+            }
+            inner.len()
+        })
+        g.go(|| {
+            let mut i = 0
+            while clock.now_ms() - start < 200 {
+                i = i + 1
+            }
+            7
+        })
+    }
+    out.print("{r}")
+    let el = clock.now_ms() - start
+    out.print("{el < 2000}")
+    // a deadline already passed: no task runs
+    let z = group g until clock.after(0) {
+        g.go(|| {
+            out.print("ran")
+            1
+        })
+    }
+    out.print("{z}")
+    // tasks started after the deadline never run
+    let late = group g until clock.after(30) {
+        g.go(|| 1)
+        clock.sleep(100)
+        g.go(|| {
+            out.print("ran late")
+            2
+        })
+    }
+    out.print("{late}")
+    // a panic still passes on, after the stuck task is cancelled
+    let p = catch(|| group g until clock.after(50) {
+        g.go(|| stuck(never))
+        g.go(|| {
+            panic("boom")
+            1
+        })
+    })
+    out.print("{p}")
+}
+|} "[Some(1), None, None, None, None, None, None, Some(7)]\ntrue\n[None]\n[Some(1), None]\nErr(\"boom\")\n";
+  par "group-until-stress" {|fn stuck(c: Chan[Int]) -> Int {
+    c.recv() ?? -1
+}
+
+fn produce(c: Chan[Str]) -> Int {
+    let mut i = 0
+    while i < 1000000 {
+        c.send("v{i}")
+        i = i + 1
+    }
+    0
+}
+
+fn consume(c: Chan[Str], clock: Clock) -> Int {
+    let mut more = true
+    while more {
+        match c.recv() {
+            Some(_) => clock.sleep(1),
+            None => {
+                more = false
+            },
+        }
+    }
+    0
+}
+
+fn main(root: Root) {
+    let clock = root.clock
+    let never: Chan[Int] = channel(1)
+    let busy: Chan[Str] = channel(2)
+    let mut total = 0
+    let mut k = 0
+    while k < 15 {
+        let r = group g until clock.after(150) {
+            let mut i = 0
+            while i < 10 {
+                g.go(|| 1)
+                g.go(|| stuck(never))
+                g.go(|| {
+                    clock.sleep(5000)
+                    1
+                })
+                g.go(|| {
+                    let inner = group h {
+                        h.go(|| stuck(never))
+                        h.go(|| 1)
+                    }
+                    inner.len()
+                })
+                g.go(|| select {
+                    v = never.recv() => 1,
+                    clock.after(5000) => 2,
+                })
+                // racing with the deadline: counted as 0 either way
+                g.go(|| produce(busy))
+                g.go(|| consume(busy, clock))
+                g.go(|| {
+                    let mut n = 0
+                    while n < 100000 {
+                        select {
+                            busy.send("s{n}") => (),
+                            clock.after(1) => (),
+                        }
+                        n = n + 1
+                    }
+                    0
+                })
+                i = i + 1
+            }
+        }
+        for x in r {
+            total = total + (x ?? 0)
+        }
+        k = k + 1
+    }
+    root.stdout.print("{total}")
+}
+|} "150\n";
+  out "group-until-sockets" ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] } {|fn main(root: Root) -> Result[(), IoError] {
+    let clock = root.clock
+    let net = root.net
+    let l = root.listen.on("127.0.0.1:0")?
+    let port = l.port()
+    // a read and a sleep that holds a connection, both cancelled
+    let a = group g until clock.after(150) {
+        g.go(|| match l.accept() {
+            Ok(c) => match c.read() {
+                Ok(s) => s.len(),
+                Err(_) => -1,
+            },
+            Err(_) => -2,
+        })
+        g.go(|| match net.connect("127.0.0.1:{port}") {
+            Ok(c) => {
+                clock.sleep(10000)
+                c.close()
+                0
+            },
+            Err(_) => -3,
+        })
+    }
+    // an accept with nobody connecting, cancelled
+    let b = group g until clock.after(50) {
+        g.go(|| match l.accept() {
+            Ok(_) => 1,
+            Err(_) => 2,
+        })
+    }
+    // the listener still works
+    let c = group g {
+        g.go(|| match l.accept() {
+            Ok(c) => (c.read() ?? "?").len(),
+            Err(_) => -1,
+        })
+        g.go(|| match net.connect("127.0.0.1:{port}") {
+            Ok(c) => {
+                c.write("hello") ?? ()
+                c.close()
+                0
+            },
+            Err(_) => -3,
+        })
+    }
+    root.stdout.print("{a} {b} {c}")
+    Ok(())
+}
+|} "[None, None] [None] [5, 0]\n";
+  errs "group-until-not-clock" (main_wrap "    let c: Chan[Int] = channel(1)\n    let r = group g until c.after(5) {\n        g.go(|| 1)\n    }") [ "E0201" ];
+  errs "group-until-ms-type" (main_wrap "    let r = group g until root.clock.after(true) {\n        g.go(|| 1)\n    }") [ "E0201" ];
+  errs "group-until-type" (main_wrap "    let r: List[Int] = group g until root.clock.after(5) {\n        g.go(|| 1)\n    }") [ "E0201" ];
+  errs "group-until-bad" (main_wrap "    let r = group g until root.clock.sleep(5) {\n        g.go(|| 1)\n    }") [ "E0003" ];
+
+  (* ---------- stdin through the poller ---------- *)
+  (* input arrives late; the other task keeps ticking meanwhile, natively on one thread *)
+  out "stdin-lines" ~feed:"sleep 0.3; printf 'one\\ntwo\\r\\n'; sleep 0.2; printf three" {|fn main(root: Root) {
+    let out = root.stdout
+    let clock = root.clock
+    let stdin = root.stdin
+    let start = clock.now_ms()
+    // while one task waits for input, the others run
+    let r = group g {
+        g.go(|| {
+            let mut lines = []
+            let mut more = true
+            while more {
+                match stdin.read_line() {
+                    Some(l) => lines.push(l),
+                    None => {
+                        more = false
+                    },
+                }
+            }
+            lines.join("|")
+        })
+        g.go(|| {
+            let mut n = 0
+            while clock.now_ms() - start < 100 {
+                clock.sleep(10)
+                n = n + 1
+            }
+            "ticked {n > 3}"
+        })
+    }
+    out.print("{r}")
+}
+|} "[\"one|two|three\", \"ticked true\"]\n";
+  out "stdin-all" ~feed:"sleep 0.3; printf 'a\\nb'; sleep 0.1; printf 'c\\n'" {|fn main(root: Root) {
+    let clock = root.clock
+    let start = clock.now_ms()
+    let r = group g {
+        g.go(|| root.stdin.read_all())
+        g.go(|| {
+            let mut n = 0
+            while clock.now_ms() - start < 100 {
+                clock.sleep(10)
+                n = n + 1
+            }
+            "{n > 3}"
+        })
+    }
+    root.stdout.print("{r}")
+    root.stdout.print("{root.stdin.read_line()}")
+}
+|} "[\"a\\nbc\\n\", \"true\"]\nNone\n";
+  (* a reader waiting for input is cancelled; the next read still gets the line *)
+  out "stdin-cancel" ~feed:"sleep 0.6; echo late" {|fn main(root: Root) {
+    let stdin = root.stdin
+    let r = group g until root.clock.after(100) {
+        g.go(|| stdin.read_line() ?? "end")
+    }
+    root.stdout.print("{r} {stdin.read_line()}")
+}
+|} "[None] Some(\"late\")\n";
+  let readers = {|fn sum_lines(stdin: Stdin) -> Int {
+    let mut sum = 0
+    let mut more = true
+    while more {
+        match stdin.read_line() {
+            Some(l) => {
+                sum = sum + (l.parse_int() ?? 0)
+            },
+            None => {
+                more = false
+            },
+        }
+    }
+    sum
+}
+
+fn main(root: Root) {
+    let stdin = root.stdin
+    let sums = group g {
+        let mut i = 0
+        while i < 6 {
+            g.go(|| sum_lines(stdin))
+            i = i + 1
+        }
+    }
+    root.stdout.print("{sums.sum()}")
+}
+|} in
+  out "stdin-readers" ~feed:"seq 1 1000; sleep 0.1; seq 1001 2000" readers "2001000\n";
+  check_tsan "stdin-readers" ~feed:"seq 1 1000; sleep 0.1; seq 1001 2000" readers "2001000\n";
+
+  (* ---------- one reader and one writer per connection, in both backends ---------- *)
+  par "socket-one-at-a-time" ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] } {|fn show(r: Result[Str, IoError]) -> Str {
+    match r {
+        Ok(s) => "read {s.len()}",
+        Err(e) => "{e}",
+    }
+}
+
+fn wrote(r: Result[(), IoError]) -> Str {
+    match r {
+        Ok(_) => "wrote",
+        Err(e) => "{e}",
+    }
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let clock = root.clock
+    let net = root.net
+    let l = root.listen.on("127.0.0.1:0")?
+    let port = l.port()
+    let mut chunk = "0123456789abcdef"
+    let mut i = 0
+    while i < 18 {
+        chunk = chunk + chunk
+        i = i + 1
+    }
+    // two readers at once: one waits for data, the other is refused
+    let r = group g {
+        g.go(|| match l.accept() {
+            Ok(c) => {
+                let rs = group h {
+                    h.go(|| show(c.read()))
+                    h.go(|| show(c.read()))
+                }
+                c.close()
+                rs.sort().join(" / ")
+            },
+            Err(e) => "{e}",
+        })
+        g.go(|| match net.connect("127.0.0.1:{port}") {
+            Ok(c) => {
+                clock.sleep(200)
+                c.write("hi") ?? ()
+                c.read() ?? ""
+                c.close()
+                ""
+            },
+            Err(e) => "{e}",
+        })
+    }
+    root.stdout.print(r[0])
+    // two accepts at once
+    let a = group g {
+        g.go(|| match l.accept() {
+            Ok(c) => {
+                c.close()
+                "accepted"
+            },
+            Err(e) => "{e}",
+        })
+        g.go(|| match l.accept() {
+            Ok(c) => {
+                c.close()
+                "accepted"
+            },
+            Err(e) => "{e}",
+        })
+        g.go(|| {
+            clock.sleep(200)
+            match net.connect("127.0.0.1:{port}") {
+                Ok(c) => {
+                    c.close()
+                    ""
+                },
+                Err(e) => "{e}",
+            }
+        })
+    }
+    root.stdout.print(a.take(2).sort().join(" / "))
+    // two writers at once, while the peer is not reading yet
+    let w = group g {
+        g.go(|| match l.accept() {
+            Ok(c) => {
+                let ws = group h {
+                    h.go(|| wrote(c.write(chunk)))
+                    h.go(|| {
+                        clock.sleep(50)
+                        wrote(c.write(chunk))
+                    })
+                }
+                c.close()
+                ws.sort().join(" / ")
+            },
+            Err(e) => "{e}",
+        })
+        g.go(|| match net.connect("127.0.0.1:{port}") {
+            Ok(c) => {
+                clock.sleep(300)
+                let mut got = 0
+                let mut more = true
+                while more {
+                    match c.read() {
+                        Ok(s) => {
+                            got = got + s.len()
+                            more = !s.is_empty()
+                        },
+                        Err(_) => {
+                            more = false
+                        },
+                    }
+                }
+                c.close()
+                "{got}"
+            },
+            Err(e) => "{e}",
+        })
+    }
+    root.stdout.print("{w[0]}; peer got {w[1]}")
+    Ok(())
+}
+|} "Failed(\"another task is already reading this connection\") / read 2\nFailed(\"another task is already accepting on this listener\") / accepted\nFailed(\"another task is already writing this connection\") / wrote; peer got 4194304\n";
+
+  (* ---------- unbuffered channels ---------- *)
+  out "chan-unbuffered" {|fn main(root: Root) {
+    let out = root.stdout
+    let clock = root.clock
+    let c: Chan[Int] = channel(0)
+    let log: Chan[Str] = channel(10)
+    // a send waits for the receiver
+    let r = group g {
+        g.go(|| {
+            c.send(1)
+            log.send("sent")
+            0
+        })
+        g.go(|| {
+            clock.sleep(100)
+            log.send("receiving")
+            c.recv() ?? 0
+        })
+    }
+    out.print("{r} {log.recv() ?? ""} then {log.recv() ?? ""}")
+    // nobody on the other side: neither arm is ready
+    let a = select {
+        c.send(1) => "sent",
+        _ => "nobody receiving",
+    }
+    let b = select {
+        v = c.recv() => "got",
+        _ => "nobody sending",
+    }
+    out.print("{a}, {b}")
+    // a select send meets a waiting receiver, and a select receive a waiting sender
+    let s = group g {
+        g.go(|| c.recv() ?? 0)
+        g.go(|| {
+            clock.sleep(50)
+            select {
+                c.send(5) => 1,
+                clock.after(5000) => 0,
+            }
+        })
+    }
+    let t = group g {
+        g.go(|| {
+            c.send(6)
+            0
+        })
+        g.go(|| {
+            clock.sleep(50)
+            select {
+                v = c.recv() => v ?? -1,
+                clock.after(5000) => -2,
+            }
+        })
+    }
+    out.print("{s} {t}")
+    // closing wakes a waiting receiver with None
+    let u = group g {
+        g.go(|| c.recv() ?? -1)
+        g.go(|| {
+            clock.sleep(50)
+            c.close()
+            0
+        })
+    }
+    out.print("{u}")
+    // and makes a waiting sender panic
+    let d: Chan[Str] = channel(0)
+    let p = catch(|| group g {
+        g.go(|| {
+            d.send("lost")
+            0
+        })
+        g.go(|| {
+            clock.sleep(50)
+            d.close()
+            0
+        })
+    })
+    out.print("{p}")
+}
+|} "[0, 1] receiving then sent\nnobody receiving, nobody sending\n[5, 1] [0, 6]\n[-1, 0]\nErr(\"send on a closed channel\")\n";
+  par "chan-unbuffered-stress" {|fn produce(c: Chan[Int], n: Int) -> Int {
+    let mut i = 0
+    while i < n {
+        c.send(i)
+        i = i + 1
+    }
+    0
+}
+
+fn consume(c: Chan[Int], done: Chan[Int], clock: Clock) -> Int {
+    let mut sum = 0
+    let mut more = true
+    while more {
+        select {
+            v = c.recv() => {
+                sum = sum + (v ?? 0)
+            },
+            v = done.recv() => {
+                more = false
+            },
+            clock.after(1) => (),
+        }
+    }
+    sum
+}
+
+fn main(root: Root) {
+    let clock = root.clock
+    let c: Chan[Int] = channel(0)
+    let done: Chan[Int] = channel(0)
+    let w1: Chan[Str] = channel(0)
+    let w2: Chan[Str] = channel(0)
+    let lonely: Chan[Str] = channel(0)
+    let never: Chan[Int] = channel(0)
+    let sums = group g {
+        g.go(|| {
+            let sent = group h {
+                h.go(|| produce(c, 1000))
+                h.go(|| produce(c, 1000))
+                h.go(|| produce(c, 1000))
+            }
+            done.close()
+            0
+        })
+        g.go(|| consume(c, done, clock))
+        g.go(|| consume(c, done, clock))
+        // a dispatcher choosing between two unbuffered workers
+        g.go(|| {
+            let mut i = 0
+            while i < 1000 {
+                select {
+                    w1.send("m{i}") => (),
+                    w2.send("m{i}") => (),
+                }
+                i = i + 1
+            }
+            w1.close()
+            w2.close()
+            0
+        })
+        g.go(|| {
+            let mut n = 0
+            while w1.recv().is_some() {
+                n = n + 1
+            }
+            n
+        })
+        g.go(|| {
+            let mut n = 0
+            while w2.recv().is_some() {
+                n = n + 1
+            }
+            n
+        })
+        // cancelled while waiting to hand over a string
+        g.go(|| {
+            let r = group h until clock.after(20) {
+                h.go(|| {
+                    lonely.send("never taken")
+                    0
+                })
+                h.go(|| {
+                    select {
+                        d = never.recv() => 0,
+                        lonely.send("nor this") => 0,
+                    }
+                })
+            }
+            0
+        })
+    }
+    root.stdout.print("{sums[1] + sums[2]} {sums[4] + sums[5]}")
+}
+|} "1498500 1000\n";
   out "catch-in-task-frees-request" "struct Req {\n    path: Str,\n    hs: List[Str],\n}\n\nfn handler(r: Req) -> Str {\n    let e: List[Str] = []\n    r.path + e[0]\n}\n\nfn serve(n: Int) -> Str {\n    let req = Req { path: \"/p{n}\", hs: [\"a{n}\", \"b\"] }\n    catch(|| handler(req)) ?? \"500\"\n}\n\nfn main(root: Root) {\n    let rs = group g {\n        for n in [1, 2, 3] {\n            g.go(|| serve(n))\n        }\n    }\n    root.stdout.print(\"{rs}\")\n}\n" "[\"500\", \"500\", \"500\"]\n";
   errs "catch-arity" (main_wrap "    let r = catch(1, 2)") [ "E0107" ];
 

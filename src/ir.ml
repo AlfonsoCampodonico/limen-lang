@@ -39,9 +39,10 @@ type rhs =
   | Interp of ipart list
   | RootField of atom * string
   | Panic of atom * Span.t
-  | GroupNew
+  | GroupNew of (atom * atom) option (* `until clock.after(ms)`: clock, milliseconds *)
   | Spawn of atom * atom * ty (* group (borrowed), task closure (consumed), result type *)
-  | GroupJoin of atom * ty (* wait for every task; result list type *)
+  | GroupJoin of atom * ty * bool
+      (* wait for every task; result list type; with a deadline (each result an Option) *)
   | ChanNew of ty * atom * Span.t (* channel type, capacity *)
   | ChanSend of atom * atom * Span.t (* channel (borrowed), value (consumed) *)
   | MkDyn of ty * string * atom * (string * ty list * ty) list
@@ -58,6 +59,7 @@ type rhs =
 and sel_op =
   | SRecv of atom * ty * atom (* channel, element type, enabled (its guard) *)
   | SSend of atom * atom * ty * atom (* channel, value, element type, enabled *)
+  | SAfter of atom * atom * atom (* clock, milliseconds, enabled: ready once that time has passed *)
 
 and ipart = IStr of string | IVal of atom * ty | IValQ of atom * ty (* printed as inside a container *)
 
@@ -102,7 +104,7 @@ let consumed = function
   | Spawn (_, c, _) -> [ c ]
   | ChanSend (_, v, _) -> [ v ]
   | MkDyn (_, _, a, _) -> [ a ]
-  | Select (_, ops, _, _) -> List.filter_map (function SSend (_, v, _, _) -> Some v | SRecv _ -> None) ops
+  | Select (_, ops, _, _) -> List.filter_map (function SSend (_, v, _, _) -> Some v | SRecv _ | SAfter _ -> None) ops
   | CallDyn (_, _, _, _, args) -> args
   | _ -> []
 
@@ -111,7 +113,8 @@ let borrowed = function
   | CallClo (c, _) -> [ c ]
   | CallDyn (_, _, _, r, _) -> [ r ]
   | Catch (c, _) -> [ c ]
-  | Select (_, ops, _, _) -> List.concat_map (function SSend (c, _, _, g) | SRecv (c, _, g) -> [ c; g ]) ops
+  | Select (_, ops, _, _) ->
+    List.concat_map (function SSend (c, _, _, g) | SRecv (c, _, g) -> [ c; g ] | SAfter (c, ms, g) -> [ c; ms; g ]) ops
   | SelGot _ -> []
   | MkDyn _ -> []
   | Bin (_, _, a, b, _) -> [ a; b ]
@@ -122,8 +125,9 @@ let borrowed = function
   | Interp ps -> List.filter_map (function IVal (a, _) | IValQ (a, _) -> Some a | IStr _ -> None) ps
   | RootField (a, _) -> [ a ]
   | Panic (a, _) -> [ a ]
-  | Spawn (g, _, _) | GroupJoin (g, _) -> [ g ]
-  | GroupNew -> []
+  | Spawn (g, _, _) | GroupJoin (g, _, _) -> [ g ]
+  | GroupNew None -> []
+  | GroupNew (Some (c, ms)) -> [ c; ms ]
   | ChanNew (_, cap, _) -> [ cap ]
   | ChanSend (c, _, _) -> [ c ]
 

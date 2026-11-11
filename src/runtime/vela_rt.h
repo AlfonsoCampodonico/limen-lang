@@ -14,6 +14,7 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <sys/time.h>
+#include <time.h>
 #include <errno.h>
 #include <signal.h>
 #include <fcntl.h>
@@ -49,6 +50,7 @@ enum { WK_BUF, WK_PLAIN, WK_LIST, WK_MAP, WK_CAP, WK_CHAN, WK_GROUP };
 typedef struct WCatch {
   jmp_buf jb; struct WCatch *prev; char *msg; char *where; WHdr objs;
   int unwinding;                   /* a panic is unwinding to this boundary */
+  int cancel;                      /* it is the task's cancellation, not a panic (msg is NULL) */
   struct _Unwind_Exception uexc;   /* in the boundary's frame, which unwinding does not touch */
 } WCatch;
 
@@ -88,7 +90,7 @@ static void w_free(void *p) {
 }
 /* Start a boundary's list; its parent is the current innermost boundary. */
 static void w_catch_init(WCatch *c) {
-  c->msg = NULL; c->where = NULL; c->unwinding = 0;
+  c->msg = NULL; c->where = NULL; c->unwinding = 0; c->cancel = 0;
   c->objs.prev = c->objs.next = &c->objs;
   WCatch **slot = w_catch_slot();
   c->prev = slot ? *slot : NULL;
@@ -192,22 +194,36 @@ static _Unwind_Reason_Code w_unwind_stop(int version, _Unwind_Action actions, _U
   return _URC_NO_REASON;
 }
 static void w_catch_land(WCatch **g) { if ((*g)->unwinding) _longjmp((*g)->jb, 1); }
+/* Unwind to the innermost boundary, running the cleanups of every frame on
+   the way, so owned locals are dropped; fall back to a plain jump if
+   unwinding fails. */
+__attribute__((noreturn)) static void w_unwind_to(WCatch **slot, WCatch *c) {
+  *slot = c->prev;
+  c->unwinding = 1;
+  memset(&c->uexc, 0, sizeof c->uexc);
+  c->uexc.exception_class = 0x56454c4150414e43ULL; /* "VELAPANC" */
+  _Unwind_ForcedUnwind(&c->uexc, w_unwind_stop, c);
+  _longjmp(c->jb, 1);
+}
 __attribute__((noreturn)) static void w_panic_c(const char *msg, const char *where) {
   WCatch **slot = w_catch_slot();
   if (slot && *slot) {
     WCatch *c = *slot;
     c->msg = strdup(msg);
     c->where = strdup(where);
-    *slot = c->prev;
-    /* unwind to the boundary, running the cleanups of every frame on the way,
-       so owned locals are dropped; fall back to a plain jump if unwinding fails */
-    c->unwinding = 1;
-    memset(&c->uexc, 0, sizeof c->uexc);
-    c->uexc.exception_class = 0x56454c4150414e43ULL; /* "VELAPANC" */
-    _Unwind_ForcedUnwind(&c->uexc, w_unwind_stop, c);
-    _longjmp(c->jb, 1);
+    w_unwind_to(slot, c);
   }
   w_fatal_c(msg, where);
+}
+/* A cancelled task stops at a wait: unwind like a panic. A `catch` on the
+   way frees what it owns and passes the cancellation on (see Catch in
+   cgen.ml), so only the task's own boundary ends it. Tasks always have a
+   boundary, and only tasks are cancelled. */
+__attribute__((noreturn)) static void w_cancel_unwind(void) {
+  WCatch **slot = w_catch_slot();
+  if (!slot || !*slot) w_fatal_c("internal: cancelled outside a task", "?");
+  (*slot)->cancel = 1;
+  w_unwind_to(slot, *slot);
 }
 __attribute__((noreturn)) static void w_unreachable(void) { w_panic_c("internal: unreachable", "?"); }
 
@@ -802,6 +818,7 @@ struct WCap {
   char *root; bool ro;        /* Fs: realpath of root, NULL = not granted */
   int fd; int port;           /* Listener, Conn: the socket */
   int64_t inflight; int closing; /* operations in progress; close requested */
+  int reading, writing;          /* a task is in a read (or accept) / a write that has had to wait */
 };
 static WCap *cap_new(int kind) { WCap *c = (WCap *)w_alloc_k(sizeof(WCap), WK_CAP); memset(c, 0, sizeof *c); c->rc = 1; c->kind = kind; c->fd = -1; return c; }
 static void w_sock_release_fd(int fd);
@@ -937,25 +954,6 @@ static L_Str *Cap_args(void) {
   L_Str *out = L_Str_new(g_nargs);
   for (int i = 0; i < g_nargs; i++) L_Str_push(&out, Str_from(g_args[i], (int64_t)strlen(g_args[i])));
   return out;
-}
-/* Stdin blocks the worker thread while it waits; reading is meant for
-   programs that read their input up front. */
-static WStr *Cap_stdin_line(bool *ok) {
-  char *line = NULL; size_t cap = 0;
-  ssize_t n = getline(&line, &cap, stdin);
-  if (n < 0) { free(line); *ok = false; return NULL; }
-  if (n > 0 && line[n - 1] == '\n') n--;
-  if (n > 0 && line[n - 1] == '\r') n--;
-  WStr *s = Str_from(line, (int64_t)n);
-  free(line);
-  *ok = true;
-  return s;
-}
-static WStr *Cap_stdin_all(void) {
-  WBuf b; buf_init(&b);
-  char t[65536]; size_t k;
-  while ((k = fread(t, 1, sizeof t, stdin)) > 0) buf_putn(&b, t, (int64_t)k);
-  return buf_take(&b);
 }
 static WStr *Cap_env_get(WCap *env, WStr *name, bool *ok) {
   char *n = strndup(name->data, (size_t)name->len);
@@ -1274,6 +1272,9 @@ struct WFiber {
   WFiber *next;
   int park_state;                       /* W_RUNNING, W_PARKING, W_PARKED or W_NOTIFIED */
   WCatch *catch_top;                    /* innermost panic boundary */
+  int cancelled;                        /* its group cancelled it: stop at the next wait */
+  int wlock;                            /* guards wait */
+  struct WSel *wait;                    /* the token of the wait it is parked in, if cancellable */
 #ifdef W_ASAN
   const void *asan_bottom; size_t asan_size;
 #endif
@@ -1355,6 +1356,7 @@ static pthread_mutex_t w_idle_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t w_idle_cv = PTHREAD_COND_INITIALIZER;
 static int64_t w_nidle;
 static int64_t w_io_waiters;                                      /* fibers parked on sockets */
+static int64_t w_tm_count;                                        /* pending timers (sleeps, timeouts, deadlines) */
 static int w_main_done;
 static size_t w_stack_size = 1024 * 1024;                         /* reserved lazily, so 10k tasks are cheap */
 #define W_GUARD_BYTES (64 * 1024)                                 /* larger than any runtime stack frame */
@@ -1496,17 +1498,19 @@ static void w_sched_loop(WWorker *w, int is_main) {
       pthread_mutex_lock(&w_idle_mu);
       int64_t idle = __atomic_add_fetch(&w_nidle, 1, __ATOMIC_SEQ_CST);
       if (__atomic_load_n(&w_queued, __ATOMIC_SEQ_CST) == 0 && !__atomic_load_n(&w_main_done, __ATOMIC_ACQUIRE)) {
-        /* Every worker idle, nothing runnable, nothing waiting on I/O: no
-           task can ever wake another. Confirm after a short wait, then
-           report the deadlock instead of hanging. */
-        if (idle == __atomic_load_n(&w_nworkers, __ATOMIC_ACQUIRE) && __atomic_load_n(&w_io_waiters, __ATOMIC_SEQ_CST) == 0) {
+        /* Every worker idle, nothing runnable, nothing waiting on I/O or a
+           timer: no task can ever wake another. Confirm after a short wait,
+           then report the deadlock instead of hanging. */
+        if (idle == __atomic_load_n(&w_nworkers, __ATOMIC_ACQUIRE) && __atomic_load_n(&w_io_waiters, __ATOMIC_SEQ_CST) == 0
+            && __atomic_load_n(&w_tm_count, __ATOMIC_SEQ_CST) == 0) {
           struct timeval tv; gettimeofday(&tv, NULL);
           struct timespec ts = { tv.tv_sec, (long)tv.tv_usec * 1000 + 100000000L };
           if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
           int rc = pthread_cond_timedwait(&w_idle_cv, &w_idle_mu, &ts);
           if (rc == ETIMEDOUT && __atomic_load_n(&w_queued, __ATOMIC_SEQ_CST) == 0
               && __atomic_load_n(&w_nidle, __ATOMIC_SEQ_CST) == __atomic_load_n(&w_nworkers, __ATOMIC_ACQUIRE)
-              && __atomic_load_n(&w_io_waiters, __ATOMIC_SEQ_CST) == 0 && !__atomic_load_n(&w_main_done, __ATOMIC_ACQUIRE))
+              && __atomic_load_n(&w_io_waiters, __ATOMIC_SEQ_CST) == 0 && __atomic_load_n(&w_tm_count, __ATOMIC_SEQ_CST) == 0
+              && !__atomic_load_n(&w_main_done, __ATOMIC_ACQUIRE))
             w_fatal_c("all tasks are blocked (deadlock)", "every task is waiting");
         } else
           pthread_cond_wait(&w_idle_cv, &w_idle_mu);
@@ -1639,19 +1643,227 @@ static void w_main_finished(void) {
   pthread_mutex_unlock(&w_idle_mu);
 }
 
+/* ---------- timers ----------
+   Sleeps, `select` timeouts and group deadlines. A timer thread keeps a
+   min-heap of deadlines on the monotonic clock and sleeps until the
+   earliest; a sleeping task parks its fiber, so no worker thread waits.
+
+   A timer either wakes a fiber or calls a function. Waking goes through a
+   WSel token that every waker of that wait must claim first (done 0 -> 1),
+   so a fiber is woken once even when a timer races a channel. A function
+   runs on the timer thread with the timer lock held; removing the timer
+   under that lock is therefore enough to know it will not run. */
+
+typedef struct WSel { int done; int fired; } WSel;
+#define W_CANCEL (-2)                   /* fired: the task was cancelled */
+
+/* ---- cancellation ----
+   A group cancels its tasks at its deadline. A cancelled task stops at its
+   next wait: one it is parked in is woken at once, a later one does not
+   park; either way the task unwinds as for a panic, freeing what it owns.
+   Every cancellable wait publishes its token in the fiber (under wlock),
+   so the canceller can claim it like any other waker. Waits that clean up
+   after a cancellation (joining a group being unwound) are not cancellable. */
+static inline void w_flock(WFiber *f) { while (__atomic_exchange_n(&f->wlock, 1, __ATOMIC_ACQUIRE)) sched_yield(); }
+static inline void w_funlock(WFiber *f) { __atomic_store_n(&f->wlock, 0, __ATOMIC_RELEASE); }
+static int w_is_cancelled(void) { WWorker *w = w_self(); return w && w->current && __atomic_load_n(&w->current->cancelled, __ATOMIC_ACQUIRE); }
+/* Start a wait (like w_prepare_park). Returns 0, without preparing to
+   park, if the task is cancelled: the caller undoes what it did, releases
+   its locks and calls w_cancel_unwind(). */
+static int w_wait_begin(WSel *tok) {
+  WFiber *f = w_current();
+  tok->done = 0; tok->fired = -1;
+  w_flock(f);
+  if (__atomic_load_n(&f->cancelled, __ATOMIC_ACQUIRE)) { w_funlock(f); return 0; }
+  w_prepare_park();
+  f->wait = tok;
+  w_funlock(f);
+  return 1;
+}
+/* After waking: the token is no longer the canceller's to claim. */
+static void w_wait_end(void) { WFiber *f = w_current(); w_flock(f); f->wait = NULL; w_funlock(f); }
+static void w_cancel_fiber(WFiber *f) {
+  int wake = 0;
+  w_flock(f);
+  __atomic_store_n(&f->cancelled, 1, __ATOMIC_RELEASE);
+  if (f->wait) {
+    int zero = 0;
+    if (__atomic_compare_exchange_n(&f->wait->done, &zero, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+      __atomic_store_n(&f->wait->fired, W_CANCEL, __ATOMIC_RELEASE);
+      wake = 1;
+    }
+  }
+  w_funlock(f);
+  if (wake) w_wake(f);
+}
+static inline int w_tok_claim(WSel *tok, int idx) {
+  int zero = 0;
+  if (!__atomic_compare_exchange_n(&tok->done, &zero, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return 0;
+  __atomic_store_n(&tok->fired, idx, __ATOMIC_RELEASE);
+  return 1;
+}
+static inline int w_tok_fired(WSel *tok) { return __atomic_load_n(&tok->fired, __ATOMIC_ACQUIRE); }
+
+typedef struct WTimer {
+  int64_t at;                           /* monotonic deadline, ns */
+  int64_t pos;                          /* index in the heap, -1 when not in it */
+  WFiber *f; WSel *sel; int idx;        /* claim sel (fired = idx), then wake f */
+  void (*fire)(void *); void *arg;      /* or call fire(arg) */
+} WTimer;
+
+static pthread_mutex_t w_tm_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t w_tm_cv = PTHREAD_COND_INITIALIZER;
+static WTimer **w_tm_heap;
+static int64_t w_tm_n, w_tm_cap;
+static pthread_once_t w_tm_once = PTHREAD_ONCE_INIT;
+
+static int64_t w_mono_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+/* now + ms, saturating: a deadline far in the future never overflows */
+static int64_t w_deadline_ms(int64_t ms) {
+  if (ms > (int64_t)1000000000000) ms = (int64_t)1000000000000;   /* about 31 years */
+  return w_mono_ns() + ms * 1000000;
+}
+
+static void w_tm_swap(int64_t i, int64_t j) {
+  WTimer *t = w_tm_heap[i]; w_tm_heap[i] = w_tm_heap[j]; w_tm_heap[j] = t;
+  w_tm_heap[i]->pos = i; w_tm_heap[j]->pos = j;
+}
+static void w_tm_up(int64_t i) {
+  while (i > 0 && w_tm_heap[(i - 1) / 2]->at > w_tm_heap[i]->at) { w_tm_swap(i, (i - 1) / 2); i = (i - 1) / 2; }
+}
+static void w_tm_down(int64_t i) {
+  for (;;) {
+    int64_t l = 2 * i + 1, r = l + 1, m = i;
+    if (l < w_tm_n && w_tm_heap[l]->at < w_tm_heap[m]->at) m = l;
+    if (r < w_tm_n && w_tm_heap[r]->at < w_tm_heap[m]->at) m = r;
+    if (m == i) return;
+    w_tm_swap(i, m); i = m;
+  }
+}
+/* with w_tm_mu held */
+static void w_tm_unlink(WTimer *t) {
+  int64_t i = t->pos;
+  if (i < 0) return;
+  w_tm_n--;
+  if (i != w_tm_n) { w_tm_heap[i] = w_tm_heap[w_tm_n]; w_tm_heap[i]->pos = i; w_tm_down(i); w_tm_up(i); }
+  t->pos = -1;
+  __atomic_store_n(&w_tm_count, w_tm_n, __ATOMIC_SEQ_CST);
+}
+
+static void *w_timer_thread(void *arg) {
+  (void)arg;
+  pthread_mutex_lock(&w_tm_mu);
+  for (;;) {
+    if (w_tm_n == 0) { pthread_cond_wait(&w_tm_cv, &w_tm_mu); continue; }
+    WTimer *t = w_tm_heap[0];
+    int64_t now = w_mono_ns();
+    if (t->at > now) {
+      /* the condition variable takes wall-clock time; recheck on waking */
+      int64_t d = t->at - now;
+      struct timeval tv; gettimeofday(&tv, NULL);
+      int64_t ns = (int64_t)tv.tv_usec * 1000 + d % 1000000000;
+      struct timespec ts = { tv.tv_sec + (time_t)(d / 1000000000) + (time_t)(ns / 1000000000), (long)(ns % 1000000000) };
+      pthread_cond_timedwait(&w_tm_cv, &w_tm_mu, &ts);
+      continue;
+    }
+    w_tm_unlink(t);
+    if (t->fire) { t->fire(t->arg); continue; }
+    WFiber *f = t->f;
+    int claimed = w_tok_claim(t->sel, t->idx);
+    /* t lives on the waiting fiber's stack: do not touch it after unlocking */
+    pthread_mutex_unlock(&w_tm_mu);
+    if (claimed) w_wake(f);
+    pthread_mutex_lock(&w_tm_mu);
+  }
+  return NULL;
+}
+static void w_tm_start(void) {
+  pthread_t th;
+  pthread_create(&th, NULL, w_timer_thread, NULL);
+  pthread_detach(th);
+}
+static void w_tm_add(WTimer *t) {
+  pthread_once(&w_tm_once, w_tm_start);
+  pthread_mutex_lock(&w_tm_mu);
+  if (w_tm_n == w_tm_cap) {
+    w_tm_cap = w_tm_cap ? w_tm_cap * 2 : 64;
+    w_tm_heap = (WTimer **)w_realloc(w_tm_heap, sizeof(WTimer *) * (size_t)w_tm_cap);
+  }
+  t->pos = w_tm_n; w_tm_heap[w_tm_n++] = t;
+  w_tm_up(t->pos);
+  __atomic_store_n(&w_tm_count, w_tm_n, __ATOMIC_SEQ_CST);
+  if (t->pos == 0) pthread_cond_signal(&w_tm_cv);   /* a new earliest deadline */
+  pthread_mutex_unlock(&w_tm_mu);
+}
+/* Take a timer out if it has not fired. Once this returns, a fire function
+   is not running and will not run. */
+static void w_tm_remove(WTimer *t) {
+  pthread_mutex_lock(&w_tm_mu);
+  w_tm_unlink(t);
+  pthread_mutex_unlock(&w_tm_mu);
+}
+
+/* Clock.sleep(ms): park until the time has passed. */
+static void Cap_sleep(int64_t ms) {
+  if (ms <= 0) return;
+  WSel tok;
+  WTimer t;
+  memset(&t, 0, sizeof t);
+  t.at = w_deadline_ms(ms); t.pos = -1; t.f = w_current(); t.sel = &tok; t.idx = 0;
+  if (!w_wait_begin(&tok)) w_cancel_unwind();
+  w_tm_add(&t);
+  w_park_now();
+  w_wait_end();
+  if (w_tok_fired(&tok) == W_CANCEL) { w_tm_remove(&t); w_cancel_unwind(); }
+}
+
 /* ---------- group / go ---------- */
 
 typedef struct WGroup WGroup;
 typedef struct WTask WTask;
-struct WTask { WClo *fn; void (*run)(WTask *); WGroup *g; char *pmsg; char *pwhere; max_align_t slot[]; };
-struct WGroup { int64_t rc; pthread_mutex_t mu; int64_t pending; WFiber *waiter; int64_t n, cap; WTask **tasks; };
+struct WTask {
+  WClo *fn; void (*run)(WTask *); WGroup *g; char *pmsg; char *pwhere;
+  WFiber *f;                            /* its fiber while it runs (under g->mu) */
+  int done, cancelled;                  /* finished; ended by cancellation (no result) */
+  max_align_t slot[];
+};
+struct WGroup {
+  int64_t rc; pthread_mutex_t mu; int64_t pending;
+  WFiber *waiter; WSel *wtok;           /* the task joining it, and its wait token */
+  int64_t n, cap; WTask **tasks;        /* in spawn order; grown under mu */
+  int cancelled;                        /* its deadline passed: tasks started now never run */
+  WTimer deadline;                      /* `group g until clock.after(ms)` (pos -1 when none) */
+};
 
+static void w_group_cancel(WGroup *g);
+static void w_group_deadline(void *p) { w_group_cancel((WGroup *)p); }
 static WGroup *w_group_new(void) {
   WGroup *g = (WGroup *)w_alloc_k(sizeof(WGroup), WK_GROUP);
-  g->rc = 1; g->pending = 0; g->waiter = NULL; g->n = 0; g->cap = 8;
+  memset(g, 0, sizeof *g);
+  g->rc = 1; g->cap = 8;
+  g->deadline.pos = -1;
   pthread_mutex_init(&g->mu, NULL);
   g->tasks = (WTask **)w_raw(sizeof(WTask *) * (size_t)g->cap);
   return g;
+}
+/* A group with a deadline ms milliseconds from now. */
+static WGroup *w_group_new_until(int64_t ms) {
+  WGroup *g = w_group_new();
+  if (ms <= 0) { g->cancelled = 1; return g; }
+  g->deadline.at = w_deadline_ms(ms); g->deadline.fire = w_group_deadline; g->deadline.arg = g;
+  w_tm_add(&g->deadline);
+  return g;
+}
+/* Cancel every task still running, and every task started from now on. */
+static void w_group_cancel(WGroup *g) {
+  pthread_mutex_lock(&g->mu);
+  g->cancelled = 1;
+  for (int64_t i = 0; i < g->n; i++) if (!g->tasks[i]->done && g->tasks[i]->f) w_cancel_fiber(g->tasks[i]->f);
+  pthread_mutex_unlock(&g->mu);
 }
 static void w_task_entry(void *p) {
   WTask *volatile t = (WTask *)p;
@@ -1661,7 +1873,10 @@ static void w_task_entry(void *p) {
   w_catch_init(&c);
   c.prev = NULL;
   WCatch **slot = w_catch_slot();
-  if (_setjmp(c.jb) == 0) {
+  if (w_is_cancelled()) {
+    Clo_drop(t->fn);   /* cancelled before it started: it never runs */
+    t->cancelled = 1;
+  } else if (_setjmp(c.jb) == 0) {
     WCatch *guard __attribute__((cleanup(w_catch_land))) = &c;
     *slot = &c;
     t->run(t);
@@ -1672,12 +1887,16 @@ static void w_task_entry(void *p) {
   } else {
     w_catch_release(&c);
     Clo_drop(t->fn);   /* run() did not get to drop it */
-    t->pmsg = c.msg;
-    t->pwhere = c.where;
+    if (c.cancel) t->cancelled = 1;
+    else { t->pmsg = c.msg; t->pwhere = c.where; }
   }
   pthread_mutex_lock(&g->mu);
   WFiber *wake = NULL;
-  if (--g->pending == 0) { wake = g->waiter; g->waiter = NULL; }
+  t->done = 1; t->f = NULL;
+  if (--g->pending == 0 && g->waiter) {
+    if (w_tok_claim(g->wtok, 0)) wake = g->waiter;
+    g->waiter = NULL; g->wtok = NULL;
+  }
   pthread_mutex_unlock(&g->mu);
   if (wake) w_wake(wake);
 }
@@ -1687,22 +1906,59 @@ static void w_spawn(WGroup *g, WClo *fn, void (*run)(WTask *), size_t slot) {
   pthread_once(&w_pool_once, w_pool_start);
   Clo_share(fn);
   WTask *t = (WTask *)w_alloc(sizeof(WTask) + slot);
-  t->fn = fn; t->run = run; t->g = g; t->pmsg = NULL; t->pwhere = NULL;
+  t->fn = fn; t->run = run; t->g = g; t->pmsg = NULL; t->pwhere = NULL; t->f = NULL; t->done = 0; t->cancelled = 0;
+  WFiber *f = w_fiber_new(w_task_entry, t, w_stack_size);
+  pthread_mutex_lock(&g->mu);
   if (g->n == g->cap) { g->cap *= 2; g->tasks = (WTask **)w_realloc(g->tasks, w_bytes(g->cap, sizeof(WTask *))); }
   g->tasks[g->n++] = t;
-  pthread_mutex_lock(&g->mu);
+  if (g->cancelled) {   /* past the deadline: the task never runs */
+    t->done = 1; t->cancelled = 1;
+    pthread_mutex_unlock(&g->mu);
+    w_fiber_free(f);
+    Clo_drop(fn);
+    return;
+  }
+  t->f = f;
   g->pending++;
   pthread_mutex_unlock(&g->mu);
-  w_ready(w_fiber_new(w_task_entry, t, w_stack_size));
+  w_ready(f);
 }
-static void w_group_wait(WGroup *g) {
+/* Wait for every task, then take the deadline off the timer thread (after
+   this, nothing else touches the group). A cancelled joiner stops waiting
+   and unwinds; the boundary it unwinds to then cancels the group's tasks
+   and joins it again, not cancellably (w_group_cleanup). */
+static void w_group_wait(WGroup *g, int cancellable) {
   pthread_mutex_lock(&g->mu);
-  if (g->pending == 0) { pthread_mutex_unlock(&g->mu); return; }
-  w_prepare_park();
-  g->waiter = w_current();
-  pthread_mutex_unlock(&g->mu);
-  w_park_now();
-  /* resumed by the last task; w_wake's atomics order its writes before ours */
+  if (g->pending > 0) {
+    WSel tok;
+    if (cancellable) {
+      if (!w_wait_begin(&tok)) { pthread_mutex_unlock(&g->mu); w_cancel_unwind(); }
+    } else {
+      tok.done = 0; tok.fired = -1;
+      w_prepare_park();
+    }
+    g->waiter = w_current(); g->wtok = &tok;
+    pthread_mutex_unlock(&g->mu);
+    w_park_now();
+    /* resumed by the last task (w_wake's atomics order its writes before
+       ours) or by cancellation */
+    if (cancellable) {
+      w_wait_end();
+      if (w_tok_fired(&tok) == W_CANCEL) {
+        pthread_mutex_lock(&g->mu);
+        if (g->wtok == &tok) { g->waiter = NULL; g->wtok = NULL; }
+        pthread_mutex_unlock(&g->mu);
+        w_cancel_unwind();
+      }
+    }
+  } else pthread_mutex_unlock(&g->mu);
+  if (g->deadline.fire) w_tm_remove(&g->deadline);
+}
+/* Joining a group whose code is being abandoned (a panic, or the task
+   running it was cancelled): a cancellation reaches its tasks too. */
+static void w_group_cleanup(WGroup *g) {
+  if (w_is_cancelled()) w_group_cancel(g);
+  w_group_wait(g, 0);
 }
 static void w_group_release_tasks(WGroup *g) {
   for (int64_t i = 0; i < g->n; i++) { free(g->tasks[i]->pmsg); free(g->tasks[i]->pwhere); w_free(g->tasks[i]); }
@@ -1724,7 +1980,7 @@ static inline WGroup *Group_dup(WGroup *g) { g->rc++; return g; }
    its tasks may still be running, so wait for them before freeing. */
 static void Group_drop(WGroup *g) {
   if (--g->rc == 0) {
-    w_group_wait(g);
+    w_group_cleanup(g);
     w_group_release_tasks(g);
     pthread_mutex_destroy(&g->mu); free(g->tasks); w_free(g);
   }
@@ -1735,12 +1991,14 @@ static inline void Group_share(WGroup *g) { (void)g; }
    A bounded queue between tasks. send blocks while the channel is full,
    recv blocks while it is empty; after close, recv drains what is left and
    then returns nothing, and send panics. Values are switched to shared
-   before they enter, because the receiver may be on another thread. */
+   before they enter, because the receiver may be on another thread.
+   With capacity 0 there is no buffer: a sender waits until a receiver takes
+   its value from it (or a waiting receiver is handed it), so send and recv
+   meet. */
 
 /* A waiting task. A `select` puts one on every channel it waits on, all
    pointing to one WSel; the first channel to act claims it (done 0 -> 1) and
    the others then skip those waiters as stale. */
-typedef struct WSel { int done; int fired; } WSel;
 typedef struct WChWait { WFiber *f; void *val; int ok; struct WChWait *next; WSel *sel; int idx; } WChWait;
 typedef struct WChan {
   int64_t rc; pthread_mutex_t mu;
@@ -1750,7 +2008,7 @@ typedef struct WChan {
 } WChan;
 
 static WChan *w_chan_new(int64_t cap, size_t esz, void (*edrop)(void *), void (*eshare)(void *), const char *where) {
-  if (cap < 1) w_panic_c("channel capacity must be at least 1", where);
+  if (cap < 0) w_panic_c("channel capacity cannot be negative", where);
   WChan *c = (WChan *)w_alloc_k(sizeof(WChan), WK_CHAN);
   memset(c, 0, sizeof *c);
   c->rc = 1; c->cap = cap; c->esz = esz ? esz : 1;
@@ -1800,7 +2058,7 @@ static void w_chq_remove(WChWait **h, WChWait **t, WChWait *w) {
 static void w_chan_send(WChan *c, void *v, const char *where) {
   if (c->eshare) c->eshare(v);
   pthread_mutex_lock(&c->mu);
-  if (c->closed) { pthread_mutex_unlock(&c->mu); w_panic_c("send on a closed channel", where); }
+  if (c->closed) { pthread_mutex_unlock(&c->mu); if (c->edrop) c->edrop(v); w_panic_c("send on a closed channel", where); }
   WChWait *r = w_chq_pop_live(&c->rq, &c->rq_t);
   if (r) {                                       /* a receiver is waiting: hand the value over */
     memcpy(r->val, v, c->esz); r->ok = 1;
@@ -1814,12 +2072,21 @@ static void w_chan_send(WChan *c, void *v, const char *where) {
     pthread_mutex_unlock(&c->mu);
     return;
   }
-  WChWait me = { w_current(), v, 0, NULL, NULL, 0 };
-  w_prepare_park();
+  WSel tok;
+  WChWait me = { w_current(), v, 0, NULL, &tok, 0 };
+  if (!w_wait_begin(&tok)) { pthread_mutex_unlock(&c->mu); if (c->edrop) c->edrop(v); w_cancel_unwind(); }
   w_chq_push(&c->sq, &c->sq_t, &me);
   pthread_mutex_unlock(&c->mu);
   w_park_now();
-  if (!me.ok) w_panic_c("send on a closed channel", where);
+  w_wait_end();
+  if (w_tok_fired(&tok) == W_CANCEL) {
+    pthread_mutex_lock(&c->mu);
+    w_chq_remove(&c->sq, &c->sq_t, &me);
+    pthread_mutex_unlock(&c->mu);
+    if (c->edrop) c->edrop(v);
+    w_cancel_unwind();
+  }
+  if (!me.ok) { if (c->edrop) c->edrop(v); w_panic_c("send on a closed channel", where); }
 }
 
 static bool w_chan_recv(WChan *c, void *out) {
@@ -1838,12 +2105,27 @@ static bool w_chan_recv(WChan *c, void *out) {
     pthread_mutex_unlock(&c->mu);
     return true;
   }
+  WChWait *s = w_chq_pop_live(&c->sq, &c->sq_t);
+  if (s) {                                       /* unbuffered: take it from a waiting sender */
+    memcpy(out, s->val, c->esz); s->ok = 1;
+    pthread_mutex_unlock(&c->mu);
+    w_wake(s->f);
+    return true;
+  }
   if (c->closed) { pthread_mutex_unlock(&c->mu); return false; }
-  WChWait me = { w_current(), out, 0, NULL, NULL, 0 };
-  w_prepare_park();
+  WSel tok;
+  WChWait me = { w_current(), out, 0, NULL, &tok, 0 };
+  if (!w_wait_begin(&tok)) { pthread_mutex_unlock(&c->mu); w_cancel_unwind(); }
   w_chq_push(&c->rq, &c->rq_t, &me);
   pthread_mutex_unlock(&c->mu);
   w_park_now();
+  w_wait_end();
+  if (w_tok_fired(&tok) == W_CANCEL) {
+    pthread_mutex_lock(&c->mu);
+    w_chq_remove(&c->rq, &c->rq_t, &me);
+    pthread_mutex_unlock(&c->mu);
+    w_cancel_unwind();
+  }
   return me.ok;
 }
 
@@ -1879,7 +2161,7 @@ static void w_catch_release(WCatch *c) {
       WChan *ch = (WChan *)o;
       if (ch->edrop) for (int64_t i = 0; i < ch->len; i++) ch->edrop(ch->buf + ((ch->head + i) % ch->cap) * ch->esz);
     }
-    if (h->kind == WK_GROUP) w_group_wait((WGroup *)o); /* its tasks still run: let them finish */
+    if (h->kind == WK_GROUP) w_group_cleanup((WGroup *)o); /* its tasks still run: let them finish */
   }
   /* 3. free them */
   while (end->next != end) {
@@ -1915,16 +2197,19 @@ static void w_catch_release(WCatch *c) {
 }
 
 /* ---------- select ----------
-   ops[i] is a receive (val: where to store the value) or a send (val: the
-   value). Returns the index of the operation done, with ops[i].ok set (a
-   receive: 1 if a value came, 0 if the channel is closed and empty), or -1
-   when nothing was ready and the select has a `_` arm. The first ready
-   operation in order wins. */
-typedef struct WSelOp { WChan *c; int send; void *val; int ok; int on; } WSelOp;
+   ops[i] is a receive (send 0; val: where to store the value), a send
+   (send 1; val: the value) or a timeout (send 2, no channel; ready ms
+   milliseconds after the select starts). Returns the index of the
+   operation done, with ops[i].ok set (a receive: 1 if a value came, 0 if
+   the channel is closed and empty), or -1 when nothing was ready and the
+   select has a `_` arm. The first ready operation in order wins. */
+enum { W_SEL_RECV = 0, W_SEL_SEND = 1, W_SEL_AFTER = 2 };
+typedef struct WSelOp { WChan *c; int send; void *val; int ok; int on; int64_t ms; } WSelOp;
 
 /* Try one operation with its channel locked. Returns 1 if done; *wake gets
    a fiber to wake after unlocking. A send on a closed channel returns -1. */
 static int w_sel_try(WSelOp *op, WFiber **wake) {
+  if (op->send == W_SEL_AFTER) return op->ms <= 0;
   WChan *c = op->c;
   if (op->send) {
     if (c->closed) return -1;
@@ -1948,6 +2233,11 @@ static int w_sel_try(WSelOp *op, WFiber **wake) {
     op->ok = 1;
     return 1;
   }
+  WChWait *s = w_chq_pop_live(&c->sq, &c->sq_t);
+  if (s) {                                       /* unbuffered: take it from a waiting sender */
+    memcpy(op->val, s->val, c->esz); s->ok = 1; *wake = s->f; op->ok = 1;
+    return 1;
+  }
   if (c->closed) { op->ok = 0; return 1; }
   return 0;
 }
@@ -1958,7 +2248,7 @@ static int w_chan_cmp(const void *a, const void *b) {
 /* every distinct channel of the select, locked in address order */
 static int w_sel_lock(WSelOp *ops, int n, WChan **cs) {
   int m = 0;
-  for (int i = 0; i < n; i++) if (ops[i].on) cs[m++] = ops[i].c;
+  for (int i = 0; i < n; i++) if (ops[i].on && ops[i].c) cs[m++] = ops[i].c;
   qsort(cs, (size_t)m, sizeof(WChan *), w_chan_cmp);
   int k = 0;
   for (int i = 0; i < m; i++) if (k == 0 || cs[k - 1] != cs[i]) cs[k++] = cs[i];
@@ -1967,19 +2257,27 @@ static int w_sel_lock(WSelOp *ops, int n, WChan **cs) {
 }
 static void w_sel_unlock(WChan **cs, int k) { for (int i = k - 1; i >= 0; i--) pthread_mutex_unlock(&cs[i]->mu); }
 
+/* A select that is cancelled sends nothing: its values are released. */
+static void w_sel_drop_sends(WSelOp *ops, int n) {
+  for (int i = 0; i < n; i++) if (ops[i].on && ops[i].send == W_SEL_SEND && ops[i].c->edrop) ops[i].c->edrop(ops[i].val);
+}
 static int w_select(WSelOp *ops, int n, int has_default, const char *where) {
   int any = 0;
   for (int i = 0; i < n; i++) if (ops[i].on) any = 1;
   if (!any && !has_default) w_panic_c("every arm of this `select` is turned off by its guard", where);
-  for (int i = 0; i < n; i++) if (ops[i].on && ops[i].send && ops[i].c->eshare) ops[i].c->eshare(ops[i].val);
+  int64_t start = 0;
+  for (int i = 0; i < n; i++) {
+    if (ops[i].on && ops[i].send == W_SEL_SEND && ops[i].c->eshare) ops[i].c->eshare(ops[i].val);
+    if (ops[i].on && ops[i].send == W_SEL_AFTER && ops[i].ms > 0 && !start) start = w_mono_ns();
+  }
   /* fast path: one channel at a time, in order */
   for (int i = 0; i < n; i++) {
     if (!ops[i].on) continue;
     WFiber *wake = NULL;
-    pthread_mutex_lock(&ops[i].c->mu);
+    if (ops[i].c) pthread_mutex_lock(&ops[i].c->mu);
     int r = w_sel_try(&ops[i], &wake);
-    pthread_mutex_unlock(&ops[i].c->mu);
-    if (r < 0) w_panic_c("send on a closed channel", where);
+    if (ops[i].c) pthread_mutex_unlock(&ops[i].c->mu);
+    if (r < 0) { w_sel_drop_sends(ops, n); w_panic_c("send on a closed channel", where); }
     if (r) { if (wake) w_wake(wake); return i; }
   }
   if (has_default) return -1;
@@ -1994,34 +2292,51 @@ static int w_select(WSelOp *ops, int n, int has_default, const char *where) {
     if (r != 0) {
       w_sel_unlock(cs, k);
       free(cs); free(ws);
-      if (r < 0) w_panic_c("send on a closed channel", where);
+      if (r < 0) { w_sel_drop_sends(ops, n); w_panic_c("send on a closed channel", where); }
       if (wake) w_wake(wake);
       return i;
     }
   }
-  WSel sel = { 0, -1 };
+  WSel sel;
   WFiber *me = w_current();
-  w_prepare_park();
+  WTimer tm;
+  memset(&tm, 0, sizeof tm);
+  tm.pos = -1;
+  if (!w_wait_begin(&sel)) {
+    w_sel_unlock(cs, k);
+    free(cs); free(ws);
+    w_sel_drop_sends(ops, n);
+    w_cancel_unwind();
+  }
   for (int i = 0; i < n; i++) {
     if (!ops[i].on) continue;
+    if (ops[i].send == W_SEL_AFTER) {   /* the checker allows one timeout per select */
+      int64_t ms = ops[i].ms > (int64_t)1000000000000 ? (int64_t)1000000000000 : ops[i].ms;
+      tm.at = start + ms * 1000000; tm.f = me; tm.sel = &sel; tm.idx = i;
+      continue;
+    }
     ws[i].f = me; ws[i].val = ops[i].val; ws[i].ok = 0; ws[i].sel = &sel; ws[i].idx = i;
     if (ops[i].send) w_chq_push(&ops[i].c->sq, &ops[i].c->sq_t, &ws[i]);
     else w_chq_push(&ops[i].c->rq, &ops[i].c->rq_t, &ws[i]);
   }
   w_sel_unlock(cs, k);
+  if (tm.f) w_tm_add(&tm);
   w_park_now();
-  /* woken by the channel that claimed us; take our other waiters back */
+  /* woken by the channel or timer that claimed us; take our other waiters back */
+  if (tm.f) w_tm_remove(&tm);
   k = w_sel_lock(ops, n, cs);
   for (int i = 0; i < n; i++) {
-    if (!ops[i].on) continue;
+    if (!ops[i].on || ops[i].send == W_SEL_AFTER) continue;
     if (ops[i].send) w_chq_remove(&ops[i].c->sq, &ops[i].c->sq_t, &ws[i]);
     else w_chq_remove(&ops[i].c->rq, &ops[i].c->rq_t, &ws[i]);
   }
   w_sel_unlock(cs, k);
-  int i = __atomic_load_n(&sel.fired, __ATOMIC_ACQUIRE);
-  ops[i].ok = ws[i].ok;
+  w_wait_end();
+  int i = w_tok_fired(&sel);
+  if (i == W_CANCEL) { free(cs); free(ws); w_sel_drop_sends(ops, n); w_cancel_unwind(); }
+  ops[i].ok = ops[i].send == W_SEL_AFTER ? 1 : ws[i].ok;
   free(cs); free(ws);
-  if (ops[i].send && !ops[i].ok) w_panic_c("send on a closed channel", where);
+  if (ops[i].send && !ops[i].ok) { w_sel_drop_sends(ops, n); w_panic_c("send on a closed channel", where); }
   return i;
 }
 
@@ -2046,7 +2361,7 @@ static pthread_once_t w_poll_once = PTHREAD_ONCE_INIT;
    event with nobody waiting sets a ready flag, so a task that registers
    just after the event still sees it. */
 #define W_MAX_FD 65536
-typedef struct { WFiber *r, *w; uint8_t rready, wready, registered; } WFdState;
+typedef struct { WFiber *r, *w; WSel *rt, *wt; uint8_t rready, wready, registered; } WFdState;
 static WFdState w_fds[W_MAX_FD];
 #define W_FD_LOCKS 64
 static pthread_mutex_t w_fd_mu[W_FD_LOCKS];
@@ -2057,8 +2372,9 @@ static void w_fd_event(int fd, int readable, int writable) {
   WFdState *st = &w_fds[fd];
   WFiber *wr = NULL, *ww = NULL;
   pthread_mutex_lock(w_fd_lock(fd));
-  if (readable) { if (st->r) { wr = st->r; st->r = NULL; } else st->rready = 1; }
-  if (writable) { if (st->w) { ww = st->w; st->w = NULL; } else st->wready = 1; }
+  /* a waiter whose token was claimed by its cancellation removes itself */
+  if (readable) { if (st->r) { if (w_tok_claim(st->rt, 0)) wr = st->r; st->r = NULL; st->rt = NULL; } else st->rready = 1; }
+  if (writable) { if (st->w) { if (w_tok_claim(st->wt, 0)) ww = st->w; st->w = NULL; st->wt = NULL; } else st->wready = 1; }
   pthread_mutex_unlock(w_fd_lock(fd));
   if (wr) w_wake(wr);
   if (ww) w_wake(ww);
@@ -2100,36 +2416,52 @@ static void w_poll_start(void) {
 }
 
 /* Park until fd may be ready in that direction. Returns -1 if another task
-   is already waiting on it in that direction (or fd is out of range). */
+   is already waiting on it in that direction (or fd is out of range), -2
+   if the task was cancelled (the caller cleans up, then calls
+   w_cancel_unwind()), and -3 if the poller cannot watch fd. */
 static int w_wait_fd(int fd, int write) {
   if (fd < 0 || fd >= W_MAX_FD) return -1;
   pthread_once(&w_poll_once, w_poll_start);
   WFdState *st = &w_fds[fd];
   pthread_mutex_lock(w_fd_lock(fd));
   if (!st->registered) {
+    int bad;
 #ifdef W_KQUEUE
-    struct kevent ev[2];
-    EV_SET(&ev[0], (uintptr_t)fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, NULL);
-    EV_SET(&ev[1], (uintptr_t)fd, EVFILT_WRITE, EV_ADD | EV_CLEAR, 0, 0, NULL);
-    kevent(w_poll_fd, ev, 2, NULL, 0, NULL);
+    /* one change per call, so a descriptor that cannot be written (stdin)
+       still gets its read filter */
+    struct kevent ev;
+    EV_SET(&ev, (uintptr_t)fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, NULL);
+    bad = kevent(w_poll_fd, &ev, 1, NULL, 0, NULL) < 0;
+    EV_SET(&ev, (uintptr_t)fd, EVFILT_WRITE, EV_ADD | EV_CLEAR, 0, 0, NULL);
+    kevent(w_poll_fd, &ev, 1, NULL, 0, NULL);
 #else
     struct epoll_event ev;
     ev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET;
     ev.data.fd = fd;
-    epoll_ctl(w_poll_fd, EPOLL_CTL_ADD, fd, &ev);
+    bad = epoll_ctl(w_poll_fd, EPOLL_CTL_ADD, fd, &ev) < 0;
 #endif
+    if (bad) { pthread_mutex_unlock(w_fd_lock(fd)); return -3; }   /* the poller cannot watch it */
     st->registered = 1;
   }
   uint8_t *ready = write ? &st->wready : &st->rready;
   WFiber **slot = write ? &st->w : &st->r;
+  WSel **tslot = write ? &st->wt : &st->rt;
   if (*ready) { *ready = 0; pthread_mutex_unlock(w_fd_lock(fd)); return 0; }
   if (*slot) { pthread_mutex_unlock(w_fd_lock(fd)); return -1; }
+  WSel tok;
+  if (!w_wait_begin(&tok)) { pthread_mutex_unlock(w_fd_lock(fd)); return -2; }
   __atomic_fetch_add(&w_io_waiters, 1, __ATOMIC_SEQ_CST);
-  w_prepare_park();
-  *slot = w_current();
+  *slot = w_current(); *tslot = &tok;
   pthread_mutex_unlock(w_fd_lock(fd));
   w_park_now();
+  w_wait_end();
   __atomic_fetch_sub(&w_io_waiters, 1, __ATOMIC_SEQ_CST);
+  if (w_tok_fired(&tok) == W_CANCEL) {
+    pthread_mutex_lock(w_fd_lock(fd));
+    if (*tslot == &tok) { *slot = NULL; *tslot = NULL; }
+    pthread_mutex_unlock(w_fd_lock(fd));
+    return -2;
+  }
   return 0;
 }
 
@@ -2235,9 +2567,24 @@ static WIo Cap_listen_on(WCap *l, WStr *addr) {
   c->fd = fd; c->port = ntohs(sa.sin_port);
   return io_ok_ptr(c);
 }
+/* One task at a time may wait to read (or accept) and one to write: an
+   operation takes the slot when it first has to wait and keeps it until it
+   returns, and another that has to wait meanwhile fails. The interpreter
+   does the same, so both backends give the same error. */
+static int w_sock_claim(int *slot, int *held) {
+  if (*held) return 1;
+  int zero = 0;
+  if (!__atomic_compare_exchange_n(slot, &zero, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return 0;
+  *held = 1;
+  return 1;
+}
+static void w_sock_unclaim(int *slot, int held) { if (held) __atomic_store_n(slot, 0, __ATOMIC_RELEASE); }
+
 static WIo Cap_accept(WCap *l) {
   int fd = w_sock_enter(l);
   if (fd < 0) return io_err(2, "listener is closed");
+  int held = 0, cancelled = 0;
+  WIo r;
   for (;;) {
     int c = accept(fd, NULL, NULL);
     if (c >= 0) {
@@ -2246,19 +2593,25 @@ static WIo Cap_accept(WCap *l) {
       setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
       WCap *conn = cap_new(CAP_CONN);
       conn->fd = c;
-      w_sock_leave(l);
-      return io_ok_ptr(conn);
+      r = io_ok_ptr(conn);
+      break;
     }
     if (errno == EINTR || errno == ECONNABORTED) continue;
     if ((errno == EAGAIN || errno == EWOULDBLOCK) && !w_sock_closing(l)) {
-      if (w_wait_fd(fd, 0) < 0) { w_sock_leave(l); return io_err(2, "another task is already accepting on this listener"); }
-      if (w_sock_closing(l)) { w_sock_leave(l); return io_err(2, "listener is closed"); }
+      if (!w_sock_claim(&l->reading, &held)) { r = io_err(2, "another task is already accepting on this listener"); break; }
+      int wr = w_wait_fd(fd, 0);
+      if (wr == -2) { cancelled = 1; break; }
+      if (wr < 0) { r = io_err(2, "another task is already accepting on this listener"); break; }
+      if (w_sock_closing(l)) { r = io_err(2, "listener is closed"); break; }
       continue;
     }
-    WIo r = w_sock_closing(l) ? io_err(2, "listener is closed") : w_errno_io();
-    w_sock_leave(l);
-    return r;
+    r = w_sock_closing(l) ? io_err(2, "listener is closed") : w_errno_io();
+    break;
   }
+  w_sock_unclaim(&l->reading, held);
+  w_sock_leave(l);
+  if (cancelled) w_cancel_unwind();
+  return r;
 }
 static WIo Cap_net_connect(WCap *n, WStr *addr) {
   char h[256]; int port;
@@ -2273,7 +2626,9 @@ static WIo Cap_net_connect(WCap *n, WStr *addr) {
   if (connect(fd, (struct sockaddr *)&sa, sizeof sa) < 0) {
     if (errno != EINPROGRESS) { WIo r = w_errno_io(); close(fd); return r; }
     for (;;) {
-      if (w_wait_fd(fd, 1) < 0) { w_sock_release_fd(fd); return io_err(2, "cannot wait on socket"); }
+      int wr = w_wait_fd(fd, 1);
+      if (wr == -2) { w_sock_release_fd(fd); w_cancel_unwind(); }
+      if (wr < 0) { w_sock_release_fd(fd); return io_err(2, "cannot wait on socket"); }
       int err = 0; socklen_t el = sizeof err;
       getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el);
       if (err) { w_sock_release_fd(fd); return io_err(2, strerror(err)); }
@@ -2290,39 +2645,149 @@ static WIo Cap_conn_read(WCap *c) {
   int fd = w_sock_enter(c);
   if (fd < 0) return io_err(2, "connection is closed");
   char *buf = (char *)w_raw(65536);
+  int held = 0, cancelled = 0;
+  WIo r;
   for (;;) {
     ssize_t n = read(fd, buf, 65536);
-    if (n >= 0 && !w_sock_closing(c)) { WStr *s = Str_from(buf, n); free(buf); w_sock_leave(c); return io_ok(s); }
+    if (n >= 0 && !w_sock_closing(c)) { r = io_ok(Str_from(buf, n)); break; }
     if (n < 0 && errno == EINTR) continue;
     if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && !w_sock_closing(c)) {
-      if (w_wait_fd(fd, 0) < 0) { free(buf); w_sock_leave(c); return io_err(2, "another task is already reading this connection"); }
+      if (!w_sock_claim(&c->reading, &held)) { r = io_err(2, "another task is already reading this connection"); break; }
+      int wr = w_wait_fd(fd, 0);
+      if (wr == -2) { cancelled = 1; break; }
+      if (wr < 0) { r = io_err(2, "another task is already reading this connection"); break; }
       continue;
     }
-    WIo r = w_sock_closing(c) ? io_err(2, "connection is closed") : w_errno_io();
-    free(buf);
-    w_sock_leave(c);
-    return r;
+    r = w_sock_closing(c) ? io_err(2, "connection is closed") : w_errno_io();
+    break;
   }
+  free(buf);
+  w_sock_unclaim(&c->reading, held);
+  w_sock_leave(c);
+  if (cancelled) w_cancel_unwind();
+  return r;
 }
 static WIo Cap_conn_write(WCap *c, WStr *s) {
   int fd = w_sock_enter(c);
   if (fd < 0) return io_err(2, "connection is closed");
   int64_t off = 0;
+  int held = 0, cancelled = 0;
+  WIo r = io_ok(NULL);
   while (off < s->len) {
-    if (w_sock_closing(c)) { w_sock_leave(c); return io_err(2, "connection is closed"); }
+    if (w_sock_closing(c)) { r = io_err(2, "connection is closed"); break; }
     ssize_t n = write(fd, s->data + off, (size_t)(s->len - off));
     if (n >= 0) { off += n; continue; }
     if (errno == EINTR) continue;
     if (errno == EAGAIN || errno == EWOULDBLOCK) {
-      if (w_wait_fd(fd, 1) < 0) { w_sock_leave(c); return io_err(2, "another task is already writing this connection"); }
+      if (!w_sock_claim(&c->writing, &held)) { r = io_err(2, "another task is already writing this connection"); break; }
+      int wr = w_wait_fd(fd, 1);
+      if (wr == -2) { cancelled = 1; break; }
+      if (wr < 0) { r = io_err(2, "another task is already writing this connection"); break; }
       continue;
     }
-    WIo r = w_errno_io();
-    w_sock_leave(c);
-    return r;
+    r = w_errno_io();
+    break;
   }
+  w_sock_unclaim(&c->writing, held);
   w_sock_leave(c);
-  return io_ok(NULL);
+  if (cancelled) w_cancel_unwind();
+  return r;
+}
+
+/* ---------- stdin ----------
+   Read through the poller like a socket: a task waiting for input parks,
+   and no worker thread blocks. Stdin keeps its blocking mode (it is shared
+   with the parent shell), so a task reads only once poll() says input is
+   there. A regular file never makes a reader wait, so it is read directly,
+   and so is anything the poller cannot watch. One task reads at a time,
+   each getting whole lines: the others queue on w_in_lock, a channel
+   holding one token. */
+#include <poll.h>
+static WChan *w_in_lock;
+static char *w_in_buf; static int64_t w_in_len, w_in_cap;
+static int w_in_eof, w_in_direct;
+static pthread_once_t w_in_once = PTHREAD_ONCE_INIT;
+static void w_in_init(void) {
+  /* built by hand, not counted by the leak check: it lives as long as the program */
+  WChan *c = (WChan *)w_raw(sizeof(WChan));
+  memset(c, 0, sizeof *c);
+  c->cap = 1; c->esz = sizeof(int64_t); c->buf = (char *)w_raw(sizeof(int64_t)); c->len = 1;
+  memset(c->buf, 0, sizeof(int64_t));
+  pthread_mutex_init(&c->mu, NULL);
+  w_in_lock = c;
+  struct stat st;
+  w_in_direct = fstat(0, &st) == 0 && S_ISREG(st.st_mode);
+}
+static void w_in_acquire(void) {
+  pthread_once(&w_in_once, w_in_init);
+  int64_t tok;
+  w_chan_recv(w_in_lock, &tok);   /* cancellable, before anything is held */
+}
+static void w_in_release(void) { int64_t tok = 0; w_chan_send(w_in_lock, &tok, "stdin"); }
+/* Read more input into the buffer. Returns 1, 0 at the end of input, or -2
+   if the task was cancelled while it waited. */
+static int w_in_fill(void) {
+  char *tmp = (char *)w_raw(65536);
+  for (;;) {
+    if (!w_in_direct) {
+      struct pollfd p = { 0, POLLIN, 0 };
+      int r = poll(&p, 1, 0);
+      if (r < 0 && errno == EINTR) continue;
+      if (r == 0) {
+        int wr = w_wait_fd(0, 0);
+        if (wr == -2) { free(tmp); return -2; }
+        if (wr < 0) w_in_direct = 1;
+        continue;
+      }
+      if (r < 0 || (p.revents & POLLNVAL)) w_in_direct = 1;
+    }
+    ssize_t n = read(0, tmp, 65536);
+    if (n < 0 && errno == EINTR) continue;
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {   /* inherited a non-blocking stdin */
+      struct pollfd p = { 0, POLLIN, 0 };
+      if (w_in_direct) poll(&p, 1, -1);
+      else { int wr = w_wait_fd(0, 0); if (wr == -2) { free(tmp); return -2; } if (wr < 0) w_in_direct = 1; }
+      continue;
+    }
+    if (n <= 0) { free(tmp); w_in_eof = 1; return 0; }
+    if (w_in_len + n > w_in_cap) {
+      while (w_in_len + n > w_in_cap) w_in_cap = w_in_cap ? w_in_cap * 2 : 65536;
+      w_in_buf = (char *)w_realloc(w_in_buf, (size_t)w_in_cap);
+    }
+    memcpy(w_in_buf + w_in_len, tmp, (size_t)n);
+    w_in_len += n;
+    free(tmp);
+    return 1;
+  }
+}
+static void w_in_consume(int64_t n) { memmove(w_in_buf, w_in_buf + n, (size_t)(w_in_len - n)); w_in_len -= n; }
+static WStr *Cap_stdin_line(bool *ok) {
+  w_in_acquire();
+  int64_t from = 0;
+  for (;;) {
+    char *nl = w_in_len > from ? (char *)memchr(w_in_buf + from, '\n', (size_t)(w_in_len - from)) : NULL;
+    if (nl || w_in_eof) {
+      int64_t end = nl ? nl - w_in_buf : w_in_len;
+      if (!nl && end == 0) { w_in_release(); *ok = false; return NULL; }
+      int64_t n = end;
+      if (n > 0 && w_in_buf[n - 1] == '\r') n--;
+      WStr *s = Str_from(w_in_buf, n);
+      w_in_consume(nl ? end + 1 : end);
+      w_in_release();
+      *ok = true;
+      return s;
+    }
+    from = w_in_len;
+    if (w_in_fill() == -2) { w_in_release(); w_cancel_unwind(); }
+  }
+}
+static WStr *Cap_stdin_all(void) {
+  w_in_acquire();
+  while (!w_in_eof) if (w_in_fill() == -2) { w_in_release(); w_cancel_unwind(); }
+  WStr *s = Str_from(w_in_buf ? w_in_buf : "", w_in_len);
+  w_in_len = 0;
+  w_in_release();
+  return s;
 }
 
 /* ---------- Exec: run another program ----------

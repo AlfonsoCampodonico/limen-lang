@@ -269,8 +269,18 @@ and parse_primary st ns =
   | KW "group" ->
     ignore (advance st);
     let name, _ = expect_ident st in
+    let until =
+      match (peek st).tok with
+      | IDENT "until" -> (
+        ignore (advance st);
+        let d = parse_expr_ns st in
+        match d.edesc with
+        | EMethod (clk, "after", _, [ ms ]) -> Some (clk, ms)
+        | _ -> raise (Diag.Fatal (Diag.make "E0003" d.espan "a group deadline is `group g until clock.after(ms) { ... }`")))
+      | _ -> None
+    in
     let b = parse_block st in
-    mk (EGroup (name, b)) (merge t.span b.bspan)
+    mk (EGroup (name, until, b)) (merge t.span b.bspan)
   | _ -> fail t "an expression"
 
 and str_part st = function
@@ -344,11 +354,12 @@ and parse_select st =
         match e.edesc with
         | EMethod (ch, "recv", _, []) -> SelRecv (None, ch)
         | EMethod (ch, "send", _, [ v ]) -> SelSend (ch, v)
+        | EMethod (clk, "after", _, [ ms ]) -> SelAfter (clk, ms)
         | _ ->
           raise
             (Diag.Fatal
                (Diag.make "E0003" e.espan
-                  "a `select` arm is `name = ch.recv()`, `ch.send(value)` or `_` (when nothing is ready)")))
+                  "a `select` arm is `name = ch.recv()`, `ch.send(value)`, `clock.after(ms)` (a timeout) or `_` (when nothing is ready)")))
     in
     let guard = if is_kw st "if" then (ignore (advance st); Some (parse_expr st)) else None in
     ignore (expect_sym st "=>");

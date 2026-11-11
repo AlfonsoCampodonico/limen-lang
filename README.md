@@ -117,7 +117,7 @@ The standard library is written in Vela: `json` (parse, stringify, field access)
 
 ## Concurrency
 
-Tasks are fibers: small stacks scheduled by worker threads, one per core, with work stealing. A task waiting on a group, a channel or a socket parks without blocking a thread. If every task is waiting and nothing can wake one, the program panics with a deadlock message instead of hanging.
+Tasks are fibers: small stacks scheduled by worker threads, one per core, with work stealing. A task waiting on a group, a channel, a socket, stdin or `clock.sleep(ms)` parks without blocking a thread. If every task is waiting and nothing can wake one, the program panics with a deadlock message instead of hanging.
 
 A `group` block starts tasks with `g.go(closure)` and evaluates to the list of their results, in the order they were started. Every task has finished when the block ends, so nothing outlives it.
 
@@ -130,7 +130,7 @@ let counts = group g {
 - Tasks share data by value. A value handed to a task is switched to atomic reference counting, together with everything it references. Values that stay on one thread keep plain counts, so single-threaded code pays nothing.
 - A task can only touch the world through capabilities it captured. Spawning is not a capability, because it has no effect outside the program.
 - The handle `g` can only be used as `g.go(...)` in the block's own body (E0310), and the body cannot `return` or use `?` to leave early (E0311).
-- **Channels:** `channel(n)` makes a `Chan[T]` with `send`, `recv` (returning `None` once closed and drained) and `close`. Values sent are shared, not copied, across threads.
+- **Channels:** `channel(n)` makes a `Chan[T]` with `send`, `recv` (returning `None` once closed and drained) and `close`; `channel(0)` is unbuffered, so a send waits for its receiver. Values sent are shared, not copied, across threads.
 - **Sockets:** `root.listen.on("host:port")` (granted with `--grant listen=...`) gives a `Listener`; `accept` and `Net.connect` give a `Conn` with `read`, `write` and `close`. The native poller is kqueue on macOS and epoll on Linux (Linux untested).
 - **Echo server:** [examples/echo.vela](examples/echo.vela) serves 10,000 concurrent connections, each kept open until all are connected, with every echo correct. Natively that takes about 2 s and 335 MB peak. Reproduce with `bench/echo_load.py`.
 - **Interpreter:** runs tasks as coroutines on OCaml 5 effect handlers, so the same programs behave the same way.
@@ -188,8 +188,10 @@ Interfaces: `interface Shape { fn area(self) -> Float }` bounds a generic parame
 
 Tuples `(Int, Str)` and maps `Map[Str, Int]` are built in: `let (q, r) = divmod(17, 5)`, `counts[w] = counts.get(w) ?? 0 + 1`. Maps iterate in insertion order, the same in both backends (see [examples/tuples.vela](examples/tuples.vela) and [examples/maps.vela](examples/maps.vela)).
 
-`select { v = jobs.recv() if open => ..., out.send(x) => ..., _ => ... }` waits on several channels, with guards to turn arms off (see [examples/select.vela](examples/select.vela)).
+`group g until clock.after(2000) { ... }` gives a group a deadline: tasks still running then are cancelled (freeing what they own) and the group evaluates to a `List[Option[T]]` with `None` for each of them.
+
+`select { v = jobs.recv() if open => ..., out.send(x) => ..., clock.after(500) => ... }` waits on several channels, with guards to turn arms off and an optional timeout (or `_` to not wait at all; see [examples/select.vela](examples/select.vela)). `clock.sleep(ms)` parks a task without blocking a thread.
 
 A panic ends only the task it happens in, and `catch(|| ...)` turns one into `Err(message)`, so `http.serve` answers 500 when a handler panics and keeps serving.
 
-Not yet: timeouts in `select`, TLS and SQL. `Int` is 64-bit and wraps on overflow, identically in the interpreter and in native code.
+Not yet: TLS and SQL. `Int` is 64-bit and wraps on overflow, identically in the interpreter and in native code.
