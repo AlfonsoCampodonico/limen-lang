@@ -1266,11 +1266,14 @@ fn main(root: Root) {
   Sys.remove (Filename.concat pdir "app/vela.toml");
 
   (* [grants] in vela.toml: the program's own grants, with --grant flags adding to them *)
+  (* the CLI built next to this test binary, wherever it is run from *)
+  let vela_exe = Filename.concat (Filename.dirname (Filename.dirname Sys.executable_name)) "bin/main.exe" in
+  let vela_exe = if Filename.is_relative vela_exe then Filename.concat (Sys.getcwd ()) vela_exe else vela_exe in
   let vela_cli args =
     let o = Filename.concat pdir "cli.out" and e = Filename.concat pdir "cli.err" in
     let code =
       Sys.command
-        (String.concat " " (List.map Filename.quote ("../bin/main.exe" :: args)) ^ sprintf " >%s 2>%s" (Filename.quote o) (Filename.quote e))
+        (String.concat " " (List.map Filename.quote (vela_exe :: args)) ^ sprintf " >%s 2>%s" (Filename.quote o) (Filename.quote e))
     in
     (code, read_file o, read_file e)
   in
