@@ -33,6 +33,14 @@ let tools =
     tool "vela_type_at" "The type (or signature) at a position in a Vela program. line and character are 0-based."
       [ source_p; ("line", int_prop "0-based line"); ("character", int_prop "0-based column") ]
       [ "source"; "line"; "character" ];
+    tool "vela_references"
+      "Every place the name at a position is defined or used: functions, methods, types, fields, variants and locals. Returns JSON {name, references: [{file, line, character, end_character, definition}]}, 0-based; a file other than input.vela is a standard library module."
+      [ source_p; ("line", int_prop "0-based line"); ("character", int_prop "0-based column") ]
+      [ "source"; "line"; "character" ];
+    tool "vela_rename"
+      "Rename the name at a position everywhere it is used and return the whole new program. Refused, with the reason, when unsafe: built-in or standard library names, interface methods, a name of the wrong case, or a new name that would clash with or capture another one."
+      [ source_p; ("line", int_prop "0-based line"); ("character", int_prop "0-based column"); ("new_name", str_prop "The new name") ]
+      [ "source"; "line"; "character"; "new_name" ];
     tool "vela_explain" "Explain a Vela error code such as E0302." [ ("code", str_prop "Error code") ] [ "code" ] ]
 
 (* ---------- helpers ---------- *)
@@ -40,6 +48,7 @@ let tools =
 let file = "input.vela"
 
 let analyze src =
+  Modules.overlay := [];
   match Modules.load file src with
   | [], (_ :: _ as ds) -> (None, ds, [])
   | items, _ ->
@@ -118,9 +127,39 @@ let call name args =
     match analyze src with
     | Some items, _, _ -> (
       let off = Lsp.offset_of src (J.to_int (arg args "line")) (J.to_int (arg args "character")) in
-      match Lsp.smallest_at off (Lsp.hover_items src items) with
+      match Lsp.smallest_at ~file off (Lsp.hover_items src items) with
       | Some (_, s) -> text_result s
       | None -> text_result "nothing typed at that position")
+    | None, ds, _ -> text_result ~is_error:true (Diag.list_to_json ds))
+  | "vela_references" -> (
+    match analyze src with
+    | Some items, _, _ -> (
+      let off = Lsp.offset_of src (J.to_int (arg args "line")) (J.to_int (arg args "character")) in
+      let occs = Refs.index items in
+      match Refs.at occs file off with
+      | None -> text_result ~is_error:true "no name at that position"
+      | Some o ->
+        let one (r : Refs.occ) =
+          let text = Option.value ~default:"" (Source.text r.sp.file) in
+          let pos = Lsp.pos_of text r.sp.lo in
+          J.Obj
+            [ ("file", J.String r.sp.file); ("line", J.member "line" pos); ("character", J.member "character" pos);
+              ("end_character", J.Int (J.to_int (J.member "character" pos) + r.sp.hi - r.sp.lo)); ("definition", J.Bool r.def) ]
+        in
+        text_result (J.to_string (J.Obj [ ("name", J.String o.name); ("references", J.List (List.map one (Refs.references occs o.key))) ])))
+    | None, ds, _ -> text_result ~is_error:true (Diag.list_to_json ds))
+  | "vela_rename" -> (
+    match analyze src with
+    | Some items, _, _ -> (
+      let off = Lsp.offset_of src (J.to_int (arg args "line")) (J.to_int (arg args "character")) in
+      let load overrides =
+        match analyze (Option.value ~default:src (List.assoc_opt file overrides)) with
+        | Some items, ds, _ -> (items, ds)
+        | None, ds, _ -> ([], ds)
+      in
+      match Refs.rename ~load items file off (J.to_str (arg args "new_name")) with
+      | Error m -> text_result ~is_error:true m
+      | Ok files -> text_result (Refs.apply_edits src (List.concat_map snd (List.filter (fun (f, _) -> f = file) files))))
     | None, ds, _ -> text_result ~is_error:true (Diag.list_to_json ds))
   | "vela_explain" -> (
     let code = String.uppercase_ascii (J.to_str (arg args "code")) in

@@ -900,7 +900,7 @@ tuplepat   = "(" pattern "," pattern { "," pattern } ")" ;
 ## 17. Tools
 
 - `vela fmt FILE` prints the canonical formatting (`--write` rewrites, `--check` verifies).
-- `vela lsp` is a language server; `vela mcp` is an MCP server exposing check, run, test, format, caps, type-at and the spec to coding agents.
+- `vela lsp` is a language server (diagnostics, hover, definition, references, rename, completion, quick fixes, outline); `vela mcp` is an MCP server exposing check, run, test, format, caps, type-at, references, rename and the spec to coding agents. Rename is refused when it is unsafe: the renamed program must check with no new errors, and the new name must refer to exactly the renamed places.
 - `vela caps FILE` lists each function's authority; `vela explain CODE` explains an error.
 - `vela doc FILE|MODULE... [--std] [--all] [--html] [-o OUT]` prints documentation built from doc comments (section 2) and signatures, as Markdown, or with `--html` as one static page. An argument that is not a file names a standard library module; `--std` documents all of them. It lists `pub` items (everything with `--all`); methods appear under their type, and methods on a type the module does not declare (such as `Str`) get their own section. Files are parsed, not type-checked.
 
