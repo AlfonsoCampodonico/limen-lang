@@ -89,9 +89,13 @@ type fn_decl = {
   fn_test : string option; (* Some name: a `test "name" { ... }` block *)
   fn_pub : bool;
   fn_bounds : (string * (string * span) list) list; (* type parameter -> interfaces it must satisfy *)
-  fn_foreign : (string * string) option;
-      (* Some (library, C symbol): declared in a `foreign "lib" { ... }` block; no body *)
+  fn_foreign : foreign option; (* declared in a `foreign "lib" { ... }` block; no body *)
 }
+
+(* A C function: its library, its symbol, and whether it is trusted. Only
+   the foreign blocks of standard library modules that src/std/vela.toml
+   names in [trust] are trusted: their calls take no Foreign capability. *)
+and foreign = { flib : string; fsym : string; ftrusted : bool }
 
 type struct_decl = {
   st_name : string;

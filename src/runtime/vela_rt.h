@@ -3077,6 +3077,11 @@ static int32_t w_ffi_i32(int64_t v, const char *arg, const char *where) {
   return (int32_t)v;
 }
 static WStr *w_ffi_str(const char *p) { return p ? Str_from(p, (int64_t)strlen(p)) : Str_new(0); }
+static WStr *w_ffi_copy(int64_t p, int64_t n, const char *where) {
+  if (n < 0) { char m[128]; snprintf(m, sizeof m, "foreign.copy: negative length %lld", (long long)n); w_panic_c(m, where); }
+  if (p == 0 && n > 0) w_panic_c("foreign.copy: null pointer", where);
+  return Str_from((const char *)(intptr_t)p, n);
+}
 static WStr *Cap_foreign_copy(WCap *x, int64_t p, int64_t n, const char *where) {
   if (x->nhosts == 0) w_panic_c("foreign: no library is granted, so C memory cannot be read", where);
   if (n < 0) { char m[128]; snprintf(m, sizeof m, "foreign.copy: negative length %lld", (long long)n); w_panic_c(m, where); }

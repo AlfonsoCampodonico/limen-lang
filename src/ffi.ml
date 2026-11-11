@@ -25,7 +25,9 @@ type cty = Int | Int32 | Float | Bool | Str | Bytes | Handle | Unit
 
 type param = { name : string; cty : cty; out : bool }
 
-type csig = { lib : string; sym : string; params : param list; ret : cty }
+(* [trusted]: from a standard library module trusted to call C (see
+   Ast.foreign); no Foreign capability is passed or checked. *)
+type csig = { lib : string; sym : string; params : param list; ret : cty; trusted : bool }
 
 (* The calling convention both backends rely on (and the interpreter's
    generic call stub implements): at most 8 integer-class and 8 floating
@@ -63,7 +65,9 @@ let result_ty s =
   | [ t ] -> vela_ty t
   | ts -> TNamed (Ast.tuple_name (List.length ts), List.map vela_ty ts)
 
-let visible_params s = TCap Foreign :: List.filter_map (fun p -> if p.out then None else Some (vela_ty p.cty)) s.params
+let visible_params s =
+  let ps = List.filter_map (fun p -> if p.out then None else Some (vela_ty p.cty)) s.params in
+  if s.trusted then ps else TCap Foreign :: ps
 
 (* A library name is a plain word: linked as -l<name>, loaded as lib<name>.so
    or lib<name>.dylib. "c" is the C library itself. *)
@@ -81,7 +85,7 @@ let boundary_types = "Int, Int32, Float, Bool, Str, Bytes, Handle, or Out[Int | 
 
 (* The C signature of a foreign declaration, or the errors in it. *)
 let of_decl (d : Ast.fn_decl) : (csig, (Span.t * string) list) result =
-  let lib, sym = match d.fn_foreign with Some x -> x | None -> invalid_arg "Ffi.of_decl" in
+  let lib, sym, trusted = match d.fn_foreign with Some fo -> (fo.flib, fo.fsym, fo.ftrusted) | None -> invalid_arg "Ffi.of_decl" in
   let errs = ref [] in
   let err sp m = errs := (sp, m) :: !errs in
   let base (te : Ast.ty_expr) =
@@ -114,12 +118,20 @@ let of_decl (d : Ast.fn_decl) : (csig, (Span.t * string) list) result =
             { name = p.prm_name; cty = Int; out = false }))
       d.fn_params
   in
+  (* "vela" is the runtime's own library of helpers for trusted standard
+     library modules; it has one function, vela_copy(p, n) -> Bytes *)
+  let runtime_lib = lib = "vela" in
+  if runtime_lib then begin
+    if not trusted then err d.fn_span "library `vela` is the runtime's own, for the standard library; use `foreign.copy(p, n)` instead";
+    if sym <> "vela_copy" then err d.fn_span "library `vela` has only `vela_copy(p: Handle, n: Int) -> Bytes`"
+  end;
   let ret =
     match d.fn_ret with
     | None -> Unit
     | Some { tdesc = TyUnit; _ } -> Unit
     | Some te -> (
       match base te with
+      | Some Bytes when runtime_lib -> Bytes
       | Some Bytes ->
         err te.tspan "a foreign function cannot return Bytes: C gives no length; return a Handle and copy with `foreign.copy(p, n)`";
         Unit
@@ -136,12 +148,12 @@ let of_decl (d : Ast.fn_decl) : (csig, (Span.t * string) list) result =
     err d.fn_span
       (Printf.sprintf "a foreign function takes at most %d integer-like and %d Float parameters (an Out counts as integer-like)" max_ints
          max_floats);
-  match !errs with [] -> Ok { lib; sym; params; ret } | es -> Error (List.rev es)
+  match !errs with [] -> Ok { lib; sym; params; ret; trusted } | es -> Error (List.rev es)
 
 (* Libraries a program's foreign declarations name, each once, in order. *)
 let libs (items : Ast.item list) =
   List.fold_left
-    (fun acc it -> match it with Ast.IFn { fn_foreign = Some (l, _); _ } when not (List.mem l acc) -> acc @ [ l ] | _ -> acc)
+    (fun acc it -> match it with Ast.IFn { fn_foreign = Some { flib = l; _ }; _ } when l <> "vela" && not (List.mem l acc) -> acc @ [ l ] | _ -> acc)
     [] items
 
 let denied_msg lib = Printf.sprintf "foreign: library `%s` is not granted (grant it with --grant foreign=%s)" lib lib

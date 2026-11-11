@@ -362,7 +362,13 @@ let rename_item mods (m : modinfo) own (it : item) : item =
         fn_bounds = List.map (fun (g, bs) -> (g, List.map bound bs)) d.fn_bounds;
         fn_params = params;
         fn_ret = Option.map (ty env) d.fn_ret;
-        fn_body = block env locals d.fn_body }
+        fn_body = block env locals d.fn_body;
+        (* a standard library module trusted with C (src/std/vela.toml [trust]) *)
+        fn_foreign =
+          Option.map
+            (fun (fo : foreign) ->
+              { fo with ftrusted = String.starts_with ~prefix:"<std>" m.mfile && List.mem m.mname (Lazy.force Package.std_manifest).trust })
+            d.fn_foreign }
   | IStruct s ->
     let env = { self = m; mods; own; gens = s.st_gen } in
     IStruct { s with st_name = qual m s.st_name; st_fields = List.map (fun (f, sp, t) -> (f, sp, ty env t)) s.st_fields }

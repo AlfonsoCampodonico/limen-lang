@@ -821,7 +821,7 @@ module Foreign = struct
     List.fold_left
       (fun acc it ->
         match (acc, it) with
-        | Ok (), IFn ({ fn_foreign = Some (lib, sym); _ } as d) when permits granted lib -> (
+        | Ok (), IFn ({ fn_foreign = Some { flib = lib; fsym = sym; ftrusted }; _ } as d) when lib <> "vela" && (ftrusted || permits granted lib) -> (
           match load lib with
           | Error e -> Error (sprintf "foreign: cannot load library `%s`: %s" lib e, d.fn_span)
           | Ok h ->
@@ -833,10 +833,24 @@ module Foreign = struct
 
   let handle v = VStruct ("Handle", [ ("addr", VInt v) ])
 
+  let copy allowed p n sp =
+    if allowed = [] then raise (Panic ("foreign: no library is granted, so C memory cannot be read", sp));
+    if n < 0L then raise (Panic (sprintf "foreign.copy: negative length %Ld" n, sp));
+    if p = 0L && n > 0L then raise (Panic ("foreign.copy: null pointer", sp));
+    if n > Int64.of_int Sys.max_string_length then raise (Panic (sprintf "foreign.copy: length %Ld is too large" n, sp));
+    VBytes (peek p (Int64.to_int n))
+
   let invoke (d : fn_decl) args sp =
     let cs = match Ffi.of_decl d with Ok cs -> cs | Error _ -> failwith "internal: foreign signature" in
-    let allowed, args = match args with VCap (CForeign a) :: rest -> (a, rest) | _ -> failwith "internal: foreign capability" in
-    if not (permits allowed cs.lib) then raise (Panic (Ffi.denied_msg cs.lib, sp));
+    let args =
+      if cs.trusted then args
+      else
+        match args with
+        | VCap (CForeign allowed) :: rest ->
+          if not (permits allowed cs.lib) then raise (Panic (Ffi.denied_msg cs.lib, sp));
+          rest
+        | _ -> failwith "internal: foreign capability"
+    in
     let rec conv ps args =
       match (ps, args) with
       | [], _ -> []
@@ -858,6 +872,9 @@ module Foreign = struct
         c :: conv ps args
       | _ :: _, [] -> failwith "internal: foreign arity"
     in
+    match (cs.lib, args) with
+    | "vela", [ VStruct (_, [ (_, VInt p) ]); VInt n ] -> copy [ "vela" ] p n sp
+    | _ ->
     let cargs = Array.of_list (conv cs.params args) in
     let fp = match Hashtbl.find_opt syms (cs.lib, cs.sym) with Some p -> p | None -> failwith "internal: unresolved foreign function" in
     let ri, rf, outs = call fp cargs (if cs.ret = Ffi.Float then 1 else 0) in
@@ -885,12 +902,6 @@ module Foreign = struct
     | [ v ] -> v
     | vs -> VStruct (Ast.tuple_name (List.length vs), List.mapi (fun i v -> (string_of_int i, v)) vs)
 
-  let copy allowed p n sp =
-    if allowed = [] then raise (Panic ("foreign: no library is granted, so C memory cannot be read", sp));
-    if n < 0L then raise (Panic (sprintf "foreign.copy: negative length %Ld" n, sp));
-    if p = 0L && n > 0L then raise (Panic ("foreign.copy: null pointer", sp));
-    if n > Int64.of_int Sys.max_string_length then raise (Panic (sprintf "foreign.copy: length %Ld is too large" n, sp));
-    VBytes (peek p (Int64.to_int n))
 end
 
 (* ---------- processes ----------

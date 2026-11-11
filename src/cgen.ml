@@ -354,11 +354,21 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     line (sprintf "    %s = %s;" dst (mk_enum c t 1 [ "m_" ]));
     line "  }";
     line "}"
+  | I.CallC ({ lib = "vela"; _ }, [ p; n ], sp) ->
+    (* the runtime's own helper: copy n bytes of C memory *)
+    set (sprintf "w_ffi_copy((%s).f0, %s, %s)" (a p) (a n) (where sp))
   | I.CallC (cs, args, sp) ->
     if not (List.mem cs.sym c.csyms) then c.csyms <- c.csyms @ [ cs.sym ];
-    let cap, vals = match List.map a args with cap :: vs -> (cap, vs) | [] -> failwith "cgen: foreign call" in
     line "{";
-    line (sprintf "  w_foreign_check(%s, %s, %s);" cap (c_string cs.lib) (where sp));
+    let vals =
+      if cs.trusted then List.map a args
+      else
+        match List.map a args with
+        | cap :: vs ->
+          line (sprintf "  w_foreign_check(%s, %s, %s);" cap (c_string cs.lib) (where sp));
+          vs
+        | [] -> failwith "cgen: foreign call"
+    in
     let rest = ref vals and outs = ref [] in
     let cargs =
       List.mapi

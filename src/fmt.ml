@@ -626,9 +626,9 @@ let format ~file src =
   (* consecutive declarations of one foreign block print as that block *)
   let rec groups = function
     | [] -> []
-    | IFn ({ fn_foreign = Some (lib, _); _ } as d) :: rest ->
+    | IFn ({ fn_foreign = Some { flib = lib; _ }; _ } as d) :: rest ->
       let rec take acc = function
-        | IFn ({ fn_foreign = Some (l, _); _ } as d) :: r when l = lib -> take (d :: acc) r
+        | IFn ({ fn_foreign = Some { flib = l; _ }; _ } as d) :: r when l = lib -> take (d :: acc) r
         | r -> (List.rev acc, r)
       in
       let ds, rest = take [ d ] rest in

@@ -11,6 +11,10 @@
      [dependencies]
      json = { path = "vendor/json" }
      fetch = { path = "../fetch", caps = ["net"] }
+     zlib = { path = "../zlib" }
+
+     [trust]
+     foreign = ["zlib"]
 
    A dependency is a directory holding NAME.vela (and any modules it uses from
    the same directory). Because Vela has no ambient authority, a function can
@@ -30,11 +34,15 @@ type dep = { dname : string; dir : string; caps : string list; dspan : Span.t; s
    like the text after `--grant KIND=`. An fs directory is made absolute
    relative to vela.toml. Only the vela.toml of the program being run is read
    for grants; a dependency's never is. *)
-type t = { pname : string; file : string; deps : dep list; grants : (string * string) list }
+(* [trust]: `foreign = [...]` names the dependencies that may call C. C code
+   can do anything the process can, so this is full trust, given only here,
+   by the program; `caps` cannot grant it. In src/std/vela.toml it names the
+   standard library modules whose foreign calls need no Foreign capability. *)
+type t = { pname : string; file : string; deps : dep list; grants : (string * string) list; trust : string list }
 
 let grant_kinds = [ "net"; "fs"; "listen"; "env"; "exec"; "foreign" ]
 
-let cap_grants = [ "net"; "fs"; "listen"; "stdout"; "clock"; "rand"; "stdin"; "env"; "exec"; "foreign" ]
+let cap_grants = [ "net"; "fs"; "listen"; "stdout"; "clock"; "rand"; "stdin"; "env"; "exec" ]
 
 (* The grant that covers a capability type. *)
 let grant_of (c : Types.cap) =
@@ -145,7 +153,7 @@ let parse file src : t =
     | _ -> fail !pos "expected a string, an array or an inline table"
   in
   let section = ref "" in
-  let name = ref "" and deps = ref [] and grants = ref [] in
+  let name = ref "" and deps = ref [] and grants = ref [] and trust = ref [] in
   let dir = Filename.dirname file in
   skip_ws ();
   while !pos < n do
@@ -154,8 +162,8 @@ let parse file src : t =
       let k, _ = key () in
       if peek () <> ']' then fail !pos "expected `]`";
       incr pos;
-      if k <> "package" && k <> "dependencies" && k <> "grants" then
-        fail (!pos - 1) ("unknown table [" ^ k ^ "]; vela.toml has [package], [grants] and [dependencies]");
+      if k <> "package" && k <> "dependencies" && k <> "grants" && k <> "trust" then
+        fail (!pos - 1) ("unknown table [" ^ k ^ "]; vela.toml has [package], [grants], [dependencies] and [trust]");
       section := k;
       end_line ()
     end
@@ -230,11 +238,21 @@ let parse file src : t =
         in
         List.iter (fun v -> if v = "" then raise (Bad (sp, "a grant cannot be empty"))) vs;
         grants := !grants @ List.map (fun v -> (g, v)) vs
-      | _ -> raise (Bad (sp, "keys belong in [package], [grants] or [dependencies]"))
+      | "trust", "foreign", VArr names ->
+        if !trust <> [] then raise (Bad (sp, "[trust] foreign is listed twice"));
+        if names = [] then raise (Bad (sp, "an empty trust list trusts nothing; remove the line"));
+        trust := names
+      | "trust", _, _ -> raise (Bad (sp, "[trust] takes `foreign = [\"dependency\", ...]`: the dependencies that may call C"))
+      | _ -> raise (Bad (sp, "keys belong in [package], [grants], [dependencies] or [trust]"))
     end;
     skip_ws ()
   done;
-  { pname = !name; file; deps = List.rev !deps; grants = !grants }
+  List.iter
+    (fun t ->
+      if not (List.exists (fun d -> d.dname = t) !deps) && file <> "<std>/vela.toml" then
+        raise (Bad (span 0 0, Printf.sprintf "[trust] names `%s`, which is not in [dependencies]" t)))
+    !trust;
+  { pname = !name; file; deps = List.rev !deps; grants = !grants; trust = !trust }
 
 (* vela.toml in the directory of [main] or the nearest parent. *)
 let find main =

@@ -1067,14 +1067,14 @@ The standard library is checked like a dependency. `src/std/vela.toml` lists the
 | --- | --- |
 | `json`, `list`, `text`, `format`, `time`, `regex` | nothing: pure |
 | `http` | `net` (Net, Conn) and `listen` (Listener, Conn) |
-| `sql` | `foreign` (to call SQLite) and `fs` (the database file's directory) |
+| `sql` | `fs` (the database file's directory); trusted with C (`[trust] foreign = ["sql"]`) to call SQLite |
 
 A module missing from the list may take nothing. `vela caps FILE` shows what each std function takes. What stays trusted, and why:
 
 - The built-in methods of the capabilities themselves (`Net.get`, `Fs.read`, `Listen.on`, ...), written in OCaml for the interpreter and C for the native runtime. They are where the grants are enforced (host allowlists, the fs root, read-only), so there is nothing below them to check them against; they are covered by the tests of both backends.
 - The built-in methods of plain values (`Str`, `List`, `Map`, channels, ...). They take no capability, so they cannot do I/O.
 - The std modules' source. It is embedded in the compiler, not fetched, so it is as trustworthy as the compiler binary; the manifest check makes sure that what it can do stays what it declares.
-- The C libraries that std modules declare in `foreign` blocks (SQLite for `sql`). The checker sees that `sql` takes `Foreign`, but not what SQLite does with it; the module wraps every call and keeps SQLite inside the `Fs` grant (see `sql` below).
+- The C libraries that std modules trusted in the manifest's `[trust]` declare in `foreign` blocks (SQLite for `sql`). Their calls need no `Foreign`, and the declarations are private to the module; the module wraps every call and keeps SQLite inside the `Fs` grant (see `sql` below). A standard library module that is not trusted cannot call C. Trusted modules may also declare the runtime's own helper library, `foreign "vela" { fn vela_copy(p: Handle, n: Int) -> Bytes }`, which no other code may.
 - Callbacks. `http.serve(l, n, handler)` calls `handler` inside std code; the handler carries only the capabilities its closure captured from your code, which appear in your signatures, not std's.
 
 ### json
@@ -1222,31 +1222,30 @@ fn main(root: Root) {
 
 ### sql
 
-SQL databases through SQLite, built on foreign functions (section 9) and the system's `libsqlite3` (on macOS it is part of the OS; on Linux install the SQLite development package). A program that uses it needs `--grant foreign=sqlite3`, and `--grant fs=DIR` for a database file.
+SQL databases through SQLite, built on foreign functions (section 9) and the system's `libsqlite3` (on macOS it is part of the OS; on Linux install the SQLite development package). The module is trusted to call SQLite itself, so a program needs no foreign grant: `--grant fs=DIR` for a database file, and nothing for `sql.memory()`.
 
 ```
 use sql
 
 fn main(root: Root) -> Result[(), IoError] {
-    let f = root.foreign                              // --grant foreign=sqlite3
-    let db = sql.open(f, root.fs, "app.db")?          // --grant fs=DIR
-    db.exec(f, "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER)", [])?
-    db.exec(f, "INSERT INTO users (name, age) VALUES (?, ?)", [sql.Text("Ada"), sql.Int(36)])?
-    for row in db.query(f, "SELECT id, name, age FROM users WHERE age > ?", [sql.Int(30)])? {
+    let db = sql.open(root.fs, "app.db")?          // --grant fs=DIR
+    db.exec("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER)", [])?
+    db.exec("INSERT INTO users (name, age) VALUES (?, ?)", [sql.Text("Ada"), sql.Int(36)])?
+    for row in db.query("SELECT id, name, age FROM users WHERE age > ?", [sql.Int(30)])? {
         root.stdout.print("{row.int("id") ?? 0} {row.text("name") ?? ""}")
     }
-    db.close(f)
+    db.close()
 }
 ```
 
-- `sql.open(f, fs, name)` opens or creates the database file `name` under the directory `fs` grants (`fs.full_path`), read-only when `fs` is read-only (the file must then exist). `sql.memory(f)` is a fresh in-memory database. Both return `Result[Db, IoError]`: `Denied` when `foreign` does not grant `sqlite3` or the path is outside the grant, `Failed` with SQLite's message otherwise.
-- Every operation takes the `Foreign` capability, since it calls C: `db.exec(f, text, params)`, `db.query(f, text, params)`. `Db` is a plain value holding the connection; it can be passed to tasks, which share the one connection safely (SQLite serialises it). `db.close(f)` closes it; a `Db` must not be used after that, and one that is never closed stays open until the program exits.
+- `sql.open(fs, name)` opens or creates the database file `name` under the directory `fs` grants (`fs.full_path`), read-only when `fs` is read-only (the file must then exist). `sql.memory()` is a fresh in-memory database. Both return `Result[Db, IoError]`: `Denied` when the path is outside the grant, `Failed` with SQLite's message otherwise.
+- `Db` is a plain value holding the connection, so `db.exec(text, params)` and `db.query(text, params)` take nothing else. It can be passed to tasks, which share the one connection safely (SQLite serialises it). Code that holds a `Db` can change that database and nothing else. `db.close()` closes it; a `Db` must not be used after that, and one that is never closed stays open until the program exits.
 - Values go in as parameters, never into the SQL text: each `?` takes the next item of `params`, a `List[sql.Value]`, which is `sql.Null`, `sql.Int(n)`, `sql.Float(x)`, `sql.Text(s)` or `sql.Blob(bytes)`. The number of `?`s must match the list.
 - `exec` returns the number of rows changed. With no parameters its text may hold several statements separated by `;` (a schema); with parameters it must be exactly one.
 - `query` runs one statement and returns every row as a `List[sql.Row]`; `query_one` returns the first, as an `Option`. A row holds `columns` (names) and `values`. `row.get(name)` is the `Value`; `row.int(name)`, `row.float(name)` (an integer reads as a float too), `row.text(name)` and `row.blob(name)` are `Option`s, `None` for NULL; `row.is_null(name)`. Asking for a column the row does not have, or reading one as the wrong type, panics: that is a bug in the query or the code, not a condition to handle.
-- `db.transaction(f, || { ...; Ok(v) })` runs the closure between `BEGIN` and `COMMIT`. If it returns `Err` or panics, the transaction is rolled back and the error (or the panic) goes on. Transactions do not nest: starting one inside another is an `Err`.
-- `db.last_id(f)` is the rowid of the last row inserted through the connection.
-- SQLite stays inside the grants. `ATTACH` is turned off, and with it `VACUUM` (which attaches a temporary database; `VACUUM INTO` would write anywhere), so SQL cannot open other files. The database file is not opened through a symlink, and `open` refuses a database whose `-journal`, `-wal` or `-shm` file is a symlink out of the granted directory (or a broken one), since SQLite follows those. URI filenames and extensions are off. What remains is a race no Vela code can cause: another process that can write to the directory swapping in such a symlink while the database is open. SQLite writes its journal next to the database, inside the granted directory. A busy database is waited on for up to 5 seconds; that wait, like every SQLite call, blocks the worker thread.
+- `db.transaction(|| { ...; Ok(v) })` runs the closure between `BEGIN` and `COMMIT`. If it returns `Err` or panics, the transaction is rolled back and the error (or the panic) goes on. Transactions do not nest: starting one inside another is an `Err`.
+- `db.last_id()` is the rowid of the last row inserted through the connection.
+- SQLite stays inside the grants. `ATTACH` is turned off, and with it `VACUUM` (which attaches a temporary database; `VACUUM INTO` would write anywhere), so SQL cannot open other files. The database file is not opened through a symlink, and `open` refuses a database whose `-journal`, `-wal` or `-shm` file is a symlink out of the granted directory (or a broken one), since SQLite follows those. URI filenames and extensions are off (SQLite's defaults, which the module never changes), and temporary tables and sorts stay in memory. What remains is a race no Vela code can cause: another process that can write to the directory swapping in such a symlink while the database is open. SQLite writes its journal next to the database, inside the granted directory. A busy database is waited on for up to 5 seconds; that wait, like every SQLite call, blocks the worker thread.
 
 ## 20. Not yet
 
