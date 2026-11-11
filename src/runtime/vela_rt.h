@@ -1973,7 +1973,7 @@ static void w_group_wait(WGroup *g, int cancellable) {
       }
     }
   } else pthread_mutex_unlock(&g->mu);
-  w_tm_remove(&g->deadline);
+  if (g->deadline.fire) w_tm_remove(&g->deadline);
 }
 /* Joining a group whose code is being abandoned (a panic, or the task
    running it was cancelled): a cancellation reaches its tasks too. */
