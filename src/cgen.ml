@@ -20,6 +20,7 @@ type ctx = {
   mutable inrange : (int * int) list; (* (list var, index var): index proven in range *)
   mutable chan_tys : ty list; (* element types of channels *)
   mutable dyns : (string * ty * (string * ty list * ty) list) list; (* vtables: C name, boxed type, methods *)
+  mutable cell_tys : ty list; (* types of owned locals, which need a drop-through-pointer function *)
 }
 
 let is_enum c = function TNamed (n, _) -> Hashtbl.mem c.g.enums n | _ -> false
@@ -278,6 +279,7 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     line "  w_catch_init(&c_);";
     line "  WCatch **slot_ = w_catch_slot();";
     line "  if (_setjmp(c_.jb) == 0) {";
+    line "    WCatch *guard_ __attribute__((cleanup(w_catch_land))) = &c_;";
     line "    *slot_ = &c_;";
     line (sprintf "    %s r_ = ((%s (*)(WClo*))(%s)->fn)(%s);" (ctype c rt) (ctype c rt) fv fv);
     line "    *slot_ = c_.prev;";
@@ -530,6 +532,27 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
 
 (* ---------- statements ---------- *)
 
+(* ---------- owned locals: unwinding drops them after a panic ---------- *)
+
+(* A local that owns memory gets a flag (does it still own its value?) and a
+   cleanup that drops it when the flag is set as its scope is left. Normal
+   code clears the flag before moving or dropping the value, so the cleanup
+   only acts during unwinding. *)
+let owns_memory _c t = not (is_scalar t)
+
+let cell_decl c line (v : I.var) on =
+  if owns_memory c v.ty then begin
+    if not (List.exists (fun t -> cname c t = cname c v.ty) c.cell_tys) then c.cell_tys <- c.cell_tys @ [ v.ty ];
+    line (sprintf "uint8_t %s_o = %d;" (var v) (if on then 1 else 0));
+    line (sprintf "WCl %s_cl __attribute__((cleanup(w_cl_run))) = { &%s, &%s_o, w_dp_%s };" (var v) (var v) (var v) (cname c v.ty))
+  end
+
+let set_owned c line (v : I.var) on = if owns_memory c v.ty then line (sprintf "%s_o = %d;" (var v) (if on then 1 else 0))
+
+(* clear the flags of variables an rhs moves out of, before it runs *)
+let release_moved c line atoms =
+  List.iter (function I.V (v : I.var) -> set_owned c line v false | _ -> ()) atoms
+
 let rec stmts c out ind (ss : I.stmt list) = List.iter (stmt c out ind) ss
 
 and stmt c out ind (s : I.stmt) =
@@ -537,17 +560,28 @@ and stmt c out ind (s : I.stmt) =
   match s with
   | I.Let (v, r) ->
     line (sprintf "%s %s;" (ctype c v.ty) (var v));
-    rhs_into c out ind (var v) v.ty r
-  | I.Decl v -> line (sprintf "%s %s;" (ctype c v.ty) (var v))
-  | I.Init (v, r) -> rhs_into c out ind (var v) v.ty r
+    cell_decl c line v false;
+    release_moved c line (I.consumed r);
+    rhs_into c out ind (var v) v.ty r;
+    set_owned c line v true
+  | I.Decl v ->
+    line (sprintf "%s %s;" (ctype c v.ty) (var v));
+    cell_decl c line v false
+  | I.Init (v, r) ->
+    release_moved c line (I.consumed r);
+    rhs_into c out ind (var v) v.ty r;
+    set_owned c line v true
   | I.Set (v, r, flag) ->
+    release_moved c line (I.consumed r);
     line "{";
     line (sprintf "  %s n_;" (ctype c v.ty));
     rhs_into c out (ind ^ "  ") "n_" v.ty r;
     if !flag && not (is_scalar v.ty) then line (sprintf "  %s_drop(%s);" (cname c v.ty) (var v));
     line (sprintf "  %s = n_;" (var v));
-    line "}"
+    line "}";
+    set_owned c line v true
   | I.Mutate (v, steps, m) ->
+    release_moved c line (I.mut_atoms m);
     line "{";
     line (sprintf "  %s* p0_ = &%s;" (ctype c v.ty) (var v));
     let p, t =
@@ -650,8 +684,14 @@ and stmt c out ind (s : I.stmt) =
     c.uniq <- saved
   | I.Break -> line "break;"
   | I.Continue -> line "continue;"
-  | I.Return x -> line (sprintf "return %s;" (atom c x))
-  | I.Drop v -> if not (is_scalar v.ty) then line (sprintf "%s_drop(%s);" (cname c v.ty) (var v))
+  | I.Return x ->
+    release_moved c line [ x ];
+    line (sprintf "return %s;" (atom c x))
+  | I.Drop v ->
+    if not (is_scalar v.ty) then begin
+      set_owned c line v false;
+      line (sprintf "%s_drop(%s);" (cname c v.ty) (var v))
+    end
 
 let signature c (f : I.fn) =
   let ps = List.map (fun (v : I.var) -> sprintf "%s %s" (ctype c v.ty) (var v)) f.params in
@@ -660,11 +700,15 @@ let signature c (f : I.fn) =
 
 let fn_body c out (f : I.fn) =
   Buffer.add_string out (signature c f ^ " {\n");
+  let line s = Buffer.add_string out ("  " ^ s ^ "\n") in
+  (* parameters are owned by the function *)
+  List.iter (fun (v : I.var) -> cell_decl c line v true) f.params;
   if f.captures <> [] then begin
     Buffer.add_string out (sprintf "  struct Env_%s* env_ = (struct Env_%s*)self_;\n" f.fname f.fname);
     List.iteri
       (fun i (v : I.var) ->
-        Buffer.add_string out (sprintf "  %s %s = %s;\n" (ctype c v.ty) (var v) (dup_of c v.ty (sprintf "env_->c%d" i))))
+        Buffer.add_string out (sprintf "  %s %s = %s;\n" (ctype c v.ty) (var v) (dup_of c v.ty (sprintf "env_->c%d" i)));
+        cell_decl c line v true)
       f.captures
   end;
   stmts c out "  " f.body;
@@ -967,7 +1011,7 @@ let type_defs c (out : Buffer.t) =
 let program (g : Lower.gctx) (prog : I.program) : string =
   let c =
     { g; names = Hashtbl.create 32; types = []; lits = Hashtbl.create 32; lit_order = []; boxed = [];
-      envs = Hashtbl.create 16; uniq = []; task_tys = []; inrange = []; chan_tys = []; dyns = [] }
+      envs = Hashtbl.create 16; uniq = []; task_tys = []; inrange = []; chan_tys = []; dyns = []; cell_tys = [] }
   in
   (* bodies first: this discovers every type and literal *)
   let bodies = Buffer.create 65536 in
@@ -994,6 +1038,10 @@ let program (g : Lower.gctx) (prog : I.program) : string =
       end)
     prog.fns;
   let dynbuf = Buffer.create 1024 in
+  (* drop-through-pointer functions for owned locals *)
+  List.iter
+    (fun t -> Buffer.add_string dynbuf (sprintf "static void w_dp_%s(void* p) { %s_drop(*(%s*)p); }\n" (cname c t) (cname c t) (ctype c t)))
+    c.cell_tys;
   List.iter
     (fun (key, t, ms) ->
       let ct = ctype c t and cn = cname c t in

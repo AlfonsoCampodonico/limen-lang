@@ -12,7 +12,7 @@ let cc () = match Sys.getenv_opt "CC" with Some c when c <> "" -> c | _ -> "cc"
 let compile_c ?(flags = [ "-O2" ]) c_text exe : (unit, string) result =
   let c_file = exe ^ ".c" in
   Out_channel.with_open_bin c_file (fun oc -> output_string oc c_text);
-  let argv = Array.of_list ((cc () :: flags) @ [ "-fwrapv"; "-ffp-contract=off"; "-fstack-clash-protection"; "-w"; "-o"; exe; c_file; "-lm" ]) in
+  let argv = Array.of_list ((cc () :: flags) @ [ "-fwrapv"; "-ffp-contract=off"; "-fstack-clash-protection"; "-fexceptions"; "-w"; "-o"; exe; c_file; "-lm" ]) in
   let out, inp, err = Unix.open_process_args_full (cc ()) argv (Unix.environment ()) in
   close_out inp;
   let o = In_channel.input_all out in

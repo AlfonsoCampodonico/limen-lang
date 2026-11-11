@@ -25,6 +25,7 @@
 #include <sys/resource.h>
 #include <pthread.h>
 #include <setjmp.h>
+#include <unwind.h>
 
 extern char **environ;
 typedef uint8_t W_Unit;
@@ -45,7 +46,17 @@ typedef struct WHdr { struct WHdr *prev, *next; int64_t kind; void (*kids)(void 
 /* kids: drops what the object refers to, without freeing the object; used
    when a panic abandons it. */
 enum { WK_BUF, WK_PLAIN, WK_LIST, WK_MAP, WK_CAP, WK_CHAN, WK_GROUP };
-typedef struct WCatch { jmp_buf jb; struct WCatch *prev; char *msg; char *where; WHdr objs; } WCatch;
+typedef struct WCatch {
+  jmp_buf jb; struct WCatch *prev; char *msg; char *where; WHdr objs;
+  int unwinding;                   /* a panic is unwinding to this boundary */
+  struct _Unwind_Exception uexc;   /* in the boundary's frame, which unwinding does not touch */
+} WCatch;
+
+/* An owned local: its value, whether it still owns it, and how to drop it.
+   Generated code gives every local that owns memory one of these with
+   __attribute__((cleanup)), so unwinding after a panic drops it. */
+typedef struct { void *v; uint8_t *o; void (*d)(void *); } WCl;
+static inline void w_cl_run(WCl *c) { if (*c->o) { *c->o = 0; c->d(c->v); } }
 static WCatch **w_catch_slot(void); /* the current fiber's innermost boundary, or NULL outside fibers */
 
 static inline void w_hdr_unlink(WHdr *h) {
@@ -77,7 +88,7 @@ static void w_free(void *p) {
 }
 /* Start a boundary's list; its parent is the current innermost boundary. */
 static void w_catch_init(WCatch *c) {
-  c->msg = NULL; c->where = NULL;
+  c->msg = NULL; c->where = NULL; c->unwinding = 0;
   c->objs.prev = c->objs.next = &c->objs;
   WCatch **slot = w_catch_slot();
   c->prev = slot ? *slot : NULL;
@@ -170,6 +181,17 @@ __attribute__((noreturn)) static void w_fatal_c(const char *msg, const char *whe
   fprintf(stderr, "panic: %s\n  --> %s\n", msg, where);
   exit(1);
 }
+/* Unwinding runs every frame's cleanups. The boundary's frame has a guard
+   variable declared after its other locals, so its cleanup runs first
+   there and jumps back into the boundary before that frame's own locals
+   are touched. The stop function only catches a failed unwind. */
+static _Unwind_Reason_Code w_unwind_stop(int version, _Unwind_Action actions, _Unwind_Exception_Class cls,
+                                         struct _Unwind_Exception *exc, struct _Unwind_Context *ctx, void *param) {
+  (void)version; (void)cls; (void)exc; (void)ctx;
+  if (actions & _UA_END_OF_STACK) _longjmp(((WCatch *)param)->jb, 1);
+  return _URC_NO_REASON;
+}
+static void w_catch_land(WCatch **g) { if ((*g)->unwinding) _longjmp((*g)->jb, 1); }
 __attribute__((noreturn)) static void w_panic_c(const char *msg, const char *where) {
   WCatch **slot = w_catch_slot();
   if (slot && *slot) {
@@ -177,6 +199,12 @@ __attribute__((noreturn)) static void w_panic_c(const char *msg, const char *whe
     c->msg = strdup(msg);
     c->where = strdup(where);
     *slot = c->prev;
+    /* unwind to the boundary, running the cleanups of every frame on the way,
+       so owned locals are dropped; fall back to a plain jump if unwinding fails */
+    c->unwinding = 1;
+    memset(&c->uexc, 0, sizeof c->uexc);
+    c->uexc.exception_class = 0x56454c4150414e43ULL; /* "VELAPANC" */
+    _Unwind_ForcedUnwind(&c->uexc, w_unwind_stop, c);
     _longjmp(c->jb, 1);
   }
   w_fatal_c(msg, where);
@@ -1655,6 +1683,7 @@ static void w_task_entry(void *p) {
   c.prev = NULL;
   WCatch **slot = w_catch_slot();
   if (_setjmp(c.jb) == 0) {
+    WCatch *guard __attribute__((cleanup(w_catch_land))) = &c;
     *slot = &c;
     t->run(t);
     *slot = NULL;
