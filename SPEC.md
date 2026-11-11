@@ -403,6 +403,7 @@ let results = group g {
 - Tasks share data by value, so there are no data races. A task reaches the world only through capabilities its closure captured. Spawning is not a capability.
 - Tasks are lightweight: natively each is a fiber with a small stack, scheduled on one worker thread per core (`VELA_THREADS` overrides this), and a task waiting on a group, a channel or a socket parks without blocking a thread. The interpreter runs tasks as coroutines. Output printed by tasks may interleave differently between the two.
 - If every task is waiting and nothing can wake one, the program panics with `all tasks are blocked (deadlock)` instead of hanging.
+- A panic in a task ends only that task. The group still waits for the others, then passes the first panic on (section 15).
 
 ### Channels
 
@@ -547,7 +548,8 @@ Strings compare byte by byte, so `c >= "a" && c <= "z"` tests a one-byte string.
 
 | Function | Meaning |
 | --- | --- |
-| `panic(msg)` | abort with a message and source location |
+| `panic(msg)` | stop with a message and source location (section 15) |
+| `catch(f)` | `Result[T, Str]`: run `f: fn() -> T`; `Err(message)` if it panicked (section 15) |
 | `channel(n)` | a new `Chan[T]` with capacity `n` |
 | `map()`, `map(pairs)` | a new `Map[K, V]`, empty or from a `List[(K, V)]` |
 | `assert(cond)` | panic with `assertion failed` unless `cond` is true |
@@ -661,7 +663,21 @@ Every diagnostic has a stable code. `vela explain CODE` prints its explanation, 
 | E0403 | module has no such item |
 | E0404 | module name used as a value |
 
-A **panic** (division by zero, index out of range, `panic(...)`, no matching arm) prints `panic: message` and the source location to stderr, then exits with status 1.
+A **panic** (division by zero, index out of range, a missing map key, `panic(...)`, no matching arm) stops the code that hit it:
+
+- Inside `catch(|| ...)`, the panic ends the closure and `catch` returns `Err(message)`. Otherwise it returns `Ok(value)`.
+- Inside a task, the panic ends only that task; the other tasks of its group run to completion. When the group finishes, it passes the first panic (in the order the tasks were started) on to the code that ran the group, where a `catch` can handle it.
+- Anywhere else, it prints `panic: message` and the source location to stderr, and the program exits with status 1. A deadlock always ends the program.
+
+```
+let r = catch(|| parse_config(text))      // Result[Config, Str]
+match r {
+    Ok(cfg) => run(cfg),
+    Err(msg) => out.print("bad config: {msg}"),
+}
+```
+
+Memory held by the code a panic abandoned is not freed, so `catch` is for keeping a program alive through bugs, such as a server answering 500 for one request, not for ordinary control flow; use `Result` and `?` for errors you expect.
 
 ## 16. Grammar
 
@@ -791,7 +807,7 @@ HTTP/1.1 over plain TCP (no TLS yet). Each message is read whole; bodies up to 8
 | `struct Response { status: Int, headers, body }`, `text(status, body)`, `json(status, body)`, `reason(status)` | |
 | `get(net, url)`, `post(net, url, content_type, body)`, `request(net, method, url, headers, body)` | `Result[Response, IoError]`; `http://host[:port]/path` URLs, chunked responses decoded |
 | `read_request(conn)`, `write_response(conn, r)` | one message on a connection |
-| `handle(conn, handler) -> Bool` | read, answer with `handler` (400 if malformed), close |
+| `handle(conn, handler) -> Bool` | read, answer with `handler` (400 if malformed, 500 if the handler panics), close |
 | `serve(listener, count, handler) -> Int` | accept `count` connections, each handled in its own task; returns how many were answered |
 
 ```

@@ -48,6 +48,7 @@ type rhs =
       (* box a value of a concrete type as `dyn I` (consumed); one entry per
          interface method: the C function implementing it, its parameter
          types after self, and its result type *)
+  | Catch of atom * ty (* call a closure (borrowed) under a panic boundary; ty is its result type *)
   | CallDyn of int * ty list * ty * atom * atom list (* method index, params, result, receiver (borrowed), args (consumed) *)
 
 and ipart = IStr of string | IVal of atom * ty | IValQ of atom * ty (* printed as inside a container *)
@@ -100,6 +101,7 @@ let borrowed = function
   | Atom _ | Call _ | MkStruct _ | MkEnum _ | MkList _ | MkClosure _ -> []
   | CallClo (c, _) -> [ c ]
   | CallDyn (_, _, _, r, _) -> [ r ]
+  | Catch (c, _) -> [ c ]
   | MkDyn _ -> []
   | Bin (_, _, a, b, _) -> [ a; b ]
   | Neg (_, a) | Not a -> [ a ]

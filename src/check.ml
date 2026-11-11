@@ -201,7 +201,7 @@ let visible_names ctx f =
   List.concat_map (fun s -> List.of_seq (Hashtbl.to_seq_keys s.vars)) f.scopes
   @ List.of_seq (Hashtbl.to_seq_keys ctx.fns)
   @ List.of_seq (Hashtbl.to_seq_keys ctx.owners)
-  @ [ "panic"; "channel"; "assert"; "assert_eq" ]
+  @ [ "panic"; "channel"; "assert"; "assert_eq"; "map"; "catch" ]
 
 (* Generic functions' bounds: function -> type parameter -> interfaces. *)
 let fn_bounds : (string, (string * string list) list) Hashtbl.t = Hashtbl.create 8
@@ -554,6 +554,15 @@ and check_call ctx f callee args sp =
      | [ a ] -> expect ctx f a TInt
      | _ -> err ctx "E0107" sp "`channel` takes 1 argument, its capacity"; check_args ctx f args);
     TChan (fresh ())
+  | EVar "catch" when lookup f "catch" = None && not (Hashtbl.mem ctx.fns "catch") -> (
+    (* catch(|| ...): Ok(value), or Err(message) if anything inside panicked *)
+    let t = fresh () in
+    match args with
+    | [ a ] -> expect ctx f a (TFn ([], t)); TNamed ("Result", [ t; TStr ])
+    | _ ->
+      err ctx "E0107" sp "`catch` takes 1 argument, a closure with no parameters, as in `catch(|| risky())`";
+      check_args ctx f args;
+      TErr)
   | EVar "map" when lookup f "map" = None && not (Hashtbl.mem ctx.fns "map") ->
     let k = fresh () and v = fresh () in
     (match args with

@@ -177,4 +177,6 @@ Interfaces: `interface Shape { fn area(self) -> Float }` bounds a generic parame
 
 Tuples `(Int, Str)` and maps `Map[Str, Int]` are built in: `let (q, r) = divmod(17, 5)`, `counts[w] = counts.get(w) ?? 0 + 1`. Maps iterate in insertion order, the same in both backends (see [examples/tuples.vela](examples/tuples.vela) and [examples/maps.vela](examples/maps.vela)).
 
+A panic ends only the task it happens in, and `catch(|| ...)` turns one into `Err(message)`, so `http.serve` answers 500 when a handler panics and keeps serving.
+
 Not yet: `select` over channels, TLS and SQL. `Int` is 64-bit and wraps on overflow, identically in the interpreter and in native code.

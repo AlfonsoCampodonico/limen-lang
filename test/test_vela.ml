@@ -120,7 +120,9 @@ let run_native ?(grants = Interp.no_grants) ?modules name src =
     let code = Sys.command ("ASAN_OPTIONS=detect_leaks=0 VELA_LEAKCHECK=1 " ^ cmd) in
     Ok (code, read_file o, read_file e)
 
-let check_native name ?grants ?modules src ~want_out ~want_err_prefix =
+(* [leaky]: the program recovers from panics, and memory owned by code a
+   panic abandoned is not freed, so the leak count may be non-zero. *)
+let check_native name ?(leaky = false) ?grants ?modules src ~want_out ~want_err_prefix =
   if native_enabled then
     match run_native ?grants ?modules name src with
     | Error m -> ok (name ^ "/native") false m
@@ -128,14 +130,15 @@ let check_native name ?grants ?modules src ~want_out ~want_err_prefix =
       ok (name ^ "/native") (o = want_out) (sprintf "stdout %S, want %S (stderr %S)" o want_out e);
       match want_err_prefix with
       | None ->
-        ok (name ^ "/native-clean") (code = 0 && e = "vela-leakcheck: 0 live\n")
+        ok (name ^ "/native-clean")
+          (code = 0 && (e = "vela-leakcheck: 0 live\n" || (leaky && String.starts_with ~prefix:"vela-leakcheck: " e)))
           (sprintf "exit %d, stderr %S" code e)
       | Some p -> ok (name ^ "/native-panic") (String.starts_with ~prefix:p e) (sprintf "stderr %S" e))
 
 (* Concurrency: the same program again under ThreadSanitizer. *)
 let tsan = [ "-O1"; "-g"; "-fsanitize=thread" ]
 
-let check_tsan name ?(grants = Interp.no_grants) src want =
+let check_tsan name ?(leaky = false) ?(grants = Interp.no_grants) src want =
   if native_enabled then begin
     let items, ds, _ = compile name src in
     let exe = Filename.concat tmpdir (name ^ "-tsan") in
@@ -155,14 +158,16 @@ let check_tsan name ?(grants = Interp.no_grants) src want =
       in
       let code = Sys.command ("TSAN_OPTIONS=halt_on_error=1 VELA_THREADS=8 VELA_LEAKCHECK=1 " ^ cmd) in
       let o = read_file o and e = read_file e in
-      ok (name ^ "/tsan") (code = 0 && o = want && e = "vela-leakcheck: 0 live\n") (sprintf "exit %d, stdout %S, stderr %S" code o e)
+      ok (name ^ "/tsan")
+        (code = 0 && o = want && (e = "vela-leakcheck: 0 live\n" || (leaky && String.starts_with ~prefix:"vela-leakcheck: " e)))
+        (sprintf "exit %d, stdout %S, stderr %S" code o e)
   end
 
-let out name ?grants ?modules src want =
+let out name ?leaky ?grants ?modules src want =
   (match run ?grants ?modules name src with
    | Ok (got, _) -> ok name (got = want) (sprintf "got %S, want %S" got want)
    | Error e -> ok name false e);
-  check_native name ?grants ?modules src ~want_out:want ~want_err_prefix:None
+  check_native name ?leaky ?grants ?modules src ~want_out:want ~want_err_prefix:None
 
 let errs ?modules name src want =
   let _, ds, _ = compile ?modules name src in
@@ -1069,10 +1074,10 @@ fn main(root: Root) {
     In_channel.with_open_bin (Filename.concat dir f) In_channel.input_all
   in
   out "std-json-list-text" (example "stdlib.vela") "{\"name\":\"Ada\",\"tags\":[\"x\",\"yé😀\"],\"n\":-125,\"ok\":true,\"none\":null,\"nested\":{\"a\":[1,2,{}]}}\nAda\n-125.0\nexpected a value at byte 3\nexpected `:` at byte 5\nexpected a value at byte 0\nexpected a closing `\"` at byte 4\nexpected end of input at byte 4\nexpected a value at byte 0\n{\"q\":\"a\\\"b\\n\\u0001\",\"xs\":[1,null,false]}\na,b,c\n[0, 1, 2, 3, 4] 2 [1, 3] [1, 2, 3] [1, 2]\n007|ab..|---|2|[\"hi\", \"there\", \"you\"]\n";
-  out "std-http"
+  out "std-http" ~leaky:true
     ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] }
     (example "http_demo.vela")
-    "served 3\n200 text/plain; charset=utf-8 hi GET\n404 text/plain; charset=utf-8 no /missing\n201 {\"got\":[1,{\"a\":true}]}\nchunked sent\n200 hello world\n";
+    "served 4\n200 text/plain; charset=utf-8 hi GET\n500 text/plain; charset=utf-8 internal error\n404 text/plain; charset=utf-8 no /missing\n201 {\"got\":[1,{\"a\":true}]}\nchunked sent\n200 hello world\n";
   (* std code is checked like user code: a json error names the byte *)
   out "std-json-errors"
     "use json\n\nfn main(root: Root) {\n    for s in [\"\\{\\\"a\\\": [1, 2.5e1, \\\"\\\\u0041\\\"]\\}\", \"[1 2]\", \"\\\"\\\\x\\\"\"] {\n        match json.parse(s) {\n            Ok(v) => root.stdout.print(json.stringify(v)),\n            Err(e) => root.stdout.print(e),\n        }\n    }\n}\n"
@@ -1150,6 +1155,15 @@ fn main(root: Root) {
   out "int64" "fn main(root: Root) {\n    let out = root.stdout\n    let max = 9223372036854775807\n    let min = -max - 1\n    out.print(\"{max} {min} {max + 1} {min - 1} {max * 2} {min / -1} {min % -1}\")\n    out.print(\"{min.abs()} {(-7) / 2} {(-7) % 2} {7 % -2}\")\n    out.print(\"{4611686018427387904 * 2} {3037000500 * 3037000500}\")\n    out.print(\"{1.0e19.to_int()} {(-1.0e19).to_int()} {9.0e18.to_int()} {(0.0 / 0.0).to_int()}\")\n    out.print(\"{\"9223372036854775807\".parse_int()} {\"-9223372036854775808\".parse_int()} {\"9223372036854775808\".parse_int()}\")\n    out.print(\"{max.to_float()} {[1, 2, 3].get(max)} {\"abc\".slice(-max, max)} {[max, max].sum()}\")\n    match max {\n        9223372036854775807 => out.print(\"matched max\"),\n        _ => out.print(\"no\"),\n    }\n}\n"
     "9223372036854775807 -9223372036854775808 -9223372036854775808 9223372036854775807 -2 -9223372036854775808 0\n-9223372036854775808 -3 -1 1\n-9223372036854775808 -9223372036709301616\n9223372036854775807 -9223372036854775808 9000000000000000000 0\nSome(9223372036854775807) Some(-9223372036854775808) None\n9.22337203685478e+18 None abc -2\nmatched max\n";
   errs "int-literal-too-large" (main_wrap "    let x = 9223372036854775808") [ "E0005" ];
+
+  (* ---------- panics end one task; catch ---------- *)
+  out "catch-and-task-panics" ~leaky:true "fn risky(n: Int) -> Int {\n    if n == 3 {\n        panic(\"three is bad\")\n    }\n    [10, 20][n]\n}\n\nfn main(root: Root) {\n    let out = root.stdout\n    out.print(\"{catch(|| risky(0))} {catch(|| risky(3))} {catch(|| risky(5))}\")\n    out.print(\"{catch(|| 10 / (2 - 2))}\")\n    // a panicking task ends only itself; the group passes the panic on\n    let r = catch(|| group g {\n        for n in [0, 3, 1] {\n            g.go(|| risky(n))\n        }\n    })\n    out.print(\"{r}\")\n    let ok = group g {\n        for n in [0, 1] {\n            g.go(|| catch(|| risky(n + 2)) ?? -1)\n        }\n    }\n    out.print(\"{ok}\")\n    // nested boundaries: the inner one handles its own panic\n    let nested = catch(|| (catch(|| risky(3)) ?? 7) + risky(1))\n    out.print(\"{nested}\")\n}\n" "Ok(10) Err(\"three is bad\") Err(\"index 5 is out of range for a list of length 2\")\nErr(\"division by zero\")\nErr(\"three is bad\")\n[-1, -1]\nOk(27)\n";
+  check_tsan "task-panics-tsan" ~leaky:true
+    "fn work(n: Int) -> Int {\n    if n % 3 == 0 {\n        panic(\"bad {n}\")\n    }\n    n\n}\n\nfn main(root: Root) {\n    let mut i = 0\n    let mut caught = 0\n    while i < 50 {\n        let r = catch(|| group g {\n            for n in [i * 3 + 1, i * 3 + 2, i * 3 + 3] {\n                g.go(|| work(n))\n            }\n        })\n        if r.is_err() {\n            caught = caught + 1\n        }\n        i = i + 1\n    }\n    root.stdout.print(\"{caught}\")\n}\n"
+    "50\n";
+  (* an uncaught panic in a task still ends the program, once its siblings finish *)
+  panics "task-panic-uncaught" "fn main(root: Root) {\n    let xs = group g {\n        g.go(|| 1)\n        g.go(|| [1][3])\n    }\n}\n" "index 3 is out of range for a list of length 1";
+  errs "catch-arity" (main_wrap "    let r = catch(1, 2)") [ "E0107" ];
 
   (* ---------- `??` ---------- *)
   out "else-operator" "fn find(xs: List[Int], x: Int) -> Option[Int] {\n    let mut i = 0\n    while i < xs.len() {\n        if xs[i] == x {\n            return Some(i)\n        }\n        i = i + 1\n    }\n    None\n}\n\nfn boom() -> Int {\n    panic(\"evaluated\")\n}\n\nfn main(root: Root) {\n    let out = root.stdout\n    let xs = [5, 6, 7]\n    out.print(\"{find(xs, 6) ?? -1} {find(xs, 9) ?? -1} {(find(xs, 7) ?? 0) + 10}\")\n    out.print(\"{\"42\".parse_int() ?? 0} {\"x\".parse_int() ?? 0 + 1} {find(xs, 5) ?? boom()}\")\n    let r: Result[Str, Str] = Err(\"no\")\n    out.print(r ?? \"fallback\")\n    let nested: Option[Option[Int]] = Some(None)\n    out.print(\"{nested ?? Some(3) ?? 4}\")\n}\n" "1 -1 12\n42 1 0\nfallback\n4\n";

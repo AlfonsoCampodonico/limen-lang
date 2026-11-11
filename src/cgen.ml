@@ -246,6 +246,24 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     line (sprintf "  d_->base.rc = 1; d_->base.vt = (const WVt*)&Dyn_%s_vt; d_->val = %s;" key (a x));
     line (sprintf "  %s = (WDyn*)d_;" dst);
     line "}"
+  | I.Catch (clo, rt) ->
+    (* run the closure under a panic boundary: Ok(value), or Err(message) *)
+    let fv = match clo with I.V v | I.VDup v -> var v | _ -> failwith "catch closure" in
+    line "{";
+    line "  WCatch c_; c_.msg = NULL; c_.where = NULL;";
+    line "  WCatch **slot_ = w_catch_slot();";
+    line "  c_.prev = *slot_;";
+    line "  if (_setjmp(c_.jb) == 0) {";
+    line "    *slot_ = &c_;";
+    line (sprintf "    %s r_ = ((%s (*)(WClo*))(%s)->fn)(%s);" (ctype c rt) (ctype c rt) fv fv);
+    line "    *slot_ = c_.prev;";
+    line (sprintf "    %s = %s;" dst (mk_enum c t 0 [ "r_" ]));
+    line "  } else {";
+    line "    WStr *m_ = Str_from(c_.msg, (int64_t)strlen(c_.msg));";
+    line "    free(c_.msg); free(c_.where);";
+    line (sprintf "    %s = %s;" dst (mk_enum c t 1 [ "m_" ]));
+    line "  }";
+    line "}"
   | I.CallDyn (k, ps, r, recv, args) ->
     let sigt = sprintf "%s (*)(%s)" (ctype c r) (String.concat ", " ("WDyn*" :: List.map (ctype c) ps)) in
     set (sprintf "((%s)(%s)->vt->m[%d])(%s)" sigt (a recv) k (String.concat ", " (a recv :: List.map a args)))
@@ -302,6 +320,7 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     line "{";
     line (sprintf "  WGroup* g_ = %s;" (a g));
     line "  w_group_wait(g_);";
+    line "  w_group_reraise(g_);";
     line (sprintf "  %s* l_ = %s_new(g_->n);" n n);
     line (sprintf "  for (int64_t i_ = 0; i_ < g_->n; i_++) memcpy(&l_->data[i_], g_->tasks[i_]->slot, sizeof(%s));" (ctype c el));
     line "  l_->len = g_->n;";

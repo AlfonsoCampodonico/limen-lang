@@ -24,6 +24,7 @@
 #include <sys/socket.h>
 #include <sys/resource.h>
 #include <pthread.h>
+#include <setjmp.h>
 
 extern char **environ;
 typedef uint8_t W_Unit;
@@ -83,10 +84,27 @@ static void w_leakcheck(void) {
   if (getenv("VELA_LEAKCHECK")) fprintf(stderr, "vela-leakcheck: %lld live\n", (long long)__atomic_load_n(&w_live, __ATOMIC_ACQUIRE));
 }
 
-__attribute__((noreturn)) static void w_panic_c(const char *msg, const char *where) {
+/* A panic boundary: `catch(|| ...)`, and every task. A panic inside one
+   jumps back to it; memory the abandoned code owned is not freed. */
+typedef struct WCatch { jmp_buf jb; struct WCatch *prev; char *msg; char *where; } WCatch;
+static WCatch **w_catch_slot(void); /* the current fiber's innermost boundary, or NULL outside fibers */
+
+/* Errors no boundary can handle: report and exit. */
+__attribute__((noreturn)) static void w_fatal_c(const char *msg, const char *where) {
   fflush(stdout);
   fprintf(stderr, "panic: %s\n  --> %s\n", msg, where);
   exit(1);
+}
+__attribute__((noreturn)) static void w_panic_c(const char *msg, const char *where) {
+  WCatch **slot = w_catch_slot();
+  if (slot && *slot) {
+    WCatch *c = *slot;
+    c->msg = strdup(msg);
+    c->where = strdup(where);
+    *slot = c->prev;
+    _longjmp(c->jb, 1);
+  }
+  w_fatal_c(msg, where);
 }
 __attribute__((noreturn)) static void w_unreachable(void) { w_panic_c("internal: unreachable", "?"); }
 
@@ -319,6 +337,8 @@ static inline int64_t w_idx(int64_t i, int64_t n, const char *where) {
    (live = 0) until the next rehash compacts them. idx is an open-addressing
    table of entry positions, at most half full. */
 
+/* A random seed per process, so nobody can choose keys that collide (hash
+   flooding). Iteration follows insertion order, so output never depends on it. */
 /* SipHash-1-3 with a 128-bit key from /dev/urandom: a keyed hash, so keys
    cannot be chosen to collide without knowing the key. */
 static uint64_t g_hash_k0, g_hash_k1;
@@ -1164,6 +1184,7 @@ struct WFiber {
   void (*entry)(void *); void *arg;
   WFiber *next;
   int park_state;                       /* W_RUNNING, W_PARKING, W_PARKED or W_NOTIFIED */
+  WCatch *catch_top;                    /* innermost panic boundary */
 #ifdef W_ASAN
   const void *asan_bottom; size_t asan_size;
 #endif
@@ -1397,7 +1418,7 @@ static void w_sched_loop(WWorker *w, int is_main) {
           if (rc == ETIMEDOUT && __atomic_load_n(&w_queued, __ATOMIC_SEQ_CST) == 0
               && __atomic_load_n(&w_nidle, __ATOMIC_SEQ_CST) == __atomic_load_n(&w_nworkers, __ATOMIC_ACQUIRE)
               && __atomic_load_n(&w_io_waiters, __ATOMIC_SEQ_CST) == 0 && !__atomic_load_n(&w_main_done, __ATOMIC_ACQUIRE))
-            w_panic_c("all tasks are blocked (deadlock)", "every task is waiting");
+            w_fatal_c("all tasks are blocked (deadlock)", "every task is waiting");
         } else
           pthread_cond_wait(&w_idle_cv, &w_idle_mu);
       }
@@ -1469,6 +1490,13 @@ static void w_park(void (*after)(void *), void *arg) {
    runnable, so no wakeup is lost and no fiber is resumed while it still runs.
    Locks are never held across a switch. */
 static WFiber *w_current(void) { return w_self()->current; }
+/* Through w_self(), never the thread-local directly: a fiber can resume on
+   another worker thread, and an inlined TLS address would be stale. */
+__attribute__((noinline)) static WCatch **w_catch_slot(void) {
+  WWorker *w = w_self();
+  if (!w || !w->current) return NULL;
+  return &w->current->catch_top;
+}
 static void w_prepare_park(void) { __atomic_store_n(&w_current()->park_state, W_PARKING, __ATOMIC_RELEASE); }
 static void w_park_commit(void *p) {
   WFiber *f = (WFiber *)p;
@@ -1526,7 +1554,7 @@ static void w_main_finished(void) {
 
 typedef struct WGroup WGroup;
 typedef struct WTask WTask;
-struct WTask { WClo *fn; void (*run)(WTask *); WGroup *g; max_align_t slot[]; };
+struct WTask { WClo *fn; void (*run)(WTask *); WGroup *g; char *pmsg; char *pwhere; max_align_t slot[]; };
 struct WGroup { int64_t rc; pthread_mutex_t mu; int64_t pending; WFiber *waiter; int64_t n, cap; WTask **tasks; };
 
 static WGroup *w_group_new(void) {
@@ -1537,9 +1565,20 @@ static WGroup *w_group_new(void) {
   return g;
 }
 static void w_task_entry(void *p) {
-  WTask *t = (WTask *)p;
+  WTask *volatile t = (WTask *)p;
   WGroup *g = t->g;
-  t->run(t);
+  /* a panic ends only this task; the group passes it on when it finishes */
+  WCatch c;
+  c.prev = NULL; c.msg = NULL; c.where = NULL;
+  WCatch **slot = w_catch_slot();
+  if (_setjmp(c.jb) == 0) {
+    *slot = &c;
+    t->run(t);
+    *slot = NULL;
+  } else {
+    t->pmsg = c.msg;
+    t->pwhere = c.where;
+  }
   pthread_mutex_lock(&g->mu);
   WFiber *wake = NULL;
   if (--g->pending == 0) { wake = g->waiter; g->waiter = NULL; }
@@ -1552,7 +1591,7 @@ static void w_spawn(WGroup *g, WClo *fn, void (*run)(WTask *), size_t slot) {
   pthread_once(&w_pool_once, w_pool_start);
   Clo_share(fn);
   WTask *t = (WTask *)w_alloc(sizeof(WTask) + slot);
-  t->fn = fn; t->run = run; t->g = g;
+  t->fn = fn; t->run = run; t->g = g; t->pmsg = NULL; t->pwhere = NULL;
   if (g->n == g->cap) { g->cap *= 2; g->tasks = (WTask **)w_realloc(g->tasks, w_bytes(g->cap, sizeof(WTask *))); }
   g->tasks[g->n++] = t;
   pthread_mutex_lock(&g->mu);
@@ -1570,8 +1609,19 @@ static void w_group_wait(WGroup *g) {
   /* resumed by the last task; w_wake's atomics order its writes before ours */
 }
 static void w_group_release_tasks(WGroup *g) {
-  for (int64_t i = 0; i < g->n; i++) w_free(g->tasks[i]);
+  for (int64_t i = 0; i < g->n; i++) { free(g->tasks[i]->pmsg); free(g->tasks[i]->pwhere); w_free(g->tasks[i]); }
   g->n = 0;
+}
+/* After every task finished: pass on the first panic, in spawn order. */
+static void w_group_reraise(WGroup *g) {
+  for (int64_t i = 0; i < g->n; i++)
+    if (g->tasks[i]->pmsg) {
+      char m[1024], w[512];
+      snprintf(m, sizeof m, "%s", g->tasks[i]->pmsg);
+      snprintf(w, sizeof w, "%s", g->tasks[i]->pwhere);
+      w_group_release_tasks(g);
+      w_panic_c(m, w);
+    }
 }
 static inline WGroup *Group_dup(WGroup *g) { g->rc++; return g; }
 static void Group_drop(WGroup *g) { if (--g->rc == 0) { pthread_mutex_destroy(&g->mu); free(g->tasks); w_free(g); } }

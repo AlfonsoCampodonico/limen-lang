@@ -6,6 +6,10 @@ use json
 fn route(r: http.Request) -> http.Response {
     if r.path == "/hello" {
         http.text(200, "hi " + r.method)
+    } else if r.path == "/crash" {
+        // a bug in a handler: the server answers 500 and keeps serving
+        let empty: List[Str] = []
+        http.text(200, empty[0])
     } else if r.method == "POST" {
         match json.parse(r.body) {
             Ok(v) => http.json(201, json.stringify(json.Obj([json.field("got", v)]))),
@@ -19,7 +23,7 @@ fn route(r: http.Request) -> http.Response {
 fn client(net: Net, port: Int) -> Str {
     let base = "http://127.0.0.1:{port}"
     let mut log = []
-    for u in ["/hello", "/missing"] {
+    for u in ["/hello", "/crash", "/missing"] {
         match http.get(net, base + u) {
             Ok(r) => log.push("{r.status} {r.header("content-type") ?? "-"} {r.body}"),
             Err(e) => log.push("{e}"),
@@ -50,7 +54,7 @@ fn main(root: Root) -> Result[(), IoError] {
     let port = l.port()
     let net = root.net
     let results = group g {
-        g.go(|| "served {http.serve(l, 3, route)}")
+        g.go(|| "served {http.serve(l, 4, route)}")
         g.go(|| client(net, port))
     }
     for r in results {

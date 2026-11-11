@@ -308,11 +308,12 @@ pub fn write_response(c: Conn, r: Response) -> Result[(), IoError] {
     c.write(head_text("HTTP/1.1 {r.status} {reason(r.status)}", hs, r.body))
 }
 
-// Answer one connection: read a request, reply with `handler`'s response
-// (or 400 if the request is malformed), then close. True if it was answered.
+// Answer one connection: read a request, reply with `handler`'s response,
+// then close. A malformed request gets 400; a handler that panics gets 500,
+// and the server keeps running. True if it was answered.
 pub fn handle(c: Conn, handler: fn(Request) -> Response) -> Bool {
     let r = match read_request(c) {
-        Ok(req) => handler(req),
+        Ok(req) => catch(|| handler(req)) ?? text(500, "internal error"),
         Err(_) => text(400, "bad request\n"),
     }
     let ok = write_response(c, r).is_ok()

@@ -44,7 +44,8 @@ type value =
   | VCtor of string * string
   | VPanicFn
   | VCap of cap
-  | VGroup of value option ref list ref (* results of spawned tasks, newest first *)
+  | VGroup of (value, string * Span.t) result option ref list ref
+      (* outcomes of spawned tasks, newest first: a value, or the panic that ended the task *)
   | VChan of chan
   | VChanFn
   | VBuiltin of string (* assert, assert_eq *)
@@ -546,7 +547,9 @@ let rec eval rt env e : value =
     ignore (eval_block rt (sc :: env) b);
     let results = List.rev !tasks in
     wait_until (fun () -> List.for_all (fun r -> !r <> None) results);
-    VList (Array.of_list (List.map (fun r -> Option.get !r) results))
+    (* a panic ended only its task; the group passes the first one on *)
+    List.iter (fun r -> match !r with Some (Error (m, s)) -> raise (Panic (m, s)) | _ -> ()) results;
+    VList (Array.of_list (List.map (fun r -> match !r with Some (Ok v) -> v | _ -> VUnit) results))
 
 and eval_var rt env n sp =
   match find_var env n with
@@ -559,7 +562,7 @@ and eval_var rt env n sp =
       | None ->
         if n = "panic" then VPanicFn
         else if n = "channel" then VChanFn
-        else if n = "assert" || n = "assert_eq" || n = "map" then VBuiltin n
+        else if n = "assert" || n = "assert_eq" || n = "map" || n = "catch" then VBuiltin n
         else raise (Panic ("internal: unbound name " ^ n, sp)))
 
 and ctor_value rt en vn =
@@ -601,6 +604,10 @@ and apply rt fv args sp =
     | [ a; b ] when equal a b -> VUnit
     | [ a; b ] -> raise (Panic (sprintf "assertion failed: %s != %s" (show ~top:false a) (show ~top:false b), sp))
     | _ -> raise (Panic ("assertion failed", sp)))
+  | VBuiltin "catch" -> (
+    match args with
+    | [ f ] -> ( try ok (apply rt f [] sp) with Panic (m, _) -> VEnum ("Result", "Err", [ VStr m ]))
+    | _ -> failwith "internal: catch")
   | VBuiltin "map" -> (
     match args with
     | [] -> VMap empty_map
@@ -757,7 +764,7 @@ and call_method rt v name args sp =
   | VGroup r, "go", [ c ] ->
     let res = ref None in
     r := res :: !r;
-    spawn_fiber (fun () -> res := Some (apply rt c [] sp));
+    spawn_fiber (fun () -> res := Some (try Ok (apply rt c [] sp) with Panic (m, s) -> Error (m, s)));
     VUnit
   | VChan ch, "send", [ v ] ->
     if ch.closed then raise (Panic ("send on a closed channel", sp));

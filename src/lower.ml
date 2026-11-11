@@ -350,6 +350,10 @@ and lower_call f e callee args ty =
   | EVar "channel" when not_local f "channel" && not (Hashtbl.mem f.g.fns "channel") ->
     let cap = lower f (List.hd args) in
     tmp f ty (I.ChanNew (ty, cap, e.espan))
+  | EVar "catch" when not_local f "catch" && not (Hashtbl.mem f.g.fns "catch") ->
+    let c = lower f (List.hd args) in
+    let inner = match tyof f (List.hd args) with TFn (_, r) -> r | _ -> TUnit in
+    tmp f ty (I.Catch (c, inner))
   | EVar "map" when not_local f "map" && not (Hashtbl.mem f.g.fns "map") ->
     let xs = List.map (lower f) args in
     tmp f ty (I.Prim ((if xs = [] then "map_new" else "map_from"), ty, xs, e.espan))
