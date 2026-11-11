@@ -496,6 +496,8 @@ static uint64_t w_siphash13(const unsigned char *in, size_t len) {
 static inline uint64_t Int_hash(int64_t x) { return w_siphash13((const unsigned char *)&x, sizeof x); }
 static inline uint64_t Unit_hash(W_Unit u) { (void)u; return 0; }
 static inline uint64_t Bool_hash(bool b) { return b ? 0x51ED27F1ULL : 0x2545F491ULL; }
+/* Combine the hashes of a struct's fields (boost's hash_combine). */
+static inline uint64_t w_hash_mix(uint64_t h, uint64_t x) { return h ^ (x + 0x9E3779B97F4A7C15ULL + (h << 6) + (h >> 2)); }
 static inline uint64_t Str_hash(WStr *s) { return w_siphash13((const unsigned char *)s->data, (size_t)s->len); }
 __attribute__((noreturn)) static void w_panic_key(WBuf *key, const char *where) {
   WBuf m; buf_init(&m);
@@ -623,11 +625,12 @@ __attribute__((noreturn)) static void w_panic_key(WBuf *key, const char *where) 
       }                                                                                       \
     buf_puts(b, "}");                                                                         \
   }                                                                                           \
-  static V M##_at(M *m, K k, const char *where) {                                             \
+  static V *M##_slot(M *m, K k, const char *where) {                                         \
     V *v = M##_get(m, k);                                                                     \
     if (!v) { WBuf kb; buf_init(&kb); KN##_show(&kb, k, false); w_panic_key(&kb, where); }   \
-    return VN##_dup(*v);                                                                      \
-  }
+    return v;                                                                                 \
+  }                                                                                           \
+  static V M##_at(M *m, K k, const char *where) { return VN##_dup(*M##_slot(m, k, where)); }
 
 typedef struct L_Int L_Int;
 typedef struct L_Str L_Str;

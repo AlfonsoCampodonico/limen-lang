@@ -21,8 +21,13 @@ type cap =
    touches a descriptor number that has been reused. *)
 and sock = { fd : Unix.file_descr; mutable shut : bool }
 
-(* Map keys: Int, Str or Bool. *)
-type mkey = KInt of int64 | KStr of string | KBool of bool
+(* Map keys: Int, Str, Bool, and tuples, structs and enums of them. *)
+type mkey =
+  | KInt of int64
+  | KStr of string
+  | KBool of bool
+  | KStruct of string * (string * mkey) list
+  | KEnum of string * string * mkey list
 
 module KM = Map.Make (struct
   type t = mkey
@@ -108,8 +113,20 @@ let cap_name = function
   | CListen _ -> "Listen" | CListener _ -> "Listener" | CConn _ -> "Conn"
   | CRand -> "Rand" | CStdin -> "Stdin" | CEnv _ -> "Env"
 
-let key_of = function VInt n -> KInt n | VStr s -> KStr s | VBool b -> KBool b | _ -> failwith "internal: map key"
-let val_of_key = function KInt n -> VInt n | KStr s -> VStr s | KBool b -> VBool b
+let rec key_of = function
+  | VInt n -> KInt n
+  | VStr s -> KStr s
+  | VBool b -> KBool b
+  | VStruct (n, fs) -> KStruct (n, List.map (fun (f, v) -> (f, key_of v)) fs)
+  | VEnum (e, v, xs) -> KEnum (e, v, List.map key_of xs)
+  | _ -> failwith "internal: map key"
+
+let rec val_of_key = function
+  | KInt n -> VInt n
+  | KStr s -> VStr s
+  | KBool b -> VBool b
+  | KStruct (n, fs) -> VStruct (n, List.map (fun (f, k) -> (f, val_of_key k)) fs)
+  | KEnum (e, v, ks) -> VEnum (e, v, List.map val_of_key ks)
 let empty_map = { m = KM.empty; next = 0 }
 
 let map_entries mv =

@@ -61,7 +61,7 @@ Statements are separated by a newline or `;`. Two statements on one line without
 | `List[T]` | growable sequence | A value: assigning or passing it never shares mutation (section 8). |
 | `Array[T, N]` | exactly `N` elements | A value type stored inline, like a struct. `N` is an integer literal. |
 | `(A, B)`, `(A, B, C)`, ... | tuples of 2 to 8 values | Written `(1, "a")`, read with `.0`, `.1`, unpacked with patterns. |
-| `Map[K, V]` | keys to values | Keys are `Int`, `Str` or `Bool` (E0113). A value, like `List`; iterates in insertion order. |
+| `Map[K, V]` | keys to values | Keys are `Int`, `Str`, `Bool`, or tuples, structs and enums made of them (E0113). A value, like `List`; iterates in insertion order. |
 | `Option[T]` | `Some(T)`, `None` | From the prelude. |
 | `Result[T, E]` | `Ok(T)`, `Err(E)` | From the prelude. |
 | `IoError` | `Denied(Str)`, `Failed(Str)` | Error type of every capability operation. |
@@ -100,7 +100,9 @@ counts["the"]                             // panics if the key is missing
 for (w, n) in counts.entries() { ... }    // in insertion order
 ```
 
-`m[k] = v` inserts or replaces and needs a `mut` place, like `push`. A map entry is replaced whole: `m[k].field = x` is E0209, so read the value, change the copy, and store it back. Iteration (`keys`, `values`, `entries`) and printing follow insertion order, the same in both backends; replacing a value keeps its key's position, and removing then re-inserting moves it to the end. Two maps are equal when they hold the same entries, in any order.
+`m[k] = v` inserts or replaces and needs a `mut` place, like `push`. An entry can also be changed in place through its key: `m[k].hits = m[k].hits + 1`, `m[k].names.push(n)`, `m[a][b] = v` for a map of maps. Those need the key to be there and panic like `m[k]` when it is not; only `m[k] = v` adds a key.
+
+A key is an `Int`, `Str` or `Bool`, or a tuple, struct or enum made of them, compared by value: `grid[(x, y)]`, `seen[Pos { x, y }]`. `Float` (NaN is not equal to itself), lists and maps cannot be keys (E0113). Iteration (`keys`, `values`, `entries`) and printing follow insertion order, the same in both backends; replacing a value keeps its key's position, and removing then re-inserting moves it to the end. Two maps are equal when they hold the same entries, in any order.
 
 There is no null and no implicit conversion between types: `Int` and `Float` never mix without `to_float()` or `to_int()`.
 
@@ -324,7 +326,7 @@ expr
 - Parameters and pattern bindings are immutable. Use `let mut y = y` to get a mutable copy.
 - `for` iterates over a snapshot: changing the list inside the loop does not affect the iteration. Over a range, both bounds are evaluated once, before the first iteration.
 - `break` and `continue` only work inside loops, not across closures (E0208).
-- Only variables, fields, list or array elements and map entries can be assigned (E0209).
+- Only variables, fields, list or array elements and map entries, and paths through them such as `m[k].x` or `xs[i].tags[j]`, can be assigned (E0209).
 
 ## 7. Patterns
 
@@ -552,6 +554,7 @@ Strings compare byte by byte, so `c >= "a" && c <= "z"` tests a one-byte string,
 | `get(k)` | `Option[V]` |
 | `contains(k)` | `Bool` |
 | `m[k] = v` | inserts or replaces (needs `mut`) |
+| `m[k].field = v`, `m[k].push(x)`, ... | changes the entry in place (needs `mut`); panics if `k` is missing |
 | `remove(k)` | `()`, removes the entry if present (needs `mut`) |
 | `keys()`, `values()` | `List[K]`, `List[V]`, in insertion order |
 | `entries()` | `List[(K, V)]`, in insertion order |
@@ -673,7 +676,7 @@ Every diagnostic has a stable code. `vela explain CODE` prints its explanation, 
 | E0110 | misplaced `self`, or a method on a built-in type |
 | E0111 | a type does not satisfy an interface |
 | E0112 | a value that cannot become `dyn` |
-| E0113 | a map key type other than `Int`, `Str` or `Bool` |
+| E0113 | a map key type that is not `Int`, `Str`, `Bool`, or a tuple, struct or enum of them |
 | E0201 | type mismatch |
 | E0202 | misuse of `?` |
 | E0203 | `if` without `else` produces a value |

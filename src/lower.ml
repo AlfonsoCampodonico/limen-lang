@@ -409,6 +409,11 @@ and lower_place f e : I.var * I.step list =
   | EField (r, name, _) ->
     let v, s = lower_place f r in
     (v, s @ [ I.PField (field_index f.g (tyof f r) name) ])
+  | EIndex (r, k) when (match tyof f r with TMap _ -> true | _ -> false) ->
+    (* `m[k].x = v`: the entry, changed in place *)
+    let v, s = lower_place f r in
+    let ka = lower f k in
+    (v, s @ [ I.PKey (ka, e.espan) ])
   | EIndex (r, i) ->
     let v, s = lower_place f r in
     let ia = lower f i in

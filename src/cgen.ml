@@ -23,6 +23,7 @@ type ctx = {
   mutable cell_tys : ty list; (* types of owned locals, which need a drop-through-pointer function *)
   mutable cmp_tys : ty list; (* composite types that need a <CName>_cmp order function *)
   mutable sort_tys : ty list; (* list types that need <CName>_sort *)
+  mutable hash_tys : ty list; (* composite map key types that need <CName>_hash *)
 }
 
 let is_enum c = function TNamed (n, _) -> Hashtbl.mem c.g.enums n | _ -> false
@@ -158,7 +159,11 @@ let walk c root rty steps =
         match t with
         | TList el -> (sprintf "(%s)->data[%s]" e (atom c i), el)
         | TArray (el, _) -> (sprintf "(%s).a[%s]" e (atom c i), el)
-        | _ -> failwith "walk index"))
+        | _ -> failwith "walk index")
+      | I.PKey (k, sp) -> (
+        match t with
+        | TMap (_, vt) -> (sprintf "(*%s_slot(%s, %s, %s))" (cname c t) e (atom c k) (where sp), vt)
+        | _ -> failwith "walk key"))
     (root, rty) steps
 
 let rec pat_cond c e t (p : Ast.pat) =
@@ -195,6 +200,25 @@ let rec cmp_prefix c t =
       | TNamed _ when is_enum c t -> List.iter (fun (_, ps) -> List.iter (fun p -> ignore (cmp_prefix c p)) ps) (Lower.variants c.g t)
       | TNamed _ -> List.iter (fun (_, ft) -> ignore (cmp_prefix c ft)) (Lower.field_types c.g t)
       | _ -> failwith ("cgen: no order on " ^ show t)
+    end;
+    n
+
+(* The prefix of the hash function for map key type [t]; tuple, struct and
+   enum keys get one generated, with the types inside them. *)
+let rec hash_prefix c t =
+  match t with
+  | TInt -> "Int"
+  | TStr -> "Str"
+  | TBool -> "Bool"
+  | TUnit -> "Unit"
+  | _ ->
+    let n = cname c t in
+    if not (List.exists (fun u -> cname c u = n) c.hash_tys) then begin
+      c.hash_tys <- c.hash_tys @ [ t ];
+      match t with
+      | TNamed _ when is_enum c t -> List.iter (fun (_, ps) -> List.iter (fun p -> ignore (hash_prefix c p)) ps) (Lower.variants c.g t)
+      | TNamed _ -> List.iter (fun (_, ft) -> ignore (hash_prefix c ft)) (Lower.field_types c.g t)
+      | _ -> failwith ("cgen: no hash for " ^ show t)
     end;
     n
 
@@ -640,6 +664,13 @@ and stmt c out ind (s : I.stmt) =
               line (sprintf "  %s* %s = &(%s->a[w_idx(%s, %d, %s)]);" (ctype c el) q p (atom c ia) n (where sp));
               (q, el)
             | _ -> failwith "mutate index")
+          | I.PKey (k, sp) -> (
+            match t with
+            | TMap (_, vt) ->
+              line (sprintf "  %s_unique(%s);" (cname c t) p);
+              line (sprintf "  %s* %s = %s_slot(*%s, %s, %s);" (ctype c vt) q (cname c t) p (atom c k) (where sp));
+              (q, vt)
+            | _ -> failwith "mutate key")
           | I.PIndexU _ -> failwith "mutate through unchecked index")
         ("p0_", v.ty)
         (List.mapi (fun i s -> (i, s)) steps)
@@ -909,6 +940,8 @@ let rec type_defs c (out : Buffer.t) =
         if e = TFloat then p (sprintf "VELA_LIST_SORT(%s, double, Float)" (cname c t))
       | _ -> ())
     (List.stable_sort (fun a b -> compare (depth a) (depth b)) lists);
+  List.iter (fun t -> match t with TMap (k, _) -> ignore (hash_prefix c k) | _ -> ()) maps;
+  List.iter (fun t -> p (sprintf "static uint64_t %s_hash(%s v);" (cname c t) (ctype c t))) c.hash_tys;
   List.iter
     (fun t ->
       match t with
@@ -1043,8 +1076,31 @@ let rec type_defs c (out : Buffer.t) =
   ;
   cmp_defs c p
 
-(* Order functions: item by item, as Interp.compare_v. *)
+(* Order functions: item by item, as Interp.compare_v; and hash functions
+   for tuple, struct and enum map keys. *)
 and cmp_defs c p =
+  List.iter
+    (fun t ->
+      let n = cname c t and ct = ctype c t in
+      let item e x = p (sprintf "  h = w_hash_mix(h, %s_hash(%s));" (hash_prefix c e) x) in
+      p (sprintf "static uint64_t %s_hash(%s v) {" n ct);
+      p "  uint64_t h = 0x2545F4914F6CDD1DULL; (void)v;";
+      (match t with
+       | TNamed _ when is_enum c t ->
+         let acc = if is_boxed c t then "->" else "." in
+         p (sprintf "  h = w_hash_mix(h, Int_hash(v%stag));" acc);
+         p (sprintf "  switch (v%stag) {" acc);
+         List.iteri
+           (fun k (_, ps) ->
+             p (sprintf "    case %d:" k);
+             List.iteri (fun i pt -> item pt (sprintf "v%su.v%d.f%d" acc k i)) ps;
+             p "      break;")
+           (Lower.variants c.g t);
+         p "  }"
+       | _ -> List.iteri (fun i (_, ft) -> item ft (sprintf "v.f%d" i)) (Lower.field_types c.g t));
+      p "  return h;";
+      p "}")
+    c.hash_tys;
   List.iter (fun t -> p (sprintf "static int %s_cmp(%s a, %s b);" (cname c t) (ctype c t) (ctype c t))) c.cmp_tys;
   List.iter
     (fun t ->
@@ -1089,7 +1145,7 @@ let program (g : Lower.gctx) (prog : I.program) : string =
   let c =
     { g; names = Hashtbl.create 32; types = []; lits = Hashtbl.create 32; lit_order = []; boxed = [];
       envs = Hashtbl.create 16; uniq = []; task_tys = []; inrange = []; chan_tys = []; dyns = []; cell_tys = [];
-      cmp_tys = []; sort_tys = [] }
+      cmp_tys = []; sort_tys = []; hash_tys = [] }
   in
   (* bodies first: this discovers every type and literal *)
   let bodies = Buffer.create 65536 in

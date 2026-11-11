@@ -19,6 +19,7 @@ type step =
   | PField of int
   | PIndex of atom * Span.t
   | PIndexU of atom (* index already proven in range (compiler-generated loops) *)
+  | PKey of atom * Span.t (* map entry by key; panics when the key is missing *)
 
 type rhs =
   | Atom of atom (* consumed *)
@@ -117,7 +118,7 @@ let borrowed = function
   | Bin (_, _, a, b, _) -> [ a; b ]
   | Neg (_, a) | Not a -> [ a ]
   | Prim (_, _, xs, _) -> xs
-  | Get (a, _, steps) -> a :: List.filter_map (function PIndex (i, _) | PIndexU i -> Some i | PField _ -> None) steps
+  | Get (a, _, steps) -> a :: List.filter_map (function PIndex (i, _) | PIndexU i | PKey (i, _) -> Some i | PField _ -> None) steps
   | Payload (a, _, _, _) | IsTag (a, _, _) | PatTest (a, _, _) -> [ a ]
   | Interp ps -> List.filter_map (function IVal (a, _) | IValQ (a, _) -> Some a | IStr _ -> None) ps
   | RootField (a, _) -> [ a ]

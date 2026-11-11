@@ -1269,22 +1269,11 @@ and check_stmt ctx f s : bool =
     false
   | SAssign (lhs, rhs) ->
     check_place ctx f lhs;
-    let rec through_map_entry (e : expr) =
-      match e.edesc with
-      | EField (r, _, _) | EIndex (r, _) -> (
-        match r.edesc with
-        | EIndex (m, _) when (match repr m.ety with TMap _ -> true | _ -> false) -> true
-        | _ -> through_map_entry r)
-      | _ -> false
-    in
     let is_group = match lhs.edesc with EVar n -> (match lookup f n with Some (v, _) -> v.vkind = KGroup | None -> false) | _ -> false in
     let lt = if is_group then TErr else check_expr ctx f lhs in
     (match lhs.edesc with
      | EBlock _ -> err ctx "E0209" lhs.espan "a method cannot be assigned to"
      | _ -> ());
-    if through_map_entry lhs then
-      err ctx "E0209" lhs.espan "a map entry can only be replaced whole"
-        ~notes:[ "read it, change the copy, and store it back: `let mut e = m[k]` ... `m[k] = e`" ];
     expect ctx f rhs lt;
     false
   | SExpr e -> ignore (check_expr ctx f e); false
@@ -1343,14 +1332,42 @@ let check_main ctx (d : fn_decl) (s : fsig) =
     err ctx "E0303" d.fn_span "`main` has the wrong signature"
       ~notes:[ "write `fn main(root: Root)` or `fn main(root: Root) -> Result[(), E]`" ]
 
+(* Map keys: Int, Str, Bool, and tuples, structs and enums made of them.
+   Returns the first type in the way, if any. *)
+let unkeyable ctx t : ty option =
+  let seen = Hashtbl.create 8 in
+  let rec go t =
+    match repr t with
+    | TInt | TStr | TBool | TVar _ | TErr -> None
+    | TNamed (n, args) as nt -> (
+      let key = show nt in
+      if Hashtbl.mem seen key then None
+      else begin
+        Hashtbl.replace seen key ();
+        match Hashtbl.find_opt ctx.structs n with
+        | Some s ->
+          let env = List.combine s.st_gen args in
+          List.find_map (fun (_, ft) -> go (subst env ft)) (Option.value ~default:[] (Hashtbl.find_opt ctx.sfields n))
+        | None -> (
+          match Hashtbl.find_opt ctx.enums n with
+          | Some e ->
+            let env = List.combine e.en_gen args in
+            List.find_map (fun (_, ps) -> List.find_map (fun p -> go (subst env p)) ps) (Option.value ~default:[] (Hashtbl.find_opt ctx.variants n))
+          | None -> Some nt)
+      end)
+    | t -> Some t
+  in
+  go t
+
 let check_pending ctx =
   List.iter
     (fun (sp, k) ->
-      match repr k with
-      | TInt | TStr | TBool | TVar _ | TErr -> ()
-      | t ->
-        err ctx "E0113" sp (sprintf "map keys must be Int, Str or Bool, not `%s`" (show t))
-          ~notes:[ "use a string or number that identifies the value, for example its name or id" ])
+      match unkeyable ctx k with
+      | None -> ()
+      | Some t ->
+        let inner = if show t = show (repr k) then "" else sprintf " (it holds `%s`)" (show t) in
+        err ctx "E0113" sp (sprintf "`%s` cannot be a map key%s" (show (repr k)) inner)
+          ~notes:[ "keys are Int, Str, Bool, and tuples, structs and enums made of them; Float, List and Map cannot be keys" ])
     !map_keys;
   map_keys := [];
   let ps = List.rev !pending in
