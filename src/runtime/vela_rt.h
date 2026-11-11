@@ -286,9 +286,11 @@ static void buf_escaped(WBuf *b, WStr *s) {
 #define Bool_dup(x) (x)
 #define Bool_drop(x) ((void)0)
 #define Bool_eq(a, b) ((a) == (b))
+#define Bool_cmp(a, b) ((int)(a) - (int)(b))
 #define Unit_dup(x) (x)
 #define Unit_drop(x) ((void)0)
 #define Unit_eq(a, b) true
+#define Unit_cmp(a, b) 0
 #define Int_share(x) ((void)0)
 #define Float_share(x) ((void)0)
 #define Bool_share(x) ((void)0)
@@ -417,7 +419,7 @@ static inline int64_t w_idx(int64_t i, int64_t n, const char *where) {
     return false;                                                                             \
   }
 
-/* Stable merge sort, for lists of Int, Float and Str. */
+/* Stable merge sort, by the element type's P##_cmp order. */
 #define VELA_LIST_SORT(L, T, P)                                                               \
   static L *L##_sort(L *l) {                                                                  \
     L *c = L##_slice(l, 0, l->len);                                                           \

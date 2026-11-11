@@ -217,10 +217,10 @@ for s in shapes {
 }
 ```
 
-- A struct or enum value becomes `dyn Shape` where one is expected: an annotated `let`, a function argument, a list literal of that type, a struct field, a `return`, the last expression of a function returning `dyn Shape`, or `push`. Its type must satisfy the interface (E0111).
+- A struct or enum value becomes `dyn Shape` where one is expected: an annotated `let`, a function argument, a list literal of that type, a struct field, a `return`, the last expression of a function returning `dyn Shape`, or `push`. The expected type reaches into each branch of an `if`, a `match` and a block, so the branches can hold different types. Its type must satisfy the interface (E0111).
 - Only struct and enum values can become `dyn`, and only if they hold no capability, function or channel (E0112), so a `dyn` value never hides authority. To work with capabilities through an interface, use a bounded type parameter instead.
 - Only the interface's methods can be called on a `dyn` value. It prints like the value inside. `==` is not allowed.
-- Both branches of an `if` must have the same type, so to choose between types, return early or annotate a `let`: `let s: dyn Shape = if big { ... } else { ... }` does not work yet; write `return` in one branch.
+- To choose between types, say where the `dyn` is expected: `let s: dyn Shape = if big { Circle { r: 1.0 } } else { Square { s: 2.0 } }`. Without an expected type, the branches of an `if` must have the same type.
 - A `dyn` value is boxed and its calls go through a table of methods; a bounded type parameter (`[T: Shape]`) has no such cost.
 
 ### main
@@ -260,13 +260,13 @@ From loosest to tightest. All binary operators are left-associative.
 | `+` | `Int`, `Float`, `Str` (concatenation) | same type |
 | `-` `*` `/` | `Int`, `Float` | same type |
 | `%` | `Int` | `Int` |
-| `<` `<=` `>` `>=` | `Int`, `Float`, `Str` (byte order) | `Bool` |
+| `<` `<=` `>` `>=` | any ordered type (below) | `Bool` |
 | `==` `!=` | any type except functions and capabilities; structural equality | `Bool` |
 | `&&` `\|\|` | `Bool`, short-circuit | `Bool` |
 | `-x` | `Int`, `Float` | same type |
 | `!x` | `Bool` | `Bool` |
 
-Both operands must have the same type. On `Int`, `/` truncates toward zero, `%` takes the sign of the dividend, and division or remainder by zero panics. On `Float`, comparisons follow IEEE, so NaN is unequal to everything, and division by zero gives infinity.
+Both operands must have the same type. The **ordered** types are `Int`, `Float`, `Str` (byte order), `Bool` (`false` first), `()`, and lists, arrays, tuples, structs and enums whose items are ordered. Those compare item by item: lists and arrays lexicographically (a prefix comes first), tuples and structs field by field in declaration order, enums by variant in declaration order and then by payload, so `None` sorts after every `Some`. Maps, functions, capabilities, channels, `dyn` values and type parameters have no order (E0201). On `Int`, `/` truncates toward zero, `%` takes the sign of the dividend, and division or remainder by zero panics. On `Float`, comparisons follow IEEE, so NaN is unequal to everything, and division by zero gives infinity. Inside a list, tuple, struct or enum, and in `sort()`, floats use a total order with NaN first, so sorting never misbehaves.
 
 ### Literals and constructors
 
@@ -526,13 +526,13 @@ Methods take the receiver by value and never modify it, except `push`, which nee
 | `push(x)` | `()`, appends in place (needs `mut`) |
 | `contains(x)` | `Bool` |
 | `reverse()`, `take(n)`, `skip(n)` | `List[T]`; `take` and `skip` clamp out-of-range counts |
-| `sort()` | `List[T]`, stable; only for `Int`, `Float` and `Str` elements |
+| `sort()` | `List[T]`, stable, in the order of `<`; `T` must be ordered (section 5) |
 | `map(f)`, `filter(p)` | `List[U]`, `List[T]` |
 | `fold(init, f)` | `U`, with `f: fn(U, T) -> U` |
 | `join(sep)` | `Str`; `List[Str]` only |
 | `sum()` | `Int`; `List[Int]` only |
 
-`xs[i]` panics when `i` is out of range; `xs.get(i)` returns `None` instead. Writes go through index and field paths: `groups[i].words.push(w)` and `items[i].qty = 3` both work on a `mut` list. `sort()` orders `Int`, `Float` and `Str` only; for other orders and for inserting or removing at a position, use the `list` module (`sort_by`, `insert_at`, `remove_at`, section 19).
+`xs[i]` panics when `i` is out of range; `xs.get(i)` returns `None` instead. Writes go through index and field paths: `groups[i].words.push(w)` and `items[i].qty = 3` both work on a `mut` list. `sort()` uses the order of `<`, so it sorts tuples by their first item, then the second, and structs by their fields in declaration order; for another order and for inserting or removing at a position, use the `list` module (`sort_by`, `insert_at`, `remove_at`, section 19).
 
 Strings compare byte by byte, so `c >= "a" && c <= "z"` tests a one-byte string. `slice`, `index_of` and `bytes()` give positions and byte codes.
 

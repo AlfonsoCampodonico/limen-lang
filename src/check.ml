@@ -311,6 +311,36 @@ let methods (t : ty) : (string * (unit -> ty list * ty)) list =
   | TChan a -> [ m "send" [ a ] TUnit; m "recv" [] (opt a); m "close" [] TUnit ]
   | _ -> []
 
+(* Types with an order, for `<` and `sort()`: numbers, strings (bytes),
+   Bool (false first), (), and lists, arrays, tuples, structs and enums of
+   ordered types, compared item by item (enum variants in declaration order).
+   Returns the first type in the way, if any. *)
+let unordered ctx t : ty option =
+  let seen = Hashtbl.create 8 in
+  let rec go t =
+    match repr t with
+    | TInt | TFloat | TStr | TBool | TUnit | TVar _ | TErr -> None
+    | TList a | TArray (a, _) -> go a
+    | TNamed (n, args) as nt -> (
+      let key = show nt in
+      if Hashtbl.mem seen key then None
+      else begin
+        Hashtbl.replace seen key ();
+        match Hashtbl.find_opt ctx.structs n with
+        | Some s ->
+          let env = List.combine s.st_gen args in
+          List.find_map (fun (_, ft) -> go (subst env ft)) (Option.value ~default:[] (Hashtbl.find_opt ctx.sfields n))
+        | None -> (
+          match Hashtbl.find_opt ctx.enums n with
+          | Some e ->
+            let env = List.combine e.en_gen args in
+            List.find_map (fun (_, ps) -> List.find_map (fun p -> go (subst env p)) ps) (Option.value ~default:[] (Hashtbl.find_opt ctx.variants n))
+          | None -> Some nt)
+      end)
+    | t -> Some t
+  in
+  go t
+
 let root_fields = [ ("net", TCap Net); ("fs", TCap Fs); ("stdout", TCap Stdout); ("clock", TCap Clock); ("listen", TCap Listen);
     ("rand", TCap Rand); ("stdin", TCap Stdin); ("env", TCap Env) ]
 
@@ -452,6 +482,15 @@ and expect ctx f e want =
     (* each element is boxed on its own, so a list can mix types *)
     List.iter (fun x -> expect ctx f x el) es;
     e.ety <- want
+  (* the expected type reaches each branch, so `if` and `match` arms can
+     become `dyn` one by one, and closures in them get their types *)
+  | EIf (c, b, Some els), _ ->
+    expect ctx f c TBool;
+    expect_block ctx f b want;
+    expect ctx f els want;
+    e.ety <- want
+  | EMatch (s, arms), _ -> e.ety <- check_match ~want ctx f s arms e.espan
+  | EBlock b, _ -> expect_block ctx f b want; e.ety <- want
   | _, TDyn i -> coerce ctx e (check_expr ctx f e) i
   | _ -> expect_plain ctx f e want
 
@@ -780,9 +819,11 @@ and check_method_value ctx f e recv name nsp args =
       else List.iter2 (fun a p -> expect ctx f a p) args ps;
       (match (name, rt) with
        | "sort", TList a -> (
-         match repr a with
-         | TInt | TFloat | TStr | TVar _ | TErr -> ()
-         | t -> err ctx "E0201" nsp (sprintf "only lists of Int, Float or Str can be sorted, found `List[%s]`" (show t)))
+         match unordered ctx a with
+         | None -> ()
+         | Some t ->
+           err ctx "E0201" nsp (sprintf "`List[%s]` cannot be sorted: `%s` has no order" (show a) (show t))
+             ~notes:[ "numbers, strings, Bool, and lists, tuples, structs and enums of them are ordered; for another order use `list.sort_by(xs, less)`" ])
        | _ -> ());
       r)
 
@@ -884,7 +925,7 @@ and check_bin ctx f op a b sp =
     | Add -> (match t with TInt | TFloat | TStr | TErr | TVar _ -> t | _ -> bad (); TErr)
     | Sub | Mul | Div -> (match t with TInt | TFloat | TErr | TVar _ -> t | _ -> bad (); TErr)
     | Mod -> (match t with TInt | TErr | TVar _ -> t | _ -> bad (); TErr)
-    | Lt | Le | Gt | Ge -> (match t with TInt | TFloat | TStr | TErr | TVar _ -> () | _ -> bad ()); TBool
+    | Lt | Le | Gt | Ge -> (match unordered ctx t with None -> () | Some _ -> bad ()); TBool
     | _ -> (match t with TFn _ | TCap _ | TChan _ | TDyn _ -> bad () | _ -> ()); TBool)
 
 and check_closure ctx f ps body want =
@@ -951,15 +992,18 @@ and check_struct_lit ctx f name nsp fields sp =
            name);
     TNamed (name, targs)
 
-and check_match ctx f s arms sp =
+and check_match ?want ctx f s arms sp =
   let st = check_expr ctx f s in
-  let result = fresh () in
+  let result = match want with Some w -> w | None -> fresh () in
   List.iter
     (fun arm ->
       push f;
       check_pat ctx f st arm.apat;
-      let bt = check_expr ctx f arm.abody in
-      unify_at ctx arm.abody.espan result bt;
+      (match want with
+       | Some w -> expect ctx f arm.abody w
+       | None ->
+         let bt = check_expr ctx f arm.abody in
+         unify_at ctx arm.abody.espan result bt);
       pop f)
     arms;
   (match arms with
@@ -1161,6 +1205,15 @@ and check_block ctx f b =
   pop f;
   t
 
+(* A block checked against the type its value must have. *)
+and expect_block ctx f b want =
+  push f;
+  let diverges = List.fold_left (fun d s -> check_stmt ctx f s || d) false b.stmts in
+  (match b.tail with
+   | Some e -> expect ctx f e want
+   | None -> if not diverges then unify_at ctx { b.bspan with lo = max b.bspan.lo (b.bspan.hi - 1) } want TUnit);
+  pop f
+
 (* Returns true when the statement never falls through. *)
 and check_stmt ctx f s : bool =
   match s.sdesc with
@@ -1281,11 +1334,10 @@ let check_fn ctx (d : fn_decl) (s : fsig) =
     (fun p t -> Hashtbl.replace scope.vars p.prm_name { vty = t; vmut = false; vspan = p.prm_span; vkind = KParam })
     d.fn_params s.ps;
   let f = { ret_ty = s.ret; scopes = [ scope ]; loops = 0; genv; in_group = 0 } in
+  match repr s.ret with
+  | TDyn _ -> expect_block ctx f d.fn_body s.ret (* the body's value becomes `dyn`, branch by branch *)
+  | _ ->
   let bt = check_block ctx f d.fn_body in
-  (match (repr s.ret, d.fn_body.tail) with
-   | TDyn i, Some e when (match repr bt with TDyn _ -> false | _ -> true) -> coerce ctx e bt i
-   | _ -> ());
-  let bt = match (repr s.ret, d.fn_body.tail) with TDyn _, Some e -> e.ety | _ -> bt in
   try unify s.ret bt
   with Mismatch ->
     let b = d.fn_body in

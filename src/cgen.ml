@@ -21,6 +21,8 @@ type ctx = {
   mutable chan_tys : ty list; (* element types of channels *)
   mutable dyns : (string * ty * (string * ty list * ty) list) list; (* vtables: C name, boxed type, methods *)
   mutable cell_tys : ty list; (* types of owned locals, which need a drop-through-pointer function *)
+  mutable cmp_tys : ty list; (* composite types that need a <CName>_cmp order function *)
+  mutable sort_tys : ty list; (* list types that need <CName>_sort *)
 }
 
 let is_enum c = function TNamed (n, _) -> Hashtbl.mem c.g.enums n | _ -> false
@@ -175,6 +177,27 @@ let rec pat_cond c e t (p : Ast.pat) =
     let subs = List.mapi (fun i (p, (_, ft)) -> pat_cond c (sprintf "(%s).f%d" e i) ft p) (List.combine ps fts) in
     (match List.filter (fun s -> s <> "true") subs with [] -> "true" | xs -> String.concat " && " xs)
 
+(* The prefix of the order function for [t] (used as <prefix>_cmp); composite
+   types get one generated, with the types inside them. *)
+let rec cmp_prefix c t =
+  match t with
+  | TInt -> "Int"
+  | TFloat -> "Float"
+  | TStr -> "Str"
+  | TBool -> "Bool"
+  | TUnit -> "Unit"
+  | _ ->
+    let n = cname c t in
+    if not (List.exists (fun u -> cname c u = n) c.cmp_tys) then begin
+      c.cmp_tys <- c.cmp_tys @ [ t ];
+      match t with
+      | TList e | TArray (e, _) -> ignore (cmp_prefix c e)
+      | TNamed _ when is_enum c t -> List.iter (fun (_, ps) -> List.iter (fun p -> ignore (cmp_prefix c p)) ps) (Lower.variants c.g t)
+      | TNamed _ -> List.iter (fun (_, ft) -> ignore (cmp_prefix c ft)) (Lower.field_types c.g t)
+      | _ -> failwith ("cgen: no order on " ^ show t)
+    end;
+    n
+
 let binop c op t a b sp =
   let open Ast in
   match (t, op) with
@@ -196,6 +219,9 @@ let binop c op t a b sp =
     sprintf "(Str_cmp(%s, %s) %s 0)" a b o
   | _, Eq -> sprintf "%s_eq(%s, %s)" (cname c t) a b
   | _, Ne -> sprintf "(!%s_eq(%s, %s))" (cname c t) a b
+  | _, (Lt | Le | Gt | Ge) ->
+    let o = match op with Lt -> "<" | Le -> "<=" | Gt -> ">" | _ -> ">=" in
+    sprintf "(%s_cmp(%s, %s) %s 0)" (cmp_prefix c t) a b o
   | _ -> failwith ("cgen binop on " ^ show t)
 
 (* Emit statements that store [rhs] into the C lvalue [dst] of type [t]. *)
@@ -448,7 +474,12 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
       opt_from (sprintf "(%s)->len > 0" (arg 0)) (dup_of c el (sprintf "(%s)->data[(%s)->len - 1]" (arg 0) (arg 0)))
     | "list_contains", _ -> set (sprintf "%s_contains(%s, %s)" (cname c rt) (arg 0) (arg 1))
     | "list_reverse", _ -> set (sprintf "%s_reverse(%s)" (cname c rt) (arg 0))
-    | "list_sort", _ -> set (sprintf "%s_sort(%s)" (cname c rt) (arg 0))
+    | "list_sort", TList el ->
+      ignore (cmp_prefix c el);
+      (match el with
+       | TInt | TStr | TFloat -> ()
+       | _ -> if not (List.exists (fun u -> cname c u = cname c rt) c.sort_tys) then c.sort_tys <- c.sort_tys @ [ rt ]);
+      set (sprintf "%s_sort(%s)" (cname c rt) (arg 0))
     | "list_take", _ -> set (sprintf "%s_slice(%s, 0, %s)" (cname c rt) (arg 0) (arg 1))
     | "list_skip", _ -> set (sprintf "%s_slice(%s, %s, (%s)->len)" (cname c rt) (arg 0) (arg 1) (arg 0))
     | "list_join", _ -> set (sprintf "L_Str_join(%s, %s)" (arg 0) (arg 1))
@@ -773,7 +804,7 @@ let topo c =
 let named_decl c t =
   match t with TNamed (n, _) -> n | _ -> ""
 
-let type_defs c (out : Buffer.t) =
+let rec type_defs c (out : Buffer.t) =
   let p s = Buffer.add_string out (s ^ "\n") in
   compute_boxed c;
   let lists = List.filter (function TList _ -> true | _ -> false) c.types in
@@ -1007,13 +1038,56 @@ let type_defs c (out : Buffer.t) =
         p (if tuple then "  buf_puts(b, \")\");\n}" else "  buf_puts(b, \" }\");\n}")
       end)
     named
+  ;
+  cmp_defs c p
+
+(* Order functions: item by item, as Interp.compare_v. *)
+and cmp_defs c p =
+  List.iter (fun t -> p (sprintf "static int %s_cmp(%s a, %s b);" (cname c t) (ctype c t) (ctype c t))) c.cmp_tys;
+  List.iter
+    (fun t ->
+      let n = cname c t and ct = ctype c t in
+      let item e x y = p (sprintf "  { int r_ = %s_cmp(%s, %s); if (r_) return r_; }" (cmp_prefix c e) x y) in
+      p (sprintf "static int %s_cmp(%s a, %s b) {" n ct ct);
+      p "  (void)a; (void)b;";
+      (match t with
+       | TList e ->
+         p "  int64_t n_ = a->len < b->len ? a->len : b->len;";
+         p "  for (int64_t i = 0; i < n_; i++)";
+         item e "a->data[i]" "b->data[i]";
+         p "  return a->len < b->len ? -1 : a->len > b->len;"
+       | TArray (e, k) ->
+         p (sprintf "  for (int64_t i = 0; i < %d; i++)" k);
+         item e "a.a[i]" "b.a[i]";
+         p "  return 0;"
+       | TNamed _ when is_enum c t ->
+         let acc = if is_boxed c t then "->" else "." in
+         p (sprintf "  if (a%stag != b%stag) return a%stag < b%stag ? -1 : 1;" acc acc acc acc);
+         p (sprintf "  switch (a%stag) {" acc);
+         List.iteri
+           (fun k (_, ps) ->
+             p (sprintf "    case %d:" k);
+             List.iteri (fun i pt -> item pt (sprintf "a%su.v%d.f%d" acc k i) (sprintf "b%su.v%d.f%d" acc k i)) ps;
+             p "      break;")
+           (Lower.variants c.g t);
+         p "  }";
+         p "  return 0;"
+       | _ ->
+         List.iteri (fun i (_, ft) -> item ft (sprintf "a.f%d" i) (sprintf "b.f%d" i)) (Lower.field_types c.g t);
+         p "  return 0;");
+      p "}")
+    c.cmp_tys;
+  List.iter
+    (fun t -> match t with TList e -> p (sprintf "VELA_LIST_SORT(%s, %s, %s)" (cname c t) (ctype c e) (cmp_prefix c e)) | _ -> ())
+    c.sort_tys
 
 (* ---------- program ---------- *)
 
 let program (g : Lower.gctx) (prog : I.program) : string =
   let c =
     { g; names = Hashtbl.create 32; types = []; lits = Hashtbl.create 32; lit_order = []; boxed = [];
-      envs = Hashtbl.create 16; uniq = []; task_tys = []; inrange = []; chan_tys = []; dyns = []; cell_tys = [] }
+      envs = Hashtbl.create 16; uniq = []; task_tys = []; inrange = []; chan_tys = []; dyns = []; cell_tys = [];
+      cmp_tys = []; sort_tys = [] }
   in
   (* bodies first: this discovers every type and literal *)
   let bodies = Buffer.create 65536 in

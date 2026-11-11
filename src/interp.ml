@@ -161,11 +161,29 @@ let rec equal a b =
     && KM.for_all (fun k (_, v) -> match KM.find_opt k b.m with Some (_, w) -> equal v w | None -> false) a.m
   | _ -> false
 
-let compare_v a b =
+(* (enum, variant) -> position in the declaration, for ordering enum values *)
+let variant_pos : (string * string, int) Hashtbl.t = Hashtbl.create 32
+
+(* The order of `<` and `sort()`: item by item, as the native `_cmp` functions.
+   Floats use a total order (NaN first) inside containers and in sort. *)
+let rec compare_v a b =
+  let rec lex xs ys =
+    match (xs, ys) with
+    | [], [] -> 0
+    | [], _ -> -1
+    | _, [] -> 1
+    | x :: xs, y :: ys -> ( match compare_v x y with 0 -> lex xs ys | c -> c)
+  in
   match (a, b) with
   | VInt x, VInt y -> compare x y
   | VFloat x, VFloat y -> compare x y
   | VStr x, VStr y -> compare x y
+  | VBool x, VBool y -> compare x y
+  | VList x, VList y -> lex (Array.to_list x) (Array.to_list y)
+  | VStruct (_, xs), VStruct (_, ys) -> lex (List.map snd xs) (List.map snd ys)
+  | VEnum (e, v, xs), VEnum (_, w, ys) ->
+    let pos v = Option.value ~default:0 (Hashtbl.find_opt variant_pos (e, v)) in
+    if v = w then lex xs ys else compare (pos v) (pos w)
   | _ -> 0
 
 let as_bool = function VBool b -> b | _ -> failwith "internal: expected Bool"
@@ -882,6 +900,7 @@ let run ~out ~grants (user_items : item list) : (value, string * Span.t) result 
       | IStruct s -> Hashtbl.replace rt.structs s.st_name s
       | IEnum e ->
         Hashtbl.replace rt.enums e.en_name e;
+        List.iteri (fun i (v, _, _) -> Hashtbl.replace variant_pos (e.en_name, v) i) e.en_variants;
         List.iter
           (fun (v, _, _) -> Hashtbl.replace owners v (e.en_name :: Option.value ~default:[] (Hashtbl.find_opt owners v)))
           e.en_variants)
@@ -917,6 +936,7 @@ let make_rt ~out ~grants (user_items : item list) =
       | IStruct s -> Hashtbl.replace rt.structs s.st_name s
       | IEnum e ->
         Hashtbl.replace rt.enums e.en_name e;
+        List.iteri (fun i (v, _, _) -> Hashtbl.replace variant_pos (e.en_name, v) i) e.en_variants;
         List.iter
           (fun (v, _, _) -> Hashtbl.replace owners v (e.en_name :: Option.value ~default:[] (Hashtbl.find_opt owners v)))
           e.en_variants)
