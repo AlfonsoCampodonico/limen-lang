@@ -463,7 +463,8 @@ let load ?(deps = []) path src : item list * Diag.t list =
               List.map (rename_item mods m own) (List.concat_map expand_table m.mitems))
             (List.rev all)
         in
-        if !errors <> [] then ([], List.rev !errors) else (items, [])
+        (* methods promoted through struct embedding, so interfaces see them *)
+        if !errors <> [] then ([], List.rev !errors) else (items @ Embed.forwarders items, [])
       end)
 
 (* Who calls C: (dependency, libraries) for each dependency whose modules

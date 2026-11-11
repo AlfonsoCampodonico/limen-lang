@@ -61,7 +61,7 @@ let load_program path text =
   | [], (_ :: _ as ds) -> ([], ds)
   | items, _ ->
     let ds, _ = Check.check_program items in
-    (items, ds)
+    (Embed.user_items items, ds)
 
 let analyze path text =
   match load_program path text with
@@ -201,7 +201,9 @@ let hover_items text items =
           i.if_methods
       | IStruct s ->
         add s.st_span ("struct " ^ s.st_name);
-        List.iter (fun (f, sp, te) -> add sp (f ^ ": " ^ slice text te.tspan)) s.st_fields
+        List.iter
+          (fun (f, sp, te) -> add sp (if List.mem f s.st_embeds then "embedded " ^ slice text te.tspan else f ^ ": " ^ slice text te.tspan))
+          s.st_fields
       | IEnum e ->
         add e.en_span ("enum " ^ e.en_name);
         List.iter
@@ -318,7 +320,15 @@ let member_completions path text off =
         | Types.TCap Types.Root -> List.map (fun (f, ft) -> item 5 f (show ft)) Check.root_fields
         | _ -> (
           match struct_decl items t with
-          | Some s -> List.map (fun (f, _, te) -> item 5 f (slice patched te.tspan)) s.st_fields
+          | Some s ->
+            List.map (fun (f, _, te) -> item 5 f (slice patched te.tspan)) s.st_fields
+            (* and those promoted from embedded structs *)
+            @ List.map
+                (fun (f, te, owner) -> item 5 f (Embed.show_ty te ^ " (from " ^ owner ^ ")"))
+                (Embed.promoted_fields
+                   ~structs:(fun n -> List.find_opt (fun s -> s.st_name = n) (structs items))
+                   ~has_method:(fun t m -> Hashtbl.mem Check.method_owner (t ^ "::" ^ m) && not (Embed.is_forwarder (t ^ "::" ^ m)))
+                   s)
           | None -> [])
       in
       let methods =
@@ -331,7 +341,9 @@ let member_completions path text off =
             (fun k _ acc ->
               if String.starts_with ~prefix:pre k then begin
                 let m = String.sub k (String.length pre) (String.length k - String.length pre) in
-                let sg = match List.find_opt (fun d -> d.fn_name = k) (fns items) with Some d -> fn_signature patched d | None -> "method" in
+                (* a method promoted from an embedded struct: the signature of the one it calls *)
+                let k' = Option.value ~default:k (Hashtbl.find_opt Embed.forwarder_of k) in
+                let sg = match List.find_opt (fun d -> d.fn_name = k') (fns items) with Some d -> fn_signature patched d | None -> "method" in
                 item 2 m sg :: acc
               end
               else acc)

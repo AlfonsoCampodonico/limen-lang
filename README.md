@@ -246,6 +246,8 @@ Interfaces: `interface Shape { fn area(self) -> Float }` bounds a generic parame
 
 `dyn Shape` is a value of any type that satisfies `Shape`, so `List[dyn Shape]` can mix types, and `let s: dyn Shape = if big { Circle { r: 1.0 } } else { Square { s: 2.0 } }` picks one (see [examples/dyn.vela](examples/dyn.vela)).
 
+Embedding: `struct Admin { User, level: Int }` embeds a `User`, so `admin.name` and `admin.greet()` reach the `User`'s field and method, and `Admin` satisfies the interfaces `User` does (as bounds and as `dyn`). It is composition, not inheritance: the embedded value is a plain field, `admin.User`, set in a literal as `Admin { User: u, level: 3 }`; the outer struct's own names come first, a name two embedded structs share is an error only where it is used, and there is no overriding or `super` (see SPEC.md, "Embedding").
+
 Ordering is structural: `<` and `sort()` work on numbers, strings, `Bool`, and on lists, tuples, structs and enums of them, item by item, so `[(2, "b"), (1, "z")].sort()` sorts by the first item, then the second.
 
 Tuples `(Int, Str)` and maps `Map[Str, Int]` are built in: `let (q, r) = divmod(17, 5)`, `counts[w] = counts.get(w) ?? 0 + 1`. Keys can be tuples, structs and enums (`grid[(x, y)]`), and entries change in place: `stats[name].hits = stats[name].hits + 1`. Maps iterate in insertion order, the same in both backends (see [examples/tuples.vela](examples/tuples.vela) and [examples/maps.vela](examples/maps.vela)).

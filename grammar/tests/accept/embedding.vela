@@ -1,0 +1,7 @@
+// embedding
+struct Person { name: Str }
+struct User {
+  Person, // the person
+  auth.Account,
+  Box[Int], email: Str
+}
