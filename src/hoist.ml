@@ -17,11 +17,14 @@ let mutated_lists body =
 let mentions (v : var) atoms = List.exists (fun a -> match atom_var a with Some w -> w.id = v.id | None -> false) atoms
 
 (* Could the list's reference count rise inside the loop? Any retain or move
-   of the variable, or a reassignment, rules the hoist out. *)
+   of the variable, or a reassignment, rules the hoist out; so does a list
+   declared inside the loop, which does not exist yet where the hoisted check
+   would go. *)
 let escapes (v : var) body =
   let rec go = function
-    | Let (_, r) | Init (_, r) -> mentions v (consumed r)
+    | Let (w, r) | Init (w, r) -> w.id = v.id || mentions v (consumed r)
     | Set (w, r, _) -> w.id = v.id || mentions v (consumed r)
+    | Decl w when w.id = v.id -> true
     | Mutate (_, _, m) -> mentions v (mut_atoms m)
     | Return a -> mentions v [ a ]
     | If (_, a, b) -> List.exists go a || List.exists go b

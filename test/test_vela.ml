@@ -245,6 +245,21 @@ let () =
     ^ main_wrap "    out.print(\"{find([5, 6, 7], 7)} {find([1], 9)}\")")
     "2 -1\n";
   (* ownership stress: each also runs natively under ASan with a leak check *)
+  (* a list made inside a loop (here by a fused filter) is not hoisted out of it *)
+  out "hoist-list-declared-in-loop"
+    {v|fn main(root: Root) {
+    let mut i = 0
+    let mut n = 0
+    while i < 3 {
+        if i > 0 {
+            n = n + "abcd".bytes().filter(|c| c > 97 + i).len()
+        }
+        i = i + 1
+    }
+    root.stdout.print("{n}")
+}
+|v}
+    "3\n";
   out "recursive-enum"
     ({|enum Tree { Leaf, Node(Tree, Int, Tree) }
 fn insert(t: Tree, v: Int) -> Tree {
