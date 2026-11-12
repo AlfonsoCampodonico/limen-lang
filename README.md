@@ -197,7 +197,7 @@ let counts = group g {
 
 ## Native backend
 
-`vela build` lowers the typed program to a small IR, instantiates generics per concrete type, inserts reference counting, and emits C compiled with `cc -O2 -fwrapv -ffp-contract=off`.
+`vela build` lowers the typed program to a small IR, instantiates generics per concrete type, inserts reference counting, and emits C compiled with `cc -O3 -fwrapv -ffp-contract=off`.
 
 - **Memory:** Perceus-style reference counting without a GC. A use that is a variable's last use becomes a move instead of a retain, so counts usually stay at 1 and `xs.push(v)` or `xs[i] = v` mutate in place. Shared values are copied on write, which keeps value semantics.
 - **Layout:** Int, Float, Bool, structs and non-recursive enums are plain C values. Strings, lists, closures, capabilities and recursive enums are reference-counted pointers.
@@ -213,19 +213,19 @@ The test suite runs every program in both the interpreter and the native binary,
 
 ## Performance
 
-Best of 5 on an Apple Silicon Mac with 12 cores, against C compiled with `-O2 -fwrapv -ffp-contract=off`. Every row produces identical output. Reproduce with `python3 bench/run.py`.
+Best of 5 on an Apple Silicon Mac with 12 cores, against C compiled with `-O2 -fwrapv -ffp-contract=off`; `vela build` compiles its C at `-O3`, as Rust's release builds do. Every row produces identical output. Reproduce with `python3 bench/run.py`, and against Rust and Go with `python3 bench/compare.py`.
 
 Single-threaded:
 
 | Benchmark | C | Vela | Vela / C |
 | --- | --- | --- | --- |
-| filter/map/fold pipeline, 30 x 3M | 0.037 s | 0.034 s | 0.93x |
-| fib(40), recursion | 0.198 s | 0.185 s | 0.94x |
-| n-body, 15M steps, `Array[Body, 5]` | 0.509 s | 0.505 s | 0.99x |
-| sieve to 100M, list mutated by index | 0.325 s | 0.327 s | 1.01x |
-| n-body, 15M steps, `List[Body]` | 0.508 s | 0.558 s | 1.10x |
+| n-body, 15M steps, `Array[Body, 5]` | 0.507 s | 0.328 s | 0.65x |
+| fib(40), recursion | 0.194 s | 0.180 s | 0.93x |
+| filter/map/fold pipeline, 30 x 3M | 0.040 s | 0.040 s | 0.99x |
+| sieve to 100M, list mutated by index | 0.345 s | 0.348 s | 1.01x |
+| n-body, 15M steps, `List[Body]` | 0.505 s | 0.561 s | 1.11x |
 
-The C n-body passes the body count as the literal `5`, so clang unrolls its loops at compile time. Vela matches it when the program states the size too, with `Array[Body, 5]`. With a `List`, the length is only known at runtime.
+With `Array[Body, 5]` the body count is part of the type, so at `-O3` the C compiler unrolls the pair loop completely; the C program, at `-O2`, keeps its loops. With a `List`, the length is only known at run time.
 
 Parallel, with `group` (Vela on one thread uses `VELA_THREADS=1`):
 

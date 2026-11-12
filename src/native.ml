@@ -25,7 +25,9 @@ let prepare c_text =
   else (c_text, [], [])
 
 (* The compiler's command line, as argv. *)
-let command ?(flags = [ "-O2" ]) ?(cflags = []) ?(libs = []) c_file exe =
+(* -O3, as Rust's release builds use: it lets clang unroll small fixed-size
+   loops (an `Array[T, N]` walked pair by pair), and compiles no slower here *)
+let command ?(flags = [ "-O3" ]) ?(cflags = []) ?(libs = []) c_file exe =
   (cc () :: flags) @ cflags
   @ [ "-fwrapv"; "-ffp-contract=off"; "-fstack-clash-protection"; "-fexceptions"; "-w"; "-o"; exe; c_file ]
   @ libs @ [ "-lm" ]

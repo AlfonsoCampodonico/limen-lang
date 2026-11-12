@@ -12,6 +12,8 @@ OUT = os.path.join(ROOT, "_build", "bench")
 RUNS = int(sys.argv[1]) if len(sys.argv) > 1 else 7
 NAMES = ["fib", "sieve", "nbody", "pipeline", "mandel", "collatz", "lines"]
 C_SOURCE = {"mandel": "mandel_pthreads", "collatz": "collatz_pthreads"}  # the threaded C versions
+# like the C version's `Body bs[5]`, a size known when compiling
+VELA_SOURCE = {"nbody": "nbody_array"}
 
 os.makedirs(OUT, exist_ok=True)
 subprocess.run(["dune", "build"], cwd=ROOT, check=True)
@@ -28,7 +30,7 @@ def build(lang, name):
     elif lang == "go":
         cmd = ["go", "build", "-o", exe, os.path.join(BENCH, "go", name + ".go")]
     else:
-        cmd = [VELA, "build", os.path.join(BENCH, name + ".vela"), "-o", exe]
+        cmd = [VELA, "build", os.path.join(BENCH, VELA_SOURCE.get(name, name) + ".vela"), "-o", exe]
     subprocess.run(cmd, check=True, capture_output=True)
     return exe
 
