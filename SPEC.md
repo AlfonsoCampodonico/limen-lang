@@ -1039,6 +1039,25 @@ For a missing key with a default, write `m.get(k) ?? default`.
 | `assert(cond)` | panic with `assertion failed` unless `cond` is true |
 | `assert_eq(a, b)` | panic with `assertion failed: <a> != <b>` unless `a == b` |
 | `keep(x)` | `()`; `x` counts as used, so the work that made it is not optimized away (for benchmarks, section 12) |
+| `embed("path")` | `Str`: the file's text, read when the program is compiled (below) |
+| `embed_bytes("path")` | `Bytes`: the file's contents, read when the program is compiled |
+
+**Embedding files.** `embed` and `embed_bytes` read a file at compile time and put its contents into the program as a literal, so a program that serves its own page or assets needs no `Fs`:
+
+```
+fn main(root: Root) {
+    let page = embed("dist/index.html")
+    let logo = embed_bytes("logo.png")
+    ...
+}
+```
+
+- The path must be a string literal, relative to the file that names it.
+- It must stay inside that file's package: the directory of the program's vela.toml (or of the main file when there is none), or a dependency's own directory. An absolute path, a `..` that leaves the package or a symlink that points outside it is error E0405. Without this rule a dependency could put `../../.ssh/id_rsa` into the binary, a read that no grant allows.
+- `embed` requires UTF-8 text (E0405 otherwise); `embed_bytes` takes any file. The standard library embeds nothing.
+- The text is taken as it is: braces in the file do not start interpolation.
+- Changing an embedded file changes the program, and the build cache sees it, because the contents are part of the generated C. `vela caps` lists every embedded file with its size after the functions (`"embeds"` in `--json`).
+- A function or variable named `embed` in scope is called as usual.
 
 ### Capabilities
 

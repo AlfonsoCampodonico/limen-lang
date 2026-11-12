@@ -1797,6 +1797,24 @@ fn main(root: Root) {
     In_channel.with_open_bin (Filename.concat dir f) In_channel.input_all
   in
   out "std-json-list-text" (example "stdlib.vela") "{\"name\":\"Ada\",\"tags\":[\"x\",\"yé😀\"],\"n\":-125,\"ok\":true,\"none\":null,\"nested\":{\"a\":[1,2,{}]}}\nAda\n-125.0\nexpected a value at byte 3\nexpected `:` at byte 5\nexpected a value at byte 0\nexpected a closing `\"` at byte 4\nexpected end of input at byte 4\nexpected a value at byte 0\n{\"q\":\"a\\\"b\\n\\u0001\",\"xs\":[1,null,false]}\na,b,c\n[0, 1, 2, 3, 4] 2 [1, 3] [1, 2, 3] [1, 2]\n007|ab..|---|2|[\"hi\", \"there\", \"you\"]\n";
+  (* embed: files read at compile time become literals, in both backends; the
+     program needs no Fs. Text keeps braces and quotes as they are; bytes keep
+     NUL and 0xff. *)
+  (let dir = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "vela-mods-%d-%s" (Unix.getpid ()) "embed-text-bytes") in
+   (try Unix.mkdir dir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+   (try Unix.mkdir (Filename.concat dir "site") 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+   Out_channel.with_open_bin (Filename.concat dir "site/page.html") (fun oc -> output_string oc "<p class=\"x\">{not interpolated} \\ é</p>\n");
+   Out_channel.with_open_bin (Filename.concat dir "logo.bin") (fun oc -> output_string oc "\000\255A");
+   out "embed-text-bytes"
+     ~modules:[ ("pages", "pub fn page() -> Str {\n    embed(\"site/page.html\")\n}\n") ]
+     {|use pages
+
+fn main(root: Root) {
+    let b = embed_bytes("logo.bin")
+    root.stdout.print("{pages.page().trim()} {b.len()} {b.get(0)} {b.get(1)} {b.get(2)}")
+}
+|}
+     "<p class=\"x\">{not interpolated} \\ é</p> 3 Some(0) Some(255) Some(65)\n");
   (* listening on [::] serves IPv4 too (dual stack), as platforms that probe
      over IPv6 and forward over IPv4 need *)
   out "listen-ipv6-dual-stack"
@@ -5049,6 +5067,38 @@ fn main(root: Root) {
   ok "pkg-granted" (pkg_codes "[package]\nname = \"app\"\n[dependencies]\nfetch = { path = \"../fetch\", caps = [\"net\", \"fs\"] }  # both\n" = []) "granted";
   ok "pkg-bad-toml" (pkg_codes "[package]\nname = \"app\"\n[dependencies]\nfetch = { path = \"../fetch\", caps = [\"disk\"] }\n" = [ "E0321" ]) "bad cap";
   ok "pkg-missing-dir" (pkg_codes "[package]\nname = \"app\"\n[dependencies]\nother = { path = \"../nope\" }\n" = [ "E0401" ]) "fetch not found";
+  (* embed stays inside the package: the main program's (app/, where its
+     vela.toml is) and each dependency's own directory *)
+  put "app/data.txt" "app data";
+  (try Unix.mkdir (Filename.concat pdir "embdep") 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+  put "embdep/note.txt" "dep data!!";
+  let embed_codes ~dep_src main_src =
+    put "embdep/embdep.vela" dep_src;
+    put "app/vela.toml" "[package]\nname = \"app\"\n[dependencies]\nembdep = { path = \"../embdep\" }\n";
+    let path = Filename.concat pdir "app/embmain.vela" in
+    put "app/embmain.vela" main_src;
+    let _, ds, _ = Modules.load_and_check path main_src in
+    codes ds
+  in
+  let main_uses e = "use embdep\n\nfn main(root: Root) {\n    let x = " ^ e ^ "\n    root.stdout.print(\"{embdep.text()} {x}\")\n}\n" in
+  let dep_embeds p = "pub fn text() -> Str {\n    embed(\"" ^ p ^ "\")\n}\n" in
+  let inside = dep_embeds "note.txt" in
+  ok "embed-own-package" (embed_codes ~dep_src:inside (main_uses "embed(\"data.txt\")") = []) "both inside";
+  ok "embed-dep-escapes" (embed_codes ~dep_src:(dep_embeds "../app/data.txt") (main_uses "1") = [ "E0405" ]) "dependency reads the app";
+  ok "embed-main-escapes" (embed_codes ~dep_src:inside (main_uses "embed(\"../embdep/note.txt\")") = [ "E0405" ]) "app reads outside its root";
+  ok "embed-absolute" (embed_codes ~dep_src:inside (main_uses "embed(\"/etc/hosts\")") = [ "E0405" ]) "absolute path";
+  ok "embed-not-literal" (embed_codes ~dep_src:inside (main_uses "embed(embdep.text())") = [ "E0405" ]) "computed path";
+  ok "embed-missing" (embed_codes ~dep_src:(dep_embeds "nope.txt") (main_uses "1") = [ "E0405" ]) "missing file";
+  put "app/bin.dat" "\255\254";
+  ok "embed-not-utf8" (embed_codes ~dep_src:inside (main_uses "embed(\"bin.dat\")") = [ "E0405" ]) "binary as text";
+  ok "embed-bytes-binary" (embed_codes ~dep_src:inside (main_uses "embed_bytes(\"bin.dat\").len()") = []) "binary as bytes";
+  ok "embed-recorded"
+    (embed_codes ~dep_src:inside (main_uses "embed(\"data.txt\")") = []
+     && List.sort compare !Modules.embedded = [ ("", "data.txt", 8); ("embdep", "note.txt", 10) ])
+    "vela caps lists embeds";
+  ok "embed-shadowed"
+    (embed_codes ~dep_src:inside "use embdep\n\nfn embed(s: Str) -> Str {\n    s\n}\n\nfn main(root: Root) {\n    root.stdout.print(embed(\"../anything\"))\n}\n" = [])
+    "a function named embed is an ordinary call";
   Sys.remove (Filename.concat pdir "app/vela.toml");
 
   (* calling C is full trust: a dependency gets it only from [trust], never from caps,

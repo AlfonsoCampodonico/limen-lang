@@ -192,6 +192,53 @@ and expand ~seen env (m : modinfo) (al : alias_decl) args (t : ty_expr) : ty_exp
 
 let mk d sp = { edesc = d; espan = sp; ety = Types.TErr; einst = []; ecallee = None }
 
+(* ---------- embed ---------- *)
+
+(* `embed("page.html")` and `embed_bytes("logo.png")` are read by the compiler
+   and become a literal, so a program that serves its own files needs no `Fs`.
+   The path is relative to the file that names it and must stay inside that
+   file's package (the directory of its vela.toml, or of the main file when
+   there is none; a dependency's own directory): otherwise a dependency could
+   bake `../../.ssh/id_rsa` into the binary, a read no grant allows. *)
+
+(* the main package's root, and the dependencies' directories, for this load *)
+let main_root = ref ""
+let dep_dirs : (string * string) list ref = ref []
+
+(* embedded files for this load: (module, path as written, size) *)
+let embedded : (string * string * int) list ref = ref []
+
+let embed_root (m : modinfo) =
+  if String.starts_with ~prefix:"<std>" m.mfile then None
+  else match m.mpkg with Some dep -> List.assoc_opt dep !dep_dirs | None -> Some !main_root
+
+let embed_file (m : modinfo) name path sp : expr_desc option =
+  let fail msg = err "E0405" sp msg; None in
+  match embed_root m with
+  | None -> fail (Printf.sprintf "the standard library cannot use `%s`" name)
+  | Some root ->
+    if path = "" || not (Filename.is_relative path) then
+      fail (Printf.sprintf "`%s` takes a path relative to this file, not `%s`" name path)
+    else (
+      let full = Filename.concat (Filename.dirname m.mfile) path in
+      match (Unix.realpath full, Unix.realpath root) with
+      | exception Unix.Unix_error _ -> fail (Printf.sprintf "cannot find `%s` (looked for %s)" path full)
+      | real, root ->
+        let inside = String.starts_with ~prefix:(if root = "/" then root else root ^ "/") real in
+        if not inside then
+          fail (Printf.sprintf "`%s` is outside this package (%s); a program can embed only its own package's files" path root)
+        else if Sys.is_directory real then fail (Printf.sprintf "`%s` is a directory, not a file" path)
+        else
+          match In_channel.with_open_bin real In_channel.input_all with
+          | exception Sys_error e -> fail (Printf.sprintf "cannot read `%s`: %s" path e)
+          | text ->
+            if name = "embed" && not (String.is_valid_utf_8 text) then
+              fail (Printf.sprintf "`%s` is not UTF-8 text; use `embed_bytes(\"%s\")` for a Bytes value" path path)
+            else (
+              embedded := (m.mname, path, String.length text) :: !embedded;
+              let lit = mk (EStr [ SPLit text ]) sp in
+              Some (if name = "embed" then lit.edesc else EMethod (lit, "to_bytes", sp, []))))
+
 let rec pat_binds (p : pat) acc =
   match p.pdesc with
   | PBind n -> n :: acc
@@ -240,6 +287,15 @@ let rec expr env locals (e : expr) : expr =
       | None -> e.edesc (* the parser rejects it *))
     | EBin (op, a, b) -> EBin (op, ex a, ex b)
     | EUn (op, a) -> EUn (op, ex a)
+    | ECall ({ edesc = EVar (("embed" | "embed_bytes") as name); _ }, args)
+      when (not (List.mem name locals)) && not (Hashtbl.mem env.own name) -> (
+      let literal = match args with [ { edesc = EStr [ SPLit p ]; _ } ] -> Some p | [ { edesc = EStr []; _ } ] -> Some "" | _ -> None in
+      match literal with
+      | Some path -> ( match embed_file env.self name path e.espan with Some d -> d | None -> EStr [])
+      | None ->
+        err "E0405" e.espan
+          (Printf.sprintf "`%s` takes one argument, a string literal with the path, as in `%s(\"page.html\")`" name name);
+        EStr [])
     | ECall (c, args) -> ECall (ex c, List.map ex args)
     | ENamed (n, sp, a) -> ENamed (n, sp, ex a)
     | EMethod ({ edesc = EVar a; espan = asp; _ }, name, nsp, args) when is_module env locals a -> (
@@ -504,8 +560,16 @@ let check_aliases (m : modinfo) =
 
 (* Load the main file at [path] (whose text is [src]) and every module it uses.
    Returns the flat program, or the diagnostics. *)
-let load ?(deps = []) path src : item list * Diag.t list =
+let load ?(deps = []) ?root path src : item list * Diag.t list =
   errors := [];
+  (* without one (the editor, the agent server), the vela.toml around the
+     file decides, as in a build; finding it fetches nothing *)
+  main_root :=
+    (match root with
+     | Some r -> r
+     | None -> ( match Package.find path with Some toml -> Filename.dirname toml | None -> Filename.dirname path));
+  dep_dirs := deps;
+  embedded := [];
   Hashtbl.reset cyclic;
   alias_uses := [];
   module_pkg := [];
@@ -582,7 +646,8 @@ let load_and_check path src : item list * Diag.t list * Check.fn_info list =
   | Error d -> ([], [ d ], [])
   | Ok pkg -> (
     let deps = match pkg with Some p -> List.map (fun (d : Package.dep) -> (d.dname, d.dir)) p.deps | None -> [] in
-    match load ~deps path src with
+    let root = match pkg with Some p -> Filename.dirname p.file | None -> Filename.dirname path in
+    match load ~deps ~root path src with
     | [], (_ :: _ as ds) -> ([], ds, [])
     | items, _ ->
       let ds, infos = Check.check_program items in

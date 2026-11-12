@@ -384,7 +384,10 @@ let cmd_caps file json =
         i.callbacks
         (i.caps = [] && not i.callbacks)
     in
-    print_endline ("{\"functions\":[" ^ String.concat "," (List.map one infos) ^ "]}")
+    let emb (m, path, size) = Printf.sprintf {|{"module":%s,"path":%s,"bytes":%d}|} (Diag.jstr m) (Diag.jstr path) size in
+    print_endline
+      ("{\"functions\":[" ^ String.concat "," (List.map one infos) ^ "],\"embeds\":["
+      ^ String.concat "," (List.map emb (List.rev !Modules.embedded)) ^ "]}")
   end
   else begin
     let width = List.fold_left (fun w (i : Check.fn_info) -> max w (String.length i.name)) 0 infos in
@@ -397,7 +400,11 @@ let cmd_caps file json =
           | cs, cb -> String.concat ", " cs ^ if cb then " + callbacks" else ""
         in
         Printf.printf "%-*s  %s\n" width i.name what)
-      infos
+      infos;
+    (* files read at compile time: changing one changes the program *)
+    List.iter
+      (fun (m, path, size) -> Printf.printf "embeds %s (%d bytes)%s\n" path size (if m = "" then "" else " in module " ^ m))
+      (List.rev !Modules.embedded)
   end
 
 let checked file =
