@@ -4812,14 +4812,20 @@ fn main(root: Root) {
     in
     (code, read_file o, read_file e)
   in
-  (* the CRUD example's tests call its router directly, in both backends *)
+  (* the examples' own tests, in both backends: the CRUD API's call its
+     router directly, the operator's need no cluster *)
   List.iter
-    (fun (name, extra) ->
+    (fun (name, file, summary, extra) ->
       let dir = if Sys.file_exists "../examples/todo_api.vela" then "../examples" else "examples" in
-      let code, o, e = vela_cli (("test" :: extra) @ [ Filename.concat dir "todo_api.vela" ]) in
+      let code, o, e = vela_cli (("test" :: extra) @ [ Filename.concat dir file ]) in
       let last = List.nth_opt (List.rev (String.split_on_char '\n' (String.trim o))) 0 |> Option.value ~default:"" in
-      ok name (code = 0 && String.starts_with ~prefix:"12 tests, 0 failed" last) (o ^ e))
-    [ ("example-todo-api-tests", []); ("example-todo-api-tests-native", [ "--native" ]) ];
+      ok name (code = 0 && String.starts_with ~prefix:summary last) (o ^ e))
+    [
+      ("example-todo-api-tests", "todo_api.vela", "12 tests, 0 failed", []);
+      ("example-todo-api-tests-native", "todo_api.vela", "12 tests, 0 failed", [ "--native" ]);
+      ("example-site-operator-tests", "site_operator.vela", "15 tests, 0 failed", []);
+      ("example-site-operator-tests-native", "site_operator.vela", "15 tests, 0 failed", [ "--native" ]);
+    ];
   (* the foreign grant is announced as full access, and `vela check` lists who calls C *)
   put "capp/vela.toml" "[package]\nname = \"capp\"\n\n[dependencies]\ncdep = { path = \"../cdep\" }\n\n[trust]\nforeign = [\"cdep\"]\n\n[grants]\nforeign = \"c\"\n";
   let cmain = Filename.concat pdir "capp/main.vela" in
