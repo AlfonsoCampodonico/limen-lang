@@ -1790,6 +1790,82 @@ fn main(root: Root) {
     In_channel.with_open_bin (Filename.concat dir f) In_channel.input_all
   in
   out "std-json-list-text" (example "stdlib.vela") "{\"name\":\"Ada\",\"tags\":[\"x\",\"yé😀\"],\"n\":-125,\"ok\":true,\"none\":null,\"nested\":{\"a\":[1,2,{}]}}\nAda\n-125.0\nexpected a value at byte 3\nexpected `:` at byte 5\nexpected a value at byte 0\nexpected a closing `\"` at byte 4\nexpected end of input at byte 4\nexpected a value at byte 0\n{\"q\":\"a\\\"b\\n\\u0001\",\"xs\":[1,null,false]}\na,b,c\n[0, 1, 2, 3, 4] 2 [1, 3] [1, 2, 3] [1, 2]\n007|ab..|---|2|[\"hi\", \"there\", \"you\"]\n";
+  (* a streamed response, a line at a time as it arrives: a line split
+     across chunks, CRLF, an empty chunk, no final line break, a sized body,
+     an error answered whole, and an endless stream the caller stops *)
+  out "std-http-request-lines"
+    ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] }
+    {|use http
+
+fn handler(clock: Clock, r: http.Request, c: Conn) -> Result[(), IoError] {
+    match r.path {
+        "/lines" => {
+            http.write_head(c, 200, [])?
+            for piece in ["a\nb", "\nc\r\n", "", "d"] {
+                http.write_chunk(c, piece)?
+                clock.sleep(2)
+            }
+            http.end_body(c)
+        },
+        "/endless" => {
+            http.write_head(c, 200, [])?
+            let mut i = 0
+            while true {
+                http.write_chunk(c, "tick {i}\n")?
+                i = i + 1
+                clock.sleep(5)
+            }
+            Ok(())
+        },
+        "/sized" => http.write_response(c, http.text(200, "one\ntwo\n")),
+        _ => http.write_response(c, http.text(404, "nope\n")),
+    }
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let l = root.listen.on("127.0.0.1:0")?
+    let port = l.port()
+    let net = root.net
+    let out = root.stdout
+    let clock = root.clock
+    let _ = group g {
+        // one connection at a time, as the client makes them
+        g.go(|| {
+            let mut i = 0
+            while i < 4 {
+                match l.accept() {
+                    Ok(c) => {
+                        let _ = http.serve_stream(c, |r, c| handler(clock, r, c))
+                    },
+                    Err(_) => (),
+                }
+                i = i + 1
+            }
+        })
+        g.go(|| {
+            let base = "http://127.0.0.1:{port}"
+            for path in ["/lines", "/sized", "/missing"] {
+                let r = http.request_lines(net, "GET", base + path, [], "", |line| {
+                    out.print("{path}: [{line}]")
+                    true
+                })
+                match r {
+                    Ok(resp) => out.print("{path} -> {resp.status} [{resp.body.trim()}]"),
+                    Err(e) => out.print("{path} -> {e}"),
+                }
+            }
+            // a stream that never ends, read until the third line
+            let r = http.request_lines(net, "GET", base + "/endless", [], "", |line| {
+                out.print(line)
+                line != "tick 2"
+            })
+            out.print("stopped: {r.map(|resp| resp.status)}")
+        })
+    }
+    Ok(())
+}
+|}
+    "/lines: [a]\n/lines: [b]\n/lines: [c]\n/lines: [d]\n/lines -> 200 []\n/sized: [one]\n/sized: [two]\n/sized -> 200 []\n/missing -> 404 [nope]\ntick 0\ntick 1\ntick 2\nstopped: Ok(200)\n";
   out "std-http"
     ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] }
     (example "http_demo.vela")
@@ -4911,8 +4987,8 @@ fn main(root: Root) {
     [
       ("example-todo-api-tests", "todo_api.vela", "12 tests, 0 failed", []);
       ("example-todo-api-tests-native", "todo_api.vela", "12 tests, 0 failed", [ "--native" ]);
-      ("example-site-operator-tests", "site_operator.vela", "15 tests, 0 failed", []);
-      ("example-site-operator-tests-native", "site_operator.vela", "15 tests, 0 failed", [ "--native" ]);
+      ("example-site-operator-tests", "site_operator.vela", "19 tests, 0 failed", []);
+      ("example-site-operator-tests-native", "site_operator.vela", "19 tests, 0 failed", [ "--native" ]);
     ];
   (* the foreign grant is announced as full access, and `vela check` lists who calls C *)
   put "capp/vela.toml" "[package]\nname = \"capp\"\n\n[dependencies]\ncdep = { path = \"../cdep\" }\n\n[trust]\nforeign = [\"cdep\"]\n\n[grants]\nforeign = \"c\"\n";

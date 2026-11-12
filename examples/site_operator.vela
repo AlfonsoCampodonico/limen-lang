@@ -7,11 +7,13 @@
 //   Service     NAME        port 80 in front of them
 //
 // and writes status.readyReplicas, status.url and status.message back to
-// the site. It is level-triggered: every few seconds it reads every site
-// and applies what should exist with server-side apply, so an object that
+// the site. It watches the sites and the objects it made, so a change to
+// either is acted on as it happens, and makes a pass over every site then:
+// it applies what should exist with server-side apply, so an object that
 // is already right is not touched and one changed by hand is put back.
-// Deleting a site deletes its objects: they name the site as their owner,
-// and Kubernetes collects them.
+// With nothing happening it makes a pass every minute anyway. Deleting a
+// site deletes its objects: they name the site as their owner, and
+// Kubernetes collects them.
 //
 // It reaches the API server through `kubectl proxy`, which holds the
 // credentials. That proxy is the only thing it can reach:
@@ -369,30 +371,113 @@ fn pass(log: Log, net: Net, base: Str, seen: Seen) -> Result[Seen, Str] {
     Ok(next)
 }
 
+// ---------- watching ----------
+
+// One line of a watch stream, `{"type": "MODIFIED", "object": {...}}`, as
+// the log shows it: "MODIFIED Deployment default/hello". An ERROR event
+// (the API server ending the watch) gives "ERROR" and its message.
+fn event_text(line: Str) -> Option[Str] {
+    let v = json.parse(line) ?? { return None }
+    let kind = str_at(v, ["type"]) ?? { return None }
+    if kind == "ERROR" {
+        return Some("ERROR " + (str_at(v, ["object", "message"]) ?? "from the API server"))
+    }
+    let what = str_at(v, ["object", "kind"]) ?? "?"
+    let ns = str_at(v, ["object", "metadata", "namespace"]) ?? "?"
+    let name = str_at(v, ["object", "metadata", "name"]) ?? "?"
+    Some("{kind} {what} {ns}/{name}")
+}
+
+// What to watch: the sites, and the objects made for them, by their label.
+fn watched() -> List[Str] {
+    let mine = "labelSelector=app.kubernetes.io%2Fname%3Dstatic-site"
+    [
+        "/apis/vela.dev/v1/staticsites?",
+        "/apis/apps/v1/deployments?{mine}&",
+        "/api/v1/configmaps?{mine}&",
+        "/api/v1/services?{mine}&",
+    ]
+}
+
+// Watch `what` for good, sending each event to `events` as it arrives. The
+// API server ends a watch after `timeoutSeconds`; it is started again then,
+// and begins with an ADDED event for everything there, so nothing is missed.
+fn watch(log: Log, net: Net, base: Str, what: Str, events: Chan[Str], clock: Clock) {
+    let url = base + what + "watch=true&timeoutSeconds=300"
+    let accept = [http.Header { name: "Accept", value: "application/json" }]
+    while true {
+        let r = http.request_lines(net, "GET", url, accept, "", |line| {
+            match event_text(line) {
+                Some(e) => {
+                    events.send(e)
+                    !e.starts_with("ERROR")
+                },
+                None => true,
+            }
+        })
+        match r {
+            Ok(resp) if resp.status < 300 => (),
+            Ok(resp) => {
+                log("watch {what}: {resp.status} {resp.body.trim()}")
+                clock.sleep(2000)
+            },
+            Err(e) => {
+                log("watch {what}: {e}")
+                clock.sleep(2000)
+            },
+        }
+    }
+}
+
+// Wait for events, then make a pass. Events come in bursts (a rollout
+// changes a Deployment several times), so it takes all that are waiting
+// and makes one pass for them. Most passes find nothing to do and say
+// nothing.
+fn reconcile(log: Log, net: Net, base: Str, events: Chan[Str], clock: Clock) {
+    let mut seen = map()
+    while true {
+        let first = select {
+            e = events.recv() => e ?? "closed",
+            clock.after(60000) => "resync",
+        }
+        let mut more = 0
+        let mut waiting = true
+        while waiting {
+            waiting = select {
+                e = events.recv() => e != None,
+                _ => false,
+            }
+            if waiting {
+                more = more + 1
+            }
+        }
+        // what the pass does is logged with the event that led to it
+        let after = if more > 0 { "{first}, and {more} more" } else { first }
+        let said = |line: Str| log("{line}  (after {after})")
+        match pass(said, net, base, seen) {
+            Ok(next) => { seen = next },
+            Err(e) => log("pass failed, trying again: {e}"),
+        }
+    }
+}
+
 fn main(root: Root) -> Result[(), IoError] {
-    let args = root.args()
-    let once = args.contains("once")
     let net = root.net
     let base = "http://127.0.0.1:8001"
     let out = root.stdout
     let clock = root.clock
     let log = |line: Str| out.print("{time.format(clock.now_ms(), "%H:%M:%S")} {line}")
+    if root.args().contains("once") {
+        pass(log, net, base, map()).map_error(|e| Failed(e))?
+        return Ok(())
+    }
     log("watching StaticSites through {base}")
-    let mut seen = map()
-    while true {
-        match pass(log, net, base, seen) {
-            Ok(next) => { seen = next },
-            Err(e) => {
-                if once {
-                    return Err(Failed(e))
-                }
-                log("pass failed, trying again: {e}")
-            },
+    let events: Chan[Str] = channel(64)
+    let _ = group g {
+        for what in watched() {
+            g.go(|| watch(log, net, base, what, events, clock))
         }
-        if once {
-            return Ok(())
-        }
-        clock.sleep(3000)
+        g.go(|| reconcile(log, net, base, events, clock))
     }
     Ok(())
 }
@@ -501,4 +586,17 @@ test "version prefers the generation" {
     let meta = |fields| obj([("metadata", obj(fields))])
     assert_eq(version(meta([("generation", num(4)), ("resourceVersion", str("812"))])), "4")
     assert_eq(version(meta([("resourceVersion", str("812"))])), "812")
+}
+
+fn event(kind: Str, object: json.Value) -> Str {
+    json.stringify(obj([("type", str(kind)), ("object", object)]))
+}
+
+test "watch events" for (line, said) in [
+    (event("ADDED", obj([("kind", str("StaticSite")), ("metadata", obj([("name", str("hello")), ("namespace", str("web"))]))])), Some("ADDED StaticSite web/hello")),
+    (event("ERROR", obj([("kind", str("Status")), ("message", str("too old resource version"))])), Some("ERROR too old resource version")),
+    ("not json", None),
+    (json.stringify(obj([("object", obj([]))])), None),
+] {
+    assert_eq(event_text(line), said)
 }

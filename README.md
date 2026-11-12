@@ -69,7 +69,7 @@ Then work through the examples. Every one runs the same in the interpreter and n
 | `repos.vela` | HTTPS to a real API | `vela run examples/repos.vela --grant net=api.github.com` |
 | `notes.vela` | SQLite through `sql` | see the comment at the top of the file |
 | `todo_api.vela` | a CRUD API: todos over HTTP and JSON, stored in SQLite, with tests that call the router directly | `vela run examples/todo_api.vela --grant listen=127.0.0.1:0 --grant net=127.0.0.1`, or `vela test examples/todo_api.vela` |
-| `site_operator.vela` | a Kubernetes operator: a StaticSite custom resource becomes a ConfigMap, an nginx Deployment and a Service, kept in place by server-side apply, with status written back; it can reach only `kubectl proxy` | see the file's header (needs a cluster, e.g. kind), or `vela test examples/site_operator.vela` |
+| `site_operator.vela` | a Kubernetes operator: a StaticSite custom resource becomes a ConfigMap, an nginx Deployment and a Service, kept in place by server-side apply, with status written back; it watches the sites and its objects (`http.request_lines`), so it acts on a change as it happens, and can reach only `kubectl proxy` | see the file's header (needs a cluster, e.g. kind), or `vela test examples/site_operator.vela` |
 | `ffi.vela` | calling C | `vela run examples/ffi.vela --grant foreign=c` |
 
 To write your own: `vela check` gives errors with fixes, `vela explain E0302` explains a code, `vela fmt --write` formats, `vela caps` lists what each function can touch, and `vela doc --std --html -o std.html` documents the standard library. For an editor, point it at `vela lsp`.

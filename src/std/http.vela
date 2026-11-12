@@ -197,7 +197,9 @@ fn hex_text(n: Int) -> Str {
 
 // Read `n` bytes of body, the first ones already in `buf`, passing each
 // piece to `f` as it arrives. The folded value and the bytes after the body.
-fn read_sized[T](c: Conn, buf: Str, n: Int, init: T, f: fn(T, Str) -> T) -> Result[(T, Str), IoError] {
+// Once `stop` is true of the folded value, it returns at once without
+// reading the rest (the caller then closes the connection).
+fn read_sized[T](c: Conn, buf: Str, n: Int, init: T, f: fn(T, Str) -> T, stop: fn(T) -> Bool) -> Result[(T, Str), IoError] {
     let mut acc = init
     let mut left = n
     let mut data = buf
@@ -211,6 +213,9 @@ fn read_sized[T](c: Conn, buf: Str, n: Int, init: T, f: fn(T, Str) -> T) -> Resu
         if data != "" {
             acc = f(acc, data)
             left = left - data.len()
+            if stop(acc) {
+                return Ok((acc, ""))
+            }
         }
         data = c.read()?
         if data == "" {
@@ -221,9 +226,9 @@ fn read_sized[T](c: Conn, buf: Str, n: Int, init: T, f: fn(T, Str) -> T) -> Resu
 }
 
 // Read a body that ends when the peer closes the connection.
-fn read_to_end[T](c: Conn, buf: Str, init: T, f: fn(T, Str) -> T) -> Result[T, IoError] {
+fn read_to_end[T](c: Conn, buf: Str, init: T, f: fn(T, Str) -> T, stop: fn(T) -> Bool) -> Result[T, IoError] {
     let mut acc = if buf == "" { init } else { f(init, buf) }
-    while true {
+    while !stop(acc) {
         let data = c.read()?
         if data == "" {
             return Ok(acc)
@@ -245,7 +250,7 @@ fn more(c: Conn, data: Str) -> Result[Str, IoError] {
 // Read a `Transfer-Encoding: chunked` body, decoding it as it arrives and
 // passing each piece to `f`. `limit` caps the decoded size (-1: no cap).
 // The folded value and the bytes after the body and its trailers.
-fn read_chunked[T](c: Conn, buf: Str, limit: Int, init: T, f: fn(T, Str) -> T) -> Result[(T, Str), IoError] {
+fn read_chunked[T](c: Conn, buf: Str, limit: Int, init: T, f: fn(T, Str) -> T, stop: fn(T) -> Bool) -> Result[(T, Str), IoError] {
     let mut acc = init
     let mut data = buf
     let mut total = 0
@@ -286,9 +291,12 @@ fn read_chunked[T](c: Conn, buf: Str, limit: Int, init: T, f: fn(T, Str) -> T) -
         if limit >= 0 && total > limit {
             return Err(bad("body too large"))
         }
-        let (a, rest) = read_sized(c, data, size, acc, f)?
+        let (a, rest) = read_sized(c, data, size, acc, f, stop)?
         acc = a
         data = rest
+        if stop(acc) {
+            return Ok((acc, ""))
+        }
         while data.len() < 2 {
             data = more(c, data)?
         }
@@ -342,7 +350,8 @@ fn parse_url(url: Str) -> Result[Url, IoError] {
     }
 }
 
-fn read_response[T](c: Conn, method: Str, init: T, f: fn(T, Str) -> T) -> Result[(Response, T), IoError] {
+// A response's status line and headers, and the bytes read after them.
+fn read_status(c: Conn) -> Result[(Response, Str), IoError] {
     let (text, rest) = read_head(c, "")? ?? { return Err(bad("connection closed before the response")) }
     let h = parse_head(text)?
     let parts = h.first.split(" ")
@@ -350,20 +359,44 @@ fn read_response[T](c: Conn, method: Str, init: T, f: fn(T, Str) -> T) -> Result
         return Err(bad("malformed status line"))
     }
     let status = parts[1].parse_int() ?? { return Err(bad("malformed status line")) }
-    let resp = Response { status, headers: h.headers, body: "" }
+    Ok((Response { status, headers: h.headers, body: "" }, rest))
+}
+
+// The body of `resp`, the first bytes already in `rest`, passed to `f`
+// piece by piece as it arrives; it stops early once `stop` is true.
+fn read_body[T](c: Conn, method: Str, resp: Response, rest: Str, init: T, f: fn(T, Str) -> T, stop: fn(T) -> Bool) -> Result[T, IoError] {
+    let status = resp.status
     if method == "HEAD" || status == 204 || status == 304 || (status >= 100 && status < 200) {
-        return Ok((resp, init))
+        return Ok(init)
     }
-    if is_chunked(h.headers) {
-        let (acc, _) = read_chunked(c, rest, -1, init, f)?
-        return Ok((resp, acc))
+    if is_chunked(resp.headers) {
+        let (acc, _) = read_chunked(c, rest, -1, init, f, stop)?
+        return Ok(acc)
     }
-    match find_header(h.headers, "Content-Length") {
+    match find_header(resp.headers, "Content-Length") {
         Some(_) => {
-            let (acc, _) = read_sized(c, rest, content_length(h.headers)?, init, f)?
-            Ok((resp, acc))
+            let (acc, _) = read_sized(c, rest, content_length(resp.headers)?, init, f, stop)?
+            Ok(acc)
         },
-        None => Ok((resp, read_to_end(c, rest, init, f)?)),
+        None => read_to_end(c, rest, init, f, stop),
+    }
+}
+
+// Connect for `url` and send the request; the connection, ready for the response.
+fn send_request(net: Net, method: Str, url: Str, headers: List[Header], body: Str) -> Result[Conn, IoError] {
+    let u = parse_url(url)?
+    let addr = "{u.host}:{u.port}"
+    let c = if u.tls { net.connect_tls(addr)? } else { net.connect(addr)? }
+    let mut all = [Header { name: "Host", value: u.host }, Header { name: "Connection", value: "close" }]
+    for h in headers {
+        all.push(h)
+    }
+    match c.write(head_text("{method} {u.path} HTTP/1.1", all, body)) {
+        Ok(_) => Ok(c),
+        Err(e) => {
+            c.close()
+            Err(e)
+        },
     }
 }
 
@@ -372,16 +405,73 @@ fn read_response[T](c: Conn, method: Str, init: T, f: fn(T, Str) -> T) -> Result
 // memory: `request_fold(net, "GET", url, [], "", 0, |n, s| n + s.len())`.
 // Returns the response, with an empty body, and the folded value.
 pub fn request_fold[T](net: Net, method: Str, url: Str, headers: List[Header], body: Str, init: T, f: fn(T, Str) -> T) -> Result[(Response, T), IoError] {
-    let u = parse_url(url)?
-    let addr = "{u.host}:{u.port}"
-    let c = if u.tls { net.connect_tls(addr)? } else { net.connect(addr)? }
-    let mut all = [Header { name: "Host", value: u.host }, Header { name: "Connection", value: "close" }]
-    for h in headers {
-        all.push(h)
+    let c = send_request(net, method, url, headers, body)?
+    let r = match read_status(c) {
+        Ok((resp, rest)) => match read_body(c, method, resp, rest, init, f, |_| false) {
+            Ok(acc) => Ok((resp, acc)),
+            Err(e) => Err(e),
+        },
+        Err(e) => Err(e),
     }
-    let sent = c.write(head_text("{method} {u.path} HTTP/1.1", all, body))
-    let r = match sent {
-        Ok(_) => read_response(c, method, init, f),
+    c.close()
+    r
+}
+
+// The lines of a body not yet passed on, and whether the caller wants more.
+struct Lines {
+    rest: Str,
+    more: Bool,
+}
+
+// Pass each complete line in `data` to `f`, keeping a partial last line.
+fn split_lines(s: Lines, data: Str, f: fn(Str) -> Bool) -> Lines {
+    let mut buf = s.rest + data
+    let mut more = s.more
+    while more {
+        match buf.index_of("\n") {
+            Some(i) => {
+                let line = buf.slice(0, i)
+                buf = buf.slice(i + 1, buf.len())
+                more = f(if line.ends_with("\r") { line.slice(0, line.len() - 1) } else { line })
+            },
+            None => {
+                if buf.len() > max_body() {
+                    // a line that never ends: stop rather than hold it all
+                    return Lines { rest: "", more: false }
+                }
+                return Lines { rest: buf, more }
+            },
+        }
+    }
+    Lines { rest: buf, more }
+}
+
+// Send a request and pass the response body to `f` a line at a time, each
+// as soon as it has arrived, without its "\n" or "\r\n": for streams that
+// never end, such as a Kubernetes watch, server-sent events or a log
+// follow. `f` returns false to stop; the connection is closed then. Only a
+// 2xx response is streamed; any other is returned with its whole body, and
+// `f` is not called. Returns the response, with an empty body when streamed.
+pub fn request_lines(net: Net, method: Str, url: Str, headers: List[Header], body: Str, f: fn(Str) -> Bool) -> Result[Response, IoError] {
+    let c = send_request(net, method, url, headers, body)?
+    let r = match read_status(c) {
+        Ok((resp, rest)) if resp.status >= 200 && resp.status < 300 => {
+            let lines = read_body(c, method, resp, rest, Lines { rest: "", more: true }, |s, data| split_lines(s, data, f), |s| !s.more)
+            match lines {
+                Ok(s) => {
+                    // a last line without a line break
+                    if s.more && s.rest != "" {
+                        let _ = f(if s.rest.ends_with("\r") { s.rest.slice(0, s.rest.len() - 1) } else { s.rest })
+                    }
+                    Ok(resp)
+                },
+                Err(e) => Err(e),
+            }
+        },
+        Ok((resp, rest)) => match read_body(c, method, resp, rest, "", |a, s| a + s, |_| false) {
+            Ok(text) => Ok(Response { status: resp.status, headers: resp.headers, body: text }),
+            Err(e) => Err(e),
+        },
         Err(e) => Err(e),
     }
     c.close()
@@ -416,13 +506,13 @@ fn read_message(c: Conn, buf: Str) -> Result[Option[(Request, Str)], IoError] {
         return Err(bad("malformed request line"))
     }
     let (body, after) = if is_chunked(h.headers) {
-        read_chunked(c, rest, max_body(), "", |a, s| a + s)?
+        read_chunked(c, rest, max_body(), "", |a, s| a + s, |_| false)?
     } else {
         let n = content_length(h.headers)?
         if n > max_body() {
             return Err(bad("request body too large"))
         }
-        read_sized(c, rest, n, "", |a, s| a + s)?
+        read_sized(c, rest, n, "", |a, s| a + s, |_| false)?
     }
     Ok(Some((Request { method: parts[0], path: parts[1], version: parts[2], headers: h.headers, body }, after)))
 }
