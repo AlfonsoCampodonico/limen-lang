@@ -1,0 +1,7 @@
+// A million lines of output: what printing costs.
+fn main(root: Root) {
+    let out = root.stdout
+    for i in 0..<1000000 {
+        out.print("line {i}")
+    }
+}
