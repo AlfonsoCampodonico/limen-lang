@@ -20,7 +20,7 @@ The extension runs the first of:
 
 1. the `vela.path` setting, from your user settings only (a workspace's `.vscode/settings.json` cannot set it);
 2. `vela` on the PATH;
-3. in a folder you have trusted (VS Code's Workspace Trust), `_build/default/bin/main.exe` in the open folder or a folder above it: this repository, after `dune build`.
+3. in a folder you have trusted (VS Code's Workspace Trust), `_build/default/bin/main.exe` in that folder itself (not a folder above it, and not through a symlink leading out of it): this repository, after `dune build`.
 
 So opening a folder you haven't trusted never runs a program that folder supplies. Highlighting works without any of them. Turn the language server off with `vela.languageServer.enabled`, and restart it with **Vela: Restart Language Server**.
 

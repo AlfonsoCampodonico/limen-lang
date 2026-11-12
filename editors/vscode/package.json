@@ -53,7 +53,7 @@
         "vela.path": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Path to the `vela` executable, set in your user settings (a workspace cannot set it). When empty, `vela` on the PATH is used, or else, in a trusted folder only, the build in the open folder (`_build/default/bin/main.exe`).",
+          "markdownDescription": "Path to the `vela` executable, set in your user settings (a workspace cannot set it). When empty, `vela` on the PATH is used, or else, in a trusted folder only, the build in that folder (`_build/default/bin/main.exe`).",
           "scope": "machine"
         },
         "vela.languageServer.enabled": {

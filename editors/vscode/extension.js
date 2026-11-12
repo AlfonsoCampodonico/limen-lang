@@ -23,14 +23,16 @@ function findVela() {
     if (fs.existsSync(p)) return p;
   }
   if (!vscode.workspace.isTrusted) return null;
+  // only the trusted folder itself: not its parents, which were never
+  // trusted, and not through a symlink that leads out of it
   for (const folder of vscode.workspace.workspaceFolders || []) {
-    let dir = folder.uri.fsPath;
-    for (;;) {
-      const p = path.join(dir, "_build", "default", "bin", "main.exe");
-      if (fs.existsSync(p)) return p;
-      const up = path.dirname(dir);
-      if (up === dir) break;
-      dir = up;
+    if (folder.uri.scheme !== "file") continue;
+    try {
+      const root = fs.realpathSync(folder.uri.fsPath);
+      const p = fs.realpathSync(path.join(root, "_build", "default", "bin", "main.exe"));
+      if (p.startsWith(root + path.sep) && fs.statSync(p).isFile()) return p;
+    } catch (_) {
+      // no build in this folder
     }
   }
   return null;
