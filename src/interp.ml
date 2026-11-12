@@ -35,9 +35,35 @@ type mkey =
   | KStruct of string * (string * mkey) list
   | KEnum of string * string * mkey list
 
+(* Any total order will do (maps iterate in insertion order, kept apart),
+   so keys are compared directly instead of through the generic compare. *)
+let key_tag = function KInt _ -> 0 | KStr _ -> 1 | KBytes _ -> 2 | KBool _ -> 3 | KStruct _ -> 4 | KEnum _ -> 5
+
+let rec compare_key a b =
+  match (a, b) with
+  | KInt x, KInt y -> Int64.compare x y
+  | KStr x, KStr y | KBytes x, KBytes y -> String.compare x y
+  | KBool x, KBool y -> Bool.compare x y
+  | KStruct (n, fs), KStruct (m, gs) ->
+    let c = String.compare n m in
+    if c <> 0 then c else compare_keys (List.map snd fs) (List.map snd gs)
+  | KEnum (e, v, xs), KEnum (f, w, ys) ->
+    let c = String.compare e f in
+    if c <> 0 then c else
+      let c = String.compare v w in
+      if c <> 0 then c else compare_keys xs ys
+  | _ -> Int.compare (key_tag a) (key_tag b)
+
+and compare_keys xs ys =
+  match (xs, ys) with
+  | [], [] -> 0
+  | [], _ -> -1
+  | _, [] -> 1
+  | x :: xs, y :: ys -> ( match compare_key x y with 0 -> compare_keys xs ys | c -> c)
+
 module KM = Map.Make (struct
   type t = mkey
-  let compare = compare
+  let compare = compare_key
 end)
 
 type value =
