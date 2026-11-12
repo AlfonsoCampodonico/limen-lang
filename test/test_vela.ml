@@ -394,6 +394,13 @@ let tls_dir =
   if Sys.file_exists (Filename.concat d "ca.pem") then d else Filename.concat (Sys.getcwd ()) "test/tls"
 let () = Unix.putenv "SSL_CERT_FILE" (Filename.concat tls_dir "ca.pem")
 
+(* builds made through the CLI keep their binaries in a cache of their own,
+   not the user's, removed at the end *)
+let test_cache = Filename.concat (Filename.get_temp_dir_name ()) (Printf.sprintf "vela-test-cache-%d" (Unix.getpid ()))
+let () =
+  Unix.putenv "VELA_CACHE" test_cache;
+  at_exit (fun () -> ignore (Sys.command (Filename.quote_command "rm" [ "-rf"; test_cache ])))
+
 let main_wrap body = "fn main(root: Root) {\n    let out = root.stdout\n" ^ body ^ "\n}\n"
 
 let () =
@@ -5065,6 +5072,31 @@ fn main(root: Root) {
     in
     (code, read_file o, read_file e)
   in
+  (* the build cache: the same program again is a copy of the first build
+     wherever it goes, a changed program builds anew, and VELA_CACHE=off
+     never touches the cache *)
+  (let dir = Filename.concat pdir "own-cache" in
+   let prog = Filename.concat pdir "cached.vela" in
+   let write text = Out_channel.with_open_bin prog (fun oc -> output_string oc text) in
+   let build ?(cache = dir) out =
+     Sys.command (sprintf "VELA_CACHE=%s %s build %s -o %s >/dev/null 2>&1" (Filename.quote cache) (Filename.quote vela_exe) (Filename.quote prog) (Filename.quote out))
+   in
+   let entries () = try Array.length (Sys.readdir dir) with Sys_error _ -> 0 in
+   let out n = Filename.concat pdir n in
+   write "fn main(root: Root) {\n    root.stdout.print(\"cached\")\n}\n";
+   let c1 = build (out "cached1") in
+   let n1 = entries () in
+   let c2 = build (out "cached2") in
+   let n2 = entries () in
+   let same = c1 = 0 && c2 = 0 && read_file (out "cached1") = read_file (out "cached2") in
+   let ran = Sys.command (sprintf "%s > %s" (Filename.quote (out "cached2")) (Filename.quote (out "cached2.out"))) = 0 && read_file (out "cached2.out") = "cached\n" in
+   write "fn main(root: Root) {\n    root.stdout.print(\"changed\")\n}\n";
+   let c3 = build (out "cached3") in
+   let n3 = entries () in
+   let c4 = build ~cache:"off" (out "cached4") in
+   let n4 = entries () in
+   ok "build-cache" (same && ran && n1 = 1 && n2 = 1 && c3 = 0 && n3 = 2 && c4 = 0 && n4 = 2)
+     (sprintf "codes %d %d %d %d, entries %d %d %d %d, same %b, ran %b" c1 c2 c3 c4 n1 n2 n3 n4 same ran));
   (* the examples' own tests, in both backends: the CRUD API's call its
      router directly, the operator's need no cluster *)
   List.iter

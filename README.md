@@ -79,7 +79,7 @@ To write your own: `vela check` gives errors with fixes, `vela explain E0302` ex
 | Command | What it does |
 | --- | --- |
 | `vela run FILE [--native] [--grant net=HOST[:PORT]\|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST[:PORT]]... [--grant env=NAME\|*]... [--grant exec=PROGRAM\|*]... [--grant foreign=LIB\|*]... [--seed N] [--no-sandbox] [-- ARGS...]` | Type-check, then run `main` in the interpreter, or compiled with `--native`. Stdout, Stdin, Clock and Rand are always granted; Net, Fs, Listen, Env, Exec and Foreign only when granted, by flags or by `[grants]` in vela.toml. `--seed` makes `Rand` repeatable; arguments after `--` are `root.args()`. The exit status is 0, 1 after a panic or an `Err` from `main`, or the `Int` that `main` returns. |
-| `vela build FILE [-o OUT] [--emit-c]` | Compile to a native binary through C. The binary takes the same `--grant` flags. `--emit-c` writes the C instead. |
+| `vela build FILE [-o OUT] [--emit-c]` | Compile to a native binary through C. The binary takes the same `--grant` flags. `--emit-c` writes the C instead. Binaries are cached by the exact C, compiler flags and compiler (in `~/Library/Caches/vela`, or `$XDG_CACHE_HOME/vela` or `~/.cache/vela`; the 200 most recently used), so rebuilding an unchanged program, or `vela run --native` on one, takes milliseconds. `VELA_CACHE=DIR` puts the cache elsewhere, `VELA_CACHE=off` compiles every time. |
 | `vela check FILE [--json]` | Type-check only. `--json` emits diagnostics with codes, spans, notes and machine-applicable fixes. |
 | `vela caps FILE [--json]` | List each function's authority: the capabilities in its signature, or `pure`. |
 | `vela explain CODE` | Explain an error code, for example `vela explain E0302`. |
