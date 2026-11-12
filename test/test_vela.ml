@@ -3712,6 +3712,94 @@ fn main(root: Root) {
    let _, ds2, _ = compile "unwrap-or-fixed2" fixed in
    ok "unwrap-or-fixed-checks" (ds2 = []) (String.concat " " (codes ds2)));
 
+  (* ---------- type aliases ---------- *)
+  let shapes = "pub type Point = (Float, Float)\npub type Path = List[Point]\ntype Secret = Int\n" in
+  out "type-alias" ~modules:[ ("shapes", shapes) ]
+    {|use shapes
+
+type Counts = Map[Str, Int]
+type Pair[T] = (T, T)
+type Handler = fn(Str) -> Str
+type Parsed[T] = Result[T, Str]
+
+fn tally(words: List[Str]) -> Counts {
+    let mut c: Counts = map()
+    for w in words {
+        c[w] = c.get(w) ?? 0 + 1
+    }
+    c
+}
+
+fn swap[T](p: Pair[T]) -> Pair[T] {
+    (p.1, p.0)
+}
+
+fn words(self: Counts) -> Str {
+    "{self.len()} words"
+}
+
+fn number(s: Str) -> Parsed[Int] {
+    match s.parse_int() {
+        Some(n) => Ok(n),
+        None => Err("not a number: {s}"),
+    }
+}
+
+fn length(p: shapes.Path) -> Int {
+    p.len()
+}
+
+struct Ev {
+    type: Str,
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let c = tally(["a", "b", "a"])
+    let up: Handler = |s| s.to_upper()
+    let m: Map[Str, Int] = c
+    out.print("{c} {swap((1, 2))} {swap(("x", "y"))} {up("hi")} {c.words()} {m == c}")
+    out.print("{number("12")} {number("x")} {length([(0.0, 1.0), (2.0, 3.0)])}")
+    let type = Ev { type: "click" }
+    out.print(type.type)
+}
+|}
+    "{\"a\": 2, \"b\": 1} (2, 1) (\"y\", \"x\") HI 2 words true\nOk(12) Err(\"not a number: x\") 2\nclick\n";
+  errs "type-alias-cycle" "type A = List[B]\ntype B = Option[A]\n\nfn main(root: Root) {\n    let x: A = []\n}\n" [ "E0116"; "E0116" ];
+  errs "type-alias-self" "type T = T\n\nfn main(root: Root) {}\n" [ "E0116" ];
+  errs "type-alias-arity" "type Pair[T] = (T, T)\n\nfn main(root: Root) {\n    let p: Pair = (1, 2)\n    let q: Pair[Int, Int] = (1, 2)\n}\n" [ "E0109"; "E0109" ];
+  errs "type-alias-twice" "struct P {\n    x: Int,\n}\n\ntype P = Int\n\nfn main(root: Root) {}\n" [ "E0106" ];
+  errs "type-alias-builtin" "type Int = Float\n\nfn main(root: Root) {}\n" [ "E0106" ];
+  errs "type-alias-unknown" "type X = Nope\n\nfn main(root: Root) {}\n" [ "E0102" ];
+  errs "type-alias-private" ~modules:[ ("shapes", shapes) ] "use shapes\n\nfn main(root: Root) {\n    let s: shapes.Secret = 1\n}\n" [ "E0402" ];
+  errs "type-alias-mismatch" "type Meters = Float\n\nfn main(root: Root) {\n    let m: Meters = \"far\"\n}\n" [ "E0201" ];
+
+  (* ---------- map and flat_map on Result and Option ---------- *)
+  out "result-map-flat-map"
+    {|fn half(n: Int) -> Result[Int, Str] {
+    if n % 2 == 0 { Ok(n / 2) } else { Err("{n} is odd") }
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let r: Result[Int, Str] = Ok(20)
+    out.print("{r.map(|x| x + 1)} {r.flat_map(half)} {r.flat_map(half).flat_map(half).flat_map(half)}")
+    let e: Result[Int, Str] = Err("no")
+    out.print("{e.map(|x| x * 2)} {e.flat_map(half)} {r.map(|x| "#{x}")}")
+    let o = Some(8)
+    out.print("{o.flat_map(|x| if x > 5 { Some([x]) } else { None })} {"7".parse_int().flat_map(|n| half(n).map(|h| Some(h)) ?? None)}")
+    let none: Option[Int] = None
+    out.print("{none.flat_map(|x| Some(x))} {[1, 2].flat_map(|x| [x, x])}")
+}
+|}
+    "Ok(21) Ok(10) Err(\"5 is odd\")\nErr(\"no\") Err(\"no\") Ok(\"#20\")\nSome([8]) None\nNone [1, 1, 2, 2]\n";
+  (let src = "fn main(root: Root) {\n    let r: Result[Int, Str] = Ok(1)\n    let o = Some(2)\n    let a = r.and_then(|x| Ok(x + 1))\n    let b = o.and_then(|x| Some(x))\n}\n" in
+   let _, ds, _ = compile "and-then-fix" src in
+   ok "and-then-gone" (codes ds = [ "E0105"; "E0105" ]) (String.concat " " (codes ds));
+   let fixed = apply_fixes src ds in
+   let _, ds2, _ = compile "and-then-fixed" fixed in
+   ok "and-then-fixed-checks" (ds2 = [] && Interp_util.find_sub fixed "r.flat_map(" 0 <> None) fixed);
+
   (* ---------- collection methods (std/methods.vela) ---------- *)
   out "collections-search"
     {|struct P {
@@ -5292,6 +5380,8 @@ fn main(root: Root) {
   canonical "fmt-aligned-comments"
     "struct P {\n    x: Int,     // across\n    yy: Int,    // down\n}\n";
   (* a block of one short return or assignment, written on one line, stays there *)
+  (* consecutive aliases stay together, unless the author spaced them *)
+  canonical "fmt-type-alias" "use json\n\ntype A = Int\npub type B[T] = Map[Str, List[T]]\n\ntype C = fn(Int) -> json.Value  // later\n\nfn main(root: Root) {}\n";
   canonical "fmt-one-line-return"
     "fn f(o: Option[Int]) -> Int {\n    let n = o ?? { return 0 }\n    match o {\n        Some(_) => { return n },\n        None => { n = 1 },\n    }\n}\n";
 

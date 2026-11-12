@@ -306,7 +306,10 @@ fn set_status(net: Net, base: Str, s: Site, st: Status) -> Result[(), Str] {
 
 // Each pass gets the versions seen by the last one, keyed by "Kind ns/name",
 // and returns the versions it saw.
-fn sync(log: fn(Str) -> (), net: Net, base: Str, s: Site, seen: Map[Str, Str]) -> Result[Map[Str, Str], Str] {
+type Seen = Map[Str, Str]
+type Log = fn(Str) -> ()
+
+fn sync(log: Log, net: Net, base: Str, s: Site, seen: Seen) -> Result[Seen, Str] {
     let mut now = map()
     let site = "{s.namespace}/{s.name}"
     let wanted = match problem(s) {
@@ -337,7 +340,7 @@ fn sync(log: fn(Str) -> (), net: Net, base: Str, s: Site, seen: Map[Str, Str]) -
     Ok(now)
 }
 
-fn pass(log: fn(Str) -> (), net: Net, base: Str, seen: Map[Str, Str]) -> Result[Map[Str, Str], Str] {
+fn pass(log: Log, net: Net, base: Str, seen: Seen) -> Result[Seen, Str] {
     let (_, list) = call(net, base, "GET", "/apis/vela.dev/v1/staticsites", "", "")?
     let items = dig(list, ["items"]) ?? json.Arr([])
     let mut next = map()

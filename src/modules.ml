@@ -32,9 +32,15 @@ let is_method = function
   | IFn { fn_test = None; fn_params = { prm_name = "self"; _ } :: _; _ } -> true
   | _ -> false
 
-let item_name = function IFn d -> d.fn_name | IStruct s -> s.st_name | IEnum e -> e.en_name | IIface i -> i.if_name
-let item_span = function IFn d -> d.fn_span | IStruct s -> s.st_span | IEnum e -> e.en_span | IIface i -> i.if_span
-let item_pub = function IFn d -> d.fn_pub | IStruct s -> s.st_pub | IEnum e -> e.en_pub | IIface i -> i.if_pub
+let item_name = function IFn d -> d.fn_name | IStruct s -> s.st_name | IEnum e -> e.en_name | IIface i -> i.if_name | IType a -> a.ty_name
+let item_span = function IFn d -> d.fn_span | IStruct s -> s.st_span | IEnum e -> e.en_span | IIface i -> i.if_span | IType a -> a.ty_span
+let item_pub = function IFn d -> d.fn_pub | IStruct s -> s.st_pub | IEnum e -> e.en_pub | IIface i -> i.if_pub | IType a -> a.ty_pub
+
+(* A module's items by bare name, methods left out. *)
+let own_items (items : item list) =
+  let own = Hashtbl.create 16 in
+  List.iter (fun i -> if not (is_method i) then Hashtbl.replace own (item_name i) i) items;
+  own
 
 let errors : Diag.t list ref = ref []
 let err ?(notes = []) code sp msg = errors := Diag.make ~notes code sp msg :: !errors
@@ -115,27 +121,74 @@ let no_member (m : modinfo) n sp =
   err "E0403" sp (Printf.sprintf "module `%s` has no `%s`" m.mname n)
     ~notes:(if names = [] then [] else [ "it exports: " ^ String.concat ", " (List.sort compare names) ])
 
-let rec ty env (t : ty_expr) : ty_expr =
+(* aliases already reported as referring to themselves, so each is reported once *)
+let cyclic : (string, unit) Hashtbl.t = Hashtbl.create 4
+
+(* Where each alias is written, by its qualified name, from the last load:
+   expanding it removes the name from the program, so find-references and
+   rename read its uses from here. *)
+let alias_uses : (string * Span.t) list ref = ref []
+
+(* A type with module names resolved and aliases expanded. [seen]: the
+   aliases being expanded around this one, to catch `type A = List[A]`. *)
+let rec ty ?(seen = []) env (t : ty_expr) : ty_expr =
   match t.tdesc with
-  | TyName (n, args) ->
-    let args = List.map (ty env) args in
-    let n =
-      match String.index_opt n '.' with
-      | Some i -> (
-        let a = String.sub n 0 i and b = String.sub n (i + 1) (String.length n - i - 1) in
-        match module_of env a t.tspan with
-        | Some m -> (
-          match member env m b t.tspan with
-          | Some (IStruct _ | IEnum _ | IIface _) -> qual m b
-          | _ -> no_member m b t.tspan; n)
-        | None -> err "E0401" t.tspan (Printf.sprintf "unknown module `%s`; add `use %s` at the top of the file" a a); n)
-      | None -> (
-        if List.mem n env.gens then n
-        else match Hashtbl.find_opt env.own n with Some (IStruct _ | IEnum _ | IIface _) -> qual env.self n | _ -> n)
-    in
-    { t with tdesc = TyName (n, args) }
-  | TyFn (ps, r) -> { t with tdesc = TyFn (List.map (ty env) ps, ty env r) }
+  | TyName (n, args) -> (
+    let args = List.map (ty ~seen env) args in
+    let named n = { t with tdesc = TyName (n, args) } in
+    match String.index_opt n '.' with
+    | Some i -> (
+      let a = String.sub n 0 i and b = String.sub n (i + 1) (String.length n - i - 1) in
+      match module_of env a t.tspan with
+      | Some m -> (
+        match member env m b t.tspan with
+        | Some (IType al) -> expand ~seen env m al args t
+        | Some (IStruct _ | IEnum _ | IIface _) -> named (qual m b)
+        | _ -> no_member m b t.tspan; named n)
+      | None -> err "E0401" t.tspan (Printf.sprintf "unknown module `%s`; add `use %s` at the top of the file" a a); named n)
+    | None -> (
+      if List.mem n env.gens then named n
+      else
+        match Hashtbl.find_opt env.own n with
+        | Some (IType al) -> expand ~seen env env.self al args t
+        | Some (IStruct _ | IEnum _ | IIface _) -> named (qual env.self n)
+        | _ -> named n))
+  | TyFn (ps, r) -> { t with tdesc = TyFn (List.map (ty ~seen env) ps, ty ~seen env r) }
   | TyUnit | TyInt _ -> t
+
+(* alias [al] of module [m], used at [t] with [args] (already resolved): its
+   body, resolved in [m], with the arguments put in for its parameters *)
+and expand ~seen env (m : modinfo) (al : alias_decl) args (t : ty_expr) : ty_expr =
+  let key = qual m al.ty_name in
+  alias_uses := (key, t.tspan) :: !alias_uses;
+  let bad = { t with tdesc = TyName (key, []) } in
+  if List.mem key seen then begin
+    if not (Hashtbl.mem cyclic key) then begin
+      Hashtbl.replace cyclic key ();
+      err "E0116" al.ty_span (Printf.sprintf "type alias `%s` refers to itself" al.ty_name)
+        ~notes:[ "an alias is only another name; for a type that contains itself, declare a struct or enum" ]
+    end;
+    bad
+  end
+  else if List.length args <> List.length al.ty_gen then begin
+    let k = List.length al.ty_gen in
+    err "E0109" t.tspan
+      (Printf.sprintf "`%s` takes %d type argument%s, found %d" al.ty_name k (if k = 1 then "" else "s") (List.length args));
+    bad
+  end
+  else
+    let aenv = { env with self = m; own = (if m == env.self then env.own else own_items m.mitems); gens = al.ty_gen } in
+    let body = ty ~seen:(key :: seen) aenv al.ty_body in
+    let pairs = List.combine al.ty_gen args in
+    let rec subst (x : ty_expr) =
+      match x.tdesc with
+      | TyName (g, []) when List.mem_assoc g pairs -> List.assoc g pairs
+      | TyName (n, xs) -> { x with tdesc = TyName (n, List.map subst xs) }
+      | TyFn (ps, r) -> { x with tdesc = TyFn (List.map subst ps, subst r) }
+      | TyUnit | TyInt _ -> x
+    in
+    (* errors about the expanded type point where the alias is used *)
+    { (subst body) with tspan = t.tspan }
 
 let mk d sp = { edesc = d; espan = sp; ety = Types.TErr; einst = [] }
 
@@ -398,6 +451,11 @@ let rename_item mods (m : modinfo) own (it : item) : item =
     let env = { self = m; mods; own; gens = e.en_gen } in
     IEnum
       { e with en_name = qual m e.en_name; en_variants = List.map (fun (v, sp, ts) -> (v, sp, List.map (ty env) ts)) e.en_variants }
+  | IType a ->
+    (* expanded where it is used; kept, expanded, so the checker checks its
+       body even if nothing uses it *)
+    let env = { self = m; mods; own; gens = a.ty_gen } in
+    IType { a with ty_name = qual m a.ty_name; ty_body = ty ~seen:[ qual m a.ty_name ] env a.ty_body }
 
 (* A table test, `test "add" for (a, b, want) in [(1, 2, 3), (2, 2, 4)] { body }`,
    becomes one test per case, named by the case's text ("add (1, 2, 3)"),
@@ -425,12 +483,31 @@ let expand_table (it : item) : item list =
     [ IFn { d with fn_body = { d.fn_body with tail = Some keep } } ]
   | _ -> [ it ]
 
+(* An alias may not take a name another item of its module or a built-in
+   type has. *)
+let builtin_type_names =
+  [ "Int"; "Int32"; "Float"; "Bool"; "Str"; "Bytes"; "List"; "Map"; "Array"; "Option"; "Result"; "IoError"; "Chan"; "Root"; "Net";
+    "Fs"; "Listen"; "Listener"; "Conn"; "Env"; "Exec"; "Foreign"; "Stdout"; "Stdin"; "Clock"; "Rand"; "Handle"; "Out" ]
+
+let check_aliases (m : modinfo) =
+  List.iter
+    (function
+      | IType a as it ->
+        if List.mem a.ty_name builtin_type_names then
+          err "E0106" a.ty_span (Printf.sprintf "`%s` is a built-in type; name the alias something else" a.ty_name)
+        else if List.exists (fun i -> i != it && (not (is_method i)) && item_name i = a.ty_name) m.mitems then
+          err "E0106" a.ty_span (Printf.sprintf "type `%s` is defined more than once" a.ty_name)
+      | _ -> ())
+    m.mitems
+
 (* ---------- entry point ---------- *)
 
 (* Load the main file at [path] (whose text is [src]) and every module it uses.
    Returns the flat program, or the diagnostics. *)
 let load ?(deps = []) path src : item list * Diag.t list =
   errors := [];
+  Hashtbl.reset cyclic;
+  alias_uses := [];
   module_pkg := [];
   std_loaded := [];
   let mods : (string, modinfo) Hashtbl.t = Hashtbl.create 8 in
@@ -470,8 +547,8 @@ let load ?(deps = []) path src : item list * Diag.t list =
         let items =
           List.concat_map
             (fun m ->
-              let own = Hashtbl.create 16 in
-              List.iter (fun i -> if not (is_method i) then Hashtbl.replace own (item_name i) i) m.mitems;
+              let own = own_items m.mitems in
+              check_aliases m;
               List.map (rename_item mods m own) (List.concat_map expand_table m.mitems))
             (List.rev all)
         in

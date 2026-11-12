@@ -32,6 +32,9 @@
           "include": "#type-decl"
         },
         {
+          "include": "#alias-decl"
+        },
+        {
           "include": "#use"
         },
         {
@@ -170,6 +173,17 @@
       "captures": {
         "1": {
           "name": "storage.type.$1.vela"
+        },
+        "2": {
+          "name": "entity.name.type.vela"
+        }
+      }
+    },
+    "alias-decl": {
+      "match": "^\\s*(?:pub\\s+)?(type)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": {
+          "name": "storage.type.alias.vela"
         },
         "2": {
           "name": "entity.name.type.vela"

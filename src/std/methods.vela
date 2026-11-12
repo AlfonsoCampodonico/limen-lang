@@ -334,3 +334,29 @@ fn merge[K: Key, V](self: Map[K, V], other: Map[K, V]) -> Map[K, V] {
     }
     m
 }
+
+// ---------- Option and Result ----------
+// map, map_error, is_ok and the others are built in; these are written here.
+
+// The value inside, passed to `f`, which may itself fail: `flat_map` as
+// on lists, so `parse(s).flat_map(check)` keeps the first error.
+fn flat_map[T, U](self: Option[T], f: fn(T) -> Option[U]) -> Option[U] {
+    match self {
+        Some(x) => f(x),
+        None => None,
+    }
+}
+
+fn map[T, E, U](self: Result[T, E], f: fn(T) -> U) -> Result[U, E] {
+    match self {
+        Ok(x) => Ok(f(x)),
+        Err(e) => Err(e),
+    }
+}
+
+fn flat_map[T, E, U](self: Result[T, E], f: fn(T) -> Result[U, E]) -> Result[U, E] {
+    match self {
+        Ok(x) => f(x),
+        Err(e) => Err(e),
+    }
+}

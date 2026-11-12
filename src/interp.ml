@@ -1798,7 +1798,7 @@ let run ?(before_main = fun () -> ()) ~out ~grants (user_items : item list) : (v
   let owners = Hashtbl.create 16 in
   List.iter
     (function
-      | IIface _ -> ()
+      | IIface _ | IType _ -> ()
       | IFn d -> Hashtbl.replace rt.fns d.fn_name d
       | IStruct s -> Hashtbl.replace rt.structs s.st_name s
       | IEnum e ->
@@ -1848,7 +1848,7 @@ let make_rt ~out ~grants (user_items : item list) =
   let owners = Hashtbl.create 16 in
   List.iter
     (function
-      | IIface _ -> ()
+      | IIface _ | IType _ -> ()
       | IFn d -> Hashtbl.replace rt.fns d.fn_name d
       | IStruct s -> Hashtbl.replace rt.structs s.st_name s
       | IEnum e ->

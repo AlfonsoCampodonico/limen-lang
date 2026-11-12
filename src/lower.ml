@@ -1120,7 +1120,7 @@ let lower_program ?(tests = false) (user_items : item list) : I.program * gctx =
   let owners = Hashtbl.create 16 in
   List.iter
     (function
-      | IIface _ -> ()
+      | IIface _ | IType _ -> ()
       | IFn d -> Hashtbl.replace g.fns d.fn_name d
       | IStruct s -> Hashtbl.replace g.structs s.st_name s
       | IEnum e ->

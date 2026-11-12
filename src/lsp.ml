@@ -213,7 +213,8 @@ let hover_items text items =
         List.iter
           (fun (v, sp, tes) ->
             add sp (if tes = [] then v else v ^ "(" ^ String.concat ", " (List.map (fun te -> slice text te.tspan) tes) ^ ")"))
-          e.en_variants)
+          e.en_variants
+      | IType a -> add a.ty_span ("type " ^ a.ty_name ^ " = " ^ slice text a.ty_body.tspan))
     items;
   !acc
 
@@ -268,6 +269,7 @@ let module_completions path text name =
                | IFn d when d.fn_pub && d.fn_test = None && not (Modules.is_method (IFn d)) -> [ documented 3 d.fn_name (Doc.fn_sig src d) d.fn_span ]
                | IStruct st when st.st_pub -> [ documented 22 st.st_name "struct" st.st_span ]
                | IIface i when i.if_pub -> [ documented 8 i.if_name "interface" i.if_span ]
+               | IType a when a.ty_pub -> [ documented 25 a.ty_name "type" a.ty_span ]
                | IEnum e when e.en_pub ->
                  documented 13 e.en_name "enum" e.en_span :: List.map (fun (v, vsp, _) -> documented 20 v e.en_name vsp) e.en_variants
                | _ -> [])
@@ -684,7 +686,8 @@ let handle st (msg : J.t) : J.t list =
                   sym name 12 sel (Span.merge d.fn_span d.fn_body.bspan)
                 | IStruct s -> sym s.st_name 23 s.st_span s.st_span
                 | IEnum e -> sym e.en_name 10 e.en_span e.en_span
-                | IIface i -> sym i.if_name 11 i.if_span i.if_span)
+                | IIface i -> sym i.if_name 11 i.if_span i.if_span
+                | IType a -> sym a.ty_name 26 a.ty_span a.ty_span)
               items))
     | _ -> reply (J.List []))
   | m -> if id = J.Null then [] else [ error id (-32601) ("method not supported: " ^ m) ]

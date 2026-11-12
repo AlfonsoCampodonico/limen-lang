@@ -148,6 +148,12 @@ let of_file ?(all = false) name text (f : file) =
             e_sig = block_sig (Printf.sprintf "%sinterface %s" (pub_kw i.if_pub) i.if_name) (List.map (fun m -> m.m_sig) ms);
             e_doc = doc_above text i.if_span.lo; e_members = List.filter (fun m -> m.m_doc <> "") ms; e_methods = [] }
           :: !types
+      | IType a when shown a.ty_pub ->
+        types :=
+          { e_kind = "type"; e_name = a.ty_name;
+            e_sig = Printf.sprintf "%stype %s%s = %s" (pub_kw a.ty_pub) a.ty_name (generics a.ty_gen []) (slice text a.ty_body.tspan);
+            e_doc = doc_above text a.ty_span.lo; e_members = []; e_methods = [] }
+          :: !types
       | _ -> ())
     f.items;
   let types = List.rev !types in

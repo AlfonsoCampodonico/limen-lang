@@ -1,0 +1,13 @@
+use json
+
+type Counts = Map[Str, Int]
+pub type Pair[T] = (T, T)
+type Handler = fn(Str) -> json.Value
+
+struct Ev {
+    type: Str,
+}
+
+fn swap[T](p: Pair[T]) -> Pair[T] {
+    (p.1, p.0)
+}

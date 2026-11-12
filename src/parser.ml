@@ -829,7 +829,14 @@ let parse_item st =
           (m, msp, params, ret))
     in
     IIface { if_name = name; if_span = nsp; if_methods = methods; if_pub = false }
-  | _ -> fail t "an item (`fn`, `struct`, `enum` or `interface`)"
+  | IDENT "type" when (match st.toks.(min (st.pos + 1) (Array.length st.toks - 1)).tok with IDENT _ -> true | _ -> false) ->
+    (* `type` is a word only here, so it stays usable as a name elsewhere *)
+    ignore (advance st);
+    let name, nsp = expect_ident st in
+    let gen = parse_generics st in
+    ignore (expect_sym st "=");
+    IType { ty_name = name; ty_span = nsp; ty_gen = gen; ty_body = parse_type st; ty_pub = false }
+  | _ -> fail t "an item (`fn`, `struct`, `enum`, `interface` or `type`)"
 
 (* `foreign "lib" { fn name(p: T, ...) -> R  ... }`: C functions from library
    [lib], each with a signature and no body. `pub fn` exports one. *)
@@ -877,6 +884,7 @@ let set_pub = function
   | IStruct s -> IStruct { s with st_pub = true }
   | IEnum e -> IEnum { e with en_pub = true }
   | IIface i -> IIface { i with if_pub = true }
+  | IType a -> IType { a with ty_pub = true }
 
 let parse_file file src : file =
   test_count := 0;
@@ -893,8 +901,8 @@ let parse_file file src : file =
     else if is_kw st "pub" then begin
       ignore (advance st);
       match (peek st).tok with
-      | KW ("fn" | "struct" | "enum" | "interface") -> items := set_pub (parse_item st) :: !items
-      | _ -> fail (peek st) "`fn`, `struct` or `enum` after `pub`"
+      | KW ("fn" | "struct" | "enum" | "interface") | IDENT "type" -> items := set_pub (parse_item st) :: !items
+      | _ -> fail (peek st) "`fn`, `struct`, `enum`, `interface` or `type` after `pub`"
     end
     else if (match (peek st).tok with IDENT "foreign" -> (match (peek2 st).tok with STR _ -> true | _ -> false) | _ -> false) then
       items := List.rev_append (parse_foreign st) !items

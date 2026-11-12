@@ -26,9 +26,11 @@ isep    ::= ws "," ws | sp "\n" ws
 stsep   ::= sp (";" | "\n") ws
 
 # ---------- items ----------
-top      ::= use | "pub" sp1 (fn | struct | enum | interface) | item | foreign
+top      ::= use | "pub" sp1 (fn | struct | enum | interface | alias) | item | foreign
 use      ::= "use" sp1 ident
-item     ::= fn | struct | enum | test | bench | interface
+item     ::= fn | struct | enum | test | bench | interface | alias
+# another name for a type: `type Pair[T] = (T, T)`
+alias    ::= "type" sp1 ident sp generics? sp "=" sp type
 interface ::= "interface" sp1 ident sp "{" ws (imethod (isep imethod)* (ws ",")?)? ws "}"
 imethod  ::= "fn" sp1 ident sp "(" ws "self" (isep param)* (ws ",")? ws ")" (sp "->" sp type)?
 test     ::= "test" sp1 plainstr sp tparams? ("for" sp1 (ident sp1 | upat sp) "in" sp1 "[" ws args ws "]" sp)? block

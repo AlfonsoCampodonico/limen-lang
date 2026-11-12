@@ -20,6 +20,7 @@ grammar = {
             {"include": "#foreign-block"},
             {"include": "#fn-decl"},
             {"include": "#type-decl"},
+            {"include": "#alias-decl"},
             {"include": "#use"},
             {"include": "#keyword"},
             {"include": "#capability"},
@@ -80,6 +81,14 @@ grammar = {
             "match": rf"\b(struct|enum|interface)\s+({ID})",
             "captures": {
                 "1": {"name": "storage.type.$1.vela"},
+                "2": {"name": "entity.name.type.vela"},
+            },
+        },
+        # `type Name = ...` at the start of a line only: `type` is a plain name elsewhere
+        "alias-decl": {
+            "match": rf"^\s*(?:pub\s+)?(type)\s+({ID})",
+            "captures": {
+                "1": {"name": "storage.type.alias.vela"},
                 "2": {"name": "entity.name.type.vela"},
             },
         },

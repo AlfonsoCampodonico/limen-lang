@@ -1247,6 +1247,13 @@ and check_method_value ?rt ctx f e recv name nsp args =
         ~notes:[ "`??` gives the value inside a `Some` or `Ok`, or the default otherwise, evaluating the default only then" ];
       check_args ctx f args;
       TErr
+    | None when name = "and_then" && (match rt with TNamed (("Option" | "Result"), _) -> true | _ -> false) ->
+      (* the same operation is called `flat_map` here, as on lists *)
+      let fix = { Diag.fmsg = "rename it to `flat_map`"; edits = [ { Diag.at = nsp; replacement = "flat_map" } ] } in
+      err ctx ~fix "E0105" nsp "there is no `and_then`; it is called `flat_map`, as on lists"
+        ~notes:[ "`x.flat_map(f)` passes the value inside a `Some` or `Ok` to `f`, which returns an Option or Result itself" ];
+      check_args ctx f args;
+      TErr
     | None ->
       let notes =
         match rt with
@@ -2085,7 +2092,7 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
         else if type_defined i.if_name || Hashtbl.mem ifaces i.if_name then
           err ctx "E0106" i.if_span (sprintf "`%s` is defined more than once" i.if_name)
         else Hashtbl.replace ifaces i.if_name []
-      | IFn _ -> ())
+      | IFn _ | IType _ -> ())
     items;
   (* 1b. interface methods *)
   List.iter
@@ -2106,9 +2113,11 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
         Hashtbl.replace ifaces i.if_name ms
       | _ -> ())
     items;
-  (* 2. resolve field and payload types *)
+  (* 2. resolve field and payload types; an alias's body, which every use
+     already has in its place, only to report a type that does not exist *)
   List.iter
     (function
+      | IType a -> ignore (resolve ctx (List.map (fun g -> (g, TParam g)) a.ty_gen) a.ty_body)
       | IStruct s when not (registered ctx.structs s.st_name s) -> ()
       | IStruct s ->
         let env = List.map (fun g -> (g, TParam g)) s.st_gen in

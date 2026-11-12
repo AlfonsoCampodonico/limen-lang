@@ -141,7 +141,12 @@ type iface_decl = {
   if_pub : bool;
 }
 
-type item = IFn of fn_decl | IStruct of struct_decl | IEnum of enum_decl | IIface of iface_decl
+(* `type Seen = Map[Str, Int]`, `type Pair[T] = (T, T)`: another name for a
+   type, the same type wherever it is written. Expanded when modules load,
+   so the checker and both backends never see one. *)
+type alias_decl = { ty_name : string; ty_span : span; ty_gen : string list; ty_body : ty_expr; ty_pub : bool }
+
+type item = IFn of fn_decl | IStruct of struct_decl | IEnum of enum_decl | IIface of iface_decl | IType of alias_decl
 
 (* Tuples are built-in generic structs named `#tupleN` with fields `0`, `1`, ...;
    the name cannot be written in source. *)

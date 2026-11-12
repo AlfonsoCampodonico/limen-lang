@@ -655,6 +655,10 @@ let iface_last_hi (i : iface_decl) =
 
 let item c (it : item) =
   match it with
+  | IType a ->
+    new_line c 0;
+    add c ((if a.ty_pub then "pub " else "") ^ "type " ^ a.ty_name ^ gens a.ty_gen ^ " = " ^ ty a.ty_body);
+    trailing c a.ty_body.tspan.hi
   | IIface i ->
     new_line c 0;
     add c ((if i.if_pub then "pub " else "") ^ "interface " ^ i.if_name ^ " {");
@@ -802,6 +806,7 @@ let item_span c = function
   | IStruct s -> (s.st_span.lo, struct_close c s + 1)
   | IEnum e -> (e.en_span.lo, enum_close c e + 1)
   | IIface i -> (i.if_span.lo, closing_brace c (iface_last_hi i) + 1)
+  | IType a -> (a.ty_span.lo, a.ty_body.tspan.hi)
 
 (* Format [src]; raises Diag.Fatal if it does not parse. *)
 let format ~file src =
@@ -831,9 +836,14 @@ let format ~file src =
       `Foreign (lib, ds) :: groups rest
     | it :: rest -> `Item it :: groups rest
   in
+  let last_alias = ref false in
   List.iteri
     (fun i g ->
       let i = i + nuses in
+      (* consecutive aliases stay together, like `use` lines, unless the author spaced them *)
+      let alias = match g with `Item (IType _) -> true | _ -> false in
+      let follows_alias = alias && !last_alias in
+      last_alias := alias;
       match g with
       | `Foreign (lib, (ds : fn_decl list)) ->
         let kw_lo = foreign_open c (List.hd ds).fn_span.lo in
@@ -849,7 +859,7 @@ let format ~file src =
         while !k > 0 && c.src.[!k - 1] <> '\n' do decr k done;
         !k
       in
-      if i > 0 then blank c;
+      if i > 0 && not (follows_alias && not (blank_between c !prev kw_lo)) then blank c;
       let after = leading c 0 ~prev:!prev kw_lo in
       if after >= 0 && List.length c.o.lines > 0 && blank_between c after kw_lo then blank c;
       item c it;

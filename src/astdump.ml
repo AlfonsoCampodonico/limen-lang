@@ -113,7 +113,8 @@ let item = function
     "enum " ^ e.en_name ^ "[" ^ String.concat "," e.en_gen ^ "]{"
     ^ String.concat "," (List.map (fun (v, _, ts) -> v ^ "(" ^ String.concat "," (List.map ty ts) ^ ")") e.en_variants)
     ^ "}"
+  | IType a -> "type " ^ a.ty_name ^ "[" ^ String.concat "," a.ty_gen ^ "]=" ^ ty a.ty_body
 
-let pub_of = function IFn d -> d.fn_pub | IStruct s -> s.st_pub | IEnum e -> e.en_pub | IIface i -> i.if_pub
+let pub_of = function IFn d -> d.fn_pub | IStruct s -> s.st_pub | IEnum e -> e.en_pub | IIface i -> i.if_pub | IType a -> a.ty_pub
 let items is = String.concat "\n" (List.map (fun i -> (if pub_of i then "pub " else "") ^ item i) is)
 let file (f : file) = String.concat "\n" (List.map (fun (u, _) -> "use " ^ u) f.uses) ^ "\n" ^ items f.items

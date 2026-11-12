@@ -84,6 +84,7 @@ test "ports" for (a, b) in [(1, 2)] { assert_eq(a, b) }
 bench "build" { 1 }
 foreign "c" { fn open(path: Str, flags: Int32) -> Int32 }
 let test = 1
+pub type Pair[T] = (T, T)
 `;
   const t = tokenize(grammar, src);
   const expect = [
@@ -133,6 +134,8 @@ let test = 1
     ["test", "keyword.other.test.vela"],
     ["bench", "keyword.other.test.vela"],
     ["foreign", "storage.modifier.foreign.vela"],
+    ["type", "storage.type.alias.vela"],
+    ["Pair", "entity.name.type.vela"],
   ];
   for (const [text, want] of expect) {
     const got = scopeOf(t, text);
@@ -143,7 +146,7 @@ let test = 1
   // nested braces inside an interpolation close at the right place: the text after is a string again
   check("nested interpolation", scopeOf(t, " and ") === "string.quoted.double.vela", scopeOf(t, " and "));
   // `test` as a plain name is not a keyword
-  const lastLine = t.lines[t.lines.length - 2];
+  const lastLine = t.lines[t.lines.length - 3];
   check("test as a name", lastLine.some(([x]) => x.includes("test")) && !lastLine.some(([, s]) => s.includes("keyword.other.test.vela")), JSON.stringify(lastLine));
   check("sample ends at top level", t.stack.equals(vsctm.INITIAL) || t.stack.depth === 1);
 

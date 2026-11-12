@@ -80,7 +80,8 @@ let index (items : item list) : occ list =
       | IFn _ -> ()
       | IStruct s -> Hashtbl.replace types s.st_name (); Hashtbl.replace structs s.st_name s
       | IEnum e -> Hashtbl.replace types e.en_name (); enums := e :: !enums
-      | IIface i -> Hashtbl.replace types i.if_name ())
+      | IIface i -> Hashtbl.replace types i.if_name ()
+      | IType a -> Hashtbl.replace types a.ty_name ())
     items;
   let enum_with_variant file v =
     match List.filter (fun e -> List.exists (fun (n, _, _) -> n = v) e.en_variants) !enums with
@@ -269,8 +270,13 @@ let index (items : item list) : occ list =
         add ~def:true ("t:" ^ i.if_name) (bare i.if_name) i.if_span;
         List.iter
           (fun (m, sp, ps, r) -> add ~def:true ("m:" ^ i.if_name ^ "#" ^ m) m sp; List.iter (fun p -> ty p.prm_ty) ps; Option.iter ty r)
-          i.if_methods)
+          i.if_methods
+      | IType a ->
+        add ~def:true ("t:" ^ a.ty_name) (bare a.ty_name) a.ty_span;
+        ty a.ty_body)
     items;
+  (* an alias is gone from the program once expanded: its uses come from loading *)
+  List.iter (fun (k, sp) -> if Hashtbl.mem types k then add ("t:" ^ k) (bare k) sp) !Modules.alias_uses;
   (* one occurrence per place (method values and shorthand can repeat a node) *)
   let seen = Hashtbl.create 256 in
   List.filter

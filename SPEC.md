@@ -29,7 +29,7 @@ fn parse_names(body: Str) -> List[Str] {   // no capabilities: cannot do I/O
 - **Comments:** `//` to the end of the line. There are no block comments.
 - **Doc comments:** the `//` lines directly above an item, a struct field, an enum variant or an interface method, with no blank line in between, document it. The comment block at the very top of a file, followed by a blank line, documents the module. `vela doc` reads them; there is no special marker.
 - **Identifiers:** `[A-Za-z_][A-Za-z0-9_]*`. By convention types and enum variants start with an uppercase letter, everything else lowercase. Patterns rely on this (section 7).
-- **Keywords:** `fn let mut if else match for in while return struct enum true false group break continue pub use interface dyn select defer`.
+- **Keywords:** `fn let mut if else match for in while return struct enum true false group break continue pub use interface dyn select defer`. `type`, `test`, `bench`, `foreign`, `until` and `with` are words only where they start their construct, so they stay usable as names: a field can be called `type`.
 - **Integers:** decimal digits, `_` allowed as a separator (`1_000_000`). A literal must fit in 64 bits: up to `9223372036854775807` (E0005).
 - **Floats:** digits with a fraction (`1.5`), an exponent (`1e9`, `2.5E-3`), or both. `_` is allowed. There is no leading-dot form (`.5`).
 - **Strings:** `"..."`, may span lines. Escapes: `\n \t \r \\ \" \{ \} \0`. Any other escape is error E0006.
@@ -121,7 +121,7 @@ Inference is local. Function parameters always carry types, and a missing parame
 
 ## 4. Declarations
 
-A file is a sequence of `use` lines and `fn`, `struct` and `enum` declarations, in any order (put `use` first by convention). Section 18 covers modules.
+A file is a sequence of `use` lines and `fn`, `struct`, `enum`, `interface` and `type` declarations, in any order (put `use` first by convention). Section 18 covers modules.
 
 ```
 struct Pair[A, B] {
@@ -146,6 +146,26 @@ fn swap[A, B](p: Pair[A, B]) -> Pair[B, A] {
 - Struct fields and enum payloads cannot hold a capability (E0301), a channel (E0305) or a function type (E0304). That keeps authority visible in signatures. A generic instantiation like `Pair[Net, Int]` is allowed, because the capability is visible in the type.
 - Defining the same type, function, field or variant twice is error E0106.
 - Types can be recursive through an enum, a `List` or a `Map`, which hold their contents indirectly: `struct Node { value: Int, next: Option[Node] }`, `enum Tree { Leaf, Node(Tree, Tree) }`, `struct Dir { files: List[Dir] }`. A struct stores its fields inline, so one that contains itself through structs, tuples or arrays alone would be infinitely large (E0114). There is no `box`: those types are the indirection.
+
+### Type aliases
+
+`type Name = Type` gives a type another name. It is the same type, not a new one: a value of either is a value of both, and messages show the type it stands for.
+
+```
+type Counts = Map[Str, Int]
+type Pair[T] = (T, T)
+type Handler = fn(Request) -> Response
+pub type Parsed[T] = Result[T, Str]
+
+fn swap[T](p: Pair[T]) -> Pair[T] {
+    (p.1, p.0)
+}
+```
+
+- An alias can take type parameters, and must be given exactly that many (E0109). `pub type` exports it; other modules write `shapes.Path`.
+- It cannot contain itself, directly or through other aliases (E0116): `type Tree = List[Tree]` would never end; declare an enum for that.
+- It cannot reuse the name of another type or item in its module, or of a built-in type (E0106).
+- A method declared on an alias is a method on the type it stands for: `fn total(self: Counts)` is a method on `Map[Str, Int]`, private to its file like any method on a built-in type.
 
 ### Methods
 
@@ -986,12 +1006,13 @@ For a missing key with a default, write `m.get(k) ?? default`.
 
 ### Option[T] and Result[T, E]
 
-`x ?? default` is the value inside `Some` or `Ok`, or `default` otherwise; `default` is evaluated only when it is needed. `??` binds tighter than arithmetic, so `counts.get(w) ?? 0 + 1` adds 1 to the count. There is no `unwrap_or`; using it is error E0105 with a fix that rewrites it.
+`x ?? default` is the value inside `Some` or `Ok`, or `default` otherwise; `default` is evaluated only when it is needed. `??` binds tighter than arithmetic, so `counts.get(w) ?? 0 + 1` adds 1 to the count. There is no `unwrap_or`; using it is error E0105 with a fix that rewrites it. `and_then` is called `flat_map`, as on lists; `and_then` is E0105 with a fix that renames it.
 
 | Method | Result |
 | --- | --- |
 | `is_some()`, `is_none()` / `is_ok()`, `is_err()` | `Bool` |
-| `map(f)` (Option) | `Option[U]` |
+| `map(f)` | `Option[U]` / `Result[U, E]`: the value inside passed through `f`; `None` or an `Err` unchanged |
+| `flat_map(f)` | the same, with `f` itself returning `Option[U]` / `Result[U, E]`: `parse(s).flat_map(check)` keeps the first error |
 | `map_error(f)` (Result) | `Result[T, F]`: the error passed through `f`, an `Ok` unchanged |
 
 `map_error` was called `map_err`. The old name still works, with warning W0001 and a fix that renames it; it will be removed.
