@@ -26,7 +26,9 @@ let prepare c_text =
 
 (* The compiler's command line, as argv. *)
 (* -O3, as Rust's release builds use: it lets clang unroll small fixed-size
-   loops (an `Array[T, N]` walked pair by pair), and compiles no slower here *)
+   loops (an `Array[T, N]` walked pair by pair). Small programs compile no
+   slower; a large one takes about a quarter longer than at -O2 (the
+   operator example, 23k lines of C with the http module: 2.7 s, not 2.1 s). *)
 let command ?(flags = [ "-O3" ]) ?(cflags = []) ?(libs = []) c_file exe =
   (cc () :: flags) @ cflags
   @ [ "-fwrapv"; "-ffp-contract=off"; "-fstack-clash-protection"; "-fexceptions"; "-w"; "-o"; exe; c_file ]
