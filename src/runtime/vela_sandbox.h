@@ -10,7 +10,10 @@
      reading file contents only under the Fs directory, the temporary
      directory with Exec, and system locations (libraries, /etc,
      certificates, devices);
-   - network: none at all unless Net or Listen is granted;
+   - network: none at all unless Net or Listen is granted, and that includes
+     Unix sockets, which reach other programs (Linux allows socketpair);
+   - signals: only to this process, and with Exec to the programs it starts;
+   - /proc (Linux): only this process's own entries, unless Exec is granted;
    - programs: starting another program only if Exec is granted. A program
      started through Exec inherits the same restrictions; it may also list
      (not read) the directories above the current one, as shells do.
@@ -23,8 +26,8 @@
    Fs's refusal of `..` and absolute paths (the kernel only sees the result).
 
    macOS: a sandbox profile (sandbox_init). Linux: Landlock for files (kernel
-   5.13 or later) and seccomp for network and exec; THE LINUX CODE IS
-   UNTESTED. Elsewhere, or on a Linux kernel without Landlock, files are not
+   5.13 or later) and seccomp for network, exec and signals; the Linux
+   code is tested in a container (dev/linux/run.sh). Elsewhere, or on a Linux kernel without Landlock, files are not
    restricted by the kernel.
 
    w_sandbox_enter returns 0 when restrictions are in place, 1 when this
@@ -134,6 +137,9 @@ static int w_sandbox_enter(const WSandboxSpec *s, char *err, size_t en) {
   w_sb_put(&b, ")))\n");
   /* no reaching other applications, which have their own authority */
   w_sb_put(&b, "(deny appleevent-send)\n(deny lsopen)\n");
+  /* signals: this process, and with Exec the programs it started */
+  w_sb_put(&b, "(deny signal)\n(allow signal (target self))\n");
+  if (s->exec) w_sb_put(&b, "(allow signal (target children))\n");
   if (!s->net) w_sb_put(&b, "(deny network*)\n");
   if (!s->exec) w_sb_put(&b, "(deny process-exec*)\n(deny process-fork)\n");
   free(tmp); free(cert_file); free(cert_dir);
@@ -150,9 +156,9 @@ static int w_sandbox_enter(const WSandboxSpec *s, char *err, size_t en) {
 
 #elif defined(__linux__)
 
-/* UNTESTED: written against the kernel's documented interfaces, but never
-   run. Landlock restricts files; a seccomp filter refuses Internet sockets
-   without Net/Listen and execve without Exec. */
+/* Landlock restricts files (and, from ABI 6, abstract Unix sockets and
+   signals); a seccomp filter refuses sockets without Net/Listen, execve
+   without Exec, and signals to other processes without Exec. */
 #include <fcntl.h>
 #include <stddef.h>
 #include <sys/prctl.h>
@@ -183,9 +189,11 @@ static int w_sandbox_enter(const WSandboxSpec *s, char *err, size_t en) {
 #define W_LL_TRUNCATE (1ULL << 14)
 #define W_LL_FILE_ONLY (W_LL_EXECUTE | W_LL_WRITE_FILE | W_LL_READ_FILE | W_LL_TRUNCATE)
 
-struct w_ll_ruleset_attr { uint64_t handled_access_fs; uint64_t handled_access_net; };
+struct w_ll_ruleset_attr { uint64_t handled_access_fs; uint64_t handled_access_net; uint64_t scoped; };
 #define W_LL_NET_BIND_TCP (1ULL << 0)
 #define W_LL_NET_CONNECT_TCP (1ULL << 1)
+#define W_LL_SCOPE_ABSTRACT_UNIX (1ULL << 0)
+#define W_LL_SCOPE_SIGNAL (1ULL << 1)
 struct w_ll_path_beneath { uint64_t allowed_access; int32_t parent_fd; } __attribute__((packed));
 
 static int w_ll_allow(int ruleset, const char *path, uint64_t access, uint64_t handled) {
@@ -204,15 +212,28 @@ static int w_landlock(const WSandboxSpec *s, char *err, size_t en) {
   long abi = syscall(__NR_landlock_create_ruleset, NULL, 0, 1 /* LANDLOCK_CREATE_RULESET_VERSION */);
   if (abi < 1) return 1; /* no Landlock in this kernel */
   uint64_t handled = W_LL_ABI1_ALL | (abi >= 2 ? W_LL_REFER : 0) | (abi >= 3 ? W_LL_TRUNCATE : 0);
-  /* ABI 4 and later also handle TCP: with no rules, no bind and no connect */
-  struct w_ll_ruleset_attr attr = { handled, (abi >= 4 && !s->net) ? (W_LL_NET_BIND_TCP | W_LL_NET_CONNECT_TCP) : 0 };
-  size_t attr_size = abi >= 4 ? sizeof attr : sizeof attr.handled_access_fs;
+  /* ABI 4 and later also handle TCP: with no rules, no bind and no connect.
+     ABI 6 and later scope abstract Unix sockets and signals: only processes
+     in this sandbox (this one, and with Exec what it starts) can be reached.
+     Pathname Unix sockets are refused by seccomp below, without Net/Listen. */
+  struct w_ll_ruleset_attr attr = {
+    handled,
+    (abi >= 4 && !s->net) ? (W_LL_NET_BIND_TCP | W_LL_NET_CONNECT_TCP) : 0,
+    abi >= 6 ? (W_LL_SCOPE_SIGNAL | (s->net ? 0 : W_LL_SCOPE_ABSTRACT_UNIX)) : 0,
+  };
+  size_t attr_size = abi >= 6 ? sizeof attr : abi >= 4 ? 2 * sizeof(uint64_t) : sizeof attr.handled_access_fs;
   int rs = (int)syscall(__NR_landlock_create_ruleset, &attr, attr_size, 0);
   if (rs < 0) { snprintf(err, en, "cannot create a Landlock ruleset: %s", strerror(errno)); return -1; }
   uint64_t rd = W_LL_READ_FILE | W_LL_READ_DIR | (s->exec ? W_LL_EXECUTE : 0);
-  const char *sys[] = { "/usr", "/lib", "/lib64", "/lib32", "/bin", "/sbin", "/etc", "/proc", "/sys", "/opt", NULL };
+  const char *sys[] = { "/usr", "/lib", "/lib64", "/lib32", "/bin", "/sbin", "/etc", "/sys", "/opt", NULL };
   int bad = 0;
   for (int i = 0; sys[i]; i++) bad |= w_ll_allow(rs, sys[i], rd, handled);
+  /* /proc: only this process's own entries, so other processes' command
+     lines and state stay hidden. /proc/self resolves to this process's
+     directory now; a program started through Exec has its own, so with Exec
+     all of /proc stays readable (Landlock still keeps ptrace-guarded entries
+     such as another process's environ and memory out of reach). */
+  bad |= w_ll_allow(rs, s->exec ? "/proc" : "/proc/self", rd, handled);
   bad |= w_ll_allow(rs, "/dev", W_LL_READ_FILE | W_LL_READ_DIR, handled);
   bad |= w_ll_allow(rs, "/dev/null", W_LL_READ_FILE | W_LL_WRITE_FILE | W_LL_TRUNCATE, handled);
   bad |= w_ll_allow(rs, "/dev/tty", W_LL_READ_FILE | W_LL_WRITE_FILE, handled);
@@ -251,7 +272,8 @@ static int w_seccomp(const WSandboxSpec *s, char *err, size_t en) {
   return 1;
 #else
   if (s->net && s->exec) return 0;
-  struct sock_filter f[32];
+  struct sock_filter f[64];
+  pid_t self = getpid();
   int n = 0;
 #define W_SB(code, k, jt, jf) (f[n++] = (struct sock_filter){ (unsigned short)(code), (unsigned char)(jt), (unsigned char)(jf), (unsigned int)(k) })
   /* another architecture's system calls: refuse them all */
@@ -272,14 +294,36 @@ static int w_seccomp(const WSandboxSpec *s, char *err, size_t en) {
     W_SB(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM, 0, 0);
 #endif
   }
+  if (!s->exec) {
+    /* signals only to this process (a kernel with Landlock ABI 6 also scopes
+       them; this covers older ones): kill and the queueing calls name the
+       target process first, tkill and pidfd signals are refused */
+    const long to_pid[] = { __NR_kill, __NR_tgkill, __NR_rt_sigqueueinfo, __NR_rt_tgsigqueueinfo, -1 };
+    for (int i = 0; to_pid[i] >= 0; i++) {
+      W_SB(BPF_JMP | BPF_JEQ | BPF_K, to_pid[i], 0, 4);
+      W_SB(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0]), 0, 0);
+      W_SB(BPF_JMP | BPF_JEQ | BPF_K, (unsigned int)self, 1, 0);
+      W_SB(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM, 0, 0);
+      W_SB(BPF_RET | BPF_K, SECCOMP_RET_ALLOW, 0, 0);
+    }
+    W_SB(BPF_JMP | BPF_JEQ | BPF_K, __NR_tkill, 0, 1);
+    W_SB(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM, 0, 0);
+#ifdef __NR_pidfd_send_signal
+    W_SB(BPF_JMP | BPF_JEQ | BPF_K, __NR_pidfd_send_signal, 0, 1);
+    W_SB(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM, 0, 0);
+#endif
+  }
   if (!s->net) {
     /* io_uring can open sockets without the socket system call */
 #ifdef __NR_io_uring_setup
     W_SB(BPF_JMP | BPF_JEQ | BPF_K, __NR_io_uring_setup, 0, 1);
     W_SB(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM, 0, 0);
 #endif
-    /* socket(domain, ...) and socketpair: Unix sockets only */
-    W_SB(BPF_JMP | BPF_JEQ | BPF_K, __NR_socket, 1, 0);
+    /* no socket() at all: a Unix socket could connect to another program
+       (a Docker daemon, an ssh-agent) and act with its authority. A
+       socketpair connects only to itself, so Unix ones stay allowed. */
+    W_SB(BPF_JMP | BPF_JEQ | BPF_K, __NR_socket, 0, 1);
+    W_SB(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EACCES, 0, 0);
     W_SB(BPF_JMP | BPF_JEQ | BPF_K, __NR_socketpair, 0, 4);
     W_SB(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0]), 0, 0);
     W_SB(BPF_JMP | BPF_JEQ | BPF_K, AF_UNIX, 1, 0);

@@ -4891,6 +4891,85 @@ fn main(root: Root) {
   end
   else ok "sandbox-binary" false "vela build failed";
   (try Sys.remove escape_file with Sys_error _ -> ());
+  (* without Net, Listen or Exec, the sandbox also refuses the ways out that
+     are not files: another program's Unix socket (here a listener of the
+     test's own, which could as well be a Docker daemon or an ssh-agent),
+     another process's /proc entries, and signalling another process *)
+  let linux = (try String.trim (In_channel.with_open_text "/proc/sys/kernel/ostype" In_channel.input_all) = "Linux" with Sys_error _ -> false) in
+  let sock_path = sprintf "/tmp/vela-sb-%d.sock" (Unix.getpid ()) in
+  (try Sys.remove sock_path with Sys_error _ -> ());
+  let lsock = Unix.socket Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  Unix.bind lsock (Unix.ADDR_UNIX sock_path);
+  Unix.listen lsock 4;
+  let sleeper = Unix.create_process "sleep" [| "sleep"; "60" |] Unix.stdin Unix.stdout Unix.stderr in
+  let probe =
+    {v|foreign "c" {
+    fn socket(domain: Int32, kind: Int32, protocol: Int32) -> Int32
+    fn connect(fd: Int32, addr: Bytes, len: Int32) -> Int32
+    fn open(path: Str, flags: Int32) -> Int32
+    fn close(fd: Int32) -> Int32
+    fn kill(pid: Int32, sig: Int32) -> Int32
+}
+
+// a sockaddr_un (a path ends in a NUL; an abstract name does not): Linux starts with a 16-bit family, macOS with a length byte and a family byte
+fn unix_addr(path: Bytes) -> Bytes {
+    let head = if LINUX { bytes([1, 0]) } else { bytes([0, 1]) }
+    head + path
+}
+
+fn reach(c: Foreign, path: Bytes) -> Bool {
+    let fd = socket(c, 1, 1, 0)
+    if fd < 0 {
+        return false
+    }
+    let addr = unix_addr(path)
+    let ok = connect(c, fd, addr, addr.len()) == 0
+    let closed = close(c, fd)
+    ok
+}
+
+fn main(root: Root) {
+    let c = root.foreign
+    let sock = reach(c, "SOCK".to_bytes() + bytes([0]))
+    let fd = open(c, "/proc/PID/cmdline", 0)
+    let proc = fd >= 0
+    if proc {
+        let closed = close(c, fd)
+    }
+    let signal = kill(c, PID, 0) == 0
+    // an abstract socket (Linux): a leading NUL byte, no file at all
+    let abstract = LINUX && reach(c, bytes([0]) + "vela-sb-abstract".to_bytes())
+    root.stdout.print("{sock} {proc} {signal} {abstract}")
+}
+|v}
+  in
+  let probe = replace_all "SOCK" sock_path (replace_all "PID" (string_of_int sleeper) (replace_all "LINUX" (string_of_bool linux) probe)) in
+  put "sbox/probe.vela" probe;
+  let pmain = Filename.concat pdir "sbox/probe.vela" in
+  (* an abstract listener for the last probe *)
+  let asock =
+    if linux then begin
+      let s = Unix.socket Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+      Unix.bind s (Unix.ADDR_UNIX "\000vela-sb-abstract");
+      Unix.listen s 4;
+      Some s
+    end
+    else None
+  in
+  (* /proc exists on Linux only *)
+  let open_all = sprintf "true %b true %b\n" linux linux in
+  List.iter
+    (fun (name, extra, want) ->
+      let code, o, e = vela_cli ((("run" :: extra) @ [ pmain ]) @ [ "--grant"; "foreign=c" ]) in
+      ok name (code = 0 && o = want) (sprintf "%d %S %S" code o e))
+    [ ("sandbox-ipc-interp", [], "false false false false\n");
+      ("sandbox-ipc-native", [ "--native" ], "false false false false\n");
+      ("sandbox-ipc-off", [ "--no-sandbox" ], open_all) ];
+  Unix.kill sleeper Sys.sigkill;
+  ignore (Unix.waitpid [] sleeper);
+  Unix.close lsock;
+  Option.iter Unix.close asock;
+  (try Sys.remove sock_path with Sys_error _ -> ());
   Sys.remove (Filename.concat pdir "capp/vela.toml");
   let _, o, e = vela_cli [ "run"; Filename.concat pdir "capp/sqlmain.vela" ] in
   ok "cli-no-foreign-no-warning" (o = "" && String.starts_with ~prefix:"panic: foreign: library `c` is not granted" e) (o ^ e);
