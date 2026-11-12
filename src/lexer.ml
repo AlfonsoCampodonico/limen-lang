@@ -14,6 +14,11 @@ type tok =
 
 type token = { tok : tok; span : Span.t; nl : bool }
 
+(* Every occurrence of a name is the same string, so the interpreter's
+   lookups usually match by physical equality before comparing text. *)
+let names : (string, string) Hashtbl.t = Hashtbl.create 256
+let intern s = match Hashtbl.find_opt names s with Some t -> t | None -> Hashtbl.replace names s s; s
+
 let keywords =
   [ "fn"; "let"; "mut"; "if"; "else"; "match"; "for"; "in"; "while"; "return"; "struct";
     "enum"; "true"; "false"; "group"; "break"; "continue"; "pub"; "use"; "interface"; "dyn"; "select"; "defer" ]
@@ -120,7 +125,7 @@ let lex ?(base = 0) file (src : string) : token array =
       let lo = !i in
       while !i < n && is_ident src.[!i] do incr i done;
       let s = String.sub src lo (!i - lo) in
-      push (if List.mem s keywords then KW s else IDENT s) lo !i
+      push (if List.mem s keywords then KW s else IDENT (intern s)) lo !i
     end
     else if c = '"' then begin
       let lo = !i in

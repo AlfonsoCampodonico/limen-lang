@@ -49,6 +49,9 @@ type value =
   | VBytes of string
   | VUnit
   | VList of value array
+  | VBuf of buf
+      (* a list being built or updated in a variable: only ever in a
+         variable's cell, never a value anywhere else (see settle) *)
   | VStruct of string * (string * value) list
   | VEnum of string * string * value list
   | VClosure of string list * expr * env
@@ -94,6 +97,11 @@ and vmap = { m : (int * value) KM.t; next : int }
 and env = scope list
 
 and scope = { mutable vars : (string * value ref) list }
+
+(* A list a variable owns, with room to grow: `push` and `xs[i] = v` change
+   it in place instead of copying the list each time. Elements 0 to len - 1
+   are the list. *)
+and buf = { mutable items : value array; mutable len : int }
 
 exception Return of value
 exception Break_
@@ -343,20 +351,55 @@ let scope () = { vars = [] }
 let bind s n v = s.vars <- (n, ref v) :: s.vars
 let scope_of n v = { vars = [ (n, ref v) ] }
 
+(* names are interned by the lexer, so a match is usually the same string;
+   the length check skips most mismatches without comparing text *)
+let same_name k n = k == n || (String.length k = String.length n && String.equal k n)
+
 let rec lookup n = function
   | [] -> None
-  | (k, v) :: r -> if k == n || String.equal k n then Some v else lookup n r
+  | (k, v) :: r -> if same_name k n then Some v else lookup n r
+
+let rec field_of name = function
+  | [] -> raise Not_found
+  | (k, v) :: r -> if same_name k name then v else field_of name r
 
 let rec find_var env n =
   match env with
   | [] -> None
   | s :: r -> ( match lookup n s.vars with Some v -> Some v | None -> find_var r n)
 
+(* A variable's value, ready to be used anywhere: a list it was building
+   becomes an ordinary list (and stays one in the cell, so the next change
+   copies it first: other holders of the value never see a change). *)
+let settle r =
+  match !r with
+  | VBuf b ->
+    let v = VList (if Array.length b.items = b.len then b.items else Array.sub b.items 0 b.len) in
+    r := v;
+    v
+  | v -> v
+
+(* The list a variable is building, read without settling it: for reads
+   that cannot keep the list (an element, its length). *)
+let peek env (e : Ast.expr) = match e.edesc with EVar n -> (match find_var env n with Some { contents = VBuf b } -> Some b | _ -> None) | _ -> None
+
+(* The variable's cell as a list it can change in place, made so if needed. *)
+let own r =
+  match !r with
+  | VBuf b -> b
+  | VList arr ->
+    let n = Array.length arr in
+    let b = { items = Array.make (max 8 (2 * n)) VUnit; len = n } in
+    Array.blit arr 0 b.items 0 n;
+    r := VBuf b;
+    b
+  | _ -> failwith "internal: not a list"
+
 (* Closures capture by value: copy every visible binding, the innermost of
    each name. *)
 let snapshot env =
   let out = ref [] in
-  List.iter (fun s -> List.iter (fun (k, v) -> if lookup k !out = None then out := (k, ref !v) :: !out) s.vars) env;
+  List.iter (fun s -> List.iter (fun (k, v) -> if lookup k !out = None then out := (k, ref (settle v)) :: !out) s.vars) env;
   { vars = List.rev !out }
 
 let binop op a b sp =
@@ -1157,6 +1200,19 @@ let rec eval rt env e : value =
       assign rt env recv (VMap { mv with m = KM.remove k mv.m });
       VUnit
     | _ -> failwith "internal: remove")
+  | EMethod ({ edesc = EVar n; _ }, "push", _, [ arg ]) when (match find_var env n with Some { contents = VList _ | VBuf _ } -> true | _ -> false) ->
+    (* in place, growing by doubling; the argument first, since it may read
+       the list (which turns it back into an ordinary one) *)
+    let v = eval rt env arg in
+    let b = own (Option.get (find_var env n)) in
+    if b.len = Array.length b.items then begin
+      let bigger = Array.make (2 * b.len) VUnit in
+      Array.blit b.items 0 bigger 0 b.len;
+      b.items <- bigger
+    end;
+    b.items.(b.len) <- v;
+    b.len <- b.len + 1;
+    VUnit
   | EMethod (recv, "push", _, [ arg ]) -> (
     match eval rt env recv with
     | VList arr ->
@@ -1166,13 +1222,30 @@ let rec eval rt env e : value =
     | _ -> failwith "internal: push")
   | EMethod ({ edesc = EVar en; _ }, name, _, args) when find_var env en = None && Hashtbl.mem rt.enums en ->
     apply rt (ctor_value rt en name) (List.map (eval rt env) args) e.espan
-  | EMethod (recv, name, _, args) ->
-    let rv = eval rt env recv in
-    let avs = List.map (eval rt env) args in
-    call_method rt rv name avs e.espan
+  | EMethod (recv, name, _, args) -> (
+    match peek env recv with
+    | Some b when name = "len" && args = [] -> VInt (Int64.of_int b.len)
+    | Some b when name = "is_empty" && args = [] -> VBool (b.len = 0)
+    | Some b ->
+      (* the method sees a copy; it reads the whole list anyway *)
+      let rv = VList (Array.sub b.items 0 b.len) in
+      let avs = List.map (eval rt env) args in
+      call_method rt rv name avs e.espan
+    | None ->
+      let rv = eval rt env recv in
+      let avs = List.map (eval rt env) args in
+      call_method rt rv name avs e.espan)
   | EField ({ edesc = EVar en; _ }, name, _) when find_var env en = None && Hashtbl.mem rt.enums en ->
     ctor_value rt en name
   | EField (recv, name, _) -> field rt (eval rt env recv) name
+  | EIndex (a, i) when peek env a <> None -> (
+    let b = Option.get (peek env a) in
+    match eval rt env i with
+    | VInt k ->
+      if k < 0L || k >= Int64.of_int b.len then
+        raise (Panic (sprintf "index %Ld is out of range for a list of length %d" k b.len, e.espan));
+      b.items.(Int64.to_int k)
+    | _ -> failwith "internal: index")
   | EIndex (a, i) -> (
     match (eval rt env a, eval rt env i) with
     | VMap mv, k -> (
@@ -1286,7 +1359,7 @@ let rec eval rt env e : value =
   | EStruct (name, _, fields) ->
     let decl = Hashtbl.find rt.structs name in
     let vals = List.map (fun (f, _, x) -> (f, eval rt env x)) fields in
-    VStruct (name, List.map (fun (f, _, _) -> (f, List.assoc f vals)) decl.st_fields)
+    VStruct (name, List.map (fun (f, _, _) -> (f, field_of f vals)) decl.st_fields)
   | EDyn (x, _) -> eval rt env x (* values carry their type, so methods dispatch on it *)
   | EPipe _ -> failwith "pipes are expanded when modules load"
   | ESafe (base, x, rest, flat) -> (
@@ -1347,7 +1420,7 @@ let rec eval rt env e : value =
 
 and eval_var rt env n sp =
   match find_var env n with
-  | Some r -> !r
+  | Some r -> settle r
   | None -> (
     if Hashtbl.mem rt.fns n then VFn n
     else
@@ -1367,7 +1440,7 @@ and ctor_value rt en vn =
 
 and field rt v name =
   match (v, name) with
-  | VStruct (_, fs), _ -> List.assoc name fs
+  | VStruct (_, fs), _ -> field_of name fs
   | VCap CRoot, "net" -> VCap (CNet rt.grants.net)
   | VCap CRoot, "fs" -> (
     match rt.grants.fs with
@@ -1446,7 +1519,9 @@ and call_fn rt d args =
   try eval_block rt [ sc ] d.fn_body with Return v -> v
 
 and eval_block rt env b =
-  let env = scope () :: env in
+  (* only a `let` directly in the block binds into its own scope; a block
+     without one shares the enclosing scope, and lookups stay short *)
+  let env = if List.exists (fun s -> match s.sdesc with SLet _ | SLetPat _ -> true | _ -> false) b.stmts then scope () :: env else env in
   run_stmts rt env b.stmts b.tail
 
 (* A `defer` runs the rest of its block, then its own body however that rest
@@ -1513,8 +1588,17 @@ and assign rt env lhs v =
   | EVar n -> ( match find_var env n with Some r -> r := v | None -> failwith "internal: assign")
   | EField (r, f, _) -> (
     match eval rt env r with
-    | VStruct (sn, fs) -> assign rt env r (VStruct (sn, List.map (fun (k, x) -> if k = f then (k, v) else (k, x)) fs))
+    | VStruct (sn, fs) -> assign rt env r (VStruct (sn, List.map (fun (k, x) -> if same_name k f then (k, v) else (k, x)) fs))
     | _ -> failwith "internal: assign field")
+  | EIndex ({ edesc = EVar n; _ }, i) when (match find_var env n with Some { contents = VList _ | VBuf _ } -> true | _ -> false) -> (
+    (* in place, in a list this variable owns *)
+    match eval rt env i with
+    | VInt k ->
+      let b = own (Option.get (find_var env n)) in
+      if k < 0L || k >= Int64.of_int b.len then
+        raise (Panic (sprintf "index %Ld is out of range for a list of length %d" k b.len, lhs.espan));
+      b.items.(Int64.to_int k) <- v
+    | _ -> failwith "internal: assign index")
   | EIndex (r, i) -> (
     match (eval rt env r, eval rt env i) with
     | VMap mv, k -> assign rt env r (VMap (map_put mv k v))

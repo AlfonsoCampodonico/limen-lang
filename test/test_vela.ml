@@ -3788,6 +3788,95 @@ fn main(root: Root) {
    let _, ds2, _ = compile "unwrap-or-fixed2" fixed in
    ok "unwrap-or-fixed-checks" (ds2 = []) (String.concat " " (codes ds2)));
 
+  (* the interpreter changes a list in place when one variable owns it: no
+     change may show through another variable, an argument, a closure or a
+     struct that holds the same list *)
+  out "list-in-place-value-semantics"
+    {|struct Box {
+    items: List[Int],
+}
+
+fn grow(xs: List[Int]) -> List[Int] {
+    let mut ys = xs
+    ys.push(99)
+    ys[0] = -1
+    ys
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    // a copy keeps its value when the original changes, and the other way round
+    let mut a = [1, 2]
+    a.push(3)
+    let b = a
+    a.push(4)
+    a[0] = 10
+    out.print("{a} {b}")
+    let mut c = b
+    c.push(5)
+    out.print("{b} {c}")
+    // passing a list does not let the callee change the caller's
+    let d = grow(a)
+    out.print("{a} {d}")
+    // a closure keeps the value it captured
+    let mut e = [7]
+    e.push(8)
+    let f = || e.len()
+    e.push(9)
+    out.print("{f()} {e.len()}")
+    // a struct field keeps its list
+    let mut g = [1]
+    g.push(2)
+    let bx = Box { items: g }
+    g.push(3)
+    g[0] = 0
+    out.print("{bx.items} {g}")
+    // iterating sees the list as it was; pushing while iterating is safe
+    let mut h = [1, 2, 3]
+    for x in h {
+        h.push(x * 10)
+    }
+    out.print("{h}")
+    // the argument may read the list being pushed to
+    let mut k = [5]
+    k.push(k.len())
+    k.push(k[0] + k[1])
+    k.push(grow(k).len())
+    k[0] = k.len()
+    out.print("{k}")
+    // lists of lists
+    let mut rows = [[1], [2]]
+    let first = rows[0]
+    rows[0] = [9, 9]
+    rows.push(first)
+    out.print("{rows} {first}")
+    // growing far past the first capacity, then reading back
+    let mut big = []
+    let mut i = 0
+    while i < 1000 {
+        big.push(i)
+        i = i + 1
+    }
+    let mut sum = 0
+    i = 0
+    while i < big.len() {
+        sum = sum + big[i]
+        i = i + 1
+    }
+    let copy = big
+    big[999] = 0
+    out.print("{sum} {big.len()} {copy[999]} {big[999]} {big.is_empty()} {big.contains(500)}")
+    // out of range, in place
+    let r = catch(|| {
+        let mut z = [1]
+        z.push(2)
+        z[5] = 1
+    })
+    out.print("{r}")
+}
+|}
+    "[10, 2, 3, 4] [1, 2, 3]\n[1, 2, 3] [1, 2, 3, 5]\n[10, 2, 3, 4] [-1, 2, 3, 4, 99]\n2 3\n[1, 2] [0, 2, 3]\n[1, 2, 3, 10, 20, 30]\n[4, 1, 6, 4]\n[[9, 9], [2], [1]] [1]\n499500 1000 999 0 false true\nErr(\"index 5 is out of range for a list of length 2\")\n";
+
   (* ---------- type aliases ---------- *)
   let shapes = "pub type Point = (Float, Float)\npub type Path = List[Point]\ntype Secret = Int\n" in
   out "type-alias" ~modules:[ ("shapes", shapes) ]
