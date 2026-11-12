@@ -68,6 +68,7 @@ Then work through the examples. Every one runs the same in the interpreter and n
 | `http_demo.vela` | an HTTP server and client in one program | `vela run examples/http_demo.vela --grant listen=127.0.0.1:0 --grant net=127.0.0.1` |
 | `repos.vela` | HTTPS to a real API | `vela run examples/repos.vela --grant net=api.github.com` |
 | `notes.vela` | SQLite through `sql` | see the comment at the top of the file |
+| `todo_api.vela` | a CRUD API: todos over HTTP and JSON, stored in SQLite, with tests that call the router directly | `vela run examples/todo_api.vela --grant listen=127.0.0.1:0 --grant net=127.0.0.1`, or `vela test examples/todo_api.vela` |
 | `ffi.vela` | calling C | `vela run examples/ffi.vela --grant foreign=c` |
 
 To write your own: `vela check` gives errors with fixes, `vela explain E0302` explains a code, `vela fmt --write` formats, `vela caps` lists what each function can touch, and `vela doc --std --html -o std.html` documents the standard library. For an editor, point it at `vela lsp`.

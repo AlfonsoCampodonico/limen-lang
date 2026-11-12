@@ -2025,6 +2025,12 @@ fn main(root: Root) -> Result[(), IoError] {
   check_tsan "sql-group" ~grants:sqlg sql_group sql_group_want;
   out "example-notes" (example "notes.vela")
     "1. The Left Hand of Darkness\n2. Robert'); DROP TABLE notes; --\n3. Paris, Texas ***\n3 notes\n";
+  (* the CRUD example's demo calls every route over loopback; its own tests
+     run further down, through the CLI *)
+  out "example-todo-api"
+    ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] }
+    (example "todo_api.vela")
+    "POST /todos -> 201 {\"id\":1,\"title\":\"buy milk\",\"done\":false}\nPOST /todos -> 201 {\"id\":2,\"title\":\"write the README\",\"done\":false}\nPOST /todos -> 400 {\"error\":\"a todo needs a title\"}\nGET /todos -> 200 [{\"id\":1,\"title\":\"buy milk\",\"done\":false},{\"id\":2,\"title\":\"write the README\",\"done\":false}]\nPATCH /todos/1 -> 200 {\"id\":1,\"title\":\"buy milk\",\"done\":true}\nGET /todos/1 -> 200 {\"id\":1,\"title\":\"buy milk\",\"done\":true}\nPATCH /todos/2 -> 400 {\"error\":\"title must be a string\"}\nDELETE /todos/2 -> 204\nDELETE /todos/2 -> 404 {\"error\":\"no todo 2\"}\nGET /todos -> 200 [{\"id\":1,\"title\":\"buy milk\",\"done\":true}]\nGET /users -> 404 {\"error\":\"no route for /users\"}\n";
   (* std code is checked like user code: a json error names the byte *)
   out "std-json-errors"
     "use json\n\nfn main(root: Root) {\n    for s in [\"\\{\\\"a\\\": [1, 2.5e1, \\\"\\\\u0041\\\"]\\}\", \"[1 2]\", \"\\\"\\\\x\\\"\"] {\n        match json.parse(s) {\n            Ok(v) => root.stdout.print(json.stringify(v)),\n            Err(e) => root.stdout.print(e),\n        }\n    }\n}\n"
@@ -4806,6 +4812,14 @@ fn main(root: Root) {
     in
     (code, read_file o, read_file e)
   in
+  (* the CRUD example's tests call its router directly, in both backends *)
+  List.iter
+    (fun (name, extra) ->
+      let dir = if Sys.file_exists "../examples/todo_api.vela" then "../examples" else "examples" in
+      let code, o, e = vela_cli (("test" :: extra) @ [ Filename.concat dir "todo_api.vela" ]) in
+      let last = List.nth_opt (List.rev (String.split_on_char '\n' (String.trim o))) 0 |> Option.value ~default:"" in
+      ok name (code = 0 && String.starts_with ~prefix:"12 tests, 0 failed" last) (o ^ e))
+    [ ("example-todo-api-tests", []); ("example-todo-api-tests-native", [ "--native" ]) ];
   (* the foreign grant is announced as full access, and `vela check` lists who calls C *)
   put "capp/vela.toml" "[package]\nname = \"capp\"\n\n[dependencies]\ncdep = { path = \"../cdep\" }\n\n[trust]\nforeign = [\"cdep\"]\n\n[grants]\nforeign = \"c\"\n";
   let cmain = Filename.concat pdir "capp/main.vela" in
