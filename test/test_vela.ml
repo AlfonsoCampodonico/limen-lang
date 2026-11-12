@@ -1797,6 +1797,36 @@ fn main(root: Root) {
     In_channel.with_open_bin (Filename.concat dir f) In_channel.input_all
   in
   out "std-json-list-text" (example "stdlib.vela") "{\"name\":\"Ada\",\"tags\":[\"x\",\"yé😀\"],\"n\":-125,\"ok\":true,\"none\":null,\"nested\":{\"a\":[1,2,{}]}}\nAda\n-125.0\nexpected a value at byte 3\nexpected `:` at byte 5\nexpected a value at byte 0\nexpected a closing `\"` at byte 4\nexpected end of input at byte 4\nexpected a value at byte 0\n{\"q\":\"a\\\"b\\n\\u0001\",\"xs\":[1,null,false]}\na,b,c\n[0, 1, 2, 3, 4] 2 [1, 3] [1, 2, 3] [1, 2]\n007|ab..|---|2|[\"hi\", \"there\", \"you\"]\n";
+  (* listening on [::] serves IPv4 too (dual stack), as platforms that probe
+     over IPv6 and forward over IPv4 need *)
+  out "listen-ipv6-dual-stack"
+    ~grants:{ Interp.no_grants with listen = [ "[::]" ]; net = [ "127.0.0.1" ] }
+    {|use http
+
+fn main(root: Root) -> Result[(), IoError] {
+    let l = root.listen.on("[::]:0")?
+    let port = l.port()
+    let net = root.net
+    let rs = group g {
+        g.go(|| {
+            let _ = http.serve(l, 1, |r| http.text(200, "dual {r.path}"))
+        })
+        g.go(|| match http.get(net, "http://127.0.0.1:{port}/v4") {
+            Ok(r) => r.body,
+            Err(e) => "{e}",
+        })
+    }
+    root.stdout.print("{rs}")
+    for bad in ["[nope]:1", "[::1]", "[::1]:99999"] {
+        match root.listen.on(bad) {
+            Ok(_) => root.stdout.print("bound {bad}"),
+            Err(e) => root.stdout.print("{e}"),
+        }
+    }
+    Ok(())
+}
+|}
+    "[\"dual /v4\"]\nFailed(\"address must be HOST:PORT\")\nFailed(\"address must be HOST:PORT\")\nFailed(\"address must be HOST:PORT\")\n";
   (* a streamed response, a line at a time as it arrives: a line split
      across chunks, CRLF, an empty chunk, no final line break, a sized body,
      an error answered whole, and an endless stream the caller stops *)

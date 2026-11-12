@@ -2681,8 +2681,28 @@ static void w_nonblock(int fd) {
 #endif
 }
 
-/* "host:port", host of [A-Za-z0-9.-], port 0..65535 (same rules as the interpreter). */
+/* "host:port", host of [A-Za-z0-9.-], port 0..65535 (same rules as the
+   interpreter); or "[ipv6]:port", the host kept with its brackets. */
 static int w_parse_addr(WStr *a, char *host, size_t hn, int *port) {
+  if (a->len > 0 && a->data[0] == '[') {
+    int64_t close = -1;
+    for (int64_t i = 1; i < a->len; i++) if (a->data[i] == ']') { close = i; break; }
+    if (close < 2 || close + 2 >= a->len || a->data[close + 1] != ':' || (size_t)close + 2 > hn || a->len - close - 2 > 5) return 0;
+    char inner[64];
+    if (close - 1 >= (int64_t)sizeof inner) return 0;
+    memcpy(inner, a->data + 1, (size_t)(close - 1)); inner[close - 1] = 0;
+    struct in6_addr probe;
+    if (inet_pton(AF_INET6, inner, &probe) != 1) return 0;
+    int p = 0;
+    for (int64_t i = close + 2; i < a->len; i++) {
+      if (a->data[i] < '0' || a->data[i] > '9') return 0;
+      p = p * 10 + (a->data[i] - '0');
+    }
+    if (p > 65535) return 0;
+    memcpy(host, a->data, (size_t)close + 1); host[close + 1] = 0; lower_ascii(host);
+    *port = p;
+    return 1;
+  }
   int64_t colon = -1;
   for (int64_t i = 0; i < a->len; i++) if (a->data[i] == ':') { if (colon >= 0) return 0; colon = i; }
   if (colon <= 0 || colon >= a->len - 1 || a->len - colon - 1 > 5 || (size_t)colon >= hn) return 0;
@@ -2717,6 +2737,26 @@ static WIo Cap_listen_on(WCap *l, WStr *addr) {
   char h[256]; int port;
   if (!w_parse_addr(addr, h, sizeof h, &port)) return io_err(2, "address must be HOST:PORT");
   if (!net_permits(l, h, port)) { char m[400]; snprintf(m, sizeof m, "listen: %s:%d is not granted", h, port); return io_err(1, m); }
+  if (h[0] == '[') {
+    /* IPv6, and IPv4 too through mapped addresses: `[::]` serves both, as
+       platforms that probe over IPv6 and forward over IPv4 need */
+    struct sockaddr_in6 s6; memset(&s6, 0, sizeof s6);
+    s6.sin6_family = AF_INET6; s6.sin6_port = htons((uint16_t)port);
+    h[strlen(h) - 1] = 0;
+    inet_pton(AF_INET6, h + 1, &s6.sin6_addr);
+    int fd = socket(AF_INET6, SOCK_STREAM, 0);
+    if (fd < 0) return w_errno_io();
+    int one = 1, zero = 0;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &zero, sizeof zero);
+    if (bind(fd, (struct sockaddr *)&s6, sizeof s6) < 0 || listen(fd, 4096) < 0) { WIo r = w_errno_io(); close(fd); return r; }
+    w_nonblock(fd);
+    socklen_t sl = sizeof s6;
+    getsockname(fd, (struct sockaddr *)&s6, &sl);
+    WCap *c = cap_new(CAP_LISTENER);
+    c->fd = fd; c->port = ntohs(s6.sin6_port);
+    return io_ok_ptr(c);
+  }
   struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
   sa.sin_family = AF_INET; sa.sin_port = htons((uint16_t)port);
   if (!w_resolve(h, &sa.sin_addr)) { char m[400]; snprintf(m, sizeof m, "cannot resolve %s", h); return io_err(2, m); }

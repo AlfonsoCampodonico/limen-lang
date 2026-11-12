@@ -675,8 +675,21 @@ module Sock = struct
   let failed e = Error (Caps.Failed (Unix.error_message e))
   let closed_err what = Error (Caps.Failed (what ^ " is closed"))
 
-  (* "host:port" with a host of [A-Za-z0-9.-] and a port 0..65535 *)
+  (* "host:port" with a host of [A-Za-z0-9.-] and a port 0..65535, or
+     "[ipv6]:port" with the host kept in its brackets *)
+  let port_of p = if p <> "" && String.length p <= 5 && String.for_all (fun c -> c >= '0' && c <= '9') p && int_of_string p <= 65535 then Some (int_of_string p) else None
+
   let parse_addr addr =
+    if String.length addr > 0 && addr.[0] = '[' then
+      match String.index_opt addr ']' with
+      | Some k when k >= 2 && k + 1 < String.length addr && addr.[k + 1] = ':' -> (
+        let inner = String.sub addr 1 (k - 1) in
+        match (Unix.inet_addr_of_string inner, port_of (String.sub addr (k + 2) (String.length addr - k - 2))) with
+        | ip, Some p when Unix.domain_of_sockaddr (Unix.ADDR_INET (ip, 0)) = Unix.PF_INET6 -> Some (String.lowercase_ascii (String.sub addr 0 (k + 1)), p)
+        | _ -> None
+        | exception Failure _ -> None)
+      | _ -> None
+    else
     match String.split_on_char ':' addr with
     | [ h; p ]
       when h <> "" && String.for_all (fun c -> (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c = '.' || c = '-') h
@@ -696,6 +709,19 @@ module Sock = struct
     | None -> Error (Caps.Failed "address must be HOST:PORT")
     | Some (h, port) ->
       if not (Caps.permits allowed ~host:h ~port) then Error (Caps.Denied (Printf.sprintf "listen: %s:%d is not granted" h port))
+      else if h.[0] = '[' then (
+        (* IPv6, and IPv4 too through mapped addresses *)
+        let ip = Unix.inet_addr_of_string (String.sub h 1 (String.length h - 2)) in
+        let fd = Unix.socket Unix.PF_INET6 Unix.SOCK_STREAM 0 in
+        try
+          Unix.setsockopt fd Unix.SO_REUSEADDR true;
+          Unix.setsockopt fd Unix.IPV6_ONLY false;
+          Unix.bind fd (Unix.ADDR_INET (ip, port));
+          Unix.listen fd 4096;
+          Unix.set_nonblock fd;
+          let p = match Unix.getsockname fd with Unix.ADDR_INET (_, p) -> p | _ -> port in
+          Ok ({ fd; shut = false; reading = false; writing = false; tls = Tls.Plain }, p)
+        with Unix.Unix_error (e, _, _) -> Unix.close fd; failed e)
       else (
         match resolve h with
         | None -> Error (Caps.Failed ("cannot resolve " ^ h))
