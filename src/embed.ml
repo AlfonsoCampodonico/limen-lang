@@ -135,7 +135,7 @@ let forwarder structs (s : struct_decl) path (d : fn_decl) : fn_decl option =
   in
   if !fail then None
   else begin
-    let mk e = { edesc = e; espan = sp; ety = Types.TErr; einst = [] } in
+    let mk e = { edesc = e; espan = sp; ety = Types.TErr; einst = []; ecallee = None } in
     let params = List.tl d.fn_params in
     let recv = List.fold_left (fun r f -> mk (EField (r, f, sp))) (mk (EVar "self")) path in
     let call = mk (EMethod (recv, method_name d.fn_name, sp, List.map (fun p -> mk (EVar p.prm_name)) params)) in

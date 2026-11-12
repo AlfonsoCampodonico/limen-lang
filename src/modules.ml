@@ -190,7 +190,7 @@ and expand ~seen env (m : modinfo) (al : alias_decl) args (t : ty_expr) : ty_exp
     (* errors about the expanded type point where the alias is used *)
     { (subst body) with tspan = t.tspan }
 
-let mk d sp = { edesc = d; espan = sp; ety = Types.TErr; einst = [] }
+let mk d sp = { edesc = d; espan = sp; ety = Types.TErr; einst = []; ecallee = None }
 
 let rec pat_binds (p : pat) acc =
   match p.pdesc with
@@ -334,7 +334,7 @@ and unpack_counter = ref 0
 and unpack (p : pat) (e : expr) : stmt list =
   incr unpack_counter;
   let tmp = "tuple$" ^ string_of_int !unpack_counter in
-  let mk d = { edesc = d; espan = p.pspan; ety = Types.TErr; einst = [] } in
+  let mk d = { edesc = d; espan = p.pspan; ety = Types.TErr; einst = []; ecallee = None } in
   let first = { sdesc = SLet (false, tmp, p.pspan, None, e); sspan = p.pspan } in
   let rest =
     match p.pdesc with
@@ -361,7 +361,7 @@ and expand_stmts (ss : stmt list) : stmt list =
       | SForPat (p, it, body) ->
         incr unpack_counter;
         let tmp = "item$" ^ string_of_int !unpack_counter in
-        let v = { edesc = EVar tmp; espan = p.pspan; ety = Types.TErr; einst = [] } in
+        let v = { edesc = EVar tmp; espan = p.pspan; ety = Types.TErr; einst = []; ecallee = None } in
         [ { s with sdesc = SFor (tmp, p.pspan, it, { body with stmts = unpack p v @ body.stmts }) } ]
       | _ -> [ s ])
     ss

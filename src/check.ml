@@ -444,7 +444,7 @@ let embed_path ctx (recv : expr) rt path =
         | TNamed (n, args) when Hashtbl.mem ctx.sfields n -> Option.value ~default:TErr (List.assoc_opt fld (struct_fields ctx n args))
         | _ -> TErr
       in
-      ({ edesc = EField (x, fld, { x.espan with lo = x.espan.hi }); espan = x.espan; ety = ft; einst = [] }, ft))
+      ({ edesc = EField (x, fld, { x.espan with lo = x.espan.hi }); espan = x.espan; ety = ft; einst = []; ecallee = None }, ft))
     (recv, rt) path
 
 let ambiguity n name paths =
@@ -537,7 +537,7 @@ and check_expr_inner ctx f e : ty =
   | EMethod (({ edesc = EVar en; _ } as recv), name, nsp, args)
     when lookup f en = None && Hashtbl.mem ctx.enums en ->
     (* `Enum.Variant(args)` is a constructor call, not a method call. *)
-    let callee = { edesc = EField (recv, name, nsp); espan = Span.merge recv.espan nsp; ety = TErr; einst = [] } in
+    let callee = { edesc = EField (recv, name, nsp); espan = Span.merge recv.espan nsp; ety = TErr; einst = []; ecallee = None } in
     check_call ctx f e callee args e.espan
   | EMethod (recv, name, nsp, args) -> check_method ctx f e recv name nsp args
   | EField (recv, name, nsp) -> check_field ctx f e recv name nsp
@@ -700,7 +700,7 @@ and check_var ctx f e n sp =
       | Some [ en ] ->
         (* name the enum when the variant name alone would be ambiguous to the backends *)
         if List.length (Hashtbl.find ctx.owners n) > 1 then
-          e.edesc <- EField ({ edesc = EVar en; espan = sp; ety = TErr; einst = [] }, n, sp);
+          e.edesc <- EField ({ edesc = EVar en; espan = sp; ety = TErr; einst = []; ecallee = None }, n, sp);
         ctor_ty ctx en n
       | Some ens ->
         err ctx "E0104" sp
@@ -834,7 +834,7 @@ and keep_order e written r =
     in
     let var (x : expr) =
       match List.assq_opt x temps with
-      | Some n -> { edesc = EVar n; espan = x.espan; ety = x.ety; einst = [] }
+      | Some n -> { edesc = EVar n; espan = x.espan; ety = x.ety; einst = []; ecallee = None }
       | None -> x
     in
     let desc =
@@ -843,7 +843,7 @@ and keep_order e written r =
       | EMethod (rv, m, nsp, xs) -> EMethod (var rv, m, nsp, List.map var xs)
       | d -> d
     in
-    let call = { edesc = desc; espan = e.espan; ety = r; einst = e.einst } in
+    let call = { edesc = desc; espan = e.espan; ety = r; einst = e.einst; ecallee = None } in
     e.edesc <-
       EBlock
         { stmts = List.map (fun ((x : expr), n) -> { sdesc = SLet (false, n, x.espan, None, x); sspan = x.espan }) temps;
@@ -1037,7 +1037,7 @@ and method_arity ?(file = "") ctx t name =
    both backends see; [recv] is already checked. *)
 and method_value ctx f e recv rt name nsp arity =
   let sp = e.espan in
-  let mk d = { edesc = d; espan = sp; ety = TErr; einst = [] } in
+  let mk d = { edesc = d; espan = sp; ety = TErr; einst = []; ecallee = None } in
   let params = List.init arity (fun i -> ("$a" ^ string_of_int i, None, sp)) in
   let call = mk (EMethod (mk (EVar "$recv"), name, nsp, List.map (fun (n, _, _) -> mk (EVar n)) params)) in
   let clo = mk (EClosure (params, call)) in
@@ -1178,7 +1178,7 @@ and check_method_value ?rt ctx f e recv name nsp args =
         check_args ctx f args
       end
       else List.iter2 (fun a p -> expect ctx f a p) args ps;
-      e.edesc <- ECall ({ edesc = EVar key; espan = nsp; ety = t; einst = env }, recv :: args);
+      e.edesc <- ECall ({ edesc = EVar key; espan = nsp; ety = t; einst = env; ecallee = None }, recv :: args);
       if labelled then keep_order e written r;
       r)
     | _ -> check_args ctx f args; TErr)

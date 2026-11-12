@@ -22,11 +22,17 @@ and pat_desc =
 
 (* [ety] and [einst] are filled in by the checker: the expression's type, and
    for a reference to a generic function, the type arguments it was used at. *)
+type param = { prm_name : string; prm_span : span; prm_ty : ty_expr }
+
 type expr = {
   mutable edesc : expr_desc; (* the checker wraps a value in EDyn where a `dyn` is expected *)
   espan : span;
   mutable ety : Types.ty;
   mutable einst : (string * Types.ty) list;
+  mutable ecallee : fn_decl option;
+      (* the interpreter's cache: for a name that refers to a top-level
+         function, that function, found the first time the name is evaluated.
+         Scoping is lexical, so it is the same every time. *)
 }
 and expr_desc =
   | EInt of int64
@@ -88,9 +94,7 @@ and stmt_desc =
   | SContinue
   | SDefer of block (* runs when the enclosing block is left, in reverse order of the defers *)
 
-type param = { prm_name : string; prm_span : span; prm_ty : ty_expr }
-
-type fn_decl = {
+and fn_decl = {
   fn_name : string;
   fn_span : span;
   fn_gen : string list;

@@ -41,7 +41,7 @@ let expect_ident st =
 let last_span st = st.toks.(max 0 (st.pos - 1)).span
 let merge = Span.merge
 let is_upper s = s <> "" && s.[0] >= 'A' && s.[0] <= 'Z'
-let mk d sp = { edesc = d; espan = sp; ety = Types.TErr; einst = [] }
+let mk d sp = { edesc = d; espan = sp; ety = Types.TErr; einst = []; ecallee = None }
 
 (* Comma-separated list up to [close]; a newline also separates items. *)
 let peek2 st = st.toks.(min (st.pos + 1) (Array.length st.toks - 1))

@@ -87,7 +87,13 @@ and group = { mutable tasks : (task * outcome option ref) list; mutable kept : b
    remembers when its key was first inserted, for insertion-order iteration. *)
 and vmap = { m : (int * value) KM.t; next : int }
 
-and env = (string, value ref) Hashtbl.t list
+(* The names in scope, innermost scope first. A scope is a short list,
+   newest binding first, searched in order: a function's scopes hold a
+   handful of names, and comparing a few short strings is much cheaper than
+   hashing every lookup. *)
+and env = scope list
+
+and scope = { mutable vars : (string * value ref) list }
 
 exception Return of value
 exception Break_
@@ -333,19 +339,35 @@ let strs l = VList (Array.of_list (List.map (fun s -> VStr s) l))
 
 (* ---------- evaluation ---------- *)
 
+let scope () = { vars = [] }
+let bind s n v = s.vars <- (n, ref v) :: s.vars
+let scope_of n v = { vars = [ (n, ref v) ] }
+
+let rec lookup n = function
+  | [] -> None
+  | (k, v) :: r -> if k == n || String.equal k n then Some v else lookup n r
+
 let rec find_var env n =
   match env with
   | [] -> None
-  | s :: r -> ( match Hashtbl.find_opt s n with Some v -> Some v | None -> find_var r n)
+  | s :: r -> ( match lookup n s.vars with Some v -> Some v | None -> find_var r n)
 
-(* Closures capture by value: copy every visible binding. *)
+(* Closures capture by value: copy every visible binding, the innermost of
+   each name. *)
 let snapshot env =
-  let t = Hashtbl.create 16 in
-  List.iter (fun s -> Hashtbl.iter (fun k v -> if not (Hashtbl.mem t k) then Hashtbl.replace t k (ref !v)) s) env;
-  t
+  let out = ref [] in
+  List.iter (fun s -> List.iter (fun (k, v) -> if lookup k !out = None then out := (k, ref !v) :: !out) s.vars) env;
+  { vars = List.rev !out }
 
 let binop op a b sp =
   match (op, a, b) with
+  (* integers first, compared directly rather than through compare_v *)
+  | Lt, VInt x, VInt y -> VBool (Int64.compare x y < 0)
+  | Le, VInt x, VInt y -> VBool (Int64.compare x y <= 0)
+  | Gt, VInt x, VInt y -> VBool (Int64.compare x y > 0)
+  | Ge, VInt x, VInt y -> VBool (Int64.compare x y >= 0)
+  | Eq, VInt x, VInt y -> VBool (Int64.equal x y)
+  | Ne, VInt x, VInt y -> VBool (not (Int64.equal x y))
   | Add, VInt x, VInt y -> VInt (Int64.add x y)
   | Sub, VInt x, VInt y -> VInt (Int64.sub x y)
   | Mul, VInt x, VInt y -> VInt (Int64.mul x y)
@@ -1080,7 +1102,7 @@ end
 let rec pmatch p v binds =
   match (p.pdesc, v) with
   | PWild, _ -> true
-  | PBind n, _ -> Hashtbl.replace binds n (ref v); true
+  | PBind n, _ -> bind binds n v; true
   | PInt n, VInt m -> Int64.equal n m
   | PStr s, VStr t -> s = t
   | PBool b, VBool c -> b = c
@@ -1098,7 +1120,14 @@ let rec eval rt env e : value =
   | EUnit -> VUnit
   | EStr parts ->
     VStr (String.concat "" (List.map (function SPLit s -> s | SPExpr x -> show (eval rt env x)) parts))
-  | EVar n -> eval_var rt env n e.espan
+  | EVar n -> (
+    match e.ecallee with
+    | Some d -> VFn d.fn_name
+    | None ->
+      let v = eval_var rt env n e.espan in
+      (* a top-level function: remember which, so later calls skip the search *)
+      (match v with VFn m when m == n || String.equal m n -> e.ecallee <- Hashtbl.find_opt rt.fns n | _ -> ());
+      v)
   | EList es -> VList (Array.of_list (List.map (eval rt env) es))
   | EBin (And, a, b) -> if as_bool (eval rt env a) then eval rt env b else VBool false
   | EBin (Or, a, b) -> if as_bool (eval rt env a) then VBool true else eval rt env b
@@ -1114,6 +1143,9 @@ let rec eval rt env e : value =
     match eval rt env a with VInt n -> VInt (Int64.neg n) | VFloat x -> VFloat (-.x) | _ -> failwith "internal: neg")
   | EUn (Not, a) -> VBool (not (as_bool (eval rt env a)))
   | ENamed _ -> failwith "internal: the checker puts named arguments in order"
+  | ECall ({ ecallee = Some d; _ }, args) when d.fn_foreign = None ->
+    (* a call to a known top-level function: no name to look up *)
+    call_fn rt d (List.map (eval rt env) args)
   | ECall (c, args) ->
     let fv = eval rt env c in
     let avs = List.map (eval rt env) args in
@@ -1175,7 +1207,7 @@ let rec eval rt env e : value =
     let rec go = function
       | [] -> raise (Panic ("no `match` arm matched " ^ show ~top:false v, e.espan))
       | a :: rest ->
-        let binds = Hashtbl.create 4 in
+        let binds = scope () in
         if pmatch a.apat v binds && (match a.aguard with Some g -> as_bool (eval rt (binds :: env) g) | None -> true) then
           eval rt (binds :: env) a.abody
         else go rest
@@ -1244,9 +1276,9 @@ let rec eval rt env e : value =
           | _ -> if w.ok then (i, None) else closed_send ())
         | None -> (i, None)
     in
-    let binds = Hashtbl.create 1 in
+    let binds = scope () in
     (match List.assoc i ops with
-     | `Recv (b, _) -> Option.iter (fun (n, _) -> Hashtbl.replace binds n (ref (match got with Some v -> some v | None -> none))) b
+     | `Recv (b, _) -> Option.iter (fun (n, _) -> bind binds n (match got with Some v -> some v | None -> none)) b
      | _ -> ());
     eval rt (binds :: env) (List.nth arms i).sbody
   | EBlock b -> eval_block rt env b
@@ -1260,9 +1292,7 @@ let rec eval rt env e : value =
   | ESafe (base, x, rest, flat) -> (
     match eval rt env base with
     | VEnum (_, "Some", [ v ]) ->
-      let b = Hashtbl.create 1 in
-      Hashtbl.replace b x (ref v);
-      let r = eval rt (b :: env) rest in
+      let r = eval rt (scope_of x v :: env) rest in
       if flat then r else some r
     | _ -> none)
   | EWith (base, fields) -> (
@@ -1290,8 +1320,7 @@ let rec eval rt env e : value =
              wait_until ~at ~cancellable:false (fun () -> !joined || now () >= at);
              if not !joined then cancel_group g)
        end);
-    let sc = Hashtbl.create 1 in
-    Hashtbl.replace sc name (ref (VGroup g));
+    let sc = scope_of name (VGroup g) in
     (try
        ignore (eval_block rt (sc :: env) b);
        wait_until (fun () -> group_finished g)
@@ -1363,8 +1392,8 @@ and apply rt fv args sp =
     let d = Hashtbl.find rt.fns n in
     if d.fn_foreign <> None then Foreign.invoke d args sp else call_fn rt d args
   | VClosure (ps, body, cenv) -> (
-    let sc = Hashtbl.create 8 in
-    List.iter2 (fun p a -> Hashtbl.replace sc p (ref a)) ps args;
+    let sc = scope () in
+    List.iter2 (fun p a -> bind sc p a) ps args;
     try eval rt (sc :: cenv) body with Return v -> v)
   | VCtor (en, vn) -> VEnum (en, vn, args)
   | VBuiltin "assert" -> (
@@ -1412,12 +1441,12 @@ and apply rt fv args sp =
   | _ -> failwith "internal: not callable"
 
 and call_fn rt d args =
-  let sc = Hashtbl.create 8 in
-  List.iter2 (fun p a -> Hashtbl.replace sc p.prm_name (ref a)) d.fn_params args;
+  let sc = scope () in
+  List.iter2 (fun p a -> bind sc p.prm_name a) d.fn_params args;
   try eval_block rt [ sc ] d.fn_body with Return v -> v
 
 and eval_block rt env b =
-  let env = Hashtbl.create 8 :: env in
+  let env = scope () :: env in
   run_stmts rt env b.stmts b.tail
 
 (* A `defer` runs the rest of its block, then its own body however that rest
@@ -1429,7 +1458,9 @@ and run_stmts rt env ss tail =
   match ss with
   | [] -> ( match tail with Some e -> eval rt env e | None -> VUnit)
   | { sdesc = SDefer d; _ } :: rest -> (
-    let at_defer = List.map Hashtbl.copy env in
+    (* the scopes as they are now: later lets are not seen, but the values
+       of the names already there are, as they are when it runs *)
+    let at_defer = List.map (fun s -> { vars = s.vars }) env in
     let run_defer () = ignore (eval_block rt at_defer d) in
     match run_stmts rt env rest tail with
     | v -> run_defer (); v
@@ -1440,7 +1471,7 @@ and exec rt env s =
   match s.sdesc with
   | SLet (_, n, _, _, e) ->
     let v = eval rt env e in
-    Hashtbl.replace (List.hd env) n (ref v)
+    bind (List.hd env) n v
   | SAssign (lhs, rhs) -> assign rt env lhs (eval rt env rhs)
   | SExpr e -> ignore (eval rt env e)
   | SReturn eo -> raise (Return (match eo with Some e -> eval rt env e | None -> VUnit))
@@ -1456,8 +1487,7 @@ and exec rt env s =
     let i = ref lo in
     try
       while !i < hi do
-        let sc = Hashtbl.create 1 in
-        Hashtbl.replace sc n (ref (VInt !i));
+        let sc = scope_of n (VInt !i) in
         i := Int64.add !i 1L;
         try ignore (eval_block rt (sc :: env) b) with Continue_ -> ()
       done
@@ -1468,8 +1498,7 @@ and exec rt env s =
       try
         Array.iter
           (fun v ->
-            let sc = Hashtbl.create 1 in
-            Hashtbl.replace sc n (ref v);
+            let sc = scope_of n v in
             try ignore (eval_block rt (sc :: env) b) with Continue_ -> ())
           arr
       with Break_ -> ())
