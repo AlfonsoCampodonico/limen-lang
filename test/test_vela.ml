@@ -5267,6 +5267,33 @@ fn main(root: Root) {
   fmt_case "fmt-comment-closure"
     "fn main(root: Root) {\n    let f = |x: Int| // add one\n        x + 1\n    root.stdout.print(\"{f(1)}\")\n}\n"
     "fn main(root: Root) {\n    let f = |x: Int|  // add one\n        x + 1\n    root.stdout.print(\"{f(1)}\")\n}\n";
+  (* an argument list on one line hugs an argument that breaks: its insides
+     one level in, its closing bracket back at the call's indentation *)
+  canonical "fmt-hug-list"
+    "fn main(root: Root) {\n    let xs = f([\n        1,\n        2,\n    ])\n    root.stdout.print(\"{xs}\")\n}\n";
+  canonical "fmt-hug-struct"
+    "fn main(root: Root) {\n    let p = Some(P {\n        x: 1,\n    })\n    root.stdout.print(\"{p}\")\n}\n";
+  canonical "fmt-hug-closure"
+    "fn main(root: Root) {\n    group g {\n        g.go(|| {\n            root.stdout.print(\"a\")\n        })\n    }\n}\n";
+  (* a comment inside an argument breaks only that argument, not the call around it *)
+  canonical "fmt-hug-nested"
+    "fn main(root: Root) {\n    let v = obj([\n        (\"a\", one(obj([\n            // the first\n            1,\n        ]))),\n    ])\n    root.stdout.print(\"{v}\")\n}\n";
+  fmt_case "fmt-hug-from-broken"
+    "fn main(root: Root) {\n    let xs = f([\n            1,\n        ])\n}\n"
+    "fn main(root: Root) {\n    let xs = f([\n        1,\n    ])\n}\n";
+  (* parentheses the author put around a compound operand stay; a negative
+     number after `??` needs none *)
+  canonical "fmt-keep-parens"
+    "fn main(root: Root) {\n    let b = (1 < 2 && 2 < 3) || 3 < 4\n    let d = (9 / 3) % 2\n    let n = Some(1) ?? -1\n    root.stdout.print(\"{b} {d} {n}\")\n}\n";
+  fmt_case "fmt-drop-parens"
+    "fn main(root: Root) {\n    let n = (2) + (f(1))\n    let m = (-1)\n}\n"
+    "fn main(root: Root) {\n    let n = 2 + f(1)\n    let m = -1\n}\n";
+  (* trailing comments keep the author's alignment *)
+  canonical "fmt-aligned-comments"
+    "struct P {\n    x: Int,     // across\n    yy: Int,    // down\n}\n";
+  (* a block of one short return or assignment, written on one line, stays there *)
+  canonical "fmt-one-line-return"
+    "fn f(o: Option[Int]) -> Int {\n    let n = o ?? { return 0 }\n    match o {\n        Some(_) => { return n },\n        None => { n = 1 },\n    }\n}\n";
 
   ok "fmt-use-pub"
     (Fmt.format ~file:"fu.vela" "use geom // g\npub   fn f() -> Int { 1 }\npub struct S { a: Int }\n"
@@ -5288,6 +5315,24 @@ fn main(root: Root) {
             end)
           (Sys.readdir dir))
     [ "../examples"; "../bench" ];
+  (* and the examples, benchmarks and standard library are already formatted *)
+  let unformatted =
+    List.concat_map
+      (fun dir ->
+        if not (Sys.file_exists dir) then []
+        else
+          Sys.readdir dir |> Array.to_list |> List.sort compare
+          |> List.filter (fun f -> Filename.check_suffix f ".vela")
+          |> List.filter_map (fun f ->
+                 let path = Filename.concat dir f in
+                 let src = In_channel.with_open_bin path In_channel.input_all in
+                 match Fmt.format ~file:path src with
+                 | out when out = src -> None
+                 | _ -> Some path
+                 | exception Diag.Fatal _ -> None))
+      [ "../examples"; "../bench"; "../src/std" ]
+  in
+  ok "fmt-repo-clean" (unformatted = []) ("not formatted: " ^ String.concat ", " unformatted);
   ok "fmt-every-program" (!fmt_failures = [])
     (String.concat "\n\n" (List.map (fun (n, m) -> n ^ ": " ^ m) (List.rev !fmt_failures)));
   ok "fmt-checked-count" (Hashtbl.length fmt_checked > 90 || Sys.getenv_opt "VELA_TEST_ONLY" <> None) (string_of_int (Hashtbl.length fmt_checked));

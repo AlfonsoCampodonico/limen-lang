@@ -93,7 +93,7 @@ fn slow(clock: Clock, ms: Int, v: Int) -> Int {
 // `defer` runs when its block is left: here by `return`, or by a panic
 fn checked(out: Stdout, s: Str) -> Result[Int, Str] {
     defer out.print("checked {s}")
-    let n = s.parse_int() ?? (-1)
+    let n = s.parse_int() ?? -1
     if n < 0 {
         return Err("not a number")
     }

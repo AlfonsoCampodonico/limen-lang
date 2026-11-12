@@ -7,46 +7,46 @@ fn main(root: Root) {
     let words: Chan[Str] = channel(4)
     let res = group g {
         g.go(|| {
-                for i in [1, 2, 3, 4, 5] {
-                    nums.send(i)
-                }
-                nums.close()
-                "nums done"
-            })
+            for i in [1, 2, 3, 4, 5] {
+                nums.send(i)
+            }
+            nums.close()
+            "nums done"
+        })
         g.go(|| {
-                for w in ["a", "b", "c"] {
-                    words.send(w)
-                }
-                words.close()
-                "words done"
-            })
+            for w in ["a", "b", "c"] {
+                words.send(w)
+            }
+            words.close()
+            "words done"
+        })
         g.go(|| {
-                let mut total = 0
-                let mut letters = ""
-                let mut nums_open = true
-                let mut words_open = true
-                while nums_open || words_open {
-                    select {
-                        n = nums.recv() if nums_open => match n {
-                            Some(x) => {
-                                total = total + x
-                            },
-                            None => {
-                                nums_open = false
-                            },
+            let mut total = 0
+            let mut letters = ""
+            let mut nums_open = true
+            let mut words_open = true
+            while nums_open || words_open {
+                select {
+                    n = nums.recv() if nums_open => match n {
+                        Some(x) => {
+                            total = total + x
                         },
-                        w = words.recv() if words_open => match w {
-                            Some(s) => {
-                                letters = letters + s
-                            },
-                            None => {
-                                words_open = false
-                            },
+                        None => {
+                            nums_open = false
                         },
-                    }
+                    },
+                    w = words.recv() if words_open => match w {
+                        Some(s) => {
+                            letters = letters + s
+                        },
+                        None => {
+                            words_open = false
+                        },
+                    },
                 }
-                "total {total} letters {letters.len()}"
-            })
+            }
+            "total {total} letters {letters.len()}"
+        })
     }
     out.print(res.join("; "))
     // `_` makes select non-blocking; the first ready arm wins
@@ -77,7 +77,7 @@ fn main(root: Root) {
     out.print(g2)
     // a guard turns an arm off; with every arm off, select panics instead of hanging
     let none_on = catch(|| select {
-            v = d.recv() if false => 1,
-        })
+        v = d.recv() if false => 1,
+    })
     out.print("{none_on}")
 }

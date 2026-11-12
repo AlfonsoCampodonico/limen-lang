@@ -69,7 +69,7 @@ enum Node {
     NRange(Int, Int),                // one byte in a range
     NCat(List[Node]),
     NAlt(List[Node]),
-    NRep(List[Node], Int, Int, Bool), // one node, min, max (-1: no limit), greedy
+    NRep(List[Node], Int, Int, Bool),  // one node, min, max (-1: no limit), greedy
     NGroup(List[Node], Int),          // one node, capture index
     NAssert(Int),
     NEmpty,

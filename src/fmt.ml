@@ -72,7 +72,10 @@ let trailing c hi =
     match c.pending with
     | (clo, _, text) :: rest when clo >= hi && line_of c clo = l ->
       c.pending <- rest;
-      add c ("  " ^ text);
+      (* at least two spaces, more if the author lined comments up *)
+      let k = ref clo in
+      while !k > 0 && c.src.[!k - 1] = ' ' do decr k done;
+      add c (String.make (max 2 (clo - !k)) ' ' ^ text);
       go ()
     | _ -> ()
   in
@@ -80,6 +83,44 @@ let trailing c hi =
 
 (* Is there a comment not printed yet that starts in [lo, hi)? *)
 let comment_in c lo hi = List.exists (fun (clo, _, _) -> clo >= lo && clo < hi) c.pending
+
+(* ... in [lo, hi) but outside every span in [inner]: a comment inside an
+   argument belongs to that argument, not to the list around it *)
+let comment_between c lo hi (inner : Span.t list) =
+  List.exists
+    (fun (clo, _, _) -> clo >= lo && clo < hi && not (List.exists (fun (sp : Span.t) -> clo >= sp.lo && clo < sp.hi) inner))
+    c.pending
+
+(* Does the source text of [lo, hi) sit inside one pair of parentheses,
+   `(...)`, with the one at [lo] closed by the one at [hi - 1]? The parser
+   gives a parenthesized expression the span of its parentheses. *)
+let wrapped_span c lo hi =
+  let n = String.length c.src in
+  lo >= 0 && hi <= n && hi - lo >= 2 && c.src.[lo] = '(' && c.src.[hi - 1] = ')'
+  &&
+  let depth = ref 1 and i = ref (lo + 1) and ok = ref true in
+  while !ok && !i < hi - 1 do
+    (match c.src.[!i] with
+     | '"' ->
+       (* skip a string; interpolations inside it are balanced *)
+       incr i;
+       while !i < hi - 1 && c.src.[!i] <> '"' do if c.src.[!i] = '\\' then incr i; incr i done
+     | '(' | '[' | '{' -> incr depth
+     | ')' | ']' | '}' -> decr depth; if !depth = 0 then ok := false
+     | _ -> ());
+    incr i
+  done;
+  !ok
+
+(* The source of a literal without parentheses written around it. *)
+let rec bare_slice c (sp : Span.t) =
+  if wrapped_span c sp.lo sp.hi then begin
+    let lo = ref (sp.lo + 1) and hi = ref (sp.hi - 1) in
+    while !lo < !hi && (c.src.[!lo] = ' ' || c.src.[!lo] = '\n') do incr lo done;
+    while !hi > !lo && (c.src.[!hi - 1] = ' ' || c.src.[!hi - 1] = '\n') do decr hi done;
+    bare_slice c { sp with lo = !lo; hi = !hi }
+  end
+  else String.sub c.src sp.lo (sp.hi - sp.lo)
 
 (* The expression goes on past a comment: the comments on this line after
    [hi], those on their own lines before [lo], then a new line at [ind]. *)
@@ -187,33 +228,42 @@ let rec simple_expr e =
   | ESafe (b, _, rest, _) -> simple_expr b && simple_expr rest
   | _ -> true
 
-let rec expr c ind ?(min = 0) e =
+(* [keep]: this is an operand, and parentheses the author wrote around a
+   compound one stay even where precedence does not need them, as in
+   `(a && b) || c` *)
+let rec expr c ind ?(min = 0) ?(keep = false) e =
   let p =
     match e.edesc with
     | EBin (op, _, _) -> prec op
     | EPipe _ -> 1
-    | EUn _ -> 14
+    (* tighter than any binary operator, so `x ?? -1` needs no parentheses *)
+    | EUn _ -> 15
     | EClosure _ -> 0
     | _ -> 18
   in
-  if p < min then (add c "("; expr_inner c ind e; add c ")") else expr_inner c ind e
+  let kept =
+    keep
+    && (match e.edesc with EBin _ | EPipe _ | EIf _ | EMatch _ -> true | _ -> false)
+    && wrapped_span c e.espan.lo e.espan.hi
+  in
+  if p < min || kept then (add c "("; expr_inner c ind e; add c ")") else expr_inner c ind e
 
 and expr_inner c ind e =
   match e.edesc with
-  | EInt _ | EFloat _ | EStr _ -> add c (slice c e.espan)
+  | EInt _ | EFloat _ | EStr _ -> add c (bare_slice c e.espan)
   | EBool b -> add c (string_of_bool b)
   | EUnit -> add c "()"
   | EVar n -> add c n
   | EBin (op, a, b) ->
     let p = prec op in
-    expr c ind ~min:p a;
+    expr c ind ~min:p ~keep:true a;
     if comment_in c a.espan.hi b.espan.lo then begin
       (* `a +  // why` then `b` on the next line: an operator at the end of a line continues it *)
       add c (if op = Range then op_str op else " " ^ op_str op);
       break_at_comments c (ind + 4) a.espan.hi b.espan.lo
     end
     else add c (if op = Range then op_str op else " " ^ op_str op ^ " ");
-    expr c ind ~min:(p + 1) b
+    expr c ind ~min:(p + 1) ~keep:true b
   | EPipe (a, b) ->
     (* a pipeline written one step per line stays that way *)
     expr c ind ~min:1 a;
@@ -248,23 +298,24 @@ and expr_inner c ind e =
     expr c ind ~min:16 a;
     add c "?";
     Option.iter (fun x -> add c " "; expr c ind x) ctx
-  | EList es -> seq c ind "[" "]" (breaks_after_open c e.espan.lo '[') ~lo:e.espan.lo ~hi:e.espan.hi (fun x -> expr c (ind + 4) x) (fun x -> x.espan) es
+  | EList es -> seq c ind "[" "]" (breaks_after_open c e.espan.lo '[') ~lo:e.espan.lo ~hi:e.espan.hi (fun i x -> expr c i x) (fun x -> x.espan) es
   | EStruct (name, _, fields) when is_tuple_name name ->
-    seq c ind "(" ")" (breaks_after_open c e.espan.lo '(') ~lo:e.espan.lo ~hi:e.espan.hi (fun (_, _, x) -> expr c (ind + 4) x) (fun (_, _, x) -> x.espan) fields
+    seq c ind "(" ")" (breaks_after_open c e.espan.lo '(') ~lo:e.espan.lo ~hi:e.espan.hi (fun i (_, _, x) -> expr c i x) (fun (_, _, x) -> x.espan) fields
   | EStruct (name, nsp, fields) ->
     add c (name ^ " ");
-    let field (f, fsp, v) =
+    let field i (f, fsp, v) =
       if v.espan = fsp then add c f (* shorthand *)
-      else (add c (f ^ ": "); expr c (ind + 4) v)
+      else (add c (f ^ ": "); expr c i v)
     in
+    let values = List.map (fun (_, _, v) -> v.espan) fields in
     if fields = [] then add c "{}"
-    else if breaks_after_open c nsp.hi '{' || comment_in c nsp.hi e.espan.hi then begin
+    else if breaks_after_open c nsp.hi '{' || comment_between c nsp.hi e.espan.hi values then begin
       add c "{";
       List.iter
         (fun ((_, (fsp : Span.t), v) as fl) ->
           ignore (leading c (ind + 4) ~prev:(-1) fsp.lo);
           new_line c (ind + 4);
-          field fl;
+          field (ind + 4) fl;
           add c ",";
           trailing c (if v.espan = fsp then fsp.hi else v.espan.hi))
         fields;
@@ -273,8 +324,9 @@ and expr_inner c ind e =
       add c "}"
     end
     else begin
+      (* on one line: a value that breaks hugs the braces, at this indentation *)
       add c "{ ";
-      List.iteri (fun i fl -> if i > 0 then add c ", "; field fl) fields;
+      List.iteri (fun i fl -> if i > 0 then add c ", "; field ind fl) fields;
       add c " }"
     end
   | ESafe (base, x, rest, _) ->
@@ -297,20 +349,21 @@ and expr_inner c ind e =
     expr_inner c ind (fill rest)
   | EWith (base, fields) ->
     (* like a struct literal: one line, or one field per line if written so *)
-    let field (f, fsp, v) =
+    let field i (f, fsp, v) =
       if v.espan = fsp then add c f (* shorthand *)
-      else (add c (f ^ ": "); expr c (ind + 4) v)
+      else (add c (f ^ ": "); expr c i v)
     in
     add c "{ ";
     expr c ind base;
     add c " with";
     let first = match fields with (_, (fsp : Span.t), _) :: _ -> fsp.lo | [] -> e.espan.hi in
-    if has_newline c base.espan.hi first || comment_in c base.espan.hi e.espan.hi then begin
+    let values = List.map (fun (_, _, v) -> v.espan) fields in
+    if has_newline c base.espan.hi first || comment_between c base.espan.hi e.espan.hi values then begin
       List.iter
         (fun ((_, (fsp : Span.t), v) as fl) ->
           ignore (leading c (ind + 4) ~prev:(-1) fsp.lo);
           new_line c (ind + 4);
-          field fl;
+          field (ind + 4) fl;
           add c ",";
           trailing c (if v.espan = fsp then fsp.hi else v.espan.hi))
         fields;
@@ -320,7 +373,7 @@ and expr_inner c ind e =
     end
     else begin
       add c " ";
-      List.iteri (fun i fl -> if i > 0 then add c ", "; field fl) fields;
+      List.iteri (fun i fl -> if i > 0 then add c ", "; field ind fl) fields;
       add c " }"
     end
   | EBlock b -> block c ind b
@@ -424,7 +477,7 @@ and receiver c ind r nsp =
 (* `(a, b)`, or `(a) { |x| ... }` / ` { ... }` with a trailing closure;
    the arguments start after [lo]. *)
 and call_args c ind lo hi args =
-  let plain xs hi = seq c ind "(" ")" (breaks_after_open c lo '(') ~lo ~hi (fun x -> expr c (ind + 4) x) (fun x -> x.espan) xs in
+  let plain xs hi = seq c ind "(" ")" (breaks_after_open c lo '(') ~lo ~hi (fun i x -> expr c i x) (fun x -> x.espan) xs in
   match trailing_arg c args with
   | Some (rest, ({ edesc = EClosure (ps, { edesc = EBlock b; _ }); _ } as clo)) ->
     if rest <> [] then plain rest clo.espan.lo;
@@ -453,11 +506,13 @@ and if_chain c ind e =
   | _ -> expr c ind e
 
 (* `( ... )` / `[ ... ]`: on one line, or one item per line with a trailing
-   comma when the author broke after the opening bracket. *)
-and seq : 'a. ctx -> int -> string -> string -> bool -> lo:int -> hi:int -> ('a -> unit) -> ('a -> Span.t) -> 'a list -> unit =
+   comma when the author broke after the opening bracket. [item] prints an
+   element at the indentation it is given. On one line an element that
+   breaks hugs the brackets: `f([` ... `])`, its insides one level in. *)
+and seq : 'a. ctx -> int -> string -> string -> bool -> lo:int -> hi:int -> (int -> 'a -> unit) -> ('a -> Span.t) -> 'a list -> unit =
  fun c ind op cl multi ~lo ~hi item span xs ->
-  (* a comment inside puts one element per line, so it can stay where it is *)
-  let multi = multi || comment_in c lo hi in
+  (* a comment between elements puts one element per line, so it can stay where it is *)
+  let multi = multi || comment_between c lo hi (List.map span xs) in
   if multi && xs <> [] then begin
     add c op;
     let prev = ref (-1) in
@@ -466,7 +521,7 @@ and seq : 'a. ctx -> int -> string -> string -> bool -> lo:int -> hi:int -> ('a 
         let sp = span x in
         ignore (leading c (ind + 4) ~prev:!prev sp.lo);
         new_line c (ind + 4);
-        item x;
+        item (ind + 4) x;
         add c ",";
         trailing c sp.hi;
         prev := sp.hi)
@@ -477,7 +532,7 @@ and seq : 'a. ctx -> int -> string -> string -> bool -> lo:int -> hi:int -> ('a 
   end
   else begin
     add c op;
-    List.iteri (fun i x -> if i > 0 then add c ", "; item x) xs;
+    List.iteri (fun i x -> if i > 0 then add c ", "; item ind x) xs;
     add c cl
   end
 
@@ -486,10 +541,27 @@ and block c ind ?(params = "") b =
   let inline =
     b.stmts = [] && (match b.tail with None -> true | Some e -> simple_expr e) && not (has_newline c b.bspan.lo b.bspan.hi)
   in
+  (* `?? { return None }`, `=> { done = true }`: one short jump or
+     assignment, written on one line, stays on it *)
+  let one_line_stmt =
+    match (b.stmts, b.tail) with
+    | [ s ], None when params = "" && not (has_newline c b.bspan.lo b.bspan.hi) -> (
+      match s.sdesc with
+      | SReturn None | SBreak | SContinue -> Some s
+      | SReturn (Some e) when simple_expr e -> Some s
+      | SAssign (l, r) when simple_expr l && simple_expr r -> Some s
+      | _ -> None)
+    | _ -> None
+  in
   if inline then
     match b.tail with
     | None -> add c (if params = "" then "{}" else "{ " ^ params ^ " }")
     | Some e -> add c ("{ " ^ (if params = "" then "" else params ^ " ")); expr c ind e; add c " }"
+  else if one_line_stmt <> None && not (comment_in c b.bspan.lo b.bspan.hi) then begin
+    add c "{ ";
+    Option.iter (stmt c ind) one_line_stmt;
+    add c " }"
+  end
   else begin
     add c (if params = "" then "{" else "{ " ^ params);
     let prev = ref (-1) in

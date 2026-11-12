@@ -330,7 +330,9 @@ pub fn parse_iso(s: Str) -> Result[Int, Str] {
     if bs.get(j) == Some(58) {
         j = j + 1
     }
-    let om = if j == bs.len() { 0 } else { num_at(bs, j, 2) ?? { return expect("two-digit offset minutes", j) } }
+    let om = if j == bs.len() { 0 } else {
+        num_at(bs, j, 2) ?? { return expect("two-digit offset minutes", j) }
+    }
     if j < bs.len() {
         j = j + 2
     }

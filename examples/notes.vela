@@ -42,9 +42,9 @@ fn demo(out: Stdout) -> Result[(), IoError] {
     let id = add(db, "films", "Paris, Texas")?
     // star a note and move the others in one transaction: all or nothing
     db.transaction(|| {
-            db.exec("UPDATE notes SET stars = ? WHERE id = ?", [sql.Int(3), sql.Int(id)])?
-            db.exec("UPDATE notes SET tag = ? WHERE tag = ?", [sql.Text("reading"), sql.Text("books")])
-        })?
+        db.exec("UPDATE notes SET stars = ? WHERE id = ?", [sql.Int(3), sql.Int(id)])?
+        db.exec("UPDATE notes SET tag = ? WHERE tag = ?", [sql.Text("reading"), sql.Text("books")])
+    })?
     list(db, out, "reading")?
     list(db, out, "films")?
     match db.query_one("SELECT count(*) AS n FROM notes", [])? {

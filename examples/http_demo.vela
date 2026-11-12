@@ -65,9 +65,9 @@ fn main(root: Root) -> Result[(), IoError] {
     let more = group g {
         g.go(|| chunked(l2))
         g.go(|| match http.get(net, "http://127.0.0.1:{port2}/") {
-                Ok(r) => "{r.status} {r.body}",
-                Err(e) => "{e}",
-            })
+            Ok(r) => "{r.status} {r.body}",
+            Err(e) => "{e}",
+        })
     }
     root.stdout.print(more.join("\n"))
     Ok(())
