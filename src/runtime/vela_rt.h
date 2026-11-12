@@ -1380,10 +1380,14 @@ static WIo Cap_fs_make_dir(WCap *fs, WStr *rel) {
   if (rc != 0) { snprintf(msg, sizeof msg, "fs: `%.*s`: %s", (int)rel->len, rel->data, strerror(errno)); return io_err(2, msg); }
   return io_ok(NULL);
 }
+/* Written out at once, as in the interpreter: a long-running program's
+   output reaches a file or pipe (a log collector) as it prints, not when a
+   buffer fills or the program exits. */
 static void Cap_print(WStr *s, bool nl) {
   flockfile(stdout);
   fwrite(s->data, 1, (size_t)s->len, stdout);
   if (nl) fputc('\n', stdout);
+  fflush(stdout);
   funlockfile(stdout);
 }
 static int64_t Cap_now_ms(void) { struct timeval tv; gettimeofday(&tv, NULL); return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000; }
