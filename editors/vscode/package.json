@@ -1,0 +1,102 @@
+{
+  "name": "vela",
+  "displayName": "Vela",
+  "description": "Vela language support: syntax highlighting, and errors, hover, go to definition, rename and completion from `vela lsp`.",
+  "version": "0.1.0",
+  "publisher": "vela-local",
+  "private": true,
+  "license": "UNLICENSED",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "workspaceContains:**/vela.toml"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "vela",
+        "aliases": [
+          "Vela",
+          "vela"
+        ],
+        "extensions": [
+          ".vela"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "vela",
+        "scopeName": "source.vela",
+        "path": "./syntaxes/vela.tmLanguage.json"
+      },
+      {
+        "scopeName": "markdown.vela.codeblock",
+        "path": "./syntaxes/vela.markdown.tmLanguage.json",
+        "injectTo": [
+          "text.html.markdown"
+        ],
+        "embeddedLanguages": {
+          "meta.embedded.block.vela": "vela"
+        }
+      }
+    ],
+    "configuration": {
+      "title": "Vela",
+      "properties": {
+        "vela.path": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to the `vela` executable, set in your user settings (a workspace cannot set it). When empty, `vela` on the PATH is used, or else, in a trusted folder only, the build in the open folder (`_build/default/bin/main.exe`).",
+          "scope": "machine"
+        },
+        "vela.languageServer.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Start `vela lsp` for errors, hover, go to definition, references, rename and completion."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "vela.restartLanguageServer",
+        "title": "Restart Language Server",
+        "category": "Vela"
+      }
+    ],
+    "configurationDefaults": {
+      "[vela]": {
+        "editor.tabSize": 4,
+        "editor.insertSpaces": true
+      }
+    }
+  },
+  "scripts": {
+    "package": "vsce package --allow-missing-repository --skip-license -o vela.vsix",
+    "test": "node test/grammar.test.js"
+  },
+  "dependencies": {
+    "vscode-languageclient": "9.0.1"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "3.2.1",
+    "vscode-oniguruma": "2.0.1",
+    "vscode-textmate": "9.1.0"
+  },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "In a folder you have not trusted, the extension does not run the folder's own build of `vela`; highlighting and `vela` from your PATH or user settings still work.",
+      "restrictedConfigurations": [
+        "vela.path"
+      ]
+    },
+    "virtualWorkspaces": false
+  }
+}

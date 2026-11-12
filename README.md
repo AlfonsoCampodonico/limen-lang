@@ -116,7 +116,7 @@ Neovim:
 vim.lsp.start({ name = "vela", cmd = { "vela", "lsp" }, root_dir = vim.fn.getcwd() })
 ```
 
-With VS Code, any generic LSP client extension works: point it at `vela lsp` for `*.vela` files.
+VS Code: [editors/vscode](editors/vscode) is a local extension with highlighting and the language server. Install it with `editors/vscode/install.sh` (needs Node and the `code` command).
 
 ## Capability rules
 
