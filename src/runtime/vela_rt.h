@@ -1380,14 +1380,14 @@ static WIo Cap_fs_make_dir(WCap *fs, WStr *rel) {
   if (rc != 0) { snprintf(msg, sizeof msg, "fs: `%.*s`: %s", (int)rel->len, rel->data, strerror(errno)); return io_err(2, msg); }
   return io_ok(NULL);
 }
-/* Written out at once, as in the interpreter: a long-running program's
-   output reaches a file or pipe (a log collector) as it prints, not when a
-   buffer fills or the program exits. */
+/* Buffered, so printing many lines costs what it does in C. The buffer is
+   written out whenever the program waits (see w_sched_loop), before stdin
+   is read, and at exit: a long-running program's output reaches a file or
+   pipe as soon as it has printed and gone back to waiting. */
 static void Cap_print(WStr *s, bool nl) {
   flockfile(stdout);
   fwrite(s->data, 1, (size_t)s->len, stdout);
   if (nl) fputc('\n', stdout);
-  fflush(stdout);
   funlockfile(stdout);
 }
 static int64_t Cap_now_ms(void) { struct timeval tv; gettimeofday(&tv, NULL); return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000; }
@@ -1646,6 +1646,9 @@ static void w_sched_loop(WWorker *w, int is_main) {
     if (is_main && __atomic_load_n(&w_main_done, __ATOMIC_ACQUIRE)) return;
     WFiber *f = w_find_work(w);
     if (!f) {
+      /* nothing to run here: write out what was printed before going idle,
+         so output is not held while the program waits */
+      fflush(stdout);
       pthread_mutex_lock(&w_idle_mu);
       int64_t idle = __atomic_add_fetch(&w_nidle, 1, __ATOMIC_SEQ_CST);
       if (__atomic_load_n(&w_queued, __ATOMIC_SEQ_CST) == 0 && !__atomic_load_n(&w_main_done, __ATOMIC_ACQUIRE)) {
@@ -3016,6 +3019,7 @@ static int w_in_fill(void) {
       }
       if (r < 0 || (p.revents & POLLNVAL)) w_in_direct = 1;
     }
+    if (w_in_direct) fflush(stdout); /* a prompt shows before a read that blocks */
     ssize_t n = read(0, tmp, 65536);
     if (n < 0 && errno == EINTR) continue;
     if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {   /* inherited a non-blocking stdin */
