@@ -6510,6 +6510,220 @@ fn main(root: Root) {
     (List.for_all (fun x -> List.mem x ec) [ "User"; "level"; "email"; "name"; "greet"; "hello"; "intro" ])
     (String.concat "," ec);
 
+  (* ---------- pure functions: calls kept across loops, repeated calls reused ---------- *)
+  (* Both backends must print the same as without the optimizations (the
+     interpreter keeps fewer calls); natively each also runs under ASan with
+     the leak check. Covered: loops that run zero times around a call that
+     would panic or never return, a call under a condition that holds only
+     later, an earlier panic in the same iteration winning, arguments that
+     change, kept values mutated, nested loops, return and break while a
+     kept value is held, a caught panic, built-in methods, tasks, and an
+     argument moved into the call. *)
+  let pure_src = {v|struct Point {
+    x: Int,
+    name: Str,
+}
+
+fn table(n: Int) -> List[Int] {
+    let mut t = []
+    for i in 0..<n {
+        t.push(i * i)
+    }
+    t
+}
+
+fn label(p: Point) -> Str {
+    "{p.name}:{p.x}"
+}
+
+fn boom(d: Int) -> List[Int] {
+    let q = 10 / d
+    [q, q]
+}
+
+fn spin(n: Int) -> Int {
+    let mut k = n
+    while k != 0 {
+        k = k + 1
+    }
+    k
+}
+
+fn find(words: List[Str], w: Str) -> Int {
+    for i in 0..<10 {
+        if table(4)[i % 4] == w.len() {
+            return i
+        }
+    }
+    -1
+}
+
+fn kept_then_panic(n: Int) -> Int {
+    let mut total = 0
+    let xs = [1, 2, 3]
+    for i in 0..<n {
+        total = total + table(5)[i % 5]
+        if i == 2 {
+            // the index panic comes first, as written
+            total = total + xs[i + 5] + boom(0)[0]
+        }
+    }
+    total
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    // zero iterations: the panicking and the endless call never run
+    let mut n = 0
+    while n < 0 {
+        out.print("{boom(0)} {spin(1)}")
+        n = n + 1
+    }
+    for i in 0..<0 {
+        out.print("{boom(i)}")
+    }
+    // under a condition that holds only later
+    let mut total = 0
+    for i in 0..<6 {
+        if i > 3 {
+            total = total + boom(5)[0] + table(3).len()
+        }
+    }
+    out.print("cond {total}")
+    // arguments that change, and ones that do not
+    let p = Point { x: 3, name: "p" }
+    let mut s = ""
+    for i in 0..<3 {
+        s = s + label(p) + label(Point { x: i, name: "q" }) + " "
+    }
+    out.print(s)
+    // kept results mutated in the loop: each iteration sees a fresh copy
+    for i in 0..<3 {
+        let mut t = table(3)
+        t.push(i)
+        out.print("{t}")
+    }
+    // nested loops: kept across the outer one, or per outer iteration
+    let mut sum = 0
+    for i in 0..<4 {
+        for j in 0..<4 {
+            sum = sum + table(4)[j] + table(i + 1).len()
+        }
+    }
+    out.print("nested {sum}")
+    // return and break while a kept value is held
+    out.print("find {find(["ab"], "abcd")} {find(["a"], "abcde")}")
+    let mut k = 0
+    while true {
+        let t = table(6)
+        if k == 3 {
+            break
+        }
+        k = k + t.len() - 5
+    }
+    out.print("k {k}")
+    // a panic after a kept value is held, caught
+    out.print("{catch(|| kept_then_panic(10))} {catch(|| kept_then_panic(2))}")
+    // built-in methods
+    let text = "a,b,c"
+    let mut parts = 0
+    for i in 0..<4 {
+        parts = parts + text.split(",").len() + text.to_upper().len()
+    }
+    out.print("parts {parts}")
+    // a kept value handed to tasks
+    let mut acc = 0
+    for i in 0..<3 {
+        let rs = group g {
+            g.go(|| table(3).len() + i)
+        }
+        acc = acc + rs[0]
+    }
+    out.print("tasks {acc}")
+    // an argument made in the loop and moved into the call
+    let mut m = 0
+    for i in 0..<3 {
+        let name = "p" + "q"
+        m = m + label(Point { x: 1, name: name }).len()
+    }
+    out.print("moved {m}")
+}
+|v} in
+  out "pure-kept-calls" pure_src "cond 10\np:3q:0 p:3q:1 p:3q:2 \n[0, 1, 4, 0]\n[0, 1, 4, 1]\n[0, 1, 4, 2]\nnested 96\nfind 2 -1\nk 3\nErr(\"index 7 is out of range for a list of length 3\") Ok(1)\nparts 32\ntasks 12\nmoved 12\n";
+  let cse_src = {v|fn count(xs: List[Int], v: Int) -> Int {
+    let mut n = 0
+    for x in xs {
+        if x == v {
+            n = n + 1
+        }
+    }
+    n
+}
+
+fn tag(s: Str) -> Str {
+    "<{s}>"
+}
+
+fn guarded(out: Stdout, n: Int) -> Int {
+    defer out.print("guarded done")
+    let mut t = 0
+    for i in 0..<n {
+        t = t + count([1, 1, 2], 1)
+    }
+    t
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let mut xs = [1, 2, 1]
+    let a = count(xs, 1)
+    let b = count(xs, 1)
+    xs.push(1)
+    let c = count(xs, 1)
+    let mut v = 2
+    let d = count(xs, v)
+    v = 1
+    let e = count(xs, v)
+    out.print("{a} {b} {c} {d} {e}")
+    let mut s = tag("x")
+    let s2 = tag("x")
+    s = s + "!"
+    out.print("{s} {s2} {tag("x")}")
+    if a > 1 {
+        out.print("{count(xs, 1)} {count(xs, 1)}")
+    }
+    let mut w = 0
+    while w < 3 {
+        w = w + count(xs, 1) - count(xs, 1) + 1
+        xs.push(1)
+    }
+    out.print("w {w} {count(xs, 1)} {guarded(out, 3)}")
+}
+|v} in
+  out "pure-reused-calls" cse_src "2 2 3 1 3\n<x>! <x> <x>\n3 3\nguarded done\nw 3 6 6\n";
+  (* natively the optimizations really happen: slots for kept calls, and
+     main calls `count` six times, not eight *)
+  (let c_of name src =
+     let items, ds, _ = compile name src in
+     if ds = [] then Native.c_source items else ""
+   in
+   let count_sub s sub =
+     let n = String.length s and m = String.length sub in
+     let rec go i acc = if i + m > n then acc else go (i + 1) (if String.sub s i m = sub then acc + 1 else acc) in
+     go 0 0
+   in
+   let kept = count_sub (c_of "pure-kept-c" pure_src) "__builtin_expect(k" in
+   ok "pure-kept-c" (kept >= 10) (sprintf "%d kept calls" kept);
+   let c = c_of "pure-reused-c" cse_src in
+   let main_body =
+     let lines = String.split_on_char '\n' c in
+     let rec from = function [] -> [] | l :: r -> if String.starts_with ~prefix:"static W_Unit wf_main(" l && String.ends_with ~suffix:"{" l then upto r else from r
+     and upto = function [] | "}" :: _ -> [] | l :: r -> l :: upto r in
+     String.concat "\n" (from lines)
+   in
+   let calls = count_sub main_body "wf_count(" in
+   ok "pure-reused-c" (calls = 6) (sprintf "%d calls" calls));
+
   drain ();
   Printf.printf "%d/%d passed\n" (!total - !failed) !total;
   if !failed > 0 then exit 1

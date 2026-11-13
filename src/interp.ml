@@ -178,6 +178,7 @@ type rt = {
   ctors : (string, string) Hashtbl.t; (* variant -> enum, when unambiguous *)
   out : string -> unit;
   grants : grants;
+  pure : (string, bool) Hashtbl.t; (* functions known pure, or not (see keep_pure) *)
 }
 
 (* ---------- printing and comparison ---------- *)
@@ -410,6 +411,120 @@ let settle r =
     r := v;
     v
   | v -> v
+
+(* ---------- pure calls kept across a loop ----------
+   As the native backend keeps a pure call whose arguments do not change in
+   a loop, the interpreter reuses a pure call's result inside a loop when
+   it calls the same function again with the same arguments. Same means the
+   same value (lists, strings and structs are never changed in place once
+   they are values), or an equal number, boolean or short string. The
+   previous result is reused only after a real call, so a loop that never
+   reaches the call never makes it, and a call that panics panics again
+   (it is never recorded). Only the calls a loop makes in its own function
+   are kept, from the outermost loop's start to its end, and only the last
+   call of each function: this is not memoization. *)
+
+(* The last call of a function in the running loop. [keep] is false for a
+   function that is not pure, or once it missed many times in a row. *)
+type entry = { mutable keep : bool; mutable args : value list; mutable result : value option; mutable misses : int }
+
+type kept = { mutable calls : (fn_decl * entry) list; mutable methods : (string * entry) list }
+
+let keeping : kept option ref = ref None
+
+(* Built-in methods worth keeping: they build a value or walk a whole one. *)
+let heavy_methods =
+  [ "split"; "lines"; "trim"; "to_upper"; "to_lower"; "replace"; "chars"; "bytes"; "contains"; "starts_with";
+    "ends_with"; "index_of"; "slice"; "parse_int"; "parse_float"; "reverse"; "sort"; "join"; "sum"; "take"; "skip";
+    "to_list" ]
+
+let same_value a b =
+  a == b
+  ||
+  match (a, b) with
+  | VInt x, VInt y -> Int64.equal x y
+  | VFloat x, VFloat y -> Int64.equal (Int64.bits_of_float x) (Int64.bits_of_float y)
+  | VBool x, VBool y -> x = y
+  | VUnit, VUnit -> true
+  | VStr x, VStr y | VBytes x, VBytes y -> String.length x <= 64 && String.equal x y
+  | _ -> false
+
+let new_entry keep = { keep; args = []; result = None; misses = 0 }
+
+(* The previous result, if the function's last call had the same arguments. *)
+let kept en avs =
+  if not en.keep then None
+  else
+    match en.result with
+    | Some _ as r when List.length avs = List.length en.args && List.for_all2 same_value avs en.args -> en.misses <- 0; r
+    | _ -> None
+
+(* Record a real call's result. A function whose arguments keep changing
+   stops being compared. *)
+let record en avs v =
+  if en.keep then begin
+    en.args <- avs;
+    en.result <- Some v;
+    en.misses <- en.misses + 1;
+    if en.misses > 16 then en.keep <- false
+  end;
+  v
+
+let in_loop f =
+  match !keeping with
+  | Some _ -> f ()
+  | None -> (
+    keeping := Some { calls = []; methods = [] };
+    match f () with
+    | v -> keeping := None; v
+    | exception e -> keeping := None; raise e)
+
+(* A type whose values can only be computed with: no capability, function,
+   channel or group in it, and fully known (not a type parameter). *)
+let rec plain_type t =
+  match Types.repr t with
+  | Types.TInt | TFloat | TBool | TUnit | TStr | TBytes | TDyn _ -> true
+  | TList a | TArray (a, _) -> plain_type a
+  | TMap (k, v) -> plain_type k && plain_type v
+  | TNamed (_, args) -> List.for_all plain_type args
+  | TFn _ | TCap _ | TChan _ | TGroup _ | TParam _ | TVar _ | TLen _ | TErr -> false
+
+(* The names a function's body may call, and whether it starts tasks,
+   selects or makes channels (the ways a computation on plain values could
+   depend on timing). *)
+let body_refs (d : fn_decl) =
+  let names = ref [] and racy = ref false in
+  let rec ex (e : expr) =
+    match e.edesc with
+    | EInt _ | EFloat _ | EBool _ | EUnit -> ()
+    | EVar n -> if n = "channel" then racy := true else names := n :: !names
+    | EStr ps -> List.iter (function SPExpr x -> ex x | SPLit _ -> ()) ps
+    | EList es -> List.iter ex es
+    | EBin (_, a, b) | EIndex (a, b) | EPipe (a, b) -> ex a; ex b
+    | EUn (_, a) | ETry (a, None) | EField (a, _, _) | ENamed (_, _, a) | EDyn (a, _) -> ex a
+    | ETry (a, Some c) -> ex a; ex c
+    | ECall (c, args) -> ex c; List.iter ex args
+    | EMethod (r, m, _, args) -> names := ("::" ^ m) :: !names; ex r; List.iter ex args
+    | EIf (c, b, eo) -> ex c; blk b; Option.iter ex eo
+    | EMatch (x, arms) -> ex x; List.iter (fun (a : arm) -> Option.iter ex a.aguard; ex a.abody) arms
+    | EBlock b -> blk b
+    | EClosure (_, body) -> ex body
+    | EStruct (_, _, fs) -> List.iter (fun (_, _, x) -> ex x) fs
+    | EWith (b, fs) -> ex b; List.iter (fun (_, _, x) -> ex x) fs
+    | ESafe (b, _, rest, _) -> ex b; ex rest
+    | EGroup _ | ESelect _ -> racy := true
+  and blk (b : block) = List.iter st b.stmts; Option.iter ex b.tail
+  and st (s : stmt) =
+    match s.sdesc with
+    | SLet (_, _, _, _, e) | SExpr e | SReturn (Some e) | SLetPat (_, e) -> ex e
+    | SAssign (l, r) -> ex l; ex r
+    | SReturn None | SBreak | SContinue -> ()
+    | SWhile (c, b) -> ex c; blk b
+    | SFor (_, _, e, b) | SForPat (_, e, b) -> ex e; blk b
+    | SDefer b -> blk b
+  in
+  blk d.fn_body;
+  (!names, !racy)
 
 (* The list a variable is building, read without settling it: for reads
    that cannot keep the list (an element, its length). *)
@@ -1505,9 +1620,24 @@ let rec eval rt env e : value =
     match eval rt env a with VInt n -> VInt (Int64.neg n) | VFloat x -> VFloat (-.x) | _ -> failwith "internal: neg")
   | EUn (Not, a) -> VBool (not (as_bool (eval rt env a)))
   | ENamed _ -> failwith "internal: the checker puts named arguments in order"
-  | ECall ({ ecallee = Some d; _ }, args) when d.fn_foreign = None ->
+  | ECall ({ ecallee = Some d; _ }, args) when d.fn_foreign = None -> (
     (* a call to a known top-level function: no name to look up *)
-    call_fn rt d (List.map (eval rt env) args)
+    let avs = List.map (eval rt env) args in
+    match !keeping with
+    | Some k -> (
+      let en =
+        match List.assq_opt d k.calls with
+        | Some en -> en
+        | None ->
+          let keep = d.fn_gen = [] && List.for_all (fun (a : expr) -> plain_type a.ety) args && pure_fn rt d in
+          let en = new_entry keep in
+          k.calls <- (d, en) :: k.calls;
+          en
+      in
+      match kept en avs with
+      | Some v -> v
+      | None -> record en avs (call_fn rt d avs))
+    | _ -> call_fn rt d avs)
   | ECall (c, args) ->
     let fv = eval rt env c in
     let avs = List.map (eval rt env) args in
@@ -1550,10 +1680,22 @@ let rec eval rt env e : value =
       let rv = VList (Array.sub b.items 0 b.len) in
       let avs = List.map (eval rt env) args in
       call_method rt rv name avs e.espan
-    | None ->
+    | None -> (
       let rv = eval rt env recv in
       let avs = List.map (eval rt env) args in
-      call_method rt rv name avs e.espan)
+      match (!keeping, rv) with
+      | Some k, (VStr _ | VBytes _ | VList _) when List.mem name heavy_methods ->
+        let en =
+          match List.assoc_opt name k.methods with
+          | Some en -> en
+          | None ->
+            let en = new_entry true in
+            k.methods <- (name, en) :: k.methods;
+            en
+        in
+        let avs' = rv :: avs in
+        (match kept en avs' with Some v -> v | None -> record en avs' (call_method rt rv name avs e.espan))
+      | _ -> call_method rt rv name avs e.espan))
   | EField ({ edesc = EVar en; _ }, name, _) when find_var env en = None && Hashtbl.mem rt.enums en ->
     ctor_value rt en name
   | EField (recv, name, _) -> field rt (eval rt env recv) name
@@ -1858,7 +2000,39 @@ and apply rt fv args sp =
 and call_fn rt d args =
   let sc = scope () in
   List.iter2 (fun p a -> bind sc p.prm_name a) d.fn_params args;
-  try eval_block rt [ sc ] d.fn_body with Return v -> v
+  match !keeping with
+  | None -> ( try eval_block rt [ sc ] d.fn_body with Return v -> v)
+  | saved -> (
+    (* a call starts afresh: only a loop's own calls are kept *)
+    keeping := None;
+    match eval_block rt [ sc ] d.fn_body with
+    | v -> keeping := saved; v
+    | exception Return v -> keeping := saved; v
+    | exception e -> keeping := saved; raise e)
+
+(* Pure: no task, select or channel anywhere it can reach, no C function,
+   no interface bounds; together with plain argument types at the call,
+   its result depends on its arguments alone. Recursion counts as pure
+   while being decided. *)
+and pure_fn rt (d : fn_decl) =
+  match Hashtbl.find_opt rt.pure d.fn_name with
+  | Some b -> b
+  | None ->
+    Hashtbl.replace rt.pure d.fn_name true;
+    let b =
+      d.fn_foreign = None && d.fn_bounds = []
+      &&
+      let names, racy = body_refs d in
+      (not racy)
+      && List.for_all
+           (fun n ->
+             if String.starts_with ~prefix:"::" n then
+               Hashtbl.fold (fun k d' ok -> ok && ((not (String.ends_with ~suffix:n k)) || pure_fn rt d')) rt.fns true
+             else match Hashtbl.find_opt rt.fns n with Some d' -> pure_fn rt d' | None -> true)
+           names
+    in
+    Hashtbl.replace rt.pure d.fn_name b;
+    b
 
 and eval_block rt env b =
   (* only a `let` directly in the block binds into its own scope; a block
@@ -1893,6 +2067,7 @@ and exec rt env s =
   | SExpr e -> ignore (eval rt env e)
   | SReturn eo -> raise (Return (match eo with Some e -> eval rt env e | None -> VUnit))
   | SWhile (c, b) -> (
+    in_loop @@ fun () ->
     try
       while as_bool (eval rt env c) do
         try ignore (eval_block rt env b) with Continue_ -> ()
@@ -1902,6 +2077,7 @@ and exec rt env s =
     let lo = match eval rt env lo with VInt x -> x | _ -> failwith "internal: range" in
     let hi = match eval rt env hi with VInt x -> x | _ -> failwith "internal: range" in
     let i = ref lo in
+    in_loop @@ fun () ->
     try
       while !i < hi do
         let sc = scope_of n (VInt !i) in
@@ -1912,6 +2088,7 @@ and exec rt env s =
   | SFor (n, _, e, b) -> (
     match eval rt env e with
     | VList arr -> (
+      in_loop @@ fun () ->
       try
         Array.iter
           (fun v ->
@@ -2248,7 +2425,7 @@ let run ?(before_main = fun () -> ()) ~out ~grants (user_items : item list) : (v
   seed_rand grants.seed;
   let rt =
     { fns = Hashtbl.create 16; structs = Hashtbl.create 16; enums = Hashtbl.create 16;
-      ctors = Hashtbl.create 16; out; grants }
+      ctors = Hashtbl.create 16; out; grants; pure = Hashtbl.create 16 }
   in
   let owners = Hashtbl.create 16 in
   List.iter
@@ -2298,7 +2475,7 @@ let run ?(before_main = fun () -> ()) ~out ~grants (user_items : item list) : (v
 let make_rt ~out ~grants (user_items : item list) =
   let rt =
     { fns = Hashtbl.create 16; structs = Hashtbl.create 16; enums = Hashtbl.create 16;
-      ctors = Hashtbl.create 16; out; grants }
+      ctors = Hashtbl.create 16; out; grants; pure = Hashtbl.create 16 }
   in
   let owners = Hashtbl.create 16 in
   List.iter

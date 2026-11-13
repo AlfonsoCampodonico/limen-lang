@@ -677,7 +677,7 @@ The rules:
 1. Programs cannot create capabilities. They come only from `root`.
 2. Attenuation only narrows. `net.only(host)` returns a `Net` limited to that host, and it is empty if you didn't hold that host. `fs.under(dir)` limits to a subdirectory; `fs.read_only()` removes writing. `exec.only(program)` limits `Exec` to one program; `foreign.only(lib)` limits `Foreign` to one library.
 3. There is no ambient I/O. Using `print`, `open`, `fetch` and similar names is error E0302, which explains the capability to use instead.
-4. A function whose parameters contain no capability and no function type is **pure**: it can only compute (and panic). `vela caps FILE` lists each function's authority.
+4. A function whose parameters contain no capability and no function type is **pure**: it can only compute (and panic). `vela caps FILE` lists each function's authority. Section 14 says what the compiler does with pure calls. It never runs them in parallel on its own: concurrency stays visible and cancellable in a `group`, where you write it.
 5. Enforcement at runtime:
    - `Net`: http and https URLs only, host allowlist, redirects not followed. `Net.connect` and `Net.connect_tls` use the same allowlist. TLS certificates are always verified (section 10).
    - `Exec`: the program name must match a grant exactly (`git` and `/usr/bin/git` are different grants), or the grant is `*`. Arguments are passed as a list, never through a shell. The child gets `/dev/null` as stdin, the working directory, `PATH`, and only the environment variables granted with `--grant env=`. A program name without `/` is looked up in `PATH`, as a shell would. Granting a program grants everything that program can do with any arguments, so `exec=sh` is as good as every other grant.
@@ -1255,7 +1255,7 @@ bench "sum to 100" {
 - `bench "name" { ... }` is a top-level item like `test`, and can take `fs: Fs` and `clock: Clock` the same way (one directory for the whole run). Its body is one operation.
 - `vela test FILE` skips benchmarks. `vela test FILE --bench` runs the tests and then every benchmark, always as native code: each benchmark runs in its own process, first once, then with more and more iterations (at most 100 times more per round), until one round takes at least the time budget, one second by default. `--bench-time 200ms` (or `2s`, `1m`) sets the budget, and `--bench-time 100x` runs exactly 100 iterations.
 - It reports the iterations of the last round, the time per operation, and the runtime's allocations per operation (strings, lists, maps, closures and other objects made, whether or not they were freed). A panic fails the benchmark like a test.
-- The value of the body's last expression is passed to `keep`, so the C compiler cannot drop the work that made it. Inside a loop, call `keep(x)` on values that are otherwise unused. A constant result (`1 + 2`) is still computed at compile time, as in any program.
+- The value of the body's last expression is passed to `keep`, so the C compiler cannot drop the work that made it. Inside a loop, call `keep(x)` on values that are otherwise unused. A constant result (`1 + 2`) is still computed at compile time, as in any program, and a pure call whose arguments do not change in a loop is made once (section 14): vary the arguments to time each call.
 - Benchmark names must be unique among benchmarks (E0106); a test and a benchmark may share a name.
 
 ## 13. How values print
@@ -1277,6 +1277,13 @@ String interpolation and `to_str()` use these rules. At the top level a `Str` pr
 ## 14. Optimizations that affect observable behavior
 
 The native backend may run a chain like `xs.filter(p).map(f).fold(z, g)` as one fused loop, interleaving the stages per element. It does this only when the earlier stages are pure closure literals, which capture no capability and no function. The only observable difference is **which panic happens first** when more than one stage would panic. Everything else (results, output order, values) is the same.
+
+Other uses of purity change nothing a program can observe. A pure call (to a pure function, or a built-in method such as `split` or `to_upper`) gives the same result for the same arguments, so:
+
+- **In a loop**, a pure call whose arguments do not change in the loop is made the first time it is reached, and later iterations reuse its result. A loop that runs zero times never makes the call, a call under an `if` runs only once the condition holds, and a call that panics or never returns does so at the same point as before.
+- **In a block**, a second call with the same arguments, where nothing they name was reassigned or changed in between, reuses the first call's result.
+
+The interpreter reuses a pure call's result in a loop when the same function is called again with the same values. Pure calls on constants are not evaluated at compile time, beyond what the C compiler does itself, and results are never remembered across calls: write a cache yourself, as a `Map` you pass along, where one is worth it.
 
 ## 15. Errors
 
@@ -1721,4 +1728,4 @@ fn main(root: Root) -> Result[(), IoError] {
 
 ## 20. Not yet
 
-A package registry and a Cranelift backend. Foreign functions have no callbacks from C, no variadic functions and no structs by value. See the design doc's Known gaps for the full list.
+A package registry, and a native backend other than C (Cranelift was decided against: native code is C compiled by the system's compiler). See the design doc's Known gaps for the full list.

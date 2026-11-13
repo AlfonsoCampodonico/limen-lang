@@ -41,6 +41,9 @@ type ctx = {
       (* variables of the current function a `defer` needs volatile: a panic
          longjmps back into the function, and the deferred body (and the
          cleanups after it) must see their latest values and owned flags *)
+  mutable pure : (string, Pure.info) Hashtbl.t; (* the program's pure functions *)
+  mutable plan : Pure.plan; (* pure calls the current function keeps across a loop *)
+  mutable slotted : I.stmt list list; (* loops whose slots are being emitted *)
 }
 
 let is_enum c = function TNamed (n, _) -> Hashtbl.mem c.g.enums n | _ -> false
@@ -866,6 +869,32 @@ let set_owned c line (v : I.var) on = if owns_memory c v.ty then line (sprintf "
 let release_moved c line atoms =
   List.iter (function I.V (v : I.var) -> set_owned c line v false | _ -> ()) atoms
 
+(* The value of a pure call kept across a loop (Pure.plan): the first time,
+   make the call and keep a reference in its slot; after that, take the
+   kept value and release what the call would have consumed. *)
+let kept_or c out ind (v : I.var) r =
+  let line s = Buffer.add_string out (ind ^ s ^ "\n") in
+  match Hashtbl.find_opt c.plan.kept v.id with
+  | None ->
+    release_moved c line (I.consumed r);
+    rhs_into c out ind (var v) v.ty r
+  | Some sl ->
+    let k = sprintf "k%d_" sl.sid in
+    line (sprintf "if (__builtin_expect(%s_o, 1)) {" k);
+    List.iter
+      (function
+        | I.V (x : I.var) when not (is_scalar x.ty) ->
+          set_owned c (fun s -> line ("  " ^ s)) x false;
+          line (sprintf "  %s_drop(%s);" (cname c x.ty) (var x))
+        | _ -> ())
+      (I.consumed r);
+    line (sprintf "  %s = %s;" (var v) (dup_of c v.ty k));
+    line "} else {";
+    release_moved c (fun s -> line ("  " ^ s)) (I.consumed r);
+    rhs_into c out (ind ^ "  ") (var v) v.ty r;
+    line (sprintf "  %s = %s; %s_o = 1;" k (dup_of c v.ty (var v)) k);
+    line "}"
+
 let scope_counter = ref 0
 
 let rec stmts c out ind (ss : I.stmt list) = List.iter (stmt c out ind) ss
@@ -876,15 +905,13 @@ and stmt c out ind (s : I.stmt) =
   | I.Let (v, r) ->
     line (sprintf "%s%s %s;" (ctype c v.ty) (vol c v) (var v));
     cell_decl c line v false;
-    release_moved c line (I.consumed r);
-    rhs_into c out ind (var v) v.ty r;
+    kept_or c out ind v r;
     set_owned c line v true
   | I.Decl v ->
     line (sprintf "%s%s %s;" (ctype c v.ty) (vol c v) (var v));
     cell_decl c line v false
   | I.Init (v, r) ->
-    release_moved c line (I.consumed r);
-    rhs_into c out ind (var v) v.ty r;
+    kept_or c out ind v r;
     set_owned c line v true
   | I.Set (v, r, flag) ->
     release_moved c line (I.consumed r);
@@ -948,6 +975,24 @@ and stmt c out ind (s : I.stmt) =
       line "} else {";
       stmts c out (ind ^ "  ") b
     end;
+    line "}"
+  | I.Loop body when List.exists (fun (b, _) -> b == body) c.plan.at_loop && not (List.memq body c.slotted) ->
+    (* Slots for the pure calls kept across this loop: filled the first
+       time each call runs, released when the loop is left by any way. *)
+    let slots = snd (List.find (fun (b, _) -> b == body) c.plan.at_loop) in
+    c.slotted <- body :: c.slotted;
+    line "{";
+    List.iter
+      (fun (sl : Pure.slot) ->
+        let k = sprintf "k%d_" sl.sid in
+        line (sprintf "  %s %s; uint8_t %s_o = 0;" (ctype c sl.sty) k k);
+        if owns_memory c sl.sty then begin
+          if not (List.exists (fun t -> cname c t = cname c sl.sty) c.cell_tys) then c.cell_tys <- c.cell_tys @ [ sl.sty ];
+          line (sprintf "  WCl %s_cl __attribute__((cleanup(w_cl_run))) = { (void*)&%s, (uint8_t*)&%s_o, w_dp_%s };" k k k (cname c sl.sty))
+        end)
+      slots;
+    stmt c out (ind ^ "  ") s;
+    c.slotted <- List.tl c.slotted;
     line "}"
   | I.Loop body ->
     (* A list that the loop mutates but never shares (no retain, no move,
@@ -1127,6 +1172,7 @@ let guard_vols (body : I.stmt list) =
 
 let fn_body c out (f : I.fn) =
   c.vols <- guard_vols f.body;
+  c.plan <- Pure.plan c.pure f;
   Buffer.add_string out (signature c f ^ " {\n");
   let line s = Buffer.add_string out ("  " ^ s ^ "\n") in
   (* parameters are owned by the function *)
@@ -1141,7 +1187,8 @@ let fn_body c out (f : I.fn) =
   end;
   stmts c out "  " f.body;
   Buffer.add_string out "  w_unreachable();\n}\n\n";
-  c.vols <- []
+  c.vols <- [];
+  c.plan <- Pure.no_plan ()
 
 (* ---------- type definitions ---------- *)
 
@@ -1509,7 +1556,8 @@ let program (g : Lower.gctx) (prog : I.program) : string =
   let c =
     { g; names = Hashtbl.create 32; types = []; lits = Hashtbl.create 32; lit_order = []; boxed = [];
       envs = Hashtbl.create 16; uniq = []; task_tys = []; inrange = []; chan_tys = []; dyns = []; cell_tys = []; vols = [];
-      cmp_tys = []; sort_tys = []; hash_tys = []; csyms = []; cstructs = []; cbs = [] }
+      cmp_tys = []; sort_tys = []; hash_tys = []; csyms = []; cstructs = []; cbs = [];
+      pure = Pure.analyse prog; plan = Pure.no_plan (); slotted = [] }
   in
   (* bodies first: this discovers every type and literal *)
   let bodies = Buffer.create 65536 in

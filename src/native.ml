@@ -2,7 +2,7 @@
 
 let c_source ?(tests = false) items =
   let prog, g = Lower.lower_program ~tests items in
-  let prog = Own.program prog in
+  let prog = Own.program (Pure.cse prog) in
   Cgen.program g prog
 
 (* Libraries named by `foreign "lib"` blocks, linked as -l<lib>. The C
