@@ -15,6 +15,9 @@ usage:
   vela lsp                (language server on stdin/stdout)
   vela mcp                (MCP server for coding agents, on stdin/stdout)
   vela spec               (print the language specification)
+  vela search [WORDS...]  (search the package index named by VELA_INDEX)
+  vela add NAME[@VERSION] (add a package from the index to vela.toml, with the caps it declares)
+  vela index entry [DIR]  (print the index entry for the package's current tag)
 
 Stdout, Stdin, Clock and Rand are always granted. Net, Fs, Listen, Env, Exec and Foreign exist only
 when granted, by --grant or by the [grants] table of vela.toml. --seed makes Rand repeatable; arguments after -- are root.args(). The process runs in an operating-system sandbox
@@ -479,6 +482,10 @@ let cmd_run file grant_args prog_args =
     end;
     exit 1
 
+(* The package index commands fail with one plain sentence. *)
+let registry f =
+  try f () with Registry.Failed m -> prerr_endline ("vela: " ^ m); exit 1
+
 let () =
   match List.tl (Array.to_list Sys.argv) with
   | [ "check"; file ] -> cmd_check file false
@@ -488,6 +495,12 @@ let () =
   | [ "lsp" ] -> Lsp.serve ()
   | [ "mcp" ] -> Mcp.serve ()
   | [ "spec" ] -> print_string Spec_text.text
+  | "search" :: words -> registry (fun () -> Registry.search words)
+  | [ "add"; spec ] -> registry (fun () -> Registry.add spec)
+  | "add" :: _ -> die_usage "add takes one NAME or NAME@VERSION"
+  | [ "index"; "entry" ] -> registry (fun () -> Registry.entry (Sys.getcwd ()))
+  | [ "index"; "entry"; dir ] -> registry (fun () -> Registry.entry dir)
+  | "index" :: _ -> die_usage "index takes `entry`, and optionally the package's directory"
   | "test" :: rest ->
     let rec go file (o : test_opts) = function
       | "--native" :: r -> go file { o with native = true } r
