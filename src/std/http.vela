@@ -662,9 +662,10 @@ pub fn serve_stream(c: Conn, handler: fn(Request, Conn) -> Result[(), IoError]) 
 
 // Accept `count` connections, each served by `serve_conn` in its own task,
 // and return how many requests were answered. The handler gets no
-// capabilities unless its closure captures them.
+// capabilities unless its closure captures them. What handlers print goes
+// out as they print it: a connection's output does not wait for earlier ones.
 pub fn serve(l: Listener, count: Int, handler: fn(Request) -> Response) -> Int {
-    let answered = group g {
+    let answered = group g interleaved {
         let mut i = 0
         while i < count {
             match l.accept() {
@@ -679,10 +680,11 @@ pub fn serve(l: Listener, count: Int, handler: fn(Request) -> Response) -> Int {
 
 // Accept connections until accepting fails, typically because the listener
 // was closed, running `f` on each in its own task. Waits for those tasks,
-// then returns the error that stopped it.
+// then returns the error that stopped it. Output from the tasks goes out as
+// they print it, as in `serve`.
 pub fn accept_forever(l: Listener, f: fn(Conn) -> Int) -> IoError {
     let mut stop = Failed("")
-    let _ = group g {
+    let _ = group g interleaved {
         let mut open = true
         while open {
             match l.accept() {

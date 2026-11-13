@@ -29,7 +29,7 @@ fn parse_names(body: Str) -> List[Str] {   // no capabilities: cannot do I/O
 - **Comments:** `//` to the end of the line. There are no block comments.
 - **Doc comments:** the `//` lines directly above an item, a struct field, an enum variant or an interface method, with no blank line in between, document it. The comment block at the very top of a file, followed by a blank line, documents the module. `vela doc` reads them; there is no special marker.
 - **Identifiers:** `[A-Za-z_][A-Za-z0-9_]*`. By convention types and enum variants start with an uppercase letter, everything else lowercase. Patterns rely on this (section 7).
-- **Keywords:** `fn let mut if else match for in while return struct enum true false group break continue pub use interface dyn select defer`. `type`, `test`, `bench`, `foreign`, `until` and `with` are words only where they start their construct, so they stay usable as names: a field can be called `type`.
+- **Keywords:** `fn let mut if else match for in while return struct enum true false group break continue pub use interface dyn select defer`. `type`, `test`, `bench`, `foreign`, `until`, `interleaved` and `with` are words only where they start their construct, so they stay usable as names: a field can be called `type`.
 - **Integers:** decimal digits, `_` allowed as a separator (`1_000_000`). A literal must fit in 64 bits: up to `9223372036854775807` (E0005).
 - **Floats:** digits with a fraction (`1.5`), an exponent (`1e9`, `2.5E-3`), or both. `_` is allowed. There is no leading-dot form (`.5`).
 - **Strings:** `"..."`, may span lines. Escapes: `\n \t \r \\ \" \{ \} \0`. Any other escape is error E0006.
@@ -815,9 +815,35 @@ let results = group g {
 - `g` can only be used as `g.go(...)` directly in the body. It cannot be stored, passed, returned, or used inside a closure (E0310).
 - The body cannot leave early with `return` or `?` (E0311), and `break` and `continue` cannot target loops outside the group.
 - Tasks share data by value, so there are no data races. A task reaches the world only through capabilities its closure captured. Spawning is not a capability.
-- Tasks are lightweight: natively each is a fiber with a small stack, scheduled on one worker thread per core (`VELA_THREADS` overrides this), and a task waiting on a group, a channel, a socket, stdin or `clock.sleep(ms)` parks without blocking a thread. The interpreter runs tasks as coroutines. Output printed by tasks may interleave differently between the two.
+- Tasks are lightweight: natively each is a fiber with a small stack, scheduled on one worker thread per core (`VELA_THREADS` overrides this), and a task waiting on a group, a channel, a socket, stdin or `clock.sleep(ms)` parks without blocking a thread. The interpreter runs tasks as coroutines. What tasks print comes out in the same order in both (below).
 - If every task is waiting and nothing can wake one (no socket and no timer can), the program panics with `all tasks are blocked (deadlock)` instead of hanging.
 - A panic in a task ends only that task. The group still waits for the others, then passes the first panic on (section 15).
+
+### Output order
+
+What a group's tasks print does not depend on how they are scheduled: the group's output reads as if its body ran first and then each task, one after another, in the order they were started.
+
+```
+let _ = group g {
+    for (name, ms) in [("slow", 50), ("fast", 0)] {
+        g.go(|| {
+            clock.sleep(ms)
+            out.print("{name} done")
+        })
+    }
+    out.print("started")
+}
+// started
+// slow done
+// fast done
+```
+
+- The body prints directly, like code outside any group. A task's output is held until the body has ended and every task started before it has finished; then what it holds is written, and from then on it prints directly. So the first unfinished task streams while the later ones wait their turn.
+- Groups nest: a group inside a task is ordered within that task's output.
+- A task stopped by a panic or by its group's deadline still has its output written in its turn, before the group passes the panic on. A program that ends with an uncaught panic or a deadlock first writes everything still held, innermost groups first, then the message on stderr. Nothing printed is lost.
+- `group g interleaved { body }` (with a deadline, `group g interleaved until clock.after(ms) { body }`) turns this off: its tasks print directly, as the body does, so their output interleaves in the order it happens. Use it for tasks that run until stopped or log as they go (a server's connections, watchers), where waiting for earlier tasks would hold their output back for as long as those run. The `http` module's servers use it.
+- Held output is limited to 4 MiB for the whole program. A print that would go past it makes its group give up order: what the group holds is written at once, in start order, and its tasks print directly from then on, as if it were `interleaved`. Reading `Stdin` does the same for every group holding the reading task's output, so a prompt shows before the program waits for the answer.
+- In every case each `print` and `write` reaches stdout whole, never mixed with another task's. Stderr, where panics and `error:` go, is never held.
 
 ### Channels
 
@@ -1406,7 +1432,7 @@ primary    = INT | FLOAT | STRING | "true" | "false"
            | "match" expr_ns "{" { pattern [ "if" expr ] "=>" expr ( "," | NL ) } "}"
            | "select" "{" { selarm ( "," | NL ) } "}"
            | "|" [ cparam { "," cparam } ] "|" expr | "||" expr
-           | "group" IDENT [ "until" expr ] block ;   (* until clock.after(ms) *)
+           | "group" IDENT [ "interleaved" ] [ "until" expr ] block ;   (* until clock.after(ms) *)
 selarm     = ( IDENT "=" expr | expr | "_" ) [ "if" expr ] "=>" expr ;
                                                 (* ch.recv(), ch.send(v) or clock.after(ms) *)
 init       = IDENT [ ":" expr ] ;
@@ -1565,11 +1591,11 @@ HTTP/1.1, plain or over TLS. The server keeps connections alive between requests
 | `get(net, url)`, `post(net, url, content_type, body)`, `request(net, method, url, headers, body)` | `Result[Response, IoError]`; `http://host[:port]/path` and `https://host[:port]/path` URLs, chunked responses decoded, one connection per request |
 | `request_fold(net, method, url, headers, body, init, f)` | `Result[(Response, T), IoError]`: the body is passed to `f: fn(T, Str) -> T` piece by piece as it arrives instead of being held in memory; the response comes back with an empty body |
 | `request_lines(net, method, url, headers, body, f)` | `Result[Response, IoError]`: for a stream that may never end (a Kubernetes watch, server-sent events, a log follow), each line of a 2xx body is passed to `f: fn(Str) -> Bool` as soon as it has arrived, without its `\n` or `\r\n`; `f` returns `false` to stop, and the connection is closed. Any other status is returned with its whole body, and `f` is not called |
-| `serve_forever(listener, handler) -> IoError` | serve every connection in its own task until the listener is closed (by another task holding it) or fails; returns that error |
+| `serve_forever(listener, handler) -> IoError` | serve every connection in its own task until the listener is closed (by another task holding it) or fails; returns that error. The tasks are an `interleaved` group (section 10): what a handler prints goes out at once |
 | `serve(listener, count, handler) -> Int` | the same for `count` connections; returns how many requests were answered |
 | `serve_conn(conn, handler) -> Int` | answer requests on one connection until the client closes it or asks to (`Connection: close`, or HTTP/1.0 without keep-alive); 400 and close on a malformed request, 500 if the handler panics, headers only for HEAD |
 | `handle(conn, handler) -> Bool` | answer one request, then close |
-| `accept_forever(listener, f) -> IoError` | run `f: fn(Conn) -> Int` on each accepted connection in its own task, until accepting fails |
+| `accept_forever(listener, f) -> IoError` | run `f: fn(Conn) -> Int` on each accepted connection in its own task, until accepting fails; an `interleaved` group too |
 | `serve_stream(conn, handler) -> Int` | like `serve_conn` for a handler `fn(Request, Conn) -> Result[(), IoError]` that writes its own response; an error or panic closes the connection |
 | `write_head(conn, status, headers)`, `write_chunk(conn, piece)`, `end_body(conn)` | write a response whose body follows in pieces (`Transfer-Encoding: chunked`) |
 | `read_request(conn)`, `write_response(conn, r)` | one message on a connection; `write_response` says the connection will close |
