@@ -697,7 +697,7 @@ foreign "sqlite3" {
 }
 ```
 
-Calling one takes a `Foreign` capability first, then the other arguments: `sqlite3_libversion(root.foreign)`. Each call checks that the `Foreign` value grants the library (`--grant foreign=sqlite3`), and panics if not. So C is reachable only from code that was handed `Foreign`, `vela caps` lists such functions, and a package dependency can use a foreign block only if the program names it in `[trust] foreign = [...]` in vela.toml (section 18). The library name is the `-l` name: `foreign "sqlite3"` links `-lsqlite3` natively and loads `libsqlite3.dylib` (macOS) or `libsqlite3.so` in the interpreter; `foreign "c"` is the C library itself, which is always there. The function name is the C symbol. Declarations are one per line; `pub fn` exports one from a module.
+Calling one takes a `Foreign` capability first, then the other arguments: `sqlite3_libversion(root.foreign)`. Each call checks that the `Foreign` value grants the library (`--grant foreign=sqlite3`), and panics if not. So C is reachable only from code that was handed `Foreign`, `vela caps` lists such functions, and a package dependency can use a foreign block only if the program names it in `[trust] foreign = [...]` in vela.toml (section 18). The library name is the `-l` name: `foreign "sqlite3"` links `-lsqlite3` natively and loads `libsqlite3.dylib` (macOS) or `libsqlite3.so` in the interpreter; `foreign "c"` is the C library itself, which is always there. The function name is the C symbol, unless the declaration names another after its signature: `fn print_int(format: Str, ..., n: Int) -> Int32 = "printf"`. Declarations are one per line; `pub fn` exports one from a module.
 
 The types that cross the boundary:
 
@@ -711,8 +711,52 @@ The types that cross the boundary:
 | `Bytes` | `const void *` | the bytes; pass the length yourself |
 | `Handle` | `void *` | an opaque pointer, `Handle { addr: Int }` in Vela; `addr == 0` is NULL |
 | `Out[T]` | `T *` | an out-parameter of `Int`, `Int32`, `Float` or `Handle`: C writes it, Vela returns it |
+| a C struct | `struct { ... }` | declared in the foreign block, passed and returned by value (below) |
+| `fn(A, B) -> R` | a pointer to a function | a callback: a top-level Vela function C calls during the call (below) |
 
 The result is one of the same types (not `Bytes`: C gives no length) or nothing. A `Str` result is copied from a NUL-terminated C string at once (NULL gives `""`); C keeps ownership of the original. `Out` parameters are not passed by the caller: they come back after the result, so `sqlite3_open_v2` above has the Vela type `fn(Foreign, Str, Int, Int) -> (Int, Handle)`, called as `let (rc, db) = sqlite3_open_v2(f, path, flags, 0)`. A function with no result and one `Out` returns that value alone.
+
+**Variadic functions.** C cannot tell what a variadic function was passed, so a declaration fixes it: the parameters before `...` are the C function's own, and the ones after it are the variadic arguments this declaration passes. A C function called with several shapes gets one declaration per shape, each with its own Vela name:
+
+```
+foreign "c" {
+    fn snprintf(buf: Handle, size: Int, format: Str, ..., n: Int32, x: Float) -> Int32
+    fn format_int(buf: Handle, size: Int, format: Str, ..., n: Int) -> Int32 = "snprintf"
+}
+```
+
+C's default promotions apply to the arguments after `...`: `Int32` and `Bool` go as `int`, `Float` as `double`, `Int` as `int64_t` (`%lld`, not `%d`). Before `...` come 1 to 6 integer-like parameters (no `Float` or struct), after it at most 8 of `Int`, `Int32`, `Float`, `Bool`, `Str`, `Bytes` and `Handle`; a variadic function does not return a struct.
+
+**Structs by value.** A `struct` in a foreign block is a C struct, with fields of `Int`, `Int32`, `Float`, `Bool` and `Handle` (C's `int64_t`, `int32_t`, `double`, `int` and `void *`) laid out as C lays them out, 1 to 8 of them. To Vela it is an ordinary struct of the module, with `Int32` fields as `Int`s: built with `Div { quot: 1, rem: 0 }`, printed, compared and passed around like any other, and exported with `pub struct`. A foreign function takes and returns it by value:
+
+```
+foreign "c" {
+    struct Div { quot: Int32, rem: Int32 }
+    fn div(a: Int32, b: Int32) -> Div
+}
+```
+
+Passing one checks each `Int32` field's range, as for an `Int32` argument. Only structs declared in a foreign block cross to C; a struct holds no `Str`, `Bytes` or other struct.
+
+**Callbacks.** A parameter of a function type, made of boundary types, is a pointer to a function that C calls:
+
+```
+foreign "c" {
+    fn qsort(base: Handle, n: Int, size: Int, compare: fn(Handle, Handle) -> Int32)
+}
+
+fn by_byte(f: Foreign, a: Handle, b: Handle) -> Int {
+    f.copy(a, 1)[0] - f.copy(b, 1)[0]
+}
+
+qsort(f, buf, n, 1, by_byte)
+```
+
+- The argument is a top-level function, named (E0332): C calls it with its arguments alone, so it has nowhere to keep a closure's captured values. A callback may take a `Foreign` first, before what C passes: it gets the Foreign value the foreign call was given, so it can read C memory and call C. It has no other capability.
+- Its parameters are `Int`, `Int32`, `Float`, `Bool`, `Str` and `Handle` (at most 8 integer-like and 8 `Float`); a `Str` is copied from the NUL-terminated C string. It returns one of those but `Str`, or `()`; an `Int32` result out of range is a panic.
+- C may call it only during the foreign call that was given it, and on the same thread. If C keeps the pointer and calls it after the call returns, or from another thread, the behaviour is undefined (both backends stop the program where they can tell).
+- Nothing unwinds through C's frames. A panic in a callback ends the program with `panic: in a callback from C: ...`, past every `catch` and task boundary, and so does waiting in one (on a group, a channel, a timer or input), which would leave C's frames on a task that moves.
+- A callback can make foreign calls with callbacks of their own. The interpreter has room for 32 callbacks in use at once (each foreign call takes its own until it returns); more is a panic there.
 
 Ownership at the boundary:
 
@@ -729,9 +773,9 @@ The foreign grant is full trust, and Vela treats it that way:
 
 What the capability lets code do: anything the C functions it declares can do, with the program's full authority, outside every other capability's checks. Vela checks the declared types and the library grant; it cannot check that a declaration matches the C prototype, and a wrong one is undefined behaviour. Keep foreign blocks small, private to a module that wraps them in a safe Vela API (as the `sql` module does), and grant `foreign` only to programs and dependencies you trust.
 
-Limits, the same in both backends: at most 8 integer-like (everything but `Float`, `Out` included) and 8 `Float` parameters; no variadic functions (`printf`), no structs by value, no callbacks from C into Vela. A foreign function can only be called, not used as a value (E0331): wrap it in a closure. A C call blocks its worker thread until it returns, like a busy loop, and C libraries decide their own thread safety.
+Limits, the same in both backends: at most 8 integer-like (everything but `Float`, `Out` and callbacks included) and 8 `Float` values, each field of a struct by value counting as one; the variadic and callback limits above; structs of 1 to 8 scalar fields, not nested. A foreign function can only be called, not used as a value (E0331): wrap it in a closure. A C call blocks its worker thread until it returns, like a busy loop, and C libraries decide their own thread safety.
 
-The backends differ in how they reach the code, not in what a program sees: natively each function is called through its exact prototype and linked with `-l<lib>` (a library outside the C compiler's default paths is found through `LIBRARY_PATH`); the interpreter loads the library with `dlopen` and calls through a generic stub, resolving the declarations of granted libraries before `main` starts. A missing library or symbol is therefore an error before the program runs in both: a link error natively, `foreign: cannot load library ...` or `foreign: library ... has no function ...` in the interpreter. One difference follows from linking: a native binary loads every library it declares when it starts (running the library's initialisers, as any linked library does), granted or not, while the interpreter never loads a library the grants do not cover. In both, a call into an ungranted library panics before it reaches the library.
+The backends differ in how they reach the code, not in what a program sees: natively each function is called through its exact prototype (a variadic one through its variadic prototype, a struct through its C declaration, a callback through a generated C function that calls the compiled Vela function) and linked with `-l<lib>` (a library outside the C compiler's default paths is found through `LIBRARY_PATH`); the interpreter loads the library with `dlopen` and calls through a generic stub that lays out the arguments as the platform's calling convention does (x86-64 System V, arm64, and Apple's arm64 variant: registers, stack, how a struct is split or passed by pointer), and C calls callbacks through a fixed set of trampolines, resolving the declarations of granted libraries before `main` starts. A missing library or symbol is therefore an error before the program runs in both: a link error natively, `foreign: cannot load library ...` or `foreign: library ... has no function ...` in the interpreter. One difference follows from linking: a native binary loads every library it declares when it starts (running the library's initialisers, as any linked library does), granted or not, while the interpreter never loads a library the grants do not cover. In both, a call into an ungranted library panics before it reaches the library.
 
 ### The operating-system sandbox
 

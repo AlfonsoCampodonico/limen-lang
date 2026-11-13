@@ -1,0 +1,3 @@
+foreign "c" {
+    fn print_int(format: Str, ..., n: Int) -> Int32 = printf
+}

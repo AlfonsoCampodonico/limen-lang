@@ -425,9 +425,25 @@ and lower_call f e callee args ty =
     f.dead <- true;
     r
   | EVar n when not_local f n && (match Hashtbl.find_opt f.g.fns n with Some { fn_foreign = Some _; _ } -> true | _ -> false) ->
-    let cs = match Ffi.of_decl (Hashtbl.find f.g.fns n) with Ok cs -> cs | Error _ -> failwith "lower: foreign signature" in
-    let xs = List.map (lower f) args in
-    tmp f ty (I.CallC (cs, xs, e.espan))
+    let cs =
+      match Ffi.of_decl ~structs:(Hashtbl.find_opt f.g.structs) (Hashtbl.find f.g.fns n) with
+      | Ok cs -> cs
+      | Error _ -> failwith "lower: foreign signature"
+    in
+    (* a callback is a top-level function (the checker made sure): C calls
+       its compiled code through a wrapper, so it is not lowered as a value *)
+    let kinds = (if cs.trusted then [] else [ Ffi.Unit ]) @ List.filter_map (fun (p : Ffi.param) -> if p.out then None else Some p.cty) cs.params in
+    let xs, cbs =
+      List.fold_left2
+        (fun (xs, cbs) (a : expr) k ->
+          match (k, a.edesc) with
+          | Ffi.Fn (ps, _), EVar m ->
+            let d = Hashtbl.find f.g.fns m in
+            (xs, cbs @ [ (instance f.g m [], m, d.fn_span, List.length d.fn_params > List.length ps) ])
+          | _ -> (xs @ [ lower f a ], cbs))
+        ([], []) args kinds
+    in
+    tmp f ty (I.CallC (cs, xs, cbs, e.espan))
   | EVar n when not_local f n && Hashtbl.mem f.g.fns n ->
     let c = instance f.g n (List.map (fun (k, t) -> (k, zonk f.genv t)) callee.einst) in
     let xs = List.map (lower f) args in

@@ -1,0 +1,13 @@
+foreign "c" {
+    struct Div { quot: Int32, rem: Int32 }
+    pub struct Wide {
+        a: Int,
+        b: Float,
+    }
+    fn div(a: Int32, b: Int32) -> Div
+    fn format_int(buf: Handle, size: Int, format: Str, ..., n: Int) -> Int32 = "snprintf"
+    fn printf(format: Str, ...) -> Int32
+    fn qsort(base: Handle, n: Int, size: Int, cmp: fn(Handle, Handle) -> Int32)
+}
+
+fn main() {}

@@ -1741,9 +1741,12 @@ static void w_pool_start(void) {
 }
 
 /* Park the current fiber; [after] runs on the scheduler once it is off its stack. */
+#define W_CB_WAIT "a callback from C cannot wait (for a task, a channel, a timer or input)"
 static void w_park(void (*after)(void *), void *arg) {
   WWorker *w = w_self();
   WFiber *f = w->current;
+  /* C's frames are on this fiber's stack: it must not move to another thread */
+  if (f->in_cb) w_fatal_c(W_CB_WAIT, f->in_cb);
   w->after = after; w->after_arg = arg;
   w_switch(f, &w->sched, 0);
 }
@@ -3332,6 +3335,22 @@ static int32_t w_ffi_i32(int64_t v, const char *arg, const char *where) {
   return (int32_t)v;
 }
 static WStr *w_ffi_str(const char *p) { return p ? Str_from(p, (int64_t)strlen(p)) : Str_new(0); }
+/* Callbacks from C (see ffi_callback_def in cgen.ml). C may call one only
+   during its foreign call, on the same thread: that is the calling task's
+   fiber, which the callback runs on. A thread Vela did not start has none. */
+static WFiber *w_cb_fiber(const char *where) {
+  WWorker *w = w_self();
+  if (!w || !w->current) w_fatal_c("a callback from C ran on a thread Vela did not start (C may call it only during the foreign call, on its thread)", where);
+  return w->current;
+}
+/* A panic in a callback cannot unwind through C's frames: it ends the program. */
+__attribute__((noreturn)) static void w_cb_fatal(WCatch *c, const char *where) {
+  if (c->cancel || !c->msg) w_fatal_c(W_CB_WAIT, where);
+  size_t n = strlen(c->msg) + 32;
+  char *m = (char *)w_raw(n);
+  snprintf(m, n, "in a callback from C: %s", c->msg);
+  w_fatal_c(m, c->where ? c->where : where);
+}
 static WStr *w_ffi_copy(int64_t p, int64_t n, const char *where) {
   if (n < 0) { char m[128]; snprintf(m, sizeof m, "foreign.copy: negative length %lld", (long long)n); w_panic_c(m, where); }
   if (p == 0 && n > 0) w_panic_c("foreign.copy: null pointer", where);

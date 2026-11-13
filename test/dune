@@ -3,6 +3,7 @@
  (libraries vela unix)
  (deps
   ../bin/main.exe
+  ffi_test.c
   (glob_files %{project_root}/examples/*.vela)
   (glob_files %{project_root}/bench/*.vela)
   (glob_files tls/*.pem)

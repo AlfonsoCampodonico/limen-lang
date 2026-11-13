@@ -104,14 +104,18 @@ let item = function
            i.if_methods)
     ^ "}"
   | IFn d ->
-    (match d.fn_foreign with Some fo -> "foreign " ^ String.escaped fo.flib ^ " " | None -> "")
+    (match d.fn_foreign with
+     | Some fo ->
+       "foreign " ^ String.escaped fo.flib ^ " " ^ (if fo.fsym <> d.fn_name then "=" ^ fo.fsym ^ " " else "")
+       ^ (match fo.fvariadic with Some k -> "..." ^ string_of_int k ^ " " | None -> "")
+     | None -> "")
     ^ (if d.fn_pub then "pub " else "")
     ^ "fn " ^ d.fn_name ^ "["
     ^ gens d.fn_gen d.fn_bounds
     ^ "]("
     ^ String.concat "," (List.map (fun p -> p.prm_name ^ ":" ^ ty p.prm_ty) d.fn_params)
     ^ ")" ^ (match d.fn_ret with Some t -> ty t | None -> "") ^ block d.fn_body
-  | IStruct s -> "struct " ^ s.st_name ^ "[" ^ String.concat "," s.st_gen ^ "]{" ^ String.concat "," (List.map (fun (f, _, t) -> if List.mem f s.st_embeds then "embed " ^ ty t else f ^ ":" ^ ty t) s.st_fields) ^ "}"
+  | IStruct s -> (match s.st_foreign with Some (l, _) -> "foreign " ^ String.escaped l ^ " " | None -> "") ^ "struct " ^ s.st_name ^ "[" ^ gens s.st_gen s.st_bounds ^ "]{" ^ String.concat "," (List.map (fun (f, _, t) -> if List.mem f s.st_embeds then "embed " ^ ty t else f ^ ":" ^ ty t) s.st_fields) ^ "}"
   | IEnum e ->
     "enum " ^ e.en_name ^ "[" ^ gens e.en_gen e.en_bounds ^ "]{"
     ^ String.concat "," (List.map (fun (v, _, ts) -> v ^ "(" ^ String.concat "," (List.map ty ts) ^ ")") e.en_variants)

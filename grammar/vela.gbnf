@@ -37,9 +37,13 @@ test     ::= "test" sp1 plainstr sp tparams? ("for" sp1 (ident sp1 | upat sp) "i
 bench    ::= "bench" sp1 plainstr sp tparams? block
 tparams  ::= "(" ws (param (isep param)* (ws ",")?)? ws ")" sp
 fn       ::= "fn" sp1 ident sp bgenerics? sp "(" ws (param (isep param)* (ws ",")?)? ws ")" (sp "->" sp type)? sp block
-# C functions from a library: signatures only, one per line
-foreign  ::= "foreign" sp1 plainstr sp "{" ws (ffn (stsep ffn)* stsep?)? ws "}"
-ffn      ::= ("pub" sp1)? "fn" sp1 ident sp "(" ws (param (isep param)* (ws ",")?)? ws ")" (sp "->" sp type)?
+# C functions from a library: signatures only, one per line, and C structs.
+# `...` makes a function variadic; `= "name"` names the C function.
+foreign  ::= "foreign" sp1 plainstr sp "{" ws (fitem (stsep fitem)* stsep?)? ws "}"
+fitem    ::= ("pub" sp1)? (ffn | fstruct)
+ffn      ::= "fn" sp1 ident sp "(" ws fparams? ws ")" (sp "->" sp type)? (sp "=" sp plainstr)?
+fparams  ::= (param isep)* "..." (isep param)* (ws ",")? | param (isep param)* (ws ",")?
+fstruct  ::= "struct" sp1 ident sp "{" ws (param (isep param)* (ws ",")?)? ws "}"
 generics ::= "[" ws ident (isep ident)* (ws ",")? ws "]"
 bgenerics ::= "[" ws bgen (isep bgen)* (ws ",")? ws "]"
 bgen     ::= ident (sp ":" sp bound (sp "+" sp bound)*)?

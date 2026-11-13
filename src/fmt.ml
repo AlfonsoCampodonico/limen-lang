@@ -763,8 +763,15 @@ let item c (it : item) =
 
 (* A `foreign "lib" { ... }` block: its declarations are consecutive items. *)
 let foreign_sig (d : fn_decl) =
-  (if d.fn_pub then "pub " else "") ^ "fn " ^ d.fn_name ^ "(" ^ String.concat ", " (List.map (fun p -> p.prm_name ^ ": " ^ ty p.prm_ty) d.fn_params) ^ ")"
-  ^ match d.fn_ret with Some t -> " -> " ^ ty t | None -> ""
+  let params = List.map (fun p -> p.prm_name ^ ": " ^ ty p.prm_ty) d.fn_params in
+  let fo = Option.get d.fn_foreign in
+  (* a variadic function's `...` goes back among its parameters *)
+  let params =
+    match fo.fvariadic with Some k -> List.filteri (fun i _ -> i < k) params @ [ "..." ] @ List.filteri (fun i _ -> i >= k) params | None -> params
+  in
+  (if d.fn_pub then "pub " else "") ^ "fn " ^ d.fn_name ^ "(" ^ String.concat ", " params ^ ")"
+  ^ (match d.fn_ret with Some t -> " -> " ^ ty t | None -> "")
+  ^ if fo.fsym <> d.fn_name then " = \"" ^ escape fo.fsym ^ "\"" else ""
 
 (* where the block's `foreign` keyword starts: the nearest line before [lo] that begins with it *)
 let foreign_open c lo =
@@ -777,7 +784,30 @@ let foreign_open c lo =
   in
   go lo
 
-let foreign_block c lib (ds : fn_decl list) =
+(* A C struct in a foreign block: on one line, unless it was written over several. *)
+let foreign_struct c (s : struct_decl) =
+  let close = struct_close c s in
+  let head = (if s.st_pub then "pub " else "") ^ "struct " ^ s.st_name ^ " {" in
+  if not (has_newline c s.st_span.lo close) then
+    add c (head ^ (if s.st_fields = [] then "}" else " " ^ String.concat ", " (List.map (fun (f, _, t) -> f ^ ": " ^ ty t) s.st_fields) ^ " }"))
+  else begin
+    add c head;
+    let prev = ref (-1) in
+    List.iter
+      (fun (f, (fsp : Span.t), t) ->
+        ignore (leading c 8 ~prev:!prev fsp.lo);
+        new_line c 8;
+        add c (f ^ ": " ^ ty t ^ ",");
+        trailing c t.tspan.hi;
+        prev := t.tspan.hi)
+      s.st_fields;
+    ignore (leading c 8 ~prev:!prev close);
+    new_line c 4;
+    add c "}"
+  end;
+  close + 1
+
+let foreign_block c lib (ds : item list) =
   new_line c 0;
   add c ("foreign \"" ^ escape lib ^ "\" {");
   let prev = ref (-1) in
@@ -830,6 +860,11 @@ let format ~file src =
     uses;
   let nuses = List.length uses in
   (* consecutive declarations of one foreign block print as that block *)
+  let foreign_lib = function
+    | IFn { fn_foreign = Some { flib; _ }; _ } -> Some flib
+    | IStruct { st_foreign = Some (l, _); _ } -> Some l
+    | _ -> None
+  in
   let rec groups = function
     | [] -> []
     | it :: rest when foreign_lib it <> None ->
@@ -838,8 +873,8 @@ let format ~file src =
         | it :: r when foreign_lib it = lib -> take (it :: acc) r
         | r -> (List.rev acc, r)
       in
-      let ds, rest = take [ d ] rest in
-      `Foreign (lib, ds) :: groups rest
+      let ds, rest = take [ it ] rest in
+      `Foreign (Option.get lib, ds) :: groups rest
     | it :: rest -> `Item it :: groups rest
   in
   let last_alias = ref false in
@@ -851,8 +886,8 @@ let format ~file src =
       let follows_alias = alias && !last_alias in
       last_alias := alias;
       match g with
-      | `Foreign (lib, (ds : fn_decl list)) ->
-        let kw_lo = foreign_open c (List.hd ds).fn_span.lo in
+      | `Foreign (lib, ds) ->
+        let kw_lo = foreign_open c (match List.hd ds with IFn d -> d.fn_span.lo | IStruct s -> s.st_span.lo | _ -> 0) in
         if i > 0 then blank c;
         let after = leading c 0 ~prev:!prev kw_lo in
         if after >= 0 && List.length c.o.lines > 0 && blank_between c after kw_lo then blank c;

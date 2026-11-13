@@ -31,6 +31,12 @@ type ctx = {
   mutable sort_tys : ty list; (* list types that need <CName>_sort *)
   mutable hash_tys : ty list; (* composite map key types that need <CName>_hash *)
   mutable csyms : string list; (* C functions that foreign calls name *)
+  mutable cstructs : (string * string * (string * Ffi.cty) list) list;
+      (* C structs passed by value: Vela name, C name, fields *)
+  mutable cbs : ((string * bool * Ffi.cty list * Ffi.cty) * (string * string * Span.t)) list;
+      (* callback wrappers: (Vela function's C name, whether it takes a
+         Foreign first, parameters, result) -> (wrapper name, Vela name,
+         where the function is declared) *)
   mutable vols : int list;
       (* variables of the current function a `defer` needs volatile: a panic
          longjmps back into the function, and the deferred body (and the
@@ -262,6 +268,121 @@ let binop c op t a b sp =
     sprintf "(%s_cmp(%s, %s) %s 0)" (cmp_prefix c t) a b o
   | _ -> failwith ("cgen binop on " ^ show t)
 
+(* ---------- foreign calls ---------- *)
+
+(* The C type of a boundary type: a C struct gets a typedef of its own
+   (VFS<n>, fields c0, c1, ... at C's layout), a callback is a pointer to a
+   function. *)
+let rec ffi_ctype c (t : Ffi.cty) =
+  match t with
+  | Ffi.Struct (n, fs) -> (
+    match List.find_opt (fun (m, _, _) -> m = n) c.cstructs with
+    | Some (_, cn, _) -> cn
+    | None ->
+      let cn = sprintf "VFS%d" (List.length c.cstructs) in
+      c.cstructs <- c.cstructs @ [ (n, cn, fs) ];
+      cn)
+  | Ffi.Fn (ps, r) -> sprintf "%s (*)(%s)" (ffi_ctype c r) (if ps = [] then "void" else String.concat ", " (List.map (ffi_ctype c) ps))
+  | t -> Ffi.c_name t
+
+(* A Vela value [v] as the C value of boundary type [t]. [what] names it in
+   an Int32 range panic. In the variadic part of a call, Int32 and Bool go as
+   int and Int as int64_t, written out so C's promotions see the right type. *)
+let ffi_arg c ?(variadic = false) (t : Ffi.cty) v what wh =
+  let i32 v what = sprintf "w_ffi_i32(%s, %s, %s)" v (c_string what) wh in
+  match t with
+  | Ffi.Int -> if variadic then sprintf "(int64_t)%s" v else v
+  | Ffi.Float -> if variadic then sprintf "(double)%s" v else v
+  | Ffi.Int32 -> if variadic then sprintf "(int)%s" (i32 v what) else i32 v what
+  | Ffi.Bool -> sprintf "(%s(%s ? 1 : 0))" (if variadic then "(int)" else "") v
+  | Ffi.Str -> sprintf "(const char *)(%s)->data" v
+  | Ffi.Bytes -> sprintf "(const void *)(%s)->data" v
+  | Ffi.Handle -> sprintf "(void *)(intptr_t)(%s).f0" v
+  | Ffi.Struct (n, fs) ->
+    let field i (f, ft) =
+      let x = sprintf "(%s).f%d" v i in
+      match ft with
+      | Ffi.Int32 -> i32 x (sprintf "field `%s` of `%s`" f n)
+      | Ffi.Bool -> sprintf "(%s ? 1 : 0)" x
+      | Ffi.Handle -> sprintf "(void *)(intptr_t)(%s).f0" x
+      | _ -> x
+    in
+    sprintf "(%s){ %s }" (ffi_ctype c t) (String.concat ", " (List.mapi field fs))
+  | Ffi.Unit | Ffi.Fn _ -> "0"
+
+(* A C value [e] of boundary type [t] as a Vela value. *)
+let ffi_result c (t : Ffi.cty) e =
+  let hd = cname c Ffi.handle_ty in
+  let one t e =
+    match t with
+    | Ffi.Int | Ffi.Float -> e
+    | Ffi.Int32 -> sprintf "(int64_t)%s" e
+    | Ffi.Bool -> sprintf "(%s != 0)" e
+    | Ffi.Str -> sprintf "w_ffi_str(%s)" e
+    | Ffi.Handle -> sprintf "(%s){ (int64_t)(intptr_t)%s }" hd e
+    | _ -> "0"
+  in
+  match t with
+  | Ffi.Struct (n, fs) -> sprintf "(%s){ %s }" (cname c (TNamed (n, []))) (String.concat ", " (List.mapi (fun i (_, ft) -> one ft (sprintf "%s.c%d" e i)) fs))
+  | t -> one t e
+
+(* The wrapper C calls for callback [fn] (a top-level function's C name),
+   created on first use. *)
+let ffi_callback c (fn, vname, sp, takes_foreign) ps r =
+  match List.assoc_opt (fn, takes_foreign, ps, r) c.cbs with
+  | Some (w, _, _) -> w
+  | None ->
+    let w = sprintf "vcb%d_" (List.length c.cbs) in
+    c.cbs <- c.cbs @ [ ((fn, takes_foreign, ps, r), (w, vname, sp)) ];
+    w
+
+(* A callback wrapper's definition: it converts C's arguments, calls the
+   compiled Vela function under a panic boundary of its own, and converts its
+   result. Nothing may unwind through C's frames, so a panic there ends the
+   program (w_cb_fatal), and so does waiting (see w_park). *)
+let ffi_callback_def c ((fn, takes_foreign, ps, r), (w, vname, sp)) =
+  let b = Buffer.create 512 in
+  let p s = Buffer.add_string b (s ^ "\n") in
+  let wh = where sp in
+  let params = List.mapi (fun i t -> sprintf "%s a%d" (ffi_ctype c t) i) ps in
+  p (sprintf "static %s %s(%s) {" (ffi_ctype c r) w (if params = [] then "void" else String.concat ", " params));
+  p (sprintf "  WFiber *f_ = w_cb_fiber(%s);" wh);
+  p "  const char *prev_ = f_->in_cb;";
+  p (sprintf "  f_->in_cb = %s;" wh);
+  if r <> Ffi.Unit then p (sprintf "  %s volatile r_ = 0;" (ffi_ctype c r));
+  p "  WCatch c_;";
+  p "  w_catch_init(&c_);";
+  p "  WCatch **slot_ = &f_->catch_top;";
+  p "  if (_setjmp(c_.jb) == 0) {";
+  p "    WCatch *guard_ __attribute__((cleanup(w_catch_land))) = &c_;";
+  p "    *slot_ = &c_;";
+  let hd = cname c Ffi.handle_ty in
+  let arg i t =
+    let a = sprintf "a%d" i in
+    match t with
+    | Ffi.Int32 -> sprintf "(int64_t)%s" a
+    | Ffi.Bool -> sprintf "(%s != 0)" a
+    | Ffi.Handle -> sprintf "(%s){ (int64_t)(intptr_t)%s }" hd a
+    | Ffi.Str -> sprintf "w_ffi_str(%s)" a
+    | _ -> a
+  in
+  (* a callback that takes a Foreign gets the one its foreign call was given *)
+  let fa = if takes_foreign then [ "Cap_dup(f_->cb_foreign)" ] else [] in
+  let call = sprintf "%s(%s)" fn (String.concat ", " (fa @ List.mapi arg ps)) in
+  (match r with
+   | Ffi.Unit -> p (sprintf "    %s;" call)
+   | Ffi.Int32 -> p (sprintf "    r_ = w_ffi_i32(%s, %s, %s);" call (c_string (sprintf "the result of callback `%s`" vname)) wh)
+   | Ffi.Bool -> p (sprintf "    r_ = %s ? 1 : 0;" call)
+   | Ffi.Handle -> p (sprintf "    r_ = (void *)(intptr_t)(%s).f0;" call)
+   | _ -> p (sprintf "    r_ = %s;" call));
+  p "    *slot_ = c_.prev;";
+  p "    w_catch_end(&c_);";
+  p (sprintf "  } else w_cb_fatal(&c_, %s);" wh);
+  p "  f_->in_cb = prev_;";
+  if r <> Ffi.Unit then p "  return r_;";
+  p "}";
+  Buffer.contents b
+
 (* Emit statements that store [rhs] into the C lvalue [dst] of type [t]. *)
 let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
   let line s = Buffer.add_string out (ind ^ s ^ "\n") in
@@ -358,7 +479,7 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     line (sprintf "    %s = %s;" dst (mk_enum c t 1 [ "m_" ]));
     line "  }";
     line "}"
-  | I.CallC ({ lib = "vela"; sym; _ }, args, sp) -> (
+  | I.CallC ({ lib = "vela"; sym; _ }, args, _, sp) -> (
     (* the runtime's own helpers (Ffi.runtime_fns) *)
     let hd = cname c Ffi.handle_ty in
     match (sym, List.map a args) with
@@ -367,7 +488,7 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     | ("vela_handle_acquire" | "vela_handle_release" | "vela_handle_close"), [ id ] ->
       set (sprintf "(%s){ w_%s(%s) }" hd (String.sub sym 5 (String.length sym - 5)) id)
     | _ -> failwith ("cgen: runtime helper " ^ sym))
-  | I.CallC (cs, args, sp) ->
+  | I.CallC (cs, args, cbs, sp) ->
     if not (List.mem cs.sym c.csyms) then c.csyms <- c.csyms @ [ cs.sym ];
     line "{";
     let vals =
@@ -392,35 +513,35 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
             "&" ^ o
           end
           else
-            let v = match !rest with v :: r -> rest := r; v | [] -> failwith "cgen: foreign arity" in
             match p.cty with
-            | Ffi.Int | Ffi.Float -> v
-            | Ffi.Int32 -> sprintf "w_ffi_i32(%s, %s, %s)" v (c_string (sprintf "argument `%s` of `%s`" p.name cs.sym)) (where sp)
-            | Ffi.Bool -> sprintf "(%s ? 1 : 0)" v
-            | Ffi.Str | Ffi.Bytes -> sprintf "(%s)->data" v
-            | Ffi.Handle -> sprintf "(void *)(intptr_t)(%s).f0" v
-            | Ffi.Unit -> "0")
+            | Ffi.Fn (ps, r) -> (
+              match !cbs with
+              | cb :: rest -> cbs := rest; ffi_callback c cb ps r
+              | [] -> failwith "cgen: foreign callback")
+            | t ->
+              let v = match !rest with v :: r -> rest := r; v | [] -> failwith "cgen: foreign arity" in
+              ffi_arg c ~variadic:(i >= fixed) t v (sprintf "argument `%s` of `%s`" p.name cs.sym) (where sp))
         cs.params
     in
     let outs = List.rev !outs in
     let ptys = List.filteri (fun i _ -> i < fixed) cs.params in
     let proto =
-      sprintf "%s (*)(%s)" (Ffi.c_name cs.ret)
-        (if cs.params = [] then "void"
-         else String.concat ", " (List.map (fun (p : Ffi.param) -> Ffi.c_name p.cty ^ if p.out then " *" else "") cs.params))
+      sprintf "%s (*)(%s)" (ffi_ctype c cs.ret)
+        (if ptys = [] then "void"
+         else
+           String.concat ", " (List.map (fun (p : Ffi.param) -> ffi_ctype c p.cty ^ if p.out then " *" else "") ptys)
+           ^ if cs.fixed <> None then ", ..." else "")
     in
     let call = sprintf "((%s)vf_%s)(%s)" proto cs.sym (String.concat ", " cargs) in
-    if cs.ret = Ffi.Unit then line (sprintf "  %s;" call) else line (sprintf "  %s r_ = %s;" (Ffi.c_name cs.ret) call);
-    let conv (t : Ffi.cty) e =
-      match t with
-      | Ffi.Int | Ffi.Float -> e
-      | Ffi.Int32 -> sprintf "(int64_t)%s" e
-      | Ffi.Bool -> sprintf "(%s != 0)" e
-      | Ffi.Str -> sprintf "w_ffi_str(%s)" e
-      | Ffi.Handle -> sprintf "(%s){ (int64_t)(intptr_t)%s }" (cname c Ffi.handle_ty) e
-      | Ffi.Bytes | Ffi.Unit -> "0"
-    in
-    let vals = (if cs.ret = Ffi.Unit then [] else [ conv cs.ret "r_" ]) @ List.map (fun (o, t) -> conv t o) outs in
+    (* the Foreign value for callbacks that take one, kept on the task's fiber *)
+    if pass_foreign then begin
+      line "  WFiber *cf_ = w_current();";
+      line "  WCap *cfp_ = cf_->cb_foreign;";
+      line (sprintf "  cf_->cb_foreign = %s;" (List.hd (List.map a args)))
+    end;
+    if cs.ret = Ffi.Unit then line (sprintf "  %s;" call) else line (sprintf "  %s r_ = %s;" (ffi_ctype c cs.ret) call);
+    if pass_foreign then line "  cf_->cb_foreign = cfp_;";
+    let vals = (if cs.ret = Ffi.Unit then [] else [ ffi_result c cs.ret "r_" ]) @ List.map (fun (o, t) -> ffi_result c t o) outs in
     (match vals with
      | [] -> line (sprintf "  %s = 0;" dst)
      | [ v ] -> line (sprintf "  %s = %s;" dst v)
@@ -1572,8 +1693,15 @@ let program (g : Lower.gctx) (prog : I.program) : string =
   mp "  return code_;";
   mp "}"
   end;
+  (* callback wrappers, after the prototypes of the functions they call *)
+  let cbdefs = String.concat "" (List.map (ffi_callback_def c) c.cbs) in
   let types = Buffer.create 16384 in
   type_defs c types;
+  List.iter
+    (fun (_, cn, fs) ->
+      Buffer.add_string types
+        (sprintf "typedef struct { %s } %s;\n" (String.concat " " (List.mapi (fun i (_, t) -> sprintf "%s c%d;" (Ffi.c_name t) i) fs)) cn))
+    c.cstructs;
   let lits = Buffer.create 4096 in
   List.iter
     (fun (n, s) -> Buffer.add_string lits (sprintf "static WStr %s = { 0, %d, (char*)%s };\n" n (String.length s) (c_string s)))

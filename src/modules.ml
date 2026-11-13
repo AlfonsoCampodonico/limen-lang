@@ -542,7 +542,15 @@ let rename_item mods (m : modinfo) own (it : item) : item =
             d.fn_foreign }
   | IStruct s ->
     let env = { self = m; mods; own; gens = s.st_gen } in
-    IStruct { s with st_name = qual m s.st_name; st_fields = List.map (fun (f, sp, t) -> (f, sp, ty env t)) s.st_fields }
+    (* a C struct's Int32 fields are Ints to the rest of Vela, as Int32
+       parameters are; the types as written stay in st_foreign *)
+    let int32_as_int (t : ty_expr) = match t.tdesc with TyName ("Int32", []) when s.st_foreign <> None -> { t with tdesc = TyName ("Int", []) } | _ -> t in
+    IStruct
+      { s with
+        st_name = qual m s.st_name;
+        st_fields = List.map (fun (f, sp, t) -> (f, sp, ty env (int32_as_int t))) s.st_fields;
+        st_foreign = Option.map (fun (l, ts) -> (l, List.map (ty env) ts)) s.st_foreign;
+        st_bounds = List.map (fun (g, bs) -> (g, List.map (ty env) bs)) s.st_bounds }
   | IIface i ->
     let env = { self = m; mods; own; gens = i.if_gen } in
     IIface

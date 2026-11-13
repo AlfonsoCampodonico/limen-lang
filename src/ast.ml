@@ -118,8 +118,12 @@ and fn_decl = {
 
 (* A C function: its library, its symbol, and whether it is trusted. Only
    the foreign blocks of standard library modules that src/std/vela.toml
-   names in [trust] are trusted: their calls take no Foreign capability. *)
-and foreign = { flib : string; fsym : string; ftrusted : bool }
+   names in [trust] are trusted: their calls take no Foreign capability.
+   [fsym] is the function's own name unless the declaration names another
+   (`fn print_int(...) -> Int32 = "printf"`). [fvariadic]: for a variadic
+   function (`...` among its parameters), how many parameters come before
+   the `...`. *)
+and foreign = { flib : string; fsym : string; ftrusted : bool; fvariadic : int option }
 
 type struct_decl = {
   st_name : string;
@@ -132,6 +136,10 @@ type struct_decl = {
          an embedded struct, stored as a field named after its type (`User`),
          whose fields and methods the checker promotes onto the outer struct *)
   st_pub : bool;
+  st_foreign : (string * ty_expr list) option;
+      (* declared in a `foreign "lib" { struct ... }` block: a C struct passed
+         by value. The library, and the field types as written (Int32 among
+         them); the loader turns Int32 fields into Int for the rest of Vela. *)
 }
 
 type enum_decl = {

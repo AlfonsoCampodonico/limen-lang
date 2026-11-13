@@ -88,6 +88,8 @@ let generics ?(text = "") names bounds =
 
 let fn_sig text (d : fn_decl) =
   let ps = List.map (fun p -> p.prm_name ^ ": " ^ slice text p.prm_ty.tspan) d.fn_params in
+  (* a variadic foreign function's `...` *)
+  let ps = match d.fn_foreign with Some { fvariadic = Some k; _ } -> List.filteri (fun i _ -> i < k) ps @ [ "..." ] @ List.filteri (fun i _ -> i >= k) ps | _ -> ps in
   let ret = match d.fn_ret with Some te -> " -> " ^ slice text te.tspan | None -> "" in
   Printf.sprintf "%sfn %s%s(%s)%s" (pub_kw d.fn_pub) d.fn_name (generics ~text d.fn_gen d.fn_bounds) (String.concat ", " ps) ret
 

@@ -136,6 +136,10 @@ exception Break_
 exception Continue_
 exception Panic of string * Span.t
 
+(* Ends the program, past every `catch` and task boundary: a panic in a
+   callback from C, which cannot unwind through C's frames. *)
+exception Fatal of string * Span.t
+
 (* A cancelled task stopping at a wait. `catch` does not catch it. *)
 exception Cancelled
 
@@ -936,11 +940,17 @@ end
    generic stub in ffi_stubs.c. The native backend links the same libraries
    and calls each function through its prototype. *)
 module Foreign = struct
-  type carg = AInt of int64 | AFloat of float | APtr of string | AOut
+  type carg = AInt of int64 | AFloat of float | APtr of string | ABlob of string | AOut
 
   external dl_open : string -> nativeint * string = "vela_ffi_open"
   external dl_sym : nativeint -> string -> nativeint = "vela_ffi_sym"
-  external call : nativeint -> carg array -> int -> int64 * float * int64 array = "vela_ffi_call"
+  external call_c : nativeint -> carg array -> float array -> int -> bool -> int * int64 array * int64 array = "vela_ffi_call"
+  external call_var : nativeint -> int -> carg array -> float array -> int -> int * int64 array * int64 array = "vela_ffi_call_var"
+  external abi_kind : unit -> int = "vela_ffi_abi"
+  external cb_take : bool -> int = "vela_ffi_cb_take"
+  external cb_free : bool -> int -> unit = "vela_ffi_cb_free"
+  external cb_addr : bool -> int -> nativeint = "vela_ffi_cb_addr"
+  external cb_fail : unit -> unit = "vela_ffi_cb_fail"
   external cstr : int64 -> string = "vela_ffi_cstr"
   external peek : int64 -> int -> string = "vela_ffi_peek"
   external sandbox_enter : string -> bool -> bool -> bool -> int = "vela_sandbox_enter"
@@ -1031,45 +1041,278 @@ module Foreign = struct
       | _ -> handle 0L)
     | _ -> failwith ("internal: runtime helper " ^ sym)
 
-  let invoke (d : fn_decl) args sp =
-    let cs = match Ffi.of_decl d with Ok cs -> cs | Error _ -> failwith "internal: foreign signature" in
-    let args =
-      if cs.trusted then args
+  (* ---- the calling convention (see the comment at the top of ffi_stubs.c) ---- *)
+
+  type abi = X64 | Arm64 | Apple
+
+  let abi = lazy (match abi_kind () with 0 -> X64 | 1 -> Arm64 | _ -> Apple)
+
+  let int32 n = Int64.of_int32 (Int64.to_int32 n)
+
+  let int32_arg n what sp =
+    if n < -2147483648L || n > 2147483647L then raise (Panic (sprintf "foreign: %Ld does not fit in Int32 (%s)" n what, sp));
+    n
+
+  (* A struct's bytes, at C's layout. *)
+  let struct_bytes name (fs : (string * Ffi.cty) list) v sp =
+    let offs, size = Ffi.layout fs in
+    let b = Bytes.make size '\000' in
+    let vals = match v with VStruct (_, vs) -> vs | _ -> failwith "internal: foreign struct" in
+    List.iter2
+      (fun (f, t) o ->
+        match (t, List.assoc f vals) with
+        | Ffi.Int, VInt n -> Bytes.set_int64_le b o n
+        | Ffi.Int32, VInt n -> Bytes.set_int32_le b o (Int64.to_int32 (int32_arg n (sprintf "field `%s` of `%s`" f name) sp))
+        | Ffi.Bool, VBool x -> Bytes.set_int32_le b o (if x then 1l else 0l)
+        | Ffi.Float, VFloat x -> Bytes.set_int64_le b o (Int64.bits_of_float x)
+        | Ffi.Handle, VStruct (_, [ (_, VInt n) ]) -> Bytes.set_int64_le b o n
+        | _ -> failwith "internal: foreign struct field")
+      fs offs;
+    b
+
+  (* A struct from C's bytes. *)
+  let struct_of_bytes name (fs : (string * Ffi.cty) list) b =
+    let offs, _ = Ffi.layout fs in
+    VStruct
+      ( name,
+        List.map2
+          (fun (f, t) o ->
+            ( f,
+              match t with
+              | Ffi.Int32 -> VInt (Int64.of_int32 (Bytes.get_int32_le b o))
+              | Ffi.Bool -> VBool (Bytes.get_int32_le b o <> 0l)
+              | Ffi.Float -> VFloat (Int64.float_of_bits (Bytes.get_int64_le b o))
+              | Ffi.Handle -> handle (Bytes.get_int64_le b o)
+              | _ -> VInt (Bytes.get_int64_le b o) ))
+          fs offs )
+
+  let word b k = let w = Bytes.make 8 '\000' in Bytes.blit b (8 * k) w 0 (min 8 (Bytes.length b - (8 * k))); Bytes.get_int64_le w 0
+
+  (* How a struct travels. x86-64: up to 16 bytes, each eightbyte in an
+     integer register unless it is a Float alone (SSE); larger, in memory.
+     arm64: 1 to 4 Floats in floating-point registers (a homogeneous
+     aggregate); up to 16 bytes in integer registers; larger, copied and
+     passed by pointer. *)
+  type cls = Words of bool list (* per eightbyte: an SSE one *) | Hfa of int | Memory | Indirect
+
+  let classify (fs : (string * Ffi.cty) list) =
+    let offs, size = Ffi.layout fs in
+    match Lazy.force abi with
+    | X64 ->
+      if size > 16 then Memory
+      else
+        Words
+          (List.init ((size + 7) / 8) (fun k ->
+               List.for_all2 (fun (_, t) o -> o / 8 <> k || t = Ffi.Float) fs offs))
+    | Arm64 | Apple ->
+      if List.length fs <= 4 && List.for_all (fun (_, t) -> t = Ffi.Float) fs then Hfa (List.length fs)
+      else if size <= 16 then Words (List.init ((size + 7) / 8) (fun _ -> false))
+      else Indirect
+
+  (* An argument as the call stub sees it. *)
+  type arg = Word of carg (* integer-like, 8 bytes *) | Small of int64 (* Int32 or Bool: a C int *) | Dbl of float | Agg of (string * Ffi.cty) list * Bytes.t
+
+  (* Lay out a plain call's arguments: the stub's integer words (registers,
+     then the stack image) and its 8 doubles. [sret]: the result comes back
+     through memory, whose pointer takes x86-64's first integer register. *)
+  let place ~sret (args : arg list) =
+    let abi = Lazy.force abi in
+    let gcap = match abi with X64 -> if sret then 5 else 6 | Arm64 | Apple -> 8 in
+    let gp = Array.make gcap (AInt 0L) and ng = ref 0 in
+    let fp = Array.make 8 0.0 and nf = ref 0 in
+    let sbytes = Bytes.make 128 '\000' and sptr = Array.make 16 None and soff = ref 0 in
+    let align a = soff := (!soff + a - 1) / a * a in
+    let st_word c = align 8; sptr.(!soff / 8) <- Some c; soff := !soff + 8 in
+    let st_bytes b =
+      align 8;
+      Bytes.blit b 0 sbytes !soff (Bytes.length b);
+      soff := !soff + ((Bytes.length b + 7) / 8 * 8)
+    in
+    let gp_word c = if !ng < gcap then (gp.(!ng) <- c; incr ng) else st_word c in
+    let dbl x = if !nf < 8 then (fp.(!nf) <- x; incr nf) else st_word (AInt (Int64.bits_of_float x)) in
+    List.iter
+      (function
+        | Word c -> gp_word c
+        | Small n ->
+          if !ng < gcap then (gp.(!ng) <- AInt n; incr ng)
+          else if abi = Apple then begin
+            (* Apple packs a 4-byte argument on the stack at 4-byte alignment *)
+            align 4;
+            Bytes.set_int32_le sbytes !soff (Int64.to_int32 n);
+            soff := !soff + 4
+          end
+          else st_word (AInt n)
+        | Dbl x -> dbl x
+        | Agg (fs, b) -> (
+          match classify fs with
+          | Memory -> st_bytes b
+          | Indirect -> gp_word (ABlob (Bytes.to_string b))
+          | Hfa n ->
+            if !nf + n <= 8 then List.iteri (fun k _ -> dbl (Int64.float_of_bits (word b k))) (List.init n Fun.id)
+            else (nf := 8; st_bytes b)
+          | Words cls ->
+            let ni = List.length (List.filter not cls) and nd = List.length (List.filter Fun.id cls) in
+            if !ng + ni <= gcap && !nf + nd <= 8 then List.iteri (fun k sse -> if sse then dbl (Int64.float_of_bits (word b k)) else gp_word (AInt (word b k))) cls
+            else begin
+              if abi <> X64 then ng := gcap;
+              st_bytes b
+            end))
+      args;
+    let nslots = (!soff + 7) / 8 in
+    if gcap + nslots > 24 then failwith "internal: foreign call too large";
+    let stack = Array.init nslots (fun k -> match sptr.(k) with Some c -> c | None -> AInt (word sbytes k)) in
+    (Array.append gp stack, fp)
+
+  (* The stub result kind for a result type, and whether it comes back
+     through memory. *)
+  let ret_kind (t : Ffi.cty) =
+    match t with
+    | Ffi.Float -> (1, false)
+    | Ffi.Struct (_, fs) -> (
+      match classify fs with
+      | Memory | Indirect -> (8, Lazy.force abi = X64)
+      | Hfa 1 -> (1, false)
+      | Hfa 2 -> (3, false)
+      | Hfa 3 -> (6, false)
+      | Hfa _ -> (7, false)
+      | Words [ false ] -> (0, false)
+      | Words [ true ] -> (1, false)
+      | Words [ false; false ] -> (2, false)
+      | Words [ true; true ] -> (3, false)
+      | Words [ false; true ] -> (4, false)
+      | Words _ -> (5, false))
+    | _ -> (0, false)
+
+  (* ---- callbacks: slots of the trampoline pools in ffi_stubs.c ---- *)
+
+  (* slot key -> what to do when C calls it *)
+  let cb_handlers : (int, int64 array -> float array -> int64) Hashtbl.t = Hashtbl.create 8
+
+  (* the failure of a callback, raised again (as Fatal) once C is left *)
+  let cb_failure : (string * Span.t) option ref = ref None
+
+  let cb_wait = "a callback from C cannot wait (for a task, a channel, a timer or input)"
+
+  let () =
+    Callback.register "vela_ffi_callback" (fun key ints floats ->
+        match Hashtbl.find_opt cb_handlers key with Some h -> h ints floats | None -> 0L)
+
+  (* The handler for Vela function [name], with C parameters [ps] and result
+     [r]: it converts the arguments, calls it, and converts the result. A
+     panic, or waiting, ends the program: nothing unwinds through C. *)
+  let cb_handler ~call ~cap (name, (cd : fn_decl)) ps r =
+    fun ints floats ->
+      try
+        let ii = ref 0 and fi = ref 0 in
+        let args =
+          List.map
+            (fun (t : Ffi.cty) ->
+              match t with
+              | Ffi.Float -> let x = floats.(!fi) in incr fi; VFloat x
+              | _ -> (
+                let n = ints.(!ii) in
+                incr ii;
+                match t with
+                | Ffi.Int32 -> VInt (int32 n)
+                | Ffi.Bool -> VBool (int32 n <> 0L)
+                | Ffi.Handle -> handle n
+                | Ffi.Str -> VStr (cstr n)
+                | _ -> VInt n))
+            ps
+        in
+        let args = if List.length cd.fn_params > List.length ps then cap :: args else args in
+        match (r, call name args) with
+        | Ffi.Int32, VInt n -> int32_arg n (sprintf "the result of callback `%s`" name) cd.fn_span
+        | Ffi.Int, VInt n -> n
+        | Ffi.Float, VFloat x -> Int64.bits_of_float x
+        | Ffi.Bool, VBool b -> if b then 1L else 0L
+        | Ffi.Handle, VStruct (_, [ (_, VInt n) ]) -> n
+        | _ -> 0L
+      with e ->
+        let failure =
+          match e with
+          | Panic (m, s) -> ("in a callback from C: " ^ m, s)
+          | Fatal (m, s) -> (m, s)
+          | Stack_overflow -> ("in a callback from C: stack overflow", cd.fn_span)
+          | Effect.Unhandled _ | Cancelled -> (cb_wait, cd.fn_span)
+          | e -> ("internal: " ^ Printexc.to_string e, cd.fn_span)
+        in
+        if !cb_failure = None then cb_failure := Some failure;
+        cb_fail ();
+        0L
+
+  (* [call name args] calls the top-level function [name], [fns] finds its
+     declaration, and [structs] a struct's. *)
+  let invoke ~call ~fns ~structs (d : fn_decl) args sp =
+    let cs = match Ffi.of_decl ~structs d with Ok cs -> cs | Error _ -> failwith "internal: foreign signature" in
+    let cap, args =
+      if cs.trusted then (VUnit, args)
       else
         match args with
-        | VCap (CForeign allowed) :: rest ->
+        | (VCap (CForeign allowed) as cap) :: rest ->
           if not (permits allowed cs.lib) then raise (Panic (Ffi.denied_msg cs.lib, sp));
-          rest
+          (cap, rest)
         | _ -> failwith "internal: foreign capability"
     in
+    match (cs.lib, args) with
+    | "vela", args -> runtime_helper cs.sym args sp
+    | _ ->
+    let taken = ref [] in
+    let release () =
+      List.iter (fun (pool, k) -> cb_free pool k; Hashtbl.remove cb_handlers ((if pool then 32 else 0) + k)) !taken;
+      taken := []
+    in
+    Fun.protect ~finally:release @@ fun () ->
     let rec conv ps args =
       match (ps, args) with
       | [], _ -> []
-      | (p : Ffi.param) :: ps, _ when p.out -> AOut :: conv ps args
+      | (p : Ffi.param) :: ps, _ when p.out -> Word AOut :: conv ps args
       | p :: ps, a :: args ->
         let c =
           match (p.cty, a) with
-          | Ffi.Int, VInt n -> AInt n
-          | Ffi.Int32, VInt n ->
-            if n < -2147483648L || n > 2147483647L then
-              raise (Panic (sprintf "foreign: %Ld does not fit in Int32 (argument `%s` of `%s`)" n p.name cs.sym, sp));
-            AInt n
-          | Ffi.Float, VFloat x -> AFloat x
-          | Ffi.Bool, VBool b -> AInt (if b then 1L else 0L)
-          | (Ffi.Str | Ffi.Bytes), (VStr s | VBytes s) -> APtr s
-          | Ffi.Handle, VStruct (_, [ (_, VInt n) ]) -> AInt n
+          | Ffi.Int, VInt n -> Word (AInt n)
+          | Ffi.Int32, VInt n -> Small (int32_arg n (sprintf "argument `%s` of `%s`" p.name cs.sym) sp)
+          | Ffi.Float, VFloat x -> Dbl x
+          | Ffi.Bool, VBool b -> Small (if b then 1L else 0L)
+          | (Ffi.Str | Ffi.Bytes), (VStr s | VBytes s) -> Word (APtr s)
+          | Ffi.Handle, VStruct (_, [ (_, VInt n) ]) -> Word (AInt n)
+          | Ffi.Struct (n, fs), v -> Agg (fs, struct_bytes n fs v sp)
+          | Ffi.Fn (cps, r), VFn m ->
+            let pool = r = Ffi.Float in
+            let k = cb_take pool in
+            if k < 0 then raise (Panic ("foreign: too many callbacks in use at once (the interpreter has room for 32)", sp));
+            taken := (pool, k) :: !taken;
+            Hashtbl.replace cb_handlers ((if pool then 32 else 0) + k) (cb_handler ~call ~cap (m, fns m) cps r);
+            Word (AInt (Int64.of_nativeint (cb_addr pool k)))
           | _ -> failwith "internal: foreign argument"
         in
         c :: conv ps args
       | _ :: _, [] -> failwith "internal: foreign arity"
     in
-    match (cs.lib, args) with
-    | "vela", args -> runtime_helper cs.sym args sp
-    | _ ->
-    let cargs = Array.of_list (conv cs.params args) in
+    let cargs = conv cs.params args in
     let fp = match Hashtbl.find_opt syms (cs.lib, cs.sym) with Some p -> p | None -> failwith "internal: unresolved foreign function" in
-    let ri, rf, outs = call fp cargs (if cs.ret = Ffi.Float then 1 else 0) in
-    let int32 n = Int64.of_int32 (Int64.to_int32 n) in
+    let copy = !taken <> [] in
+    let kind, sret = ret_kind cs.ret in
+    let status, words, outs =
+      match cs.fixed with
+      | None ->
+        let ints, floats = place ~sret cargs in
+        call_c fp ints floats kind copy
+      | Some k ->
+        let word_of = function Word c -> c | Small n -> AInt n | Dbl x -> AInt (Int64.bits_of_float x) | Agg _ -> AInt 0L in
+        let ints, floats =
+          if Lazy.force abi = Apple then (List.map word_of cargs, [])
+          else
+            ( List.filter_map (function Dbl _ -> None | a -> Some (word_of a)) cargs,
+              List.filter_map (function Dbl x -> Some x | _ -> None) cargs )
+        in
+        call_var fp (k + if copy then 256 else 0) (Array.of_list ints) (Array.of_list floats) kind
+    in
+    if status <> 0 then begin
+      let m, s = Option.value ~default:("internal: a callback failed", sp) !cb_failure in
+      cb_failure := None;
+      raise (Fatal (m, s))
+    end;
     let of_raw (t : Ffi.cty) n =
       match t with
       | Ffi.Int -> VInt n
@@ -1078,13 +1321,16 @@ module Foreign = struct
       | Ffi.Bool -> VBool (int32 n <> 0L)
       | Ffi.Handle -> handle n
       | Ffi.Str -> VStr (cstr n)
-      | Ffi.Bytes | Ffi.Unit -> VUnit
+      | _ -> VUnit
     in
     let ret =
       match cs.ret with
       | Ffi.Unit -> []
-      | Ffi.Float -> [ VFloat rf ]
-      | t -> [ of_raw t ri ]
+      | Ffi.Struct (n, fs) ->
+        let b = Bytes.create (8 * Array.length words) in
+        Array.iteri (fun k w -> Bytes.set_int64_le b (8 * k) w) words;
+        [ struct_of_bytes n fs b ]
+      | t -> [ of_raw t words.(0) ]
     in
     let out_tys = List.filter_map (fun (p : Ffi.param) -> if p.out then Some p.cty else None) cs.params in
     let outs = List.mapi (fun i t -> of_raw t outs.(i)) out_tys in
@@ -1555,7 +1801,11 @@ and apply rt fv args sp =
     vela_method rt n args sp
   | VFn n ->
     let d = Hashtbl.find rt.fns n in
-    if d.fn_foreign <> None then Foreign.invoke d args sp else call_fn rt d args
+    if d.fn_foreign <> None then
+      Foreign.invoke d args sp
+        ~call:(fun m args -> call_fn rt (Hashtbl.find rt.fns m) args)
+        ~fns:(Hashtbl.find rt.fns) ~structs:(Hashtbl.find_opt rt.structs)
+    else call_fn rt d args
   | VClosure (ps, body, cenv) -> (
     let sc = scope () in
     List.iter2 (fun p a -> bind sc p a) ps args;
@@ -2042,7 +2292,7 @@ let run ?(before_main = fun () -> ()) ~out ~grants (user_items : item list) : (v
         Ok (VEnum ("Result", "Err", [ Option.get !m ]))
       | r, _ -> Ok r
     with
-    | Panic (m, sp) -> Queue.clear runq; Error (m, sp)
+    | Panic (m, sp) | Fatal (m, sp) -> Queue.clear runq; Error (m, sp)
     | Stack_overflow -> Queue.clear runq; Error ("stack overflow", d.fn_span))
 
 let make_rt ~out ~grants (user_items : item list) =
@@ -2099,7 +2349,7 @@ let run_tests_timed ?(select = fun _ -> true) ~out (user_items : item list) :
             schedule (fun () -> !finished) d.fn_span;
             Ok ()
           with
-          | Panic (m, sp) -> Error (m, sp)
+          | Panic (m, sp) | Fatal (m, sp) -> Error (m, sp)
           | Stack_overflow -> Error ("stack overflow", d.fn_span)
         in
         Queue.clear runq;

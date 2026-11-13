@@ -1,19 +1,62 @@
-/* The interpreter's way into C: load a library, find a symbol, and call it.
+/* The interpreter's way into C: load a library, find a symbol, and call it,
+   without libffi. The native backend calls each function through its exact
+   prototype instead, and lets the C compiler do the ABI.
 
-   Calls go through one generic function-pointer type that takes 8 integer
-   and 8 double arguments. On the 64-bit ABIs Vela supports (x86-64 System V
-   and arm64, Apple's included) integer and floating-point arguments are
-   assigned to their own register sequences, and up to 8 doubles all travel
-   in registers, so a callee with at most 8 integer-like and 8 double
-   parameters reads exactly the arguments it declares, in order; the extra
-   ones are ignored. This does not hold for variadic functions, which the
-   checker never lets through. The native backend calls each function
-   through its exact prototype instead. */
+   Plain calls. Every call goes through one of a few function-pointer types
+   that take 24 integer and 8 double arguments (vela_gi and friends). On the
+   64-bit ABIs Vela supports (x86-64 System V, arm64 AAPCS64, and Apple's
+   arm64 variant) integer and floating-point arguments are assigned to their
+   own register sequences, and arguments that do not fit in registers go on
+   the stack in order. So the integer arguments of the stub are the callee's
+   integer registers (6 on x86-64, 5 when a hidden struct-result pointer
+   takes the first, 8 on arm64) followed by an image of its stack arguments,
+   8 bytes per stub argument, and its 8 doubles are the callee's floating
+   point registers. The interpreter (Foreign in interp.ml) lays out each
+   call that way for the ABI vela_ffi_abi reports: which register or stack
+   bytes each argument goes to, how a struct by value is split (x86-64:
+   eightbytes classified INTEGER or SSE, memory beyond 16 bytes; arm64:
+   homogeneous Float aggregates in FP registers, other structs of up to 16
+   bytes in integer registers, larger ones copied to memory and passed by
+   pointer; Apple packs 4-byte arguments on the stack at 4-byte alignment).
+   A callee reads exactly the registers and stack bytes it declares; the
+   rest of the stub's arguments are ignored. The result comes back through a
+   stub whose result type the C compiler returns in the same registers:
+   int64_t (rax / x0), double (xmm0 / d0), pairs of them, 3 or 4 doubles
+   (an arm64 floating-point aggregate), or a 128-byte struct, which the C
+   compiler returns through memory (the hidden pointer in rdi on x86-64, x8
+   on arm64), as it does the callee's larger structs.
+
+   Variadic calls (vela_ffi_call_var). On x86-64 and on arm64 Linux a
+   variadic argument travels like any other, and va_arg reads the integer
+   and floating-point registers by class, so one stub declared
+   `int64_t (int64_t, ...)` passes the integer-like arguments (fixed, then
+   variadic) and then 8 doubles; the C compiler sets %al on x86-64. On
+   Apple arm64 every variadic argument goes on the stack in an 8-byte slot,
+   so the stub must have exactly as many fixed parameters as the callee:
+   one per count, 1 to 6, all integer-like (the checker allows nothing
+   else before `...`), then 8 slots holding the variadic arguments' bit
+   patterns in order.
+
+   Callbacks (trampolines). C calls a Vela function through one of a fixed
+   pool of trampolines that take 8 integer and 8 double arguments, the same
+   way round: a callee's parameters arrive in those registers (and the stack
+   slots after them, on x86-64). One pool returns int64_t, the other double.
+   A trampoline calls the interpreter (caml_callback) with its slot number.
+   A slot is taken for the duration of one foreign call. A panic in the
+   callback cannot unwind through C's frames: the interpreter records it, and
+   the trampoline jumps (longjmp) back to the foreign call that is running,
+   skipping only C frames, which then ends the program. */
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <pthread.h>
+#include <setjmp.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <caml/alloc.h>
+#include <caml/callback.h>
 #include <caml/memory.h>
 #include <caml/mlvalues.h>
 
@@ -38,55 +81,290 @@ value vela_ffi_sym(value lib, value name) {
   CAMLreturn(caml_copy_nativeint((intnat)p));
 }
 
-typedef int64_t (*vela_fi)(int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-                           double, double, double, double, double, double, double, double);
-typedef double (*vela_ff)(int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-                          double, double, double, double, double, double, double, double);
+/* vela_ffi_abi : unit -> int (0 x86-64 System V, 1 arm64 AAPCS64, 2 Apple arm64) */
+value vela_ffi_abi(value unit) {
+  (void)unit;
+#if defined(__aarch64__) && defined(__APPLE__)
+  return Val_int(2);
+#elif defined(__aarch64__)
+  return Val_int(1);
+#elif defined(__x86_64__)
+  return Val_int(0);
+#else
+#error "foreign calls in the interpreter support x86-64 and arm64"
+#endif
+}
 
-/* vela_ffi_call : nativeint -> arg array -> int (result kind) -> int64 * float * int64 array
+#define NI 24 /* integer words: registers, then the stack image */
+#define I24 int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, \
+            int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t
+#define D8 double, double, double, double, double, double, double, double
+#define AI24 iv[0], iv[1], iv[2], iv[3], iv[4], iv[5], iv[6], iv[7], iv[8], iv[9], iv[10], iv[11], iv[12], iv[13], iv[14], iv[15], \
+             iv[16], iv[17], iv[18], iv[19], iv[20], iv[21], iv[22], iv[23]
+#define AD8 fv[0], fv[1], fv[2], fv[3], fv[4], fv[5], fv[6], fv[7]
 
-   arg is the OCaml variant
+typedef struct { int64_t a, b; } vela_ii;
+typedef struct { double a, b; } vela_dd;
+typedef struct { int64_t a; double b; } vela_id;
+typedef struct { double a; int64_t b; } vela_di;
+typedef struct { double a, b, c; } vela_d3;
+typedef struct { double a, b, c, d; } vela_d4;
+typedef struct { int64_t w[16]; } vela_big;
+typedef int64_t (*vela_gi)(I24, D8);
+typedef double (*vela_gd)(I24, D8);
+typedef vela_ii (*vela_gii)(I24, D8);
+typedef vela_dd (*vela_gdd)(I24, D8);
+typedef vela_id (*vela_gid)(I24, D8);
+typedef vela_di (*vela_gdi)(I24, D8);
+typedef vela_d3 (*vela_gd3)(I24, D8);
+typedef vela_d4 (*vela_gd4)(I24, D8);
+typedef vela_big (*vela_gbig)(I24, D8);
+
+/* The innermost foreign call a failed callback jumps back to, and whether
+   the interpreter has reported a failure (vela_ffi_cb_fail). The
+   interpreter runs on one thread. */
+static jmp_buf *vela_cb_jmp;
+static int vela_cb_failed;
+
+/* An argument word. arg is the OCaml variant
      | AInt of int64      (tag 0)
-     | AFloat of float    (tag 1)
+     | AFloat of float    (tag 1: its bit pattern)
      | APtr of string     (tag 2: a pointer to the string's bytes, NUL-terminated by OCaml)
+     | ABlob of string    (tag 3: a pointer to a copy of the bytes, freed after the call)
      | AOut               (constant 0: a pointer to a fresh zeroed 8-byte slot)
-   Result kind: 0 integer-like (the int64 register), 1 double.
-   The out slots come back in order, as raw 8-byte values. No OCaml allocation
-   happens between reading a string's address and the call, so the GC cannot
-   move it meanwhile. */
-value vela_ffi_call(value fn, value args, value kind) {
-  CAMLparam3(fn, args, kind);
-  CAMLlocal2(r, outs);
-  int64_t iv[8] = { 0 };
-  double fv[8] = { 0 };
-  int64_t slots[8] = { 0 };
-  int ni = 0, nf = 0, no = 0;
-  mlsize_t n = Wosize_val(args);
-  for (mlsize_t k = 0; k < n; k++) {
-    value a = Field(args, k);
-    if (Is_long(a)) {
-      if (ni < 8) iv[ni++] = (int64_t)(intptr_t)&slots[no++];
-    } else
-      switch (Tag_val(a)) {
-      case 0: if (ni < 8) iv[ni++] = Int64_val(Field(a, 0)); break;
-      case 1: if (nf < 8) fv[nf++] = Double_val(Field(a, 0)); break;
-      case 2: if (ni < 8) iv[ni++] = (int64_t)(intptr_t)String_val(Field(a, 0)); break;
-      }
+   With [copy] (a callback may run, and the OCaml heap may move while it
+   does), APtr points to a copy too. Otherwise no OCaml allocation happens
+   between reading a string's address and the call, so the GC cannot move it
+   meanwhile. */
+static int64_t vela_word(value a, int copy, int64_t *slots, int *no, void **owned, int *nown) {
+  if (Is_long(a)) return (int64_t)(intptr_t)&slots[(*no)++];
+  switch (Tag_val(a)) {
+  case 0: return Int64_val(Field(a, 0));
+  case 1: { double d = Double_val(Field(a, 0)); int64_t x; memcpy(&x, &d, 8); return x; }
+  case 2:
+    if (!copy) return (int64_t)(intptr_t)String_val(Field(a, 0));
+    /* fall through */
+  default: {
+    mlsize_t n = caml_string_length(Field(a, 0));
+    char *p = malloc(n + 1);
+    if (!p) { fputs("panic: out of memory\n", stderr); exit(1); }
+    memcpy(p, String_val(Field(a, 0)), n + 1);
+    owned[(*nown)++] = p;
+    return (int64_t)(intptr_t)p;
   }
-  void *f = (void *)Nativeint_val(fn);
-  int64_t ri = 0;
-  double rf = 0;
-  if (Int_val(kind) == 1)
-    rf = ((vela_ff)f)(iv[0], iv[1], iv[2], iv[3], iv[4], iv[5], iv[6], iv[7], fv[0], fv[1], fv[2], fv[3], fv[4], fv[5], fv[6], fv[7]);
-  else
-    ri = ((vela_fi)f)(iv[0], iv[1], iv[2], iv[3], iv[4], iv[5], iv[6], iv[7], fv[0], fv[1], fv[2], fv[3], fv[4], fv[5], fv[6], fv[7]);
+  }
+}
+
+static value vela_result(int status, int64_t *w, int nw, int64_t *slots, int no) {
+  CAMLparam0();
+  CAMLlocal4(r, words, outs, x);
+  words = caml_alloc(nw, 0);
+  for (int k = 0; k < nw; k++) { x = caml_copy_int64(w[k]); Store_field(words, k, x); }
   outs = caml_alloc(no, 0);
-  for (int k = 0; k < no; k++) Store_field(outs, k, caml_copy_int64(slots[k]));
+  for (int k = 0; k < no; k++) { x = caml_copy_int64(slots[k]); Store_field(outs, k, x); }
   r = caml_alloc_tuple(3);
-  Store_field(r, 0, caml_copy_int64(ri));
-  Store_field(r, 1, caml_copy_double(rf));
+  Store_field(r, 0, Val_int(status));
+  Store_field(r, 1, words);
   Store_field(r, 2, outs);
   CAMLreturn(r);
+}
+
+/* vela_ffi_call : nativeint -> arg array -> float array -> int -> bool -> int * int64 array * int64 array
+
+   (function, integer words, doubles, result kind, copy) -> (status, result
+   words, out slots). Result kinds: 0 int64_t, 1 double, 2 two int64_t, 3
+   two doubles, 4 int64_t then double, 5 double then int64_t, 6 three
+   doubles, 7 four doubles, 8 a struct returned through memory (16 words).
+   The words are the result's bytes in memory order. Status 1: a callback
+   failed and the call was abandoned. */
+value vela_ffi_call(value fn, value ints, value floats, value kind, value copy) {
+  CAMLparam5(fn, ints, floats, kind, copy);
+  int64_t iv[NI] = { 0 };
+  double fv[8] = { 0 };
+  int64_t slots[NI] = { 0 };
+  void *owned[NI];
+  int no = 0, nown = 0;
+  int cp = Bool_val(copy);
+  mlsize_t n = Wosize_val(ints);
+  for (mlsize_t k = 0; k < n && k < NI; k++) iv[k] = vela_word(Field(ints, k), cp, slots, &no, owned, &nown);
+  mlsize_t nf = Wosize_val(floats) / Double_wosize;
+  for (mlsize_t k = 0; k < nf && k < 8; k++) fv[k] = Double_flat_field(floats, k);
+  void *f = (void *)Nativeint_val(fn);
+  int64_t w[16] = { 0 };
+  int nw = 1;
+  volatile int status = 0;
+  jmp_buf jb;
+  jmp_buf *prev = vela_cb_jmp;
+  if (setjmp(jb) == 0) {
+    vela_cb_jmp = &jb;
+    switch (Int_val(kind)) {
+    case 1: { double d = ((vela_gd)f)(AI24, AD8); memcpy(w, &d, 8); break; }
+    case 2: { vela_ii x = ((vela_gii)f)(AI24, AD8); memcpy(w, &x, 16); nw = 2; break; }
+    case 3: { vela_dd x = ((vela_gdd)f)(AI24, AD8); memcpy(w, &x, 16); nw = 2; break; }
+    case 4: { vela_id x = ((vela_gid)f)(AI24, AD8); memcpy(w, &x, 16); nw = 2; break; }
+    case 5: { vela_di x = ((vela_gdi)f)(AI24, AD8); memcpy(w, &x, 16); nw = 2; break; }
+    case 6: { vela_d3 x = ((vela_gd3)f)(AI24, AD8); memcpy(w, &x, 24); nw = 3; break; }
+    case 7: { vela_d4 x = ((vela_gd4)f)(AI24, AD8); memcpy(w, &x, 32); nw = 4; break; }
+    case 8: { vela_big x = ((vela_gbig)f)(AI24, AD8); memcpy(w, &x, sizeof x); nw = 16; break; }
+    default: w[0] = ((vela_gi)f)(AI24, AD8); break;
+    }
+  } else
+    status = 1;
+  vela_cb_jmp = prev;
+  for (int k = 0; k < nown; k++) free(owned[k]);
+  CAMLreturn(vela_result(status, w, status ? 0 : nw, slots, status ? 0 : no));
+}
+
+/* vela_ffi_call_var : nativeint -> int -> arg array -> float array -> int -> int * int64 array * int64 array
+
+   (function, fixed + 256 * copy, integer words, doubles, result kind 0 or
+   1). Apple arm64: the words are the fixed arguments, then the variadic
+   ones' bit patterns in order (doubles included). Elsewhere: the
+   integer-like arguments, fixed then variadic, and the doubles apart. */
+#define V8(k) iv[k], iv[k + 1], iv[k + 2], iv[k + 3], iv[k + 4], iv[k + 5], iv[k + 6], iv[k + 7]
+#define VCALL(RT, out)                                                                                                         \
+  switch (fixed) {                                                                                                             \
+  case 1: out = ((RT (*)(int64_t, ...))f)(iv[0], V8(1)); break;                                                               \
+  case 2: out = ((RT (*)(int64_t, int64_t, ...))f)(iv[0], iv[1], V8(2)); break;                                               \
+  case 3: out = ((RT (*)(int64_t, int64_t, int64_t, ...))f)(iv[0], iv[1], iv[2], V8(3)); break;                               \
+  case 4: out = ((RT (*)(int64_t, int64_t, int64_t, int64_t, ...))f)(iv[0], iv[1], iv[2], iv[3], V8(4)); break;               \
+  case 5: out = ((RT (*)(int64_t, int64_t, int64_t, int64_t, int64_t, ...))f)(iv[0], iv[1], iv[2], iv[3], iv[4], V8(5)); break; \
+  default:                                                                                                                     \
+    out = ((RT (*)(int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, ...))f)(iv[0], iv[1], iv[2], iv[3], iv[4], iv[5], V8(6)); \
+    break;                                                                                                                     \
+  }
+value vela_ffi_call_var(value fn, value flags, value ints, value floats, value kind) {
+  CAMLparam5(fn, flags, ints, floats, kind);
+  int64_t iv[NI] = { 0 };
+  double fv[8] = { 0 };
+  int64_t slots[NI] = { 0 };
+  void *owned[NI];
+  int no = 0, nown = 0;
+  int fixed = Int_val(flags) & 255, cp = Int_val(flags) >> 8;
+  mlsize_t n = Wosize_val(ints);
+  for (mlsize_t k = 0; k < n && k < NI; k++) iv[k] = vela_word(Field(ints, k), cp, slots, &no, owned, &nown);
+  mlsize_t nf = Wosize_val(floats) / Double_wosize;
+  for (mlsize_t k = 0; k < nf && k < 8; k++) fv[k] = Double_flat_field(floats, k);
+  void *f = (void *)Nativeint_val(fn);
+  int64_t w[1] = { 0 };
+  volatile int status = 0;
+  jmp_buf jb;
+  jmp_buf *prev = vela_cb_jmp;
+  if (setjmp(jb) == 0) {
+    vela_cb_jmp = &jb;
+#if defined(__aarch64__) && defined(__APPLE__)
+    if (Int_val(kind) == 1) { double d = 0; VCALL(double, d); memcpy(w, &d, 8); }
+    else { VCALL(int64_t, w[0]); }
+#else
+    (void)fixed;
+    if (Int_val(kind) == 1) {
+      double d = ((double (*)(int64_t, ...))f)(iv[0], iv[1], iv[2], iv[3], iv[4], iv[5], iv[6], iv[7], iv[8], iv[9], iv[10], iv[11],
+                                               iv[12], iv[13], AD8);
+      memcpy(w, &d, 8);
+    } else
+      w[0] = ((int64_t (*)(int64_t, ...))f)(iv[0], iv[1], iv[2], iv[3], iv[4], iv[5], iv[6], iv[7], iv[8], iv[9], iv[10], iv[11], iv[12],
+                                            iv[13], AD8);
+#endif
+  } else
+    status = 1;
+  vela_cb_jmp = prev;
+  for (int k = 0; k < nown; k++) free(owned[k]);
+  CAMLreturn(vela_result(status, w, status ? 0 : 1, slots, status ? 0 : no));
+}
+
+/* ---- callbacks ---- */
+
+#define NCB 32
+static int vela_cb_used[2][NCB];
+static pthread_t vela_cb_thread;
+
+static int64_t vela_cb_call(int pool, int slot, int64_t *a, double *d) {
+  CAMLparam0();
+  CAMLlocal4(ia, fa, x, r);
+  static const value *cb = NULL;
+  if (!cb) cb = caml_named_value("vela_ffi_callback");
+  ia = caml_alloc(8, 0);
+  for (int k = 0; k < 8; k++) { x = caml_copy_int64(a[k]); Store_field(ia, k, x); }
+  fa = caml_alloc(8 * Double_wosize, Double_array_tag);
+  for (int k = 0; k < 8; k++) Store_double_flat_field(fa, k, d[k]);
+  r = caml_callback3_exn(*cb, Val_int(pool * NCB + slot), ia, fa);
+  if (Is_exception_result(r)) { vela_cb_failed = 1; CAMLreturnT(int64_t, 0); }
+  CAMLreturnT(int64_t, Int64_val(r));
+}
+
+static int64_t vela_cb_run(int pool, int slot, int64_t *a, double *d) {
+  if (!vela_cb_used[pool][slot] || !pthread_equal(pthread_self(), vela_cb_thread)) {
+    fputs("panic: a callback from C ran after its foreign call returned, or on another thread\n", stderr);
+    fflush(stderr);
+    _exit(1);
+  }
+  int64_t r = vela_cb_call(pool, slot, a, d);
+  if (vela_cb_failed) {
+    vela_cb_failed = 0;
+    if (vela_cb_jmp) longjmp(*vela_cb_jmp, 1);
+  }
+  return r;
+}
+
+#define TRAMP(n)                                                                                                            \
+  static int64_t vela_cbi_##n(int64_t a0, int64_t a1, int64_t a2, int64_t a3, int64_t a4, int64_t a5, int64_t a6, int64_t a7, \
+                              double d0, double d1, double d2, double d3, double d4, double d5, double d6, double d7) {     \
+    int64_t a[8] = { a0, a1, a2, a3, a4, a5, a6, a7 };                                                                     \
+    double d[8] = { d0, d1, d2, d3, d4, d5, d6, d7 };                                                                      \
+    return vela_cb_run(0, n, a, d);                                                                                        \
+  }                                                                                                                         \
+  static double vela_cbd_##n(int64_t a0, int64_t a1, int64_t a2, int64_t a3, int64_t a4, int64_t a5, int64_t a6, int64_t a7, \
+                             double d0, double d1, double d2, double d3, double d4, double d5, double d6, double d7) {      \
+    int64_t a[8] = { a0, a1, a2, a3, a4, a5, a6, a7 };                                                                     \
+    double d[8] = { d0, d1, d2, d3, d4, d5, d6, d7 };                                                                      \
+    int64_t r = vela_cb_run(1, n, a, d);                                                                                   \
+    double x;                                                                                                               \
+    memcpy(&x, &r, 8);                                                                                                      \
+    return x;                                                                                                               \
+  }
+TRAMP(0) TRAMP(1) TRAMP(2) TRAMP(3) TRAMP(4) TRAMP(5) TRAMP(6) TRAMP(7) TRAMP(8) TRAMP(9) TRAMP(10) TRAMP(11) TRAMP(12) TRAMP(13)
+TRAMP(14) TRAMP(15) TRAMP(16) TRAMP(17) TRAMP(18) TRAMP(19) TRAMP(20) TRAMP(21) TRAMP(22) TRAMP(23) TRAMP(24) TRAMP(25) TRAMP(26)
+TRAMP(27) TRAMP(28) TRAMP(29) TRAMP(30) TRAMP(31)
+#define TL(p)                                                                                                                       \
+  { (void *)vela_cb##p##_0, (void *)vela_cb##p##_1, (void *)vela_cb##p##_2, (void *)vela_cb##p##_3, (void *)vela_cb##p##_4,       \
+    (void *)vela_cb##p##_5, (void *)vela_cb##p##_6, (void *)vela_cb##p##_7, (void *)vela_cb##p##_8, (void *)vela_cb##p##_9,       \
+    (void *)vela_cb##p##_10, (void *)vela_cb##p##_11, (void *)vela_cb##p##_12, (void *)vela_cb##p##_13, (void *)vela_cb##p##_14,  \
+    (void *)vela_cb##p##_15, (void *)vela_cb##p##_16, (void *)vela_cb##p##_17, (void *)vela_cb##p##_18, (void *)vela_cb##p##_19,  \
+    (void *)vela_cb##p##_20, (void *)vela_cb##p##_21, (void *)vela_cb##p##_22, (void *)vela_cb##p##_23, (void *)vela_cb##p##_24,  \
+    (void *)vela_cb##p##_25, (void *)vela_cb##p##_26, (void *)vela_cb##p##_27, (void *)vela_cb##p##_28, (void *)vela_cb##p##_29,  \
+    (void *)vela_cb##p##_30, (void *)vela_cb##p##_31 }
+static void *const vela_cb_addrs[2][NCB] = { TL(i), TL(d) };
+
+/* vela_ffi_cb_take : bool (double result) -> int: a free slot, now taken, or -1 */
+value vela_ffi_cb_take(value dbl) {
+  int p = Bool_val(dbl);
+  for (int k = 0; k < NCB; k++)
+    if (!vela_cb_used[p][k]) {
+      vela_cb_used[p][k] = 1;
+      vela_cb_thread = pthread_self();
+      return Val_int(k);
+    }
+  return Val_int(-1);
+}
+
+/* vela_ffi_cb_free : bool -> int -> unit */
+value vela_ffi_cb_free(value dbl, value k) {
+  vela_cb_used[Bool_val(dbl)][Int_val(k)] = 0;
+  return Val_unit;
+}
+
+/* vela_ffi_cb_addr : bool -> int -> nativeint (the slot's trampoline) */
+value vela_ffi_cb_addr(value dbl, value k) {
+  CAMLparam2(dbl, k);
+  CAMLreturn(caml_copy_nativeint((intnat)vela_cb_addrs[Bool_val(dbl)][Int_val(k)]));
+}
+
+/* vela_ffi_cb_fail : unit -> unit: the callback running now failed; its
+   trampoline abandons the foreign call */
+value vela_ffi_cb_fail(value unit) {
+  (void)unit;
+  vela_cb_failed = 1;
+  return Val_unit;
 }
 
 /* vela_ffi_cstr : int64 -> string (the NUL-terminated string at the address; "" for NULL) */

@@ -1096,7 +1096,29 @@ and check_call ?want ctx f e callee args sp =
              (if List.length args = 1 then "was" else "were"));
         check_args ctx f args
       end
-      else List.iter2 (fun a p -> expect ctx f a p) args ps;
+      else begin
+        match callee.edesc with
+        | EVar n when lookup f n = None && Hashtbl.mem foreign_fns n ->
+          (* a callback may take the call's Foreign first, before what C passes *)
+          let ps =
+            match ps with
+            | TCap Foreign :: _ ->
+              List.map2
+                (fun (a : expr) p ->
+                  match (repr p, a.edesc) with
+                  | TFn (cps, r), EVar m when lookup f m = None -> (
+                    match Hashtbl.find_opt ctx.fns m with
+                    | Some s when (match s.ps with TCap Foreign :: rest -> List.length rest = List.length cps | _ -> false) ->
+                      TFn (TCap Foreign :: cps, r)
+                    | _ -> p)
+                  | _ -> p)
+                args ps
+            | _ -> ps
+          in
+          List.iter2 (fun a p -> expect ctx f a p) args ps;
+          check_callbacks ctx f args ps
+        | _ -> List.iter2 (fun a p -> expect ctx f a p) args ps
+      end;
       if labelled then begin
         e.edesc <- ECall (callee, args);
         keep_order e written r
@@ -1112,6 +1134,22 @@ and check_call ?want ctx f e callee args sp =
       err ctx "E0108" callee.espan (sprintf "a value of type `%s` is not a function" (show t));
       check_args ctx f args;
       TErr)
+
+(* A callback passed to C names a top-level function: C calls it with its
+   arguments alone, so it has nowhere to keep a closure's captured values. *)
+and check_callbacks ctx f args ps =
+  List.iter2
+    (fun (a : expr) p ->
+      match repr p with
+      | TFn _ -> (
+        match a.edesc with
+        | EVar m when lookup f m = None && (match Hashtbl.find_opt ctx.fns m with Some s -> s.gen = [] | None -> false) -> ()
+        | _ ->
+          err ctx "E0332" a.espan "a callback to C is a top-level function, passed by its name"
+            ~notes:
+              [ "C calls it with its arguments alone, so it has nowhere to keep a closure's captured values; pass what it needs through C (most C functions that take a callback also take a pointer for it)" ])
+      | _ -> ())
+    args ps
 
 and check_field ctx f e recv name nsp =
   match recv.edesc with
@@ -2339,6 +2377,8 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
         pending := []
       | IStruct s when not (registered ctx.structs s.st_name s) -> ()
       | IStruct s ->
+        Hashtbl.reset param_kinds;
+        (if s.st_foreign <> None then match Ffi.struct_fields s with Ok _ -> () | Error es -> List.iter (fun (sp, m) -> err ctx "E0330" sp m) es);
         let env = List.map (fun g -> (g, TParam g)) s.st_gen in
         let seen = Hashtbl.create 8 in
         let fs =
@@ -2433,7 +2473,7 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
               Hashtbl.replace foreign_fns d.fn_name ();
               (* the Vela type of a C function: Foreign first, Out parameters moved to the result *)
               if d.fn_name = "main" then err ctx "E0330" d.fn_span "`main` cannot be a foreign function";
-              match Ffi.of_decl d with
+              match Ffi.of_decl ~structs:(Hashtbl.find_opt ctx.structs) d with
               | Ok cs -> (Ffi.visible_params cs, Ffi.result_ty cs)
               | Error es ->
                 List.iter (fun (sp, m) -> err ctx "E0330" sp m) es;

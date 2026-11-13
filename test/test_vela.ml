@@ -1140,6 +1140,239 @@ fn main(root: Root) {
     run_native ~grants:libc "ffi-missing-native" "foreign \"c\" {\n    fn vela_no_such_function() -> Int\n}\n\nfn main(root: Root) {\n    root.stdout.print(\"{vela_no_such_function(root.foreign)}\")\n}\n" (function
      | Error m -> ok "ffi-missing/native" (Interp_util.find_sub m "vela_no_such_function" 0 <> None) m
      | Ok _ -> ok "ffi-missing/native" false "linked");
+  (* variadic functions: each declaration fixes the types it passes after `...` *)
+  let vdecls = {|foreign "c" {
+    fn malloc(n: Int) -> Handle
+    fn free(p: Handle)
+    fn snprintf(buf: Handle, size: Int, format: Str, ..., n: Int32, x: Float, s: Str, on: Bool) -> Int32
+    fn format_int(buf: Handle, size: Int, format: Str, ..., n: Int) -> Int32 = "snprintf"
+    fn format8(buf: Handle, size: Int, format: Str, ..., a: Int, b: Int, c: Int, d: Int, e: Int, f: Int, g: Int, h: Int) -> Int32 = "snprintf"
+    fn format_floats(buf: Handle, size: Int, format: Str, ..., a: Float, b: Float, c: Float, d: Float, e: Float, f: Float, g: Float, h: Float) -> Int32 = "snprintf"
+    fn format_none(buf: Handle, size: Int, format: Str, ...) -> Int32 = "snprintf"
+}
+|} in
+  out "ffi-variadic" ~grants:libc
+    (vdecls ^ {|
+fn main(root: Root) {
+    let f = root.foreign
+    let buf = malloc(f, 128)
+    let n = snprintf(f, buf, 128, "%d|%.3f|%s|%d", -42, 2.5, "text", true)
+    root.stdout.print("{n} {f.copy(buf, n).to_str()}")
+    let m = format_int(f, buf, 128, "<%lld>", 9000000000)
+    root.stdout.print("{f.copy(buf, m).to_str()}")
+    let k = format8(f, buf, 128, "%lld %lld %lld %lld %lld %lld %lld %lld", 1, 2, 3, 4, 5, 6, 7, -8)
+    root.stdout.print("{f.copy(buf, k).to_str()}")
+    let j = format_floats(f, buf, 128, "%g %g %g %g %g %g %g %g", 0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, -7.5)
+    root.stdout.print("{f.copy(buf, j).to_str()}")
+    let e = format_none(f, buf, 128, "plain")
+    root.stdout.print("{f.copy(buf, e).to_str()}")
+    free(f, buf)
+}
+|})
+    "16 -42|2.500|text|1\n<9000000000>\n1 2 3 4 5 6 7 -8\n0.5 1.5 2.5 3.5 4.5 5.5 6.5 -7.5\nplain\n";
+  panics "ffi-variadic-int32" ~grants:libc
+    (vdecls ^ "\nfn main(root: Root) {\n    let f = root.foreign\n    let buf = malloc(f, 16)\n    snprintf(f, buf, 16, \"%d\", 5000000000, 1.0, \"\", false);\n}\n")
+    "foreign: 5000000000 does not fit in Int32 (argument `n` of `snprintf`)";
+  (* structs by value: libc's div and lldiv return one *)
+  out "ffi-struct-libc" ~grants:libc
+    {|foreign "c" {
+    struct Div { quot: Int32, rem: Int32 }
+    pub struct LongDiv { quot: Int, rem: Int }
+    fn div(a: Int32, b: Int32) -> Div
+    fn lldiv(a: Int, b: Int) -> LongDiv
+}
+
+fn main(root: Root) {
+    let f = root.foreign
+    let d = div(f, 17, -5)
+    let l = lldiv(f, 9000000000, 7)
+    root.stdout.print("{d} {d.quot * 10 + d.rem} {l}")
+}
+|}
+    "Div { quot: -3, rem: 2 } -28 LongDiv { quot: 1285714285, rem: 5 }\n";
+  (* callbacks: qsort calls a top-level function, which gets the call's Foreign first *)
+  let qdecls = {|foreign "c" {
+    fn malloc(n: Int) -> Handle
+    fn free(p: Handle)
+    fn memcpy(dst: Handle, src: Bytes, n: Int) -> Handle
+    fn qsort(base: Handle, n: Int, size: Int, cmp: fn(Handle, Handle) -> Int32)
+}
+
+fn by_byte(f: Foreign, a: Handle, b: Handle) -> Int {
+    f.copy(a, 1)[0] - f.copy(b, 1)[0]
+}
+
+fn too_big(a: Handle, b: Handle) -> Int {
+    3000000000
+}
+|} in
+  out "ffi-qsort" ~grants:libc
+    (qdecls ^ {|
+fn main(root: Root) {
+    let f = root.foreign
+    let data = bytes([5, 3, 9, 1, 7, 200, 0])
+    let buf = malloc(f, data.len())
+    memcpy(f, buf, data, data.len())
+    qsort(f, buf, data.len(), 1, by_byte)
+    root.stdout.print("{f.copy(buf, data.len())}")
+    free(f, buf)
+}
+|})
+    "bytes([0, 1, 3, 5, 7, 9, 200])\n";
+  panics "ffi-callback-int32" ~grants:libc
+    (qdecls ^ "\nfn main(root: Root) {\n    let f = root.foreign\n    let buf = malloc(f, 2)\n    memcpy(f, buf, bytes([2, 1]), 2)\n    qsort(f, buf, 2, 1, too_big)\n}\n")
+    "in a callback from C: foreign: 3000000000 does not fit in Int32 (the result of callback `too_big`)";
+  (* callbacks from many tasks at once, each on its own task's thread *)
+  let qsort_group = qdecls ^ {|
+fn main(root: Root) {
+    let f = root.foreign
+    let sorted = group g {
+        for i in 0..<8 {
+            g.go(|| {
+                let data = bytes([9, i, 4, 7 - i, 1])
+                let buf = malloc(f, 5)
+                memcpy(f, buf, data, 5)
+                qsort(f, buf, 5, 1, by_byte)
+                let r = f.copy(buf, 5)
+                free(f, buf)
+                r[0] + r[4] * 100
+            })
+        }
+    }
+    root.stdout.print("{sorted}")
+}
+|} in
+  out "ffi-callback-group" ~grants:libc qsort_group "[900, 901, 901, 901, 901, 901, 901, 900]\n";
+  check_tsan "ffi-callback-group" ~grants:libc qsort_group "[900, 901, 901, 901, 901, 901, 901, 900]\n";
+  (* structs of every shape the calling conventions treat differently, and
+     callbacks, against a small C library (test/ffi_test.c) built here *)
+  (* next to the test binary, not in $TMPDIR: dune gives each run a temporary
+     directory of its own, which can be gone while binaries still point at it *)
+  let vt_dir = Filename.concat (Filename.dirname Sys.executable_name) "vela-ffi-test" in
+  (try Unix.mkdir vt_dir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+  let vt_src = let d = Filename.concat (Sys.getcwd ()) "ffi_test.c" in if Sys.file_exists d then d else Filename.concat (Sys.getcwd ()) "test/ffi_test.c" in
+  let macos = Sys.file_exists "/System/Library/CoreServices" in
+  let vt_lib = Filename.concat vt_dir (if macos then "libvelatest.dylib" else "libvelatest.so") in
+  let built =
+    Sys.command
+      (String.concat " "
+         (List.map Filename.quote
+            ([ Native.cc (); "-shared"; "-fPIC"; "-O1"; "-o"; vt_lib; vt_src ] @ if macos then [ "-install_name"; vt_lib ] else []))
+      ^ " 2>&1")
+    = 0
+  in
+  ok "ffi-test-lib" built "cannot build test/ffi_test.c";
+  let add_path var = Unix.putenv var (vt_dir ^ match Sys.getenv_opt var with Some p when p <> "" -> ":" ^ p | _ -> "") in
+  add_path "LIBRARY_PATH";
+  if not macos then add_path "LD_LIBRARY_PATH";
+  (match Interp.Foreign.dl_open vt_lib with h, _ when h <> 0n -> Hashtbl.replace Interp.Foreign.libs "velatest" h | _ -> ());
+  let vt = { Interp.no_grants with foreign = [ "velatest" ] } in
+  let vtdecls = {|foreign "velatest" {
+    struct P2 { a: Int32, b: Int32 }
+    struct T3 { a: Int32, b: Int32, c: Int32 }
+    struct V2 { x: Float, y: Float }
+    struct V3 { x: Float, y: Float, z: Float }
+    struct V4 { a: Float, b: Float, c: Float, d: Float }
+    struct NX { n: Int, x: Float }
+    struct XK { x: Float, k: Int32 }
+    struct Big { a: Int32, b: Int, on: Bool, h: Handle, x: Float }
+
+    fn vt_p2_swap(p: P2) -> P2
+    fn vt_t3_rot(t: T3) -> T3
+    fn vt_v2_add(a: V2, b: V2) -> V2
+    fn vt_v3_scale(v: V3, k: Float) -> V3
+    fn vt_v4(x: Float) -> V4
+    fn vt_nx(a: NX, m: Int) -> NX
+    fn vt_xk(a: XK) -> XK
+    fn vt_big(b: Big, d: Int32) -> Big
+    fn vt_tight(a: Int, b: Int, c: Int, d: Int, e: Int, t: T3) -> Int
+    fn vt_spill(a: Int, b: Int, c: Int, d: Int, e: Int, f: Int, g: Int, n: NX, z: Float) -> Float
+    fn vt_pack(a: Int, b: Int, c: Int, d: Int, p: XK, q: XK, h1: Int32, h2: Int32) -> Int
+    fn vt_bool(on: Bool) -> Int32
+    fn vt_apply(f: fn(Float, Int) -> Float, x: Float, n: Int) -> Float
+    fn vt_each(f: fn(Str, Int) -> Int, n: Int) -> Int
+    fn vt_call8(f: fn(Int, Int, Int, Int, Int, Int, Int, Int) -> Int) -> Int
+    fn vt_mixed(f: fn(Int32, Float, Int32, Float, Handle) -> Int) -> Int
+    fn vt_note(n: Int)
+    fn vt_noted() -> Int
+    fn vt_times(f: fn(Int) -> (), n: Int)
+}
+
+fn poly(x: Float, n: Int) -> Float {
+    if n > 2 { x * x } else { x }
+}
+
+fn nested(f: Foreign, x: Float, n: Int) -> Float {
+    vt_apply(f, poly, x, n)
+}
+
+fn weigh(name: Str, i: Int) -> Int {
+    name.len() * 10 + i
+}
+
+fn sum8(a: Int, b: Int, c: Int, d: Int, e: Int, f: Int, g: Int, h: Int) -> Int {
+    a + 2 * b + 3 * c + 4 * d + 5 * e + 6 * f + 7 * g + 8 * h
+}
+
+fn mixed(a: Int, x: Float, b: Int, y: Float, h: Handle) -> Int {
+    a * 100 + b * 10 + h.addr + if x + y == 0.75 { 1000 } else { 0 }
+}
+
+fn note_square(f: Foreign, n: Int) {
+    vt_note(f, n * n)
+}
+|} in
+  out "ffi-struct-shapes" ~grants:vt
+    (vtdecls ^ {|
+fn main(root: Root) {
+    let f = root.foreign
+    let out = root.stdout
+    out.print("{vt_p2_swap(f, P2 { a: 1, b: -2 })} {vt_t3_rot(f, T3 { a: 1, b: 2, c: 3 })}")
+    out.print("{vt_v2_add(f, V2 { x: 1.5, y: 2.0 }, V2 { x: 0.25, y: -1.0 })} {vt_v3_scale(f, V3 { x: 1.0, y: 2.0, z: 3.0 }, 2.0)}")
+    out.print("{vt_v4(f, 1.5)} {vt_nx(f, NX { n: 3, x: 0.5 }, 4)} {vt_xk(f, XK { x: 2.5, k: 21 })}")
+    out.print("{vt_big(f, Big { a: 1, b: 2, on: true, h: Handle { addr: 100 }, x: 9.0 }, 3)}")
+    out.print("{vt_tight(f, 1, 2, 3, 4, 5, T3 { a: 6, b: 7, c: 8 })} {vt_spill(f, 1, 2, 3, 4, 5, 6, 7, NX { n: 2, x: 0.5 }, 3.0)}")
+    out.print("{vt_pack(f, 1, 2, 3, 4, XK { x: 1.25, k: 5 }, XK { x: 2.75, k: 6 }, 7, 8)} {vt_bool(f, true)} {vt_bool(f, false)}")
+}
+|})
+    ("P2 { a: -2, b: 1 } T3 { a: 2, b: 3, c: 1 }\nV2 { x: 1.75, y: 1.0 } V3 { x: 2.0, y: 4.0, z: 6.0 }\n"
+     ^ "V4 { a: 1.5, b: 3.0, c: 4.5, d: 6.0 } NX { n: 12, x: 2.0 } XK { x: 3.5, k: 42 }\n"
+     ^ "Big { a: 4, b: 6, on: false, h: Handle { addr: 103 }, x: 3.0 }\n87654321 30728.0\n807049 7 3\n");
+  out "ffi-callbacks" ~grants:vt
+    (vtdecls ^ {|
+fn main(root: Root) {
+    let f = root.foreign
+    root.stdout.print("{vt_apply(f, poly, 2.0, 3)} {vt_apply(f, nested, 1.0, 3)} {vt_each(f, weigh, 4)}")
+    vt_times(f, note_square, 4)
+    root.stdout.print("{vt_call8(f, sum8)} {vt_mixed(f, mixed)} {vt_noted(f)}")
+}
+|})
+    "13.0 18.0 156\n204 748 30\n";
+  (* nothing unwinds through C: a panic in a callback ends the program, past `catch` *)
+  panics "ffi-callback-panic" ~grants:vt
+    (vtdecls ^ "\nfn crash(x: Float, n: Int) -> Float {\n    if n > 0 {\n        panic(\"boom\")\n    }\n    x\n}\n\nfn main(root: Root) {\n    let f = root.foreign\n    root.stdout.print(\"{catch(|| vt_apply(f, crash, 1.0, 1))}\")\n}\n")
+    "in a callback from C: boom";
+  panics "ffi-callback-wait" ~grants:vt
+    (vtdecls ^ "\nfn waits(n: Int) {\n    let c: Chan[Int] = channel(0)\n    c.recv();\n}\n\nfn main(root: Root) {\n    vt_times(root.foreign, waits, 1)\n}\n")
+    "a callback from C cannot wait (for a task, a channel, a timer or input)";
+  (* a foreign struct from another module, named through it *)
+  out "ffi-struct-module" ~grants:libc
+    ~modules:[ ("cdiv", "foreign \"c\" {\n    pub struct Div { quot: Int32, rem: Int32 }\n    pub fn div(a: Int32, b: Int32) -> Div\n}\n\npub fn half(f: Foreign, n: Int) -> Div {\n    div(f, n, 2)\n}\n") ]
+    "use cdiv\n\nfn show(d: cdiv.Div) -> Str {\n    \"{d.quot}r{d.rem}\"\n}\n\nfn main(root: Root) {\n    let f = root.foreign\n    root.stdout.print(\"{show(cdiv.half(f, 7))} {show(cdiv.div(f, 9, 4))} {cdiv.Div { quot: 1, rem: 0 }}\")\n}\n"
+    "3r1 2r1 cdiv.Div { quot: 1, rem: 0 }\n";
+  (* declaration errors *)
+  errs "ffi-struct-bad-field" "foreign \"c\" {\n    struct S { name: Str, n: Int }\n    struct E {}\n}\n\nfn main() {}\n" [ "E0330"; "E0330" ];
+  errs "ffi-not-c-struct" "struct Pt { x: Int }\n\nforeign \"c\" {\n    fn f(p: Pt)\n}\n\nfn main() {}\n" [ "E0330" ];
+  errs "ffi-variadic-bad"
+    "foreign \"c\" {\n    struct S { x: Int }\n    fn a(...)\n    fn b(x: Float, ...)\n    fn c(s: Str, ..., p: S)\n    fn d(s: Str, ..., o: Out[Int])\n    fn e(s: Str, ...) -> S\n}\n\nfn main() {}\n"
+    [ "E0330"; "E0330"; "E0330"; "E0330"; "E0330" ];
+  errs "ffi-variadic-twice" "foreign \"c\" {\n    fn a(s: Str, ..., ...)\n}\n\nfn main() {}\n" [ "E0003" ];
+  errs "ffi-symbol-bad" "foreign \"c\" {\n    fn f() = \"not a name\"\n}\n\nfn main() {}\n" [ "E0330" ];
+  errs "ffi-callback-bad-type" "foreign \"c\" {\n    fn f(cb: fn(Str) -> Str)\n    fn g(cb: fn(List[Int]) -> Int)\n    fn h() -> fn(Int) -> Int\n}\n\nfn main() {}\n"
+    [ "E0330"; "E0330"; "E0330" ];
+  errs "ffi-callback-closure"
+    "foreign \"c\" {\n    fn qsort(base: Handle, n: Int, size: Int, cmp: fn(Handle, Handle) -> Int32)\n}\n\nfn cmp(a: Handle, b: Handle) -> Int {\n    0\n}\n\nfn main(root: Root) {\n    let k = 1\n    let g = cmp\n    qsort(root.foreign, Handle { addr: 0 }, 0, 1, |a, b| k)\n    qsort(root.foreign, Handle { addr: 0 }, 0, 1, g)\n}\n"
+    [ "E0332"; "E0332" ];
   (* the child sees PATH and only the variables the Env grant names *)
   let env_src = main_wrap {|    match root.exec.run("sh", ["-c", "echo $\{HOME:+home\} $\{PATH:+path\} $\{VELA_SECRET_TEST:-none\}"]) {
         Ok(r) => out.write(r.stdout),
