@@ -1203,13 +1203,9 @@ and builtin_method ctx t name file =
   | Some tn ->
     let suffix = tn ^ "::" ^ name in
     let own =
-      Hashtbl.fold
-        (fun k _ acc ->
-          if acc = None && (k = suffix || String.ends_with ~suffix:("." ^ suffix) k)
-             && (match Hashtbl.find_opt method_owner k with Some (_, fl) -> fl = file | None -> false)
-          then Some k
-          else acc)
-        ctx.fns None
+      List.find_opt
+        (fun k -> match Hashtbl.find_opt method_owner k with Some (_, fl) -> fl = file | None -> false)
+        (methods_named ctx suffix)
     in
     (* the built-in methods written in Vela (std/methods.vela) *)
     if own = None && Hashtbl.mem ctx.fns suffix

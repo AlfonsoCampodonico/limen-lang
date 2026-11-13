@@ -16,8 +16,15 @@ type token = { tok : tok; span : Span.t; nl : bool }
 
 (* Every occurrence of a name is the same string, so the interpreter's
    lookups usually match by physical equality before comparing text. *)
-let names : (string, string) Hashtbl.t = Hashtbl.create 256
-let intern s = match Hashtbl.find_opt names s with Some t -> t | None -> Hashtbl.replace names s s; s
+module Strings = Hashtbl.Make (struct
+  type t = string
+
+  let equal = String.equal
+  let hash = Hashtbl.hash
+end)
+
+let names : string Strings.t = Strings.create 256
+let intern s = match Strings.find_opt names s with Some t -> t | None -> Strings.replace names s s; s
 
 let keywords =
   [ "fn"; "let"; "mut"; "if"; "else"; "match"; "for"; "in"; "while"; "return"; "struct";
@@ -25,6 +32,19 @@ let keywords =
 
 let syms2 = [ "->"; "=>"; "=="; "!="; "<="; ">="; "&&"; "||"; "??"; "|>" ]
 let syms1 = "(){}[],:;.|+-*/%!?=<>"
+
+(* Lookups the lexer makes for every token, so they do not compare strings
+   one by one or allocate: keywords, and each symbol's one shared string. *)
+let keyword_set : unit Strings.t =
+  let h = Strings.create 64 in
+  List.iter (fun k -> Strings.replace h k ()) keywords;
+  h
+
+let sym1_text = Array.init 256 (fun c -> String.make 1 (Char.chr c))
+
+let sym2_at src i =
+  let a = src.[i] and b = src.[i + 1] in
+  List.find_opt (fun s -> s.[0] = a && s.[1] = b) syms2
 
 let describe = function
   | INT n -> Printf.sprintf "number `%Ld`" n
@@ -75,11 +95,11 @@ let comments : (int * int * string) list ref = ref []
 let lex ?(base = 0) file (src : string) : token array =
   if base = 0 then comments := [];
   let n = String.length src in
-  let toks = ref [] in
+  let toks = Dynarray.create () in
   let i = ref 0 in
   let nl = ref false in
   let push tok lo hi =
-    toks := { tok; span = { Span.file; lo = base + lo; hi = base + hi }; nl = !nl } :: !toks;
+    Dynarray.add_last toks { tok; span = { Span.file; lo = base + lo; hi = base + hi }; nl = !nl };
     nl := false
   in
   let fail code lo hi msg = fatal code file (base + lo) (base + hi) msg in
@@ -95,7 +115,7 @@ let lex ?(base = 0) file (src : string) : token array =
     else if is_digit c then begin
       let lo = !i in
       (* `t.0.1` is two tuple fields, not the float 0.1 *)
-      let after_dot = match !toks with { tok = SYM ("." | "?."); span; _ } :: _ -> span.hi = base + lo | _ -> false in
+      let after_dot = match Dynarray.find_last toks with Some { tok = SYM ("." | "?."); span; _ } -> span.hi = base + lo | _ -> false in
       while !i < n && (is_digit src.[!i] || src.[!i] = '_') do incr i done;
       let is_float = (not after_dot) && !i + 1 < n && src.[!i] = '.' && is_digit src.[!i + 1] in
       if is_float then begin
@@ -125,7 +145,7 @@ let lex ?(base = 0) file (src : string) : token array =
       let lo = !i in
       while !i < n && is_ident src.[!i] do incr i done;
       let s = String.sub src lo (!i - lo) in
-      push (if List.mem s keywords then KW s else IDENT (intern s)) lo !i
+      push (if Strings.mem keyword_set s then KW s else IDENT (intern s)) lo !i
     end
     else if c = '"' then begin
       let lo = !i in
@@ -188,14 +208,18 @@ let lex ?(base = 0) file (src : string) : token array =
     end
     else begin
       let lo = !i in
-      let two = if !i + 1 < n then String.sub src !i 2 else "" in
-      if !i + 2 < n && String.sub src !i 3 = "..<" then (i := !i + 3; push (SYM "..<") lo !i)
+      let two = if !i + 1 < n then sym2_at src !i else None in
+      if !i + 2 < n && c = '.' && src.[!i + 1] = '.' && src.[!i + 2] = '<' then (i := !i + 3; push (SYM "..<") lo !i)
+        (* `...` marks the variadic arguments of a foreign function *)
+      else if !i + 2 < n && c = '.' && src.[!i + 1] = '.' && src.[!i + 2] = '.' then (i := !i + 3; push (SYM "...") lo !i)
         (* `?.` is safe navigation, unless it is `?` before a range: `x?..<n` *)
-      else if two = "?." && not (!i + 2 < n && src.[!i + 2] = '.') then (i := !i + 2; push (SYM "?.") lo !i)
-      else if List.mem two syms2 then (i := !i + 2; push (SYM two) lo !i)
-      else if String.contains syms1 c then (incr i; push (SYM (String.make 1 c)) lo !i)
+      else if c = '?' && !i + 1 < n && src.[!i + 1] = '.' && not (!i + 2 < n && src.[!i + 2] = '.') then (i := !i + 2; push (SYM "?.") lo !i)
+      else match two with
+      | Some t -> i := !i + 2; push (SYM t) lo !i
+      | None ->
+      if String.contains syms1 c then (incr i; push (SYM sym1_text.(Char.code c)) lo !i)
       else fail "E0001" lo (lo + 1) (Printf.sprintf "unexpected character `%c`" c)
     end
   done;
   push EOF n n;
-  Array.of_list (List.rev !toks)
+  Dynarray.to_array toks

@@ -11,7 +11,7 @@ let peek st = st.toks.(st.pos)
 
 let advance st =
   let t = st.toks.(st.pos) in
-  if t.tok <> EOF then st.pos <- st.pos + 1;
+  (match t.tok with EOF -> () | _ -> st.pos <- st.pos + 1);
   t
 
 let fail (t : token) expected =
@@ -19,8 +19,9 @@ let fail (t : token) expected =
     (Diag.Fatal
        (Diag.make "E0003" t.span (Printf.sprintf "expected %s, found %s" expected (describe t.tok))))
 
-let is_sym st s = (peek st).tok = SYM s
-let is_kw st s = (peek st).tok = KW s
+let sym_is tok s = match tok with SYM t -> String.equal t s | _ -> false
+let is_sym st s = match (peek st).tok with SYM t -> String.equal t s | _ -> false
+let is_kw st s = match (peek st).tok with KW t -> String.equal t s | _ -> false
 let accept_sym st s = if is_sym st s then (ignore (advance st); true) else false
 let expect_sym st s = if is_sym st s then advance st else fail (peek st) (Printf.sprintf "`%s`" s)
 let expect_kw st s = if is_kw st s then advance st else fail (peek st) (Printf.sprintf "`%s`" s)
@@ -165,8 +166,8 @@ and parse_bin st ns minp =
   let go = ref true in
   while !go do
     let t = peek st in
-    match if t.tok = SYM "|>" then None else if t.nl then None else binop_of t.tok with
-    | _ when t.tok = SYM "|>" && minp < 1 ->
+    match if sym_is t.tok "|>" then None else if t.nl then None else binop_of t.tok with
+    | _ when sym_is t.tok "|>" && minp < 1 ->
       ignore (advance st);
       let rhs = parse_bin st ns 1 in
       if pipe_call !lhs rhs = None then
@@ -295,7 +296,7 @@ and starts_trailing st ns =
    as its last argument. [] when there is none. *)
 and trailing_closure st ns =
   let t = peek st in
-  if t.tok = SYM "{" && (not t.nl) && starts_trailing st ns then begin
+  if sym_is t.tok "{" && (not t.nl) && starts_trailing st ns then begin
     let lb = advance st in
     let params =
       match (peek st).tok with
@@ -327,7 +328,7 @@ and parse_primary st ns =
     ignore (advance st);
     let tok k = st.toks.(min (st.pos + k) (Array.length st.toks - 1)) in
     if (not ns) && is_upper name && is_sym st "{" then parse_struct_lit st name t.span
-    else if (not ns) && is_sym st "." && (match (tok 1).tok with IDENT b -> is_upper b | _ -> false) && (tok 2).tok = SYM "{"
+    else if (not ns) && is_sym st "." && (match (tok 1).tok with IDENT b -> is_upper b | _ -> false) && sym_is (tok 2).tok "{"
             && not (tok 1).nl then begin
       (* a struct from another module: `json.Field { ... }` *)
       ignore (advance st);
@@ -618,7 +619,7 @@ and parse_stmt st =
   | KW "return" ->
     ignore (advance st);
     let nt = peek st in
-    if nt.nl || nt.tok = SYM "}" || nt.tok = SYM ";" then mks (SReturn None) t.span
+    if nt.nl || sym_is nt.tok "}" || sym_is nt.tok ";" then mks (SReturn None) t.span
     else
       let e = parse_expr st in
       mks (SReturn (Some e)) (merge t.span e.espan)
