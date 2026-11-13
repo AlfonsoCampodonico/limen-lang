@@ -3479,6 +3479,50 @@ fn main(root: Root) {
     root.stdout.print("{total}")
 }
 |} "150\n";
+  let zone_dir =
+    let d = Filename.concat (Sys.getcwd ()) "zoneinfo" in
+    if Sys.file_exists (Filename.concat d "UTC") then d else Filename.concat (Sys.getcwd ()) "test/zoneinfo"
+  in
+  out "time-zones" ~grants:{ Interp.no_grants with fs = Some (Unix.realpath zone_dir, true) } {|use time
+
+fn at(y: Int, mo: Int, d: Int, h: Int, mi: Int) -> time.DateTime {
+    time.DateTime { year: y, month: mo, day: d, hour: h, minute: mi, second: 0, ms: 0, weekday: 0, yday: 0 }
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let out = root.stdout
+    let madrid = time.load_zone(root.fs, "Europe/Madrid")?
+    let ny = time.load_zone(root.fs, "America/New_York")?
+    let sydney = time.load_zone(root.fs, "Australia/Sydney")?
+    let utc = time.load_zone(root.fs, "UTC")?
+    let summer = time.parse_iso("2026-07-01T12:00Z") ?? 0
+    let winter = time.parse_iso("2026-01-15T12:00Z") ?? 0
+    // 2080 is past the files' last listed change: the POSIX rule decides
+    let far = time.parse_iso("2080-07-01T12:00Z") ?? 0
+    for z in [madrid, ny, sydney, utc] {
+        out.print("{z.name}: {time.iso_in(summer, z)} {time.abbr_in(summer, z)} {time.is_dst_in(summer, z)} | {time.iso_in(winter, z)} {time.abbr_in(winter, z)} | {time.format_in(far, z, "%Y-%m-%d %H:%M %Z %z %%Z")}")
+    }
+    // the hour before and after Madrid's change on 2026-03-29 at 01:00 UTC
+    let change = time.parse_iso("2026-03-29T01:00Z") ?? 0
+    out.print("{time.offset_in(change - 1, madrid)} {time.offset_in(change, madrid)}")
+    // 02:30 is skipped when clocks go forward, and happens twice when they go back
+    out.print("{time.iso(time.from_parts_in(at(2026, 3, 29, 2, 30), madrid))} {time.iso(time.from_parts_in(at(2026, 10, 25, 2, 30), madrid))} {time.iso(time.from_parts_in(at(2026, 6, 1, 9, 0), madrid))}")
+    out.print("{time.parts_in(summer, sydney).hour} {time.offset_in(time.parse_iso("1950-07-01T00:00Z") ?? 0, ny)}")
+    out.print("{time.load_zone(root.fs, "../etc/passwd")}")
+    out.print("{time.load_zone(root.fs, "Europe/Nowhere").is_err()}")
+    out.print("{time.zone_from_tzif("x", "nope".to_bytes())}")
+    Ok(())
+}
+|} "Europe/Madrid: 2026-07-01T14:00:00.000+02:00 CEST true | 2026-01-15T13:00:00.000+01:00 CET | 2080-07-01 14:00 CEST +0200 %Z\n\
+America/New_York: 2026-07-01T08:00:00.000-04:00 EDT true | 2026-01-15T07:00:00.000-05:00 EST | 2080-07-01 08:00 EDT -0400 %Z\n\
+Australia/Sydney: 2026-07-01T22:00:00.000+10:00 AEST false | 2026-01-15T23:00:00.000+11:00 AEDT | 2080-07-01 22:00 AEST +1000 %Z\n\
+UTC: 2026-07-01T12:00:00.000+00:00 UTC false | 2026-01-15T12:00:00.000+00:00 UTC | 2080-07-01 12:00 UTC +0000 %Z\n\
+60 120\n\
+2026-03-29T01:30:00.000Z 2026-10-25T00:30:00.000Z 2026-06-01T07:00:00.000Z\n\
+22 -240\n\
+Err(Failed(\"time: `../etc/passwd` is not a zone name\"))\n\
+true\n\
+Err(\"time: `x` is not a TZif zone file\")\n";
   out "group-until-sockets" ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] } {|fn main(root: Root) -> Result[(), IoError] {
     let clock = root.clock
     let net = root.net
@@ -5603,7 +5647,8 @@ fn main(root: Root) {
   ok "std-manifest-complete" (listed = List.sort compare (List.map fst Std_text.modules)) (String.concat ", " listed);
   ok "std-manifest-http" (List.exists (fun (d : Package.dep) -> d.dname = "http" && d.caps = [ "net"; "listen" ]) manifest.deps) "http: net, listen";
   ok "std-manifest-sql" (List.exists (fun (d : Package.dep) -> d.dname = "sql" && d.caps = [ "fs" ]) manifest.deps && manifest.trust = [ "sql" ]) "sql: fs, trusted with C";
-  ok "std-manifest-pure" (List.for_all (fun (d : Package.dep) -> d.dname = "http" || d.dname = "sql" || d.caps = []) manifest.deps) "the others are pure";
+  ok "std-manifest-time" (List.exists (fun (d : Package.dep) -> d.dname = "time" && d.caps = [ "clock"; "fs" ]) manifest.deps) "time: clock (within), fs (load_zone)";
+  ok "std-manifest-pure" (List.for_all (fun (d : Package.dep) -> d.dname = "http" || d.dname = "sql" || d.dname = "time" || d.caps = []) manifest.deps) "the others are pure";
   let real_std = !Modules.std_modules in
   let std_errs name extra src =
     Modules.std_modules := extra @ real_std;

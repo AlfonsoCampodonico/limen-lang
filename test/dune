@@ -6,7 +6,8 @@
   (glob_files %{project_root}/examples/*.vela)
   (glob_files %{project_root}/bench/*.vela)
   (glob_files tls/*.pem)
-  (glob_files tls/*.py)))
+  (glob_files tls/*.py)
+  (source_tree zoneinfo)))
 
 ; `vela lsp` end to end over stdio.
 (rule

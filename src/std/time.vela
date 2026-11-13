@@ -1,8 +1,8 @@
 // Dates and times as pure functions of epoch milliseconds, the number
 // `Clock.now_ms()` returns. Everything is UTC (proleptic Gregorian calendar,
-// no leap seconds). Fixed offsets such as +01:00 are supported where noted;
-// named zones with daylight saving rules (Europe/Madrid) are not, since they
-// need the system's zone database.
+// no leap seconds). Fixed offsets such as +01:00 are supported where noted.
+// Named zones with daylight saving rules (Europe/Madrid) come from the
+// system's zone database, read through an `Fs`: see `load_zone`.
 
 // A moment split into calendar fields.
 pub struct DateTime {
@@ -344,4 +344,396 @@ pub fn parse_iso(s: Str) -> Result[Int, Str] {
     }
     let off = minutes(oh * 60 + om)
     Ok(if z == 43 { local - off } else { local + off })
+}
+// ---------- named time zones ----------
+
+// A named time zone from the tz database: its offsets over history and the
+// rule that applies after the last listed change. Build one with
+// `load_zone` or `zone_from_tzif`; the functions that use it are pure.
+pub struct Zone {
+    name: Str,
+    changes: List[Int],   // when the offset changed, epoch seconds, ascending
+    kinds: List[Int],     // for each change, the index of the offset it starts
+    offsets: List[Int],   // seconds east of UTC
+    dst: List[Bool],
+    abbrs: List[Str],
+    rule: Str,            // POSIX TZ rule for times after the last change, or ""
+}
+
+// Reads `name` ("Europe/Madrid") from the zone database that `fs` is
+// granted: `--grant fs=/usr/share/zoneinfo:ro`, then
+// `time.load_zone(root.fs, "Europe/Madrid")`.
+pub fn load_zone(fs: Fs, name: Str) -> Result[Zone, IoError] {
+    let ok = !name.is_empty() && !name.contains("..") && name.bytes().all(|b| (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || (b >= 48 && b <= 57) || b == 47 || b == 95 || b == 45 || b == 43)
+    if !ok {
+        return Err(Failed("time: `{name}` is not a zone name"))
+    }
+    let data = fs.read(name)?
+    match zone_from_tzif(name, data.to_bytes()) {
+        Ok(z) => Ok(z),
+        Err(m) => Err(Failed(m)),
+    }
+}
+
+fn be(bs: List[Int], at: Int, n: Int) -> Int {
+    let mut v = 0
+    let mut k = 0
+    while k < n {
+        v = v * 256 + bs[at + k]
+        k = k + 1
+    }
+    // a 4-byte value is signed; an 8-byte one already wrapped into Int
+    if n == 4 && v >= 2147483648 { v - 4294967296 } else { v }
+}
+
+// A zone from the bytes of a TZif file (RFC 8536, versions 1 to 4).
+pub fn zone_from_tzif(name: Str, data: Bytes) -> Result[Zone, Str] {
+    let bs = data.to_list()
+    let bad = Err("time: `{name}` is not a TZif zone file")
+    if bs.len() < 44 || data.slice(0, 4).to_str() != "TZif" {
+        return bad
+    }
+    let version = bs[4]
+    let counts = |at: Int| [be(bs, at + 20, 4), be(bs, at + 24, 4), be(bs, at + 28, 4), be(bs, at + 32, 4), be(bs, at + 36, 4), be(bs, at + 40, 4)]
+    // isutcnt, isstdcnt, leapcnt, timecnt, typecnt, charcnt
+    let c1 = counts(0)
+    let v1_size = c1[3] * 5 + c1[4] * 6 + c1[5] + c1[2] * 8 + c1[1] + c1[0]
+    let mut at = 0
+    let mut width = 4
+    let mut c = c1
+    if version >= 50 {
+        at = 44 + v1_size
+        if bs.len() < at + 44 || data.slice(at, at + 4).to_str() != "TZif" {
+            return bad
+        }
+        c = counts(at)
+        width = 8
+    }
+    let timecnt = c[3]
+    let typecnt = c[4]
+    let charcnt = c[5]
+    let leapcnt = c[2]
+    let mut p = at + 44
+    let size = timecnt * (width + 1) + typecnt * 6 + charcnt + leapcnt * (width + 4) + c[1] + c[0]
+    if typecnt == 0 || bs.len() < p + size {
+        return bad
+    }
+    let mut changes = []
+    let mut i = 0
+    while i < timecnt {
+        changes.push(be(bs, p + i * width, width))
+        i = i + 1
+    }
+    p = p + timecnt * width
+    let mut kinds = []
+    i = 0
+    while i < timecnt {
+        if bs[p + i] >= typecnt {
+            return bad
+        }
+        kinds.push(bs[p + i])
+        i = i + 1
+    }
+    p = p + timecnt
+    let chars = data.slice(p + typecnt * 6, p + typecnt * 6 + charcnt).to_str()
+    let mut offsets = []
+    let mut dst = []
+    let mut abbrs = []
+    i = 0
+    while i < typecnt {
+        let t = p + i * 6
+        offsets.push(be(bs, t, 4))
+        dst.push(bs[t + 4] != 0)
+        let from = bs[t + 5]
+        let rest = chars.slice(from, chars.len())
+        let end = rest.index_of("\0") ?? rest.len()
+        abbrs.push(rest.slice(0, end))
+        i = i + 1
+    }
+    p = p + typecnt * 6 + charcnt + leapcnt * (width + 4) + c[1] + c[0]
+    // version 2 and later end with "\n<rule>\n"
+    let mut rule = ""
+    if width == 8 && p < bs.len() && bs[p] == 10 {
+        let tail = data.slice(p + 1, bs.len()).to_str()
+        rule = tail.slice(0, tail.index_of("\n") ?? tail.len())
+    }
+    Ok(Zone { name, changes, kinds, offsets, dst, abbrs, rule })
+}
+
+// A POSIX TZ rule, "CET-1CEST,M3.5.0,M10.5.0/3": offsets east of UTC in
+// seconds, and when daylight saving starts and ends in local time.
+struct Rule {
+    std_abbr: Str,
+    std_off: Int,
+    dst_abbr: Str,      // "" without daylight saving
+    dst_off: Int,
+    start: (Int, Int, Int, Int),   // kind (0 Jn, 1 n, 2 Mm.w.d), a, b, c
+    start_time: Int,               // seconds after local midnight
+    end: (Int, Int, Int, Int),
+    end_time: Int,
+}
+
+struct Cursor {
+    s: List[Int],
+    at: Int,
+}
+
+fn peek(c: Cursor) -> Int {
+    c.s.get(c.at) ?? 0
+}
+
+fn read_abbr(c: Cursor) -> (Str, Cursor) {
+    let mut at = c.at
+    let mut out = []
+    if peek(c) == 60 {
+        // <...>
+        at = at + 1
+        while at < c.s.len() && c.s[at] != 62 {
+            out.push(c.s[at])
+            at = at + 1
+        }
+        return (bytes(out).to_str(), { c with at: at + 1 })
+    }
+    while at < c.s.len() && ((c.s[at] >= 65 && c.s[at] <= 90) || (c.s[at] >= 97 && c.s[at] <= 122)) {
+        out.push(c.s[at])
+        at = at + 1
+    }
+    (bytes(out).to_str(), { c with at })
+}
+
+fn read_num(c: Cursor) -> (Int, Cursor) {
+    let mut at = c.at
+    let mut v = 0
+    while at < c.s.len() && c.s[at] >= 48 && c.s[at] <= 57 {
+        v = v * 10 + c.s[at] - 48
+        at = at + 1
+    }
+    (v, { c with at })
+}
+
+// [+-]hh[:mm[:ss]] in seconds
+fn read_hms(c: Cursor) -> (Int, Cursor) {
+    let mut cur = c
+    let mut sign = 1
+    if peek(cur) == 45 {
+        sign = -1
+        cur = { cur with at: cur.at + 1 }
+    } else if peek(cur) == 43 {
+        cur = { cur with at: cur.at + 1 }
+    }
+    let (h, c1) = read_num(cur)
+    cur = c1
+    let mut total = h * 3600
+    if peek(cur) == 58 {
+        let (m, c2) = read_num({ cur with at: cur.at + 1 })
+        cur = c2
+        total = total + m * 60
+        if peek(cur) == 58 {
+            let (sec, c3) = read_num({ cur with at: cur.at + 1 })
+            cur = c3
+            total = total + sec
+        }
+    }
+    (sign * total, cur)
+}
+
+fn read_date(c: Cursor) -> ((Int, Int, Int, Int), Int, Cursor) {
+    let mut cur = c
+    let mut d = (1, 0, 0, 0)
+    if peek(cur) == 74 {
+        // Jn
+        let (n, c1) = read_num({ cur with at: cur.at + 1 })
+        d = (0, n, 0, 0)
+        cur = c1
+    } else if peek(cur) == 77 {
+        // Mm.w.d
+        let (m, c1) = read_num({ cur with at: cur.at + 1 })
+        let (w, c2) = read_num({ c1 with at: c1.at + 1 })
+        let (wd, c3) = read_num({ c2 with at: c2.at + 1 })
+        d = (2, m, w, wd)
+        cur = c3
+    } else {
+        let (n, c1) = read_num(cur)
+        d = (1, n, 0, 0)
+        cur = c1
+    }
+    let mut t = 7200
+    if peek(cur) == 47 {
+        let (tt, c4) = read_hms({ cur with at: cur.at + 1 })
+        t = tt
+        cur = c4
+    }
+    (d, t, cur)
+}
+
+fn parse_rule(s: Str) -> Option[Rule] {
+    if s.is_empty() {
+        return None
+    }
+    let c0 = Cursor { s: s.bytes(), at: 0 }
+    let (std_abbr, c1) = read_abbr(c0)
+    let (std_west, c2) = read_hms(c1)
+    let none = (0, 0, 0, 0)
+    let mut r = Rule { std_abbr, std_off: -std_west, dst_abbr: "", dst_off: -std_west, start: none, start_time: 0, end: none, end_time: 0 }
+    if c2.at >= c2.s.len() {
+        return Some(r)
+    }
+    let (dst_abbr, c3) = read_abbr(c2)
+    let mut cur = c3
+    let mut dst_off = r.std_off + 3600
+    if peek(cur) != 44 && cur.at < cur.s.len() {
+        let (w, c4) = read_hms(cur)
+        dst_off = -w
+        cur = c4
+    }
+    if peek(cur) != 44 {
+        return None
+    }
+    let (start, start_time, c5) = read_date({ cur with at: cur.at + 1 })
+    if peek(c5) != 44 {
+        return None
+    }
+    let (end, end_time, _) = read_date({ c5 with at: c5.at + 1 })
+    r = { r with dst_abbr, dst_off, start, start_time, end, end_time }
+    Some(r)
+}
+
+// Epoch seconds of local midnight (as if UTC) of a rule date in `year`.
+fn rule_day(year: Int, d: (Int, Int, Int, Int)) -> Int {
+    let (kind, a, b, wd) = d
+    let jan1 = days_from_civil(year, 1, 1)
+    let day = if kind == 0 {
+        // Jn: 1 to 365, February 29 never counted
+        jan1 + a - 1 + if is_leap_year(year) && a >= 60 { 1 } else { 0 }
+    } else if kind == 1 {
+        jan1 + a
+    } else {
+        // week b (5 = last) of month a, weekday wd (0 = Sunday)
+        let first = days_from_civil(year, a, 1)
+        let first_wd = floor_mod(first + 4, 7)   // 0 = Sunday
+        let mut dd = first + floor_mod(wd - first_wd, 7) + (b - 1) * 7
+        while dd >= first + days_in_month(year, a) {
+            dd = dd - 7
+        }
+        dd
+    }
+    day * 86400
+}
+
+// (offset in seconds, daylight saving, abbreviation) of a rule at an instant
+fn rule_at(r: Rule, t: Int) -> (Int, Bool, Str) {
+    if r.dst_abbr.is_empty() {
+        return (r.std_off, false, r.std_abbr)
+    }
+    let year = parts((t + r.std_off) * 1000).year
+    let start = rule_day(year, r.start) + r.start_time - r.std_off
+    let end = rule_day(year, r.end) + r.end_time - r.dst_off
+    let in_dst = if start < end { t >= start && t < end } else { !(t >= end && t < start) }
+    if in_dst { (r.dst_off, true, r.dst_abbr) } else { (r.std_off, false, r.std_abbr) }
+}
+
+// (offset in seconds, daylight saving, abbreviation) of a zone at epoch seconds t
+fn zone_at(z: Zone, t: Int) -> (Int, Bool, Str) {
+    let n = z.changes.len()
+    if n == 0 || t < z.changes[0] {
+        if n == 0 && !z.rule.is_empty() {
+            match parse_rule(z.rule) {
+                Some(r) => {
+                    return rule_at(r, t)
+                },
+                None => (),
+            }
+        }
+        return (z.offsets[0], z.dst[0], z.abbrs[0])
+    }
+    if t >= z.changes[n - 1] && !z.rule.is_empty() {
+        match parse_rule(z.rule) {
+            Some(r) => {
+                return rule_at(r, t)
+            },
+            None => (),
+        }
+    }
+    // the last change at or before t
+    let mut lo = 0
+    let mut hi = n - 1
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2
+        if z.changes[mid] <= t {
+            lo = mid
+        } else {
+            hi = mid - 1
+        }
+    }
+    let k = z.kinds[lo]
+    (z.offsets[k], z.dst[k], z.abbrs[k])
+}
+
+// The zone's offset from UTC at a moment, in minutes (+60 for UTC+01:00).
+pub fn offset_in(ms: Int, z: Zone) -> Int {
+    let (off, _, _) = zone_at(z, floor_div(ms, 1000))
+    off / 60
+}
+
+// The zone's abbreviation at a moment: "CET", "CEST", "EST".
+pub fn abbr_in(ms: Int, z: Zone) -> Str {
+    let (_, _, a) = zone_at(z, floor_div(ms, 1000))
+    a
+}
+
+// Whether daylight saving time is in effect in the zone at a moment.
+pub fn is_dst_in(ms: Int, z: Zone) -> Bool {
+    let (_, d, _) = zone_at(z, floor_div(ms, 1000))
+    d
+}
+
+// The calendar fields of a moment in a zone.
+pub fn parts_in(ms: Int, z: Zone) -> DateTime {
+    parts_at(ms, offset_in(ms, z))
+}
+
+// ISO 8601 in a zone: "2026-07-01T14:00:00.000+02:00".
+pub fn iso_in(ms: Int, z: Zone) -> Str {
+    iso_at(ms, offset_in(ms, z))
+}
+
+// `format` in a zone; `%Z` is the zone's abbreviation ("CEST").
+pub fn format_in(ms: Int, z: Zone, layout: Str) -> Str {
+    let abbr = abbr_in(ms, z)
+    let bs = layout.bytes()
+    let mut fixed = ""
+    let mut start = 0
+    let mut i = 0
+    while i + 1 < bs.len() {
+        if bs[i] == 37 && bs[i + 1] == 90 {
+            fixed = fixed + layout.slice(start, i) + abbr.replace("%", "%%")
+            i = i + 2
+            start = i
+        } else if bs[i] == 37 {
+            i = i + 2
+        } else {
+            i = i + 1
+        }
+    }
+    format_at(ms, offset_in(ms, z), fixed + layout.slice(start, layout.len()))
+}
+
+// The moment that calendar fields name in a zone (weekday and yday are
+// ignored). A local time that happens twice when clocks go back gives the
+// earlier moment; one skipped when clocks go forward gives the moment that
+// many minutes after the change, as if the clocks had not moved yet.
+pub fn from_parts_in(p: DateTime, z: Zone) -> Int {
+    let local = from_parts(p)
+    let before = offset_in(local - days(1), z)
+    let after = offset_in(local + days(1), z)
+    let a = local - minutes(before)
+    if before == after {
+        return a
+    }
+    let b = local - minutes(after)
+    let a_ok = offset_in(a, z) == before
+    let b_ok = offset_in(b, z) == after
+    if a_ok && b_ok {
+        if a < b { a } else { b }
+    } else if b_ok && !a_ok { b } else { a }
 }

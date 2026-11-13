@@ -6,7 +6,7 @@ FROM debian:trixie
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ocaml-nox ocaml-dune ocaml-findlib gcc libc6-dev make \
       libssl-dev libsqlite3-dev openssl ca-certificates \
-      python3 git curl procps \
+      python3 git curl procps tzdata \
     && rm -rf /var/lib/apt/lists/*
 RUN useradd -m vela
 USER vela

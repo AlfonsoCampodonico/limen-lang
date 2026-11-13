@@ -11,7 +11,7 @@ list = { path = ".", caps = [] }
 text = { path = ".", caps = [] }
 http = { path = ".", caps = ["net", "listen"] }
 format = { path = ".", caps = [] }
-time = { path = ".", caps = [] }
+time = { path = ".", caps = ["clock", "fs"] }
 regex = { path = ".", caps = [] }
 sql = { path = ".", caps = ["fs"] }
 errors = { path = ".", caps = [] }

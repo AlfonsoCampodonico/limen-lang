@@ -1554,7 +1554,7 @@ fn main(root: Root) {
 
 ### time
 
-Calendar dates and times as pure functions of epoch milliseconds, the number `Clock.now_ms()` returns. Everything is UTC on the proleptic Gregorian calendar, without leap seconds. Fixed offsets from UTC (in minutes, `60` for +01:00) are supported where a function says so; named time zones with daylight saving rules are not, as they need the system's zone database.
+Calendar dates and times as pure functions of epoch milliseconds (and `within`, a deadline for anything that waits), the number `Clock.now_ms()` returns. Everything is UTC on the proleptic Gregorian calendar, without leap seconds. Fixed offsets from UTC (in minutes, `60` for +01:00) are supported where a function says so. Named time zones with daylight saving rules come from the system's tz database, read through an `Fs` granted to it; after loading, a `Zone` is plain data and the functions using it are pure.
 
 | Item | Meaning |
 | --- | --- |
@@ -1568,6 +1568,13 @@ Calendar dates and times as pure functions of epoch milliseconds, the number `Cl
 | `seconds(n)`, `minutes(n)`, `hours(n)`, `days(n)` | durations in milliseconds: `now + time.days(3)` |
 | `add_months(ms, n)` | same time of day `n` months later, the day clamped to the month's end |
 | `is_leap_year(y)`, `days_in_month(y, m)`, `month_name(m)`, `weekday_name(d)` | |
+| `struct Zone { name, ... }` | a named zone: its offsets over history and the POSIX rule for times after the last listed change |
+| `load_zone(fs, name) -> Result[Zone, IoError]` | reads `name` (`"Europe/Madrid"`; letters, digits, `/ _ - +`, no `..`) from the directory `fs` is granted: `--grant fs=/usr/share/zoneinfo:ro` |
+| `zone_from_tzif(name, data: Bytes) -> Result[Zone, Str]` | a zone from a TZif file's bytes (RFC 8536, versions 1 to 4), for zones shipped with a program (`embed_bytes`) |
+| `offset_in(ms, z)`, `abbr_in(ms, z)`, `is_dst_in(ms, z)` | the offset in minutes (rounded toward zero; only local mean times before about 1900 have seconds), `"CEST"`, `true` |
+| `parts_in(ms, z)`, `iso_in(ms, z)`, `format_in(ms, z, layout)` | as `parts_at`, `iso_at` and `format_at` at the zone's offset then; `format_in`'s `%Z` is the abbreviation |
+| `from_parts_in(p, z)` | the moment local fields name in a zone. A time that happens twice when clocks go back gives the earlier moment; a skipped one (02:30 when clocks jump from 02:00 to 03:00) is read with the offset before the change, so it lands after it (03:30) |
+| `within(clock, ms, f) -> Result[T, IoError]` | runs `f: fn() -> Result[T, IoError]` with a deadline: its result, or `Err(Failed("timed out after {ms} ms"))`. `f` runs as a task of a group with that deadline (section 10), so at the deadline it stops at its next wait, its defers run and its sockets are closed. With `load_zone`, one of the two functions here that take a capability |
 
 ```
 use time
