@@ -120,6 +120,7 @@ let forwarder structs (s : struct_decl) path (d : fn_decl) : fn_decl option =
   let bounds =
     List.map
       (fun (g, bs) ->
+        let bs = List.map (subst env) bs in
         match List.assoc_opt g renamed with
         | Some g' -> (g', bs)
         | None -> (

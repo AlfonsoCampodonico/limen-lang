@@ -653,6 +653,13 @@ let iface_last_hi (i : iface_decl) =
     match r with Some t -> t.tspan.hi | None -> ( match List.rev ps with p :: _ -> p.prm_ty.tspan.hi | [] -> msp.hi))
   | [] -> i.if_span.hi
 
+(* Type parameters with their bounds: `[K: Key, V]`. *)
+let bgens gs bounds =
+  match gs with
+  | [] -> ""
+  | gs ->
+    "[" ^ String.concat ", " (List.map (fun g -> match List.assoc_opt g bounds with Some bs -> g ^ ": " ^ String.concat " + " (List.map ty bs) | None -> g) gs) ^ "]"
+
 let item c (it : item) =
   match it with
   | IType a ->
@@ -661,7 +668,7 @@ let item c (it : item) =
     trailing c a.ty_body.tspan.hi
   | IIface i ->
     new_line c 0;
-    add c ((if i.if_pub then "pub " else "") ^ "interface " ^ i.if_name ^ " {");
+    add c ((if i.if_pub then "pub " else "") ^ "interface " ^ i.if_name ^ gens i.if_gen ^ " {");
     let close = closing_brace c (iface_last_hi i) in
     let prev = ref (-1) in
     List.iter
@@ -696,15 +703,7 @@ let item c (it : item) =
   | IFn d ->
     new_line c 0;
     let params = List.map (fun p -> p.prm_name ^ ": " ^ ty p.prm_ty) d.fn_params in
-    let bgens =
-      match d.fn_gen with
-      | [] -> ""
-      | gs ->
-        "[" ^ String.concat ", "
-          (List.map (fun g -> match List.assoc_opt g d.fn_bounds with Some bs -> g ^ ": " ^ String.concat " + " (List.map fst bs) | None -> g) gs)
-        ^ "]"
-    in
-    add c ((if d.fn_pub then "pub " else "") ^ "fn " ^ d.fn_name ^ bgens);
+    add c ((if d.fn_pub then "pub " else "") ^ "fn " ^ d.fn_name ^ bgens d.fn_gen d.fn_bounds);
     if breaks_after_open c d.fn_span.hi '(' && params <> [] then begin
       add c "(";
       List.iter (fun p -> new_line c 4; add c (p ^ ",")) params;
@@ -718,7 +717,7 @@ let item c (it : item) =
     trailing c d.fn_body.bspan.hi
   | IStruct s ->
     new_line c 0;
-    add c ((if s.st_pub then "pub " else "") ^ "struct " ^ s.st_name ^ gens s.st_gen ^ " {");
+    add c ((if s.st_pub then "pub " else "") ^ "struct " ^ s.st_name ^ bgens s.st_gen s.st_bounds ^ " {");
     let close = struct_close c s in
     (* a struct written on one line keeps its trailing comment after the brace *)
     let single = not (has_newline c s.st_span.lo close) in
@@ -741,7 +740,7 @@ let item c (it : item) =
     trailing c (close + 1)
   | IEnum e ->
     new_line c 0;
-    add c ((if e.en_pub then "pub " else "") ^ "enum " ^ e.en_name ^ gens e.en_gen ^ " {");
+    add c ((if e.en_pub then "pub " else "") ^ "enum " ^ e.en_name ^ bgens e.en_gen e.en_bounds ^ " {");
     let close = enum_close c e in
     let single = not (has_newline c e.en_span.lo close) in
     let prev = ref (-1) in
@@ -783,16 +782,22 @@ let foreign_block c lib (ds : fn_decl list) =
   add c ("foreign \"" ^ escape lib ^ "\" {");
   let prev = ref (-1) in
   List.iter
-    (fun (d : fn_decl) ->
-      let k = ref d.fn_span.lo in
+    (fun it ->
+      let lo = match it with IFn d -> d.fn_span.lo | IStruct s -> s.st_span.lo | _ -> 0 in
+      let k = ref lo in
       while !k > 0 && c.src.[!k - 1] <> '\n' do decr k done;
       if !prev >= 0 && blank_between c !prev !k then blank c;
       let after = leading c 4 ~prev:!prev !k in
       if after >= 0 && !prev >= 0 && blank_between c after !k then blank c;
       new_line c 4;
-      add c (foreign_sig d);
-      trailing c d.fn_body.bspan.hi;
-      prev := d.fn_body.bspan.hi)
+      let hi =
+        match it with
+        | IFn d -> add c (foreign_sig d); d.fn_body.bspan.hi
+        | IStruct s -> foreign_struct c s
+        | _ -> !prev
+      in
+      trailing c hi;
+      prev := hi)
     ds;
   let close = closing_brace c !prev in
   ignore (leading c 4 ~prev:!prev close);
@@ -827,9 +832,10 @@ let format ~file src =
   (* consecutive declarations of one foreign block print as that block *)
   let rec groups = function
     | [] -> []
-    | IFn ({ fn_foreign = Some { flib = lib; _ }; _ } as d) :: rest ->
+    | it :: rest when foreign_lib it <> None ->
+      let lib = foreign_lib it in
       let rec take acc = function
-        | IFn ({ fn_foreign = Some { flib = l; _ }; _ } as d) :: r when l = lib -> take (d :: acc) r
+        | it :: r when foreign_lib it = lib -> take (it :: acc) r
         | r -> (List.rev acc, r)
       in
       let ds, rest = take [ d ] rest in

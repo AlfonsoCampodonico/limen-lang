@@ -31,7 +31,7 @@ use      ::= "use" sp1 ident
 item     ::= fn | struct | enum | test | bench | interface | alias
 # another name for a type: `type Pair[T] = (T, T)`
 alias    ::= "type" sp1 ident sp generics? sp "=" sp type
-interface ::= "interface" sp1 ident sp "{" ws (imethod (isep imethod)* (ws ",")?)? ws "}"
+interface ::= "interface" sp1 ident sp generics? sp "{" ws (imethod (isep imethod)* (ws ",")?)? ws "}"
 imethod  ::= "fn" sp1 ident sp "(" ws "self" (isep param)* (ws ",")? ws ")" (sp "->" sp type)?
 test     ::= "test" sp1 plainstr sp tparams? ("for" sp1 (ident sp1 | upat sp) "in" sp1 "[" ws args ws "]" sp)? block
 bench    ::= "bench" sp1 plainstr sp tparams? block
@@ -42,18 +42,19 @@ foreign  ::= "foreign" sp1 plainstr sp "{" ws (ffn (stsep ffn)* stsep?)? ws "}"
 ffn      ::= ("pub" sp1)? "fn" sp1 ident sp "(" ws (param (isep param)* (ws ",")?)? ws ")" (sp "->" sp type)?
 generics ::= "[" ws ident (isep ident)* (ws ",")? ws "]"
 bgenerics ::= "[" ws bgen (isep bgen)* (ws ",")? ws "]"
-bgen     ::= ident (sp ":" sp qident (sp "+" sp qident)*)?
-qident   ::= ident ("." ident)?
+bgen     ::= ident (sp ":" sp bound (sp "+" sp bound)*)?
+# an interface, with its type arguments if it is generic: `Shape`, `geo.Area`, `Container[Int]`
+bound    ::= ident ("." ident)? (sp "[" ws typearg (isep typearg)* (ws ",")? ws "]")?
 param    ::= ident sp ":" sp type
-struct   ::= "struct" sp1 ident sp generics? sp "{" ws (field (isep field)* (ws ",")?)? ws "}"
+struct   ::= "struct" sp1 ident sp bgenerics? sp "{" ws (field (isep field)* (ws ",")?)? ws "}"
 field    ::= ident sp ":" sp type | embed
 # an embedded struct: its type alone, starting with a capital (`User`, `auth.User`, `Box[Int]`)
 embed    ::= (ident ".")? upper (sp "[" ws typearg (isep typearg)* (ws ",")? ws "]")?
-enum     ::= "enum" sp1 ident sp generics? sp "{" ws (variant (isep variant)* (ws ",")?)? ws "}"
+enum     ::= "enum" sp1 ident sp bgenerics? sp "{" ws (variant (isep variant)* (ws ",")?)? ws "}"
 variant  ::= ident (sp "(" ws type (isep type)* (ws ",")? ws ")")?
 
 # ---------- types ----------
-type    ::= "dyn" sp1 qident | ident ("." ident)? (sp "[" ws typearg (isep typearg)* (ws ",")? ws "]")? | "(" ws ")" | "(" ws type (isep type)* (ws ",")? ws ")" | "fn" sp "(" ws (type (isep type)* (ws ",")?)? ws ")" sp "->" sp type
+type    ::= "dyn" sp1 bound | ident ("." ident)? (sp "[" ws typearg (isep typearg)* (ws ",")? ws "]")? | "(" ws ")" | "(" ws type (isep type)* (ws ",")? ws ")" | "fn" sp "(" ws (type (isep type)* (ws ",")?)? ws ")" sp "->" sp type
 typearg ::= type | int
 
 # ---------- blocks and statements ----------

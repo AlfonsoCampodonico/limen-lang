@@ -67,7 +67,7 @@ Statements are separated by a newline or `;`. Two statements on one line without
 | `Bytes` | immutable binary data | Built with `bytes([104, 105])` or `s.to_bytes()`; prints as `bytes([104, 105])`. |
 | `()` | the unit value `()` | Type of statements and of functions without `->`. |
 | `List[T]` | growable sequence | A value: assigning or passing it never shares mutation (section 8). |
-| `Array[T, N]` | exactly `N` elements | A value type stored inline, like a struct. `N` is an integer literal. |
+| `Array[T, N]` | exactly `N` elements | A value type stored inline, like a struct. `N` is an integer literal, or a type parameter that stands for one (section 4). |
 | `(A, B)`, `(A, B, C)`, ... | tuples of 2 to 8 values | Written `(1, "a")`, read with `.0`, `.1`, unpacked with patterns. |
 | `Map[K, V]` | keys to values | Keys are `Int`, `Str`, `Bytes`, `Bool`, or tuples, structs and enums made of them (E0113). A value, like `List`; iterates in insertion order. |
 | `Option[T]` | `Some(T)`, `None` | From the prelude. |
@@ -143,6 +143,7 @@ fn swap[A, B](p: Pair[A, B]) -> Pair[B, A] {
 - A function without `-> T` returns `()`.
 - The body's last expression, without `;`, is the return value. `return e` returns early.
 - Generic parameters go in `[...]` after the name. They are instantiated at each use and are never written at call sites: `swap(p)`.
+- A type parameter written as an array's size stands for a length, inferred at each call: `fn sum[N](xs: Array[Int, N]) -> Int` takes an array of any length, and `fn first[T, N](xs: Array[T, N]) -> T` any element type too. Inside, `xs.len()` is that length. The function is compiled once per length used, like the rest of generics. A parameter cannot be both a length and a type (E0102), and it is not a value: use `xs.len()`.
 - Struct fields and enum payloads cannot hold a capability (E0301), a channel (E0305) or a function type (E0304). That keeps authority visible in signatures. A generic instantiation like `Pair[Net, Int]` is allowed, because the capability is visible in the type.
 - Defining the same type, function, field or variant twice is error E0106.
 - Types can be recursive through an enum, a `List` or a `Map`, which hold their contents indirectly: `struct Node { value: Int, next: Option[Node] }`, `enum Tree { Leaf, Node(Tree, Tree) }`, `struct Dir { files: List[Dir] }`. A struct stores its fields inline, so one that contains itself through structs, tuples or arrays alone would be infinitely large (E0114). There is no `box`: those types are the indirection.
@@ -217,7 +218,7 @@ total([Circle { r: 1.0 }, Circle { r: 2.0 }])   // Circle has `area` and `name`
 - Two bounds are built in and have no methods. `Ordered`: the type has `<` (section 5), so `fn lowest[T: Ordered](xs: List[T])` can compare items and call `xs.min()` or `xs.sort()`. `Key`: the type can be a map key (`Int`, `Str`, `Bytes`, `Bool`, and tuples, structs and enums of them), so `fn index[K: Key, V](xs: List[V], key: fn(V) -> K) -> Map[K, V]` can build a map keyed by `K`; keys are ordered too, so `Key` includes `Ordered`. A type that is not ordered or not a key is E0111 at the call. They cannot be `dyn`, and no interface can take their names.
 - Code is generated separately for each type used, so a call through an interface costs the same as a direct call.
 - An interface is not a type: `fn f(s: Shape)` is E0102; write `fn f[T: Shape](s: T)`. A list holds one type, so `List[T]` cannot mix `Circle` and `Square` values.
-- Bounds go only on functions, not on structs or enums.
+- Bounds go on the type parameters of functions, structs and enums (below), not of interfaces or aliases.
 - Because built-in capabilities satisfy interfaces too, tests can pass a fake:
 
 ```
@@ -245,6 +246,57 @@ test "elapsed" {
 
 `vela caps` reports a function with bounded type parameters like one that takes callbacks: what it can do depends on the type it is called with.
 
+#### Generic interfaces
+
+An interface can take type parameters, used in its methods. A bound names its arguments:
+
+```
+interface Container[T] {
+    fn get(self, i: Int) -> Option[T]
+    fn len(self) -> Int
+}
+
+fn count[C: Container[Int]](c: C) -> Int {
+    c.len()
+}
+
+fn first[C: Container[T], T](c: C) -> Option[T] {
+    c.get(0)
+}
+
+first(["a", "b"])     // Some("a"): `List[Str]` has `get` and `len`, so T is Str
+count([1, 2, 3])      // 3
+```
+
+- An argument can be a type parameter of the function, as `T` in `first`. At each call it is inferred from the methods of the type used, here `List[Str]`'s `get`, so `first(xs)` has type `Option[Str]`. Inside, `c.get(0)` has type `Option[T]`.
+- A generic interface is always written with its arguments: `[C: Container]` or `Container[Int, Str]` is E0109, with the right form in the note. A type that has the methods with other types, such as a `get` returning `Option[Str]` for `Container[Int]`, is E0111.
+- Interfaces from other modules and aliases work as anywhere else: `[C: coll.Container[Int]]`, and `type Ints = Container[Int]` makes `[C: Ints]` the same bound.
+- There are no associated types: a type an interface's methods depend on is a parameter of the interface, inferred as above. `fn first[C: Container[T], T](c: C) -> Option[T]` says what an associated `Item` type would, with nothing new to learn.
+
+#### Bounds on structs and enums
+
+A struct's or enum's type parameters can have bounds, written as on functions:
+
+```
+struct Sorted[T: Ordered] {
+    items: List[T],
+}
+
+enum Tree[K: Key, V] {
+    Leaf,
+    Node(K, V, Tree[K, V], Tree[K, V]),
+}
+
+fn insert[T](self: Sorted[T], x: T) -> Sorted[T] {
+    let mut items = self.items
+    items.push(x)
+    Sorted { items: items.sort() }
+}
+```
+
+- Every place the type gets its arguments is checked against the bounds (E0111): a struct literal, a variant, and every type written with it, such as `let s: Sorted[Foo]`, a parameter, a field or a result type.
+- A function whose parameter has the type with a type parameter as an argument gets the bounds for free: in `insert`, `T` is `Ordered` because `self` is a `Sorted[T]`, so `items.sort()` (and `<` on two `T`s) works without writing `[T: Ordered]`. That holds only for parameters; a function that makes a `Sorted[T]` from a plain `T`, or returns one, declares the bound itself, and so does a struct with a `Sorted[T]` field.
+
 ### Interface values: `dyn`
 
 `dyn Shape` is a type: a value of any type that satisfies `Shape`, called through the interface's methods. A list of them can mix types:
@@ -261,6 +313,7 @@ for s in shapes {
 - Only the interface's methods can be called on a `dyn` value. It prints like the value inside. `==` is not allowed.
 - To choose between types, say where the `dyn` is expected: `let s: dyn Shape = if big { Circle { r: 1.0 } } else { Square { s: 2.0 } }`. Without an expected type, the branches of an `if` must have the same type.
 - A `dyn` value is boxed and its calls go through a table of methods; a bounded type parameter (`[T: Shape]`) has no such cost.
+- A generic interface is `dyn` with its arguments: `let bags: List[dyn Container[Str]] = [a, b]`. `dyn Container[Int]` and `dyn Container[Str]` are different types.
 
 ### Embedding
 
@@ -1259,26 +1312,26 @@ EBNF. `NL` is a newline, as described in section 2. `UPPER` is an `IDENT` that s
 ```
 program    = { "use" IDENT | [ "pub" ] ( fn | struct | enum | interface ) | test | bench | foreign } ;
 foreign    = "foreign" STRING "{" { [ "pub" ] "fn" IDENT "(" [ params ] ")" [ "->" type ] ( NL | ";" ) } "}" ;
-interface  = "interface" IDENT "{" { "fn" IDENT "(" "self" { "," param } ")" [ "->" type ] ( "," | NL ) } "}" ;
+interface  = "interface" IDENT [ generics ] "{" { "fn" IDENT "(" "self" { "," param } ")" [ "->" type ] ( "," | NL ) } "}" ;
 test       = "test" STRING [ "(" [ params ] ")" ] [ "for" ( IDENT | tuplepat ) "in" "[" expr { "," expr } [ "," ] "]" ] block ;
 bench      = "bench" STRING [ "(" [ params ] ")" ] block ;
 fn         = "fn" IDENT [ bgenerics ] "(" [ params ] ")" [ "->" type ] block ;
 bgenerics  = "[" IDENT [ ":" bound { "+" bound } ] { "," IDENT [ ":" bound { "+" bound } ] } "]" ;
-bound      = IDENT [ "." IDENT ] ;                (* an interface *)
+bound      = IDENT [ "." IDENT ] [ "[" typearg { "," typearg } "]" ] ;   (* an interface, with its arguments *)
 generics   = "[" IDENT { "," IDENT } "]" ;
 params     = param { sep param } [ "," ] ;
 param      = IDENT ":" type ;
-struct     = "struct" IDENT [ generics ] "{" [ field { sep field } [ "," ] ] "}" ;
+struct     = "struct" IDENT [ bgenerics ] "{" [ field { sep field } [ "," ] ] "}" ;
 field      = IDENT ":" type
            | [ IDENT "." ] UPPER [ "[" typearg { "," typearg } "]" ] ;   (* an embedded struct *)
-enum       = "enum" IDENT [ generics ] "{" [ variant { sep variant } [ "," ] ] "}" ;
+enum       = "enum" IDENT [ bgenerics ] "{" [ variant { sep variant } [ "," ] ] "}" ;
 variant    = IDENT [ "(" type { "," type } ")" ] ;
-type       = "dyn" IDENT [ "." IDENT ]               (* an interface value *)
+type       = "dyn" bound                          (* an interface value *)
            | "(" type "," type { "," type } ")"     (* a tuple *)
            | IDENT [ "." IDENT ] [ "[" typearg { "," typearg } "]" ]
            | "(" ")"
            | "fn" "(" [ type { "," type } ] ")" "->" type ;
-typearg    = type | INT ;                       (* INT only as Array's size *)
+typearg    = type | INT ;                       (* INT only as Array's size, which can also be a type parameter *)
 sep        = "," | NL ;
 
 block      = "{" { stmt ( NL | ";" ) } [ expr ] "}" ;

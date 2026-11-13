@@ -144,7 +144,7 @@ let struct_decl items t =
 (* ---------- hover ---------- *)
 
 let fn_signature text (d : fn_decl) =
-  let gens = if d.fn_gen = [] then "" else "[" ^ String.concat ", " d.fn_gen ^ "]" in
+  let gens = Doc.generics ~text d.fn_gen d.fn_bounds in
   let ps = List.map (fun p -> p.prm_name ^ ": " ^ slice text p.prm_ty.tspan) d.fn_params in
   let ret = match d.fn_ret with Some te -> " -> " ^ slice text te.tspan | None -> "" in
   (* a method `Shape::area` is written `fn area(self: Shape)` *)
@@ -196,7 +196,7 @@ let hover_items text items =
         stmts d.fn_body;
         walk_block (fun e -> match e.edesc with EBlock b | EGroup (_, _, b) -> stmts b | EIf (_, b, _) -> stmts b | EClosure (_, { edesc = EBlock b; _ }) -> stmts b | _ -> ()) d.fn_body
       | IIface i ->
-        add i.if_span ("interface " ^ i.if_name);
+        add i.if_span ("interface " ^ i.if_name ^ Doc.generics i.if_gen []);
         List.iter
           (fun (m, sp, ps, r) ->
             add sp

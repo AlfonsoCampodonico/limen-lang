@@ -15,6 +15,51 @@ let ifaces : (string, (string * (ty list * ty)) list) Hashtbl.t = Hashtbl.create
    (the type can be a map key; keys are ordered too). *)
 let builtin_bounds = [ "Ordered"; "Key" ]
 
+(* The type parameters of generic interfaces, `interface Container[T]`; the
+   methods in [ifaces] mention them as TParam. *)
+let iface_gen : (string, string list) Hashtbl.t = Hashtbl.create 8
+
+(* A bound: an interface and its type arguments, `Container[Int]`. *)
+type bound = string * ty list
+
+let show_bound ((i, args) : bound) = if args = [] then i else i ^ "[" ^ String.concat ", " (List.map show args) ^ "]"
+let dyn_of ((i, a) : bound) = TDyn (i, a)
+let subst_bound env ((i, args) : bound) : bound = (i, List.map (subst env) args)
+
+(* The methods of an interface, its parameters replaced by the bound's arguments. *)
+let iface_methods ((i, args) : bound) =
+  let ms = Option.value ~default:[] (Hashtbl.find_opt ifaces i) in
+  match Hashtbl.find_opt iface_gen i with
+  | Some gs when gs <> [] && List.length gs = List.length args ->
+    let env = List.combine gs args in
+    List.map (fun (m, (ps, r)) -> (m, (List.map (subst env) ps, subst env r))) ms
+  | _ -> ms
+
+(* Bounds on the type parameters of structs and enums, `struct Sorted[T: Ordered]`:
+   type -> its parameters, and each parameter's bounds in terms of them. *)
+let type_bounds : (string, string list * (string * bound list) list) Hashtbl.t = Hashtbl.create 8
+
+(* Instantiations to check against their bounds once the body's types are
+   known: (where, the type used, the bound, the type parameter). *)
+let pending : (Span.t * ty * bound * string) list ref = ref []
+
+(* Bounds of generic interfaces at calls: their arguments that are type
+   parameters of the callee are inferred from the type's methods as soon as
+   the type is known (see [infer_pending]). *)
+let to_infer : (ty * bound) list ref = ref []
+
+(* A use of struct or enum [n] with these type arguments: its bounds apply. *)
+let add_type_bounds n args sp =
+  match Hashtbl.find_opt type_bounds n with
+  | Some (gen, bs) when List.length gen = List.length args ->
+    let env = List.combine gen args in
+    List.iter (fun (g, ifs) -> let t = List.assoc g env in List.iter (fun b -> pending := (sp, t, subst_bound env b, g) :: !pending) ifs) bs
+  | _ -> ()
+
+(* Type parameters of the declaration being resolved, used as an array's
+   length (true) or as a type (false). One cannot be both. *)
+let param_kinds : (string, bool) Hashtbl.t = Hashtbl.create 8
+
 
 
 type var_kind = KLet | KParam | KPat | KGroup
@@ -81,6 +126,14 @@ let did_you_mean ctx ?(notes = []) code span msg name cands =
       code span msg
   | None -> err ctx ~notes code span msg
 
+let param_kind ctx g len sp =
+  match Hashtbl.find_opt param_kinds g with
+  | Some k when k <> len ->
+    err ctx "E0102" sp (sprintf "`%s` is used both as a type and as an array length" g)
+      ~notes:[ "a type parameter in an array's size stands for a length, as in `fn sum[N](xs: Array[Int, N])`; use another parameter for the type" ]
+  | Some _ -> ()
+  | None -> Hashtbl.replace param_kinds g len
+
 let unify_at ctx span want got =
   try unify want got
   with Mismatch -> err ctx "E0201" span (sprintf "expected `%s`, found `%s`" (show want) (show got))
@@ -103,6 +156,13 @@ let ambient =
 (* ---------- type expressions ---------- *)
 
 let rec resolve ctx env (te : ty_expr) : ty =
+  let iface_note n =
+    let gs = Option.value ~default:[] (Hashtbl.find_opt iface_gen n) in
+    if gs = [] then sprintf "take a type parameter bounded by it: `fn f[T: %s](x: T)`" n
+    else
+      let gs = String.concat ", " gs in
+      sprintf "take a type parameter bounded by it: `fn f[C: %s[%s], %s](x: C)`" n gs gs
+  in
   match te.tdesc with
   | TyUnit -> TUnit
   | TyFn (ps, r) -> TFn (List.map (resolve ctx env) ps, resolve ctx env r)
@@ -111,16 +171,21 @@ let rec resolve ctx env (te : ty_expr) : ty =
     TErr
   | TyName ("Array", [ elt; { tdesc = TyInt n; _ } ]) ->
     if n < 0 then (err ctx "E0102" te.tspan "an array size cannot be negative"; TErr)
-    else TArray (resolve ctx env elt, n)
+    else TArray (resolve ctx env elt, TLen n)
+  | TyName ("Array", [ elt; { tdesc = TyName (g, []); tspan } ]) when List.mem_assoc g env ->
+    (* generic over the length: `fn sum[N](xs: Array[Int, N])` *)
+    param_kind ctx g true tspan;
+    TArray (resolve ctx env elt, List.assoc g env)
   | TyName ("Array", _) ->
-    err ctx "E0109" te.tspan "`Array` takes an element type and a size, as in `Array[Float, 4]`";
+    err ctx "E0109" te.tspan "`Array` takes an element type and a size, as in `Array[Float, 4]`"
+      ~notes:[ "the size is a number, or a type parameter that stands for one: `fn sum[N](xs: Array[Int, N])`" ];
     TErr
-  | TyName ("dyn", [ { tdesc = TyName (i, []); tspan } ]) when List.mem i builtin_bounds ->
+  | TyName ("dyn", [ { tdesc = TyName (i, _); tspan } ]) when List.mem i builtin_bounds ->
     err ctx "E0102" tspan (sprintf "`%s` is a built-in bound, not an interface with methods; it cannot be `dyn`" i)
       ~notes:[ sprintf "use it on a type parameter: `fn f[T: %s](x: T)`" i ];
     TErr
-  | TyName ("dyn", [ { tdesc = TyName (i, []); tspan } ]) ->
-    if Hashtbl.mem ifaces i then TDyn i
+  | TyName ("dyn", [ { tdesc = TyName (i, args); tspan } ]) ->
+    if Hashtbl.mem ifaces i then (match bound_args ctx env i args tspan with Some a -> TDyn (i, a) | None -> TErr)
     else begin
       did_you_mean ctx "E0102" tspan (sprintf "unknown interface `%s`" i) i (List.of_seq (Hashtbl.to_seq_keys ifaces));
       TErr
@@ -160,7 +225,7 @@ let rec resolve ctx env (te : ty_expr) : ty =
     | "Map" -> if want 2 then TMap (List.nth args' 0, List.nth args' 1) else TErr
     | _ -> (
       match List.assoc_opt n env with
-      | Some t -> simple t
+      | Some t -> param_kind ctx n false te.tspan; simple t
       | None -> (
         let gen =
           match Hashtbl.find_opt ctx.structs n with
@@ -168,7 +233,12 @@ let rec resolve ctx env (te : ty_expr) : ty =
           | None -> Option.map (fun e -> e.en_gen) (Hashtbl.find_opt ctx.enums n)
         in
         match gen with
-        | Some g -> if want (List.length g) then TNamed (n, args') else TErr
+        | Some g ->
+          if want (List.length g) then begin
+            add_type_bounds n args' te.tspan;
+            TNamed (n, args')
+          end
+          else TErr
         | None ->
           let cands =
             builtin_types
@@ -177,10 +247,31 @@ let rec resolve ctx env (te : ty_expr) : ty =
             @ List.map fst env
           in
           if Hashtbl.mem ifaces n then
-            err ctx "E0102" te.tspan (sprintf "`%s` is an interface, not a type" n)
-              ~notes:[ sprintf "take a type parameter bounded by it: `fn f[T: %s](x: T)`" n ]
+            err ctx "E0102" te.tspan (sprintf "`%s` is an interface, not a type" n) ~notes:[ iface_note n ]
           else did_you_mean ctx "E0102" te.tspan (sprintf "unknown type `%s`" n) n cands;
           TErr)))
+
+(* The type arguments of interface [i], written [args]: exactly as many as it has parameters. *)
+and bound_args ctx env i args sp =
+  let gs = Option.value ~default:[] (Hashtbl.find_opt iface_gen i) in
+  if List.length gs = List.length args then Some (List.map (resolve ctx env) args)
+  else begin
+    let k = List.length gs in
+    err ctx "E0109" sp (sprintf "interface `%s` takes %d type argument%s, found %d" i k (plural k) (List.length args))
+      ~notes:
+        [ (if k = 0 then sprintf "write it without arguments: `%s`" i
+           else sprintf "write it with its type argument%s: `%s[%s]`" (plural k) i (String.concat ", " gs)) ];
+    None
+  end
+
+(* A bound on a type parameter: `Shape`, `Ordered`, `Container[Int]`. *)
+and resolve_bound ctx env (b : ty_expr) : bound option =
+  match b.tdesc with
+  | TyName (i, args) when Hashtbl.mem ifaces i -> Option.map (fun a -> (i, a)) (bound_args ctx env i args b.tspan)
+  | TyName (i, _) ->
+    did_you_mean ctx "E0102" b.tspan (sprintf "unknown interface `%s`" i) i (List.of_seq (Hashtbl.to_seq_keys ifaces));
+    None
+  | _ -> err ctx "E0102" b.tspan "a bound is an interface"; None
 
 let check_storable ctx span t =
   if caps_in t [] <> [] then
@@ -220,19 +311,24 @@ let visible_names ctx f =
   @ [ "panic"; "channel"; "assert"; "assert_eq"; "map"; "catch"; "bytes"; "keep"; "embed"; "embed_bytes"; "embed_dir" ]
 
 (* Generic functions' bounds: function -> type parameter -> interfaces. *)
-let fn_bounds : (string, (string * string list) list) Hashtbl.t = Hashtbl.create 8
+let fn_bounds : (string, (string * bound list) list) Hashtbl.t = Hashtbl.create 8
 
-(* Bounds of the type parameters of the function being checked. *)
-let cur_bounds : (string * string list) list ref = ref []
+(* Every function's bounds as seen inside it, declared and implied, and its
+   type parameters that stand for array lengths. *)
+let fn_cur_bounds : (string, (string * bound list) list) Hashtbl.t = Hashtbl.create 8
+let fn_kinds : (string, (string * bool) list) Hashtbl.t = Hashtbl.create 8
+
+(* Bounds of the type parameters of the function being checked: the ones
+   it declares, and the ones its parameter types imply (`self: Sorted[T]`
+   gives T the bounds of `Sorted`'s parameter). *)
+let cur_bounds : (string * bound list) list ref = ref []
+
+let bounds_of g = Option.value ~default:[] (List.assoc_opt g !cur_bounds)
 
 (* Whether type parameter [g] of the function being checked has bound [b]. *)
 let bounded g b =
-  let bs = Option.value ~default:[] (List.assoc_opt g !cur_bounds) in
+  let bs = List.map fst (bounds_of g) in
   List.mem b bs || (b = "Ordered" && List.mem "Key" bs)
-
-(* Instantiations to check against their bounds once the body's types are
-   known: (where, the type used, the interface, the type parameter). *)
-let pending : (Span.t * ty * string * string) list ref = ref []
 
 (* Key types of maps created in the function being checked: they must end
    up Int, Str or Bool. *)
@@ -243,7 +339,16 @@ let add_bounds fname env sp =
   | None -> ()
   | Some bs ->
     List.iter
-      (fun (g, ifs) -> match List.assoc_opt g env with Some t -> List.iter (fun i -> pending := (sp, t, i, g) :: !pending) ifs | None -> ())
+      (fun (g, ifs) ->
+        match List.assoc_opt g env with
+        | Some t ->
+          List.iter
+            (fun b ->
+              let b = subst_bound env b in
+              pending := (sp, t, b, g) :: !pending;
+              if snd b <> [] then to_infer := (t, b) :: !to_infer)
+            ifs
+        | None -> ())
       bs
 
 (* The built-in methods written in Vela that the program calls: only their
@@ -292,9 +397,10 @@ let variant_scope ctx v file =
   | [] -> ( match from Prelude.file with [] -> ens | p -> p)
   | own -> own
 
-let ctor_ty ctx en v =
+let ctor_ty ctx en v sp =
   let e = Hashtbl.find ctx.enums en in
   let targs = List.map (fun _ -> fresh ()) e.en_gen in
+  add_type_bounds en targs sp;
   let env = List.combine e.en_gen targs in
   let payload = List.assoc v (Hashtbl.find ctx.variants en) in
   let result = TNamed (en, targs) in
@@ -455,27 +561,26 @@ let ambiguous ctx sp n name paths =
   err ctx "E0120" sp (ambiguity n name paths)
     ~notes:[ sprintf "name the embedded struct you mean: %s" (String.concat " or " (List.map (fun p -> "`." ^ String.concat "." (p @ [ name ]) ^ "`") paths)) ]
 
-(* Does [t] have every method of interface [i], with the same types? *)
-let satisfies ctx t i : string option =
-  let ms = Option.value ~default:[] (Hashtbl.find_opt ifaces i) in
+(* Does [t] have every method of bound [b], with the same types? Unifying
+   the method types infers the bound's arguments where they are unknown. *)
+let satisfies ctx t ((i, args) as b : bound) : string option =
+  let ms = iface_methods b in
   let t = repr t in
+  let name = show_bound b in
+  let same_args a = List.length a = List.length args && (try List.iter2 unify args a; true with Mismatch -> false) in
   let check (m, (ps, r)) =
     let want = TFn (ps, r) in
-    let trial got = try unify want got; None with Mismatch -> Some (sprintf "its `%s` has type `%s`, but `%s` needs `%s`" m (show got) i (show want)) in
+    let trial got = try unify want got; None with Mismatch -> Some (sprintf "its `%s` has type `%s`, but `%s` needs `%s`" m (show got) name (show want)) in
     match t with
     | TVar _ | TErr -> None
-    | TDyn j when j = i -> None
-    | TDyn j -> (
-      match Option.bind (Hashtbl.find_opt ifaces j) (List.assoc_opt m) with
+    | TDyn (j, ja) -> (
+      match List.assoc_opt m (iface_methods (j, ja)) with
       | Some (ps', r') -> trial (TFn (ps', r'))
-      | None -> Some (sprintf "`dyn %s` has no method `%s`" j m))
-    | TParam g ->
-      let bs = Option.value ~default:[] (List.assoc_opt g !cur_bounds) in
-      if List.mem i bs then None
-      else (
-        match List.find_map (fun b -> Option.bind (Hashtbl.find_opt ifaces b) (List.assoc_opt m)) bs with
-        | Some (ps', r') -> trial (TFn (ps', r'))
-        | None -> Some (sprintf "type parameter `%s` is not bounded by `%s`; add it: `[%s: %s]`" g i g i))
+      | None -> Some (sprintf "`%s` has no method `%s`" (show t) m))
+    | TParam g -> (
+      match List.find_map (fun b' -> List.assoc_opt m (iface_methods b')) (bounds_of g) with
+      | Some (ps', r') -> trial (TFn (ps', r'))
+      | None -> Some (sprintf "type parameter `%s` is not bounded by `%s`; add it: `[%s: %s]`" g name g name))
     | TNamed (n, _) when Hashtbl.mem ctx.fns (n ^ "::" ^ m) -> (
       let _, ft = instantiate (Hashtbl.find ctx.fns (n ^ "::" ^ m)) in
       match ft with
@@ -493,10 +598,45 @@ let satisfies ctx t i : string option =
     let own = match t with TNamed (n, _) -> Hashtbl.mem ctx.fns (n ^ "::" ^ m) || List.mem_assoc m (methods t) | TParam _ | TDyn _ -> true | _ -> List.mem_assoc m (methods t) in
     if i = "Error" && m = "cause" && not own then None else check (m, sg)
   in
-  List.find_map check ms
+  match t with
+  | TDyn (j, ja) when j = i && same_args ja -> None
+  | TParam g when List.exists (fun (j, ja) -> j = i && same_args ja) (bounds_of g) -> None
+  | _ -> List.find_map check ms
+
+(* Infer the arguments of the generic-interface bounds of the calls made so
+   far whose type is now known, so `first(xs)` has its result type at once. *)
+let infer_pending ctx =
+  if !to_infer <> [] then
+    to_infer := List.filter (fun (t, b) -> match repr t with TVar _ -> true | _ -> ignore (satisfies ctx t b); false) !to_infer
+
+
+(* The functions `Type::name` and `module.Type::name` by their `Type::name`
+   part, so finding a method a file added to a built-in type is a lookup, not
+   a scan of every function (which made checking quadratic). Rebuilt when the
+   set of functions has changed. *)
+let methods_index : (string, string) Hashtbl.t = Hashtbl.create 64
+let methods_index_of = ref None (* the table indexed, and its size then *)
+
+let methods_named ctx suffix =
+  let fresh = match !methods_index_of with Some (t, n) -> t == ctx.fns && n = Hashtbl.length ctx.fns | None -> false in
+  if not fresh then begin
+    Hashtbl.reset methods_index;
+    Hashtbl.iter
+      (fun k _ ->
+        match Interp_util.find_sub k "::" 0 with
+        | Some i ->
+          let ty = String.sub k 0 i in
+          let base = match String.rindex_opt ty '.' with Some d -> String.sub ty (d + 1) (String.length ty - d - 1) | None -> ty in
+          Hashtbl.add methods_index (base ^ String.sub k i (String.length k - i)) k
+        | None -> ())
+      ctx.fns;
+    methods_index_of := Some (ctx.fns, Hashtbl.length ctx.fns)
+  end;
+  Hashtbl.find_all methods_index suffix
 
 let rec check_expr ctx f e : ty =
   let t = check_expr_inner ctx f e in
+  (match e.edesc with ECall _ | EMethod _ -> infer_pending ctx | _ -> ());
   e.ety <- t;
   t
 
@@ -572,7 +712,11 @@ and check_expr_inner ctx f e : ty =
   | EBlock b -> check_block ctx f b
   | EClosure (ps, body) -> check_closure ctx f ps body None
   | EStruct (name, nsp, fields) -> check_struct_lit ctx f name nsp fields e.espan
-  | EDyn (x, i) -> ignore (check_expr ctx f x); TDyn i
+  | EDyn (x, i) -> (
+    (* checked again (a table test's copy): the type it was boxed as *)
+    let before = e.ety in
+    ignore (check_expr ctx f x);
+    match repr before with TDyn _ as t -> t | _ -> TDyn (i, []))
   | EPipe _ -> failwith "pipes are expanded when modules load"
   | EWith (base, fields) -> check_with ctx f base fields e.espan
   | ESafe (base, x, rest, _) -> check_safe ctx f e base x rest
@@ -611,9 +755,14 @@ and expect ctx f e want =
   match (e.edesc, repr want) with
   | EList es, TArray (el, n) ->
     List.iter (fun x -> expect ctx f x el) es;
-    if List.length es <> n then
-      err ctx "E0201" e.espan
-        (sprintf "expected %d element%s for `%s`, found %d" n (plural n) (show want) (List.length es));
+    (match repr n with
+     | TLen n ->
+       if List.length es <> n then
+         err ctx "E0201" e.espan
+           (sprintf "expected %d element%s for `%s`, found %d" n (plural n) (show want) (List.length es))
+     | _ ->
+       (* a length still to infer, as at a call of `fn sum[N](xs: Array[Int, N])` *)
+       unify_at ctx e.espan n (TLen (List.length es)));
     e.ety <- want
   | EList es, TList el when (match repr el with TDyn _ -> true | _ -> false) ->
     (* each element is boxed on its own, so a list can mix types *)
@@ -634,36 +783,37 @@ and expect ctx f e want =
     e.ety <- t;
     unify_at ctx e.espan want t
   | EBlock b, _ -> expect_block ctx f b want; e.ety <- want
-  | _, TDyn i -> coerce ctx e (check_expr ctx f e) i
+  | _, TDyn (i, a) -> coerce ctx e (check_expr ctx f e) (i, a)
   | _ -> expect_plain ctx f e want
 
 (* A value used where `dyn I` is expected: box it if its type satisfies I. *)
-and coerce ctx e t i =
+and coerce ctx e t ((i, _) as b) =
+  let bn = show_bound b in
   match repr t with
-  | TDyn j when j = i -> ()
-  | TVar _ -> unify_at ctx e.espan (TDyn i) t
+  | TDyn (j, _) when j = i -> unify_at ctx e.espan (dyn_of b) t
+  | TVar _ -> unify_at ctx e.espan (dyn_of b) t
   | TErr -> ()
   | TStr | TNamed ("IoError", _) when i = "Error" ->
     (* the built-in errors: a message, no cause *)
     let inner = { e with edesc = e.edesc } in
     e.edesc <- EDyn (inner, i);
-    e.ety <- TDyn i
+    e.ety <- dyn_of b
   | TNamed (n, _) as ct when (Hashtbl.mem ctx.structs n || Hashtbl.mem ctx.enums n) && not (List.mem n [ "Option"; "Result"; "IoError" ]) ->
     if caps_in ct [] <> [] || has_fn ct || has_chan ct then
       err ctx "E0112" e.espan
-        (sprintf "`%s` holds a capability, function or channel, so it cannot become `dyn %s`" (show ct) i)
-        ~notes:[ "authority must stay visible in types; pass it with a type parameter, as in `[T: " ^ i ^ "]`" ]
+        (sprintf "`%s` holds a capability, function or channel, so it cannot become `dyn %s`" (show ct) bn)
+        ~notes:[ "authority must stay visible in types; pass it with a type parameter, as in `[T: " ^ bn ^ "]`" ]
     else begin
-      match satisfies ctx ct i with
-      | Some why -> err ctx "E0111" e.espan (sprintf "`%s` does not satisfy interface `%s`" (show ct) i) ~notes:[ why ]
+      match satisfies ctx ct b with
+      | Some why -> err ctx "E0111" e.espan (sprintf "`%s` does not satisfy interface `%s`" (show ct) bn) ~notes:[ why ]
       | None ->
         let inner = { e with edesc = e.edesc } in
         e.edesc <- EDyn (inner, i);
-        e.ety <- TDyn i
+        e.ety <- dyn_of b
     end
   | t ->
     err ctx "E0112" e.espan
-      (sprintf "only struct and enum values can become `dyn %s`, not `%s`" i (show t))
+      (sprintf "only struct and enum values can become `dyn %s`, not `%s`" bn (show t))
       ~notes:[ "wrap the value in a struct that has the interface's methods" ]
 
 and expect_plain ctx f e want =
@@ -701,7 +851,7 @@ and check_var ctx f e n sp =
         (* name the enum when the variant name alone would be ambiguous to the backends *)
         if List.length (Hashtbl.find ctx.owners n) > 1 then
           e.edesc <- EField ({ edesc = EVar en; espan = sp; ety = TErr; einst = []; ecallee = None }, n, sp);
-        ctor_ty ctx en n
+        ctor_ty ctx en n sp
       | Some ens ->
         err ctx "E0104" sp
           (sprintf "`%s` is a variant of several enums (%s); qualify it, for example `%s.%s`" n
@@ -967,7 +1117,7 @@ and check_field ctx f e recv name nsp =
   match recv.edesc with
   | EVar en when lookup f en = None && Hashtbl.mem ctx.enums en ->
     let vs = Hashtbl.find ctx.variants en in
-    if List.mem_assoc name vs then ctor_ty ctx en name
+    if List.mem_assoc name vs then ctor_ty ctx en name nsp
     else begin
       did_you_mean ctx "E0104" nsp (sprintf "enum `%s` has no variant `%s`" en name) name (List.map fst vs);
       TErr
@@ -1024,10 +1174,8 @@ and method_arity ?(file = "") ctx t name =
   | None ->
   match repr t with
   | TNamed (n, _) when Hashtbl.mem ctx.fns (n ^ "::" ^ name) && builtin_tname t = None -> Some (List.length (Hashtbl.find ctx.fns (n ^ "::" ^ name)).ps - 1)
-  | TDyn i -> Option.map (fun (ps, _) -> List.length ps) (Option.bind (Hashtbl.find_opt ifaces i) (List.assoc_opt name))
-  | TParam g ->
-    let bs = Option.value ~default:[] (List.assoc_opt g !cur_bounds) in
-    List.find_map (fun b -> Option.map (fun (ps, _) -> List.length ps) (Option.bind (Hashtbl.find_opt ifaces b) (List.assoc_opt name))) bs
+  | TDyn (i, a) -> Option.map (fun (ps, _) -> List.length ps) (List.assoc_opt name (iface_methods (i, a)))
+  | TParam g -> List.find_map (fun b -> Option.map (fun (ps, _) -> List.length ps) (List.assoc_opt name (iface_methods b))) (bounds_of g)
   | (TList _ | TMap _) when name = "push" || name = "remove" -> None (* they change the receiver *)
   | t -> Option.map (fun mk -> List.length (fst (mk ()))) (List.assoc_opt name (methods t))
 
@@ -1121,13 +1269,11 @@ and check_method_value ?rt ctx f e recv name nsp args =
        `m`, or `x: dyn I` *)
     let g, bs =
       match rt with
-      | TDyn i -> ("dyn " ^ i, [ i ])
-      | TParam g -> (g, Option.value ~default:[] (List.assoc_opt g !cur_bounds))
+      | TDyn (i, a) -> ("dyn " ^ show_bound (i, a), [ (i, a) ])
+      | TParam g -> (g, bounds_of g)
       | _ -> ("", [])
     in
-    let found =
-      List.find_map (fun b -> Option.map (fun m -> (b, m)) (Option.bind (Hashtbl.find_opt ifaces b) (List.assoc_opt name))) bs
-    in
+    let found = List.find_map (fun ((bi, _) as b) -> Option.map (fun m -> (bi, m)) (List.assoc_opt name (iface_methods b))) bs in
     match found with
     | Some (b, (ps, r)) -> (
       let names = Option.to_result ~none:"" (Hashtbl.find_opt param_names (b ^ "::" ^ name)) in
@@ -1149,10 +1295,10 @@ and check_method_value ?rt ctx f e recv name nsp args =
       end;
       r)
     | None ->
-      let declared = List.concat_map (fun b -> List.map fst (Option.value ~default:[] (Hashtbl.find_opt ifaces b))) bs in
+      let declared = List.concat_map (fun b -> List.map fst (iface_methods b)) bs in
       let notes =
         if bs = [] then [ sprintf "`%s` is a type parameter with no bounds; add one, as in `[%s: Interface]`, whose interface declares `fn %s(self, ...)`" g g name ]
-        else [ sprintf "the bounds of `%s` (%s) declare: %s" g (String.concat ", " bs) (if declared = [] then "nothing" else String.concat ", " declared) ]
+        else [ sprintf "the bounds of `%s` (%s) declare: %s" g (String.concat ", " (List.map show_bound bs)) (if declared = [] then "nothing" else String.concat ", " declared) ]
       in
       did_you_mean ctx ~notes "E0105" nsp (sprintf "no method `%s` on `%s`" name g) name declared;
       check_args ctx f args;
@@ -1334,11 +1480,11 @@ and check_place ctx f e =
 (* Can errors of type [e] become `dyn Error`? None if so, else why not. *)
 and error_conversion ctx e =
   match repr e with
-  | TDyn "Error" | TErr | TStr | TNamed ("IoError", _) -> None
-  | TVar _ -> unify e (TDyn "Error"); None
+  | TDyn ("Error", []) | TErr | TStr | TNamed ("IoError", _) -> None
+  | TVar _ -> unify e (TDyn ("Error", [])); None
   | TNamed (n, _) as ct when (Hashtbl.mem ctx.structs n || Hashtbl.mem ctx.enums n) && not (List.mem n [ "Option"; "Result" ]) ->
     if caps_in ct [] <> [] || has_fn ct || has_chan ct then Some (sprintf "`%s` holds a capability, function or channel" (show ct))
-    else satisfies ctx ct "Error"
+    else satisfies ctx ct ("Error", [])
   | t -> Some (sprintf "`%s` does not satisfy `Error`" (show t))
 
 (* The fix-it that changes the function's error type to `dyn Error`. *)
@@ -1362,7 +1508,7 @@ and check_try_ok ctx f x context sp =
     err ctx "E0311" sp "`?` cannot leave a `group` block early; every task must finish first"
       ~notes:[ "handle the error inside the task, or after the group returns its results" ];
   let t = repr (check_expr ctx f x) in
-  let is_dyn_error t = match repr t with TDyn "Error" -> true | _ -> false in
+  let is_dyn_error t = match repr t with TDyn ("Error", []) -> true | _ -> false in
   let wrong_fn rt kind =
     err ctx "E0202" sp
       (sprintf "`?` can only be used in a function that returns `%s`, this one returns `%s`" kind (show rt))
@@ -1380,7 +1526,7 @@ and check_try_ok ctx f x context sp =
          err ctx "E0202" sp
            (sprintf "`?` with context returns a `dyn Error`, but this function returns errors of type `%s`" (show fe))
            ?fix:(dyn_error_fix f)
-       | TVar _ -> unify_at ctx sp f.ret_ty (res (fresh ()) (TDyn "Error"))
+       | TVar _ -> unify_at ctx sp f.ret_ty (res (fresh ()) (TDyn ("Error", [])))
        | TErr -> ()
        | rt -> wrong_fn rt "Result[_, dyn Error]");
       true
@@ -1510,6 +1656,7 @@ and check_struct_lit ctx f name nsp fields sp =
   | Some decl_fields ->
     let gen = (Hashtbl.find ctx.structs name).st_gen in
     let targs = List.map (fun _ -> fresh ()) gen in
+    add_type_bounds name targs nsp;
     let env = List.combine gen targs in
     let seen = Hashtbl.create 8 in
     List.iter
@@ -1982,25 +2129,67 @@ let check_pending ctx =
   let ps = List.rev !pending in
   pending := [];
   List.iter
-    (fun (sp, t, i, g) ->
+    (fun (sp, t, ((i, _) as b), g) ->
       let why =
         match i with
         | "Ordered" -> Option.map (fun u -> sprintf "`%s` has no order: numbers, strings, Bool, and lists, tuples, structs and enums of them are ordered" (show u)) (unordered ctx t)
         | "Key" -> Option.map (fun u -> sprintf "`%s` cannot be a map key: keys are Int, Str, Bytes, Bool, and tuples, structs and enums of them" (show u)) (unkeyable ctx t)
-        | _ -> satisfies ctx t i
+        | _ -> satisfies ctx t b
       in
       match why with
       | None -> ()
       | Some why ->
         err ctx "E0111" sp
           (if List.mem i builtin_bounds then sprintf "`%s` does not satisfy `%s`, required of `%s`" (show (repr t)) i g
-           else sprintf "`%s` does not satisfy interface `%s`, required of `%s`" (show (repr t)) i g)
+           else sprintf "`%s` does not satisfy interface `%s`, required of `%s`" (show (repr t)) (show_bound b) g)
           ~notes:(why :: match repr t with TParam p when List.mem i builtin_bounds -> [ sprintf "add the bound: `[%s: %s]`" p i ] | _ -> []))
     ps
 
+(* The bounds a function's parameter types give its type parameters: in
+   `fn insert[T](self: Sorted[T], x: T)`, T has the bounds of `Sorted`'s
+   parameter, since every `Sorted` value was checked where it was made. Not
+   the result type: a function that makes one must declare the bounds. *)
+let implied_bounds ctx gen ts =
+  let acc = ref [] in
+  let add g b =
+    let prev = Option.value ~default:[] (List.assoc_opt g !acc) in
+    if not (List.mem b prev) then acc := (g, prev @ [ b ]) :: List.remove_assoc g !acc
+  in
+  let rec walk t =
+    match repr t with
+    | TNamed (n, args) ->
+      (match Hashtbl.find_opt type_bounds n with
+       | Some (tg, bs) when List.length tg = List.length args ->
+         let env = List.combine tg args in
+         List.iter
+           (fun (p, pbs) -> match repr (List.assoc p env) with TParam g when List.mem g gen -> List.iter (fun b -> add g (subst_bound env b)) pbs | _ -> ())
+           bs
+       | _ -> ());
+      List.iter walk args
+    | TList a | TChan a | TGroup a | TArray (a, _) -> walk a
+    | TMap (k, v) -> walk k; walk v
+    | TFn (ps, r) -> List.iter walk ps; walk r
+    | TDyn (_, xs) -> List.iter walk xs
+    | _ -> ()
+  in
+  ignore ctx;
+  List.iter walk ts;
+  List.rev !acc
+
+let merge_bounds a b =
+  List.fold_left
+    (fun acc (g, bs) ->
+      let prev = Option.value ~default:[] (List.assoc_opt g acc) in
+      let extra = List.filter (fun x -> not (List.mem x prev)) bs in
+      if List.mem_assoc g acc then List.map (fun (h, p) -> if h = g then (h, p @ extra) else (h, p)) acc else acc @ [ (g, extra) ])
+    a b
+
 let check_fn ctx (d : fn_decl) (s : fsig) =
-  cur_bounds := List.map (fun (g, bs) -> (g, List.map fst bs)) d.fn_bounds;
+  cur_bounds := Option.value ~default:[] (Hashtbl.find_opt fn_cur_bounds d.fn_name);
+  Hashtbl.reset param_kinds;
+  List.iter (fun (g, k) -> Hashtbl.replace param_kinds g k) (Option.value ~default:[] (Hashtbl.find_opt fn_kinds d.fn_name));
   pending := [];
+  to_infer := [];
   map_keys := [];
   Fun.protect ~finally:(fun () -> check_pending ctx) @@ fun () ->
   let genv = List.map (fun g -> (g, TParam g)) d.fn_gen in
@@ -2072,6 +2261,14 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
   Hashtbl.reset ifaces;
   List.iter (fun b -> Hashtbl.replace ifaces b []) builtin_bounds;
   Hashtbl.reset fn_bounds;
+  Hashtbl.reset fn_cur_bounds;
+  Hashtbl.reset fn_kinds;
+  Hashtbl.reset iface_gen;
+  Hashtbl.reset type_bounds;
+  pending := [];
+  (* bound checks of the types in declarations, made once every method is known *)
+  let deferred = ref [] in
+  let take_pending bounds = deferred := (bounds, !pending) :: !deferred; pending := [] in
   let items = Prelude.items () @ user_items in
   let type_defined n = Hashtbl.mem ctx.structs n || Hashtbl.mem ctx.enums n || List.mem n builtin_types in
   (* 1. register type names *)
@@ -2088,7 +2285,10 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
           err ctx "E0106" i.if_span (sprintf "`%s` is a built-in bound; name the interface something else" i.if_name)
         else if type_defined i.if_name || Hashtbl.mem ifaces i.if_name then
           err ctx "E0106" i.if_span (sprintf "`%s` is defined more than once" i.if_name)
-        else Hashtbl.replace ifaces i.if_name []
+        else begin
+          Hashtbl.replace ifaces i.if_name [];
+          Hashtbl.replace iface_gen i.if_name i.if_gen
+        end
       | IFn _ | IType _ -> ())
     items;
   (* 1b. interface methods *)
@@ -2103,18 +2303,44 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
               else begin
                 Hashtbl.replace seen m ();
                 Hashtbl.replace param_names (i.if_name ^ "::" ^ m) (List.map (fun p -> p.prm_name) ps);
-                Some (m, (List.map (fun p -> resolve ctx [] p.prm_ty) ps, match r with Some te -> resolve ctx [] te | None -> TUnit))
+                let env = List.map (fun g -> (g, TParam g)) i.if_gen in
+                Some (m, (List.map (fun p -> resolve ctx env p.prm_ty) ps, match r with Some te -> resolve ctx env te | None -> TUnit))
               end)
             i.if_methods
         in
-        Hashtbl.replace ifaces i.if_name ms
+        Hashtbl.replace ifaces i.if_name ms;
+        (* the interface's own parameters have no bounds to check *)
+        pending := List.filter (fun (_, t, _, _) -> match repr t with TParam g -> not (List.mem g i.if_gen) | _ -> true) !pending;
+        take_pending []
       | _ -> ())
     items;
+  (* 1c. bounds on the type parameters of structs and enums *)
+  let declare_bounds name gen (bounds : Ast.bounds) =
+    let env = List.map (fun g -> (g, TParam g)) gen in
+    let bs = List.filter_map (fun (g, tes) -> match List.filter_map (resolve_bound ctx env) tes with [] -> None | bs -> Some (g, bs)) bounds in
+    if bs <> [] then Hashtbl.replace type_bounds name (gen, bs);
+    take_pending bs
+  in
+  List.iter
+    (function
+      | IStruct s when registered ctx.structs s.st_name s && s.st_bounds <> [] -> declare_bounds s.st_name s.st_gen s.st_bounds
+      | IEnum e when registered ctx.enums e.en_name e && e.en_bounds <> [] -> declare_bounds e.en_name e.en_gen e.en_bounds
+      | _ -> ())
+    items;
+  let own_bounds n = match Hashtbl.find_opt type_bounds n with Some (_, bs) -> bs | None -> [] in
   (* 2. resolve field and payload types; an alias's body, which every use
      already has in its place, only to report a type that does not exist *)
   List.iter
     (function
-      | IType a -> ignore (resolve ctx (List.map (fun g -> (g, TParam g)) a.ty_gen) a.ty_body)
+      | IType a ->
+        Hashtbl.reset param_kinds;
+        (match a.ty_body.tdesc with
+         | TyName (i, args) when Hashtbl.mem ifaces i && not (List.mem i builtin_bounds) ->
+           (* another name for an interface with its arguments, used as a bound: `type Ints = Container[Int]` *)
+           ignore (bound_args ctx (List.map (fun g -> (g, TParam g)) a.ty_gen) i args a.ty_body.tspan)
+         | _ -> ignore (resolve ctx (List.map (fun g -> (g, TParam g)) a.ty_gen) a.ty_body));
+        (* an alias is checked where it is used, with the arguments it is given there *)
+        pending := []
       | IStruct s when not (registered ctx.structs s.st_name s) -> ()
       | IStruct s ->
         let env = List.map (fun g -> (g, TParam g)) s.st_gen in
@@ -2141,9 +2367,11 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
               end)
             s.st_fields
         in
-        Hashtbl.replace ctx.sfields s.st_name fs
+        Hashtbl.replace ctx.sfields s.st_name fs;
+        take_pending (own_bounds s.st_name)
       | IEnum e ->
         if registered ctx.enums e.en_name e then begin
+          Hashtbl.reset param_kinds;
           let env = List.map (fun g -> (g, TParam g)) e.en_gen in
           let vs =
             List.filter_map
@@ -2160,7 +2388,8 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
                 end)
               e.en_variants
           in
-          Hashtbl.replace ctx.variants e.en_name vs
+          Hashtbl.replace ctx.variants e.en_name vs;
+          take_pending (own_bounds e.en_name)
         end
       | IFn _ | IIface _ -> ())
     items;
@@ -2197,6 +2426,7 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
     List.filter_map
       (function
         | IFn d ->
+          Hashtbl.reset param_kinds;
           let env = List.map (fun g -> (g, TParam g)) d.fn_gen in
           let ps, ret =
             match d.fn_foreign with
@@ -2217,15 +2447,14 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
           if d.fn_foreign = None && not (Hashtbl.mem ctx.fns d.fn_name) then
             Hashtbl.replace param_names d.fn_name (List.map (fun p -> p.prm_name) d.fn_params);
           check_self ctx d ps;
-          List.iter
-            (fun (_, bs) ->
-              List.iter
-                (fun (b, bsp) ->
-                  if not (Hashtbl.mem ifaces b) then
-                    did_you_mean ctx "E0102" bsp (sprintf "unknown interface `%s`" b) b (List.of_seq (Hashtbl.to_seq_keys ifaces)))
-                bs)
-            d.fn_bounds;
-          if d.fn_bounds <> [] then Hashtbl.replace fn_bounds d.fn_name (List.map (fun (g, bs) -> (g, List.map fst bs)) d.fn_bounds);
+          let declared =
+            List.filter_map (fun (g, tes) -> match List.filter_map (resolve_bound ctx env) tes with [] -> None | bs -> Some (g, bs)) d.fn_bounds
+          in
+          if declared <> [] then Hashtbl.replace fn_bounds d.fn_name declared;
+          let all = merge_bounds declared (implied_bounds ctx d.fn_gen ps) in
+          Hashtbl.replace fn_cur_bounds d.fn_name all;
+          Hashtbl.replace fn_kinds d.fn_name (List.of_seq (Hashtbl.to_seq param_kinds));
+          take_pending all;
           (* a clash with a built-in method written in Vela is reported by check_self *)
           let builtin_clash = match Hashtbl.find_opt method_owner d.fn_name with Some (_, fl) -> fl = Prelude.methods_file | None -> false in
           if String.contains d.fn_name ':' && not builtin_clash then Hashtbl.replace method_owner d.fn_name (d.fn_pub, d.fn_span.file);
@@ -2238,6 +2467,8 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
         | _ -> None)
       items
   in
+  (* the bounds of the types written in declarations *)
+  List.iter (fun (bs, ps) -> cur_bounds := bs; pending := ps; check_pending ctx) (List.rev !deferred);
   (* test names are unique *)
   let seen_tests = Hashtbl.create 8 in
   List.iter

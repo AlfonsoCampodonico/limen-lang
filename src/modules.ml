@@ -526,23 +526,11 @@ let rename_item mods (m : modinfo) own (it : item) : item =
         | _ -> qual m d.fn_name (* the checker reports the bad `self` *)
       else qual m d.fn_name
     in
-    (* bounds name interfaces, qualified like types *)
-    let bound (b, sp) =
-      match String.index_opt b '.' with
-      | Some i -> (
-        let a = String.sub b 0 i and n = String.sub b (i + 1) (String.length b - i - 1) in
-        match module_of env a sp with
-        | Some md -> (
-          match member env md n sp with
-          | Some (IIface _) -> (qual md n, sp)
-          | _ -> no_member md n sp; (b, sp))
-        | None -> err "E0401" sp (Printf.sprintf "unknown module `%s`; add `use %s` at the top of the file" a a); (b, sp))
-      | None -> ( match Hashtbl.find_opt own b with Some (IIface _) -> (qual m b, sp) | _ -> (b, sp))
-    in
     IFn
       { d with
         fn_name = name;
-        fn_bounds = List.map (fun (g, bs) -> (g, List.map bound bs)) d.fn_bounds;
+        (* bounds name interfaces, qualified and expanded like types *)
+        fn_bounds = List.map (fun (g, bs) -> (g, List.map (ty env) bs)) d.fn_bounds;
         fn_params = params;
         fn_ret = Option.map (ty env) d.fn_ret;
         fn_body = block env locals d.fn_body;
@@ -556,7 +544,7 @@ let rename_item mods (m : modinfo) own (it : item) : item =
     let env = { self = m; mods; own; gens = s.st_gen } in
     IStruct { s with st_name = qual m s.st_name; st_fields = List.map (fun (f, sp, t) -> (f, sp, ty env t)) s.st_fields }
   | IIface i ->
-    let env = { self = m; mods; own; gens = [] } in
+    let env = { self = m; mods; own; gens = i.if_gen } in
     IIface
       { i with
         if_name = qual m i.if_name;
@@ -567,7 +555,10 @@ let rename_item mods (m : modinfo) own (it : item) : item =
   | IEnum e ->
     let env = { self = m; mods; own; gens = e.en_gen } in
     IEnum
-      { e with en_name = qual m e.en_name; en_variants = List.map (fun (v, sp, ts) -> (v, sp, List.map (ty env) ts)) e.en_variants }
+      { e with
+        en_name = qual m e.en_name;
+        en_variants = List.map (fun (v, sp, ts) -> (v, sp, List.map (ty env) ts)) e.en_variants;
+        en_bounds = List.map (fun (g, bs) -> (g, List.map (ty env) bs)) e.en_bounds }
   | IType a ->
     (* expanded where it is used; kept, expanded, so the checker checks its
        body even if nothing uses it *)

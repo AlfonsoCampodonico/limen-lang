@@ -2829,6 +2829,7 @@ fn main(root: Root) -> Result[(), IoError] {
 
   (* ---------- interfaces ---------- *)
   out "interfaces" (example "interfaces.vela") "15.0 9.0\nsquare of area 4.0\nbox of area 1.0, box of area 1.0\n500 true\n";
+  out "generics-example" (example "generics.vela") "Some(\"Emma\") Some(3)\n2 Some(\"Dune\")\n0 None\n[1, 2, 5, 7]\n28 30\n";
   let shape = "interface Shape {\n    fn area(self) -> Float\n}\n\nstruct Blob {\n    n: Int,\n}\n\nfn area(self: Blob) -> Int {\n    self.n\n}\n\nfn total[T: Shape](xs: List[T]) -> Float {\n    xs.map(|s| s.area()).fold(0.0, |a, b| a + b)\n}\n\n" in
   errs "iface-wrong-signature" (shape ^ "fn main() {\n    let a = total([Blob { n: 1 }])\n}\n") [ "E0111" ];
   errs "iface-builtin-missing" (shape ^ "fn main() {\n    let a = total([1, 2])\n}\n") [ "E0111" ];
@@ -2836,12 +2837,45 @@ fn main(root: Root) -> Result[(), IoError] {
   errs "iface-as-type" (shape ^ "fn bad(s: Shape) {}\n\nfn main() {}\n") [ "E0102" ];
   errs "iface-unknown-bound" (shape ^ "fn bad[T: Shpe](x: T) {}\n\nfn main() {}\n") [ "E0102" ];
   errs "iface-forward-unbounded" (shape ^ "fn outer[T](xs: List[T]) -> Float {\n    total(xs)\n}\n\nfn main() {}\n") [ "E0111" ];
-  errs "iface-bound-on-struct" "interface S {\n    fn a(self) -> Int\n}\n\nstruct B[T: S] {\n    x: T,\n}\n\nfn main() {}\n" [ "E0003" ];
+  errs "iface-bound-on-struct" "interface S {\n    fn a(self) -> Int\n}\n\nstruct B[T: S] {\n    x: T,\n}\n\nfn main() {}\n" [];
   (* an interface from another module, satisfied by a type in this one *)
   let geo = "pub interface Area {\n    fn area(self) -> Int\n}\n\npub fn twice[T: Area](x: T) -> Int {\n    x.area() * 2\n}\n" in
   out "iface-across-modules" ~modules:[ ("geo", geo) ]
     "use geo\n\nstruct Sq {\n    s: Int,\n}\n\nfn area(self: Sq) -> Int {\n    self.s * self.s\n}\n\nfn show[T: geo.Area](x: T) -> Int {\n    geo.twice(x) + x.area()\n}\n\nfn main(root: Root) {\n    root.stdout.print(\"{show(Sq { s: 3 })}\")\n}\n"
     "27\n";
+  (* generic interfaces: arguments named in bounds, inferred from the type's methods; dyn with arguments *)
+  out "iface-generic" "interface Container[T] {\n    fn get(self, i: Int) -> Option[T]\n    fn len(self) -> Int\n}\n\nstruct Bag {\n    items: List[Str],\n}\n\nfn get(self: Bag, i: Int) -> Option[Str] {\n    self.items.get(i)\n}\n\nfn len(self: Bag) -> Int {\n    self.items.len()\n}\n\nfn first[C: Container[T], T](c: C) -> Option[T] {\n    c.get(0)\n}\n\nfn count[C: Container[Int]](c: C) -> Int {\n    let mut total = 0\n    for i in 0..<c.len() {\n        total = total + (c.get(i) ?? 0)\n    }\n    total\n}\n\nfn main(root: Root) {\n    let out = root.stdout\n    let b = Bag { items: [\"a\", \"b\"] }\n    let f = first(b)\n    out.print(\"{f} {first([1, 2, 3])} {count([4, 5, 6])}\")\n    let x = first(b) ?? \"none\"\n    out.print(x.to_upper())\n    let boxes: List[dyn Container[Str]] = [b, Bag { items: [] }]\n    for c in boxes {\n        out.print(\"{c.len()} {c.get(1)}\")\n    }\n}\n"
+    "Some(\"a\") Some(1) 15\nA\n2 Some(\"b\")\n0 None\n";
+  out "iface-generic-across-modules" ~modules:[ ("coll", "pub interface Container[T] {\n    fn get(self, i: Int) -> Option[T]\n    fn len(self) -> Int\n}\n\npub struct Sorted[T: Ordered] {\n    items: List[T],\n}\n\npub fn last[C: Container[T], T](c: C) -> Option[T] {\n    c.get(c.len() - 1)\n}\n\npub type Ints = Container[Int]\n") ]
+    "use coll\n\ntype Strs = coll.Container[Str]\ntype Pair = (Int, Int)\n\nfn total[C: coll.Ints](c: C) -> Int {\n    c.len()\n}\n\nfn firsts[C: Strs](c: C) -> Str {\n    c.get(0) ?? \"-\"\n}\n\nfn pairs[C: coll.Container[Pair]](c: C) -> Int {\n    c.len()\n}\n\nfn main(root: Root) {\n    let s: coll.Sorted[Int] = coll.Sorted { items: [1] }\n    let d: dyn coll.Container[Str] = Wrap { xs: [\"q\"] }\n    root.stdout.print(\"{coll.last([1, 2])} {total([1])} {firsts([\"z\"])} {pairs([(1, 2)])} {s.items} {d.get(0)}\")\n}\n\nstruct Wrap {\n    xs: List[Str],\n}\n\nfn get(self: Wrap, i: Int) -> Option[Str] {\n    self.xs.get(i)\n}\n\nfn len(self: Wrap) -> Int {\n    self.xs.len()\n}\n"
+    "Some(2) 1 z 1 [1] Some(\"q\")\n";
+  (* built-in types and capabilities satisfy generic interfaces too; a bound passed on to another call *)
+  out "iface-generic-builtins" "interface Lookup[T] {\n    fn get(self, key: Str) -> Option[T]\n}\n\nfn find[L: Lookup[T], T](l: L, key: Str) -> Option[T] {\n    l.get(key)\n}\n\nfn again[L: Lookup[T], T](l: L, key: Str) -> Option[T] {\n    find(l, key)\n}\n\nfn main(root: Root) {\n    let m = map([(\"a\", 1)])\n    let home = again(root.env, \"HOME_NOT_SET_XYZ\") ?? \"unset\"\n    root.stdout.print(\"{again(m, \"a\")} {find(m, \"b\")} {home}\")\n}\n" "Some(1) None unset\n";
+  let cont = "interface Container[T] {\n    fn get(self, i: Int) -> Option[T]\n}\n\nstruct Blob {\n    n: Int,\n}\n\nfn get(self: Blob, i: Int) -> Option[Str] {\n    None\n}\n\n" in
+  errs "iface-generic-no-args" (cont ^ "fn f[C: Container](c: C) {}\n\nfn main() {}\n") [ "E0109" ];
+  errs "iface-generic-wrong-count" (cont ^ "fn f[C: Container[Int, Str]](c: C) {}\n\nfn main() {}\n") [ "E0109" ];
+  errs "iface-generic-mismatch" (cont ^ "fn f[C: Container[Int]](c: C) {}\n\nfn main() {\n    f(Blob { n: 1 })\n}\n") [ "E0111" ];
+  errs "iface-generic-inferred" (cont ^ "fn first[C: Container[T], T](c: C) -> Option[T] {\n    c.get(0)\n}\n\nfn main() {\n    let n: Option[Int] = first(Blob { n: 1 })\n}\n") [ "E0201" ];
+  errs "iface-generic-dyn-mismatch" (cont ^ "fn main() {\n    let c: dyn Container[Int] = Blob { n: 1 }\n}\n") [ "E0111" ];
+  errs "iface-generic-dyn-no-args" (cont ^ "fn f(c: dyn Container) {}\n\nfn main() {}\n") [ "E0109" ];
+  errs "iface-generic-as-type" (cont ^ "fn f(c: Container[Int]) {}\n\nfn main() {}\n") [ "E0102" ];
+  errs "iface-generic-bound-on-interface" (cont ^ "interface Holder[T: Container[Int]] {\n    fn get(self) -> T\n}\n\nfn main() {}\n") [ "E0003" ];
+  (* bounds on struct and enum type parameters; generic array lengths *)
+  out "bounds-on-types-and-array-lengths" "struct Sorted[T: Ordered] {\n    items: List[T],\n}\n\nfn insert[T](self: Sorted[T], x: T) -> Sorted[T] {\n    let mut out: List[T] = []\n    let mut done = false\n    for y in self.items {\n        if !done && x < y {\n            out.push(x)\n            done = true\n        }\n        out.push(y)\n    }\n    if !done {\n        out.push(x)\n    }\n    Sorted { items: out }\n}\n\nenum Tree[K: Key, V] {\n    Leaf,\n    Node(K, V),\n}\n\nfn key[K, V](self: Tree[K, V]) -> Map[K, Int] {\n    match self {\n        Tree.Node(k, _) => map([(k, 1)]),\n        Tree.Leaf => map([]),\n    }\n}\n\ninterface Shape {\n    fn area(self) -> Float\n}\n\nstruct Sq {\n    s: Float,\n}\n\nfn area(self: Sq) -> Float {\n    self.s * self.s\n}\n\nstruct Box[T: Shape] {\n    item: T,\n}\n\nfn double[T](self: Box[T]) -> Float {\n    self.item.area() * 2.0\n}\n\nfn sum[N](xs: Array[Int, N]) -> Int {\n    let mut t = 0\n    for x in xs {\n        t = t + x\n    }\n    t\n}\n\nfn first[T, N](xs: Array[T, N]) -> T {\n    xs[0]\n}\n\nfn size[N](xs: Array[Str, N]) -> Int {\n    xs.len()\n}\n\nfn main(root: Root) {\n    let out = root.stdout\n    let s = Sorted { items: [1, 5] }.insert(3).insert(9)\n    out.print(\"{s.items}\")\n    let t: Tree[Str, Int] = Tree.Node(\"a\", 2)\n    out.print(\"{t.key()}\")\n    out.print(\"{Box { item: Sq { s: 2.0 } }.double()}\")\n    let a: Array[Int, 3] = [1, 2, 3]\n    out.print(\"{sum(a)} {sum([10, 20])} {first(a)} {first([\"x\", \"y\"])} {size([\"a\", \"b\", \"c\", \"d\"])}\")\n}\n"
+    "[1, 3, 5, 9]\n{\"a\": 1}\n8.0\n6 30 1 x 4\n";
+  let boxes = "interface Shape {\n    fn area(self) -> Float\n}\n\nstruct Box[T: Shape] {\n    item: T,\n}\n\nstruct Sq {\n    s: Float,\n}\n\nfn area(self: Sq) -> Float {\n    self.s\n}\n\nstruct Blob {\n    n: Int,\n}\n\n" in
+  errs "bounds-struct-literal" (boxes ^ "fn main() {\n    let b = Box { item: Blob { n: 1 } }\n}\n") [ "E0111" ];
+  errs "bounds-annotation" (boxes ^ "fn main() {\n    let b: Option[Box[Blob]] = None\n}\n") [ "E0111" ];
+  errs "bounds-param" (boxes ^ "fn f(b: Box[Blob]) {}\n\nfn main() {}\n") [ "E0111" ];
+  errs "bounds-field" (boxes ^ "struct H {\n    b: Box[Blob],\n}\n\nfn main() {}\n") [ "E0111" ];
+  errs "bounds-field-unbounded" (boxes ^ "struct H[T] {\n    b: Box[T],\n}\n\nfn main() {}\n") [ "E0111" ];
+  (* the result type, and the literal in the body *)
+  errs "bounds-result-needs-own" (boxes ^ "fn wrap[T](x: T) -> Box[T] {\n    Box { item: x }\n}\n\nfn main() {}\n") [ "E0111"; "E0111" ];
+  errs "bounds-implied-by-param" (boxes ^ "fn twice[T](b: Box[T]) -> Float {\n    b.item.area() * 2.0\n}\n\nfn wrap[T: Shape](x: T) -> Box[T] {\n    Box { item: x }\n}\n\nfn main() {\n    let a = twice(wrap(Sq { s: 1.0 }))\n}\n") [  ];
+  errs "bounds-variant" ("enum E[K: Key] {\n    A(K),\n}\n\nfn main() {\n    let e = E.A(1.5)\n}\n") [ "E0111" ];
+  errs "bounds-ordered-implied" ("struct Sorted[T: Ordered] {\n    items: List[T],\n}\n\nfn lower[T](self: Sorted[T], x: T, y: T) -> Bool {\n    x < y\n}\n\nfn plain[T](x: T, y: T) -> Bool {\n    x < y\n}\n\nfn main() {}\n") [ "E0201" ];
+  errs "array-length-param-is-type" ("fn f[N](a: N, xs: Array[Int, N]) {}\n\nfn main() {}\n") [ "E0102" ];
+  errs "array-length-mismatch" ("fn dot[N](a: Array[Int, N], b: Array[Int, N]) -> Int {\n    0\n}\n\nfn main() {\n    let x: Array[Int, 2] = [1, 2]\n    let y: Array[Int, 3] = [1, 2, 3]\n    let d = dot(x, y)\n}\n") [ "E0201" ];
 
   (* ---------- named arguments ---------- *)
   let named_prelude =

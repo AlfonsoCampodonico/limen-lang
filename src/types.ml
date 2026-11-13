@@ -13,10 +13,13 @@ type ty =
   | TNamed of string * ty list (* user or prelude struct/enum *)
   | TCap of cap
   | TGroup of ty (* handle of a `group` block whose tasks return ty *)
-  | TArray of ty * int (* fixed-size array, a value type *)
+  | TArray of ty * ty
+      (* fixed-size array, a value type: the element and the length, a TLen, or
+         a type parameter (or variable) standing for one until it is instantiated *)
+  | TLen of int (* an array's length, `3` in `Array[Int, 3]`; never a value's type *)
   | TChan of ty (* channel between tasks *)
   | TMap of ty * ty (* keys (Int, Str, Bool, or tuples, structs and enums of them) to values, in insertion order *)
-  | TDyn of string (* a value of any type that satisfies the interface, boxed with its methods *)
+  | TDyn of string * ty list (* a value of any type that satisfies the interface (with these arguments), boxed with its methods *)
   | TParam of string (* a generic parameter inside its own definition *)
   | TVar of tvar ref
   | TErr (* already reported; unifies with anything *)
@@ -69,9 +72,11 @@ let rec show t =
   | TNamed (n, args) -> n ^ "[" ^ String.concat ", " (List.map show args) ^ "]"
   | TCap c -> cap_name c
   | TGroup a -> "Group[" ^ show a ^ "]"
-  | TArray (a, n) -> "Array[" ^ show a ^ ", " ^ string_of_int n ^ "]"
+  | TArray (a, n) -> "Array[" ^ show a ^ ", " ^ show n ^ "]"
+  | TLen n -> string_of_int n
   | TChan a -> "Chan[" ^ show a ^ "]"
-  | TDyn i -> "dyn " ^ i
+  | TDyn (i, []) -> "dyn " ^ i
+  | TDyn (i, args) -> "dyn " ^ i ^ "[" ^ String.concat ", " (List.map show args) ^ "]"
   | TMap (k, v) -> "Map[" ^ show k ^ ", " ^ show v ^ "]"
   | TParam n -> n
   | TVar _ -> "_"
@@ -80,7 +85,9 @@ let rec show t =
 let rec occurs r t =
   match repr t with
   | TVar r' -> r == r'
-  | TList a | TGroup a | TArray (a, _) | TChan a -> occurs r a
+  | TList a | TGroup a | TChan a -> occurs r a
+  | TArray (a, n) -> occurs r a || occurs r n
+  | TDyn (_, a) -> List.exists (occurs r) a
   | TMap (k, v) -> occurs r k || occurs r v
   | TFn (ps, b) -> List.exists (occurs r) ps || occurs r b
   | TNamed (_, a) -> List.exists (occurs r) a
@@ -96,7 +103,8 @@ let rec unify a b =
   | TVar r, t | t, TVar r -> if occurs r t then raise Mismatch else r := Link t
   | TInt, TInt | TFloat, TFloat | TBool, TBool | TStr, TStr | TBytes, TBytes | TUnit, TUnit -> ()
   | TList x, TList y | TGroup x, TGroup y -> unify x y
-  | TArray (x, n), TArray (y, m) when n = m -> unify x y
+  | TArray (x, n), TArray (y, m) -> unify n m; unify x y
+  | TLen n, TLen m when n = m -> ()
   | TChan x, TChan y -> unify x y
   | TMap (k1, v1), TMap (k2, v2) -> unify k1 k2; unify v1 v2
   | TFn (p1, r1), TFn (p2, r2) ->
@@ -107,14 +115,15 @@ let rec unify a b =
     List.iter2 unify a1 a2
   | TCap c1, TCap c2 when c1 = c2 -> ()
   | TParam x, TParam y when x = y -> ()
-  | TDyn x, TDyn y when x = y -> ()
+  | TDyn (x, xs), TDyn (y, ys) when x = y && List.length xs = List.length ys -> List.iter2 unify xs ys
   | _ -> raise Mismatch
 
 let rec subst env t =
   match repr t with
   | TParam n -> ( match List.assoc_opt n env with Some t' -> t' | None -> t)
   | TList a -> TList (subst env a)
-  | TArray (a, n) -> TArray (subst env a, n)
+  | TArray (a, n) -> TArray (subst env a, subst env n)
+  | TDyn (i, xs) -> TDyn (i, List.map (subst env) xs)
   | TChan a -> TChan (subst env a)
   | TMap (k, v) -> TMap (subst env k, subst env v)
   | TGroup a -> TGroup (subst env a)
@@ -166,13 +175,17 @@ let rec zonk env t =
   | TParam n -> ( match List.assoc_opt n env with Some t' -> zonk [] t' | None -> TUnit)
   | TVar _ -> TUnit
   | TList a -> TList (zonk env a)
-  | TArray (a, n) -> TArray (zonk env a, n)
+  | TArray (a, n) -> TArray (zonk env a, (match zonk env n with TLen _ as l -> l | _ -> TLen 0))
+  | TDyn (i, xs) -> TDyn (i, List.map (zonk env) xs)
   | TChan a -> TChan (zonk env a)
   | TMap (k, v) -> TMap (zonk env k, zonk env v)
   | TGroup a -> TGroup (zonk env a)
   | TFn (ps, r) -> TFn (List.map (zonk env) ps, zonk env r)
   | TNamed (n, args) -> TNamed (n, List.map (zonk env) args)
   | t -> t
+
+(* The length of an array type's length position, once it is known. *)
+let arr_len t = match repr t with TLen n -> n | _ -> 0
 
 let opt t = TNamed ("Option", [ t ])
 let res t e = TNamed ("Result", [ t; e ])

@@ -156,7 +156,7 @@ let index (items : item list) : occ list =
     | EMethod (r, name, nsp, args) ->
       x r;
       (match Types.repr r.ety with
-       | Types.TDyn i -> add ("m:" ^ i ^ "#" ^ name) name nsp
+       | Types.TDyn (i, _) -> add ("m:" ^ i ^ "#" ^ name) name nsp
        | Types.TNamed (n, _) when Hashtbl.mem fns (n ^ "::" ^ name) -> add ("f:" ^ n ^ "::" ^ name) name nsp
        | _ -> ());
       List.iter x args
@@ -248,7 +248,7 @@ let index (items : item list) : occ list =
     (function
       | IFn d ->
         if d.fn_test = None then add ~def:true ("f:" ^ d.fn_name) (bare d.fn_name) d.fn_span;
-        List.iter (fun (_, bs) -> List.iter (fun (b, sp) -> type_ref b sp) bs) d.fn_bounds;
+        List.iter (fun (_, bs) -> List.iter ty bs) d.fn_bounds;
         let env =
           List.map
             (fun p ->
@@ -261,10 +261,12 @@ let index (items : item list) : occ list =
         block env d.fn_body
       | IStruct s ->
         add ~def:true ("t:" ^ s.st_name) (bare s.st_name) s.st_span;
+        List.iter (fun (_, bs) -> List.iter ty bs) s.st_bounds;
         (* an embedded field is named by its type, so its name is a use of the type *)
         List.iter (fun (f, sp, te) -> if List.mem f s.st_embeds then ty te else (add ~def:true ("d:" ^ s.st_name ^ "#" ^ f) f sp; ty te)) s.st_fields
       | IEnum e ->
         add ~def:true ("t:" ^ e.en_name) (bare e.en_name) e.en_span;
+        List.iter (fun (_, bs) -> List.iter ty bs) e.en_bounds;
         List.iter (fun (v, sp, tes) -> add ~def:true ("v:" ^ e.en_name ^ "#" ^ v) v sp; List.iter ty tes) e.en_variants
       | IIface i ->
         add ~def:true ("t:" ^ i.if_name) (bare i.if_name) i.if_span;

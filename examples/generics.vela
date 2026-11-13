@@ -1,0 +1,60 @@
+// Generic interfaces, bounds on structs and enums, and functions generic
+// over an array's length.
+
+// A generic interface: the type of the items is a parameter.
+interface Container[T] {
+    fn get(self, i: Int) -> Option[T]
+    fn len(self) -> Int
+}
+
+struct Shelf {
+    books: List[Str],
+}
+
+fn get(self: Shelf, i: Int) -> Option[Str] {
+    self.books.get(i)
+}
+
+fn len(self: Shelf) -> Int {
+    self.books.len()
+}
+
+// T is inferred from the container's methods at each call.
+fn last[C: Container[T], T](c: C) -> Option[T] {
+    c.get(c.len() - 1)
+}
+
+// A struct whose items must be ordered.
+struct Sorted[T: Ordered] {
+    items: List[T],
+}
+
+// `self: Sorted[T]` gives T the bound, so `sort` works here.
+fn add[T](self: Sorted[T], x: T) -> Sorted[T] {
+    let mut items = self.items
+    items.push(x)
+    Sorted { items: items.sort() }
+}
+
+// Generic over the length: compiled once per length used.
+fn total[N](xs: Array[Int, N]) -> Int {
+    let mut sum = 0
+    for x in xs {
+        sum = sum + x
+    }
+    sum
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let shelf = Shelf { books: ["Dune", "Emma"] }
+    out.print("{last(shelf)} {last([1, 2, 3])}")
+    let mixed: List[dyn Container[Str]] = [shelf, Shelf { books: [] }]
+    for c in mixed {
+        out.print("{c.len()} {c.get(0)}")
+    }
+    let s = Sorted { items: [2, 7] }.add(5).add(1)
+    out.print("{s.items}")
+    let week: Array[Int, 7] = [1, 2, 3, 4, 5, 6, 7]
+    out.print("{total(week)} {total([10, 20])}")
+}

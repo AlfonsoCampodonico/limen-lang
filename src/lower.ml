@@ -103,8 +103,9 @@ let rec resolve env (te : ty_expr) : ty =
   | TyUnit -> TUnit
   | TyFn (ps, r) -> TFn (List.map (resolve env) ps, resolve env r)
   | TyInt _ -> TUnit
-  | TyName ("Array", [ elt; { tdesc = TyInt n; _ } ]) -> TArray (resolve env elt, n)
-  | TyName ("dyn", [ { tdesc = TyName (i, []); _ } ]) -> TDyn i
+  | TyName ("Array", [ elt; { tdesc = TyInt n; _ } ]) -> TArray (resolve env elt, TLen n)
+  | TyName ("Array", [ elt; { tdesc = TyName (g, []); _ } ]) when List.mem_assoc g env -> TArray (resolve env elt, List.assoc g env)
+  | TyName ("dyn", [ { tdesc = TyName (i, args); _ } ]) -> TDyn (i, List.map (resolve env) args)
   | TyName (n, args) -> (
     let a = List.map (resolve env) args in
     match (n, a) with
@@ -351,7 +352,7 @@ let rec lower f (e : expr) : I.atom =
     | EDyn (x, i) ->
       let t = tyof f x in
       let a = lower f x in
-      mk_dyn f t i a
+      mk_dyn f t (match ty with TDyn (_, args) -> (i, args) | _ -> (i, [])) a
     | EGroup (name, until, b) ->
       (* with a deadline, each result is an Option: None for a cancelled task *)
       let t = match (ty, until) with TList (TNamed ("Option", [ t ])), Some _ -> t | TList t, None -> t | _ -> TUnit in
@@ -485,10 +486,12 @@ and lower_place f e : I.var * I.step list =
   | _ -> failwith "place"
 
 (* Box [a] of type [t] as `dyn i`: a vtable of t's methods. *)
-and mk_dyn f t i a =
-  let ms = Option.value ~default:[] (Hashtbl.find_opt Check.ifaces i) in
+and mk_dyn f t (i, args) a =
+  let ms = Check.iface_methods (i, args) in
   let entries = List.map (fun (m, (ps, r)) -> (method_fn f t m ps, ps, r)) ms in
-  tmp f (TDyn i) (I.MkDyn (t, i, a, entries))
+  (* the vtable is per interface and arguments *)
+  let key = if args = [] then i else show (TDyn (i, args)) in
+  tmp f (TDyn (i, args)) (I.MkDyn (t, key, a, entries))
 
 (* The function that is method [m] of type [t], receiver first. *)
 and method_fn f t m ps =
@@ -510,13 +513,13 @@ and lower_try f x context =
   (* the error the function returns: converted to `dyn Error` if it returns
      one, and wrapped with the context if there is one *)
   let to_ret_err ev et =
-    let ev = match (fn_err, et) with Some (TDyn "Error"), TDyn "Error" -> ev | Some (TDyn "Error"), _ -> mk_dyn f et "Error" ev | _ -> ev in
+    let ev = match (fn_err, et) with Some (TDyn ("Error", [])), TDyn ("Error", []) -> ev | Some (TDyn ("Error", [])), _ -> mk_dyn f et ("Error", []) ev | _ -> ev in
     match context with
     | None -> ev
     | Some c ->
       let ca = lower f c in
       let wt = TNamed ("WrappedError", []) in
-      mk_dyn f wt "Error" (tmp f wt (I.MkStruct (wt, [ ca; ev ])))
+      mk_dyn f wt ("Error", []) (tmp f wt (I.MkStruct (wt, [ ca; ev ])))
   in
   let ok_ty, fail =
     match xt with
@@ -528,7 +531,7 @@ and lower_try f x context =
     | TNamed ("Option", [ t ]) when context <> None ->
       (* `opt? "context"`: the context is the error *)
       let c = Option.get context in
-      (t, fun () -> let ca = lower f c in tmp f f.ret (I.MkEnum (f.ret, 1, [ mk_dyn f TStr "Error" ca ])))
+      (t, fun () -> let ca = lower f c in tmp f f.ret (I.MkEnum (f.ret, 1, [ mk_dyn f TStr ("Error", []) ca ])))
     | TNamed ("Option", [ t ]) -> (t, fun () -> tmp f f.ret (I.MkEnum (f.ret, 1, [])))
     | _ -> failwith "try"
   in
@@ -724,7 +727,8 @@ and derive_targs d act =
   let rec m decl act =
     match (decl, act) with
     | TParam g, t -> if not (List.mem_assoc g !found) then found := (g, t) :: !found
-    | TList a, TList b | TChan a, TChan b | TArray (a, _), TArray (b, _) -> m a b
+    | TList a, TList b | TChan a, TChan b -> m a b
+    | TArray (a, n), TArray (b, k) -> m a b; m n k
     | TNamed (_, xs), TNamed (_, ys) when List.length xs = List.length ys -> List.iter2 m xs ys
     | TFn (xs, r1), TFn (ys, r2) when List.length xs = List.length ys -> List.iter2 m xs ys; m r1 r2
     | _ -> ()
@@ -737,9 +741,9 @@ and derive_targs d act =
 and lower_method f e recv name args ty =
   let rt = tyof f recv in
   match rt with
-  | TDyn i ->
+  | TDyn (i, targs) ->
     (* through the vtable *)
-    let ms = Option.value ~default:[] (Hashtbl.find_opt Check.ifaces i) in
+    let ms = Check.iface_methods (i, targs) in
     let rec index k = function [] -> failwith "dyn method" | (m, sg) :: rest -> if m = name then (k, sg) else index (k + 1) rest in
     let k, (ps, r) = index 0 ms in
     let ra = lower f recv in

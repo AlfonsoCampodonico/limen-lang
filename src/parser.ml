@@ -70,7 +70,7 @@ let rec parse_type st : ty_expr =
   let t = peek st in
   match t.tok with
   | KW "dyn" ->
-    (* `dyn Shape` is written in the AST as `dyn[Shape]` *)
+    (* `dyn Shape` is written in the AST as `dyn[Shape]`, `dyn Container[Int]` as `dyn[Container[Int]]` *)
     ignore (advance st);
     let a, asp = expect_ident st in
     let name, nsp =
@@ -81,7 +81,15 @@ let rec parse_type st : ty_expr =
       end
       else (a, asp)
     in
-    { tdesc = TyName ("dyn", [ { tdesc = TyName (name, []); tspan = nsp } ]); tspan = merge t.span nsp }
+    let args, nsp =
+      if is_sym st "[" && not (peek st).nl then begin
+        ignore (advance st);
+        let args = comma_list st "]" parse_type in
+        (args, merge nsp (last_span st))
+      end
+      else ([], nsp)
+    in
+    { tdesc = TyName ("dyn", [ { tdesc = TyName (name, args); tspan = nsp } ]); tspan = merge t.span nsp }
   | SYM "(" ->
     ignore (advance st);
     if is_sym st ")" then
@@ -662,7 +670,8 @@ and parse_stmt st =
     end
     else mks (SExpr e) e.espan
 
-(* `[A, B: Shape + Show]`: names, and the interfaces each must satisfy. *)
+(* `[A, B: Shape + Show]`: names, and the interfaces each must satisfy,
+   written as types: `Shape`, `geo.Area`, `Container[Int]`. *)
 let parse_bounded_generics st =
   if is_sym st "[" then begin
     ignore (advance st);
@@ -690,11 +699,15 @@ let parse_bounded_generics st =
   end
   else []
 
+(* Type parameters with their bounds, the ones without bounds left out. *)
+let split_generics gs = (List.map fst gs, List.filter (fun (_, b) -> b <> []) gs)
+
+(* The type parameters of an interface or an alias, which take no bounds. *)
 let parse_generics st =
   let t = peek st in
   let gs = parse_bounded_generics st in
   if List.exists (fun (_, b) -> b <> []) gs then
-    raise (Diag.Fatal (Diag.make "E0003" t.span "interface bounds go on a function's type parameters, not on a struct or enum"));
+    raise (Diag.Fatal (Diag.make "E0003" t.span "bounds go on the type parameters of a function, struct or enum"));
   List.map fst gs
 
 let test_count = ref 0
@@ -751,9 +764,7 @@ let parse_item st =
   | KW "fn" ->
     ignore (advance st);
     let name, nsp = expect_ident st in
-    let bgen = parse_bounded_generics st in
-    let gen = List.map fst bgen in
-    let bounds = List.filter (fun (_, b) -> b <> []) bgen in
+    let gen, bounds = split_generics (parse_bounded_generics st) in
     ignore (expect_sym st "(");
     let params = comma_list st ")" parse_param in
     let ret = if accept_sym st "->" then Some (parse_type st) else None in
@@ -762,7 +773,7 @@ let parse_item st =
   | KW "struct" ->
     ignore (advance st);
     let name, nsp = expect_ident st in
-    let gen = parse_generics st in
+    let gen, bounds = split_generics (parse_bounded_generics st) in
     ignore (expect_sym st "{");
     (* a field is `name: Type`, or a bare struct type that is embedded:
        `User`, `auth.User`, `Pair[Int]`, stored as a field named `User` *)
@@ -794,7 +805,7 @@ let parse_item st =
   | KW "enum" ->
     ignore (advance st);
     let name, nsp = expect_ident st in
-    let gen = parse_generics st in
+    let gen, bounds = split_generics (parse_bounded_generics st) in
     ignore (expect_sym st "{");
     let variants =
       comma_list st "}" (fun st ->
@@ -802,10 +813,11 @@ let parse_item st =
           let payload = if accept_sym st "(" then comma_list st ")" parse_type else [] in
           (v, vsp, payload))
     in
-    IEnum { en_name = name; en_span = nsp; en_gen = gen; en_variants = variants; en_pub = false }
+    IEnum { en_name = name; en_span = nsp; en_gen = gen; en_variants = variants; en_bounds = bounds; en_pub = false }
   | KW "interface" ->
     ignore (advance st);
     let name, nsp = expect_ident st in
+    let gen = parse_generics st in
     ignore (expect_sym st "{");
     let methods =
       comma_list st "}" (fun st ->
@@ -828,7 +840,7 @@ let parse_item st =
           let ret = if accept_sym st "->" then Some (parse_type st) else None in
           (m, msp, params, ret))
     in
-    IIface { if_name = name; if_span = nsp; if_methods = methods; if_pub = false }
+    IIface { if_name = name; if_span = nsp; if_gen = gen; if_methods = methods; if_pub = false }
   | IDENT "type" when (match st.toks.(min (st.pos + 1) (Array.length st.toks - 1)).tok with IDENT _ -> true | _ -> false) ->
     (* `type` is a word only here, so it stays usable as a name elsewhere *)
     ignore (advance st);

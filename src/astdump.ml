@@ -87,13 +87,16 @@ and stmt s =
   | SContinue -> "continue"
   | SDefer b -> "defer" ^ block b
 
+let gens gs bounds =
+  String.concat "," (List.map (fun g -> g ^ (match List.assoc_opt g bounds with Some bs -> ":" ^ String.concat "+" (List.map ty bs) | None -> "")) gs)
+
 let item = function
   | IFn { fn_test = Some n; fn_body; fn_params; fn_bench; fn_table; _ } ->
     (if fn_bench then "bench " else "test ") ^ String.escaped n ^ "("
     ^ String.concat "," (List.map (fun p -> p.prm_name ^ ":" ^ ty p.prm_ty) fn_params)
     ^ ")" ^ (match fn_table with Some (p, e) -> "for " ^ pat p ^ " in " ^ expr e | None -> "") ^ block fn_body
   | IIface i ->
-    "interface " ^ i.if_name ^ "{"
+    "interface " ^ i.if_name ^ "[" ^ String.concat "," i.if_gen ^ "]{"
     ^ String.concat ";"
         (List.map
            (fun (m, _, ps, r) ->
@@ -104,13 +107,13 @@ let item = function
     (match d.fn_foreign with Some fo -> "foreign " ^ String.escaped fo.flib ^ " " | None -> "")
     ^ (if d.fn_pub then "pub " else "")
     ^ "fn " ^ d.fn_name ^ "["
-    ^ String.concat "," (List.map (fun g -> g ^ (match List.assoc_opt g d.fn_bounds with Some bs -> ":" ^ String.concat "+" (List.map fst bs) | None -> "")) d.fn_gen)
+    ^ gens d.fn_gen d.fn_bounds
     ^ "]("
     ^ String.concat "," (List.map (fun p -> p.prm_name ^ ":" ^ ty p.prm_ty) d.fn_params)
     ^ ")" ^ (match d.fn_ret with Some t -> ty t | None -> "") ^ block d.fn_body
   | IStruct s -> "struct " ^ s.st_name ^ "[" ^ String.concat "," s.st_gen ^ "]{" ^ String.concat "," (List.map (fun (f, _, t) -> if List.mem f s.st_embeds then "embed " ^ ty t else f ^ ":" ^ ty t) s.st_fields) ^ "}"
   | IEnum e ->
-    "enum " ^ e.en_name ^ "[" ^ String.concat "," e.en_gen ^ "]{"
+    "enum " ^ e.en_name ^ "[" ^ gens e.en_gen e.en_bounds ^ "]{"
     ^ String.concat "," (List.map (fun (v, _, ts) -> v ^ "(" ^ String.concat "," (List.map ty ts) ^ ")") e.en_variants)
     ^ "}"
   | IType a -> "type " ^ a.ty_name ^ "[" ^ String.concat "," a.ty_gen ^ "]=" ^ ty a.ty_body

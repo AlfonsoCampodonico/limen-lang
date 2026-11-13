@@ -1,0 +1,23 @@
+// generic interfaces, bounds on structs and enums, generic array lengths
+pub interface Container[T] {
+    fn get(self, i: Int) -> Option[T]
+    fn len(self) -> Int
+}
+interface Pairs[K, V] {}
+struct Sorted[T: Ordered] {
+    items: List[T],
+}
+enum Tree[K: Key, V] {
+    Leaf,
+    Node(K, V),
+}
+struct Holder[C: geo.Area + Container[Int], T] { c: C, t: T }
+fn first[C: Container[T], T](c: C) -> Option[T] {
+    c.get(0)
+}
+fn sum[N](xs: Array[Int, N]) -> Int {
+    xs.len()
+}
+fn boxed(c: dyn Container[Str], d: dyn geo.Lookup[Int, Str]) -> List[dyn Container[ List[Int] ]] {
+    []
+}

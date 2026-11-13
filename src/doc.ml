@@ -76,20 +76,20 @@ let module_comment text =
 let slice text (sp : Span.t) = String.sub text sp.lo (max 0 (min sp.hi (String.length text) - sp.lo))
 let pub_kw p = if p then "pub " else ""
 
-let generics names bounds =
+let generics ?(text = "") names bounds =
   if names = [] then ""
   else
     "["
     ^ String.concat ", "
         (List.map
-           (fun g -> match List.assoc_opt g bounds with Some bs when bs <> [] -> g ^ ": " ^ String.concat " + " (List.map fst bs) | _ -> g)
+           (fun g -> match List.assoc_opt g bounds with Some bs when bs <> [] -> g ^ ": " ^ String.concat " + " (List.map (fun (b : ty_expr) -> slice text b.tspan) bs) | _ -> g)
            names)
     ^ "]"
 
 let fn_sig text (d : fn_decl) =
   let ps = List.map (fun p -> p.prm_name ^ ": " ^ slice text p.prm_ty.tspan) d.fn_params in
   let ret = match d.fn_ret with Some te -> " -> " ^ slice text te.tspan | None -> "" in
-  Printf.sprintf "%sfn %s%s(%s)%s" (pub_kw d.fn_pub) d.fn_name (generics d.fn_gen d.fn_bounds) (String.concat ", " ps) ret
+  Printf.sprintf "%sfn %s%s(%s)%s" (pub_kw d.fn_pub) d.fn_name (generics ~text d.fn_gen d.fn_bounds) (String.concat ", " ps) ret
 
 let iface_method_sig text (m, _, ps, r) =
   "fn " ^ m ^ "(" ^ String.concat ", " ("self" :: List.map (fun p -> p.prm_name ^ ": " ^ slice text p.prm_ty.tspan) ps) ^ ")"
@@ -125,7 +125,7 @@ let of_file ?(all = false) name text (f : file) =
         in
         types :=
           { e_kind = "struct"; e_name = s.st_name;
-            e_sig = block_sig (Printf.sprintf "%sstruct %s%s" (pub_kw s.st_pub) s.st_name (generics s.st_gen [])) (List.map (fun m -> m.m_sig) fields);
+            e_sig = block_sig (Printf.sprintf "%sstruct %s%s" (pub_kw s.st_pub) s.st_name (generics ~text s.st_gen s.st_bounds)) (List.map (fun m -> m.m_sig) fields);
             e_doc = doc_above text s.st_span.lo; e_members = List.filter (fun m -> m.m_doc <> "") fields; e_methods = [] }
           :: !types
       | IEnum e when shown e.en_pub ->
@@ -138,14 +138,14 @@ let of_file ?(all = false) name text (f : file) =
         in
         types :=
           { e_kind = "enum"; e_name = e.en_name;
-            e_sig = block_sig (Printf.sprintf "%senum %s%s" (pub_kw e.en_pub) e.en_name (generics e.en_gen [])) (List.map (fun m -> m.m_sig) vs);
+            e_sig = block_sig (Printf.sprintf "%senum %s%s" (pub_kw e.en_pub) e.en_name (generics ~text e.en_gen e.en_bounds)) (List.map (fun m -> m.m_sig) vs);
             e_doc = doc_above text e.en_span.lo; e_members = List.filter (fun m -> m.m_doc <> "") vs; e_methods = [] }
           :: !types
       | IIface i when shown i.if_pub ->
         let ms = List.map (fun ((m, (msp : Span.t), _, _) as x) -> { m_name = m; m_sig = iface_method_sig text x; m_doc = doc_above text msp.lo }) i.if_methods in
         types :=
           { e_kind = "interface"; e_name = i.if_name;
-            e_sig = block_sig (Printf.sprintf "%sinterface %s" (pub_kw i.if_pub) i.if_name) (List.map (fun m -> m.m_sig) ms);
+            e_sig = block_sig (Printf.sprintf "%sinterface %s%s" (pub_kw i.if_pub) i.if_name (generics i.if_gen [])) (List.map (fun m -> m.m_sig) ms);
             e_doc = doc_above text i.if_span.lo; e_members = List.filter (fun m -> m.m_doc <> "") ms; e_methods = [] }
           :: !types
       | IType a when shown a.ty_pub ->

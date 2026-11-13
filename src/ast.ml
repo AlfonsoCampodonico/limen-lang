@@ -20,6 +20,11 @@ and pat_desc =
   | PVariant of string option * string * pat list (* qualifier, variant, payload *)
   | PTuple of pat list
 
+(* The bounds on type parameters: each parameter with the interfaces it must
+   satisfy, written as types so module names and aliases resolve as in any
+   type: `Shape`, `geo.Area`, `Container[Int]`. *)
+type bounds = (string * ty_expr list) list
+
 (* [ety] and [einst] are filled in by the checker: the expression's type, and
    for a reference to a generic function, the type arguments it was used at. *)
 type param = { prm_name : string; prm_span : span; prm_ty : ty_expr }
@@ -107,7 +112,7 @@ and fn_decl = {
       (* a table test, `for PAT in [case, ...]` (the expression is that list): one isolated run per
          case. Expanded when modules load into one test per case, each keeping its own case here. *)
   fn_pub : bool;
-  fn_bounds : (string * (string * span) list) list; (* type parameter -> interfaces it must satisfy *)
+  fn_bounds : bounds; (* type parameter -> interfaces it must satisfy *)
   fn_foreign : foreign option; (* declared in a `foreign "lib" { ... }` block; no body *)
 }
 
@@ -121,6 +126,7 @@ type struct_decl = {
   st_span : span;
   st_gen : string list;
   st_fields : (string * span * ty_expr) list;
+  st_bounds : bounds; (* `struct Sorted[T: Ordered]`: checked wherever the type is instantiated *)
   st_embeds : string list;
       (* the fields written as a bare type, `struct Admin { User, level: Int }`:
          an embedded struct, stored as a field named after its type (`User`),
@@ -133,14 +139,18 @@ type enum_decl = {
   en_span : span;
   en_gen : string list;
   en_variants : (string * span * ty_expr list) list;
+  en_bounds : bounds;
   en_pub : bool;
 }
 
 (* `interface Shape { fn area(self) -> Float }`: the methods a type needs.
-   Satisfied structurally, by any type that has those methods. *)
+   Satisfied structurally, by any type that has those methods. A generic
+   interface, `interface Container[T] { ... }`, is named with its arguments
+   wherever it is used: `[C: Container[Int]]`, `dyn Container[Str]`. *)
 type iface_decl = {
   if_name : string;
   if_span : span;
+  if_gen : string list;
   if_methods : (string * span * param list * ty_expr option) list; (* `self` is left out of the params *)
   if_pub : bool;
 }

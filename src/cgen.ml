@@ -80,7 +80,7 @@ let rec cname c t =
        | _ -> ());
       c.types <- c.types @ [ t ];
       n)
-  | TParam _ | TVar _ | TErr -> failwith ("cgen: non-concrete type " ^ show t)
+  | TParam _ | TVar _ | TErr | TLen _ -> failwith ("cgen: non-concrete type " ^ show t)
 
 let ctype c t =
   match t with
@@ -165,7 +165,7 @@ let walk c root rty steps =
       | I.PIndex (i, sp) -> (
         match t with
         | TList el -> (sprintf "(*%s_at(%s, %s, %s))" (cname c t) e (atom c i) (where sp), el)
-        | TArray (el, n) -> (sprintf "(%s).a[w_idx(%s, %d, %s)]" e (atom c i) n (where sp), el)
+        | TArray (el, TLen n) -> (sprintf "(%s).a[w_idx(%s, %d, %s)]" e (atom c i) n (where sp), el)
         | _ -> failwith "walk index")
       | I.PIndexU i -> (
         match t with
@@ -304,7 +304,7 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     let sigt = sprintf "%s (*)(%s)" (ctype c r) (String.concat ", " ("WClo*" :: List.map (ctype c) ps)) in
     set (sprintf "((%s)(%s)->fn)(%s)" sigt (var fv) (String.concat ", " (var fv :: List.map a args)))
   | I.MkDyn (t, i, x, ms) ->
-    let key = cname c t ^ "_as_" ^ String.map (fun ch -> if ch = '.' then '_' else ch) i in
+    let key = cname c t ^ "_as_" ^ String.map (fun ch -> if ch = '.' || ch = '[' || ch = ']' || ch = ',' || ch = ' ' || ch = '(' || ch = ')' then '_' else ch) i in
     if not (List.exists (fun (k, _, _) -> k = key) c.dyns) then c.dyns <- c.dyns @ [ (key, t, ms) ];
     line "{";
     line (sprintf "  struct Dyn_%s* d_ = (struct Dyn_%s*)w_alloc_k(sizeof(struct Dyn_%s), WK_PLAIN);" key key key);
@@ -379,7 +379,9 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
           vs
         | [] -> failwith "cgen: foreign call"
     in
-    let rest = ref vals and outs = ref [] in
+    let pass_foreign = List.exists (fun (_, _, _, tf) -> tf) cbs in
+    let rest = ref vals and cbs = ref cbs and outs = ref [] in
+    let fixed = match cs.fixed with Some k -> k | None -> List.length cs.params in
     let cargs =
       List.mapi
         (fun i (p : Ffi.param) ->
@@ -401,6 +403,7 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
         cs.params
     in
     let outs = List.rev !outs in
+    let ptys = List.filteri (fun i _ -> i < fixed) cs.params in
     let proto =
       sprintf "%s (*)(%s)" (Ffi.c_name cs.ret)
         (if cs.params = [] then "void"
@@ -523,13 +526,13 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
       set (sprintf "(%s) ? %s : %s" cond (mk_enum c t 0 [ value ]) (mk_enum c t 1 []))
     in
     match (name, rt) with
-    | ("list_len" | "array_len"), TArray (_, n) -> set (string_of_int n)
-    | "array_get", TArray (el, n) ->
+    | ("list_len" | "array_len"), TArray (_, TLen n) -> set (string_of_int n)
+    | "array_get", TArray (el, TLen n) ->
       opt_from (sprintf "%s >= 0 && %s < %d" (arg 1) (arg 1) n) (dup_of c el (sprintf "(%s).a[%s]" (arg 0) (arg 1)))
-    | "array_contains", TArray (el, n) ->
+    | "array_contains", TArray (el, TLen n) ->
       set (sprintf "({ bool f_ = false; for (int64_t i_ = 0; i_ < %d; i_++) if (%s) { f_ = true; break; } f_; })" n
              (binop c Ast.Eq el (sprintf "(%s).a[i_]" (arg 0)) (arg 1) Span.dummy))
-    | "array_to_list", TArray (el, n) ->
+    | "array_to_list", TArray (el, TLen n) ->
       let ln = cname c (TList el) in
       line "{";
       line (sprintf "  %s* l_ = %s_new(%d);" ln ln n);
@@ -792,7 +795,7 @@ and stmt c out ind (s : I.stmt) =
               if proven then line (sprintf "  %s* %s = &(*%s)->data[%s];" (ctype c el) q p (atom c ia))
               else line (sprintf "  %s* %s = %s_at(*%s, %s, %s);" (ctype c el) q (cname c t) p (atom c ia) (where sp));
               (q, el)
-            | TArray (el, n) ->
+            | TArray (el, TLen n) ->
               line (sprintf "  %s* %s = &(%s->a[w_idx(%s, %d, %s)]);" (ctype c el) q p (atom c ia) n (where sp));
               (q, el)
             | _ -> failwith "mutate index")
@@ -1107,7 +1110,7 @@ let rec type_defs c (out : Buffer.t) =
     (fun t ->
       let n = cname c t in
       match t with
-      | TArray (e, k) -> p (sprintf "struct %s { %s a[%d]; };" n (ctype c e) (max k 1))
+      | TArray (e, TLen k) -> p (sprintf "struct %s { %s a[%d]; };" n (ctype c e) (max k 1))
       | _ ->
       if is_enum c t then begin
         let vs = Lower.variants c.g t in
@@ -1195,7 +1198,7 @@ let rec type_defs c (out : Buffer.t) =
       let acc = if boxed then "->" else "." in
       let name = named_decl c t in
       match t with
-      | TArray (e, k) ->
+      | TArray (e, TLen k) ->
         let en = cname c e in
         let each f = if not (is_scalar e) then p (sprintf "  for (int64_t i = 0; i < %d; i++) %s;" k f) in
         p (sprintf "static %s %s_dup(%s v) {" ct n ct);
@@ -1353,7 +1356,7 @@ and cmp_defs c p =
          p "  for (int64_t i = 0; i < n_; i++)";
          item e "a->data[i]" "b->data[i]";
          p "  return a->len < b->len ? -1 : a->len > b->len;"
-       | TArray (e, k) ->
+       | TArray (e, TLen k) ->
          p (sprintf "  for (int64_t i = 0; i < %d; i++)" k);
          item e "a.a[i]" "b.a[i]";
          p "  return 0;"
@@ -1385,7 +1388,7 @@ let program (g : Lower.gctx) (prog : I.program) : string =
   let c =
     { g; names = Hashtbl.create 32; types = []; lits = Hashtbl.create 32; lit_order = []; boxed = [];
       envs = Hashtbl.create 16; uniq = []; task_tys = []; inrange = []; chan_tys = []; dyns = []; cell_tys = []; vols = [];
-      cmp_tys = []; sort_tys = []; hash_tys = []; csyms = [] }
+      cmp_tys = []; sort_tys = []; hash_tys = []; csyms = []; cstructs = []; cbs = [] }
   in
   (* bodies first: this discovers every type and literal *)
   let bodies = Buffer.create 65536 in
@@ -1546,7 +1549,7 @@ let program (g : Lower.gctx) (prog : I.program) : string =
      mp (sprintf "  if (%s == 1) {" (tag_expr c rt "r_"));
      mp "    WBuf b_; buf_init(&b_); buf_puts(&b_, \"error: \");";
      (match et with
-      | TDyn "Error" ->
+      | TDyn ("Error", []) ->
         (* a `dyn Error` is reported by its message: method 0 of its vtable *)
         let d = payload_expr c rt "r_" 1 0 in
         mp (sprintf "    WStr* m_ = ((WStr* (*)(WDyn*))(%s)->vt->m[0])(%s);" d d);
@@ -1583,4 +1586,5 @@ let program (g : Lower.gctx) (prog : I.program) : string =
       (* each foreign C function under a private name, bound to its symbol by
          an asm label, so it clashes with no header's declaration of it *)
       String.concat "" (List.map (fun sym -> sprintf "extern void vf_%s(void) __asm__(W_CSYM(\"%s\"));\n" sym sym) c.csyms);
+      cbdefs;
       "/* ---- dyn vtables ---- */"; Buffer.contents dynbuf; Buffer.contents bodies; Buffer.contents main ]
