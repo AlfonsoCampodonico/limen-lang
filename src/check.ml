@@ -725,7 +725,7 @@ and check_expr_inner ctx f e : ty =
     err ctx "E0122" nsp (sprintf "`%s:` names a parameter, but this call takes its arguments by position" n)
       ~fix:{ Diag.fmsg = "remove the label"; edits = [ { Diag.at = { nsp with hi = x.espan.lo }; replacement = "" } ] };
     check_expr ctx f x
-  | EGroup (name, until, b) ->
+  | EGroup (name, _, until, b) ->
     let t = fresh () in
     Option.iter
       (fun (clk, ms) ->

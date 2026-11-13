@@ -424,7 +424,7 @@ let rec expr env locals (e : expr) : expr =
         | None -> ( match Hashtbl.find_opt env.own n with Some (IStruct _) -> qual env.self n | _ -> n)
       in
       EStruct (n, sp, List.map (fun (f, fsp, x) -> (f, fsp, ex x)) fields)
-    | EGroup (g, until, b) -> EGroup (g, Option.map (fun (c, ms) -> (ex c, ex ms)) until, block env (g :: locals) b)
+    | EGroup (g, il, until, b) -> EGroup (g, il, Option.map (fun (c, ms) -> (ex c, ex ms)) until, block env (g :: locals) b)
     | EWith (b, fields) -> EWith (ex b, List.map (fun (f, fsp, x) -> (f, fsp, ex x)) fields)
     | ESafe (b, x, rest, flat) -> ESafe (ex b, x, expr env (x :: locals) rest, flat)
     | EDyn (x, i) -> EDyn (ex x, i)

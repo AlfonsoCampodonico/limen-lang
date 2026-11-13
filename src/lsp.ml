@@ -99,7 +99,7 @@ let rec walk_expr (f : expr -> unit) e =
   | EIf (c, b, eo) -> w c; walk_block f b; Option.iter w eo
   | EMatch (s, arms) -> w s; List.iter (fun a -> Option.iter w a.aguard; w a.abody) arms
   | EBlock b -> walk_block f b
-  | EGroup (_, until, b) -> Option.iter (fun (c, ms) -> w c; w ms) until; walk_block f b
+  | EGroup (_, _, until, b) -> Option.iter (fun (c, ms) -> w c; w ms) until; walk_block f b
   | EClosure (_, body) -> w body
   | EStruct (_, _, fs) -> List.iter (fun (_, _, x) -> w x) fs
   | EWith (b, fs) -> w b; List.iter (fun (_, _, x) -> w x) fs
@@ -196,7 +196,7 @@ let hover_items text items =
             b.stmts
         in
         stmts d.fn_body;
-        walk_block (fun e -> match e.edesc with EBlock b | EGroup (_, _, b) -> stmts b | EIf (_, b, _) -> stmts b | EClosure (_, { edesc = EBlock b; _ }) -> stmts b | _ -> ()) d.fn_body
+        walk_block (fun e -> match e.edesc with EBlock b | EGroup (_, _, _, b) -> stmts b | EIf (_, b, _) -> stmts b | EClosure (_, { edesc = EBlock b; _ }) -> stmts b | _ -> ()) d.fn_body
       | IIface i ->
         add i.if_span ("interface " ^ i.if_name ^ Doc.generics i.if_gen []);
         List.iter
@@ -462,7 +462,7 @@ let general_completions doc off =
                 b.stmts
             in
             stmts d.fn_body;
-            walk_block (fun e -> match e.edesc with EBlock b | EIf (_, b, _) | EGroup (_, _, b) -> stmts b | _ -> ()) d.fn_body;
+            walk_block (fun e -> match e.edesc with EBlock b | EIf (_, b, _) | EGroup (_, _, _, b) -> stmts b | _ -> ()) d.fn_body;
             List.rev !out
           end
           else [])

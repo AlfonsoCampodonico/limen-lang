@@ -40,7 +40,8 @@ type rhs =
   | Interp of ipart list
   | RootField of atom * string
   | Panic of atom * Span.t
-  | GroupNew of (atom * atom) option (* `until clock.after(ms)`: clock, milliseconds *)
+  | GroupNew of (atom * atom) option * bool
+      (* `until clock.after(ms)`: clock, milliseconds; whether the tasks' output interleaves *)
   | Spawn of atom * atom * ty * bool
       (* group (borrowed), task closure (consumed), result type, whether its result goes in the group's list *)
   | GroupJoin of atom * ty * bool
@@ -144,8 +145,8 @@ let borrowed = function
   | RootField (a, _) -> [ a ]
   | Panic (a, _) -> [ a ]
   | Spawn (g, _, _, _) | GroupJoin (g, _, _) -> [ g ]
-  | GroupNew None -> []
-  | GroupNew (Some (c, ms)) -> [ c; ms ]
+  | GroupNew (None, _) -> []
+  | GroupNew (Some (c, ms), _) -> [ c; ms ]
   | ChanNew (_, cap, _) -> [ cap ]
   | ChanSend (c, _, _) -> [ c ]
 

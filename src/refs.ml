@@ -170,7 +170,7 @@ let index (items : item list) : occ list =
           expr env a.abody)
         arms
     | EBlock b -> block env b
-    | EGroup (n, until, b) ->
+    | EGroup (n, _, until, b) ->
       Option.iter (fun (c, ms) -> x c; x ms) until;
       let env =
         match find_word { e.espan with hi = b.bspan.lo } n with
