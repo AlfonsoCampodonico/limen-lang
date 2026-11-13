@@ -2565,7 +2565,11 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
                     else sprintf "a test cannot take `%s`" (show t))
                    ~notes:[ "a test can take `fs: Fs` (a fresh temporary directory) and `clock: Clock`; pass anything else through an interface" ];
                  seen)
-             [] d.fn_params s.ps))
+             [] d.fn_params s.ps);
+      (* a bench measures real time *)
+      if d.fn_bench && d.fn_virtual then
+        err ctx "E0306" d.fn_span "a bench cannot take a virtual clock"
+          ~notes:[ "a bench is timed on the real clock; take `clock: Clock`" ])
     sigs;
   (* 4. main *)
   List.iter (fun (d, s) -> if d.fn_name = "main" then check_main ctx d s) sigs;

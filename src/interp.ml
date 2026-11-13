@@ -609,17 +609,52 @@ let binop op a b sp =
 (* ---------- cooperative scheduler ----------
    Tasks are coroutines built on OCaml 5 effects. A task that cannot go on
    performs Block with the condition it waits for, optionally a socket to
-   poll and a time to wake up at; the scheduler resumes the first task whose
+   poll and a timer to wake up at; the scheduler resumes the first task whose
    condition holds, and when none can go on it sleeps until a socket is
-   ready or the earliest wake-up time. *)
+   ready or the earliest timer.
+
+   Virtual time (a test that takes `clock: virtual Clock`): the clock starts
+   at [virtual_start_ms] and stands still while any task can go on. When no
+   task can, and none waits on a socket or stdin, the earliest timer rings
+   (of two at the same time, the one set first): the clock jumps to it and
+   only its task wakes. The next timer, even one due at the same time, waits
+   until every task is blocked again. A task waiting on real I/O holds the
+   clock still until the I/O is done. *)
 
 type io_wait = (sock * bool) option (* socket, true = wait for writing *)
-type _ Effect.t += Block : (unit -> bool) * io_wait * float option -> unit Effect.t
 
-let runq : ((unit -> bool) * io_wait * float option * (unit -> unit)) Queue.t = Queue.create ()
+(* [at]: seconds since the epoch, or on virtual time milliseconds since
+   [virtual_start_ms]. [seq] orders timers set for the same time. *)
+type timer = { at : float; seq : int; mutable rang : bool }
+
+type _ Effect.t += Block : (unit -> bool) * io_wait * timer option -> unit Effect.t
+
+let runq : ((unit -> bool) * io_wait * timer option * (unit -> unit)) Queue.t = Queue.create ()
 let io_epoch = ref 0 (* advances after each round of waiting for I/O *)
 
-let now () = Unix.gettimeofday ()
+(* 2026-01-01T00:00:00Z, where virtual time starts *)
+let virtual_start_ms = 1767225600000L
+
+(* Some ms: running on virtual time, ms milliseconds past the start *)
+let virtual_now : float option ref = ref None
+
+let now () = match !virtual_now with Some t -> t | None -> Unix.gettimeofday ()
+
+let timer_seq = ref 0
+
+(* A timer [ms] milliseconds after [from] (default: now). *)
+let timer_after ?from ms =
+  let ms = Int64.to_float (min ms 1_000_000_000_000L) in
+  let from = match from with Some t -> t | None -> now () in
+  incr timer_seq;
+  { at = (if !virtual_now = None then from +. (ms /. 1000.) else from +. ms); seq = !timer_seq; rang = false }
+
+let rung tm = if !virtual_now = None then now () >= tm.at else tm.rang
+
+let clock_now_ms () =
+  match !virtual_now with
+  | Some t -> Int64.add virtual_start_ms (Int64.of_float t)
+  | None -> Int64.of_float (Unix.gettimeofday () *. 1000.)
 
 (* The task running now; main and tests run as tasks nobody cancels. *)
 let current = ref { cancelled = false; scopes = []; sink = None }
@@ -630,12 +665,12 @@ let current = ref { cancelled = false; scopes = []; sink = None }
    can go on at once does not look at the cancel flag. *)
 let stopped t = t.cancelled || List.exists (fun g -> g.gcancelled) t.scopes
 
-let wait_until ?io ?at ?(cancellable = true) cond =
+let wait_until ?io ?tm ?(cancellable = true) cond =
   if not (cond ()) then begin
     let t = !current in
     if cancellable && stopped t then raise Cancelled;
     let c = if cancellable then fun () -> cond () || stopped t else cond in
-    Effect.perform (Block (c, io, at));
+    Effect.perform (Block (c, io, tm));
     if cancellable && not (cond ()) then raise Cancelled
   end
 
@@ -655,10 +690,10 @@ let rec run_fiber t (f : unit -> unit) =
       effc =
         (fun (type a) (e : a Effect.t) ->
           match e with
-          | Block (cond, io, at) ->
+          | Block (cond, io, tm) ->
             Some
               (fun (k : (a, unit) Effect.Deep.continuation) ->
-                Queue.push (cond, io, at, fun () -> current := t; Effect.Deep.continue k ()) runq)
+                Queue.push (cond, io, tm, fun () -> current := t; Effect.Deep.continue k ()) runq)
           | _ -> None) }
 
 let spawn_fiber t f = Queue.push ((fun () -> true), None, None, fun () -> run_fiber t f) runq
@@ -783,10 +818,10 @@ let try_recv ch =
     | Some s -> s.ok <- true; `Got s.v
     | None -> if ch.closed then `Closed else `Blocked
 
-(* Wait until a waker claims [cl], or until [at]. A cancelled task gives up:
-   its waiters become stale and are taken off their queues. *)
-let wait_claim ?at cl (queued : (waiter Queue.t * waiter) list) =
-  (try wait_until ?at (fun () -> cl.fired <> -1 || match at with Some t -> now () >= t | None -> false)
+(* Wait until a waker claims [cl], or until [tm] rings. A cancelled task gives
+   up: its waiters become stale and are taken off their queues. *)
+let wait_claim ?tm cl (queued : (waiter Queue.t * waiter) list) =
+  (try wait_until ?tm (fun () -> cl.fired <> -1 || match tm with Some tm -> rung tm | None -> false)
    with Cancelled ->
      cl.fired <- -2;
      List.iter (fun (q, w) -> remove_waiter q w) queued;
@@ -825,8 +860,8 @@ let chan_close ch =
 (* Clock.sleep: wait without holding up other tasks. *)
 let sleep_ms (ms : int64) =
   if ms > 0L then begin
-    let at = now () +. (Int64.to_float (min ms 1_000_000_000_000L) /. 1000.) in
-    wait_until ~at (fun () -> now () >= at)
+    let tm = timer_after ms in
+    wait_until ~tm (fun () -> rung tm)
   end
 
 (* Run tasks until [finished ()]. *)
@@ -843,18 +878,34 @@ let rec schedule finished sp =
       let waits =
         Queue.fold (fun acc (_, io, _, _) -> match io with Some ((s : sock), w) when not s.shut -> (s.fd, w) :: acc | _ -> acc) [] runq
       in
-      let wake = Queue.fold (fun acc (_, _, at, _) -> match (at, acc) with Some t, Some u -> Some (Float.min t u) | Some t, None -> Some t | None, _ -> acc) None runq in
-      if waits = [] && wake = None then raise (Panic ("all tasks are blocked (deadlock)", sp));
-      let timeout = match wake with Some t -> Float.max 0. (t -. now ()) | None -> -1. in
-      (* select() cannot watch descriptors past FD_SETSIZE; then just pause
-         briefly. Either way, waiting tasks retry their operation. *)
-      let small = List.for_all (fun (fd, _) -> (Obj.magic fd : int) < 1000) waits in
-      (if small then
-         let rd = List.filter_map (fun (fd, w) -> if w then None else Some fd) waits in
-         let wr = List.filter_map (fun (fd, w) -> if w then Some fd else None) waits in
-         ignore (try Unix.select rd wr [] timeout with Unix.Unix_error (Unix.EINTR, _, _) -> ([], [], []))
-       else Unix.sleepf (if timeout < 0. then 0.001 else Float.min timeout 0.001));
-      incr io_epoch
+      (* the timer due first; of two due together, the one set first *)
+      let first =
+        Queue.fold
+          (fun acc (_, _, tm, _) ->
+            match (tm, acc) with
+            | Some t, Some u when (u.at, u.seq) <= (t.at, t.seq) -> acc
+            | Some t, _ when not t.rang -> Some t
+            | _ -> acc)
+          None runq
+      in
+      if waits = [] && first = None then raise (Panic ("all tasks are blocked (deadlock)", sp));
+      match (!virtual_now, first) with
+      | Some t, Some tm when waits = [] ->
+        (* every task is blocked and none on I/O: jump to the next timer *)
+        virtual_now := Some (Float.max t tm.at);
+        tm.rang <- true
+      | _ ->
+        (* on virtual time the clock stands still while a task waits on I/O *)
+        let timeout = match (!virtual_now, first) with None, Some tm -> Float.max 0. (tm.at -. now ()) | _ -> -1. in
+        (* select() cannot watch descriptors past FD_SETSIZE; then just pause
+           briefly. Either way, waiting tasks retry their operation. *)
+        let small = List.for_all (fun (fd, _) -> (Obj.magic fd : int) < 1000) waits in
+        (if small then
+           let rd = List.filter_map (fun (fd, w) -> if w then None else Some fd) waits in
+           let wr = List.filter_map (fun (fd, w) -> if w then Some fd else None) waits in
+           ignore (try Unix.select rd wr [] timeout with Unix.Unix_error (Unix.EINTR, _, _) -> ([], [], []))
+         else Unix.sleepf (if timeout < 0. then 0.001 else Float.min timeout 0.001));
+        incr io_epoch
     end;
     schedule finished sp
   end
@@ -1899,12 +1950,12 @@ let rec eval rt env e : value =
             (fun best (i, op) ->
               match (op, best) with
               | `After ms, _ ->
-                let at = start +. (Int64.to_float (min ms 1_000_000_000_000L) /. 1000.) in
-                (match best with Some (_, b) when b <= at -> best | _ -> Some (i, at))
+                let tm = timer_after ~from:start ms in
+                (match best with Some (_, b) when b.at <= tm.at -> best | _ -> Some (i, tm))
               | _ -> best)
             None ops
         in
-        wait_claim ?at:(Option.map snd after) cl queued;
+        wait_claim ?tm:(Option.map snd after) cl queued;
         if cl.fired = -1 then cl.fired <- fst (Option.get after); (* the timeout *)
         let i = cl.fired in
         match List.find_opt (fun (_, w) -> w.idx = i) queued with
@@ -1966,9 +2017,9 @@ let rec eval rt env e : value =
        if ms <= 0L then g.gcancelled <- true
        else begin
          (* the deadline: a coroutine of its own that cancels the tasks when the time comes *)
-         let at = now () +. (Int64.to_float (min ms 1_000_000_000_000L) /. 1000.) in
+         let tm = timer_after ms in
          spawn_fiber { cancelled = false; scopes = []; sink = None } (fun () ->
-             wait_until ~at ~cancellable:false (fun () -> !joined || now () >= at);
+             wait_until ~tm ~cancellable:false (fun () -> !joined || rung tm);
              if not !joined then cancel_group g)
        end);
     let sc = scope_of name (VGroup g) in
@@ -2482,7 +2533,7 @@ and cap_call rt c name args sp =
   match (c, name, args) with
   | CStdout, "print", [ VStr s ] -> put rt.out !current.sink (s ^ "\n"); VUnit
   | CStdout, "write", [ VStr s ] -> put rt.out !current.sink s; VUnit
-  | CClock, "now_ms", [] -> VInt (Int64.of_float (Unix.gettimeofday () *. 1000.))
+  | CClock, "now_ms", [] -> VInt (clock_now_ms ())
   | CClock, "sleep", [ VInt ms ] -> sleep_ms ms; VUnit
   | CRand, "float", [] -> VFloat (Int64.to_float (Int64.shift_right_logical (rand_next ()) 11) *. 0x1p-53)
   | CStdin, "read_line", [] -> (
@@ -2638,7 +2689,8 @@ let run_tests_timed ?(select = fun _ -> true) ~out (user_items : item list) :
         let start = Unix.gettimeofday () in
         Queue.clear runq;
         let finished = ref false in
-        (* capabilities the test asked for: a fresh directory as Fs, the real Clock *)
+        (* capabilities the test asked for: a fresh directory as Fs, the real
+           Clock or (`clock: virtual Clock`) one on virtual time *)
         let dir = if Caps.takes_fs d then Some (Caps.test_dir ()) else None in
         let args =
           List.map
@@ -2648,6 +2700,7 @@ let run_tests_timed ?(select = fun _ -> true) ~out (user_items : item list) :
               | _ -> VCap CClock)
             d.fn_params
         in
+        virtual_now := if d.fn_virtual then Some 0. else None;
         let r =
           match resolved with
           | Error e -> Error e
@@ -2662,6 +2715,7 @@ let run_tests_timed ?(select = fun _ -> true) ~out (user_items : item list) :
         in
         Queue.clear runq;
         live_groups := [];
+        virtual_now := None;
         Option.iter Caps.remove_tree dir;
         Some (name, r, Unix.gettimeofday () -. start)
       | _ -> None)

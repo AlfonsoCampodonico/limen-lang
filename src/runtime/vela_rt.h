@@ -1394,7 +1394,17 @@ static WIo Cap_fs_make_dir(WCap *fs, WStr *rel) {
   if (rc != 0) { snprintf(msg, sizeof msg, "fs: `%.*s`: %s", (int)rel->len, rel->data, strerror(errno)); return io_err(2, msg); }
   return io_ok(NULL);
 }
-static int64_t Cap_now_ms(void) { struct timeval tv; gettimeofday(&tv, NULL); return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000; }
+/* Virtual time, for a test that takes `clock: virtual Clock`: the clock
+   starts at 2026-01-01T00:00:00Z and moves only when every task is blocked
+   (see w_tm_advance). w_vnow_ns is how far it has moved. */
+#define W_VIRTUAL_START_MS ((int64_t)1767225600000)
+static int w_virtual;
+static int64_t w_vnow_ns;
+static void w_virtual_start(void) { w_virtual = 1; }
+static int64_t Cap_now_ms(void) {
+  if (w_virtual) return W_VIRTUAL_START_MS + __atomic_load_n(&w_vnow_ns, __ATOMIC_ACQUIRE) / 1000000;
+  struct timeval tv; gettimeofday(&tv, NULL); return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
 
 /* ---------- fibers and the work-stealing scheduler ----------
    Every Vela task, and main itself, runs as a fiber: a small mmap'd stack
@@ -1522,6 +1532,7 @@ static int64_t w_nidle;
 static int64_t w_io_waiters;                                      /* fibers parked on sockets */
 static int64_t w_tm_count;                                        /* pending timers (sleeps, timeouts, deadlines) */
 static int w_main_done;
+static int w_tm_advance(void);
 static size_t w_stack_size = 1024 * 1024;                         /* reserved lazily, so 10k tasks are cheap */
 #define W_GUARD_BYTES (64 * 1024)                                 /* larger than any runtime stack frame */
 static int64_t w_fibers_alive;                                    /* created and not yet freed */
@@ -1628,8 +1639,8 @@ static WFiber *w_take(WWorker *w, int own) {
   WFiber *f = NULL;
   pthread_mutex_lock(&w->mu);
   if (w->tail > w->head) {
-    if (own) { w->tail--; f = w->q[w->tail % w->cap]; }   /* newest first: good locality for fork/join */
-    else { f = w->q[w->head % w->cap]; w->head++; }       /* thieves take the oldest */
+    if (own && !w_virtual) { w->tail--; f = w->q[w->tail % w->cap]; }   /* newest first: good locality for fork/join */
+    else { f = w->q[w->head % w->cap]; w->head++; }       /* thieves take the oldest; on virtual time, everyone */
   }
   pthread_mutex_unlock(&w->mu);
   if (f) __atomic_fetch_sub(&w_queued, 1, __ATOMIC_SEQ_CST);
@@ -1668,8 +1679,18 @@ static void w_sched_loop(WWorker *w, int is_main) {
         /* Every worker idle, nothing runnable, nothing waiting on I/O or a
            timer: no task can ever wake another. Confirm after a short wait,
            then report the deadlock instead of hanging. */
-        if (idle == __atomic_load_n(&w_nworkers, __ATOMIC_ACQUIRE) && __atomic_load_n(&w_io_waiters, __ATOMIC_SEQ_CST) == 0
-            && __atomic_load_n(&w_tm_count, __ATOMIC_SEQ_CST) == 0) {
+        int quiet = idle == __atomic_load_n(&w_nworkers, __ATOMIC_ACQUIRE) && __atomic_load_n(&w_io_waiters, __ATOMIC_SEQ_CST) == 0;
+        if (quiet && w_virtual && __atomic_load_n(&w_tm_count, __ATOMIC_SEQ_CST) > 0) {
+          /* virtual time: every task is blocked and none on I/O, so the
+             clock jumps to the next timer. This worker is the last to go
+             idle; it stops being idle to ring the timer, so no other can
+             ring one until everything is blocked again. */
+          __atomic_fetch_sub(&w_nidle, 1, __ATOMIC_SEQ_CST);
+          pthread_mutex_unlock(&w_idle_mu);
+          w_tm_advance();
+          continue;
+        }
+        if (quiet && __atomic_load_n(&w_tm_count, __ATOMIC_SEQ_CST) == 0) {
           struct timeval tv; gettimeofday(&tv, NULL);
           struct timespec ts = { tv.tv_sec, (long)tv.tv_usec * 1000 + 100000000L };
           if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
@@ -1728,6 +1749,7 @@ static void w_pool_start(void) {
   const char *e = getenv("VELA_THREADS");
   if (e) n = atol(e);
   if (n > W_MAX_WORKERS) n = W_MAX_WORKERS;
+  if (w_virtual) n = 1;   /* virtual time: tasks take turns on one thread, in start order, the same every run */
   for (long i = 1; i < n; i++) {
     pthread_t th;
     pthread_create(&th, NULL, w_worker_thread, NULL);
@@ -1892,6 +1914,7 @@ static inline int w_tok_fired(WSel *tok) { return __atomic_load_n(&tok->fired, _
 
 typedef struct WTimer {
   int64_t at;                           /* monotonic deadline, ns */
+  int64_t seq;                          /* orders timers due at the same time: the one set first */
   int64_t pos;                          /* index in the heap, -1 when not in it */
   WFiber *f; WSel *sel; int idx;        /* claim sel (fired = idx), then wake f */
   void (*fire)(void *); void *arg;      /* or call fire(arg) */
@@ -1900,10 +1923,11 @@ typedef struct WTimer {
 static pthread_mutex_t w_tm_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t w_tm_cv = PTHREAD_COND_INITIALIZER;
 static WTimer **w_tm_heap;
-static int64_t w_tm_n, w_tm_cap;
+static int64_t w_tm_n, w_tm_cap, w_tm_seq;
 static pthread_once_t w_tm_once = PTHREAD_ONCE_INIT;
 
 static int64_t w_mono_ns(void) {
+  if (w_virtual) return __atomic_load_n(&w_vnow_ns, __ATOMIC_ACQUIRE);
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
@@ -1918,14 +1942,15 @@ static void w_tm_swap(int64_t i, int64_t j) {
   WTimer *t = w_tm_heap[i]; w_tm_heap[i] = w_tm_heap[j]; w_tm_heap[j] = t;
   w_tm_heap[i]->pos = i; w_tm_heap[j]->pos = j;
 }
+static int w_tm_before(WTimer *a, WTimer *b) { return a->at < b->at || (a->at == b->at && a->seq < b->seq); }
 static void w_tm_up(int64_t i) {
-  while (i > 0 && w_tm_heap[(i - 1) / 2]->at > w_tm_heap[i]->at) { w_tm_swap(i, (i - 1) / 2); i = (i - 1) / 2; }
+  while (i > 0 && w_tm_before(w_tm_heap[i], w_tm_heap[(i - 1) / 2])) { w_tm_swap(i, (i - 1) / 2); i = (i - 1) / 2; }
 }
 static void w_tm_down(int64_t i) {
   for (;;) {
     int64_t l = 2 * i + 1, r = l + 1, m = i;
-    if (l < w_tm_n && w_tm_heap[l]->at < w_tm_heap[m]->at) m = l;
-    if (r < w_tm_n && w_tm_heap[r]->at < w_tm_heap[m]->at) m = r;
+    if (l < w_tm_n && w_tm_before(w_tm_heap[l], w_tm_heap[m])) m = l;
+    if (r < w_tm_n && w_tm_before(w_tm_heap[r], w_tm_heap[m])) m = r;
     if (m == i) return;
     w_tm_swap(i, m); i = m;
   }
@@ -1973,8 +1998,9 @@ static void w_tm_start(void) {
   pthread_detach(th);
 }
 static void w_tm_add(WTimer *t) {
-  pthread_once(&w_tm_once, w_tm_start);
+  if (!w_virtual) pthread_once(&w_tm_once, w_tm_start);   /* on virtual time, idle workers ring the timers */
   pthread_mutex_lock(&w_tm_mu);
+  t->seq = w_tm_seq++;
   if (w_tm_n == w_tm_cap) {
     w_tm_cap = w_tm_cap ? w_tm_cap * 2 : 64;
     w_tm_heap = (WTimer **)w_realloc(w_tm_heap, sizeof(WTimer *) * (size_t)w_tm_cap);
@@ -1985,6 +2011,29 @@ static void w_tm_add(WTimer *t) {
   if (t->pos == 0) pthread_cond_signal(&w_tm_cv);   /* a new earliest deadline */
   pthread_mutex_unlock(&w_tm_mu);
 }
+/* Virtual time: ring the earliest timer (of two due together, the one set
+   first), moving the clock to it, as the timer thread would. Only that
+   timer: the next one, even at the same time, waits until every task is
+   blocked again, so what each woken task does happens in the same order on
+   every run. Returns 0 if no timer was pending. */
+static int w_tm_advance(void) {
+  pthread_mutex_lock(&w_tm_mu);
+  if (w_tm_n == 0) { pthread_mutex_unlock(&w_tm_mu); return 0; }
+  WTimer *t = w_tm_heap[0];
+  w_tm_unlink(t);
+  if (t->at > __atomic_load_n(&w_vnow_ns, __ATOMIC_ACQUIRE)) __atomic_store_n(&w_vnow_ns, t->at, __ATOMIC_RELEASE);
+  if (t->fire) t->fire(t->arg);
+  else {
+    WFiber *f = t->f;
+    int claimed = w_tok_claim(t->sel, t->idx);
+    pthread_mutex_unlock(&w_tm_mu);
+    if (claimed) w_wake(f);
+    return 1;
+  }
+  pthread_mutex_unlock(&w_tm_mu);
+  return 1;
+}
+
 /* Take a timer out if it has not fired. Once this returns, a fire function
    is not running and will not run. */
 static void w_tm_remove(WTimer *t) {

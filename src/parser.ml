@@ -746,8 +746,22 @@ let parse_item st =
       | STR [ Lit n ] -> n
       | _ -> raise (Diag.Fatal (Diag.make "E0003" s.span (Printf.sprintf "a %s name must be a plain string, without interpolation" kind)))
     in
-    (* optional capabilities the runner hands the test: `(fs: Fs, clock: Clock)` *)
-    let params = if accept_sym st "(" then comma_list st ")" parse_param else [] in
+    (* optional capabilities the runner hands the test: `(fs: Fs, clock: Clock)`;
+       `clock: virtual Clock` asks for a clock on virtual time *)
+    let virtual_clock = ref false in
+    let test_param st =
+      let pn, psp = expect_ident st in
+      if not (is_sym st ":") then
+        raise (Diag.Fatal (Diag.make "E0008" psp (Printf.sprintf "parameter `%s` needs a type, for example `%s: Int`" pn pn)));
+      skip st;
+      (match (cur st, next st) with
+       | IDENT "virtual", IDENT "Clock" -> skip st; virtual_clock := true
+       | IDENT "virtual", _ ->
+         raise (Diag.Fatal (Diag.make "E0003" (cur_span st) "only a test's clock can be virtual: `clock: virtual Clock`"))
+       | _ -> ());
+      { prm_name = pn; prm_span = psp; prm_ty = parse_type st }
+    in
+    let params = if accept_sym st "(" then comma_list st ")" test_param else [] in
     (* a table test: `for (a, b, want) in [(1, 2, 3), (2, 2, 4)]`, each case run on its own *)
     let table =
       if kind = "test" && is_kw st "for" then begin
@@ -774,7 +788,7 @@ let parse_item st =
     (* the generated name cannot be written in source, so tests cannot be called *)
     IFn
       { fn_name = Printf.sprintf "%s#%d" kind !test_count; fn_span = s.span; fn_gen = []; fn_params = params; fn_ret = None;
-        fn_body = body; fn_test = Some name; fn_bench = kind = "bench"; fn_table = table; fn_pub = false; fn_bounds = [];
+        fn_body = body; fn_test = Some name; fn_bench = kind = "bench"; fn_virtual = !virtual_clock; fn_table = table; fn_pub = false; fn_bounds = [];
         fn_foreign = None }
   | KW "fn" ->
     skip st;
@@ -784,7 +798,7 @@ let parse_item st =
     let params = comma_list st ")" parse_param in
     let ret = if accept_sym st "->" then Some (parse_type st) else None in
     let body = parse_block st in
-    IFn { fn_name = name; fn_span = nsp; fn_gen = gen; fn_params = params; fn_ret = ret; fn_body = body; fn_test = None; fn_bench = false; fn_table = None; fn_pub = false; fn_bounds = bounds; fn_foreign = None }
+    IFn { fn_name = name; fn_span = nsp; fn_gen = gen; fn_params = params; fn_ret = ret; fn_body = body; fn_test = None; fn_bench = false; fn_virtual = false; fn_table = None; fn_pub = false; fn_bounds = bounds; fn_foreign = None }
   | KW "struct" ->
     skip st;
     let name, nsp = expect_ident st in
@@ -940,8 +954,8 @@ let parse_foreign st =
       let body = { stmts = []; tail = None; bspan = { nsp with hi } } in
       items :=
         IFn
-          { fn_name = name; fn_span = nsp; fn_gen = []; fn_params = params; fn_ret = ret; fn_body = body; fn_test = None; fn_bench = false; fn_table = None;
-            fn_pub = pub; fn_bounds = []; fn_foreign = Some { flib = lib; fsym = sym; ftrusted = false; fvariadic = !variadic } }
+          { fn_name = name; fn_span = nsp; fn_gen = []; fn_params = params; fn_ret = ret; fn_body = body; fn_test = None; fn_bench = false; fn_virtual = false;
+            fn_table = None; fn_pub = pub; fn_bounds = []; fn_foreign = Some { flib = lib; fsym = sym; ftrusted = false; fvariadic = !variadic } }
         :: !items
     end;
     (* one declaration per line (or separated by `;`) *)

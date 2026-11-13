@@ -110,8 +110,9 @@ type fn = {
   body : stmt list;
 }
 
-type program = { fns : fn list; main : string; main_takes_root : bool; main_ret : ty; tests : (string * string list) list (* C names, in order, and the root fields each takes *);
-  benches : (string * string list) list (* likewise, for `bench` blocks *) }
+type program = { fns : fn list; main : string; main_takes_root : bool; main_ret : ty; tests : (string * string list * bool) list
+      (* C names, in order, the root fields each takes, and whether it runs on virtual time *);
+  benches : (string * string list) list (* likewise, for `bench` blocks (never on virtual time) *) }
 
 (* Which atoms of an rhs are consumed (ownership moves) and which are only read. *)
 let consumed = function

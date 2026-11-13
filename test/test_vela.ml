@@ -1734,6 +1734,240 @@ test "fails with a dir" (fs: Fs) {
   end;
   errs "vela-test-bad-cap" "test \"x\" (n: Net) {}\ntest \"y\" (a: Fs, b: Fs) {}\ntest \"z\" (c: Clock, d: Int) {}" [ "E0306"; "E0306"; "E0306" ];
 
+  (* virtual time: `clock: virtual Clock` starts at 2026-01-01T00:00:00Z and
+     jumps to the next timer whenever every task is waiting, the same in both
+     backends; an hour of sleeping takes no real time *)
+  let virtual_src = {|use time
+
+test "an hour at once" (clock: virtual Clock) {
+    let start = clock.now_ms()
+    assert_eq(start, 1767225600000)
+    clock.sleep(3600000)
+    assert_eq(clock.now_ms(), start + 3600000)
+    for _ in 0..<1000 {
+        clock.sleep(1000)
+    }
+    clock.sleep(0)
+    clock.sleep(-5)
+    assert_eq(clock.now_ms(), start + 4600000)
+}
+
+test "the message comes first" (clock: virtual Clock) {
+    let c: Chan[Str] = channel(0)
+    let got = group g {
+        g.go(|| {
+            clock.sleep(4999)
+            c.send("message")
+        })
+        g.go(|| {
+            select {
+                v = c.recv() => v ?? "closed",
+                clock.after(5000) => "timed out",
+            }
+        })
+    }
+    assert_eq(got, ["message"])
+    assert_eq(clock.now_ms(), 1767225604999)
+}
+
+test "the timeout comes first" (clock: virtual Clock) {
+    let c: Chan[Str] = channel(1)
+    let got = group g {
+        g.go(|| {
+            clock.sleep(5001)
+            c.send("message")
+        })
+        g.go(|| {
+            let r = select {
+                v = c.recv() => v ?? "closed",
+                clock.after(5000) => "timed out",
+            }
+            "{r} at {clock.now_ms() - 1767225600000}"
+        })
+    }
+    assert_eq(got, ["timed out at 5000"])
+    assert_eq(clock.now_ms(), 1767225605001)
+}
+
+test "the timer set first rings first" (clock: virtual Clock) {
+    let c: Chan[Str] = channel(1)
+    let got = group g {
+        g.go(|| {
+            clock.sleep(5000)
+            c.send("message")
+        })
+        g.go(|| {
+            select {
+                v = c.recv() => v ?? "closed",
+                clock.after(5000) => "timed out",
+            }
+        })
+    }
+    assert_eq(got, ["message"])
+}
+
+test "a deadline cancels the slow task" (clock: virtual Clock) {
+    let got = group g until clock.after(100) {
+        g.go(|| {
+            clock.sleep(50)
+            1
+        })
+        g.go(|| {
+            clock.sleep(150)
+            2
+        })
+    }
+    assert_eq(got, [Some(1), None])
+    assert_eq(clock.now_ms(), 1767225600100)
+}
+
+test "nested deadlines" (clock: virtual Clock) {
+    let start = clock.now_ms()
+    let got = group outer until clock.after(1000) {
+        outer.go(|| {
+            let inner = group g until clock.after(100) {
+                g.go(|| {
+                    clock.sleep(50)
+                    "a"
+                })
+                g.go(|| {
+                    clock.sleep(500)
+                    "b"
+                })
+            }
+            assert_eq(inner, [Some("a"), None])
+            clock.now_ms() - start
+        })
+        outer.go(|| {
+            clock.sleep(2000)
+            0
+        })
+    }
+    assert_eq(got, [Some(100), None])
+    assert_eq(clock.now_ms() - start, 1000)
+}
+
+test "within" (clock: virtual Clock) {
+    let slow = time.within(clock, 100, || {
+        clock.sleep(3600000)
+        Ok(1)
+    })
+    assert_eq(slow, Err(Failed("timed out after 100 ms")))
+    let fast = time.within(clock, 100, || {
+        clock.sleep(10)
+        Ok(2)
+    })
+    assert_eq(fast, Ok(2))
+    assert_eq(clock.now_ms(), 1767225600110)
+}
+
+test "tasks wake in order" (clock: virtual Clock) {
+    let c: Chan[Str] = channel(10)
+    let _ = group g {
+        for (name, ms) in [("c", 300), ("a", 100), ("d", 400), ("b", 200), ("a2", 100)] {
+            g.go(|| {
+                clock.sleep(ms)
+                c.send("{name}@{clock.now_ms() - 1767225600000}")
+            })
+        }
+    }
+    c.close()
+    let mut got: List[Str] = []
+    let mut more = true
+    while more {
+        match c.recv() {
+            Some(v) => { got.push(v) },
+            None => { more = false },
+        }
+    }
+    assert_eq(got, ["a@100", "a2@100", "b@200", "c@300", "d@400"])
+}
+
+test "time stands still while a task works" (fs: Fs, clock: virtual Clock) {
+    let got = group g {
+        g.go(|| {
+            clock.sleep(10)
+            clock.now_ms()
+        })
+        g.go(|| {
+            for i in 0..<200 {
+                assert(fs.write("f{i}.txt", "x").is_ok())
+            }
+            clock.now_ms()
+        })
+    }
+    assert_eq(got, [1767225600010, 1767225600000])
+}
+
+test "a deadlock with no timers" (clock: virtual Clock) {
+    let c: Chan[Int] = channel(0)
+    clock.sleep(1000)
+    let _ = c.recv()
+}
+
+test "for each case" (clock: virtual Clock) for ms in [10, 20] {
+    clock.sleep(ms)
+    assert_eq(clock.now_ms(), 1767225600000 + ms)
+}
+
+test "the real clock" (clock: Clock) {
+    assert(clock.now_ms() > 1700000000000)
+    assert(clock.now_ms() != 1767225600000)
+}
+|} in
+  let items, ds, _ = compile "vela-virtual-time" virtual_src in
+  ok "vela-virtual-time-checks" (ds = []) (String.concat "," (codes ds));
+  let deadlock = "all tasks are blocked (deadlock)" in
+  let want =
+    [ ("an hour at once", None); ("the message comes first", None); ("the timeout comes first", None);
+      ("the timer set first rings first", None); ("a deadline cancels the slow task", None); ("nested deadlines", None);
+      ("within", None); ("tasks wake in order", None); ("time stands still while a task works", None);
+      ("a deadlock with no timers", Some deadlock); ("for each case 10", None); ("for each case 20", None); ("the real clock", None) ]
+  in
+  let show got = String.concat "; " (List.map (fun (n, m) -> n ^ "=" ^ Option.value ~default:"ok" m) got) in
+  let t0 = Unix.gettimeofday () in
+  let got = List.map (fun (n, r) -> (n, match r with Ok () -> None | Error (m, _) -> Some m)) (Interp.run_tests ~out:ignore items) in
+  let secs = Unix.gettimeofday () -. t0 in
+  ok "vela-virtual-time-interp" (got = want) (show got);
+  ok "vela-virtual-time-interp-fast" (secs < 10.) (sprintf "took %.1f s" secs);
+  (* natively, each test in its own process (a watchdog stops one that would
+     wait in real time), under AddressSanitizer and ThreadSanitizer *)
+  let native_virtual suffix flags env =
+    let name = "vela-virtual-time" ^ suffix in
+    if native_for name && selected name then begin
+      let exe = exe_path name in
+      let dir = Caps.test_dir () in
+      let q = Filename.quote in
+      let runs =
+        List.mapi
+          (fun i _ ->
+            sprintf "%sperl -e 'alarm 60; exec @ARGV' %s %d --grant fs=%s >/dev/null 2>%s.%d.err; echo $? >%s.%d.code" env (q exe) i (q dir) (q exe) i
+              (q exe) i)
+          want
+      in
+      let run_cmd = sprintf "s=$(date +%%s); %s; echo $(( $(date +%%s) - s )) >%s.secs" (String.concat "; " runs) (q exe) in
+      native_job ~tests:true ~flags items exe run_cmd (function
+        | Error m -> Caps.remove_tree dir; ok name false ("C compile failed:\n" ^ m)
+        | Ok _ ->
+          Caps.remove_tree dir;
+          List.iteri
+            (fun i (n, w) ->
+              let code = int_of_string (String.trim (read_file (sprintf "%s.%d.code" exe i))) in
+              let err = read_file (sprintf "%s.%d.err" exe i) in
+              match w with
+              | None -> ok (name ^ "/" ^ n) (code = 0 && err = "vela-leakcheck: 0 live\n") (sprintf "exit %d, stderr %S" code err)
+              | Some m -> ok (name ^ "/" ^ n) (code <> 0 && String.starts_with ~prefix:("panic: " ^ m) err) (sprintf "exit %d, stderr %S" code err))
+            want;
+          let secs = int_of_string (String.trim (read_file (exe ^ ".secs"))) in
+          ok (name ^ "-fast") (secs < 60) (sprintf "took %d s" secs))
+    end
+  in
+  native_virtual "" sanitize "ASAN_OPTIONS=detect_leaks=0 VELA_LEAKCHECK=1 ";
+  native_virtual "-tsan" tsan "TSAN_OPTIONS=halt_on_error=1 VELA_THREADS=8 VELA_LEAKCHECK=1 ";
+  errs "vela-virtual-bench" "bench \"b\" (clock: virtual Clock) {\n    clock.sleep(1)\n}" [ "E0306" ];
+  errs "vela-virtual-not-clock" "test \"t\" (fs: virtual Fs) {\n    assert(true)\n}" [ "E0003" ];
+  errs "vela-virtual-twice" "test \"t\" (a: virtual Clock, b: Clock) {\n    assert(true)\n}" [ "E0306" ];
+
   (* table tests: one isolated run per case, named by the case's text;
      benches: skipped by tests, run natively by `vela test --bench` *)
   let table_src = {|fn add(a: Int, b: Int) -> Int {

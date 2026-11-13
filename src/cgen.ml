@@ -1669,7 +1669,7 @@ let program (g : Lower.gctx) (prog : I.program) : string =
     mp "static void wtest_entry_(void* a) {";
     mp "  (void)a;";
     mp "  if (!wtest_bench_) switch (wtest_index_) {";
-    List.iteri (fun i (t, fields) -> mp (sprintf "    case %d: %s(%s); break;" i t (cap_args fields))) prog.tests;
+    List.iteri (fun i (t, fields, _) -> mp (sprintf "    case %d: %s(%s); break;" i t (cap_args fields))) prog.tests;
     mp "  }";
     if prog.benches <> [] then begin
       mp "  else switch (wtest_index_) {";
@@ -1696,6 +1696,9 @@ let program (g : Lower.gctx) (prog : I.program) : string =
     mp "    w_init(argc - 4, argv + 4);   /* then `--grant fs=DIR` for a bench that takes Fs */";
     mp "  } else {";
     mp "    wtest_index_ = atoi(argv[1]);";
+    (* a test that takes `clock: virtual Clock` runs on virtual time, from before any thread starts *)
+    let virtual_tests = List.concat (List.mapi (fun i (_, _, v) -> if v then [ sprintf "case %d:" i ] else []) prog.tests) in
+    if virtual_tests <> [] then mp (sprintf "    switch (wtest_index_) { %s w_virtual_start(); }" (String.concat " " virtual_tests));
     mp "    w_init(argc - 1, argv + 1);   /* `--grant fs=DIR` for a test that takes Fs */";
     mp "  }";
     mp "  w_run(wtest_entry_, NULL);";

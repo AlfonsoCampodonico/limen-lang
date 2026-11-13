@@ -918,7 +918,7 @@ clock.sleep(250)                      // wait a quarter of a second
 ```
 
 - `clock.sleep(ms)` waits at least `ms` milliseconds; other tasks keep running, and natively no thread waits. Time is measured on a monotonic clock, so changing the system time does not shorten or stretch a sleep.
-- Waiting needs the `Clock` capability like reading the time does, so a pure function cannot depend on timing. For deterministic tests, take the clock through an interface (`interface Sleeper { fn sleep(self, ms: Int) }`) and pass a fake that does not wait; `Clock` satisfies such interfaces (section 4).
+- Waiting needs the `Clock` capability like reading the time does, so a pure function cannot depend on timing. For deterministic tests, ask for `clock: virtual Clock` (section 12): sleeps, `select` timeouts and group deadlines then run on virtual time, which jumps ahead whenever every task is waiting, so timeout logic is tested instantly and gives the same result every run. A fake through an interface (`interface Sleeper { fn sleep(self, ms: Int) }`) works too; `Clock` satisfies such interfaces (section 4).
 
 ### Deadlines and cancellation
 
@@ -1238,7 +1238,7 @@ test "adds small numbers" {
 ```
 
 - `test "name" { ... }` is a top-level item. Tests get no `root`, so by default they cannot do I/O; they can use groups and channels, and fakes through interfaces.
-- A test can ask the runner for two real capabilities, by declaring them like parameters: `fs: Fs` is a fresh, empty, writable temporary directory, removed when the test ends, and `clock: Clock` is the real clock. Each at most once; anything else is E0306.
+- A test can ask the runner for two real capabilities, by declaring them like parameters: `fs: Fs` is a fresh, empty, writable temporary directory, removed when the test ends, and `clock: Clock` is the real clock. `clock: virtual Clock` asks for a clock on virtual time instead (below). Each at most once; anything else is E0306.
 
 ```
 test "saves the config" (fs: Fs) {
@@ -1246,6 +1246,35 @@ test "saves the config" (fs: Fs) {
     assert_eq(fs.read("app.conf"), Ok("3"))
 }
 ```
+
+### Virtual time
+
+```
+test "gives up after five seconds" (clock: virtual Clock) {
+    let replies: Chan[Str] = channel(1)
+    let got = group g {
+        g.go(|| {
+            clock.sleep(60000)                // a reply that comes a minute later
+            replies.send("late")
+        })
+        g.go(|| {
+            select {
+                r = replies.recv() => r ?? "closed",
+                clock.after(5000) => "timed out",
+            }
+        })
+    }
+    assert_eq(got, ["timed out"])
+}
+```
+
+- The clock is still a `Clock`, so the test passes it to the code under test as usual. `virtual` changes only where its time comes from, and is written only there, in a test's parameters. A `bench` is timed on the real clock and cannot take one (E0306).
+- The clock starts at 2026-01-01T00:00:00Z: `clock.now_ms()` is `1767225600000` when the test starts, every run.
+- It does not move while any task of the test can go on. When every task is waiting (on `clock.sleep`, a `clock.after` arm, a group's deadline, a channel or a group), the clock jumps to the earliest timer and that timer rings: its sleep returns, its `select` arm is chosen or its group's deadline passes. Then the woken tasks run until every task is waiting again, and the next timer rings. So a test that sleeps for an hour finishes at once, and `now_ms` afterwards is exactly an hour later.
+- Timers ring one at a time, in a fixed order: the earliest first, and of two set for the same instant, the one set first (a `sleep(5000)` started before a `select` with `clock.after(5000)` returns first, so a message it then sends wins). The next timer, even one due at the same instant, rings only once every task is waiting again. Natively, the tasks of such a test take turns on one thread in the order they become ready, as in the interpreter, so the same test does the same thing every run, in both.
+- Work does not take time: while a task computes, writes files or calls C, the clock stands still. The same holds for a task waiting on real I/O (a socket, stdin): no timer rings until it has its data, since only the outside world can wake it. A test cannot take `Net`, `Listen` or `Stdin`, so in practice its tasks only ever wait on each other and on timers.
+- When every task is waiting and no timer is set, nothing can ever wake one: the test fails with `all tasks are blocked (deadlock)`, as a program does.
+- Only `vela test` (with or without `--native`) runs code on virtual time, and only in tests that ask for it; `vela run` and `vela build` always use the real clock, as do tests that take `clock: Clock`.
 - `vela test FILE` runs every test, each isolated, and prints `ok` (with the time it took) or `FAIL` with the panic message and location; it exits with status 1 if any test fails. `--native` runs them as native code.
 - `--run TEXT` runs only the tests (and benchmarks) whose name contains `TEXT`. `--json` prints one JSON object instead, for tools and agents: `{"tests": [{"name", "ok", "message"?, "where"?, "seconds"}], "benches": [...], "passed", "failed", "seconds"}`; a test's own output is left out of it.
 - Test names must be unique (E0106). Tests are type-checked by `vela check` and ignored by `vela run` and `vela build`.
@@ -1278,7 +1307,7 @@ bench "sum to 100" {
 }
 ```
 
-- `bench "name" { ... }` is a top-level item like `test`, and can take `fs: Fs` and `clock: Clock` the same way (one directory for the whole run). Its body is one operation.
+- `bench "name" { ... }` is a top-level item like `test`, and can take `fs: Fs` and `clock: Clock` (never `virtual`) the same way (one directory for the whole run). Its body is one operation.
 - `vela test FILE` skips benchmarks. `vela test FILE --bench` runs the tests and then every benchmark, always as native code: each benchmark runs in its own process, first once, then with more and more iterations (at most 100 times more per round), until one round takes at least the time budget, one second by default. `--bench-time 200ms` (or `2s`, `1m`) sets the budget, and `--bench-time 100x` runs exactly 100 iterations.
 - It reports the iterations of the last round, the time per operation, and the runtime's allocations per operation (strings, lists, maps, closures and other objects made, whether or not they were freed). A panic fails the benchmark like a test.
 - The value of the body's last expression is passed to `keep`, so the C compiler cannot drop the work that made it. Inside a loop, call `keep(x)` on values that are otherwise unused. A constant result (`1 + 2`) is still computed at compile time, as in any program, and a pure call whose arguments do not change in a loop is made once (section 14): vary the arguments to time each call.
@@ -1351,7 +1380,7 @@ Every diagnostic has a stable code. `vela explain CODE` prints its explanation, 
 | E0303 | bad `main` signature |
 | E0304 | function stored in a field |
 | E0305 | channel stored in a field |
-| E0306 | a test parameter that is not `fs: Fs` or `clock: Clock` |
+| E0306 | a test parameter that is not `fs: Fs`, `clock: Clock` or `clock: virtual Clock`, or a bench that takes `virtual Clock` |
 | E0310 | misuse of a group handle |
 | E0311 | `return` or `?` leaving a group |
 | E0320 | a dependency takes a capability vela.toml does not grant it |
@@ -1390,7 +1419,7 @@ EBNF. `NL` is a newline, as described in section 2. `UPPER` is an `IDENT` that s
 program    = { "use" IDENT | [ "pub" ] ( fn | struct | enum | interface ) | test | bench | foreign } ;
 foreign    = "foreign" STRING "{" { [ "pub" ] "fn" IDENT "(" [ params ] ")" [ "->" type ] ( NL | ";" ) } "}" ;
 interface  = "interface" IDENT [ generics ] "{" { "fn" IDENT "(" "self" { "," param } ")" [ "->" type ] ( "," | NL ) } "}" ;
-test       = "test" STRING [ "(" [ params ] ")" ] [ "for" ( IDENT | tuplepat ) "in" "[" expr { "," expr } [ "," ] "]" ] block ;
+test       = "test" STRING [ "(" [ tparams ] ")" ] [ "for" ( IDENT | tuplepat ) "in" "[" expr { "," expr } [ "," ] "]" ] block ;
 bench      = "bench" STRING [ "(" [ params ] ")" ] block ;
 fn         = "fn" IDENT [ bgenerics ] "(" [ params ] ")" [ "->" type ] block ;
 bgenerics  = "[" IDENT [ ":" bound { "+" bound } ] { "," IDENT [ ":" bound { "+" bound } ] } "]" ;
@@ -1398,6 +1427,8 @@ bound      = IDENT [ "." IDENT ] [ "[" typearg { "," typearg } "]" ] ;   (* an i
 generics   = "[" IDENT { "," IDENT } "]" ;
 params     = param { sep param } [ "," ] ;
 param      = IDENT ":" type ;
+tparams    = tparam { sep tparam } [ "," ] ;
+tparam     = param | IDENT ":" "virtual" "Clock" ;             (* a clock on virtual time *)
 struct     = "struct" IDENT [ bgenerics ] "{" [ field { sep field } [ "," ] ] "}" ;
 field      = IDENT ":" type
            | [ IDENT "." ] UPPER [ "[" typearg { "," typearg } "]" ] ;   (* an embedded struct *)

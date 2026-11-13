@@ -1158,7 +1158,8 @@ let lower_program ?(tests = false) (user_items : item list) : I.program * gctx =
     if tests then
       List.filter_map
         (function
-          | IFn ({ fn_test = Some _; fn_bench = false; _ } as d) -> Some (instance g d.fn_name [], List.map field d.fn_params)
+          | IFn ({ fn_test = Some _; fn_bench = false; _ } as d) ->
+            Some (instance g d.fn_name [], List.map field d.fn_params, d.fn_virtual)
           | _ -> None)
         user_items
     else []

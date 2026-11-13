@@ -110,6 +110,7 @@ and fn_decl = {
   fn_body : block;
   fn_test : string option; (* Some name: a `test "name" { ... }` or `bench "name" { ... }` block *)
   fn_bench : bool; (* a `bench` block: run by `vela test --bench`, timed, never as a test *)
+  fn_virtual : bool; (* a test that takes `clock: virtual Clock`: it runs on virtual time *)
   fn_table : (pat * expr) option;
       (* a table test, `for PAT in [case, ...]` (the expression is that list): one isolated run per
          case. Expanded when modules load into one test per case, each keeping its own case here. *)

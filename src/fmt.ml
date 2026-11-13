@@ -692,7 +692,8 @@ let item c (it : item) =
   | IFn ({ fn_test = Some name; _ } as d) ->
     new_line c 0;
     add c ((if d.fn_bench then "bench" else "test") ^ " \"" ^ escape name ^ "\" ");
-    if d.fn_params <> [] then add c ("(" ^ String.concat ", " (List.map (fun p -> p.prm_name ^ ": " ^ ty p.prm_ty) d.fn_params) ^ ") ");
+    let cap p = p.prm_name ^ ": " ^ (if d.fn_virtual && p.prm_ty.tdesc = TyName ("Clock", []) then "virtual " else "") ^ ty p.prm_ty in
+    if d.fn_params <> [] then add c ("(" ^ String.concat ", " (List.map cap d.fn_params) ^ ") ");
     (match d.fn_table with
      | Some (p, cases) ->
        add c ("for " ^ pat p ^ " in ");

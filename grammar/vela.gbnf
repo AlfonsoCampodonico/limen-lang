@@ -35,7 +35,9 @@ interface ::= "interface" sp1 ident sp generics? sp "{" ws (imethod (isep imetho
 imethod  ::= "fn" sp1 ident sp "(" ws "self" (isep param)* (ws ",")? ws ")" (sp "->" sp type)?
 test     ::= "test" sp1 plainstr sp tparams? ("for" sp1 (ident sp1 | upat sp) "in" sp1 "[" ws args ws "]" sp)? block
 bench    ::= "bench" sp1 plainstr sp tparams? block
-tparams  ::= "(" ws (param (isep param)* (ws ",")?)? ws ")" sp
+tparams  ::= "(" ws (tparam (isep tparam)* (ws ",")?)? ws ")" sp
+# `clock: virtual Clock`: a clock on virtual time
+tparam   ::= param | ident sp ":" sp "virtual" sp1 "Clock"
 fn       ::= "fn" sp1 ident sp bgenerics? sp "(" ws (param (isep param)* (ws ",")?)? ws ")" (sp "->" sp type)? sp block
 # C functions from a library: signatures only, one per line, and C structs.
 # `...` makes a function variadic; `= "name"` names the C function.

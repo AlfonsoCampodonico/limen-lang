@@ -1,0 +1,8 @@
+test "times out" (clock: virtual Clock) {
+    clock.sleep(3600000)
+    assert(clock.now_ms() == 1767229200000)
+}
+
+test "with a dir" (fs: Fs, clock: virtual Clock) for n in [1, 2] {
+    clock.sleep(n)
+}
