@@ -1416,6 +1416,10 @@ static int64_t Cap_now_ms(void) { struct timeval tv; gettimeofday(&tv, NULL); re
 #include <sched.h>
 
 typedef struct WFiber WFiber;
+/* A group body under its deadline (`group g until ...`): the deadline stops
+   the body at its next wait, as it does the group's tasks. stop points at
+   the group's cancelled flag. */
+typedef struct WScope { struct WScope *prev; int *stop; struct WGroup *g; } WScope;
 struct WFiber {
   void *sp;
   char *map; size_t map_size;          /* mmap'd stack, NULL for a worker's own context */
@@ -1426,6 +1430,9 @@ struct WFiber {
   int cancelled;                        /* its group cancelled it: stop at the next wait */
   int wlock;                            /* guards wait */
   struct WSel *wait;                    /* the token of the wait it is parked in, if cancellable */
+  WScope *scopes;                       /* deadline scopes it is in, innermost first (under wlock) */
+  const char *in_cb;                    /* in a callback from C: where the callback is declared */
+  struct WCap *cb_foreign;              /* in a foreign call: its Foreign, for callbacks that take one */
 #ifdef W_ASAN
   const void *asan_bottom; size_t asan_size;
 #endif
@@ -1820,7 +1827,20 @@ typedef struct WSel { int done; int fired; } WSel;
    after a cancellation (joining a group being unwound) are not cancellable. */
 static inline void w_flock(WFiber *f) { while (__atomic_exchange_n(&f->wlock, 1, __ATOMIC_ACQUIRE)) sched_yield(); }
 static inline void w_funlock(WFiber *f) { __atomic_store_n(&f->wlock, 0, __ATOMIC_RELEASE); }
-static int w_is_cancelled(void) { WWorker *w = w_self(); return w && w->current && __atomic_load_n(&w->current->cancelled, __ATOMIC_ACQUIRE); }
+/* cancelled as a task, or inside a group body whose deadline passed */
+static int w_scopes_stopped(WScope *sc) {
+  for (; sc; sc = sc->prev) if (__atomic_load_n(sc->stop, __ATOMIC_ACQUIRE)) return 1;
+  return 0;
+}
+static int w_fiber_stopped(WFiber *f) { return __atomic_load_n(&f->cancelled, __ATOMIC_ACQUIRE) || w_scopes_stopped(f->scopes); }
+static int w_is_cancelled(void) {
+  WWorker *w = w_self();
+  if (!w || !w->current) return 0;
+  w_flock(w->current);
+  int r = w_fiber_stopped(w->current);
+  w_funlock(w->current);
+  return r;
+}
 /* Start a wait (like w_prepare_park). Returns 0, without preparing to
    park, if the task is cancelled: the caller undoes what it did, releases
    its locks and calls w_cancel_unwind(). */
@@ -1828,7 +1848,7 @@ static int w_wait_begin(WSel *tok) {
   WFiber *f = w_current();
   tok->done = 0; tok->fired = -1;
   w_flock(f);
-  if (__atomic_load_n(&f->cancelled, __ATOMIC_ACQUIRE)) { w_funlock(f); return 0; }
+  if (w_fiber_stopped(f)) { w_funlock(f); return 0; }
   w_prepare_park();
   f->wait = tok;
   w_funlock(f);
@@ -1836,10 +1856,12 @@ static int w_wait_begin(WSel *tok) {
 }
 /* After waking: the token is no longer the canceller's to claim. */
 static void w_wait_end(void) { WFiber *f = w_current(); w_flock(f); f->wait = NULL; w_funlock(f); }
-static void w_cancel_fiber(WFiber *f) {
+/* Wake f from a cancellable wait, if it is in one: its stop flag (the task's
+   or a scope's) is already set, so it unwinds. */
+static void w_interrupt_fiber(WFiber *f, int task) {
   int wake = 0;
   w_flock(f);
-  __atomic_store_n(&f->cancelled, 1, __ATOMIC_RELEASE);
+  if (task) __atomic_store_n(&f->cancelled, 1, __ATOMIC_RELEASE);
   if (f->wait) {
     int zero = 0;
     if (__atomic_compare_exchange_n(&f->wait->done, &zero, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
@@ -1850,6 +1872,7 @@ static void w_cancel_fiber(WFiber *f) {
   w_funlock(f);
   if (wake) w_wake(f);
 }
+static void w_cancel_fiber(WFiber *f) { w_interrupt_fiber(f, 1); }
 static inline int w_tok_claim(WSel *tok, int idx) {
   int zero = 0;
   if (!__atomic_compare_exchange_n(&tok->done, &zero, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return 0;
@@ -1996,6 +2019,7 @@ struct WGroup {
   WFiber *waiter; WSel *wtok;           /* the task joining it, and its wait token */
   int64_t n, cap; WTask **tasks;        /* in spawn order; grown under mu */
   int cancelled;                        /* its deadline passed: tasks started now never run */
+  WFiber *body;                         /* the fiber running its body under the deadline, if any */
   WTimer deadline;                      /* `group g until clock.after(ms)` (pos -1 when none) */
 };
 
@@ -2021,9 +2045,61 @@ static WGroup *w_group_new_until(int64_t ms) {
 /* Cancel every task still running, and every task started from now on. */
 static void w_group_cancel(WGroup *g) {
   pthread_mutex_lock(&g->mu);
-  g->cancelled = 1;
+  __atomic_store_n(&g->cancelled, 1, __ATOMIC_RELEASE);
   for (int64_t i = 0; i < g->n; i++) if (!g->tasks[i]->done && g->tasks[i]->f) w_cancel_fiber(g->tasks[i]->f);
+  if (g->body) w_interrupt_fiber(g->body, 0);   /* the body stops at its next wait too */
   pthread_mutex_unlock(&g->mu);
+}
+static void w_group_cleanup(WGroup *g);
+static void w_group_release_tasks(WGroup *g);
+/* Enter and leave a group body under its deadline. */
+static void w_scope_push(WScope *sc, WGroup *g) {
+  WFiber *f = w_current();
+  sc->g = g; sc->stop = &g->cancelled;
+  pthread_mutex_lock(&g->mu);
+  g->body = f;
+  pthread_mutex_unlock(&g->mu);
+  w_flock(f);
+  sc->prev = f->scopes; f->scopes = sc;
+  w_funlock(f);
+}
+static void w_scope_pop(WScope *sc) {
+  WFiber *f = w_current();
+  if (f->scopes != sc) return;   /* already left (a stop passed on) */
+  pthread_mutex_lock(&sc->g->mu);
+  sc->g->body = NULL;
+  pthread_mutex_unlock(&sc->g->mu);
+  w_flock(f);
+  f->scopes = sc->prev;
+  w_funlock(f);
+}
+/* The body unwound to its boundary c. Its own deadline stopping it ends the
+   body: groups it started and left are cancelled and joined, what else it
+   made is handed on, and the join goes on. A panic, the task's own
+   cancellation or an outer deadline passes on. */
+static void w_scope_land(WCatch *c, WScope *sc) {
+  WFiber *f = w_current();
+  int mine = c->cancel && __atomic_load_n(sc->stop, __ATOMIC_ACQUIRE) && !__atomic_load_n(&f->cancelled, __ATOMIC_ACQUIRE) && !w_scopes_stopped(sc->prev);
+  if (mine) {
+    for (;;) {
+      WHdr *h = c->objs.next;
+      while (h != &c->objs && h->kind != WK_GROUP) h = h->next;
+      if (h == &c->objs) break;
+      WGroup *g = (WGroup *)(h + 1);
+      w_group_cleanup(g);   /* stopped: cancels its tasks, then waits for them */
+      w_group_release_tasks(g);
+      pthread_mutex_destroy(&g->mu); free(g->tasks); w_free(g);
+    }
+    w_catch_end(c);
+    return;
+  }
+  w_catch_end(c);
+  w_scope_pop(sc);
+  if (c->cancel) w_cancel_unwind();
+  char m[1024], w[512];
+  snprintf(m, sizeof m, "%s", c->msg); snprintf(w, sizeof w, "%s", c->where);
+  free(c->msg); free(c->where);
+  w_panic_c(m, w);
 }
 static void w_task_entry(void *p) {
   WTask *volatile t = (WTask *)p;
@@ -2471,9 +2547,10 @@ static int w_select(WSelOp *ops, int n, int has_default, const char *where) {
   }
   for (int i = 0; i < n; i++) {
     if (!ops[i].on) continue;
-    if (ops[i].send == W_SEL_AFTER) {   /* the checker allows one timeout per select */
+    if (ops[i].send == W_SEL_AFTER) {   /* the earliest timeout wins; on a tie, the first written */
       int64_t ms = ops[i].ms > (int64_t)1000000000000 ? (int64_t)1000000000000 : ops[i].ms;
-      tm.at = start + ms * 1000000; tm.f = me; tm.sel = &sel; tm.idx = i;
+      int64_t at = start + ms * 1000000;
+      if (!tm.f || at < tm.at) { tm.at = at; tm.f = me; tm.sel = &sel; tm.idx = i; }
       continue;
     }
     ws[i].f = me; ws[i].val = ops[i].val; ws[i].ok = 0; ws[i].sel = &sel; ws[i].idx = i;

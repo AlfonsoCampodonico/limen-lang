@@ -85,6 +85,9 @@ type stmt =
          cancellation leaves the protected statements, and those statements.
          Normal exits run the body themselves, after a GuardEnd. *)
   | GuardEnd of int (* leave guard [n] normally: pop its panic boundary *)
+  | Scope of atom * stmt list
+      (* the body of a group with a deadline: the deadline stops it at its
+         next wait, and the code after it (the join) goes on *)
 
 and mutation =
   | MSet of atom

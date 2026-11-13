@@ -3221,7 +3221,94 @@ fn main(root: Root) {
 }
 |} "1999000\n";
   let tchans = "    let c: Chan[Int] = channel(1)\n    let clock = root.clock\n" in
-  errs "select-two-afters" (main_wrap (tchans ^ "    let x = select {\n        v = c.recv() => 1,\n        clock.after(1) => 2,\n        clock.after(2) => 3,\n    }")) [ "E0106" ];
+  let body_src = {|fn main(root: Root) {
+    let clock = root.clock
+    let out = root.stdout
+    let quiet: Chan[Int] = channel(1)
+    let mut seen = "start"
+    let r = group g until clock.after(40) {
+        g.go(|| { clock.sleep(5); 1 })
+        g.go(|| { clock.sleep(5000); 2 })
+        defer { out.print("defer ran") }
+        seen = "body waiting"
+        let v = quiet.recv()
+        seen = "never"
+        g.go(|| 3)
+    }
+    out.print("{seen} {r}")
+    // an inner group the body waits on is cancelled with it
+    let r2 = group g until clock.after(30) {
+        let inner = group h {
+            h.go(|| { clock.sleep(5000); 7 })
+        }
+        g.go(|| 9)
+        ()
+    }
+    out.print("inner {r2}")
+    // a body that finishes in time is not touched
+    let r3 = group g until clock.after(1000) {
+        g.go(|| 4)
+        clock.sleep(5)
+    }
+    out.print("fast {r3}")
+    // nested: the inner deadline stops the inner body only
+    let r4 = group g until clock.after(2000) {
+        let a = group h until clock.after(20) {
+            h.go(|| 5)
+            clock.sleep(5000)
+        }
+        g.go(|| a.len())
+    }
+    out.print("nested {r4}")
+    // a task its group cancels stops inside its own deadline body, and stays stopped
+    let r5 = group g until clock.after(20) {
+        g.go(|| {
+            let inner = group h until clock.after(5000) {
+                h.go(|| 1)
+                clock.sleep(5000)
+            }
+            inner.len()
+        })
+    }
+    out.print("task {r5}")
+    // a panic in a body still ends the program
+    let p = catch(|| {
+        let x = group g until clock.after(1000) {
+            g.go(|| 1)
+            panic("boom")
+        }
+        x.len()
+    })
+    out.print("panic {p}")
+}
+|} in
+  out "group-deadline-stops-body" body_src "defer ran\nbody waiting [Some(1), None]\ninner []\nfast [Some(4)]\nnested [Some(1)]\ntask [None]\npanic Err(\"boom\")\n";
+  check_tsan "group-deadline-stops-body" body_src "defer ran\nbody waiting [Some(1), None]\ninner []\nfast [Some(4)]\nnested [Some(1)]\ntask [None]\npanic Err(\"boom\")\n";
+  out "select-several-afters" {|fn main(root: Root) {
+    let clock = root.clock
+    let quiet: Chan[Int] = channel(1)
+    // the earliest timeout wins, wherever it is written
+    let a = select {
+        v = quiet.recv() => "value",
+        clock.after(5000) => "late",
+        clock.after(20) => "early",
+    }
+    // on a tie the first written wins
+    let b = select {
+        v = quiet.recv() => "value",
+        clock.after(10) => "first",
+        clock.after(10) => "second",
+    }
+    // a guard turns one off
+    let on = false
+    let c = select {
+        v = quiet.recv() => "value",
+        clock.after(1) if on => "off",
+        clock.after(15) => "on",
+    }
+    root.stdout.print("{a} {b} {c}")
+}
+|} "early first on\n";
   errs "select-after-and-default" (main_wrap (tchans ^ "    let x = select {\n        v = c.recv() => 1,\n        clock.after(1) => 2,\n        _ => 3,\n    }")) [ "E0003" ];
   errs "select-after-not-clock" (main_wrap (tchans ^ "    let x = select {\n        v = c.recv() => 1,\n        c.after(1) => 2,\n    }")) [ "E0201" ];
   errs "select-after-ms-type" (main_wrap (tchans ^ "    let x = select {\n        v = c.recv() => 1,\n        clock.after(\"soon\") => 2,\n    }")) [ "E0201" ];
@@ -3288,7 +3375,7 @@ fn main(root: Root) {
         })
     }
     out.print("{z}")
-    // tasks started after the deadline never run
+    // the deadline stops the body at its sleep: the late task is never started
     let late = group g until clock.after(30) {
         g.go(|| 1)
         clock.sleep(100)
@@ -3308,7 +3395,7 @@ fn main(root: Root) {
     })
     out.print("{p}")
 }
-|} "[Some(1), None, None, None, None, None, None, Some(7)]\ntrue\n[None]\n[Some(1), None]\nErr(\"boom\")\n";
+|} "[Some(1), None, None, None, None, None, None, Some(7)]\ntrue\n[None]\n[Some(1)]\nErr(\"boom\")\n";
   par "group-until-stress" {|fn stuck(c: Chan[Int]) -> Int {
     c.recv() ?? -1
 }
@@ -3343,9 +3430,14 @@ fn main(root: Root) {
     let mut k = 0
     while k < 15 {
         let r = group g until clock.after(150) {
+            // the counted tasks go first, before the busy ones slow the body
+            let mut j = 0
+            while j < 10 {
+                g.go(|| 1)
+                j = j + 1
+            }
             let mut i = 0
             while i < 10 {
-                g.go(|| 1)
                 g.go(|| stuck(never))
                 g.go(|| {
                     clock.sleep(5000)

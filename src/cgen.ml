@@ -742,6 +742,8 @@ let set_owned c line (v : I.var) on = if owns_memory c v.ty then line (sprintf "
 let release_moved c line atoms =
   List.iter (function I.V (v : I.var) -> set_owned c line v false | _ -> ()) atoms
 
+let scope_counter = ref 0
+
 let rec stmts c out ind (ss : I.stmt list) = List.iter (stmt c out ind) ss
 
 and stmt c out ind (s : I.stmt) =
@@ -915,6 +917,27 @@ and stmt c out ind (s : I.stmt) =
     line "    w_panic_c(m_, w_);";
     line "  }";
     line "}"
+  | I.Scope (g, body) ->
+    (* A group body under its deadline: the deadline cancels it at its next
+       wait, like a task, and it unwinds to this boundary; then the join
+       after it goes on. A panic, or a cancellation from further out, passes
+       on (w_scope_land). *)
+    incr scope_counter;
+    let s = sprintf "s%d_" !scope_counter in
+    line "{";
+    line (sprintf "  WScope %ssc; w_scope_push(&%ssc, %s);" s s (atom c g));
+    line (sprintf "  WCatch %s;" s);
+    line (sprintf "  w_catch_init(&%s);" s);
+    line (sprintf "  WCatch **%sslot = w_catch_slot();" s);
+    line (sprintf "  if (_setjmp(%s.jb) == 0) {" s);
+    line (sprintf "    WCatch *%sland __attribute__((cleanup(w_catch_land))) = &%s;" s s);
+    line (sprintf "    *%sslot = &%s;" s s);
+    stmts c out (ind ^ "    ") body;
+    line (sprintf "    *%sslot = %s.prev;" s s);
+    line (sprintf "    w_catch_end(&%s);" s);
+    line (sprintf "  } else w_scope_land(&%s, &%ssc);" s s);
+    line (sprintf "  w_scope_pop(&%ssc);" s);
+    line "}"
   | I.GuardEnd n ->
     let g = sprintf "g%d_" n in
     line (sprintf "if (%sslot) *%sslot = %s.prev;" g g g);
@@ -956,6 +979,7 @@ let guard_vols (body : I.stmt list) =
     | I.Guard (_, h, b) ->
       let d1, u1 = scan h and d2, u2 = scan b in
       (S.union d1 d2, S.union u1 u2)
+    | I.Scope (_, b) -> scan b
     | I.Break | I.Continue | I.GuardEnd _ -> (S.empty, S.empty)
   in
   let rec walk acc ss =
@@ -966,6 +990,10 @@ let guard_vols (body : I.stmt list) =
           let _, hu = scan h in
           let bd, bu = scan b in
           walk (walk (S.union acc (S.union hu (S.diff bu bd))) h) b
+        | I.Scope (_, b) ->
+          (* the code after a stopped body reads what the body wrote *)
+          let bd, bu = scan b in
+          walk (S.union acc (S.diff bu bd)) b
         | I.If (_, a, b) -> walk (walk acc a) b
         | I.Loop b -> walk acc b
         | _ -> acc)

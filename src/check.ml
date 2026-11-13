@@ -1793,9 +1793,6 @@ and check_select ctx f arms sp =
   if List.length defaults = List.length arms then
     err ctx "E0003" sp "`select` needs at least one channel arm: `v = ch.recv() => ...` or `ch.send(x) => ...`";
   let afters = List.filter (fun a -> match a.sop with SelAfter _ -> true | _ -> false) arms in
-  (match afters with
-   | _ :: second :: _ -> err ctx "E0106" second.sspan_ "`select` has more than one `clock.after` arm"
-   | _ -> ());
   if afters <> [] && defaults <> [] then
     err ctx "E0003" (List.hd afters).sspan_ "a `select` with a `_` arm never waits, so it cannot also have a `clock.after` timeout";
   let rt = fresh () in

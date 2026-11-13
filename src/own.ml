@@ -12,7 +12,7 @@ open Ir
 module S = Set.Make (Int)
 
 type ann = { s : stmt; out : S.t; sub : sub }
-and sub = NoSub | IfSub of ablock * ablock | LoopSub of ablock | GuardSub of ablock * ablock (* handler, body *)
+and sub = NoSub | IfSub of ablock * ablock | LoopSub of ablock | GuardSub of ablock * ablock (* handler, body *) | ScopeSub of ablock
 and ablock = { stmts : ann list; lin : S.t }
 
 let ids atoms = List.fold_left (fun acc a -> match atom_var a with Some v -> S.add v.id acc | None -> acc) S.empty atoms
@@ -53,6 +53,12 @@ and live_stmt ?(pin = S.empty) s out ~brk ~cont : ann * S.t =
   | Continue -> plain cont
   | Return a -> plain (ids [ a ])
   | Drop _ | GuardEnd _ -> plain out
+  | Scope (g, body) ->
+    (* the deadline can stop the body anywhere; the code after reads only
+       what is live after it, which the body keeps (owned flags tell the
+       frame's cleanups what a stopped body still owned) *)
+    let bb = live_block ~pin body out ~brk ~cont in
+    ({ s; out; sub = ScopeSub bb }, S.union pin (S.union (ids [ g ]) bb.lin))
   | Guard (_, h, b) ->
     (* A panic can leave the body anywhere, and the handler then reads what
        it uses: those variables stay live, so retained and never moved or
@@ -190,6 +196,9 @@ and fwd_stmt (a : ann) owned ~brk ~cont : stmt list * S.t =
   | Loop _, LoopSub b ->
     let body, _ = fwd_block b owned ~brk:a.out ~cont:b.lin in
     ([ Loop body ], S.inter owned a.out)
+  | Scope (g, _), ScopeSub bb ->
+    let sb, ob = fwd_block bb owned ~brk ~cont in
+    ([ Scope (g, sb) ], ob)
   | Guard (n, _, _), GuardSub (hb, bb) ->
     (* the handler owns nothing from outside: its uses retain, and the frame's
        cleanups drop the variables as the panic goes on *)
@@ -214,6 +223,7 @@ let rec collect_vars stmts =
       | If (_, a, b) -> collect_vars a; collect_vars b
       | Loop b -> collect_vars b
       | Guard (_, h, b) -> collect_vars h; collect_vars b
+      | Scope (_, b) -> collect_vars b
       | _ -> ())
     stmts
 

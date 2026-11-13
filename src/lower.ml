@@ -360,7 +360,10 @@ let rec lower f (e : expr) : I.atom =
       emit f (I.Let (g, I.GroupNew dl));
       f.scopes <- Hashtbl.create 8 :: f.scopes;
       bind f name g;
-      ignore (lower_block f b);
+      (if until = None then ignore (lower_block f b)
+       else
+         let body, _, _ = in_block f (fun () -> ignore (lower_block f b)) in
+         emit f (I.Scope (I.V g, body)));
       f.scopes <- List.tl f.scopes;
       tmp f ty (I.GroupJoin (I.V g, ty, until <> None))
 

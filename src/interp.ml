@@ -102,7 +102,9 @@ and claim = { mutable fired : int }
 and waiter = { claim : claim; idx : int; mutable v : value; mutable ok : bool }
 
 (* A task's cancel flag: set by its group's deadline, seen at its next wait. *)
-and task = { mutable cancelled : bool }
+and task = { mutable cancelled : bool; mutable scopes : group list }
+(* scopes: the groups whose bodies it is running under their deadline,
+   innermost first; a passed deadline stops the body at its next wait too *)
 
 (* How a task ended: its value, the panic that ended it, or cancellation. *)
 and outcome = Done of value | Failed of string * Span.t | Stopped
@@ -484,17 +486,19 @@ let io_epoch = ref 0 (* advances after each round of waiting for I/O *)
 let now () = Unix.gettimeofday ()
 
 (* The task running now; main and tests run as tasks nobody cancels. *)
-let current = ref { cancelled = false }
+let current = ref { cancelled = false; scopes = [] }
 
 (* Wait until [cond] holds. A cancelled task stops instead (raising
    Cancelled) unless [cancellable] is false, which is only for joining the
    tasks of a group that is being abandoned. As natively, an operation that
    can go on at once does not look at the cancel flag. *)
+let stopped t = t.cancelled || List.exists (fun g -> g.gcancelled) t.scopes
+
 let wait_until ?io ?at ?(cancellable = true) cond =
   if not (cond ()) then begin
     let t = !current in
-    if cancellable && t.cancelled then raise Cancelled;
-    let c = if cancellable then fun () -> cond () || t.cancelled else cond in
+    if cancellable && stopped t then raise Cancelled;
+    let c = if cancellable then fun () -> cond () || stopped t else cond in
     Effect.perform (Block (c, io, at));
     if cancellable && not (cond ()) then raise Cancelled
   end
@@ -1390,7 +1394,17 @@ let rec eval rt env e : value =
               | _ -> None)
             ops
         in
-        let after = List.find_map (function i, `After ms -> Some (i, start +. (Int64.to_float (min ms 1_000_000_000_000L) /. 1000.)) | _ -> None) ops in
+        (* the earliest timeout wins; on a tie, the first written *)
+        let after =
+          List.fold_left
+            (fun best (i, op) ->
+              match (op, best) with
+              | `After ms, _ ->
+                let at = start +. (Int64.to_float (min ms 1_000_000_000_000L) /. 1000.) in
+                (match best with Some (_, b) when b <= at -> best | _ -> Some (i, at))
+              | _ -> best)
+            None ops
+        in
         wait_claim ?at:(Option.map snd after) cl queued;
         if cl.fired = -1 then cl.fired <- fst (Option.get after); (* the timeout *)
         let i = cl.fired in
@@ -1441,18 +1455,27 @@ let rec eval rt env e : value =
        else begin
          (* the deadline: a coroutine of its own that cancels the tasks when the time comes *)
          let at = now () +. (Int64.to_float (min ms 1_000_000_000_000L) /. 1000.) in
-         spawn_fiber { cancelled = false } (fun () ->
+         spawn_fiber { cancelled = false; scopes = [] } (fun () ->
              wait_until ~at ~cancellable:false (fun () -> !joined || now () >= at);
              if not !joined then cancel_group g)
        end);
     let sc = scope_of name (VGroup g) in
+    let t = !current in
     (try
-       ignore (eval_block rt (sc :: env) b);
+       (match until with
+        | None -> ignore (eval_block rt (sc :: env) b)
+        | Some _ -> (
+          (* the deadline stops the body at its next wait; then the join goes on *)
+          t.scopes <- g :: t.scopes;
+          let leave () = t.scopes <- List.tl t.scopes in
+          try ignore (eval_block rt (sc :: env) b); leave () with
+          | Cancelled when g.gcancelled && (not t.cancelled) && not (List.exists (fun o -> o.gcancelled) (List.tl t.scopes)) -> leave ()
+          | e -> leave (); raise e));
        wait_until (fun () -> group_finished g)
      with e ->
        (* abandoned (a panic, or this task was cancelled): a cancellation
           reaches the group's tasks too; either way wait for them *)
-       if !current.cancelled then cancel_group g;
+       if stopped !current then cancel_group g;
        wait_until ~cancellable:false (fun () -> group_finished g);
        joined := true;
        raise e);
@@ -1859,7 +1882,7 @@ and call_method rt v name args sp =
   | VEnum ("Result", "Err", [ e ]), "map_error", [ f ] -> VEnum ("Result", "Err", [ call f [ e ] ])
   | (VEnum ("Result", _, _) as r), "map_error", [ _ ] -> r
   | VGroup g, (("go" | "#go") as go), [ c ] ->
-    let t = { cancelled = g.gcancelled } in
+    let t = { cancelled = g.gcancelled; scopes = [] } in
     let res = ref (if g.gcancelled then Some Stopped else None) in
     g.tasks <- (t, res) :: g.tasks;
     g.kept <- (go = "go") :: g.kept;
@@ -1988,7 +2011,7 @@ let run ?(before_main = fun () -> ()) ~out ~grants (user_items : item list) : (v
     Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
     let result = ref None in
     try
-      spawn_fiber { cancelled = false } (fun () -> result := Some (call_fn rt d args));
+      spawn_fiber { cancelled = false; scopes = [] } (fun () -> result := Some (call_fn rt d args));
       schedule (fun () -> !result <> None) d.fn_span;
       Queue.clear runq;
       (* a `dyn Error` from main is reported by its message *)
@@ -1996,7 +2019,7 @@ let run ?(before_main = fun () -> ()) ~out ~grants (user_items : item list) : (v
       | ( VEnum ("Result", "Err", [ e ]),
           Some { tdesc = TyName ("Result", [ _; { tdesc = TyName ("dyn", [ { tdesc = TyName ("Error", []); _ } ]); _ } ]); _ } ) ->
         let m = ref None in
-        spawn_fiber { cancelled = false } (fun () -> m := Some (call_method rt e "message" [] d.fn_span));
+        spawn_fiber { cancelled = false; scopes = [] } (fun () -> m := Some (call_method rt e "message" [] d.fn_span));
         schedule (fun () -> !m <> None) d.fn_span;
         Queue.clear runq;
         Ok (VEnum ("Result", "Err", [ Option.get !m ]))
@@ -2055,7 +2078,7 @@ let run_tests_timed ?(select = fun _ -> true) ~out (user_items : item list) :
           | Error e -> Error e
           | Ok () ->
           try
-            spawn_fiber { cancelled = false } (fun () -> ignore (call_fn rt d args); finished := true);
+            spawn_fiber { cancelled = false; scopes = [] } (fun () -> ignore (call_fn rt d args); finished := true);
             schedule (fun () -> !finished) d.fn_span;
             Ok ()
           with
