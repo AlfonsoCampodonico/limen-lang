@@ -6025,6 +6025,165 @@ fn main(root: Root) {
   gtoml (sprintf "git = %S, tag = \"v3\", caps = [\"fs\"]" url);
   grun "git-caps-granted" "v3";
 
+  (* the package index: vela index entry, vela search and vela add, with an
+     index directory and git repositories made here *)
+  let rdir = Filename.concat pdir "registry" in
+  let rpath p = Filename.concat rdir p in
+  List.iter (fun d -> try Unix.mkdir d 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ())
+    (rdir :: List.map rpath [ "index"; "color"; "peek"; "mover"; "cfun"; "app1"; "app2"; "app3"; "app4" ]);
+  let rgit repo args = Sys.command (String.concat " " (List.map Filename.quote ([ "git"; "-C"; rpath repo; "-c"; "user.name=t"; "-c"; "user.email=t@t" ] @ args)) ^ " >/dev/null 2>&1") = 0 in
+  let rput f s = Out_channel.with_open_bin (rpath f) (fun oc -> output_string oc s) in
+  (* run vela in [dir]; returns (exit code, stdout, stderr) *)
+  let rcli dir args =
+    let o = rpath "cli.out" and e = rpath "cli.err" in
+    let code =
+      Sys.command
+        (sprintf "cd %s && %s >%s 2>%s" (Filename.quote dir) (String.concat " " (List.map Filename.quote (vela_exe :: args))) (Filename.quote o) (Filename.quote e))
+    in
+    (code, read_file o, read_file e)
+  in
+  let has s sub = Interp_util.find_sub s sub 0 <> None in
+  let show3 (c, o, e) = sprintf "code %d, out %S, err %S" c o e in
+  (* a package whose current tag goes into the index as `vela index entry` prints it *)
+  let index_entry repo file =
+    let ((c, o, _) as r) = rcli (rpath repo) [ "index"; "entry" ] in
+    if c = 0 then Out_channel.with_open_bin (rpath ("index/" ^ file)) (fun oc -> output_string oc o);
+    r
+  in
+  let url repo = "file://" ^ rpath repo in
+  ok "registry-setup"
+    (rgit "color" [ "init"; "-q" ]
+     && (rput "color/vela.toml" "[package]\nname = \"color\"\ndescription = \"Colors for terminal output\"\n";
+         rput "color/color.vela" "pub fn name() -> Str {\n    \"red\"\n}\n";
+         rgit "color" [ "add"; "." ])
+     && rgit "color" [ "commit"; "-qm"; "one" ] && rgit "color" [ "tag"; "v1.2.0" ]
+     && rgit "color" [ "remote"; "add"; "origin"; url "color" ])
+    "could not create the color repository";
+  (* a package with no tag yet, or with uncommitted changes, has no entry *)
+  rput "color/color.vela" "pub fn name() -> Str {\n    \"red\"\n}\n\npub fn red(out: Stdout, s: Str) {\n    out.print(s)\n}\n";
+  let c, _, e = rcli (rpath "color") [ "index"; "entry" ] in
+  ok "registry-entry-dirty" (c = 1 && has e "uncommitted changes") e;
+  ok "registry-commit" (rgit "color" [ "commit"; "-qam"; "two" ]) "commit";
+  let c, _, e = rcli (rpath "color") [ "index"; "entry" ] in
+  ok "registry-entry-untagged" (c = 1 && has e "has no tag") e;
+  ok "registry-tag" (rgit "color" [ "tag"; "v1.10.0" ]) "tag";
+  let ((c, o, _) as r) = index_entry "color" "color-1.10.0.toml" in
+  ok "registry-entry"
+    (c = 0 && has o "[[package]]\nname = \"color\"\n" && has o (sprintf "git = %S\n" (url "color")) && has o "tag = \"v1.10.0\"\n"
+     && has o "description = \"Colors for terminal output\"\n" && has o "caps = [\"stdout\"]\n" && has o "commit = \"")
+    (show3 r);
+  ok "registry-checkout-old" (rgit "color" [ "checkout"; "-q"; "v1.2.0" ]) "checkout";
+  let ((c, o, _) as r) = index_entry "color" "color-1.2.0.toml" in
+  ok "registry-entry-pure" (c = 0 && has o "tag = \"v1.2.0\"\n" && has o "caps = []\n") (show3 r);
+  (* a package that uses Fs, indexed as pure: the index entry lies *)
+  ok "registry-peek"
+    (rgit "peek" [ "init"; "-q" ]
+     && (rput "peek/peek.vela" "pub fn peek(fs: Fs) -> Bool {\n    fs.exists(\"x\")\n}\n"; rgit "peek" [ "add"; "." ])
+     && rgit "peek" [ "commit"; "-qm"; "one" ] && rgit "peek" [ "tag"; "v1" ])
+    "peek";
+  let c, o, _ = rcli (rpath "peek") [ "index"; "entry" ] in
+  ok "registry-entry-fs" (c = 0 && has o "caps = [\"fs\"]\n" && has o "# no git remote") o;
+  let rev repo r =
+    let f = rpath "rev" in
+    ignore (Sys.command (sprintf "git -C %s rev-parse %s >%s" (Filename.quote (rpath repo)) (Filename.quote r) (Filename.quote f)));
+    String.trim (read_file f)
+  in
+  let entry name repo tag commit desc caps =
+    sprintf "[[package]]\nname = %S\ngit = %S\ntag = %S\ncommit = %S\ndescription = %S\ncaps = [%s]\n" name (url repo) tag commit desc
+      (String.concat ", " (List.map (sprintf "%S") caps))
+  in
+  rput "index/peek.toml" (entry "peek" "peek" "v1" (rev "peek" "v1") "Looks for a file" []);
+  (* a package whose tag moves after it is indexed *)
+  ok "registry-mover"
+    (rgit "mover" [ "init"; "-q" ]
+     && (rput "mover/mover.vela" "pub fn hi() -> Str {\n    \"one\"\n}\n"; rgit "mover" [ "add"; "." ])
+     && rgit "mover" [ "commit"; "-qm"; "one" ] && rgit "mover" [ "tag"; "v1" ])
+    "mover";
+  rput "index/mover.toml" (entry "mover" "mover" "v1" (rev "mover" "v1") "Says hi" []);
+  ok "registry-mover-moved"
+    ((rput "mover/mover.vela" "pub fn hi() -> Str {\n    \"two\"\n}\n"; rgit "mover" [ "commit"; "-qam"; "two" ]) && rgit "mover" [ "tag"; "-f"; "v1" ])
+    "move the tag";
+  (* a package that calls C *)
+  ok "registry-cfun"
+    (rgit "cfun" [ "init"; "-q" ]
+     && (rput "cfun/cfun.vela" "foreign \"c\" {\n    fn getpid() -> Int32\n}\n\npub fn pid(f: Foreign) -> Int {\n    getpid(f)\n}\n";
+         rgit "cfun" [ "add"; "." ])
+     && rgit "cfun" [ "commit"; "-qm"; "one" ] && rgit "cfun" [ "tag"; "v0.1.0" ])
+    "cfun";
+  let c, o, e = rcli (rpath "cfun") [ "index"; "entry" ] in
+  ok "registry-entry-foreign" (c = 0 && has o "caps = [\"foreign\"]\n") (o ^ e);
+  rput "index/cfun.toml" (entry "cfun" "cfun" "v0.1.0" (rev "cfun" "v0.1.0") "The process id, from C" [ "foreign" ]);
+
+  (* no index, an unreachable one, a malformed one *)
+  Unix.putenv "VELA_INDEX" "";
+  let c, _, e = rcli rdir [ "search"; "color" ] in
+  ok "registry-no-index" (c = 1 && has e "no package index is set" && has e "VELA_INDEX") e;
+  Unix.putenv "VELA_INDEX" ("file://" ^ rpath "nowhere");
+  let c, _, e = rcli rdir [ "search"; "color" ] in
+  ok "registry-unreachable" (c = 1 && has e "cannot reach the package index") e;
+  rput "bad.toml" "[[package]]\nname = \"x\"\ngit = \"ftp://x\"\ntag = \"v1\"\ncommit = \"abcdef0\"\n";
+  Unix.putenv "VELA_INDEX" (rpath "bad.toml");
+  let c, _, e = rcli rdir [ "search" ] in
+  ok "registry-bad-index" (c = 1 && has e "bad.toml:3: `git` must be") e;
+
+  (* search: every word in the name or description; the latest version by number *)
+  Unix.putenv "VELA_INDEX" (rpath "index");
+  let ((c, o, _) as r) = rcli rdir [ "search"; "terminal"; "COLORS" ] in
+  ok "registry-search"
+    (c = 0 && has o "color v1.10.0: Colors for terminal output\n  caps: stdout\n  older: v1.2.0\n" && not (has o "peek"))
+    (show3 r);
+  let c, o, _ = rcli rdir [ "search" ] in
+  ok "registry-search-all" (c = 0 && has o "peek v1: Looks for a file\n  caps: none (pure)\n" && has o "cfun v0.1.0" && has o "it calls C") o;
+  let c, o, _ = rcli rdir [ "search"; "nothing-like-this" ] in
+  ok "registry-search-none" (c = 0 && has o "no package matches") o;
+  (* the index as a git repository *)
+  ok "registry-index-git" (rgit "index" [ "init"; "-q" ] && rgit "index" [ "add"; "." ] && rgit "index" [ "commit"; "-qm"; "index" ]) "index repo";
+  Unix.putenv "VELA_INDEX" (url "index");
+  let c, o, e = rcli rdir [ "search"; "color" ] in
+  ok "registry-search-git" (c = 0 && has o "color v1.10.0") (o ^ e);
+  Unix.putenv "VELA_INDEX" (rpath "index");
+
+  (* add: the latest version, with the caps the index lists; then it builds and runs *)
+  let app_src = "use color\n\nfn main(root: Root) {\n    color.red(root.stdout, color.name())\n}\n" in
+  rput "app1/main.vela" app_src;
+  rput "app1/vela.toml" "[package]\nname = \"app\"\n\n[dependencies]\n\n[grants]\nenv = [\"HOME\"]\n";
+  let ((c, o, _) as r) = rcli (rpath "app1") [ "add"; "color" ] in
+  ok "registry-add" (c = 0 && has o "added color v1.10.0" && has o "color may use: stdout\n") (show3 r);
+  let toml = read_file (rpath "app1/vela.toml") in
+  ok "registry-add-toml"
+    (toml = sprintf "[package]\nname = \"app\"\n\n[dependencies]\ncolor = { git = %S, tag = \"v1.10.0\", caps = [\"stdout\"] }\n\n[grants]\nenv = [\"HOME\"]\n" (url "color"))
+    toml;
+  ok "registry-add-lock" (has (read_file (rpath "app1/vela.lock")) (sprintf "color %s tag:v1.10.0 %s blake2b:" (url "color") (rev "color" "v1.10.0"))) (read_file (rpath "app1/vela.lock"));
+  let c, o, e = rcli (rpath "app1") [ "run"; "main.vela" ] in
+  ok "registry-add-run" (c = 0 && o = "red\n") (show3 (c, o, e));
+  let c, _, e = rcli (rpath "app1") [ "add"; "color" ] in
+  ok "registry-add-twice" (c = 1 && has e "already a dependency") e;
+  (* a chosen version, with or without its `v`; a new vela.toml when there is none *)
+  let c, o, _ = rcli (rpath "app2") [ "add"; "color@1.2.0" ] in
+  ok "registry-add-version"
+    (c = 0 && has o "color may use no capabilities: it is pure"
+     && read_file (rpath "app2/vela.toml") = sprintf "[dependencies]\ncolor = { git = %S, tag = \"v1.2.0\", caps = [] }\n" (url "color"))
+    (o ^ read_file (rpath "app2/vela.toml"));
+  let c, _, e = rcli (rpath "app3") [ "add"; "color@v9" ] in
+  ok "registry-add-no-version" (c = 1 && has e "no version v9 of `color`; it has v1.10.0, v1.2.0") e;
+  let c, _, e = rcli (rpath "app3") [ "add"; "nosuch" ] in
+  ok "registry-add-unknown" (c = 1 && has e "no package named `nosuch`") e;
+  (* refused: the code uses more than the index lists, or the tag moved *)
+  let c, _, e = rcli (rpath "app3") [ "add"; "peek" ] in
+  ok "registry-add-caps-mismatch" (c = 1 && has e "`peek` v1 uses fs, which the index does not list (it lists none)" && not (Sys.file_exists (rpath "app3/vela.toml"))) e;
+  let c, _, e = rcli (rpath "app3") [ "add"; "mover" ] in
+  ok "registry-add-moved-tag" (c = 1 && has e "tag v1 of" && has e "was moved after the package was indexed" && not (Sys.file_exists (rpath "app3/vela.toml"))) e;
+  (* a package that calls C is added without trust; the program builds once the user trusts it *)
+  rput "app4/main.vela" "use cfun\n\nfn main(root: Root) {\n    root.stdout.print(\"{cfun.pid(root.foreign) > 0}\")\n}\n";
+  let ((c, o, _) as r) = rcli (rpath "app4") [ "add"; "cfun" ] in
+  ok "registry-add-foreign" (c = 0 && has o "cfun calls C (c)" && has o "[trust]\nforeign = [\"cfun\"]" && not (has (read_file (rpath "app4/vela.toml")) "[trust]")) (show3 r);
+  let c, _, e = rcli (rpath "app4") [ "check"; "main.vela" ] in
+  ok "registry-add-foreign-untrusted" (c = 1 && has e "E0320") e;
+  rput "app4/vela.toml" (read_file (rpath "app4/vela.toml") ^ "\n[trust]\nforeign = [\"cfun\"]\n");
+  let c, o, e = rcli (rpath "app4") [ "check"; "main.vela" ] in
+  ok "registry-add-foreign-trusted" (c = 0 && has o "ok") (o ^ e);
+  Unix.putenv "VELA_INDEX" "";
+
   (* the standard library declares its capabilities in src/std/vela.toml and is checked against it *)
   let manifest = Lazy.force Package.std_manifest in
   let listed = List.sort compare (List.map (fun (d : Package.dep) -> d.dname) manifest.deps) in

@@ -1422,6 +1422,7 @@ tuplepat   = "(" pattern "," pattern { "," pattern } ")" ;
 - `vela fmt FILE` prints the canonical formatting (`--write` rewrites, `--check` verifies).
 - `vela lsp` is a language server (diagnostics, hover, definition, references, rename, completion, quick fixes, outline); `vela mcp` is an MCP server exposing check, run, test, format, caps, type-at, references, rename and the spec to coding agents. Rename is refused when it is unsafe: the renamed program must check with no new errors, and the new name must refer to exactly the renamed places.
 - `vela caps FILE` lists each function's authority; `vela explain CODE` explains an error.
+- `vela search`, `vela add` and `vela index entry` use the package index (section 18).
 - `vela doc FILE|MODULE... [--std] [--all] [--html] [-o OUT]` prints documentation built from doc comments (section 2) and signatures, as Markdown, or with `--html` as one static page. An argument that is not a file names a standard library module; `--std` documents all of them. It lists `pub` items (everything with `--all`); methods appear under their type, and methods on a type the module does not declare (such as `Str`) get their own section. Files are parsed, not type-checked.
 
 ```vela
@@ -1486,7 +1487,7 @@ yaml = { git = "git@example.com:me/yaml.git", commit = "3f9c2e1d7a" }
 - `caps` lists what the dependency may use: `net` (Net and Conn), `listen` (Listen, Listener and Conn), `fs`, `stdout`, `stdin`, `clock`, `rand`, `env`, `exec`. The default is none. No dependency can take `Root`, and `caps` cannot give `foreign` (E0321).
 - `[trust] foreign = ["name", ...]` names the dependencies that may call C: declare foreign blocks and take `Foreign`. Calling C is full trust, since C code is outside every capability check, so it is a separate, explicit list rather than one more cap, and only the program's vela.toml can hold it. An untrusted dependency that calls C is E0320. vela.lock gets a line per trusted dependency that calls C, `foreign NAME LIB,LIB`, written on the first build; when an update makes the dependency declare a library the line does not have, the build stops (E0324) until you review it and delete the line.
 - Vela has no ambient authority, so a function can only use a capability that reaches it as a parameter. The checker therefore knows everything a dependency can ever do from its signatures, and rejects the program (E0320) if a dependency's function takes a capability it was not granted. Granting is still only an upper bound: at run time the dependency gets exactly the capabilities you pass it, which can be narrowed with `only` and `under`.
-- A dependency is a local directory (`path`) or a git repository (`git`) at a `tag` or a `commit` (lowercase hex, at least 7 characters). The URL is `https://`, `http://`, `ssh://`, `git://`, `file://` or `user@host:path`. There is no central registry: the URL is the name of the source.
+- A dependency is a local directory (`path`) or a git repository (`git`) at a `tag` or a `commit` (lowercase hex, at least 7 characters). The URL is `https://`, `http://`, `ssh://`, `git://`, `file://` or `user@host:path`. No registry holds the code: the URL is the name of the source, and the package index (below) only points at URLs.
 - A git dependency is fetched with the `git` command into a cache, one directory per commit: `$VELA_CACHE`, else `$XDG_CACHE_HOME/vela`, else `~/.cache/vela`. Fetching needs no grant because it happens in the compiler, before the program exists; `vela lsp` and `vela mcp` never fetch, and report a dependency that is not cached yet (E0322).
 - `vela.lock`, next to vela.toml, is written on the first build and should be committed. It holds one line per git dependency: name, URL, `tag:NAME` or `commit:HASH` as written in vela.toml, the full commit, and a BLAKE2b hash of the dependency's files:
 
@@ -1496,6 +1497,26 @@ yaml = { git = "git@example.com:me/yaml.git", commit = "3f9c2e1d7a" }
 
   Every build uses the locked commit, even if the tag has moved since, and checks the cached files against the hash (E0323). To update a dependency, change its `tag` or `commit`, or delete its line; vela fetches it and rewrites the line.
 - Each dependency must be listed in the program's vela.toml, including dependencies of dependencies: a dependency's own vela.toml is not read.
+
+### The package index
+
+A package index is a list of packages to search and add, not a place that stores them: each entry names a git repository and a tag, with the capabilities the package needs. There is no service and no account. The index is a git repository (or a local directory) of `.toml` files, one `[[package]]` table per version:
+
+```
+[[package]]
+name = "color"
+git = "https://example.com/color.git"
+tag = "v1.2.0"
+commit = "8d022128f5f177019f1e6aed46f75c93c90815f1"
+description = "Colors for terminal output"
+caps = ["stdout"]
+```
+
+- `commit` is the commit the tag pointed at when the entry was written. `caps` are written as in vela.toml, plus `foreign` for a package that calls C. `description` and `caps` may be left out (no description, no capabilities).
+- `VELA_INDEX` names the index: a git URL (cloned each time it is used), a directory (every `.toml` file at its top) or one file. It has no default; without it, the commands below say how to set it. An index that cannot be reached is an error, never an empty result.
+- `vela search [WORDS...]` lists the packages whose name or description contains every word (ignoring case), each with its description, its latest version and its capabilities. Versions compare as numbers: a leading `v` is dropped, so `v1.10.0` is newer than `v1.2.0`.
+- `vela add NAME[@VERSION]` adds the latest version, or the one named (`color@1.2.0` or `color@v1.2.0`), to the nearest vela.toml (a new one in the current directory if there is none) as `NAME = { git = "URL", tag = "TAG", caps = [...] }`, with `caps` exactly what the index lists, and prints those capabilities: they are what you are granting. Before writing anything it fetches the tag and refuses when the tag no longer points at the indexed commit (it was moved), or when the package's code takes a capability the index does not list (the same check as E0320, with `caps` set to the index's list). It writes the checked commit to vela.lock. It never grants `foreign`: for a package that calls C it says so, and the program does not build until you add `[trust] foreign = ["NAME"]` yourself.
+- `vela index entry [DIR]`, run at the top of a package's git repository, prints the entry for the tag on the current commit: the name (vela.toml's `[package] name`, else the directory's), the URL of the `origin` remote, the tag and commit, vela.toml's `[package] description`, and the capabilities its functions take, computed from the code. It refuses uncommitted changes and an untagged commit. Publishing a version is adding that entry to the index, for example in a pull request.
 
 ## 19. Standard library
 
@@ -1721,4 +1742,4 @@ fn main(root: Root) -> Result[(), IoError] {
 
 ## 20. Not yet
 
-A package registry and a Cranelift backend. Foreign functions have no callbacks from C, no variadic functions and no structs by value. See the design doc's Known gaps for the full list.
+A Cranelift backend. Foreign functions have no callbacks from C, no variadic functions and no structs by value. See the design doc's Known gaps for the full list.

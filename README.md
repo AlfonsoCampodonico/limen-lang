@@ -90,6 +90,9 @@ To write your own: `vela check` gives errors with fixes, `vela explain E0302` ex
 | `vela lsp` | Language server on stdin/stdout. |
 | `vela mcp` | MCP server for coding agents on stdin/stdout. |
 | `vela spec` | Print the language specification. |
+| `vela search [WORDS...]` | Search the package index named by `VELA_INDEX`: each matching package's description, latest version and capabilities. |
+| `vela add NAME[@VERSION]` | Add a package from the index to vela.toml as a git dependency, with `caps` set to what the index lists; refuses a moved tag or code that takes more. |
+| `vela index entry [DIR]` | Print the index entry for the package's current tag, with the capabilities computed from its code. |
 
 ## Tooling for editors and models
 
@@ -162,7 +165,9 @@ fetch = { path = "../fetch", caps = ["net"] }
 color = { git = "https://example.com/color.git", tag = "v1.2.0" }
 ```
 
-Git dependencies are fetched with `git` into a local cache (`~/.cache/vela`, or `$VELA_CACHE`). `vela.lock` records the exact commit and a hash of the files of each one, and every build checks the cache against it, so a moved tag or a changed copy cannot slip in. There is no central registry.
+Git dependencies are fetched with `git` into a local cache (`~/.cache/vela`, or `$VELA_CACHE`). `vela.lock` records the exact commit and a hash of the files of each one, and every build checks the cache against it, so a moved tag or a changed copy cannot slip in.
+
+A package index, named by `VELA_INDEX` (a git URL or a directory; there is no default), lists packages by git URL and tag with the capabilities each needs, and hosts nothing. `vela search WORDS` finds packages; `vela add NAME[@VERSION]` writes the dependency into vela.toml with `caps` set to what the index lists, prints them, and refuses if the tag moved since it was indexed or the code takes more than the index says. It never grants `foreign`: a package that calls C needs your own `[trust]` line. `vela index entry`, run in a package's repository, prints the entry for its current tag, capabilities computed from the code; publishing is adding that entry to the index. SPEC.md section 18 has the format.
 
 Since capabilities only arrive as parameters, a dependency's signatures are a complete list of what it can do. If one asks for a capability it was not granted, the program does not compile (E0320).
 
