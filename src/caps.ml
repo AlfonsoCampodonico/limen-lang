@@ -30,7 +30,22 @@ let parse_url u : (url, string) result =
         String.iteri (fun j c -> if (c = '/' || c = '?' || c = '#') && j < !stop then stop := j) rest;
         let auth = String.sub rest 0 !stop in
         let host_ok c = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c = '.' || c = '-' in
+        let v6 = String.length auth > 0 && auth.[0] = '[' in
         let host, port =
+          if v6 then
+            match String.index_opt auth ']' with
+            | Some k when k > 1 && (match Unix.inet_addr_of_string (String.sub auth 1 (k - 1)) with
+                                    | a -> Unix.domain_of_sockaddr (Unix.ADDR_INET (a, 0)) = Unix.PF_INET6
+                                    | exception Failure _ -> false) ->
+              let h = String.sub auth 0 (k + 1) and tail = String.sub auth (k + 1) (String.length auth - k - 1) in
+              if tail = "" then (h, Some (if scheme = "https" then 443 else 80))
+              else if tail.[0] = ':' then
+                let p = String.sub tail 1 (String.length tail - 1) in
+                let digits = p <> "" && String.length p <= 5 && String.for_all (fun c -> c >= '0' && c <= '9') p in
+                (h, if digits then match int_of_string_opt p with Some n when n >= 1 && n <= 65535 -> Some n | _ -> None else None)
+              else ("", None)
+            | _ -> ("", None)
+          else
           match String.split_on_char ':' auth with
           | [ h ] -> (h, Some (if scheme = "https" then 443 else 80))
           | [ h; p ] ->
@@ -43,7 +58,8 @@ let parse_url u : (url, string) result =
           let p = match String.index_opt p '#' with Some k -> String.sub p 0 k | None -> p in
           if p = "" then "/" else if p.[0] = '?' then "/" ^ p else p
         in
-        if String.contains auth '@' || not (String.for_all (fun c -> host_ok c || c = ':') auth) then
+        if v6 && host = "" then Error "malformed IPv6 address in URL"
+        else if (not v6) && (String.contains auth '@' || not (String.for_all (fun c -> host_ok c || c = ':') auth)) then
           Error "URL host may only contain letters, digits, `.` and `-`"
         else if host = "" then Error "URL has no host"
         else

@@ -1157,7 +1157,18 @@ static int parse_url(const char *u, char *host, size_t hn, int *port, int *is_ht
   const char *auth = c + 3;
   size_t alen = strcspn(auth, "/?#");
   const char *colon = NULL;
-  for (size_t i = 0; i < alen; i++) {
+  size_t from = 0;
+  if (alen > 0 && auth[0] == '[') {   /* [ipv6], kept with its brackets */
+    const char *rb = memchr(auth, ']', alen);
+    char inner[64]; struct in6_addr probe;
+    size_t il = rb ? (size_t)(rb - auth - 1) : 0;
+    if (!rb || il == 0 || il >= sizeof inner) { snprintf(err, en, "malformed IPv6 address in URL"); return 0; }
+    memcpy(inner, auth + 1, il); inner[il] = 0;
+    if (inet_pton(AF_INET6, inner, &probe) != 1) { snprintf(err, en, "malformed IPv6 address in URL"); return 0; }
+    from = il + 2;
+    if (from < alen && auth[from] != ':') { snprintf(err, en, "malformed host in URL"); return 0; }
+  }
+  for (size_t i = from; i < alen; i++) {
     char ch = auth[i];
     if (ch == ':') { if (colon) { snprintf(err, en, "malformed host in URL"); return 0; } colon = auth + i; }
     else if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '.' || ch == '-')) {
@@ -2808,6 +2819,89 @@ static int w_resolve(const char *h, struct in_addr *out) {
   freeaddrinfo(res);
   return 1;
 }
+/* Name lookups for outgoing connections, IPv4 and IPv6. getaddrinfo
+   blocks, so a lookup runs on a thread of its own and the task parks on a
+   pipe the thread writes to when it is done. A cancelled task leaves at
+   once; the thread then frees everything itself when the lookup returns. */
+typedef struct {
+  char host[256]; struct addrinfo *res; int rc; int fds[2];
+  int state;   /* 0 looking up, 1 done, 2 abandoned by its task */
+  pthread_mutex_t mu;
+} WDns;
+static void *w_dns_thread(void *p) {
+  WDns *d = (WDns *)p;
+  struct addrinfo hints; memset(&hints, 0, sizeof hints);
+  hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM; hints.ai_flags = AI_ADDRCONFIG;
+  d->rc = getaddrinfo(d->host, NULL, &hints, &d->res);
+  pthread_mutex_lock(&d->mu);
+  if (d->state == 2) {
+    pthread_mutex_unlock(&d->mu);
+    if (d->rc == 0 && d->res) freeaddrinfo(d->res);
+    close(d->fds[1]); pthread_mutex_destroy(&d->mu); free(d);
+    return NULL;
+  }
+  d->state = 1;
+  pthread_mutex_unlock(&d->mu);
+  ssize_t k; do k = write(d->fds[1], "x", 1); while (k < 0 && errno == EINTR);
+  return NULL;
+}
+/* The addresses for host (a name, an IPv4 address or a bracketed IPv6
+   one) and port, in the order to try them; NULL with a message in err if
+   there are none. A cancelled task unwinds. Free with freeaddrinfo. */
+static struct addrinfo *w_lookup(const char *h, int port, char *err, size_t en) {
+  char hb[256];
+  snprintf(hb, sizeof hb, "%s", strcmp(h, "localhost") == 0 ? "127.0.0.1" : h);
+  if (hb[0] == '[') { size_t l = strlen(hb); memmove(hb, hb + 1, l); hb[l - 2] = 0; }
+  char ps[8]; snprintf(ps, sizeof ps, "%d", port);
+  struct addrinfo hints, *res = NULL;
+  memset(&hints, 0, sizeof hints);
+  hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM; hints.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV;
+  if (getaddrinfo(hb, ps, &hints, &res) == 0 && res) return res;   /* an address: no lookup */
+  WDns *d = (WDns *)calloc(1, sizeof(WDns));
+  if (!d) w_oom();
+  snprintf(d->host, sizeof d->host, "%s", hb);
+  pthread_mutex_init(&d->mu, NULL);
+  if (pipe(d->fds) != 0) { snprintf(err, en, "cannot resolve %s: %s", h, strerror(errno)); pthread_mutex_destroy(&d->mu); free(d); return NULL; }
+  w_nonblock(d->fds[0]);
+  pthread_t th; pthread_attr_t at;
+  pthread_attr_init(&at); pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+  if (pthread_create(&th, &at, w_dns_thread, d) != 0) {
+    pthread_attr_destroy(&at);
+    close(d->fds[0]); close(d->fds[1]); pthread_mutex_destroy(&d->mu); free(d);
+    snprintf(err, en, "cannot resolve %s: no thread for the lookup", h); return NULL;
+  }
+  pthread_attr_destroy(&at);
+  for (;;) {
+    char b;
+    ssize_t k = read(d->fds[0], &b, 1);
+    if (k == 1) break;
+    if (k < 0 && errno == EINTR) continue;
+    int wr = w_wait_fd(d->fds[0], 0);
+    if (wr == -2 || wr == -1) {
+      pthread_mutex_lock(&d->mu);
+      int done = d->state == 1;
+      if (!done) d->state = 2;
+      pthread_mutex_unlock(&d->mu);
+      w_sock_release_fd(d->fds[0]);
+      if (done) {
+        if (d->rc == 0 && d->res) freeaddrinfo(d->res);
+        close(d->fds[1]); pthread_mutex_destroy(&d->mu); free(d);
+      }
+      if (wr == -2) w_cancel_unwind();
+      snprintf(err, en, "cannot resolve %s: cannot wait for the lookup", h); return NULL;
+    }
+  }
+  w_sock_release_fd(d->fds[0]); close(d->fds[1]);
+  int rc = d->rc; res = d->res;
+  pthread_mutex_destroy(&d->mu); free(d);
+  if (rc != 0 || !res) { snprintf(err, en, "cannot resolve %s", h); return NULL; }
+  /* port into every address */
+  for (struct addrinfo *a = res; a; a = a->ai_next) {
+    if (a->ai_family == AF_INET) ((struct sockaddr_in *)a->ai_addr)->sin_port = htons((uint16_t)port);
+    else if (a->ai_family == AF_INET6) ((struct sockaddr_in6 *)a->ai_addr)->sin6_port = htons((uint16_t)port);
+  }
+  return res;
+}
 static WIo w_errno_io(void) { return io_err(2, strerror(errno)); }
 
 static WIo Cap_listen_on(WCap *l, WStr *addr) {
@@ -2897,30 +2991,43 @@ static WIo Cap_accept(WCap *l) {
   if (cancelled) w_cancel_unwind();
   return r;
 }
+/* One connection attempt: the connected fd, -1 with err set, or it unwinds
+   if the task is cancelled. */
+static int w_connect_one(struct addrinfo *a, char *err, size_t en) {
+  int fd = socket(a->ai_family, SOCK_STREAM, 0);
+  if (fd < 0) { snprintf(err, en, "%s", strerror(errno)); return -1; }
+  w_nonblock(fd);
+  if (connect(fd, a->ai_addr, a->ai_addrlen) == 0) return fd;
+  if (errno != EINPROGRESS) { snprintf(err, en, "%s", strerror(errno)); close(fd); return -1; }
+  for (;;) {
+    int wr = w_wait_fd(fd, 1);
+    if (wr == -2) { w_sock_release_fd(fd); return -2; }
+    if (wr < 0) { w_sock_release_fd(fd); snprintf(err, en, "cannot wait on socket"); return -1; }
+    int e = 0; socklen_t el = sizeof e;
+    getsockopt(fd, SOL_SOCKET, SO_ERROR, &e, &el);
+    if (e) { w_sock_release_fd(fd); snprintf(err, en, "%s", strerror(e)); return -1; }
+    struct sockaddr_storage peer; socklen_t pl = sizeof peer;
+    if (getpeername(fd, (struct sockaddr *)&peer, &pl) == 0) return fd;   /* connected */
+    if (errno != ENOTCONN) { snprintf(err, en, "%s", strerror(errno)); w_sock_release_fd(fd); return -1; }
+  }
+}
 static WIo Cap_net_connect(WCap *n, WStr *addr) {
   char h[256]; int port;
   if (!w_parse_addr(addr, h, sizeof h, &port)) return io_err(2, "address must be HOST:PORT");
   if (!net_permits(n, h, port)) { char m[400]; snprintf(m, sizeof m, "net: %s:%d is not granted", h, port); return io_err(1, m); }
-  struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
-  sa.sin_family = AF_INET; sa.sin_port = htons((uint16_t)port);
-  if (!w_resolve(h, &sa.sin_addr)) { char m[400]; snprintf(m, sizeof m, "cannot resolve %s", h); return io_err(2, m); }
-  int fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (fd < 0) return w_errno_io();
-  w_nonblock(fd);
-  if (connect(fd, (struct sockaddr *)&sa, sizeof sa) < 0) {
-    if (errno != EINPROGRESS) { WIo r = w_errno_io(); close(fd); return r; }
-    for (;;) {
-      int wr = w_wait_fd(fd, 1);
-      if (wr == -2) { w_sock_release_fd(fd); w_cancel_unwind(); }
-      if (wr < 0) { w_sock_release_fd(fd); return io_err(2, "cannot wait on socket"); }
-      int err = 0; socklen_t el = sizeof err;
-      getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el);
-      if (err) { w_sock_release_fd(fd); return io_err(2, strerror(err)); }
-      struct sockaddr_in peer; socklen_t pl = sizeof peer;
-      if (getpeername(fd, (struct sockaddr *)&peer, &pl) == 0) break;   /* connected */
-      if (errno != ENOTCONN) { WIo r = w_errno_io(); w_sock_release_fd(fd); return r; }
-    }
+  char err[400];
+  struct addrinfo *res = w_lookup(h, port, err, sizeof err);
+  if (!res) return io_err(2, err);
+  /* each address in turn, as the resolver ordered them (IPv6 first where
+     the host has a route for it); the last failure is the error */
+  int fd = -1;
+  for (struct addrinfo *a = res; a && fd < 0; a = a->ai_next) {
+    if (a->ai_family != AF_INET && a->ai_family != AF_INET6) continue;
+    fd = w_connect_one(a, err, sizeof err);
+    if (fd == -2) { freeaddrinfo(res); w_cancel_unwind(); }
   }
+  freeaddrinfo(res);
+  if (fd < 0) return io_err(2, err);
   WCap *c = cap_new(CAP_CONN);
   c->fd = fd;
   return io_ok_ptr(c);
@@ -3044,6 +3151,7 @@ static WIo Cap_net_connect_tls(WCap *n, WStr *addr) {
   if (r.kind != 0) return r;
   WCap *c = (WCap *)r.ptr;
   char err[300];
+  if (h[0] == '[') { size_t l = strlen(h); memmove(h, h + 1, l); h[l - 2] = 0; }
   VTls *t = vtls_client(c->fd, h, err, sizeof err);
   if (!t) { Cap_sock_close(c); Cap_drop(c); return io_err(2, err); }
   c->tls = t;

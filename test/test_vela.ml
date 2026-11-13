@@ -3523,6 +3523,97 @@ UTC: 2026-07-01T12:00:00.000+00:00 UTC false | 2026-01-15T12:00:00.000+00:00 UTC
 Err(Failed(\"time: `../etc/passwd` is not a zone name\"))\n\
 true\n\
 Err(\"time: `x` is not a TZif zone file\")\n";
+  par "time-within" ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] } {|use time
+
+fn main(root: Root) -> Result[(), IoError] {
+    let out = root.stdout
+    let clock = root.clock
+    let net = root.net
+    let l = root.listen.on("127.0.0.1:0")?
+    let port = l.port()
+    // the server accepts and never answers, so the read waits until the deadline
+    let r = group g {
+        g.go(|| match l.accept() {
+            Ok(c) => {
+                clock.sleep(1000)
+                c.close()
+            },
+            Err(_) => (),
+        })
+        g.go(|| {
+            let start = clock.now_ms()
+            let got = time.within(clock, 100, || net.get("http://127.0.0.1:{port}/").map(|r| r.status))
+            let took = clock.now_ms() - start
+            out.print("{got} {took >= 100 && took < 900}")
+        })
+    }
+    out.print("{time.within(clock, 1000, || Ok(7))}")
+    out.print("{time.within(clock, 1000, || Err(Failed("no")))}")
+    let late: Result[Int, IoError] = time.within(clock, 0, || Ok(1))
+    out.print("{late}")
+    Ok(())
+}
+|} "Err(Failed(\"timed out after 100 ms\")) true\nOk(7)\nErr(Failed(\"no\"))\nErr(Failed(\"timed out after 0 ms\"))\n";
+  par "net-ipv6" ~grants:{ Interp.no_grants with listen = [ "[::1]:0"; "127.0.0.1:0" ]; net = [ "[::1]"; "localhost" ] } {|fn main(root: Root) -> Result[(), IoError] {
+    let out = root.stdout
+    let net = root.net
+    let l = root.listen.on("[::1]:0")?
+    let port = l.port()
+    let r = group g {
+        g.go(|| {
+            let mut n = 0
+            while n < 2 {
+                match l.accept() {
+                    Ok(c) => {
+                        let _ = c.read()
+                        let _ = c.write("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                        c.close()
+                    },
+                    Err(_) => (),
+                }
+                n = n + 1
+            }
+        })
+        g.go(|| match net.get("http://[::1]:{port}/x") {
+            Ok(r) => r.status,
+            Err(e) => {
+                out.print("{e}")
+                0
+            },
+        })
+        g.go(|| match net.connect("[::1]:{port}") {
+            Ok(c) => {
+                let _ = c.write("GET / HTTP/1.1\r\n\r\n")
+                let _ = c.read()
+                1
+            },
+            Err(e) => {
+                out.print("{e}")
+                0
+            },
+        })
+    }
+    out.print("{r}")
+    // a name that resolves to IPv4
+    let v4 = root.listen.on("127.0.0.1:0")?
+    let p4 = v4.port()
+    let both = group g {
+        g.go(|| match v4.accept() {
+            Ok(_) => 1,
+            Err(_) => 0,
+        })
+        g.go(|| match net.connect("localhost:{p4}") {
+            Ok(_) => 1,
+            Err(_) => 0,
+        })
+    }
+    out.print("{both}")
+    out.print("{net.get("http://[::1:80/")}")
+    out.print("{net.get("http://[nope]/")}")
+    out.print("{net.get("http://[::2]:9/")}")
+    Ok(())
+}
+|} "[204, 1]\n[1, 1]\nErr(Failed(\"malformed IPv6 address in URL\"))\nErr(Failed(\"malformed IPv6 address in URL\"))\nErr(Denied(\"net: [::2]:9 is not granted\"))\n";
   out "group-until-sockets" ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] } {|fn main(root: Root) -> Result[(), IoError] {
     let clock = root.clock
     let net = root.net

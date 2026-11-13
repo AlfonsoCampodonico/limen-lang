@@ -702,6 +702,13 @@ module Sock = struct
       Some (String.lowercase_ascii h, int_of_string p)
     | _ -> None
 
+  (* The addresses to try for an outgoing connection, IPv4 and IPv6, in the
+     resolver's order; a bracketed host is an IPv6 address. *)
+  let lookup h port =
+    let h = if h = "localhost" then "127.0.0.1" else if h.[0] = '[' then String.sub h 1 (String.length h - 2) else h in
+    Unix.getaddrinfo h (string_of_int port) [ Unix.AI_SOCKTYPE Unix.SOCK_STREAM ]
+    |> List.filter_map (fun a -> match a.Unix.ai_addr with Unix.ADDR_INET _ as sa -> Some (a.Unix.ai_family, sa) | _ -> None)
+
   let resolve h =
     if h = "localhost" then Some Unix.inet_addr_loopback
     else
@@ -768,24 +775,33 @@ module Sock = struct
     | Some (h, port) -> (
       if not (Caps.permits allowed ~host:h ~port) then Error (Caps.Denied (Printf.sprintf "net: %s:%d is not granted" h port))
       else
-        match resolve h with
-        | None -> Error (Caps.Failed ("cannot resolve " ^ h))
-        | Some ip -> (
-          let sk = { fd = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0; shut = false; reading = false; writing = false; tls = Tls.Plain } in
-          Unix.set_nonblock sk.fd;
-          (* waits can be woken by any socket, so retry until this one says it is connected *)
-          let rec go () =
-            match Unix.connect sk.fd (Unix.ADDR_INET (ip, port)) with
-            | () -> Ok sk
-            | exception Unix.Unix_error (Unix.EISCONN, _, _) -> Ok sk
-            | exception Unix.Unix_error ((Unix.EINPROGRESS | Unix.EALREADY | Unix.EAGAIN | Unix.EINTR), _, _) -> (
-              wait sk true;
-              match Unix.getsockopt_error sk.fd with
-              | Some e -> Unix.close sk.fd; failed e
-              | None -> go ())
-            | exception Unix.Unix_error (e, _, _) -> Unix.close sk.fd; failed e
+        match lookup h port with
+        | [] -> Error (Caps.Failed ("cannot resolve " ^ h))
+        | addrs ->
+          (* each address in turn; the last failure is the error *)
+          let rec try_ = function
+            | [] -> assert false
+            | (dom, sa) :: rest -> (
+              let sk = { fd = Unix.socket dom Unix.SOCK_STREAM 0; shut = false; reading = false; writing = false; tls = Tls.Plain } in
+              Unix.set_nonblock sk.fd;
+              (* waits can be woken by any socket, so retry until this one says it is connected *)
+              let rec go () =
+                match Unix.connect sk.fd sa with
+                | () -> Ok sk
+                | exception Unix.Unix_error (Unix.EISCONN, _, _) -> Ok sk
+                | exception Unix.Unix_error ((Unix.EINPROGRESS | Unix.EALREADY | Unix.EAGAIN | Unix.EINTR), _, _) -> (
+                  (match wait sk true with () -> () | exception e -> Unix.close sk.fd; raise e);
+                  match Unix.getsockopt_error sk.fd with
+                  | Some e -> Unix.close sk.fd; failed e
+                  | None -> go ())
+                | exception Unix.Unix_error (e, _, _) -> Unix.close sk.fd; failed e
+              in
+              match go () with
+              | Error _ as e when rest = [] -> e
+              | Error _ -> try_ rest
+              | ok -> ok)
           in
-          go ()))
+          try_ addrs)
 
   (* One TLS read or write step: Ok n, or Error (Some write) when the socket
      must be ready that way first, or Error None with the message in [m]. *)
@@ -861,6 +877,7 @@ module Sock = struct
       match connect allowed addr with
       | Error e -> Error e
       | Ok sk -> (
+        let h = if h.[0] = '[' then String.sub h 1 (String.length h - 2) else h in
         match Tls.client sk.fd h with
         | exception Failure m -> close sk; Error (Caps.Failed m)
         | s ->

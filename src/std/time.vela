@@ -345,6 +345,23 @@ pub fn parse_iso(s: Str) -> Result[Int, Str] {
     let off = minutes(oh * 60 + om)
     Ok(if z == 43 { local - off } else { local + off })
 }
+
+// Runs `f` with a deadline: its result if it finishes within `ms`
+// milliseconds, else `Err(Failed("timed out after {ms} ms"))`. `f` runs as a
+// task of a group with that deadline, so at the deadline it stops at its
+// next wait (a socket, a channel, a sleep, a name lookup), its defers run
+// and what it holds is freed. A timeout for anything that waits:
+// `time.within(clock, 5000, || net.get(url))`.
+pub fn within[T](clock: Clock, ms: Int, f: fn() -> Result[T, IoError]) -> Result[T, IoError] {
+    let r = group g until clock.after(ms) {
+        g.go(|| f())
+    }
+    match r.get(0) {
+        Some(Some(v)) => v,
+        _ => Err(Failed("timed out after {ms} ms")),
+    }
+}
+
 // ---------- named time zones ----------
 
 // A named time zone from the tz database: its offsets over history and the

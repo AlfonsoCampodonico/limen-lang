@@ -834,6 +834,7 @@ fn main(root: Root) -> Result[(), IoError] {
 
 - `Listen.on("host:port")` binds; port `0` picks a free port, which `Listener.port()` reports.
 - `Listener.accept()` waits for a connection. `Net.connect("host:port")` opens one.
+- An address is `name:port`, `ipv4:port` or `[ipv6]:port`, and grants are written the same way (`--grant net=[::1]`). Listening on `[::]` accepts IPv6 and IPv4. `connect` tries every address a name resolves to, IPv6 and IPv4, in the order the system's resolver gives, until one connects; the error is the last one's. Natively a name lookup runs on a thread of its own, so a cancelled task stops waiting for it.
 - `Conn.read()` waits for data and returns what arrived; `""` means the peer closed. `Conn.write(s)` sends all of `s`. Both return `Result`.
 - `close()` on a `Listener` or `Conn` makes any task waiting on it get `Err(Failed("... is closed"))`.
 - One task at a time reads a connection or accepts on a listener, and one writes a connection. A `read` or `accept` that has to wait while another task is already waiting for the same thing, or a `write` that starts while another task's write on that connection is still going, returns `Err(Failed("another task is already reading this connection"))` (or `accepting on this listener`, `writing this connection`) instead of mixing their data; a read or accept that can go on at once is not refused, and a refused write sends nothing. Both backends behave alike.
@@ -892,7 +893,7 @@ if resp.status == 200 {
 - `Net.get(url)` sends one HTTP/1.1 `GET` (with `Host`, `User-Agent: vela`, `Accept: */*` and `Connection: close`), reads until the server closes, and returns `HttpResponse { status, headers, body }`.
 - Every status is `Ok`, including 404 and 500; redirects are returned, not followed. `Err(Failed(...))` means the server could not be reached or the response was not valid HTTP; responses over 64 MiB, with more than 64 KiB of headers or with more than 1000 header lines are refused.
 - `headers` is a `Map[Str, Str]` with lowercased names, in the order they arrived; a repeated header's values are joined with `", "`. The body is decoded from chunked transfer encoding or cut to `Content-Length`.
-- `https://` URLs go over `Net.connect_tls` (port 443 unless given), with the certificate checks described under TLS. There is no timeout yet. For other methods, request headers or bodies, use `http.request` from the `http` module, which works over `Net.connect` and `Net.connect_tls`.
+- `https://` URLs go over `Net.connect_tls` (port 443 unless given), with the certificate checks described under TLS. URLs may name an IPv6 address: `http://[::1]:8080/`. A server that never answers keeps `get` waiting; give it a deadline with `time.within(clock, ms, || net.get(url))`. For other methods, request headers or bodies, use `http.request` from the `http` module, which works over `Net.connect` and `Net.connect_tls`.
 
 ## 11. Built-in methods
 
