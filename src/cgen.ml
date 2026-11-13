@@ -596,8 +596,8 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
   | I.Interp parts ->
     show_into (List.map (function I.IStr s -> `Lit s | I.IVal (x, ty) -> `Val (a x, ty) | I.IValQ (x, ty) -> `ValQ (a x, ty)) parts)
   | I.RootField (x, f) -> set (sprintf "Cap_root_field(%s, %s)" (a x) (c_string f))
-  | I.GroupNew None -> set "w_group_new()"
-  | I.GroupNew (Some (_, ms)) -> set (sprintf "w_group_new_until(%s)" (a ms))
+  | I.GroupNew (None, il) -> set (sprintf "w_group_new(%d)" (Bool.to_int (not il)))
+  | I.GroupNew (Some (_, ms), il) -> set (sprintf "w_group_new_until(%s, %d)" (a ms) (Bool.to_int (not il)))
   | I.Spawn (g, task, rt, keep) ->
     if not (List.mem rt c.task_tys) then c.task_tys <- c.task_tys @ [ rt ];
     line (sprintf "w_spawn(%s, %s, wtask_%s, sizeof(%s), %s);" (a g) (a task) (cname c rt) (ctype c rt) (if keep then "true" else "false"));

@@ -5479,6 +5479,214 @@ fn main(root: Root) {
   in
   out "group-mixed-tasks" mixed "[4, 9] Some(\"hello\")\na\na\n0 2 [1, 2]\nErr(\"first\")\n";
   check_tsan "group-mixed-tasks" mixed "[4, 9] Some(\"hello\")\na\na\n0 2 [1, 2]\nErr(\"first\")\n";
+
+  (* ---------- output in start order ---------- *)
+  let both name ?feed src want =
+    out name ?feed src want;
+    check_tsan name ?feed src want
+  in
+  both "output-order"
+    {|fn main(root: Root) {
+    let out = root.stdout
+    let clock = root.clock
+    out.print("before")
+    // the later tasks finish first, and each runs a group of its own
+    let rs = group g {
+        for i in 0..<4 {
+            g.go(|| {
+                clock.sleep(30 - i * 10)
+                out.print("task {i} a")
+                let inner = group h {
+                    h.go(|| {
+                        clock.sleep(5)
+                        out.print("  inner {i}.0")
+                        0
+                    })
+                    h.go(|| {
+                        out.write("  inner {i}.1\n")
+                        1
+                    })
+                }
+                out.print("task {i} b {inner}")
+                i
+            })
+        }
+        out.print("body")
+    }
+    out.print("after {rs}")
+    // a task the deadline stops still has its output written in its turn
+    let t = group g until clock.after(50) {
+        g.go(|| {
+            out.print("slow starts")
+            clock.sleep(5000)
+            out.print("never")
+            1
+        })
+        g.go(|| {
+            out.print("fast")
+            2
+        })
+    }
+    out.print("deadline {t}")
+    // the panic is passed on after every task's output
+    let r = catch(|| group g {
+        g.go(|| {
+            clock.sleep(20)
+            out.print("first")
+            1
+        })
+        g.go(|| {
+            out.print("second, then panics")
+            panic("boom")
+        })
+        g.go(|| {
+            out.print("third")
+            3
+        })
+    })
+    out.print("{r}")
+    // the receiver was started first, so its output comes first
+    let c: Chan[Int] = channel(0)
+    let _ = group g {
+        g.go(|| out.print("got {c.recv() ?? 0}"))
+        g.go(|| {
+            out.print("sending")
+            c.send(7)
+        })
+    }
+    // interleaved: in the order it happens
+    let d: Chan[Int] = channel(0)
+    let _ = group g interleaved {
+        g.go(|| out.print("got {d.recv() ?? 0}"))
+        g.go(|| {
+            out.print("sending")
+            d.send(8)
+        })
+    }
+}
+|}
+    "before\nbody\ntask 0 a\n  inner 0.0\n  inner 0.1\ntask 0 b [0, 1]\ntask 1 a\n  inner 1.0\n  inner 1.1\ntask 1 b [0, 1]\n\
+     task 2 a\n  inner 2.0\n  inner 2.1\ntask 2 b [0, 1]\ntask 3 a\n  inner 3.0\n  inner 3.1\ntask 3 b [0, 1]\nafter [0, 1, 2, 3]\n\
+     slow starts\nfast\ndeadline [None, Some(2)]\nfirst\nsecond, then panics\nthird\nErr(\"boom\")\ngot 7\nsending\nsending\ngot 8\n";
+  (* many tasks that wait now and then, so natively they run in any order *)
+  let many =
+    String.concat ""
+      (List.init 40 (fun i ->
+           String.concat "" (List.init 12 (fun k -> sprintf "t%d %d\n" i k))
+           ^ String.concat "" (List.init 3 (fun j -> sprintf "  t%d.%d\n" i j))))
+  in
+  both "output-order-many"
+    {|fn main(root: Root) {
+    let out = root.stdout
+    let clock = root.clock
+    let c: Chan[Int] = channel(4)
+    let _ = group g {
+        for i in 0..<40 {
+            g.go(|| {
+                for k in 0..<12 {
+                    out.print("t{i} {k}")
+                    if k % 4 == i % 4 {
+                        clock.sleep(i % 3)
+                    }
+                    c.send(k)
+                    let _ = c.recv()
+                }
+                let _ = group h {
+                    for j in 0..<3 {
+                        h.go(|| out.print("  t{i}.{j}"))
+                    }
+                }
+            })
+        }
+    }
+}
+|}
+    many;
+  (* past 4 MiB held, the group gives up order: the second task's lines go
+     out before the first task, which waits for them, prints *)
+  let mib = String.make (1 lsl 20) 'x' in
+  both "output-order-limit"
+    {|fn main(root: Root) {
+    let out = root.stdout
+    let mut s = "x"
+    for _ in 0..<20 {
+        s = s + s
+    }
+    let c: Chan[Int] = channel(0)
+    let _ = group g {
+        g.go(|| out.print("got {c.recv() ?? 0}"))
+        g.go(|| {
+            for _ in 0..<5 {
+                out.print(s)
+            }
+            c.send(5)
+        })
+    }
+    out.print("end")
+}
+|}
+    (String.concat "" (List.init 5 (fun _ -> mib ^ "\n")) ^ "got 5\nend\n");
+  (* reading stdin shows the prompt the task printed, though it is held *)
+  both "output-order-stdin" ~feed:"echo ana"
+    {|fn main(root: Root) {
+    let out = root.stdout
+    let input = root.stdin
+    let c: Chan[Str] = channel(1)
+    let _ = group g {
+        g.go(|| out.print("done: {c.recv() ?? ""}"))
+        g.go(|| {
+            out.write("name? ")
+            let name = input.read_line() ?? "nobody"
+            out.print("hello {name}")
+            c.send(name)
+        })
+    }
+}
+|}
+    "name? hello ana\ndone: ana\n";
+  (* a program that ends with a panic or a deadlock writes what is held first *)
+  let held_then name src want_out want_err =
+    if selected name then begin
+      let items, _, _ = compile name src in
+      let buf = Buffer.create 64 in
+      (match Interp.run ~out:(Buffer.add_string buf) ~grants:Interp.no_grants items with
+       | Error (m, _) ->
+         ok name (Buffer.contents buf = want_out && m = want_err) (sprintf "stdout %S, panic %S" (Buffer.contents buf) m)
+       | Ok _ -> ok name false "no panic");
+      check_native name src ~want_out ~want_err_prefix:(Some ("panic: " ^ want_err ^ "\n"))
+    end
+  in
+  held_then "output-order-panic"
+    {|fn main(root: Root) {
+    let out = root.stdout
+    let clock = root.clock
+    let _ = group g {
+        g.go(|| {
+            clock.sleep(20)
+            out.print("first")
+        })
+        g.go(|| {
+            out.print("second")
+            panic("boom")
+        })
+    }
+}
+|}
+    "first\nsecond\n" "boom";
+  held_then "output-order-deadlock"
+    {|fn main(root: Root) {
+    let out = root.stdout
+    let c: Chan[Int] = channel(0)
+    let _ = group g {
+        g.go(|| out.print("first {c.recv() ?? 0}"))
+        g.go(|| {
+            out.print("held")
+            let _ = c.recv()
+        })
+    }
+}
+|}
+    "held\n" "all tasks are blocked (deadlock)";
   errs "group-mixed-values" "fn main() {\n    let r = group g {\n        g.go(|| 1)\n        g.go(|| \"a\")\n    }\n}\n" [ "E0201" ];
 
   (* ---------- variant names: the file's own enums first ---------- *)

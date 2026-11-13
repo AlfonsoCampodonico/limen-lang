@@ -1,0 +1,14 @@
+// a group whose tasks print as they go, with and without a deadline
+fn main(root: Root) {
+    let out = root.stdout
+    let clock = root.clock
+    let interleaved = 2
+    let _ = group g interleaved {
+        g.go(|| out.print("a"))
+        g.go(|| out.print("b {interleaved}"))
+    }
+    let rs = group g interleaved until clock.after(100) {
+        g.go(|| 1)
+    }
+    out.print("{rs}")
+}

@@ -102,17 +102,34 @@ and claim = { mutable fired : int }
 and waiter = { claim : claim; idx : int; mutable v : value; mutable ok : bool }
 
 (* A task's cancel flag: set by its group's deadline, seen at its next wait. *)
-and task = { mutable cancelled : bool; mutable scopes : group list }
+and task = { mutable cancelled : bool; mutable scopes : group list; sink : sink option }
 (* scopes: the groups whose bodies it is running under their deadline,
-   innermost first; a passed deadline stops the body at its next wait too *)
+   innermost first; a passed deadline stops the body at its next wait too.
+   sink: where its output goes, None for stdout itself. *)
+
+(* The output of a task of an ordered group, held until the tasks started
+   before it have finished and the group's body has ended (section 10). *)
+and sink = { sgroup : group; held : Buffer.t; mutable sdone : bool }
 
 (* How a task ended: its value, the panic that ended it, or cancellation. *)
 and outcome = Done of value | Failed of string * Span.t | Stopped
 
 (* The tasks of a group, newest first, and whether its deadline has passed. *)
-and group = { mutable tasks : (task * outcome option ref) list; mutable kept : bool list; mutable gcancelled : bool }
+and group = {
+  mutable tasks : (task * outcome option ref) list;
+  mutable kept : bool list;
+  mutable gcancelled : bool;
+  gparent : sink option;
+  mutable ordered : bool;
+  mutable body_done : bool;
+  waiting : sink Queue.t;
+}
 (* kept: per task, newest first like tasks, whether its result goes in the
-   group's list (a task that returns () is not kept) *)
+   group's list (a task that returns () is not kept). gparent: where the
+   body's output goes, and the tasks' once released. ordered: the tasks'
+   output follows start order (not `interleaved`, and not given up for
+   memory or stdin). waiting: the sinks not released yet, in start order;
+   once the body has ended, the first of them writes through. *)
 
 (* A persistent map, so updates are cheap and values stay values. Each entry
    remembers when its key was first inserted, for insertion-order iteration. *)
@@ -605,7 +622,7 @@ let io_epoch = ref 0 (* advances after each round of waiting for I/O *)
 let now () = Unix.gettimeofday ()
 
 (* The task running now; main and tests run as tasks nobody cancels. *)
-let current = ref { cancelled = false; scopes = [] }
+let current = ref { cancelled = false; scopes = []; sink = None }
 
 (* Wait until [cond] holds. A cancelled task stops instead (raising
    Cancelled) unless [cancellable] is false, which is only for joining the
@@ -653,6 +670,83 @@ let cancel_group g =
   List.iter (fun (t, r) -> if !r = None then t.cancelled <- true) g.tasks
 
 let group_finished g = List.for_all (fun (_, r) -> !r <> None) g.tasks
+
+(* ---------- output in start order ----------
+   A task of an ordered group writes into its sink until it is the first
+   unreleased task and the body has ended; then its held output goes to the
+   group's parent and it writes through. Held output is limited to
+   [hold_limit] bytes for the whole program: past it, the group that would
+   hold more gives up order, releasing what it holds in start order. *)
+
+let hold_limit = 4 * 1024 * 1024
+let held_bytes = ref 0
+
+(* ordered groups still running, newest (innermost) first *)
+let live_groups : group list ref = ref []
+
+let through k =
+  let g = k.sgroup in
+  (not g.ordered) || (g.body_done && match Queue.peek_opt g.waiting with Some f -> f == k | None -> false)
+
+let rec put (out : string -> unit) sk s =
+  match sk with
+  | None -> out s
+  | Some k ->
+    if through k then put out k.sgroup.gparent s
+    else if !held_bytes + String.length s > hold_limit then begin
+      spill out k.sgroup;
+      put out k.sgroup.gparent s
+    end
+    else begin
+      Buffer.add_string k.held s;
+      held_bytes := !held_bytes + String.length s
+    end
+
+and release out g k =
+  if Buffer.length k.held > 0 then begin
+    let s = Buffer.contents k.held in
+    Buffer.reset k.held;
+    held_bytes := !held_bytes - String.length s;
+    put out g.gparent s
+  end
+
+(* give up order: release everything held, in start order *)
+and spill out g =
+  g.ordered <- false;
+  Queue.iter (release out g) g.waiting;
+  Queue.clear g.waiting
+
+(* release what can go now: the finished tasks at the front, and the held
+   output of the first unfinished one, which then writes through *)
+let advance out g =
+  if g.ordered && g.body_done then begin
+    let rec go () =
+      match Queue.peek_opt g.waiting with
+      | Some k ->
+        release out g k;
+        if k.sdone then begin
+          ignore (Queue.pop g.waiting);
+          go ()
+        end
+      | None -> ()
+    in
+    go ()
+  end
+
+(* Reading stdin: a prompt the task printed must show, so every group that
+   holds this task's output gives up order. *)
+let rec unhold out = function
+  | None -> ()
+  | Some k ->
+    if not (through k) then spill out k.sgroup;
+    unhold out k.sgroup.gparent
+
+(* The program is ending with a panic or a deadlock: release everything
+   still held, innermost groups first, before the message. *)
+let release_all out =
+  List.iter (fun g -> if g.ordered then spill out g) !live_groups;
+  live_groups := [];
+  held_bytes := 0
 
 (* ---------- channels ---------- *)
 
@@ -1847,9 +1941,22 @@ let rec eval rt env e : value =
     match (match early with Some v -> v | None -> eval rt env base) with
     | VStruct (n, fs) -> VStruct (n, List.map (fun (k, v) -> (k, Option.value ~default:v (List.assoc_opt k vals))) fs)
     | _ -> failwith "internal: with on a non-struct")
-  | EGroup (name, until, b) ->
+  | EGroup (name, interleaved, until, b) ->
     (* tasks are coroutines; the group waits until every one has a result *)
-    let g = { tasks = []; kept = []; gcancelled = false } in
+    let t = !current in
+    let g =
+      { tasks = []; kept = []; gcancelled = false; gparent = t.sink; ordered = not interleaved; body_done = false;
+        waiting = Queue.create () }
+    in
+    if g.ordered then live_groups := g :: !live_groups;
+    let finish () = live_groups := List.filter (fun o -> o != g) !live_groups in
+    (* the body has ended: the tasks' output can start to go out *)
+    let body_ended () =
+      if not g.body_done then begin
+        g.body_done <- true;
+        advance rt.out g
+      end
+    in
     let joined = ref false in
     (match until with
      | None -> ()
@@ -1860,12 +1967,11 @@ let rec eval rt env e : value =
        else begin
          (* the deadline: a coroutine of its own that cancels the tasks when the time comes *)
          let at = now () +. (Int64.to_float (min ms 1_000_000_000_000L) /. 1000.) in
-         spawn_fiber { cancelled = false; scopes = [] } (fun () ->
+         spawn_fiber { cancelled = false; scopes = []; sink = None } (fun () ->
              wait_until ~at ~cancellable:false (fun () -> !joined || now () >= at);
              if not !joined then cancel_group g)
        end);
     let sc = scope_of name (VGroup g) in
-    let t = !current in
     (try
        (match until with
         | None -> ignore (eval_block rt (sc :: env) b)
@@ -1876,15 +1982,19 @@ let rec eval rt env e : value =
           try ignore (eval_block rt (sc :: env) b); leave () with
           | Cancelled when g.gcancelled && (not t.cancelled) && not (List.exists (fun o -> o.gcancelled) (List.tl t.scopes)) -> leave ()
           | e -> leave (); raise e));
+       body_ended ();
        wait_until (fun () -> group_finished g)
      with e ->
        (* abandoned (a panic, or this task was cancelled): a cancellation
           reaches the group's tasks too; either way wait for them *)
+       body_ended ();
        if stopped !current then cancel_group g;
        wait_until ~cancellable:false (fun () -> group_finished g);
        joined := true;
+       finish ();
        raise e);
     joined := true;
+    finish ();
     let results = List.rev_map snd g.tasks in
     (* a panic ended only its task; the group passes the first one on *)
     List.iter (fun r -> match !r with Some (Failed (m, s)) -> raise (Panic (m, s)) | _ -> ()) results;
@@ -2326,7 +2436,16 @@ and call_method rt v name args sp =
   | VEnum ("Result", "Err", [ e ]), "map_error", [ f ] -> VEnum ("Result", "Err", [ call f [ e ] ])
   | (VEnum ("Result", _, _) as r), "map_error", [ _ ] -> r
   | VGroup g, (("go" | "#go") as go), [ c ] ->
-    let t = { cancelled = g.gcancelled; scopes = [] } in
+    (* an ordered group holds the task's output in a sink of its own *)
+    let sink =
+      if g.ordered && not g.gcancelled then begin
+        let k = { sgroup = g; held = Buffer.create 0; sdone = false } in
+        Queue.push k g.waiting;
+        Some k
+      end
+      else g.gparent
+    in
+    let t = { cancelled = g.gcancelled; scopes = []; sink } in
     let res = ref (if g.gcancelled then Some Stopped else None) in
     g.tasks <- (t, res) :: g.tasks;
     g.kept <- (go = "go") :: g.kept;
@@ -2336,7 +2455,13 @@ and call_method rt v name args sp =
           res :=
             Some
               (if t.cancelled then Stopped
-               else try Done (apply rt c [] sp) with Panic (m, s) -> Failed (m, s) | Cancelled -> Stopped));
+               else try Done (apply rt c [] sp) with Panic (m, s) -> Failed (m, s) | Cancelled -> Stopped);
+          (* finished: its output goes out once the tasks before it have *)
+          match sink with
+          | Some k when k.sgroup == g ->
+            k.sdone <- true;
+            advance rt.out g
+          | _ -> ());
     VUnit
   | VChan ch, "send", [ v ] -> chan_send ch v sp; VUnit
   | VChan ch, "recv", [] -> ( match chan_recv ch with Some v -> some v | None -> none)
@@ -2355,13 +2480,17 @@ and sock_result : 'a. ('a, Caps.ioerr) result -> ('a -> value) -> value = fun r 
 
 and cap_call rt c name args sp =
   match (c, name, args) with
-  | CStdout, "print", [ VStr s ] -> rt.out (s ^ "\n"); VUnit
-  | CStdout, "write", [ VStr s ] -> rt.out s; VUnit
+  | CStdout, "print", [ VStr s ] -> put rt.out !current.sink (s ^ "\n"); VUnit
+  | CStdout, "write", [ VStr s ] -> put rt.out !current.sink s; VUnit
   | CClock, "now_ms", [] -> VInt (Int64.of_float (Unix.gettimeofday () *. 1000.))
   | CClock, "sleep", [ VInt ms ] -> sleep_ms ms; VUnit
   | CRand, "float", [] -> VFloat (Int64.to_float (Int64.shift_right_logical (rand_next ()) 11) *. 0x1p-53)
-  | CStdin, "read_line", [] -> ( match Stdin.read_line () with Some l -> some (VStr l) | None -> none)
-  | CStdin, "read_all", [] -> VStr (Stdin.read_all ())
+  | CStdin, "read_line", [] -> (
+    unhold rt.out !current.sink;
+    match Stdin.read_line () with Some l -> some (VStr l) | None -> none)
+  | CStdin, "read_all", [] ->
+    unhold rt.out !current.sink;
+    VStr (Stdin.read_all ())
   | CEnv names, "get", [ VStr n ] ->
     if List.mem "*" names || List.mem n names then match Sys.getenv_opt n with Some v -> some (VStr v) | None -> none
     else none
@@ -2451,11 +2580,13 @@ let run ?(before_main = fun () -> ()) ~out ~grants (user_items : item list) : (v
     let args = match d.fn_params with [] -> [] | _ -> [ VCap CRoot ] in
     (* main is a coroutine too, so it can wait on groups and channels *)
     Queue.clear runq;
+    live_groups := [];
+    held_bytes := 0;
     Stdin.reset ();
     Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
     let result = ref None in
     try
-      spawn_fiber { cancelled = false; scopes = [] } (fun () -> result := Some (call_fn rt d args));
+      spawn_fiber { cancelled = false; scopes = []; sink = None } (fun () -> result := Some (call_fn rt d args));
       schedule (fun () -> !result <> None) d.fn_span;
       Queue.clear runq;
       (* a `dyn Error` from main is reported by its message *)
@@ -2463,14 +2594,14 @@ let run ?(before_main = fun () -> ()) ~out ~grants (user_items : item list) : (v
       | ( VEnum ("Result", "Err", [ e ]),
           Some { tdesc = TyName ("Result", [ _; { tdesc = TyName ("dyn", [ { tdesc = TyName ("Error", []); _ } ]); _ } ]); _ } ) ->
         let m = ref None in
-        spawn_fiber { cancelled = false; scopes = [] } (fun () -> m := Some (call_method rt e "message" [] d.fn_span));
+        spawn_fiber { cancelled = false; scopes = []; sink = None } (fun () -> m := Some (call_method rt e "message" [] d.fn_span));
         schedule (fun () -> !m <> None) d.fn_span;
         Queue.clear runq;
         Ok (VEnum ("Result", "Err", [ Option.get !m ]))
       | r, _ -> Ok r
     with
-    | Panic (m, sp) | Fatal (m, sp) -> Queue.clear runq; Error (m, sp)
-    | Stack_overflow -> Queue.clear runq; Error ("stack overflow", d.fn_span))
+    | Panic (m, sp) | Fatal (m, sp) -> Queue.clear runq; release_all rt.out; Error (m, sp)
+    | Stack_overflow -> Queue.clear runq; release_all rt.out; Error ("stack overflow", d.fn_span))
 
 let make_rt ~out ~grants (user_items : item list) =
   let rt =
@@ -2522,14 +2653,15 @@ let run_tests_timed ?(select = fun _ -> true) ~out (user_items : item list) :
           | Error e -> Error e
           | Ok () ->
           try
-            spawn_fiber { cancelled = false; scopes = [] } (fun () -> ignore (call_fn rt d args); finished := true);
+            spawn_fiber { cancelled = false; scopes = []; sink = None } (fun () -> ignore (call_fn rt d args); finished := true);
             schedule (fun () -> !finished) d.fn_span;
             Ok ()
           with
-          | Panic (m, sp) | Fatal (m, sp) -> Error (m, sp)
-          | Stack_overflow -> Error ("stack overflow", d.fn_span)
+          | Panic (m, sp) | Fatal (m, sp) -> release_all out; Error (m, sp)
+          | Stack_overflow -> release_all out; Error ("stack overflow", d.fn_span)
         in
         Queue.clear runq;
+        live_groups := [];
         Option.iter Caps.remove_tree dir;
         Some (name, r, Unix.gettimeofday () -. start)
       | _ -> None)

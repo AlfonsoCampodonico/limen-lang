@@ -353,12 +353,12 @@ let rec lower f (e : expr) : I.atom =
       let t = tyof f x in
       let a = lower f x in
       mk_dyn f t (match ty with TDyn (_, args) -> (i, args) | _ -> (i, [])) a
-    | EGroup (name, until, b) ->
+    | EGroup (name, interleaved, until, b) ->
       (* with a deadline, each result is an Option: None for a cancelled task *)
       let t = match (ty, until) with TList (TNamed ("Option", [ t ])), Some _ -> t | TList t, None -> t | _ -> TUnit in
       let dl = Option.map (fun (clk, ms) -> let c = lower f clk in (c, lower f ms)) until in
       let g = fresh_var name (TGroup t) in
-      emit f (I.Let (g, I.GroupNew dl));
+      emit f (I.Let (g, I.GroupNew (dl, interleaved)));
       f.scopes <- Hashtbl.create 8 :: f.scopes;
       bind f name g;
       (if until = None then ignore (lower_block f b)

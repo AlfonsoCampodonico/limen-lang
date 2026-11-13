@@ -182,8 +182,11 @@ static void w_leakcheck(void) {
    w_fatal_c instead. Keep it that way when adding a w_panic_c call. */
 
 
-/* Errors no boundary can handle: report and exit. */
+static void w_out_release_all(void);
+/* Errors no boundary can handle: report and exit, after the output tasks
+   still hold. */
 __attribute__((noreturn)) static void w_fatal_c(const char *msg, const char *where) {
+  w_out_release_all();
   fflush(stdout);
   fprintf(stderr, "panic: %s\n  --> %s\n", msg, where);
   exit(1);
@@ -1391,16 +1394,6 @@ static WIo Cap_fs_make_dir(WCap *fs, WStr *rel) {
   if (rc != 0) { snprintf(msg, sizeof msg, "fs: `%.*s`: %s", (int)rel->len, rel->data, strerror(errno)); return io_err(2, msg); }
   return io_ok(NULL);
 }
-/* Buffered, so printing many lines costs what it does in C. The buffer is
-   written out whenever the program waits (see w_sched_loop), before stdin
-   is read, and at exit: a long-running program's output reaches a file or
-   pipe as soon as it has printed and gone back to waiting. */
-static void Cap_print(WStr *s, bool nl) {
-  flockfile(stdout);
-  fwrite(s->data, 1, (size_t)s->len, stdout);
-  if (nl) fputc('\n', stdout);
-  funlockfile(stdout);
-}
 static int64_t Cap_now_ms(void) { struct timeval tv; gettimeofday(&tv, NULL); return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000; }
 
 /* ---------- fibers and the work-stealing scheduler ----------
@@ -1427,6 +1420,7 @@ static int64_t Cap_now_ms(void) { struct timeval tv; gettimeofday(&tv, NULL); re
 #include <sched.h>
 
 typedef struct WFiber WFiber;
+typedef struct WOut WOut;
 /* A group body under its deadline (`group g until ...`): the deadline stops
    the body at its next wait, as it does the group's tasks. stop points at
    the group's cancelled flag. */
@@ -1443,6 +1437,7 @@ struct WFiber {
   struct WSel *wait;                    /* the token of the wait it is parked in, if cancellable */
   WScope *scopes;                       /* deadline scopes it is in, innermost first (under wlock) */
   const char *in_cb;                    /* in a callback from C: where the callback is declared */
+  WOut *out;                            /* where its output goes (NULL: stdout); see Cap_print */
   struct WCap *cb_foreign;              /* in a foreign call: its Foreign, for callbacks that take one */
 #ifdef W_ASAN
   const void *asan_bottom; size_t asan_size;
@@ -2021,11 +2016,20 @@ static void Cap_sleep(int64_t ms) { if (w_nap(ms) < 0) w_cancel_unwind(); }
 
 typedef struct WGroup WGroup;
 typedef struct WTask WTask;
+/* The output of a task of an ordered group, held until the tasks started
+   before it have finished and the group's body has ended. Under w_out_mu. */
+struct WOut {
+  WGroup *g;                            /* the group whose task writes here */
+  WOut *next;                           /* g's next task not released yet, in start order */
+  char *buf; size_t len, cap;           /* what it holds */
+  int done;                             /* the task has finished */
+};
 struct WTask {
   WClo *fn; void (*run)(WTask *); WGroup *g; char *pmsg; char *pwhere;
   WFiber *f;                            /* its fiber while it runs (under g->mu) */
   int done, cancelled;                  /* finished; ended by cancellation (no result) */
   bool keep;                            /* its result goes in the group's list (not a () task) */
+  WOut out;                             /* its output, in an ordered group */
   max_align_t slot[];
 };
 struct WGroup {
@@ -2035,22 +2039,141 @@ struct WGroup {
   int cancelled;                        /* its deadline passed: tasks started now never run */
   WFiber *body;                         /* the fiber running its body under the deadline, if any */
   WTimer deadline;                      /* `group g until clock.after(ms)` (pos -1 when none) */
+  /* output, under w_out_mu: */
+  WOut *parent;                         /* where the body's output goes (NULL: stdout) */
+  int ordered;                          /* tasks' output in start order: not `interleaved`, not given up */
+  int body_done;                        /* the body has ended, so the first task writes through */
+  WOut *first, *last;                   /* the tasks not released yet, in start order */
+  WGroup *live_next, *live_prev; int live;   /* in w_live_groups */
 };
+
+/* ---------- output in start order ----------
+   Output that tasks of an ordered group print is held in their WOut until
+   the group's body has ended and every task started before them has
+   finished; the first unfinished task then writes through to the group's
+   parent. So a group's output reads as if its body ran first and then each
+   task, one after another, in start order. Held output is limited to
+   W_HOLD_LIMIT bytes for the whole program: past it, the group that would
+   hold more gives up order, releasing what it holds in start order. Every
+   write happens under w_out_mu, so a print is never torn. The interpreter
+   does the same (interp.ml, "output in start order"). */
+#define W_HOLD_LIMIT ((size_t)4 << 20)
+static pthread_mutex_t w_out_mu = PTHREAD_MUTEX_INITIALIZER;
+static __thread int w_out_locked;       /* this thread holds w_out_mu (never across a switch) */
+static size_t w_held;                   /* bytes held in every WOut */
+static WGroup *w_live_groups;           /* ordered groups still running, newest (innermost) first */
+static void w_out_lock(void) { pthread_mutex_lock(&w_out_mu); w_out_locked = 1; }
+static void w_out_unlock(void) { w_out_locked = 0; pthread_mutex_unlock(&w_out_mu); }
+static WOut *w_cur_out(void) { WWorker *w = w_self(); return w && w->current ? w->current->out : NULL; }
+static void w_live_remove(WGroup *g) {
+  if (!g->live) return;
+  if (g->live_prev) g->live_prev->live_next = g->live_next; else w_live_groups = g->live_next;
+  if (g->live_next) g->live_next->live_prev = g->live_prev;
+  g->live = 0;
+}
+static int w_out_through(WOut *o) { WGroup *g = o->g; return !g->ordered || (g->body_done && g->first == o); }
+static void w_out_spill(WGroup *g);
+static void w_out_put(WOut *o, const char *p, size_t n) {
+  while (o) {
+    WGroup *g = o->g;
+    if (w_out_through(o)) { o = g->parent; continue; }
+    if (w_held + n > W_HOLD_LIMIT) { w_out_spill(g); o = g->parent; continue; }
+    if (o->len + n > o->cap) {
+      size_t c = o->cap ? o->cap : 256;
+      while (c < o->len + n) c *= 2;
+      char *b = (char *)realloc(o->buf, c);
+      if (!b) w_oom();
+      o->buf = b; o->cap = c;
+    }
+    memcpy(o->buf + o->len, p, n);
+    o->len += n; w_held += n;
+    return;
+  }
+  fwrite(p, 1, n, stdout);
+}
+static void w_out_release(WOut *o) {
+  if (!o->buf) return;
+  char *b = o->buf; size_t n = o->len;
+  o->buf = NULL; o->len = o->cap = 0;
+  w_held -= n;
+  w_out_put(o->g->parent, b, n);
+  free(b);
+}
+/* Give up order: release everything held, in start order. */
+static void w_out_spill(WGroup *g) {
+  g->ordered = 0;
+  for (WOut *o = g->first; o; o = o->next) w_out_release(o);
+  g->first = g->last = NULL;
+  w_live_remove(g);
+}
+/* Release what can go now: the finished tasks at the front, and the held
+   output of the first unfinished one, which then writes through. */
+static void w_out_advance(WGroup *g) {
+  if (!g->ordered || !g->body_done) return;
+  WOut *o;
+  while ((o = g->first)) {
+    w_out_release(o);
+    if (!o->done) break;
+    g->first = o->next;
+    if (!g->first) g->last = NULL;
+  }
+}
+/* The program is ending with a panic or a deadlock: release everything
+   still held, innermost groups first, before the message. */
+static void w_out_release_all(void) {
+  int mine = w_out_locked;
+  if (!mine) w_out_lock();
+  while (w_live_groups) w_out_spill(w_live_groups);
+  if (!mine) w_out_unlock();
+}
+/* Buffered, so printing many lines costs what it does in C. The buffer is
+   written out whenever the program waits (see w_sched_loop), before stdin
+   is read, and at exit: a long-running program's output reaches a file or
+   pipe as soon as it has printed and gone back to waiting. */
+static void Cap_print(WStr *s, bool nl) {
+  WOut *o = w_cur_out();
+  w_out_lock();
+  w_out_put(o, s->data, (size_t)s->len);
+  if (nl) w_out_put(o, "\n", 1);
+  w_out_unlock();
+}
+/* Reading stdin: a prompt this task printed must show, so every group that
+   holds its output gives up order. */
+static void w_out_unhold(void) {
+  WOut *o = w_cur_out();
+  w_out_lock();
+  while (o) {
+    WGroup *g = o->g;
+    if (!w_out_through(o)) w_out_spill(g);
+    o = g->parent;
+  }
+  w_out_unlock();
+}
 
 static void w_group_cancel(WGroup *g);
 static void w_group_deadline(void *p) { w_group_cancel((WGroup *)p); }
-static WGroup *w_group_new(void) {
+/* ordered: 0 for `group g interleaved` */
+static WGroup *w_group_new(int ordered) {
   WGroup *g = (WGroup *)w_alloc_k(sizeof(WGroup), WK_GROUP);
   memset(g, 0, sizeof *g);
   g->rc = 1; g->cap = 8;
   g->deadline.pos = -1;
   pthread_mutex_init(&g->mu, NULL);
   g->tasks = (WTask **)w_raw(sizeof(WTask *) * (size_t)g->cap);
+  g->parent = w_cur_out();
+  if (ordered) {
+    w_out_lock();
+    g->ordered = 1; g->live = 1;
+    g->live_next = w_live_groups;
+    if (w_live_groups) w_live_groups->live_prev = g;
+    w_live_groups = g;
+    w_out_unlock();
+  }
   return g;
 }
 /* A group with a deadline ms milliseconds from now. */
-static WGroup *w_group_new_until(int64_t ms) {
-  WGroup *g = w_group_new();
+static WGroup *w_group_new_until(int64_t ms, int ordered) {
+  WGroup *g = w_group_new(ordered);
   if (ms <= 0) { g->cancelled = 1; return g; }
   g->deadline.at = w_deadline_ms(ms); g->deadline.fire = w_group_deadline; g->deadline.arg = g;
   w_tm_add(&g->deadline);
@@ -2140,6 +2263,11 @@ static void w_task_entry(void *p) {
     if (c.cancel) t->cancelled = 1;
     else { t->pmsg = c.msg; t->pwhere = c.where; }
   }
+  /* finished: its output goes out once the tasks before it have */
+  w_out_lock();
+  t->out.done = 1;
+  w_out_advance(g);
+  w_out_unlock();
   pthread_mutex_lock(&g->mu);
   WFiber *wake = NULL;
   t->done = 1; t->f = NULL;
@@ -2158,13 +2286,27 @@ static void w_spawn(WGroup *g, WClo *fn, void (*run)(WTask *), size_t slot, bool
   Clo_share(fn);
   WTask *t = (WTask *)w_alloc(sizeof(WTask) + slot);
   t->fn = fn; t->run = run; t->g = g; t->pmsg = NULL; t->pwhere = NULL; t->f = NULL; t->done = 0; t->cancelled = 0; t->keep = keep;
+  memset(&t->out, 0, sizeof t->out);
+  t->out.g = g;
   WFiber *f = w_fiber_new(w_task_entry, t, w_stack_size);
+  /* an ordered group holds the task's output in its WOut */
+  w_out_lock();
+  if (g->ordered) {
+    if (g->last) g->last->next = &t->out; else g->first = &t->out;
+    g->last = &t->out;
+    f->out = &t->out;
+  } else f->out = g->parent;
+  w_out_unlock();
   pthread_mutex_lock(&g->mu);
   if (g->n == g->cap) { g->cap *= 2; g->tasks = (WTask **)w_realloc(g->tasks, w_bytes(g->cap, sizeof(WTask *))); }
   g->tasks[g->n++] = t;
   if (g->cancelled) {   /* past the deadline: the task never runs */
     t->done = 1; t->cancelled = 1;
     pthread_mutex_unlock(&g->mu);
+    w_out_lock();
+    t->out.done = 1;
+    w_out_advance(g);
+    w_out_unlock();
     w_fiber_free(f);
     Clo_drop(fn);
     return;
@@ -2179,6 +2321,10 @@ static void w_spawn(WGroup *g, WClo *fn, void (*run)(WTask *), size_t slot, bool
    and unwinds; the boundary it unwinds to then cancels the group's tasks
    and joins it again, not cancellably (w_group_cleanup). */
 static void w_group_wait(WGroup *g, int cancellable) {
+  /* the body has ended: the tasks' output can start to go out */
+  w_out_lock();
+  if (!g->body_done) { g->body_done = 1; w_out_advance(g); }
+  w_out_unlock();
   pthread_mutex_lock(&g->mu);
   if (g->pending > 0) {
     WSel tok;
@@ -2204,6 +2350,10 @@ static void w_group_wait(WGroup *g, int cancellable) {
     }
   } else pthread_mutex_unlock(&g->mu);
   if (g->deadline.fire) w_tm_remove(&g->deadline);
+  /* every task has finished, so all their output has gone out */
+  w_out_lock();
+  w_live_remove(g);
+  w_out_unlock();
 }
 /* Joining a group whose code is being abandoned (a panic, or the task
    running it was cancelled): a cancellation reaches its tasks too. */
@@ -2212,7 +2362,7 @@ static void w_group_cleanup(WGroup *g) {
   w_group_wait(g, 0);
 }
 static void w_group_release_tasks(WGroup *g) {
-  for (int64_t i = 0; i < g->n; i++) { free(g->tasks[i]->pmsg); free(g->tasks[i]->pwhere); w_free(g->tasks[i]); }
+  for (int64_t i = 0; i < g->n; i++) { free(g->tasks[i]->pmsg); free(g->tasks[i]->pwhere); free(g->tasks[i]->out.buf); w_free(g->tasks[i]); }
   g->n = 0;
 }
 /* After every task finished: pass on the first panic, in spawn order. */
@@ -3269,6 +3419,7 @@ static int w_in_fill(void) {
 }
 static void w_in_consume(int64_t n) { memmove(w_in_buf, w_in_buf + n, (size_t)(w_in_len - n)); w_in_len -= n; }
 static WStr *Cap_stdin_line(bool *ok) {
+  w_out_unhold();
   w_in_acquire();
   int64_t from = 0;
   for (;;) {
@@ -3289,6 +3440,7 @@ static WStr *Cap_stdin_line(bool *ok) {
   }
 }
 static WStr *Cap_stdin_all(void) {
+  w_out_unhold();
   w_in_acquire();
   while (!w_in_eof) if (w_in_fill() == -2) { w_in_release(); w_cancel_unwind(); }
   WStr *s = Str_from(w_in_buf ? w_in_buf : "", w_in_len);

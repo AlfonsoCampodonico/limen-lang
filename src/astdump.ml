@@ -52,8 +52,9 @@ let rec expr e =
   | EStruct (n, _, fs) -> n ^ "{" ^ String.concat "," (List.map (fun (f, _, x) -> f ^ ":" ^ expr x) fs) ^ "}"
   | ESafe (b, _, rest, _) -> "safe(" ^ expr b ^ "," ^ expr rest ^ ")"
   | EWith (b, fs) -> "{" ^ expr b ^ " with " ^ String.concat "," (List.map (fun (f, _, x) -> f ^ ":" ^ expr x) fs) ^ "}"
-  | EGroup (n, None, b) -> "group " ^ n ^ block b
-  | EGroup (n, Some (c, ms), b) -> "group " ^ n ^ " until " ^ expr c ^ ".after(" ^ expr ms ^ ")" ^ block b
+  | EGroup (n, il, None, b) -> "group " ^ n ^ (if il then " interleaved" else "") ^ block b
+  | EGroup (n, il, Some (c, ms), b) ->
+    "group " ^ n ^ (if il then " interleaved" else "") ^ " until " ^ expr c ^ ".after(" ^ expr ms ^ ")" ^ block b
   | EDyn (x, _) -> expr x
   | ESelect arms ->
     "select{"

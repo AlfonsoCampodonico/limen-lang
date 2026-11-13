@@ -477,10 +477,10 @@ let rec expr env locals (e : expr) : expr =
       in
       let fields' = map_same (fun ((f, fsp, x) as fl) -> let y = ex x in if y == x then fl else (f, fsp, y)) fields in
       if n == n0 && fields' == fields then e.edesc else EStruct (n, sp, fields')
-    | EGroup (g, until, b) ->
+    | EGroup (g, il, until, b) ->
       let b' = block env (g :: locals) b in
       let until' = opt_same (fun ((c, ms) as u) -> let ms' = ex ms in let c' = ex c in if c' == c && ms' == ms then u else (c', ms')) until in
-      if b' == b && until' == until then e.edesc else EGroup (g, until', b')
+      if b' == b && until' == until then e.edesc else EGroup (g, il, until', b')
     | EWith (b, fields) ->
       let fields' = map_same (fun ((f, fsp, x) as fl) -> let y = ex x in if y == x then fl else (f, fsp, y)) fields in
       let b' = ex b in

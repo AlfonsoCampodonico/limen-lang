@@ -473,7 +473,8 @@ fn main(root: Root) -> Result[(), IoError] {
     }
     log("watching StaticSites through {base}")
     let events: Chan[Str] = channel(64)
-    let _ = group g {
+    // the watchers run until stopped, so their logs go out as they happen
+    let _ = group g interleaved {
         for what in watched() {
             g.go(|| watch(log, net, base, what, events, clock))
         }

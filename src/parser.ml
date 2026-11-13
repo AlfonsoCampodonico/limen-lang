@@ -398,6 +398,7 @@ and parse_primary st ns =
   | KW "group" ->
     skip st;
     let name, _ = expect_ident st in
+    let interleaved = match cur st with IDENT "interleaved" -> skip st; true | _ -> false in
     let until =
       match cur st with
       | IDENT "until" -> (
@@ -409,7 +410,7 @@ and parse_primary st ns =
       | _ -> None
     in
     let b = parse_block st in
-    mk (EGroup (name, until, b)) (merge sp b.bspan)
+    mk (EGroup (name, interleaved, until, b)) (merge sp b.bspan)
   | _ -> fail (peek st) "an expression"
 
 and str_part st = function

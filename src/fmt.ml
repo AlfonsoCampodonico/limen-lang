@@ -446,8 +446,9 @@ and expr_inner c ind e =
       add c " ";
       expr c ind body
     end
-  | EGroup (name, until, b) ->
+  | EGroup (name, interleaved, until, b) ->
     add c ("group " ^ name ^ " ");
+    if interleaved then add c "interleaved ";
     (match until with
      | Some (clk, ms) ->
        add c "until ";
