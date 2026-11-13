@@ -5,13 +5,21 @@
 open Ast
 open Lexer
 
-type st = { toks : token array; mutable pos : int; file : string }
+type st = { toks : tokens; mutable pos : int; file : string }
 
-let peek st = st.toks.(st.pos)
+(* The token at [st.pos], its kind and whether a newline came before it,
+   read without building a token. *)
+let cur st = st.toks.toks.(st.pos)
+let cur_nl st = nl_before st.toks st.pos
+let tok_at st i = st.toks.toks.(min i (st.toks.count - 1))
+let next st = tok_at st (st.pos + 1)
+let peek st = token st.toks st.pos
+let cur_span st = span st.toks st.pos
+let skip st = match cur st with EOF -> () | _ -> st.pos <- st.pos + 1
 
 let advance st =
-  let t = st.toks.(st.pos) in
-  (match t.tok with EOF -> () | _ -> st.pos <- st.pos + 1);
+  let t = peek st in
+  skip st;
   t
 
 let fail (t : token) expected =
@@ -20,17 +28,22 @@ let fail (t : token) expected =
        (Diag.make "E0003" t.span (Printf.sprintf "expected %s, found %s" expected (describe t.tok))))
 
 let sym_is tok s = match tok with SYM t -> String.equal t s | _ -> false
-let is_sym st s = match (peek st).tok with SYM t -> String.equal t s | _ -> false
-let is_kw st s = match (peek st).tok with KW t -> String.equal t s | _ -> false
-let accept_sym st s = if is_sym st s then (ignore (advance st); true) else false
+let is_sym st s = match cur st with SYM t -> String.equal t s | _ -> false
+let is_kw st s = match cur st with KW t -> String.equal t s | _ -> false
+let accept_sym st s = if is_sym st s then (skip st; true) else false
 let expect_sym st s = if is_sym st s then advance st else fail (peek st) (Printf.sprintf "`%s`" s)
 let expect_kw st s = if is_kw st s then advance st else fail (peek st) (Printf.sprintf "`%s`" s)
 
+(* [expect_sym] and [expect_kw] for when the token itself is not needed *)
+let need_sym st s = if is_sym st s then skip st else ignore (fail (peek st) (Printf.sprintf "`%s`" s))
+let need_kw st s = if is_kw st s then skip st else ignore (fail (peek st) (Printf.sprintf "`%s`" s))
+
 let expect_ident st =
-  match (peek st).tok with
+  match cur st with
   | IDENT s ->
-    let t = advance st in
-    (s, t.span)
+    let sp = span st.toks st.pos in
+    skip st;
+    (s, sp)
   | KW k ->
     raise
       (Diag.Fatal
@@ -39,13 +52,12 @@ let expect_ident st =
             (Printf.sprintf "expected a name, found keyword `%s`" k)))
   | _ -> fail (peek st) "a name"
 
-let last_span st = st.toks.(max 0 (st.pos - 1)).span
+let last_span st = span st.toks (max 0 (st.pos - 1))
 let merge = Span.merge
 let is_upper s = s <> "" && s.[0] >= 'A' && s.[0] <= 'Z'
 let mk d sp = { edesc = d; espan = sp; ety = Types.TErr; einst = []; ecallee = None }
 
 (* Comma-separated list up to [close]; a newline also separates items. *)
-let peek2 st = st.toks.(min (st.pos + 1) (Array.length st.toks - 1))
 
 (* names for the value inside an Option in `a?.b`; reset per file so a
    formatted file parses to the same tree *)
@@ -61,7 +73,7 @@ let comma_list st close f =
       let x = f st in
       if accept_sym st "," then go (x :: acc)
       else if accept_sym st close then List.rev (x :: acc)
-      else if (peek st).nl then go (x :: acc)
+      else if cur_nl st then go (x :: acc)
       else fail (peek st) (Printf.sprintf "`,` or `%s`" close)
     end
   in
@@ -72,19 +84,19 @@ let rec parse_type st : ty_expr =
   match t.tok with
   | KW "dyn" ->
     (* `dyn Shape` is written in the AST as `dyn[Shape]`, `dyn Container[Int]` as `dyn[Container[Int]]` *)
-    ignore (advance st);
+    skip st;
     let a, asp = expect_ident st in
     let name, nsp =
       if is_sym st "." then begin
-        ignore (advance st);
+        skip st;
         let b, bsp = expect_ident st in
         (a ^ "." ^ b, merge asp bsp)
       end
       else (a, asp)
     in
     let args, nsp =
-      if is_sym st "[" && not (peek st).nl then begin
-        ignore (advance st);
+      if is_sym st "[" && not (cur_nl st) then begin
+        skip st;
         let args = comma_list st "]" parse_type in
         (args, merge nsp (last_span st))
       end
@@ -92,7 +104,7 @@ let rec parse_type st : ty_expr =
     in
     { tdesc = TyName ("dyn", [ { tdesc = TyName (name, args); tspan = nsp } ]); tspan = merge t.span nsp }
   | SYM "(" ->
-    ignore (advance st);
+    skip st;
     if is_sym st ")" then
       let r = advance st in
       { tdesc = TyUnit; tspan = merge t.span r.span }
@@ -105,28 +117,28 @@ let rec parse_type st : ty_expr =
       | _ -> { tdesc = TyName (tuple_name (List.length ts), ts); tspan = sp }
     end
   | KW "fn" ->
-    ignore (advance st);
-    ignore (expect_sym st "(");
+    skip st;
+    need_sym st "(";
     let ps = comma_list st ")" parse_type in
-    ignore (expect_sym st "->");
+    need_sym st "->";
     let r = parse_type st in
     { tdesc = TyFn (ps, r); tspan = merge t.span r.tspan }
   | INT n ->
-    ignore (advance st);
+    skip st;
     { tdesc = TyInt (if n > Int64.of_int max_int then max_int else Int64.to_int n); tspan = t.span }
   | IDENT n0 ->
-    ignore (advance st);
+    skip st;
     (* a type from another module: `json.Value` *)
     let n =
       if is_sym st "." then begin
-        ignore (advance st);
+        skip st;
         let m, _ = expect_ident st in
         n0 ^ "." ^ m
       end
       else n0
     in
-    if is_sym st "[" && not (peek st).nl then begin
-      ignore (advance st);
+    if is_sym st "[" && not (cur_nl st) then begin
+      skip st;
       let args = comma_list st "]" parse_type in
       { tdesc = TyName (n, args); tspan = merge t.span (last_span st) }
     end
@@ -165,10 +177,10 @@ and parse_bin st ns minp =
   let lhs = ref (parse_unary st ns) in
   let go = ref true in
   while !go do
-    let t = peek st in
-    match if sym_is t.tok "|>" then None else if t.nl then None else binop_of t.tok with
-    | _ when sym_is t.tok "|>" && minp < 1 ->
-      ignore (advance st);
+    let tok = cur st in
+    match if sym_is tok "|>" then None else if cur_nl st then None else binop_of tok with
+    | _ when sym_is tok "|>" && minp < 1 ->
+      skip st;
       let rhs = parse_bin st ns 1 in
       if pipe_call !lhs rhs = None then
         raise
@@ -178,7 +190,7 @@ and parse_bin st ns minp =
                 "the right side of `|>` must be a function or a call, as in `x |> f`, `x |> f(a)` or `x |> list.map(g)`"));
       lhs := mk (EPipe (!lhs, rhs)) (merge (!lhs).espan rhs.espan)
     | Some (p, op) when p > minp ->
-      ignore (advance st);
+      skip st;
       let rhs = parse_bin st ns p in
       lhs := mk (EBin (op, !lhs, rhs)) (merge (!lhs).espan rhs.espan)
     | _ -> go := false
@@ -186,89 +198,95 @@ and parse_bin st ns minp =
   !lhs
 
 and parse_unary st ns =
-  let t = peek st in
-  match t.tok with
+  match cur st with
   | SYM "-" ->
-    ignore (advance st);
+    let sp = cur_span st in
+    skip st;
     let e = parse_unary st ns in
-    mk (EUn (Neg, e)) (merge t.span e.espan)
+    mk (EUn (Neg, e)) (merge sp e.espan)
   | SYM "!" ->
-    ignore (advance st);
+    let sp = cur_span st in
+    skip st;
     let e = parse_unary st ns in
-    mk (EUn (Not, e)) (merge t.span e.espan)
+    mk (EUn (Not, e)) (merge sp e.espan)
   | _ -> parse_postfix st ns (parse_primary st ns)
 
 (* [in_safe]: parsing the rest of a `?.` chain, which takes every postfix
    operation up to a `?` (that one applies to the whole chain). *)
 and parse_postfix ?(in_safe = false) st ns e =
-  let t = peek st in
-  let continue_ = parse_postfix ~in_safe st ns in
-  (* `.name`, `.name(args)` or `.0` after the dot *)
-  let member e =
-    match (peek st).tok with
-    | INT k ->
-      let it = advance st in
-      mk (EField (e, Int64.to_string k, it.span)) (merge e.espan it.span)
-    | _ ->
-      let name, nsp = expect_ident st in
-      if is_sym st "(" && not (peek st).nl then begin
-        ignore (advance st);
-        let args = comma_list st ")" parse_arg in
-        let args = args @ trailing_closure st ns in
-        mk (EMethod (e, name, nsp, args)) (merge e.espan (last_span st))
-      end
-      else if is_sym st "{" && (not (peek st).nl) && starts_trailing st ns then begin
-        (* `items.each { |x| ... }` *)
-        let args = trailing_closure st ns in
-        mk (EMethod (e, name, nsp, args)) (merge e.espan (last_span st))
-      end
-      else mk (EField (e, name, nsp)) (merge e.espan nsp)
-  in
-  match t.tok with
-  | SYM "(" when not t.nl ->
-    ignore (advance st);
-    let args = comma_list st ")" parse_arg in
-    let args = args @ trailing_closure st ns in
-    continue_ (mk (ECall (e, args)) (merge e.espan (last_span st)))
-  | SYM "{" when (not t.nl) && (match e.edesc with EVar n -> not (is_upper n) | _ -> false) && starts_trailing st ns ->
+  let nl = cur_nl st in
+  match cur st with
+  | SYM "(" when not nl ->
+    skip st;
+    let args = call_args st ns in
+    parse_postfix ~in_safe st ns (mk (ECall (e, args)) (merge e.espan (last_span st)))
+  | SYM "{" when (not nl) && (match e.edesc with EVar n -> not (is_upper n) | _ -> false) && starts_trailing st ns ->
     (* `catch { ... }`: a trailing closure and no parentheses *)
     let args = trailing_closure st ns in
-    continue_ (mk (ECall (e, args)) (merge e.espan (last_span st)))
-  | SYM "[" when not t.nl ->
-    ignore (advance st);
+    parse_postfix ~in_safe st ns (mk (ECall (e, args)) (merge e.espan (last_span st)))
+  | SYM "[" when not nl ->
+    skip st;
     let i = parse_expr st in
     let r = expect_sym st "]" in
-    continue_ (mk (EIndex (e, i)) (merge e.espan r.span))
+    parse_postfix ~in_safe st ns (mk (EIndex (e, i)) (merge e.espan r.span))
   | SYM "." ->
-    ignore (advance st);
-    continue_ (member e)
+    skip st;
+    parse_postfix ~in_safe st ns (parse_member st ns e)
   | SYM "?." ->
     (* safe navigation: the rest of the chain runs on the value inside the
        Option, and None short-circuits all of it *)
-    ignore (advance st);
+    let sp = cur_span st in
+    skip st;
     incr safe_count;
     let x = Printf.sprintf "safe$%d" !safe_count in
-    let hole = mk (EVar x) t.span in
-    let rest = parse_postfix ~in_safe:true st ns (member hole) in
+    let hole = mk (EVar x) sp in
+    let rest = parse_postfix ~in_safe:true st ns (parse_member st ns hole) in
     let node = mk (ESafe (e, x, rest, false)) (merge e.espan rest.espan) in
-    if in_safe then node else continue_ node
-  | SYM "?" when not t.nl && not in_safe -> (
-    ignore (advance st);
+    if in_safe then node else parse_postfix ~in_safe st ns node
+  | SYM "?" when (not nl) && not in_safe -> (
+    let sp = cur_span st in
+    skip st;
     (* `x? "reading config"`: a string on the same line adds context to the error *)
-    match (peek st).tok with
-    | STR _ when not (peek st).nl ->
+    match cur st with
+    | STR _ when not (cur_nl st) ->
       let c = parse_primary st ns in
-      continue_ (mk (ETry (e, Some c)) (merge e.espan c.espan))
-    | _ -> continue_ (mk (ETry (e, None)) (merge e.espan t.span)))
+      parse_postfix ~in_safe st ns (mk (ETry (e, Some c)) (merge e.espan c.espan))
+    | _ -> parse_postfix ~in_safe st ns (mk (ETry (e, None)) (merge e.espan sp)))
   | _ -> e
+
+(* `.name`, `.name(args)` or `.0` after the dot *)
+and parse_member st ns e =
+  match cur st with
+  | INT k ->
+    let it = advance st in
+    mk (EField (e, Int64.to_string k, it.span)) (merge e.espan it.span)
+  | _ ->
+    let name, nsp = expect_ident st in
+    if is_sym st "(" && not (cur_nl st) then begin
+      skip st;
+      let args = call_args st ns in
+      mk (EMethod (e, name, nsp, args)) (merge e.espan (last_span st))
+    end
+    else if is_sym st "{" && (not (cur_nl st)) && starts_trailing st ns then begin
+      (* `items.each { |x| ... }` *)
+      let args = trailing_closure st ns in
+      mk (EMethod (e, name, nsp, args)) (merge e.espan (last_span st))
+    end
+    else mk (EField (e, name, nsp)) (merge e.espan nsp)
+
+(* The arguments of a call whose `(` has been read, with a trailing closure
+   after the `)` if there is one. *)
+and call_args st ns =
+  let args = comma_list st ")" parse_arg in
+  match trailing_closure st ns with [] -> args | closure -> args @ closure
 
 (* A call argument: an expression, or `name: expression` naming the
    parameter it is for. *)
 and parse_arg st =
-  match ((peek st).tok, (peek2 st).tok) with
+  match (cur st, next st) with
   | IDENT n, SYM ":" ->
     let t = advance st in
-    ignore (advance st);
+    skip st;
     let v = parse_expr st in
     mk (ENamed (n, t.span, v)) (merge t.span v.espan)
   | _ -> parse_expr st
@@ -281,7 +299,7 @@ and parse_arg st =
 and starts_trailing st ns =
   if not ns then true
   else begin
-    (match (peek2 st).tok with
+    (match next st with
      | SYM "|" | SYM "||" ->
        raise
          (Diag.Fatal
@@ -295,14 +313,13 @@ and starts_trailing st ns =
 (* `f(a) { |x| ... }`: a closure written after the call's parentheses, passed
    as its last argument. [] when there is none. *)
 and trailing_closure st ns =
-  let t = peek st in
-  if sym_is t.tok "{" && (not t.nl) && starts_trailing st ns then begin
+  if is_sym st "{" && (not (cur_nl st)) && starts_trailing st ns then begin
     let lb = advance st in
     let params =
-      match (peek st).tok with
-      | SYM "||" -> ignore (advance st); []
+      match cur st with
+      | SYM "||" -> skip st; []
       | SYM "|" ->
-        ignore (advance st);
+        skip st;
         comma_list st "|" (fun st ->
             let n, sp = expect_ident st in
             let ty = if accept_sym st ":" then Some (parse_type st) else None in
@@ -315,49 +332,48 @@ and trailing_closure st ns =
   else []
 
 and parse_primary st ns =
-  let t = peek st in
-  match t.tok with
-  | INT n -> ignore (advance st); mk (EInt n) t.span
-  | FLOAT f -> ignore (advance st); mk (EFloat f) t.span
-  | KW "true" -> ignore (advance st); mk (EBool true) t.span
-  | KW "false" -> ignore (advance st); mk (EBool false) t.span
+  let sp = cur_span st in
+  match cur st with
+  | INT n -> skip st; mk (EInt n) sp
+  | FLOAT f -> skip st; mk (EFloat f) sp
+  | KW "true" -> skip st; mk (EBool true) sp
+  | KW "false" -> skip st; mk (EBool false) sp
   | STR parts ->
-    ignore (advance st);
-    mk (EStr (List.map (str_part st) parts)) t.span
+    skip st;
+    mk (EStr (List.map (str_part st) parts)) sp
   | IDENT name ->
-    ignore (advance st);
-    let tok k = st.toks.(min (st.pos + k) (Array.length st.toks - 1)) in
-    if (not ns) && is_upper name && is_sym st "{" then parse_struct_lit st name t.span
-    else if (not ns) && is_sym st "." && (match (tok 1).tok with IDENT b -> is_upper b | _ -> false) && sym_is (tok 2).tok "{"
-            && not (tok 1).nl then begin
+    skip st;
+    if (not ns) && is_upper name && is_sym st "{" then parse_struct_lit st name sp
+    else if (not ns) && is_sym st "." && (match next st with IDENT b -> is_upper b | _ -> false) && sym_is (tok_at st (st.pos + 2)) "{"
+            && not (nl_before st.toks (min (st.pos + 1) (st.toks.count - 1))) then begin
       (* a struct from another module: `json.Field { ... }` *)
-      ignore (advance st);
+      skip st;
       let b, bsp = expect_ident st in
-      parse_struct_lit st (name ^ "." ^ b) (merge t.span bsp)
+      parse_struct_lit st (name ^ "." ^ b) (merge sp bsp)
     end
-    else mk (EVar name) t.span
+    else mk (EVar name) sp
   | SYM "(" ->
-    ignore (advance st);
+    skip st;
     if is_sym st ")" then
       let r = advance st in
-      mk EUnit (merge t.span r.span)
+      mk EUnit (merge sp r.span)
     else
       let e = parse_expr st in
       if is_sym st "," then begin
         (* a tuple: `(a, b)` *)
-        ignore (advance st);
+        skip st;
         let rest = comma_list st ")" parse_expr in
         let es = e :: rest in
-        let sp = merge t.span (last_span st) in
-        mk (EStruct (tuple_name (List.length es), t.span, List.mapi (fun i x -> (string_of_int i, x.espan, x)) es)) sp
+        let whole = merge sp (last_span st) in
+        mk (EStruct (tuple_name (List.length es), sp, List.mapi (fun i x -> (string_of_int i, x.espan, x)) es)) whole
       end
       else
         let r = expect_sym st ")" in
-        { e with espan = merge t.span r.span }
+        { e with espan = merge sp r.span }
   | SYM "[" ->
-    ignore (advance st);
+    skip st;
     let es = comma_list st "]" parse_expr in
-    mk (EList es) (merge t.span (last_span st))
+    mk (EList es) (merge sp (last_span st))
   | SYM "{" when is_with_lit st -> parse_with st
   | SYM "{" ->
     let b = parse_block st in
@@ -366,7 +382,7 @@ and parse_primary st ns =
   | KW "match" -> parse_match st
   | KW "select" -> parse_select st
   | SYM "|" ->
-    ignore (advance st);
+    skip st;
     let params =
       comma_list st "|" (fun st ->
           let n, sp = expect_ident st in
@@ -374,18 +390,18 @@ and parse_primary st ns =
           (n, ty, sp))
     in
     let body = parse_expr st in
-    mk (EClosure (params, body)) (merge t.span body.espan)
+    mk (EClosure (params, body)) (merge sp body.espan)
   | SYM "||" ->
-    ignore (advance st);
+    skip st;
     let body = parse_expr st in
-    mk (EClosure ([], body)) (merge t.span body.espan)
+    mk (EClosure ([], body)) (merge sp body.espan)
   | KW "group" ->
-    ignore (advance st);
+    skip st;
     let name, _ = expect_ident st in
     let until =
-      match (peek st).tok with
+      match cur st with
       | IDENT "until" -> (
-        ignore (advance st);
+        skip st;
         let d = parse_expr_ns st in
         match d.edesc with
         | EMethod (clk, "after", _, [ ms ]) -> Some (clk, ms)
@@ -393,8 +409,8 @@ and parse_primary st ns =
       | _ -> None
     in
     let b = parse_block st in
-    mk (EGroup (name, until, b)) (merge t.span b.bspan)
-  | _ -> fail t "an expression"
+    mk (EGroup (name, until, b)) (merge sp b.bspan)
+  | _ -> fail (peek st) "an expression"
 
 and str_part st = function
   | Lit s -> SPLit s
@@ -402,27 +418,26 @@ and str_part st = function
     let toks = Lexer.lex ~base:off st.file src in
     let sub = { toks; pos = 0; file = st.file } in
     let e = parse_expr sub in
-    if (peek sub).tok <> EOF then fail (peek sub) "`}` to close the interpolation";
+    if cur sub <> EOF then fail (peek sub) "`}` to close the interpolation";
     SPExpr e
 
 (* At a `{`: is this `{ base with field: ... }` rather than a block? It is
    when `with` follows the base on the first line, outside any brackets, and
    is followed by a field: `with x:`, `with x,` or `with x }`. *)
 and is_with_lit st =
-  let n = Array.length st.toks in
+  let n = st.toks.count in
   let rec scan i depth =
     if i >= n then false
     else
-      let t = st.toks.(i) in
-      if depth = 0 && t.nl && i > st.pos + 1 then false
+      if depth = 0 && nl_before st.toks i && i > st.pos + 1 then false
       else
-        match t.tok with
+        match st.toks.toks.(i) with
         | EOF -> false
         | SYM ("(" | "[" | "{") -> scan (i + 1) (depth + 1)
         | SYM (")" | "]" | "}") -> if depth = 0 then false else scan (i + 1) (depth - 1)
         | SYM ";" when depth = 0 -> false
         | IDENT "with" when depth = 0 && i > st.pos + 1 && i + 2 < n -> (
-          match (st.toks.(i + 1).tok, st.toks.(i + 2).tok) with
+          match (st.toks.toks.(i + 1), st.toks.toks.(i + 2)) with
           | IDENT _, SYM (":" | "," | "}") -> true
           | _ -> scan (i + 1) depth)
         | _ -> scan (i + 1) depth
@@ -432,7 +447,7 @@ and is_with_lit st =
 and parse_with st =
   let lb = expect_sym st "{" in
   let base = parse_expr st in
-  (match (peek st).tok with IDENT "with" -> ignore (advance st) | _ -> fail (peek st) "`with`");
+  (match cur st with IDENT "with" -> skip st | _ -> fail (peek st) "`with`");
   let fields =
     comma_list st "}" (fun st ->
         let f, fsp = expect_ident st in
@@ -441,7 +456,7 @@ and parse_with st =
   mk (EWith (base, fields)) (merge lb.span (last_span st))
 
 and parse_struct_lit st name nsp =
-  ignore (expect_sym st "{");
+  need_sym st "{";
   let fields =
     comma_list st "}" (fun st ->
         let f, fsp = expect_ident st in
@@ -454,7 +469,7 @@ and parse_if st =
   let c = parse_expr_ns st in
   let b = parse_block st in
   if is_kw st "else" then begin
-    ignore (advance st);
+    skip st;
     let e =
       if is_kw st "if" then parse_if st
       else
@@ -468,32 +483,32 @@ and parse_if st =
 and parse_match st =
   let t = expect_kw st "match" in
   let s = parse_expr_ns st in
-  ignore (expect_sym st "{");
+  need_sym st "{";
   let arms = ref [] in
   while not (accept_sym st "}") do
     let p = parse_pat st in
-    let guard = if is_kw st "if" then (ignore (advance st); Some (parse_expr st)) else None in
-    ignore (expect_sym st "=>");
+    let guard = if is_kw st "if" then (skip st; Some (parse_expr st)) else None in
+    need_sym st "=>";
     let body = parse_expr st in
     arms := { apat = p; aguard = guard; abody = body } :: !arms;
-    if (not (accept_sym st ",")) && (not (is_sym st "}")) && not (peek st).nl then
+    if (not (accept_sym st ",")) && (not (is_sym st "}")) && not (cur_nl st) then
       fail (peek st) "`,` or a new line between match arms"
   done;
   mk (EMatch (s, List.rev !arms)) (merge t.span (last_span st))
 
 and parse_select st =
   let t = expect_kw st "select" in
-  ignore (expect_sym st "{");
+  need_sym st "{";
   let arms = ref [] in
   while not (accept_sym st "}") do
     let a = peek st in
     let op =
-      match (a.tok, (peek2 st).tok) with
-      | IDENT "_", SYM "=>" -> ignore (advance st); SelDefault
+      match (a.tok, next st) with
+      | IDENT "_", SYM "=>" -> skip st; SelDefault
       | IDENT n, SYM "=" ->
         (* `v = ch.recv()` *)
-        ignore (advance st);
-        ignore (advance st);
+        skip st;
+        skip st;
         let e = parse_expr st in
         (match e.edesc with
          | EMethod (ch, "recv", _, []) -> SelRecv ((if n = "_" then None else Some (n, a.span)), ch)
@@ -510,11 +525,11 @@ and parse_select st =
                (Diag.make "E0003" e.espan
                   "a `select` arm is `name = ch.recv()`, `ch.send(value)`, `clock.after(ms)` (a timeout) or `_` (when nothing is ready)")))
     in
-    let guard = if is_kw st "if" then (ignore (advance st); Some (parse_expr st)) else None in
-    ignore (expect_sym st "=>");
+    let guard = if is_kw st "if" then (skip st; Some (parse_expr st)) else None in
+    need_sym st "=>";
     let body = parse_expr st in
     arms := { sop = op; sguard = guard; sbody = body; sspan_ = merge a.span body.espan } :: !arms;
-    if (not (accept_sym st ",")) && (not (is_sym st "}")) && not (peek st).nl then
+    if (not (accept_sym st ",")) && (not (is_sym st "}")) && not (cur_nl st) then
       fail (peek st) "`,` or a new line between select arms"
   done;
   mk (ESelect (List.rev !arms)) (merge t.span (last_span st))
@@ -523,39 +538,39 @@ and parse_pat st =
   let t = peek st in
   let mkp d sp = { pdesc = d; pspan = sp } in
   match t.tok with
-  | IDENT "_" -> ignore (advance st); mkp PWild t.span
-  | INT n -> ignore (advance st); mkp (PInt n) t.span
+  | IDENT "_" -> skip st; mkp PWild t.span
+  | INT n -> skip st; mkp (PInt n) t.span
   | SYM "-" -> (
-    ignore (advance st);
-    match (peek st).tok with
+    skip st;
+    match cur st with
     | INT n ->
       let t2 = advance st in
       mkp (PInt (Int64.neg n)) (merge t.span t2.span)
     | _ -> fail (peek st) "a number")
-  | STR [] -> ignore (advance st); mkp (PStr "") t.span
-  | STR [ Lit s ] -> ignore (advance st); mkp (PStr s) t.span
+  | STR [] -> skip st; mkp (PStr "") t.span
+  | STR [ Lit s ] -> skip st; mkp (PStr s) t.span
   | STR _ -> fail t "a plain string (no interpolation) in a pattern"
-  | KW "true" -> ignore (advance st); mkp (PBool true) t.span
-  | KW "false" -> ignore (advance st); mkp (PBool false) t.span
+  | KW "true" -> skip st; mkp (PBool true) t.span
+  | KW "false" -> skip st; mkp (PBool false) t.span
   | IDENT a ->
-    ignore (advance st);
+    skip st;
     let q, v, vsp =
       if is_sym st "." then begin
-        ignore (advance st);
+        skip st;
         let v, vsp = expect_ident st in
         (Some a, v, vsp)
       end
       else (None, a, t.span)
     in
     if is_sym st "(" then begin
-      ignore (advance st);
+      skip st;
       let args = comma_list st ")" parse_pat in
       mkp (PVariant (q, v, args)) (merge t.span (last_span st))
     end
     else if q <> None || is_upper v then mkp (PVariant (q, v, [])) (merge t.span vsp)
     else mkp (PBind v) t.span
   | SYM "(" ->
-    ignore (advance st);
+    skip st;
     let ps = comma_list st ")" parse_pat in
     let sp = merge t.span (last_span st) in
     (match ps with
@@ -580,11 +595,11 @@ and parse_block_body st (lb : token) =
         | _ -> stmts := s :: !stmts
       end
       else begin
-        if (not semi) && not (peek st).nl then
+        if (not semi) && not (cur_nl st) then
           raise
             (Diag.Fatal
                (Diag.make "E0004" (peek st).span
-                  (Printf.sprintf "expected a new line or `;` before %s" (describe (peek st).tok))));
+                  (Printf.sprintf "expected a new line or `;` before %s" (describe (cur st)))));
         stmts := s :: !stmts;
         loop ()
       end
@@ -595,77 +610,77 @@ and parse_block_body st (lb : token) =
   { stmts = List.rev !stmts; tail = !tail; bspan = merge lb.span rb.span }
 
 and parse_stmt st =
-  let t = peek st in
+  let sp = cur_span st in
   let mks d sp = { sdesc = d; sspan = sp } in
-  match t.tok with
+  match cur st with
   | KW "let" ->
-    ignore (advance st);
-    let m = if is_kw st "mut" then (ignore (advance st); true) else false in
+    skip st;
+    let m = if is_kw st "mut" then (skip st; true) else false in
     if is_sym st "(" then begin
       (* `let (a, b) = e` *)
       let p = parse_pat st in
       if not (irrefutable_tuple p) then
         raise (Diag.Fatal (Diag.make "E0003" p.pspan "`let` can only unpack a tuple into names and `_`, as in `let (a, _) = t`"));
-      ignore (expect_sym st "=");
+      need_sym st "=";
       let e = parse_expr st in
-      mks (SLetPat (p, e)) (merge t.span e.espan)
+      mks (SLetPat (p, e)) (merge sp e.espan)
     end
     else
     let n, nsp = expect_ident st in
     let ann = if accept_sym st ":" then Some (parse_type st) else None in
-    ignore (expect_sym st "=");
+    need_sym st "=";
     let e = parse_expr st in
-    mks (SLet (m, n, nsp, ann, e)) (merge t.span e.espan)
+    mks (SLet (m, n, nsp, ann, e)) (merge sp e.espan)
   | KW "return" ->
-    ignore (advance st);
+    skip st;
     let nt = peek st in
-    if nt.nl || sym_is nt.tok "}" || sym_is nt.tok ";" then mks (SReturn None) t.span
+    if nt.nl || sym_is nt.tok "}" || sym_is nt.tok ";" then mks (SReturn None) sp
     else
       let e = parse_expr st in
-      mks (SReturn (Some e)) (merge t.span e.espan)
+      mks (SReturn (Some e)) (merge sp e.espan)
   | KW "while" ->
-    ignore (advance st);
+    skip st;
     let c = parse_expr_ns st in
     let b = parse_block st in
-    mks (SWhile (c, b)) (merge t.span b.bspan)
-  | KW "for" when (match (peek2 st).tok with SYM "(" -> true | _ -> false) ->
-    ignore (advance st);
+    mks (SWhile (c, b)) (merge sp b.bspan)
+  | KW "for" when (match next st with SYM "(" -> true | _ -> false) ->
+    skip st;
     let p = parse_pat st in
     if not (irrefutable_tuple p) then
       raise (Diag.Fatal (Diag.make "E0003" p.pspan "`for` can only unpack a tuple into names and `_`, as in `for (k, v) in m.entries()`"));
-    ignore (expect_kw st "in");
+    need_kw st "in";
     let e = parse_expr_ns st in
     let b = parse_block st in
-    mks (SForPat (p, e, b)) (merge t.span b.bspan)
+    mks (SForPat (p, e, b)) (merge sp b.bspan)
   | KW "for" ->
-    ignore (advance st);
+    skip st;
     let n, nsp = expect_ident st in
-    ignore (expect_kw st "in");
+    need_kw st "in";
     let e = parse_expr_ns st in
     let b = parse_block st in
-    mks (SFor (n, nsp, e, b)) (merge t.span b.bspan)
-  | KW "break" -> ignore (advance st); mks SBreak t.span
-  | KW "continue" -> ignore (advance st); mks SContinue t.span
+    mks (SFor (n, nsp, e, b)) (merge sp b.bspan)
+  | KW "break" -> skip st; mks SBreak sp
+  | KW "continue" -> skip st; mks SContinue sp
   | KW "defer" ->
-    ignore (advance st);
+    skip st;
     if is_sym st "{" then
       let b = parse_block st in
-      mks (SDefer b) (merge t.span b.bspan)
+      mks (SDefer b) (merge sp b.bspan)
     else
       (* one expression or assignment: `defer f.close()`, `defer n = n + 1` *)
       let s = parse_stmt st in
       (match s.sdesc with
-       | SExpr e -> mks (SDefer { stmts = []; tail = Some e; bspan = e.espan }) (merge t.span e.espan)
+       | SExpr e -> mks (SDefer { stmts = []; tail = Some e; bspan = e.espan }) (merge sp e.espan)
        | SLet _ | SLetPat _ ->
          raise
            (Diag.Fatal
               (Diag.make "E0003" s.sspan "a `let` after `defer` would bind a name nothing can use"
                  ~notes:[ "wrap statements in braces: `defer { ... }`" ]))
-       | _ -> mks (SDefer { stmts = [ s ]; tail = None; bspan = s.sspan }) (merge t.span s.sspan))
+       | _ -> mks (SDefer { stmts = [ s ]; tail = None; bspan = s.sspan }) (merge sp s.sspan))
   | _ ->
     let e = parse_expr st in
     if is_sym st "=" then begin
-      ignore (advance st);
+      skip st;
       let r = parse_expr st in
       mks (SAssign (e, r)) (merge e.espan r.espan)
     end
@@ -675,7 +690,7 @@ and parse_stmt st =
    written as types: `Shape`, `geo.Area`, `Container[Int]`. *)
 let parse_bounded_generics st =
   if is_sym st "[" then begin
-    ignore (advance st);
+    skip st;
     comma_list st "]" (fun st ->
         let g, _ = expect_ident st in
         let bounds =
@@ -715,14 +730,14 @@ let parse_param st =
   let pn, psp = expect_ident st in
   if not (is_sym st ":") then
     raise (Diag.Fatal (Diag.make "E0008" psp (Printf.sprintf "parameter `%s` needs a type, for example `%s: Int`" pn pn)));
-  ignore (advance st);
+  skip st;
   { prm_name = pn; prm_span = psp; prm_ty = parse_type st }
 
 let parse_item st =
   let t = peek st in
   match t.tok with
-  | IDENT (("test" | "bench") as kind) when (match st.toks.(min (st.pos + 1) (Array.length st.toks - 1)).tok with STR _ -> true | _ -> false) ->
-    ignore (advance st);
+  | IDENT (("test" | "bench") as kind) when (match next st with STR _ -> true | _ -> false) ->
+    skip st;
     let s = advance st in
     let name =
       match s.tok with
@@ -739,7 +754,7 @@ let parse_item st =
         let p = parse_pat st in
         if not (irrefutable_tuple p) then
           raise (Diag.Fatal (Diag.make "E0003" p.pspan "a table test names each case's parts, as in `for (a, b, want) in [(1, 2, 3)]`"));
-        ignore (expect_kw st "in");
+        need_kw st "in";
         let e = parse_expr_ns st in
         match e.edesc with
         | EList (_ :: _) -> Some (p, e)
@@ -761,32 +776,32 @@ let parse_item st =
         fn_body = body; fn_test = Some name; fn_bench = kind = "bench"; fn_table = table; fn_pub = false; fn_bounds = [];
         fn_foreign = None }
   | KW "fn" ->
-    ignore (advance st);
+    skip st;
     let name, nsp = expect_ident st in
     let gen, bounds = split_generics (parse_bounded_generics st) in
-    ignore (expect_sym st "(");
+    need_sym st "(";
     let params = comma_list st ")" parse_param in
     let ret = if accept_sym st "->" then Some (parse_type st) else None in
     let body = parse_block st in
     IFn { fn_name = name; fn_span = nsp; fn_gen = gen; fn_params = params; fn_ret = ret; fn_body = body; fn_test = None; fn_bench = false; fn_table = None; fn_pub = false; fn_bounds = bounds; fn_foreign = None }
   | KW "struct" ->
-    ignore (advance st);
+    skip st;
     let name, nsp = expect_ident st in
     let gen, bounds = split_generics (parse_bounded_generics st) in
-    ignore (expect_sym st "{");
+    need_sym st "{";
     (* a field is `name: Type`, or a bare struct type that is embedded:
        `User`, `auth.User`, `Pair[Int]`, stored as a field named `User` *)
     let embeds = ref [] in
     let fields =
       comma_list st "}" (fun st ->
-          match ((peek st).tok, (peek2 st).tok) with
+          match (cur st, next st) with
           | IDENT _, SYM ":" ->
             let f, fsp = expect_ident st in
-            ignore (expect_sym st ":");
+            need_sym st ":";
             (f, fsp, parse_type st)
           | IDENT n, nxt
             when is_upper n
-                 || (nxt = SYM "." && match (st.toks.(min (st.pos + 2) (Array.length st.toks - 1))).tok with IDENT b -> is_upper b | _ -> false) ->
+                 || (nxt = SYM "." && match tok_at st (st.pos + 2) with IDENT b -> is_upper b | _ -> false) ->
             let te = parse_type st in
             let f =
               match te.tdesc with
@@ -797,15 +812,15 @@ let parse_item st =
             (f, te.tspan, te)
           | _ ->
             let f, fsp = expect_ident st in
-            ignore (expect_sym st ":");
+            need_sym st ":";
             (f, fsp, parse_type st))
     in
     IStruct { st_name = name; st_span = nsp; st_gen = gen; st_bounds = bounds; st_fields = fields; st_embeds = List.rev !embeds; st_pub = false; st_foreign = None }
   | KW "enum" ->
-    ignore (advance st);
+    skip st;
     let name, nsp = expect_ident st in
     let gen, bounds = split_generics (parse_bounded_generics st) in
-    ignore (expect_sym st "{");
+    need_sym st "{";
     let variants =
       comma_list st "}" (fun st ->
           let v, vsp = expect_ident st in
@@ -814,38 +829,38 @@ let parse_item st =
     in
     IEnum { en_name = name; en_span = nsp; en_gen = gen; en_variants = variants; en_bounds = bounds; en_pub = false }
   | KW "interface" ->
-    ignore (advance st);
+    skip st;
     let name, nsp = expect_ident st in
     let gen = parse_generics st in
-    ignore (expect_sym st "{");
+    need_sym st "{";
     let methods =
       comma_list st "}" (fun st ->
           if not (is_kw st "fn") then fail (peek st) "`fn name(self, ...)` in an interface";
-          ignore (advance st);
+          skip st;
           let m, msp = expect_ident st in
-          ignore (expect_sym st "(");
+          need_sym st "(";
           let selft = peek st in
           (match selft.tok with
-           | IDENT "self" -> ignore (advance st)
+           | IDENT "self" -> skip st
            | _ -> raise (Diag.Fatal (Diag.make "E0003" selft.span "an interface method's first parameter is `self`, without a type")));
           let params =
             if accept_sym st "," then
               comma_list st ")" (fun st ->
                   let pn, psp = expect_ident st in
-                  ignore (expect_sym st ":");
+                  need_sym st ":";
                   { prm_name = pn; prm_span = psp; prm_ty = parse_type st })
-            else (ignore (expect_sym st ")"); [])
+            else (need_sym st ")"; [])
           in
           let ret = if accept_sym st "->" then Some (parse_type st) else None in
           (m, msp, params, ret))
     in
     IIface { if_name = name; if_span = nsp; if_gen = gen; if_methods = methods; if_pub = false }
-  | IDENT "type" when (match st.toks.(min (st.pos + 1) (Array.length st.toks - 1)).tok with IDENT _ -> true | _ -> false) ->
+  | IDENT "type" when (match next st with IDENT _ -> true | _ -> false) ->
     (* `type` is a word only here, so it stays usable as a name elsewhere *)
-    ignore (advance st);
+    skip st;
     let name, nsp = expect_ident st in
     let gen = parse_generics st in
-    ignore (expect_sym st "=");
+    need_sym st "=";
     IType { ty_name = name; ty_span = nsp; ty_gen = gen; ty_body = parse_type st; ty_pub = false }
   | _ -> fail t "an item (`fn`, `struct`, `enum`, `interface` or `type`)"
 
@@ -857,27 +872,27 @@ let parse_item st =
    `struct Name { field: T, ... }` in the block declares a C struct passed by
    value. *)
 let parse_foreign st =
-  ignore (advance st);
+  skip st;
   let s = advance st in
   let lib =
     match s.tok with
     | STR [ Lit n ] -> n
     | _ -> raise (Diag.Fatal (Diag.make "E0003" s.span "a foreign library name must be a plain string, as in `foreign \"sqlite3\" { ... }`"))
   in
-  ignore (expect_sym st "{");
+  need_sym st "{";
   let items = ref [] in
   while not (is_sym st "}") do
-    if (peek st).tok = EOF then fail (peek st) "`}` to end the foreign block";
-    let pub = if is_kw st "pub" then (ignore (advance st); true) else false in
+    if cur st = EOF then fail (peek st) "`}` to end the foreign block";
+    let pub = if is_kw st "pub" then (skip st; true) else false in
     if is_kw st "struct" then begin
-      ignore (advance st);
+      skip st;
       let name, nsp = expect_ident st in
       if is_sym st "[" then raise (Diag.Fatal (Diag.make "E0003" (peek st).span "a foreign struct cannot have type parameters"));
-      ignore (expect_sym st "{");
+      need_sym st "{";
       let fields =
         comma_list st "}" (fun st ->
             let f, fsp = expect_ident st in
-            ignore (expect_sym st ":");
+            need_sym st ":";
             (f, fsp, parse_type st))
       in
       items :=
@@ -888,11 +903,11 @@ let parse_foreign st =
     end
     else begin
       if not (is_kw st "fn") then fail (peek st) "`fn name(...) -> Type` or `struct Name { ... }` in a foreign block";
-      ignore (advance st);
+      skip st;
       let name, nsp = expect_ident st in
       if is_sym st "[" then
         raise (Diag.Fatal (Diag.make "E0003" (peek st).span "a foreign function cannot have type parameters"));
-      ignore (expect_sym st "(");
+      need_sym st "(";
       let variadic = ref None and count = ref 0 in
       let params =
         List.filter_map Fun.id
@@ -929,9 +944,9 @@ let parse_foreign st =
         :: !items
     end;
     (* one declaration per line (or separated by `;`) *)
-    if not (accept_sym st ";" || is_sym st "}" || (peek st).nl) then fail (peek st) "a new line after a foreign declaration"
+    if not (accept_sym st ";" || is_sym st "}" || cur_nl st) then fail (peek st) "a new line after a foreign declaration"
   done;
-  ignore (advance st);
+  skip st;
   List.rev !items
 
 let set_pub = function
@@ -947,19 +962,19 @@ let parse_file file src : file =
   let toks = Lexer.lex file src in
   let st = { toks; pos = 0; file } in
   let items = ref [] and uses = ref [] in
-  while (peek st).tok <> EOF do
+  while cur st <> EOF do
     if is_kw st "use" then begin
-      ignore (advance st);
+      skip st;
       let m, msp = expect_ident st in
       uses := (m, msp) :: !uses
     end
     else if is_kw st "pub" then begin
-      ignore (advance st);
-      match (peek st).tok with
+      skip st;
+      match cur st with
       | KW ("fn" | "struct" | "enum" | "interface") | IDENT "type" -> items := set_pub (parse_item st) :: !items
       | _ -> fail (peek st) "`fn`, `struct`, `enum`, `interface` or `type` after `pub`"
     end
-    else if (match (peek st).tok with IDENT "foreign" -> (match (peek2 st).tok with STR _ -> true | _ -> false) | _ -> false) then
+    else if (match cur st with IDENT "foreign" -> (match next st with STR _ -> true | _ -> false) | _ -> false) then
       items := List.rev_append (parse_foreign st) !items
     else items := parse_item st :: !items
   done;

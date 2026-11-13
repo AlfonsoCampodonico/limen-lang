@@ -65,7 +65,11 @@ let param_kinds : (string, bool) Hashtbl.t = Hashtbl.create 8
 type var_kind = KLet | KParam | KPat | KGroup
 type var_info = { vty : ty; vmut : bool; vspan : Span.t; vkind : var_kind }
 type fsig = { gen : string list; ps : ty list; ret : ty }
-type scope = { vars : (string, var_info) Hashtbl.t; barrier : bool }
+type scope = { mutable vars : (string, var_info) Hashtbl.t; barrier : bool }
+
+(* The variables of a scope that has none yet; [bind] gives the scope a
+   table of its own, so the many blocks that bind nothing allocate none. *)
+let no_vars : (string, var_info) Hashtbl.t = Hashtbl.create 1
 
 type ctx = {
   structs : (string, struct_decl) Hashtbl.t;
@@ -289,20 +293,31 @@ let check_storable ctx span t =
 
 (* ---------- scopes ---------- *)
 
-let push f = f.scopes <- { vars = Hashtbl.create 8; barrier = false } :: f.scopes
+let push f = f.scopes <- { vars = no_vars; barrier = false } :: f.scopes
 let pop f = f.scopes <- List.tl f.scopes
-let bind f name info = Hashtbl.replace (List.hd f.scopes).vars name info
+let bind f name info =
+  let s = List.hd f.scopes in
+  if s.vars == no_vars then s.vars <- Hashtbl.create 8;
+  Hashtbl.replace s.vars name info
 
 (* Returns the variable and whether the lookup crossed a closure boundary. *)
-let lookup f name =
-  let rec go crossed = function
-    | [] -> None
-    | s :: rest -> (
-      match Hashtbl.find_opt s.vars name with
-      | Some v -> Some (v, crossed)
-      | None -> go (crossed || s.barrier) rest)
-  in
-  go false f.scopes
+let rec lookup_in name crossed = function
+  | [] -> None
+  | s :: rest -> (
+    match if s.vars == no_vars then None else Hashtbl.find_opt s.vars name with
+    | Some v -> Some (v, crossed)
+    | None -> lookup_in name (crossed || s.barrier) rest)
+
+let lookup f name = lookup_in name false f.scopes
+
+(* [lookup] for when whether it crossed a closure does not matter *)
+let rec find_in name = function
+  | [] -> None
+  | s :: rest -> ( match if s.vars == no_vars then None else Hashtbl.find_opt s.vars name with None -> find_in name rest | found -> found)
+
+let find_var f name = find_in name f.scopes
+let rec bound_in name = function [] -> false | s :: rest -> (s.vars != no_vars && Hashtbl.mem s.vars name) || bound_in name rest
+let is_local f name = bound_in name f.scopes
 
 let visible_names ctx f =
   List.concat_map (fun s -> List.of_seq (Hashtbl.to_seq_keys s.vars)) f.scopes
@@ -427,7 +442,7 @@ let builtin_tname t =
   | TNamed (("Option" | "Result" | "IoError") as n, _) -> Some n
   | _ -> None
 
-let methods (t : ty) : (string * (unit -> ty list * ty)) list =
+let build_methods (t : ty) : (string * (unit -> ty list * ty)) list =
   let m name ps r = (name, fun () -> (ps, r)) in
   match t with
   | TStr ->
@@ -446,22 +461,23 @@ let methods (t : ty) : (string * (unit -> ty list * ty)) list =
   | TFloat -> [ m "to_str" [] TStr; m "to_int" [] TInt; m "abs" [] TFloat; m "sqrt" [] TFloat;
       m "to_fixed" [ TInt ] TStr ]
   | TBool -> [ m "to_str" [] TStr ]
+  (* the types of a type with parameters are built only for the method asked for *)
   | TList a ->
-    [ m "len" [] TInt; m "is_empty" [] TBool; m "get" [ TInt ] (opt a); m "first" [] (opt a);
-      m "last" [] (opt a); m "push" [ a ] TUnit; m "contains" [ a ] TBool;
-      m "reverse" [] (TList a); m "sort" [] (TList a); m "take" [ TInt ] (TList a);
-      m "skip" [ TInt ] (TList a); m "filter" [ TFn ([ a ], TBool) ] (TList a);
+    [ ("len", fun () -> ([], TInt)); ("is_empty", fun () -> ([], TBool)); ("get", fun () -> ([ TInt ], opt a)); ("first", fun () -> ([], opt a));
+      ("last", fun () -> ([], opt a)); ("push", fun () -> ([ a ], TUnit)); ("contains", fun () -> ([ a ], TBool));
+      ("reverse", fun () -> ([], TList a)); ("sort", fun () -> ([], TList a)); ("take", fun () -> ([ TInt ], TList a));
+      ("skip", fun () -> ([ TInt ], TList a)); ("filter", fun () -> ([ TFn ([ a ], TBool) ], TList a));
       ("map", fun () -> let u = fresh () in ([ TFn ([ a ], u) ], TList u));
       ("fold", fun () -> let u = fresh () in ([ u; TFn ([ u; a ], u) ], u));
-      m "join" [ TStr ] TStr; m "sum" [] TInt ]
+      ("join", fun () -> ([ TStr ], TStr)); ("sum", fun () -> ([], TInt)) ]
   | TMap (k, v) ->
-    [ m "len" [] TInt; m "is_empty" [] TBool; m "get" [ k ] (opt v); m "contains" [ k ] TBool;
-      m "remove" [ k ] TUnit; m "keys" [] (TList k); m "values" [] (TList v);
-      m "entries" [] (TList (TNamed (Ast.tuple_name 2, [ k; v ]))) ]
+    [ ("len", fun () -> ([], TInt)); ("is_empty", fun () -> ([], TBool)); ("get", fun () -> ([ k ], opt v)); ("contains", fun () -> ([ k ], TBool));
+      ("remove", fun () -> ([ k ], TUnit)); ("keys", fun () -> ([], TList k)); ("values", fun () -> ([], TList v));
+      ("entries", fun () -> ([], TList (TNamed (Ast.tuple_name 2, [ k; v ])))) ]
   | TArray (a, _) ->
-    [ m "len" [] TInt; m "get" [ TInt ] (opt a); m "to_list" [] (TList a); m "contains" [ a ] TBool ]
+    [ ("len", fun () -> ([], TInt)); ("get", fun () -> ([ TInt ], opt a)); ("to_list", fun () -> ([], TList a)); ("contains", fun () -> ([ a ], TBool)) ]
   | TNamed ("Option", [ a ]) ->
-    [ m "is_some" [] TBool; m "is_none" [] TBool;
+    [ ("is_some", fun () -> ([], TBool)); ("is_none", fun () -> ([], TBool));
       ("map", fun () -> let u = fresh () in ([ TFn ([ a ], u) ], opt u)) ]
   | TNamed ("IoError", []) -> [ m "message" [] TStr ]
   | TNamed ("Result", [ a; e ]) ->
@@ -487,8 +503,25 @@ let methods (t : ty) : (string * (unit -> ty list * ty)) list =
   | TCap Foreign ->
     [ m "only" [ TStr ] (TCap Foreign); m "allows" [ TStr ] TBool; m "copy" [ TNamed ("Handle", []); TInt ] TBytes ]
   | TCap Root -> [ m "args" [] (TList TStr) ]
-  | TChan a -> [ m "send" [ a ] TUnit; m "recv" [] (opt a); m "close" [] TUnit ]
+  | TChan a -> [ ("send", fun () -> ([ a ], TUnit)); ("recv", fun () -> ([], opt a)); ("close", fun () -> ([], TUnit)) ]
   | _ -> []
+
+(* The methods of a built-in type, by name. Checking asks for them at every
+   method call, so the lists of the types without parameters are built once. *)
+let str_methods = build_methods TStr
+let bytes_methods = build_methods TBytes
+let int_methods = build_methods TInt
+let float_methods = build_methods TFloat
+let bool_methods = build_methods TBool
+
+let methods (t : ty) =
+  match t with
+  | TStr -> str_methods
+  | TBytes -> bytes_methods
+  | TInt -> int_methods
+  | TFloat -> float_methods
+  | TBool -> bool_methods
+  | _ -> build_methods t
 
 (* Types with an order, for `<` and `sort()`: numbers, strings (bytes),
    Bool (false first), (), and lists, arrays, tuples, structs and enums of
@@ -675,7 +708,7 @@ and check_expr_inner ctx f e : ty =
   | EUn (Not, a) -> expect ctx f a TBool; TBool
   | ECall (callee, args) -> check_call ctx f e callee args e.espan
   | EMethod (({ edesc = EVar en; _ } as recv), name, nsp, args)
-    when lookup f en = None && Hashtbl.mem ctx.enums en ->
+    when not (is_local f en) && Hashtbl.mem ctx.enums en ->
     (* `Enum.Variant(args)` is a constructor call, not a method call. *)
     let callee = { edesc = EField (recv, name, nsp); espan = Span.merge recv.espan nsp; ety = TErr; einst = []; ecallee = None } in
     check_call ctx f e callee args e.espan
@@ -827,11 +860,11 @@ and expect_plain ctx f e want =
     unify_at ctx e.espan want t
 
 and check_var ctx f e n sp =
-  match lookup f n with
-  | Some (v, _) when v.vkind = KGroup ->
+  match find_var f n with
+  | Some v when v.vkind = KGroup ->
     err ctx "E0310" sp (sprintf "`%s` is a group handle; the only thing you can do with it is `%s.go(...)`" n n);
     TErr
-  | Some (v, _) -> v.vty
+  | Some v -> v.vty
   | None -> (
     let direct = !calling in
     calling := false;
@@ -1008,12 +1041,12 @@ and method_params key =
 
 and check_call ?want ctx f e callee args sp =
   match callee.edesc with
-  | EVar "assert" when lookup f "assert" = None && not (Hashtbl.mem ctx.fns "assert") ->
+  | EVar "assert" when not (is_local f "assert") && not (Hashtbl.mem ctx.fns "assert") ->
     (match args with
      | [ a ] -> expect ctx f a TBool
      | _ -> err ctx "E0107" sp "`assert` takes 1 argument, a Bool"; check_args ctx f args);
     TUnit
-  | EVar "assert_eq" when lookup f "assert_eq" = None && not (Hashtbl.mem ctx.fns "assert_eq") ->
+  | EVar "assert_eq" when not (is_local f "assert_eq") && not (Hashtbl.mem ctx.fns "assert_eq") ->
     (match args with
      | [ a; b ] -> (
        let t = check_expr ctx f a in
@@ -1023,18 +1056,18 @@ and check_call ?want ctx f e callee args sp =
        | _ -> ())
      | _ -> err ctx "E0107" sp "`assert_eq` takes 2 arguments"; check_args ctx f args);
     TUnit
-  | EVar "keep" when lookup f "keep" = None && not (Hashtbl.mem ctx.fns "keep") ->
+  | EVar "keep" when not (is_local f "keep") && not (Hashtbl.mem ctx.fns "keep") ->
     (* `keep(x)`: x counts as used, so a benchmark's work is not optimized away *)
     (match args with
      | [ a ] -> ignore (check_expr ctx f a)
      | _ -> err ctx "E0107" sp "`keep` takes 1 argument"; check_args ctx f args);
     TUnit
-  | EVar "channel" when lookup f "channel" = None && not (Hashtbl.mem ctx.fns "channel") ->
+  | EVar "channel" when not (is_local f "channel") && not (Hashtbl.mem ctx.fns "channel") ->
     (match args with
      | [ a ] -> expect ctx f a TInt
      | _ -> err ctx "E0107" sp "`channel` takes 1 argument, its capacity"; check_args ctx f args);
     TChan (fresh ())
-  | EVar "catch" when lookup f "catch" = None && not (Hashtbl.mem ctx.fns "catch") -> (
+  | EVar "catch" when not (is_local f "catch") && not (Hashtbl.mem ctx.fns "catch") -> (
     (* catch(|| ...): Ok(value), or Err(message) if anything inside panicked *)
     let t = fresh () in
     match args with
@@ -1043,13 +1076,13 @@ and check_call ?want ctx f e callee args sp =
       err ctx "E0107" sp "`catch` takes 1 argument, a closure with no parameters, as in `catch(|| risky())`";
       check_args ctx f args;
       TErr)
-  | EVar "bytes" when lookup f "bytes" = None && not (Hashtbl.mem ctx.fns "bytes") ->
+  | EVar "bytes" when not (is_local f "bytes") && not (Hashtbl.mem ctx.fns "bytes") ->
     (* bytes([104, 105]): each item 0 to 255, or it panics *)
     (match args with
      | [ a ] -> expect ctx f a (TList TInt)
      | _ -> err ctx "E0107" sp "`bytes` takes 1 argument, a list of Ints from 0 to 255"; check_args ctx f args);
     TBytes
-  | EVar "map" when lookup f "map" = None && not (Hashtbl.mem ctx.fns "map") ->
+  | EVar "map" when not (is_local f "map") && not (Hashtbl.mem ctx.fns "map") ->
     let k = fresh () and v = fresh () in
     (match args with
      | [] -> ()
@@ -1057,7 +1090,7 @@ and check_call ?want ctx f e callee args sp =
      | _ -> err ctx "E0107" sp "`map` takes no arguments, or a list of (key, value) pairs"; check_args ctx f args);
     map_keys := (sp, k) :: !map_keys;
     TMap (k, v)
-  | EVar "panic" when lookup f "panic" = None && not (Hashtbl.mem ctx.fns "panic") ->
+  | EVar "panic" when not (is_local f "panic") && not (Hashtbl.mem ctx.fns "panic") ->
     (match args with
      | [ a ] -> expect ctx f a TStr
      | _ -> err ctx "E0107" sp "`panic` takes 1 argument (a message)"; check_args ctx f args);
@@ -1070,9 +1103,9 @@ and check_call ?want ctx f e callee args sp =
     in
     let what, names =
       match callee.edesc with
-      | EVar n when lookup f n = None && Hashtbl.mem param_names n -> (sprintf "function `%s`" n, Ok (Hashtbl.find param_names n))
-      | EVar n when lookup f n = None && Hashtbl.mem foreign_fns n -> ("", Error (sprintf "foreign function `%s` takes its arguments by position" n))
-      | EVar n when lookup f n <> None -> ("", Error (sprintf "`%s` is a function value, and function values have no parameter names" n))
+      | EVar n when not (is_local f n) && Hashtbl.mem param_names n -> (sprintf "function `%s`" n, Ok (Hashtbl.find param_names n))
+      | EVar n when not (is_local f n) && Hashtbl.mem foreign_fns n -> ("", Error (sprintf "foreign function `%s` takes its arguments by position" n))
+      | EVar n when is_local f n -> ("", Error (sprintf "`%s` is a function value, and function values have no parameter names" n))
       | EVar n when Hashtbl.mem ctx.owners n -> ("", Error "an enum variant takes its payload by position")
       | EField _ -> ("", Error "an enum variant takes its payload by position")
       | _ -> ("", Error "a function value has no parameter names")
@@ -1098,7 +1131,7 @@ and check_call ?want ctx f e callee args sp =
       end
       else begin
         match callee.edesc with
-        | EVar n when lookup f n = None && Hashtbl.mem foreign_fns n ->
+        | EVar n when not (is_local f n) && Hashtbl.mem foreign_fns n ->
           (* a callback may take the call's Foreign first, before what C passes *)
           let ps =
             match ps with
@@ -1106,7 +1139,7 @@ and check_call ?want ctx f e callee args sp =
               List.map2
                 (fun (a : expr) p ->
                   match (repr p, a.edesc) with
-                  | TFn (cps, r), EVar m when lookup f m = None -> (
+                  | TFn (cps, r), EVar m when not (is_local f m) -> (
                     match Hashtbl.find_opt ctx.fns m with
                     | Some s when (match s.ps with TCap Foreign :: rest -> List.length rest = List.length cps | _ -> false) ->
                       TFn (TCap Foreign :: cps, r)
@@ -1143,7 +1176,7 @@ and check_callbacks ctx f args ps =
       match repr p with
       | TFn _ -> (
         match a.edesc with
-        | EVar m when lookup f m = None && (match Hashtbl.find_opt ctx.fns m with Some s -> s.gen = [] | None -> false) -> ()
+        | EVar m when not (is_local f m) && (match Hashtbl.find_opt ctx.fns m with Some s -> s.gen = [] | None -> false) -> ()
         | _ ->
           err ctx "E0332" a.espan "a callback to C is a top-level function, passed by its name"
             ~notes:
@@ -1153,7 +1186,7 @@ and check_callbacks ctx f args ps =
 
 and check_field ctx f e recv name nsp =
   match recv.edesc with
-  | EVar en when lookup f en = None && Hashtbl.mem ctx.enums en ->
+  | EVar en when not (is_local f en) && Hashtbl.mem ctx.enums en ->
     let vs = Hashtbl.find ctx.variants en in
     if List.mem_assoc name vs then ctor_ty ctx en name nsp
     else begin

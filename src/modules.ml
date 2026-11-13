@@ -85,7 +85,22 @@ type env = {
   mods : (string, modinfo) Hashtbl.t;
   own : (string, item) Hashtbl.t; (* this module's items by bare name *)
   gens : string list; (* type parameters in scope *)
+  fresh : bool; (* give every expression a new node, even one renaming leaves alone *)
 }
+
+(* Renaming keeps the parts of the tree it leaves alone, so a large program
+   is not copied whole: [map_same f l] is [List.map f l], or [l] itself when
+   [f] returned every element unchanged (and likewise [opt_same] for an
+   option). Both call [f] in the order List.map and Option.map do. *)
+let rec map_same f l =
+  match l with
+  | [] -> l
+  | x :: rest ->
+    let y = f x in
+    let rest' = map_same f rest in
+    if y == x && rest' == rest then l else y :: rest'
+
+let opt_same f o = match o with None -> o | Some x -> let y = f x in if y == x then o else Some y
 
 (* Built-in types a file can add methods to. *)
 let builtin_method_types = [ "Int"; "Float"; "Bool"; "Str"; "Bytes"; "List"; "Map"; "Option"; "Result"; "IoError" ]
@@ -133,9 +148,10 @@ let alias_uses : (string * Span.t) list ref = ref []
    aliases being expanded around this one, to catch `type A = List[A]`. *)
 let rec ty ?(seen = []) env (t : ty_expr) : ty_expr =
   match t.tdesc with
-  | TyName (n, args) -> (
-    let args = List.map (ty ~seen env) args in
-    let named n = { t with tdesc = TyName (n, args) } in
+  | TyName (n0, args0) -> (
+    let n = n0 in
+    let args = map_same (ty ~seen env) args0 in
+    let named n = if n == n0 && args == args0 then t else { t with tdesc = TyName (n, args) } in
     match String.index_opt n '.' with
     | Some i -> (
       let a = String.sub n 0 i and b = String.sub n (i + 1) (String.length n - i - 1) in
@@ -153,7 +169,10 @@ let rec ty ?(seen = []) env (t : ty_expr) : ty_expr =
         | Some (IType al) -> expand ~seen env env.self al args t
         | Some (IStruct _ | IEnum _ | IIface _) -> named (qual env.self n)
         | _ -> named n))
-  | TyFn (ps, r) -> { t with tdesc = TyFn (List.map (ty ~seen env) ps, ty ~seen env r) }
+  | TyFn (ps, r) ->
+    let r' = ty ~seen env r in
+    let ps' = map_same (ty ~seen env) ps in
+    if r' == r && ps' == ps then t else { t with tdesc = TyFn (ps', r') }
   | TyUnit | TyInt _ -> t
 
 (* alias [al] of module [m], used at [t] with [args] (already resolved): its
@@ -320,8 +339,12 @@ let rec pat env locals (p : pat) : pat =
         match Hashtbl.find_opt env.own q with Some (IEnum _) -> Some (qual env.self q) | _ -> Some q
     in
     { p with pdesc = PVariant (q, v, ps) }
-  | PVariant (None, v, ps) -> { p with pdesc = PVariant (None, v, List.map (pat env locals) ps) }
-  | PTuple ps -> { p with pdesc = PTuple (List.map (pat env locals) ps) }
+  | PVariant (None, v, ps) ->
+    let ps' = map_same (pat env locals) ps in
+    if ps' == ps then p else { p with pdesc = PVariant (None, v, ps') }
+  | PTuple ps ->
+    let ps' = map_same (pat env locals) ps in
+    if ps' == ps then p else { p with pdesc = PTuple ps' }
   | _ -> p
 
 let rec expr env locals (e : expr) : expr =
@@ -329,21 +352,26 @@ let rec expr env locals (e : expr) : expr =
   let d =
     match e.edesc with
     | EInt _ | EFloat _ | EBool _ | EUnit -> e.edesc
-    | EStr parts -> EStr (List.map (function SPLit s -> SPLit s | SPExpr x -> SPExpr (ex x)) parts)
+    | EStr parts ->
+      let parts' = map_same (function SPLit _ as p -> p | SPExpr x as p -> let y = ex x in if y == x then p else SPExpr y) parts in
+      if parts' == parts then e.edesc else EStr parts'
     | EVar n ->
       if List.mem n locals then e.edesc
       else (
         match Hashtbl.find_opt env.own n with
         | Some (IFn _) -> EVar (qual env.self n)
         | _ -> if is_module env locals n then (err "E0404" e.espan (Printf.sprintf "module `%s` is not a value; use one of its items, such as `%s.name`" n n); e.edesc) else e.edesc)
-    | EList es -> EList (List.map ex es)
+    | EList es -> let es' = map_same ex es in if es' == es then e.edesc else EList es'
     | EPipe (x, rhs) -> (
       (* `x |> f(a)` is `f(x, a)` from here on *)
       match pipe_call x rhs with
       | Some d -> (ex { e with edesc = d }).edesc
       | None -> e.edesc (* the parser rejects it *))
-    | EBin (op, a, b) -> EBin (op, ex a, ex b)
-    | EUn (op, a) -> EUn (op, ex a)
+    | EBin (op, a, b) ->
+      let b' = ex b in
+      let a' = ex a in
+      if a' == a && b' == b then e.edesc else EBin (op, a', b')
+    | EUn (op, a) -> let a' = ex a in if a' == a then e.edesc else EUn (op, a')
     | ECall ({ edesc = EVar (("embed" | "embed_bytes" | "embed_dir") as name); _ }, args)
       when (not (List.mem name locals)) && not (Hashtbl.mem env.own name) -> (
       let literal = match args with [ { edesc = EStr [ SPLit p ]; _ } ] -> Some p | [ { edesc = EStr []; _ } ] -> Some "" | _ -> None in
@@ -357,8 +385,11 @@ let rec expr env locals (e : expr) : expr =
         err "E0405" e.espan
           (Printf.sprintf "`%s` takes one argument, a string literal with the path, as in `%s(\"page.html\")`" name name);
         EStr [])
-    | ECall (c, args) -> ECall (ex c, List.map ex args)
-    | ENamed (n, sp, a) -> ENamed (n, sp, ex a)
+    | ECall (c, args) ->
+      let args' = map_same ex args in
+      let c' = ex c in
+      if c' == c && args' == args then e.edesc else ECall (c', args')
+    | ENamed (n, sp, a) -> let a' = ex a in if a' == a then e.edesc else ENamed (n, sp, a')
     | EMethod ({ edesc = EVar a; espan = asp; _ }, name, nsp, args) when is_module env locals a -> (
       let args = List.map ex args in
       match Hashtbl.find_opt env.mods a with
@@ -377,7 +408,10 @@ let rec expr env locals (e : expr) : expr =
     | EMethod (({ edesc = EVar en; _ } as r), name, nsp, args)
       when (not (List.mem en locals)) && (match Hashtbl.find_opt env.own en with Some (IEnum _) -> true | _ -> false) ->
       EMethod ({ r with edesc = EVar (qual env.self en) }, name, nsp, List.map ex args)
-    | EMethod (r, name, nsp, args) -> EMethod (ex r, name, nsp, List.map ex args)
+    | EMethod (r, name, nsp, args) ->
+      let args' = map_same ex args in
+      let r' = ex r in
+      if r' == r && args' == args then e.edesc else EMethod (r', name, nsp, args')
     | EField ({ edesc = EVar a; espan = asp; _ }, name, nsp) when is_module env locals a -> (
       match Hashtbl.find_opt env.mods a with
       | None -> e.edesc
@@ -394,23 +428,41 @@ let rec expr env locals (e : expr) : expr =
     | EField (({ edesc = EVar en; _ } as r), name, nsp)
       when (not (List.mem en locals)) && (match Hashtbl.find_opt env.own en with Some (IEnum _) -> true | _ -> false) ->
       EField ({ r with edesc = EVar (qual env.self en) }, name, nsp)
-    | EField (r, name, nsp) -> EField (ex r, name, nsp)
-    | EIndex (a, i) -> EIndex (ex a, ex i)
-    | ETry (a, c) -> ETry (ex a, Option.map ex c)
-    | EIf (c, b, el) -> EIf (ex c, block env locals b, Option.map ex el)
+    | EField (r, name, nsp) -> let r' = ex r in if r' == r then e.edesc else EField (r', name, nsp)
+    | EIndex (a, i) ->
+      let i' = ex i in
+      let a' = ex a in
+      if a' == a && i' == i then e.edesc else EIndex (a', i')
+    | ETry (a, c) ->
+      let c' = opt_same ex c in
+      let a' = ex a in
+      if a' == a && c' == c then e.edesc else ETry (a', c')
+    | EIf (c, b, el) ->
+      let el' = opt_same ex el in
+      let b' = block env locals b in
+      let c' = ex c in
+      if c' == c && b' == b && el' == el then e.edesc else EIf (c', b', el')
     | EMatch (s, arms) ->
-      EMatch
-        ( ex s,
-          List.map
-            (fun a ->
-              let inner = pat_binds a.apat locals in
-              { apat = pat env locals a.apat; aguard = Option.map (expr env inner) a.aguard; abody = expr env inner a.abody })
-            arms )
-    | EBlock b -> EBlock (block env locals b)
+      let arms' =
+        map_same
+          (fun a ->
+            let inner = pat_binds a.apat locals in
+            let abody = expr env inner a.abody in
+            let aguard = opt_same (expr env inner) a.aguard in
+            let apat = pat env locals a.apat in
+            if apat == a.apat && aguard == a.aguard && abody == a.abody then a else { apat; aguard; abody })
+          arms
+      in
+      let s' = ex s in
+      if s' == s && arms' == arms then e.edesc else EMatch (s', arms')
+    | EBlock b -> let b' = block env locals b in if b' == b then e.edesc else EBlock b'
     | EClosure (ps, body) ->
       let locals' = List.fold_left (fun acc (n, _, _) -> n :: acc) locals ps in
-      EClosure (List.map (fun (n, t, sp) -> (n, Option.map (ty env) t, sp)) ps, expr env locals' body)
-    | EStruct (n, sp, fields) ->
+      let body' = expr env locals' body in
+      let ps' = map_same (fun ((n, t, sp) as p) -> let t' = opt_same (ty env) t in if t' == t then p else (n, t', sp)) ps in
+      if ps' == ps && body' == body then e.edesc else EClosure (ps', body')
+    | EStruct (n0, sp, fields) ->
+      let n = n0 in
       let n =
         match String.index_opt n '.' with
         | Some i -> (
@@ -423,11 +475,21 @@ let rec expr env locals (e : expr) : expr =
           | None -> err "E0401" sp (Printf.sprintf "unknown module `%s`; add `use %s` at the top of the file" a a); n)
         | None -> ( match Hashtbl.find_opt env.own n with Some (IStruct _) -> qual env.self n | _ -> n)
       in
-      EStruct (n, sp, List.map (fun (f, fsp, x) -> (f, fsp, ex x)) fields)
-    | EGroup (g, until, b) -> EGroup (g, Option.map (fun (c, ms) -> (ex c, ex ms)) until, block env (g :: locals) b)
-    | EWith (b, fields) -> EWith (ex b, List.map (fun (f, fsp, x) -> (f, fsp, ex x)) fields)
-    | ESafe (b, x, rest, flat) -> ESafe (ex b, x, expr env (x :: locals) rest, flat)
-    | EDyn (x, i) -> EDyn (ex x, i)
+      let fields' = map_same (fun ((f, fsp, x) as fl) -> let y = ex x in if y == x then fl else (f, fsp, y)) fields in
+      if n == n0 && fields' == fields then e.edesc else EStruct (n, sp, fields')
+    | EGroup (g, until, b) ->
+      let b' = block env (g :: locals) b in
+      let until' = opt_same (fun ((c, ms) as u) -> let ms' = ex ms in let c' = ex c in if c' == c && ms' == ms then u else (c', ms')) until in
+      if b' == b && until' == until then e.edesc else EGroup (g, until', b')
+    | EWith (b, fields) ->
+      let fields' = map_same (fun ((f, fsp, x) as fl) -> let y = ex x in if y == x then fl else (f, fsp, y)) fields in
+      let b' = ex b in
+      if b' == b && fields' == fields then e.edesc else EWith (b', fields')
+    | ESafe (b, x, rest, flat) ->
+      let rest' = expr env (x :: locals) rest in
+      let b' = ex b in
+      if b' == b && rest' == rest then e.edesc else ESafe (b', x, rest', flat)
+    | EDyn (x, i) -> let x' = ex x in if x' == x then e.edesc else EDyn (x', i)
     | ESelect arms ->
       ESelect
         (List.map
@@ -442,7 +504,7 @@ let rec expr env locals (e : expr) : expr =
              | SelDefault -> { a with sbody = ex a.sbody })
            arms)
   in
-  { e with edesc = d }
+  if d == e.edesc && not env.fresh then e else { e with edesc = d }
 
 (* `let (a, (b, _)) = e` becomes `let t = e; let a = t.0; let u = t.1; let b = u.0`,
    and `for (k, v) in xs { body }` becomes `for t in xs { let (k, v) = t; body }`. *)
@@ -471,6 +533,8 @@ and unpack (p : pat) (e : expr) : stmt list =
   first :: rest
 
 and expand_stmts (ss : stmt list) : stmt list =
+  if not (List.exists (fun (s : stmt) -> match s.sdesc with SLetPat _ | SForPat _ -> true | _ -> false) ss) then ss
+  else
   List.concat_map
     (fun (s : stmt) ->
       match s.sdesc with
@@ -483,36 +547,48 @@ and expand_stmts (ss : stmt list) : stmt list =
       | _ -> [ s ])
     ss
 
-and block env locals (b : block) : block =
-  let b = { b with stmts = expand_stmts b.stmts } in
+and block env locals (b0 : block) : block =
+  let expanded = expand_stmts b0.stmts in
+  let b = if expanded == b0.stmts then b0 else { b0 with stmts = expanded } in
   let locals = ref locals in
   let stmts =
-    List.map
+    map_same
       (fun (s : stmt) ->
         let d =
           match s.sdesc with
           | SLet (m, n, sp, t, x) ->
-            let x = expr env !locals x in
+            let x' = expr env !locals x in
             locals := n :: !locals;
-            SLet (m, n, sp, Option.map (ty env) t, x)
-          | SAssign (a, b) -> SAssign (expr env !locals a, expr env !locals b)
-          | SExpr x -> SExpr (expr env !locals x)
-          | SReturn x -> SReturn (Option.map (expr env !locals) x)
-          | SWhile (c, body) -> SWhile (expr env !locals c, block env !locals body)
-          | SFor (n, sp, it, body) -> SFor (n, sp, expr env !locals it, block env (n :: !locals) body)
+            let t' = opt_same (ty env) t in
+            if x' == x && t' == t then s.sdesc else SLet (m, n, sp, t', x')
+          | SAssign (a, b) ->
+            let b' = expr env !locals b in
+            let a' = expr env !locals a in
+            if a' == a && b' == b then s.sdesc else SAssign (a', b')
+          | SExpr x -> let x' = expr env !locals x in if x' == x then s.sdesc else SExpr x'
+          | SReturn x -> let x' = opt_same (expr env !locals) x in if x' == x then s.sdesc else SReturn x'
+          | SWhile (c, body) ->
+            let body' = block env !locals body in
+            let c' = expr env !locals c in
+            if c' == c && body' == body then s.sdesc else SWhile (c', body')
+          | SFor (n, sp, it, body) ->
+            let body' = block env (n :: !locals) body in
+            let it' = expr env !locals it in
+            if it' == it && body' == body then s.sdesc else SFor (n, sp, it', body')
           | SBreak | SContinue -> s.sdesc
-          | SDefer body -> SDefer (block env !locals body)
+          | SDefer body -> let body' = block env !locals body in if body' == body then s.sdesc else SDefer body'
           | SLetPat _ | SForPat _ -> s.sdesc (* already expanded *)
         in
-        { s with sdesc = d })
+        if d == s.sdesc then s else { s with sdesc = d })
       b.stmts
   in
-  { b with stmts; tail = Option.map (expr env !locals) b.tail }
+  let tail = opt_same (expr env !locals) b.tail in
+  if stmts == b.stmts && tail == b.tail then b else { b with stmts; tail }
 
-let rename_item mods (m : modinfo) own (it : item) : item =
+let rename_item ?(fresh = false) mods (m : modinfo) own (it : item) : item =
   match it with
   | IFn d ->
-    let env = { self = m; mods; own; gens = d.fn_gen } in
+    let env = { self = m; mods; own; gens = d.fn_gen; fresh } in
     let locals = List.map (fun p -> p.prm_name) d.fn_params in
     let params = List.map (fun p -> { p with prm_ty = ty env p.prm_ty }) d.fn_params in
     let name =
@@ -541,7 +617,7 @@ let rename_item mods (m : modinfo) own (it : item) : item =
               { fo with ftrusted = String.starts_with ~prefix:"<std>" m.mfile && List.mem m.mname (Lazy.force Package.std_manifest).trust })
             d.fn_foreign }
   | IStruct s ->
-    let env = { self = m; mods; own; gens = s.st_gen } in
+    let env = { self = m; mods; own; gens = s.st_gen; fresh } in
     (* a C struct's Int32 fields are Ints to the rest of Vela, as Int32
        parameters are; the types as written stay in st_foreign *)
     let int32_as_int (t : ty_expr) = match t.tdesc with TyName ("Int32", []) when s.st_foreign <> None -> { t with tdesc = TyName ("Int", []) } | _ -> t in
@@ -552,7 +628,7 @@ let rename_item mods (m : modinfo) own (it : item) : item =
         st_foreign = Option.map (fun (l, ts) -> (l, List.map (ty env) ts)) s.st_foreign;
         st_bounds = List.map (fun (g, bs) -> (g, List.map (ty env) bs)) s.st_bounds }
   | IIface i ->
-    let env = { self = m; mods; own; gens = i.if_gen } in
+    let env = { self = m; mods; own; gens = i.if_gen; fresh } in
     IIface
       { i with
         if_name = qual m i.if_name;
@@ -561,7 +637,7 @@ let rename_item mods (m : modinfo) own (it : item) : item =
             (fun (n, sp, ps, r) -> (n, sp, List.map (fun p -> { p with prm_ty = ty env p.prm_ty }) ps, Option.map (ty env) r))
             i.if_methods }
   | IEnum e ->
-    let env = { self = m; mods; own; gens = e.en_gen } in
+    let env = { self = m; mods; own; gens = e.en_gen; fresh } in
     IEnum
       { e with
         en_name = qual m e.en_name;
@@ -570,7 +646,7 @@ let rename_item mods (m : modinfo) own (it : item) : item =
   | IType a ->
     (* expanded where it is used; kept, expanded, so the checker checks its
        body even if nothing uses it *)
-    let env = { self = m; mods; own; gens = a.ty_gen } in
+    let env = { self = m; mods; own; gens = a.ty_gen; fresh } in
     IType { a with ty_name = qual m a.ty_name; ty_body = ty ~seen:[ qual m a.ty_name ] env a.ty_body }
 
 (* A table test, `test "add" for (a, b, want) in [(1, 2, 3), (2, 2, 4)] { body }`,
@@ -673,7 +749,12 @@ let load ?(deps = []) ?root path src : item list * Diag.t list =
             (fun m ->
               let own = own_items m.mitems in
               check_aliases m;
-              List.map (rename_item mods m own) (List.concat_map expand_table m.mitems))
+              List.concat_map
+                (fun it ->
+                  (* the copies of a table test share their body until renaming makes each its own *)
+                  let fresh = match it with IFn { fn_table = Some _; _ } -> true | _ -> false in
+                  List.map (rename_item ~fresh mods m own) (expand_table it))
+                m.mitems)
             (List.rev all)
         in
         (* methods promoted through struct embedding, so interfaces see them *)
