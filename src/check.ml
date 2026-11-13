@@ -2181,6 +2181,19 @@ let unkeyable ctx t : ty option =
   in
   go t
 
+(* A bound failure written in several places in one function (its result
+   type, and the literal in its body that builds the value) is reported once,
+   at the first. [fn_extents]: each function's span, from its name to the end
+   of its body, set by check_program. *)
+let reported_bounds : (string * int * string * string * string, unit) Hashtbl.t = Hashtbl.create 8
+let fn_extents : (string * int * int) list ref = ref []
+
+(* The start of the function [sp] lies in, or [sp]'s own start outside any. *)
+let enclosing_fn (sp : Span.t) =
+  match List.find_opt (fun (f, lo, hi) -> f = sp.file && lo <= sp.lo && sp.hi <= hi) !fn_extents with
+  | Some (_, lo, _) -> lo
+  | None -> sp.lo
+
 let check_pending ctx =
   List.iter
     (fun (sp, k) ->
@@ -2197,6 +2210,8 @@ let check_pending ctx =
   pending := [];
   List.iter
     (fun (sp, t, ((i, _) as b), g) ->
+      let key = (sp.Span.file, enclosing_fn sp, show (repr t), show_bound b, g) in
+      if not (Hashtbl.mem reported_bounds key) then
       let why =
         match i with
         | "Ordered" -> Option.map (fun u -> sprintf "`%s` has no order: numbers, strings, Bool, and lists, tuples, structs and enums of them are ordered" (show u)) (unordered ctx t)
@@ -2206,6 +2221,7 @@ let check_pending ctx =
       match why with
       | None -> ()
       | Some why ->
+        Hashtbl.replace reported_bounds key ();
         err ctx "E0111" sp
           (if List.mem i builtin_bounds then sprintf "`%s` does not satisfy `%s`, required of `%s`" (show (repr t)) i g
            else sprintf "`%s` does not satisfy interface `%s`, required of `%s`" (show (repr t)) (show_bound b) g)
@@ -2324,6 +2340,11 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
   Hashtbl.reset method_owner;
   Hashtbl.reset used_methods;
   Hashtbl.reset foreign_fns;
+  Hashtbl.reset reported_bounds;
+  fn_extents :=
+    List.filter_map
+      (function IFn d -> Some (d.fn_span.Span.file, d.fn_span.lo, max d.fn_span.hi d.fn_body.bspan.hi) | _ -> None)
+      user_items;
   Hashtbl.reset param_names;
   Hashtbl.reset ifaces;
   List.iter (fun b -> Hashtbl.replace ifaces b []) builtin_bounds;
@@ -2358,7 +2379,21 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
         end
       | IFn _ | IType _ -> ())
     items;
-  (* 1b. interface methods *)
+  (* 1b. bounds on the type parameters of structs and enums, before the
+     interface methods, whose signatures can name those types *)
+  let declare_bounds name gen (bounds : Ast.bounds) =
+    let env = List.map (fun g -> (g, TParam g)) gen in
+    let bs = List.filter_map (fun (g, tes) -> match List.filter_map (resolve_bound ctx env) tes with [] -> None | bs -> Some (g, bs)) bounds in
+    if bs <> [] then Hashtbl.replace type_bounds name (gen, bs);
+    take_pending bs
+  in
+  List.iter
+    (function
+      | IStruct s when registered ctx.structs s.st_name s && s.st_bounds <> [] -> declare_bounds s.st_name s.st_gen s.st_bounds
+      | IEnum e when registered ctx.enums e.en_name e && e.en_bounds <> [] -> declare_bounds e.en_name e.en_gen e.en_bounds
+      | _ -> ())
+    items;
+  (* 1c. interface methods *)
   List.iter
     (function
       | IIface i ->
@@ -2379,19 +2414,6 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
         (* the interface's own parameters have no bounds to check *)
         pending := List.filter (fun (_, t, _, _) -> match repr t with TParam g -> not (List.mem g i.if_gen) | _ -> true) !pending;
         take_pending []
-      | _ -> ())
-    items;
-  (* 1c. bounds on the type parameters of structs and enums *)
-  let declare_bounds name gen (bounds : Ast.bounds) =
-    let env = List.map (fun g -> (g, TParam g)) gen in
-    let bs = List.filter_map (fun (g, tes) -> match List.filter_map (resolve_bound ctx env) tes with [] -> None | bs -> Some (g, bs)) bounds in
-    if bs <> [] then Hashtbl.replace type_bounds name (gen, bs);
-    take_pending bs
-  in
-  List.iter
-    (function
-      | IStruct s when registered ctx.structs s.st_name s && s.st_bounds <> [] -> declare_bounds s.st_name s.st_gen s.st_bounds
-      | IEnum e when registered ctx.enums e.en_name e && e.en_bounds <> [] -> declare_bounds e.en_name e.en_gen e.en_bounds
       | _ -> ())
     items;
   let own_bounds n = match Hashtbl.find_opt type_bounds n with Some (_, bs) -> bs | None -> [] in

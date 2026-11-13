@@ -258,7 +258,10 @@ let native_job ?tests ~flags items exe run_cmd (k : (int, string) result -> unit
     | Some d ->
       (* the paths differ from run to run; the command around them does not *)
       let shape = Native.command ~flags ~cflags ~libs "prog.c" "prog" in
-      let key = Digest.to_hex (Digest.string (String.concat "\000" (Lazy.force cc_version :: shape @ [ c_text ]))) in
+      (* and where linked libraries are found: a binary that links one (the FFI
+         tests' own) records its path, which differs between checkouts *)
+      let lib_env = List.map (fun v -> v ^ "=" ^ Option.value ~default:"" (Sys.getenv_opt v)) [ "LIBRARY_PATH"; "LD_LIBRARY_PATH" ] in
+      let key = Digest.to_hex (Digest.string (String.concat "\000" ((Lazy.force cc_version :: shape) @ lib_env @ [ c_text ]))) in
       let cached = Filename.concat d key in
       (* a hit is copied (and touched, so it stays); a miss is compiled and stored *)
       sprintf "if [ -f %s ]; then touch %s && cp %s %s; else %s && cp %s %s.$$ && mv -f %s.$$ %s; fi" (q cached) (q cached) (q cached) (q exe)
@@ -3337,7 +3340,15 @@ fn main(root: Root) -> Result[(), IoError] {
   errs "bounds-field" (boxes ^ "struct H {\n    b: Box[Blob],\n}\n\nfn main() {}\n") [ "E0111" ];
   errs "bounds-field-unbounded" (boxes ^ "struct H[T] {\n    b: Box[T],\n}\n\nfn main() {}\n") [ "E0111" ];
   (* the result type, and the literal in the body *)
-  errs "bounds-result-needs-own" (boxes ^ "fn wrap[T](x: T) -> Box[T] {\n    Box { item: x }\n}\n\nfn main() {}\n") [ "E0111"; "E0111" ];
+  (* reported once per function: the result type and the literal are the same failure *)
+  errs "bounds-result-needs-own" (boxes ^ "fn wrap[T](x: T) -> Box[T] {\n    Box { item: x }\n}\n\nfn main() {}\n") [ "E0111" ];
+  errs "bounds-each-function"
+    (boxes ^ "fn wrap[T](x: T) -> Box[T] {\n    Box { item: x }\n}\n\nfn wrap2[T](x: T) -> Box[T] {\n    Box { item: x }\n}\n\nfn main() {}\n")
+    [ "E0111"; "E0111" ];
+  (* an interface method's signature is checked like any written type *)
+  errs "bounds-in-interface-method"
+    "struct Blob {\n    f: Float,\n}\n\nstruct Keyed[T: Key] {\n    items: List[T],\n}\n\ninterface Maker {\n    fn make(self) -> Keyed[Blob]\n}\n\nfn main() {}\n"
+    [ "E0111" ];
   errs "bounds-implied-by-param" (boxes ^ "fn twice[T](b: Box[T]) -> Float {\n    b.item.area() * 2.0\n}\n\nfn wrap[T: Shape](x: T) -> Box[T] {\n    Box { item: x }\n}\n\nfn main() {\n    let a = twice(wrap(Sq { s: 1.0 }))\n}\n") [  ];
   errs "bounds-variant" ("enum E[K: Key] {\n    A(K),\n}\n\nfn main() {\n    let e = E.A(1.5)\n}\n") [ "E0111" ];
   errs "bounds-ordered-implied" ("struct Sorted[T: Ordered] {\n    items: List[T],\n}\n\nfn lower[T](self: Sorted[T], x: T, y: T) -> Bool {\n    x < y\n}\n\nfn plain[T](x: T, y: T) -> Bool {\n    x < y\n}\n\nfn main() {}\n") [ "E0201" ];
