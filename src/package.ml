@@ -22,7 +22,8 @@
    dependency can ever use are exactly those in its functions' signatures. The
    checker compares them with `caps` and rejects the program if a dependency
    asks for more than it was granted (E0320). Only a subset of TOML is read:
-   tables, strings, string arrays and inline tables. *)
+   tables, strings, string arrays and inline tables, plus arrays of tables
+   ([[package]]) for the package index (registry.ml). *)
 
 (* A dependency comes from a local directory or from a git repository at a
    tag or a commit. A git dependency's [dir] is "" until [load] fetches it
@@ -75,11 +76,22 @@ let git_url_ok u =
      | Some a, Some c -> a > 0 && c > a + 1 && not (String.contains (String.sub u 0 c) '/')
      | _ -> false)
 
+(* A tag we hand to git, and a commit hash as vela.toml writes one. *)
+let tag_ok t = t <> "" && t.[0] <> '-' && not (String.exists (fun c -> Char.code c <= 0x20 || c = '\x7f') t)
+
+let commit_ok c =
+  String.for_all (function '0' .. '9' | 'a' .. 'f' -> true | _ -> false) c && String.length c >= 7 && String.length c <= 64
+
 (* ---------- a small TOML reader ---------- *)
 
 type v = VStr of string | VArr of string list | VTable of (string * v) list
 
-let parse file src : t =
+(* A table of the file: its name ("" for keys before the first header),
+   whether it was written [[name]] (one of an array of tables), the span of
+   its header, and its keys in order. *)
+type table = { tname : string; tarray : bool; tspan : Span.t; keys : (string * v * Span.t) list }
+
+let read file src : table list =
   Source.add file src;
   let n = String.length src in
   let pos = ref 0 in
@@ -152,19 +164,21 @@ let parse file src : t =
       VTable (List.rev !fields)
     | _ -> fail !pos "expected a string, an array or an inline table"
   in
-  let section = ref "" in
-  let name = ref "" and deps = ref [] and grants = ref [] and trust = ref [] in
-  let dir = Filename.dirname file in
+  let tables = ref [] and cur = ref { tname = ""; tarray = false; tspan = span 0 0; keys = [] } in
+  let close () = if !cur.tname <> "" || !cur.keys <> [] then tables := { !cur with keys = List.rev !cur.keys } :: !tables in
   skip_ws ();
   while !pos < n do
     if peek () = '[' then begin
+      let lo = !pos in
       incr pos;
+      let arr = peek () = '[' in
+      if arr then incr pos;
       let k, _ = key () in
       if peek () <> ']' then fail !pos "expected `]`";
       incr pos;
-      if k <> "package" && k <> "dependencies" && k <> "grants" && k <> "trust" then
-        fail (!pos - 1) ("unknown table [" ^ k ^ "]; vela.toml has [package], [grants], [dependencies] and [trust]");
-      section := k;
+      if arr then (if peek () <> ']' then fail !pos "expected `]]`"; incr pos);
+      close ();
+      cur := { tname = k; tarray = arr; tspan = span lo !pos; keys = [] };
       end_line ()
     end
     else begin
@@ -175,82 +189,99 @@ let parse file src : t =
       let v = value () in
       let sp = span klo !pos in
       end_line ();
-      match (!section, k, v) with
-      | "package", "name", VStr s -> name := s
-      | "package", ("version" | "description"), VStr _ -> ()
-      | "package", _, _ -> raise (Bad (sp, "unknown or malformed key in [package]"))
-      | "dependencies", d, VTable fields ->
-        let str f = match List.assoc_opt f fields with Some (VStr v) -> Some v | None -> None | Some _ -> raise (Bad (sp, "`" ^ f ^ "` is a string")) in
-        let source, path =
-          match (str "path", str "git", str "tag", str "commit") with
-          | Some p, None, None, None -> (Path, p)
-          | None, Some url, tag, commit ->
-            if not (git_url_ok url) then
-              raise (Bad (sp, "`git` must be an https://, http://, ssh://, git:// or file:// URL, or user@host:path"));
-            let rev =
-              match (tag, commit) with
-              | Some t, None ->
-                if t = "" || t.[0] = '-' || String.exists (fun c -> Char.code c <= 0x20 || c = '\x7f') t then raise (Bad (sp, "bad tag"));
-                Tag t
-              | None, Some c ->
-                let hex = String.for_all (function '0' .. '9' | 'a' .. 'f' -> true | _ -> false) c in
-                if not (hex && String.length c >= 7 && String.length c <= 64) then
-                  raise (Bad (sp, "`commit` is a commit hash in lowercase hex, at least 7 characters"));
-                Commit c
-              | _ -> raise (Bad (sp, "a git dependency needs exactly one of `tag` and `commit`"))
-            in
-            (Git (url, rev), "")
-          | Some _, Some _, _, _ -> raise (Bad (sp, "a dependency has `path` or `git`, not both"))
-          | None, None, _, _ -> raise (Bad (sp, "a dependency needs `path = \"DIR\"` or `git = \"URL\"` with a `tag` or `commit`"))
-          | Some _, None, _, _ -> raise (Bad (sp, "`tag` and `commit` go with `git`, not `path`"))
-        in
-        let caps = match List.assoc_opt "caps" fields with Some (VArr cs) -> cs | None -> [] | Some _ -> raise (Bad (sp, "`caps` is a list of strings")) in
-        List.iter
-          (fun c ->
-            if c = "foreign" then
-              raise (Bad (sp, Printf.sprintf "`caps` cannot grant foreign: calling C is full trust; name the dependency in [trust] instead: foreign = [\"%s\"]" d))
-            else if not (List.mem c cap_grants) then
-              raise (Bad (sp, Printf.sprintf "unknown capability `%s`; use %s" c (String.concat ", " cap_grants))))
-          caps;
-        List.iter
-          (fun (f, _) -> if not (List.mem f [ "path"; "git"; "tag"; "commit"; "caps" ]) then raise (Bad (sp, "unknown dependency field `" ^ f ^ "`")))
-          fields;
-        let path = if source = Path && Filename.is_relative path then Filename.concat dir path else path in
-        if List.exists (fun d' -> d'.dname = d) !deps then raise (Bad (sp, "dependency `" ^ d ^ "` is listed twice"));
-        deps := { dname = d; dir = path; caps; dspan = sp; source } :: !deps
-      | "dependencies", _, _ ->
-        raise (Bad (sp, "write a dependency as `name = { path = \"DIR\", caps = [...] }` or `name = { git = \"URL\", tag = \"v1.0.0\" }`"))
-      | "grants", g, v ->
-        if not (List.mem g grant_kinds) then
-          raise
-            (Bad
-               ( sp,
-                 if List.mem g cap_grants then Printf.sprintf "`%s` is always granted; [grants] lists %s" g (String.concat ", " grant_kinds)
-                 else Printf.sprintf "unknown grant `%s`; [grants] lists %s" g (String.concat ", " grant_kinds) ));
-        if List.mem_assoc g !grants then raise (Bad (sp, Printf.sprintf "grant `%s` is listed twice; give a list instead" g));
-        let vs = match v with VStr s -> [ s ] | VArr l -> l | VTable _ -> raise (Bad (sp, "a grant is a string or a list of strings")) in
-        if vs = [] then raise (Bad (sp, "an empty grant list grants nothing; remove the line"));
-        if g = "fs" && List.length vs > 1 then raise (Bad (sp, "fs takes one directory"));
-        let vs =
-          if g <> "fs" then vs
-          else
-            List.map
-              (fun v ->
-                let d, ro = if String.ends_with ~suffix:":ro" v then (String.sub v 0 (String.length v - 3), ":ro") else (v, "") in
-                (if Filename.is_relative d then Filename.concat dir d else d) ^ ro)
-              vs
-        in
-        List.iter (fun v -> if v = "" then raise (Bad (sp, "a grant cannot be empty"))) vs;
-        grants := !grants @ List.map (fun v -> (g, v)) vs
-      | "trust", "foreign", VArr names ->
-        if !trust <> [] then raise (Bad (sp, "[trust] foreign is listed twice"));
-        if names = [] then raise (Bad (sp, "an empty trust list trusts nothing; remove the line"));
-        trust := names
-      | "trust", _, _ -> raise (Bad (sp, "[trust] takes `foreign = [\"dependency\", ...]`: the dependencies that may call C"))
-      | _ -> raise (Bad (sp, "keys belong in [package], [grants], [dependencies] or [trust]"))
+      cur := { !cur with keys = (k, v, sp) :: !cur.keys }
     end;
     skip_ws ()
   done;
+  close ();
+  List.rev !tables
+
+let parse file src : t =
+  let tables = read file src in
+  let name = ref "" and deps = ref [] and grants = ref [] and trust = ref [] in
+  let span lo hi = { Span.file; lo; hi } in
+  let dir = Filename.dirname file in
+  List.iter
+    (fun tb ->
+      let k = tb.tname in
+      if tb.tarray || (k <> "" && k <> "package" && k <> "dependencies" && k <> "grants" && k <> "trust") then
+        raise (Bad (tb.tspan, "unknown table " ^ (if tb.tarray then "[[" ^ k ^ "]]" else "[" ^ k ^ "]") ^ "; vela.toml has [package], [grants], [dependencies] and [trust]"));
+      List.iter
+        (fun (k, v, sp) ->
+          match (tb.tname, k, v) with
+          | "package", "name", VStr s -> name := s
+          | "package", ("version" | "description"), VStr _ -> ()
+          | "package", _, _ -> raise (Bad (sp, "unknown or malformed key in [package]"))
+          | "dependencies", d, VTable fields ->
+            let str f = match List.assoc_opt f fields with Some (VStr v) -> Some v | None -> None | Some _ -> raise (Bad (sp, "`" ^ f ^ "` is a string")) in
+            let source, path =
+              match (str "path", str "git", str "tag", str "commit") with
+              | Some p, None, None, None -> (Path, p)
+              | None, Some url, tag, commit ->
+                if not (git_url_ok url) then
+                  raise (Bad (sp, "`git` must be an https://, http://, ssh://, git:// or file:// URL, or user@host:path"));
+                let rev =
+                  match (tag, commit) with
+                  | Some t, None ->
+                    if not (tag_ok t) then raise (Bad (sp, "bad tag"));
+                    Tag t
+                  | None, Some c ->
+                    if not (commit_ok c) then
+                      raise (Bad (sp, "`commit` is a commit hash in lowercase hex, at least 7 characters"));
+                    Commit c
+                  | _ -> raise (Bad (sp, "a git dependency needs exactly one of `tag` and `commit`"))
+                in
+                (Git (url, rev), "")
+              | Some _, Some _, _, _ -> raise (Bad (sp, "a dependency has `path` or `git`, not both"))
+              | None, None, _, _ -> raise (Bad (sp, "a dependency needs `path = \"DIR\"` or `git = \"URL\"` with a `tag` or `commit`"))
+              | Some _, None, _, _ -> raise (Bad (sp, "`tag` and `commit` go with `git`, not `path`"))
+            in
+            let caps = match List.assoc_opt "caps" fields with Some (VArr cs) -> cs | None -> [] | Some _ -> raise (Bad (sp, "`caps` is a list of strings")) in
+            List.iter
+              (fun c ->
+                if c = "foreign" then
+                  raise (Bad (sp, Printf.sprintf "`caps` cannot grant foreign: calling C is full trust; name the dependency in [trust] instead: foreign = [\"%s\"]" d))
+                else if not (List.mem c cap_grants) then
+                  raise (Bad (sp, Printf.sprintf "unknown capability `%s`; use %s" c (String.concat ", " cap_grants))))
+              caps;
+            List.iter
+              (fun (f, _) -> if not (List.mem f [ "path"; "git"; "tag"; "commit"; "caps" ]) then raise (Bad (sp, "unknown dependency field `" ^ f ^ "`")))
+              fields;
+            let path = if source = Path && Filename.is_relative path then Filename.concat dir path else path in
+            if List.exists (fun d' -> d'.dname = d) !deps then raise (Bad (sp, "dependency `" ^ d ^ "` is listed twice"));
+            deps := { dname = d; dir = path; caps; dspan = sp; source } :: !deps
+          | "dependencies", _, _ ->
+            raise (Bad (sp, "write a dependency as `name = { path = \"DIR\", caps = [...] }` or `name = { git = \"URL\", tag = \"v1.0.0\" }`"))
+          | "grants", g, v ->
+            if not (List.mem g grant_kinds) then
+              raise
+                (Bad
+                   ( sp,
+                     if List.mem g cap_grants then Printf.sprintf "`%s` is always granted; [grants] lists %s" g (String.concat ", " grant_kinds)
+                     else Printf.sprintf "unknown grant `%s`; [grants] lists %s" g (String.concat ", " grant_kinds) ));
+            if List.mem_assoc g !grants then raise (Bad (sp, Printf.sprintf "grant `%s` is listed twice; give a list instead" g));
+            let vs = match v with VStr s -> [ s ] | VArr l -> l | VTable _ -> raise (Bad (sp, "a grant is a string or a list of strings")) in
+            if vs = [] then raise (Bad (sp, "an empty grant list grants nothing; remove the line"));
+            if g = "fs" && List.length vs > 1 then raise (Bad (sp, "fs takes one directory"));
+            let vs =
+              if g <> "fs" then vs
+              else
+                List.map
+                  (fun v ->
+                    let d, ro = if String.ends_with ~suffix:":ro" v then (String.sub v 0 (String.length v - 3), ":ro") else (v, "") in
+                    (if Filename.is_relative d then Filename.concat dir d else d) ^ ro)
+                  vs
+            in
+            List.iter (fun v -> if v = "" then raise (Bad (sp, "a grant cannot be empty"))) vs;
+            grants := !grants @ List.map (fun v -> (g, v)) vs
+          | "trust", "foreign", VArr names ->
+            if !trust <> [] then raise (Bad (sp, "[trust] foreign is listed twice"));
+            if names = [] then raise (Bad (sp, "an empty trust list trusts nothing; remove the line"));
+            trust := names
+          | "trust", _, _ -> raise (Bad (sp, "[trust] takes `foreign = [\"dependency\", ...]`: the dependencies that may call C"))
+          | _ -> raise (Bad (sp, "keys belong in [package], [grants], [dependencies] or [trust]")))
+        tb.keys)
+    tables;
   List.iter
     (fun t ->
       if not (List.exists (fun d -> d.dname = t) !deps) && file <> "<std>/vela.toml" then
