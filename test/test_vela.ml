@@ -1805,6 +1805,19 @@ fn main(root: Root) {
    (try Unix.mkdir (Filename.concat dir "site") 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
    Out_channel.with_open_bin (Filename.concat dir "site/page.html") (fun oc -> output_string oc "<p class=\"x\">{not interpolated} \\ é</p>\n");
    Out_channel.with_open_bin (Filename.concat dir "logo.bin") (fun oc -> output_string oc "\000\255A");
+   let ddir = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "vela-mods-%d-%s" (Unix.getpid ()) "embed-dir") in
+   List.iter (fun d -> try Unix.mkdir (Filename.concat ddir d) 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ()) [ ""; "site"; "site/css"; "site/.git" ];
+   List.iter (fun (f, t) -> Out_channel.with_open_bin (Filename.concat ddir f) (fun oc -> output_string oc t))
+     [ ("site/page.html", "<p>x</p>"); ("site/css/a.css", "b{}"); ("site/.git/HEAD", "hidden"); ("site/.env", "hidden") ];
+   out "embed-dir" ~modules:[ ("assets", "pub fn all() -> Map[Str, Bytes] {\n    embed_dir(\"site\")\n}\n") ]
+     {|use assets
+
+fn main(root: Root) {
+    let files = assets.all()
+    root.stdout.print("{files.keys()} {files["css/a.css"].to_str()} {files.get(".env")}")
+}
+|}
+     "[\"css/a.css\", \"page.html\"] b{} None\n";
    out "embed-text-bytes"
      ~modules:[ ("pages", "pub fn page() -> Str {\n    embed(\"site/page.html\")\n}\n") ]
      {|use pages
@@ -5323,6 +5336,19 @@ fn main(root: Root) {
     (embed_codes ~dep_src:inside (main_uses "embed(\"data.txt\")") = []
      && List.sort compare !Modules.embedded = [ ("", "data.txt", 8); ("embdep", "note.txt", 10) ])
     "vela caps lists embeds";
+  (try Unix.mkdir (Filename.concat pdir "app/pub") 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+  (try Unix.mkdir (Filename.concat pdir "app/empty") 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+  put "app/pub/x.txt" "xx";
+  ok "embed-dir-recorded"
+    (embed_codes ~dep_src:inside (main_uses "embed_dir(\"pub\").len()") = []
+     && List.mem ("", "pub/x.txt", 2) !Modules.embedded)
+    "each file is listed";
+  ok "embed-dir-escapes" (embed_codes ~dep_src:inside (main_uses "embed_dir(\"..\").len()") = [ "E0405" ]) "the parent of the package";
+  ok "embed-dir-file" (embed_codes ~dep_src:inside (main_uses "embed_dir(\"data.txt\").len()") = [ "E0405" ]) "a file, not a directory";
+  ok "embed-dir-empty" (embed_codes ~dep_src:inside (main_uses "embed_dir(\"empty\").len()") = [ "E0405" ]) "nothing to embed";
+  (try Unix.symlink "../../embdep" (Filename.concat pdir "app/pub/out") with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+  ok "embed-dir-symlink-out" (embed_codes ~dep_src:inside (main_uses "embed_dir(\"pub\").len()") = [ "E0405" ]) "a link leaving the package";
+  Sys.remove (Filename.concat pdir "app/pub/out");
   ok "embed-shadowed"
     (embed_codes ~dep_src:inside "use embdep\n\nfn embed(s: Str) -> Str {\n    s\n}\n\nfn main(root: Root) {\n    root.stdout.print(embed(\"../anything\"))\n}\n" = [])
     "a function named embed is an ordinary call";

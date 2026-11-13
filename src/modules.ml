@@ -239,6 +239,63 @@ let embed_file (m : modinfo) name path sp : expr_desc option =
               let lit = mk (EStr [ SPLit text ]) sp in
               Some (if name = "embed" then lit.edesc else EMethod (lit, "to_bytes", sp, []))))
 
+(* `embed_dir("public")`: every file under a directory, read at compile time,
+   as a `Map[Str, Bytes]` from the path inside the directory ("css/site.css")
+   to the contents, in sorted path order. Names starting with `.` are left
+   out (.git, .DS_Store); every file and subdirectory must stay inside the
+   package, as for `embed`. *)
+let embed_dir (m : modinfo) path sp : expr_desc option =
+  let name = "embed_dir" in
+  let fail msg = err "E0405" sp msg; None in
+  match embed_root m with
+  | None -> fail (Printf.sprintf "the standard library cannot use `%s`" name)
+  | Some root ->
+    if path = "" || not (Filename.is_relative path) then
+      fail (Printf.sprintf "`%s` takes a path relative to this file, not `%s`" name path)
+    else (
+      let full = Filename.concat (Filename.dirname m.mfile) path in
+      match (Unix.realpath full, Unix.realpath root) with
+      | exception Unix.Unix_error _ -> fail (Printf.sprintf "cannot find `%s` (looked for %s)" path full)
+      | real, root ->
+        let inside r = String.starts_with ~prefix:(if root = "/" then root else root ^ "/") r || r = root in
+        if not (inside real) then
+          fail (Printf.sprintf "`%s` is outside this package (%s); a program can embed only its own package's files" path root)
+        else if not (Sys.is_directory real) then fail (Printf.sprintf "`%s` is a file, not a directory; use `embed` or `embed_bytes` for one file" path)
+        else
+          (* (key, contents) for every file, or the first problem *)
+          let rec walk dir key_prefix acc =
+            match acc with
+            | Error _ -> acc
+            | Ok files ->
+              let names = Sys.readdir dir |> Array.to_list |> List.filter (fun n -> n <> "" && n.[0] <> '.') |> List.sort compare in
+              List.fold_left
+                (fun acc n ->
+                  match acc with
+                  | Error _ -> acc
+                  | Ok _ -> (
+                    let key = if key_prefix = "" then n else key_prefix ^ "/" ^ n in
+                    match Unix.realpath (Filename.concat dir n) with
+                    | exception Unix.Unix_error _ -> Error (Printf.sprintf "cannot read `%s/%s`" path key)
+                    | r when not (inside r) ->
+                      Error (Printf.sprintf "`%s/%s` points outside this package (%s); a program can embed only its own package's files" path key root)
+                    | r when Sys.is_directory r -> walk r key acc
+                    | r -> (
+                      match In_channel.with_open_bin r In_channel.input_all with
+                      | exception Sys_error e -> Error (Printf.sprintf "cannot read `%s/%s`: %s" path key e)
+                      | text -> ( match acc with Ok fs -> Ok ((key, text) :: fs) | e -> e))))
+                acc names
+          in
+          match walk real "" (Ok []) with
+          | Error msg -> fail msg
+          | Ok [] -> fail (Printf.sprintf "`%s` has no files to embed (names starting with `.` are left out)" path)
+          | Ok files ->
+            let files = List.rev files in
+            List.iter (fun (k, text) -> embedded := (m.mname, path ^ "/" ^ k, String.length text) :: !embedded) files;
+            let pair (k, text) =
+              mk (EStruct (tuple_name 2, sp, [ ("0", sp, mk (EStr [ SPLit k ]) sp); ("1", sp, mk (EMethod (mk (EStr [ SPLit text ]) sp, "to_bytes", sp, [])) sp) ])) sp
+            in
+            Some (ECall (mk (EVar "map") sp, [ mk (EList (List.map pair files)) sp ])))
+
 let rec pat_binds (p : pat) acc =
   match p.pdesc with
   | PBind n -> n :: acc
@@ -287,10 +344,14 @@ let rec expr env locals (e : expr) : expr =
       | None -> e.edesc (* the parser rejects it *))
     | EBin (op, a, b) -> EBin (op, ex a, ex b)
     | EUn (op, a) -> EUn (op, ex a)
-    | ECall ({ edesc = EVar (("embed" | "embed_bytes") as name); _ }, args)
+    | ECall ({ edesc = EVar (("embed" | "embed_bytes" | "embed_dir") as name); _ }, args)
       when (not (List.mem name locals)) && not (Hashtbl.mem env.own name) -> (
       let literal = match args with [ { edesc = EStr [ SPLit p ]; _ } ] -> Some p | [ { edesc = EStr []; _ } ] -> Some "" | _ -> None in
       match literal with
+      | Some path when name = "embed_dir" -> (
+        match embed_dir env.self path e.espan with
+        | Some d -> d
+        | None -> ECall (mk (EVar "map") e.espan, [ mk (EList [ mk (EStruct (tuple_name 2, e.espan, [ ("0", e.espan, mk (EStr []) e.espan); ("1", e.espan, mk (EMethod (mk (EStr []) e.espan, "to_bytes", e.espan, [])) e.espan) ])) e.espan ]) e.espan ]))
       | Some path -> ( match embed_file env.self name path e.espan with Some d -> d | None -> EStr [])
       | None ->
         err "E0405" e.espan

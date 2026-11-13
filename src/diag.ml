@@ -79,7 +79,7 @@ let explanations = [
   "E0402", "The item is private to its module. Only items marked `pub` can be used from another module.";
   "E0403", "The module has no exported item with this name. The note lists what it exports.";
   "E0404", "A module name is not a value. Use one of its items, such as `json.parse(text)`.";
-  "E0405", "`embed(\"path\")` and `embed_bytes(\"path\")` read a file when the program is compiled. The path must be a string literal, relative to the file that names it, and inside that file's package: the directory of its vela.toml (or of the main file when there is none), or a dependency's own directory. Use `embed` for UTF-8 text and `embed_bytes` for anything else. The standard library embeds nothing.";
+  "E0405", "`embed(\"path\")` and `embed_bytes(\"path\")` read a file when the program is compiled. The path must be a string literal, relative to the file that names it, and inside that file's package: the directory of its vela.toml (or of the main file when there is none), or a dependency's own directory. Use `embed` for UTF-8 text and `embed_bytes` for anything else; `embed_dir(\"public\")` takes every file under a directory (names starting with `.` are left out), and none of them may point outside the package. The standard library embeds nothing.";
   "E0901", "This feature is designed but not implemented yet.";
 ]
 

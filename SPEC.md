@@ -1042,13 +1042,15 @@ For a missing key with a default, write `m.get(k) ?? default`.
 | `keep(x)` | `()`; `x` counts as used, so the work that made it is not optimized away (for benchmarks, section 12) |
 | `embed("path")` | `Str`: the file's text, read when the program is compiled (below) |
 | `embed_bytes("path")` | `Bytes`: the file's contents, read when the program is compiled |
+| `embed_dir("path")` | `Map[Str, Bytes]`: every file under a directory, by its path inside it (`"css/site.css"`), read when the program is compiled |
 
-**Embedding files.** `embed` and `embed_bytes` read a file at compile time and put its contents into the program as a literal, so a program that serves its own page or assets needs no `Fs`:
+**Embedding files.** `embed`, `embed_bytes` and `embed_dir` read files at compile time and put its contents into the program as a literal, so a program that serves its own page or assets needs no `Fs`:
 
 ```
 fn main(root: Root) {
     let page = embed("dist/index.html")
     let logo = embed_bytes("logo.png")
+    let assets = embed_dir("public")       // assets["css/site.css"]
     ...
 }
 ```
@@ -1056,6 +1058,7 @@ fn main(root: Root) {
 - The path must be a string literal, relative to the file that names it.
 - It must stay inside that file's package: the directory of the program's vela.toml (or of the main file when there is none), or a dependency's own directory. An absolute path, a `..` that leaves the package or a symlink that points outside it is error E0405. Without this rule a dependency could put `../../.ssh/id_rsa` into the binary, a read that no grant allows.
 - `embed` requires UTF-8 text (E0405 otherwise); `embed_bytes` takes any file. The standard library embeds nothing.
+- `embed_dir` takes every file under the directory and its subdirectories, keyed by its path inside it with `/` between parts, in sorted order. Names starting with `.` (`.git`, `.env`, `.DS_Store`) are left out, at any depth. Every file and subdirectory, links included, must stay inside the package (E0405), and a directory with nothing to embed is E0405 too. Values are `Bytes`; `to_str()` costs nothing for text.
 - The text is taken as it is: braces in the file do not start interpolation.
 - Changing an embedded file changes the program, and the build cache sees it, because the contents are part of the generated C. `vela caps` lists every embedded file with its size after the functions (`"embeds"` in `--json`).
 - A function or variable named `embed` in scope is called as usual.
