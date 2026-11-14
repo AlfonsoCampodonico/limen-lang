@@ -1,0 +1,29 @@
+pub fn area(x: Int) -> Int {
+    x
+}
+
+fn secret() -> Int {
+    1
+}
+
+struct Hidden {
+    x: Int,
+}
+
+fn Hidden2() -> Int {
+    2
+}
+
+enum Private {
+    Inner(Int),
+}
+
+pub enum Color {
+    Red,
+}
+
+pub type Size = Int
+
+pub interface Shape {
+    fn area(self) -> Int
+}

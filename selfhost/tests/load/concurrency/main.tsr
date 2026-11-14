@@ -1,0 +1,5 @@
+use worker
+
+fn main(root: Root) {
+    worker.run(root.clock)
+}

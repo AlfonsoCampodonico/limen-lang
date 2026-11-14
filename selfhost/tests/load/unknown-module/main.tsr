@@ -1,0 +1,8 @@
+fn f(x: geo.Point) -> geo.Shape {
+    let p = geo.Point { x: 1 }
+    let geo = 1
+    let q = geo.Point { x: 2 }
+    p
+}
+
+fn main() {}

@@ -1,0 +1,5 @@
+use a
+
+pub fn pong(n: Int) -> Int {
+    a.ping(n)
+}

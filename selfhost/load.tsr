@@ -1,0 +1,98 @@
+// Prints the program selfhost/loader.tsr makes of one file, in the format
+// of selfhost/loaddump (the OCaml loader's), so the two can be compared:
+// the items, one per line, then `foreign`, `embedded` and `spans`; or the
+// problems, each as ERROR CODE FILE LO HI, its message and its notes.
+//
+// It reads through the one Fs it is granted: the standard library's
+// sources at STD, and the program at FILE, a path relative to CWD; both
+// are paths inside the granted directory.
+//
+//   tessera run selfhost/load.tsr --grant fs=..:ro -- tessera/src/std tessera/examples hello.tsr
+use ast
+use ast_print
+use diag
+use disk
+use loader
+use rename
+use walk
+
+fn main(root: Root) -> Int {
+    let out = root.stdout
+    let args = root.args()
+    if args.len() != 3 {
+        out.print("usage: load STD CWD FILE")
+        return 2
+    }
+    let fs = root.fs
+    let base = match fs.full_path("") {
+        Ok(p) => p,
+        Err(e) => {
+            out.print("no directory granted: {e}")
+            return 1
+        },
+    }
+    let place = disk.Place { cwd: args[1], root: base }
+    let p = loader.load(fs, fs.under(args[0]), place, args[2])
+    let paths = p.files.map(|f| f.path)
+    for d in p.diags {
+        out.print("ERROR {d.code} {diag.path_of(p.files, d.span.file)} {d.span.lo} {d.span.hi}")
+        // a lexing error has no message of its own here
+        if d.message != "" {
+            out.print(d.message)
+        }
+        for n in d.notes {
+            out.print("note: {n}")
+        }
+    }
+    if !p.diags.is_empty() {
+        return 0
+    }
+    // not part of the comparison, which the OCaml loader has no ids for:
+    // a line here makes it fail
+    let problem = id_problem(p)
+    if problem != "" {
+        out.print("ERROR ids: " + problem)
+    }
+    for i in p.items {
+        out.print(ast_print.item_line(i))
+    }
+    out.print("foreign")
+    for i in p.items {
+        match i {
+            IFn(d) => match d.foreign {
+                Some(f) => out.print("  fn {d.name} " + (if f.trusted { "trusted" } else { "untrusted" })),
+                None => {},
+            },
+            IStruct(s) => match s.foreign {
+                Some(f) => out.print("  struct {s.name} {ast_print.escaped(f.lib)} {f.types.map(ast_print.ty).join(",")}"),
+                None => {},
+            },
+            _ => {},
+        }
+    }
+    out.print("embedded")
+    for e in p.embedded {
+        out.print("  {if e.module == "" { "main" } else { e.module }} {e.path} {e.size}")
+    }
+    out.print("spans")
+    for i in p.items {
+        let home = rename.item_span(i).file
+        out.print("  {paths.get(home) ?? ""} {ast_print.item_spans_in(ast_print.Where { home, paths }, i)}")
+    }
+    0
+}
+
+// What is wrong with the expression ids of a loaded program, or "": each
+// expression must have its own, from 1 up to the program's next free id.
+fn id_problem(p: loader.Program) -> Str {
+    let ids = p.items.flat_map(walk.item).map(|e| e.id).sort()
+    for (k, id) in ids.with_index() {
+        if id < 1 || id >= p.next_id {
+            return "{id} is out of range"
+        }
+        if k > 0 && ids[k - 1] == id {
+            return "{id} is used twice"
+        }
+    }
+    ""
+}

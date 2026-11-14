@@ -1,0 +1,27 @@
+// table tests become one test per case, named by the case's text
+fn add(a: Int, b: Int) -> Int {
+    a + b
+}
+
+test "adds" for (a, b, want) in [(1, 2, 3), (2,
+    2,   4)] {
+    assert_eq(add(a, b), want)
+}
+
+test "" for n in [1, 2] {
+    assert(n > 0)
+}
+
+test "plain" {
+    assert(true)
+}
+
+bench "sum" {
+    add(1, 2)
+}
+
+bench "nothing" {
+    let x = 1
+}
+
+fn main() {}

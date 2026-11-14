@@ -1,0 +1,33 @@
+use text
+
+fn double(x: Int) -> Int {
+    x * 2
+}
+
+fn add(x: Int, y: Int) -> Int {
+    x + y
+}
+
+fn check(x: Int) -> Result[Int, Str] {
+    Ok(x)
+}
+
+fn run() -> Result[Int, Str] {
+    let a = 1 |> double
+    let b = 1 |> add(2) |> double
+    let c = "ab" |> text.repeat(3)
+    let d = [1, 2] |> list_len
+    let e = 3 |> |x| x + 1
+    let f = 4 |> check?
+    let g = 5 |> check? "checking"
+    let h = "x"
+        |> text.repeat(2)
+        |> text.pad_left(5, " ")
+    Ok(a)
+}
+
+fn list_len(xs: List[Int]) -> Int {
+    xs.len()
+}
+
+fn main() {}

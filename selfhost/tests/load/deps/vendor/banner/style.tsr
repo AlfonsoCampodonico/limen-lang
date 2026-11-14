@@ -1,0 +1,4 @@
+pub fn frame(s: Str) -> Str {
+    "[" + s + "]"
+    let x = embed("art.txt")
+}

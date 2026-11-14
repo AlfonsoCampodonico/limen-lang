@@ -1,0 +1,40 @@
+// tuple patterns become plain lets through temporaries, numbered in the
+// order the OCaml loader meets them (an if's else before its then)
+fn pairs() -> List[(Int, (Str, Bool))] {
+    [(1, ("a", true))]
+}
+
+fn main() {
+    let (a, (b, _)) = (1, ("x", false))
+    let (_, _) = (2, 3)
+    let (only) = 4
+    for (n, (s, flag)) in pairs() {
+        let (x, y) = (n, s)
+    }
+    if a > 0 {
+        let (p, q) = (1, 2)
+    } else {
+        let (r, t) = (3, 4)
+    }
+    let v = match a {
+        1 => {
+            let (m, n) = (5, 6)
+            m
+        },
+        _ => {
+            let (o, u) = (7, 8)
+            o
+        },
+    }
+    let mut i = 0
+    let mut j = ""
+    (i, (j, _)) = (1, ("z", true))
+    (i, _) = (2, 3)
+    while i < 3 {
+        (i, j) = (i + 1, j)
+    }
+    let f = |k: Int| {
+        let (c, d) = (k, k)
+        c
+    }
+}

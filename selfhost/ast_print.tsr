@@ -8,7 +8,7 @@ use floats
 // `s` as OCaml's String.escaped writes it: `\"`, `\\`, `\n`, `\t`, `\r`,
 // `\b`, printable ASCII as it is, and any other byte as three decimal
 // digits, `\001`.
-fn escaped(s: Str) -> Str {
+pub fn escaped(s: Str) -> Str {
     let mut out: List[Str] = []
     let mut start = 0
     let bs = s.bytes()
@@ -203,7 +203,7 @@ fn item(i: ast.Item) -> Str {
         },
         IIface(f) => "interface " + f.name + "[" + f.generics.join(",") + "]\{" + f.methods.map(|m| m.name + "(" + params(m.params) + ")" + ret(m.ret)).join(";") + "\}",
         IStruct(s) => {
-            let foreign = s.foreign.map(|lib| "foreign " + escaped(lib) + " ") ?? ""
+            let foreign = s.foreign.map(|f| "foreign " + escaped(f.lib) + " ") ?? ""
             let fields = commas(s.fields, |f| if s.embeds.contains(f.name) { "embed " + ty(f.ty) } else { f.name + ":" + ty(f.ty) })
             foreign + "struct " + s.name + "[" + generics(s.generics, s.bounds) + "]\{" + fields + "\}"
         },
@@ -241,10 +241,15 @@ fn is_public(i: ast.Item) -> Bool {
     }
 }
 
+// An item on one line, as src/astdump.ml writes the items of a file.
+pub fn item_line(i: ast.Item) -> Str {
+    (if is_public(i) { "pub " } else { "" }) + item(i)
+}
+
 // The whole file, as src/astdump.ml writes it.
 pub fn file(f: ast.File) -> Str {
     let uses = f.uses.map(|u| "use " + u.text).join("\n")
-    let items = f.items.map(|i| (if is_public(i) { "pub " } else { "" }) + item(i)).join("\n")
+    let items = f.items.map(item_line).join("\n")
     uses + "\n" + items
 }
 
@@ -254,8 +259,17 @@ pub fn file(f: ast.File) -> Str {
 // each, in the order a walk of the tree meets them; selfhost/astdump walks
 // the OCaml tree in the same order.
 
-fn sp(s: ast.Span) -> Str {
-    " {s.lo}:{s.hi}"
+// Where the spans being written are: the file they are expected in, and
+// the paths of the files by number. A span in another file is written
+// ` lo:hi@path` (a loaded program's type alias brings its body's positions
+// from its own module).
+pub struct Where {
+    home: Int,
+    paths: List[Str],
+}
+
+fn sp(w: Where, s: ast.Span) -> Str {
+    if s.file == w.home { " {s.lo}:{s.hi}" } else { " {s.lo}:{s.hi}@{w.paths.get(s.file) ?? ""}" }
 }
 
 fn all[T](xs: List[T], f: fn(T) -> Str) -> Str {
@@ -266,99 +280,110 @@ fn maybe[T](x: Option[T], f: fn(T) -> Str) -> Str {
     x.map(f) ?? ""
 }
 
-fn ty_spans(t: ast.TyExpr) -> Str {
-    sp(t.span) + match t.desc {
-        TyName(_, args) => all(args, ty_spans),
-        TyFn(params, ret) => all(params, ty_spans) + ty_spans(ret),
+fn ty_spans(w: Where, t: ast.TyExpr) -> Str {
+    sp(w, t.span) + match t.desc {
+        TyName(_, args) => all(args, |x| ty_spans(w, x)),
+        TyFn(params, ret) => all(params, |x| ty_spans(w, x)) + ty_spans(w, ret),
         _ => "",
     }
 }
 
-fn pat_spans(p: ast.Pat) -> Str {
-    sp(p.span) + match p.desc {
-        PVariant(_, _, items) | PTuple(items) | PList(items) | POr(items) => all(items, pat_spans),
+fn pat_spans(w: Where, p: ast.Pat) -> Str {
+    sp(w, p.span) + match p.desc {
+        PVariant(_, _, items) | PTuple(items) | PList(items) | POr(items) => all(items, |x| pat_spans(w, x)),
         _ => "",
     }
 }
 
-fn init_spans(f: ast.FieldInit) -> Str {
-    sp(f.span) + expr_spans(f.value)
+fn init_spans(w: Where, f: ast.FieldInit) -> Str {
+    sp(w, f.span) + expr_spans(w, f.value)
 }
 
-fn expr_spans(e: ast.Expr) -> Str {
-    sp(e.span) + match e.desc {
+fn expr_spans(w: Where, e: ast.Expr) -> Str {
+    sp(w, e.span) + match e.desc {
         EStr(parts) => all(parts, |part| match part {
-            SPExpr(x) => expr_spans(x),
+            SPExpr(x) => expr_spans(w, x),
             SPLit(_) => "",
         }),
-        EList(items) => all(items, expr_spans),
-        EBin(_, a, b) | EPipe(a, b) | EIndex(a, b) => expr_spans(a) + expr_spans(b),
-        EUn(_, a) => expr_spans(a),
-        ECall(f, args) => expr_spans(f) + all(args, expr_spans),
-        EMethod(r, _, name, args) => expr_spans(r) + sp(name) + all(args, expr_spans),
-        EField(r, _, name) => expr_spans(r) + sp(name),
-        ETry(a, c) => expr_spans(a) + maybe(c, expr_spans),
-        EIf(c, b, other) => expr_spans(c) + block_spans(b) + maybe(other, expr_spans),
-        EMatch(s, arms) => expr_spans(s) + all(arms, |a| pat_spans(a.pat) + maybe(a.guard, expr_spans) + expr_spans(a.body)),
-        EBlock(b) => block_spans(b),
-        EClosure(params, body) => all(params, |p| sp(p.span) + maybe(p.ty, ty_spans)) + expr_spans(body),
-        EStruct(_, name, fields) => sp(name) + all(fields, init_spans),
-        EWith(b, fields) => expr_spans(b) + all(fields, init_spans),
-        EGroup(_, _, until, b) => maybe(until, |d| expr_spans(d.clock) + expr_spans(d.ms)) + block_spans(b),
-        ESelect(arms) => all(arms, |a| sp(a.span) + sel_spans(a.op) + maybe(a.guard, expr_spans) + expr_spans(a.body)),
-        ESafe(b, _, rest) => expr_spans(b) + expr_spans(rest),
-        ENamed(_, name, x) => sp(name) + expr_spans(x),
+        EList(items) => all(items, |x| expr_spans(w, x)),
+        EBin(_, a, b) | EPipe(a, b) | EIndex(a, b) => expr_spans(w, a) + expr_spans(w, b),
+        EUn(_, a) => expr_spans(w, a),
+        ECall(f, args) => expr_spans(w, f) + all(args, |x| expr_spans(w, x)),
+        EMethod(r, _, name, args) => expr_spans(w, r) + sp(w, name) + all(args, |x| expr_spans(w, x)),
+        EField(r, _, name) => expr_spans(w, r) + sp(w, name),
+        ETry(a, c) => expr_spans(w, a) + maybe(c, |x| expr_spans(w, x)),
+        EIf(c, b, other) => expr_spans(w, c) + block_spans(w, b) + maybe(other, |x| expr_spans(w, x)),
+        EMatch(s, arms) => expr_spans(w, s) + all(arms, |a| pat_spans(w, a.pat) + maybe(a.guard, |x| expr_spans(w, x)) + expr_spans(w, a.body)),
+        EBlock(b) => block_spans(w, b),
+        EClosure(params, body) => all(params, |p| sp(w, p.span) + maybe(p.ty, |x| ty_spans(w, x))) + expr_spans(w, body),
+        EStruct(_, name, fields) => sp(w, name) + all(fields, |x| init_spans(w, x)),
+        EWith(b, fields) => expr_spans(w, b) + all(fields, |x| init_spans(w, x)),
+        EGroup(_, _, until, b) => maybe(until, |d| expr_spans(w, d.clock) + expr_spans(w, d.ms)) + block_spans(w, b),
+        ESelect(arms) => all(arms, |a| sp(w, a.span) + sel_spans(w, a.op) + maybe(a.guard, |x| expr_spans(w, x)) + expr_spans(w, a.body)),
+        ESafe(b, _, rest) => expr_spans(w, b) + expr_spans(w, rest),
+        ENamed(_, name, x) => sp(w, name) + expr_spans(w, x),
         EInt(_) | EFloat(_) | EBool(_) | EUnit | EVar(_) => "",
     }
 }
 
-fn sel_spans(o: ast.SelOp) -> Str {
+fn sel_spans(w: Where, o: ast.SelOp) -> Str {
     match o {
-        SelRecv(bound, ch) => maybe(bound, |b| sp(b.span)) + expr_spans(ch),
-        SelSend(ch, v) => expr_spans(ch) + expr_spans(v),
-        SelAfter(clock, ms) => expr_spans(clock) + expr_spans(ms),
+        SelRecv(bound, ch) => maybe(bound, |b| sp(w, b.span)) + expr_spans(w, ch),
+        SelSend(ch, v) => expr_spans(w, ch) + expr_spans(w, v),
+        SelAfter(clock, ms) => expr_spans(w, clock) + expr_spans(w, ms),
         SelDefault => "",
     }
 }
 
-fn block_spans(b: ast.Block) -> Str {
-    sp(b.span) + all(b.stmts, stmt_spans) + maybe(b.tail, expr_spans)
+fn block_spans(w: Where, b: ast.Block) -> Str {
+    sp(w, b.span) + all(b.stmts, |x| stmt_spans(w, x)) + maybe(b.tail, |x| expr_spans(w, x))
 }
 
-fn stmt_spans(s: ast.Stmt) -> Str {
-    sp(s.span) + match s.desc {
-        SLet(_, _, name, t, e) => sp(name) + maybe(t, ty_spans) + expr_spans(e),
-        SAssign(a, b) => expr_spans(a) + expr_spans(b),
-        SExpr(e) => expr_spans(e),
-        SReturn(e) => maybe(e, expr_spans),
-        SWhile(c, b) => expr_spans(c) + block_spans(b),
-        SFor(_, name, e, b) => sp(name) + expr_spans(e) + block_spans(b),
-        SLetPat(p, e) => pat_spans(p) + expr_spans(e),
-        SForPat(p, e, b) => pat_spans(p) + expr_spans(e) + block_spans(b),
-        SDefer(b) => block_spans(b),
+fn stmt_spans(w: Where, s: ast.Stmt) -> Str {
+    sp(w, s.span) + match s.desc {
+        SLet(_, _, name, t, e) => sp(w, name) + maybe(t, |x| ty_spans(w, x)) + expr_spans(w, e),
+        SAssign(a, b) => expr_spans(w, a) + expr_spans(w, b),
+        SExpr(e) => expr_spans(w, e),
+        SReturn(e) => maybe(e, |x| expr_spans(w, x)),
+        SWhile(c, b) => expr_spans(w, c) + block_spans(w, b),
+        SFor(_, name, e, b) => sp(w, name) + expr_spans(w, e) + block_spans(w, b),
+        SLetPat(p, e) => pat_spans(w, p) + expr_spans(w, e),
+        SForPat(p, e, b) => pat_spans(w, p) + expr_spans(w, e) + block_spans(w, b),
+        SDefer(b) => block_spans(w, b),
         SBreak | SContinue => "",
     }
 }
 
-fn param_spans(p: ast.Param) -> Str {
-    sp(p.span) + ty_spans(p.ty)
+fn param_spans(w: Where, p: ast.Param) -> Str {
+    sp(w, p.span) + ty_spans(w, p.ty)
 }
 
-fn bound_spans(bs: List[ast.Bound]) -> Str {
-    all(bs, |b| all(b.ifaces, ty_spans))
+fn bound_spans(w: Where, bs: List[ast.Bound]) -> Str {
+    all(bs, |b| all(b.ifaces, |x| ty_spans(w, x)))
 }
 
-fn item_spans(i: ast.Item) -> Str {
+fn item_spans(w: Where, i: ast.Item) -> Str {
     match i {
-        IFn(d) => sp(d.span) + all(d.params, param_spans) + maybe(d.ret, ty_spans) + bound_spans(d.bounds) + maybe(d.table, |t| pat_spans(t.pat) + expr_spans(t.cases)) + block_spans(d.body),
-        IStruct(s) => sp(s.span) + bound_spans(s.bounds) + all(s.fields, |f| sp(f.span) + ty_spans(f.ty)),
-        IEnum(e) => sp(e.span) + bound_spans(e.bounds) + all(e.variants, |v| sp(v.span) + all(v.payload, ty_spans)),
-        IIface(f) => sp(f.span) + all(f.methods, |m| sp(m.span) + all(m.params, param_spans) + maybe(m.ret, ty_spans)),
-        IType(a) => sp(a.span) + ty_spans(a.body),
+        IFn(d) => sp(w, d.span) + all(d.params, |x| param_spans(w, x)) + maybe(d.ret, |x| ty_spans(w, x)) + bound_spans(w, d.bounds) + maybe(d.table, |t| pat_spans(w, t.pat) + expr_spans(w, t.cases)) + block_spans(w, d.body),
+        IStruct(s) => sp(w, s.span) + bound_spans(w, s.bounds) + all(s.fields, |f| sp(w, f.span) + ty_spans(w, f.ty)),
+        IEnum(e) => sp(w, e.span) + bound_spans(w, e.bounds) + all(e.variants, |v| sp(w, v.span) + all(v.payload, |x| ty_spans(w, x))),
+        IIface(f) => sp(w, f.span) + all(f.methods, |m| sp(w, m.span) + all(m.params, |x| param_spans(w, x)) + maybe(m.ret, |x| ty_spans(w, x))),
+        IType(a) => sp(w, a.span) + ty_spans(w, a.body),
     }
 }
 
 // One line per `use` and per item, each listing the spans in it.
 pub fn spans(f: ast.File) -> List[Str] {
-    f.uses.map(|u| "  " + sp(u.span).trim()) + f.items.map(|i| "  " + item_spans(i).trim())
+    let w = Where { home: 0, paths: [] }
+    f.uses.map(|u| "  " + sp(w, u.span).trim()) + f.items.map(|i| "  " + item_spans(w, i).trim())
+}
+
+// The spans of one item of a loaded program, whose own file is `w.home`;
+// a C struct's field types as written come last.
+pub fn item_spans_in(w: Where, i: ast.Item) -> Str {
+    let foreign = match i {
+        IStruct(s) => maybe(s.foreign, |f| all(f.types, |x| ty_spans(w, x))),
+        _ => "",
+    }
+    (item_spans(w, i) + foreign).trim()
 }

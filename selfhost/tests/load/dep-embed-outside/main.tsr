@@ -1,0 +1,5 @@
+use peek
+
+fn main() {
+    peek.look()
+}

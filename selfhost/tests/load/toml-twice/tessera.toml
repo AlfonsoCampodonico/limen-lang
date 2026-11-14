@@ -1,0 +1,3 @@
+[dependencies]
+j = { path = "a" }
+j = { path = "b" }

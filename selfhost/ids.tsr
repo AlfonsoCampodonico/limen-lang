@@ -1,0 +1,271 @@
+// Expression ids. The checker learns things about expressions (a type,
+// the type arguments of a generic function's use, which function a call
+// reaches) and keeps them in maps keyed by an expression's id, since it
+// cannot write them into the tree the way the OCaml checker does. So every
+// expression of a loaded program needs an id no other expression has.
+//
+// The parser numbers each file as it finishes it, from a first id the
+// module loader gives it, so the files of a program get ranges that do not
+// overlap. The loader gives the expressions it builds itself (a pipe's
+// call, the parts of an unpacked tuple, an embedded file's text) ids that
+// come after all the files', and numbers each copy of a table test again.
+//
+// The order is a walk of the tree: an expression before the expressions
+// inside it, those in the order they are written. Only expressions get
+// ids. Patterns, statements and types are not annotated: a binding's type
+// is its value's type or follows from the scrutinee's, and a block's is its
+// tail's.
+use ast
+
+// Each function takes the next free id and returns the node numbered and
+// the next free id after it.
+
+pub fn file(f: ast.File, next: Int) -> (ast.File, Int) {
+    let (items, next) = each(f.items, next, item)
+    ({ f with items }, next)
+}
+
+pub fn item(i: ast.Item, next: Int) -> (ast.Item, Int) {
+    match i {
+        IFn(d) => {
+            let (d, next) = function(d, next)
+            (IFn(d), next)
+        },
+        // only functions hold expressions
+        IStruct(_) | IEnum(_) | IIface(_) | IType(_) => (i, next),
+    }
+}
+
+fn function(d: ast.FnDecl, next: Int) -> (ast.FnDecl, Int) {
+    let (table, n) = maybe(d.table, next, |t, n| {
+        let (cases, n) = expr(t.cases, n)
+        ({ t with cases }, n)
+    })
+    let (body, n) = block(d.body, n)
+    ({ d with table, body }, n)
+}
+
+pub fn expr(e: ast.Expr, next: Int) -> (ast.Expr, Int) {
+    // this expression first, then the ones inside it
+    let n = next + 1
+    let (desc, n) = match e.desc {
+        EInt(_) | EFloat(_) | EBool(_) | EUnit | EVar(_) => (e.desc, n),
+        EStr(parts) => {
+            let (parts, n) = each(parts, n, str_part)
+            (EStr(parts), n)
+        },
+        EList(items) => {
+            let (items, n) = each(items, n, expr)
+            (EList(items), n)
+        },
+        EBin(o, a, b) => {
+            let (a, n) = expr(a, n)
+            let (b, n) = expr(b, n)
+            (EBin(o, a, b), n)
+        },
+        EUn(o, a) => {
+            let (a, n) = expr(a, n)
+            (EUn(o, a), n)
+        },
+        ECall(f, args) => {
+            let (f, n) = expr(f, n)
+            let (args, n) = each(args, n, expr)
+            (ECall(f, args), n)
+        },
+        EMethod(r, name, span, args) => {
+            let (r, n) = expr(r, n)
+            let (args, n) = each(args, n, expr)
+            (EMethod(r, name, span, args), n)
+        },
+        EField(r, name, span) => {
+            let (r, n) = expr(r, n)
+            (EField(r, name, span), n)
+        },
+        EIndex(a, i) => {
+            let (a, n) = expr(a, n)
+            let (i, n) = expr(i, n)
+            (EIndex(a, i), n)
+        },
+        ETry(a, context) => {
+            let (a, n) = expr(a, n)
+            let (context, n) = maybe(context, n, expr)
+            (ETry(a, context), n)
+        },
+        EIf(c, then, other) => {
+            let (c, n) = expr(c, n)
+            let (then, n) = block(then, n)
+            let (other, n) = maybe(other, n, expr)
+            (EIf(c, then, other), n)
+        },
+        EMatch(s, arms) => {
+            let (s, n) = expr(s, n)
+            let (arms, n) = each(arms, n, arm)
+            (EMatch(s, arms), n)
+        },
+        EBlock(b) => {
+            let (b, n) = block(b, n)
+            (EBlock(b), n)
+        },
+        EClosure(params, body) => {
+            let (body, n) = expr(body, n)
+            (EClosure(params, body), n)
+        },
+        EStruct(name, span, fields) => {
+            let (fields, n) = each(fields, n, field_init)
+            (EStruct(name, span, fields), n)
+        },
+        EGroup(name, interleaved, until, b) => {
+            let (until, n) = maybe(until, n, deadline)
+            let (b, n) = block(b, n)
+            (EGroup(name, interleaved, until, b), n)
+        },
+        ESelect(arms) => {
+            let (arms, n) = each(arms, n, sel_arm)
+            (ESelect(arms), n)
+        },
+        EPipe(a, b) => {
+            let (a, n) = expr(a, n)
+            let (b, n) = expr(b, n)
+            (EPipe(a, b), n)
+        },
+        EWith(base, fields) => {
+            let (base, n) = expr(base, n)
+            let (fields, n) = each(fields, n, field_init)
+            (EWith(base, fields), n)
+        },
+        ESafe(option, name, rest) => {
+            let (option, n) = expr(option, n)
+            let (rest, n) = expr(rest, n)
+            (ESafe(option, name, rest), n)
+        },
+        ENamed(name, span, value) => {
+            let (value, n) = expr(value, n)
+            (ENamed(name, span, value), n)
+        },
+    }
+    ({ e with desc, id: next }, n)
+}
+
+fn str_part(part: ast.StrPart, next: Int) -> (ast.StrPart, Int) {
+    match part {
+        SPLit(_) => (part, next),
+        SPExpr(x) => {
+            let (x, n) = expr(x, next)
+            (SPExpr(x), n)
+        },
+    }
+}
+
+fn field_init(f: ast.FieldInit, next: Int) -> (ast.FieldInit, Int) {
+    let (value, n) = expr(f.value, next)
+    ({ f with value }, n)
+}
+
+fn deadline(d: ast.Deadline, next: Int) -> (ast.Deadline, Int) {
+    let (clock, n) = expr(d.clock, next)
+    let (ms, n) = expr(d.ms, n)
+    (ast.Deadline { clock, ms }, n)
+}
+
+fn arm(a: ast.Arm, next: Int) -> (ast.Arm, Int) {
+    let (guard, n) = maybe(a.guard, next, expr)
+    let (body, n) = expr(a.body, n)
+    ({ a with guard, body }, n)
+}
+
+fn sel_arm(a: ast.SelArm, next: Int) -> (ast.SelArm, Int) {
+    let (op, n) = match a.op {
+        SelRecv(bound, ch) => {
+            let (ch, n) = expr(ch, next)
+            (SelRecv(bound, ch), n)
+        },
+        SelSend(ch, v) => {
+            let (ch, n) = expr(ch, next)
+            let (v, n) = expr(v, n)
+            (SelSend(ch, v), n)
+        },
+        SelAfter(clock, ms) => {
+            let (clock, n) = expr(clock, next)
+            let (ms, n) = expr(ms, n)
+            (SelAfter(clock, ms), n)
+        },
+        SelDefault => (SelDefault, next),
+    }
+    let (guard, n) = maybe(a.guard, n, expr)
+    let (body, n) = expr(a.body, n)
+    ({ a with op, guard, body }, n)
+}
+
+pub fn block(b: ast.Block, next: Int) -> (ast.Block, Int) {
+    let (stmts, n) = each(b.stmts, next, stmt)
+    let (tail, n) = maybe(b.tail, n, expr)
+    ({ b with stmts, tail }, n)
+}
+
+fn stmt(s: ast.Stmt, next: Int) -> (ast.Stmt, Int) {
+    let (desc, n) = match s.desc {
+        SLet(m, name, span, t, e) => {
+            let (e, n) = expr(e, next)
+            (SLet(m, name, span, t, e), n)
+        },
+        SAssign(a, b) => {
+            let (a, n) = expr(a, next)
+            let (b, n) = expr(b, n)
+            (SAssign(a, b), n)
+        },
+        SExpr(e) => {
+            let (e, n) = expr(e, next)
+            (SExpr(e), n)
+        },
+        SReturn(e) => {
+            let (e, n) = maybe(e, next, expr)
+            (SReturn(e), n)
+        },
+        SWhile(c, body) => {
+            let (c, n) = expr(c, next)
+            let (body, n) = block(body, n)
+            (SWhile(c, body), n)
+        },
+        SFor(name, span, e, body) => {
+            let (e, n) = expr(e, next)
+            let (body, n) = block(body, n)
+            (SFor(name, span, e, body), n)
+        },
+        SLetPat(p, e) => {
+            let (e, n) = expr(e, next)
+            (SLetPat(p, e), n)
+        },
+        SForPat(p, e, body) => {
+            let (e, n) = expr(e, next)
+            let (body, n) = block(body, n)
+            (SForPat(p, e, body), n)
+        },
+        SDefer(body) => {
+            let (body, n) = block(body, next)
+            (SDefer(body), n)
+        },
+        SBreak | SContinue => (s.desc, next),
+    }
+    ({ s with desc }, n)
+}
+
+fn each[T](xs: List[T], next: Int, f: fn(T, Int) -> (T, Int)) -> (List[T], Int) {
+    let mut out: List[T] = []
+    let mut n = next
+    for x in xs {
+        let (y, after) = f(x, n)
+        out.push(y)
+        n = after
+    }
+    (out, n)
+}
+
+fn maybe[T](x: Option[T], next: Int, f: fn(T, Int) -> (T, Int)) -> (Option[T], Int) {
+    match x {
+        Some(v) => {
+            let (v, n) = f(v, next)
+            (Some(v), n)
+        },
+        None => (None, next),
+    }
+}

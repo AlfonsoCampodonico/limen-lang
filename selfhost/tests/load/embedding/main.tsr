@@ -1,0 +1,65 @@
+// methods promoted through embedded structs get forwarders
+use people
+
+struct Named {
+    name: Str,
+}
+
+fn greet(self: Named) -> Str {
+    "hi " + self.name
+}
+
+fn rename[T](self: Named, to: Str, tag: T) -> Named {
+    Named { name: to }
+}
+
+struct Box[T] {
+    value: T,
+}
+
+fn get[T](self: Box[T]) -> T {
+    self.value
+}
+
+fn pick[T, U: Show](self: Box[T], other: U) -> T {
+    self.value
+}
+
+fn only_int(self: Box[Int]) -> Int {
+    self.value
+}
+
+interface Show {
+    fn show(self) -> Str
+}
+
+struct Labeled[U] {
+    Box[U],
+    Named,
+    label: Str,
+}
+
+struct Admin {
+    people.User,
+    Named,
+    level: Int,
+}
+
+struct Both {
+    Named,
+    Other,
+}
+
+struct Other {
+    name: Str,
+}
+
+fn greet(self: Other) -> Str {
+    "other"
+}
+
+struct Deep {
+    Labeled[Str],
+}
+
+fn main() {}

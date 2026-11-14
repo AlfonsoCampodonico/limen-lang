@@ -1,0 +1,21 @@
+type Int = Str
+type Point = (Int, Int)
+
+struct Point {
+    x: Int,
+}
+
+fn Point2() -> Int {
+    1
+}
+
+type Point2 = Str
+
+// a method may share a name with an alias
+fn Counts(self: Str) -> Int {
+    1
+}
+
+type Counts = Map[Str, Int]
+
+fn main() {}

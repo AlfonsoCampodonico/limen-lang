@@ -1,0 +1,5 @@
+use b
+
+pub fn ping(n: Int) -> Int {
+    if n == 0 { 0 } else { b.pong(n - 1) }
+}

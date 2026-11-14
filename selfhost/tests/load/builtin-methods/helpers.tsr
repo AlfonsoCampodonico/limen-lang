@@ -1,0 +1,19 @@
+fn double(self: Int) -> Int {
+    self * 2
+}
+
+fn head[T](self: List[T]) -> Option[T] {
+    self.first()
+}
+
+pub struct Q {
+    y: Int,
+}
+
+fn norm(self: Q) -> Int {
+    self.y
+}
+
+pub fn twice(n: Int) -> Int {
+    n.double()
+}

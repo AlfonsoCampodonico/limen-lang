@@ -1,0 +1,6 @@
+// modules that use each other load once each
+use a
+
+fn main() {
+    a.ping(3)
+}

@@ -1,0 +1,50 @@
+// many problems in one file, to pin down the order they are found in
+
+use m
+
+fn f[T: m.B1](x: m.T1) -> m.T2 {
+    m.e1
+}
+
+struct S[T: m.B2] {
+    a: m.T3,
+}
+
+enum E[T: m.B3] {
+    V(m.T4),
+}
+
+interface I {
+    fn f(self, x: m.T5) -> m.T6
+}
+
+fn g(c: Bool) {
+    let a = m.a1() + m.a2()
+    let b = (m.c1)(m.c2)
+    let d = m.c3(m.c4)
+    if m.i1 {
+        m.i2
+    } else {
+        m.i3
+    }
+    let t = m.t1? "c {m.t2}"
+    let i = m.x1[m.x2]
+    m.y1 = m.y2
+    while m.w1 {
+        m.w2
+    }
+    for q in m.f1 {
+        m.f2
+    }
+    match m.s { m.V1(x) if m.g1 => m.b1, _ => m.b2 }
+    let w = { m.w1 with a: m.w2 }
+    let s = m.s1?.foo(m.s2)
+    let cl = |x: m.T7| m.cb
+    let y: m.TT = m.v
+    select { v = m.ch1.recv() if m.sg => m.sb, m.ch2.send(m.sv) => m.sb2 }
+    group g until m.cl.after(m.ms) {
+        m.gb
+    }
+    let z = Q { a: m.q1, b: m.q2 }
+    let r = m.P { x: m.q3 }
+}

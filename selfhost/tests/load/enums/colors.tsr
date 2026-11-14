@@ -1,0 +1,11 @@
+pub enum Paint {
+    Red,
+    Mix(Int, Int),
+}
+
+fn first(p: Paint) -> Int {
+    match p {
+        Red => 1,
+        Paint.Mix(a, _) => a,
+    }
+}

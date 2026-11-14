@@ -1,0 +1,30 @@
+// variants of this module's enums and of another module's
+use colors
+
+enum Shape {
+    Circle(Float),
+    Square(Float),
+}
+
+fn area(s: Shape) -> Float {
+    match s {
+        Shape.Circle(r) => r * r,
+        Shape.Square(a) | Circle(a) => a * a,
+        colors.Red => 0.0,
+    }
+}
+
+fn main() {
+    let a = Shape.Circle(1.0)
+    let b = Shape.Square
+    let c = colors.Red
+    let d = colors.Mix(1, 2)
+    let e = colors.Paint.Red
+    match c {
+        colors.Red | colors.Mix(_, _) => 1,
+        Paint.Red => 2,
+        _ => 3,
+    }
+    let Shape = 1
+    let f = Shape.Circle(2.0)
+}

@@ -1,0 +1,8 @@
+// two modules that do not exist, reported in order
+use nowhere
+use text
+use elsewhere
+
+fn main() {
+    text.repeat("a", 2)
+}

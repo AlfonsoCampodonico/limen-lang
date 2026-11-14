@@ -2,9 +2,19 @@
 // as src/ast.ml, without the slots the OCaml checker fills in later (an
 // expression's type, its type arguments, the interpreter's cache, `dyn`
 // boxing). Tuples of the OCaml tree are small named structs here.
+//
+// Those slots cannot live in the tree: a Tessera value cannot be changed
+// from elsewhere, so a checker that wrote an expression's type into the
+// tree would have to rebuild the whole tree around it. Instead every
+// expression has an `id`, unique in the program, and the checker keeps
+// what it learns in maps keyed by it (selfhost/ids.tsr numbers them).
 
-// A byte range in the file being parsed: `lo` up to `hi`.
+// A byte range in a source file: `lo` up to `hi`. `file` says which file,
+// as a number the module loader gives each file it reads (0 for a file
+// parsed on its own). A loaded program mixes files: a type alias from
+// another module brings its body's positions along.
 pub struct Span {
+    file: Int,
     lo: Int,
     hi: Int,
 }
@@ -12,7 +22,7 @@ pub struct Span {
 // The span from the start of `a` to the end of whichever ends later, as
 // Span.merge does in the OCaml compiler.
 pub fn merge(a: Span, b: Span) -> Span {
-    Span { lo: a.lo, hi: a.hi.max(b.hi) }
+    { a with hi: a.hi.max(b.hi) }
 }
 
 // ---------- types ----------
@@ -87,6 +97,8 @@ pub enum UnOp {
 pub struct Expr {
     desc: ExprDesc,
     span: Span,
+    // unique in a loaded program; 0 until selfhost/ids.tsr numbers the tree
+    id: Int,
 }
 
 pub enum ExprDesc {
@@ -237,12 +249,15 @@ pub struct Table {
 }
 
 // A C function from a `foreign "lib" { ... }` block: its library, its
-// symbol, and for a variadic one how many parameters come before the `...`.
-// (Whether the library is trusted is decided when modules load.)
+// symbol, for a variadic one how many parameters come before the `...`,
+// and whether its calls need no Foreign capability: only those of the
+// standard library modules src/std/tessera.toml trusts, which the module
+// loader decides (the parser says false).
 pub struct Foreign {
     lib: Str,
     sym: Str,
     variadic: Option[Int],
+    trusted: Bool,
 }
 
 pub struct FnDecl {
@@ -279,8 +294,16 @@ pub struct StructDecl {
     // each named after its type
     embeds: List[Str],
     public: Bool,
-    // declared in a `foreign "lib" { ... }` block: the library
-    foreign: Option[Str],
+    // declared in a `foreign "lib" { ... }` block: a C struct
+    foreign: Option[ForeignStruct],
+}
+
+// A C struct: its library, and its field types as written. The module
+// loader turns Int32 fields into Int for the rest of Tessera, so these are
+// what C sees.
+pub struct ForeignStruct {
+    lib: Str,
+    types: List[TyExpr],
 }
 
 pub struct Variant {

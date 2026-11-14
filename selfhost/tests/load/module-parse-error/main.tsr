@@ -1,0 +1,5 @@
+// the missing module is not reported: the parse error stops the load
+use missing
+use broken
+
+fn main() {}

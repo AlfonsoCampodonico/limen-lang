@@ -1,0 +1,2 @@
+[dependencies]
+z = { path = "z", caps = ["foreign"] }

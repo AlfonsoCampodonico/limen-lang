@@ -1,0 +1,19 @@
+pub type Row = List[Cell]
+pub type Label = Str
+pub type Wrapped[T] = Option[Box[T]]
+
+pub struct Cell {
+    on: Bool,
+}
+
+pub struct Box[T] {
+    value: T,
+}
+
+pub interface Measured {
+    fn size(self) -> Int
+}
+
+pub fn wrap[T](x: T) -> Wrapped[T] {
+    Some(Box { value: x })
+}

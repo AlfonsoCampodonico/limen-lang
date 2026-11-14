@@ -1,0 +1,7 @@
+use banner
+use local
+
+fn main(root: Root) {
+    banner.show(root.stdout, local.name())
+    let mine = embed("vendor/banner/art.txt")
+}

@@ -1,0 +1,2 @@
+[dependencies]
+j = { path = "a", caps = ["net", "disk"] }

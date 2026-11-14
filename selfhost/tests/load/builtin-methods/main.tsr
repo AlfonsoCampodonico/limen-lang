@@ -1,0 +1,19 @@
+// methods on built-in types belong to their file
+use helpers
+
+fn shout(self: Str) -> Str {
+    self.to_upper()
+}
+
+struct P {
+    x: Int,
+}
+
+fn norm(self: P) -> Int {
+    self.x
+}
+
+fn main() {
+    "a".shout()
+    helpers.twice(2)
+}

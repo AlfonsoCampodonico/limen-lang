@@ -1,0 +1,5 @@
+[package]
+name = "x"
+
+[trust]
+foreign = ["zlib"]

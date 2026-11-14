@@ -1,0 +1,12 @@
+use shapes
+
+fn main() {
+    let m = shapes
+    let t = shapes.Point
+    let u = shapes.Point(1)
+    let ok = shapes.make
+    let v = shapes.Red
+    let w = shapes.Wrap(3)
+    let shapes = 1
+    let fine = shapes.x
+}

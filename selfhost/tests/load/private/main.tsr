@@ -1,0 +1,17 @@
+use shapes
+use bare
+
+fn main() {
+    let a = shapes.secret()
+    let b: shapes.Hidden = shapes.Hidden { x: 1 }
+    let c = shapes.nothing(1)
+    let d: shapes.Missing = bare.nope
+    match shapes.area(1) {
+        shapes.Gone(x) => x,
+        shapes.Inner(y) => y,
+        _ => 0,
+    }
+    let e = shapes.Inner(2)
+    let f = shapes.Inner
+    let g = shapes.Hidden2 { x: 1 }
+}

@@ -1,0 +1,35 @@
+// Where the compiler reads files. It reads only through the Fs it is
+// handed, whose paths are relative to the directory that Fs grants; the
+// paths it prints are the OCaml compiler's, relative to the directory it
+// runs in or absolute. A Place turns one into the other.
+use paths
+
+pub struct Place {
+    // the directory paths are relative to, inside the granted one ("" for
+    // the granted directory itself)
+    cwd: Str,
+    // the granted directory's absolute path
+    root: Str,
+}
+
+// The path in the Fs for `path` as the loader writes it.
+pub fn locate(self: Place, path: Str) -> Str {
+    if paths.is_relative(path) {
+        return paths.concat(self.cwd, path)
+    }
+    // an absolute path reaches the Fs only inside its directory
+    if path == self.root {
+        ""
+    } else if path.starts_with(self.root + "/") {
+        path.slice(self.root.len() + 1, path.len())
+    } else {
+        // the Fs refuses absolute paths, so this one reads as missing
+        path
+    }
+}
+
+// The absolute path of directory `dir` (a path in the Fs), as OCaml's
+// Sys.getcwd and Filename.concat would build it.
+pub fn absolute(self: Place, dir: Str) -> Str {
+    if dir == "" { self.root } else { paths.concat(self.root, dir) }
+}

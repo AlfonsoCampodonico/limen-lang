@@ -1,0 +1,11 @@
+// a local or an item named like an embed is called as usual
+fn embed_bytes(s: Str) -> Str {
+    s
+}
+
+fn main() {
+    let embed = |s: Str| s
+    let a = embed("not read")
+    let b = embed_bytes("not read either")
+    let c = embed_dir("missing")
+}

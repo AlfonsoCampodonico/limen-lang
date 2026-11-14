@@ -1,0 +1,12 @@
+pub struct Point {
+    x: Int,
+}
+
+pub fn make() -> Point {
+    Point { x: 1 }
+}
+
+pub enum Color {
+    Red,
+    Wrap(Int),
+}

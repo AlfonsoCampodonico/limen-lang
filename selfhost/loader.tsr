@@ -1,0 +1,389 @@
+// The module loader, as src/modules.ml does it: `use NAME` loads NAME.tsr
+// (next to the file that uses it, then a tessera.toml dependency, then the
+// standard library), and everything becomes one flat program whose items
+// have qualified names (selfhost/rename.tsr), ready for the checker.
+//
+// The loader reads files only through the capabilities it is handed: an
+// Fs for the program and its dependencies, and one for the standard
+// library's sources. A file it cannot see through them does not exist for
+// it.
+use ast
+use diag
+use disk
+use embeds
+use forwarders
+use ids
+use package
+use parser
+use paths
+use rename
+
+// A loaded program, or why it could not be loaded.
+pub struct Program {
+    // every item of every module, renamed and expanded, then the
+    // forwarders struct embedding needs; empty when there are problems
+    items: List[ast.Item],
+    // the problems, in the order they were found
+    diags: List[diag.Diag],
+    // the files read, by the number spans give them
+    files: List[diag.Source],
+    // each module that belongs to a tessera.toml dependency, with it
+    packages: List[(Str, Str)],
+    // the standard library modules the program uses
+    std_modules: List[Str],
+    // the files `embed` read
+    embedded: List[rename.Embedded],
+    // the program's tessera.toml, if it has one, and the standard
+    // library's: what each dependency and each std module may take
+    manifest: Option[package.Manifest],
+    std_manifest: Option[package.Manifest],
+    // the id the checker can give the next expression it makes
+    next_id: Int,
+}
+
+fn failed(files: List[diag.Source], diags: List[diag.Diag]) -> Program {
+    Program { items: [], diags, files, packages: [], std_modules: [], embedded: [], manifest: None, std_manifest: None, next_id: 0 }
+}
+
+// What finding modules needs, the same for the whole load.
+struct Setup {
+    place: disk.Place,
+    // dependency name -> the directory holding NAME.tsr
+    deps: List[(Str, Str)],
+    // the standard library's module names
+    std_names: List[Str],
+}
+
+// The modules found so far, the files read, the problems.
+struct Loading {
+    mods: Map[Str, rename.Module],
+    files: List[diag.Source],
+    next_id: Int,
+    errors: List[diag.Diag],
+}
+
+// Load the program whose main file is `path`, a path relative to
+// `place.cwd` inside what `fs` grants, or absolute. `std` reads the
+// standard library's sources (src/std).
+pub fn load(fs: Fs, std: Fs, place: disk.Place, path: Str) -> Program {
+    let text = match fs.read(place.locate(path)) {
+        Ok(text) => text,
+        Err(e) => {
+            return failed([], [diag.error("E0401", diag.nowhere(), "cannot read {path}: {e}")])
+        },
+    }
+    let mut files = [diag.Source { path, text }]
+    // the package around the file, as a build loads it
+    let mut manifest: Option[package.Manifest] = None
+    let mut root = paths.dirname(path)
+    match find_manifest(fs, place, path) {
+        Some(toml) => {
+            let src = match fs.read(place.locate(toml)) {
+                Ok(src) => src,
+                Err(e) => {
+                    return failed(files, [diag.error("E0321", diag.nowhere(), "{e}")])
+                },
+            }
+            files.push(diag.Source { path: toml, text: src })
+            let m = match package.parse(files.len() - 1, toml, src) {
+                Ok(m) => m,
+                Err(d) => {
+                    return failed(files, [d])
+                },
+            }
+            for d in m.deps {
+                if d.git.is_some() {
+                    return failed(files, [diag.error("E0322", d.span, "cannot fetch dependency `{d.name}`: this loader does not fetch git dependencies")])
+                }
+            }
+            manifest = Some(m)
+            root = paths.dirname(toml)
+        },
+        None => {},
+    }
+    let std_names = match std.list("") {
+        Ok(names) => names.filter(|n| n.ends_with(".tsr")).map(|n| n.slice(0, n.len() - 4)),
+        Err(_) => [],
+    }
+    let deps = manifest.map(|m| m.deps.map(|d| (d.name, d.dir))) ?? []
+    // what the standard library's modules may take, and which are trusted with C
+    let std_manifest = match std.read("tessera.toml") {
+        Ok(src) => package.parse(-1, "<std>/tessera.toml", src).map(|m| Some(m)) ?? None,
+        Err(_) => None,
+    }
+    let trusted = std_manifest.map(|m| m.trust) ?? []
+    let setup = Setup { place, deps, std_names }
+    let (f, next_id) = match parser.parse_file(text, 0, 1) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            return failed(files, [from_parse(e)])
+        },
+    }
+    let main = rename.Module { name: "", path, file: 0, items: f.items, uses: f.uses, package: None }
+    let start = Loading { mods: map(), files, next_id, errors: [] }
+    let loading = match visit(fs, std, setup, start, main) {
+        Ok(l) => l,
+        Err((files, d)) => {
+            return failed(files, [d])
+        },
+    }
+    if !loading.errors.is_empty() {
+        return failed(loading.files, loading.errors)
+    }
+    let others = loading.mods.values().sort_by(|m| m.name)
+    let packages = others.flat_map(|m| m.package.map(|p| [(m.name, p)]) ?? [])
+    let std_modules = others.filter(rename.is_std).map(|m| m.name)
+    // the modules last to first by name, then the main file
+    let order = others.reverse() + [main]
+    let mut st = rename.State { errors: [], temps: 0, next_id: loading.next_id, cyclic: [], embedded: [] }
+    let mut items: List[ast.Item] = []
+    for m in order {
+        st = check_aliases(st, m)
+        let found = embeds.read_all(fs, place, m.path, embed_root(m, deps, root), m.items)
+        let cx = rename.Context { module: m, mods: loading.mods, own: rename.own_items(m.items), gens: [], found, trusted }
+        let src = loading.files[m.file].text
+        for i in m.items {
+            let (copies, after) = expand_table(st, src, i)
+            st = after
+            for copy in copies {
+                let (renamed, after) = rename.item(st, cx, copy)
+                items.push(renamed)
+                st = after
+            }
+        }
+    }
+    if !st.errors.is_empty() {
+        return failed(loading.files, st.errors)
+    }
+    // methods promoted through struct embedding, so interfaces see them
+    let (promoted, next_id) = forwarders.forwarders(items, st.next_id)
+    Program { items: items + promoted, diags: [], files: loading.files, packages, std_modules, embedded: st.embedded, manifest, std_manifest, next_id }
+}
+
+fn from_parse(e: parser.ParseError) -> diag.Diag {
+    diag.Diag { code: e.code, span: e.span, message: e.message, notes: e.notes }
+}
+
+// tessera.toml next to the main file, or in the nearest directory above
+// it, as an absolute path.
+fn find_manifest(fs: Fs, place: disk.Place, path: Str) -> Option[Str] {
+    let exists = |p: Str| fs.exists(place.locate(p))
+    let dir = paths.dirname(path)
+    let beside = paths.concat(dir, "tessera.toml")
+    if exists(beside) {
+        return Some(beside)
+    }
+    let mut d = if paths.is_relative(dir) { paths.concat(place.absolute(place.cwd), dir) } else { dir }
+    while true {
+        let p = paths.concat(d, "tessera.toml")
+        if exists(p) {
+            return Some(p)
+        }
+        let parent = paths.dirname(d)
+        if parent == d {
+            return None
+        }
+        d = parent
+    }
+    None
+}
+
+// The directory a module's embedded files must stay in: its dependency's,
+// or the main package's; the standard library embeds nothing.
+fn embed_root(m: rename.Module, deps: List[(Str, Str)], root: Str) -> Option[Str] {
+    if rename.is_std(m) {
+        return None
+    }
+    match m.package {
+        Some(dep) => deps.find(|d| d.0 == dep).map(|d| d.1),
+        None => Some(root),
+    }
+}
+
+// ---------- finding modules ----------
+
+enum Lookup {
+    // its path, its text, and whether it came from a dependency
+    Found(Str, Str, Bool),
+    // found, but it could not be read
+    Unreadable(Str),
+    NotFound,
+}
+
+// Module `name`, used by the file at `from` (in directory `dir`; "" for
+// the standard library, whose modules are found only by name).
+fn find_module(fs: Fs, std: Fs, setup: Setup, from: Str, dir: Str, name: Str) -> Lookup {
+    let place = setup.place
+    let read = |p: Str, from_dep: Bool| match fs.read(place.locate(p)) {
+        Ok(text) => Found(p, text, from_dep),
+        Err(_) => Unreadable(p),
+    }
+    let local = paths.concat(dir, name + ".tsr")
+    // a file never uses itself: `use http` in http.tsr means another http
+    if dir != "" && fs.exists(place.locate(local)) && !same_file(fs, place, local, from) {
+        return read(local, false)
+    }
+    match setup.deps.find(|d| d.0 == name) {
+        Some(d) => read(paths.concat(d.1, name + ".tsr"), true),
+        None => {
+            if !setup.std_names.contains(name) {
+                return NotFound
+            }
+            match std.read(name + ".tsr") {
+                Ok(text) => Found("<std>/" + name + ".tsr", text, false),
+                Err(_) => Unreadable("<std>/" + name + ".tsr"),
+            }
+        },
+    }
+}
+
+fn same_file(fs: Fs, place: disk.Place, a: Str, b: Str) -> Bool {
+    match (fs.full_path(place.locate(a)), fs.full_path(place.locate(b))) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
+// Load every module `m` uses that is not loaded yet, and theirs, depth
+// first. A module that does not parse stops the load: the error comes back
+// alone, with the files read so far.
+fn visit(fs: Fs, std: Fs, setup: Setup, loading: Loading, m: rename.Module) -> Result[Loading, (List[diag.Source], diag.Diag)] {
+    let dir = if rename.is_std(m) { "" } else { paths.dirname(m.path) }
+    let mut l = loading
+    for u in m.uses {
+        let name = u.text
+        if l.mods.contains(name) {
+            continue
+        }
+        match find_module(fs, std, setup, m.path, dir, name) {
+            NotFound => {
+                let looked = paths.concat(dir, name + ".tsr")
+                let d = diag.error("E0401", u.span, "cannot find module `{name}`").note("looked for {looked}, the dependencies in tessera.toml and the standard library")
+                l.errors.push(d)
+            },
+            Unreadable(p) => l.errors.push(diag.error("E0401", u.span, "cannot read module `{name}` at {p}")),
+            Found(p, text, from_dep) => {
+                let file = l.files.len()
+                l.files.push(diag.Source { path: p, text })
+                let (f, next_id) = match parser.parse_file(text, file, l.next_id) {
+                    Ok(parsed) => parsed,
+                    Err(e) => {
+                        return Err((l.files, from_parse(e)))
+                    },
+                }
+                // tests and main belong to the program being run, not its modules
+                let items = f.items.filter(|i| match i {
+                    IFn(d) => d.test.is_none(),
+                    _ => true,
+                })
+                let package = if from_dep { Some(name) } else if p.starts_with("<std>") { None } else { m.package }
+                let module = rename.Module { name, path: p, file, items, uses: f.uses, package }
+                l.mods[name] = module
+                l.next_id = next_id
+                l = visit(fs, std, setup, l, module)?
+            },
+        }
+    }
+    Ok(l)
+}
+
+// ---------- items ----------
+
+fn builtin_type_names() -> List[Str] {
+    ["Int", "Int32", "Float", "Bool", "Str", "Bytes", "List", "Map", "Array", "Option", "Result", "IoError", "Chan", "Root", "Net", "Fs", "Listen", "Listener", "Conn", "Env", "Exec", "Foreign", "Stdout", "Stdin", "Clock", "Rand", "Handle", "Out"]
+}
+
+// An alias may not take the name of another item of its module or of a
+// built-in type.
+fn check_aliases(st: rename.State, m: rename.Module) -> rename.State {
+    let mut st = st
+    for (k, i) in m.items.with_index() {
+        match i {
+            IType(a) => {
+                let message = if builtin_type_names().contains(a.name) {
+                    "`{a.name}` is a built-in type; name the alias something else"
+                } else if m.items.with_index().any(|x| x.0 != k && !rename.is_method(x.1) && rename.item_name(x.1) == a.name) {
+                    "type `{a.name}` is defined more than once"
+                } else {
+                    continue
+                }
+                st = { st with errors: st.errors + [diag.error("E0106", a.span, message)] }
+            },
+            _ => {},
+        }
+    }
+    st
+}
+
+// A table test, `test "add" for (a, b, want) in [(1, 2, 3), (2, 2, 4)] {
+// body }`, becomes one test per case, named by the case's text ("add (1,
+// 2, 3)"), whose body starts with `let (a, b, want) = (1, 2, 3)`; each
+// copy is numbered again, so its expressions have ids of their own. A
+// bench's value is passed to `keep`, so the work that made it is not
+// optimized away. `src` is the text of the item's file.
+fn expand_table(st: rename.State, src: Str, i: ast.Item) -> (List[ast.Item], rename.State) {
+    let d = match i {
+        IFn(d) => d,
+        _ => {
+            return ([i], st)
+        },
+    }
+    match (d.table, d.test) {
+        (Some(t), Some(base)) => match t.cases.desc {
+            EList(cases) => {
+                let mut st = st
+                let mut copies: List[ast.Item] = []
+                for (k, c) in cases.with_index() {
+                    let text = one_line(src, c.span)
+                    let name = if base == "" { text } else { base + " " + text }
+                    let unpack = ast.Stmt { desc: SLetPat(t.pat, c), span: c.span }
+                    let copy = IFn({ d with name: "{d.name}/{k}", test: Some(name), table: Some({ t with cases: c }), body: { d.body with stmts: [unpack] + d.body.stmts } })
+                    let (copy, next_id) = ids.item(copy, st.next_id)
+                    copies.push(copy)
+                    st = { st with next_id }
+                }
+                (copies, st)
+            },
+            _ => ([i], st),
+        },
+        _ => match d.body.tail {
+            Some(e) if d.bench => {
+                let keep_var = ast.Expr { desc: EVar("keep"), span: e.span, id: st.next_id }
+                let keep = ast.Expr { desc: ECall(keep_var, [e]), span: e.span, id: st.next_id + 1 }
+                ([IFn({ d with body: { d.body with tail: Some(keep) } })], { st with next_id: st.next_id + 2 })
+            },
+            _ => ([i], st),
+        },
+    }
+}
+
+// The text at `span` on one line: runs of spaces and newlines become one
+// space, with none at either end.
+fn one_line(src: Str, span: ast.Span) -> Str {
+    if span.lo < 0 || span.hi > src.len() || span.lo >= span.hi {
+        return "?"
+    }
+    let text = src.slice(span.lo, span.hi)
+    let mut out: List[Str] = []
+    let mut start = 0
+    let mut space = false
+    let bs = text.bytes()
+    let mut i = 0
+    while i < bs.len() {
+        let b = bs[i]
+        if b == 32 || b == 10 || b == 9 || b == 13 {
+            if !space && i > start {
+                out.push(text.slice(start, i))
+            }
+            space = true
+        } else if space {
+            space = false
+            start = i
+        }
+        i = i + 1
+    }
+    if !space && start < bs.len() {
+        out.push(text.slice(start, bs.len()))
+    }
+    out.join(" ")
+}

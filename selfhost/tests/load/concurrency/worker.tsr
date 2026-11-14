@@ -1,0 +1,20 @@
+fn tick(n: Int) -> Int {
+    n + 1
+}
+
+pub fn run(clock: Clock) {
+    let c: Chan[Int] = channel(1)
+    let done: Chan[Int] = channel(1)
+    group g until clock.after(tick(5)) {
+        g.go(|| c.send(tick(1)))
+    }
+    group h interleaved {
+        h.go(|| done.send(2))
+    }
+    select {
+        v = c.recv() if tick(0) > 0 => tick(v ?? 0),
+        done.send(tick(2)) => 0,
+        clock.after(tick(3)) => 1,
+        _ => 2,
+    }
+}

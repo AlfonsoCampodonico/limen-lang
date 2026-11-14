@@ -1,0 +1,8 @@
+// the files a program embeds become literals
+fn main() {
+    let page = embed("assets/page.html")
+    let logo = embed_bytes("assets/logo.bin")
+    let all = embed_dir("assets")
+    let again = embed("./assets/../assets/page.html")
+    let empty = embed("assets/empty.txt")
+}

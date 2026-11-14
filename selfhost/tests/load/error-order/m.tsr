@@ -1,0 +1,11 @@
+pub fn ok() -> Int {
+    1
+}
+
+fn hidden() -> Int {
+    2
+}
+
+pub struct P {
+    x: Int,
+}

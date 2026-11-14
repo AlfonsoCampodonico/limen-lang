@@ -1,0 +1,2 @@
+[dependencies]
+j = { git = ["a"], commit = ["b"] }

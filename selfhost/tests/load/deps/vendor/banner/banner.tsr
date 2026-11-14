@@ -1,0 +1,5 @@
+use style
+
+pub fn show(out: Stdout, name: Str) {
+    out.print(style.frame(embed("art.txt") + name))
+}

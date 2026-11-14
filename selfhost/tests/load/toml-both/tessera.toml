@@ -1,0 +1,2 @@
+[dependencies]
+j = { path = "a", git = "https://example.com/j.git" }

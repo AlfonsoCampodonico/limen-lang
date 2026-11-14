@@ -1,0 +1,39 @@
+// aliases expand where they are used: in signatures, lets, closures,
+// fields, payloads, bounds and other aliases, and from other modules,
+// whose bodies keep their own positions
+use geo
+
+type Counts = Map[Str, Int]
+type Pair[T] = (T, T)
+type Handler[A, B] = fn(A) -> Pair[B]
+type Grid = List[geo.Row]
+
+struct Board {
+    cells: Grid,
+    seen: Counts,
+}
+
+enum Event {
+    Moved(Pair[Int]),
+    Named(geo.Label),
+}
+
+fn swap[T](p: Pair[T]) -> Pair[T] {
+    (p.1, p.0)
+}
+
+fn total(self: Counts) -> Int {
+    self.values().sum()
+}
+
+fn apply[S: geo.Measured](h: Handler[Int, Str], s: S) -> geo.Wrapped[Str] {
+    let c: Counts = map()
+    let f = |x: Pair[geo.Row]| x.0
+    let w: geo.Wrapped[Int] = geo.wrap(1)
+    geo.wrap("x")
+}
+
+fn main() {
+    let b = Board { cells: [], seen: map() }
+    let p: Pair[Int] = swap((1, 2))
+}

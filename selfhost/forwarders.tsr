@@ -1,0 +1,288 @@
+// Forwarders for struct embedding, as src/embed.ml makes them.
+//
+// In `struct Admin { User, level: Int }` the embedded User is an ordinary
+// field named `User`, and the checker turns `admin.greet()` into
+// `admin.User.greet()`. So that Admin also satisfies interfaces through the
+// methods it gets from User (bounds `[T: Greeter]`, `dyn Greeter`), the
+// loader adds a method `Admin::greet` for each such method, whose body is
+// `self.User.greet(...)`.
+//
+// The lookup rule is Go's: the outer struct's own methods come first, then
+// the embedded structs one depth at a time, and the first depth where the
+// name exists wins. Two structs with it at that depth make it ambiguous,
+// which is an error only where it is used, so no forwarder is made.
+use ast
+
+// What looking a member up from a struct finds.
+enum Found {
+    // the struct itself has it
+    Own,
+    // the embedded fields to go through, and the struct that has it
+    Path(List[Str], Str),
+    // two or more structs at the nearest depth have it
+    Ambiguous,
+    Missing,
+}
+
+// The struct type an embedded field holds: its name and type arguments.
+fn embed_type(s: ast.StructDecl, f: Str) -> Option[(Str, List[ast.TyExpr])] {
+    match s.fields.find(|x| x.name == f) {
+        Some(x) => match x.ty.desc {
+            TyName(n, args) => Some((n, args)),
+            _ => None,
+        },
+        None => None,
+    }
+}
+
+// Find a member of struct `n`; `has(t)` says whether struct `t` declares it.
+fn lookup(structs: Map[Str, ast.StructDecl], has: fn(Str) -> Bool, n: Str) -> Found {
+    if has(n) {
+        return Own
+    }
+    // each struct reached at this depth, with the fields that reach it
+    let embeds_of = |at: (Str, List[Str])| match structs.get(at.0) {
+        Some(s) => s.embeds.flat_map(|f| match embed_type(s, f) {
+            Some((t, _)) if structs.contains(t) => [(t, at.1 + [f])],
+            _ => [],
+        }),
+        None => [],
+    }
+    // `seen`: the structs at shallower depths, so a struct that embeds
+    // itself (an error reported elsewhere) cannot loop
+    let mut seen = [n]
+    let mut level = [(n, [])]
+    while true {
+        let next = level.flat_map(embeds_of).filter(|x| !seen.contains(x.0))
+        if next.is_empty() {
+            return Missing
+        }
+        match next.filter(|x| has(x.0)) {
+            [(t, path)] => {
+                return Path(path, t)
+            },
+            [] => {
+                seen = seen + next.map(|x| x.0)
+                level = next
+            },
+            _ => {
+                return Ambiguous
+            },
+        }
+    }
+    Missing
+}
+
+// The name of method `Type::name`.
+fn method_name(key: Str) -> Str {
+    match key.last_index_of(":") {
+        Some(i) => key.slice(i + 1, key.len()),
+        None => key,
+    }
+}
+
+// Whether two types are the same, wherever they are written.
+fn same(a: ast.TyExpr, b: ast.TyExpr) -> Bool {
+    match (a.desc, b.desc) {
+        (TyName(n, xs), TyName(m, ys)) => n == m && xs.len() == ys.len() && xs.zip(ys).all(|p| same(p.0, p.1)),
+        (TyFn(ps, r), TyFn(qs, s)) => ps.len() == qs.len() && ps.zip(qs).all(|p| same(p.0, p.1)) && same(r, s),
+        (TyUnit, TyUnit) => true,
+        (TyInt(x), TyInt(y)) => x == y,
+        _ => false,
+    }
+}
+
+// `t` with the type parameters in `env` replaced.
+fn subst(env: List[(Str, ast.TyExpr)], t: ast.TyExpr) -> ast.TyExpr {
+    match t.desc {
+        TyName(n, []) if env.any(|p| p.0 == n) => env.find(|p| p.0 == n).map(|p| p.1) ?? t,
+        TyName(n, args) => { t with desc: TyName(n, args.map(|a| subst(env, a))) },
+        TyFn(params, ret) => { t with desc: TyFn(params.map(|p| subst(env, p)), subst(env, ret)) },
+        _ => t,
+    }
+}
+
+fn lookup_type(env: List[(Str, ast.TyExpr)], name: Str) -> Option[ast.TyExpr] {
+    env.find(|p| p.0 == name).map(|p| p.1)
+}
+
+// The method of struct `s` that calls `d` (a method of the struct reached
+// through `path`), if it can be written: a method on one instantiation
+// only (`fn f(self: Box[Int])`) cannot be forwarded from a generic struct.
+// `next` is the id for its first expression.
+fn forwarder(structs: Map[Str, ast.StructDecl], s: ast.StructDecl, path: List[Str], d: ast.FnDecl, next: Int) -> Option[(ast.FnDecl, Int)] {
+    let sp = d.span
+    let named = |n: Str, args: List[ast.TyExpr]| ast.TyExpr { desc: TyName(n, args), span: sp }
+    // the embedded value's type, in terms of `s`'s type parameters
+    let mut cur = s
+    let mut env: List[(Str, ast.TyExpr)] = []
+    for f in path {
+        let (tn, args) = embed_type(cur, f) ?? {
+            return None
+        }
+        let inner = structs.get(tn) ?? {
+            return None
+        }
+        if inner.generics.len() != args.len() {
+            return None
+        }
+        env = inner.generics.zip(args.map(|a| subst(env, a)))
+        cur = inner
+    }
+    let embedded = named(cur.name, cur.generics.map(|g| subst(env, named(g, []))))
+    // the method's type parameters that the embedded type decides
+    let mut fail = false
+    let mut mapping: List[(Str, ast.TyExpr)] = []
+    let receiver_args = match d.params.first() {
+        Some(p) => match p.ty.desc {
+            TyName(_, args) => Some(args),
+            _ => None,
+        },
+        None => None,
+    }
+    match (embedded.desc, receiver_args) {
+        (TyName(_, eargs), Some(sargs)) if eargs.len() == sargs.len() => {
+            for pair in sargs.zip(eargs) {
+                let (sa, ea) = pair
+                match sa.desc {
+                    TyName(g, []) if d.generics.contains(g) => match lookup_type(mapping, g) {
+                        Some(prev) => {
+                            if !same(prev, ea) {
+                                fail = true
+                            }
+                        },
+                        None => {
+                            mapping = [(g, ea)] + mapping
+                        },
+                    },
+                    _ => {
+                        if !same(sa, ea) {
+                            fail = true
+                        }
+                    },
+                }
+            }
+        },
+        _ => {
+            fail = true
+        },
+    }
+    // the method's other type parameters, renamed away from the struct's
+    let rest = d.generics.filter(|g| lookup_type(mapping, g).is_none())
+    let fresh = |g: Str| {
+        let mut i = 2
+        while s.generics.contains(g + i.to_str()) || d.generics.contains(g + i.to_str()) {
+            i = i + 1
+        }
+        g + i.to_str()
+    }
+    let renamed = rest.map(|g| (g, if s.generics.contains(g) { fresh(g) } else { g }))
+    let env = mapping + renamed.map(|r| (r.0, named(r.1, [])))
+    let mut bounds: List[ast.Bound] = []
+    for b in d.bounds {
+        let ifaces = b.ifaces.map(|t| subst(env, t))
+        let name = match renamed.find(|r| r.0 == b.name) {
+            Some(r) => r.1,
+            None => match lookup_type(mapping, b.name).map(|t| t.desc) {
+                Some(TyName(g, [])) if s.generics.contains(g) => g,
+                _ => {
+                    fail = true
+                    b.name
+                },
+            },
+        }
+        // bounds on the same parameter join, the joined one moving first
+        bounds = match bounds.find(|x| x.name == name) {
+            Some(prev) => [ast.Bound { name, ifaces: prev.ifaces + ifaces }] + bounds.filter(|x| x.name != name),
+            None => bounds + [ast.Bound { name, ifaces }],
+        }
+    }
+    if fail {
+        return None
+    }
+    // `self.User.greet(a, b)`
+    let params = d.params.skip(1)
+    let mut id = next
+    let mut recv = ast.Expr { desc: EVar("self"), span: sp, id }
+    for f in path {
+        id = id + 1
+        recv = ast.Expr { desc: EField(recv, f, sp), span: sp, id }
+    }
+    let mut args: List[ast.Expr] = []
+    for p in params {
+        id = id + 1
+        args.push(ast.Expr { desc: EVar(p.name), span: sp, id })
+    }
+    let call = ast.Expr { desc: EMethod(recv, method_name(d.name), sp, args), span: sp, id: id + 1 }
+    let receiver = ast.Param { name: "self", span: sp, ty: named(s.name, s.generics.map(|g| named(g, []))) }
+    let f = { d with
+        name: s.name + "::" + method_name(d.name),
+        generics: s.generics + renamed.map(|r| r.1),
+        params: [receiver] + params.map(|p| { p with ty: subst(env, p.ty) }),
+        ret: d.ret.map(|t| subst(env, t)),
+        body: ast.Block { stmts: [], tail: Some(call), span: sp },
+        test: None,
+        bounds,
+        foreign: None,
+    }
+    Some((f, id + 2))
+}
+
+// The forwarders for every method promoted onto a struct of `items`, and
+// the next free expression id.
+pub fn forwarders(items: List[ast.Item], next: Int) -> (List[ast.Item], Int) {
+    let mut structs: Map[Str, ast.StructDecl] = map()
+    let mut methods: Map[Str, ast.FnDecl] = map()
+    for i in items {
+        match i {
+            IStruct(s) => {
+                structs[s.name] = s
+            },
+            IFn(d) if d.test.is_none() && d.name.contains(":") => {
+                methods[d.name] = d
+            },
+            _ => {},
+        }
+    }
+    let mut out: List[ast.Item] = []
+    let mut id = next
+    for i in items {
+        let s = match i {
+            IStruct(s) if !s.embeds.is_empty() => s,
+            _ => {
+                continue
+            },
+        }
+        // every method of every struct reachable through embedding
+        let below = reach(structs, [], s.name).filter(|t| t != s.name)
+        let names = methods.keys().filter(|k| below.any(|t| k.starts_with(t + "::"))).map(method_name).distinct().sort()
+        for m in names {
+            match lookup(structs, |t| methods.contains(t + "::" + m), s.name) {
+                Path(path, t) => match forwarder(structs, s, path, methods[t + "::" + m], id) {
+                    Some((f, after)) => {
+                        out.push(IFn(f))
+                        id = after
+                    },
+                    None => {},
+                },
+                _ => {},
+            }
+        }
+    }
+    (out, id)
+}
+
+// The structs reachable from `t` through embedding, `t` included, added
+// to `seen`.
+fn reach(structs: Map[Str, ast.StructDecl], seen: List[Str], t: Str) -> List[Str] {
+    if seen.contains(t) {
+        return seen
+    }
+    match structs.get(t) {
+        Some(s) => s.embeds.fold([t] + seen, |acc, f| match embed_type(s, f) {
+            Some((tn, _)) => reach(structs, acc, tn),
+            None => acc,
+        }),
+        None => seen,
+    }
+}

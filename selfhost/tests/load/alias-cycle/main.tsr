@@ -1,0 +1,14 @@
+// each alias that contains itself is reported once, where it is declared
+use units
+
+type Tree = List[Tree]
+type A = Map[Str, B]
+type B = Option[A]
+type Loop[T] = Loop[T]
+
+fn f(t: Tree, a: A, b: B, l: Loop[Int], c: units.Cycle) -> Int {
+    let x: Tree = t
+    1
+}
+
+fn main() {}

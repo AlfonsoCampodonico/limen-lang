@@ -1,0 +1,11 @@
+pub struct User {
+    id: Int,
+}
+
+fn describe(self: User) -> Str {
+    "user"
+}
+
+fn greet(self: User) -> Str {
+    "user hi"
+}

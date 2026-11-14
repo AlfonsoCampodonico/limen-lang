@@ -12,6 +12,7 @@
 // with `.`, `?.` or `|>`, so `f\n(x)` is two statements, not a call.
 use ast
 use floats
+use ids
 use lexer
 
 pub struct Parser {
@@ -21,6 +22,8 @@ pub struct Parser {
     // how many `?.` the file has had so far: each one names the value it
     // unwraps after its number
     safes: Int,
+    // the file's number, for the spans
+    file: Int,
 }
 
 pub struct ParseError {
@@ -60,12 +63,12 @@ fn nl(self: Parser) -> Bool {
 }
 
 fn span(self: Parser) -> ast.Span {
-    span_of(self.tok())
+    self.span_of(self.tok())
 }
 
 // The span of the token just read.
 fn last_span(self: Parser) -> ast.Span {
-    span_of(self.toks[(self.pos - 1).max(0)])
+    self.span_of(self.toks[(self.pos - 1).max(0)])
 }
 
 fn at_end(self: Parser) -> Bool {
@@ -107,8 +110,8 @@ fn is_symbol(k: lexer.Kind, s: Str) -> Bool {
     }
 }
 
-fn span_of(t: lexer.Token) -> ast.Span {
-    ast.Span { lo: t.lo, hi: t.hi }
+fn span_of(self: Parser, t: lexer.Token) -> ast.Span {
+    ast.Span { file: self.file, lo: t.lo, hi: t.hi }
 }
 
 fn is_upper(s: Str) -> Bool {
@@ -140,12 +143,12 @@ fn describe(k: lexer.Kind) -> Str {
 }
 
 // "expected `)`, found `,`", at token `t`
-fn unexpected(t: lexer.Token, what: Str) -> ParseError {
-    error("E0003", span_of(t), "expected {what}, found {describe(t.kind)}")
+fn unexpected(self: Parser, t: lexer.Token, what: Str) -> ParseError {
+    error("E0003", self.span_of(t), "expected {what}, found {describe(t.kind)}")
 }
 
 fn expected(self: Parser, what: Str) -> ParseError {
-    unexpected(self.tok(), what)
+    self.unexpected(self.tok(), what)
 }
 
 // Past the symbol `s`, which must be next.
@@ -176,8 +179,10 @@ fn expect_ident(self: Parser) -> Parsed[ast.Name] {
 
 // ---------- building the tree ----------
 
+// A new expression node; selfhost/ids.tsr numbers them once the file is
+// parsed.
 fn mk(desc: ast.ExprDesc, span: ast.Span) -> ast.Expr {
-    ast.Expr { desc, span }
+    ast.Expr { desc, span, id: 0 }
 }
 
 fn merge(a: ast.Span, b: ast.Span) -> ast.Span {
@@ -211,7 +216,7 @@ fn comma_list[T](p: Parser, close: Str, item: fn(Parser) -> Parsed[T]) -> Parsed
 
 pub fn parse_type(p: Parser) -> Parsed[ast.TyExpr] {
     let t = p.tok()
-    let start = span_of(t)
+    let start = p.span_of(t)
     match t.kind {
         // `dyn Shape` is the type `dyn[Shape]`, `dyn Container[Int]` is
         // `dyn[Container[Int]]`
@@ -263,7 +268,7 @@ pub fn parse_type(p: Parser) -> Parsed[ast.TyExpr] {
             let (args, p) = type_args(p)?
             Ok((ast.TyExpr { desc: TyName(name, args), span: merge(start, p.last_span()) }, p))
         },
-        _ => Err(unexpected(t, "a type")),
+        _ => Err(p.unexpected(t, "a type")),
     }
 }
 
@@ -376,7 +381,7 @@ fn parse_postfix(p: Parser, ns: Bool, e: ast.Expr, in_safe: Bool) -> Parsed[ast.
         } else if p.is_sym("[") && !nl {
             let (index, next) = parse_expr(p.skip())?
             let (close, next) = next.expect("]")?
-            (e, p) = (mk(EIndex(e, index), merge(e.span, span_of(close))), next)
+            (e, p) = (mk(EIndex(e, index), merge(e.span, p.span_of(close))), next)
         } else if p.is_sym(".") {
             (e, p) = parse_member(p.skip(), ns, e)?
         } else if p.is_sym("?.") {
@@ -588,7 +593,7 @@ fn parse_parens(p: Parser) -> Parsed[ast.Expr] {
     let (first, p) = parse_expr(p)?
     if !p.is_sym(",") {
         let (close, p) = p.expect(")")?
-        return Ok(({ first with span: merge(start, span_of(close)) }, p))
+        return Ok(({ first with span: merge(start, p.span_of(close)) }, p))
     }
     let (rest, p) = comma_list(p.skip(), ")", parse_expr)?
     let items = [first] + rest
@@ -618,19 +623,19 @@ fn interpolation(p: Parser, code: Str, at: Int) -> Parsed[ast.Expr] {
     let toks = match lexer.lex_at(code, at) {
         Ok(toks) => toks,
         Err(e) => {
-            return Err(lex_error(e))
+            return Err(lex_error(e, p.file))
         },
     }
     // its own tokens, but the file's count of `?.`
-    let (e, sub) = parse_expr(Parser { toks, pos: 0, safes: p.safes })?
+    let (e, sub) = parse_expr(Parser { toks, pos: 0, safes: p.safes, file: p.file })?
     if !sub.at_end() {
         return Err(sub.expected("`\}` to close the interpolation"))
     }
     Ok((e, { p with safes: sub.safes }))
 }
 
-fn lex_error(e: lexer.LexError) -> ParseError {
-    error(e.code, ast.Span { lo: e.lo, hi: e.hi }, "")
+fn lex_error(e: lexer.LexError, file: Int) -> ParseError {
+    error(e.code, ast.Span { file, lo: e.lo, hi: e.hi }, "")
 }
 
 // At a `{`: is this `{ base with field: ... }` rather than a block? It is
@@ -685,7 +690,7 @@ fn parse_with(p: Parser) -> Parsed[ast.Expr] {
         return Err(p.expected("`with`"))
     }
     let (fields, p) = comma_list(p.skip(), "\}", field_init)?
-    Ok((mk(EWith(base, fields), merge(span_of(open), p.last_span())), p))
+    Ok((mk(EWith(base, fields), merge(p.span_of(open), p.last_span())), p))
 }
 
 // `name: value`, or `name` alone for `name: name`.
@@ -710,7 +715,7 @@ fn parse_if(p: Parser) -> Parsed[ast.Expr] {
     let (cond, p) = parse_expr_ns(p)?
     let (then, p) = parse_block(p)?
     if !p.is_kw("else") {
-        return Ok((mk(EIf(cond, then, None), merge(span_of(t), then.span)), p))
+        return Ok((mk(EIf(cond, then, None), merge(p.span_of(t), then.span)), p))
     }
     let p = p.skip()
     let (other, p) = if p.is_kw("if") {
@@ -719,7 +724,7 @@ fn parse_if(p: Parser) -> Parsed[ast.Expr] {
         let (b, p) = parse_block(p)?
         (mk(EBlock(b), b.span), p)
     }
-    Ok((mk(EIf(cond, then, Some(other)), merge(span_of(t), other.span)), p))
+    Ok((mk(EIf(cond, then, Some(other)), merge(p.span_of(t), other.span)), p))
 }
 
 // `if cond` after a pattern or a select operation.
@@ -755,7 +760,7 @@ fn parse_match(p: Parser) -> Parsed[ast.Expr] {
         arms.push(ast.Arm { pat, guard, body })
         p = arm_end(next, "match arms")?
     }
-    Ok((mk(EMatch(subject, arms), merge(span_of(t), p.span())), p.skip()))
+    Ok((mk(EMatch(subject, arms), merge(p.span_of(t), p.span())), p.skip()))
 }
 
 fn parse_select(p: Parser) -> Parsed[ast.Expr] {
@@ -770,7 +775,7 @@ fn parse_select(p: Parser) -> Parsed[ast.Expr] {
         arms.push(ast.SelArm { op, guard, body, span: merge(start, body.span) })
         p = arm_end(next, "select arms")?
     }
-    Ok((mk(ESelect(arms), merge(span_of(t), p.span())), p.skip()))
+    Ok((mk(ESelect(arms), merge(p.span_of(t), p.span())), p.skip()))
 }
 
 // What a `select` arm waits for: `v = ch.recv()`, `ch.recv()`,
@@ -903,7 +908,7 @@ fn is_rest(p: ast.Pat) -> Bool {
 
 fn parse_pat1(p: Parser) -> Parsed[ast.Pat] {
     let t = p.tok()
-    let start = span_of(t)
+    let start = p.span_of(t)
     match t.kind {
         Ident("_") => Ok((pat(PWild, start), p.skip())),
         IntLit(n) => Ok((pat(PInt(n), start), p.skip())),
@@ -917,7 +922,7 @@ fn parse_pat1(p: Parser) -> Parsed[ast.Pat] {
         // a string without interpolation: one piece, or none for `""`
         StrLit([]) => Ok((pat(PStr(""), start), p.skip())),
         StrLit([Lit(s)]) => Ok((pat(PStr(s), start), p.skip())),
-        StrLit(_) => Err(unexpected(t, "a plain string (no interpolation) in a pattern")),
+        StrLit(_) => Err(p.unexpected(t, "a plain string (no interpolation) in a pattern")),
         Keyword("true") => Ok((pat(PBool(true), start), p.skip())),
         Keyword("false") => Ok((pat(PBool(false), start), p.skip())),
         Ident(first) => {
@@ -951,7 +956,7 @@ fn parse_pat1(p: Parser) -> Parsed[ast.Pat] {
             let (items, p) = pat_items(p.skip(), "]", true)?
             Ok((pat(PList(items), merge(start, p.last_span())), p))
         },
-        _ => Err(unexpected(t, "a pattern")),
+        _ => Err(p.unexpected(t, "a pattern")),
     }
 }
 
@@ -996,7 +1001,7 @@ fn parse_block_body(p: Parser, open: lexer.Token) -> Parsed[ast.Block] {
         }
     }
     let (close, p) = p.expect("\}")?
-    Ok((ast.Block { stmts, tail, span: merge(span_of(open), span_of(close)) }, p))
+    Ok((ast.Block { stmts, tail, span: merge(p.span_of(open), p.span_of(close)) }, p))
 }
 
 fn stmt(desc: ast.StmtDesc, span: ast.Span) -> ast.Stmt {
@@ -1197,7 +1202,7 @@ fn parse_item(p: Parser, number: Int) -> Parsed[ast.Item] {
             let (body, p) = parse_type(p.need("=")?)?
             Ok((IType(ast.AliasDecl { name: name.text, span: name.span, generics, body, public: false }), p))
         },
-        _ => Err(unexpected(t, "an item (`fn`, `struct`, `enum`, `interface` or `type`)")),
+        _ => Err(p.unexpected(t, "an item (`fn`, `struct`, `enum`, `interface` or `type`)")),
     }
 }
 
@@ -1208,7 +1213,7 @@ fn parse_test(p: Parser, kind: Str, number: Int) -> Parsed[ast.FnDecl] {
         StrLit([]) => "",
         StrLit([Lit(n)]) => n,
         _ => {
-            return Err(error("E0003", span_of(s), "a {kind} name must be a plain string, without interpolation"))
+            return Err(error("E0003", p.span_of(s), "a {kind} name must be a plain string, without interpolation"))
         },
     }
     // the capabilities the runner hands the test: `(fs: Fs, clock: Clock)`;
@@ -1218,7 +1223,7 @@ fn parse_test(p: Parser, kind: Str, number: Int) -> Parsed[ast.FnDecl] {
     let (body, p) = parse_block(p)?
     let d = ast.FnDecl {
         name: "{kind}#{number}",
-        span: span_of(s),
+        span: p.span_of(s),
         generics: [],
         params: params.map(|x| x.param),
         ret: None,
@@ -1411,7 +1416,7 @@ fn parse_foreign(p: Parser) -> Parsed[List[ast.Item]] {
     let lib = match s.kind {
         StrLit([Lit(l)]) => l,
         _ => {
-            return Err(error("E0003", span_of(s), "a foreign library name must be a plain string, as in `foreign \"sqlite3\" \{ ... \}`"))
+            return Err(error("E0003", p.span_of(s), "a foreign library name must be a plain string, as in `foreign \"sqlite3\" \{ ... \}`"))
         },
     }
     let mut p = p.skip().skip().need("\{")?
@@ -1442,7 +1447,7 @@ fn foreign_struct(p: Parser, lib: Str, public: Bool) -> Parsed[ast.Item] {
         return Err(error("E0003", p.span(), "a foreign struct cannot have type parameters"))
     }
     let (fields, p) = comma_list(p.need("\{")?, "\}", typed_field)?
-    let d = ast.StructDecl { name: name.text, span: name.span, generics: [], fields, bounds: [], embeds: [], public, foreign: Some(lib) }
+    let d = ast.StructDecl { name: name.text, span: name.span, generics: [], fields, bounds: [], embeds: [], public, foreign: Some(ast.ForeignStruct { lib, types: fields.map(|f| f.ty) }) }
     Ok((IStruct(d), p))
 }
 
@@ -1471,7 +1476,7 @@ fn foreign_fn(p: Parser, lib: Str, public: Bool) -> Parsed[ast.Item] {
         match t.kind {
             StrLit([Lit(s)]) => (s, t.hi, p.skip().skip()),
             _ => {
-                return Err(error("E0003", span_of(t), "the C function is named by a plain string, as in `= \"printf\"`"))
+                return Err(error("E0003", p.span_of(t), "the C function is named by a plain string, as in `= \"printf\"`"))
             },
         }
     } else {
@@ -1486,14 +1491,14 @@ fn foreign_fn(p: Parser, lib: Str, public: Bool) -> Parsed[ast.Item] {
         generics: [],
         params: sig.params,
         ret,
-        body: ast.Block { stmts: [], tail: None, span: ast.Span { lo: name.span.lo, hi } },
+        body: ast.Block { stmts: [], tail: None, span: { name.span with hi } },
         test: None,
         bench: false,
         virtual: false,
         table: None,
         public,
         bounds: [],
-        foreign: Some(ast.Foreign { lib, sym, variadic: sig.variadic }),
+        foreign: Some(ast.Foreign { lib, sym, variadic: sig.variadic, trusted: false }),
     }
     Ok((IFn(d), p))
 }
@@ -1566,15 +1571,27 @@ fn starts_foreign(p: Parser) -> Bool {
     }
 }
 
-// Parse a whole file: its `use` lines and its items.
+// Parse a whole file on its own: its `use` lines and its items.
 pub fn parse(src: Str) -> Result[ast.File, ParseError] {
+    let (f, _) = parse_file(src, 0, 1)?
+    Ok(f)
+}
+
+// Parse file number `file` of a program, numbering its expressions from
+// `first_id` on; returns the tree and the next free id.
+pub fn parse_file(src: Str, file: Int, first_id: Int) -> Result[(ast.File, Int), ParseError] {
+    let f = parse_tokens(src, file)?
+    Ok(ids.file(f, first_id))
+}
+
+fn parse_tokens(src: Str, file: Int) -> Result[ast.File, ParseError] {
     let toks = match lexer.lex(src) {
         Ok(toks) => toks,
         Err(e) => {
-            return Err(lex_error(e))
+            return Err(lex_error(e, file))
         },
     }
-    let mut p = Parser { toks, pos: 0, safes: 0 }
+    let mut p = Parser { toks, pos: 0, safes: 0, file }
     let mut uses: List[ast.Name] = []
     let mut items: List[ast.Item] = []
     let mut tests = 0

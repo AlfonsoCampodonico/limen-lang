@@ -1,0 +1,11 @@
+# a program with a dependency, which embeds its own file and uses a
+# module of its own directory
+[package]
+name = "app"
+version = "1.0"
+
+[grants]
+fs = "data:ro"
+
+[dependencies]
+banner = { path = "vendor/banner", caps = ["stdout"] }

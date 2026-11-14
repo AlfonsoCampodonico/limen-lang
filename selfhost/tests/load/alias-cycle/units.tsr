@@ -1,0 +1,2 @@
+pub type Cycle = List[Other]
+type Other = Option[Cycle]

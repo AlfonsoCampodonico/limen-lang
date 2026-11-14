@@ -1,0 +1,36 @@
+// Diagnostics: what went wrong, where, and what to do about it, as the
+// OCaml compiler's src/diag.ml has them. A span names its file by number;
+// the loaded program's file table turns the number into a path.
+use ast
+
+pub struct Diag {
+    code: Str,
+    span: ast.Span,
+    message: Str,
+    notes: List[Str],
+}
+
+pub fn error(code: Str, span: ast.Span, message: Str) -> Diag {
+    Diag { code, span, message, notes: [] }
+}
+
+pub fn note(self: Diag, text: Str) -> Diag {
+    { self with notes: self.notes + [text] }
+}
+
+// A file of the program: its path as the loader names it, and its text.
+pub struct Source {
+    path: Str,
+    text: Str,
+}
+
+// The span OCaml calls Span.dummy, for a problem with no place in any
+// file: file number -1, which the file table has no entry for.
+pub fn nowhere() -> ast.Span {
+    ast.Span { file: -1, lo: 0, hi: 0 }
+}
+
+// The path of file number `file`, or "" for nowhere.
+pub fn path_of(files: List[Source], file: Int) -> Str {
+    files.get(file).map(|s| s.path) ?? ""
+}

@@ -1,0 +1,8 @@
+type Pair[T] = (T, T)
+type Count = Int
+
+fn f(p: Pair, q: Pair[Int, Int], c: Count[Str], ok: Pair[Count]) -> Pair[Pair[Int]] {
+    ((1, 1), (2, 2))
+}
+
+fn main() {}

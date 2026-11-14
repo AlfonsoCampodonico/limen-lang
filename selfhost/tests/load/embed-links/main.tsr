@@ -1,0 +1,6 @@
+// links that lead out of the package are refused
+fn main() {
+    let a = embed("out.txt")
+    let b = embed_dir("linked")
+    let c = embed("inside.txt")
+}
