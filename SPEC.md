@@ -34,6 +34,16 @@ fn parse_names(body: Str) -> List[Str] {   // no capabilities: cannot do I/O
 - **Floats:** digits with a fraction (`1.5`), an exponent (`1e9`, `2.5E-3`), or both. `_` is allowed. There is no leading-dot form (`.5`).
 - **Strings:** `"..."`, may span lines. Escapes: `\n \t \r \\ \" \{ \} \0`. Any other escape is error E0006.
 - **Interpolation:** `{expr}` inside a string evaluates any expression, including ones with their own strings: `"{xs.join(", ")}"`. An empty `{}` is error E0007; write `\{` for a literal brace.
+- **Multi-line strings:** `"""` at the end of a line opens one, its text is on the lines that follow, and `"""` on a line of its own closes it; code may follow the closing `"""` on that line. The closing line's indentation (its spaces and tabs, byte for byte) is taken off every line, and the line breaks right after the opening `"""` and right before the closing one are not part of the string:
+  ```
+  c.write("""
+      HTTP/1.1 200 OK
+      Content-Type: {kind}
+
+      {body}
+      """)
+  ```
+  is `"HTTP/1.1 200 OK\nContent-Type: {kind}\n\n{body}"`. Escapes and interpolation work as in `"..."`, and `"` needs no escape (write `\"""` for a line that starts with three quotes). A line ending in `\` goes on with the next line, with no line break, and the next line's indentation is still taken off. A line indented less than the closing `"""` is error E0009, unless it holds only spaces and tabs (it is then an empty line); so is text after the opening `"""`, and a `\` ending the last line. A line break written `\r\n` in the file is `\n` in the string. For a protocol that wants `\r\n` line ends, replace them: `"""...""".replace("\n", "\r\n")`. An interpolation's code is code, not text: it may span lines, and those lines keep their indentation.
 - **Symbols:** `( ) { } [ ] , : ; . | + - * / % ! ? = < > & ^ ~ -> => == != <= >= && || << >> ..< |> ?.`. `?.` is one symbol (safe navigation), so `e?.name` is never `?` followed by `.name`; write `(e?).name` for that.
 
 ### Newlines
@@ -1433,7 +1443,7 @@ Every diagnostic has a stable code. `tessera explain CODE` prints its explanatio
 | --- | --- |
 | W0001 | a renamed built-in method (`map_err`, now `map_error`) |
 | W0002 | a `match` arm, or an alternative of an or-pattern, that can never match |
-| E0001-E0008 | lexing and parsing: bad character, unclosed string, unexpected token, missing newline, integer too large, bad escape, empty interpolation, untyped parameter |
+| E0001-E0009 | lexing and parsing: bad character, unclosed string, unexpected token, missing newline, integer too large, bad escape, empty interpolation, untyped parameter, misshapen multi-line string |
 | E0101 | unknown name (with a suggestion) |
 | E0102 | unknown type, or a struct pattern naming something that is not a struct |
 | E0103 | unknown field |

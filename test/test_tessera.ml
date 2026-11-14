@@ -27,7 +27,9 @@ let grammar_superset =
     "trailing-in-for"; "trailing-in-match";
     "pattern-two-rests"; "pattern-tuple-named-rest"; "pattern-variant-named-rest"; "pattern-list-two-rests";
     (* `let (a | b, c) = t` reads as a call of `let` with `a | b` in it *)
-    "pattern-let-or" ]
+    "pattern-let-or";
+    (* a grammar cannot compare a multi-line string's lines with its closing line *)
+    "multiline-string-less-indented"; "multiline-string-less-says"; "multiline-string-join-last" ]
 
 let dump name src parsed =
   match Sys.getenv_opt "TESSERA_DUMP_DIR" with
@@ -3842,6 +3844,53 @@ fn main(root: Root) -> Result[(), IoError] {
     "32 1000 true\n";
   panics "rand-bytes-negative" (main_wrap "    out.print(\"{root.rand.bytes(-1)}\")") "rand.bytes: negative length -1";
   errs "interp-escaped-quote" (main_wrap "    out.print(\"{\\\"x\\\".len()}\")\n    out.print(\"later\")") [ "E0006" ];
+  (* multi-line strings: the closing line's indentation comes off every
+     line; escapes, interpolation (a multi-line string inside one too), `\`
+     joining lines, and patterns *)
+  out "multiline-string"
+    (main_wrap {|    let name = "web"
+    let head = """
+        HTTP/1.1 200 OK
+        Server: {name}
+          "indented" \{braces\} tab:\t.
+
+        one \
+        line
+        """
+    out.print(head)
+    out.print("{head.replace("\n", "\r\n").len()} {head.len()}")
+    out.print("""
+    {["a", "b"].join("""
+        -
+        """)}
+    """)
+    let empty = """
+        """
+    out.print("[{empty}]")
+    match "a\nb" {
+        """
+        a
+        b
+        """ => out.print("pattern"),
+        _ => out.print("no"),
+    }|})
+    "HTTP/1.1 200 OK\nServer: web\n  \"indented\" {braces} tab:\t.\n\none line\n70 66\na-b\n[]\npattern\n";
+  (* a line of spaces may be less indented (it is empty); `\r\n` in the file is `\n` *)
+  out "multiline-string-blank-crlf"
+    (main_wrap "    let s = \"\"\"\r\n        a\r\n\r\n  \r\n          b\r\n        \"\"\"\r\n    out.print(\"{s.len()} {s.replace(\"\\n\", \"|\")}\")")
+    "7 a|||  b\n";
+  errs "multiline-string-less-indented" (main_wrap "    let s = \"\"\"\n        a\n      b\n        \"\"\"") [ "E0009" ];
+  errs "multiline-string-text-after-open" (main_wrap "    let s = \"\"\" a\n        \"\"\"") [ "E0009" ];
+  errs "multiline-string-join-last" (main_wrap "    let s = \"\"\"\n        a \\\n        \"\"\"") [ "E0009" ];
+  errs "multiline-string-unterminated" (main_wrap "    let s = \"\"\"\n        a\n") [ "E0002" ];
+  says "multiline-string-less-says" (main_wrap "    let s = \"\"\"\n        a\n      b\n        \"\"\"") "E0009" "less indented than the closing";
+  (* fmt moves the lines with the line the string opens on, keeping the
+     closing quotes' distance from it, so the value stays the same *)
+  (let src = "fn main(root: Root) {\n  let s = \"\"\"   \n      a\n        b {1 +\n    2}\n   \n      \"\"\"\n  if true {\n          root.stdout.print(\"\"\"\n          x\n          \"\"\".replace(\"\\n\", \"\\r\\n\"))  // keep\n  }\n}\n" in
+   let want = "fn main(root: Root) {\n    let s = \"\"\"\n        a\n          b {1 +\n    2}\n\n        \"\"\"\n    if true {\n        root.stdout.print(\"\"\"\n        x\n        \"\"\".replace(\"\\n\", \"\\r\\n\"))  // keep\n    }\n}\n" in
+   let got = try Fmt.format ~file:"fmt-multiline.tsr" src with Diag.Fatal d -> "error: " ^ d.message in
+   ok "fmt-multiline-string" (got = want) (sprintf "got:\n%s\nwant:\n%s" got want);
+   check_fmt "fmt-multiline-string" src ());
   ok "unknown-method-lists-methods"
     (let _, ds, _ = compile "unknown-method" (main_wrap "    let n = [1].size_of()") in
      List.exists (fun (d : Diag.t) -> List.exists (fun n -> String.starts_with ~prefix:"`List[Int]` has: " n) d.notes) ds)

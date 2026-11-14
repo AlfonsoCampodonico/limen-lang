@@ -121,20 +121,44 @@ let[@inline] is_digit c = c >= '0' && c <= '9'
 let[@inline] is_ident_start c = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c = '_'
 let[@inline] is_ident c = is_ident_start c || is_digit c
 
-(* Index just past the string literal starting at [i] (a '"'). Handles
-   escapes and nested interpolations, so `"{xs.join("-")}"` works. *)
-let rec skip_string src i on_eof =
+(* Where the text of a multi-line string opened at [i] starts: [i] is the
+   first of three quotes followed by nothing but spaces and tabs on their
+   line; -1 if they are not. *)
+let ml_start src i =
   let n = String.length src in
-  let rec go j =
-    if j >= n then on_eof ()
-    else
-      match src.[j] with
-      | '"' -> j + 1
-      | '\\' -> go (j + 2)
-      | '{' -> go (skip_braces src (j + 1) on_eof)
-      | _ -> go (j + 1)
-  in
-  go (i + 1)
+  if i + 2 < n && src.[i] = '"' && src.[i + 1] = '"' && src.[i + 2] = '"' then begin
+    let j = ref (i + 3) in
+    while !j < n && (src.[!j] = ' ' || src.[!j] = '\t' || src.[!j] = '\r') do incr j done;
+    if !j < n && src.[!j] = '\n' then !j + 1 else -1
+  end
+  else -1
+
+(* After the spaces and tabs at [j]. *)
+let skip_indent src j =
+  let n = String.length src in
+  let k = ref j in
+  while !k < n && (src.[!k] = ' ' || src.[!k] = '\t') do incr k done;
+  !k
+
+(* Index just past the string literal starting at [i] (a '"'). Handles
+   escapes and nested interpolations, so `"{xs.join("-")}"` works, and
+   multi-line strings. *)
+let rec skip_string src i on_eof =
+  let first = ml_start src i in
+  if first >= 0 then skip_indent src (ml_close src first on_eof) + 3
+  else begin
+    let n = String.length src in
+    let rec go j =
+      if j >= n then on_eof ()
+      else
+        match src.[j] with
+        | '"' -> j + 1
+        | '\\' -> go (j + 2)
+        | '{' -> go (skip_braces src (j + 1) on_eof)
+        | _ -> go (j + 1)
+    in
+    go (i + 1)
+  end
 
 and skip_braces src i on_eof =
   let n = String.length src in
@@ -148,6 +172,25 @@ and skip_braces src i on_eof =
       | _ -> go (j + 1) depth
   in
   go i 0
+
+(* The start of the line that closes the multi-line string whose first line
+   starts at [i]: the first line holding only indentation and three quotes
+   (and whatever code follows them). An interpolation's code may span lines. *)
+and ml_close src i on_eof =
+  let n = String.length src in
+  let rec line j =
+    let k = skip_indent src j in
+    if k + 2 < n && src.[k] = '"' && src.[k + 1] = '"' && src.[k + 2] = '"' then j else rest j
+  and rest j =
+    if j >= n then on_eof ()
+    else
+      match src.[j] with
+      | '\n' -> line (j + 1)
+      | '\\' -> if j + 1 < n && src.[j + 1] = '\n' then line (j + 2) else rest (j + 2)
+      | '{' -> rest (skip_braces src (j + 1) on_eof)
+      | _ -> rest (j + 1)
+  in
+  line i
 
 (* Comments seen by the last top-level lex, as (start, end, text); the
    formatter puts them back. *)
@@ -230,7 +273,6 @@ let lex ?(base = 0) file (src : string) : tokens =
     end
     else if c = '"' then begin
       let lo = !i in
-      incr i;
       let parts = ref [] in
       let buf = Buffer.create 16 in
       let flush () =
@@ -239,51 +281,112 @@ let lex ?(base = 0) file (src : string) : tokens =
           Buffer.clear buf
         end
       in
-      let closed = ref false in
-      while not !closed do
-        if !i >= n then fail "E0002" lo n "unterminated string literal";
-        let c = src.[!i] in
-        if c = '"' then (closed := true; incr i)
-        else if c = '\\' then begin
-          if !i + 1 >= n then fail "E0002" lo n "unterminated string literal";
-          let e = src.[!i + 1] in
-          (match e with
-           | 'n' -> Buffer.add_char buf '\n'
-           | 't' -> Buffer.add_char buf '\t'
-           | 'r' -> Buffer.add_char buf '\r'
-           | '\\' -> Buffer.add_char buf '\\'
-           | '"' -> Buffer.add_char buf '"'
-           | '{' -> Buffer.add_char buf '{'
-           | '}' -> Buffer.add_char buf '}'
-           | '0' -> Buffer.add_char buf '\000'
-           | _ -> fail "E0006" !i (!i + 2) (Printf.sprintf "unknown escape `\\%c`" e));
-          i := !i + 2
-        end
-        else if c = '{' then begin
-          flush ();
-          let open_at = !i in
-          let start = !i + 1 in
-          let depth = ref 1 in
-          incr i;
-          while !depth > 0 do
-            if !i >= n then fail "E0002" open_at n "unterminated interpolation `{...}`";
-            (match src.[!i] with
-             | '{' -> incr depth; incr i
-             | '}' -> decr depth; incr i
-             | '"' -> i := skip_string src !i (fun () -> fail "E0002" open_at n "unterminated string literal")
-             | '\\' ->
-               (* code has no backslashes, so this is an escaped quote meant for a nested string *)
-               fail "E0006" !i (!i + 2)
-                 "a `\\` inside `{...}`: an interpolation holds code, so a string in it uses plain quotes, as in `\"{f(\"x\")}\"`"
-             | _ -> incr i)
-          done;
-          let inner = String.sub src start (!i - 1 - start) in
-          if String.trim inner = "" then
-            fail "E0007" open_at !i "empty interpolation `{}`; write `\\{` for a literal brace";
-          parts := Interp (inner, base + start) :: !parts
-        end
-        else (Buffer.add_char buf c; incr i)
-      done;
+      (* the escape `\e` at [j] *)
+      let escape j =
+        let e = src.[j + 1] in
+        match e with
+        | 'n' -> Buffer.add_char buf '\n'
+        | 't' -> Buffer.add_char buf '\t'
+        | 'r' -> Buffer.add_char buf '\r'
+        | '\\' -> Buffer.add_char buf '\\'
+        | '"' -> Buffer.add_char buf '"'
+        | '{' -> Buffer.add_char buf '{'
+        | '}' -> Buffer.add_char buf '}'
+        | '0' -> Buffer.add_char buf '\000'
+        | _ -> fail "E0006" j (j + 2) (Printf.sprintf "unknown escape `\\%c`" e)
+      in
+      (* the interpolation opened at [open_at], which must close before
+         [limit]; the index after it *)
+      let interp open_at limit =
+        flush ();
+        let start = open_at + 1 in
+        let depth = ref 1 in
+        let j = ref start in
+        while !depth > 0 do
+          if !j >= limit then fail "E0002" open_at limit "unterminated interpolation `{...}`";
+          (match src.[!j] with
+           | '{' -> incr depth; incr j
+           | '}' -> decr depth; incr j
+           | '"' -> j := skip_string src !j (fun () -> fail "E0002" open_at n "unterminated string literal")
+           | '\\' ->
+             (* code has no backslashes, so this is an escaped quote meant for a nested string *)
+             fail "E0006" !j (!j + 2)
+               "a `\\` inside `{...}`: an interpolation holds code, so a string in it uses plain quotes, as in `\"{f(\"x\")}\"`"
+           | _ -> incr j)
+        done;
+        let inner = String.sub src start (!j - 1 - start) in
+        if String.trim inner = "" then
+          fail "E0007" open_at !j "empty interpolation `{}`; write `\\{` for a literal brace";
+        parts := Interp (inner, base + start) :: !parts;
+        !j
+      in
+      if !i + 2 < n && src.[!i + 1] = '"' && src.[!i + 2] = '"' then begin
+        (* a multi-line string: the closing line's indentation is taken off
+           every line, and the line breaks after the opening quotes and
+           before the closing ones are not part of it *)
+        let cs = ml_start src lo in
+        if cs < 0 then begin
+          let j = ref (lo + 3) in
+          while !j < n && (src.[!j] = ' ' || src.[!j] = '\t' || src.[!j] = '\r') do incr j done;
+          if !j >= n then fail "E0002" lo n "unterminated multi-line string; end it with `\"\"\"` on a line of its own"
+          else fail "E0009" lo (lo + 3) "a multi-line string starts with `\"\"\"` at the end of a line; its text begins on the next line"
+        end;
+        let cls = ml_close src cs (fun () -> fail "E0002" lo n "unterminated multi-line string; end it with `\"\"\"` on a line of its own") in
+        let k = skip_indent src cls in
+        let ind = k - cls in
+        let indent = String.sub src cls ind in
+        (* the text runs up to the line break before the closing line *)
+        let ce = cls - 1 in
+        (* where the text of the line starting at [j] starts *)
+        let start_line j =
+          if j + ind <= ce && String.sub src j ind = indent then j + ind
+          else begin
+            let w = ref j in
+            while !w < ce && (src.[!w] = ' ' || src.[!w] = '\t' || src.[!w] = '\r') do incr w done;
+            if !w = ce || src.[!w] = '\n' then !w
+            else
+              fail "E0009" j (if !w > j then !w else j + 1)
+                "this line is less indented than the closing `\"\"\"`; every line of a multi-line string starts with the closing line's indentation"
+          end
+        in
+        if cls > cs then begin
+          let j = ref (start_line cs) in
+          while !j < ce do
+            let c = src.[!j] in
+            if c = '\n' then (Buffer.add_char buf '\n'; j := start_line (!j + 1))
+            else if c = '\r' && src.[!j + 1] = '\n' then incr j
+            else if c = '\\' then begin
+              let e = src.[!j + 1] in
+              if e = '\n' || (e = '\r' && src.[!j + 2] = '\n') then begin
+                (* a line ending in `\` goes on with the next, with no line break *)
+                let at = if e = '\n' then !j + 1 else !j + 2 in
+                if at >= ce then fail "E0009" !j (!j + 1) "a `\\` at the end of the last line has no next line to join";
+                j := start_line (at + 1)
+              end
+              else (escape !j; j := !j + 2)
+            end
+            else if c = '{' then j := interp !j ce
+            else (Buffer.add_char buf c; incr j)
+          done
+        end;
+        i := k + 3
+      end
+      else begin
+        incr i;
+        let closed = ref false in
+        while not !closed do
+          if !i >= n then fail "E0002" lo n "unterminated string literal";
+          let c = src.[!i] in
+          if c = '"' then (closed := true; incr i)
+          else if c = '\\' then begin
+            if !i + 1 >= n then fail "E0002" lo n "unterminated string literal";
+            escape !i;
+            i := !i + 2
+          end
+          else if c = '{' then i := interp !i n
+          else (Buffer.add_char buf c; incr i)
+        done
+      end;
       flush ();
       push (STR (List.rev !parts)) lo !i
     end

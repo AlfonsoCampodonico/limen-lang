@@ -1,0 +1,41 @@
+// Multi-line strings: the closing line's indentation comes off every line.
+fn main(root: Root) {
+    let out = root.stdout
+    let name = "web"
+    let empty = """
+        """
+    let one_empty_line = """
+
+        """
+    let head = """
+        HTTP/1.1 200 OK
+          Server: {name} "quoted" \{braces\} \t \\ \"""
+
+
+        one \
+        line
+        """
+    let tabs = """
+	a
+		b
+	"""
+    let code = """
+        {name +
+    "!"} and {["a", "b"].join("""
+            -
+            """)}
+        """
+    let crlf = """
+        a
+        """.replace("\n", "\r\n")
+    let mid = """
+        a """ b "" c
+        """
+    out.print("{empty}{one_empty_line}{head}{tabs}{code}{crlf}{mid}")
+    match name {
+        """
+        web
+        """ => out.print("web"),
+        _ => out.print("other"),
+    }
+}

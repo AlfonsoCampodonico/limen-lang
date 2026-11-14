@@ -31,6 +31,7 @@ let explanations = [
   "E0006", "Unknown escape in a string. Valid escapes: \\n \\t \\r \\\\ \\\" \\{ \\} \\0.";
   "E0007", "An interpolation `{...}` cannot be empty. Write `\\{` for a literal brace.";
   "E0008", "Every function parameter needs a type, for example `fn f(x: Int)`. Tessera only infers types inside function bodies.";
+  "E0009", "A multi-line string opens with `\"\"\"` at the end of a line, its text on the lines after, and closes with `\"\"\"` on a line of its own. The closing line's indentation is taken off every line, so no line may be indented less than it (a line of only spaces is fine). A line ending in `\\` joins the next one, so the last line cannot end in one.";
   "E0101", "A name was used that is not a local variable, function or enum variant in scope.";
   "E0102", "A type name is not defined, or a struct literal or struct pattern names something that is not a struct (an enum is built and matched with its variants). Built-in types: Int, Float, Bool, Str, List, Array[T, N], Option, Result, IoError, Root, Net, Fs, Stdout, Stderr, Clock, Listen, Listener, Conn, Rand, Stdin, Env, Exec, Foreign, Handle, FileInfo.";
   "E0103", "The struct (or Root) has no field with this name. A struct pattern names the struct's own fields; a field promoted from an embedded struct is matched through the embedded field.";

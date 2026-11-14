@@ -102,9 +102,8 @@ let wrapped_span c lo hi =
   while !ok && !i < hi - 1 do
     (match c.src.[!i] with
      | '"' ->
-       (* skip a string; interpolations inside it are balanced *)
-       incr i;
-       while !i < hi - 1 && c.src.[!i] <> '"' do if c.src.[!i] = '\\' then incr i; incr i done
+       (* skip a string, its interpolations and lines included *)
+       i := Lexer.skip_string c.src !i (fun () -> hi) - 1
      | '(' | '[' | '{' -> incr depth
      | ')' | ']' | '}' -> decr depth; if !depth = 0 then ok := false
      | _ -> ());
@@ -112,15 +111,47 @@ let wrapped_span c lo hi =
   done;
   !ok
 
-(* The source of a literal without parentheses written around it. *)
-let rec bare_slice c (sp : Span.t) =
+(* The span of a literal without parentheses written around it. *)
+let rec bare_span c (sp : Span.t) =
   if wrapped_span c sp.lo sp.hi then begin
     let lo = ref (sp.lo + 1) and hi = ref (sp.hi - 1) in
     while !lo < !hi && (c.src.[!lo] = ' ' || c.src.[!lo] = '\n') do incr lo done;
     while !hi > !lo && (c.src.[!hi - 1] = ' ' || c.src.[!hi - 1] = '\n') do decr hi done;
-    bare_slice c { sp with lo = !lo; hi = !hi }
+    bare_span c { sp with lo = !lo; hi = !hi }
   end
-  else String.sub c.src sp.lo (sp.hi - sp.lo)
+  else sp
+
+let bare_slice c sp = slice c (bare_span c sp)
+
+(* A multi-line string at [lo], its source [text], on an output line
+   indented [ind]: its lines move with the line it opens on, keeping how
+   far the closing quotes sit to the right of that line's indentation. The
+   closing line's indentation is taken off every line of the string, so
+   moving them together keeps its value; a line of only spaces, which may
+   be less indented, becomes empty, and a `\r` before a line break goes, as
+   the lexer drops it. *)
+let multiline c ind lo text =
+  let ws ch = ch = ' ' || ch = '\t' in
+  let indent_of s = let k = ref 0 in while !k < String.length s && ws s.[!k] do incr k done; !k in
+  let ls = match String.rindex_from_opt c.src (max 0 (lo - 1)) '\n' with Some j when lo > 0 -> j + 1 | _ -> 0 in
+  let open_ind = indent_of (String.sub c.src ls (lo - ls)) in
+  let lines = List.map (fun l -> if String.ends_with ~suffix:"\r" l then String.sub l 0 (String.length l - 1) else l) (String.split_on_char '\n' text) in
+  let close = List.nth lines (List.length lines - 1) in
+  let old = indent_of close in
+  let pad = String.make (ind + max 0 (old - open_ind)) ' ' in
+  let body = List.filteri (fun i _ -> i > 0 && i < List.length lines - 1) lines in
+  let moved l =
+    if String.length l >= old && String.sub l 0 old = String.sub close 0 old then
+      if String.length l = old then "" else pad ^ String.sub l old (String.length l - old)
+    else if indent_of l = String.length l then ""
+    else l
+  in
+  String.concat "\n" (("\"\"\"" :: List.map moved body) @ [ pad ^ "\"\"\"" ])
+
+let is_multiline c (sp : Span.t) = sp.hi - sp.lo >= 6 && Lexer.ml_start c.src sp.lo >= 0
+
+(* The indentation of the output line being written. *)
+let current_indent c = match c.o.lines with (ind, _) :: _ -> ind | [] -> 0
 
 (* The expression goes on past a comment: the comments on this line after
    [hi], those on their own lines before [lo], then a new line at [ind]. *)
@@ -264,6 +295,9 @@ let rec expr c ind ?(min = 0) ?(keep = false) e =
 
 and expr_inner c ind e =
   match e.edesc with
+  | EStr _ when is_multiline c (bare_span c e.espan) ->
+    let sp = bare_span c e.espan in
+    add c (multiline c (current_indent c) sp.lo (slice c sp))
   | EInt _ | EFloat _ | EStr _ -> add c (bare_slice c e.espan)
   | EBool b -> add c (string_of_bool b)
   | EUnit -> add c "()"
