@@ -4461,6 +4461,67 @@ fn main(root: Root) {
     out.print("{p}")
 }
 |} "[Some(1), None, None, None, None, None, None, Some(7)]\ntrue\n[None]\n[Some(1)]\nErr(\"boom\")\n";
+  (* The scheduler busy past both a deadline and a later sleep or timeout:
+     the timers ring in order, so the deadline stops what was due after it.
+     A task that computes without waiting stalls the interpreter's scheduler
+     (and one native worker) deterministically. *)
+  out "group-until-stalled" {|use time
+
+fn busy(clock: Clock, ms: Int) -> Int {
+    clock.sleep(5)
+    let until = clock.now_ms() + ms
+    let mut n = 0
+    while clock.now_ms() < until {
+        n = n + 1
+    }
+    1
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let clock = root.clock
+    let never: Chan[Int] = channel(0)
+    // the body's sleep is due after the deadline: the late task never starts
+    let late = group g until clock.after(30) {
+        g.go(|| busy(clock, 150))
+        clock.sleep(100)
+        g.go(|| {
+            out.print("ran late")
+            2
+        })
+    }
+    // a task's sleep and a select's timeouts due after the deadline
+    let slept = group g until clock.after(30) {
+        g.go(|| {
+            clock.sleep(100)
+            2
+        })
+        g.go(|| select {
+            v = never.recv() => 3,
+            clock.after(120) => 4,
+            clock.after(100) => 5,
+        })
+        g.go(|| busy(clock, 150))
+    }
+    // a sleep due before the deadline still wins
+    let early = group g until clock.after(100) {
+        g.go(|| {
+            clock.sleep(30)
+            2
+        })
+        g.go(|| busy(clock, 150))
+    }
+    // time.within: the same deadline, through a group of its own
+    let within = group g {
+        g.go(|| time.within(clock, 30, || {
+            clock.sleep(100)
+            Ok(2)
+        }).is_ok())
+        g.go(|| busy(clock, 150) == 1)
+    }
+    out.print("{late} {slept} {early} {within}")
+}
+|} "[Some(1)] [None, None, Some(1)] [Some(2), Some(1)] [false, true]\n";
   par "group-until-stress" {|fn stuck(c: Chan[Int]) -> Int {
     c.recv() ?? -1
 }

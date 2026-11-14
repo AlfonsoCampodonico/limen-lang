@@ -863,7 +863,10 @@ let try_recv ch =
 (* Wait until a waker claims [cl], or until [tm] rings. A cancelled task gives
    up: its waiters become stale and are taken off their queues. *)
 let wait_claim ?tm cl (queued : (waiter Queue.t * waiter) list) =
-  (try wait_until ?tm (fun () -> cl.fired <> -1 || match tm with Some tm -> rung tm | None -> false)
+  (try
+     wait_until ?tm (fun () -> cl.fired <> -1 || match tm with Some tm -> rung tm | None -> false);
+     (* woken by the timer, but a deadline due no later rang first: stop *)
+     if cl.fired = -1 && stopped !current then raise Cancelled
    with Cancelled ->
      cl.fired <- -2;
      List.iter (fun (q, w) -> remove_waiter q w) queued;
@@ -903,7 +906,9 @@ let chan_close ch =
 let sleep_ms (ms : int64) =
   if ms > 0L then begin
     let tm = timer_after ms in
-    wait_until ~tm (fun () -> rung tm)
+    wait_until ~tm (fun () -> rung tm);
+    (* a deadline due no later than the sleep rang first and stops it *)
+    if stopped !current then raise Cancelled
   end
 
 (* Run tasks until [finished ()]. *)
@@ -916,7 +921,33 @@ let rec schedule finished sp =
         let ((cond, _, _, k) as entry) = Queue.pop runq in
         if cond () then (k (); true) else (Queue.push entry runq; pick (i + 1))
     in
-    if not (pick 0) then begin
+    (* On the real clock several timers can be due at once (the scheduler
+       was busy past them): they ring in order, the earliest first (of two
+       due together, the one set first), before any other task, so a group's
+       deadline that passed first stops a sleep or a timeout due after it.
+       On virtual time only the timer that rang is due. *)
+    let due =
+      if !virtual_now <> None then None
+      else
+        Queue.fold
+          (fun acc ((_, _, tm, _) as entry) ->
+            match (tm, acc) with
+            | Some t, Some (u, _) when (u.at, u.seq) <= (t.at, t.seq) -> acc
+            | Some t, _ when rung t -> Some (t, entry)
+            | _ -> acc)
+          None runq
+    in
+    let ring_due () =
+      match due with
+      | Some (_, ((cond, _, _, k) as entry)) when cond () ->
+        let rest = Queue.fold (fun acc e -> if e == entry then acc else e :: acc) [] runq in
+        Queue.clear runq;
+        List.iter (fun e -> Queue.push e runq) (List.rev rest);
+        k ();
+        true
+      | _ -> false
+    in
+    if not (ring_due () || pick 0) then begin
       let waits =
         Queue.fold (fun acc (_, io, _, _) -> match io with Some ((s : sock), w) when not s.shut -> (s.fd, w) :: acc | _ -> acc) [] runq
       in
