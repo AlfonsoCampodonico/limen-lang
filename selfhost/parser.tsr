@@ -249,8 +249,14 @@ pub fn parse_type(p: Parser) -> Parsed[ast.TyExpr] {
         Keyword("fn") => {
             let p = p.skip().need("(")?
             let (params, p) = comma_list(p, ")", parse_type)?
-            let p = p.need("->")?
-            let (ret, p) = parse_type(p)?
+            // `fn(A)` returns nothing, as a function declared without `->`
+            // does: its result is `()`, with an empty span after the `)` so
+            // the formatter writes it back the way it was written
+            if !p.is_sym("->") {
+                let close = p.last_span()
+                return Ok((ast.TyExpr { desc: TyFn(params, ast.TyExpr { desc: TyUnit, span: { close with lo: close.hi } }), span: merge(start, close) }, p))
+            }
+            let (ret, p) = parse_type(p.skip())?
             Ok((ast.TyExpr { desc: TyFn(params, ret), span: merge(start, ret.span) }, p))
         },
         // OCaml's ints have 63 bits, and the OCaml tree keeps a size within
@@ -1054,6 +1060,11 @@ fn parse_let(p: Parser) -> Parsed[ast.Stmt] {
         }
         let (e, p) = parse_expr(p.need("=")?)?
         return Ok((stmt(SLetPat(unpack, e), merge(start, e.span)), p))
+    }
+    if p.is_sym("[") {
+        // `let [a, b] = xs`: a list can have any length
+        let (list, _) = parse_pat(p)?
+        return Err(error("E0003", list.span, "`let` cannot unpack a list: list patterns need `match`").note("a list can have any length, so take it apart with `match`, as in `match xs \{ [a, b] => ..., _ => ... }`"))
     }
     let (name, p) = p.expect_ident()?
     let (ann, p) = if p.is_sym(":") {

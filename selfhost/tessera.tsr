@@ -330,6 +330,12 @@ fn build(out: Stdout, fs: Fs, exec: Exec, env: Env, setup: Setup, file: Str, tar
         report(out, f)
         return 1
     }
+    // a build records the C libraries of trusted dependencies in
+    // tessera.lock; `check` and `caps` only read it
+    match f.loaded.manifest {
+        Some(m) => caps.record(fs, setup.place, m, f.loaded.items, f.loaded.packages),
+        None => {},
+    }
     let has = |p: fn(ast.FnDecl) -> Bool| f.loaded.items.any(|i| match i {
         IFn(d) => p(d),
         _ => false,

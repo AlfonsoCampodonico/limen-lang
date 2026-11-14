@@ -149,6 +149,8 @@ let rec ty (t : ty_expr) =
   | TyName (n, args) when is_tuple_name n -> "(" ^ String.concat ", " (List.map ty args) ^ ")"
   | TyName (n, []) -> n
   | TyName (n, args) -> n ^ "[" ^ String.concat ", " (List.map ty args) ^ "]"
+  (* `fn(A)`, written without a result: the parser gives its `()` an empty span *)
+  | TyFn (ps, { tdesc = TyUnit; tspan }) when tspan.lo = tspan.hi -> "fn(" ^ String.concat ", " (List.map ty ps) ^ ")"
   | TyFn (ps, r) -> "fn(" ^ String.concat ", " (List.map ty ps) ^ ") -> " ^ ty r
 
 let escape s =

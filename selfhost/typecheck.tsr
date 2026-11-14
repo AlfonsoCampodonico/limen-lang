@@ -174,11 +174,40 @@ fn type_defined(cx: env.Cx, n: Str) -> Bool {
     cx.structs.contains(n) || cx.enums.contains(n) || builtins.type_names().contains(n)
 }
 
+// A type of the program's own named like a built-in one (a built-in type,
+// a capability, a type of the prelude): the problem, if it is one.
+fn builtin_clash(cx: env.Cx, prelude_types: List[Str], span: ast.Span, n: Str, what: Str) -> Option[diag.Diag] {
+    if span.file == cx.prelude_file || !(builtins.type_names().contains(n) || prelude_types.contains(n)) {
+        return None
+    }
+    let kind = if builtins.cap_names().contains(n) { "capability" } else { "type" }
+    Some(diag.error("E0106", span, "`{n}` is a built-in {kind}; name the {what} something else"))
+}
+
 // 1. the names of types and interfaces
 fn register_types(cx: env.Cx, st: env.State, items: List[ast.Item]) -> (env.Cx, env.State) {
     let mut cx = cx
     let mut st = st
+    let prelude_types = items.flat_map(|i| match i {
+        IStruct(s) if s.span.file == cx.prelude_file => [s.name],
+        IEnum(e) if e.span.file == cx.prelude_file => [e.name],
+        IIface(f) if f.span.file == cx.prelude_file => [f.name],
+        _ => [],
+    })
     for i in items {
+        let clash = match i {
+            IStruct(s) => builtin_clash(cx, prelude_types, s.span, s.name, "struct"),
+            IEnum(e) => builtin_clash(cx, prelude_types, e.span, e.name, "enum"),
+            IIface(f) if !builtins.bounds().contains(f.name) => builtin_clash(cx, prelude_types, f.span, f.name, "interface"),
+            _ => None,
+        }
+        match clash {
+            Some(d) => {
+                st = st.report(d)
+                continue
+            },
+            None => {},
+        }
         match i {
             IStruct(s) => {
                 if type_defined(cx, s.name) {

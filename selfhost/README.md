@@ -68,8 +68,9 @@ What each file does, in pipeline order:
   dependency (and each standard library module) takes only the
   capabilities its tessera.toml line grants (E0320), and a dependency
   trusted with C calls only the libraries tessera.lock recorded (E0324).
-  It reads tessera.lock through the Fs and never writes it; the OCaml
-  compiler records new libraries there.
+  Checking reads tessera.lock through the Fs and never writes it; a
+  build then records the libraries it has no line for (`caps.record`),
+  as the OCaml compiler's build does.
 - The backend is `src/lower.ml`, `src/ir.ml`, `src/pure.ml`,
   `src/own.ml`, `src/hoist.ml` and `src/free.ml`, in the order
   `src/native.ml` runs them before C generation. `ir.tsr` is the IR:

@@ -1,6 +1,6 @@
-// Declarations: types, functions, variants and fields defined twice, a
-// struct that contains itself, what struct fields cannot hold, embedding,
-// main's signature, test parameters.
+// Declarations: types, functions, variants and fields defined twice, types
+// named like built-in ones, a struct that contains itself, what struct
+// fields cannot hold, embedding, main's signature, test parameters.
 struct Dup {
     a: Int,
     a: Str,
@@ -22,6 +22,18 @@ enum Twice {
 
 struct Int {
     v: Int,
+}
+
+struct Env {
+    name: Str,
+}
+
+enum Result {
+    Fine,
+}
+
+interface Clock {
+    fn now(self) -> Int
 }
 
 struct Node {

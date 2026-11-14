@@ -2285,7 +2285,10 @@ and check_stmt ctx f s : bool =
       | t' ->
         err ctx "E0211" e.espan
           (sprintf "the left side assigns %d values, but the right side is `%s`" k (show t'))
-          ~notes:[ sprintf "the right side of `(a, b) = value` must be a tuple of %d items" k ];
+          ~notes:
+            [ sprintf "the right side of `(%s) = value` must be a tuple of %d items"
+                (String.concat ", " (List.init k (fun i -> String.make 1 (Char.chr (97 + (i mod 26))))))
+                k ];
         TErr
     in
     bind f n { vty = t; vmut = false; vspan = nsp; vkind = KLet };
@@ -2588,18 +2591,40 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
   let take_pending bounds = deferred := (bounds, !pending) :: !deferred; pending := [] in
   let items = Prelude.items () @ user_items in
   let type_defined n = Hashtbl.mem ctx.structs n || Hashtbl.mem ctx.enums n || List.mem n builtin_types in
+  (* a type of the program's own named like a built-in one: the built-in
+     types, the capabilities, and the types of the prelude *)
+  let prelude_types =
+    List.filter_map
+      (function
+        | IStruct s when s.st_span.file = Prelude.file -> Some s.st_name
+        | IEnum e when e.en_span.file = Prelude.file -> Some e.en_name
+        | IIface i when i.if_span.file = Prelude.file -> Some i.if_name
+        | _ -> None)
+      items
+  in
+  let builtin_clash (sp : Span.t) n what =
+    if sp.file <> Prelude.file && (List.mem n builtin_types || List.mem n prelude_types) then begin
+      let kind = if List.exists (fun c -> Types.cap_name c = n) Types.all_caps then "capability" else "type" in
+      err ctx "E0106" sp (sprintf "`%s` is a built-in %s; name the %s something else" n kind what);
+      true
+    end
+    else false
+  in
   (* 1. register type names *)
   List.iter
     (function
       | IStruct s ->
-        if type_defined s.st_name then err ctx "E0106" s.st_span (sprintf "type `%s` is defined more than once" s.st_name)
+        if builtin_clash s.st_span s.st_name "struct" then ()
+        else if type_defined s.st_name then err ctx "E0106" s.st_span (sprintf "type `%s` is defined more than once" s.st_name)
         else Hashtbl.replace ctx.structs s.st_name s
       | IEnum e ->
-        if type_defined e.en_name then err ctx "E0106" e.en_span (sprintf "type `%s` is defined more than once" e.en_name)
+        if builtin_clash e.en_span e.en_name "enum" then ()
+        else if type_defined e.en_name then err ctx "E0106" e.en_span (sprintf "type `%s` is defined more than once" e.en_name)
         else Hashtbl.replace ctx.enums e.en_name e
       | IIface i ->
         if List.mem i.if_name builtin_bounds then
           err ctx "E0106" i.if_span (sprintf "`%s` is a built-in bound; name the interface something else" i.if_name)
+        else if builtin_clash i.if_span i.if_name "interface" then ()
         else if type_defined i.if_name || Hashtbl.mem ifaces i.if_name then
           err ctx "E0106" i.if_span (sprintf "`%s` is defined more than once" i.if_name)
         else begin

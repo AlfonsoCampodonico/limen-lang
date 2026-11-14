@@ -120,9 +120,15 @@ let rec parse_type st : ty_expr =
     skip st;
     need_sym st "(";
     let ps = comma_list st ")" parse_type in
-    need_sym st "->";
-    let r = parse_type st in
-    { tdesc = TyFn (ps, r); tspan = merge t.span r.tspan }
+    (* `fn(A)` returns nothing, as a function declared without `->` does:
+       its result is `()`, with an empty span after the `)` so the
+       formatter writes it back the way it was written *)
+    if accept_sym st "->" then
+      let r = parse_type st in
+      { tdesc = TyFn (ps, r); tspan = merge t.span r.tspan }
+    else
+      let close = last_span st in
+      { tdesc = TyFn (ps, { tdesc = TyUnit; tspan = { close with lo = close.hi } }); tspan = merge t.span close }
   | INT n ->
     skip st;
     { tdesc = TyInt (if n > Int64.of_int max_int then max_int else Int64.to_int n); tspan = t.span }
@@ -667,6 +673,14 @@ and parse_stmt st =
       need_sym st "=";
       let e = parse_expr st in
       mks (SLetPat (p, e)) (merge sp e.espan)
+    end
+    else if is_sym st "[" then begin
+      (* `let [a, b] = xs`: a list can have any length *)
+      let p = parse_pat st in
+      raise
+        (Diag.Fatal
+           (Diag.make "E0003" p.pspan ~notes:[ "a list can have any length, so take it apart with `match`, as in `match xs { [a, b] => ..., _ => ... }`" ]
+              "`let` cannot unpack a list: list patterns need `match`"))
     end
     else
     let n, nsp = expect_ident st in

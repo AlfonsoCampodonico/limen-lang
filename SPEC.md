@@ -75,7 +75,7 @@ Statements are separated by a newline or `;`. Two statements on one line without
 | `IoError` | `Denied(Str)`, `Failed(Str)` | Error type of every capability operation. |
 | `HttpResponse` | `{ status: Int, headers: Map[Str, Str], body: Str }` | From the prelude; returned by `Net.get`. |
 | `ProcessOutput` | `{ code: Int, stdout: Str, stderr: Str }` | From the prelude; returned by `Exec.run`. |
-| `fn(A, B) -> R` | functions and closures | |
+| `fn(A, B) -> R` | functions and closures | `fn(A, B)` without `-> R` returns `()`, as a function declared without `->` does. |
 | `Chan[T]` | a channel between tasks | Created with `channel(capacity)` (section 10). |
 | `Handle` | `{ addr: Int }` | From the prelude: an opaque C pointer, for foreign functions (section 9). |
 | `Root`, `Net`, `Fs`, `Stdout`, `Clock`, `Listen`, `Listener`, `Conn`, `Rand`, `Stdin`, `Env`, `Exec`, `Foreign` | capabilities | Cannot be created by programs (section 9). |
@@ -1483,7 +1483,7 @@ type       = "dyn" bound                          (* an interface value *)
            | "(" type "," type { "," type } ")"     (* a tuple *)
            | IDENT [ "." IDENT ] [ "[" typearg { "," typearg } "]" ]
            | "(" ")"
-           | "fn" "(" [ type { "," type } ] ")" "->" type ;
+           | "fn" "(" [ type { "," type } ] ")" [ "->" type ] ;   (* no "->": returns () *)
 typearg    = type | INT ;                       (* INT only as Array's size, which can also be a type parameter *)
 sep        = "," | NL ;
 
@@ -1603,7 +1603,7 @@ yaml = { git = "git@example.com:me/yaml.git", commit = "3f9c2e1d7a" }
 - Tessera has no ambient authority, so a function can only use a capability that reaches it as a parameter. The checker therefore knows everything a dependency can ever do from its signatures, and rejects the program (E0320) if a dependency's function takes a capability it was not granted. Granting is still only an upper bound: at run time the dependency gets exactly the capabilities you pass it, which can be narrowed with `only` and `under`.
 - A dependency is a local directory (`path`) or a git repository (`git`) at a `tag` or a `commit` (lowercase hex, at least 7 characters). The URL is `https://`, `http://`, `ssh://`, `git://`, `file://` or `user@host:path`. No registry holds the code: the URL is the name of the source, and the package index (below) only points at URLs.
 - A git dependency is fetched with the `git` command into a cache, one directory per commit: `$TESSERA_CACHE`, else `$XDG_CACHE_HOME/tessera`, else `~/.cache/tessera`. Fetching needs no grant because it happens in the compiler, before the program exists; `tessera lsp` and `tessera mcp` never fetch, and report a dependency that is not cached yet (E0322).
-- `tessera.lock`, next to tessera.toml, is written on the first build and should be committed. It holds one line per git dependency: name, URL, `tag:NAME` or `commit:HASH` as written in tessera.toml, the full commit, and a BLAKE2b hash of the dependency's files:
+- `tessera.lock`, next to tessera.toml, is written by the commands that produce something, `tessera build`, `tessera run` and `tessera test` (and `tessera add`), the first time they meet a new git dependency or a new trusted one that calls C, and should be committed. `tessera check`, `tessera caps` and the editor and agent servers read it and never write it: a check of a project whose lock is missing a line passes or fails as the build would, and leaves the file as it is. It holds one line per git dependency: name, URL, `tag:NAME` or `commit:HASH` as written in tessera.toml, the full commit, and a BLAKE2b hash of the dependency's files:
 
   ```
   color https://example.com/color.git tag:v1.2.0 8d022128f5f177019f1e6aed46f75c93c90815f1 blake2b:5fea136b...

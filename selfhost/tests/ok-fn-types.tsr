@@ -1,0 +1,16 @@
+// Function types: with a result, and without one (the result is `()`).
+fn apply(f: fn(Int) -> Int, g: fn(Int), h: fn(), k: fn() -> ()) -> fn(Str) {
+    g(f(1))
+    h()
+    k()
+    |s| {}
+}
+
+fn nested(f: fn(fn(Int)) -> fn()) {}
+
+foreign "c" {
+    fn each(xs: Handle, n: Int, cb: fn(Int32))
+}
+
+fn main() {
+}

@@ -1,0 +1,10 @@
+// A program with warnings and no errors: they close with their count, and
+// it builds.
+fn main(root: Root) {
+    let n = match root.args().len() {
+        _ => 1,
+        2 => 2,
+    }
+    let r: Result[Int, Str] = Ok(n)
+    root.stdout.print("{r.map_err(|e| e + "!")}")
+}

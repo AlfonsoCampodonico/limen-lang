@@ -325,6 +325,11 @@ let find main =
    a fetch: the editor and agent servers never run git. *)
 let offline = ref false
 
+(* Whether loading a program may write tessera.lock. Only the commands that
+   produce something set it (build, run, test): `tessera check`, `caps`, the
+   editor and agent servers read the lock and never change it. *)
+let write_lock = ref false
+
 exception Fetch of string
 
 let cache_dir () =
@@ -460,8 +465,8 @@ let read_foreign_lock path =
       (String.split_on_char '\n' (In_channel.with_open_bin path In_channel.input_all))
 
 (* Fetch or find each git dependency, check it against tessera.lock, and write
-   tessera.lock if it changed. Errors carry their code: E0322 (fetch), E0323
-   (lock). *)
+   tessera.lock if it changed (with [write_lock]). Errors carry their code:
+   E0322 (fetch), E0323 (lock). *)
 exception Lock_error of string * Span.t * string * string list
 
 let resolve (pkg : t) : t =
@@ -509,7 +514,7 @@ let resolve (pkg : t) : t =
       pkg.deps
   in
   let lines = List.rev !lines in
-  if !changed || List.length lines <> List.length locked then begin
+  if !write_lock && (!changed || List.length lines <> List.length locked) then begin
     let text = String.concat "" (List.map (fun l -> Printf.sprintf "%s %s %s %s %s\n" l.lname l.lurl l.lrev l.lcommit l.lhash) lines) in
     let keep = List.map (fun (n, ls) -> foreign_line n ls) (read_foreign_lock lock_path) in
     if not (lines = [] && keep = [] && not (Sys.file_exists lock_path)) then
@@ -590,7 +595,8 @@ let enforce ?(std = false) (pkg : t) (module_pkg : (string * string) list) (info
    recorded when it was trusted, so an update that starts calling another
    library (or C at all, for one trusted only in name) stops the build until
    someone looks. [uses] is (dependency, libraries it declares). The first
-   build records them; a dependency that no longer calls C loses its line. *)
+   build records them (with [write_lock]); a dependency that no longer calls
+   C loses its line. *)
 let check_foreign_lock (pkg : t) (uses : (string * string list) list) : Diag.t list =
   let lock_path = Filename.concat (Filename.dirname pkg.file) "tessera.lock" in
   let recorded = read_foreign_lock lock_path in
@@ -614,7 +620,7 @@ let check_foreign_lock (pkg : t) (uses : (string * string list) list) : Diag.t l
       uses
   in
   let fresh = List.map (fun (d, libs) -> (d, match List.assoc_opt d recorded with Some old -> old | None -> libs)) uses in
-  if errs = [] && List.sort compare fresh <> List.sort compare recorded then begin
+  if !write_lock && errs = [] && List.sort compare fresh <> List.sort compare recorded then begin
     let others =
       if Sys.file_exists lock_path then
         List.filter

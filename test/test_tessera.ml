@@ -357,6 +357,15 @@ let errs ?modules name src want =
   let _, ds, _ = compile ?modules name src in
   ok name (codes ds = want) (sprintf "got [%s], want [%s]" (String.concat " " (codes ds)) (String.concat " " want))
 
+(* A problem with [code] whose message or notes say [sub]. *)
+let says name src code sub =
+  if selected name then
+  let _, ds, _ = compile name src in
+  let text (d : Diag.t) = String.concat "\n" (d.message :: d.notes) in
+  ok name
+    (List.exists (fun (d : Diag.t) -> d.code = code && Interp_util.find_sub (text d) sub 0 <> None) ds)
+    (String.concat "; " (List.map (fun (d : Diag.t) -> d.code ^ " " ^ text d) ds))
+
 let panics ?grants name src want =
   if selected name then begin
   (match run ?grants name src with
@@ -4743,6 +4752,15 @@ fn main(root: Root) {
   errs "type-alias-arity" "type Pair[T] = (T, T)\n\nfn main(root: Root) {\n    let p: Pair = (1, 2)\n    let q: Pair[Int, Int] = (1, 2)\n}\n" [ "E0109"; "E0109" ];
   errs "type-alias-twice" "struct P {\n    x: Int,\n}\n\ntype P = Int\n\nfn main(root: Root) {}\n" [ "E0106" ];
   errs "type-alias-builtin" "type Int = Float\n\nfn main(root: Root) {}\n" [ "E0106" ];
+  (* a type named like a built-in one says so, rather than "defined more than once" *)
+  says "struct-named-cap" "struct Env {\n    x: Int,\n}\n\nfn main() {}\n" "E0106" "`Env` is a built-in capability; name the struct something else";
+  says "enum-named-prelude" "enum Option {\n    A,\n}\n\nfn main() {}\n" "E0106" "`Option` is a built-in type; name the enum something else";
+  says "iface-named-builtin" "interface Str {\n    fn f(self) -> Int\n}\n\nfn main() {}\n" "E0106" "`Str` is a built-in type; name the interface something else";
+  says "tuple-assign-note" (main_wrap "    let mut a = 1\n    let mut b = 2\n    let mut c = 3\n    (a, b, c) = (1, 2)") "E0211" "`(a, b, c) = value` must be a tuple of 3 items";
+  says "let-list-hint" (main_wrap "    let xs = [1, 2]\n    let [a, b] = xs") "E0003" "list patterns need `match`";
+  (* a function type without `-> R` returns nothing, as a declaration without one does *)
+  out "fn-type-no-result" "fn twice(f: fn(Int), x: Int) {\n    f(x)\n    f(x)\n}\n\nfn main(root: Root) {\n    twice(|x| root.stdout.print(\"{x}\"), 3)\n}\n" "3\n3\n";
+  errs "fn-type-no-result-is-unit" "fn f(g: fn(Int)) -> Int {\n    g(1)\n}\n\nfn main() {}\n" [ "E0201" ];
   errs "type-alias-unknown" "type X = Nope\n\nfn main(root: Root) {}\n" [ "E0102" ];
   errs "type-alias-private" ~modules:[ ("shapes", shapes) ] "use shapes\n\nfn main(root: Root) {\n    let s: shapes.Secret = 1\n}\n" [ "E0402" ];
   errs "type-alias-mismatch" "type Meters = Float\n\nfn main(root: Root) {\n    let m: Meters = \"far\"\n}\n" [ "E0201" ];
@@ -6100,6 +6118,10 @@ fn main(root: Root) {
   ok "trust-not-caps" (codes (cpkg "[package]\nname = \"capp\"\n\n[dependencies]\ncdep = { path = \"../cdep\", caps = [\"foreign\"] }\n") = [ "E0321" ]) "caps = [foreign] is refused";
   ok "trust-unknown" (codes (cpkg (dep ^ "\n[trust]\nforeign = [\"other\"]\n")) = [ "E0321" ]) "trust names a dependency";
   let trusted = dep ^ "\n[trust]\nforeign = [\"cdep\"]\n" in
+  (* checking reads tessera.lock and never writes it: only build, run and test record *)
+  let ds = cpkg trusted in
+  ok "trust-check-no-lock" (ds = [] && not (Sys.file_exists lock)) (if Sys.file_exists lock then read_file lock else show ds);
+  Package.write_lock := true;
   let ds = cpkg trusted in
   ok "trust-granted" (ds = []) (show ds);
   ok "trust-locked" (Sys.file_exists lock && Interp_util.find_sub (read_file lock) "foreign cdep c\n" 0 <> None) (if Sys.file_exists lock then read_file lock else "no lock");
@@ -6112,6 +6134,7 @@ fn main(root: Root) {
   Out_channel.with_open_bin lock (fun oc -> output_string oc "# reviewed\n");
   ok "trust-relock" (cpkg trusted = [] && Interp_util.find_sub (read_file lock) "foreign cdep c,z\n" 0 <> None) (read_file lock);
   put "cdep/cdep.tsr" (cdep_src [ ("c", "getpid") ]);
+  Package.write_lock := false;
   Sys.remove (Filename.concat pdir "capp/tessera.toml");
 
   (* [grants] in tessera.toml: the program's own grants, with --grant flags adding to them *)
@@ -6126,6 +6149,15 @@ fn main(root: Root) {
     in
     (code, read_file o, read_file e)
   in
+  (* the closing count: warnings alone, and errors with warnings *)
+  let wmain = Filename.concat pdir "warned.tsr" in
+  put "warned.tsr" "fn main() {\n    let n = match 1 {\n        _ => 1,\n        2 => 2,\n    }\n}\n";
+  let code, o, e = tessera_cli [ "check"; wmain ] in
+  ok "warnings-count" (code = 0 && o = "ok\n" && String.ends_with ~suffix:"\n1 warning\n" e) (sprintf "code %d, out %S, err %S" code o e);
+  put "warned.tsr" "fn main() {\n    let n = match 1 {\n        _ => 1,\n        2 => 2,\n    }\n    let s: Int = \"x\"\n}\n";
+  let code, _, e = tessera_cli [ "check"; wmain ] in
+  ok "errors-and-warnings-count" (code = 1 && String.ends_with ~suffix:"\n1 error, 1 warning\n" e) (sprintf "code %d, err %S" code e);
+
   (* the build cache: the same program again is a copy of the first build
      wherever it goes, a changed program builds anew, and TESSERA_CACHE=off
      never touches the cache *)
@@ -6415,6 +6447,10 @@ fn main(root: Root) {
   let gcodes () = let _, ds, _ = Modules.load_and_check gmain gapp in codes ds in
   let lock_has s = Sys.file_exists lock && Interp_util.find_sub (read_file lock) s 0 <> None in
   gtoml (sprintf "git = %S, tag = \"v1\"" url);
+  (* `tessera check` fetches what it needs but leaves tessera.lock alone *)
+  let code, _, e = tessera_cli [ "check"; gmain ] in
+  ok "git-check-no-lock" (code = 0 && not (Sys.file_exists lock)) (sprintf "code %d, err %S" code e);
+  Package.write_lock := true;
   grun "git-tag" "v1";
   ok "git-lock-written" (lock_has (sprintf "greet %s tag:v1 %s blake2b:" url v1)) (if Sys.file_exists lock then read_file lock else "no tessera.lock");
   if native_enabled then begin
@@ -6478,6 +6514,7 @@ fn main(root: Root) {
   ok "git-caps-denied" (gcodes () = [ "E0320" ]) (String.concat "," (gcodes ()));
   gtoml (sprintf "git = %S, tag = \"v3\", caps = [\"fs\"]" url);
   grun "git-caps-granted" "v3";
+  Package.write_lock := false;
 
   (* the package index: tessera index entry, tessera search and tessera add, with an
      index directory and git repositories made here *)

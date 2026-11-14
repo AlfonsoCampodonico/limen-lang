@@ -2506,7 +2506,7 @@ fn check_stmt(st: env.State, cx: env.Cx, fx: env.Fx, s: ast.Stmt) -> (Bool, env.
                     u
                 },
                 other => {
-                    let d = diag.error("E0211", e.span, "the left side assigns {k} values, but the right side is `{st.show(other)}`").note("the right side of `(a, b) = value` must be a tuple of {k} items")
+                    let d = diag.error("E0211", e.span, "the left side assigns {k} values, but the right side is `{st.show(other)}`").note("the right side of `({(0..<k).map(|i| (97 + i % 26).to_char()).join(", ")}) = value` must be a tuple of {k} items")
                     st = st.report(d)
                     TErr
                 },

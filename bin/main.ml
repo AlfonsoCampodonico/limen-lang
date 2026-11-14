@@ -28,8 +28,15 @@ let die_usage msg =
   prerr_string (if msg = "" then usage else "tessera: " ^ msg ^ "\n\n" ^ usage);
   exit 2
 
+(* "1 error", "2 warnings" *)
+let count n what = Printf.sprintf "%d %s%s" n what (if n = 1 then "" else "s")
+
+(* The warnings [load] printed, which the closing count of [report] includes. *)
+let warned = ref 0
+
 (* Warnings go to stderr here, unless [keep_warnings]; the diagnostics
-   returned are the errors, which stop the command. *)
+   returned are the errors, which stop the command. With warnings and no
+   errors, their count closes them, as [report] closes errors. *)
 let load ?(keep_warnings = false) file =
   let src =
     try In_channel.with_open_bin file In_channel.input_all
@@ -38,14 +45,18 @@ let load ?(keep_warnings = false) file =
   let items, ds, infos = Modules.load_and_check file src in
   if keep_warnings then (items, ds, infos)
   else begin
-    List.iter (fun d -> prerr_string (Diag.render d); prerr_newline ()) (Diag.warnings ds);
-    (items, Diag.errors ds, infos)
+    let ws = Diag.warnings ds and errs = Diag.errors ds in
+    List.iter (fun d -> prerr_string (Diag.render d); prerr_newline ()) ws;
+    warned := List.length ws;
+    if errs = [] && ws <> [] then prerr_endline (count !warned "warning");
+    (items, errs, infos)
   end
 
+(* The errors, then their count, with the warnings [load] printed: "2 errors,
+   1 warning". *)
 let report diags =
   List.iter (fun d -> prerr_string (Diag.render d); prerr_newline ()) diags;
-  let n = List.length diags in
-  Printf.eprintf "%d error%s\n" n (if n = 1 then "" else "s")
+  prerr_endline (count (List.length diags) "error" ^ if !warned > 0 then ", " ^ count !warned "warning" else "")
 
 let parse_grants args =
   List.fold_left
@@ -213,6 +224,7 @@ let ns_per_op b =
 type test_opts = { native : bool; bench : (int * int) option; pattern : string option; json : bool }
 
 let cmd_test file (o : test_opts) =
+  Package.write_lock := true;
   let items, diags, _ = load file in
   if diags <> [] then begin
     if o.json then print_endline (Diag.list_to_json diags) else report diags;
@@ -420,6 +432,7 @@ let checked file =
   items
 
 let cmd_build file out emit_c =
+  Package.write_lock := true;
   let items = checked file in
   let out = match out with Some o -> o | None -> Filename.remove_extension (Filename.basename file) in
   if emit_c then Out_channel.with_open_bin (out ^ ".c") (fun oc -> output_string oc (Native.c_source items))
@@ -432,6 +445,7 @@ let cmd_build file out emit_c =
       exit 1
 
 let cmd_run_native file grant_args prog_args =
+  Package.write_lock := true;
   let grant_args = toml_grants file @ grant_args in
   warn_foreign (parse_grants grant_args);
   let items = checked file in
@@ -455,6 +469,7 @@ let cmd_run_native file grant_args prog_args =
   exit (match status with Unix.WEXITED n -> n | _ -> 1)
 
 let cmd_run file grant_args prog_args =
+  Package.write_lock := true;
   let grant_args = toml_grants file @ grant_args in
   let grants = { (parse_grants grant_args) with args = prog_args } in
   warn_foreign grants;

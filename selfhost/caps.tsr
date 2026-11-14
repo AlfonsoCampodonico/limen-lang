@@ -145,15 +145,10 @@ fn c_users(items: List[ast.Item], module_pkg: List[(Str, Str)]) -> List[(Str, Li
 }
 
 // E0324: each trusted dependency's C libraries are the ones tessera.lock
-// recorded when it was trusted. The OCaml compiler then records what is
-// new in tessera.lock; this checker reads through an Fs it may not write
-// with, so it only checks.
+// recorded when it was trusted. Checking only reads tessera.lock; a build
+// then records what is new there (`record`).
 fn foreign_lock(fs: Fs, place: disk.Place, pkg: package.Manifest, uses: List[(Str, List[Str])]) -> List[diag.Diag] {
-    let lock = paths.concat(paths.dirname(pkg.path), "tessera.lock")
-    let recorded = match fs.read(place.locate(lock)) {
-        Ok(text) => read_foreign_lock(text),
-        Err(_) => [],
-    }
+    let recorded = recorded_libraries(fs, place, pkg)
     let mut out: List[diag.Diag] = []
     for (d, libs) in uses {
         if libs.is_empty() || !pkg.trust.contains(d) {
@@ -174,6 +169,48 @@ fn foreign_lock(fs: Fs, place: disk.Place, pkg: package.Manifest, uses: List[(St
         out.push(problem)
     }
     out
+}
+
+fn lock_path(place: disk.Place, pkg: package.Manifest) -> Str {
+    place.locate(paths.concat(paths.dirname(pkg.path), "tessera.lock"))
+}
+
+fn recorded_libraries(fs: Fs, place: disk.Place, pkg: package.Manifest) -> List[(Str, List[Str])] {
+    match fs.read(lock_path(place, pkg)) {
+        Ok(text) => read_foreign_lock(text),
+        Err(_) => [],
+    }
+}
+
+// What a build does after the checks passed, as src/package.ml's
+// check_foreign_lock does when it may write: record in tessera.lock the C
+// libraries of each trusted dependency it has no line for, and drop the
+// lines of those that no longer call C. A lock that cannot be written is
+// left as it is.
+pub fn record(fs: Fs, place: disk.Place, pkg: package.Manifest, items: List[ast.Item], packages: List[(Str, Str)]) {
+    let recorded = recorded_libraries(fs, place, pkg)
+    let uses = c_users(items, packages).filter(|u| !u.1.is_empty() && pkg.trust.contains(u.0))
+    let fresh = uses.map(|u| (u.0, recorded.find(|x| x.0 == u.0).map(|x| x.1) ?? u.1))
+    if fresh.sort() == recorded.sort() {
+        return
+    }
+    let path = lock_path(place, pkg)
+    let exists = fs.exists(path)
+    let others = match fs.read(path) {
+        Ok(text) => text.split("\n").filter(|l| {
+            let t = l.trim()
+            t != "" && !t.starts_with("foreign ") && !t.starts_with("#")
+        }),
+        Err(_) => [],
+    }
+    if fresh.is_empty() && others.is_empty() && !exists {
+        return
+    }
+    let header = "# tessera.lock: the exact version of each git dependency, and the C libraries of each trusted one, written by tessera. Commit it.\n"
+    let text = header + others.map(|l| l + "\n").join("") + fresh.map(|f| "foreign {f.0} {f.1.join(",")}\n").join("")
+    match fs.write(path, text) {
+        _ => {},
+    }
 }
 
 // The `foreign NAME LIB,LIB` lines of tessera.lock.
