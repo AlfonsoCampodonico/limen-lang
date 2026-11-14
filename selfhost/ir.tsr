@@ -201,6 +201,9 @@ pub struct Program {
     main_ret: types.Ty,
     tests: List[Test],
     benches: List[Test],
+    // the checker's substitution, for the authority the program's structs
+    // and enums hold (types.with_authority)
+    types: types.Subst,
 }
 
 // The atoms of an rhs that are consumed (ownership moves).

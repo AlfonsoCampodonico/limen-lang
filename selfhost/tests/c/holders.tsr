@@ -1,0 +1,57 @@
+// Values holding capabilities: a function taking one is never pure (its
+// calls are neither reused nor kept across a loop), and a closure
+// capturing one is not fused into a pipeline.
+struct Log {
+    out: Stdout,
+    tag: Str,
+}
+
+enum Sink {
+    ToOut(Stdout),
+    Nowhere,
+}
+
+struct Box[T] {
+    item: T,
+}
+
+fn tagged(l: Log) -> Str {
+    l.tag
+}
+
+fn sunk(s: Box[Sink]) -> Int {
+    match s.item {
+        ToOut(_) => 1,
+        Nowhere => 0,
+    }
+}
+
+fn twice(x: Int) -> Int {
+    x * 2
+}
+
+fn note(l: Log, n: Int) -> Int {
+    l.out.print("{l.tag} {n}")
+    n
+}
+
+fn main(root: Root) {
+    let l = Log { out: root.stdout, tag: "t" }
+    let a = tagged(l) + tagged(l)
+    let b = twice(2) + twice(2)
+    let mut i = 0
+    let mut n = 0
+    while i < 3 {
+        n = n + sunk(Box { item: ToOut(root.stdout) }) + twice(i)
+        i = i + 1
+    }
+    let xs = [1, 2, 3].map(|x| note(l, x)).filter(|x| x > 1)
+    let ys = [1, 2, 3].map(|x| x + 1).filter(|x| x > 2)
+    let logs = [l, { l with tag: "u" }]
+    let r = group g {
+        for x in logs {
+            g.go(|| note(x, 1))
+        }
+    }
+    root.stdout.print("{a} {b} {n} {xs} {ys} {r} {l}")
+}

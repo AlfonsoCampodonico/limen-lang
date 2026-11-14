@@ -91,7 +91,29 @@ type fctx = {
   ret_te : ty_expr option; (* the declared result type, for fix-its *)
 }
 
-type fn_info = { name : string; span : Span.t; caps : cap list; callbacks : bool }
+(* [via]: for each capability not written in the parameters' types, the
+   path through the struct or enum that holds it, `Client.net`. *)
+type fn_info = { name : string; span : Span.t; caps : cap list; via : (cap * string) list; callbacks : bool }
+
+(* The capabilities values of these types hold, in [all_caps] order, each
+   with where it comes from when no type writes it: the first type's path. *)
+let authority_of ts =
+  let found = List.fold_left (fun acc t -> caps_in t acc) [] ts in
+  let written = List.fold_left (fun acc t -> caps_written t acc) [] ts in
+  List.filter_map
+    (fun c ->
+      if not (List.mem c found) then None
+      else if List.mem c written then Some (c, None)
+      else Some (c, List.find_map (fun t -> via t c) ts))
+    all_caps
+
+(* "`T` holds capability `C`", and through which field when T does not
+   write it, for the messages that refuse a type holding authority. *)
+let held t =
+  match authority_of [ t ] with
+  | (c, Some path) :: _ -> Some (sprintf "`%s` holds capability `%s` through `%s`" (show t) (cap_name c) path)
+  | (c, None) :: _ -> Some (sprintf "`%s` holds capability `%s`" (show t) (cap_name c))
+  | [] -> None
 
 let err ctx ?notes ?fix code span msg = ctx.diags <- Diag.make ?notes ?fix code span msg :: ctx.diags
 let plural n = if n = 1 then "" else "s"
@@ -278,12 +300,10 @@ and resolve_bound ctx env (b : ty_expr) : bound option =
     None
   | _ -> err ctx "E0102" b.tspan "a bound is an interface"; None
 
+(* Channels and functions cannot hide in a struct or enum; capabilities can,
+   and the types holding them are tracked (Types.authority). *)
 let check_storable ctx span t =
-  if caps_in t [] <> [] then
-    err ctx "E0301" span
-      (sprintf "capability type `%s` cannot be stored in a struct or enum field" (show t))
-      ~notes:[ "pass the capability as a function parameter instead, so it stays visible in signatures" ]
-  else if has_chan t then
+  if has_chan t then
     err ctx "E0305" span
       (sprintf "channel type `%s` cannot be stored in a struct or enum field" (show t))
       ~notes:[ "pass the channel as a parameter or capture it in a task's closure instead" ]
@@ -843,10 +863,16 @@ and coerce ctx e t ((i, _) as b) =
     e.edesc <- EDyn (inner, i);
     e.ety <- dyn_of b
   | TNamed (n, _) as ct when (Hashtbl.mem ctx.structs n || Hashtbl.mem ctx.enums n) && not (List.mem n [ "Option"; "Result"; "IoError" ]) ->
-    if caps_in ct [] <> [] || has_fn ct || has_chan ct then
+    (match held ct with
+    | Some h ->
       err ctx "E0112" e.espan
-        (sprintf "`%s` holds a capability, function or channel, so it cannot become `dyn %s`" (show ct) bn)
+        (sprintf "%s, so it cannot become `dyn %s`" h bn)
         ~notes:[ "authority must stay visible in types; pass it with a type parameter, as in `[T: " ^ bn ^ "]`" ]
+    | None ->
+    if has_fn ct || has_chan ct then
+      err ctx "E0112" e.espan
+        (sprintf "`%s` holds a function or channel, so it cannot become `dyn %s`" (show ct) bn)
+        ~notes:[ "a function or channel could carry authority out of sight; pass it with a type parameter, as in `[T: " ^ bn ^ "]`" ]
     else begin
       match satisfies ctx ct b with
       | Some why -> err ctx "E0111" e.espan (sprintf "`%s` does not satisfy interface `%s`" (show ct) bn) ~notes:[ why ]
@@ -854,7 +880,7 @@ and coerce ctx e t ((i, _) as b) =
         let inner = { e with edesc = e.edesc } in
         e.edesc <- EDyn (inner, i);
         e.ety <- dyn_of b
-    end
+    end)
   | t ->
     err ctx "E0112" e.espan
       (sprintf "only struct and enum values can become `dyn %s`, not `%s`" bn (show t))
@@ -1561,8 +1587,11 @@ and error_conversion ctx e =
   | TDyn ("Error", []) | TErr | TStr | TNamed ("IoError", _) -> None
   | TVar _ -> unify e (TDyn ("Error", [])); None
   | TNamed (n, _) as ct when (Hashtbl.mem ctx.structs n || Hashtbl.mem ctx.enums n) && not (List.mem n [ "Option"; "Result" ]) ->
-    if caps_in ct [] <> [] || has_fn ct || has_chan ct then Some (sprintf "`%s` holds a capability, function or channel" (show ct))
-    else satisfies ctx ct ("Error", [])
+    (match held ct with
+    | Some h -> Some h
+    | None ->
+    if has_fn ct || has_chan ct then Some (sprintf "`%s` holds a function or channel" (show ct))
+    else satisfies ctx ct ("Error", []))
   | t -> Some (sprintf "`%s` does not satisfy `Error`" (show t))
 
 (* The fix-it that changes the function's error type to `dyn Error`. *)
@@ -1620,7 +1649,10 @@ and check_try_ok ctx f x context sp =
          | None -> ()
          | Some why ->
            err ctx "E0202" sp (sprintf "`?` cannot turn an error of type `%s` into `dyn Error`" (show e))
-             ~notes:[ why; "give it a method `fn message(self: " ^ show e ^ ") -> Str`" ])
+             ~notes:
+               [ why;
+                 (if held e <> None || has_fn e || has_chan e then "an error cannot carry authority: keep capabilities, functions and channels out of the error type"
+                  else "give it a method `fn message(self: " ^ show e ^ ") -> Str`") ])
      | TNamed ("Result", [ _; fe ]) -> (
        try unify fe e
        with Mismatch ->
@@ -1691,7 +1723,17 @@ and check_bin ctx f op a b sp =
     | Sub | Mul | Div -> (match t with TInt | TFloat | TErr | TVar _ -> t | _ -> bad (); TErr)
     | Mod | BitAnd | BitOr | BitXor | Shl | Shr -> (match t with TInt | TErr | TVar _ -> t | _ -> bad (); TErr)
     | Lt | Le | Gt | Ge -> (match unordered ctx t with None -> () | Some _ -> bad ()); TBool
-    | _ -> (match t with TFn _ | TCap _ | TChan _ | TDyn _ -> bad () | _ -> ()); TBool)
+    | _ ->
+      (match t with
+       | TFn _ | TCap _ | TChan _ | TDyn _ -> bad ()
+       | _ -> (
+         (* capabilities have no equality, so neither has a value holding one *)
+         match held t with
+         | Some h ->
+           err ctx "E0201" sp (sprintf "operator `%s` cannot be applied to `%s`" name (show t))
+             ~notes:[ h ^ ", and capabilities cannot be compared" ]
+         | None -> ()));
+      TBool)
 
 and check_closure ctx f ps body want =
   let want_ps, want_ret =
@@ -2628,6 +2670,7 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
       variants = Hashtbl.create 16; owners = Hashtbl.create 16; fns = Hashtbl.create 16; diags = [] }
   in
   Hashtbl.reset method_owner;
+  Hashtbl.reset Types.authority;
   Hashtbl.reset used_methods;
   Hashtbl.reset foreign_fns;
   Hashtbl.reset reported_bounds;
@@ -2824,6 +2867,18 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
          | None -> ())
       | _ -> ())
     items;
+  (* 2c. the authority each struct and enum holds through its fields *)
+  Types.compute_authority
+    (List.filter_map
+       (function
+         | IStruct s when registered ctx.structs s.st_name s -> Some s.st_name
+         | IEnum e when registered ctx.enums e.en_name e -> Some e.en_name
+         | _ -> None)
+       items)
+    (fun n ->
+      match Hashtbl.find_opt ctx.sfields n with
+      | Some fs -> Some fs
+      | None -> Option.map (List.concat_map (fun (v, ts) -> List.map (fun t -> (v, t)) ts)) (Hashtbl.find_opt ctx.variants n));
   (* 3. function signatures *)
   let sigs =
     List.filter_map
@@ -2954,9 +3009,10 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
   let infos =
     List.map
       (fun ((d : fn_decl), s) ->
-        let found = List.fold_left (fun acc t -> caps_in t acc) [] s.ps in
+        let held = authority_of s.ps in
         { name = d.fn_name; span = d.fn_span;
-          caps = List.filter (fun c -> List.mem c found) all_caps;
+          caps = List.map fst held;
+          via = List.filter_map (fun (c, p) -> Option.map (fun p -> (c, p)) p) held;
           callbacks = List.exists has_fn s.ps || d.fn_bounds <> [] })
       (* forwarders only pass their arguments on; the methods they call are reported *)
       (List.filter (fun ((d : fn_decl), _) -> d.fn_test = None && d.fn_span.file <> Prelude.methods_file && d.fn_span.Span.file <> Prelude.file && not (Embed.is_forwarder d.fn_name)) sigs)

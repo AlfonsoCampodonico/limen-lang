@@ -1,0 +1,7 @@
+# A dependency cannot launder authority through a struct: the Fs held by
+# Ctx.disk counts against its grant (E0320).
+[package]
+name = "app"
+
+[dependencies]
+launder = { path = "launder", caps = ["stdout"] }

@@ -88,10 +88,12 @@ let check_diag (d : Diag.t) =
       f.edits
 
 (* What `tessera caps` reports of a function: CAPS NAME FILE LO HI, its
-   capabilities in brackets, and whether it runs callbacks. *)
+   capabilities in brackets (each held through a struct or enum with its
+   path, `Net=Client.net`), and whether it runs callbacks. *)
 let caps_line (i : Check.fn_info) =
   Printf.printf "CAPS %s %s %d %d [%s] %b\n" i.name i.span.file i.span.lo i.span.hi
-    (String.concat "," (List.map Types.cap_name i.caps)) i.callbacks
+    (String.concat "," (List.map (fun c -> match List.assoc_opt c i.via with Some p -> Types.cap_name c ^ "=" ^ p | None -> Types.cap_name c) i.caps))
+    i.callbacks
 
 let load_diag (d : Diag.t) =
   Printf.printf "ERROR %s %s %d %d\n" d.code d.span.file d.span.lo d.span.hi;

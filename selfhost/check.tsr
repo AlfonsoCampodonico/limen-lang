@@ -82,7 +82,11 @@ fn main(root: Root) -> Int {
         }
     }
     for i in c.infos {
-        out.print("CAPS {i.name} {diag.path_of(files, i.span.file)} {i.span.lo} {i.span.hi} [{i.caps.join(",")}] {i.callbacks}")
+        let caps = i.caps.map(|c| match i.via.find(|v| v.0 == c) {
+            Some((_, p)) => c + "=" + p,
+            None => c,
+        })
+        out.print("CAPS {i.name} {diag.path_of(files, i.span.file)} {i.span.lo} {i.span.hi} [{caps.join(",")}] {i.callbacks}")
     }
     for i in c.items {
         out.print(ast_print.item_line(i))

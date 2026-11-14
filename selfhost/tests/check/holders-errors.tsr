@@ -1,0 +1,67 @@
+// What a type holding a capability cannot do: become `dyn` (E0112, also
+// as an error converted to `dyn Error`), be a map key (E0113), be compared
+// (E0201). Channels and functions still cannot be stored (E0305, E0304).
+struct Client {
+    net: Net,
+    name: Str,
+}
+
+struct App {
+    client: Client,
+    count: Int,
+}
+
+enum Sink {
+    ToOut(Stdout),
+    Nowhere,
+}
+
+struct Box[T] {
+    item: T,
+}
+
+struct Piped {
+    c: Chan[Int],
+}
+
+struct Called {
+    f: fn(Net),
+}
+
+interface Named {
+    fn label(self) -> Str
+}
+
+fn label(self: App) -> Str {
+    "app"
+}
+
+fn label[T](self: Box[T]) -> Str {
+    "box"
+}
+
+fn message(self: Client) -> Str {
+    self.name
+}
+
+fn convert(c: Client) -> Result[Int, dyn Error] {
+    let r: Result[Int, Client] = Err(c)
+    let n = r?
+    Ok(n)
+}
+
+fn same(a: Client, b: Client) -> Bool {
+    a == b
+}
+
+fn differ(a: Box[Option[Sink]]) -> Bool {
+    a != a
+}
+
+fn main(root: Root) {
+    let a = App { client: Client { net: root.net, name: "x" }, count: 1 }
+    let d: dyn Named = a
+    let e: dyn Named = Box { item: [Sink.ToOut(root.stdout)] }
+    let m: Map[Client, Int] = map()
+    let k: Map[(Int, Sink), Int] = map()
+}

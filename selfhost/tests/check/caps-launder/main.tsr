@@ -1,0 +1,5 @@
+use launder
+
+fn main(root: Root) {
+    launder.run(launder.Ctx { out: root.stdout, disk: launder.Fake })
+}

@@ -572,20 +572,22 @@ let enforce ?(std = false) (pkg : t) (module_pkg : (string * string) list) (info
           | [] -> None
           | c :: _ ->
             let need = match grant_of c with [] -> "Root, which no dependency can be granted" | g :: _ -> Printf.sprintf "\"%s\"" g in
+            (* held through a struct or enum: say which field *)
+            let through c = match List.assoc_opt c i.via with Some p -> Printf.sprintf " through `%s`" p | None -> "" in
             let where (sp : Span.t) = let l, _ = Source.line_col sp.file sp.lo in Printf.sprintf "%s:%d" sp.file l in
             if std then
               Some
                 (Diag.make "E0320" d.dspan
                    (Printf.sprintf "standard library module `%s` uses capability `%s`, which %s does not declare" dn (Types.cap_name c) std_file)
                    ~notes:
-                     [ Printf.sprintf "`%s` takes `%s` (%s)" i.name (Types.cap_name c) (where i.span);
+                     [ Printf.sprintf "`%s` takes `%s`%s (%s)" i.name (Types.cap_name c) (through c) (where i.span);
                        "this is a bug in the standard library: declare the capability in src/std/tessera.toml, or stop taking it" ])
             else
             Some
               (Diag.make "E0320" d.dspan
                  (Printf.sprintf "dependency `%s` uses capability `%s`, which tessera.toml does not grant it" dn (Types.cap_name c))
                  ~notes:
-                   [ Printf.sprintf "`%s` takes `%s` (%s)" i.name (Types.cap_name c) (let l, _ = Source.line_col i.span.file i.span.lo in Printf.sprintf "%s:%d" i.span.file l);
+                   [ Printf.sprintf "`%s` takes `%s`%s (%s)" i.name (Types.cap_name c) (through c) (let l, _ = Source.line_col i.span.file i.span.lo in Printf.sprintf "%s:%d" i.span.file l);
                      (if c = Types.Root then "a dependency can never take Root: pass it the narrower capability it needs"
                       else if c = Types.Foreign then
                         Printf.sprintf "calling C is full trust: if you trust `%s` with everything the program can do, add [trust] foreign = [\"%s\"] to tessera.toml" dn dn

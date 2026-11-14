@@ -27,8 +27,8 @@ fn is_scalar(t: types.Ty) -> Bool {
     }
 }
 
-fn pure_type(t: types.Ty) -> Bool {
-    let s = types.empty()
+// `s` knows the authority the program's structs and enums hold.
+fn pure_type(s: types.Subst, t: types.Ty) -> Bool {
     s.caps_in(t, []).is_empty() && !s.has_fn(t) && !s.has_chan(t)
 }
 
@@ -94,7 +94,7 @@ pub fn analyse(p: ir.Program) -> Map[Str, Bool] {
     let mut calls: Map[Str, List[Str]] = map()
     let mut candidates: Map[Str, Bool] = map()
     for f in p.fns {
-        let mut ok = (f.params + f.captures).all(|v| pure_type(v.ty))
+        let mut ok = (f.params + f.captures).all(|v| pure_type(p.types, v.ty))
         let mut callees: List[Str] = []
         let mut scalar_only = f.params.all(|v| is_scalar(v.ty)) && is_scalar(f.ret)
         let mut straight = true

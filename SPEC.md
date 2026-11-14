@@ -79,7 +79,7 @@ Statements are separated by a newline or `;`. Two statements on one line without
 | `Chan[T]` | a channel between tasks | Created with `channel(capacity)` (section 10). |
 | `Handle` | `{ addr: Int }` | From the prelude: an opaque C pointer, for foreign functions (section 9). |
 | `FileInfo` | `{ size: Int, modified_ms: Int, is_file: Bool, is_dir: Bool }` | From the prelude; returned by `Fs.info`. |
-| `Root`, `Net`, `Fs`, `Stdout`, `Stderr`, `Clock`, `Listen`, `Listener`, `Conn`, `Rand`, `Stdin`, `Env`, `Exec`, `Foreign` | capabilities | Cannot be created by programs (section 9). |
+| `Root`, `Net`, `Fs`, `Stdout`, `Stderr`, `Clock`, `Listen`, `Listener`, `Conn`, `Rand`, `Stdin`, `Env`, `Exec`, `Foreign` | capabilities | Cannot be created by programs; can be passed, returned and stored in struct fields, enum payloads and collections (section 9). |
 | user `struct` and `enum` | | Optionally generic (section 4). |
 
 There is no separate character type: a character is a `Str` holding one UTF-8 code point. `s.chars()` gives them as a `List[Str]`, `for c in s.chars() { ... }` visits them, and `s.bytes()` gives the bytes (section 11). One type for text keeps the API small; `len()` still counts bytes.
@@ -114,7 +114,7 @@ for (w, n) in counts.entries() { ... }    // in insertion order
 
 `m[k] = v` inserts or replaces and needs a `mut` place, like `push`. An entry can also be changed in place through its key: `m[k].hits = m[k].hits + 1`, `m[k].names.push(n)`, `m[a][b] = v` for a map of maps. Those need the key to be there and panic like `m[k]` when it is not; only `m[k] = v` adds a key.
 
-A key is an `Int`, `Str`, `Bytes` or `Bool`, or a tuple, struct or enum made of them, compared by value: `grid[(x, y)]`, `seen[Pos { x, y }]`. `Float` (NaN is not equal to itself), lists and maps cannot be keys (E0113). Iteration (`keys`, `values`, `entries`) and printing follow insertion order, the same in both backends; replacing a value keeps its key's position, and removing then re-inserting moves it to the end. Two maps are equal when they hold the same entries, in any order.
+A key is an `Int`, `Str`, `Bytes` or `Bool`, or a tuple, struct or enum made of them, compared by value: `grid[(x, y)]`, `seen[Pos { x, y }]`. `Float` (NaN is not equal to itself), lists, maps and capabilities cannot be keys, nor can a struct or enum that holds one (E0113). Iteration (`keys`, `values`, `entries`) and printing follow insertion order, the same in both backends; replacing a value keeps its key's position, and removing then re-inserting moves it to the end. Two maps are equal when they hold the same entries, in any order.
 
 There is no null and no implicit conversion between types: `Int` and `Float` never mix without `to_float()` or `to_int()`.
 
@@ -145,7 +145,7 @@ fn swap[A, B](p: Pair[A, B]) -> Pair[B, A] {
 - The body's last expression, without `;`, is the return value. `return e` returns early.
 - Generic parameters go in `[...]` after the name. They are instantiated at each use and are never written at call sites: `swap(p)`.
 - A type parameter written as an array's size stands for a length, inferred at each call: `fn sum[N](xs: Array[Int, N]) -> Int` takes an array of any length, and `fn first[T, N](xs: Array[T, N]) -> T` any element type too. Inside, `xs.len()` is that length. The function is compiled once per length used, like the rest of generics. A parameter cannot be both a length and a type (E0102), and it is not a value: use `xs.len()`.
-- Struct fields and enum payloads cannot hold a capability (E0301), a channel (E0305) or a function type (E0304). That keeps authority visible in signatures. A generic instantiation like `Pair[Net, Int]` is allowed, because the capability is visible in the type.
+- Struct fields and enum payloads can hold capabilities: `struct Client { net: Net, base: Str }`. The authority a type holds through its fields is tracked wherever the type goes (section 9). They cannot hold a channel (E0305) or a function type (E0304), which could carry authority out of sight.
 - Defining the same type, function, field or variant twice is error E0106.
 - Types can be recursive through an enum, a `List` or a `Map`, which hold their contents indirectly: `struct Node { value: Int, next: Option[Node] }`, `enum Tree { Leaf, Node(Tree, Tree) }`, `struct Dir { files: List[Dir] }`. A struct stores its fields inline, so one that contains itself through structs, tuples or arrays alone would be infinitely large (E0114). There is no `box`: those types are the indirection.
 
@@ -310,7 +310,7 @@ for s in shapes {
 ```
 
 - A struct or enum value becomes `dyn Shape` where one is expected: an annotated `let`, a function argument, a list literal of that type, a struct field, a `return`, the last expression of a function returning `dyn Shape`, `push`, or the argument of a constructor whose type is expected, as `Some(x)` where an `Option[dyn Shape]` is expected and `Err(x)` in a function returning `Result[T, dyn Error]`. The expected type reaches into each branch of an `if`, a `match` and a block, so the branches can hold different types. Its type must satisfy the interface (E0111).
-- Only struct and enum values can become `dyn`, and only if they hold no capability, function or channel (E0112), so a `dyn` value never hides authority. To work with capabilities through an interface, use a bounded type parameter instead. The one exception is `dyn Error` (below), which `Str` and `IoError` values can become too.
+- Only struct and enum values can become `dyn`, and only if they hold no capability, function or channel (E0112), directly or through the fields of the structs and enums inside them, so a `dyn` value never hides authority. To work with such values through an interface, use a bounded type parameter instead. The one exception is `dyn Error` (below), which `Str` and `IoError` values can become too.
 - Only the interface's methods can be called on a `dyn` value. It prints like the value inside. `==` is not allowed.
 - To choose between types, say where the `dyn` is expected: `let s: dyn Shape = if big { Circle { r: 1.0 } } else { Square { s: 2.0 } }`. Without an expected type, the branches of an `if` must have the same type.
 - A `dyn` value is boxed and its calls go through a table of methods; a bounded type parameter (`[T: Shape]`) has no such cost.
@@ -437,7 +437,7 @@ From loosest to tightest. All binary operators are left-associative.
 | `-` `*` `/` | `Int`, `Float` | same type |
 | `%` | `Int` | `Int` |
 | `<` `<=` `>` `>=` | any ordered type (below) | `Bool` |
-| `==` `!=` | any type except functions and capabilities; structural equality | `Bool` |
+| `==` `!=` | any type except functions, channels, `dyn` values, capabilities and values holding a capability (E0201); structural equality | `Bool` |
 | `&&` `\|\|` | `Bool`, short-circuit | `Bool` |
 | `..<` | `Int` | `List[Int]`: `lo..<hi` counts up from `lo`, stopping before `hi` |
 | `-x` | `Int`, `Float` | same type |
@@ -729,13 +729,38 @@ The rules:
 1. Programs cannot create capabilities. They come only from `root`.
 2. Attenuation only narrows. `net.only(host)` returns a `Net` limited to that host, and it is empty if you didn't hold that host. `fs.under(dir)` limits to a subdirectory; `fs.read_only()` removes writing. `exec.only(program)` limits `Exec` to one program; `foreign.only(lib)` limits `Foreign` to one library.
 3. There is no ambient I/O. Using `print`, `open`, `fetch` and similar names is error E0302, which explains the capability to use instead.
-4. A function whose parameters contain no capability and no function type is **pure**: it can only compute (and panic). `tessera caps FILE` lists each function's authority. Section 14 says what the compiler does with pure calls. It never runs them in parallel on its own: concurrency stays visible and cancellable in a `group`, where you write it.
+4. A function whose parameters hold no capability (not even through a struct or enum field, below) and no function type is **pure**: it can only compute (and panic). `tessera caps FILE` lists each function's authority. Section 14 says what the compiler does with pure calls. It never runs them in parallel on its own: concurrency stays visible and cancellable in a `group`, where you write it.
 5. Enforcement at runtime:
    - `Net`: http and https URLs only, host allowlist, redirects not followed. `Net.connect` and `Net.connect_tls` use the same allowlist. TLS certificates are always verified (section 10).
    - `Exec`: the program name must match a grant exactly (`git` and `/usr/bin/git` are different grants), or the grant is `*`. Arguments are passed as a list, never through a shell. The child gets `/dev/null` as stdin, the working directory, `PATH`, and only the environment variables granted with `--grant env=`. A program name without `/` is looked up in `PATH`, as a shell would. Granting a program grants everything that program can do with any arguments, so `exec=sh` is as good as every other grant.
    - `Listen`: binding is allowed only for granted `host` or `host:port` entries, with or without TLS.
    - `Fs`: paths are relative to the granted directory; absolute paths, `..` escapes and symlinks pointing outside are refused. That holds for both ends of a `rename`, and a read-only `Fs` refuses it, as it refuses every write.
    - `Foreign`: a call checks that the function's library is on the `Foreign` value's list (or the list holds `*`). C code runs with the whole process's authority, so granting a library grants everything that library can do; see below.
+
+### Capabilities in structs and enums
+
+A struct field or an enum payload can be a capability, so authority that travels together can be bundled:
+
+```
+struct Client {
+    net: Net,
+    base: Str,
+}
+
+fn fetch(c: Client, path: Str) -> Result[Str, IoError] {
+    Ok(c.net.get(c.base + path)?.body)
+}
+```
+
+A type **holds** a capability when it contains one: written in it (`Net`, `List[Net]`, `Box[Net]`), or reached through the fields and payloads of the structs and enums in it, however deeply and through lists, maps, options and type arguments (`struct App { client: Client }` holds `Net`). The compiler works this out once per type, recursive types included, and every rule about authority looks through it:
+
+- A function taking `c: Client` takes `Net`. `tessera caps` says where it comes from, `Net (via Client.net)` (a path through fields, with an enum payload named by its variant, `Sink.ToOut`), and the `--json` output has a `"via"` object mapping each such capability to its path. A capability also written in a parameter's type has no `via`.
+- Such a function is never pure, so the compiler never reuses or keeps its calls (section 14), and a closure that captures such a value is not fused into a pipeline.
+- A dependency taking a `Client` is checked against its `caps` like one taking a `Net` (E0320): authority cannot cross into a dependency inside a struct.
+- A value holding a capability cannot become `dyn` (E0112), cannot be a map key (E0113) and cannot be compared with `==` or `!=` (E0201): capabilities have no equality, and neither does a value holding one. Use a bounded type parameter, `[T: Named]`, to reach its methods through an interface.
+- It is an ordinary value otherwise: built with a literal, updated with `with`, kept in lists and maps, matched, passed to tasks (each task gets its own copy; capabilities are shared safely between threads). It prints with its capabilities as `<Net>`, which cannot be turned back into one.
+
+Rule 1 still holds: a struct cannot make a capability, only carry one it was given.
 
 ### Foreign functions (C)
 
@@ -1389,7 +1414,7 @@ String interpolation and `to_str()` use these rules. At the top level a `Str` pr
 
 ## 14. Optimizations that affect observable behavior
 
-The native backend may run a chain like `xs.filter(p).map(f).fold(z, g)` as one fused loop, interleaving the stages per element. It does this only when the earlier stages are pure closure literals, which capture no capability and no function. The only observable difference is **which panic happens first** when more than one stage would panic. Everything else (results, output order, values) is the same.
+The native backend may run a chain like `xs.filter(p).map(f).fold(z, g)` as one fused loop, interleaving the stages per element. It does this only when the earlier stages are pure closure literals, which capture no capability (nor a value holding one, section 9) and no function. The only observable difference is **which panic happens first** when more than one stage would panic. Everything else (results, output order, values) is the same.
 
 Other uses of purity change nothing a program can observe. A pure call (to a pure function, or a built-in method such as `split` or `to_upper`) gives the same result for the same arguments, so:
 
@@ -1436,7 +1461,7 @@ Every diagnostic has a stable code. `tessera explain CODE` prints its explanatio
 | E0209 | invalid assignment target |
 | E0210 | the alternatives of an or-pattern bind different names, or a name with different types |
 | E0211 | a tuple assignment whose right side is not a tuple of as many items |
-| E0301 | capability stored in a field |
+| E0301 | no longer reported: capabilities can be stored in fields (section 9) |
 | E0302 | ambient I/O name such as `print` |
 | E0303 | bad `main` signature |
 | E0304 | function stored in a field |
@@ -1553,7 +1578,7 @@ upat       = "_" | IDENT | tuplepat ;
 
 - `tessera fmt FILE` prints the canonical formatting (`--write` rewrites, `--check` verifies).
 - `tessera lsp` is a language server (diagnostics, hover, definition, references, rename, completion, quick fixes, outline); `tessera mcp` is an MCP server exposing check, run, test, format, caps, type-at, references, rename and the spec to coding agents. Rename is refused when it is unsafe: the renamed program must check with no new errors, and the new name must refer to exactly the renamed places.
-- `tessera caps FILE` lists each function's authority; `tessera explain CODE` explains an error.
+- `tessera caps FILE` lists each function's authority, saying for a capability held through a struct or enum which field holds it (`Net (via Client.net)`); `tessera explain CODE` explains an error.
 - `tessera search`, `tessera add` and `tessera index entry` use the package index (section 18).
 - `tessera doc FILE|MODULE... [--std] [--all] [--html] [-o OUT]` prints documentation built from doc comments (section 2) and signatures, as Markdown, or with `--html` as one static page. An argument that is not a file names a standard library module; `--std` documents all of them. It lists `pub` items (everything with `--all`); methods appear under their type, and methods on a type the module does not declare (such as `Str`) get their own section. Files are parsed, not type-checked.
 
@@ -1618,7 +1643,7 @@ yaml = { git = "git@example.com:me/yaml.git", commit = "3f9c2e1d7a" }
 - A dependency is a directory holding `NAME.tsr`, plus any modules that file uses from the same directory.
 - `caps` lists what the dependency may use: `net` (Net and Conn), `listen` (Listen, Listener and Conn), `fs`, `stdout`, `stderr`, `stdin`, `clock`, `rand`, `env`, `exec`. The default is none. No dependency can take `Root`, and `caps` cannot give `foreign` (E0321).
 - `[trust] foreign = ["name", ...]` names the dependencies that may call C: declare foreign blocks and take `Foreign`. Calling C is full trust, since C code is outside every capability check, so it is a separate, explicit list rather than one more cap, and only the program's tessera.toml can hold it. An untrusted dependency that calls C is E0320. tessera.lock gets a line per trusted dependency that calls C, `foreign NAME LIB,LIB`, written on the first build; when an update makes the dependency declare a library the line does not have, the build stops (E0324) until you review it and delete the line.
-- Tessera has no ambient authority, so a function can only use a capability that reaches it as a parameter. The checker therefore knows everything a dependency can ever do from its signatures, and rejects the program (E0320) if a dependency's function takes a capability it was not granted. Granting is still only an upper bound: at run time the dependency gets exactly the capabilities you pass it, which can be narrowed with `only` and `under`.
+- Tessera has no ambient authority, so a function can only use a capability that reaches it as a parameter. The checker therefore knows everything a dependency can ever do from its signatures, and rejects the program (E0320) if a dependency's function takes a capability it was not granted, counting those held by the structs and enums it takes (the note names the field, `through Ctx.fs`). Granting is still only an upper bound: at run time the dependency gets exactly the capabilities you pass it, which can be narrowed with `only` and `under`.
 - A dependency is a local directory (`path`) or a git repository (`git`) at a `tag` or a `commit` (lowercase hex, at least 7 characters). The URL is `https://`, `http://`, `ssh://`, `git://`, `file://` or `user@host:path`. No registry holds the code: the URL is the name of the source, and the package index (below) only points at URLs.
 - A git dependency is fetched with the `git` command into a cache, one directory per commit: `$TESSERA_CACHE`, else `$XDG_CACHE_HOME/tessera`, else `~/.cache/tessera`. Fetching needs no grant because it happens in the compiler, before the program exists; `tessera lsp` and `tessera mcp` never fetch, and report a dependency that is not cached yet (E0322).
 - `tessera.lock`, next to tessera.toml, is written by the commands that produce something, `tessera build`, `tessera run` and `tessera test` (and `tessera add`), the first time they meet a new git dependency or a new trusted one that calls C, and should be committed. `tessera check`, `tessera caps` and the editor and agent servers read it and never write it: a check of a project whose lock is missing a line passes or fails as the build would, and leaves the file as it is. It holds one line per git dependency: name, URL, `tag:NAME` or `commit:HASH` as written in tessera.toml, the full commit, and a BLAKE2b hash of the dependency's files:

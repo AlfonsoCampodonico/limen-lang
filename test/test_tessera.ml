@@ -1667,7 +1667,9 @@ fn main(root: Root) {
 
   (* ---------- diagnostics ---------- *)
   errs "ambient-print" (main_wrap "    print(\"x\")") [ "E0302" ];
-  errs "cap-in-struct" "struct C { n: Net }\nfn main(root: Root) {}" [ "E0301" ];
+  errs "cap-in-struct" "struct C { n: Net }\nenum E { A(Fs), B }\nfn main(root: Root) {}" [];
+  errs "chan-in-struct-still" "struct C { n: Net, c: Chan[Int] }\nfn main(root: Root) {}" [ "E0305" ];
+  errs "fn-of-cap-in-struct" "struct C { f: fn(Net) }\nfn main(root: Root) {}" [ "E0304" ];
   errs "fn-in-struct" "struct C { f: fn(Int) -> Int }\nfn main(root: Root) {}" [ "E0304" ];
   errs "generic-cap-visible-ok" "struct Box[T] { v: T }\nfn f(b: Box[Net]) {}\nfn main(root: Root) {}" [];
   errs "bad-main" "fn main(x: Int) {}" [ "E0303" ];
@@ -1725,6 +1727,138 @@ fn main(root: Root) {
   ok "authority-net" ((find "net").caps = [ Types.Net ]) "net fn missing Net";
   ok "authority-callback" (find "cb").callbacks "callback not detected";
   ok "authority-main" ((find "main").caps = [ Types.Root ]) "main missing Root";
+
+  (* ---------- capabilities held in structs and enums ---------- *)
+  let holders =
+    "struct Client { net: Net, name: Str }\nstruct App { client: Client, out: Stdout, count: Int }\nenum Sink { ToOut(Stdout), Nowhere }\n\
+     struct Node { val: Int, next: Option[Node], log: Stdout }\nstruct Box[T] { item: T }\ninterface Named {\n    fn label(self) -> Str\n}\n\
+     fn label(self: App) -> Str {\n    self.client.name\n}\n\n"
+  in
+  let _, ds, infos =
+    compile "held-authority"
+      (holders
+     ^ "fn greet(app: App) {\n    app.out.print(\"hi\")\n}\nfn emit(s: Sink) {}\nfn walk(n: Node) {}\nfn boxed(b: Box[List[Client]]) {}\n\
+        fn both(c: Client, n: Net) {}\nfn plain(x: Box[Int]) {}\nfn main(root: Root) {}")
+  in
+  let find n = List.find (fun (i : Check.fn_info) -> i.name = n) infos in
+  let via n = List.map (fun (c, p) -> Types.cap_name c ^ "=" ^ p) (find n).via in
+  ok "held-authority-checks" (ds = []) (String.concat " " (codes ds));
+  ok "held-authority-nested" ((find "greet").caps = [ Types.Net; Types.Stdout ] && via "greet" = [ "Net=App.client.net"; "Stdout=App.out" ]) (String.concat " " (via "greet"));
+  ok "held-authority-enum" ((find "emit").caps = [ Types.Stdout ] && via "emit" = [ "Stdout=Sink.ToOut" ]) (String.concat " " (via "emit"));
+  ok "held-authority-recursive" ((find "walk").caps = [ Types.Stdout ] && via "walk" = [ "Stdout=Node.log" ]) (String.concat " " (via "walk"));
+  ok "held-authority-generic" ((find "boxed").caps = [ Types.Net ] && via "boxed" = [ "Net=Client.net" ]) (String.concat " " (via "boxed"));
+  ok "held-authority-written" ((find "both").caps = [ Types.Net ] && (find "both").via = []) (String.concat " " (via "both"));
+  ok "held-authority-pure" ((find "plain").caps = [] && not (find "plain").callbacks) "Box[Int] holds nothing";
+  errs "held-dyn" (holders ^ "fn main(root: Root) {\n    let a = App { client: Client { net: root.net, name: \"x\" }, out: root.stdout, count: 1 }\n    let d: dyn Named = a\n}\n") [ "E0112" ];
+  says "held-dyn-says" (holders ^ "fn main(root: Root) {\n    let a = App { client: Client { net: root.net, name: \"x\" }, out: root.stdout, count: 1 }\n    let d: dyn Named = a\n}\n") "E0112" "through `App.client.net`";
+  errs "held-dyn-generic" (holders ^ "fn label[T](self: Box[T]) -> Str {\n    \"box\"\n}\n\nfn main(root: Root) {\n    let d: dyn Named = Box { item: [Sink.ToOut(root.stdout)] }\n}\n") [ "E0112" ];
+  errs "held-dyn-error" (holders ^ "fn message(self: Client) -> Str {\n    self.name\n}\n\nfn f(c: Client) -> Result[Int, dyn Error] {\n    let r: Result[Int, Client] = Err(c)\n    let n = r?\n    Ok(n)\n}\n\nfn main(root: Root) {}\n") [ "E0202" ];
+  errs "held-map-key" (holders ^ "fn main(root: Root) {\n    let m: Map[Client, Int] = map()\n}\n") [ "E0113" ];
+  errs "held-map-key-enum" (holders ^ "fn main(root: Root) {\n    let m: Map[(Int, Sink), Int] = map()\n}\n") [ "E0113" ];
+  errs "held-eq" (holders ^ "fn same(a: Client, b: Client) -> Bool {\n    a == b\n}\n\nfn main(root: Root) {}\n") [ "E0201" ];
+  errs "held-ne-generic" (holders ^ "fn same(a: Box[Option[Sink]]) -> Bool {\n    a != a\n}\n\nfn main(root: Root) {}\n") [ "E0201" ];
+  errs "held-eq-plain-ok" (holders ^ "fn same(a: Box[Int]) -> Bool {\n    a == a\n}\n\nfn main(root: Root) {}\n") [];
+  errs "held-bound-ok" (holders ^ "fn show[T: Named](x: T) -> Str {\n    x.label()\n}\n\nfn main(root: Root) {\n    let a = App { client: Client { net: root.net, name: \"x\" }, out: root.stdout, count: 1 }\n    root.stdout.print(show(a))\n}\n") [];
+  out "held-run"
+    (holders
+   ^ {|fn greet(app: App) {
+    app.out.print("hi {app.client.name} {app.count}")
+}
+
+fn emit(s: Sink, msg: Str) {
+    match s {
+        ToOut(o) => o.print(msg),
+        Nowhere => {},
+    }
+}
+
+fn walk(n: Node) -> Int {
+    n.log.print("at {n.val}")
+    match n.next {
+        Some(m) => n.val + walk(m),
+        None => n.val,
+    }
+}
+
+fn speak[T: Named](x: T, out: Stdout) {
+    out.print(x.label())
+}
+
+fn main(root: Root) {
+    let app = App { client: Client { net: root.net.only("example.com"), name: "x" }, out: root.stdout, count: 1 }
+    greet(app)
+    let app2 = { app with count: 2 }
+    let mut apps = [app, app2]
+    apps.push({ app2 with count: 3 })
+    apps[0].count = 10
+    for a in apps {
+        greet(a)
+    }
+    emit(ToOut(root.stdout), "sink")
+    emit(Nowhere, "none")
+    let sinks = [Some(Sink.ToOut(root.stdout)), None]
+    for s in sinks {
+        emit(s ?? Nowhere, "maybe")
+    }
+    let n = Node { val: 1, next: Some(Node { val: 2, next: None, log: root.stdout }), log: root.stdout }
+    root.stdout.print("{walk(n)}")
+    let b = Box { item: app }
+    b.item.out.print("boxed {b.item.count}")
+    speak(app, root.stdout)
+    let counts = group g {
+        for a in apps {
+            g.go(|| {
+                a.out.print("task {a.count}")
+                a.count
+            })
+        }
+    }
+    root.stdout.print("{counts}")
+    root.stdout.print("{app}")
+    root.stdout.print("{ToOut(root.stdout)} {b}")
+    match app.client.net.get("http://other.org/") {
+        Ok(_) => root.stdout.print("fetched"),
+        Err(e) => root.stdout.print("{e}"),
+    }
+}
+|})
+    "hi x 1\nhi x 10\nhi x 2\nhi x 3\nsink\nmaybe\nat 1\nat 2\n3\nboxed 1\nx\ntask 10\ntask 2\ntask 3\n[10, 2, 3]\n\
+     App { client: Client { net: <Net>, name: \"x\" }, out: <Stdout>, count: 1 }\nToOut(<Stdout>) Box { item: App { client: Client { net: <Net>, name: \"x\" }, out: <Stdout>, count: 1 } }\n\
+     Denied(\"net: other.org:80 is not granted\")\n";
+  (* a function taking a value that holds a capability is never pure: its
+     calls are not reused, and a closure capturing one is not fused *)
+  out "held-not-pure"
+    {|struct Log { out: Stdout, tag: Str }
+
+fn note(l: Log, n: Int) -> Int {
+    l.out.print("{l.tag} {n}")
+    n
+}
+
+fn tagged(l: Log) -> Str {
+    l.tag
+}
+
+fn main(root: Root) {
+    let l = Log { out: root.stdout, tag: "t" }
+    let a = note(l, 1) + note(l, 1)
+    let mut i = 0
+    while i < 2 {
+        let b = note(l, 2)
+        i = i + 1
+    }
+    let xs = [1, 2].map(|x| note(l, x)).filter(|x| x > 1)
+    root.stdout.print("{a} {xs} {tagged(l)} {tagged(l)}")
+}
+|}
+    "t 1\nt 1\nt 2\nt 2\nt 1\nt 2\n2 [2] t t\n";
+  (let items, ds, _ = compile "held-not-pure-ir" "struct Log { out: Stdout, tag: Str }\n\nfn tagged(l: Log) -> Str {\n    l.tag\n}\n\nfn twice(x: Int) -> Int {\n    x * 2\n}\n\nfn main(root: Root) {\n    let l = Log { out: root.stdout, tag: \"t\" }\n    root.stdout.print(\"{tagged(l)} {twice(2)}\")\n}\n" in
+   if ds <> [] then ok "held-not-pure-ir" false (String.concat " " (codes ds))
+   else
+     let prog, _ = Lower.lower_program ~tests:false items in
+     let pure = Pure.analyse prog in
+     let is n = Hashtbl.fold (fun k _ acc -> acc || Interp_util.find_sub k n 0 <> None) pure false in
+     ok "held-not-pure-ir" ((not (is "tagged")) && is "twice") (String.concat " " (List.of_seq (Hashtbl.to_seq_keys pure))));
 
   (* ---------- JSON output is well formed ---------- *)
   let _, ds, _ = compile "json" (main_wrap "    print(\"a \\\"quoted\\\"\\n\")") in
@@ -6151,6 +6285,23 @@ fn main(root: Root) {
   ok "pkg-granted" (pkg_codes "[package]\nname = \"app\"\n[dependencies]\nfetch = { path = \"../fetch\", caps = [\"net\", \"fs\"] }  # both\n" = []) "granted";
   ok "pkg-bad-toml" (pkg_codes "[package]\nname = \"app\"\n[dependencies]\nfetch = { path = \"../fetch\", caps = [\"disk\"] }\n" = [ "E0321" ]) "bad cap";
   ok "pkg-missing-dir" (pkg_codes "[package]\nname = \"app\"\n[dependencies]\nother = { path = \"../nope\" }\n" = [ "E0401" ]) "fetch not found";
+  (* a dependency cannot launder authority through a struct: what its
+     functions' parameters hold counts *)
+  (try Unix.mkdir (Filename.concat pdir "launder") 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+  put "launder/launder.tsr" "pub struct Ctx {\n    out: Stdout,\n    disk: Disk,\n}\n\npub enum Disk {\n    Real(Fs),\n    Fake,\n}\n\npub fn run(c: Ctx) {\n    c.out.print(\"x\")\n}\n";
+  let laundered toml =
+    put "app/tessera.toml" toml;
+    let src = "use launder\n\nfn main(root: Root) {\n    launder.run(launder.Ctx { out: root.stdout, disk: launder.Fake })\n}\n" in
+    let path = Filename.concat pdir "app/launder_main.tsr" in
+    put "app/launder_main.tsr" src;
+    let _, ds, _ = Modules.load_and_check path src in
+    ds
+  in
+  let ds = laundered "[package]\nname = \"app\"\n[dependencies]\nlaunder = { path = \"../launder\", caps = [\"stdout\"] }\n" in
+  ok "pkg-struct-launder"
+    (codes ds = [ "E0320" ] && List.exists (fun n -> Interp_util.find_sub n "through `launder.Ctx.disk.Real`" 0 <> None) (List.hd ds).notes)
+    (String.concat "; " (List.map (fun (d : Diag.t) -> d.code ^ " " ^ d.message ^ " " ^ String.concat " " d.notes) ds));
+  ok "pkg-struct-granted" (codes (laundered "[package]\nname = \"app\"\n[dependencies]\nlaunder = { path = \"../launder\", caps = [\"stdout\", \"fs\"] }\n") = []) "granted";
   (* embed stays inside the package: the main program's (app/, where its
      tessera.toml is) and each dependency's own directory *)
   put "app/data.txt" "app data";

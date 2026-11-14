@@ -132,15 +132,84 @@ let rec subst env t =
   | TNamed (n, args) -> TNamed (n, List.map (subst env) args)
   | t -> t
 
-(* Capabilities mentioned anywhere in a type. *)
+(* The authority a struct or enum holds through its own fields and
+   payloads, by name: each capability with the first path that reaches it,
+   `Client.net` or `App.client.net` (type arguments are not counted here;
+   [caps_in] walks them where the type is used). Filled by the checker once
+   the declarations are known (see [compute_authority]); a type holding no
+   capability has no entry. *)
+let authority : (string, (cap * string) list) Hashtbl.t = Hashtbl.create 16
+
+(* Capabilities a value of the type holds: written in the type, or reached
+   through the fields and payloads of the structs and enums in it. *)
 let rec caps_in t acc =
   match repr t with
   | TCap c -> if List.mem c acc then acc else c :: acc
   | TList a | TArray (a, _) -> caps_in a acc
   | TMap (k, v) -> caps_in v (caps_in k acc)
   | TFn (ps, r) -> List.fold_left (fun acc p -> caps_in p acc) (caps_in r acc) ps
-  | TNamed (_, args) -> List.fold_left (fun acc a -> caps_in a acc) acc args
+  | TNamed (n, args) ->
+    let acc = List.fold_left (fun acc a -> caps_in a acc) acc args in
+    (match Hashtbl.find_opt authority n with
+     | Some held -> List.fold_left (fun acc (c, _) -> if List.mem c acc then acc else c :: acc) acc held
+     | None -> acc)
   | _ -> acc
+
+(* The capabilities written in the type itself, not those its structs and
+   enums hold through their fields. *)
+let rec caps_written t acc =
+  match repr t with
+  | TCap c -> if List.mem c acc then acc else c :: acc
+  | TList a | TArray (a, _) -> caps_written a acc
+  | TMap (k, v) -> caps_written v (caps_written k acc)
+  | TFn (ps, r) -> List.fold_left (fun acc p -> caps_written p acc) (caps_written r acc) ps
+  | TNamed (_, args) -> List.fold_left (fun acc a -> caps_written a acc) acc args
+  | _ -> acc
+
+(* Where a type that does not write capability [c] gets it from: the path
+   through the first struct or enum in it that holds [c] (its own entry
+   first, then its type arguments in order). *)
+let rec via t c =
+  match repr t with
+  | TList a | TArray (a, _) -> via a c
+  | TMap (k, v) -> (match via k c with Some p -> Some p | None -> via v c)
+  | TFn (ps, r) -> List.find_map (fun p -> via p c) (ps @ [ r ])
+  | TNamed (n, args) -> (
+    match Option.bind (Hashtbl.find_opt authority n) (List.assoc_opt c) with
+    | Some p -> Some p
+    | None -> List.find_map (fun a -> via a c) args)
+  | _ -> None
+
+(* Fill [authority] for the program's structs and enums: [fields] gives a
+   type's fields (a variant's payloads are named by the variant), in
+   declaration order, with its type parameters as TParam. Each type is
+   walked depth first from its first field, every type entered once, so
+   recursive types end. *)
+let compute_authority (names : string list) (fields : string -> (string * ty) list option) =
+  Hashtbl.reset authority;
+  List.iter
+    (fun n ->
+      let seen = Hashtbl.create 8 and found = ref [] in
+      let add c path = if not (List.mem_assoc c !found) then found := !found @ [ (c, path) ] in
+      let rec enter m path =
+        if not (Hashtbl.mem seen m) then begin
+          Hashtbl.replace seen m ();
+          match fields m with
+          | Some fs -> List.iter (fun (f, t) -> walk (path ^ "." ^ f) t) fs
+          | None -> ()
+        end
+      and walk path t =
+        match repr t with
+        | TCap c -> add c path
+        | TList a | TArray (a, _) -> walk path a
+        | TMap (k, v) -> walk path k; walk path v
+        | TFn (ps, r) -> List.iter (walk path) ps; walk path r
+        | TNamed (m, args) -> List.iter (walk path) args; enter m path
+        | _ -> ()
+      in
+      enter n n;
+      if !found <> [] then Hashtbl.replace authority n !found)
+    names
 
 (* Channels: shared communication, so values holding one are never pure. *)
 let rec has_chan t =

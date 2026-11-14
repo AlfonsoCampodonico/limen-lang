@@ -42,6 +42,9 @@ pub struct FnInfo {
     name: Str,
     span: ast.Span,
     caps: List[Str],
+    // for each capability no parameter's type writes, the path through the
+    // struct or enum that holds it, `Client.net`
+    via: List[(Str, Str)],
     callbacks: Bool,
 }
 
@@ -91,6 +94,7 @@ pub fn check_program(items: List[ast.Item], files: List[diag.Source], next_id: I
     (cx, st, ds) = iface_methods(cx, st, ds, all)
     (cx, st, ds) = fields_and_variants(cx, st, ds, all)
     st = no_self_containing(cx, st, all)
+    st = authority(cx, st, all)
     let mut sigs: List[Fn] = []
     (cx, st, ds, sigs) = signatures(cx, st, ds, all)
     // the bounds of the types written in declarations
@@ -132,9 +136,33 @@ pub fn check_program(items: List[ast.Item], files: List[diag.Source], next_id: I
 }
 
 fn fn_info(st: env.State, f: Fn) -> FnInfo {
-    let found = f.sig.params.fold([], |acc, t| st.subst.caps_in(t, acc))
+    let held = st.authority_of(f.sig.params)
     let callbacks = f.sig.params.any(|t| st.subst.has_fn(t)) || !f.decl.bounds.is_empty()
-    FnInfo { name: f.decl.name, span: f.decl.span, caps: builtins.cap_names().filter(|c| found.contains(c)), callbacks }
+    let via = held.flat_map(|h| match h.1 {
+        Some(p) => [(h.0, p)],
+        None => [],
+    })
+    FnInfo { name: f.decl.name, span: f.decl.span, caps: held.map(|h| h.0), via, callbacks }
+}
+
+// 2c. the authority each struct and enum holds through its fields
+fn authority(cx: env.Cx, st: env.State, items: List[ast.Item]) -> env.State {
+    let mut names: List[Str] = []
+    let mut fields: Map[Str, List[(Str, types.Ty)]] = map()
+    for i in items {
+        match i {
+            IStruct(s) if registered_struct(cx, s) => {
+                names.push(s.name)
+                fields[s.name] = cx.sfields.get(s.name) ?? []
+            },
+            IEnum(e) if registered_enum(cx, e) => {
+                names.push(e.name)
+                fields[e.name] = (cx.variants.get(e.name) ?? []).flat_map(|v| v.1.map(|t| (v.0, t)))
+            },
+            _ => {},
+        }
+    }
+    { st with subst: st.subst.with_authority(names, fields) }
 }
 
 fn item_file(i: ast.Item) -> Int {

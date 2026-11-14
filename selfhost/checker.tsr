@@ -255,8 +255,15 @@ fn coerce(st: env.State, cx: env.Cx, e: ast.Expr, t: types.Ty, b: env.Bound) -> 
         TStr | TNamed("IoError", _) if b.iface == "Error" => box(st, e, b),
         TNamed(n, _) if (cx.structs.contains(n) || cx.enums.contains(n)) && !["Option", "Result", "IoError"].contains(n) => {
             let ct = st.repr(t)
-            if !st.subst.caps_in(ct, []).is_empty() || st.subst.has_fn(ct) || st.subst.has_chan(ct) {
-                let d = diag.error("E0112", e.span, "`{st.show(ct)}` holds a capability, function or channel, so it cannot become `dyn {bn}`").note("authority must stay visible in types; pass it with a type parameter, as in `[T: " + bn + "]`")
+            match st.held(ct) {
+                Some(h) => {
+                    let d = diag.error("E0112", e.span, "{h}, so it cannot become `dyn {bn}`").note("authority must stay visible in types; pass it with a type parameter, as in `[T: " + bn + "]`")
+                    return st.report(d)
+                },
+                None => {},
+            }
+            if st.subst.has_fn(ct) || st.subst.has_chan(ct) {
+                let d = diag.error("E0112", e.span, "`{st.show(ct)}` holds a function or channel, so it cannot become `dyn {bn}`").note("a function or channel could carry authority out of sight; pass it with a type parameter, as in `[T: " + bn + "]`")
                 return st.report(d)
             }
             match satisfies(st, cx, ct, b) {
@@ -1726,8 +1733,14 @@ fn error_conversion(st: env.State, cx: env.Cx, e: types.Ty) -> (Option[Str], env
         TVar(_) => (None, st.unify(e, TDyn("Error", [])).1),
         TNamed(n, _) if (cx.structs.contains(n) || cx.enums.contains(n)) && n != "Option" && n != "Result" => {
             let ct = st.repr(e)
-            if !st.subst.caps_in(ct, []).is_empty() || st.subst.has_fn(ct) || st.subst.has_chan(ct) {
-                return (Some("`{st.show(ct)}` holds a capability, function or channel"), st)
+            match st.held(ct) {
+                Some(h) => {
+                    return (Some(h), st)
+                },
+                None => {},
+            }
+            if st.subst.has_fn(ct) || st.subst.has_chan(ct) {
+                return (Some("`{st.show(ct)}` holds a function or channel"), st)
             }
             satisfies(st, cx, ct, env.Bound { iface: "Error", args: [] })
         },
@@ -1821,7 +1834,12 @@ fn check_try_ok(st: env.State, cx: env.Cx, fx: env.Fx, x: ast.Expr, context: Opt
                         st = next
                         match why {
                             Some(why) => {
-                                let d = diag.error("E0202", sp, "`?` cannot turn an error of type `{st.show(e)}` into `dyn Error`").note(why).note("give it a method `fn message(self: " + st.show(e) + ") -> Str`")
+                                let hint = if st.held(e).is_some() || st.subst.has_fn(e) || st.subst.has_chan(e) {
+                                    "an error cannot carry authority: keep capabilities, functions and channels out of the error type"
+                                } else {
+                                    "give it a method `fn message(self: " + st.show(e) + ") -> Str`"
+                                }
+                                let d = diag.error("E0202", sp, "`?` cannot turn an error of type `{st.show(e)}` into `dyn Error`").note(why).note(hint)
                                 st = st.report(d)
                             },
                             None => {},
@@ -1944,7 +1962,11 @@ fn check_bin(st: env.State, cx: env.Cx, fx: env.Fx, op: ast.BinOp, a: ast.Expr, 
                 Lt | Le | Gt | Ge => (TBool, if unordered(st, cx, t).is_some() { bad(st) } else { st }),
                 _ => match t {
                     TFn(..) | TCap(_) | TChan(_) | TDyn(..) => (TBool, bad(st)),
-                    _ => (TBool, st),
+                    // capabilities have no equality, so neither has a value holding one
+                    _ => match st.held(t) {
+                        Some(h) => (TBool, st.report(diag.error("E0201", sp, "operator `{op_name(op)}` cannot be applied to `{st.show(t)}`").note(h + ", and capabilities cannot be compared"))),
+                        None => (TBool, st),
+                    },
                 },
             }
         },

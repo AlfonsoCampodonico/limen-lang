@@ -392,10 +392,15 @@ let cmd_caps file json =
   let _, diags, infos = load file in
   if diags <> [] then (report diags; exit 1);
   let caps_str (i : Check.fn_info) = List.map Types.cap_name i.caps in
+  (* a capability held through a struct or enum says where: `Net (via Client.net)` *)
+  let caps_via (i : Check.fn_info) =
+    List.map (fun c -> match List.assoc_opt c i.via with Some p -> Printf.sprintf "%s (via %s)" (Types.cap_name c) p | None -> Types.cap_name c) i.caps
+  in
   if json then begin
     let one (i : Check.fn_info) =
-      Printf.sprintf {|{"name":%s,"caps":[%s],"callbacks":%b,"pure":%b}|} (Diag.jstr i.name)
+      Printf.sprintf {|{"name":%s,"caps":[%s],"via":{%s},"callbacks":%b,"pure":%b}|} (Diag.jstr i.name)
         (String.concat "," (List.map Diag.jstr (caps_str i)))
+        (String.concat "," (List.map (fun (c, p) -> Diag.jstr (Types.cap_name c) ^ ":" ^ Diag.jstr p) i.via))
         i.callbacks
         (i.caps = [] && not i.callbacks)
     in
@@ -409,7 +414,7 @@ let cmd_caps file json =
     List.iter
       (fun (i : Check.fn_info) ->
         let what =
-          match (caps_str i, i.callbacks) with
+          match (caps_via i, i.callbacks) with
           | [], false -> "pure"
           | [], true -> "pure itself, runs callbacks"
           | cs, cb -> String.concat ", " cs ^ if cb then " + callbacks" else ""

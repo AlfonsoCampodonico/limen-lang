@@ -61,14 +61,18 @@ pub fn io_err() -> Ty {
 }
 
 // What the type variables stand for: the type each linked variable was
-// unified with, and the number the next new variable gets.
+// unified with, and the number the next new variable gets. It also carries
+// the authority each struct and enum holds through its fields (set once
+// the declarations are known, see `with_authority`), which every question
+// about a type's capabilities needs.
 pub struct Subst {
     links: Map[Int, Ty],
     next: Int,
+    authority: Map[Str, List[(Str, Str)]],
 }
 
 pub fn empty() -> Subst {
-    Subst { links: map(), next: 1 }
+    Subst { links: map(), next: 1, authority: map() }
 }
 
 pub fn fresh(self: Subst) -> (Ty, Subst) {
@@ -208,16 +212,120 @@ pub fn subst(self: Subst, env: List[(Str, Ty)], t: Ty) -> Ty {
     }
 }
 
-// The capabilities mentioned anywhere in `t`, in the order OCaml's
-// caps_in finds them (it puts each new one in front).
+// The capabilities a value of type `t` holds: written in the type, or
+// reached through the fields and payloads of the structs and enums in it,
+// in the order OCaml's caps_in finds them (it puts each new one in front).
 pub fn caps_in(self: Subst, t: Ty, acc: List[Str]) -> List[Str] {
     match self.repr(t) {
         TCap(c) => if acc.contains(c) { acc } else { [c] + acc },
         TList(a) | TArray(a, _) => self.caps_in(a, acc),
         TMap(k, v) => self.caps_in(v, self.caps_in(k, acc)),
         TFn(ps, r) => ps.fold(self.caps_in(r, acc), |got, p| self.caps_in(p, got)),
-        TNamed(_, args) => args.fold(acc, |got, a| self.caps_in(a, got)),
+        TNamed(n, args) => {
+            let got = args.fold(acc, |got, a| self.caps_in(a, got))
+            (self.authority.get(n) ?? []).fold(got, |got, held| if got.contains(held.0) { got } else { [held.0] + got })
+        },
         _ => acc,
+    }
+}
+
+// The capabilities written in `t` itself, not those its structs and enums
+// hold through their fields.
+pub fn caps_written(self: Subst, t: Ty, acc: List[Str]) -> List[Str] {
+    match self.repr(t) {
+        TCap(c) => if acc.contains(c) { acc } else { [c] + acc },
+        TList(a) | TArray(a, _) => self.caps_written(a, acc),
+        TMap(k, v) => self.caps_written(v, self.caps_written(k, acc)),
+        TFn(ps, r) => ps.fold(self.caps_written(r, acc), |got, p| self.caps_written(p, got)),
+        TNamed(_, args) => args.fold(acc, |got, a| self.caps_written(a, got)),
+        _ => acc,
+    }
+}
+
+// Where a type that does not write capability `c` gets it from: the path
+// through the first struct or enum in it that holds `c` (its own entry
+// first, then its type arguments in order).
+pub fn via(self: Subst, t: Ty, c: Str) -> Option[Str] {
+    match self.repr(t) {
+        TList(a) | TArray(a, _) => self.via(a, c),
+        TMap(k, v) => first_via(self, [k, v], c),
+        TFn(ps, r) => first_via(self, ps + [r], c),
+        TNamed(n, args) => match (self.authority.get(n) ?? []).find(|held| held.0 == c) {
+            Some(held) => Some(held.1),
+            None => first_via(self, args, c),
+        },
+        _ => None,
+    }
+}
+
+fn first_via(s: Subst, ts: List[Ty], c: Str) -> Option[Str] {
+    for t in ts {
+        match s.via(t, c) {
+            Some(p) => {
+                return Some(p)
+            },
+            None => {},
+        }
+    }
+    None
+}
+
+// The authority each of the structs and enums `names` holds through its
+// own fields and payloads: each capability with the first path that
+// reaches it, `Client.net` or `App.client.net`. `fields` gives a type's
+// fields (a variant's payloads named by the variant) in declaration order,
+// its type parameters as TParam. Each type is walked depth first from its
+// first field, every type entered once, so recursive types end; type
+// arguments are not counted here (caps_in walks them where the type is
+// used). A type holding no capability gets no entry.
+pub fn with_authority(self: Subst, names: List[Str], fields: Map[Str, List[(Str, Ty)]]) -> Subst {
+    let mut table: Map[Str, List[(Str, Str)]] = map()
+    for n in names {
+        let found = enter(self, fields, n, n, [], []).0
+        if !found.is_empty() {
+            table[n] = found
+        }
+    }
+    { self with authority: table }
+}
+
+// Enter type `m`, reached by `path`: the capabilities found so far and the
+// types entered.
+fn enter(s: Subst, fields: Map[Str, List[(Str, Ty)]], m: Str, path: Str, found: List[(Str, Str)], seen: List[Str]) -> (List[(Str, Str)], List[Str]) {
+    if seen.contains(m) {
+        return (found, seen)
+    }
+    let mut found = found
+    let mut seen = seen + [m]
+    for (f, t) in fields.get(m) ?? [] {
+        (found, seen) = walk(s, fields, path + "." + f, t, found, seen)
+    }
+    (found, seen)
+}
+
+fn walk(s: Subst, fields: Map[Str, List[(Str, Ty)]], path: Str, t: Ty, found: List[(Str, Str)], seen: List[Str]) -> (List[(Str, Str)], List[Str]) {
+    match s.repr(t) {
+        TCap(c) => (if found.any(|held| held.0 == c) { found } else { found + [(c, path)] }, seen),
+        TList(a) | TArray(a, _) => walk(s, fields, path, a, found, seen),
+        TMap(k, v) => {
+            let (f1, s1) = walk(s, fields, path, k, found, seen)
+            walk(s, fields, path, v, f1, s1)
+        },
+        TFn(ps, r) => {
+            let mut acc = (found, seen)
+            for p in ps + [r] {
+                acc = walk(s, fields, path, p, acc.0, acc.1)
+            }
+            acc
+        },
+        TNamed(m, args) => {
+            let mut acc = (found, seen)
+            for a in args {
+                acc = walk(s, fields, path, a, acc.0, acc.1)
+            }
+            enter(s, fields, m, path, acc.0, acc.1)
+        },
+        _ => (found, seen),
     }
 }
 

@@ -1675,7 +1675,7 @@ fn pure_closure(self: Lx, f: ast.Expr) -> (Bool, Lx) {
     match f.desc {
         EClosure(ps, body) if !free.has_escape(body) => {
             let mut lx = self
-            let s = no_subst()
+            let s = self.ro.subst
             for n in free.expr(ps.map(|p| p.name), body) {
                 let (found, next) = lx.lookup(n)
                 lx = next
@@ -2048,5 +2048,5 @@ pub fn lower_program(checked_prelude: List[ast.Item], user_items: List[ast.Item]
         Some(d) => !d.params.is_empty(),
         None => false,
     }
-    (ir.Program { fns: lx.out, main, main_takes_root: takes_root, main_ret, tests: test_names, benches: bench_names }, lx.ro)
+    (ir.Program { fns: lx.out, main, main_takes_root: takes_root, main_ret, tests: test_names, benches: bench_names, types: lx.ro.subst }, lx.ro)
 }

@@ -1,0 +1,13 @@
+pub struct Ctx {
+    out: Stdout,
+    disk: Disk,
+}
+
+pub enum Disk {
+    Real(Fs),
+    Fake,
+}
+
+pub fn run(c: Ctx) {
+    c.out.print("x")
+}

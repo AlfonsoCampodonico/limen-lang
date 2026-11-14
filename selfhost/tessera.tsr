@@ -301,7 +301,12 @@ fn caps_of(out: Stdout, err: Stderr, fs: Fs, setup: Setup, file: Str) -> Int {
     }
     let width = infos.fold(0, |w, i| w.max(i.name.len()))
     for i in infos {
-        let what = match (i.caps, i.callbacks) {
+        // a capability held through a struct or enum says where: `Net (via Client.net)`
+        let caps = i.caps.map(|c| match i.via.find(|v| v.0 == c) {
+            Some((_, p)) => "{c} (via {p})",
+            None => c,
+        })
+        let what = match (caps, i.callbacks) {
             ([], false) => "pure",
             ([], true) => "pure itself, runs callbacks",
             (cs, cb) => cs.join(", ") + if cb { " + callbacks" } else { "" },
