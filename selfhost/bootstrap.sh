@@ -12,14 +12,13 @@ cd "$(dirname "$0")/.."
 dune build ./bin/main.exe
 out=$(mktemp -d)
 trap 'rm -rf "$out"' EXIT
-export TESSERA_SRC="$PWD/src"
 # the self-hosted compiler and the only authority it gets: files, the
 # settings it reads, and the programs a build runs
 tsc() {
   bin=$1
   shift
   "$bin" --grant fs=/ \
-    --grant env=PWD --grant env=TESSERA_SRC --grant env=CC --grant env=PATH --grant env=HOME \
+    --grant env=PWD --grant env=CC --grant env=PATH --grant env=HOME \
     --grant env=TESSERA_CACHE --grant env=XDG_CACHE_HOME --grant env=DEVELOPER_DIR --grant env=TESSERA_OPENSSL \
     --grant env=LIBRARY_PATH --grant env=CPATH --grant env=C_INCLUDE_PATH --grant env=SDKROOT --grant env=MACOSX_DEPLOYMENT_TARGET \
     --grant "exec=${CC:-cc}" --grant exec=readlink --grant exec=cp --grant exec=touch --grant exec=pkg-config \

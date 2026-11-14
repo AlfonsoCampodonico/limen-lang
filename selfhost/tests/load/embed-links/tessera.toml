@@ -1,0 +1,3 @@
+# This edge case embeds files: its package is this directory.
+[package]
+name = "embed-links"

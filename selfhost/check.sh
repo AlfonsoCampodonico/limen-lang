@@ -30,7 +30,6 @@ checkdump=$PWD/_build/default/selfhost/checkdump/checkdump.exe
 irdump=$PWD/_build/default/selfhost/irdump/irdump.exe
 cdump=$PWD/_build/default/selfhost/cdump/cdump.exe
 tessera_abs=$PWD/$tessera
-src=$PWD/src
 book=${TESSERA_BOOK:-../tessera-book}/examples
 out=$(mktemp -d)
 trap 'rm -rf "$out"' EXIT
@@ -61,10 +60,9 @@ compare() {
 }
 
 # The loaders read more than the file's directory: the package around it,
-# its dependencies, the standard library. The Tessera one is granted the
-# directory that holds this repository and the book, finds the standard
-# library in this repository's src/std, and runs in DIR as the OCaml one
-# does.
+# its dependencies, the files it embeds. The Tessera one is granted the
+# directory that holds this repository and the book, and runs in DIR as the
+# OCaml one does; both have the standard library built in.
 grant=$(cd .. && pwd)
 if [ -d "$book" ]; then
   bookdir=$(cd "$book" && pwd)
@@ -76,12 +74,11 @@ fi
 inside() {
   if [ "$grant" = / ]; then echo "${1#/}"; else echo "${1#"$grant"/}"; fi
 }
-std=$(inside "$PWD/src/std")
 
 # compare_load DIR FILE: load DIR/FILE with both loaders
 compare_load() {
   (cd "$1" && "$loaddump" "$2") > "$out/want" 2>&1 || true
-  "$out/load" --grant "fs=$grant:ro" -- "$std" "$(inside "$(cd "$1" && pwd)")" "$2" > "$out/got" 2>&1 || true
+  "$out/load" --grant "fs=$grant:ro" -- "$(inside "$(cd "$1" && pwd)")" "$2" > "$out/got" 2>&1 || true
   same "$1/$2"
 }
 
@@ -89,7 +86,7 @@ compare_load() {
 # compare_load loads it
 compare_check() {
   (cd "$1" && "$checkdump" "$2") > "$out/want" 2>&1 || true
-  "$out/check" --grant "fs=$grant:ro" -- "$std" "$(inside "$(cd "$1" && pwd)")" "$2" > "$out/got" 2>&1 || true
+  "$out/check" --grant "fs=$grant:ro" -- "$(inside "$(cd "$1" && pwd)")" "$2" > "$out/got" 2>&1 || true
   same "$1/$2"
 }
 
@@ -97,17 +94,17 @@ compare_check() {
 # loads it
 compare_ir() {
   (cd "$1" && "$irdump" "$2") > "$out/want" 2>&1 || true
-  "$out/lowered" --grant "fs=$grant:ro" -- "$std" "$(inside "$(cd "$1" && pwd)")" "$2" > "$out/got" 2>&1 || true
+  "$out/lowered" --grant "fs=$grant:ro" -- "$(inside "$(cd "$1" && pwd)")" "$2" > "$out/got" 2>&1 || true
   same "$1/$2"
 }
 
 # tsc ARGS...: the Tessera compiler, in the current directory, granted
-# what it reads and writes (everything, for this test: the programs, the
-# compiler's sources and the scratch directory are far apart), the
-# programs a build runs and the variables it reads
+# what it reads and writes (everything, for this test: the programs and
+# the scratch directory are far apart), the programs a build runs and the
+# variables it reads
 tsc() {
-  env TESSERA_SRC="$src" "$out/tsc" --grant fs=/ \
-    --grant env=PWD --grant env=TESSERA_SRC --grant env=CC --grant env=PATH --grant env=HOME \
+  "$out/tsc" --grant fs=/ \
+    --grant env=PWD --grant env=CC --grant env=PATH --grant env=HOME \
     --grant env=TESSERA_CACHE --grant env=XDG_CACHE_HOME --grant env=DEVELOPER_DIR --grant env=TESSERA_OPENSSL \
     --grant env=LIBRARY_PATH --grant env=CPATH --grant env=C_INCLUDE_PATH --grant env=SDKROOT --grant env=MACOSX_DEPLOYMENT_TARGET \
     --grant "exec=${CC:-cc}" --grant exec=readlink --grant exec=cp --grant exec=touch --grant exec=pkg-config \

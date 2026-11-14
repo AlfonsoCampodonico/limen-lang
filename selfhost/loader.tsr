@@ -3,10 +3,10 @@
 // standard library), and everything becomes one flat program whose items
 // have qualified names (selfhost/rename.tsr), ready for the checker.
 //
-// The loader reads files only through the capabilities it is handed: an
-// Fs for the program and its dependencies, and one for the standard
-// library's sources. A file it cannot see through them does not exist for
-// it.
+// The loader reads files only through the Fs it is handed, for the
+// program and its dependencies; the standard library's sources come with
+// it, by name (selfhost/sources.tsr builds them into the compiler). A file
+// it cannot see through the Fs does not exist for it.
 use ast
 use diag
 use disk
@@ -67,9 +67,9 @@ struct Loading {
 }
 
 // Load the program whose main file is `path`, a path relative to
-// `place.cwd` inside what `fs` grants, or absolute. `std` reads the
-// standard library's sources (src/std).
-pub fn load(fs: Fs, std: Fs, place: disk.Place, path: Str) -> Program {
+// `place.cwd` inside what `fs` grants, or absolute. `std` holds the
+// standard library's sources (each file of src/std by name).
+pub fn load(fs: Fs, std: Map[Str, Str], place: disk.Place, path: Str) -> Program {
     let text = match fs.read(place.locate(path)) {
         Ok(text) => text,
         Err(e) => {
@@ -111,15 +111,12 @@ pub fn load(fs: Fs, std: Fs, place: disk.Place, path: Str) -> Program {
         },
         None => {},
     }
-    let std_names = match std.list("") {
-        Ok(names) => names.filter(|n| n.ends_with(".tsr")).map(|n| n.slice(0, n.len() - 4)),
-        Err(_) => [],
-    }
+    let std_names = std.keys().sort().filter(|n| n.ends_with(".tsr")).map(|n| n.slice(0, n.len() - 4))
     let deps = manifest.map(|m| m.deps.map(|d| (d.name, d.dir))) ?? []
     // what the standard library's modules may take, and which are trusted with C
-    let std_manifest = match std.read("tessera.toml") {
-        Ok(src) => package.parse(-1, "<std>/tessera.toml", src).map(|m| Some(m)) ?? None,
-        Err(_) => None,
+    let std_manifest = match std.get("tessera.toml") {
+        Some(src) => package.parse(-1, "<std>/tessera.toml", src).map(|m| Some(m)) ?? None,
+        None => None,
     }
     let trusted = std_manifest.map(|m| m.trust) ?? []
     let setup = Setup { place, deps, std_names, root }
@@ -224,7 +221,7 @@ enum Lookup {
 
 // Module `name`, used by the file at `from` (in directory `dir`; "" for
 // the standard library, whose modules are found only by name).
-fn find_module(fs: Fs, std: Fs, setup: Setup, from: Str, dir: Str, name: Str) -> Lookup {
+fn find_module(fs: Fs, std: Map[Str, Str], setup: Setup, from: Str, dir: Str, name: Str) -> Lookup {
     let place = setup.place
     let read = |p: Str, from_dep: Bool| match fs.read(place.locate(p)) {
         Ok(text) => Found(p, text, from_dep),
@@ -241,9 +238,9 @@ fn find_module(fs: Fs, std: Fs, setup: Setup, from: Str, dir: Str, name: Str) ->
             if !setup.std_names.contains(name) {
                 return NotFound
             }
-            match std.read(name + ".tsr") {
-                Ok(text) => Found("<std>/" + name + ".tsr", text, false),
-                Err(_) => Unreadable("<std>/" + name + ".tsr"),
+            match std.get(name + ".tsr") {
+                Some(text) => Found("<std>/" + name + ".tsr", text, false),
+                None => Unreadable("<std>/" + name + ".tsr"),
             }
         },
     }
@@ -259,7 +256,7 @@ fn same_file(fs: Fs, place: disk.Place, a: Str, b: Str) -> Bool {
 // Load every module `m` uses that is not loaded yet, and theirs, depth
 // first. A module that does not parse stops the load: the error comes back
 // alone, with the files read so far.
-fn visit(fs: Fs, std: Fs, setup: Setup, loading: Loading, m: rename.Module) -> Result[Loading, (List[diag.Source], diag.Diag)] {
+fn visit(fs: Fs, std: Map[Str, Str], setup: Setup, loading: Loading, m: rename.Module) -> Result[Loading, (List[diag.Source], diag.Diag)] {
     let dir = if rename.is_std(m) { "" } else { paths.dirname(m.path) }
     let mut l = loading
     for u in m.uses {

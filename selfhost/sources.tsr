@@ -1,0 +1,26 @@
+// The standard library's sources and the C runtime, read when the
+// compiler is built, as the OCaml compiler has them built in (src/dune
+// writes them into std_text.ml and runtime_text.ml). They are files of
+// src/, outside this package: selfhost/tessera.toml declares src/std and
+// src/runtime as embed roots, so the compiler binary carries them and
+// reads nothing of its own at run time.
+
+// Each file of src/std by name: the modules, methods.tsr (the built-in
+// methods written in Tessera) and tessera.toml (what each module may take).
+pub fn std() -> Map[Str, Str] {
+    let mut files: Map[Str, Str] = map()
+    for (name, text) in embed_dir("../src/std").entries() {
+        files[name] = text.to_str()
+    }
+    files
+}
+
+// The C every program starts with: the sandbox, then the runtime.
+pub fn runtime() -> Str {
+    embed("../src/runtime/tessera_sandbox.h") + embed("../src/runtime/tessera_rt.h")
+}
+
+// The TLS core, pasted in ahead of the runtime when a program may use TLS.
+pub fn tls() -> Str {
+    embed("../src/runtime/tessera_tls.h")
+}

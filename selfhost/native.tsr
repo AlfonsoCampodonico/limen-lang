@@ -29,8 +29,8 @@ use md5
 use paths
 
 // What a build reads of its surroundings: the variables above, read once,
-// and where the process runs. A capability cannot be kept in a struct, so
-// the Exec and the Fs are passed to each function that uses them.
+// and where the process runs. The functions that use only the Exec or only
+// the Fs take it as a parameter; those that need both are a Builder's.
 pub struct Setting {
     vars: Map[Str, Str],
     // where the process runs, inside the granted directory: the paths
@@ -168,18 +168,18 @@ fn stat(self: Setting, fs: Fs, files: List[Str]) -> Map[Str, FileInfo] {
 // and on macOS the clang behind the /usr/bin shim, in the developer
 // directory xcode-select chose. Updating either replaces a file, which
 // changes this.
-pub fn compiler_id(self: Setting, exec: Exec, fs: Fs) -> Str {
-    let name = self.cc()
-    let candidates = if name.contains("/") { [name] } else { self.var("PATH").split(":").filter(|d| d != "").map(|d| paths.concat(d, name)) }
-    let mut dev = self.var("DEVELOPER_DIR")
+fn compiler_id(self: Builder) -> Str {
+    let name = self.setting.cc()
+    let candidates = if name.contains("/") { [name] } else { self.setting.var("PATH").split(":").filter(|d| d != "").map(|d| paths.concat(d, name)) }
+    let mut dev = self.setting.var("DEVELOPER_DIR")
     if dev == "" {
-        dev = match exec.run("readlink", ["/var/db/xcode_select_link"]) {
+        dev = match self.exec.run("readlink", ["/var/db/xcode_select_link"]) {
             Ok(r) if r.code == 0 => r.stdout.trim(),
             _ => "",
         }
     }
     let behind = if dev == "" { [] } else { ["usr/bin/clang", "Toolchains/XcodeDefault.xctoolchain/usr/bin/clang"].map(|rel| paths.concat(dev, rel)) }
-    let known = self.stat(fs, candidates + behind)
+    let known = self.setting.stat(self.fs, candidates + behind)
     let shown = |p: Str| match known.get(p) {
         Some(i) => "{p}:{i.size}:{i.modified_ms}",
         None => p + ":?",
@@ -196,22 +196,22 @@ pub fn compiler_id(self: Setting, exec: Exec, fs: Fs) -> Str {
     ([first] + behind.filter(|p| known.contains(p)).map(shown)).join("|")
 }
 
-pub fn cache_key(self: Setting, exec: Exec, fs: Fs, c_text: Str, argv: List[Str]) -> Str {
-    let env = ["LIBRARY_PATH", "CPATH", "C_INCLUDE_PATH", "SDKROOT", "MACOSX_DEPLOYMENT_TARGET", "DEVELOPER_DIR"].map(|v| v + "=" + self.var(v))
-    md5.hex(([c_text, self.compiler_id(exec, fs)] + env + argv).join("\0"))
+fn cache_key(self: Builder, c_text: Str, argv: List[Str]) -> Str {
+    let env = ["LIBRARY_PATH", "CPATH", "C_INCLUDE_PATH", "SDKROOT", "MACOSX_DEPLOYMENT_TARGET", "DEVELOPER_DIR"].map(|v| v + "=" + self.setting.var(v))
+    md5.hex(([c_text, self.compiler_id()] + env + argv).join("\0"))
 }
 
 // Copy binary `from` to `to`, executable, replacing `to` in one step: cp
 // gives the copy the mode of an executable source, and the Fs renames it
 // into place. The temporary name is told apart by a digest of where the
 // copy goes, so two builds writing the same entry do not share it.
-fn copy(self: Setting, exec: Exec, fs: Fs, from: Str, to: Str, tag: Str) -> Bool {
+fn copy(self: Builder, from: Str, to: Str, tag: Str) -> Bool {
     let tmp = to + ".tmp" + md5.hex(tag).slice(0, 8)
-    let copied = match exec.run("cp", [from, tmp]) {
+    let copied = match self.exec.run("cp", [from, tmp]) {
         Ok(p) => p.code == 0,
         Err(_) => false,
     }
-    copied && fs.rename(self.in_fs(tmp), self.in_fs(to)).is_ok()
+    copied && self.fs.rename(self.setting.in_fs(tmp), self.setting.in_fs(to)).is_ok()
 }
 
 // Make directory `dir` (a path in the Fs) and those above it.
@@ -262,40 +262,49 @@ fn run_cc(self: Setting, exec: Exec, argv: List[Str]) -> Result[(), Str] {
     }
 }
 
+// A build, with what it needs both the Exec and the Fs for: the C
+// compiler's identity for the cache key, and the cache itself.
+pub struct Builder {
+    setting: Setting,
+    exec: Exec,
+    fs: Fs,
+}
+
 // Compile `c_text` to `exe` (a path as the user gave it), through the
 // cache. Err holds the compiler's output.
-pub fn compile_c(self: Setting, exec: Exec, fs: Fs, c_text: Str, tls_text: Str, libs: List[Str], exe: Str) -> Result[(), Str] {
+fn compile_c(self: Builder, c_text: Str, tls_text: Str, libs: List[Str], exe: Str) -> Result[(), Str] {
+    let (n, exec, fs) = (self.setting, self.exec, self.fs)
     let c_file = exe + ".c"
-    let (text, cflags, tls_libs) = self.prepare(exec, c_text, tls_text)
-    match fs.write(self.in_fs(c_file), text) {
+    let (text, cflags, tls_libs) = n.prepare(exec, c_text, tls_text)
+    match fs.write(n.in_fs(c_file), text) {
         Ok(_) => {},
         Err(e) => {
             return Err("tessera: cannot write {c_file}: {e}\n")
         },
     }
     let all_libs = tls_libs + link_flags(libs)
-    let argv = self.command(cflags, all_libs, c_file, exe)
-    let dir = match self.cache_dir(fs) {
+    let argv = n.command(cflags, all_libs, c_file, exe)
+    let dir = match n.cache_dir(fs) {
         // only a cache the Fs reaches: outside it, every build compiles
-        Some(d) if !paths.is_relative(self.in_fs(d)) => {
-            return self.run_cc(exec, argv)
+        Some(d) if !paths.is_relative(n.in_fs(d)) => {
+            return n.run_cc(exec, argv)
         },
         Some(d) => d,
         None => {
-            return self.run_cc(exec, argv)
+            return n.run_cc(exec, argv)
         },
     }
     // the key leaves out where this build's files go
-    let shape = self.command(cflags, all_libs, "prog.c", "prog")
-    let cached = paths.concat(dir, self.cache_key(exec, fs, text, shape))
-    let target = self.place.absolute(self.in_fs(exe))
-    if fs.exists(self.in_fs(cached)) && self.copy(exec, fs, cached, exe, target) {
+    let shape = n.command(cflags, all_libs, "prog.c", "prog")
+    let cached = paths.concat(dir, self.cache_key(text, shape))
+    let target = n.place.absolute(n.in_fs(exe))
+    if fs.exists(n.in_fs(cached)) && self.copy(cached, exe, target) {
         let _ = exec.run("touch", [cached])
         return Ok(())
     }
-    self.run_cc(exec, argv)?
-    if self.make_dirs(fs, self.in_fs(dir)) && self.copy(exec, fs, exe, cached, target) {
-        self.prune(fs, dir)
+    n.run_cc(exec, argv)?
+    if n.make_dirs(fs, n.in_fs(dir)) && self.copy(exe, cached, target) {
+        n.prune(fs, dir)
     }
     Ok(())
 }
@@ -303,8 +312,8 @@ pub fn compile_c(self: Setting, exec: Exec, fs: Fs, c_text: Str, tls_text: Str, 
 // Compile the program's C to `exe`; `libs` are the foreign libraries it
 // links (ffi.libs). A failure most likely means a missing library: then
 // say which ones the program links.
-pub fn build(self: Setting, exec: Exec, fs: Fs, c_text: Str, tls_text: Str, libs: List[Str], exe: Str) -> Result[(), Str] {
-    match self.compile_c(exec, fs, c_text, tls_text, libs, exe) {
+pub fn build(self: Builder, c_text: Str, tls_text: Str, libs: List[Str], exe: Str) -> Result[(), Str] {
+    match self.compile_c(c_text, tls_text, libs, exe) {
         Ok(_) => Ok(()),
         Err(m) if libs.is_empty() => Err(m),
         Err(m) => Err(m + "tessera: the program links foreign libraries ({libs.join(", ")}); check that they are installed where the C compiler finds them\n"),

@@ -15,7 +15,7 @@
 //
 // It reads through the one Fs it is granted, as selfhost/load.tsr does:
 //
-//   tessera run selfhost/check.tsr --grant fs=..:ro -- tessera/src/std tessera/examples hello.tsr
+//   tessera run selfhost/check.tsr --grant fs=..:ro -- tessera/examples hello.tsr
 use ast
 use ast_print
 use caps
@@ -23,14 +23,15 @@ use diag
 use disk
 use env
 use loader
+use sources
 use typecheck
 use walk
 
 fn main(root: Root) -> Int {
     let out = root.stdout
     let args = root.args()
-    if args.len() != 3 {
-        out.print("usage: check STD CWD FILE")
+    if args.len() != 2 {
+        out.print("usage: check CWD FILE")
         return 2
     }
     let fs = root.fs
@@ -41,9 +42,9 @@ fn main(root: Root) -> Int {
             return 1
         },
     }
-    let std = fs.under(args[0])
-    let place = disk.Place { cwd: args[1], root: base }
-    let p = loader.load(fs, std, place, args[2])
+    let std = sources.std()
+    let place = disk.Place { cwd: args[0], root: base }
+    let p = loader.load(fs, std, place, args[1])
     for d in p.diags {
         out.print("ERROR {d.code} {diag.path_of(p.files, d.span.file)} {d.span.lo} {d.span.hi}")
         out.print(d.message)
@@ -54,13 +55,7 @@ fn main(root: Root) -> Int {
     if !p.diags.is_empty() {
         return 0
     }
-    let methods = match std.read("methods.tsr") {
-        Ok(text) => text,
-        Err(e) => {
-            out.print("cannot read the built-in methods: {e}")
-            return 1
-        },
-    }
+    let methods = std.get("methods.tsr") ?? ""
     let c = typecheck.check_program(p.items, p.files, p.next_id, methods, p.forwarders)
     let st = c.state
     let files = st_files(p.files) + [diag.Source { path: "<std>/tessera.toml", text: "" }]

@@ -4,24 +4,25 @@
 // `spans`; or the
 // problems, each as ERROR CODE FILE LO HI, its message and its notes.
 //
-// It reads through the one Fs it is granted: the standard library's
-// sources at STD, and the program at FILE, a path relative to CWD; both
-// are paths inside the granted directory.
+// It reads the program through the one Fs it is granted: FILE, a path
+// relative to CWD, a path inside the granted directory. The standard
+// library's sources are built in (selfhost/sources.tsr).
 //
-//   tessera run selfhost/load.tsr --grant fs=..:ro -- tessera/src/std tessera/examples hello.tsr
+//   tessera run selfhost/load.tsr --grant fs=..:ro -- tessera/examples hello.tsr
 use ast
 use ast_print
 use diag
 use disk
 use loader
 use rename
+use sources
 use walk
 
 fn main(root: Root) -> Int {
     let out = root.stdout
     let args = root.args()
-    if args.len() != 3 {
-        out.print("usage: load STD CWD FILE")
+    if args.len() != 2 {
+        out.print("usage: load CWD FILE")
         return 2
     }
     let fs = root.fs
@@ -32,8 +33,8 @@ fn main(root: Root) -> Int {
             return 1
         },
     }
-    let place = disk.Place { cwd: args[1], root: base }
-    let p = loader.load(fs, fs.under(args[0]), place, args[2])
+    let place = disk.Place { cwd: args[0], root: base }
+    let p = loader.load(fs, sources.std(), place, args[1])
     let paths = p.files.map(|f| f.path)
     for d in p.diags {
         out.print("ERROR {d.code} {diag.path_of(p.files, d.span.file)} {d.span.lo} {d.span.hi}")

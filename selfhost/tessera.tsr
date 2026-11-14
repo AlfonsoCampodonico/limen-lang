@@ -5,18 +5,17 @@
 // C, as selfhost/cdump does for the OCaml compiler.
 //
 //   tessera build selfhost/tessera.tsr -o tsc
-//   ./tsc --grant fs=$HOME --grant exec=cc ... --grant env=PWD --grant env=TESSERA_SRC -- build hello.tsr
+//   ./tsc --grant fs=$HOME --grant exec=cc ... --grant env=PWD -- build hello.tsr
 //
 // It reaches everything through its grants. The Fs must hold the program
-// and its packages, the compiler's own sources (TESSERA_SRC, the
-// repository's src/ directory: the standard library in src/std and the C
-// runtime in src/runtime, which the OCaml compiler has built in), where
-// the binary goes, and the build cache if it is to be used. The working
-// directory is PWD, which must be inside the Fs. A build runs the C
-// compiler and a few small programs through the Exec (selfhost/native.tsr
-// lists them) and reads the variables native.tsr names through the Env.
-// What the OCaml compiler writes to stderr (diagnostics, the usage) it
-// writes to stderr too.
+// and its packages, where the binary goes, and the build cache if it is
+// to be used. The standard library and the C runtime are built into it,
+// as they are into the OCaml compiler (selfhost/sources.tsr), so it reads
+// nothing of its own. The working directory is PWD, which must be inside
+// the Fs. A build runs the C compiler and a few small programs through the
+// Exec (selfhost/native.tsr lists them) and reads the variables native.tsr
+// names through the Env. What the OCaml compiler writes to stderr
+// (diagnostics, the usage) it writes to stderr too.
 use ast
 use caps
 use cgen
@@ -27,9 +26,9 @@ use loader
 use lower
 use native
 use own
-use paths
 use prelude
 use pure
+use sources
 use typecheck
 
 fn usage() -> Str {
@@ -62,11 +61,13 @@ fn die_usage(err: Stderr, msg: Str) -> Int {
     2
 }
 
-// Where the compiler runs and what it reads its own sources from.
-struct Setup {
+// What the commands work with: where they write, the files, and where in
+// them the compiler runs.
+struct Ctx {
+    out: Stdout,
+    err: Stderr,
+    fs: Fs,
     place: disk.Place,
-    // the compiler's src/ directory, as a path in the Fs
-    src: Str,
 }
 
 // The program after the loader, the checker and the capability checks.
@@ -81,19 +82,19 @@ struct Front {
 }
 
 fn main(root: Root) -> Int {
-    let out = root.stdout
     let err = root.stderr
     let args = root.args()
-    let setup = match where_am_i(root.fs, root.env) {
-        Ok(s) => s,
+    let place = match where_am_i(root.fs, root.env) {
+        Ok(p) => p,
         Err(m) => {
             err.print("tessera: " + m)
             return 2
         },
     }
+    let cx = Ctx { out: root.stdout, err, fs: root.fs, place }
     match args {
-        ["check", file] => check(out, err, root.fs, setup, file),
-        ["caps", file] => caps_of(out, err, root.fs, setup, file),
+        ["check", file] => check(cx, file),
+        ["caps", file] => caps_of(cx, file),
         ["check", _, "--json"] | ["check", "--json", _] | ["caps", _, "--json"] | ["caps", "--json", _] => {
             err.print("tessera: --json is not in this compiler yet")
             2
@@ -123,21 +124,20 @@ fn main(root: Root) -> Int {
                 i = i + 1
             }
             match file {
-                Some(f) => build(out, err, root.fs, root.exec, root.env, setup, f, target, emit_c, tests),
+                Some(f) => build(cx, root.exec, root.env, f, target, emit_c, tests),
                 None => die_usage(err, "build needs a FILE"),
             }
         },
         [] | ["-h"] | ["--help"] | ["help"] => {
-            out.write(usage())
+            cx.out.write(usage())
             0
         },
         _ => die_usage(err, ""),
     }
 }
 
-// The working directory inside the Fs (from PWD), and the compiler's
-// sources (TESSERA_SRC, absolute or relative to the working directory).
-fn where_am_i(fs: Fs, env: Env) -> Result[Setup, Str] {
+// The working directory inside the Fs (from PWD).
+fn where_am_i(fs: Fs, env: Env) -> Result[disk.Place, Str] {
     let base = match fs.full_path("") {
         Ok(p) => p,
         Err(e) => {
@@ -154,51 +154,33 @@ fn where_am_i(fs: Fs, env: Env) -> Result[Setup, Str] {
     } else {
         return Err("the working directory {pwd} is outside the granted directory {base}")
     }
-    let place = disk.Place { cwd, root: base }
-    let src = match env.get("TESSERA_SRC") {
-        Some(s) => place.locate(s),
-        None => {
-            return Err("set TESSERA_SRC to the compiler's src directory (with std/ and runtime/), and grant env=TESSERA_SRC")
-        },
-    }
-    Ok(Setup { place, src })
-}
-
-fn read(fs: Fs, path: Str) -> Result[Str, Str] {
-    fs.read(path).map_error(|e| "cannot read {path}: {e}")
+    Ok(disk.Place { cwd, root: base })
 }
 
 // Load and check `file` as the OCaml compiler's Modules.load_and_check
 // does, with the capability checks.
-fn front(fs: Fs, setup: Setup, file: Str) -> Result[Front, Str] {
-    let std = fs.under(paths.concat(setup.src, "std"))
-    let methods = read(std, "methods.tsr")?
-    let std_toml = read(std, "tessera.toml")?
-    let p = loader.load(fs, std, setup.place, file)
+fn front(fs: Fs, place: disk.Place, file: Str) -> Front {
+    let std = sources.std()
+    let methods = std.get("methods.tsr") ?? ""
+    let p = loader.load(fs, std, place, file)
     if !p.diags.is_empty() {
-        return Ok(Front { loaded: p, checked: None, files: p.files, errors: p.diags.filter(|d| !d.warning), warnings: p.diags.filter(|d| d.warning) })
+        return Front { loaded: p, checked: None, files: p.files, errors: p.diags.filter(|d| !d.warning), warnings: p.diags.filter(|d| d.warning) }
     }
     let c = typecheck.check_program(p.items, p.files, p.next_id, methods, p.forwarders)
-    let files = p.files + [diag.Source { path: prelude.file_name(), text: prelude.text() }, diag.Source { path: prelude.methods_name(), text: methods }, diag.Source { path: "<std>/tessera.toml", text: std_toml }]
-    let diags = caps.check(fs, setup.place, files, files.len() - 1, p.std_manifest, p.std_modules, p.manifest, p.packages, p.items, c)
-    Ok(Front { loaded: p, checked: Some(c), files, errors: diags.filter(|d| !d.warning), warnings: diags.filter(|d| d.warning) })
+    let files = p.files + [diag.Source { path: prelude.file_name(), text: prelude.text() }, diag.Source { path: prelude.methods_name(), text: methods }, diag.Source { path: "<std>/tessera.toml", text: std.get("tessera.toml") ?? "" }]
+    let diags = caps.check(fs, place, files, files.len() - 1, p.std_manifest, p.std_modules, p.manifest, p.packages, p.items, c)
+    Front { loaded: p, checked: Some(c), files, errors: diags.filter(|d| !d.warning), warnings: diags.filter(|d| d.warning) }
 }
 
 // Load `file`, saying what is wrong with it: the warnings, then (when
 // there are errors) the errors and their count, as bin/main.ml's `load`
 // and `report` print them. None when it cannot go on, with the exit code.
-fn load(err: Stderr, fs: Fs, setup: Setup, file: Str) -> Result[Front, Int] {
-    if !fs.exists(setup.place.locate(file)) {
+fn load(err: Stderr, fs: Fs, place: disk.Place, file: Str) -> Result[Front, Int] {
+    if !fs.exists(place.locate(file)) {
         err.print("tessera: {file}: No such file or directory")
         return Err(2)
     }
-    let f = match front(fs, setup, file) {
-        Ok(f) => f,
-        Err(m) => {
-            err.print("tessera: " + m)
-            return Err(2)
-        },
-    }
+    let f = front(fs, place, file)
     for d in f.warnings {
         err.write(d.render(f.files) + "\n")
     }
@@ -225,20 +207,20 @@ fn report(err: Stderr, f: Front) {
     err.print(count(f.errors.len(), "error") + if w > 0 { ", " + count(w, "warning") } else { "" })
 }
 
-fn check(out: Stdout, err: Stderr, fs: Fs, setup: Setup, file: Str) -> Int {
-    let f = match load(err, fs, setup, file) {
+fn check(cx: Ctx, file: Str) -> Int {
+    let f = match load(cx.err, cx.fs, cx.place, file) {
         Ok(f) => f,
         Err(code) => {
             return code
         },
     }
     if !f.errors.is_empty() {
-        report(err, f)
+        report(cx.err, f)
         return 1
     }
-    out.print("ok")
+    cx.out.print("ok")
     for l in c_callers(f.loaded.items, f.loaded.packages) {
-        out.print(l)
+        cx.out.print(l)
     }
     0
 }
@@ -284,15 +266,16 @@ fn c_callers(items: List[ast.Item], packages: List[(Str, Str)]) -> List[Str] {
     })
 }
 
-fn caps_of(out: Stdout, err: Stderr, fs: Fs, setup: Setup, file: Str) -> Int {
-    let f = match load(err, fs, setup, file) {
+fn caps_of(cx: Ctx, file: Str) -> Int {
+    let out = cx.out
+    let f = match load(cx.err, cx.fs, cx.place, file) {
         Ok(f) => f,
         Err(code) => {
             return code
         },
     }
     if !f.errors.is_empty() {
-        report(err, f)
+        report(cx.err, f)
         return 1
     }
     let infos = match f.checked {
@@ -340,8 +323,9 @@ fn default_output(file: Str) -> Str {
     }
 }
 
-fn build(out: Stdout, err: Stderr, fs: Fs, exec: Exec, env: Env, setup: Setup, file: Str, target: Option[Str], emit_c: Bool, tests: Bool) -> Int {
-    let f = match load(err, fs, setup, file) {
+fn build(cx: Ctx, exec: Exec, env: Env, file: Str, target: Option[Str], emit_c: Bool, tests: Bool) -> Int {
+    let (out, err, fs) = (cx.out, cx.err, cx.fs)
+    let f = match load(err, fs, cx.place, file) {
         Ok(f) => f,
         Err(code) => {
             return code
@@ -354,7 +338,7 @@ fn build(out: Stdout, err: Stderr, fs: Fs, exec: Exec, env: Env, setup: Setup, f
     // a build records the C libraries of trusted dependencies in
     // tessera.lock; `check` and `caps` only read it
     match f.loaded.manifest {
-        Some(m) => caps.record(fs, setup.place, m, f.loaded.items, f.loaded.packages),
+        Some(m) => caps.record(fs, cx.place, m, f.loaded.items, f.loaded.packages),
         None => {},
     }
     let has = |p: fn(ast.FnDecl) -> Bool| f.loaded.items.any(|i| match i {
@@ -376,18 +360,9 @@ fn build(out: Stdout, err: Stderr, fs: Fs, exec: Exec, env: Env, setup: Setup, f
         },
     }
     let exe = target ?? default_output(file)
-    let runtime_dir = paths.concat(setup.src, "runtime")
-    let headers = read(fs, paths.concat(runtime_dir, "tessera_sandbox.h")).flat_map(|a| read(fs, paths.concat(runtime_dir, "tessera_rt.h")).map(|b| a + b))
-    let runtime = match headers {
-        Ok(text) => text,
-        Err(m) => {
-            err.print("tessera: " + m)
-            return 2
-        },
-    }
-    let c_text = c_source(c, f.files, runtime, tests)
+    let c_text = c_source(c, f.files, sources.runtime(), tests)
     if emit_c {
-        return match fs.write(setup.place.locate(exe + ".c"), c_text) {
+        return match fs.write(cx.place.locate(exe + ".c"), c_text) {
             Ok(_) => 0,
             Err(e) => {
                 err.print("tessera: cannot write {exe}.c: {e}")
@@ -395,9 +370,9 @@ fn build(out: Stdout, err: Stderr, fs: Fs, exec: Exec, env: Env, setup: Setup, f
             },
         }
     }
-    let tls_text = read(fs, paths.concat(runtime_dir, "tessera_tls.h")) ?? ""
-    let n = native.setting(env, setup.place)
-    match n.build(exec, fs, c_text, tls_text, ffi.libs(c.items), exe) {
+    let n = native.setting(env, cx.place)
+    let builder = native.Builder { setting: n, exec, fs }
+    match builder.build(c_text, sources.tls(), ffi.libs(c.items), exe) {
         Ok(_) => {
             n.remove_c(fs, exe)
             0

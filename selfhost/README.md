@@ -4,7 +4,7 @@ The Tessera compiler, written in Tessera. Tessera is self-hosting: the
 OCaml compiler in `src/` builds this one (stage 1), stage 1 builds itself
 (stage 2), stage 2 builds itself again (stage 3), and stages 2 and 3 emit
 the same C, which is also exactly what the OCaml compiler emits for it
-(about 376,000 lines). `sh selfhost/bootstrap.sh` runs all three stages and
+(about 382,000 lines, the embedded standard library and runtime included). `sh selfhost/bootstrap.sh` runs all three stages and
 checks that; it takes about three minutes, nearly all of it the C compiler.
 The OCaml compiler stays as the way to build from scratch, and as the
 reference: `sh selfhost/check.sh` requires both compilers to agree on every
@@ -15,7 +15,10 @@ program, step by step.
 CLI. It holds only the authority it is granted: files, a fixed list of
 environment variables, and the programs a build runs (the C compiler and a
 few file tools); `tessera caps selfhost/tessera.tsr` shows that checking,
-lowering and C generation are pure. The interpreter, formatter, language
+lowering and C generation are pure. Like the OCaml compiler, it has the
+standard library and the C runtime built in: `selfhost/tessera.toml`
+declares `src/std` and `src/runtime` embed roots, and `sources.tsr` embeds
+them, so the binary reads nothing of its own when it runs. The interpreter, formatter, language
 server, `doc` and MCP server are still OCaml only.
 
 What each file does, in pipeline order:
@@ -39,9 +42,10 @@ What each file does, in pipeline order:
   `package.tsr` reading tessera.toml, and makes one program of them.
   `rename.tsr` gives every item its qualified name and rewrites the
   references, expands type aliases, pipes, tuple unpacking and tuple
-  assignment; `embeds.tsr` reads the files `embed` names (the loader reads
-  only through the Fs capabilities it is handed: one for the program, one
-  for the standard library's sources); `forwarders.tsr` adds the methods
+  assignment; `embeds.tsr` reads the files `embed` names, in the package
+  or under the embed roots its tessera.toml declares (the loader reads
+  only through the Fs it is handed, for the program; the standard
+  library's sources come built in, from `sources.tsr`); `forwarders.tsr` adds the methods
   struct embedding promotes. The diagnostics are the OCaml loader's, in
   the same order.
 - The type checker is `src/check.ml` and `src/types.ml`. `types.tsr` has
@@ -105,13 +109,17 @@ What each file does, in pipeline order:
   into place (`Fs.rename`); what it cannot do (read the link xcode-select
   keeps, copy a binary keeping it executable, touch a cache entry) it
   asks `readlink`, `cp` and `touch` to do through the Exec; OpenSSL is
-  found through `TESSERA_OPENSSL` or `pkg-config`.
+  found through `TESSERA_OPENSSL` or `pkg-config`. A `Builder` holds the
+  Exec and the Fs for the steps that need both (the cache key, the cache);
+  the others take only the one they use.
+- `sources.tsr` is the standard library's sources and the C runtime,
+  embedded from `src/std` and `src/runtime` when the compiler is built, as
+  `src/dune` builds them into the OCaml compiler.
 - `tessera.tsr` is the compiler: `check FILE`, `caps FILE` and `build FILE
   [-o OUT] [--emit-c]` as `bin/main.ml` has them, plus `build --tests` for
   the test binary of `tessera test --native` (`cdump/` writes the OCaml
-  compiler's C of it). It reads the standard library and the C runtime
-  from `TESSERA_SRC` (the repository's `src/`), which the OCaml compiler
-  has built in: a program can embed only files of its own package. What
+  compiler's C of it). The standard library and the C runtime are built
+  into it (`sources.tsr`), as into the OCaml compiler. What
   the OCaml compiler writes to stderr (the diagnostics and their count,
   the usage) it writes to stderr too, and a build records the C libraries
   of trusted dependencies in tessera.lock as the OCaml one does (`check`
@@ -119,24 +127,25 @@ What each file does, in pipeline order:
 
 ```sh
 dune build && _build/default/bin/main.exe build selfhost/tessera.tsr -o tsc
-TESSERA_SRC=$PWD/src ./tsc --grant fs=/ \
-  --grant env=PWD --grant env=TESSERA_SRC --grant env=CC --grant env=PATH --grant env=HOME \
+./tsc --grant fs=/ \
+  --grant env=PWD --grant env=CC --grant env=PATH --grant env=HOME \
   --grant env=TESSERA_CACHE --grant env=XDG_CACHE_HOME --grant env=DEVELOPER_DIR --grant env=TESSERA_OPENSSL \
   --grant env=LIBRARY_PATH --grant env=CPATH --grant env=C_INCLUDE_PATH --grant env=SDKROOT --grant env=MACOSX_DEPLOYMENT_TARGET \
   --grant exec=cc --grant exec=readlink --grant exec=cp --grant exec=touch --grant exec=pkg-config \
   -- build examples/hello.tsr -o hello
 ```
 
-  The Fs must hold the program, `TESSERA_SRC`, the output and (to use
-  it) the build cache, and the C compiler for the cache key to match the
-  OCaml compiler's; `fs=/` is the simple choice.
+  The Fs must hold the program, the output and (to use it) the build
+  cache, and the C compiler for the cache key to match the OCaml
+  compiler's; `fs=/` is the simple choice.
 - `tokens.tsr` prints a file's tokens one per line; `tokdump/` prints the
   OCaml lexer's in the same format.
 - `parse.tsr` prints a file's tree (with `ast_print.tsr`): the compiler's
   position-free format from `src/astdump.ml`, then every span in the tree,
   or the error. `astdump/` prints the OCaml parser's in the same format.
 - `load.tsr` prints the loaded program (its items in the same format, then
-  the C declarations, the embedded files and every span with its file), or
+  the C declarations, the embed roots, the embedded files and every span
+  with its file), or
   the loader's diagnostics in order. `loaddump/` prints the OCaml loader's.
 - `check.tsr` prints what the checker makes of a program: its problems as
   `tessera check` reports them (with notes and fixes, the capability
@@ -166,7 +175,10 @@ TESSERA_SRC=$PWD/src ./tsc --grant fs=/ \
   on stderr (compared apart from the output) and the exit status where
   there is no C; and a set of the book's programs (concurrency,
   HTTP, TLS, JSON, SQL, C calls, embedded files, tests, ...) built by
-  both compilers and run:
+  both compilers and run. The edge cases are programs of their own:
+  `tests/tessera.toml` keeps them out of the compiler's package (and its
+  embed roots), and the ones that embed files have a tessera.toml in
+  their own directory, so their package is that directory:
 
 ```sh
 sh selfhost/check.sh
