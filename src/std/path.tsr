@@ -1,0 +1,187 @@
+// Paths with `/` between their parts, as macOS and Linux write them, and
+// `Fs` takes them. Everything here works on the text alone, without
+// looking at any file, except `walk`, which lists a directory tree through
+// an `Fs`.
+
+// `a` and `b` joined with one `/` and cleaned: `join("a/", "../b")` is
+// `"b"`. A `b` starting with `/` is still joined under `a`
+// (`join("data", "/x")` is `"data/x"`); empty parts are left out.
+pub fn join(a: Str, b: Str) -> Str {
+    join_all([a, b])
+}
+
+// Every part joined, as `join` does: `join_all(["a", "b", "c.txt"])`.
+pub fn join_all(parts: List[Str]) -> Str {
+    let nonempty = parts.filter(|p| p != "")
+    if nonempty.is_empty() {
+        return ""
+    }
+    clean(nonempty.join("/"))
+}
+
+// The shortest path naming the same file, by the text alone: repeated `/`
+// become one, `.` parts go, a `..` takes away the part before it, and a
+// trailing `/` goes. A `..` at the start of a relative path stays, and one
+// right after the root goes (`/..` is `/`). An empty path is `"."`.
+// `clean("a//b/./../c/")` is `"a/c"`.
+pub fn clean(p: Str) -> Str {
+    if p == "" {
+        return "."
+    }
+    let rooted = p.starts_with("/")
+    let mut out: List[Str] = []
+    for part in p.split("/") {
+        if part == "" || part == "." {
+            // nothing
+        } else if part == ".." {
+            if !out.is_empty() && out[out.len() - 1] != ".." {
+                out = out.take(out.len() - 1)
+            } else if !rooted {
+                out.push("..")
+            }
+        } else {
+            out.push(part)
+        }
+    }
+    let body = out.join("/")
+    if rooted {
+        "/" + body
+    } else if body == "" {
+        "."
+    } else {
+        body
+    }
+}
+
+// The parts of the cleaned path: `parts("/a/b/")` is `["a", "b"]`, and
+// `parts(".")` is `[]`.
+pub fn parts(p: Str) -> List[Str] {
+    clean(p).split("/").filter(|s| s != "" && s != ".")
+}
+
+// Whether `p` starts at the root: `/etc` is absolute, `etc` is not.
+pub fn is_absolute(p: Str) -> Bool {
+    p.starts_with("/")
+}
+
+// Everything before the last `/`, cleaned: `dir("a/b/c.txt")` is
+// `"a/b"`, `dir("c.txt")` is `"."`, `dir("/c")` is `"/"`, and
+// `dir("a/b/")` is `"a/b"`.
+pub fn dir(p: Str) -> Str {
+    match p.last_index_of("/") {
+        Some(k) => clean(p.slice(0, k + 1)),
+        None => ".",
+    }
+}
+
+// The last part, without trailing `/`s: `base("a/b/c.txt")` is `"c.txt"`,
+// `base("a/b/")` is `"b"`, `base("/")` is `"/"` and `base("")` is `"."`.
+pub fn base(p: Str) -> Str {
+    if p == "" {
+        return "."
+    }
+    let t = trim_end(p)
+    if t == "/" {
+        return "/"
+    }
+    match t.last_index_of("/") {
+        Some(k) => t.slice(k + 1, t.len()),
+        None => t,
+    }
+}
+
+// `p` without trailing slashes (but `/` stays as it is).
+fn trim_end(p: Str) -> Str {
+    let mut t = p
+    while t.len() > 1 && t.ends_with("/") {
+        t = t.slice(0, t.len() - 1)
+    }
+    t
+}
+
+// The extension of the last part, with its dot: `ext("a/b.tar.gz")` is
+// `".gz"`. A name with no dot, or whose only dot starts it (`.bashrc`), has
+// none: `""`.
+pub fn ext(p: Str) -> Str {
+    let b = base(p)
+    match b.last_index_of(".") {
+        Some(k) if k > 0 && b != ".." => b.slice(k, b.len()),
+        _ => "",
+    }
+}
+
+// The last part without its extension: `stem("a/b.tar.gz")` is `"b.tar"`.
+pub fn stem(p: Str) -> Str {
+    let b = base(p)
+    b.slice(0, b.len() - ext(b).len())
+}
+
+// `p` with its extension replaced by `e` (with its dot, or `""` to drop
+// it): `with_ext("notes.md", ".html")` is `"notes.html"`.
+pub fn with_ext(p: Str, e: Str) -> Str {
+    let t = trim_end(p)
+    t.slice(0, t.len() - ext(t).len()) + e
+}
+
+// The path that leads from the directory `from` to `to`, by the text
+// alone: `relative("a/b", "a/c/d")` is `Ok("../c/d")`. Both must be
+// absolute or both relative, and `from` cannot climb out through more
+// `..`s than `to` does, since the names it would climb past are unknown.
+pub fn relative(from: Str, to: Str) -> Result[Str, Str] {
+    if is_absolute(from) != is_absolute(to) {
+        return Err("path: cannot make `{to}` relative to `{from}`: one is absolute and the other is not")
+    }
+    let f = parts(from)
+    let t = parts(to)
+    let mut i = 0
+    while i < f.len() && i < t.len() && f[i] == t[i] {
+        i = i + 1
+    }
+    if f.skip(i).contains("..") {
+        return Err("path: cannot make `{to}` relative to `{from}`: it would climb out of a directory whose name is unknown")
+    }
+    let up = f.skip(i).map(|_| "..")
+    let rel = up + t.skip(i)
+    Ok(if rel.is_empty() { "." } else { rel.join("/") })
+}
+
+// ---------- walking a tree ----------
+
+// One entry of a directory tree: its path from the directory walked (as
+// `Fs` takes it, the directory included) and whether it is a directory.
+pub struct Entry {
+    path: Str,
+    is_dir: Bool,
+}
+
+// Every file and directory under `dir` (`""` for the whole of `fs`),
+// depth first, each directory before what it holds, names in sorted
+// order; `dir` itself is not listed. Links are followed, but each
+// directory is entered once, so a link back up the tree is listed and not
+// entered again.
+pub fn walk(fs: Fs, dir: Str) -> Result[List[Entry], IoError] {
+    let mut seen: Map[Str, Bool] = map()
+    seen[fs.full_path(join(dir, "x"))?] = true
+    let (_, out) = walk_dir(fs, dir, seen, [])?
+    Ok(out)
+}
+
+// `out` with the entries under `d` added, and `seen` with the real paths
+// of the directories entered.
+fn walk_dir(fs: Fs, d: Str, seen: Map[Str, Bool], out: List[Entry]) -> Result[(Map[Str, Bool], List[Entry]), IoError] {
+    let mut s = seen
+    let mut o = out
+    for name in fs.list(d)? {
+        let p = if d == "" { name } else { join(d, name) }
+        let is_dir = fs.is_dir(p)
+        o.push(Entry { path: p, is_dir })
+        if is_dir {
+            let real = fs.full_path(p + "/x")?
+            if !s.contains(real) {
+                s[real] = true
+                (s, o) = walk_dir(fs, p, s, o)?
+            }
+        }
+    }
+    Ok((s, o))
+}

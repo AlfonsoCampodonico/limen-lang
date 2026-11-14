@@ -3232,6 +3232,33 @@ fn main(root: Root) {
   exits "example-csvstats" ~grants:{ Interp.no_grants with args = [ "--sum"; "amount"; "--by"; "region"; "--log-level"; "error" ] }
     ~feed:"printf 'region,amount\\nnorth,10.5\\nsouth,2\\nnorth,x\\n\"we,st\",1\\nnorth,1e1\\n'"
     (example "csvstats.tsr") "region,amount\nnorth,20.50\nsouth,2.00\n\"we,st\",1.00\n" 0;
+  (* a tree for path.walk: a link back up (a/b/up -> ..) is listed, not entered *)
+  let walk_dir = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "tessera-walk-%d" (Unix.getpid ())) in
+  List.iter (fun d -> try Unix.mkdir d 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ()) [ walk_dir; walk_dir ^ "/a"; walk_dir ^ "/a/b" ];
+  List.iter (fun f -> Out_channel.with_open_bin (Filename.concat walk_dir f) ignore) [ "a/b/f.txt"; "top.txt" ];
+  (try Unix.symlink ".." (walk_dir ^ "/a/b/up") with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+  (try Unix.symlink "../top.txt" (walk_dir ^ "/a/link.txt") with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+  let walk_dir = Unix.realpath walk_dir in
+  out "std-path" ~grants:{ Interp.no_grants with fs = Some (walk_dir, true) }
+    {v|use path
+
+fn main(root: Root) -> Result[(), IoError] {
+    let out = root.stdout
+    for p in ["", ".", "/", "//", "a", "a/", "/a/b/", "a//b/./../c/", "../../a", "/../a/..", "a/../..", "./x/./y/../z", "a/b/c.tar.gz", ".bashrc", "dir.d/file", "/x.y/"] {
+        out.print("{p} | clean={path.clean(p)} dir={path.dir(p)} base={path.base(p)} ext={path.ext(p)} stem={path.stem(p)} abs={path.is_absolute(p)} parts={path.parts(p)}")
+    }
+    out.print("{path.join("a/", "../b")} {path.join("data", "/x")} {path.join("", "")} {path.join("/", "etc")} {path.join_all(["a", "", "b", "c.txt"])} {path.with_ext("notes.md", ".html")} {path.with_ext("a/b", ".c")} {path.with_ext("x.tar.gz", "")}")
+    for (f, t) in [("a/b", "a/c/d"), ("a", "a"), ("/a/b/c", "/x"), ("a", "/b"), ("../a", "b"), ("a", "../b"), (".", "a/b"), ("a/b", ".")] {
+        out.print("{f} -> {t}: {path.relative(f, t)}")
+    }
+    for e in path.walk(root.fs, "")? {
+        out.print("{e.path} {e.is_dir}")
+    }
+    out.print("{path.walk(root.fs, "a").map(|es| es.len())} {path.walk(root.fs, "nope").is_err()}")
+    Ok(())
+}
+|v}
+    " | clean=. dir=. base=. ext= stem=. abs=false parts=[]\n. | clean=. dir=. base=. ext= stem=. abs=false parts=[]\n/ | clean=/ dir=/ base=/ ext= stem=/ abs=true parts=[]\n// | clean=/ dir=/ base=/ ext= stem=/ abs=true parts=[]\na | clean=a dir=. base=a ext= stem=a abs=false parts=[\"a\"]\na/ | clean=a dir=a base=a ext= stem=a abs=false parts=[\"a\"]\n/a/b/ | clean=/a/b dir=/a/b base=b ext= stem=b abs=true parts=[\"a\", \"b\"]\na//b/./../c/ | clean=a/c dir=a/c base=c ext= stem=c abs=false parts=[\"a\", \"c\"]\n../../a | clean=../../a dir=../.. base=a ext= stem=a abs=false parts=[\"..\", \"..\", \"a\"]\n/../a/.. | clean=/ dir=/a base=.. ext= stem=.. abs=true parts=[]\na/../.. | clean=.. dir=. base=.. ext= stem=.. abs=false parts=[\"..\"]\n./x/./y/../z | clean=x/z dir=x base=z ext= stem=z abs=false parts=[\"x\", \"z\"]\na/b/c.tar.gz | clean=a/b/c.tar.gz dir=a/b base=c.tar.gz ext=.gz stem=c.tar abs=false parts=[\"a\", \"b\", \"c.tar.gz\"]\n.bashrc | clean=.bashrc dir=. base=.bashrc ext= stem=.bashrc abs=false parts=[\".bashrc\"]\ndir.d/file | clean=dir.d/file dir=dir.d base=file ext= stem=file abs=false parts=[\"dir.d\", \"file\"]\n/x.y/ | clean=/x.y dir=/x.y base=x.y ext=.y stem=x abs=true parts=[\"x.y\"]\nb data/x  /etc a/b/c.txt notes.html a/b.c x.tar\na/b -> a/c/d: Ok(\"../c/d\")\na -> a: Ok(\".\")\n/a/b/c -> /x: Ok(\"../../../x\")\na -> /b: Err(\"path: cannot make `/b` relative to `a`: one is absolute and the other is not\")\n../a -> b: Err(\"path: cannot make `b` relative to `../a`: it would climb out of a directory whose name is unknown\")\na -> ../b: Ok(\"../../b\")\n. -> a/b: Ok(\"a/b\")\na/b -> .: Ok(\"../..\")\na true\na/b true\na/b/f.txt false\na/b/up true\na/link.txt false\ntop.txt false\nOk(4) true\n";
   out "std-http-keepalive-stream" ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] }
     {v|use http
 
@@ -7212,8 +7239,9 @@ fn main(root: Root) {
   ok "std-manifest-sql" (List.exists (fun (d : Package.dep) -> d.dname = "sql" && d.caps = [ "fs" ]) manifest.deps && manifest.trust = [ "sql" ]) "sql: fs, trusted with C";
   ok "std-manifest-time" (List.exists (fun (d : Package.dep) -> d.dname = "time" && d.caps = [ "clock"; "fs" ]) manifest.deps) "time: clock (within), fs (load_zone)";
   ok "std-manifest-log" (List.exists (fun (d : Package.dep) -> d.dname = "log" && d.caps = [ "stdout"; "stderr"; "clock" ]) manifest.deps) "log: stdout, stderr, clock";
+  ok "std-manifest-path" (List.exists (fun (d : Package.dep) -> d.dname = "path" && d.caps = [ "fs" ]) manifest.deps) "path: fs (walk)";
   ok "std-manifest-pure"
-    (List.for_all (fun (d : Package.dep) -> List.mem d.dname [ "http"; "sql"; "time"; "log" ] || d.caps = []) manifest.deps)
+    (List.for_all (fun (d : Package.dep) -> List.mem d.dname [ "http"; "sql"; "time"; "log"; "path" ] || d.caps = []) manifest.deps)
     "the others are pure";
   let real_std = !Modules.std_modules in
   let std_errs name extra src =

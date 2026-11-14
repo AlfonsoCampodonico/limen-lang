@@ -1695,6 +1695,7 @@ The standard library is checked like a dependency. `src/std/tessera.toml` lists 
 | `time` | `clock` and `fs`, for `within` and `load_zone` alone |
 | `sql` | `fs` (the database file's directory); trusted with C (`[trust] foreign = ["sql"]`) to call SQLite |
 | `log` | `stdout`, `stderr` and `clock`: a Logger holds where it writes and, for timestamps, a clock |
+| `path` | `fs`, for `walk` alone |
 
 A module missing from the list may take nothing. `tessera caps FILE` shows what each std function takes. What stays trusted, and why:
 
@@ -2063,6 +2064,20 @@ fn main(root: Root) {
 | `format_line(format, time: Option[Int], level, msg, fields) -> Str` | the line without writing it, for tests and other destinations |
 
 In text, the message's line breaks and other control characters are escaped, so a message is always one line, and a value that is empty or holds spaces, quotes or `=` is quoted. A function taking a Logger takes the capabilities it holds, so `tessera caps` shows them: `Stderr (via Logger.sink.ToStderr)`.
+
+### path
+
+Paths with `/` between their parts, as macOS and Linux write them and `Fs` takes them. Everything works on the text alone, without looking at any file, except `walk`, which lists a tree through an `Fs`.
+
+| Item | Meaning |
+| --- | --- |
+| `join(a, b)`, `join_all(parts)` | joined with one `/` and cleaned: `join("a/", "../b")` is `"b"`; a `b` starting with `/` is still joined under `a` (`join("data", "/x")` is `"data/x"`), and empty parts are left out |
+| `clean(p)` | the shortest path naming the same file by the text: one `/` between parts, no `.` parts, a `..` removing the part before it, no trailing `/`; a `..` at the start of a relative path stays, and `/..` is `/`; `""` is `"."` |
+| `dir(p)`, `base(p)` | everything before the last `/`, cleaned, and the last part: `dir("a/b/c.txt")` is `"a/b"`, `base` is `"c.txt"`; `dir("c.txt")` is `"."`, `base("/")` is `"/"` |
+| `ext(p)`, `stem(p)`, `with_ext(p, e)` | `".gz"` and `"b.tar"` for `"a/b.tar.gz"`, `""` for a name with no dot or only a leading one (`.bashrc`); `with_ext("notes.md", ".html")` is `"notes.html"` |
+| `parts(p)`, `is_absolute(p)` | the parts of the cleaned path, `["a", "b"]` for `/a/b/`; whether it starts with `/` |
+| `relative(from, to) -> Result[Str, Str]` | the path from the directory `from` to `to`: `relative("a/b", "a/c/d")` is `Ok("../c/d")`. Both must be absolute or both relative, and `from` cannot climb past more `..`s than `to` |
+| `struct Entry { path, is_dir }`, `walk(fs, dir) -> Result[List[Entry], IoError]` | every file and directory under `dir` (`""` for the whole of `fs`), depth first, each directory before what it holds, names sorted. Links are followed, but each directory is entered once (by its real path, `fs.full_path`), so a link back up the tree is listed and not entered again |
 
 ## 20. Not yet
 
