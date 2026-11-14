@@ -1,0 +1,14 @@
+// The program's hex and the standard library's in one program: each keeps
+// its own C names, as do a function of the main file and a module's whose
+// names would meet if the module's name were only joined on.
+use hex
+use url
+
+fn hex_digit(b: Int) -> Int {
+    b
+}
+
+fn main(root: Root) {
+    let d = hex.Digest { text: "x" }
+    root.stdout.print("{hex.encode("ab".to_bytes())} {hex.digit(97)} {hex_digit(97)} {url.decode("%41") ?? "?"} {d}")
+}

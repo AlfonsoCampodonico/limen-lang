@@ -391,7 +391,7 @@ let compared : (Span.t * ty * string) list ref = ref []
 
 (* The generic built-ins that compare the values of a type parameter with
    `==`: the function, the parameter, and the name to report. *)
-let comparing_generics = [ ("List::chunk_by", "K", "chunk_by"); ("list.index_of", "T", "index_of") ]
+let comparing_generics = [ ("List::chunk_by", "K", "chunk_by"); ("list.index_of", "T", "index_of"); ("std/list.index_of", "T", "index_of") ]
 
 let add_bounds fname env sp =
   List.iter

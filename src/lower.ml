@@ -158,13 +158,25 @@ let is_struct g = function TNamed (n, _) -> Hashtbl.mem g.structs n | _ -> false
 
 (* ---------- function instances ---------- *)
 
+(* The C name of function [name]: `wf_NAME` for the main file's, and for
+   module M's `wmN_M_NAME` (`wsN_M_NAME` for the standard library's `std/M`),
+   N the length of M, so no two modules' names meet in C, whatever
+   underscores their names have. *)
+let c_name name =
+  let safe = String.map (fun ch -> if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch = '_' then ch else '_') in
+  match String.index_opt name '.' with
+  | None -> "wf_" ^ safe name
+  | Some k ->
+    let m = String.sub name 0 k and rest = String.sub name (k + 1) (String.length name - k - 1) in
+    let tag, m = if String.starts_with ~prefix:"std/" m then ("ws", String.sub m 4 (String.length m - 4)) else ("wm", m) in
+    sprintf "%s%d_%s_%s" tag (String.length m) m (safe rest)
+
 let instance g name (targs : (string * ty) list) =
   let key = name ^ "[" ^ String.concat "," (List.map (fun (_, t) -> show t) targs) ^ "]" in
   match Hashtbl.find_opt g.instances key with
   | Some c -> c
   | None ->
-    let safe = String.map (fun ch -> if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch = '_' then ch else '_') name in
-    let c = if targs = [] then "wf_" ^ safe else sprintf "wf_%s_%d" safe (Hashtbl.length g.instances) in
+    let c = if targs = [] then c_name name else sprintf "%s_%d" (c_name name) (Hashtbl.length g.instances) in
     Hashtbl.replace g.instances key c;
     g.queue <- g.queue @ [ (c, Hashtbl.find g.fns name, targs) ];
     c

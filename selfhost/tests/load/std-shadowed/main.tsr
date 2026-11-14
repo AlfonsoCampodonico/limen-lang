@@ -1,0 +1,10 @@
+// A module of the program's own named like a standard library module: the
+// program's `use hex` gets it, and url, which uses the standard library's
+// hex, gets that one, which is then named `std/hex`.
+use hex
+use url
+
+fn main(root: Root) {
+    let d = hex.Digest { text: "x" }
+    root.stdout.print("{hex.encode("ab".to_bytes())} {hex.digit(97)} {url.decode("%41") ?? "?"} {d}")
+}

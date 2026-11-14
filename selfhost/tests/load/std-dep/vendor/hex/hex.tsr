@@ -1,0 +1,7 @@
+pub fn encode(b: Bytes) -> Str {
+    "dep:{b.len()}"
+}
+
+pub fn shout(out: Stdout) {
+    out.print("dep hex")
+}

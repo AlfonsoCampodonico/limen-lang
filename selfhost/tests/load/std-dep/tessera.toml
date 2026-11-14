@@ -1,0 +1,6 @@
+# a dependency named like a standard library module
+[package]
+name = "app"
+
+[dependencies]
+hex = { path = "vendor/hex", caps = ["stdout"] }

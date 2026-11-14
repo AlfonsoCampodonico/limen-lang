@@ -384,6 +384,23 @@ pub fn iface_methods(ro: Ro, i: Str, args: List[types.Ty]) -> List[env.IfaceMeth
 
 // ---------- function instances ----------
 
+// The C name of function `name`: `wf_NAME` for the main file's, and for
+// module M's `wmN_M_NAME` (`wsN_M_NAME` for the standard library's
+// `std/M`), N the length of M, so no two modules' names meet in C,
+// whatever underscores their names have.
+fn c_name(name: Str) -> Str {
+    let safe = |s: Str| bytes(s.bytes().map(|ch| if (ch >= 97 && ch <= 122) || (ch >= 65 && ch <= 90) || (ch >= 48 && ch <= 57) || ch == 95 { ch } else { 95 })).to_str()
+    match name.index_of(".") {
+        None => "wf_" + safe(name),
+        Some(k) => {
+            let m = name.slice(0, k)
+            let rest = name.slice(k + 1, name.len())
+            let (tag, m) = if m.starts_with("std/") { ("ws", m.slice(4, m.len())) } else { ("wm", m) }
+            "{tag}{m.len()}_{m}_{safe(rest)}"
+        },
+    }
+}
+
 // The C name of function `name` instantiated with `targs`, queued to be
 // lowered the first time.
 fn instance(self: Lx, name: Str, targs: List[(Str, types.Ty)]) -> (Str, Lx) {
@@ -391,9 +408,8 @@ fn instance(self: Lx, name: Str, targs: List[(Str, types.Ty)]) -> (Str, Lx) {
     match self.instances.get(key) {
         Some(c) => (c, self),
         None => {
-            let safe = bytes(name.bytes().map(|ch| if (ch >= 97 && ch <= 122) || (ch >= 65 && ch <= 90) || (ch >= 48 && ch <= 57) || ch == 95 { ch } else { 95 })).to_str()
             let mut lx = self
-            let c = if targs.is_empty() { "wf_" + safe } else { "wf_{safe}_{lx.instances.len()}" }
+            let c = if targs.is_empty() { c_name(name) } else { "{c_name(name)}_{lx.instances.len()}" }
             lx.instances[key] = c
             lx.queue.push(Job { cname: c, decl: lx.ro.fns[name], targs })
             (c, lx)

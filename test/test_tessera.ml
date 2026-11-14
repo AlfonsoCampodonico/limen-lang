@@ -6611,6 +6611,31 @@ fn main(root: Root) {
   out "modules-nested"
     ~modules:[ ("a", "use b\n\npub fn twice(n: Int) -> Int {\n    b.inc(b.inc(n))\n}\n"); ("b", "pub fn inc(n: Int) -> Int {\n    n + 1\n}\n") ]
     "use a\n\nfn main(root: Root) {\n    root.stdout.print(\"{a.twice(1)}\")\n}\n" "3\n";
+  (* a module of the program's own named like a standard library module: the
+     program's `use hex` gets it, while url, which uses the standard
+     library's hex, gets that one, named std/hex *)
+  let my_hex = "pub struct Digest {\n    text: Str,\n}\n\npub fn encode(b: Bytes) -> Str {\n    \"mine:{b.len()}\"\n}\n\npub fn digit(b: Int) -> Int {\n    -7\n}\n" in
+  let shadowed = "use hex\nuse url\n\nfn main(root: Root) {\n    let d = hex.Digest { text: \"x\" }\n    root.stdout.print(\"{hex.encode(\"ab\".to_bytes())} {hex.digit(97)} {url.decode(\"%41%62\") ?? \"?\"} {d}\")\n}\n" in
+  out "modules-std-shadowed" ~modules:[ ("hex", my_hex) ] shadowed "mine:2 -7 Ab hex.Digest { text: \"x\" }\n";
+  if selected "modules-std-shadowed" then begin
+    let _, ds, infos = compile ~modules:[ ("hex", my_hex) ] "modules-std-shadowed" shadowed in
+    let names = List.map (fun (i : Check.fn_info) -> i.name) infos in
+    ok "modules-std-shadowed/names" (ds = [] && List.mem "hex.digit" names && List.mem "std/hex.digit" names && List.mem "url.decode" names)
+      (String.concat " " (List.filter (fun n -> String.contains n '.') names));
+    ok "modules-std-shadowed/std-loaded" (List.sort compare !Modules.std_loaded = [ ("std/hex", "hex"); ("url", "url") ])
+      (String.concat " " (List.map (fun (a, b) -> a ^ "=" ^ b) !Modules.std_loaded))
+  end;
+  (* without a module of its own named hex, the standard library's is hex *)
+  if selected "modules-std-unshadowed" then begin
+    let _, ds, infos = compile "modules-std-unshadowed" "use url\n\nfn main(root: Root) {\n    root.stdout.print(url.decode(\"%41\") ?? \"\")\n}\n" in
+    ok "modules-std-unshadowed" (ds = [] && List.exists (fun (i : Check.fn_info) -> i.name = "hex.digit") infos && List.sort compare !Modules.std_loaded = [ ("hex", "hex"); ("url", "url") ]) "std hex is hex"
+  end;
+  (* a type error names the module it means: the program's hex, or std/hex *)
+  errs "modules-std-shadowed-private" ~modules:[ ("hex", my_hex) ] "use hex\n\nfn main(root: Root) {\n    let x = hex.decode(\"00\")\n}\n" [ "E0403" ];
+  (* C names: no module's function meets another's, or the main file's *)
+  out "modules-c-names"
+    ~modules:[ ("a", "pub fn b_c() -> Str {\n    \"a.b_c\"\n}\n"); ("a_b", "pub fn c() -> Str {\n    \"a_b.c\"\n}\n") ]
+    "use a\nuse a_b\n\nfn a_b_c() -> Str {\n    \"a_b_c\"\n}\n\nfn main(root: Root) {\n    root.stdout.print(\"{a.b_c()} {a_b.c()} {a_b_c()}\")\n}\n" "a.b_c a_b.c a_b_c\n";
   errs "modules-private" ~modules "use geom\n\nfn main(root: Root) {\n    root.stdout.print(\"{geom.sq(2)}\")\n}\n" [ "E0402" ];
   errs "modules-missing-member" ~modules "use geom\n\nfn main(root: Root) {\n    geom.nope()\n}\n" [ "E0403" ];
   errs "modules-not-found" "use nowhere\n\nfn main(root: Root) {}\n" [ "E0401" ];
@@ -6637,6 +6662,30 @@ fn main(root: Root) {
   ok "pkg-granted" (pkg_codes "[package]\nname = \"app\"\n[dependencies]\nfetch = { path = \"../fetch\", caps = [\"net\", \"fs\"] }  # both\n" = []) "granted";
   ok "pkg-bad-toml" (pkg_codes "[package]\nname = \"app\"\n[dependencies]\nfetch = { path = \"../fetch\", caps = [\"disk\"] }\n" = [ "E0321" ]) "bad cap";
   ok "pkg-missing-dir" (pkg_codes "[package]\nname = \"app\"\n[dependencies]\nother = { path = \"../nope\" }\n" = [ "E0401" ]) "fetch not found";
+  (* a dependency named like a standard library module: the program's `use
+     hex` gets the dependency, url gets the standard library's hex, and each
+     is checked against its own manifest *)
+  if selected "pkg-std-shadowed" then begin
+    List.iter (fun d -> try Unix.mkdir (Filename.concat pdir d) 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ()) [ "stddep"; "stddep/hex" ];
+    put "stddep/hex/hex.tsr" "pub fn encode(b: Bytes) -> Str {\n    \"dep:{b.len()}\"\n}\n\npub fn shout(out: Stdout) {\n    out.print(\"dep hex\")\n}\n";
+    put "stddep/tessera.toml" "[package]\nname = \"app\"\n[dependencies]\nhex = { path = \"hex\", caps = [\"stdout\"] }\n";
+    let src = "use hex\nuse url\n\nfn main(root: Root) {\n    hex.shout(root.stdout)\n    root.stdout.print(\"{hex.encode(\"ab\".to_bytes())} {url.decode(\"%41\") ?? \"?\"}\")\n}\n" in
+    put "stddep/main.tsr" src;
+    let items, ds, infos = Modules.load_and_check (Filename.concat pdir "stddep/main.tsr") src in
+    let buf = Buffer.create 16 in
+    let r = if ds = [] then Interp.run ~out:(Buffer.add_string buf) ~grants:Interp.no_grants items else Error ("diagnostics", Span.dummy) in
+    ok "pkg-std-shadowed" (r <> Error ("diagnostics", Span.dummy) && Buffer.contents buf = "dep hex\ndep:2 A\n")
+      (Buffer.contents buf ^ String.concat "; " (List.map (fun (d : Diag.t) -> d.code ^ " " ^ d.message) ds));
+    ok "pkg-std-shadowed/names"
+      (List.exists (fun (i : Check.fn_info) -> i.name = "std/hex.digit") infos && !Modules.module_pkg = [ ("hex", "hex") ])
+      "std/hex.digit and the dependency's hex";
+    (* the dependency is still held to its own caps *)
+    put "stddep/tessera.toml" "[package]\nname = \"app\"\n[dependencies]\nhex = { path = \"hex\" }\n";
+    let _, ds, _ = Modules.load_and_check (Filename.concat pdir "stddep/main.tsr") src in
+    ok "pkg-std-shadowed/caps"
+      (codes ds = [ "E0320" ] && Interp_util.find_sub (List.hd ds).message "dependency `hex`" 0 <> None)
+      (String.concat "; " (List.map (fun (d : Diag.t) -> d.code ^ " " ^ d.message) ds))
+  end;
   (* a dependency cannot launder authority through a struct: what its
      functions' parameters hold counts *)
   (try Unix.mkdir (Filename.concat pdir "launder") 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());

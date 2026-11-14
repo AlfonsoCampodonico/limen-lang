@@ -31,13 +31,13 @@ fn grant_of(c: Str) -> List[Str] {
 // only when the one before it found nothing), then the checker's warnings.
 // `std_file` is the number `files` gives src/std/tessera.toml, which the
 // loader read with no number of its own.
-pub fn check(fs: Fs, place: disk.Place, files: List[diag.Source], std_file: Int, std_manifest: Option[package.Manifest], std_modules: List[Str], manifest: Option[package.Manifest], packages: List[(Str, Str)], items: List[ast.Item], c: typecheck.Checked) -> List[diag.Diag] {
+pub fn check(fs: Fs, place: disk.Place, files: List[diag.Source], std_file: Int, std_manifest: Option[package.Manifest], std_modules: List[(Str, Str)], manifest: Option[package.Manifest], packages: List[(Str, Str)], items: List[ast.Item], c: typecheck.Checked) -> List[diag.Diag] {
     let warnings = c.diags.filter(|d| d.warning)
     let mut errors = c.diags.filter(|d| !d.warning)
     if errors.is_empty() {
         let std = std_manifest ?? package.Manifest { name: "", path: "", deps: [], grants: [], trust: [], embed_roots: [] }
         let numbered = { std with deps: std.deps.map(|d| { d with span: { d.span with file: std_file } }) }
-        errors = enforce(files, true, numbered, std_modules.map(|m| (m, m)), c.infos)
+        errors = enforce(files, true, numbered, std_modules, c.infos)
     }
     match manifest {
         Some(m) if errors.is_empty() => {

@@ -519,7 +519,7 @@ fn instantiate(st: env.State, s: env.Sig) -> (List[(Str, types.Ty)], types.Ty, e
 // The generic built-ins that compare the values of a type parameter with
 // `==`: the function, the parameter, and the name to report.
 fn comparing_generics() -> List[(Str, Str, Str)] {
-    [("List::chunk_by", "K", "chunk_by"), ("list.index_of", "T", "index_of")]
+    [("List::chunk_by", "K", "chunk_by"), ("list.index_of", "T", "index_of"), ("std/list.index_of", "T", "index_of")]
 }
 
 // E0201 when built-in `name` compares values of type `t` that have no

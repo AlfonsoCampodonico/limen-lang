@@ -118,7 +118,7 @@ let () =
          finds any, then the checker's warnings *)
       let warnings = Diag.warnings ds in
       let ds = Diag.errors ds in
-      let ds = if ds = [] then Package.enforce ~std:true (Lazy.force Package.std_manifest) (List.map (fun m -> (m, m)) !Modules.std_loaded) infos else ds in
+      let ds = if ds = [] then Package.enforce ~std:true (Lazy.force Package.std_manifest) !Modules.std_loaded infos else ds in
       let ds = match pkg with Some p when ds = [] -> Package.enforce p !Modules.module_pkg infos | _ -> ds in
       let ds = match pkg with Some p when ds = [] -> Package.check_foreign_lock p (Modules.c_users items) | _ -> ds in
       List.iter check_diag (ds @ warnings);

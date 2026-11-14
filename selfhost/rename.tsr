@@ -45,6 +45,12 @@ pub fn is_std(m: Module) -> Bool {
     m.path.starts_with("<std>")
 }
 
+// A standard library module's name in the standard library, its file's:
+// the program calls it `std/NAME` when it has a module NAME of its own.
+pub fn std_name(m: Module) -> Str {
+    m.path.slice(6, m.path.len() - 4)
+}
+
 // What renaming needs to know, the same for a whole item.
 pub struct Context {
     // the module being renamed
@@ -946,7 +952,7 @@ pub fn item(st: State, cx: Context, i: ast.Item) -> (ast.Item, State) {
             let (body, st) = block(st, cx, d.params.map(|p| p.name), d.body)
             let (ret, st) = maybe(st, d.ret, |st, t| ty(st, cx, [], t))
             // a standard library module trusted with C (src/std/tessera.toml [trust])
-            let trusted = is_std(cx.module) && cx.trusted.contains(cx.module.name)
+            let trusted = is_std(cx.module) && cx.trusted.contains(std_name(cx.module))
             let foreign = d.foreign.map(|f| { f with trusted })
             (IFn({ d with name, params, bounds: bs, body, ret, foreign }), st)
         },

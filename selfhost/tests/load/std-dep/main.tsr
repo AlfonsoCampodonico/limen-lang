@@ -1,0 +1,9 @@
+// The program's `use hex` gets the dependency; url gets the standard
+// library's hex, named `std/hex`.
+use hex
+use url
+
+fn main(root: Root) {
+    hex.shout(root.stdout)
+    root.stdout.print("{hex.encode("ab".to_bytes())} {url.decode("%41") ?? "?"}")
+}

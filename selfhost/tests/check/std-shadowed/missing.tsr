@@ -1,0 +1,8 @@
+// `hex` here is the program's, which has no `decode`, though the standard
+// library's has.
+use hex
+use url
+
+fn main(root: Root) {
+    let m = hex.decode("00")
+}

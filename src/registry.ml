@@ -189,7 +189,7 @@ let examine ?(deps = []) name dir =
     let ds, infos = Check.check_program items in
     let ds = Diag.errors ds in
     let ds =
-      if ds = [] then Package.enforce ~std:true (Lazy.force Package.std_manifest) (List.map (fun m -> (m, m)) !Modules.std_loaded) infos else ds
+      if ds = [] then Package.enforce ~std:true (Lazy.force Package.std_manifest) !Modules.std_loaded infos else ds
     in
     if ds <> [] then failed ds;
     (items, infos, List.filter (fun (_, p) -> p = name) !Modules.module_pkg)

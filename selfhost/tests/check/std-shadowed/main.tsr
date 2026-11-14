@@ -1,0 +1,10 @@
+// The program's hex next to the standard library's: what each function
+// takes is listed under its own name (`hex.digit`, `std/hex.digit`), and a
+// problem names the module it means.
+use hex
+use url
+
+fn main(root: Root) {
+    let n: Int = hex.encode("ab".to_bytes())
+    let s: Str = url.decode("%41")
+}

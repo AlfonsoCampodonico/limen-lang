@@ -1614,6 +1614,7 @@ pub fn load(text: Str) -> Result[json.Value, Str] {
 ```
 
 - `use NAME` makes module `NAME` available in this file. It looks for `NAME.tsr` next to the file, then a dependency named `NAME` in tessera.toml, then the standard library. A file never imports itself.
+- A standard library module's `use NAME` always means the standard library's `NAME`, so no file or dependency of the program changes what the standard library does. A program can then hold a module `NAME` of its own (a file or a dependency) and the standard library's at once: its own is `NAME`, and the standard library's is named `std/NAME` wherever the program shows names, in messages, in types (`std/url.Url`) and in `tessera caps`. The two never meet: natively each module's functions have C names of their own.
 - Refer to a module's items as `NAME.item`: functions `json.parse(s)`, types `json.Value`, struct literals `json.Field { key, value }`, variants `json.Num(1.0)` and patterns `json.Num(x)`. A function can be used as a value: `let f = json.parse`.
 - Only items marked `pub` (`pub fn`, `pub struct`, `pub enum`) can be used from another module (E0402). Struct fields and enum variants of a `pub` type are all visible.
 - Inside a module, its own items are used unqualified. A local variable shadows a module name.
@@ -1684,7 +1685,7 @@ caps = ["stdout"]
 
 ## 19. Standard library
 
-Written in Tessera and built into the compiler; `use` any of them. They take capabilities only as parameters, like any other code.
+Written in Tessera and built into the compiler; `use` any of them. They take capabilities only as parameters, like any other code. They use each other (`url` reads hex digits with `hex`), always the standard library's own modules, whatever modules the program has of the same names (section 18).
 
 The standard library is checked like a dependency. `src/std/tessera.toml` lists the capabilities each module may take, and every program that uses a module is checked against it (E0320), with or without a tessera.toml of its own:
 
@@ -1916,6 +1917,7 @@ Binary data as hexadecimal text, two digits per byte, as checksums and keys are 
 | --- | --- |
 | `encode(data: Bytes) -> Str`, `encode_upper(data)`, `encode_str(s)` | lowercase (or uppercase) digits: `encode(bytes([1, 171]))` is `"01ab"`; `encode_str` takes the bytes of a `Str` |
 | `decode(s) -> Result[Bytes, Str]`, `decode_str(s) -> Result[Str, Str]` | digits in either case; an odd number of digits, or anything else, is an error naming the byte: `hex: not a hex digit at byte 3` |
+| `digit(b: Int) -> Int` | the value of one hex digit's byte, in either case, or -1: `digit(97)` (`a`) is 10 |
 
 ### base64
 

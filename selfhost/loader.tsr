@@ -29,8 +29,10 @@ pub struct Program {
     files: List[diag.Source],
     // each module that belongs to a tessera.toml dependency, with it
     packages: List[(Str, Str)],
-    // the standard library modules the program uses
-    std_modules: List[Str],
+    // the standard library modules the program uses: the name the program
+    // gives each (`std/NAME` when it has a module NAME of its own) and its
+    // name in the standard library
+    std_modules: List[(Str, Str)],
     // the files `embed` read
     embedded: List[rename.Embedded],
     // the program's tessera.toml, if it has one, and the standard
@@ -58,9 +60,14 @@ struct Setup {
     root: Str,
 }
 
-// The modules found so far, the files read, the problems.
+// The modules found so far, the files read, the problems. Modules are
+// kept by key: the program's by name, the standard library's by "<std>"
+// and the name, so a module of each name can coexist. `resolved` is what
+// each name the program's own modules use resolved to, the first time one
+// used it: the key of the module.
 struct Loading {
     mods: Map[Str, rename.Module],
+    resolved: Map[Str, Str],
     files: List[diag.Source],
     next_id: Int,
     errors: List[diag.Diag],
@@ -127,7 +134,7 @@ pub fn load(fs: Fs, std: Map[Str, Str], place: disk.Place, path: Str) -> Program
         },
     }
     let main = rename.Module { name: "", path, file: 0, items: f.items, uses: f.uses, package: None }
-    let start = Loading { mods: map(), files, next_id, errors: [] }
+    let start = Loading { mods: map(), resolved: map(), files, next_id, errors: [] }
     let loading = match visit(fs, std, setup, start, main) {
         Ok(l) => l,
         Err((files, d)) => {
@@ -137,9 +144,15 @@ pub fn load(fs: Fs, std: Map[Str, Str], place: disk.Place, path: Str) -> Program
     if !loading.errors.is_empty() {
         return failed(loading.files, loading.errors)
     }
-    let others = loading.mods.values().sort_by(|m| m.name)
+    // a standard library module the program has a module of the same name
+    // besides is `std/NAME`
+    let mut named: Map[Str, rename.Module] = map()
+    for (key, m) in loading.mods.entries() {
+        named[key] = if rename.is_std(m) && loading.mods.contains(m.name) { { m with name: "std/" + m.name } } else { m }
+    }
+    let others = named.values().sort_by(|m| m.name)
     let packages = others.flat_map(|m| m.package.map(|p| [(m.name, p)]) ?? [])
-    let std_modules = others.filter(rename.is_std).map(|m| m.name)
+    let std_modules = others.filter(rename.is_std).map(|m| (m.name, rename.std_name(m)))
     // the modules last to first by name, then the main file
     let order = others.reverse() + [main]
     let mut st = rename.State { errors: [], temps: 0, next_id: loading.next_id, cyclic: [], embedded: [] }
@@ -147,7 +160,7 @@ pub fn load(fs: Fs, std: Map[Str, Str], place: disk.Place, path: Str) -> Program
     for m in order {
         st = check_aliases(st, m)
         let found = embeds.read_all(fs, place, m.path, embed_dirs(m, deps, root, manifest), m.items)
-        let cx = rename.Context { module: m, mods: loading.mods, own: rename.own_items(m.items), gens: [], found, trusted }
+        let cx = rename.Context { module: m, mods: view(m, named, loading.resolved), own: rename.own_items(m.items), gens: [], found, trusted }
         let src = loading.files[m.file].text
         for i in m.items {
             let (copies, after) = expand_table(st, src, i)
@@ -166,6 +179,21 @@ pub fn load(fs: Fs, std: Map[Str, Str], place: disk.Place, path: Str) -> Program
     let (promoted, next_id) = forwarders.forwarders(items, st.next_id)
     let names = promoted.map(rename.item_name)
     Program { items: items + promoted, diags: [], files: loading.files, packages, std_modules, embedded: st.embedded, manifest, std_manifest, next_id, forwarders: names }
+}
+
+// The modules `m` uses, by the names it uses them by.
+fn view(m: rename.Module, named: Map[Str, rename.Module], resolved: Map[Str, Str]) -> Map[Str, rename.Module] {
+    let mut v: Map[Str, rename.Module] = map()
+    for u in m.uses {
+        let key = if rename.is_std(m) { Some("<std>" + u.text) } else { resolved.get(u.text) }
+        match key.flat_map(|k| named.get(k)) {
+            Some(x) => {
+                v[u.text] = x
+            },
+            None => {},
+        }
+    }
+    v
 }
 
 fn from_parse(e: parser.ParseError) -> diag.Diag {
@@ -220,12 +248,15 @@ enum Lookup {
 }
 
 // Module `name`, used by the file at `from` (in directory `dir`; "" for
-// the standard library, whose modules are found only by name).
+// the standard library, whose modules use only the standard library).
 fn find_module(fs: Fs, std: Map[Str, Str], setup: Setup, from: Str, dir: Str, name: Str) -> Lookup {
     let place = setup.place
     let read = |p: Str, from_dep: Bool| match fs.read(place.locate(p)) {
         Ok(text) => Found(p, text, from_dep),
         Err(_) => Unreadable(p),
+    }
+    if dir == "" {
+        return std_module(std, setup, name)
     }
     let local = paths.concat(dir, name + ".tsr")
     // a file never uses itself: `use http` in http.tsr means another http
@@ -234,15 +265,17 @@ fn find_module(fs: Fs, std: Map[Str, Str], setup: Setup, from: Str, dir: Str, na
     }
     match setup.deps.find(|d| d.0 == name) {
         Some(d) => read(paths.concat(d.1, name + ".tsr"), true),
-        None => {
-            if !setup.std_names.contains(name) {
-                return NotFound
-            }
-            match std.get(name + ".tsr") {
-                Some(text) => Found("<std>/" + name + ".tsr", text, false),
-                None => Unreadable("<std>/" + name + ".tsr"),
-            }
-        },
+        None => std_module(std, setup, name),
+    }
+}
+
+fn std_module(std: Map[Str, Str], setup: Setup, name: Str) -> Lookup {
+    if !setup.std_names.contains(name) {
+        return NotFound
+    }
+    match std.get(name + ".tsr") {
+        Some(text) => Found("<std>/" + name + ".tsr", text, false),
+        None => Unreadable("<std>/" + name + ".tsr"),
     }
 }
 
@@ -261,7 +294,8 @@ fn visit(fs: Fs, std: Map[Str, Str], setup: Setup, loading: Loading, m: rename.M
     let mut l = loading
     for u in m.uses {
         let name = u.text
-        if l.mods.contains(name) {
+        // the standard library uses only itself
+        if (rename.is_std(m) && l.mods.contains("<std>" + name)) || (!rename.is_std(m) && l.resolved.contains(name)) {
             continue
         }
         match find_module(fs, std, setup, m.path, dir, name) {
@@ -272,6 +306,13 @@ fn visit(fs: Fs, std: Map[Str, Str], setup: Setup, loading: Loading, m: rename.M
             },
             Unreadable(p) => l.errors.push(diag.error("E0401", u.span, "cannot read module `{name}` at {p}")),
             Found(p, text, from_dep) => {
+                let key = if p.starts_with("<std>") { "<std>" + name } else { name }
+                if !rename.is_std(m) {
+                    l.resolved[name] = key
+                }
+                if l.mods.contains(key) {
+                    continue
+                }
                 // only the program declares embed roots
                 let toml = paths.concat(paths.dirname(p), "tessera.toml")
                 if from_dep && !same_file(fs, setup.place, toml, paths.concat(setup.root, "tessera.toml")) {
@@ -301,7 +342,7 @@ fn visit(fs: Fs, std: Map[Str, Str], setup: Setup, loading: Loading, m: rename.M
                 })
                 let package = if from_dep { Some(name) } else if p.starts_with("<std>") { None } else { m.package }
                 let module = rename.Module { name, path: p, file, items, uses: f.uses, package }
-                l.mods[name] = module
+                l.mods[key] = module
                 l.next_id = next_id
                 l = visit(fs, std, setup, l, module)?
             },

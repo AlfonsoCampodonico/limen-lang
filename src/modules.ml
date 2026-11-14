@@ -4,6 +4,12 @@
    keeps its names. References are rewritten scope-aware, so the checker and
    both backends see a single program with qualified names.
 
+   A standard library module's `use NAME` always means the standard library's
+   NAME, whatever the program has. So a program can hold its own module NAME
+   (a file or a dependency) and the standard library's at once: the program's
+   is `NAME`, and the standard library's is then named `std/NAME`, in its
+   items' qualified names, in messages and in `tessera caps`.
+
    Inside module M, an unqualified name that is one of M's items means that
    item. `m.f(...)`, `m.f`, `m.Type`, `m.Type { ... }`, `m.Variant(...)` and the
    pattern `m.Variant(...)` refer to module m, which the file must `use`. Only
@@ -21,8 +27,15 @@ type modinfo = {
 (* module name -> dependency, for the last program loaded *)
 let module_pkg : (string * string) list ref = ref []
 
-(* the standard library modules in the last program loaded *)
-let std_loaded : string list ref = ref []
+(* the standard library modules in the last program loaded: the name the
+   program gives each (`std/NAME` when the program has a module NAME of its
+   own) and its name in the standard library *)
+let std_loaded : (string * string) list ref = ref []
+
+let is_std (m : modinfo) = String.starts_with ~prefix:"<std>" m.mfile
+
+(* A standard library module's name in the standard library: its file's. *)
+let std_name (m : modinfo) = Filename.remove_extension (Filename.basename m.mfile)
 
 let std_modules : (string * string) list ref = ref Std_text.modules (* name -> source *)
 
@@ -690,7 +703,7 @@ let rename_item ?(fresh = false) mods (m : modinfo) own (it : item) : item =
         fn_foreign =
           Option.map
             (fun (fo : foreign) ->
-              { fo with ftrusted = String.starts_with ~prefix:"<std>" m.mfile && List.mem m.mname (Lazy.force Package.std_manifest).trust })
+              { fo with ftrusted = is_std m && List.mem (std_name m) (Lazy.force Package.std_manifest).trust })
             d.fn_foreign }
   | IStruct s ->
     let env = { self = m; mods; own; gens = s.st_gen; fresh } in
@@ -798,22 +811,44 @@ let load ?(deps = []) ?root ?roots path src : item list * Diag.t list =
   alias_uses := [];
   module_pkg := [];
   std_loaded := [];
+  (* modules by key: the program's by name, the standard library's by
+     "<std>" ^ name, so a module of each name can coexist *)
   let mods : (string, modinfo) Hashtbl.t = Hashtbl.create 8 in
+  (* what each name the program's own modules use resolved to, the first
+     time one used it: the key of the module *)
+  let resolved : (string, string) Hashtbl.t = Hashtbl.create 8 in
+  let std_key name = "<std>" ^ name in
   match parse path src with
   | exception Diag.Fatal d -> ([], [ d ])
   | f -> (
     let main = { mname = ""; mfile = path; mitems = f.items; muses = f.uses; mpkg = None } in
     let rec visit (m : modinfo) =
-      let dir = if String.starts_with ~prefix:"<std>" m.mfile then "" else Filename.dirname m.mfile in
+      let dir = if is_std m then "" else Filename.dirname m.mfile in
       List.iter
         (fun (name, sp) ->
-          if not (Hashtbl.mem mods name) then
-            match find_module ~deps ~from:m.mfile dir name with
-            | None ->
+          (* the standard library uses only itself *)
+          let found =
+            if is_std m then
+              if Hashtbl.mem mods (std_key name) then None
+              else
+                Some
+                  (match List.assoc_opt name !std_modules with
+                   | Some src -> Some ("<std>/" ^ name ^ ".tsr", Some src, false)
+                   | None -> None)
+            else if Hashtbl.mem resolved name then None
+            else Some (find_module ~deps ~from:m.mfile dir name)
+          in
+          match found with
+          | None -> ()
+          | Some None ->
               err "E0401" sp (Printf.sprintf "cannot find module `%s`" name)
                 ~notes:[ Printf.sprintf "looked for %s, the dependencies in tessera.toml and the standard library" (Filename.concat dir (name ^ ".tsr")) ]
-            | Some (p, None, _) -> err "E0401" sp (Printf.sprintf "cannot read module `%s` at %s" name p)
-            | Some (p, Some src, from_dep) ->
+          | Some (Some (p, None, _)) -> err "E0401" sp (Printf.sprintf "cannot read module `%s` at %s" name p)
+          | Some (Some (p, Some src, from_dep)) ->
+              let std = String.starts_with ~prefix:"<std>" p in
+              let key = if std then std_key name else name in
+              if not (is_std m) then Hashtbl.replace resolved name key;
+              if not (Hashtbl.mem mods key) then begin
               (* only the program declares embed roots *)
               let real d = try Unix.realpath d with Unix.Unix_error _ -> d in
               (if from_dep && real (Filename.dirname p) <> real !main_root then
@@ -830,10 +865,11 @@ let load ?(deps = []) ?root ?roots path src : item list * Diag.t list =
               let f = parse p src in
               (* tests and main belong to the program being run, not its modules *)
               let items = List.filter (function IFn { fn_test = Some _; _ } -> false | _ -> true) f.items in
-              let mpkg = if from_dep then Some name else if String.starts_with ~prefix:"<std>" p then None else m.mpkg in
+              let mpkg = if from_dep then Some name else if std then None else m.mpkg in
               let mi = { mname = name; mfile = p; mitems = items; muses = f.uses; mpkg } in
-              Hashtbl.replace mods name mi;
-              visit mi)
+              Hashtbl.replace mods key mi;
+              visit mi
+              end)
         m.muses
     in
     match visit main with
@@ -841,14 +877,32 @@ let load ?(deps = []) ?root ?roots path src : item list * Diag.t list =
     | () ->
       if !errors <> [] then ([], List.rev !errors)
       else begin
-        let all = main :: List.of_seq (Hashtbl.to_seq_values mods) in
-        let all = main :: List.sort (fun a b -> compare a.mname b.mname) (List.tl all) in
+        (* a standard library module the program has a module of the same
+           name besides is `std/NAME` *)
+        let named = Hashtbl.create 8 in
+        Hashtbl.iter
+          (fun key (m : modinfo) ->
+            let m = if is_std m && Hashtbl.mem mods m.mname then { m with mname = "std/" ^ m.mname } else m in
+            Hashtbl.replace named key m)
+          mods;
+        (* each module sees the modules it uses by the names it uses them by *)
+        let view (m : modinfo) =
+          let v : (string, modinfo) Hashtbl.t = Hashtbl.create 8 in
+          List.iter
+            (fun (name, _) ->
+              let key = if is_std m then Some (std_key name) else Hashtbl.find_opt resolved name in
+              match Option.bind key (Hashtbl.find_opt named) with Some u -> Hashtbl.replace v name u | None -> ())
+            m.muses;
+          v
+        in
+        let all = main :: List.sort (fun a b -> compare a.mname b.mname) (List.of_seq (Hashtbl.to_seq_values named)) in
         module_pkg := List.filter_map (fun m -> Option.map (fun p -> (m.mname, p)) m.mpkg) all;
-        std_loaded := List.filter_map (fun m -> if String.starts_with ~prefix:"<std>" m.mfile then Some m.mname else None) all;
+        std_loaded := List.filter_map (fun m -> if is_std m then Some (m.mname, std_name m) else None) all;
         let items =
           List.concat_map
             (fun m ->
               let own = own_items m.mitems in
+              let mods = view m in
               check_aliases m;
               List.concat_map
                 (fun it ->
@@ -898,7 +952,7 @@ let load_and_check path src : item list * Diag.t list * Check.fn_info list =
          with or without a tessera.toml of the program's own *)
       let warnings = Diag.warnings ds in
       let ds = Diag.errors ds in
-      let ds = if ds = [] then Package.enforce ~std:true (Lazy.force Package.std_manifest) (List.map (fun m -> (m, m)) !std_loaded) infos else ds in
+      let ds = if ds = [] then Package.enforce ~std:true (Lazy.force Package.std_manifest) !std_loaded infos else ds in
       let ds = match pkg with Some p when ds = [] -> Package.enforce p !module_pkg infos | _ -> ds in
       let ds =
         match pkg with

@@ -9,6 +9,8 @@
 // written, since decoding `%2F` in a path would change its meaning; decode
 // them with `decode` or `parse_query`. `user` and `password` are decoded.
 
+use hex
+
 // The parts of a URL. A part that is not there is empty, and so is `port`
 // (`None`): `default_port(u.scheme)` gives the usual one.
 pub struct Url {
@@ -259,8 +261,8 @@ fn unescape(s: Str, plus: Bool) -> Result[Str, Str] {
     while i < bs.len() {
         let b = bs[i]
         if b == 37 {
-            let hi = if i + 1 < bs.len() { hex_digit(bs[i + 1]) } else { -1 }
-            let lo = if i + 2 < bs.len() { hex_digit(bs[i + 2]) } else { -1 }
+            let hi = if i + 1 < bs.len() { hex.digit(bs[i + 1]) } else { -1 }
+            let lo = if i + 2 < bs.len() { hex.digit(bs[i + 2]) } else { -1 }
             if hi < 0 || lo < 0 {
                 return Err("url: `%` without two hex digits at byte {i}")
             }
@@ -272,18 +274,6 @@ fn unescape(s: Str, plus: Bool) -> Result[Str, Str] {
         }
     }
     Ok(bytes(out).to_str())
-}
-
-fn hex_digit(b: Int) -> Int {
-    if is_digit(b) {
-        b - 48
-    } else if b >= 97 && b <= 102 {
-        b - 87
-    } else if b >= 65 && b <= 70 {
-        b - 55
-    } else {
-        -1
-    }
 }
 
 // ---------- query strings ----------

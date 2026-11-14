@@ -39,7 +39,10 @@ What each file does, in pipeline order:
   messages.
 - `loader.tsr` is `src/modules.ml`: it finds the modules a file uses (next
   to it, in a tessera.toml dependency, in the standard library), with
-  `package.tsr` reading tessera.toml, and makes one program of them.
+  `package.tsr` reading tessera.toml, and makes one program of them. A
+  standard library module's `use` always finds the standard library's
+  module; when the program has a module of the same name besides, the
+  standard library's is named `std/NAME`.
   `rename.tsr` gives every item its qualified name and rewrites the
   references, expands type aliases, pipes, tuple unpacking and tuple
   assignment; `embeds.tsr` reads the files `embed` names, in the package

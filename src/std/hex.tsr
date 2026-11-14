@@ -56,8 +56,9 @@ pub fn decode_str(s: Str) -> Result[Str, Str] {
     decode(s).map(|b| b.to_str())
 }
 
-// The value of one hex digit, or -1.
-fn digit(b: Int) -> Int {
+// The value of the hex digit whose byte is `b`, in either case, or -1:
+// `digit(97)` (`a`) is 10.
+pub fn digit(b: Int) -> Int {
     if b >= 48 && b <= 57 {
         b - 48
     } else if b >= 97 && b <= 102 {

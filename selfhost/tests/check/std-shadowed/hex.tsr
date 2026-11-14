@@ -1,0 +1,12 @@
+// The program's own hex, named like a standard library module.
+pub struct Digest {
+    text: Str,
+}
+
+pub fn encode(b: Bytes) -> Str {
+    "mine:{b.len()}"
+}
+
+pub fn digit(b: Int) -> Int {
+    -7
+}

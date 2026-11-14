@@ -225,7 +225,7 @@ let () =
       let ds, infos = Check.check_program items in
       (* the capability checks, as Modules.load_and_check makes them *)
       let ds = Diag.errors ds in
-      let ds = if ds = [] then Package.enforce ~std:true (Lazy.force Package.std_manifest) (List.map (fun m -> (m, m)) !Modules.std_loaded) infos else ds in
+      let ds = if ds = [] then Package.enforce ~std:true (Lazy.force Package.std_manifest) !Modules.std_loaded infos else ds in
       let ds = match pkg with Some p when ds = [] -> Package.enforce p !Modules.module_pkg infos | _ -> ds in
       let ds = match pkg with Some p when ds = [] -> Package.check_foreign_lock p (Modules.c_users items) | _ -> ds in
       if ds <> [] then List.iter error ds
