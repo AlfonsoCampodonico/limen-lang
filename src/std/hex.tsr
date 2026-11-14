@@ -1,0 +1,70 @@
+// Hexadecimal text for binary data: two digits per byte, as in checksums,
+// keys and dumps. To write a number in hex, use `format.hex(n)`.
+
+// `data` as lowercase hex digits: `encode(bytes([1, 171]))` is `"01ab"`.
+pub fn encode(data: Bytes) -> Str {
+    digits_of(data, "0123456789abcdef")
+}
+
+// `data` as uppercase hex digits: `"01AB"`.
+pub fn encode_upper(data: Bytes) -> Str {
+    digits_of(data, "0123456789ABCDEF")
+}
+
+// The bytes of `s` as lowercase hex digits: `encode_str("hi")` is `"6869"`.
+pub fn encode_str(s: Str) -> Str {
+    encode(s.to_bytes())
+}
+
+fn digits_of(data: Bytes, digits: Str) -> Str {
+    let d = digits.bytes()
+    let mut out: List[Int] = []
+    for i in 0..<data.len() {
+        let b = data[i]
+        out.push(d[b >> 4])
+        out.push(d[b & 15])
+    }
+    bytes(out).to_str()
+}
+
+// The bytes that hex digits stand for, in either case. An odd number of
+// digits or anything but a digit is an error naming the byte offset.
+pub fn decode(s: Str) -> Result[Bytes, Str] {
+    let bs = s.bytes()
+    if bs.len() % 2 != 0 {
+        return Err("hex: an odd number of digits ({bs.len()})")
+    }
+    let mut out: List[Int] = []
+    let mut i = 0
+    while i < bs.len() {
+        let hi = digit(bs[i])
+        let lo = digit(bs[i + 1])
+        if hi < 0 {
+            return Err("hex: not a hex digit at byte {i}")
+        }
+        if lo < 0 {
+            return Err("hex: not a hex digit at byte {i + 1}")
+        }
+        out.push(hi << 4 | lo)
+        i = i + 2
+    }
+    Ok(bytes(out))
+}
+
+// `decode`, with the bytes as a `Str`.
+pub fn decode_str(s: Str) -> Result[Str, Str] {
+    decode(s).map(|b| b.to_str())
+}
+
+// The value of one hex digit, or -1.
+fn digit(b: Int) -> Int {
+    if b >= 48 && b <= 57 {
+        b - 48
+    } else if b >= 97 && b <= 102 {
+        b - 87
+    } else if b >= 65 && b <= 70 {
+        b - 55
+    } else {
+        -1
+    }
+}

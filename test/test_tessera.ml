@@ -3021,6 +3021,20 @@ fn main(root: Root) {
   out "std-logscan-example" (example "logscan.tsr")
     "09:15:02 GET  /index.html 200     5,120\n09:15:09 GET  /missing    404         0\nskipped: not a log line\n09:01:44 POST /api/orders 201 1,048,576\ntotal 1,053,696 bytes\ndue 01/12/2026, paid 30/11/2026\n[\"a\", \"b\", \"c\", \"d\"]\n";
   panics "std-regex-must" "use regex\n\nfn main(root: Root) {\n    let r = regex.must(\"(a\")\n    root.stdout.print(r.pattern)\n}\n" "regex: missing `)`";
+  out "std-hex"
+    {v|use hex
+
+fn main(root: Root) {
+    let out = root.stdout
+    let all = bytes((0..<256).map(|i| 255 - i))
+    out.print("{hex.encode(bytes([1, 171, 255]))} {hex.encode_upper(bytes([1, 171, 255]))} {hex.encode_str("hi")} {hex.encode(bytes([]))}")
+    out.print("{hex.decode("01aBfF")} {hex.decode_str("6869")} {hex.decode(hex.encode(all)) == Ok(all)} {hex.decode(hex.encode_upper(all)) == Ok(all)} {hex.encode(all).len()}")
+    for bad in ["abc", "zz", "0g", "é"] {
+        out.print("{hex.decode(bad)}")
+    }
+}
+|v}
+    "01abff 01ABFF 6869 \nOk(bytes([1, 171, 255])) Ok(\"hi\") true true 512\nErr(\"hex: an odd number of digits (3)\")\nErr(\"hex: not a hex digit at byte 0\")\nErr(\"hex: not a hex digit at byte 1\")\nErr(\"hex: not a hex digit at byte 0\")\n";
   out "std-http-keepalive-stream" ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] }
     {v|use http
 

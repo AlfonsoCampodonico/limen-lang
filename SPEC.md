@@ -1690,8 +1690,9 @@ The standard library is checked like a dependency. `src/std/tessera.toml` lists 
 
 | Module | May take |
 | --- | --- |
-| `json`, `list`, `text`, `format`, `time`, `regex`, `errors` | nothing: pure |
+| `json`, `list`, `text`, `format`, `regex`, `errors`, `hex` | nothing: pure |
 | `http` | `net` (Net, Conn) and `listen` (Listener, Conn) |
+| `time` | `clock` and `fs`, for `within` and `load_zone` alone |
 | `sql` | `fs` (the database file's directory); trusted with C (`[trust] foreign = ["sql"]`) to call SQLite |
 
 A module missing from the list may take nothing. `tessera caps FILE` shows what each std function takes. What stays trusted, and why:
@@ -1903,6 +1904,15 @@ fn main(root: Root) -> Result[(), IoError] {
 - `db.transaction(|| { ...; Ok(v) })` runs the closure between `BEGIN` and `COMMIT`. If it returns `Err` or panics, the transaction is rolled back and the error (or the panic) goes on. Transactions do not nest: starting one inside another is an `Err`.
 - `db.last_id()` is the rowid of the last row inserted through the connection, as a `Result[Int, IoError]`.
 - SQLite stays inside the grants. `ATTACH` is turned off, and with it `VACUUM` (which attaches a temporary database; `VACUUM INTO` would write anywhere), so SQL cannot open other files. The database file is not opened through a symlink, and `open` refuses a database whose `-journal`, `-wal` or `-shm` file is a symlink out of the granted directory (or a broken one), since SQLite follows those. URI filenames and extensions are off (SQLite's defaults, which the module never changes), and temporary tables and sorts stay in memory. What remains is a race no Tessera code can cause: another process that can write to the directory swapping in such a symlink while the database is open. SQLite writes its journal next to the database, inside the granted directory. A busy database is waited on for up to 5 seconds; that wait, like every SQLite call, blocks the worker thread.
+
+### hex
+
+Binary data as hexadecimal text, two digits per byte, as checksums and keys are written. Pure functions; for a number in hex, `format.hex(n)`.
+
+| Item | Meaning |
+| --- | --- |
+| `encode(data: Bytes) -> Str`, `encode_upper(data)`, `encode_str(s)` | lowercase (or uppercase) digits: `encode(bytes([1, 171]))` is `"01ab"`; `encode_str` takes the bytes of a `Str` |
+| `decode(s) -> Result[Bytes, Str]`, `decode_str(s) -> Result[Str, Str]` | digits in either case; an odd number of digits, or anything else, is an error naming the byte: `hex: not a hex digit at byte 3` |
 
 ## 20. Not yet
 
