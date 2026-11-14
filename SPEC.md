@@ -710,7 +710,7 @@ The native backend implements this with reference counting and copy-on-write. A 
 | `root.stderr` | `Stderr` | always |
 | `root.stdin` | `Stdin` | always |
 | `root.clock` | `Clock` | always |
-| `root.rand` | `Rand` | always; `--seed N` makes the numbers repeatable, the same in both backends (`bytes` included) |
+| `root.rand` | `Rand` | always: the operating system's secure generator; `--seed N` makes the numbers repeatable instead, the same in both backends (`bytes` included) |
 | `root.env` | `Env` | only with `--grant env=NAME` (repeatable) or `--grant env=*`; other variables read as `None` |
 | `root.net` | `Net` | only with `--grant net=HOST[:PORT]` (repeatable) or `--grant net=*` |
 | `root.fs` | `Fs` | only with `--grant fs=DIR` or `--grant fs=DIR:ro` |
@@ -1276,9 +1276,9 @@ fn main(root: Root) {
 | `Stderr` | `print(s)`, `write(s)` | `()`, as `Stdout` does, to standard error: at once, never held in a group's order (section 10), after what stdout has buffered so far |
 | `Clock` | `now_ms()` | `Int`, milliseconds since the Unix epoch |
 | `Clock` | `sleep(ms)` | `()`, waits `ms` milliseconds (section 10); returns at once if `ms <= 0` |
-| `Rand` | `int(lo, hi)` | `Int` in `lo` up to but not including `hi`; panics if `hi <= lo` |
+| `Rand` | `int(lo, hi)` | `Int` in `lo` up to but not including `hi`, every value equally likely; panics if `hi <= lo` |
 | `Rand` | `float()` | `Float` in [0, 1) |
-| `Rand` | `bytes(n)` | `Bytes`: `n` bytes from the operating system's cryptographically secure generator (`arc4random_buf` on macOS, `/dev/urandom` on Linux), for keys, tokens and UUIDs; a negative `n` panics. With `--seed` they come from the seeded generator instead, so a seeded run repeats. `int` and `float` are a fast generator (splitmix64) seeded from the time and process id, not fit for secrets |
+| `Rand` | `bytes(n)` | `Bytes`: `n` random bytes, for keys, tokens and UUIDs; a negative `n` panics |
 | `Stdin` | `read_line()` | `Option[Str]`, without the newline (or `\r\n`); `None` at the end of input. Waiting for input parks the task; one task reads at a time, so tasks reading together each get whole lines |
 | `Stdin` | `read_all()` | `Str`, the rest of the input |
 | `Env` | `get(name)` | `Option[Str]`; `None` if unset or not granted |
@@ -1310,6 +1310,8 @@ fn main(root: Root) {
 | `Fs` | `under(dir)`, `read_only()` | `Fs` |
 | `Fs` | `full_path(path)` | `Result[Str, IoError]`: the absolute path, checked as for writing (the file need not exist, its directory must), with the directory part resolved to its real path, for handing to C or another program |
 | `Fs` | `is_read_only()` | `Bool`; an ungranted `Fs` is read-only |
+
+`Rand`'s numbers and bytes all come from the operating system's cryptographically secure generator (`arc4random_buf` on macOS, `getrandom` on Linux, `/dev/urandom` where that is missing), read a buffer at a time, so they are fit for secrets: keys, tokens, passwords, nonces, and `shuffle` or `choice` built on `int`. Natively `int` gives about 380 million numbers a second. With `--seed N` they come from a fast deterministic generator (splitmix64) seeded with `N` instead, the same stream in both backends, so a seeded run repeats: for tests and simulations, never for secrets. `int` maps a seeded number into the range by its remainder, and an unseeded one without bias, by drawing again when the number falls in the uneven part.
 
 ## 12. Tests
 

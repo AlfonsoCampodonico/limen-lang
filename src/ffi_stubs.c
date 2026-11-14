@@ -419,3 +419,42 @@ value tessera_mtime_ms(value path) {
 #endif
   CAMLreturn(Val_long(ms));
 }
+
+/* Fill a buffer from the operating system's cryptographically secure
+   generator, as the native runtime's Rand does without --seed:
+   arc4random_buf on macOS, getrandom on Linux, /dev/urandom where that is
+   missing. Returns false if none of them gave enough bytes.
+   tessera_os_random : bytes -> bool */
+#include <errno.h>
+#include <fcntl.h>
+#if defined(__linux__)
+#include <sys/random.h>
+#endif
+value tessera_os_random(value buf) {
+  unsigned char *p = Bytes_val(buf);
+  size_t n = caml_string_length(buf), got = 0;
+#if defined(__APPLE__)
+  arc4random_buf(p, n);
+  got = n;
+#else
+#if defined(__linux__)
+  while (got < n) {
+    ssize_t r = getrandom(p + got, n - got, 0);
+    if (r < 0 && errno == EINTR) continue;
+    if (r <= 0) break;
+    got += (size_t)r;
+  }
+#endif
+  if (got < n) {
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    while (fd >= 0 && got < n) {
+      ssize_t r = read(fd, p + got, n - got);
+      if (r < 0 && errno == EINTR) continue;
+      if (r <= 0) break;
+      got += (size_t)r;
+    }
+    if (fd >= 0) close(fd);
+  }
+#endif
+  return Val_bool(got == n);
+}

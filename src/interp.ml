@@ -174,7 +174,11 @@ type grants = {
 
 let no_grants = { net = []; fs = None; listen = []; env = []; exec = []; foreign = []; seed = None; args = [] }
 
-(* Rand: splitmix64, the same generator as the native runtime, so a seed
+(* Rand. Without --seed every number comes from the operating system's
+   secure generator (arc4random_buf on macOS, getrandom on Linux,
+   /dev/urandom where that is missing), drawn into a buffer so a number
+   costs a copy, not a system call, as in the native runtime. With --seed
+   they come from splitmix64, the native runtime's generator too, so a seed
    gives the same numbers in both backends. *)
 let rand_state = ref 0L
 
@@ -189,17 +193,51 @@ let rand_seeded = ref false
 
 let seed_rand = function
   | Some s -> rand_state := Int64.of_int s; rand_seeded := true
-  | None ->
-    rand_state := Int64.of_float (Unix.gettimeofday () *. 1e6) |> Int64.logxor (Int64.of_int (Unix.getpid ()));
-    rand_seeded := false
+  | None -> rand_seeded := false
 
-(* Rand.bytes: the operating system's secure generator (/dev/urandom), or
-   with --seed splitmix64's next outputs, eight bytes each, low byte first,
-   as the native runtime gives them. *)
+external os_random : bytes -> bool = "tessera_os_random"
+
+let os_random_into b sp =
+  if not (os_random b) then raise (Panic ("rand: cannot read the system's secure random generator", sp))
+
+let rand_buf = Bytes.create 4096
+let rand_left = ref 0
+
+(* The next 64 random bits: the OS generator's, or splitmix64's with --seed. *)
+let rand_u64 sp =
+  if !rand_seeded then rand_next ()
+  else begin
+    if !rand_left < 8 then begin
+      os_random_into rand_buf sp;
+      rand_left := Bytes.length rand_buf
+    end;
+    let z = Bytes.get_int64_le rand_buf (Bytes.length rand_buf - !rand_left) in
+    rand_left := !rand_left - 8;
+    z
+  end
+
+(* Rand.int: with --seed the seeded number modulo the span, as always;
+   otherwise the draws below 2^64 mod span are rejected, so every value is
+   as likely as the others, as natively. *)
+let rand_int lo hi sp =
+  let span = Int64.sub hi lo in
+  if !rand_seeded then Int64.add lo (Int64.unsigned_rem (rand_next ()) span)
+  else begin
+    let skip = Int64.unsigned_rem (Int64.neg span) span in
+    let rec draw () =
+      let z = rand_u64 sp in
+      if Int64.unsigned_compare z skip < 0 then draw () else z
+    in
+    Int64.add lo (Int64.unsigned_rem (draw ()) span)
+  end
+
+(* Rand.bytes: the operating system's secure generator, or with --seed
+   splitmix64's next outputs, eight bytes each, low byte first, as the
+   native runtime gives them. *)
 let rand_bytes n sp =
   if n < 0 then raise (Panic (sprintf "rand.bytes: negative length %d" n, sp));
+  let b = Bytes.create n in
   if !rand_seeded then begin
-    let b = Bytes.create n in
     let i = ref 0 in
     while !i < n do
       let z = rand_next () in
@@ -207,12 +245,10 @@ let rand_bytes n sp =
         Bytes.set b (!i + j) (Char.chr (Int64.to_int (Int64.logand (Int64.shift_right_logical z (8 * j)) 0xFFL)))
       done;
       i := !i + 8
-    done;
-    Bytes.to_string b
+    done
   end
-  else
-    try In_channel.with_open_bin "/dev/urandom" (fun ic -> really_input_string ic n)
-    with Sys_error _ | End_of_file -> raise (Panic ("rand.bytes: cannot read the system's random source /dev/urandom", sp))
+  else if n > 0 then os_random_into b sp;
+  Bytes.to_string b
 
 type rt = {
   fns : (string, fn_decl) Hashtbl.t;
@@ -2620,8 +2656,7 @@ and call_method rt v name args sp =
     VUnit
   | VCap CRand, "int", [ VInt lo; VInt hi ] ->
     if hi <= lo then raise (Panic (sprintf "rand.int: empty range %Ld..%Ld" lo hi, sp));
-    let span = Int64.sub hi lo in
-    VInt (Int64.add lo (Int64.unsigned_rem (rand_next ()) span))
+    VInt (rand_int lo hi sp)
   | VCap c, _, _ -> cap_call rt c name args sp
   | _ -> raise (Panic (sprintf "internal: no method `%s` on %s" name (show ~top:false v), sp))
 
@@ -2636,7 +2671,7 @@ and cap_call rt c name args sp =
   | CStderr, "write", [ VStr s ] -> rt.err s; VUnit
   | CClock, "now_ms", [] -> VInt (clock_now_ms ())
   | CClock, "sleep", [ VInt ms ] -> sleep_ms ms; VUnit
-  | CRand, "float", [] -> VFloat (Int64.to_float (Int64.shift_right_logical (rand_next ()) 11) *. 0x1p-53)
+  | CRand, "float", [] -> VFloat (Int64.to_float (Int64.shift_right_logical (rand_u64 sp) 11) *. 0x1p-53)
   | CRand, "bytes", [ VInt n ] -> VBytes (rand_bytes (Int64.to_int n) sp)
   | CStdin, "read_line", [] -> (
     unhold rt.out !current.sink;

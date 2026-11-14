@@ -3840,6 +3840,32 @@ fn main(root: Root) -> Result[(), IoError] {
   out "rand-bytes-system"
     (main_wrap "    let r = root.rand\n    let a = r.bytes(32)\n    let b = r.bytes(32)\n    out.print(\"{a.len()} {r.bytes(1000).len()} {a != b}\")")
     "32 1000 true\n";
+  (* Rand unseeded: the system's secure generator, buffered; every value of
+     a range comes up, nothing falls outside it, and huge spans work *)
+  out "rand-system-ints"
+    (main_wrap
+       (String.concat "\n"
+          [ "    let r = root.rand";
+            "    let mut seen = [0, 0, 0, 0, 0, 0, 0]";
+            "    let mut bad = 0";
+            "    for _ in 0..<20000 {";
+            "        let x = r.int(-3, 4)";
+            "        if x < -3 || x >= 4 {";
+            "            bad = bad + 1";
+            "        } else {";
+            "            seen[x + 3] = seen[x + 3] + 1";
+            "        }";
+            "        let f = r.float()";
+            "        if f < 0.0 || f >= 1.0 {";
+            "            bad = bad + 1";
+            "        }";
+            "    }";
+            "    let big = r.int(-9223372036854775807 - 1, 9223372036854775807)";
+            "    let wide = (0..<64).map(|_| r.int(0, 4611686018427387904 + 3)).filter(|x| x >= 4611686018427387904).len()";
+            "    let a = (0..<8).map(|_| r.int(0, 1000000000))";
+            "    let b = (0..<8).map(|_| r.int(0, 1000000000))";
+            "    out.print(\"{bad} {seen.all(|n| n > 2000)} {big == big} {wide < 8} {a != b} {r.int(5, 6)}\")" ]))
+    "0 true true true true 5\n";
   panics "rand-bytes-negative" (main_wrap "    out.print(\"{root.rand.bytes(-1)}\")") "rand.bytes: negative length -1";
   errs "interp-escaped-quote" (main_wrap "    out.print(\"{\\\"x\\\".len()}\")\n    out.print(\"later\")") [ "E0006" ];
   ok "unknown-method-lists-methods"

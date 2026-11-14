@@ -988,11 +988,6 @@ static void w_init(int argc, char **argv) {
       if (rl.rlim_cur < want) { rl.rlim_cur = want; setrlimit(RLIMIT_NOFILE, &rl); }
     }
   }
-  {
-    struct timeval tv; gettimeofday(&tv, NULL);
-    g_rand_state = (uint64_t)tv.tv_sec * 1000000u + (uint64_t)tv.tv_usec;
-    g_rand_state ^= (uint64_t)getpid();
-  }
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--") == 0) { g_args = argv + i + 1; g_nargs = argc - i - 1; break; }
     if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) { g_rand_state = (uint64_t)strtoll(argv[++i], NULL, 10); g_rand_seeded = true; continue; }
@@ -1087,14 +1082,61 @@ static WCap *Cap_root_field(WCap *root, const char *f) {
   return cap_new(CAP_CLOCK);
 }
 
-/* Rand: splitmix64. The state only ever advances by a constant, so an atomic
-   add keeps it correct across threads, and a seed gives the interpreter's
-   sequence too. */
+/* Rand. Without --seed every number comes from the operating system's
+   cryptographically secure generator (arc4random_buf on macOS, getrandom on
+   Linux, /dev/urandom where that is missing), drawn into a buffer per
+   thread so a number costs a copy, not a system call; `int` rejects the
+   draws that would make some values likelier than others. With --seed they
+   come from splitmix64, the interpreter's sequence too: its state only ever
+   advances by a constant, so an atomic add keeps it correct across
+   threads. */
+#if defined(__linux__)
+#include <sys/random.h>
+#endif
 static uint64_t w_rand_next(void) {
   uint64_t z = __atomic_add_fetch(&g_rand_state, 0x9E3779B97F4A7C15ULL, __ATOMIC_RELAXED);
   z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
   z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
   return z ^ (z >> 31);
+}
+/* `n` bytes from the operating system's secure generator. */
+static void w_os_random(unsigned char *p, int64_t n, const char *where) {
+#if defined(__APPLE__)
+  (void)where;
+  arc4random_buf(p, (size_t)n);
+#else
+  int64_t got = 0;
+#if defined(__linux__)
+  while (got < n) {
+    ssize_t r = getrandom(p + got, (size_t)(n - got), 0);
+    if (r < 0 && errno == EINTR) continue;
+    if (r <= 0) break;
+    got += r;
+  }
+#endif
+  if (got < n) {
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    while (fd >= 0 && got < n) {
+      ssize_t r = read(fd, p + got, (size_t)(n - got));
+      if (r < 0 && errno == EINTR) continue;
+      if (r <= 0) break;
+      got += r;
+    }
+    if (fd >= 0) close(fd);
+  }
+  if (got < n) w_panic_c("rand: cannot read the system's secure random generator", where);
+#endif
+}
+#define W_RAND_BUF 4096
+static __thread unsigned char w_rand_buf[W_RAND_BUF];
+static __thread int w_rand_left;
+static uint64_t w_rand_u64(const char *where) {
+  if (g_rand_seeded) return w_rand_next();
+  if (w_rand_left < 8) { w_os_random(w_rand_buf, W_RAND_BUF, where); w_rand_left = W_RAND_BUF; }
+  uint64_t z;
+  memcpy(&z, w_rand_buf + (W_RAND_BUF - w_rand_left), 8);
+  w_rand_left -= 8;
+  return z;
 }
 static int64_t Cap_rand_int(int64_t lo, int64_t hi, const char *where) {
   if (hi <= lo) {
@@ -1103,13 +1145,16 @@ static int64_t Cap_rand_int(int64_t lo, int64_t hi, const char *where) {
     w_panic_c(m, where);
   }
   uint64_t span = (uint64_t)hi - (uint64_t)lo;
-  return (int64_t)((uint64_t)lo + w_rand_next() % span);
+  if (g_rand_seeded) return (int64_t)((uint64_t)lo + w_rand_next() % span);
+  /* the draws below 2^64 mod span would make the low values likelier */
+  uint64_t skip = -span % span, z;
+  do z = w_rand_u64(where); while (z < skip);
+  return (int64_t)((uint64_t)lo + z % span);
 }
-static double Cap_rand_float(void) { return (double)(w_rand_next() >> 11) * 0x1.0p-53; }
-/* Rand.bytes: `n` bytes from the operating system's cryptographically
-   secure generator (arc4random_buf on macOS, /dev/urandom elsewhere), for
-   keys, tokens and UUIDs. With --seed they come from splitmix64 instead, so a
-   seeded run repeats: each output gives eight bytes, low byte first, the
+static double Cap_rand_float(void) { return (double)(w_rand_u64("rand.float") >> 11) * 0x1.0p-53; }
+/* Rand.bytes: `n` bytes from the operating system's secure generator, for
+   keys, tokens and UUIDs. With --seed they come from splitmix64 instead, so
+   a seeded run repeats: each output gives eight bytes, low byte first, the
    last output's unused bytes dropped, as in the interpreter. */
 static WStr *Cap_rand_bytes(int64_t n, const char *where) {
   if (n < 0) { char m[96]; snprintf(m, sizeof m, "rand.bytes: negative length %lld", (long long)n); w_panic_c(m, where); }
@@ -1122,20 +1167,7 @@ static WStr *Cap_rand_bytes(int64_t n, const char *where) {
     }
     return s;
   }
-#if defined(__APPLE__)
-  arc4random_buf(p, (size_t)n);
-#else
-  int64_t got = 0;
-  int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
-  while (fd >= 0 && got < n) {
-    ssize_t r = read(fd, p + got, (size_t)(n - got));
-    if (r < 0 && errno == EINTR) continue;
-    if (r <= 0) break;
-    got += r;
-  }
-  if (fd >= 0) close(fd);
-  if (got < n) w_panic_c("rand.bytes: cannot read the system's random source /dev/urandom", where);
-#endif
+  w_os_random(p, n, where);
   return s;
 }
 static L_Str *Cap_args(void) {
