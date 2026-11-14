@@ -1,0 +1,8 @@
+// Files under the embed roots, by a path relative to this file.
+fn main(root: Root) {
+    let a = embed("../assets/a.txt")
+    let s = embed_bytes("../other/s.txt")
+    let all = embed_dir("../assets")
+    let own = embed("sub/own.txt")
+    root.stdout.print("{a} {s.len()} {all.len()} {own}")
+}

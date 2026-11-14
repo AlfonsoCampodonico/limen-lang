@@ -1,0 +1,6 @@
+# An embed root must be a directory (E0321).
+[package]
+name = "app"
+
+[embed]
+roots = ["main.tsr"]

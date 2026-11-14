@@ -406,7 +406,9 @@ let cmd_caps file json =
     in
     let emb (m, path, size) = Printf.sprintf {|{"module":%s,"path":%s,"bytes":%d}|} (Diag.jstr m) (Diag.jstr path) size in
     print_endline
-      ("{\"functions\":[" ^ String.concat "," (List.map one infos) ^ "],\"embeds\":["
+      ("{\"functions\":[" ^ String.concat "," (List.map one infos) ^ "],\"embed_roots\":["
+      ^ String.concat "," (List.map (fun (r, _) -> Diag.jstr r) !Modules.embed_roots)
+      ^ "],\"embeds\":["
       ^ String.concat "," (List.map emb (List.rev !Modules.embedded)) ^ "]}")
   end
   else begin
@@ -421,7 +423,9 @@ let cmd_caps file json =
         in
         Printf.printf "%-*s  %s\n" width i.name what)
       infos;
-    (* files read at compile time: changing one changes the program *)
+    (* files read at compile time: changing one changes the program; the
+       directories outside the package they may come from first *)
+    List.iter (fun (r, _) -> Printf.printf "embed root %s\n" r) !Modules.embed_roots;
     List.iter
       (fun (m, path, size) -> Printf.printf "embeds %s (%d bytes)%s\n" path size (if m = "" then "" else " in module " ^ m))
       (List.rev !Modules.embedded)

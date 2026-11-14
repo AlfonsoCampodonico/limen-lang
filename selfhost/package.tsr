@@ -15,6 +15,9 @@
 //     [trust]
 //     foreign = ["zlib"]
 //
+//     [embed]
+//     roots = ["../assets"]
+//
 // Only the subset of TOML a manifest needs is read: tables, strings,
 // string arrays and inline tables. Every problem is E0321, at the place in
 // the file, with the OCaml reader's message.
@@ -32,6 +35,10 @@ pub struct Manifest {
     grants: List[(Str, Str)],
     // the dependencies that may call C
     trust: List[Str],
+    // the directories besides the package whose files the program may
+    // embed: each as written, the path it names (relative to the
+    // manifest's directory), and its line
+    embed_roots: List[(Str, Str, ast.Span)],
 }
 
 pub struct Dep {
@@ -310,16 +317,27 @@ fn tables(file: Int, src: Str) -> Result[List[Table], diag.Diag] {
 
 // ---------- the manifest ----------
 
+// Whether the tessera.toml text `src` (file number `file`) declares embed
+// roots: the span of its [embed] table. A dependency's tessera.toml is
+// otherwise never read, and one that cannot be read declares nothing.
+pub fn declares_embed(file: Int, src: Str) -> Option[ast.Span] {
+    match tables(file, src) {
+        Ok(ts) => ts.find(|t| t.name == "embed" && !t.array).map(|t| t.span),
+        Err(_) => None,
+    }
+}
+
 // The manifest in `src`, read from `path`, file number `file`.
 pub fn parse(file: Int, path: Str, src: Str) -> Result[Manifest, diag.Diag] {
     let dir = paths.dirname(path)
     let bad = |span: ast.Span, message: Str| diag.error("E0321", span, message)
-    let mut m = Manifest { name: "", path, deps: [], grants: [], trust: [] }
+    let mut m = Manifest { name: "", path, deps: [], grants: [], trust: [], embed_roots: [] }
+    let mut has_roots = false
     for t in tables(file, src)? {
-        let known = t.name == "" || ["package", "dependencies", "grants", "trust"].contains(t.name)
+        let known = t.name == "" || ["package", "dependencies", "grants", "trust", "embed"].contains(t.name)
         if t.array || !known {
             let header = if t.array { "[[{t.name}]]" } else { "[{t.name}]" }
-            return Err(bad(t.span, "unknown table {header}; tessera.toml has [package], [grants], [dependencies] and [trust]"))
+            return Err(bad(t.span, "unknown table {header}; tessera.toml has [package], [grants], [dependencies], [trust] and [embed]"))
         }
         for k in t.keys {
             m = match (t.name, k.value) {
@@ -351,8 +369,29 @@ pub fn parse(file: Int, path: Str, src: Str) -> Result[Manifest, diag.Diag] {
                 ("trust", _) => {
                     return Err(bad(k.span, "[trust] takes `foreign = [\"dependency\", ...]`: the dependencies that may call C"))
                 },
+                ("embed", VArr(roots)) if k.name == "roots" => {
+                    if has_roots {
+                        return Err(bad(k.span, "[embed] roots is listed twice"))
+                    }
+                    if roots.is_empty() {
+                        return Err(bad(k.span, "an empty list of embed roots adds nothing; remove the line"))
+                    }
+                    for (i, r) in roots.with_index() {
+                        if r == "" {
+                            return Err(bad(k.span, "an embed root cannot be empty"))
+                        }
+                        if roots.take(i).contains(r) {
+                            return Err(bad(k.span, "embed root `{r}` is listed twice"))
+                        }
+                    }
+                    has_roots = true
+                    { m with embed_roots: roots.map(|r| (r, if paths.is_relative(r) { paths.concat(dir, r) } else { r }, k.span)) }
+                },
+                ("embed", _) => {
+                    return Err(bad(k.span, "[embed] takes `roots = [\"DIR\", ...]`: directories, relative to tessera.toml, whose files the program may embed"))
+                },
                 _ => {
-                    return Err(bad(k.span, "keys belong in [package], [grants], [dependencies] or [trust]"))
+                    return Err(bad(k.span, "keys belong in [package], [grants], [dependencies], [trust] or [embed]"))
                 },
             }
         }

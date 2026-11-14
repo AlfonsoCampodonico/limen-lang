@@ -1,0 +1,3 @@
+# The same root twice (E0321).
+[embed]
+roots = ["a", "b", "a"]

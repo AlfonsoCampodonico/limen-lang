@@ -1,6 +1,7 @@
 // Prints the program selfhost/loader.tsr makes of one file, in the format
 // of selfhost/loaddump (the OCaml loader's), so the two can be compared:
-// the items, one per line, then `foreign`, `embedded` and `spans`; or the
+// the items, one per line, then `foreign`, `embed roots`, `embedded` and
+// `spans`; or the
 // problems, each as ERROR CODE FILE LO HI, its message and its notes.
 //
 // It reads through the one Fs it is granted: the standard library's
@@ -66,6 +67,10 @@ fn main(root: Root) -> Int {
             },
             _ => {},
         }
+    }
+    out.print("embed roots")
+    for (r, full, _) in p.manifest.map(|m| m.embed_roots) ?? [] {
+        out.print("  {r} {full}")
     }
     out.print("embedded")
     for e in p.embedded {

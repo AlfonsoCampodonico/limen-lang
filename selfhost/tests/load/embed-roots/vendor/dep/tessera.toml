@@ -1,0 +1,5 @@
+[package]
+name = "dep"
+
+[embed]
+roots = ["../../app"]

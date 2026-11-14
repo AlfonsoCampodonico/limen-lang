@@ -334,7 +334,7 @@ let add spec =
      check as for any dependency, with exactly those caps *)
   let caps = List.filter (( <> ) "foreign") e.caps and calls_c = List.mem "foreign" e.caps in
   let dep = { Package.dname = name; dir; caps; dspan = Span.dummy; source = Package.Git (e.git, Package.Tag e.tag) } in
-  let as_listed = { Package.pname = ""; file = toml; deps = [ dep ]; grants = []; trust = (if calls_c then [ name ] else []) } in
+  let as_listed = { Package.pname = ""; file = toml; deps = [ dep ]; grants = []; trust = (if calls_c then [ name ] else []); embed_roots = [] } in
   (match Package.enforce as_listed mine infos with
    | [] -> ()
    | d :: _ ->

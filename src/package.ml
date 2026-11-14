@@ -16,6 +16,9 @@
      [trust]
      foreign = ["zlib"]
 
+     [embed]
+     roots = ["../assets"]
+
    A dependency is a directory holding NAME.tsr (and any modules it uses from
    the same directory). Because Tessera has no ambient authority, a function can
    only use a capability that reaches it as a parameter, so the capabilities a
@@ -39,7 +42,18 @@ type dep = { dname : string; dir : string; caps : string list; dspan : Span.t; s
    can do anything the process can, so this is full trust, given only here,
    by the program; `caps` cannot grant it. In src/std/tessera.toml it names the
    standard library modules whose foreign calls need no Foreign capability. *)
-type t = { pname : string; file : string; deps : dep list; grants : (string * string) list; trust : string list }
+(* [embed]: `roots = [...]`, directories (relative to tessera.toml) whose
+   files the program may `embed` besides its own package's: each as written,
+   the path it names, and where. Only the program's tessera.toml can declare
+   them; a dependency that tries is E0321 (Modules.load). *)
+type t = {
+  pname : string;
+  file : string;
+  deps : dep list;
+  grants : (string * string) list;
+  trust : string list;
+  embed_roots : (string * string * Span.t) list;
+}
 
 let grant_kinds = [ "net"; "fs"; "listen"; "env"; "exec"; "foreign" ]
 
@@ -199,14 +213,14 @@ let read file src : table list =
 
 let parse file src : t =
   let tables = read file src in
-  let name = ref "" and deps = ref [] and grants = ref [] and trust = ref [] in
+  let name = ref "" and deps = ref [] and grants = ref [] and trust = ref [] and roots = ref None in
   let span lo hi = { Span.file; lo; hi } in
   let dir = Filename.dirname file in
   List.iter
     (fun tb ->
       let k = tb.tname in
-      if tb.tarray || (k <> "" && k <> "package" && k <> "dependencies" && k <> "grants" && k <> "trust") then
-        raise (Bad (tb.tspan, "unknown table " ^ (if tb.tarray then "[[" ^ k ^ "]]" else "[" ^ k ^ "]") ^ "; tessera.toml has [package], [grants], [dependencies] and [trust]"));
+      if tb.tarray || (k <> "" && k <> "package" && k <> "dependencies" && k <> "grants" && k <> "trust" && k <> "embed") then
+        raise (Bad (tb.tspan, "unknown table " ^ (if tb.tarray then "[[" ^ k ^ "]]" else "[" ^ k ^ "]") ^ "; tessera.toml has [package], [grants], [dependencies], [trust] and [embed]"));
       List.iter
         (fun (k, v, sp) ->
           match (tb.tname, k, v) with
@@ -280,7 +294,18 @@ let parse file src : t =
             if names = [] then raise (Bad (sp, "an empty trust list trusts nothing; remove the line"));
             trust := names
           | "trust", _, _ -> raise (Bad (sp, "[trust] takes `foreign = [\"dependency\", ...]`: the dependencies that may call C"))
-          | _ -> raise (Bad (sp, "keys belong in [package], [grants], [dependencies] or [trust]")))
+          | "embed", "roots", VArr rs ->
+            if !roots <> None then raise (Bad (sp, "[embed] roots is listed twice"));
+            if rs = [] then raise (Bad (sp, "an empty list of embed roots adds nothing; remove the line"));
+            List.iteri
+              (fun i r ->
+                if r = "" then raise (Bad (sp, "an embed root cannot be empty"));
+                if List.mem r (List.filteri (fun j _ -> j < i) rs) then raise (Bad (sp, Printf.sprintf "embed root `%s` is listed twice" r)))
+              rs;
+            roots := Some (List.map (fun r -> (r, (if Filename.is_relative r then Filename.concat dir r else r), sp)) rs)
+          | "embed", _, _ ->
+            raise (Bad (sp, "[embed] takes `roots = [\"DIR\", ...]`: directories, relative to tessera.toml, whose files the program may embed"))
+          | _ -> raise (Bad (sp, "keys belong in [package], [grants], [dependencies], [trust] or [embed]")))
         tb.keys)
     tables;
   List.iter
@@ -288,7 +313,24 @@ let parse file src : t =
       if not (List.exists (fun d -> d.dname = t) !deps) && file <> "<std>/tessera.toml" then
         raise (Bad (span 0 0, Printf.sprintf "[trust] names `%s`, which is not in [dependencies]" t)))
     !trust;
-  { pname = !name; file; deps = List.rev !deps; grants = !grants; trust = !trust }
+  { pname = !name; file; deps = List.rev !deps; grants = !grants; trust = !trust; embed_roots = Option.value ~default:[] !roots }
+
+(* The embed roots must be directories, through any links (E0321 at the
+   root's line otherwise). *)
+let check_roots (pkg : t) =
+  List.iter
+    (fun (r, full, sp) ->
+      if not (Sys.file_exists full && Sys.is_directory full) then
+        raise (Bad (sp, Printf.sprintf "embed root `%s` is not a directory (looked for %s)" r full)))
+    pkg.embed_roots
+
+(* Whether the tessera.toml text [src] (at [file]) declares embed roots:
+   the span of its [embed] table. A dependency's tessera.toml is otherwise
+   never read, and one that cannot be read declares nothing. *)
+let declares_embed file src =
+  match read file src with
+  | tables -> Option.map (fun tb -> tb.tspan) (List.find_opt (fun tb -> tb.tname = "embed" && not tb.tarray) tables)
+  | exception Bad _ -> None
 
 (* tessera.toml in the directory of [main] or the nearest parent. *)
 let find main =
@@ -534,7 +576,10 @@ let load main : (t option, Diag.t) result =
     | src -> (
       match parse p src with
       | exception Bad (sp, m) -> Error (Diag.make "E0321" sp m)
-      | pkg -> ( try Ok (Some (resolve pkg)) with Lock_error (code, sp, m, notes) -> Error (Diag.make ~notes code sp m))))
+      | pkg -> (
+        match check_roots pkg with
+        | exception Bad (sp, m) -> Error (Diag.make "E0321" sp m)
+        | () -> ( try Ok (Some (resolve pkg)) with Lock_error (code, sp, m, notes) -> Error (Diag.make ~notes code sp m)))))
 
 (* The standard library's own manifest, src/std/tessera.toml: each std module
    is a "dependency" with the capabilities it may take. *)

@@ -1,0 +1,3 @@
+# [embed] takes `roots`, a list of directories (E0321).
+[embed]
+roots = "assets"

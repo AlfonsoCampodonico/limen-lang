@@ -6,7 +6,9 @@
    A loaded program prints as its items, one per line, in the compiler's
    position-free format (src/astdump.ml), with qualified names and every
    expansion done; then `foreign`, what the loader decided about C
-   declarations; then `embedded`, the files `embed` read; then `spans`,
+   declarations; then `embed roots`, the directories the program's
+   tessera.toml lets it embed from (as written, and the path); then
+   `embedded`, the files `embed` read; then `spans`,
    one line per item: the item's file and every span in it, in the order a
    walk of the tree meets them. A span from another file (a type alias's
    body) is written with that file after an `@`.
@@ -140,6 +142,8 @@ let program items =
         Printf.printf "  struct %s %s %s\n" st_name (String.escaped lib) (String.concat "," (List.map Astdump.ty ts))
       | _ -> ())
     items;
+  print_endline "embed roots";
+  List.iter (fun (r, full) -> Printf.printf "  %s %s\n" r full) !Modules.embed_roots;
   print_endline "embedded";
   List.iter (fun (m, p, n) -> Printf.printf "  %s %s %d\n" (if m = "" then "main" else m) p n) (List.rev !Modules.embedded);
   print_endline "spans";
@@ -158,6 +162,7 @@ let () =
   | Ok pkg -> (
     let deps = match pkg with Some p -> List.map (fun (d : Package.dep) -> (d.dname, d.dir)) p.deps | None -> [] in
     let root = match pkg with Some p -> Filename.dirname p.file | None -> Filename.dirname path in
-    match Modules.load ~deps ~root path src with
+    let roots = match pkg with Some p -> List.map (fun (r, full, _) -> (r, full)) p.embed_roots | None -> [] in
+    match Modules.load ~deps ~root ~roots path src with
     | [], (_ :: _ as ds) -> List.iter diag ds
     | items, _ -> program items)

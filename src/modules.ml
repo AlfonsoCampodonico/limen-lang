@@ -218,35 +218,67 @@ let mk d sp = { edesc = d; espan = sp; ety = Types.TErr; einst = []; ecallee = N
    The path is relative to the file that names it and must stay inside that
    file's package (the directory of its tessera.toml, or of the main file when
    there is none; a dependency's own directory): otherwise a dependency could
-   bake `../../.ssh/id_rsa` into the binary, a read no grant allows. *)
+   bake `../../.ssh/id_rsa` into the binary, a read no grant allows. The
+   program's own tessera.toml (never a dependency's) can add directories its
+   files may embed from too, its embed roots: `[embed] roots = ["../assets"]`. *)
 
-(* the main package's root, and the dependencies' directories, for this load *)
+(* the main package's root, its embed roots (as written, and the path), and
+   the dependencies' directories, for this load *)
 let main_root = ref ""
+let embed_roots : (string * string) list ref = ref []
 let dep_dirs : (string * string) list ref = ref []
 
 (* embedded files for this load: (module, path as written, size) *)
 let embedded : (string * string * int) list ref = ref []
 
-let embed_root (m : modinfo) =
+(* The directories a module's embedded files may come from: its
+   dependency's, or the main package's and then its embed roots. *)
+let embed_dirs (m : modinfo) =
   if String.starts_with ~prefix:"<std>" m.mfile then None
-  else match m.mpkg with Some dep -> List.assoc_opt dep !dep_dirs | None -> Some !main_root
+  else
+    match m.mpkg with
+    | Some dep -> Option.map (fun d -> [ d ]) (List.assoc_opt dep !dep_dirs)
+    | None -> Some (!main_root :: List.map snd !embed_roots)
+
+let inside_of root r = String.starts_with ~prefix:(if root = "/" then root else root ^ "/") r || r = root
+
+(* The real path of the first of [roots] that holds the real path [real]
+   (the first root must exist), or the message saying [path] is outside
+   them all. *)
+let pick_root roots real path =
+  let reals = List.filter_map (fun r -> try Some (Unix.realpath r) with Unix.Unix_error _ -> None) (List.tl roots) in
+  let first = Unix.realpath (List.hd roots) in
+  match List.find_opt (fun r -> inside_of r real) (first :: reals) with
+  | Some r -> Ok r
+  | None ->
+    if reals = [] then
+      Error (Printf.sprintf "`%s` is outside this package (%s); a program can embed only its own package's files" path first)
+    else
+      Error
+        (Printf.sprintf "`%s` is outside this package (%s) and its embed roots (%s); a program can embed only its own package's files and those under the roots its tessera.toml declares"
+           path first (String.concat ", " reals))
+
+(* The message for a path outside every root. *)
+let outside_msg roots path = match pick_root roots "" path with Error m -> m | Ok _ -> ""
 
 let embed_file (m : modinfo) name path sp : expr_desc option =
   let fail msg = err "E0405" sp msg; None in
-  match embed_root m with
+  match embed_dirs m with
   | None -> fail (Printf.sprintf "the standard library cannot use `%s`" name)
-  | Some root ->
+  | Some roots ->
     if path = "" || not (Filename.is_relative path) then
       fail (Printf.sprintf "`%s` takes a path relative to this file, not `%s`" name path)
     else (
       let full = Filename.concat (Filename.dirname m.mfile) path in
-      match (Unix.realpath full, Unix.realpath root) with
+      match (Unix.realpath full, Unix.realpath (List.hd roots)) with
       | exception Unix.Unix_error _ -> fail (Printf.sprintf "cannot find `%s` (looked for %s)" path full)
-      | real, root ->
-        let inside = String.starts_with ~prefix:(if root = "/" then root else root ^ "/") real in
-        if not inside then
-          fail (Printf.sprintf "`%s` is outside this package (%s); a program can embed only its own package's files" path root)
-        else if Sys.is_directory real then fail (Printf.sprintf "`%s` is a directory, not a file" path)
+      | real, _ ->
+        match pick_root roots real path with
+        | Error msg -> fail msg
+        (* a single file is never a root itself *)
+        | Ok r when r = real -> fail (outside_msg roots path)
+        | Ok _ ->
+        if Sys.is_directory real then fail (Printf.sprintf "`%s` is a directory, not a file" path)
         else
           match In_channel.with_open_bin real In_channel.input_all with
           | exception Sys_error e -> fail (Printf.sprintf "cannot read `%s`: %s" path e)
@@ -266,20 +298,21 @@ let embed_file (m : modinfo) name path sp : expr_desc option =
 let embed_dir (m : modinfo) path sp : expr_desc option =
   let name = "embed_dir" in
   let fail msg = err "E0405" sp msg; None in
-  match embed_root m with
+  match embed_dirs m with
   | None -> fail (Printf.sprintf "the standard library cannot use `%s`" name)
-  | Some root ->
+  | Some roots ->
     if path = "" || not (Filename.is_relative path) then
       fail (Printf.sprintf "`%s` takes a path relative to this file, not `%s`" name path)
     else (
       let full = Filename.concat (Filename.dirname m.mfile) path in
-      match (Unix.realpath full, Unix.realpath root) with
+      match (Unix.realpath full, Unix.realpath (List.hd roots)) with
       | exception Unix.Unix_error _ -> fail (Printf.sprintf "cannot find `%s` (looked for %s)" path full)
-      | real, root ->
-        let inside r = String.starts_with ~prefix:(if root = "/" then root else root ^ "/") r || r = root in
-        if not (inside real) then
-          fail (Printf.sprintf "`%s` is outside this package (%s); a program can embed only its own package's files" path root)
-        else if not (Sys.is_directory real) then fail (Printf.sprintf "`%s` is a file, not a directory; use `embed` or `embed_bytes` for one file" path)
+      | real, _ ->
+        match pick_root roots real path with
+        | Error msg -> fail msg
+        | Ok root ->
+        let inside = inside_of root in
+        if not (Sys.is_directory real) then fail (Printf.sprintf "`%s` is a file, not a directory; use `embed` or `embed_bytes` for one file" path)
         else
           (* (key, contents) for every file, or the first problem *)
           let rec walk dir key_prefix acc =
@@ -739,7 +772,7 @@ let check_aliases (m : modinfo) =
 
 (* Load the main file at [path] (whose text is [src]) and every module it uses.
    Returns the flat program, or the diagnostics. *)
-let load ?(deps = []) ?root path src : item list * Diag.t list =
+let load ?(deps = []) ?root ?roots path src : item list * Diag.t list =
   errors := [];
   (* without one (the editor, the agent server), the tessera.toml around the
      file decides, as in a build; finding it fetches nothing *)
@@ -747,6 +780,18 @@ let load ?(deps = []) ?root path src : item list * Diag.t list =
     (match root with
      | Some r -> r
      | None -> ( match Package.find path with Some toml -> Filename.dirname toml | None -> Filename.dirname path));
+  (embed_roots :=
+     match roots with
+     | Some rs -> rs
+     | None -> (
+       (* the same for the embed roots: a tessera.toml that cannot be read declares none *)
+       match Package.find path with
+       | Some toml -> (
+         try
+           let p = Package.parse toml (In_channel.with_open_bin toml In_channel.input_all) in
+           List.map (fun (r, full, _) -> (r, full)) p.embed_roots
+         with _ -> [])
+       | None -> []));
   dep_dirs := deps;
   embedded := [];
   Hashtbl.reset cyclic;
@@ -769,6 +814,19 @@ let load ?(deps = []) ?root path src : item list * Diag.t list =
                 ~notes:[ Printf.sprintf "looked for %s, the dependencies in tessera.toml and the standard library" (Filename.concat dir (name ^ ".tsr")) ]
             | Some (p, None, _) -> err "E0401" sp (Printf.sprintf "cannot read module `%s` at %s" name p)
             | Some (p, Some src, from_dep) ->
+              (* only the program declares embed roots *)
+              let real d = try Unix.realpath d with Unix.Unix_error _ -> d in
+              (if from_dep && real (Filename.dirname p) <> real !main_root then
+                 let toml = Filename.concat (Filename.dirname p) "tessera.toml" in
+                 match read_file toml with
+                 | Some text -> (
+                   match Package.declares_embed toml text with
+                   | Some tsp ->
+                     err "E0321" tsp
+                       (Printf.sprintf "dependency `%s` declares embed roots in its tessera.toml; only the program's own tessera.toml can" name)
+                       ~notes:[ "a dependency embeds only files of its own directory; remove its [embed] table" ]
+                   | None -> ())
+                 | None -> ());
               let f = parse p src in
               (* tests and main belong to the program being run, not its modules *)
               let items = List.filter (function IFn { fn_test = Some _; _ } -> false | _ -> true) f.items in
@@ -831,7 +889,8 @@ let load_and_check path src : item list * Diag.t list * Check.fn_info list =
   | Ok pkg -> (
     let deps = match pkg with Some p -> List.map (fun (d : Package.dep) -> (d.dname, d.dir)) p.deps | None -> [] in
     let root = match pkg with Some p -> Filename.dirname p.file | None -> Filename.dirname path in
-    match load ~deps ~root path src with
+    let roots = match pkg with Some p -> List.map (fun (r, full, _) -> (r, full)) p.embed_roots | None -> [] in
+    match load ~deps ~root ~roots path src with
     | [], (_ :: _ as ds) -> ([], ds, [])
     | items, _ ->
       let ds, infos = Check.check_program items in

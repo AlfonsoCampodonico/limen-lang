@@ -313,7 +313,11 @@ fn caps_of(out: Stdout, err: Stderr, fs: Fs, setup: Setup, file: Str) -> Int {
         }
         out.print(i.name + spaces(width - i.name.len()) + "  " + what)
     }
-    // files read at compile time: changing one changes the program
+    // files read at compile time: changing one changes the program; the
+    // directories outside the package they may come from first
+    for (r, _, _) in f.loaded.manifest.map(|m| m.embed_roots) ?? [] {
+        out.print("embed root {r}")
+    }
     for e in f.loaded.embedded {
         out.print("embeds {e.path} ({e.size} bytes){if e.module == "" { "" } else { " in module " + e.module }}")
     }

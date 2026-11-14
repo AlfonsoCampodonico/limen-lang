@@ -6347,6 +6347,38 @@ fn main(root: Root) {
   ok "embed-shadowed"
     (embed_codes ~dep_src:inside "use embdep\n\nfn embed(s: Str) -> Str {\n    s\n}\n\nfn main(root: Root) {\n    root.stdout.print(embed(\"../anything\"))\n}\n" = [])
     "a function named embed is an ordinary call";
+  (* embed roots: the program's tessera.toml adds directories its own files
+     may embed from; a dependency keeps the package-only rule, and its
+     tessera.toml cannot add any *)
+  (try Unix.mkdir (Filename.concat pdir "shared") 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+  put "shared/s.txt" "shared!";
+  let rooted ?(roots = "[\"../shared\"]") ~dep_src main_src =
+    put "embdep/embdep.tsr" dep_src;
+    put "app/tessera.toml" ("[package]\nname = \"app\"\n[dependencies]\nembdep = { path = \"../embdep\" }\n[embed]\nroots = " ^ roots ^ "\n");
+    let path = Filename.concat pdir "app/embmain.tsr" in
+    put "app/embmain.tsr" main_src;
+    let items, ds, _ = Modules.load_and_check path main_src in
+    (items, ds)
+  in
+  let _, ds = rooted ~dep_src:inside (main_uses "embed(\"../shared/s.txt\")") in
+  ok "embed-root" (codes ds = [] && List.mem ("", "../shared/s.txt", 7) !Modules.embedded && List.map fst !Modules.embed_roots = [ "../shared" ]) (String.concat " " (codes ds));
+  let _, ds = rooted ~dep_src:inside (main_uses "embed_dir(\"../shared\").len()") in
+  ok "embed-root-dir" (codes ds = []) (String.concat " " (codes ds));
+  let _, ds = rooted ~dep_src:(dep_embeds "../shared/s.txt") (main_uses "1") in
+  ok "embed-root-not-for-deps" (codes ds = [ "E0405" ]) "a dependency still embeds only its own files";
+  let _, ds = rooted ~dep_src:inside (main_uses "embed(\"../embdep/note.txt\")") in
+  ok "embed-root-outside" (codes ds = [ "E0405" ] && Interp_util.find_sub (List.hd ds).message "embed roots" 0 <> None) (String.concat " " (codes ds));
+  let _, ds = rooted ~roots:"[\"../nowhere\"]" ~dep_src:inside (main_uses "1") in
+  ok "embed-root-missing" (codes ds = [ "E0321" ]) (String.concat " " (codes ds));
+  let _, ds = rooted ~roots:"[]" ~dep_src:inside (main_uses "1") in
+  ok "embed-root-empty" (codes ds = [ "E0321" ]) (String.concat " " (codes ds));
+  put "embdep/tessera.toml" "[package]\nname = \"embdep\"\n\n[embed]\nroots = [\"../app\"]\n";
+  let _, ds = rooted ~dep_src:inside (main_uses "1") in
+  ok "embed-root-dep-toml" (codes ds = [ "E0321" ] && Interp_util.find_sub (List.hd ds).message "dependency `embdep` declares embed roots" 0 <> None) (String.concat " " (codes ds));
+  Sys.remove (Filename.concat pdir "embdep/tessera.toml");
+  (* the program built with a root runs the same in both backends *)
+  (let items, ds = rooted ~dep_src:inside "use embdep\n\nfn main(root: Root) {\n    root.stdout.print(embed(\"../shared/s.txt\") + embdep.text())\n}\n" in
+   ok "embed-root-runs" (ds = [] && items <> []) (String.concat " " (codes ds)));
   Sys.remove (Filename.concat pdir "app/tessera.toml");
 
   (* calling C is full trust: a dependency gets it only from [trust], never from caps,

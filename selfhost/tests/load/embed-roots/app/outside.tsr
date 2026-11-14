@@ -1,0 +1,8 @@
+// Outside the package and every root, a root itself as a file, and a
+// directory under a root as a file.
+fn main(root: Root) {
+    let a = embed("../vendor/dep/dep.tsr")
+    let b = embed("../assets")
+    let c = embed("../assets/css")
+    let d = embed_dir("../assets/css")
+}

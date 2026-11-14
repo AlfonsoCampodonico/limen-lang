@@ -1260,10 +1260,11 @@ fn main(root: Root) {
 
 - The path must be a string literal, relative to the file that names it.
 - It must stay inside that file's package: the directory of the program's tessera.toml (or of the main file when there is none), or a dependency's own directory. An absolute path, a `..` that leaves the package or a symlink that points outside it is error E0405. Without this rule a dependency could put `../../.ssh/id_rsa` into the binary, a read that no grant allows.
+- The program's own tessera.toml can name more directories its files may embed from, its **embed roots**: `[embed] roots = ["../assets"]`, relative to tessera.toml (section 18). A file of the program's package may then embed a file under one of them, still by a path relative to itself (`embed("../assets/logo.png")`). Dependencies keep the package-only rule: a dependency's tessera.toml that declares embed roots is E0321.
 - `embed` requires UTF-8 text (E0405 otherwise); `embed_bytes` takes any file. The standard library embeds nothing.
-- `embed_dir` takes every file under the directory and its subdirectories, keyed by its path inside it with `/` between parts, in sorted order. Names starting with `.` (`.git`, `.env`, `.DS_Store`) are left out, at any depth. Every file and subdirectory, links included, must stay inside the package (E0405), and a directory with nothing to embed is E0405 too. Values are `Bytes`; `to_str()` costs nothing for text.
+- `embed_dir` takes every file under the directory and its subdirectories, keyed by its path inside it with `/` between parts, in sorted order. Names starting with `.` (`.git`, `.env`, `.DS_Store`) are left out, at any depth. Every file and subdirectory, links included, must stay inside the package, or the embed root holding the directory (E0405), and a directory with nothing to embed is E0405 too. Values are `Bytes`; `to_str()` costs nothing for text.
 - The text is taken as it is: braces in the file do not start interpolation.
-- Changing an embedded file changes the program, and the build cache sees it, because the contents are part of the generated C. `tessera caps` lists every embedded file with its size after the functions (`"embeds"` in `--json`).
+- Changing an embedded file changes the program, and the build cache sees it, because the contents are part of the generated C. `tessera caps` lists the embed roots (`embed root ../assets`) and every embedded file with its size after the functions (`"embed_roots"` and `"embeds"` in `--json`).
 - A function or variable named `embed` in scope is called as usual.
 
 ### Capabilities
@@ -1470,7 +1471,7 @@ Every diagnostic has a stable code. `tessera explain CODE` prints its explanatio
 | E0310 | misuse of a group handle |
 | E0311 | `return` or `?` leaving a group |
 | E0320 | a dependency takes a capability tessera.toml does not grant it |
-| E0321 | malformed tessera.toml |
+| E0321 | malformed tessera.toml, an embed root that is not a directory, or a dependency's tessera.toml that declares embed roots |
 | E0322 | a git dependency could not be fetched |
 | E0323 | tessera.lock does not match: a malformed line, or a dependency whose files changed |
 | E0324 | a trusted dependency calls a C library that tessera.lock did not record |
@@ -1480,6 +1481,7 @@ Every diagnostic has a stable code. `tessera explain CODE` prints its explanatio
 | E0402 | item is not `pub` |
 | E0403 | module has no such item |
 | E0404 | module name used as a value |
+| E0405 | an embedded file outside its package (and, for the program's own files, its embed roots), missing, or not UTF-8 for `embed` |
 
 A **panic** (division by zero, a negative shift count, index out of range, a missing map key, `panic(...)`, no matching arm) stops the code that hit it:
 
@@ -1636,10 +1638,14 @@ json2 = { path = "vendor/json2" }                  # pure: no capabilities
 fetch = { path = "../fetch", caps = ["net"] }
 color = { git = "https://example.com/color.git", tag = "v1.2.0" }
 yaml = { git = "git@example.com:me/yaml.git", commit = "3f9c2e1d7a" }
+
+[embed]                                            # what `embed` may read besides the package
+roots = ["../assets"]
 ```
 
 - `[grants]` takes `net`, `fs`, `listen`, `env`, `exec` and `foreign`, each a string or a list of strings written exactly like the text after `--grant KIND=`. `fs` takes one directory, relative to tessera.toml, with an optional `:ro`. Stdout, Stderr, Stdin, Clock and Rand are always granted, so listing them is an error. Flags on the command line add to these grants.
 - Grants belong to the program being run: only the tessera.toml found for the main file is read for them. A dependency's own tessera.toml never grants anything, so adding or updating a dependency cannot widen what the program may do. A dependency gets capabilities in exactly one way: your code passes them to it, and only of the kinds its `caps` allow. `[grants]` decides what reaches `main`; `caps` decides which of those may cross into each dependency.
+- `[embed] roots` lists directories, relative to tessera.toml, whose files the program's own files may `embed` besides those of its package (section 11). Each must exist and be a directory, links followed (E0321 otherwise). Like grants, they belong to the program: a dependency embeds only its own directory's files, and a dependency whose tessera.toml has an `[embed]` table is E0321, though its tessera.toml is otherwise never read. Embedding reads files at compile time, not at run time, so a root grants the program nothing when it runs; it only decides what can be built into it.
 - A dependency is a directory holding `NAME.tsr`, plus any modules that file uses from the same directory.
 - `caps` lists what the dependency may use: `net` (Net and Conn), `listen` (Listen, Listener and Conn), `fs`, `stdout`, `stderr`, `stdin`, `clock`, `rand`, `env`, `exec`. The default is none. No dependency can take `Root`, and `caps` cannot give `foreign` (E0321).
 - `[trust] foreign = ["name", ...]` names the dependencies that may call C: declare foreign blocks and take `Foreign`. Calling C is full trust, since C code is outside every capability check, so it is a separate, explicit list rather than one more cap, and only the program's tessera.toml can hold it. An untrusted dependency that calls C is E0320. tessera.lock gets a line per trusted dependency that calls C, `foreign NAME LIB,LIB`, written on the first build; when an update makes the dependency declare a library the line does not have, the build stops (E0324) until you review it and delete the line.

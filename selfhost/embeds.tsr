@@ -6,9 +6,11 @@
 // that file's package: the directory of its tessera.toml (of the main file
 // when there is none), or a dependency's own directory. Otherwise a
 // dependency could bake `../../.ssh/id_rsa` into the binary, a read no
-// grant allows. Here that rule is a capability: the loader reads a
-// package's files through an Fs limited to the package (`fs.under`),
-// which refuses `..` and links that lead out of it.
+// grant allows. The program's own tessera.toml can add directories, its
+// embed roots (`[embed] roots = ["../assets"]`); a dependency's cannot.
+// Here that rule is a capability: the loader reads a file through an Fs
+// limited to the package or the root holding it (`fs.under`), which
+// refuses `..` and links that lead out of it.
 //
 // The loader reads every embedded file of a module before renaming it, so
 // renaming (selfhost/rename.tsr) stays pure; it looks up what each call
@@ -49,17 +51,18 @@ pub fn key(span: ast.Span) -> Str {
 }
 
 // What each embed call in `items` finds, by key. `file` is the path of
-// the module they come from and `root` its package's directory (None for
-// the standard library, which cannot embed). A call that a local or an
-// item turns out to hide is read too, and its result never used.
-pub fn read_all(fs: Fs, place: disk.Place, file: Str, root: Option[Str], items: List[ast.Item]) -> Map[Str, Found] {
+// the module they come from and `roots` the directories its files may
+// come from, its package's first (None for the standard library, which
+// cannot embed). A call that a local or an item turns out to hide is read
+// too, and its result never used.
+pub fn read_all(fs: Fs, place: disk.Place, file: Str, roots: Option[List[Str]], items: List[ast.Item]) -> Map[Str, Found] {
     let mut found: Map[Str, Found] = map()
     for e in items.flat_map(walk.item) {
         match e.desc {
             ECall(callee, args) => match callee.desc {
                 EVar(name) if is_embed(name) => match literal_path(args) {
                     Some(path) => {
-                        found[key(e.span)] = read(fs, place, file, root, name, path)
+                        found[key(e.span)] = read(fs, place, file, roots, name, path)
                     },
                     None => {},
                 },
@@ -71,8 +74,8 @@ pub fn read_all(fs: Fs, place: disk.Place, file: Str, root: Option[Str], items: 
     found
 }
 
-fn read(fs: Fs, place: disk.Place, file: Str, root: Option[Str], name: Str, path: Str) -> Found {
-    let root = match root {
+fn read(fs: Fs, place: disk.Place, file: Str, roots: Option[List[Str]], name: Str, path: Str) -> Found {
+    let roots = match roots {
         Some(r) => r,
         None => {
             return Problem("the standard library cannot use `{name}`")
@@ -84,7 +87,7 @@ fn read(fs: Fs, place: disk.Place, file: Str, root: Option[Str], name: Str, path
     let full = paths.concat(paths.dirname(file), path)
     let missing = Problem("cannot find `{path}` (looked for {full})")
     // the package's directory and the file, as real paths
-    let real_root = match fs.full_path(place.locate(root)) {
+    let real_main = match fs.full_path(place.locate(roots[0])) {
         Ok(r) => r,
         Err(_) => {
             return missing
@@ -99,9 +102,29 @@ fn read(fs: Fs, place: disk.Place, file: Str, root: Option[Str], name: Str, path
             return missing
         },
     }
-    let outside = Problem("`{path}` is outside this package ({real_root}); a program can embed only its own package's files")
-    let inner = match inside(real_root, real) {
-        Some(p) => p,
+    // the embed roots that exist, each with its real path
+    let extra = roots.skip(1).flat_map(|r| match fs.full_path(place.locate(r)) {
+        Ok(x) => [(r, x)],
+        Err(_) => [],
+    })
+    let outside = Problem(if extra.is_empty() {
+        "`{path}` is outside this package ({real_main}); a program can embed only its own package's files"
+    } else {
+        "`{path}` is outside this package ({real_main}) and its embed roots ({extra.map(|x| x.1).join(", ")}); a program can embed only its own package's files and those under the roots its tessera.toml declares"
+    })
+    // the first directory that holds the file
+    let mut chosen: Option[(Str, Str, Str)] = None
+    for (r, real_r) in [(roots[0], real_main)] + extra {
+        match inside(real_r, real) {
+            Some(p) => {
+                chosen = Some((r, real_r, p))
+                break
+            },
+            None => {},
+        }
+    }
+    let (root, real_root, inner) = match chosen {
+        Some(c) => c,
         None => {
             return outside
         },

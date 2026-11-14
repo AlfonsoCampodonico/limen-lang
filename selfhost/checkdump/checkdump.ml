@@ -108,7 +108,8 @@ let () =
   | Ok pkg -> (
     let deps = match pkg with Some p -> List.map (fun (d : Package.dep) -> (d.dname, d.dir)) p.deps | None -> [] in
     let root = match pkg with Some p -> Filename.dirname p.file | None -> Filename.dirname path in
-    match Modules.load ~deps ~root path src with
+    let roots = match pkg with Some p -> List.map (fun (r, full, _) -> (r, full)) p.embed_roots | None -> [] in
+    match Modules.load ~deps ~root ~roots path src with
     | [], (_ :: _ as ds) -> List.iter load_diag ds
     | items, _ ->
       let ds, infos = Check.check_program items in

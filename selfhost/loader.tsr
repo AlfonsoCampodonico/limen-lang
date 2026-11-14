@@ -54,6 +54,8 @@ struct Setup {
     deps: List[(Str, Str)],
     // the standard library's module names
     std_names: List[Str],
+    // the main package's directory
+    root: Str,
 }
 
 // The modules found so far, the files read, the problems.
@@ -93,6 +95,12 @@ pub fn load(fs: Fs, std: Fs, place: disk.Place, path: Str) -> Program {
                     return failed(files, [d])
                 },
             }
+            // the embed roots must be directories, through any links
+            for (r, full, span) in m.embed_roots {
+                if !fs.is_dir(place.locate(full)) {
+                    return failed(files, [diag.error("E0321", span, "embed root `{r}` is not a directory (looked for {full})")])
+                }
+            }
             for d in m.deps {
                 if d.git.is_some() {
                     return failed(files, [diag.error("E0322", d.span, "cannot fetch dependency `{d.name}`: this loader does not fetch git dependencies")])
@@ -114,7 +122,7 @@ pub fn load(fs: Fs, std: Fs, place: disk.Place, path: Str) -> Program {
         Err(_) => None,
     }
     let trusted = std_manifest.map(|m| m.trust) ?? []
-    let setup = Setup { place, deps, std_names }
+    let setup = Setup { place, deps, std_names, root }
     let (f, next_id) = match parser.parse_file(text, 0, 1) {
         Ok(parsed) => parsed,
         Err(e) => {
@@ -141,7 +149,7 @@ pub fn load(fs: Fs, std: Fs, place: disk.Place, path: Str) -> Program {
     let mut items: List[ast.Item] = []
     for m in order {
         st = check_aliases(st, m)
-        let found = embeds.read_all(fs, place, m.path, embed_root(m, deps, root), m.items)
+        let found = embeds.read_all(fs, place, m.path, embed_dirs(m, deps, root, manifest), m.items)
         let cx = rename.Context { module: m, mods: loading.mods, own: rename.own_items(m.items), gens: [], found, trusted }
         let src = loading.files[m.file].text
         for i in m.items {
@@ -191,15 +199,16 @@ fn find_manifest(fs: Fs, place: disk.Place, path: Str) -> Option[Str] {
     None
 }
 
-// The directory a module's embedded files must stay in: its dependency's,
-// or the main package's; the standard library embeds nothing.
-fn embed_root(m: rename.Module, deps: List[(Str, Str)], root: Str) -> Option[Str] {
+// The directories a module's embedded files may come from: its
+// dependency's, or the main package's and then the embed roots its
+// tessera.toml declares; the standard library embeds nothing.
+fn embed_dirs(m: rename.Module, deps: List[(Str, Str)], root: Str, manifest: Option[package.Manifest]) -> Option[List[Str]] {
     if rename.is_std(m) {
         return None
     }
     match m.package {
-        Some(dep) => deps.find(|d| d.0 == dep).map(|d| d.1),
-        None => Some(root),
+        Some(dep) => deps.find(|d| d.0 == dep).map(|d| [d.1]),
+        None => Some([root] + (manifest.map(|x| x.embed_roots.map(|r| r.1)) ?? [])),
     }
 }
 
@@ -266,6 +275,20 @@ fn visit(fs: Fs, std: Fs, setup: Setup, loading: Loading, m: rename.Module) -> R
             },
             Unreadable(p) => l.errors.push(diag.error("E0401", u.span, "cannot read module `{name}` at {p}")),
             Found(p, text, from_dep) => {
+                // only the program declares embed roots
+                let toml = paths.concat(paths.dirname(p), "tessera.toml")
+                if from_dep && !same_file(fs, setup.place, toml, paths.concat(setup.root, "tessera.toml")) {
+                    match fs.read(setup.place.locate(toml)) {
+                        Ok(src) => match package.declares_embed(l.files.len(), src) {
+                            Some(span) => {
+                                l.files.push(diag.Source { path: toml, text: src })
+                                l.errors.push(diag.error("E0321", span, "dependency `{name}` declares embed roots in its tessera.toml; only the program's own tessera.toml can").note("a dependency embeds only files of its own directory; remove its [embed] table"))
+                            },
+                            None => {},
+                        },
+                        Err(_) => {},
+                    }
+                }
                 let file = l.files.len()
                 l.files.push(diag.Source { path: p, text })
                 let (f, next_id) = match parser.parse_file(text, file, l.next_id) {

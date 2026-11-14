@@ -35,7 +35,7 @@ pub fn check(fs: Fs, place: disk.Place, files: List[diag.Source], std_file: Int,
     let warnings = c.diags.filter(|d| d.warning)
     let mut errors = c.diags.filter(|d| !d.warning)
     if errors.is_empty() {
-        let std = std_manifest ?? package.Manifest { name: "", path: "", deps: [], grants: [], trust: [] }
+        let std = std_manifest ?? package.Manifest { name: "", path: "", deps: [], grants: [], trust: [], embed_roots: [] }
         let numbered = { std with deps: std.deps.map(|d| { d with span: { d.span with file: std_file } }) }
         errors = enforce(files, true, numbered, std_modules.map(|m| (m, m)), c.infos)
     }
