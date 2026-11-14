@@ -1,14 +1,24 @@
 # Tessera in Tessera
 
-The start of a Tessera compiler written in Tessera. The plan is the usual
-bootstrap: the OCaml compiler in `src/` builds this one, this one builds
-itself, and when two rounds of that produce the same C, the compiler hosts
-itself. The OCaml compiler stays as the way to build from scratch.
+The Tessera compiler, written in Tessera. Tessera is self-hosting: the
+OCaml compiler in `src/` builds this one (stage 1), stage 1 builds itself
+(stage 2), stage 2 builds itself again (stage 3), and stages 2 and 3 emit
+the same C, which is also exactly what the OCaml compiler emits for it
+(about 368,000 lines). `sh selfhost/bootstrap.sh` runs all three stages and
+checks that; it takes about three minutes, nearly all of it the C compiler.
+The OCaml compiler stays as the way to build from scratch, and as the
+reference: `sh selfhost/check.sh` requires both compilers to agree on every
+program, step by step.
 
-So far: the whole compiler for `check`, `caps` and `build`: the lexer,
-the parser, the module loader, the type checker, lowering to the IR and
-the passes on it, C generation, and the build (the C compiler, the build
-cache). It gives the OCaml compiler's C byte for byte.
+`tessera.tsr` is the compiler program: `check`, `caps` and `build` (with
+`--emit-c` and `--tests`), with the same output and exit codes as the OCaml
+CLI. It holds only the authority it is granted: files, a fixed list of
+environment variables, and the programs a build runs (the C compiler and a
+few file tools); `tessera caps selfhost/tessera.tsr` shows that checking,
+lowering and C generation are pure. The interpreter, formatter, language
+server, `doc` and MCP server are still OCaml only.
+
+What each file does, in pipeline order:
 
 - `lexer.tsr` turns source text into tokens, with the same rules, positions
   and errors as `src/lexer.ml`.
