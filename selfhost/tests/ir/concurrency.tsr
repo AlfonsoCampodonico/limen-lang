@@ -1,0 +1,72 @@
+// Groups and tasks, with and without results, interleaved output, a
+// deadline (`until`), channels, and `select` with receives, sends,
+// timeouts, guards and a default arm.
+fn work(n: Int) -> Int {
+    n * n
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let clock = root.clock
+    let results = group g {
+        for i in 0..<3 {
+            g.go(|| work(i))
+        }
+    }
+    out.print("{results}")
+    let logs = group g interleaved {
+        g.go(|| {
+            out.print("task")
+            1
+        })
+    }
+    out.print("{logs.len()}")
+    let timed = group g until clock.after(50) {
+        g.go(|| {
+            clock.sleep(10)
+            "done"
+        })
+        g.go(|| {
+            clock.sleep(1000)
+            "late"
+        })
+    }
+    out.print("{timed}")
+    let ch: Chan[Int] = channel(2)
+    let done: Chan[Str] = channel(1)
+    let _ = group g {
+        g.go(|| {
+            ch.send(1)
+            ch.send(2)
+            ch.close()
+            0
+        })
+        g.go(|| {
+            let mut seen = 0
+            let mut open = true
+            while open {
+                select {
+                    v = ch.recv() => match v {
+                        Some(x) => {
+                            seen = seen + x
+                        },
+                        None => {
+                            open = false
+                        },
+                    },
+                    done.send("tick") if seen > 100 => {},
+                    clock.after(500) => {
+                        open = false
+                    },
+                }
+            }
+            seen
+        })
+    }
+    let got = select {
+        ch.recv() => "closed",
+        s = done.recv() => s ?? "none",
+        _ => "nothing ready",
+    }
+    out.print(got)
+}

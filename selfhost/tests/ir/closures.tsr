@@ -1,0 +1,77 @@
+// Closures and what they capture: a variable of the enclosing function,
+// one of a function two levels out (captured by every closure between),
+// the same variable used twice, functions and variant constructors used
+// as values, methods as values, and closures that can return early, which
+// are never inlined.
+struct Point {
+    x: Int,
+    y: Int,
+}
+
+enum Op {
+    Add(Int),
+    Neg,
+}
+
+fn shift(self: Point, d: Int) -> Point {
+    Point { x: self.x + d, y: self.y + d }
+}
+
+fn double(n: Int) -> Int {
+    n * 2
+}
+
+fn run(ops: List[fn(Int) -> Int], n: Int) -> Int {
+    ops.fold(n, |acc, f| f(acc))
+}
+
+fn make_adder(k: Int) -> fn(Int) -> Int {
+    |x| x + k
+}
+
+fn nested(base: Int) -> fn(Int) -> fn(Int) -> Int {
+    |a| |b| base + a + b + base
+}
+
+fn early(xs: List[Int]) -> List[Int] {
+    xs.map(|x| {
+        if x < 0 {
+            return 0
+        }
+        x * 10
+    })
+}
+
+fn tries(xs: List[Str]) -> List[Option[Int]] {
+    xs.map(|s| {
+        let n = s.parse_int()?
+        Some(n + 1)
+    })
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let k = 5
+    let add_k = |x: Int| x + k
+    let f = double
+    let g = make_adder(3)
+    out.print("{run([add_k, f, g, double], 1)}")
+    out.print("{nested(1)(2)(3)}")
+    let mk = Add
+    let ops = [mk(1), Op.Neg, Add(2)].map(|o| match o {
+        Add(n) => n + k,
+        Neg => 0 - k,
+    })
+    out.print("{ops}")
+    let p = Point { x: 1, y: 2 }
+    let mover = p.shift
+    let moved = [1, 2].map(mover)
+    out.print("{moved.len()} {early([1, -1])} {tries(["1", "x"])}")
+    let say = out.print
+    say("bye {k}")
+    let counter = |n: Int| {
+        let inner = |m: Int| m + n + k
+        inner(n) + inner(k)
+    }
+    out.print("{counter(2)}")
+}

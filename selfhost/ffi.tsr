@@ -35,12 +35,17 @@ pub struct CParam {
     out: Bool,
 }
 
-// The C signature of a foreign declaration. `trusted`: no Foreign
-// capability is passed or checked.
+// The C signature of a foreign declaration: its library and symbol, its
+// parameters and result. `trusted`: no Foreign capability is passed or
+// checked. `fixed`: for a variadic function, how many parameters come
+// before the `...`.
 pub struct CSig {
+    lib: Str,
+    sym: Str,
     params: List[CParam],
     ret: CTy,
     trusted: Bool,
+    fixed: Option[Int],
 }
 
 // What the interpreter's call stubs can pass, and so the limits of both
@@ -81,10 +86,32 @@ fn tessera_ty(c: CTy) -> types.Ty {
     }
 }
 
-// The value a call produces: the result, then the out-parameters.
+// The C type a boundary type is written as; a struct and a callback are
+// named by the native backend.
+pub fn c_name(c: CTy) -> Str {
+    match c {
+        Int => "int64_t",
+        Int32 => "int32_t",
+        Float => "double",
+        Bool => "int",
+        Str => "const char *",
+        Bytes => "const void *",
+        Handle => "void *",
+        Unit => "void",
+        Struct(..) | Fn(..) => panic("ffi.c_name: a struct or callback is named by the backend"),
+    }
+}
+
+// The values a call produces, in order: the result, then the
+// out-parameters.
+pub fn results(s: CSig) -> List[CTy] {
+    (if s.ret == Unit { [] } else { [s.ret] }) + s.params.filter(|p| p.out).map(|p| p.cty)
+}
+
+// The value a call produces: the results, as a tuple when there are
+// several.
 pub fn result_ty(s: CSig) -> types.Ty {
-    let results = (if s.ret == Unit { [] } else { [s.ret] }) + s.params.filter(|p| p.out).map(|p| p.cty)
-    match results {
+    match results(s) {
         [] => TUnit,
         [t] => tessera_ty(t),
         ts => TNamed(ast.tuple_name(ts.len()), ts.map(tessera_ty)),
@@ -378,5 +405,21 @@ pub fn of_decl(d: ast.FnDecl, structs: Map[Str, ast.StructDecl]) -> Result[CSig,
         },
         _ => {},
     }
-    if errs.is_empty() { Ok(CSig { params, ret, trusted: f.trusted }) } else { Err(errs) }
+    if errs.is_empty() { Ok(CSig { lib: f.lib, sym: f.sym, params, ret, trusted: f.trusted, fixed: f.variadic }) } else { Err(errs) }
+}
+
+// The libraries a program's foreign declarations name, each once, in
+// order; the runtime's own `tessera` is not one.
+pub fn libs(items: List[ast.Item]) -> List[Str] {
+    let mut acc: List[Str] = []
+    for i in items {
+        match i {
+            IFn(d) => match d.foreign {
+                Some(f) if f.lib != "tessera" && !acc.contains(f.lib) => acc.push(f.lib),
+                _ => {},
+            },
+            _ => {},
+        }
+    }
+    acc
 }

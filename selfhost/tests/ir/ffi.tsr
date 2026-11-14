@@ -1,0 +1,39 @@
+// Calls of C functions: the Foreign capability first, Out parameters
+// returned after the result, C structs by value, callbacks (top-level
+// functions C calls, with and without the call's Foreign), and variadic
+// functions.
+foreign "c" {
+    struct Div { quot: Int32, rem: Int32 }
+    fn div(a: Int32, b: Int32) -> Div
+    fn strtol(s: Str, end: Out[Handle], base: Int32) -> Int
+    fn frexp(x: Float, exp: Out[Int32]) -> Float
+    fn printf(format: Str, ..., n: Int, s: Str) -> Int32
+    fn snprintf(buf: Handle, size: Int, format: Str, ..., x: Float) -> Int32
+    fn qsort(base: Handle, n: Int, size: Int, cmp: fn(Handle, Handle) -> Int32)
+    fn atexit(f: fn() -> ())
+    fn getenv(name: Str) -> Str
+    fn abs(n: Int32) -> Int32
+}
+
+foreign "m" {
+    fn cbrt(x: Float) -> Float
+}
+
+fn compare(a: Handle, b: Handle) -> Int {
+    0
+}
+
+fn bye(foreign: Foreign) {
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let c = root.foreign
+    let d = div(c, 7, 2)
+    let (n, end) = strtol(c, "42x", 10)
+    let (m, e) = frexp(c, 8.0)
+    let _ = printf(c, "%lld %s\n", 3, "three")
+    qsort(c, end, 0, 8, compare)
+    atexit(c, bye)
+    out.print("{d.quot} {d.rem} {n} {end.addr} {m} {e} {getenv(c, "HOME")} {abs(c, -3)} {cbrt(c, 27.0)}")
+}

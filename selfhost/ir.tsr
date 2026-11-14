@@ -1,0 +1,281 @@
+// The compiler's intermediate form, as src/ir.ml has it: a small
+// structured IR in A-normal form. Every type is concrete (no generics, no
+// unknowns). Every variable owns its value; the ownership pass
+// (selfhost/own.tsr) decides where to retain (VDup) and where to release
+// (Drop).
+//
+// The constructors keep OCaml's names, except where another module of the
+// compiler already has the name (`Not`, `Neg`, `Interp`): an unqualified
+// variant must name one enum.
+use ast
+use ffi
+use types
+
+// A variable: unique by `id` in a program; `name` is for reading.
+pub struct Var {
+    id: Int,
+    name: Str,
+    ty: types.Ty,
+}
+
+pub enum Atom {
+    // a use of a variable; a move when consumed
+    V(Var),
+    // consumed while still live elsewhere: retain first
+    VDup(Var),
+    AInt(Int),
+    AFloat(Float),
+    ABool(Bool),
+    AUnit,
+    AStr(Str),
+}
+
+// A step into a value: a struct field (by declaration index), a list
+// element, or a map entry.
+pub enum Step {
+    PField(Int),
+    PIndex(Atom, ast.Span),
+    // an index already proven in range (loops the compiler made)
+    PIndexU(Atom),
+    // a map entry by key; panics when the key is missing
+    PKey(Atom, ast.Span),
+}
+
+// One method of a `dyn` value's vtable: the C function implementing it,
+// its parameter types after self, and its result type.
+pub struct DynEntry {
+    fname: Str,
+    params: List[types.Ty],
+    ret: types.Ty,
+}
+
+// A callback passed to C: the top-level function's C name, its Tessera
+// name, where it is declared, and whether it takes the call's Foreign
+// first.
+pub struct Callback {
+    cname: Str,
+    name: Str,
+    span: ast.Span,
+    takes_foreign: Bool,
+}
+
+pub enum Rhs {
+    // consumed (OCaml's `Atom`)
+    Use(Atom),
+    // the operand type; borrowed
+    Bin(ast.BinOp, types.Ty, Atom, Atom, ast.Span),
+    // OCaml's `Neg`
+    Negate(types.Ty, Atom),
+    // OCaml's `Not`
+    Flip(Atom),
+    // consumed
+    Call(Str, List[Atom]),
+    // closure borrowed, arguments consumed
+    CallClo(Atom, List[Atom]),
+    // a built-in method on the receiver type; borrowed
+    Prim(Str, types.Ty, List[Atom], ast.Span),
+    MkStruct(types.Ty, List[Atom]),
+    MkEnum(types.Ty, Int, List[Atom]),
+    MkList(types.Ty, List[Atom]),
+    // a lifted function, captures consumed
+    MkClosure(Str, types.Ty, List[Atom]),
+    // read through steps; borrowed, the result retained
+    Get(Atom, types.Ty, List[Step]),
+    // an enum value, its type, the tag, the field
+    Payload(Atom, types.Ty, Int, Int),
+    IsTag(Atom, types.Ty, Int),
+    PatTest(Atom, types.Ty, ast.Pat),
+    // OCaml's `Interp`
+    Format(List[IPart]),
+    RootField(Atom, Str),
+    Panic(Atom, ast.Span),
+    // `until clock.after(ms)`: clock, milliseconds; whether the tasks'
+    // output interleaves
+    GroupNew(Option[(Atom, Atom)], Bool),
+    // group (borrowed), task closure (consumed), result type, whether its
+    // result goes in the group's list
+    Spawn(Atom, Atom, types.Ty, Bool),
+    // wait for every task; the result list type; with a deadline (each
+    // result an Option)
+    GroupJoin(Atom, types.Ty, Bool),
+    // channel type, capacity
+    ChanNew(types.Ty, Atom, ast.Span),
+    // channel (borrowed), value (consumed)
+    ChanSend(Atom, Atom, ast.Span),
+    // box a value of a concrete type as `dyn I` (consumed): the type, the
+    // vtable's key, the value, one entry per interface method
+    MkDyn(types.Ty, Str, Atom, List[DynEntry]),
+    // select number, operations, has a `_` arm; the result is the index
+    // of the operation done, or -1 for `_`
+    Select(Int, List[Sel], Bool, ast.Span),
+    // the Option a receive in select [n], operation [i], produced
+    SelGot(Int, Int, types.Ty),
+    // call a closure (borrowed) under a panic boundary; its result type
+    Catch(Atom, types.Ty),
+    // method index, parameters, result, receiver (borrowed), arguments
+    // (consumed)
+    CallDyn(Int, List[types.Ty], types.Ty, Atom, List[Atom]),
+    // a C function: the Foreign capability first, then the arguments that
+    // are not Out or callbacks, all borrowed; then the callbacks
+    CallC(ffi.CSig, List[Atom], List[Callback], ast.Span),
+}
+
+// An operation of a `select`: channels borrowed, send values consumed.
+pub enum Sel {
+    // channel, element type, enabled (its guard)
+    SRecv(Atom, types.Ty, Atom),
+    // channel, value, element type, enabled
+    SSend(Atom, Atom, types.Ty, Atom),
+    // clock, milliseconds, enabled
+    SAfter(Atom, Atom, Atom),
+}
+
+pub enum IPart {
+    IStr(Str),
+    IVal(Atom, types.Ty),
+    // printed as inside a container
+    IValQ(Atom, types.Ty),
+}
+
+pub enum Stmt {
+    Let(Var, Rhs),
+    // declared, initialised later by Init in each branch
+    Decl(Var),
+    Init(Var, Rhs),
+    // reassign; whether to release the old value (the ownership pass says)
+    Set(Var, Rhs, Bool),
+    Mutate(Var, List[Step], Mutation),
+    If(Atom, List[Stmt], List[Stmt]),
+    Loop(List[Stmt]),
+    Break,
+    Continue,
+    Return(Atom),
+    Drop(Var),
+    // a `defer`: guard number, the deferred body to run when a panic or a
+    // cancellation leaves the protected statements, and those statements
+    Guard(Int, List[Stmt], List[Stmt]),
+    // leave guard [n] normally: pop its panic boundary
+    GuardEnd(Int),
+    // the body of a group with a deadline
+    Scope(Atom, List[Stmt]),
+}
+
+pub enum Mutation {
+    MSet(Atom),
+    MPush(Atom),
+    // a map: key, value
+    MPut(Atom, Atom),
+    // a map: key
+    MRemove(Atom),
+}
+
+pub fn mut_atoms(m: Mutation) -> List[Atom] {
+    match m {
+        MSet(a) | MPush(a) | MRemove(a) => [a],
+        MPut(k, v) => [k, v],
+    }
+}
+
+pub struct Fn {
+    fname: Str,
+    params: List[Var],
+    // non-empty only for lifted closures
+    captures: List[Var],
+    is_closure: Bool,
+    ret: types.Ty,
+    body: List[Stmt],
+}
+
+// A test or a benchmark: its C name, the root fields it takes, and for a
+// test whether it runs on virtual time.
+pub struct Test {
+    cname: Str,
+    fields: List[Str],
+    virtual: Bool,
+}
+
+pub struct Program {
+    fns: List[Fn],
+    main: Str,
+    main_takes_root: Bool,
+    main_ret: types.Ty,
+    tests: List[Test],
+    benches: List[Test],
+}
+
+// The atoms of an rhs that are consumed (ownership moves).
+pub fn consumed(r: Rhs) -> List[Atom] {
+    match r {
+        Use(a) => [a],
+        Call(_, args) | CallClo(_, args) => args,
+        MkStruct(_, xs) | MkEnum(_, _, xs) | MkList(_, xs) | MkClosure(_, _, xs) => xs,
+        Spawn(_, c, _, _) => [c],
+        ChanSend(_, v, _) => [v],
+        MkDyn(_, _, a, _) => [a],
+        Select(_, ops, _, _) => ops.flat_map(|op| match op {
+            SSend(_, v, _, _) => [v],
+            SRecv(..) | SAfter(..) => [],
+        }),
+        CallDyn(_, _, _, _, args) => args,
+        _ => [],
+    }
+}
+
+// The atoms of an rhs that are only read.
+pub fn borrowed(r: Rhs) -> List[Atom] {
+    match r {
+        Use(_) | Call(..) | MkStruct(..) | MkEnum(..) | MkList(..) | MkClosure(..) => [],
+        CallClo(c, _) => [c],
+        CallDyn(_, _, _, recv, _) => [recv],
+        Catch(c, _) => [c],
+        Select(_, ops, _, _) => ops.flat_map(|op| match op {
+            SSend(c, _, _, g) | SRecv(c, _, g) => [c, g],
+            SAfter(c, ms, g) => [c, ms, g],
+        }),
+        SelGot(..) | MkDyn(..) => [],
+        Bin(_, _, a, b, _) => [a, b],
+        Negate(_, a) | Flip(a) => [a],
+        Prim(_, _, xs, _) => xs,
+        CallC(_, xs, _, _) => xs,
+        Get(a, _, steps) => [a] + step_atoms(steps),
+        Payload(a, ..) | IsTag(a, ..) | PatTest(a, ..) => [a],
+        Format(ps) => ps.flat_map(|p| match p {
+            IVal(a, _) | IValQ(a, _) => [a],
+            IStr(_) => [],
+        }),
+        RootField(a, _) => [a],
+        Panic(a, _) => [a],
+        Spawn(g, ..) | GroupJoin(g, ..) => [g],
+        GroupNew(None, _) => [],
+        GroupNew(Some((c, ms)), _) => [c, ms],
+        ChanNew(_, cap, _) => [cap],
+        ChanSend(c, _, _) => [c],
+    }
+}
+
+// The index and key atoms of a path.
+pub fn step_atoms(steps: List[Step]) -> List[Atom] {
+    steps.flat_map(|s| match s {
+        PIndex(a, _) | PIndexU(a) | PKey(a, _) => [a],
+        PField(_) => [],
+    })
+}
+
+pub fn atom_var(a: Atom) -> Option[Var] {
+    match a {
+        V(v) | VDup(v) => Some(v),
+        _ => None,
+    }
+}
+
+// The type of an atom.
+pub fn atom_ty(a: Atom) -> types.Ty {
+    match a {
+        V(v) | VDup(v) => v.ty,
+        AInt(_) => TInt,
+        AFloat(_) => TFloat,
+        ABool(_) => TBool,
+        AUnit => TUnit,
+        AStr(_) => TStr,
+    }
+}

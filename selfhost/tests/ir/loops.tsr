@@ -1,0 +1,73 @@
+// Loops C generation treats specially: a counted loop that only pushes a
+// constant (filled in one go), loops indexing lists by a counter that
+// stays below their length (versioned), lists written in a loop that can
+// be made unique before it, and loops where none of that holds.
+fn fill(n: Int) -> List[Int] {
+    let mut xs: List[Int] = []
+    let mut i = 0
+    while i < n {
+        xs.push(0)
+        i = i + 1
+    }
+    let mut j = 0
+    while j <= n {
+        xs.push(7)
+        j = j + 1
+    }
+    xs
+}
+
+fn dot(a: List[Int], b: List[Int], n: Int) -> Int {
+    let mut t = 0
+    let mut i = 0
+    while i < n {
+        t = t + a[i] * b[i]
+        i = i + 1
+    }
+    t
+}
+
+fn scale(xs: List[Float], k: Float) -> List[Float] {
+    let mut ys = xs
+    let mut i = 0
+    let n = ys.len()
+    while i < n {
+        ys[i] = ys[i] * k
+        i = i + 2
+    }
+    ys
+}
+
+fn grow(n: Int) -> List[Int] {
+    let mut xs = [1]
+    for i in 0..<n {
+        xs.push(i)
+        xs[0] = xs[0] + i
+    }
+    xs
+}
+
+fn shared(n: Int) -> List[List[Int]] {
+    let mut xs = [0]
+    let mut all: List[List[Int]] = []
+    for i in 0..<n {
+        xs.push(i)
+        all.push(xs)
+    }
+    all
+}
+
+fn late_index(xs: List[Int], n: Int) -> Int {
+    let mut i = 0
+    let mut t = 0
+    while i < n {
+        i = i + 1
+        t = t + xs[i]
+    }
+    t
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    out.print("{fill(3)} {dot([1, 2], [3, 4], 2)} {scale([1.0, 2.0], 2.0)} {grow(3)} {shared(2)} {late_index([1, 2, 3], 2)}")
+}

@@ -1,0 +1,51 @@
+// Pure calls: a repeated call with the same arguments reuses the first
+// one's result (until an argument is reassigned), and a heavy call whose
+// arguments do not change in a loop is made once and kept across it.
+fn slow(n: Int) -> Int {
+    let mut t = 0
+    for i in 0..<n {
+        t = t + i
+    }
+    t
+}
+
+fn fast(n: Int) -> Int {
+    n + 1
+}
+
+fn words(s: Str) -> List[Str] {
+    s.split(" ")
+}
+
+fn effect(out: Stdout, n: Int) -> Int {
+    out.print("{n}")
+    n
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let a = slow(10) + slow(10)
+    let b = fast(1) + fast(1)
+    let mut n = 3
+    let c = slow(n)
+    n = n + 1
+    let d = slow(n) + slow(n)
+    let e = effect(out, 1) + effect(out, 1)
+    let text = "a b c"
+    let mut count = 0
+    for i in 0..<5 {
+        let ws = words(text)
+        let parts = text.split(" ")
+        count = count + ws.len() + parts.len() + slow(4) + fast(i)
+        if i > 2 {
+            count = count + text.to_upper().len()
+        }
+    }
+    let mut j = 0
+    while j < 3 {
+        let changing = slow(j)
+        count = count + changing
+        j = j + 1
+    }
+    out.print("{a} {b} {c} {d} {e} {count}")
+}

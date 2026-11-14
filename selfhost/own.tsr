@@ -1,0 +1,341 @@
+// Ownership, as src/own.ml decides it: where the IR retains a value and
+// where it releases one (Perceus-style, without reuse).
+//
+// 1. Backward liveness over the structured IR (loops iterate to a
+//    fixpoint).
+// 2. A forward pass tracking which variables currently own their value:
+//    - a consuming use of a variable that is dead afterwards is a move;
+//      otherwise it becomes VDup (retain);
+//    - an owned variable is released (Drop) right after its last use, at
+//      the start of a branch that does not use it, and before break,
+//      continue and return.
+// Moving the last use is what keeps reference counts at 1, so `xs.push`
+// and `xs[i] = v` mutate in place instead of copying.
+use intset
+use ir
+
+// A statement with what is live after it, and its blocks so annotated.
+struct Ann {
+    s: ir.Stmt,
+    out: List[Int],
+    sub: Sub,
+}
+
+enum Sub {
+    NoSub,
+    IfSub(ABlock, ABlock),
+    LoopSub(ABlock),
+    // the handler, then the body
+    GuardSub(ABlock, ABlock),
+    ScopeSub(ABlock),
+}
+
+// A block's statements, and what is live at its start.
+struct ABlock {
+    stmts: List[Ann],
+    lin: List[Int],
+}
+
+fn ids(atoms: List[ir.Atom]) -> List[Int] {
+    intset.of_list(atoms.flat_map(|a| match ir.atom_var(a) {
+        Some(v) => [v.id],
+        None => [],
+    }))
+}
+
+fn rhs_uses(r: ir.Rhs) -> List[Int] {
+    ids(ir.consumed(r) + ir.borrowed(r))
+}
+
+// Where control goes after a break and a continue: what is live there.
+struct Exits {
+    brk: List[Int],
+    cont: List[Int],
+}
+
+fn no_exits() -> Exits {
+    Exits { brk: [], cont: [] }
+}
+
+// `pin`: variables a defer's handler reads; they stay live at every point
+// of its guarded statements, since a panic can leave them anywhere.
+fn live_block(pin: List[Int], stmts: List[ir.Stmt], out: List[Int], ex: Exits) -> ABlock {
+    let mut live = intset.union(out, pin)
+    let mut anns: List[Ann] = []
+    for s in stmts.reverse() {
+        let (a, l) = live_stmt(pin, s, live, ex)
+        anns.push(a)
+        live = l
+    }
+    ABlock { stmts: anns.reverse(), lin: live }
+}
+
+fn live_stmt(pin: List[Int], s: ir.Stmt, out: List[Int], ex: Exits) -> (Ann, List[Int]) {
+    let out = intset.union(out, pin)
+    let plain = |l: List[Int]| (Ann { s, out, sub: NoSub }, intset.union(l, pin))
+    match s {
+        Let(v, r) | Init(v, r) | Set(v, r, _) => plain(intset.union(intset.remove(out, v.id), rhs_uses(r))),
+        Decl(v) => plain(intset.remove(out, v.id)),
+        Mutate(v, steps, m) => plain(intset.add(intset.union(out, ids(ir.mut_atoms(m) + ir.step_atoms(steps))), v.id)),
+        If(c, a, b) => {
+            let ba = live_block(pin, a, out, ex)
+            let bb = live_block(pin, b, out, ex)
+            (Ann { s, out, sub: IfSub(ba, bb) }, intset.union(pin, intset.union(ids([c]), intset.union(ba.lin, bb.lin))))
+        },
+        Loop(body) => {
+            let mut l = intset.empty()
+            let mut b = live_block(pin, body, l, Exits { brk: out, cont: l })
+            while b.lin != l {
+                l = intset.union(l, b.lin)
+                b = live_block(pin, body, l, Exits { brk: out, cont: l })
+            }
+            (Ann { s, out, sub: LoopSub(b) }, intset.union(pin, b.lin))
+        },
+        Break => plain(ex.brk),
+        Continue => plain(ex.cont),
+        Return(a) => plain(ids([a])),
+        Drop(_) | GuardEnd(_) => plain(out),
+        Scope(g, body) => {
+            // the deadline can stop the body anywhere; the code after reads
+            // only what is live after it, which the body keeps
+            let bb = live_block(pin, body, out, ex)
+            (Ann { s, out, sub: ScopeSub(bb) }, intset.union(pin, intset.union(ids([g]), bb.lin)))
+        },
+        Guard(_, h, b) => {
+            // A panic can leave the body anywhere, and the handler then reads
+            // what it uses: those variables stay live, so retained and never
+            // moved or dropped, all through the body.
+            let hb = live_block(intset.empty(), h, intset.empty(), no_exits())
+            let pinned = intset.union(pin, hb.lin)
+            let bb = live_block(pinned, b, out, ex)
+            (Ann { s, out, sub: GuardSub(hb, bb) }, intset.union(pinned, bb.lin))
+        },
+    }
+}
+
+// ---------- the forward pass ----------
+
+// The variables of the function being rewritten, by id.
+struct Fwd {
+    vars: Map[Int, ir.Var],
+}
+
+fn drops(self: Fwd, set: List[Int]) -> List[ir.Stmt] {
+    set.map(|id| Drop(self.vars[id]))
+}
+
+// Rewrite the consumed atoms of a statement: move or retain.
+fn consume(atoms: List[ir.Atom], live_after: List[Int], borrowed: List[Int], owned: List[Int]) -> (List[ir.Atom], List[Int]) {
+    let mut count: Map[Int, Int] = map()
+    for a in atoms {
+        match ir.atom_var(a) {
+            Some(v) => {
+                count[v.id] = (count.get(v.id) ?? 0) + 1
+            },
+            None => {},
+        }
+    }
+    let mut owned = owned
+    let mut out: List[ir.Atom] = []
+    for a in atoms {
+        match a {
+            V(v) => {
+                let left = count[v.id]
+                count[v.id] = left - 1
+                if intset.mem(live_after, v.id) || left > 1 || intset.mem(borrowed, v.id) || !intset.mem(owned, v.id) {
+                    out.push(VDup(v))
+                } else {
+                    owned = intset.remove(owned, v.id)
+                    out.push(V(v))
+                }
+            },
+            _ => out.push(a),
+        }
+    }
+    (out, owned)
+}
+
+fn rewrite_rhs(r: ir.Rhs, live_after: List[Int], owned: List[Int]) -> (ir.Rhs, List[Int]) {
+    let borrowed = ids(ir.borrowed(r))
+    let c = |atoms: List[ir.Atom]| consume(atoms, live_after, borrowed, owned)
+    match r {
+        Use(a) => {
+            let (xs, o) = c([a])
+            (Use(xs[0]), o)
+        },
+        Call(n, args) => {
+            let (xs, o) = c(args)
+            (Call(n, xs), o)
+        },
+        CallClo(f, args) => {
+            let (xs, o) = c(args)
+            (CallClo(f, xs), o)
+        },
+        MkStruct(t, args) => {
+            let (xs, o) = c(args)
+            (MkStruct(t, xs), o)
+        },
+        MkEnum(t, k, args) => {
+            let (xs, o) = c(args)
+            (MkEnum(t, k, xs), o)
+        },
+        MkList(t, args) => {
+            let (xs, o) = c(args)
+            (MkList(t, xs), o)
+        },
+        MkClosure(n, t, args) => {
+            let (xs, o) = c(args)
+            (MkClosure(n, t, xs), o)
+        },
+        Spawn(g, task, t, keep) => {
+            let (xs, o) = c([task])
+            (Spawn(g, xs[0], t, keep), o)
+        },
+        ChanSend(ch, v, sp) => {
+            let (xs, o) = c([v])
+            (ChanSend(ch, xs[0], sp), o)
+        },
+        Select(id, ops, d, sp) => {
+            let sends = ops.flat_map(|op| match op {
+                SSend(_, v, _, _) => [v],
+                SRecv(..) | SAfter(..) => [],
+            })
+            let (xs, o) = c(sends)
+            let mut k = 0
+            let mut rebuilt: List[ir.Sel] = []
+            for op in ops {
+                match op {
+                    SSend(ch, _, t, g) => {
+                        rebuilt.push(SSend(ch, xs[k], t, g))
+                        k = k + 1
+                    },
+                    _ => rebuilt.push(op),
+                }
+            }
+            (Select(id, rebuilt, d, sp), o)
+        },
+        MkDyn(t, i, v, ms) => {
+            let (xs, o) = c([v])
+            (MkDyn(t, i, xs[0], ms), o)
+        },
+        CallDyn(k, ps, rt, recv, args) => {
+            let (xs, o) = c(args)
+            (CallDyn(k, ps, rt, recv, xs), o)
+        },
+        _ => (r, owned),
+    }
+}
+
+fn fwd_block(self: Fwd, b: ABlock, owned: List[Int], ex: Exits) -> (List[ir.Stmt], List[Int]) {
+    let entry = intset.diff(owned, b.lin)
+    let mut acc = self.drops(entry)
+    let mut owned = intset.diff(owned, entry)
+    for a in b.stmts {
+        let (ss, o) = self.fwd_stmt(a, owned, ex)
+        for s in ss {
+            acc.push(s)
+        }
+        owned = o
+    }
+    (acc, owned)
+}
+
+fn fwd_stmt(self: Fwd, a: Ann, owned: List[Int], ex: Exits) -> (List[ir.Stmt], List[Int]) {
+    let after = |s: ir.Stmt, owned: List[Int]| {
+        let d = intset.diff(owned, a.out)
+        ([s] + self.drops(d), intset.diff(owned, d))
+    }
+    match (a.s, a.sub) {
+        (Let(v, r), _) => {
+            let (r, o) = rewrite_rhs(r, a.out, owned)
+            after(Let(v, r), intset.add(o, v.id))
+        },
+        (Init(v, r), _) => {
+            let (r, o) = rewrite_rhs(r, a.out, owned)
+            after(Init(v, r), intset.add(o, v.id))
+        },
+        (Set(v, r, _), _) => {
+            let (r, o) = rewrite_rhs(r, intset.remove(a.out, v.id), owned)
+            after(Set(v, r, intset.mem(o, v.id)), intset.add(o, v.id))
+        },
+        (Decl(v), _) => ([Decl(v)], owned),
+        (Mutate(v, steps, m), _) => {
+            let borrowed = intset.add(ids(ir.step_atoms(steps)), v.id)
+            let (xs, o) = consume(ir.mut_atoms(m), a.out, borrowed, owned)
+            let m = match m {
+                MSet(_) => MSet(xs[0]),
+                MPush(_) => MPush(xs[0]),
+                MRemove(_) => MRemove(xs[0]),
+                MPut(..) => MPut(xs[0], xs[1]),
+            }
+            after(Mutate(v, steps, m), o)
+        },
+        (If(c, _, _), IfSub(ba, bb)) => {
+            let (sa, oa) = self.fwd_block(ba, owned, ex)
+            let (sb, ob) = self.fwd_block(bb, owned, ex)
+            ([If(c, sa, sb)], intset.inter(a.out, intset.union(oa, ob)))
+        },
+        (Loop(_), LoopSub(b)) => {
+            let (body, _) = self.fwd_block(b, owned, Exits { brk: a.out, cont: b.lin })
+            ([Loop(body)], intset.inter(owned, a.out))
+        },
+        (Scope(g, _), ScopeSub(bb)) => {
+            let (sb, ob) = self.fwd_block(bb, owned, ex)
+            ([Scope(g, sb)], ob)
+        },
+        (Guard(n, _, _), GuardSub(hb, bb)) => {
+            // the handler owns nothing from outside: its uses retain, and the
+            // frame's cleanups drop the variables as the panic goes on
+            let (sh, _) = self.fwd_block(hb, intset.empty(), no_exits())
+            let (sb, ob) = self.fwd_block(bb, owned, ex)
+            // what the handler kept alive and nothing after needs
+            let left = intset.diff(ob, a.out)
+            ([Guard(n, sh, sb)] + self.drops(left), intset.inter(a.out, ob))
+        },
+        (Break, _) => (self.drops(intset.diff(owned, ex.brk)) + [Break], intset.empty()),
+        (Continue, _) => (self.drops(intset.diff(owned, ex.cont)) + [Continue], intset.empty()),
+        (Return(x), _) => {
+            let (xs, o) = consume([x], intset.empty(), intset.empty(), owned)
+            (self.drops(o) + [Return(xs[0])], intset.empty())
+        },
+        (s, _) => ([s], owned),
+    }
+}
+
+fn collect_vars(vars: Map[Int, ir.Var], stmts: List[ir.Stmt]) -> Map[Int, ir.Var] {
+    let mut vars = vars
+    for s in stmts {
+        match s {
+            Let(v, _) | Decl(v) | Init(v, _) | Set(v, _, _) | Mutate(v, _, _) | Drop(v) => {
+                vars[v.id] = v
+            },
+            If(_, a, b) => {
+                vars = collect_vars(collect_vars(vars, a), b)
+            },
+            Loop(b) | Scope(_, b) => {
+                vars = collect_vars(vars, b)
+            },
+            Guard(_, h, b) => {
+                vars = collect_vars(collect_vars(vars, h), b)
+            },
+            _ => {},
+        }
+    }
+    vars
+}
+
+pub fn function(f: ir.Fn) -> ir.Fn {
+    let mut vars: Map[Int, ir.Var] = map()
+    for v in f.params + f.captures {
+        vars[v.id] = v
+    }
+    let fwd = Fwd { vars: collect_vars(vars, f.body) }
+    let b = live_block(intset.empty(), f.body, intset.empty(), no_exits())
+    let owned = intset.of_list((f.params + f.captures).map(|v| v.id))
+    let (body, _) = fwd.fwd_block(b, owned, no_exits())
+    { f with body }
+}
+
+pub fn program(p: ir.Program) -> ir.Program {
+    { p with fns: p.fns.map(function) }
+}

@@ -1,0 +1,38 @@
+// List pipelines: chains of map and filter ending in map, filter or fold
+// fuse into one loop when their closures are pure literals; a stage whose
+// closure captures a capability or a function, or is not a literal, or
+// can return early, is not fused into the stages after it.
+fn square(n: Int) -> Int {
+    n * n
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let xs = [1, 2, 3, 4, 5, 6]
+    let k = 2
+    let fused = xs.filter(|x| x % 2 == 0).map(|x| x * k).fold(0, |a, b| a + b)
+    let mapped = xs.map(|x| x + 1).filter(|x| x > 3).map(|x| "{x}")
+    let three = xs.map(|x| x * 3).map(|x| x - 1).filter(|x| x != 5)
+    out.print("{fused} {mapped} {three}")
+    // a function value: not a literal
+    let named = xs.map(square).filter(|x| x > 4)
+    // capturing a capability: printing interleaved would show
+    let loud = xs.map(|x| {
+        out.print("{x}")
+        x
+    }).filter(|x| x > 2)
+    // capturing a function value
+    let f = |x: Int| x + 1
+    let through = xs.map(|x| f(x)).fold(0, |a, b| a + b)
+    // a closure that can return early is called, not inlined
+    let early = xs.filter(|x| {
+        if x > 4 {
+            return false
+        }
+        true
+    }).map(|x| x * 2)
+    let nested = [[1, 2], [3]].map(|row| row.map(|x| x + k).fold(0, |a, b| a + b))
+    out.print("{named} {loud} {through} {early} {nested}")
+    let words = ["a", "bb", "ccc"].filter(|w| w.len() > 1).map(|w| w.to_upper())
+    out.print(words.join(","))
+}

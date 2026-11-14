@@ -1,0 +1,87 @@
+// Maps, lists, arrays, bytes and strings: building, reading through index
+// and field paths, writing through them (`m[k].x = v`, `xs[i].tags[j]`),
+// `remove`, interpolation, `??`, `?.`, `{ p with ... }`, tuple
+// assignment, or-patterns, list patterns with a rest, and match guards.
+struct Item {
+    name: Str,
+    tags: List[Str],
+    qty: Int,
+}
+
+struct Wrap {
+    inner: Option[Item],
+}
+
+enum Shape {
+    Circle(Float),
+    Rect(Float, Float),
+    Ring(Float, Float),
+    Dot,
+}
+
+fn area(s: Shape) -> Float {
+    match s {
+        Circle(r) | Ring(r, _) => r * r,
+        Rect(w, h) if w == h => w * w,
+        Rect(w, h) => w * h,
+        Dot => 0.0,
+    }
+}
+
+fn describe(xs: List[Int]) -> Str {
+    match xs {
+        [] => "empty",
+        [only] => "one {only}",
+        [first, .., last] if first == last => "same ends",
+        [first, ..rest] => "{first} then {rest.len()}",
+    }
+}
+
+fn ends(xs: List[Str]) -> Str {
+    match xs {
+        [.., a, b] => a + b,
+        [..init, _] => "{init}",
+        _ => "",
+    }
+}
+
+fn kind(n: Int) -> Str {
+    match (n % 3, n > 10) {
+        (0, true) | (1, true) => "big",
+        (0, _) => "fizz",
+        _ => "other",
+    }
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let mut m: Map[Str, Item] = map()
+    m["a"] = Item { name: "a", tags: [], qty: 1 }
+    m["a"].qty = 5
+    m["a"].tags.push("new")
+    m.remove("b")
+    let mut counts: Map[Str, Int] = map([("x", 1)])
+    counts["x"] = (counts.get("x") ?? 0) + 1
+    let mut items = [Item { name: "b", tags: ["t"], qty: 2 }]
+    items[0].tags[0] = "u"
+    items[0].qty = items[0].qty + m["a"].qty
+    let first = items[0]
+    let bumped = { first with qty: first.qty + 1, name: "c" }
+    let again = { items[0] with qty: 9 }
+    let arr: Array[Float, 3] = [1.0, 2.5, -0.0]
+    let b = bytes([104, 105])
+    let text = "{b.to_str()} {arr[1]} {b[0]} {arr.len()}"
+    let w = Wrap { inner: Some(first) }
+    let tag = w.inner?.tags.get(0)
+    let qty = w.inner?.qty
+    let mut x = 1
+    let mut y = 2
+    (x, y) = (y, x)
+    let mut pair = (0, "s")
+    (pair.0, items[0].name) = (7, "z")
+    let shapes = [Circle(1.0), Rect(2.0, 2.0), Rect(1.0, 3.0), Ring(2.0, 1.0), Dot]
+    out.print("{shapes.map(area)} {describe([1, 2, 1])} {describe([4])} {ends(["p", "q"])} {kind(12)} {kind(3)}")
+    out.print("{text} {tag} {qty} {x} {y} {pair} {bumped.qty} {again.qty} {counts} {m.keys()}")
+    let s = "héllo wörld"
+    out.print("{s.len()} {s.slice(0, 2)} {s.contains("w")} {s.bytes().len()} {s.split(" ")} {-3.5} {7 / 2} {7 % 3}")
+}

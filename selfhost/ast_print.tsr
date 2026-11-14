@@ -72,7 +72,7 @@ pub fn pat(p: ast.Pat) -> Str {
     }
 }
 
-fn op(o: ast.BinOp) -> Str {
+pub fn op(o: ast.BinOp) -> Str {
     match o {
         Add => "+",
         Sub => "-",

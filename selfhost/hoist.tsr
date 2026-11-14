@@ -1,0 +1,229 @@
+// What C generation does with loops, as src/hoist.ml finds it: lists a
+// loop writes to that it can make unique once, before the loop, instead
+// of checking on every write (copy-on-write hoisting); counted loops that
+// only push a constant (filled in one go); and loops whose indexes stay in
+// range of the lists they index (versioned: checked once, then run
+// without bounds checks).
+use ir
+use pure
+use types
+
+fn same(a: ir.Var, b: ir.Var) -> Bool {
+    a.id == b.id
+}
+
+fn is_list(t: types.Ty) -> Bool {
+    match t {
+        TList(_) => true,
+        _ => false,
+    }
+}
+
+// List variables that a loop body writes through: `v[i] = ...`,
+// `v.push(...)`; the latest found first.
+pub fn mutated_lists(body: List[ir.Stmt]) -> List[ir.Var] {
+    mutated(body, [])
+}
+
+fn mutated(ss: List[ir.Stmt], acc: List[ir.Var]) -> List[ir.Var] {
+    let mut acc = acc
+    for s in ss {
+        match s {
+            Mutate(v, steps, _) => {
+                let through = match steps {
+                    [] | [PIndex(..), ..] => true,
+                    _ => false,
+                }
+                if through && !acc.any(|w| same(w, v)) && is_list(v.ty) {
+                    acc = [v] + acc
+                }
+            },
+            If(_, a, b) => {
+                acc = mutated(b, mutated(a, acc))
+            },
+            Loop(b) | Guard(_, _, b) | Scope(_, b) => {
+                acc = mutated(b, acc)
+            },
+            _ => {},
+        }
+    }
+    acc
+}
+
+fn mentions(v: ir.Var, atoms: List[ir.Atom]) -> Bool {
+    atoms.any(|a| match ir.atom_var(a) {
+        Some(w) => same(w, v),
+        None => false,
+    })
+}
+
+// Could the list's reference count rise inside the loop? Any retain or
+// move of the variable, or a reassignment, rules the hoist out; so does a
+// list declared inside the loop, which does not exist yet where the
+// hoisted check would go.
+pub fn escapes(v: ir.Var, body: List[ir.Stmt]) -> Bool {
+    body.any(|s| match s {
+        Let(w, r) | Init(w, r) | Set(w, r, _) => same(w, v) || mentions(v, ir.consumed(r)),
+        Decl(w) => same(w, v),
+        Mutate(_, _, m) => mentions(v, ir.mut_atoms(m)),
+        Return(a) => mentions(v, [a]),
+        If(_, a, b) => escapes(v, a) || escapes(v, b),
+        Loop(b) => escapes(v, b),
+        // code after a panic or deadline can see the list: keep the checks
+        Guard(..) | Scope(..) => true,
+        Break | Continue | Drop(_) | GuardEnd(_) => false,
+    })
+}
+
+fn is_small_scalar(t: types.Ty) -> Bool {
+    match t {
+        TInt | TFloat | TBool | TUnit => true,
+        _ => false,
+    }
+}
+
+fn only_drops(l: List[ir.Stmt]) -> Bool {
+    l.all(|s| match s {
+        Drop(_) => true,
+        _ => false,
+    })
+}
+
+// A counted fill loop:
+//   loop { c = i < n (or <=); if c {} else { break }; v.push(x); t = i + 1; i = t }
+pub struct Fill {
+    i: ir.Var,
+    inclusive: Bool,
+    n: ir.Atom,
+    v: ir.Var,
+    x: ir.Atom,
+}
+
+// The fill loop `body` is, if it is one: x is a scalar constant or a
+// variable the loop does not assign, and n likewise. Drops of scalars are
+// ignored.
+pub fn fill_loop(body: List[ir.Stmt]) -> Option[Fill] {
+    let body = body.filter(|s| match s {
+        Drop(w) => !is_small_scalar(w.ty),
+        _ => true,
+    })
+    let assigned = body.flat_map(|s| match s {
+        Set(w, _, _) | Let(w, _) => [w.id],
+        _ => [],
+    })
+    let invariant = |a: ir.Atom| match a {
+        V(w) => !assigned.contains(w.id),
+        AInt(_) | AFloat(_) | ABool(_) | AUnit => true,
+        _ => false,
+    }
+    match body {
+        [Let(c, Bin(cmp, TInt, V(i), n, _)), If(V(c2), yes, brk), Mutate(v, [], MPush(x)), Let(t, Bin(Add, TInt, V(i2), AInt(1), _)), Set(i3, Use(V(t2)), _)] => {
+            let breaks = match brk.reverse() {
+                [Break, ..rest] => only_drops(rest),
+                _ => false,
+            }
+            let fills = match v.ty {
+                TList(e) => is_small_scalar(e),
+                _ => false,
+            }
+            if (cmp == Lt || cmp == Le) && same(c, c2) && same(i, i2) && same(i, i3) && same(t, t2) && only_drops(yes) && breaks && invariant(n) && invariant(x) && !same(v, i) && fills {
+                Some(Fill { i, inclusive: cmp == Le, n, v, x })
+            } else {
+                None
+            }
+        },
+        _ => None,
+    }
+}
+
+// Loop versioning for bounds checks. Matches
+//   loop { c = m < n (or <=); if c {} else { break }; ...; t = m + step; m = t; ... }
+// where m is assigned only by that increment, n and step are not assigned
+// in the loop, and the lists indexed by m keep their length (no push, no
+// reassignment). C generation emits the fast version guarded by: m >= 0,
+// step >= 0, n + step does not overflow, and n < len (or n <= len) for
+// every list.
+pub struct Versioned {
+    m: ir.Var,
+    inclusive: Bool,
+    n: ir.Atom,
+    step: ir.Atom,
+    lists: List[ir.Var],
+}
+
+pub fn versionable(body: List[ir.Stmt]) -> Option[Versioned] {
+    let (m, cmp, n) = match body {
+        [Let(c, Bin(cmp, TInt, V(m), n, _)), If(V(c2), _, _), ..] if (cmp == Lt || cmp == Le) && same(c, c2) => (m, cmp, n),
+        _ => {
+            return None
+        },
+    }
+    let ss = pure.all_stmts(body)
+    let assigns_of = |w: ir.Var| ss.filter(|s| match s {
+        Set(x, _, _) | Let(x, _) | Init(x, _) => same(x, w),
+        _ => false,
+    })
+    let invariant = |a: ir.Atom| match a {
+        V(w) => assigns_of(w).is_empty(),
+        AInt(_) => true,
+        _ => false,
+    }
+    // m's only assignment: m = t, with t = m + step
+    let incr = match assigns_of(m) {
+        [Set(_, Use(V(t)), _)] => match ss.find(|s| match s {
+            Let(x, _) => same(x, t),
+            _ => false,
+        }) {
+            Some(Let(_, Bin(Add, TInt, V(m2), step, _))) if same(m2, m) && invariant(step) => Some(step),
+            _ => None,
+        },
+        _ => None,
+    }
+    // lists indexed by m directly (first step), in reads and writes; the
+    // latest found first
+    let mut indexed: List[ir.Var] = []
+    for s in ss {
+        let found = match s {
+            Let(_, Get(V(v), TList(_), [PIndex(V(i), _), ..])) if same(i, m) => Some(v),
+            Mutate(v, [PIndex(V(i), _), ..], _) if same(i, m) && is_list(v.ty) => Some(v),
+            _ => None,
+        }
+        match found {
+            Some(v) if !indexed.any(|w| same(w, v)) => {
+                indexed = [v] + indexed
+            },
+            _ => {},
+        }
+    }
+    let keeps_len = |v: ir.Var| assigns_of(v).is_empty() && !ss.any(|s| match s {
+        Mutate(w, [], MPush(_)) => same(w, v),
+        _ => false,
+    })
+    match incr {
+        Some(step) if invariant(n) && !indexed.is_empty() && indexed.all(keeps_len) && ordered(m, body) => Some(Versioned { m, inclusive: cmp == Le, n, step, lists: indexed }),
+        _ => None,
+    }
+}
+
+// Accesses must come before the increment: the guard only covers indexes
+// up to n. The increment must be a top-level statement of the body.
+fn ordered(m: ir.Var, body: List[ir.Stmt]) -> Bool {
+    let uses_m = |s: ir.Stmt| pure.all_stmts([s]).any(|x| match x {
+        Let(_, Get(_, _, [PIndex(V(i), _), ..])) | Mutate(_, [PIndex(V(i), _), ..], _) => same(i, m),
+        _ => false,
+    })
+    let mut seen_incr = false
+    for s in body {
+        match s {
+            Set(x, _, _) if same(x, m) => {
+                seen_incr = true
+            },
+            _ => {
+                if seen_incr && uses_m(s) {
+                    return false
+                }
+            },
+        }
+    }
+    seen_incr
+}

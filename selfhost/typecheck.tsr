@@ -25,6 +25,12 @@ pub struct Checked {
     state: env.State,
     // what each of the program's functions can do
     infos: List[FnInfo],
+    // the declarations, for the backend: interfaces' methods, fields,
+    // variants
+    cx: env.Cx,
+    // the items every program gets (selfhost/prelude.tsr), rewritten: the
+    // backend compiles those the program uses
+    prelude: List[ast.Item],
 }
 
 // What `tessera caps` reports of a function: the capabilities its
@@ -122,7 +128,7 @@ pub fn check_program(items: List[ast.Item], files: List[diag.Source], next_id: I
     // forwarders only pass their arguments on; the methods they call are reported
     let reported = sigs.filter(|f| f.decl.test.is_none() && f.decl.span.file != methods_file && f.decl.span.file != prelude_file && !cx.forwarders.contains(f.decl.name))
     let infos = reported.map(|f| fn_info(st, f))
-    Checked { items: items.map(|i| rewritten_item(st, i)), diags: in_order(cx, st.diags), state: st, infos }
+    Checked { items: items.map(|i| rewritten_item(st, i)), diags: in_order(cx, st.diags), state: st, infos, cx, prelude: pre.map(|i| rewritten_item(st, i)) }
 }
 
 fn fn_info(st: env.State, f: Fn) -> FnInfo {

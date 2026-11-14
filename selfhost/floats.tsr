@@ -9,7 +9,8 @@ fn is_infinite(x: Float) -> Bool {
     x != 0.0 && x == x * 2.0
 }
 
-fn negative(x: Float) -> Bool {
+// Below zero, or -0.0.
+pub fn negative(x: Float) -> Bool {
     x < 0.0 || (x == 0.0 && 1.0 / x < 0.0)
 }
 

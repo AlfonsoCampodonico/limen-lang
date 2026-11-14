@@ -1,0 +1,463 @@
+// What the native backend does with pure functions, as src/pure.ml has
+// it. A function whose parameters hold no capability, no function and no
+// channel can only compute and panic (SPEC section 9). Here the test is
+// made on the IR and is a little stricter: the body (and every function it
+// calls) also starts no task, makes no channel and calls no closure or
+// `dyn` method, so the same arguments always give the same result.
+//
+// Two rewrites use it, and neither can be observed by the program:
+//
+// - `cse`, before the ownership pass: a second call with the same
+//   arguments in the same block (or a block inside it), with nothing
+//   reassigned in between, takes the first call's result instead of
+//   calling again.
+// - `plan`, for C generation: a call in a loop whose arguments do not
+//   change in the loop is made the first time it is reached and its result
+//   kept for the later iterations.
+use floats
+use intset
+use ir
+use lower
+use types
+
+fn is_scalar(t: types.Ty) -> Bool {
+    match t {
+        TInt | TFloat | TBool | TUnit => true,
+        _ => false,
+    }
+}
+
+fn pure_type(t: types.Ty) -> Bool {
+    let s = types.empty()
+    s.caps_in(t, []).is_empty() && !s.has_fn(t) && !s.has_chan(t)
+}
+
+// Built-in methods worth keeping across a loop: they allocate or walk a
+// whole value, so the C compiler cannot move them itself. Cheap ones
+// (`len`, `abs`, `min`) it already handles.
+fn heavy_prims() -> List[Str] {
+    ["list_contains", "list_reverse", "list_sort", "list_take", "list_skip", "list_join", "list_sum", "str_lines", "str_split", "str_trim", "str_contains", "str_starts_with", "str_ends_with", "str_to_upper", "str_to_lower", "str_replace", "str_parse_int", "str_parse_float", "str_slice", "str_index_of", "str_last_index_of", "list_slice", "str_bytes", "str_chars", "str_to_bytes", "bytes_to_str", "bytes_slice", "bytes_to_list", "bytes_new", "int_range", "int_to_str", "float_to_str", "bool_to_str", "float_to_fixed", "map_keys", "map_values", "map_entries", "map_from", "array_to_list", "array_contains"]
+}
+
+// A built-in method a pure function may use: anything but those on
+// capabilities and channels, and `keep` (the benchmark black box).
+fn pure_prim(name: Str, t: types.Ty) -> Bool {
+    let on_effect = match t {
+        TCap(_) | TChan(_) => true,
+        _ => false,
+    }
+    name != "keep" && !on_effect && !name.starts_with("cap_") && !name.starts_with("chan_")
+}
+
+// Every statement of `ss`, each before the ones inside it.
+pub fn all_stmts(ss: List[ir.Stmt]) -> List[ir.Stmt] {
+    collect([], ss)
+}
+
+fn collect(acc: List[ir.Stmt], ss: List[ir.Stmt]) -> List[ir.Stmt] {
+    let mut acc = acc
+    for s in ss {
+        acc.push(s)
+        match s {
+            If(_, a, b) => {
+                acc = collect(collect(acc, a), b)
+            },
+            Loop(b) | Scope(_, b) => {
+                acc = collect(acc, b)
+            },
+            Guard(_, h, b) => {
+                acc = collect(collect(acc, h), b)
+            },
+            _ => {},
+        }
+    }
+    acc
+}
+
+fn rhs_of(s: ir.Stmt) -> Option[ir.Rhs] {
+    match s {
+        Let(_, r) | Init(_, r) | Set(_, r, _) => Some(r),
+        _ => None,
+    }
+}
+
+// The pure functions of a program, by C name, and whether each is heavy:
+// worth keeping across a loop, not a short scalar computation the C
+// compiler sees through. Calls between functions are taken as pure until
+// shown otherwise (recursion is fine).
+pub fn analyse(p: ir.Program) -> Map[Str, Bool] {
+    let names: Map[Str, Bool] = p.fns.fold(map(), |m, f| {
+        let mut m = m
+        m[f.fname] = true
+        m
+    })
+    let mut calls: Map[Str, List[Str]] = map()
+    let mut candidates: Map[Str, Bool] = map()
+    for f in p.fns {
+        let mut ok = (f.params + f.captures).all(|v| pure_type(v.ty))
+        let mut callees: List[Str] = []
+        let mut scalar_only = f.params.all(|v| is_scalar(v.ty)) && is_scalar(f.ret)
+        let mut straight = true
+        for s in all_stmts(f.body) {
+            match s {
+                Let(v, _) | Init(v, _) | Decl(v) => {
+                    if !is_scalar(v.ty) {
+                        scalar_only = false
+                    }
+                },
+                Loop(_) => {
+                    straight = false
+                },
+                Scope(..) => {
+                    ok = false
+                },
+                _ => {},
+            }
+            match rhs_of(s) {
+                Some(Call(g, _)) => {
+                    straight = false
+                    callees.push(g)
+                    if !names.contains(g) {
+                        ok = false
+                    }
+                },
+                Some(Prim(n, t, _, _)) => {
+                    straight = false
+                    if !pure_prim(n, t) {
+                        ok = false
+                    }
+                },
+                Some(CallClo(..)) | Some(CallDyn(..)) | Some(Catch(..)) | Some(Spawn(..)) | Some(GroupNew(..)) | Some(GroupJoin(..)) | Some(ChanNew(..)) | Some(ChanSend(..)) | Some(Select(..)) | Some(SelGot(..)) | Some(RootField(..)) | Some(CallC(..)) => {
+                    ok = false
+                },
+                _ => {},
+            }
+        }
+        if ok {
+            candidates[f.fname] = !(scalar_only && straight)
+            calls[f.fname] = callees
+        }
+    }
+    // drop functions that call a non-pure one, until nothing changes; a
+    // function calling a heavy one is heavy
+    let mut changed = true
+    while changed {
+        changed = false
+        let mut next: Map[Str, Bool] = map()
+        for (name, heavy) in candidates.entries() {
+            let cs = calls[name]
+            if cs.all(|g| candidates.contains(g)) {
+                let now = heavy || cs.any(|g| candidates.get(g) ?? false)
+                if now != heavy {
+                    changed = true
+                }
+                next[name] = now
+            } else {
+                changed = true
+            }
+        }
+        candidates = next
+    }
+    candidates
+}
+
+// A call whose result depends only on its arguments.
+fn pure_rhs(pure: Map[Str, Bool], r: ir.Rhs) -> Bool {
+    match r {
+        Call(f, _) => pure.contains(f),
+        Prim(n, t, _, _) => pure_prim(n, t),
+        _ => false,
+    }
+}
+
+fn worth_keeping(pure: Map[Str, Bool], r: ir.Rhs) -> Bool {
+    match r {
+        Call(f, _) => pure.get(f) ?? false,
+        Prim(n, t, _, _) => pure_prim(n, t) && heavy_prims().contains(n),
+        _ => false,
+    }
+}
+
+// Variables a statement list assigns other than by `let`.
+fn assigned(ss: List[ir.Stmt]) -> List[Int] {
+    intset.of_list(all_stmts(ss).flat_map(|s| match s {
+        Set(v, _, _) | Mutate(v, _, _) | Init(v, _) | Decl(v) => [v.id],
+        _ => [],
+    }))
+}
+
+// ---------- reusing a repeated call ----------
+
+enum KAtom {
+    KV(Int),
+    KI(Int),
+    KF(Float),
+    KB(Bool),
+    KU,
+    KS(Str),
+}
+
+// What a call computes: which call, and its arguments.
+struct Key {
+    kind: Str,
+    name: Str,
+    args: List[KAtom],
+}
+
+fn katom(a: ir.Atom) -> KAtom {
+    match a {
+        V(v) | VDup(v) => KV(v.id),
+        AInt(n) => KI(n),
+        AFloat(x) => KF(x),
+        ABool(b) => KB(b),
+        AUnit => KU,
+        AStr(s) => KS(s),
+    }
+}
+
+fn key_of(r: ir.Rhs) -> Key {
+    match r {
+        Call(f, args) => Key { kind: "call", name: f, args: args.map(katom) },
+        Prim(n, t, args, _) => Key { kind: n, name: lower.show(t), args: args.map(katom) },
+        _ => panic("key_of"),
+    }
+}
+
+// A float argument is compared by its bits, so -0.0 differs from 0.0 (a
+// constant is never NaN).
+fn same_katom(x: KAtom, y: KAtom) -> Bool {
+    match (x, y) {
+        (KF(p), KF(q)) => p == q && floats.negative(p) == floats.negative(q),
+        _ => x == y,
+    }
+}
+
+fn same_key(a: Key, b: Key) -> Bool {
+    a.kind == b.kind && a.name == b.name && a.args.len() == b.args.len() && a.args.zip(b.args).all(|p| same_katom(p.0, p.1))
+}
+
+fn mentions_any(killed: List[Int], e: (Key, ir.Var)) -> Bool {
+    intset.mem(killed, e.1.id) || e.0.args.any(|a| match a {
+        KV(id) => intset.mem(killed, id),
+        _ => false,
+    })
+}
+
+// `avail`: calls made earlier on every path to here, with the variable
+// holding each result, the latest first.
+fn cse_block(pure: Map[Str, Bool], avail: List[(Key, ir.Var)], ss: List[ir.Stmt]) -> List[ir.Stmt] {
+    let mut avail = avail
+    let mut out: List[ir.Stmt] = []
+    for s in ss {
+        let kill = |avail: List[(Key, ir.Var)], killed: List[Int]| avail.filter(|e| !mentions_any(killed, e))
+        match s {
+            Let(v, r) if pure_rhs(pure, r) => {
+                let k = key_of(r)
+                match avail.find(|e| same_key(k, e.0)) {
+                    Some(e) => out.push(Let(v, Use(V(e.1)))),
+                    None => {
+                        avail = [(k, v)] + avail
+                        out.push(s)
+                    },
+                }
+            },
+            Let(..) | Drop(_) | Break | Continue | Return(_) | GuardEnd(_) => out.push(s),
+            Set(v, _, _) | Mutate(v, _, _) | Init(v, _) | Decl(v) => {
+                avail = kill(avail, [v.id])
+                out.push(s)
+            },
+            If(c, a, b) => {
+                let a2 = cse_block(pure, avail, a)
+                let b2 = cse_block(pure, avail, b)
+                avail = kill(avail, assigned(a + b))
+                out.push(If(c, a2, b2))
+            },
+            Loop(body) => {
+                avail = kill(avail, assigned(body))
+                out.push(Loop(cse_block(pure, avail, body)))
+            },
+            Guard(n, h, b) => {
+                avail = kill(avail, assigned(h + b))
+                out.push(Guard(n, cse_block(pure, [], h), cse_block(pure, [], b)))
+            },
+            Scope(g, b) => {
+                avail = kill(avail, assigned(b))
+                out.push(Scope(g, cse_block(pure, [], b)))
+            },
+        }
+    }
+    out
+}
+
+pub fn cse(p: ir.Program) -> ir.Program {
+    let pure = analyse(p)
+    { p with fns: p.fns.map(|f| { f with body: cse_block(pure, [], f.body) }) }
+}
+
+// ---------- keeping a call across a loop ----------
+
+// A kept call's result lives in a slot declared before the loop it is
+// kept across; the slot is filled the first time the call runs.
+pub struct Slot {
+    sid: Int,
+    ty: types.Ty,
+}
+
+// The slots of a function: by loop (numbered in the order the loops start
+// in the function's text), and by the variable each call's result goes to.
+pub struct Plan {
+    at_loop: Map[Int, List[Slot]],
+    kept: Map[Int, Slot],
+}
+
+pub fn no_plan() -> Plan {
+    Plan { at_loop: map(), kept: map() }
+}
+
+// A loop of the function, as the planning sees it.
+struct LoopInfo {
+    assigned: List[Int],
+    defs: Map[Int, ir.Rhs],
+    // what is known of variables: whether each is the same each time
+    memo: Map[Int, Bool],
+    slots: List[Slot],
+}
+
+struct Planner {
+    pure: Map[Str, Bool],
+    loops: List[LoopInfo],
+    kept: Map[Int, Slot],
+    // the last slot number given, in the whole program
+    slot: Int,
+}
+
+// Does an atom have the same value on every iteration of loop `l`? A
+// variable does if the loop never reassigns it and either it comes from
+// outside the loop or the loop computes it from such values alone.
+fn same_each_time(self: Planner, l: Int, a: ir.Atom) -> (Bool, Planner) {
+    let v = match ir.atom_var(a) {
+        Some(v) => v,
+        None => {
+            return (true, self)
+        },
+    }
+    let lp = self.loops[l]
+    if intset.mem(lp.assigned, v.id) {
+        return (false, self)
+    }
+    let r = match lp.defs.get(v.id) {
+        Some(r) => r,
+        None => {
+            return (true, self)
+        },
+    }
+    match lp.memo.get(v.id) {
+        Some(b) => {
+            return (b, self)
+        },
+        None => {},
+    }
+    let mut pl = self
+    pl.loops[l].memo[v.id] = false
+    let kind_ok = match r {
+        Use(_) | Bin(..) | Negate(..) | Flip(_) | Get(..) | Payload(..) | IsTag(..) | PatTest(..) | Format(_) | MkStruct(..) | MkEnum(..) | MkList(..) => true,
+        Call(..) | Prim(..) => pure_rhs(pl.pure, r),
+        _ => false,
+    }
+    let mut b = kind_ok
+    if kind_ok {
+        for x in ir.consumed(r) + ir.borrowed(r) {
+            let (same, next) = pl.same_each_time(l, x)
+            pl = next
+            if !same {
+                b = false
+                break
+            }
+        }
+    }
+    pl.loops[l].memo[v.id] = b
+    (b, pl)
+}
+
+// Which loop, if any, of `outer` (innermost first) the call `r` can be
+// kept across: the outermost one its arguments do not change in.
+fn keep_across(self: Planner, outer: List[Int], r: ir.Rhs) -> (Option[Int], Planner) {
+    let atoms = ir.consumed(r) + ir.borrowed(r)
+    let mut pl = self
+    for l in outer.reverse() {
+        let mut all = true
+        for a in atoms {
+            let (same, next) = pl.same_each_time(l, a)
+            pl = next
+            if !same {
+                all = false
+                break
+            }
+        }
+        if all {
+            return (Some(l), pl)
+        }
+    }
+    (None, pl)
+}
+
+fn walk(self: Planner, outer: List[Int], ss: List[ir.Stmt]) -> Planner {
+    let mut pl = self
+    for s in ss {
+        match s {
+            Let(v, r) | Init(v, r) if !outer.is_empty() && worth_keeping(pl.pure, r) => {
+                let (l, next) = pl.keep_across(outer, r)
+                pl = next
+                match l {
+                    Some(l) => {
+                        pl.slot = pl.slot + 1
+                        let sl = Slot { sid: pl.slot, ty: v.ty }
+                        pl.loops[l].slots.push(sl)
+                        pl.kept[v.id] = sl
+                    },
+                    None => {},
+                }
+            },
+            If(_, a, b) => {
+                pl = pl.walk(outer, a).walk(outer, b)
+            },
+            Loop(body) => {
+                let mut defs: Map[Int, ir.Rhs] = map()
+                for x in all_stmts(body) {
+                    match x {
+                        Let(v, r) => {
+                            defs[v.id] = r
+                        },
+                        _ => {},
+                    }
+                }
+                let l = pl.loops.len()
+                pl.loops.push(LoopInfo { assigned: assigned(body), defs, memo: map(), slots: [] })
+                pl = pl.walk([l] + outer, body)
+            },
+            _ => {},
+        }
+    }
+    pl
+}
+
+// The calls of `f` to keep across loops, and the last slot number given
+// (`slot` is the last one before). A defer or a deadline jumps back into
+// the frame with setjmp's rules: such a function keeps the plain code.
+pub fn plan(pure: Map[Str, Bool], f: ir.Fn, slot: Int) -> (Plan, Int) {
+    let boundary = all_stmts(f.body).any(|s| match s {
+        Guard(..) | Scope(..) => true,
+        _ => false,
+    })
+    if boundary {
+        return (no_plan(), slot)
+    }
+    let pl = Planner { pure, loops: [], kept: map(), slot }.walk([], f.body)
+    let mut at_loop: Map[Int, List[Slot]] = map()
+    for (i, l) in pl.loops.with_index() {
+        if !l.slots.is_empty() {
+            at_loop[i] = l.slots
+        }
+    }
+    (Plan { at_loop, kept: pl.kept }, pl.slot)
+}

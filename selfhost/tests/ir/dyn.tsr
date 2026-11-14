@@ -1,0 +1,106 @@
+// `dyn` values and their vtables (one per interface and arguments),
+// method calls through them, `?` converting an error to `dyn Error`, the
+// context string after `?` on a Result and on an Option (WrappedError),
+// and `message` and `cause` on Str, IoError and types without a `cause`.
+interface Speaker {
+    fn speak(self, loud: Bool) -> Str
+}
+
+interface Store[K, V] {
+    fn fetch(self, k: K) -> Option[V]
+}
+
+struct Dog {
+    name: Str,
+}
+
+enum Cat {
+    Tabby,
+    Black(Int),
+}
+
+struct Table {
+    rows: Map[Str, Int],
+}
+
+struct ParseError {
+    at: Int,
+}
+
+fn speak(self: Dog, loud: Bool) -> Str {
+    if loud { self.name.to_upper() } else { self.name }
+}
+
+fn speak(self: Cat, loud: Bool) -> Str {
+    match self {
+        Tabby => "mew",
+        Black(n) => "meow x{n}",
+    }
+}
+
+fn fetch(self: Table, k: Str) -> Option[Int] {
+    self.rows.get(k)
+}
+
+fn message(self: ParseError) -> Str {
+    "bad input at {self.at}"
+}
+
+fn cause(self: ParseError) -> Option[dyn Error] {
+    None
+}
+
+fn parse(s: Str) -> Result[Int, ParseError] {
+    match s.parse_int() {
+        Some(n) => Ok(n),
+        None => Err(ParseError { at: 0 }),
+    }
+}
+
+fn read(fs: Fs, path: Str) -> Result[Str, dyn Error] {
+    let text = fs.read(path)?
+    let n = parse(text)?
+    let m = parse(text)? "parsing {path}"
+    let first = text.lines().get(0)? "empty file"
+    Ok("{n} {m} {first}")
+}
+
+fn same_error(s: Str) -> Result[Int, ParseError] {
+    let n = parse(s)?
+    Ok(n + 1)
+}
+
+fn maybe(xs: List[Int]) -> Option[Int] {
+    let x = xs.get(0)?
+    Some(x * 2)
+}
+
+fn chain(e: dyn Error) -> List[Str] {
+    let mut out = [e.message()]
+    let mut cur = e.cause()
+    while cur.is_some() {
+        let c = cur ?? e
+        out.push(c.message())
+        cur = c.cause()
+    }
+    out
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let animals: List[dyn Speaker] = [Dog { name: "rex" }, Tabby, Black(3)]
+    for a in animals {
+        out.print(a.speak(true) + a.speak(false))
+    }
+    let s: dyn Store[Str, Int] = Table { rows: map([("a", 1)]) }
+    out.print("{s.fetch("a") ?? 0}")
+    match read(root.fs, "x.txt") {
+        Ok(v) => out.print(v),
+        Err(e) => out.print(chain(e).join(" <- ")),
+    }
+    let errs: List[dyn Error] = ["plain", ParseError { at: 3 }, Failed("io")]
+    for e in errs {
+        out.print(e.message())
+    }
+    out.print("{same_error("4")} {maybe([1])} {maybe([])}")
+}

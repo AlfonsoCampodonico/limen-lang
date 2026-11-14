@@ -1,0 +1,101 @@
+// Generic functions instantiated several ways (one C function per set of
+// type arguments), generic structs and enums, a generic array length, and
+// methods reached through an interface bound, whose type arguments the
+// lowering reads off the actual types.
+struct Pair[A, B] {
+    first: A,
+    second: B,
+}
+
+enum Tree[T] {
+    Leaf,
+    Node(Tree[T], T, Tree[T]),
+}
+
+interface Shape {
+    fn area(self) -> Float
+    fn name(self) -> Str
+}
+
+interface Box[T] {
+    fn get(self) -> T
+}
+
+struct Square {
+    side: Float,
+}
+
+struct Holder[T] {
+    item: T,
+}
+
+fn area(self: Square) -> Float {
+    self.side * self.side
+}
+
+fn name(self: Square) -> Str {
+    "square"
+}
+
+fn get[T](self: Holder[T]) -> T {
+    self.item
+}
+
+fn swap[A, B](p: Pair[A, B]) -> Pair[B, A] {
+    Pair { first: p.second, second: p.first }
+}
+
+fn first_or[T](xs: List[T], d: T) -> T {
+    xs.get(0) ?? d
+}
+
+fn size[T](t: Tree[T]) -> Int {
+    match t {
+        Leaf => 0,
+        Node(l, _, r) => size(l) + 1 + size(r),
+    }
+}
+
+fn total[S: Shape](shapes: List[S]) -> Float {
+    shapes.fold(0.0, |acc, s| acc + s.area())
+}
+
+fn describe[S: Shape](s: S) -> Str {
+    "{s.name()}: {s.area()}"
+}
+
+fn unbox[B: Box[T], T](b: B) -> T {
+    b.get()
+}
+
+fn sum[N](xs: Array[Int, N]) -> Int {
+    let mut t = 0
+    for x in xs {
+        t = t + x
+    }
+    t
+}
+
+fn apply[T, U](x: T, f: fn(T) -> U) -> U {
+    f(x)
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let p = swap(Pair { first: 1, second: "one" })
+    let q = swap(Pair { first: [1.5], second: true })
+    let r = swap(swap(p))
+    out.print("{p.first} {q.second} {r.first}")
+    out.print("{first_or([3, 4], 0)} {first_or([], "none")} {first_or([[1]], [])}")
+    let t = Node(Node(Leaf, 1, Leaf), 2, Leaf)
+    let u: Tree[Str] = Node(Leaf, "x", Leaf)
+    out.print("{size(t)} {size(u)}")
+    out.print("{total([Square { side: 2.0 }])} {describe(Square { side: 1.0 })}")
+    out.print("{unbox(Holder { item: 7 })} {unbox(Holder { item: "seven" })}")
+    let a: Array[Int, 3] = [1, 2, 3]
+    let b: Array[Int, 2] = [4, 5]
+    out.print("{sum(a)} {sum(b)}")
+    out.print(apply(3, |n| "{n}") + apply("s", |s| s + "!"))
+    let id = |x: Int| x
+    out.print("{apply(apply(1, id), id)}")
+}

@@ -253,3 +253,30 @@ pub fn has_fn(self: Subst, t: Ty) -> Bool {
         _ => false,
     }
 }
+
+// `t` for code generation: the type parameters of `env` replaced by their
+// types, and whatever is still unknown, an unlinked variable or a
+// parameter `env` does not give, taken as `()`. The result holds no TVar
+// and no TParam.
+pub fn zonk(self: Subst, env: List[(Str, Ty)], t: Ty) -> Ty {
+    let all = |ts: List[Ty]| ts.map(|x| self.zonk(env, x))
+    match self.repr(t) {
+        TParam(n) => match env.find(|p| p.0 == n) {
+            Some(p) => self.zonk([], p.1),
+            None => TUnit,
+        },
+        TVar(_) => TUnit,
+        TList(a) => TList(self.zonk(env, a)),
+        TArray(a, n) => TArray(self.zonk(env, a), match self.zonk(env, n) {
+            TLen(k) => TLen(k),
+            _ => TLen(0),
+        }),
+        TDyn(i, xs) => TDyn(i, all(xs)),
+        TChan(a) => TChan(self.zonk(env, a)),
+        TMap(k, v) => TMap(self.zonk(env, k), self.zonk(env, v)),
+        TGroup(a) => TGroup(self.zonk(env, a)),
+        TFn(ps, r) => TFn(all(ps), self.zonk(env, r)),
+        TNamed(n, args) => TNamed(n, all(args)),
+        other => other,
+    }
+}

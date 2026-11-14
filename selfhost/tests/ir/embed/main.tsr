@@ -1,0 +1,8 @@
+// Files embedded when the program is compiled: their contents are
+// literals in the IR.
+fn main(root: Root) {
+    let page = embed("page.txt")
+    let raw = embed_bytes("page.txt")
+    let all = embed_dir("assets")
+    root.stdout.print("{page.len()} {raw.len()} {all.keys()}")
+}

@@ -1,0 +1,180 @@
+// The free variables of an expression, and whether a closure body can
+// return early (`return` or `?`) from itself, as src/free.ml has them.
+// Lowering uses them to decide which closure literals to inline and which
+// pipelines to fuse into one loop.
+//
+// The lists come out in OCaml's order (each new name in front), because
+// lowering looks the names up in that order and a lookup can create a
+// capture, which numbers a variable.
+use ast
+
+// The names `p` binds, in front of `acc`.
+pub fn pat_binds(p: ast.Pat, acc: List[Str]) -> List[Str] {
+    match p.desc {
+        PBind(n) => [n] + acc,
+        PRest(Some(n)) => [n] + acc,
+        PVariant(_, _, args) | PTuple(args) | PList(args) | POr(args) => args.fold(acc, |got, a| pat_binds(a, got)),
+        _ => acc,
+    }
+}
+
+// The free variables of `e` that are not in `bound`, newest first.
+pub fn expr(bound: List[Str], e: ast.Expr) -> List[Str] {
+    fv(bound, [], e)
+}
+
+fn fv(bound: List[Str], acc: List[Str], e: ast.Expr) -> List[Str] {
+    let go = |acc: List[Str], x: ast.Expr| fv(bound, acc, x)
+    match e.desc {
+        EVar(n) => if bound.contains(n) || acc.contains(n) { acc } else { [n] + acc },
+        EInt(_) | EFloat(_) | EBool(_) | EUnit => acc,
+        EGroup(n, _, until, b) => {
+            let acc = match until {
+                Some(d) => go(go(acc, d.clock), d.ms),
+                None => acc,
+            }
+            fv_block([n] + bound, acc, b)
+        },
+        EStr(ps) => ps.fold(acc, |acc, p| match p {
+            SPExpr(x) => go(acc, x),
+            SPLit(_) => acc,
+        }),
+        EList(es) => es.fold(acc, go),
+        EBin(_, a, b) | EIndex(a, b) | EPipe(a, b) => go(go(acc, a), b),
+        EUn(_, a) | ETry(a, None) | EField(a, _, _) => go(acc, a),
+        ETry(a, Some(c)) => go(go(acc, a), c),
+        ECall(c, args) => args.fold(go(acc, c), go),
+        ENamed(_, _, a) => go(acc, a),
+        EMethod(r, _, _, args) => args.fold(go(acc, r), go),
+        EIf(c, b, other) => {
+            let acc = fv_block(bound, go(acc, c), b)
+            match other {
+                Some(x) => go(acc, x),
+                None => acc,
+            }
+        },
+        EMatch(s, arms) => arms.fold(go(acc, s), |acc, a| {
+            let inner = pat_binds(a.pat, bound)
+            let acc = match a.guard {
+                Some(g) => fv(inner, acc, g),
+                None => acc,
+            }
+            fv(inner, acc, a.body)
+        }),
+        EBlock(b) => fv_block(bound, acc, b),
+        EClosure(ps, body) => fv(ps.map(|p| p.name) + bound, acc, body),
+        EStruct(_, _, fs) => fs.fold(acc, |acc, f| go(acc, f.value)),
+        EWith(b, fs) => fs.fold(go(acc, b), |acc, f| go(acc, f.value)),
+        ESafe(b, x, rest) => fv([x] + bound, go(acc, b), rest),
+        EDyn(x, _) => go(acc, x),
+        ESelect(arms) => arms.fold(acc, |acc, a| {
+            let acc = match a.guard {
+                Some(g) => go(acc, g),
+                None => acc,
+            }
+            match a.op {
+                SelRecv(b, c) => {
+                    let inner = match b {
+                        Some(n) => [n.text] + bound,
+                        None => bound,
+                    }
+                    fv(inner, go(acc, c), a.body)
+                },
+                SelSend(c, v) | SelAfter(c, v) => go(go(go(acc, c), v), a.body),
+                SelDefault => go(acc, a.body),
+            }
+        }),
+    }
+}
+
+fn fv_block(bound: List[Str], acc: List[Str], b: ast.Block) -> List[Str] {
+    let mut bound = bound
+    let mut acc = acc
+    for s in b.stmts {
+        match s.desc {
+            SLet(_, n, _, _, e) => {
+                acc = fv(bound, acc, e)
+                bound = [n] + bound
+            },
+            SAssign(l, r) => {
+                acc = fv(bound, fv(bound, acc, l), r)
+            },
+            SExpr(e) | SReturn(Some(e)) => {
+                acc = fv(bound, acc, e)
+            },
+            SReturn(None) | SBreak | SContinue => {},
+            SWhile(c, body) => {
+                acc = fv_block(bound, fv(bound, acc, c), body)
+            },
+            SFor(n, _, e, body) => {
+                acc = fv_block([n] + bound, fv(bound, acc, e), body)
+            },
+            SDefer(body) => {
+                acc = fv_block(bound, acc, body)
+            },
+            SLetPat(..) | SForPat(..) => panic("destructuring is expanded when modules load"),
+        }
+    }
+    match b.tail {
+        Some(e) => fv(bound, acc, e),
+        None => acc,
+    }
+}
+
+// `return` or `?` at this closure's own level, not inside a nested
+// closure.
+pub fn has_escape(e: ast.Expr) -> Bool {
+    let opt = |x: Option[ast.Expr]| match x {
+        Some(y) => has_escape(y),
+        None => false,
+    }
+    match e.desc {
+        ETry(..) => true,
+        EClosure(..) => false,
+        EVar(_) | EInt(_) | EFloat(_) | EBool(_) | EUnit => false,
+        EGroup(_, _, until, b) => (match until {
+            Some(d) => has_escape(d.clock) || has_escape(d.ms),
+            None => false,
+        }) || block_escape(b),
+        EStr(ps) => ps.any(|p| match p {
+            SPExpr(x) => has_escape(x),
+            SPLit(_) => false,
+        }),
+        EList(es) => es.any(has_escape),
+        EBin(_, a, b) | EIndex(a, b) | EPipe(a, b) => has_escape(a) || has_escape(b),
+        EUn(_, a) | EField(a, _, _) => has_escape(a),
+        ECall(c, args) => has_escape(c) || args.any(has_escape),
+        ENamed(_, _, a) => has_escape(a),
+        EMethod(r, _, _, args) => has_escape(r) || args.any(has_escape),
+        EIf(c, b, other) => has_escape(c) || block_escape(b) || opt(other),
+        EMatch(s, arms) => has_escape(s) || arms.any(|a| has_escape(a.body) || opt(a.guard)),
+        EBlock(b) => block_escape(b),
+        EStruct(_, _, fs) => fs.any(|f| has_escape(f.value)),
+        EWith(b, fs) => has_escape(b) || fs.any(|f| has_escape(f.value)),
+        ESafe(b, _, rest) => has_escape(b) || has_escape(rest),
+        EDyn(x, _) => has_escape(x),
+        ESelect(arms) => arms.any(|a| has_escape(a.body) || opt(a.guard) || match a.op {
+            SelRecv(_, c) => has_escape(c),
+            SelSend(c, v) | SelAfter(c, v) => has_escape(c) || has_escape(v),
+            SelDefault => false,
+        }),
+    }
+}
+
+fn block_escape(b: ast.Block) -> Bool {
+    let stmt_escapes = |s: ast.Stmt| match s.desc {
+        SReturn(_) => true,
+        SLet(_, _, _, _, e) | SExpr(e) => has_escape(e),
+        SAssign(l, r) => has_escape(l) || has_escape(r),
+        SWhile(c, body) => has_escape(c) || block_escape(body),
+        SFor(_, _, e, body) => has_escape(e) || block_escape(body),
+        SLetPat(..) | SForPat(..) => panic("destructuring is expanded when modules load"),
+        SBreak | SContinue => false,
+        // a deferred body cannot leave (E0115)
+        SDefer(_) => false,
+    }
+    b.stmts.any(stmt_escapes) || match b.tail {
+        Some(e) => has_escape(e),
+        None => false,
+    }
+}

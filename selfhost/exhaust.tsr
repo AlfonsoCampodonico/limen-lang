@@ -43,7 +43,7 @@ pub fn fill_rest(ps: List[ast.Pat], n: Int) -> List[ast.Pat] {
 
 // A list pattern's items before the `..`, the `..` itself (None when there
 // is none, Some(name) when it binds the rest), and the items after it.
-fn list_parts(ps: List[ast.Pat]) -> (List[ast.Pat], Option[Option[Str]], List[ast.Pat]) {
+pub fn list_parts(ps: List[ast.Pat]) -> (List[ast.Pat], Option[Option[Str]], List[ast.Pat]) {
     for (i, p) in ps.with_index() {
         match p.desc {
             PRest(r) => {

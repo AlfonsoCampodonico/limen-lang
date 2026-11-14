@@ -1,0 +1,2032 @@
+// The checked program, lowered to the IR of selfhost/ir.tsr, as
+// src/lower.ml does it. Generic functions are instantiated per concrete
+// type arguments (monomorphization); closures are lifted to top-level
+// functions that receive their captured values; list map, filter and fold
+// and the Option and Result helpers become plain loops and branches.
+//
+// The OCaml lowering keeps a mutable context per function, with a pointer
+// to the enclosing one for closures. Here the whole context is one value,
+// `Lx`, threaded through every step: the function being lowered is `cur`,
+// the ones around it (for a closure) are `parents`, innermost first.
+// Lowering a nested block, which OCaml does by running a callback between
+// saving and restoring the statement buffer, is `open` and `close` here.
+//
+// Variables, lifted functions and instances are numbered in the order
+// OCaml makes them, which is also the order it evaluates its expressions
+// in, so the IR comes out the same, numbers included. That holds even in
+// code lowered after a panic, which emits nothing but still numbers what
+// it makes.
+use ast
+use env
+use exhaust
+use ffi
+use free
+use ir
+use types
+
+// What lowering reads and never changes: the checked program.
+pub struct Ro {
+    fns: Map[Str, ast.FnDecl],
+    structs: Map[Str, ast.StructDecl],
+    enums: Map[Str, ast.EnumDecl],
+    // variant -> its enum, when only one enum defines it
+    ctors: Map[Str, Str],
+    // each expression's type and type arguments, by id, read through the
+    // checker's final substitution
+    types: Map[Int, types.Ty],
+    insts: Map[Int, List[(Str, types.Ty)]],
+    // `a?.b` whose rest is an Option already
+    nested: Map[Int, Bool],
+    subst: types.Subst,
+    ifaces: Map[Str, List[env.IfaceMethod]],
+    iface_gen: Map[Str, List[Str]],
+}
+
+// A `defer` being lowered: its body, the names in scope at the defer, the
+// loop depth there, its guard number and the defers around it.
+struct Deferred {
+    body: ast.Block,
+    scopes: List[Map[Str, ir.Var]],
+    loop_depth: Int,
+    id: Int,
+    outer: List[Deferred],
+}
+
+// A function being lowered.
+struct Frame {
+    // its type parameters' types
+    genv: List[(Str, types.Ty)],
+    // innermost first
+    scopes: List[Map[Str, ir.Var]],
+    // the statements so far
+    buf: List[ir.Stmt],
+    // control cannot reach this point
+    dead: Bool,
+    ret: types.Ty,
+    // captured: the variable outside, the one inside
+    caps: List[(ir.Var, ir.Var)],
+    // innermost first
+    defers: List[Deferred],
+    loop_depth: Int,
+}
+
+// A job: an instance to lower, its C name, its declaration and type
+// arguments.
+struct Job {
+    cname: Str,
+    decl: ast.FnDecl,
+    targs: List[(Str, types.Ty)],
+}
+
+pub struct Lx {
+    ro: Ro,
+    // "name[args]" -> C name
+    instances: Map[Str, Str],
+    queue: List[Job],
+    // the next job of the queue to lower
+    next_job: Int,
+    out: List[ir.Fn],
+    // lifted functions and selects
+    counter: Int,
+    // the last variable and guard numbers given
+    vars: Int,
+    guards: Int,
+    cur: Frame,
+    parents: List[Frame],
+}
+
+// What a nested block saved of the one around it.
+struct Saved {
+    buf: List[ir.Stmt],
+    dead: Bool,
+}
+
+// A function argument of map, filter or fold: a closure literal inlined
+// where it is applied, or a value called.
+enum Prep {
+    Inline(List[Str], ast.Expr),
+    Value(ir.Atom),
+}
+
+// What a fused loop does with each item that gets through the stages.
+enum Terminal {
+    FoldInto(ir.Var, Prep),
+    MapInto(ir.Var, Prep),
+    FilterInto(ir.Var, Prep),
+}
+
+fn new_frame(genv: List[(Str, types.Ty)], ret: types.Ty) -> Frame {
+    Frame { genv, scopes: [map()], buf: [], dead: false, ret, caps: [], defers: [], loop_depth: 0 }
+}
+
+fn no_subst() -> types.Subst {
+    types.empty()
+}
+
+pub fn show(t: types.Ty) -> Str {
+    no_subst().show(t)
+}
+
+// ---------- the context ----------
+
+fn fresh_var(self: Lx, name: Str, ty: types.Ty) -> (ir.Var, Lx) {
+    let mut lx = self
+    lx.vars = lx.vars + 1
+    (ir.Var { id: lx.vars, name, ty }, lx)
+}
+
+fn emit(self: Lx, s: ir.Stmt) -> Lx {
+    if self.cur.dead {
+        return self
+    }
+    let mut lx = self
+    lx.cur.buf.push(s)
+    lx
+}
+
+fn emit_all(self: Lx, ss: List[ir.Stmt]) -> Lx {
+    ss.fold(self, |lx, s| lx.emit(s))
+}
+
+fn tmp(self: Lx, ty: types.Ty, rhs: ir.Rhs) -> (ir.Atom, Lx) {
+    let (v, lx) = self.fresh_var("t", ty)
+    (V(v), lx.emit(Let(v, rhs)))
+}
+
+fn set_dead(self: Lx) -> Lx {
+    let mut lx = self
+    lx.cur.dead = true
+    lx
+}
+
+fn bind(self: Lx, n: Str, v: ir.Var) -> Lx {
+    let mut lx = self
+    lx.cur.scopes[0][n] = v
+    lx
+}
+
+fn push_scope(self: Lx) -> Lx {
+    let mut lx = self
+    lx.cur.scopes = [map()] + lx.cur.scopes
+    lx
+}
+
+fn pop_scope(self: Lx) -> Lx {
+    let mut lx = self
+    lx.cur.scopes = lx.cur.scopes.skip(1)
+    lx
+}
+
+// Start collecting statements into a separate block with its own scope.
+fn open(self: Lx) -> (Saved, Lx) {
+    let mut lx = self
+    let saved = Saved { buf: lx.cur.buf, dead: lx.cur.dead }
+    lx.cur.buf = []
+    lx.cur.dead = false
+    (saved, lx.push_scope())
+}
+
+// The block's statements, and whether control can leave its end.
+fn close(self: Lx, saved: Saved) -> (List[ir.Stmt], Bool, Lx) {
+    let mut lx = self.pop_scope()
+    let stmts = lx.cur.buf
+    let dead = lx.cur.dead
+    lx.cur.buf = saved.buf
+    lx.cur.dead = saved.dead
+    (stmts, dead, lx)
+}
+
+// The block that only breaks out of the loop.
+fn break_block(self: Lx) -> (List[ir.Stmt], Lx) {
+    let (saved, lx) = self.open()
+    let (b, _, lx) = lx.emit(Break).set_dead().close(saved)
+    (b, lx)
+}
+
+fn frame(self: Lx, depth: Int) -> Frame {
+    if depth == 0 { self.cur } else { self.parents[depth - 1] }
+}
+
+// The variable `n` names in the function `depth` levels out. A variable of
+// an enclosing function is captured: the closure gets a variable of its
+// own for it, made the first time it is used, in every closure between.
+fn lookup_at(self: Lx, depth: Int, n: Str) -> (Option[ir.Var], Lx) {
+    for s in self.frame(depth).scopes {
+        match s.get(n) {
+            Some(v) => {
+                return (Some(v), self)
+            },
+            None => {},
+        }
+    }
+    if depth >= self.parents.len() {
+        return (None, self)
+    }
+    let (found, lx) = self.lookup_at(depth + 1, n)
+    match found {
+        None => (None, lx),
+        Some(outer) => match lx.frame(depth).caps.find(|c| c.0.id == outer.id) {
+            Some(c) => (Some(c.1), lx),
+            None => {
+                let (inner, lx) = lx.fresh_var(n, outer.ty)
+                let mut lx = lx
+                if depth == 0 {
+                    lx.cur.caps.push((outer, inner))
+                } else {
+                    lx.parents[depth - 1].caps.push((outer, inner))
+                }
+                (Some(inner), lx)
+            },
+        },
+    }
+}
+
+fn lookup(self: Lx, n: Str) -> (Option[ir.Var], Lx) {
+    self.lookup_at(0, n)
+}
+
+fn not_local(self: Lx, n: Str) -> (Bool, Lx) {
+    let (found, lx) = self.lookup(n)
+    (found.is_none(), lx)
+}
+
+fn is_enum_name(self: Lx, n: Str) -> (Bool, Lx) {
+    let (no, lx) = self.not_local(n)
+    (no && lx.ro.enums.contains(n), lx)
+}
+
+// ---------- types ----------
+
+// The type a written type stands for, with the type parameters of `env`.
+pub fn resolve(env: List[(Str, types.Ty)], te: ast.TyExpr) -> types.Ty {
+    let assoc = |n: Str| env.find(|p| p.0 == n).map(|p| p.1)
+    match te.desc {
+        TyUnit => TUnit,
+        TyFn(ps, r) => TFn(ps.map(|p| resolve(env, p)), resolve(env, r)),
+        TyInt(_) => TUnit,
+        TyName("Array", [elt, size]) if is_len(env, size) => match size.desc {
+            TyInt(n) => TArray(resolve(env, elt), TLen(n)),
+            TyName(g, _) => TArray(resolve(env, elt), assoc(g) ?? TUnit),
+            _ => TUnit,
+        },
+        TyName("dyn", [target]) if is_named(target) => match target.desc {
+            TyName(i, args) => TDyn(i, args.map(|a| resolve(env, a))),
+            _ => TUnit,
+        },
+        TyName(n, args) => {
+            let a = args.map(|x| resolve(env, x))
+            match (n, a) {
+                ("Int", _) => TInt,
+                ("Float", _) => TFloat,
+                ("Bool", _) => TBool,
+                ("Str", _) => TStr,
+                ("Bytes", _) => TBytes,
+                ("List", [x]) => TList(x),
+                ("Chan", [x]) => TChan(x),
+                ("Map", [k, v]) => TMap(k, v),
+                _ if is_cap(n) => TCap(n),
+                _ => assoc(n) ?? TNamed(n, a),
+            }
+        },
+    }
+}
+
+fn is_cap(n: Str) -> Bool {
+    ["Root", "Net", "Fs", "Stdout", "Clock", "Listen", "Listener", "Conn", "Rand", "Stdin", "Env", "Exec", "Foreign"].contains(n)
+}
+
+// An array's size: a number, or a type parameter that stands for one.
+fn is_len(env: List[(Str, types.Ty)], size: ast.TyExpr) -> Bool {
+    match size.desc {
+        TyInt(_) => true,
+        TyName(g, []) => env.any(|p| p.0 == g),
+        _ => false,
+    }
+}
+
+fn is_named(te: ast.TyExpr) -> Bool {
+    match te.desc {
+        TyName(..) => true,
+        _ => false,
+    }
+}
+
+// The fields of struct type `t`, with their types.
+pub fn field_types(ro: Ro, t: types.Ty) -> List[(Str, types.Ty)] {
+    match t {
+        TNamed(n, args) => {
+            let s = ro.structs[n]
+            let env = s.generics.zip(args)
+            s.fields.map(|f| (f.name, resolve(env, f.ty)))
+        },
+        _ => panic("field_types"),
+    }
+}
+
+// The variants of enum type `t`, with their payload types.
+pub fn variants(ro: Ro, t: types.Ty) -> List[(Str, List[types.Ty])] {
+    match t {
+        TNamed(n, args) => {
+            let e = ro.enums[n]
+            let env = e.generics.zip(args)
+            e.variants.map(|v| (v.name, v.payload.map(|p| resolve(env, p))))
+        },
+        _ => panic("variants"),
+    }
+}
+
+fn index_of(x: Str, l: List[Str]) -> Int {
+    for (i, y) in l.with_index() {
+        if y == x {
+            return i
+        }
+    }
+    panic("index_of " + x)
+}
+
+pub fn field_index(ro: Ro, t: types.Ty, name: Str) -> Int {
+    index_of(name, field_types(ro, t).map(|f| f.0))
+}
+
+pub fn tag_of(ro: Ro, t: types.Ty, v: Str) -> Int {
+    index_of(v, variants(ro, t).map(|x| x.0))
+}
+
+fn is_struct(ro: Ro, t: types.Ty) -> Bool {
+    match t {
+        TNamed(n, _) => ro.structs.contains(n),
+        _ => false,
+    }
+}
+
+// The type of `e` in the function being lowered: concrete.
+fn tyof(self: Lx, e: ast.Expr) -> types.Ty {
+    self.ro.subst.zonk(self.cur.genv, self.ro.types.get(e.id) ?? TErr)
+}
+
+// The type arguments of a generic function's use, made concrete.
+fn inst_of(self: Lx, e: ast.Expr) -> List[(Str, types.Ty)] {
+    let insts = self.ro.insts.get(e.id) ?? []
+    insts.map(|p| (p.0, self.ro.subst.zonk(self.cur.genv, p.1)))
+}
+
+// The methods of interface `i` with these type arguments.
+pub fn iface_methods(ro: Ro, i: Str, args: List[types.Ty]) -> List[env.IfaceMethod] {
+    let ms = ro.ifaces.get(i) ?? []
+    match ro.iface_gen.get(i) {
+        Some(gs) if !gs.is_empty() && gs.len() == args.len() => {
+            let e = gs.zip(args)
+            ms.map(|m| { m with params: m.params.map(|p| ro.subst.subst(e, p)), ret: ro.subst.subst(e, m.ret) })
+        },
+        _ => ms,
+    }
+}
+
+// ---------- function instances ----------
+
+// The C name of function `name` instantiated with `targs`, queued to be
+// lowered the first time.
+fn instance(self: Lx, name: Str, targs: List[(Str, types.Ty)]) -> (Str, Lx) {
+    let key = name + "[" + targs.map(|p| show(p.1)).join(",") + "]"
+    match self.instances.get(key) {
+        Some(c) => (c, self),
+        None => {
+            let safe = bytes(name.bytes().map(|ch| if (ch >= 97 && ch <= 122) || (ch >= 65 && ch <= 90) || (ch >= 48 && ch <= 57) || ch == 95 { ch } else { 95 })).to_str()
+            let mut lx = self
+            let c = if targs.is_empty() { "wf_" + safe } else { "wf_{safe}_{lx.instances.len()}" }
+            lx.instances[key] = c
+            lx.queue.push(Job { cname: c, decl: lx.ro.fns[name], targs })
+            (c, lx)
+        },
+    }
+}
+
+fn lift(self: Lx, params: List[ir.Var], ret: types.Ty, body: List[ir.Stmt]) -> (Str, Lx) {
+    let mut lx = self
+    lx.counter = lx.counter + 1
+    let name = "wf_lift{lx.counter}"
+    lx.out.push(ir.Fn { fname: name, params, captures: [], is_closure: true, ret, body })
+    (name, lx)
+}
+
+// A top-level function or a variant constructor used as a value: a lifted
+// function that calls it.
+fn wrapper(self: Lx, ty: types.Ty, make: fn(List[ir.Atom]) -> ir.Rhs) -> (Str, Lx) {
+    match ty {
+        TFn(ps, r) => {
+            let mut lx = self
+            let mut params: List[ir.Var] = []
+            for t in ps {
+                let (v, next) = lx.fresh_var("a", t)
+                params.push(v)
+                lx = next
+            }
+            let (res, lx) = lx.fresh_var("r", r)
+            let body = [Let(res, make(params.map(|v| V(v)))), Return(V(res))]
+            lx.lift(params, r, body)
+        },
+        _ => panic("wrapper"),
+    }
+}
+
+// ---------- expressions ----------
+
+fn lower_all(self: Lx, es: List[ast.Expr]) -> (List[ir.Atom], Lx) {
+    let mut lx = self
+    let mut xs: List[ir.Atom] = []
+    for e in es {
+        let (a, next) = lx.lower(e)
+        xs.push(a)
+        lx = next
+    }
+    (xs, lx)
+}
+
+fn is_map(t: types.Ty) -> Bool {
+    match t {
+        TMap(..) => true,
+        _ => false,
+    }
+}
+
+fn is_list(t: types.Ty) -> Bool {
+    match t {
+        TList(_) => true,
+        _ => false,
+    }
+}
+
+pub fn lower(self: Lx, e: ast.Expr) -> (ir.Atom, Lx) {
+    if self.cur.dead {
+        return (AUnit, self)
+    }
+    let ty = self.tyof(e)
+    let lx = self
+    let sp = e.span
+    match e.desc {
+        EInt(n) => (AInt(n), lx),
+        EFloat(x) => (AFloat(x), lx),
+        EBool(b) => (ABool(b), lx),
+        EUnit => (AUnit, lx),
+        EStr([]) => (AStr(""), lx),
+        EStr([SPLit(s)]) => (AStr(s), lx),
+        EStr(parts) => {
+            let mut lx = lx
+            let mut ps: List[ir.IPart] = []
+            for p in parts {
+                match p {
+                    SPLit(s) => ps.push(IStr(s)),
+                    SPExpr(x) => {
+                        let (a, next) = lx.lower(x)
+                        lx = next
+                        ps.push(IVal(a, lx.tyof(x)))
+                    },
+                }
+            }
+            lx.tmp(TStr, Format(ps))
+        },
+        EVar(n) => {
+            let (found, lx) = lx.lookup(n)
+            match found {
+                Some(v) => (V(v), lx),
+                None => lx.global_value(e, n, ty),
+            }
+        },
+        EList(es) => {
+            let (xs, lx) = lx.lower_all(es)
+            lx.tmp(ty, MkList(ty, xs))
+        },
+        EBin(op, a, b) if op == And || op == Or => {
+            let (x, lx) = lx.lower(a)
+            let (r, lx) = lx.fresh_var("b", TBool)
+            let lx = lx.emit(Decl(r))
+            let (saved, lx) = lx.open()
+            let (y, lx) = lx.lower(b)
+            let (rhs_branch, _, lx) = lx.emit(Init(r, Use(y))).close(saved)
+            let const_branch = [Init(r, Use(ABool(op == Or)))]
+            let lx = lx.emit(if op == And { If(x, rhs_branch, const_branch) } else { If(x, const_branch, rhs_branch) })
+            (V(r), lx)
+        },
+        EBin(Else, a, b) => {
+            // `a ?? b`: the payload of Some or Ok (tag 0), else b, evaluated
+            // only then
+            let (x, lx) = lx.lower(a)
+            let at = lx.tyof(a)
+            let (r, lx) = lx.fresh_var("v", ty)
+            let lx = lx.emit(Decl(r))
+            let (has, lx) = lx.tmp(TBool, IsTag(x, at, 0))
+            let (saved, lx) = lx.open()
+            let (some_b, _, lx) = lx.emit(Init(r, Payload(x, at, 0, 0))).close(saved)
+            let (saved, lx) = lx.open()
+            let (y, lx) = lx.lower(b)
+            let (none_b, _, lx) = lx.emit(Init(r, Use(y))).close(saved)
+            (V(r), lx.emit(If(has, some_b, none_b)))
+        },
+        EBin(Range, a, b) => {
+            let (x, lx) = lx.lower(a)
+            let (y, lx) = lx.lower(b)
+            lx.tmp(ty, Prim("int_range", TInt, [x, y], sp))
+        },
+        EBin(op, a, b) => {
+            let (x, lx) = lx.lower(a)
+            let (y, lx) = lx.lower(b)
+            lx.tmp(ty, Bin(op, lx.tyof(a), x, y, sp))
+        },
+        EUn(Neg, a) => {
+            let (x, lx) = lx.lower(a)
+            lx.tmp(ty, Negate(ty, x))
+        },
+        EUn(Not, a) => {
+            let (x, lx) = lx.lower(a)
+            lx.tmp(TBool, Flip(x))
+        },
+        ECall(callee, args) => lx.lower_call(e, callee, args, ty),
+        ENamed(..) => panic("internal: the checker puts named arguments in order"),
+        EMethod(recv, name, _, args) => lx.lower_method_expr(e, recv, name, args, ty),
+        EField(recv, name, _) => {
+            let (is_ctor, lx) = match recv.desc {
+                EVar(en) => lx.is_enum_name(en),
+                _ => (false, lx),
+            }
+            if is_ctor {
+                return lx.ctor_value(name, ty)
+            }
+            lx.lower_access(e, ty)
+        },
+        EIndex(..) => lx.lower_access(e, ty),
+        ETry(x, c) => lx.lower_try(x, c),
+        EIf(c, b, other) => {
+            let (ca, lx) = lx.lower(c)
+            let (r, lx) = lx.fresh_var("if", ty)
+            let lx = lx.emit(Decl(r))
+            let (saved, lx) = lx.open()
+            let (a, lx) = lx.lower_block_inner(b)
+            let (s1, d1, lx) = lx.emit(Init(r, Use(a))).close(saved)
+            let (saved, lx) = lx.open()
+            let lx = match other {
+                Some(x) => {
+                    let (a, lx) = lx.lower(x)
+                    lx.emit(Init(r, Use(a)))
+                },
+                None => lx.emit(Init(r, Use(AUnit))),
+            }
+            let (s2, d2, lx) = lx.close(saved)
+            let lx = lx.emit(If(ca, s1, s2))
+            (V(r), if d1 && d2 { lx.set_dead() } else { lx })
+        },
+        EMatch(s, arms) => lx.lower_match(e, s, arms, ty),
+        ESelect(arms) => lx.lower_select(e, arms, ty),
+        EBlock(b) => lx.lower_block(b),
+        EClosure(ps, body) => lx.lower_closure(ps, body, ty),
+        EPipe(..) => panic("pipes are expanded when modules load"),
+        ESafe(base, x, rest) => {
+            // `a?.b`: if a is Some(v), the rest of the chain on v (wrapped in
+            // Some unless it is an Option already), else None
+            let flat = lx.ro.nested.contains(e.id)
+            let (a, lx) = lx.lower(base)
+            let bt = lx.tyof(base)
+            let inner = match bt {
+                TNamed("Option", [t]) => t,
+                _ => TUnit,
+            }
+            let (r, lx) = lx.fresh_var("safe", ty)
+            let lx = lx.emit(Decl(r))
+            let (has, lx) = lx.tmp(TBool, IsTag(a, bt, 0))
+            let (saved, lx) = lx.open()
+            let (v, lx) = lx.fresh_var(x, inner)
+            let lx = lx.emit(Let(v, Payload(a, bt, 0, 0))).bind(x, v)
+            let (c, lx) = lx.lower(rest)
+            let (some_b, _, lx) = lx.emit(Init(r, if flat { Use(c) } else { MkEnum(ty, 0, [c]) })).close(saved)
+            let (saved, lx) = lx.open()
+            let (none_b, _, lx) = lx.emit(Init(r, MkEnum(ty, 1, []))).close(saved)
+            (V(r), lx.emit(If(has, some_b, none_b)))
+        },
+        EWith(base, fields) => {
+            // Take the base, then overwrite the fields in place. When the
+            // base is not used afterwards it is moved, so its storage is
+            // reused; otherwise the ownership pass retains it (a copy)
+            // first. A plain variable is read after the new values, so
+            // `p = { p with x: p.x + 1 }` still moves `p`.
+            let bt = lx.tyof(base)
+            let mut lx = lx
+            let early = match base.desc {
+                EVar(_) => None,
+                _ => {
+                    let (a, next) = lx.lower(base)
+                    lx = next
+                    Some(a)
+                },
+            }
+            let mut vals: List[(Int, ir.Atom)] = []
+            for f in fields {
+                let (a, next) = lx.lower(f.value)
+                lx = next
+                vals.push((field_index(lx.ro, bt, f.name), a))
+            }
+            let b = match early {
+                Some(a) => a,
+                None => {
+                    let (a, next) = lx.lower(base)
+                    lx = next
+                    a
+                },
+            }
+            let (v, lx) = lx.fresh_var("with", bt)
+            let lx = lx.emit(Let(v, Use(b)))
+            (V(v), vals.fold(lx, |lx, p| lx.emit(Mutate(v, [PField(p.0)], MSet(p.1)))))
+        },
+        EStruct(name, _, fields) => {
+            let mut lx = lx
+            let mut vals: List[(Str, ir.Atom)] = []
+            for f in fields {
+                let (a, next) = lx.lower(f.value)
+                lx = next
+                vals.push((f.name, a))
+            }
+            let decl = lx.ro.structs[name]
+            let xs = decl.fields.map(|fd| vals.find(|p| p.0 == fd.name).map(|p| p.1) ?? AUnit)
+            lx.tmp(ty, MkStruct(ty, xs))
+        },
+        EDyn(x, i) => {
+            let t = lx.tyof(x)
+            let (a, lx) = lx.lower(x)
+            let args = match ty {
+                TDyn(_, args) => args,
+                _ => [],
+            }
+            lx.mk_dyn(t, i, args, a)
+        },
+        EGroup(name, interleaved, until, b) => {
+            // with a deadline, each result is an Option: None for a
+            // cancelled task
+            let t = match (ty, until) {
+                (TList(TNamed("Option", [t])), Some(_)) => t,
+                (TList(t), None) => t,
+                _ => TUnit,
+            }
+            let mut lx = lx
+            let dl = match until {
+                Some(d) => {
+                    let (c, next) = lx.lower(d.clock)
+                    let (ms, next) = next.lower(d.ms)
+                    lx = next
+                    Some((c, ms))
+                },
+                None => None,
+            }
+            let (g, lx) = lx.fresh_var(name, TGroup(t))
+            let lx = lx.emit(Let(g, GroupNew(dl, interleaved))).push_scope().bind(name, g)
+            let lx = if until.is_none() {
+                lx.lower_block(b).1
+            } else {
+                let (saved, lx) = lx.open()
+                let (_, lx) = lx.lower_block(b)
+                let (body, _, lx) = lx.close(saved)
+                lx.emit(Scope(V(g), body))
+            }
+            lx.pop_scope().tmp(ty, GroupJoin(V(g), ty, until.is_some()))
+        },
+    }
+}
+
+// `r.name` and `a[i]` chains read as one path.
+fn lower_access(self: Lx, e: ast.Expr, ty: types.Ty) -> (ir.Atom, Lx) {
+    let (root, rty, steps, lx) = self.access(e)
+    if steps.is_empty() {
+        return (root, lx)
+    }
+    lx.tmp(ty, Get(root, rty, steps))
+}
+
+fn lower_method_expr(self: Lx, e: ast.Expr, recv: ast.Expr, name: Str, args: List[ast.Expr], ty: types.Ty) -> (ir.Atom, Lx) {
+    let (is_ctor, lx) = match recv.desc {
+        EVar(en) => self.is_enum_name(en),
+        _ => (false, self),
+    }
+    let rt = lx.tyof(recv)
+    let one = args.len() == 1
+    if is_ctor {
+        let (xs, lx) = lx.lower_all(args)
+        return lx.tmp(ty, MkEnum(ty, tag_of(lx.ro, ty, name), xs))
+    }
+    if name == "remove" && one && is_map(rt) {
+        let (v, steps, lx) = lx.lower_place(recv)
+        let (ka, lx) = lx.lower(args[0])
+        return (AUnit, lx.emit(Mutate(v, steps, MRemove(ka))))
+    }
+    if name == "push" && one && is_list(rt) {
+        let (v, steps, lx) = lx.lower_place(recv)
+        let (x, lx) = lx.lower(args[0])
+        return (AUnit, lx.emit(Mutate(v, steps, MPush(x))))
+    }
+    let on_group = match rt {
+        TGroup(_) => true,
+        _ => false,
+    }
+    if (name == "go" || name == "#go") && one && on_group {
+        let (g, lx) = lx.lower(recv)
+        let (c, lx) = lx.lower(args[0])
+        let keep = name == "go"
+        let t = match rt {
+            TGroup(t) if keep => t,
+            _ => TUnit,
+        }
+        let (_, lx) = lx.tmp(TUnit, Spawn(g, c, t, keep))
+        return (AUnit, lx)
+    }
+    let chan = match rt {
+        TChan(_) => true,
+        _ => false,
+    }
+    if name == "send" && one && chan {
+        let (c, lx) = lx.lower(recv)
+        let (x, lx) = lx.lower(args[0])
+        let (_, lx) = lx.tmp(TUnit, ChanSend(c, x, e.span))
+        return (AUnit, lx)
+    }
+    lx.lower_method(e, recv, name, args, ty)
+}
+
+fn global_value(self: Lx, e: ast.Expr, n: Str, ty: types.Ty) -> (ir.Atom, Lx) {
+    if self.ro.fns.contains(n) {
+        let targs = self.inst_of(e)
+        let (c, lx) = self.instance(n, targs)
+        let (w, lx) = lx.wrapper(ty, |args| Call(c, args))
+        return lx.tmp(ty, MkClosure(w, ty, []))
+    }
+    self.ctor_value(n, ty)
+}
+
+fn ctor_value(self: Lx, vname: Str, ty: types.Ty) -> (ir.Atom, Lx) {
+    match ty {
+        TFn(_, rt) => {
+            let tag = tag_of(self.ro, rt, vname)
+            let (w, lx) = self.wrapper(ty, |args| MkEnum(rt, tag, args))
+            lx.tmp(ty, MkClosure(w, ty, []))
+        },
+        _ => self.tmp(ty, MkEnum(ty, tag_of(self.ro, ty, vname), [])),
+    }
+}
+
+// A block that panics with `msg`, after which nothing runs.
+fn panic_block(self: Lx, msg: ir.Atom, sp: ast.Span) -> (List[ir.Stmt], Lx) {
+    let (saved, lx) = self.open()
+    let (_, lx) = lx.tmp(TUnit, Panic(msg, sp))
+    let (b, _, lx) = lx.set_dead().close(saved)
+    (b, lx)
+}
+
+fn lower_call(self: Lx, e: ast.Expr, callee: ast.Expr, args: List[ast.Expr], ty: types.Ty) -> (ir.Atom, Lx) {
+    let sp = e.span
+    match callee.desc {
+        EVar(n) => {
+            let (no_local, lx) = self.not_local(n)
+            if no_local && !lx.ro.fns.contains(n) {
+                match n {
+                    "assert" => {
+                        let (c, lx) = lx.lower(args[0])
+                        let (fail, lx) = lx.panic_block(AStr("assertion failed"), sp)
+                        return (AUnit, lx.emit(If(c, [], fail)))
+                    },
+                    "assert_eq" => {
+                        let (x, lx) = lx.lower(args[0])
+                        let (y, lx) = lx.lower(args[1])
+                        let t = lx.tyof(args[0])
+                        let (same, lx) = lx.tmp(TBool, Bin(Eq, t, x, y, sp))
+                        let (saved, lx) = lx.open()
+                        let (msg, lx) = lx.tmp(TStr, Format([IStr("assertion failed: "), IValQ(x, t), IStr(" != "), IValQ(y, t)]))
+                        let (_, lx) = lx.tmp(TUnit, Panic(msg, sp))
+                        let (fail, _, lx) = lx.set_dead().close(saved)
+                        return (AUnit, lx.emit(If(same, [], fail)))
+                    },
+                    "channel" => {
+                        let (cap, lx) = lx.lower(args[0])
+                        return lx.tmp(ty, ChanNew(ty, cap, sp))
+                    },
+                    "catch" => {
+                        let (c, lx) = lx.lower(args[0])
+                        let inner = match lx.tyof(args[0]) {
+                            TFn(_, r) => r,
+                            _ => TUnit,
+                        }
+                        return lx.tmp(ty, Catch(c, inner))
+                    },
+                    "keep" => {
+                        let (x, lx) = lx.lower(args[0])
+                        return lx.tmp(TUnit, Prim("keep", lx.tyof(args[0]), [x], sp))
+                    },
+                    "bytes" => {
+                        let (xs, lx) = lx.lower_all(args)
+                        return lx.tmp(ty, Prim("bytes_new", TBytes, xs, sp))
+                    },
+                    "map" => {
+                        let (xs, lx) = lx.lower_all(args)
+                        return lx.tmp(ty, Prim(if xs.is_empty() { "map_new" } else { "map_from" }, ty, xs, sp))
+                    },
+                    "panic" => {
+                        let (m, lx) = lx.lower(args[0])
+                        let (r, lx) = lx.tmp(ty, Panic(m, sp))
+                        return (r, lx.set_dead())
+                    },
+                    _ => {},
+                }
+            }
+            if no_local {
+                match lx.ro.fns.get(n) {
+                    Some(d) if d.foreign.is_some() => {
+                        return lx.lower_foreign(d, args, ty, sp)
+                    },
+                    Some(_) => {
+                        let targs = lx.inst_of(callee)
+                        let (c, lx) = lx.instance(n, targs)
+                        let (xs, lx) = lx.lower_all(args)
+                        return lx.tmp(ty, Call(c, xs))
+                    },
+                    None => {},
+                }
+                if lx.ro.ctors.contains(n) {
+                    let (xs, lx) = lx.lower_all(args)
+                    return lx.tmp(ty, MkEnum(ty, tag_of(lx.ro, ty, n), xs))
+                }
+            }
+            lx.call_value(callee, args, ty)
+        },
+        EField(recv, v, _) => {
+            let (is_ctor, lx) = match recv.desc {
+                EVar(en) => self.is_enum_name(en),
+                _ => (false, self),
+            }
+            if is_ctor {
+                let (xs, lx) = lx.lower_all(args)
+                return lx.tmp(ty, MkEnum(ty, tag_of(lx.ro, ty, v), xs))
+            }
+            lx.call_value(callee, args, ty)
+        },
+        _ => self.call_value(callee, args, ty),
+    }
+}
+
+// A call of a closure value.
+fn call_value(self: Lx, callee: ast.Expr, args: List[ast.Expr], ty: types.Ty) -> (ir.Atom, Lx) {
+    let (c, lx) = self.lower(callee)
+    let (xs, lx) = lx.lower_all(args)
+    lx.tmp(ty, CallClo(c, xs))
+}
+
+// A call of a foreign C function. A callback is a top-level function (the
+// checker made sure): C calls its compiled code through a wrapper, so it
+// is not lowered as a value.
+fn lower_foreign(self: Lx, d: ast.FnDecl, args: List[ast.Expr], ty: types.Ty, sp: ast.Span) -> (ir.Atom, Lx) {
+    let cs = match ffi.of_decl(d, self.ro.structs) {
+        Ok(cs) => cs,
+        Err(_) => panic("lower: foreign signature"),
+    }
+    let kinds = (if cs.trusted { [] } else { [Unit] }) + cs.params.filter(|p| !p.out).map(|p| p.cty)
+    let mut lx = self
+    let mut xs: List[ir.Atom] = []
+    let mut cbs: List[ir.Callback] = []
+    for (a, k) in args.zip(kinds) {
+        match (k, a.desc) {
+            (Fn(ps, _), EVar(m)) => {
+                let cd = lx.ro.fns[m]
+                let (c, next) = lx.instance(m, [])
+                lx = next
+                cbs.push(ir.Callback { cname: c, name: m, span: cd.span, takes_foreign: cd.params.len() > ps.len() })
+            },
+            _ => {
+                let (x, next) = lx.lower(a)
+                lx = next
+                xs.push(x)
+            },
+        }
+    }
+    lx.tmp(ty, CallC(cs, xs, cbs, sp))
+}
+
+// A chain of field and index reads, so `a[i].x` is one Get, not two
+// copies: the value at its root, the root's type, and the steps.
+fn access(self: Lx, e: ast.Expr) -> (ir.Atom, types.Ty, List[ir.Step], Lx) {
+    let lx = self
+    match e.desc {
+        EField(r, name, _) if is_struct(lx.ro, lx.tyof(r)) => {
+            let (a, rt, steps, lx) = lx.access(r)
+            (a, rt, steps + [PField(field_index(lx.ro, lx.tyof(r), name))], lx)
+        },
+        EIndex(r, i) if lx.tyof(r) == TBytes => {
+            let (b, lx) = lx.lower(r)
+            let (ia, lx) = lx.lower(i)
+            let (x, lx) = lx.tmp(TInt, Prim("bytes_at", TBytes, [b, ia], e.span))
+            (x, TInt, [], lx)
+        },
+        EIndex(r, k) if is_map(lx.tyof(r)) => {
+            // a map lookup starts a new path: the value it finds
+            let (m, lx) = lx.lower(r)
+            let (ka, lx) = lx.lower(k)
+            let vt = lx.tyof(e)
+            let (x, lx) = lx.tmp(vt, Prim("map_at", lx.tyof(r), [m, ka], e.span))
+            (x, vt, [], lx)
+        },
+        EIndex(r, i) => {
+            let (a, rt, steps, lx) = lx.access(r)
+            let (ia, lx) = lx.lower(i)
+            (a, rt, steps + [PIndex(ia, e.span)], lx)
+        },
+        EField(r, name, _) if lx.tyof(r) == TCap("Root") => {
+            let (a, lx) = lx.lower(r)
+            let (x, lx) = lx.tmp(lx.tyof(e), RootField(a, name))
+            (x, lx.tyof(e), [], lx)
+        },
+        _ => {
+            let (a, lx) = lx.lower(e)
+            (a, lx.tyof(e), [], lx)
+        },
+    }
+}
+
+// The variable at the root of an assignable path, and the steps to the
+// place.
+fn lower_place(self: Lx, e: ast.Expr) -> (ir.Var, List[ir.Step], Lx) {
+    match e.desc {
+        EVar(n) => match self.lookup(n) {
+            (Some(v), lx) => (v, [], lx),
+            (None, _) => panic("place " + n),
+        },
+        EField(r, name, _) => {
+            let (v, s, lx) = self.lower_place(r)
+            (v, s + [PField(field_index(lx.ro, lx.tyof(r), name))], lx)
+        },
+        EIndex(r, k) if is_map(self.tyof(r)) => {
+            // `m[k].x = v`: the entry, changed in place
+            let (v, s, lx) = self.lower_place(r)
+            let (ka, lx) = lx.lower(k)
+            (v, s + [PKey(ka, e.span)], lx)
+        },
+        EIndex(r, i) => {
+            let (v, s, lx) = self.lower_place(r)
+            let (ia, lx) = lx.lower(i)
+            (v, s + [PIndex(ia, e.span)], lx)
+        },
+        _ => panic("place"),
+    }
+}
+
+// Box `a` of type `t` as `dyn i`: a vtable of t's methods.
+fn mk_dyn(self: Lx, t: types.Ty, i: Str, args: List[types.Ty], a: ir.Atom) -> (ir.Atom, Lx) {
+    let mut lx = self
+    let mut entries: List[ir.DynEntry] = []
+    for m in iface_methods(lx.ro, i, args) {
+        let (f, next) = lx.method_fn(t, m.name, m.params)
+        lx = next
+        entries.push(ir.DynEntry { fname: f, params: m.params, ret: m.ret })
+    }
+    // the vtable is per interface and arguments
+    let key = if args.is_empty() { i } else { show(TDyn(i, args)) }
+    lx.tmp(TDyn(i, args), MkDyn(t, key, a, entries))
+}
+
+// The function that is method `m` of type `t`, receiver first.
+fn method_fn(self: Lx, t: types.Ty, m: Str, ps: List[types.Ty]) -> (Str, Lx) {
+    let key = match t {
+        TNamed(n, _) if self.ro.fns.contains(n + "::" + m) => n + "::" + m,
+        TStr if m == "message" => "$Str::message",
+        TNamed("IoError", _) if m == "message" => "$IoError::message",
+        // `cause` is optional in `Error`
+        _ if m == "cause" => "$no_cause",
+        _ => panic("no method " + m),
+    }
+    let d = self.ro.fns[key]
+    self.instance(key, derive_targs(d, [t] + ps))
+}
+
+fn lower_try(self: Lx, x: ast.Expr, context: Option[ast.Expr]) -> (ir.Atom, Lx) {
+    let (a, lx) = self.lower(x)
+    let xt = lx.tyof(x)
+    let ok_ty = match xt {
+        TNamed("Result", [t, _]) | TNamed("Option", [t]) => t,
+        _ => panic("try"),
+    }
+    let (ok, lx) = lx.tmp(TBool, IsTag(a, xt, 0))
+    let (saved, lx) = lx.open()
+    let (r, lx) = lx.try_fail(a, xt, context)
+    let lx = lx.run_defers(lx.cur.defers)
+    let (fail_block, _, lx) = lx.emit(Return(r)).set_dead().close(saved)
+    let lx = lx.emit(If(ok, [], fail_block))
+    lx.tmp(ok_ty, Payload(a, xt, 0, 0))
+}
+
+// What `x?` returns when `a`, of type `xt`, is an Err or None.
+fn try_fail(self: Lx, a: ir.Atom, xt: types.Ty, context: Option[ast.Expr]) -> (ir.Atom, Lx) {
+    let ret = self.cur.ret
+    match (xt, context) {
+        (TNamed("Result", [_, et]), _) => {
+            let (ev, lx) = self.tmp(et, Payload(a, xt, 1, 0))
+            let (err, lx) = lx.to_ret_err(ev, et, context)
+            lx.tmp(ret, MkEnum(ret, 1, [err]))
+        },
+        // `opt? "context"`: the context is the error
+        (TNamed("Option", _), Some(c)) => {
+            let (ca, lx) = self.lower(c)
+            let (err, lx) = lx.mk_dyn(TStr, "Error", [], ca)
+            lx.tmp(ret, MkEnum(ret, 1, [err]))
+        },
+        _ => self.tmp(ret, MkEnum(ret, 1, [])),
+    }
+}
+
+// The error the function returns: converted to `dyn Error` if it returns
+// one, and wrapped with the context if there is one.
+fn to_ret_err(self: Lx, ev: ir.Atom, et: types.Ty, context: Option[ast.Expr]) -> (ir.Atom, Lx) {
+    let dyn_error = TDyn("Error", [])
+    let returns_dyn = match self.cur.ret {
+        TNamed("Result", [_, e]) => e == dyn_error,
+        _ => false,
+    }
+    let (ev, lx) = if returns_dyn && et != dyn_error { self.mk_dyn(et, "Error", [], ev) } else { (ev, self) }
+    match context {
+        None => (ev, lx),
+        Some(c) => {
+            let (ca, lx) = lx.lower(c)
+            let wt = TNamed("WrappedError", [])
+            let (s, lx) = lx.tmp(wt, MkStruct(wt, [ca, ev]))
+            lx.mk_dyn(wt, "Error", [], s)
+        },
+    }
+}
+
+fn no_arm_matched(self: Lx, sp: ast.Span) -> Lx {
+    let (_, lx) = self.tmp(TUnit, Panic(AStr("no `match` arm matched"), sp))
+    lx.set_dead()
+}
+
+fn lower_match(self: Lx, e: ast.Expr, s: ast.Expr, arms: List[ast.Arm], ty: types.Ty) -> (ir.Atom, Lx) {
+    let (sa, lx) = self.lower(s)
+    let st = lx.tyof(s)
+    let (r, lx) = lx.fresh_var("m", ty)
+    let lx = lx.emit(Decl(r))
+    if arms.all(|a| a.guard.is_none()) {
+        return (V(r), lx.match_chain(e, sa, st, r, arms))
+    }
+    // With guards, first find the arm: `k` is the index of the first arm
+    // whose pattern matches and whose guard holds (-1 for none), trying
+    // each arm only while none has been found. Then run that arm's body.
+    // Each arm's bindings are made again for its body; this keeps the code
+    // linear in the number of arms.
+    let (k, lx) = lx.fresh_var("arm", TInt)
+    let mut lx = lx.emit(Let(k, Use(AInt(-1))))
+    for (i, arm) in arms.with_index() {
+        if i == 0 {
+            lx = lx.try_arm(sa, st, k, i, arm)
+        } else {
+            let (pending, next) = lx.tmp(TBool, Bin(Eq, TInt, V(k), AInt(-1), e.span))
+            let (saved, next) = next.open()
+            let (b, _, next) = next.try_arm(sa, st, k, i, arm).close(saved)
+            lx = next.emit(If(pending, b, []))
+        }
+    }
+    (V(r), lx.dispatch(e, sa, st, r, k, 0, arms))
+}
+
+// The arms without guards, each tried in turn.
+fn match_chain(self: Lx, e: ast.Expr, sa: ir.Atom, st: types.Ty, r: ir.Var, arms: List[ast.Arm]) -> Lx {
+    match arms {
+        [] => self.no_arm_matched(e.span),
+        [arm, ..rest] => {
+            if exhaust.irrefutable(arm.pat) {
+                let (saved, lx) = self.open()
+                let (b, d, lx) = lx.arm_body(sa, st, r, arm).close(saved)
+                let lx = lx.emit_all(b)
+                return if d { lx.set_dead() } else { lx }
+            }
+            let (t, lx) = self.tmp(TBool, PatTest(sa, st, arm.pat))
+            let (saved, lx) = lx.open()
+            let (b1, d1, lx) = lx.arm_body(sa, st, r, arm).close(saved)
+            let (saved, lx) = lx.open()
+            let (b2, d2, lx) = lx.match_chain(e, sa, st, r, rest).close(saved)
+            let lx = lx.emit(If(t, b1, b2))
+            if d1 && d2 { lx.set_dead() } else { lx }
+        },
+    }
+}
+
+fn arm_body(self: Lx, sa: ir.Atom, st: types.Ty, r: ir.Var, arm: ast.Arm) -> Lx {
+    let lx = self.bind_pat(sa, st, arm.pat)
+    let (a, lx) = lx.lower(arm.body)
+    lx.emit(Init(r, Use(a)))
+}
+
+// Set `k` to `i` if arm `i` applies.
+fn try_arm(self: Lx, sa: ir.Atom, st: types.Ty, k: ir.Var, i: Int, arm: ast.Arm) -> Lx {
+    let (saved, lx) = self.open()
+    let lx = match arm.guard {
+        None => lx.emit(Set(k, Use(AInt(i)), false)),
+        Some(g) => {
+            let lx = lx.bind_pat(sa, st, arm.pat)
+            let (ga, lx) = lx.lower(g)
+            let (saved, lx) = lx.open()
+            let (yes, _, lx) = lx.emit(Set(k, Use(AInt(i)), false)).close(saved)
+            lx.emit(If(ga, yes, []))
+        },
+    }
+    let (b, _, lx) = lx.close(saved)
+    if exhaust.irrefutable(arm.pat) {
+        return lx.emit_all(b)
+    }
+    let (t, lx) = lx.tmp(TBool, PatTest(sa, st, arm.pat))
+    lx.emit(If(t, b, []))
+}
+
+// Run the body of arm `k`.
+fn dispatch(self: Lx, e: ast.Expr, sa: ir.Atom, st: types.Ty, r: ir.Var, k: ir.Var, i: Int, arms: List[ast.Arm]) -> Lx {
+    match arms {
+        [] => self.no_arm_matched(e.span),
+        [arm, ..rest] => {
+            let (t, lx) = self.tmp(TBool, Bin(Eq, TInt, V(k), AInt(i), e.span))
+            let (saved, lx) = lx.open()
+            let (b1, d1, lx) = lx.arm_body(sa, st, r, arm).close(saved)
+            let (saved, lx) = lx.open()
+            let (b2, d2, lx) = lx.dispatch(e, sa, st, r, k, i + 1, rest).close(saved)
+            let lx = lx.emit(If(t, b1, b2))
+            if d1 && d2 { lx.set_dead() } else { lx }
+        },
+    }
+}
+
+fn chan_elem(t: types.Ty) -> types.Ty {
+    match t {
+        TChan(x) => x,
+        _ => TUnit,
+    }
+}
+
+fn lower_select(self: Lx, e: ast.Expr, arms: List[ast.SelArm], ty: types.Ty) -> (ir.Atom, Lx) {
+    let mut lx = self
+    lx.counter = lx.counter + 1
+    let id = lx.counter
+    // channels and send values first, in order
+    let mut ops: List[ir.Sel] = []
+    for a in arms {
+        let on = match a.guard {
+            Some(g) => {
+                let (x, next) = lx.lower(g)
+                lx = next
+                x
+            },
+            None => ABool(true),
+        }
+        match a.op {
+            SelRecv(_, ch) => {
+                let el = chan_elem(lx.tyof(ch))
+                let (c, next) = lx.lower(ch)
+                lx = next
+                ops.push(SRecv(c, el, on))
+            },
+            SelSend(ch, v) => {
+                let el = chan_elem(lx.tyof(ch))
+                let (c, next) = lx.lower(ch)
+                let (x, next) = next.lower(v)
+                lx = next
+                ops.push(SSend(c, x, el, on))
+            },
+            SelAfter(clk, ms) => {
+                let (c, next) = lx.lower(clk)
+                let (m, next) = next.lower(ms)
+                lx = next
+                ops.push(SAfter(c, m, on))
+            },
+            SelDefault => {},
+        }
+    }
+    let has_default = arms.any(|a| is_default(a.op))
+    let (k, lx) = lx.tmp(TInt, Select(id, ops, has_default, e.span))
+    let (r, lx) = lx.fresh_var("s", ty)
+    let lx = lx.emit(Decl(r))
+    // number the channel arms; `_` is -1
+    let mut n = 0
+    let mut numbered: List[(Int, ast.SelArm)] = []
+    for a in arms {
+        if is_default(a.op) {
+            numbered.push((-1, a))
+        } else {
+            numbered.push((n, a))
+            n = n + 1
+        }
+    }
+    (V(r), lx.select_chain(e, id, k, r, numbered))
+}
+
+fn is_default(op: ast.SelOp) -> Bool {
+    match op {
+        SelDefault => true,
+        _ => false,
+    }
+}
+
+fn select_chain(self: Lx, e: ast.Expr, id: Int, k: ir.Atom, r: ir.Var, arms: List[(Int, ast.SelArm)]) -> Lx {
+    match arms {
+        [] => self,
+        [(i, a)] => {
+            let (saved, lx) = self.open()
+            let (b, d, lx) = lx.select_body(id, i, r, a).close(saved)
+            let lx = lx.emit_all(b)
+            if d { lx.set_dead() } else { lx }
+        },
+        [(i, a), ..rest] => {
+            let (t, lx) = self.tmp(TBool, Bin(Eq, TInt, k, AInt(i), e.span))
+            let (saved, lx) = lx.open()
+            let (b1, d1, lx) = lx.select_body(id, i, r, a).close(saved)
+            let (saved, lx) = lx.open()
+            let (b2, d2, lx) = lx.select_chain(e, id, k, r, rest).close(saved)
+            let lx = lx.emit(If(t, b1, b2))
+            if d1 && d2 { lx.set_dead() } else { lx }
+        },
+    }
+}
+
+fn select_body(self: Lx, id: Int, i: Int, r: ir.Var, a: ast.SelArm) -> Lx {
+    let lx = match a.op {
+        SelRecv(b, ch) => {
+            // always take the value out, so an unnamed one is released
+            let ot = types.opt(chan_elem(self.tyof(ch)))
+            let (v, lx) = self.fresh_var(b.map(|n| n.text) ?? "got", ot)
+            let lx = lx.emit(Let(v, SelGot(id, i, ot)))
+            match b {
+                Some(n) => lx.bind(n.text, v),
+                None => lx,
+            }
+        },
+        _ => self,
+    }
+    let (x, lx) = lx.lower(a.body)
+    lx.emit(Init(r, Use(x)))
+}
+
+fn has_bind(p: ast.Pat) -> Bool {
+    !free.pat_binds(p, []).is_empty()
+}
+
+// Bind the names in `p`, which matches `a` of type `t`.
+fn bind_pat(self: Lx, a: ir.Atom, t: types.Ty, p: ast.Pat) -> Lx {
+    let mut lx = self
+    match p.desc {
+        PBind(n) => {
+            let (v, lx) = lx.fresh_var(n, t)
+            lx.emit(Let(v, Use(a))).bind(n, v)
+        },
+        PVariant(_, vn, args) => {
+            let tag = tag_of(lx.ro, t, vn)
+            let ptys = variants(lx.ro, t).find(|v| v.0 == vn).map(|v| v.1) ?? []
+            for (i, pair) in exhaust.fill_rest(args, ptys.len()).zip(ptys).with_index() {
+                let (sub, pt) = pair
+                if has_bind(sub) {
+                    let (pv, next) = lx.tmp(pt, Payload(a, t, tag, i))
+                    lx = next.bind_pat(pv, pt, sub)
+                }
+            }
+            lx
+        },
+        PTuple(ps) => {
+            let fts = field_types(lx.ro, t)
+            for (i, pair) in exhaust.fill_rest(ps, fts.len()).zip(fts).with_index() {
+                let (sub, ft) = pair
+                if has_bind(sub) {
+                    let (pv, next) = lx.tmp(ft.1, Get(a, t, [PField(i)]))
+                    lx = next.bind_pat(pv, ft.1, sub)
+                }
+            }
+            lx
+        },
+        PList(ps) if has_bind(p) => lx.bind_list(a, t, p, ps),
+        POr(alts) if has_bind(p) => lx.bind_or(a, t, p, alts),
+        _ => lx,
+    }
+}
+
+fn bind_list(self: Lx, a: ir.Atom, t: types.Ty, p: ast.Pat, ps: List[ast.Pat]) -> Lx {
+    let el = match t {
+        TList(el) => el,
+        _ => panic("bind_pat: list"),
+    }
+    let (before, rest, after) = exhaust.list_parts(ps)
+    let mut lx = self
+    for (i, sub) in before.with_index() {
+        lx = lx.bind_item(a, t, el, AInt(i), sub)
+    }
+    if rest.is_none() && after.is_empty() {
+        return lx
+    }
+    let (n, next) = lx.tmp(TInt, Prim("list_len", t, [a], p.span))
+    lx = next
+    let j = after.len()
+    for (i, sub) in after.with_index() {
+        if has_bind(sub) {
+            let (at, next) = lx.tmp(TInt, Bin(Sub, TInt, n, AInt(j - i), p.span))
+            lx = next.bind_item(a, t, el, at, sub)
+        }
+    }
+    match rest {
+        Some(Some(name)) => {
+            let (hi, lx) = lx.tmp(TInt, Bin(Sub, TInt, n, AInt(j), p.span))
+            let (v, lx) = lx.fresh_var(name, t)
+            lx.emit(Let(v, Prim("list_slice", t, [a, AInt(before.len()), hi], p.span))).bind(name, v)
+        },
+        _ => lx,
+    }
+}
+
+fn bind_item(self: Lx, a: ir.Atom, t: types.Ty, el: types.Ty, i: ir.Atom, sub: ast.Pat) -> Lx {
+    if !has_bind(sub) {
+        return self
+    }
+    let (x, lx) = self.tmp(el, Get(a, t, [PIndexU(i)]))
+    lx.bind_pat(x, el, sub)
+}
+
+// The names come from whichever alternative matched: each gets a variable
+// declared here, set in the branch for that alternative.
+fn bind_or(self: Lx, a: ir.Atom, t: types.Ty, p: ast.Pat, alts: List[ast.Pat]) -> Lx {
+    let names = free.pat_binds(p, []).sort().distinct()
+    let mut outs: Map[Str, ir.Var] = map()
+    let mut lx = self
+    let mut branches: List[(ast.Pat, List[ir.Stmt])] = []
+    for alt in alts {
+        let (saved, next) = lx.open()
+        lx = next.bind_pat(a, t, alt)
+        for n in names {
+            let v = lx.cur.scopes[0][n]
+            let o = match outs.get(n) {
+                Some(o) => o,
+                None => {
+                    let (o, next) = lx.fresh_var(n, v.ty)
+                    lx = next
+                    outs[n] = o
+                    o
+                },
+            }
+            lx = lx.emit(Init(o, Use(V(v))))
+        }
+        let (b, _, next) = lx.close(saved)
+        lx = next
+        branches.push((alt, b))
+    }
+    for n in names {
+        lx = lx.emit(Decl(outs[n]))
+    }
+    lx = lx.or_chain(a, t, branches)
+    names.fold(lx, |lx, n| lx.bind(n, outs[n]))
+}
+
+fn or_chain(self: Lx, a: ir.Atom, t: types.Ty, branches: List[(ast.Pat, List[ir.Stmt])]) -> Lx {
+    match branches {
+        [] => self,
+        [(_, b)] => self.emit_all(b),
+        [(alt, b), ..rest] => {
+            let (c, lx) = self.tmp(TBool, PatTest(a, t, alt))
+            let (saved, lx) = lx.open()
+            let (other, _, lx) = lx.or_chain(a, t, rest).close(saved)
+            lx.emit(If(c, b, other))
+        },
+    }
+}
+
+// The type arguments of generic function `d` called with arguments of the
+// given concrete types.
+fn derive_targs(d: ast.FnDecl, act: List[types.Ty]) -> List[(Str, types.Ty)] {
+    let genv = d.generics.map(|g| (g, TParam(g)))
+    let decl = d.params.map(|p| resolve(genv, p.ty))
+    let found = if decl.len() == act.len() { match_all(decl, act, []) } else { [] }
+    d.generics.map(|g| (g, found.find(|p| p.0 == g).map(|p| p.1) ?? TUnit))
+}
+
+// Read the type parameters of `decl` off `act`; the first binding of each
+// wins.
+fn match_targs(decl: types.Ty, act: types.Ty, found: List[(Str, types.Ty)]) -> List[(Str, types.Ty)] {
+    match (decl, act) {
+        (TParam(g), t) => if found.any(|p| p.0 == g) { found } else { [(g, t)] + found },
+        (TList(a), TList(b)) | (TChan(a), TChan(b)) => match_targs(a, b, found),
+        (TArray(a, n), TArray(b, k)) => match_targs(n, k, match_targs(a, b, found)),
+        (TNamed(_, xs), TNamed(_, ys)) if xs.len() == ys.len() => match_all(xs, ys, found),
+        (TFn(xs, r1), TFn(ys, r2)) if xs.len() == ys.len() => match_targs(r1, r2, match_all(xs, ys, found)),
+        _ => found,
+    }
+}
+
+fn match_all(xs: List[types.Ty], ys: List[types.Ty], found: List[(Str, types.Ty)]) -> List[(Str, types.Ty)] {
+    xs.zip(ys).fold(found, |acc, p| match_targs(p.0, p.1, acc))
+}
+
+fn lower_method(self: Lx, e: ast.Expr, recv: ast.Expr, name: Str, args: List[ast.Expr], ty: types.Ty) -> (ir.Atom, Lx) {
+    let rt = self.tyof(recv)
+    let lx = self
+    match rt {
+        TDyn(i, targs) => {
+            // through the vtable
+            let ms = iface_methods(lx.ro, i, targs)
+            let k = index_of(name, ms.map(|m| m.name))
+            let m = ms[k]
+            let (ra, lx) = lx.lower(recv)
+            let (xs, lx) = lx.lower_all(args)
+            return lx.tmp(ty, CallDyn(k, m.params, m.ret, ra, xs))
+        },
+        _ => {},
+    }
+    let error_type = match rt {
+        TStr => true,
+        TNamed("IoError", _) => true,
+        _ => false,
+    }
+    let no_cause = match rt {
+        TStr => true,
+        TNamed(n, _) => !lx.ro.fns.contains(n + "::cause"),
+        _ => false,
+    }
+    if (error_type && name == "message") || (no_cause && name == "cause" && args.is_empty()) {
+        // `message` of Str and IoError, and `cause` reached through an
+        // `Error` bound on a type without one
+        let (c, lx) = lx.method_fn(rt, name, [])
+        let (x, lx) = lx.lower(recv)
+        return lx.tmp(ty, Call(c, [x]))
+    }
+    match rt {
+        TNamed(n, _) if lx.ro.fns.contains(n + "::" + name) => {
+            // a method on a user type: a call with the receiver first
+            let key = n + "::" + name
+            let d = lx.ro.fns[key]
+            let env = lx.inst_of(e)
+            // reached through an interface bound, the checker only knew a
+            // type parameter: read the instantiation off the actual types
+            let targs = if d.generics.all(|g| env.any(|p| p.0 == g)) { env } else { derive_targs(d, ([recv] + args).map(|x| lx.tyof(x))) }
+            let (c, lx) = lx.instance(key, targs)
+            let (xs, lx) = lx.lower_all([recv] + args)
+            return lx.tmp(ty, Call(c, xs))
+        },
+        _ => {},
+    }
+    let sp = e.span
+    match (rt, name, args) {
+        (TNamed("Option", _), "is_some", []) | (TNamed("Result", _), "is_ok", []) => {
+            let (x, lx) = lx.lower(recv)
+            lx.tmp(TBool, IsTag(x, rt, 0))
+        },
+        (TNamed("Option", _), "is_none", []) | (TNamed("Result", _), "is_err", []) => {
+            let (x, lx) = lx.lower(recv)
+            lx.tmp(TBool, IsTag(x, rt, 1))
+        },
+        (TNamed("Option", [xt]), "map", [f]) => {
+            let (ra, lx) = lx.lower(recv)
+            let (ca, lx) = lx.lower(f)
+            let (c, lx) = lx.tmp(TBool, IsTag(ra, rt, 0))
+            let (r, lx) = lx.fresh_var("u", ty)
+            let lx = lx.emit(Decl(r))
+            let ut = match ty {
+                TNamed(_, [u]) => u,
+                _ => TUnit,
+            }
+            let (saved, lx) = lx.open()
+            let (p, lx) = lx.tmp(xt, Payload(ra, rt, 0, 0))
+            let (y, lx) = lx.tmp(ut, CallClo(ca, [p]))
+            let (s1, _, lx) = lx.emit(Init(r, MkEnum(ty, 0, [y]))).close(saved)
+            let (saved, lx) = lx.open()
+            let (s2, _, lx) = lx.emit(Init(r, MkEnum(ty, 1, []))).close(saved)
+            (V(r), lx.emit(If(c, s1, s2)))
+        },
+        (TNamed("Result", [at, et]), "map_error", [f]) => {
+            let (ra, lx) = lx.lower(recv)
+            let (ca, lx) = lx.lower(f)
+            let (c, lx) = lx.tmp(TBool, IsTag(ra, rt, 1))
+            let (r, lx) = lx.fresh_var("u", ty)
+            let lx = lx.emit(Decl(r))
+            let ut = match ty {
+                TNamed(_, [_, u]) => u,
+                _ => TUnit,
+            }
+            let (saved, lx) = lx.open()
+            let (p, lx) = lx.tmp(et, Payload(ra, rt, 1, 0))
+            let (y, lx) = lx.tmp(ut, CallClo(ca, [p]))
+            let (s1, _, lx) = lx.emit(Init(r, MkEnum(ty, 1, [y]))).close(saved)
+            let (saved, lx) = lx.open()
+            let (p, lx) = lx.tmp(at, Payload(ra, rt, 0, 0))
+            let (s2, _, lx) = lx.emit(Init(r, MkEnum(ty, 0, [p]))).close(saved)
+            (V(r), lx.emit(If(c, s1, s2)))
+        },
+        (TList(_), "map", _) | (TList(_), "filter", _) | (TList(_), "fold", _) => lx.lower_fused(recv, name, args, ty, sp),
+        _ => {
+            let (ra, lx) = lx.lower(recv)
+            let (xs, lx) = lx.lower_all(args)
+            let prefix = match rt {
+                TStr => "str_",
+                TBytes => "bytes_",
+                TInt => "int_",
+                TFloat => "float_",
+                TBool => "bool_",
+                TList(_) => "list_",
+                TMap(..) => "map_",
+                TArray(..) => "array_",
+                TChan(_) => "chan_",
+                TCap(_) => "cap_",
+                _ => panic("method on " + show(rt)),
+            }
+            lx.tmp(ty, Prim(prefix + name, rt, [ra] + xs, sp))
+        },
+    }
+}
+
+fn elem(t: types.Ty) -> types.Ty {
+    match t {
+        TList(x) => x,
+        _ => TUnit,
+    }
+}
+
+// Fuse a chain like xs.filter(p).map(g).fold(z, h) into one loop. Only
+// pure closure literals are fused into earlier stages: they capture no
+// capability and no function, so running them interleaved instead of
+// stage by stage cannot be observed (except which panic comes first).
+fn lower_fused(self: Lx, recv: ast.Expr, name: Str, args: List[ast.Expr], ty: types.Ty, sp: ast.Span) -> (ir.Atom, Lx) {
+    let (src_e, stages, lx) = self.stages_of(recv)
+    let (src, lx) = lx.lower(src_e)
+    let mut lx = lx
+    let mut prepared: List[(Str, Prep, types.Ty)] = []
+    for s in stages {
+        let (p, next) = lx.prepare(s.1)
+        lx = next
+        prepared.push((s.0, p, s.2))
+    }
+    let src_ty = lx.tyof(src_e)
+    match (name, args) {
+        ("fold", [init, f]) => {
+            let (ia, lx) = lx.lower(init)
+            let (p, lx) = lx.prepare(f)
+            let (acc, lx) = lx.fresh_var("acc", ty)
+            let lx = lx.emit(Let(acc, Use(ia)))
+            let (x, saved, lx) = lx.for_start(src, src_ty, sp)
+            let lx = lx.run_stages(V(x), elem(src_ty), prepared, FoldInto(acc, p), ty)
+            (V(acc), lx.for_end(saved))
+        },
+        (_, [f]) => {
+            let (p, lx) = lx.prepare(f)
+            let (out, lx) = lx.fresh_var("out", ty)
+            let lx = lx.emit(Let(out, MkList(ty, [])))
+            let (x, saved, lx) = lx.for_start(src, src_ty, sp)
+            let terminal = if name == "map" { MapInto(out, p) } else { FilterInto(out, p) }
+            let lx = lx.run_stages(V(x), elem(src_ty), prepared, terminal, ty)
+            (V(out), lx.for_end(saved))
+        },
+        _ => panic("list method arity"),
+    }
+}
+
+// The stages, then what the loop does with the item.
+fn run_stages(self: Lx, v: ir.Atom, vty: types.Ty, stages: List[(Str, Prep, types.Ty)], terminal: Terminal, ty: types.Ty) -> Lx {
+    match stages {
+        [] => match terminal {
+            FoldInto(acc, p) => {
+                let (r, lx) = self.apply(p, [V(acc), v], ty)
+                lx.emit(Set(acc, Use(r), false))
+            },
+            MapInto(out, p) => {
+                let (y, lx) = self.apply(p, [v], elem(ty))
+                lx.emit(Mutate(out, [], MPush(y)))
+            },
+            FilterInto(out, p) => {
+                let (keep, lx) = self.apply(p, [v], TBool)
+                let (saved, lx) = lx.open()
+                let (push, _, lx) = lx.emit(Mutate(out, [], MPush(v))).close(saved)
+                lx.emit(If(keep, push, []))
+            },
+        },
+        [("map", p, t), ..rest] => {
+            let (y, lx) = self.apply(p, [v], elem(t))
+            lx.run_stages(y, elem(t), rest, terminal, ty)
+        },
+        [(_, p, _), ..rest] => {
+            let (keep, lx) = self.apply(p, [v], TBool)
+            let (saved, lx) = lx.open()
+            let (blk, _, lx) = lx.run_stages(v, vty, rest, terminal, ty).close(saved)
+            lx.emit(If(keep, blk, []))
+        },
+    }
+}
+
+// Split `src.filter(a).map(b)` into the source and its fusable stages.
+fn stages_of(self: Lx, e: ast.Expr) -> (ast.Expr, List[(Str, ast.Expr, types.Ty)], Lx) {
+    match e.desc {
+        EMethod(r, k, _, [f]) if (k == "map" || k == "filter") && is_list(self.tyof(r)) => {
+            let (pure, lx) = self.pure_closure(f)
+            if !pure {
+                return (e, [], lx)
+            }
+            let (src, st, lx) = lx.stages_of(r)
+            (src, st + [(k, f, lx.tyof(e))], lx)
+        },
+        _ => (e, [], self),
+    }
+}
+
+// A closure literal is inlined where it is applied (no closure object, no
+// indirect call) unless its body can return early from itself.
+fn prepare(self: Lx, f: ast.Expr) -> (Prep, Lx) {
+    match f.desc {
+        EClosure(ps, body) if !free.has_escape(body) => (Inline(ps.map(|p| p.name), body), self),
+        _ => {
+            let (a, lx) = self.lower(f)
+            (Value(a), lx)
+        },
+    }
+}
+
+fn apply(self: Lx, prep: Prep, args: List[ir.Atom], ret_ty: types.Ty) -> (ir.Atom, Lx) {
+    match prep {
+        Value(c) => self.tmp(ret_ty, CallClo(c, args)),
+        Inline(ps, body) => {
+            let mut lx = self.push_scope()
+            for (n, a) in ps.zip(args) {
+                let (v, next) = lx.fresh_var(n, ir.atom_ty(a))
+                lx = next.emit(Let(v, Use(a))).bind(n, v)
+            }
+            let (r, lx) = lx.lower(body)
+            (r, lx.pop_scope())
+        },
+    }
+}
+
+// Pure: a closure literal whose free variables hold no capability and no
+// function value. It can then only compute, which is what fusion needs.
+fn pure_closure(self: Lx, f: ast.Expr) -> (Bool, Lx) {
+    match f.desc {
+        EClosure(ps, body) if !free.has_escape(body) => {
+            let mut lx = self
+            let s = no_subst()
+            for n in free.expr(ps.map(|p| p.name), body) {
+                let (found, next) = lx.lookup(n)
+                lx = next
+                match found {
+                    Some(v) => {
+                        if !s.caps_in(v.ty, []).is_empty() || s.has_fn(v.ty) || s.has_chan(v.ty) {
+                            return (false, lx)
+                        }
+                    },
+                    // a top-level function or constructor
+                    None => {},
+                }
+            }
+            (true, lx)
+        },
+        _ => (false, self),
+    }
+}
+
+// for x in list: iterate over a snapshot of the list by index. This
+// starts the loop, up to the item `x`; the caller lowers the body, then
+// for_end closes it.
+fn for_start(self: Lx, la: ir.Atom, lty: types.Ty, sp: ast.Span) -> (ir.Var, Saved, Lx) {
+    let elt = match lty {
+        TList(t) | TArray(t, _) => t,
+        _ => TUnit,
+    }
+    let (it, lx) = self.fresh_var("it", lty)
+    let lx = lx.emit(Let(it, Use(la)))
+    let (i, lx) = lx.fresh_var("i", TInt)
+    let lx = lx.emit(Let(i, Use(AInt(0))))
+    let (saved, lx) = lx.open()
+    let (n, lx) = lx.tmp(TInt, Prim("list_len", lty, [V(it)], sp))
+    let (c, lx) = lx.tmp(TBool, Bin(Ge, TInt, V(i), n, sp))
+    let (brk, lx) = lx.break_block()
+    let lx = lx.emit(If(c, brk, []))
+    let (x, lx) = lx.fresh_var("x", elt)
+    // i < len was checked just above, on a snapshot nothing else can change
+    let lx = lx.emit(Let(x, Get(V(it), lty, [PIndexU(V(i))])))
+    (x, saved, lx.emit(Set(i, Bin(Add, TInt, V(i), AInt(1), sp), false)))
+}
+
+fn for_end(self: Lx, saved: Saved) -> Lx {
+    let (stmts, _, lx) = self.close(saved)
+    lx.emit(Loop(stmts))
+}
+
+fn lower_closure(self: Lx, ps: List[ast.ClosureParam], body: ast.Expr, ty: types.Ty) -> (ir.Atom, Lx) {
+    let (pts, rt) = match ty {
+        TFn(a, b) => (a, b),
+        _ => panic("closure type"),
+    }
+    let mut lx = self
+    let cf = new_frame(lx.cur.genv, rt)
+    lx.parents = [lx.cur] + lx.parents
+    lx.cur = cf
+    let mut params: List[ir.Var] = []
+    for (p, t) in ps.zip(pts) {
+        let (v, next) = lx.fresh_var(p.name, t)
+        lx = next.bind(p.name, v)
+        params.push(v)
+    }
+    let (a, next) = lx.lower(body)
+    lx = next.emit(Return(a))
+    lx.counter = lx.counter + 1
+    let name = "wf_clo{lx.counter}"
+    let caps = lx.cur.caps
+    let fbody = lx.cur.buf
+    lx.cur = lx.parents[0]
+    lx.parents = lx.parents.skip(1)
+    lx.out.push(ir.Fn { fname: name, params, captures: caps.map(|c| c.1), is_closure: true, ret: rt, body: fbody })
+    lx.tmp(ty, MkClosure(name, ty, caps.map(|c| V(c.0))))
+}
+
+fn lower_block(self: Lx, b: ast.Block) -> (ir.Atom, Lx) {
+    let (a, lx) = self.push_scope().lower_block_inner(b)
+    (a, lx.pop_scope())
+}
+
+fn lower_block_inner(self: Lx, b: ast.Block) -> (ir.Atom, Lx) {
+    self.lower_stmts(b.stmts, b.tail)
+}
+
+fn lower_stmts(self: Lx, ss: List[ast.Stmt], tail: Option[ast.Expr]) -> (ir.Atom, Lx) {
+    let mut lx = self
+    for (i, s) in ss.with_index() {
+        match s.desc {
+            SDefer(d) if !lx.cur.dead => {
+                return lx.lower_defer(d, ss.skip(i + 1), tail)
+            },
+            _ => {
+                lx = lx.lower_stmt(s)
+            },
+        }
+    }
+    match tail {
+        Some(e) => lx.lower(e),
+        None => (AUnit, lx),
+    }
+}
+
+// `defer d` followed by `rest`: the rest runs under a guard whose handler
+// is `d` (for panics and cancellations); every normal way out of the rest
+// runs `d` itself after popping the guard: the end of the block here, and
+// return, `?`, break and continue through run_defers.
+fn lower_defer(self: Lx, d: ast.Block, rest: List[ast.Stmt], tail: Option[ast.Expr]) -> (ir.Atom, Lx) {
+    let mut lx = self
+    lx.guards = lx.guards + 1
+    let fr = Deferred { body: d, scopes: lx.cur.scopes, loop_depth: lx.cur.loop_depth, id: lx.guards, outer: lx.cur.defers }
+    let rt = match tail {
+        Some(e) => lx.tyof(e),
+        None => TUnit,
+    }
+    let (r, lx) = lx.fresh_var("dr", rt)
+    let lx = lx.emit(Decl(r))
+    let (saved, lx) = lx.open()
+    let (handler, _, lx) = lx.lower_defer_body(fr).close(saved)
+    let (saved, lx) = lx.open()
+    let mut lx = lx
+    lx.cur.defers = [fr] + lx.cur.defers
+    let (a, next) = lx.lower_stmts(rest, tail)
+    lx = next
+    lx.cur.defers = fr.outer
+    if !lx.cur.dead {
+        lx = lx.emit(GuardEnd(fr.id)).lower_defer_body(fr).emit(Init(r, Use(a)))
+    }
+    let (body, dead, lx) = lx.close(saved)
+    let lx = lx.emit(Guard(fr.id, handler, body))
+    (V(r), if dead { lx.set_dead() } else { lx })
+}
+
+// The deferred body, in the scope of its defer, with only the defers
+// around it still pending.
+fn lower_defer_body(self: Lx, fr: Deferred) -> Lx {
+    let mut lx = self
+    let saved_scopes = lx.cur.scopes
+    let saved_defers = lx.cur.defers
+    lx.cur.scopes = fr.scopes
+    lx.cur.defers = fr.outer
+    let (_, next) = lx.lower_block(fr.body)
+    lx = next
+    lx.cur.scopes = saved_scopes
+    lx.cur.defers = saved_defers
+    lx
+}
+
+// Leaving the given defers' blocks normally: innermost first, pop each
+// guard and run its body.
+fn run_defers(self: Lx, frames: List[Deferred]) -> Lx {
+    frames.fold(self, |lx, fr| lx.emit(GuardEnd(fr.id)).lower_defer_body(fr))
+}
+
+// The defers inside the innermost loop, which break and continue leave.
+fn loop_defers(self: Lx) -> List[Deferred] {
+    let depth = self.cur.loop_depth
+    self.cur.defers.filter(|fr| fr.loop_depth >= depth)
+}
+
+fn in_loop_block(self: Lx, b: ast.Block) -> Lx {
+    let mut lx = self
+    lx.cur.loop_depth = lx.cur.loop_depth + 1
+    let (_, next) = lx.lower_block(b)
+    lx = next
+    lx.cur.loop_depth = lx.cur.loop_depth - 1
+    lx
+}
+
+fn lower_stmt(self: Lx, s: ast.Stmt) -> Lx {
+    if self.cur.dead {
+        return self
+    }
+    let lx = self
+    match s.desc {
+        SLetPat(..) | SForPat(..) => panic("destructuring is expanded when modules load"),
+        SLet(_, n, _, _, e) => {
+            let (a, lx) = lx.lower(e)
+            let (v, lx) = lx.fresh_var(n, lx.tyof(e))
+            lx.emit(Let(v, Use(a))).bind(n, v)
+        },
+        SAssign(lhs, rhs) => match lhs.desc {
+            EVar(n) => {
+                let (a, lx) = lx.lower(rhs)
+                match lx.lookup(n) {
+                    (Some(v), lx) => lx.emit(Set(v, Use(a), false)),
+                    (None, _) => panic("assign"),
+                }
+            },
+            EIndex(m, k) if is_map(lx.tyof(m)) => {
+                // `m[k] = v` inserts or replaces
+                let (a, lx) = lx.lower(rhs)
+                let (ka, lx) = lx.lower(k)
+                let (v, steps, lx) = lx.lower_place(m)
+                lx.emit(Mutate(v, steps, MPut(ka, a)))
+            },
+            _ => {
+                let (a, lx) = lx.lower(rhs)
+                let (v, steps, lx) = lx.lower_place(lhs)
+                lx.emit(Mutate(v, steps, MSet(a)))
+            },
+        },
+        SExpr(e) => lx.lower(e).1,
+        SReturn(eo) => {
+            let (a, lx) = match eo {
+                Some(e) => lx.lower(e),
+                None => (AUnit, lx),
+            }
+            lx.run_defers(lx.cur.defers).emit(Return(a)).set_dead()
+        },
+        SWhile(c, b) => {
+            let (saved, lx) = lx.open()
+            let (ca, lx) = lx.lower(c)
+            let (brk, lx) = lx.break_block()
+            let lx = lx.emit(If(ca, [], brk)).in_loop_block(b)
+            let (body, _, lx) = lx.close(saved)
+            lx.emit(Loop(body))
+        },
+        SFor(n, _, range, b) if is_range(range) => {
+            // count from lo while below hi; the list is never built
+            let (lo, hi) = match range.desc {
+                EBin(_, lo, hi) => (lo, hi),
+                _ => panic("range"),
+            }
+            let sp = range.span
+            let (la, lx) = lx.lower(lo)
+            let (ha, lx) = lx.lower(hi)
+            let (i, lx) = lx.fresh_var("i", TInt)
+            let lx = lx.emit(Let(i, Use(la)))
+            let (h, lx) = lx.fresh_var("hi", TInt)
+            let lx = lx.emit(Let(h, Use(ha)))
+            let (saved, lx) = lx.open()
+            let (c, lx) = lx.tmp(TBool, Bin(Ge, TInt, V(i), V(h), sp))
+            let (brk, lx) = lx.break_block()
+            let lx = lx.emit(If(c, brk, []))
+            let (x, lx) = lx.fresh_var(n, TInt)
+            let lx = lx.emit(Let(x, Use(V(i))))
+            // i < hi, so i + 1 cannot overflow
+            let lx = lx.emit(Set(i, Bin(Add, TInt, V(i), AInt(1), sp), false)).bind(n, x).in_loop_block(b)
+            let (stmts, _, lx) = lx.close(saved)
+            lx.emit(Loop(stmts))
+        },
+        SFor(n, _, e, b) => {
+            let (la, lx) = lx.lower(e)
+            let (x, saved, lx) = lx.for_start(la, lx.tyof(e), e.span)
+            lx.bind(n, x).in_loop_block(b).for_end(saved)
+        },
+        SBreak => lx.run_defers(lx.loop_defers()).emit(Break).set_dead(),
+        SContinue => lx.run_defers(lx.loop_defers()).emit(Continue).set_dead(),
+        SDefer(_) => panic("defer is lowered with its block"),
+    }
+}
+
+fn is_range(e: ast.Expr) -> Bool {
+    match e.desc {
+        EBin(Range, _, _) => true,
+        _ => false,
+    }
+}
+
+// ---------- functions and the program ----------
+
+fn lower_fn(self: Lx, job: Job) -> (ir.Fn, Lx) {
+    let d = job.decl
+    let env = job.targs
+    let ret = match d.ret {
+        Some(te) => resolve(env, te),
+        None => TUnit,
+    }
+    let mut lx = self
+    lx.cur = new_frame(env, ret)
+    lx.parents = []
+    let mut params: List[ir.Var] = []
+    for p in d.params {
+        let (v, next) = lx.fresh_var(p.name, resolve(env, p.ty))
+        lx = next.bind(p.name, v)
+        params.push(v)
+    }
+    let (a, next) = lx.lower_block_inner(d.body)
+    lx = next.emit(Return(a))
+    let f = ir.Fn { fname: job.cname, params, captures: [], is_closure: false, ret, body: lx.cur.buf }
+    lx.cur = new_frame([], TUnit)
+    (f, lx)
+}
+
+// The checked program (its prelude, then its own items, as the checker
+// returned them) in the IR. With `tests`, the program is its tests and
+// benchmarks instead of `main`.
+pub fn lower_program(checked_prelude: List[ast.Item], user_items: List[ast.Item], cx: env.Cx, st: env.State, tests: Bool) -> (ir.Program, Ro) {
+    let mut fns: Map[Str, ast.FnDecl] = map()
+    let mut structs: Map[Str, ast.StructDecl] = map()
+    let mut enums: Map[Str, ast.EnumDecl] = map()
+    let mut owners: Map[Str, Int] = map()
+    let mut first_owner: Map[Str, Str] = map()
+    for i in checked_prelude + user_items {
+        match i {
+            IFn(d) => {
+                fns[d.name] = d
+            },
+            IStruct(s) => {
+                structs[s.name] = s
+            },
+            IEnum(e) => {
+                enums[e.name] = e
+                for v in e.variants {
+                    owners[v.name] = (owners.get(v.name) ?? 0) + 1
+                    first_owner[v.name] = e.name
+                }
+            },
+            IIface(_) | IType(_) => {},
+        }
+    }
+    let mut ctors: Map[Str, Str] = map()
+    for (v, n) in owners.entries() {
+        if n == 1 {
+            ctors[v] = first_owner[v]
+        }
+    }
+    let ro = Ro { fns, structs, enums, ctors, types: st.types, insts: st.insts, nested: st.nested, subst: st.subst, ifaces: cx.ifaces, iface_gen: cx.iface_gen }
+    let mut lx = Lx { ro, instances: map(), queue: [], next_job: 0, out: [], counter: 0, vars: 0, guards: 0, cur: new_frame([], TUnit), parents: [] }
+    let field = |p: ast.Param| match p.ty.desc {
+        TyName("Fs", _) => "fs",
+        _ => "clock",
+    }
+    let mut test_names: List[ir.Test] = []
+    let mut bench_names: List[ir.Test] = []
+    if tests {
+        for i in user_items {
+            match i {
+                IFn(d) if d.test.is_some() && !d.bench => {
+                    let (c, next) = lx.instance(d.name, [])
+                    lx = next
+                    test_names.push(ir.Test { cname: c, fields: d.params.map(field), virtual: d.virtual })
+                },
+                _ => {},
+            }
+        }
+        for i in user_items {
+            match i {
+                IFn(d) if d.test.is_some() && d.bench => {
+                    let (c, next) = lx.instance(d.name, [])
+                    lx = next
+                    bench_names.push(ir.Test { cname: c, fields: d.params.map(field), virtual: false })
+                },
+                _ => {},
+            }
+        }
+    }
+    let main_decl = if tests { None } else { lx.ro.fns.get("main") }
+    let mut main = ""
+    if main_decl.is_some() {
+        let (c, next) = lx.instance("main", [])
+        lx = next
+        main = c
+    }
+    while lx.next_job < lx.queue.len() {
+        let job = lx.queue[lx.next_job]
+        lx.next_job = lx.next_job + 1
+        // lowering may add lifted closures to `out` first
+        let (f, next) = lx.lower_fn(job)
+        lx = next
+        lx.out.push(f)
+    }
+    let main_ret = match main_decl {
+        Some(d) => match d.ret {
+            Some(te) => resolve([], te),
+            None => TUnit,
+        },
+        None => TUnit,
+    }
+    let takes_root = match main_decl {
+        Some(d) => !d.params.is_empty(),
+        None => false,
+    }
+    (ir.Program { fns: lx.out, main, main_takes_root: takes_root, main_ret, tests: test_names, benches: bench_names }, lx.ro)
+}

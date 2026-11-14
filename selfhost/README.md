@@ -5,7 +5,8 @@ bootstrap: the OCaml compiler in `src/` builds this one, this one builds
 itself, and when two rounds of that produce the same C, the compiler hosts
 itself. The OCaml compiler stays as the way to build from scratch.
 
-So far: the lexer, the parser, the module loader and the type checker.
+So far: the lexer, the parser, the module loader, the type checker, and
+the backend up to C generation: lowering to the IR and the passes on it.
 
 - `lexer.tsr` turns source text into tokens, with the same rules, positions
   and errors as `src/lexer.ml`.
@@ -57,6 +58,25 @@ So far: the lexer, the parser, the module loader and the type checker.
   trusted with C calls only the libraries tessera.lock recorded (E0324).
   It reads tessera.lock through the Fs and never writes it; the OCaml
   compiler records new libraries there.
+- The backend is `src/lower.ml`, `src/ir.ml`, `src/pure.ml`,
+  `src/own.ml`, `src/hoist.ml` and `src/free.ml`, in the order
+  `src/native.ml` runs them before C generation. `ir.tsr` is the IR:
+  A-normal form, every type concrete, every variable owning its value. `lower.tsr`
+  lowers the checked program (its prelude and the built-in methods it
+  uses included) to it, one instance per generic function and type
+  arguments, closures lifted, list pipelines fused into loops (`free.tsr`
+  says which closures can be inlined). The OCaml lowering keeps a mutable
+  context per function; here it is one value, threaded through, with the
+  enclosing functions of a closure in a list, and a nested block is
+  `open` then `close` around its statements. Types come from the
+  checker's State through its final substitution and `types.zonk`.
+  `pure.tsr` finds the pure functions, reuses repeated pure calls (CSE)
+  and plans which heavy calls to keep across a loop; `own.tsr` places the
+  retains and releases (liveness in `intset.tsr`'s sorted lists);
+  `hoist.tsr` finds the loops C generation makes faster (copy-on-write
+  checks made once, fill loops, versioned loops). `ffi.tsr` gives C
+  generation the C signature, the results and the libraries of foreign
+  functions.
 - `tokens.tsr` prints a file's tokens one per line; `tokdump/` prints the
   OCaml lexer's in the same format.
 - `parse.tsr` prints a file's tree (with `ast_print.tsr`): the compiler's
@@ -71,15 +91,23 @@ So far: the lexer, the parser, the module loader and the type checker.
   each item as rewritten, with every expression's type and type arguments
   in the order `walk.tsr` visits them. `checkdump/` prints the OCaml
   checker's.
+- `lowered.tsr` prints the IR a program lowers to after every pass, as
+  C generation gets it, with what C generation decides about it (the
+  pure functions, the calls kept across loops, the loops it hoists,
+  fills or versions), in `ir_print.tsr`'s format: as `tessera build`
+  compiles it, and as `tessera test` does when it has tests. `irdump/`
+  prints the OCaml backend's.
 - `check.sh` builds the programs and compares the lexers, the parsers,
-  the loaders and the checkers on every `.tsr` file in the repository, the
+  the loaders, the checkers and the backends on every `.tsr` file in the repository, the
   parsers also on the edge cases in `tests/` (constructs that are easy to
   get wrong, and one file for each error the parser can report), the
   loaders on those in `tests/load/` (one directory each, for each
   diagnostic the loader can report and each expansion), the checkers on
   those in `tests/check/` (every problem the checker and the capability
-  checks can report, and every rewrite), and all of them on the book's
-  examples when `../tessera-book` (or `$TESSERA_BOOK`) is there:
+  checks can report, and every rewrite), the backends on those in
+  `tests/ir/` (each construct the lowering and the passes treat on their
+  own), and all of them on the book's examples when `../tessera-book`
+  (or `$TESSERA_BOOK`) is there:
 
 ```sh
 sh selfhost/check.sh
@@ -89,5 +117,5 @@ The loader does not fetch git dependencies (the OCaml one runs git and
 keeps tessera.lock), and it sees only what its Fs grants: a dependency or
 an embedded file outside the granted directory does not exist for it.
 
-Next: lowering and C generation, compared the same way against the OCaml
-compiler at each step.
+Next: C generation (`src/cgen.ml`), compared the same way against the
+OCaml compiler.
