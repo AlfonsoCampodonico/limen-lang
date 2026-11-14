@@ -6,6 +6,7 @@
   ffi_test.c
   (glob_files %{project_root}/examples/*.tsr)
   (glob_files %{project_root}/bench/*.tsr)
+  (glob_files %{project_root}/selfhost/*.tsr)
   (glob_files tls/*.pem)
   (glob_files tls/*.py)
   (source_tree zoneinfo)))

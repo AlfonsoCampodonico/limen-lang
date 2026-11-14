@@ -6830,7 +6830,7 @@ fn main(root: Root) {
                  | out when out = src -> None
                  | _ -> Some path
                  | exception Diag.Fatal _ -> None))
-      [ "../examples"; "../bench"; "../src/std" ]
+      [ "../examples"; "../bench"; "../src/std"; "../selfhost" ]
   in
   ok "fmt-repo-clean" (unformatted = []) ("not formatted: " ^ String.concat ", " unformatted);
   ok "fmt-every-program" (!fmt_failures = [])
