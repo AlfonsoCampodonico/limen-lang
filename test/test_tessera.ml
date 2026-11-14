@@ -3259,6 +3259,29 @@ fn main(root: Root) -> Result[(), IoError] {
 }
 |v}
     " | clean=. dir=. base=. ext= stem=. abs=false parts=[]\n. | clean=. dir=. base=. ext= stem=. abs=false parts=[]\n/ | clean=/ dir=/ base=/ ext= stem=/ abs=true parts=[]\n// | clean=/ dir=/ base=/ ext= stem=/ abs=true parts=[]\na | clean=a dir=. base=a ext= stem=a abs=false parts=[\"a\"]\na/ | clean=a dir=a base=a ext= stem=a abs=false parts=[\"a\"]\n/a/b/ | clean=/a/b dir=/a/b base=b ext= stem=b abs=true parts=[\"a\", \"b\"]\na//b/./../c/ | clean=a/c dir=a/c base=c ext= stem=c abs=false parts=[\"a\", \"c\"]\n../../a | clean=../../a dir=../.. base=a ext= stem=a abs=false parts=[\"..\", \"..\", \"a\"]\n/../a/.. | clean=/ dir=/a base=.. ext= stem=.. abs=true parts=[]\na/../.. | clean=.. dir=. base=.. ext= stem=.. abs=false parts=[\"..\"]\n./x/./y/../z | clean=x/z dir=x base=z ext= stem=z abs=false parts=[\"x\", \"z\"]\na/b/c.tar.gz | clean=a/b/c.tar.gz dir=a/b base=c.tar.gz ext=.gz stem=c.tar abs=false parts=[\"a\", \"b\", \"c.tar.gz\"]\n.bashrc | clean=.bashrc dir=. base=.bashrc ext= stem=.bashrc abs=false parts=[\".bashrc\"]\ndir.d/file | clean=dir.d/file dir=dir.d base=file ext= stem=file abs=false parts=[\"dir.d\", \"file\"]\n/x.y/ | clean=/x.y dir=/x.y base=x.y ext=.y stem=x abs=true parts=[\"x.y\"]\nb data/x  /etc a/b/c.txt notes.html a/b.c x.tar\na/b -> a/c/d: Ok(\"../c/d\")\na -> a: Ok(\".\")\n/a/b/c -> /x: Ok(\"../../../x\")\na -> /b: Err(\"path: cannot make `/b` relative to `a`: one is absolute and the other is not\")\n../a -> b: Err(\"path: cannot make `b` relative to `../a`: it would climb out of a directory whose name is unknown\")\na -> ../b: Ok(\"../../b\")\n. -> a/b: Ok(\"a/b\")\na/b -> .: Ok(\"../..\")\na true\na/b true\na/b/f.txt false\na/b/up true\na/link.txt false\ntop.txt false\nOk(4) true\n";
+  out "std-uuid" ~grants:{ Interp.no_grants with seed = Some 1 }
+    {v|use uuid
+
+fn main(root: Root) {
+    let out = root.stdout
+    let a = uuid.v4(root.rand)
+    let b = uuid.v4(root.rand)
+    out.print("{a.to_str()} {a.version()} {a.to_str().len()} {a == b} {uuid.parse(a.to_str()) == Ok(a)}")
+    let r = uuid.v7_from(1645557742000, bytes([12, 195, 24, 196, 220, 12, 12, 7, 57, 143]))
+    out.print("{r.to_str()} {r.version()} {r.time_ms()} {a.time_ms()}")
+    let c = uuid.v7(root.rand, root.clock)
+    out.print("{c.version()} {c.to_str().slice(14, 15)} {(c.time_ms() ?? 0) > 1700000000000}")
+    out.print(uuid.from_random(bytes((0..<16).map(|i| 255))).to_str())
+    for s in ["F81D4FAE-7DEC-11D0-A765-00A0C91E6BF6", "urn:uuid:f81d4fae-7dec-11d0-a765-00a0c91e6bf6", "\{f81d4fae-7dec-11d0-a765-00a0c91e6bf6\}", "f81d4fae7dec11d0a76500a0c91e6bf6", "f81d4fae-7dec-11d0-a765_00a0c91e6bf6", "f81d4fae-7dec-11d0-a765-00a0c91e6bfg", "nope", "urn:uuid:f81d4fae-7dec-11d0-a765-00a0c91e6bfx"] {
+        out.print("{uuid.parse(s).map(|u| u.to_str())}")
+    }
+    out.print("{uuid.nil().to_str()} {uuid.nil().version()} {uuid.from_bytes(bytes([1, 2]))} {uuid.from_bytes(uuid.nil().bytes).map(|u| u.version())}")
+    let mut m: Map[uuid.Uuid, Int] = map()
+    m[a] = 1
+    out.print("{m.get(a)} {[c, r].sort() == [r, c]}")
+}
+|v}
+    "c15c0289-ec2d-4a91-a7ec-8e65a18debbe 4 36 false true\n017f22e2-79b0-7cc3-98c4-dc0c0c07398f 7 Some(1645557742000) None\n7 7 true\nffffffff-ffff-4fff-bfff-ffffffffffff\nOk(\"f81d4fae-7dec-11d0-a765-00a0c91e6bf6\")\nOk(\"f81d4fae-7dec-11d0-a765-00a0c91e6bf6\")\nOk(\"f81d4fae-7dec-11d0-a765-00a0c91e6bf6\")\nOk(\"f81d4fae-7dec-11d0-a765-00a0c91e6bf6\")\nErr(\"uuid: expected `-` at byte 23\")\nErr(\"uuid: not a hex digit at byte 35\")\nErr(\"uuid: `nope` is not a UUID: 32 hex digits, usually as 8-4-4-4-12\")\nErr(\"uuid: not a hex digit at byte 44\")\n00000000-0000-0000-0000-000000000000 0 Err(\"uuid: 2 bytes, not 16\") Ok(0)\nSome(1) true\n";
   out "std-http-keepalive-stream" ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] }
     {v|use http
 
@@ -7240,8 +7263,9 @@ fn main(root: Root) {
   ok "std-manifest-time" (List.exists (fun (d : Package.dep) -> d.dname = "time" && d.caps = [ "clock"; "fs" ]) manifest.deps) "time: clock (within), fs (load_zone)";
   ok "std-manifest-log" (List.exists (fun (d : Package.dep) -> d.dname = "log" && d.caps = [ "stdout"; "stderr"; "clock" ]) manifest.deps) "log: stdout, stderr, clock";
   ok "std-manifest-path" (List.exists (fun (d : Package.dep) -> d.dname = "path" && d.caps = [ "fs" ]) manifest.deps) "path: fs (walk)";
+  ok "std-manifest-uuid" (List.exists (fun (d : Package.dep) -> d.dname = "uuid" && d.caps = [ "rand"; "clock" ]) manifest.deps) "uuid: rand, clock";
   ok "std-manifest-pure"
-    (List.for_all (fun (d : Package.dep) -> List.mem d.dname [ "http"; "sql"; "time"; "log"; "path" ] || d.caps = []) manifest.deps)
+    (List.for_all (fun (d : Package.dep) -> List.mem d.dname [ "http"; "sql"; "time"; "log"; "path"; "uuid" ] || d.caps = []) manifest.deps)
     "the others are pure";
   let real_std = !Modules.std_modules in
   let std_errs name extra src =

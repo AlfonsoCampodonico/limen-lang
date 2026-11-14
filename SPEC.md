@@ -1696,6 +1696,7 @@ The standard library is checked like a dependency. `src/std/tessera.toml` lists 
 | `sql` | `fs` (the database file's directory); trusted with C (`[trust] foreign = ["sql"]`) to call SQLite |
 | `log` | `stdout`, `stderr` and `clock`: a Logger holds where it writes and, for timestamps, a clock |
 | `path` | `fs`, for `walk` alone |
+| `uuid` | `rand` and `clock`, for `v4` and `v7` alone |
 
 A module missing from the list may take nothing. `tessera caps FILE` shows what each std function takes. What stays trusted, and why:
 
@@ -2079,12 +2080,35 @@ Paths with `/` between their parts, as macOS and Linux write them and `Fs` takes
 | `relative(from, to) -> Result[Str, Str]` | the path from the directory `from` to `to`: `relative("a/b", "a/c/d")` is `Ok("../c/d")`. Both must be absolute or both relative, and `from` cannot climb past more `..`s than `to` |
 | `struct Entry { path, is_dir }`, `walk(fs, dir) -> Result[List[Entry], IoError]` | every file and directory under `dir` (`""` for the whole of `fs`), depth first, each directory before what it holds, names sorted. Links are followed, but each directory is entered once (by its real path, `fs.full_path`), so a link back up the tree is listed and not entered again |
 
+### uuid
+
+UUIDs (RFC 9562), as 16 bytes written `f81d4fae-7dec-41d0-a765-00a0c91e6bf6`. Version 4 is random; version 7 starts with the time in milliseconds, so ids made later sort later and sit well in a database index. Both take their random bits from `Rand.bytes`, the system's secure generator. A `Uuid` is plain data: compare it, sort it, use it as a map key.
+
+| Item | Meaning |
+| --- | --- |
+| `struct Uuid { bytes: Bytes }` | the 16 bytes, most significant first |
+| `v4(rand) -> Uuid`, `v7(rand, clock) -> Uuid` | a random one, and a time-ordered one |
+| `from_random(random: Bytes)`, `v7_from(ms, random: Bytes)` | the same from bytes you give (16, and 10), with the version and variant bits set; fewer bytes panic |
+| `parse(s) -> Result[Uuid, Str]` | 32 hex digits in either case, as 8-4-4-4-12 or without dashes, optionally in braces or after `urn:uuid:`; the error names the byte |
+| `u.to_str()` | lowercase, with dashes |
+| `u.version()`, `u.time_ms() -> Option[Int]` | 4, 7, or 0 for `nil()`; the time of a version 7 one |
+| `nil()`, `from_bytes(b) -> Result[Uuid, Str]` | all zeros; exactly 16 bytes |
+
+```
+use uuid
+
+fn main(root: Root) {
+    let id = uuid.v7(root.rand, root.clock)
+    root.stdout.print(id.to_str())                       // 01a1dc01-3110-78de-b5ab-5f70bff3dee5
+}
+```
+
 ## 20. Not yet
 
 The core language is close to complete; what is missing is mostly around it.
 
 - Platforms: no Windows (fibers, the poller and the sandbox are macOS and Linux only); x86-64 has not run on real hardware; no cross-compilation or WebAssembly target.
-- Standard library: no hashing or crypto (SHA-256, HMAC, secure random numbers), base64 or hex, URL parsing, CSV, compression, UUIDs, command-line flags, logging, path helpers or directory walking, and Unicode support stops at `chars()`.
+- Standard library: no compression, no encryption or public-key signatures (hashing and HMAC only), no incremental hashing of a stream, and Unicode support stops at `chars()`.
 - Tooling: no debugger mapping (native code is C without `#line`), profiler or test coverage; cold builds spend about 3 s in the C compiler for a 600-line program; no incremental checking.
 - Distribution: no prebuilt releases or Homebrew formula; the package index has no hosted default; no stability promise yet.
 - Language: no default parameter values, no integer types besides `Int` outside FFI, no code generation for repetitive cases such as JSON for a struct, and C callbacks cannot be kept for later.

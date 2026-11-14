@@ -1,0 +1,153 @@
+// UUIDs (RFC 9562): 128-bit identifiers written as 32 hex digits,
+// `f81d4fae-7dec-41d0-a765-00a0c91e6bf6`. Version 4 is random; version 7
+// starts with the time in milliseconds, so ids made later sort later and
+// sit well in a database index. Both take their random bits from
+// `Rand.bytes`, the system's secure generator.
+//
+// A Uuid is plain data: compare it, sort it, use it as a map key.
+
+// A UUID: its 16 bytes, most significant first.
+pub struct Uuid {
+    bytes: Bytes,
+}
+
+// A random (version 4) UUID.
+pub fn v4(rand: Rand) -> Uuid {
+    from_random(rand.bytes(16))
+}
+
+// A version 7 UUID: the time from `clock`, then random bits.
+pub fn v7(rand: Rand, clock: Clock) -> Uuid {
+    v7_from(clock.now_ms(), rand.bytes(10))
+}
+
+// The version 4 UUID that the first 16 bytes of `random` make, with the
+// version and variant bits set. Panics with fewer than 16 bytes.
+pub fn from_random(random: Bytes) -> Uuid {
+    if random.len() < 16 {
+        panic("uuid: from_random needs 16 random bytes, not {random.len()}")
+    }
+    let mut b = random.slice(0, 16).to_list()
+    b[6] = b[6] & 15 | 64
+    b[8] = b[8] & 63 | 128
+    Uuid { bytes: bytes(b) }
+}
+
+// The version 7 UUID for the time `ms` (milliseconds since 1970, 48 bits)
+// and the first 10 bytes of `random`. Panics with fewer than 10 bytes.
+pub fn v7_from(ms: Int, random: Bytes) -> Uuid {
+    if random.len() < 10 {
+        panic("uuid: v7_from needs 10 random bytes, not {random.len()}")
+    }
+    let mut b: List[Int] = []
+    for i in 0..<6 {
+        b.push(ms >> (8 * (5 - i)) & 255)
+    }
+    let r = random.to_list()
+    b.push(r[0] & 15 | 112)
+    b.push(r[1])
+    b.push(r[2] & 63 | 128)
+    for i in 3..<10 {
+        b.push(r[i])
+    }
+    Uuid { bytes: bytes(b) }
+}
+
+// The nil UUID, all zeros.
+pub fn nil() -> Uuid {
+    Uuid { bytes: bytes([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]) }
+}
+
+// The UUID made of exactly 16 bytes.
+pub fn from_bytes(b: Bytes) -> Result[Uuid, Str] {
+    if b.len() != 16 {
+        return Err("uuid: {b.len()} bytes, not 16")
+    }
+    Ok(Uuid { bytes: b })
+}
+
+// The UUID `s` writes: 32 hex digits in either case, in groups of 8, 4, 4,
+// 4 and 12 joined by `-`, or without the dashes; in braces or after
+// `urn:uuid:` too. The error names the byte where it went wrong.
+pub fn parse(s: Str) -> Result[Uuid, Str] {
+    let mut t = s
+    let mut at = 0
+    if t.starts_with("urn:uuid:") || t.starts_with("URN:UUID:") {
+        t = t.slice(9, t.len())
+        at = 9
+    } else if t.starts_with("\{") && t.ends_with("\}") {
+        t = t.slice(1, t.len() - 1)
+        at = 1
+    }
+    let bs = t.bytes()
+    let dashed = bs.len() == 36
+    if !dashed && bs.len() != 32 {
+        return Err("uuid: `{s}` is not a UUID: 32 hex digits, usually as 8-4-4-4-12")
+    }
+    let mut out: List[Int] = []
+    let mut hi = -1
+    for (i, b) in bs.with_index() {
+        if dashed && (i == 8 || i == 13 || i == 18 || i == 23) {
+            if b != 45 {
+                return Err("uuid: expected `-` at byte {at + i}")
+            }
+        } else {
+            let d = hex_digit(b)
+            if d < 0 {
+                return Err("uuid: not a hex digit at byte {at + i}")
+            }
+            if hi < 0 {
+                hi = d
+            } else {
+                out.push(hi * 16 + d)
+                hi = -1
+            }
+        }
+    }
+    Ok(Uuid { bytes: bytes(out) })
+}
+
+fn hex_digit(b: Int) -> Int {
+    if b >= 48 && b <= 57 {
+        b - 48
+    } else if b >= 97 && b <= 102 {
+        b - 87
+    } else if b >= 65 && b <= 70 {
+        b - 55
+    } else {
+        -1
+    }
+}
+
+// The usual form: lowercase, `f81d4fae-7dec-41d0-a765-00a0c91e6bf6`.
+pub fn to_str(self: Uuid) -> Str {
+    let d = "0123456789abcdef".bytes()
+    let mut out: List[Int] = []
+    for i in 0..<16 {
+        if i == 4 || i == 6 || i == 8 || i == 10 {
+            out.push(45)
+        }
+        let b = self.bytes[i]
+        out.push(d[b >> 4])
+        out.push(d[b & 15])
+    }
+    bytes(out).to_str()
+}
+
+// The version: 4 for random, 7 for time-ordered, 0 for nil.
+pub fn version(self: Uuid) -> Int {
+    self.bytes[6] >> 4
+}
+
+// When a version 7 UUID was made, in milliseconds since 1970; `None` for
+// other versions.
+pub fn time_ms(self: Uuid) -> Option[Int] {
+    if self.version() != 7 {
+        return None
+    }
+    let mut ms = 0
+    for i in 0..<6 {
+        ms = ms << 8 | self.bytes[i]
+    }
+    Some(ms)
+}

@@ -81,7 +81,7 @@
 ; Embed the standard library modules (written in Tessera).
 (rule
  (targets std_text.ml)
- (deps std/json.tsr std/list.tsr std/text.tsr std/http.tsr std/format.tsr std/time.tsr std/regex.tsr std/sql.tsr std/errors.tsr std/hex.tsr std/base64.tsr std/hash.tsr std/csv.tsr std/url.tsr std/flags.tsr std/log.tsr std/path.tsr std/tessera.toml)
+ (deps std/json.tsr std/list.tsr std/text.tsr std/http.tsr std/format.tsr std/time.tsr std/regex.tsr std/sql.tsr std/errors.tsr std/hex.tsr std/base64.tsr std/hash.tsr std/csv.tsr std/url.tsr std/flags.tsr std/log.tsr std/path.tsr std/uuid.tsr std/tessera.toml)
  (action
   (with-stdout-to
    std_text.ml
@@ -121,6 +121,8 @@
     (cat std/log.tsr)
     (echo "|xxstdxx});\n(\"path\", {xxstdxx|")
     (cat std/path.tsr)
+    (echo "|xxstdxx});\n(\"uuid\", {xxstdxx|")
+    (cat std/uuid.tsr)
     (echo "|xxstdxx}) ]\n")
     (echo "let manifest = {xxstdxx|")
     (cat std/tessera.toml)

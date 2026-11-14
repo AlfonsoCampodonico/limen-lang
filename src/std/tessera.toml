@@ -23,6 +23,7 @@ url = { path = ".", caps = [] }
 flags = { path = ".", caps = [] }
 log = { path = ".", caps = ["stdout", "stderr", "clock"] }
 path = { path = ".", caps = ["fs"] }
+uuid = { path = ".", caps = ["rand", "clock"] }
 
 # Modules whose foreign blocks are part of the standard library's trusted
 # base: their C calls need no Foreign capability, so a program using them
