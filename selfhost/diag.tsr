@@ -8,14 +8,38 @@ pub struct Diag {
     span: ast.Span,
     message: Str,
     notes: List[Str],
+    // a warning is reported, but does not stop a program from building
+    warning: Bool,
+    fix: Option[Fix],
+}
+
+// A change that would solve the problem: what it does, and the edits.
+pub struct Fix {
+    message: Str,
+    edits: List[Edit],
+}
+
+// Replace the text at `at` with `replacement`.
+pub struct Edit {
+    at: ast.Span,
+    replacement: Str,
 }
 
 pub fn error(code: Str, span: ast.Span, message: Str) -> Diag {
-    Diag { code, span, message, notes: [] }
+    Diag { code, span, message, notes: [], warning: false, fix: None }
+}
+
+pub fn warning(code: Str, span: ast.Span, message: Str) -> Diag {
+    { error(code, span, message) with warning: true }
 }
 
 pub fn note(self: Diag, text: Str) -> Diag {
     { self with notes: self.notes + [text] }
+}
+
+// The fix with one edit: replace `at` with `replacement`.
+pub fn fix(self: Diag, message: Str, at: ast.Span, replacement: Str) -> Diag {
+    { self with fix: Some(Fix { message, edits: [Edit { at, replacement }] }) }
 }
 
 // A file of the program: its path as the loader names it, and its text.

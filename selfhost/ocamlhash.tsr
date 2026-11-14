@@ -1,0 +1,106 @@
+// The order OCaml's hash tables list their keys in. The OCaml checker
+// suggests a name for a misspelled one ("did you mean `count`?") by
+// scanning candidates that come from its hash tables, and of two
+// candidates equally close it keeps the first: so which one it suggests
+// depends on where the keys sit in the table. To suggest the same name,
+// the Tessera checker lists the candidates in that order.
+//
+// A table created with `Hashtbl.create n` (n up to 16) starts with 16
+// buckets and doubles them when it holds more than twice as many keys. A
+// key goes in bucket `hash land (buckets - 1)`, at the front, and doubling
+// keeps the order inside a bucket. Listing goes through the buckets in
+// order, each from its front.
+//
+// Tessera has no bitwise operators, so the hash's 32-bit operations are
+// spelled with arithmetic.
+
+// The keys of a table that got them in this order, each once, in the
+// order Hashtbl.to_seq_keys lists them.
+pub fn order(keys: List[Str]) -> List[Str] {
+    let mut buckets = 16
+    for (i, _) in keys.with_index() {
+        if i + 1 > 2 * buckets {
+            buckets = buckets * 2
+        }
+    }
+    let n = keys.len()
+    keys.with_index().sort_by(|p| (hash(p.1) % buckets, n - p.0)).map(|p| p.1)
+}
+
+// What Hashtbl.hash gives for a string: MurmurHash3's mixing of its bytes,
+// four at a time, then of its length.
+pub fn hash(s: Str) -> Int {
+    let bs = s.bytes()
+    let mut h = 0
+    let mut i = 0
+    while i + 4 <= bs.len() {
+        h = mix(h, bs[i] + bs[i + 1] * 256 + bs[i + 2] * 65536 + bs[i + 3] * 16777216)
+        i = i + 4
+    }
+    let left = bs.len() - i
+    if left > 0 {
+        let mut w = 0
+        let mut k = left - 1
+        while k >= 0 {
+            w = w * 256 + bs[i + k]
+            k = k - 1
+        }
+        h = mix(h, w)
+    }
+    h = xor(h, bs.len())
+    // the final mix
+    h = xor(h, h / 65536)
+    h = mul(h, 2246822507)
+    h = xor(h, h / 8192)
+    h = mul(h, 3266489909)
+    h = xor(h, h / 65536)
+    h % 1073741824
+}
+
+fn mix(h: Int, d: Int) -> Int {
+    let mut d = mul(d, 3432918353)
+    d = rotl(d, 15)
+    d = mul(d, 461845907)
+    let mut h = xor(h, d)
+    h = rotl(h, 13)
+    low32(h * 5 + 3864292196)
+}
+
+fn low32(x: Int) -> Int {
+    let m = 4294967296
+    (x % m + m) % m
+}
+
+// Int arithmetic wraps at 64 bits, which keeps the low 32 bits right.
+fn mul(a: Int, b: Int) -> Int {
+    low32(a * b)
+}
+
+fn rotl(x: Int, n: Int) -> Int {
+    let p = pow2(n)
+    low32(x * p) + x / pow2(32 - n)
+}
+
+fn pow2(n: Int) -> Int {
+    let mut p = 1
+    for _ in 0..<n {
+        p = p * 2
+    }
+    p
+}
+
+fn xor(a: Int, b: Int) -> Int {
+    let mut a = a
+    let mut b = b
+    let mut out = 0
+    let mut bit = 1
+    while a > 0 || b > 0 {
+        if a % 2 != b % 2 {
+            out = out + bit
+        }
+        a = a / 2
+        b = b / 2
+        bit = bit * 2
+    }
+    out
+}

@@ -1,0 +1,99 @@
+// Declarations: types, functions, variants and fields defined twice, a
+// struct that contains itself, what struct fields cannot hold, embedding,
+// main's signature, test parameters.
+struct Dup {
+    a: Int,
+    a: Str,
+}
+
+struct Dup {
+    b: Int,
+}
+
+enum Dup {
+    X,
+}
+
+enum Twice {
+    A,
+    A,
+    B,
+}
+
+struct Int {
+    v: Int,
+}
+
+struct Node {
+    value: Int,
+    next: Node,
+}
+
+struct Ring {
+    left: Link,
+}
+
+struct Link {
+    ring: Ring,
+}
+
+struct Ok2 {
+    next: Option[Ok2],
+}
+
+struct Holder {
+    fs: Fs,
+    f: fn() -> Int,
+    ch: Chan[Int],
+}
+
+struct Named {
+    Int,
+}
+
+struct A {
+    x: Int,
+}
+
+struct B {
+    x: Int,
+}
+
+struct Both {
+    A,
+    B,
+}
+
+struct Inner {
+    Base,
+}
+
+struct Base {
+    y: Int,
+}
+
+fn hello() {}
+
+fn hello() {}
+
+test "same" {}
+
+test "same" {}
+
+bench "same" {}
+
+test "caps" (fs: Fs, fs2: Fs, out: Stdout) {}
+
+bench "virtual" (clock: virtual Clock) {}
+
+fn use_both(b: Both) -> Int {
+    b.x
+}
+
+fn promoted(i: Inner) -> Int {
+    i.y
+}
+
+fn main[T](root: Root, other: Int) -> Str {
+    ""
+}

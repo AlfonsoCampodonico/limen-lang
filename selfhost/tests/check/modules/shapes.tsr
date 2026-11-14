@@ -1,0 +1,26 @@
+// A module with a private method, a pub one, an enum whose variant name
+// another module's enum also has, and a method on a built-in type.
+pub struct Square {
+    side: Int,
+}
+
+fn secret(self: Square) -> Int {
+    self.side
+}
+
+pub fn area(self: Square) -> Int {
+    self.side * self.side
+}
+
+pub enum Kind {
+    Solid,
+    Hollow,
+}
+
+fn double(self: Int) -> Int {
+    self * 2
+}
+
+pub fn twice(n: Int) -> Int {
+    n.double()
+}

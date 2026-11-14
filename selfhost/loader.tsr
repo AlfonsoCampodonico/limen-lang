@@ -39,10 +39,12 @@ pub struct Program {
     std_manifest: Option[package.Manifest],
     // the id the checker can give the next expression it makes
     next_id: Int,
+    // the methods struct embedding added (selfhost/forwarders.tsr), by name
+    forwarders: List[Str],
 }
 
 fn failed(files: List[diag.Source], diags: List[diag.Diag]) -> Program {
-    Program { items: [], diags, files, packages: [], std_modules: [], embedded: [], manifest: None, std_manifest: None, next_id: 0 }
+    Program { items: [], diags, files, packages: [], std_modules: [], embedded: [], manifest: None, std_manifest: None, next_id: 0, forwarders: [] }
 }
 
 // What finding modules needs, the same for the whole load.
@@ -157,11 +159,12 @@ pub fn load(fs: Fs, std: Fs, place: disk.Place, path: Str) -> Program {
     }
     // methods promoted through struct embedding, so interfaces see them
     let (promoted, next_id) = forwarders.forwarders(items, st.next_id)
-    Program { items: items + promoted, diags: [], files: loading.files, packages, std_modules, embedded: st.embedded, manifest, std_manifest, next_id }
+    let names = promoted.map(rename.item_name)
+    Program { items: items + promoted, diags: [], files: loading.files, packages, std_modules, embedded: st.embedded, manifest, std_manifest, next_id, forwarders: names }
 }
 
 fn from_parse(e: parser.ParseError) -> diag.Diag {
-    diag.Diag { code: e.code, span: e.span, message: e.message, notes: e.notes }
+    { diag.error(e.code, e.span, e.message) with notes: e.notes }
 }
 
 // tessera.toml next to the main file, or in the nearest directory above

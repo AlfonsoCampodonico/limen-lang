@@ -1,0 +1,6 @@
+; The OCaml checker's results for one file, in the format selfhost/check.tsr
+; prints, so the two can be compared:
+; dune exec selfhost/checkdump/checkdump.exe -- FILE
+(executable
+ (name checkdump)
+ (libraries tessera))

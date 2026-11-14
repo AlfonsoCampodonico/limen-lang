@@ -1,0 +1,148 @@
+// Matches: arms missing (with the fix that adds them, on their own lines
+// or not), arms that can never match, or-patterns that bind differently,
+// patterns of the wrong shape.
+enum Shape {
+    Circle(Float),
+    Rect(Float, Float),
+    Dot,
+}
+
+enum Tree {
+    Leaf,
+    Node(Tree, Int, Tree),
+}
+
+enum Wrap {
+    One(Option[Bool]),
+}
+
+fn area(s: Shape) -> Float {
+    match s {
+        Circle(r) => r,
+    }
+}
+
+fn same_line(b: Bool) -> Int {
+    match b {
+        true => 1,
+    }
+}
+
+fn lists(xs: List[Int]) -> Int {
+    match xs {
+        [] => 0,
+        [a] => a,
+        [a, b, ..] if a > b => a,
+    }
+}
+
+fn tuples(t: (Bool, Bool)) -> Int {
+    match t {
+        (true, _) => 1,
+        (_, true) => 2,
+    }
+}
+
+fn nested(w: Wrap) -> Int {
+    match w {
+        One(Some(true)) => 1,
+    }
+}
+
+fn trees(t: Tree) -> Int {
+    match t {
+        Leaf => 0,
+    }
+}
+
+fn ints(n: Int) -> Int {
+    match n {
+        1 => 1,
+        2 => 2,
+    }
+}
+
+fn unreachable(s: Shape) -> Float {
+    match s {
+        _ => 0.0,
+        Dot => 1.0,
+    }
+}
+
+fn alternatives(s: Shape) -> Float {
+    match s {
+        Circle(r) => r,
+        Dot | Circle(_) => 0.0,
+        Rect(w, _) => w,
+    }
+}
+
+fn binds(s: Shape) -> Float {
+    match s {
+        Circle(r) | Dot => 1.0,
+        Rect(w, h) | Circle(h) => h,
+        Dot | Circle(z) => 2.0,
+        _ => 0.0,
+    }
+}
+
+fn types_differ(x: (Int, Str)) -> Int {
+    match x {
+        (a, _) | (_, a) => 1,
+    }
+}
+
+fn shapes(s: Shape, n: Int) -> Int {
+    match s {
+        Circle(a, b) => 1,
+        Rect(..) => 2,
+        Rect(a, b, c, ..) => 3,
+        Shape.Squ => 4,
+        Sape.Dot => 5,
+        Squar => 6,
+        _ => 7,
+    }
+}
+
+fn tuple_rest(t: (Int, Int)) -> Int {
+    match t {
+        (a, b, c, ..) => a,
+        (a, ..) => a,
+    }
+}
+
+fn not_tuple(n: Int) -> Int {
+    match n {
+        (a, ..) => a,
+        _ => 0,
+    }
+}
+
+fn empty(n: Int) -> Int {
+    match n {
+    }
+}
+
+fn unknown_rest() {
+    let f = |t| match t {
+        (a, ..) => 1,
+    }
+}
+
+fn wrong_type(n: Int) -> Int {
+    match n {
+        "x" => 1,
+        Some(x) => 2,
+        _ => 3,
+    }
+}
+
+fn list_rest(xs: List[Int]) -> Int {
+    match xs {
+        [a, ..rest] => rest.len(),
+        [] => 0,
+        [_] => 9,
+    }
+}
+
+fn main(root: Root) {}

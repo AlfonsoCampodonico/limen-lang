@@ -1,0 +1,35 @@
+// Names that do not exist, ambient I/O, variants of several enums, group
+// handles used as values.
+enum Light {
+    Red,
+    Green,
+}
+
+enum Paint {
+    Red,
+    Blue,
+}
+
+struct Counter {
+    n: Int,
+}
+
+fn bump(self: Counter) -> Counter {
+    { self with n: self.n + 1 }
+}
+
+fn main(root: Root) {
+    let total = 3
+    let x = totl + 1
+    let c = Red
+    print("hi")
+    let f = now()
+    let b = bump
+    let y = nothing_like_this
+    group g {
+        let h = g
+        g.go(|| 1)
+    }
+    let ok = Light.Red
+    let p = Blue
+}

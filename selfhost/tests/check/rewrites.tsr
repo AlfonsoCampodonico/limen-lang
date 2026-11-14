@@ -1,0 +1,74 @@
+// What the checker rewrites, with no problems: named arguments put in
+// parameter order (through temporaries when that would change the order
+// of effects), method values, promoted fields and methods of embedded
+// structs, tasks that return nothing, `?.` chains that are Options
+// already, renamed methods.
+struct User {
+    name: Str,
+    age: Int,
+}
+
+struct Admin {
+    User,
+    level: Int,
+}
+
+struct Root2 {
+    Admin,
+}
+
+fn greet(self: User, greeting: Str) -> Str {
+    greeting + " " + self.name
+}
+
+fn describe(self: Admin, prefix: Str, upper: Bool) -> Str {
+    prefix
+}
+
+fn connect(host: Str, port: Int, retries: Int) -> Int {
+    port + retries
+}
+
+fn next(n: Int) -> Int {
+    n + 1
+}
+
+fn find(id: Int) -> Option[User] {
+    None
+}
+
+fn main(root: Root) {
+    let u = User { name: "ann", age: 3 }
+    let a = Admin { User: u, level: 2 }
+    let r = Root2 { Admin: a }
+    let n = a.name
+    let m = r.name
+    let g = a.greet("hi")
+    let h = r.greet(greeting: "yo")
+    let d = a.describe(upper: true, prefix: "x")
+    let e = a.describe(upper: next(1) > 0, prefix: "y".to_upper())
+    let c1 = connect("h", retries: 1, port: 2)
+    let c2 = connect("h", retries: next(1), port: next(2))
+    let c3 = connect(port: next(1), retries: 2, host: "h")
+    let gv = u.greet
+    let said = gv("hello")
+    let lv = [1, 2].contains
+    let has = lv(2)
+    let age = find(1)?.age
+    let first = find(1)?.name.slice(0, 1)
+    let idx = find(1)?.name.index_of("a")
+    let len_of = "abc".len
+    let results = group g {
+        g.go(|| 1)
+        g.go(|| 2)
+    }
+    let nothing = group g {
+        g.go(|| {})
+    }
+    let res: Result[Int, Str] = Ok(1)
+    let mapped = res.map_err(|e| e.len())
+    let total = [1, 2].fold(0, |acc, x| acc + x)
+    let names = [u].map(|x| x.name)
+    let p = (1, "a")
+    let q = p.1
+}

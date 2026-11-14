@@ -1,0 +1,39 @@
+// Map keys, orders and the built-in bounds `Ordered` and `Key`.
+struct Pt {
+    x: Float,
+}
+
+enum Ev {
+    Hit(List[Int]),
+}
+
+fn largest[T](xs: List[T]) -> Bool {
+    xs[0] < xs[1]
+}
+
+fn keyed[K](k: K) -> Map[K, Int] {
+    let mut m = map()
+    m[k] = 1
+    m
+}
+
+fn top[T](xs: List[T]) -> Option[T] {
+    xs.max()
+}
+
+fn main(root: Root) {
+    let mut a = map()
+    a[1.5] = 1
+    let mut b = map()
+    b[[1]] = 1
+    let mut c = map()
+    c[Pt { x: 1.0 }] = 2
+    let d = [Pt { x: 1.0 }].sort()
+    let f = [map()].sort()
+    let g = [1.5, 2.5].distinct()
+    let h = [[1]].tally()
+    let i = [Ev.Hit([1])].max()
+    let j = [|| 1].max()
+    let k = map([((1, "a"), 2)])
+    let ok = [1, 2].max()
+}

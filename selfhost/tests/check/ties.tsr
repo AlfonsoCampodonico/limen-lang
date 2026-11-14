@@ -1,0 +1,28 @@
+// Suggestions between names equally close: the OCaml checker keeps the
+// first its hash tables list.
+struct Bat {
+    a: Int,
+}
+
+struct Cot {
+    a: Int,
+}
+
+struct Cut {
+    a: Int,
+}
+
+fn cap() {}
+
+fn cop() {}
+
+fn cup() {}
+
+fn main(root: Root) {
+    let bit = 1
+    let bet = 2
+    let x = bot + 1
+    let y = cip()
+    let z = Cat { a: 1 }
+    let w: Cct = Cot { a: 1 }
+}

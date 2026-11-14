@@ -1,0 +1,23 @@
+// Using another module's methods (a private one is E0402), and a variant
+// name two enums share: the file's own enum wins, and the checker names
+// the enum, since the name alone is ambiguous to the backends.
+use shapes
+
+enum Fill {
+    Solid,
+    Striped,
+}
+
+fn double(self: Int) -> Int {
+    self + self
+}
+
+fn main(root: Root) {
+    let s = shapes.Square { side: 2 }
+    let a = s.area()
+    let b = s.secret()
+    let f = Solid
+    let h = 3.double()
+    let i = shapes.twice(2)
+    let j = s.aera()
+}

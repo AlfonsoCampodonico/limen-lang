@@ -1,0 +1,311 @@
+// Whether the arms of a `match` cover every value, which values they miss
+// (E0204), and whether an arm can ever match (W0002), as src/check.ml
+// decides them: the classic matrix check, splitting on the first column's
+// constructors (enum variants, `true` and `false`, a tuple's one shape, a
+// list's lengths). Int and Str literals never cover their type.
+use ast
+use env
+use types
+
+// ---------- patterns ----------
+
+pub fn is_rest(p: ast.Pat) -> Bool {
+    match p.desc {
+        PRest(_) => true,
+        _ => false,
+    }
+}
+
+fn is_wild(p: ast.Pat) -> Bool {
+    match p.desc {
+        PWild | PBind(_) => true,
+        _ => false,
+    }
+}
+
+fn wild_at(span: ast.Span) -> ast.Pat {
+    ast.Pat { desc: PWild, span }
+}
+
+fn wilds(n: Int) -> List[ast.Pat] {
+    (0..<n).map(|_| wild_at(ast.Span { file: -1, lo: 0, hi: 0 }))
+}
+
+// The items of a tuple or variant pattern for a value with `n` parts: a
+// `..` among them stands for as many `_` as make up the count.
+pub fn fill_rest(ps: List[ast.Pat], n: Int) -> List[ast.Pat] {
+    if !ps.any(is_rest) {
+        return ps
+    }
+    let k = ps.len() - 1
+    ps.flat_map(|p| if is_rest(p) { (0..<0.max(n - k)).map(|_| wild_at(p.span)) } else { [p] })
+}
+
+// A list pattern's items before the `..`, the `..` itself (None when there
+// is none, Some(name) when it binds the rest), and the items after it.
+fn list_parts(ps: List[ast.Pat]) -> (List[ast.Pat], Option[Option[Str]], List[ast.Pat]) {
+    for (i, p) in ps.with_index() {
+        match p.desc {
+            PRest(r) => {
+                return (ps.take(i), Some(r), ps.skip(i + 1))
+            },
+            _ => {},
+        }
+    }
+    (ps, None, [])
+}
+
+// Does `p` match every value of its type?
+pub fn irrefutable(p: ast.Pat) -> Bool {
+    match p.desc {
+        PWild | PBind(_) | PRest(_) => true,
+        PTuple(ps) => ps.all(irrefutable),
+        PList([only]) => is_rest(only),
+        POr(ps) => ps.any(irrefutable),
+        _ => false,
+    }
+}
+
+// The alternatives of an or-pattern, or the pattern alone.
+pub fn alternatives(p: ast.Pat) -> List[ast.Pat] {
+    match p.desc {
+        POr(ps) => ps,
+        _ => [p],
+    }
+}
+
+// ---------- missing arms ----------
+
+// The patterns still unmatched, as source text. Single-field payloads are
+// checked recursively; multi-field payloads only need one arm each.
+pub fn missing_arms(cx: env.Cx, s: types.Subst, t: types.Ty, pats: List[ast.Pat]) -> List[Str] {
+    let pats = pats.flat_map(alternatives)
+    if pats.any(irrefutable) {
+        return []
+    }
+    let underscores = |n: Int| (0..<n).map(|_| "_").join(", ")
+    match s.repr(t) {
+        TNamed(n, _) if ast.is_tuple_name(n) => if exhaustive(cx, s, pats.map(|p| [p]), [t]) { [] } else { ["_"] },
+        TBool => [true, false].filter(|b| !pats.any(|p| p.desc == PBool(b))).map(|b| "{b}"),
+        TList(el) => {
+            // the lengths not covered: `[]`, `[_]`, ..., and `[_, .., ]`
+            // for the longer ones
+            let rows = pats.map(|p| [p])
+            let m = list_longest(rows)
+            (0..<m + 2).filter(|l| !exhaustive(cx, s, list_rows(l, rows), (0..<l).map(|_| el))).map(|l| {
+                let items = (0..<l).map(|_| "_") + (if l > m { [".."] } else { [] })
+                "[" + items.join(", ") + "]"
+            })
+        },
+        TNamed(n, args) if cx.variants.contains(n) => {
+            let gen = cx.enums.get(n).map(|e| e.generics) ?? []
+            let env = gen.zip(args)
+            (cx.variants.get(n) ?? []).flat_map(|vp| {
+                let v = vp.0
+                let payload = vp.1
+                let rows = pats.flat_map(|p| match p.desc {
+                    PVariant(_, w, a) if w == v => {
+                        let a = fill_rest(a, payload.len())
+                        // the wrong number of items, reported already: as if `_`
+                        [if a.len() == payload.len() { a } else { payload.map(|_| wild_at(p.span)) }]
+                    },
+                    _ => [],
+                })
+                match (payload, rows) {
+                    (_, []) => [if payload.is_empty() { v } else { "{v}({underscores(payload.len())})" }],
+                    ([], _) => [],
+                    ([pt], _) => {
+                        let inner = rows.flat_map(|r| match r {
+                            [p] => [p],
+                            _ => [],
+                        })
+                        missing_arms(cx, s, s.subst(env, pt), inner).map(|x| "{v}({x})")
+                    },
+                    _ => if exhaustive(cx, s, rows, payload.map(|p| s.subst(env, p))) { [] } else { ["{v}({underscores(payload.len())})"] },
+                }
+            })
+        },
+        TErr | TVar(_) => [],
+        _ => ["_"],
+    }
+}
+
+// The longest list a list pattern at the head of these rows spells out,
+// not counting a `..`: lists longer than that all match the same rows.
+fn list_longest(rows: List[List[ast.Pat]]) -> Int {
+    expand_heads(rows).fold(0, |m, row| match row {
+        [first, ..] => match first.desc {
+            PList(ps) => m.max(ps.count(|p| !is_rest(p))),
+            _ => m,
+        },
+        _ => m,
+    })
+}
+
+// The rows that match a list of length `l` at their head, with that
+// list's `l` items in its place.
+fn list_rows(l: Int, rows: List[List[ast.Pat]]) -> List[List[ast.Pat]] {
+    expand_heads(rows).flat_map(|row| match row {
+        [p, ..rest] => match list_items(l, p) {
+            Some(items) => [items + rest],
+            None => [],
+        },
+        [] => [],
+    })
+}
+
+// What pattern `p` says of the items of a list of length `l`: one pattern
+// each, or None when it does not match that length.
+fn list_items(l: Int, p: ast.Pat) -> Option[List[ast.Pat]] {
+    let wild = wild_at(p.span)
+    match p.desc {
+        PWild | PBind(_) => Some((0..<l).map(|_| wild)),
+        PList(ps) => match list_parts(ps) {
+            (before, None, _) => if before.len() == l { Some(before) } else { None },
+            (before, Some(_), after) => {
+                let k = before.len() + after.len()
+                if k <= l { Some(before + (0..<l - k).map(|_| wild) + after) } else { None }
+            },
+        },
+        _ => None,
+    }
+}
+
+// Each row whose first pattern is an or-pattern becomes one row per
+// alternative.
+fn expand_heads(rows: List[List[ast.Pat]]) -> List[List[ast.Pat]] {
+    rows.flat_map(|row| match row {
+        [first, ..rest] => match first.desc {
+            POr(alts) => expand_heads(alts.map(|a| [a] + rest)),
+            _ => [row],
+        },
+        [] => [row],
+    })
+}
+
+// Do the rows of patterns cover every value of the column types?
+pub fn exhaustive(cx: env.Cx, s: types.Subst, rows: List[List[ast.Pat]], tys: List[types.Ty]) -> Bool {
+    !useful(cx, s, false, rows, wilds(tys.len()), tys)
+}
+
+// Does the row of patterns `q` match some value that none of `rows` does?
+// `unknown` is the answer where a type is not known (after an error).
+pub fn useful(cx: env.Cx, s: types.Subst, unknown: Bool, rows: List[List[ast.Pat]], q: List[ast.Pat], tys: List[types.Ty]) -> Bool {
+    let (qh, qr, t, rest_tys) = match (q, tys) {
+        ([qh, ..qr], [t, ..rest_tys]) => (qh, qr, t, rest_tys),
+        _ => {
+            return rows.is_empty()
+        },
+    }
+    let rows = expand_heads(rows)
+    // the rows (and q) specialised to a constructor with `n` arguments
+    let special = |matches: fn(ast.Pat) -> Option[List[ast.Pat]], n: Int| rows.flat_map(|row| match row {
+        [p, ..r] if is_wild(p) => [wilds(n) + r],
+        [p, ..r] => match matches(p) {
+            Some(ps) if ps.len() == n => [ps + r],
+            // the wrong number of items, reported already
+            Some(_) => [wilds(n) + r],
+            None => [],
+        },
+        [] => [],
+    })
+    let go = |matches: fn(ast.Pat) -> Option[List[ast.Pat]], args: List[types.Ty]| {
+        let n = args.len()
+        if is_wild(qh) {
+            useful(cx, s, unknown, special(matches, n), wilds(n) + qr, args + rest_tys)
+        } else {
+            match matches(qh) {
+                Some(ps) if ps.len() == n => useful(cx, s, unknown, special(matches, n), ps + qr, args + rest_tys),
+                _ => unknown,
+            }
+        }
+    }
+    // a `_` against constructors the rows do not all name: the rows that
+    // start with `_` decide, since some value has a constructor no other
+    // row matches (this also keeps a recursive type from being unfolded
+    // forever)
+    let default = || useful(cx, s, unknown, rows.flat_map(|row| match row {
+        [p, ..r] if is_wild(p) => [r],
+        _ => [],
+    }), qr, rest_tys)
+    let heads = rows.flat_map(|row| match row {
+        [p, ..] if !is_wild(p) => [p],
+        _ => [],
+    })
+    match qh.desc {
+        POr(alts) => {
+            return alts.any(|a| useful(cx, s, unknown, rows, [a] + qr, tys))
+        },
+        _ => {},
+    }
+    match s.repr(t) {
+        TNamed(n, args) if ast.is_tuple_name(n) => go(|p| match p.desc {
+            PTuple(ps) => Some(fill_rest(ps, args.len())),
+            _ => None,
+        }, args),
+        TBool => {
+            let one = |b: Bool| go(|p| if p.desc == PBool(b) { Some([]) } else { None }, [])
+            let named = |b: Bool| heads.any(|p| p.desc == PBool(b))
+            match qh.desc {
+                PBool(b) => one(b),
+                _ if is_wild(qh) => if named(true) && named(false) { one(true) || one(false) } else { default() },
+                _ => unknown,
+            }
+        },
+        TNamed(n, targs) if cx.variants.contains(n) => {
+            let env = (cx.enums.get(n).map(|e| e.generics) ?? []).zip(targs)
+            let vs = cx.variants.get(n) ?? []
+            let one = |v: Str, payload: List[types.Ty]| {
+                let ptys = payload.map(|p| s.subst(env, p))
+                go(|p| match p.desc {
+                    PVariant(_, w, a) if w == v => Some(fill_rest(a, ptys.len())),
+                    _ => None,
+                }, ptys)
+            }
+            let named = |v: Str| heads.any(|p| match p.desc {
+                PVariant(_, w, _) => w == v,
+                _ => false,
+            })
+            match qh.desc {
+                PVariant(_, v, _) => match vs.find(|x| x.0 == v) {
+                    Some(x) => one(x.0, x.1),
+                    None => unknown,
+                },
+                _ if is_wild(qh) => if vs.all(|x| named(x.0)) { vs.any(|x| one(x.0, x.1)) } else { default() },
+                _ => unknown,
+            }
+        },
+        TList(el) => {
+            let m = list_longest([[qh]] + rows)
+            let lengths = 0..<m + 2
+            let items_of = |l: Int| (0..<l).map(|_| el)
+            if is_wild(qh) {
+                // the lengths up to the longest pattern, and one past it
+                // for all the longer ones
+                if lengths.all(|l| heads.any(|p| list_items(l, p).is_some())) {
+                    lengths.any(|l| useful(cx, s, unknown, list_rows(l, rows), wilds(l) + qr, items_of(l) + rest_tys))
+                } else {
+                    default()
+                }
+            } else {
+                match qh.desc {
+                    PList(_) => lengths.any(|l| match list_items(l, qh) {
+                        Some(items) => useful(cx, s, unknown, list_rows(l, rows), items + qr, items_of(l) + rest_tys),
+                        None => false,
+                    }),
+                    _ => unknown,
+                }
+            }
+        },
+        TErr | TVar(_) => unknown,
+        // Int, Str, Float and the like: literals never cover the type
+        _ => match qh.desc {
+            PInt(_) | PStr(_) | PBool(_) => useful(cx, s, unknown, rows.flat_map(|row| match row {
+                [p, ..r] if is_wild(p) || p.desc == qh.desc => [r],
+                _ => [],
+            }), qr, rest_tys),
+            _ if is_wild(qh) => default(),
+            _ => unknown,
+        },
+    }
+}

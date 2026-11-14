@@ -1,0 +1,51 @@
+// Calls: counts, named arguments, callees that are not functions, the
+// built-in functions.
+fn connect(host: Str, port: Int, retries: Int) -> Int {
+    port + retries
+}
+
+fn next(n: Int) -> Int {
+    n + 1
+}
+
+fn each(xs: List[Int], f: fn(Int) -> Int) -> List[Int] {
+    xs.map(f)
+}
+
+enum Msg {
+    Text(Str),
+}
+
+fn main(root: Root) {
+    let a = connect("h", 1)
+    let b = connect("h", 1, 2, 3)
+    let c = connect("h", retries: 3, port: next(1))
+    let d = connect("h", port: next(1), retries: next(2))
+    let e = connect(retries: next(1), "h", port: 2)
+    let f = connect("h", port: 1, port: 2, retries: 3)
+    let g = connect("h", prot: 1, retries: 2)
+    let h = connect("h", wrong: 1, other: 2)
+    let i = connect(port: 1, "h", 3)
+    let j = each([1]) { |x| x + 1 }
+    let k = each(f: |x| x, xs: [next(0)])
+    let n = 5
+    let l = n(1)
+    let m = Text(text: "x")
+    let clo = |x: Int| x
+    let o = clo(x: 1)
+    let s = connect(host: "h", 1, 2)
+    assert(1, 2)
+    assert(true)
+    assert_eq(1)
+    assert_eq(clo, clo)
+    keep()
+    let ch = channel(1, 2)
+    let r = catch(1, 2)
+    let bs = bytes()
+    let mp = map(1, 2)
+    panic()
+    let ok = connect(port: 80, retries: 1, host: "x")
+    let missing_two = connect(retries: 1)
+    let extra_and_named = connect("a", 1, 2, 3, port: 5)
+    let unknown_two = connect("a", 1, prt: 1, retris: 2)
+}

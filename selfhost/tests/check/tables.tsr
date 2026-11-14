@@ -1,0 +1,16 @@
+// Table tests: a problem in one case names the case; one in every case is
+// said once.
+fn half(n: Int) -> Int {
+    n / 2
+}
+
+test "halves" for (n, want) in [(4, 2), ("6", 3), (8, 4)] {
+    assert_eq(half(n), want)
+    let bad = nope
+}
+
+bench "work" {
+    half(10)
+}
+
+fn main(root: Root) {}

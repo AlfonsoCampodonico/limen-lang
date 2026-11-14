@@ -1,0 +1,101 @@
+// The items every program has without declaring them, as src/prelude.ml
+// makes them: the prelude's types and the functions behind the `Error`
+// interface, the tuple structs `#tuple2` to `#tuple8`, and the built-in
+// methods of List and Map written in Tessera (src/std/methods.tsr). The
+// checker puts them before the program's own items.
+use ast
+use parser
+
+pub fn text() -> Str {
+    "enum Option[T] \{ Some(T), None }
+enum Result[T, E] \{ Ok(T), Err(E) }
+enum IoError \{ Denied(Str), Failed(Str) }
+struct ProcessOutput \{ code: Int, stdout: Str, stderr: Str }
+struct HttpResponse \{ status: Int, headers: Map[Str, Str], body: Str }
+struct Handle \{ addr: Int }
+interface Error \{
+    fn message(self) -> Str
+    fn cause(self) -> Option[dyn Error]
+}
+struct WrappedError \{ context: Str, inner: dyn Error }
+fn message(self: WrappedError) -> Str \{ \"\{self.context}: \{self.inner.message()}\" }
+fn cause(self: WrappedError) -> Option[dyn Error] \{ Some(self.inner) }
+fn str_message(s: Str) -> Str \{ s }
+fn ioerror_message(e: IoError) -> Str \{ match e \{ Denied(m) => \"denied: \{m}\", Failed(m) => m } }
+fn no_cause[T](x: T) -> Option[dyn Error] \{ None }
+"
+}
+
+// The prelude's file name, and the built-in methods'.
+pub fn file_name() -> Str {
+    "<prelude>"
+}
+
+pub fn methods_name() -> Str {
+    "<builtin>"
+}
+
+// The prelude's items, parsed as file number `file` with expression ids
+// from `next`, then the tuples, then the built-in methods (`methods`, the
+// text of src/std/methods.tsr) as file `methods_file`. Returns the items
+// and the next free id.
+pub fn items(file: Int, methods: Str, methods_file: Int, next: Int) -> (List[ast.Item], Int) {
+    let (own, next) = parse(text(), file, next)
+    let (builtin, next) = parse(methods, methods_file, next)
+    (own.map(rename) + tuples() + builtin.map(as_method), next)
+}
+
+fn parse(src: Str, file: Int, next: Int) -> (List[ast.Item], Int) {
+    match parser.parse_file(src, file, next) {
+        Ok((f, next)) => (f.items, next),
+        // the prelude and src/std/methods.tsr always parse
+        Err(e) => panic("cannot parse {file}: {e.message}"),
+    }
+}
+
+// A function whose first parameter is `self` is the method `Type::name`.
+fn as_method(i: ast.Item) -> ast.Item {
+    match i {
+        IFn(d) => match d.params {
+            [p, ..] if p.name == "self" => match p.ty.desc {
+                TyName(tn, _) => IFn({ d with name: tn + "::" + d.name }),
+                _ => i,
+            },
+            _ => i,
+        },
+        _ => i,
+    }
+}
+
+// The prelude's own items are methods as above, and the functions behind
+// `Error` get names programs cannot write, which the backends call.
+fn rename(i: ast.Item) -> ast.Item {
+    let hidden = [("str_message", "$Str::message"), ("ioerror_message", "$IoError::message"), ("no_cause", "$no_cause")]
+    match as_method(i) {
+        IFn(d) => match hidden.find(|h| h.0 == d.name) {
+            Some(h) => IFn({ d with name: h.1 }),
+            None => IFn(d),
+        },
+        other => other,
+    }
+}
+
+// Tuples of 2 to 8 items: generic structs `#tupleN` with fields `0`,
+// `1`, ..., placed nowhere.
+fn tuples() -> List[ast.Item] {
+    let nowhere = ast.Span { file: -1, lo: 0, hi: 0 }
+    (2..<9).map(|n| {
+        let gen = (0..<n).map(|i| "T{i}")
+        let fields = gen.with_index().map(|p| ast.Field { name: "{p.0}", span: nowhere, ty: ast.TyExpr { desc: TyName(p.1, []), span: nowhere } })
+        IStruct(ast.StructDecl { name: ast.tuple_name(n), span: nowhere, generics: gen, fields, bounds: [], embeds: [], public: true, foreign: None })
+    })
+}
+
+// The names of the built-in methods written in Tessera for type `tn`.
+pub fn method_names(items: List[ast.Item], tn: Str) -> List[Str] {
+    let prefix = tn + "::"
+    items.flat_map(|i| match i {
+        IFn(d) if d.name.starts_with(prefix) => [d.name.slice(prefix.len(), d.name.len())],
+        _ => [],
+    })
+}

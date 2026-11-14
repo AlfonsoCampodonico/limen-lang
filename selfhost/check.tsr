@@ -1,0 +1,106 @@
+// Prints what selfhost/typecheck.tsr makes of one file, in the format of
+// selfhost/checkdump (the OCaml checker's), so the two can be compared:
+// the problems, each as ERROR or WARNING, CODE FILE LO HI, its message,
+// its notes and its fix; then each item of the program as the checker
+// rewrote it, and under it one line per expression, in the order
+// selfhost/walk.tsr visits them: its type, the type arguments of a generic
+// function's use, and `nested` for `a?.b` whose rest is an Option already.
+// A program the loader cannot load prints the loader's problems instead,
+// as selfhost/load.tsr does.
+//
+// It reads through the one Fs it is granted, as selfhost/load.tsr does:
+//
+//   tessera run selfhost/check.tsr --grant fs=..:ro -- tessera/src/std tessera/examples hello.tsr
+use ast
+use ast_print
+use diag
+use disk
+use env
+use loader
+use typecheck
+use walk
+
+fn main(root: Root) -> Int {
+    let out = root.stdout
+    let args = root.args()
+    if args.len() != 3 {
+        out.print("usage: check STD CWD FILE")
+        return 2
+    }
+    let fs = root.fs
+    let base = match fs.full_path("") {
+        Ok(p) => p,
+        Err(e) => {
+            out.print("no directory granted: {e}")
+            return 1
+        },
+    }
+    let std = fs.under(args[0])
+    let place = disk.Place { cwd: args[1], root: base }
+    let p = loader.load(fs, std, place, args[2])
+    for d in p.diags {
+        out.print("ERROR {d.code} {diag.path_of(p.files, d.span.file)} {d.span.lo} {d.span.hi}")
+        // a lexing error has no message of its own here
+        if d.message != "" {
+            out.print(d.message)
+        }
+        for n in d.notes {
+            out.print("note: {n}")
+        }
+    }
+    if !p.diags.is_empty() {
+        return 0
+    }
+    let methods = match std.read("methods.tsr") {
+        Ok(text) => text,
+        Err(e) => {
+            out.print("cannot read the built-in methods: {e}")
+            return 1
+        },
+    }
+    let c = typecheck.check_program(p.items, p.files, p.next_id, methods, p.forwarders)
+    let st = c.state
+    // what the Tessera checker does not do yet: a line here makes the
+    // comparison fail
+    for what in st.unported {
+        out.print("UNPORTED {what}")
+    }
+    let files = st_files(p.files)
+    for d in c.diags {
+        out.print("{if d.warning { "WARNING" } else { "ERROR" }} {d.code} {diag.path_of(files, d.span.file)} {d.span.lo} {d.span.hi}")
+        out.print(d.message)
+        for n in d.notes {
+            out.print("note: {n}")
+        }
+        match d.fix {
+            Some(f) => {
+                out.print("fix: " + f.message)
+                for ed in f.edits {
+                    out.print("edit {diag.path_of(files, ed.at.file)} {ed.at.lo} {ed.at.hi} {ast_print.escaped(ed.replacement)}")
+                }
+            },
+            None => {},
+        }
+    }
+    for i in c.items {
+        out.print(ast_print.item_line(i))
+        for e in walk.item(i) {
+            out.print("  " + line(st, e))
+        }
+    }
+    0
+}
+
+// The program's files, then the prelude's and the built-in methods', as
+// the checker numbers them.
+fn st_files(files: List[diag.Source]) -> List[diag.Source] {
+    files + [diag.Source { path: "<prelude>", text: "" }, diag.Source { path: "<builtin>", text: "" }]
+}
+
+// An expression's type, its type arguments, and whether it is a nested `?.`.
+fn line(st: env.State, e: ast.Expr) -> Str {
+    let inst = st.inst_of(e)
+    let shown = st.show(st.type_of(e))
+    let typed = if inst.is_empty() { shown } else { shown + " inst " + inst.map(|p| p.0 + "=" + st.show(p.1)).join(",") }
+    if st.nested.contains(e.id) { typed + " nested" } else { typed }
+}

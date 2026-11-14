@@ -1,0 +1,67 @@
+// Method calls: unknown methods and the notes that explain them, the
+// renamed and missing Option/Result methods, counts, methods a file adds
+// to built-in types (rewritten to plain calls), labels on methods (in
+// parameter order, with the written order kept), method definitions that
+// are not allowed.
+struct Box {
+    size: Int,
+}
+
+struct Empty {
+    n: Int,
+}
+
+fn grow(self: Box, by: Int, times: Int) -> Box {
+    { self with size: self.size + by * times }
+}
+
+fn shout(self: Str, mark: Str) -> Str {
+    self.to_upper() + mark
+}
+
+fn len(self: Str) -> Int {
+    0
+}
+
+pub fn whisper(self: Str) -> Str {
+    self.to_lower()
+}
+
+fn bad(x: Int, self: Int) {}
+
+fn on_fn(self: fn() -> Int) {}
+
+fn tick(n: Int) -> Int {
+    n + 1
+}
+
+fn main(root: Root) {
+    let b = Box { size: 1 }
+    let c = b.size()
+    let d = b.grw(1, 2)
+    let e = b.grow(1)
+    let f = b.grow(times: tick(1), by: tick(2))
+    let g = b.grow(1, times: 2)
+    let h = Empty { n: 1 }.reset()
+    let s = "hi".shout("!")
+    let t = "hi".shout(mark: "?")
+    let u = "hi".lenn()
+    let v = "hi".zzz()
+    let o = Some(1)
+    let w = o.unwrap_or(0)
+    let w2 = o.unwrap_or(1 + 2).len()
+    let w3 = -o.unwrap_or(3)
+    let x = o.and_then(|v| Some(v))
+    let r: Result[Int, Str] = Ok(1)
+    let y = r.map_err(|e| e.len())
+    let z = root.clock.after(10)
+    let q = root.net()
+    let xs = [3, 1, 2]
+    let n = xs.len(1)
+    let m = xs.take(count: 1)
+    let ys = xs.sort()
+    let fs = [|x: Int| x].sort()
+    let words = ["a"].join(", ")
+    let total = [1].sum()
+    let bad_join = [1].join(",")
+}
