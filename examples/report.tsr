@@ -1,5 +1,5 @@
 // A small report: dates from the clock, numbers lined up in columns.
-// Run: vela run examples/report.vela
+// Run: tessera run examples/report.tsr
 use format
 use time
 

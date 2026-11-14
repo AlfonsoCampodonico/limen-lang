@@ -1,8 +1,8 @@
 // A tour of the newer features, one small section each.
-// Run: vela run examples/tour.vela
-// Native: vela run examples/tour.vela --native
-// Tests: vela test examples/tour.vela
-// Benchmarks: vela test examples/tour.vela --bench
+// Run: tessera run examples/tour.tsr
+// Native: tessera run examples/tour.tsr --native
+// Tests: tessera test examples/tour.tsr
+// Benchmarks: tessera test examples/tour.tsr --bench
 use errors
 
 interface Shape {
@@ -123,7 +123,7 @@ fn main(root: Root) -> Int {
     let c = Circle { r: 1.0 }
     let f = c.area
     out.print("bound method {f().to_fixed(3)}")
-    out.print("vela".shout())
+    out.print("tessera".shout())
     // tuples and structs as map keys, and entries updated in place
     let mut grid: Map[Point, List[Str]] = map()
     grid[Point { x: 0, y: 0 }] = ["origin"]

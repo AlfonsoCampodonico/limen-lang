@@ -1,5 +1,5 @@
-(* Modules: `use NAME` loads NAME.vela (next to the importing file, then a
-   vela.toml dependency, then the standard library) and merges everything into
+(* Modules: `use NAME` loads NAME.tsr (next to the importing file, then a
+   tessera.toml dependency, then the standard library) and merges everything into
    one flat program. Every item of module M is renamed `M.item`; the main file
    keeps its names. References are rewritten scope-aware, so the checker and
    both backends see a single program with qualified names.
@@ -15,7 +15,7 @@ type modinfo = {
   mfile : string;
   mitems : item list;
   muses : (string * span) list;
-  mpkg : string option; (* the vela.toml dependency it belongs to *)
+  mpkg : string option; (* the tessera.toml dependency it belongs to *)
 }
 
 (* module name -> dependency, for the last program loaded *)
@@ -56,22 +56,22 @@ let read_file path =
   | Some t -> Some t
   | None -> try Some (In_channel.with_open_bin path In_channel.input_all) with Sys_error _ -> None
 
-(* deps: name -> directory holding NAME.vela (from vela.toml) *)
+(* deps: name -> directory holding NAME.tsr (from tessera.toml) *)
 (* Returns the path, the text, and whether it came from a dependency. *)
 let same_file a b = try Unix.realpath a = Unix.realpath b with Unix.Unix_error _ -> false
 
 let find_module ~deps ~from dir name =
-  let local = Filename.concat dir (name ^ ".vela") in
-  (* a file never imports itself: `use http` in http.vela means another http *)
+  let local = Filename.concat dir (name ^ ".tsr") in
+  (* a file never imports itself: `use http` in http.tsr means another http *)
   if dir <> "" && (Sys.file_exists local || List.mem_assoc local !overlay) && not (same_file local from) then Some (local, read_file local, false)
   else
     match List.assoc_opt name deps with
     | Some d ->
-      let p = Filename.concat d (name ^ ".vela") in
+      let p = Filename.concat d (name ^ ".tsr") in
       Some (p, read_file p, true)
     | None -> (
       match List.assoc_opt name !std_modules with
-      | Some src -> Some ("<std>/" ^ name ^ ".vela", Some src, false)
+      | Some src -> Some ("<std>/" ^ name ^ ".tsr", Some src, false)
       | None -> None)
 
 let parse path src =
@@ -216,7 +216,7 @@ let mk d sp = { edesc = d; espan = sp; ety = Types.TErr; einst = []; ecallee = N
 (* `embed("page.html")` and `embed_bytes("logo.png")` are read by the compiler
    and become a literal, so a program that serves its own files needs no `Fs`.
    The path is relative to the file that names it and must stay inside that
-   file's package (the directory of its vela.toml, or of the main file when
+   file's package (the directory of its tessera.toml, or of the main file when
    there is none; a dependency's own directory): otherwise a dependency could
    bake `../../.ssh/id_rsa` into the binary, a read no grant allows. *)
 
@@ -610,7 +610,7 @@ let rename_item ?(fresh = false) mods (m : modinfo) own (it : item) : item =
         fn_params = params;
         fn_ret = Option.map (ty env) d.fn_ret;
         fn_body = block env locals d.fn_body;
-        (* a standard library module trusted with C (src/std/vela.toml [trust]) *)
+        (* a standard library module trusted with C (src/std/tessera.toml [trust]) *)
         fn_foreign =
           Option.map
             (fun (fo : foreign) ->
@@ -618,7 +618,7 @@ let rename_item ?(fresh = false) mods (m : modinfo) own (it : item) : item =
             d.fn_foreign }
   | IStruct s ->
     let env = { self = m; mods; own; gens = s.st_gen; fresh } in
-    (* a C struct's Int32 fields are Ints to the rest of Vela, as Int32
+    (* a C struct's Int32 fields are Ints to the rest of Tessera, as Int32
        parameters are; the types as written stay in st_foreign *)
     let int32_as_int (t : ty_expr) = match t.tdesc with TyName ("Int32", []) when s.st_foreign <> None -> { t with tdesc = TyName ("Int", []) } | _ -> t in
     IStruct
@@ -698,7 +698,7 @@ let check_aliases (m : modinfo) =
    Returns the flat program, or the diagnostics. *)
 let load ?(deps = []) ?root path src : item list * Diag.t list =
   errors := [];
-  (* without one (the editor, the agent server), the vela.toml around the
+  (* without one (the editor, the agent server), the tessera.toml around the
      file decides, as in a build; finding it fetches nothing *)
   main_root :=
     (match root with
@@ -723,7 +723,7 @@ let load ?(deps = []) ?root path src : item list * Diag.t list =
             match find_module ~deps ~from:m.mfile dir name with
             | None ->
               err "E0401" sp (Printf.sprintf "cannot find module `%s`" name)
-                ~notes:[ Printf.sprintf "looked for %s, the dependencies in vela.toml and the standard library" (Filename.concat dir (name ^ ".vela")) ]
+                ~notes:[ Printf.sprintf "looked for %s, the dependencies in tessera.toml and the standard library" (Filename.concat dir (name ^ ".tsr")) ]
             | Some (p, None, _) -> err "E0401" sp (Printf.sprintf "cannot read module `%s` at %s" name p)
             | Some (p, Some src, from_dep) ->
               let f = parse p src in
@@ -779,7 +779,7 @@ let c_users (items : item list) : (string * string list) list =
       | _ -> acc)
     [] items
 
-(* Load a program with the vela.toml around it (if any), then type-check it
+(* Load a program with the tessera.toml around it (if any), then type-check it
    and enforce the capabilities of each standard library module and each
    dependency. *)
 let load_and_check path src : item list * Diag.t list * Check.fn_info list =
@@ -792,8 +792,8 @@ let load_and_check path src : item list * Diag.t list * Check.fn_info list =
     | [], (_ :: _ as ds) -> ([], ds, [])
     | items, _ ->
       let ds, infos = Check.check_program items in
-      (* standard library modules are checked against src/std/vela.toml,
-         with or without a vela.toml of the program's own *)
+      (* standard library modules are checked against src/std/tessera.toml,
+         with or without a tessera.toml of the program's own *)
       let warnings = Diag.warnings ds in
       let ds = Diag.errors ds in
       let ds = if ds = [] then Package.enforce ~std:true (Lazy.force Package.std_manifest) (List.map (fun m -> (m, m)) !std_loaded) infos else ds in

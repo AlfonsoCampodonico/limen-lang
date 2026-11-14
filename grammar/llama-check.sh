@@ -1,10 +1,10 @@
 #!/bin/sh
-# Check grammar/vela.gbnf with llama.cpp's real GBNF parser and matcher (not
+# Check grammar/tessera.gbnf with llama.cpp's real GBNF parser and matcher (not
 # part of `dune test`; it needs git, cmake, a C++ compiler and a network
 # connection the first time).
 #
 # Fetches llama.cpp at a pinned release into a cache outside the repository
-# ($VELA_CACHE, default ~/.cache/vela), builds only the llama library, then
+# ($TESSERA_CACHE, default ~/.cache/tessera), builds only the llama library, then
 # runs every program through grammar/llama_check.cpp: the hand-written accept
 # and reject cases, the examples, the benchmarks, and every program in the
 # test suite (programs that parse must match, programs the parser rejects
@@ -16,7 +16,7 @@
 set -e
 TAG=b12250
 root=$(cd "$(dirname "$0")/.." && pwd)
-cache=${VELA_CACHE:-$HOME/.cache/vela}
+cache=${TESSERA_CACHE:-$HOME/.cache/tessera}
 src=$cache/llama.cpp-$TAG
 build=$src/build-grammar
 mkdir -p "$cache"
@@ -36,7 +36,7 @@ if [ ! -f "$build/src/libllama.a" ]; then
   cmake --build "$build" --target llama -j "$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)" >/dev/null
 fi
 
-exe=$build/vela-llama-check
+exe=$build/tessera-llama-check
 if [ ! -x "$exe" ] || [ "$root/grammar/llama_check.cpp" -nt "$exe" ]; then
   libs=$(find "$build" -name 'libllama.a' -o -name 'libggml*.a' | sort -r)
   case $(uname) in Darwin) libs="$libs -framework Accelerate -framework Foundation" ;; esac
@@ -49,7 +49,7 @@ dump=$(mktemp -d)
 trap 'rm -rf "$dump"' EXIT
 cd "$root"
 dune build --root . 2>/dev/null
-VELA_SKIP_NATIVE=1 VELA_DUMP_DIR="$dump" ./_build/default/test/test_vela.exe >/dev/null || true
+TESSERA_SKIP_NATIVE=1 TESSERA_DUMP_DIR="$dump" ./_build/default/test/test_tessera.exe >/dev/null || true
 
-"$exe" grammar/vela.gbnf grammar/tests/accept/*.vela examples/*.vela bench/*.vela "$dump"/accept/*.vela \
-  --reject grammar/tests/reject/*.vela "$dump"/reject/*.vela
+"$exe" grammar/tessera.gbnf grammar/tests/accept/*.tsr examples/*.tsr bench/*.tsr "$dump"/accept/*.tsr \
+  --reject grammar/tests/reject/*.tsr "$dump"/reject/*.tsr

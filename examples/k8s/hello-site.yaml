@@ -1,4 +1,4 @@
-apiVersion: vela.dev/v1
+apiVersion: tessera.dev/v1
 kind: StaticSite
 metadata:
   name: hello
@@ -7,4 +7,4 @@ spec:
   html: |
     <!doctype html>
     <title>hello</title>
-    <h1>Served by a Vela operator</h1>
+    <h1>Served by a Tessera operator</h1>

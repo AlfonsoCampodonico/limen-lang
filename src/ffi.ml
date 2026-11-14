@@ -5,20 +5,20 @@
    function in library [lib]. Each parameter and the result has one of these
    boundary types:
 
-     Vela type      C type          notes
+     Tessera type      C type          notes
      Int            int64_t
-     Int32          int32_t         an Int in Vela; out of range panics
+     Int32          int32_t         an Int in Tessera; out of range panics
      Float          double
      Bool           int             0 is false
      Str            const char *    the bytes, then a NUL; valid during the call only
      Bytes          const void *    likewise; pass the length yourself
-     Handle         void *          an opaque pointer, `Handle { addr }` in Vela
+     Handle         void *          an opaque pointer, `Handle { addr }` in Tessera
      Out[T]         T *             T is Int, Int32, Float or Handle: an out-parameter
      a C struct     struct { ... }  declared in the block, passed and returned by value
-     fn(A) -> R     function ptr    a callback: a top-level Vela function C calls
+     fn(A) -> R     function ptr    a callback: a top-level Tessera function C calls
 
    A Str result is copied from a NUL-terminated C string (NULL gives ""). A
-   function's Vela type takes a Foreign capability first, then the parameters
+   function's Tessera type takes a Foreign capability first, then the parameters
    that are not Out; its value is the C result (unless it returns nothing)
    followed by the Out values, as a tuple when there is more than one.
 
@@ -37,8 +37,8 @@ type cty =
   | Bytes
   | Handle
   | Unit
-  | Struct of string * (string * cty) list (* a C struct by value: its Vela name and its fields *)
-  | Fn of cty list * cty (* a callback: C calls a top-level Vela function through it *)
+  | Struct of string * (string * cty) list (* a C struct by value: its Tessera name and its fields *)
+  | Fn of cty list * cty (* a callback: C calls a top-level Tessera function through it *)
 
 type param = { name : string; cty : cty; out : bool }
 
@@ -61,7 +61,7 @@ let max_varargs = 8
 
 let handle_ty = TNamed ("Handle", [])
 
-let rec vela_ty = function
+let rec tessera_ty = function
   | Int | Int32 -> TInt
   | Float -> TFloat
   | Bool -> TBool
@@ -70,7 +70,7 @@ let rec vela_ty = function
   | Handle -> handle_ty
   | Unit -> TUnit
   | Struct (n, _) -> TNamed (n, [])
-  | Fn (ps, r) -> TFn (List.map vela_ty ps, vela_ty r)
+  | Fn (ps, r) -> TFn (List.map tessera_ty ps, tessera_ty r)
 
 let c_name = function
   | Int -> "int64_t"
@@ -121,11 +121,11 @@ let results s = (if s.ret = Unit then [] else [ s.ret ]) @ List.filter_map (fun 
 let result_ty s =
   match results s with
   | [] -> TUnit
-  | [ t ] -> vela_ty t
-  | ts -> TNamed (Ast.tuple_name (List.length ts), List.map vela_ty ts)
+  | [ t ] -> tessera_ty t
+  | ts -> TNamed (Ast.tuple_name (List.length ts), List.map tessera_ty ts)
 
 let visible_params s =
-  let ps = List.filter_map (fun p -> if p.out then None else Some (vela_ty p.cty)) s.params in
+  let ps = List.filter_map (fun p -> if p.out then None else Some (tessera_ty p.cty)) s.params in
   if s.trusted then ps else TCap Foreign :: ps
 
 (* A library name is a plain word: linked as -l<name>, loaded as lib<name>.so
@@ -173,17 +173,17 @@ let struct_fields (s : Ast.struct_decl) : ((string * cty) list, (Span.t * string
 
 (* The runtime's helpers for trusted standard library modules, with the
    signature each must be declared with.
-   - vela_copy(p, n): n bytes of C memory at p, as Bytes.
-   - vela_handle_new(p) -> id: put a C pointer in the runtime's handle table
-     under a fresh random id, so Vela values hold an id that cannot be forged
-     into a pointer. vela_handle_acquire(id) gives the pointer back (NULL if
+   - tessera_copy(p, n): n bytes of C memory at p, as Bytes.
+   - tessera_handle_new(p) -> id: put a C pointer in the runtime's handle table
+     under a fresh random id, so Tessera values hold an id that cannot be forged
+     into a pointer. tessera_handle_acquire(id) gives the pointer back (NULL if
      the id is unknown or closed) and counts a use in progress;
-     vela_handle_release(id) ends that use. vela_handle_close(id) closes the
+     tessera_handle_release(id) ends that use. tessera_handle_close(id) closes the
      id; the pointer comes back (to free) from whichever of close and the
      last release happens last, and NULL from the others. *)
 let runtime_fns =
-  [ ("vela_copy", ([ Handle; Int ], Bytes)); ("vela_handle_new", ([ Handle ], Int)); ("vela_handle_acquire", ([ Int ], Handle));
-    ("vela_handle_release", ([ Int ], Handle)); ("vela_handle_close", ([ Int ], Handle)) ]
+  [ ("tessera_copy", ([ Handle; Int ], Bytes)); ("tessera_handle_new", ([ Handle ], Int)); ("tessera_handle_acquire", ([ Int ], Handle));
+    ("tessera_handle_release", ([ Int ], Handle)); ("tessera_handle_close", ([ Int ], Handle)) ]
 
 (* The C signature of a foreign declaration, or the errors in it. [structs]
    finds a struct declaration by its (qualified) name. *)
@@ -265,13 +265,13 @@ let of_decl ?(structs : string -> Ast.struct_decl option = fun _ -> None) (d : A
             { name = p.prm_name; cty = Int; out = false }))
       d.fn_params
   in
-  (* "vela" is the runtime's own library of helpers for trusted standard
+  (* "tessera" is the runtime's own library of helpers for trusted standard
      library modules (see runtime_fns) *)
-  let runtime_lib = lib = "vela" in
+  let runtime_lib = lib = "tessera" in
   if runtime_lib then begin
-    if not trusted then err d.fn_span "library `vela` is the runtime's own, for the standard library; use `foreign.copy(p, n)` instead";
+    if not trusted then err d.fn_span "library `tessera` is the runtime's own, for the standard library; use `foreign.copy(p, n)` instead";
     if not (List.mem_assoc sym runtime_fns) then
-      err d.fn_span (Printf.sprintf "library `vela` has no function `%s`; it has %s" sym (String.concat ", " (List.map fst runtime_fns)))
+      err d.fn_span (Printf.sprintf "library `tessera` has no function `%s`; it has %s" sym (String.concat ", " (List.map fst runtime_fns)))
   end;
   let ret =
     match d.fn_ret with
@@ -330,7 +330,7 @@ let of_decl ?(structs : string -> Ast.struct_decl option = fun _ -> None) (d : A
 (* Libraries a program's foreign declarations name, each once, in order. *)
 let libs (items : Ast.item list) =
   List.fold_left
-    (fun acc it -> match it with Ast.IFn { fn_foreign = Some { flib = l; _ }; _ } when l <> "vela" && not (List.mem l acc) -> acc @ [ l ] | _ -> acc)
+    (fun acc it -> match it with Ast.IFn { fn_foreign = Some { flib = l; _ }; _ } when l <> "tessera" && not (List.mem l acc) -> acc @ [ l ] | _ -> acc)
     [] items
 
 let denied_msg lib = Printf.sprintf "foreign: library `%s` is not granted (grant it with --grant foreign=%s)" lib lib

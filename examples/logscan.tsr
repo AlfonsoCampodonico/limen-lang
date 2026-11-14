@@ -1,5 +1,5 @@
 // Pull fields out of log lines with a regex, then summarise them.
-// Run: vela run examples/logscan.vela
+// Run: tessera run examples/logscan.tsr
 use format
 use regex
 use time

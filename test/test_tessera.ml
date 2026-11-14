@@ -1,13 +1,13 @@
-open Vela
+open Tessera
 
 let sprintf = Printf.sprintf
 let total = ref 0
 let failed = ref 0
 
-(* VELA_TEST_ONLY=a,b runs only the program tests whose names start with
+(* TESSERA_TEST_ONLY=a,b runs only the program tests whose names start with
    one of those prefixes (for working on a feature; the full run ignores it). *)
 let selected name =
-  match Sys.getenv_opt "VELA_TEST_ONLY" with
+  match Sys.getenv_opt "TESSERA_TEST_ONLY" with
   | None | Some "" -> true
   | Some ps -> List.exists (fun p -> String.starts_with ~prefix:p name) (String.split_on_char ',' ps)
 
@@ -18,8 +18,8 @@ let ok name cond msg =
     Printf.printf "FAIL %s: %s\n" name msg
   end
 
-(* VELA_DUMP_DIR=dir writes every program into dir/accept (it parses) or
-   dir/reject (lexer or parser error), for checking grammar/vela.gbnf. *)
+(* TESSERA_DUMP_DIR=dir writes every program into dir/accept (it parses) or
+   dir/reject (lexer or parser error), for checking grammar/tessera.gbnf. *)
 (* Rejected by the parser but within the grammar's documented superset
    (keywords are not excluded from identifiers). *)
 let grammar_superset =
@@ -27,16 +27,16 @@ let grammar_superset =
     "trailing-in-for"; "trailing-in-match" ]
 
 let dump name src parsed =
-  match Sys.getenv_opt "VELA_DUMP_DIR" with
+  match Sys.getenv_opt "TESSERA_DUMP_DIR" with
   | None -> ()
   | Some _ when (not parsed) && List.mem name grammar_superset -> ()
   | Some dir ->
     let sub = Filename.concat dir (if parsed then "accept" else "reject") in
     (try Unix.mkdir dir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
     (try Unix.mkdir sub 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
-    Out_channel.with_open_bin (Filename.concat sub (name ^ ".vela")) (fun oc -> output_string oc src)
+    Out_channel.with_open_bin (Filename.concat sub (name ^ ".tsr")) (fun oc -> output_string oc src)
 
-(* vela fmt on every program that parses: the result must parse to the same
+(* tessera fmt on every program that parses: the result must parse to the same
    tree (ignoring positions), formatting again must not change it, and no
    comment may be lost. Checked once per program. *)
 let fmt_checked : (string, unit) Hashtbl.t = Hashtbl.create 64
@@ -45,8 +45,8 @@ let fmt_failures = ref []
 let check_fmt name src () =
   if not (Hashtbl.mem fmt_checked name) then begin
     Hashtbl.replace fmt_checked name ();
-    let file = name ^ ".vela" in
-    let comments_of s = (try ignore (Lexer.lex "c.vela" s) with Diag.Fatal _ -> ()); List.sort compare (List.map (fun (_, _, t) -> t) !Lexer.comments) in
+    let file = name ^ ".tsr" in
+    let comments_of s = (try ignore (Lexer.lex "c.tsr" s) with Diag.Fatal _ -> ()); List.sort compare (List.map (fun (_, _, t) -> t) !Lexer.comments) in
     let before = comments_of src in
     match Fmt.format ~file:("fmt-" ^ file) src with
     | exception Diag.Fatal d -> fmt_failures := (name, "formatting failed: " ^ d.message) :: !fmt_failures
@@ -63,13 +63,13 @@ let check_fmt name src () =
 
 (* [modules]: other files (name, source) written next to the program, for `use`. *)
 let compile ?(modules = []) name src =
-  let file = name ^ ".vela" in
+  let file = name ^ ".tsr" in
   let file =
     if modules = [] then file
     else begin
-      let dir = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "vela-mods-%d-%s" (Unix.getpid ()) name) in
+      let dir = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "tessera-mods-%d-%s" (Unix.getpid ()) name) in
       (try Unix.mkdir dir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
-      List.iter (fun (m, s) -> Out_channel.with_open_bin (Filename.concat dir (m ^ ".vela")) (fun oc -> output_string oc s)) modules;
+      List.iter (fun (m, s) -> Out_channel.with_open_bin (Filename.concat dir (m ^ ".tsr")) (fun oc -> output_string oc s)) modules;
       Filename.concat dir file
     end
   in
@@ -113,19 +113,19 @@ let run ?(grants = Interp.no_grants) ?modules ?feed name src =
 
 (* ---------- native backend: same program, compiled to C ---------- *)
 
-let tmpdir = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "vela-native-%d" (Unix.getpid ()))
+let tmpdir = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "tessera-native-%d" (Unix.getpid ()))
 let () = try Unix.mkdir tmpdir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ()
-let native_enabled = Sys.getenv_opt "VELA_SKIP_NATIVE" = None
+let native_enabled = Sys.getenv_opt "TESSERA_SKIP_NATIVE" = None
 
-(* VELA_NATIVE_ONLY=a,b runs the native half only for tests whose name starts with a or b. *)
+(* TESSERA_NATIVE_ONLY=a,b runs the native half only for tests whose name starts with a or b. *)
 let native_for name =
   native_enabled
-  && match Sys.getenv_opt "VELA_NATIVE_ONLY" with
+  && match Sys.getenv_opt "TESSERA_NATIVE_ONLY" with
      | None | Some "" -> true
      | Some l -> List.exists (fun p -> String.starts_with ~prefix:p name) (String.split_on_char ',' l)
 
 (* AddressSanitizer catches use-after-free and double free in the reference
-   counting; VELA_LEAKCHECK reports objects still alive at exit. *)
+   counting; TESSERA_LEAKCHECK reports objects still alive at exit. *)
 let sanitize = [ "-O1"; "-g"; "-fsanitize=address,undefined"; "-fno-sanitize-recover=all" ]
 
 let read_file p = In_channel.with_open_bin p In_channel.input_all
@@ -134,18 +134,18 @@ let read_file p = In_channel.with_open_bin p In_channel.input_all
 
    Compiling with a sanitizer and running the result is most of the suite's
    time, and each program is independent (sockets use port 0), so they run as
-   background jobs, VELA_JOBS at a time (default: one per core). The C source
+   background jobs, TESSERA_JOBS at a time (default: one per core). The C source
    is generated here, in order; the job compiles it and runs the binary, and a
    callback checks the result when it ends. [drain] waits for all of them
    before the summary.
 
    Compiled binaries are cached by a digest of the compiler, its flags and the
-   C source, in $VELA_CACHE/test-native (default ~/.cache/vela), so a run that
-   changes no generated C compiles nothing. VELA_TEST_CACHE=0 turns it off.
+   C source, in $TESSERA_CACHE/test-native (default ~/.cache/tessera), so a run that
+   changes no generated C compiles nothing. TESSERA_TEST_CACHE=0 turns it off.
    Entries unused for a week are removed. *)
 
 let jobs_max =
-  match Option.bind (Sys.getenv_opt "VELA_JOBS") int_of_string_opt with
+  match Option.bind (Sys.getenv_opt "TESSERA_JOBS") int_of_string_opt with
   | Some n when n > 0 -> n
   | _ -> (
     try
@@ -157,7 +157,7 @@ let jobs_max =
 
 let running : (int * (int -> unit)) list ref = ref []
 
-(* VELA_TEST_SLOW=1 lists the slowest jobs at the end. *)
+(* TESSERA_TEST_SLOW=1 lists the slowest jobs at the end. *)
 let job_times : (float * string) list ref = ref []
 let job_started : (int, float * string) Hashtbl.t = Hashtbl.create 64
 
@@ -196,7 +196,7 @@ let spawn cmd k =
 
 let drain () =
   while !running <> [] do reap () done;
-  if Sys.getenv_opt "VELA_TEST_SLOW" <> None then
+  if Sys.getenv_opt "TESSERA_TEST_SLOW" <> None then
     List.iteri
       (fun i (t, cmd) ->
         if i < 25 then
@@ -205,12 +205,12 @@ let drain () =
       (List.sort (fun (a, _) (b, _) -> compare b a) !job_times)
 
 let cache_dir =
-  if Sys.getenv_opt "VELA_TEST_CACHE" = Some "0" then None
+  if Sys.getenv_opt "TESSERA_TEST_CACHE" = Some "0" then None
   else
     let base =
-      match Sys.getenv_opt "VELA_CACHE" with
+      match Sys.getenv_opt "TESSERA_CACHE" with
       | Some d when d <> "" -> Some d
-      | _ -> Option.map (fun h -> Filename.concat (Filename.concat h ".cache") "vela") (Sys.getenv_opt "HOME")
+      | _ -> Option.map (fun h -> Filename.concat (Filename.concat h ".cache") "tessera") (Sys.getenv_opt "HOME")
     in
     match base with
     | None -> None
@@ -291,8 +291,8 @@ let run_native ?(grants = Interp.no_grants) ?modules ?feed name src k =
   let args = grant_args grants @ ("--" :: grants.Interp.args) in
   let o = exe ^ ".out" and e = exe ^ ".err" in
   let cmd = String.concat " " (List.map Filename.quote (exe :: args)) ^ sprintf " >%s 2>%s" (Filename.quote o) (Filename.quote e) in
-  let env = "ASAN_OPTIONS=detect_leaks=0 VELA_LEAKCHECK=1 " in
-  let run_cmd = match feed with None -> env ^ cmd | Some f -> sprintf "(%s) | %sVELA_THREADS=1 %s" f env cmd in
+  let env = "ASAN_OPTIONS=detect_leaks=0 TESSERA_LEAKCHECK=1 " in
+  let run_cmd = match feed with None -> env ^ cmd | Some f -> sprintf "(%s) | %sTESSERA_THREADS=1 %s" f env cmd in
   native_job ~flags:sanitize items exe run_cmd (function
     | Error m -> k (Error ("C compile failed:\n" ^ m))
     | Ok code -> k (Ok (code, read_file o, read_file e)))
@@ -306,7 +306,7 @@ let check_native name ?grants ?modules ?feed src ~want_out ~want_err_prefix =
         match want_err_prefix with
         | None ->
           ok (name ^ "/native-clean")
-            (code = 0 && e = "vela-leakcheck: 0 live\n")
+            (code = 0 && e = "tessera-leakcheck: 0 live\n")
             (sprintf "exit %d, stderr %S" code e)
         | Some p -> ok (name ^ "/native-panic") (String.starts_with ~prefix:p e) (sprintf "stderr %S" e)))
 
@@ -331,14 +331,14 @@ let check_tsan name ?(grants = Interp.no_grants) ?feed src want =
       let cmd =
         String.concat " " (List.map Filename.quote (exe :: args)) ^ sprintf " >%s 2>%s" (Filename.quote o) (Filename.quote e)
       in
-      let env = "TSAN_OPTIONS=halt_on_error=1 VELA_THREADS=8 VELA_LEAKCHECK=1 " in
+      let env = "TSAN_OPTIONS=halt_on_error=1 TESSERA_THREADS=8 TESSERA_LEAKCHECK=1 " in
       let run_cmd = match feed with None -> env ^ cmd | Some f -> sprintf "(%s) | %s%s" f env cmd in
       native_job ~flags:tsan items exe run_cmd (function
         | Error m -> ok (name ^ "/tsan") false ("C compile failed:\n" ^ m)
         | Ok code ->
           let o = read_file o and e = read_file e in
           ok (name ^ "/tsan")
-            (code = 0 && o = want && e = "vela-leakcheck: 0 live\n")
+            (code = 0 && o = want && e = "tessera-leakcheck: 0 live\n")
             (sprintf "exit %d, stdout %S, stderr %S" code o e))
     end
   end
@@ -378,7 +378,7 @@ let exits name ?grants src want_out want_code =
       | Ok (code, o, e) ->
         ok (name ^ "/native")
           (o = want_out && code = want_code
-           && (String.ends_with ~suffix:"vela-leakcheck: 0 live\n" e || String.starts_with ~prefix:"error: " e))
+           && (String.ends_with ~suffix:"tessera-leakcheck: 0 live\n" e || String.starts_with ~prefix:"error: " e))
           (sprintf "stdout %S exit %d stderr %S, want %S exit %d" o code e want_out want_code))
 
 (* Apply every fix's edits and return the new source. *)
@@ -399,9 +399,9 @@ let () = Unix.putenv "SSL_CERT_FILE" (Filename.concat tls_dir "ca.pem")
 
 (* builds made through the CLI keep their binaries in a cache of their own,
    not the user's, removed at the end *)
-let test_cache = Filename.concat (Filename.get_temp_dir_name ()) (Printf.sprintf "vela-test-cache-%d" (Unix.getpid ()))
+let test_cache = Filename.concat (Filename.get_temp_dir_name ()) (Printf.sprintf "tessera-test-cache-%d" (Unix.getpid ()))
 let () =
-  Unix.putenv "VELA_CACHE" test_cache;
+  Unix.putenv "TESSERA_CACHE" test_cache;
   at_exit (fun () -> ignore (Sys.command (Filename.quote_command "rm" [ "-rf"; test_cache ])))
 
 let main_wrap body = "fn main(root: Root) {\n    let out = root.stdout\n" ^ body ^ "\n}\n"
@@ -1010,8 +1010,8 @@ fn client(net: Net, port: Int, k: Int) -> Int {
   out "exec-not-granted" (main_wrap "    out.print(\"{root.exec.run(\"sh\", [\"-c\", \"true\"])}\")")
     "Err(Denied(\"exec: `sh` is not granted\"))\n";
   out "exec-missing" ~grants:{ Interp.no_grants with exec = [ "*" ] }
-    (main_wrap "    out.print(\"{root.exec.run(\"vela-no-such-program\", [])}\")")
-    "Err(Failed(\"exec: cannot run `vela-no-such-program`: No such file or directory\"))\n";
+    (main_wrap "    out.print(\"{root.exec.run(\"tessera-no-such-program\", [])}\")")
+    "Err(Failed(\"exec: cannot run `tessera-no-such-program`: No such file or directory\"))\n";
   out "exec-signal" ~grants:sh
     (main_wrap "    out.print(\"{root.exec.run(\"sh\", [\"-c\", \"kill -9 $$\"]).map_error(|e| 0)}\")")
     "Ok(ProcessOutput { code: 137, stdout: \"\", stderr: \"\" })\n";
@@ -1061,7 +1061,7 @@ fn main(root: Root) {
     let (x, rest) = strtod(c, "1.25e2!")
     out.print("{x} {c.copy(rest, 1).to_str()}")
     out.print("{strchr(c, "hello", 108)} [{strchr(c, "hello", 122)}] {isdigit(c, 55)} {isdigit(c, 65)}")
-    out.print("{getenv(c, "VELA_NO_SUCH_VARIABLE").addr == 0}")
+    out.print("{getenv(c, "TESSERA_NO_SUCH_VARIABLE").addr == 0}")
     let b = bytes([1, 0, 7, 9])
     out.print("{memcmp(c, b, bytes([1, 0, 7, 8]), 4) > 0} {memcmp(c, b, b, 4)} {c.copy(end, 0).len()}")
     out.print("{strlen(c, "")} {c.allows("c")} {c.allows("sqlite3")}")
@@ -1124,24 +1124,24 @@ fn main(root: Root) {
   errs "ffi-body" "foreign \"c\" {\n    fn f() -> Int { 1 }\n}\n\nfn main() {}\n" [ "E0003" ];
   errs "ffi-generic" "foreign \"c\" {\n    fn f[T](x: T)\n}\n\nfn main() {}\n" [ "E0003" ];
   (* only trusted standard library modules call C without Foreign *)
-  errs "ffi-runtime-lib" "foreign \"vela\" {\n    fn vela_copy(p: Handle, n: Int) -> Bytes\n}\n\nfn main() {}\n" [ "E0330" ];
+  errs "ffi-runtime-lib" "foreign \"tessera\" {\n    fn tessera_copy(p: Handle, n: Int) -> Bytes\n}\n\nfn main() {}\n" [ "E0330" ];
   errs "ffi-sql-private" "use sql\n\nfn main() {\n    let x = sql.sqlite3_errstr(1)\n}\n" [ "E0402" ];
   errs "ffi-same-line" "foreign \"c\" {\n    fn a() fn b()\n}\n\nfn main() {}\n" [ "E0003" ];
   errs "ffi-main" "foreign \"c\" {\n    fn main()\n}\n" [ "E0303"; "E0330" ];
   (* a missing symbol is an error before the program runs (natively, a link error) *)
-  if selected "ffi-missing" then (match run ~grants:libc "ffi-missing" "foreign \"c\" {\n    fn vela_no_such_function() -> Int\n}\n\nfn main(root: Root) {\n    root.stdout.print(\"{vela_no_such_function(root.foreign)}\")\n}\n" with
-   | Error e -> ok "ffi-missing" (e = "panic: foreign: library `c` has no function `vela_no_such_function`") e
+  if selected "ffi-missing" then (match run ~grants:libc "ffi-missing" "foreign \"c\" {\n    fn tessera_no_such_function() -> Int\n}\n\nfn main(root: Root) {\n    root.stdout.print(\"{tessera_no_such_function(root.foreign)}\")\n}\n" with
+   | Error e -> ok "ffi-missing" (e = "panic: foreign: library `c` has no function `tessera_no_such_function`") e
    | Ok _ -> ok "ffi-missing" false "ran");
-  if selected "ffi-no-lib" then (match run ~grants:{ Interp.no_grants with foreign = [ "*" ] } "ffi-no-lib" "foreign \"vela_no_such_lib\" {\n    fn f() -> Int\n}\n\nfn main(root: Root) {\n    root.stdout.print(\"{f(root.foreign)}\")\n}\n" with
-   | Error e -> ok "ffi-no-lib" (String.starts_with ~prefix:"panic: foreign: cannot load library `vela_no_such_lib`" e) e
+  if selected "ffi-no-lib" then (match run ~grants:{ Interp.no_grants with foreign = [ "*" ] } "ffi-no-lib" "foreign \"tessera_no_such_lib\" {\n    fn f() -> Int\n}\n\nfn main(root: Root) {\n    root.stdout.print(\"{f(root.foreign)}\")\n}\n" with
+   | Error e -> ok "ffi-no-lib" (String.starts_with ~prefix:"panic: foreign: cannot load library `tessera_no_such_lib`" e) e
    | Ok _ -> ok "ffi-no-lib" false "ran");
   (* a library the grants do not cover is not even loaded: the call panics first *)
-  if selected "ffi-no-lib-ungranted" then (match run ~grants:libc "ffi-no-lib-ungranted" "foreign \"vela_no_such_lib\" {\n    fn f() -> Int\n}\n\nfn main(root: Root) {\n    root.stdout.print(\"before\")\n    root.stdout.print(\"{f(root.foreign)}\")\n}\n" with
-   | Error e -> ok "ffi-no-lib-ungranted" (e = "panic: foreign: library `vela_no_such_lib` is not granted (grant it with --grant foreign=vela_no_such_lib)") e
+  if selected "ffi-no-lib-ungranted" then (match run ~grants:libc "ffi-no-lib-ungranted" "foreign \"tessera_no_such_lib\" {\n    fn f() -> Int\n}\n\nfn main(root: Root) {\n    root.stdout.print(\"before\")\n    root.stdout.print(\"{f(root.foreign)}\")\n}\n" with
+   | Error e -> ok "ffi-no-lib-ungranted" (e = "panic: foreign: library `tessera_no_such_lib` is not granted (grant it with --grant foreign=tessera_no_such_lib)") e
    | Ok _ -> ok "ffi-no-lib-ungranted" false "ran");
   if native_for "ffi-missing" && selected "ffi-missing" then
-    run_native ~grants:libc "ffi-missing-native" "foreign \"c\" {\n    fn vela_no_such_function() -> Int\n}\n\nfn main(root: Root) {\n    root.stdout.print(\"{vela_no_such_function(root.foreign)}\")\n}\n" (function
-     | Error m -> ok "ffi-missing/native" (Interp_util.find_sub m "vela_no_such_function" 0 <> None) m
+    run_native ~grants:libc "ffi-missing-native" "foreign \"c\" {\n    fn tessera_no_such_function() -> Int\n}\n\nfn main(root: Root) {\n    root.stdout.print(\"{tessera_no_such_function(root.foreign)}\")\n}\n" (function
+     | Error m -> ok "ffi-missing/native" (Interp_util.find_sub m "tessera_no_such_function" 0 <> None) m
      | Ok _ -> ok "ffi-missing/native" false "linked");
   (* variadic functions: each declaration fixes the types it passes after `...` *)
   let vdecls = {|foreign "c" {
@@ -1251,11 +1251,11 @@ fn main(root: Root) {
      callbacks, against a small C library (test/ffi_test.c) built here *)
   (* next to the test binary, not in $TMPDIR: dune gives each run a temporary
      directory of its own, which can be gone while binaries still point at it *)
-  let vt_dir = Filename.concat (Filename.dirname Sys.executable_name) "vela-ffi-test" in
+  let vt_dir = Filename.concat (Filename.dirname Sys.executable_name) "tessera-ffi-test" in
   (try Unix.mkdir vt_dir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
   let vt_src = let d = Filename.concat (Sys.getcwd ()) "ffi_test.c" in if Sys.file_exists d then d else Filename.concat (Sys.getcwd ()) "test/ffi_test.c" in
   let macos = Sys.file_exists "/System/Library/CoreServices" in
-  let vt_lib = Filename.concat vt_dir (if macos then "libvelatest.dylib" else "libvelatest.so") in
+  let vt_lib = Filename.concat vt_dir (if macos then "libtesseratest.dylib" else "libtesseratest.so") in
   let built =
     Sys.command
       (String.concat " "
@@ -1268,9 +1268,9 @@ fn main(root: Root) {
   let add_path var = Unix.putenv var (vt_dir ^ match Sys.getenv_opt var with Some p when p <> "" -> ":" ^ p | _ -> "") in
   add_path "LIBRARY_PATH";
   if not macos then add_path "LD_LIBRARY_PATH";
-  (match Interp.Foreign.dl_open vt_lib with h, _ when h <> 0n -> Hashtbl.replace Interp.Foreign.libs "velatest" h | _ -> ());
-  let vt = { Interp.no_grants with foreign = [ "velatest" ] } in
-  let vtdecls = {|foreign "velatest" {
+  (match Interp.Foreign.dl_open vt_lib with h, _ when h <> 0n -> Hashtbl.replace Interp.Foreign.libs "tesseratest" h | _ -> ());
+  let vt = { Interp.no_grants with foreign = [ "tesseratest" ] } in
+  let vtdecls = {|foreign "tesseratest" {
     struct P2 { a: Int32, b: Int32 }
     struct T3 { a: Int32, b: Int32, c: Int32 }
     struct V2 { x: Float, y: Float }
@@ -1377,13 +1377,13 @@ fn main(root: Root) {
     "foreign \"c\" {\n    fn qsort(base: Handle, n: Int, size: Int, cmp: fn(Handle, Handle) -> Int32)\n}\n\nfn cmp(a: Handle, b: Handle) -> Int {\n    0\n}\n\nfn main(root: Root) {\n    let k = 1\n    let g = cmp\n    qsort(root.foreign, Handle { addr: 0 }, 0, 1, |a, b| k)\n    qsort(root.foreign, Handle { addr: 0 }, 0, 1, g)\n}\n"
     [ "E0332"; "E0332" ];
   (* the child sees PATH and only the variables the Env grant names *)
-  let env_src = main_wrap {|    match root.exec.run("sh", ["-c", "echo $\{HOME:+home\} $\{PATH:+path\} $\{VELA_SECRET_TEST:-none\}"]) {
+  let env_src = main_wrap {|    match root.exec.run("sh", ["-c", "echo $\{HOME:+home\} $\{PATH:+path\} $\{TESSERA_SECRET_TEST:-none\}"]) {
         Ok(r) => out.write(r.stdout),
         Err(e) => out.print("{e}"),
     }|} in
-  Unix.putenv "VELA_SECRET_TEST" "s3cret";
+  Unix.putenv "TESSERA_SECRET_TEST" "s3cret";
   out "exec-env-filtered" ~grants:sh env_src "path none\n";
-  out "exec-env-granted" ~grants:{ sh with env = [ "HOME"; "VELA_SECRET_TEST" ] } env_src "home path s3cret\n";
+  out "exec-env-granted" ~grants:{ sh with env = [ "HOME"; "TESSERA_SECRET_TEST" ] } env_src "home path s3cret\n";
   errs "exec-ambient" "fn main(root: Root) { system(\"ls\") }" [ "E0302" ];
 
   (* ---------- capabilities at runtime ---------- *)
@@ -1504,7 +1504,7 @@ fn main(root: Root) -> Result[(), IoError] {
   let http_grants = { Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] } in
   out "net-get-http" ~grants:http_grants http_src http_want;
   check_tsan "net-get-http" ~grants:http_grants http_src http_want;
-  let dir = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "vela-test-%d" (Unix.getpid ())) in
+  let dir = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "tessera-test-%d" (Unix.getpid ())) in
   (try Unix.mkdir dir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
   (try Unix.mkdir (Filename.concat dir "sub") 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
   Out_channel.with_open_bin (Filename.concat dir "a.txt") (fun oc -> output_string oc "alpha");
@@ -1616,7 +1616,7 @@ fn main(root: Root) -> Result[(), IoError] {
   let j = Diag.list_to_json ds in
   ok "json-shape" (String.starts_with ~prefix:"{\"diagnostics\":[{\"code\":\"E0302\"" j) j;
 
-  (* ---------- vela test ---------- *)
+  (* ---------- tessera test ---------- *)
   let test_src =
     {|fn add(a: Int, b: Int) -> Int { a + b }
 
@@ -1647,18 +1647,18 @@ test "channels" {
 }
 |}
   in
-  let items, ds, _ = compile "vela-test" test_src in
-  ok "vela-test-checks" (ds = []) (String.concat "," (codes ds));
+  let items, ds, _ = compile "tessera-test" test_src in
+  ok "tessera-test-checks" (ds = []) (String.concat "," (codes ds));
   let want =
     [ ("adds", None); ("fails on a list", Some "assertion failed: [\"a\", \"b\"] != [\"a\", \"b\", \"c\"]");
       ("panics are failures", Some "index 5 is out of range for a list of length 1"); ("channels", None) ]
   in
   let got = List.map (fun (n, r) -> (n, match r with Ok () -> None | Error (m, _) -> Some m)) (Interp.run_tests ~out:ignore items) in
-  ok "vela-test-interp" (got = want) (String.concat "; " (List.map (fun (n, m) -> n ^ "=" ^ Option.value ~default:"ok" m) got));
+  ok "tessera-test-interp" (got = want) (String.concat "; " (List.map (fun (n, m) -> n ^ "=" ^ Option.value ~default:"ok" m) got));
   if native_enabled then begin
-    let exe = Filename.concat tmpdir "vela-test-native" in
+    let exe = Filename.concat tmpdir "tessera-test-native" in
     match Native.build ~flags:sanitize ~tests:true items exe with
-    | Error m -> ok "vela-test-native" false m
+    | Error m -> ok "tessera-test-native" false m
     | Ok () ->
       let got =
         List.mapi
@@ -1669,9 +1669,9 @@ test "channels" {
             (n, if code = 0 then None else Some (if String.starts_with ~prefix:"panic: " first then String.sub first 7 (String.length first - 7) else first)))
           want
       in
-      ok "vela-test-native" (got = want) (String.concat "; " (List.map (fun (n, m) -> n ^ "=" ^ Option.value ~default:"ok" m) got))
+      ok "tessera-test-native" (got = want) (String.concat "; " (List.map (fun (n, m) -> n ^ "=" ^ Option.value ~default:"ok" m) got))
   end;
-  errs "vela-test-duplicate" "test \"a\" {}\ntest \"a\" {}" [ "E0106" ];
+  errs "tessera-test-duplicate" "test \"a\" {}\ntest \"a\" {}" [ "E0106" ];
 
   (* tests can ask for a fresh directory as `fs: Fs` and the real clock *)
   let cap_tests = {|fn save(fs: Fs, name: Str, n: Int) -> Result[(), IoError] {
@@ -1702,23 +1702,23 @@ test "fails with a dir" (fs: Fs) {
     assert_eq(fs.list(""), Ok([]))
 }
 |} in
-  let items, ds, _ = compile "vela-test-caps" cap_tests in
-  ok "vela-test-caps-checks" (ds = []) (String.concat "," (codes ds));
+  let items, ds, _ = compile "tessera-test-caps" cap_tests in
+  ok "tessera-test-caps-checks" (ds = []) (String.concat "," (codes ds));
   let want =
     [ ("saves a file", None); ("each test starts empty", None); ("clock only", None);
       ("fails with a dir", Some "assertion failed: Ok([\"x\"]) != Ok([])") ]
   in
   let test_dirs () =
-    List.filter (String.starts_with ~prefix:"vela-test-") (Array.to_list (Sys.readdir (Filename.get_temp_dir_name ())))
+    List.filter (String.starts_with ~prefix:"tessera-test-") (Array.to_list (Sys.readdir (Filename.get_temp_dir_name ())))
   in
   let before = test_dirs () in
   let got = List.map (fun (n, r) -> (n, match r with Ok () -> None | Error (m, _) -> Some m)) (Interp.run_tests ~out:ignore items) in
-  ok "vela-test-caps-interp" (got = want) (String.concat "; " (List.map (fun (n, m) -> n ^ "=" ^ Option.value ~default:"ok" m) got));
-  ok "vela-test-caps-cleanup" (List.for_all (fun d -> List.mem d before) (test_dirs ())) "test directories left behind";
-  if native_for "vela-test-caps" then begin
-    let exe = Filename.concat tmpdir "vela-test-caps" in
+  ok "tessera-test-caps-interp" (got = want) (String.concat "; " (List.map (fun (n, m) -> n ^ "=" ^ Option.value ~default:"ok" m) got));
+  ok "tessera-test-caps-cleanup" (List.for_all (fun d -> List.mem d before) (test_dirs ())) "test directories left behind";
+  if native_for "tessera-test-caps" then begin
+    let exe = Filename.concat tmpdir "tessera-test-caps" in
     match Native.build ~flags:sanitize ~tests:true items exe with
-    | Error m -> ok "vela-test-caps-native" false m
+    | Error m -> ok "tessera-test-caps-native" false m
     | Ok () ->
       List.iteri
         (fun i (n, w) ->
@@ -1726,16 +1726,16 @@ test "fails with a dir" (fs: Fs) {
           let e = exe ^ ".err" in
           let code =
             Sys.command
-              (sprintf "ASAN_OPTIONS=detect_leaks=0 VELA_LEAKCHECK=1 %s %d --grant fs=%s 2>%s" (Filename.quote exe) i (Filename.quote dir) (Filename.quote e))
+              (sprintf "ASAN_OPTIONS=detect_leaks=0 TESSERA_LEAKCHECK=1 %s %d --grant fs=%s 2>%s" (Filename.quote exe) i (Filename.quote dir) (Filename.quote e))
           in
           Caps.remove_tree dir;
           let err = read_file e in
           match w with
-          | None -> ok ("vela-test-caps-native/" ^ n) (code = 0 && err = "vela-leakcheck: 0 live\n") (sprintf "exit %d, stderr %S" code err)
-          | Some m -> ok ("vela-test-caps-native/" ^ n) (code <> 0 && String.starts_with ~prefix:("panic: " ^ m) err) (sprintf "exit %d, stderr %S" code err))
+          | None -> ok ("tessera-test-caps-native/" ^ n) (code = 0 && err = "tessera-leakcheck: 0 live\n") (sprintf "exit %d, stderr %S" code err)
+          | Some m -> ok ("tessera-test-caps-native/" ^ n) (code <> 0 && String.starts_with ~prefix:("panic: " ^ m) err) (sprintf "exit %d, stderr %S" code err))
         want
   end;
-  errs "vela-test-bad-cap" "test \"x\" (n: Net) {}\ntest \"y\" (a: Fs, b: Fs) {}\ntest \"z\" (c: Clock, d: Int) {}" [ "E0306"; "E0306"; "E0306" ];
+  errs "tessera-test-bad-cap" "test \"x\" (n: Net) {}\ntest \"y\" (a: Fs, b: Fs) {}\ntest \"z\" (c: Clock, d: Int) {}" [ "E0306"; "E0306"; "E0306" ];
 
   (* virtual time: `clock: virtual Clock` starts at 2026-01-01T00:00:00Z and
      jumps to the next timer whenever every task is waiting, the same in both
@@ -1918,8 +1918,8 @@ test "the real clock" (clock: Clock) {
     assert(clock.now_ms() != 1767225600000)
 }
 |} in
-  let items, ds, _ = compile "vela-virtual-time" virtual_src in
-  ok "vela-virtual-time-checks" (ds = []) (String.concat "," (codes ds));
+  let items, ds, _ = compile "tessera-virtual-time" virtual_src in
+  ok "tessera-virtual-time-checks" (ds = []) (String.concat "," (codes ds));
   let deadlock = "all tasks are blocked (deadlock)" in
   let want =
     [ ("an hour at once", None); ("the message comes first", None); ("the timeout comes first", None);
@@ -1931,12 +1931,12 @@ test "the real clock" (clock: Clock) {
   let t0 = Unix.gettimeofday () in
   let got = List.map (fun (n, r) -> (n, match r with Ok () -> None | Error (m, _) -> Some m)) (Interp.run_tests ~out:ignore items) in
   let secs = Unix.gettimeofday () -. t0 in
-  ok "vela-virtual-time-interp" (got = want) (show got);
-  ok "vela-virtual-time-interp-fast" (secs < 10.) (sprintf "took %.1f s" secs);
+  ok "tessera-virtual-time-interp" (got = want) (show got);
+  ok "tessera-virtual-time-interp-fast" (secs < 10.) (sprintf "took %.1f s" secs);
   (* natively, each test in its own process (a watchdog stops one that would
      wait in real time), under AddressSanitizer and ThreadSanitizer *)
   let native_virtual suffix flags env =
-    let name = "vela-virtual-time" ^ suffix in
+    let name = "tessera-virtual-time" ^ suffix in
     if native_for name && selected name then begin
       let exe = exe_path name in
       let dir = Caps.test_dir () in
@@ -1958,21 +1958,21 @@ test "the real clock" (clock: Clock) {
               let code = int_of_string (String.trim (read_file (sprintf "%s.%d.code" exe i))) in
               let err = read_file (sprintf "%s.%d.err" exe i) in
               match w with
-              | None -> ok (name ^ "/" ^ n) (code = 0 && err = "vela-leakcheck: 0 live\n") (sprintf "exit %d, stderr %S" code err)
+              | None -> ok (name ^ "/" ^ n) (code = 0 && err = "tessera-leakcheck: 0 live\n") (sprintf "exit %d, stderr %S" code err)
               | Some m -> ok (name ^ "/" ^ n) (code <> 0 && String.starts_with ~prefix:("panic: " ^ m) err) (sprintf "exit %d, stderr %S" code err))
             want;
           let secs = int_of_string (String.trim (read_file (exe ^ ".secs"))) in
           ok (name ^ "-fast") (secs < 60) (sprintf "took %d s" secs))
     end
   in
-  native_virtual "" sanitize "ASAN_OPTIONS=detect_leaks=0 VELA_LEAKCHECK=1 ";
-  native_virtual "-tsan" tsan "TSAN_OPTIONS=halt_on_error=1 VELA_THREADS=8 VELA_LEAKCHECK=1 ";
-  errs "vela-virtual-bench" "bench \"b\" (clock: virtual Clock) {\n    clock.sleep(1)\n}" [ "E0306" ];
-  errs "vela-virtual-not-clock" "test \"t\" (fs: virtual Fs) {\n    assert(true)\n}" [ "E0003" ];
-  errs "vela-virtual-twice" "test \"t\" (a: virtual Clock, b: Clock) {\n    assert(true)\n}" [ "E0306" ];
+  native_virtual "" sanitize "ASAN_OPTIONS=detect_leaks=0 TESSERA_LEAKCHECK=1 ";
+  native_virtual "-tsan" tsan "TSAN_OPTIONS=halt_on_error=1 TESSERA_THREADS=8 TESSERA_LEAKCHECK=1 ";
+  errs "tessera-virtual-bench" "bench \"b\" (clock: virtual Clock) {\n    clock.sleep(1)\n}" [ "E0306" ];
+  errs "tessera-virtual-not-clock" "test \"t\" (fs: virtual Fs) {\n    assert(true)\n}" [ "E0003" ];
+  errs "tessera-virtual-twice" "test \"t\" (a: virtual Clock, b: Clock) {\n    assert(true)\n}" [ "E0306" ];
 
   (* table tests: one isolated run per case, named by the case's text;
-     benches: skipped by tests, run natively by `vela test --bench` *)
+     benches: skipped by tests, run natively by `tessera test --bench` *)
   let table_src = {|fn add(a: Int, b: Int) -> Int {
     a + b
 }
@@ -2009,27 +2009,27 @@ bench "boom" {
     [1][3]
 }
 |} in
-  let items, ds, _ = compile "vela-table-tests" table_src in
-  ok "vela-table-checks" (ds = []) (String.concat "," (codes ds));
+  let items, ds, _ = compile "tessera-table-tests" table_src in
+  ok "tessera-table-checks" (ds = []) (String.concat "," (codes ds));
   let want =
     [ ("add (1, 2, 3)", None); ("add (2, 2, 4)", None); ("add (2, 2, 5)", Some "assertion failed: 4 != 5"); ("one name \"a\"", None);
       ("one name \"bb\"", None); ("with a dir (\"a.txt\", (\"x\", 1))", None); ("with a dir (\"b.txt\", (\"y\", 2))", None) ]
   in
   let got = List.map (fun (n, r) -> (n, match r with Ok () -> None | Error (m, _) -> Some m)) (Interp.run_tests ~out:ignore items) in
-  ok "vela-table-interp" (got = want) (String.concat "; " (List.map (fun (n, m) -> n ^ "=" ^ Option.value ~default:"ok" m) got));
+  ok "tessera-table-interp" (got = want) (String.concat "; " (List.map (fun (n, m) -> n ^ "=" ^ Option.value ~default:"ok" m) got));
   let only = List.map (fun (n, _, _) -> n) (Interp.run_tests_timed ~select:(fun n -> String.starts_with ~prefix:"one" n) ~out:ignore items) in
-  ok "vela-table-select" (only = [ "one name \"a\""; "one name \"bb\"" ]) (String.concat "; " only);
-  if native_for "vela-table" then begin
-    let exe = Filename.concat tmpdir "vela-table-tests" in
+  ok "tessera-table-select" (only = [ "one name \"a\""; "one name \"bb\"" ]) (String.concat "; " only);
+  if native_for "tessera-table" then begin
+    let exe = Filename.concat tmpdir "tessera-table-tests" in
     match Native.build ~flags:sanitize ~tests:true items exe with
-    | Error m -> ok "vela-table-native" false m
+    | Error m -> ok "tessera-table-native" false m
     | Ok () ->
       let run args fs =
         let dir = if fs then Some (Caps.test_dir ()) else None in
         let e = exe ^ ".err" in
         let grant = match dir with Some d -> sprintf " --grant fs=%s" (Filename.quote d) | None -> "" in
         let code =
-          Sys.command (sprintf "ASAN_OPTIONS=detect_leaks=0 VELA_LEAKCHECK=1 %s %s%s >/dev/null 2>%s" (Filename.quote exe) args grant (Filename.quote e))
+          Sys.command (sprintf "ASAN_OPTIONS=detect_leaks=0 TESSERA_LEAKCHECK=1 %s %s%s >/dev/null 2>%s" (Filename.quote exe) args grant (Filename.quote e))
         in
         Option.iter Caps.remove_tree dir;
         (code, read_file e)
@@ -2038,44 +2038,44 @@ bench "boom" {
         (fun i (n, w) ->
           let code, err = run (string_of_int i) (i >= 5) in
           match w with
-          | None -> ok ("vela-table-native/" ^ n) (code = 0 && err = "vela-leakcheck: 0 live\n") (sprintf "exit %d, stderr %S" code err)
-          | Some m -> ok ("vela-table-native/" ^ n) (code <> 0 && String.starts_with ~prefix:("panic: " ^ m) err) (sprintf "exit %d, stderr %S" code err))
+          | None -> ok ("tessera-table-native/" ^ n) (code = 0 && err = "tessera-leakcheck: 0 live\n") (sprintf "exit %d, stderr %S" code err)
+          | Some m -> ok ("tessera-table-native/" ^ n) (code <> 0 && String.starts_with ~prefix:("panic: " ^ m) err) (sprintf "exit %d, stderr %S" code err))
         want;
       (* `bench N NS ITERS`: a fixed count reports it, its time and allocations *)
       let report err = match String.split_on_char ' ' (List.hd (String.split_on_char '\n' err)) with
-        | [ "vela-bench:"; n; ns; al ] -> Some (int_of_string n, int_of_string ns, int_of_string al)
+        | [ "tessera-bench:"; n; ns; al ] -> Some (int_of_string n, int_of_string ns, int_of_string al)
         | _ -> None
       in
       let code, err = run "bench 0 0 7" false in
-      ok "vela-bench-native/sum"
-        (code = 0 && (match report err with Some (7, ns, 0) -> ns >= 0 | _ -> false) && String.ends_with ~suffix:"\nvela-leakcheck: 0 live\n" err)
+      ok "tessera-bench-native/sum"
+        (code = 0 && (match report err with Some (7, ns, 0) -> ns >= 0 | _ -> false) && String.ends_with ~suffix:"\ntessera-leakcheck: 0 live\n" err)
         (sprintf "exit %d, stderr %S" code err);
       let code, err = run "bench 1 0 5" true in
-      ok "vela-bench-native/strings"
-        (code = 0 && (match report err with Some (5, _, al) -> al >= 10 | _ -> false) && String.ends_with ~suffix:"\nvela-leakcheck: 0 live\n" err)
+      ok "tessera-bench-native/strings"
+        (code = 0 && (match report err with Some (5, _, al) -> al >= 10 | _ -> false) && String.ends_with ~suffix:"\ntessera-leakcheck: 0 live\n" err)
         (sprintf "exit %d, stderr %S" code err);
       (* a time budget: the count grows until a round fills it *)
       let code, err = run "bench 0 20000000 0" false in
-      ok "vela-bench-native/scaled" (code = 0 && match report err with Some (n, ns, _) -> n > 1000 && ns >= 20000000 | None -> false) (sprintf "exit %d, stderr %S" code err);
+      ok "tessera-bench-native/scaled" (code = 0 && match report err with Some (n, ns, _) -> n > 1000 && ns >= 20000000 | None -> false) (sprintf "exit %d, stderr %S" code err);
       let code, err = run "bench 2 0 3" false in
-      ok "vela-bench-native/boom" (code <> 0 && String.starts_with ~prefix:"panic: index 3 is out of range" err) (sprintf "exit %d, stderr %S" code err)
+      ok "tessera-bench-native/boom" (code <> 0 && String.starts_with ~prefix:"panic: index 3 is out of range" err) (sprintf "exit %d, stderr %S" code err)
   end;
-  errs "vela-table-not-literal" "fn cases() -> List[Int] { [1] }\ntest \"t\" for x in cases() {}" [ "E0003" ];
-  errs "vela-table-empty" "test \"t\" for x in [] {}" [ "E0003" ];
-  errs "vela-table-refutable" "test \"t\" for Some(x) in [Some(1)] {}" [ "E0003" ];
-  errs "vela-table-duplicate-case" "test \"t\" for x in [1, 2, 1] {\n    assert(x > 0)\n}" [ "E0106" ];
+  errs "tessera-table-not-literal" "fn cases() -> List[Int] { [1] }\ntest \"t\" for x in cases() {}" [ "E0003" ];
+  errs "tessera-table-empty" "test \"t\" for x in [] {}" [ "E0003" ];
+  errs "tessera-table-refutable" "test \"t\" for Some(x) in [Some(1)] {}" [ "E0003" ];
+  errs "tessera-table-duplicate-case" "test \"t\" for x in [1, 2, 1] {\n    assert(x > 0)\n}" [ "E0106" ];
   (* the body is checked once per case, and each problem is reported once *)
-  errs "vela-table-error-once" "test \"t\" for (a, b) in [(1, 2), (3, 4), (5, 6)] {\n    let s: Str = a\n}" [ "E0201" ];
-  errs "vela-table-case-types" "test \"t\" for (a, b) in [(1, 2), (\"x\", 4)] {\n    assert(a + 1 > b)\n}" [ "E0201"; "E0201" ];
-  errs "vela-bench-duplicate" "bench \"a\" {}\nbench \"a\" {}\ntest \"a\" {}" [ "E0106" ];
-  errs "vela-bench-bad-cap" "bench \"x\" (n: Net) {}" [ "E0306" ];
+  errs "tessera-table-error-once" "test \"t\" for (a, b) in [(1, 2), (3, 4), (5, 6)] {\n    let s: Str = a\n}" [ "E0201" ];
+  errs "tessera-table-case-types" "test \"t\" for (a, b) in [(1, 2), (\"x\", 4)] {\n    assert(a + 1 > b)\n}" [ "E0201"; "E0201" ];
+  errs "tessera-bench-duplicate" "bench \"a\" {}\nbench \"a\" {}\ntest \"a\" {}" [ "E0106" ];
+  errs "tessera-bench-bad-cap" "bench \"x\" (n: Net) {}" [ "E0306" ];
   errs "keep-arity" "fn main() {\n    keep(1, 2)\n}" [ "E0107" ];
-  (* the `vela test` command: --run, --json, --bench *)
+  (* the `tessera test` command: --run, --json, --bench *)
   let cli_exe =
     let e = Filename.concat (Filename.dirname (Filename.dirname Sys.executable_name)) "bin/main.exe" in
     if Filename.is_relative e then Filename.concat (Sys.getcwd ()) e else e
   in
-  let table_file = Filename.concat tmpdir "table-tests.vela" in
+  let table_file = Filename.concat tmpdir "table-tests.tsr" in
   Out_channel.with_open_bin table_file (fun oc -> output_string oc table_src);
   let cli args =
     let o = table_file ^ ".out" and e = table_file ^ ".err" in
@@ -2123,13 +2123,13 @@ bench "boom" {
     ok "cli-test-bench-fail" (code = 1 && Json.member "ok" b = Json.Bool false && String.starts_with ~prefix:"index 3" (Json.to_str (Json.member "message" b))) o
   end;
   let code, _, e = cli [ "test"; table_file; "--bench-time"; "fast" ] in
-  ok "cli-test-bench-time-bad" (code = 2 && String.starts_with ~prefix:"vela: --bench-time" e) e;
+  ok "cli-test-bench-time-bad" (code = 2 && String.starts_with ~prefix:"tessera: --bench-time" e) e;
   out "keep" "fn main(root: Root) {\n    keep(1 + 2)\n    keep(\"s\" + \"t\")\n    keep([1, 2])\n    root.stdout.print(\"kept\")\n}" "kept\n";
 
   (* ---------- language server ---------- *)
   let module J = Json in
   let st = Lsp.create () in
-  let uri = "file:///tmp/lsp-test.vela" in
+  let uri = "file:///tmp/lsp-test.tsr" in
   let doc =
     {|struct Point { x: Int, y: Int }
 
@@ -2177,11 +2177,11 @@ fn main(root: Root) {
   let hover text needle ?nth k =
     J.to_str (J.path (result (Lsp.handle st (req "textDocument/hover" (tdp text needle ?nth k)))) [ "contents"; "value" ])
   in
-  ok "lsp-hover-let" (hover doc "total = " 0 = "```vela\nlet total: Int\n```") (hover doc "total = " 0);
+  ok "lsp-hover-let" (hover doc "total = " 0 = "```tessera\nlet total: Int\n```") (hover doc "total = " 0);
   (* a call shows the function's declaration (and its doc comment, if any) *)
-  ok "lsp-hover-call" (hover doc "dist(pt)" 0 = "```vela\nfn dist(p: Point) -> Int\n```") (hover doc "dist(pt)" 0);
-  ok "lsp-hover-method" (hover doc "print(\"{" 0 = "```vela\nprint(Str) -> ()\n```") (hover doc "print(\"{" 0);
-  ok "lsp-hover-fn" (hover doc "dist(p" 0 = "```vela\nfn dist(p: Point) -> Int\n```") (hover doc "dist(p" 0);
+  ok "lsp-hover-call" (hover doc "dist(pt)" 0 = "```tessera\nfn dist(p: Point) -> Int\n```") (hover doc "dist(pt)" 0);
+  ok "lsp-hover-method" (hover doc "print(\"{" 0 = "```tessera\nprint(Str) -> ()\n```") (hover doc "print(\"{" 0);
+  ok "lsp-hover-fn" (hover doc "dist(p" 0 = "```tessera\nfn dist(p: Point) -> Int\n```") (hover doc "dist(p" 0);
   let def text needle ?nth k =
     match result (Lsp.handle st (req "textDocument/definition" (tdp text needle ?nth k))) with
     | J.Null -> None
@@ -2263,19 +2263,19 @@ fn main(root: Root) {
 
   (* ---------- the standard library ---------- *)
   let example f =
-    let dir = if Sys.file_exists "../examples/stdlib.vela" then "../examples" else "examples" in
+    let dir = if Sys.file_exists "../examples/stdlib.tsr" then "../examples" else "examples" in
     In_channel.with_open_bin (Filename.concat dir f) In_channel.input_all
   in
-  out "std-json-list-text" (example "stdlib.vela") "{\"name\":\"Ada\",\"tags\":[\"x\",\"yé😀\"],\"n\":-125,\"ok\":true,\"none\":null,\"nested\":{\"a\":[1,2,{}]}}\nAda\n-125.0\nexpected a value at byte 3\nexpected `:` at byte 5\nexpected a value at byte 0\nexpected a closing `\"` at byte 4\nexpected end of input at byte 4\nexpected a value at byte 0\n{\"q\":\"a\\\"b\\n\\u0001\",\"xs\":[1,null,false]}\na,b,c\n[0, 1, 2, 3, 4] 2 [1, 3] [1, 2, 3] [1, 2]\n007|ab..|---|2|[\"hi\", \"there\", \"you\"]\n";
+  out "std-json-list-text" (example "stdlib.tsr") "{\"name\":\"Ada\",\"tags\":[\"x\",\"yé😀\"],\"n\":-125,\"ok\":true,\"none\":null,\"nested\":{\"a\":[1,2,{}]}}\nAda\n-125.0\nexpected a value at byte 3\nexpected `:` at byte 5\nexpected a value at byte 0\nexpected a closing `\"` at byte 4\nexpected end of input at byte 4\nexpected a value at byte 0\n{\"q\":\"a\\\"b\\n\\u0001\",\"xs\":[1,null,false]}\na,b,c\n[0, 1, 2, 3, 4] 2 [1, 3] [1, 2, 3] [1, 2]\n007|ab..|---|2|[\"hi\", \"there\", \"you\"]\n";
   (* embed: files read at compile time become literals, in both backends; the
      program needs no Fs. Text keeps braces and quotes as they are; bytes keep
      NUL and 0xff. *)
-  (let dir = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "vela-mods-%d-%s" (Unix.getpid ()) "embed-text-bytes") in
+  (let dir = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "tessera-mods-%d-%s" (Unix.getpid ()) "embed-text-bytes") in
    (try Unix.mkdir dir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
    (try Unix.mkdir (Filename.concat dir "site") 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
    Out_channel.with_open_bin (Filename.concat dir "site/page.html") (fun oc -> output_string oc "<p class=\"x\">{not interpolated} \\ é</p>\n");
    Out_channel.with_open_bin (Filename.concat dir "logo.bin") (fun oc -> output_string oc "\000\255A");
-   let ddir = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "vela-mods-%d-%s" (Unix.getpid ()) "embed-dir") in
+   let ddir = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "tessera-mods-%d-%s" (Unix.getpid ()) "embed-dir") in
    List.iter (fun d -> try Unix.mkdir (Filename.concat ddir d) 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ()) [ ""; "site"; "site/css"; "site/.git" ];
    List.iter (fun (f, t) -> Out_channel.with_open_bin (Filename.concat ddir f) (fun oc -> output_string oc t))
      [ ("site/page.html", "<p>x</p>"); ("site/css/a.css", "b{}"); ("site/.git/HEAD", "hidden"); ("site/.env", "hidden") ];
@@ -2406,9 +2406,9 @@ fn main(root: Root) -> Result[(), IoError] {
     "/lines: [a]\n/lines: [b]\n/lines: [c]\n/lines: [d]\n/lines -> 200 []\n/sized: [one]\n/sized: [two]\n/sized -> 200 []\n/missing -> 404 [nope]\ntick 0\ntick 1\ntick 2\nstopped: Ok(200)\n";
   out "std-http"
     ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] }
-    (example "http_demo.vela")
+    (example "http_demo.tsr")
     "served 4\n200 text/plain; charset=utf-8 hi GET\n500 text/plain; charset=utf-8 internal error\n404 text/plain; charset=utf-8 no /missing\n201 {\"got\":[1,{\"a\":true}]}\nchunked sent\n200 hello world\n";
-  out "example-ffi" ~grants:{ Interp.no_grants with foreign = [ "c" ] } (example "ffi.vela")
+  out "example-ffi" ~grants:{ Interp.no_grants with foreign = [ "c" ] } (example "ffi.tsr")
     "3.25 kg: 3.25, then [ kg]\n-1e3: -1000.0, then []\n0x1p4!: 16.0, then [!]\nabc: not a number\n: not a number\n";
   (* ---------- sql: SQLite, trusted by the standard library ---------- *)
   let sqlg = Interp.no_grants in
@@ -2460,8 +2460,8 @@ fn main(root: Root) {
             out.print("{db.query("SELECT ?", [sql.Int(1), sql.Int(2)])}")
             out.print("{db.exec("INSERT INTO t (name) VALUES (?); DELETE FROM t", [sql.Text("b")])}")
             out.print("{db.exec("  ", [sql.Int(1)])}")
-            out.print("{db.exec("ATTACH DATABASE '/tmp/vela-sql-attach.db' AS other", [])}")
-            out.print("{db.exec("VACUUM INTO '/tmp/vela-sql-vacuum.db'", [])}")
+            out.print("{db.exec("ATTACH DATABASE '/tmp/tessera-sql-attach.db' AS other", [])}")
+            out.print("{db.exec("VACUUM INTO '/tmp/tessera-sql-vacuum.db'", [])}")
             match db.query("SELECT name FROM t", []) {
                 Ok(rows) => {
                     out.print("{rows}")
@@ -2518,7 +2518,7 @@ fn main(root: Root) -> Result[(), IoError] {
   out "sql-transaction" ~grants:sqlg sql_tx
     "Ok(\"committed\") 2\nErr(Failed(\"sql: exec: NOT NULL constraint failed: t.x\")) 2\nErr(\"boom\") 2\nErr(Failed(\"sql: a transaction is already open on this connection\")) 2\n";
   (* a file under the Fs grant; read-only when the Fs is *)
-  let sqldir = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "vela-sql-%d" (Unix.getpid ())) in
+  let sqldir = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "tessera-sql-%d" (Unix.getpid ())) in
   (try Unix.mkdir sqldir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
   let sqlreal = Unix.realpath sqldir in
   let sql_file = {v|use sql
@@ -2547,11 +2547,11 @@ fn main(root: Root) -> Result[(), IoError] {
   out "sql-file" ~grants:{ sqlg with fs = Some (sqlreal, false) } sql_file
     "true\nSome(\"saved\")\nErr(Failed(\"sql: exec: attempt to write a readonly database\"))\ntrue\nErr(Denied(\"fs: path escapes the granted directory\"))\nErr(Denied(\"fs: absolute paths are not allowed; paths are relative to the granted directory\"))\nErr(Failed(\"fs: directory of `no/such/dir.db` does not exist\"))\n";
   (* SQLite follows symlinked sidecar files: open refuses ones that leave the grant *)
-  let outside = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "vela-sql-outside-%d" (Unix.getpid ())) in
+  let outside = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "tessera-sql-outside-%d" (Unix.getpid ())) in
   Out_channel.with_open_bin outside (fun oc -> output_string oc "keep");
   Out_channel.with_open_bin (Filename.concat sqlreal "fine-target") (fun oc -> output_string oc "");
   List.iter (fun (link, target) -> (try Unix.unlink (Filename.concat sqlreal link) with Unix.Unix_error _ -> ()); Unix.symlink target (Filename.concat sqlreal link))
-    [ ("evil.db-journal", outside); ("broken.db-wal", "/vela-no-such-dir/x"); ("fine.db-shm", "fine-target") ];
+    [ ("evil.db-journal", outside); ("broken.db-wal", "/tessera-no-such-dir/x"); ("fine.db-shm", "fine-target") ];
   out "sql-sidecar-links" ~grants:{ sqlg with fs = Some (sqlreal, false) }
     "use sql\n\nfn main(root: Root) {\n    for name in [\"evil.db\", \"broken.db\"] {\n        root.stdout.print(\"{sql.open(root.fs, name).is_err()}\")\n    }\n    match sql.open(root.fs, \"evil.db\") {\n        Err(Denied(m)) => root.stdout.print(m.slice(0, 50)),\n        _ => root.stdout.print(\"opened\"),\n    }\n    match sql.open(root.fs, \"fine.db\") {\n        Ok(db) => root.stdout.print(\"{db.exec(\"CREATE TABLE IF NOT EXISTS t (x)\", [])} {db.close()}\"),\n        Err(e) => root.stdout.print(\"{e}\"),\n    }\n    let gone = root.fs.remove(\"fine.db\").is_ok()\n}\n"
     "true\ntrue\nsql: refusing to open `evil.db`: `evil.db-journal`\nOk(0) Ok(())\n";
@@ -2637,13 +2637,13 @@ fn main(root: Root) -> Result[(), IoError] {
   let sql_group_want = "[20, 20, 20, 20, 20, 20] Some(sql.Row { columns: [\"c\", \"s\"], values: [Int(120), Int(1140)] })\n" in
   out "sql-group" ~grants:sqlg sql_group sql_group_want;
   check_tsan "sql-group" ~grants:sqlg sql_group sql_group_want;
-  out "example-notes" (example "notes.vela")
+  out "example-notes" (example "notes.tsr")
     "1. The Left Hand of Darkness\n2. Robert'); DROP TABLE notes; --\n3. Paris, Texas ***\n3 notes\n";
   (* the CRUD example's demo calls every route over loopback; its own tests
      run further down, through the CLI *)
   out "example-todo-api"
     ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] }
-    (example "todo_api.vela")
+    (example "todo_api.tsr")
     "POST /todos -> 201 {\"id\":1,\"title\":\"buy milk\",\"done\":false}\nPOST /todos -> 201 {\"id\":2,\"title\":\"write the README\",\"done\":false}\nPOST /todos -> 400 {\"error\":\"a todo needs a title\"}\nGET /todos -> 200 [{\"id\":1,\"title\":\"buy milk\",\"done\":false},{\"id\":2,\"title\":\"write the README\",\"done\":false}]\nPATCH /todos/1 -> 200 {\"id\":1,\"title\":\"buy milk\",\"done\":true}\nGET /todos/1 -> 200 {\"id\":1,\"title\":\"buy milk\",\"done\":true}\nPATCH /todos/2 -> 400 {\"error\":\"title must be a string\"}\nDELETE /todos/2 -> 204\nDELETE /todos/2 -> 404 {\"error\":\"no todo 2\"}\nGET /todos -> 200 [{\"id\":1,\"title\":\"buy milk\",\"done\":true}]\nGET /users -> 404 {\"error\":\"no route for /users\"}\n";
   (* std code is checked like user code: a json error names the byte *)
   out "std-json-errors"
@@ -2693,7 +2693,7 @@ fn main(root: Root) {
 }
 |v}
     "2025-11-11T18:22:05.123Z\ntime.DateTime { year: 2025, month: 11, day: 11, hour: 18, minute: 22, second: 5, ms: 123, weekday: 2, yday: 315 }\n1970-01-01T00:00:00.000Z 1969-12-31T23:59:59.999Z 2000-02-29T00:00:00.000Z -000001-12-31T00:00:00.000Z +010000-01-01T00:00:00.000Z\ntime.DateTime { year: 1969, month: 12, day: 31, hour: 23, minute: 59, second: 59, ms: 999, weekday: 3, yday: 365 }\nTue 11 Nov 2025 06:22 PM, day 315, week day 2, 1762885325 +0000 UTC % %q 100%\n2025-11-11 12:52 -05:30 -0530 2025-11-11T19:22:05.123+01:00 2025-11-11\n2024-02-29T05:00:00.000Z 2023-01-15T00:00:00.000Z 2025-01-01T00:00:00.000Z 2024-02-29T00:00:00.000Z\n1794355200000 2026-11-11T00:00:00.000Z\n1794421325123 2026-11-11T18:22:05.123Z\n1794421325123 2026-11-11T18:22:05.123Z\n1794421320000 2026-11-11T18:22:00.000Z\n-1 1969-12-31T23:59:59.999Z\n1709146800000 2024-02-28T19:00:00.000Z\ntime: day 29 is out of range for 2023-02\ntime: month 13 is out of range\ntime: 24:00:00 is not a valid time\ntime: expected `:` at byte 13\ntime: expected digits at byte 20\ntime: expected `Z`, an offset or end of input at byte 16\ntime: expected a four-digit year at byte 0\ntime: expected end of input at byte 21\nfalse true 28 ? Sunday\ntrue 1767315600000\n";
-  out "std-report-example" (example "report.vela")
+  out "std-report-example" (example "report.tsr")
     "Mon 09 Nov caf\195\169        1,234.50\nTue 10 Nov books          98.12\nWed 11 Nov rent    1,500,000.00\n                   1,501,332.62\norder #000042, id 0xbeef\ndue 2026-12-01T08:30:00.000Z, week 2026-305\nprinted in true\n";
   out "std-regex"
     {v|use regex
@@ -2748,7 +2748,7 @@ fn main(root: Root) {
 }
 |v}
     "a+b on xaaab: aaab at 1..5 [Some(\"aaab\")]\n(\\d+)-(\\d+)? on tel 12- or 3-4: 12- at 4..7 [Some(\"12-\"), Some(\"12\"), None]\na|ab on ab: a at 0..1 [Some(\"a\")]\n(?i)hello on say HeLLo: HeLLo at 4..9 [Some(\"HeLLo\")]\nx* on abc:  at 0..0 [Some(\"\")]\n\195\169+. on a\195\169\195\169z: \195\169\195\169z at 1..6 [Some(\"\\195\\169\\195\\169z\")]\n[^a] on a\195\169: \195\169 at 1..3 [Some(\"\\195\\169\")]\n\\bfoo\\b on foobar foo: foo at 7..10 [Some(\"foo\")]\na{2,3}? on aaaa: aa at 0..2 [Some(\"aa\")]\n(a*)*b on aaab: aaab at 0..4 [Some(\"aaab\"), Some(\"aaa\")]\nregex: missing `]` at byte 0\nregex: unmatched `)`\nregex: unsupported group syntax (no lookaround or backreferences) at byte 0\nregex: a quantifier with nothing to repeat\ntrue false true\nSome(\"2026\") Some(\"11\") None None\n[\"1\", \"22\", \"333\"]\n[\"0:\", \"1:aaa\", \"5:\"]\nfrom 11/$y $1 to 01/$y $1\nf0o\nHI THERE\n[\"a\", \"b\", \"c\", \"\"] [\"a\", \"b\", \"c\"] [\"\"]\n1\\+1=2\\? \\(yes\\)\n[\"one\", \"two\"] 0\nfalse None\n";
-  out "std-logscan-example" (example "logscan.vela")
+  out "std-logscan-example" (example "logscan.tsr")
     "09:15:02 GET  /index.html 200     5,120\n09:15:09 GET  /missing    404         0\nskipped: not a log line\n09:01:44 POST /api/orders 201 1,048,576\ntotal 1,053,696 bytes\ndue 01/12/2026, paid 30/11/2026\n[\"a\", \"b\", \"c\", \"d\"]\n";
   panics "std-regex-must" "use regex\n\nfn main(root: Root) {\n    let r = regex.must(\"(a\")\n    root.stdout.print(r.pattern)\n}\n" "regex: missing `)`";
   out "std-http-keepalive-stream" ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] }
@@ -3227,20 +3227,20 @@ fn main(root: Root) -> Result[(), IoError] {
      check_tsan "tls-cut" ~grants tls_cut_src tls_cut_want;
      ignore (Unix.close_process_in ic));
   (* ---------- Rand, Env, args and the Fs additions ---------- *)
-  let box = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "vela-box-%d" (Unix.getpid ())) in
+  let box = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "tessera-box-%d" (Unix.getpid ())) in
   (try Unix.mkdir box 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
   let box = Unix.realpath box in
-  Unix.putenv "VELA_TEST_VISIBLE" "yes";
-  Unix.putenv "VELA_TEST_HIDDEN" "no";
+  Unix.putenv "TESSERA_TEST_VISIBLE" "yes";
+  Unix.putenv "TESSERA_TEST_HIDDEN" "no";
   out "caps-rand-env-args-fs"
-    ~grants:{ Interp.no_grants with seed = Some 42; env = [ "VELA_TEST_VISIBLE" ]; args = [ "one"; "two" ]; fs = Some (box, false) }
+    ~grants:{ Interp.no_grants with seed = Some 42; env = [ "TESSERA_TEST_VISIBLE" ]; args = [ "one"; "two" ]; fs = Some (box, false) }
     (String.concat "\n"
        [ "fn main(root: Root) -> Result[(), IoError] {";
          "    let out = root.stdout";
          "    let r = root.rand";
          "    let xs = [r.int(1, 7), r.int(1, 7), r.int(1, 7), r.int(-5, -4), r.int(0, 1000000)]";
          "    out.print(\"{xs} {r.float() < 1.0}\")";
-         "    out.print(\"{root.args()} {root.env.get(\"VELA_TEST_VISIBLE\")} {root.env.get(\"VELA_TEST_HIDDEN\")}\")";
+         "    out.print(\"{root.args()} {root.env.get(\"TESSERA_TEST_VISIBLE\")} {root.env.get(\"TESSERA_TEST_HIDDEN\")}\")";
          "    let fs = root.fs";
          "    fs.make_dir(\"d\")?";
          "    fs.write(\"d/a.txt\", \"a\")?";
@@ -3265,7 +3265,7 @@ fn main(root: Root) -> Result[(), IoError] {
   errs "ambient-random" (main_wrap "    let x = random(1, 2)") [ "E0302" ];
 
   (* ---------- methods ---------- *)
-  out "methods" (example "methods.vela") "8.0 12.0\ncircle at 8.0,12.0 with area 3.0\nrect with area 96.0\none 1 1\n10 25\n";
+  out "methods" (example "methods.tsr") "8.0 12.0\ncircle at 8.0,12.0 with area 3.0\nrect with area 96.0\none 1 1\n10 25\n";
   errs "method-on-capability" "fn twice(self: Clock) -> Int {\n    self.now_ms() * 2\n}\n\nfn main() {}\n" [ "E0110" ];
   errs "method-self-not-first" "struct P {\n    a: Int,\n}\n\nfn f(x: Int, self: P) -> Int {\n    x\n}\n\nfn main() {}\n" [ "E0110" ];
   errs "method-on-builtin-pub" "pub fn double(self: Int) -> Int {\n    self * 2\n}\n\nfn main() {}\n" [ "E0110" ];
@@ -3298,8 +3298,8 @@ fn main(root: Root) -> Result[(), IoError] {
   errs "methods-private" ~modules:[ ("geo", geo) ] "use geo\n\nfn main(root: Root) {\n    let v = geo.make(3).twice()\n}\n" [ "E0402" ];
 
   (* ---------- interfaces ---------- *)
-  out "interfaces" (example "interfaces.vela") "15.0 9.0\nsquare of area 4.0\nbox of area 1.0, box of area 1.0\n500 true\n";
-  out "generics-example" (example "generics.vela") "Some(\"Emma\") Some(3)\n2 Some(\"Dune\")\n0 None\n[1, 2, 5, 7]\n28 30\n";
+  out "interfaces" (example "interfaces.tsr") "15.0 9.0\nsquare of area 4.0\nbox of area 1.0, box of area 1.0\n500 true\n";
+  out "generics-example" (example "generics.tsr") "Some(\"Emma\") Some(3)\n2 Some(\"Dune\")\n0 None\n[1, 2, 5, 7]\n28 30\n";
   let shape = "interface Shape {\n    fn area(self) -> Float\n}\n\nstruct Blob {\n    n: Int,\n}\n\nfn area(self: Blob) -> Int {\n    self.n\n}\n\nfn total[T: Shape](xs: List[T]) -> Float {\n    xs.map(|s| s.area()).fold(0.0, |a, b| a + b)\n}\n\n" in
   errs "iface-wrong-signature" (shape ^ "fn main() {\n    let a = total([Blob { n: 1 }])\n}\n") [ "E0111" ];
   errs "iface-builtin-missing" (shape ^ "fn main() {\n    let a = total([1, 2])\n}\n") [ "E0111" ];
@@ -3482,7 +3482,7 @@ fn main(root: Root) -> Result[(), IoError] {
   errs "trailing-after-labels-fills-last" (trail "    let n = apply(times: 1, n: 2) { |v| v }\n    let m = apply(times: 1, |v| v, n: 2)") [ "E0122" ];
   (* fmt keeps the form written; empty parentheses before a trailing closure go *)
   let fmt_case_early name src want =
-    let got = try Fmt.format ~file:(name ^ ".vela") src with Diag.Fatal d -> "error: " ^ d.message in
+    let got = try Fmt.format ~file:(name ^ ".tsr") src with Diag.Fatal d -> "error: " ^ d.message in
     ok name (got = want) (sprintf "got:\n%s\nwant:\n%s" got want);
     check_fmt name src ()
   in
@@ -3501,8 +3501,8 @@ fn main(root: Root) -> Result[(), IoError] {
   out "defer-heap-panic" "struct Log {\n    lines: List[Str],\n}\n\nfn work(out: Stdout, n: Int) -> Int {\n    let mut name = \"start\"\n    let mut xs = [\"a\"]\n    let mut log = Log { lines: [] }\n    defer {\n        out.print(\"work {n}: {name} {xs} {log.lines.len()}\")\n        defer out.print(\"work {n}: inner defer\")\n    }\n    name = \"renamed {n}\"\n    xs.push(\"b\")\n    log.lines.push(\"one\")\n    let tmp = \"temp {n}\"\n    if n % 2 == 0 {\n        panic(\"even {tmp}\")\n    }\n    xs = [\"c\", \"d\", \"e\"]\n    name.len() + xs.len()\n}\n\nfn task(out: Stdout, i: Int) -> Int {\n    defer out.print(\"task done\")\n    let mut total = 0\n    for k in 0..<1000 {\n        defer total = total + 1\n        if k == 500 && i == 3 {\n            panic(\"task {i} failed\")\n        }\n    }\n    total\n}\n\nfn main(root: Root) {\n    let out = root.stdout\n    let mut i = 0\n    while i < 30 {\n        let r = catch(|| work(out, i))\n        if i < 4 {\n            out.print(\"{r}\")\n        }\n        i = i + 1\n    }\n    let f = |x: Int| {\n        defer out.print(\"closure {x}\")\n        x * 3\n    }\n    out.print(\"{f(4)}\")\n    let rs = catch(|| group g {\n        for i in 0..<4 {\n            g.go(|| task(out, i))\n        }\n    })\n    out.print(\"{rs}\")\n    defer out.print(\"main: deferred before the uncaught panic\")\n}\n" "work 0: renamed 0 [\"a\", \"b\"] 1\nwork 0: inner defer\nErr(\"even temp 0\")\nwork 1: renamed 1 [\"c\", \"d\", \"e\"] 1\nwork 1: inner defer\nOk(12)\nwork 2: renamed 2 [\"a\", \"b\"] 1\nwork 2: inner defer\nErr(\"even temp 2\")\nwork 3: renamed 3 [\"c\", \"d\", \"e\"] 1\nwork 3: inner defer\nOk(12)\nwork 4: renamed 4 [\"a\", \"b\"] 1\nwork 4: inner defer\nwork 5: renamed 5 [\"c\", \"d\", \"e\"] 1\nwork 5: inner defer\nwork 6: renamed 6 [\"a\", \"b\"] 1\nwork 6: inner defer\nwork 7: renamed 7 [\"c\", \"d\", \"e\"] 1\nwork 7: inner defer\nwork 8: renamed 8 [\"a\", \"b\"] 1\nwork 8: inner defer\nwork 9: renamed 9 [\"c\", \"d\", \"e\"] 1\nwork 9: inner defer\nwork 10: renamed 10 [\"a\", \"b\"] 1\nwork 10: inner defer\nwork 11: renamed 11 [\"c\", \"d\", \"e\"] 1\nwork 11: inner defer\nwork 12: renamed 12 [\"a\", \"b\"] 1\nwork 12: inner defer\nwork 13: renamed 13 [\"c\", \"d\", \"e\"] 1\nwork 13: inner defer\nwork 14: renamed 14 [\"a\", \"b\"] 1\nwork 14: inner defer\nwork 15: renamed 15 [\"c\", \"d\", \"e\"] 1\nwork 15: inner defer\nwork 16: renamed 16 [\"a\", \"b\"] 1\nwork 16: inner defer\nwork 17: renamed 17 [\"c\", \"d\", \"e\"] 1\nwork 17: inner defer\nwork 18: renamed 18 [\"a\", \"b\"] 1\nwork 18: inner defer\nwork 19: renamed 19 [\"c\", \"d\", \"e\"] 1\nwork 19: inner defer\nwork 20: renamed 20 [\"a\", \"b\"] 1\nwork 20: inner defer\nwork 21: renamed 21 [\"c\", \"d\", \"e\"] 1\nwork 21: inner defer\nwork 22: renamed 22 [\"a\", \"b\"] 1\nwork 22: inner defer\nwork 23: renamed 23 [\"c\", \"d\", \"e\"] 1\nwork 23: inner defer\nwork 24: renamed 24 [\"a\", \"b\"] 1\nwork 24: inner defer\nwork 25: renamed 25 [\"c\", \"d\", \"e\"] 1\nwork 25: inner defer\nwork 26: renamed 26 [\"a\", \"b\"] 1\nwork 26: inner defer\nwork 27: renamed 27 [\"c\", \"d\", \"e\"] 1\nwork 27: inner defer\nwork 28: renamed 28 [\"a\", \"b\"] 1\nwork 28: inner defer\nwork 29: renamed 29 [\"c\", \"d\", \"e\"] 1\nwork 29: inner defer\nclosure 4\n12\ntask done\ntask done\ntask done\ntask done\nErr(\"task 3 failed\")\nmain: deferred before the uncaught panic\n";
   check_tsan "defer-in-tasks-tsan" "fn worker(c: Chan[Int], id: Int) -> Int {\n    let mut sent = 0\n    defer c.send(-1)\n    for k in 0..<200 {\n        defer sent = sent + 1\n        c.send(k)\n        if id == 2 && k == 100 {\n            panic(\"worker {id} stops\")\n        }\n    }\n    sent\n}\n\nfn main(root: Root) {\n    let c: Chan[Int] = channel(8)\n    let r = catch(|| group g {\n        for id in 0..<4 {\n            g.go(|| worker(c, id))\n        }\n        g.go(|| {\n            let mut ends = 0\n            let mut sum = 0\n            while ends < 4 {\n                let v = c.recv() ?? -1\n                if v < 0 {\n                    ends = ends + 1\n                } else {\n                    sum = sum + v\n                }\n            }\n            sum\n        })\n    })\n    root.stdout.print(\"{r}\")\n}\n" "Err(\"worker 2 stops\")\n";
   errs "defer-cannot-leave" "fn f(xs: List[Int]) -> Result[Int, Str] {\n    for x in xs {\n        defer {\n            if x > 1 {\n                break\n            }\n        }\n        defer {\n            for y in xs {\n                if y > 2 {\n                    break\n                }\n            }\n        }\n    }\n    defer return Err(\"no\")\n    defer {\n        let n = \"3\".parse_int()?\n    }\n    Ok(1)\n}\n" [ "E0115"; "E0115"; "E0115" ];
-  exits "example-tour" (example "tour.vela") "-- language\ncircle 12.57\n[2.25, 12.56636]\n[0, 1, 4, 9, 16] [\"h\", \"o\", \"l\", \"a\"]\nbound method 3.142\nVELA!\n{Point { x: 0, y: 0 }: [\"origin\", \"home\"]} {(1, 2): 2}\n[(1, \"a\"), (1, \"z\"), (2, \"b\")]\n{\"the\": 3, \"and\": 2} {\"he\": [\"the\"], \"at\": [\"cat\", \"hat\", \"bat\"], \"nd\": [\"and\"]}\n[\"cat\", \"hat\", \"bat\"] 3 [[1, 2], [2, 3]]\n[\"and\", \"the\", \"cat\", \"hat\", \"bat\"] 3 Some((4, \"hat\"))\n3 bytes: hi!\nreading settings\ncaused by: not a port: 80x\n8080\n-- defer\nin the block\ncleanup: runs first\ncleanup: runs last\nchecked 7\nchecked x\nOk(7) Err(\"not a number\")\nchecked 0\nErr(\"zero\")\n-- embedding\nhome at (5, 2) [\"(5, 2)\", \"(5, 2)\"]\n-- syntax\npipe 12\nPoint { x: 0, y: 0 } Point { x: 0, y: 5 }\nbig\nsmall\nnothing\nSome(3) -1\n..tour\n[10, 20, 30] Err(\"oops\")\n-- concurrency\na side task ran\nresults [1, 2]\nwith a deadline [Some(1), None]\nnobody sent anything\n" 3;
-  out "select" (example "select.vela") "nums done; words done; total 15 letters 3\nnothing ready | sent to c | sent to d | d Some(10)\nafter close: Some(7)\nErr(\"every arm of this `select` is turned off by its guard\")\n";
+  exits "example-tour" (example "tour.tsr") "-- language\ncircle 12.57\n[2.25, 12.56636]\n[0, 1, 4, 9, 16] [\"h\", \"o\", \"l\", \"a\"]\nbound method 3.142\nTESSERA!\n{Point { x: 0, y: 0 }: [\"origin\", \"home\"]} {(1, 2): 2}\n[(1, \"a\"), (1, \"z\"), (2, \"b\")]\n{\"the\": 3, \"and\": 2} {\"he\": [\"the\"], \"at\": [\"cat\", \"hat\", \"bat\"], \"nd\": [\"and\"]}\n[\"cat\", \"hat\", \"bat\"] 3 [[1, 2], [2, 3]]\n[\"and\", \"the\", \"cat\", \"hat\", \"bat\"] 3 Some((4, \"hat\"))\n3 bytes: hi!\nreading settings\ncaused by: not a port: 80x\n8080\n-- defer\nin the block\ncleanup: runs first\ncleanup: runs last\nchecked 7\nchecked x\nOk(7) Err(\"not a number\")\nchecked 0\nErr(\"zero\")\n-- embedding\nhome at (5, 2) [\"(5, 2)\", \"(5, 2)\"]\n-- syntax\npipe 12\nPoint { x: 0, y: 0 } Point { x: 0, y: 5 }\nbig\nsmall\nnothing\nSome(3) -1\n..tour\n[10, 20, 30] Err(\"oops\")\n-- concurrency\na side task ran\nresults [1, 2]\nwith a deadline [Some(1), None]\nnobody sent anything\n" 3;
+  out "select" (example "select.tsr") "nums done; words done; total 15 letters 3\nnothing ready | sent to c | sent to d | d Some(10)\nafter close: Some(7)\nErr(\"every arm of this `select` is turned off by its guard\")\n";
   out "select-stress" "fn produce(c: Chan[Int], n: Int) -> Int {\n    let mut i = 0\n    while i < n {\n        c.send(i)\n        i = i + 1\n    }\n    c.close()\n    0\n}\n\n// receive from all four until every one is closed\nfn consume(a: Chan[Int], b: Chan[Int], c: Chan[Int], d: Chan[Int]) -> Int {\n    let mut sum = 0\n    let mut on = [true, true, true, true]\n    while on[0] || on[1] || on[2] || on[3] {\n        select {\n            v = a.recv() if on[0] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[0] = false\n                },\n            },\n            v = b.recv() if on[1] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[1] = false\n                },\n            },\n            v = c.recv() if on[2] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[2] = false\n                },\n            },\n            v = d.recv() if on[3] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[3] = false\n                },\n            },\n        }\n    }\n    sum\n}\n\nfn drain(c: Chan[Str]) -> Int {\n    let mut n = 0\n    let mut more = true\n    while more {\n        match c.recv() {\n            Some(s) => {\n                n = n + s.len()\n            },\n            None => {\n                more = false\n            },\n        }\n    }\n    n\n}\n\nfn main(root: Root) {\n    let a: Chan[Int] = channel(1)\n    let b: Chan[Int] = channel(1)\n    let c: Chan[Int] = channel(2)\n    let d: Chan[Int] = channel(1)\n    let sums = group g {\n        g.go(|| produce(a, 500))\n        g.go(|| produce(b, 500))\n        g.go(|| produce(c, 500))\n        g.go(|| produce(d, 500))\n        g.go(|| consume(a, b, c, d))\n        g.go(|| consume(a, b, c, d))\n        g.go(|| consume(a, b, c, d))\n    }\n    root.stdout.print(\"{sums.sum()}\")\n    // select between two sends: a dispatcher feeding two workers\n    let w1: Chan[Str] = channel(1)\n    let w2: Chan[Str] = channel(1)\n    let parts = group g {\n        g.go(|| {\n                let mut i = 0\n                while i < 1000 {\n                    let msg = \"m{i}\"\n                    select {\n                        w1.send(msg) => (),\n                        w2.send(msg) => (),\n                    }\n                    i = i + 1\n                }\n                w1.close()\n                w2.close()\n                0\n            })\n        g.go(|| drain(w1))\n        g.go(|| drain(w2))\n    }\n    root.stdout.print(\"{parts.sum()}\")\n}\n" "499000\n3890\n";
   check_tsan "select-stress-tsan" "fn produce(c: Chan[Int], n: Int) -> Int {\n    let mut i = 0\n    while i < n {\n        c.send(i)\n        i = i + 1\n    }\n    c.close()\n    0\n}\n\n// receive from all four until every one is closed\nfn consume(a: Chan[Int], b: Chan[Int], c: Chan[Int], d: Chan[Int]) -> Int {\n    let mut sum = 0\n    let mut on = [true, true, true, true]\n    while on[0] || on[1] || on[2] || on[3] {\n        select {\n            v = a.recv() if on[0] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[0] = false\n                },\n            },\n            v = b.recv() if on[1] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[1] = false\n                },\n            },\n            v = c.recv() if on[2] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[2] = false\n                },\n            },\n            v = d.recv() if on[3] => match v {\n                Some(x) => {\n                    sum = sum + x\n                },\n                None => {\n                    on[3] = false\n                },\n            },\n        }\n    }\n    sum\n}\n\nfn drain(c: Chan[Str]) -> Int {\n    let mut n = 0\n    let mut more = true\n    while more {\n        match c.recv() {\n            Some(s) => {\n                n = n + s.len()\n            },\n            None => {\n                more = false\n            },\n        }\n    }\n    n\n}\n\nfn main(root: Root) {\n    let a: Chan[Int] = channel(1)\n    let b: Chan[Int] = channel(1)\n    let c: Chan[Int] = channel(2)\n    let d: Chan[Int] = channel(1)\n    let sums = group g {\n        g.go(|| produce(a, 500))\n        g.go(|| produce(b, 500))\n        g.go(|| produce(c, 500))\n        g.go(|| produce(d, 500))\n        g.go(|| consume(a, b, c, d))\n        g.go(|| consume(a, b, c, d))\n        g.go(|| consume(a, b, c, d))\n    }\n    root.stdout.print(\"{sums.sum()}\")\n    // select between two sends: a dispatcher feeding two workers\n    let w1: Chan[Str] = channel(1)\n    let w2: Chan[Str] = channel(1)\n    let parts = group g {\n        g.go(|| {\n                let mut i = 0\n                while i < 1000 {\n                    let msg = \"m{i}\"\n                    select {\n                        w1.send(msg) => (),\n                        w2.send(msg) => (),\n                    }\n                    i = i + 1\n                }\n                w1.close()\n                w2.close()\n                0\n            })\n        g.go(|| drain(w1))\n        g.go(|| drain(w2))\n    }\n    root.stdout.print(\"{parts.sum()}\")\n}\n" "499000\n3890\n";
   let chans = "    let c: Chan[Int] = channel(1)\n" in
@@ -3751,7 +3751,7 @@ fn main(root: Root) {
     let out = root.stdout
     let quiet: Chan[Int] = channel(1)
     let mut seen = "start"
-    let r = group g until clock.after(40) {
+    let r = group g until clock.after(400) {
         g.go(|| { clock.sleep(5); 1 })
         g.go(|| { clock.sleep(5000); 2 })
         defer { out.print("defer ran") }
@@ -4772,7 +4772,7 @@ fn main(root: Root) {
    let _, ds2, _ = compile "and-then-fixed" fixed in
    ok "and-then-fixed-checks" (ds2 = [] && Interp_util.find_sub fixed "r.flat_map(" 0 <> None) fixed);
 
-  (* ---------- collection methods (std/methods.vela) ---------- *)
+  (* ---------- collection methods (std/methods.tsr) ---------- *)
   out "collections-search"
     {|struct P {
     name: Str,
@@ -4990,7 +4990,7 @@ true {"a": 2, "b": 1} [5, 9]
   errs "bound-dyn" (main_wrap "    let d: dyn Key = 1") [ "E0102" ];
   errs "bound-iface-name" "interface Ordered {\n    fn k(self) -> Int\n}\n\nfn main() {\n}\n" [ "E0106" ];
   panics "collections-callback-panic" (main_wrap "    let xs = [1, 0]\n    out.print(\"{xs.find(|x| 10 / x > 100)}\")") "division by zero";
-  (* the methods written in Vela stay out of `vela caps` *)
+  (* the methods written in Tessera stay out of `tessera caps` *)
   let _, _, infos = compile "collections-caps" (main_wrap "    out.print(\"{[1].any(|x| x > 0)}\")") in
   ok "collections-caps" (List.for_all (fun (i : Check.fn_info) -> i.span.file <> Prelude.methods_file) infos) "a built-in method is listed";
 
@@ -5285,8 +5285,8 @@ fn main(root: Root) {
   errs "safe-nav-type" "struct P {\n    x: Int,\n}\n\nfn main(root: Root) {\n    let p = Some(P { x: 1 })\n    let y: Int = p?.x\n}\n" [ "E0201" ];
 
   (* ---------- tuples and maps ---------- *)
-  out "tuples" (example "tuples.vela") "3 2 (2, 1)\n(1, \"one\", 1.5) 1 one 1.5 (2, \"a\")\n4 ((1, 2), (3, (4, 5)))\n1 3 4 5\na1 b2 c3 \nyes zero yes no 7\ntrue false 6\n";
-  out "maps" (example "maps.vela") "{\"the\": 3, \"cat\": 1, \"and\": 2, \"hat\": 1, \"bat\": 1} 5 3 None\n[\"the\", \"cat\", \"and\", \"hat\", \"bat\"] [3, 1, 2, 1, 1]\nthe=3 and=2 \n{\"the\": 100, \"and\": 2, \"hat\": 1, \"bat\": 1, \"zebra\": 9}\n{\"the\": 3, \"cat\": 1, \"and\": 2, \"hat\": 1, \"bat\": 1}\ntrue false false\n{1: 1, 2: 4, 3: 9} true false 0\n1 {\"a\": 1}\nyes\n";
+  out "tuples" (example "tuples.tsr") "3 2 (2, 1)\n(1, \"one\", 1.5) 1 one 1.5 (2, \"a\")\n4 ((1, 2), (3, (4, 5)))\n1 3 4 5\na1 b2 c3 \nyes zero yes no 7\ntrue false 6\n";
+  out "maps" (example "maps.tsr") "{\"the\": 3, \"cat\": 1, \"and\": 2, \"hat\": 1, \"bat\": 1} 5 3 None\n[\"the\", \"cat\", \"and\", \"hat\", \"bat\"] [3, 1, 2, 1, 1]\nthe=3 and=2 \n{\"the\": 100, \"and\": 2, \"hat\": 1, \"bat\": 1, \"zebra\": 9}\n{\"the\": 3, \"cat\": 1, \"and\": 2, \"hat\": 1, \"bat\": 1}\ntrue false false\n{1: 1, 2: 4, 3: 9} true false 0\n1 {\"a\": 1}\nyes\n";
   panics "map-missing-key" (main_wrap "    let m = map([(\"a\", 1)])\n    out.print(\"{m[\"b\"]}\")") "key \"b\" is not in the map";
   out "maps-stress" ~grants:{ Interp.no_grants with seed = Some 7 } "fn main(root: Root) {\n    let out = root.stdout\n    let r = root.rand\n    let mut m: Map[Int, Str] = map()\n    let mut sum = 0\n    let mut i = 0\n    while i < 20000 {\n        let k = r.int(0, 500)\n        let op = r.int(0, 3)\n        if op == 0 {\n            m[k] = \"v{k}\"\n        } else if op == 1 {\n            m.remove(k)\n        } else {\n            sum = sum + m.get(k).map(|s| s.len()) ?? 0\n        }\n        i = i + 1\n    }\n    out.print(\"{m.len()} {sum} {m.keys().take(8)} {m.values().take(3)}\")\n    let copy = m\n    m.remove(m.keys()[0])\n    out.print(\"{copy.len()} {m.len()} {copy == m}\")\n    // maps handed to concurrent tasks\n    let parts = group g {\n        for d in [0, 1, 2, 3] {\n            g.go(|| copy.keys().filter(|k| k % 4 == d).len())\n        }\n    }\n    out.print(\"{parts} {parts.sum() == copy.len()}\")\n}\n" "273 12086 [461, 206, 21, 361, 292, 414, 473, 199] [\"v461\", \"v206\", \"v21\"]\n273 272 false\n[76, 71, 63, 63] true\n";
   errs "map-key-type" (main_wrap "    let mut m = map()\n    m[1.5] = 1") [ "E0113" ];
@@ -5318,7 +5318,7 @@ fn main(root: Root) {
   errs "tuple-let-refutable" "fn main() {\n    let (1, b) = (1, 2)\n}\n" [ "E0003" ];
 
   (* ---------- dyn ---------- *)
-  out "dyn" (example "dyn.vela")
+  out "dyn" (example "dyn.tsr")
     "3 5 triangle square\ncircle,square,triangle,circle,square\n41.0\ndemo: 5 Square { s: 2.0 }\n2.25 Square { s: 1.5 }\n[4.0, 2.0, 2.25] abcd\n";
   let dshape = "interface Shape {\n    fn area(self) -> Float\n}\n\nstruct C {\n    r: Float,\n}\n\nfn area(self: C) -> Float {\n    self.r\n}\n\nstruct Bad {\n    n: Int,\n}\n\nstruct Holder[T] {\n    x: T,\n}\n\nfn area[T](self: Holder[T]) -> Float {\n    1.0\n}\n\n" in
   errs "dyn-not-satisfied" (dshape ^ "fn main() {\n    let s: dyn Shape = Bad { n: 1 }\n}\n") [ "E0111" ];
@@ -5628,11 +5628,11 @@ fn main() -> Result[(), dyn Error] {
    let fixed = apply_fixes src ds in
    let _, ds2, _ = compile "error-context-fixed" fixed in
    ok "error-context-fix-applies" (ds2 = [] && fixed = "fn f(fs: Fs) -> Result[Str, dyn Error] {\n    let t = fs.read(\"a\")? \"reading\"\n    Ok(t)\n}\n\nfn main() {}\n") fixed);
-  ok "error-context-fmt" (Fmt.format ~file:"ec.vela" "fn f(fs: Fs) -> Result[Str, dyn Error] {\n    let t = fs.read(\"a\")?\"reading {1}\"\n    Ok(t)\n}\n"
+  ok "error-context-fmt" (Fmt.format ~file:"ec.tsr" "fn f(fs: Fs) -> Result[Str, dyn Error] {\n    let t = fs.read(\"a\")?\"reading {1}\"\n    Ok(t)\n}\n"
      = "fn f(fs: Fs) -> Result[Str, dyn Error] {\n    let t = fs.read(\"a\")? \"reading {1}\"\n    Ok(t)\n}\n")
-    (Fmt.format ~file:"ec.vela" "fn f(fs: Fs) -> Result[Str, dyn Error] {\n    let t = fs.read(\"a\")?\"reading {1}\"\n    Ok(t)\n}\n");
+    (Fmt.format ~file:"ec.tsr" "fn f(fs: Fs) -> Result[Str, dyn Error] {\n    let t = fs.read(\"a\")?\"reading {1}\"\n    Ok(t)\n}\n");
   ok "error-context-astdump"
-    (let items = Parser.parse_program "ad.vela" "fn f() {\n    g()? \"c\"\n}\n" in
+    (let items = Parser.parse_program "ad.tsr" "fn f() {\n    g()? \"c\"\n}\n" in
      match items with
      | [ Ast.IFn { fn_body = { tail = Some { edesc = Ast.ETry (_, Some _); _ }; _ }; _ } ] -> true
      | _ -> false)
@@ -6007,18 +6007,18 @@ fn main(root: Root) {
   errs "modules-no-use" ~modules "fn main(root: Root) {\n    let p: geom.Point = geom.origin()\n}\n" [ "E0401" ];
   errs "modules-type-check" ~modules "use geom\n\nfn main(root: Root) {\n    let p: geom.Point = 1\n}\n" [ "E0201" ];
   errs "modules-not-value" ~modules "use geom\n\nfn main(root: Root) {\n    let g = geom\n}\n" [ "E0404" ];
-  (* packages: each dependency may only use the capabilities vela.toml grants it *)
-  let pdir = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "vela-pkg-%d" (Unix.getpid ())) in
+  (* packages: each dependency may only use the capabilities tessera.toml grants it *)
+  let pdir = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "tessera-pkg-%d" (Unix.getpid ())) in
   List.iter (fun d -> try Unix.mkdir d 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ())
     [ pdir; Filename.concat pdir "app"; Filename.concat pdir "fetch" ];
   let put f s = Out_channel.with_open_bin (Filename.concat pdir f) (fun oc -> output_string oc s) in
-  put "fetch/fetch.vela" "use util\n\npub fn get(net: Net, u: Str) -> Str {\n    match net.get(u) {\n        Ok(r) => util.first(r.body),\n        Err(_) => \"none\",\n    }\n}\n";
-  put "fetch/util.vela" "pub fn first(s: Str) -> Str {\n    s.lines().first() ?? \"\"\n}\n\npub fn sneaky(fs: Fs) -> Bool {\n    fs.exists(\"x\")\n}\n";
+  put "fetch/fetch.tsr" "use util\n\npub fn get(net: Net, u: Str) -> Str {\n    match net.get(u) {\n        Ok(r) => util.first(r.body),\n        Err(_) => \"none\",\n    }\n}\n";
+  put "fetch/util.tsr" "pub fn first(s: Str) -> Str {\n    s.lines().first() ?? \"\"\n}\n\npub fn sneaky(fs: Fs) -> Bool {\n    fs.exists(\"x\")\n}\n";
   let app = "use fetch\n\nfn main(root: Root) {\n    root.stdout.print(fetch.get(root.net, \"http://h\"))\n}\n" in
-  put "app/main.vela" app;
+  put "app/main.tsr" app;
   let pkg_codes toml =
-    put "app/vela.toml" toml;
-    let path = Filename.concat pdir "app/main.vela" in
+    put "app/tessera.toml" toml;
+    let path = Filename.concat pdir "app/main.tsr" in
     let _, ds, _ = Modules.load_and_check path app in
     codes ds
   in
@@ -6028,15 +6028,15 @@ fn main(root: Root) {
   ok "pkg-bad-toml" (pkg_codes "[package]\nname = \"app\"\n[dependencies]\nfetch = { path = \"../fetch\", caps = [\"disk\"] }\n" = [ "E0321" ]) "bad cap";
   ok "pkg-missing-dir" (pkg_codes "[package]\nname = \"app\"\n[dependencies]\nother = { path = \"../nope\" }\n" = [ "E0401" ]) "fetch not found";
   (* embed stays inside the package: the main program's (app/, where its
-     vela.toml is) and each dependency's own directory *)
+     tessera.toml is) and each dependency's own directory *)
   put "app/data.txt" "app data";
   (try Unix.mkdir (Filename.concat pdir "embdep") 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
   put "embdep/note.txt" "dep data!!";
   let embed_codes ~dep_src main_src =
-    put "embdep/embdep.vela" dep_src;
-    put "app/vela.toml" "[package]\nname = \"app\"\n[dependencies]\nembdep = { path = \"../embdep\" }\n";
-    let path = Filename.concat pdir "app/embmain.vela" in
-    put "app/embmain.vela" main_src;
+    put "embdep/embdep.tsr" dep_src;
+    put "app/tessera.toml" "[package]\nname = \"app\"\n[dependencies]\nembdep = { path = \"../embdep\" }\n";
+    let path = Filename.concat pdir "app/embmain.tsr" in
+    put "app/embmain.tsr" main_src;
     let _, ds, _ = Modules.load_and_check path main_src in
     codes ds
   in
@@ -6055,7 +6055,7 @@ fn main(root: Root) {
   ok "embed-recorded"
     (embed_codes ~dep_src:inside (main_uses "embed(\"data.txt\")") = []
      && List.sort compare !Modules.embedded = [ ("", "data.txt", 8); ("embdep", "note.txt", 10) ])
-    "vela caps lists embeds";
+    "tessera caps lists embeds";
   (try Unix.mkdir (Filename.concat pdir "app/pub") 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
   (try Unix.mkdir (Filename.concat pdir "app/empty") 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
   put "app/pub/x.txt" "xx";
@@ -6072,23 +6072,23 @@ fn main(root: Root) {
   ok "embed-shadowed"
     (embed_codes ~dep_src:inside "use embdep\n\nfn embed(s: Str) -> Str {\n    s\n}\n\nfn main(root: Root) {\n    root.stdout.print(embed(\"../anything\"))\n}\n" = [])
     "a function named embed is an ordinary call";
-  Sys.remove (Filename.concat pdir "app/vela.toml");
+  Sys.remove (Filename.concat pdir "app/tessera.toml");
 
   (* calling C is full trust: a dependency gets it only from [trust], never from caps,
-     and vela.lock records its libraries so a change is noticed *)
+     and tessera.lock records its libraries so a change is noticed *)
   (try Unix.mkdir (Filename.concat pdir "cdep") 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
   (try Unix.mkdir (Filename.concat pdir "capp") 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
   let cdep_src libs =
     String.concat "" (List.map (fun (l, fn) -> sprintf "foreign \"%s\" {\n    fn %s() -> Int32\n}\n\n" l fn) libs)
     ^ "pub fn pid(f: Foreign) -> Int {\n    getpid(f)\n}\n"
   in
-  put "cdep/cdep.vela" (cdep_src [ ("c", "getpid") ]);
+  put "cdep/cdep.tsr" (cdep_src [ ("c", "getpid") ]);
   let capp = "use cdep\n\nfn main(root: Root) {\n    root.stdout.print(\"{cdep.pid(root.foreign) > 0}\")\n}\n" in
-  put "capp/main.vela" capp;
-  let lock = Filename.concat pdir "capp/vela.lock" in
+  put "capp/main.tsr" capp;
+  let lock = Filename.concat pdir "capp/tessera.lock" in
   let cpkg toml =
-    put "capp/vela.toml" toml;
-    let _, ds, _ = Modules.load_and_check (Filename.concat pdir "capp/main.vela") capp in
+    put "capp/tessera.toml" toml;
+    let _, ds, _ = Modules.load_and_check (Filename.concat pdir "capp/main.tsr") capp in
     ds
   in
   let dep = "[package]\nname = \"capp\"\n\n[dependencies]\ncdep = { path = \"../cdep\" }\n" in
@@ -6104,35 +6104,35 @@ fn main(root: Root) {
   ok "trust-locked" (Sys.file_exists lock && Interp_util.find_sub (read_file lock) "foreign cdep c\n" 0 <> None) (if Sys.file_exists lock then read_file lock else "no lock");
   ok "trust-stable" (cpkg trusted = []) "same libraries";
   (* an update that starts calling another library stops the build *)
-  put "cdep/cdep.vela" (cdep_src [ ("c", "getpid"); ("z", "zlibVersion") ]);
+  put "cdep/cdep.tsr" (cdep_src [ ("c", "getpid"); ("z", "zlibVersion") ]);
   let ds = cpkg trusted in
   ok "trust-lock-changed" (codes ds = [ "E0324" ] && Interp_util.find_sub (List.hd ds).message "`z`" 0 <> None) (show ds);
   (* deleting the line accepts the new libraries *)
   Out_channel.with_open_bin lock (fun oc -> output_string oc "# reviewed\n");
   ok "trust-relock" (cpkg trusted = [] && Interp_util.find_sub (read_file lock) "foreign cdep c,z\n" 0 <> None) (read_file lock);
-  put "cdep/cdep.vela" (cdep_src [ ("c", "getpid") ]);
-  Sys.remove (Filename.concat pdir "capp/vela.toml");
+  put "cdep/cdep.tsr" (cdep_src [ ("c", "getpid") ]);
+  Sys.remove (Filename.concat pdir "capp/tessera.toml");
 
-  (* [grants] in vela.toml: the program's own grants, with --grant flags adding to them *)
+  (* [grants] in tessera.toml: the program's own grants, with --grant flags adding to them *)
   (* the CLI built next to this test binary, wherever it is run from *)
-  let vela_exe = Filename.concat (Filename.dirname (Filename.dirname Sys.executable_name)) "bin/main.exe" in
-  let vela_exe = if Filename.is_relative vela_exe then Filename.concat (Sys.getcwd ()) vela_exe else vela_exe in
-  let vela_cli args =
+  let tessera_exe = Filename.concat (Filename.dirname (Filename.dirname Sys.executable_name)) "bin/main.exe" in
+  let tessera_exe = if Filename.is_relative tessera_exe then Filename.concat (Sys.getcwd ()) tessera_exe else tessera_exe in
+  let tessera_cli args =
     let o = Filename.concat pdir "cli.out" and e = Filename.concat pdir "cli.err" in
     let code =
       Sys.command
-        (String.concat " " (List.map Filename.quote (vela_exe :: args)) ^ sprintf " >%s 2>%s" (Filename.quote o) (Filename.quote e))
+        (String.concat " " (List.map Filename.quote (tessera_exe :: args)) ^ sprintf " >%s 2>%s" (Filename.quote o) (Filename.quote e))
     in
     (code, read_file o, read_file e)
   in
   (* the build cache: the same program again is a copy of the first build
-     wherever it goes, a changed program builds anew, and VELA_CACHE=off
+     wherever it goes, a changed program builds anew, and TESSERA_CACHE=off
      never touches the cache *)
   (let dir = Filename.concat pdir "own-cache" in
-   let prog = Filename.concat pdir "cached.vela" in
+   let prog = Filename.concat pdir "cached.tsr" in
    let write text = Out_channel.with_open_bin prog (fun oc -> output_string oc text) in
    let build ?(cache = dir) out =
-     Sys.command (sprintf "VELA_CACHE=%s %s build %s -o %s >/dev/null 2>&1" (Filename.quote cache) (Filename.quote vela_exe) (Filename.quote prog) (Filename.quote out))
+     Sys.command (sprintf "TESSERA_CACHE=%s %s build %s -o %s >/dev/null 2>&1" (Filename.quote cache) (Filename.quote tessera_exe) (Filename.quote prog) (Filename.quote out))
    in
    let entries () = try Array.length (Sys.readdir dir) with Sys_error _ -> 0 in
    let out n = Filename.concat pdir n in
@@ -6154,29 +6154,29 @@ fn main(root: Root) {
      router directly, the operator's need no cluster *)
   List.iter
     (fun (name, file, summary, extra) ->
-      let dir = if Sys.file_exists "../examples/todo_api.vela" then "../examples" else "examples" in
-      let code, o, e = vela_cli (("test" :: extra) @ [ Filename.concat dir file ]) in
+      let dir = if Sys.file_exists "../examples/todo_api.tsr" then "../examples" else "examples" in
+      let code, o, e = tessera_cli (("test" :: extra) @ [ Filename.concat dir file ]) in
       let last = List.nth_opt (List.rev (String.split_on_char '\n' (String.trim o))) 0 |> Option.value ~default:"" in
       ok name (code = 0 && String.starts_with ~prefix:summary last) (o ^ e))
     [
-      ("example-todo-api-tests", "todo_api.vela", "12 tests, 0 failed", []);
-      ("example-todo-api-tests-native", "todo_api.vela", "12 tests, 0 failed", [ "--native" ]);
-      ("example-site-operator-tests", "site_operator.vela", "19 tests, 0 failed", []);
-      ("example-site-operator-tests-native", "site_operator.vela", "19 tests, 0 failed", [ "--native" ]);
+      ("example-todo-api-tests", "todo_api.tsr", "12 tests, 0 failed", []);
+      ("example-todo-api-tests-native", "todo_api.tsr", "12 tests, 0 failed", [ "--native" ]);
+      ("example-site-operator-tests", "site_operator.tsr", "19 tests, 0 failed", []);
+      ("example-site-operator-tests-native", "site_operator.tsr", "19 tests, 0 failed", [ "--native" ]);
     ];
-  (* the foreign grant is announced as full access, and `vela check` lists who calls C *)
-  put "capp/vela.toml" "[package]\nname = \"capp\"\n\n[dependencies]\ncdep = { path = \"../cdep\" }\n\n[trust]\nforeign = [\"cdep\"]\n\n[grants]\nforeign = \"c\"\n";
-  let cmain = Filename.concat pdir "capp/main.vela" in
+  (* the foreign grant is announced as full access, and `tessera check` lists who calls C *)
+  put "capp/tessera.toml" "[package]\nname = \"capp\"\n\n[dependencies]\ncdep = { path = \"../cdep\" }\n\n[trust]\nforeign = [\"cdep\"]\n\n[grants]\nforeign = \"c\"\n";
+  let cmain = Filename.concat pdir "capp/main.tsr" in
   (try Sys.remove lock with Sys_error _ -> ());
-  let code, o, e = vela_cli [ "run"; cmain ] in
+  let code, o, e = tessera_cli [ "run"; cmain ] in
   ok "cli-foreign-warning"
-    (code = 0 && o = "true\n" && e = "vela: warning: --grant foreign=c is full access: C code can do anything this process can, past every other grant\n")
+    (code = 0 && o = "true\n" && e = "tessera: warning: --grant foreign=c is full access: C code can do anything this process can, past every other grant\n")
     (sprintf "%d %S %S" code o e);
-  let code, o, _ = vela_cli [ "check"; cmain ] in
-  ok "cli-check-calls-c" (code = 0 && o = "ok\ncalls C: module `cdep` (dependency `cdep`, trusted in vela.toml [trust]): c\n") o;
-  put "capp/sqlmain.vela" "use sql\n\nforeign \"c\" {\n    fn getpid() -> Int32\n}\n\nfn main(root: Root) {\n    root.stdout.print(\"{sql.memory().is_ok()} {getpid(root.foreign) > 0}\")\n}\n";
-  let code, o, _ = vela_cli [ "check"; Filename.concat pdir "capp/sqlmain.vela" ] in
-  ok "cli-check-calls-c-std" (code = 0 && o = "ok\ncalls C: the program itself (needs --grant foreign): c\ncalls C: module `sql` (standard library, trusted by src/std/vela.toml): sqlite3\n") o;
+  let code, o, _ = tessera_cli [ "check"; cmain ] in
+  ok "cli-check-calls-c" (code = 0 && o = "ok\ncalls C: module `cdep` (dependency `cdep`, trusted in tessera.toml [trust]): c\n") o;
+  put "capp/sqlmain.tsr" "use sql\n\nforeign \"c\" {\n    fn getpid() -> Int32\n}\n\nfn main(root: Root) {\n    root.stdout.print(\"{sql.memory().is_ok()} {getpid(root.foreign) > 0}\")\n}\n";
+  let code, o, _ = tessera_cli [ "check"; Filename.concat pdir "capp/sqlmain.tsr" ] in
+  ok "cli-check-calls-c-std" (code = 0 && o = "ok\ncalls C: the program itself (needs --grant foreign): c\ncalls C: module `sql` (standard library, trusted by src/std/tessera.toml): sqlite3\n") o;
   (* the operating-system sandbox: even C code stays inside the grants, in
      both backends, unless --no-sandbox *)
   List.iter (fun d -> try Unix.mkdir (Filename.concat pdir d) 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ()) [ "sbox"; "sbox/data" ];
@@ -6223,20 +6223,20 @@ fn main(root: Root) {
     done;
     Buffer.contents b
   in
-  put "sbox/main.vela" (replace_all "ESCAPE" escape_file (replace_all "SECRET" secret src));
-  let smain = Filename.concat pdir "sbox/main.vela" in
+  put "sbox/main.tsr" (replace_all "ESCAPE" escape_file (replace_all "SECRET" secret src));
+  let smain = Filename.concat pdir "sbox/main.tsr" in
   let grant = [ "--grant"; "foreign=c"; "--grant"; "fs=" ^ Filename.concat pdir "sbox/data" ] in
   List.iter
     (fun (name, extra, want) ->
       (try Sys.remove escape_file with Sys_error _ -> ());
-      let code, o, e = vela_cli ((("run" :: extra) @ [ smain ]) @ grant) in
+      let code, o, e = tessera_cli ((("run" :: extra) @ [ smain ]) @ grant) in
       ok name (code = 0 && o = want && Sys.file_exists escape_file = (extra = [ "--no-sandbox" ])) (sprintf "%d %S %S" code o e))
     [ ("sandbox-interp", [], "false false false\nOk(\"granted\") true true\n");
       ("sandbox-native", [ "--native" ], "false false false\nOk(\"granted\") true true\n");
       ("sandbox-off", [ "--no-sandbox" ], "true true true\nOk(\"granted\") true true\n") ];
   (* a built binary takes --no-sandbox too, and refuses unknown arguments *)
   let sbin = Filename.concat pdir "sbox/prog" in
-  let code, _, _ = vela_cli [ "build"; smain; "-o"; sbin ] in
+  let code, _, _ = tessera_cli [ "build"; smain; "-o"; sbin ] in
   if code = 0 then begin
     let run args =
       let o = Filename.concat pdir "sbox/out" in
@@ -6247,14 +6247,14 @@ fn main(root: Root) {
     let _, o2 = run [ "--no-sandbox" ] in
     ok "sandbox-binary" (String.starts_with ~prefix:"false false false" o1 && String.starts_with ~prefix:"true true true" o2) (o1 ^ o2)
   end
-  else ok "sandbox-binary" false "vela build failed";
+  else ok "sandbox-binary" false "tessera build failed";
   (try Sys.remove escape_file with Sys_error _ -> ());
   (* without Net, Listen or Exec, the sandbox also refuses the ways out that
      are not files: another program's Unix socket (here a listener of the
      test's own, which could as well be a Docker daemon or an ssh-agent),
      another process's /proc entries, and signalling another process *)
   let linux = (try String.trim (In_channel.with_open_text "/proc/sys/kernel/ostype" In_channel.input_all) = "Linux" with Sys_error _ -> false) in
-  let sock_path = sprintf "/tmp/vela-sb-%d.sock" (Unix.getpid ()) in
+  let sock_path = sprintf "/tmp/tessera-sb-%d.sock" (Unix.getpid ()) in
   (try Sys.remove sock_path with Sys_error _ -> ());
   let lsock = Unix.socket Unix.PF_UNIX Unix.SOCK_STREAM 0 in
   Unix.bind lsock (Unix.ADDR_UNIX sock_path);
@@ -6296,19 +6296,19 @@ fn main(root: Root) {
     }
     let signal = kill(c, PID, 0) == 0
     // an abstract socket (Linux): a leading NUL byte, no file at all
-    let abstract = LINUX && reach(c, bytes([0]) + "vela-sb-abstract".to_bytes())
+    let abstract = LINUX && reach(c, bytes([0]) + "tessera-sb-abstract".to_bytes())
     root.stdout.print("{sock} {proc} {signal} {abstract}")
 }
 |v}
   in
   let probe = replace_all "SOCK" sock_path (replace_all "PID" (string_of_int sleeper) (replace_all "LINUX" (string_of_bool linux) probe)) in
-  put "sbox/probe.vela" probe;
-  let pmain = Filename.concat pdir "sbox/probe.vela" in
+  put "sbox/probe.tsr" probe;
+  let pmain = Filename.concat pdir "sbox/probe.tsr" in
   (* an abstract listener for the last probe *)
   let asock =
     if linux then begin
       let s = Unix.socket Unix.PF_UNIX Unix.SOCK_STREAM 0 in
-      Unix.bind s (Unix.ADDR_UNIX "\000vela-sb-abstract");
+      Unix.bind s (Unix.ADDR_UNIX "\000tessera-sb-abstract");
       Unix.listen s 4;
       Some s
     end
@@ -6318,7 +6318,7 @@ fn main(root: Root) {
   let open_all = sprintf "true %b true %b\n" linux linux in
   List.iter
     (fun (name, extra, want) ->
-      let code, o, e = vela_cli ((("run" :: extra) @ [ pmain ]) @ [ "--grant"; "foreign=c" ]) in
+      let code, o, e = tessera_cli ((("run" :: extra) @ [ pmain ]) @ [ "--grant"; "foreign=c" ]) in
       ok name (code = 0 && o = want) (sprintf "%d %S %S" code o e))
     [ ("sandbox-ipc-interp", [], "false false false false\n");
       ("sandbox-ipc-native", [ "--native" ], "false false false false\n");
@@ -6328,57 +6328,57 @@ fn main(root: Root) {
   Unix.close lsock;
   Option.iter Unix.close asock;
   (try Sys.remove sock_path with Sys_error _ -> ());
-  Sys.remove (Filename.concat pdir "capp/vela.toml");
-  let _, o, e = vela_cli [ "run"; Filename.concat pdir "capp/sqlmain.vela" ] in
+  Sys.remove (Filename.concat pdir "capp/tessera.toml");
+  let _, o, e = tessera_cli [ "run"; Filename.concat pdir "capp/sqlmain.tsr" ] in
   ok "cli-no-foreign-no-warning" (o = "" && String.starts_with ~prefix:"panic: foreign: library `c` is not granted" e) (o ^ e);
   List.iter (fun d -> try Unix.mkdir (Filename.concat pdir d) 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ()) [ "grants"; "grants/data"; "envy" ];
   put "grants/data/a.txt" "hi";
-  Unix.putenv "VELA_T_A" "a";
-  Unix.putenv "VELA_T_B" "b";
-  put "grants/vela.toml" "[package]\nname = \"g\"\n\n[grants]\nfs = \"data:ro\"   # read-only\nenv = [\"VELA_T_A\"]\n";
-  put "grants/main.vela"
-    "fn main(root: Root) {\n    root.stdout.print(root.fs.read(\"a.txt\") ?? \"denied\")\n    root.stdout.print(root.env.get(\"VELA_T_A\") ?? \"none\")\n    root.stdout.print(root.env.get(\"VELA_T_B\") ?? \"none\")\n    root.stdout.print(\"{root.fs.write(\"b.txt\", \"x\").is_ok()}\")\n}\n";
-  let gmain = Filename.concat pdir "grants/main.vela" in
+  Unix.putenv "TESSERA_T_A" "a";
+  Unix.putenv "TESSERA_T_B" "b";
+  put "grants/tessera.toml" "[package]\nname = \"g\"\n\n[grants]\nfs = \"data:ro\"   # read-only\nenv = [\"TESSERA_T_A\"]\n";
+  put "grants/main.tsr"
+    "fn main(root: Root) {\n    root.stdout.print(root.fs.read(\"a.txt\") ?? \"denied\")\n    root.stdout.print(root.env.get(\"TESSERA_T_A\") ?? \"none\")\n    root.stdout.print(root.env.get(\"TESSERA_T_B\") ?? \"none\")\n    root.stdout.print(\"{root.fs.write(\"b.txt\", \"x\").is_ok()}\")\n}\n";
+  let gmain = Filename.concat pdir "grants/main.tsr" in
   (match Package.load gmain with
    | Ok (Some p) ->
      ok "grants-toml-parse"
-       (p.grants = [ ("fs", Filename.concat (Filename.concat pdir "grants") "data" ^ ":ro"); ("env", "VELA_T_A") ])
+       (p.grants = [ ("fs", Filename.concat (Filename.concat pdir "grants") "data" ^ ":ro"); ("env", "TESSERA_T_A") ])
        (String.concat ", " (List.map (fun (k, v) -> k ^ "=" ^ v) p.grants))
    | _ -> ok "grants-toml-parse" false "no package");
   List.iter
     (fun (name, extra) ->
-      let code, o, e = vela_cli ([ "run" ] @ extra @ [ gmain ]) in
+      let code, o, e = tessera_cli ([ "run" ] @ extra @ [ gmain ]) in
       ok ("grants-toml-" ^ name) (code = 0 && o = "hi\na\nnone\nfalse\n") (sprintf "code %d, out %S, err %S" code o e);
-      let code, o, e = vela_cli ([ "run" ] @ extra @ [ gmain; "--grant"; "env=VELA_T_B" ]) in
+      let code, o, e = tessera_cli ([ "run" ] @ extra @ [ gmain; "--grant"; "env=TESSERA_T_B" ]) in
       ok ("grants-toml-flag-adds-" ^ name) (code = 0 && o = "hi\na\nb\nfalse\n") (sprintf "code %d, out %S, err %S" code o e))
     ([ ("interp", []) ] @ if native_enabled then [ ("native", [ "--native" ]) ] else []);
   (* a flag's fs replaces the toml's: here a writable one *)
-  let code, o, e = vela_cli [ "run"; gmain; "--grant"; "fs=" ^ Filename.concat pdir "grants/data" ] in
+  let code, o, e = tessera_cli [ "run"; gmain; "--grant"; "fs=" ^ Filename.concat pdir "grants/data" ] in
   ok "grants-toml-fs-flag" (code = 0 && o = "hi\na\nnone\ntrue\n") (sprintf "code %d, out %S, err %S" code o e);
   let grant_err toml =
-    put "grants/vela.toml" toml;
-    let code, _, e = vela_cli [ "run"; gmain ] in
+    put "grants/tessera.toml" toml;
+    let code, _, e = tessera_cli [ "run"; gmain ] in
     code = 1 && Interp_util.find_sub e "E0321" 0 <> None
   in
   ok "grants-toml-always" (grant_err "[grants]\nstdout = \"x\"\n") "stdout is always granted";
   ok "grants-toml-unknown" (grant_err "[grants]\ndisk = \"x\"\n") "unknown grant";
   ok "grants-toml-two-fs" (grant_err "[grants]\nfs = [\"a\", \"b\"]\n") "one fs";
   ok "grants-toml-twice" (grant_err "[grants]\nnet = \"a\"\nnet = \"b\"\n") "listed twice";
-  Sys.remove (Filename.concat pdir "grants/vela.toml");
-  (* a dependency's own vela.toml never grants anything: only the program's does *)
-  put "envy/envy.vela" "pub fn get(env: Env) -> Str {\n    env.get(\"VELA_T_A\") ?? \"none\"\n}\n";
-  put "envy/vela.toml" "[package]\nname = \"envy\"\n\n[grants]\nenv = \"*\"\n";
-  put "grants/vela.toml" "[package]\nname = \"g\"\n\n[dependencies]\nenvy = { path = \"../envy\", caps = [\"env\"] }\n";
-  put "grants/dep.vela" "use envy\n\nfn main(root: Root) {\n    root.stdout.print(envy.get(root.env))\n}\n";
-  let code, o, e = vela_cli [ "run"; Filename.concat pdir "grants/dep.vela" ] in
+  Sys.remove (Filename.concat pdir "grants/tessera.toml");
+  (* a dependency's own tessera.toml never grants anything: only the program's does *)
+  put "envy/envy.tsr" "pub fn get(env: Env) -> Str {\n    env.get(\"TESSERA_T_A\") ?? \"none\"\n}\n";
+  put "envy/tessera.toml" "[package]\nname = \"envy\"\n\n[grants]\nenv = \"*\"\n";
+  put "grants/tessera.toml" "[package]\nname = \"g\"\n\n[dependencies]\nenvy = { path = \"../envy\", caps = [\"env\"] }\n";
+  put "grants/dep.tsr" "use envy\n\nfn main(root: Root) {\n    root.stdout.print(envy.get(root.env))\n}\n";
+  let code, o, e = tessera_cli [ "run"; Filename.concat pdir "grants/dep.tsr" ] in
   ok "grants-dep-toml-ignored" (code = 0 && o = "none\n") (sprintf "code %d, out %S, err %S" code o e);
-  Sys.remove (Filename.concat pdir "grants/vela.toml");
+  Sys.remove (Filename.concat pdir "grants/tessera.toml");
 
   (* git dependencies: a local file:// repository, fetched into a temporary
-     cache, pinned by vela.lock *)
+     cache, pinned by tessera.lock *)
   let gdir = Filename.concat pdir "git" in
   List.iter (fun d -> try Unix.mkdir d 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ()) [ gdir; Filename.concat gdir "repo"; Filename.concat gdir "app" ];
-  Unix.putenv "VELA_CACHE" (Filename.concat gdir "cache");
+  Unix.putenv "TESSERA_CACHE" (Filename.concat gdir "cache");
   let repo = Filename.concat gdir "repo" in
   let git args = Sys.command (String.concat " " (List.map Filename.quote ([ "git"; "-C"; repo; "-c"; "user.name=t"; "-c"; "user.email=t@t" ] @ args)) ^ " >/dev/null 2>&1") in
   let rev_of r =
@@ -6386,7 +6386,7 @@ fn main(root: Root) {
     ignore (Sys.command (sprintf "git -C %s rev-parse %s >%s" (Filename.quote repo) (Filename.quote r) (Filename.quote o)));
     String.trim (read_file o)
   in
-  let version v = Out_channel.with_open_bin (Filename.concat repo "greet.vela") (fun oc -> output_string oc (sprintf "pub fn hi() -> Str {\n    \"%s\"\n}\n" v)) in
+  let version v = Out_channel.with_open_bin (Filename.concat repo "greet.tsr") (fun oc -> output_string oc (sprintf "pub fn hi() -> Str {\n    \"%s\"\n}\n" v)) in
   ok "git-setup"
     (git [ "init"; "-q" ] = 0
      && (version "v1"; git [ "add"; "." ] = 0)
@@ -6398,10 +6398,10 @@ fn main(root: Root) {
   let v1 = rev_of "v1" and v2 = rev_of "v2" in
   let url = "file://" ^ repo in
   let gapp = "use greet\n\nfn main(root: Root) {\n    root.stdout.print(greet.hi())\n}\n" in
-  let gmain = Filename.concat gdir "app/main.vela" in
-  put "git/app/main.vela" gapp;
-  let lock = Filename.concat gdir "app/vela.lock" in
-  let gtoml dep = put "git/app/vela.toml" (sprintf "[package]\nname = \"app\"\n\n[dependencies]\ngreet = { %s }\n" dep) in
+  let gmain = Filename.concat gdir "app/main.tsr" in
+  put "git/app/main.tsr" gapp;
+  let lock = Filename.concat gdir "app/tessera.lock" in
+  let gtoml dep = put "git/app/tessera.toml" (sprintf "[package]\nname = \"app\"\n\n[dependencies]\ngreet = { %s }\n" dep) in
   let grun name want =
     match Modules.load_and_check gmain gapp with
     | items, [], _ -> (
@@ -6415,9 +6415,9 @@ fn main(root: Root) {
   let lock_has s = Sys.file_exists lock && Interp_util.find_sub (read_file lock) s 0 <> None in
   gtoml (sprintf "git = %S, tag = \"v1\"" url);
   grun "git-tag" "v1";
-  ok "git-lock-written" (lock_has (sprintf "greet %s tag:v1 %s blake2b:" url v1)) (if Sys.file_exists lock then read_file lock else "no vela.lock");
+  ok "git-lock-written" (lock_has (sprintf "greet %s tag:v1 %s blake2b:" url v1)) (if Sys.file_exists lock then read_file lock else "no tessera.lock");
   if native_enabled then begin
-    let code, o, e = vela_cli [ "run"; "--native"; gmain ] in
+    let code, o, e = tessera_cli [ "run"; "--native"; gmain ] in
     ok "git-tag/native" (code = 0 && o = "v1\n") (sprintf "code %d, out %S, err %S" code o e)
   end;
   (* the tag moves upstream: the lock still pins the old commit *)
@@ -6427,13 +6427,13 @@ fn main(root: Root) {
   Package.offline := true;
   grun "git-offline-cached" "v1";
   (* a changed cached copy no longer matches the lock *)
-  let cached = Filename.concat (Package.commit_dir url v1) "greet.vela" in
+  let cached = Filename.concat (Package.commit_dir url v1) "greet.tsr" in
   let orig = read_file cached in
   Out_channel.with_open_bin cached (fun oc -> output_string oc (orig ^ "// changed\n"));
   ok "git-hash-mismatch" (gcodes () = [ "E0323" ]) (String.concat "," (gcodes ()));
   Out_channel.with_open_bin cached (fun oc -> output_string oc orig);
   grun "git-hash-restored" "v1";
-  (* a changed tag in vela.toml is fetched, except offline *)
+  (* a changed tag in tessera.toml is fetched, except offline *)
   gtoml (sprintf "git = %S, tag = \"v2\"" url);
   ok "git-offline-unfetched" (gcodes () = [ "E0322" ]) (String.concat "," (gcodes ()));
   Package.offline := false;
@@ -6470,7 +6470,7 @@ fn main(root: Root) {
   grun "git-relock" "v2";
   (* capabilities of a git dependency are checked like any other *)
   version "v3";
-  Out_channel.with_open_bin (Filename.concat repo "greet.vela") (fun oc ->
+  Out_channel.with_open_bin (Filename.concat repo "greet.tsr") (fun oc ->
       output_string oc "pub fn hi() -> Str {\n    \"v3\"\n}\n\npub fn peek(fs: Fs) -> Bool {\n    fs.exists(\"x\")\n}\n");
   ok "git-v3" (git [ "commit"; "-qam"; "three" ] = 0 && git [ "tag"; "v3" ] = 0) "v3";
   gtoml (sprintf "git = %S, tag = \"v3\"" url);
@@ -6478,7 +6478,7 @@ fn main(root: Root) {
   gtoml (sprintf "git = %S, tag = \"v3\", caps = [\"fs\"]" url);
   grun "git-caps-granted" "v3";
 
-  (* the package index: vela index entry, vela search and vela add, with an
+  (* the package index: tessera index entry, tessera search and tessera add, with an
      index directory and git repositories made here *)
   let rdir = Filename.concat pdir "registry" in
   let rpath p = Filename.concat rdir p in
@@ -6486,18 +6486,18 @@ fn main(root: Root) {
     (rdir :: List.map rpath [ "index"; "color"; "peek"; "mover"; "cfun"; "app1"; "app2"; "app3"; "app4" ]);
   let rgit repo args = Sys.command (String.concat " " (List.map Filename.quote ([ "git"; "-C"; rpath repo; "-c"; "user.name=t"; "-c"; "user.email=t@t" ] @ args)) ^ " >/dev/null 2>&1") = 0 in
   let rput f s = Out_channel.with_open_bin (rpath f) (fun oc -> output_string oc s) in
-  (* run vela in [dir]; returns (exit code, stdout, stderr) *)
+  (* run tessera in [dir]; returns (exit code, stdout, stderr) *)
   let rcli dir args =
     let o = rpath "cli.out" and e = rpath "cli.err" in
     let code =
       Sys.command
-        (sprintf "cd %s && %s >%s 2>%s" (Filename.quote dir) (String.concat " " (List.map Filename.quote (vela_exe :: args))) (Filename.quote o) (Filename.quote e))
+        (sprintf "cd %s && %s >%s 2>%s" (Filename.quote dir) (String.concat " " (List.map Filename.quote (tessera_exe :: args))) (Filename.quote o) (Filename.quote e))
     in
     (code, read_file o, read_file e)
   in
   let has s sub = Interp_util.find_sub s sub 0 <> None in
   let show3 (c, o, e) = sprintf "code %d, out %S, err %S" c o e in
-  (* a package whose current tag goes into the index as `vela index entry` prints it *)
+  (* a package whose current tag goes into the index as `tessera index entry` prints it *)
   let index_entry repo file =
     let ((c, o, _) as r) = rcli (rpath repo) [ "index"; "entry" ] in
     if c = 0 then Out_channel.with_open_bin (rpath ("index/" ^ file)) (fun oc -> output_string oc o);
@@ -6506,14 +6506,14 @@ fn main(root: Root) {
   let url repo = "file://" ^ rpath repo in
   ok "registry-setup"
     (rgit "color" [ "init"; "-q" ]
-     && (rput "color/vela.toml" "[package]\nname = \"color\"\ndescription = \"Colors for terminal output\"\n";
-         rput "color/color.vela" "pub fn name() -> Str {\n    \"red\"\n}\n";
+     && (rput "color/tessera.toml" "[package]\nname = \"color\"\ndescription = \"Colors for terminal output\"\n";
+         rput "color/color.tsr" "pub fn name() -> Str {\n    \"red\"\n}\n";
          rgit "color" [ "add"; "." ])
      && rgit "color" [ "commit"; "-qm"; "one" ] && rgit "color" [ "tag"; "v1.2.0" ]
      && rgit "color" [ "remote"; "add"; "origin"; url "color" ])
     "could not create the color repository";
   (* a package with no tag yet, or with uncommitted changes, has no entry *)
-  rput "color/color.vela" "pub fn name() -> Str {\n    \"red\"\n}\n\npub fn red(out: Stdout, s: Str) {\n    out.print(s)\n}\n";
+  rput "color/color.tsr" "pub fn name() -> Str {\n    \"red\"\n}\n\npub fn red(out: Stdout, s: Str) {\n    out.print(s)\n}\n";
   let c, _, e = rcli (rpath "color") [ "index"; "entry" ] in
   ok "registry-entry-dirty" (c = 1 && has e "uncommitted changes") e;
   ok "registry-commit" (rgit "color" [ "commit"; "-qam"; "two" ]) "commit";
@@ -6531,7 +6531,7 @@ fn main(root: Root) {
   (* a package that uses Fs, indexed as pure: the index entry lies *)
   ok "registry-peek"
     (rgit "peek" [ "init"; "-q" ]
-     && (rput "peek/peek.vela" "pub fn peek(fs: Fs) -> Bool {\n    fs.exists(\"x\")\n}\n"; rgit "peek" [ "add"; "." ])
+     && (rput "peek/peek.tsr" "pub fn peek(fs: Fs) -> Bool {\n    fs.exists(\"x\")\n}\n"; rgit "peek" [ "add"; "." ])
      && rgit "peek" [ "commit"; "-qm"; "one" ] && rgit "peek" [ "tag"; "v1" ])
     "peek";
   let c, o, _ = rcli (rpath "peek") [ "index"; "entry" ] in
@@ -6549,17 +6549,17 @@ fn main(root: Root) {
   (* a package whose tag moves after it is indexed *)
   ok "registry-mover"
     (rgit "mover" [ "init"; "-q" ]
-     && (rput "mover/mover.vela" "pub fn hi() -> Str {\n    \"one\"\n}\n"; rgit "mover" [ "add"; "." ])
+     && (rput "mover/mover.tsr" "pub fn hi() -> Str {\n    \"one\"\n}\n"; rgit "mover" [ "add"; "." ])
      && rgit "mover" [ "commit"; "-qm"; "one" ] && rgit "mover" [ "tag"; "v1" ])
     "mover";
   rput "index/mover.toml" (entry "mover" "mover" "v1" (rev "mover" "v1") "Says hi" []);
   ok "registry-mover-moved"
-    ((rput "mover/mover.vela" "pub fn hi() -> Str {\n    \"two\"\n}\n"; rgit "mover" [ "commit"; "-qam"; "two" ]) && rgit "mover" [ "tag"; "-f"; "v1" ])
+    ((rput "mover/mover.tsr" "pub fn hi() -> Str {\n    \"two\"\n}\n"; rgit "mover" [ "commit"; "-qam"; "two" ]) && rgit "mover" [ "tag"; "-f"; "v1" ])
     "move the tag";
   (* a package that calls C *)
   ok "registry-cfun"
     (rgit "cfun" [ "init"; "-q" ]
-     && (rput "cfun/cfun.vela" "foreign \"c\" {\n    fn getpid() -> Int32\n}\n\npub fn pid(f: Foreign) -> Int {\n    getpid(f)\n}\n";
+     && (rput "cfun/cfun.tsr" "foreign \"c\" {\n    fn getpid() -> Int32\n}\n\npub fn pid(f: Foreign) -> Int {\n    getpid(f)\n}\n";
          rgit "cfun" [ "add"; "." ])
      && rgit "cfun" [ "commit"; "-qm"; "one" ] && rgit "cfun" [ "tag"; "v0.1.0" ])
     "cfun";
@@ -6568,19 +6568,19 @@ fn main(root: Root) {
   rput "index/cfun.toml" (entry "cfun" "cfun" "v0.1.0" (rev "cfun" "v0.1.0") "The process id, from C" [ "foreign" ]);
 
   (* no index, an unreachable one, a malformed one *)
-  Unix.putenv "VELA_INDEX" "";
+  Unix.putenv "TESSERA_INDEX" "";
   let c, _, e = rcli rdir [ "search"; "color" ] in
-  ok "registry-no-index" (c = 1 && has e "no package index is set" && has e "VELA_INDEX") e;
-  Unix.putenv "VELA_INDEX" ("file://" ^ rpath "nowhere");
+  ok "registry-no-index" (c = 1 && has e "no package index is set" && has e "TESSERA_INDEX") e;
+  Unix.putenv "TESSERA_INDEX" ("file://" ^ rpath "nowhere");
   let c, _, e = rcli rdir [ "search"; "color" ] in
   ok "registry-unreachable" (c = 1 && has e "cannot reach the package index") e;
   rput "bad.toml" "[[package]]\nname = \"x\"\ngit = \"ftp://x\"\ntag = \"v1\"\ncommit = \"abcdef0\"\n";
-  Unix.putenv "VELA_INDEX" (rpath "bad.toml");
+  Unix.putenv "TESSERA_INDEX" (rpath "bad.toml");
   let c, _, e = rcli rdir [ "search" ] in
   ok "registry-bad-index" (c = 1 && has e "bad.toml:3: `git` must be") e;
 
   (* search: every word in the name or description; the latest version by number *)
-  Unix.putenv "VELA_INDEX" (rpath "index");
+  Unix.putenv "TESSERA_INDEX" (rpath "index");
   let ((c, o, _) as r) = rcli rdir [ "search"; "terminal"; "COLORS" ] in
   ok "registry-search"
     (c = 0 && has o "color v1.10.0: Colors for terminal output\n  caps: stdout\n  older: v1.2.0\n" && not (has o "peek"))
@@ -6591,53 +6591,53 @@ fn main(root: Root) {
   ok "registry-search-none" (c = 0 && has o "no package matches") o;
   (* the index as a git repository *)
   ok "registry-index-git" (rgit "index" [ "init"; "-q" ] && rgit "index" [ "add"; "." ] && rgit "index" [ "commit"; "-qm"; "index" ]) "index repo";
-  Unix.putenv "VELA_INDEX" (url "index");
+  Unix.putenv "TESSERA_INDEX" (url "index");
   let c, o, e = rcli rdir [ "search"; "color" ] in
   ok "registry-search-git" (c = 0 && has o "color v1.10.0") (o ^ e);
-  Unix.putenv "VELA_INDEX" (rpath "index");
+  Unix.putenv "TESSERA_INDEX" (rpath "index");
 
   (* add: the latest version, with the caps the index lists; then it builds and runs *)
   let app_src = "use color\n\nfn main(root: Root) {\n    color.red(root.stdout, color.name())\n}\n" in
-  rput "app1/main.vela" app_src;
-  rput "app1/vela.toml" "[package]\nname = \"app\"\n\n[dependencies]\n\n[grants]\nenv = [\"HOME\"]\n";
+  rput "app1/main.tsr" app_src;
+  rput "app1/tessera.toml" "[package]\nname = \"app\"\n\n[dependencies]\n\n[grants]\nenv = [\"HOME\"]\n";
   let ((c, o, _) as r) = rcli (rpath "app1") [ "add"; "color" ] in
   ok "registry-add" (c = 0 && has o "added color v1.10.0" && has o "color may use: stdout\n") (show3 r);
-  let toml = read_file (rpath "app1/vela.toml") in
+  let toml = read_file (rpath "app1/tessera.toml") in
   ok "registry-add-toml"
     (toml = sprintf "[package]\nname = \"app\"\n\n[dependencies]\ncolor = { git = %S, tag = \"v1.10.0\", caps = [\"stdout\"] }\n\n[grants]\nenv = [\"HOME\"]\n" (url "color"))
     toml;
-  ok "registry-add-lock" (has (read_file (rpath "app1/vela.lock")) (sprintf "color %s tag:v1.10.0 %s blake2b:" (url "color") (rev "color" "v1.10.0"))) (read_file (rpath "app1/vela.lock"));
-  let c, o, e = rcli (rpath "app1") [ "run"; "main.vela" ] in
+  ok "registry-add-lock" (has (read_file (rpath "app1/tessera.lock")) (sprintf "color %s tag:v1.10.0 %s blake2b:" (url "color") (rev "color" "v1.10.0"))) (read_file (rpath "app1/tessera.lock"));
+  let c, o, e = rcli (rpath "app1") [ "run"; "main.tsr" ] in
   ok "registry-add-run" (c = 0 && o = "red\n") (show3 (c, o, e));
   let c, _, e = rcli (rpath "app1") [ "add"; "color" ] in
   ok "registry-add-twice" (c = 1 && has e "already a dependency") e;
-  (* a chosen version, with or without its `v`; a new vela.toml when there is none *)
+  (* a chosen version, with or without its `v`; a new tessera.toml when there is none *)
   let c, o, _ = rcli (rpath "app2") [ "add"; "color@1.2.0" ] in
   ok "registry-add-version"
     (c = 0 && has o "color may use no capabilities: it is pure"
-     && read_file (rpath "app2/vela.toml") = sprintf "[dependencies]\ncolor = { git = %S, tag = \"v1.2.0\", caps = [] }\n" (url "color"))
-    (o ^ read_file (rpath "app2/vela.toml"));
+     && read_file (rpath "app2/tessera.toml") = sprintf "[dependencies]\ncolor = { git = %S, tag = \"v1.2.0\", caps = [] }\n" (url "color"))
+    (o ^ read_file (rpath "app2/tessera.toml"));
   let c, _, e = rcli (rpath "app3") [ "add"; "color@v9" ] in
   ok "registry-add-no-version" (c = 1 && has e "no version v9 of `color`; it has v1.10.0, v1.2.0") e;
   let c, _, e = rcli (rpath "app3") [ "add"; "nosuch" ] in
   ok "registry-add-unknown" (c = 1 && has e "no package named `nosuch`") e;
   (* refused: the code uses more than the index lists, or the tag moved *)
   let c, _, e = rcli (rpath "app3") [ "add"; "peek" ] in
-  ok "registry-add-caps-mismatch" (c = 1 && has e "`peek` v1 uses fs, which the index does not list (it lists none)" && not (Sys.file_exists (rpath "app3/vela.toml"))) e;
+  ok "registry-add-caps-mismatch" (c = 1 && has e "`peek` v1 uses fs, which the index does not list (it lists none)" && not (Sys.file_exists (rpath "app3/tessera.toml"))) e;
   let c, _, e = rcli (rpath "app3") [ "add"; "mover" ] in
-  ok "registry-add-moved-tag" (c = 1 && has e "tag v1 of" && has e "was moved after the package was indexed" && not (Sys.file_exists (rpath "app3/vela.toml"))) e;
+  ok "registry-add-moved-tag" (c = 1 && has e "tag v1 of" && has e "was moved after the package was indexed" && not (Sys.file_exists (rpath "app3/tessera.toml"))) e;
   (* a package that calls C is added without trust; the program builds once the user trusts it *)
-  rput "app4/main.vela" "use cfun\n\nfn main(root: Root) {\n    root.stdout.print(\"{cfun.pid(root.foreign) > 0}\")\n}\n";
+  rput "app4/main.tsr" "use cfun\n\nfn main(root: Root) {\n    root.stdout.print(\"{cfun.pid(root.foreign) > 0}\")\n}\n";
   let ((c, o, _) as r) = rcli (rpath "app4") [ "add"; "cfun" ] in
-  ok "registry-add-foreign" (c = 0 && has o "cfun calls C (c)" && has o "[trust]\nforeign = [\"cfun\"]" && not (has (read_file (rpath "app4/vela.toml")) "[trust]")) (show3 r);
-  let c, _, e = rcli (rpath "app4") [ "check"; "main.vela" ] in
+  ok "registry-add-foreign" (c = 0 && has o "cfun calls C (c)" && has o "[trust]\nforeign = [\"cfun\"]" && not (has (read_file (rpath "app4/tessera.toml")) "[trust]")) (show3 r);
+  let c, _, e = rcli (rpath "app4") [ "check"; "main.tsr" ] in
   ok "registry-add-foreign-untrusted" (c = 1 && has e "E0320") e;
-  rput "app4/vela.toml" (read_file (rpath "app4/vela.toml") ^ "\n[trust]\nforeign = [\"cfun\"]\n");
-  let c, o, e = rcli (rpath "app4") [ "check"; "main.vela" ] in
+  rput "app4/tessera.toml" (read_file (rpath "app4/tessera.toml") ^ "\n[trust]\nforeign = [\"cfun\"]\n");
+  let c, o, e = rcli (rpath "app4") [ "check"; "main.tsr" ] in
   ok "registry-add-foreign-trusted" (c = 0 && has o "ok") (o ^ e);
-  Unix.putenv "VELA_INDEX" "";
+  Unix.putenv "TESSERA_INDEX" "";
 
-  (* the standard library declares its capabilities in src/std/vela.toml and is checked against it *)
+  (* the standard library declares its capabilities in src/std/tessera.toml and is checked against it *)
   let manifest = Lazy.force Package.std_manifest in
   let listed = List.sort compare (List.map (fun (d : Package.dep) -> d.dname) manifest.deps) in
   ok "std-manifest-complete" (listed = List.sort compare (List.map fst Std_text.modules)) (String.concat ", " listed);
@@ -6648,7 +6648,7 @@ fn main(root: Root) {
   let real_std = !Modules.std_modules in
   let std_errs name extra src =
     Modules.std_modules := extra @ real_std;
-    let _, ds, _ = Modules.load_and_check (name ^ ".vela") src in
+    let _, ds, _ = Modules.load_and_check (name ^ ".tsr") src in
     Modules.std_modules := real_std;
     ds
   in
@@ -6665,8 +6665,8 @@ fn main(root: Root) {
   let ds = std_errs "std-foreign" [ ("sneakyc", "foreign \"c\" {\n    fn getpid() -> Int32\n}\n\npub fn pid(f: Foreign) -> Int {\n    getpid(f)\n}\n") ]
       "use sneakyc\n\nfn main(root: Root) {\n    root.stdout.print(\"{sneakyc.pid(root.foreign)}\")\n}\n" in
   ok "std-foreign" (codes ds = [ "E0320"; "E0320" ]) (String.concat "; " (List.map (fun (d : Diag.t) -> d.code ^ " " ^ d.message) ds));
-  (* checked without any vela.toml, and fine for the real std *)
-  let _, ds, _ = Modules.load_and_check "std-http.vela" "use http\nuse json\n\nfn main(root: Root) {\n    root.stdout.print(http.reason(200))\n}\n" in
+  (* checked without any tessera.toml, and fine for the real std *)
+  let _, ds, _ = Modules.load_and_check "std-http.tsr" "use http\nuse json\n\nfn main(root: Root) {\n    root.stdout.print(http.reason(200))\n}\n" in
   ok "std-real-ok" (ds = []) (String.concat "; " (List.map (fun (d : Diag.t) -> d.code ^ " " ^ d.message) ds));
 
   (* find references and rename on real programs: renaming every function,
@@ -6676,7 +6676,7 @@ fn main(root: Root) {
   let refs_failures = ref [] and renamed = ref 0 in
   Array.iter
     (fun f ->
-      if Filename.check_suffix f ".vela" then begin
+      if Filename.check_suffix f ".tsr" then begin
         let path = Filename.concat "../examples" f in
         let src = In_channel.with_open_bin path In_channel.input_all in
         let load overrides =
@@ -6711,23 +6711,23 @@ fn main(root: Root) {
     (if Sys.file_exists "../examples" then Sys.readdir "../examples" else [||]);
   ok "refs-rename-examples" (!refs_failures = [] && (!renamed > 50 || not (Sys.file_exists "../examples"))) (sprintf "%d renamed; %s" !renamed (String.concat "\n" (List.rev !refs_failures)));
 
-  (* vela doc: doc comments directly above items, fields, variants and interface methods *)
+  (* tessera doc: doc comments directly above items, fields, variants and interface methods *)
   let doc_src =
     "// Geometry helpers.\n//\n// Second paragraph.\n\n// A point.\npub struct Point {\n    // Distance from the left.\n    x: Float,\n    y: Float,\n}\n\n// not a doc: a blank line follows\n\n// How far from the origin.\npub fn norm(self: Point) -> Float {\n    self.x\n}\n\npub enum Shape {\n    // A round one.\n    Circle(Float),\n    Dot,\n}\n\n// Things with an area.\npub interface Area {\n    // The area, in square units.\n    fn area(self) -> Float\n}\n\n// Shouts.\npub fn loud(self: Str) -> Str {\n    self.upper()\n}\n\n// Private.\nfn hidden() -> Int {\n    1\n}\n\npub fn pick[T: Area](xs: List[T], i: Int) -> T {\n    xs[i]\n}\n"
   in
-  let md = Doc.load_source "geom" "geom.vela" doc_src in
+  let md = Doc.load_source "geom" "geom.tsr" doc_src in
   let mdtext = Doc.markdown [ md ] in
   let has s = Interp_util.find_sub mdtext s 0 <> None in
   ok "doc-markdown"
     (has "# Module `geom`\n\nGeometry helpers.\n\nSecond paragraph.\n"
-     && has "### struct `Point`\n\n```vela\npub struct Point {\n    x: Float,\n    y: Float,\n}\n```\n\nA point.\n\n- `x`: Distance from the left.\n"
-     && has "#### Methods\n\n```vela\npub fn norm(self: Point) -> Float\n```\n\nHow far from the origin.\n"
+     && has "### struct `Point`\n\n```tessera\npub struct Point {\n    x: Float,\n    y: Float,\n}\n```\n\nA point.\n\n- `x`: Distance from the left.\n"
+     && has "#### Methods\n\n```tessera\npub fn norm(self: Point) -> Float\n```\n\nHow far from the origin.\n"
      && has "- `Circle`: A round one.\n" && has "Things with an area.\n\n- `area`: The area, in square units.\n"
-     && has "## Methods on `Str`\n\n```vela\npub fn loud(self: Str) -> Str\n```\n\nShouts.\n"
+     && has "## Methods on `Str`\n\n```tessera\npub fn loud(self: Str) -> Str\n```\n\nShouts.\n"
      && has "pub fn pick[T: Area](xs: List[T], i: Int) -> T\n"
      && (not (has "hidden")) && not (has "not a doc"))
     mdtext;
-  let all = Doc.markdown [ Doc.load_source ~all:true "geom" "geom.vela" doc_src ] in
+  let all = Doc.markdown [ Doc.load_source ~all:true "geom" "geom.tsr" doc_src ] in
   ok "doc-all" (Interp_util.find_sub all "fn hidden() -> Int\n```\n\nPrivate.\n" 0 <> None) all;
   let page = Doc.html [ md ] in
   let hp s = Interp_util.find_sub page s 0 <> None in
@@ -6742,7 +6742,7 @@ fn main(root: Root) {
 
   (* comments inside an expression stay where they were written *)
   let fmt_case name src want =
-    let got = try Fmt.format ~file:(name ^ ".vela") src with Diag.Fatal d -> "error: " ^ d.message in
+    let got = try Fmt.format ~file:(name ^ ".tsr") src with Diag.Fatal d -> "error: " ^ d.message in
     ok name (got = want) (sprintf "got:\n%s\nwant:\n%s" got want);
     check_fmt name src ()
   in
@@ -6796,9 +6796,9 @@ fn main(root: Root) {
     "fn f(o: Option[Int]) -> Int {\n    let n = o ?? { return 0 }\n    match o {\n        Some(_) => { return n },\n        None => { n = 1 },\n    }\n}\n";
 
   ok "fmt-use-pub"
-    (Fmt.format ~file:"fu.vela" "use geom // g\npub   fn f() -> Int { 1 }\npub struct S { a: Int }\n"
+    (Fmt.format ~file:"fu.tsr" "use geom // g\npub   fn f() -> Int { 1 }\npub struct S { a: Int }\n"
      = "use geom  // g\n\npub fn f() -> Int { 1 }\n\npub struct S {\n    a: Int,\n}\n")
-    (Fmt.format ~file:"fu.vela" "use geom // g\npub   fn f() -> Int { 1 }\npub struct S { a: Int }\n");
+    (Fmt.format ~file:"fu.tsr" "use geom // g\npub   fn f() -> Int { 1 }\npub struct S { a: Int }\n");
 
   (* the formatter on the examples and benchmarks too (with their comments) *)
   List.iter
@@ -6806,7 +6806,7 @@ fn main(root: Root) {
       if Sys.file_exists dir then
         Array.iter
           (fun f ->
-            if Filename.check_suffix f ".vela" then begin
+            if Filename.check_suffix f ".tsr" then begin
               let path = Filename.concat dir f in
               let src = In_channel.with_open_bin path In_channel.input_all in
               match Parser.parse_program path src with
@@ -6822,7 +6822,7 @@ fn main(root: Root) {
         if not (Sys.file_exists dir) then []
         else
           Sys.readdir dir |> Array.to_list |> List.sort compare
-          |> List.filter (fun f -> Filename.check_suffix f ".vela")
+          |> List.filter (fun f -> Filename.check_suffix f ".tsr")
           |> List.filter_map (fun f ->
                  let path = Filename.concat dir f in
                  let src = In_channel.with_open_bin path In_channel.input_all in
@@ -6835,7 +6835,7 @@ fn main(root: Root) {
   ok "fmt-repo-clean" (unformatted = []) ("not formatted: " ^ String.concat ", " unformatted);
   ok "fmt-every-program" (!fmt_failures = [])
     (String.concat "\n\n" (List.map (fun (n, m) -> n ^ ": " ^ m) (List.rev !fmt_failures)));
-  ok "fmt-checked-count" (Hashtbl.length fmt_checked > 90 || Sys.getenv_opt "VELA_TEST_ONLY" <> None) (string_of_int (Hashtbl.length fmt_checked));
+  ok "fmt-checked-count" (Hashtbl.length fmt_checked > 90 || Sys.getenv_opt "TESSERA_TEST_ONLY" <> None) (string_of_int (Hashtbl.length fmt_checked));
 
   (* ---------- struct embedding ---------- *)
   let module J = Json in
@@ -7066,19 +7066,19 @@ struct C {
     "note names the embedded path";
   (* forwarders for promoted methods are not reported as functions of their own *)
   ok "embed-caps"
-    (let _, _, infos = Modules.load_and_check "embed-caps.vela" (embed_base ^ "\nfn main(root: Root) {}\n") in
+    (let _, _, infos = Modules.load_and_check "embed-caps.tsr" (embed_base ^ "\nfn main(root: Root) {}\n") in
      let names = List.map (fun (i : Check.fn_info) -> i.name) infos in
      List.mem "Admin::greet" names && not (List.mem "Admin::hello" names) && not (List.mem "User::greet" names))
     "infos";
   (* a lowercase bare name is still a field missing its type *)
   errs "embed-lowercase" "struct P {\n    x\n}\n\nfn main(root: Root) {}\n" [ "E0003" ];
   ok "embed-fmt"
-    (Fmt.format ~file:"emb.vela" "struct A { x: Int }\nstruct S { A, auth.User,   Box[Int], n: Int }\n"
+    (Fmt.format ~file:"emb.tsr" "struct A { x: Int }\nstruct S { A, auth.User,   Box[Int], n: Int }\n"
      = "struct A {\n    x: Int,\n}\n\nstruct S {\n    A,\n    auth.User,\n    Box[Int],\n    n: Int,\n}\n")
-    (Fmt.format ~file:"emb.vela" "struct A { x: Int }\nstruct S { A, auth.User,   Box[Int], n: Int }\n");
+    (Fmt.format ~file:"emb.tsr" "struct A { x: Int }\nstruct S { A, auth.User,   Box[Int], n: Int }\n");
   (* the language server sees through promotion *)
   let est = Lsp.create () in
-  let euri = "file:///tmp/lsp-embed.vela" in
+  let euri = "file:///tmp/lsp-embed.tsr" in
   let edoc =
     embed_base
     ^ {|

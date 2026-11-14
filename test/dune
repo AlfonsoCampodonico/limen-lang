@@ -1,23 +1,23 @@
 (test
- (name test_vela)
- (libraries vela unix)
+ (name test_tessera)
+ (libraries tessera unix)
  (deps
   ../bin/main.exe
   ffi_test.c
-  (glob_files %{project_root}/examples/*.vela)
-  (glob_files %{project_root}/bench/*.vela)
+  (glob_files %{project_root}/examples/*.tsr)
+  (glob_files %{project_root}/bench/*.tsr)
   (glob_files tls/*.pem)
   (glob_files tls/*.py)
   (source_tree zoneinfo)))
 
-; `vela lsp` end to end over stdio.
+; `tessera lsp` end to end over stdio.
 (rule
  (alias runtest)
  (deps lsp_stdio.py %{exe:../bin/main.exe})
  (action
   (run python3 lsp_stdio.py %{exe:../bin/main.exe})))
 
-; `vela mcp` end to end over stdio.
+; `tessera mcp` end to end over stdio.
 (rule
  (alias runtest)
  (deps mcp_stdio.py %{exe:../bin/main.exe})

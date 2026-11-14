@@ -1,9 +1,9 @@
 {
-  "name": "vela",
-  "displayName": "Vela",
-  "description": "Vela language support: syntax highlighting, and errors, hover, go to definition, rename and completion from `vela lsp`.",
+  "name": "tessera",
+  "displayName": "Tessera",
+  "description": "Tessera language support: syntax highlighting, and errors, hover, go to definition, rename and completion from `tessera lsp`.",
   "version": "0.1.0",
-  "publisher": "vela-local",
+  "publisher": "tessera-local",
   "private": true,
   "license": "UNLICENSED",
   "engines": {
@@ -14,71 +14,71 @@
   ],
   "main": "./extension.js",
   "activationEvents": [
-    "workspaceContains:**/vela.toml"
+    "workspaceContains:**/tessera.toml"
   ],
   "contributes": {
     "languages": [
       {
-        "id": "vela",
+        "id": "tessera",
         "aliases": [
-          "Vela",
-          "vela"
+          "Tessera",
+          "tessera"
         ],
         "extensions": [
-          ".vela"
+          ".tsr"
         ],
         "configuration": "./language-configuration.json"
       }
     ],
     "grammars": [
       {
-        "language": "vela",
-        "scopeName": "source.vela",
-        "path": "./syntaxes/vela.tmLanguage.json"
+        "language": "tessera",
+        "scopeName": "source.tessera",
+        "path": "./syntaxes/tessera.tmLanguage.json"
       },
       {
-        "scopeName": "markdown.vela.codeblock",
-        "path": "./syntaxes/vela.markdown.tmLanguage.json",
+        "scopeName": "markdown.tessera.codeblock",
+        "path": "./syntaxes/tessera.markdown.tmLanguage.json",
         "injectTo": [
           "text.html.markdown"
         ],
         "embeddedLanguages": {
-          "meta.embedded.block.vela": "vela"
+          "meta.embedded.block.tessera": "tessera"
         }
       }
     ],
     "configuration": {
-      "title": "Vela",
+      "title": "Tessera",
       "properties": {
-        "vela.path": {
+        "tessera.path": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Path to the `vela` executable, set in your user settings (a workspace cannot set it). When empty, `vela` on the PATH is used, or else, in a trusted folder only, the build in that folder (`_build/default/bin/main.exe`).",
+          "markdownDescription": "Path to the `tessera` executable, set in your user settings (a workspace cannot set it). When empty, `tessera` on the PATH is used, or else, in a trusted folder only, the build in that folder (`_build/default/bin/main.exe`).",
           "scope": "machine"
         },
-        "vela.languageServer.enabled": {
+        "tessera.languageServer.enabled": {
           "type": "boolean",
           "default": true,
-          "description": "Start `vela lsp` for errors, hover, go to definition, references, rename and completion."
+          "description": "Start `tessera lsp` for errors, hover, go to definition, references, rename and completion."
         }
       }
     },
     "commands": [
       {
-        "command": "vela.restartLanguageServer",
+        "command": "tessera.restartLanguageServer",
         "title": "Restart Language Server",
-        "category": "Vela"
+        "category": "Tessera"
       }
     ],
     "configurationDefaults": {
-      "[vela]": {
+      "[tessera]": {
         "editor.tabSize": 4,
         "editor.insertSpaces": true
       }
     }
   },
   "scripts": {
-    "package": "vsce package --allow-missing-repository --skip-license -o vela.vsix",
+    "package": "vsce package --allow-missing-repository --skip-license -o tessera.vsix",
     "test": "node test/grammar.test.js"
   },
   "dependencies": {
@@ -92,9 +92,9 @@
   "capabilities": {
     "untrustedWorkspaces": {
       "supported": "limited",
-      "description": "In a folder you have not trusted, the extension does not run the folder's own build of `vela`; highlighting and `vela` from your PATH or user settings still work.",
+      "description": "In a folder you have not trusted, the extension does not run the folder's own build of `tessera`; highlighting and `tessera` from your PATH or user settings still work.",
       "restrictedConfigurations": [
-        "vela.path"
+        "tessera.path"
       ]
     },
     "virtualWorkspaces": false

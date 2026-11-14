@@ -1,4 +1,4 @@
-; How fast vela checks a program, by phase: dune exec bench/checkspeed/checkspeed.exe -- FILE
+; How fast tessera checks a program, by phase: dune exec bench/checkspeed/checkspeed.exe -- FILE
 (executable
  (name checkspeed)
- (libraries vela unix))
+ (libraries tessera unix))

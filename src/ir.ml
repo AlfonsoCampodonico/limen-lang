@@ -61,7 +61,7 @@ type rhs =
   | CallC of Ffi.csig * atom list * (string * string * Span.t * bool) list * Span.t
       (* a foreign C function; the Foreign capability first, then the
          non-Out arguments that are not callbacks; all borrowed. Then the
-         callbacks, in order: each top-level function's C name, its Vela
+         callbacks, in order: each top-level function's C name, its Tessera
          name, where it is declared, and whether it takes the call's
          Foreign first. *)
 

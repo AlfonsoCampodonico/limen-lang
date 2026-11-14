@@ -18,15 +18,15 @@
 // It reaches the API server through `kubectl proxy`, which holds the
 // credentials. That proxy is the only thing it can reach:
 //
-//   kind create cluster --name vela-demo                (kubectl now points at it)
+//   kind create cluster --name tessera-demo                (kubectl now points at it)
 //   kubectl apply -f examples/k8s/staticsite-crd.yaml
 //   kubectl proxy --port 8001 &
-//   vela run examples/site_operator.vela --grant net=127.0.0.1:8001
+//   tessera run examples/site_operator.tsr --grant net=127.0.0.1:8001
 //   kubectl apply -f examples/k8s/hello-site.yaml       (in another terminal)
 //
 // `-- once` makes one pass and exits. The tests need no cluster:
 //
-//   vela test examples/site_operator.vela
+//   tessera test examples/site_operator.tsr
 use http
 use json
 use time
@@ -128,7 +128,7 @@ struct Object {
 }
 
 fn labels(s: Site) -> json.Value {
-    obj([("app.kubernetes.io/name", str("static-site")), ("vela.dev/site", str(s.name))])
+    obj([("app.kubernetes.io/name", str("static-site")), ("tessera.dev/site", str(s.name))])
 }
 
 fn metadata(s: Site, name: Str) -> json.Value {
@@ -138,7 +138,7 @@ fn metadata(s: Site, name: Str) -> json.Value {
         ("labels", labels(s)),
         // the site owns it: deleting the site deletes it
         ("ownerReferences", one(obj([
-            ("apiVersion", str("vela.dev/v1")),
+            ("apiVersion", str("tessera.dev/v1")),
             ("kind", str("StaticSite")),
             ("name", str(s.name)),
             ("uid", str(s.uid)),
@@ -180,7 +180,7 @@ fn pod(s: Site) -> json.Value {
     obj([
         ("metadata", obj([
             ("labels", labels(s)),
-            ("annotations", obj([("vela.dev/page", str(fingerprint(s.html)))])),
+            ("annotations", obj([("tessera.dev/page", str(fingerprint(s.html)))])),
         ])),
         ("spec", obj([
             ("containers", one(obj([
@@ -289,12 +289,12 @@ fn call(net: Net, base: Str, method: Str, path: Str, content_type: Str, body: St
 // ours, so a change made to them by hand is reverted (`force`); fields we
 // never set are left alone.
 fn apply(net: Net, base: Str, o: Object) -> Result[(Int, json.Value), Str] {
-    let query = "?fieldManager=vela-site-operator&force=true"
+    let query = "?fieldManager=tessera-site-operator&force=true"
     call(net, base, "PATCH", o.path + query, "application/apply-patch+yaml", json.stringify(o.body))
 }
 
 fn set_status(net: Net, base: Str, s: Site, st: Status) -> Result[(), Str] {
-    let path = "/apis/vela.dev/v1/namespaces/{s.namespace}/staticsites/{s.name}/status"
+    let path = "/apis/tessera.dev/v1/namespaces/{s.namespace}/staticsites/{s.name}/status"
     let patch = obj([("status", obj([
         ("readyReplicas", num(st.ready)),
         ("url", str(st.url)),
@@ -343,7 +343,7 @@ fn sync(log: Log, net: Net, base: Str, s: Site, seen: Seen) -> Result[Seen, Str]
 }
 
 fn pass(log: Log, net: Net, base: Str, seen: Seen) -> Result[Seen, Str] {
-    let (_, list) = call(net, base, "GET", "/apis/vela.dev/v1/staticsites", "", "")?
+    let (_, list) = call(net, base, "GET", "/apis/tessera.dev/v1/staticsites", "", "")?
     let items = dig(list, ["items"]) ?? json.Arr([])
     let mut next = map()
     for item in items.as_list() ?? [] {
@@ -392,7 +392,7 @@ fn event_text(line: Str) -> Option[Str] {
 fn watched() -> List[Str] {
     let mine = "labelSelector=app.kubernetes.io%2Fname%3Dstatic-site"
     [
-        "/apis/vela.dev/v1/staticsites?",
+        "/apis/tessera.dev/v1/staticsites?",
         "/apis/apps/v1/deployments?{mine}&",
         "/api/v1/configmaps?{mine}&",
         "/api/v1/services?{mine}&",
@@ -539,7 +539,7 @@ test "the deployment serves the page" {
 test "a new page rolls the pods" {
     let before = deployment(site("hello", "<h1>hi</h1>", 1)).body
     let after = deployment(site("hello", "<h1>bye</h1>", 1)).body
-    let page = ["spec", "template", "metadata", "annotations", "vela.dev/page"]
+    let page = ["spec", "template", "metadata", "annotations", "tessera.dev/page"]
     assert(str_at(before, page) != str_at(after, page))
     assert_eq(str_at(before, page), str_at(deployment(site("hello", "<h1>hi</h1>", 5)).body, page))
 }

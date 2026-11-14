@@ -35,7 +35,7 @@ let tuples =
         { st_name = Ast.tuple_name n; st_span = sp; st_gen = gen; st_bounds = []; st_pub = true; st_embeds = []; st_foreign = None;
           st_fields = List.mapi (fun i g -> (string_of_int i, sp, { Ast.tdesc = Ast.TyName (g, []); tspan = sp })) gen })
 
-(* Built-in methods of List and Map written in Vela (std/methods.vela). They
+(* Built-in methods of List and Map written in Tessera (std/methods.tsr). They
    are keyed like methods (`List::group_by`) and every file can call them. *)
 let methods_file = "<builtin>"
 
@@ -49,7 +49,7 @@ let methods =
          | it -> it)
        (Parser.parse_program methods_file Methods_text.text))
 
-(* The names of the built-in methods written in Vela for type [tn]. *)
+(* The names of the built-in methods written in Tessera for type [tn]. *)
 let method_names tn =
   List.filter_map
     (function

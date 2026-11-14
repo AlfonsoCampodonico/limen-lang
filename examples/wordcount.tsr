@@ -1,4 +1,4 @@
-// vela run examples/wordcount.vela --grant fs=examples:ro
+// tessera run examples/wordcount.tsr --grant fs=examples:ro
 
 struct Count {
     word: Str,

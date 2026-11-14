@@ -1,14 +1,14 @@
 {
-  "scopeName": "markdown.vela.codeblock",
+  "scopeName": "markdown.tessera.codeblock",
   "injectionSelector": "L:text.html.markdown",
   "patterns": [
     {
-      "include": "#vela-block"
+      "include": "#tessera-block"
     }
   ],
   "repository": {
-    "vela-block": {
-      "begin": "(^|\\G)(\\s*)(`{3,}|~{3,})\\s*(?i:(vela)(\\s+[^`~]*)?$)",
+    "tessera-block": {
+      "begin": "(^|\\G)(\\s*)(`{3,}|~{3,})\\s*(?i:(tessera)(\\s+[^`~]*)?$)",
       "beginCaptures": {
         "3": {
           "name": "punctuation.definition.markdown"
@@ -28,10 +28,10 @@
         {
           "begin": "(^|\\G)(\\s*)(.*)",
           "while": "(^|\\G)(?!\\s*([`~]{3,})\\s*$)",
-          "contentName": "meta.embedded.block.vela",
+          "contentName": "meta.embedded.block.tessera",
           "patterns": [
             {
-              "include": "source.vela"
+              "include": "source.tessera"
             }
           ]
         }

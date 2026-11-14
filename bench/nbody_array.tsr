@@ -1,4 +1,4 @@
-// n-body with a fixed-size array, `Array[Body, 5]`: the Vela equivalent of
+// n-body with a fixed-size array, `Array[Body, 5]`: the Tessera equivalent of
 // C's `Body bs[5]`, so the C compiler knows the body count at compile time.
 struct Body {
     x: Float,

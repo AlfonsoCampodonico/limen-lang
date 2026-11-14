@@ -9,11 +9,11 @@
 // With no arguments it runs a demo: the server and a client in one program,
 // over loopback, with the database in memory.
 //
-//   vela run examples/todo_api.vela --grant listen=127.0.0.1:0 --grant net=127.0.0.1
+//   tessera run examples/todo_api.tsr --grant listen=127.0.0.1:0 --grant net=127.0.0.1
 //
 // To serve for real, on port 8080 (or `serve PORT`) with the database in todos.db:
 //
-//   vela run examples/todo_api.vela --grant listen=127.0.0.1:8080 --grant fs=. -- serve
+//   tessera run examples/todo_api.tsr --grant listen=127.0.0.1:8080 --grant fs=. -- serve
 //   curl -X POST localhost:8080/todos -d '{"title": "buy milk"}'
 //   curl localhost:8080/todos
 //

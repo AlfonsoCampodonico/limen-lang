@@ -15,13 +15,13 @@ let cc () = match Sys.getenv_opt "CC" with Some c when c <> "" -> c | _ -> "cc"
 (* Compile [c_text] to [exe]. Returns the compiler's output on failure. *)
 (* No FMA contraction: float results must not depend on the C compiler. *)
 (* A program that may use TLS (Cgen marks it) gets the TLS core pasted in
-   ahead of the runtime and is linked with OpenSSL, as found when vela was
+   ahead of the runtime and is linked with OpenSSL, as found when tessera was
    built (Openssl_config). Without OpenSSL it still compiles, and its TLS
    operations fail with an error saying so. Returns the C text to compile and
    the extra compiler and linker flags. *)
 let prepare c_text =
   if Openssl_config.found && String.starts_with ~prefix:Cgen.tls_marker c_text then
-    ("#ifndef _GNU_SOURCE\n#define _GNU_SOURCE\n#endif\n#define VELA_TLS 1\n" ^ Tls_text.text ^ c_text, Openssl_config.cflags, Openssl_config.libs)
+    ("#ifndef _GNU_SOURCE\n#define _GNU_SOURCE\n#endif\n#define TESSERA_TLS 1\n" ^ Tls_text.text ^ c_text, Openssl_config.cflags, Openssl_config.libs)
   else (c_text, [], [])
 
 (* The compiler's command line, as argv. *)
@@ -39,20 +39,20 @@ let command ?(flags = [ "-O3" ]) ?(cflags = []) ?(libs = []) c_file exe =
    takes milliseconds), so binaries are kept by a digest of everything that
    decides them: the exact C text, the compiler's command line, which
    compiler it is, and the environment variables that change what it finds.
-   A rebuild of an unchanged program copies the binary instead. VELA_CACHE
+   A rebuild of an unchanged program copies the binary instead. TESSERA_CACHE
    names another directory, or `off` to compile every time. Failing to read
    or write the cache never fails a build: it just compiles. *)
 
 let cache_dir () =
-  match Sys.getenv_opt "VELA_CACHE" with
+  match Sys.getenv_opt "TESSERA_CACHE" with
   | Some "off" -> None
   | Some d when d <> "" -> Some d
   | _ -> (
     match (Sys.getenv_opt "XDG_CACHE_HOME", Sys.getenv_opt "HOME") with
-    | Some d, _ when d <> "" -> Some (Filename.concat d "vela")
+    | Some d, _ when d <> "" -> Some (Filename.concat d "tessera")
     | _, Some h when h <> "" ->
       let mac = Filename.concat h "Library/Caches" in
-      Some (if Sys.file_exists mac then Filename.concat mac "vela" else Filename.concat h ".cache/vela")
+      Some (if Sys.file_exists mac then Filename.concat mac "tessera" else Filename.concat h ".cache/tessera")
     | _ -> None)
 
 (* The program `name` runs as, found on the PATH. *)
@@ -163,5 +163,5 @@ let build ?flags ?tests items exe =
   | Error m, libs ->
     (* most likely a missing library: say which ones the program links *)
     Error
-      (m ^ Printf.sprintf "vela: the program links foreign libraries (%s); check that they are installed where the C compiler finds them\n"
+      (m ^ Printf.sprintf "tessera: the program links foreign libraries (%s); check that they are installed where the C compiler finds them\n"
              (String.concat ", " libs))

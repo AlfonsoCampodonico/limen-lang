@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Build each benchmark with vela and with cc -O2, check outputs match, and
+"""Build each benchmark with tessera and with cc -O2, check outputs match, and
 report the best of N wall-clock runs.  Usage: python3 bench/run.py [runs]"""
 import os, subprocess, sys, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-VELA = os.path.join(ROOT, "_build", "default", "bin", "main.exe")
+TESSERA = os.path.join(ROOT, "_build", "default", "bin", "main.exe")
 OUT = os.path.join(ROOT, "_build", "bench")
 RUNS = int(sys.argv[1]) if len(sys.argv) > 1 else 3
 SEQUENTIAL = ["fib", "sieve", "nbody", "nbody_array", "pipeline"]
@@ -31,26 +31,26 @@ def build_c(name):
     return exe
 
 
-def build_vela(name):
-    exe = os.path.join(OUT, name + "-vela")
-    subprocess.run([VELA, "build", os.path.join(ROOT, "bench", name + ".vela"), "-o", exe], check=True)
+def build_tessera(name):
+    exe = os.path.join(OUT, name + "-tessera")
+    subprocess.run([TESSERA, "build", os.path.join(ROOT, "bench", name + ".tsr"), "-o", exe], check=True)
     return exe
 
 
 print("single-threaded workloads")
-print(f"{'benchmark':<10} {'C (s)':>8} {'Vela (s)':>9} {'Vela/C':>7}  same output")
+print(f"{'benchmark':<10} {'C (s)':>8} {'Tessera (s)':>9} {'Tessera/C':>7}  same output")
 for n in SEQUENTIAL:
     tc, oc = best([build_c(C_SOURCE.get(n, n))])
-    tw, ow = best([build_vela(n)])
+    tw, ow = best([build_tessera(n)])
     print(f"{n:<10} {tc:>8.3f} {tw:>9.3f} {tw / tc:>6.2f}x  {'yes' if oc == ow else 'NO'}")
 
-one = dict(os.environ, VELA_THREADS="1")
+one = dict(os.environ, TESSERA_THREADS="1")
 print("\nparallel workloads (group/go)")
-print(f"{'benchmark':<10} {'C seq':>8} {'C pthreads':>11} {'Vela 1 thr':>11} {'Vela all':>9} {'Vela/C seq':>11} {'Vela/C thr':>11}  same output")
+print(f"{'benchmark':<10} {'C seq':>8} {'C pthreads':>11} {'Tessera 1 thr':>11} {'Tessera all':>9} {'Tessera/C seq':>11} {'Tessera/C thr':>11}  same output")
 for n in PARALLEL:
     ts, os_ = best([build_c(n)])
     tp, op = best([build_c(n + "_pthreads")])
-    w = build_vela(n)
+    w = build_tessera(n)
     t1, o1 = best([w], env=one)
     ta, oa = best([w])
     same = os_ == op == o1 == oa

@@ -9,7 +9,7 @@
 //   }
 //   db.close()
 //
-// The module calls SQLite itself: src/std/vela.toml trusts it with C, so a
+// The module calls SQLite itself: src/std/tessera.toml trusts it with C, so a
 // program needs no foreign grant to use it, only the Fs for the database's
 // directory (sql.memory() needs nothing). What it lets SQLite touch stays
 // inside that grant: the file is a path under the granted directory, opened
@@ -54,13 +54,13 @@ foreign "sqlite3" {
 }
 
 // the runtime's helpers: copy C memory into Bytes, and the handle table
-// that keeps connection pointers out of Vela values
-foreign "vela" {
-    fn vela_copy(p: Handle, n: Int) -> Bytes
-    fn vela_handle_new(p: Handle) -> Int
-    fn vela_handle_acquire(id: Int) -> Handle
-    fn vela_handle_release(id: Int) -> Handle
-    fn vela_handle_close(id: Int) -> Handle
+// that keeps connection pointers out of Tessera values
+foreign "tessera" {
+    fn tessera_copy(p: Handle, n: Int) -> Bytes
+    fn tessera_handle_new(p: Handle) -> Int
+    fn tessera_handle_acquire(id: Int) -> Handle
+    fn tessera_handle_release(id: Int) -> Handle
+    fn tessera_handle_close(id: Int) -> Handle
 }
 
 // result codes and flags from sqlite3.h
@@ -122,7 +122,7 @@ fn connect(path: Str, read_only: Bool) -> Result[Db, IoError] {
     sqlite3_busy_timeout(h, 5000)
     // no temporary files outside the grant: temp tables and sorts stay in memory
     sqlite3_exec(h, "PRAGMA temp_store = MEMORY", 0, 0)
-    Ok(Db { id: vela_handle_new(h) })
+    Ok(Db { id: tessera_handle_new(h) })
 }
 
 // Open (or create) the database file `name` under the directory `fs` grants.
@@ -151,12 +151,12 @@ fn closed() -> IoError {
 // Run `body` with the connection, counted as in use so a close in another
 // task waits for it; the connection is closed here if a close came meanwhile.
 fn using[T](self: Db, body: fn(Handle) -> Result[T, IoError]) -> Result[T, IoError] {
-    let h = vela_handle_acquire(self.id)
+    let h = tessera_handle_acquire(self.id)
     if h.addr == 0 {
         return Err(closed())
     }
     let r = catch(|| body(h))
-    let last = vela_handle_release(self.id)
+    let last = tessera_handle_release(self.id)
     if last.addr != 0 {
         // the last use after a close: the connection goes now
         let rc = sqlite3_close_v2(last)
@@ -170,12 +170,12 @@ fn using[T](self: Db, body: fn(Handle) -> Result[T, IoError]) -> Result[T, IoErr
 // Close the connection; using the Db afterwards gives an error. Operations
 // still running in other tasks finish first.
 pub fn close(self: Db) -> Result[(), IoError] {
-    let h = vela_handle_acquire(self.id)
+    let h = tessera_handle_acquire(self.id)
     if h.addr == 0 {
         return Err(closed())
     }
-    vela_handle_close(self.id)
-    let last = vela_handle_release(self.id)
+    tessera_handle_close(self.id)
+    let last = tessera_handle_release(self.id)
     if last.addr == 0 {
         return Ok(())
     }
@@ -237,11 +237,11 @@ fn column(st: Handle, i: Int) -> Value {
         2 => Float(sqlite3_column_double(st, i)),
         3 => {
             let p = sqlite3_column_text(st, i)
-            Text(vela_copy(p, sqlite3_column_bytes(st, i)).to_str())
+            Text(tessera_copy(p, sqlite3_column_bytes(st, i)).to_str())
         },
         4 => {
             let p = sqlite3_column_blob(st, i)
-            Blob(vela_copy(p, sqlite3_column_bytes(st, i)))
+            Blob(tessera_copy(p, sqlite3_column_bytes(st, i)))
         },
         _ => Null,
     }

@@ -1,4 +1,4 @@
-/* Vela C runtime. Included verbatim at the top of every generated program.
+/* Tessera C runtime. Included verbatim at the top of every generated program.
    Its behaviour mirrors the interpreter (src/interp.ml and src/caps.ml). */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -36,9 +36,9 @@ typedef uint8_t W_Unit;
 
 /* Counted allocations: every runtime object (strings, lists, closures,
    capabilities, boxed enums) goes through w_alloc/w_free, so tests can check
-   that reference counting frees everything (VELA_LEAKCHECK=1). */
+   that reference counting frees everything (TESSERA_LEAKCHECK=1). */
 static int64_t w_live;
-static int64_t w_allocs;   /* allocations ever made: `vela test --bench` reports them per operation */
+static int64_t w_allocs;   /* allocations ever made: `tessera test --bench` reports them per operation */
 
 /* Every allocation has a header. While a panic boundary (a `catch` or a
    task) is active, each object the task allocates is linked into the
@@ -168,7 +168,7 @@ static void *w_realloc(void *p, size_t n) {
   return q;
 }
 static void w_leakcheck(void) {
-  if (getenv("VELA_LEAKCHECK")) fprintf(stderr, "vela-leakcheck: %lld live\n", (long long)__atomic_load_n(&w_live, __ATOMIC_ACQUIRE));
+  if (getenv("TESSERA_LEAKCHECK")) fprintf(stderr, "tessera-leakcheck: %lld live\n", (long long)__atomic_load_n(&w_live, __ATOMIC_ACQUIRE));
 }
 
 /* A panic boundary: `catch(|| ...)`, and every task. A panic inside one
@@ -209,7 +209,7 @@ __attribute__((noreturn)) static void w_unwind_to(WCatch **slot, WCatch *c) {
   *slot = c->prev;
   c->unwinding = 1;
   memset(&c->uexc, 0, sizeof c->uexc);
-  c->uexc.exception_class = 0x56454c4150414e43ULL; /* "VELAPANC" */
+  c->uexc.exception_class = 0x56454c4150414e43ULL; /* "TESSERAPANC" */
   _Unwind_ForcedUnwind(&c->uexc, w_unwind_stop, c);
   _longjmp(c->jb, 1);
 }
@@ -368,9 +368,9 @@ static inline int64_t w_idx(int64_t i, int64_t n, const char *where) {
 
 /* ---------- lists ---------- */
 
-#define VELA_LIST_STRUCT(L, T) struct L { int64_t rc; int64_t len; int64_t cap; T *data; };
+#define TESSERA_LIST_STRUCT(L, T) struct L { int64_t rc; int64_t len; int64_t cap; T *data; };
 
-#define VELA_LIST_FUNCS(L, T, P)                                                              \
+#define TESSERA_LIST_FUNCS(L, T, P)                                                              \
   static void L##_kids(void *o) { L *l = (L *)o; for (int64_t i = 0; i < l->len; i++) P##_drop(l->data[i]); } \
   static L *L##_new(int64_t cap) {                                                            \
     L *l = (L *)w_alloc_k(sizeof(L), WK_LIST);                                                \
@@ -444,7 +444,7 @@ static inline int64_t w_idx(int64_t i, int64_t n, const char *where) {
   }
 
 /* Stable merge sort, by the element type's P##_cmp order. */
-#define VELA_LIST_SORT(L, T, P)                                                               \
+#define TESSERA_LIST_SORT(L, T, P)                                                               \
   static L *L##_sort(L *l) {                                                                  \
     L *c = L##_slice(l, 0, l->len);                                                           \
     int64_t n = c->len;                                                                       \
@@ -530,10 +530,10 @@ __attribute__((noreturn)) static void w_panic_key(WBuf *key, const char *where) 
   w_panic_c(m.p, where);
 }
 
-#define VELA_MAP_STRUCT(M, K, V) \
+#define TESSERA_MAP_STRUCT(M, K, V) \
   struct M { int64_t rc; int64_t len, n, cap, icap; K *keys; V *vals; uint8_t *live; int64_t *idx; };
 
-#define VELA_MAP_FUNCS(M, K, KN, V, VN)                                                       \
+#define TESSERA_MAP_FUNCS(M, K, KN, V, VN)                                                       \
   static void M##_kids(void *o) {                                                             \
     M *m = (M *)o;                                                                            \
     for (int64_t i = 0; i < m->n; i++) if (m->live[i]) { KN##_drop(m->keys[i]); VN##_drop(m->vals[i]); } \
@@ -658,12 +658,12 @@ __attribute__((noreturn)) static void w_panic_key(WBuf *key, const char *where) 
 
 typedef struct L_Int L_Int;
 typedef struct L_Str L_Str;
-VELA_LIST_STRUCT(L_Int, int64_t)
-VELA_LIST_STRUCT(L_Str, WStr *)
-VELA_LIST_FUNCS(L_Int, int64_t, Int)
-VELA_LIST_FUNCS(L_Str, WStr *, Str)
-VELA_LIST_SORT(L_Int, int64_t, Int)
-VELA_LIST_SORT(L_Str, WStr *, Str)
+TESSERA_LIST_STRUCT(L_Int, int64_t)
+TESSERA_LIST_STRUCT(L_Str, WStr *)
+TESSERA_LIST_FUNCS(L_Int, int64_t, Int)
+TESSERA_LIST_FUNCS(L_Str, WStr *, Str)
+TESSERA_LIST_SORT(L_Int, int64_t, Int)
+TESSERA_LIST_SORT(L_Str, WStr *, Str)
 
 static int64_t L_Int_sum(L_Int *l) { int64_t s = 0; for (int64_t i = 0; i < l->len; i++) s += l->data[i]; return s; }
 static WStr *L_Str_join(L_Str *l, WStr *sep) {
@@ -997,13 +997,13 @@ static void w_init(int argc, char **argv) {
       g_listen[g_nlisten++] = strdup(g + 7);
     } else w_usage("unknown grant");
   }
-  /* restrict the whole process to the grants (vela_sandbox.h), before any
+  /* restrict the whole process to the grants (tessera_sandbox.h), before any
      thread starts; --no-sandbox turns it off, for debugging */
   if (!g_no_sandbox) {
     WSandboxSpec sb = { g_fs_root, g_fs_root ? (int)g_fs_ro : 0, g_nhosts > 0 || g_nlisten > 0, g_nexec > 0 };
     char err[512];
     if (w_sandbox_enter(&sb, err, sizeof err) < 0) {
-      fprintf(stderr, "vela: %s (run with --no-sandbox to go without it)\n", err);
+      fprintf(stderr, "tessera: %s (run with --no-sandbox to go without it)\n", err);
       exit(1);
     }
   }
@@ -1407,8 +1407,8 @@ static int64_t Cap_now_ms(void) {
 }
 
 /* ---------- fibers and the work-stealing scheduler ----------
-   Every Vela task, and main itself, runs as a fiber: a small mmap'd stack
-   plus saved registers. Worker threads (one per core, VELA_THREADS to
+   Every Tessera task, and main itself, runs as a fiber: a small mmap'd stack
+   plus saved registers. Worker threads (one per core, TESSERA_THREADS to
    override) each keep a local run queue; an idle worker steals from the
    others. A fiber that must wait (for a group, a channel or a socket)
    parks: it switches back to its worker's scheduler, which then runs the
@@ -1507,7 +1507,7 @@ static void w_frame_init(void **frame, WFiber *f) {
   frame[6] = (void *)w_ctx_tramp;       /* return address */
 }
 #else
-#error "Vela fibers need arm64 or x86_64"
+#error "Tessera fibers need arm64 or x86_64"
 #endif
 
 typedef struct WWorker {
@@ -1746,7 +1746,7 @@ static void *w_worker_thread(void *arg) {
 static pthread_once_t w_pool_once = PTHREAD_ONCE_INIT;
 static void w_pool_start(void) {
   long n = sysconf(_SC_NPROCESSORS_ONLN);
-  const char *e = getenv("VELA_THREADS");
+  const char *e = getenv("TESSERA_THREADS");
   if (e) n = atol(e);
   if (n > W_MAX_WORKERS) n = W_MAX_WORKERS;
   if (w_virtual) n = 1;   /* virtual time: tasks take turns on one thread, in start order, the same every run */
@@ -1816,7 +1816,7 @@ void w_fiber_main(WFiber *f) {
 
 /* Run [entry] as the main fiber; return when it finishes. */
 static void w_run(void (*entry)(void *), void *arg) {
-  const char *e = getenv("VELA_STACK_KB");
+  const char *e = getenv("TESSERA_STACK_KB");
   if (e && atol(e) > 0) w_stack_size = (size_t)atol(e) * 1024;
   pthread_mutex_lock(&w_global_mu);
   WWorker *w = w_worker_new();
@@ -3318,13 +3318,13 @@ static WIo Cap_conn_write(WCap *c, WStr *s) {
 }
 
 /* ---------- TLS ----------
-   On the core in vela_tls.h, pasted ahead of this header (with VELA_TLS
+   On the core in tessera_tls.h, pasted ahead of this header (with TESSERA_TLS
    defined) when a program can use TLS and OpenSSL was found. A TLS Conn is
    a plain Conn whose reads and writes go through its session; waits park
    the task on the poller exactly as for plain sockets. A server session
    does its handshake inside the first read or write, so accept() never
    waits for a slow client. */
-#ifdef VELA_TLS
+#ifdef TESSERA_TLS
 static void w_tls_release(WCap *c) {
   if (c->kind == CAP_LISTENER) SSL_CTX_free((SSL_CTX *)c->tls);
   else vtls_free((VTls *)c->tls);
@@ -3538,10 +3538,10 @@ static int32_t w_ffi_i32(int64_t v, const char *arg, const char *where) {
 static WStr *w_ffi_str(const char *p) { return p ? Str_from(p, (int64_t)strlen(p)) : Str_new(0); }
 /* Callbacks from C (see ffi_callback_def in cgen.ml). C may call one only
    during its foreign call, on the same thread: that is the calling task's
-   fiber, which the callback runs on. A thread Vela did not start has none. */
+   fiber, which the callback runs on. A thread Tessera did not start has none. */
 static WFiber *w_cb_fiber(const char *where) {
   WWorker *w = w_self();
-  if (!w || !w->current) w_fatal_c("a callback from C ran on a thread Vela did not start (C may call it only during the foreign call, on its thread)", where);
+  if (!w || !w->current) w_fatal_c("a callback from C ran on a thread Tessera did not start (C may call it only during the foreign call, on its thread)", where);
   return w->current;
 }
 /* A panic in a callback cannot unwind through C's frames: it ends the program. */
@@ -3558,7 +3558,7 @@ static WStr *w_ffi_copy(int64_t p, int64_t n, const char *where) {
   return Str_from((const char *)(intptr_t)p, n);
 }
 /* The handle table for trusted standard library modules (Ffi.runtime_fns):
-   a Vela value holds a random id, never the C pointer, so it cannot be
+   a Tessera value holds a random id, never the C pointer, so it cannot be
    forged, and a pointer is handed back for freeing only once no use of it is
    in progress. */
 typedef struct { int64_t id, ptr; int64_t uses; bool closed; } WHandleEntry;
@@ -3671,7 +3671,7 @@ static WIo Cap_exec_run(WCap *x, WStr *prog_s, L_Str *args) {
   argv[args->len + 1] = NULL;
   const char *tmp = getenv("TMPDIR");
   char tpl[1024];
-  snprintf(tpl, sizeof tpl, "%s/vela-exec-XXXXXX", tmp && tmp[0] ? tmp : "/tmp");
+  snprintf(tpl, sizeof tpl, "%s/tessera-exec-XXXXXX", tmp && tmp[0] ? tmp : "/tmp");
   /* Descriptors are close-on-exec from birth where the system allows, so a
      program spawned at the same moment by another worker cannot inherit our
      pipe and hold it open; on macOS the spawn closes everything else anyway. */
@@ -3915,7 +3915,7 @@ static WIo Cap_net_get(WCap *n, WStr *url_s) {
   buf_puts(&req, " HTTP/1.1\r\nHost: ");
   buf_puts(&req, host);
   if (port != (https ? 443 : 80)) { char pb[16]; snprintf(pb, sizeof pb, ":%d", port); buf_puts(&req, pb); }
-  buf_puts(&req, "\r\nUser-Agent: vela\r\nAccept: */*\r\nConnection: close\r\n\r\n");
+  buf_puts(&req, "\r\nUser-Agent: tessera\r\nAccept: */*\r\nConnection: close\r\n\r\n");
   WStr *reqs = buf_take(&req);
   char addr[600]; snprintf(addr, sizeof addr, "%s:%d", host, port);
   free(url);
@@ -3930,7 +3930,7 @@ static WIo Cap_net_get(WCap *n, WStr *url_s) {
     WBuf b; buf_init(&b);
     for (;;) {
       WIo k = Cap_conn_read(conn);
-#ifdef VELA_TLS
+#ifdef TESSERA_TLS
       if (k.kind != 0 && https && k.msg->len == (int64_t)strlen(VTLS_CUT_MSG) && memcmp(k.msg->data, VTLS_CUT_MSG, strlen(VTLS_CUT_MSG)) == 0) {
         r = w_http_parse(b.p, b.len, VTLS_CUT_MSG);
         Str_drop(k.msg);

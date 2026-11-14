@@ -23,14 +23,14 @@ let errors ds = List.filter (fun d -> d.severity = Error) ds
 let warnings ds = List.filter (fun d -> d.severity = Warning) ds
 
 let explanations = [
-  "E0001", "The lexer found a character that is not part of Vela's syntax.";
+  "E0001", "The lexer found a character that is not part of Tessera's syntax.";
   "E0002", "A string literal or interpolation was not closed before the end of the file.";
   "E0003", "The parser expected a different token here. The message names what it expected.";
   "E0004", "Statements are separated by a newline or `;`. Two statements were found on the same line.";
   "E0005", "An integer literal does not fit in Int.";
   "E0006", "Unknown escape in a string. Valid escapes: \\n \\t \\r \\\\ \\\" \\{ \\} \\0.";
   "E0007", "An interpolation `{...}` cannot be empty. Write `\\{` for a literal brace.";
-  "E0008", "Every function parameter needs a type, for example `fn f(x: Int)`. Vela only infers types inside function bodies.";
+  "E0008", "Every function parameter needs a type, for example `fn f(x: Int)`. Tessera only infers types inside function bodies.";
   "E0101", "A name was used that is not a local variable, function or enum variant in scope.";
   "E0102", "A type name is not defined. Built-in types: Int, Float, Bool, Str, List, Array[T, N], Option, Result, IoError, Root, Net, Fs, Stdout, Clock, Listen, Listener, Conn, Rand, Stdin, Env, Exec, Foreign, Handle.";
   "E0103", "The struct (or Root) has no field with this name.";
@@ -45,13 +45,13 @@ let explanations = [
   "E0112", "Only struct and enum values can become `dyn Interface`, and only if they hold no capability, function or channel. A `dyn` value hides its concrete type, so it must not hide authority either; pass capabilities with a type parameter bounded by the interface instead.";
   "E0115", "A `defer` body runs while its block is being left, by falling off the end, `return`, `?`, `break`, `continue`, a panic or a cancellation. It cannot start another way out: no `return`, no `?`, and no `break` or `continue` for a loop outside it (a loop inside the body is fine). Handle errors inside it, for example with `??` or a `match`.";
   "E0116", "A type alias is another name for a type, so it cannot contain itself, directly or through other aliases: `type Tree = List[Tree]` would never end. Declare a struct or enum for a type that contains itself: `enum Tree { Leaf(Int), Node(List[Tree]) }`.";
-  "E0114", "A struct holds its fields inline, so a struct that contains itself, directly or through other structs, tuples or arrays, would be infinitely large. Put the recursive part in an `Option`, an enum or a `List`, which store their contents indirectly: `struct Node { value: Int, next: Option[Node] }`. Vela has no `box`: those types already are the indirection.";
+  "E0114", "A struct holds its fields inline, so a struct that contains itself, directly or through other structs, tuples or arrays, would be infinitely large. Put the recursive part in an `Option`, an enum or a `List`, which store their contents indirectly: `struct Node { value: Int, next: Option[Node] }`. Tessera has no `box`: those types already are the indirection.";
   "E0113", "Map keys must be Int, Str or Bool, or tuples, structs and enums made of them, so they hash and compare by value the same way in both backends. Float (NaN is not equal to itself), lists and maps cannot be keys; key the map by an id or a name instead. In a generic function, a type parameter can be a key once it has the bound `Key`: `fn index[K: Key, V](...)`.";
   "E0120", "A name is promoted from two embedded structs at the same depth, so `x.name` could mean either. In `struct C { A, B }` where both A and B have `name`, write `c.A.name` or `c.B.name`. Ambiguity is only an error where the name is used; the outer struct can also declare its own `name`, which comes first.";
   "E0121", "Only a struct can be embedded: `struct Admin { User, level: Int }`. An `Int`, an enum, a list or a type parameter needs a field name, as in `count: Int`.";
-  "E0122", "A named argument, `f(x, retries: 3)`, must name one of the callee's parameters, each parameter at most once, after all the positional arguments. Only functions and methods declared with `fn` (and interface methods) have parameter names: closures, function values, enum variants, built-in methods and functions, and foreign functions take their arguments by position. Every parameter must still be passed; Vela has no default values.";
+  "E0122", "A named argument, `f(x, retries: 3)`, must name one of the callee's parameters, each parameter at most once, after all the positional arguments. Only functions and methods declared with `fn` (and interface methods) have parameter names: closures, function values, enum variants, built-in methods and functions, and foreign functions take their arguments by position. Every parameter must still be passed; Tessera has no default values.";
   "E0201", "Type mismatch. The message shows the expected and the actual type.";
-  "W0001", "A built-in method was renamed: `map_err` is now `map_error`. The old name still works for now; `vela check --json` and the editor offer a fix that renames it.";
+  "W0001", "A built-in method was renamed: `map_err` is now `map_error`. The old name still works for now; `tessera check --json` and the editor offer a fix that renames it.";
   "E0202", "`?` returns early with the error, so the enclosing function must return `Result` (or `Option`) with the same error type, or `Result[_, dyn Error]`, which any error type with a `message` method converts to (Str and IoError included). Convert errors by hand with `.map_error(...)`.";
   "E0203", "An `if` without `else` is a statement, so its block must have type `()`.";
   "E0204", "A `match` must cover every possible value. Add the missing arms or a `_` arm. An arm with an `if` guard covers nothing, because its guard may be false.";
@@ -61,7 +61,7 @@ let explanations = [
   "E0208", "`break` and `continue` only work inside `while` and `for` loops (not inside closures).";
   "E0209", "Only variables, struct fields, list elements and map entries (and paths through them, such as `m[k].x`) can be assigned to. A method value such as `p.area` cannot.";
   "E0301", "Capabilities (Root, Net, Fs, Stdout, Clock) cannot be stored in struct or enum fields. Authority must stay visible in function signatures, so pass capabilities as parameters.";
-  "E0302", "Vela has no ambient I/O: there is no global print, open, http or clock. I/O goes through capability values. `main` receives `root: Root`; pass `root.stdout`, `root.fs`, `root.net` or `root.clock` to the functions that need them.";
+  "E0302", "Tessera has no ambient I/O: there is no global print, open, http or clock. I/O goes through capability values. `main` receives `root: Root`; pass `root.stdout`, `root.fs`, `root.net` or `root.clock` to the functions that need them.";
   "E0303", "`main` must be `fn main(root: Root)`, `fn main(root: Root) -> Int` (the exit code), `fn main(root: Root) -> Result[(), E]` or `fn main(root: Root) -> Result[Int, E]`, with no type parameters. `root` may be left out.";
   "E0304", "Functions cannot be stored in struct or enum fields, because a stored closure could carry a capability out of sight.";
   "E0305", "Channels cannot be stored in struct or enum fields: like capabilities, they are passed as parameters or captured by a task's closure.";
@@ -71,16 +71,16 @@ let explanations = [
   "E0330", "A foreign declaration can only use types that cross to C: Int (int64_t), Int32 (int32_t), Float (double), Bool (int), Str and Bytes (a pointer to the bytes, valid during the call), Handle (void *), a struct declared in the foreign block (`struct Div { quot: Int32, rem: Int32 }`, 1 to 8 fields of Int, Int32, Float, Bool or Handle), a callback `fn(A, B) -> R` (A and B of Int, Int32, Float, Bool, Str or Handle; R one of those but Str, or `()`), and Out[Int | Int32 | Float | Handle] for an out-parameter. It returns one of those (not Bytes or a callback) or nothing. At most 8 integer-like and 8 Float values, each field of a struct counting as one. A variadic function (`fn printf(format: Str, ...) -> Int32`) has 1 to 6 integer-like parameters before `...` and at most 8 after it, of Int, Int32, Float, Bool, Str, Bytes or Handle, and does not return a struct. `= \"name\"` after the signature names the C function, which must be a C identifier.";
   "E0331", "A foreign function can only be called directly, as in `strlen(foreign, s)`; it cannot be stored, passed or returned as a value. Wrap it in a closure when you need one: `|s| strlen(foreign, s)`.";
   "E0332", "A callback passed to C is a top-level function, named as in `qsort(f, base, n, 8, compare)`. C calls it with its arguments alone, so it has nowhere to keep a closure's captured values: a closure, a function value in a variable, or a generic function cannot be passed. A callback may take a `Foreign` first, before what C passes: it gets the Foreign value the foreign call was given.";
-  "E0320", "A dependency's functions take a capability that vela.toml does not grant it. Vela has no ambient authority, so the capabilities in a dependency's signatures are all it can ever use. Grant it with `caps = [\"net\"]` (net, fs, listen, stdout, clock) on its line in [dependencies], or use a dependency that needs less. No dependency can take Root. Standard library modules are checked the same way against src/std/vela.toml; an error there is a bug in the standard library.";
-  "E0321", "vela.toml could not be read. It has a [package] table with `name`, a [grants] table with the program's own grants (`fs = \"data:ro\"`, `net = [\"api.github.com\"]`; net, fs, listen and env), and a [dependencies] table with lines like `json = { path = \"vendor/json\", caps = [] }`.";
-  "E0322", "A git dependency could not be fetched. Vela runs `git clone` on the URL in vela.toml and checks out its `tag` or `commit`; the message has git's own error. Check the URL, that the tag or commit exists, and that git is installed. The editor and agent servers never fetch: run `vela check FILE` once to fill the cache.";
-  "E0323", "vela.lock does not match. vela.lock records the commit and a hash of the files of every git dependency; the cached copy is checked against it on every build, so a changed cache or a rewritten history is caught. Delete the cached directory named in the note to fetch it again, or delete the dependency's line from vela.lock to accept a new version on purpose.";
-  "E0324", "A dependency trusted with C (named in [trust] foreign in vela.toml) declares C libraries that vela.lock did not record when it was trusted. Calling C is full trust, so a dependency update that starts using a new library stops the build. Review the change, then delete the dependency's `foreign NAME ...` line from vela.lock; the next build records the libraries it uses now.";
-  "E0401", "A module could not be found. `use NAME` looks for NAME.vela next to the importing file, then in the dependencies listed in vela.toml, then in the standard library. A qualified name such as `json.parse` needs `use json` in the same file.";
+  "E0320", "A dependency's functions take a capability that tessera.toml does not grant it. Tessera has no ambient authority, so the capabilities in a dependency's signatures are all it can ever use. Grant it with `caps = [\"net\"]` (net, fs, listen, stdout, clock) on its line in [dependencies], or use a dependency that needs less. No dependency can take Root. Standard library modules are checked the same way against src/std/tessera.toml; an error there is a bug in the standard library.";
+  "E0321", "tessera.toml could not be read. It has a [package] table with `name`, a [grants] table with the program's own grants (`fs = \"data:ro\"`, `net = [\"api.github.com\"]`; net, fs, listen and env), and a [dependencies] table with lines like `json = { path = \"vendor/json\", caps = [] }`.";
+  "E0322", "A git dependency could not be fetched. Tessera runs `git clone` on the URL in tessera.toml and checks out its `tag` or `commit`; the message has git's own error. Check the URL, that the tag or commit exists, and that git is installed. The editor and agent servers never fetch: run `tessera check FILE` once to fill the cache.";
+  "E0323", "tessera.lock does not match. tessera.lock records the commit and a hash of the files of every git dependency; the cached copy is checked against it on every build, so a changed cache or a rewritten history is caught. Delete the cached directory named in the note to fetch it again, or delete the dependency's line from tessera.lock to accept a new version on purpose.";
+  "E0324", "A dependency trusted with C (named in [trust] foreign in tessera.toml) declares C libraries that tessera.lock did not record when it was trusted. Calling C is full trust, so a dependency update that starts using a new library stops the build. Review the change, then delete the dependency's `foreign NAME ...` line from tessera.lock; the next build records the libraries it uses now.";
+  "E0401", "A module could not be found. `use NAME` looks for NAME.tsr next to the importing file, then in the dependencies listed in tessera.toml, then in the standard library. A qualified name such as `json.parse` needs `use json` in the same file.";
   "E0402", "The item is private to its module. Only items marked `pub` can be used from another module.";
   "E0403", "The module has no exported item with this name. The note lists what it exports.";
   "E0404", "A module name is not a value. Use one of its items, such as `json.parse(text)`.";
-  "E0405", "`embed(\"path\")` and `embed_bytes(\"path\")` read a file when the program is compiled. The path must be a string literal, relative to the file that names it, and inside that file's package: the directory of its vela.toml (or of the main file when there is none), or a dependency's own directory. Use `embed` for UTF-8 text and `embed_bytes` for anything else; `embed_dir(\"public\")` takes every file under a directory (names starting with `.` are left out), and none of them may point outside the package. The standard library embeds nothing.";
+  "E0405", "`embed(\"path\")` and `embed_bytes(\"path\")` read a file when the program is compiled. The path must be a string literal, relative to the file that names it, and inside that file's package: the directory of its tessera.toml (or of the main file when there is none), or a dependency's own directory. Use `embed` for UTF-8 text and `embed_bytes` for anything else; `embed_dir(\"public\")` takes every file under a directory (names starting with `.` are left out), and none of them may point outside the package. The standard library embeds nothing.";
   "E0901", "This feature is designed but not implemented yet.";
 ]
 
@@ -128,7 +128,7 @@ let to_json d =
     (jstr d.message) (jspan d.span)
     (String.concat "," (List.map jstr d.notes))
     fix
-    (jstr ("vela explain " ^ d.code))
+    (jstr ("tessera explain " ^ d.code))
 
 let list_to_json ds = "{\"diagnostics\":[" ^ String.concat "," (List.map to_json ds) ^ "]}"
 

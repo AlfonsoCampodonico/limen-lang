@@ -1,5 +1,5 @@
 // filter / map / fold with closures over a 3M-element slice, 30 rounds.
-// Each stage builds a new slice, as the Vela version does.
+// Each stage builds a new slice, as the Tessera version does.
 package main
 
 import "fmt"

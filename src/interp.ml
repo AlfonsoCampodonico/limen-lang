@@ -1202,18 +1202,18 @@ end
 module Foreign = struct
   type carg = AInt of int64 | AFloat of float | APtr of string | ABlob of string | AOut
 
-  external dl_open : string -> nativeint * string = "vela_ffi_open"
-  external dl_sym : nativeint -> string -> nativeint = "vela_ffi_sym"
-  external call_c : nativeint -> carg array -> float array -> int -> bool -> int * int64 array * int64 array = "vela_ffi_call"
-  external call_var : nativeint -> int -> carg array -> float array -> int -> int * int64 array * int64 array = "vela_ffi_call_var"
-  external abi_kind : unit -> int = "vela_ffi_abi"
-  external cb_take : bool -> int = "vela_ffi_cb_take"
-  external cb_free : bool -> int -> unit = "vela_ffi_cb_free"
-  external cb_addr : bool -> int -> nativeint = "vela_ffi_cb_addr"
-  external cb_fail : unit -> unit = "vela_ffi_cb_fail"
-  external cstr : int64 -> string = "vela_ffi_cstr"
-  external peek : int64 -> int -> string = "vela_ffi_peek"
-  external sandbox_enter : string -> bool -> bool -> bool -> int = "vela_sandbox_enter"
+  external dl_open : string -> nativeint * string = "tessera_ffi_open"
+  external dl_sym : nativeint -> string -> nativeint = "tessera_ffi_sym"
+  external call_c : nativeint -> carg array -> float array -> int -> bool -> int * int64 array * int64 array = "tessera_ffi_call"
+  external call_var : nativeint -> int -> carg array -> float array -> int -> int * int64 array * int64 array = "tessera_ffi_call_var"
+  external abi_kind : unit -> int = "tessera_ffi_abi"
+  external cb_take : bool -> int = "tessera_ffi_cb_take"
+  external cb_free : bool -> int -> unit = "tessera_ffi_cb_free"
+  external cb_addr : bool -> int -> nativeint = "tessera_ffi_cb_addr"
+  external cb_fail : unit -> unit = "tessera_ffi_cb_fail"
+  external cstr : int64 -> string = "tessera_ffi_cstr"
+  external peek : int64 -> int -> string = "tessera_ffi_peek"
+  external sandbox_enter : string -> bool -> bool -> bool -> int = "tessera_sandbox_enter"
 
   let permits allowed lib = List.mem "*" allowed || List.mem lib allowed
   let only allowed l = if (l = "*" && List.mem "*" allowed) || (l <> "*" && permits allowed l) then [ l ] else []
@@ -1243,7 +1243,7 @@ module Foreign = struct
     List.fold_left
       (fun acc it ->
         match (acc, it) with
-        | Ok (), IFn ({ fn_foreign = Some { flib = lib; fsym = sym; ftrusted }; _ } as d) when lib <> "vela" && (ftrusted || permits granted lib) -> (
+        | Ok (), IFn ({ fn_foreign = Some { flib = lib; fsym = sym; ftrusted }; _ } as d) when lib <> "tessera" && (ftrusted || permits granted lib) -> (
           match load lib with
           | Error e -> Error (sprintf "foreign: cannot load library `%s`: %s" lib e, d.fn_span)
           | Ok h ->
@@ -1274,8 +1274,8 @@ module Foreign = struct
       | None -> 0L
     in
     match (sym, args) with
-    | "vela_copy", [ VStruct (_, [ (_, VInt p) ]); VInt n ] -> copy [ "vela" ] p n sp
-    | "vela_handle_new", [ VStruct (_, [ (_, VInt p) ]) ] ->
+    | "tessera_copy", [ VStruct (_, [ (_, VInt p) ]); VInt n ] -> copy [ "tessera" ] p n sp
+    | "tessera_handle_new", [ VStruct (_, [ (_, VInt p) ]) ] ->
       let rec fresh () =
         let id = Int64.logand (Random.State.int64 (Lazy.force id_rng) Int64.max_int) 0x3FFFFFFFFFFFFFFFL in
         if id = 0L || Hashtbl.mem handles id then fresh () else id
@@ -1283,17 +1283,17 @@ module Foreign = struct
       let id = fresh () in
       Hashtbl.replace handles id { ptr = p; uses = 0; closed = false };
       VInt id
-    | "vela_handle_acquire", [ VInt id ] -> (
+    | "tessera_handle_acquire", [ VInt id ] -> (
       match Hashtbl.find_opt handles id with
       | Some e when not e.closed -> e.uses <- e.uses + 1; handle e.ptr
       | _ -> handle 0L)
-    | "vela_handle_release", [ VInt id ] -> (
+    | "tessera_handle_release", [ VInt id ] -> (
       match Hashtbl.find_opt handles id with
       | Some e when e.uses > 0 ->
         e.uses <- e.uses - 1;
         if e.closed && e.uses = 0 then (Hashtbl.remove handles id; handle (ptr_of (Some e))) else handle 0L
       | _ -> handle 0L)
-    | "vela_handle_close", [ VInt id ] -> (
+    | "tessera_handle_close", [ VInt id ] -> (
       match Hashtbl.find_opt handles id with
       | Some e when not e.closed ->
         e.closed <- true;
@@ -1454,10 +1454,10 @@ module Foreign = struct
   let cb_wait = "a callback from C cannot wait (for a task, a channel, a timer or input)"
 
   let () =
-    Callback.register "vela_ffi_callback" (fun key ints floats ->
+    Callback.register "tessera_ffi_callback" (fun key ints floats ->
         match Hashtbl.find_opt cb_handlers key with Some h -> h ints floats | None -> 0L)
 
-  (* The handler for Vela function [name], with C parameters [ps] and result
+  (* The handler for Tessera function [name], with C parameters [ps] and result
      [r]: it converts the arguments, calls it, and converts the result. A
      panic, or waiting, ends the program: nothing unwinds through C. *)
   let cb_handler ~call ~cap (name, (cd : fn_decl)) ps r =
@@ -1515,7 +1515,7 @@ module Foreign = struct
         | _ -> failwith "internal: foreign capability"
     in
     match (cs.lib, args) with
-    | "vela", args -> runtime_helper cs.sym args sp
+    | "tessera", args -> runtime_helper cs.sym args sp
     | _ ->
     let taken = ref [] in
     let release () =
@@ -1616,7 +1616,7 @@ module Proc = struct
     else if List.exists (fun a -> String.contains a '\000') args then Error (Caps.Failed "exec: an argument contains a NUL byte")
     else if not (permits allowed prog) then Error (Caps.Denied (sprintf "exec: `%s` is not granted" prog))
     else
-      match Filename.temp_file "vela-exec-" "" with
+      match Filename.temp_file "tessera-exec-" "" with
       | exception Sys_error m -> Error (Caps.Failed m)
       | tmp -> (
         let errfd = Unix.openfile tmp [ Unix.O_RDWR; Unix.O_CLOEXEC ] 0o600 in
@@ -2101,7 +2101,7 @@ and apply rt fv args sp =
   match fv with
   | VFn n when String.length n > 5 && (String.sub n 0 6 = "List::" || String.sub n 0 5 = "Map::")
                && (match Hashtbl.find_opt rt.fns n with Some d -> d.fn_span.file = Prelude.methods_file | None -> false) ->
-    vela_method rt n args sp
+    tessera_method rt n args sp
   | VFn n ->
     let d = Hashtbl.find rt.fns n in
     if d.fn_foreign <> None then
@@ -2291,10 +2291,10 @@ and assign rt env lhs v =
     | _ -> failwith "internal: assign index")
   | _ -> failwith "internal: assign target"
 
-(* The built-in methods written in Vela (std/methods.vela), done directly:
-   pushing onto a list copies it here, so the Vela loops would be quadratic.
-   Same results as the Vela source, which the native backend compiles. *)
-and vela_method rt n args sp =
+(* The built-in methods written in Tessera (std/methods.tsr), done directly:
+   pushing onto a list copies it here, so the Tessera loops would be quadratic.
+   Same results as the Tessera source, which the native backend compiles. *)
+and tessera_method rt n args sp =
   let call f xs = apply rt f xs sp in
   let lt a b = as_bool (binop Lt a b sp) in
   let tup a b = VStruct (Ast.tuple_name 2, [ ("0", a); ("1", b) ]) in
@@ -2592,7 +2592,7 @@ and cap_call rt c name args sp =
 let exit_code n = Int64.to_int (Int64.logand n 255L)
 
 (* Run `main`. Returns its value, or the panic message and location. *)
-(* Restrict this process to [grants] (vela_sandbox.h). Ok true when the
+(* Restrict this process to [grants] (tessera_sandbox.h). Ok true when the
    operating system enforces it, Ok false when it has no sandbox here. *)
 let sandbox (g : grants) : (bool, string) result =
   let root, ro = match g.fs with Some (r, ro) -> (r, ro) | None -> ("", false) in

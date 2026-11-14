@@ -1,4 +1,4 @@
-(* vela doc: documentation from doc comments and signatures.
+(* tessera doc: documentation from doc comments and signatures.
 
    A doc comment is the block of `//` lines directly above an item, a struct
    field, an enum variant or an interface method, with no blank line in
@@ -175,7 +175,7 @@ let load_source ?all name path text = of_file ?all name text (Parser.parse_file 
 
 (* ---------- Markdown ---------- *)
 
-let code_block s = "```vela\n" ^ s ^ "\n```\n"
+let code_block s = "```tessera\n" ^ s ^ "\n```\n"
 
 let markdown (mods : module_doc list) =
   let b = Buffer.create 4096 in
@@ -256,7 +256,7 @@ p code{background:var(--code);padding:1px 4px;border-radius:4px}dl{margin:6px 0 
 .kind{color:var(--muted);font-weight:400}
 @media (max-width:720px){.wrap{display:block}nav{position:static;border-right:0;border-bottom:1px solid var(--line);max-height:none}main{padding:16px}}|}
 
-let html ?(title = "Vela documentation") (mods : module_doc list) =
+let html ?(title = "Tessera documentation") (mods : module_doc list) =
   let b = Buffer.create 8192 in
   let p s = Buffer.add_string b s in
   p "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n";
@@ -321,7 +321,7 @@ let load ?all arg =
   else
     match List.assoc_opt arg !Modules.std_modules with
     | Some text ->
-      let path = "<std>/" ^ arg ^ ".vela" in
+      let path = "<std>/" ^ arg ^ ".tsr" in
       Source.add path text;
       load_source ?all arg path text
     | None -> raise (Sys_error (arg ^ ": no such file or standard library module"))

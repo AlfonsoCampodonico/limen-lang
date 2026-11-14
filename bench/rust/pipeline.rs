@@ -1,5 +1,5 @@
 // filter / map / fold with closures over a 3M-element Vec, 30 rounds.
-// Each stage builds a new Vec, as the Vela version does.
+// Each stage builds a new Vec, as the Tessera version does.
 fn main() {
     let mut xs = Vec::new();
     for i in 0..3_000_000i64 {

@@ -1,30 +1,30 @@
 #!/usr/bin/env python3
 """Grade solutions for the agent benchmark.
 Usage: python3 bench/agent/grade.py SOLUTIONS_DIR [--native]
-SOLUTIONS_DIR holds NN-name.vela files. Each runs from a fresh copy of its
+SOLUTIONS_DIR holds NN-name.tsr files. Each runs from a fresh copy of its
 task directory, with that task's grants, and must print exactly the
 expected output."""
 import os, shutil, subprocess, sys, tempfile
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-VELA = os.path.join(ROOT, "..", "..", "_build", "default", "bin", "main.exe")
+TESSERA = os.path.join(ROOT, "..", "..", "_build", "default", "bin", "main.exe")
 sol_dir = sys.argv[1]
 native = "--native" in sys.argv[2:]
 tasks = sorted(os.listdir(os.path.join(ROOT, "tasks")))
 passed, rows = 0, []
 for t in tasks:
-    sol = os.path.join(sol_dir, t + ".vela")
+    sol = os.path.join(sol_dir, t + ".tsr")
     expected = open(os.path.join(ROOT, "expected", t + ".txt")).read()
     if not os.path.exists(sol):
         rows.append((t, "missing", ""))
         continue
     src = open(sol).read()
-    work = tempfile.mkdtemp(prefix="vela-grade-")
+    work = tempfile.mkdtemp(prefix="tessera-grade-")
     tdir = os.path.join(work, t)
     shutil.copytree(os.path.join(ROOT, "tasks", t), tdir)
-    shutil.copy(sol, os.path.join(tdir, "solution.vela"))
+    shutil.copy(sol, os.path.join(tdir, "solution.tsr"))
     grants = [g for g in open(os.path.join(tdir, "grants")).read().split("\n") if g]
-    cmd = [os.path.abspath(VELA), "run"] + (["--native"] if native else []) + ["solution.vela"]
+    cmd = [os.path.abspath(TESSERA), "run"] + (["--native"] if native else []) + ["solution.tsr"]
     for g in grants:
         cmd += ["--grant", g]
     try:

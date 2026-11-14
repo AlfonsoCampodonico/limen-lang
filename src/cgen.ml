@@ -11,7 +11,7 @@ let sprintf = Printf.sprintf
    Net.connect_tls, Listen.on_tls). The output then starts with
    [tls_marker], and Native links OpenSSL and pastes in the TLS core. *)
 let uses_tls = ref false
-let tls_marker = "/* vela: uses tls */\n"
+let tls_marker = "/* tessera: uses tls */\n"
 
 type ctx = {
   g : Lower.gctx;
@@ -32,10 +32,10 @@ type ctx = {
   mutable hash_tys : ty list; (* composite map key types that need <CName>_hash *)
   mutable csyms : string list; (* C functions that foreign calls name *)
   mutable cstructs : (string * string * (string * Ffi.cty) list) list;
-      (* C structs passed by value: Vela name, C name, fields *)
+      (* C structs passed by value: Tessera name, C name, fields *)
   mutable cbs : ((string * bool * Ffi.cty list * Ffi.cty) * (string * string * Span.t)) list;
-      (* callback wrappers: (Vela function's C name, whether it takes a
-         Foreign first, parameters, result) -> (wrapper name, Vela name,
+      (* callback wrappers: (Tessera function's C name, whether it takes a
+         Foreign first, parameters, result) -> (wrapper name, Tessera name,
          where the function is declared) *)
   mutable vols : int list;
       (* variables of the current function a `defer` needs volatile: a panic
@@ -288,7 +288,7 @@ let rec ffi_ctype c (t : Ffi.cty) =
   | Ffi.Fn (ps, r) -> sprintf "%s (*)(%s)" (ffi_ctype c r) (if ps = [] then "void" else String.concat ", " (List.map (ffi_ctype c) ps))
   | t -> Ffi.c_name t
 
-(* A Vela value [v] as the C value of boundary type [t]. [what] names it in
+(* A Tessera value [v] as the C value of boundary type [t]. [what] names it in
    an Int32 range panic. In the variadic part of a call, Int32 and Bool go as
    int and Int as int64_t, written out so C's promotions see the right type. *)
 let ffi_arg c ?(variadic = false) (t : Ffi.cty) v what wh =
@@ -313,7 +313,7 @@ let ffi_arg c ?(variadic = false) (t : Ffi.cty) v what wh =
     sprintf "(%s){ %s }" (ffi_ctype c t) (String.concat ", " (List.mapi field fs))
   | Ffi.Unit | Ffi.Fn _ -> "0"
 
-(* A C value [e] of boundary type [t] as a Vela value. *)
+(* A C value [e] of boundary type [t] as a Tessera value. *)
 let ffi_result c (t : Ffi.cty) e =
   let hd = cname c Ffi.handle_ty in
   let one t e =
@@ -340,7 +340,7 @@ let ffi_callback c (fn, vname, sp, takes_foreign) ps r =
     w
 
 (* A callback wrapper's definition: it converts C's arguments, calls the
-   compiled Vela function under a panic boundary of its own, and converts its
+   compiled Tessera function under a panic boundary of its own, and converts its
    result. Nothing may unwind through C's frames, so a panic there ends the
    program (w_cb_fatal), and so does waiting (see w_park). *)
 let ffi_callback_def c ((fn, takes_foreign, ps, r), (w, vname, sp)) =
@@ -482,14 +482,14 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     line (sprintf "    %s = %s;" dst (mk_enum c t 1 [ "m_" ]));
     line "  }";
     line "}"
-  | I.CallC ({ lib = "vela"; sym; _ }, args, _, sp) -> (
+  | I.CallC ({ lib = "tessera"; sym; _ }, args, _, sp) -> (
     (* the runtime's own helpers (Ffi.runtime_fns) *)
     let hd = cname c Ffi.handle_ty in
     match (sym, List.map a args) with
-    | "vela_copy", [ p; n ] -> set (sprintf "w_ffi_copy((%s).f0, %s, %s)" p n (where sp))
-    | "vela_handle_new", [ p ] -> set (sprintf "w_handle_new((%s).f0)" p)
-    | ("vela_handle_acquire" | "vela_handle_release" | "vela_handle_close"), [ id ] ->
-      set (sprintf "(%s){ w_%s(%s) }" hd (String.sub sym 5 (String.length sym - 5)) id)
+    | "tessera_copy", [ p; n ] -> set (sprintf "w_ffi_copy((%s).f0, %s, %s)" p n (where sp))
+    | "tessera_handle_new", [ p ] -> set (sprintf "w_handle_new((%s).f0)" p)
+    | ("tessera_handle_acquire" | "tessera_handle_release" | "tessera_handle_close"), [ id ] ->
+      set (sprintf "(%s){ w_%s(%s) }" hd (let p = String.length "tessera_" in String.sub sym p (String.length sym - p)) id)
     | _ -> failwith ("cgen: runtime helper " ^ sym))
   | I.CallC (cs, args, cbs, sp) ->
     if not (List.mem cs.sym c.csyms) then c.csyms <- c.csyms @ [ cs.sym ];
@@ -1262,9 +1262,9 @@ let rec type_defs c (out : Buffer.t) =
       | _ -> if is_boxed c t then p (sprintf "typedef struct %s_box* %s;" n n) else p (sprintf "typedef struct %s %s;" n n))
     (lists @ named);
   List.iter (fun t -> p (sprintf "typedef struct %s %s;" (cname c t) (cname c t))) maps;
-  List.iter (fun t -> match t with TList e -> p (sprintf "VELA_LIST_STRUCT(%s, %s)" (cname c t) (ctype c e)) | _ -> ()) lists;
+  List.iter (fun t -> match t with TList e -> p (sprintf "TESSERA_LIST_STRUCT(%s, %s)" (cname c t) (ctype c e)) | _ -> ()) lists;
   List.iter
-    (fun t -> match t with TMap (k, v) -> p (sprintf "VELA_MAP_STRUCT(%s, %s, %s)" (cname c t) (ctype c k) (ctype c v)) | _ -> ())
+    (fun t -> match t with TMap (k, v) -> p (sprintf "TESSERA_MAP_STRUCT(%s, %s, %s)" (cname c t) (ctype c k) (ctype c v)) | _ -> ())
     maps;
   (* map prototypes: lists and structs of maps refer to them *)
   List.iter
@@ -1346,8 +1346,8 @@ let rec type_defs c (out : Buffer.t) =
     (fun t ->
       match t with
       | TList e ->
-        p (sprintf "VELA_LIST_FUNCS(%s, %s, %s)" (cname c t) (ctype c e) (cname c e));
-        if e = TFloat then p (sprintf "VELA_LIST_SORT(%s, double, Float)" (cname c t))
+        p (sprintf "TESSERA_LIST_FUNCS(%s, %s, %s)" (cname c t) (ctype c e) (cname c e));
+        if e = TFloat then p (sprintf "TESSERA_LIST_SORT(%s, double, Float)" (cname c t))
       | _ -> ())
     (List.stable_sort (fun a b -> compare (depth a) (depth b)) lists);
   List.iter (fun t -> match t with TMap (k, _) -> ignore (hash_prefix c k) | _ -> ()) maps;
@@ -1355,7 +1355,7 @@ let rec type_defs c (out : Buffer.t) =
   List.iter
     (fun t ->
       match t with
-      | TMap (k, v) -> p (sprintf "VELA_MAP_FUNCS(%s, %s, %s, %s, %s)" (cname c t) (ctype c k) (cname c k) (ctype c v) (cname c v))
+      | TMap (k, v) -> p (sprintf "TESSERA_MAP_FUNCS(%s, %s, %s, %s, %s)" (cname c t) (ctype c k) (cname c k) (ctype c v) (cname c v))
       | _ -> ())
     maps;
   (* dup/drop/eq/show definitions *)
@@ -1546,7 +1546,7 @@ and cmp_defs c p =
       p "}")
     c.cmp_tys;
   List.iter
-    (fun t -> match t with TList e -> p (sprintf "VELA_LIST_SORT(%s, %s, %s)" (cname c t) (ctype c e) (cmp_prefix c e)) | _ -> ())
+    (fun t -> match t with TList e -> p (sprintf "TESSERA_LIST_SORT(%s, %s, %s)" (cname c t) (ctype c e) (cmp_prefix c e)) | _ -> ())
     c.sort_tys
 
 (* ---------- program ---------- *)
@@ -1655,7 +1655,7 @@ let program (g : Lower.gctx) (prog : I.program) : string =
       mp "    int64_t al = __atomic_load_n(&w_allocs, __ATOMIC_RELAXED) - a0;";
       mp "    if (wbench_fixed_ > 0 || ns >= wbench_budget_ || n >= 1000000000) {";
       mp "      fflush(stdout);";
-      mp "      fprintf(stderr, \"vela-bench: %lld %lld %lld\\n\", (long long)n, (long long)ns, (long long)al);";
+      mp "      fprintf(stderr, \"tessera-bench: %lld %lld %lld\\n\", (long long)n, (long long)ns, (long long)al);";
       mp "      return;";
       mp "    }";
       mp "    int64_t next = ns > 0 ? (int64_t)(1.2 * (double)wbench_budget_ * (double)n / (double)ns) : n * 100;";

@@ -1,4 +1,4 @@
-// Check Vela programs against grammar/vela.gbnf with llama.cpp's own GBNF
+// Check Tessera programs against grammar/tessera.gbnf with llama.cpp's own GBNF
 // parser and matcher, the code that constrains decoding. Built and run by
 // grammar/llama-check.sh, against a pinned llama.cpp release.
 //

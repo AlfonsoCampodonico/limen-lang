@@ -115,7 +115,7 @@ let max_headers = 1000
 
 let http_request (u : url) =
   let host = if u.port = (if u.https then 443 else 80) then u.host else sprintf "%s:%d" u.host u.port in
-  sprintf "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: vela\r\nAccept: */*\r\nConnection: close\r\n\r\n" u.path host
+  sprintf "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: tessera\r\nAccept: */*\r\nConnection: close\r\n\r\n" u.path host
 
 let trim_sp s =
   let n = String.length s in
@@ -150,7 +150,7 @@ let dechunk data =
 
 (* (status, headers in order, body) *)
 (* The error text of a TLS stream that ended without the peer's close
-   message (VTLS_CUT_MSG in runtime/vela_tls.h). *)
+   message (VTLS_CUT_MSG in runtime/tessera_tls.h). *)
 let tls_cut = "tls: the connection was closed without a TLS close message, so the data may be cut short"
 
 (* [cut]: the stream ended that way, so a body that runs until the close may
@@ -335,7 +335,7 @@ let make_dir fs rel : (unit, ioerr) result =
 (* ---------- test directories ----------
    A test that takes `fs: Fs` gets a fresh directory, removed afterwards. *)
 
-let test_dir () = Unix.realpath (Filename.temp_dir "vela-test-" "")
+let test_dir () = Unix.realpath (Filename.temp_dir "tessera-test-" "")
 
 let rec remove_tree p =
   match Unix.lstat p with

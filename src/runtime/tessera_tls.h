@@ -1,7 +1,7 @@
-/* Vela TLS core, on OpenSSL (1.1.1 or later; 3.x on macOS from Homebrew,
+/* Tessera TLS core, on OpenSSL (1.1.1 or later; 3.x on macOS from Homebrew,
    libssl on Linux). Shared by both backends so they behave and fail alike:
    the native compiler pastes it into programs that use TLS, ahead of
-   vela_rt.h, and the interpreter's C stub (src/tls_stubs.c) includes it.
+   tessera_rt.h, and the interpreter's C stub (src/tls_stubs.c) includes it.
 
    Everything here is non-blocking: a step either makes progress or says
    which way the socket must become ready (VTLS_WANT_READ / VTLS_WANT_WRITE),

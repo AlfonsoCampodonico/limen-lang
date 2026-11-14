@@ -1,6 +1,6 @@
 /* The operating-system sandbox: at startup, the whole process (and every
    program it starts) is restricted to what was granted, so code that is
-   outside Vela's own checks (C called through `foreign`, or a bug in the
+   outside Tessera's own checks (C called through `foreign`, or a bug in the
    runtime) cannot reach past the grants either. Shared by the native runtime
    (compiled into every program, see w_init) and the interpreter (ffi_stubs.c).
 
@@ -21,7 +21,7 @@
    cannot have another application act for it. It still reaches the system's
    Mach services, as every process does; seccomp on Linux refuses x32 system
    calls and io_uring without Net/Listen.
-   What stays in Vela, not the kernel: which hosts and ports Net and Listen
+   What stays in Tessera, not the kernel: which hosts and ports Net and Listen
    allow, which programs Exec allows, which environment variables Env shows,
    Fs's refusal of `..` and absolute paths (the kernel only sees the result).
 

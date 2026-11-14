@@ -1,10 +1,10 @@
-# Vela language specification
+# Tessera language specification
 
-This document describes Vela as implemented by this repository's compiler: interpreter (`vela run`) and native backend (`vela build`, `vela run --native`). It is meant to be read whole, by people and by models writing Vela. Where the two backends differ, the difference is stated.
+This document describes Tessera as implemented by this repository's compiler: interpreter (`tessera run`) and native backend (`tessera build`, `tessera run --native`). It is meant to be read whole, by people and by models writing Tessera. Where the two backends differ, the difference is stated.
 
 ## 1. The idea
 
-Vela code can only touch the outside world through **capabilities**: values that grant authority. There is no global `print`, `open`, `http.get` or clock. The program starts with one capability, `root: Root`, and passes narrower ones to the functions that need them. A function's parameter types therefore say everything it can do.
+Tessera code can only touch the outside world through **capabilities**: values that grant authority. There is no global `print`, `open`, `http.get` or clock. The program starts with one capability, `root: Root`, and passes narrower ones to the functions that need them. A function's parameter types therefore say everything it can do.
 
 ```
 fn main(root: Root) -> Result[(), IoError] {
@@ -27,7 +27,7 @@ fn parse_names(body: Str) -> List[Str] {   // no capabilities: cannot do I/O
 ## 2. Lexical structure
 
 - **Comments:** `//` to the end of the line. There are no block comments.
-- **Doc comments:** the `//` lines directly above an item, a struct field, an enum variant or an interface method, with no blank line in between, document it. The comment block at the very top of a file, followed by a blank line, documents the module. `vela doc` reads them; there is no special marker.
+- **Doc comments:** the `//` lines directly above an item, a struct field, an enum variant or an interface method, with no blank line in between, document it. The comment block at the very top of a file, followed by a blank line, documents the module. `tessera doc` reads them; there is no special marker.
 - **Identifiers:** `[A-Za-z_][A-Za-z0-9_]*`. By convention types and enum variants start with an uppercase letter, everything else lowercase. Patterns rely on this (section 7).
 - **Keywords:** `fn let mut if else match for in while return struct enum true false group break continue pub use interface dyn select defer`. `type`, `test`, `bench`, `foreign`, `until`, `interleaved` and `with` are words only where they start their construct, so they stay usable as names: a field can be called `type`.
 - **Integers:** decimal digits, `_` allowed as a separator (`1_000_000`). A literal must fit in 64 bits: up to `9223372036854775807` (E0005).
@@ -244,7 +244,7 @@ test "elapsed" {
 // in main: elapsed(root.clock, start)
 ```
 
-`vela caps` reports a function with bounded type parameters like one that takes callbacks: what it can do depends on the type it is called with.
+`tessera caps` reports a function with bounded type parameters like one that takes callbacks: what it can do depends on the type it is called with.
 
 #### Generic interfaces
 
@@ -477,7 +477,7 @@ group g {
 - With no other arguments the parentheses can go: `catch { ... }`, `xs.map { |x| x * 2 }`. After a plain name, only a lowercase one: `Point { x: 1 }` is still a struct literal.
 - The closure is always the last argument, after named ones too: `retry(times: 3) { |n| attempt(n) }` (a closure written last after named arguments fills the last parameter).
 - **Not in a condition.** In the head of `if`, `while`, `for` and `match` (and a group's `until`), `{` starts the body, as with struct literals, so a trailing closure there is error E0003. Pass the closure in the parentheses, `if xs.filter(|x| x > 1).len() > 0 {`, or wrap the whole condition in parentheses.
-- It is the same closure as `|x| { ... }`: same types, same captures. `vela fmt` keeps whichever form was written (and drops the empty `()` in `f() { ... }`).
+- It is the same closure as `|x| { ... }`: same types, same captures. `tessera fmt` keeps whichever form was written (and drops the empty `()` in `f() { ... }`).
 - There is one trailing closure per call; `f(a) { ... } { ... }` is not two.
 
 ### The `?` operator
@@ -542,7 +542,7 @@ server.describe(prefix: "to", upper: true)
 ```
 
 - Positional arguments come first, then named ones in any order. A named argument is `name: expr`, with the parameter's name as declared.
-- Every parameter is passed exactly once. Labels only say which is which: Vela has no default values, so leaving one out is still E0107.
+- Every parameter is passed exactly once. Labels only say which is which: Tessera has no default values, so leaving one out is still E0107.
 - They work for functions and methods declared with `fn`, generic ones included, for methods called through an interface bound or a `dyn` value (the names are the interface's), and for functions of other modules. They do not work where the callee has no parameter names: closures and other function values (a type like `fn(Int) -> Int` has none), enum variants, built-in methods and functions, and foreign functions. A label there is E0122, with a fix that removes it.
 - An unknown name, a parameter passed twice, and a positional argument after a named one are E0122 (except a closure written last, which fills the last parameter: that is how a trailing closure combines with labels). When the right name is clear (one unknown label and one parameter left over, or a positional argument where one parameter is missing) the error carries a fix.
 - The arguments run in the order they are written, not in the parameter order, so `connect(retries: next(), port: other())` calls `next` first. Renaming a parameter changes the labels callers can use: it is part of the function's interface, like its types.
@@ -666,9 +666,9 @@ The native backend implements this with reference counting and copy-on-write. A 
 | `root.exec` | `Exec` | only with `--grant exec=PROGRAM` (repeatable) or `--grant exec=*` |
 | `root.foreign` | `Foreign` | only with `--grant foreign=LIB` (repeatable) or `--grant foreign=*`: calls into C libraries |
 
-`root.args()` is the `List[Str]` of command-line arguments after `--`: `vela run app.vela -- a b`.
+`root.args()` is the `List[Str]` of command-line arguments after `--`: `tessera run app.tsr -- a b`.
 
-Grants can also be written once in the `[grants]` table of the program's vela.toml (section 18), so they are not retyped every run. `vela run` applies them first and the `--grant` flags add to them; a `--grant fs=...` flag replaces the fs grant, since there is only one. A binary from `vela build` reads only its flags.
+Grants can also be written once in the `[grants]` table of the program's tessera.toml (section 18), so they are not retyped every run. `tessera run` applies them first and the `--grant` flags add to them; a `--grant fs=...` flag replaces the fs grant, since there is only one. A binary from `tessera build` reads only its flags.
 
 An ungranted `Net`, `Fs`, `Listen` or `Exec` still exists, but every operation on it returns `Err(Denied(...))`. An ungranted `Foreign` exists too; calling a foreign function through it panics (`foreign.allows(lib)` checks first). `Listener` and `Conn` are capabilities too: you get them from `Listen.on`, `Listener.accept` and `Net.connect`.
 
@@ -677,7 +677,7 @@ The rules:
 1. Programs cannot create capabilities. They come only from `root`.
 2. Attenuation only narrows. `net.only(host)` returns a `Net` limited to that host, and it is empty if you didn't hold that host. `fs.under(dir)` limits to a subdirectory; `fs.read_only()` removes writing. `exec.only(program)` limits `Exec` to one program; `foreign.only(lib)` limits `Foreign` to one library.
 3. There is no ambient I/O. Using `print`, `open`, `fetch` and similar names is error E0302, which explains the capability to use instead.
-4. A function whose parameters contain no capability and no function type is **pure**: it can only compute (and panic). `vela caps FILE` lists each function's authority. Section 14 says what the compiler does with pure calls. It never runs them in parallel on its own: concurrency stays visible and cancellable in a `group`, where you write it.
+4. A function whose parameters contain no capability and no function type is **pure**: it can only compute (and panic). `tessera caps FILE` lists each function's authority. Section 14 says what the compiler does with pure calls. It never runs them in parallel on its own: concurrency stays visible and cancellable in a `group`, where you write it.
 5. Enforcement at runtime:
    - `Net`: http and https URLs only, host allowlist, redirects not followed. `Net.connect` and `Net.connect_tls` use the same allowlist. TLS certificates are always verified (section 10).
    - `Exec`: the program name must match a grant exactly (`git` and `/usr/bin/git` are different grants), or the grant is `*`. Arguments are passed as a list, never through a shell. The child gets `/dev/null` as stdin, the working directory, `PATH`, and only the environment variables granted with `--grant env=`. A program name without `/` is looked up in `PATH`, as a shell would. Granting a program grants everything that program can do with any arguments, so `exec=sh` is as good as every other grant.
@@ -697,26 +697,26 @@ foreign "sqlite3" {
 }
 ```
 
-Calling one takes a `Foreign` capability first, then the other arguments: `sqlite3_libversion(root.foreign)`. Each call checks that the `Foreign` value grants the library (`--grant foreign=sqlite3`), and panics if not. So C is reachable only from code that was handed `Foreign`, `vela caps` lists such functions, and a package dependency can use a foreign block only if the program names it in `[trust] foreign = [...]` in vela.toml (section 18). The library name is the `-l` name: `foreign "sqlite3"` links `-lsqlite3` natively and loads `libsqlite3.dylib` (macOS) or `libsqlite3.so` in the interpreter; `foreign "c"` is the C library itself, which is always there. The function name is the C symbol, unless the declaration names another after its signature: `fn print_int(format: Str, ..., n: Int) -> Int32 = "printf"`. Declarations are one per line; `pub fn` exports one from a module.
+Calling one takes a `Foreign` capability first, then the other arguments: `sqlite3_libversion(root.foreign)`. Each call checks that the `Foreign` value grants the library (`--grant foreign=sqlite3`), and panics if not. So C is reachable only from code that was handed `Foreign`, `tessera caps` lists such functions, and a package dependency can use a foreign block only if the program names it in `[trust] foreign = [...]` in tessera.toml (section 18). The library name is the `-l` name: `foreign "sqlite3"` links `-lsqlite3` natively and loads `libsqlite3.dylib` (macOS) or `libsqlite3.so` in the interpreter; `foreign "c"` is the C library itself, which is always there. The function name is the C symbol, unless the declaration names another after its signature: `fn print_int(format: Str, ..., n: Int) -> Int32 = "printf"`. Declarations are one per line; `pub fn` exports one from a module.
 
 The types that cross the boundary:
 
-| Vela | C | Notes |
+| Tessera | C | Notes |
 | --- | --- | --- |
 | `Int` | `int64_t` | |
-| `Int32` | `int32_t` (C `int`) | an `Int` in Vela; an argument outside the 32-bit range panics |
+| `Int32` | `int32_t` (C `int`) | an `Int` in Tessera; an argument outside the 32-bit range panics |
 | `Float` | `double` | |
 | `Bool` | `int` | 0 is `false`; any other value is `true` |
 | `Str` | `const char *` | the string's bytes followed by a NUL; pass the length yourself if C wants it (`s.len()`) |
 | `Bytes` | `const void *` | the bytes; pass the length yourself |
-| `Handle` | `void *` | an opaque pointer, `Handle { addr: Int }` in Vela; `addr == 0` is NULL |
-| `Out[T]` | `T *` | an out-parameter of `Int`, `Int32`, `Float` or `Handle`: C writes it, Vela returns it |
+| `Handle` | `void *` | an opaque pointer, `Handle { addr: Int }` in Tessera; `addr == 0` is NULL |
+| `Out[T]` | `T *` | an out-parameter of `Int`, `Int32`, `Float` or `Handle`: C writes it, Tessera returns it |
 | a C struct | `struct { ... }` | declared in the foreign block, passed and returned by value (below) |
-| `fn(A, B) -> R` | a pointer to a function | a callback: a top-level Vela function C calls during the call (below) |
+| `fn(A, B) -> R` | a pointer to a function | a callback: a top-level Tessera function C calls during the call (below) |
 
-The result is one of the same types (not `Bytes`: C gives no length) or nothing. A `Str` result is copied from a NUL-terminated C string at once (NULL gives `""`); C keeps ownership of the original. `Out` parameters are not passed by the caller: they come back after the result, so `sqlite3_open_v2` above has the Vela type `fn(Foreign, Str, Int, Int) -> (Int, Handle)`, called as `let (rc, db) = sqlite3_open_v2(f, path, flags, 0)`. A function with no result and one `Out` returns that value alone.
+The result is one of the same types (not `Bytes`: C gives no length) or nothing. A `Str` result is copied from a NUL-terminated C string at once (NULL gives `""`); C keeps ownership of the original. `Out` parameters are not passed by the caller: they come back after the result, so `sqlite3_open_v2` above has the Tessera type `fn(Foreign, Str, Int, Int) -> (Int, Handle)`, called as `let (rc, db) = sqlite3_open_v2(f, path, flags, 0)`. A function with no result and one `Out` returns that value alone.
 
-**Variadic functions.** C cannot tell what a variadic function was passed, so a declaration fixes it: the parameters before `...` are the C function's own, and the ones after it are the variadic arguments this declaration passes. A C function called with several shapes gets one declaration per shape, each with its own Vela name:
+**Variadic functions.** C cannot tell what a variadic function was passed, so a declaration fixes it: the parameters before `...` are the C function's own, and the ones after it are the variadic arguments this declaration passes. A C function called with several shapes gets one declaration per shape, each with its own Tessera name:
 
 ```
 foreign "c" {
@@ -727,7 +727,7 @@ foreign "c" {
 
 C's default promotions apply to the arguments after `...`: `Int32` and `Bool` go as `int`, `Float` as `double`, `Int` as `int64_t` (`%lld`, not `%d`). Before `...` come 1 to 6 integer-like parameters (no `Float` or struct), after it at most 8 of `Int`, `Int32`, `Float`, `Bool`, `Str`, `Bytes` and `Handle`; a variadic function does not return a struct.
 
-**Structs by value.** A `struct` in a foreign block is a C struct, with fields of `Int`, `Int32`, `Float`, `Bool` and `Handle` (C's `int64_t`, `int32_t`, `double`, `int` and `void *`) laid out as C lays them out, 1 to 8 of them. To Vela it is an ordinary struct of the module, with `Int32` fields as `Int`s: built with `Div { quot: 1, rem: 0 }`, printed, compared and passed around like any other, and exported with `pub struct`. A foreign function takes and returns it by value:
+**Structs by value.** A `struct` in a foreign block is a C struct, with fields of `Int`, `Int32`, `Float`, `Bool` and `Handle` (C's `int64_t`, `int32_t`, `double`, `int` and `void *`) laid out as C lays them out, 1 to 8 of them. To Tessera it is an ordinary struct of the module, with `Int32` fields as `Int`s: built with `Div { quot: 1, rem: 0 }`, printed, compared and passed around like any other, and exported with `pub struct`. A foreign function takes and returns it by value:
 
 ```
 foreign "c" {
@@ -760,26 +760,26 @@ qsort(f, buf, n, 1, by_byte)
 
 Ownership at the boundary:
 
-- Arguments are lent to C for the duration of the call, never moved. A `Str` or `Bytes` pointer is valid only until the call returns: C must copy what it keeps (SQLite's `SQLITE_TRANSIENT`, a destructor argument of `-1`, does this). A `Handle` that C returns pointing into a Vela string is dangling once that string is freed.
-- Memory C allocates belongs to C: free it with the library's own function (`sqlite3_finalize`, `free`). Vela never frees a `Handle`, and the leak check does not see C memory.
+- Arguments are lent to C for the duration of the call, never moved. A `Str` or `Bytes` pointer is valid only until the call returns: C must copy what it keeps (SQLite's `SQLITE_TRANSIENT`, a destructor argument of `-1`, does this). A `Handle` that C returns pointing into a Tessera string is dangling once that string is freed.
+- Memory C allocates belongs to C: free it with the library's own function (`sqlite3_finalize`, `free`). Tessera never frees a `Handle`, and the leak check does not see C memory.
 - `foreign.copy(p, n)` copies `n` bytes at `p` into new `Bytes`, for results that are a pointer and a length (`sqlite3_column_blob` and `sqlite3_column_bytes`). It reads raw memory, so it needs a `Foreign` that grants at least one library.
 
-The foreign grant is full trust, and Vela treats it that way:
+The foreign grant is full trust, and Tessera treats it that way:
 
-- Only the program grants it: `--grant foreign=LIB` or `[grants] foreign` in the program's own vela.toml. `vela run` prints a one-line warning whenever it is given, since nothing in Vela bounds what C code does; only the operating-system sandbox (below) still does.
-- It does not pass along: a dependency's `caps` cannot include `foreign`. A dependency may declare foreign blocks only when the program names it in `[trust]`, and vela.lock records the C libraries each trusted dependency uses (section 18).
-- `vela check` lists every part of the program that calls C, one line each: the program's own files, trusted dependencies, and trusted standard library modules.
-- The standard library calls C only from modules that its manifest, src/std/vela.toml, trusts in the same way (`sql`). Their foreign functions are private to the module and take no `Foreign`, so a program using `sql` grants only an `Fs`; the module is what keeps SQLite inside that grant.
+- Only the program grants it: `--grant foreign=LIB` or `[grants] foreign` in the program's own tessera.toml. `tessera run` prints a one-line warning whenever it is given, since nothing in Tessera bounds what C code does; only the operating-system sandbox (below) still does.
+- It does not pass along: a dependency's `caps` cannot include `foreign`. A dependency may declare foreign blocks only when the program names it in `[trust]`, and tessera.lock records the C libraries each trusted dependency uses (section 18).
+- `tessera check` lists every part of the program that calls C, one line each: the program's own files, trusted dependencies, and trusted standard library modules.
+- The standard library calls C only from modules that its manifest, src/std/tessera.toml, trusts in the same way (`sql`). Their foreign functions are private to the module and take no `Foreign`, so a program using `sql` grants only an `Fs`; the module is what keeps SQLite inside that grant.
 
-What the capability lets code do: anything the C functions it declares can do, with the program's full authority, outside every other capability's checks. Vela checks the declared types and the library grant; it cannot check that a declaration matches the C prototype, and a wrong one is undefined behaviour. Keep foreign blocks small, private to a module that wraps them in a safe Vela API (as the `sql` module does), and grant `foreign` only to programs and dependencies you trust.
+What the capability lets code do: anything the C functions it declares can do, with the program's full authority, outside every other capability's checks. Tessera checks the declared types and the library grant; it cannot check that a declaration matches the C prototype, and a wrong one is undefined behaviour. Keep foreign blocks small, private to a module that wraps them in a safe Tessera API (as the `sql` module does), and grant `foreign` only to programs and dependencies you trust.
 
 Limits, the same in both backends: at most 8 integer-like (everything but `Float`, `Out` and callbacks included) and 8 `Float` values, each field of a struct by value counting as one; the variadic and callback limits above; structs of 1 to 8 scalar fields, not nested. A foreign function can only be called, not used as a value (E0331): wrap it in a closure. A C call blocks its worker thread until it returns, like a busy loop, and C libraries decide their own thread safety.
 
-The backends differ in how they reach the code, not in what a program sees: natively each function is called through its exact prototype (a variadic one through its variadic prototype, a struct through its C declaration, a callback through a generated C function that calls the compiled Vela function) and linked with `-l<lib>` (a library outside the C compiler's default paths is found through `LIBRARY_PATH`); the interpreter loads the library with `dlopen` and calls through a generic stub that lays out the arguments as the platform's calling convention does (x86-64 System V, arm64, and Apple's arm64 variant: registers, stack, how a struct is split or passed by pointer), and C calls callbacks through a fixed set of trampolines, resolving the declarations of granted libraries before `main` starts. A missing library or symbol is therefore an error before the program runs in both: a link error natively, `foreign: cannot load library ...` or `foreign: library ... has no function ...` in the interpreter. One difference follows from linking: a native binary loads every library it declares when it starts (running the library's initialisers, as any linked library does), granted or not, while the interpreter never loads a library the grants do not cover. In both, a call into an ungranted library panics before it reaches the library.
+The backends differ in how they reach the code, not in what a program sees: natively each function is called through its exact prototype (a variadic one through its variadic prototype, a struct through its C declaration, a callback through a generated C function that calls the compiled Tessera function) and linked with `-l<lib>` (a library outside the C compiler's default paths is found through `LIBRARY_PATH`); the interpreter loads the library with `dlopen` and calls through a generic stub that lays out the arguments as the platform's calling convention does (x86-64 System V, arm64, and Apple's arm64 variant: registers, stack, how a struct is split or passed by pointer), and C calls callbacks through a fixed set of trampolines, resolving the declarations of granted libraries before `main` starts. A missing library or symbol is therefore an error before the program runs in both: a link error natively, `foreign: cannot load library ...` or `foreign: library ... has no function ...` in the interpreter. One difference follows from linking: a native binary loads every library it declares when it starts (running the library's initialisers, as any linked library does), granted or not, while the interpreter never loads a library the grants do not cover. In both, a call into an ungranted library panics before it reaches the library.
 
 ### The operating-system sandbox
 
-Vela's checks cover Vela code. To cover everything else in the process (C called through `foreign`, and any bug in the runtime), every program also runs in an operating-system sandbox built from its grants. It is on by default, in both backends: `vela run` enters it once the program is loaded (and its granted C libraries with it), and a native binary enters it at startup, before any thread starts. `--no-sandbox` (on `vela run`, or on a built binary) turns it off; it is for debugging, not for production.
+Tessera's checks cover Tessera code. To cover everything else in the process (C called through `foreign`, and any bug in the runtime), every program also runs in an operating-system sandbox built from its grants. It is on by default, in both backends: `tessera run` enters it once the program is loaded (and its granted C libraries with it), and a native binary enters it at startup, before any thread starts. `--no-sandbox` (on `tessera run`, or on a built binary) turns it off; it is for debugging, not for production.
 
 What the kernel enforces:
 
@@ -790,14 +790,14 @@ What the kernel enforces:
 | Network | nothing unless `Net` or `Listen` is granted; then any host |
 | Starting programs | only if `Exec` is granted. A started program inherits the sandbox: it can read system locations and the `Fs` directory, and list (not read) the directories above the current one, which shells need |
 
-What stays in Vela's own checks, not the kernel's: which hosts and ports `Net` and `Listen` allow (the kernel allows all networking once either is granted), which programs `Exec` may run, which variables `Env` shows, `Fs`'s refusal of `..` and absolute paths (the kernel sees only the resolved file), and everything inside the process: C code with the foreign grant can still read and corrupt the program's own memory, and through it every capability the program holds.
+What stays in Tessera's own checks, not the kernel's: which hosts and ports `Net` and `Listen` allow (the kernel allows all networking once either is granted), which programs `Exec` may run, which variables `Env` shows, `Fs`'s refusal of `..` and absolute paths (the kernel sees only the resolved file), and everything inside the process: C code with the foreign grant can still read and corrupt the program's own memory, and through it every capability the program holds.
 
 How:
 
 - macOS: a sandbox profile (`sandbox_init`), allowing by default and denying the above. It also refuses Apple events and LaunchServices opens, so the program cannot have another application act for it. Mach services stay reachable, as for every process.
 - Linux: Landlock (kernel 5.13 or later) for files, and on kernels with Landlock ABI 4 or later for TCP too, plus a seccomp filter that, without `Net` or `Listen`, allows only Unix sockets and refuses io_uring, and without `Exec` refuses `execve`; it also refuses x32 system calls. It has been run on arm64 Linux (kernel 7.0); on x86-64 it compiles but has not been run on a real kernel.
 - A system without a sandbox (another OS, a Linux kernel without Landlock or seccomp filters, an emulator) runs the program without one, silently, as before. A sandbox that exists but cannot be entered stops the program with a message naming `--no-sandbox`.
-- `vela test` runs native tests in the sandbox too (a test that takes `fs: Fs` gets its temporary directory); interpreted tests run inside the `vela` process, unsandboxed.
+- `tessera test` runs native tests in the sandbox too (a test that takes `fs: Fs` gets its temporary directory); interpreted tests run inside the `tessera` process, unsandboxed.
 
 ## 10. Concurrency
 
@@ -815,7 +815,7 @@ let results = group g {
 - `g` can only be used as `g.go(...)` directly in the body. It cannot be stored, passed, returned, or used inside a closure (E0310).
 - The body cannot leave early with `return` or `?` (E0311), and `break` and `continue` cannot target loops outside the group.
 - Tasks share data by value, so there are no data races. A task reaches the world only through capabilities its closure captured. Spawning is not a capability.
-- Tasks are lightweight: natively each is a fiber with a small stack, scheduled on one worker thread per core (`VELA_THREADS` overrides this), and a task waiting on a group, a channel, a socket, stdin or `clock.sleep(ms)` parks without blocking a thread. The interpreter runs tasks as coroutines. What tasks print comes out in the same order in both (below).
+- Tasks are lightweight: natively each is a fiber with a small stack, scheduled on one worker thread per core (`TESSERA_THREADS` overrides this), and a task waiting on a group, a channel, a socket, stdin or `clock.sleep(ms)` parks without blocking a thread. The interpreter runs tasks as coroutines. What tasks print comes out in the same order in both (below).
 - If every task is waiting and nothing can wake one (no socket and no timer can), the program panics with `all tasks are blocked (deadlock)` instead of hanging.
 - A panic in a task ends only that task. The group still waits for the others, then passes the first panic on (section 15).
 
@@ -987,7 +987,7 @@ let l = root.listen.on_tls("0.0.0.0:8443", cert, key)?
 
 #### TLS library
 
-TLS is OpenSSL (1.1.1 or later), in both backends: the interpreter is linked with it, and native programs that use `Net.get`, `connect_tls` or `on_tls` are linked with it. It is found when vela is built: `$VELA_OPENSSL` (an install prefix) if set, else `pkg-config openssl` (looking in Homebrew's `openssl@3` first), else the system headers. On macOS that is Homebrew's `openssl@3` (`brew install openssl@3`), whose trusted certificates are Homebrew's `cert.pem` bundle; on Linux it is the distribution's libssl (`libssl-dev` or `openssl-devel` to build), trusting the distribution's certificate store. Native programs link OpenSSL's shared libraries, so a binary from `vela build` that uses TLS needs them where it runs. If OpenSSL is not found, vela still builds and runs everything else, and every TLS operation fails with `Failed("tls: ... built without TLS ...")`.
+TLS is OpenSSL (1.1.1 or later), in both backends: the interpreter is linked with it, and native programs that use `Net.get`, `connect_tls` or `on_tls` are linked with it. It is found when tessera is built: `$TESSERA_OPENSSL` (an install prefix) if set, else `pkg-config openssl` (looking in Homebrew's `openssl@3` first), else the system headers. On macOS that is Homebrew's `openssl@3` (`brew install openssl@3`), whose trusted certificates are Homebrew's `cert.pem` bundle; on Linux it is the distribution's libssl (`libssl-dev` or `openssl-devel` to build), trusting the distribution's certificate store. Native programs link OpenSSL's shared libraries, so a binary from `tessera build` that uses TLS needs them where it runs. If OpenSSL is not found, tessera still builds and runs everything else, and every TLS operation fails with `Failed("tls: ... built without TLS ...")`.
 
 ### Running programs
 
@@ -1013,7 +1013,7 @@ if resp.status == 200 {
 }
 ```
 
-- `Net.get(url)` sends one HTTP/1.1 `GET` (with `Host`, `User-Agent: vela`, `Accept: */*` and `Connection: close`), reads until the server closes, and returns `HttpResponse { status, headers, body }`.
+- `Net.get(url)` sends one HTTP/1.1 `GET` (with `Host`, `User-Agent: tessera`, `Accept: */*` and `Connection: close`), reads until the server closes, and returns `HttpResponse { status, headers, body }`.
 - Every status is `Ok`, including 404 and 500; redirects are returned, not followed. `Err(Failed(...))` means the server could not be reached or the response was not valid HTTP; responses over 64 MiB, with more than 64 KiB of headers or with more than 1000 header lines are refused.
 - `headers` is a `Map[Str, Str]` with lowercased names, in the order they arrived; a repeated header's values are joined with `", "`. The body is decoded from chunked transfer encoding or cut to `Content-Length`.
 - `https://` URLs go over `Net.connect_tls` (port 443 unless given), with the certificate checks described under TLS. URLs may name an IPv6 address: `http://[::1]:8080/`. A server that never answers keeps `get` waiting; give it a deadline with `time.within(clock, ms, || net.get(url))`. For other methods, request headers or bodies, use `http.request` from the `http` module, which works over `Net.connect` and `Net.connect_tls`.
@@ -1099,7 +1099,7 @@ Binary data, kept apart from text so a byte buffer is never printed or concatena
 | `count_by(key)` | `Map[K, Int]`, how many items have each key |
 | `tally()` | `Map[T, Int]`, how many times each item occurs: `"hello".chars().tally()` is `{"h": 1, "e": 1, "l": 2, "o": 1}` |
 
-None of these panic, except when a function passed to them does. The methods from `any` on take functions and are written in Vela; they work the same as the others (a file cannot define a method with one of their names, E0106), and natively they compile like your own code, so a call through a closure literal costs a function call per item. A pipeline of `map` and `filter` before one of them still runs as one loop.
+None of these panic, except when a function passed to them does. The methods from `any` on take functions and are written in Tessera; they work the same as the others (a file cannot define a method with one of their names, E0106), and natively they compile like your own code, so a call through a closure literal costs a function call per item. A pipeline of `map` and `filter` before one of them still runs as one loop.
 
 `xs[i]` panics when `i` is out of range; `xs.get(i)` returns `None` instead. Writes go through index and field paths: `groups[i].words.push(w)` and `items[i].qty = 3` both work on a `mut` list. `sort()` uses the order of `<`, so it sorts tuples by their first item, then the second, and structs by their fields in declaration order; `sort_by(key)` sorts by a key; for another order and for inserting or removing at a position, use the `list` module (`list.sort_by(xs, less)`, `insert_at`, `remove_at`, section 19).
 
@@ -1179,11 +1179,11 @@ fn main(root: Root) {
 ```
 
 - The path must be a string literal, relative to the file that names it.
-- It must stay inside that file's package: the directory of the program's vela.toml (or of the main file when there is none), or a dependency's own directory. An absolute path, a `..` that leaves the package or a symlink that points outside it is error E0405. Without this rule a dependency could put `../../.ssh/id_rsa` into the binary, a read that no grant allows.
+- It must stay inside that file's package: the directory of the program's tessera.toml (or of the main file when there is none), or a dependency's own directory. An absolute path, a `..` that leaves the package or a symlink that points outside it is error E0405. Without this rule a dependency could put `../../.ssh/id_rsa` into the binary, a read that no grant allows.
 - `embed` requires UTF-8 text (E0405 otherwise); `embed_bytes` takes any file. The standard library embeds nothing.
 - `embed_dir` takes every file under the directory and its subdirectories, keyed by its path inside it with `/` between parts, in sorted order. Names starting with `.` (`.git`, `.env`, `.DS_Store`) are left out, at any depth. Every file and subdirectory, links included, must stay inside the package (E0405), and a directory with nothing to embed is E0405 too. Values are `Bytes`; `to_str()` costs nothing for text.
 - The text is taken as it is: braces in the file do not start interpolation.
-- Changing an embedded file changes the program, and the build cache sees it, because the contents are part of the generated C. `vela caps` lists every embedded file with its size after the functions (`"embeds"` in `--json`).
+- Changing an embedded file changes the program, and the build cache sees it, because the contents are part of the generated C. `tessera caps` lists every embedded file with its size after the functions (`"embeds"` in `--json`).
 - A function or variable named `embed` in scope is called as usual.
 
 ### Capabilities
@@ -1274,10 +1274,10 @@ test "gives up after five seconds" (clock: virtual Clock) {
 - Timers ring one at a time, in a fixed order: the earliest first, and of two set for the same instant, the one set first (a `sleep(5000)` started before a `select` with `clock.after(5000)` returns first, so a message it then sends wins). The next timer, even one due at the same instant, rings only once every task is waiting again. Natively, the tasks of such a test take turns on one thread in the order they become ready, as in the interpreter, so the same test does the same thing every run, in both.
 - Work does not take time: while a task computes, writes files or calls C, the clock stands still. The same holds for a task waiting on real I/O (a socket, stdin): no timer rings until it has its data, since only the outside world can wake it. A test cannot take `Net`, `Listen` or `Stdin`, so in practice its tasks only ever wait on each other and on timers.
 - When every task is waiting and no timer is set, nothing can ever wake one: the test fails with `all tasks are blocked (deadlock)`, as a program does.
-- Only `vela test` (with or without `--native`) runs code on virtual time, and only in tests that ask for it; `vela run` and `vela build` always use the real clock, as do tests that take `clock: Clock`.
-- `vela test FILE` runs every test, each isolated, and prints `ok` (with the time it took) or `FAIL` with the panic message and location; it exits with status 1 if any test fails. `--native` runs them as native code.
+- Only `tessera test` (with or without `--native`) runs code on virtual time, and only in tests that ask for it; `tessera run` and `tessera build` always use the real clock, as do tests that take `clock: Clock`.
+- `tessera test FILE` runs every test, each isolated, and prints `ok` (with the time it took) or `FAIL` with the panic message and location; it exits with status 1 if any test fails. `--native` runs them as native code.
 - `--run TEXT` runs only the tests (and benchmarks) whose name contains `TEXT`. `--json` prints one JSON object instead, for tools and agents: `{"tests": [{"name", "ok", "message"?, "where"?, "seconds"}], "benches": [...], "passed", "failed", "seconds"}`; a test's own output is left out of it.
-- Test names must be unique (E0106). Tests are type-checked by `vela check` and ignored by `vela run` and `vela build`.
+- Test names must be unique (E0106). Tests are type-checked by `tessera check` and ignored by `tessera run` and `tessera build`.
 
 ### Table tests
 
@@ -1308,7 +1308,7 @@ bench "sum to 100" {
 ```
 
 - `bench "name" { ... }` is a top-level item like `test`, and can take `fs: Fs` and `clock: Clock` (never `virtual`) the same way (one directory for the whole run). Its body is one operation.
-- `vela test FILE` skips benchmarks. `vela test FILE --bench` runs the tests and then every benchmark, always as native code: each benchmark runs in its own process, first once, then with more and more iterations (at most 100 times more per round), until one round takes at least the time budget, one second by default. `--bench-time 200ms` (or `2s`, `1m`) sets the budget, and `--bench-time 100x` runs exactly 100 iterations.
+- `tessera test FILE` skips benchmarks. `tessera test FILE --bench` runs the tests and then every benchmark, always as native code: each benchmark runs in its own process, first once, then with more and more iterations (at most 100 times more per round), until one round takes at least the time budget, one second by default. `--bench-time 200ms` (or `2s`, `1m`) sets the budget, and `--bench-time 100x` runs exactly 100 iterations.
 - It reports the iterations of the last round, the time per operation, and the runtime's allocations per operation (strings, lists, maps, closures and other objects made, whether or not they were freed). A panic fails the benchmark like a test.
 - The value of the body's last expression is passed to `keep`, so the C compiler cannot drop the work that made it. Inside a loop, call `keep(x)` on values that are otherwise unused. A constant result (`1 + 2`) is still computed at compile time, as in any program, and a pure call whose arguments do not change in a loop is made once (section 14): vary the arguments to time each call.
 - Benchmark names must be unique among benchmarks (E0106); a test and a benchmark may share a name.
@@ -1342,7 +1342,7 @@ The interpreter reuses a pure call's result in a loop when the same function is 
 
 ## 15. Errors
 
-Every diagnostic has a stable code. `vela explain CODE` prints its explanation, and `vela check --json` emits code, span, notes and an auto-fix when there is one. Codes starting with W are warnings: they are printed, but the program still builds and runs.
+Every diagnostic has a stable code. `tessera explain CODE` prints its explanation, and `tessera check --json` emits code, span, notes and an auto-fix when there is one. Codes starting with W are warnings: they are printed, but the program still builds and runs.
 
 | Code | Meaning |
 | --- | --- |
@@ -1383,11 +1383,11 @@ Every diagnostic has a stable code. `vela explain CODE` prints its explanation, 
 | E0306 | a test parameter that is not `fs: Fs`, `clock: Clock` or `clock: virtual Clock`, or a bench that takes `virtual Clock` |
 | E0310 | misuse of a group handle |
 | E0311 | `return` or `?` leaving a group |
-| E0320 | a dependency takes a capability vela.toml does not grant it |
-| E0321 | malformed vela.toml |
+| E0320 | a dependency takes a capability tessera.toml does not grant it |
+| E0321 | malformed tessera.toml |
 | E0322 | a git dependency could not be fetched |
-| E0323 | vela.lock does not match: a malformed line, or a dependency whose files changed |
-| E0324 | a trusted dependency calls a C library that vela.lock did not record |
+| E0323 | tessera.lock does not match: a malformed line, or a dependency whose files changed |
+| E0324 | a trusted dependency calls a C library that tessera.lock did not record |
 | E0330 | a foreign function signature with a type that cannot cross to C, too many parameters, or a bad library name |
 | E0331 | a foreign function used as a value instead of called |
 | E0401 | module not found, or a qualified name without `use` |
@@ -1413,7 +1413,7 @@ A panic unwinds the stack up to the boundary: everything the abandoned code owne
 
 ## 16. Grammar
 
-EBNF. `NL` is a newline, as described in section 2. `UPPER` is an `IDENT` that starts with a capital letter. A character-level version for constrained decoding, with the newline rules spelled out, is in [grammar/vela.gbnf](grammar/vela.gbnf). `{ x }` means zero or more, and `[ x ]` means optional.
+EBNF. `NL` is a newline, as described in section 2. `UPPER` is an `IDENT` that starts with a capital letter. A character-level version for constrained decoding, with the newline rules spelled out, is in [grammar/tessera.gbnf](grammar/tessera.gbnf). `{ x }` means zero or more, and `[ x ]` means optional.
 
 ```
 program    = { "use" IDENT | [ "pub" ] ( fn | struct | enum | interface ) | test | bench | foreign } ;
@@ -1483,13 +1483,13 @@ tuplepat   = "(" pattern "," pattern { "," pattern } ")" ;
 
 ## 17. Tools
 
-- `vela fmt FILE` prints the canonical formatting (`--write` rewrites, `--check` verifies).
-- `vela lsp` is a language server (diagnostics, hover, definition, references, rename, completion, quick fixes, outline); `vela mcp` is an MCP server exposing check, run, test, format, caps, type-at, references, rename and the spec to coding agents. Rename is refused when it is unsafe: the renamed program must check with no new errors, and the new name must refer to exactly the renamed places.
-- `vela caps FILE` lists each function's authority; `vela explain CODE` explains an error.
-- `vela search`, `vela add` and `vela index entry` use the package index (section 18).
-- `vela doc FILE|MODULE... [--std] [--all] [--html] [-o OUT]` prints documentation built from doc comments (section 2) and signatures, as Markdown, or with `--html` as one static page. An argument that is not a file names a standard library module; `--std` documents all of them. It lists `pub` items (everything with `--all`); methods appear under their type, and methods on a type the module does not declare (such as `Str`) get their own section. Files are parsed, not type-checked.
+- `tessera fmt FILE` prints the canonical formatting (`--write` rewrites, `--check` verifies).
+- `tessera lsp` is a language server (diagnostics, hover, definition, references, rename, completion, quick fixes, outline); `tessera mcp` is an MCP server exposing check, run, test, format, caps, type-at, references, rename and the spec to coding agents. Rename is refused when it is unsafe: the renamed program must check with no new errors, and the new name must refer to exactly the renamed places.
+- `tessera caps FILE` lists each function's authority; `tessera explain CODE` explains an error.
+- `tessera search`, `tessera add` and `tessera index entry` use the package index (section 18).
+- `tessera doc FILE|MODULE... [--std] [--all] [--html] [-o OUT]` prints documentation built from doc comments (section 2) and signatures, as Markdown, or with `--html` as one static page. An argument that is not a file names a standard library module; `--std` documents all of them. It lists `pub` items (everything with `--all`); methods appear under their type, and methods on a type the module does not declare (such as `Str`) get their own section. Files are parsed, not type-checked.
 
-```vela
+```tessera
 // Geometry helpers.
 
 // A point on the plane.
@@ -1510,30 +1510,30 @@ pub fn norm(self: Point) -> Float {
 ### Modules
 
 ```
-use json                  // json.vela next to this file, a dependency, or the standard library
+use json                  // json.tsr next to this file, a dependency, or the standard library
 
 pub fn load(text: Str) -> Result[json.Value, Str] {
     json.parse(text)
 }
 ```
 
-- `use NAME` makes module `NAME` available in this file. It looks for `NAME.vela` next to the file, then a dependency named `NAME` in vela.toml, then the standard library. A file never imports itself.
+- `use NAME` makes module `NAME` available in this file. It looks for `NAME.tsr` next to the file, then a dependency named `NAME` in tessera.toml, then the standard library. A file never imports itself.
 - Refer to a module's items as `NAME.item`: functions `json.parse(s)`, types `json.Value`, struct literals `json.Field { key, value }`, variants `json.Num(1.0)` and patterns `json.Num(x)`. A function can be used as a value: `let f = json.parse`.
 - Only items marked `pub` (`pub fn`, `pub struct`, `pub enum`) can be used from another module (E0402). Struct fields and enum variants of a `pub` type are all visible.
 - Inside a module, its own items are used unqualified. A local variable shadows a module name.
 - Variants are matched by name, so `match v { Num(x) => ... }` works without the module prefix when the type is known.
-- `test` blocks in a used module are not run; `vela test` runs the tests of the file you give it.
+- `test` blocks in a used module are not run; `tessera test` runs the tests of the file you give it.
 - Modules can use each other, including in cycles. Type names print with their module: `json.Value`.
 
 ### Packages and capabilities
 
-A vela.toml next to the program (or in a parent directory) lists the program's own grants, its dependencies, and what each may do:
+A tessera.toml next to the program (or in a parent directory) lists the program's own grants, its dependencies, and what each may do:
 
 ```
 [package]
 name = "app"
 
-[grants]                                           # what `vela run` grants the program
+[grants]                                           # what `tessera run` grants the program
 fs = "data:ro"
 net = ["api.github.com"]
 env = ["HOME", "LANG"]
@@ -1545,22 +1545,22 @@ color = { git = "https://example.com/color.git", tag = "v1.2.0" }
 yaml = { git = "git@example.com:me/yaml.git", commit = "3f9c2e1d7a" }
 ```
 
-- `[grants]` takes `net`, `fs`, `listen`, `env`, `exec` and `foreign`, each a string or a list of strings written exactly like the text after `--grant KIND=`. `fs` takes one directory, relative to vela.toml, with an optional `:ro`. Stdout, Stdin, Clock and Rand are always granted, so listing them is an error. Flags on the command line add to these grants.
-- Grants belong to the program being run: only the vela.toml found for the main file is read for them. A dependency's own vela.toml never grants anything, so adding or updating a dependency cannot widen what the program may do. A dependency gets capabilities in exactly one way: your code passes them to it, and only of the kinds its `caps` allow. `[grants]` decides what reaches `main`; `caps` decides which of those may cross into each dependency.
-- A dependency is a directory holding `NAME.vela`, plus any modules that file uses from the same directory.
+- `[grants]` takes `net`, `fs`, `listen`, `env`, `exec` and `foreign`, each a string or a list of strings written exactly like the text after `--grant KIND=`. `fs` takes one directory, relative to tessera.toml, with an optional `:ro`. Stdout, Stdin, Clock and Rand are always granted, so listing them is an error. Flags on the command line add to these grants.
+- Grants belong to the program being run: only the tessera.toml found for the main file is read for them. A dependency's own tessera.toml never grants anything, so adding or updating a dependency cannot widen what the program may do. A dependency gets capabilities in exactly one way: your code passes them to it, and only of the kinds its `caps` allow. `[grants]` decides what reaches `main`; `caps` decides which of those may cross into each dependency.
+- A dependency is a directory holding `NAME.tsr`, plus any modules that file uses from the same directory.
 - `caps` lists what the dependency may use: `net` (Net and Conn), `listen` (Listen, Listener and Conn), `fs`, `stdout`, `stdin`, `clock`, `rand`, `env`, `exec`. The default is none. No dependency can take `Root`, and `caps` cannot give `foreign` (E0321).
-- `[trust] foreign = ["name", ...]` names the dependencies that may call C: declare foreign blocks and take `Foreign`. Calling C is full trust, since C code is outside every capability check, so it is a separate, explicit list rather than one more cap, and only the program's vela.toml can hold it. An untrusted dependency that calls C is E0320. vela.lock gets a line per trusted dependency that calls C, `foreign NAME LIB,LIB`, written on the first build; when an update makes the dependency declare a library the line does not have, the build stops (E0324) until you review it and delete the line.
-- Vela has no ambient authority, so a function can only use a capability that reaches it as a parameter. The checker therefore knows everything a dependency can ever do from its signatures, and rejects the program (E0320) if a dependency's function takes a capability it was not granted. Granting is still only an upper bound: at run time the dependency gets exactly the capabilities you pass it, which can be narrowed with `only` and `under`.
+- `[trust] foreign = ["name", ...]` names the dependencies that may call C: declare foreign blocks and take `Foreign`. Calling C is full trust, since C code is outside every capability check, so it is a separate, explicit list rather than one more cap, and only the program's tessera.toml can hold it. An untrusted dependency that calls C is E0320. tessera.lock gets a line per trusted dependency that calls C, `foreign NAME LIB,LIB`, written on the first build; when an update makes the dependency declare a library the line does not have, the build stops (E0324) until you review it and delete the line.
+- Tessera has no ambient authority, so a function can only use a capability that reaches it as a parameter. The checker therefore knows everything a dependency can ever do from its signatures, and rejects the program (E0320) if a dependency's function takes a capability it was not granted. Granting is still only an upper bound: at run time the dependency gets exactly the capabilities you pass it, which can be narrowed with `only` and `under`.
 - A dependency is a local directory (`path`) or a git repository (`git`) at a `tag` or a `commit` (lowercase hex, at least 7 characters). The URL is `https://`, `http://`, `ssh://`, `git://`, `file://` or `user@host:path`. No registry holds the code: the URL is the name of the source, and the package index (below) only points at URLs.
-- A git dependency is fetched with the `git` command into a cache, one directory per commit: `$VELA_CACHE`, else `$XDG_CACHE_HOME/vela`, else `~/.cache/vela`. Fetching needs no grant because it happens in the compiler, before the program exists; `vela lsp` and `vela mcp` never fetch, and report a dependency that is not cached yet (E0322).
-- `vela.lock`, next to vela.toml, is written on the first build and should be committed. It holds one line per git dependency: name, URL, `tag:NAME` or `commit:HASH` as written in vela.toml, the full commit, and a BLAKE2b hash of the dependency's files:
+- A git dependency is fetched with the `git` command into a cache, one directory per commit: `$TESSERA_CACHE`, else `$XDG_CACHE_HOME/tessera`, else `~/.cache/tessera`. Fetching needs no grant because it happens in the compiler, before the program exists; `tessera lsp` and `tessera mcp` never fetch, and report a dependency that is not cached yet (E0322).
+- `tessera.lock`, next to tessera.toml, is written on the first build and should be committed. It holds one line per git dependency: name, URL, `tag:NAME` or `commit:HASH` as written in tessera.toml, the full commit, and a BLAKE2b hash of the dependency's files:
 
   ```
   color https://example.com/color.git tag:v1.2.0 8d022128f5f177019f1e6aed46f75c93c90815f1 blake2b:5fea136b...
   ```
 
-  Every build uses the locked commit, even if the tag has moved since, and checks the cached files against the hash (E0323). To update a dependency, change its `tag` or `commit`, or delete its line; vela fetches it and rewrites the line.
-- Each dependency must be listed in the program's vela.toml, including dependencies of dependencies: a dependency's own vela.toml is not read.
+  Every build uses the locked commit, even if the tag has moved since, and checks the cached files against the hash (E0323). To update a dependency, change its `tag` or `commit`, or delete its line; tessera fetches it and rewrites the line.
+- Each dependency must be listed in the program's tessera.toml, including dependencies of dependencies: a dependency's own tessera.toml is not read.
 
 ### The package index
 
@@ -1576,17 +1576,17 @@ description = "Colors for terminal output"
 caps = ["stdout"]
 ```
 
-- `commit` is the commit the tag pointed at when the entry was written. `caps` are written as in vela.toml, plus `foreign` for a package that calls C. `description` and `caps` may be left out (no description, no capabilities).
-- `VELA_INDEX` names the index: a git URL (cloned each time it is used), a directory (every `.toml` file at its top) or one file. It has no default; without it, the commands below say how to set it. An index that cannot be reached is an error, never an empty result.
-- `vela search [WORDS...]` lists the packages whose name or description contains every word (ignoring case), each with its description, its latest version and its capabilities. Versions compare as numbers: a leading `v` is dropped, so `v1.10.0` is newer than `v1.2.0`.
-- `vela add NAME[@VERSION]` adds the latest version, or the one named (`color@1.2.0` or `color@v1.2.0`), to the nearest vela.toml (a new one in the current directory if there is none) as `NAME = { git = "URL", tag = "TAG", caps = [...] }`, with `caps` exactly what the index lists, and prints those capabilities: they are what you are granting. Before writing anything it fetches the tag and refuses when the tag no longer points at the indexed commit (it was moved), or when the package's code takes a capability the index does not list (the same check as E0320, with `caps` set to the index's list). It writes the checked commit to vela.lock. It never grants `foreign`: for a package that calls C it says so, and the program does not build until you add `[trust] foreign = ["NAME"]` yourself.
-- `vela index entry [DIR]`, run at the top of a package's git repository, prints the entry for the tag on the current commit: the name (vela.toml's `[package] name`, else the directory's), the URL of the `origin` remote, the tag and commit, vela.toml's `[package] description`, and the capabilities its functions take, computed from the code. It refuses uncommitted changes and an untagged commit. Publishing a version is adding that entry to the index, for example in a pull request.
+- `commit` is the commit the tag pointed at when the entry was written. `caps` are written as in tessera.toml, plus `foreign` for a package that calls C. `description` and `caps` may be left out (no description, no capabilities).
+- `TESSERA_INDEX` names the index: a git URL (cloned each time it is used), a directory (every `.toml` file at its top) or one file. It has no default; without it, the commands below say how to set it. An index that cannot be reached is an error, never an empty result.
+- `tessera search [WORDS...]` lists the packages whose name or description contains every word (ignoring case), each with its description, its latest version and its capabilities. Versions compare as numbers: a leading `v` is dropped, so `v1.10.0` is newer than `v1.2.0`.
+- `tessera add NAME[@VERSION]` adds the latest version, or the one named (`color@1.2.0` or `color@v1.2.0`), to the nearest tessera.toml (a new one in the current directory if there is none) as `NAME = { git = "URL", tag = "TAG", caps = [...] }`, with `caps` exactly what the index lists, and prints those capabilities: they are what you are granting. Before writing anything it fetches the tag and refuses when the tag no longer points at the indexed commit (it was moved), or when the package's code takes a capability the index does not list (the same check as E0320, with `caps` set to the index's list). It writes the checked commit to tessera.lock. It never grants `foreign`: for a package that calls C it says so, and the program does not build until you add `[trust] foreign = ["NAME"]` yourself.
+- `tessera index entry [DIR]`, run at the top of a package's git repository, prints the entry for the tag on the current commit: the name (tessera.toml's `[package] name`, else the directory's), the URL of the `origin` remote, the tag and commit, tessera.toml's `[package] description`, and the capabilities its functions take, computed from the code. It refuses uncommitted changes and an untagged commit. Publishing a version is adding that entry to the index, for example in a pull request.
 
 ## 19. Standard library
 
-Written in Vela and built into the compiler; `use` any of them. They take capabilities only as parameters, like any other code.
+Written in Tessera and built into the compiler; `use` any of them. They take capabilities only as parameters, like any other code.
 
-The standard library is checked like a dependency. `src/std/vela.toml` lists the capabilities each module may take, and every program that uses a module is checked against it (E0320), with or without a vela.toml of its own:
+The standard library is checked like a dependency. `src/std/tessera.toml` lists the capabilities each module may take, and every program that uses a module is checked against it (E0320), with or without a tessera.toml of its own:
 
 | Module | May take |
 | --- | --- |
@@ -1594,12 +1594,12 @@ The standard library is checked like a dependency. `src/std/vela.toml` lists the
 | `http` | `net` (Net, Conn) and `listen` (Listener, Conn) |
 | `sql` | `fs` (the database file's directory); trusted with C (`[trust] foreign = ["sql"]`) to call SQLite |
 
-A module missing from the list may take nothing. `vela caps FILE` shows what each std function takes. What stays trusted, and why:
+A module missing from the list may take nothing. `tessera caps FILE` shows what each std function takes. What stays trusted, and why:
 
 - The built-in methods of the capabilities themselves (`Net.get`, `Fs.read`, `Listen.on`, ...), written in OCaml for the interpreter and C for the native runtime. They are where the grants are enforced (host allowlists, the fs root, read-only), so there is nothing below them to check them against; they are covered by the tests of both backends.
 - The built-in methods of plain values (`Str`, `List`, `Map`, channels, ...). They take no capability, so they cannot do I/O.
 - The std modules' source. It is embedded in the compiler, not fetched, so it is as trustworthy as the compiler binary; the manifest check makes sure that what it can do stays what it declares.
-- The C libraries that std modules trusted in the manifest's `[trust]` declare in `foreign` blocks (SQLite for `sql`). Their calls need no `Foreign`, and the declarations are private to the module; the module wraps every call and keeps SQLite inside the `Fs` grant (see `sql` below). A standard library module that is not trusted cannot call C. Trusted modules may also declare the runtime's own helper library, `foreign "vela"`, which no other code may: `vela_copy(p, n)` copies C memory into `Bytes`, and a handle table (`vela_handle_new`, `_acquire`, `_release`, `_close`) keeps C pointers out of Vela values. A trusted module's values hold a random id from that table instead of a `Handle`, since any code can write `Handle { addr: ... }` but no code can turn an id into a pointer; an unknown or closed id is an error, and a pointer is freed only once no use of it is in progress.
+- The C libraries that std modules trusted in the manifest's `[trust]` declare in `foreign` blocks (SQLite for `sql`). Their calls need no `Foreign`, and the declarations are private to the module; the module wraps every call and keeps SQLite inside the `Fs` grant (see `sql` below). A standard library module that is not trusted cannot call C. Trusted modules may also declare the runtime's own helper library, `foreign "tessera"`, which no other code may: `tessera_copy(p, n)` copies C memory into `Bytes`, and a handle table (`tessera_handle_new`, `_acquire`, `_release`, `_close`) keeps C pointers out of Tessera values. A trusted module's values hold a random id from that table instead of a `Handle`, since any code can write `Handle { addr: ... }` but no code can turn an id into a pointer; an unknown or closed id is an error, and a pointer is freed only once no use of it is in progress.
 - Callbacks. `http.serve(l, n, handler)` calls `handler` inside std code; the handler carries only the capabilities its closure captured from your code, which appear in your signatures, not std's.
 
 ### errors
@@ -1709,7 +1709,7 @@ Number formatting. Fixed decimals are the Float method `x.to_fixed(d)`; this mod
 
 ### regex
 
-Regular expressions that never backtrack: a pattern compiles to a program for a Pike VM, which follows every way the pattern can match at once, so a search takes time proportional to the pattern size times the text length, whatever the pattern. `(a+)+$` on a long run of `a`s is as fast as any other pattern. Written in Vela.
+Regular expressions that never backtrack: a pattern compiles to a program for a Pike VM, which follows every way the pattern can match at once, so a search takes time proportional to the pattern size times the text length, whatever the pattern. `(a+)+$` on a long run of `a`s is as fast as any other pattern. Written in Tessera.
 
 | Item | Meaning |
 | --- | --- |
@@ -1723,7 +1723,7 @@ Regular expressions that never backtrack: a pattern compiles to a program for a 
 | `escape(s)` | `s` with metacharacters escaped, to match it literally |
 | `struct Match { text, start, end, groups, names }`, `m.capture(i)`, `m.named(name)` | `start` and `end` are byte offsets; `capture(0)` is the whole match; a group that did not take part is `None` |
 
-The syntax is a subset of RE2's: literals; `.` (any character but newline); classes `[abc]`, `[^a-z]`, `[\d_]`; `\d \w \s` and `\D \W \S` (ASCII); `\b \B` word edges; `^ $` (text start and end) and `\A \z`; `* + ? {n} {n,} {n,m}` (counts up to 1000), each lazy with a trailing `?`; `( )` captures, `(?: )` groups without capturing, `(?P<name> )` or `(?<name> )` name a capture; `|`; escapes `\n \t \r \f \v \0 \xHH` and `\` before any punctuation. Flags `(?i)` (ASCII case-insensitive), `(?m)` (`^` and `$` match at lines) and `(?s)` (`.` matches newline) apply from where they appear to the end of the pattern. Text is UTF-8: `.` and negated classes match whole characters, and a non-ASCII character is one unit for a quantifier. Classes may list non-ASCII characters but not ranges of them, and a negated class cannot list them. Backreferences and lookaround are not supported, since they need backtracking. A Vela string needs `\{` for a literal brace, so `\d{4}` is written `"\\d\{4\}"`.
+The syntax is a subset of RE2's: literals; `.` (any character but newline); classes `[abc]`, `[^a-z]`, `[\d_]`; `\d \w \s` and `\D \W \S` (ASCII); `\b \B` word edges; `^ $` (text start and end) and `\A \z`; `* + ? {n} {n,} {n,m}` (counts up to 1000), each lazy with a trailing `?`; `( )` captures, `(?: )` groups without capturing, `(?P<name> )` or `(?<name> )` name a capture; `|`; escapes `\n \t \r \f \v \0 \xHH` and `\` before any punctuation. Flags `(?i)` (ASCII case-insensitive), `(?m)` (`^` and `$` match at lines) and `(?s)` (`.` matches newline) apply from where they appear to the end of the pattern. Text is UTF-8: `.` and negated classes match whole characters, and a non-ASCII character is one unit for a quantifier. Classes may list non-ASCII characters but not ranges of them, and a negated class cannot list them. Backreferences and lookaround are not supported, since they need backtracking. A Tessera string needs `\{` for a literal brace, so `\d{4}` is written `"\\d\{4\}"`.
 
 ```
 use regex
@@ -1802,7 +1802,7 @@ fn main(root: Root) -> Result[(), IoError] {
 - `query` runs one statement and returns every row as a `List[sql.Row]`; `query_one` returns the first, as an `Option`. A row holds `columns` (names) and `values`. `row.get(name)` is the `Value`; `row.int(name)`, `row.float(name)` (an integer reads as a float too), `row.text(name)` and `row.blob(name)` are `Option`s, `None` for NULL; `row.is_null(name)`. Asking for a column the row does not have, or reading one as the wrong type, panics: that is a bug in the query or the code, not a condition to handle.
 - `db.transaction(|| { ...; Ok(v) })` runs the closure between `BEGIN` and `COMMIT`. If it returns `Err` or panics, the transaction is rolled back and the error (or the panic) goes on. Transactions do not nest: starting one inside another is an `Err`.
 - `db.last_id()` is the rowid of the last row inserted through the connection, as a `Result[Int, IoError]`.
-- SQLite stays inside the grants. `ATTACH` is turned off, and with it `VACUUM` (which attaches a temporary database; `VACUUM INTO` would write anywhere), so SQL cannot open other files. The database file is not opened through a symlink, and `open` refuses a database whose `-journal`, `-wal` or `-shm` file is a symlink out of the granted directory (or a broken one), since SQLite follows those. URI filenames and extensions are off (SQLite's defaults, which the module never changes), and temporary tables and sorts stay in memory. What remains is a race no Vela code can cause: another process that can write to the directory swapping in such a symlink while the database is open. SQLite writes its journal next to the database, inside the granted directory. A busy database is waited on for up to 5 seconds; that wait, like every SQLite call, blocks the worker thread.
+- SQLite stays inside the grants. `ATTACH` is turned off, and with it `VACUUM` (which attaches a temporary database; `VACUUM INTO` would write anywhere), so SQL cannot open other files. The database file is not opened through a symlink, and `open` refuses a database whose `-journal`, `-wal` or `-shm` file is a symlink out of the granted directory (or a broken one), since SQLite follows those. URI filenames and extensions are off (SQLite's defaults, which the module never changes), and temporary tables and sorts stay in memory. What remains is a race no Tessera code can cause: another process that can write to the directory swapping in such a symlink while the database is open. SQLite writes its journal next to the database, inside the granted directory. A busy database is waited on for up to 5 seconds; that wait, like every SQLite call, blocks the worker thread.
 
 ## 20. Not yet
 

@@ -1,6 +1,6 @@
 /* A small C library for the foreign-function tests: structs by value in
    the shapes each calling convention treats differently, and callbacks.
-   The test suite builds it as libvelatest (a shared library). */
+   The test suite builds it as libtesseratest (a shared library). */
 #include <stdint.h>
 #include <string.h>
 

@@ -1,7 +1,7 @@
 // Echo server: one task per connection, all parked on the socket poller
 // while they wait. Serves `limit` connections, then reports.
 //
-//   vela build examples/echo.vela -o echo
+//   tessera build examples/echo.tsr -o echo
 //   ./echo --grant listen=127.0.0.1:9000
 //   python3 bench/echo_load.py 9000 10000
 

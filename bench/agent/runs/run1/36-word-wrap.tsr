@@ -18,7 +18,7 @@ fn wrap(text: Str, width: Int) -> List[Str] {
 }
 
 fn main(root: Root) {
-    let text = "Vela is a small statically typed language where code can only touch the outside world through capabilities"
+    let text = "Tessera is a small statically typed language where code can only touch the outside world through capabilities"
     for line in wrap(text, 30) {
         root.stdout.print(line)
     }

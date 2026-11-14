@@ -1,7 +1,7 @@
 // A tiny notebook in SQLite: add notes, tag them, list them by tag.
 //
-//   vela run examples/notes.vela --grant fs=. -- add groceries "oat milk"
-//   vela run examples/notes.vela --grant fs=. -- list groceries
+//   tessera run examples/notes.tsr --grant fs=. -- add groceries "oat milk"
+//   tessera run examples/notes.tsr --grant fs=. -- list groceries
 //
 // With no arguments it runs a short demo in memory. Values always go in as
 // parameters (`?`), never pasted into the SQL text.

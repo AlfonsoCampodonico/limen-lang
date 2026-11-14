@@ -1,7 +1,7 @@
-// Built-in methods of List and Map written in Vela. Every file sees them,
+// Built-in methods of List and Map written in Tessera. Every file sees them,
 // like the methods in SPEC.md section 11 that are written in OCaml and C.
 // They never panic, so a panic location never points in here.
-// Plain Vela: no destructuring (it is expanded when modules load, and this
+// Plain Tessera: no destructuring (it is expanded when modules load, and this
 // file is not a module), and every method is generic, so a program only
 // compiles the ones it calls.
 

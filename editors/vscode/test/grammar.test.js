@@ -1,4 +1,4 @@
-// Tokenizes Vela source with VS Code's own TextMate engine and checks the
+// Tokenizes Tessera source with VS Code's own TextMate engine and checks the
 // scopes. Run: npm test (from editors/vscode).
 const fs = require("fs");
 const path = require("path");
@@ -17,12 +17,12 @@ async function loadGrammar() {
       createOnigString: (s) => new oniguruma.OnigString(s),
     }),
     loadGrammar: async (scope) => {
-      if (scope !== "source.vela") return null;
-      const file = path.join(root, "syntaxes", "vela.tmLanguage.json");
+      if (scope !== "source.tessera") return null;
+      const file = path.join(root, "syntaxes", "tessera.tmLanguage.json");
       return vsctm.parseRawGrammar(fs.readFileSync(file, "utf8"), file);
     },
   });
-  return registry.loadGrammar("source.vela");
+  return registry.loadGrammar("source.tessera");
 }
 
 // [text, scopes] for each token of each line; the rule stack after the last line
@@ -88,66 +88,66 @@ pub type Pair[T] = (T, T)
 `;
   const t = tokenize(grammar, src);
   const expect = [
-    ["use", "keyword.other.use.vela"],
-    ["errors", "entity.name.namespace.vela"],
-    ["// a comment with \"quotes\" and fn", "comment.line.double-slash.vela"],
-    ["pub", "storage.modifier.vela"],
-    ["fn", "storage.type.function.vela"],
-    ["fetch", "entity.name.function.vela"],
-    ["Net", "support.type.capability.vela"],
-    ["Str", "support.type.builtin.vela"],
-    ["Result", "support.type.builtin.vela"],
-    ["IoError", "entity.name.type.vela"],
-    ["->", "keyword.operator.arrow.vela"],
-    ["let", "storage.type.vela"],
-    ["get", "entity.name.function.call.vela"],
-    ["https://x/", "string.quoted.double.vela"],
-    ["{", "punctuation.section.interpolation.begin.vela"],
-    ["org", "source.vela.embedded"],
-    ["\\n", "constant.character.escape.vela"],
-    ["?", "keyword.operator.option.vela"],
-    ["mut", "storage.modifier.vela"],
-    ["1_000", "constant.numeric.integer.vela"],
-    ["2.5e3", "constant.numeric.float.vela"],
-    ["with", "keyword.other.with.vela"],
-    ["..<", "keyword.operator.range.vela"],
-    ["|>", "keyword.operator.pipe.vela"],
-    ["?.", "keyword.operator.option.vela"],
-    ["??", "keyword.operator.option.vela"],
-    ["map", "entity.name.function.call.vela"],
-    ["match", "keyword.control.vela"],
-    ["Some", "support.function.variant.vela"],
-    ["if", "keyword.control.vela"],
-    ["=>", "keyword.operator.arrow.vela"],
-    ["big ", "string.quoted.double.vela"],
-    ["to_str", "entity.name.function.call.vela"],
-    ["defer", "keyword.control.vela"],
-    ["group", "keyword.control.vela"],
-    ["until", "keyword.control.vela"],
-    ["Point", "entity.name.type.vela"],
-    ["self", "variable.language.self.vela"],
-    ["true", "constant.language.boolean.vela"],
-    ["struct", "storage.type.struct.vela"],
-    ["interface", "storage.type.interface.vela"],
-    ["Shape", "entity.name.type.vela"],
-    ["area", "entity.name.function.vela"],
-    ["test", "keyword.other.test.vela"],
-    ["bench", "keyword.other.test.vela"],
-    ["foreign", "storage.modifier.foreign.vela"],
-    ["type", "storage.type.alias.vela"],
-    ["Pair", "entity.name.type.vela"],
+    ["use", "keyword.other.use.tessera"],
+    ["errors", "entity.name.namespace.tessera"],
+    ["// a comment with \"quotes\" and fn", "comment.line.double-slash.tessera"],
+    ["pub", "storage.modifier.tessera"],
+    ["fn", "storage.type.function.tessera"],
+    ["fetch", "entity.name.function.tessera"],
+    ["Net", "support.type.capability.tessera"],
+    ["Str", "support.type.builtin.tessera"],
+    ["Result", "support.type.builtin.tessera"],
+    ["IoError", "entity.name.type.tessera"],
+    ["->", "keyword.operator.arrow.tessera"],
+    ["let", "storage.type.tessera"],
+    ["get", "entity.name.function.call.tessera"],
+    ["https://x/", "string.quoted.double.tessera"],
+    ["{", "punctuation.section.interpolation.begin.tessera"],
+    ["org", "source.tessera.embedded"],
+    ["\\n", "constant.character.escape.tessera"],
+    ["?", "keyword.operator.option.tessera"],
+    ["mut", "storage.modifier.tessera"],
+    ["1_000", "constant.numeric.integer.tessera"],
+    ["2.5e3", "constant.numeric.float.tessera"],
+    ["with", "keyword.other.with.tessera"],
+    ["..<", "keyword.operator.range.tessera"],
+    ["|>", "keyword.operator.pipe.tessera"],
+    ["?.", "keyword.operator.option.tessera"],
+    ["??", "keyword.operator.option.tessera"],
+    ["map", "entity.name.function.call.tessera"],
+    ["match", "keyword.control.tessera"],
+    ["Some", "support.function.variant.tessera"],
+    ["if", "keyword.control.tessera"],
+    ["=>", "keyword.operator.arrow.tessera"],
+    ["big ", "string.quoted.double.tessera"],
+    ["to_str", "entity.name.function.call.tessera"],
+    ["defer", "keyword.control.tessera"],
+    ["group", "keyword.control.tessera"],
+    ["until", "keyword.control.tessera"],
+    ["Point", "entity.name.type.tessera"],
+    ["self", "variable.language.self.tessera"],
+    ["true", "constant.language.boolean.tessera"],
+    ["struct", "storage.type.struct.tessera"],
+    ["interface", "storage.type.interface.tessera"],
+    ["Shape", "entity.name.type.tessera"],
+    ["area", "entity.name.function.tessera"],
+    ["test", "keyword.other.test.tessera"],
+    ["bench", "keyword.other.test.tessera"],
+    ["foreign", "storage.modifier.foreign.tessera"],
+    ["type", "storage.type.alias.tessera"],
+    ["Pair", "entity.name.type.tessera"],
   ];
   for (const [text, want] of expect) {
     const got = scopeOf(t, text);
     check(`scope of ${JSON.stringify(text)}`, got === want, `got ${got}, want ${want}`);
   }
   // a string inside an interpolation is a string; `-` before it was arithmetic
-  check("string in interpolation", scopeOf(t, "-", 1) === "string.quoted.double.vela", scopeOf(t, "-", 1));
+  check("string in interpolation", scopeOf(t, "-", 1) === "string.quoted.double.tessera", scopeOf(t, "-", 1));
   // nested braces inside an interpolation close at the right place: the text after is a string again
-  check("nested interpolation", scopeOf(t, " and ") === "string.quoted.double.vela", scopeOf(t, " and "));
+  check("nested interpolation", scopeOf(t, " and ") === "string.quoted.double.tessera", scopeOf(t, " and "));
   // `test` as a plain name is not a keyword
   const lastLine = t.lines[t.lines.length - 3];
-  check("test as a name", lastLine.some(([x]) => x.includes("test")) && !lastLine.some(([, s]) => s.includes("keyword.other.test.vela")), JSON.stringify(lastLine));
+  check("test as a name", lastLine.some(([x]) => x.includes("test")) && !lastLine.some(([, s]) => s.includes("keyword.other.test.tessera")), JSON.stringify(lastLine));
   check("sample ends at top level", t.stack.equals(vsctm.INITIAL) || t.stack.depth === 1);
 
   // every real program ends outside any string or interpolation (strings
@@ -156,7 +156,7 @@ pub type Pair[T] = (T, T)
   let files = 0;
   for (const dir of dirs) {
     if (!fs.existsSync(dir)) continue;
-    for (const f of fs.readdirSync(dir).filter((f) => f.endsWith(".vela"))) {
+    for (const f of fs.readdirSync(dir).filter((f) => f.endsWith(".tsr"))) {
       const text = fs.readFileSync(path.join(dir, f), "utf8");
       const r = tokenize(grammar, text);
       files++;
