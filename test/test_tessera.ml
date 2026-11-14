@@ -378,14 +378,14 @@ let panics ?grants name src want =
 
 (* A program that chooses its exit status: the same stdout and status from
    both backends, and nothing leaked natively. *)
-let exits name ?grants src want_out want_code =
-  (match run ?grants name src with
+let exits name ?grants ?feed src want_out want_code =
+  (match run ?grants ?feed name src with
    | Ok (got, v) ->
      let code = match v with Interp.VInt n | Interp.VEnum ("Result", "Ok", [ Interp.VInt n ]) -> Interp.exit_code n | Interp.VEnum ("Result", "Err", _) -> 1 | _ -> 0 in
      ok name (got = want_out && code = want_code) (sprintf "got %S exit %d, want %S exit %d" got code want_out want_code)
    | Error e -> ok name false e);
   if native_for name then
-    run_native ?grants name src (function
+    run_native ?grants ?feed name src (function
       | Error m -> ok (name ^ "/native") false m
       | Ok (code, o, e) ->
         ok (name ^ "/native")
@@ -3099,6 +3099,30 @@ fn main(root: Root) {
 }
 |v}
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 da39a3ee5e6b4b0d3255bfef95601890afd80709 d41d8cd98f00b204e9800998ecf8427e\nba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad a9993e364706816aba3e25717850c26c9cd0d89d 900150983cd24fb0d6963f7d28e17f72\n248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1 84983e441c3bd26ebaae4aa1f95129e5e54670f1 8215ef0796a20bcaaae116d3876c664a\ncf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1 a49b2446a02c645bf419f995b67091253a04a259 03dd8807a93175fb062dfb55dc7d359c\nd7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592 2fd4e1c67a2d28fced849ee1bb76e7391b93eb12 9e107d9d372bb6826bd81d3542a419d6\n55 9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318 c1c8bbdc22796e28c0e15163d20899b65621d65a ef1772b6dff9a122358552954ad0df65\n56 b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a c2db330f6083854c99d4b5bfb6e8f29f201be699 3b0c8ac703f828b04c6c197006d17218\n63 7d3e74a05d7db15bce4ad9ec0658ea98e3f06eeecf16b4c6fff2da457ddc2f34 03f09f5b158a7a8cdad920bddc29b81c18a551f5 b06521f39153d618550606be297466d5\n64 ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb 0098ba824b5c16427bd7a1122a5a442a25ec644d 014842d480b571495a4a0363793f7367\n65 635361c48bb9eab14198e76ea8ab7f1a41685d6ad62aa9146d301d4f17eb0ae0 11655326c708d70319be2610e8a57d9a5b959d3b c743a45e0d2e6a95cb859adae0248435\n119 31eba51c313a5c08226adf18d4a359cfdfd8d2e816b13f4af952f7ea6584dcfb ee971065aaa017e0632a8ca6c77bb3bf8b1dfc56 8a7bd0732ed6a28ce75f6dabc90e1613\n120 2f3d335432c70b580af0e8e1b3674a7c020d683aa5f73aaaedfdc55af904c21c f34c1488385346a55709ba056ddd08280dd4c6d6 5f61c0ccad4cac44c75ff505e1f1e537\n128 6836cf13bac400e9105071cd6af47084dfacad4e5e302c94bfed24e013afb73e ad5b3fdbcb526778c2839d2f151ea753995e26a0 e510683b3f5ffe4093d021808bc6ff70\ncdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0\nb0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7 b617318655057264e28bc0b6fb378c8ef146be00\n5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843 effcdf6ae5eb2fa2d27416d5f184df9c259a7c79\n773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe 125d7342b9ac11cd91a39af48aa17b4f63f175d3\n82558a389a443c0ea4cc819899f2083a85f0faa3e578f8077a2e3ff46729665b 4c9007f4026250c6bc8414f9bf50c86c2d7235da\na3b6167473100ee06e0c796c2955552bfa6f7c0a6a8aef8b93f860aab0cd20c5 4c1a03424b55e07fe7f27be1d58bb9324a9a5a04\n60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54 90d0dace1c1bdc957339307803160335bde6df2b\n9b09ffa71b942fcb27635fbcd5b0e944bfdc63644f0713938a7f51535c3a35e2 217e44bb08b6e06a2d6c30f3cb9f537f97c63356\ntrue false false true 32 16\n";
+  out "std-csv"
+    {v|use csv
+
+fn main(root: Root) {
+    let out = root.stdout
+    out.print("{csv.parse("a,b\n1,\"x, y\"\n")}")
+    out.print("{csv.parse("name,quote\r\nAda,\"said \"\"hi\"\"\r\nthen left\"\r\n\r\nBob,,\n,\n\"\"")}")
+    out.print("{csv.parse(bytes([239, 187, 191, 120]).to_str())} {csv.parse("")} {csv.parse("\n\n")} {csv.parse("a")} {csv.parse("a,")} {csv.parse(",")}")
+    out.print("{csv.parse_with("a\tb;c\n1\t2", "\t")} {csv.parse_with("a;b", ";")}")
+    out.print("{csv.parse_maps("id,name\n1,Ada\n2,\"Lin, B\"\n")}")
+    for bad in ["a,\"b\n\nc", "a,b\"c\n", "\"a\"b,c", "x\ny\n\"a\" ,b", "h,h\n1,2", "a,b\n1\n", "a,b\n1,2,3"] {
+        out.print("{csv.parse_maps(bad)}")
+    }
+    out.print("{csv.parse_with("a", "\"")} {csv.parse_with("a", ",,")}")
+    let rows = [["a", "b,c", "say \"hi\""], ["line\nbreak", "", "cr\r"], [""], []]
+    let text = csv.write(rows)
+    out.print(text)
+    out.print("{csv.parse(text)}")
+    out.print(csv.write_with([["a", "b\tc"], ["d;e", "f"]], "\t"))
+    out.print(csv.write_maps(["id", "name"], [map([("name", "Ada"), ("id", "1")]), map([("id", "2")])]))
+    out.print("{csv.escape("plain")} {csv.escape("a,b")} {csv.escape("\"")}")
+}
+|v}
+    "Ok([[\"a\", \"b\"], [\"1\", \"x, y\"]])\nOk([[\"name\", \"quote\"], [\"Ada\", \"said \\\"hi\\\"\\r\\nthen left\"], [\"Bob\", \"\", \"\"], [\"\", \"\"], [\"\"]])\nOk([[\"x\"]]) Ok([]) Ok([]) Ok([[\"a\"]]) Ok([[\"a\", \"\"]]) Ok([[\"\", \"\"]])\nOk([[\"a\", \"b;c\"], [\"1\", \"2\"]]) Ok([[\"a\", \"b\"]])\nOk([{\"id\": \"1\", \"name\": \"Ada\"}, {\"id\": \"2\", \"name\": \"Lin, B\"}])\nErr(\"csv: line 1: a quoted field is not closed\")\nErr(\"csv: line 1: a quote inside an unquoted field; quote the whole field and double the quote\")\nErr(\"csv: line 1: `,` or a line break must follow a closing quote\")\nErr(\"csv: line 3: `,` or a line break must follow a closing quote\")\nErr(\"csv: line 1: the header names `h` twice\")\nErr(\"csv: line 2: 1 field, but the header has 2\")\nErr(\"csv: line 2: 3 fields, but the header has 2\")\nErr(\"csv: the separator must be one byte other than a quote or a line break, not `\\\"`\") Err(\"csv: the separator must be one byte other than a quote or a line break, not `,,`\")\na,\"b,c\",\"say \"\"hi\"\"\"\n\"line\nbreak\",,\"cr\r\"\n\"\"\n\n\nOk([[\"a\", \"b,c\", \"say \\\"hi\\\"\"], [\"line\\nbreak\", \"\", \"cr\\r\"], [\"\"]])\na\t\"b\tc\"\nd;e\tf\n\nid,name\n1,Ada\n2,\n\nplain \"a,b\" \"\"\"\"\n";
   out "std-http-keepalive-stream" ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] }
     {v|use http
 

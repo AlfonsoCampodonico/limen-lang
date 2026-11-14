@@ -1690,7 +1690,7 @@ The standard library is checked like a dependency. `src/std/tessera.toml` lists 
 
 | Module | May take |
 | --- | --- |
-| `json`, `list`, `text`, `format`, `regex`, `errors`, `hex`, `base64`, `hash` | nothing: pure |
+| `json`, `list`, `text`, `format`, `regex`, `errors`, `hex`, `base64`, `hash`, `csv` | nothing: pure |
 | `http` | `net` (Net, Conn) and `listen` (Listener, Conn) |
 | `time` | `clock` and `fs`, for `within` and `load_zone` alone |
 | `sql` | `fs` (the database file's directory); trusted with C (`[trust] foreign = ["sql"]`) to call SQLite |
@@ -1949,6 +1949,19 @@ fn verify(secret: Str, body: Str, mac: Bytes) -> Bool {
     hash.equal(hash.hmac_sha256(secret.to_bytes(), body.to_bytes()), mac)
 }
 ```
+
+### csv
+
+CSV as RFC 4180 has it: fields separated by commas, quoted with `"` when they hold a comma, a quote (written twice) or a line break, and lines ending in `\n` or `\r\n`. Reading is a little lenient: rows may differ in length (`parse_maps` checks them against the header), blank lines are skipped, and a UTF-8 byte order mark at the start is dropped. Pure functions.
+
+| Item | Meaning |
+| --- | --- |
+| `parse(text) -> Result[List[List[Str]], Str]` | the rows, each a list of fields: `parse("a,b\n1,\"x, y\"\n")` is `Ok([["a", "b"], ["1", "x, y"]])`. The error names the line, counting the lines inside quoted fields: `csv: line 3: a quoted field is not closed` |
+| `parse_with(text, sep)` | the same with another separator, one byte that is not a quote or a line break: `"\t"` for TSV, `";"` |
+| `parse_maps(text) -> Result[List[Map[Str, Str]], Str]` | the first row names the fields, and each later row is a map from those names to its fields, in the header's order. A row with another number of fields, or a header naming a field twice, is an error |
+| `write(rows) -> Str`, `write_with(rows, sep)` | one line per row, each ending in `\n`; fields are quoted only when they need it |
+| `write_maps(header, rows) -> Str` | a header line, then each map's values in the header's order, `""` for a name the map lacks |
+| `escape(field) -> Str` | one field as it goes in a line: `escape("a,b")` is `"\"a,b\""` |
 
 ## 20. Not yet
 
