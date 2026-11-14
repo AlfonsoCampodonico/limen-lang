@@ -2674,6 +2674,50 @@ fn main(root: Root) -> Result[(), IoError] {
 }
 |}
     "/lines: [a]\n/lines: [b]\n/lines: [c]\n/lines: [d]\n/lines -> 200 []\n/sized: [one]\n/sized: [two]\n/sized -> 200 []\n/missing -> 404 [nope]\ntick 0\ntick 1\ntick 2\nstopped: Ok(200)\n";
+  (* the client reads URLs with the url module: the fragment stays with the
+     client, a query right after the host is not part of the host, nor is a
+     user, and the scheme's case does not matter *)
+  out "std-http-url"
+    ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] }
+    {|use http
+
+fn main(root: Root) -> Result[(), IoError] {
+    let l = root.listen.on("127.0.0.1:0")?
+    let port = l.port()
+    let net = root.net
+    let out = root.stdout
+    let base = "127.0.0.1:{port}"
+    let urls = ["http://{base}/p?a=1#frag", "http://{base}?x=1", "http://{base}", "HTTP://{base}/up#", "http://{base}/a%20b?q=a+b", "http://ana:pw@{base}/auth"]
+    let _ = group g {
+        g.go(|| {
+            for _ in urls {
+                match l.accept() {
+                    Ok(c) => {
+                        let _ = http.serve_stream(c, |r, c| http.write_response(c, http.text(200, "{r.path} {http.find_header(r.headers, "host") ?? "-"}")))
+                    },
+                    Err(_) => (),
+                }
+            }
+        })
+        g.go(|| {
+            for u in urls {
+                match http.get(net, u) {
+                    Ok(r) => out.print(r.body),
+                    Err(e) => out.print("{e}"),
+                }
+            }
+            for u in ["http://127.0.0.1:99999/", "ftp://{base}/", "/relative", "http:///x"] {
+                match http.get(net, u) {
+                    Ok(r) => out.print("{r.status}"),
+                    Err(e) => out.print("{e}"),
+                }
+            }
+        })
+    }
+    Ok(())
+}
+|}
+    "/p?a=1 127.0.0.1\n/?x=1 127.0.0.1\n/ 127.0.0.1\n/up 127.0.0.1\n/a%20b?q=a+b 127.0.0.1\n/auth 127.0.0.1\nFailed(\"http: url: `99999` is not a port number (0 to 65535) at byte 17\")\nFailed(\"http: the URL must start with http:// or https://\")\nFailed(\"http: the URL must start with http:// or https://\")\nFailed(\"http: the URL has no host\")\n";
   out "std-http"
     ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] }
     (example "http_demo.tsr")

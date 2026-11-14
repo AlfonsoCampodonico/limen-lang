@@ -4,6 +4,8 @@
 // (Net.connect_tls); the server speaks TLS when its listener came from
 // Listen.on_tls, with nothing else to change.
 
+use url
+
 pub struct Header {
     name: Str,
     value: Str,
@@ -325,29 +327,36 @@ fn head_text(first: Str, headers: List[Header], body: Str) -> Str {
 
 // ---------- client ----------
 
-struct Url {
+// Where a request for a URL goes: over TLS or not, the address to connect
+// to, the Host header, and the target the request line names.
+struct Target {
     tls: Bool,
+    addr: Str,
     host: Str,
-    port: Int,
+    // the path and the query, never the fragment, which stays with the client
     path: Str,
 }
 
-fn parse_url(url: Str) -> Result[Url, IoError] {
-    let tls = url.starts_with("https://")
-    if !tls && !url.starts_with("http://") {
+fn target(text: Str) -> Result[Target, IoError] {
+    let u = match url.parse(text) {
+        Ok(u) => u,
+        Err(e) => {
+            return Err(bad(e))
+        },
+    }
+    let tls = u.scheme == "https"
+    if !tls && u.scheme != "http" {
         return Err(bad("the URL must start with http:// or https://"))
     }
-    let rest = url.slice(if tls { 8 } else { 7 }, url.len())
-    let slash = rest.index_of("/") ?? rest.len()
-    let authority = rest.slice(0, slash)
-    let path = if slash < rest.len() { rest.slice(slash, rest.len()) } else { "/" }
-    match authority.index_of(":") {
-        Some(k) => match authority.slice(k + 1, authority.len()).parse_int() {
-            Some(p) => Ok(Url { tls, host: authority.slice(0, k), port: p, path }),
-            None => Err(bad("bad port in URL")),
-        },
-        None => Ok(Url { tls, host: authority, port: if tls { 443 } else { 80 }, path }),
+    if u.host == "" {
+        return Err(bad("the URL has no host"))
     }
+    // an IPv6 address keeps its brackets
+    let host = if u.host.contains(":") { "[" + u.host + "]" } else { u.host }
+    let port = u.port ?? if tls { 443 } else { 80 }
+    let path = if u.path == "" { "/" } else { u.path }
+    let query = if u.query == "" { "" } else { "?" + u.query }
+    Ok(Target { tls, addr: "{host}:{port}", host, path: path + query })
 }
 
 // A response's status line and headers, and the bytes read after them.
@@ -384,9 +393,8 @@ fn read_body[T](c: Conn, method: Str, resp: Response, rest: Str, init: T, f: fn(
 
 // Connect for `url` and send the request; the connection, ready for the response.
 fn send_request(net: Net, method: Str, url: Str, headers: List[Header], body: Str) -> Result[Conn, IoError] {
-    let u = parse_url(url)?
-    let addr = "{u.host}:{u.port}"
-    let c = if u.tls { net.connect_tls(addr)? } else { net.connect(addr)? }
+    let u = target(url)?
+    let c = if u.tls { net.connect_tls(u.addr)? } else { net.connect(u.addr)? }
     let mut all = [Header { name: "Host", value: u.host }, Header { name: "Connection", value: "close" }]
     for h in headers {
         all.push(h)

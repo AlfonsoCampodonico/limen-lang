@@ -1,0 +1,5 @@
+// The program's own url: http still reads its URLs with the standard
+// library's.
+pub fn parse(s: Str) -> Str {
+    "mine: {s}"
+}

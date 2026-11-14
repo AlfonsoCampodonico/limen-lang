@@ -1,0 +1,12 @@
+// http uses the standard library's url (named `std/url` here, since the
+// program has a url of its own), and that uses the standard library's hex.
+use http
+use url
+
+fn main(root: Root) {
+    root.stdout.print(url.parse("x"))
+    match http.get(root.net, "http://127.0.0.1:1/?q#f") {
+        Ok(r) => root.stdout.print("{r.status}"),
+        Err(e) => root.stdout.print("{e}"),
+    }
+}
