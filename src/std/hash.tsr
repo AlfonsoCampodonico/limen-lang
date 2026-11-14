@@ -4,16 +4,16 @@
 // since both are broken for security. Digests are Bytes; the `_hex`
 // functions give them as lowercase hex, as checksum tools print them.
 //
+// Each hash can also be computed a piece at a time, for data that arrives
+// in chunks or is too big to hold at once: start a Hasher, feed it with
+// `update`, and `finish` it. Any split of the data gives the same digest.
+//
 // A 32-bit word is an Int from 0 to 2^32 - 1, kept there with `& mask()`.
 use hex
 
 // The SHA-256 digest of `data`: 32 bytes.
 pub fn sha256(data: Bytes) -> Bytes {
-    let n = data.len()
-    let full = n / 64
-    let state = sha256_blocks([1779033703, 3144134277, 1013904242, 2773480762, 1359893119, 2600822924, 528734635, 1541459225], data, full)
-    let last = sha256_blocks(state, padding(data, full * 64, true), if n % 64 < 56 { 1 } else { 2 })
-    words_big(last)
+    sha256_new().update(data).finish()
 }
 
 // `sha256(data)` as 64 hex digits:
@@ -26,22 +26,18 @@ pub fn sha256_hex(data: Bytes) -> Str {
 // length works; one longer than 64 bytes is hashed first, as the RFC says.
 // Compare a MAC you are given with `equal`, not `==`.
 pub fn hmac_sha256(key: Bytes, data: Bytes) -> Bytes {
-    hmac(Sha256, key, data)
+    hmac_sha256_new(key).update(data).finish()
 }
 
 // `hmac_sha256(key, data)` as 64 hex digits.
 pub fn hmac_sha256_hex(key: Bytes, data: Bytes) -> Str {
-    hex.encode(hmac(Sha256, key, data))
+    hex.encode(hmac_sha256(key, data))
 }
 
 // The SHA-1 digest of `data`: 20 bytes. Broken for security (collisions
 // can be made); for formats that name it.
 pub fn sha1(data: Bytes) -> Bytes {
-    let n = data.len()
-    let full = n / 64
-    let state = sha1_blocks([1732584193, 4023233417, 2562383102, 271733878, 3285377520], data, full)
-    let last = sha1_blocks(state, padding(data, full * 64, true), if n % 64 < 56 { 1 } else { 2 })
-    words_big(last)
+    sha1_new().update(data).finish()
 }
 
 // `sha1(data)` as 40 hex digits.
@@ -52,23 +48,13 @@ pub fn sha1_hex(data: Bytes) -> Str {
 // The HMAC-SHA-1 of `data` under `key`: 20 bytes, for protocols that
 // name it (TOTP, older webhooks).
 pub fn hmac_sha1(key: Bytes, data: Bytes) -> Bytes {
-    hmac(Sha1, key, data)
+    hmac_sha1_new(key).update(data).finish()
 }
 
 // The MD5 digest of `data` (RFC 1321): 16 bytes. Broken for security; for
 // checksums and formats that name it.
 pub fn md5(data: Bytes) -> Bytes {
-    let n = data.len()
-    let full = n / 64
-    let state = md5_blocks([1732584193, 4023233417, 2562383102, 271733878], data, full)
-    let last = md5_blocks(state, padding(data, full * 64, false), if n % 64 < 56 { 1 } else { 2 })
-    let mut out: List[Int] = []
-    for w in last {
-        for i in 0..<4 {
-            out.push(w >> (8 * i) & 255)
-        }
-    }
-    bytes(out)
+    md5_new().update(data).finish()
 }
 
 // `md5(data)` as 32 hex digits.
@@ -95,22 +81,127 @@ pub fn hex(data: Bytes) -> Str {
     hex.encode(data)
 }
 
-// ---------- HMAC ----------
+// ---------- hashing a piece at a time ----------
 
-enum Algo {
-    Sha1,
+// The hash functions a Hasher computes.
+pub enum Algo {
     Sha256,
+    Sha1,
+    Md5,
 }
 
-fn digest(algo: Algo, data: Bytes) -> Bytes {
-    match algo {
-        Sha1 => sha1(data),
-        Sha256 => sha256(data),
+// A hash in progress: the data fed to it so far, as a state of 32-bit
+// words and the last block's bytes. It is a plain value, so `update`
+// returns the next one and the old one still stands for the data before:
+// feed a common prefix once and finish copies with different endings.
+//
+//     let mut h = hash.sha256_new()
+//     for chunk in chunks {
+//         h = h.update(chunk)
+//     }
+//     let digest = h.finish()
+pub struct Hasher {
+    algo: Algo,
+    // the words after every full 64-byte block so far
+    state: List[Int],
+    // the bytes after them: fewer than 64
+    pending: Bytes,
+    // how many bytes have been fed
+    length: Int,
+    // for an HMAC, the key's outer block, hashed before the inner digest
+    // when the hasher finishes; empty for a plain hash
+    outer: Bytes,
+}
+
+// A Hasher for SHA-256.
+pub fn sha256_new() -> Hasher {
+    new(Sha256)
+}
+
+// A Hasher for SHA-1.
+pub fn sha1_new() -> Hasher {
+    new(Sha1)
+}
+
+// A Hasher for MD5.
+pub fn md5_new() -> Hasher {
+    new(Md5)
+}
+
+// A Hasher for the HMAC-SHA-256 of what it is fed, under `key`: its
+// `finish` gives what `hmac_sha256(key, data)` gives.
+pub fn hmac_sha256_new(key: Bytes) -> Hasher {
+    hmac_new(Sha256, key)
+}
+
+// A Hasher for the HMAC-SHA-1 of what it is fed, under `key`.
+pub fn hmac_sha1_new(key: Bytes) -> Hasher {
+    hmac_new(Sha1, key)
+}
+
+// A Hasher for `algo`, fed nothing yet.
+pub fn new(algo: Algo) -> Hasher {
+    let state = match algo {
+        Sha256 => [1779033703, 3144134277, 1013904242, 2773480762, 1359893119, 2600822924, 528734635, 1541459225],
+        Sha1 => [1732584193, 4023233417, 2562383102, 271733878, 3285377520],
+        Md5 => [1732584193, 4023233417, 2562383102, 271733878],
+    }
+    Hasher { algo, state, pending: bytes([]), length: 0, outer: bytes([]) }
+}
+
+// The hasher fed `data` after what it was fed before. Whole 64-byte
+// blocks are hashed straight from `data`; only the bytes of an unfinished
+// block are kept.
+pub fn update(self: Hasher, data: Bytes) -> Hasher {
+    let mut h = self
+    let n = data.len()
+    let mut at = 0
+    if h.pending.len() > 0 {
+        let need = 64 - h.pending.len()
+        if n < need {
+            h.pending = h.pending + data
+            h.length = h.length + n
+            return h
+        }
+        h.state = blocks(h.algo, h.state, h.pending + data.slice(0, need), 0, 1)
+        at = need
+    }
+    let full = (n - at) / 64
+    h.state = blocks(h.algo, h.state, data, at, full)
+    h.pending = data.slice(at + full * 64, n)
+    h.length = h.length + n
+    h
+}
+
+// The digest of everything the hasher was fed: 32 bytes for SHA-256, 20
+// for SHA-1, 16 for MD5, the MAC for an HMAC hasher.
+pub fn finish(self: Hasher) -> Bytes {
+    let big = match self.algo {
+        Md5 => false,
+        _ => true,
+    }
+    let tail = padding(self.pending, self.length, big)
+    let words = blocks(self.algo, self.state, tail, 0, tail.len() / 64)
+    let digest = if big { words_big(words) } else { words_little(words) }
+    if self.outer.is_empty() {
+        digest
+    } else {
+        new(self.algo).update(self.outer).update(digest).finish()
     }
 }
 
-fn hmac(algo: Algo, key: Bytes, data: Bytes) -> Bytes {
-    let k = if key.len() > 64 { digest(algo, key) } else { key }
+// `finish()` as lowercase hex digits.
+pub fn finish_hex(self: Hasher) -> Str {
+    hex.encode(self.finish())
+}
+
+// ---------- HMAC ----------
+
+// The key padded to a block (hashed first when longer), XORed with the
+// inner pad starts the inner hash; with the outer pad it is kept for
+// `finish`.
+fn hmac_new(algo: Algo, key: Bytes) -> Hasher {
+    let k = if key.len() > 64 { new(algo).update(key).finish() } else { key }
     let mut inner: List[Int] = []
     let mut outer: List[Int] = []
     for i in 0..<64 {
@@ -118,7 +209,21 @@ fn hmac(algo: Algo, key: Bytes, data: Bytes) -> Bytes {
         inner.push(b ^ 54)
         outer.push(b ^ 92)
     }
-    digest(algo, bytes(outer) + digest(algo, bytes(inner) + data))
+    let mut h = new(algo).update(bytes(inner))
+    h.outer = bytes(outer)
+    h
+}
+
+// The state after `count` 64-byte blocks of `data` starting at byte `at`.
+fn blocks(algo: Algo, state: List[Int], data: Bytes, at: Int, count: Int) -> List[Int] {
+    if count == 0 {
+        return state
+    }
+    match algo {
+        Sha256 => sha256_blocks(state, data, at, count),
+        Sha1 => sha1_blocks(state, data, at, count),
+        Md5 => md5_blocks(state, data, at, count),
+    }
 }
 
 // ---------- the compression functions ----------
@@ -135,21 +240,30 @@ fn rotl(x: Int, n: Int) -> Int {
     (x << n | x >> (32 - n)) & mask()
 }
 
-// The last one or two blocks: the bytes of `data` from `from`, a 1 bit,
-// zeros, and the length in bits as 8 bytes, big-endian for the SHAs and
-// little-endian for MD5.
-fn padding(data: Bytes, from: Int, big: Bool) -> Bytes {
-    let mut out: List[Int] = []
-    for i in from..<data.len() {
-        out.push(data[i])
-    }
+// The last one or two blocks: `rest`, the bytes after the last full
+// block, then a 1 bit, zeros, and the length of all the data (`total`
+// bytes) in bits as 8 bytes, big-endian for the SHAs and little-endian
+// for MD5.
+fn padding(rest: Bytes, total: Int, big: Bool) -> Bytes {
+    let mut out = rest.to_list()
     out.push(128)
     while out.len() % 64 != 56 {
         out.push(0)
     }
-    let bits = data.len() * 8
+    let bits = total * 8
     for i in 0..<8 {
         out.push(bits >> (8 * (if big { 7 - i } else { i })) & 255)
+    }
+    bytes(out)
+}
+
+// Words as bytes, low byte first.
+fn words_little(ws: List[Int]) -> Bytes {
+    let mut out: List[Int] = []
+    for w in ws {
+        for i in 0..<4 {
+            out.push(w >> (8 * i) & 255)
+        }
     }
     bytes(out)
 }
@@ -237,8 +351,7 @@ fn sha256_k() -> List[Int] {
     ]
 }
 
-// The state after the first `blocks` 64-byte blocks of `data`.
-fn sha256_blocks(state: List[Int], data: Bytes, blocks: Int) -> List[Int] {
+fn sha256_blocks(state: List[Int], data: Bytes, from: Int, count: Int) -> List[Int] {
     let k = sha256_k()
     let m = mask()
     let mut h0 = state[0]
@@ -253,8 +366,8 @@ fn sha256_blocks(state: List[Int], data: Bytes, blocks: Int) -> List[Int] {
     for _ in 0..<64 {
         w.push(0)
     }
-    for blk in 0..<blocks {
-        let at = blk * 64
+    for blk in 0..<count {
+        let at = from + blk * 64
         for t in 0..<16 {
             let i = at + t * 4
             w[t] = data[i] << 24 | data[i + 1] << 16 | data[i + 2] << 8 | data[i + 3]
@@ -301,7 +414,7 @@ fn sha256_blocks(state: List[Int], data: Bytes, blocks: Int) -> List[Int] {
     [h0, h1, h2, h3, h4, h5, h6, h7]
 }
 
-fn sha1_blocks(state: List[Int], data: Bytes, blocks: Int) -> List[Int] {
+fn sha1_blocks(state: List[Int], data: Bytes, from: Int, count: Int) -> List[Int] {
     let m = mask()
     let mut h0 = state[0]
     let mut h1 = state[1]
@@ -312,8 +425,8 @@ fn sha1_blocks(state: List[Int], data: Bytes, blocks: Int) -> List[Int] {
     for _ in 0..<80 {
         w.push(0)
     }
-    for blk in 0..<blocks {
-        let at = blk * 64
+    for blk in 0..<count {
+        let at = from + blk * 64
         for t in 0..<16 {
             let i = at + t * 4
             w[t] = data[i] << 24 | data[i + 1] << 16 | data[i + 2] << 8 | data[i + 3]
@@ -492,7 +605,7 @@ fn md5_shifts() -> List[Int] {
     ]
 }
 
-fn md5_blocks(state: List[Int], data: Bytes, blocks: Int) -> List[Int] {
+fn md5_blocks(state: List[Int], data: Bytes, from: Int, count: Int) -> List[Int] {
     let k = md5_k()
     let shift = md5_shifts()
     let m = mask()
@@ -504,8 +617,8 @@ fn md5_blocks(state: List[Int], data: Bytes, blocks: Int) -> List[Int] {
     for _ in 0..<16 {
         x.push(0)
     }
-    for blk in 0..<blocks {
-        let at = blk * 64
+    for blk in 0..<count {
+        let at = from + blk * 64
         for j in 0..<16 {
             let i = at + j * 4
             x[j] = data[i] | data[i + 1] << 8 | data[i + 2] << 16 | data[i + 3] << 24

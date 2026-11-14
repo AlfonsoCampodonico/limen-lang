@@ -1942,6 +1942,9 @@ Cryptographic hashes of `Bytes`: SHA-256 (FIPS 180-4) and HMAC-SHA-256 (RFC 2104
 | `hmac_sha256(key, data) -> Bytes`, `hmac_sha256_hex(key, data)` | the MAC of `data` under `key`, any length of key (one over 64 bytes is hashed first, as the RFC says) |
 | `sha1(data)`, `sha1_hex(data)`, `hmac_sha1(key, data)` | SHA-1: 20 bytes |
 | `md5(data)`, `md5_hex(data)` | MD5 (RFC 1321): 16 bytes |
+| `sha256_new()`, `sha1_new()`, `md5_new()`, `hmac_sha256_new(key)`, `hmac_sha1_new(key)`, `new(algo) -> Hasher` | a hash computed a piece at a time, fed nothing yet; `algo` is `hash.Sha256`, `hash.Sha1` or `hash.Md5` |
+| `h.update(data) -> Hasher` | the hasher fed `data` after what it was fed before: any split of the data gives the same digest. Whole 64-byte blocks are hashed at once, and only an unfinished block's bytes are kept |
+| `h.finish() -> Bytes`, `h.finish_hex() -> Str` | the digest (or MAC) of everything fed, as the one-shot function gives it |
 | `equal(a, b) -> Bool` | whether two byte strings are equal, in a time that does not depend on where they differ; compare a MAC or token you were given with it, not `==`, so the time taken does not tell an attacker how much of a guess was right |
 | `hex(data) -> Str` | bytes as lowercase hex |
 
@@ -1954,6 +1957,18 @@ fn sign(secret: Str, body: Str) -> Str {
 
 fn verify(secret: Str, body: Str, mac: Bytes) -> Bool {
     hash.equal(hash.hmac_sha256(secret.to_bytes(), body.to_bytes()), mac)
+}
+```
+
+A `Hasher` is a plain value, like any other: `update` returns the next one and leaves the old one as it was, so data that arrives in chunks is hashed with `h = h.update(chunk)` (which updates in place, as the old value is not used again), and a common prefix can be fed once and finished with different endings. The one-shot functions are a hasher fed once.
+
+```
+fn checksum(chunks: List[Bytes]) -> Str {
+    let mut h = hash.sha256_new()
+    for c in chunks {
+        h = h.update(c)
+    }
+    h.finish_hex()
 }
 ```
 
@@ -2112,7 +2127,7 @@ fn main(root: Root) {
 The core language is close to complete; what is missing is mostly around it.
 
 - Platforms: no Windows (fibers, the poller and the sandbox are macOS and Linux only); x86-64 has not run on real hardware; no cross-compilation or WebAssembly target.
-- Standard library: no compression, no encryption or public-key signatures (hashing and HMAC only), no incremental hashing of a stream, and Unicode support stops at `chars()`.
+- Standard library: no compression, no encryption or public-key signatures (hashing and HMAC only), and Unicode support stops at `chars()`.
 - Tooling: no debugger mapping (native code is C without `#line`), profiler or test coverage; cold builds spend about 3 s in the C compiler for a 600-line program; no incremental checking.
 - Distribution: no prebuilt releases or Homebrew formula; the package index has no hosted default; no stability promise yet.
 - Language: no default parameter values, no integer types besides `Int` outside FFI, no code generation for repetitive cases such as JSON for a struct, and C callbacks cannot be kept for later.

@@ -3326,6 +3326,67 @@ fn main(root: Root) {
 }
 |v}
     "c15c0289-ec2d-4a91-a7ec-8e65a18debbe 4 36 false true\n017f22e2-79b0-7cc3-98c4-dc0c0c07398f 7 Some(1645557742000) None\n7 7 true\nffffffff-ffff-4fff-bfff-ffffffffffff\nOk(\"f81d4fae-7dec-11d0-a765-00a0c91e6bf6\")\nOk(\"f81d4fae-7dec-11d0-a765-00a0c91e6bf6\")\nOk(\"f81d4fae-7dec-11d0-a765-00a0c91e6bf6\")\nOk(\"f81d4fae-7dec-11d0-a765-00a0c91e6bf6\")\nErr(\"uuid: expected `-` at byte 23\")\nErr(\"uuid: not a hex digit at byte 35\")\nErr(\"uuid: `nope` is not a UUID: 32 hex digits, usually as 8-4-4-4-12\")\nErr(\"uuid: not a hex digit at byte 44\")\n00000000-0000-0000-0000-000000000000 0 Err(\"uuid: 2 bytes, not 16\") Ok(0)\nSome(1) true\n";
+  (* streaming hashes: every split of the data, across block boundaries,
+     gives the one-shot digest; a Hasher is a value, so a prefix can be
+     shared *)
+  out "std-hash-streaming"
+    {v|use hash
+
+fn rep(b: Int, n: Int) -> Bytes {
+    bytes((0..<n).map(|_| b))
+}
+
+fn fed(h: hash.Hasher, data: Bytes, sizes: List[Int]) -> hash.Hasher {
+    let mut out = h
+    let mut at = 0
+    let mut i = 0
+    while at < data.len() {
+        let n = sizes[i % sizes.len()]
+        out = out.update(data.slice(at, at + n))
+        at = at + n
+        i = i + 1
+    }
+    out
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let data = bytes((0..<700).map(|i| (i * 7 + i / 13) % 256))
+    let key = rep(170, 131)
+    let splits = [[1], [3, 61], [63], [64], [65], [7, 128, 0, 200], [700]]
+    let mut same = 0
+    let mut differ = 0
+    for n in [0, 1, 55, 56, 63, 64, 65, 119, 120, 127, 128, 129, 500, 700] {
+        let d = data.slice(0, n)
+        for sz in splits {
+            let got = [
+                fed(hash.sha256_new(), d, sz).finish() == hash.sha256(d),
+                fed(hash.sha1_new(), d, sz).finish() == hash.sha1(d),
+                fed(hash.md5_new(), d, sz).finish() == hash.md5(d),
+                fed(hash.hmac_sha256_new(key), d, sz).finish() == hash.hmac_sha256(key, d),
+                fed(hash.hmac_sha1_new(key), d, sz).finish() == hash.hmac_sha1(key, d),
+                fed(hash.new(hash.Sha256), d, sz).finish_hex() == hash.sha256_hex(d),
+            ]
+            same = same + got.count(|x| x)
+            differ = differ + got.count(|x| !x)
+        }
+    }
+    out.print("{same} {differ}")
+    out.print(hash.sha256_new().update("ab".to_bytes()).update("c".to_bytes()).finish_hex())
+    out.print(hash.sha1_new().update("a".to_bytes()).update(bytes([])).update("bc".to_bytes()).finish_hex())
+    out.print(hash.md5_new().update("message ".to_bytes()).update("digest".to_bytes()).finish_hex())
+    out.print(hash.hmac_sha256_new("Jefe".to_bytes()).update("what do ya want ".to_bytes()).update("for nothing?".to_bytes()).finish_hex())
+    let base = hash.sha256_new().update("ab".to_bytes())
+    let h = base.update("c".to_bytes())
+    out.print("{h.length} {h.finish_hex() == hash.sha256_hex("abc".to_bytes())} {base.finish_hex() == hash.sha256_hex("ab".to_bytes())}")
+    let mut m = hash.sha256_new()
+    for _ in 0..<1000 {
+        m = m.update(rep(97, 1000))
+    }
+    out.print(m.finish_hex())
+}
+|v}
+    "588 0\nba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\na9993e364706816aba3e25717850c26c9cd0d89d\nf96b697d7cb7938d525a2f31aaf161d0\n5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843\n3 true true\ncdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0\n";
   out "std-http-keepalive-stream" ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] }
     {v|use http
 
