@@ -1,6 +1,6 @@
 (* tessera mcp: a Model Context Protocol server on stdin/stdout (one JSON-RPC
    message per line). Gives a coding agent the compiler's tools and the
-   spec. Programs run with no grants: only Stdout, Clock and Rand are useful (stdin is empty), so code an
+   spec. Programs run with no grants: only Stdout, Stderr, Clock and Rand are useful (stdin is empty), so code an
    agent just wrote cannot touch files or the network. *)
 module J = Json
 

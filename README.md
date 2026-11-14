@@ -78,7 +78,7 @@ To write your own: `tessera check` gives errors with fixes, `tessera explain E03
 
 | Command | What it does |
 | --- | --- |
-| `tessera run FILE [--native] [--grant net=HOST[:PORT]\|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST[:PORT]]... [--grant env=NAME\|*]... [--grant exec=PROGRAM\|*]... [--grant foreign=LIB\|*]... [--seed N] [--no-sandbox] [-- ARGS...]` | Type-check, then run `main` in the interpreter, or compiled with `--native`. Stdout, Stdin, Clock and Rand are always granted; Net, Fs, Listen, Env, Exec and Foreign only when granted, by flags or by `[grants]` in tessera.toml. `--seed` makes `Rand` repeatable; arguments after `--` are `root.args()`. The exit status is 0, 1 after a panic or an `Err` from `main`, or the `Int` that `main` returns. |
+| `tessera run FILE [--native] [--grant net=HOST[:PORT]\|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST[:PORT]]... [--grant env=NAME\|*]... [--grant exec=PROGRAM\|*]... [--grant foreign=LIB\|*]... [--seed N] [--no-sandbox] [-- ARGS...]` | Type-check, then run `main` in the interpreter, or compiled with `--native`. Stdout, Stderr, Stdin, Clock and Rand are always granted; Net, Fs, Listen, Env, Exec and Foreign only when granted, by flags or by `[grants]` in tessera.toml. `--seed` makes `Rand` repeatable; arguments after `--` are `root.args()`. The exit status is 0, 1 after a panic or an `Err` from `main`, or the `Int` that `main` returns. |
 | `tessera build FILE [-o OUT] [--emit-c]` | Compile to a native binary through C. The binary takes the same `--grant` flags. `--emit-c` writes the C instead. Binaries are cached by the exact C, compiler flags and compiler (in `~/Library/Caches/tessera`, or `$XDG_CACHE_HOME/tessera` or `~/.cache/tessera`; the 200 most recently used), so rebuilding an unchanged program, or `tessera run --native` on one, takes milliseconds. `TESSERA_CACHE=DIR` puts the cache elsewhere, `TESSERA_CACHE=off` compiles every time. |
 | `tessera check FILE [--json]` | Type-check only, writing nothing (tessera.lock included). Errors and warnings close with their count (`2 errors, 1 warning`). `--json` emits diagnostics with codes, spans, notes and machine-applicable fixes. |
 | `tessera caps FILE [--json]` | List each function's authority: the capabilities in its signature, or `pure`; then the files it embeds. |
@@ -125,7 +125,7 @@ VS Code: [editors/vscode](editors/vscode) is a local extension with highlighting
 
 ## Capability rules
 
-- `Root` holds `net`, `fs`, `listen`, `env`, `exec`, `foreign`, `stdout`, `stdin`, `clock` and `rand`. Only the runtime creates capabilities.
+- `Root` holds `net`, `fs`, `listen`, `env`, `exec`, `foreign`, `stdout`, `stderr`, `stdin`, `clock` and `rand`. Only the runtime creates capabilities. `root.stderr.print(...)` writes to standard error at once, never held back by a group's output order.
 - Attenuation only narrows: `net.only(host)`, `fs.under(dir)`, `fs.read_only()`. Asking for more than you hold gives an empty capability.
 - Capabilities and function types cannot be stored in struct or enum fields (E0301, E0304), so authority always shows up in signatures. Generic instantiations like `Box[Net]` are allowed because the capability is visible in the type.
 - A function with no capability or function-typed parameters is pure.

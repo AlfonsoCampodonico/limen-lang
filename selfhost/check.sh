@@ -9,7 +9,8 @@
 # function, same IR, same positions, same errors. Then the compilers
 # themselves: selfhost/tessera.tsr and bin/main.ml give the same C for
 # `build --emit-c` (and for the test binary, against selfhost/cdump), with
-# the same output and exit status when there is no C; and programs built
+# the same output, the same diagnostics on stderr and the same exit status
+# when there is no C; and programs built
 # by the Tessera compiler run as those the OCaml compiler builds.
 #   sh selfhost/check.sh
 # They are compared on every .tsr file in the repository, on the edge cases
@@ -113,12 +114,12 @@ tsc() {
     -- "$@"
 }
 
-# compare_c DIR FILE: `build --emit-c` with both compilers: the output and
-# exit status, then the C
+# compare_c DIR FILE: `build --emit-c` with both compilers: the output, the
+# diagnostics on stderr and the exit status, then the C
 compare_c() {
   rm -f "$out/cw.c" "$out/cg.c"
-  (cd "$1" && "$tessera_abs" build "$2" --emit-c -o "$out/cw") > "$out/want" 2>&1 && echo "exit 0" >> "$out/want" || echo "exit $?" >> "$out/want"
-  (cd "$1" && tsc build "$2" --emit-c -o "$out/cg") > "$out/got" 2>&1 && echo "exit 0" >> "$out/got" || echo "exit $?" >> "$out/got"
+  (cd "$1" && "$tessera_abs" build "$2" --emit-c -o "$out/cw") > "$out/want" 2> "$out/want.err" && echo "exit 0" >> "$out/want" || echo "exit $?" >> "$out/want"
+  (cd "$1" && tsc build "$2" --emit-c -o "$out/cg") > "$out/got" 2> "$out/got.err" && echo "exit 0" >> "$out/got" || echo "exit $?" >> "$out/got"
   if [ -f "$out/cw.c" ]; then cat "$out/cw.c" >> "$out/want"; fi
   if [ -f "$out/cg.c" ]; then cat "$out/cg.c" >> "$out/got"; fi
   same "$1/$2"
@@ -128,8 +129,8 @@ compare_c() {
 # from `build --emit-c --tests`
 compare_test_c() {
   rm -f "$out/cw.c" "$out/cg.c"
-  (cd "$1" && "$cdump" "$2" "$out/cw") > "$out/want" 2>&1 && echo "exit 0" >> "$out/want" || echo "exit $?" >> "$out/want"
-  (cd "$1" && tsc build "$2" --emit-c --tests -o "$out/cg") > "$out/got" 2>&1 && echo "exit 0" >> "$out/got" || echo "exit $?" >> "$out/got"
+  (cd "$1" && "$cdump" "$2" "$out/cw") > "$out/want" 2> "$out/want.err" && echo "exit 0" >> "$out/want" || echo "exit $?" >> "$out/want"
+  (cd "$1" && tsc build "$2" --emit-c --tests -o "$out/cg") > "$out/got" 2> "$out/got.err" && echo "exit 0" >> "$out/got" || echo "exit $?" >> "$out/got"
   if [ -f "$out/cw.c" ]; then cat "$out/cw.c" >> "$out/want"; fi
   if [ -f "$out/cg.c" ]; then cat "$out/cg.c" >> "$out/got"; fi
   same "$1/$2"
@@ -143,8 +144,8 @@ compare_run() {
   dir=$1 file=$2
   shift 2
   rm -rf "$out/rw" "$out/rg" "$out/work"
-  (cd "$dir" && "$tessera_abs" build "$file" -o "$out/rw") > "$out/want" 2>&1
-  (cd "$dir" && export TESSERA_CACHE="$out/cache" && tsc build "$file" -o "$out/rg") > "$out/got" 2>&1
+  (cd "$dir" && "$tessera_abs" build "$file" -o "$out/rw") > "$out/want" 2> "$out/want.err"
+  (cd "$dir" && export TESSERA_CACHE="$out/cache" && tsc build "$file" -o "$out/rg") > "$out/got" 2> "$out/got.err"
   for bin in rw rg; do
     mkdir -p "$out/work"
     if [ "$bin" = rw ]; then into=want; else into=got; fi
@@ -160,8 +161,8 @@ compare_run() {
 # same output, same exit status
 compare_tests() {
   rm -f "$out/tw" "$out/tg"
-  (cd "$1" && "$cdump" "$2" "$out/tw" && ${CC:-cc} -O3 -fwrapv -ffp-contract=off -fstack-clash-protection -fexceptions -w -o "$out/tw" "$out/tw.c" -lm) > "$out/want" 2>&1
-  (cd "$1" && export TESSERA_CACHE="$out/cache" && tsc build "$2" --tests -o "$out/tg") > "$out/got" 2>&1
+  (cd "$1" && "$cdump" "$2" "$out/tw" && ${CC:-cc} -O3 -fwrapv -ffp-contract=off -fstack-clash-protection -fexceptions -w -o "$out/tw" "$out/tw.c" -lm) > "$out/want" 2> "$out/want.err"
+  (cd "$1" && export TESSERA_CACHE="$out/cache" && tsc build "$2" --tests -o "$out/tg") > "$out/got" 2> "$out/got.err"
   n=$(grep -c '^test ' "$1/$2")
   i=0
   while [ "$i" -lt "$n" ]; do
@@ -172,12 +173,19 @@ compare_tests() {
   same "$1/$2"
 }
 
+# same FILE: the outputs compared, and the compilers' stderr where a
+# comparison keeps it apart (both compilers write their diagnostics there);
+# then it is cleared for the next comparison
 same() {
-  if cmp -s "$out/want" "$out/got"; then
+  touch "$out/want.err" "$out/got.err"
+  if cmp -s "$out/want" "$out/got" && cmp -s "$out/want.err" "$out/got.err"; then
+    rm -f "$out/want.err" "$out/got.err"
     return 0
   fi
   echo "differs: $1"
   diff "$out/want" "$out/got" | head -6
+  diff "$out/want.err" "$out/got.err" | head -6
+  rm -f "$out/want.err" "$out/got.err"
   return 1
 }
 

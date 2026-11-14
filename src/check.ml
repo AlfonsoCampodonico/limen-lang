@@ -142,12 +142,12 @@ let unify_at ctx span want got =
   try unify want got
   with Mismatch -> err ctx "E0201" span (sprintf "expected `%s`, found `%s`" (show want) (show got))
 
-let builtin_types = [ "Int"; "Float"; "Bool"; "Str"; "Bytes"; "List"; "Array"; "Chan"; "Root"; "Net"; "Fs"; "Stdout"; "Clock"; "Listen"; "Listener"; "Conn"; "Rand"; "Stdin"; "Env"; "Exec"; "Foreign"; "Map" ]
+let builtin_types = [ "Int"; "Float"; "Bool"; "Str"; "Bytes"; "List"; "Array"; "Chan"; "Root"; "Net"; "Fs"; "Stdout"; "Stderr"; "Clock"; "Listen"; "Listener"; "Conn"; "Rand"; "Stdin"; "Env"; "Exec"; "Foreign"; "Map" ]
 
 (* Names other languages use for ambient I/O, mapped to the capability way. *)
 let ambient =
   [ ("print", "Stdout", "out.print(...)"); ("println", "Stdout", "out.print(...)");
-    ("eprint", "Stdout", "out.print(...)"); ("puts", "Stdout", "out.print(...)");
+    ("eprint", "Stderr", "stderr.print(...)"); ("puts", "Stdout", "out.print(...)");
     ("open", "Fs", "fs.read(path)"); ("read_file", "Fs", "fs.read(path)");
     ("write_file", "Fs", "fs.write(path, text)"); ("fetch", "Net", "net.get(url)");
     ("http_get", "Net", "net.get(url)"); ("now", "Clock", "clock.now_ms()");
@@ -216,6 +216,7 @@ let rec resolve ctx env (te : ty_expr) : ty =
     | "Net" -> simple (TCap Net)
     | "Fs" -> simple (TCap Fs)
     | "Stdout" -> simple (TCap Stdout)
+    | "Stderr" -> simple (TCap Stderr)
     | "Clock" -> simple (TCap Clock)
     | "Listen" -> simple (TCap Listen)
     | "Listener" -> simple (TCap Listener)
@@ -555,7 +556,7 @@ let unordered ctx t : ty option =
   in
   go t
 
-let root_fields = [ ("net", TCap Net); ("fs", TCap Fs); ("stdout", TCap Stdout); ("clock", TCap Clock); ("listen", TCap Listen);
+let root_fields = [ ("net", TCap Net); ("fs", TCap Fs); ("stdout", TCap Stdout); ("stderr", TCap Stderr); ("clock", TCap Clock); ("listen", TCap Listen);
     ("rand", TCap Rand); ("stdin", TCap Stdin); ("env", TCap Env); ("exec", TCap Exec);
     ("foreign", TCap Foreign) ]
 

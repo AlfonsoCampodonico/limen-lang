@@ -58,7 +58,7 @@ fn grant_kinds() -> List[Str] {
 
 // what `caps` can grant a dependency
 fn cap_grants() -> List[Str] {
-    ["net", "fs", "listen", "stdout", "clock", "rand", "stdin", "env", "exec"]
+    ["net", "fs", "listen", "stdout", "stderr", "clock", "rand", "stdin", "env", "exec"]
 }
 
 // ---------- the TOML subset ----------

@@ -119,6 +119,7 @@ let rec resolve env (te : ty_expr) : ty =
     | "Net", _ -> TCap Net
     | "Fs", _ -> TCap Fs
     | "Stdout", _ -> TCap Stdout
+    | "Stderr", _ -> TCap Stderr
     | "Clock", _ -> TCap Clock
     | "Listen", _ -> TCap Listen
     | "Listener", _ -> TCap Listener

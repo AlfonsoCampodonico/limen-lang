@@ -43,7 +43,7 @@ type t = { pname : string; file : string; deps : dep list; grants : (string * st
 
 let grant_kinds = [ "net"; "fs"; "listen"; "env"; "exec"; "foreign" ]
 
-let cap_grants = [ "net"; "fs"; "listen"; "stdout"; "clock"; "rand"; "stdin"; "env"; "exec" ]
+let cap_grants = [ "net"; "fs"; "listen"; "stdout"; "stderr"; "clock"; "rand"; "stdin"; "env"; "exec" ]
 
 (* The grant that covers a capability type. *)
 let grant_of (c : Types.cap) =
@@ -53,6 +53,7 @@ let grant_of (c : Types.cap) =
   | Listen | Listener -> [ "listen" ]
   | Fs -> [ "fs" ]
   | Stdout -> [ "stdout" ]
+  | Stderr -> [ "stderr" ]
   | Clock -> [ "clock" ]
   | Rand -> [ "rand" ]
   | Stdin -> [ "stdin" ]

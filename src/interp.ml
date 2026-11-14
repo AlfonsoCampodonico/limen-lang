@@ -9,6 +9,7 @@ type cap =
   | CNet of string list
   | CFs of Caps.fs
   | CStdout
+  | CStderr
   | CClock
   | CListen of string list
   | CListener of sock * int
@@ -194,6 +195,7 @@ type rt = {
   enums : (string, enum_decl) Hashtbl.t;
   ctors : (string, string) Hashtbl.t; (* variant -> enum, when unambiguous *)
   out : string -> unit;
+  err : string -> unit; (* Stderr: written at once, past the order groups keep for [out] *)
   grants : grants;
   pure : (string, bool) Hashtbl.t; (* functions known pure, or not (see keep_pure) *)
 }
@@ -204,7 +206,7 @@ let fmt_float x =
   if Float.is_integer x && Float.abs x < 1e16 then sprintf "%.1f" x else sprintf "%.15g" x
 
 let cap_name = function
-  | CRoot -> "Root" | CNet _ -> "Net" | CFs _ -> "Fs" | CStdout -> "Stdout" | CClock -> "Clock"
+  | CRoot -> "Root" | CNet _ -> "Net" | CFs _ -> "Fs" | CStdout -> "Stdout" | CStderr -> "Stderr" | CClock -> "Clock"
   | CListen _ -> "Listen" | CListener _ -> "Listener" | CConn _ -> "Conn"
   | CRand -> "Rand" | CStdin -> "Stdin" | CEnv _ -> "Env" | CExec _ -> "Exec" | CForeign _ -> "Foreign"
 
@@ -2113,6 +2115,7 @@ and field rt v name =
     | Some (root, ro) -> VCap (CFs { Caps.root = Some root; ro })
     | None -> VCap (CFs { Caps.root = None; ro = true }))
   | VCap CRoot, "stdout" -> VCap CStdout
+  | VCap CRoot, "stderr" -> VCap CStderr
   | VCap CRoot, "clock" -> VCap CClock
   | VCap CRoot, "listen" -> VCap (CListen rt.grants.listen)
   | VCap CRoot, "rand" -> VCap CRand
@@ -2559,6 +2562,9 @@ and cap_call rt c name args sp =
   match (c, name, args) with
   | CStdout, "print", [ VStr s ] -> put rt.out !current.sink (s ^ "\n"); VUnit
   | CStdout, "write", [ VStr s ] -> put rt.out !current.sink s; VUnit
+  (* stderr is written at once, past the order groups keep for stdout *)
+  | CStderr, "print", [ VStr s ] -> rt.err (s ^ "\n"); VUnit
+  | CStderr, "write", [ VStr s ] -> rt.err s; VUnit
   | CClock, "now_ms", [] -> VInt (clock_now_ms ())
   | CClock, "sleep", [ VInt ms ] -> sleep_ms ms; VUnit
   | CRand, "float", [] -> VFloat (Int64.to_float (Int64.shift_right_logical (rand_next ()) 11) *. 0x1p-53)
@@ -2627,11 +2633,14 @@ let sandbox (g : grants) : (bool, string) result =
   | _ -> Ok false
   | exception Failure m -> Error m
 
-let run ?(before_main = fun () -> ()) ~out ~grants (user_items : item list) : (value, string * Span.t) result =
+(* Stderr, unless a caller captures it *)
+let to_stderr s = prerr_string s; flush stderr
+
+let run ?(before_main = fun () -> ()) ~out ?(err = to_stderr) ~grants (user_items : item list) : (value, string * Span.t) result =
   seed_rand grants.seed;
   let rt =
     { fns = Hashtbl.create 16; structs = Hashtbl.create 16; enums = Hashtbl.create 16;
-      ctors = Hashtbl.create 16; out; grants; pure = Hashtbl.create 16 }
+      ctors = Hashtbl.create 16; out; err; grants; pure = Hashtbl.create 16 }
   in
   let owners = Hashtbl.create 16 in
   List.iter
@@ -2680,10 +2689,10 @@ let run ?(before_main = fun () -> ()) ~out ~grants (user_items : item list) : (v
     | Panic (m, sp) | Fatal (m, sp) -> Queue.clear runq; release_all rt.out; Error (m, sp)
     | Stack_overflow -> Queue.clear runq; release_all rt.out; Error ("stack overflow", d.fn_span))
 
-let make_rt ~out ~grants (user_items : item list) =
+let make_rt ~out ?(err = to_stderr) ~grants (user_items : item list) =
   let rt =
     { fns = Hashtbl.create 16; structs = Hashtbl.create 16; enums = Hashtbl.create 16;
-      ctors = Hashtbl.create 16; out; grants; pure = Hashtbl.create 16 }
+      ctors = Hashtbl.create 16; out; err; grants; pure = Hashtbl.create 16 }
   in
   let owners = Hashtbl.create 16 in
   List.iter

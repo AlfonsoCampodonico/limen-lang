@@ -924,7 +924,7 @@ static void w_dyn_kids(void *o) { WDyn *d = (WDyn *)o; d->vt->h.drop(d); }
 
 /* ---------- capabilities ---------- */
 
-enum { CAP_ROOT, CAP_NET, CAP_FS, CAP_STDOUT, CAP_CLOCK, CAP_LISTEN, CAP_LISTENER, CAP_CONN, CAP_RAND, CAP_STDIN, CAP_ENV, CAP_EXEC, CAP_FOREIGN };
+enum { CAP_ROOT, CAP_NET, CAP_FS, CAP_STDOUT, CAP_CLOCK, CAP_LISTEN, CAP_LISTENER, CAP_CONN, CAP_RAND, CAP_STDIN, CAP_ENV, CAP_EXEC, CAP_FOREIGN, CAP_STDERR };
 typedef struct WCap WCap;
 struct WCap {
   int64_t rc; int kind;
@@ -945,7 +945,7 @@ static void Cap_drop(WCap *c) { if (w_rc_dec(&c->rc)) Cap_release(c); }
 static inline bool Cap_eq(WCap *a, WCap *b) { return a == b; }
 static void Cap_show(WBuf *b, WCap *c, bool top) {
   (void)top;
-  static const char *names[] = { "<Root>", "<Net>", "<Fs>", "<Stdout>", "<Clock>", "<Listen>", "<Listener>", "<Conn>", "<Rand>", "<Stdin>", "<Env>", "<Exec>", "<Foreign>" };
+  static const char *names[] = { "<Root>", "<Net>", "<Fs>", "<Stdout>", "<Clock>", "<Listen>", "<Listener>", "<Conn>", "<Rand>", "<Stdin>", "<Env>", "<Exec>", "<Foreign>", "<Stderr>" };
   buf_puts(b, names[c->kind]);
 }
 
@@ -1037,6 +1037,7 @@ static WCap *Cap_root_field(WCap *root, const char *f) {
     return c;
   }
   if (strcmp(f, "stdout") == 0) return cap_new(CAP_STDOUT);
+  if (strcmp(f, "stderr") == 0) return cap_new(CAP_STDERR);
   if (strcmp(f, "listen") == 0) {
     WCap *c = cap_new(CAP_LISTEN);
     c->hosts = (char **)w_raw(sizeof(char *) * (size_t)(g_nlisten + 1));
@@ -2196,6 +2197,17 @@ static void Cap_print(WStr *s, bool nl) {
   w_out_lock();
   w_out_put(o, s->data, (size_t)s->len);
   if (nl) w_out_put(o, "\n", 1);
+  w_out_unlock();
+}
+/* Stderr is written at once, past the order groups keep for stdout: it is
+   for messages about the run, which should show when they happen. What
+   stdout has buffered goes first, so where both reach the same place a
+   message follows the output printed before it. */
+static void Cap_eprint(WStr *s, bool nl) {
+  w_out_lock();
+  fflush(stdout);
+  fwrite(s->data, 1, (size_t)s->len, stderr);
+  if (nl) fputc('\n', stderr);
   w_out_unlock();
 }
 /* Reading stdin: a prompt this task printed must show, so every group that

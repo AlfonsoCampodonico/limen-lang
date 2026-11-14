@@ -292,7 +292,7 @@ pub fn resolve(env: List[(Str, types.Ty)], te: ast.TyExpr) -> types.Ty {
 }
 
 fn is_cap(n: Str) -> Bool {
-    ["Root", "Net", "Fs", "Stdout", "Clock", "Listen", "Listener", "Conn", "Rand", "Stdin", "Env", "Exec", "Foreign"].contains(n)
+    ["Root", "Net", "Fs", "Stdout", "Stderr", "Clock", "Listen", "Listener", "Conn", "Rand", "Stdin", "Env", "Exec", "Foreign"].contains(n)
 }
 
 // An array's size: a number, or a type parameter that stands for one.

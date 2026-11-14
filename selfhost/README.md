@@ -110,9 +110,11 @@ What each file does, in pipeline order:
   the test binary of `tessera test --native` (`cdump/` writes the OCaml
   compiler's C of it). It reads the standard library and the C runtime
   from `TESSERA_SRC` (the repository's `src/`), which the OCaml compiler
-  has built in: a program can embed only files of its own package. A
-  Tessera program cannot write to stderr, so what the OCaml compiler
-  writes there goes to stdout. Its grants, in full:
+  has built in: a program can embed only files of its own package. What
+  the OCaml compiler writes to stderr (the diagnostics and their count,
+  the usage) it writes to stderr too, and a build records the C libraries
+  of trusted dependencies in tessera.lock as the OCaml one does (`check`
+  and `caps` only read it). Its grants, in full:
 
 ```sh
 dune build && _build/default/bin/main.exe build selfhost/tessera.tsr -o tsc
@@ -158,8 +160,9 @@ TESSERA_SRC=$PWD/src ./tsc --grant fs=/ \
   own), and all of them on the book's examples when `../tessera-book`
   (or `$TESSERA_BOOK`) is there. Then the compilers: the C of `build
   --emit-c` (and of the test binary) on every program, the edge cases in
-  `tests/c/` and the book's examples, with the output and exit status
-  where there is no C; and a set of the book's programs (concurrency,
+  `tests/c/` and the book's examples, with the output, the diagnostics
+  on stderr (compared apart from the output) and the exit status where
+  there is no C; and a set of the book's programs (concurrency,
   HTTP, TLS, JSON, SQL, C calls, embedded files, tests, ...) built by
   both compilers and run:
 

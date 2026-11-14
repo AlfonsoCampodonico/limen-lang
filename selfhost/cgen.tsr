@@ -1441,6 +1441,8 @@ fn prim(self: Cg, ind: Str, dst: Str, t: types.Ty, name: Str, rt: types.Ty, a: L
         ("float_to_fixed", _) => c.set(ind, dst, "Float_to_fixed({arg(0)}, {arg(1)})"),
         ("cap_print", TCap("Stdout")) => c.line(ind, "Cap_print({arg(1)}, true);").set(ind, dst, "0"),
         ("cap_write", TCap("Stdout")) => c.line(ind, "Cap_print({arg(1)}, false);").set(ind, dst, "0"),
+        ("cap_print", TCap("Stderr")) => c.line(ind, "Cap_eprint({arg(1)}, true);").set(ind, dst, "0"),
+        ("cap_write", TCap("Stderr")) => c.line(ind, "Cap_eprint({arg(1)}, false);").set(ind, dst, "0"),
         ("cap_now_ms", _) => c.set(ind, dst, "Cap_now_ms()"),
         ("cap_sleep", TCap("Clock")) => c.line(ind, "Cap_sleep({arg(1)});").set(ind, dst, "0"),
         ("cap_int", TCap("Rand")) => c.set(ind, dst, "Cap_rand_int({arg(1)}, {arg(2)}, {c.where(sp)})"),

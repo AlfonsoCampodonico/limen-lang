@@ -15,9 +15,8 @@
 // directory is PWD, which must be inside the Fs. A build runs the C
 // compiler and a few small programs through the Exec (selfhost/native.tsr
 // lists them) and reads the variables native.tsr names through the Env.
-//
-// A Tessera program has no way to write to stderr, so what the OCaml
-// compiler writes there (diagnostics, the usage) goes to stdout here.
+// What the OCaml compiler writes to stderr (diagnostics, the usage) it
+// writes to stderr too.
 use ast
 use caps
 use cgen
@@ -52,14 +51,14 @@ usage:
   tessera add NAME[@VERSION] (add a package from the index to tessera.toml, with the caps it declares)
   tessera index entry [DIR]  (print the index entry for the package's current tag)
 
-Stdout, Stdin, Clock and Rand are always granted. Net, Fs, Listen, Env, Exec and Foreign exist only
+Stdout, Stderr, Stdin, Clock and Rand are always granted. Net, Fs, Listen, Env, Exec and Foreign exist only
 when granted, by --grant or by the [grants] table of tessera.toml. --seed makes Rand repeatable; arguments after -- are root.args(). The process runs in an operating-system sandbox
 limited to those grants (macOS; Linux untested); --no-sandbox turns it off, for debugging.
 "
 }
 
-fn die_usage(out: Stdout, msg: Str) -> Int {
-    out.write(if msg == "" { usage() } else { "tessera: " + msg + "\n\n" + usage() })
+fn die_usage(err: Stderr, msg: Str) -> Int {
+    err.write(if msg == "" { usage() } else { "tessera: " + msg + "\n\n" + usage() })
     2
 }
 
@@ -83,19 +82,20 @@ struct Front {
 
 fn main(root: Root) -> Int {
     let out = root.stdout
+    let err = root.stderr
     let args = root.args()
     let setup = match where_am_i(root.fs, root.env) {
         Ok(s) => s,
         Err(m) => {
-            out.print("tessera: " + m)
+            err.print("tessera: " + m)
             return 2
         },
     }
     match args {
-        ["check", file] => check(out, root.fs, setup, file),
-        ["caps", file] => caps_of(out, root.fs, setup, file),
+        ["check", file] => check(out, err, root.fs, setup, file),
+        ["caps", file] => caps_of(out, err, root.fs, setup, file),
         ["check", _, "--json"] | ["check", "--json", _] | ["caps", _, "--json"] | ["caps", "--json", _] => {
-            out.print("tessera: --json is not in this compiler yet")
+            err.print("tessera: --json is not in this compiler yet")
             2
         },
         ["build", ..rest] => {
@@ -118,20 +118,20 @@ fn main(root: Root) -> Int {
                 } else if file.is_none() {
                     file = Some(a)
                 } else {
-                    return die_usage(out, "bad build arguments")
+                    return die_usage(err, "bad build arguments")
                 }
                 i = i + 1
             }
             match file {
-                Some(f) => build(out, root.fs, root.exec, root.env, setup, f, target, emit_c, tests),
-                None => die_usage(out, "build needs a FILE"),
+                Some(f) => build(out, err, root.fs, root.exec, root.env, setup, f, target, emit_c, tests),
+                None => die_usage(err, "build needs a FILE"),
             }
         },
         [] | ["-h"] | ["--help"] | ["help"] => {
             out.write(usage())
             0
         },
-        _ => die_usage(out, ""),
+        _ => die_usage(err, ""),
     }
 }
 
@@ -187,41 +187,53 @@ fn front(fs: Fs, setup: Setup, file: Str) -> Result[Front, Str] {
 // Load `file`, saying what is wrong with it: the warnings, then (when
 // there are errors) the errors and their count, as bin/main.ml's `load`
 // and `report` print them. None when it cannot go on, with the exit code.
-fn load(out: Stdout, fs: Fs, setup: Setup, file: Str) -> Result[Front, Int] {
+fn load(err: Stderr, fs: Fs, setup: Setup, file: Str) -> Result[Front, Int] {
     if !fs.exists(setup.place.locate(file)) {
-        out.print("tessera: {file}: No such file or directory")
+        err.print("tessera: {file}: No such file or directory")
         return Err(2)
     }
     let f = match front(fs, setup, file) {
         Ok(f) => f,
         Err(m) => {
-            out.print("tessera: " + m)
+            err.print("tessera: " + m)
             return Err(2)
         },
     }
     for d in f.warnings {
-        out.write(d.render(f.files) + "\n")
+        err.write(d.render(f.files) + "\n")
+    }
+    // with warnings and no errors, their count closes them, as `report`
+    // closes errors
+    if f.errors.is_empty() && !f.warnings.is_empty() {
+        err.print(count(f.warnings.len(), "warning"))
     }
     Ok(f)
 }
 
-fn report(out: Stdout, f: Front) {
-    for d in f.errors {
-        out.write(d.render(f.files) + "\n")
-    }
-    let n = f.errors.len()
-    out.print("{n} error{if n == 1 { "" } else { "s" }}")
+// "1 error", "2 warnings"
+fn count(n: Int, what: Str) -> Str {
+    "{n} {what}{if n == 1 { "" } else { "s" }}"
 }
 
-fn check(out: Stdout, fs: Fs, setup: Setup, file: Str) -> Int {
-    let f = match load(out, fs, setup, file) {
+// The errors, then their count, with the warnings `load` printed: "2
+// errors, 1 warning".
+fn report(err: Stderr, f: Front) {
+    for d in f.errors {
+        err.write(d.render(f.files) + "\n")
+    }
+    let w = f.warnings.len()
+    err.print(count(f.errors.len(), "error") + if w > 0 { ", " + count(w, "warning") } else { "" })
+}
+
+fn check(out: Stdout, err: Stderr, fs: Fs, setup: Setup, file: Str) -> Int {
+    let f = match load(err, fs, setup, file) {
         Ok(f) => f,
         Err(code) => {
             return code
         },
     }
     if !f.errors.is_empty() {
-        report(out, f)
+        report(err, f)
         return 1
     }
     out.print("ok")
@@ -272,15 +284,15 @@ fn c_callers(items: List[ast.Item], packages: List[(Str, Str)]) -> List[Str] {
     })
 }
 
-fn caps_of(out: Stdout, fs: Fs, setup: Setup, file: Str) -> Int {
-    let f = match load(out, fs, setup, file) {
+fn caps_of(out: Stdout, err: Stderr, fs: Fs, setup: Setup, file: Str) -> Int {
+    let f = match load(err, fs, setup, file) {
         Ok(f) => f,
         Err(code) => {
             return code
         },
     }
     if !f.errors.is_empty() {
-        report(out, f)
+        report(err, f)
         return 1
     }
     let infos = match f.checked {
@@ -319,15 +331,15 @@ fn default_output(file: Str) -> Str {
     }
 }
 
-fn build(out: Stdout, fs: Fs, exec: Exec, env: Env, setup: Setup, file: Str, target: Option[Str], emit_c: Bool, tests: Bool) -> Int {
-    let f = match load(out, fs, setup, file) {
+fn build(out: Stdout, err: Stderr, fs: Fs, exec: Exec, env: Env, setup: Setup, file: Str, target: Option[Str], emit_c: Bool, tests: Bool) -> Int {
+    let f = match load(err, fs, setup, file) {
         Ok(f) => f,
         Err(code) => {
             return code
         },
     }
     if !f.errors.is_empty() {
-        report(out, f)
+        report(err, f)
         return 1
     }
     // a build records the C libraries of trusted dependencies in
@@ -345,7 +357,7 @@ fn build(out: Stdout, fs: Fs, exec: Exec, env: Env, setup: Setup, file: Str, tar
         return 0
     }
     if !tests && !has(|d| d.name == "main") {
-        out.print("error: no `main` function")
+        err.print("error: no `main` function")
         return 1
     }
     let c = match f.checked {
@@ -360,7 +372,7 @@ fn build(out: Stdout, fs: Fs, exec: Exec, env: Env, setup: Setup, file: Str, tar
     let runtime = match headers {
         Ok(text) => text,
         Err(m) => {
-            out.print("tessera: " + m)
+            err.print("tessera: " + m)
             return 2
         },
     }
@@ -369,7 +381,7 @@ fn build(out: Stdout, fs: Fs, exec: Exec, env: Env, setup: Setup, file: Str, tar
         return match fs.write(setup.place.locate(exe + ".c"), c_text) {
             Ok(_) => 0,
             Err(e) => {
-                out.print("tessera: cannot write {exe}.c: {e}")
+                err.print("tessera: cannot write {exe}.c: {e}")
                 2
             },
         }
@@ -382,8 +394,8 @@ fn build(out: Stdout, fs: Fs, exec: Exec, env: Env, setup: Setup, file: Str, tar
             0
         },
         Err(m) => {
-            out.write(m)
-            out.print("tessera: the C compiler failed (this is a bug in tessera)")
+            err.write(m)
+            err.print("tessera: the C compiler failed (this is a bug in tessera)")
             1
         },
     }

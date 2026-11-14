@@ -690,11 +690,12 @@ The native backend implements this with reference counting and copy-on-write. A 
 
 ## 9. Capabilities
 
-`Root` has ten fields, each a capability, and one method:
+`Root` has eleven fields, each a capability, and one method:
 
 | Field | Type | Granted |
 | --- | --- | --- |
 | `root.stdout` | `Stdout` | always |
+| `root.stderr` | `Stderr` | always |
 | `root.stdin` | `Stdin` | always |
 | `root.clock` | `Clock` | always |
 | `root.rand` | `Rand` | always; `--seed N` makes the numbers repeatable, the same in both backends |
@@ -882,7 +883,7 @@ let _ = group g {
 - A task stopped by a panic or by its group's deadline still has its output written in its turn, before the group passes the panic on. A program that ends with an uncaught panic or a deadlock first writes everything still held, innermost groups first, then the message on stderr. Nothing printed is lost.
 - `group g interleaved { body }` (with a deadline, `group g interleaved until clock.after(ms) { body }`) turns this off: its tasks print directly, as the body does, so their output interleaves in the order it happens. Use it for tasks that run until stopped or log as they go (a server's connections, watchers), where waiting for earlier tasks would hold their output back for as long as those run. The `http` module's servers use it.
 - Held output is limited to 4 MiB for the whole program. A print that would go past it makes its group give up order: what the group holds is written at once, in start order, and its tasks print directly from then on, as if it were `interleaved`. Reading `Stdin` does the same for every group holding the reading task's output, so a prompt shows before the program waits for the answer.
-- In every case each `print` and `write` reaches stdout whole, never mixed with another task's. Stderr, where panics and `error:` go, is never held.
+- In every case each `print` and `write` reaches stdout whole, never mixed with another task's. Stderr, where panics and `error:` go, and where `root.stderr` writes, is never held: a line written there comes out at once, after whatever stdout output has been written out so far.
 
 ### Channels
 
@@ -1234,6 +1235,7 @@ fn main(root: Root) {
 | --- | --- | --- |
 | `Stdout` | `print(s)` | `()`, writes `s` and a newline |
 | `Stdout` | `write(s)` | `()`, writes `s` |
+| `Stderr` | `print(s)`, `write(s)` | `()`, as `Stdout` does, to standard error: at once, never held in a group's order (section 10), after what stdout has buffered so far |
 | `Clock` | `now_ms()` | `Int`, milliseconds since the Unix epoch |
 | `Clock` | `sleep(ms)` | `()`, waits `ms` milliseconds (section 10); returns at once if `ms <= 0` |
 | `Rand` | `int(lo, hi)` | `Int` in `lo` up to but not including `hi`; panics if `hi <= lo` |
@@ -1595,10 +1597,10 @@ color = { git = "https://example.com/color.git", tag = "v1.2.0" }
 yaml = { git = "git@example.com:me/yaml.git", commit = "3f9c2e1d7a" }
 ```
 
-- `[grants]` takes `net`, `fs`, `listen`, `env`, `exec` and `foreign`, each a string or a list of strings written exactly like the text after `--grant KIND=`. `fs` takes one directory, relative to tessera.toml, with an optional `:ro`. Stdout, Stdin, Clock and Rand are always granted, so listing them is an error. Flags on the command line add to these grants.
+- `[grants]` takes `net`, `fs`, `listen`, `env`, `exec` and `foreign`, each a string or a list of strings written exactly like the text after `--grant KIND=`. `fs` takes one directory, relative to tessera.toml, with an optional `:ro`. Stdout, Stderr, Stdin, Clock and Rand are always granted, so listing them is an error. Flags on the command line add to these grants.
 - Grants belong to the program being run: only the tessera.toml found for the main file is read for them. A dependency's own tessera.toml never grants anything, so adding or updating a dependency cannot widen what the program may do. A dependency gets capabilities in exactly one way: your code passes them to it, and only of the kinds its `caps` allow. `[grants]` decides what reaches `main`; `caps` decides which of those may cross into each dependency.
 - A dependency is a directory holding `NAME.tsr`, plus any modules that file uses from the same directory.
-- `caps` lists what the dependency may use: `net` (Net and Conn), `listen` (Listen, Listener and Conn), `fs`, `stdout`, `stdin`, `clock`, `rand`, `env`, `exec`. The default is none. No dependency can take `Root`, and `caps` cannot give `foreign` (E0321).
+- `caps` lists what the dependency may use: `net` (Net and Conn), `listen` (Listen, Listener and Conn), `fs`, `stdout`, `stderr`, `stdin`, `clock`, `rand`, `env`, `exec`. The default is none. No dependency can take `Root`, and `caps` cannot give `foreign` (E0321).
 - `[trust] foreign = ["name", ...]` names the dependencies that may call C: declare foreign blocks and take `Foreign`. Calling C is full trust, since C code is outside every capability check, so it is a separate, explicit list rather than one more cap, and only the program's tessera.toml can hold it. An untrusted dependency that calls C is E0320. tessera.lock gets a line per trusted dependency that calls C, `foreign NAME LIB,LIB`, written on the first build; when an update makes the dependency declare a library the line does not have, the build stops (E0324) until you review it and delete the line.
 - Tessera has no ambient authority, so a function can only use a capability that reaches it as a parameter. The checker therefore knows everything a dependency can ever do from its signatures, and rejects the program (E0320) if a dependency's function takes a capability it was not granted. Granting is still only an upper bound: at run time the dependency gets exactly the capabilities you pass it, which can be narrowed with `only` and `under`.
 - A dependency is a local directory (`path`) or a git repository (`git`) at a `tag` or a `commit` (lowercase hex, at least 7 characters). The URL is `https://`, `http://`, `ssh://`, `git://`, `file://` or `user@host:path`. No registry holds the code: the URL is the name of the source, and the package index (below) only points at URLs.

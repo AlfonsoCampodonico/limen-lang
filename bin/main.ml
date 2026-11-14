@@ -19,7 +19,7 @@ usage:
   tessera add NAME[@VERSION] (add a package from the index to tessera.toml, with the caps it declares)
   tessera index entry [DIR]  (print the index entry for the package's current tag)
 
-Stdout, Stdin, Clock and Rand are always granted. Net, Fs, Listen, Env, Exec and Foreign exist only
+Stdout, Stderr, Stdin, Clock and Rand are always granted. Net, Fs, Listen, Env, Exec and Foreign exist only
 when granted, by --grant or by the [grants] table of tessera.toml. --seed makes Rand repeatable; arguments after -- are root.args(). The process runs in an operating-system sandbox
 limited to those grants (macOS; Linux untested); --no-sandbox turns it off, for debugging.
 |}
