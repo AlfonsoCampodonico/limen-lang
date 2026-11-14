@@ -1758,6 +1758,27 @@ fn main(root: Root) {
   errs "held-eq" (holders ^ "fn same(a: Client, b: Client) -> Bool {\n    a == b\n}\n\nfn main(root: Root) {}\n") [ "E0201" ];
   errs "held-ne-generic" (holders ^ "fn same(a: Box[Option[Sink]]) -> Bool {\n    a != a\n}\n\nfn main(root: Root) {}\n") [ "E0201" ];
   errs "held-eq-plain-ok" (holders ^ "fn same(a: Box[Int]) -> Bool {\n    a == a\n}\n\nfn main(root: Root) {}\n") [];
+  (* built-ins that compare values refuse holders, as `==` does *)
+  let mk = "    let c = Client { net: root.net, name: \"x\" }\n" in
+  errs "held-contains" (holders ^ "fn main(root: Root) {\n" ^ mk ^ "    let b = [c].contains(c)\n}\n") [ "E0201" ];
+  says "held-contains-says" (holders ^ "fn main(root: Root) {\n" ^ mk ^ "    let b = [c].contains(c)\n}\n") "E0201"
+    "`contains` compares values, and `Client` holds capability `Net` through `Client.net`";
+  says "held-contains-cap" "fn main(root: Root) {\n    let b = [root.net].contains(root.net)\n}\n" "E0201"
+    "`contains` compares values, and values of type `Net` cannot be compared";
+  errs "held-contains-array" (holders ^ "fn main(root: Root) {\n    let a: Array[Option[Sink], 1] = [None]\n    let b = a.contains(None)\n}\n") [ "E0201" ];
+  errs "held-contains-late" (holders ^ "fn main(root: Root) {\n" ^ mk ^ "    let xs = []\n    let b = xs.contains(c)\n}\n") [ "E0201" ];
+  errs "held-contains-fn" "fn main() {\n    let b = [|| 1].contains(|| 2)\n}\n" [ "E0201" ];
+  says "held-index-of" ("use list\n\n" ^ holders ^ "fn main(root: Root) {\n" ^ mk ^ "    let i = list.index_of([c], c)\n}\n") "E0201"
+    "`index_of` compares values, and `Client` holds capability `Net` through `Client.net`";
+  says "held-chunk-by" (holders ^ "fn main(root: Root) {\n" ^ mk ^ "    let g = [c].chunk_by(|x| x)\n}\n") "E0201" "`chunk_by` compares values";
+  errs "held-chunk-by-ok" (holders ^ "fn main(root: Root) {\n" ^ mk ^ "    let g = [c].chunk_by(|x| x.name)\n}\n") [];
+  says "held-sort" (holders ^ "fn main(root: Root) {\n    let s = [Sink.Nowhere].sort()\n}\n") "E0201"
+    "`sort` compares values, and `Sink` holds capability `Stdout` through `Sink.ToOut`";
+  errs "held-max" (holders ^ "fn main(root: Root) {\n" ^ mk ^ "    let m = [c].max()\n}\n") [ "E0111" ];
+  errs "held-distinct" (holders ^ "fn main(root: Root) {\n" ^ mk ^ "    let d = [c].distinct()\n}\n") [ "E0111" ];
+  says "held-assert-eq" (holders ^ "fn main(root: Root) {\n" ^ mk ^ "    assert_eq([c], [c])\n}\n") "E0201"
+    "`assert_eq` compares values, and `List[Client]` holds capability `Net` through `Client.net`";
+  errs "held-compare-plain-ok" ("use list\n\n" ^ holders ^ "fn main(root: Root) {\n    let xs = [Box { item: 1 }]\n    let b = xs.contains(xs[0])\n    let i = list.index_of(xs, xs[0])\n    let s = [1, 2].sort()\n    assert_eq(xs, xs)\n}\n") [];
   errs "held-bound-ok" (holders ^ "fn show[T: Named](x: T) -> Str {\n    x.label()\n}\n\nfn main(root: Root) {\n    let a = App { client: Client { net: root.net, name: \"x\" }, out: root.stdout, count: 1 }\n    root.stdout.print(show(a))\n}\n") [];
   out "held-run"
     (holders

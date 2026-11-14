@@ -516,9 +516,39 @@ fn instantiate(st: env.State, s: env.Sig) -> (List[(Str, types.Ty)], types.Ty, e
     (inst, TFn(s.params.map(|p| st.subst(inst, p)), st.subst(inst, s.ret)), st)
 }
 
+// The generic built-ins that compare the values of a type parameter with
+// `==`: the function, the parameter, and the name to report.
+fn comparing_generics() -> List[(Str, Str, Str)] {
+    [("List::chunk_by", "K", "chunk_by"), ("list.index_of", "T", "index_of")]
+}
+
+// E0201 when built-in `name` compares values of type `t` that have no
+// equality: functions, channels, `dyn` values, capabilities, and values
+// holding a capability, as `==` refuses them.
+pub fn refuse_compare(st: env.State, sp: ast.Span, name: Str, t: types.Ty) -> env.State {
+    let t = st.repr(t)
+    match t {
+        TFn(..) | TCap(_) | TChan(_) | TDyn(..) => st.report(diag.error("E0201", sp, "`{name}` compares values, and values of type `{st.show(t)}` cannot be compared")),
+        _ => match st.held(t) {
+            Some(h) => st.report(diag.error("E0201", sp, "`{name}` compares values, and {h}").note("capabilities have no equality, so neither has a value holding one; compare something it holds that is not a capability, as in `xs.any(|x| x.name == name)`")),
+            None => st,
+        },
+    }
+}
+
 // The bounds of generic function `name` apply to its type arguments here.
 fn add_bounds(st: env.State, cx: env.Cx, name: Str, inst: List[(Str, types.Ty)], sp: ast.Span) -> env.State {
     let mut st = st
+    for (f, g, shown) in comparing_generics() {
+        if f == name {
+            match inst.find(|p| p.0 == g) {
+                Some((_, t)) => {
+                    st.compared = [(sp, t, shown)] + st.compared
+                },
+                None => {},
+            }
+        }
+    }
     for b in cx.fn_bounds.get(name) ?? [] {
         match inst.find(|p| p.0 == b.param) {
             Some((_, t)) => {
@@ -803,7 +833,7 @@ fn builtin_call(st: env.State, cx: env.Cx, fx: env.Fx, n: Str, args: List[ast.Ex
                     let next = expect(next, cx, fx, b, t)
                     match next.repr(t) {
                         TFn(..) | TCap(_) | TChan(_) | TDyn(..) => next.report(diag.error("E0201", sp, "values of type `{next.show(t)}` cannot be compared")),
-                        _ => next,
+                        _ => refuse_compare(next, sp, "assert_eq", t),
                     }
                 },
                 _ => wrong(st, "`assert_eq` takes 2 arguments"),
@@ -1603,11 +1633,17 @@ fn builtin_method_call(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv:
     }
     match (name, rt) {
         ("sort", TList(a)) => match unordered(st, cx, a) {
+            Some(_) if st.held(st.repr(a)).is_some() => {
+                st = refuse_compare(st, nsp, "sort", a)
+            },
             Some(t) => {
                 let d = diag.error("E0201", nsp, "`List[{st.show(a)}]` cannot be sorted: `{st.show(t)}` has no order").note("numbers, strings, Bool, and lists, tuples, structs and enums of them are ordered; to sort by a key use `xs.sort_by(key)`, for another order `list.sort_by(xs, less)`")
                 st = st.report(d)
             },
             None => {},
+        },
+        ("contains", TList(a)) | ("contains", TArray(a, _)) => {
+            st.compared = [(nsp, a, "contains")] + st.compared
         },
         _ => {},
     }

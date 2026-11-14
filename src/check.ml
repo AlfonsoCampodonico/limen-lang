@@ -116,6 +116,20 @@ let held t =
   | [] -> None
 
 let err ctx ?notes ?fix code span msg = ctx.diags <- Diag.make ?notes ?fix code span msg :: ctx.diags
+
+(* E0201 when built-in [name] compares values of type [t] that have no
+   equality: functions, channels, `dyn` values, capabilities, and values
+   holding a capability, as `==` refuses them. *)
+let refuse_compare ctx sp name t =
+  match repr t with
+  | (TFn _ | TCap _ | TChan _ | TDyn _) as t ->
+    err ctx "E0201" sp (sprintf "`%s` compares values, and values of type `%s` cannot be compared" name (show t))
+  | t -> (
+    match held t with
+    | Some h ->
+      err ctx "E0201" sp (sprintf "`%s` compares values, and %s" name h)
+        ~notes:[ "capabilities have no equality, so neither has a value holding one; compare something it holds that is not a capability, as in `xs.any(|x| x.name == name)`" ]
+    | None -> ())
 let plural n = if n = 1 then "" else "s"
 
 let lev a b =
@@ -370,7 +384,21 @@ let bounded g b =
    up Int, Str or Bool. *)
 let map_keys : (Span.t * ty) list ref = ref []
 
+(* Values compared by a built-in method or standard library function in
+   the function being checked, with the method's name: they must not hold
+   authority, as with `==`. *)
+let compared : (Span.t * ty * string) list ref = ref []
+
+(* The generic built-ins that compare the values of a type parameter with
+   `==`: the function, the parameter, and the name to report. *)
+let comparing_generics = [ ("List::chunk_by", "K", "chunk_by"); ("list.index_of", "T", "index_of") ]
+
 let add_bounds fname env sp =
+  List.iter
+    (fun (fn, g, name) ->
+      if fn = fname then
+        match List.assoc_opt g env with Some t -> compared := (sp, t, name) :: !compared | None -> ())
+    comparing_generics;
   match Hashtbl.find_opt fn_bounds fname with
   | None -> ()
   | Some bs ->
@@ -1090,7 +1118,7 @@ and check_call ?want ctx f e callee args sp =
        expect ctx f b t;
        match repr t with
        | TFn _ | TCap _ | TChan _ | TDyn _ -> err ctx "E0201" sp (sprintf "values of type `%s` cannot be compared" (show t))
-       | _ -> ())
+       | _ -> refuse_compare ctx sp "assert_eq" t)
      | _ -> err ctx "E0107" sp "`assert_eq` takes 2 arguments"; check_args ctx f args);
     TUnit
   | EVar "keep" when not (is_local f "keep") && not (Hashtbl.mem ctx.fns "keep") ->
@@ -1550,9 +1578,11 @@ and check_method_value ?rt ctx f e recv name nsp args =
        | "sort", TList a -> (
          match unordered ctx a with
          | None -> ()
+         | Some _ when held (repr a) <> None -> refuse_compare ctx nsp "sort" a
          | Some t ->
            err ctx "E0201" nsp (sprintf "`List[%s]` cannot be sorted: `%s` has no order" (show a) (show t))
              ~notes:[ "numbers, strings, Bool, and lists, tuples, structs and enums of them are ordered; to sort by a key use `xs.sort_by(key)`, for another order `list.sort_by(xs, less)`" ])
+       | "contains", (TList a | TArray (a, _)) -> compared := (nsp, a, "contains") :: !compared
        | _ -> ());
       r)
 
@@ -2538,6 +2568,8 @@ let check_pending ctx =
                   :: match t with TParam g -> [ sprintf "a type parameter can be a key with the bound `[%s: Key]`" g ] | _ -> []))
     !map_keys;
   map_keys := [];
+  List.iter (fun (sp, t, name) -> refuse_compare ctx sp name t) (List.rev !compared);
+  compared := [];
   let ps = List.rev !pending in
   pending := [];
   List.iter
@@ -2606,6 +2638,7 @@ let check_fn ctx (d : fn_decl) (s : fsig) =
   pending := [];
   to_infer := [];
   map_keys := [];
+  compared := [];
   Fun.protect ~finally:(fun () -> check_pending ctx) @@ fun () ->
   let genv = List.map (fun g -> (g, TParam g)) d.fn_gen in
   let scope = { vars = Hashtbl.create 8; barrier = false } in

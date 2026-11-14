@@ -1,0 +1,68 @@
+// Built-in methods and standard library functions that compare values
+// refuse values holding a capability (E0201), as `==` does: `contains`
+// on lists and arrays, `sort`, `chunk_by`'s keys, `list.index_of` and
+// `assert_eq`. `min`, `max`, `sort_by`, `distinct` and the other bounded
+// ones refuse them through `Ordered` and `Key` (E0111). Values that hold
+// none still compare.
+use list
+
+struct Logger {
+    out: Stdout,
+    name: Str,
+}
+
+struct App {
+    log: Logger,
+    count: Int,
+}
+
+enum Sink {
+    ToOut(Stdout),
+    Nowhere,
+}
+
+struct Plain {
+    name: Str,
+}
+
+fn main(root: Root) {
+    let a = Logger { out: root.stdout, name: "a" }
+    let xs = [a]
+    let found = xs.contains(a)
+    let nets = [root.net]
+    let has_net = nets.contains(root.net)
+    let apps = [App { log: a, count: 1 }]
+    let i = list.index_of(apps, apps[0])
+    let groups = xs.chunk_by(|x| x)
+    let sinks = [Sink.Nowhere, Sink.ToOut(root.stdout)]
+    let sorted = sinks.sort()
+    let arr: Array[Option[Sink], 2] = [None, None]
+    let in_arr = arr.contains(None)
+    let fs = [|| 1]
+    let has_f = fs.contains(|| 2)
+    let late = []
+    let found_late = late.contains(a)
+    let top = xs.max()
+    let by = xs.sort_by(|x| x)
+    let once = xs.distinct()
+    let ok = [Plain { name: "p" }].contains(Plain { name: "p" })
+    let ok_i = list.index_of([1, 2], 2)
+    let ok_g = [1, 1, 2].chunk_by(|n| n)
+    let ok_by = xs.chunk_by(|x| x.name)
+    let ok_s = [Plain { name: "q" }].sort()
+}
+
+fn wrap[T](xs: List[T], x: T) -> Bool {
+    xs.contains(x)
+}
+
+test "holders" {
+    let p = Plain { name: "p" }
+    assert_eq(p, p)
+}
+
+fn same(root: Root) {
+    let a = Logger { out: root.stdout, name: "a" }
+    assert_eq(a, a)
+    assert_eq([Sink.Nowhere], [Sink.Nowhere])
+}

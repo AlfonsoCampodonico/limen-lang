@@ -437,7 +437,7 @@ From loosest to tightest. All binary operators are left-associative.
 | `-` `*` `/` | `Int`, `Float` | same type |
 | `%` | `Int` | `Int` |
 | `<` `<=` `>` `>=` | any ordered type (below) | `Bool` |
-| `==` `!=` | any type except functions, channels, `dyn` values, capabilities and values holding a capability (E0201); structural equality | `Bool` |
+| `==` `!=` | any type except functions, channels, `dyn` values, capabilities and values holding a capability (E0201, as for the built-ins that compare, such as `contains`); structural equality | `Bool` |
 | `&&` `\|\|` | `Bool`, short-circuit | `Bool` |
 | `..<` | `Int` | `List[Int]`: `lo..<hi` counts up from `lo`, stopping before `hi` |
 | `-x` | `Int`, `Float` | same type |
@@ -757,7 +757,7 @@ A type **holds** a capability when it contains one: written in it (`Net`, `List[
 - A function taking `c: Client` takes `Net`. `tessera caps` says where it comes from, `Net (via Client.net)` (a path through fields, with an enum payload named by its variant, `Sink.ToOut`), and the `--json` output has a `"via"` object mapping each such capability to its path. A capability also written in a parameter's type has no `via`.
 - Such a function is never pure, so the compiler never reuses or keeps its calls (section 14), and a closure that captures such a value is not fused into a pipeline.
 - A dependency taking a `Client` is checked against its `caps` like one taking a `Net` (E0320): authority cannot cross into a dependency inside a struct.
-- A value holding a capability cannot become `dyn` (E0112), cannot be a map key (E0113) and cannot be compared with `==` or `!=` (E0201): capabilities have no equality, and neither does a value holding one. Use a bounded type parameter, `[T: Named]`, to reach its methods through an interface.
+- A value holding a capability cannot become `dyn` (E0112), cannot be a map key (E0113) and cannot be compared with `==` or `!=` (E0201): capabilities have no equality, and neither does a value holding one. The built-ins that compare values refuse it the same way (E0201, naming the built-in and the path): `contains` on lists and arrays, `sort`, `chunk_by`'s keys, `list.index_of` and `assert_eq`; those bounded by `Ordered` or `Key` (`min`, `max`, `min_by`, `max_by`, `sort_by`, `distinct`, `distinct_by`, `group_by`, `count_by`, `tally`) refuse it as a type without order or a key (E0111). Compare something it holds that is not a capability instead, `xs.any(|x| x.name == name)`. Use a bounded type parameter, `[T: Named]`, to reach its methods through an interface.
 - It is an ordinary value otherwise: built with a literal, updated with `with`, kept in lists and maps, matched, passed to tasks (each task gets its own copy; capabilities are shared safely between threads). It prints with its capabilities as `<Net>`, which cannot be turned back into one.
 
 Rule 1 still holds: a struct cannot make a capability, only carry one it was given.
