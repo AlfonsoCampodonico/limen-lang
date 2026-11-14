@@ -1,0 +1,4 @@
+fn main() {
+    if xs.any { |x| x > 1 } {
+    }
+}

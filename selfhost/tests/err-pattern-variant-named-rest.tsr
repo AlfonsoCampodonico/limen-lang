@@ -1,0 +1,5 @@
+fn f(s: Stmt) -> Int {
+    match s {
+        SLet(..rest) => 0,
+    }
+}

@@ -1,0 +1,99 @@
+// Declarations: generics with bounds, interfaces, dyn, aliases, embedding,
+// tests, table tests and benchmarks.
+use json
+use errors
+
+pub struct Pair[A, B] {
+    first: A,
+    second: B,
+}
+
+struct Sorted[T: Ordered] {
+    items: List[T],
+}
+
+pub enum Tree[K: Key + Ordered, V] {
+    Leaf,
+    Node(K, V, Tree[K, V], Tree[K, V]),
+}
+
+enum Empty {
+}
+
+struct Admin {
+    User,
+    auth.Role,
+    Box[Int],
+    level: Int
+    type: Str,
+}
+
+pub interface Container[T] {
+    fn get(self, i: Int) -> Option[T]
+    fn len(self) -> Int,
+    fn clear(self)
+}
+
+interface Shape {
+    fn area(self) -> Float
+}
+
+type Counts = Map[Str, Int]
+pub type Parsed[T] = Result[T, Str]
+type Handler = fn(Request, Int) -> Response
+type Grid = Array[Array[Int, 3], 99999999999999999]
+type Shapes = List[dyn Shape]
+type Bags = List[dyn coll.Container[Str]]
+type Unit = ()
+type Triple = (Int, (Str, Bool), fn() -> ())
+
+fn first[C: Container[T], T](c: C) -> Option[T] {
+    c.get(0)
+}
+
+pub fn lowest[T: Ordered + geo.Area + Container[Map[Str, Int]]](xs: List[T], dyn_ok: dyn Shape) -> Option[T] {
+    xs.min()
+}
+
+fn sum[N](xs: Array[Int, N]) -> Int {
+    0
+}
+
+fn noparams() {
+}
+
+test "elapsed" {
+    assert_eq(elapsed(FakeClock { t: 1500 }, 1000), 500)
+}
+
+test "" {
+}
+
+test "timeouts" (clock: virtual Clock, fs: Fs) {
+}
+
+test "sums" for (a, b, want) in [(1, 2, 3), (2, 2, 4)] {
+    assert_eq(a + b, want)
+}
+
+test "one" for x in [1] {
+}
+
+test "with params" (clock: Clock) for (a, _) in [(1, 2)] {
+}
+
+bench "loop" {
+    keep(work())
+}
+
+bench "with fs" (fs: Fs) {
+}
+
+fn type(x: Int) -> Int {
+    let type = 1
+    let test = 2
+    let foreign = 3
+    let until = 4
+    let with = 5
+    type + test
+}

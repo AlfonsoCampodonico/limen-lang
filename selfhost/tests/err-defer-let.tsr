@@ -1,0 +1,3 @@
+fn main() {
+    defer let x = 1
+}

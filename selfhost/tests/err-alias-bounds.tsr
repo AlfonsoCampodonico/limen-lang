@@ -1,0 +1,1 @@
+type Pair[T: Ordered] = (T, T)

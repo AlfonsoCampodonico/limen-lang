@@ -1,0 +1,11 @@
+fn f(p: Parser) -> Result[Int, Str] {
+    let mut x = 0
+    let mut p = p
+    (x, p) = parse(p)?
+    (a, b) = (b, a)
+    ((lo, hi), _) = bounds()
+    (best.score, scores[i]) = (s, s * 2)
+    (m[k], t.0) = pair
+    defer (a, b) = (1, 2)
+    Ok(x)
+}

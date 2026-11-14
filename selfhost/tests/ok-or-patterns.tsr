@@ -1,0 +1,17 @@
+fn f(x: Shape, t: (Int, Option[Int])) -> Int {
+    match x {
+        Circle(_) | Point => 1,
+        Rect(w, _) | Square(w) if w > 0 => 2,
+        Shape.Tri(a, b, c) | Shape.Quad(a, b, c, _) => 3,
+        (A | B) | C => 4,
+        A
+        | B => 5,
+        _ => 0,
+    }
+    match t {
+        (1 | 2, Some(3 | 4)) => 1,
+        (-1 | 0, None) | (_, Some(_)) => 2,
+        ("a" | "b", true | false) => 3,
+        (_, _) => 0,
+    }
+}

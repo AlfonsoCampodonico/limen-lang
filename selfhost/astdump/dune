@@ -1,0 +1,5 @@
+; The OCaml parser's tree for one file, in the format selfhost/parse.tsr
+; prints, so the two can be compared: dune exec selfhost/astdump/astdump.exe -- FILE
+(executable
+ (name astdump)
+ (libraries tessera))

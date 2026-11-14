@@ -1,0 +1,31 @@
+// Foreign blocks: structs, variadic functions and C symbols.
+foreign "c" {
+    fn abs(x: Int32) -> Int32
+    pub fn labs(x: Int) -> Int
+    fn printf(fmt: Str, ...) -> Int32
+    fn print_int(fmt: Str, ..., n: Int) -> Int32 = "printf"
+    fn puts(s: Str) = "puts"; fn putchar(c: Int32) -> Int32
+    fn trailing(a: Int, b: Int,) -> Int
+    fn split(
+        a: Int
+        b: Int
+    ) -> Int
+    struct Point {
+        x: Int32,
+        y: Int32,
+    }
+    pub struct Size {
+        w: Float,
+        h: Float
+    }
+}
+
+foreign "m" {
+}
+
+fn main() {
+}
+
+foreign "sqlite3" {
+    fn sqlite3_open(path: Str, db: Handle) -> Int32
+}

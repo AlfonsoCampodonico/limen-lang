@@ -1,0 +1,4 @@
+fn main() {
+    group g until clock.sleep(5) {
+    }
+}

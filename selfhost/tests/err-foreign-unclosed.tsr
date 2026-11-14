@@ -1,0 +1,2 @@
+foreign "m" {
+    fn sin(x: Float) -> Float

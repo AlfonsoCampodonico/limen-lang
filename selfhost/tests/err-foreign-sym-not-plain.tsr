@@ -1,0 +1,3 @@
+foreign "c" {
+    fn p(x: Int) -> Int32 = puts
+}

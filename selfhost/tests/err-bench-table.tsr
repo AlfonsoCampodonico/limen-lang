@@ -1,0 +1,2 @@
+bench "b" for x in [1] {
+}

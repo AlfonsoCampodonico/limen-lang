@@ -1,0 +1,4 @@
+fn main() {
+    for x in xs.map { |x| x } {
+    }
+}

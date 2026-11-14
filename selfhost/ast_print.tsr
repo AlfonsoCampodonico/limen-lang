@@ -1,0 +1,364 @@
+// The syntax tree as text, in two parts, so the parsers can be compared:
+// `file` writes it in the position-free format of src/astdump.ml (the one
+// the compiler's formatter tests use), and `spans` lists the positions the
+// tree carries, as selfhost/astdump does for the OCaml tree.
+use ast
+use floats
+
+// `s` as OCaml's String.escaped writes it: `\"`, `\\`, `\n`, `\t`, `\r`,
+// `\b`, printable ASCII as it is, and any other byte as three decimal
+// digits, `\001`.
+fn escaped(s: Str) -> Str {
+    let mut out: List[Str] = []
+    let mut start = 0
+    let bs = s.bytes()
+    let mut i = 0
+    while i < bs.len() {
+        let b = bs[i]
+        let esc = if b == 34 {
+            "\\\""
+        } else if b == 92 {
+            "\\\\"
+        } else if b == 10 {
+            "\\n"
+        } else if b == 9 {
+            "\\t"
+        } else if b == 13 {
+            "\\r"
+        } else if b == 8 {
+            "\\b"
+        } else if b < 32 || b > 126 {
+            "\\" + "{b / 100}{b / 10 % 10}{b % 10}"
+        } else {
+            ""
+        }
+        if esc != "" {
+            out.push(s.slice(start, i))
+            out.push(esc)
+            start = i + 1
+        }
+        i = i + 1
+    }
+    out.push(s.slice(start, bs.len()))
+    out.join("")
+}
+
+fn commas[T](xs: List[T], f: fn(T) -> Str) -> Str {
+    xs.map(f).join(",")
+}
+
+pub fn ty(t: ast.TyExpr) -> Str {
+    match t.desc {
+        TyUnit => "()",
+        TyInt(n) => n.to_str(),
+        TyName(n, args) => n + "[" + commas(args, ty) + "]",
+        TyFn(params, ret) => "fn(" + commas(params, ty) + ")" + ty(ret),
+    }
+}
+
+pub fn pat(p: ast.Pat) -> Str {
+    match p.desc {
+        PWild => "_",
+        PBind(n) => "b:" + n,
+        PInt(n) => n.to_str(),
+        PStr(s) => escaped(s),
+        PBool(b) => b.to_str(),
+        PVariant(q, v, args) => (q ?? "") + "." + v + "(" + commas(args, pat) + ")",
+        PTuple(items) => "(" + commas(items, pat) + ")",
+        PList(items) => "[" + commas(items, pat) + "]",
+        PRest(None) => "..",
+        PRest(Some(n)) => "..b:" + n,
+        POr(alts) => "or(" + alts.map(pat).join("|") + ")",
+    }
+}
+
+fn op(o: ast.BinOp) -> Str {
+    match o {
+        Add => "+",
+        Sub => "-",
+        Mul => "*",
+        Div => "/",
+        Mod => "%",
+        Eq => "==",
+        Ne => "!=",
+        Lt => "<",
+        Le => "<=",
+        Gt => ">",
+        Ge => ">=",
+        And => "&&",
+        Or => "||",
+        Else => "??",
+        Range => "..<",
+    }
+}
+
+fn guard(g: Option[ast.Expr]) -> Str {
+    match g {
+        Some(x) => " if " + expr(x),
+        None => "",
+    }
+}
+
+fn inits(fields: List[ast.FieldInit]) -> Str {
+    commas(fields, |f| f.name + ":" + expr(f.value))
+}
+
+pub fn expr(e: ast.Expr) -> Str {
+    match e.desc {
+        EInt(n) => n.to_str(),
+        EFloat(f) => floats.hex(f),
+        EBool(b) => b.to_str(),
+        EUnit => "()",
+        EStr(parts) => "\"" + parts.map(|part| str_part(part)).join("") + "\"",
+        // the name `?.` gives the value it unwraps, which depends on how
+        // many came before
+        EVar(n) => if n.starts_with("safe$") { "$" } else { n },
+        EList(items) => "[" + commas(items, expr) + "]",
+        EBin(o, a, b) => "(" + expr(a) + op(o) + expr(b) + ")",
+        EPipe(a, b) => "(" + expr(a) + "|>" + expr(b) + ")",
+        EUn(Neg, a) => "(-" + expr(a) + ")",
+        EUn(Not, a) => "(!" + expr(a) + ")",
+        ECall(f, args) => expr(f) + "(" + commas(args, expr) + ")",
+        ENamed(n, _, a) => n + ":" + expr(a),
+        EMethod(r, n, _, args) => expr(r) + "." + n + "(" + commas(args, expr) + ")",
+        EField(r, n, _) => expr(r) + "." + n,
+        EIndex(a, i) => expr(a) + "[" + expr(i) + "]",
+        ETry(a, None) => expr(a) + "?",
+        ETry(a, Some(c)) => expr(a) + "?" + expr(c),
+        EIf(c, b, other) => "if(" + expr(c) + ")" + block(b) + (other.map(|x| "else" + expr(x)) ?? ""),
+        EMatch(s, arms) => "match(" + expr(s) + ")\{" + arms.map(|a| pat(a.pat) + guard(a.guard) + "=>" + expr(a.body)).join(";") + "\}",
+        EBlock(b) => block(b),
+        EClosure(params, body) => "|" + commas(params, |p| p.name + (p.ty.map(|t| ":" + ty(t)) ?? "")) + "|" + expr(body),
+        EStruct(n, _, fields) => n + "\{" + inits(fields) + "\}",
+        ESafe(b, _, rest) => "safe(" + expr(b) + "," + expr(rest) + ")",
+        EWith(b, fields) => "\{" + expr(b) + " with " + inits(fields) + "\}",
+        EGroup(n, interleaved, until, b) => {
+            let mode = if interleaved { " interleaved" } else { "" }
+            let deadline = until.map(|d| " until " + expr(d.clock) + ".after(" + expr(d.ms) + ")") ?? ""
+            "group " + n + mode + deadline + block(b)
+        },
+        ESelect(arms) => "select\{" + arms.map(|a| sel_op(a.op) + guard(a.guard) + "=>" + expr(a.body)).join(";") + "\}",
+    }
+}
+
+fn str_part(p: ast.StrPart) -> Str {
+    match p {
+        SPLit(s) => escaped(s),
+        SPExpr(x) => "\{" + expr(x) + "\}",
+    }
+}
+
+fn sel_op(o: ast.SelOp) -> Str {
+    match o {
+        SelRecv(bound, ch) => (bound.map(|b| b.text) ?? "_") + "=" + expr(ch) + ".recv()",
+        SelSend(ch, v) => expr(ch) + ".send(" + expr(v) + ")",
+        SelAfter(clock, ms) => expr(clock) + ".after(" + expr(ms) + ")",
+        SelDefault => "_",
+    }
+}
+
+pub fn block(b: ast.Block) -> Str {
+    let tail = b.tail.map(|e| "|tail " + expr(e)) ?? ""
+    "\{" + b.stmts.map(|s| stmt(s)).join(";") + tail + "\}"
+}
+
+fn annotation(t: Option[ast.TyExpr]) -> Str {
+    t.map(|x| ":" + ty(x)) ?? ""
+}
+
+fn stmt(s: ast.Stmt) -> Str {
+    match s.desc {
+        SLet(m, n, _, t, e) => "let " + (if m { "mut " } else { "" }) + n + annotation(t) + "=" + expr(e),
+        SAssign(a, b) => expr(a) + "=" + expr(b),
+        SExpr(e) => expr(e),
+        SReturn(e) => "return " + (e.map(|x| expr(x)) ?? ""),
+        SWhile(c, b) => "while(" + expr(c) + ")" + block(b),
+        SFor(n, _, e, b) => "for " + n + " in " + expr(e) + block(b),
+        SLetPat(p, e) => "let " + pat(p) + "=" + expr(e),
+        SForPat(p, e, b) => "for " + pat(p) + " in " + expr(e) + block(b),
+        SBreak => "break",
+        SContinue => "continue",
+        SDefer(b) => "defer" + block(b),
+    }
+}
+
+// Type parameters, each with its bounds: `T:Shape[]+Show[]`.
+fn generics(gs: List[Str], bounds: List[ast.Bound]) -> Str {
+    commas(gs, |g| g + (bounds.find(|b| b.name == g).map(|b| ":" + b.ifaces.map(|t| ty(t)).join("+")) ?? ""))
+}
+
+fn params(ps: List[ast.Param]) -> Str {
+    commas(ps, |p| p.name + ":" + ty(p.ty))
+}
+
+fn ret(t: Option[ast.TyExpr]) -> Str {
+    t.map(|x| ty(x)) ?? ""
+}
+
+fn item(i: ast.Item) -> Str {
+    match i {
+        IFn(d) => match d.test {
+            Some(name) => test(d, name),
+            None => function(d),
+        },
+        IIface(f) => "interface " + f.name + "[" + f.generics.join(",") + "]\{" + f.methods.map(|m| m.name + "(" + params(m.params) + ")" + ret(m.ret)).join(";") + "\}",
+        IStruct(s) => {
+            let foreign = s.foreign.map(|lib| "foreign " + escaped(lib) + " ") ?? ""
+            let fields = commas(s.fields, |f| if s.embeds.contains(f.name) { "embed " + ty(f.ty) } else { f.name + ":" + ty(f.ty) })
+            foreign + "struct " + s.name + "[" + generics(s.generics, s.bounds) + "]\{" + fields + "\}"
+        },
+        IEnum(e) => "enum " + e.name + "[" + generics(e.generics, e.bounds) + "]\{" + commas(e.variants, |v| v.name + "(" + commas(v.payload, ty) + ")") + "\}",
+        IType(a) => "type " + a.name + "[" + a.generics.join(",") + "]=" + ty(a.body),
+    }
+}
+
+fn test(d: ast.FnDecl, name: Str) -> Str {
+    let kind = if d.bench { "bench " } else { "test " }
+    let virtual = if d.virtual { " virtual" } else { "" }
+    let table = d.table.map(|t| "for " + pat(t.pat) + " in " + expr(t.cases)) ?? ""
+    kind + escaped(name) + virtual + "(" + params(d.params) + ")" + table + block(d.body)
+}
+
+fn function(d: ast.FnDecl) -> Str {
+    let foreign = d.foreign.map(|f| foreign_prefix(f, d.name)) ?? ""
+    let public = if d.public { "pub " } else { "" }
+    foreign + public + "fn " + d.name + "[" + generics(d.generics, d.bounds) + "](" + params(d.params) + ")" + ret(d.ret) + block(d.body)
+}
+
+fn foreign_prefix(f: ast.Foreign, name: Str) -> Str {
+    let sym = if f.sym != name { "=" + f.sym + " " } else { "" }
+    let variadic = f.variadic.map(|k| "...{k} ") ?? ""
+    "foreign " + escaped(f.lib) + " " + sym + variadic
+}
+
+fn is_public(i: ast.Item) -> Bool {
+    match i {
+        IFn(d) => d.public,
+        IStruct(s) => s.public,
+        IEnum(e) => e.public,
+        IIface(f) => f.public,
+        IType(a) => a.public,
+    }
+}
+
+// The whole file, as src/astdump.ml writes it.
+pub fn file(f: ast.File) -> Str {
+    let uses = f.uses.map(|u| "use " + u.text).join("\n")
+    let items = f.items.map(|i| (if is_public(i) { "pub " } else { "" }) + item(i)).join("\n")
+    uses + "\n" + items
+}
+
+// ---------- spans ----------
+
+// Each function below writes the spans of a part of the tree, ` lo:hi`
+// each, in the order a walk of the tree meets them; selfhost/astdump walks
+// the OCaml tree in the same order.
+
+fn sp(s: ast.Span) -> Str {
+    " {s.lo}:{s.hi}"
+}
+
+fn all[T](xs: List[T], f: fn(T) -> Str) -> Str {
+    xs.map(f).join("")
+}
+
+fn maybe[T](x: Option[T], f: fn(T) -> Str) -> Str {
+    x.map(f) ?? ""
+}
+
+fn ty_spans(t: ast.TyExpr) -> Str {
+    sp(t.span) + match t.desc {
+        TyName(_, args) => all(args, ty_spans),
+        TyFn(params, ret) => all(params, ty_spans) + ty_spans(ret),
+        _ => "",
+    }
+}
+
+fn pat_spans(p: ast.Pat) -> Str {
+    sp(p.span) + match p.desc {
+        PVariant(_, _, items) | PTuple(items) | PList(items) | POr(items) => all(items, pat_spans),
+        _ => "",
+    }
+}
+
+fn init_spans(f: ast.FieldInit) -> Str {
+    sp(f.span) + expr_spans(f.value)
+}
+
+fn expr_spans(e: ast.Expr) -> Str {
+    sp(e.span) + match e.desc {
+        EStr(parts) => all(parts, |part| match part {
+            SPExpr(x) => expr_spans(x),
+            SPLit(_) => "",
+        }),
+        EList(items) => all(items, expr_spans),
+        EBin(_, a, b) | EPipe(a, b) | EIndex(a, b) => expr_spans(a) + expr_spans(b),
+        EUn(_, a) => expr_spans(a),
+        ECall(f, args) => expr_spans(f) + all(args, expr_spans),
+        EMethod(r, _, name, args) => expr_spans(r) + sp(name) + all(args, expr_spans),
+        EField(r, _, name) => expr_spans(r) + sp(name),
+        ETry(a, c) => expr_spans(a) + maybe(c, expr_spans),
+        EIf(c, b, other) => expr_spans(c) + block_spans(b) + maybe(other, expr_spans),
+        EMatch(s, arms) => expr_spans(s) + all(arms, |a| pat_spans(a.pat) + maybe(a.guard, expr_spans) + expr_spans(a.body)),
+        EBlock(b) => block_spans(b),
+        EClosure(params, body) => all(params, |p| sp(p.span) + maybe(p.ty, ty_spans)) + expr_spans(body),
+        EStruct(_, name, fields) => sp(name) + all(fields, init_spans),
+        EWith(b, fields) => expr_spans(b) + all(fields, init_spans),
+        EGroup(_, _, until, b) => maybe(until, |d| expr_spans(d.clock) + expr_spans(d.ms)) + block_spans(b),
+        ESelect(arms) => all(arms, |a| sp(a.span) + sel_spans(a.op) + maybe(a.guard, expr_spans) + expr_spans(a.body)),
+        ESafe(b, _, rest) => expr_spans(b) + expr_spans(rest),
+        ENamed(_, name, x) => sp(name) + expr_spans(x),
+        EInt(_) | EFloat(_) | EBool(_) | EUnit | EVar(_) => "",
+    }
+}
+
+fn sel_spans(o: ast.SelOp) -> Str {
+    match o {
+        SelRecv(bound, ch) => maybe(bound, |b| sp(b.span)) + expr_spans(ch),
+        SelSend(ch, v) => expr_spans(ch) + expr_spans(v),
+        SelAfter(clock, ms) => expr_spans(clock) + expr_spans(ms),
+        SelDefault => "",
+    }
+}
+
+fn block_spans(b: ast.Block) -> Str {
+    sp(b.span) + all(b.stmts, stmt_spans) + maybe(b.tail, expr_spans)
+}
+
+fn stmt_spans(s: ast.Stmt) -> Str {
+    sp(s.span) + match s.desc {
+        SLet(_, _, name, t, e) => sp(name) + maybe(t, ty_spans) + expr_spans(e),
+        SAssign(a, b) => expr_spans(a) + expr_spans(b),
+        SExpr(e) => expr_spans(e),
+        SReturn(e) => maybe(e, expr_spans),
+        SWhile(c, b) => expr_spans(c) + block_spans(b),
+        SFor(_, name, e, b) => sp(name) + expr_spans(e) + block_spans(b),
+        SLetPat(p, e) => pat_spans(p) + expr_spans(e),
+        SForPat(p, e, b) => pat_spans(p) + expr_spans(e) + block_spans(b),
+        SDefer(b) => block_spans(b),
+        SBreak | SContinue => "",
+    }
+}
+
+fn param_spans(p: ast.Param) -> Str {
+    sp(p.span) + ty_spans(p.ty)
+}
+
+fn bound_spans(bs: List[ast.Bound]) -> Str {
+    all(bs, |b| all(b.ifaces, ty_spans))
+}
+
+fn item_spans(i: ast.Item) -> Str {
+    match i {
+        IFn(d) => sp(d.span) + all(d.params, param_spans) + maybe(d.ret, ty_spans) + bound_spans(d.bounds) + maybe(d.table, |t| pat_spans(t.pat) + expr_spans(t.cases)) + block_spans(d.body),
+        IStruct(s) => sp(s.span) + bound_spans(s.bounds) + all(s.fields, |f| sp(f.span) + ty_spans(f.ty)),
+        IEnum(e) => sp(e.span) + bound_spans(e.bounds) + all(e.variants, |v| sp(v.span) + all(v.payload, ty_spans)),
+        IIface(f) => sp(f.span) + all(f.methods, |m| sp(m.span) + all(m.params, param_spans) + maybe(m.ret, ty_spans)),
+        IType(a) => sp(a.span) + ty_spans(a.body),
+    }
+}
+
+// One line per `use` and per item, each listing the spans in it.
+pub fn spans(f: ast.File) -> List[Str] {
+    f.uses.map(|u| "  " + sp(u.span).trim()) + f.items.map(|i| "  " + item_spans(i).trim())
+}

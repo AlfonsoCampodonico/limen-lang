@@ -1,0 +1,4 @@
+fn main() {
+    for (k, Some(v)) in m {
+    }
+}

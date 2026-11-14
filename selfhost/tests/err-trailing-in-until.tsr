@@ -1,0 +1,4 @@
+fn main() {
+    group g until clock.after(ms).then { |x| x } {
+    }
+}

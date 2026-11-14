@@ -1,0 +1,66 @@
+// match guards, select, groups, loops and defer.
+fn main(root: Root) {
+    let label = match order {
+        Some(o) if o.total > 1000 => "large",
+        Some(o) if o.paid => "paid"
+        Some(_) => "open",
+        None => "none",
+    }
+    match shape {
+        Shape.Circle(r) => 3.14 * r * r,
+        Rect(w, h) => w * h,
+        Point => 0.0,
+        json.Num(n) => n,
+        (true, _) => 1.0,
+        (-5, "x", "", false) => 2.0,
+        ((a, b), c) => 3.0,
+        (x) => x,
+        other => { more = false },
+    }
+    let reply = select {
+        r = replies.recv() => r ?? "closed",
+        _ = done.recv() if open => "done",
+        ticks.recv() => "tick",
+        out.send(v) if ready => "sent"
+        clock.after(500) => "timed out",
+    }
+    let poll = select {
+        v = c.recv() => v,
+        _ => None,
+    }
+    let results = group g interleaved until clock.after(ms) {
+        g.go { fetch(net, url) }
+    }
+    group g {
+        g.go(|| work())
+    }
+    group g interleaved {
+    }
+    group g until root.clock.after(deadline - now) {
+    }
+    while i < n {
+        i = i + 1
+        if i == 3 {
+            continue
+        }
+        break
+    }
+    for i in 0..<n {
+    }
+    for (k, v) in m.entries() {
+    }
+    for (_, (a, b)) in pairs {
+    }
+    let (q, _) = divmod(17, 5)
+    let mut (x, y) = t
+    let mut total: Map[Str, List[Int]] = map()
+    defer log.flush()
+    defer count = count + 1
+    defer {
+        log.add("done")
+    }
+    if (xs.filter { |x| x > 1 }).len() > 0 {
+    }
+    if (Point { x: 1 }) == p {
+    }
+}

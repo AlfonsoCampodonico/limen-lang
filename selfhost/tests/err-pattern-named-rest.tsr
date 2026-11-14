@@ -1,0 +1,5 @@
+fn f(t: (Int, Int)) -> Int {
+    match t {
+        (a, ..rest) => a,
+    }
+}

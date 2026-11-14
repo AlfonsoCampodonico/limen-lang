@@ -1,0 +1,5 @@
+fn f(xs: List[Int]) -> Int {
+    match xs {
+        [] | => 0,
+    }
+}

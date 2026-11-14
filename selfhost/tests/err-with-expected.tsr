@@ -1,0 +1,3 @@
+fn main() {
+    let q = { p q with x: 1 }
+}

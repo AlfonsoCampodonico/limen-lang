@@ -1,0 +1,5 @@
+fn main() {
+    select {
+        v = ch.send(1) => v,
+    }
+}

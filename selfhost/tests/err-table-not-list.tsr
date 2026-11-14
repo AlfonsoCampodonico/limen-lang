@@ -1,0 +1,2 @@
+test "t" for x in cases() {
+}

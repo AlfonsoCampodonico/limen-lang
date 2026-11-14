@@ -40,7 +40,7 @@ fn keywords() -> List[Str] {
 }
 
 fn two_byte_symbols() -> List[Str] {
-    ["->", "=>", "==", "!=", "<=", ">=", "&&", "||", "??", "|>"]
+    ["->", "=>", "==", "!=", "<=", ">=", "&&", "||", "??", "|>", ".."]
 }
 
 fn is_digit(b: Int) -> Bool {
@@ -143,7 +143,7 @@ fn skip_braces(bs: List[Int], i: Int) -> Option[Int] {
 fn after_dot(toks: List[Token], lo: Int) -> Bool {
     match toks.last() {
         Some(t) => match t.kind {
-            Symbol(s) => t.hi == lo && (s == "." || s == "?."),
+            Symbol("." | "?.") => t.hi == lo,
             _ => false,
         },
         None => false,
@@ -312,4 +312,29 @@ pub fn lex(src: Str) -> Result[List[Token], LexError] {
     }
     toks.push(Token { kind: End, lo: n, hi: n, nl })
     Ok(toks)
+}
+
+// The tokens of `src` as if it started at byte `base` of a larger text. The
+// parser lexes the code of an interpolation `{...}` this way, so its tokens
+// carry positions in the file.
+pub fn lex_at(src: Str, base: Int) -> Result[List[Token], LexError] {
+    match lex(src) {
+        Ok(toks) => Ok(toks.map(|t| shifted(t, base))),
+        Err(e) => Err(err(e.code, e.lo + base, e.hi + base)),
+    }
+}
+
+fn shifted(t: Token, base: Int) -> Token {
+    let kind = match t.kind {
+        StrLit(parts) => StrLit(parts.map(|p| shifted_part(p, base))),
+        k => k,
+    }
+    Token { kind, lo: t.lo + base, hi: t.hi + base, nl: t.nl }
+}
+
+fn shifted_part(p: Part, base: Int) -> Part {
+    match p {
+        Interp(code, at) => Interp(code, at + base),
+        lit => lit,
+    }
 }

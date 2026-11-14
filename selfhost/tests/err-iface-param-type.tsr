@@ -1,0 +1,3 @@
+interface S {
+    fn scale(self, by) -> Float
+}

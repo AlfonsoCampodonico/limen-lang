@@ -1,0 +1,32 @@
+// Trailing closures, named arguments and pipes.
+fn main(root: Root) {
+    let big = xs.filter { |x| x > 10 }
+    let r = catch { risky() }
+    let typed = xs.map { |x: Int, y: List[Int]| x + y.len() }
+    let none = run() { || 1 }
+    each(rows) { |row|
+        out.print(row.name)
+    }
+    retry(times: 3) { |n| attempt(n) }
+    connect(host, retries: 3, port: 443)
+    server.describe(prefix: "to", upper: true)
+    let report = read_orders(text)
+        |> list.sort_by(|a, b| a.total > b.total)
+        |> top(10)
+        |> summarize
+    let doubled = 3 |> (|n| n * 2)
+    let parsed = text |> parse()? "parsing"
+    let checked = text |> parse?
+    let total = a + b |> f
+    let chained = xs
+        .map(|x| x * 2)
+        ?.first()
+        .sum()
+    f
+    (x)
+    a
+    -1
+    let m = r.m
+    let t = p.0.1
+    let s = q?.0
+}

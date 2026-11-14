@@ -1,0 +1,16 @@
+fn f(s: Stmt, t: (Int, Int, Int)) -> Int {
+    match s {
+        SLet(name, ..) => 1,
+        SFor(.., body) => 2,
+        SWhile(cond, .., body) => 3,
+        SBreak(..) => 4,
+        Big(a, b, ..,) => 5,
+        _ => 0,
+    }
+    match t {
+        (a, ..) => a,
+        (.., z) => z,
+        (..) => 0,
+        (a, .., z) => a + z,
+    }
+}

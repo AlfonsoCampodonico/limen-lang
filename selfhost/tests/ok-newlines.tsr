@@ -1,0 +1,42 @@
+// Where a newline ends an expression and where it does not.
+fn main() {
+    let a = b +
+        c
+    let d = e
+        .f()
+        ?.g
+    let h = i
+        |> j
+    let k = json
+        .Field { key: "k" }
+    let l = json.
+        Field
+    let m = n?
+    "context on the next line is a new statement"
+    let o = [
+        1
+        2,
+        3
+    ]
+    let p = Point {
+        x: 1
+        y: 2
+    }
+    let q = f(
+        a
+        b: 2
+    )
+    let r = xs.map { |x|
+        x
+    }
+    let s = t
+    { u }
+    let v = Map[Int]
+    let w: List[
+        Int
+    ] = []
+    match x {
+        1 => a
+        2 => b
+    }
+}

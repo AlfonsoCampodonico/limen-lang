@@ -1,0 +1,5 @@
+foreign "m" {
+    struct P[T] {
+        x: T,
+    }
+}

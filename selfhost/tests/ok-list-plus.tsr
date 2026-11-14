@@ -1,0 +1,4 @@
+fn f(xs: List[Int], s: Str) -> List[Int] {
+    let i = s.last_index_of("/") ?? 0
+    xs + [i] + []
+}

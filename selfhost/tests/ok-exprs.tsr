@@ -1,0 +1,61 @@
+// `with`, safe navigation, `?`, operators and literals.
+struct Point {
+    x: Int,
+    y: Int,
+}
+
+fn main() {
+    let p = Point { x: 1, y: 2 }
+    let q = { p with x: 3, y }
+    let r = { p with
+        x: 4,
+    }
+    let block = { p }
+    let nested = { f(a, { b with c: 1 }) with d: 2 }
+    let city = user?.address?.city ?? "unknown"
+    let n = find(id)?.address?.city?
+    let len = name?.len() + 1
+    let deep = a?.b(c)[d].e?.f
+    let k = m.get(k) ?? 0 + 1
+    let range = 0..<n + 1
+    let tried = x?..<n
+    let ok = !a && b || c == d != e
+    let cmp = a < b && c <= d && e > f && g >= h
+    let math = -a * b / c % d - e
+    let floats = [1.5, 2.0e10, 3E-2, 1_000.000_1, 0.1, 1e400, 4.9e-324, 1e-310, 123456789.123]
+    let ints = [0, 1_000_000, 9223372036854775807]
+    let unit = ()
+    let tuple = (1, "a", 1.5)
+    let one = (1)
+    let empty: List[Int] = []
+    let mod = json.Field { key: "k", value: v }
+    let notlit = json.field
+    let shorthand = Point { x, y }
+    let close = |x| x + 1
+    let typed = |x: Int, f: fn(Int) -> Int| f(x)
+    let none = || 0
+    let s = "plain \"quoted\" \\ tab\t nl\n cr\r nul\0 brace \{ \} é ü 日本"
+    let interp = "a {b} c {d.e(f)} {g ?? "h {i}"} {"{"{j}"}"}"
+    let safes = "{a?.b} {c?.d?.e}"
+    let after = x?.y
+    let ctx = load(path)? "reading {path}"
+    xs[i][j] = v
+    m[k].hits = m[k].hits + 1
+    return
+}
+
+fn early(x: Int) -> Int {
+    if x > 0 {
+        return x
+    } else if x < 0 {
+        return -x
+    }
+    else {
+        return 0;
+    }
+}
+
+fn semi() {
+    let a = 1; let b = 2;
+    a; b
+}

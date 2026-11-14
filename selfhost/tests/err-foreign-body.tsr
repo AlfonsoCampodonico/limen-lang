@@ -1,0 +1,5 @@
+foreign "c" {
+    fn abs(x: Int32) -> Int32 {
+        x
+    }
+}
