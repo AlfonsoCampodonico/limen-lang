@@ -1,0 +1,431 @@
+// Command-line flags: declare what a program takes, parse `root.args()`,
+// and print help built from the declarations. Pure: the program passes the
+// arguments in and prints what comes back.
+//
+//     let spec = flags.spec("grep", "Print the lines of FILE that match PATTERN.")
+//         .flag("ignore-case", "i", "match without regard to case")
+//         .option("max", "m", "stop after NUM matching lines").value_name("NUM").default("0")
+//         .positional("PATTERN", "what to look for")
+//         .rest("FILE", "files to read")
+//     let p = spec.parse(root.args())?
+//     if p.help {
+//         root.stdout.print(spec.help())
+//         return Ok(())
+//     }
+//     let max = p.int("max")?
+//
+// Long flags are `--name value` or `--name=value`, and `--name` for a
+// boolean flag. Short ones are `-m value` or `-mvalue`, and boolean ones
+// combine: `-iv`. Flags and positional arguments may come in any order;
+// after `--` everything is positional, and so is `-` alone and a negative
+// number such as `-5` when no short flag is a digit. `-h` and `--help` set
+// `help` unless the program declares them itself.
+
+// What a program takes. Build it with `spec` and the methods below; each
+// returns a new Spec.
+pub struct Spec {
+    program: Str,
+    about: Str,
+    flags: List[Flag],
+    positionals: List[Arg],
+    // the name of the arguments after the positional ones, "" for none
+    rest_name: Str,
+    rest_help: Str,
+}
+
+// One flag: a boolean one (`takes_value` false) or one with a value.
+pub struct Flag {
+    name: Str,
+    // one character, or "" for none
+    short: Str,
+    help: Str,
+    takes_value: Bool,
+    value_name: Str,
+    default: Option[Str],
+    required: Bool,
+}
+
+// A positional argument, required, in order.
+pub struct Arg {
+    name: Str,
+    help: Str,
+}
+
+// The flags and arguments a command line gave.
+pub struct Parsed {
+    spec: Spec,
+    // each flag given, with its values in order (`"true"` for a boolean one)
+    given: Map[Str, List[Str]],
+    // every positional argument, in order
+    args: List[Str],
+    // whether `-h` or `--help` was given; the other checks are skipped then
+    help: Bool,
+}
+
+// A spec for `program`, with a sentence for the help.
+pub fn spec(program: Str, about: Str) -> Spec {
+    Spec { program, about, flags: [], positionals: [], rest_name: "", rest_help: "" }
+}
+
+// A boolean flag, `--name` (and `-short` unless `short` is ""): `p.bool(name)`.
+pub fn flag(self: Spec, name: Str, short: Str, help: Str) -> Spec {
+    self.add(Flag { name, short, help, takes_value: false, value_name: "", default: None, required: false })
+}
+
+// A flag with a value, `--name VALUE`: `p.get(name)`, `p.int(name)`, ...
+pub fn option(self: Spec, name: Str, short: Str, help: Str) -> Spec {
+    self.add(Flag { name, short, help, takes_value: true, value_name: name.to_upper().replace("-", "_"), default: None, required: false })
+}
+
+fn add(self: Spec, f: Flag) -> Spec {
+    if f.name == "" || f.name.starts_with("-") || f.name.contains("=") || f.name.contains(" ") {
+        panic("flags: `{f.name}` is not a flag name")
+    }
+    if f.short.len() > 1 || f.short == "-" || f.short == "=" {
+        panic("flags: the short form of --{f.name} must be one character, not `{f.short}`")
+    }
+    if self.flags.any(|g| g.name == f.name || (f.short != "" && g.short == f.short)) {
+        panic("flags: --{f.name} or -{f.short} is declared twice")
+    }
+    let mut flags = self.flags
+    flags.push(f)
+    { self with flags }
+}
+
+// The last flag declared, which `what` changes: it must take a value.
+fn last_flag(self: Spec, what: Str) -> Flag {
+    match self.flags.last() {
+        Some(f) => {
+            if !f.takes_value {
+                panic("flags: {what} needs a flag with a value, and --{f.name} is boolean")
+            }
+            f
+        },
+        None => panic("flags: {what} comes after the flag it is for"),
+    }
+}
+
+fn set_last(self: Spec, f: Flag) -> Spec {
+    let mut flags = self.flags
+    flags[flags.len() - 1] = f
+    { self with flags }
+}
+
+// The value the last flag declared has when it is not given.
+pub fn default(self: Spec, value: Str) -> Spec {
+    let f = self.last_flag("default")
+    self.set_last({ f with default: Some(value) })
+}
+
+// The last flag declared must be given (a default does not count).
+pub fn required(self: Spec) -> Spec {
+    let f = self.last_flag("required")
+    self.set_last({ f with required: true })
+}
+
+// The name the help shows for the last flag's value: `--max NUM`.
+pub fn value_name(self: Spec, name: Str) -> Spec {
+    let f = self.last_flag("value_name")
+    self.set_last({ f with value_name: name })
+}
+
+// A required positional argument, after those declared before it.
+pub fn positional(self: Spec, name: Str, help: Str) -> Spec {
+    let mut positionals = self.positionals
+    positionals.push(Arg { name, help })
+    { self with positionals }
+}
+
+// Any number of arguments after the positional ones (none without this):
+// `p.rest()`.
+pub fn rest(self: Spec, name: Str, help: Str) -> Spec {
+    { self with rest_name: name, rest_help: help }
+}
+
+// ---------- parsing ----------
+
+fn find_long(self: Spec, name: Str) -> Option[Flag] {
+    self.flags.find(|f| f.name == name)
+}
+
+fn find_short(self: Spec, c: Str) -> Option[Flag] {
+    self.flags.find(|f| f.short == c)
+}
+
+fn is_negative_number(self: Spec, a: Str) -> Bool {
+    a.len() > 1 && a.slice(1, a.len()).parse_float().is_some() && !self.flags.any(|f| f.short != "" && text_is_digit(f.short))
+}
+
+fn text_is_digit(s: Str) -> Bool {
+    s >= "0" && s <= "9"
+}
+
+fn give(given: Map[Str, List[Str]], name: Str, value: Str) -> Map[Str, List[Str]] {
+    let mut g = given
+    let mut vs = g.get(name) ?? []
+    vs.push(value)
+    g[name] = vs
+    g
+}
+
+// The flags and arguments in `args` (`root.args()`). An unknown flag, a
+// flag without its value, a value for a boolean flag, a missing required
+// flag or argument, or an argument too many is an error saying which.
+pub fn parse(self: Spec, args: List[Str]) -> Result[Parsed, Str] {
+    let own_help = self.find_long("help").is_some()
+    let own_h = self.find_short("h").is_some()
+    let mut given: Map[Str, List[Str]] = map()
+    let mut positional: List[Str] = []
+    let mut help = false
+    let mut i = 0
+    let mut options = true
+    while i < args.len() {
+        let a = args[i]
+        i = i + 1
+        if !options || a == "-" || !a.starts_with("-") || self.is_negative_number(a) {
+            positional.push(a)
+        } else if a == "--" {
+            options = false
+        } else if a.starts_with("--") {
+            let body = a.slice(2, a.len())
+            let (name, inline) = match body.index_of("=") {
+                Some(k) => (body.slice(0, k), Some(body.slice(k + 1, body.len()))),
+                None => (body, None),
+            }
+            match self.find_long(name) {
+                Some(f) => {
+                    if f.takes_value {
+                        match inline {
+                            Some(v) => {
+                                given = give(given, name, v)
+                            },
+                            None => {
+                                if i >= args.len() {
+                                    return Err("flags: --{name} needs a value")
+                                }
+                                given = give(given, name, args[i])
+                                i = i + 1
+                            },
+                        }
+                    } else {
+                        if inline.is_some() {
+                            return Err("flags: --{name} takes no value")
+                        }
+                        given = give(given, name, "true")
+                    }
+                },
+                None => {
+                    if name == "help" && !own_help {
+                        help = true
+                    } else {
+                        return Err("flags: unknown flag --{name}")
+                    }
+                },
+            }
+        } else {
+            // one or more short flags: `-v`, `-iv`, `-m5`, `-m 5`
+            let chars = a.slice(1, a.len()).chars()
+            let mut j = 0
+            while j < chars.len() {
+                let c = chars[j]
+                j = j + 1
+                match self.find_short(c) {
+                    Some(f) => {
+                        if f.takes_value {
+                            let attached = chars.skip(j).join("")
+                            if attached != "" {
+                                given = give(given, f.name, attached)
+                            } else if i < args.len() {
+                                given = give(given, f.name, args[i])
+                                i = i + 1
+                            } else {
+                                return Err("flags: -{c} needs a value")
+                            }
+                            j = chars.len()
+                        } else {
+                            given = give(given, f.name, "true")
+                        }
+                    },
+                    None => {
+                        if c == "h" && !own_h {
+                            help = true
+                        } else {
+                            return Err("flags: unknown flag -{c}")
+                        }
+                    },
+                }
+            }
+        }
+    }
+    if !help {
+        for f in self.flags {
+            if f.required && !given.contains(f.name) {
+                return Err("flags: --{f.name} is required")
+            }
+        }
+        if positional.len() < self.positionals.len() {
+            return Err("flags: missing {self.positionals[positional.len()].name}")
+        }
+        if positional.len() > self.positionals.len() && self.rest_name == "" {
+            return Err("flags: unexpected argument `{positional[self.positionals.len()]}`")
+        }
+    }
+    Ok(Parsed { spec: self, given, args: positional, help })
+}
+
+// ---------- reading what was parsed ----------
+
+fn declared(self: Parsed, name: Str) -> Flag {
+    match self.spec.find_long(name) {
+        Some(f) => f,
+        None => panic("flags: no flag --{name} was declared"),
+    }
+}
+
+// Whether the boolean flag `name` was given.
+pub fn bool(self: Parsed, name: Str) -> Bool {
+    let f = self.declared(name)
+    if f.takes_value {
+        panic("flags: --{name} takes a value; read it with get, str, int or float")
+    }
+    self.given.contains(name)
+}
+
+// How many times the flag `name` was given: `-vvv` is 3.
+pub fn count(self: Parsed, name: Str) -> Int {
+    let _ = self.declared(name)
+    (self.given.get(name) ?? []).len()
+}
+
+// The value of the flag `name`: the last one given, else its default.
+pub fn get(self: Parsed, name: Str) -> Option[Str] {
+    let f = self.declared(name)
+    match self.given.get(name) {
+        Some(vs) => vs.last(),
+        None => f.default,
+    }
+}
+
+// `get(name)`, or "" when the flag has no value.
+pub fn str(self: Parsed, name: Str) -> Str {
+    self.get(name) ?? ""
+}
+
+// Every value given for the flag `name`, in order (`--tag a --tag b`), or
+// its default alone when none was.
+pub fn all(self: Parsed, name: Str) -> List[Str] {
+    let f = self.declared(name)
+    match self.given.get(name) {
+        Some(vs) => vs,
+        None => match f.default {
+            Some(d) => [d],
+            None => [],
+        },
+    }
+}
+
+// The value of the flag `name` as a whole number. An error if it has none
+// or it is not one.
+pub fn int(self: Parsed, name: Str) -> Result[Int, Str] {
+    match self.get(name) {
+        Some(v) => match v.parse_int() {
+            Some(n) => Ok(n),
+            None => Err("flags: --{name} must be a whole number, not `{v}`"),
+        },
+        None => Err("flags: --{name} is not set"),
+    }
+}
+
+// The value of the flag `name` as a number.
+pub fn float(self: Parsed, name: Str) -> Result[Float, Str] {
+    match self.get(name) {
+        Some(v) => match v.parse_float() {
+            Some(x) => Ok(x),
+            None => Err("flags: --{name} must be a number, not `{v}`"),
+        },
+        None => Err("flags: --{name} is not set"),
+    }
+}
+
+// The positional argument declared as `name`.
+pub fn arg(self: Parsed, name: Str) -> Str {
+    for (i, p) in self.spec.positionals.with_index() {
+        if p.name == name {
+            return self.args.get(i) ?? ""
+        }
+    }
+    panic("flags: no positional argument {name} was declared")
+}
+
+// The arguments after the declared positional ones.
+pub fn rest(self: Parsed) -> List[Str] {
+    self.args.skip(self.spec.positionals.len())
+}
+
+// ---------- help ----------
+
+// The usage line: `Usage: grep [options] PATTERN [FILE...]`.
+pub fn usage(self: Spec) -> Str {
+    let mut parts = ["Usage:", self.program, "[options]"]
+    for p in self.positionals {
+        parts.push(p.name)
+    }
+    if self.rest_name != "" {
+        parts.push("[{self.rest_name}...]")
+    }
+    parts.join(" ")
+}
+
+// The full help: the usage line, the sentence about the program, the
+// arguments and every flag with its help, default and whether it is
+// required.
+pub fn help(self: Spec) -> Str {
+    let mut args: List[(Str, Str)] = self.positionals.map(|p| (p.name, p.help))
+    if self.rest_name != "" {
+        args.push(("{self.rest_name}...", self.rest_help))
+    }
+    let mut opts: List[(Str, Str)] = self.flags.map(|f| (flag_left(f), flag_right(f)))
+    let own_help = self.find_long("help").is_some()
+    let own_h = self.find_short("h").is_some()
+    if !own_help || !own_h {
+        let left = if own_h { "    --help" } else if own_help { "-h" } else { "-h, --help" }
+        opts.push((left, "show this help"))
+    }
+    let width = (args + opts).map(|p| p.0.len()).max() ?? 0
+    let mut out = self.usage() + "\n"
+    if self.about != "" {
+        out = out + "\n" + self.about + "\n"
+    }
+    if args.len() > 0 {
+        out = out + "\nArguments:\n" + args.map(|p| row(p, width)).join("")
+    }
+    out = out + "\nOptions:\n" + opts.map(|p| row(p, width)).join("")
+    out
+}
+
+fn flag_left(f: Flag) -> Str {
+    let short = if f.short == "" { "    " } else { "-{f.short}, " }
+    short + "--" + f.name + if f.takes_value { " " + f.value_name } else { "" }
+}
+
+fn flag_right(f: Flag) -> Str {
+    let mut s = f.help
+    match f.default {
+        Some(d) => {
+            s = s + " (default: {d})"
+        },
+        None => (),
+    }
+    if f.required {
+        s = s + " (required)"
+    }
+    s
+}
+
+fn row(p: (Str, Str), width: Int) -> Str {
+    let mut left = p.0
+    while left.len() < width {
+        left = left + " "
+    }
+    if p.1 == "" { "  " + p.0 + "\n" } else { "  " + left + "  " + p.1 + "\n" }
+}

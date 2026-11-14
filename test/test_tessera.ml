@@ -3149,6 +3149,63 @@ fn main(root: Root) {
 }
 |v}
     "https|ana|s@cret|Example.com|Some(8443)|/docs/a%20b|q=1&q=2|top => https://ana:s%40cret@Example.com:8443/docs/a%20b?q=1&q=2#top\nhttp|||::1|Some(8080)||| => http://[::1]:8080\nhttp|||fe80::1%25en0|None|/x|| => http://[fe80::1%25en0]/x\n||||None|/a/b|x=1|f => /a/b?x=1#f\n|||cdn.example.com|None|/lib.js|| => //cdn.example.com/lib.js\nmailto||||None|ada@example.com|| => mailto:ada@example.com\nfile||||None|/etc/hosts|| => file:///etc/hosts\nurn||||None|isbn:0451450523|| => urn:isbn:0451450523\nhttp|||host|None||x| => http://host?x\nhttp|||h|Some(80)|/p:q|| => http://h:80/p:q\n||||None|rel/path|| => rel/path\n||||None||| => \nurl: `99999` is not a port number (0 to 65535) at byte 9\nurl: `8x` is not a port number (0 to 65535) at byte 9\n||||None|1http://x|| => 1http://x\nurl: `ht tp` is not a valid scheme\nurl: `[` without a closing `]` at byte 7\nurl: expected `:` after `]` at byte 12\nurl: a space in the host at byte 8\nurl: a control character at byte 9\nurl: `%` without two hex digits at byte 1 in the user\na%20b%26c%2Fd%3D%C3%A9~ /my%20files/a%2Bb Ok(\"a b/c+d\") Err(\"url: `%` without two hex digits at byte 3\") Err(\"url: `%` without two hex digits at byte 0\") Ok(\"\\226\\130\\172\")\n[(\"q\", \"a b\"), (\"tag\", \"x\"), (\"tag\", \"y\"), (\"flag\", \"\"), (\"e\", \"=&\"), (\"\", \"v\")]\nSome(\"x\") [\"x\", \"y\"] None Some(\"\")\nq=a%20b&n=1&k%26%3D=v%2F%C3%A9\nErr(\"url: `%` without two hex digits at byte 0 of `a=%zz`\") Ok([])\nOk([(\"a\", \"1\"), (\"b\", \"2\")])\nSome(443) None\n";
+  out "std-flags" ~grants:{ Interp.no_grants with args = [ "-o"; "x"; "pat"; "f1" ] }
+    {v|use flags
+
+fn grep_spec() -> flags.Spec {
+    flags.spec("grep", "Print the lines of FILE that match PATTERN.")
+        .flag("ignore-case", "i", "match without regard to case")
+        .flag("verbose", "v", "say more")
+        .option("max", "m", "stop after NUM matching lines").value_name("NUM").default("0")
+        .option("tag", "", "a tag to add")
+        .option("ratio", "r", "a ratio")
+        .option("out", "o", "where to write").required()
+        .positional("PATTERN", "what to look for")
+        .rest("FILE", "files to read")
+}
+
+fn show(args: List[Str]) -> Str {
+    match grep_spec().parse(args) {
+        Ok(p) => "ok help={p.help} i={p.bool("ignore-case")} v={p.count("verbose")} max={p.int("max")} tag={p.all("tag")} ratio={p.float("ratio")} out={p.str("out")} pattern={p.arg("PATTERN")} rest={p.rest()} args={p.args}",
+        Err(e) => e,
+    }
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    for args in [
+        ["-o", "x", "foo"],
+        ["foo", "a.txt", "-iv", "--max=3", "b.txt", "-o", "out.txt", "--tag", "a", "--tag=b", "-vv"],
+        ["-m5", "-ox", "-r", "0.5", "--", "-i", "--max"],
+        ["-o", "x", "-", "-5", "pat"],
+        ["--help"],
+        ["-h", "--max", "zz"],
+        ["-o", "x", "--max", "zz", "p"],
+        ["-o", "x", "-r", "half", "p"],
+        ["foo"],
+        ["-o", "x"],
+        ["-o"],
+        ["--out"],
+        ["--nope", "x"],
+        ["-x"],
+        ["-o", "x", "--verbose=yes", "p"],
+    ] {
+        out.print("{args} -> {show(args)}")
+    }
+    out.print(grep_spec().usage())
+    out.print(grep_spec().help())
+    let simple = flags.spec("hello", "").flag("loud", "", "").flag("help", "", "custom help")
+    out.print(simple.help())
+    out.print("{simple.parse(["a"])}")
+    out.print("{simple.parse(["-h"]).map(|p| p.help)} {simple.parse(["--help"]).map(|p| p.bool("help"))}")
+    out.print("{grep_spec().parse(root.args()).map(|p| "{p.arg("PATTERN")} {p.str("out")} {p.rest()}")}")
+}
+|v}
+    "[\"-o\", \"x\", \"foo\"] -> ok help=false i=false v=0 max=Ok(0) tag=[] ratio=Err(\"flags: --ratio is not set\") out=x pattern=foo rest=[] args=[\"foo\"]\n[\"foo\", \"a.txt\", \"-iv\", \"--max=3\", \"b.txt\", \"-o\", \"out.txt\", \"--tag\", \"a\", \"--tag=b\", \"-vv\"] -> ok help=false i=true v=3 max=Ok(3) tag=[\"a\", \"b\"] ratio=Err(\"flags: --ratio is not set\") out=out.txt pattern=foo rest=[\"a.txt\", \"b.txt\"] args=[\"foo\", \"a.txt\", \"b.txt\"]\n[\"-m5\", \"-ox\", \"-r\", \"0.5\", \"--\", \"-i\", \"--max\"] -> ok help=false i=false v=0 max=Ok(5) tag=[] ratio=Ok(0.5) out=x pattern=-i rest=[\"--max\"] args=[\"-i\", \"--max\"]\n[\"-o\", \"x\", \"-\", \"-5\", \"pat\"] -> ok help=false i=false v=0 max=Ok(0) tag=[] ratio=Err(\"flags: --ratio is not set\") out=x pattern=- rest=[\"-5\", \"pat\"] args=[\"-\", \"-5\", \"pat\"]\n[\"--help\"] -> ok help=true i=false v=0 max=Ok(0) tag=[] ratio=Err(\"flags: --ratio is not set\") out= pattern= rest=[] args=[]\n[\"-h\", \"--max\", \"zz\"] -> ok help=true i=false v=0 max=Err(\"flags: --max must be a whole number, not `zz`\") tag=[] ratio=Err(\"flags: --ratio is not set\") out= pattern= rest=[] args=[]\n[\"-o\", \"x\", \"--max\", \"zz\", \"p\"] -> ok help=false i=false v=0 max=Err(\"flags: --max must be a whole number, not `zz`\") tag=[] ratio=Err(\"flags: --ratio is not set\") out=x pattern=p rest=[] args=[\"p\"]\n[\"-o\", \"x\", \"-r\", \"half\", \"p\"] -> ok help=false i=false v=0 max=Ok(0) tag=[] ratio=Err(\"flags: --ratio must be a number, not `half`\") out=x pattern=p rest=[] args=[\"p\"]\n[\"foo\"] -> flags: --out is required\n[\"-o\", \"x\"] -> flags: missing PATTERN\n[\"-o\"] -> flags: -o needs a value\n[\"--out\"] -> flags: --out needs a value\n[\"--nope\", \"x\"] -> flags: unknown flag --nope\n[\"-x\"] -> flags: unknown flag -x\n[\"-o\", \"x\", \"--verbose=yes\", \"p\"] -> flags: --verbose takes no value\nUsage: grep [options] PATTERN [FILE...]\nUsage: grep [options] PATTERN [FILE...]\n\nPrint the lines of FILE that match PATTERN.\n\nArguments:\n  PATTERN            what to look for\n  FILE...            files to read\n\nOptions:\n  -i, --ignore-case  match without regard to case\n  -v, --verbose      say more\n  -m, --max NUM      stop after NUM matching lines (default: 0)\n      --tag TAG      a tag to add\n  -r, --ratio RATIO  a ratio\n  -o, --out OUT      where to write (required)\n  -h, --help         show this help\n\nUsage: hello [options]\n\nOptions:\n      --loud\n      --help  custom help\n  -h          show this help\n\nErr(\"flags: unexpected argument `a`\")\nOk(true) Ok(true)\nOk(\"pat x [\\\"f1\\\"]\")\n";
+  out "example-checksum" ~grants:{ Interp.no_grants with args = [ "--text"; "abc" ] } (example "checksum.tsr")
+    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  -\n";
+  out "example-checksum-hmac" ~grants:{ Interp.no_grants with args = [ "-k"; "key"; "-a"; "sha1"; "-b"; "-t"; "The quick brown fox jumps over the lazy dog" ] } (example "checksum.tsr")
+    "3nybhbi3iqa8ino29wqQcBydtNk=  -\n";
   out "std-http-keepalive-stream" ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] }
     {v|use http
 

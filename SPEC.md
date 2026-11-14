@@ -1690,7 +1690,7 @@ The standard library is checked like a dependency. `src/std/tessera.toml` lists 
 
 | Module | May take |
 | --- | --- |
-| `json`, `list`, `text`, `format`, `regex`, `errors`, `hex`, `base64`, `hash`, `csv`, `url` | nothing: pure |
+| `json`, `list`, `text`, `format`, `regex`, `errors`, `hex`, `base64`, `hash`, `csv`, `url`, `flags` | nothing: pure |
 | `http` | `net` (Net, Conn) and `listen` (Listener, Conn) |
 | `time` | `clock` and `fs`, for `within` and `load_zone` alone |
 | `sql` | `fs` (the database file's directory); trusted with C (`[trust] foreign = ["sql"]`) to call SQLite |
@@ -1990,6 +1990,48 @@ fn main(root: Root) -> Result[(), Str] {
     Ok(())
 }
 ```
+
+### flags
+
+Command-line flags. A program declares what it takes, parses `root.args()` and prints help built from the declarations. Pure: the arguments go in and the help comes back as text.
+
+```
+use flags
+
+fn main(root: Root) -> Result[Int, Str] {
+    let spec = flags.spec("grep", "Print the lines of FILE that match PATTERN.")
+        .flag("ignore-case", "i", "match without regard to case")
+        .option("max", "m", "stop after NUM matching lines").value_name("NUM").default("0")
+        .positional("PATTERN", "what to look for")
+        .rest("FILE", "files to read")
+    let p = spec.parse(root.args())?
+    if p.help {
+        root.stdout.print(spec.help())
+        return Ok(0)
+    }
+    let max = p.int("max")?
+    ...
+}
+```
+
+- Long flags are `--name value` or `--name=value`, and `--name` alone for a boolean flag; short ones are `-m value` or `-mvalue`, and boolean ones combine, `-iv`. Flags and positional arguments may come in any order. After `--` everything is positional, and so is `-` alone and a negative number (`-5`) when no short flag is a digit.
+- `-h` and `--help` set `p.help` and skip the other checks, unless the program declares them itself.
+- An unknown flag, a flag without its value, a value for a boolean flag, a missing required flag or positional argument, and an argument too many are errors: `flags: unknown flag --nope`. Declaring a flag twice, or `default` with no flag before it, is a bug in the program and panics.
+
+| Item | Meaning |
+| --- | --- |
+| `spec(program, about) -> Spec` | a spec with a sentence for the help |
+| `s.flag(name, short, help)` | a boolean flag, `--name` and `-short` (`short` may be `""`) |
+| `s.option(name, short, help)` | a flag with a value; `.default(v)`, `.required()` and `.value_name(n)` after it change it |
+| `s.positional(name, help)`, `s.rest(name, help)` | a required positional argument; any number after them (none without `rest`) |
+| `s.parse(args) -> Result[Parsed, Str]` | the flags and arguments given |
+| `s.usage()`, `s.help()` | the usage line, and the whole help with every flag, its default and whether it is required |
+| `p.bool(name)`, `p.count(name)` | whether a boolean flag was given, and how many times (`-vvv` is 3) |
+| `p.get(name) -> Option[Str]`, `p.str(name)`, `p.all(name)` | the last value given or the default; that or `""`; every value given (`--tag a --tag b`) |
+| `p.int(name) -> Result[Int, Str]`, `p.float(name)` | the value as a number; an error if it is missing or not one |
+| `p.arg(name)`, `p.rest()`, `p.args`, `p.help` | a positional argument by name, those after the declared ones, all of them, and whether help was asked for |
+
+Reading a flag that was not declared panics, like reading a missing SQL column.
 
 ## 20. Not yet
 
