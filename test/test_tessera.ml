@@ -3123,6 +3123,32 @@ fn main(root: Root) {
 }
 |v}
     "Ok([[\"a\", \"b\"], [\"1\", \"x, y\"]])\nOk([[\"name\", \"quote\"], [\"Ada\", \"said \\\"hi\\\"\\r\\nthen left\"], [\"Bob\", \"\", \"\"], [\"\", \"\"], [\"\"]])\nOk([[\"x\"]]) Ok([]) Ok([]) Ok([[\"a\"]]) Ok([[\"a\", \"\"]]) Ok([[\"\", \"\"]])\nOk([[\"a\", \"b;c\"], [\"1\", \"2\"]]) Ok([[\"a\", \"b\"]])\nOk([{\"id\": \"1\", \"name\": \"Ada\"}, {\"id\": \"2\", \"name\": \"Lin, B\"}])\nErr(\"csv: line 1: a quoted field is not closed\")\nErr(\"csv: line 1: a quote inside an unquoted field; quote the whole field and double the quote\")\nErr(\"csv: line 1: `,` or a line break must follow a closing quote\")\nErr(\"csv: line 3: `,` or a line break must follow a closing quote\")\nErr(\"csv: line 1: the header names `h` twice\")\nErr(\"csv: line 2: 1 field, but the header has 2\")\nErr(\"csv: line 2: 3 fields, but the header has 2\")\nErr(\"csv: the separator must be one byte other than a quote or a line break, not `\\\"`\") Err(\"csv: the separator must be one byte other than a quote or a line break, not `,,`\")\na,\"b,c\",\"say \"\"hi\"\"\"\n\"line\nbreak\",,\"cr\r\"\n\"\"\n\n\nOk([[\"a\", \"b,c\", \"say \\\"hi\\\"\"], [\"line\\nbreak\", \"\", \"cr\\r\"], [\"\"]])\na\t\"b\tc\"\nd;e\tf\n\nid,name\n1,Ada\n2,\n\nplain \"a,b\" \"\"\"\"\n";
+  out "std-url"
+    {v|use url
+
+fn show(s: Str) -> Str {
+    match url.parse(s) {
+        Ok(u) => "{u.scheme}|{u.user}|{u.password}|{u.host}|{u.port}|{u.path}|{u.query}|{u.fragment} => {u.to_str()}",
+        Err(e) => e,
+    }
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    for s in ["https://ana:s%40cret@Example.com:8443/docs/a%20b?q=1&q=2#top", "HTTP://[::1]:8080", "http://[fe80::1%25en0]/x", "/a/b?x=1#f", "//cdn.example.com/lib.js", "mailto:ada@example.com", "file:///etc/hosts", "urn:isbn:0451450523", "http://host?x", "http://h:80/p:q", "rel/path", "", "http://a:99999/", "http://a:8x/", "1http://x", "ht tp://x", "http://[::1/", "http://[::1]x/", "http://a b/", "http://x/\ty", "http://u%zz@h/"] {
+        out.print(show(s))
+    }
+    out.print("{url.encode("a b&c/d=é~")} {url.encode_path("/my files/a+b")} {url.decode("a%20b%2Fc+d")} {url.decode("100%")} {url.decode("%4")} {url.decode("%e2%82%AC")}")
+    let q = url.parse_query("q=a+b&tag=x&tag=y&&flag&e=%3D%26&=v") ?? []
+    out.print("{q}")
+    out.print("{url.param(q, "tag")} {url.param_all(q, "tag")} {url.param(q, "none")} {url.param(q, "flag")}")
+    out.print(url.build_query([("q", "a b"), ("n", "1"), ("k&=", "v/é")]))
+    out.print("{url.parse_query("a=%zz")} {url.parse_query("")}")
+    out.print("{(url.parse("http://x/?a=1&b=2") ?? url.Url { scheme: "", user: "", password: "", host: "", port: None, path: "", query: "", fragment: "" }).params()}")
+    out.print("{url.default_port("HTTPS")} {url.default_port("gopher")}")
+}
+|v}
+    "https|ana|s@cret|Example.com|Some(8443)|/docs/a%20b|q=1&q=2|top => https://ana:s%40cret@Example.com:8443/docs/a%20b?q=1&q=2#top\nhttp|||::1|Some(8080)||| => http://[::1]:8080\nhttp|||fe80::1%25en0|None|/x|| => http://[fe80::1%25en0]/x\n||||None|/a/b|x=1|f => /a/b?x=1#f\n|||cdn.example.com|None|/lib.js|| => //cdn.example.com/lib.js\nmailto||||None|ada@example.com|| => mailto:ada@example.com\nfile||||None|/etc/hosts|| => file:///etc/hosts\nurn||||None|isbn:0451450523|| => urn:isbn:0451450523\nhttp|||host|None||x| => http://host?x\nhttp|||h|Some(80)|/p:q|| => http://h:80/p:q\n||||None|rel/path|| => rel/path\n||||None||| => \nurl: `99999` is not a port number (0 to 65535) at byte 9\nurl: `8x` is not a port number (0 to 65535) at byte 9\n||||None|1http://x|| => 1http://x\nurl: `ht tp` is not a valid scheme\nurl: `[` without a closing `]` at byte 7\nurl: expected `:` after `]` at byte 12\nurl: a space in the host at byte 8\nurl: a control character at byte 9\nurl: `%` without two hex digits at byte 1 in the user\na%20b%26c%2Fd%3D%C3%A9~ /my%20files/a%2Bb Ok(\"a b/c+d\") Err(\"url: `%` without two hex digits at byte 3\") Err(\"url: `%` without two hex digits at byte 0\") Ok(\"\\226\\130\\172\")\n[(\"q\", \"a b\"), (\"tag\", \"x\"), (\"tag\", \"y\"), (\"flag\", \"\"), (\"e\", \"=&\"), (\"\", \"v\")]\nSome(\"x\") [\"x\", \"y\"] None Some(\"\")\nq=a%20b&n=1&k%26%3D=v%2F%C3%A9\nErr(\"url: `%` without two hex digits at byte 0 of `a=%zz`\") Ok([])\nOk([(\"a\", \"1\"), (\"b\", \"2\")])\nSome(443) None\n";
   out "std-http-keepalive-stream" ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] }
     {v|use http
 

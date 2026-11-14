@@ -1,0 +1,329 @@
+// URLs (RFC 3986): parsing one into its parts and back, percent-encoding,
+// and query strings.
+//
+//     https://ana:secret@example.com:8443/docs/a%20b?q=1&q=2#top
+//     scheme  user password host       port path     query   fragment
+//
+// `parse` takes absolute URLs and references without a scheme (`/a?b`,
+// `//host/x`). `path`, `query` and `fragment` stay percent-encoded, as
+// written, since decoding `%2F` in a path would change its meaning; decode
+// them with `decode` or `parse_query`. `user` and `password` are decoded.
+
+// The parts of a URL. A part that is not there is empty, and so is `port`
+// (`None`): `default_port(u.scheme)` gives the usual one.
+pub struct Url {
+    // lowercased: `https`
+    scheme: Str,
+    user: Str,
+    password: Str,
+    // without the brackets of an IPv6 address: `::1`
+    host: Str,
+    port: Option[Int],
+    // as written: `/docs/a%20b`
+    path: Str,
+    // without the `?`: `q=1&q=2`
+    query: Str,
+    // without the `#`
+    fragment: Str,
+}
+
+// The parts of `s`. An error names the byte where it went wrong: a scheme
+// with characters schemes cannot have, a port that is not a number up to
+// 65535, an unclosed `[` in the host, or a control character or space.
+pub fn parse(s: Str) -> Result[Url, Str] {
+    let bs = s.bytes()
+    for (i, b) in bs.with_index() {
+        if b < 32 || b == 127 {
+            return Err("url: a control character at byte {i}")
+        }
+    }
+    let mut u = Url { scheme: "", user: "", password: "", host: "", port: None, path: "", query: "", fragment: "" }
+    let mut rest = s
+    let mut at = 0
+    // the fragment and the query come off the end first
+    match rest.index_of("#") {
+        Some(k) => {
+            u.fragment = rest.slice(k + 1, rest.len())
+            rest = rest.slice(0, k)
+        },
+        None => (),
+    }
+    match rest.index_of("?") {
+        Some(k) => {
+            u.query = rest.slice(k + 1, rest.len())
+            rest = rest.slice(0, k)
+        },
+        None => (),
+    }
+    // a scheme: a letter, then letters, digits, `+`, `-` or `.`, up to a `:`
+    // that comes before any `/`
+    match rest.index_of(":") {
+        Some(k) if k > 0 && !rest.slice(0, k).contains("/") => {
+            let name = rest.slice(0, k)
+            if is_scheme(name) {
+                u.scheme = name.to_lower()
+                rest = rest.slice(k + 1, rest.len())
+                at = k + 1
+            } else if is_alpha(bs[0]) {
+                return Err("url: `{name}` is not a valid scheme")
+            }
+        },
+        _ => (),
+    }
+    if rest.starts_with("//") {
+        let body = rest.slice(2, rest.len())
+        let end = body.index_of("/") ?? body.len()
+        let authority = body.slice(0, end)
+        u = read_authority(u, authority, at + 2)?
+        rest = body.slice(end, body.len())
+    }
+    u.path = rest
+    Ok(u)
+}
+
+fn is_alpha(b: Int) -> Bool {
+    (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
+}
+
+fn is_digit(b: Int) -> Bool {
+    b >= 48 && b <= 57
+}
+
+fn is_scheme(s: Str) -> Bool {
+    let bs = s.bytes()
+    is_alpha(bs[0]) && bs.all(|b| is_alpha(b) || is_digit(b) || b == 43 || b == 45 || b == 46)
+}
+
+// `user:password@host:port`, starting at byte `at` of the URL.
+fn read_authority(u: Url, authority: Str, at: Int) -> Result[Url, Str] {
+    let mut out = u
+    let mut hostport = authority
+    let mut start = at
+    match authority.last_index_of("@") {
+        Some(k) => {
+            let info = authority.slice(0, k)
+            let (user, password) = match info.index_of(":") {
+                Some(c) => (info.slice(0, c), info.slice(c + 1, info.len())),
+                None => (info, ""),
+            }
+            out.user = decode(user).map_error(|e| "{e} in the user")?
+            out.password = decode(password).map_error(|e| "{e} in the password")?
+            hostport = authority.slice(k + 1, authority.len())
+            start = at + k + 1
+        },
+        None => (),
+    }
+    let mut port_text = ""
+    if hostport.starts_with("[") {
+        match hostport.index_of("]") {
+            Some(k) => {
+                out.host = hostport.slice(1, k)
+                let after = hostport.slice(k + 1, hostport.len())
+                if after.starts_with(":") {
+                    port_text = after.slice(1, after.len())
+                } else if after != "" {
+                    return Err("url: expected `:` after `]` at byte {start + k + 1}")
+                }
+            },
+            None => {
+                return Err("url: `[` without a closing `]` at byte {start}")
+            },
+        }
+    } else {
+        match hostport.last_index_of(":") {
+            Some(k) => {
+                out.host = hostport.slice(0, k)
+                port_text = hostport.slice(k + 1, hostport.len())
+            },
+            None => {
+                out.host = hostport
+            },
+        }
+        match out.host.index_of(" ") {
+            Some(k) => {
+                return Err("url: a space in the host at byte {start + k}")
+            },
+            None => (),
+        }
+    }
+    if port_text != "" {
+        let p = port_text.bytes()
+        if !p.all(|b| is_digit(b)) || p.len() > 5 || (port_text.parse_int() ?? 0) > 65535 {
+            return Err("url: `{port_text}` is not a port number (0 to 65535) at byte {start + hostport.len() - port_text.len()}")
+        }
+        out.port = port_text.parse_int()
+    }
+    Ok(out)
+}
+
+// The URL as text, with `user` and `password` percent-encoded and the
+// other parts as they are. `parse(s)?.to_str()` gives `s` back for URLs
+// written in the usual form, except that the scheme is lowercase, an empty
+// `?` or `#` is left out, and a scheme with an absolute path gets `//`
+// (`file:/a` becomes `file:///a`).
+pub fn to_str(self: Url) -> Str {
+    let mut out = ""
+    if self.scheme != "" {
+        out = self.scheme + ":"
+    }
+    // `file:///etc/hosts`: an empty host is written when the path is absolute
+    if self.host != "" || self.user != "" || self.port.is_some() || (self.scheme != "" && self.path.starts_with("/")) {
+        out = out + "//"
+        if self.user != "" || self.password != "" {
+            out = out + encode(self.user)
+            if self.password != "" {
+                out = out + ":" + encode(self.password)
+            }
+            out = out + "@"
+        }
+        out = out + if self.host.contains(":") { "[" + self.host + "]" } else { self.host }
+        match self.port {
+            Some(p) => {
+                out = out + ":{p}"
+            },
+            None => (),
+        }
+        if self.path != "" && !self.path.starts_with("/") {
+            out = out + "/"
+        }
+    }
+    out = out + self.path
+    if self.query != "" {
+        out = out + "?" + self.query
+    }
+    if self.fragment != "" {
+        out = out + "#" + self.fragment
+    }
+    out
+}
+
+// The query's parameters, as `parse_query` reads them.
+pub fn params(self: Url) -> Result[List[(Str, Str)], Str] {
+    parse_query(self.query)
+}
+
+// The usual port of a scheme: 80 for `http` and `ws`, 443 for `https`
+// and `wss`, 21 for `ftp`; `None` for others.
+pub fn default_port(scheme: Str) -> Option[Int] {
+    match scheme.to_lower() {
+        "http" | "ws" => Some(80),
+        "https" | "wss" => Some(443),
+        "ftp" => Some(21),
+        _ => None,
+    }
+}
+
+// ---------- percent-encoding ----------
+
+// `s` with every byte but the unreserved ones (letters, digits, `-`, `.`,
+// `_`, `~`) written as `%XX`: safe for any part of a URL, a query key or
+// value included. `encode("a b&c")` is `"a%20b%26c"`.
+pub fn encode(s: Str) -> Str {
+    escape(s, false)
+}
+
+// `s` encoded for a path: like `encode`, but `/` stays, so the segments
+// stay apart: `encode_path("/my files/a+b")` is `"/my%20files/a%2Bb"`.
+pub fn encode_path(s: Str) -> Str {
+    escape(s, true)
+}
+
+fn escape(s: Str, keep_slash: Bool) -> Str {
+    let digits = "0123456789ABCDEF".bytes()
+    let mut out: List[Int] = []
+    for b in s.bytes() {
+        if is_alpha(b) || is_digit(b) || b == 45 || b == 46 || b == 95 || b == 126 || (keep_slash && b == 47) {
+            out.push(b)
+        } else {
+            out.push(37)
+            out.push(digits[b >> 4])
+            out.push(digits[b & 15])
+        }
+    }
+    bytes(out).to_str()
+}
+
+// `s` with each `%XX` replaced by the byte it stands for. A `%` without
+// two hex digits after it is an error naming its byte.
+pub fn decode(s: Str) -> Result[Str, Str] {
+    unescape(s, false)
+}
+
+fn unescape(s: Str, plus: Bool) -> Result[Str, Str] {
+    let bs = s.bytes()
+    if !bs.any(|b| b == 37 || (plus && b == 43)) {
+        return Ok(s)
+    }
+    let mut out: List[Int] = []
+    let mut i = 0
+    while i < bs.len() {
+        let b = bs[i]
+        if b == 37 {
+            let hi = if i + 1 < bs.len() { hex_digit(bs[i + 1]) } else { -1 }
+            let lo = if i + 2 < bs.len() { hex_digit(bs[i + 2]) } else { -1 }
+            if hi < 0 || lo < 0 {
+                return Err("url: `%` without two hex digits at byte {i}")
+            }
+            out.push(hi * 16 + lo)
+            i = i + 3
+        } else {
+            out.push(if plus && b == 43 { 32 } else { b })
+            i = i + 1
+        }
+    }
+    Ok(bytes(out).to_str())
+}
+
+fn hex_digit(b: Int) -> Int {
+    if is_digit(b) {
+        b - 48
+    } else if b >= 97 && b <= 102 {
+        b - 87
+    } else if b >= 65 && b <= 70 {
+        b - 55
+    } else {
+        -1
+    }
+}
+
+// ---------- query strings ----------
+
+// The `key=value` pairs of a query string (without its `?`), in order,
+// repeated keys included, keys and values decoded; `+` is a space, as
+// HTML forms send it. A pair without `=` has an empty value, and empty
+// pairs (`a=1&&b=2`) are skipped. `parse_query("q=a+b&tag=x&tag=y")` is
+// `Ok([("q", "a b"), ("tag", "x"), ("tag", "y")])`.
+pub fn parse_query(q: Str) -> Result[List[(Str, Str)], Str] {
+    let mut out: List[(Str, Str)] = []
+    if q == "" {
+        return Ok(out)
+    }
+    for part in q.split("&") {
+        if part != "" {
+            let (k, v) = match part.index_of("=") {
+                Some(e) => (part.slice(0, e), part.slice(e + 1, part.len())),
+                None => (part, ""),
+            }
+            let key = unescape(k, true).map_error(|e| "{e} of `{part}`")?
+            let value = unescape(v, true).map_error(|e| "{e} of `{part}`")?
+            out.push((key, value))
+        }
+    }
+    Ok(out)
+}
+
+// A query string from pairs, in order, each key and value encoded:
+// `build_query([("q", "a b"), ("n", "1")])` is `"q=a%20b&n=1"`.
+pub fn build_query(pairs: List[(Str, Str)]) -> Str {
+    pairs.map(|p| encode(p.0) + "=" + encode(p.1)).join("&")
+}
+
+// The first value of `key` among `pairs`.
+pub fn param(pairs: List[(Str, Str)], key: Str) -> Option[Str] {
+    pairs.find(|p| p.0 == key)?.1
+}
+
+// Every value of `key` among `pairs`, in order.
+pub fn param_all(pairs: List[(Str, Str)], key: Str) -> List[Str] {
+    pairs.filter(|p| p.0 == key).map(|p| p.1)
+}

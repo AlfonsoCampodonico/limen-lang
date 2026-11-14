@@ -1690,7 +1690,7 @@ The standard library is checked like a dependency. `src/std/tessera.toml` lists 
 
 | Module | May take |
 | --- | --- |
-| `json`, `list`, `text`, `format`, `regex`, `errors`, `hex`, `base64`, `hash`, `csv` | nothing: pure |
+| `json`, `list`, `text`, `format`, `regex`, `errors`, `hex`, `base64`, `hash`, `csv`, `url` | nothing: pure |
 | `http` | `net` (Net, Conn) and `listen` (Listener, Conn) |
 | `time` | `clock` and `fs`, for `within` and `load_zone` alone |
 | `sql` | `fs` (the database file's directory); trusted with C (`[trust] foreign = ["sql"]`) to call SQLite |
@@ -1962,6 +1962,34 @@ CSV as RFC 4180 has it: fields separated by commas, quoted with `"` when they ho
 | `write(rows) -> Str`, `write_with(rows, sep)` | one line per row, each ending in `\n`; fields are quoted only when they need it |
 | `write_maps(header, rows) -> Str` | a header line, then each map's values in the header's order, `""` for a name the map lacks |
 | `escape(field) -> Str` | one field as it goes in a line: `escape("a,b")` is `"\"a,b\""` |
+
+### url
+
+URLs (RFC 3986): parsing one into its parts and back, percent-encoding, and query strings with repeated keys. Pure functions.
+
+| Item | Meaning |
+| --- | --- |
+| `struct Url { scheme, user, password, host, port: Option[Int], path, query, fragment }` | `scheme` lowercased, `host` without the brackets of an IPv6 address, `query` without its `?`, `fragment` without its `#`; a part that is not there is `""` (or `None`). `path`, `query` and `fragment` stay percent-encoded as written, since decoding `%2F` would change a path's meaning; `user` and `password` are decoded |
+| `parse(s) -> Result[Url, Str]` | an absolute URL or a reference without a scheme (`/a?b`, `//host/x`); a bad scheme, a port that is not a number up to 65535, an unclosed `[`, a space in the host or a control character is an error naming the byte |
+| `u.to_str()` | the URL as text, `user` and `password` encoded; `parse(s)?.to_str()` gives `s` back for URLs in the usual form |
+| `u.params() -> Result[List[(Str, Str)], Str]` | the query's pairs, as `parse_query` reads them |
+| `default_port(scheme) -> Option[Int]` | 80 for `http` and `ws`, 443 for `https` and `wss`, 21 for `ftp` |
+| `encode(s)`, `encode_path(s)` | every byte but letters, digits and `-._~` as `%XX` (`encode_path` keeps `/` too): `encode("a b&c")` is `"a%20b%26c"` |
+| `decode(s) -> Result[Str, Str]` | each `%XX` as its byte; a `%` without two hex digits is an error |
+| `parse_query(q) -> Result[List[(Str, Str)], Str]` | the `key=value` pairs in order, repeated keys kept, decoded, `+` as a space (as HTML forms send it); a pair without `=` has the value `""` |
+| `build_query(pairs) -> Str` | pairs encoded and joined: `build_query([("q", "a b")])` is `"q=a%20b"` |
+| `param(pairs, key) -> Option[Str]`, `param_all(pairs, key) -> List[Str]` | the first value of a key, and all of them |
+
+```
+use url
+
+fn main(root: Root) -> Result[(), Str] {
+    let u = url.parse("https://example.com:8443/search?q=tessera+lang&page=2#top")?
+    let q = u.params()?
+    root.stdout.print("{u.host} {u.port} {url.param(q, "q") ?? ""}")   // example.com Some(8443) tessera lang
+    Ok(())
+}
+```
 
 ## 20. Not yet
 
