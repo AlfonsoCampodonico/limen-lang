@@ -253,6 +253,10 @@ let rec lower f (e : expr) : I.atom =
     | EUn (Not, a) ->
       let x = lower f a in
       tmp f TBool (I.Not x)
+    | EUn (BitNot, a) ->
+      (* `~x` is `x ^ -1` *)
+      let x = lower f a in
+      tmp f TInt (I.Bin (BitXor, TInt, x, I.AInt (-1L), e.espan))
     | ECall (callee, args) -> lower_call f e callee args ty
     | ENamed _ -> failwith "internal: the checker puts named arguments in order"
     | EMethod ({ edesc = EVar en; _ }, name, _, args) when is_enum_name f en ->

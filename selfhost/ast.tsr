@@ -87,11 +87,19 @@ pub enum BinOp {
     Else,
     // `a..<b`
     Range,
+    // `&`, `|`, `^`, `<<` and `>>` (arithmetic) on Int
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
 }
 
 pub enum UnOp {
     Neg,
     Not,
+    // `~`
+    BitNot,
 }
 
 pub struct Expr {

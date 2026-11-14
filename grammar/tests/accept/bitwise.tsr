@@ -1,0 +1,9 @@
+fn main(root: Root) {
+    let a = 12 & 10 | 3 ^ 1
+    let b = ~a << 2 >> 1
+    let c = a & 1 == 0 || b | 2 > 0
+    let d = [1, 2].map(|x| x | 8)
+    let e = a.shift_right_unsigned(3) &
+        255
+    root.stderr.print("{a} {b} {c} {d} {e}")
+}

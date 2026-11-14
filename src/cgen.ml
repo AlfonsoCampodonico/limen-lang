@@ -268,6 +268,11 @@ let binop c op t a b sp =
   | TInt, Mul -> sprintf "(%s * %s)" a b
   | TInt, Div -> sprintf "w_div(%s, %s, %s)" a b (where sp)
   | TInt, Mod -> sprintf "w_mod(%s, %s, %s)" a b (where sp)
+  | TInt, BitAnd -> sprintf "(%s & %s)" a b
+  | TInt, BitOr -> sprintf "(%s | %s)" a b
+  | TInt, BitXor -> sprintf "(%s ^ %s)" a b
+  | TInt, Shl -> sprintf "w_shl(%s, %s, %s)" a b (where sp)
+  | TInt, Shr -> sprintf "w_shr(%s, %s, %s)" a b (where sp)
   | TFloat, Add -> sprintf "(%s + %s)" a b
   | TFloat, Sub -> sprintf "(%s - %s)" a b
   | TFloat, Mul -> sprintf "(%s * %s)" a b
@@ -795,6 +800,7 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     | ("int_to_str" | "float_to_str" | "bool_to_str"), _ -> show_into [ `Val (arg 0, rt) ]
     | "int_to_float", _ -> set (sprintf "(double)%s" (arg 0))
     | "int_abs", _ -> set (sprintf "w_abs(%s)" (arg 0))
+    | "int_shift_right_unsigned", _ -> set (sprintf "w_ushr(%s, %s, %s)" (arg 0) (arg 1) (where sp))
     | "float_to_int", _ -> set (sprintf "w_f2i(%s)" (arg 0))
     | "float_abs", _ -> set (sprintf "fabs(%s)" (arg 0))
     | "float_sqrt", _ -> set (sprintf "sqrt(%s)" (arg 0))

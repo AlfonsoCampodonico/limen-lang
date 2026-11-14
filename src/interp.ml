@@ -592,6 +592,14 @@ let binop op a b sp =
   | Mod, VInt _, VInt -1L -> VInt 0L
   | Div, VInt x, VInt y -> VInt (Int64.div x y)
   | Mod, VInt x, VInt y -> VInt (Int64.rem x y)
+  | BitAnd, VInt x, VInt y -> VInt (Int64.logand x y)
+  | BitOr, VInt x, VInt y -> VInt (Int64.logor x y)
+  | BitXor, VInt x, VInt y -> VInt (Int64.logxor x y)
+  (* as the native w_shl/w_shr: a negative count panics, 64 or more shifts
+     every bit out *)
+  | (Shl | Shr), VInt _, VInt n when n < 0L -> raise (Panic ("negative shift count", sp))
+  | Shl, VInt x, VInt n -> VInt (if n >= 64L then 0L else Int64.shift_left x (Int64.to_int n))
+  | Shr, VInt x, VInt n -> VInt (Int64.shift_right x (Int64.to_int (min n 63L)))
   | Add, VFloat x, VFloat y -> VFloat (x +. y)
   | Sub, VFloat x, VFloat y -> VFloat (x -. y)
   | Mul, VFloat x, VFloat y -> VFloat (x *. y)
@@ -1791,6 +1799,7 @@ let rec eval rt env e : value =
   | EUn (Neg, a) -> (
     match eval rt env a with VInt n -> VInt (Int64.neg n) | VFloat x -> VFloat (-.x) | _ -> failwith "internal: neg")
   | EUn (Not, a) -> VBool (not (as_bool (eval rt env a)))
+  | EUn (BitNot, a) -> (match eval rt env a with VInt n -> VInt (Int64.lognot n) | _ -> failwith "internal: bitwise not")
   | ENamed _ -> failwith "internal: the checker puts named arguments in order"
   | ECall ({ ecallee = Some d; _ }, args) when d.fn_foreign = None -> (
     (* a call to a known top-level function: no name to look up *)
@@ -2472,6 +2481,8 @@ and call_method rt v name args sp =
   | VInt n, "to_str", [] -> VStr (Int64.to_string n)
   | VInt n, "to_float", [] -> VFloat (Int64.to_float n)
   | VInt n, "abs", [] -> VInt (if n < 0L then Int64.neg n else n)
+  | VInt _, "shift_right_unsigned", [ VInt k ] when k < 0L -> raise (Panic ("negative shift count", sp))
+  | VInt n, "shift_right_unsigned", [ VInt k ] -> VInt (if k >= 64L then 0L else Int64.shift_right_logical n (Int64.to_int k))
   | VFloat x, "to_str", [] -> VStr (fmt_float x)
   | VFloat x, "to_int", [] -> VInt (float_to_int x)
   | VFloat x, "abs", [] -> VFloat (Float.abs x)

@@ -34,7 +34,7 @@ fn parse_names(body: Str) -> List[Str] {   // no capabilities: cannot do I/O
 - **Floats:** digits with a fraction (`1.5`), an exponent (`1e9`, `2.5E-3`), or both. `_` is allowed. There is no leading-dot form (`.5`).
 - **Strings:** `"..."`, may span lines. Escapes: `\n \t \r \\ \" \{ \} \0`. Any other escape is error E0006.
 - **Interpolation:** `{expr}` inside a string evaluates any expression, including ones with their own strings: `"{xs.join(", ")}"`. An empty `{}` is error E0007; write `\{` for a literal brace.
-- **Symbols:** `( ) { } [ ] , : ; . | + - * / % ! ? = < > -> => == != <= >= && || ..< |> ?.`. `?.` is one symbol (safe navigation), so `e?.name` is never `?` followed by `.name`; write `(e?).name` for that.
+- **Symbols:** `( ) { } [ ] , : ; . | + - * / % ! ? = < > & ^ ~ -> => == != <= >= && || << >> ..< |> ?.`. `?.` is one symbol (safe navigation), so `e?.name` is never `?` followed by `.name`; write `(e?).name` for that.
 
 ### Newlines
 
@@ -422,10 +422,10 @@ From loosest to tightest. All binary operators are left-associative.
 | 4 | `==` `!=` |
 | 5 | `<` `<=` `>` `>=` |
 | 6 | `..<` |
-| 7 | `+` `-` |
-| 8 | `*` `/` `%` |
+| 7 | `+` `-` `\|` `^` |
+| 8 | `*` `/` `%` `&` `<<` `>>` |
 | 9 | `??` |
-| 10 | unary `-` `!` |
+| 10 | unary `-` `!` `~` |
 | 11 | call `f(x)`, index `a[i]`, field `p.x`, method `s.len()`, safe navigation `a?.b`, `?` |
 
 ### Operators
@@ -441,6 +441,11 @@ From loosest to tightest. All binary operators are left-associative.
 | `..<` | `Int` | `List[Int]`: `lo..<hi` counts up from `lo`, stopping before `hi` |
 | `-x` | `Int`, `Float` | same type |
 | `!x` | `Bool` | `Bool` |
+| `&` `\|` `^` | `Int`: bitwise and, or, exclusive or | `Int` |
+| `<<` `>>` | `Int`: shift left, shift right keeping the sign | `Int` |
+| `~x` | `Int`: every bit flipped (`-x - 1`) | `Int` |
+
+The bitwise operators bind as in Go: `|` and `^` with `+`, `&` and the shifts with `*`, so `x & mask == 0` is `(x & mask) == 0` and `a + b << 2` is `a + (b << 2)`. `|` between two expressions is always this operator; a closure's `|x|` and an or-pattern's `A | B` are where an expression cannot be. A shift count of 64 or more shifts every bit out: `x << 64` is `0` and `x >> 64` is `0` or `-1` by the sign of `x`; a negative count panics (`negative shift count`), the same in both backends. `>>` is arithmetic; `x.shift_right_unsigned(n)` shifts in zeros instead (section 11).
 
 Both operands must have the same type. The **ordered** types are `Int`, `Float`, `Str` and `Bytes` (byte order), `Bool` (`false` first), `()`, and lists, arrays, tuples, structs and enums whose items are ordered. Those compare item by item: lists and arrays lexicographically (a prefix comes first), tuples and structs field by field in declaration order, enums by variant in declaration order and then by payload, so `None` sorts after every `Some`. Maps, functions, capabilities, channels, `dyn` values and type parameters have no order (E0201), unless the type parameter has the bound `Ordered` or `Key` (section 4). On `Int`, `/` truncates toward zero, `%` takes the sign of the dividend, and division or remainder by zero panics. On `Float`, comparisons follow IEEE, so NaN is unequal to everything, and division by zero gives infinity. Inside a list, tuple, struct or enum, and in `sort()`, floats use a total order with NaN first, so sorting never misbehaves.
 
@@ -1102,7 +1107,7 @@ Binary data, kept apart from text so a byte buffer is never printed or concatena
 
 | Type | Methods |
 | --- | --- |
-| `Int` | `to_str()`, `to_float()`, `abs()`, `min(n)`, `max(n)`, `to_char()` (the UTF-8 text of a code point, `65.to_char()` is `"A"`; invalid code points give U+FFFD) |
+| `Int` | `to_str()`, `to_float()`, `abs()`, `min(n)`, `max(n)`, `to_char()` (the UTF-8 text of a code point, `65.to_char()` is `"A"`; invalid code points give U+FFFD), `shift_right_unsigned(n)` (`>>` shifting in zeros instead of the sign: `(-1).shift_right_unsigned(60)` is `15`; a count of 64 or more gives `0`, a negative one panics) |
 | `Float` | `to_str()`, `to_int()` (truncates; NaN gives 0), `abs()`, `sqrt()`, `to_fixed(d)` (exactly `d` decimals, 0 to 30, rounded as C's printf rounds: `3.14159.to_fixed(2)` is `"3.14"`; NaN and infinities give `nan`, `inf`, `-inf`) |
 | `Bool` | `to_str()` |
 
@@ -1442,7 +1447,7 @@ Every diagnostic has a stable code. `tessera explain CODE` prints its explanatio
 | E0403 | module has no such item |
 | E0404 | module name used as a value |
 
-A **panic** (division by zero, index out of range, a missing map key, `panic(...)`, no matching arm) stops the code that hit it:
+A **panic** (division by zero, a negative shift count, index out of range, a missing map key, `panic(...)`, no matching arm) stops the code that hit it:
 
 - Inside `catch(|| ...)`, the panic ends the closure and `catch` returns `Err(message)`. Otherwise it returns `Ok(value)`.
 - Inside a task, the panic ends only that task; the other tasks of its group run to completion. When the group finishes, it passes the first panic (in the order the tasks were started) on to the code that ran the group, where a `catch` can handle it.
@@ -1501,7 +1506,7 @@ stmt       = "let" [ "mut" ] IDENT [ ":" type ] "=" expr
 
 expr       = unary { BINOP unary | "|>" unary } ; (* precedence: section 5; a line may start with "|>" *)
 expr_ns    = expr ;                             (* no struct literal at the top level *)
-unary      = ( "-" | "!" ) unary | postfix ;
+unary      = ( "-" | "!" | "~" ) unary | postfix ;
 postfix    = primary { "(" [ args ] ")" [ trailing ] | trailing | "[" expr "]" | ( "." | "?." ) IDENT [ "(" [ args ] ")" ] [ trailing ] | ( "." | "?." ) INT | "?" [ STRING ] } ;
 trailing   = "{" [ "|" [ cparam { "," cparam } ] "|" ] { stmt ( NL | ";" ) } [ expr ] "}" ;
                                                 (* same line; not in expr_ns; bare only after a lowercase name or method *)

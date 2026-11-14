@@ -182,11 +182,13 @@ let rec pat (p : pat) =
 
 (* doubled, so a range fits between comparison and arithmetic *)
 let prec = function
-  | Or -> 2 | And -> 4 | Eq | Ne -> 6 | Lt | Le | Gt | Ge -> 8 | Range -> 9 | Add | Sub -> 10 | Mul | Div | Mod -> 12 | Else -> 14
+  | Or -> 2 | And -> 4 | Eq | Ne -> 6 | Lt | Le | Gt | Ge -> 8 | Range -> 9 | Add | Sub | BitOr | BitXor -> 10
+  | Mul | Div | Mod | BitAnd | Shl | Shr -> 12 | Else -> 14
 
 let op_str = function
   | Or -> "||" | And -> "&&" | Eq -> "==" | Ne -> "!=" | Lt -> "<" | Le -> "<=" | Gt -> ">" | Ge -> ">="
   | Add -> "+" | Sub -> "-" | Mul -> "*" | Div -> "/" | Mod -> "%" | Else -> "??" | Range -> "..<"
+  | BitAnd -> "&" | BitOr -> "|" | BitXor -> "^" | Shl -> "<<" | Shr -> ">>"
 
 (* A struct literal that would be read as the start of a block in an
    `if`/`while`/`for`/`match` head. *)
@@ -280,7 +282,7 @@ and expr_inner c ind e =
     else add c " |> ";
     expr c ind ~min:2 b
   | EUn (op, a) ->
-    add c (match op with Neg -> "-" | Not -> "!");
+    add c (match op with Neg -> "-" | Not -> "!" | BitNot -> "~");
     expr c ind ~min:16 a
   | ECall (f, args) ->
     expr c ind ~min:16 f;

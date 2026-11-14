@@ -26,6 +26,7 @@ let rec pat (p : pat) =
 let op = function
   | Add -> "+" | Sub -> "-" | Mul -> "*" | Div -> "/" | Mod -> "%" | Eq -> "==" | Ne -> "!=" | Lt -> "<"
   | Le -> "<=" | Gt -> ">" | Ge -> ">=" | And -> "&&" | Or -> "||" | Else -> "??" | Range -> "..<"
+  | BitAnd -> "&" | BitOr -> "|" | BitXor -> "^" | Shl -> "<<" | Shr -> ">>"
 
 let rec expr e =
   match e.edesc with
@@ -41,6 +42,7 @@ let rec expr e =
   | EPipe (a, b) -> "(" ^ expr a ^ "|>" ^ expr b ^ ")"
   | EUn (Neg, a) -> "(-" ^ expr a ^ ")"
   | EUn (Not, a) -> "(!" ^ expr a ^ ")"
+  | EUn (BitNot, a) -> "(~" ^ expr a ^ ")"
   | ECall (f, a) -> expr f ^ "(" ^ String.concat "," (List.map expr a) ^ ")"
   | ENamed (n, _, a) -> n ^ ":" ^ expr a
   | EMethod (r, n, _, a) -> expr r ^ "." ^ n ^ "(" ^ String.concat "," (List.map expr a) ^ ")"

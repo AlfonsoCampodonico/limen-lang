@@ -345,6 +345,21 @@ static inline int64_t w_mod(int64_t a, int64_t b, const char *where) {
   if (b == -1) return 0;
   return a % b;
 }
+/* Shifts: a negative count panics, a count of 64 or more shifts every bit
+   out (no undefined behaviour in C). `>>` keeps the sign; w_ushr is
+   Int.shift_right_unsigned, which shifts in zeros. */
+static inline int64_t w_shl(int64_t a, int64_t n, const char *where) {
+  if (n < 0) w_panic_c("negative shift count", where);
+  return n >= 64 ? 0 : (int64_t)((uint64_t)a << n);
+}
+static inline int64_t w_shr(int64_t a, int64_t n, const char *where) {
+  if (n < 0) w_panic_c("negative shift count", where);
+  return a >> (n >= 64 ? 63 : n);
+}
+static inline int64_t w_ushr(int64_t a, int64_t n, const char *where) {
+  if (n < 0) w_panic_c("negative shift count", where);
+  return n >= 64 ? 0 : (int64_t)((uint64_t)a >> n);
+}
 static inline int64_t w_f2i(double x) {
   if (isnan(x)) return 0;
   if (x >= 9.2e18) return INT64_MAX;

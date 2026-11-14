@@ -31,4 +31,6 @@ fn main(root: Root) {
     out.print("{b.len()} {b[1]} {b.get(5)} {b.get(0)} {b.slice(0, 2)} {b.to_list()} {b.is_empty()} {"hi".to_bytes() == b.slice(0, 2)} {b.slice(0, 2).to_str()}")
     out.print("{65.to_char()} {(-7).abs()} {3.min(4)} {3.max(4)} {7.to_float()} {2.9.to_int()} {(-2.5).abs()} {16.0.sqrt()} {3.14159.to_fixed(2)} {true.to_str()} {12.to_str()} {0.5.to_str()}")
     out.print("{0..<3}")
+    let n = xs.len()
+    out.print("{n & 6} {n | 8} {n ^ 5} {~n} {n << 3} {-n >> 1} {n << 64} {-n >> 99} {(-n).shift_right_unsigned(60)} {n.shift_right_unsigned(64)}")
 }

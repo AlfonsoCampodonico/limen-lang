@@ -79,8 +79,8 @@ for    ::= "for" sp1 (ident sp1 | upat sp) "in" sp1 expr sp block
 # ---------- expressions ----------
 # `|>` may also start a line, to continue a pipeline
 expr    ::= unary (sp binop ws unary | ws "|>" ws unary)*
-binop   ::= "??" | "||" | "&&" | "==" | "!=" | "<=" | ">=" | "<" | ">" | "..<" | "+" | "-" | "*" | "/" | "%"
-unary   ::= ("-" | "!") sp unary | postfix
+binop   ::= "??" | "||" | "&&" | "==" | "!=" | "<=" | ">=" | "<" | ">" | "..<" | "+" | "-" | "*" | "/" | "%" | "&" | "|" | "^" | "<<" | ">>"
+unary   ::= ("-" | "!" | "~") sp unary | postfix
 postfix ::= primary suffix*
 # `?.` is safe navigation (a line may start with it, as with `.`)
 suffix  ::= sp "(" ws args? ws ")" (sp tclosure)? | sp tclosure | sp "[" ws expr ws "]" | ws "." sp ident | "." [0-9]+ | ws "?." sp ident | "?." [0-9]+ | sp "?" (sp string)?

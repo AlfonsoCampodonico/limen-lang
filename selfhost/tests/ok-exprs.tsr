@@ -22,6 +22,8 @@ fn main() {
     let ok = !a && b || c == d != e
     let cmp = a < b && c <= d && e > f && g >= h
     let math = -a * b / c % d - e
+    let bits = a & b | c ^ d << e >> f & ~g == h | ~-i
+    let masks = xs.map(|x| x | 1).filter(|x| x & mask != 0)
     let floats = [1.5, 2.0e10, 3E-2, 1_000.000_1, 0.1, 1e400, 4.9e-324, 1e-310, 123456789.123]
     let ints = [0, 1_000_000, 9223372036854775807]
     let unit = ()

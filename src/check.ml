@@ -459,7 +459,7 @@ let build_methods (t : ty) : (string * (unit -> ty list * ty)) list =
       m "to_list" [] (TList TInt); m "to_str" [] TStr ]
   | TInt ->
     [ m "to_str" [] TStr; m "to_float" [] TFloat; m "abs" [] TInt; m "to_char" [] TStr; m "min" [ TInt ] TInt;
-      m "max" [ TInt ] TInt ]
+      m "max" [ TInt ] TInt; m "shift_right_unsigned" [ TInt ] TInt ]
   | TFloat -> [ m "to_str" [] TStr; m "to_int" [] TInt; m "abs" [] TFloat; m "sqrt" [] TFloat;
       m "to_fixed" [ TInt ] TStr ]
   | TBool -> [ m "to_str" [] TStr ]
@@ -708,6 +708,14 @@ and check_expr_inner ctx f e : ty =
       err ctx "E0201" a.espan (sprintf "cannot negate a value of type `%s`" (show t));
       TErr)
   | EUn (Not, a) -> expect ctx f a TBool; TBool
+  | EUn (BitNot, a) -> (
+    let t = check_expr ctx f a in
+    match repr t with
+    | TInt | TErr -> t
+    | TVar _ -> unify_at ctx a.espan TInt t; TInt
+    | _ ->
+      err ctx "E0201" a.espan (sprintf "operator `~` cannot be applied to `%s`" (show t));
+      TErr)
   | ECall (callee, args) -> check_call ctx f e callee args e.espan
   | EMethod (({ edesc = EVar en; _ } as recv), name, nsp, args)
     when not (is_local f en) && Hashtbl.mem ctx.enums en ->
@@ -1672,6 +1680,7 @@ and check_bin ctx f op a b sp =
       match op with
       | Add -> "+" | Sub -> "-" | Mul -> "*" | Div -> "/" | Mod -> "%" | Eq -> "==" | Ne -> "!="
       | Lt -> "<" | Le -> "<=" | Gt -> ">" | Ge -> ">=" | And -> "&&" | Or -> "||" | Else -> "??" | Range -> "..<"
+      | BitAnd -> "&" | BitOr -> "|" | BitXor -> "^" | Shl -> "<<" | Shr -> ">>"
     in
     let bad () =
       err ctx "E0201" sp (sprintf "operator `%s` cannot be applied to `%s`" name (show t))
@@ -1679,7 +1688,7 @@ and check_bin ctx f op a b sp =
     match op with
     | Add -> (match t with TInt | TFloat | TStr | TBytes | TList _ | TErr | TVar _ -> t | _ -> bad (); TErr)
     | Sub | Mul | Div -> (match t with TInt | TFloat | TErr | TVar _ -> t | _ -> bad (); TErr)
-    | Mod -> (match t with TInt | TErr | TVar _ -> t | _ -> bad (); TErr)
+    | Mod | BitAnd | BitOr | BitXor | Shl | Shr -> (match t with TInt | TErr | TVar _ -> t | _ -> bad (); TErr)
     | Lt | Le | Gt | Ge -> (match unordered ctx t with None -> () | Some _ -> bad ()); TBool
     | _ -> (match t with TFn _ | TCap _ | TChan _ | TDyn _ -> bad () | _ -> ()); TBool)
 

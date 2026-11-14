@@ -279,6 +279,8 @@ Errors: any type with `fn message(self: T) -> Str` satisfies the prelude's `Erro
 
 `x |> f(a)` is `f(x, a)`: a pipeline reads in the order things happen, one step per line if you like (`lines |> parse_all |> list.sort_by(less) |> top(10)`). It is the loosest operator, so `a + b |> f` is `f(a + b)`.
 
+`Int` has the bitwise operators `&`, `|`, `^`, `<<`, `>>` and `~`, binding as in Go (`x & mask == 0` is `(x & mask) == 0`). Shifting by 64 or more shifts every bit out and a negative count panics, the same in both backends; `>>` keeps the sign, `x.shift_right_unsigned(n)` shifts in zeros.
+
 A panic ends only the task it happens in, and `catch(|| ...)` turns one into `Err(message)`, so `http.serve` answers 500 when a handler panics and keeps serving.
 
 Not yet: nothing big; see the design doc's Known gaps. `Int` is 64-bit and wraps on overflow, identically in the interpreter and in native code.

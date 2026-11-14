@@ -41,7 +41,7 @@ fn keywords() -> List[Str] {
 }
 
 fn two_byte_symbols() -> List[Str] {
-    ["->", "=>", "==", "!=", "<=", ">=", "&&", "||", "??", "|>", ".."]
+    ["->", "=>", "==", "!=", "<=", ">=", "&&", "||", "??", "|>", "..", "<<", ">>"]
 }
 
 fn is_digit(b: Int) -> Bool {
@@ -57,7 +57,7 @@ fn is_ident(b: Int) -> Bool {
 }
 
 fn is_symbol(b: Int) -> Bool {
-    "()\{\}[],:;.|+-*/%!?=<>".bytes().contains(b)
+    "()\{\}[],:;.|+-*/%!?=<>&^~".bytes().contains(b)
 }
 
 // The byte an escape `\e` stands for, if `e` is one.

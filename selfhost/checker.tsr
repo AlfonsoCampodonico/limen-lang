@@ -75,6 +75,14 @@ fn inner(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr) -> (types.Ty, env.S
             }
         },
         EUn(Not, a) => (TBool, expect(st, cx, fx, a, TBool)),
+        EUn(BitNot, a) => {
+            let (t, st) = check_expr(st, cx, fx, a)
+            match st.repr(t) {
+                TInt | TErr => (t, st),
+                TVar(_) => (TInt, st.unify_at(a.span, TInt, t)),
+                _ => (TErr, st.report(diag.error("E0201", a.span, "operator `~` cannot be applied to `{st.show(t)}`"))),
+            }
+        },
         ECall(callee, args) => check_call(st, cx, fx, e, callee, args, e.span, None),
         EMethod(recv, name, nsp, args) => match st.desc(recv) {
             // `Enum.Variant(args)` is a constructor call, not a method call
@@ -1889,6 +1897,11 @@ fn op_name(op: ast.BinOp) -> Str {
         Or => "||",
         Else => "??",
         Range => "..<",
+        BitAnd => "&",
+        BitOr => "|",
+        BitXor => "^",
+        Shl => "<<",
+        Shr => ">>",
     }
 }
 
@@ -1924,7 +1937,7 @@ fn check_bin(st: env.State, cx: env.Cx, fx: env.Fx, op: ast.BinOp, a: ast.Expr, 
                     TInt | TFloat | TErr | TVar(_) => (t, st),
                     _ => (TErr, bad(st)),
                 },
-                Mod => match t {
+                Mod | BitAnd | BitOr | BitXor | Shl | Shr => match t {
                     TInt | TErr | TVar(_) => (t, st),
                     _ => (TErr, bad(st)),
                 },

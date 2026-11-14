@@ -89,6 +89,11 @@ pub fn op(o: ast.BinOp) -> Str {
         Or => "||",
         Else => "??",
         Range => "..<",
+        BitAnd => "&",
+        BitOr => "|",
+        BitXor => "^",
+        Shl => "<<",
+        Shr => ">>",
     }
 }
 
@@ -118,6 +123,7 @@ pub fn expr(e: ast.Expr) -> Str {
         EPipe(a, b) => "(" + expr(a) + "|>" + expr(b) + ")",
         EUn(Neg, a) => "(-" + expr(a) + ")",
         EUn(Not, a) => "(!" + expr(a) + ")",
+        EUn(BitNot, a) => "(~" + expr(a) + ")",
         ECall(f, args) => expr(f) + "(" + commas(args, expr) + ")",
         ENamed(n, _, a) => n + ":" + expr(a),
         EDyn(x, _) => expr(x),

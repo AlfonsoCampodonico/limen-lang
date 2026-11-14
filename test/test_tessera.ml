@@ -25,7 +25,9 @@ let ok name cond msg =
 let grammar_superset =
   [ "tuple-let-refutable"; "select-bad-arm"; "group-until-bad"; "pipe-not-callable"; "pipe-binary-rhs"; "trailing-in-if"; "trailing-in-while";
     "trailing-in-for"; "trailing-in-match";
-    "pattern-two-rests"; "pattern-tuple-named-rest"; "pattern-variant-named-rest"; "pattern-list-two-rests" ]
+    "pattern-two-rests"; "pattern-tuple-named-rest"; "pattern-variant-named-rest"; "pattern-list-two-rests";
+    (* `let (a | b, c) = t` reads as a call of `let` with `a | b` in it *)
+    "pattern-let-or" ]
 
 let dump name src parsed =
   match Sys.getenv_opt "TESSERA_DUMP_DIR" with

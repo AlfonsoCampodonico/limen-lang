@@ -307,6 +307,13 @@ fn binop(k: lexer.Kind) -> Option[(Int, ast.BinOp)] {
         Symbol("*") => Some((12, Mul)),
         Symbol("/") => Some((12, Div)),
         Symbol("%") => Some((12, Mod)),
+        // as in Go: `|` and `^` with `+`, `&` and the shifts with `*`, so
+        // `x & mask == 0` is `(x & mask) == 0`
+        Symbol("|") => Some((10, BitOr)),
+        Symbol("^") => Some((10, BitXor)),
+        Symbol("&") => Some((12, BitAnd)),
+        Symbol("<<") => Some((12, Shl)),
+        Symbol(">>") => Some((12, Shr)),
         // tighter than arithmetic: `m.get(k) ?? 0 + 1` is `(m.get(k) ?? 0) + 1`
         Symbol("??") => Some((14, Else)),
         _ => None,
@@ -360,8 +367,8 @@ fn parse_bin(p: Parser, ns: Bool, min: Int) -> Parsed[ast.Expr] {
 
 fn parse_unary(p: Parser, ns: Bool) -> Parsed[ast.Expr] {
     let start = p.span()
-    if p.is_sym("-") || p.is_sym("!") {
-        let op = if p.is_sym("-") { Neg } else { Not }
+    if p.is_sym("-") || p.is_sym("!") || p.is_sym("~") {
+        let op = if p.is_sym("-") { Neg } else if p.is_sym("!") { Not } else { BitNot }
         let (e, p) = parse_unary(p.skip(), ns)?
         return Ok((mk(EUn(op, e), merge(start, e.span)), p))
     }

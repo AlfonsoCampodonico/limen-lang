@@ -540,6 +540,11 @@ pub fn lower(self: Lx, e: ast.Expr) -> (ir.Atom, Lx) {
             let (x, lx) = lx.lower(a)
             lx.tmp(TBool, Flip(x))
         },
+        EUn(BitNot, a) => {
+            // `~x` is `x ^ -1`
+            let (x, lx) = lx.lower(a)
+            lx.tmp(TInt, Bin(BitXor, TInt, x, AInt(-1), sp))
+        },
         ECall(callee, args) => lx.lower_call(e, callee, args, ty),
         ENamed(..) => panic("internal: the checker puts named arguments in order"),
         EMethod(recv, name, _, args) => lx.lower_method_expr(e, recv, name, args, ty),

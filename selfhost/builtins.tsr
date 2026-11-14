@@ -58,6 +58,7 @@ pub fn methods(t: types.Ty, u: types.Ty) -> List[Method] {
             m("to_char", [], TStr),
             m("min", [TInt], TInt),
             m("max", [TInt], TInt),
+            m("shift_right_unsigned", [TInt], TInt),
         ],
         TFloat => [m("to_str", [], TStr), m("to_int", [], TInt), m("abs", [], TFloat), m("sqrt", [], TFloat), m("to_fixed", [TInt], TStr)],
         TBool => [m("to_str", [], TStr)],

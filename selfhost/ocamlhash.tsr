@@ -10,9 +10,6 @@
 // key goes in bucket `hash land (buckets - 1)`, at the front, and doubling
 // keeps the order inside a bucket. Listing goes through the buckets in
 // order, each from its front.
-//
-// Tessera has no bitwise operators, so the hash's 32-bit operations are
-// spelled with arithmetic.
 
 // The keys of a table that got them in this order, each once, in the
 // order Hashtbl.to_seq_keys lists them.
@@ -28,13 +25,15 @@ pub fn order(keys: List[Str]) -> List[Str] {
 }
 
 // What Hashtbl.hash gives for a string: MurmurHash3's mixing of its bytes,
-// four at a time, then of its length.
+// four at a time, then of its length. A 32-bit word is an Int from 0 to
+// 2^32 - 1, kept there with `& mask()`; Int arithmetic wraps at 64 bits,
+// which keeps the low 32 bits of a product right.
 pub fn hash(s: Str) -> Int {
     let bs = s.bytes()
     let mut h = 0
     let mut i = 0
     while i + 4 <= bs.len() {
-        h = mix(h, bs[i] + bs[i + 1] * 256 + bs[i + 2] * 65536 + bs[i + 3] * 16777216)
+        h = mix(h, bs[i] | bs[i + 1] << 8 | bs[i + 2] << 16 | bs[i + 3] << 24)
         i = i + 4
     }
     let left = bs.len() - i
@@ -42,65 +41,31 @@ pub fn hash(s: Str) -> Int {
         let mut w = 0
         let mut k = left - 1
         while k >= 0 {
-            w = w * 256 + bs[i + k]
+            w = w << 8 | bs[i + k]
             k = k - 1
         }
         h = mix(h, w)
     }
-    h = xor(h, bs.len())
+    h = h ^ bs.len()
     // the final mix
-    h = xor(h, h / 65536)
-    h = mul(h, 2246822507)
-    h = xor(h, h / 8192)
-    h = mul(h, 3266489909)
-    h = xor(h, h / 65536)
-    h % 1073741824
+    h = h ^ h >> 16
+    h = h * 2246822507 & mask()
+    h = h ^ h >> 13
+    h = h * 3266489909 & mask()
+    h = h ^ h >> 16
+    h & 1073741823
+}
+
+fn mask() -> Int {
+    4294967295
 }
 
 fn mix(h: Int, d: Int) -> Int {
-    let mut d = mul(d, 3432918353)
-    d = rotl(d, 15)
-    d = mul(d, 461845907)
-    let mut h = xor(h, d)
-    h = rotl(h, 13)
-    low32(h * 5 + 3864292196)
-}
-
-fn low32(x: Int) -> Int {
-    let m = 4294967296
-    (x % m + m) % m
-}
-
-// Int arithmetic wraps at 64 bits, which keeps the low 32 bits right.
-fn mul(a: Int, b: Int) -> Int {
-    low32(a * b)
+    let d = rotl(d * 3432918353 & mask(), 15) * 461845907 & mask()
+    let h = rotl(h ^ d, 13)
+    (h * 5 + 3864292196) & mask()
 }
 
 fn rotl(x: Int, n: Int) -> Int {
-    let p = pow2(n)
-    low32(x * p) + x / pow2(32 - n)
-}
-
-fn pow2(n: Int) -> Int {
-    let mut p = 1
-    for _ in 0..<n {
-        p = p * 2
-    }
-    p
-}
-
-fn xor(a: Int, b: Int) -> Int {
-    let mut a = a
-    let mut b = b
-    let mut out = 0
-    let mut bit = 1
-    while a > 0 || b > 0 {
-        if a % 2 != b % 2 {
-            out = out + bit
-        }
-        a = a / 2
-        b = b / 2
-        bit = bit * 2
-    }
-    out
+    (x << n | x >> (32 - n)) & mask()
 }

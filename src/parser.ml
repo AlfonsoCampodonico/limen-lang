@@ -168,6 +168,13 @@ let binop_of = function
   | SYM "*" -> Some (12, Mul)
   | SYM "/" -> Some (12, Div)
   | SYM "%" -> Some (12, Mod)
+  (* as in Go: `|` and `^` with `+`, `&` and the shifts with `*`, so
+     `x & mask == 0` is `(x & mask) == 0` *)
+  | SYM "|" -> Some (10, BitOr)
+  | SYM "^" -> Some (10, BitXor)
+  | SYM "&" -> Some (12, BitAnd)
+  | SYM "<<" -> Some (12, Shl)
+  | SYM ">>" -> Some (12, Shr)
   (* tighter than arithmetic: `m.get(k) ?? 0 + 1` is `(m.get(k) ?? 0) + 1` *)
   | SYM "??" -> Some (14, Else)
   | _ -> None
@@ -215,6 +222,11 @@ and parse_unary st ns =
     skip st;
     let e = parse_unary st ns in
     mk (EUn (Not, e)) (merge sp e.espan)
+  | SYM "~" ->
+    let sp = cur_span st in
+    skip st;
+    let e = parse_unary st ns in
+    mk (EUn (BitNot, e)) (merge sp e.espan)
   | _ -> parse_postfix st ns (parse_primary st ns)
 
 (* [in_safe]: parsing the rest of a `?.` chain, which takes every postfix
