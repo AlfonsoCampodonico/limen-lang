@@ -1,10 +1,11 @@
 #!/bin/sh
 # Compare the Tessera lexer, parser, module loader and type checker
 # (selfhost/*.tsr) with the OCaml ones (src/lexer.ml, src/parser.ml,
-# src/modules.ml and src/check.ml, through selfhost/tokdump,
-# selfhost/astdump, selfhost/loaddump and selfhost/checkdump): same tokens,
-# same trees, same loaded programs, same types and rewrites, same
-# positions, same errors.
+# src/modules.ml, and src/check.ml with the capability checks of
+# src/package.ml, through selfhost/tokdump, selfhost/astdump,
+# selfhost/loaddump and selfhost/checkdump): same tokens, same trees, same
+# loaded programs, same types and rewrites, same capabilities per
+# function, same positions, same errors.
 #   sh selfhost/check.sh
 # They are compared on every .tsr file in the repository, on the edge cases
 # in selfhost/tests (the loader's in selfhost/tests/load, one directory
@@ -69,63 +70,11 @@ compare_load() {
   same "$1/$2"
 }
 
-# The checker is ported in two parts. These files use what the second part
-# will port, so they are not compared yet: interfaces and bounds on them,
-# `dyn` values, the `Error` interface on a program's own types, bounds on
-# structs and enums, foreign functions (C). Each is named with what it
-# uses; a book example as book/PATH. The list is to shrink to nothing: a
-# file on it must still need part 2 (the Tessera checker says so), and one
-# that compares the same must come off it.
-part2="
-examples/dyn.tsr: interfaces, dyn values, interface bounds
-examples/ffi.tsr: foreign functions
-examples/generics.tsr: interfaces, bounds on structs and enums, generic interface bounds, dyn values
-examples/interfaces.tsr: interfaces, interface bounds
-examples/notes.tsr: foreign functions (std sql)
-examples/todo_api.tsr: foreign functions (std sql)
-examples/tour.tsr: interfaces, dyn values, the Error interface
-grammar/tests/accept/foreign-c.tsr: foreign functions
-grammar/tests/accept/interfaces.tsr: interfaces
-selfhost/tests/ok-foreign.tsr: foreign functions
-src/std/errors.tsr: dyn values
-src/std/sql.tsr: foreign functions
-book/ch08-03-context/main.tsr: dyn values (std errors)
-book/ch08-04-own-error/main.tsr: the Error interface
-book/ch10-02-interfaces/main.tsr: interfaces, interface bounds
-book/ch10-03-unsatisfied/main.tsr: interfaces, interface bounds
-book/ch10-04-generic-interfaces/main.tsr: interfaces, generic interface bounds
-book/ch10-05-dyn/main.tsr: interfaces, dyn values
-book/ch11-04-fakes/main.tsr: interfaces, interface bounds
-book/ch12-07-sandbox/main.tsr: foreign functions
-book/ch14-05-sql/main.tsr: foreign functions (std sql)
-book/ch15-01-strtol/main.tsr: foreign functions
-book/ch15-02-more-c/main.tsr: foreign functions
-book/ch15-03-closure-callback/main.tsr: foreign functions
-book/ch16-links/api.tsr: foreign functions
-book/ch16-links/main.tsr: foreign functions, dyn values
-book/ch16-links/store.tsr: foreign functions
-"
-skipped=0
-
 # compare_check DIR FILE: check DIR/FILE with both checkers, as
 # compare_load loads it
 compare_check() {
   (cd "$1" && "$checkdump" "$2") > "$out/want" 2>&1 || true
   "$out/check" --grant "fs=$grant:ro" -- "$std" "$(inside "$(cd "$1" && pwd)")" "$2" > "$out/got" 2>&1 || true
-  key=$1/$2
-  if [ -d "$book" ]; then
-    key=$(echo "$key" | sed "s|^$book/|book/|")
-  fi
-  if echo "$part2" | grep -q "^$key: "; then
-    if cmp -s "$out/want" "$out/got"; then
-      echo "compares the same, so it comes off the part-2 list: $key"
-      return 1
-    fi
-    if grep -q '^UNPORTED' "$out/got"; then
-      skipped=$((skipped + 1))
-      return 0
-    fi
-  fi
   same "$1/$2"
 }
 
@@ -154,12 +103,7 @@ check() {
     n=$((n + 1))
     $how "$(dirname "$f")" "$(basename "$f")" || bad=$((bad + 1))
   done
-  if [ "$skipped" -gt 0 ]; then
-    echo "$((n - bad - skipped))/$((n - skipped)) $label ($skipped on the part-2 list)"
-  else
-    echo "$((n - bad))/$n $label"
-  fi
-  skipped=0
+  echo "$((n - bad))/$n $label"
   [ "$bad" -eq 0 ] || failed=1
 }
 

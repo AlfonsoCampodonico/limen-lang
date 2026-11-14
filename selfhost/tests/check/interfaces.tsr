@@ -1,0 +1,148 @@
+// Interfaces: declaring them, bounds that name them, methods called
+// through a bound, and whether a type satisfies one (E0111), with each
+// reason it can fail.
+interface Shape {
+    fn area(self) -> Float
+    fn name(self) -> Str
+}
+
+interface Show {
+    fn show(self, width: Int, fill: Str) -> Str
+}
+
+struct Circle {
+    r: Float,
+}
+
+fn area(self: Circle) -> Float {
+    self.r * self.r * 3.0
+}
+
+fn name(self: Circle) -> Str {
+    "circle"
+}
+
+struct Square {
+    side: Float,
+}
+
+// the wrong type for `area`, and no `name`
+fn area(self: Square) -> Int {
+    1
+}
+
+enum Dot {
+    Here,
+}
+
+fn show(self: Dot, width: Int, fill: Str) -> Str {
+    fill
+}
+
+struct Plain {
+    x: Int,
+}
+
+// a method promoted from two embedded structs at the same depth
+struct Left {
+    x: Int,
+}
+
+struct Right {
+    y: Int,
+}
+
+fn name(self: Left) -> Str {
+    "left"
+}
+
+fn area(self: Left) -> Float {
+    1.0
+}
+
+fn name(self: Right) -> Str {
+    "right"
+}
+
+struct Both {
+    Left,
+    Right,
+}
+
+fn describe[T: Shape](x: T) -> Str {
+    "{x.name()}: {x.area()}"
+}
+
+fn padded[T: Show](x: T) -> Str {
+    let a = x.show(3, "*")
+    let b = x.show(fill: "-", width: 2)
+    let c = x.show(wdth: 2, fill: "-")
+    let d = x.show(1)
+    let e = x.shw(1, "")
+    a + b + c + d + e
+}
+
+fn unbounded[T](x: T) -> Str {
+    x.name()
+}
+
+fn twice[T: Shape + Show](x: T) -> Str {
+    x.size()
+}
+
+fn bad_bounds[A: Shap, B: Int, C: Show[Int]](a: A, b: B, c: C) {}
+
+fn as_type(s: Shape, l: List[Show]) {}
+
+fn forward[T: Shape](x: T) -> Str {
+    // a type parameter passed on: its own bounds decide
+    describe(x)
+}
+
+fn forward_unbounded[T](x: T) -> Str {
+    describe(x)
+}
+
+fn forward_other[T: Show](x: T) -> Str {
+    describe(x)
+}
+
+// bounded by other interfaces that declare the same methods: their types decide
+interface Sized {
+    fn area(self) -> Float
+    fn name(self) -> Str
+}
+
+interface Measured {
+    fn area(self) -> Int
+    fn name(self) -> Str
+}
+
+fn through_sized[T: Sized](x: T) -> Str {
+    describe(x)
+}
+
+fn through_measured[T: Measured](x: T) -> Str {
+    describe(x)
+}
+
+// a `dyn` value: its interface's methods decide
+fn through_dyn(a: dyn Shape, b: dyn Sized, c: dyn Measured, d: dyn Show) -> Str {
+    describe(a) + describe(b) + describe(c) + describe(d)
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    out.print(describe(Circle { r: 1.0 }))
+    out.print(describe(Square { side: 2.0 }))
+    out.print(describe(Plain { x: 1 }))
+    out.print(describe(1))
+    out.print(describe("text"))
+    out.print(describe(Both { Left: Left { x: 1 }, Right: Right { y: 2 } }))
+    out.print(padded(Here))
+    out.print(padded(Circle { r: 2.0 }))
+    // the same failure twice in one function is reported once
+    out.print(describe(Square { side: 3.0 }))
+    let m = Circle { r: 1.0 }.area
+    out.print("{m()}")
+}

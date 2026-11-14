@@ -48,7 +48,7 @@ fn below(e: ast.Expr) -> List[ast.Expr] {
         }),
         EList(items) => all(items),
         EBin(_, a, b) | EPipe(a, b) | EIndex(a, b) | ESafe(a, _, b) => expr(a) + expr(b),
-        EUn(_, a) | EField(a, _, _) | ENamed(_, _, a) | EClosure(_, a) => expr(a),
+        EUn(_, a) | EField(a, _, _) | ENamed(_, _, a) | EClosure(_, a) | EDyn(a, _) => expr(a),
         ECall(f, args) | EMethod(f, _, _, args) => expr(f) + all(args),
         ETry(a, context) => expr(a) + maybe(context),
         EIf(c, then, other) => expr(c) + block(then) + maybe(other),

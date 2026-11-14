@@ -1,10 +1,15 @@
 // Prints what selfhost/typecheck.tsr makes of one file, in the format of
 // selfhost/checkdump (the OCaml checker's), so the two can be compared:
 // the problems, each as ERROR or WARNING, CODE FILE LO HI, its message,
-// its notes and its fix; then each item of the program as the checker
-// rewrote it, and under it one line per expression, in the order
-// selfhost/walk.tsr visits them: its type, the type arguments of a generic
-// function's use, and `nested` for `a?.b` whose rest is an Option already.
+// its notes and its fix, as `tessera check` reports them (the checker's
+// errors, or else those of the capability checks of selfhost/caps.tsr,
+// then the checker's warnings); then what `tessera caps` reports of each
+// function: CAPS NAME FILE LO HI, its capabilities, and whether it runs
+// callbacks; then each item of the program as the checker rewrote it, and
+// under it one line per expression, in the order selfhost/walk.tsr visits
+// them: its type, the type arguments of a generic function's use, `nested`
+// for `a?.b` whose rest is an Option already, and `dyn I` for a value
+// boxed as `dyn I`.
 // A program the loader cannot load prints the loader's problems instead,
 // as selfhost/load.tsr does.
 //
@@ -13,6 +18,7 @@
 //   tessera run selfhost/check.tsr --grant fs=..:ro -- tessera/src/std tessera/examples hello.tsr
 use ast
 use ast_print
+use caps
 use diag
 use disk
 use env
@@ -60,13 +66,9 @@ fn main(root: Root) -> Int {
     }
     let c = typecheck.check_program(p.items, p.files, p.next_id, methods, p.forwarders)
     let st = c.state
-    // what the Tessera checker does not do yet: a line here makes the
-    // comparison fail
-    for what in st.unported {
-        out.print("UNPORTED {what}")
-    }
-    let files = st_files(p.files)
-    for d in c.diags {
+    let files = st_files(p.files) + [diag.Source { path: "<std>/tessera.toml", text: "" }]
+    let diags = caps.check(fs, place, files, files.len() - 1, p.std_manifest, p.std_modules, p.manifest, p.packages, p.items, c)
+    for d in diags {
         out.print("{if d.warning { "WARNING" } else { "ERROR" }} {d.code} {diag.path_of(files, d.span.file)} {d.span.lo} {d.span.hi}")
         out.print(d.message)
         for n in d.notes {
@@ -81,6 +83,9 @@ fn main(root: Root) -> Int {
             },
             None => {},
         }
+    }
+    for i in c.infos {
+        out.print("CAPS {i.name} {diag.path_of(files, i.span.file)} {i.span.lo} {i.span.hi} [{i.caps.join(",")}] {i.callbacks}")
     }
     for i in c.items {
         out.print(ast_print.item_line(i))
@@ -102,5 +107,9 @@ fn line(st: env.State, e: ast.Expr) -> Str {
     let inst = st.inst_of(e)
     let shown = st.show(st.type_of(e))
     let typed = if inst.is_empty() { shown } else { shown + " inst " + inst.map(|p| p.0 + "=" + st.show(p.1)).join(",") }
-    if st.nested.contains(e.id) { typed + " nested" } else { typed }
+    let nested = if st.nested.contains(e.id) { typed + " nested" } else { typed }
+    match e.desc {
+        EDyn(_, i) => nested + " dyn " + i,
+        _ => nested,
+    }
 }

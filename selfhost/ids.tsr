@@ -142,6 +142,10 @@ pub fn expr(e: ast.Expr, next: Int) -> (ast.Expr, Int) {
             let (value, n) = expr(value, n)
             (ENamed(name, span, value), n)
         },
+        EDyn(value, iface) => {
+            let (value, n) = expr(value, n)
+            (EDyn(value, iface), n)
+        },
     }
     ({ e with desc, id: next }, n)
 }

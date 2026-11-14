@@ -1,0 +1,4 @@
+// Takes Root, which no dependency can be granted, and Net, which it is.
+pub fn everything(root: Root) {}
+
+pub fn fetch(net: Net, fs: Fs) {}

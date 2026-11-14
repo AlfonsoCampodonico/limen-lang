@@ -1,0 +1,14 @@
+// A dependency that takes more than tessera.toml grants it (E0320): a
+// capability left out of its caps, Root (never granted), and Foreign
+// (only [trust] gives it). Conn comes with listen as well as net.
+use clib
+use fetch
+use rooty
+use serve
+
+fn main(root: Root) {
+    let page = fetch.get(root.net, "https://example.com")
+    rooty.everything(root)
+    let n = clib.abs(root.foreign, -1)
+    let c = serve.accept(root.listen)
+}

@@ -1,0 +1,39 @@
+// Declaring interfaces: a method declared twice, a built-in bound's name,
+// a name taken twice (the last declaration's methods are the ones that
+// count), and a type that does not exist in a method's signature.
+interface Shape {
+    fn area(self) -> Float
+    fn name(self) -> Str
+    fn area(self) -> Int
+}
+
+interface Ordered {
+    fn less(self, other: Int) -> Bool
+}
+
+interface Key {}
+
+struct Shape {
+    x: Int,
+}
+
+interface Shape {
+    fn other(self, x: Nope) -> Strr
+}
+
+interface Box[T] {
+    fn get(self) -> T
+    fn put(self, x: T, y: U)
+}
+
+fn other(self: Shape, x: Int) -> Str {
+    "x"
+}
+
+fn use_it[T: Shape](x: T) -> Str {
+    x.other(1)
+}
+
+fn main() {
+    let s = use_it(Shape { x: 1 })
+}

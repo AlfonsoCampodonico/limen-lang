@@ -419,6 +419,10 @@ pub fn expr(st: State, cx: Context, locals: List[Str], e: ast.Expr) -> (ast.Expr
             let (a, st) = ex(st, a)
             set(e, ENamed(n, span, a), st)
         },
+        EDyn(a, iface) => {
+            let (a, st) = ex(st, a)
+            set(e, EDyn(a, iface), st)
+        },
         EMethod(r, name, nsp, args) => method(st, cx, locals, e, r, name, nsp, args),
         EField(r, name, nsp) => field(st, cx, locals, e, r, name, nsp),
         EIndex(a, i) => {

@@ -23,6 +23,11 @@ use types
 
 pub fn check_expr(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr) -> (types.Ty, env.State) {
     let (t, st) = inner(st, cx, fx, e)
+    // a call can make the type of a generic interface bound known
+    let st = match st.desc(e) {
+        ECall(..) | EMethod(..) => infer_pending(st, cx),
+        _ => st,
+    }
     (t, st.set_type(e, t))
 }
 
@@ -122,6 +127,15 @@ fn inner(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr) -> (types.Ty, env.S
         EPipe(..) => panic("pipes are expanded when modules load"),
         EWith(base, fields) => check_with(st, cx, fx, base, fields, e.span),
         ESafe(base, x, rest) => check_safe(st, cx, fx, e, base, x, rest),
+        EDyn(x, i) => {
+            // checked again: the type it was boxed as
+            let before = st.repr(st.type_of(e))
+            let (_, st) = check_expr(st, cx, fx, x)
+            match before {
+                TDyn(..) => (before, st),
+                _ => (TDyn(i, []), st),
+            }
+        },
         ENamed(n, nsp, x) => {
             // a label the call did not take away: the callee has no
             // parameter names
@@ -224,18 +238,181 @@ fn is_dyn(st: env.State, t: types.Ty) -> Bool {
 // A value used where `dyn I` is expected: box it if its type satisfies I.
 fn coerce(st: env.State, cx: env.Cx, e: ast.Expr, t: types.Ty, b: env.Bound) -> env.State {
     let boxed = TDyn(b.iface, b.args)
+    let bn = st.show_bound(b)
     match st.repr(t) {
         TDyn(j, _) if j == b.iface => st.unify_at(e.span, boxed, t),
         TVar(_) => st.unify_at(e.span, boxed, t),
         TErr => st,
-        TStr | TNamed("IoError", _) if b.iface == "Error" => st.unported("dyn values"),
-        TNamed(n, _) if (cx.structs.contains(n) || cx.enums.contains(n)) && !["Option", "Result", "IoError"].contains(n) => st.unported("dyn values"),
+        // the built-in errors: a message, no cause
+        TStr | TNamed("IoError", _) if b.iface == "Error" => box(st, e, b),
+        TNamed(n, _) if (cx.structs.contains(n) || cx.enums.contains(n)) && !["Option", "Result", "IoError"].contains(n) => {
+            let ct = st.repr(t)
+            if !st.subst.caps_in(ct, []).is_empty() || st.subst.has_fn(ct) || st.subst.has_chan(ct) {
+                let d = diag.error("E0112", e.span, "`{st.show(ct)}` holds a capability, function or channel, so it cannot become `dyn {bn}`").note("authority must stay visible in types; pass it with a type parameter, as in `[T: " + bn + "]`")
+                return st.report(d)
+            }
+            match satisfies(st, cx, ct, b) {
+                (Some(why), st) => st.report(diag.error("E0111", e.span, "`{st.show(ct)}` does not satisfy interface `{bn}`").note(why)),
+                (None, st) => box(st, e, b),
+            }
+        },
         other => {
-            let bn = st.show_bound(b)
             let d = diag.error("E0112", e.span, "only struct and enum values can become `dyn {bn}`, not `{st.show(other)}`").note("wrap the value in a struct that has the interface's methods")
             st.report(d)
         },
     }
+}
+
+// `e`, already checked, becomes `EDyn(inner, I)`: `inner` is a new
+// expression with what was known of `e` (its form, type and type
+// arguments), and `e` is the boxed value, of type `dyn I`.
+fn box(st: env.State, e: ast.Expr, b: env.Bound) -> env.State {
+    let (inner, st) = st.node(st.desc(e), e.span)
+    let mut st = st.set_type(inner, st.type_of(e)).set_inst(inner, st.inst_of(e))
+    if st.nested.contains(e.id) {
+        st.nested[inner.id] = true
+    }
+    st.rewrite(e, EDyn(inner, b.iface)).set_type(e, TDyn(b.iface, b.args))
+}
+
+// Does `t` have every method of bound `b`, with the same types? None if
+// so, else why not. Unifying the method types infers the bound's
+// arguments where they are unknown.
+pub fn satisfies(st: env.State, cx: env.Cx, t: types.Ty, b: env.Bound) -> (Option[Str], env.State) {
+    let mut st = st
+    let ms = iface_methods(st, cx, b)
+    let t = st.repr(t)
+    let name = st.show_bound(b)
+    // the bound's own arguments, unified with `args`
+    let same_args = |st: env.State, args: List[types.Ty]| {
+        if args.len() != b.args.len() {
+            return (false, st)
+        }
+        let mut st = st
+        for (x, y) in b.args.zip(args) {
+            let (ok, next) = st.unify(x, y)
+            st = next
+            if !ok {
+                return (false, st)
+            }
+        }
+        (true, st)
+    }
+    match t {
+        TDyn(j, ja) if j == b.iface => {
+            let (same, next) = same_args(st, ja)
+            st = next
+            if same {
+                return (None, st)
+            }
+        },
+        TParam(g) => {
+            for x in bounds_of(st, g) {
+                if x.iface == b.iface {
+                    let (same, next) = same_args(st, x.args)
+                    st = next
+                    if same {
+                        return (None, st)
+                    }
+                }
+            }
+        },
+        _ => {},
+    }
+    for m in ms {
+        // `cause` is optional in `Error`: a type without one has no cause
+        let own = match t {
+            TNamed(n, _) => cx.fns.contains(n + "::" + m.name) || builtins.names(t).contains(m.name),
+            TParam(_) | TDyn(..) => true,
+            _ => builtins.names(t).contains(m.name),
+        }
+        if b.iface == "Error" && m.name == "cause" && !own {
+            continue
+        }
+        let (why, next) = method_fits(st, cx, t, name, m)
+        st = next
+        if why.is_some() {
+            return (why, st)
+        }
+    }
+    (None, st)
+}
+
+// Whether `t` has method `m` of the interface called `name` (as shown),
+// with its type; why not if it does not.
+fn method_fits(st: env.State, cx: env.Cx, t: types.Ty, name: Str, m: env.IfaceMethod) -> (Option[Str], env.State) {
+    let want = TFn(m.params, m.ret)
+    let trial = |st: env.State, got: types.Ty| {
+        let (ok, st) = st.unify(want, got)
+        if ok {
+            return (None, st)
+        }
+        (Some("its `{m.name}` has type `{st.show(got)}`, but `{name}` needs `{st.show(want)}`"), st)
+    }
+    let key = |n: Str| n + "::" + m.name
+    match t {
+        TVar(_) | TErr => (None, st),
+        TDyn(j, ja) => match iface_methods(st, cx, env.Bound { iface: j, args: ja }).find(|x| x.name == m.name) {
+            Some(x) => trial(st, TFn(x.params, x.ret)),
+            None => (Some("`{st.show(t)}` has no method `{m.name}`"), st),
+        },
+        TParam(g) => {
+            for x in bounds_of(st, g) {
+                match iface_methods(st, cx, x).find(|y| y.name == m.name) {
+                    Some(y) => {
+                        return trial(st, TFn(y.params, y.ret))
+                    },
+                    None => {},
+                }
+            }
+            (Some("type parameter `{g}` is not bounded by `{name}`; add it: `[{g}: {name}]`"), st)
+        },
+        TNamed(n, _) if cx.fns.contains(key(n)) => {
+            let (_, ft, st) = instantiate(st, cx.fns.get(key(n)) ?? env.Sig { gen: [], params: [], ret: TErr })
+            match ft {
+                TFn([p0, ..rest], r) => trial(st.unify(p0, t).1, TFn(rest, r)),
+                _ => (Some("its `{m.name}` is not a method"), st),
+            }
+        },
+        TNamed(n, _) if is_ambiguous(promote(cx, false, n, m.name)) => match promote(cx, false, n, m.name) {
+            Ambiguous(paths) => (Some(ambiguity(n, m.name, paths)), st),
+            _ => (None, st),
+        },
+        _ => {
+            let (u, st) = st.fresh()
+            match builtins.find(t, u, m.name) {
+                Some(x) => trial(st, TFn(x.params, x.result)),
+                None => (Some("`{st.show(t)}` has no method `{m.name}`"), st),
+            }
+        },
+    }
+}
+
+fn is_ambiguous(f: Found) -> Bool {
+    match f {
+        Ambiguous(_) => true,
+        _ => false,
+    }
+}
+
+// Infer the arguments of the generic-interface bounds of the calls made so
+// far whose type is now known, so `first(xs)` has its result type at once.
+fn infer_pending(st: env.State, cx: env.Cx) -> env.State {
+    if st.to_infer.is_empty() {
+        return st
+    }
+    let mut st = st
+    let mut keep: List[(types.Ty, env.Bound)] = []
+    for (t, b) in st.to_infer {
+        match st.repr(t) {
+            TVar(_) => keep.push((t, b)),
+            _ => {
+                st = satisfies(st, cx, t, b).1
+            },
+        }
+    }
+    st.to_infer = keep
+    st
 }
 
 fn expect_plain(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, want: types.Ty) -> env.State {
@@ -334,7 +511,7 @@ fn add_bounds(st: env.State, cx: env.Cx, name: Str, inst: List[(Str, types.Ty)],
                     let bound = st.subst_bound(inst, bound)
                     st.pending = [env.Pending { span: sp, ty: t, bound, param: b.param }] + st.pending
                     if !bound.args.is_empty() {
-                        st = st.unported("generic interface bounds")
+                        st.to_infer = [(t, bound)] + st.to_infer
                     }
                 }
             },
@@ -574,7 +751,7 @@ fn pure(st: env.State, x: ast.Expr) -> Bool {
             SPLit(_) => true,
             SPExpr(_) => false,
         }),
-        EField(a, _, _) => pure(st, a),
+        EField(a, _, _) | EDyn(a, _) => pure(st, a),
         _ => false,
     }
 }
@@ -725,14 +902,16 @@ fn check_call(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, callee: ast.Ex
                 st = st.report(diag.error("E0107", sp, "this function takes {ps.len()} argument{env.plural(ps.len())} but {args2.len()} {env.was_were(args2.len())} supplied"))
                 st = check_args(st, cx, fx, args2)
             } else {
-                match st.desc(callee) {
-                    EVar(n) if !fx.is_local(n) && cx.foreign_fns.contains(n) => {
-                        st = st.unported("foreign functions")
-                    },
-                    _ => {},
+                let foreign = match st.desc(callee) {
+                    EVar(n) => !fx.is_local(n) && cx.foreign_fns.contains(n),
+                    _ => false,
                 }
+                let ps = if foreign { callback_params(st, cx, fx, args2, ps) } else { ps }
                 for (a, p) in args2.zip(ps) {
                     st = expect(st, cx, fx, a, p)
+                }
+                if foreign {
+                    st = check_callbacks(st, cx, fx, args2, ps)
                 }
             }
             if labelled {
@@ -756,6 +935,52 @@ fn check_call(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, callee: ast.Ex
             (TErr, check_args(st, cx, fx, args))
         },
     }
+}
+
+// The parameter types of a call of a foreign function: a callback may
+// take the call's Foreign first, before what C passes.
+fn callback_params(st: env.State, cx: env.Cx, fx: env.Fx, args: List[ast.Expr], ps: List[types.Ty]) -> List[types.Ty] {
+    match ps {
+        [TCap("Foreign"), ..] => {},
+        _ => {
+            return ps
+        },
+    }
+    args.zip(ps).map(|x| {
+        let (a, p) = x
+        match (st.repr(p), st.desc(a)) {
+            (TFn(cps, r), EVar(m)) if !fx.is_local(m) => match cx.fns.get(m) {
+                Some(s) => match s.params {
+                    [TCap("Foreign"), ..rest] if rest.len() == cps.len() => TFn([TCap("Foreign")] + cps, r),
+                    _ => p,
+                },
+                None => p,
+            },
+            _ => p,
+        }
+    })
+}
+
+// A callback passed to C names a top-level function: C calls it with its
+// arguments alone, so it has nowhere to keep a closure's captured values.
+fn check_callbacks(st: env.State, cx: env.Cx, fx: env.Fx, args: List[ast.Expr], ps: List[types.Ty]) -> env.State {
+    let mut st = st
+    for (a, p) in args.zip(ps) {
+        match st.repr(p) {
+            TFn(..) => {
+                let named = match st.desc(a) {
+                    EVar(m) => !fx.is_local(m) && (cx.fns.get(m).map(|s| s.gen.is_empty()) ?? false),
+                    _ => false,
+                }
+                if !named {
+                    let d = diag.error("E0332", a.span, "a callback to C is a top-level function, passed by its name").note("C calls it with its arguments alone, so it has nowhere to keep a closure's captured values; pass what it needs through C (most C functions that take a callback also take a pointer for it)")
+                    st = st.report(d)
+                }
+            },
+            _ => {},
+        }
+    }
+    st
 }
 
 // ---------- fields and methods ----------
@@ -1496,8 +1721,7 @@ fn error_conversion(st: env.State, cx: env.Cx, e: types.Ty) -> (Option[Str], env
             if !st.subst.caps_in(ct, []).is_empty() || st.subst.has_fn(ct) || st.subst.has_chan(ct) {
                 return (Some("`{st.show(ct)}` holds a capability, function or channel"), st)
             }
-            // whether it satisfies `Error`: part 2
-            (None, st.unported("the Error interface"))
+            satisfies(st, cx, ct, env.Bound { iface: "Error", args: [] })
         },
         t => (Some("`{st.show(t)}` does not satisfy `Error`"), st),
     }

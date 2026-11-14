@@ -1,0 +1,9 @@
+# Each dependency may take only the capabilities its line grants (E0320).
+[package]
+name = "app"
+
+[dependencies]
+fetch = { path = "fetch", caps = ["fs"] }
+rooty = { path = "rooty", caps = ["net", "fs"] }
+clib = { path = "clib" }
+serve = { path = "serve", caps = ["listen"] }

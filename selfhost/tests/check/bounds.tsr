@@ -1,0 +1,158 @@
+// Bounds on structs and enums, checked wherever the type is used (in
+// declarations too); the bounds a method's parameter types imply; generic
+// interfaces, whose arguments a call infers from the type's methods.
+interface Container[T] {
+    fn get(self, i: Int) -> Option[T]
+    fn size(self) -> Int
+}
+
+interface Pair[A, B] {
+    fn left(self) -> A
+    fn right(self) -> B
+}
+
+interface Show {
+    fn show(self) -> Str
+}
+
+struct Shelf {
+    items: List[Str],
+}
+
+fn get(self: Shelf, i: Int) -> Option[Str] {
+    self.items.get(i)
+}
+
+fn size(self: Shelf) -> Int {
+    self.items.len()
+}
+
+struct Numbers {
+    items: List[Int],
+}
+
+fn get(self: Numbers, i: Int) -> Option[Int] {
+    self.items.get(i)
+}
+
+fn size(self: Numbers) -> Str {
+    "many"
+}
+
+struct Two {
+    a: Int,
+}
+
+fn left(self: Two) -> Int {
+    self.a
+}
+
+fn right(self: Two) -> Str {
+    "two"
+}
+
+fn first[C: Container[T], T](c: C) -> Option[T] {
+    c.get(0)
+}
+
+fn sides[P: Pair[A, B], A, B](p: P) -> (A, B) {
+    (p.left(), p.right())
+}
+
+fn ints[C: Container[Int]](c: C) -> Int {
+    c.size()
+}
+
+// a struct whose items must be ordered, and an enum whose keys must be keys
+struct Sorted[T: Ordered] {
+    items: List[T],
+}
+
+enum Index[K: Key, V] {
+    Empty,
+    One(K, V),
+}
+
+struct Labeled[T: Show] {
+    item: T,
+}
+
+struct Plain {
+    x: Int,
+}
+
+// an interface's own parameters have no bounds to check
+interface Sorter[T] {
+    fn sorted(self) -> Sorted[T]
+}
+
+// another name for an interface with its arguments, used as a bound
+type Strings = Container[Str]
+
+type Wrong = Container
+
+fn count[C: Strings](c: C) -> Int {
+    c.size()
+}
+
+fn show(self: Plain) -> Str {
+    "plain"
+}
+
+struct Mute {
+    x: Int,
+}
+
+// T has the bounds of `Sorted`'s parameter here
+fn add[T](self: Sorted[T], x: T) -> Sorted[T] {
+    let mut items = self.items
+    items.push(x)
+    Sorted { items: items.sort() }
+}
+
+fn lookup[K, V](self: Index[K, V], k: K) -> Option[V] {
+    let m = map([(k, 1)])
+    match self {
+        Empty => None,
+        One(key, v) => if key == k { Some(v) } else { None },
+    }
+}
+
+// a result type does not imply bounds
+fn make[T](x: T) -> Sorted[T] {
+    Sorted { items: [x] }
+}
+
+fn label[T](x: T) -> Labeled[T] {
+    Labeled { item: x }
+}
+
+// bounds written in declarations are checked once every method is known
+struct Holder {
+    floats: Sorted[Float],
+    fns: Sorted[Map[Int, Int]],
+    keyed: Index[List[Int], Str],
+    shown: Labeled[Mute],
+    fine: Labeled[Plain],
+}
+
+fn takes(s: Sorted[Map[Str, Int]], l: Labeled[Mute]) {}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let shelf = Shelf { items: ["a", "b"] }
+    // the result type is known at once, so `.len()` is fine
+    let n = (first(shelf) ?? "").len()
+    let m = first(Numbers { items: [1] })
+    let p = sides(Two { a: 1 })
+    let q = p.0 + 1
+    let r = p.1.len()
+    let c = ints(shelf) + count(shelf) + count(Numbers { items: [] })
+    let s = Sorted { items: [1, 2] }.add(3)
+    let t = Sorted { items: [Mute { x: 1 }] }
+    let u: Index[Float, Int] = Empty
+    let v = One([1.0], 2)
+    let w = label(Mute { x: 1 })
+    let x = Labeled { item: Plain { x: 1 } }
+    out.print("{n} {q} {r} {c}")
+}

@@ -120,6 +120,7 @@ pub fn expr(e: ast.Expr) -> Str {
         EUn(Not, a) => "(!" + expr(a) + ")",
         ECall(f, args) => expr(f) + "(" + commas(args, expr) + ")",
         ENamed(n, _, a) => n + ":" + expr(a),
+        EDyn(x, _) => expr(x),
         EMethod(r, n, _, args) => expr(r) + "." + n + "(" + commas(args, expr) + ")",
         EField(r, n, _) => expr(r) + "." + n,
         EIndex(a, i) => expr(a) + "[" + expr(i) + "]",
@@ -322,6 +323,7 @@ fn expr_spans(w: Where, e: ast.Expr) -> Str {
         ESelect(arms) => all(arms, |a| sp(w, a.span) + sel_spans(w, a.op) + maybe(a.guard, |x| expr_spans(w, x)) + expr_spans(w, a.body)),
         ESafe(b, _, rest) => expr_spans(w, b) + expr_spans(w, rest),
         ENamed(_, name, x) => sp(w, name) + expr_spans(w, x),
+        EDyn(x, _) => expr_spans(w, x),
         EInt(_) | EFloat(_) | EBool(_) | EUnit | EVar(_) => "",
     }
 }

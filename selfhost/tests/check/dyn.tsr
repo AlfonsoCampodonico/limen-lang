@@ -1,0 +1,118 @@
+// `dyn` values: where a value is boxed (an annotation, an argument, a
+// list's items, each branch of an `if` or a `match`, a payload, a
+// function's result), what cannot be boxed (E0111, E0112), and what a
+// `dyn` value can do.
+interface Shape {
+    fn area(self) -> Float
+}
+
+interface Named {
+    fn name(self) -> Str
+    fn rename(self, to: Str) -> Str
+}
+
+struct Circle {
+    r: Float,
+}
+
+fn area(self: Circle) -> Float {
+    self.r
+}
+
+enum Blob {
+    Small,
+    Big(Int),
+}
+
+fn area(self: Blob) -> Float {
+    match self {
+        Small => 1.0,
+        Big(n) => n.to_float(),
+    }
+}
+
+struct Square {
+    side: Int,
+}
+
+fn area(self: Square) -> Int {
+    self.side
+}
+
+struct Holder {
+    items: List[Int],
+}
+
+fn total(shapes: List[dyn Shape]) -> Float {
+    shapes.fold(0.0, |acc, s| acc + s.area())
+}
+
+fn pick(n: Int) -> dyn Shape {
+    if n > 0 {
+        Circle { r: 1.0 }
+    } else {
+        match n {
+            0 => Small,
+            _ => Big(n),
+        }
+    }
+}
+
+fn early(n: Int) -> dyn Shape {
+    if n < 0 {
+        return Circle { r: 2.0 }
+    }
+    Square { side: n }
+}
+
+fn maybe(n: Int) -> Option[dyn Shape] {
+    if n == 0 {
+        return None
+    }
+    Some(Circle { r: 3.0 })
+}
+
+fn not_values(out: Stdout) {
+    let a: dyn Shape = 1
+    let b: dyn Shape = "text"
+    let c: dyn Shape = [Circle { r: 1.0 }]
+    let d: dyn Named = Circle { r: 1.0 }
+    let e: dyn Shape = Square { side: 2 }
+    let f: dyn Shape = Some(Circle { r: 1.0 })
+}
+
+fn compare(a: dyn Shape, b: dyn Shape) -> Bool {
+    assert_eq(a, b)
+    a == b
+}
+
+fn methods(s: dyn Shape) -> Float {
+    let f = s.area
+    let g = s.perimeter()
+    s.area(1) + f()
+}
+
+fn again(s: dyn Shape) -> dyn Shape {
+    // already a `dyn Shape`: nothing to box
+    let t: dyn Shape = s
+    t
+}
+
+fn wrong_dyn(s: dyn Named) -> dyn Shape {
+    s
+}
+
+fn kinds(a: dyn Ordered, b: dyn Missing, c: dyn Shape[Int], d: dyn Shape) {}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let shapes: List[dyn Shape] = [Circle { r: 1.0 }, Small, Big(2)]
+    out.print("{total(shapes)}")
+    out.print("{total([Circle { r: 2.0 }, Square { side: 1 }])}")
+    out.print("{pick(1).area()} {early(2).area()}")
+    let m = maybe(1)
+    let blobs = [Small, Big(1)]
+    let more: List[dyn Shape] = blobs
+    let mapped: List[dyn Shape] = blobs.map(|b| b)
+    let first: dyn Shape = if true { Small } else { Circle { r: 0.0 } }
+}

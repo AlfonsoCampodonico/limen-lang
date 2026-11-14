@@ -1,0 +1,127 @@
+// The `Error` interface on a program's own types: `?` turns an error into
+// a `dyn Error` when its type has a `message` (and its `cause`, if any,
+// has the right type); Str and IoError are errors already. And values that
+// hold authority cannot become `dyn` (E0112).
+enum ParseError {
+    Empty,
+    Bad(Str),
+}
+
+fn message(self: ParseError) -> Str {
+    match self {
+        Empty => "empty",
+        Bad(s) => "bad: {s}",
+    }
+}
+
+struct Quiet {
+    code: Int,
+}
+
+struct Loud {
+    code: Int,
+}
+
+fn message(self: Loud) -> Int {
+    self.code
+}
+
+struct Chained {
+    inner: ParseError,
+}
+
+fn message(self: Chained) -> Str {
+    "chained"
+}
+
+fn cause(self: Chained) -> Option[dyn Error] {
+    Some(self.inner)
+}
+
+struct Wrong {
+    code: Int,
+}
+
+fn message(self: Wrong) -> Str {
+    "wrong"
+}
+
+fn cause(self: Wrong) -> Str {
+    "none"
+}
+
+struct Box[T] {
+    item: T,
+}
+
+fn message[T](self: Box[T]) -> Str {
+    "box"
+}
+
+fn parse(s: Str) -> Result[Int, ParseError] {
+    if s == "" {
+        return Err(Empty)
+    }
+    s.parse_int().map(|n| Ok(n)) ?? Err(Bad(s))
+}
+
+fn quiet() -> Result[Int, Quiet] {
+    Err(Quiet { code: 1 })
+}
+
+fn loud() -> Result[Int, Loud] {
+    Err(Loud { code: 1 })
+}
+
+fn chained() -> Result[Int, Chained] {
+    Err(Chained { inner: Empty })
+}
+
+fn wrong() -> Result[Int, Wrong] {
+    Err(Wrong { code: 2 })
+}
+
+fn read(fs: Fs) -> Result[Str, dyn Error] {
+    let a = fs.read("a")?
+    let b = parse(a)?
+    let c = quiet()?
+    let d = loud()?
+    let e = chained()?
+    let f = wrong()?
+    let g = Err("message")?
+    let h = parse(a)? "parsing a"
+    Ok(a)
+}
+
+fn mixed() -> Result[Int, ParseError] {
+    let a = quiet()?
+    let b = chained()?
+    a + b
+}
+
+fn own_errors(fs: Fs) -> Result[Int, Quiet] {
+    let a = parse("1")?
+    let t = fs.read("x")?
+    Ok(a)
+}
+
+fn boxes(fs: Fs) -> Result[Int, dyn Error] {
+    let held: Result[Int, Box[Fs]] = Err(Box { item: fs })
+    let n = held?
+    let call: Result[Int, Box[fn() -> Int]] = Err(Box { item: || 1 })
+    let m = call?
+    let e: dyn Error = Box { item: fs }
+    let fine: dyn Error = Box { item: 1 }
+    Ok(n + m)
+}
+
+fn errors() -> List[dyn Error] {
+    ["text", Empty, Chained { inner: Bad("x") }, Failed("io"), Quiet { code: 3 }]
+}
+
+fn main(root: Root) -> Result[(), dyn Error] {
+    let s = read(root.fs)?
+    root.stdout.print(s)
+    let n = mixed()? "mixing"
+    Ok(())
+}

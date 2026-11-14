@@ -4,14 +4,15 @@
 // problems in order of position.
 //
 // The result is the program's items as the checker rewrote them, each
-// expression's type and type arguments (in the State, by id), and the
-// problems.
+// expression's type and type arguments (in the State, by id), the
+// problems, and what each function can do (its capabilities).
 use ast
 use builtins
 use checker
 use diag
 use env
 use exhaust
+use ffi
 use prelude
 use types
 
@@ -22,6 +23,20 @@ pub struct Checked {
     diags: List[diag.Diag],
     // what was learned of every expression
     state: env.State,
+    // what each of the program's functions can do
+    infos: List[FnInfo],
+}
+
+// What `tessera caps` reports of a function: the capabilities its
+// parameters mention (in the order of builtins.cap_names) and whether it
+// runs code it is handed (a function parameter, or a bound whose methods
+// it calls). The package checks (selfhost/caps.tsr) hold a dependency to
+// the capabilities its tessera.toml line grants.
+pub struct FnInfo {
+    name: Str,
+    span: ast.Span,
+    caps: List[Str],
+    callbacks: Bool,
 }
 
 // A function and its signature.
@@ -104,7 +119,16 @@ pub fn check_program(items: List[ast.Item], files: List[diag.Source], next_id: I
             (st, ds) = check_one(cx, st, ds, f)
         }
     }
-    Checked { items: items.map(|i| rewritten_item(st, i)), diags: in_order(cx, st.diags), state: st }
+    // forwarders only pass their arguments on; the methods they call are reported
+    let reported = sigs.filter(|f| f.decl.test.is_none() && f.decl.span.file != methods_file && f.decl.span.file != prelude_file && !cx.forwarders.contains(f.decl.name))
+    let infos = reported.map(|f| fn_info(st, f))
+    Checked { items: items.map(|i| rewritten_item(st, i)), diags: in_order(cx, st.diags), state: st, infos }
+}
+
+fn fn_info(st: env.State, f: Fn) -> FnInfo {
+    let found = f.sig.params.fold([], |acc, t| st.subst.caps_in(t, acc))
+    let callbacks = f.sig.params.any(|t| st.subst.has_fn(t)) || !f.decl.bounds.is_empty()
+    FnInfo { name: f.decl.name, span: f.decl.span, caps: builtins.cap_names().filter(|c| found.contains(c)), callbacks }
 }
 
 fn item_file(i: ast.Item) -> Int {
@@ -165,9 +189,6 @@ fn register_types(cx: env.Cx, st: env.State, items: List[ast.Item]) -> (env.Cx, 
                 }
             },
             IIface(f) => {
-                if f.span.file != cx.prelude_file {
-                    st = st.unported("interfaces")
-                }
                 if builtins.bounds().contains(f.name) {
                     st = st.report(diag.error("E0106", f.span, "`{f.name}` is a built-in bound; name the interface something else"))
                 } else if type_defined(cx, f.name) || cx.ifaces.contains(f.name) {
@@ -239,7 +260,6 @@ fn type_bounds(cx: env.Cx, st: env.State, ds: Decls, items: List[ast.Item]) -> (
                 continue
             },
         }
-        st = st.unported("bounds on structs and enums")
         let (bs, next) = resolve_bounds(cx, st, gen, bounds)
         st = next
         if !bs.is_empty() {
@@ -320,7 +340,14 @@ fn fields_and_variants(cx: env.Cx, st: env.State, ds: Decls, items: List[ast.Ite
             IStruct(s) if registered_struct(cx, s) => {
                 st.kinds = map()
                 if s.foreign.is_some() {
-                    st = st.unported("foreign functions")
+                    match ffi.struct_fields(s) {
+                        Err(es) => {
+                            for (sp, m) in es {
+                                st = st.report(diag.error("E0330", sp, m))
+                            }
+                        },
+                        Ok(_) => {},
+                    }
                 }
                 let genv = generic_env(s.generics)
                 let mut seen: List[Str] = []
@@ -523,11 +550,25 @@ fn signatures(cx: env.Cx, st: env.State, ds: Decls, items: List[ast.Item]) -> (e
                 }
             },
             Some(_) => {
-                // the C types of a foreign function: part 2
+                // the Tessera type of a C function: Foreign first, Out
+                // parameters moved to the result
                 cx.foreign_fns[d.name] = true
-                st = st.unported("foreign functions")
-                ps = [TCap("Foreign")] + d.params.map(|_| TErr)
-                ret = TErr
+                if d.name == "main" {
+                    st = st.report(diag.error("E0330", d.span, "`main` cannot be a foreign function"))
+                }
+                match ffi.of_decl(d, cx.structs) {
+                    Ok(cs) => {
+                        ps = ffi.visible_params(cs)
+                        ret = ffi.result_ty(cs)
+                    },
+                    Err(es) => {
+                        for (sp, m) in es {
+                            st = st.report(diag.error("E0330", sp, m))
+                        }
+                        ps = [TCap("Foreign")] + d.params.map(|_| TErr)
+                        ret = TErr
+                    },
+                }
             },
         }
         let s = env.Sig { gen: d.generics, params: ps, ret }
@@ -741,6 +782,7 @@ fn check_fn(cx: env.Cx, st: env.State, ds: Decls, d: ast.FnDecl, s: env.Sig) -> 
         st.kinds[g] = k
     }
     st.pending = []
+    st.to_infer = []
     st.map_keys = []
     let genv = generic_env(d.generics)
     let mut scope = env.Scope { vars: map(), barrier: false }
@@ -813,9 +855,9 @@ fn check_pending(cx: env.Cx, st: env.State, ds: Decls) -> (env.State, Decls) {
             "Ordered" => checker.unordered_why(st, cx, p.ty),
             "Key" => checker.unkeyable(st, cx, p.ty).map(|u| "`{st.show(u)}` cannot be a map key: keys are Int, Str, Bytes, Bool, and tuples, structs and enums of them"),
             _ => {
-                // whether a type satisfies an interface: part 2
-                st = st.unported("interface bounds")
-                None
+                let (why, next) = checker.satisfies(st, cx, p.ty, p.bound)
+                st = next
+                why
             },
         }
         match why {
@@ -921,6 +963,7 @@ fn expr(st: env.State, e: ast.Expr) -> ast.Expr {
         EWith(b, fs) => EWith(x(b), inits(fs)),
         ESafe(b, n, rest) => ESafe(x(b), n, x(rest)),
         ENamed(n, nsp, v) => ENamed(n, nsp, x(v)),
+        EDyn(v, i) => EDyn(x(v), i),
     }
     { e with desc }
 }

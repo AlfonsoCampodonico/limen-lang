@@ -1,0 +1,10 @@
+// Takes Net and Stdout, granted only fs.
+pub fn get(net: Net, url: Str) -> Str {
+    url
+}
+
+pub fn save(fs: Fs, out: Stdout, path: Str) {}
+
+pub fn pure_fn(x: Int) -> Int {
+    x
+}

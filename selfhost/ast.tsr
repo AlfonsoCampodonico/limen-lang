@@ -139,6 +139,9 @@ pub enum ExprDesc {
     ESafe(Expr, Str, Expr),
     // `name: value`, a call argument naming its parameter
     ENamed(Str, Span, Expr),
+    // a value boxed as `dyn Interface`: never written, the checker puts it
+    // where a value of a struct or enum is used as a `dyn`
+    EDyn(Expr, Str),
 }
 
 pub enum StrPart {

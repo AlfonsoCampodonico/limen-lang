@@ -1,0 +1,4 @@
+// Calls C without being trusted with it.
+foreign "c" {
+    pub fn abs(x: Int32) -> Int32
+}

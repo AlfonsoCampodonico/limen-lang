@@ -1,0 +1,6 @@
+// Listen and Conn are both covered by listen.
+pub fn accept(l: Listen) -> Int {
+    1
+}
+
+pub fn reply(c: Conn, text: Str) {}

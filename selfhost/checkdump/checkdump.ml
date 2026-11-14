@@ -6,7 +6,10 @@
    Otherwise the checker's diagnostics come first, in the order it reports
    them (sorted by position): ERROR or WARNING, CODE FILE LO HI, the
    message, the notes, and the fix, if any, with each edit as FILE LO HI
-   and the replacement. Then each item of the program in load order: the
+   and the replacement; as `tessera check` reports them, the errors come
+   first, then the capability checks of src/package.ml when there are no
+   errors, then the warnings. Then what `tessera caps` reports of each
+   function (see caps_line). Then each item of the program in load order: the
    item as the checker rewrote it, in the position-free format of
    src/astdump.ml, and below it one line per expression, in the order
    selfhost/walk.tsr visits them (an expression, then the ones inside it,
@@ -84,6 +87,12 @@ let check_diag (d : Diag.t) =
       (fun (ed : Diag.edit) -> Printf.printf "edit %s %d %d %s\n" ed.at.file ed.at.lo ed.at.hi (String.escaped ed.replacement))
       f.edits
 
+(* What `tessera caps` reports of a function: CAPS NAME FILE LO HI, its
+   capabilities in brackets, and whether it runs callbacks. *)
+let caps_line (i : Check.fn_info) =
+  Printf.printf "CAPS %s %s %d %d [%s] %b\n" i.name i.span.file i.span.lo i.span.hi
+    (String.concat "," (List.map Types.cap_name i.caps)) i.callbacks
+
 let lexer_codes = [ "E0001"; "E0002"; "E0005"; "E0006"; "E0007" ]
 
 let load_diag (d : Diag.t) =
@@ -102,8 +111,17 @@ let () =
     match Modules.load ~deps ~root path src with
     | [], (_ :: _ as ds) -> List.iter load_diag ds
     | items, _ ->
-      let ds, _ = Check.check_program items in
-      List.iter check_diag ds;
+      let ds, infos = Check.check_program items in
+      (* then the capability checks, as Modules.load_and_check makes them:
+         the checker's errors, or else the first of the package checks that
+         finds any, then the checker's warnings *)
+      let warnings = Diag.warnings ds in
+      let ds = Diag.errors ds in
+      let ds = if ds = [] then Package.enforce ~std:true (Lazy.force Package.std_manifest) (List.map (fun m -> (m, m)) !Modules.std_loaded) infos else ds in
+      let ds = match pkg with Some p when ds = [] -> Package.enforce p !Modules.module_pkg infos | _ -> ds in
+      let ds = match pkg with Some p when ds = [] -> Package.check_foreign_lock p (Modules.c_users items) | _ -> ds in
+      List.iter check_diag (ds @ warnings);
+      List.iter caps_line infos;
       List.iter
         (fun it ->
           print_endline (Astdump.items [ it ]);
