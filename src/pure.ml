@@ -32,7 +32,7 @@ let pure_type t = caps_in t [] = [] && not (has_fn t) && not (has_chan t)
 let heavy_prims =
   [ "list_contains"; "list_reverse"; "list_sort"; "list_take"; "list_skip"; "list_join"; "list_sum";
     "str_lines"; "str_split"; "str_trim"; "str_contains"; "str_starts_with"; "str_ends_with"; "str_to_upper";
-    "str_to_lower"; "str_replace"; "str_parse_int"; "str_parse_float"; "str_slice"; "str_index_of";
+    "str_to_lower"; "str_replace"; "str_parse_int"; "str_parse_float"; "str_slice"; "str_index_of"; "str_last_index_of"; "list_slice";
     "str_bytes"; "str_chars"; "str_to_bytes"; "bytes_to_str"; "bytes_slice"; "bytes_to_list"; "bytes_new";
     "int_range"; "int_to_str"; "float_to_str"; "bool_to_str"; "float_to_fixed"; "map_keys"; "map_values";
     "map_entries"; "map_from"; "array_to_list"; "array_contains" ]

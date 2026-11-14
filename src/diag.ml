@@ -60,6 +60,9 @@ let explanations = [
   "E0207", "The type of this value is not known at this point. Add a type annotation, for example `let xs: List[Int] = []`.";
   "E0208", "`break` and `continue` only work inside `while` and `for` loops (not inside closures).";
   "E0209", "Only variables, struct fields, list elements and map entries (and paths through them, such as `m[k].x`) can be assigned to. A method value such as `p.area` cannot.";
+  "E0210", "Every alternative of an or-pattern `A | B` must bind the same names, with the same types, because the arm's body uses them whichever alternative matched: `Circle(r) | Ring(r, _) => r` is fine, `Circle(r) | Point => r` is not. Give an alternative the missing name, or use `_` in all of them.";
+  "E0211", "In a tuple assignment, `(a, b) = value`, the value must be a tuple with one item for each target on the left: `(x, p) = (1, 2)`, `(count, rest) = split(text)?`. Write `_` on the left for an item to ignore.";
+  "W0002", "This arm (or this alternative of an or-pattern) can never match: the unguarded arms before it already match every value it would. Remove it, or move it above the arm that covers it. A guarded arm does not count as covering anything, since its guard may be false.";
   "E0301", "Capabilities (Root, Net, Fs, Stdout, Clock) cannot be stored in struct or enum fields. Authority must stay visible in function signatures, so pass capabilities as parameters.";
   "E0302", "Tessera has no ambient I/O: there is no global print, open, http or clock. I/O goes through capability values. `main` receives `root: Root`; pass `root.stdout`, `root.fs`, `root.net` or `root.clock` to the functions that need them.";
   "E0303", "`main` must be `fn main(root: Root)`, `fn main(root: Root) -> Int` (the exit code), `fn main(root: Root) -> Result[(), E]` or `fn main(root: Root) -> Result[Int, E]`, with no type parameters. `root` may be left out.";

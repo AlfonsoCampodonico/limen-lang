@@ -318,7 +318,8 @@ let embed_dir (m : modinfo) path sp : expr_desc option =
 let rec pat_binds (p : pat) acc =
   match p.pdesc with
   | PBind n -> n :: acc
-  | PVariant (_, _, ps) | PTuple ps -> List.fold_left (fun acc p -> pat_binds p acc) acc ps
+  | PRest (Some n) -> n :: acc
+  | PVariant (_, _, ps) | PTuple ps | PList ps | POr ps -> List.fold_left (fun acc p -> pat_binds p acc) acc ps
   | _ -> acc
 
 let rec pat env locals (p : pat) : pat =
@@ -345,6 +346,12 @@ let rec pat env locals (p : pat) : pat =
   | PTuple ps ->
     let ps' = map_same (pat env locals) ps in
     if ps' == ps then p else { p with pdesc = PTuple ps' }
+  | PList ps ->
+    let ps' = map_same (pat env locals) ps in
+    if ps' == ps then p else { p with pdesc = PList ps' }
+  | POr ps ->
+    let ps' = map_same (pat env locals) ps in
+    if ps' == ps then p else { p with pdesc = POr ps' }
   | _ -> p
 
 let rec expr env locals (e : expr) : expr =
@@ -532,12 +539,37 @@ and unpack (p : pat) (e : expr) : stmt list =
   in
   first :: rest
 
+(* `(a, (b, _)) = e` becomes `let $assign1 = e; a = $assign1.0;
+   let $assign2 = $assign1.1; b = $assign2.0`: the right side first, then
+   each target, left to right. Each `let` carries the tuple's type name with
+   no arguments (`#tuple2`) as its annotation, which says how many parts the
+   left side takes; the checker checks the right side against it. *)
+and assign_parts (lhs : expr) (e : expr) (sp : Span.t) : stmt list =
+  match lhs.edesc with
+  | EStruct (n, _, fields) when is_tuple_name n ->
+    incr unpack_counter;
+    let tmp = "$assign" ^ string_of_int !unpack_counter in
+    let ann = { tdesc = TyName (n, []); tspan = lhs.espan } in
+    let first = { sdesc = SLet (false, tmp, lhs.espan, Some ann, e); sspan = sp } in
+    let part i (_, _, (target : expr)) =
+      let mk d = { edesc = d; espan = target.espan; ety = Types.TErr; einst = []; ecallee = None } in
+      match target.edesc with
+      | EVar "_" -> []
+      | _ -> assign_parts target (mk (EField (mk (EVar tmp), string_of_int i, target.espan))) target.espan
+    in
+    first :: List.concat (List.mapi part fields)
+  | _ -> [ { sdesc = SAssign (lhs, e); sspan = sp } ]
+
+and is_tuple_assign (s : stmt) =
+  match s.sdesc with SAssign ({ edesc = EStruct (n, _, _); _ }, _) -> is_tuple_name n | _ -> false
+
 and expand_stmts (ss : stmt list) : stmt list =
-  if not (List.exists (fun (s : stmt) -> match s.sdesc with SLetPat _ | SForPat _ -> true | _ -> false) ss) then ss
+  if not (List.exists (fun (s : stmt) -> match s.sdesc with SLetPat _ | SForPat _ -> true | _ -> is_tuple_assign s) ss) then ss
   else
   List.concat_map
     (fun (s : stmt) ->
       match s.sdesc with
+      | SAssign (lhs, e) when is_tuple_assign s -> assign_parts lhs e s.sspan
       | SLetPat (p, e) -> unpack p e
       | SForPat (p, it, body) ->
         incr unpack_counter;

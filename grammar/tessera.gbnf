@@ -106,7 +106,11 @@ cparam    ::= ident (sp ":" sp type)?
 tclosure  ::= "{" ws ("|" ws (cparam (isep cparam)* ws)? "|" ws | "||" ws)? (stmt (stsep stmt)* (sp ";")?)? ws "}"
 group     ::= "group" sp1 ident (sp1 "interleaved")? (sp1 "until" sp1 expr)? sp block
 
-pattern ::= "-"? int | plainstr | ident ("." ident)? (sp "(" ws pattern (isep pattern)* (ws ",")? ws ")")? | tpat
+# `A | B`: an or-pattern; `..` (once per bracket, `..name` in a list) is the rest
+pattern ::= palt (ws "|" ws palt)*
+palt    ::= "-"? int | plainstr | ident ("." ident)? (sp "(" ws pitems ws ")")? | "(" ws pitems ws ")" | "[" ws pitems? ws "]"
+pitems  ::= pitem (isep pitem)* (ws ",")?
+pitem   ::= pattern | ".." (sp ident)?
 
 # ---------- tokens ----------
 ident  ::= [A-Za-z_] [A-Za-z0-9_]*

@@ -433,6 +433,12 @@ static inline int64_t w_idx(int64_t i, int64_t n, const char *where) {
     for (int64_t i = from; i < to; i++) c->data[c->len++] = P##_dup(l->data[i]);             \
     return c;                                                                                 \
   }                                                                                           \
+  static L *L##_concat(L *a, L *b) {                                                          \
+    L *c = L##_new(a->len + b->len);                                                          \
+    for (int64_t i = 0; i < a->len; i++) c->data[c->len++] = P##_dup(a->data[i]);           \
+    for (int64_t i = 0; i < b->len; i++) c->data[c->len++] = P##_dup(b->data[i]);           \
+    return c;                                                                                 \
+  }                                                                                           \
   static L *L##_reverse(L *l) {                                                               \
     L *c = L##_new(l->len);                                                                   \
     for (int64_t i = l->len - 1; i >= 0; i--) c->data[c->len++] = P##_dup(l->data[i]);      \
@@ -677,6 +683,12 @@ static WStr *L_Str_join(L_Str *l, WStr *sep) {
 static int64_t Str_find(WStr *s, WStr *sub, int64_t from) {
   if (sub->len == 0) return from;
   for (int64_t i = from; i + sub->len <= s->len; i++)
+    if (memcmp(s->data + i, sub->data, (size_t)sub->len) == 0) return i;
+  return -1;
+}
+/* the last occurrence; an empty sub is found at the end */
+static int64_t Str_rfind(WStr *s, WStr *sub) {
+  for (int64_t i = s->len - sub->len; i >= 0; i--)
     if (memcmp(s->data + i, sub->data, (size_t)sub->len) == 0) return i;
   return -1;
 }

@@ -24,7 +24,8 @@ let ok name cond msg =
    (keywords are not excluded from identifiers). *)
 let grammar_superset =
   [ "tuple-let-refutable"; "select-bad-arm"; "group-until-bad"; "pipe-not-callable"; "pipe-binary-rhs"; "trailing-in-if"; "trailing-in-while";
-    "trailing-in-for"; "trailing-in-match" ]
+    "trailing-in-for"; "trailing-in-match";
+    "pattern-two-rests"; "pattern-tuple-named-rest"; "pattern-variant-named-rest"; "pattern-list-two-rests" ]
 
 let dump name src parsed =
   match Sys.getenv_opt "TESSERA_DUMP_DIR" with
@@ -7335,6 +7336,306 @@ fn main(root: Root) {
    in
    let calls = count_sub main_body "wf_count(" in
    ok "pure-reused-c" (calls = 6) (sprintf "%d calls" calls));
+
+  (* ---------- tuple assignment, or-patterns, `..`, list patterns, list `+`, last_index_of ---------- *)
+  out "tuple-assign"
+    {|fn step(n: Int) -> Result[(Int, Int), Str] {
+    if n > 5 { return Err("too big") }
+    Ok((n * 10, n + 1))
+}
+
+fn walk(limit: Int) -> Result[Int, Str] {
+    let mut x = 0
+    let mut p = 1
+    let mut total = 0
+    while p < limit {
+        (x, p) = step(p)?
+        total = total + x
+    }
+    Ok(total)
+}
+
+struct Best { name: Str, score: Int }
+
+fn main(root: Root) {
+    let out = root.stdout
+    out.print("{walk(4)} {walk(9)}")
+    let mut a = "x"
+    let mut b = "y"
+    (a, b) = (b, a)
+    out.print("{a} {b}")
+    let mut names = ["p", "q", "r"]
+    let mut best = Best { name: "none", score: 0 }
+    let mut i = 0
+    (i, names[i], _) = (2, "R", [1, 2])
+    out.print("{i} {names}")
+    ((best.name, best.score), a) = (("ann", 7), "z")
+    out.print("{best.name} {best.score} {a}")
+    let mut m: Map[Str, List[Str]] = map([("k", [])])
+    let mut count = 0
+    (m["k"], count) = (["v", "w"], 2)
+    out.print("{m} {count}")
+    let mut s = "s"
+    for k in 0..<3 {
+        let pair = ("{s}{k}", k)
+        (s, count) = pair
+    }
+    out.print("{s} {count}")
+    defer (a, b) = (b, a)
+}
+|}
+    "Ok(60) Err(\"too big\")\ny x\n2 [\"p\", \"q\", \"R\"]\nann 7 z\n{\"k\": [\"v\", \"w\"]} 2\ns012 2\n";
+  errs "tuple-assign-not-mut" "fn main() {\n    let mut a = 1\n    let b = 2\n    (a, b) = (3, 4)\n}\n" [ "E0205" ];
+  errs "tuple-assign-type" "fn main() {\n    let mut a = 1\n    let mut b = 2\n    (a, b) = (3, \"x\")\n}\n" [ "E0201" ];
+  errs "tuple-assign-arity" "fn main() {\n    let mut a = 1\n    let mut b = 2\n    (a, b) = (3, 4, 5)\n}\n" [ "E0211" ];
+  errs "tuple-assign-not-tuple" "fn main() {\n    let mut a = 1\n    let mut b = 2\n    (a, b) = 3\n}\n" [ "E0211" ];
+  errs "tuple-assign-bad-target" "fn f() -> Int { 1 }\nfn main() {\n    let mut a = 1\n    (a, f()) = (3, 4)\n}\n" [ "E0209" ];
+  ok "tuple-assign-explained" (List.mem_assoc "E0211" Diag.explanations && List.mem_assoc "E0210" Diag.explanations && List.mem_assoc "W0002" Diag.explanations) "no explanation";
+  out "or-patterns"
+    {|enum Shape {
+    Circle(Float),
+    Ring(Float, Float),
+    Rect(Float, Float),
+    Point,
+}
+
+fn kind(s: Shape) -> Str {
+    match s {
+        Circle(r) | Ring(r, _) => "round {r}",
+        Rect(w, h) if w == h => "square",
+        Rect(..) | Point => "other",
+    }
+}
+
+fn small(t: (Int, Option[Str])) -> Str {
+    match t {
+        (1 | 2, Some("a" | "b") | None) => "small",
+        (n, Some(_)) | (n, None) if n > 100 => "big {n}",
+        _ => "?",
+    }
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    for s in [Circle(1.0), Ring(2.0, 3.0), Rect(1.0, 1.0), Rect(1.0, 2.0), Point] {
+        out.print(kind(s))
+    }
+    for t in [(1, Some("a")), (2, None), (1, Some("c")), (200, Some("z")), (300, None), (3, None)] {
+        out.print(small(t))
+    }
+    let words = [Some("x"), None, Some("y")]
+    let mut n = 0
+    for w in words {
+        match w {
+            Some("x" | "y") | None => { n = n + 1 },
+            Some(_) => (),
+        }
+    }
+    out.print("{n}")
+}
+|}
+    "round 1.0\nround 2.0\nsquare\nother\nother\nsmall\nsmall\n?\nbig 200\nbig 300\n?\n3\n";
+  (* an or-pattern binding owned values, in a guarded match: the native
+     build must release whichever alternative's values were bound *)
+  out "or-patterns-owned"
+    {|enum Node {
+    Leaf(Str),
+    Pair(Str, List[Str]),
+    Many(List[Str], Str),
+}
+
+fn label(n: Node) -> Str {
+    match n {
+        Leaf(s) | Pair(s, _) | Many(_, s) if s.len() > 1 => "long {s}",
+        Pair(_, xs) | Many(xs, _) => "list {xs}",
+        Leaf(s) => "short {s}",
+    }
+}
+
+fn main(root: Root) {
+    for n in [Leaf("a"), Leaf("abc"), Pair("p", ["x"]), Pair("pq", []), Many(["m", "n"], "z"), Many([], "zz")] {
+        root.stdout.print(label(n))
+    }
+}
+|}
+    "short a\nlong abc\nlist [\"x\"]\nlong pq\nlist [\"m\", \"n\"]\nlong zz\n";
+  errs "or-pattern-missing-name"
+    "enum E { A(Int), B(Int), C }\nfn f(e: E) -> Int {\n    match e {\n        A(x) | C => x,\n        B(_) => 0,\n    }\n}\nfn main() {}\n" [ "E0210" ];
+  errs "or-pattern-extra-name"
+    "enum E { A(Int), B(Int), C }\nfn f(e: E) -> Int {\n    match e {\n        C | A(x) => 0,\n        B(_) => 0,\n    }\n}\nfn main() {}\n" [ "E0210" ];
+  errs "or-pattern-type-differs"
+    "enum E { A(Int), B(Str) }\nfn f(e: E) -> Int {\n    match e {\n        A(x) | B(x) => 0,\n    }\n}\nfn main() {}\n" [ "E0210" ];
+  errs "or-pattern-exhaustive"
+    "enum E { A, B, C }\nfn f(e: E, b: Bool) -> Int {\n    let x = match e {\n        A | B => 1,\n        C => 2,\n    }\n    match b {\n        true | false => x,\n    }\n}\nfn main() {}\n" [];
+  errs "or-pattern-not-exhaustive"
+    "enum E { A, B, C }\nfn f(e: E) -> Int {\n    match e {\n        A | B => 1,\n    }\n}\nfn main() {}\n" [ "E0204" ];
+  errs "or-pattern-nested-not-exhaustive"
+    "fn f(o: Option[Bool]) -> Int {\n    match o {\n        Some(true) | None => 1,\n    }\n}\nfn main() {}\n" [ "E0204" ];
+  (let _, ds, _ = compile "or-pattern-fix" "enum E { A, B, C }\nfn f(e: E) -> Int {\n    match e {\n        A | B => 1,\n    }\n}\nfn main() {}\n" in
+   let fixed = apply_fixes "enum E { A, B, C }\nfn f(e: E) -> Int {\n    match e {\n        A | B => 1,\n    }\n}\nfn main() {}\n" ds in
+   let _, ds2, _ = compile "or-pattern-fixed" fixed in
+   ok "or-pattern-fix" (Diag.errors ds2 = []) fixed);
+  errs "unreachable-arm"
+    "enum E { A, B, C }\nfn f(e: E) -> Int {\n    match e {\n        A | B => 1,\n        B => 2,\n        _ => 3,\n    }\n}\nfn main() {}\n" [ "W0002" ];
+  errs "unreachable-alternative"
+    "enum E { A, B, C }\nfn f(e: E) -> Int {\n    match e {\n        A => 1,\n        B | A => 2,\n        C => 3,\n    }\n}\nfn main() {}\n" [ "W0002" ];
+  errs "unreachable-after-wild"
+    "fn f(n: Int) -> Int {\n    match n {\n        _ => 1,\n        3 => 2,\n    }\n}\nfn main() {}\n" [ "W0002" ];
+  errs "unreachable-guard-covers-nothing"
+    "fn f(n: Int) -> Int {\n    match n {\n        k if k > 0 => 1,\n        k => 2,\n    }\n}\nfn main() {}\n" [];
+  errs "unreachable-list"
+    "fn f(xs: List[Int]) -> Int {\n    match xs {\n        [] => 0,\n        [_, ..] => 1,\n        [a] => a,\n    }\n}\nfn main() {}\n" [ "W0002" ];
+  errs "reachable-recursive-enum"
+    "enum T { Node(T, T), Leaf(Int) }\nfn f(t: T) -> Int {\n    match t {\n        Node(Leaf(a), _) => a,\n        Node(_, Leaf(b)) => b,\n        Node(Node(_, _), Node(_, _)) => 0,\n        Leaf(n) => n,\n    }\n}\nfn main() {}\n" [];
+  out "rest-patterns"
+    {|enum Stmt {
+    Let(Str, Int, Bool),
+    Expr(Int),
+    Loop(Int, Str, Str, Int),
+}
+
+fn name(s: Stmt) -> Str {
+    match s {
+        Let(n, ..) => "let {n}",
+        Loop(first, .., last) => "loop {first} {last}",
+        Expr(..) => "expr",
+    }
+}
+
+fn main(root: Root) {
+    for s in [Let("x", 1, true), Expr(3), Loop(1, "a", "b", 9)] {
+        root.stdout.print(name(s))
+    }
+    let t = (1, "two", 3.0, [4])
+    match t {
+        (1, ..) => root.stdout.print("starts with 1"),
+        (.., [4]) => root.stdout.print("ends with [4]"),
+        (..) => root.stdout.print("anything"),
+    }
+    match t {
+        (_, .., [n]) => root.stdout.print("last item {n}"),
+        _ => (),
+    }
+}
+|}
+    "let x\nexpr\nloop 1 9\nstarts with 1\nlast item 4\n";
+  errs "rest-pattern-too-many" "enum E { A(Int) }\nfn f(e: E) -> Int {\n    match e {\n        A(x, y, ..) => x,\n    }\n}\nfn main() {}\n" [ "E0107" ];
+  errs "rest-pattern-tuple-too-many" "fn f(t: (Int, Int)) -> Int {\n    match t {\n        (a, b, c, ..) => a,\n    }\n}\nfn main() {}\n" [ "E0107" ];
+  errs "rest-pattern-exhaustive" "enum E { A(Int, Bool), B }\nfn f(e: E) -> Int {\n    match e {\n        A(..) => 1,\n        B => 2,\n    }\n}\nfn main() {}\n" [];
+  errs "rest-pattern-not-exhaustive" "enum E { A(Int, Bool), B }\nfn f(e: E) -> Int {\n    match e {\n        A(.., true) => 1,\n        B => 2,\n    }\n}\nfn main() {}\n" [ "E0204" ];
+  errs "pattern-two-rests" "fn f(t: (Int, Int)) -> Int {\n    match t {\n        (.., ..) => 0,\n    }\n}\n" [ "E0003" ];
+  errs "pattern-tuple-named-rest" "fn f(t: (Int, Int)) -> Int {\n    match t {\n        (a, ..rest) => a,\n    }\n}\n" [ "E0003" ];
+  errs "pattern-variant-named-rest" "fn f(o: Option[Int]) -> Int {\n    match o {\n        Some(..rest) => 0,\n        None => 1,\n    }\n}\n" [ "E0003" ];
+  errs "pattern-let-rest" "fn main() {\n    let (a, ..) = (1, 2)\n}\n" [ "E0003" ];
+  errs "pattern-let-or" "fn main() {\n    let (a | a, b) = (1, 2)\n}\n" [ "E0003" ];
+  out "list-patterns"
+    {|fn describe(xs: List[Int]) -> Str {
+    match xs {
+        [] => "empty",
+        [x] => "one {x}",
+        [a, b] if a == b => "pair of {a}",
+        [first, .., last] if first == last => "same ends {first}",
+        [first, ..rest] => "first {first} then {rest}",
+    }
+}
+
+fn ends(ws: List[Str]) -> Str {
+    match ws {
+        [..init, "end"] => "ends after {init}",
+        ["start", ..mid, last] => "mid {mid} last {last}",
+        [..all] => "all {all.len()}",
+    }
+}
+
+fn sum(xs: List[Int]) -> Int {
+    match xs {
+        [] => 0,
+        [x, ..rest] => x + sum(rest),
+    }
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    for xs in [[], [7], [3, 3], [1, 2, 1], [1, 2, 3, 4]] {
+        out.print(describe(xs))
+    }
+    for ws in [["a", "end"], ["end"], ["start", "x", "y", "z"], ["start", "z"], ["q"]] {
+        out.print(ends(ws))
+    }
+    out.print("{sum([1, 2, 3, 4])}")
+    let nested = [[1, 2], [3]]
+    match nested {
+        [[a, ..], [b]] => out.print("nested {a} {b}"),
+        _ => out.print("no"),
+    }
+    let opts = [Some("a"), None]
+    match opts {
+        [Some(_) | None, ..] if false => out.print("never"),
+        [Some(s), None] => out.print("some then none {s}"),
+        _ => out.print("other"),
+    }
+}
+|}
+    "empty\none 7\npair of 3\nsame ends 1\nfirst 1 then [2, 3, 4]\nends after [\"a\"]\nends after []\nmid [\"x\", \"y\"] last z\nmid [] last z\nall 1\n10\nnested 1 3\nsome then none a\n";
+  errs "list-pattern-not-exhaustive" "fn f(xs: List[Int]) -> Int {\n    match xs {\n        [] => 0,\n        [_, _, ..] => 2,\n    }\n}\nfn main() {}\n" [ "E0204" ];
+  errs "list-pattern-exhaustive" "fn f(xs: List[Int]) -> Int {\n    match xs {\n        [] => 0,\n        [x] => x,\n        [x, y, ..rest] => x + y + rest.len(),\n    }\n}\nfn main() {}\n" [];
+  errs "list-pattern-exhaustive-items" "fn f(xs: List[Bool]) -> Int {\n    match xs {\n        [] => 0,\n        [true, ..] => 1,\n        [false, ..] => 2,\n    }\n}\nfn main() {}\n" [];
+  errs "list-pattern-items-not-exhaustive" "fn f(xs: List[Bool]) -> Int {\n    match xs {\n        [] => 0,\n        [true, ..] => 1,\n    }\n}\nfn main() {}\n" [ "E0204" ];
+  errs "list-pattern-type" "fn f(n: Int) -> Int {\n    match n {\n        [] => 0,\n        _ => 1,\n    }\n}\nfn main() {}\n" [ "E0201" ];
+  errs "pattern-list-two-rests" "fn f(xs: List[Int]) -> Int {\n    match xs {\n        [a, ..b, ..c] => a,\n    }\n}\n" [ "E0003" ];
+  (let src = "fn f(xs: List[Int]) -> Int {\n    match xs {\n        [] => 0,\n        [_, _, ..] => 2,\n    }\n}\nfn main() {}\n" in
+   let _, ds, _ = compile "list-pattern-fix" src in
+   let fixed = apply_fixes src ds in
+   let _, ds2, _ = compile "list-pattern-fixed" fixed in
+   ok "list-pattern-fix" (Diag.errors ds2 = [] && String.length fixed > String.length src) fixed);
+  out "list-plus"
+    {|fn main(root: Root) {
+    let xs = [1, 2]
+    let ys = xs + [3] + []
+    let mut zs: List[Str] = []
+    zs = zs + ["a"]
+    zs = zs + zs
+    let nested = [[1]] + [[2, 3]]
+    root.stdout.print("{xs} {ys} {zs} {nested} {xs + xs == [1, 2, 1, 2]}")
+}
+|}
+    "[1, 2] [1, 2, 3] [\"a\", \"a\"] [[1], [2, 3]] true\n";
+  errs "list-plus-mismatch" "fn main() {\n    let xs = [1] + [\"a\"]\n}\n" [ "E0201" ];
+  (* the formatter prints each new form back as written *)
+  (let src =
+     {|fn f(t: (Int, Int), xs: List[Int], o: Option[Int]) -> Int {
+    let mut a = 0
+    let mut b = 0
+    (a, b) = t
+    ((a, _), b) = ((1, 2), 3)
+    let ys = xs + [a] + []
+    let k = "a/b".last_index_of("/") ?? 0
+    match o {
+        Some(1 | 2) | None => 0,
+        Some(_) => 1,
+    }
+    match t {
+        (1, ..) => 1,
+        (.., 2) => 2,
+        (..) => 3,
+    }
+    match ys {
+        [] => k,
+        [x] => x,
+        [first, .., last] => first + last,
+        [..rest] => rest.len(),
+    }
+}
+|}
+   in
+   let got = try Fmt.format ~file:"fmt-patterns.tsr" src with Diag.Fatal d -> "error: " ^ d.message in
+   ok "fmt-new-patterns" (got = src) (sprintf "got:\n%s" got);
+   let got2 = try Fmt.format ~file:"fmt-patterns2.tsr" "fn f(o: Option[Int]) -> Int {\n    match o {\n        Some( 1|2 )\n        | None => 0,\n        Some( .. ) => 1,\n    }\n}\n" with Diag.Fatal d -> "error: " ^ d.message in
+   ok "fmt-new-patterns-spacing" (got2 = "fn f(o: Option[Int]) -> Int {\n    match o {\n        Some(1 | 2) | None => 0,\n        Some(..) => 1,\n    }\n}\n") (sprintf "got:\n%s" got2));
+  out "str-last-index-of"
+    (main_wrap {|    let s = "a/b/c"
+    out.print("{s.last_index_of("/")} {s.index_of("/")} {s.last_index_of("x")} {s.last_index_of("")} {"".last_index_of("")} {"aaa".last_index_of("aa")} {s.last_index_of("a/b/c/")}")|})
+    "Some(3) Some(1) None Some(5) Some(0) Some(1) None\n";
 
   drain ();
   Printf.printf "%d/%d passed\n" (!total - !failed) !total;

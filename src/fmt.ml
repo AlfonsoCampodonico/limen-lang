@@ -171,6 +171,10 @@ let rec pat (p : pat) =
   | PVariant (q, v, args) ->
     (match q with Some e -> e ^ "." ^ v | None -> v) ^ if args = [] then "" else "(" ^ String.concat ", " (List.map pat args) ^ ")"
   | PTuple ps -> "(" ^ String.concat ", " (List.map pat ps) ^ ")"
+  | PList ps -> "[" ^ String.concat ", " (List.map pat ps) ^ "]"
+  | PRest None -> ".."
+  | PRest (Some n) -> ".." ^ n
+  | POr ps -> String.concat " | " (List.map pat ps)
 
 (* ---------- expressions ---------- *)
 

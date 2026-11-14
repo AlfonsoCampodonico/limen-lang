@@ -567,7 +567,6 @@ and lower_match f e s arms ty =
   let st = tyof f s in
   let r = fresh_var "m" ty in
   emit f (I.Decl r);
-  let rec irrefutable p = match p.pdesc with PWild | PBind _ -> true | PTuple ps -> List.for_all irrefutable ps | _ -> false in
   let rec chain = function
     | [] ->
       ignore (tmp f TUnit (I.Panic (I.AStr "no `match` arm matched", e.espan)));
@@ -708,10 +707,9 @@ and lower_select f e arms ty =
   chain numbered;
   I.V r
 
+(* Bind the names in [p], which matches [a] of type [t]. *)
 and bind_pat f a t (p : pat) =
-  let rec has_bind p =
-    match p.pdesc with PBind _ -> true | PVariant (_, _, args) | PTuple args -> List.exists has_bind args | _ -> false
-  in
+  let has_bind p = Free.pat_binds p [] <> [] in
   match p.pdesc with
   | PBind n ->
     let v = fresh_var n t in
@@ -725,7 +723,7 @@ and bind_pat f a t (p : pat) =
         if has_bind sub then
           let pv = tmp f pt (I.Payload (a, t, tag, i)) in
           bind_pat f pv pt sub)
-      (List.combine args ptys)
+      (List.combine (fill_rest args (List.length ptys)) ptys)
   | PTuple ps ->
     let fts = field_types f.g t in
     List.iteri
@@ -733,7 +731,54 @@ and bind_pat f a t (p : pat) =
         if has_bind sub then
           let pv = tmp f ft (I.Get (a, t, [ I.PField i ])) in
           bind_pat f pv ft sub)
-      (List.combine ps fts)
+      (List.combine (fill_rest ps (List.length fts)) fts)
+  | PList ps when has_bind p ->
+    let el = match t with TList el -> el | _ -> failwith "bind_pat: list" in
+    let before, rest, after = list_parts ps in
+    let item i sub = if has_bind sub then bind_pat f (tmp f el (I.Get (a, t, [ I.PIndexU i ]))) el sub in
+    List.iteri (fun i sub -> item (I.AInt (Int64.of_int i)) sub) before;
+    if rest <> None || after <> [] then begin
+      let n = tmp f TInt (I.Prim ("list_len", t, [ a ], p.pspan)) in
+      let j = List.length after in
+      List.iteri (fun i sub -> if has_bind sub then item (tmp f TInt (I.Bin (Sub, TInt, n, I.AInt (Int64.of_int (j - i)), p.pspan))) sub) after;
+      match rest with
+      | Some (Some name) ->
+        let hi = tmp f TInt (I.Bin (Sub, TInt, n, I.AInt (Int64.of_int j), p.pspan)) in
+        let v = fresh_var name t in
+        emit f (I.Let (v, I.Prim ("list_slice", t, [ a; I.AInt (Int64.of_int (List.length before)); hi ], p.pspan)));
+        bind f name v
+      | _ -> ()
+    end
+  | POr alts when has_bind p ->
+    (* the names come from whichever alternative matched: each gets a
+       variable declared here, set in the branch for that alternative *)
+    let names = List.sort_uniq compare (Free.pat_binds p []) in
+    let outs = Hashtbl.create 4 in
+    let branch alt =
+      let b, _, _ =
+        in_block f (fun () ->
+            bind_pat f a t alt;
+            List.iter
+              (fun n ->
+                let v = Hashtbl.find (List.hd f.scopes) n in
+                let o = match Hashtbl.find_opt outs n with Some o -> o | None -> let o = fresh_var n v.I.ty in Hashtbl.replace outs n o; o in
+                emit f (I.Init (o, I.Atom (I.V v))))
+              names)
+      in
+      (alt, b)
+    in
+    let branches = List.map branch alts in
+    List.iter (fun n -> emit f (I.Decl (Hashtbl.find outs n))) names;
+    let rec chain = function
+      | [] -> ()
+      | [ (_, b) ] -> List.iter (emit f) b
+      | (alt, b) :: rest ->
+        let c = tmp f TBool (I.PatTest (a, t, alt)) in
+        let other, _, _ = in_block f (fun () -> chain rest) in
+        emit f (I.If (c, b, other))
+    in
+    chain branches;
+    List.iter (fun n -> bind f n (Hashtbl.find outs n)) names
   | _ -> ()
 
 (* The type arguments of generic function [d] called with arguments of the

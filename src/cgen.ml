@@ -196,12 +196,27 @@ let rec pat_cond c e t (p : Ast.pat) =
   | Ast.PVariant (_, vn, args) ->
     let k = Lower.tag_of c.g t vn in
     let ptys = List.assoc vn (Lower.variants c.g t) in
-    let subs = List.mapi (fun i (a, pt) -> pat_cond c (payload_expr c t e k i) pt a) (List.combine args ptys) in
+    let subs = List.mapi (fun i (a, pt) -> pat_cond c (payload_expr c t e k i) pt a) (List.combine (Ast.fill_rest args (List.length ptys)) ptys) in
     String.concat " && " (sprintf "(%s == %d)" (tag_expr c t e) k :: List.filter (fun s -> s <> "true") subs)
   | Ast.PTuple ps ->
     let fts = Lower.field_types c.g t in
-    let subs = List.mapi (fun i (p, (_, ft)) -> pat_cond c (sprintf "(%s).f%d" e i) ft p) (List.combine ps fts) in
+    let subs = List.mapi (fun i (p, (_, ft)) -> pat_cond c (sprintf "(%s).f%d" e i) ft p) (List.combine (Ast.fill_rest ps (List.length fts)) fts) in
     (match List.filter (fun s -> s <> "true") subs with [] -> "true" | xs -> String.concat " && " xs)
+  | Ast.PList ps ->
+    let el = match t with TList el -> el | _ -> failwith "pat_cond: list" in
+    let before, rest, after = Ast.list_parts ps in
+    let k = List.length before and j = List.length after in
+    let len = sprintf "(%s)->len" e in
+    let size = if rest = None then sprintf "(%s == %d)" len k else sprintf "(%s >= %d)" len (k + j) in
+    let subs =
+      List.mapi (fun i p -> pat_cond c (sprintf "(%s)->data[%d]" e i) el p) before
+      @ List.mapi (fun i p -> pat_cond c (sprintf "(%s)->data[%s - %d]" e len (j - i)) el p) after
+    in
+    String.concat " && " (size :: List.filter (fun s -> s <> "true") subs)
+  | Ast.PRest _ -> "true"
+  | Ast.POr alts ->
+    let conds = List.map (pat_cond c e t) alts in
+    if List.mem "true" conds then "true" else "(" ^ String.concat " || " conds ^ ")"
 
 (* The prefix of the order function for [t] (used as <prefix>_cmp); composite
    types get one generated, with the types inside them. *)
@@ -258,6 +273,7 @@ let binop c op t a b sp =
   | TFloat, Mul -> sprintf "(%s * %s)" a b
   | TFloat, Div -> sprintf "(%s / %s)" a b
   | (TStr | TBytes), Add -> sprintf "Str_concat(%s, %s)" a b
+  | TList _, Add -> sprintf "%s_concat(%s, %s)" (cname c t) a b
   | (TInt | TFloat | TBool), (Lt | Le | Gt | Ge | Eq | Ne) ->
     let o = match op with Lt -> "<" | Le -> "<=" | Gt -> ">" | Ge -> ">=" | Eq -> "==" | _ -> "!=" in
     sprintf "(%s %s %s)" a o b
@@ -727,6 +743,7 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
        | TInt | TStr | TFloat -> ()
        | _ -> if not (List.exists (fun u -> cname c u = cname c rt) c.sort_tys) then c.sort_tys <- c.sort_tys @ [ rt ]);
       set (sprintf "%s_sort(%s)" (cname c rt) (arg 0))
+    | "list_slice", _ -> set (sprintf "%s_slice(%s, %s, %s)" (cname c rt) (arg 0) (arg 1) (arg 2))
     | "list_take", _ -> set (sprintf "%s_slice(%s, 0, %s)" (cname c rt) (arg 0) (arg 1))
     | "list_skip", _ -> set (sprintf "%s_slice(%s, %s, (%s)->len)" (cname c rt) (arg 0) (arg 1) (arg 0))
     | "list_join", _ -> set (sprintf "L_Str_join(%s, %s)" (arg 0) (arg 1))
@@ -754,6 +771,11 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     | "str_index_of", _ ->
       line "{";
       line (sprintf "  int64_t i_ = Str_find(%s, %s, 0);" (arg 0) (arg 1));
+      line (sprintf "  %s = i_ >= 0 ? %s : %s;" dst (mk_enum c t 0 [ "i_" ]) (mk_enum c t 1 []));
+      line "}"
+    | "str_last_index_of", _ ->
+      line "{";
+      line (sprintf "  int64_t i_ = Str_rfind(%s, %s);" (arg 0) (arg 1));
       line (sprintf "  %s = i_ >= 0 ? %s : %s;" dst (mk_enum c t 0 [ "i_" ]) (mk_enum c t 1 []));
       line "}"
     | "str_bytes", _ -> set (sprintf "Str_bytes(%s)" (arg 0))

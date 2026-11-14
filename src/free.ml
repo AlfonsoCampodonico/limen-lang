@@ -5,7 +5,8 @@ open Ast
 let rec pat_binds p acc =
   match p.pdesc with
   | PBind n -> n :: acc
-  | PVariant (_, _, args) | PTuple args -> List.fold_left (fun acc a -> pat_binds a acc) acc args
+  | PRest (Some n) -> n :: acc
+  | PVariant (_, _, args) | PTuple args | PList args | POr args -> List.fold_left (fun acc a -> pat_binds a acc) acc args
   | _ -> acc
 
 let rec fv bound acc e =

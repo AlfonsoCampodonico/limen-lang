@@ -451,6 +451,7 @@ let build_methods (t : ty) : (string * (unit -> ty list * ty)) list =
       m "starts_with" [ TStr ] TBool; m "ends_with" [ TStr ] TBool; m "to_upper" [] TStr;
       m "to_lower" [] TStr; m "replace" [ TStr; TStr ] TStr; m "parse_int" [] (opt TInt);
       m "parse_float" [] (opt TFloat); m "slice" [ TInt; TInt ] TStr; m "index_of" [ TStr ] (opt TInt);
+      m "last_index_of" [ TStr ] (opt TInt);
       m "bytes" [] (TList TInt); m "chars" [] (TList TStr); m "to_bytes" [] TBytes; m "message" [] TStr ]
   | TBytes ->
     [ m "len" [] TInt; m "is_empty" [] TBool; m "get" [ TInt ] (opt TInt); m "slice" [ TInt; TInt ] TBytes;
@@ -1675,7 +1676,7 @@ and check_bin ctx f op a b sp =
       err ctx "E0201" sp (sprintf "operator `%s` cannot be applied to `%s`" name (show t))
     in
     match op with
-    | Add -> (match t with TInt | TFloat | TStr | TBytes | TErr | TVar _ -> t | _ -> bad (); TErr)
+    | Add -> (match t with TInt | TFloat | TStr | TBytes | TList _ | TErr | TVar _ -> t | _ -> bad (); TErr)
     | Sub | Mul | Div -> (match t with TInt | TFloat | TErr | TVar _ -> t | _ -> bad (); TErr)
     | Mod -> (match t with TInt | TErr | TVar _ -> t | _ -> bad (); TErr)
     | Lt | Le | Gt | Ge -> (match unordered ctx t with None -> () | Some _ -> bad ()); TBool
@@ -1824,6 +1825,7 @@ and check_with ctx f base fields sp =
 
 and check_match ?want ctx f s arms sp =
   let st = check_expr ctx f s in
+  let errors_before = List.length (Diag.errors ctx.diags) in
   let result = match want with Some w -> w | None -> fresh () in
   List.iter
     (fun arm ->
@@ -1837,6 +1839,26 @@ and check_match ?want ctx f s arms sp =
          unify_at ctx arm.abody.espan result bt);
       pop f)
     arms;
+  (* an arm, or an alternative in one, that the unguarded arms before it
+     already cover can never run (not looked for after an error in the arms,
+     whose patterns may then not fit their type) *)
+  if List.length (Diag.errors ctx.diags) = errors_before then
+  ignore
+    (List.fold_left
+       (fun before arm ->
+         let alts = alternatives arm.apat in
+         if not (useful ~unknown:true ctx before [ arm.apat ] [ st ]) then
+           warn_unreachable ctx arm.apat.pspan "this arm can never match: the arms before it cover every value it matches"
+         else if List.length alts > 1 then
+           ignore
+             (List.fold_left
+                (fun seen alt ->
+                  if not (useful ~unknown:true ctx seen [ alt ] [ st ]) then
+                    warn_unreachable ctx alt.pspan "this alternative can never match: the arms and alternatives before it cover every value it matches";
+                  [ alt ] :: seen)
+                before alts);
+         if arm.aguard = None then [ arm.apat ] :: before else before)
+       [] arms);
   (match arms with
    | [] -> err ctx "E0204" sp "`match` needs at least one arm"
    | _ -> (
@@ -1862,6 +1884,9 @@ and check_match ?want ctx f s arms sp =
          ~fix:{ Diag.fmsg = "add the missing arms"; edits = [ { Diag.at = at; replacement = text } ] }));
   result
 
+and warn_unreachable ctx span msg =
+  ctx.diags <- Diag.make ~severity:Diag.Warning "W0002" span msg :: ctx.diags
+
 and check_pat ctx f t p =
   match p.pdesc with
   | PWild -> ()
@@ -1869,10 +1894,75 @@ and check_pat ctx f t p =
   | PInt _ -> unify_at ctx p.pspan t TInt
   | PStr _ -> unify_at ctx p.pspan t TStr
   | PBool _ -> unify_at ctx p.pspan t TBool
+  | PTuple ps when List.exists is_rest ps -> (
+    (* `(a, ..)`: the tuple's size comes from its type *)
+    match repr t with
+    | TNamed (n, ts) when is_tuple_name n ->
+      if List.length ps - 1 > List.length ts then begin
+        err ctx "E0107" p.pspan
+          (sprintf "the tuple has %d items, the pattern has at least %d" (List.length ts) (List.length ps - 1));
+        List.iter (check_pat ctx f TErr) ps
+      end
+      else List.iter2 (check_pat ctx f) ts (fill_rest ps (List.length ts))
+    | TErr -> List.iter (check_pat ctx f TErr) ps
+    | TVar _ ->
+      err ctx "E0207" p.pspan "the type of this value is not known here, so `..` cannot stand for its other items; add a type annotation";
+      List.iter (check_pat ctx f TErr) ps
+    | t ->
+      err ctx "E0201" p.pspan (sprintf "this pattern is a tuple, but the value is `%s`" (show t));
+      List.iter (check_pat ctx f TErr) ps)
   | PTuple ps ->
     let ts = List.map (fun _ -> fresh ()) ps in
     unify_at ctx p.pspan (TNamed (tuple_name (List.length ps), ts)) t;
     List.iter2 (check_pat ctx f) ts ps
+  | PList ps ->
+    let el = fresh () in
+    unify_at ctx p.pspan (TList el) t;
+    List.iter
+      (fun q ->
+        match q.pdesc with
+        | PRest (Some n) -> bind f n { vty = TList el; vmut = false; vspan = q.pspan; vkind = KPat }
+        | _ -> check_pat ctx f el q)
+      ps
+  | PRest _ -> () (* only inside a tuple, variant or list pattern, which handle it *)
+  | POr alts ->
+    (* each alternative in a scope of its own, to compare what they bind *)
+    let binds_of alt =
+      push f;
+      check_pat ctx f t alt;
+      let s = List.hd f.scopes in
+      let vs = if s.vars == no_vars then [] else List.of_seq (Hashtbl.to_seq s.vars) in
+      pop f;
+      List.sort (fun (a, _) (b, _) -> compare a b) vs
+    in
+    let first = binds_of (List.hd alts) in
+    List.iter
+      (fun alt ->
+        let vs = binds_of alt in
+        let names l = List.map fst l in
+        let only_in a b = List.filter (fun n -> not (List.mem n (names b))) (names a) in
+        match (only_in first vs, only_in vs first) with
+        | n :: _, _ ->
+          err ctx "E0210" alt.pspan
+            (sprintf "`%s` is bound in the first alternative but not in this one" n)
+            ~notes:[ "every alternative of `A | B` must bind the same names, with the same types" ]
+        | [], n :: _ ->
+          err ctx "E0210" alt.pspan
+            (sprintf "`%s` is bound in this alternative but not in the first one" n)
+            ~notes:[ "every alternative of `A | B` must bind the same names, with the same types" ]
+        | [], [] ->
+          List.iter
+            (fun (n, (v : var_info)) ->
+              let v0 = List.assoc n first in
+              match unify v0.vty v.vty with
+              | () -> ()
+              | exception Mismatch ->
+                err ctx "E0210" v.vspan
+                  (sprintf "`%s` is `%s` in the first alternative and `%s` in this one" n (show v0.vty) (show v.vty))
+                  ~notes:[ "every alternative of `A | B` must bind the same names, with the same types" ])
+            vs)
+      (List.tl alts);
+    List.iter (fun (n, v) -> bind f n v) first
   | PVariant (q, v, args) -> (
     let rt = repr t in
     let skip () = List.iter (fun a -> check_pat ctx f TErr a) args in
@@ -1919,18 +2009,20 @@ and check_pat ctx f t p =
         let targs = List.map (fun _ -> fresh ()) gen in
         unify_at ctx p.pspan t (TNamed (en, targs));
         let ptys = List.map (subst (List.combine gen targs)) payload in
-        if List.length ptys <> List.length args then begin
+        let rest = List.exists is_rest args in
+        let given = List.length args - if rest then 1 else 0 in
+        if (if rest then given > List.length ptys else given <> List.length ptys) then begin
           err ctx "E0107" p.pspan
-            (sprintf "variant `%s` has %d field%s, the pattern has %d" v (List.length ptys)
-               (plural (List.length ptys)) (List.length args));
+            (sprintf "variant `%s` has %d field%s, the pattern has %s%d" v (List.length ptys)
+               (plural (List.length ptys)) (if rest then "at least " else "") given);
           skip ()
         end
-        else List.iter2 (fun a pt -> check_pat ctx f pt a) args ptys))
+        else List.iter2 (fun a pt -> check_pat ctx f pt a) (fill_rest args (List.length ptys)) ptys))
 
 (* Patterns still unmatched, as source text. Single-field payloads are
    checked recursively; multi-field payloads only need one arm each. *)
 and missing_arms ctx t pats =
-  let rec irrefutable p = match p.pdesc with PWild | PBind _ -> true | PTuple ps -> List.for_all irrefutable ps | _ -> false in
+  let pats = List.concat_map alternatives pats in
   if List.exists irrefutable pats then []
   else
     match repr t with
@@ -1939,6 +2031,17 @@ and missing_arms ctx t pats =
       List.filter_map
         (fun b -> if List.exists (fun p -> p.pdesc = PBool b) pats then None else Some (string_of_bool b))
         [ true; false ]
+    | TList el ->
+      (* the lengths not covered: `[]`, `[_]`, ..., and `[_, .., ]` for the longer ones *)
+      let rows = List.map (fun p -> [ p ]) pats in
+      let m = list_longest rows in
+      List.filter_map
+        (fun l ->
+          if exhaustive ctx (list_rows l rows) (List.init l (fun _ -> el)) then None
+          else
+            let items = List.init l (fun _ -> "_") @ if l > m then [ ".." ] else [] in
+            Some ("[" ^ String.concat ", " items ^ "]"))
+        (List.init (m + 2) Fun.id)
     | TNamed (n, args) when Hashtbl.mem ctx.variants n ->
       let gen = (Hashtbl.find ctx.enums n).en_gen in
       let env = List.combine gen args in
@@ -1946,7 +2049,13 @@ and missing_arms ctx t pats =
         (fun (v, payload) ->
           let rows =
             List.filter_map
-              (fun p -> match p.pdesc with PVariant (_, v', a) when v' = v -> Some a | _ -> None)
+              (fun p ->
+                match p.pdesc with
+                | PVariant (_, v', a) when v' = v ->
+                  let a = fill_rest a (List.length payload) in
+                  (* the wrong number of items, reported already: as if `_` *)
+                  Some (if List.length a = List.length payload then a else List.map (fun _ -> { p with pdesc = PWild }) payload)
+                | _ -> None)
               pats
           in
           match (payload, rows) with
@@ -1956,47 +2065,146 @@ and missing_arms ctx t pats =
           | [ pt ], _ ->
             let inner = List.filter_map (function [ p ] -> Some p | _ -> None) rows in
             List.map (fun m -> v ^ "(" ^ m ^ ")") (missing_arms ctx (subst env pt) inner)
-          | _ -> [])
+          | _ -> if exhaustive ctx rows (List.map (subst env) payload) then [] else [ v ^ "(" ^ String.concat ", " (List.map (fun _ -> "_") payload) ^ ")" ])
         (Hashtbl.find ctx.variants n)
     | TErr | TVar _ -> []
     | _ -> [ "_" ]
 
-(* Do the rows of patterns cover every value of the column types? The
-   classic matrix check: split on the first column's constructors. *)
+(* The longest list a list pattern at the head of these rows spells out,
+   not counting a `..`: lists longer than that all match the same rows. *)
+and list_longest rows =
+  List.fold_left
+    (fun m row ->
+      match row with
+      | { pdesc = PList ps; _ } :: _ -> max m (List.length (List.filter (fun p -> not (is_rest p)) ps))
+      | _ -> m)
+    0 (expand_heads rows)
+
+(* The rows that match a list of length [l] at their head, with that list's
+   [l] items in its place. *)
+and list_rows l rows =
+  List.filter_map
+    (fun row ->
+      match row with
+      | [] -> None
+      | p :: r -> ( match list_items l p with Some items -> Some (items @ r) | None -> None))
+    (expand_heads rows)
+
+(* What pattern [p] says of the items of a list of length [l]: one pattern
+   each, or None when it does not match that length. *)
+and list_items l (p : pat) =
+  let wild = { pdesc = PWild; pspan = p.pspan } in
+  match p.pdesc with
+  | PWild | PBind _ -> Some (List.init l (fun _ -> wild))
+  | PList ps -> (
+    match list_parts ps with
+    | before, None, _ -> if List.length before = l then Some before else None
+    | before, Some _, after ->
+      let k = List.length before + List.length after in
+      if k <= l then Some (before @ List.init (l - k) (fun _ -> wild) @ after) else None)
+  | _ -> None
+
+(* Each row whose first pattern is an or-pattern becomes one row per
+   alternative. *)
+and expand_heads rows =
+  List.concat_map
+    (function { pdesc = POr alts; _ } :: r -> expand_heads (List.map (fun a -> a :: r) alts) | row -> [ row ])
+    rows
+
+(* Do the rows of patterns cover every value of the column types? *)
 and exhaustive ctx (rows : pat list list) (tys : ty list) : bool =
-  match tys with
-  | [] -> rows <> []
-  | t :: rest_tys -> (
+  not (useful ~unknown:false ctx rows (List.map (fun _ -> { pdesc = PWild; pspan = Span.dummy }) tys) tys)
+
+(* Does the row of patterns [q] match some value that none of [rows] does?
+   The classic matrix check, splitting on the first column's constructors:
+   enum variants, `true` and `false`, a tuple's one shape, a list's lengths;
+   Int and Str literals never cover their type. [unknown] is the answer
+   where a type is not known (after an error). *)
+and useful ~unknown ctx (rows : pat list list) (q : pat list) (tys : ty list) : bool =
+  match (q, tys) with
+  | [], _ | _, [] -> rows = []
+  | qh :: qr, t :: rest_tys -> (
+    let rows = expand_heads rows in
     let wild p = match p.pdesc with PWild | PBind _ -> true | _ -> false in
-    let wild_p = { pdesc = PWild; pspan = Span.dummy } in
-    let default () = exhaustive ctx (List.filter_map (function p :: r when wild p -> Some r | _ -> None) rows) rest_tys in
-    (* rows specialised to a constructor with these argument types *)
-    let special matches args =
+    let wilds n = List.init n (fun _ -> { pdesc = PWild; pspan = Span.dummy }) in
+    (* rows (and q) specialised to a constructor with [n] arguments *)
+    let special matches n =
       List.filter_map
         (function
-          | p :: r when wild p -> Some (List.map (fun _ -> wild_p) args @ r)
-          | p :: r -> ( match matches p with Some ps -> Some (ps @ r) | None -> None)
+          | p :: r when wild p -> Some (wilds n @ r)
+          | p :: r -> (
+            match matches p with
+            | Some ps when List.length ps = n -> Some (ps @ r)
+            | Some _ -> Some (wilds n @ r) (* the wrong number of items, reported already *)
+            | None -> None)
           | [] -> None)
         rows
     in
-    match repr t with
-    | TNamed (n, args) when is_tuple_name n ->
-      exhaustive ctx (special (fun p -> match p.pdesc with PTuple ps -> Some ps | _ -> None) args) (args @ rest_tys)
-    | TBool ->
-      List.for_all
-        (fun b -> exhaustive ctx (special (fun p -> if p.pdesc = PBool b then Some [] else None) []) rest_tys)
-        [ true; false ]
-    | TNamed (n, targs) when Hashtbl.mem ctx.variants n ->
-      let env = List.combine (Hashtbl.find ctx.enums n).en_gen targs in
-      List.for_all
-        (fun (v, payload) ->
+    let go matches args =
+      let n = List.length args in
+      if wild qh then useful ~unknown ctx (special matches n) (wilds n @ qr) (args @ rest_tys)
+      else
+        match matches qh with
+        | Some ps when List.length ps = n -> useful ~unknown ctx (special matches n) (ps @ qr) (args @ rest_tys)
+        | _ -> unknown
+    in
+    (* a `_` against constructors the rows do not all name: the rows that
+       start with `_` decide, since some value has a constructor no other row
+       matches (this also keeps a recursive type from being unfolded forever) *)
+    let default () = useful ~unknown ctx (List.filter_map (function p :: r when wild p -> Some r | _ -> None) rows) qr rest_tys in
+    let heads = List.filter_map (function p :: _ when not (wild p) -> Some p | _ -> None) rows in
+    match qh.pdesc with
+    | POr alts -> List.exists (fun a -> useful ~unknown ctx rows (a :: qr) tys) alts
+    | _ -> (
+      match repr t with
+      | TNamed (n, args) when is_tuple_name n ->
+        go (fun p -> match p.pdesc with PTuple ps -> Some (fill_rest ps (List.length args)) | _ -> None) args
+      | TBool -> (
+        let one b = go (fun p -> if p.pdesc = PBool b then Some [] else None) [] in
+        let named b = List.exists (fun p -> p.pdesc = PBool b) heads in
+        match qh.pdesc with
+        | PBool b -> one b
+        | _ when wild qh -> if named true && named false then one true || one false else default ()
+        | _ -> unknown)
+      | TNamed (n, targs) when Hashtbl.mem ctx.variants n -> (
+        let env = List.combine (Hashtbl.find ctx.enums n).en_gen targs in
+        let one (v, payload) =
           let ptys = List.map (subst env) payload in
-          exhaustive ctx
-            (special (fun p -> match p.pdesc with PVariant (_, v', a) when v' = v -> Some a | _ -> None) ptys)
-            (ptys @ rest_tys))
-        (Hashtbl.find ctx.variants n)
-    | TErr | TVar _ -> true
-    | _ -> default ())
+          go (fun p -> match p.pdesc with PVariant (_, v', a) when v' = v -> Some (fill_rest a (List.length ptys)) | _ -> None) ptys
+        in
+        let vs = Hashtbl.find ctx.variants n in
+        let named (v, _) = List.exists (fun p -> match p.pdesc with PVariant (_, v', _) -> v' = v | _ -> false) heads in
+        match qh.pdesc with
+        | PVariant (_, v, _) -> ( match List.assoc_opt v vs with Some payload -> one (v, payload) | None -> unknown)
+        | _ when wild qh -> if List.for_all named vs then List.exists one vs else default ()
+        | _ -> unknown)
+      | TList el ->
+        let m = list_longest ([ qh ] :: rows) in
+        let lengths = List.init (m + 2) Fun.id in
+        let at l = useful ~unknown ctx (list_rows l rows) in
+        if wild qh then
+          (* the lengths up to the longest pattern, and one past it for all the longer ones *)
+          if List.for_all (fun l -> List.exists (fun p -> list_items l p <> None) heads) lengths then
+            List.exists (fun l -> at l (wilds l @ qr) (List.init l (fun _ -> el) @ rest_tys)) lengths
+          else default ()
+        else if (match qh.pdesc with PList _ -> false | _ -> true) then unknown
+        else
+          List.exists
+            (fun l ->
+              match list_items l qh with
+              | Some items -> at l (items @ qr) (List.init l (fun _ -> el) @ rest_tys)
+              | None -> false)
+            lengths
+      | TErr | TVar _ -> unknown
+      | _ -> (
+        (* Int, Str, Float and the like: literals never cover the type *)
+        match qh.pdesc with
+        | PInt _ | PStr _ | PBool _ ->
+          useful ~unknown ctx
+            (List.filter_map (function p :: r when wild p || p.pdesc = qh.pdesc -> Some r | _ -> None) rows)
+            qr rest_tys
+        | _ when wild qh -> default ()
+        | _ -> unknown)))
 
 and check_select ctx f arms sp =
   let defaults = List.filter (fun a -> a.sop = SelDefault) arms in
@@ -2061,6 +2269,27 @@ and expect_block ctx f b want =
 (* Returns true when the statement never falls through. *)
 and check_stmt ctx f s : bool =
   match s.sdesc with
+  | SLet (_, n, nsp, Some { tdesc = TyName (tn, []); _ }, e) when String.starts_with ~prefix:"$assign" n && is_tuple_name tn ->
+    (* the right side of `(a, b) = e`, expanded when modules load; the
+       annotation `#tupleN` says how many parts the left side takes *)
+    let k = int_of_string (String.sub tn 6 (String.length tn - 6)) in
+    let t = check_expr ctx f e in
+    let t =
+      match repr t with
+      | TNamed (tn', ts) when is_tuple_name tn' && List.length ts = k -> t
+      | TErr -> TErr
+      | TVar _ ->
+        let u = TNamed (tn, List.init k (fun _ -> fresh ())) in
+        unify_at ctx e.espan u t;
+        u
+      | t' ->
+        err ctx "E0211" e.espan
+          (sprintf "the left side assigns %d values, but the right side is `%s`" k (show t'))
+          ~notes:[ sprintf "the right side of `(a, b) = value` must be a tuple of %d items" k ];
+        TErr
+    in
+    bind f n { vty = t; vmut = false; vspan = nsp; vkind = KLet };
+    false
   | SLet (m, n, nsp, ann, e) ->
     let t =
       match ann with

@@ -1,0 +1,36 @@
+enum Shape {
+    Circle(Float),
+    Ring(Float, Float),
+    Rect(Float, Float),
+    Point,
+}
+
+fn area(s: Shape) -> Float {
+    match s {
+        Circle(r) | Ring(r, _) => 3.14 * r * r,
+        Rect(w, ..) if w > 1.0 => w,
+        Rect(..)
+        | Point => 0.0,
+    }
+}
+
+fn first(xs: List[Int]) -> Int {
+    match xs {
+        [] => 0,
+        [x] => x,
+        [a, .., z] if a == z => a,
+        [first, ..rest] => first + rest.len(),
+    }
+}
+
+fn swap(t: (Int, Int)) -> (Int, Int) {
+    let mut a = 0
+    let mut b = 0
+    (a, b) = t
+    (a, b) = (b, a)
+    ((a, _), b) = ((1, 2), 3)
+    match (a, b) {
+        (1 | 2, ..) => (b, a),
+        (..) => (([a] + [b]).len(), 0),
+    }
+}

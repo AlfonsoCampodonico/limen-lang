@@ -319,6 +319,12 @@ let find_sub s sub from =
   let rec go i = if i + m > n then None else if String.sub s i m = sub then Some i else go (i + 1) in
   if m = 0 then Some from else go from
 
+(* The last occurrence of [sub] in [s]; an empty [sub] is found at the end. *)
+let find_last_sub s sub =
+  let n = String.length s and m = String.length sub in
+  let rec go i = if i < 0 then None else if String.sub s i m = sub then Some i else go (i - 1) in
+  go (n - m)
+
 let split_on s sep =
   if sep = "" then List.init (String.length s) (fun i -> String.make 1 s.[i])
   else
@@ -452,7 +458,7 @@ let keeping : kept option ref = ref None
 (* Built-in methods worth keeping: they build a value or walk a whole one. *)
 let heavy_methods =
   [ "split"; "lines"; "trim"; "to_upper"; "to_lower"; "replace"; "chars"; "bytes"; "contains"; "starts_with";
-    "ends_with"; "index_of"; "slice"; "parse_int"; "parse_float"; "reverse"; "sort"; "join"; "sum"; "take"; "skip";
+    "ends_with"; "index_of"; "last_index_of"; "slice"; "parse_int"; "parse_float"; "reverse"; "sort"; "join"; "sum"; "take"; "skip";
     "to_list" ]
 
 let same_value a b =
@@ -590,6 +596,7 @@ let binop op a b sp =
   | Div, VFloat x, VFloat y -> VFloat (x /. y)
   | Add, VStr x, VStr y -> VStr (x ^ y)
   | Add, VBytes x, VBytes y -> VBytes (x ^ y)
+  | Add, VList x, VList y -> VList (Array.append x y)
   | Lt, VFloat x, VFloat y -> VBool (x < y)
   | Le, VFloat x, VFloat y -> VBool (x <= y)
   | Gt, VFloat x, VFloat y -> VBool (x > y)
@@ -1729,9 +1736,27 @@ let rec pmatch p v binds =
   | PStr s, VStr t -> s = t
   | PBool b, VBool c -> b = c
   | PVariant (_, vn, args), VEnum (_, vn', vals) ->
-    vn = vn' && List.length args = List.length vals && List.for_all2 (fun p v -> pmatch p v binds) args vals
-  | PTuple ps, VStruct (_, fs) when List.length ps = List.length fs ->
-    List.for_all2 (fun p (_, v) -> pmatch p v binds) ps fs
+    vn = vn'
+    &&
+    let args = fill_rest args (List.length vals) in
+    List.length args = List.length vals && List.for_all2 (fun p v -> pmatch p v binds) args vals
+  | PTuple ps, VStruct (_, fs) when List.length (fill_rest ps (List.length fs)) = List.length fs ->
+    List.for_all2 (fun p (_, v) -> pmatch p v binds) (fill_rest ps (List.length fs)) fs
+  | PList ps, VList a -> (
+    let n = Array.length a in
+    match list_parts ps with
+    | before, None, _ -> List.length before = n && List.for_all2 (fun p i -> pmatch p a.(i) binds) before (List.init n Fun.id)
+    | before, Some rest, after ->
+      let k = List.length before and j = List.length after in
+      k + j <= n
+      && List.for_all2 (fun p i -> pmatch p a.(i) binds) before (List.init k Fun.id)
+      && List.for_all2 (fun p i -> pmatch p a.(n - j + i) binds) after (List.init j Fun.id)
+      && ((match rest with Some name -> bind binds name (VList (Array.sub a k (n - k - j))) | None -> ());
+          true))
+  | POr alts, _ ->
+    (* a failed alternative's bindings are undone *)
+    let saved = binds.vars in
+    List.exists (fun alt -> pmatch alt v binds || (binds.vars <- saved; false)) alts
   | _ -> false
 
 let rec eval rt env e : value =
@@ -2424,6 +2449,7 @@ and call_method rt v name args sp =
     let hi = max lo (clamp hi n) in
     VStr (String.sub s lo (hi - lo))
   | VStr s, "index_of", [ VStr t ] -> ( match find_sub s t 0 with Some i -> some (vint i) | None -> none)
+  | VStr s, "last_index_of", [ VStr t ] -> ( match find_last_sub s t with Some i -> some (vint i) | None -> none)
   | VStr s, "chars", [] -> strs (chars s)
   | VStr s, "to_bytes", [] -> VBytes s
   | VBytes b, "len", [] -> vint (String.length b)

@@ -19,6 +19,45 @@ and pat_desc =
   | PBool of bool
   | PVariant of string option * string * pat list (* qualifier, variant, payload *)
   | PTuple of pat list
+  | PList of pat list (* `[a, b, ..rest]` *)
+  | PRest of string option
+      (* `..`, any remaining parts, as an item of a tuple, variant or list
+         pattern; `..name` (lists only) binds them as a list *)
+  | POr of pat list (* `A | B`: two or more alternatives, none of them a POr *)
+
+let is_rest (p : pat) = match p.pdesc with PRest _ -> true | _ -> false
+
+(* The items of a tuple or variant pattern for a value with [n] parts: a
+   `..` among them stands for as many `_` as make up the count. The checker
+   reports a pattern with too many items; elsewhere [n] is always enough. *)
+let fill_rest (ps : pat list) n =
+  if not (List.exists is_rest ps) then ps
+  else
+    let k = List.length ps - 1 in
+    List.concat_map (fun p -> if is_rest p then List.init (max 0 (n - k)) (fun _ -> { p with pdesc = PWild }) else [ p ]) ps
+
+(* A list pattern's items before the `..`, the `..` itself (None when there
+   is none, Some name when it binds the rest), and the items after it. *)
+let list_parts (ps : pat list) =
+  let rec go before = function
+    | [] -> (List.rev before, None, [])
+    | { pdesc = PRest r; _ } :: after -> (List.rev before, Some r, after)
+    | p :: rest -> go (p :: before) rest
+  in
+  go [] ps
+
+(* Does [p] match every value of its type? Names, `_`, tuples of those,
+   `[..rest]`, and or-patterns with such an alternative. *)
+let rec irrefutable (p : pat) =
+  match p.pdesc with
+  | PWild | PBind _ | PRest _ -> true
+  | PTuple ps -> List.for_all irrefutable ps
+  | PList [ { pdesc = PRest _; _ } ] -> true
+  | POr ps -> List.exists irrefutable ps
+  | _ -> false
+
+(* The alternatives of an or-pattern, or the pattern alone. *)
+let alternatives (p : pat) = match p.pdesc with POr ps -> ps | _ -> [ p ]
 
 (* The bounds on type parameters: each parameter with the interfaces it must
    satisfy, written as types so module names and aliases resolve as in any

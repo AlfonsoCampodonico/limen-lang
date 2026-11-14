@@ -535,7 +535,44 @@ and parse_select st =
   done;
   mk (ESelect (List.rev !arms)) (merge t.span (last_span st))
 
+(* A pattern, with alternatives: `A | B`. Alternatives inside alternatives,
+   `(A | B) | C`, are flattened into one list. *)
 and parse_pat st =
+  let first = parse_pat1 st in
+  if not (is_sym st "|") then first
+  else begin
+    let alts = ref (List.rev (alternatives first)) in
+    while accept_sym st "|" do
+      alts := List.rev_append (alternatives (parse_pat1 st)) !alts
+    done;
+    { pdesc = POr (List.rev !alts); pspan = merge first.pspan (last_span st) }
+  end
+
+(* The items of a tuple, variant or list pattern up to [close]: patterns,
+   and at most one `..` for the rest, which a list pattern can name:
+   `[first, ..rest]`. *)
+and pat_items st close ~list =
+  let seen = ref false in
+  comma_list st close (fun st ->
+      if is_sym st ".." then begin
+        let t = advance st in
+        if !seen then raise (Diag.Fatal (Diag.make "E0003" t.span "a pattern can have only one `..`"));
+        seen := true;
+        match cur st with
+        | IDENT n when n <> "_" && not (cur_nl st) ->
+          let nt = advance st in
+          if not list then
+            raise
+              (Diag.Fatal
+                 (Diag.make "E0003" (merge t.span nt.span)
+                    ~notes:[ "here `..` alone stands for the remaining parts" ]
+                    "only a list pattern can name the rest, as in `[first, ..rest]`"));
+          { pdesc = PRest (Some n); pspan = merge t.span nt.span }
+        | _ -> { pdesc = PRest None; pspan = t.span }
+      end
+      else parse_pat st)
+
+and parse_pat1 st =
   let t = peek st in
   let mkp d sp = { pdesc = d; pspan = sp } in
   match t.tok with
@@ -565,18 +602,23 @@ and parse_pat st =
     in
     if is_sym st "(" then begin
       skip st;
-      let args = comma_list st ")" parse_pat in
+      let args = pat_items st ")" ~list:false in
       mkp (PVariant (q, v, args)) (merge t.span (last_span st))
     end
     else if q <> None || is_upper v then mkp (PVariant (q, v, [])) (merge t.span vsp)
     else mkp (PBind v) t.span
   | SYM "(" ->
     skip st;
-    let ps = comma_list st ")" parse_pat in
+    let ps = pat_items st ")" ~list:false in
     let sp = merge t.span (last_span st) in
     (match ps with
+     | [ { pdesc = PRest _; _ } ] -> mkp (PTuple ps) sp
      | [ one ] -> { one with pspan = sp }
      | _ -> mkp (PTuple ps) sp)
+  | SYM "[" ->
+    skip st;
+    let ps = pat_items st "]" ~list:true in
+    mkp (PList ps) (merge t.span (last_span st))
   | _ -> fail t "a pattern"
 
 and parse_block st =

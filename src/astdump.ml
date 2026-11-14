@@ -18,6 +18,10 @@ let rec pat (p : pat) =
   | PBool b -> string_of_bool b
   | PVariant (q, v, a) -> Option.value ~default:"" q ^ "." ^ v ^ "(" ^ String.concat "," (List.map pat a) ^ ")"
   | PTuple ps -> "(" ^ String.concat "," (List.map pat ps) ^ ")"
+  | PList ps -> "[" ^ String.concat "," (List.map pat ps) ^ "]"
+  | PRest None -> ".."
+  | PRest (Some n) -> "..b:" ^ n
+  | POr ps -> "or(" ^ String.concat "|" (List.map pat ps) ^ ")"
 
 let op = function
   | Add -> "+" | Sub -> "-" | Mul -> "*" | Div -> "/" | Mod -> "%" | Eq -> "==" | Ne -> "!=" | Lt -> "<"

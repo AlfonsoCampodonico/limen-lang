@@ -37,7 +37,7 @@ let keywords =
   [ "fn"; "let"; "mut"; "if"; "else"; "match"; "for"; "in"; "while"; "return"; "struct";
     "enum"; "true"; "false"; "group"; "break"; "continue"; "pub"; "use"; "interface"; "dyn"; "select"; "defer" ]
 
-let syms2 = [ "->"; "=>"; "=="; "!="; "<="; ">="; "&&"; "||"; "??"; "|>" ]
+let syms2 = [ "->"; "=>"; "=="; "!="; "<="; ">="; "&&"; "||"; "??"; "|>"; ".." ]
 let syms1 = "(){}[],:;.|+-*/%!?=<>"
 
 (* Every word's one token: KW for a keyword, IDENT for a name. Every

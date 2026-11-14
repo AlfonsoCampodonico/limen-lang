@@ -432,7 +432,7 @@ From loosest to tightest. All binary operators are left-associative.
 
 | Operator | Operands | Result |
 | --- | --- | --- |
-| `+` | `Int`, `Float`, `Str`, `Bytes` (concatenation) | same type |
+| `+` | `Int`, `Float`, `Str`, `Bytes`, `List[T]` (concatenation) | same type |
 | `-` `*` `/` | `Int`, `Float` | same type |
 | `%` | `Int` | `Int` |
 | `<` `<=` `>` `>=` | any ordered type (below) | `Bool` |
@@ -562,6 +562,7 @@ while cond { ... }
 for x in list_or_array { ... }
 for i in 0..<n { ... }    // 0, 1, ..., n - 1
 let (a, b) = pair         // unpack a tuple
+(x, p) = step(p)?         // assign a tuple's items to existing variables
 for (k, v) in m.entries() { ... }
 m[key] = value            // insert into a map (needs mut)
 break
@@ -575,6 +576,23 @@ expr
 - `for` iterates over a snapshot: changing the list inside the loop does not affect the iteration. Over a range, both bounds are evaluated once, before the first iteration.
 - `break` and `continue` only work inside loops, not across closures (E0208).
 - Only variables, fields, list or array elements and map entries, and paths through them such as `m[k].x` or `xs[i].tags[j]`, can be assigned (E0209).
+
+### Tuple assignment
+
+`(a, b) = value` assigns the items of a tuple to places that already exist, the way `let (a, b) = value` makes new names:
+
+```
+let mut x = 0
+let mut p = start
+(x, p) = parse_number(p)?     // value and new position, both kept
+(a, b) = (b, a)               // swap
+((lo, hi), _) = bounds()      // nested; `_` ignores an item
+(best.score, scores[i]) = (s, s * 2)
+```
+
+- The right side is evaluated first, completely, then each target is assigned from left to right. A target's own index or path is evaluated when that target is assigned, so in `(i, xs[i]) = (1, 5)` the element written is `xs[1]`.
+- A target is anything an assignment can have on its left (section 6 above: a `mut` variable, a field, a list element, a map entry, a path through them), `_`, or a nested tuple of targets. Each one is checked against its item's type as a plain assignment is: E0205 when it is not `mut`, E0201 when the type differs.
+- The right side must be a tuple with one item per target (E0211).
 
 ### defer
 
@@ -613,6 +631,9 @@ Used in `match` arms:
 | `Variant(p1, p2)` | a variant, matching its payload against sub-patterns |
 | `Enum.Variant(...)` | a variant, qualified |
 | `(p1, p2)` | a tuple, matching each item |
+| `[]`, `[p1, p2]` | a list of exactly that length, matching each item |
+| `[p1, ..]`, `[.., pn]`, `[p1, ..rest]` | a list at least that long; `..rest` binds the items it skips, as a list |
+| `p1 \| p2` | either pattern: an or-pattern |
 
 ```
 match shape {
@@ -621,6 +642,22 @@ match shape {
     Point => 0.0,
 }
 ```
+
+**Or-patterns.** `p1 | p2 | ...` matches when any alternative does, tried from left to right. It can stand for a whole arm or for a part of a pattern: `Keyword("fn") | Keyword("let") => ...`, `Some(1 | 2)`, `(Red | Green, n)`. Every alternative must bind the same names with the same types, so the arm's body can use them whichever one matched (E0210): `Circle(r) | Ring(r, _) => r`.
+
+**The rest: `..`.** In a variant or tuple pattern, `..` stands for all the items not written out: `SLet(name, ..)` matches an `SLet` whatever its other fields, and `(first, ..)` any tuple, taking its first item. It may come anywhere among the items, at most once per pattern: `(.., last)`, `Rect(w, .., h)` are fine. The type being matched says how many items it stands for, possibly none; writing more items than the value has is E0107. In a variant or tuple `..` cannot be named.
+
+**List patterns.** `[p1, p2]` matches a list of exactly two items. With a `..` it matches any list at least as long as the items written: `[first, ..]` a list with at least one item, `[.., last]` likewise from the end, `[first, .., last]` one with at least two (for one item, `first` and `last` would be the same item, so that list does not match). In a list, the rest can be named: `[first, ..rest]` binds `rest` to a new `List` of the items after `first`, `[..init, last]` to those before `last`. One `..` per list.
+
+```
+match tokens {
+    [] => "empty",
+    [only] => "just {only}",
+    [first, ..rest] => "{first}, then {rest.len()} more",
+}
+```
+
+`let`, `for` and table tests unpack only names, `_` and tuples of those (`let (a, b) = pair`); the other patterns need a `match`.
 
 An arm can have a guard, `if cond` after the pattern, as in a `select`: the arm applies only when its pattern matches **and** the guard is true, otherwise matching goes on with the next arm. The guard sees the pattern's bindings and must be a `Bool` (E0201). Guards run in order, only until an arm applies.
 
@@ -635,7 +672,9 @@ match order {
 
 A guarded arm counts for nothing when checking that a `match` is exhaustive, since its guard may be false: above, `Some(_)` is still needed.
 
-Arms are separated by `,` or a newline. An arm's body is an expression, so a statement such as an assignment needs a block: `None => { more = false },`. Patterns nest: `Err(Failed(msg))`, `Some(Some(n))`. A `match` must be exhaustive (E0204); the error comes with an auto-fix that adds the missing arms. Matching on `Int` or `Str` needs a `_` or binding arm. Tuples are checked column by column, so `(true, _)` and `(false, _)` together are exhaustive.
+Arms are separated by `,` or a newline. An arm's body is an expression, so a statement such as an assignment needs a block: `None => { more = false },`. Patterns nest: `Err(Failed(msg))`, `Some(Some(n))`. A `match` must be exhaustive (E0204); the error comes with an auto-fix that adds the missing arms. Matching on `Int` or `Str` needs a `_` or binding arm. Tuples are checked column by column, so `(true, _)` and `(false, _)` together are exhaustive; an or-pattern covers what its alternatives cover; lists are checked by length, so `[]` and `[_, ..]` together are exhaustive, and so are `[]`, `[x]` and `[x, y, ..rest]`.
+
+An arm that can never match, because the unguarded arms before it already match everything it would, is reported with a warning (W0002), and so is an alternative of an or-pattern that the arms and alternatives before it cover: in `A | B => 1, B => 2` the second arm never runs.
 
 ## 8. Value semantics
 
@@ -1039,6 +1078,7 @@ Methods take the receiver by value and never modify it, except `push`, which nee
 | `parse_float()` | `Option[Float]`, decimal with optional sign, point and exponent (`"2.5e3"`); no hex, `nan` or `inf` |
 | `slice(lo, hi)` | `Str`, bytes `lo` up to `hi`; out-of-range bounds are clamped, so it never panics |
 | `index_of(s)` | `Option[Int]`, byte offset of the first occurrence |
+| `last_index_of(s)` | `Option[Int]`, byte offset of the last occurrence (`"a/b/c".last_index_of("/")` is `Some(3)`); an empty `s` is found at the end, `Some(len())` |
 | `bytes()` | `List[Int]`, each byte as 0-255; index it to scan a string fast |
 
 ### Bytes
@@ -1098,6 +1138,8 @@ Binary data, kept apart from text so a byte buffer is never printed or concatena
 | `group_by(key)` | `Map[K, List[T]]`, the items by `key(x)`, keys in order of first appearance; the key must be a map key type |
 | `count_by(key)` | `Map[K, Int]`, how many items have each key |
 | `tally()` | `Map[T, Int]`, how many times each item occurs: `"hello".chars().tally()` is `{"h": 1, "e": 1, "l": 2, "o": 1}` |
+
+`xs + ys` is a new list: the items of `xs`, then those of `ys`. Neither operand changes, as with strings.
 
 None of these panic, except when a function passed to them does. The methods from `any` on take functions and are written in Tessera; they work the same as the others (a file cannot define a method with one of their names, E0106), and natively they compile like your own code, so a call through a closure literal costs a function call per item. A pipeline of `map` and `filter` before one of them still runs as one loop.
 
@@ -1347,6 +1389,7 @@ Every diagnostic has a stable code. `tessera explain CODE` prints its explanatio
 | Code | Meaning |
 | --- | --- |
 | W0001 | a renamed built-in method (`map_err`, now `map_error`) |
+| W0002 | a `match` arm, or an alternative of an or-pattern, that can never match |
 | E0001-E0008 | lexing and parsing: bad character, unclosed string, unexpected token, missing newline, integer too large, bad escape, empty interpolation, untyped parameter |
 | E0101 | unknown name (with a suggestion) |
 | E0102 | unknown type |
@@ -1375,6 +1418,8 @@ Every diagnostic has a stable code. `tessera explain CODE` prints its explanatio
 | E0207 | type unknown here |
 | E0208 | `break`/`continue` outside a loop |
 | E0209 | invalid assignment target |
+| E0210 | the alternatives of an or-pattern bind different names, or a name with different types |
+| E0211 | a tuple assignment whose right side is not a tuple of as many items |
 | E0301 | capability stored in a field |
 | E0302 | ambient I/O name such as `print` |
 | E0303 | bad `main` signature |
@@ -1450,7 +1495,7 @@ stmt       = "let" [ "mut" ] IDENT [ ":" type ] "=" expr
            | "for" ( IDENT | tuplepat ) "in" expr_ns block
            | "break" | "continue"
            | "defer" ( block | stmt )             (* not a `let` *)
-           | expr [ "=" expr ] ;
+           | expr [ "=" expr ] ;                 (* a tuple of targets on the left: `(a, b) = e` *)
 
 expr       = unary { BINOP unary | "|>" unary } ; (* precedence: section 5; a line may start with "|>" *)
 expr_ns    = expr ;                             (* no struct literal at the top level *)
@@ -1475,10 +1520,15 @@ selarm     = ( IDENT "=" expr | expr | "_" ) [ "if" expr ] "=>" expr ;
                                                 (* ch.recv(), ch.send(v) or clock.after(ms) *)
 init       = IDENT [ ":" expr ] ;
 cparam     = IDENT [ ":" type ] ;
-pattern    = "_" | IDENT | [ "-" ] INT | STRING | "true" | "false"
-           | IDENT [ "." IDENT ] [ "(" pattern { "," pattern } ")" ]
-           | tuplepat ;
-tuplepat   = "(" pattern "," pattern { "," pattern } ")" ;
+pattern    = alt { "|" alt } ;                 (* an or-pattern; not in `let`, `for` or a table test *)
+alt        = "_" | IDENT | [ "-" ] INT | STRING | "true" | "false"
+           | IDENT [ "." IDENT ] [ "(" items ")" ]
+           | "(" items ")"                       (* a tuple, or one pattern in parentheses *)
+           | "[" [ items ] "]" ;                (* a list *)
+items      = item { sep item } [ "," ] ;        (* at most one ".." *)
+item       = pattern | ".." [ IDENT ] ;         (* `..name` only in a list *)
+tuplepat   = "(" upat "," upat { "," upat } ")" ;   (* unpacking in `let`, `for` and table tests *)
+upat       = "_" | IDENT | tuplepat ;
 ```
 
 ## 17. Tools

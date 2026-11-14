@@ -123,7 +123,10 @@ let index (items : item list) : occ list =
       Option.iter (fun en -> add ("v:" ^ en ^ "#" ^ v) v p.pspan) en;
       (match q with Some q -> type_ref q p.pspan | None -> ());
       List.fold_left pat env args
-    | PTuple ps -> List.fold_left pat env ps
+    | PTuple ps | PList ps | POr ps -> List.fold_left pat env ps
+    | PRest (Some n) ->
+      let nsp = { p.pspan with lo = p.pspan.hi - String.length n } in
+      add ~def:true (local nsp) n nsp; (n, local nsp) :: env
     | _ -> env
   in
   let rec expr env e =
