@@ -8,8 +8,8 @@
 // `//host/x`). `path`, `query` and `fragment` stay percent-encoded, as
 // written, since decoding `%2F` in a path would change its meaning; decode
 // them with `decode` or `parse_query`. `user` and `password` are decoded.
-
 use hex
+use text
 
 // The parts of a URL. A part that is not there is empty, and so is `port`
 // (`None`): `default_port(u.scheme)` gives the usual one.
@@ -66,7 +66,7 @@ pub fn parse(s: Str) -> Result[Url, Str] {
                 u.scheme = name.to_lower()
                 rest = rest.slice(k + 1, rest.len())
                 at = k + 1
-            } else if is_alpha(bs[0]) {
+            } else if text.is_alpha(bs[0]) {
                 return Err("url: `{name}` is not a valid scheme")
             }
         },
@@ -83,17 +83,9 @@ pub fn parse(s: Str) -> Result[Url, Str] {
     Ok(u)
 }
 
-fn is_alpha(b: Int) -> Bool {
-    (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
-}
-
-fn is_digit(b: Int) -> Bool {
-    b >= 48 && b <= 57
-}
-
 fn is_scheme(s: Str) -> Bool {
     let bs = s.bytes()
-    is_alpha(bs[0]) && bs.all(|b| is_alpha(b) || is_digit(b) || b == 43 || b == 45 || b == 46)
+    text.is_alpha(bs[0]) && bs.all(|b| text.is_alpha(b) || text.is_digit(b) || b == 43 || b == 45 || b == 46)
 }
 
 // `user:password@host:port`, starting at byte `at` of the URL.
@@ -150,7 +142,7 @@ fn read_authority(u: Url, authority: Str, at: Int) -> Result[Url, Str] {
     }
     if port_text != "" {
         let p = port_text.bytes()
-        if !p.all(|b| is_digit(b)) || p.len() > 5 || (port_text.parse_int() ?? 0) > 65535 {
+        if !p.all(text.is_digit) || p.len() > 5 || (port_text.parse_int() ?? 0) > 65535 {
             return Err("url: `{port_text}` is not a port number (0 to 65535) at byte {start + hostport.len() - port_text.len()}")
         }
         out.port = port_text.parse_int()
@@ -234,7 +226,7 @@ fn escape(s: Str, keep_slash: Bool) -> Str {
     let digits = "0123456789ABCDEF".bytes()
     let mut out: List[Int] = []
     for b in s.bytes() {
-        if is_alpha(b) || is_digit(b) || b == 45 || b == 46 || b == 95 || b == 126 || (keep_slash && b == 47) {
+        if text.is_alpha(b) || text.is_digit(b) || b == 45 || b == 46 || b == 95 || b == 126 || (keep_slash && b == 47) {
             out.push(b)
         } else {
             out.push(37)

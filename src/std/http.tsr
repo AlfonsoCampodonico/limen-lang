@@ -3,7 +3,8 @@
 // be streamed in chunks both ways. The client speaks TLS for https:// URLs
 // (Net.connect_tls); the server speaks TLS when its listener came from
 // Listen.on_tls, with nothing else to change.
-
+use format
+use hex
 use url
 
 pub struct Header {
@@ -169,32 +170,13 @@ fn hex_value(s: Str) -> Option[Int] {
     }
     let mut n = 0
     for b in t.bytes() {
-        let d = if b >= 48 && b <= 57 {
-            b - 48
-        } else if b >= 97 && b <= 102 {
-            b - 87
-        } else if b >= 65 && b <= 70 {
-            b - 55
-        } else {
-            -1
-        }
+        let d = hex.digit(b)
         if d < 0 {
             return None
         }
         n = n * 16 + d
     }
     Some(n)
-}
-
-fn hex_text(n: Int) -> Str {
-    let digits = "0123456789abcdef"
-    let mut s = ""
-    let mut m = n
-    while m > 0 || s == "" {
-        s = digits.slice(m % 16, m % 16 + 1) + s
-        m = m / 16
-    }
-    s
 }
 
 // Read `n` bytes of body, the first ones already in `buf`, passing each
@@ -577,7 +559,7 @@ pub fn write_chunk(c: Conn, data: Str) -> Result[(), IoError] {
     if data == "" {
         return Ok(())
     }
-    c.write(hex_text(data.len()) + "\r\n" + data + "\r\n")
+    c.write(format.hex(data.len()) + "\r\n" + data + "\r\n")
 }
 
 // End a body started with `write_head`.

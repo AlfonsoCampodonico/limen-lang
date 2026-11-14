@@ -5,6 +5,7 @@
 // functions give them as lowercase hex, as checksum tools print them.
 //
 // A 32-bit word is an Int from 0 to 2^32 - 1, kept there with `& mask()`.
+use hex
 
 // The SHA-256 digest of `data`: 32 bytes.
 pub fn sha256(data: Bytes) -> Bytes {
@@ -18,7 +19,7 @@ pub fn sha256(data: Bytes) -> Bytes {
 // `sha256(data)` as 64 hex digits:
 // `sha256_hex("abc".to_bytes())` is `"ba7816bf...f20015ad"`.
 pub fn sha256_hex(data: Bytes) -> Str {
-    hex(sha256(data))
+    hex.encode(sha256(data))
 }
 
 // The HMAC-SHA-256 of `data` under `key` (RFC 2104): 32 bytes. Any key
@@ -30,7 +31,7 @@ pub fn hmac_sha256(key: Bytes, data: Bytes) -> Bytes {
 
 // `hmac_sha256(key, data)` as 64 hex digits.
 pub fn hmac_sha256_hex(key: Bytes, data: Bytes) -> Str {
-    hex(hmac(Sha256, key, data))
+    hex.encode(hmac(Sha256, key, data))
 }
 
 // The SHA-1 digest of `data`: 20 bytes. Broken for security (collisions
@@ -45,7 +46,7 @@ pub fn sha1(data: Bytes) -> Bytes {
 
 // `sha1(data)` as 40 hex digits.
 pub fn sha1_hex(data: Bytes) -> Str {
-    hex(sha1(data))
+    hex.encode(sha1(data))
 }
 
 // The HMAC-SHA-1 of `data` under `key`: 20 bytes, for protocols that
@@ -72,7 +73,7 @@ pub fn md5(data: Bytes) -> Bytes {
 
 // `md5(data)` as 32 hex digits.
 pub fn md5_hex(data: Bytes) -> Str {
-    hex(md5(data))
+    hex.encode(md5(data))
 }
 
 // Whether `a` and `b` hold the same bytes, taking the same time wherever
@@ -91,13 +92,7 @@ pub fn equal(a: Bytes, b: Bytes) -> Bool {
 
 // Bytes as lowercase hex digits.
 pub fn hex(data: Bytes) -> Str {
-    let d = "0123456789abcdef".bytes()
-    let mut out: List[Int] = []
-    for i in 0..<data.len() {
-        out.push(d[data[i] >> 4])
-        out.push(d[data[i] & 15])
-    }
-    bytes(out).to_str()
+    hex.encode(data)
 }
 
 // ---------- HMAC ----------

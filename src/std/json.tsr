@@ -1,5 +1,6 @@
 // JSON: parse text into a Value, turn a Value back into text, and read
 // fields out of it.
+use hex
 
 pub enum Value {
     Null,
@@ -102,28 +103,6 @@ fn num_text(x: Float) -> Str {
     }
 }
 
-fn hex4(n: Int) -> Str {
-    let digits = "0123456789abcdef"
-    let mut out = ""
-    let mut k = 12
-    while k >= 0 {
-        let d = (n / pow2(k)) % 16
-        out = out + digits.slice(d, d + 1)
-        k = k - 4
-    }
-    out
-}
-
-fn pow2(k: Int) -> Int {
-    let mut p = 1
-    let mut i = 0
-    while i < k {
-        p = p * 2
-        i = i + 1
-    }
-    p
-}
-
 // `s` as a JSON string literal, with quotes.
 pub fn quote(s: Str) -> Str {
     let bs = s.bytes()
@@ -143,7 +122,7 @@ pub fn quote(s: Str) -> Str {
         } else if b == 9 {
             "\\t"
         } else if b < 32 {
-            "\\u" + hex4(b)
+            "\\u00" + hex.encode(bytes([b]))
         } else {
             ""
         }
@@ -284,18 +263,6 @@ fn object(t: Text, i: Int) -> Result[Parsed, Str] {
     Err(fail("`\}`", j))
 }
 
-fn hex_digit(b: Int) -> Int {
-    if b >= 48 && b <= 57 {
-        b - 48
-    } else if b >= 97 && b <= 102 {
-        b - 87
-    } else if b >= 65 && b <= 70 {
-        b - 55
-    } else {
-        -1
-    }
-}
-
 // Four hex digits at `i`, or -1.
 fn hex_at(t: Text, i: Int) -> Int {
     if i + 4 > t.bs.len() {
@@ -304,7 +271,7 @@ fn hex_at(t: Text, i: Int) -> Int {
     let mut n = 0
     let mut k = 0
     while k < 4 {
-        let d = hex_digit(t.bs[i + k])
+        let d = hex.digit(t.bs[i + k])
         if d < 0 {
             return -1
         }

@@ -6666,13 +6666,13 @@ fn main(root: Root) {
     let names = List.map (fun (i : Check.fn_info) -> i.name) infos in
     ok "modules-std-shadowed/names" (ds = [] && List.mem "hex.digit" names && List.mem "std/hex.digit" names && List.mem "url.decode" names)
       (String.concat " " (List.filter (fun n -> String.contains n '.') names));
-    ok "modules-std-shadowed/std-loaded" (List.sort compare !Modules.std_loaded = [ ("std/hex", "hex"); ("url", "url") ])
+    ok "modules-std-shadowed/std-loaded" (List.sort compare !Modules.std_loaded = [ ("std/hex", "hex"); ("text", "text"); ("url", "url") ])
       (String.concat " " (List.map (fun (a, b) -> a ^ "=" ^ b) !Modules.std_loaded))
   end;
   (* without a module of its own named hex, the standard library's is hex *)
   if selected "modules-std-unshadowed" then begin
     let _, ds, infos = compile "modules-std-unshadowed" "use url\n\nfn main(root: Root) {\n    root.stdout.print(url.decode(\"%41\") ?? \"\")\n}\n" in
-    ok "modules-std-unshadowed" (ds = [] && List.exists (fun (i : Check.fn_info) -> i.name = "hex.digit") infos && List.sort compare !Modules.std_loaded = [ ("hex", "hex"); ("url", "url") ]) "std hex is hex"
+    ok "modules-std-unshadowed" (ds = [] && List.exists (fun (i : Check.fn_info) -> i.name = "hex.digit") infos && List.sort compare !Modules.std_loaded = [ ("hex", "hex"); ("text", "text"); ("url", "url") ]) "std hex is hex"
   end;
   (* a type error names the module it means: the program's hex, or std/hex *)
   errs "modules-std-shadowed-private" ~modules:[ ("hex", my_hex) ] "use hex\n\nfn main(root: Root) {\n    let x = hex.decode(\"00\")\n}\n" [ "E0403" ];
