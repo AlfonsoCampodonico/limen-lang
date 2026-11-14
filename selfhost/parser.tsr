@@ -635,7 +635,7 @@ fn interpolation(p: Parser, code: Str, at: Int) -> Parsed[ast.Expr] {
 }
 
 fn lex_error(e: lexer.LexError, file: Int) -> ParseError {
-    error(e.code, ast.Span { file, lo: e.lo, hi: e.hi }, "")
+    error(e.code, ast.Span { file, lo: e.lo, hi: e.hi }, e.message)
 }
 
 // At a `{`: is this `{ base with field: ... }` rather than a block? It is

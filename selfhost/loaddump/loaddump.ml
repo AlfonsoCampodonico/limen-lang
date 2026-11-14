@@ -12,8 +12,7 @@
    body) is written with that file after an `@`.
 
    Otherwise it prints the diagnostics in order: ERROR CODE FILE LO HI,
-   the message (not for the lexer's errors, whose messages the Tessera
-   lexer does not write) and the notes. *)
+   the message and the notes. *)
 open Tessera
 open Ast
 
@@ -144,11 +143,9 @@ let program items =
   print_endline "spans";
   List.iter spans items
 
-let lexer_codes = [ "E0001"; "E0002"; "E0005"; "E0006"; "E0007" ]
-
 let diag (d : Diag.t) =
   Printf.printf "ERROR %s %s %d %d\n" d.code d.span.file d.span.lo d.span.hi;
-  if not (List.mem d.code lexer_codes) then print_endline d.message;
+  print_endline d.message;
   List.iter (fun n -> print_endline ("note: " ^ n)) d.notes
 
 let () =

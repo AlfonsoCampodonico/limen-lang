@@ -1,0 +1,66 @@
+// The boundary to C as C generation writes it: Bool and Int32 both ways,
+// Bytes and Str arguments, Handle results, a struct with Bool and Handle
+// fields by value, Int32 and Bool in the variadic part, callbacks of each
+// result type with and without the call's Foreign, and two calls sharing
+// one wrapper. `on_span` and `pick` are in no library: this file is for
+// comparing the C, which does not link.
+foreign "c" {
+    struct Span { start: Int, live: Bool, at: Handle, width: Int32 }
+    fn isatty(fd: Int32) -> Int32
+    fn malloc(size: Int) -> Handle
+    fn free(p: Handle)
+    fn memcmp(a: Bytes, b: Bytes, n: Int) -> Int32
+    fn strlen(s: Str) -> Int
+    fn printf(format: Str, ..., n: Int32, b: Bool, s: Str) -> Int32
+    fn qsort(base: Handle, n: Int, size: Int, cmp: fn(Handle, Handle) -> Int32)
+    fn bsearch(key: Handle, base: Handle, n: Int, size: Int, cmp: fn(Handle, Handle) -> Int32) -> Handle
+    fn atexit(f: fn() -> ())
+    fn signal(n: Int32, h: fn(Int32) -> ()) -> Handle
+    fn on_span(s: Span, f: fn(Int) -> Bool) -> Span
+    fn pick(f: fn(Bool, Int32) -> Handle, g: fn(Str) -> Float) -> Bool
+}
+
+fn cmp(a: Handle, b: Handle) -> Int {
+    a.addr - b.addr
+}
+
+fn cmp_reading(f: Foreign, a: Handle, b: Handle) -> Int {
+    f.copy(a, 1)[0] - f.copy(b, 1)[0]
+}
+
+fn done() {
+}
+
+fn handler(n: Int) {
+}
+
+fn check(n: Int) -> Bool {
+    n > 0
+}
+
+fn choose(b: Bool, n: Int) -> Handle {
+    Handle { addr: n }
+}
+
+fn measure(s: Str) -> Float {
+    s.len().to_float()
+}
+
+fn main(root: Root) {
+    let f = root.foreign
+    let out = root.stdout
+    let p = malloc(f, 16)
+    let same = memcmp(f, "ab".to_bytes(), "ab".to_bytes(), 2)
+    let _ = printf(f, "%d %d %s\n", 7, true, "x")
+    qsort(f, p, 0, 1, cmp)
+    qsort(f, p, 0, 1, cmp_reading)
+    let found = bsearch(f, p, p, 0, 1, cmp)
+    atexit(f, done)
+    let _ = signal(f, 2, handler)
+    if f.allows("c") && isatty(f, 1) == 7 {
+        let s = on_span(f, Span { start: 1, live: true, at: p, width: 3 }, check)
+        out.print("{s} {pick(f, choose, measure)}")
+    }
+    out.print("{same} {strlen(f, "four")} {found.addr == 0} {f.only("m").allows("c")}")
+    free(f, p)
+}

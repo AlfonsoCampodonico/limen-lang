@@ -1,0 +1,34 @@
+// The built-in methods, each as C generation writes it.
+struct Point {
+    x: Int,
+    y: Int,
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let arr: Array[Int, 4] = [4, 1, 3, 2]
+    out.print("{arr.len()} {arr.get(2)} {arr.get(9)} {arr.contains(3)} {arr.to_list()}")
+    let words: Array[Str, 2] = ["a", "b"]
+    out.print("{words.contains("b")} {words.to_list()} {words.get(0)}")
+    let mut m: Map[Str, Int] = map()
+    m["one"] = 1
+    m["two"] = 2
+    m["three"] = 3
+    m.remove("two")
+    out.print("{m.len()} {m.is_empty()} {m["one"]} {m.get("two")} {m.contains("three")} {m.keys()} {m.values()} {m.entries()}")
+    let pts: Map[Point, Str] = map([(Point { x: 1, y: 2 }, "a"), (Point { x: 3, y: 4 }, "b")])
+    out.print("{pts.get(Point { x: 1, y: 2 })} {pts}")
+    let xs = [5, 3, 9, 1]
+    out.print("{xs.get(1)} {xs.first()} {xs.last()} {xs.take(2)} {xs.skip(2)} {xs.sort()} {xs.reverse()} {xs.contains(9)} {xs.sum()} {xs.is_empty()}")
+    let fs = [2.5, -1.0, 0.5]
+    out.print("{fs.sort()} {[Point { x: 2, y: 1 }, Point { x: 1, y: 5 }].sort()} {[(2, "b"), (1, "a")].sort()} {[[3, 1], [2]].sort()}")
+    let s = "  Hello, World  "
+    let t = s.trim()
+    out.print("{t.len()} {t.to_upper()} {t.to_lower()} {t.replace("l", "L")} {t.split(", ")} {t.contains("World")} {t.starts_with("He")} {t.ends_with("d")}")
+    out.print("{t.index_of("o")} {t.last_index_of("o")} {t.index_of("z")} {t.slice(0, 5)} {"a\nb\n".lines()} {t.chars().len()} {t.bytes().take(3)}")
+    out.print("{"42".parse_int()} {"x".parse_int()} {"2.5e3".parse_float()} {"".is_empty()} {["a", "b"].join("-")}")
+    let b = bytes([104, 105, 255])
+    out.print("{b.len()} {b[1]} {b.get(5)} {b.get(0)} {b.slice(0, 2)} {b.to_list()} {b.is_empty()} {"hi".to_bytes() == b.slice(0, 2)} {b.slice(0, 2).to_str()}")
+    out.print("{65.to_char()} {(-7).abs()} {3.min(4)} {3.max(4)} {7.to_float()} {2.9.to_int()} {(-2.5).abs()} {16.0.sqrt()} {3.14159.to_fixed(2)} {true.to_str()} {12.to_str()} {0.5.to_str()}")
+    out.print("{0..<3}")
+}

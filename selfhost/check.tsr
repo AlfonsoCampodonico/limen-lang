@@ -46,10 +46,7 @@ fn main(root: Root) -> Int {
     let p = loader.load(fs, std, place, args[2])
     for d in p.diags {
         out.print("ERROR {d.code} {diag.path_of(p.files, d.span.file)} {d.span.lo} {d.span.hi}")
-        // a lexing error has no message of its own here
-        if d.message != "" {
-            out.print(d.message)
-        }
+        out.print(d.message)
         for n in d.notes {
             out.print("note: {n}")
         }

@@ -3,8 +3,7 @@
    (src/astdump.ml, the one the formatter tests compare), then the spans the
    tree carries: a line `spans`, then one line per `use` and per item with
    every span in it, in the order a walk of the tree meets them. A parse
-   error prints ERROR CODE LO HI, followed, for the parser's own errors
-   (not the lexer's), by its message and notes. *)
+   error prints ERROR CODE LO HI, followed by its message and notes. *)
 open Tessera
 open Ast
 
@@ -111,8 +110,6 @@ let line f =
   f ();
   print_endline ("  " ^ String.trim (Buffer.contents out))
 
-let parser_codes = [ "E0003"; "E0004"; "E0008" ]
-
 let () =
   let file = Sys.argv.(1) in
   let src = In_channel.with_open_bin file In_channel.input_all in
@@ -124,7 +121,5 @@ let () =
     List.iter (fun i -> line (fun () -> item i)) f.items
   | exception Diag.Fatal d ->
     Printf.printf "ERROR %s %d %d\n" d.code d.span.lo d.span.hi;
-    if List.mem d.code parser_codes then begin
-      print_endline d.message;
-      List.iter (fun n -> print_endline ("note: " ^ n)) d.notes
-    end
+    print_endline d.message;
+    List.iter (fun n -> print_endline ("note: " ^ n)) d.notes

@@ -5,8 +5,10 @@ bootstrap: the OCaml compiler in `src/` builds this one, this one builds
 itself, and when two rounds of that produce the same C, the compiler hosts
 itself. The OCaml compiler stays as the way to build from scratch.
 
-So far: the lexer, the parser, the module loader, the type checker, and
-the backend up to C generation: lowering to the IR and the passes on it.
+So far: the whole compiler for `check`, `caps` and `build`: the lexer,
+the parser, the module loader, the type checker, lowering to the IR and
+the passes on it, C generation, and the build (the C compiler, the build
+cache). It gives the OCaml compiler's C byte for byte.
 
 - `lexer.tsr` turns source text into tokens, with the same rules, positions
   and errors as `src/lexer.ml`.
@@ -77,6 +79,42 @@ the backend up to C generation: lowering to the IR and the passes on it.
   checks made once, fill loops, versioned loops). `ffi.tsr` gives C
   generation the C signature, the results and the libraries of foreign
   functions.
+- `cgen.tsr` is `src/cgen.ml`: the IR as C. The OCaml generator names
+  types (`T0`, `T1`, ...), string literals, callback wrappers and C
+  structs in the order it first meets them, in a mutable context; here
+  the context is one value, `Cg`, threaded through, and the order is
+  OCaml's order of evaluation, which takes a call's arguments from right
+  to left. The loops that keep pure calls in slots are found by their
+  number in the function, as `pure.plan` numbers them.
+- `native.tsr` is the rest of `src/native.ml`: the TLS core pasted in
+  when the program may use TLS, the C compiler's command line, and the
+  build cache, keyed as the OCaml compiler keys it (`md5.tsr` is MD5), so
+  the two compilers share it. What the Fs cannot do (a file's size,
+  modification time and inode for the key, an executable copy, touching
+  a cache entry) it asks `stat`, `readlink`, `cp`, `mv` and `touch` to do
+  through the Exec; OpenSSL is found through `TESSERA_OPENSSL` or
+  `pkg-config`.
+- `tessera.tsr` is the compiler: `check FILE`, `caps FILE` and `build FILE
+  [-o OUT] [--emit-c]` as `bin/main.ml` has them, plus `build --tests` for
+  the test binary of `tessera test --native` (`cdump/` writes the OCaml
+  compiler's C of it). It reads the standard library and the C runtime
+  from `TESSERA_SRC` (the repository's `src/`), which the OCaml compiler
+  has built in: a program can embed only files of its own package. A
+  Tessera program cannot write to stderr, so what the OCaml compiler
+  writes there goes to stdout. Its grants, in full:
+
+```sh
+dune build && _build/default/bin/main.exe build selfhost/tessera.tsr -o tsc
+TESSERA_SRC=$PWD/src ./tsc --grant fs=/ \
+  --grant env=PWD --grant env=TESSERA_SRC --grant env=CC --grant env=PATH --grant env=HOME \
+  --grant env=TESSERA_CACHE --grant env=XDG_CACHE_HOME --grant env=DEVELOPER_DIR --grant env=TESSERA_OPENSSL \
+  --grant env=LIBRARY_PATH --grant env=CPATH --grant env=C_INCLUDE_PATH --grant env=SDKROOT --grant env=MACOSX_DEPLOYMENT_TARGET \
+  --grant exec=cc --grant exec=stat --grant exec=readlink --grant exec=cp --grant exec=mv --grant exec=touch --grant exec=pkg-config \
+  -- build examples/hello.tsr -o hello
+```
+
+  The Fs must hold the program, `TESSERA_SRC`, the output and (to use
+  it) the build cache; `fs=/` is the simple choice.
 - `tokens.tsr` prints a file's tokens one per line; `tokdump/` prints the
   OCaml lexer's in the same format.
 - `parse.tsr` prints a file's tree (with `ast_print.tsr`): the compiler's
@@ -107,7 +145,12 @@ the backend up to C generation: lowering to the IR and the passes on it.
   checks can report, and every rewrite), the backends on those in
   `tests/ir/` (each construct the lowering and the passes treat on their
   own), and all of them on the book's examples when `../tessera-book`
-  (or `$TESSERA_BOOK`) is there:
+  (or `$TESSERA_BOOK`) is there. Then the compilers: the C of `build
+  --emit-c` (and of the test binary) on every program, the edge cases in
+  `tests/c/` and the book's examples, with the output and exit status
+  where there is no C; and a set of the book's programs (concurrency,
+  HTTP, TLS, JSON, SQL, C calls, embedded files, tests, ...) built by
+  both compilers and run:
 
 ```sh
 sh selfhost/check.sh
@@ -117,5 +160,5 @@ The loader does not fetch git dependencies (the OCaml one runs git and
 keeps tessera.lock), and it sees only what its Fs grants: a dependency or
 an embedded file outside the granted directory does not exist for it.
 
-Next: C generation (`src/cgen.ml`), compared the same way against the
-OCaml compiler.
+Next: the bootstrap. `tessera.tsr` compiled by itself, then that
+compiler compiling it again, should give the same C.

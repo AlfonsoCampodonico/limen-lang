@@ -1,0 +1,47 @@
+// Every capability operation, as the runtime call C generation writes
+// for it.
+fn files(fs: Fs) -> Result[Str, IoError] {
+    let ro = fs.read_only()
+    let sub = fs.under("data")
+    fs.make_dir("data")?
+    sub.write("a.txt", "one")?
+    sub.append("a.txt", "two")?
+    let names = fs.list("data")?
+    let text = sub.read("a.txt")?
+    let full = fs.full_path("data/a.txt")?
+    sub.remove("a.txt")?
+    Ok("{names} {text} {full.len() > 0} {fs.exists("data")} {fs.is_dir("data")} {ro.is_read_only()}")
+}
+
+fn network(net: Net, listen: Listen) -> Result[Str, IoError] {
+    let l = listen.on("127.0.0.1:0")?
+    let port = l.port()
+    let conn = net.only("127.0.0.1").connect("127.0.0.1:{port}")?
+    conn.write("ping")?
+    let peer = l.accept()?
+    let got = peer.read()?
+    peer.close()
+    conn.close()
+    l.close()
+    let page = net.get("https://example.com/")?
+    let tls = net.connect_tls("example.com:443")?
+    tls.close()
+    let secure = listen.on_tls("127.0.0.1:0", "cert", "key")?
+    secure.close()
+    Ok("{got} {page.status} {page.headers.get("server")} {page.body.len()}")
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let out = root.stdout
+    out.write("no newline ")
+    out.print("{root.args()} {root.clock.now_ms() > 0} {root.rand.int(1, 2)} {root.rand.float() < 1.0}")
+    root.clock.sleep(1)
+    out.print("{root.env.get("HOME").is_some()} {root.stdin.read_line()} {root.stdin.read_all().len()}")
+    let r = root.exec.only("echo").run("echo", ["hi"])?
+    out.print("{r.code} {r.stdout} {r.stderr}")
+    out.print("{files(root.fs)}")
+    out.print("{network(root.net, root.listen)}")
+    let f = root.foreign.only("c")
+    out.print("{f.allows("c")}")
+    Ok(())
+}

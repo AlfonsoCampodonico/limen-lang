@@ -1,0 +1,38 @@
+// A test binary: plain tests, a table test, tests taking capabilities,
+// one on virtual time, and benchmarks with and without capabilities.
+fn double(n: Int) -> Int {
+    n * 2
+}
+
+fn main(root: Root) {
+    root.stdout.print("{double(21)}")
+}
+
+test "doubles" {
+    assert(double(2) == 4)
+}
+
+test "table" for (n, want) in [(1, 2), (3, 6)] {
+    assert(double(n) == want)
+}
+
+test "clock" (clock: Clock) {
+    assert(clock.now_ms() > 0)
+}
+
+test "waits" (clock: virtual Clock) {
+    clock.sleep(1000)
+    assert(clock.now_ms() >= 1000)
+}
+
+test "files" (fs: Fs) {
+    assert(fs.write("x.txt", "hi").is_ok())
+}
+
+bench "double" {
+    let _ = double(3)
+}
+
+bench "both" (clock: Clock, fs: Fs) {
+    let _ = fs.exists("x")
+}

@@ -1,0 +1,28 @@
+// String and number literals as C writes them: bytes outside printable
+// ASCII, quotes, backslashes and `?` (a trigraph's start) in octal; the
+// same text twice is one literal; floats in hexadecimal, infinities by
+// name; the smallest Int.
+fn main(root: Root) {
+    let out = root.stdout
+    out.print("plain text")
+    out.print("quote \" backslash \\ question?? tab\t newline\n end")
+    out.print("café, naïve, 日本, emoji 🙂")
+    out.print("plain text")
+    out.print("brace \{ and } and \r return")
+    let floats = [0.0, -0.0, 1.5, 0.1, 1e300 * 1e300, -1e300 * 1e300, 5e-324, 1.7976931348623157e308, 3.0e-5]
+    for x in floats {
+        out.print("{x}")
+    }
+    let lo = -9223372036854775807 - 1
+    let hi = 9223372036854775807
+    out.print("{lo} {hi} {-1} {0}")
+    match lo {
+        0 => out.print("zero"),
+        -1 => out.print("minus one"),
+        _ => out.print("other"),
+    }
+    match "a?b" {
+        "a?b" => out.print("matched a?b"),
+        _ => out.print("no"),
+    }
+}

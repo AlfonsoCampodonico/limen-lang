@@ -33,6 +33,7 @@ pub struct LexError {
     code: Str,
     lo: Int,
     hi: Int,
+    message: Str,
 }
 
 fn keywords() -> List[Str] {
@@ -74,8 +75,8 @@ fn escaped(e: Int) -> Option[Int] {
     }
 }
 
-fn err(code: Str, lo: Int, hi: Int) -> LexError {
-    LexError { code, lo, hi }
+fn err(code: Str, lo: Int, hi: Int, message: Str) -> LexError {
+    LexError { code, lo, hi, message }
 }
 
 // The index just past the string literal that starts at `i` (a quote),
@@ -196,7 +197,7 @@ pub fn lex(src: Str) -> Result[List[Token], LexError] {
                 match text.replace("_", "").parse_int() {
                     Some(v) => toks.push(Token { kind: IntLit(v), lo, hi: i, nl }),
                     None => {
-                        return Err(err("E0005", lo, i))
+                        return Err(err("E0005", lo, i, "integer literal `{text.replace("_", "")}` is too large"))
                     },
                 }
             }
@@ -218,7 +219,7 @@ pub fn lex(src: Str) -> Result[List[Token], LexError] {
             let mut closed = false
             while !closed {
                 if i >= n {
-                    return Err(err("E0002", lo, n))
+                    return Err(err("E0002", lo, n, "unterminated string literal"))
                 }
                 let d = bs[i]
                 if d == 34 {
@@ -226,12 +227,12 @@ pub fn lex(src: Str) -> Result[List[Token], LexError] {
                     i = i + 1
                 } else if d == 92 {
                     if i + 1 >= n {
-                        return Err(err("E0002", lo, n))
+                        return Err(err("E0002", lo, n, "unterminated string literal"))
                     }
                     match escaped(bs[i + 1]) {
                         Some(b) => buf.push(b),
                         None => {
-                            return Err(err("E0006", i, i + 2))
+                            return Err(err("E0006", i, i + 2, "unknown escape `\\{src.slice(i + 1, i + 2)}`"))
                         },
                     }
                     i = i + 2
@@ -246,7 +247,7 @@ pub fn lex(src: Str) -> Result[List[Token], LexError] {
                     i = i + 1
                     while depth > 0 {
                         if i >= n {
-                            return Err(err("E0002", open_at, n))
+                            return Err(err("E0002", open_at, n, "unterminated interpolation `\{...}`"))
                         }
                         let k = bs[i]
                         if k == 123 {
@@ -261,19 +262,19 @@ pub fn lex(src: Str) -> Result[List[Token], LexError] {
                                     i = j
                                 },
                                 None => {
-                                    return Err(err("E0002", open_at, n))
+                                    return Err(err("E0002", open_at, n, "unterminated string literal"))
                                 },
                             }
                         } else if k == 92 {
                             // code has no backslashes: an escaped quote meant for a nested string
-                            return Err(err("E0006", i, i + 2))
+                            return Err(err("E0006", i, i + 2, "a `\\` inside `\{...}`: an interpolation holds code, so a string in it uses plain quotes, as in `\"\{f(\"x\")}\"`"))
                         } else {
                             i = i + 1
                         }
                     }
                     let inner = src.slice(start, i - 1)
                     if inner.trim() == "" {
-                        return Err(err("E0007", open_at, i))
+                        return Err(err("E0007", open_at, i, "empty interpolation `\{}`; write `\\\{` for a literal brace"))
                     }
                     parts.push(Interp(inner, start))
                 } else {
@@ -303,7 +304,7 @@ pub fn lex(src: Str) -> Result[List[Token], LexError] {
             } else if is_symbol(c) {
                 sym = src.slice(i, i + 1)
             } else {
-                return Err(err("E0001", lo, lo + 1))
+                return Err(err("E0001", lo, lo + 1, "unexpected character `{src.slice(lo, lo + 1)}`"))
             }
             i = i + sym.len()
             toks.push(Token { kind: Symbol(sym), lo, hi: i, nl })
@@ -320,7 +321,7 @@ pub fn lex(src: Str) -> Result[List[Token], LexError] {
 pub fn lex_at(src: Str, base: Int) -> Result[List[Token], LexError] {
     match lex(src) {
         Ok(toks) => Ok(toks.map(|t| shifted(t, base))),
-        Err(e) => Err(err(e.code, e.lo + base, e.hi + base)),
+        Err(e) => Err(err(e.code, e.lo + base, e.hi + base, e.message)),
     }
 }
 

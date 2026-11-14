@@ -17,9 +17,12 @@ pub fn locate(self: Place, path: Str) -> Str {
     if paths.is_relative(path) {
         return paths.concat(self.cwd, path)
     }
-    // an absolute path reaches the Fs only inside its directory
+    // an absolute path reaches the Fs only inside its directory; a grant
+    // of `/` reaches every one
     if path == self.root {
         ""
+    } else if self.root == "/" {
+        path.slice(1, path.len())
     } else if path.starts_with(self.root + "/") {
         path.slice(self.root.len() + 1, path.len())
     } else {

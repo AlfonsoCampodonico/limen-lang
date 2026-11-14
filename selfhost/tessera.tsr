@@ -1,0 +1,392 @@
+// The compiler, written in Tessera: `check`, `caps` and `build` as the
+// OCaml compiler's bin/main.ml has them, with the same output and exit
+// codes. `build --tests` builds the test binary `tessera test --native`
+// runs instead (`PROGRAM N` runs test N), which with `--emit-c` gives its
+// C, as selfhost/cdump does for the OCaml compiler.
+//
+//   tessera build selfhost/tessera.tsr -o tsc
+//   ./tsc --grant fs=$HOME --grant exec=cc ... --grant env=PWD --grant env=TESSERA_SRC -- build hello.tsr
+//
+// It reaches everything through its grants. The Fs must hold the program
+// and its packages, the compiler's own sources (TESSERA_SRC, the
+// repository's src/ directory: the standard library in src/std and the C
+// runtime in src/runtime, which the OCaml compiler has built in), where
+// the binary goes, and the build cache if it is to be used. The working
+// directory is PWD, which must be inside the Fs. A build runs the C
+// compiler and a few small programs through the Exec (selfhost/native.tsr
+// lists them) and reads the variables native.tsr names through the Env.
+//
+// A Tessera program has no way to write to stderr, so what the OCaml
+// compiler writes there (diagnostics, the usage) goes to stdout here.
+use ast
+use caps
+use cgen
+use diag
+use disk
+use ffi
+use loader
+use lower
+use native
+use own
+use paths
+use prelude
+use pure
+use typecheck
+
+fn usage() -> Str {
+    "tessera: a small language where I/O needs a capability
+
+usage:
+  tessera run FILE [--native] [--grant net=HOST[:PORT]|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST:PORT]... [--grant env=NAME|*]... [--grant exec=PROGRAM|*]... [--grant foreign=LIB|*]... [--seed N] [--no-sandbox] [-- ARGS...]
+  tessera build FILE [-o OUT] [--emit-c]
+  tessera check FILE [--json]
+  tessera caps FILE [--json]
+  tessera explain CODE
+  tessera test FILE [--native] [--run TEXT] [--bench] [--bench-time 1s|100x] [--json]
+  tessera fmt FILE... [--write | --check]
+  tessera doc FILE|MODULE... [--std] [--all] [--html] [-o OUT]
+  tessera lsp                (language server on stdin/stdout)
+  tessera mcp                (MCP server for coding agents, on stdin/stdout)
+  tessera spec               (print the language specification)
+  tessera search [WORDS...]  (search the package index named by TESSERA_INDEX)
+  tessera add NAME[@VERSION] (add a package from the index to tessera.toml, with the caps it declares)
+  tessera index entry [DIR]  (print the index entry for the package's current tag)
+
+Stdout, Stdin, Clock and Rand are always granted. Net, Fs, Listen, Env, Exec and Foreign exist only
+when granted, by --grant or by the [grants] table of tessera.toml. --seed makes Rand repeatable; arguments after -- are root.args(). The process runs in an operating-system sandbox
+limited to those grants (macOS; Linux untested); --no-sandbox turns it off, for debugging.
+"
+}
+
+fn die_usage(out: Stdout, msg: Str) -> Int {
+    out.write(if msg == "" { usage() } else { "tessera: " + msg + "\n\n" + usage() })
+    2
+}
+
+// Where the compiler runs and what it reads its own sources from.
+struct Setup {
+    place: disk.Place,
+    // the compiler's src/ directory, as a path in the Fs
+    src: Str,
+}
+
+// The program after the loader, the checker and the capability checks.
+struct Front {
+    loaded: loader.Program,
+    checked: Option[typecheck.Checked],
+    // the files spans name: the program's, the prelude's, the built-in
+    // methods' and the standard library's tessera.toml
+    files: List[diag.Source],
+    errors: List[diag.Diag],
+    warnings: List[diag.Diag],
+}
+
+fn main(root: Root) -> Int {
+    let out = root.stdout
+    let args = root.args()
+    let setup = match where_am_i(root.fs, root.env) {
+        Ok(s) => s,
+        Err(m) => {
+            out.print("tessera: " + m)
+            return 2
+        },
+    }
+    match args {
+        ["check", file] => check(out, root.fs, setup, file),
+        ["caps", file] => caps_of(out, root.fs, setup, file),
+        ["check", _, "--json"] | ["check", "--json", _] | ["caps", _, "--json"] | ["caps", "--json", _] => {
+            out.print("tessera: --json is not in this compiler yet")
+            2
+        },
+        ["build", ..rest] => {
+            let mut file: Option[Str] = None
+            let mut target: Option[Str] = None
+            let mut emit_c = false
+            let mut tests = false
+            let mut i = 0
+            while i < rest.len() {
+                let a = rest[i]
+                if a == "-o" && i + 1 < rest.len() {
+                    target = Some(rest[i + 1])
+                    i = i + 2
+                    continue
+                }
+                if a == "--emit-c" {
+                    emit_c = true
+                } else if a == "--tests" {
+                    tests = true
+                } else if file.is_none() {
+                    file = Some(a)
+                } else {
+                    return die_usage(out, "bad build arguments")
+                }
+                i = i + 1
+            }
+            match file {
+                Some(f) => build(out, root.fs, root.exec, root.env, setup, f, target, emit_c, tests),
+                None => die_usage(out, "build needs a FILE"),
+            }
+        },
+        [] | ["-h"] | ["--help"] | ["help"] => {
+            out.write(usage())
+            0
+        },
+        _ => die_usage(out, ""),
+    }
+}
+
+// The working directory inside the Fs (from PWD), and the compiler's
+// sources (TESSERA_SRC, absolute or relative to the working directory).
+fn where_am_i(fs: Fs, env: Env) -> Result[Setup, Str] {
+    let base = match fs.full_path("") {
+        Ok(p) => p,
+        Err(e) => {
+            return Err("no directory granted: {e}")
+        },
+    }
+    let pwd = env.get("PWD") ?? base
+    let cwd = if pwd == base {
+        ""
+    } else if base == "/" && pwd.starts_with("/") {
+        pwd.slice(1, pwd.len())
+    } else if pwd.starts_with(base + "/") {
+        pwd.slice(base.len() + 1, pwd.len())
+    } else {
+        return Err("the working directory {pwd} is outside the granted directory {base}")
+    }
+    let place = disk.Place { cwd, root: base }
+    let src = match env.get("TESSERA_SRC") {
+        Some(s) => place.locate(s),
+        None => {
+            return Err("set TESSERA_SRC to the compiler's src directory (with std/ and runtime/), and grant env=TESSERA_SRC")
+        },
+    }
+    Ok(Setup { place, src })
+}
+
+fn read(fs: Fs, path: Str) -> Result[Str, Str] {
+    fs.read(path).map_error(|e| "cannot read {path}: {e}")
+}
+
+// Load and check `file` as the OCaml compiler's Modules.load_and_check
+// does, with the capability checks.
+fn front(fs: Fs, setup: Setup, file: Str) -> Result[Front, Str] {
+    let std = fs.under(paths.concat(setup.src, "std"))
+    let methods = read(std, "methods.tsr")?
+    let std_toml = read(std, "tessera.toml")?
+    let p = loader.load(fs, std, setup.place, file)
+    if !p.diags.is_empty() {
+        return Ok(Front { loaded: p, checked: None, files: p.files, errors: p.diags.filter(|d| !d.warning), warnings: p.diags.filter(|d| d.warning) })
+    }
+    let c = typecheck.check_program(p.items, p.files, p.next_id, methods, p.forwarders)
+    let files = p.files + [diag.Source { path: prelude.file_name(), text: prelude.text() }, diag.Source { path: prelude.methods_name(), text: methods }, diag.Source { path: "<std>/tessera.toml", text: std_toml }]
+    let diags = caps.check(fs, setup.place, files, files.len() - 1, p.std_manifest, p.std_modules, p.manifest, p.packages, p.items, c)
+    Ok(Front { loaded: p, checked: Some(c), files, errors: diags.filter(|d| !d.warning), warnings: diags.filter(|d| d.warning) })
+}
+
+// Load `file`, saying what is wrong with it: the warnings, then (when
+// there are errors) the errors and their count, as bin/main.ml's `load`
+// and `report` print them. None when it cannot go on, with the exit code.
+fn load(out: Stdout, fs: Fs, setup: Setup, file: Str) -> Result[Front, Int] {
+    if !fs.exists(setup.place.locate(file)) {
+        out.print("tessera: {file}: No such file or directory")
+        return Err(2)
+    }
+    let f = match front(fs, setup, file) {
+        Ok(f) => f,
+        Err(m) => {
+            out.print("tessera: " + m)
+            return Err(2)
+        },
+    }
+    for d in f.warnings {
+        out.write(d.render(f.files) + "\n")
+    }
+    Ok(f)
+}
+
+fn report(out: Stdout, f: Front) {
+    for d in f.errors {
+        out.write(d.render(f.files) + "\n")
+    }
+    let n = f.errors.len()
+    out.print("{n} error{if n == 1 { "" } else { "s" }}")
+}
+
+fn check(out: Stdout, fs: Fs, setup: Setup, file: Str) -> Int {
+    let f = match load(out, fs, setup, file) {
+        Ok(f) => f,
+        Err(code) => {
+            return code
+        },
+    }
+    if !f.errors.is_empty() {
+        report(out, f)
+        return 1
+    }
+    out.print("ok")
+    for l in c_callers(f.loaded.items, f.loaded.packages) {
+        out.print(l)
+    }
+    0
+}
+
+// Every part of the program that calls C, so it can be reviewed: C code
+// is outside every capability check. One line each.
+fn c_callers(items: List[ast.Item], packages: List[(Str, Str)]) -> List[Str] {
+    // module -> (libraries, trusted), newest module first as OCaml keeps it
+    let mut groups: List[(Str, (List[Str], Bool))] = []
+    for i in items {
+        match i {
+            IFn(d) => match d.foreign {
+                Some(fo) => {
+                    let m = match d.name.index_of(".") {
+                        Some(k) => d.name.slice(0, k),
+                        None => "",
+                    }
+                    let (libs, trusted) = match groups.find(|g| g.0 == m) {
+                        Some(g) => g.1,
+                        None => ([], fo.trusted),
+                    }
+                    let libs = if libs.contains(fo.lib) || fo.lib == "tessera" { libs } else { libs + [fo.lib] }
+                    groups = [(m, (libs, trusted))] + groups.filter(|g| g.0 != m)
+                },
+                None => {},
+            },
+            _ => {},
+        }
+    }
+    groups.sort().map(|g| {
+        let (m, (libs, trusted)) = g
+        let who = if m == "" {
+            "the program itself (needs --grant foreign)"
+        } else if trusted {
+            "module `{m}` (standard library, trusted by src/std/tessera.toml)"
+        } else {
+            match packages.find(|p| p.0 == m) {
+                Some(p) => "module `{m}` (dependency `{p.1}`, trusted in tessera.toml [trust])",
+                None => "module `{m}` (the program's own, needs --grant foreign)",
+            }
+        }
+        "calls C: {who}: {libs.join(", ")}"
+    })
+}
+
+fn caps_of(out: Stdout, fs: Fs, setup: Setup, file: Str) -> Int {
+    let f = match load(out, fs, setup, file) {
+        Ok(f) => f,
+        Err(code) => {
+            return code
+        },
+    }
+    if !f.errors.is_empty() {
+        report(out, f)
+        return 1
+    }
+    let infos = match f.checked {
+        Some(c) => c.infos,
+        None => [],
+    }
+    let width = infos.fold(0, |w, i| w.max(i.name.len()))
+    for i in infos {
+        let what = match (i.caps, i.callbacks) {
+            ([], false) => "pure",
+            ([], true) => "pure itself, runs callbacks",
+            (cs, cb) => cs.join(", ") + if cb { " + callbacks" } else { "" },
+        }
+        out.print(i.name + spaces(width - i.name.len()) + "  " + what)
+    }
+    // files read at compile time: changing one changes the program
+    for e in f.loaded.embedded {
+        out.print("embeds {e.path} ({e.size} bytes){if e.module == "" { "" } else { " in module " + e.module }}")
+    }
+    0
+}
+
+fn spaces(n: Int) -> Str {
+    (0..<n).map(|_| " ").join("")
+}
+
+// OCaml's Filename.remove_extension of Filename.basename.
+fn default_output(file: Str) -> Str {
+    let base = match file.last_index_of("/") {
+        Some(k) => file.slice(k + 1, file.len()),
+        None => file,
+    }
+    match base.last_index_of(".") {
+        Some(k) if k > 0 => base.slice(0, k),
+        _ => base,
+    }
+}
+
+fn build(out: Stdout, fs: Fs, exec: Exec, env: Env, setup: Setup, file: Str, target: Option[Str], emit_c: Bool, tests: Bool) -> Int {
+    let f = match load(out, fs, setup, file) {
+        Ok(f) => f,
+        Err(code) => {
+            return code
+        },
+    }
+    if !f.errors.is_empty() {
+        report(out, f)
+        return 1
+    }
+    let has = |p: fn(ast.FnDecl) -> Bool| f.loaded.items.any(|i| match i {
+        IFn(d) => p(d),
+        _ => false,
+    })
+    if tests && !has(|d| d.test.is_some()) {
+        out.print("no tests")
+        return 0
+    }
+    if !tests && !has(|d| d.name == "main") {
+        out.print("error: no `main` function")
+        return 1
+    }
+    let c = match f.checked {
+        Some(c) => c,
+        None => {
+            return 1
+        },
+    }
+    let exe = target ?? default_output(file)
+    let runtime_dir = paths.concat(setup.src, "runtime")
+    let headers = read(fs, paths.concat(runtime_dir, "tessera_sandbox.h")).flat_map(|a| read(fs, paths.concat(runtime_dir, "tessera_rt.h")).map(|b| a + b))
+    let runtime = match headers {
+        Ok(text) => text,
+        Err(m) => {
+            out.print("tessera: " + m)
+            return 2
+        },
+    }
+    let c_text = c_source(c, f.files, runtime, tests)
+    if emit_c {
+        return match fs.write(setup.place.locate(exe + ".c"), c_text) {
+            Ok(_) => 0,
+            Err(e) => {
+                out.print("tessera: cannot write {exe}.c: {e}")
+                2
+            },
+        }
+    }
+    let tls_text = read(fs, paths.concat(runtime_dir, "tessera_tls.h")) ?? ""
+    let n = native.setting(env, setup.place)
+    match n.build(exec, fs, c_text, tls_text, ffi.libs(c.items), exe) {
+        Ok(_) => {
+            n.remove_c(fs, exe)
+            0
+        },
+        Err(m) => {
+            out.write(m)
+            out.print("tessera: the C compiler failed (this is a bug in tessera)")
+            1
+        },
+    }
+}
+
+// The program's C, as Native.c_source makes it: lowered (as the test
+// binary, with `tests`), repeated pure calls reused, ownership placed,
+// then C generation.
+fn c_source(c: typecheck.Checked, files: List[diag.Source], runtime: Str, tests: Bool) -> Str {
+    let (prog, ro) = lower.lower_program(c.prelude, c.items, c.cx, c.state, tests)
+    cgen.program(ro, files, own.program(pure.cse(prog)), runtime)
+}

@@ -1,0 +1,93 @@
+// Types C generation defines: enums that contain themselves (boxed),
+// arrays of structs, maps keyed by structs, enums and tuples (hashed),
+// order on lists, arrays, enums, structs and tuples, lists of lists, and
+// dyn values backed by structs and by enums.
+enum Tree {
+    Leaf,
+    Node(Tree, Int, Tree),
+}
+
+enum Expr {
+    Num(Float),
+    Add(List[Expr]),
+    Neg(Expr),
+}
+
+enum Color {
+    Red,
+    Green,
+    Rgb(Int, Int, Int),
+}
+
+struct Cell {
+    pos: (Int, Int),
+    color: Color,
+    tags: Array[Str, 2],
+}
+
+interface Shape {
+    fn area(self) -> Float
+    fn name(self) -> Str
+}
+
+struct Square {
+    side: Float,
+}
+
+fn area(self: Square) -> Float {
+    self.side * self.side
+}
+
+fn name(self: Square) -> Str {
+    "square"
+}
+
+fn area(self: Color) -> Float {
+    0.0
+}
+
+fn name(self: Color) -> Str {
+    "color"
+}
+
+fn insert(t: Tree, v: Int) -> Tree {
+    match t {
+        Leaf => Node(Leaf, v, Leaf),
+        Node(l, x, r) => if v < x { Node(insert(l, v), x, r) } else { Node(l, x, insert(r, v)) },
+    }
+}
+
+fn eval(e: Expr) -> Float {
+    match e {
+        Num(x) => x,
+        Add(es) => es.fold(0.0, |a, x| a + eval(x)),
+        Neg(x) => 0.0 - eval(x),
+    }
+}
+
+fn main(root: Root) -> Result[Int, dyn Error] {
+    let out = root.stdout
+    let t = [5, 2, 8, 1].fold(Leaf, insert)
+    out.print("{t} {t == insert(Leaf, 5)}")
+    out.print("{eval(Add([Num(1.5), Neg(Num(0.5)), Add([])]))}")
+    let cells: Array[Cell, 2] = [Cell { pos: (0, 0), color: Red, tags: ["a", "b"] }, Cell { pos: (1, 2), color: Rgb(1, 2, 3), tags: ["c", "d"] }]
+    out.print("{cells} {cells[0] < cells[1]} {cells == cells}")
+    let mut by_color: Map[Color, Int] = map()
+    by_color[Red] = 1
+    by_color[Rgb(1, 2, 3)] = 2
+    let mut by_pos: Map[(Int, Str), Bool] = map()
+    by_pos[(1, "x")] = true
+    out.print("{by_color} {by_pos.get((1, "x"))}")
+    out.print("{[Green, Red, Rgb(0, 0, 0)].sort()} {[[2, 1], [1, 9, 9]] < [[2, 1]]} {[(1, Green)].sort()}")
+    let nested = [[[1, 2]], [[3]]]
+    out.print("{nested} {nested[1][0]}")
+    let shapes: List[dyn Shape] = [Square { side: 2.0 }, Green]
+    for s in shapes {
+        out.print("{s.name()} {s.area()}")
+    }
+    let fail: Result[Int, dyn Error] = Err("no luck")
+    match fail {
+        Ok(n) => Ok(n),
+        Err(_) => Ok(3),
+    }
+}

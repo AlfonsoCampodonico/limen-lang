@@ -93,11 +93,9 @@ let caps_line (i : Check.fn_info) =
   Printf.printf "CAPS %s %s %d %d [%s] %b\n" i.name i.span.file i.span.lo i.span.hi
     (String.concat "," (List.map Types.cap_name i.caps)) i.callbacks
 
-let lexer_codes = [ "E0001"; "E0002"; "E0005"; "E0006"; "E0007" ]
-
 let load_diag (d : Diag.t) =
   Printf.printf "ERROR %s %s %d %d\n" d.code d.span.file d.span.lo d.span.hi;
-  if not (List.mem d.code lexer_codes) then print_endline d.message;
+  print_endline d.message;
   List.iter (fun n -> print_endline ("note: " ^ n)) d.notes
 
 let () =

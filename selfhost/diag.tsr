@@ -58,3 +58,66 @@ pub fn nowhere() -> ast.Span {
 pub fn path_of(files: List[Source], file: Int) -> Str {
     files.get(file).map(|s| s.path) ?? ""
 }
+
+// The line and column of offset `off` in file number `file`, counted as
+// the OCaml compiler's Source.line_col counts them.
+pub fn line_col(files: List[Source], file: Int, off: Int) -> (Int, Int) {
+    let text = match files.get(file) {
+        Some(s) => s.text,
+        None => {
+            return (1, off + 1)
+        },
+    }
+    let mut line = 1
+    let mut col = 1
+    let bs = text.bytes()
+    let n = off.min(bs.len())
+    let mut i = 0
+    while i < n {
+        if bs[i] == 10 {
+            line = line + 1
+            col = 1
+        } else {
+            col = col + 1
+        }
+        i = i + 1
+    }
+    (line, col)
+}
+
+fn line_text(files: List[Source], file: Int, line: Int) -> Str {
+    match files.get(file) {
+        Some(s) => s.text.split("\n").get(line - 1) ?? "",
+        None => "",
+    }
+}
+
+fn repeat(s: Str, n: Int) -> Str {
+    (0..<n).map(|_| s).join("")
+}
+
+// The problem as `tessera check` prints it: what and where, the line with
+// the span underlined, then the notes and the fix.
+pub fn render(self: Diag, files: List[Source]) -> Str {
+    let mut b = "{if self.warning { "warning" } else { "error" }}[{self.code}]: {self.message}\n"
+    let file = path_of(files, self.span.file)
+    if file != "" {
+        let (l, c) = line_col(files, self.span.file, self.span.lo)
+        b = b + "  --> {file}:{l}:{c}\n"
+        let text = line_text(files, self.span.file, l)
+        let gutter = repeat(" ", "{l}".len())
+        let (l2, c2) = line_col(files, self.span.file, self.span.hi)
+        let width = if l2 == l { (c2 - c).max(1) } else { (text.len() - c + 1).max(1) }
+        b = b + " {gutter} |\n {l} | {text}\n {gutter} | {repeat(" ", (c - 1).max(0))}{repeat("^", width)}\n"
+    }
+    for n in self.notes {
+        b = b + "  = note: {n}\n"
+    }
+    match self.fix {
+        Some(f) => {
+            b = b + "  = help: {f.message}\n"
+        },
+        None => {},
+    }
+    b
+}

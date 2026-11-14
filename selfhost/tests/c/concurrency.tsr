@@ -1,0 +1,75 @@
+// Groups with and without a deadline, tasks with and without results,
+// channels of composite values, select with sends, receives, a timeout
+// and a default, catch, and defer inside a loop and inside a task.
+struct Job {
+    id: Int,
+    name: Str,
+}
+
+fn work(j: Job) -> (Int, Str) {
+    (j.id * 2, j.name + "!")
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let clock = root.clock
+    let jobs = [Job { id: 1, name: "a" }, Job { id: 2, name: "b" }]
+    let done = group g {
+        for j in jobs {
+            g.go(|| work(j))
+        }
+        g.go(|| out.print("side task"))
+    }
+    out.print("{done}")
+    let late = group g until clock.after(50) {
+        g.go(|| {
+            clock.sleep(10)
+            "quick"
+        })
+        g.go(|| {
+            clock.sleep(5000)
+            "slow"
+        })
+    }
+    out.print("{late}")
+    let ch: Chan[Job] = channel(2)
+    let nums: Chan[Int] = channel(0)
+    group g {
+        g.go(|| {
+            for j in jobs {
+                ch.send(j)
+            }
+            ch.close()
+        })
+        g.go(|| {
+            let mut got: List[Str] = []
+            while true {
+                match ch.recv() {
+                    Some(j) => got.push(j.name),
+                    None => {
+                        break
+                    },
+                }
+            }
+            out.print("{got}")
+        })
+    }
+    let mut n = 0
+    while n < 3 {
+        defer n = n + 1
+        select {
+            nums.send(n) if n > 5 => out.print("sent"),
+            x = nums.recv() => out.print("got {x}"),
+            clock.after(1) => out.print("tick {n}"),
+        }
+    }
+    select {
+        x = nums.recv() => out.print("got {x}"),
+        _ => out.print("nothing ready"),
+    }
+    let r = catch(|| {
+        let xs = [1, 2]
+        xs[5]
+    })
+    out.print("{r}")
+}

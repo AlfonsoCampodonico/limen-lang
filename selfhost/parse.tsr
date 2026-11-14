@@ -25,10 +25,7 @@ fn main(root: Root) -> Int {
                 },
                 Err(e) => {
                     out.print("ERROR {e.code} {e.span.lo} {e.span.hi}")
-                    // a lexing error has no message of its own here
-                    if e.message != "" {
-                        out.print(e.message)
-                    }
+                    out.print(e.message)
                     for n in e.notes {
                         out.print("note: {n}")
                     }
