@@ -87,7 +87,7 @@ fn read(fs: Fs, place: disk.Place, file: Str, roots: Option[List[Str]], name: St
     let full = paths.concat(paths.dirname(file), path)
     let missing = Problem("cannot find `{path}` (looked for {full})")
     // the package's directory and the file, as real paths
-    let real_main = match fs.full_path(place.locate(roots[0])) {
+    let real_main = match real_dir(fs, place.locate(roots[0])) {
         Ok(r) => r,
         Err(_) => {
             return missing
@@ -96,14 +96,16 @@ fn read(fs: Fs, place: disk.Place, file: Str, roots: Option[List[Str]], name: St
     if !fs.exists(place.locate(full)) {
         return missing
     }
-    let real = match fs.full_path(place.locate(full)) {
+    // a directory (for `embed_dir`) is followed to the end, as a root is
+    let at = place.locate(full)
+    let real = match if fs.is_dir(at) { real_dir(fs, at) } else { fs.full_path(at) } {
         Ok(r) => r,
         Err(_) => {
             return missing
         },
     }
     // the embed roots that exist, each with its real path
-    let extra = roots.skip(1).flat_map(|r| match fs.full_path(place.locate(r)) {
+    let extra = roots.skip(1).flat_map(|r| match real_dir(fs, place.locate(r)) {
         Ok(x) => [(r, x)],
         Err(_) => [],
     })
@@ -160,6 +162,14 @@ fn read(fs: Fs, place: disk.Place, file: Str, roots: Option[List[Str]], name: St
         Err(Denied(_)) => outside,
         Err(e) => Problem("cannot read `{path}`: {e}"),
     }
+}
+
+// The real path of directory `dir` (a path in the Fs), every link on the
+// way followed, the last one too, as OCaml's Unix.realpath does:
+// `fs.full_path` resolves only the directory part of a path, so it is
+// asked for a name inside `dir` (which need not exist).
+fn real_dir(fs: Fs, dir: Str) -> Result[Str, IoError] {
+    Ok(paths.dirname(fs.full_path(paths.concat(dir, "x"))?))
 }
 
 // `path` relative to `root` when it is inside it ("" for the root itself).

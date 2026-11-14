@@ -1,0 +1,10 @@
+// Files under embed roots that are links, or reached through one.
+fn main(root: Root) {
+    let a = embed("../assets-link/a.txt")
+    let all = embed_dir("../assets-link")
+    let css = embed_dir("../assets-link/css")
+    let b = embed("../via/stuff/b.txt")
+    let real = embed("../assets/a.txt")
+    let stuff = embed_dir("../real/stuff")
+    root.stdout.print("{a} {all.len()} {css.len()} {b} {real} {stuff.len()}")
+}

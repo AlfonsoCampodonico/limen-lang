@@ -1,0 +1,6 @@
+// A root that is a link, embedded as a file, and a file outside every
+// root: the message names the roots' real paths.
+fn main(root: Root) {
+    let a = embed("../assets-link")
+    let b = embed("../via/other.txt")
+}

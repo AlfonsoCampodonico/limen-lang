@@ -1,0 +1,8 @@
+# Embed roots that are links (`../assets-link` is a link to `../assets`)
+# or reached through one (`../via` is a link to `../real`): both loaders
+# follow them all the way.
+[package]
+name = "app"
+
+[embed]
+roots = ["../assets-link", "../via/stuff"]
