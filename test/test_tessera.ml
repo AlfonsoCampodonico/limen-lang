@@ -3206,6 +3206,32 @@ fn main(root: Root) {
     "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  -\n";
   out "example-checksum-hmac" ~grants:{ Interp.no_grants with args = [ "-k"; "key"; "-a"; "sha1"; "-b"; "-t"; "The quick brown fox jumps over the lazy dog" ] } (example "checksum.tsr")
     "3nybhbi3iqa8ino29wqQcBydtNk=  -\n";
+  out "std-log"
+    {v|use log
+
+fn main(root: Root) {
+    let out = root.stdout
+    let l = log.to_stdout(root.stdout)
+    l.debug("hidden")
+    l.info("started")
+    let req = l.field("request", "42").field("path", "/a b")
+    req.warn("slow")
+    req.level(log.Error).warn("hidden too")
+    l.level(log.Debug).fields([("k", ""), ("q", "say \"hi\""), ("eq", "a=b")]).debug("line\nbreak\ttab")
+    l.json().field("n", "1").error("failed: \"x\"\n")
+    l.json().text().log(log.Error, "back to text")
+    l.with_clock(root.clock).level(log.Error).info("not written")
+    out.print("{l.enabled(log.Debug)} {l.enabled(log.Warn)} {log.parse_level("WARNING")} {log.parse_level("loud")} {log.Warn > log.Info} {log.level_name(log.Error)}")
+    for ms in [0, 1762885325123, -1, 951782400000, 253402300799999] {
+        out.print(log.format_line(log.Text, Some(ms), log.Info, "t", []))
+    }
+    out.print(log.format_line(log.Json, Some(1762885325123), log.Debug, "m", [("a", "b"), ("tab", "x\ty")]))
+}
+|v}
+    "INFO  started\nWARN  slow request=42 path=\"/a b\"\nDEBUG line\\nbreak\\ttab k=\"\" q=\"say \\\"hi\\\"\" eq=\"a=b\"\n{\"level\":\"error\",\"msg\":\"failed: \\\"x\\\"\\n\",\"n\":\"1\"}\nERROR back to text\nfalse true Ok(Warn) Err(\"log: unknown level `loud` (debug, info, warn or error)\") true error\n1970-01-01T00:00:00.000Z INFO  t\n2025-11-11T18:22:05.123Z INFO  t\n1969-12-31T23:59:59.999Z INFO  t\n2000-02-29T00:00:00.000Z INFO  t\n9999-12-31T23:59:59.999Z INFO  t\n{\"time\":\"2025-11-11T18:22:05.123Z\",\"level\":\"debug\",\"msg\":\"m\",\"a\":\"b\",\"tab\":\"x\\ty\"}\n";
+  exits "example-csvstats" ~grants:{ Interp.no_grants with args = [ "--sum"; "amount"; "--by"; "region"; "--log-level"; "error" ] }
+    ~feed:"printf 'region,amount\\nnorth,10.5\\nsouth,2\\nnorth,x\\n\"we,st\",1\\nnorth,1e1\\n'"
+    (example "csvstats.tsr") "region,amount\nnorth,20.50\nsouth,2.00\n\"we,st\",1.00\n" 0;
   out "std-http-keepalive-stream" ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] }
     {v|use http
 
@@ -7185,7 +7211,10 @@ fn main(root: Root) {
   ok "std-manifest-http" (List.exists (fun (d : Package.dep) -> d.dname = "http" && d.caps = [ "net"; "listen" ]) manifest.deps) "http: net, listen";
   ok "std-manifest-sql" (List.exists (fun (d : Package.dep) -> d.dname = "sql" && d.caps = [ "fs" ]) manifest.deps && manifest.trust = [ "sql" ]) "sql: fs, trusted with C";
   ok "std-manifest-time" (List.exists (fun (d : Package.dep) -> d.dname = "time" && d.caps = [ "clock"; "fs" ]) manifest.deps) "time: clock (within), fs (load_zone)";
-  ok "std-manifest-pure" (List.for_all (fun (d : Package.dep) -> d.dname = "http" || d.dname = "sql" || d.dname = "time" || d.caps = []) manifest.deps) "the others are pure";
+  ok "std-manifest-log" (List.exists (fun (d : Package.dep) -> d.dname = "log" && d.caps = [ "stdout"; "stderr"; "clock" ]) manifest.deps) "log: stdout, stderr, clock";
+  ok "std-manifest-pure"
+    (List.for_all (fun (d : Package.dep) -> List.mem d.dname [ "http"; "sql"; "time"; "log" ] || d.caps = []) manifest.deps)
+    "the others are pure";
   let real_std = !Modules.std_modules in
   let std_errs name extra src =
     Modules.std_modules := extra @ real_std;

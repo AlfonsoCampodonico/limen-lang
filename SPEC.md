@@ -1694,6 +1694,7 @@ The standard library is checked like a dependency. `src/std/tessera.toml` lists 
 | `http` | `net` (Net, Conn) and `listen` (Listener, Conn) |
 | `time` | `clock` and `fs`, for `within` and `load_zone` alone |
 | `sql` | `fs` (the database file's directory); trusted with C (`[trust] foreign = ["sql"]`) to call SQLite |
+| `log` | `stdout`, `stderr` and `clock`: a Logger holds where it writes and, for timestamps, a clock |
 
 A module missing from the list may take nothing. `tessera caps FILE` shows what each std function takes. What stays trusted, and why:
 
@@ -2032,6 +2033,36 @@ fn main(root: Root) -> Result[Int, Str] {
 | `p.arg(name)`, `p.rest()`, `p.args`, `p.help` | a positional argument by name, those after the declared ones, all of them, and whether help was asked for |
 
 Reading a flag that was not declared panics, like reading a missing SQL column.
+
+### log
+
+Leveled logging, one line per message, as text or as JSON, to the `Stdout` or `Stderr` a `Logger` holds, with key-value fields. A Logger is a value: each method returns a new one, so a part of the program adds its own fields without changing anyone else's. Lines carry a timestamp only from a Logger given a `Clock`, so code that logs without one stays free of the time.
+
+```
+use log
+
+fn main(root: Root) {
+    let l = log.to_stderr(root.stderr).with_clock(root.clock).level(log.Debug)
+    let req = l.field("request", "42")
+    req.field("path", "/index.html").info("served")
+    // 2026-11-14T20:01:02.003Z INFO  served request=42 path=/index.html
+    req.json().warn("slow")
+    // {"time":"2026-11-14T20:01:02.004Z","level":"warn","msg":"slow","request":"42"}
+}
+```
+
+| Item | Meaning |
+| --- | --- |
+| `enum Level { Debug, Info, Warn, Error }` | in that order, so `Warn > Info` |
+| `to_stdout(out)`, `to_stderr(err)` | a Logger writing text lines of `Info` and above |
+| `l.level(min)`, `l.json()`, `l.text()`, `l.with_clock(clock)` | the Logger writing `min` and above, as JSON or text, with timestamps (UTC, ISO 8601) |
+| `l.field(key, value)`, `l.fields(pairs)` | the Logger adding fields to every line, after the ones it has |
+| `l.debug(msg)`, `l.info(msg)`, `l.warn(msg)`, `l.error(msg)`, `l.log(level, msg)` | write a line if the level is enabled |
+| `l.enabled(level)` | whether a line of that level would be written, to skip building an expensive message |
+| `parse_level(s) -> Result[Level, Str]`, `level_name(level)` | `debug`, `info`, `warn` (or `warning`) and `error`, ignoring case, for a `--log-level` flag |
+| `format_line(format, time: Option[Int], level, msg, fields) -> Str` | the line without writing it, for tests and other destinations |
+
+In text, the message's line breaks and other control characters are escaped, so a message is always one line, and a value that is empty or holds spaces, quotes or `=` is quoted. A function taking a Logger takes the capabilities it holds, so `tessera caps` shows them: `Stderr (via Logger.sink.ToStderr)`.
 
 ## 20. Not yet
 

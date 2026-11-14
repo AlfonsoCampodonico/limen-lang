@@ -1,0 +1,256 @@
+// Leveled logging: one line per message, as text or as JSON, to the
+// Stdout or Stderr the Logger holds, with key-value fields. A Logger is a
+// value: each method returns a new one, so a part of the program can add
+// its own fields without changing anyone else's.
+//
+//     let l = log.to_stderr(root.stderr).with_clock(root.clock)
+//     let req = l.field("request", id)
+//     req.field("path", path).info("served")
+//     // 2026-11-14T20:01:02.003Z INFO  served request=42 path=/index.html
+//
+// Lines get a timestamp only from a Logger given a Clock (`with_clock`), so
+// code that logs without one stays free of the time. `format_line` builds a
+// line without writing it, for tests and other destinations.
+
+// How much a message matters, from least to most. Levels compare in this
+// order: `Warn > Info`.
+pub enum Level {
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+// How a line is written: `INFO  served path=/` or
+// `{"level":"info","msg":"served","path":"/"}`.
+pub enum Format {
+    Text,
+    Json,
+}
+
+// Where the lines go.
+pub enum Sink {
+    ToStdout(Stdout),
+    ToStderr(Stderr),
+}
+
+// A logger: where it writes, the least level it writes, the format, the
+// fields every line gets, and the clock for timestamps if it has one.
+pub struct Logger {
+    sink: Sink,
+    min: Level,
+    format: Format,
+    fields: List[(Str, Str)],
+    clock: Option[Clock],
+}
+
+// A logger writing text lines of level Info and above to `out`.
+pub fn to_stdout(out: Stdout) -> Logger {
+    Logger { sink: ToStdout(out), min: Info, format: Text, fields: [], clock: None }
+}
+
+// A logger writing text lines of level Info and above to `err`, where logs
+// usually go, apart from a program's output.
+pub fn to_stderr(err: Stderr) -> Logger {
+    Logger { sink: ToStderr(err), min: Info, format: Text, fields: [], clock: None }
+}
+
+// The logger writing only messages of level `min` and above.
+pub fn level(self: Logger, min: Level) -> Logger {
+    { self with min }
+}
+
+// The logger writing JSON lines, one object per line.
+pub fn json(self: Logger) -> Logger {
+    { self with format: Json }
+}
+
+// The logger writing text lines.
+pub fn text(self: Logger) -> Logger {
+    { self with format: Text }
+}
+
+// The logger starting each line with the time from `clock`, in UTC as
+// ISO 8601.
+pub fn with_clock(self: Logger, clock: Clock) -> Logger {
+    { self with clock: Some(clock) }
+}
+
+// The logger adding `key=value` to every line, after the fields it has.
+pub fn field(self: Logger, key: Str, value: Str) -> Logger {
+    let mut fields = self.fields
+    fields.push((key, value))
+    { self with fields }
+}
+
+// The logger adding each of `fields` to every line.
+pub fn fields(self: Logger, more: List[(Str, Str)]) -> Logger {
+    { self with fields: self.fields + more }
+}
+
+// Whether a message of `level` would be written.
+pub fn enabled(self: Logger, level: Level) -> Bool {
+    level >= self.min
+}
+
+// Write `msg` at `level`, if the logger writes that level.
+pub fn log(self: Logger, level: Level, msg: Str) {
+    if level < self.min {
+        return
+    }
+    let time = match self.clock {
+        Some(c) => Some(c.now_ms()),
+        None => None,
+    }
+    let line = format_line(self.format, time, level, msg, self.fields)
+    match self.sink {
+        ToStdout(out) => out.print(line),
+        ToStderr(err) => err.print(line),
+    }
+}
+
+pub fn debug(self: Logger, msg: Str) {
+    self.log(Debug, msg)
+}
+
+pub fn info(self: Logger, msg: Str) {
+    self.log(Info, msg)
+}
+
+pub fn warn(self: Logger, msg: Str) {
+    self.log(Warn, msg)
+}
+
+pub fn error(self: Logger, msg: Str) {
+    self.log(Error, msg)
+}
+
+// The level a name gives, ignoring case: `debug`, `info`, `warn` (or
+// `warning`) and `error`, for a `--log-level` flag.
+pub fn parse_level(s: Str) -> Result[Level, Str] {
+    match s.trim().to_lower() {
+        "debug" => Ok(Debug),
+        "info" => Ok(Info),
+        "warn" | "warning" => Ok(Warn),
+        "error" => Ok(Error),
+        _ => Err("log: unknown level `{s}` (debug, info, warn or error)"),
+    }
+}
+
+// The lowercase name of a level: `info`.
+pub fn level_name(level: Level) -> Str {
+    match level {
+        Debug => "debug",
+        Info => "info",
+        Warn => "warn",
+        Error => "error",
+    }
+}
+
+// ---------- lines ----------
+
+// One line, without its newline: the time (epoch milliseconds) if given,
+// the level, the message and the fields, in `format`. In text, a message's
+// line breaks and other control characters are escaped, so a line is always
+// one line, and a value with spaces, quotes or `=` in it is quoted.
+pub fn format_line(format: Format, time: Option[Int], level: Level, msg: Str, fields: List[(Str, Str)]) -> Str {
+    match format {
+        Text => {
+            let mut parts: List[Str] = []
+            match time {
+                Some(ms) => parts.push(iso(ms)),
+                None => (),
+            }
+            parts.push(pad(level_name(level).to_upper()) + " " + escape(msg))
+            for (k, v) in fields {
+                parts.push(escape(k) + "=" + text_value(v))
+            }
+            parts.join(" ")
+        },
+        Json => {
+            let mut parts: List[Str] = []
+            match time {
+                Some(ms) => parts.push("\"time\":" + quote(iso(ms))),
+                None => (),
+            }
+            parts.push("\"level\":" + quote(level_name(level)))
+            parts.push("\"msg\":" + quote(msg))
+            for (k, v) in fields {
+                parts.push(quote(k) + ":" + quote(v))
+            }
+            "\{" + parts.join(",") + "\}"
+        },
+    }
+}
+
+fn pad(s: Str) -> Str {
+    if s.len() < 5 { s + " " } else { s }
+}
+
+fn text_value(v: Str) -> Str {
+    if v == "" || v.bytes().any(|b| b <= 32 || b == 34 || b == 61 || b == 127) {
+        quote(v)
+    } else {
+        v
+    }
+}
+
+// `s` with control characters escaped as in JSON, quotes left alone.
+fn escape(s: Str) -> Str {
+    if !s.bytes().any(|b| b < 32 || b == 127) {
+        return s
+    }
+    s.chars().map(|c| control(c) ?? c).join("")
+}
+
+// A JSON string literal.
+fn quote(s: Str) -> Str {
+    "\"" + s.chars().map(|c| if c == "\"" { "\\\"" } else if c == "\\" { "\\\\" } else { control(c) ?? c }).join("") + "\""
+}
+
+fn control(c: Str) -> Option[Str] {
+    let b = c.bytes()[0]
+    if c.len() != 1 || (b >= 32 && b != 127) {
+        None
+    } else if b == 10 {
+        Some("\\n")
+    } else if b == 13 {
+        Some("\\r")
+    } else if b == 9 {
+        Some("\\t")
+    } else {
+        let digits = "0123456789abcdef"
+        Some("\\u00" + digits.slice(b >> 4, (b >> 4) + 1) + digits.slice(b & 15, (b & 15) + 1))
+    }
+}
+
+// Epoch milliseconds as `2026-11-14T20:01:02.003Z` (what time.iso gives,
+// for years 0 to 9999).
+fn iso(ms: Int) -> Str {
+    let day = floor_div(ms, 86400000)
+    let in_day = ms - day * 86400000
+    // days since 1970-01-01 to a civil date (Howard Hinnant's algorithm)
+    let z = day + 719468
+    let era = floor_div(z, 146097)
+    let doe = z - era * 146097
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp = (5 * doy + 2) / 153
+    let d = doy - (153 * mp + 2) / 5 + 1
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 }
+    "{digits(y, 4)}-{digits(m, 2)}-{digits(d, 2)}T{digits(in_day / 3600000, 2)}:{digits(in_day / 60000 % 60, 2)}:{digits(in_day / 1000 % 60, 2)}.{digits(in_day % 1000, 3)}Z"
+}
+
+fn floor_div(a: Int, b: Int) -> Int {
+    let q = a / b
+    if a % b != 0 && (a < 0) != (b < 0) { q - 1 } else { q }
+}
+
+fn digits(n: Int, width: Int) -> Str {
+    let mut s = n.abs().to_str()
+    while s.len() < width {
+        s = "0" + s
+    }
+    if n < 0 { "-" + s } else { s }
+}

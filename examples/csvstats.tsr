@@ -1,0 +1,43 @@
+// Totals of a column of the CSV on stdin, grouped by another column, as
+// CSV again; rows whose value is not a number are logged and skipped. The
+// flags, csv and log modules together.
+//
+//     tessera run examples/csvstats.tsr -- --sum amount --by region < sales.csv
+use csv
+use flags
+use log
+
+fn main(root: Root) -> Result[Int, dyn Error] {
+    let spec = flags.spec("csvstats", "Add up a column of the CSV on stdin, by the values of another.")
+        .option("sum", "s", "the column to add up").required()
+        .option("by", "b", "the column to group by")
+        .option("log-level", "", "debug, info, warn or error").default("warn")
+        .flag("json-log", "", "log JSON lines")
+    let p = spec.parse(root.args())?
+    if p.help {
+        root.stdout.write(spec.help())
+        return Ok(0)
+    }
+    let mut l = log.to_stderr(root.stderr).level(log.parse_level(p.str("log-level"))?)
+    if p.bool("json-log") {
+        l = l.json()
+    }
+    let rows = csv.parse_maps(root.stdin.read_all())?
+    let col = p.str("sum")
+    let by = p.str("by")
+    let mut totals: Map[Str, Float] = map()
+    for (i, row) in rows.with_index() {
+        let key = if by == "" { "all" } else { row.get(by)? "no column `{by}`" }
+        let text = row.get(col)? "no column `{col}`"
+        match text.parse_float() {
+            Some(x) => {
+                totals[key] = totals.get(key) ?? 0.0 + x
+            },
+            None => l.field("line", "{i + 2}").field("value", text).warn("not a number, skipped"),
+        }
+    }
+    l.field("rows", "{rows.len()}").field("groups", "{totals.len()}").info("done")
+    let header = [if by == "" { "group" } else { by }, col]
+    root.stdout.write(csv.write([header] + totals.entries().map(|e| [e.0, e.1.to_fixed(2)])))
+    Ok(0)
+}

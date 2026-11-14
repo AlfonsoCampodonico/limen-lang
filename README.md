@@ -66,6 +66,7 @@ Then work through the examples. Every one runs the same in the interpreter and n
 | `parallel.tsr`, `select.tsr` | tasks, groups, channels, `select` | `tessera run examples/select.tsr` |
 | `stdlib.tsr`, `report.tsr`, `logscan.tsr` | `json`, `format`, `time`, `regex` | `tessera run examples/logscan.tsr` |
 | `checksum.tsr` | `flags`, `hash`, `hex`, `base64`: digests and HMACs of files or text, with generated help | `tessera run examples/checksum.tsr -- --help` |
+| `csvstats.tsr` | `flags`, `csv`, `log`: totals of a CSV on stdin, with skipped rows logged to stderr | `printf 'k,n\na,1\na,2\n' \| tessera run examples/csvstats.tsr -- --sum n --by k` |
 | `http_demo.tsr` | an HTTP server and client in one program | `tessera run examples/http_demo.tsr --grant listen=127.0.0.1:0 --grant net=127.0.0.1` |
 | `repos.tsr` | HTTPS to a real API | `tessera run examples/repos.tsr --grant net=api.github.com` |
 | `notes.tsr` | SQLite through `sql` | see the comment at the top of the file |
