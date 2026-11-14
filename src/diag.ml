@@ -25,7 +25,7 @@ let warnings ds = List.filter (fun d -> d.severity = Warning) ds
 let explanations = [
   "E0001", "The lexer found a character that is not part of Tessera's syntax.";
   "E0002", "A string literal or interpolation was not closed before the end of the file.";
-  "E0003", "The parser expected a different token here. The message names what it expected.";
+  "E0003", "The parser expected a different token here, or found a construct where it is not allowed (a list pattern in `let`, which needs `match`; `as _`). The message names what it expected.";
   "E0004", "Statements are separated by a newline or `;`. Two statements were found on the same line.";
   "E0005", "An integer literal does not fit in Int.";
   "E0006", "Unknown escape in a string. Valid escapes: \\n \\t \\r \\\\ \\\" \\{ \\} \\0.";
@@ -36,7 +36,7 @@ let explanations = [
   "E0103", "The struct (or Root) has no field with this name.";
   "E0104", "The enum has no such variant, or the variant name is ambiguous. Qualify it as `Enum.Variant`.";
   "E0105", "The type has no method with this name. User-defined types have no methods in phase 1; write a function that takes the value.";
-  "E0106", "Something is defined twice: a type, function, field or variant.";
+  "E0106", "Something is defined twice: a type, function, field or variant, or a field is set twice in a struct literal or matched twice in a struct pattern. A struct, enum or interface cannot take the name of a built-in type or capability (`Env`, `Option`, `Int`, ...), which every program already has: name it something else.";
   "E0107", "A function, variant or pattern was given the wrong number of arguments.";
   "E0108", "Only functions and closures can be called.";
   "E0109", "A generic type was given the wrong number of type arguments, for example `List` instead of `List[Int]`, or a generic interface named without its arguments, `Container` instead of `Container[Int]`.";
@@ -56,7 +56,7 @@ let explanations = [
   "E0203", "An `if` without `else` is a statement, so its block must have type `()`.";
   "E0204", "A `match` must cover every possible value. Add the missing arms or a `_` arm. An arm with an `if` guard covers nothing, because its guard may be false.";
   "E0205", "Variables are immutable unless declared with `let mut`. Parameters and pattern bindings are always immutable, and closures cannot modify captured variables because they capture by value.";
-  "E0206", "A struct literal must set every field.";
+  "E0206", "A struct literal must set every field. A struct pattern must name every field too, unless it ends with `..`, which matches any value of the fields it leaves out: `Point { x: 0, .. }`.";
   "E0207", "The type of this value is not known at this point. Add a type annotation, for example `let xs: List[Int] = []`.";
   "E0208", "`break` and `continue` only work inside `while` and `for` loops (not inside closures).";
   "E0209", "Only variables, struct fields, list elements and map entries (and paths through them, such as `m[k].x`) can be assigned to. A method value such as `p.area` cannot.";

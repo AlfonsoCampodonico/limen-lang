@@ -1,0 +1,18 @@
+struct Point {
+    x: Int,
+    y: Int,
+}
+
+fn f(p: Option[Point], xs: List[Int]) -> Int {
+    match p {
+        Some(Point { x: 0, y: 0 }) => 0,
+        Some(Point { x, .. } as q) if x > 0 => q.y,
+        Some(Point {
+            x,
+            y: 1 | 2,
+        }) => x,
+        Some(geo.Point { .. }) | None as o => 1,
+        Some(Empty {}) => 2,
+        Some(_) => 3,
+    }
+}

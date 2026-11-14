@@ -553,18 +553,43 @@ and parse_select st =
   done;
   mk (ESelect (List.rev !arms)) (merge t.span (last_span st))
 
-(* A pattern, with alternatives: `A | B`. Alternatives inside alternatives,
-   `(A | B) | C`, are flattened into one list. *)
+(* A pattern, with alternatives: `A | B`, and a name for the whole: `p as
+   name`, which takes in every alternative before it (`A | B as x` is
+   `(A | B) as x`). Alternatives inside alternatives, `(A | B) | C`, are
+   flattened into one list. *)
 and parse_pat st =
   let first = parse_pat1 st in
-  if not (is_sym st "|") then first
-  else begin
-    let alts = ref (List.rev (alternatives first)) in
-    while accept_sym st "|" do
-      alts := List.rev_append (alternatives (parse_pat1 st)) !alts
-    done;
-    { pdesc = POr (List.rev !alts); pspan = merge first.pspan (last_span st) }
-  end
+  let p =
+    if not (is_sym st "|") then first
+    else begin
+      let alts = ref (List.rev (alternatives first)) in
+      while accept_sym st "|" do
+        alts := List.rev_append (alternatives (parse_pat1 st)) !alts
+      done;
+      { pdesc = POr (List.rev !alts); pspan = merge first.pspan (last_span st) }
+    end
+  in
+  match cur st with
+  | IDENT "as" ->
+    skip st;
+    let n, nsp = expect_ident st in
+    if n = "_" then raise (Diag.Fatal (Diag.make "E0003" nsp "`as` needs a name for the value; `as _` names nothing, so leave it out"));
+    { pdesc = PAs (p, n, nsp); pspan = merge p.pspan nsp }
+  | _ -> p
+
+(* The fields of a struct pattern after its `{`: `x`, `x: pattern`, and a
+   last `..` for the fields not named. *)
+and struct_pat_fields st =
+  let rest = ref false in
+  let fields =
+    comma_list st "}" (fun st ->
+        if !rest then raise (Diag.Fatal (Diag.make "E0003" (peek st).span "`..` comes last in a struct pattern"));
+        if is_sym st ".." then (skip st; rest := true; None)
+        else
+          let f, fsp = expect_ident st in
+          if accept_sym st ":" then Some (f, fsp, parse_pat st) else Some (f, fsp, { pdesc = PBind f; pspan = fsp }))
+  in
+  (List.filter_map Fun.id fields, !rest)
 
 (* The items of a tuple, variant or list pattern up to [close]: patterns,
    and at most one `..` for the rest, which a list pattern can name:
@@ -622,6 +647,13 @@ and parse_pat1 st =
       skip st;
       let args = pat_items st ")" ~list:false in
       mkp (PVariant (q, v, args)) (merge t.span (last_span st))
+    end
+    else if is_sym st "{" && is_upper v then begin
+      (* a struct pattern: `Point { x, y: 0, .. }`, `geo.Point { .. }` *)
+      skip st;
+      let fields, rest = struct_pat_fields st in
+      let name = match q with Some m -> m ^ "." ^ v | None -> v in
+      mkp (PStruct (name, merge t.span vsp, fields, rest)) (merge t.span (last_span st))
     end
     else if q <> None || is_upper v then mkp (PVariant (q, v, [])) (merge t.span vsp)
     else mkp (PBind v) t.span

@@ -106,11 +106,17 @@ cparam    ::= ident (sp ":" sp type)?
 tclosure  ::= "{" ws ("|" ws (cparam (isep cparam)* ws)? "|" ws | "||" ws)? (stmt (stsep stmt)* (sp ";")?)? ws "}"
 group     ::= "group" sp1 ident (sp1 "interleaved")? (sp1 "until" sp1 expr)? sp block
 
-# `A | B`: an or-pattern; `..` (once per bracket, `..name` in a list) is the rest
-pattern ::= palt (ws "|" ws palt)*
-palt    ::= "-"? int | plainstr | ident ("." ident)? (sp "(" ws pitems ws ")")? | "(" ws pitems ws ")" | "[" ws pitems? ws "]"
+# `A | B`: an or-pattern; `..` (once per bracket, `..name` in a list) is the rest;
+# `p as name` names the whole value
+pattern ::= palt (ws "|" ws palt)* (sp1 "as" sp1 asname)?
+# the name `as` gives: any name but `_`
+asname  ::= [A-Za-z] [A-Za-z0-9_]* | "_" [A-Za-z0-9_]+
+palt    ::= "-"? int | plainstr | ident ("." ident)? (sp "(" ws pitems ws ")")? | spat | "(" ws pitems ws ")" | "[" ws pitems? ws "]"
 pitems  ::= pitem (isep pitem)* (ws ",")?
 pitem   ::= pattern | ".." (sp ident)?
+# a struct pattern: `Point { x, y: 0, .. }`, with `..` last
+spat    ::= (ident ".")? upper sp "{" ws (fpat (isep fpat)* (isep "..")? (ws ",")? | ".." (ws ",")?)? ws "}"
+fpat    ::= ident (sp ":" ws pattern)?
 
 # ---------- tokens ----------
 ident  ::= [A-Za-z_] [A-Za-z0-9_]*

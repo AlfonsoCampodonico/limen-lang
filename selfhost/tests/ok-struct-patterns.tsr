@@ -1,0 +1,20 @@
+// Struct patterns (punned fields, nested, `..`, qualified, empty) and
+// as-patterns (on a whole or-pattern, inside items, nested).
+fn f(p: Point) -> Int {
+    match p {
+        Point { x: 0, y: 0 } => 0,
+        Point { x, .. } if x > 0 => x,
+        Point { x: 1 | 2, y } => y,
+        Point {
+            x,
+            y: Some(z) as w,
+        } => z,
+        geo.Point { x: -1, .. } => 1,
+        Empty {} => 2,
+        Empty { .. } => 3,
+        Line { from: Point { x, .. }, to: _ } as line => x,
+        Some(Point { x, y }) | None as o => 4,
+        (a as b, [c, ..rest] as all) => 5,
+        Wrap(Box { item: (1, two) as pair, .. }) => 6,
+    }
+}

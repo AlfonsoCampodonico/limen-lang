@@ -1935,6 +1935,40 @@ and check_pat ctx f t p =
         | _ -> check_pat ctx f el q)
       ps
   | PRest _ -> () (* only inside a tuple, variant or list pattern, which handle it *)
+  | PAs (q, n, nsp) ->
+    check_pat ctx f t q;
+    bind f n { vty = t; vmut = false; vspan = nsp; vkind = KPat }
+  | PStruct (name, nsp, fields, rest) -> (
+    let skip () = List.iter (fun (_, _, q) -> check_pat ctx f TErr q) fields in
+    match Hashtbl.find_opt ctx.sfields name with
+    | None ->
+      if Hashtbl.mem ctx.enums name then
+        err ctx "E0102" nsp (sprintf "`%s` is an enum; match it with its variants, for example `%s.Variant(...)`" name name)
+      else did_you_mean ctx "E0102" nsp (sprintf "unknown struct `%s`" name) name (List.of_seq (Hashtbl.to_seq_keys ctx.sfields));
+      skip ()
+    | Some decl_fields ->
+      let gen = (Hashtbl.find ctx.structs name).st_gen in
+      let targs = List.map (fun _ -> fresh ()) gen in
+      unify_at ctx p.pspan t (TNamed (name, targs));
+      let env = List.combine gen targs in
+      let seen = Hashtbl.create 8 in
+      List.iter
+        (fun (fname, fsp, q) ->
+          if Hashtbl.mem seen fname then err ctx "E0106" fsp (sprintf "field `%s` is matched twice" fname);
+          Hashtbl.replace seen fname ();
+          match List.assoc_opt fname decl_fields with
+          | Some ft -> check_pat ctx f (subst env ft) q
+          | None ->
+            did_you_mean ctx "E0103" fsp (sprintf "struct `%s` has no field `%s`" name fname) fname (List.map fst decl_fields);
+            check_pat ctx f TErr q)
+        fields;
+      let missing = List.filter (fun (fn, _) -> not (Hashtbl.mem seen fn)) decl_fields in
+      if missing <> [] && not rest then
+        err ctx "E0206" p.pspan
+          (sprintf "missing field%s %s in the pattern for `%s`" (plural (List.length missing))
+             (String.concat ", " (List.map (fun (n, _) -> "`" ^ n ^ "`") missing))
+             name)
+          ~notes:[ "name every field, or end the pattern with `..` to match any value of the others" ])
   | POr alts ->
     (* each alternative in a scope of its own, to compare what they bind *)
     let binds_of alt =
@@ -2032,11 +2066,13 @@ and check_pat ctx f t p =
 (* Patterns still unmatched, as source text. Single-field payloads are
    checked recursively; multi-field payloads only need one arm each. *)
 and missing_arms ctx t pats =
-  let pats = List.concat_map alternatives pats in
+  let rec flat p = match p.pdesc with PAs (q, _, _) -> flat q | POr alts -> List.concat_map flat alts | _ -> [ p ] in
+  let pats = List.concat_map flat pats in
   if List.exists irrefutable pats then []
   else
     match repr t with
-    | TNamed (n, _) when is_tuple_name n -> if exhaustive ctx (List.map (fun p -> [ p ]) pats) [ t ] then [] else [ "_" ]
+    | TNamed (n, _) when is_tuple_name n || Hashtbl.mem ctx.sfields n ->
+      if exhaustive ctx (List.map (fun p -> [ p ]) pats) [ t ] then [] else [ "_" ]
     | TBool ->
       List.filter_map
         (fun b -> if List.exists (fun p -> p.pdesc = PBool b) pats then None else Some (string_of_bool b))
@@ -2115,10 +2151,13 @@ and list_items l (p : pat) =
   | _ -> None
 
 (* Each row whose first pattern is an or-pattern becomes one row per
-   alternative. *)
+   alternative; a name given with `as` is left out. *)
 and expand_heads rows =
   List.concat_map
-    (function { pdesc = POr alts; _ } :: r -> expand_heads (List.map (fun a -> a :: r) alts) | row -> [ row ])
+    (function
+      | { pdesc = POr alts; _ } :: r -> expand_heads (List.map (fun a -> a :: r) alts)
+      | { pdesc = PAs (q, _, _); _ } :: r -> expand_heads [ q :: r ]
+      | row -> [ row ])
     rows
 
 (* Do the rows of patterns cover every value of the column types? *)
@@ -2165,10 +2204,18 @@ and useful ~unknown ctx (rows : pat list list) (q : pat list) (tys : ty list) : 
     let heads = List.filter_map (function p :: _ when not (wild p) -> Some p | _ -> None) rows in
     match qh.pdesc with
     | POr alts -> List.exists (fun a -> useful ~unknown ctx rows (a :: qr) tys) alts
+    | PAs (q, _, _) -> useful ~unknown ctx rows (q :: qr) tys
     | _ -> (
       match repr t with
       | TNamed (n, args) when is_tuple_name n ->
         go (fun p -> match p.pdesc with PTuple ps -> Some (fill_rest ps (List.length args)) | _ -> None) args
+      | TNamed (n, targs) when Hashtbl.mem ctx.sfields n ->
+        (* a struct has one shape: its fields, in declaration order *)
+        let fields = Hashtbl.find ctx.sfields n in
+        let env = List.combine (Hashtbl.find ctx.structs n).st_gen targs in
+        go
+          (fun p -> match p.pdesc with PStruct (_, _, fs, _) -> Some (struct_items fs (List.map fst fields) p.pspan) | _ -> None)
+          (List.map (fun (_, ft) -> subst env ft) fields)
       | TBool -> (
         let one b = go (fun p -> if p.pdesc = PBool b then Some [] else None) [] in
         let named b = List.exists (fun p -> p.pdesc = PBool b) heads in

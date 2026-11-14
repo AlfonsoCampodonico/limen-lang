@@ -2255,9 +2255,60 @@ fn check_pat(st: env.State, cx: env.Cx, fx: env.Fx, t: types.Ty, p: ast.Pat) -> 
         },
         // only inside a tuple, variant or list pattern, which handle it
         PRest(_) => (fx, st),
+        PAs(q, n, nsp) => {
+            let (fx, st) = check_pat(st, cx, fx, t, q)
+            (bind(fx, n, t, nsp), st)
+        },
+        PStruct(name, nsp, fields, rest) => check_struct_pat(st, cx, fx, t, p, name, nsp, fields, rest),
         POr(alts) => check_or(st, cx, fx, t, alts),
         PVariant(q, v, args) => check_variant_pat(st, cx, fx, t, p, q, v, args),
     }
+}
+
+// `Point \{ x, y: 0, .. }`: the struct's fields, each matched against its
+// pattern; without `..`, every field is named.
+fn check_struct_pat(st: env.State, cx: env.Cx, fx: env.Fx, t: types.Ty, p: ast.Pat, name: Str, nsp: ast.Span, fields: List[ast.FieldPat], rest: Bool) -> (env.Fx, env.State) {
+    let mut st = st
+    let decl = match cx.sfields.get(name) {
+        Some(d) => d,
+        None => {
+            if cx.enums.contains(name) {
+                st = st.report(diag.error("E0102", nsp, "`{name}` is an enum; match it with its variants, for example `{name}.Variant(...)`"))
+            } else {
+                st = st.did_you_mean(diag.error("E0102", nsp, "unknown struct `{name}`"), name, env.keys_in_order(cx.sfields))
+            }
+            return check_pats(st, cx, fx, fields.map(|_| TErr), fields.map(|f| f.pat))
+        },
+    }
+    let gen = cx.structs.get(name).map(|s| s.generics) ?? []
+    let (targs, next) = st.fresh_list(gen.len())
+    st = next.unify_at(p.span, t, TNamed(name, targs))
+    let inst = gen.zip(targs)
+    let mut fx = fx
+    let mut seen: List[Str] = []
+    for f in fields {
+        if seen.contains(f.name) {
+            st = st.report(diag.error("E0106", f.span, "field `{f.name}` is matched twice"))
+        } else {
+            seen.push(f.name)
+        }
+        let ft = match decl.find(|x| x.0 == f.name) {
+            Some((_, ft)) => st.subst(inst, ft),
+            None => {
+                st = st.did_you_mean(diag.error("E0103", f.span, "struct `{name}` has no field `{f.name}`"), f.name, decl.map(|x| x.0))
+                TErr
+            },
+        }
+        let (inside, next) = check_pat(st, cx, fx, ft, f.pat)
+        fx = inside
+        st = next
+    }
+    let missing = decl.filter(|f| !seen.contains(f.0))
+    if !missing.is_empty() && !rest {
+        let listed = missing.map(|f| "`" + f.0 + "`").join(", ")
+        st = st.report(diag.error("E0206", p.span, "missing field{env.plural(missing.len())} {listed} in the pattern for `{name}`").note("name every field, or end the pattern with `..` to match any value of the others"))
+    }
+    (fx, st)
 }
 
 fn check_pats(st: env.State, cx: env.Cx, fx: env.Fx, ts: List[types.Ty], ps: List[ast.Pat]) -> (env.Fx, env.State) {

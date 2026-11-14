@@ -124,6 +124,24 @@ let index (items : item list) : occ list =
       (match q with Some q -> type_ref q p.pspan | None -> ());
       List.fold_left pat env args
     | PTuple ps | PList ps | POr ps -> List.fold_left pat env ps
+    | PStruct (name, nsp, fs, _) ->
+      type_ref name nsp;
+      List.fold_left
+        (fun env (f, (fsp : Span.t), q) ->
+          match q.pdesc with
+          | PBind n when n = f && q.pspan = fsp ->
+            (* `S { f }` is `S { f: f }`: one name, a field and a new local *)
+            add ~short:Field_side ("d:" ^ name ^ "#" ^ f) f fsp;
+            add ~def:true ~short:(Var_side f) (local fsp) n fsp;
+            (n, local fsp) :: env
+          | _ ->
+            if Hashtbl.mem structs name then field_ref name f fsp else add ("d:" ^ name ^ "#" ^ f) f fsp;
+            pat env q)
+        env fs
+    | PAs (q, n, nsp) ->
+      let env = pat env q in
+      add ~def:true (local nsp) n nsp;
+      (n, local nsp) :: env
     | PRest (Some n) ->
       let nsp = { p.pspan with lo = p.pspan.hi - String.length n } in
       add ~def:true (local nsp) n nsp; (n, local nsp) :: env

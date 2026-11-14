@@ -7,6 +7,8 @@ let rec pat_binds p acc =
   | PBind n -> n :: acc
   | PRest (Some n) -> n :: acc
   | PVariant (_, _, args) | PTuple args | PList args | POr args -> List.fold_left (fun acc a -> pat_binds a acc) acc args
+  | PStruct (_, _, fs, _) -> List.fold_left (fun acc (_, _, a) -> pat_binds a acc) acc fs
+  | PAs (q, n, _) -> pat_binds q (n :: acc)
   | _ -> acc
 
 let rec fv bound acc e =

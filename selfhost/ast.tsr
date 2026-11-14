@@ -65,6 +65,20 @@ pub enum PatDesc {
     PRest(Option[Str]),
     // `A | B`: two or more alternatives, none of them an or-pattern
     POr(List[Pat]),
+    // `Point { x, y: 0, .. }`: the struct (`geo.Point` until modules
+    // load) and its span, each field named with its pattern, and whether
+    // `..` stands for the fields not named
+    PStruct(Str, Span, List[FieldPat], Bool),
+    // `p as name`: matches p, and binds the whole value to name too
+    PAs(Pat, Str, Span),
+}
+
+// A field of a struct pattern: `x: pattern`, or `x` alone for `x: x` (a
+// PBind with the field's span).
+pub struct FieldPat {
+    name: Str,
+    span: Span,
+    pat: Pat,
 }
 
 // ---------- expressions ----------

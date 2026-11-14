@@ -213,6 +213,12 @@ let rec pat_cond c e t (p : Ast.pat) =
       @ List.mapi (fun i p -> pat_cond c (sprintf "(%s)->data[%s - %d]" e len (j - i)) el p) after
     in
     String.concat " && " (size :: List.filter (fun s -> s <> "true") subs)
+  | Ast.PStruct (_, _, fs, _) ->
+    let fts = Lower.field_types c.g t in
+    let items = Ast.struct_items fs (List.map fst fts) p.pspan in
+    let subs = List.mapi (fun i (p, (_, ft)) -> pat_cond c (sprintf "(%s).f%d" e i) ft p) (List.combine items fts) in
+    (match List.filter (fun s -> s <> "true") subs with [] -> "true" | xs -> String.concat " && " xs)
+  | Ast.PAs (q, _, _) -> pat_cond c e t q
   | Ast.PRest _ -> "true"
   | Ast.POr alts ->
     let conds = List.map (pat_cond c e t) alts in

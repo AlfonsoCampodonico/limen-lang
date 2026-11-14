@@ -145,4 +145,73 @@ fn list_rest(xs: List[Int]) -> Int {
     }
 }
 
+struct Point {
+    x: Int,
+    y: Int,
+}
+
+struct Pair[T] {
+    left: T,
+    right: T,
+}
+
+// struct patterns: missing fields, unknown and repeated fields, an enum
+// or an unknown name, wrong types, and what they cover
+fn struct_patterns(p: Point, q: Pair[Bool], o: Option[Point]) -> Int {
+    let a = match p {
+        Point { x } => x,
+        Point { x, z: 1, x: 2, .. } => x,
+        Pointt { x, .. } => 1,
+        Shape { .. } => 2,
+        Point { x: "s", .. } => 3,
+    }
+    let b = match p {
+        Point { x: 0, .. } => 1,
+        Point { y: 1, .. } => 2,
+    }
+    let c = match q {
+        Pair { left: true, right } => 1,
+        Pair { left: false, right: true } => 2,
+    }
+    let d = match q {
+        Pair { left: true, .. } | Pair { right: true, .. } => 1,
+        Pair { left: false, right: false } => 2,
+        Pair { .. } => 3,
+    }
+    let e = match o {
+        Some(Point { x: 1, .. }) => 1,
+        None => 0,
+    }
+    let g = match (p, q) {
+        (Point { x: 0, .. }, Pair { left: true, .. }) => 1,
+        (Point { .. }, _) => 2,
+        (_, Pair { left, right }) => 3,
+    }
+    a + b + c + d + e + g
+}
+
+// as-patterns: the whole value with its parts, in every alternative, and
+// what they cover
+fn as_patterns(o: Option[Point], xs: List[Int]) -> Int {
+    let a = match o {
+        Some(Point { x, .. } as p) if x > 0 => p.y,
+        Some(_) as s => 1,
+        None as n => 0,
+    }
+    let b = match xs {
+        [first, ..] as all => first + all.len(),
+        [] as none => none.len(),
+        _ => 9,
+    }
+    let c = match o {
+        Some(Point { x: 0, .. }) | None as which => 1,
+        Some(p as q) => q.x,
+    }
+    let d: Str = match o {
+        Some(p) as whole => whole,
+        None => "",
+    }
+    a + b + c
+}
+
 fn main(root: Root) {}

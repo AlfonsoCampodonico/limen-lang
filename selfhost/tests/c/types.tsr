@@ -1,7 +1,8 @@
 // Types C generation defines: enums that contain themselves (boxed),
 // arrays of structs, maps keyed by structs, enums and tuples (hashed),
 // order on lists, arrays, enums, structs and tuples, lists of lists, and
-// dyn values backed by structs and by enums.
+// dyn values backed by structs and by enums; struct patterns and
+// as-patterns.
 enum Tree {
     Leaf,
     Node(Tree, Int, Tree),
@@ -65,8 +66,18 @@ fn eval(e: Expr) -> Float {
     }
 }
 
+// struct patterns and as-patterns, tested as C conditions
+fn cell_kind(c: Cell) -> Str {
+    match c {
+        Cell { pos: (0, 0), color: Red, .. } => "red origin",
+        Cell { color: Rgb(r, _, b) as rgb, pos, .. } if r == b => "{rgb} at {pos}",
+        Cell { tags, .. } as whole => "{tags.len()} {whole.color}",
+    }
+}
+
 fn main(root: Root) -> Result[Int, dyn Error] {
     let out = root.stdout
+    out.print(cell_kind(Cell { pos: (0, 0), color: Rgb(1, 2, 1), tags: ["a", "b"] }))
     let t = [5, 2, 8, 1].fold(Leaf, insert)
     out.print("{t} {t == insert(Leaf, 5)}")
     out.print("{eval(Add([Num(1.5), Neg(Num(0.5)), Add([])]))}")

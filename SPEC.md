@@ -639,6 +639,8 @@ Used in `match` arms:
 | `[]`, `[p1, p2]` | a list of exactly that length, matching each item |
 | `[p1, ..]`, `[.., pn]`, `[p1, ..rest]` | a list at least that long; `..rest` binds the items it skips, as a list |
 | `p1 \| p2` | either pattern: an or-pattern |
+| `Point { x, y: 0 }`, `Point { x, .. }` | a struct, matching the fields it names; `geo.Point { ... }` for another module's |
+| `p as name` | what `p` matches, binding the whole value to `name` as well |
 
 ```
 match shape {
@@ -662,7 +664,11 @@ match tokens {
 }
 ```
 
-`let`, `for` and table tests unpack only names, `_` and tuples of those (`let (a, b) = pair`); the other patterns need a `match`.
+**Struct patterns.** `Point { x: 0, y }` matches a `Point` whose `x` is `0`, binding its `y`. Each field is `name: pattern`, or `name` alone for `name: name`, which binds the field to a variable of its own name. Every field must be named (E0206), unless the pattern ends with `..`, which matches any value of the fields left out: `Point { x: 0, .. }`. `..` comes last, once. A field named twice is E0106, one the struct does not have E0103 (only the struct's own fields: one promoted from an embedded struct is matched through the embedded field, `Admin { User: User { name, .. }, .. }`), and an enum's or an unknown name E0102. They nest like the other patterns, `Line { from: Point { x, .. }, to }`, and a struct of another module is named as in a type, `geo.Point { x, .. }`. A struct has one shape, so for exhaustiveness its fields are checked like a tuple's items: `Point { x: 0, .. }` and `Point { x: _, .. }` together cover every `Point`.
+
+**As-patterns.** `p as name` matches what `p` matches and binds the whole value to `name` too, next to the names `p` binds: `Some(Point { x, .. } as p) => p.y + x`, `[first, ..] as all => all.len()`. `as` takes in everything before it: `A | B as x` is `(A | B) as x`, binding `x` whichever alternative matched; to name one alternative, use parentheses, `(A as x) | B`, and then every alternative must bind `x` (E0210). `as _` is E0003; leave it out. The name is written after the pattern, as in OCaml, F# and Python, rather than with a sign before it.
+
+`let`, `for` and table tests unpack only names, `_` and tuples of those (`let (a, b) = pair`); the other patterns need a `match`. `let [a, b] = xs` says so (E0003): a list can have any length, so it is taken apart with `match`.
 
 An arm can have a guard, `if cond` after the pattern, as in a `select`: the arm applies only when its pattern matches **and** the guard is true, otherwise matching goes on with the next arm. The guard sees the pattern's bindings and must be a `Bool` (E0201). Guards run in order, only until an arm applies.
 
@@ -677,7 +683,7 @@ match order {
 
 A guarded arm counts for nothing when checking that a `match` is exhaustive, since its guard may be false: above, `Some(_)` is still needed.
 
-Arms are separated by `,` or a newline. An arm's body is an expression, so a statement such as an assignment needs a block: `None => { more = false },`. Patterns nest: `Err(Failed(msg))`, `Some(Some(n))`. A `match` must be exhaustive (E0204); the error comes with an auto-fix that adds the missing arms. Matching on `Int` or `Str` needs a `_` or binding arm. Tuples are checked column by column, so `(true, _)` and `(false, _)` together are exhaustive; an or-pattern covers what its alternatives cover; lists are checked by length, so `[]` and `[_, ..]` together are exhaustive, and so are `[]`, `[x]` and `[x, y, ..rest]`.
+Arms are separated by `,` or a newline. An arm's body is an expression, so a statement such as an assignment needs a block: `None => { more = false },`. Patterns nest: `Err(Failed(msg))`, `Some(Some(n))`. A `match` must be exhaustive (E0204); the error comes with an auto-fix that adds the missing arms. Matching on `Int` or `Str` needs a `_` or binding arm. Tuples are checked column by column, so `(true, _)` and `(false, _)` together are exhaustive; an or-pattern covers what its alternatives cover; lists are checked by length, so `[]` and `[_, ..]` together are exhaustive, and so are `[]`, `[x]` and `[x, y, ..rest]`; a struct pattern is checked field by field, and `p as name` covers what `p` covers.
 
 An arm that can never match, because the unguarded arms before it already match everything it would, is reported with a warning (W0002), and so is an alternative of an or-pattern that the arms and alternatives before it cover: in `A | B => 1, B => 2` the second arm never runs.
 
@@ -1403,7 +1409,7 @@ Every diagnostic has a stable code. `tessera explain CODE` prints its explanatio
 | E0103 | unknown field |
 | E0104 | unknown or ambiguous variant |
 | E0105 | unknown method |
-| E0106 | defined twice |
+| E0106 | defined twice, a type named like a built-in type or capability, or a field set or matched twice |
 | E0107 | wrong number of arguments |
 | E0108 | not callable |
 | E0109 | wrong number of type arguments |
@@ -1421,7 +1427,7 @@ Every diagnostic has a stable code. `tessera explain CODE` prints its explanatio
 | E0203 | `if` without `else` produces a value |
 | E0204 | non-exhaustive `match` |
 | E0205 | assignment to something immutable |
-| E0206 | missing struct field |
+| E0206 | missing struct field, in a literal or in a struct pattern without `..` |
 | E0207 | type unknown here |
 | E0208 | `break`/`continue` outside a loop |
 | E0209 | invalid assignment target |
@@ -1527,13 +1533,15 @@ selarm     = ( IDENT "=" expr | expr | "_" ) [ "if" expr ] "=>" expr ;
                                                 (* ch.recv(), ch.send(v) or clock.after(ms) *)
 init       = IDENT [ ":" expr ] ;
 cparam     = IDENT [ ":" type ] ;
-pattern    = alt { "|" alt } ;                 (* an or-pattern; not in `let`, `for` or a table test *)
+pattern    = alt { "|" alt } [ "as" IDENT ] ;  (* an or-pattern, named; not in `let`, `for` or a table test *)
 alt        = "_" | IDENT | [ "-" ] INT | STRING | "true" | "false"
            | IDENT [ "." IDENT ] [ "(" items ")" ]
+           | [ IDENT "." ] UPPER "{" [ fpat { sep fpat } [ sep ".." ] [ "," ] | ".." [ "," ] ] "}"   (* a struct *)
            | "(" items ")"                       (* a tuple, or one pattern in parentheses *)
            | "[" [ items ] "]" ;                (* a list *)
 items      = item { sep item } [ "," ] ;        (* at most one ".." *)
 item       = pattern | ".." [ IDENT ] ;         (* `..name` only in a list *)
+fpat       = IDENT [ ":" pattern ] ;            (* `x` alone is `x: x` *)
 tuplepat   = "(" upat "," upat { "," upat } ")" ;   (* unpacking in `let`, `for` and table tests *)
 upat       = "_" | IDENT | tuplepat ;
 ```

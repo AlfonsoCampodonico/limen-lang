@@ -1763,6 +1763,8 @@ let rec pmatch p v binds =
       && List.for_all2 (fun p i -> pmatch p a.(n - j + i) binds) after (List.init j Fun.id)
       && ((match rest with Some name -> bind binds name (VList (Array.sub a k (n - k - j))) | None -> ());
           true))
+  | PStruct (_, _, fields, _), VStruct (_, fs) -> List.for_all (fun (n, _, q) -> pmatch q (field_of n fs) binds) fields
+  | PAs (q, n, _), _ -> pmatch q v binds && (bind binds n v; true)
   | POr alts, _ ->
     (* a failed alternative's bindings are undone *)
     let saved = binds.vars in

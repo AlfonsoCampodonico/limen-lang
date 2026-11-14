@@ -1,0 +1,17 @@
+// struct patterns name the struct as types do: this module's, another
+// module's (qualified), and a missing one
+use geo
+
+struct Box {
+    item: geo.Point,
+    label: Str,
+}
+
+fn main() {
+    let b = Box { item: geo.Point { x: 1, y: 2 }, label: "b" }
+    match b {
+        Box { item: geo.Point { x, y } as p, label } => x,
+        geo.Box { .. } => 0,
+        other.Point { .. } => 0,
+    }
+}

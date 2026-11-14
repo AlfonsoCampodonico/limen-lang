@@ -320,10 +320,33 @@ let rec pat_binds (p : pat) acc =
   | PBind n -> n :: acc
   | PRest (Some n) -> n :: acc
   | PVariant (_, _, ps) | PTuple ps | PList ps | POr ps -> List.fold_left (fun acc p -> pat_binds p acc) acc ps
+  | PStruct (_, _, fs, _) -> List.fold_left (fun acc (_, _, p) -> pat_binds p acc) acc fs
+  | PAs (q, n, _) -> pat_binds q (n :: acc)
   | _ -> acc
+
+(* The qualified name of the struct a literal or a pattern names: `geo.Point`
+   from module geo, or `Point` of this module. *)
+let struct_name env locals n sp =
+  match String.index_opt n '.' with
+  | Some i -> (
+    let a = String.sub n 0 i and b = String.sub n (i + 1) (String.length n - i - 1) in
+    match if List.mem a locals then None else module_of env a sp with
+    | Some m -> (
+      match member env m b sp with
+      | Some (IStruct _) -> qual m b
+      | _ -> no_member m b sp; n)
+    | None -> err "E0401" sp (Printf.sprintf "unknown module `%s`; add `use %s` at the top of the file" a a); n)
+  | None -> ( match Hashtbl.find_opt env.own n with Some (IStruct _) -> qual env.self n | _ -> n)
 
 let rec pat env locals (p : pat) : pat =
   match p.pdesc with
+  | PStruct (n0, nsp, fs, rest) ->
+    let n = struct_name env locals n0 nsp in
+    let fs' = map_same (fun ((f, fsp, q) as fl) -> let q' = pat env locals q in if q' == q then fl else (f, fsp, q')) fs in
+    if n == n0 && fs' == fs then p else { p with pdesc = PStruct (n, nsp, fs', rest) }
+  | PAs (q, n, nsp) ->
+    let q' = pat env locals q in
+    if q' == q then p else { p with pdesc = PAs (q', n, nsp) }
   | PVariant (Some q, v, ps) ->
     let ps = List.map (pat env locals) ps in
     let q =
@@ -469,19 +492,7 @@ let rec expr env locals (e : expr) : expr =
       let ps' = map_same (fun ((n, t, sp) as p) -> let t' = opt_same (ty env) t in if t' == t then p else (n, t', sp)) ps in
       if ps' == ps && body' == body then e.edesc else EClosure (ps', body')
     | EStruct (n0, sp, fields) ->
-      let n = n0 in
-      let n =
-        match String.index_opt n '.' with
-        | Some i -> (
-          let a = String.sub n 0 i and b = String.sub n (i + 1) (String.length n - i - 1) in
-          match if List.mem a locals then None else module_of env a sp with
-          | Some m -> (
-            match member env m b sp with
-            | Some (IStruct _) -> qual m b
-            | _ -> no_member m b sp; n)
-          | None -> err "E0401" sp (Printf.sprintf "unknown module `%s`; add `use %s` at the top of the file" a a); n)
-        | None -> ( match Hashtbl.find_opt env.own n with Some (IStruct _) -> qual env.self n | _ -> n)
-      in
+      let n = struct_name env locals n0 sp in
       let fields' = map_same (fun ((f, fsp, x) as fl) -> let y = ex x in if y == x then fl else (f, fsp, y)) fields in
       if n == n0 && fields' == fields then e.edesc else EStruct (n, sp, fields')
     | EGroup (g, il, until, b) ->

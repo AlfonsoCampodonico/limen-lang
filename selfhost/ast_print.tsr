@@ -69,6 +69,8 @@ pub fn pat(p: ast.Pat) -> Str {
         PRest(None) => "..",
         PRest(Some(n)) => "..b:" + n,
         POr(alts) => "or(" + alts.map(pat).join("|") + ")",
+        PStruct(n, _, fields, rest) => n + "\{" + (fields.map(|f| f.name + ":" + pat(f.pat)) + (if rest { [".."] } else { [] })).join(",") + "\}",
+        PAs(q, n, _) => "as(" + pat(q) + "," + n + ")",
     }
 }
 
@@ -298,6 +300,8 @@ fn ty_spans(w: Where, t: ast.TyExpr) -> Str {
 fn pat_spans(w: Where, p: ast.Pat) -> Str {
     sp(w, p.span) + match p.desc {
         PVariant(_, _, items) | PTuple(items) | PList(items) | POr(items) => all(items, |x| pat_spans(w, x)),
+        PStruct(_, nsp, fields, _) => sp(w, nsp) + all(fields, |f| sp(w, f.span) + pat_spans(w, f.pat)),
+        PAs(q, _, nsp) => pat_spans(w, q) + sp(w, nsp),
         _ => "",
     }
 }

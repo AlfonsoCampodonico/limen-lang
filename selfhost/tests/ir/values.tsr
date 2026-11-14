@@ -1,7 +1,8 @@
 // Maps, lists, arrays, bytes and strings: building, reading through index
 // and field paths, writing through them (`m[k].x = v`, `xs[i].tags[j]`),
 // `remove`, interpolation, `??`, `?.`, `{ p with ... }`, tuple
-// assignment, or-patterns, list patterns with a rest, and match guards.
+// assignment, or-patterns, list patterns with a rest, match guards, and
+// struct patterns, as-patterns and the bitwise operators.
 struct Item {
     name: Str,
     tags: List[Str],
@@ -53,8 +54,26 @@ fn kind(n: Int) -> Str {
     }
 }
 
+// struct patterns and as-patterns: a field by its place in the struct, the
+// whole value as well as its parts
+fn classify(i: Item, s: Shape) -> Str {
+    match (i, s) {
+        (Item { qty: 0, .. }, _) => "none",
+        (Item { name, tags: [first, ..], .. } as whole, Rect(w, _) as r) => "{name} {first} {whole.qty} {w} {r}",
+        (Item { name: "x" | "y", .. }, Circle(_) | Dot) => "xy",
+        (it, _) => it.name,
+    }
+}
+
+// bitwise operators: `~x` lowers to `x ^ -1`
+fn bits(x: Int) -> Int {
+    ~x & (x << 2) | x >> 1 ^ x.shift_right_unsigned(3)
+}
+
 fn main(root: Root) {
     let out = root.stdout
+    out.print("{bits(root.args().len())}")
+    out.print(classify(Item { name: "a", tags: ["t"], qty: 2 }, Rect(1.0, 2.0)))
     let mut m: Map[Str, Item] = map()
     m["a"] = Item { name: "a", tags: [], qty: 1 }
     m["a"].qty = 5

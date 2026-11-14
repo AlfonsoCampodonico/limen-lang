@@ -35,6 +35,8 @@ let rec pat (p : pat) =
   sp p.pspan;
   match p.pdesc with
   | PVariant (_, _, args) | PTuple args | PList args | POr args -> List.iter pat args
+  | PStruct (_, nsp, fields, _) -> sp nsp; List.iter (fun (_, fsp, q) -> sp fsp; pat q) fields
+  | PAs (q, _, nsp) -> pat q; sp nsp
   | PWild | PBind _ | PInt _ | PStr _ | PBool _ | PRest _ -> ()
 
 let opt f = function Some x -> f x | None -> ()

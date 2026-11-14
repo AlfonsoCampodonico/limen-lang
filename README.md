@@ -271,7 +271,7 @@ Errors: any type with `fn message(self: T) -> Str` satisfies the prelude's `Erro
 
 `user?.address?.city ?? "unknown"` navigates through `Option`s: `None` anywhere short-circuits the rest of the chain, and the result is a single `Option`.
 
-`match` arms take guards, as `select` arms do: `Some(n) if n > 10 => ...`. A guarded arm does not count toward exhaustiveness. Patterns have alternatives (`Circle(r) | Ring(r, _) => ...`, `Some(1 | 2)`), `..` for the parts not written (`SLet(name, ..)`, `(first, ..)`), and list patterns (`[]`, `[x]`, `[first, ..rest]`, `[.., last]`); exhaustiveness understands all three, and an arm that can never match is a warning (W0002).
+`match` arms take guards, as `select` arms do: `Some(n) if n > 10 => ...`. A guarded arm does not count toward exhaustiveness. Patterns have alternatives (`Circle(r) | Ring(r, _) => ...`, `Some(1 | 2)`), `..` for the parts not written (`SLet(name, ..)`, `(first, ..)`), list patterns (`[]`, `[x]`, `[first, ..rest]`, `[.., last]`), struct patterns (`Point { x: 0, y }`, `Line { from: Point { x, .. }, .. }`) and a name for the whole value (`Some(p) as whole`, `[first, ..] as all`); exhaustiveness understands them all, and an arm that can never match is a warning (W0002).
 
 `(x, p) = parse(p)?` assigns a tuple's items to existing `mut` variables (or fields, elements, `_`, nested tuples), and `xs + ys` concatenates lists.
 

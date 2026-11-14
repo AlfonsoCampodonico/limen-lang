@@ -62,7 +62,25 @@ pub fn irrefutable(p: ast.Pat) -> Bool {
         PTuple(ps) => ps.all(irrefutable),
         PList([only]) => is_rest(only),
         POr(ps) => ps.any(irrefutable),
+        PStruct(_, _, fields, _) => fields.all(|f| irrefutable(f.pat)),
+        PAs(q, _, _) => irrefutable(q),
         _ => false,
+    }
+}
+
+// The items of a struct pattern in the order of the struct's `fields`:
+// each named field's pattern, `_` for the others.
+pub fn struct_items(named: List[ast.FieldPat], fields: List[Str], span: ast.Span) -> List[ast.Pat] {
+    fields.map(|n| named.find(|f| f.name == n).map(|f| f.pat) ?? wild_at(span))
+}
+
+// The patterns an arm's pattern stands for: its alternatives, without the
+// names `as` gives.
+fn flat(p: ast.Pat) -> List[ast.Pat] {
+    match p.desc {
+        PAs(q, _, _) => flat(q),
+        POr(alts) => alts.flat_map(flat),
+        _ => [p],
     }
 }
 
@@ -79,13 +97,13 @@ pub fn alternatives(p: ast.Pat) -> List[ast.Pat] {
 // The patterns still unmatched, as source text. Single-field payloads are
 // checked recursively; multi-field payloads only need one arm each.
 pub fn missing_arms(cx: env.Cx, s: types.Subst, t: types.Ty, pats: List[ast.Pat]) -> List[Str] {
-    let pats = pats.flat_map(alternatives)
+    let pats = pats.flat_map(flat)
     if pats.any(irrefutable) {
         return []
     }
     let underscores = |n: Int| (0..<n).map(|_| "_").join(", ")
     match s.repr(t) {
-        TNamed(n, _) if ast.is_tuple_name(n) => if exhaustive(cx, s, pats.map(|p| [p]), [t]) { [] } else { ["_"] },
+        TNamed(n, _) if ast.is_tuple_name(n) || cx.sfields.contains(n) => if exhaustive(cx, s, pats.map(|p| [p]), [t]) { [] } else { ["_"] },
         TBool => [true, false].filter(|b| !pats.any(|p| p.desc == PBool(b))).map(|b| "{b}"),
         TList(el) => {
             // the lengths not covered: `[]`, `[_]`, ..., and `[_, .., ]`
@@ -172,11 +190,12 @@ fn list_items(l: Int, p: ast.Pat) -> Option[List[ast.Pat]] {
 }
 
 // Each row whose first pattern is an or-pattern becomes one row per
-// alternative.
+// alternative; a name given with `as` is left out.
 fn expand_heads(rows: List[List[ast.Pat]]) -> List[List[ast.Pat]] {
     rows.flat_map(|row| match row {
         [first, ..rest] => match first.desc {
             POr(alts) => expand_heads(alts.map(|a| [a] + rest)),
+            PAs(q, _, _) => expand_heads([[q] + rest]),
             _ => [row],
         },
         [] => [row],
@@ -236,6 +255,9 @@ pub fn useful(cx: env.Cx, s: types.Subst, unknown: Bool, rows: List[List[ast.Pat
         POr(alts) => {
             return alts.any(|a| useful(cx, s, unknown, rows, [a] + qr, tys))
         },
+        PAs(q, _, _) => {
+            return useful(cx, s, unknown, rows, [q] + qr, tys)
+        },
         _ => {},
     }
     match s.repr(t) {
@@ -243,6 +265,15 @@ pub fn useful(cx: env.Cx, s: types.Subst, unknown: Bool, rows: List[List[ast.Pat
             PTuple(ps) => Some(fill_rest(ps, args.len())),
             _ => None,
         }, args),
+        // a struct has one shape: its fields, in declaration order
+        TNamed(n, targs) if cx.sfields.contains(n) => {
+            let fields = cx.sfields.get(n) ?? []
+            let env = (cx.structs.get(n).map(|d| d.generics) ?? []).zip(targs)
+            go(|p| match p.desc {
+                PStruct(_, _, named, _) => Some(struct_items(named, fields.map(|f| f.0), p.span)),
+                _ => None,
+            }, fields.map(|f| s.subst(env, f.1)))
+        },
         TBool => {
             let one = |b: Bool| go(|p| if p.desc == PBool(b) { Some([]) } else { None }, [])
             let named = |b: Bool| heads.any(|p| p.desc == PBool(b))

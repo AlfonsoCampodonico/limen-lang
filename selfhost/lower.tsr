@@ -1300,6 +1300,21 @@ fn bind_pat(self: Lx, a: ir.Atom, t: types.Ty, p: ast.Pat) -> Lx {
             }
             lx
         },
+        PStruct(_, _, fields, _) => {
+            let fts = field_types(lx.ro, t)
+            for (i, pair) in exhaust.struct_items(fields, fts.map(|f| f.0), p.span).zip(fts).with_index() {
+                let (sub, ft) = pair
+                if has_bind(sub) {
+                    let (pv, next) = lx.tmp(ft.1, Get(a, t, [PField(i)]))
+                    lx = next.bind_pat(pv, ft.1, sub)
+                }
+            }
+            lx
+        },
+        PAs(q, n, _) => {
+            let (v, lx) = lx.fresh_var(n, t)
+            lx.emit(Let(v, Use(a))).bind(n, v).bind_pat(a, t, q)
+        },
         PList(ps) if has_bind(p) => lx.bind_list(a, t, p, ps),
         POr(alts) if has_bind(p) => lx.bind_or(a, t, p, alts),
         _ => lx,

@@ -737,6 +737,19 @@ and bind_pat f a t (p : pat) =
           let pv = tmp f ft (I.Get (a, t, [ I.PField i ])) in
           bind_pat f pv ft sub)
       (List.combine (fill_rest ps (List.length fts)) fts)
+  | PStruct (_, _, fs, _) ->
+    let fts = field_types f.g t in
+    List.iteri
+      (fun i (sub, (_, ft)) ->
+        if has_bind sub then
+          let pv = tmp f ft (I.Get (a, t, [ I.PField i ])) in
+          bind_pat f pv ft sub)
+      (List.combine (struct_items fs (List.map fst fts) p.pspan) fts)
+  | PAs (q, n, _) ->
+    let v = fresh_var n t in
+    emit f (I.Let (v, I.Atom a));
+    bind f n v;
+    bind_pat f a t q
   | PList ps when has_bind p ->
     let el = match t with TList el -> el | _ -> failwith "bind_pat: list" in
     let before, rest, after = list_parts ps in

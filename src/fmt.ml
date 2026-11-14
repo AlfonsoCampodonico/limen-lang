@@ -176,7 +176,13 @@ let rec pat (p : pat) =
   | PList ps -> "[" ^ String.concat ", " (List.map pat ps) ^ "]"
   | PRest None -> ".."
   | PRest (Some n) -> ".." ^ n
-  | POr ps -> String.concat " | " (List.map pat ps)
+  | POr ps -> String.concat " | " (List.map (fun q -> match q.pdesc with PAs _ -> "(" ^ pat q ^ ")" | _ -> pat q) ps)
+  | PStruct (n, _, [], false) -> n ^ " {}"
+  | PStruct (n, _, fs, rest) ->
+    (* `x` alone where the pattern is the field's own name, as written *)
+    let field (f, fsp, q) = match q.pdesc with PBind b when b = f && q.pspan = fsp -> f | _ -> f ^ ": " ^ pat q in
+    n ^ " { " ^ String.concat ", " (List.map field fs @ if rest then [ ".." ] else []) ^ " }"
+  | PAs (q, n, _) -> pat q ^ " as " ^ n
 
 (* ---------- expressions ---------- *)
 

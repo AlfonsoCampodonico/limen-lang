@@ -305,6 +305,8 @@ fn binds(p: ast.Pat, locals: List[Str]) -> List[Str] {
     match p.desc {
         PBind(n) | PRest(Some(n)) => [n] + locals,
         PVariant(_, _, ps) | PTuple(ps) | PList(ps) | POr(ps) => ps.fold(locals, |acc, x| binds(x, acc)),
+        PStruct(_, _, fields, _) => fields.fold(locals, |acc, f| binds(f.pat, acc)),
+        PAs(q, n, _) => binds(q, [n] + locals),
         _ => locals,
     }
 }
@@ -348,6 +350,18 @@ fn pat(st: State, cx: Context, locals: List[Str], p: ast.Pat) -> (ast.Pat, State
         POr(ps) => {
             let (ps, st) = sub(st, ps)
             ({ p with desc: POr(ps) }, st)
+        },
+        PStruct(n, nsp, fields, rest) => {
+            let (n, st) = struct_name(st, cx, locals, n, nsp)
+            let (fields, st) = each(st, fields, |st, f| {
+                let (q, st) = pat(st, cx, locals, f.pat)
+                ({ f with pat: q }, st)
+            })
+            ({ p with desc: PStruct(n, nsp, fields, rest) }, st)
+        },
+        PAs(q, n, nsp) => {
+            let (q, st) = pat(st, cx, locals, q)
+            ({ p with desc: PAs(q, n, nsp) }, st)
         },
         _ => (p, st),
     }

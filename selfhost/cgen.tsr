@@ -521,6 +521,18 @@ fn pat_cond(self: Cg, e: Str, t: types.Ty, p: ast.Pat) -> (Str, Cg) {
             }
             (([size] + (head + tail).filter(|s| s != "true")).join(" && "), c)
         },
+        PStruct(_, _, fields, _) => {
+            let fts = c.fields_of(t)
+            let mut subs: List[Str] = []
+            for (i, pair) in exhaust.struct_items(fields, fts.map(|f| f.0), p.span).zip(fts.map(|f| f.1)).with_index() {
+                let (s, c1) = c.pat_cond("({e}).f{i}", pair.1, pair.0)
+                c = c1
+                subs.push(s)
+            }
+            let real = subs.filter(|s| s != "true")
+            (if real.is_empty() { "true" } else { real.join(" && ") }, c)
+        },
+        PAs(q, _, _) => c.pat_cond(e, t, q),
         POr(alts) => {
             let mut conds: List[Str] = []
             for q in alts {

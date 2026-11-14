@@ -14,6 +14,8 @@ pub fn pat_binds(p: ast.Pat, acc: List[Str]) -> List[Str] {
         PBind(n) => [n] + acc,
         PRest(Some(n)) => [n] + acc,
         PVariant(_, _, args) | PTuple(args) | PList(args) | POr(args) => args.fold(acc, |got, a| pat_binds(a, got)),
+        PStruct(_, _, fields, _) => fields.fold(acc, |got, f| pat_binds(f.pat, got)),
+        PAs(q, n, _) => pat_binds(q, [n] + acc),
         _ => acc,
     }
 }

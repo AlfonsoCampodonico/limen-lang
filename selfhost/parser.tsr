@@ -843,20 +843,59 @@ fn pat(desc: ast.PatDesc, span: ast.Span) -> ast.Pat {
     ast.Pat { desc, span }
 }
 
-// A pattern, with alternatives: `A | B`. Alternatives inside alternatives,
-// `(A | B) | C`, are flattened into one list.
+// A pattern, with alternatives: `A | B`, and a name for the whole: `p as
+// name`, which takes in every alternative before it (`A | B as x` is
+// `(A | B) as x`). Alternatives inside alternatives, `(A | B) | C`, are
+// flattened into one list.
 fn parse_pat(p: Parser) -> Parsed[ast.Pat] {
     let (first, p) = parse_pat1(p)?
-    if !p.is_sym("|") {
-        return Ok((first, p))
+    let (whole, p) = if !p.is_sym("|") {
+        (first, p)
+    } else {
+        let mut alts = alternatives(first)
+        let mut p = p
+        while p.is_sym("|") {
+            let (alt, next) = parse_pat1(p.skip())?
+            (alts, p) = (alts + alternatives(alt), next)
+        }
+        (pat(POr(alts), merge(first.span, p.last_span())), p)
     }
-    let mut alts = alternatives(first)
+    if !p.is_word("as") {
+        return Ok((whole, p))
+    }
+    let (name, p) = p.skip().expect_ident()?
+    if name.text == "_" {
+        return Err(error("E0003", name.span, "`as` needs a name for the value; `as _` names nothing, so leave it out"))
+    }
+    Ok((pat(PAs(whole, name.text, name.span), merge(whole.span, name.span)), p))
+}
+
+// The fields of a struct pattern after its `\{`: `x`, `x: pattern`, and a
+// last `..` for the fields not named; whether there is a `..`.
+fn struct_pat_fields(p: Parser) -> Parsed[(List[ast.FieldPat], Bool)] {
     let mut p = p
-    while p.is_sym("|") {
-        let (alt, next) = parse_pat1(p.skip())?
-        (alts, p) = (alts + alternatives(alt), next)
+    let mut fields: List[ast.FieldPat] = []
+    let mut rest = false
+    while !p.is_sym("\}") {
+        if rest {
+            return Err(error("E0003", p.span(), "`..` comes last in a struct pattern"))
+        }
+        if p.is_sym("..") {
+            rest = true
+            p = p.skip()
+        } else {
+            let (name, next) = p.expect_ident()?
+            let (q, next) = if next.is_sym(":") { parse_pat(next.skip())? } else { (pat(PBind(name.text), name.span), next) }
+            fields.push(ast.FieldPat { name: name.text, span: name.span, pat: q })
+            p = next
+        }
+        if p.is_sym(",") {
+            p = p.skip()
+        } else if !p.is_sym("\}") && !p.nl() {
+            return Err(p.expected("`,` or `\}`"))
+        }
     }
-    Ok((pat(POr(alts), merge(first.span, p.last_span())), p))
+    Ok(((fields, rest), p.skip()))
 }
 
 fn alternatives(p: ast.Pat) -> List[ast.Pat] {
@@ -950,6 +989,14 @@ fn parse_pat1(p: Parser) -> Parsed[ast.Pat] {
             if p.is_sym("(") {
                 let (args, p) = pat_items(p.skip(), ")", false)?
                 Ok((pat(PVariant(qualifier, variant.text, args), merge(start, p.last_span())), p))
+            } else if p.is_sym("\{") && is_upper(variant.text) {
+                // a struct pattern: `Point \{ x, y: 0, .. }`, `geo.Point \{ .. }`
+                let ((fields, rest), p) = struct_pat_fields(p.skip())?
+                let name = match qualifier {
+                    Some(m) => m + "." + variant.text,
+                    None => variant.text,
+                }
+                Ok((pat(PStruct(name, merge(start, variant.span), fields, rest), merge(start, p.last_span())), p))
             } else if qualifier.is_some() || is_upper(variant.text) {
                 Ok((pat(PVariant(qualifier, variant.text, []), merge(start, variant.span)), p))
             } else {

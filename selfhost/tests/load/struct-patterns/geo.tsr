@@ -1,0 +1,11 @@
+pub struct Point {
+    x: Int,
+    y: Int,
+}
+
+pub fn on_axis(p: Point) -> Bool {
+    match p {
+        Point { x: 0, .. } | Point { y: 0, .. } => true,
+        _ => false,
+    }
+}

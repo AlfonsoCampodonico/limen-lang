@@ -22,6 +22,9 @@ let rec pat (p : pat) =
   | PRest None -> ".."
   | PRest (Some n) -> "..b:" ^ n
   | POr ps -> "or(" ^ String.concat "|" (List.map pat ps) ^ ")"
+  | PStruct (n, _, fs, rest) ->
+    n ^ "{" ^ String.concat "," (List.map (fun (f, _, q) -> f ^ ":" ^ pat q) fs @ if rest then [ ".." ] else []) ^ "}"
+  | PAs (q, n, _) -> "as(" ^ pat q ^ "," ^ n ^ ")"
 
 let op = function
   | Add -> "+" | Sub -> "-" | Mul -> "*" | Div -> "/" | Mod -> "%" | Eq -> "==" | Ne -> "!=" | Lt -> "<"

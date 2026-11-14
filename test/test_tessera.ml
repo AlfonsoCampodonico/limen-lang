@@ -1562,6 +1562,95 @@ fn main(root: Root) -> Result[(), IoError] {
       "Err(Denied(\"fs: path resolves outside the granted directory\"))\n"
   end;
 
+  (* Stderr: always granted, written at once and apart from stdout *)
+  let stderr_src = main_wrap "    out.print(\"one\")\n    root.stderr.print(\"two\")\n    root.stderr.write(\"three\")\n    out.write(\"four\\n\")" in
+  if selected "stderr" then begin
+    let items, _, _ = compile "stderr" stderr_src in
+    let o = Buffer.create 16 and e = Buffer.create 16 in
+    (match Interp.run ~out:(Buffer.add_string o) ~err:(Buffer.add_string e) ~grants:Interp.no_grants items with
+     | Ok _ ->
+       ok "stderr" (Buffer.contents o = "one\nfour\n" && Buffer.contents e = "two\nthree")
+         (sprintf "stdout %S, stderr %S" (Buffer.contents o) (Buffer.contents e))
+     | Error (m, _) -> ok "stderr" false m);
+    if native_for "stderr" then
+      run_native "stderr" stderr_src (function
+        | Error m -> ok "stderr/native" false m
+        | Ok (code, o, e) ->
+          ok "stderr/native" (code = 0 && o = "one\nfour\n" && e = "two\nthreetessera-leakcheck: 0 live\n")
+            (sprintf "exit %d, stdout %S, stderr %S" code o e))
+  end;
+  errs "stderr-type" "fn warn(err: Stderr, m: Str) {\n    err.print(m)\n}\n\nfn main(root: Root) {\n    warn(root.stderr, \"x\")\n}\n" [];
+  says "ambient-eprint" (main_wrap "    eprint(\"x\")") "E0302" "Stderr";
+
+  (* bitwise operators on Int: `|` and `^` bind like `+`, `&` and the
+     shifts like `*`; a shift by 64 or more shifts every bit out *)
+  out "bitwise"
+    (main_wrap
+       {|    let a = 12
+    let b = 10
+    out.print("{a & b} {a | b} {a ^ b} {~a} {~-1} {1 << 4} {-16 >> 2} {1 << 63} {1 << 64} {-1 >> 100} {5 >> 64} {7 >> 63}")
+    out.print("{(-1).shift_right_unsigned(60)} {(-1).shift_right_unsigned(64)} {(-8).shift_right_unsigned(0)} {(-8).shift_right_unsigned(1)}")
+    out.print("{a & 1 == 0} {1 + 2 << 3} {a | b ^ 3 & 1} {[1, 2, 3].map(|x| x | 8)}")
+    match 3 {
+        1 | 2 => out.print("small"),
+        _ => out.print("big"),
+    }|})
+    "8 14 6 -13 0 16 -4 -9223372036854775808 0 -1 0 0\n15 0 -8 9223372036854775804\ntrue 17 15 [9, 10, 11]\nbig\n";
+  panics "shift-negative" (main_wrap "    let n = root.args().len() - 1\n    out.print(\"{1 << n}\")") "negative shift count";
+  panics "shift-right-unsigned-negative" (main_wrap "    let n = root.args().len() - 1\n    out.print(\"{8.shift_right_unsigned(n)}\")") "negative shift count";
+  errs "bitwise-on-float" (main_wrap "    let x = 1.5 & 2.0") [ "E0201" ];
+  errs "bitwise-not-on-bool" (main_wrap "    let x = ~true") [ "E0201" ];
+  errs "bitwise-mixed" (main_wrap "    let x = 1 | true") [ "E0201" ];
+
+  (* struct patterns and as-patterns *)
+  let point = "struct Point {\n    x: Int,\n    y: Int,\n}\n\nstruct Line {\n    from: Point,\n    to: Point,\n}\n\n" in
+  out "struct-patterns"
+    (point
+    ^ {|fn describe(p: Point) -> Str {
+    match p {
+        Point { x: 0, y: 0 } => "origin",
+        Point { x: 0, .. } => "on the y axis",
+        Point { x, y: 0 } => "on the x axis at {x}",
+        Point { x: px, y } => "at {px}, {y}",
+    }
+}
+
+fn line(o: Option[Line]) -> Str {
+    match o {
+        Some(Line { from: Point { x: 0, .. } as start, to }) => "from the y axis at {start.y} to {to.x}",
+        Some(Line { from, .. } as l) if from == l.to => "a point",
+        Some(_) as s => "{s.is_some()}",
+        None => "none",
+    }
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    for p in [Point { x: 0, y: 0 }, Point { x: 0, y: 3 }, Point { x: 4, y: 0 }, Point { x: 1, y: 2 }] {
+        out.print(describe(p))
+    }
+    let a = Point { x: 0, y: 5 }
+    let b = Point { x: 7, y: 1 }
+    out.print("{line(Some(Line { from: a, to: b }))} {line(Some(Line { from: b, to: b }))} {line(Some(Line { from: b, to: a }))} {line(None)}")
+    match [1, 2, 3] {
+        [first, ..] as all => out.print("{first} of {all.len()}"),
+        [] => out.print("empty"),
+    }
+}
+|})
+    "origin\non the y axis\non the x axis at 4\nat 1, 2\nfrom the y axis at 5 to 7 a point true none\n1 of 3\n";
+  errs "struct-pattern-missing-field" (point ^ "fn f(p: Point) -> Int {\n    match p {\n        Point { x } => x,\n    }\n}\n\nfn main() {}\n") [ "E0206" ];
+  errs "struct-pattern-unknown-field" (point ^ "fn f(p: Point) -> Int {\n    match p {\n        Point { z, .. } => 1,\n        _ => 0,\n    }\n}\n\nfn main() {}\n") [ "E0103" ];
+  errs "struct-pattern-twice" (point ^ "fn f(p: Point) -> Int {\n    match p {\n        Point { x, x: 1, .. } => x,\n        _ => 0,\n    }\n}\n\nfn main() {}\n") [ "E0106" ];
+  errs "struct-pattern-unknown" (point ^ "fn f(p: Point) -> Int {\n    match p {\n        Pointt { .. } => 1,\n    }\n}\n\nfn main() {}\n") [ "E0102" ];
+  errs "struct-pattern-wrong-type" (point ^ "fn f(p: Line) -> Int {\n    match p {\n        Point { .. } => 1,\n    }\n}\n\nfn main() {}\n") [ "E0201" ];
+  says "struct-pattern-not-covered" (point ^ "fn f(p: Point) -> Int {\n    match p {\n        Point { x: 0, .. } => 1,\n        Point { y: 0, .. } => 2,\n    }\n}\n\nfn main() {}\n") "E0204" "does not cover `_`";
+  says "struct-pattern-nested-not-covered" (point ^ "fn f(p: Option[Point]) -> Int {\n    match p {\n        Some(Point { x: 0, .. }) => 1,\n        None => 2,\n    }\n}\n\nfn main() {}\n") "E0204" "does not cover `Some(_)`";
+  says "as-pattern-unreachable" (point ^ "fn f(p: Point) -> Int {\n    match p {\n        Point { .. } as q => q.x,\n        Point { x, .. } as r => x,\n    }\n}\n\nfn main() {}\n") "W0002" "can never match";
+  errs "as-pattern-type" (main_wrap "    let s: Str = match Some(1) {\n        Some(_) as o => o,\n        None => \"\",\n    }") [ "E0201" ];
+  errs "as-pattern-or-binds" (main_wrap "    let n = match Some(1) {\n        (Some(1) as o) | None => 1,\n        _ => 2,\n    }") [ "E0210" ];
+  errs "as-pattern-wild" (main_wrap "    let n = match 1 {\n        _ as _ => 1,\n    }") [ "E0003" ];
+
   (* ---------- diagnostics ---------- *)
   errs "ambient-print" (main_wrap "    print(\"x\")") [ "E0302" ];
   errs "cap-in-struct" "struct C { n: Net }\nfn main(root: Root) {}" [ "E0301" ];

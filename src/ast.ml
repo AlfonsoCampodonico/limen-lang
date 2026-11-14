@@ -26,6 +26,12 @@ and pat_desc =
       (* `..`, any remaining parts, as an item of a tuple, variant or list
          pattern; `..name` (lists only) binds them as a list *)
   | POr of pat list (* `A | B`: two or more alternatives, none of them a POr *)
+  | PStruct of string * span * (string * span * pat) list * bool
+      (* `Point { x, y: 0, .. }`: the struct (`geo.Point` until modules load)
+         and its span, each field named with its pattern and the field's
+         span (`x` alone is `x: x`, a PBind with the field's span), and
+         whether `..` stands for the fields not named *)
+  | PAs of pat * string * span (* `p as name`: matches [p], and binds the whole value to [name] too *)
 
 let is_rest (p : pat) = match p.pdesc with PRest _ -> true | _ -> false
 
@@ -56,10 +62,20 @@ let rec irrefutable (p : pat) =
   | PTuple ps -> List.for_all irrefutable ps
   | PList [ { pdesc = PRest _; _ } ] -> true
   | POr ps -> List.exists irrefutable ps
+  | PStruct (_, _, fs, _) -> List.for_all (fun (_, _, q) -> irrefutable q) fs
+  | PAs (q, _, _) -> irrefutable q
   | _ -> false
 
 (* The alternatives of an or-pattern, or the pattern alone. *)
 let alternatives (p : pat) = match p.pdesc with POr ps -> ps | _ -> [ p ]
+
+(* The pattern without the `as name` around it. *)
+let rec unnamed (p : pat) = match p.pdesc with PAs (q, _, _) -> unnamed q | _ -> p
+
+(* The items of a struct pattern in the order of the struct's [fields]: each
+   named field's pattern, `_` for the others. *)
+let struct_items (fs : (string * span * pat) list) (fields : string list) (sp : span) =
+  List.map (fun n -> match List.find_opt (fun (m, _, _) -> m = n) fs with Some (_, _, q) -> q | None -> { pdesc = PWild; pspan = sp }) fields
 
 (* The bounds on type parameters: each parameter with the interfaces it must
    satisfy, written as types so module names and aliases resolve as in any
