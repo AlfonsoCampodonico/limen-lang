@@ -1690,7 +1690,7 @@ The standard library is checked like a dependency. `src/std/tessera.toml` lists 
 
 | Module | May take |
 | --- | --- |
-| `json`, `list`, `text`, `format`, `regex`, `errors`, `hex`, `base64` | nothing: pure |
+| `json`, `list`, `text`, `format`, `regex`, `errors`, `hex`, `base64`, `hash` | nothing: pure |
 | `http` | `net` (Net, Conn) and `listen` (Listener, Conn) |
 | `time` | `clock` and `fs`, for `within` and `load_zone` alone |
 | `sql` | `fs` (the database file's directory); trusted with C (`[trust] foreign = ["sql"]`) to call SQLite |
@@ -1924,6 +1924,31 @@ Binary data as text of 64 characters, four for every three bytes (RFC 4648). The
 | `encode_url(data)` | the URL-safe alphabet, unpadded: `"aGk"` |
 | `encode_with(data, url: Bool, pad: Bool)` | either alphabet, padded or not |
 | `decode(s) -> Result[Bytes, Str]`, `decode_str(s) -> Result[Str, Str]`, `decode_url(s)` | padding is optional but, if there is any, must be right. Anything outside the alphabet (whitespace included), a misplaced `=`, a lone last character or leftover bits that are not zero is an error naming the byte: `base64: `-` belongs to the URL-safe alphabet at byte 4` |
+
+### hash
+
+Cryptographic hashes of `Bytes`: SHA-256 (FIPS 180-4) and HMAC-SHA-256 (RFC 2104) for checksums, signatures and keys, and SHA-1 and MD5 only for formats that still name them (git object ids, TOTP, ETags), since both are broken for security. Digests are `Bytes`; the `_hex` functions give lowercase hex, as `shasum` prints it. Pure functions, written in Tessera with 32-bit words in `Int`s; natively SHA-256 runs at about 200 MB/s.
+
+| Item | Meaning |
+| --- | --- |
+| `sha256(data) -> Bytes`, `sha256_hex(data) -> Str` | the 32-byte digest: `sha256_hex("abc".to_bytes())` is `"ba7816bf...f20015ad"` |
+| `hmac_sha256(key, data) -> Bytes`, `hmac_sha256_hex(key, data)` | the MAC of `data` under `key`, any length of key (one over 64 bytes is hashed first, as the RFC says) |
+| `sha1(data)`, `sha1_hex(data)`, `hmac_sha1(key, data)` | SHA-1: 20 bytes |
+| `md5(data)`, `md5_hex(data)` | MD5 (RFC 1321): 16 bytes |
+| `equal(a, b) -> Bool` | whether two byte strings are equal, in a time that does not depend on where they differ; compare a MAC or token you were given with it, not `==`, so the time taken does not tell an attacker how much of a guess was right |
+| `hex(data) -> Str` | bytes as lowercase hex |
+
+```
+use hash
+
+fn sign(secret: Str, body: Str) -> Str {
+    hash.hmac_sha256_hex(secret.to_bytes(), body.to_bytes())
+}
+
+fn verify(secret: Str, body: Str, mac: Bytes) -> Bool {
+    hash.equal(hash.hmac_sha256(secret.to_bytes(), body.to_bytes()), mac)
+}
+```
 
 ## 20. Not yet
 

@@ -3060,6 +3060,45 @@ fn main(root: Root) {
 }
 |v}
     "= Ok(\"\")  Ok(\"\")  Ok(\"\")\nf=Zg== Ok(\"f\") Zg Ok(\"f\") 66 Ok(\"f\")\nfo=Zm8= Ok(\"fo\") Zm8 Ok(\"fo\") 666f Ok(\"fo\")\nfoo=Zm9v Ok(\"foo\") Zm9v Ok(\"foo\") 666f6f Ok(\"foo\")\nfoob=Zm9vYg== Ok(\"foob\") Zm9vYg Ok(\"foob\") 666f6f62 Ok(\"foob\")\nfooba=Zm9vYmE= Ok(\"fooba\") Zm9vYmE Ok(\"fooba\") 666f6f6261 Ok(\"fooba\")\nfoobar=Zm9vYmFy Ok(\"foobar\") Zm9vYmFy Ok(\"foobar\") 666f6f626172 Ok(\"foobar\")\n344 true true true true\n-_8= +/8= 01ABFF\nOk(\"hi\") Ok(bytes([251, 255])) Ok(bytes([251, 255]))\nErr(\"base64: wrong padding at byte 3\")\nErr(\"base64: a lone character at the end, at byte 0\")\nErr(\"base64: `=` before the end at byte 3\")\nErr(\"base64: `=` before the end at byte 1\")\nErr(\"base64: a space is not a base64 character at byte 2\")\nErr(\"base64: `-` belongs to the URL-safe alphabet at byte 0\")\nErr(\"base64: the last character has bits left over at byte 2\")\nErr(\"base64: the last character has bits left over at byte 1\")\nErr(\"base64: wrong padding at byte 4\")\nErr(\"base64: byte value 9 is not a base64 character at byte 2\")\nErr(\"hex: an odd number of digits (3)\")\nErr(\"hex: not a hex digit at byte 0\")\nErr(\"hex: not a hex digit at byte 1\")\nErr(\"hex: not a hex digit at byte 0\")\n";
+  out "std-hash"
+    {v|use hash
+use hex
+
+fn rep(b: Int, n: Int) -> Bytes {
+    bytes((0..<n).map(|_| b))
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let msgs = ["", "abc", "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq", "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu", "The quick brown fox jumps over the lazy dog"]
+    for m in msgs {
+        let b = m.to_bytes()
+        out.print("{hash.sha256_hex(b)} {hash.sha1_hex(b)} {hash.md5_hex(b)}")
+    }
+    for n in [55, 56, 63, 64, 65, 119, 120, 128] {
+        let b = rep(97, n)
+        out.print("{n} {hash.sha256_hex(b)} {hash.sha1_hex(b)} {hash.md5_hex(b)}")
+    }
+    let million = rep(97, 1000000)
+    out.print("{hash.sha256_hex(million)}")
+    // RFC 4231
+    let cases = [
+        (rep(11, 20), "Hi There".to_bytes()),
+        ("Jefe".to_bytes(), "what do ya want for nothing?".to_bytes()),
+        (rep(170, 20), rep(221, 50)),
+        (hex.decode("0102030405060708090a0b0c0d0e0f10111213141516171819") ?? bytes([]), rep(205, 50)),
+        (rep(12, 20), "Test With Truncation".to_bytes()),
+        (rep(170, 131), "Test Using Larger Than Block-Size Key - Hash Key First".to_bytes()),
+        (rep(170, 131), "This is a test using a larger than block-size key and a larger than block-size data. The key needs to be hashed before being used by the HMAC algorithm.".to_bytes()),
+    ]
+    for (k, d) in cases {
+        out.print("{hash.hmac_sha256_hex(k, d)} {hash.hex(hash.hmac_sha1(k, d))}")
+    }
+    let a = hash.sha256("x".to_bytes())
+    out.print("{hash.equal(a, hash.sha256("x".to_bytes()))} {hash.equal(a, hash.sha256("y".to_bytes()))} {hash.equal(a, a.slice(0, 31))} {hash.equal(bytes([]), bytes([]))} {hash.sha256(bytes([])).len()} {hash.md5(bytes([])).len()}")
+}
+|v}
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 da39a3ee5e6b4b0d3255bfef95601890afd80709 d41d8cd98f00b204e9800998ecf8427e\nba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad a9993e364706816aba3e25717850c26c9cd0d89d 900150983cd24fb0d6963f7d28e17f72\n248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1 84983e441c3bd26ebaae4aa1f95129e5e54670f1 8215ef0796a20bcaaae116d3876c664a\ncf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1 a49b2446a02c645bf419f995b67091253a04a259 03dd8807a93175fb062dfb55dc7d359c\nd7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592 2fd4e1c67a2d28fced849ee1bb76e7391b93eb12 9e107d9d372bb6826bd81d3542a419d6\n55 9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318 c1c8bbdc22796e28c0e15163d20899b65621d65a ef1772b6dff9a122358552954ad0df65\n56 b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a c2db330f6083854c99d4b5bfb6e8f29f201be699 3b0c8ac703f828b04c6c197006d17218\n63 7d3e74a05d7db15bce4ad9ec0658ea98e3f06eeecf16b4c6fff2da457ddc2f34 03f09f5b158a7a8cdad920bddc29b81c18a551f5 b06521f39153d618550606be297466d5\n64 ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb 0098ba824b5c16427bd7a1122a5a442a25ec644d 014842d480b571495a4a0363793f7367\n65 635361c48bb9eab14198e76ea8ab7f1a41685d6ad62aa9146d301d4f17eb0ae0 11655326c708d70319be2610e8a57d9a5b959d3b c743a45e0d2e6a95cb859adae0248435\n119 31eba51c313a5c08226adf18d4a359cfdfd8d2e816b13f4af952f7ea6584dcfb ee971065aaa017e0632a8ca6c77bb3bf8b1dfc56 8a7bd0732ed6a28ce75f6dabc90e1613\n120 2f3d335432c70b580af0e8e1b3674a7c020d683aa5f73aaaedfdc55af904c21c f34c1488385346a55709ba056ddd08280dd4c6d6 5f61c0ccad4cac44c75ff505e1f1e537\n128 6836cf13bac400e9105071cd6af47084dfacad4e5e302c94bfed24e013afb73e ad5b3fdbcb526778c2839d2f151ea753995e26a0 e510683b3f5ffe4093d021808bc6ff70\ncdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0\nb0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7 b617318655057264e28bc0b6fb378c8ef146be00\n5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843 effcdf6ae5eb2fa2d27416d5f184df9c259a7c79\n773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe 125d7342b9ac11cd91a39af48aa17b4f63f175d3\n82558a389a443c0ea4cc819899f2083a85f0faa3e578f8077a2e3ff46729665b 4c9007f4026250c6bc8414f9bf50c86c2d7235da\na3b6167473100ee06e0c796c2955552bfa6f7c0a6a8aef8b93f860aab0cd20c5 4c1a03424b55e07fe7f27be1d58bb9324a9a5a04\n60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54 90d0dace1c1bdc957339307803160335bde6df2b\n9b09ffa71b942fcb27635fbcd5b0e944bfdc63644f0713938a7f51535c3a35e2 217e44bb08b6e06a2d6c30f3cb9f537f97c63356\ntrue false false true 32 16\n";
   out "std-http-keepalive-stream" ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] }
     {v|use http
 

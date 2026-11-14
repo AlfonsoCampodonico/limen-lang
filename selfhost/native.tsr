@@ -25,7 +25,7 @@
 // MACOSX_DEPLOYMENT_TARGET). The C compiler sees only the variables the
 // Env grants, where the OCaml compiler passes its whole environment.
 use disk
-use md5
+use hash
 use paths
 
 // What a build reads of its surroundings: the variables above, read once,
@@ -198,7 +198,7 @@ fn compiler_id(self: Builder) -> Str {
 
 fn cache_key(self: Builder, c_text: Str, argv: List[Str]) -> Str {
     let env = ["LIBRARY_PATH", "CPATH", "C_INCLUDE_PATH", "SDKROOT", "MACOSX_DEPLOYMENT_TARGET", "DEVELOPER_DIR"].map(|v| v + "=" + self.setting.var(v))
-    md5.hex(([c_text, self.compiler_id()] + env + argv).join("\0"))
+    hash.md5_hex(([c_text, self.compiler_id()] + env + argv).join("\0").to_bytes())
 }
 
 // Copy binary `from` to `to`, executable, replacing `to` in one step: cp
@@ -206,7 +206,7 @@ fn cache_key(self: Builder, c_text: Str, argv: List[Str]) -> Str {
 // into place. The temporary name is told apart by a digest of where the
 // copy goes, so two builds writing the same entry do not share it.
 fn copy(self: Builder, from: Str, to: Str, tag: Str) -> Bool {
-    let tmp = to + ".tmp" + md5.hex(tag).slice(0, 8)
+    let tmp = to + ".tmp" + hash.md5_hex(tag.to_bytes()).slice(0, 8)
     let copied = match self.exec.run("cp", [from, tmp]) {
         Ok(p) => p.code == 0,
         Err(_) => false,

@@ -103,7 +103,8 @@ What each file does, in pipeline order:
   number in the function, as `pure.plan` numbers them.
 - `native.tsr` is the rest of `src/native.ml`: the TLS core pasted in
   when the program may use TLS, the C compiler's command line, and the
-  build cache, keyed as the OCaml compiler keys it (`md5.tsr` is MD5), so
+  build cache, keyed as the OCaml compiler keys it (MD5, from the standard
+  library's `hash` module), so
   the two compilers share it. The Fs gives the C compiler's size and
   modification time for the key (`Fs.info`) and moves a finished copy
   into place (`Fs.rename`); what it cannot do (read the link xcode-select
