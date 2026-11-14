@@ -323,6 +323,32 @@ let remove fs rel : (unit, ioerr) result =
       try if Sys.is_directory p then Unix.rmdir p else Unix.unlink p; Ok ()
       with Unix.Unix_error (e, _, _) -> Error (Failed (sprintf "fs: `%s`: %s" rel (Unix.error_message e))))
 
+(* A file's modification time in milliseconds (following links), as the
+   native runtime has it; -1 when it cannot be read. *)
+external mtime_ms : string -> int = "tessera_mtime_ms"
+
+(* Size, modification time and kind of [rel], following links:
+   (size, modified_ms, is_file, is_dir). *)
+let info fs rel : (int * int * bool * bool, ioerr) result =
+  match resolve fs rel ~for_write:false with
+  | Error e -> Error e
+  | Ok p -> (
+    match Unix.stat p with
+    | st -> Ok (st.st_size, mtime_ms p, st.st_kind = Unix.S_REG, st.st_kind = Unix.S_DIR)
+    | exception Unix.Unix_error (e, _, _) -> Error (Failed (sprintf "fs: `%s`: %s" rel (Unix.error_message e))))
+
+(* Move [from] to [to] in one step, replacing what is at [to]; never the
+   granted directory itself. *)
+let rename fs from to_ : (unit, ioerr) result =
+  if fs.root <> None && fs.ro then Error read_only_err
+  else
+    match (resolve fs from ~for_write:false, resolve fs to_ ~for_write:true) with
+    | Error e, _ | _, Error e -> Error e
+    | Ok a, Ok b when Some a = fs.root || Some b = fs.root -> Error (Denied "fs: cannot rename the granted directory itself")
+    | Ok a, Ok b -> (
+      try Unix.rename a b; Ok ()
+      with Unix.Unix_error (e, _, _) -> Error (Failed (sprintf "fs: `%s`: %s" from (Unix.error_message e))))
+
 let make_dir fs rel : (unit, ioerr) result =
   if fs.root <> None && fs.ro then Error read_only_err
   else

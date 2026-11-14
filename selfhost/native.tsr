@@ -5,16 +5,18 @@
 //
 // Everything goes through the capabilities it is handed. The Fs reads and
 // writes files: the C file, and the cache directory, which is used only
-// when the Fs grants it (otherwise every build compiles). What the Fs
+// when the Fs grants it (otherwise every build compiles); it gives the size
+// and modification time of the compiler for the cache key (Fs.info), and
+// moves a finished copy into place in one step (Fs.rename). What the Fs
 // cannot do, the compiler asks small programs to do through the Exec:
 //
 //   cc (or $CC)   compiles
-//   stat          size, modification time and inode of the compiler, for
-//                 the cache key; and modification times, to prune the cache
-//   readlink      where /var/db/xcode_select_link points (macOS)
-//   cp, mv        copy a binary keeping it executable, replacing the target
-//                 in one step
-//   touch         a cache hit becomes the most recently used entry
+//   readlink      where /var/db/xcode_select_link points (macOS): the Fs
+//                 does not read links
+//   cp            copies a binary keeping it executable: the Fs writes
+//                 files without the executable bit
+//   touch         a cache hit becomes the most recently used entry: the Fs
+//                 cannot set a file's time
 //   pkg-config    finds OpenSSL, for a program that may use TLS
 //
 // and reads these variables through the Env: CC, PATH, TESSERA_CACHE,
@@ -147,56 +149,26 @@ pub fn cache_dir(self: Setting, fs: Fs) -> Option[Str] {
     Some(if fs.exists(self.in_fs(mac)) { paths.concat(mac, "tessera") } else { paths.concat(home, ".cache/tessera") })
 }
 
-// For each of `files` that exists (following links), its size,
-// modification time and inode, as "SIZE:MTIME:INODE" with the time in
-// seconds rounded as OCaml's "%.0f" rounds Unix.stat's float. One `stat`
-// for all of them: the BSD one (macOS), else the GNU one.
-fn stat(self: Setting, exec: Exec, files: List[Str]) -> Map[Str, Str] {
-    let mut found: Map[Str, Str] = map()
-    if files.is_empty() {
-        return found
-    }
-    let mut out = match exec.run("stat", ["-L", "-f", "%N|%z:%Fm:%i"] + files) {
-        Ok(r) => r.stdout,
-        Err(_) => "",
-    }
-    if out == "" {
-        out = match exec.run("stat", ["-L", "-c", "%n|%s:%.9Y:%i"] + files) {
-            Ok(r) => r.stdout,
-            Err(_) => "",
-        }
-    }
-    for l in out.lines() {
-        match l.last_index_of("|") {
-            Some(bar) => {
-                let parts = l.slice(bar + 1, l.len()).split(":")
-                if parts.len() == 3 {
-                    found[l.slice(0, bar)] = "{parts[0]}:{seconds(parts[1])}:{parts[2]}"
-                }
+// What the Fs says of each of `files` it can see (following links): the
+// size and the modification time in milliseconds.
+fn stat(self: Setting, fs: Fs, files: List[Str]) -> Map[Str, FileInfo] {
+    let mut found: Map[Str, FileInfo] = map()
+    for f in files {
+        match fs.info(self.in_fs(f)) {
+            Ok(i) => {
+                found[f] = i
             },
-            None => {},
+            Err(_) => {},
         }
     }
     found
-}
-
-// "SECONDS.NANOSECONDS" as OCaml prints Unix.stat's st_mtime with "%.0f":
-// the float sec + nsec / 1e9, rounded.
-fn seconds(t: Str) -> Str {
-    let (sec, nsec) = match t.index_of(".") {
-        Some(dot) => (t.slice(0, dot), t.slice(dot + 1, t.len())),
-        None => (t, "0"),
-    }
-    let s = (sec.parse_int() ?? 0).to_float()
-    let ns = (nsec.parse_int() ?? 0).to_float() / 1000000000.0
-    (s + ns).to_fixed(0)
 }
 
 // Which compiler this is, without starting it: the file the PATH gives,
 // and on macOS the clang behind the /usr/bin shim, in the developer
 // directory xcode-select chose. Updating either replaces a file, which
 // changes this.
-pub fn compiler_id(self: Setting, exec: Exec) -> Str {
+pub fn compiler_id(self: Setting, exec: Exec, fs: Fs) -> Str {
     let name = self.cc()
     let candidates = if name.contains("/") { [name] } else { self.var("PATH").split(":").filter(|d| d != "").map(|d| paths.concat(d, name)) }
     let mut dev = self.var("DEVELOPER_DIR")
@@ -207,9 +179,9 @@ pub fn compiler_id(self: Setting, exec: Exec) -> Str {
         }
     }
     let behind = if dev == "" { [] } else { ["usr/bin/clang", "Toolchains/XcodeDefault.xctoolchain/usr/bin/clang"].map(|rel| paths.concat(dev, rel)) }
-    let known = self.stat(exec, candidates + behind)
+    let known = self.stat(fs, candidates + behind)
     let shown = |p: Str| match known.get(p) {
-        Some(s) => p + ":" + s,
+        Some(i) => "{p}:{i.size}:{i.modified_ms}",
         None => p + ":?",
     }
     // a name with a slash is taken as it is, as OCaml's `which` does
@@ -224,22 +196,22 @@ pub fn compiler_id(self: Setting, exec: Exec) -> Str {
     ([first] + behind.filter(|p| known.contains(p)).map(shown)).join("|")
 }
 
-pub fn cache_key(self: Setting, exec: Exec, c_text: Str, argv: List[Str]) -> Str {
+pub fn cache_key(self: Setting, exec: Exec, fs: Fs, c_text: Str, argv: List[Str]) -> Str {
     let env = ["LIBRARY_PATH", "CPATH", "C_INCLUDE_PATH", "SDKROOT", "MACOSX_DEPLOYMENT_TARGET", "DEVELOPER_DIR"].map(|v| v + "=" + self.var(v))
-    md5.hex(([c_text, self.compiler_id(exec)] + env + argv).join("\0"))
+    md5.hex(([c_text, self.compiler_id(exec, fs)] + env + argv).join("\0"))
 }
 
 // Copy binary `from` to `to`, executable, replacing `to` in one step: cp
-// gives the copy the mode of an executable source, and mv renames it into
-// place. The temporary name is told apart by a digest of where the copy
-// goes, so two builds writing the same entry do not share it.
-fn copy(self: Setting, exec: Exec, from: Str, to: Str, tag: Str) -> Bool {
+// gives the copy the mode of an executable source, and the Fs renames it
+// into place. The temporary name is told apart by a digest of where the
+// copy goes, so two builds writing the same entry do not share it.
+fn copy(self: Setting, exec: Exec, fs: Fs, from: Str, to: Str, tag: Str) -> Bool {
     let tmp = to + ".tmp" + md5.hex(tag).slice(0, 8)
-    let ok = |r: Result[ProcessOutput, IoError]| match r {
+    let copied = match exec.run("cp", [from, tmp]) {
         Ok(p) => p.code == 0,
         Err(_) => false,
     }
-    ok(exec.run("cp", [from, tmp])) && ok(exec.run("mv", ["-f", tmp, to]))
+    copied && fs.rename(self.in_fs(tmp), self.in_fs(to)).is_ok()
 }
 
 // Make directory `dir` (a path in the Fs) and those above it.
@@ -262,7 +234,7 @@ fn keep() -> Int {
 // Keep the newest binaries; a hit refreshes its time, so this drops the
 // least recently used. Names with a dot are not entries (copies on their
 // way in).
-fn prune(self: Setting, exec: Exec, fs: Fs, dir: Str) {
+fn prune(self: Setting, fs: Fs, dir: Str) {
     let at = self.in_fs(dir)
     let names = match fs.list(at) {
         Ok(ns) => ns.filter(|n| !n.contains(".")),
@@ -271,9 +243,9 @@ fn prune(self: Setting, exec: Exec, fs: Fs, dir: Str) {
     if names.len() <= keep() {
         return
     }
-    let known = self.stat(exec, names.map(|n| paths.concat(dir, n)))
+    let known = self.stat(fs, names.map(|n| paths.concat(dir, n)))
     let time = |n: Str| match known.get(paths.concat(dir, n)) {
-        Some(s) => s.split(":")[1].parse_int() ?? 0,
+        Some(i) => i.modified_ms,
         None => 0,
     }
     let newest_first = names.sort_by(|n| 0 - time(n))
@@ -315,15 +287,15 @@ pub fn compile_c(self: Setting, exec: Exec, fs: Fs, c_text: Str, tls_text: Str, 
     }
     // the key leaves out where this build's files go
     let shape = self.command(cflags, all_libs, "prog.c", "prog")
-    let cached = paths.concat(dir, self.cache_key(exec, text, shape))
+    let cached = paths.concat(dir, self.cache_key(exec, fs, text, shape))
     let target = self.place.absolute(self.in_fs(exe))
-    if fs.exists(self.in_fs(cached)) && self.copy(exec, cached, exe, target) {
+    if fs.exists(self.in_fs(cached)) && self.copy(exec, fs, cached, exe, target) {
         let _ = exec.run("touch", [cached])
         return Ok(())
     }
     self.run_cc(exec, argv)?
-    if self.make_dirs(fs, self.in_fs(dir)) && self.copy(exec, exe, cached, target) {
-        self.prune(exec, fs, dir)
+    if self.make_dirs(fs, self.in_fs(dir)) && self.copy(exec, fs, exe, cached, target) {
+        self.prune(fs, dir)
     }
     Ok(())
 }

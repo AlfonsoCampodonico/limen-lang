@@ -66,9 +66,11 @@ let which name =
 (* Which compiler this is, without starting it (`cc --version` costs 0.1 s
    on macOS): the file the PATH gives, and on macOS the clang behind the
    /usr/bin shim, in the developer directory xcode-select chose. Updating
-   either replaces a file, which changes this. *)
+   either replaces a file, which changes its size or its modification time
+   (in milliseconds, as Fs.info gives them to the compiler written in
+   Tessera, which keys the cache the same way). *)
 let compiler_id () =
-  let stat p = try let st = Unix.stat p in Printf.sprintf "%s:%d:%.0f:%d" p st.st_size st.st_mtime st.st_ino with Unix.Unix_error _ -> p ^ ":?" in
+  let stat p = try let st = Unix.stat p in Printf.sprintf "%s:%d:%d" p st.st_size (Caps.mtime_ms p) with Unix.Unix_error _ -> p ^ ":?" in
   let dev =
     match Sys.getenv_opt "DEVELOPER_DIR" with
     | Some d when d <> "" -> Some d
@@ -106,7 +108,7 @@ let prune dir keep =
       Sys.readdir dir |> Array.to_list
       |> List.filter_map (fun f ->
              let p = Filename.concat dir f in
-             try if String.contains f '.' then None else Some (p, (Unix.stat p).st_mtime) with Unix.Unix_error _ -> None)
+             if String.contains f '.' then None else match Caps.mtime_ms p with -1 -> None | t -> Some (p, t))
       |> List.sort (fun (_, a) (_, b) -> compare b a)
     in
     List.iteri (fun i (p, _) -> if i >= keep then try Sys.remove p with Sys_error _ -> ()) entries

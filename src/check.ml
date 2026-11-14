@@ -494,8 +494,9 @@ let build_methods (t : ty) : (string * (unit -> ty list * ty)) list =
       m "append" [ TStr; TStr ] (res TUnit io_err); m "list" [ TStr ] (res (TList TStr) io_err);
       m "remove" [ TStr ] (res TUnit io_err); m "make_dir" [ TStr ] (res TUnit io_err);
       m "is_dir" [ TStr ] TBool; m "full_path" [ TStr ] (res TStr io_err); m "is_read_only" [] TBool;
-      m "exists" [ TStr ] TBool; m "under" [ TStr ] (TCap Fs); m "read_only" [] (TCap Fs) ]
-  | TCap Stdout -> [ m "print" [ TStr ] TUnit; m "write" [ TStr ] TUnit ]
+      m "exists" [ TStr ] TBool; m "under" [ TStr ] (TCap Fs); m "read_only" [] (TCap Fs);
+      m "rename" [ TStr; TStr ] (res TUnit io_err); m "info" [ TStr ] (res (TNamed ("FileInfo", [])) io_err) ]
+  | TCap (Stdout | Stderr) -> [ m "print" [ TStr ] TUnit; m "write" [ TStr ] TUnit ]
   | TCap Clock -> [ m "now_ms" [] TInt; m "sleep" [ TInt ] TUnit ]
   | TCap Rand -> [ m "int" [ TInt; TInt ] TInt; m "float" [] TFloat ]
   | TCap Stdin -> [ m "read_line" [] (opt TStr); m "read_all" [] TStr ]

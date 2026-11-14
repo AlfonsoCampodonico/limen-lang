@@ -1555,6 +1555,20 @@ fn main(root: Root) -> Result[(), IoError] {
     out.print("{rs}")|})
     "[true, true, false]\n";
   out "fs-not-granted" (main_wrap "    out.print(\"{root.fs.read(\"a.txt\").is_err()}\")") "true\n";
+  (* rename moves in one step, inside the grant; info follows links *)
+  out "fs-rename-info" ~grants:rw
+    (main_wrap
+       {|    let fs = root.fs
+    let w = fs.write("ren-a.txt", "one")
+    let r = fs.rename("ren-a.txt", "sub/ren-b.txt")
+    out.print("{w} {r} {fs.exists("ren-a.txt")} {fs.read("sub/ren-b.txt")}")
+    out.print("{fs.rename("ren-missing", "x")} {fs.rename("sub/ren-b.txt", "../x")} {fs.rename("sub/ren-b.txt", "nodir/x")}")
+    out.print("{fs.read_only().rename("sub/ren-b.txt", "y")} {fs.rename("", "y")} {fs.rename("sub/ren-b.txt", "")}")
+    let i = fs.info("sub/ren-b.txt")
+    out.print("{i.map(|x| x.size)} {i.map(|x| x.is_file)} {i.map(|x| x.is_dir)} {i.map(|x| x.modified_ms > 1600000000000)}")
+    out.print("{fs.info("sub").map(|x| x.is_dir)} {fs.info("nope")} {fs.info("../a.txt")} {fs.read_only().info("a.txt").is_ok()}")
+    out.print("{fs.remove("sub/ren-b.txt")}")|})
+    "Ok(()) Ok(()) false Ok(\"one\")\nErr(Failed(\"fs: `ren-missing` does not exist\")) Err(Denied(\"fs: path escapes the granted directory\")) Err(Failed(\"fs: directory of `nodir/x` does not exist\"))\nErr(Denied(\"fs: this capability is read-only\")) Err(Denied(\"fs: cannot rename the granted directory itself\")) Err(Denied(\"fs: cannot rename the granted directory itself\"))\nOk(3) Ok(true) Ok(false) Ok(true)\nOk(true) Err(Failed(\"fs: `nope` does not exist\")) Err(Denied(\"fs: path escapes the granted directory\")) true\nOk(())\n";
   if Sys.file_exists "/etc" then begin
     (try Unix.symlink "/etc" (Filename.concat dir "link") with Unix.Unix_error _ -> ());
     out "fs-symlink-escape" ~grants:ro

@@ -4,7 +4,7 @@ The Tessera compiler, written in Tessera. Tessera is self-hosting: the
 OCaml compiler in `src/` builds this one (stage 1), stage 1 builds itself
 (stage 2), stage 2 builds itself again (stage 3), and stages 2 and 3 emit
 the same C, which is also exactly what the OCaml compiler emits for it
-(about 368,000 lines). `sh selfhost/bootstrap.sh` runs all three stages and
+(about 376,000 lines). `sh selfhost/bootstrap.sh` runs all three stages and
 checks that; it takes about three minutes, nearly all of it the C compiler.
 The OCaml compiler stays as the way to build from scratch, and as the
 reference: `sh selfhost/check.sh` requires both compilers to agree on every
@@ -100,11 +100,12 @@ What each file does, in pipeline order:
 - `native.tsr` is the rest of `src/native.ml`: the TLS core pasted in
   when the program may use TLS, the C compiler's command line, and the
   build cache, keyed as the OCaml compiler keys it (`md5.tsr` is MD5), so
-  the two compilers share it. What the Fs cannot do (a file's size,
-  modification time and inode for the key, an executable copy, touching
-  a cache entry) it asks `stat`, `readlink`, `cp`, `mv` and `touch` to do
-  through the Exec; OpenSSL is found through `TESSERA_OPENSSL` or
-  `pkg-config`.
+  the two compilers share it. The Fs gives the C compiler's size and
+  modification time for the key (`Fs.info`) and moves a finished copy
+  into place (`Fs.rename`); what it cannot do (read the link xcode-select
+  keeps, copy a binary keeping it executable, touch a cache entry) it
+  asks `readlink`, `cp` and `touch` to do through the Exec; OpenSSL is
+  found through `TESSERA_OPENSSL` or `pkg-config`.
 - `tessera.tsr` is the compiler: `check FILE`, `caps FILE` and `build FILE
   [-o OUT] [--emit-c]` as `bin/main.ml` has them, plus `build --tests` for
   the test binary of `tessera test --native` (`cdump/` writes the OCaml
@@ -122,12 +123,13 @@ TESSERA_SRC=$PWD/src ./tsc --grant fs=/ \
   --grant env=PWD --grant env=TESSERA_SRC --grant env=CC --grant env=PATH --grant env=HOME \
   --grant env=TESSERA_CACHE --grant env=XDG_CACHE_HOME --grant env=DEVELOPER_DIR --grant env=TESSERA_OPENSSL \
   --grant env=LIBRARY_PATH --grant env=CPATH --grant env=C_INCLUDE_PATH --grant env=SDKROOT --grant env=MACOSX_DEPLOYMENT_TARGET \
-  --grant exec=cc --grant exec=stat --grant exec=readlink --grant exec=cp --grant exec=mv --grant exec=touch --grant exec=pkg-config \
+  --grant exec=cc --grant exec=readlink --grant exec=cp --grant exec=touch --grant exec=pkg-config \
   -- build examples/hello.tsr -o hello
 ```
 
   The Fs must hold the program, `TESSERA_SRC`, the output and (to use
-  it) the build cache; `fs=/` is the simple choice.
+  it) the build cache, and the C compiler for the cache key to match the
+  OCaml compiler's; `fs=/` is the simple choice.
 - `tokens.tsr` prints a file's tokens one per line; `tokdump/` prints the
   OCaml lexer's in the same format.
 - `parse.tsr` prints a file's tree (with `ast_print.tsr`): the compiler's

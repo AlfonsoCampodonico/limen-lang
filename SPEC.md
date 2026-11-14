@@ -78,7 +78,8 @@ Statements are separated by a newline or `;`. Two statements on one line without
 | `fn(A, B) -> R` | functions and closures | `fn(A, B)` without `-> R` returns `()`, as a function declared without `->` does. |
 | `Chan[T]` | a channel between tasks | Created with `channel(capacity)` (section 10). |
 | `Handle` | `{ addr: Int }` | From the prelude: an opaque C pointer, for foreign functions (section 9). |
-| `Root`, `Net`, `Fs`, `Stdout`, `Clock`, `Listen`, `Listener`, `Conn`, `Rand`, `Stdin`, `Env`, `Exec`, `Foreign` | capabilities | Cannot be created by programs (section 9). |
+| `FileInfo` | `{ size: Int, modified_ms: Int, is_file: Bool, is_dir: Bool }` | From the prelude; returned by `Fs.info`. |
+| `Root`, `Net`, `Fs`, `Stdout`, `Stderr`, `Clock`, `Listen`, `Listener`, `Conn`, `Rand`, `Stdin`, `Env`, `Exec`, `Foreign` | capabilities | Cannot be created by programs (section 9). |
 | user `struct` and `enum` | | Optionally generic (section 4). |
 
 There is no separate character type: a character is a `Str` holding one UTF-8 code point. `s.chars()` gives them as a `List[Str]`, `for c in s.chars() { ... }` visits them, and `s.bytes()` gives the bytes (section 11). One type for text keeps the API small; `len()` still counts bytes.
@@ -733,7 +734,7 @@ The rules:
    - `Net`: http and https URLs only, host allowlist, redirects not followed. `Net.connect` and `Net.connect_tls` use the same allowlist. TLS certificates are always verified (section 10).
    - `Exec`: the program name must match a grant exactly (`git` and `/usr/bin/git` are different grants), or the grant is `*`. Arguments are passed as a list, never through a shell. The child gets `/dev/null` as stdin, the working directory, `PATH`, and only the environment variables granted with `--grant env=`. A program name without `/` is looked up in `PATH`, as a shell would. Granting a program grants everything that program can do with any arguments, so `exec=sh` is as good as every other grant.
    - `Listen`: binding is allowed only for granted `host` or `host:port` entries, with or without TLS.
-   - `Fs`: paths are relative to the granted directory; absolute paths, `..` escapes and symlinks pointing outside are refused.
+   - `Fs`: paths are relative to the granted directory; absolute paths, `..` escapes and symlinks pointing outside are refused. That holds for both ends of a `rename`, and a read-only `Fs` refuses it, as it refuses every write.
    - `Foreign`: a call checks that the function's library is on the `Foreign` value's list (or the list holds `*`). C code runs with the whole process's authority, so granting a library grants everything that library can do; see below.
 
 ### Foreign functions (C)
@@ -1276,6 +1277,8 @@ fn main(root: Root) {
 | `Fs` | `list(dir)` | `Result[List[Str], IoError]`, names sorted, without `.` and `..`; `""` is the granted directory |
 | `Fs` | `make_dir(path)` | `Result[(), IoError]`; the parent must exist |
 | `Fs` | `remove(path)` | `Result[(), IoError]`, a file or an empty directory, never the granted directory itself |
+| `Fs` | `rename(from, to)` | `Result[(), IoError]`: moves a file or directory in one step, replacing what is at `to` (a file, or an empty directory); never the granted directory itself |
+| `Fs` | `info(path)` | `Result[FileInfo, IoError]`, following links: `size` in bytes, `modified_ms` (milliseconds since the Unix epoch), `is_file`, `is_dir` |
 | `Fs` | `exists(path)`, `is_dir(path)` | `Bool` |
 | `Fs` | `under(dir)`, `read_only()` | `Fs` |
 | `Fs` | `full_path(path)` | `Result[Str, IoError]`: the absolute path, checked as for writing (the file need not exist, its directory must), with the directory part resolved to its real path, for handing to C or another program |
@@ -1405,7 +1408,7 @@ Every diagnostic has a stable code. `tessera explain CODE` prints its explanatio
 | W0002 | a `match` arm, or an alternative of an or-pattern, that can never match |
 | E0001-E0008 | lexing and parsing: bad character, unclosed string, unexpected token, missing newline, integer too large, bad escape, empty interpolation, untyped parameter |
 | E0101 | unknown name (with a suggestion) |
-| E0102 | unknown type |
+| E0102 | unknown type, or a struct pattern naming something that is not a struct |
 | E0103 | unknown field |
 | E0104 | unknown or ambiguous variant |
 | E0105 | unknown method |

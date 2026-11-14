@@ -8,6 +8,7 @@ enum IoError { Denied(Str), Failed(Str) }
 struct ProcessOutput { code: Int, stdout: Str, stderr: Str }
 struct HttpResponse { status: Int, headers: Map[Str, Str], body: Str }
 struct Handle { addr: Int }
+struct FileInfo { size: Int, modified_ms: Int, is_file: Bool, is_dir: Bool }
 interface Error {
     fn message(self) -> Str
     fn cause(self) -> Option[dyn Error]

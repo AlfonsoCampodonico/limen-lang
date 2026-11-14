@@ -22,7 +22,7 @@ tsc() {
     --grant env=PWD --grant env=TESSERA_SRC --grant env=CC --grant env=PATH --grant env=HOME \
     --grant env=TESSERA_CACHE --grant env=XDG_CACHE_HOME --grant env=DEVELOPER_DIR --grant env=TESSERA_OPENSSL \
     --grant env=LIBRARY_PATH --grant env=CPATH --grant env=C_INCLUDE_PATH --grant env=SDKROOT --grant env=MACOSX_DEPLOYMENT_TARGET \
-    --grant "exec=${CC:-cc}" --grant exec=stat --grant exec=readlink --grant exec=cp --grant exec=mv --grant exec=touch --grant exec=pkg-config \
+    --grant "exec=${CC:-cc}" --grant exec=readlink --grant exec=cp --grant exec=touch --grant exec=pkg-config \
     -- "$@"
 }
 step() { printf '%-44s' "$1"; start=$(date +%s); }

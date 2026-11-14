@@ -401,3 +401,21 @@ value tessera_sandbox_enter(value root, value ro, value net, value exec) {
   if (rc < 0) caml_failwith(err);
   CAMLreturn(Val_int(rc));
 }
+
+/* A file's modification time in whole milliseconds, as the native runtime's
+   Fs.info gives it: OCaml's Unix.stat has it only as a float, which cannot
+   always give the same millisecond back. Follows links; -1 when the file
+   cannot be read.
+   tessera_mtime_ms : string -> int */
+#include <sys/stat.h>
+value tessera_mtime_ms(value path) {
+  CAMLparam1(path);
+  struct stat st;
+  if (stat(String_val(path), &st) != 0) CAMLreturn(Val_long(-1));
+#ifdef __APPLE__
+  int64_t ms = (int64_t)st.st_mtimespec.tv_sec * 1000 + st.st_mtimespec.tv_nsec / 1000000;
+#else
+  int64_t ms = (int64_t)st.st_mtim.tv_sec * 1000 + st.st_mtim.tv_nsec / 1000000;
+#endif
+  CAMLreturn(Val_long(ms));
+}

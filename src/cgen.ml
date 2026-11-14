@@ -838,6 +838,12 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     | "cap_remove", TCap Fs -> io_result (sprintf "Cap_fs_remove(%s, %s)" (arg 0) (arg 1)) "0"
     | "cap_make_dir", TCap Fs -> io_result (sprintf "Cap_fs_make_dir(%s, %s)" (arg 0) (arg 1)) "0"
     | "cap_is_dir", TCap Fs -> set (sprintf "Cap_fs_is_dir(%s, %s)" (arg 0) (arg 1))
+    | "cap_rename", TCap Fs -> io_result (sprintf "Cap_fs_rename(%s, %s, %s)" (arg 0) (arg 1) (arg 2)) "0"
+    | "cap_info", TCap Fs ->
+      let fi = TNamed ("FileInfo", []) in
+      io_result
+        (sprintf "Cap_fs_info(%s, %s)" (arg 0) (arg 1))
+        (sprintf "({ WFileInfo *i_ = (WFileInfo*)r_.ptr; %s v_ = { i_->size, i_->mtime_ms, i_->is_file, i_->is_dir }; free(i_); v_; })" (ctype c fi))
     | "cap_only", TCap Exec -> set (sprintf "Cap_exec_only(%s, %s)" (arg 0) (arg 1))
     | "cap_only", TCap Foreign -> set (sprintf "Cap_foreign_only(%s, %s)" (arg 0) (arg 1))
     | "cap_allows", TCap Foreign -> set (sprintf "Cap_foreign_allows(%s, %s)" (arg 0) (arg 1))

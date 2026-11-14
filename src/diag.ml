@@ -32,8 +32,8 @@ let explanations = [
   "E0007", "An interpolation `{...}` cannot be empty. Write `\\{` for a literal brace.";
   "E0008", "Every function parameter needs a type, for example `fn f(x: Int)`. Tessera only infers types inside function bodies.";
   "E0101", "A name was used that is not a local variable, function or enum variant in scope.";
-  "E0102", "A type name is not defined. Built-in types: Int, Float, Bool, Str, List, Array[T, N], Option, Result, IoError, Root, Net, Fs, Stdout, Clock, Listen, Listener, Conn, Rand, Stdin, Env, Exec, Foreign, Handle.";
-  "E0103", "The struct (or Root) has no field with this name.";
+  "E0102", "A type name is not defined, or a struct literal or struct pattern names something that is not a struct (an enum is built and matched with its variants). Built-in types: Int, Float, Bool, Str, List, Array[T, N], Option, Result, IoError, Root, Net, Fs, Stdout, Stderr, Clock, Listen, Listener, Conn, Rand, Stdin, Env, Exec, Foreign, Handle, FileInfo.";
+  "E0103", "The struct (or Root) has no field with this name. A struct pattern names the struct's own fields; a field promoted from an embedded struct is matched through the embedded field.";
   "E0104", "The enum has no such variant, or the variant name is ambiguous. Qualify it as `Enum.Variant`.";
   "E0105", "The type has no method with this name. User-defined types have no methods in phase 1; write a function that takes the value.";
   "E0106", "Something is defined twice: a type, function, field or variant, or a field is set twice in a struct literal or matched twice in a struct pattern. A struct, enum or interface cannot take the name of a built-in type or capability (`Env`, `Option`, `Int`, ...), which every program already has: name it something else.";

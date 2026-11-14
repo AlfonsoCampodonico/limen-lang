@@ -2596,6 +2596,12 @@ and cap_call rt c name args sp =
   | CFs fs, "remove", [ VStr p ] -> io_result (fun () -> VUnit) (Caps.remove fs p)
   | CFs fs, "make_dir", [ VStr p ] -> io_result (fun () -> VUnit) (Caps.make_dir fs p)
   | CFs fs, "is_dir", [ VStr p ] -> VBool (Caps.is_dir fs p)
+  | CFs fs, "rename", [ VStr a; VStr b ] -> io_result (fun () -> VUnit) (Caps.rename fs a b)
+  | CFs fs, "info", [ VStr p ] ->
+    io_result
+      (fun (size, ms, is_file, is_dir) ->
+        VStruct ("FileInfo", [ ("size", vint size); ("modified_ms", vint ms); ("is_file", VBool is_file); ("is_dir", VBool is_dir) ]))
+      (Caps.info fs p)
   | CNet allowed, "only", [ VStr h ] -> VCap (CNet (Caps.attenuate allowed h))
   | CNet allowed, "get", [ VStr url ] ->
     io_result

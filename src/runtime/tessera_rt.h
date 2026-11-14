@@ -1422,6 +1422,46 @@ static WIo Cap_fs_make_dir(WCap *fs, WStr *rel) {
   if (rc != 0) { snprintf(msg, sizeof msg, "fs: `%.*s`: %s", (int)rel->len, rel->data, strerror(errno)); return io_err(2, msg); }
   return io_ok(NULL);
 }
+/* Move `from` to `to` in one step, replacing what is at `to` (rename(2));
+   never the granted directory itself. */
+static WIo Cap_fs_rename(WCap *fs, WStr *from, WStr *to) {
+  if (fs->root && fs->ro) return io_err(1, "fs: this capability is read-only");
+  int kind; char msg[1024];
+  char *a = fs_resolve(fs, from, false, &kind, msg, sizeof msg);
+  if (!a) return io_err(kind, msg);
+  char *b = fs_resolve(fs, to, true, &kind, msg, sizeof msg);
+  if (!b) { free(a); return io_err(kind, msg); }
+  if (strcmp(a, fs->root) == 0 || strcmp(b, fs->root) == 0) { free(a); free(b); return io_err(1, "fs: cannot rename the granted directory itself"); }
+  int rc = rename(a, b);
+  free(a); free(b);
+  if (rc != 0) { snprintf(msg, sizeof msg, "fs: `%.*s`: %s", (int)from->len, from->data, strerror(errno)); return io_err(2, msg); }
+  return io_ok(NULL);
+}
+/* Fs.info: size, modification time in milliseconds and kind, following
+   links. */
+typedef struct { int64_t size; int64_t mtime_ms; bool is_file; bool is_dir; } WFileInfo;
+static WIo Cap_fs_info(WCap *fs, WStr *rel) {
+  int kind; char msg[1024];
+  char *p = fs_resolve(fs, rel, false, &kind, msg, sizeof msg);
+  if (!p) return io_err(kind, msg);
+  struct stat st;
+  if (stat(p, &st) != 0) {
+    snprintf(msg, sizeof msg, "fs: `%.*s`: %s", (int)rel->len, rel->data, strerror(errno));
+    free(p);
+    return io_err(2, msg);
+  }
+  free(p);
+  WFileInfo *i = (WFileInfo *)w_raw(sizeof(WFileInfo));
+  i->size = (int64_t)st.st_size;
+#ifdef __APPLE__
+  i->mtime_ms = (int64_t)st.st_mtimespec.tv_sec * 1000 + st.st_mtimespec.tv_nsec / 1000000;
+#else
+  i->mtime_ms = (int64_t)st.st_mtim.tv_sec * 1000 + st.st_mtim.tv_nsec / 1000000;
+#endif
+  i->is_file = S_ISREG(st.st_mode);
+  i->is_dir = S_ISDIR(st.st_mode);
+  return io_ok_ptr(i);
+}
 /* Virtual time, for a test that takes `clock: virtual Clock`: the clock
    starts at 2026-01-01T00:00:00Z and moves only when every task is blocked
    (see w_tm_advance). w_vnow_ns is how far it has moved. */
