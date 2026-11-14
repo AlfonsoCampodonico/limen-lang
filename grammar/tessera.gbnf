@@ -124,8 +124,23 @@ upper  ::= [A-Z] [A-Za-z0-9_]*
 int    ::= [0-9] [0-9_]*
 float  ::= [0-9] [0-9_]* ("." [0-9] [0-9_]* exp? | exp)
 exp    ::= [eE] [+-]? [0-9]+
-string ::= "\"" (strchar | escape | interp)* "\""
-plainstr ::= "\"" (strchar | escape)* "\""
+string ::= mlstr | "\"" (strchar | escape | interp)* "\""
+# a multi-line string: three quotes ending their line, lines of text, and
+# three quotes on a line of their own (the grammar does not check that every
+# line is indented at least as far as the closing line)
+mlstr   ::= "\"\"\"" [ \t\r]* "\n" mlline* [ \t]* "\"\"\""
+mlline  ::= [ \t]* (mlfirst mlchar* | "\"" | "\"\"")? "\n"
+mlfirst ::= [^ \t\n"\\{] | escape | interp | mljoin | "\"" mlnq | "\"\"" mlnq
+mlnq    ::= [^"\n\\{] | escape | interp | mljoin
+mlchar  ::= [^\n\\{] | escape | interp | mljoin
+# a line ending in a backslash goes on with the next one
+mljoin  ::= "\\" "\r"? "\n"
+plainstr ::= mlplain | "\"" (strchar | escape)* "\""
+mlplain  ::= "\"\"\"" [ \t\r]* "\n" mlpline* [ \t]* "\"\"\""
+mlpline  ::= [ \t]* (mlpfirst mlpchar* | "\"" | "\"\"")? "\n"
+mlpfirst ::= [^ \t\n"\\{] | escape | mljoin | "\"" mlpnq | "\"\"" mlpnq
+mlpnq    ::= [^"\n\\{] | escape | mljoin
+mlpchar  ::= [^\n\\{] | escape | mljoin
 strchar ::= [^"\\{]
 escape  ::= "\\" [ntr\\"{}0]
 interp  ::= "{" ws expr ws "}"
