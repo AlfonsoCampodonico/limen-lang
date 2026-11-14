@@ -3527,6 +3527,15 @@ fn main(root: Root) -> Result[(), IoError] {
          "" ])
     "[2, 2, 1, -5, 963250] true\n[\"one\", \"two\"] Some(\"yes\") None\n[\"a.txt\", \"new.txt\"] ab true false\ntrue true true true\nfalse Err(Denied(\"fs: this capability is read-only\")) Err(Denied(\"fs: path escapes the granted directory\"))\n";
   panics "rand-empty-range" (main_wrap "    out.print(\"{root.rand.int(3, 3)}\")") "rand.int: empty range 3..3";
+  (* Rand.bytes: seeded, splitmix64 outputs eight bytes at a time, the same in
+     both backends; unseeded, the system's secure generator *)
+  out "rand-bytes-seeded" ~grants:{ Interp.no_grants with seed = Some 7 }
+    (main_wrap "    let r = root.rand\n    out.print(\"{r.bytes(10)} {r.bytes(0)} {r.int(0, 1000)} {r.bytes(3)}\")")
+    "bytes([215, 13, 50, 89, 228, 225, 203, 99, 28, 102]) bytes([]) 346 bytes([203, 41, 62])\n";
+  out "rand-bytes-system"
+    (main_wrap "    let r = root.rand\n    let a = r.bytes(32)\n    let b = r.bytes(32)\n    out.print(\"{a.len()} {r.bytes(1000).len()} {a != b}\")")
+    "32 1000 true\n";
+  panics "rand-bytes-negative" (main_wrap "    out.print(\"{root.rand.bytes(-1)}\")") "rand.bytes: negative length -1";
   errs "interp-escaped-quote" (main_wrap "    out.print(\"{\\\"x\\\".len()}\")\n    out.print(\"later\")") [ "E0006" ];
   ok "unknown-method-lists-methods"
     (let _, ds, _ = compile "unknown-method" (main_wrap "    let n = [1].size_of()") in

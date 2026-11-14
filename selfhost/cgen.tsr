@@ -1465,6 +1465,7 @@ fn prim(self: Cg, ind: Str, dst: Str, t: types.Ty, name: Str, rt: types.Ty, a: L
         ("cap_sleep", TCap("Clock")) => c.line(ind, "Cap_sleep({arg(1)});").set(ind, dst, "0"),
         ("cap_int", TCap("Rand")) => c.set(ind, dst, "Cap_rand_int({arg(1)}, {arg(2)}, {c.where(sp)})"),
         ("cap_float", TCap("Rand")) => c.set(ind, dst, "Cap_rand_float()"),
+        ("cap_bytes", TCap("Rand")) => c.set(ind, dst, "Cap_rand_bytes({arg(1)}, {c.where(sp)})"),
         ("cap_args", TCap("Root")) => c.set(ind, dst, "Cap_args()"),
         ("cap_read_line", TCap("Stdin")) => c.found(ind, dst, t, "bool ok_;\n{ind}  WStr *s_ = Cap_stdin_line(&ok_);", "ok_", "s_"),
         ("cap_read_all", TCap("Stdin")) => c.set(ind, dst, "Cap_stdin_all()"),

@@ -546,7 +546,7 @@ let build_methods (t : ty) : (string * (unit -> ty list * ty)) list =
       m "rename" [ TStr; TStr ] (res TUnit io_err); m "info" [ TStr ] (res (TNamed ("FileInfo", [])) io_err) ]
   | TCap (Stdout | Stderr) -> [ m "print" [ TStr ] TUnit; m "write" [ TStr ] TUnit ]
   | TCap Clock -> [ m "now_ms" [] TInt; m "sleep" [ TInt ] TUnit ]
-  | TCap Rand -> [ m "int" [ TInt; TInt ] TInt; m "float" [] TFloat ]
+  | TCap Rand -> [ m "int" [ TInt; TInt ] TInt; m "float" [] TFloat; m "bytes" [ TInt ] TBytes ]
   | TCap Stdin -> [ m "read_line" [] (opt TStr); m "read_all" [] TStr ]
   | TCap Env -> [ m "get" [ TStr ] (opt TStr) ]
   | TCap Exec ->

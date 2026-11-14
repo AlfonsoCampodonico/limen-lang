@@ -36,7 +36,7 @@ fn main(root: Root) -> Result[(), IoError] {
     out.write("no newline ")
     root.stderr.print("to stderr")
     root.stderr.write("no newline on stderr")
-    out.print("{root.args()} {root.clock.now_ms() > 0} {root.rand.int(1, 2)} {root.rand.float() < 1.0}")
+    out.print("{root.args()} {root.clock.now_ms() > 0} {root.rand.int(1, 2)} {root.rand.float() < 1.0} {root.rand.bytes(4).len()}")
     root.clock.sleep(1)
     out.print("{root.env.get("HOME").is_some()} {root.stdin.read_line()} {root.stdin.read_all().len()}")
     let r = root.exec.only("echo").run("echo", ["hi"])?

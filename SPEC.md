@@ -710,7 +710,7 @@ The native backend implements this with reference counting and copy-on-write. A 
 | `root.stderr` | `Stderr` | always |
 | `root.stdin` | `Stdin` | always |
 | `root.clock` | `Clock` | always |
-| `root.rand` | `Rand` | always; `--seed N` makes the numbers repeatable, the same in both backends |
+| `root.rand` | `Rand` | always; `--seed N` makes the numbers repeatable, the same in both backends (`bytes` included) |
 | `root.env` | `Env` | only with `--grant env=NAME` (repeatable) or `--grant env=*`; other variables read as `None` |
 | `root.net` | `Net` | only with `--grant net=HOST[:PORT]` (repeatable) or `--grant net=*` |
 | `root.fs` | `Fs` | only with `--grant fs=DIR` or `--grant fs=DIR:ro` |
@@ -1278,6 +1278,7 @@ fn main(root: Root) {
 | `Clock` | `sleep(ms)` | `()`, waits `ms` milliseconds (section 10); returns at once if `ms <= 0` |
 | `Rand` | `int(lo, hi)` | `Int` in `lo` up to but not including `hi`; panics if `hi <= lo` |
 | `Rand` | `float()` | `Float` in [0, 1) |
+| `Rand` | `bytes(n)` | `Bytes`: `n` bytes from the operating system's cryptographically secure generator (`arc4random_buf` on macOS, `/dev/urandom` on Linux), for keys, tokens and UUIDs; a negative `n` panics. With `--seed` they come from the seeded generator instead, so a seeded run repeats. `int` and `float` are a fast generator (splitmix64) seeded from the time and process id, not fit for secrets |
 | `Stdin` | `read_line()` | `Option[Str]`, without the newline (or `\r\n`); `None` at the end of input. Waiting for input parks the task; one task reads at a time, so tasks reading together each get whole lines |
 | `Stdin` | `read_all()` | `Str`, the rest of the input |
 | `Env` | `get(name)` | `Option[Str]`; `None` if unset or not granted |

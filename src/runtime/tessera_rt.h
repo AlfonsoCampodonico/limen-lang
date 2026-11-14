@@ -972,6 +972,7 @@ static char **g_foreign; static int g_nforeign;
 static bool g_no_sandbox;
 static char **g_args; static int g_nargs;
 static uint64_t g_rand_state;
+static bool g_rand_seeded;
 
 static void w_usage(const char *m) {
   fprintf(stderr, "%s\nusage: PROGRAM [--grant KIND=VALUE]... [--seed N] [--no-sandbox] [-- ARGS...]\n", m);
@@ -994,7 +995,7 @@ static void w_init(int argc, char **argv) {
   }
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--") == 0) { g_args = argv + i + 1; g_nargs = argc - i - 1; break; }
-    if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) { g_rand_state = (uint64_t)strtoll(argv[++i], NULL, 10); continue; }
+    if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) { g_rand_state = (uint64_t)strtoll(argv[++i], NULL, 10); g_rand_seeded = true; continue; }
     if (strcmp(argv[i], "--no-sandbox") == 0) { g_no_sandbox = true; continue; }
     if (strcmp(argv[i], "--grant") != 0 || i + 1 >= argc) w_usage("unknown argument");
     const char *g = argv[++i];
@@ -1105,6 +1106,38 @@ static int64_t Cap_rand_int(int64_t lo, int64_t hi, const char *where) {
   return (int64_t)((uint64_t)lo + w_rand_next() % span);
 }
 static double Cap_rand_float(void) { return (double)(w_rand_next() >> 11) * 0x1.0p-53; }
+/* Rand.bytes: `n` bytes from the operating system's cryptographically
+   secure generator (arc4random_buf on macOS, /dev/urandom elsewhere), for
+   keys, tokens and UUIDs. With --seed they come from splitmix64 instead, so a
+   seeded run repeats: each output gives eight bytes, low byte first, the
+   last output's unused bytes dropped, as in the interpreter. */
+static WStr *Cap_rand_bytes(int64_t n, const char *where) {
+  if (n < 0) { char m[96]; snprintf(m, sizeof m, "rand.bytes: negative length %lld", (long long)n); w_panic_c(m, where); }
+  WStr *s = Str_new(n);
+  unsigned char *p = (unsigned char *)s->data;
+  if (g_rand_seeded) {
+    for (int64_t i = 0; i < n; i += 8) {
+      uint64_t z = w_rand_next();
+      for (int64_t j = 0; j < 8 && i + j < n; j++) p[i + j] = (unsigned char)(z >> (8 * j));
+    }
+    return s;
+  }
+#if defined(__APPLE__)
+  arc4random_buf(p, (size_t)n);
+#else
+  int64_t got = 0;
+  int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+  while (fd >= 0 && got < n) {
+    ssize_t r = read(fd, p + got, (size_t)(n - got));
+    if (r < 0 && errno == EINTR) continue;
+    if (r <= 0) break;
+    got += r;
+  }
+  if (fd >= 0) close(fd);
+  if (got < n) w_panic_c("rand.bytes: cannot read the system's random source /dev/urandom", where);
+#endif
+  return s;
+}
 static L_Str *Cap_args(void) {
   L_Str *out = L_Str_new(g_nargs);
   for (int i = 0; i < g_nargs; i++) L_Str_push(&out, Str_from(g_args[i], (int64_t)strlen(g_args[i])));

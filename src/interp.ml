@@ -185,9 +185,34 @@ let rand_next () =
   let z = Int64.mul (Int64.logxor z (Int64.shift_right_logical z 27)) 0x94D049BB133111EBL in
   Int64.logxor z (Int64.shift_right_logical z 31)
 
+let rand_seeded = ref false
+
 let seed_rand = function
-  | Some s -> rand_state := Int64.of_int s
-  | None -> rand_state := Int64.of_float (Unix.gettimeofday () *. 1e6) |> Int64.logxor (Int64.of_int (Unix.getpid ()))
+  | Some s -> rand_state := Int64.of_int s; rand_seeded := true
+  | None ->
+    rand_state := Int64.of_float (Unix.gettimeofday () *. 1e6) |> Int64.logxor (Int64.of_int (Unix.getpid ()));
+    rand_seeded := false
+
+(* Rand.bytes: the operating system's secure generator (/dev/urandom), or
+   with --seed splitmix64's next outputs, eight bytes each, low byte first,
+   as the native runtime gives them. *)
+let rand_bytes n sp =
+  if n < 0 then raise (Panic (sprintf "rand.bytes: negative length %d" n, sp));
+  if !rand_seeded then begin
+    let b = Bytes.create n in
+    let i = ref 0 in
+    while !i < n do
+      let z = rand_next () in
+      for j = 0 to min 7 (n - !i - 1) do
+        Bytes.set b (!i + j) (Char.chr (Int64.to_int (Int64.logand (Int64.shift_right_logical z (8 * j)) 0xFFL)))
+      done;
+      i := !i + 8
+    done;
+    Bytes.to_string b
+  end
+  else
+    try In_channel.with_open_bin "/dev/urandom" (fun ic -> really_input_string ic n)
+    with Sys_error _ | End_of_file -> raise (Panic ("rand.bytes: cannot read the system's random source /dev/urandom", sp))
 
 type rt = {
   fns : (string, fn_decl) Hashtbl.t;
@@ -2581,6 +2606,7 @@ and cap_call rt c name args sp =
   | CClock, "now_ms", [] -> VInt (clock_now_ms ())
   | CClock, "sleep", [ VInt ms ] -> sleep_ms ms; VUnit
   | CRand, "float", [] -> VFloat (Int64.to_float (Int64.shift_right_logical (rand_next ()) 11) *. 0x1p-53)
+  | CRand, "bytes", [ VInt n ] -> VBytes (rand_bytes (Int64.to_int n) sp)
   | CStdin, "read_line", [] -> (
     unhold rt.out !current.sink;
     match Stdin.read_line () with Some l -> some (VStr l) | None -> none)
