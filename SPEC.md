@@ -1690,7 +1690,7 @@ The standard library is checked like a dependency. `src/std/tessera.toml` lists 
 
 | Module | May take |
 | --- | --- |
-| `json`, `list`, `text`, `format`, `regex`, `errors`, `hex` | nothing: pure |
+| `json`, `list`, `text`, `format`, `regex`, `errors`, `hex`, `base64` | nothing: pure |
 | `http` | `net` (Net, Conn) and `listen` (Listener, Conn) |
 | `time` | `clock` and `fs`, for `within` and `load_zone` alone |
 | `sql` | `fs` (the database file's directory); trusted with C (`[trust] foreign = ["sql"]`) to call SQLite |
@@ -1913,6 +1913,17 @@ Binary data as hexadecimal text, two digits per byte, as checksums and keys are 
 | --- | --- |
 | `encode(data: Bytes) -> Str`, `encode_upper(data)`, `encode_str(s)` | lowercase (or uppercase) digits: `encode(bytes([1, 171]))` is `"01ab"`; `encode_str` takes the bytes of a `Str` |
 | `decode(s) -> Result[Bytes, Str]`, `decode_str(s) -> Result[Str, Str]` | digits in either case; an odd number of digits, or anything else, is an error naming the byte: `hex: not a hex digit at byte 3` |
+
+### base64
+
+Binary data as text of 64 characters, four for every three bytes (RFC 4648). The standard alphabet ends in `+` and `/` and pads with `=`; the URL-safe one ends in `-` and `_`, so the text can go in URLs and file names, and is usually written without padding, as JSON Web Tokens do. Pure functions.
+
+| Item | Meaning |
+| --- | --- |
+| `encode(data: Bytes) -> Str`, `encode_str(s)` | the standard alphabet, padded: `encode_str("hi")` is `"aGk="` |
+| `encode_url(data)` | the URL-safe alphabet, unpadded: `"aGk"` |
+| `encode_with(data, url: Bool, pad: Bool)` | either alphabet, padded or not |
+| `decode(s) -> Result[Bytes, Str]`, `decode_str(s) -> Result[Str, Str]`, `decode_url(s)` | padding is optional but, if there is any, must be right. Anything outside the alphabet (whitespace included), a misplaced `=`, a lone last character or leftover bits that are not zero is an error naming the byte: `base64: `-` belongs to the URL-safe alphabet at byte 4` |
 
 ## 20. Not yet
 

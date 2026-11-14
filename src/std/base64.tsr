@@ -1,0 +1,162 @@
+// Base64 (RFC 4648): binary data as text of 64 safe characters, four
+// characters for every three bytes. The standard alphabet ends in `+` and
+// `/` and pads with `=`; the URL-safe one ends in `-` and `_`, so the text
+// can go in URLs and file names, and is usually written without padding
+// (as in JSON Web Tokens).
+
+// `data` in the standard alphabet, padded: `encode(bytes([104, 105]))` is
+// `"aGk="`.
+pub fn encode(data: Bytes) -> Str {
+    encode_with(data, url: false, pad: true)
+}
+
+// The bytes of `s`, encoded as `encode` does: `encode_str("hi")` is `"aGk="`.
+pub fn encode_str(s: Str) -> Str {
+    encode_with(s.to_bytes(), url: false, pad: true)
+}
+
+// `data` in the URL-safe alphabet, without padding: `"aGk"`.
+pub fn encode_url(data: Bytes) -> Str {
+    encode_with(data, url: true, pad: false)
+}
+
+// `data` in the URL-safe alphabet if `url`, else the standard one, padded
+// with `=` to a multiple of four characters if `pad`.
+pub fn encode_with(data: Bytes, url: Bool, pad: Bool) -> Str {
+    let abc = alphabet(url).bytes()
+    let n = data.len()
+    let mut out: List[Int] = []
+    let mut i = 0
+    while i + 2 < n {
+        let w = data[i] << 16 | data[i + 1] << 8 | data[i + 2]
+        out.push(abc[w >> 18])
+        out.push(abc[w >> 12 & 63])
+        out.push(abc[w >> 6 & 63])
+        out.push(abc[w & 63])
+        i = i + 3
+    }
+    if n - i == 1 {
+        let w = data[i] << 16
+        out.push(abc[w >> 18])
+        out.push(abc[w >> 12 & 63])
+        if pad {
+            out.push(61)
+            out.push(61)
+        }
+    } else if n - i == 2 {
+        let w = data[i] << 16 | data[i + 1] << 8
+        out.push(abc[w >> 18])
+        out.push(abc[w >> 12 & 63])
+        out.push(abc[w >> 6 & 63])
+        if pad {
+            out.push(61)
+        }
+    }
+    bytes(out).to_str()
+}
+
+// The bytes that standard base64 text stands for. Padding is optional,
+// but if there is any it must be right. Anything outside the alphabet
+// (whitespace included), a misplaced `=`, a lone character at the end, or
+// leftover bits that are not zero is an error naming the byte offset.
+pub fn decode(s: Str) -> Result[Bytes, Str] {
+    decode_with(s, false)
+}
+
+// `decode`, with the bytes as a `Str`.
+pub fn decode_str(s: Str) -> Result[Str, Str] {
+    decode_with(s, false).map(|b| b.to_str())
+}
+
+// The bytes that URL-safe base64 text stands for, padded or not.
+pub fn decode_url(s: Str) -> Result[Bytes, Str] {
+    decode_with(s, true)
+}
+
+fn alphabet(url: Bool) -> Str {
+    if url {
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    } else {
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    }
+}
+
+// The value of one character of the alphabet, or -1.
+fn value(b: Int, url: Bool) -> Int {
+    if b >= 65 && b <= 90 {
+        b - 65
+    } else if b >= 97 && b <= 122 {
+        b - 71
+    } else if b >= 48 && b <= 57 {
+        b + 4
+    } else if b == (if url { 45 } else { 43 }) {
+        62
+    } else if b == (if url { 95 } else { 47 }) {
+        63
+    } else {
+        -1
+    }
+}
+
+fn decode_with(s: Str, url: Bool) -> Result[Bytes, Str] {
+    let bs = s.bytes()
+    // the text without its padding, which must make a multiple of four
+    let mut n = bs.len()
+    while n > 0 && bs[n - 1] == 61 {
+        n = n - 1
+    }
+    let padding = bs.len() - n
+    if padding > 0 && (bs.len() % 4 != 0 || padding > 2) {
+        return Err("base64: wrong padding at byte {n}")
+    }
+    let mut out: List[Int] = []
+    let mut w = 0
+    let mut i = 0
+    while i < n {
+        let v = value(bs[i], url)
+        if v < 0 {
+            return Err("base64: {what(bs[i], url)} at byte {i}")
+        }
+        w = w << 6 | v
+        if i % 4 == 3 {
+            out.push(w >> 16)
+            out.push(w >> 8 & 255)
+            out.push(w & 255)
+            w = 0
+        }
+        i = i + 1
+    }
+    // two or three characters left over: one or two more bytes, the bits
+    // after them zero
+    let rest = n % 4
+    if rest == 1 {
+        return Err("base64: a lone character at the end, at byte {n - 1}")
+    } else if rest == 2 {
+        if w & 15 != 0 {
+            return Err("base64: the last character has bits left over at byte {n - 1}")
+        }
+        out.push(w >> 4)
+    } else if rest == 3 {
+        if w & 3 != 0 {
+            return Err("base64: the last character has bits left over at byte {n - 1}")
+        }
+        out.push(w >> 10)
+        out.push(w >> 2 & 255)
+    }
+    Ok(bytes(out))
+}
+
+// What is wrong with a byte that is not in the alphabet.
+fn what(b: Int, url: Bool) -> Str {
+    if b == 61 {
+        "`=` before the end"
+    } else if value(b, !url) >= 0 {
+        "`{b.to_char()}` belongs to the {if url { "standard" } else { "URL-safe" }} alphabet"
+    } else if b > 32 && b < 127 {
+        "`{b.to_char()}` is not a base64 character"
+    } else if b == 32 {
+        "a space is not a base64 character"
+    } else {
+        "byte value {b} is not a base64 character"
+    }
+}

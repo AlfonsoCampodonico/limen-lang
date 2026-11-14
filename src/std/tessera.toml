@@ -16,6 +16,7 @@ regex = { path = ".", caps = [] }
 sql = { path = ".", caps = ["fs"] }
 errors = { path = ".", caps = [] }
 hex = { path = ".", caps = [] }
+base64 = { path = ".", caps = [] }
 
 # Modules whose foreign blocks are part of the standard library's trusted
 # base: their C calls need no Foreign capability, so a program using them

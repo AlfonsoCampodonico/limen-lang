@@ -3035,6 +3035,31 @@ fn main(root: Root) {
 }
 |v}
     "01abff 01ABFF 6869 \nOk(bytes([1, 171, 255])) Ok(\"hi\") true true 512\nErr(\"hex: an odd number of digits (3)\")\nErr(\"hex: not a hex digit at byte 0\")\nErr(\"hex: not a hex digit at byte 1\")\nErr(\"hex: not a hex digit at byte 0\")\n";
+  out "std-base64"
+    {v|use base64
+use hex
+
+fn main(root: Root) {
+    let out = root.stdout
+    // RFC 4648 section 10 vectors
+    for s in ["", "f", "fo", "foo", "foob", "fooba", "foobar"] {
+        let e = base64.encode_str(s)
+        out.print("{s}={e} {base64.decode_str(e)} {base64.encode_url(s.to_bytes())} {base64.decode_url(base64.encode_url(s.to_bytes())).map(|b| b.to_str())} {hex.encode_str(s)} {hex.decode_str(hex.encode_str(s))}")
+    }
+    let all = bytes((0..<256).map(|i| 255 - i))
+    let e = base64.encode(all)
+    out.print("{e.len()} {base64.decode(e) == Ok(all)} {base64.decode_url(base64.encode_url(all)) == Ok(all)} {hex.decode(hex.encode(all)) == Ok(all)} {hex.decode(hex.encode_upper(all)) == Ok(all)}")
+    out.print(base64.encode_with(bytes([251, 255]), url: true, pad: true) + " " + base64.encode(bytes([251, 255])) + " " + hex.encode_upper(bytes([1, 171, 255])))
+    out.print("{base64.decode_str("aGk")} {base64.decode_url("-_8")} {base64.decode("+/8=")}")
+    for bad in ["aGk==", "a", "aGk=x", "a=Gk", "aG k", "-_8=", "aGl=", "aR==", "aGkx====", "ab\tc"] {
+        out.print("{base64.decode(bad)}")
+    }
+    for bad in ["abc", "zz", "0g", "é"] {
+        out.print("{hex.decode(bad)}")
+    }
+}
+|v}
+    "= Ok(\"\")  Ok(\"\")  Ok(\"\")\nf=Zg== Ok(\"f\") Zg Ok(\"f\") 66 Ok(\"f\")\nfo=Zm8= Ok(\"fo\") Zm8 Ok(\"fo\") 666f Ok(\"fo\")\nfoo=Zm9v Ok(\"foo\") Zm9v Ok(\"foo\") 666f6f Ok(\"foo\")\nfoob=Zm9vYg== Ok(\"foob\") Zm9vYg Ok(\"foob\") 666f6f62 Ok(\"foob\")\nfooba=Zm9vYmE= Ok(\"fooba\") Zm9vYmE Ok(\"fooba\") 666f6f6261 Ok(\"fooba\")\nfoobar=Zm9vYmFy Ok(\"foobar\") Zm9vYmFy Ok(\"foobar\") 666f6f626172 Ok(\"foobar\")\n344 true true true true\n-_8= +/8= 01ABFF\nOk(\"hi\") Ok(bytes([251, 255])) Ok(bytes([251, 255]))\nErr(\"base64: wrong padding at byte 3\")\nErr(\"base64: a lone character at the end, at byte 0\")\nErr(\"base64: `=` before the end at byte 3\")\nErr(\"base64: `=` before the end at byte 1\")\nErr(\"base64: a space is not a base64 character at byte 2\")\nErr(\"base64: `-` belongs to the URL-safe alphabet at byte 0\")\nErr(\"base64: the last character has bits left over at byte 2\")\nErr(\"base64: the last character has bits left over at byte 1\")\nErr(\"base64: wrong padding at byte 4\")\nErr(\"base64: byte value 9 is not a base64 character at byte 2\")\nErr(\"hex: an odd number of digits (3)\")\nErr(\"hex: not a hex digit at byte 0\")\nErr(\"hex: not a hex digit at byte 1\")\nErr(\"hex: not a hex digit at byte 0\")\n";
   out "std-http-keepalive-stream" ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] }
     {v|use http
 
