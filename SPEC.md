@@ -1579,6 +1579,7 @@ Every diagnostic has a stable code. `limen explain CODE` prints its explanation,
 | E0306 | a test parameter that is not `fs: Fs`, `clock: Clock` or `clock: virtual Clock`, or a bench that takes `virtual Clock` |
 | E0310 | misuse of a group handle |
 | E0311 | `return` or `?` leaving a group |
+| E0312 | the function given to a `Shared` value's `update` can wait (a channel, `select`, `group`, `sleep`, stdin, a socket, a program, or another `Shared`) |
 | E0320 | a dependency takes a capability limen.toml does not grant it, or reaches a C library its caps do not name |
 | E0321 | malformed limen.toml, an embed root that is not a directory, or a dependency's limen.toml that declares embed roots |
 | E0322 | a git dependency could not be fetched |
@@ -1586,6 +1587,7 @@ Every diagnostic has a stable code. `limen explain CODE` prints its explanation,
 | E0324 | a trusted dependency calls a C library that limen.lock did not record |
 | E0330 | a foreign function signature with a type that cannot cross to C, too many parameters, or a bad library name |
 | E0331 | a foreign function used as a value instead of called |
+| E0332 | a callback passed to C that is not a top-level function |
 | E0333 | a foreign function given a `Foreign` narrowed with `only` to other libraries |
 | E0401 | module not found, or a qualified name without `use` |
 | E0402 | item is not `pub` |
