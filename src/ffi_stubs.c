@@ -341,10 +341,13 @@ static void *limen_job_thread(void *p) {
     limen_job_free(j);
     return NULL;
   }
-  j->state = 1;
-  pthread_mutex_unlock(&j->mu);
+  /* written before done shows and under the lock: once a cancelled task
+     sees done it frees the job (closing the pipe), so the thread must not
+     touch it after letting go (the pipe is empty, so this does not block) */
   ssize_t k;
   do k = write(j->fds[1], "x", 1); while (k < 0 && errno == EINTR);
+  j->state = 1;
+  pthread_mutex_unlock(&j->mu);
   return NULL;
 }
 

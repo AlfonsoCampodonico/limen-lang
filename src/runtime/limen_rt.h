@@ -3956,11 +3956,22 @@ static void w_block_free(WBlock *b) {
   free(b);
 }
 /* The job's variable goes out of scope, normally or unwinding (generated
-   code declares it with this cleanup): freed, unless a cancelled task left
-   it to the pool, which frees it when C returns. */
+   code declares it with this cleanup): freed, unless a cancelled task leaves
+   it while C still runs it, in which case the pool frees it when C returns.
+   That hand-over is decided here, as the task's last use of the job: once
+   state says abandoned, the pool thread may free it at any moment. pooled
+   is only ever set and read by the task, so it needs no lock. */
 static void w_block_end(void *p) {
   WBlock *b = *(WBlock **)p;
-  if (b && !b->pooled) w_block_free(b);
+  if (!b) return;
+  if (b->pooled) {
+    pthread_mutex_lock(&w_bl_mu);
+    int running = b->state == 0;
+    if (running) b->state = 2;
+    pthread_mutex_unlock(&w_bl_mu);
+    if (running) return;
+  }
+  w_block_free(b);
 }
 /* The Str result, now the task's (on its boundary's list, like anything it allocates). */
 static WStr *w_block_str(WBlock *b) {
@@ -4062,13 +4073,9 @@ static void w_block_wait(WBlock *b) {
   if (!quick) w_park_now();
   __atomic_fetch_sub(&w_io_waiters, 1, __ATOMIC_SEQ_CST);
   if (cancellable) w_wait_end();
-  if (w_tok_fired(&b->tok) == W_CANCEL) {
-    /* done already: the job is the task's again; otherwise the pool's */
-    pthread_mutex_lock(&w_bl_mu);
-    if (b->state == 1) b->pooled = 0; else b->state = 2;
-    pthread_mutex_unlock(&w_bl_mu);
-    w_cancel_unwind();
-  }
+  /* cancelled: the job stays pooled and w_block_end, as the task unwinds,
+     either frees it (C has returned) or leaves it to the pool */
+  if (w_tok_fired(&b->tok) == W_CANCEL) w_cancel_unwind();
   b->pooled = 0;
 }
 /* ---------- Atomic and Shared ----------

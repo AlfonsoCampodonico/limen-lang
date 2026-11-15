@@ -1361,6 +1361,34 @@ fn main(root: Root) {
 |} in
   out "ffi-blocking" ~grants:libc blocking_libc "140 true 5 42 true  3\n[None, Some(2)] true\n";
   check_tsan "ffi-blocking" ~grants:libc blocking_libc "140 true 5 42 true  3\n[None, Some(2)] true\n";
+  (* A task cancelled while its call is in C leaves the job to the pool
+     thread, which frees it when C returns: the task must make that hand-over
+     its last use of the job. Each round abandons a call and then makes no
+     other blocking call until it has returned, so nothing else orders the
+     task's unwinding before the pool thread's free (ThreadSanitizer saw a
+     race there, a use after free had the pool been quicker). *)
+  check_tsan "ffi-blocking-abandon" ~grants:libc {|foreign "c" {
+    blocking fn usleep(us: Int32) -> Int32
+}
+
+fn main(root: Root) {
+    let f = root.foreign
+    let clock = root.clock
+    let mut k = 0
+    while k < 20 {
+        group g until clock.after(1) {
+            g.go(|| {
+                usleep(f, 20000)
+                1
+            })
+        }
+        clock.sleep(25)
+        k = k + 1
+    }
+    clock.sleep(100)
+    root.stdout.print("{k}")
+}
+|} "20\n";
   errs "ffi-blocking-callback" "foreign \"c\" {\n    blocking fn qsort(base: Handle, n: Int, size: Int, compare: fn(Handle, Handle) -> Int32)\n}\n\nfn main() {\n}\n" [ "E0330" ];
   (* structs of every shape the calling conventions treat differently, and
      callbacks, against a small C library (test/ffi_test.c) built here *)
