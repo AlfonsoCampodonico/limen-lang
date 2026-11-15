@@ -79,9 +79,46 @@ fn err(code: Str, lo: Int, hi: Int, message: Str) -> LexError {
     LexError { code, lo, hi, message }
 }
 
+// Where the text of a multi-line string opened at `i` starts: `i` is the
+// first of three quotes followed by nothing but spaces and tabs on their
+// line; -1 if they are not.
+fn ml_start(bs: List[Int], i: Int) -> Int {
+    let n = bs.len()
+    if triple(bs, i) {
+        let mut j = i + 3
+        while j < n && (bs[j] == 32 || bs[j] == 9 || bs[j] == 13) {
+            j = j + 1
+        }
+        if j < n && bs[j] == 10 {
+            return j + 1
+        }
+    }
+    -1
+}
+
+// Whether three quotes start at `i`.
+fn triple(bs: List[Int], i: Int) -> Bool {
+    i + 2 < bs.len() && bs[i] == 34 && bs[i + 1] == 34 && bs[i + 2] == 34
+}
+
+// The index after the spaces and tabs at `j`.
+fn skip_indent(bs: List[Int], j: Int) -> Int {
+    let n = bs.len()
+    let mut k = j
+    while k < n && (bs[k] == 32 || bs[k] == 9) {
+        k = k + 1
+    }
+    k
+}
+
 // The index just past the string literal that starts at `i` (a quote),
-// following escapes and nested interpolations; None at the end of input.
+// following escapes, nested interpolations and multi-line strings; None at
+// the end of input.
 fn skip_string(bs: List[Int], i: Int) -> Option[Int] {
+    let first = ml_start(bs, i)
+    if first >= 0 {
+        return Some(skip_indent(bs, ml_close(bs, first)?) + 3)
+    }
     let n = bs.len()
     let mut j = i + 1
     while j < n {
@@ -137,6 +174,173 @@ fn skip_braces(bs: List[Int], i: Int) -> Option[Int] {
         }
     }
     None
+}
+
+// The start of the line that closes the multi-line string whose first line
+// starts at `i`: the first line holding only indentation and three quotes
+// (and whatever code follows them). An interpolation's code may span
+// lines. None at the end of input.
+fn ml_close(bs: List[Int], i: Int) -> Option[Int] {
+    let n = bs.len()
+    let mut j = i
+    let mut line = true
+    while line || j < n {
+        if line {
+            if triple(bs, skip_indent(bs, j)) {
+                return Some(j)
+            }
+            line = false
+        } else {
+            let c = bs[j]
+            if c == 10 {
+                j = j + 1
+                line = true
+            } else if c == 92 {
+                line = j + 1 < n && bs[j + 1] == 10
+                j = j + 2
+            } else if c == 123 {
+                j = skip_braces(bs, j + 1)?
+            } else {
+                j = j + 1
+            }
+        }
+    }
+    None
+}
+
+// The byte the escape `\e` at `j` stands for.
+fn escape_at(src: Str, bs: List[Int], j: Int) -> Result[Int, LexError] {
+    match escaped(bs[j + 1]) {
+        Some(b) => Ok(b),
+        None => Err(err("E0006", j, j + 2, "unknown escape `\\{src.slice(j + 1, j + 2)}`")),
+    }
+}
+
+// The interpolation opened at `open_at`, which must close before `limit`,
+// and the index after it.
+fn interp(src: Str, bs: List[Int], open_at: Int, limit: Int) -> Result[(Part, Int), LexError] {
+    let n = bs.len()
+    let start = open_at + 1
+    let mut depth = 1
+    let mut i = start
+    while depth > 0 {
+        if i >= limit {
+            return Err(err("E0002", open_at, limit, "unterminated interpolation `\{...}`"))
+        }
+        let k = bs[i]
+        if k == 123 {
+            depth = depth + 1
+            i = i + 1
+        } else if k == 125 {
+            depth = depth - 1
+            i = i + 1
+        } else if k == 34 {
+            match skip_string(bs, i) {
+                Some(j) => {
+                    i = j
+                },
+                None => {
+                    return Err(err("E0002", open_at, n, "unterminated string literal"))
+                },
+            }
+        } else if k == 92 {
+            // code has no backslashes: an escaped quote meant for a nested string
+            return Err(err("E0006", i, i + 2, "a `\\` inside `\{...}`: an interpolation holds code, so a string in it uses plain quotes, as in `\"\{f(\"x\")}\"`"))
+        } else {
+            i = i + 1
+        }
+    }
+    let inner = src.slice(start, i - 1)
+    if inner.trim() == "" {
+        return Err(err("E0007", open_at, i, "empty interpolation `\{}`; write `\\\{` for a literal brace"))
+    }
+    Ok((Interp(inner, start), i))
+}
+
+// Where the text of the line of a multi-line string that starts at `j`
+// starts: after `indent`, the closing line's indentation, which a line of
+// only spaces and tabs may lack. The text ends at `ce`.
+fn start_line(bs: List[Int], src: Str, j: Int, ce: Int, indent: Str) -> Result[Int, LexError] {
+    if j + indent.len() <= ce && src.slice(j, j + indent.len()) == indent {
+        return Ok(j + indent.len())
+    }
+    let mut w = j
+    while w < ce && (bs[w] == 32 || bs[w] == 9 || bs[w] == 13) {
+        w = w + 1
+    }
+    if w == ce || bs[w] == 10 {
+        return Ok(w)
+    }
+    Err(err("E0009", j, if w > j { w } else { j + 1 }, "this line is less indented than the closing `\"\"\"`; every line of a multi-line string starts with the closing line's indentation"))
+}
+
+// The multi-line string opened at `lo`: its parts and the index after it.
+// The closing line's indentation is taken off every line, and the line
+// breaks after the opening quotes and before the closing ones are not part
+// of it.
+fn multiline(src: Str, bs: List[Int], lo: Int) -> Result[(List[Part], Int), LexError] {
+    let n = bs.len()
+    let unterminated = err("E0002", lo, n, "unterminated multi-line string; end it with `\"\"\"` on a line of its own")
+    let cs = ml_start(bs, lo)
+    if cs < 0 {
+        let mut j = lo + 3
+        while j < n && (bs[j] == 32 || bs[j] == 9 || bs[j] == 13) {
+            j = j + 1
+        }
+        if j >= n {
+            return Err(unterminated)
+        }
+        return Err(err("E0009", lo, lo + 3, "a multi-line string starts with `\"\"\"` at the end of a line; its text begins on the next line"))
+    }
+    let cls = ml_close(bs, cs) ?? {
+        return Err(unterminated)
+    }
+    let k = skip_indent(bs, cls)
+    let indent = src.slice(cls, k)
+    // the text runs up to the line break before the closing line
+    let ce = cls - 1
+    let mut parts: List[Part] = []
+    let mut buf: List[Int] = []
+    if cls > cs {
+        let mut j = start_line(bs, src, cs, ce, indent)?
+        while j < ce {
+            let c = bs[j]
+            if c == 10 {
+                buf.push(10)
+                j = start_line(bs, src, j + 1, ce, indent)?
+            } else if c == 13 && bs[j + 1] == 10 {
+                j = j + 1
+            } else if c == 92 {
+                let e = bs[j + 1]
+                if e == 10 || (e == 13 && bs[j + 2] == 10) {
+                    // a line ending in `\` goes on with the next, with no line break
+                    let at = if e == 10 { j + 1 } else { j + 2 }
+                    if at >= ce {
+                        return Err(err("E0009", j, j + 1, "a `\\` at the end of the last line has no next line to join"))
+                    }
+                    j = start_line(bs, src, at + 1, ce, indent)?
+                } else {
+                    buf.push(escape_at(src, bs, j)?)
+                    j = j + 2
+                }
+            } else if c == 123 {
+                if !buf.is_empty() {
+                    parts.push(Lit(bytes(buf).to_str()))
+                    buf = []
+                }
+                let (part, after) = interp(src, bs, j, ce)?
+                parts.push(part)
+                j = after
+            } else {
+                buf.push(c)
+                j = j + 1
+            }
+        }
+    }
+    if !buf.is_empty() {
+        parts.push(Lit(bytes(buf).to_str()))
+    }
+    Ok((parts, k + 3))
 }
 
 // Whether the last token is a `.` or `?.` ending exactly at `lo`: then
@@ -211,6 +415,11 @@ pub fn lex(src: Str) -> Result[List[Token], LexError] {
             let kind = if keywords().contains(word) { Keyword(word) } else { Ident(word) }
             toks.push(Token { kind, lo, hi: i, nl })
             nl = false
+        } else if c == 34 && triple(bs, i) {
+            let (parts, hi) = multiline(src, bs, i)?
+            toks.push(Token { kind: StrLit(parts), lo: i, hi, nl })
+            i = hi
+            nl = false
         } else if c == 34 {
             let lo = i
             i = i + 1
@@ -229,54 +438,16 @@ pub fn lex(src: Str) -> Result[List[Token], LexError] {
                     if i + 1 >= n {
                         return Err(err("E0002", lo, n, "unterminated string literal"))
                     }
-                    match escaped(bs[i + 1]) {
-                        Some(b) => buf.push(b),
-                        None => {
-                            return Err(err("E0006", i, i + 2, "unknown escape `\\{src.slice(i + 1, i + 2)}`"))
-                        },
-                    }
+                    buf.push(escape_at(src, bs, i)?)
                     i = i + 2
                 } else if d == 123 {
                     if !buf.is_empty() {
                         parts.push(Lit(bytes(buf).to_str()))
                         buf = []
                     }
-                    let open_at = i
-                    let start = i + 1
-                    let mut depth = 1
-                    i = i + 1
-                    while depth > 0 {
-                        if i >= n {
-                            return Err(err("E0002", open_at, n, "unterminated interpolation `\{...}`"))
-                        }
-                        let k = bs[i]
-                        if k == 123 {
-                            depth = depth + 1
-                            i = i + 1
-                        } else if k == 125 {
-                            depth = depth - 1
-                            i = i + 1
-                        } else if k == 34 {
-                            match skip_string(bs, i) {
-                                Some(j) => {
-                                    i = j
-                                },
-                                None => {
-                                    return Err(err("E0002", open_at, n, "unterminated string literal"))
-                                },
-                            }
-                        } else if k == 92 {
-                            // code has no backslashes: an escaped quote meant for a nested string
-                            return Err(err("E0006", i, i + 2, "a `\\` inside `\{...}`: an interpolation holds code, so a string in it uses plain quotes, as in `\"\{f(\"x\")}\"`"))
-                        } else {
-                            i = i + 1
-                        }
-                    }
-                    let inner = src.slice(start, i - 1)
-                    if inner.trim() == "" {
-                        return Err(err("E0007", open_at, i, "empty interpolation `\{}`; write `\\\{` for a literal brace"))
-                    }
-                    parts.push(Interp(inner, start))
+                    let (part, after) = interp(src, bs, i, n)?
+                    parts.push(part)
+                    i = after
                 } else {
                     buf.push(d)
                     i = i + 1

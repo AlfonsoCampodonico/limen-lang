@@ -15,6 +15,7 @@ grammar = {
     "repository": {
         "code": {"patterns": [
             {"include": "#comment"},
+            {"include": "#string-multiline"},
             {"include": "#string"},
             {"include": "#test-block"},
             {"include": "#foreign-block"},
@@ -41,7 +42,20 @@ grammar = {
             "beginCaptures": {"0": {"name": "punctuation.definition.string.begin.tessera"}},
             "endCaptures": {"0": {"name": "punctuation.definition.string.end.tessera"}},
             "patterns": [
-                {"match": r"\\[ntr0\\\"{]", "name": "constant.character.escape.tessera"},
+                {"match": r"\\[ntr0\\\"{}]", "name": "constant.character.escape.tessera"},
+                {"match": r"\\.", "name": "invalid.illegal.escape.tessera"},
+                {"include": "#interpolation"},
+            ],
+        },
+        # `"""` ending its line opens a multi-line string; `"""` first on a line closes it
+        "string-multiline": {
+            "name": "string.quoted.triple.tessera",
+            "begin": r'"""(?=[ \t\r]*$)', "end": r'^[ \t]*"""',
+            "beginCaptures": {"0": {"name": "punctuation.definition.string.begin.tessera"}},
+            "endCaptures": {"0": {"name": "punctuation.definition.string.end.tessera"}},
+            "patterns": [
+                {"match": r"\\$", "name": "constant.character.escape.line-continuation.tessera"},
+                {"match": r"\\[ntr0\\\"{}]", "name": "constant.character.escape.tessera"},
                 {"match": r"\\.", "name": "invalid.illegal.escape.tessera"},
                 {"include": "#interpolation"},
             ],

@@ -17,6 +17,9 @@
           "include": "#comment"
         },
         {
+          "include": "#string-multiline"
+        },
+        {
           "include": "#string"
         },
         {
@@ -83,7 +86,39 @@
       },
       "patterns": [
         {
-          "match": "\\\\[ntr0\\\\\\\"{]",
+          "match": "\\\\[ntr0\\\\\\\"{}]",
+          "name": "constant.character.escape.tessera"
+        },
+        {
+          "match": "\\\\.",
+          "name": "invalid.illegal.escape.tessera"
+        },
+        {
+          "include": "#interpolation"
+        }
+      ]
+    },
+    "string-multiline": {
+      "name": "string.quoted.triple.tessera",
+      "begin": "\"\"\"(?=[ \\t\\r]*$)",
+      "end": "^[ \\t]*\"\"\"",
+      "beginCaptures": {
+        "0": {
+          "name": "punctuation.definition.string.begin.tessera"
+        }
+      },
+      "endCaptures": {
+        "0": {
+          "name": "punctuation.definition.string.end.tessera"
+        }
+      },
+      "patterns": [
+        {
+          "match": "\\\\$",
+          "name": "constant.character.escape.line-continuation.tessera"
+        },
+        {
+          "match": "\\\\[ntr0\\\\\\\"{}]",
           "name": "constant.character.escape.tessera"
         },
         {

@@ -150,6 +150,42 @@ pub type Pair[T] = (T, T)
   check("test as a name", lastLine.some(([x]) => x.includes("test")) && !lastLine.some(([, s]) => s.includes("keyword.other.test.tessera")), JSON.stringify(lastLine));
   check("sample ends at top level", t.stack.equals(vsctm.INITIAL) || t.stack.depth === 1);
 
+  // multi-line strings: quotes inside need no escape, `"""` first on a line closes
+  const ml = tokenize(grammar, `fn main(c: Conn) {
+    c.write("""
+        HTTP/1.1 200 OK
+        Server: {name} "quoted" \\{x\\}
+        a "" b """ c \\
+        joined
+        """)
+    let after = 1
+}
+`);
+  check("multi-line opening", scopeOf(ml, '"""') === "punctuation.definition.string.begin.tessera", scopeOf(ml, '"""'));
+  check("multi-line text", scopeOf(ml, "        HTTP/1.1 200 OK") === "string.quoted.triple.tessera", scopeOf(ml, "        HTTP/1.1 200 OK"));
+  check("multi-line interpolation", scopeOf(ml, "name") === "source.tessera.embedded", scopeOf(ml, "name"));
+  check("multi-line quotes are text", scopeOf(ml, ' "quoted" ') === "string.quoted.triple.tessera", scopeOf(ml, ' "quoted" '));
+  check("multi-line escape", scopeOf(ml, "\\{") === "constant.character.escape.tessera", scopeOf(ml, "\\{"));
+  check("multi-line closing brace escape", scopeOf(ml, "\\}") === "constant.character.escape.tessera", scopeOf(ml, "\\}"));
+  check("multi-line three quotes mid-line are text", scopeOf(ml, '        a "" b """ c ') === "string.quoted.triple.tessera", scopeOf(ml, '        a "" b """ c '));
+  check("multi-line joined line", scopeOf(ml, "\\") === "constant.character.escape.line-continuation.tessera", scopeOf(ml, "\\"));
+  check("multi-line closing", scopeOf(ml, '        """') === "punctuation.definition.string.end.tessera", scopeOf(ml, '        """'));
+  check("code after multi-line", scopeOf(ml, "let") === "storage.type.tessera", scopeOf(ml, "let"));
+  check("multi-line ends at top level", ml.stack.depth === 1, `depth ${ml.stack.depth}`);
+  // the language server's custom semantic token type and modifiers are
+  // declared, and fall back to the grammar's scopes in themes without rules
+  const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")).contributes;
+  check("semantic type capability", pkg.semanticTokenTypes.some((t) => t.id === "capability"));
+  check("semantic modifiers", ["capability", "mutable"].every((m) => pkg.semanticTokenModifiers.some((t) => t.id === m)));
+  const scopes = pkg.semanticTokenScopes.find((s) => s.language === "tessera").scopes;
+  check("capability scope", scopes.capability[0] === "support.type.capability.tessera", JSON.stringify(scopes));
+  check("namespace scope", scopes.namespace[0] === "entity.name.namespace.tessera", JSON.stringify(scopes));
+  check("capability struct scope", scopes["struct.capability"][0] === "support.type.capability.tessera", JSON.stringify(scopes));
+
+  // `""` is still an empty string, not the start of a multi-line one
+  const empty = tokenize(grammar, `let e = ""\nlet f = 1\n`);
+  check("empty string", scopeOf(empty, "let", 1) === "storage.type.tessera", scopeOf(empty, "let", 1));
+
   // every real program ends outside any string or interpolation (strings
   // may span lines, so only the end is checked)
   const dirs = ["examples", "bench", "src/std"].map((d) => path.join(repo, d));
