@@ -1,0 +1,394 @@
+// The compiler, written in Limen: `check`, `caps` and `build` as the
+// OCaml compiler's bin/main.ml has them, with the same output and exit
+// codes. `build --tests` builds the test binary `limen test --native`
+// runs instead (`PROGRAM N` runs test N), which with `--emit-c` gives its
+// C, as selfhost/cdump does for the OCaml compiler.
+//
+//   limen build selfhost/limen.lmn -o tsc
+//   ./tsc --grant fs=$HOME --grant exec=cc ... --grant env=PWD -- build hello.lmn
+//
+// It reaches everything through its grants. The Fs must hold the program
+// and its packages, where the binary goes, and the build cache if it is
+// to be used. The standard library and the C runtime are built into it,
+// as they are into the OCaml compiler (selfhost/sources.lmn), so it reads
+// nothing of its own. The working directory is PWD, which must be inside
+// the Fs. A build runs the C compiler and a few small programs through the
+// Exec (selfhost/native.lmn lists them) and reads the variables native.lmn
+// names through the Env. What the OCaml compiler writes to stderr
+// (diagnostics, the usage) it writes to stderr too.
+use ast
+use caps
+use cgen
+use diag
+use disk
+use ffi
+use loader
+use lower
+use native
+use own
+use prelude
+use pure
+use sources
+use typecheck
+
+fn usage() -> Str {
+    "limen: a small language where I/O needs a capability
+
+usage:
+  limen run FILE [--native] [--grant net=HOST[:PORT]|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST:PORT]... [--grant env=NAME|*]... [--grant exec=PROGRAM|*]... [--grant foreign=LIB|*]... [--seed N] [--no-sandbox] [-- ARGS...]
+  limen build FILE [-o OUT] [--emit-c]
+  limen check FILE [--json]
+  limen caps FILE [--json]
+  limen explain CODE
+  limen test FILE [--native] [--run TEXT] [--bench] [--bench-time 1s|100x] [--json]
+  limen fmt FILE... [--write | --check]
+  limen doc FILE|MODULE... [--std] [--all] [--html] [-o OUT]
+  limen lsp                (language server on stdin/stdout)
+  limen mcp                (MCP server for coding agents, on stdin/stdout)
+  limen spec               (print the language specification)
+  limen search [WORDS...]  (search the package index named by LIMEN_INDEX)
+  limen add NAME[@VERSION] (add a package from the index to limen.toml, with the caps it declares)
+  limen index entry [DIR]  (print the index entry for the package's current tag)
+
+Stdout, Stderr, Stdin, Clock and Rand are always granted. Net, Fs, Listen, Env, Exec and Foreign exist only
+when granted, by --grant or by the [grants] table of limen.toml. --seed makes Rand repeatable; arguments after -- are root.args(). The process runs in an operating-system sandbox
+limited to those grants (macOS; Linux untested); --no-sandbox turns it off, for debugging.
+"
+}
+
+fn die_usage(err: Stderr, msg: Str) -> Int {
+    err.write(if msg == "" { usage() } else { "limen: " + msg + "\n\n" + usage() })
+    2
+}
+
+// What the commands work with: where they write, the files, and where in
+// them the compiler runs.
+struct Ctx {
+    out: Stdout,
+    err: Stderr,
+    fs: Fs,
+    place: disk.Place,
+}
+
+// The program after the loader, the checker and the capability checks.
+struct Front {
+    loaded: loader.Program,
+    checked: Option[typecheck.Checked],
+    // the files spans name: the program's, the prelude's, the built-in
+    // methods' and the standard library's limen.toml
+    files: List[diag.Source],
+    errors: List[diag.Diag],
+    warnings: List[diag.Diag],
+}
+
+fn main(root: Root) -> Int {
+    let err = root.stderr
+    let args = root.args()
+    let place = match where_am_i(root.fs, root.env) {
+        Ok(p) => p,
+        Err(m) => {
+            err.print("limen: " + m)
+            return 2
+        },
+    }
+    let cx = Ctx { out: root.stdout, err, fs: root.fs, place }
+    match args {
+        ["check", file] => check(cx, file),
+        ["caps", file] => caps_of(cx, file),
+        ["check", _, "--json"] | ["check", "--json", _] | ["caps", _, "--json"] | ["caps", "--json", _] => {
+            err.print("limen: --json is not in this compiler yet")
+            2
+        },
+        ["build", ..rest] => {
+            let mut file: Option[Str] = None
+            let mut target: Option[Str] = None
+            let mut emit_c = false
+            let mut tests = false
+            let mut i = 0
+            while i < rest.len() {
+                let a = rest[i]
+                if a == "-o" && i + 1 < rest.len() {
+                    target = Some(rest[i + 1])
+                    i = i + 2
+                    continue
+                }
+                if a == "--emit-c" {
+                    emit_c = true
+                } else if a == "--tests" {
+                    tests = true
+                } else if file.is_none() {
+                    file = Some(a)
+                } else {
+                    return die_usage(err, "bad build arguments")
+                }
+                i = i + 1
+            }
+            match file {
+                Some(f) => build(cx, root.exec, root.env, f, target, emit_c, tests),
+                None => die_usage(err, "build needs a FILE"),
+            }
+        },
+        [] | ["-h"] | ["--help"] | ["help"] => {
+            cx.out.write(usage())
+            0
+        },
+        _ => die_usage(err, ""),
+    }
+}
+
+// The working directory inside the Fs (from PWD).
+fn where_am_i(fs: Fs, env: Env) -> Result[disk.Place, Str] {
+    let base = match fs.full_path("") {
+        Ok(p) => p,
+        Err(e) => {
+            return Err("no directory granted: {e}")
+        },
+    }
+    let pwd = env.get("PWD") ?? base
+    let cwd = if pwd == base {
+        ""
+    } else if base == "/" && pwd.starts_with("/") {
+        pwd.slice(1, pwd.len())
+    } else if pwd.starts_with(base + "/") {
+        pwd.slice(base.len() + 1, pwd.len())
+    } else {
+        return Err("the working directory {pwd} is outside the granted directory {base}")
+    }
+    Ok(disk.Place { cwd, root: base })
+}
+
+// Load and check `file` as the OCaml compiler's Modules.load_and_check
+// does, with the capability checks.
+fn front(fs: Fs, place: disk.Place, file: Str) -> Front {
+    let std = sources.std()
+    let methods = std.get("methods.lmn") ?? ""
+    let p = loader.load(fs, std, place, file)
+    if !p.diags.is_empty() {
+        return Front { loaded: p, checked: None, files: p.files, errors: p.diags.filter(|d| !d.warning), warnings: p.diags.filter(|d| d.warning) }
+    }
+    let c = typecheck.check_program(p.items, p.files, p.next_id, methods, p.forwarders)
+    let files = p.files + [diag.Source { path: prelude.file_name(), text: prelude.text() }, diag.Source { path: prelude.methods_name(), text: methods }, diag.Source { path: "<std>/limen.toml", text: std.get("limen.toml") ?? "" }]
+    let diags = caps.check(fs, place, files, files.len() - 1, p.std_manifest, p.std_modules, p.manifest, p.packages, p.items, c)
+    Front { loaded: p, checked: Some(c), files, errors: diags.filter(|d| !d.warning), warnings: diags.filter(|d| d.warning) }
+}
+
+// Load `file`, saying what is wrong with it: the warnings, then (when
+// there are errors) the errors and their count, as bin/main.ml's `load`
+// and `report` print them. None when it cannot go on, with the exit code.
+fn load(err: Stderr, fs: Fs, place: disk.Place, file: Str) -> Result[Front, Int] {
+    if !fs.exists(place.locate(file)) {
+        err.print("limen: {file}: No such file or directory")
+        return Err(2)
+    }
+    let f = front(fs, place, file)
+    for d in f.warnings {
+        err.write(d.render(f.files) + "\n")
+    }
+    // with warnings and no errors, their count closes them, as `report`
+    // closes errors
+    if f.errors.is_empty() && !f.warnings.is_empty() {
+        err.print(count(f.warnings.len(), "warning"))
+    }
+    Ok(f)
+}
+
+// "1 error", "2 warnings"
+fn count(n: Int, what: Str) -> Str {
+    "{n} {what}{if n == 1 { "" } else { "s" }}"
+}
+
+// The errors, then their count, with the warnings `load` printed: "2
+// errors, 1 warning".
+fn report(err: Stderr, f: Front) {
+    for d in f.errors {
+        err.write(d.render(f.files) + "\n")
+    }
+    let w = f.warnings.len()
+    err.print(count(f.errors.len(), "error") + if w > 0 { ", " + count(w, "warning") } else { "" })
+}
+
+fn check(cx: Ctx, file: Str) -> Int {
+    let f = match load(cx.err, cx.fs, cx.place, file) {
+        Ok(f) => f,
+        Err(code) => {
+            return code
+        },
+    }
+    if !f.errors.is_empty() {
+        report(cx.err, f)
+        return 1
+    }
+    cx.out.print("ok")
+    for l in c_callers(f.loaded.items, f.loaded.packages) {
+        cx.out.print(l)
+    }
+    0
+}
+
+// Every part of the program that calls C, so it can be reviewed: C code
+// is outside every capability check. One line each.
+fn c_callers(items: List[ast.Item], packages: List[(Str, Str)]) -> List[Str] {
+    // module -> (libraries, trusted), newest module first as OCaml keeps it
+    let mut groups: List[(Str, (List[Str], Bool))] = []
+    for i in items {
+        match i {
+            IFn(d) => match d.foreign {
+                Some(fo) => {
+                    let m = match d.name.index_of(".") {
+                        Some(k) => d.name.slice(0, k),
+                        None => "",
+                    }
+                    let (libs, trusted) = match groups.find(|g| g.0 == m) {
+                        Some(g) => g.1,
+                        None => ([], fo.trusted),
+                    }
+                    let libs = if libs.contains(fo.lib) || fo.lib == "limen" { libs } else { libs + [fo.lib] }
+                    groups = [(m, (libs, trusted))] + groups.filter(|g| g.0 != m)
+                },
+                None => {},
+            },
+            _ => {},
+        }
+    }
+    groups.sort().map(|g| {
+        let (m, (libs, trusted)) = g
+        let who = if m == "" {
+            "the program itself (needs --grant foreign)"
+        } else if trusted {
+            "module `{m}` (standard library, trusted by src/std/limen.toml)"
+        } else {
+            match packages.find(|p| p.0 == m) {
+                Some(p) => "module `{m}` (dependency `{p.1}`, trusted in limen.toml [trust])",
+                None => "module `{m}` (the program's own, needs --grant foreign)",
+            }
+        }
+        "calls C: {who}: {libs.join(", ")}"
+    })
+}
+
+fn caps_of(cx: Ctx, file: Str) -> Int {
+    let out = cx.out
+    let f = match load(cx.err, cx.fs, cx.place, file) {
+        Ok(f) => f,
+        Err(code) => {
+            return code
+        },
+    }
+    if !f.errors.is_empty() {
+        report(cx.err, f)
+        return 1
+    }
+    let infos = match f.checked {
+        Some(c) => c.infos,
+        None => [],
+    }
+    let width = infos.fold(0, |w, i| w.max(i.name.len()))
+    for i in infos {
+        // a capability held through a struct or enum says where: `Net (via Client.net)`
+        let caps = i.caps.map(|c| match i.via.find(|v| v.0 == c) {
+            Some((_, p)) => "{c} (via {p})",
+            None => c,
+        })
+        let what = match (caps, i.callbacks) {
+            ([], false) => "pure",
+            ([], true) => "pure itself, runs callbacks",
+            (cs, cb) => cs.join(", ") + if cb { " + callbacks" } else { "" },
+        }
+        out.print(i.name + spaces(width - i.name.len()) + "  " + what)
+    }
+    // files read at compile time: changing one changes the program; the
+    // directories outside the package they may come from first
+    for (r, _, _) in f.loaded.manifest.map(|m| m.embed_roots) ?? [] {
+        out.print("embed root {r}")
+    }
+    for e in f.loaded.embedded {
+        out.print("embeds {e.path} ({e.size} bytes){if e.module == "" { "" } else { " in module " + e.module }}")
+    }
+    0
+}
+
+fn spaces(n: Int) -> Str {
+    (0..<n).map(|_| " ").join("")
+}
+
+// OCaml's Filename.remove_extension of Filename.basename.
+fn default_output(file: Str) -> Str {
+    let base = match file.last_index_of("/") {
+        Some(k) => file.slice(k + 1, file.len()),
+        None => file,
+    }
+    match base.last_index_of(".") {
+        Some(k) if k > 0 => base.slice(0, k),
+        _ => base,
+    }
+}
+
+fn build(cx: Ctx, exec: Exec, env: Env, file: Str, target: Option[Str], emit_c: Bool, tests: Bool) -> Int {
+    let (out, err, fs) = (cx.out, cx.err, cx.fs)
+    let f = match load(err, fs, cx.place, file) {
+        Ok(f) => f,
+        Err(code) => {
+            return code
+        },
+    }
+    if !f.errors.is_empty() {
+        report(err, f)
+        return 1
+    }
+    // a build records the C libraries of trusted dependencies in
+    // limen.lock; `check` and `caps` only read it
+    match f.loaded.manifest {
+        Some(m) => caps.record(fs, cx.place, m, f.loaded.items, f.loaded.packages),
+        None => {},
+    }
+    let has = |p: fn(ast.FnDecl) -> Bool| f.loaded.items.any(|i| match i {
+        IFn(d) => p(d),
+        _ => false,
+    })
+    if tests && !has(|d| d.test.is_some()) {
+        out.print("no tests")
+        return 0
+    }
+    if !tests && !has(|d| d.name == "main") {
+        err.print("error: no `main` function")
+        return 1
+    }
+    let c = match f.checked {
+        Some(c) => c,
+        None => {
+            return 1
+        },
+    }
+    let exe = target ?? default_output(file)
+    let c_text = c_source(c, f.files, sources.runtime(), tests)
+    if emit_c {
+        return match fs.write(cx.place.locate(exe + ".c"), c_text) {
+            Ok(_) => 0,
+            Err(e) => {
+                err.print("limen: cannot write {exe}.c: {e}")
+                2
+            },
+        }
+    }
+    let n = native.setting(env, cx.place)
+    let builder = native.Builder { setting: n, exec, fs }
+    match builder.build(c_text, sources.tls(), ffi.libs(c.items), exe) {
+        Ok(_) => {
+            n.remove_c(fs, exe)
+            0
+        },
+        Err(m) => {
+            err.write(m)
+            err.print("limen: the C compiler failed (this is a bug in limen)")
+            1
+        },
+    }
+}
+
+// The program's C, as Native.c_source makes it: lowered (as the test
+// binary, with `tests`), repeated pure calls reused, ownership placed,
+// then C generation.
+fn c_source(c: typecheck.Checked, files: List[diag.Source], runtime: Str, tests: Bool) -> Str {
+    let (prog, ro) = lower.lower_program(c.prelude, c.items, c.cx, c.state, tests)
+    cgen.program(ro, files, own.program(pure.cse(prog)), runtime)
+}

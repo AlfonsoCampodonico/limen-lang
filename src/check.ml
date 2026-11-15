@@ -415,7 +415,7 @@ let add_bounds fname env sp =
         | None -> ())
       bs
 
-(* The built-in methods written in Tessera that the program calls: only their
+(* The built-in methods written in Limen that the program calls: only their
    bodies are checked (and only they are compiled). *)
 let used_methods : (string, unit) Hashtbl.t = Hashtbl.create 16
 
@@ -959,7 +959,7 @@ and check_var ctx f e n sp =
         match List.find_opt (fun (a, _, _) -> a = n) ambient with
         | Some (_, cap, how) ->
           err ctx "E0302" sp
-            (sprintf "`%s` does not exist: Tessera has no ambient I/O" n)
+            (sprintf "`%s` does not exist: Limen has no ambient I/O" n)
             ~notes:
               [ sprintf "I/O goes through capabilities: take a `%s` parameter and call `%s`" cap how;
                 "in `main`, the capabilities live on `root`, for example `root.stdout.print(\"hi\")`" ];
@@ -1055,7 +1055,7 @@ and order_args ctx ~what ~sp names args =
           (fun m ->
             ok := false;
             err ctx "E0107" sp (sprintf "%s is missing the argument for parameter `%s`" what m)
-              ~notes:[ "every parameter must be passed; Tessera has no default values" ])
+              ~notes:[ "every parameter must be passed; Limen has no default values" ])
           !missing;
       if !ok then Some (List.map Option.get (Array.to_list slots)) else None
 
@@ -1343,7 +1343,7 @@ and builtin_method ctx t name file =
         (fun k -> match Hashtbl.find_opt method_owner k with Some (_, fl) -> fl = file | None -> false)
         (methods_named ctx suffix)
     in
-    (* the built-in methods written in Tessera (std/methods.tsr) *)
+    (* the built-in methods written in Limen (std/methods.lmn) *)
     if own = None && Hashtbl.mem ctx.fns suffix
        && (match Hashtbl.find_opt method_owner suffix with Some (_, fl) -> fl = Prelude.methods_file | None -> false)
     then (Hashtbl.replace used_methods suffix (); Some suffix)
@@ -2926,7 +2926,7 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
               (ps, match d.fn_ret with Some te -> resolve ctx env te | None -> TUnit)
             | Some _ -> (
               Hashtbl.replace foreign_fns d.fn_name ();
-              (* the Tessera type of a C function: Foreign first, Out parameters moved to the result *)
+              (* the Limen type of a C function: Foreign first, Out parameters moved to the result *)
               if d.fn_name = "main" then err ctx "E0330" d.fn_span "`main` cannot be a foreign function";
               match Ffi.of_decl ~structs:(Hashtbl.find_opt ctx.structs) d with
               | Ok cs -> (Ffi.visible_params cs, Ffi.result_ty cs)
@@ -2946,7 +2946,7 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
           Hashtbl.replace fn_cur_bounds d.fn_name all;
           Hashtbl.replace fn_kinds d.fn_name (List.of_seq (Hashtbl.to_seq param_kinds));
           take_pending all;
-          (* a clash with a built-in method written in Tessera is reported by check_self *)
+          (* a clash with a built-in method written in Limen is reported by check_self *)
           let builtin_clash = match Hashtbl.find_opt method_owner d.fn_name with Some (_, fl) -> fl = Prelude.methods_file | None -> false in
           if String.contains d.fn_name ':' && not builtin_clash then Hashtbl.replace method_owner d.fn_name (d.fn_pub, d.fn_span.file);
           if Hashtbl.mem ctx.fns d.fn_name then begin
@@ -3009,7 +3009,7 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
   in
   let builtin (d : fn_decl) = d.fn_span.file = Prelude.methods_file in
   List.iter (fun (d, s) -> if d.fn_foreign = None && not (builtin d) then check_one d s) sigs;
-  (* the built-in methods written in Tessera that were called, and those they call *)
+  (* the built-in methods written in Limen that were called, and those they call *)
   let checked = Hashtbl.create 16 in
   let rec more () =
     let todo = List.filter (fun ((d : fn_decl), _) -> builtin d && Hashtbl.mem used_methods d.fn_name && not (Hashtbl.mem checked d.fn_name)) sigs in

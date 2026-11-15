@@ -1,6 +1,0 @@
-// `use json` in json.tsr is the standard library's json, not this file
-use json
-
-fn main() {
-    let v = json.parse("1")
-}

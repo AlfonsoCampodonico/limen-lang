@@ -1,0 +1,33 @@
+// The phase 1 gate: main narrows its network grant to one host, hands it to
+// fetch_repos, and parsing stays pure.
+//
+//   limen run examples/repos.lmn --grant net=api.github.com
+//   limen caps examples/repos.lmn
+
+fn main(root: Root) -> Result[(), IoError] {
+    let gh = root.net.only("api.github.com:443")
+    let names = fetch_repos(gh, "rust-lang")?
+    root.stdout.print("{names.len()} repos")
+    for name in names.take(5) {
+        root.stdout.print("  {name}")
+    }
+    Ok(())
+}
+
+fn fetch_repos(net: Net, org: Str) -> Result[List[Str], IoError] {
+    let resp = net.get("https://api.github.com/orgs/{org}/repos?per_page=100")?
+    if resp.status != 200 {
+        return Err(Failed("GitHub answered {resp.status}"))
+    }
+    Ok(parse_names(resp.body))
+}
+
+// No capability parameters: this function cannot do I/O.
+fn parse_names(body: Str) -> List[Str] {
+    let mut names = []
+    for chunk in body.split("\"full_name\":").skip(1) {
+        let quoted = chunk.trim().split("\"")
+        names.push(quoted.get(1) ?? "?")
+    }
+    names
+}

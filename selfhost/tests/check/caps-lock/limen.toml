@@ -1,0 +1,15 @@
+# The dependencies trusted with C, and limen.lock with the libraries each
+# called when it was trusted (E0324). The dependencies live outside this
+# directory: checked on its own, a file under this limen.toml calls no C
+# from a dependency, and the OCaml checker would rewrite limen.lock to
+# say so.
+[package]
+name = "app"
+
+[dependencies]
+cl = { path = "../caps-lock-deps/cl" }
+same = { path = "../caps-lock-deps/same" }
+two = { path = "../caps-lock-deps/two" }
+
+[trust]
+foreign = ["cl", "same", "two"]

@@ -115,7 +115,7 @@ let max_headers = 1000
 
 let http_request (u : url) =
   let host = if u.port = (if u.https then 443 else 80) then u.host else sprintf "%s:%d" u.host u.port in
-  sprintf "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: tessera\r\nAccept: */*\r\nConnection: close\r\n\r\n" u.path host
+  sprintf "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: limen\r\nAccept: */*\r\nConnection: close\r\n\r\n" u.path host
 
 let trim_sp s =
   let n = String.length s in
@@ -150,7 +150,7 @@ let dechunk data =
 
 (* (status, headers in order, body) *)
 (* The error text of a TLS stream that ended without the peer's close
-   message (VTLS_CUT_MSG in runtime/tessera_tls.h). *)
+   message (VTLS_CUT_MSG in runtime/limen_tls.h). *)
 let tls_cut = "tls: the connection was closed without a TLS close message, so the data may be cut short"
 
 (* [cut]: the stream ended that way, so a body that runs until the close may
@@ -325,7 +325,7 @@ let remove fs rel : (unit, ioerr) result =
 
 (* A file's modification time in milliseconds (following links), as the
    native runtime has it; -1 when it cannot be read. *)
-external mtime_ms : string -> int = "tessera_mtime_ms"
+external mtime_ms : string -> int = "limen_mtime_ms"
 
 (* Size, modification time and kind of [rel], following links:
    (size, modified_ms, is_file, is_dir). *)
@@ -361,7 +361,7 @@ let make_dir fs rel : (unit, ioerr) result =
 (* ---------- test directories ----------
    A test that takes `fs: Fs` gets a fresh directory, removed afterwards. *)
 
-let test_dir () = Unix.realpath (Filename.temp_dir "tessera-test-" "")
+let test_dir () = Unix.realpath (Filename.temp_dir "limen-test-" "")
 
 let rec remove_tree p =
   match Unix.lstat p with

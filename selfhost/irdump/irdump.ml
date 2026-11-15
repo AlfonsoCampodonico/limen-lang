@@ -1,10 +1,10 @@
-(* Print the IR the OCaml backend makes of FILE, as selfhost/lowered.tsr
-   prints the Tessera one's, so the two can be compared: what
+(* Print the IR the OCaml backend makes of FILE, as selfhost/lowered.lmn
+   prints the Limen one's, so the two can be compared: what
    Native.c_source hands to C generation (Lower.lower_program, then
    Pure.cse, then Own.program), with what C generation decides about it
    (Pure.analyse and Pure.plan, and per loop what Hoist finds, as
-   Cgen.stmt asks). The program as `tessera build` compiles it comes under
-   `== build` when it has a `main`, and as `tessera test` compiles it under
+   Cgen.stmt asks). The program as `limen build` compiles it comes under
+   `== build` when it has a `main`, and as `limen test` compiles it under
    `== test` when it has tests or benchmarks. A program that does not load
    or check prints its errors instead, one `ERROR CODE FILE LO HI` line
    each.
@@ -16,7 +16,7 @@
    calls kept across it, the lists made unique before it, and whether it is
    a fill loop or versioned; a statement whose call is kept says which
    slot. *)
-open Tessera
+open Limen
 open Ir
 
 let show = Types.show

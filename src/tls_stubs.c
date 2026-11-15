@@ -1,6 +1,6 @@
 /* The interpreter's TLS: thin OCaml bindings over the core the native
-   runtime uses (runtime/tessera_tls.h), so both backends verify, fail and
-   word their errors the same way. Without TESSERA_TLS (OpenSSL not found at
+   runtime uses (runtime/limen_tls.h), so both backends verify, fail and
+   word their errors the same way. Without LIMEN_TLS (OpenSSL not found at
    build time) every entry point fails with the same message the native
    runtime gives. */
 #include <caml/mlvalues.h>
@@ -10,10 +10,10 @@
 #include <caml/custom.h>
 #include <string.h>
 
-#define NO_TLS "tls: tessera was built without TLS (OpenSSL was not found when it was compiled)"
+#define NO_TLS "tls: limen was built without TLS (OpenSSL was not found when it was compiled)"
 
-#ifdef TESSERA_TLS
-#include "runtime/tessera_tls.h"
+#ifdef LIMEN_TLS
+#include "runtime/limen_tls.h"
 
 /* A session or a server context in a custom block; freed at most once,
    by close/free or else by the GC. */
@@ -22,10 +22,10 @@
 
 static void tls_finalize(value v) { vtls_free(Tls_val(v)); Tls_val(v) = NULL; }
 static void ctx_finalize(value v) { if (Ctx_val(v)) SSL_CTX_free(Ctx_val(v)); Ctx_val(v) = NULL; }
-static struct custom_operations tls_ops = { "tessera.tls", tls_finalize, custom_compare_default, custom_hash_default,
+static struct custom_operations tls_ops = { "limen.tls", tls_finalize, custom_compare_default, custom_hash_default,
                                             custom_serialize_default, custom_deserialize_default,
                                             custom_compare_ext_default, custom_fixed_length_default };
-static struct custom_operations ctx_ops = { "tessera.tls_ctx", ctx_finalize, custom_compare_default, custom_hash_default,
+static struct custom_operations ctx_ops = { "limen.tls_ctx", ctx_finalize, custom_compare_default, custom_hash_default,
                                             custom_serialize_default, custom_deserialize_default,
                                             custom_compare_ext_default, custom_fixed_length_default };
 
@@ -36,7 +36,7 @@ static value wrap_tls(VTls *t) {
 }
 
 /* client : Unix.file_descr -> string -> t   (raises Failure msg) */
-value tessera_tls_client(value fd, value host) {
+value limen_tls_client(value fd, value host) {
   CAMLparam2(fd, host);
   char err[300];
   VTls *t = vtls_client(Int_val(fd), String_val(host), err, sizeof err);
@@ -45,7 +45,7 @@ value tessera_tls_client(value fd, value host) {
 }
 
 /* server_ctx : string -> string -> ctx   (raises Failure msg) */
-value tessera_tls_server_ctx(value cert, value key) {
+value limen_tls_server_ctx(value cert, value key) {
   CAMLparam2(cert, key);
   CAMLlocal1(v);
   char err[300];
@@ -57,7 +57,7 @@ value tessera_tls_server_ctx(value cert, value key) {
 }
 
 /* server : ctx -> Unix.file_descr -> t   (raises Failure msg) */
-value tessera_tls_server(value ctx, value fd) {
+value limen_tls_server(value ctx, value fd) {
   CAMLparam2(ctx, fd);
   char err[300];
   if (!Ctx_val(ctx)) caml_failwith("tls: the listener is closed");
@@ -71,7 +71,7 @@ value tessera_tls_server(value ctx, value fd) {
    bytes (or 0), -1 want read, -2 want write; raises Failure on an error.
    The call never blocks, so the OCaml runtime lock stays held and buf
    cannot move during it. */
-value tessera_tls_step(value t, value op, value buf, value off, value len) {
+value limen_tls_step(value t, value op, value buf, value off, value len) {
   CAMLparam5(t, op, buf, off, len);
   char err[300];
   VTls *s = Tls_val(t);
@@ -82,29 +82,29 @@ value tessera_tls_step(value t, value op, value buf, value off, value len) {
 }
 
 /* close : t -> unit   sends close_notify and frees the session */
-value tessera_tls_close(value t) {
+value limen_tls_close(value t) {
   CAMLparam1(t);
   VTls *s = Tls_val(t);
   if (s) { vtls_close_notify(s); vtls_free(s); Tls_val(t) = NULL; }
   CAMLreturn(Val_unit);
 }
 
-value tessera_tls_ctx_free(value c) {
+value limen_tls_ctx_free(value c) {
   CAMLparam1(c);
   if (Ctx_val(c)) { SSL_CTX_free(Ctx_val(c)); Ctx_val(c) = NULL; }
   CAMLreturn(Val_unit);
 }
 
-value tessera_tls_available(value u) { (void)u; return Val_true; }
+value limen_tls_available(value u) { (void)u; return Val_true; }
 
 #else
 
-value tessera_tls_client(value fd, value host) { (void)fd; (void)host; caml_failwith(NO_TLS); }
-value tessera_tls_server_ctx(value c, value k) { (void)c; (void)k; caml_failwith(NO_TLS); }
-value tessera_tls_server(value c, value fd) { (void)c; (void)fd; caml_failwith(NO_TLS); }
-value tessera_tls_step(value t, value op, value b, value o, value l) { (void)t; (void)op; (void)b; (void)o; (void)l; caml_failwith(NO_TLS); }
-value tessera_tls_close(value t) { (void)t; return Val_unit; }
-value tessera_tls_ctx_free(value c) { (void)c; return Val_unit; }
-value tessera_tls_available(value u) { (void)u; return Val_false; }
+value limen_tls_client(value fd, value host) { (void)fd; (void)host; caml_failwith(NO_TLS); }
+value limen_tls_server_ctx(value c, value k) { (void)c; (void)k; caml_failwith(NO_TLS); }
+value limen_tls_server(value c, value fd) { (void)c; (void)fd; caml_failwith(NO_TLS); }
+value limen_tls_step(value t, value op, value b, value o, value l) { (void)t; (void)op; (void)b; (void)o; (void)l; caml_failwith(NO_TLS); }
+value limen_tls_close(value t) { (void)t; return Val_unit; }
+value limen_tls_ctx_free(value c) { (void)c; return Val_unit; }
+value limen_tls_available(value u) { (void)u; return Val_false; }
 
 #endif

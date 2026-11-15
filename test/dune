@@ -1,25 +1,25 @@
 (test
- (name test_tessera)
- (libraries tessera unix)
+ (name test_limen)
+ (libraries limen unix)
  (deps
   ../bin/main.exe
   ffi_test.c
-  (glob_files %{project_root}/examples/*.tsr)
-  (glob_files %{project_root}/bench/*.tsr)
-  (glob_files %{project_root}/selfhost/*.tsr)
+  (glob_files %{project_root}/examples/*.lmn)
+  (glob_files %{project_root}/bench/*.lmn)
+  (glob_files %{project_root}/selfhost/*.lmn)
   (glob_files tls/*.pem)
   (glob_files tls/*.py)
   (glob_files compressed/*)
   (source_tree zoneinfo)))
 
-; `tessera lsp` end to end over stdio.
+; `limen lsp` end to end over stdio.
 (rule
  (alias runtest)
  (deps lsp_stdio.py %{exe:../bin/main.exe})
  (action
   (run python3 lsp_stdio.py %{exe:../bin/main.exe})))
 
-; `tessera mcp` end to end over stdio.
+; `limen mcp` end to end over stdio.
 (rule
  (alias runtest)
  (deps mcp_stdio.py %{exe:../bin/main.exe})

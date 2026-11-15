@@ -1,0 +1,292 @@
+// The IR as text, with what C generation will decide about it, so the
+// Limen and OCaml backends can be compared: selfhost/irdump prints the
+// OCaml compiler's in the same format.
+//
+// The program's entry points, its libraries and its pure functions come
+// first, then each function: a header, then one statement per line,
+// indented by nesting. A variable is `name#id` (with its type where it is
+// made), a span `@file:lo-hi`. A loop shows what C generation does with
+// it: the slots of the pure calls kept across it (`slots`), the lists made
+// unique before it (`unique`), and whether it is a fill loop or versioned;
+// a statement whose call is kept says which slot (`kept`).
+use ast
+use ast_print
+use diag
+use ffi
+use floats
+use hoist
+use types
+use ir
+use lower
+use pure
+
+// What the statements are printed with: the files spans name, the
+// function's plan, and the lists already unique in the loops around.
+struct Printer {
+    files: List[diag.Source],
+    plan: pure.Plan,
+    // the loops seen so far in the function, to find each one's slots
+    loops: Int,
+    uniq: List[Int],
+}
+
+fn show(t: types.Ty) -> Str {
+    lower.show(t)
+}
+
+fn span(self: Printer, sp: ast.Span) -> Str {
+    "@{diag.path_of(self.files, sp.file)}:{sp.lo}-{sp.hi}"
+}
+
+fn var(v: ir.Var) -> Str {
+    "{v.name}#{v.id}"
+}
+
+fn var_decl(v: ir.Var) -> Str {
+    "{var(v)}: {show(v.ty)}"
+}
+
+fn atom(a: ir.Atom) -> Str {
+    match a {
+        V(v) => var(v),
+        VDup(v) => "dup " + var(v),
+        AInt(n) => "{n}",
+        AFloat(x) => floats.hex(x),
+        ABool(b) => "{b}",
+        AUnit => "()",
+        AStr(s) => "\"" + ast_print.escaped(s) + "\"",
+    }
+}
+
+fn atoms(xs: List[ir.Atom]) -> Str {
+    xs.map(atom).join(", ")
+}
+
+fn types_of(ts: List[types.Ty]) -> Str {
+    ts.map(show).join(", ")
+}
+
+fn step(self: Printer, s: ir.Step) -> Str {
+    match s {
+        PField(k) => ".{k}",
+        PIndex(a, sp) => "[{atom(a)} {self.span(sp)}]",
+        PIndexU(a) => "[{atom(a)} unchecked]",
+        PKey(a, sp) => "\{{atom(a)} {self.span(sp)}}",
+    }
+}
+
+fn steps(self: Printer, ss: List[ir.Step]) -> Str {
+    ss.map(|s| self.step(s)).join("")
+}
+
+fn cty(c: ffi.CTy) -> Str {
+    match c {
+        Int => "Int",
+        Int32 => "Int32",
+        Float => "Float",
+        Bool => "Bool",
+        Str => "Str",
+        Bytes => "Bytes",
+        Handle => "Handle",
+        Unit => "Unit",
+        Struct(n, fs) => "Struct({n}\{" + fs.map(|f| f.0 + ":" + cty(f.1)).join(",") + "})",
+        Fn(ps, r) => "Fn(" + ps.map(cty).join(",") + ")->" + cty(r),
+    }
+}
+
+fn csig(s: ffi.CSig) -> Str {
+    let fixed = match s.fixed {
+        Some(k) => "{k}",
+        None => "-",
+    }
+    let ps = s.params.map(|p| p.name + ":" + cty(p.cty) + if p.out { " out" } else { "" }).join(", ")
+    "{s.lib} {s.sym} trusted={s.trusted} fixed={fixed} ({ps}) -> {cty(s.ret)}"
+}
+
+fn ipart(p: ir.IPart) -> Str {
+    match p {
+        IStr(s) => "\"" + ast_print.escaped(s) + "\"",
+        IVal(a, t) => "val {atom(a)}: {show(t)}",
+        IValQ(a, t) => "valq {atom(a)}: {show(t)}",
+    }
+}
+
+fn sel(o: ir.Sel) -> Str {
+    match o {
+        SRecv(c, t, g) => "recv {atom(c)}: {show(t)} if {atom(g)}",
+        SSend(c, v, t, g) => "send {atom(c)} {atom(v)}: {show(t)} if {atom(g)}",
+        SAfter(c, ms, g) => "after {atom(c)} {atom(ms)} if {atom(g)}",
+    }
+}
+
+fn rhs(self: Printer, r: ir.Rhs) -> Str {
+    match r {
+        Use(a) => atom(a),
+        Bin(op, t, a, b, sp) => "bin {ast_print.op(op)} {show(t)} {atom(a)}, {atom(b)} {self.span(sp)}",
+        Negate(t, a) => "neg {show(t)} {atom(a)}",
+        Flip(a) => "not {atom(a)}",
+        Call(f, args) => "call {f}({atoms(args)})",
+        CallClo(c, args) => "callclo {atom(c)}({atoms(args)})",
+        Prim(n, t, args, sp) => "prim {n} {show(t)}({atoms(args)}) {self.span(sp)}",
+        MkStruct(t, xs) => "struct {show(t)}({atoms(xs)})",
+        MkEnum(t, k, xs) => "enum {show(t)} #{k}({atoms(xs)})",
+        MkList(t, xs) => "list {show(t)}[{atoms(xs)}]",
+        MkClosure(f, t, xs) => "closure {f} {show(t)}({atoms(xs)})",
+        Get(a, t, ss) => "get {atom(a)}: {show(t)} {self.steps(ss)}",
+        Payload(a, t, tag, k) => "payload {atom(a)}: {show(t)} #{tag}.{k}",
+        IsTag(a, t, tag) => "istag {atom(a)}: {show(t)} #{tag}",
+        PatTest(a, t, p) => "pattest {atom(a)}: {show(t)} {ast_print.pat(p)}",
+        Format(ps) => "interp[" + ps.map(ipart).join(", ") + "]",
+        RootField(a, n) => "rootfield {atom(a)}.{n}",
+        Panic(a, sp) => "panic {atom(a)} {self.span(sp)}",
+        GroupNew(dl, il) => {
+            let until = match dl {
+                Some((c, ms)) => " until {atom(c)} {atom(ms)}",
+                None => "",
+            }
+            "groupnew interleaved={il}{until}"
+        },
+        Spawn(g, c, t, keep) => "spawn {atom(g)} {atom(c)}: {show(t)} keep={keep}",
+        GroupJoin(g, t, dl) => "groupjoin {atom(g)}: {show(t)} deadline={dl}",
+        ChanNew(t, cap, sp) => "channew {show(t)} {atom(cap)} {self.span(sp)}",
+        ChanSend(c, v, sp) => "chansend {atom(c)} {atom(v)} {self.span(sp)}",
+        MkDyn(t, key, a, ms) => {
+            let entries = ms.map(|m| "{m.fname}({types_of(m.params)}) -> {show(m.ret)}").join(", ")
+            "dyn {show(t)} {key} {atom(a)} [{entries}]"
+        },
+        Select(n, ops, dflt, sp) => "select {n} [" + ops.map(sel).join("; ") + "] default={dflt} {self.span(sp)}",
+        SelGot(n, i, t) => "selgot {n} {i}: {show(t)}",
+        Catch(c, t) => "catch {atom(c)}: {show(t)}",
+        CallDyn(k, ps, rt, recv, args) => "calldyn #{k} ({types_of(ps)}) -> {show(rt)} {atom(recv)}({atoms(args)})",
+        CallC(s, args, cbs, sp) => {
+            let callbacks = cbs.map(|c| "{c.cname} {c.name} {self.span(c.span)} foreign={c.takes_foreign}").join("; ")
+            "callc {csig(s)} ({atoms(args)}) [{callbacks}] {self.span(sp)}"
+        },
+    }
+}
+
+fn mutation(m: ir.Mutation) -> Str {
+    match m {
+        MSet(a) => "= {atom(a)}",
+        MPush(a) => "push {atom(a)}",
+        MPut(k, v) => "put {atom(k)} {atom(v)}",
+        MRemove(k) => "remove {atom(k)}",
+    }
+}
+
+fn kept(self: Printer, v: ir.Var) -> Str {
+    match self.plan.kept.get(v.id) {
+        Some(sl) => " kept k{sl.sid}",
+        None => "",
+    }
+}
+
+fn block(self: Printer, out: List[Str], ind: Str, ss: List[ir.Stmt]) -> (List[Str], Printer) {
+    let mut out = out
+    let mut pr = self
+    for s in ss {
+        (out, pr) = pr.stmt(out, ind, s)
+    }
+    (out, pr)
+}
+
+fn stmt(self: Printer, out: List[Str], ind: Str, s: ir.Stmt) -> (List[Str], Printer) {
+    let mut out = out
+    let mut pr = self
+    let deeper = ind + "  "
+    match s {
+        Let(v, r) => out.push(ind + "let {var_decl(v)} = {pr.rhs(r)}{pr.kept(v)}"),
+        Decl(v) => out.push(ind + "decl {var_decl(v)}"),
+        Init(v, r) => out.push(ind + "init {var(v)} = {pr.rhs(r)}{pr.kept(v)}"),
+        Set(v, r, release) => out.push(ind + "set {var(v)} = {pr.rhs(r)} release={release}"),
+        Mutate(v, ss, m) => out.push(ind + "mutate {var(v)}{pr.steps(ss)} {mutation(m)}"),
+        If(c, a, b) => {
+            out.push(ind + "if {atom(c)}")
+            (out, pr) = pr.block(out, deeper, a)
+            if !b.is_empty() {
+                out.push(ind + "else")
+                (out, pr) = pr.block(out, deeper, b)
+            }
+        },
+        Loop(body) => {
+            let mut line = ind + "loop"
+            match pr.plan.at_loop.get(pr.loops) {
+                Some(slots) => {
+                    line = line + " slots[" + slots.map(|sl| "k{sl.sid}: {show(sl.ty)}").join(", ") + "]"
+                },
+                None => {},
+            }
+            pr.loops = pr.loops + 1
+            // as C generation does: lists unique already are not hoisted again
+            let saved = pr.uniq
+            let hoisted = hoist.mutated_lists(body).filter(|v| !saved.contains(v.id) && !hoist.escapes(v, body))
+            if !hoisted.is_empty() {
+                line = line + " unique[" + hoisted.map(var).join(", ") + "]"
+            }
+            pr.uniq = hoisted.map(|v| v.id) + saved
+            match hoist.fill_loop(body) {
+                Some(f) => {
+                    line = line + " fill({var(f.i)} {if f.inclusive { "<=" } else { "<" }} {atom(f.n)} push {var(f.v)} {atom(f.x)})"
+                },
+                None => match hoist.versionable(body) {
+                    Some(vs) => {
+                        line = line + " versioned({var(vs.m)} {if vs.inclusive { "<=" } else { "<" }} {atom(vs.n)} step {atom(vs.step)} lists {vs.lists.map(var).join(", ")})"
+                    },
+                    None => {},
+                },
+            }
+            out.push(line)
+            (out, pr) = pr.block(out, deeper, body)
+            pr.uniq = saved
+        },
+        Break => out.push(ind + "break"),
+        Continue => out.push(ind + "continue"),
+        Return(a) => out.push(ind + "return {atom(a)}"),
+        Drop(v) => out.push(ind + "drop {var(v)}"),
+        Guard(n, h, b) => {
+            out.push(ind + "guard {n}")
+            out.push(ind + "handler")
+            (out, pr) = pr.block(out, deeper, h)
+            out.push(ind + "body")
+            (out, pr) = pr.block(out, deeper, b)
+        },
+        GuardEnd(n) => out.push(ind + "guardend {n}"),
+        Scope(g, b) => {
+            out.push(ind + "scope {atom(g)}")
+            (out, pr) = pr.block(out, deeper, b)
+        },
+    }
+    (out, pr)
+}
+
+fn test_line(kind: Str, t: ir.Test) -> Str {
+    "{kind} {t.cname} [{t.fields.join(",")}]" + if kind == "test" { " virtual={t.virtual}" } else { "" }
+}
+
+// The program, as lines: `libs` are the libraries it links.
+pub fn program(files: List[diag.Source], p: ir.Program, libs: List[Str]) -> List[Str] {
+    let mut out: List[Str] = []
+    out.push("main {p.main} root={p.main_takes_root} ret={show(p.main_ret)}")
+    for t in p.tests {
+        out.push(test_line("test", t))
+    }
+    for t in p.benches {
+        out.push(test_line("bench", t))
+    }
+    out.push("libs [{libs.join(",")}]")
+    let pure_fns = pure.analyse(p)
+    for name in pure_fns.keys().sort() {
+        out.push("pure {name} heavy={pure_fns[name]}")
+    }
+    let mut slot = 0
+    for f in p.fns {
+        let (plan, next) = pure.plan(pure_fns, f, slot)
+        slot = next
+        let caps = if f.captures.is_empty() { "" } else { " captures(" + f.captures.map(var_decl).join(", ") + ")" }
+        out.push("fn {f.fname}({f.params.map(var_decl).join(", ")}) -> {show(f.ret)}{if f.is_closure { " closure" } else { "" }}{caps}")
+        let pr = Printer { files, plan, loops: 0, uniq: [] }
+        let (lines, _) = pr.block(out, "  ", f.body)
+        out = lines
+    }
+    out
+}

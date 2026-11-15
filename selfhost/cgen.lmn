@@ -1,0 +1,2870 @@
+// The IR as C, as src/cgen.ml writes it: `limen build --emit-c` gives
+// the same text byte for byte. Value types (Int, Float, Bool, (), structs,
+// enums that do not contain themselves, arrays) are C values; Str, List,
+// Map, closures, capabilities and enums that contain themselves are
+// reference-counted pointers. Every composite type gets generated
+// dup/drop/eq/show functions named <CName>_dup and so on.
+//
+// The OCaml generator keeps a mutable context: naming a type for the first
+// time gives it the next number (T0, T1, ...) and queues its definition, a
+// string literal gets the next `litN`, and so on. Here the context is one
+// value, `Cg`, threaded through every step, and every function that can
+// name something returns the context with what it named. The numbers
+// depend on the order things are first named in, so this follows OCaml's
+// order of evaluation where it matters: OCaml evaluates the arguments of
+// a call, and so of a `sprintf`, from right to left.
+use ast
+use diag
+use exhaust
+use ffi
+use floats
+use hoist
+use intset
+use ir
+use lower
+use pure
+use types
+
+// The first line of the C of a program that may use TLS (Net.get,
+// Net.connect_tls, Listen.on_tls): the build then links OpenSSL and pastes
+// the TLS core in ahead of the runtime.
+pub fn tls_marker() -> Str {
+    "/* limen: uses tls */\n"
+}
+
+// A `dyn` vtable to define: its key, the boxed type, its methods.
+struct DynBox {
+    key: Str,
+    ty: types.Ty,
+    methods: List[ir.DynEntry],
+}
+
+// A C struct passed by value to a foreign function: its Limen name, its
+// C typedef name (VFS<n>) and its fields.
+struct CStruct {
+    name: Str,
+    cname: Str,
+    fields: List[(Str, ffi.CTy)],
+}
+
+// A callback wrapper C calls: the Limen function's C name, whether it
+// takes a Foreign first, its parameters and result at the boundary, the
+// wrapper's name, the Limen name and where it is declared.
+struct Wrapper {
+    fname: Str,
+    takes_foreign: Bool,
+    params: List[ffi.CTy],
+    ret: ffi.CTy,
+    name: Str,
+    vname: Str,
+    span: ast.Span,
+}
+
+struct Cg {
+    ro: lower.Ro,
+    files: List[diag.Source],
+    // where each line of each file starts, for `file:line:col`
+    starts: List[List[Int]],
+    // show(t) -> C name
+    names: Map[Str, Str],
+    // composite types, in the order their names were finished
+    types: List[types.Ty],
+    lits: Map[Str, Str],
+    lit_order: List[(Str, Str)],
+    // C names of enums that contain themselves, boxed behind a pointer
+    boxed: List[Str],
+    // lists known unique inside the current loop
+    uniq: List[Int],
+    // result types of spawned tasks
+    task_tys: List[types.Ty],
+    // (list var, index var): the index is proven in range
+    inrange: List[(Int, Int)],
+    // element types of channels
+    chan_tys: List[types.Ty],
+    dyns: List[DynBox],
+    // types of owned locals, which need a drop-through-pointer function
+    cell_tys: List[types.Ty],
+    // composite types that need a <CName>_cmp order function
+    cmp_tys: List[types.Ty],
+    // list types that need <CName>_sort
+    sort_tys: List[types.Ty],
+    // composite map key types that need <CName>_hash
+    hash_tys: List[types.Ty],
+    // C functions that foreign calls name
+    csyms: List[Str],
+    cstructs: List[CStruct],
+    wrappers: List[Wrapper],
+    // variables of the current function a `defer` needs volatile: a panic
+    // longjmps back into the function, and the deferred body (and the
+    // cleanups after it) must see their latest values and owned flags
+    vols: List[Int],
+    pure: Map[Str, Bool],
+    // pure calls the current function keeps across a loop
+    plan: pure.Plan,
+    // the last slot number given, in the whole program
+    slot: Int,
+    // the loops of the current function met so far, in the order the
+    // planner numbers them, and those whose slots are being written
+    loops: Int,
+    slotted: List[Int],
+    // the deadline scopes written so far, in the whole program
+    scopes: Int,
+    tls: Bool,
+    // the C of the function bodies, in pieces
+    out: List[Str],
+}
+
+fn show(t: types.Ty) -> Str {
+    lower.show(t)
+}
+
+fn is_scalar(t: types.Ty) -> Bool {
+    match t {
+        TInt | TFloat | TBool | TUnit => true,
+        _ => false,
+    }
+}
+
+fn is_enum(self: Cg, t: types.Ty) -> Bool {
+    match t {
+        TNamed(n, _) => self.ro.enums.contains(n),
+        _ => false,
+    }
+}
+
+fn fields_of(self: Cg, t: types.Ty) -> List[(Str, types.Ty)] {
+    lower.field_types(self.ro, t)
+}
+
+fn variants_of(self: Cg, t: types.Ty) -> List[(Str, List[types.Ty])] {
+    lower.variants(self.ro, t)
+}
+
+// The types a struct's fields or an enum's payloads hold.
+fn parts(self: Cg, t: types.Ty) -> List[types.Ty] {
+    if self.is_enum(t) {
+        self.variants_of(t).flat_map(|v| v.1)
+    } else {
+        self.fields_of(t).map(|f| f.1)
+    }
+}
+
+// The C name of a type. A composite type is numbered the first time it is
+// named, and the types inside it are named next, so they get definitions
+// too; it joins `types` after them.
+fn cname(self: Cg, t: types.Ty) -> (Str, Cg) {
+    let mut c = self
+    match t {
+        TInt => ("Int", c),
+        TFloat => ("Float", c),
+        TBool => ("Bool", c),
+        TUnit => ("Unit", c),
+        TStr => ("Str", c),
+        TBytes => ("Bytes", c),
+        TFn(ps, r) => {
+            for p in ps {
+                (_, c) = c.cname(p)
+            }
+            (_, c) = c.cname(r)
+            ("Clo", c)
+        },
+        TCap(_) => ("Cap", c),
+        TDyn(..) => ("Dyn", c),
+        TGroup(a) => {
+            (_, c) = c.cname(a)
+            ("Group", c)
+        },
+        TChan(a) => {
+            (_, c) = c.cname(a)
+            if !c.chan_tys.contains(a) {
+                c.chan_tys.push(a)
+            }
+            ("Chan", c)
+        },
+        TList(TInt) => ("L_Int", c),
+        TList(TStr) => ("L_Str", c),
+        TList(_) | TNamed(..) | TArray(..) | TMap(..) => {
+            let k = show(t)
+            match c.names.get(k) {
+                Some(n) => {
+                    return (n, c)
+                },
+                None => {},
+            }
+            let n = "T{c.names.len()}"
+            c.names[k] = n
+            let inside = match t {
+                TList(e) | TArray(e, _) => [e],
+                TMap(kt, vt) => [kt, vt],
+                _ => c.parts(t),
+            }
+            for e in inside {
+                (_, c) = c.cname(e)
+            }
+            c.types.push(t)
+            (n, c)
+        },
+        _ => panic("cgen: non-concrete type " + show(t)),
+    }
+}
+
+// The C type of a value of type `t`.
+fn ctype(self: Cg, t: types.Ty) -> (Str, Cg) {
+    match t {
+        TInt => ("int64_t", self),
+        TFloat => ("double", self),
+        TBool => ("bool", self),
+        TUnit => ("W_Unit", self),
+        TStr | TBytes => ("WStr*", self),
+        TFn(..) => ("WClo*", self),
+        TDyn(..) => ("WDyn*", self),
+        TCap(_) => ("WCap*", self),
+        TGroup(_) => ("WGroup*", self),
+        TChan(_) => ("WChan*", self),
+        TList(_) | TMap(..) => {
+            let (n, c) = self.cname(t)
+            (n + "*", c)
+        },
+        // structs, enums and arrays are C values
+        _ => self.cname(t),
+    }
+}
+
+// Whether `t` has the C name of one of `ts`: types with the same C name
+// share their generated functions (every closure type is `Clo`).
+fn named_in(self: Cg, ts: List[types.Ty], t: types.Ty) -> (Bool, Cg) {
+    let mut c = self
+    for u in ts {
+        let (b, c1) = c.cname(t)
+        let (a, c2) = c1.cname(u)
+        c = c2
+        if a == b {
+            return (true, c)
+        }
+    }
+    (false, c)
+}
+
+// ---------- literals ----------
+
+// `s` as a C string literal: printable ASCII as itself, every other byte
+// (and `"`, `\`, `?`, which would start a trigraph) in octal.
+pub fn c_string(s: Str) -> Str {
+    let bs = s.bytes()
+    let mut parts: List[Str] = ["\""]
+    let mut start = 0
+    let mut i = 0
+    let n = bs.len()
+    while i < n {
+        let b = bs[i]
+        if b < 32 || b >= 127 || b == 34 || b == 92 || b == 63 {
+            if start < i {
+                parts.push(s.slice(start, i))
+            }
+            parts.push("\\{b / 64}{b / 8 % 8}{b % 8}")
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start < n {
+        parts.push(s.slice(start, n))
+    }
+    parts.push("\"")
+    parts.join("")
+}
+
+fn lit(self: Cg, s: Str) -> (Str, Cg) {
+    match self.lits.get(s) {
+        Some(n) => (n, self),
+        None => {
+            let mut c = self
+            let n = "lit{c.lits.len()}"
+            c.lits[s] = n
+            c.lit_order.push((n, s))
+            (n, c)
+        },
+    }
+}
+
+// Where each line of `text` starts.
+fn line_starts(text: Str) -> List[Int] {
+    let mut starts = [0]
+    for (i, b) in text.bytes().with_index() {
+        if b == 10 {
+            starts.push(i + 1)
+        }
+    }
+    starts
+}
+
+// The line and column of offset `off` in file `file`, as Source.line_col
+// counts them; a file with no text is all one line.
+fn line_col(self: Cg, file: Int, off: Int) -> (Int, Int) {
+    let st = match self.starts.get(file) {
+        Some(st) => st,
+        None => {
+            return (1, off + 1)
+        },
+    }
+    let o = off.min(self.files[file].text.len())
+    // the last line starting at or before o
+    let mut lo = 0
+    let mut hi = st.len() - 1
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2
+        if st[mid] <= o {
+            lo = mid
+        } else {
+            hi = mid - 1
+        }
+    }
+    (lo + 1, o - st[lo] + 1)
+}
+
+// `"file:line:col"`, the place a panic reports.
+fn where(self: Cg, sp: ast.Span) -> Str {
+    let (l, col) = self.line_col(sp.file, sp.lo)
+    c_string("{diag.path_of(self.files, sp.file)}:{l}:{col}")
+}
+
+fn var(v: ir.Var) -> Str {
+    "v{v.id}"
+}
+
+fn float_lit(x: Float) -> Str {
+    // NaN is the one value unequal to itself, and an infinity minus itself
+    // is NaN
+    if x != x {
+        "NAN"
+    } else if x - x != 0.0 {
+        if x > 0.0 { "INFINITY" } else { "(-INFINITY)" }
+    } else {
+        floats.hex(x)
+    }
+}
+
+fn int_lit(n: Int) -> Str {
+    if n == -9223372036854775807 - 1 { "INT64_MIN" } else { "INT64_C({n})" }
+}
+
+fn atom(self: Cg, a: ir.Atom) -> (Str, Cg) {
+    match a {
+        V(v) => (var(v), self),
+        VDup(v) => self.dup_of(v.ty, var(v)),
+        AInt(n) => (int_lit(n), self),
+        AFloat(x) => (float_lit(x), self),
+        ABool(b) => (if b { "true" } else { "false" }, self),
+        AUnit => ("0", self),
+        AStr(s) => {
+            let (n, c) = self.lit(s)
+            ("(&{n})", c)
+        },
+    }
+}
+
+// The atoms, left to right, as List.map takes them.
+fn atoms(self: Cg, xs: List[ir.Atom]) -> (List[Str], Cg) {
+    let mut c = self
+    let mut out: List[Str] = []
+    for x in xs {
+        let (s, next) = c.atom(x)
+        c = next
+        out.push(s)
+    }
+    (out, c)
+}
+
+// ---------- enum helpers ----------
+
+fn tag_expr(self: Cg, t: types.Ty, e: Str) -> (Str, Cg) {
+    let (n, c) = self.cname(t)
+    ("{n}_tag({e})", c)
+}
+
+fn payload_expr(self: Cg, t: types.Ty, e: Str, k: Int, i: Int) -> (Str, Cg) {
+    let (n, c) = self.cname(t)
+    ("{n}_p_{k}_{i}({e})", c)
+}
+
+fn mk_enum(self: Cg, t: types.Ty, k: Int, args: List[Str]) -> (Str, Cg) {
+    let (n, c) = self.cname(t)
+    ("{n}_mk_{k}({args.join(", ")})", c)
+}
+
+// A new reference to `e`, of type `t`.
+fn dup_of(self: Cg, t: types.Ty, e: Str) -> (Str, Cg) {
+    if is_scalar(t) {
+        return (e, self)
+    }
+    let (n, c) = self.cname(t)
+    ("{n}_dup({e})", c)
+}
+
+// Follow a chain of steps from `root`: the lvalue and its type.
+fn walk(self: Cg, root: Str, rty: types.Ty, steps: List[ir.Step]) -> (Str, types.Ty, Cg) {
+    let mut c = self
+    let mut e = root
+    let mut t = rty
+    for step in steps {
+        match step {
+            PField(k) => {
+                let ft = c.fields_of(t)[k].1
+                e = "({e}).f{k}"
+                t = ft
+            },
+            PIndex(i, sp) => {
+                let wh = c.where(sp)
+                let (ia, c1) = c.atom(i)
+                match t {
+                    TList(el) => {
+                        let (n, c2) = c1.cname(t)
+                        c = c2
+                        e = "(*{n}_at({e}, {ia}, {wh}))"
+                        t = el
+                    },
+                    TArray(el, TLen(len)) => {
+                        c = c1
+                        e = "({e}).a[w_idx({ia}, {len}, {wh})]"
+                        t = el
+                    },
+                    _ => panic("walk index"),
+                }
+            },
+            PIndexU(i) => {
+                let (ia, c1) = c.atom(i)
+                c = c1
+                match t {
+                    TList(el) => {
+                        e = "({e})->data[{ia}]"
+                        t = el
+                    },
+                    TArray(el, _) => {
+                        e = "({e}).a[{ia}]"
+                        t = el
+                    },
+                    _ => panic("walk index"),
+                }
+            },
+            PKey(k, sp) => match t {
+                TMap(_, vt) => {
+                    let wh = c.where(sp)
+                    let (ka, c1) = c.atom(k)
+                    let (n, c2) = c1.cname(t)
+                    c = c2
+                    e = "(*{n}_slot({e}, {ka}, {wh}))"
+                    t = vt
+                },
+                _ => panic("walk key"),
+            },
+        }
+    }
+    (e, t, c)
+}
+
+// The C condition for value `e` of type `t` matching pattern `p`.
+fn pat_cond(self: Cg, e: Str, t: types.Ty, p: ast.Pat) -> (Str, Cg) {
+    let mut c = self
+    match p.desc {
+        PWild | PBind(_) | PRest(_) => ("true", c),
+        PInt(n) => (if n == -9223372036854775807 - 1 { "({e} == INT64_MIN)" } else { "({e} == INT64_C({n}))" }, c),
+        PBool(b) => ("({e} == {if b { "true" } else { "false" }})", c),
+        PStr(s) => {
+            let (n, c1) = c.lit(s)
+            ("Str_eq({e}, &{n})", c1)
+        },
+        PVariant(_, vn, args) => {
+            let k = lower.tag_of(c.ro, t, vn)
+            let ptys = c.variants_of(t).find(|v| v.0 == vn).map(|v| v.1) ?? []
+            let mut subs: List[Str] = []
+            for (i, pair) in exhaust.fill_rest(args, ptys.len()).zip(ptys).with_index() {
+                let (pe, c1) = c.payload_expr(t, e, k, i)
+                let (s, c2) = c1.pat_cond(pe, pair.1, pair.0)
+                c = c2
+                subs.push(s)
+            }
+            let (te, c3) = c.tag_expr(t, e)
+            ((["({te} == {k})"] + subs.filter(|s| s != "true")).join(" && "), c3)
+        },
+        PTuple(ps) => {
+            let fts = c.fields_of(t)
+            let mut subs: List[Str] = []
+            for (i, pair) in exhaust.fill_rest(ps, fts.len()).zip(fts.map(|f| f.1)).with_index() {
+                let (s, c1) = c.pat_cond("({e}).f{i}", pair.1, pair.0)
+                c = c1
+                subs.push(s)
+            }
+            let real = subs.filter(|s| s != "true")
+            (if real.is_empty() { "true" } else { real.join(" && ") }, c)
+        },
+        PList(ps) => {
+            let el = match t {
+                TList(el) => el,
+                _ => panic("pat_cond: list"),
+            }
+            let (before, rest, after) = exhaust.list_parts(ps)
+            let k = before.len()
+            let j = after.len()
+            let len = "({e})->len"
+            let size = if rest.is_none() { "({len} == {k})" } else { "({len} >= {k + j})" }
+            // `before @ after`: OCaml makes the right operand first
+            let mut tail: List[Str] = []
+            for (i, q) in after.with_index() {
+                let (s, c1) = c.pat_cond("({e})->data[{len} - {j - i}]", el, q)
+                c = c1
+                tail.push(s)
+            }
+            let mut head: List[Str] = []
+            for (i, q) in before.with_index() {
+                let (s, c1) = c.pat_cond("({e})->data[{i}]", el, q)
+                c = c1
+                head.push(s)
+            }
+            (([size] + (head + tail).filter(|s| s != "true")).join(" && "), c)
+        },
+        PStruct(_, _, fields, _) => {
+            let fts = c.fields_of(t)
+            let mut subs: List[Str] = []
+            for (i, pair) in exhaust.struct_items(fields, fts.map(|f| f.0), p.span).zip(fts.map(|f| f.1)).with_index() {
+                let (s, c1) = c.pat_cond("({e}).f{i}", pair.1, pair.0)
+                c = c1
+                subs.push(s)
+            }
+            let real = subs.filter(|s| s != "true")
+            (if real.is_empty() { "true" } else { real.join(" && ") }, c)
+        },
+        PAs(q, _, _) => c.pat_cond(e, t, q),
+        POr(alts) => {
+            let mut conds: List[Str] = []
+            for q in alts {
+                let (s, c1) = c.pat_cond(e, t, q)
+                c = c1
+                conds.push(s)
+            }
+            (if conds.contains("true") { "true" } else { "(" + conds.join(" || ") + ")" }, c)
+        },
+    }
+}
+
+// The prefix of the order function for `t` (used as <prefix>_cmp);
+// composite types get one generated, and so do the types inside them.
+fn cmp_prefix(self: Cg, t: types.Ty) -> (Str, Cg) {
+    match t {
+        TInt => ("Int", self),
+        TFloat => ("Float", self),
+        TStr => ("Str", self),
+        TBytes => ("Bytes", self),
+        TBool => ("Bool", self),
+        TUnit => ("Unit", self),
+        _ => {
+            let (n, c0) = self.cname(t)
+            let mut c = c0
+            let mut known = false
+            for u in c.cmp_tys {
+                let (un, c1) = c.cname(u)
+                c = c1
+                if un == n {
+                    known = true
+                    break
+                }
+            }
+            if !known {
+                c.cmp_tys.push(t)
+                let inside = match t {
+                    TList(e) | TArray(e, _) => [e],
+                    TNamed(..) => c.parts(t),
+                    _ => panic("cgen: no order on " + show(t)),
+                }
+                for e in inside {
+                    (_, c) = c.cmp_prefix(e)
+                }
+            }
+            (n, c)
+        },
+    }
+}
+
+// The prefix of the hash function for map key type `t`; tuple, struct and
+// enum keys get one generated, and so do the types inside them.
+fn hash_prefix(self: Cg, t: types.Ty) -> (Str, Cg) {
+    match t {
+        TInt => ("Int", self),
+        TStr => ("Str", self),
+        TBytes => ("Bytes", self),
+        TBool => ("Bool", self),
+        TUnit => ("Unit", self),
+        _ => {
+            let (n, c0) = self.cname(t)
+            let mut c = c0
+            let mut known = false
+            for u in c.hash_tys {
+                let (un, c1) = c.cname(u)
+                c = c1
+                if un == n {
+                    known = true
+                    break
+                }
+            }
+            if !known {
+                c.hash_tys.push(t)
+                let inside = match t {
+                    TNamed(..) => c.parts(t),
+                    _ => panic("cgen: no hash for " + show(t)),
+                }
+                for e in inside {
+                    (_, c) = c.hash_prefix(e)
+                }
+            }
+            (n, c)
+        },
+    }
+}
+
+fn cmp_op(op: ast.BinOp) -> Str {
+    match op {
+        Lt => "<",
+        Le => "<=",
+        Gt => ">",
+        Eq => "==",
+        Ne => "!=",
+        _ => ">=",
+    }
+}
+
+fn binop(self: Cg, op: ast.BinOp, t: types.Ty, a: Str, b: Str, sp: ast.Span) -> (Str, Cg) {
+    match (t, op) {
+        (TInt, Add) | (TFloat, Add) => ("({a} + {b})", self),
+        (TInt, Sub) | (TFloat, Sub) => ("({a} - {b})", self),
+        (TInt, Mul) | (TFloat, Mul) => ("({a} * {b})", self),
+        (TInt, Div) => ("w_div({a}, {b}, {self.where(sp)})", self),
+        (TInt, Mod) => ("w_mod({a}, {b}, {self.where(sp)})", self),
+        (TInt, BitAnd) => ("({a} & {b})", self),
+        (TInt, BitOr) => ("({a} | {b})", self),
+        (TInt, BitXor) => ("({a} ^ {b})", self),
+        (TInt, Shl) => ("w_shl({a}, {b}, {self.where(sp)})", self),
+        (TInt, Shr) => ("w_shr({a}, {b}, {self.where(sp)})", self),
+        (TFloat, Div) => ("({a} / {b})", self),
+        (TStr, Add) | (TBytes, Add) => ("Str_concat({a}, {b})", self),
+        (TList(_), Add) => {
+            let (n, c) = self.cname(t)
+            ("{n}_concat({a}, {b})", c)
+        },
+        (TInt, Lt | Le | Gt | Ge | Eq | Ne) | (TFloat, Lt | Le | Gt | Ge | Eq | Ne) | (TBool, Lt | Le | Gt | Ge | Eq | Ne) => ("({a} {cmp_op(op)} {b})", self),
+        (TStr, Lt | Le | Gt | Ge) => ("(Str_cmp({a}, {b}) {cmp_op(op)} 0)", self),
+        (_, Eq) => {
+            let (n, c) = self.cname(t)
+            ("{n}_eq({a}, {b})", c)
+        },
+        (_, Ne) => {
+            let (n, c) = self.cname(t)
+            ("(!{n}_eq({a}, {b}))", c)
+        },
+        (_, Lt | Le | Gt | Ge) => {
+            let (n, c) = self.cmp_prefix(t)
+            ("({n}_cmp({a}, {b}) {cmp_op(op)} 0)", c)
+        },
+        _ => panic("cgen binop on " + show(t)),
+    }
+}
+
+// ---------- writing ----------
+
+fn put(self: Cg, s: Str) -> Cg {
+    let mut c = self
+    c.out.push(s)
+    c
+}
+
+fn line(self: Cg, ind: Str, s: Str) -> Cg {
+    self.put(ind + s + "\n")
+}
+
+// ---------- foreign calls ----------
+
+fn handle_ty() -> types.Ty {
+    TNamed("Handle", [])
+}
+
+// The C type of a boundary type: a C struct gets a typedef of its own
+// (VFS<n>, fields c0, c1, ... at C's layout), a callback is a pointer to a
+// function.
+fn ffi_ctype(self: Cg, t: ffi.CTy) -> (Str, Cg) {
+    match t {
+        Struct(n, fs) => match self.cstructs.find(|s| s.name == n) {
+            Some(s) => (s.cname, self),
+            None => {
+                let mut c = self
+                let cn = "VFS{c.cstructs.len()}"
+                c.cstructs.push(CStruct { name: n, cname: cn, fields: fs })
+                (cn, c)
+            },
+        },
+        Fn(ps, r) => {
+            let mut c = self
+            let mut cps: List[Str] = []
+            for p in ps {
+                let (s, next) = c.ffi_ctype(p)
+                c = next
+                cps.push(s)
+            }
+            let (cr, c2) = c.ffi_ctype(r)
+            ("{cr} (*)({if ps.is_empty() { "void" } else { cps.join(", ") }})", c2)
+        },
+        _ => (ffi.c_name(t), self),
+    }
+}
+
+fn i32_arg(v: Str, what: Str, wh: Str) -> Str {
+    "w_ffi_i32({v}, {c_string(what)}, {wh})"
+}
+
+// A Limen value `v` as the C value of boundary type `t`. `what` names it
+// in an Int32 range panic. In the variadic part of a call, Int32 and Bool
+// go as int and Int as int64_t, written out so C's promotions see the
+// right type.
+fn ffi_arg(self: Cg, variadic: Bool, t: ffi.CTy, v: Str, what: Str, wh: Str) -> (Str, Cg) {
+    match t {
+        Int => (if variadic { "(int64_t){v}" } else { v }, self),
+        Float => (if variadic { "(double){v}" } else { v }, self),
+        Int32 => (if variadic { "(int){i32_arg(v, what, wh)}" } else { i32_arg(v, what, wh) }, self),
+        Bool => ("({if variadic { "(int)" } else { "" }}({v} ? 1 : 0))", self),
+        Str => ("(const char *)({v})->data", self),
+        Bytes => ("(const void *)({v})->data", self),
+        Handle => ("(void *)(intptr_t)({v}).f0", self),
+        Struct(n, fs) => {
+            let mut items: List[Str] = []
+            for (i, f) in fs.with_index() {
+                let x = "({v}).f{i}"
+                items.push(match f.1 {
+                    Int32 => i32_arg(x, "field `{f.0}` of `{n}`", wh),
+                    Bool => "({x} ? 1 : 0)",
+                    Handle => "(void *)(intptr_t)({x}).f0",
+                    _ => x,
+                })
+            }
+            let (cn, c) = self.ffi_ctype(t)
+            ("({cn})\{ {items.join(", ")} }", c)
+        },
+        Unit | Fn(..) => ("0", self),
+    }
+}
+
+// A C value `e` of boundary type `t` as a Limen value.
+fn ffi_result(self: Cg, t: ffi.CTy, e: Str) -> (Str, Cg) {
+    let (hd, c) = self.cname(handle_ty())
+    let one = |t: ffi.CTy, e: Str| match t {
+        Int | Float => e,
+        Int32 => "(int64_t){e}",
+        Bool => "({e} != 0)",
+        Str => "w_ffi_str({e})",
+        Handle => "({hd})\{ (int64_t)(intptr_t){e} }",
+        _ => "0",
+    }
+    match t {
+        Struct(n, fs) => {
+            let items = fs.with_index().map(|p| {
+                let (i, f) = p
+                one(f.1, "{e}.c{i}")
+            })
+            let (sn, c2) = c.cname(TNamed(n, []))
+            ("({sn})\{ {items.join(", ")} }", c2)
+        },
+        _ => (one(t, e), c),
+    }
+}
+
+// The wrapper C calls for callback `cb` (a top-level function), made on
+// first use.
+fn ffi_callback(self: Cg, cb: ir.Callback, ps: List[ffi.CTy], r: ffi.CTy) -> (Str, Cg) {
+    match self.wrappers.find(|w| w.fname == cb.cname && w.takes_foreign == cb.takes_foreign && w.params == ps && w.ret == r) {
+        Some(w) => (w.name, self),
+        None => {
+            let mut c = self
+            let w = "vcb{c.wrappers.len()}_"
+            c.wrappers.push(Wrapper { fname: cb.cname, takes_foreign: cb.takes_foreign, params: ps, ret: r, name: w, vname: cb.name, span: cb.span })
+            (w, c)
+        },
+    }
+}
+
+// A callback wrapper's definition: it converts C's arguments, calls the
+// compiled Limen function under a panic boundary of its own, and
+// converts its result. Nothing may unwind through C's frames, so a panic
+// there ends the program (w_cb_fatal), and so does waiting (see w_park).
+fn ffi_callback_def(self: Cg, w: Wrapper) -> (Str, Cg) {
+    let mut c = self
+    let mut b: List[Str] = []
+    let wh = c.where(w.span)
+    let mut params: List[Str] = []
+    for (i, t) in w.params.with_index() {
+        let (ct, next) = c.ffi_ctype(t)
+        c = next
+        params.push("{ct} a{i}")
+    }
+    let (rt, c1) = c.ffi_ctype(w.ret)
+    c = c1
+    b.push("static {rt} {w.name}({if params.is_empty() { "void" } else { params.join(", ") }}) \{")
+    b.push("  WFiber *f_ = w_cb_fiber({wh});")
+    b.push("  const char *prev_ = f_->in_cb;")
+    b.push("  f_->in_cb = {wh};")
+    if w.ret != Unit {
+        let (rt2, c2) = c.ffi_ctype(w.ret)
+        c = c2
+        b.push("  {rt2} volatile r_ = 0;")
+    }
+    b.push("  WCatch c_;")
+    b.push("  w_catch_init(&c_);")
+    b.push("  WCatch **slot_ = &f_->catch_top;")
+    b.push("  if (_setjmp(c_.jb) == 0) \{")
+    b.push("    WCatch *guard_ __attribute__((cleanup(w_catch_land))) = &c_;")
+    b.push("    *slot_ = &c_;")
+    let (hd, c3) = c.cname(handle_ty())
+    c = c3
+    let args = w.params.with_index().map(|p| match p.1 {
+        Int32 => "(int64_t)a{p.0}",
+        Bool => "(a{p.0} != 0)",
+        Handle => "({hd})\{ (int64_t)(intptr_t)a{p.0} }",
+        Str => "w_ffi_str(a{p.0})",
+        _ => "a{p.0}",
+    })
+    // a callback that takes a Foreign gets the one its foreign call was given
+    let fa = if w.takes_foreign { ["Cap_dup(f_->cb_foreign)"] } else { [] }
+    let call = "{w.fname}({(fa + args).join(", ")})"
+    b.push(match w.ret {
+        Unit => "    {call};",
+        Int32 => "    r_ = w_ffi_i32({call}, {c_string("the result of callback `{w.vname}`")}, {wh});",
+        Bool => "    r_ = {call} ? 1 : 0;",
+        Handle => "    r_ = (void *)(intptr_t)({call}).f0;",
+        _ => "    r_ = {call};",
+    })
+    b.push("    *slot_ = c_.prev;")
+    b.push("    w_catch_end(&c_);")
+    b.push("  } else w_cb_fatal(&c_, {wh});")
+    b.push("  f_->in_cb = prev_;")
+    if w.ret != Unit {
+        b.push("  return r_;")
+    }
+    b.push("}")
+    (b.map(|l| l + "\n").join(""), c)
+}
+
+// ---------- right-hand sides ----------
+
+// A piece of a value being shown into a buffer: text, or a value of a
+// type, at the top (a string as itself) or inside a container (quoted).
+enum Shown {
+    Text(Str),
+    Value(Str, types.Ty, Bool),
+}
+
+fn set(self: Cg, ind: Str, dst: Str, e: Str) -> Cg {
+    self.line(ind, "{dst} = {e};")
+}
+
+fn show_into(self: Cg, ind: Str, dst: Str, parts: List[Shown]) -> Cg {
+    let mut c = self.line(ind, "\{").line(ind, "  WBuf b_; buf_init(&b_);")
+    for part in parts {
+        match part {
+            Text(s) => {
+                c = c.line(ind, "  buf_putn(&b_, {c_string(s)}, {s.len()});")
+            },
+            Value(e, ty, top) => {
+                let (n, c1) = c.cname(ty)
+                c = c1.line(ind, "  {n}_show(&b_, {e}, {top});")
+            },
+        }
+    }
+    c.line(ind, "  {dst} = buf_take(&b_);").line(ind, "}")
+}
+
+// An I/O operation's WIo result as a Result[_, IoError]: `ok` is the Ok
+// value, read from `r_`.
+fn io_result(self: Cg, ind: Str, dst: Str, t: types.Ty, call: Str, ok: Str) -> Cg {
+    let ioe = types.io_err()
+    let c = self.line(ind, "\{").line(ind, "  WIo r_ = {call};")
+    let (failed, c1) = c.mk_enum(ioe, 1, ["r_.msg"])
+    let (denied, c2) = c1.mk_enum(ioe, 0, ["r_.msg"])
+    let (err, c3) = c2.mk_enum(t, 1, ["(r_.kind == 1 ? {denied} : {failed})"])
+    let (good, c4) = c3.mk_enum(t, 0, [ok])
+    c4.line(ind, "  if (r_.kind == 0) {dst} = {good}; else {dst} = {err};").line(ind, "}")
+}
+
+// `cond ? Some(value) : None`, into `dst` of Option type `t`.
+fn opt_from(self: Cg, ind: Str, dst: Str, t: types.Ty, cond: Str, value: Str) -> Cg {
+    let (none, c1) = self.mk_enum(t, 1, [])
+    let (some, c2) = c1.mk_enum(t, 0, [value])
+    c2.set(ind, dst, "({cond}) ? {some} : {none}")
+}
+
+fn is_array(t: types.Ty) -> Bool {
+    match t {
+        TArray(..) => true,
+        _ => false,
+    }
+}
+
+fn atom_var(a: ir.Atom) -> ir.Var {
+    match ir.atom_var(a) {
+        Some(v) => v,
+        None => panic("cgen: a variable was expected"),
+    }
+}
+
+fn vtable_key(i: Str) -> Str {
+    i.chars().map(|ch| if ch == "." || ch == "[" || ch == "]" || ch == "," || ch == " " || ch == "(" || ch == ")" { "_" } else { ch }).join("")
+}
+
+// Write the statements that store `r` into the C lvalue `dst` of type `t`.
+fn rhs_into(self: Cg, ind: Str, dst: Str, t: types.Ty, r: ir.Rhs) -> Cg {
+    let mut c = self
+    match r {
+        Use(x) => {
+            let (a, c1) = c.atom(x)
+            c1.set(ind, dst, a)
+        },
+        Bin(op, ty, x, y, sp) => {
+            let (b, c1) = c.atom(y)
+            let (a, c2) = c1.atom(x)
+            let (e, c3) = c2.binop(op, ty, a, b, sp)
+            c3.set(ind, dst, e)
+        },
+        Negate(TInt, x) => {
+            let (a, c1) = c.atom(x)
+            c1.set(ind, dst, "(int64_t)(0 - (uint64_t){a})")
+        },
+        Negate(_, x) => {
+            let (a, c1) = c.atom(x)
+            c1.set(ind, dst, "(-{a})")
+        },
+        Flip(x) => {
+            let (a, c1) = c.atom(x)
+            c1.set(ind, dst, "(!{a})")
+        },
+        Call(f, args) => {
+            let (xs, c1) = c.atoms(args)
+            c1.set(ind, dst, "{f}({xs.join(", ")})")
+        },
+        CallClo(f, args) => {
+            let fv = atom_var(f)
+            let (ps, rt) = match fv.ty {
+                TFn(ps, rt) => (ps, rt),
+                _ => panic("callclo type"),
+            }
+            let mut cps = ["WClo*"]
+            for p in ps {
+                let (s, c1) = c.ctype(p)
+                c = c1
+                cps.push(s)
+            }
+            let (cr, c2) = c.ctype(rt)
+            let (xs, c3) = c2.atoms(args)
+            c3.set(ind, dst, "(({cr} (*)({cps.join(", ")}))({var(fv)})->fn)({([var(fv)] + xs).join(", ")})")
+        },
+        MkDyn(ty, i, x, ms) => {
+            let (n, c1) = c.cname(ty)
+            c = c1
+            let key = n + "_as_" + vtable_key(i)
+            if !c.dyns.any(|d| d.key == key) {
+                c.dyns.push(DynBox { key, ty, methods: ms })
+            }
+            let (a, c2) = c.atom(x)
+            c2.line(ind, "\{").line(ind, "  struct Dyn_{key}* d_ = (struct Dyn_{key}*)w_alloc_k(sizeof(struct Dyn_{key}), WK_PLAIN);").line(ind, "  d_->base.rc = 1; d_->base.vt = (const WVt*)&Dyn_{key}_vt; d_->val = {a};").line(ind, "  w_set_kids(d_, w_dyn_kids);").line(ind, "  {dst} = (WDyn*)d_;").line(ind, "}")
+        },
+        Select(id, ops, has_default, sp) => {
+            let n = ops.len()
+            c = c.line(ind, "WSelOp sel{id}_ops[{n}];")
+            for (i, op) in ops.with_index() {
+                match op {
+                    SRecv(ch, el, on) => {
+                        let (ct, c1) = c.ctype(el)
+                        let (o, c2) = c1.line(ind, "{ct} sel{id}_v{i};").atom(on)
+                        let (ca, c3) = c2.atom(ch)
+                        c = c3.line(ind, "sel{id}_ops[{i}] = (WSelOp)\{ {ca}, 0, &sel{id}_v{i}, 0, {o} };")
+                    },
+                    SSend(ch, v, el, on) => {
+                        let (va, c1) = c.atom(v)
+                        let (ct, c2) = c1.ctype(el)
+                        let (o, c3) = c2.line(ind, "{ct} sel{id}_s{i} = {va};").atom(on)
+                        let (ca, c4) = c3.atom(ch)
+                        c = c4.line(ind, "sel{id}_ops[{i}] = (WSelOp)\{ {ca}, 1, &sel{id}_s{i}, 0, {o} };")
+                    },
+                    SAfter(_, ms, on) => {
+                        let (m, c1) = c.atom(ms)
+                        let (o, c2) = c1.atom(on)
+                        c = c2.line(ind, "sel{id}_ops[{i}] = (WSelOp)\{ NULL, 2, NULL, 0, {o}, {m} };")
+                    },
+                }
+            }
+            c = c.set(ind, dst, "w_select(sel{id}_ops, {n}, {if has_default { 1 } else { 0 }}, {c.where(sp)})")
+            // a value that was not sent is still ours
+            for (i, op) in ops.with_index() {
+                match op {
+                    SSend(_, _, el, _) if !is_scalar(el) => {
+                        let (en, c1) = c.cname(el)
+                        c = c1.line(ind, "if ({dst} != {i}) {en}_drop(sel{id}_s{i});")
+                    },
+                    _ => {},
+                }
+            }
+            c
+        },
+        SelGot(id, i, ot) => {
+            let (none, c1) = c.mk_enum(ot, 1, [])
+            let (some, c2) = c1.mk_enum(ot, 0, ["sel{id}_v{i}"])
+            c2.set(ind, dst, "(sel{id}_ops[{i}].ok ? {some} : {none})")
+        },
+        Catch(clo, rt) => {
+            // run the closure under a panic boundary: Ok(value), or Err(message)
+            let fv = var(atom_var(clo))
+            let (ct, c1) = c.ctype(rt)
+            let (ok, c2) = c1.mk_enum(t, 0, ["r_"])
+            let (err, c3) = c2.mk_enum(t, 1, ["m_"])
+            c3.line(ind, "\{").line(ind, "  WCatch c_;").line(ind, "  w_catch_init(&c_);").line(ind, "  WCatch **slot_ = w_catch_slot();").line(ind, "  if (_setjmp(c_.jb) == 0) \{").line(ind, "    WCatch *guard_ __attribute__((cleanup(w_catch_land))) = &c_;").line(ind, "    *slot_ = &c_;").line(ind, "    {ct} r_ = (({ct} (*)(WClo*))({fv})->fn)({fv});").line(ind, "    *slot_ = c_.prev;").line(ind, "    w_catch_end(&c_);").line(ind, "    {dst} = {ok};").line(ind, "  } else \{").line(ind, "    w_catch_release(&c_);").line(ind, "    if (c_.cancel) w_cancel_unwind();   /* a cancellation passes through `catch` */").line(ind, "    WStr *m_ = Str_from(c_.msg, (int64_t)strlen(c_.msg));").line(ind, "    free(c_.msg); free(c_.where);").line(ind, "    {dst} = {err};").line(ind, "  }").line(ind, "}")
+        },
+        CallC(cs, args, _, sp) if cs.lib == "limen" => {
+            // the runtime's own helpers (ffi.runtime_fns)
+            let (hd, c1) = c.cname(handle_ty())
+            let (xs, c2) = c1.atoms(args)
+            match (cs.sym, xs) {
+                ("limen_copy", [p, n]) => c2.set(ind, dst, "w_ffi_copy(({p}).f0, {n}, {c2.where(sp)})"),
+                ("limen_handle_new", [p]) => c2.set(ind, dst, "w_handle_new(({p}).f0)"),
+                ("limen_handle_acquire" | "limen_handle_release" | "limen_handle_close", [id]) => c2.set(ind, dst, "({hd})\{ w_{cs.sym.slice("limen_".len(), cs.sym.len())}({id}) }"),
+                _ => panic("cgen: runtime helper " + cs.sym),
+            }
+        },
+        CallC(cs, args, cbs, sp) => c.call_c(ind, dst, t, cs, args, cbs, sp),
+        CallDyn(k, ps, rt, recv, args) => {
+            let mut cps = ["WDyn*"]
+            for p in ps {
+                let (s, c1) = c.ctype(p)
+                c = c1
+                cps.push(s)
+            }
+            let (cr, c2) = c.ctype(rt)
+            let (xs, c3) = c2.atoms(args)
+            let (ra, c4) = c3.atom(recv)
+            c4.set(ind, dst, "(({cr} (*)({cps.join(", ")}))({ra})->vt->m[{k}])({([ra] + xs).join(", ")})")
+        },
+        MkStruct(ty, args) => {
+            let (xs, c1) = c.atoms(args)
+            let (n, c2) = c1.cname(ty)
+            c2.set(ind, dst, if args.is_empty() { "({n})\{0}" } else { "({n})\{ {xs.join(", ")} }" })
+        },
+        MkEnum(ty, k, args) => {
+            let (xs, c1) = c.atoms(args)
+            let (e, c2) = c1.mk_enum(ty, k, xs)
+            c2.set(ind, dst, e)
+        },
+        MkList(ty, args) if is_array(ty) => {
+            let (xs, c1) = c.atoms(args)
+            let (n, c2) = c1.cname(ty)
+            c2.set(ind, dst, if args.is_empty() { "({n})\{0}" } else { "({n})\{ \{ {xs.join(", ")} } }" })
+        },
+        MkList(ty, args) => {
+            let (n, c1) = c.cname(ty)
+            c = c1.line(ind, "\{").line(ind, "  {n}* l_ = {n}_new({args.len()});")
+            for (i, x) in args.with_index() {
+                let (a, c2) = c.atom(x)
+                c = c2.line(ind, "  l_->data[{i}] = {a};")
+            }
+            c.line(ind, "  l_->len = {args.len()};").line(ind, "  {dst} = l_;").line(ind, "}")
+        },
+        MkClosure(fname, _, []) => c.line(ind, "\{").line(ind, "  WClo* k_ = (WClo*)w_alloc_k(sizeof(WClo), WK_PLAIN);").line(ind, "  k_->rc = 1; k_->fn = (void*){fname}; k_->drop = NULL; k_->share = NULL;").line(ind, "  {dst} = k_;").line(ind, "}"),
+        MkClosure(fname, _, args) => {
+            c = c.line(ind, "\{").line(ind, "  struct Env_{fname}* e_ = (struct Env_{fname}*)w_alloc_k(sizeof(struct Env_{fname}), WK_PLAIN);").line(ind, "  e_->base.rc = 1; e_->base.fn = (void*){fname}; e_->base.drop = Env_{fname}_drop; e_->base.share = Env_{fname}_share;").line(ind, "  w_set_kids(e_, (void (*)(void*))Env_{fname}_drop);")
+            for (i, x) in args.with_index() {
+                let (a, c1) = c.atom(x)
+                c = c1.line(ind, "  e_->c{i} = {a};")
+            }
+            c.line(ind, "  {dst} = (WClo*)e_;").line(ind, "}")
+        },
+        Get(root, rty, steps) => {
+            let steps = match (root, steps) {
+                (V(v) | VDup(v), [PIndex(V(i), _), ..rest]) if c.inrange.contains((v.id, i.id)) => [PIndexU(V(i))] + rest,
+                _ => steps,
+            }
+            let (ra, c1) = c.atom(root)
+            let (e, ft, c2) = c1.walk(ra, rty, steps)
+            let (d, c3) = c2.dup_of(ft, e)
+            c3.set(ind, dst, d)
+        },
+        Payload(x, ety, k, i) => {
+            let pt = c.variants_of(ety)[k].1[i]
+            let (a, c1) = c.atom(x)
+            let (pe, c2) = c1.payload_expr(ety, a, k, i)
+            let (d, c3) = c2.dup_of(pt, pe)
+            c3.set(ind, dst, d)
+        },
+        IsTag(x, ety, k) => {
+            let (a, c1) = c.atom(x)
+            let (te, c2) = c1.tag_expr(ety, a)
+            c2.set(ind, dst, "({te} == {k})")
+        },
+        PatTest(x, ty, p) => {
+            let (a, c1) = c.atom(x)
+            let (e, c2) = c1.pat_cond(a, ty, p)
+            c2.set(ind, dst, e)
+        },
+        Format(ps) => {
+            let mut shown: List[Shown] = []
+            for p in ps {
+                match p {
+                    IStr(s) => shown.push(Text(s)),
+                    IVal(x, ty) => {
+                        let (a, c1) = c.atom(x)
+                        c = c1
+                        shown.push(Value(a, ty, true))
+                    },
+                    IValQ(x, ty) => {
+                        let (a, c1) = c.atom(x)
+                        c = c1
+                        shown.push(Value(a, ty, false))
+                    },
+                }
+            }
+            c.show_into(ind, dst, shown)
+        },
+        RootField(x, f) => {
+            let (a, c1) = c.atom(x)
+            c1.set(ind, dst, "Cap_root_field({a}, {c_string(f)})")
+        },
+        GroupNew(None, il) => c.set(ind, dst, "w_group_new({if il { 0 } else { 1 }})"),
+        GroupNew(Some((_, ms)), il) => {
+            let (m, c1) = c.atom(ms)
+            c1.set(ind, dst, "w_group_new_until({m}, {if il { 0 } else { 1 }})")
+        },
+        Spawn(g, task, rt, keep) => {
+            if !c.task_tys.contains(rt) {
+                c.task_tys.push(rt)
+            }
+            let (ct, c1) = c.ctype(rt)
+            let (n, c2) = c1.cname(rt)
+            let (ta, c3) = c2.atom(task)
+            let (ga, c4) = c3.atom(g)
+            c4.line(ind, "w_spawn({ga}, {ta}, wtask_{n}, sizeof({ct}), {keep});").set(ind, dst, "0")
+        },
+        GroupJoin(g, lty, until) => {
+            let el = match lty {
+                TList(e) => e,
+                _ => TUnit,
+            }
+            let (n, c1) = c.cname(lty)
+            let (ga, c2) = c1.atom(g)
+            c = c2.line(ind, "\{").line(ind, "  WGroup* g_ = {ga};").line(ind, "  w_group_wait(g_, 1);").line(ind, "  w_group_reraise(g_);").line(ind, "  {n}* l_ = {n}_new(g_->n);")
+            // tasks that return () are not kept: the list holds the others' results
+            if until {
+                // a cancelled task has no result: None
+                let rt = match el {
+                    TNamed("Option", [r]) => r,
+                    _ => TUnit,
+                }
+                let (none, c3) = c.mk_enum(el, 1, [])
+                let (some, c4) = c3.mk_enum(el, 0, ["r_"])
+                let (ct, c5) = c4.ctype(rt)
+                c = c5.line(ind, "  for (int64_t i_ = 0; i_ < g_->n; i_++) \{").line(ind, "    if (!g_->tasks[i_]->keep) continue;").line(ind, "    if (g_->tasks[i_]->cancelled) l_->data[l_->len++] = {none};").line(ind, "    else \{ {ct} r_; memcpy(&r_, g_->tasks[i_]->slot, sizeof({ct})); l_->data[l_->len++] = {some}; }").line(ind, "  }")
+            } else {
+                let (ct, c3) = c.ctype(el)
+                c = c3.line(ind, "  for (int64_t i_ = 0; i_ < g_->n; i_++) if (g_->tasks[i_]->keep) memcpy(&l_->data[l_->len++], g_->tasks[i_]->slot, sizeof({ct}));")
+            }
+            c.line(ind, "  w_group_release_tasks(g_);").line(ind, "  {dst} = l_;").line(ind, "}")
+        },
+        ChanNew(TChan(el), cap, sp) => {
+            (_, c) = c.cname(TChan(el))
+            let wh = c.where(sp)
+            let mut share = "NULL"
+            let mut drop = "NULL"
+            if !is_scalar(el) {
+                let (en, c1) = c.cname(el)
+                let (en2, c2) = c1.cname(el)
+                c = c2
+                share = "chshare_" + en
+                drop = "chdrop_" + en2
+            }
+            let (ct, c3) = c.ctype(el)
+            let (a, c4) = c3.atom(cap)
+            c4.set(ind, dst, "w_chan_new({a}, sizeof({ct}), {drop}, {share}, {wh})")
+        },
+        ChanNew(..) => panic("channel type"),
+        ChanSend(ch, v, sp) => {
+            let el = match ir.atom_ty(ch) {
+                TChan(e) => e,
+                _ => TUnit,
+            }
+            let (va, c1) = c.atom(v)
+            let (ct, c2) = c1.ctype(el)
+            let (ca, c3) = c2.line(ind, "\{").line(ind, "  {ct} v_ = {va};").atom(ch)
+            c3.line(ind, "  w_chan_send({ca}, &v_, {c3.where(sp)});").line(ind, "}").set(ind, dst, "0")
+        },
+        Panic(m, sp) => {
+            let (a, c1) = c.line(ind, "memset(&{dst}, 0, sizeof {dst});").atom(m)
+            c1.line(ind, "w_panic_c(({a})->data, {c1.where(sp)});")
+        },
+        Prim(name, rt, args, sp) => {
+            let (xs, c1) = c.atoms(args)
+            c1.prim(ind, dst, t, name, rt, xs, sp)
+        },
+    }
+}
+
+// A call into C: the Foreign checked (unless trusted), the arguments
+// converted, callbacks passed as their wrappers, out-parameters as
+// locals, and the results converted back.
+fn call_c(self: Cg, ind: Str, dst: Str, t: types.Ty, cs: ffi.CSig, args: List[ir.Atom], cbs: List[ir.Callback], sp: ast.Span) -> Cg {
+    let mut c = self
+    if !c.csyms.contains(cs.sym) {
+        c.csyms.push(cs.sym)
+    }
+    c = c.line(ind, "\{")
+    let (xs, c1) = c.atoms(args)
+    c = c1
+    let mut rest = xs
+    if !cs.trusted {
+        match xs {
+            [cap, ..vs] => {
+                c = c.line(ind, "  w_foreign_check({cap}, {c_string(cs.lib)}, {c.where(sp)});")
+                rest = vs
+            },
+            [] => panic("cgen: foreign call"),
+        }
+    }
+    let pass_foreign = cbs.any(|cb| cb.takes_foreign)
+    let mut left = cbs
+    let mut outs: List[(Str, ffi.CTy)] = []
+    let fixed = cs.fixed ?? cs.params.len()
+    let mut cargs: List[Str] = []
+    for (i, p) in cs.params.with_index() {
+        if p.out {
+            let o = "o{i}_"
+            c = c.line(ind, "  {ffi.c_name(p.cty)} {o} = 0;")
+            outs.push((o, p.cty))
+            cargs.push("&" + o)
+            continue
+        }
+        match p.cty {
+            Fn(ps, r) => match left {
+                [cb, ..more] => {
+                    left = more
+                    let (w, c2) = c.ffi_callback(cb, ps, r)
+                    c = c2
+                    cargs.push(w)
+                },
+                [] => panic("cgen: foreign callback"),
+            },
+            ty => {
+                let v = match rest {
+                    [v, ..more] => {
+                        rest = more
+                        v
+                    },
+                    [] => panic("cgen: foreign arity"),
+                }
+                let (a, c2) = c.ffi_arg(i >= fixed, ty, v, "argument `{p.name}` of `{cs.sym}`", c.where(sp))
+                c = c2
+                cargs.push(a)
+            },
+        }
+    }
+    let mut ptys: List[Str] = []
+    for p in cs.params.take(fixed) {
+        let (pt, c2) = c.ffi_ctype(p.cty)
+        c = c2
+        ptys.push(pt + if p.out { " *" } else { "" })
+    }
+    let (rt, c3) = c.ffi_ctype(cs.ret)
+    c = c3
+    let proto = "{rt} (*)({if ptys.is_empty() { "void" } else { ptys.join(", ") + if cs.fixed.is_some() { ", ..." } else { "" } }})"
+    let call = "(({proto})vf_{cs.sym})({cargs.join(", ")})"
+    // the Foreign value for callbacks that take one, kept on the task's fiber
+    if pass_foreign {
+        c = c.line(ind, "  WFiber *cf_ = w_current();").line(ind, "  WCap *cfp_ = cf_->cb_foreign;").line(ind, "  cf_->cb_foreign = {xs[0]};")
+    }
+    if cs.ret == Unit {
+        c = c.line(ind, "  {call};")
+    } else {
+        let (rt2, c4) = c.ffi_ctype(cs.ret)
+        c = c4.line(ind, "  {rt2} r_ = {call};")
+    }
+    if pass_foreign {
+        c = c.line(ind, "  cf_->cb_foreign = cfp_;")
+    }
+    // the out-parameters' values first: OCaml makes the right operand of
+    // `@` first
+    let mut outv: List[Str] = []
+    for o in outs {
+        let (v, c5) = c.ffi_result(o.1, o.0)
+        c = c5
+        outv.push(v)
+    }
+    let mut vals: List[Str] = []
+    if cs.ret != Unit {
+        let (v, c6) = c.ffi_result(cs.ret, "r_")
+        c = c6
+        vals.push(v)
+    }
+    vals = vals + outv
+    c = match vals {
+        [] => c.line(ind, "  {dst} = 0;"),
+        [v] => c.line(ind, "  {dst} = {v};"),
+        vs => {
+            let (n, c7) = c.cname(t)
+            c7.line(ind, "  {dst} = ({n})\{ {vs.join(", ")} };")
+        },
+    }
+    c.line(ind, "}")
+}
+
+// A built-in method on receiver type `rt`, its arguments `a` already C.
+fn prim(self: Cg, ind: Str, dst: Str, t: types.Ty, name: Str, rt: types.Ty, a: List[Str], sp: ast.Span) -> Cg {
+    let c = self
+    let arg = |i: Int| a[i]
+    match (name, rt) {
+        ("list_len" | "array_len", TArray(_, TLen(n))) => c.set(ind, dst, "{n}"),
+        ("array_get", TArray(el, TLen(n))) => {
+            let (v, c1) = c.dup_of(el, "({arg(0)}).a[{arg(1)}]")
+            c1.opt_from(ind, dst, t, "{arg(1)} >= 0 && {arg(1)} < {n}", v)
+        },
+        ("array_contains", TArray(el, TLen(n))) => {
+            let (eq, c1) = c.binop(Eq, el, "({arg(0)}).a[i_]", arg(1), diag.nowhere())
+            c1.set(ind, dst, "(\{ bool f_ = false; for (int64_t i_ = 0; i_ < {n}; i_++) if ({eq}) \{ f_ = true; break; } f_; })")
+        },
+        ("array_to_list", TArray(el, TLen(n))) => {
+            let (ln, c1) = c.cname(TList(el))
+            let (v, c2) = c1.dup_of(el, "({arg(0)}).a[i_]")
+            c2.line(ind, "\{").line(ind, "  {ln}* l_ = {ln}_new({n});").line(ind, "  for (int64_t i_ = 0; i_ < {n}; i_++) l_->data[i_] = {v};").line(ind, "  l_->len = {n};").line(ind, "  {dst} = l_;").line(ind, "}")
+        },
+        ("chan_recv", TChan(el)) => {
+            let (ct, c1) = c.ctype(el)
+            let (none, c2) = c1.line(ind, "\{").line(ind, "  {ct} v_;").mk_enum(t, 1, [])
+            let (some, c3) = c2.mk_enum(t, 0, ["v_"])
+            c3.line(ind, "  {dst} = w_chan_recv({arg(0)}, &v_) ? {some} : {none};").line(ind, "}")
+        },
+        // the value escapes into an empty asm statement the compiler cannot see through
+        ("keep", _) => c.line(ind, "\{ __typeof__({arg(0)}) k_ = {arg(0)}; __asm__ volatile(\"\" : : \"r\"(&k_) : \"memory\"); }").set(ind, dst, "0"),
+        ("chan_close", _) => c.line(ind, "w_chan_close({arg(0)}, {c.where(sp)});").set(ind, dst, "0"),
+        ("map_new", TMap(..)) => {
+            let (n, c1) = c.cname(rt)
+            c1.set(ind, dst, "{n}_new()")
+        },
+        ("map_from", TMap(k, v)) => {
+            let (n, c1) = c.cname(rt)
+            let (dv, c2) = c1.dup_of(v, "({arg(0)})->data[i_].f1")
+            let (dk, c3) = c2.dup_of(k, "({arg(0)})->data[i_].f0")
+            let c4 = c3.line(ind, "\{").line(ind, "  {n}* m_ = {n}_new();").line(ind, "  for (int64_t i_ = 0; i_ < ({arg(0)})->len; i_++) {n}_put(&m_, {dk}, {dv});")
+            let (_, c5) = c4.cname(TList(TNamed(ast.tuple_name(2), [k, v])))
+            c5.line(ind, "  {dst} = m_;").line(ind, "}")
+        },
+        ("map_at", TMap(..)) => {
+            let (n, c1) = c.cname(rt)
+            c1.set(ind, dst, "{n}_at({arg(0)}, {arg(1)}, {c1.where(sp)})")
+        },
+        ("map_get", TMap(_, v)) => {
+            let (n, c1) = c.cname(rt)
+            let (vt, c2) = c1.ctype(v)
+            let (dv, c3) = c2.line(ind, "\{").line(ind, "  {vt}* p_ = {n}_get({arg(0)}, {arg(1)});").dup_of(v, "*p_")
+            let (none, c4) = c3.mk_enum(t, 1, [])
+            let (some, c5) = c4.mk_enum(t, 0, [dv])
+            c5.line(ind, "  {dst} = p_ ? {some} : {none};").line(ind, "}")
+        },
+        ("map_contains", TMap(..)) => {
+            let (n, c1) = c.cname(rt)
+            c1.set(ind, dst, "({n}_find({arg(0)}, {arg(1)}) >= 0)")
+        },
+        ("map_len", _) => c.set(ind, dst, "({arg(0)})->len"),
+        ("map_is_empty", _) => c.set(ind, dst, "(({arg(0)})->len == 0)"),
+        ("map_keys" | "map_values" | "map_entries", TMap(k, v)) => {
+            let (ln, c1) = c.cname(t)
+            let (item, c2) = match name {
+                "map_keys" => c1.dup_of(k, "(m_)->keys[i_]"),
+                "map_values" => c1.dup_of(v, "(m_)->vals[i_]"),
+                _ => {
+                    let (dv, c3) = c1.dup_of(v, "(m_)->vals[i_]")
+                    let (dk, c4) = c3.dup_of(k, "(m_)->keys[i_]")
+                    let (tn, c5) = c4.cname(TNamed(ast.tuple_name(2), [k, v]))
+                    ("({tn})\{ {dk}, {dv} }", c5)
+                },
+            }
+            let (mn, c6) = c2.cname(rt)
+            c6.line(ind, "\{").line(ind, "  {mn}* m_ = {arg(0)};").line(ind, "  {ln}* l_ = {ln}_new(m_->len);").line(ind, "  for (int64_t i_ = 0; i_ < m_->n; i_++) if (m_->live[i_]) {ln}_push_u(&l_, {item});").line(ind, "  {dst} = l_;").line(ind, "}")
+        },
+        ("list_len" | "str_len", _) => c.set(ind, dst, "({arg(0)})->len"),
+        ("list_is_empty" | "str_is_empty", _) => c.set(ind, dst, "(({arg(0)})->len == 0)"),
+        ("list_get", TList(el)) => {
+            let (v, c1) = c.dup_of(el, "({arg(0)})->data[{arg(1)}]")
+            c1.opt_from(ind, dst, t, "{arg(1)} >= 0 && {arg(1)} < ({arg(0)})->len", v)
+        },
+        ("list_first", TList(el)) => {
+            let (v, c1) = c.dup_of(el, "({arg(0)})->data[0]")
+            c1.opt_from(ind, dst, t, "({arg(0)})->len > 0", v)
+        },
+        ("list_last", TList(el)) => {
+            let (v, c1) = c.dup_of(el, "({arg(0)})->data[({arg(0)})->len - 1]")
+            c1.opt_from(ind, dst, t, "({arg(0)})->len > 0", v)
+        },
+        ("list_contains", _) => c.named_call(ind, dst, rt, "_contains({arg(0)}, {arg(1)})"),
+        ("list_reverse", _) => c.named_call(ind, dst, rt, "_reverse({arg(0)})"),
+        ("list_sort", TList(el)) => {
+            let (_, c1) = c.cmp_prefix(el)
+            let mut c2 = c1
+            match el {
+                TInt | TStr | TFloat => {},
+                _ => {
+                    let (known, c3) = c2.named_in(c2.sort_tys, rt)
+                    c2 = c3
+                    if !known {
+                        c2.sort_tys.push(rt)
+                    }
+                },
+            }
+            c2.named_call(ind, dst, rt, "_sort({arg(0)})")
+        },
+        ("list_slice", _) => c.named_call(ind, dst, rt, "_slice({arg(0)}, {arg(1)}, {arg(2)})"),
+        ("list_take", _) => c.named_call(ind, dst, rt, "_slice({arg(0)}, 0, {arg(1)})"),
+        ("list_skip", _) => c.named_call(ind, dst, rt, "_slice({arg(0)}, {arg(1)}, ({arg(0)})->len)"),
+        ("list_join", _) => c.set(ind, dst, "L_Str_join({arg(0)}, {arg(1)})"),
+        ("list_sum", _) => c.set(ind, dst, "L_Int_sum({arg(0)})"),
+        ("str_lines", _) => c.set(ind, dst, "Str_lines({arg(0)})"),
+        ("str_split", _) => c.set(ind, dst, "Str_split({arg(0)}, {arg(1)})"),
+        ("str_trim", _) => c.set(ind, dst, "Str_trim({arg(0)})"),
+        ("str_contains", _) => c.set(ind, dst, "(Str_find({arg(0)}, {arg(1)}, 0) >= 0)"),
+        ("str_starts_with", _) => c.set(ind, dst, "Str_starts({arg(0)}, {arg(1)})"),
+        ("str_ends_with", _) => c.set(ind, dst, "Str_ends({arg(0)}, {arg(1)})"),
+        ("str_to_upper", _) => c.set(ind, dst, "Str_map_case({arg(0)}, true)"),
+        ("str_to_lower", _) => c.set(ind, dst, "Str_map_case({arg(0)}, false)"),
+        ("str_replace", _) => c.set(ind, dst, "Str_replace({arg(0)}, {arg(1)}, {arg(2)})"),
+        ("str_parse_int", _) => c.found(ind, dst, t, "int64_t n_;", "Str_parse_int({arg(0)}, &n_)", "n_"),
+        ("str_parse_float", _) => c.found(ind, dst, t, "double x_;", "Str_parse_float({arg(0)}, &x_)", "x_"),
+        ("str_slice", _) => c.set(ind, dst, "Str_slice({arg(0)}, {arg(1)}, {arg(2)})"),
+        ("str_index_of", _) => c.found(ind, dst, t, "int64_t i_ = Str_find({arg(0)}, {arg(1)}, 0);", "i_ >= 0", "i_"),
+        ("str_last_index_of", _) => c.found(ind, dst, t, "int64_t i_ = Str_rfind({arg(0)}, {arg(1)});", "i_ >= 0", "i_"),
+        ("str_bytes", _) => c.set(ind, dst, "Str_bytes({arg(0)})"),
+        ("str_chars", _) => c.set(ind, dst, "Str_chars({arg(0)})"),
+        ("str_to_bytes" | "bytes_to_str", _) => c.set(ind, dst, "Str_dup({arg(0)})"),
+        ("bytes_new", _) => c.set(ind, dst, "Bytes_from_list({arg(0)}, {c.where(sp)})"),
+        ("bytes_at", _) => c.set(ind, dst, "Bytes_at({arg(0)}, {arg(1)}, {c.where(sp)})"),
+        ("bytes_len", _) => c.set(ind, dst, "({arg(0)})->len"),
+        ("bytes_is_empty", _) => c.set(ind, dst, "(({arg(0)})->len == 0)"),
+        ("bytes_get", _) => c.opt_from(ind, dst, t, "{arg(1)} >= 0 && {arg(1)} < ({arg(0)})->len", "(int64_t)(unsigned char)({arg(0)})->data[{arg(1)}]"),
+        ("bytes_slice", _) => c.set(ind, dst, "Str_slice({arg(0)}, {arg(1)}, {arg(2)})"),
+        ("bytes_to_list", _) => c.set(ind, dst, "Str_bytes({arg(0)})"),
+        ("int_range", _) => c.set(ind, dst, "L_Int_range({arg(0)}, {arg(1)})"),
+        ("int_to_char", _) => c.set(ind, dst, "Int_to_char({arg(0)})"),
+        ("int_min", _) => c.set(ind, dst, "({arg(0)} < {arg(1)} ? {arg(0)} : {arg(1)})"),
+        ("int_max", _) => c.set(ind, dst, "({arg(0)} > {arg(1)} ? {arg(0)} : {arg(1)})"),
+        ("int_to_str" | "float_to_str" | "bool_to_str", _) => c.show_into(ind, dst, [Value(arg(0), rt, true)]),
+        ("int_to_float", _) => c.set(ind, dst, "(double){arg(0)}"),
+        ("int_abs", _) => c.set(ind, dst, "w_abs({arg(0)})"),
+        ("int_shift_right_unsigned", _) => c.set(ind, dst, "w_ushr({arg(0)}, {arg(1)}, {c.where(sp)})"),
+        ("float_to_int", _) => c.set(ind, dst, "w_f2i({arg(0)})"),
+        ("float_abs", _) => c.set(ind, dst, "fabs({arg(0)})"),
+        ("float_sqrt", _) => c.set(ind, dst, "sqrt({arg(0)})"),
+        ("float_to_fixed", _) => c.set(ind, dst, "Float_to_fixed({arg(0)}, {arg(1)})"),
+        ("cap_print", TCap("Stdout")) => c.line(ind, "Cap_print({arg(1)}, true);").set(ind, dst, "0"),
+        ("cap_write", TCap("Stdout")) => c.line(ind, "Cap_print({arg(1)}, false);").set(ind, dst, "0"),
+        ("cap_print", TCap("Stderr")) => c.line(ind, "Cap_eprint({arg(1)}, true);").set(ind, dst, "0"),
+        ("cap_write", TCap("Stderr")) => c.line(ind, "Cap_eprint({arg(1)}, false);").set(ind, dst, "0"),
+        ("cap_now_ms", _) => c.set(ind, dst, "Cap_now_ms()"),
+        ("cap_sleep", TCap("Clock")) => c.line(ind, "Cap_sleep({arg(1)});").set(ind, dst, "0"),
+        ("cap_int", TCap("Rand")) => c.set(ind, dst, "Cap_rand_int({arg(1)}, {arg(2)}, {c.where(sp)})"),
+        ("cap_float", TCap("Rand")) => c.set(ind, dst, "Cap_rand_float()"),
+        ("cap_bytes", TCap("Rand")) => c.set(ind, dst, "Cap_rand_bytes({arg(1)}, {c.where(sp)})"),
+        ("cap_args", TCap("Root")) => c.set(ind, dst, "Cap_args()"),
+        ("cap_read_line", TCap("Stdin")) => c.found(ind, dst, t, "bool ok_;\n{ind}  WStr *s_ = Cap_stdin_line(&ok_);", "ok_", "s_"),
+        ("cap_read_all", TCap("Stdin")) => c.set(ind, dst, "Cap_stdin_all()"),
+        ("cap_get", TCap("Env")) => c.found(ind, dst, t, "bool ok_;\n{ind}  WStr *s_ = Cap_env_get({arg(0)}, {arg(1)}, &ok_);", "ok_", "s_"),
+        ("cap_append", TCap("Fs")) => c.io_result(ind, dst, t, "Cap_fs_append({arg(0)}, {arg(1)}, {arg(2)})", "0"),
+        ("cap_list", TCap("Fs")) => c.io_result(ind, dst, t, "Cap_fs_list({arg(0)}, {arg(1)})", "(L_Str*)r_.ptr"),
+        ("cap_remove", TCap("Fs")) => c.io_result(ind, dst, t, "Cap_fs_remove({arg(0)}, {arg(1)})", "0"),
+        ("cap_make_dir", TCap("Fs")) => c.io_result(ind, dst, t, "Cap_fs_make_dir({arg(0)}, {arg(1)})", "0"),
+        ("cap_is_dir", TCap("Fs")) => c.set(ind, dst, "Cap_fs_is_dir({arg(0)}, {arg(1)})"),
+        ("cap_rename", TCap("Fs")) => c.io_result(ind, dst, t, "Cap_fs_rename({arg(0)}, {arg(1)}, {arg(2)})", "0"),
+        ("cap_info", TCap("Fs")) => {
+            let (fi, c1) = c.ctype(TNamed("FileInfo", []))
+            c1.io_result(ind, dst, t, "Cap_fs_info({arg(0)}, {arg(1)})", "(\{ WFileInfo *i_ = (WFileInfo*)r_.ptr; {fi} v_ = \{ i_->size, i_->mtime_ms, i_->is_file, i_->is_dir }; free(i_); v_; })")
+        },
+        ("cap_only", TCap("Exec")) => c.set(ind, dst, "Cap_exec_only({arg(0)}, {arg(1)})"),
+        ("cap_only", TCap("Foreign")) => c.set(ind, dst, "Cap_foreign_only({arg(0)}, {arg(1)})"),
+        ("cap_allows", TCap("Foreign")) => c.set(ind, dst, "Cap_foreign_allows({arg(0)}, {arg(1)})"),
+        ("cap_copy", TCap("Foreign")) => c.set(ind, dst, "Cap_foreign_copy({arg(0)}, ({arg(1)}).f0, {arg(2)}, {c.where(sp)})"),
+        ("cap_run", TCap("Exec")) => {
+            let (po, c1) = c.ctype(TNamed("ProcessOutput", []))
+            c1.io_result(ind, dst, t, "Cap_exec_run({arg(0)}, {arg(1)}, {arg(2)})", "(\{ WProc *p_ = (WProc*)r_.ptr; {po} v_ = \{ p_->code, p_->out, p_->err }; free(p_); v_; })")
+        },
+        ("cap_only", _) => c.set(ind, dst, "Cap_net_only({arg(0)}, {arg(1)})"),
+        ("cap_get", _) => {
+            let mut c1 = c
+            c1.tls = true
+            let (ht, c2) = c1.ctype(TNamed("HttpResponse", []))
+            let (mt, c3) = c2.cname(TMap(TStr, TStr))
+            c3.io_result(ind, dst, t, "Cap_net_get({arg(0)}, {arg(1)})", "(\{ WHttp *h_ = (WHttp*)r_.ptr; {mt}* m_ = {mt}_new(); for (int i_ = 0; i_ < h_->n; i_++) {mt}_put(&m_, h_->names[i_], h_->values[i_]); {ht} v_ = \{ h_->status, m_, h_->body }; free(h_->names); free(h_->values); free(h_); v_; })")
+        },
+        ("cap_under", _) => c.set(ind, dst, "Cap_fs_under({arg(0)}, {arg(1)})"),
+        ("cap_read_only", _) => c.set(ind, dst, "Cap_fs_read_only({arg(0)})"),
+        ("cap_read", TCap("Conn")) => c.io_result(ind, dst, t, "Cap_conn_read({arg(0)})", "r_.val"),
+        ("cap_write", TCap("Conn")) => c.io_result(ind, dst, t, "Cap_conn_write({arg(0)}, {arg(1)})", "0"),
+        ("cap_on", _) => c.io_result(ind, dst, t, "Cap_listen_on({arg(0)}, {arg(1)})", "(WCap*)r_.ptr"),
+        ("cap_accept", _) => c.io_result(ind, dst, t, "Cap_accept({arg(0)})", "(WCap*)r_.ptr"),
+        ("cap_connect", _) => c.io_result(ind, dst, t, "Cap_net_connect({arg(0)}, {arg(1)})", "(WCap*)r_.ptr"),
+        ("cap_connect_tls", _) => {
+            let mut c1 = c
+            c1.tls = true
+            c1.io_result(ind, dst, t, "Cap_net_connect_tls({arg(0)}, {arg(1)})", "(WCap*)r_.ptr")
+        },
+        ("cap_on_tls", _) => {
+            let mut c1 = c
+            c1.tls = true
+            c1.io_result(ind, dst, t, "Cap_listen_on_tls({arg(0)}, {arg(1)}, {arg(2)}, {arg(3)})", "(WCap*)r_.ptr")
+        },
+        ("cap_port", _) => c.set(ind, dst, "(int64_t)({arg(0)})->port"),
+        ("cap_close", _) => c.line(ind, "Cap_sock_close({arg(0)});").set(ind, dst, "0"),
+        ("cap_read", _) => c.io_result(ind, dst, t, "Cap_fs_read({arg(0)}, {arg(1)})", "r_.val"),
+        ("cap_write", TCap("Fs")) => c.io_result(ind, dst, t, "Cap_fs_write({arg(0)}, {arg(1)}, {arg(2)})", "0"),
+        ("cap_exists", _) => c.set(ind, dst, "Cap_fs_exists({arg(0)}, {arg(1)})"),
+        ("cap_full_path", TCap("Fs")) => c.io_result(ind, dst, t, "Cap_fs_full_path({arg(0)}, {arg(1)})", "r_.val"),
+        ("cap_is_read_only", TCap("Fs")) => c.set(ind, dst, "({arg(0)})->ro"),
+        _ => panic("cgen: unknown primitive {name} on {show(rt)}"),
+    }
+}
+
+// `<CName of rt><rest>`, into dst.
+fn named_call(self: Cg, ind: Str, dst: Str, rt: types.Ty, rest: Str) -> Cg {
+    let (n, c) = self.cname(rt)
+    c.set(ind, dst, n + rest)
+}
+
+// A lookup that may find nothing, into dst of Option type `t`: `decl`
+// declares what the lookup fills, `cond` says whether it found `value`.
+fn found(self: Cg, ind: Str, dst: Str, t: types.Ty, decl: Str, cond: Str, value: Str) -> Cg {
+    let c = self.line(ind, "\{").line(ind, "  " + decl)
+    let (none, c1) = c.mk_enum(t, 1, [])
+    let (some, c2) = c1.mk_enum(t, 0, [value])
+    c2.line(ind, "  {dst} = {cond} ? {some} : {none};").line(ind, "}")
+}
+
+// ---------- owned locals: unwinding drops them after a panic ----------
+
+// A local that owns memory gets a flag (does it still own its value?) and
+// a cleanup that drops it when the flag is set as its scope is left.
+// Normal code clears the flag before moving or dropping the value, so the
+// cleanup only acts during unwinding. A group is left out: unwinding must
+// not free it while its tasks run. It stays on the boundary's list, and
+// w_catch_release waits for them first.
+fn owns_memory(t: types.Ty) -> Bool {
+    match t {
+        TGroup(_) => false,
+        _ => !is_scalar(t),
+    }
+}
+
+fn vol(self: Cg, v: ir.Var) -> Str {
+    if intset.mem(self.vols, v.id) { " volatile" } else { "" }
+}
+
+// Note that owned locals of type `t` need w_dp_<CName>.
+fn add_cell_ty(self: Cg, t: types.Ty) -> Cg {
+    let (known, c) = self.named_in(self.cell_tys, t)
+    let mut c = c
+    if !known {
+        c.cell_tys.push(t)
+    }
+    c
+}
+
+fn cell_decl(self: Cg, ind: Str, v: ir.Var, on: Bool) -> Cg {
+    if !owns_memory(v.ty) {
+        return self
+    }
+    let c = self.add_cell_ty(v.ty).line(ind, "uint8_t{self.vol(v)} {var(v)}_o = {if on { 1 } else { 0 }};")
+    let (n, c1) = c.cname(v.ty)
+    let x = var(v)
+    c1.line(ind, "WCl {x}_cl __attribute__((cleanup(w_cl_run))) = \{ (void*)&{x}, (uint8_t*)&{x}_o, w_dp_{n} };")
+}
+
+fn set_owned(self: Cg, ind: Str, v: ir.Var, on: Bool) -> Cg {
+    if owns_memory(v.ty) { self.line(ind, "{var(v)}_o = {if on { 1 } else { 0 }};") } else { self }
+}
+
+// Clear the flags of the variables an rhs moves out of, before it runs.
+fn release_moved(self: Cg, ind: Str, xs: List[ir.Atom]) -> Cg {
+    let mut c = self
+    for x in xs {
+        match x {
+            V(v) => {
+                c = c.set_owned(ind, v, false)
+            },
+            _ => {},
+        }
+    }
+    c
+}
+
+// The value of a pure call kept across a loop (pure.plan): the first time,
+// make the call and keep a reference in its slot; after that, take the
+// kept value and release what the call would have consumed.
+fn kept_or(self: Cg, ind: Str, v: ir.Var, r: ir.Rhs) -> Cg {
+    let sl = match self.plan.kept.get(v.id) {
+        Some(sl) => sl,
+        None => {
+            return self.release_moved(ind, ir.consumed(r)).rhs_into(ind, var(v), v.ty, r)
+        },
+    }
+    let k = "k{sl.sid}_"
+    let mut c = self.line(ind, "if (__builtin_expect({k}_o, 1)) \{")
+    for x in ir.consumed(r) {
+        match x {
+            V(w) if !is_scalar(w.ty) => {
+                let (n, c1) = c.set_owned(ind + "  ", w, false).cname(w.ty)
+                c = c1.line(ind, "  {n}_drop({var(w)});")
+            },
+            _ => {},
+        }
+    }
+    let (d, c2) = c.dup_of(v.ty, k)
+    c = c2.line(ind, "  {var(v)} = {d};").line(ind, "} else \{").release_moved(ind + "  ", ir.consumed(r)).rhs_into(ind + "  ", var(v), v.ty, r)
+    let (d2, c3) = c.dup_of(v.ty, var(v))
+    c3.line(ind, "  {k} = {d2}; {k}_o = 1;").line(ind, "}")
+}
+
+// ---------- statements ----------
+
+fn stmts(self: Cg, ind: Str, ss: List[ir.Stmt]) -> Cg {
+    ss.fold(self, |c, s| c.stmt(ind, s))
+}
+
+// The loops in `ss`, as the planner counts them: through `if` and loops.
+fn count_loops(ss: List[ir.Stmt]) -> Int {
+    ss.sum_by(|s| match s {
+        Loop(body) => 1 + count_loops(body),
+        If(_, a, b) => count_loops(a) + count_loops(b),
+        _ => 0,
+    })
+}
+
+// The body of loop number `idx`, written at `ind`: loops inside it are
+// numbered from idx + 1 each time it is written.
+fn loop_body(self: Cg, ind: Str, idx: Int, body: List[ir.Stmt]) -> Cg {
+    let mut c = self
+    c.loops = idx + 1
+    c.stmts(ind, body)
+}
+
+fn stmt(self: Cg, ind: Str, s: ir.Stmt) -> Cg {
+    let mut c = self
+    match s {
+        Let(v, r) => {
+            let (ct, c1) = c.ctype(v.ty)
+            c1.line(ind, "{ct}{c1.vol(v)} {var(v)};").cell_decl(ind, v, false).kept_or(ind, v, r).set_owned(ind, v, true)
+        },
+        Decl(v) => {
+            let (ct, c1) = c.ctype(v.ty)
+            c1.line(ind, "{ct}{c1.vol(v)} {var(v)};").cell_decl(ind, v, false)
+        },
+        Init(v, r) => c.kept_or(ind, v, r).set_owned(ind, v, true),
+        Set(v, r, release) => {
+            let (ct, c1) = c.release_moved(ind, ir.consumed(r)).line(ind, "\{").ctype(v.ty)
+            c = c1.line(ind, "  {ct} n_;").rhs_into(ind + "  ", "n_", v.ty, r)
+            if release && !is_scalar(v.ty) {
+                let (n, c2) = c.cname(v.ty)
+                c = c2.line(ind, "  {n}_drop({var(v)});")
+            }
+            c.line(ind, "  {var(v)} = n_;").line(ind, "}").set_owned(ind, v, true)
+        },
+        Mutate(v, steps, m) => c.mutate(ind, v, steps, m),
+        If(cond, a, b) => {
+            let (ca, c1) = c.atom(cond)
+            c = c1.line(ind, "if ({ca}) \{").stmts(ind + "  ", a)
+            if !b.is_empty() {
+                c = c.line(ind, "} else \{").stmts(ind + "  ", b)
+            }
+            c.line(ind, "}")
+        },
+        Loop(body) => {
+            let idx = c.loops
+            match c.plan.at_loop.get(idx) {
+                Some(slots) if !c.slotted.contains(idx) => {
+                    // Slots for the pure calls kept across this loop:
+                    // filled the first time each call runs, released when
+                    // the loop is left by any way.
+                    c.slotted = [idx] + c.slotted
+                    c = c.line(ind, "\{")
+                    for sl in slots {
+                        let k = "k{sl.sid}_"
+                        let (ct, c1) = c.ctype(sl.ty)
+                        c = c1.line(ind, "  {ct} {k}; uint8_t {k}_o = 0;")
+                        if owns_memory(sl.ty) {
+                            let (n, c2) = c.add_cell_ty(sl.ty).cname(sl.ty)
+                            c = c2.line(ind, "  WCl {k}_cl __attribute__((cleanup(w_cl_run))) = \{ (void*)&{k}, (uint8_t*)&{k}_o, w_dp_{n} };")
+                        }
+                    }
+                    c = c.stmt(ind + "  ", s)
+                    c.slotted = c.slotted.skip(1)
+                    c.line(ind, "}")
+                },
+                _ => c.plain_loop(ind, idx, body),
+            }
+        },
+        Break => c.line(ind, "break;"),
+        Continue => c.line(ind, "continue;"),
+        Return(x) => {
+            let (a, c1) = c.release_moved(ind, [x]).atom(x)
+            c1.line(ind, "return {a};")
+        },
+        Drop(v) => {
+            if is_scalar(v.ty) {
+                return c
+            }
+            let (n, c1) = c.set_owned(ind, v, false).cname(v.ty)
+            c1.line(ind, "{n}_drop({var(v)});")
+        },
+        Guard(n, handler, body) => {
+            // A defer. The rest of its block runs under a panic boundary;
+            // normal exits pop it (GuardEnd) and run the deferred body
+            // themselves. A panic or a cancellation lands here (the guard
+            // cleanup is declared after this frame's other locals, so it
+            // jumps back before they are touched), runs the deferred body,
+            // and passes the panic or the cancellation on. What the rest
+            // allocated stays with the enclosing boundary: an outer
+            // variable may now point at it.
+            let g = "g{n}_"
+            c.line(ind, "\{").line(ind, "  WCatch {g};").line(ind, "  w_catch_init(&{g});").line(ind, "  WCatch **{g}slot = w_catch_slot();").line(ind, "  if (_setjmp({g}.jb) == 0) \{").line(ind, "    WCatch *{g}land __attribute__((cleanup(w_catch_land))) = &{g};").line(ind, "    if ({g}slot) *{g}slot = &{g};").stmts(ind + "    ", body).line(ind, "  } else \{").line(ind, "    w_catch_end(&{g});").line(ind, "    int cancel_ = {g}.cancel;").line(ind, "    char m_[1024] = \"\", w_[512] = \"\";").line(ind, "    if (!cancel_) \{ snprintf(m_, sizeof m_, \"%s\", {g}.msg); snprintf(w_, sizeof w_, \"%s\", {g}.where); free({g}.msg); free({g}.where); }").stmts(ind + "    ", handler).line(ind, "    if (cancel_) w_cancel_unwind();").line(ind, "    w_panic_c(m_, w_);").line(ind, "  }").line(ind, "}")
+        },
+        Scope(g, body) => {
+            // A group body under its deadline: the deadline cancels it at
+            // its next wait, like a task, and it unwinds to this boundary;
+            // then the join after it goes on. A panic, or a cancellation
+            // from further out, passes on (w_scope_land).
+            c.scopes = c.scopes + 1
+            let b = "s{c.scopes}_"
+            let (ga, c1) = c.atom(g)
+            c1.line(ind, "\{").line(ind, "  WScope {b}sc; w_scope_push(&{b}sc, {ga});").line(ind, "  WCatch {b};").line(ind, "  w_catch_init(&{b});").line(ind, "  WCatch **{b}slot = w_catch_slot();").line(ind, "  if (_setjmp({b}.jb) == 0) \{").line(ind, "    WCatch *{b}land __attribute__((cleanup(w_catch_land))) = &{b};").line(ind, "    *{b}slot = &{b};").stmts(ind + "    ", body).line(ind, "    *{b}slot = {b}.prev;").line(ind, "    w_catch_end(&{b});").line(ind, "  } else w_scope_land(&{b}, &{b}sc);").line(ind, "  w_scope_pop(&{b}sc);").line(ind, "}")
+        },
+        GuardEnd(n) => {
+            let g = "g{n}_"
+            c.line(ind, "if ({g}slot) *{g}slot = {g}.prev;").line(ind, "w_catch_end(&{g});")
+        },
+    }
+}
+
+fn mutate(self: Cg, ind: Str, v: ir.Var, steps: List[ir.Step], m: ir.Mutation) -> Cg {
+    let (vt, c0) = self.release_moved(ind, ir.mut_atoms(m)).line(ind, "\{").ctype(v.ty)
+    let mut c = c0.line(ind, "  {vt}* p0_ = ({vt}*)&{var(v)};")
+    let mut p = "p0_"
+    let mut t = v.ty
+    for (i, step) in steps.with_index() {
+        let q = "p{i + 1}_"
+        match step {
+            PField(k) => {
+                let ft = c.fields_of(t)[k].1
+                let (ct, c1) = c.ctype(ft)
+                c = c1.line(ind, "  {ct}* {q} = &({p}->f{k});")
+                t = ft
+            },
+            PIndex(ia, sp) => match t {
+                TList(el) => {
+                    if !(i == 0 && c.uniq.contains(v.id)) {
+                        let (n, c1) = c.cname(t)
+                        c = c1.line(ind, "  {n}_unique({p});")
+                    }
+                    let proven = i == 0 && match ia {
+                        V(iv) => c.inrange.contains((v.id, iv.id)),
+                        _ => false,
+                    }
+                    let wh = c.where(sp)
+                    let (a, c1) = c.atom(ia)
+                    let (n, c2) = c1.cname(t)
+                    let (ct, c3) = c2.ctype(el)
+                    c = if proven { c3.line(ind, "  {ct}* {q} = &(*{p})->data[{a}];") } else { c3.line(ind, "  {ct}* {q} = {n}_at(*{p}, {a}, {wh});") }
+                    t = el
+                },
+                TArray(el, TLen(n)) => {
+                    let wh = c.where(sp)
+                    let (a, c1) = c.atom(ia)
+                    let (ct, c2) = c1.ctype(el)
+                    c = c2.line(ind, "  {ct}* {q} = &({p}->a[w_idx({a}, {n}, {wh})]);")
+                    t = el
+                },
+                _ => panic("mutate index"),
+            },
+            PKey(k, sp) => match t {
+                TMap(_, vt2) => {
+                    let (n, c1) = c.cname(t)
+                    let wh = c1.where(sp)
+                    let (a, c2) = c1.line(ind, "  {n}_unique({p});").atom(k)
+                    let (ct, c3) = c2.ctype(vt2)
+                    c = c3.line(ind, "  {ct}* {q} = {n}_slot(*{p}, {a}, {wh});")
+                    t = vt2
+                },
+                _ => panic("mutate key"),
+            },
+            PIndexU(_) => panic("mutate through unchecked index"),
+        }
+        p = q
+    }
+    c = match m {
+        MSet(x) => {
+            if !is_scalar(t) {
+                let (n, c1) = c.cname(t)
+                c = c1.line(ind, "  {n}_drop(*{p});")
+            }
+            let (a, c2) = c.atom(x)
+            c2.line(ind, "  *{p} = {a};")
+        },
+        MPush(x) => {
+            let unchecked = steps.is_empty() && c.uniq.contains(v.id)
+            let (a, c1) = c.atom(x)
+            let (n, c2) = c1.cname(t)
+            c2.line(ind, "  {n}_push{if unchecked { "_u" } else { "" }}({p}, {a});")
+        },
+        MPut(k, x) => {
+            let (xa, c1) = c.atom(x)
+            let (ka, c2) = c1.atom(k)
+            let (n, c3) = c2.cname(t)
+            c3.line(ind, "  {n}_put({p}, {ka}, {xa});")
+        },
+        MRemove(k) => {
+            let (ka, c1) = c.atom(k)
+            let (n, c2) = c1.cname(t)
+            c2.line(ind, "  {n}_remove({p}, {ka});")
+        },
+    }
+    c.line(ind, "}")
+}
+
+// A loop without slots, as C: the lists it keeps unique made unique once
+// before it, then a fill in one go, a versioned loop, or a plain one.
+fn plain_loop(self: Cg, ind: Str, idx: Int, body: List[ir.Stmt]) -> Cg {
+    let mut c = self
+    // A list that the loop mutates but never shares (no retain, no move,
+    // no reassignment) stays unique: make it unique once, here, and skip
+    // the copy-on-write check on every write inside the loop.
+    let saved = c.uniq
+    let hoisted = hoist.mutated_lists(body).filter(|v| !saved.contains(v.id) && !hoist.escapes(v, body))
+    for v in hoisted {
+        let (n, c1) = c.cname(v.ty)
+        c = c1.line(ind, "{n}_unique(&{var(v)});")
+    }
+    c.uniq = hoisted.map(|v| v.id) + saved
+    match hoist.fill_loop(body) {
+        Some(f) => {
+            // Fill in one go: reserve once, then a plain store loop the C
+            // compiler vectorises.
+            let (ln, c1) = c.cname(f.v.ty)
+            let el = match f.v.ty {
+                TList(e) => e,
+                _ => TUnit,
+            }
+            let (na, c2) = c1.line(ind, "\{").line(ind, "  int64_t cnt_;").atom(f.n)
+            let (ct, c3) = c2.line(ind, "  if (!__builtin_sub_overflow({na}, {var(f.i)}, &cnt_) && cnt_ < INT64_MAX - 1) \{").line(ind, "    cnt_ += {if f.inclusive { 1 } else { 0 }};").line(ind, "    int64_t want_;").line(ind, "    if (cnt_ > 0 && __builtin_add_overflow({var(f.v)}->len, cnt_, &want_)) w_oom();").line(ind, "    if (cnt_ > 0) \{").line(ind, "      {ln}_reserve(&{var(f.v)}, want_);").ctype(el)
+            let (xa, c4) = c3.line(ind, "      {ct}* d_ = {var(f.v)}->data + {var(f.v)}->len;").atom(f.x)
+            c = c4.line(ind, "      for (int64_t k_ = 0; k_ < cnt_; k_++) d_[k_] = {xa};").line(ind, "      {var(f.v)}->len += cnt_; {var(f.i)} += cnt_;").line(ind, "    }").line(ind, "  } else \{").line(ind, "  for (;;) \{").loop_body(ind + "    ", idx, body).line(ind, "  }").line(ind, "  }").line(ind, "}")
+        },
+        None => match hoist.versionable(body) {
+            Some(vs) => {
+                // Loop versioning: one range check up front, no bounds
+                // checks inside.
+                let (step, c1) = c.atom(vs.step)
+                let (n, c2) = c1.atom(vs.n)
+                c = c2
+                let conds = ["{var(vs.m)} >= 0", "{step} >= 0", "{n} <= INT64_MAX - {step}"] + vs.lists.map(|v| "{n} {if vs.inclusive { "<" } else { "<=" }} {var(v)}->len")
+                c = c.line(ind, "if ({conds.join(" && ")}) \{")
+                let saved_r = c.inrange
+                c.inrange = vs.lists.map(|v| (v.id, vs.m.id)) + c.inrange
+                c = c.line(ind, "  for (;;) \{").loop_body(ind + "    ", idx, body).line(ind, "  }")
+                c.inrange = saved_r
+                c = c.line(ind, "} else \{").line(ind, "  for (;;) \{").loop_body(ind + "    ", idx, body).line(ind, "  }").line(ind, "}")
+            },
+            None => {
+                c = c.line(ind, "for (;;) \{").loop_body(ind + "  ", idx, body).line(ind, "}")
+            },
+        },
+    }
+    c.loops = idx + 1 + count_loops(body)
+    c.uniq = saved
+    c
+}
+
+// ---------- functions ----------
+
+fn signature(self: Cg, f: ir.Fn) -> (Str, Cg) {
+    let mut c = self
+    let mut ps: List[Str] = if f.is_closure { ["WClo* self_"] } else { [] }
+    for v in f.params {
+        let (ct, c1) = c.ctype(v.ty)
+        c = c1
+        ps.push("{ct}{c.vol(v)} {var(v)}")
+    }
+    let (rt, c2) = c.ctype(f.ret)
+    ("static {rt} {f.fname}({if ps.is_empty() { "void" } else { ps.join(", ") }})", c2)
+}
+
+fn atom_ids(xs: List[ir.Atom]) -> List[Int] {
+    xs.flat_map(|a| match ir.atom_var(a) {
+        Some(v) => [v.id],
+        None => [],
+    })
+}
+
+// The variables declared in statements, and those they use.
+struct Uses {
+    declared: List[Int],
+    used: List[Int],
+}
+
+fn no_uses() -> Uses {
+    Uses { declared: [], used: [] }
+}
+
+fn join_uses(a: Uses, b: Uses) -> Uses {
+    Uses { declared: intset.union(a.declared, b.declared), used: intset.union(a.used, b.used) }
+}
+
+fn scan(ss: List[ir.Stmt]) -> Uses {
+    ss.fold(no_uses(), |acc, s| join_uses(acc, scan1(s)))
+}
+
+fn rhs_ids(r: ir.Rhs) -> List[Int] {
+    atom_ids(ir.consumed(r) + ir.borrowed(r))
+}
+
+fn scan1(s: ir.Stmt) -> Uses {
+    match s {
+        Let(v, r) => Uses { declared: [v.id], used: intset.of_list(rhs_ids(r)) },
+        Decl(v) => Uses { declared: [v.id], used: [] },
+        Init(v, r) | Set(v, r, _) => Uses { declared: [], used: intset.add(intset.of_list(rhs_ids(r)), v.id) },
+        Mutate(v, steps, m) => Uses { declared: [], used: intset.add(intset.of_list(atom_ids(ir.step_atoms(steps) + ir.mut_atoms(m))), v.id) },
+        If(cnd, a, b) => {
+            let u = join_uses(scan(a), scan(b))
+            Uses { declared: u.declared, used: intset.union(intset.of_list(atom_ids([cnd])), u.used) }
+        },
+        Loop(b) => scan(b),
+        Return(a) => Uses { declared: [], used: intset.of_list(atom_ids([a])) },
+        Drop(v) => Uses { declared: [], used: [v.id] },
+        Guard(_, h, b) => join_uses(scan(h), scan(b)),
+        Scope(_, b) => scan(b),
+        Break | Continue | GuardEnd(_) => no_uses(),
+    }
+}
+
+// The variables a guard needs volatile (see Cg.vols): those its deferred
+// body uses, and those declared outside its guarded statements that those
+// statements use (a write there changes a value or an owned flag that the
+// frame's cleanups read after the longjmp). Variables declared inside the
+// guarded statements are cleaned up by unwinding itself, before the jump.
+fn guard_vols(body: List[ir.Stmt]) -> List[Int] {
+    vols_in([], body)
+}
+
+fn vols_in(acc: List[Int], ss: List[ir.Stmt]) -> List[Int] {
+    ss.fold(acc, |acc, s| match s {
+        Guard(_, h, b) => {
+            let hu = scan(h).used
+            let bs = scan(b)
+            vols_in(vols_in(intset.union(acc, intset.union(hu, intset.diff(bs.used, bs.declared))), h), b)
+        },
+        Scope(_, b) => {
+            // the code after a stopped body reads what the body wrote
+            let bs = scan(b)
+            vols_in(intset.union(acc, intset.diff(bs.used, bs.declared)), b)
+        },
+        If(_, a, b) => vols_in(vols_in(acc, a), b),
+        Loop(b) => vols_in(acc, b),
+        _ => acc,
+    })
+}
+
+fn fn_body(self: Cg, f: ir.Fn) -> Cg {
+    let mut c = self
+    c.vols = guard_vols(f.body)
+    (c.plan, c.slot) = pure.plan(c.pure, f, c.slot)
+    c.loops = 0
+    c.slotted = []
+    let (sig, c1) = c.signature(f)
+    c = c1.put(sig + " \{\n")
+    // parameters are owned by the function
+    for v in f.params {
+        c = c.cell_decl("  ", v, true)
+    }
+    if !f.captures.is_empty() {
+        c = c.put("  struct Env_{f.fname}* env_ = (struct Env_{f.fname}*)self_;\n")
+        for (i, v) in f.captures.with_index() {
+            let (d, c2) = c.dup_of(v.ty, "env_->c{i}")
+            let (ct, c3) = c2.ctype(v.ty)
+            c = c3.put("  {ct}{c3.vol(v)} {var(v)} = {d};\n").cell_decl("  ", v, true)
+        }
+    }
+    c = c.stmts("  ", f.body).put("  w_unreachable();\n}\n\n")
+    c.vols = []
+    c.plan = pure.no_plan()
+    c
+}
+
+// ---------- type definitions ----------
+
+// The named types and arrays a type holds by value (lists, strings and
+// closures are pointers).
+fn by_value(t: types.Ty) -> List[types.Ty] {
+    match t {
+        TNamed(..) | TArray(..) => [t],
+        _ => [],
+    }
+}
+
+fn contents(self: Cg, t: types.Ty) -> List[types.Ty] {
+    match t {
+        TNamed(..) => self.parts(t).flat_map(by_value),
+        TArray(e, _) => by_value(e),
+        _ => [],
+    }
+}
+
+// Whether `t` reaches itself through what it holds by value.
+fn reaches_self(self: Cg, t: types.Ty) -> Bool {
+    let mut seen: List[types.Ty] = []
+    let mut todo = [t]
+    // depth first, as the OCaml search goes
+    while !todo.is_empty() {
+        let u = todo[0]
+        todo = todo.skip(1)
+        let mut next: List[types.Ty] = []
+        for w in self.contents(u) {
+            if w == t {
+                return true
+            }
+            if !seen.contains(w) {
+                seen.push(w)
+                next.push(w)
+            }
+        }
+        todo = next + todo
+    }
+    false
+}
+
+fn compute_boxed(self: Cg) -> Cg {
+    let mut c = self
+    let mut boxed: List[Str] = []
+    for t in c.types {
+        match t {
+            TNamed(..) if c.is_enum(t) && c.reaches_self(t) => {
+                let (n, c1) = c.cname(t)
+                c = c1
+                boxed.push(n)
+            },
+            _ => {},
+        }
+    }
+    c.boxed = boxed
+    c
+}
+
+fn is_boxed(self: Cg, t: types.Ty) -> Bool {
+    match self.names.get(show(t)) {
+        Some(n) => self.boxed.contains(n),
+        None => false,
+    }
+}
+
+// The named types and arrays, ordered so that every by-value dependency
+// is defined first.
+fn topo(self: Cg) -> List[types.Ty] {
+    let mut done: List[types.Ty] = []
+    let mut order: List[types.Ty] = []
+    for t in self.types {
+        match t {
+            TNamed(..) | TArray(..) => {
+                (done, order) = self.visit(t, [], done, order)
+            },
+            _ => {},
+        }
+    }
+    order
+}
+
+fn visit(self: Cg, t: types.Ty, visiting: List[types.Ty], done: List[types.Ty], order: List[types.Ty]) -> (List[types.Ty], List[types.Ty]) {
+    if done.contains(t) {
+        return (done, order)
+    }
+    if visiting.contains(t) {
+        panic("recursive type needs an enum to break the cycle: " + show(t))
+    }
+    let mut d = done
+    let mut o = order
+    for u in self.contents(t) {
+        if !self.is_boxed(u) {
+            (d, o) = self.visit(u, visiting + [t], d, o)
+        }
+    }
+    d.push(t)
+    o.push(t)
+    (d, o)
+}
+
+fn list_depth(t: types.Ty) -> Int {
+    match t {
+        TList(e) => 1 + list_depth(e),
+        _ => 0,
+    }
+}
+
+fn acc_of(boxed: Bool) -> Str {
+    if boxed { "->" } else { "." }
+}
+
+// The C definitions of the program's composite types and their
+// functions, in pieces.
+fn type_defs(self: Cg) -> (List[Str], Cg) {
+    let mut c = self.compute_boxed()
+    let mut out: List[Str] = []
+    let lists = c.types.filter(|t| match t {
+        TList(_) => true,
+        _ => false,
+    })
+    let maps = c.types.filter(|t| match t {
+        TMap(..) => true,
+        _ => false,
+    })
+    let named = c.topo()
+    // forward typedefs
+    for t in lists + named {
+        let (n, c1) = c.cname(t)
+        c = c1
+        out.push(match t {
+            TList(_) => "typedef struct {n} {n};",
+            _ => if c.is_boxed(t) { "typedef struct {n}_box* {n};" } else { "typedef struct {n} {n};" },
+        })
+    }
+    for t in maps {
+        let (n, c1) = c.cname(t)
+        c = c1
+        out.push("typedef struct {n} {n};")
+    }
+    for t in lists {
+        match t {
+            TList(e) => {
+                let (et, c1) = c.ctype(e)
+                let (n, c2) = c1.cname(t)
+                c = c2
+                out.push("LIMEN_LIST_STRUCT({n}, {et})")
+            },
+            _ => {},
+        }
+    }
+    for t in maps {
+        match t {
+            TMap(k, v) => {
+                let (vt, c1) = c.ctype(v)
+                let (kt, c2) = c1.ctype(k)
+                let (n, c3) = c2.cname(t)
+                c = c3
+                out.push("LIMEN_MAP_STRUCT({n}, {kt}, {vt})")
+            },
+            _ => {},
+        }
+    }
+    // map prototypes: lists and structs of maps refer to them
+    for t in maps {
+        let (n, c1) = c.cname(t)
+        c = c1
+        out.push("static {n}* {n}_dup({n}* m);\nstatic void {n}_drop({n}* m);\nstatic void {n}_share({n}* m);\nstatic bool {n}_eq({n}* a, {n}* b);\nstatic void {n}_show(WBuf* b, {n}* m, bool top);")
+    }
+    // struct bodies
+    for t in named {
+        let (n, c1) = c.cname(t)
+        c = c1
+        match t {
+            TArray(e, TLen(k)) => {
+                let (et, c2) = c.ctype(e)
+                c = c2
+                out.push("struct {n} \{ {et} a[{k.max(1)}]; };")
+            },
+            _ => if c.is_enum(t) {
+                let vs = c.variants_of(t)
+                let boxed = c.is_boxed(t)
+                out.push("struct {n}{if boxed { "_box" } else { "" }} \{{if boxed { " int64_t rc;" } else { "" }} int32_t tag;")
+                if vs.any(|v| !v.1.is_empty()) {
+                    out.push("  union \{")
+                    for (k, v) in vs.with_index() {
+                        if !v.1.is_empty() {
+                            let mut fs: List[Str] = []
+                            for (i, pt) in v.1.with_index() {
+                                let (ct, c2) = c.ctype(pt)
+                                c = c2
+                                fs.push("{ct} f{i};")
+                            }
+                            out.push("    struct \{ {fs.join(" ")} } v{k};")
+                        }
+                    }
+                    out.push("  } u;")
+                }
+                out.push("};")
+            } else {
+                let mut fs: List[Str] = []
+                for (i, f) in c.fields_of(t).with_index() {
+                    let (ct, c2) = c.ctype(f.1)
+                    c = c2
+                    fs.push("{ct} f{i};")
+                }
+                out.push("struct {n} \{ {if fs.is_empty() { "char empty_;" } else { fs.join(" ") }} };")
+            },
+        }
+    }
+    // prototypes
+    for t in named {
+        let (n, c1) = c.cname(t)
+        let (ct, c2) = c1.ctype(t)
+        c = c2
+        out.push("static {ct} {n}_dup({ct} v);")
+        out.push("static void {n}_drop({ct} v);")
+        out.push("static bool {n}_eq({ct} a, {ct} b);")
+        out.push("static void {n}_show(WBuf* b, {ct} v, bool top);")
+        out.push("static void {n}_share({ct} v);")
+        if c.is_boxed(t) {
+            out.push("static void {n}_kids(void* o);")
+        }
+    }
+    // enum constructors and accessors
+    for t in named {
+        if !c.is_enum(t) {
+            continue
+        }
+        let (n, c1) = c.cname(t)
+        c = c1
+        let boxed = c.is_boxed(t)
+        let acc = acc_of(boxed)
+        out.push("#define {n}_tag(v) ((v){acc}tag)")
+        for (k, v) in c.variants_of(t).with_index() {
+            for (i, _) in v.1.with_index() {
+                out.push("#define {n}_p_{k}_{i}(v) ((v){acc}u.v{k}.f{i})")
+            }
+            let mut params: List[Str] = []
+            for (i, pt) in v.1.with_index() {
+                let (ct, c2) = c.ctype(pt)
+                c = c2
+                params.push("{ct} a{i}")
+            }
+            out.push("static inline {n} {n}_mk_{k}({if params.is_empty() { "void" } else { params.join(", ") }}) \{")
+            out.push(if boxed { "  {n} r = ({n})w_alloc_k(sizeof(struct {n}_box), WK_PLAIN); r->rc = 1; w_set_kids(r, {n}_kids);" } else { "  {n} r;" })
+            out.push("  r{acc}tag = {k};")
+            for (i, _) in v.1.with_index() {
+                out.push("  r{acc}u.v{k}.f{i} = a{i};")
+            }
+            out.push("  return r;")
+            out.push("}")
+        }
+    }
+    // list functions, inner lists first
+    for t in lists.sort_by(list_depth) {
+        match t {
+            TList(e) => {
+                let (en, c1) = c.cname(e)
+                let (et, c2) = c1.ctype(e)
+                let (n, c3) = c2.cname(t)
+                c = c3
+                out.push("LIMEN_LIST_FUNCS({n}, {et}, {en})")
+                if e == TFloat {
+                    out.push("LIMEN_LIST_SORT({n}, double, Float)")
+                }
+            },
+            _ => {},
+        }
+    }
+    for t in maps {
+        match t {
+            TMap(k, _) => {
+                (_, c) = c.hash_prefix(k)
+            },
+            _ => {},
+        }
+    }
+    for t in c.hash_tys {
+        let (ct, c1) = c.ctype(t)
+        let (n, c2) = c1.cname(t)
+        c = c2
+        out.push("static uint64_t {n}_hash({ct} v);")
+    }
+    for t in maps {
+        match t {
+            TMap(k, v) => {
+                let (vn, c1) = c.cname(v)
+                let (vt, c2) = c1.ctype(v)
+                let (kn, c3) = c2.cname(k)
+                let (kt, c4) = c3.ctype(k)
+                let (n, c5) = c4.cname(t)
+                c = c5
+                out.push("LIMEN_MAP_FUNCS({n}, {kt}, {kn}, {vt}, {vn})")
+            },
+            _ => {},
+        }
+    }
+    // dup/drop/eq/show definitions
+    for t in named {
+        let (ls, c1) = c.value_fns(t)
+        c = c1
+        out = out + ls
+    }
+    let (ls, c2) = c.cmp_defs()
+    (out + ls, c2)
+}
+
+// The dup, drop, share, eq and show functions of a named type or array.
+fn value_fns(self: Cg, t: types.Ty) -> (List[Str], Cg) {
+    let (n, c0) = self.cname(t)
+    let (ct, c1) = c0.ctype(t)
+    let mut c = c1
+    let mut out: List[Str] = []
+    match t {
+        TArray(e, TLen(k)) => {
+            let (en, c2) = c.cname(e)
+            c = c2
+            let each = |f: Str| if is_scalar(e) { [] } else { ["  for (int64_t i = 0; i < {k}; i++) {f};"] }
+            out = out + ["static {ct} {n}_dup({ct} v) \{"] + each("v.a[i] = {en}_dup(v.a[i])") + ["  return v;\n}"]
+            out = out + ["static void {n}_drop({ct} v) \{", "  (void)v;"] + each("{en}_drop(v.a[i])") + ["}"]
+            out = out + ["static void {n}_share({ct} v) \{", "  (void)v;"] + each("{en}_share(v.a[i])") + ["}"]
+            let (eq, c3) = c.binop(Eq, e, "a.a[i]", "b.a[i]", diag.nowhere())
+            c = c3
+            out = out + ["static bool {n}_eq({ct} a, {ct} b) \{", "  for (int64_t i = 0; i < {k}; i++) if (!({eq})) return false;", "  (void)a; (void)b; return true;\n}"]
+            out = out + ["static void {n}_show(WBuf* b, {ct} v, bool top) \{", "  (void)top; buf_puts(b, \"[\");", "  for (int64_t i = 0; i < {k}; i++) \{ if (i) buf_puts(b, \", \"); {en}_show(b, v.a[i], false); }", "  buf_puts(b, \"]\");\n}"]
+        },
+        _ => if c.is_enum(t) {
+            let vs = c.variants_of(t)
+            let boxed = c.is_boxed(t)
+            let acc = acc_of(boxed)
+            // one `case` per variant, with what `f` writes for each of its
+            // payloads
+            out.push("static {ct} {n}_dup({ct} v) \{")
+            if boxed {
+                out.push("  w_rc_inc(&v->rc);")
+            } else {
+                out.push("  switch (v.tag) \{")
+                for (k, v) in vs.with_index() {
+                    out.push("    case {k}: \{")
+                    for (i, pt) in v.1.with_index() {
+                        if !is_scalar(pt) {
+                            let (pn, c2) = c.cname(pt)
+                            c = c2
+                            out.push("      v.u.v{k}.f{i} = {pn}_dup(v.u.v{k}.f{i});")
+                        }
+                    }
+                    out.push("      break; }")
+                }
+                out.push("  }")
+            }
+            out.push("  return v;\n}")
+            if boxed {
+                out = out + ["static void {n}_kids(void* o) \{", "  {n} v = ({n})o;", "  switch (v->tag) \{"]
+                for (k, v) in vs.with_index() {
+                    out.push("    case {k}: \{")
+                    for (i, pt) in v.1.with_index() {
+                        if !is_scalar(pt) {
+                            let (pn, c2) = c.cname(pt)
+                            c = c2
+                            out.push("      {pn}_drop(v->u.v{k}.f{i});")
+                        }
+                    }
+                    out.push("      break; }")
+                }
+                out = out + ["  }", "}"]
+            }
+            out.push("static void {n}_drop({ct} v) \{")
+            if boxed {
+                out.push("  if (!w_rc_dec(&v->rc)) return;")
+            }
+            out.push("  switch (v{acc}tag) \{")
+            for (k, v) in vs.with_index() {
+                out.push("    case {k}: \{")
+                for (i, pt) in v.1.with_index() {
+                    if !is_scalar(pt) {
+                        let (pn, c2) = c.cname(pt)
+                        c = c2
+                        out.push("      {pn}_drop(v{acc}u.v{k}.f{i});")
+                    }
+                }
+                out.push("      break; }")
+            }
+            out.push("  }")
+            if boxed {
+                out.push("  w_free(v);")
+            }
+            out.push("}")
+            out.push("static void {n}_share({ct} v) \{")
+            if boxed {
+                out.push("  if (!w_rc_share(&v->rc)) return;")
+            }
+            out.push("  switch (v{acc}tag) \{")
+            for (k, v) in vs.with_index() {
+                out.push("    case {k}: \{")
+                for (i, pt) in v.1.with_index() {
+                    if !is_scalar(pt) {
+                        let (pn, c2) = c.cname(pt)
+                        c = c2
+                        out.push("      {pn}_share(v{acc}u.v{k}.f{i});")
+                    }
+                }
+                out.push("      break; }")
+            }
+            out = out + ["  }", "}"]
+            out.push("static bool {n}_eq({ct} a, {ct} b) \{")
+            out.push("  if (a{acc}tag != b{acc}tag) return false;")
+            out.push("  switch (a{acc}tag) \{")
+            for (k, v) in vs.with_index() {
+                out.push("    case {k}: \{")
+                for (i, pt) in v.1.with_index() {
+                    let (eq, c2) = c.binop(Eq, pt, "a{acc}u.v{k}.f{i}", "b{acc}u.v{k}.f{i}", diag.nowhere())
+                    c = c2
+                    out.push("      if (!({eq})) return false;")
+                }
+                out.push("      break; }")
+            }
+            out = out + ["  }", "  return true;\n}"]
+            out = out + ["static void {n}_show(WBuf* b, {ct} v, bool top) \{", "  (void)top;", "  switch (v{acc}tag) \{"]
+            for (k, v) in vs.with_index() {
+                out.push("    case {k}:")
+                out.push("      buf_puts(b, {c_string(if v.1.is_empty() { v.0 } else { v.0 + "(" })});")
+                for (i, pt) in v.1.with_index() {
+                    if i > 0 {
+                        out.push("      buf_puts(b, \", \");")
+                    }
+                    let (pn, c2) = c.cname(pt)
+                    c = c2
+                    out.push("      {pn}_show(b, v{acc}u.v{k}.f{i}, false);")
+                }
+                if !v.1.is_empty() {
+                    out.push("      buf_puts(b, \")\");")
+                }
+                out.push("      break;")
+            }
+            out.push("  }\n}")
+        } else {
+            let fs = c.fields_of(t)
+            out.push("static {ct} {n}_dup({ct} v) \{")
+            for (i, f) in fs.with_index() {
+                if !is_scalar(f.1) {
+                    let (fn_, c2) = c.cname(f.1)
+                    c = c2
+                    out.push("  v.f{i} = {fn_}_dup(v.f{i});")
+                }
+            }
+            out.push("  return v;\n}")
+            out = out + ["static void {n}_drop({ct} v) \{", "  (void)v;"]
+            for (i, f) in fs.with_index() {
+                if !is_scalar(f.1) {
+                    let (fn_, c2) = c.cname(f.1)
+                    c = c2
+                    out.push("  {fn_}_drop(v.f{i});")
+                }
+            }
+            out.push("}")
+            out = out + ["static void {n}_share({ct} v) \{", "  (void)v;"]
+            for (i, f) in fs.with_index() {
+                if !is_scalar(f.1) {
+                    let (fn_, c2) = c.cname(f.1)
+                    c = c2
+                    out.push("  {fn_}_share(v.f{i});")
+                }
+            }
+            out.push("}")
+            out = out + ["static bool {n}_eq({ct} a, {ct} b) \{", "  (void)a; (void)b;"]
+            for (i, f) in fs.with_index() {
+                let (eq, c2) = c.binop(Eq, f.1, "a.f{i}", "b.f{i}", diag.nowhere())
+                c = c2
+                out.push("  if (!({eq})) return false;")
+            }
+            out.push("  return true;\n}")
+            out = out + ["static void {n}_show(WBuf* b, {ct} v, bool top) \{", "  (void)top; (void)v;"]
+            let name = match t {
+                TNamed(nm, _) => nm,
+                _ => "",
+            }
+            let tuple = ast.is_tuple_name(name)
+            out.push("  buf_puts(b, {c_string(if tuple { "(" } else { name + " \{ " })});")
+            for (i, f) in fs.with_index() {
+                out.push("  buf_puts(b, {c_string((if i > 0 { ", " } else { "" }) + if tuple { "" } else { f.0 + ": " })});")
+                let (fn_, c2) = c.cname(f.1)
+                c = c2
+                out.push("  {fn_}_show(b, v.f{i}, false);")
+            }
+            out.push(if tuple { "  buf_puts(b, \")\");\n}" } else { "  buf_puts(b, \" }\");\n}" })
+        },
+    }
+    (out, c)
+}
+
+// Order functions, item by item as the interpreter compares; and hash
+// functions for tuple, struct and enum map keys.
+fn cmp_defs(self: Cg) -> (List[Str], Cg) {
+    let mut c = self
+    let mut out: List[Str] = []
+    for t in c.hash_tys {
+        let (n, c1) = c.cname(t)
+        let (ct, c2) = c1.ctype(t)
+        c = c2
+        out.push("static uint64_t {n}_hash({ct} v) \{")
+        out.push("  uint64_t h = 0x2545F4914F6CDD1DULL; (void)v;")
+        if c.is_enum(t) {
+            let acc = acc_of(c.is_boxed(t))
+            out.push("  h = w_hash_mix(h, Int_hash(v{acc}tag));")
+            out.push("  switch (v{acc}tag) \{")
+            for (k, v) in c.variants_of(t).with_index() {
+                out.push("    case {k}:")
+                for (i, pt) in v.1.with_index() {
+                    let (hp, c3) = c.hash_prefix(pt)
+                    c = c3
+                    out.push("  h = w_hash_mix(h, {hp}_hash(v{acc}u.v{k}.f{i}));")
+                }
+                out.push("      break;")
+            }
+            out.push("  }")
+        } else {
+            for (i, f) in c.fields_of(t).with_index() {
+                let (hp, c3) = c.hash_prefix(f.1)
+                c = c3
+                out.push("  h = w_hash_mix(h, {hp}_hash(v.f{i}));")
+            }
+        }
+        out.push("  return h;")
+        out.push("}")
+    }
+    for t in c.cmp_tys {
+        let (ct, c1) = c.ctype(t)
+        let (n, c2) = c1.cname(t)
+        c = c2
+        out.push("static int {n}_cmp({ct} a, {ct} b);")
+    }
+    for t in c.cmp_tys {
+        let (n, c1) = c.cname(t)
+        let (ct, c2) = c1.ctype(t)
+        c = c2
+        out.push("static int {n}_cmp({ct} a, {ct} b) \{")
+        out.push("  (void)a; (void)b;")
+        match t {
+            TList(e) => {
+                out.push("  int64_t n_ = a->len < b->len ? a->len : b->len;")
+                out.push("  for (int64_t i = 0; i < n_; i++)")
+                let (cp, c3) = c.cmp_prefix(e)
+                c = c3
+                out.push("  \{ int r_ = {cp}_cmp(a->data[i], b->data[i]); if (r_) return r_; }")
+                out.push("  return a->len < b->len ? -1 : a->len > b->len;")
+            },
+            TArray(e, TLen(k)) => {
+                out.push("  for (int64_t i = 0; i < {k}; i++)")
+                let (cp, c3) = c.cmp_prefix(e)
+                c = c3
+                out.push("  \{ int r_ = {cp}_cmp(a.a[i], b.a[i]); if (r_) return r_; }")
+                out.push("  return 0;")
+            },
+            _ => if c.is_enum(t) {
+                let acc = acc_of(c.is_boxed(t))
+                out.push("  if (a{acc}tag != b{acc}tag) return a{acc}tag < b{acc}tag ? -1 : 1;")
+                out.push("  switch (a{acc}tag) \{")
+                for (k, v) in c.variants_of(t).with_index() {
+                    out.push("    case {k}:")
+                    for (i, pt) in v.1.with_index() {
+                        let (cp, c3) = c.cmp_prefix(pt)
+                        c = c3
+                        out.push("  \{ int r_ = {cp}_cmp(a{acc}u.v{k}.f{i}, b{acc}u.v{k}.f{i}); if (r_) return r_; }")
+                    }
+                    out.push("      break;")
+                }
+                out.push("  }")
+                out.push("  return 0;")
+            } else {
+                for (i, f) in c.fields_of(t).with_index() {
+                    let (cp, c3) = c.cmp_prefix(f.1)
+                    c = c3
+                    out.push("  \{ int r_ = {cp}_cmp(a.f{i}, b.f{i}); if (r_) return r_; }")
+                }
+                out.push("  return 0;")
+            },
+        }
+        out.push("}")
+    }
+    for t in c.sort_tys {
+        match t {
+            TList(e) => {
+                let (cp, c1) = c.cmp_prefix(e)
+                let (et, c2) = c1.ctype(e)
+                let (n, c3) = c2.cname(t)
+                c = c3
+                out.push("LIMEN_LIST_SORT({n}, {et}, {cp})")
+            },
+            _ => {},
+        }
+    }
+    (out, c)
+}
+
+// ---------- the program ----------
+
+// OCaml's `%S` of a root field's name: a plain identifier, quoted.
+fn quoted(s: Str) -> Str {
+    "\"" + s + "\""
+}
+
+// The program as C: `files` are the program's files (with the prelude's
+// and the built-in methods'), so panics can say where they happened;
+// `runtime` is the runtime header (limen_sandbox.h then limen_rt.h).
+pub fn program(ro: lower.Ro, files: List[diag.Source], prog: ir.Program, runtime: Str) -> Str {
+    let mut c = Cg {
+        ro,
+        files,
+        starts: files.map(|f| line_starts(f.text)),
+        names: map(),
+        types: [],
+        lits: map(),
+        lit_order: [],
+        boxed: [],
+        uniq: [],
+        task_tys: [],
+        inrange: [],
+        chan_tys: [],
+        dyns: [],
+        cell_tys: [],
+        cmp_tys: [],
+        sort_tys: [],
+        hash_tys: [],
+        csyms: [],
+        cstructs: [],
+        wrappers: [],
+        vols: [],
+        pure: pure.analyse(prog),
+        plan: pure.no_plan(),
+        slot: 0,
+        loops: 0,
+        slotted: [],
+        scopes: 0,
+        tls: false,
+        out: [],
+    }
+    // bodies first: this names every type and literal
+    for f in prog.fns {
+        c = c.fn_body(f)
+    }
+    let bodies = c.out.join("")
+    let mut protos: List[Str] = []
+    for f in prog.fns {
+        let (sig, c1) = c.signature(f)
+        c = c1
+        protos.push(sig + ";\n")
+    }
+    let mut envs: List[Str] = []
+    for f in prog.fns {
+        if f.captures.is_empty() {
+            continue
+        }
+        let mut cs: List[Str] = []
+        for (i, v) in f.captures.with_index() {
+            let (ct, c1) = c.ctype(v.ty)
+            c = c1
+            cs.push("{ct} c{i};")
+        }
+        envs.push("struct Env_{f.fname} \{ WClo base; {cs.join(" ")} };\n")
+        for what in ["drop", "share"] {
+            envs.push("static void Env_{f.fname}_{what}(WClo* k) \{\n  struct Env_{f.fname}* e = (struct Env_{f.fname}*)k;\n  (void)e;\n")
+            for (i, v) in f.captures.with_index() {
+                if !is_scalar(v.ty) {
+                    let (n, c1) = c.cname(v.ty)
+                    c = c1
+                    envs.push("  {n}_{what}(e->c{i});\n")
+                }
+            }
+            envs.push("}\n")
+        }
+    }
+    let mut dynbuf: List[Str] = []
+    // drop-through-pointer functions for owned locals
+    for t in c.cell_tys {
+        let (ct, c1) = c.ctype(t)
+        let (n, c2) = c1.cname(t)
+        c = c2
+        dynbuf.push("static void w_dp_{n}(void* p) \{ {n}_drop(*({ct}*)p); }\n")
+    }
+    for d in c.dyns {
+        let (ct, c1) = c.ctype(d.ty)
+        let (cn, c2) = c1.cname(d.ty)
+        c = c2
+        let key = d.key
+        let p = "((struct Dyn_{key}*)d)->val"
+        dynbuf.push("struct Dyn_{key} \{ WDyn base; {ct} val; };\n")
+        dynbuf.push("static void Dyn_{key}_drop(WDyn* d) \{ {if is_scalar(d.ty) { "(void)d;" } else { "{cn}_drop({p});" }} }\n")
+        dynbuf.push("static void Dyn_{key}_share(WDyn* d) \{ {if is_scalar(d.ty) { "(void)d;" } else { "{cn}_share({p});" }} }\n")
+        dynbuf.push("static void Dyn_{key}_show(WBuf* b, WDyn* d, bool top) \{ {cn}_show(b, {p}, top); }\n")
+        for (k, m) in d.methods.with_index() {
+            let mut params = ["WDyn* d"]
+            for (j, pt) in m.params.with_index() {
+                let (pc, c3) = c.ctype(pt)
+                c = c3
+                params.push("{pc} a{j}")
+            }
+            let self_arg = if is_scalar(d.ty) { p } else { "{cn}_dup({p})" }
+            let (rc, c4) = c.ctype(m.ret)
+            c = c4
+            let args = [self_arg] + m.params.with_index().map(|q| "a{q.0}")
+            dynbuf.push("static {rc} Dyn_{key}_m{k}({params.join(", ")}) \{ return {m.fname}({args.join(", ")}); }\n")
+        }
+        let slots = if d.methods.is_empty() { "NULL" } else { d.methods.with_index().map(|q| "(void*)Dyn_{key}_m{q.0}").join(", ") }
+        dynbuf.push("static const struct \{ WVtHead h; void *m[{d.methods.len().max(1)}]; } Dyn_{key}_vt = \{ \{ Dyn_{key}_drop, Dyn_{key}_share, Dyn_{key}_show }, \{ {slots} } };\n")
+    }
+    let mut tasks: List[Str] = []
+    for t in c.chan_tys {
+        if !is_scalar(t) {
+            let (ct, c1) = c.ctype(t)
+            let (n, c2) = c1.cname(t)
+            c = c2
+            tasks.push("static void chdrop_{n}(void* p) \{ {n}_drop(*({ct}*)p); }\nstatic void chshare_{n}(void* p) \{ {n}_share(*({ct}*)p); }\n")
+        }
+    }
+    for t in c.task_tys {
+        let mut share = ""
+        if !is_scalar(t) {
+            let (n0, c0) = c.cname(t)
+            c = c0
+            share = "{n0}_share(r);"
+        }
+        let (ct, c1) = c.ctype(t)
+        let (n, c2) = c1.cname(t)
+        c = c2
+        tasks.push("static void wtask_{n}(WTask* t) \{\n  {ct} r = (({ct} (*)(WClo*))t->fn->fn)(t->fn);\n  {share}\n  memcpy(t->slot, &r, sizeof r);\n  Clo_drop(t->fn);\n}\n")
+    }
+    let (main, c5) = c.main_fn(prog)
+    c = c5
+    // callback wrappers, after the prototypes of the functions they call
+    let mut cbdefs: List[Str] = []
+    for w in c.wrappers {
+        let (d, c1) = c.ffi_callback_def(w)
+        c = c1
+        cbdefs.push(d)
+    }
+    let (defs, c6) = c.type_defs()
+    c = c6
+    let mut tys = defs.map(|l| l + "\n")
+    for s in c.cstructs {
+        let fields = s.fields.with_index().map(|q| {
+            let (i, f) = q
+            "{ffi.c_name(f.1)} c{i};"
+        })
+        tys.push("typedef struct \{ {fields.join(" ")} } {s.cname};\n")
+    }
+    let lits = c.lit_order.map(|p| "static WStr {p.0} = \{ 0, {p.1.len()}, (char*){c_string(p.1)} };\n")
+    // each foreign C function under a private name, bound to its symbol by
+    // an asm label, so it clashes with no header's declaration of it
+    let externs = c.csyms.map(|sym| "extern void vf_{sym}(void) __asm__(W_CSYM(\"{sym}\"));\n")
+    (if c.tls { tls_marker() } else { "" }) + [runtime, "/* ---- types ---- */", tys.join(""), "/* ---- literals ---- */", lits.join(""), "/* ---- closures ---- */", envs.join(""), tasks.join(""), "/* ---- functions ---- */", protos.join(""), externs.join(""), cbdefs.join(""), "/* ---- dyn vtables ---- */", dynbuf.join(""), bodies, main].join("\n")
+}
+
+// `main` of the C program: a test binary's, or the one that runs the
+// program's `main` as the main fiber and turns its result into the exit
+// status.
+fn main_fn(self: Cg, prog: ir.Program) -> (Str, Cg) {
+    let mut c = self
+    let mut m: List[Str] = []
+    let rt = prog.main_ret
+    if !prog.tests.is_empty() || !prog.benches.is_empty() {
+        // test binary: `PROGRAM N` runs test N (each test in its own
+        // process); `PROGRAM bench N NS ITERS` runs bench N, ITERS times,
+        // or (ITERS = 0) as many times as fit in NS nanoseconds, and
+        // reports on stderr
+        let cap_args = |fields: List[Str]| fields.map(|f| "Cap_root_field(NULL, {quoted(f)})").join(", ")
+        m.push("static int wtest_index_, wtest_bench_;")
+        m.push("static int64_t wbench_budget_, wbench_fixed_;")
+        if !prog.benches.is_empty() {
+            m.push("static WCap* wbench_caps_[2];")
+            for (i, b) in prog.benches.with_index() {
+                m.push("static void wbench_{i}_(void) \{")
+                for (k, _) in b.fields.with_index() {
+                    m.push("  Cap_dup(wbench_caps_[{k}]);")
+                }
+                m.push("  {b.cname}({b.fields.with_index().map(|q| "wbench_caps_[{q.0}]").join(", ")});")
+                m.push("}")
+            }
+            // Go's scaling: run once, then grow the count toward the time
+            // budget, at most 100 times per round, until one round fills
+            // the budget
+            m = m + ["static void wbench_loop_(void (*body)(void)) \{", "  int64_t n = wbench_fixed_ > 0 ? wbench_fixed_ : 1;", "  for (;;) \{", "    int64_t a0 = __atomic_load_n(&w_allocs, __ATOMIC_RELAXED);", "    int64_t t0 = w_mono_ns();", "    for (int64_t i = 0; i < n; i++) body();", "    int64_t ns = w_mono_ns() - t0;", "    int64_t al = __atomic_load_n(&w_allocs, __ATOMIC_RELAXED) - a0;", "    if (wbench_fixed_ > 0 || ns >= wbench_budget_ || n >= 1000000000) \{", "      fflush(stdout);", "      fprintf(stderr, \"limen-bench: %lld %lld %lld\\n\", (long long)n, (long long)ns, (long long)al);", "      return;", "    }", "    int64_t next = ns > 0 ? (int64_t)(1.2 * (double)wbench_budget_ * (double)n / (double)ns) : n * 100;", "    if (next > n * 100) next = n * 100;", "    if (next <= n) next = n + 1;", "    if (next > 1000000000) next = 1000000000;", "    n = next;", "  }", "}"]
+        }
+        m = m + ["static void wtest_entry_(void* a) \{", "  (void)a;", "  if (!wtest_bench_) switch (wtest_index_) \{"]
+        for (i, t) in prog.tests.with_index() {
+            m.push("    case {i}: {t.cname}({cap_args(t.fields)}); break;")
+        }
+        m.push("  }")
+        if !prog.benches.is_empty() {
+            m.push("  else switch (wtest_index_) \{")
+            for (i, b) in prog.benches.with_index() {
+                m.push("    case {i}:")
+                for (k, f) in b.fields.with_index() {
+                    m.push("      wbench_caps_[{k}] = Cap_root_field(NULL, {quoted(f)});")
+                }
+                m.push("      wbench_loop_(wbench_{i}_);")
+                for (k, _) in b.fields.with_index() {
+                    m.push("      Cap_drop(wbench_caps_[{k}]);")
+                }
+                m.push("      break;")
+            }
+            m.push("  }")
+        }
+        m = m + ["  w_main_finished();", "}", "int main(int argc, char** argv) \{", "  if (argc < 2) return 2;", "  if (strcmp(argv[1], \"bench\") == 0) \{", "    if (argc < 5) return 2;", "    wtest_bench_ = 1;", "    wtest_index_ = atoi(argv[2]);", "    wbench_budget_ = atoll(argv[3]);", "    wbench_fixed_ = atoll(argv[4]);", "    w_init(argc - 4, argv + 4);   /* then `--grant fs=DIR` for a bench that takes Fs */", "  } else \{", "    wtest_index_ = atoi(argv[1]);"]
+        // a test that takes `clock: virtual Clock` runs on virtual time,
+        // from before any thread starts
+        let virtual = prog.tests.with_index().filter(|q| {
+            let (_, t) = q
+            t.virtual
+        }).map(|q| "case {q.0}:")
+        if !virtual.is_empty() {
+            m.push("    switch (wtest_index_) \{ {virtual.join(" ")} w_virtual_start(); }")
+        }
+        m = m + ["    w_init(argc - 1, argv + 1);   /* `--grant fs=DIR` for a test that takes Fs */", "  }", "  w_run(wtest_entry_, NULL);", "  fflush(stdout);", "  w_leakcheck();", "  return 0;", "}"]
+    } else {
+        // main runs as the main fiber, so it can wait on groups, channels
+        // and sockets
+        let (ct, c1) = c.ctype(rt)
+        c = c1
+        m.push("static {ct} wmain_result_;")
+        m.push("static void wmain_entry_(void* a) \{ (void)a; wmain_result_ = {prog.main}({if prog.main_takes_root { "w_root()" } else { "" }}); w_main_finished(); }")
+        m = m + ["int main(int argc, char** argv) \{", "  w_init(argc, argv);", "  w_run(wmain_entry_, NULL);", "  {ct} r_ = wmain_result_;"]
+        match rt {
+            TNamed("Result", [_, et]) => {
+                let (te, c2) = c.tag_expr(rt, "r_")
+                c = c2
+                m.push("  if ({te} == 1) \{")
+                m.push("    WBuf b_; buf_init(&b_); buf_puts(&b_, \"error: \");")
+                match et {
+                    TDyn("Error", []) => {
+                        // a `dyn Error` is reported by its message: method
+                        // 0 of its vtable
+                        let (d, c3) = c.payload_expr(rt, "r_", 1, 0)
+                        c = c3
+                        m.push("    WStr* m_ = ((WStr* (*)(WDyn*))({d})->vt->m[0])({d});")
+                        m.push("    Str_show(&b_, m_, true); Str_drop(m_);")
+                    },
+                    _ => {
+                        let (pe, c3) = c.payload_expr(rt, "r_", 1, 0)
+                        let (en, c4) = c3.cname(et)
+                        c = c4
+                        m.push("    {en}_show(&b_, {pe}, true);")
+                    },
+                }
+                m.push("    buf_puts(&b_, \"\\n\"); fflush(stdout); fwrite(b_.p, 1, (size_t)b_.len, stderr); return 1;")
+                m.push("  }")
+            },
+            _ => {},
+        }
+        // `main` returning Int (or Ok(Int)) chooses the exit status; the
+        // OS keeps its low 8 bits
+        let code = match rt {
+            TInt => "(int)(r_ & 255)",
+            TNamed("Result", [TInt, _]) => {
+                let (pe, c2) = c.payload_expr(rt, "r_", 0, 0)
+                c = c2
+                "(int)({pe} & 255)"
+            },
+            _ => "0",
+        }
+        m.push("  int code_ = {code};")
+        if is_scalar(rt) {
+            m.push("  (void)r_;")
+        } else {
+            let (n, c2) = c.cname(rt)
+            c = c2
+            m.push("  {n}_drop(r_);")
+        }
+        m = m + ["  fflush(stdout);", "  w_leakcheck();", "  return code_;", "}"]
+    }
+    (m.map(|l| l + "\n").join(""), c)
+}

@@ -1,5 +1,5 @@
 level: yes
-tessera: no
+limen: no
 racecar: yes
 noon: yes
 capability: no

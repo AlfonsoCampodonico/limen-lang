@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""End-to-end check of `tessera lsp` over stdio: framing, diagnostics, hover,
+"""End-to-end check of `limen lsp` over stdio: framing, diagnostics, hover,
 completion, definitions, references and rename across modules, shutdown and
-exit.  Usage: python3 test/lsp_stdio.py TESSERA_EXE"""
+exit.  Usage: python3 test/lsp_stdio.py LIMEN_EXE"""
 import json, os, subprocess, sys, tempfile
 
 exe = sys.argv[1]
@@ -26,13 +26,13 @@ def recv():
     return json.loads(p.stdout.read(length))
 
 
-uri = "file:///tmp/e2e.tsr"
+uri = "file:///tmp/e2e.lmn"
 text = 'fn main(root: Root) {\n    let n = 41 + 1\n    print("x")\n    root.stdout.print("{n}")\n}\n'
 send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
 init = recv()
 assert init["result"]["capabilities"]["completionProvider"]["triggerCharacters"] == ["."], init
 send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
-send({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {"textDocument": {"uri": uri, "languageId": "tessera", "version": 1, "text": text}}})
+send({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {"textDocument": {"uri": uri, "languageId": "limen", "version": 1, "text": text}}})
 diags = recv()
 assert diags["method"] == "textDocument/publishDiagnostics", diags
 assert [d["code"] for d in diags["params"]["diagnostics"]] == ["E0302"], diags
@@ -51,7 +51,7 @@ labels = complete(3, 16, 5)  # root.stdout.|print
 assert labels == ["print", "write"], labels
 
 # ---------- two modules on disk: definitions, hover, references, rename ----------
-d = tempfile.mkdtemp(prefix="tessera-lsp-")
+d = tempfile.mkdtemp(prefix="limen-lsp-")
 geom = """// Geometry.
 
 // A point.
@@ -85,14 +85,14 @@ fn main(root: Root) {
     root.stdout.print("{t} {s.x} {helper(2)}")
 }
 """
-with open(os.path.join(d, "geom.tsr"), "w") as f:
+with open(os.path.join(d, "geom.lmn"), "w") as f:
     f.write(geom)
-main_path = os.path.join(d, "main.tsr")
+main_path = os.path.join(d, "main.lmn")
 with open(main_path, "w") as f:
     f.write(main)
 muri = "file://" + main_path
-guri = "file://" + os.path.join(d, "geom.tsr")
-send({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {"textDocument": {"uri": muri, "languageId": "tessera", "version": 1, "text": main}}})
+guri = "file://" + os.path.join(d, "geom.lmn")
+send({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {"textDocument": {"uri": muri, "languageId": "limen", "version": 1, "text": main}}})
 assert recv()["params"]["diagnostics"] == []
 rid = [100]
 
@@ -158,7 +158,7 @@ send({"jsonrpc": "2.0", "method": "textDocument/didChange", "params": {"textDocu
       "contentChanges": [{"text": main.replace("    let t = p.total()", "    let v = json.parse(\"1\")\n    let t = p.total()")}]}})
 assert recv()["params"]["diagnostics"] == []
 loc = req("textDocument/definition", 10, 18)["result"]
-assert loc["uri"].endswith("/tessera-std/json.tsr") and os.path.exists(loc["uri"][7:]), loc
+assert loc["uri"].endswith("/limen-std/json.lmn") and os.path.exists(loc["uri"][7:]), loc
 assert "standard library" in rename(10, 18, "parse2")
 send({"jsonrpc": "2.0", "id": 4, "method": "shutdown"})
 assert recv()["id"] == 4

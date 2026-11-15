@@ -1,4 +1,4 @@
 (executable
  (name main)
- (public_name tessera)
- (libraries tessera unix))
+ (public_name limen)
+ (libraries limen unix))

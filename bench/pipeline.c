@@ -1,4 +1,4 @@
-/* Same computation as pipeline.tsr, written the way C would: one fused loop. */
+/* Same computation as pipeline.lmn, written the way C would: one fused loop. */
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>

@@ -1,0 +1,247 @@
+// A tour of the newer features, one small section each.
+// Run: limen run examples/tour.lmn
+// Native: limen run examples/tour.lmn --native
+// Tests: limen test examples/tour.lmn
+// Benchmarks: limen test examples/tour.lmn --bench
+use errors
+
+interface Shape {
+    fn area(self) -> Float
+    fn name(self) -> Str
+}
+
+struct Circle {
+    r: Float,
+}
+
+struct Square {
+    side: Float,
+}
+
+fn area(self: Circle) -> Float { 3.14159 * self.r * self.r }
+
+fn name(self: Circle) -> Str { "circle" }
+
+fn area(self: Square) -> Float { self.side * self.side }
+
+fn name(self: Square) -> Str { "square" }
+
+struct Point {
+    x: Int,
+    y: Int,
+}
+
+// embedding: Labeled has Point's fields and methods, and satisfies the
+// interfaces Point does; Point stays a plain field, `l.Point`
+struct Labeled {
+    Point,
+    label: Str,
+}
+
+fn describe(self: Point) -> Str { "({self.x}, {self.y})" }
+
+interface Described {
+    fn describe(self) -> Str
+}
+
+// a file can add its own methods to built-in types
+fn shout(self: Str) -> Str { self.to_upper() + "!" }
+
+fn pick(big: Bool) -> dyn Shape {
+    // branches of different types become `dyn` where one is expected
+    if big { Circle { r: 2.0 } } else { Square { side: 1.5 } }
+}
+
+// any type with a `message` method is an Error
+struct BadPort {
+    text: Str,
+}
+
+fn message(self: BadPort) -> Str { "not a port: {self.text}" }
+
+fn parse_port(s: Str) -> Result[Int, BadPort] {
+    match s.parse_int() {
+        Some(n) => Ok(n),
+        None => Err(BadPort { text: s }),
+    }
+}
+
+// `?` converts any Error to `dyn Error`, and a string after it adds context
+fn port(settings: Map[Str, Str]) -> Result[Int, dyn Error] {
+    let raw = settings.get("port")? "no port set"
+    let n = parse_port(raw)? "reading settings"
+    Ok(n)
+}
+
+fn evens(xs: List[Int]) -> List[Int] { xs.filter(|x| x % 2 == 0) }
+
+fn total(xs: List[Int]) -> Int { xs.fold(0, |a, b| a + b) }
+
+fn label(text: Str, width: Int, fill: Str) -> Str {
+    let mut s = text
+    while s.len() < width {
+        s = fill + s
+    }
+    s
+}
+
+fn slow(clock: Clock, ms: Int, v: Int) -> Int {
+    clock.sleep(ms)
+    v
+}
+
+// `defer` runs when its block is left: here by `return`, or by a panic
+fn checked(out: Stdout, s: Str) -> Result[Int, Str] {
+    defer out.print("checked {s}")
+    let n = s.parse_int() ?? -1
+    if n < 0 {
+        return Err("not a number")
+    }
+    if n == 0 {
+        panic("zero")
+    }
+    Ok(n)
+}
+
+// main can return the program's exit code
+fn main(root: Root) -> Int {
+    let out = root.stdout
+    let clock = root.clock
+
+    out.print("-- language")
+    let s = pick(true)
+    out.print("{s.name()} {s.area().to_fixed(2)}")
+    let sizes = [pick(true), pick(false)].map(|x| x.area())
+    out.print("{sizes.sort()}")
+    // ranges and characters
+    let mut squares = []
+    for i in 0..<5 {
+        squares.push(i * i)
+    }
+    out.print("{squares} {"hola".chars()}")
+    // method values: `p.area` without a call is a closure
+    let c = Circle { r: 1.0 }
+    let f = c.area
+    out.print("bound method {f().to_fixed(3)}")
+    out.print("limen".shout())
+    // tuples and structs as map keys, and entries updated in place
+    let mut grid: Map[Point, List[Str]] = map()
+    grid[Point { x: 0, y: 0 }] = ["origin"]
+    grid[Point { x: 0, y: 0 }].push("home")
+    let mut seen: Map[(Int, Int), Int] = map()
+    seen[(1, 2)] = 1
+    seen[(1, 2)] = seen[(1, 2)] + 1
+    out.print("{grid} {seen}")
+    // structs and tuples sort field by field
+    out.print("{[(2, "b"), (1, "z"), (1, "a")].sort()}")
+    // collections: grouping, counting, splitting
+    let words = "the cat and the hat and the bat".split(" ")
+    out.print("{words.tally().filter(|w, n| n > 1)} {words.distinct().group_by(|w| w.slice(1, 3))}")
+    out.print("{words.partition(|w| w.ends_with("at")).0} {words.chunks(3).len()} {[1, 2, 3].windows(2)}")
+    out.print("{words.distinct().sort_by(|w| w.slice(2, 3))} {words.count(|w| w == "the")} {words.with_index().find(|p| p.1 == "hat")}")
+    // binary data
+    let b = "hi".to_bytes() + bytes([33])
+    out.print("{b.len()} bytes: {b.to_str()}")
+    // errors from different types, with context, walked with the errors module
+    match port(map([("port", "80x")])) {
+        Ok(n) => out.print("port {n}"),
+        Err(e) => out.print(errors.report(e)),
+    }
+    out.print("{port(map([("port", "8080")])) ?? 0}")
+
+    out.print("-- defer")
+    {
+        defer out.print("cleanup: runs last")
+        defer out.print("cleanup: runs first")
+        out.print("in the block")
+    }
+    out.print("{checked(out, "7")} {checked(out, "x")}")
+    out.print("{catch(|| checked(out, "0"))}")
+
+    out.print("-- embedding")
+    let mut home = Labeled { Point: Point { x: 1, y: 2 }, label: "home" }
+    home.x = 5
+    let ds: List[dyn Described] = [home, home.Point]
+    out.print("{home.label} at {home.describe()} {ds.map(|d| d.describe())}")
+    out.print("-- syntax")
+    // pipes: the value goes in as the first argument
+    let sum = 1..<7
+        |> evens
+        |> total
+    out.print("pipe {sum}")
+    // copy with changes: the other fields are kept
+    let origin = Point { x: 0, y: 0 }
+    let moved = { origin with y: 5 }
+    out.print("{origin} {moved}")
+    // guards in match arms; a guarded arm does not count as covering its pattern
+    for o in [Some(42), Some(3), None] {
+        let size = match o {
+            Some(n) if n > 10 => "big",
+            Some(_) => "small",
+            None => "nothing",
+        }
+        out.print(size)
+    }
+    // safe navigation: None anywhere ends the chain
+    let corner: Option[Point] = Some(Point { x: 3, y: 4 })
+    let nowhere: Option[Point] = None
+    out.print("{corner?.x} {nowhere?.y ?? -1}")
+    // named arguments: any order after the positional ones, all required
+    out.print(label("tour", fill: ".", width: 6))
+    // a closure after the call's parentheses is its last argument
+    let tens = [1, 2, 3].map { |x| x * 10 }
+    let failed = catch { panic("oops") }
+    out.print("{tens} {failed}")
+
+    out.print("-- concurrency")
+    // tasks returning () run for their effect and add nothing to the list
+    let rs = group g {
+        g.go(|| 1)
+        g.go(|| out.print("a side task ran"))
+        g.go(|| 2)
+    }
+    out.print("results {rs}")
+    // a deadline cancels the stuck task: None in its place
+    let timed = group g until clock.after(100) {
+        g.go(|| slow(clock, 10, 1))
+        g.go(|| slow(clock, 5000, 2))
+    }
+    out.print("with a deadline {timed}")
+    // an unbuffered channel and a select that times out
+    let ch: Chan[Str] = channel(0)
+    let got = select {
+        v = ch.recv() => v ?? "closed",
+        clock.after(50) => "nobody sent anything",
+    }
+    out.print(got)
+
+    // exit status 3: check it with `echo $?`
+    3
+}
+
+test "areas" {
+    assert(Square { side: 2.0 }.area() == 4.0)
+    assert(pick(false).name() == "square")
+}
+
+test "ranges" {
+    let mut n = 0
+    for i in 1..<4 {
+        n = n + i
+    }
+    assert(n == 6)
+}
+
+// a table test: one isolated run per case, named by the case, as in `square sides (3.0, 9.0)`
+test "square sides" for (side, want) in [(1.0, 1.0), (2.0, 4.0), (3.0, 9.0)] {
+    assert_eq(Square { side: side }.area(), want)
+}
+
+// a benchmark: the body is one operation; its value is kept, so it is not optimized away
+bench "build a list" {
+    let mut xs: List[Int] = []
+    for i in 0..<100 {
+        xs.push(i * i)
+    }
+    xs.len()
+}

@@ -1,5 +1,5 @@
-; The OCaml lexer's tokens for one file, in the format selfhost/lexer.tsr
+; The OCaml lexer's tokens for one file, in the format selfhost/lexer.lmn
 ; prints, so the two can be compared: dune exec selfhost/tokdump/tokdump.exe -- FILE
 (executable
  (name tokdump)
- (libraries tessera))
+ (libraries limen))

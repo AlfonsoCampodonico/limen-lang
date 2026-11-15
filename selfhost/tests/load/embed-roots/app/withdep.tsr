@@ -1,6 +1,0 @@
-// A dependency whose tessera.toml declares embed roots.
-use dep
-
-fn main(root: Root) {
-    root.stdout.print(dep.hi())
-}

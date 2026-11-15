@@ -1,4 +1,0 @@
-# tessera.lock: the exact version of each git dependency, and the C libraries of each trusted one, written by tessera. Commit it.
-foreign cl z
-foreign same c,m
-foreign two b

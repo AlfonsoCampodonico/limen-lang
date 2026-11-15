@@ -1,49 +1,49 @@
 #!/bin/sh
-# Compare the Tessera lexer, parser, module loader, type checker and
-# lowering (selfhost/*.tsr) with the OCaml ones (src/lexer.ml,
+# Compare the Limen lexer, parser, module loader, type checker and
+# lowering (selfhost/*.lmn) with the OCaml ones (src/lexer.ml,
 # src/parser.ml, src/modules.ml, src/check.ml with the capability checks
 # of src/package.ml, and src/lower.ml with the IR passes Native.c_source
 # runs, through selfhost/tokdump, selfhost/astdump, selfhost/loaddump,
 # selfhost/checkdump and selfhost/irdump): same tokens, same trees, same
 # loaded programs, same types and rewrites, same capabilities per
 # function, same IR, same positions, same errors. Then the compilers
-# themselves: selfhost/tessera.tsr and bin/main.ml give the same C for
+# themselves: selfhost/limen.lmn and bin/main.ml give the same C for
 # `build --emit-c` (and for the test binary, against selfhost/cdump), with
 # the same output, the same diagnostics on stderr and the same exit status
 # when there is no C; and programs built
-# by the Tessera compiler run as those the OCaml compiler builds.
+# by the Limen compiler run as those the OCaml compiler builds.
 #   sh selfhost/check.sh
-# They are compared on every .tsr file in the repository, on the edge cases
+# They are compared on every .lmn file in the repository, on the edge cases
 # in selfhost/tests (the loader's in selfhost/tests/load, one directory
 # each, the checker's in selfhost/tests/check, the lowering's in
 # selfhost/tests/ir, C generation's in selfhost/tests/c), and on the
 # book's examples when the book is checked out next to this repository
-# (or at $TESSERA_BOOK).
+# (or at $LIMEN_BOOK).
 set -e
 cd "$(dirname "$0")/.."
 dune build ./bin/main.exe ./selfhost/tokdump/tokdump.exe ./selfhost/astdump/astdump.exe ./selfhost/loaddump/loaddump.exe ./selfhost/checkdump/checkdump.exe ./selfhost/irdump/irdump.exe ./selfhost/cdump/cdump.exe
-tessera=_build/default/bin/main.exe
+limen=_build/default/bin/main.exe
 tokdump=$PWD/_build/default/selfhost/tokdump/tokdump.exe
 astdump=$PWD/_build/default/selfhost/astdump/astdump.exe
 loaddump=$PWD/_build/default/selfhost/loaddump/loaddump.exe
 checkdump=$PWD/_build/default/selfhost/checkdump/checkdump.exe
 irdump=$PWD/_build/default/selfhost/irdump/irdump.exe
 cdump=$PWD/_build/default/selfhost/cdump/cdump.exe
-tessera_abs=$PWD/$tessera
-book=${TESSERA_BOOK:-../tessera-book}/examples
+limen_abs=$PWD/$limen
+book=${LIMEN_BOOK:-../limen-book}/examples
 out=$(mktemp -d)
 trap 'rm -rf "$out"' EXIT
-"$tessera" build selfhost/tokens.tsr -o "$out/tokens"
-"$tessera" build selfhost/parse.tsr -o "$out/parse"
-"$tessera" build selfhost/load.tsr -o "$out/load"
-"$tessera" build selfhost/check.tsr -o "$out/check"
-"$tessera" build selfhost/lowered.tsr -o "$out/lowered"
-"$tessera" build selfhost/tessera.tsr -o "$out/tsc"
+"$limen" build selfhost/tokens.lmn -o "$out/tokens"
+"$limen" build selfhost/parse.lmn -o "$out/parse"
+"$limen" build selfhost/load.lmn -o "$out/load"
+"$limen" build selfhost/check.lmn -o "$out/check"
+"$limen" build selfhost/lowered.lmn -o "$out/lowered"
+"$limen" build selfhost/limen.lmn -o "$out/tsc"
 
 # The repository's files (the new ones in selfhost/ too, before they are
 # committed), and the loader's edge cases among them: each file of
 # selfhost/tests/load is loaded as a program.
-files=$({ git ls-files '*.tsr'; ls selfhost/*.tsr; find selfhost/tests/load selfhost/tests/check selfhost/tests/ir selfhost/tests/c -name '*.tsr'; } | sort -u)
+files=$({ git ls-files '*.lmn'; ls selfhost/*.lmn; find selfhost/tests/load selfhost/tests/check selfhost/tests/ir selfhost/tests/c -name '*.lmn'; } | sort -u)
 load_cases=$(echo "$files" | grep '^selfhost/tests/load/')
 check_cases=$(echo "$files" | grep '^selfhost/tests/check/')
 ir_cases=$(echo "$files" | grep '^selfhost/tests/ir/')
@@ -51,7 +51,7 @@ c_cases=$(echo "$files" | grep '^selfhost/tests/c/')
 programs=$(echo "$files" | grep -v '^selfhost/tests/load/' | grep -v '^selfhost/tests/check/' | grep -v '^selfhost/tests/ir/' | grep -v '^selfhost/tests/c/')
 failed=0
 
-# compare WANT_CMD GOT_PROGRAM DIR FILE: run both on DIR/FILE, the Tessera
+# compare WANT_CMD GOT_PROGRAM DIR FILE: run both on DIR/FILE, the Limen
 # one with read access to DIR only
 compare() {
   (cd "$3" && "$1" "$4") > "$out/want"
@@ -60,7 +60,7 @@ compare() {
 }
 
 # The loaders read more than the file's directory: the package around it,
-# its dependencies, the files it embeds. The Tessera one is granted the
+# its dependencies, the files it embeds. The Limen one is granted the
 # directory that holds this repository and the book, and runs in DIR as the
 # OCaml one does; both have the standard library built in.
 grant=$(cd .. && pwd)
@@ -98,14 +98,14 @@ compare_ir() {
   same "$1/$2"
 }
 
-# tsc ARGS...: the Tessera compiler, in the current directory, granted
+# tsc ARGS...: the Limen compiler, in the current directory, granted
 # what it reads and writes (everything, for this test: the programs and
 # the scratch directory are far apart), the programs a build runs and the
 # variables it reads
 tsc() {
   "$out/tsc" --grant fs=/ \
     --grant env=PWD --grant env=CC --grant env=PATH --grant env=HOME \
-    --grant env=TESSERA_CACHE --grant env=XDG_CACHE_HOME --grant env=DEVELOPER_DIR --grant env=TESSERA_OPENSSL \
+    --grant env=LIMEN_CACHE --grant env=XDG_CACHE_HOME --grant env=DEVELOPER_DIR --grant env=LIMEN_OPENSSL \
     --grant env=LIBRARY_PATH --grant env=CPATH --grant env=C_INCLUDE_PATH --grant env=SDKROOT --grant env=MACOSX_DEPLOYMENT_TARGET \
     --grant "exec=${CC:-cc}" --grant exec=readlink --grant exec=cp --grant exec=touch --grant exec=pkg-config \
     -- "$@"
@@ -115,7 +115,7 @@ tsc() {
 # diagnostics on stderr and the exit status, then the C
 compare_c() {
   rm -f "$out/cw.c" "$out/cg.c"
-  (cd "$1" && "$tessera_abs" build "$2" --emit-c -o "$out/cw") > "$out/want" 2> "$out/want.err" && echo "exit 0" >> "$out/want" || echo "exit $?" >> "$out/want"
+  (cd "$1" && "$limen_abs" build "$2" --emit-c -o "$out/cw") > "$out/want" 2> "$out/want.err" && echo "exit 0" >> "$out/want" || echo "exit $?" >> "$out/want"
   (cd "$1" && tsc build "$2" --emit-c -o "$out/cg") > "$out/got" 2> "$out/got.err" && echo "exit 0" >> "$out/got" || echo "exit $?" >> "$out/got"
   if [ -f "$out/cw.c" ]; then cat "$out/cw.c" >> "$out/want"; fi
   if [ -f "$out/cg.c" ]; then cat "$out/cg.c" >> "$out/got"; fi
@@ -134,15 +134,15 @@ compare_test_c() {
 }
 
 # compare_run DIR FILE [ARGS...]: build FILE with both compilers (the
-# Tessera one through a cache of its own, so it runs the C compiler) and
+# Limen one through a cache of its own, so it runs the C compiler) and
 # run both binaries in DIR with ARGS; a fs=work grant gets a fresh
 # directory each. Same output, same exit status.
 compare_run() {
   dir=$1 file=$2
   shift 2
   rm -rf "$out/rw" "$out/rg" "$out/work"
-  (cd "$dir" && "$tessera_abs" build "$file" -o "$out/rw") > "$out/want" 2> "$out/want.err"
-  (cd "$dir" && export TESSERA_CACHE="$out/cache" && tsc build "$file" -o "$out/rg") > "$out/got" 2> "$out/got.err"
+  (cd "$dir" && "$limen_abs" build "$file" -o "$out/rw") > "$out/want" 2> "$out/want.err"
+  (cd "$dir" && export LIMEN_CACHE="$out/cache" && tsc build "$file" -o "$out/rg") > "$out/got" 2> "$out/got.err"
   for bin in rw rg; do
     mkdir -p "$out/work"
     if [ "$bin" = rw ]; then into=want; else into=got; fi
@@ -159,7 +159,7 @@ compare_run() {
 compare_tests() {
   rm -f "$out/tw" "$out/tg"
   (cd "$1" && "$cdump" "$2" "$out/tw" && ${CC:-cc} -O3 -fwrapv -ffp-contract=off -fstack-clash-protection -fexceptions -w -o "$out/tw" "$out/tw.c" -lm) > "$out/want" 2> "$out/want.err"
-  (cd "$1" && export TESSERA_CACHE="$out/cache" && tsc build "$2" --tests -o "$out/tg") > "$out/got" 2> "$out/got.err"
+  (cd "$1" && export LIMEN_CACHE="$out/cache" && tsc build "$2" --tests -o "$out/tg") > "$out/got" 2> "$out/got.err"
   n=$(grep -c '^test ' "$1/$2")
   i=0
   while [ "$i" -lt "$n" ]; do
@@ -208,7 +208,7 @@ check() {
 
 check "files lex the same" compare "$tokdump" tokens -- $files
 check "files parse the same" compare "$astdump" parse -- $files
-check "edge cases parse the same" compare "$astdump" parse -- selfhost/tests/*.tsr
+check "edge cases parse the same" compare "$astdump" parse -- selfhost/tests/*.lmn
 check "files load the same" compare_load -- $programs
 check "edge cases load the same" compare_load -- $load_cases
 check "files check the same" compare_check -- $programs
@@ -220,7 +220,7 @@ check "edge cases compile to the same C" compare_c -- $c_cases
 with_tests=$(grep -l '^test \|^bench ' $programs $c_cases)
 check "test binaries compile to the same C" compare_test_c -- $with_tests
 if [ -d "$book" ]; then
-  examples=$(find "$book" -name '*.tsr' | sort)
+  examples=$(find "$book" -name '*.lmn' | sort)
   check "book examples parse the same" compare "$astdump" parse -- $examples
   check "book examples load the same" compare_load -- $examples
   check "book examples check the same" compare_check -- $examples
@@ -236,23 +236,23 @@ if [ -d "$book" ]; then
     runs=$((runs + 1))
     compare_run "$book/$1" "$2" $3 || bad_runs=$((bad_runs + 1))
   }
-  run ch13-01-group main.tsr
-  run ch13-03-channels main.tsr
-  run ch13-04-select main.tsr
-  run ch13-05-deadline main.tsr
-  run ch14-01-files main.tsr "--grant fs=work"
-  run ch14-02-http main.tsr "--grant listen=127.0.0.1:0 --grant net=127.0.0.1"
-  run ch14-03-tls main.tsr
-  run ch14-04-json main.tsr
-  run ch14-05-sql main.tsr
-  run ch15-01-strtol main.tsr "--grant foreign=c"
-  run ch15-02-more-c main.tsr "--grant foreign=c"
-  run ch12-08-embed main.tsr
-  run ch12-06-exec main.tsr "--grant exec=echo --grant exec=ls"
-  run ch08-07-defer main.tsr
-  run ch08-06-catch main.tsr
-  run ch10-05-dyn main.tsr
-  for t in ch11-01-tests/slug.tsr ch11-02-failing/slug.tsr; do
+  run ch13-01-group main.lmn
+  run ch13-03-channels main.lmn
+  run ch13-04-select main.lmn
+  run ch13-05-deadline main.lmn
+  run ch14-01-files main.lmn "--grant fs=work"
+  run ch14-02-http main.lmn "--grant listen=127.0.0.1:0 --grant net=127.0.0.1"
+  run ch14-03-tls main.lmn
+  run ch14-04-json main.lmn
+  run ch14-05-sql main.lmn
+  run ch15-01-strtol main.lmn "--grant foreign=c"
+  run ch15-02-more-c main.lmn "--grant foreign=c"
+  run ch12-08-embed main.lmn
+  run ch12-06-exec main.lmn "--grant exec=echo --grant exec=ls"
+  run ch08-07-defer main.lmn
+  run ch08-06-catch main.lmn
+  run ch10-05-dyn main.lmn
+  for t in ch11-01-tests/slug.lmn ch11-02-failing/slug.lmn; do
     runs=$((runs + 1))
     compare_tests "$book/$(dirname "$t")" "$(basename "$t")" || bad_runs=$((bad_runs + 1))
   done

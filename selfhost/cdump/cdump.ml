@@ -1,8 +1,8 @@
-(* Write to OUT.c the C of FILE's test binary, as `tessera test --native`
+(* Write to OUT.c the C of FILE's test binary, as `limen test --native`
    compiles it (Native.c_source ~tests:true), after the same checks. When
-   the program does not load or check, print the problems as `tessera
+   the program does not load or check, print the problems as `limen
    build` does and exit 1. *)
-open Tessera
+open Limen
 
 let () =
   let file = Sys.argv.(1) and out = Sys.argv.(2) in

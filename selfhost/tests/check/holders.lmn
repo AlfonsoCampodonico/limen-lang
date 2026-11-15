@@ -1,0 +1,115 @@
+// Capabilities in struct fields and enum payloads: the authority a type
+// holds through them, nested, generic and recursive, as `limen caps`
+// reports it.
+struct Client {
+    net: Net,
+    name: Str,
+}
+
+struct App {
+    client: Client,
+    out: Stdout,
+    count: Int,
+}
+
+enum Sink {
+    ToOut(Stdout),
+    ToErr(Stderr),
+    Nowhere,
+}
+
+struct Node {
+    val: Int,
+    next: Option[Node],
+    log: Stdout,
+}
+
+enum Tree {
+    Leaf(Fs),
+    Branch(List[Tree], Map[Str, Tree]),
+}
+
+struct Box[T] {
+    item: T,
+}
+
+struct Pair[A, B] {
+    a: A,
+    b: Box[B],
+    sinks: List[Sink],
+}
+
+interface Named {
+    fn label(self) -> Str
+}
+
+fn label(self: App) -> Str {
+    self.client.name
+}
+
+fn greet(app: App) {
+    app.out.print("hi {app.client.name} {app.count}")
+}
+
+fn emit(s: Sink, msg: Str) {
+    match s {
+        ToOut(o) => o.print(msg),
+        ToErr(e) => e.print(msg),
+        Nowhere => {},
+    }
+}
+
+fn walk(n: Node) -> Int {
+    n.log.print("at {n.val}")
+    match n.next {
+        Some(m) => n.val + walk(m),
+        None => n.val,
+    }
+}
+
+fn leaves(t: Tree) -> Int {
+    match t {
+        Leaf(_) => 1,
+        Branch(ts, more) => ts.fold(0, |n, x| n + leaves(x)) + more.values().fold(0, |n, x| n + leaves(x)),
+    }
+}
+
+fn boxed(b: Box[List[Client]], m: Map[Str, Option[App]]) -> Int {
+    b.item.len() + m.len()
+}
+
+fn both(c: Client, n: Net) -> Str {
+    c.name
+}
+
+fn paired(p: Pair[Int, Clock]) -> Int {
+    p.a
+}
+
+fn plain(b: Box[Int]) -> Int {
+    b.item
+}
+
+fn same(a: Box[Int], b: Box[Int]) -> Bool {
+    a == b
+}
+
+fn speak[T: Named](x: T, out: Stdout) {
+    out.print(x.label())
+}
+
+fn main(root: Root) {
+    let app = App { client: Client { net: root.net, name: "x" }, out: root.stdout, count: 1 }
+    greet(app)
+    let mut apps = [app, { app with count: 2 }]
+    apps[0].count = 3
+    emit(ToOut(root.stdout), "sink")
+    let n = Node { val: 1, next: None, log: root.stdout }
+    root.stdout.print("{walk(n)} {plain(Box { item: 2 })} {app}")
+    speak(app, root.stdout)
+    let counts = group g {
+        for a in apps {
+            g.go(|| a.count)
+        }
+    }
+}

@@ -1,6 +1,0 @@
-fn main(root: Root) -> Result[(), IoError] {
-    root.fs.write("out.txt", "hello from tessera")?
-    let text = root.fs.read("out.txt")?
-    root.stdout.print(text)
-    Ok(())
-}

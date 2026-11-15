@@ -1,4 +1,0 @@
-// Calls a, not the b tessera.lock recorded.
-foreign "a" {
-    pub fn ask() -> Int
-}

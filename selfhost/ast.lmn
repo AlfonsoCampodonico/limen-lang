@@ -1,0 +1,414 @@
+// The syntax tree the parser (selfhost/parser.lmn) builds: the same shape
+// as src/ast.ml, without the slots the OCaml checker fills in later (an
+// expression's type, its type arguments, the interpreter's cache, `dyn`
+// boxing). Tuples of the OCaml tree are small named structs here.
+//
+// Those slots cannot live in the tree: a Limen value cannot be changed
+// from elsewhere, so a checker that wrote an expression's type into the
+// tree would have to rebuild the whole tree around it. Instead every
+// expression has an `id`, unique in the program, and the checker keeps
+// what it learns in maps keyed by it (selfhost/ids.lmn numbers them).
+
+// A byte range in a source file: `lo` up to `hi`. `file` says which file,
+// as a number the module loader gives each file it reads (0 for a file
+// parsed on its own). A loaded program mixes files: a type alias from
+// another module brings its body's positions along.
+pub struct Span {
+    file: Int,
+    lo: Int,
+    hi: Int,
+}
+
+// The span from the start of `a` to the end of whichever ends later, as
+// Span.merge does in the OCaml compiler.
+pub fn merge(a: Span, b: Span) -> Span {
+    { a with hi: a.hi.max(b.hi) }
+}
+
+// ---------- types ----------
+
+pub struct TyExpr {
+    desc: TyDesc,
+    span: Span,
+}
+
+pub enum TyDesc {
+    // a named type with its arguments; `dyn Shape` is `dyn[Shape]`, and a
+    // tuple `(A, B)` is `#tuple2[A, B]`
+    TyName(Str, List[TyExpr]),
+    TyUnit,
+    TyFn(List[TyExpr], TyExpr),
+    // a size, as in Array[Int, 3]
+    TyInt(Int),
+}
+
+// ---------- patterns ----------
+
+pub struct Pat {
+    desc: PatDesc,
+    span: Span,
+}
+
+pub enum PatDesc {
+    PWild,
+    PBind(Str),
+    PInt(Int),
+    PStr(Str),
+    PBool(Bool),
+    // qualifier, variant, payload: `Shape.Rect(w, h)`
+    PVariant(Option[Str], Str, List[Pat]),
+    PTuple(List[Pat]),
+    // `[a, b, ..rest]`
+    PList(List[Pat]),
+    // `..`, the remaining parts, as an item of a tuple, variant or list
+    // pattern; in a list, `..name` binds them as a list
+    PRest(Option[Str]),
+    // `A | B`: two or more alternatives, none of them an or-pattern
+    POr(List[Pat]),
+    // `Point { x, y: 0, .. }`: the struct (`geo.Point` until modules
+    // load) and its span, each field named with its pattern, and whether
+    // `..` stands for the fields not named
+    PStruct(Str, Span, List[FieldPat], Bool),
+    // `p as name`: matches p, and binds the whole value to name too
+    PAs(Pat, Str, Span),
+}
+
+// A field of a struct pattern: `x: pattern`, or `x` alone for `x: x` (a
+// PBind with the field's span).
+pub struct FieldPat {
+    name: Str,
+    span: Span,
+    pat: Pat,
+}
+
+// ---------- expressions ----------
+
+pub enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    And,
+    Or,
+    // `??`
+    Else,
+    // `a..<b`
+    Range,
+    // `&`, `|`, `^`, `<<` and `>>` (arithmetic) on Int
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
+}
+
+pub enum UnOp {
+    Neg,
+    Not,
+    // `~`
+    BitNot,
+}
+
+pub struct Expr {
+    desc: ExprDesc,
+    span: Span,
+    // unique in a loaded program; 0 until selfhost/ids.lmn numbers the tree
+    id: Int,
+}
+
+pub enum ExprDesc {
+    EInt(Int),
+    EFloat(Float),
+    EBool(Bool),
+    EUnit,
+    EStr(List[StrPart]),
+    EVar(Str),
+    EList(List[Expr]),
+    EBin(BinOp, Expr, Expr),
+    EUn(UnOp, Expr),
+    ECall(Expr, List[Expr]),
+    // receiver, method, the method name's span, arguments
+    EMethod(Expr, Str, Span, List[Expr]),
+    // `r.name` or `t.0`, with the name's span
+    EField(Expr, Str, Span),
+    EIndex(Expr, Expr),
+    // `x?`, or `x? "context"`
+    ETry(Expr, Option[Expr]),
+    EIf(Expr, Block, Option[Expr]),
+    EMatch(Expr, List[Arm]),
+    EBlock(Block),
+    EClosure(List[ClosureParam], Expr),
+    // a struct literal: its name, the name's span, the fields; tuples are
+    // `#tupleN` with fields `0`, `1`, ...
+    EStruct(Str, Span, List[FieldInit]),
+    // `group g interleaved until clock.after(ms) { ... }`
+    EGroup(Str, Bool, Option[Deadline], Block),
+    ESelect(List[SelArm]),
+    // `x |> f(a)`, kept as written; it becomes `f(x, a)` when modules load
+    EPipe(Expr, Expr),
+    // `{ p with x: 1 }`
+    EWith(Expr, List[FieldInit]),
+    // `a?.b.c`: the Option `a`, a name for the value inside it ("safe$N",
+    // which source cannot write), and the rest of the chain run on that
+    // name, `safe$N.b.c`
+    ESafe(Expr, Str, Expr),
+    // `name: value`, a call argument naming its parameter
+    ENamed(Str, Span, Expr),
+    // a value boxed as `dyn Interface`: never written, the checker puts it
+    // where a value of a struct or enum is used as a `dyn`
+    EDyn(Expr, Str),
+}
+
+pub enum StrPart {
+    SPLit(Str),
+    SPExpr(Expr),
+}
+
+pub struct ClosureParam {
+    name: Str,
+    ty: Option[TyExpr],
+    span: Span,
+}
+
+// `name: value` in a struct literal or a `with`; `name` alone is `name: name`
+pub struct FieldInit {
+    name: Str,
+    span: Span,
+    value: Expr,
+}
+
+// the deadline of a group: `until clock.after(ms)`
+pub struct Deadline {
+    clock: Expr,
+    ms: Expr,
+}
+
+pub struct Arm {
+    pat: Pat,
+    // `if cond`: the arm applies only when it is true
+    guard: Option[Expr],
+    body: Expr,
+}
+
+pub struct SelArm {
+    op: SelOp,
+    guard: Option[Expr],
+    body: Expr,
+    span: Span,
+}
+
+pub enum SelOp {
+    // `v = ch.recv()`: the name bound (None for `_ =` or none) and the channel
+    SelRecv(Option[Name], Expr),
+    // `ch.send(v)`: channel, value
+    SelSend(Expr, Expr),
+    // `clock.after(ms)`: clock, milliseconds
+    SelAfter(Expr, Expr),
+    // `_`
+    SelDefault,
+}
+
+// A name as written, where it is: a `use`, a binding in a `select` arm.
+pub struct Name {
+    text: Str,
+    span: Span,
+}
+
+pub struct Block {
+    stmts: List[Stmt],
+    tail: Option[Expr],
+    span: Span,
+}
+
+// ---------- statements ----------
+
+pub struct Stmt {
+    desc: StmtDesc,
+    span: Span,
+}
+
+pub enum StmtDesc {
+    // mutable, name, the name's span, annotation, value
+    SLet(Bool, Str, Span, Option[TyExpr], Expr),
+    SAssign(Expr, Expr),
+    SExpr(Expr),
+    SReturn(Option[Expr]),
+    SWhile(Expr, Block),
+    // `for x in xs { ... }`: name, the name's span, the list, the body
+    SFor(Str, Span, Expr, Block),
+    // `let (a, b) = e`
+    SLetPat(Pat, Expr),
+    // `for (k, v) in xs { ... }`
+    SForPat(Pat, Expr, Block),
+    SBreak,
+    SContinue,
+    SDefer(Block),
+}
+
+// ---------- items ----------
+
+pub struct Param {
+    name: Str,
+    span: Span,
+    ty: TyExpr,
+}
+
+// A type parameter and the interfaces it must satisfy: `T: Shape + Show`.
+// Only the parameters that have bounds are listed.
+pub struct Bound {
+    name: Str,
+    ifaces: List[TyExpr],
+}
+
+// a table test's cases: `for (a, want) in [(1, 2), (2, 4)]`
+pub struct Table {
+    pat: Pat,
+    cases: Expr,
+}
+
+// A C function from a `foreign "lib" { ... }` block: its library, its
+// symbol, for a variadic one how many parameters come before the `...`,
+// and whether its calls need no Foreign capability: only those of the
+// standard library modules src/std/limen.toml trusts, which the module
+// loader decides (the parser says false).
+pub struct Foreign {
+    lib: Str,
+    sym: Str,
+    variadic: Option[Int],
+    trusted: Bool,
+}
+
+pub struct FnDecl {
+    name: Str,
+    span: Span,
+    generics: List[Str],
+    params: List[Param],
+    ret: Option[TyExpr],
+    body: Block,
+    // Some(name): a `test "name" { ... }` or `bench "name" { ... }` block
+    test: Option[Str],
+    bench: Bool,
+    // a test that takes `clock: virtual Clock`
+    virtual: Bool,
+    table: Option[Table],
+    public: Bool,
+    bounds: List[Bound],
+    foreign: Option[Foreign],
+}
+
+pub struct Field {
+    name: Str,
+    span: Span,
+    ty: TyExpr,
+}
+
+pub struct StructDecl {
+    name: Str,
+    span: Span,
+    generics: List[Str],
+    fields: List[Field],
+    bounds: List[Bound],
+    // the fields written as a bare type, `struct Admin { User, level: Int }`,
+    // each named after its type
+    embeds: List[Str],
+    public: Bool,
+    // declared in a `foreign "lib" { ... }` block: a C struct
+    foreign: Option[ForeignStruct],
+}
+
+// A C struct: its library, and its field types as written. The module
+// loader turns Int32 fields into Int for the rest of Limen, so these are
+// what C sees.
+pub struct ForeignStruct {
+    lib: Str,
+    types: List[TyExpr],
+}
+
+pub struct Variant {
+    name: Str,
+    span: Span,
+    payload: List[TyExpr],
+}
+
+pub struct EnumDecl {
+    name: Str,
+    span: Span,
+    generics: List[Str],
+    variants: List[Variant],
+    bounds: List[Bound],
+    public: Bool,
+}
+
+// `fn area(self) -> Float` in an interface; `self` is left out of `params`
+pub struct Method {
+    name: Str,
+    span: Span,
+    params: List[Param],
+    ret: Option[TyExpr],
+}
+
+pub struct IfaceDecl {
+    name: Str,
+    span: Span,
+    generics: List[Str],
+    methods: List[Method],
+    public: Bool,
+}
+
+// `type Seen = Map[Str, Int]`
+pub struct AliasDecl {
+    name: Str,
+    span: Span,
+    generics: List[Str],
+    body: TyExpr,
+    public: Bool,
+}
+
+pub enum Item {
+    IFn(FnDecl),
+    IStruct(StructDecl),
+    IEnum(EnumDecl),
+    IIface(IfaceDecl),
+    IType(AliasDecl),
+}
+
+// A parsed file: its `use` lines and its items.
+pub struct File {
+    uses: List[Name],
+    items: List[Item],
+}
+
+// Tuples are built-in generic structs named `#tupleN` with fields `0`,
+// `1`, ...; the name cannot be written in source.
+pub fn tuple_name(n: Int) -> Str {
+    "#tuple{n}"
+}
+
+pub fn is_tuple_name(s: Str) -> Bool {
+    s.len() > 6 && s.starts_with("#tuple")
+}
+
+// `x |> rhs`: whether a value can be piped into `rhs`, which must be a
+// call `f(a)` or `r.m(a)`, a function or closure `f` or `r.m` called with
+// the value alone, or one of those followed by `?`.
+pub fn pipes_into(rhs: Expr) -> Bool {
+    match rhs.desc {
+        ECall(..) | EMethod(..) | EVar(_) | EClosure(..) => true,
+        // `r.m` is a method, but `t.0` is a tuple field
+        EField(_, name, _) => !starts_with_digit(name),
+        ETry(inner, _) => pipes_into(inner),
+        _ => false,
+    }
+}
+
+fn starts_with_digit(s: Str) -> Bool {
+    let c = s.slice(0, 1)
+    c >= "0" && c <= "9"
+}

@@ -1,0 +1,390 @@
+// Types as the checker sees them, and unification, as src/types.ml has
+// them.
+//
+// The OCaml checker's type variables are mutable cells: unifying one
+// links it to a type, and every type that holds the variable sees the
+// link. A Limen value cannot change under its holders, so here a
+// variable is a number and the links live in a substitution, `Subst`, that
+// the checker threads through everything it does. `repr` follows a
+// variable's links the way OCaml's `repr` follows its cells, so a type
+// read through the substitution is the type OCaml would see at that
+// moment, and what the checker records about an expression (its type, a
+// generic function's type arguments) is read through the final
+// substitution when the program has been checked.
+use ast
+
+pub enum Ty {
+    TInt,
+    TFloat,
+    TBool,
+    TStr,
+    // immutable bytes
+    TBytes,
+    TUnit,
+    TList(Ty),
+    TFn(List[Ty], Ty),
+    // a struct or enum, the prelude's included, with its type arguments;
+    // tuples are `#tupleN`
+    TNamed(Str, List[Ty]),
+    // a capability, by name: Root, Net, Fs, Stdout, ...
+    TCap(Str),
+    // the handle of a `group` block whose tasks return the type
+    TGroup(Ty),
+    // a fixed-size array: the element type and the length, a TLen, or a
+    // type parameter (or variable) that stands for one
+    TArray(Ty, Ty),
+    // an array's length, `3` in `Array[Int, 3]`; never a value's type
+    TLen(Int),
+    TChan(Ty),
+    TMap(Ty, Ty),
+    // a value of any type that satisfies the interface (with these
+    // arguments)
+    TDyn(Str, List[Ty]),
+    // a type parameter, inside its own definition
+    TParam(Str),
+    // a type variable, by number: what it stands for is in the Subst
+    TVar(Int),
+    // already reported: unifies with anything
+    TErr,
+}
+
+pub fn opt(t: Ty) -> Ty {
+    TNamed("Option", [t])
+}
+
+pub fn res(t: Ty, e: Ty) -> Ty {
+    TNamed("Result", [t, e])
+}
+
+pub fn io_err() -> Ty {
+    TNamed("IoError", [])
+}
+
+// What the type variables stand for: the type each linked variable was
+// unified with, and the number the next new variable gets. It also carries
+// the authority each struct and enum holds through its fields (set once
+// the declarations are known, see `with_authority`), which every question
+// about a type's capabilities needs.
+pub struct Subst {
+    links: Map[Int, Ty],
+    next: Int,
+    authority: Map[Str, List[(Str, Str)]],
+}
+
+pub fn empty() -> Subst {
+    Subst { links: map(), next: 1, authority: map() }
+}
+
+pub fn fresh(self: Subst) -> (Ty, Subst) {
+    (TVar(self.next), { self with next: self.next + 1 })
+}
+
+// `t` with the links of the variable at its top followed: the outermost
+// part of the type is known, or it is an unlinked variable.
+pub fn repr(self: Subst, t: Ty) -> Ty {
+    let mut t = t
+    while true {
+        match t {
+            TVar(v) => match self.links.get(v) {
+                Some(linked) => {
+                    t = linked
+                },
+                None => {
+                    return t
+                },
+            },
+            _ => {
+                return t
+            },
+        }
+    }
+    t
+}
+
+pub fn show(self: Subst, t: Ty) -> Str {
+    let all = |ts: List[Ty]| ts.map(|x| self.show(x)).join(", ")
+    match self.repr(t) {
+        TInt => "Int",
+        TFloat => "Float",
+        TBool => "Bool",
+        TStr => "Str",
+        TBytes => "Bytes",
+        TUnit => "()",
+        TList(a) => "List[{self.show(a)}]",
+        TFn(ps, r) => "fn({all(ps)}) -> {self.show(r)}",
+        TNamed(n, args) if ast.is_tuple_name(n) => "({all(args)})",
+        TNamed(n, []) => n,
+        TNamed(n, args) => "{n}[{all(args)}]",
+        TCap(c) => c,
+        TGroup(a) => "Group[{self.show(a)}]",
+        TArray(a, n) => "Array[{self.show(a)}, {self.show(n)}]",
+        TLen(n) => "{n}",
+        TChan(a) => "Chan[{self.show(a)}]",
+        TDyn(i, []) => "dyn " + i,
+        TDyn(i, args) => "dyn {i}[{all(args)}]",
+        TMap(k, v) => "Map[{self.show(k)}, {self.show(v)}]",
+        TParam(n) => n,
+        TVar(_) => "_",
+        TErr => "?",
+    }
+}
+
+// Does variable `v` occur in `t`?
+fn occurs(self: Subst, v: Int, t: Ty) -> Bool {
+    match self.repr(t) {
+        TVar(w) => v == w,
+        TList(a) | TGroup(a) | TChan(a) => self.occurs(v, a),
+        TArray(a, n) => self.occurs(v, a) || self.occurs(v, n),
+        TDyn(_, args) | TNamed(_, args) => args.any(|a| self.occurs(v, a)),
+        TMap(k, x) => self.occurs(v, k) || self.occurs(v, x),
+        TFn(ps, r) => ps.any(|p| self.occurs(v, p)) || self.occurs(v, r),
+        _ => false,
+    }
+}
+
+// Make `a` and `b` the same type, linking variables where needed. False
+// when they cannot be; the links made before the mismatch was found stay,
+// as they do in OCaml, where the cells were already written.
+pub fn unify(self: Subst, a: Ty, b: Ty) -> (Bool, Subst) {
+    let a = self.repr(a)
+    let b = self.repr(b)
+    match (a, b) {
+        (TErr, _) | (_, TErr) => (true, self),
+        (TVar(x), TVar(y)) if x == y => (true, self),
+        (TVar(v), t) | (t, TVar(v)) => {
+            if self.occurs(v, t) {
+                return (false, self)
+            }
+            let mut s = self
+            s.links[v] = t
+            (true, s)
+        },
+        (TInt, TInt) | (TFloat, TFloat) | (TBool, TBool) | (TStr, TStr) | (TBytes, TBytes) | (TUnit, TUnit) => (true, self),
+        (TList(x), TList(y)) | (TGroup(x), TGroup(y)) | (TChan(x), TChan(y)) => self.unify(x, y),
+        // the length first, as OCaml does
+        (TArray(x, n), TArray(y, m)) => self.unify_all([n, x], [m, y]),
+        (TLen(n), TLen(m)) if n == m => (true, self),
+        (TMap(k1, v1), TMap(k2, v2)) => self.unify_all([k1, v1], [k2, v2]),
+        (TFn(p1, r1), TFn(p2, r2)) => {
+            if p1.len() != p2.len() {
+                return (false, self)
+            }
+            self.unify_all(p1 + [r1], p2 + [r2])
+        },
+        (TNamed(n1, a1), TNamed(n2, a2)) if n1 == n2 && a1.len() == a2.len() => self.unify_all(a1, a2),
+        (TCap(c1), TCap(c2)) if c1 == c2 => (true, self),
+        (TParam(x), TParam(y)) if x == y => (true, self),
+        (TDyn(x, xs), TDyn(y, ys)) if x == y && xs.len() == ys.len() => self.unify_all(xs, ys),
+        _ => (false, self),
+    }
+}
+
+// Unify the pairs in order, stopping at the first that fails.
+fn unify_all(self: Subst, xs: List[Ty], ys: List[Ty]) -> (Bool, Subst) {
+    let mut s = self
+    for (x, y) in xs.zip(ys) {
+        let (ok, next) = s.unify(x, y)
+        s = next
+        if !ok {
+            return (false, s)
+        }
+    }
+    (true, s)
+}
+
+// `t` with the type parameters of `env` replaced by their types.
+pub fn subst(self: Subst, env: List[(Str, Ty)], t: Ty) -> Ty {
+    let all = |ts: List[Ty]| ts.map(|x| self.subst(env, x))
+    match self.repr(t) {
+        TParam(n) => match env.find(|p| p.0 == n) {
+            Some(p) => p.1,
+            None => TParam(n),
+        },
+        TList(a) => TList(self.subst(env, a)),
+        TArray(a, n) => TArray(self.subst(env, a), self.subst(env, n)),
+        TDyn(i, xs) => TDyn(i, all(xs)),
+        TChan(a) => TChan(self.subst(env, a)),
+        TMap(k, v) => TMap(self.subst(env, k), self.subst(env, v)),
+        TGroup(a) => TGroup(self.subst(env, a)),
+        TFn(ps, r) => TFn(all(ps), self.subst(env, r)),
+        TNamed(n, args) => TNamed(n, all(args)),
+        other => other,
+    }
+}
+
+// The capabilities a value of type `t` holds: written in the type, or
+// reached through the fields and payloads of the structs and enums in it,
+// in the order OCaml's caps_in finds them (it puts each new one in front).
+pub fn caps_in(self: Subst, t: Ty, acc: List[Str]) -> List[Str] {
+    match self.repr(t) {
+        TCap(c) => if acc.contains(c) { acc } else { [c] + acc },
+        TList(a) | TArray(a, _) => self.caps_in(a, acc),
+        TMap(k, v) => self.caps_in(v, self.caps_in(k, acc)),
+        TFn(ps, r) => ps.fold(self.caps_in(r, acc), |got, p| self.caps_in(p, got)),
+        TNamed(n, args) => {
+            let got = args.fold(acc, |got, a| self.caps_in(a, got))
+            (self.authority.get(n) ?? []).fold(got, |got, held| if got.contains(held.0) { got } else { [held.0] + got })
+        },
+        _ => acc,
+    }
+}
+
+// The capabilities written in `t` itself, not those its structs and enums
+// hold through their fields.
+pub fn caps_written(self: Subst, t: Ty, acc: List[Str]) -> List[Str] {
+    match self.repr(t) {
+        TCap(c) => if acc.contains(c) { acc } else { [c] + acc },
+        TList(a) | TArray(a, _) => self.caps_written(a, acc),
+        TMap(k, v) => self.caps_written(v, self.caps_written(k, acc)),
+        TFn(ps, r) => ps.fold(self.caps_written(r, acc), |got, p| self.caps_written(p, got)),
+        TNamed(_, args) => args.fold(acc, |got, a| self.caps_written(a, got)),
+        _ => acc,
+    }
+}
+
+// Where a type that does not write capability `c` gets it from: the path
+// through the first struct or enum in it that holds `c` (its own entry
+// first, then its type arguments in order).
+pub fn via(self: Subst, t: Ty, c: Str) -> Option[Str] {
+    match self.repr(t) {
+        TList(a) | TArray(a, _) => self.via(a, c),
+        TMap(k, v) => first_via(self, [k, v], c),
+        TFn(ps, r) => first_via(self, ps + [r], c),
+        TNamed(n, args) => match (self.authority.get(n) ?? []).find(|held| held.0 == c) {
+            Some(held) => Some(held.1),
+            None => first_via(self, args, c),
+        },
+        _ => None,
+    }
+}
+
+fn first_via(s: Subst, ts: List[Ty], c: Str) -> Option[Str] {
+    for t in ts {
+        match s.via(t, c) {
+            Some(p) => {
+                return Some(p)
+            },
+            None => {},
+        }
+    }
+    None
+}
+
+// The authority each of the structs and enums `names` holds through its
+// own fields and payloads: each capability with the first path that
+// reaches it, `Client.net` or `App.client.net`. `fields` gives a type's
+// fields (a variant's payloads named by the variant) in declaration order,
+// its type parameters as TParam. Each type is walked depth first from its
+// first field, every type entered once, so recursive types end; type
+// arguments are not counted here (caps_in walks them where the type is
+// used). A type holding no capability gets no entry.
+pub fn with_authority(self: Subst, names: List[Str], fields: Map[Str, List[(Str, Ty)]]) -> Subst {
+    let mut table: Map[Str, List[(Str, Str)]] = map()
+    for n in names {
+        let found = enter(self, fields, n, n, [], []).0
+        if !found.is_empty() {
+            table[n] = found
+        }
+    }
+    { self with authority: table }
+}
+
+// Enter type `m`, reached by `path`: the capabilities found so far and the
+// types entered.
+fn enter(s: Subst, fields: Map[Str, List[(Str, Ty)]], m: Str, path: Str, found: List[(Str, Str)], seen: List[Str]) -> (List[(Str, Str)], List[Str]) {
+    if seen.contains(m) {
+        return (found, seen)
+    }
+    let mut found = found
+    let mut seen = seen + [m]
+    for (f, t) in fields.get(m) ?? [] {
+        (found, seen) = walk(s, fields, path + "." + f, t, found, seen)
+    }
+    (found, seen)
+}
+
+fn walk(s: Subst, fields: Map[Str, List[(Str, Ty)]], path: Str, t: Ty, found: List[(Str, Str)], seen: List[Str]) -> (List[(Str, Str)], List[Str]) {
+    match s.repr(t) {
+        TCap(c) => (if found.any(|held| held.0 == c) { found } else { found + [(c, path)] }, seen),
+        TList(a) | TArray(a, _) => walk(s, fields, path, a, found, seen),
+        TMap(k, v) => {
+            let (f1, s1) = walk(s, fields, path, k, found, seen)
+            walk(s, fields, path, v, f1, s1)
+        },
+        TFn(ps, r) => {
+            let mut acc = (found, seen)
+            for p in ps + [r] {
+                acc = walk(s, fields, path, p, acc.0, acc.1)
+            }
+            acc
+        },
+        TNamed(m, args) => {
+            let mut acc = (found, seen)
+            for a in args {
+                acc = walk(s, fields, path, a, acc.0, acc.1)
+            }
+            enter(s, fields, m, path, acc.0, acc.1)
+        },
+        _ => (found, seen),
+    }
+}
+
+// Channels are shared, so a value that holds one is never pure.
+pub fn has_chan(self: Subst, t: Ty) -> Bool {
+    match self.repr(t) {
+        TChan(_) => true,
+        TList(a) | TArray(a, _) => self.has_chan(a),
+        TMap(k, v) => self.has_chan(k) || self.has_chan(v),
+        TFn(ps, r) => ps.any(|p| self.has_chan(p)) || self.has_chan(r),
+        TNamed(_, args) => args.any(|a| self.has_chan(a)),
+        _ => false,
+    }
+}
+
+// Does `t` mention a `dyn` type?
+pub fn has_dyn(self: Subst, t: Ty) -> Bool {
+    match self.repr(t) {
+        TDyn(..) => true,
+        TList(a) | TChan(a) | TArray(a, _) => self.has_dyn(a),
+        TMap(k, v) => self.has_dyn(k) || self.has_dyn(v),
+        TNamed(_, args) => args.any(|a| self.has_dyn(a)),
+        _ => false,
+    }
+}
+
+pub fn has_fn(self: Subst, t: Ty) -> Bool {
+    match self.repr(t) {
+        TFn(..) => true,
+        TList(a) | TArray(a, _) => self.has_fn(a),
+        TMap(k, v) => self.has_fn(k) || self.has_fn(v),
+        TNamed(_, args) => args.any(|a| self.has_fn(a)),
+        _ => false,
+    }
+}
+
+// `t` for code generation: the type parameters of `env` replaced by their
+// types, and whatever is still unknown, an unlinked variable or a
+// parameter `env` does not give, taken as `()`. The result holds no TVar
+// and no TParam.
+pub fn zonk(self: Subst, env: List[(Str, Ty)], t: Ty) -> Ty {
+    let all = |ts: List[Ty]| ts.map(|x| self.zonk(env, x))
+    match self.repr(t) {
+        TParam(n) => match env.find(|p| p.0 == n) {
+            Some(p) => self.zonk([], p.1),
+            None => TUnit,
+        },
+        TVar(_) => TUnit,
+        TList(a) => TList(self.zonk(env, a)),
+        TArray(a, n) => TArray(self.zonk(env, a), match self.zonk(env, n) {
+            TLen(k) => TLen(k),
+            _ => TLen(0),
+        }),
+        TDyn(i, xs) => TDyn(i, all(xs)),
+        TChan(a) => TChan(self.zonk(env, a)),
+        TMap(k, v) => TMap(self.zonk(env, k), self.zonk(env, v)),
+        TGroup(a) => TGroup(self.zonk(env, a)),
+        TFn(ps, r) => TFn(all(ps), self.zonk(env, r)),
+        TNamed(n, args) => TNamed(n, all(args)),
+        other => other,
+    }
+}

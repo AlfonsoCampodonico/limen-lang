@@ -1,0 +1,42 @@
+// Calling C: parse numbers with the C library's strtod.
+//
+//   limen run examples/ffi.lmn --grant foreign=c
+//
+// The foreign block declares the C functions; only code that holds the
+// Foreign capability can call them, and only for granted libraries.
+
+foreign "c" {
+    // double strtod(const char *s, char **end)
+    fn strtod(s: Str, end: Out[Handle]) -> Float
+    // size_t strnlen(const char *p, size_t max)
+    fn strnlen(p: Handle, max: Int) -> Int
+}
+
+// A safe wrapper: the pointer C hands back never leaves this function.
+fn parse_number(c: Foreign, s: Str) -> Option[(Float, Str)] {
+    let (x, end) = strtod(c, s)
+    // `end` points into the bytes of `s`, which C only borrowed for the
+    // call: turn it into an offset now, while `s` is still alive (it is used
+    // below), and use plain Limen from there on.
+    let used = s.len() - strnlen(c, end, s.len())
+    if used == 0 {
+        None
+    } else {
+        Some((x, s.slice(used, s.len())))
+    }
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let c = root.foreign
+    if !c.allows("c") {
+        out.print("run with --grant foreign=c")
+        return
+    }
+    for s in ["3.25 kg", "-1e3", "0x1p4!", "abc", ""] {
+        match parse_number(c, s) {
+            Some((x, rest)) => out.print("{s}: {x}, then [{rest}]"),
+            None => out.print("{s}: not a number"),
+        }
+    }
+}

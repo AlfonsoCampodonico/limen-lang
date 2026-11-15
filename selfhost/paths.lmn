@@ -1,0 +1,40 @@
+// File paths as text, the way OCaml's Filename module writes them on Unix,
+// so the paths the loader prints are the OCaml loader's: "./json.lmn" for a
+// module next to "main.lmn", "vendor/json" for a dependency.
+
+// The directory part: "a/b.lmn" is "a", "b.lmn" is ".", "/b" is "/".
+// Trailing slashes are ignored, and so are repeated ones before the name.
+pub fn dirname(path: Str) -> Str {
+    if path == "" {
+        return "."
+    }
+    let bs = path.bytes()
+    let slash = 47
+    // skip trailing slashes, then the name, then the slashes before it
+    let mut i = bs.len() - 1
+    while i >= 0 && bs[i] == slash {
+        i = i - 1
+    }
+    if i < 0 {
+        return "/"
+    }
+    while i >= 0 && bs[i] != slash {
+        i = i - 1
+    }
+    if i < 0 {
+        return "."
+    }
+    while i >= 0 && bs[i] == slash {
+        i = i - 1
+    }
+    if i < 0 { "/" } else { path.slice(0, i + 1) }
+}
+
+// `dir` and `name` joined with one `/`.
+pub fn concat(dir: Str, name: Str) -> Str {
+    if dir == "" || dir.ends_with("/") { dir + name } else { dir + "/" + name }
+}
+
+pub fn is_relative(path: Str) -> Bool {
+    !path.starts_with("/")
+}

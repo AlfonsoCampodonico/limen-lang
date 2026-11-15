@@ -1,4 +1,4 @@
-; How fast tessera checks a program, by phase: dune exec bench/checkspeed/checkspeed.exe -- FILE
+; How fast limen checks a program, by phase: dune exec bench/checkspeed/checkspeed.exe -- FILE
 (executable
  (name checkspeed)
- (libraries tessera unix))
+ (libraries limen unix))

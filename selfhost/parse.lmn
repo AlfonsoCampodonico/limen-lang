@@ -1,0 +1,41 @@
+// Prints the syntax tree of one file as selfhost/parser.lmn builds it, in
+// the format of selfhost/astdump (the OCaml parser's), so the two can be
+// compared: the tree, then `spans` and the positions in it. A parse error
+// prints ERROR CODE LO HI, then the parser's message and notes.
+//
+//   limen run selfhost/parse.lmn --grant fs=.:ro -- examples/hello.lmn
+use ast_print
+use parser
+
+fn main(root: Root) -> Int {
+    let out = root.stdout
+    let path = root.args().first() ?? {
+        out.print("usage: parse FILE")
+        return 2
+    }
+    match root.fs.read(path) {
+        Ok(src) => {
+            match parser.parse(src) {
+                Ok(f) => {
+                    out.print(ast_print.file(f))
+                    out.print("spans")
+                    for line in ast_print.spans(f) {
+                        out.print(line)
+                    }
+                },
+                Err(e) => {
+                    out.print("ERROR {e.code} {e.span.lo} {e.span.hi}")
+                    out.print(e.message)
+                    for n in e.notes {
+                        out.print("note: {n}")
+                    }
+                },
+            }
+            0
+        },
+        Err(e) => {
+            out.print("cannot read {path}: {e}")
+            1
+        },
+    }
+}

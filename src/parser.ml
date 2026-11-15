@@ -983,7 +983,7 @@ let parse_item st =
    [lib], each with a signature and no body. `pub fn` exports one. A `...`
    among the parameters makes the function variadic: the parameters after it
    are the variadic arguments this declaration passes. `= "sym"` after the
-   signature names the C function when it differs from the Tessera name. A
+   signature names the C function when it differs from the Limen name. A
    `struct Name { field: T, ... }` in the block declares a C struct passed by
    value. *)
 let parse_foreign st =
@@ -1040,7 +1040,7 @@ let parse_foreign st =
         params;
       let ret = if accept_sym st "->" then Some (parse_type st) else None in
       let hi = match ret with Some t -> t.tspan.hi | None -> nsp.hi in
-      (* `= "printf"`: the C function, when it is not the Tessera name *)
+      (* `= "printf"`: the C function, when it is not the Limen name *)
       let sym, hi =
         if accept_sym st "=" then
           let t = advance st in

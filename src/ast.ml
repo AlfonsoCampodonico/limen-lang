@@ -166,7 +166,7 @@ and fn_decl = {
   fn_ret : ty_expr option;
   fn_body : block;
   fn_test : string option; (* Some name: a `test "name" { ... }` or `bench "name" { ... }` block *)
-  fn_bench : bool; (* a `bench` block: run by `tessera test --bench`, timed, never as a test *)
+  fn_bench : bool; (* a `bench` block: run by `limen test --bench`, timed, never as a test *)
   fn_virtual : bool; (* a test that takes `clock: virtual Clock`: it runs on virtual time *)
   fn_table : (pat * expr) option;
       (* a table test, `for PAT in [case, ...]` (the expression is that list): one isolated run per
@@ -177,7 +177,7 @@ and fn_decl = {
 }
 
 (* A C function: its library, its symbol, and whether it is trusted. Only
-   the foreign blocks of standard library modules that src/std/tessera.toml
+   the foreign blocks of standard library modules that src/std/limen.toml
    names in [trust] are trusted: their calls take no Foreign capability.
    [fsym] is the function's own name unless the declaration names another
    (`fn print_int(...) -> Int32 = "printf"`). [fvariadic]: for a variadic
@@ -199,7 +199,7 @@ type struct_decl = {
   st_foreign : (string * ty_expr list) option;
       (* declared in a `foreign "lib" { struct ... }` block: a C struct passed
          by value. The library, and the field types as written (Int32 among
-         them); the loader turns Int32 fields into Int for the rest of Tessera. *)
+         them); the loader turns Int32 fields into Int for the rest of Limen. *)
 }
 
 type enum_decl = {

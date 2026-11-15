@@ -1,4 +1,4 @@
-(* tessera.toml: a package's name, the program's own grants, and its
+(* limen.toml: a package's name, the program's own grants, and its
    dependencies, each with the capabilities it may use.
 
      [package]
@@ -19,8 +19,8 @@
      [embed]
      roots = ["../assets"]
 
-   A dependency is a directory holding NAME.tsr (and any modules it uses from
-   the same directory). Because Tessera has no ambient authority, a function can
+   A dependency is a directory holding NAME.lmn (and any modules it uses from
+   the same directory). Because Limen has no ambient authority, a function can
    only use a capability that reaches it as a parameter, so the capabilities a
    dependency can ever use are exactly those in its functions' signatures. The
    checker compares them with `caps` and rejects the program if a dependency
@@ -36,15 +36,15 @@ type source = Path | Git of string * rev
 type dep = { dname : string; dir : string; caps : string list; dspan : Span.t; source : source }
 (* [grants]: the program's own grants, as (kind, value) pairs written exactly
    like the text after `--grant KIND=`. An fs directory is made absolute
-   relative to tessera.toml. Only the tessera.toml of the program being run is read
+   relative to limen.toml. Only the limen.toml of the program being run is read
    for grants; a dependency's never is. *)
 (* [trust]: `foreign = [...]` names the dependencies that may call C. C code
    can do anything the process can, so this is full trust, given only here,
-   by the program; `caps` cannot grant it. In src/std/tessera.toml it names the
+   by the program; `caps` cannot grant it. In src/std/limen.toml it names the
    standard library modules whose foreign calls need no Foreign capability. *)
-(* [embed]: `roots = [...]`, directories (relative to tessera.toml) whose
+(* [embed]: `roots = [...]`, directories (relative to limen.toml) whose
    files the program may `embed` besides its own package's: each as written,
-   the path it names, and where. Only the program's tessera.toml can declare
+   the path it names, and where. Only the program's limen.toml can declare
    them; a dependency that tries is E0321 (Modules.load). *)
 type t = {
   pname : string;
@@ -91,7 +91,7 @@ let git_url_ok u =
      | Some a, Some c -> a > 0 && c > a + 1 && not (String.contains (String.sub u 0 c) '/')
      | _ -> false)
 
-(* A tag we hand to git, and a commit hash as tessera.toml writes one. *)
+(* A tag we hand to git, and a commit hash as limen.toml writes one. *)
 let tag_ok t = t <> "" && t.[0] <> '-' && not (String.exists (fun c -> Char.code c <= 0x20 || c = '\x7f') t)
 
 let commit_ok c =
@@ -220,7 +220,7 @@ let parse file src : t =
     (fun tb ->
       let k = tb.tname in
       if tb.tarray || (k <> "" && k <> "package" && k <> "dependencies" && k <> "grants" && k <> "trust" && k <> "embed") then
-        raise (Bad (tb.tspan, "unknown table " ^ (if tb.tarray then "[[" ^ k ^ "]]" else "[" ^ k ^ "]") ^ "; tessera.toml has [package], [grants], [dependencies], [trust] and [embed]"));
+        raise (Bad (tb.tspan, "unknown table " ^ (if tb.tarray then "[[" ^ k ^ "]]" else "[" ^ k ^ "]") ^ "; limen.toml has [package], [grants], [dependencies], [trust] and [embed]"));
       List.iter
         (fun (k, v, sp) ->
           match (tb.tname, k, v) with
@@ -304,13 +304,13 @@ let parse file src : t =
               rs;
             roots := Some (List.map (fun r -> (r, (if Filename.is_relative r then Filename.concat dir r else r), sp)) rs)
           | "embed", _, _ ->
-            raise (Bad (sp, "[embed] takes `roots = [\"DIR\", ...]`: directories, relative to tessera.toml, whose files the program may embed"))
+            raise (Bad (sp, "[embed] takes `roots = [\"DIR\", ...]`: directories, relative to limen.toml, whose files the program may embed"))
           | _ -> raise (Bad (sp, "keys belong in [package], [grants], [dependencies], [trust] or [embed]")))
         tb.keys)
     tables;
   List.iter
     (fun t ->
-      if not (List.exists (fun d -> d.dname = t) !deps) && file <> "<std>/tessera.toml" then
+      if not (List.exists (fun d -> d.dname = t) !deps) && file <> "<std>/limen.toml" then
         raise (Bad (span 0 0, Printf.sprintf "[trust] names `%s`, which is not in [dependencies]" t)))
     !trust;
   { pname = !name; file; deps = List.rev !deps; grants = !grants; trust = !trust; embed_roots = Option.value ~default:[] !roots }
@@ -324,37 +324,37 @@ let check_roots (pkg : t) =
         raise (Bad (sp, Printf.sprintf "embed root `%s` is not a directory (looked for %s)" r full)))
     pkg.embed_roots
 
-(* Whether the tessera.toml text [src] (at [file]) declares embed roots:
-   the span of its [embed] table. A dependency's tessera.toml is otherwise
+(* Whether the limen.toml text [src] (at [file]) declares embed roots:
+   the span of its [embed] table. A dependency's limen.toml is otherwise
    never read, and one that cannot be read declares nothing. *)
 let declares_embed file src =
   match read file src with
   | tables -> Option.map (fun tb -> tb.tspan) (List.find_opt (fun tb -> tb.tname = "embed" && not tb.tarray) tables)
   | exception Bad _ -> None
 
-(* tessera.toml in the directory of [main] or the nearest parent. *)
+(* limen.toml in the directory of [main] or the nearest parent. *)
 let find main =
   let rec up d =
-    let p = Filename.concat d "tessera.toml" in
+    let p = Filename.concat d "limen.toml" in
     if Sys.file_exists p then Some p
     else
       let parent = Filename.dirname d in
       if parent = d then None else up parent
   in
   let d = Filename.dirname main in
-  let beside = Filename.concat d "tessera.toml" in
+  let beside = Filename.concat d "limen.toml" in
   if Sys.file_exists beside then Some beside
   else up (if Filename.is_relative d then Filename.concat (Sys.getcwd ()) d else d)
 
-(* ---------- git dependencies, the cache and tessera.lock ---------- *)
+(* ---------- git dependencies, the cache and limen.lock ---------- *)
 
 (* A git dependency is cloned with the `git` command into the cache, one
    directory per commit, without its .git directory:
 
-     $TESSERA_CACHE (or $XDG_CACHE_HOME/tessera, or ~/.cache/tessera)
+     $LIMEN_CACHE (or $XDG_CACHE_HOME/limen, or ~/.cache/limen)
        git/<url-key>/<commit>/
 
-   tessera.lock, next to tessera.toml, records the exact commit each one resolved to
+   limen.lock, next to limen.toml, records the exact commit each one resolved to
    and a hash of its files, one line per dependency:
 
      json2 https://example.com/json2.git tag:v1.2.0 <commit> blake2b:<hex>
@@ -368,20 +368,20 @@ let find main =
    a fetch: the editor and agent servers never run git. *)
 let offline = ref false
 
-(* Whether loading a program may write tessera.lock. Only the commands that
-   produce something set it (build, run, test): `tessera check`, `caps`, the
+(* Whether loading a program may write limen.lock. Only the commands that
+   produce something set it (build, run, test): `limen check`, `caps`, the
    editor and agent servers read the lock and never change it. *)
 let write_lock = ref false
 
 exception Fetch of string
 
 let cache_dir () =
-  match Sys.getenv_opt "TESSERA_CACHE" with
+  match Sys.getenv_opt "LIMEN_CACHE" with
   | Some d when d <> "" -> d
   | _ -> (
     match Sys.getenv_opt "XDG_CACHE_HOME" with
-    | Some d when d <> "" -> Filename.concat d "tessera"
-    | _ -> Filename.concat (Filename.concat (Option.value (Sys.getenv_opt "HOME") ~default:".") ".cache") "tessera")
+    | Some d when d <> "" -> Filename.concat d "limen"
+    | _ -> Filename.concat (Filename.concat (Option.value (Sys.getenv_opt "HOME") ~default:".") ".cache") "limen")
 
 let rec mkdir_p d =
   if not (Sys.file_exists d) then begin
@@ -444,7 +444,7 @@ let commit_dir url commit = Filename.concat (Filename.concat (Filename.concat (c
 (* Clone [url], check out [rev], and move the files into the cache. Returns
    the full commit. *)
 let fetch name url rev =
-  if !offline then raise (Fetch (Printf.sprintf "`%s` is not in the cache yet; run `tessera check` on the program to fetch it" name));
+  if !offline then raise (Fetch (Printf.sprintf "`%s` is not in the cache yet; run `limen check` on the program to fetch it" name));
   let base = Filename.concat (cache_dir ()) "git" in
   mkdir_p base;
   let tmp = Filename.concat base (Printf.sprintf "tmp-%d-%d" (Unix.getpid ()) (Random.bits ())) in
@@ -468,7 +468,7 @@ let fetch name url rev =
 type lock_line = { lname : string; lurl : string; lrev : string; lcommit : string; lhash : string }
 
 let rev_text = function Tag t -> "tag:" ^ t | Commit c -> "commit:" ^ c
-let lock_header = "# tessera.lock: the exact version of each git dependency, and the C libraries of each trusted one, written by tessera. Commit it.\n"
+let lock_header = "# limen.lock: the exact version of each git dependency, and the C libraries of each trusted one, written by limen. Commit it.\n"
 
 let read_lock path =
   if not (Sys.file_exists path) then []
@@ -490,11 +490,11 @@ let read_lock path =
             raise
               (Bad
                  ( { Span.file = path; lo = start; hi = start + String.length l },
-                   "malformed line in tessera.lock; expected NAME URL REV COMMIT HASH (delete the line to fetch again)" )))
+                   "malformed line in limen.lock; expected NAME URL REV COMMIT HASH (delete the line to fetch again)" )))
       lines
 
 (* Trusted dependencies that call C: `foreign NAME LIB,LIB` lines in
-   tessera.lock, the libraries each one declared when it was trusted. *)
+   limen.lock, the libraries each one declared when it was trusted. *)
 let foreign_line name libs = Printf.sprintf "foreign %s %s\n" name (String.concat "," libs)
 
 let read_foreign_lock path =
@@ -507,13 +507,13 @@ let read_foreign_lock path =
         | _ -> None)
       (String.split_on_char '\n' (In_channel.with_open_bin path In_channel.input_all))
 
-(* Fetch or find each git dependency, check it against tessera.lock, and write
-   tessera.lock if it changed (with [write_lock]). Errors carry their code:
+(* Fetch or find each git dependency, check it against limen.lock, and write
+   limen.lock if it changed (with [write_lock]). Errors carry their code:
    E0322 (fetch), E0323 (lock). *)
 exception Lock_error of string * Span.t * string * string list
 
 let resolve (pkg : t) : t =
-  let lock_path = Filename.concat (Filename.dirname pkg.file) "tessera.lock" in
+  let lock_path = Filename.concat (Filename.dirname pkg.file) "limen.lock" in
   let locked = try read_lock lock_path with Bad (sp, m) -> raise (Lock_error ("E0323", sp, m, [])) in
   let changed = ref false in
   let lines = ref [] in
@@ -531,7 +531,7 @@ let resolve (pkg : t) : t =
               (if not (Sys.file_exists dir) then
                  try
                    let c = fetch d.dname url (Commit l.lcommit) in
-                   if c <> l.lcommit then raise (Fetch (Printf.sprintf "commit %s from tessera.lock resolved to %s" l.lcommit c))
+                   if c <> l.lcommit then raise (Fetch (Printf.sprintf "commit %s from limen.lock resolved to %s" l.lcommit c))
                  with Fetch m -> raise (fetch_err m));
               let h = content_hash dir in
               if h <> l.lhash then
@@ -539,7 +539,7 @@ let resolve (pkg : t) : t =
                   (Lock_error
                      ( "E0323",
                        d.dspan,
-                       Printf.sprintf "dependency `%s` at %s does not match tessera.lock: its files hash to %s, the lock says %s" d.dname
+                       Printf.sprintf "dependency `%s` at %s does not match limen.lock: its files hash to %s, the lock says %s" d.dname
                          (String.sub l.lcommit 0 (min 12 (String.length l.lcommit))) h l.lhash,
                        [ "the cached copy at " ^ dir ^ " was changed, or the repository's history was rewritten";
                          "delete that directory to fetch it again; if it still does not match, do not trust the new contents" ] ));
@@ -562,11 +562,11 @@ let resolve (pkg : t) : t =
     let keep = List.map (fun (n, ls) -> foreign_line n ls) (read_foreign_lock lock_path) in
     if not (lines = [] && keep = [] && not (Sys.file_exists lock_path)) then
       try Out_channel.with_open_bin lock_path (fun oc -> output_string oc (lock_header ^ text ^ String.concat "" keep))
-      with Sys_error m -> raise (Lock_error ("E0323", Span.dummy, "cannot write tessera.lock: " ^ m, []))
+      with Sys_error m -> raise (Lock_error ("E0323", Span.dummy, "cannot write limen.lock: " ^ m, []))
   end;
   { pkg with deps }
 
-(* Load the package around [main]: Ok None when there is no tessera.toml. *)
+(* Load the package around [main]: Ok None when there is no limen.toml. *)
 let load main : (t option, Diag.t) result =
   match find main with
   | None -> Ok None
@@ -581,9 +581,9 @@ let load main : (t option, Diag.t) result =
         | exception Bad (sp, m) -> Error (Diag.make "E0321" sp m)
         | () -> ( try Ok (Some (resolve pkg)) with Lock_error (code, sp, m, notes) -> Error (Diag.make ~notes code sp m)))))
 
-(* The standard library's own manifest, src/std/tessera.toml: each std module
+(* The standard library's own manifest, src/std/limen.toml: each std module
    is a "dependency" with the capabilities it may take. *)
-let std_file = "<std>/tessera.toml"
+let std_file = "<std>/limen.toml"
 let std_manifest = lazy (parse std_file Std_text.manifest)
 
 (* E0320: every function of a dependency may only take capabilities its
@@ -626,27 +626,27 @@ let enforce ?(std = false) (pkg : t) (module_pkg : (string * string) list) (info
                    (Printf.sprintf "standard library module `%s` uses capability `%s`, which %s does not declare" dn (Types.cap_name c) std_file)
                    ~notes:
                      [ Printf.sprintf "`%s` takes `%s`%s (%s)" i.name (Types.cap_name c) (through c) (where i.span);
-                       "this is a bug in the standard library: declare the capability in src/std/tessera.toml, or stop taking it" ])
+                       "this is a bug in the standard library: declare the capability in src/std/limen.toml, or stop taking it" ])
             else
             Some
               (Diag.make "E0320" d.dspan
-                 (Printf.sprintf "dependency `%s` uses capability `%s`, which tessera.toml does not grant it" dn (Types.cap_name c))
+                 (Printf.sprintf "dependency `%s` uses capability `%s`, which limen.toml does not grant it" dn (Types.cap_name c))
                  ~notes:
                    [ Printf.sprintf "`%s` takes `%s`%s (%s)" i.name (Types.cap_name c) (through c) (let l, _ = Source.line_col i.span.file i.span.lo in Printf.sprintf "%s:%d" i.span.file l);
                      (if c = Types.Root then "a dependency can never take Root: pass it the narrower capability it needs"
                       else if c = Types.Foreign then
-                        Printf.sprintf "calling C is full trust: if you trust `%s` with everything the program can do, add [trust] foreign = [\"%s\"] to tessera.toml" dn dn
+                        Printf.sprintf "calling C is full trust: if you trust `%s` with everything the program can do, add [trust] foreign = [\"%s\"] to limen.toml" dn dn
                       else Printf.sprintf "to allow it, add %s to its caps" need) ]))))
     infos
 
-(* E0324: each trusted dependency's C libraries must match what tessera.lock
+(* E0324: each trusted dependency's C libraries must match what limen.lock
    recorded when it was trusted, so an update that starts calling another
    library (or C at all, for one trusted only in name) stops the build until
    someone looks. [uses] is (dependency, libraries it declares). The first
    build records them (with [write_lock]); a dependency that no longer calls
    C loses its line. *)
 let check_foreign_lock (pkg : t) (uses : (string * string list) list) : Diag.t list =
-  let lock_path = Filename.concat (Filename.dirname pkg.file) "tessera.lock" in
+  let lock_path = Filename.concat (Filename.dirname pkg.file) "limen.lock" in
   let recorded = read_foreign_lock lock_path in
   let uses = List.filter (fun (d, libs) -> libs <> [] && List.mem d pkg.trust) uses in
   let span_of d = match List.find_opt (fun x -> x.dname = d) pkg.deps with Some x -> x.dspan | None -> Span.dummy in
@@ -658,12 +658,12 @@ let check_foreign_lock (pkg : t) (uses : (string * string list) list) : Diag.t l
         | Some old ->
           Some
             (Diag.make "E0324" (span_of d)
-               (Printf.sprintf "trusted dependency `%s` now calls C library %s; tessera.lock recorded %s" d
+               (Printf.sprintf "trusted dependency `%s` now calls C library %s; limen.lock recorded %s" d
                   (String.concat ", " (List.map (fun l -> "`" ^ l ^ "`") (List.filter (fun l -> not (List.mem l old)) libs)))
                   (String.concat ", " old))
                ~notes:
                  [ "calling C is full trust: review what changed in the dependency";
-                   Printf.sprintf "then delete the line `foreign %s ...` from tessera.lock to record the new libraries" d ])
+                   Printf.sprintf "then delete the line `foreign %s ...` from limen.lock to record the new libraries" d ])
         | None -> None)
       uses
   in

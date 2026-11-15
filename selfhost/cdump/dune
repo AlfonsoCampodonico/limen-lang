@@ -1,7 +1,7 @@
-; The C of a program's test binary, as `tessera test --native` compiles
-; it, so selfhost/tessera.tsr's `build --emit-c --tests` can be compared
-; with it (`tessera build --emit-c` gives the other binary's C):
+; The C of a program's test binary, as `limen test --native` compiles
+; it, so selfhost/limen.lmn's `build --emit-c --tests` can be compared
+; with it (`limen build --emit-c` gives the other binary's C):
 ; dune exec selfhost/cdump/cdump.exe -- FILE OUT
 (executable
  (name cdump)
- (libraries tessera))
+ (libraries limen))

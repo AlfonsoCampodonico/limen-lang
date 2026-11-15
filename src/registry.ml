@@ -1,6 +1,6 @@
 (* The package index: a searchable list of git URLs and tags, with the
    capabilities each package needs. Nothing is hosted: an entry points at a
-   tag of a git repository, and `tessera add` fetches it from there like any
+   tag of a git repository, and `limen add` fetches it from there like any
    git dependency.
 
      [[package]]
@@ -13,9 +13,9 @@
 
    One [[package]] table per version. `commit` is what the tag pointed at
    when the entry was written, so a tag moved since is caught. `caps` are
-   written as in tessera.toml, plus "foreign" for a package that calls C.
+   written as in limen.toml, plus "foreign" for a package that calls C.
 
-   TESSERA_INDEX names the index: a git URL (cloned on each use), a directory
+   LIMEN_INDEX names the index: a git URL (cloned on each use), a directory
    (every .toml file at its top), or one file. There is no default. *)
 
 open Printf
@@ -26,7 +26,7 @@ exception Failed of string
 
 let fail fmt = ksprintf (fun m -> raise (Failed m)) fmt
 
-let help = "set TESSERA_INDEX to a package index: a git URL, or a directory or file of [[package]] entries"
+let help = "set LIMEN_INDEX to a package index: a git URL, or a directory or file of [[package]] entries"
 
 let name_ok n =
   n <> "" && (match n.[0] with 'a' .. 'z' | '_' -> true | _ -> false)
@@ -95,7 +95,7 @@ let toml_files dir =
   List.filter (fun f -> Filename.check_suffix f ".toml") (List.sort compare (Array.to_list (Sys.readdir dir)))
 
 let load () : entry list =
-  match Sys.getenv_opt "TESSERA_INDEX" with
+  match Sys.getenv_opt "LIMEN_INDEX" with
   | None -> fail "no package index is set; %s" help
   | Some loc when String.trim loc = "" -> fail "no package index is set; %s" help
   | Some loc ->
@@ -107,7 +107,7 @@ let load () : entry list =
       end
       else read_files [ (loc, loc) ]
     else if Package.git_url_ok loc then begin
-      let tmp = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "tessera-index-%d-%d" (Unix.getpid ()) (Random.bits ())) in
+      let tmp = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "limen-index-%d-%d" (Unix.getpid ()) (Random.bits ())) in
       Fun.protect
         ~finally:(fun () -> try Package.rm_rf tmp with _ -> ())
         (fun () ->
@@ -117,7 +117,7 @@ let load () : entry list =
           if fs = [] then fail "the package index at %s has no .toml files at its top" loc;
           read_files (List.map (fun f -> (Filename.concat tmp f, loc ^ " " ^ f)) fs))
     end
-    else fail "TESSERA_INDEX is `%s`, which is neither a directory, a file nor a git URL; %s" loc help
+    else fail "LIMEN_INDEX is `%s`, which is neither a directory, a file nor a git URL; %s" loc help
 
 (* ---------- versions ---------- *)
 
@@ -149,7 +149,7 @@ let caps_text caps =
   | cs, false -> String.concat ", " cs
   | cs, true -> String.concat ", " cs ^ ", and it calls C"
 
-(* ---------- tessera search ---------- *)
+(* ---------- limen search ---------- *)
 
 let search words =
   let entries = load () in
@@ -180,7 +180,7 @@ let search words =
    program, its functions' capabilities and the modules that belong to the
    package. *)
 let examine ?(deps = []) name dir =
-  let main = Filename.concat (Filename.concat (Filename.get_temp_dir_name ()) (sprintf "tessera-package-%d" (Unix.getpid ()))) "main.tsr" in
+  let main = Filename.concat (Filename.concat (Filename.get_temp_dir_name ()) (sprintf "limen-package-%d" (Unix.getpid ()))) "main.lmn" in
   let src = sprintf "use %s\n\nfn main(root: Root) {\n}\n" name in
   let failed ds = fail "`%s` does not check:\n%s" name (String.concat "" (List.map Diag.render ds)) in
   match Modules.load ~deps:((name, dir) :: deps) ~root:(Filename.dirname main) main src with
@@ -197,7 +197,7 @@ let examine ?(deps = []) name dir =
 let in_package mine (i : Check.fn_info) =
   match String.index_opt i.name '.' with Some k -> List.mem_assoc (String.sub i.name 0 k) mine | None -> false
 
-(* The capabilities the package's functions take, written as in tessera.toml,
+(* The capabilities the package's functions take, written as in limen.toml,
    plus "foreign" when it calls C. *)
 let caps_used mine (infos : Check.fn_info list) =
   let infos = List.filter (in_package mine) infos in
@@ -219,7 +219,7 @@ let quote s =
 
 let list l = "[" ^ String.concat ", " (List.map quote l) ^ "]"
 
-(* ---------- tessera index entry ---------- *)
+(* ---------- limen index entry ---------- *)
 
 let entry dir =
   let dir = try Unix.realpath dir with Unix.Unix_error _ -> fail "no such directory %s" dir in
@@ -229,7 +229,7 @@ let entry dir =
     with Package.Fetch _ | Unix.Unix_error _ -> fail "%s is not in a git repository; an index entry is a tag of a git repository" dir
   in
   if top <> dir then fail "run this at the top of the repository (%s): a git dependency is the whole repository" top;
-  let toml = Filename.concat dir "tessera.toml" in
+  let toml = Filename.concat dir "limen.toml" in
   let package_key k =
     if not (Sys.file_exists toml) then None
     else
@@ -243,9 +243,9 @@ let entry dir =
           tables
   in
   let name = match package_key "name" with Some n -> n | None -> Filename.basename dir in
-  if not (name_ok name) then fail "`%s` cannot be a package name: use lowercase letters, digits and `_` ([package] name in tessera.toml)" name;
-  let file = Filename.concat dir (name ^ ".tsr") in
-  if not (Sys.file_exists file) then fail "there is no %s.tsr in %s: a package is a directory holding NAME.tsr" name dir;
+  if not (name_ok name) then fail "`%s` cannot be a package name: use lowercase letters, digits and `_` ([package] name in limen.toml)" name;
+  let file = Filename.concat dir (name ^ ".lmn") in
+  if not (Sys.file_exists file) then fail "there is no %s.lmn in %s: a package is a directory holding NAME.lmn" name dir;
   if git [ "status"; "--porcelain"; "--untracked-files=no" ] <> "" then
     fail "%s has uncommitted changes; commit them and tag the commit, so the entry describes what is in the tag" dir;
   let tag =
@@ -256,7 +256,7 @@ let entry dir =
   let url = try git [ "remote"; "get-url"; "origin" ] with Package.Fetch _ -> "" in
   let url = if url <> "" && url.[0] = '/' then "file://" ^ url else url in
   let url = if Package.git_url_ok url then url else "" in
-  (* its own dependencies, as its tessera.toml lists them *)
+  (* its own dependencies, as its limen.toml lists them *)
   let deps =
     match Package.load file with
     | Ok (Some p) -> List.map (fun (d : Package.dep) -> (d.dname, d.dir)) p.deps
@@ -273,11 +273,11 @@ let entry dir =
   printf "commit = %s\n" (quote commit);
   printf "description = %s\n" (quote (Option.value ~default:"" (package_key "description")));
   printf "caps = %s\n" (list caps);
-  prerr_endline "tessera: to publish this version, add the entry above to the package index, for example in a pull request to its repository"
+  prerr_endline "limen: to publish this version, add the entry above to the package index, for example in a pull request to its repository"
 
-(* ---------- tessera add ---------- *)
+(* ---------- limen add ---------- *)
 
-(* [line] added at the end of the [dependencies] table of tessera.toml's text. *)
+(* [line] added at the end of the [dependencies] table of limen.toml's text. *)
 let insert_dependency old line =
   if String.trim old = "" then "[dependencies]\n" ^ line ^ "\n"
   else
@@ -302,7 +302,7 @@ let add spec =
   in
   let entries = load () in
   let all = versions entries name in
-  if all = [] then fail "the index has no package named `%s`; try `tessera search %s`" name name;
+  if all = [] then fail "the index has no package named `%s`; try `limen search %s`" name name;
   let e =
     match version with
     | None -> List.hd all
@@ -311,9 +311,9 @@ let add spec =
       | Some e -> e
       | None -> fail "the index has no version %s of `%s`; it has %s" v name (String.concat ", " (List.map (fun e -> e.tag) all)))
   in
-  (* the program's tessera.toml: the nearest one, or a new one here *)
-  let here = Filename.concat (Sys.getcwd ()) "main.tsr" in
-  let toml = match Package.find here with Some p -> p | None -> Filename.concat (Sys.getcwd ()) "tessera.toml" in
+  (* the program's limen.toml: the nearest one, or a new one here *)
+  let here = Filename.concat (Sys.getcwd ()) "main.lmn" in
+  let toml = match Package.find here with Some p -> p | None -> Filename.concat (Sys.getcwd ()) "limen.toml" in
   let old = if Sys.file_exists toml then In_channel.with_open_bin toml In_channel.input_all else "" in
   let pkg =
     if old = "" then None
@@ -349,7 +349,7 @@ let add spec =
    | exception Package.Bad (sp, m) -> fail "could not add `%s` to %s: %s: %s" name toml (where sp) m
    | _ -> ());
   (* pin the commit that was checked, so the first build does not fetch the tag again *)
-  let lock = Filename.concat (Filename.dirname toml) "tessera.lock" in
+  let lock = Filename.concat (Filename.dirname toml) "limen.lock" in
   let kept =
     if Sys.file_exists lock then
       List.filter
@@ -372,5 +372,5 @@ let add spec =
     let libs = Option.value ~default:[] (List.assoc_opt name (Modules.c_users items)) in
     printf "%s calls C%s. Calling C is full trust, so it was not granted:\n" name
       (if libs = [] then "" else " (" ^ String.concat ", " libs ^ ")");
-    printf "if you trust %s with everything your program can do, add this to tessera.toml yourself:\n\n[trust]\nforeign = [%s]\n" name (quote name)
+    printf "if you trust %s with everything your program can do, add this to limen.toml yourself:\n\n[trust]\nforeign = [%s]\n" name (quote name)
   end

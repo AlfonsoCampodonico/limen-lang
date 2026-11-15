@@ -1,0 +1,111 @@
+// Prints what selfhost/typecheck.lmn makes of one file, in the format of
+// selfhost/checkdump (the OCaml checker's), so the two can be compared:
+// the problems, each as ERROR or WARNING, CODE FILE LO HI, its message,
+// its notes and its fix, as `limen check` reports them (the checker's
+// errors, or else those of the capability checks of selfhost/caps.lmn,
+// then the checker's warnings); then what `limen caps` reports of each
+// function: CAPS NAME FILE LO HI, its capabilities, and whether it runs
+// callbacks; then each item of the program as the checker rewrote it, and
+// under it one line per expression, in the order selfhost/walk.lmn visits
+// them: its type, the type arguments of a generic function's use, `nested`
+// for `a?.b` whose rest is an Option already, and `dyn I` for a value
+// boxed as `dyn I`.
+// A program the loader cannot load prints the loader's problems instead,
+// as selfhost/load.lmn does.
+//
+// It reads through the one Fs it is granted, as selfhost/load.lmn does:
+//
+//   limen run selfhost/check.lmn --grant fs=..:ro -- limen/examples hello.lmn
+use ast
+use ast_print
+use caps
+use diag
+use disk
+use env
+use loader
+use sources
+use typecheck
+use walk
+
+fn main(root: Root) -> Int {
+    let out = root.stdout
+    let args = root.args()
+    if args.len() != 2 {
+        out.print("usage: check CWD FILE")
+        return 2
+    }
+    let fs = root.fs
+    let base = match fs.full_path("") {
+        Ok(p) => p,
+        Err(e) => {
+            out.print("no directory granted: {e}")
+            return 1
+        },
+    }
+    let std = sources.std()
+    let place = disk.Place { cwd: args[0], root: base }
+    let p = loader.load(fs, std, place, args[1])
+    for d in p.diags {
+        out.print("ERROR {d.code} {diag.path_of(p.files, d.span.file)} {d.span.lo} {d.span.hi}")
+        out.print(d.message)
+        for n in d.notes {
+            out.print("note: {n}")
+        }
+    }
+    if !p.diags.is_empty() {
+        return 0
+    }
+    let methods = std.get("methods.lmn") ?? ""
+    let c = typecheck.check_program(p.items, p.files, p.next_id, methods, p.forwarders)
+    let st = c.state
+    let files = st_files(p.files) + [diag.Source { path: "<std>/limen.toml", text: "" }]
+    let diags = caps.check(fs, place, files, files.len() - 1, p.std_manifest, p.std_modules, p.manifest, p.packages, p.items, c)
+    for d in diags {
+        out.print("{if d.warning { "WARNING" } else { "ERROR" }} {d.code} {diag.path_of(files, d.span.file)} {d.span.lo} {d.span.hi}")
+        out.print(d.message)
+        for n in d.notes {
+            out.print("note: {n}")
+        }
+        match d.fix {
+            Some(f) => {
+                out.print("fix: " + f.message)
+                for ed in f.edits {
+                    out.print("edit {diag.path_of(files, ed.at.file)} {ed.at.lo} {ed.at.hi} {ast_print.escaped(ed.replacement)}")
+                }
+            },
+            None => {},
+        }
+    }
+    for i in c.infos {
+        let caps = i.caps.map(|c| match i.via.find(|v| v.0 == c) {
+            Some((_, p)) => c + "=" + p,
+            None => c,
+        })
+        out.print("CAPS {i.name} {diag.path_of(files, i.span.file)} {i.span.lo} {i.span.hi} [{caps.join(",")}] {i.callbacks}")
+    }
+    for i in c.items {
+        out.print(ast_print.item_line(i))
+        for e in walk.item(i) {
+            out.print("  " + line(st, e))
+        }
+    }
+    0
+}
+
+// The program's files, then the prelude's and the built-in methods', as
+// the checker numbers them.
+fn st_files(files: List[diag.Source]) -> List[diag.Source] {
+    files + [diag.Source { path: "<prelude>", text: "" }, diag.Source { path: "<builtin>", text: "" }]
+}
+
+// An expression's type, its type arguments, and whether it is a nested `?.`.
+fn line(st: env.State, e: ast.Expr) -> Str {
+    let inst = st.inst_of(e)
+    let shown = st.show(st.type_of(e))
+    let typed = if inst.is_empty() { shown } else { shown + " inst " + inst.map(|p| p.0 + "=" + st.show(p.1)).join(",") }
+    let nested = if st.nested.contains(e.id) { typed + " nested" } else { typed }
+    match e.desc {
+        EDyn(_, i) => nested + " dyn " + i,
+        _ => nested,
+    }
+}

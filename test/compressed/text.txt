@@ -5,16 +5,16 @@
 004 brown length distance huffman window fox
 005 over code code lazy
 006 literal window quick fox value fox distance
-007 tessera code block stream
-008 over tessera tessera jumps dog fox
+007 limen code block stream
+008 over limen limen jumps dog fox
 009 capability huffman block block code stream
-010 code tessera window block
+010 code limen window block
 011 block literal list over list
-012 length code length tessera
+012 length code length limen
 013 the bytes map huffman distance code capability window distance
 014 dog lazy the the bytes list distance over block
 015 the huffman fox value over distance bytes jumps
-016 lazy tessera stream code huffman huffman tessera brown the
+016 lazy limen stream code huffman huffman limen brown the
 017 over code capability over block brown
 018 list distance over brown block huffman value distance
 019 stream block literal brown window fox length
@@ -38,8 +38,8 @@
 037 lazy lazy over huffman map
 038 map length code huffman brown
 039 bytes map map brown stream jumps
-040 list bytes tessera length
-041 over jumps tessera quick tessera quick
+040 list bytes limen length
+041 over jumps limen quick limen quick
 042 stream window length distance map map
 043 huffman jumps length
 044 jumps quick dog distance fox list lazy
@@ -47,31 +47,31 @@
 046 length bytes literal
 047 fox bytes length over huffman quick quick length
 048 capability huffman capability
-049 length list tessera over huffman window
+049 length list limen over huffman window
 050 literal map quick jumps
 051 over bytes bytes quick lazy
 052 literal bytes quick code value literal code
 053 dog code brown bytes length window
-054 code literal tessera map
-055 tessera dog over window
+054 code literal limen map
+055 limen dog over window
 056 over value huffman
 057 literal map fox bytes capability stream
 058 literal quick list quick capability capability distance over lazy
 059 brown the capability huffman jumps block over block map
-060 dog dog length tessera dog stream dog capability length
-061 brown bytes the tessera
-062 window value tessera over lazy
+060 dog dog length limen dog stream dog capability length
+061 brown bytes the limen
+062 window value limen over lazy
 063 fox code literal list length dog capability literal
-064 the block list literal value length brown tessera
+064 the block list literal value length brown limen
 065 quick literal block stream
 066 bytes capability bytes dog quick the huffman
-067 block the quick length bytes quick tessera length distance
-068 distance map quick fox lazy tessera literal brown lazy
+067 block the quick length bytes quick limen length distance
+068 distance map quick fox lazy limen literal brown lazy
 069 value huffman bytes capability
-070 distance tessera capability huffman
+070 distance limen capability huffman
 071 code stream bytes lazy
-072 tessera tessera dog tessera list value distance brown list
-073 tessera over lazy brown brown distance
+072 limen limen dog limen list value distance brown list
+073 limen over lazy brown brown distance
 074 value dog code the list the map
 075 over huffman window window lazy huffman
 076 over over distance
@@ -80,7 +80,7 @@
 079 quick value literal jumps literal dog fox
 080 huffman jumps huffman stream bytes
 081 stream list jumps stream code stream quick
-082 map brown quick map tessera bytes
+082 map brown quick map limen bytes
 083 value literal length list
 084 length code brown huffman over the length value
 085 list fox fox stream distance
@@ -107,7 +107,7 @@
 106 capability length literal list code fox length block over
 107 the distance bytes code map code fox map
 108 length stream distance the brown block huffman
-109 huffman value tessera bytes jumps distance
+109 huffman value limen bytes jumps distance
 110 over fox lazy block huffman jumps quick block
 111 quick stream quick list capability distance list capability over
 112 huffman value bytes value block quick stream lazy distance

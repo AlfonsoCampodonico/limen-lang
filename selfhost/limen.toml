@@ -1,0 +1,9 @@
+# The Limen compiler written in Limen, and the tools that compare it
+# with the OCaml one. Its files embed the standard library's sources and the
+# C runtime from src/ (selfhost/sources.lmn), so the compiler binary reads
+# nothing of its own at run time.
+[package]
+name = "limen"
+
+[embed]
+roots = ["../src/std", "../src/runtime"]

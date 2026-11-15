@@ -1,0 +1,6 @@
+fn main(root: Root) {
+    let s = "Programming In Limen Is Fun"
+    let vowels = ["a", "e", "i", "o", "u"]
+    let n = s.to_lower().split("").filter(|c| vowels.contains(c)).len()
+    root.stdout.print(n.to_str())
+}

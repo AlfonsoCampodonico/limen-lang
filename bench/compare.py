@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The same benchmarks in C, Rust, Go and Tessera: build each with its usual
+"""The same benchmarks in C, Rust, Go and Limen: build each with its usual
 release settings, check the four outputs agree, and report the best of N
 wall-clock runs. Writes _build/bench/compare.json for the comparison page.
 Usage: python3 bench/compare.py [runs]"""
@@ -7,13 +7,13 @@ import json, os, platform, resource, subprocess, sys, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BENCH = os.path.join(ROOT, "bench")
-TESSERA = os.path.join(ROOT, "_build", "default", "bin", "main.exe")
+LIMEN = os.path.join(ROOT, "_build", "default", "bin", "main.exe")
 OUT = os.path.join(ROOT, "_build", "bench")
 RUNS = int(sys.argv[1]) if len(sys.argv) > 1 else 7
 NAMES = ["fib", "sieve", "nbody", "pipeline", "mandel", "collatz", "lines"]
 C_SOURCE = {"mandel": "mandel_pthreads", "collatz": "collatz_pthreads"}  # the threaded C versions
 # like the C version's `Body bs[5]`, a size known when compiling
-TESSERA_SOURCE = {"nbody": "nbody_array"}
+LIMEN_SOURCE = {"nbody": "nbody_array"}
 
 os.makedirs(OUT, exist_ok=True)
 subprocess.run(["dune", "build"], cwd=ROOT, check=True)
@@ -23,14 +23,14 @@ def build(lang, name):
     exe = os.path.join(OUT, f"{name}-{lang}")
     if lang == "c":
         src = os.path.join(BENCH, C_SOURCE.get(name, name) + ".c")
-        # no fused multiply-add, so C rounds every step as Rust and Tessera do
+        # no fused multiply-add, so C rounds every step as Rust and Limen do
         cmd = ["cc", "-O2", "-ffp-contract=off", "-o", exe, src, "-lm", "-lpthread"]
     elif lang == "rust":
         cmd = ["rustc", "--edition", "2021", "-C", "opt-level=3", "-o", exe, os.path.join(BENCH, "rust", name + ".rs")]
     elif lang == "go":
         cmd = ["go", "build", "-o", exe, os.path.join(BENCH, "go", name + ".go")]
     else:
-        cmd = [TESSERA, "build", os.path.join(BENCH, TESSERA_SOURCE.get(name, name) + ".tsr"), "-o", exe]
+        cmd = [LIMEN, "build", os.path.join(BENCH, LIMEN_SOURCE.get(name, name) + ".lmn"), "-o", exe]
     subprocess.run(cmd, check=True, capture_output=True)
     return exe
 
@@ -64,7 +64,7 @@ def numbers(out):
     return vals
 
 
-langs = ["c", "rust", "go", "tessera"]
+langs = ["c", "rust", "go", "limen"]
 results = {}
 print(f"{'benchmark':<10}" + "".join(f"{l:>9}" for l in langs) + "   cpu: " + "".join(f"{l:>7}" for l in langs) + "  output")
 for n in NAMES:
@@ -72,14 +72,14 @@ for n in NAMES:
     for l in langs:
         t, c, o = best(build(l, n))
         row[l], cpus[l], outs[l] = t, c, o
-    ref = numbers(outs["tessera"])
+    ref = numbers(outs["limen"])
     differ = [l for l in langs if numbers(outs[l]) != ref]
     results[n] = {
         "seconds": row,
         "cpu_seconds": cpus,
         "differ": differ,
         "outputs": {l: outs[l].strip() for l in langs},
-        "output": outs["tessera"].strip().splitlines()[-1] if outs["tessera"].strip() else "",
+        "output": outs["limen"].strip().splitlines()[-1] if outs["limen"].strip() else "",
     }
     note = "same" if not differ else "differs: " + ", ".join(f"{l}={outs[l].strip()[:40]!r}" for l in differ)
     print(f"{n:<10}" + "".join(f"{row[l]:>9.3f}" for l in langs) + "        " + "".join(f"{cpus[l]:>7.2f}" for l in langs) + "  " + note)

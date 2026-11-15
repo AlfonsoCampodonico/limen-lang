@@ -1,0 +1,425 @@
+// Foreign functions, as the checker sees them: what crosses the boundary
+// to C, from src/ffi.ml. A `foreign "lib" { fn name(p: T, ...) -> R }`
+// declaration names a C function in library `lib`; each parameter and the
+// result has one of these boundary types:
+//
+//   Int, Int32, Float, Bool, Str, Bytes, Handle, a C struct declared in the
+//   block (passed by value), a callback `fn(A) -> R` (a top-level Limen
+//   function C calls), and Out[T] for a parameter C writes to.
+//
+// A function's Limen type takes a Foreign capability first (unless the
+// standard library module declaring it is trusted), then the parameters
+// that are not Out; its value is the C result (unless it returns nothing)
+// followed by the Out values, as a tuple when there is more than one.
+use ast
+use types
+
+pub enum CTy {
+    Int,
+    Int32,
+    Float,
+    Bool,
+    Str,
+    Bytes,
+    Handle,
+    Unit,
+    // a C struct by value: its Limen name and its fields
+    Struct(Str, List[(Str, CTy)]),
+    // a callback: C calls a top-level Limen function through it
+    Fn(List[CTy], CTy),
+}
+
+pub struct CParam {
+    name: Str,
+    cty: CTy,
+    out: Bool,
+}
+
+// The C signature of a foreign declaration: its library and symbol, its
+// parameters and result. `trusted`: no Foreign capability is passed or
+// checked. `fixed`: for a variadic function, how many parameters come
+// before the `...`.
+pub struct CSig {
+    lib: Str,
+    sym: Str,
+    params: List[CParam],
+    ret: CTy,
+    trusted: Bool,
+    fixed: Option[Int],
+}
+
+// What the interpreter's call stubs can pass, and so the limits of both
+// backends: at most 8 integer-like and 8 Float values, each field of a
+// struct counting as one; a struct has 1 to 8 fields; a variadic function
+// has 1 to 6 integer-like parameters before the `...` and at most 8 after.
+fn max_ints() -> Int {
+    8
+}
+
+fn max_floats() -> Int {
+    8
+}
+
+fn max_fields() -> Int {
+    8
+}
+
+fn max_fixed() -> Int {
+    6
+}
+
+fn max_varargs() -> Int {
+    8
+}
+
+fn limen_ty(c: CTy) -> types.Ty {
+    match c {
+        Int | Int32 => TInt,
+        Float => TFloat,
+        Bool => TBool,
+        Str => TStr,
+        Bytes => TBytes,
+        Handle => TNamed("Handle", []),
+        Unit => TUnit,
+        Struct(n, _) => TNamed(n, []),
+        Fn(ps, r) => TFn(ps.map(limen_ty), limen_ty(r)),
+    }
+}
+
+// The C type a boundary type is written as; a struct and a callback are
+// named by the native backend.
+pub fn c_name(c: CTy) -> Str {
+    match c {
+        Int => "int64_t",
+        Int32 => "int32_t",
+        Float => "double",
+        Bool => "int",
+        Str => "const char *",
+        Bytes => "const void *",
+        Handle => "void *",
+        Unit => "void",
+        Struct(..) | Fn(..) => panic("ffi.c_name: a struct or callback is named by the backend"),
+    }
+}
+
+// The values a call produces, in order: the result, then the
+// out-parameters.
+pub fn results(s: CSig) -> List[CTy] {
+    (if s.ret == Unit { [] } else { [s.ret] }) + s.params.filter(|p| p.out).map(|p| p.cty)
+}
+
+// The value a call produces: the results, as a tuple when there are
+// several.
+pub fn result_ty(s: CSig) -> types.Ty {
+    match results(s) {
+        [] => TUnit,
+        [t] => limen_ty(t),
+        ts => TNamed(ast.tuple_name(ts.len()), ts.map(limen_ty)),
+    }
+}
+
+// The parameters a Limen call passes: Foreign first unless trusted,
+// then those that are not Out.
+pub fn visible_params(s: CSig) -> List[types.Ty] {
+    let ps = s.params.filter(|p| !p.out).map(|p| limen_ty(p.cty))
+    if s.trusted { ps } else { [TCap("Foreign")] + ps }
+}
+
+// The integer-like and Float values a parameter list passes, a struct's
+// fields each counting as one.
+fn counts(ps: List[CParam]) -> (Int, Int) {
+    let mut ints = 0
+    let mut floats = 0
+    for p in ps {
+        if p.out {
+            ints = ints + 1
+            continue
+        }
+        match p.cty {
+            Float => {
+                floats = floats + 1
+            },
+            Struct(_, fs) => {
+                for f in fs {
+                    if f.1 == Float {
+                        floats = floats + 1
+                    } else {
+                        ints = ints + 1
+                    }
+                }
+            },
+            _ => {
+                ints = ints + 1
+            },
+        }
+    }
+    (ints, floats)
+}
+
+fn lib_ok(l: Str) -> Bool {
+    l != "" && !l.starts_with("-") && l.bytes().all(|c| is_alnum(c) || c == 95 || c == 46 || c == 43 || c == 45)
+}
+
+fn ident_ok(s: Str) -> Bool {
+    let bs = s.bytes()
+    s != "" && !(bs[0] >= 48 && bs[0] <= 57) && bs.all(|c| is_alnum(c) || c == 95)
+}
+
+fn is_alnum(c: Int) -> Bool {
+    (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57)
+}
+
+fn boundary_types() -> Str {
+    "Int, Int32, Float, Bool, Str, Bytes, Handle, a struct declared in a foreign block, a callback `fn(...) -> T`, or Out[Int | Int32 | Float | Handle] for a parameter"
+}
+
+fn field_cty(te: ast.TyExpr) -> Option[CTy] {
+    match te.desc {
+        TyName("Int", []) => Some(Int),
+        TyName("Int32", []) => Some(Int32),
+        TyName("Float", []) => Some(Float),
+        TyName("Bool", []) => Some(Bool),
+        TyName("Handle", []) => Some(Handle),
+        _ => None,
+    }
+}
+
+// The fields of a struct declared in a foreign block, or the problems in
+// it, each a place and a message.
+pub fn struct_fields(s: ast.StructDecl) -> Result[List[(Str, CTy)], List[(ast.Span, Str)]] {
+    let tys = s.foreign.map(|f| f.types) ?? []
+    let mut errs: List[(ast.Span, Str)] = []
+    let mut fs: List[(Str, CTy)] = []
+    for (f, te) in s.fields.zip(tys) {
+        match field_cty(te) {
+            Some(t) => fs.push((f.name, t)),
+            None => errs.push((te.span, "a field of a C struct is Int, Int32, Float, Bool or Handle")),
+        }
+    }
+    if s.fields.is_empty() {
+        errs.push((s.span, "a C struct needs at least one field"))
+    }
+    if s.fields.len() > max_fields() {
+        errs.push((s.span, "a C struct has at most {max_fields()} fields"))
+    }
+    if errs.is_empty() { Ok(fs) } else { Err(errs) }
+}
+
+// The runtime's helpers for trusted standard library modules, with the
+// signature each must be declared with.
+fn runtime_fns() -> List[(Str, List[CTy], CTy)] {
+    [
+        ("limen_copy", [Handle, Int], Bytes),
+        ("limen_handle_new", [Handle], Int),
+        ("limen_handle_acquire", [Int], Handle),
+        ("limen_handle_release", [Int], Handle),
+        ("limen_handle_close", [Int], Handle),
+    ]
+}
+
+// The last part of a qualified name: `Point` of `geo.Point`.
+fn last_part(n: Str) -> Str {
+    match n.last_index_of(".") {
+        Some(i) => n.slice(i + 1, n.len()),
+        None => n,
+    }
+}
+
+// The C signature of foreign declaration `d`, or the problems in it, in
+// the order src/ffi.ml finds them. `structs` are the program's structs by
+// (qualified) name.
+pub fn of_decl(d: ast.FnDecl, structs: Map[Str, ast.StructDecl]) -> Result[CSig, List[(ast.Span, Str)]] {
+    let f = d.foreign ?? ast.Foreign { lib: "", sym: "", variadic: None, trusted: false }
+    let mut errs: List[(ast.Span, Str)] = []
+    // the boundary type a written type names, if it is a plain one
+    let base = |errs: List[(ast.Span, Str)], te: ast.TyExpr| match te.desc {
+        TyName("Int", []) => (Some(Int), errs),
+        TyName("Int32", []) => (Some(Int32), errs),
+        TyName("Float", []) => (Some(Float), errs),
+        TyName("Bool", []) => (Some(Bool), errs),
+        TyName("Str", []) => (Some(Str), errs),
+        TyName("Bytes", []) => (Some(Bytes), errs),
+        TyName("Handle", []) => (Some(Handle), errs),
+        TyName(n, []) => match structs.get(n) {
+            // a bad field is reported at the struct
+            Some(s) if s.foreign.is_some() => (Some(Struct(n, struct_fields(s) ?? [("0", Int)])), errs),
+            Some(_) => {
+                let short = last_part(n)
+                (Some(Int), errs + [(te.span, "`{short}` is not a C struct: a struct passed to C is declared in the foreign block, as in `struct {short} \{ x: Int }`")])
+            },
+            None => (None, errs),
+        },
+        _ => (None, errs),
+    }
+    let mut params: List[CParam] = []
+    for p in d.params {
+        let te = p.ty
+        let param = match te.desc {
+            TyName("Out", [inner]) => {
+                let (got, next) = base(errs, inner)
+                errs = next
+                match got {
+                    Some(Int) | Some(Int32) | Some(Float) | Some(Handle) => CParam { name: p.name, cty: got ?? Int, out: true },
+                    _ => {
+                        errs.push((inner.span, "an `Out` parameter holds an Int, Int32, Float or Handle"))
+                        CParam { name: p.name, cty: Int, out: true }
+                    },
+                }
+            },
+            TyFn(cps, r) => {
+                // a callback: its parameters, then its result
+                let mut ps: List[CTy] = []
+                for cp in cps {
+                    let (got, next) = base(errs, cp)
+                    errs = next
+                    match got {
+                        Some(Int) | Some(Int32) | Some(Float) | Some(Bool) | Some(Str) | Some(Handle) => ps.push(got ?? Int),
+                        _ => {
+                            errs.push((cp.span, "a callback's parameter is Int, Int32, Float, Bool, Str or Handle"))
+                            ps.push(Int)
+                        },
+                    }
+                }
+                let ret = match r.desc {
+                    TyUnit => Unit,
+                    _ => {
+                        let (got, next) = base(errs, r)
+                        errs = next
+                        match got {
+                            Some(Int) | Some(Int32) | Some(Float) | Some(Bool) | Some(Handle) => got ?? Unit,
+                            Some(Str) => {
+                                errs.push((r.span, "a callback cannot return Str: C would not know who frees it"))
+                                Unit
+                            },
+                            _ => {
+                                errs.push((r.span, "a callback returns Int, Int32, Float, Bool, Handle or nothing"))
+                                Unit
+                            },
+                        }
+                    },
+                }
+                let fl = ps.count(|t| t == Float)
+                if ps.len() - fl > max_ints() || fl > max_floats() {
+                    errs.push((te.span, "a callback takes at most {max_ints()} integer-like and {max_floats()} Float parameters"))
+                }
+                CParam { name: p.name, cty: Fn(ps, ret), out: false }
+            },
+            _ => {
+                let (got, next) = base(errs, te)
+                errs = next
+                match got {
+                    Some(t) => CParam { name: p.name, cty: t, out: false },
+                    None => {
+                        errs.push((te.span, "this type cannot cross to C; use " + boundary_types()))
+                        CParam { name: p.name, cty: Int, out: false }
+                    },
+                }
+            },
+        }
+        params.push(param)
+    }
+    // "limen" is the runtime's own library of helpers for trusted
+    // standard library modules
+    let runtime_lib = f.lib == "limen"
+    let helper = runtime_fns().find(|x| x.0 == f.sym)
+    if runtime_lib {
+        if !f.trusted {
+            errs.push((d.span, "library `limen` is the runtime's own, for the standard library; use `foreign.copy(p, n)` instead"))
+        }
+        if helper.is_none() {
+            errs.push((d.span, "library `limen` has no function `{f.sym}`; it has {runtime_fns().map(|x| x.0).join(", ")}"))
+        }
+    }
+    let ret = match d.ret {
+        None => Unit,
+        Some(te) => match te.desc {
+            TyUnit => Unit,
+            _ => {
+                let (got, next) = base(errs, te)
+                errs = next
+                match got {
+                    Some(Bytes) if runtime_lib => Bytes,
+                    Some(Bytes) => {
+                        errs.push((te.span, "a foreign function cannot return Bytes: C gives no length; return a Handle and copy with `foreign.copy(p, n)`"))
+                        Unit
+                    },
+                    Some(Struct(..)) if f.variadic.is_some() => {
+                        errs.push((te.span, "a variadic function cannot return a struct"))
+                        Unit
+                    },
+                    Some(t) => t,
+                    None => {
+                        match te.desc {
+                            TyFn(..) => errs.push((te.span, "a foreign function cannot return a function")),
+                            _ => errs.push((te.span, "a foreign function returns Int, Int32, Float, Bool, Str, Handle, a C struct or nothing")),
+                        }
+                        Unit
+                    },
+                }
+            },
+        },
+    }
+    if !lib_ok(f.lib) {
+        errs.push((d.span, "`{f.lib}` is not a library name: use letters, digits, `_`, `.`, `+` and `-`"))
+    }
+    if !ident_ok(f.sym) {
+        errs.push((d.span, "`{f.sym}` is not a C function name"))
+    }
+    match f.variadic {
+        None => {
+            let (ints, floats) = counts(params)
+            if ints > max_ints() || floats > max_floats() {
+                errs.push((d.span, "a foreign function takes at most {max_ints()} integer-like and {max_floats()} Float values (an Out counts as integer-like, and each field of a struct as one)"))
+            }
+        },
+        Some(k) => {
+            let spans = d.params.map(|p| p.ty.span)
+            if k == 0 {
+                errs.push((d.span, "a variadic function needs a parameter before `...`, as in C"))
+            }
+            if k > max_fixed() {
+                errs.push((d.span, "a variadic function takes at most {max_fixed()} parameters before `...`"))
+            }
+            for (i, p) in params.take(k).with_index() {
+                match p.cty {
+                    Float | Struct(..) if !p.out => errs.push((spans[i], "a parameter before `...` is integer-like: not a Float or a struct")),
+                    _ => {},
+                }
+            }
+            let rest = params.skip(k)
+            if rest.len() > max_varargs() {
+                errs.push((d.span, "a variadic function passes at most {max_varargs()} arguments after `...`"))
+            }
+            for (i, p) in rest.with_index() {
+                match p.cty {
+                    Struct(..) | Fn(..) if !p.out => errs.push((spans[k + i], "an argument after `...` is Int, Int32, Float, Bool, Str, Bytes or Handle")),
+                    _ if p.out => errs.push((spans[k + i], "an `Out` parameter goes before `...`")),
+                    _ => {},
+                }
+            }
+        },
+    }
+    match helper {
+        Some((_, ps, r)) if runtime_lib && (params.map(|p| if p.out { Unit } else { p.cty }) != ps || ret != r) => {
+            errs.push((d.span, "`{f.sym}` is declared with the wrong types for the runtime's helper"))
+        },
+        _ => {},
+    }
+    if errs.is_empty() { Ok(CSig { lib: f.lib, sym: f.sym, params, ret, trusted: f.trusted, fixed: f.variadic }) } else { Err(errs) }
+}
+
+// The libraries a program's foreign declarations name, each once, in
+// order; the runtime's own `limen` is not one.
+pub fn libs(items: List[ast.Item]) -> List[Str] {
+    let mut acc: List[Str] = []
+    for i in items {
+        match i {
+            IFn(d) => match d.foreign {
+                Some(f) if f.lib != "limen" && !acc.contains(f.lib) => acc.push(f.lib),
+                _ => {},
+            },
+            _ => {},
+        }
+    }
+    acc
+}

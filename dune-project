@@ -1,4 +1,4 @@
 (lang dune 3.0)
 
 (package
- (name tessera))
+ (name limen))

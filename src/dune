@@ -1,10 +1,10 @@
 (library
- (name tessera)
+ (name limen)
  (libraries unix)
  (foreign_stubs
   (language c)
   (names tls_stubs)
-  (extra_deps runtime/tessera_tls.h)
+  (extra_deps runtime/limen_tls.h)
   (flags
    (:standard
     (:include tls_cflags.sexp))))
@@ -12,7 +12,7 @@
  (foreign_stubs
   (language c)
   (names ffi_stubs)
-  (extra_deps runtime/tessera_sandbox.h))
+  (extra_deps runtime/limen_sandbox.h))
  (c_library_flags
   (:include tls_libs.sexp))
  (flags
@@ -21,23 +21,23 @@
 ; Embed the C runtime header as an OCaml string.
 (rule
  (targets runtime_text.ml)
- (deps runtime/tessera_rt.h runtime/tessera_sandbox.h)
+ (deps runtime/limen_rt.h runtime/limen_sandbox.h)
  (action
   (with-stdout-to
    runtime_text.ml
    (progn
     (echo "let text = {xxrtxx|")
-    (cat runtime/tessera_sandbox.h)
-    (cat runtime/tessera_rt.h)
+    (cat runtime/limen_sandbox.h)
+    (cat runtime/limen_rt.h)
     (echo "|xxrtxx}\n")))))
 
-; Find OpenSSL for TLS (see openssl_config.sh); without it tessera builds
+; Find OpenSSL for TLS (see openssl_config.sh); without it limen builds
 ; without TLS.
 (rule
  (targets tls_cflags.sexp tls_libs.sexp openssl_config.ml)
  (deps
   openssl_config.sh
-  (env_var TESSERA_OPENSSL)
+  (env_var LIMEN_OPENSSL)
   (env_var CC))
  (action
   (run sh %{dep:openssl_config.sh} tls_cflags.sexp tls_libs.sexp openssl_config.ml)))
@@ -45,16 +45,16 @@
 ; Embed the TLS core, pasted into native programs that use TLS.
 (rule
  (targets tls_text.ml)
- (deps runtime/tessera_tls.h)
+ (deps runtime/limen_tls.h)
  (action
   (with-stdout-to
    tls_text.ml
    (progn
     (echo "let text = {xxtlsxx|")
-    (cat runtime/tessera_tls.h)
+    (cat runtime/limen_tls.h)
     (echo "|xxtlsxx}\n")))))
 
-; Embed SPEC.md for `tessera spec` and the MCP server.
+; Embed SPEC.md for `limen spec` and the MCP server.
 (rule
  (targets spec_text.ml)
  (deps %{project_root}/SPEC.md)
@@ -66,66 +66,66 @@
     (cat %{project_root}/SPEC.md)
     (echo "|xxspecxx}\n")))))
 
-; Embed the built-in List and Map methods written in Tessera (see prelude.ml).
+; Embed the built-in List and Map methods written in Limen (see prelude.ml).
 (rule
  (targets methods_text.ml)
- (deps std/methods.tsr)
+ (deps std/methods.lmn)
  (action
   (with-stdout-to
    methods_text.ml
    (progn
     (echo "let text = {xxmethodsxx|")
-    (cat std/methods.tsr)
+    (cat std/methods.lmn)
     (echo "|xxmethodsxx}\n")))))
 
-; Embed the standard library modules (written in Tessera).
+; Embed the standard library modules (written in Limen).
 (rule
  (targets std_text.ml)
- (deps std/json.tsr std/list.tsr std/text.tsr std/http.tsr std/format.tsr std/time.tsr std/regex.tsr std/sql.tsr std/errors.tsr std/hex.tsr std/base64.tsr std/hash.tsr std/csv.tsr std/url.tsr std/flags.tsr std/log.tsr std/path.tsr std/uuid.tsr std/compress.tsr std/tessera.toml)
+ (deps std/json.lmn std/list.lmn std/text.lmn std/http.lmn std/format.lmn std/time.lmn std/regex.lmn std/sql.lmn std/errors.lmn std/hex.lmn std/base64.lmn std/hash.lmn std/csv.lmn std/url.lmn std/flags.lmn std/log.lmn std/path.lmn std/uuid.lmn std/compress.lmn std/limen.toml)
  (action
   (with-stdout-to
    std_text.ml
    (progn
     (echo "let modules = [\n")
     (echo "(\"json\", {xxstdxx|")
-    (cat std/json.tsr)
+    (cat std/json.lmn)
     (echo "|xxstdxx});\n(\"list\", {xxstdxx|")
-    (cat std/list.tsr)
+    (cat std/list.lmn)
     (echo "|xxstdxx});\n(\"text\", {xxstdxx|")
-    (cat std/text.tsr)
+    (cat std/text.lmn)
     (echo "|xxstdxx});\n(\"http\", {xxstdxx|")
-    (cat std/http.tsr)
+    (cat std/http.lmn)
     (echo "|xxstdxx});\n(\"format\", {xxstdxx|")
-    (cat std/format.tsr)
+    (cat std/format.lmn)
     (echo "|xxstdxx});\n(\"time\", {xxstdxx|")
-    (cat std/time.tsr)
+    (cat std/time.lmn)
     (echo "|xxstdxx});\n(\"regex\", {xxstdxx|")
-    (cat std/regex.tsr)
+    (cat std/regex.lmn)
     (echo "|xxstdxx});\n(\"sql\", {xxstdxx|")
-    (cat std/sql.tsr)
+    (cat std/sql.lmn)
     (echo "|xxstdxx});\n(\"errors\", {xxstdxx|")
-    (cat std/errors.tsr)
+    (cat std/errors.lmn)
     (echo "|xxstdxx});\n(\"hex\", {xxstdxx|")
-    (cat std/hex.tsr)
+    (cat std/hex.lmn)
     (echo "|xxstdxx});\n(\"base64\", {xxstdxx|")
-    (cat std/base64.tsr)
+    (cat std/base64.lmn)
     (echo "|xxstdxx});\n(\"hash\", {xxstdxx|")
-    (cat std/hash.tsr)
+    (cat std/hash.lmn)
     (echo "|xxstdxx});\n(\"csv\", {xxstdxx|")
-    (cat std/csv.tsr)
+    (cat std/csv.lmn)
     (echo "|xxstdxx});\n(\"url\", {xxstdxx|")
-    (cat std/url.tsr)
+    (cat std/url.lmn)
     (echo "|xxstdxx});\n(\"flags\", {xxstdxx|")
-    (cat std/flags.tsr)
+    (cat std/flags.lmn)
     (echo "|xxstdxx});\n(\"log\", {xxstdxx|")
-    (cat std/log.tsr)
+    (cat std/log.lmn)
     (echo "|xxstdxx});\n(\"path\", {xxstdxx|")
-    (cat std/path.tsr)
+    (cat std/path.lmn)
     (echo "|xxstdxx});\n(\"uuid\", {xxstdxx|")
-    (cat std/uuid.tsr)
+    (cat std/uuid.lmn)
     (echo "|xxstdxx});\n(\"compress\", {xxstdxx|")
-    (cat std/compress.tsr)
+    (cat std/compress.lmn)
     (echo "|xxstdxx}) ]\n")
     (echo "let manifest = {xxstdxx|")
-    (cat std/tessera.toml)
+    (cat std/limen.toml)
     (echo "|xxstdxx}\n")))))

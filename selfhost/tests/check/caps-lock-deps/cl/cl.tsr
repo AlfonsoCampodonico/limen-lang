@@ -1,8 +1,0 @@
-// Calls z, which tessera.lock recorded, and m, which it did not.
-foreign "z" {
-    pub fn deflate(x: Int) -> Int
-}
-
-foreign "m" {
-    pub fn sqrt(x: Int) -> Int
-}

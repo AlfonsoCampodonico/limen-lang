@@ -1,4 +1,4 @@
-// Starts `tessera lsp` for .tsr files. Highlighting needs none of this: it
+// Starts `limen lsp` for .lmn files. Highlighting needs none of this: it
 // comes from the grammar in syntaxes/.
 const vscode = require("vscode");
 const fs = require("fs");
@@ -8,18 +8,18 @@ const { LanguageClient } = require("vscode-languageclient/node");
 let client;
 let output;
 
-// The `tessera` to run: the user setting, else `tessera` on the PATH, else (in a
+// The `limen` to run: the user setting, else `limen` on the PATH, else (in a
 // trusted folder only) the build in an open folder, which is this repository
-// while working on Tessera itself. A workspace can never choose the executable:
+// while working on Limen itself. A workspace can never choose the executable:
 // opening a folder must not run a program that folder supplies.
-function findTessera() {
-  const set = vscode.workspace.getConfiguration("tessera").inspect("path");
+function findLimen() {
+  const set = vscode.workspace.getConfiguration("limen").inspect("path");
   const userPath = set && (set.globalValue || set.defaultValue);
   if (userPath) return userPath;
   const dirs = (process.env.PATH || "").split(path.delimiter);
   for (const d of dirs) {
     if (!path.isAbsolute(d)) continue; // a relative PATH entry would resolve inside the workspace
-    const p = path.join(d, "tessera");
+    const p = path.join(d, "limen");
     if (fs.existsSync(p)) return p;
   }
   if (!vscode.workspace.isTrusted) return null;
@@ -39,28 +39,28 @@ function findTessera() {
 }
 
 async function start() {
-  if (!vscode.workspace.getConfiguration("tessera").get("languageServer.enabled")) return;
-  const command = findTessera();
+  if (!vscode.workspace.getConfiguration("limen").get("languageServer.enabled")) return;
+  const command = findLimen();
   if (!command) {
     vscode.window.showWarningMessage(
       vscode.workspace.isTrusted
-        ? "Tessera: `tessera` was not found, so there are no errors, hover or rename (highlighting still works). Put it on your PATH or set `tessera.path` in your user settings."
-        : "Tessera: `tessera` was not found on your PATH or in your user settings, and this folder is not trusted, so its own build is not used. Highlighting still works."
+        ? "Limen: `limen` was not found, so there are no errors, hover or rename (highlighting still works). Put it on your PATH or set `limen.path` in your user settings."
+        : "Limen: `limen` was not found on your PATH or in your user settings, and this folder is not trusted, so its own build is not used. Highlighting still works."
     );
     return;
   }
   output.appendLine(`starting ${command} lsp`);
   client = new LanguageClient(
-    "tessera",
-    "Tessera",
+    "limen",
+    "Limen",
     { command, args: ["lsp"] },
-    { documentSelector: [{ scheme: "file", language: "tessera" }], outputChannel: output }
+    { documentSelector: [{ scheme: "file", language: "limen" }], outputChannel: output }
   );
   try {
     await client.start();
   } catch (e) {
     client = undefined;
-    vscode.window.showErrorMessage(`Tessera: could not start \`${command} lsp\`: ${e.message}`);
+    vscode.window.showErrorMessage(`Limen: could not start \`${command} lsp\`: ${e.message}`);
   }
 }
 
@@ -73,10 +73,10 @@ async function stop() {
 }
 
 async function activate(context) {
-  output = vscode.window.createOutputChannel("Tessera");
+  output = vscode.window.createOutputChannel("Limen");
   context.subscriptions.push(
     output,
-    vscode.commands.registerCommand("tessera.restartLanguageServer", async () => {
+    vscode.commands.registerCommand("limen.restartLanguageServer", async () => {
       await stop();
       await start();
     }),
@@ -84,7 +84,7 @@ async function activate(context) {
       if (!client) await start();
     }),
     vscode.workspace.onDidChangeConfiguration(async (e) => {
-      if (e.affectsConfiguration("tessera")) {
+      if (e.affectsConfiguration("limen")) {
         await stop();
         await start();
       }

@@ -1,0 +1,512 @@
+// The Limen lexer, written in Limen: the first piece of a compiler that
+// compiles itself. It turns source text into the same tokens as
+// src/lexer.ml, and selfhost/check.sh compares the two on every .lmn file
+// in the repository.
+
+// A piece of a string literal: text, or the source of an interpolation
+// `{...}` with the offset where it starts.
+pub enum Part {
+    Lit(Str),
+    Interp(Str, Int),
+}
+
+pub enum Kind {
+    IntLit(Int),
+    FloatLit(Str),
+    StrLit(List[Part]),
+    Ident(Str),
+    Keyword(Str),
+    Symbol(Str),
+    End,
+}
+
+// A token and where it is: bytes `lo` up to `hi`, and whether a newline
+// came before it (the parser uses that to end statements).
+pub struct Token {
+    kind: Kind,
+    lo: Int,
+    hi: Int,
+    nl: Bool,
+}
+
+pub struct LexError {
+    code: Str,
+    lo: Int,
+    hi: Int,
+    message: Str,
+}
+
+fn keywords() -> List[Str] {
+    ["fn", "let", "mut", "if", "else", "match", "for", "in", "while", "return", "struct", "enum", "true", "false", "group", "break", "continue", "pub", "use", "interface", "dyn", "select", "defer"]
+}
+
+fn two_byte_symbols() -> List[Str] {
+    ["->", "=>", "==", "!=", "<=", ">=", "&&", "||", "??", "|>", "..", "<<", ">>"]
+}
+
+fn is_digit(b: Int) -> Bool {
+    b >= 48 && b <= 57
+}
+
+fn is_ident_start(b: Int) -> Bool {
+    (b >= 97 && b <= 122) || (b >= 65 && b <= 90) || b == 95
+}
+
+fn is_ident(b: Int) -> Bool {
+    is_ident_start(b) || is_digit(b)
+}
+
+fn is_symbol(b: Int) -> Bool {
+    "()\{\}[],:;.|+-*/%!?=<>&^~".bytes().contains(b)
+}
+
+// The byte an escape `\e` stands for, if `e` is one.
+fn escaped(e: Int) -> Option[Int] {
+    match e {
+        110 => Some(10),
+        116 => Some(9),
+        114 => Some(13),
+        92 => Some(92),
+        34 => Some(34),
+        123 => Some(123),
+        125 => Some(125),
+        48 => Some(0),
+        _ => None,
+    }
+}
+
+fn err(code: Str, lo: Int, hi: Int, message: Str) -> LexError {
+    LexError { code, lo, hi, message }
+}
+
+// Where the text of a multi-line string opened at `i` starts: `i` is the
+// first of three quotes followed by nothing but spaces and tabs on their
+// line; -1 if they are not.
+fn ml_start(bs: List[Int], i: Int) -> Int {
+    let n = bs.len()
+    if triple(bs, i) {
+        let mut j = i + 3
+        while j < n && (bs[j] == 32 || bs[j] == 9 || bs[j] == 13) {
+            j = j + 1
+        }
+        if j < n && bs[j] == 10 {
+            return j + 1
+        }
+    }
+    -1
+}
+
+// Whether three quotes start at `i`.
+fn triple(bs: List[Int], i: Int) -> Bool {
+    i + 2 < bs.len() && bs[i] == 34 && bs[i + 1] == 34 && bs[i + 2] == 34
+}
+
+// The index after the spaces and tabs at `j`.
+fn skip_indent(bs: List[Int], j: Int) -> Int {
+    let n = bs.len()
+    let mut k = j
+    while k < n && (bs[k] == 32 || bs[k] == 9) {
+        k = k + 1
+    }
+    k
+}
+
+// The index just past the string literal that starts at `i` (a quote),
+// following escapes, nested interpolations and multi-line strings; None at
+// the end of input.
+fn skip_string(bs: List[Int], i: Int) -> Option[Int] {
+    let first = ml_start(bs, i)
+    if first >= 0 {
+        return Some(skip_indent(bs, ml_close(bs, first)?) + 3)
+    }
+    let n = bs.len()
+    let mut j = i + 1
+    while j < n {
+        let c = bs[j]
+        if c == 34 {
+            return Some(j + 1)
+        }
+        if c == 92 {
+            j = j + 2
+        } else if c == 123 {
+            match skip_braces(bs, j + 1) {
+                Some(k) => {
+                    j = k
+                },
+                None => {
+                    return None
+                },
+            }
+        } else {
+            j = j + 1
+        }
+    }
+    None
+}
+
+// The index just past the `}` that closes a brace opened before `i`.
+fn skip_braces(bs: List[Int], i: Int) -> Option[Int] {
+    let n = bs.len()
+    let mut j = i
+    let mut depth = 0
+    while j < n {
+        let c = bs[j]
+        if c == 123 {
+            depth = depth + 1
+            j = j + 1
+        } else if c == 125 {
+            if depth == 0 {
+                return Some(j + 1)
+            }
+            depth = depth - 1
+            j = j + 1
+        } else if c == 34 {
+            match skip_string(bs, j) {
+                Some(k) => {
+                    j = k
+                },
+                None => {
+                    return None
+                },
+            }
+        } else {
+            j = j + 1
+        }
+    }
+    None
+}
+
+// The start of the line that closes the multi-line string whose first line
+// starts at `i`: the first line holding only indentation and three quotes
+// (and whatever code follows them). An interpolation's code may span
+// lines. None at the end of input.
+fn ml_close(bs: List[Int], i: Int) -> Option[Int] {
+    let n = bs.len()
+    let mut j = i
+    let mut line = true
+    while line || j < n {
+        if line {
+            if triple(bs, skip_indent(bs, j)) {
+                return Some(j)
+            }
+            line = false
+        } else {
+            let c = bs[j]
+            if c == 10 {
+                j = j + 1
+                line = true
+            } else if c == 92 {
+                line = j + 1 < n && bs[j + 1] == 10
+                j = j + 2
+            } else if c == 123 {
+                j = skip_braces(bs, j + 1)?
+            } else {
+                j = j + 1
+            }
+        }
+    }
+    None
+}
+
+// The byte the escape `\e` at `j` stands for.
+fn escape_at(src: Str, bs: List[Int], j: Int) -> Result[Int, LexError] {
+    match escaped(bs[j + 1]) {
+        Some(b) => Ok(b),
+        None => Err(err("E0006", j, j + 2, "unknown escape `\\{src.slice(j + 1, j + 2)}`")),
+    }
+}
+
+// The interpolation opened at `open_at`, which must close before `limit`,
+// and the index after it.
+fn interp(src: Str, bs: List[Int], open_at: Int, limit: Int) -> Result[(Part, Int), LexError] {
+    let n = bs.len()
+    let start = open_at + 1
+    let mut depth = 1
+    let mut i = start
+    while depth > 0 {
+        if i >= limit {
+            return Err(err("E0002", open_at, limit, "unterminated interpolation `\{...}`"))
+        }
+        let k = bs[i]
+        if k == 123 {
+            depth = depth + 1
+            i = i + 1
+        } else if k == 125 {
+            depth = depth - 1
+            i = i + 1
+        } else if k == 34 {
+            match skip_string(bs, i) {
+                Some(j) => {
+                    i = j
+                },
+                None => {
+                    return Err(err("E0002", open_at, n, "unterminated string literal"))
+                },
+            }
+        } else if k == 92 {
+            // code has no backslashes: an escaped quote meant for a nested string
+            return Err(err("E0006", i, i + 2, "a `\\` inside `\{...}`: an interpolation holds code, so a string in it uses plain quotes, as in `\"\{f(\"x\")}\"`"))
+        } else {
+            i = i + 1
+        }
+    }
+    let inner = src.slice(start, i - 1)
+    if inner.trim() == "" {
+        return Err(err("E0007", open_at, i, "empty interpolation `\{}`; write `\\\{` for a literal brace"))
+    }
+    Ok((Interp(inner, start), i))
+}
+
+// Where the text of the line of a multi-line string that starts at `j`
+// starts: after `indent`, the closing line's indentation, which a line of
+// only spaces and tabs may lack. The text ends at `ce`.
+fn start_line(bs: List[Int], src: Str, j: Int, ce: Int, indent: Str) -> Result[Int, LexError] {
+    if j + indent.len() <= ce && src.slice(j, j + indent.len()) == indent {
+        return Ok(j + indent.len())
+    }
+    let mut w = j
+    while w < ce && (bs[w] == 32 || bs[w] == 9 || bs[w] == 13) {
+        w = w + 1
+    }
+    if w == ce || bs[w] == 10 {
+        return Ok(w)
+    }
+    Err(err("E0009", j, if w > j { w } else { j + 1 }, "this line is less indented than the closing `\"\"\"`; every line of a multi-line string starts with the closing line's indentation"))
+}
+
+// The multi-line string opened at `lo`: its parts and the index after it.
+// The closing line's indentation is taken off every line, and the line
+// breaks after the opening quotes and before the closing ones are not part
+// of it.
+fn multiline(src: Str, bs: List[Int], lo: Int) -> Result[(List[Part], Int), LexError] {
+    let n = bs.len()
+    let unterminated = err("E0002", lo, n, "unterminated multi-line string; end it with `\"\"\"` on a line of its own")
+    let cs = ml_start(bs, lo)
+    if cs < 0 {
+        let mut j = lo + 3
+        while j < n && (bs[j] == 32 || bs[j] == 9 || bs[j] == 13) {
+            j = j + 1
+        }
+        if j >= n {
+            return Err(unterminated)
+        }
+        return Err(err("E0009", lo, lo + 3, "a multi-line string starts with `\"\"\"` at the end of a line; its text begins on the next line"))
+    }
+    let cls = ml_close(bs, cs) ?? {
+        return Err(unterminated)
+    }
+    let k = skip_indent(bs, cls)
+    let indent = src.slice(cls, k)
+    // the text runs up to the line break before the closing line
+    let ce = cls - 1
+    let mut parts: List[Part] = []
+    let mut buf: List[Int] = []
+    if cls > cs {
+        let mut j = start_line(bs, src, cs, ce, indent)?
+        while j < ce {
+            let c = bs[j]
+            if c == 10 {
+                buf.push(10)
+                j = start_line(bs, src, j + 1, ce, indent)?
+            } else if c == 13 && bs[j + 1] == 10 {
+                j = j + 1
+            } else if c == 92 {
+                let e = bs[j + 1]
+                if e == 10 || (e == 13 && bs[j + 2] == 10) {
+                    // a line ending in `\` goes on with the next, with no line break
+                    let at = if e == 10 { j + 1 } else { j + 2 }
+                    if at >= ce {
+                        return Err(err("E0009", j, j + 1, "a `\\` at the end of the last line has no next line to join"))
+                    }
+                    j = start_line(bs, src, at + 1, ce, indent)?
+                } else {
+                    buf.push(escape_at(src, bs, j)?)
+                    j = j + 2
+                }
+            } else if c == 123 {
+                if !buf.is_empty() {
+                    parts.push(Lit(bytes(buf).to_str()))
+                    buf = []
+                }
+                let (part, after) = interp(src, bs, j, ce)?
+                parts.push(part)
+                j = after
+            } else {
+                buf.push(c)
+                j = j + 1
+            }
+        }
+    }
+    if !buf.is_empty() {
+        parts.push(Lit(bytes(buf).to_str()))
+    }
+    Ok((parts, k + 3))
+}
+
+// Whether the last token is a `.` or `?.` ending exactly at `lo`: then
+// `t.0.1` is two tuple fields, not the number 0.1.
+fn after_dot(toks: List[Token], lo: Int) -> Bool {
+    match toks.last() {
+        Some(t) => match t.kind {
+            Symbol("." | "?.") => t.hi == lo,
+            _ => false,
+        },
+        None => false,
+    }
+}
+
+pub fn lex(src: Str) -> Result[List[Token], LexError] {
+    let bs = src.bytes()
+    let n = bs.len()
+    let mut toks: List[Token] = []
+    let mut i = 0
+    let mut nl = false
+    while i < n {
+        let c = bs[i]
+        if c == 10 {
+            nl = true
+            i = i + 1
+        } else if c == 32 || c == 9 || c == 13 {
+            i = i + 1
+        } else if c == 47 && i + 1 < n && bs[i + 1] == 47 {
+            // a comment runs to the end of the line
+            while i < n && bs[i] != 10 {
+                i = i + 1
+            }
+        } else if is_digit(c) {
+            let lo = i
+            let dotted = after_dot(toks, lo)
+            while i < n && (is_digit(bs[i]) || bs[i] == 95) {
+                i = i + 1
+            }
+            let fraction = !dotted && i + 1 < n && bs[i] == 46 && is_digit(bs[i + 1])
+            if fraction {
+                i = i + 1
+                while i < n && (is_digit(bs[i]) || bs[i] == 95) {
+                    i = i + 1
+                }
+            }
+            // an exponent: 1e9, 2.5E-3
+            let exponent = !dotted && i < n && (bs[i] == 101 || bs[i] == 69) && ((i + 1 < n && is_digit(bs[i + 1])) || (i + 2 < n && (bs[i + 1] == 43 || bs[i + 1] == 45) && is_digit(bs[i + 2])))
+            if exponent {
+                i = i + 2
+                while i < n && is_digit(bs[i]) {
+                    i = i + 1
+                }
+            }
+            let text = src.slice(lo, i)
+            if fraction || exponent {
+                toks.push(Token { kind: FloatLit(text), lo, hi: i, nl })
+            } else {
+                match text.replace("_", "").parse_int() {
+                    Some(v) => toks.push(Token { kind: IntLit(v), lo, hi: i, nl }),
+                    None => {
+                        return Err(err("E0005", lo, i, "integer literal `{text.replace("_", "")}` is too large"))
+                    },
+                }
+            }
+            nl = false
+        } else if is_ident_start(c) {
+            let lo = i
+            while i < n && is_ident(bs[i]) {
+                i = i + 1
+            }
+            let word = src.slice(lo, i)
+            let kind = if keywords().contains(word) { Keyword(word) } else { Ident(word) }
+            toks.push(Token { kind, lo, hi: i, nl })
+            nl = false
+        } else if c == 34 && triple(bs, i) {
+            let (parts, hi) = multiline(src, bs, i)?
+            toks.push(Token { kind: StrLit(parts), lo: i, hi, nl })
+            i = hi
+            nl = false
+        } else if c == 34 {
+            let lo = i
+            i = i + 1
+            let mut parts: List[Part] = []
+            let mut buf: List[Int] = []
+            let mut closed = false
+            while !closed {
+                if i >= n {
+                    return Err(err("E0002", lo, n, "unterminated string literal"))
+                }
+                let d = bs[i]
+                if d == 34 {
+                    closed = true
+                    i = i + 1
+                } else if d == 92 {
+                    if i + 1 >= n {
+                        return Err(err("E0002", lo, n, "unterminated string literal"))
+                    }
+                    buf.push(escape_at(src, bs, i)?)
+                    i = i + 2
+                } else if d == 123 {
+                    if !buf.is_empty() {
+                        parts.push(Lit(bytes(buf).to_str()))
+                        buf = []
+                    }
+                    let (part, after) = interp(src, bs, i, n)?
+                    parts.push(part)
+                    i = after
+                } else {
+                    buf.push(d)
+                    i = i + 1
+                }
+            }
+            if !buf.is_empty() {
+                parts.push(Lit(bytes(buf).to_str()))
+            }
+            toks.push(Token { kind: StrLit(parts), lo, hi: i, nl })
+            nl = false
+        } else {
+            let lo = i
+            let two = if i + 1 < n { src.slice(i, i + 2) } else { "" }
+            let mut sym = ""
+            if i + 2 < n && c == 46 && bs[i + 1] == 46 && bs[i + 2] == 60 {
+                sym = "..<"
+            } else if i + 2 < n && c == 46 && bs[i + 1] == 46 && bs[i + 2] == 46 {
+                // `...` marks the variadic arguments of a foreign function
+                sym = "..."
+            } else if c == 63 && i + 1 < n && bs[i + 1] == 46 && !(i + 2 < n && bs[i + 2] == 46) {
+                // `?.` is safe navigation, unless it is `?` before a range: `x?..<n`
+                sym = "?."
+            } else if two_byte_symbols().contains(two) {
+                sym = two
+            } else if is_symbol(c) {
+                sym = src.slice(i, i + 1)
+            } else {
+                return Err(err("E0001", lo, lo + 1, "unexpected character `{src.slice(lo, lo + 1)}`"))
+            }
+            i = i + sym.len()
+            toks.push(Token { kind: Symbol(sym), lo, hi: i, nl })
+            nl = false
+        }
+    }
+    toks.push(Token { kind: End, lo: n, hi: n, nl })
+    Ok(toks)
+}
+
+// The tokens of `src` as if it started at byte `base` of a larger text. The
+// parser lexes the code of an interpolation `{...}` this way, so its tokens
+// carry positions in the file.
+pub fn lex_at(src: Str, base: Int) -> Result[List[Token], LexError] {
+    match lex(src) {
+        Ok(toks) => Ok(toks.map(|t| shifted(t, base))),
+        Err(e) => Err(err(e.code, e.lo + base, e.hi + base, e.message)),
+    }
+}
+
+fn shifted(t: Token, base: Int) -> Token {
+    let kind = match t.kind {
+        StrLit(parts) => StrLit(parts.map(|p| shifted_part(p, base))),
+        k => k,
+    }
+    Token { kind, lo: t.lo + base, hi: t.hi + base, nl: t.nl }
+}
+
+fn shifted_part(p: Part, base: Int) -> Part {
+    match p {
+        Interp(code, at) => Interp(code, at + base),
+        lit => lit,
+    }
+}

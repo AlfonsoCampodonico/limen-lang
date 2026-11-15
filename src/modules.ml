@@ -1,5 +1,5 @@
-(* Modules: `use NAME` loads NAME.tsr (next to the importing file, then a
-   tessera.toml dependency, then the standard library) and merges everything into
+(* Modules: `use NAME` loads NAME.lmn (next to the importing file, then a
+   limen.toml dependency, then the standard library) and merges everything into
    one flat program. Every item of module M is renamed `M.item`; the main file
    keeps its names. References are rewritten scope-aware, so the checker and
    both backends see a single program with qualified names.
@@ -8,7 +8,7 @@
    NAME, whatever the program has. So a program can hold its own module NAME
    (a file or a dependency) and the standard library's at once: the program's
    is `NAME`, and the standard library's is then named `std/NAME`, in its
-   items' qualified names, in messages and in `tessera caps`.
+   items' qualified names, in messages and in `limen caps`.
 
    Inside module M, an unqualified name that is one of M's items means that
    item. `m.f(...)`, `m.f`, `m.Type`, `m.Type { ... }`, `m.Variant(...)` and the
@@ -21,7 +21,7 @@ type modinfo = {
   mfile : string;
   mitems : item list;
   muses : (string * span) list;
-  mpkg : string option; (* the tessera.toml dependency it belongs to *)
+  mpkg : string option; (* the limen.toml dependency it belongs to *)
 }
 
 (* module name -> dependency, for the last program loaded *)
@@ -69,22 +69,22 @@ let read_file path =
   | Some t -> Some t
   | None -> try Some (In_channel.with_open_bin path In_channel.input_all) with Sys_error _ -> None
 
-(* deps: name -> directory holding NAME.tsr (from tessera.toml) *)
+(* deps: name -> directory holding NAME.lmn (from limen.toml) *)
 (* Returns the path, the text, and whether it came from a dependency. *)
 let same_file a b = try Unix.realpath a = Unix.realpath b with Unix.Unix_error _ -> false
 
 let find_module ~deps ~from dir name =
-  let local = Filename.concat dir (name ^ ".tsr") in
-  (* a file never imports itself: `use http` in http.tsr means another http *)
+  let local = Filename.concat dir (name ^ ".lmn") in
+  (* a file never imports itself: `use http` in http.lmn means another http *)
   if dir <> "" && (Sys.file_exists local || List.mem_assoc local !overlay) && not (same_file local from) then Some (local, read_file local, false)
   else
     match List.assoc_opt name deps with
     | Some d ->
-      let p = Filename.concat d (name ^ ".tsr") in
+      let p = Filename.concat d (name ^ ".lmn") in
       Some (p, read_file p, true)
     | None -> (
       match List.assoc_opt name !std_modules with
-      | Some src -> Some ("<std>/" ^ name ^ ".tsr", Some src, false)
+      | Some src -> Some ("<std>/" ^ name ^ ".lmn", Some src, false)
       | None -> None)
 
 let parse path src =
@@ -229,10 +229,10 @@ let mk d sp = { edesc = d; espan = sp; ety = Types.TErr; einst = []; ecallee = N
 (* `embed("page.html")` and `embed_bytes("logo.png")` are read by the compiler
    and become a literal, so a program that serves its own files needs no `Fs`.
    The path is relative to the file that names it and must stay inside that
-   file's package (the directory of its tessera.toml, or of the main file when
+   file's package (the directory of its limen.toml, or of the main file when
    there is none; a dependency's own directory): otherwise a dependency could
    bake `../../.ssh/id_rsa` into the binary, a read no grant allows. The
-   program's own tessera.toml (never a dependency's) can add directories its
+   program's own limen.toml (never a dependency's) can add directories its
    files may embed from too, its embed roots: `[embed] roots = ["../assets"]`. *)
 
 (* the main package's root, its embed roots (as written, and the path), and
@@ -268,7 +268,7 @@ let pick_root roots real path =
       Error (Printf.sprintf "`%s` is outside this package (%s); a program can embed only its own package's files" path first)
     else
       Error
-        (Printf.sprintf "`%s` is outside this package (%s) and its embed roots (%s); a program can embed only its own package's files and those under the roots its tessera.toml declares"
+        (Printf.sprintf "`%s` is outside this package (%s) and its embed roots (%s); a program can embed only its own package's files and those under the roots its limen.toml declares"
            path first (String.concat ", " reals))
 
 (* The message for a path outside every root. *)
@@ -699,7 +699,7 @@ let rename_item ?(fresh = false) mods (m : modinfo) own (it : item) : item =
         fn_params = params;
         fn_ret = Option.map (ty env) d.fn_ret;
         fn_body = block env locals d.fn_body;
-        (* a standard library module trusted with C (src/std/tessera.toml [trust]) *)
+        (* a standard library module trusted with C (src/std/limen.toml [trust]) *)
         fn_foreign =
           Option.map
             (fun (fo : foreign) ->
@@ -707,7 +707,7 @@ let rename_item ?(fresh = false) mods (m : modinfo) own (it : item) : item =
             d.fn_foreign }
   | IStruct s ->
     let env = { self = m; mods; own; gens = s.st_gen; fresh } in
-    (* a C struct's Int32 fields are Ints to the rest of Tessera, as Int32
+    (* a C struct's Int32 fields are Ints to the rest of Limen, as Int32
        parameters are; the types as written stay in st_foreign *)
     let int32_as_int (t : ty_expr) = match t.tdesc with TyName ("Int32", []) when s.st_foreign <> None -> { t with tdesc = TyName ("Int", []) } | _ -> t in
     IStruct
@@ -787,7 +787,7 @@ let check_aliases (m : modinfo) =
    Returns the flat program, or the diagnostics. *)
 let load ?(deps = []) ?root ?roots path src : item list * Diag.t list =
   errors := [];
-  (* without one (the editor, the agent server), the tessera.toml around the
+  (* without one (the editor, the agent server), the limen.toml around the
      file decides, as in a build; finding it fetches nothing *)
   main_root :=
     (match root with
@@ -797,7 +797,7 @@ let load ?(deps = []) ?root ?roots path src : item list * Diag.t list =
      match roots with
      | Some rs -> rs
      | None -> (
-       (* the same for the embed roots: a tessera.toml that cannot be read declares none *)
+       (* the same for the embed roots: a limen.toml that cannot be read declares none *)
        match Package.find path with
        | Some toml -> (
          try
@@ -833,7 +833,7 @@ let load ?(deps = []) ?root ?roots path src : item list * Diag.t list =
               else
                 Some
                   (match List.assoc_opt name !std_modules with
-                   | Some src -> Some ("<std>/" ^ name ^ ".tsr", Some src, false)
+                   | Some src -> Some ("<std>/" ^ name ^ ".lmn", Some src, false)
                    | None -> None)
             else if Hashtbl.mem resolved name then None
             else Some (find_module ~deps ~from:m.mfile dir name)
@@ -842,7 +842,7 @@ let load ?(deps = []) ?root ?roots path src : item list * Diag.t list =
           | None -> ()
           | Some None ->
               err "E0401" sp (Printf.sprintf "cannot find module `%s`" name)
-                ~notes:[ Printf.sprintf "looked for %s, the dependencies in tessera.toml and the standard library" (Filename.concat dir (name ^ ".tsr")) ]
+                ~notes:[ Printf.sprintf "looked for %s, the dependencies in limen.toml and the standard library" (Filename.concat dir (name ^ ".lmn")) ]
           | Some (Some (p, None, _)) -> err "E0401" sp (Printf.sprintf "cannot read module `%s` at %s" name p)
           | Some (Some (p, Some src, from_dep)) ->
               let std = String.starts_with ~prefix:"<std>" p in
@@ -852,13 +852,13 @@ let load ?(deps = []) ?root ?roots path src : item list * Diag.t list =
               (* only the program declares embed roots *)
               let real d = try Unix.realpath d with Unix.Unix_error _ -> d in
               (if from_dep && real (Filename.dirname p) <> real !main_root then
-                 let toml = Filename.concat (Filename.dirname p) "tessera.toml" in
+                 let toml = Filename.concat (Filename.dirname p) "limen.toml" in
                  match read_file toml with
                  | Some text -> (
                    match Package.declares_embed toml text with
                    | Some tsp ->
                      err "E0321" tsp
-                       (Printf.sprintf "dependency `%s` declares embed roots in its tessera.toml; only the program's own tessera.toml can" name)
+                       (Printf.sprintf "dependency `%s` declares embed roots in its limen.toml; only the program's own limen.toml can" name)
                        ~notes:[ "a dependency embeds only files of its own directory; remove its [embed] table" ]
                    | None -> ())
                  | None -> ());
@@ -934,7 +934,7 @@ let c_users (items : item list) : (string * string list) list =
       | _ -> acc)
     [] items
 
-(* Load a program with the tessera.toml around it (if any), then type-check it
+(* Load a program with the limen.toml around it (if any), then type-check it
    and enforce the capabilities of each standard library module and each
    dependency. *)
 let load_and_check path src : item list * Diag.t list * Check.fn_info list =
@@ -948,8 +948,8 @@ let load_and_check path src : item list * Diag.t list * Check.fn_info list =
     | [], (_ :: _ as ds) -> ([], ds, [])
     | items, _ ->
       let ds, infos = Check.check_program items in
-      (* standard library modules are checked against src/std/tessera.toml,
-         with or without a tessera.toml of the program's own *)
+      (* standard library modules are checked against src/std/limen.toml,
+         with or without a limen.toml of the program's own *)
       let warnings = Diag.warnings ds in
       let ds = Diag.errors ds in
       let ds = if ds = [] then Package.enforce ~std:true (Lazy.force Package.std_manifest) !std_loaded infos else ds in

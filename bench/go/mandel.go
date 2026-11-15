@@ -1,5 +1,5 @@
 // Points of a 4000x4000 grid inside the Mandelbrot set (500 iterations).
-// One goroutine per row, as Tessera starts one task per row.
+// One goroutine per row, as Limen starts one task per row.
 package main
 
 import (

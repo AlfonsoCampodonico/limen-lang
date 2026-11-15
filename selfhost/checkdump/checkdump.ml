@@ -1,22 +1,22 @@
 (* Print what the type checker (src/check.ml) makes of FILE, as
-   selfhost/check.tsr prints the Tessera checker's, so the two can be
+   selfhost/check.lmn prints the Limen checker's, so the two can be
    compared. The program is loaded as selfhost/loaddump loads it; if that
    fails, the loader's diagnostics are printed as loaddump prints them.
 
    Otherwise the checker's diagnostics come first, in the order it reports
    them (sorted by position): ERROR or WARNING, CODE FILE LO HI, the
    message, the notes, and the fix, if any, with each edit as FILE LO HI
-   and the replacement; as `tessera check` reports them, the errors come
+   and the replacement; as `limen check` reports them, the errors come
    first, then the capability checks of src/package.ml when there are no
-   errors, then the warnings. Then what `tessera caps` reports of each
+   errors, then the warnings. Then what `limen caps` reports of each
    function (see caps_line). Then each item of the program in load order: the
    item as the checker rewrote it, in the position-free format of
    src/astdump.ml, and below it one line per expression, in the order
-   selfhost/walk.tsr visits them (an expression, then the ones inside it,
+   selfhost/walk.lmn visits them (an expression, then the ones inside it,
    as written): the expression's type, the type arguments of a generic
    function's use (`inst`), and for `a?.b` whose rest is an Option already,
    `nested`. *)
-open Tessera
+open Limen
 open Ast
 
 let rec walk (e : expr) =
@@ -87,7 +87,7 @@ let check_diag (d : Diag.t) =
       (fun (ed : Diag.edit) -> Printf.printf "edit %s %d %d %s\n" ed.at.file ed.at.lo ed.at.hi (String.escaped ed.replacement))
       f.edits
 
-(* What `tessera caps` reports of a function: CAPS NAME FILE LO HI, its
+(* What `limen caps` reports of a function: CAPS NAME FILE LO HI, its
    capabilities in brackets (each held through a struct or enum with its
    path, `Net=Client.net`), and whether it runs callbacks. *)
 let caps_line (i : Check.fn_info) =

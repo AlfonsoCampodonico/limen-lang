@@ -1,6 +1,0 @@
-# The edge cases are programs of their own, not files of the compiler's
-# package (selfhost/tessera.toml): this keeps its embed roots away from
-# them. The ones that embed files have a tessera.toml of their own, so
-# their package is their own directory.
-[package]
-name = "edge-cases"

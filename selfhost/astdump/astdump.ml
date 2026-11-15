@@ -1,10 +1,10 @@
-(* Print the syntax tree of FILE as the Tessera parser in selfhost/parser.tsr
+(* Print the syntax tree of FILE as the Limen parser in selfhost/parser.lmn
    does. First the tree in the compiler's own position-free format
    (src/astdump.ml, the one the formatter tests compare), then the spans the
    tree carries: a line `spans`, then one line per `use` and per item with
    every span in it, in the order a walk of the tree meets them. A parse
    error prints ERROR CODE LO HI, followed by its message and notes. *)
-open Tessera
+open Limen
 open Ast
 
 let out = Buffer.create 4096

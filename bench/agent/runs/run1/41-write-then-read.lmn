@@ -1,0 +1,6 @@
+fn main(root: Root) -> Result[(), IoError] {
+    root.fs.write("out.txt", "hello from limen")?
+    let text = root.fs.read("out.txt")?
+    root.stdout.print(text)
+    Ok(())
+}

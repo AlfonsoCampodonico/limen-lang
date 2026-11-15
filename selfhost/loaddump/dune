@@ -1,6 +1,6 @@
 ; The OCaml module loader's program for one file, in the format
-; selfhost/load.tsr prints, so the two can be compared:
+; selfhost/load.lmn prints, so the two can be compared:
 ; dune exec selfhost/loaddump/loaddump.exe -- FILE
 (executable
  (name loaddump)
- (libraries tessera))
+ (libraries limen))

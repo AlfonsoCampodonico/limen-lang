@@ -1,10 +1,10 @@
-(* Print the tokens of FILE one per line, as the Tessera lexer in
-   selfhost/lexer.tsr does:  LO HI NL KIND VALUE
+(* Print the tokens of FILE one per line, as the Limen lexer in
+   selfhost/lexer.lmn does:  LO HI NL KIND VALUE
    NL is 1 when a newline came before the token. Text is escaped the same
    way on both sides: printable ASCII as it is, except \ and |, which are
    written as \x5c and \x7c like every other byte. A lexing error prints
    ERROR CODE LO HI and nothing else. *)
-open Tessera
+open Limen
 
 let esc s =
   let b = Buffer.create (String.length s) in

@@ -1,13 +1,13 @@
 (* Print the program the module loader (src/modules.ml) makes of FILE, as
-   selfhost/load.tsr prints the Tessera loader's, so the two can be
+   selfhost/load.lmn prints the Limen loader's, so the two can be
    compared. The package around the file is loaded first, as a build does
-   (src/package.ml: tessera.toml, its dependencies).
+   (src/package.ml: limen.toml, its dependencies).
 
    A loaded program prints as its items, one per line, in the compiler's
    position-free format (src/astdump.ml), with qualified names and every
    expansion done; then `foreign`, what the loader decided about C
    declarations; then `embed roots`, the directories the program's
-   tessera.toml lets it embed from (as written, and the path); then
+   limen.toml lets it embed from (as written, and the path); then
    `embedded`, the files `embed` read; then `spans`,
    one line per item: the item's file and every span in it, in the order a
    walk of the tree meets them. A span from another file (a type alias's
@@ -15,7 +15,7 @@
 
    Otherwise it prints the diagnostics in order: ERROR CODE FILE LO HI,
    the message and the notes. *)
-open Tessera
+open Limen
 open Ast
 
 let out = Buffer.create 4096

@@ -1,10 +1,10 @@
-(* How fast `tessera check` is, by phase, on one file, in CPU time (wall time is
+(* How fast `limen check` is, by phase, on one file, in CPU time (wall time is
    at the mercy of whatever else the machine runs):
      dune exec bench/checkspeed/checkspeed.exe -- FILE
    gen.py writes a large program of ordinary code to try it on. Each phase is
    run on its own, then the whole check once more; the words column is what
    the phase allocated, in millions. *)
-open Tessera
+open Limen
 
 let time name f =
   Gc.full_major ();
@@ -23,5 +23,5 @@ let () =
   let (items, _), _ = time "load" (fun () -> Modules.load file src) in
   ignore (time "check" (fun () -> Check.check_program items));
   let (_, ds, _), total = time "all" (fun () -> Modules.load_and_check file src) in
-  Printf.printf "%d lines, %d errors; `tessera check` (lex, parse, load, check): %.0f lines/s\n" lines (List.length (Diag.errors ds))
+  Printf.printf "%d lines, %d errors; `limen check` (lex, parse, load, check): %.0f lines/s\n" lines (List.length (Diag.errors ds))
     (float lines /. total)

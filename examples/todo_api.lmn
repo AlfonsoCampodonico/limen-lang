@@ -1,0 +1,342 @@
+// A small CRUD API: todos over HTTP and JSON, stored in SQLite.
+//
+//   GET    /todos        list them
+//   POST   /todos        create one: {"title": "buy milk"}
+//   GET    /todos/ID     read one
+//   PATCH  /todos/ID     change title and/or done: {"done": true}
+//   DELETE /todos/ID     delete one
+//
+// With no arguments it runs a demo: the server and a client in one program,
+// over loopback, with the database in memory.
+//
+//   limen run examples/todo_api.lmn --grant listen=127.0.0.1:0 --grant net=127.0.0.1
+//
+// To serve for real, on port 8080 (or `serve PORT`) with the database in todos.db:
+//
+//   limen run examples/todo_api.lmn --grant listen=127.0.0.1:8080 --grant fs=. -- serve
+//   curl -X POST localhost:8080/todos -d '{"title": "buy milk"}'
+//   curl localhost:8080/todos
+//
+// The handlers get the database and nothing else: they cannot reach the
+// network or any file, whatever the requests say.
+use http
+use json
+use sql
+
+struct Todo {
+    id: Int,
+    title: Str,
+    done: Bool,
+}
+
+// ---------- storage ----------
+
+fn setup(db: sql.Db) -> Result[(), IoError] {
+    db.exec("CREATE TABLE IF NOT EXISTS todos (id INTEGER PRIMARY KEY, title TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0)", [])?
+    Ok(())
+}
+
+fn from_row(row: sql.Row) -> Todo {
+    Todo { id: row.int("id") ?? 0, title: row.text("title") ?? "", done: row.int("done") == Some(1) }
+}
+
+fn all(db: sql.Db) -> Result[List[Todo], IoError] {
+    let rows = db.query("SELECT id, title, done FROM todos ORDER BY id", [])?
+    Ok(rows.map(from_row))
+}
+
+fn find(db: sql.Db, id: Int) -> Result[Option[Todo], IoError] {
+    let row = db.query_one("SELECT id, title, done FROM todos WHERE id = ?", [sql.Int(id)])?
+    Ok(row.map(from_row))
+}
+
+// RETURNING gives the new row's id from the insert itself, so two requests
+// at once cannot see each other's id
+fn create(db: sql.Db, title: Str) -> Result[Todo, IoError] {
+    let row = db.query_one("INSERT INTO todos (title) VALUES (?) RETURNING id, title, done", [sql.Text(title)])?
+    match row {
+        Some(r) => Ok(from_row(r)),
+        None => Err(Failed("insert returned no row")),
+    }
+}
+
+fn save(db: sql.Db, t: Todo) -> Result[(), IoError] {
+    db.exec("UPDATE todos SET title = ?, done = ? WHERE id = ?", [sql.Text(t.title), sql.Int(if t.done { 1 } else { 0 }), sql.Int(t.id)])?
+    Ok(())
+}
+
+fn remove(db: sql.Db, id: Int) -> Result[Bool, IoError] {
+    let changed = db.exec("DELETE FROM todos WHERE id = ?", [sql.Int(id)])?
+    Ok(changed > 0)
+}
+
+// ---------- JSON ----------
+
+fn to_json(t: Todo) -> json.Value {
+    json.Obj([
+        json.field("id", json.Num(t.id.to_float())),
+        json.field("title", json.Str(t.title)),
+        json.field("done", json.Bool(t.done)),
+    ])
+}
+
+fn reply(status: Int, v: json.Value) -> http.Response {
+    http.json(status, json.stringify(v))
+}
+
+fn problem(status: Int, message: Str) -> http.Response {
+    reply(status, json.Obj([json.field("error", json.Str(message))]))
+}
+
+// The fields a POST or PATCH body may set. Anything else in it is ignored.
+struct Changes {
+    title: Option[Str],
+    done: Option[Bool],
+}
+
+fn read_changes(body: Str) -> Result[Changes, Str] {
+    let v = json.parse(body)?
+    let title = match v.get("title") {
+        Some(t) => match t.as_str() {
+            Some(s) if s.trim().is_empty() => { return Err("title is empty") },
+            Some(s) => Some(s.trim()),
+            None => { return Err("title must be a string") },
+        },
+        None => None,
+    }
+    let done = match v.get("done") {
+        Some(d) => match d.as_bool() {
+            Some(b) => Some(b),
+            None => { return Err("done must be true or false") },
+        },
+        None => None,
+    }
+    Ok(Changes { title, done })
+}
+
+// ---------- routes ----------
+
+fn route(db: sql.Db, r: http.Request) -> http.Response {
+    // "/todos/3?x=1" -> ["todos", "3"]
+    let path = r.path.split("?")[0]
+    let parts = path.split("/").filter(|p| !p.is_empty())
+    if parts.is_empty() || parts[0] != "todos" || parts.len() > 2 {
+        return problem(404, "no route for {path}")
+    }
+    let answer = if parts.len() == 1 {
+        match r.method {
+            "GET" => list_todos(db),
+            "POST" => create_todo(db, r.body),
+            _ => Ok(problem(405, "use GET or POST on /todos")),
+        }
+    } else {
+        match parts[1].parse_int() {
+            None => Ok(problem(404, "no todo `{parts[1]}`")),
+            Some(id) => match r.method {
+                "GET" => get_todo(db, id),
+                "PATCH" => update_todo(db, id, r.body),
+                "DELETE" => delete_todo(db, id),
+                _ => Ok(problem(405, "use GET, PATCH or DELETE on /todos/{id}")),
+            },
+        }
+    }
+    // a database failure is the server's fault, not the request's
+    answer ?? problem(500, "the database failed")
+}
+
+fn list_todos(db: sql.Db) -> Result[http.Response, IoError] {
+    let todos = all(db)?
+    Ok(reply(200, json.Arr(todos.map(to_json))))
+}
+
+fn create_todo(db: sql.Db, body: Str) -> Result[http.Response, IoError] {
+    let changes = match read_changes(body) {
+        Ok(c) => c,
+        Err(e) => { return Ok(problem(400, e)) },
+    }
+    match changes.title {
+        None => Ok(problem(400, "a todo needs a title")),
+        Some(title) => {
+            let t = create(db, title)?
+            Ok(reply(201, to_json(t)))
+        },
+    }
+}
+
+fn get_todo(db: sql.Db, id: Int) -> Result[http.Response, IoError] {
+    match find(db, id)? {
+        Some(t) => Ok(reply(200, to_json(t))),
+        None => Ok(problem(404, "no todo {id}")),
+    }
+}
+
+fn update_todo(db: sql.Db, id: Int, body: Str) -> Result[http.Response, IoError] {
+    let changes = match read_changes(body) {
+        Ok(c) => c,
+        Err(e) => { return Ok(problem(400, e)) },
+    }
+    match find(db, id)? {
+        None => Ok(problem(404, "no todo {id}")),
+        Some(t) => {
+            let updated = { t with title: changes.title ?? t.title, done: changes.done ?? t.done }
+            save(db, updated)?
+            Ok(reply(200, to_json(updated)))
+        },
+    }
+}
+
+fn delete_todo(db: sql.Db, id: Int) -> Result[http.Response, IoError] {
+    if remove(db, id)? {
+        Ok(http.text(204, ""))
+    } else {
+        Ok(problem(404, "no todo {id}"))
+    }
+}
+
+// ---------- the demo client ----------
+
+fn call(net: Net, base: Str, method: Str, path: Str, body: Str) -> Str {
+    let line = "{method} {path}"
+    match http.request(net, method, base + path, [http.Header { name: "content-type", value: "application/json" }], body) {
+        Ok(r) if r.body.is_empty() => "{line} -> {r.status}",
+        Ok(r) => "{line} -> {r.status} {r.body}",
+        Err(e) => "{line} -> {e}",
+    }
+}
+
+// A JSON body from fields, so no braces need escaping inside a string.
+fn body(fields: List[json.Field]) -> Str {
+    json.stringify(json.Obj(fields))
+}
+
+fn titled(title: Str) -> Str {
+    body([json.field("title", json.Str(title))])
+}
+
+fn marked(done: Bool) -> Str {
+    body([json.field("done", json.Bool(done))])
+}
+
+fn demo_client(net: Net, port: Int) -> List[Str] {
+    let base = "http://127.0.0.1:{port}"
+    [
+        call(net, base, "POST", "/todos", titled("buy milk")),
+        call(net, base, "POST", "/todos", titled("write the README")),
+        call(net, base, "POST", "/todos", marked(true)),
+        call(net, base, "GET", "/todos", ""),
+        call(net, base, "PATCH", "/todos/1", marked(true)),
+        call(net, base, "GET", "/todos/1", ""),
+        call(net, base, "PATCH", "/todos/2", body([json.field("title", json.Num(7.0))])),
+        call(net, base, "DELETE", "/todos/2", ""),
+        call(net, base, "DELETE", "/todos/2", ""),
+        call(net, base, "GET", "/todos", ""),
+        call(net, base, "GET", "/users", ""),
+    ]
+}
+
+fn demo(root: Root) -> Result[(), IoError] {
+    let db = sql.memory()?
+    setup(db)?
+    let l = root.listen.on("127.0.0.1:0")?
+    let port = l.port()
+    let net = root.net
+    // the client opens one connection per call, so the server stops after 11
+    let results = group g {
+        g.go(|| {
+            let _ = http.serve(l, 11, |r| route(db, r))
+        })
+        g.go(|| demo_client(net, port))
+    }
+    for lines in results {
+        for line in lines {
+            root.stdout.print(line)
+        }
+    }
+    db.close()
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let args = root.args()
+    if args.is_empty() || args[0] != "serve" {
+        return demo(root)
+    }
+    // `serve` or `serve PORT`; the listen grant must allow that port
+    let port = if args.len() > 1 { args[1] } else { "8080" }
+    let db = sql.open(root.fs, "todos.db")?
+    setup(db)?
+    let l = root.listen.on("127.0.0.1:{port}")?
+    root.stdout.print("serving todos on http://127.0.0.1:{port}")
+    Err(http.serve_forever(l, |r| route(db, r)))
+}
+
+// ---------- tests ----------
+// They call the router directly with a Request, against a fresh in-memory
+// database: the whole API, with no network.
+
+fn fresh() -> sql.Db {
+    match sql.memory() {
+        Ok(db) => {
+            match setup(db) {
+                Ok(_) => db,
+                Err(e) => panic("setup: {e}"),
+            }
+        },
+        Err(e) => panic("no database: {e}"),
+    }
+}
+
+fn send(db: sql.Db, method: Str, path: Str, body: Str) -> http.Response {
+    route(db, http.Request { method, path, version: "HTTP/1.1", headers: [], body })
+}
+
+fn todo(id: Int, title: Str, done: Bool) -> Result[json.Value, Str] {
+    Ok(to_json(Todo { id, title, done }))
+}
+
+test "create, then read it back" {
+    let db = fresh()
+    let made = send(db, "POST", "/todos", titled("  buy milk  "))
+    assert_eq(made.status, 201)
+    assert_eq(json.parse(made.body), todo(1, "buy milk", false))
+    assert_eq(send(db, "GET", "/todos/1", "").body, made.body)
+}
+
+test "list in creation order" {
+    let db = fresh()
+    send(db, "POST", "/todos", titled("a"))
+    send(db, "POST", "/todos", titled("b"))
+    let list = send(db, "GET", "/todos", "")
+    assert_eq(list.status, 200)
+    assert_eq(json.parse(list.body), Ok(json.Arr([to_json(Todo { id: 1, title: "a", done: false }), to_json(Todo { id: 2, title: "b", done: false })])))
+}
+
+test "update changes only the fields given" {
+    let db = fresh()
+    send(db, "POST", "/todos", titled("buy milk"))
+    let done = send(db, "PATCH", "/todos/1", marked(true))
+    assert_eq(json.parse(done.body), todo(1, "buy milk", true))
+    let renamed = send(db, "PATCH", "/todos/1", titled("buy oat milk"))
+    assert_eq(json.parse(renamed.body), todo(1, "buy oat milk", true))
+}
+
+test "delete, then it is gone" {
+    let db = fresh()
+    send(db, "POST", "/todos", titled("buy milk"))
+    assert_eq(send(db, "DELETE", "/todos/1", "").status, 204)
+    assert_eq(send(db, "GET", "/todos/1", "").status, 404)
+    assert_eq(send(db, "DELETE", "/todos/1", "").status, 404)
+}
+
+// one isolated run per case, each on an empty database
+test "refused" for (method, path, req, status) in [
+    ("POST", "/todos", "not json", 400),
+    ("POST", "/todos", marked(true), 400),
+    ("POST", "/todos", titled(""), 400),
+    ("PATCH", "/todos/1", body([json.field("done", json.Str("yes"))]), 400),
+    ("GET", "/todos/9", "", 404),
+    ("GET", "/todos/abc", "", 404),
+    ("GET", "/users", "", 404),
+    ("PUT", "/todos", "", 405),
+] {
+    assert_eq(send(fresh(), method, path, req).status, status)
+}

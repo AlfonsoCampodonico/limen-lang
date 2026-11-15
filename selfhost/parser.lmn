@@ -1,0 +1,1689 @@
+// The Limen parser, written in Limen: recursive descent, with
+// precedence climbing for binary operators. It turns the tokens of
+// selfhost/lexer.lmn into the tree of selfhost/ast.lmn, with the same
+// shape, positions and errors as src/parser.ml, and selfhost/check.sh
+// compares the two on every .lmn file in the repository.
+//
+// Values in Limen are never shared, so the parser's state cannot be
+// changed in place: each parsing function takes a Parser and returns what
+// it parsed together with the Parser after it, `Ok((expr, p))`.
+//
+// Newline rule: a newline ends an expression unless the next line starts
+// with `.`, `?.` or `|>`, so `f\n(x)` is two statements, not a call.
+use ast
+use floats
+use ids
+use lexer
+
+pub struct Parser {
+    toks: List[lexer.Token],
+    // the token being looked at
+    pos: Int,
+    // how many `?.` the file has had so far: each one names the value it
+    // unwraps after its number
+    safes: Int,
+    // the file's number, for the spans
+    file: Int,
+}
+
+pub struct ParseError {
+    code: Str,
+    message: Str,
+    // more on what to write instead
+    notes: List[Str],
+    span: ast.Span,
+}
+
+// What a parsing function returns: the thing parsed and the parser after
+// it, or the first error.
+type Parsed[T] = Result[(T, Parser), ParseError]
+
+// ---------- looking at tokens ----------
+
+fn tok(self: Parser) -> lexer.Token {
+    self.toks[self.pos]
+}
+
+fn kind(self: Parser) -> lexer.Kind {
+    self.toks[self.pos].kind
+}
+
+// The kind of token `i`, or of the end when `i` is past it.
+fn kind_at(self: Parser, i: Int) -> lexer.Kind {
+    self.toks[i.min(self.toks.len() - 1)].kind
+}
+
+fn next_kind(self: Parser) -> lexer.Kind {
+    self.kind_at(self.pos + 1)
+}
+
+// Whether a newline comes before the current token.
+fn nl(self: Parser) -> Bool {
+    self.toks[self.pos].nl
+}
+
+fn span(self: Parser) -> ast.Span {
+    self.span_of(self.tok())
+}
+
+// The span of the token just read.
+fn last_span(self: Parser) -> ast.Span {
+    self.span_of(self.toks[(self.pos - 1).max(0)])
+}
+
+fn at_end(self: Parser) -> Bool {
+    match self.kind() {
+        End => true,
+        _ => false,
+    }
+}
+
+// The parser one token further on; the end stays where it is.
+fn skip(self: Parser) -> Parser {
+    if self.at_end() { self } else { { self with pos: self.pos + 1 } }
+}
+
+fn is_sym(self: Parser, s: Str) -> Bool {
+    is_symbol(self.kind(), s)
+}
+
+fn is_kw(self: Parser, s: Str) -> Bool {
+    match self.kind() {
+        Keyword(k) => k == s,
+        _ => false,
+    }
+}
+
+// The words that start a construct only where they appear (`with`,
+// `until`, `type`, ...) are identifiers to the lexer.
+fn is_word(self: Parser, s: Str) -> Bool {
+    match self.kind() {
+        Ident(w) => w == s,
+        _ => false,
+    }
+}
+
+fn is_symbol(k: lexer.Kind, s: Str) -> Bool {
+    match k {
+        Symbol(t) => t == s,
+        _ => false,
+    }
+}
+
+fn span_of(self: Parser, t: lexer.Token) -> ast.Span {
+    ast.Span { file: self.file, lo: t.lo, hi: t.hi }
+}
+
+fn is_upper(s: Str) -> Bool {
+    let c = s.slice(0, 1)
+    c >= "A" && c <= "Z"
+}
+
+// ---------- errors ----------
+
+fn error(code: Str, span: ast.Span, message: Str) -> ParseError {
+    ParseError { code, message, notes: [], span }
+}
+
+fn note(self: ParseError, text: Str) -> ParseError {
+    { self with notes: self.notes + [text] }
+}
+
+// How a token is named in a message: "keyword `fn`", "end of file".
+fn describe(k: lexer.Kind) -> Str {
+    match k {
+        IntLit(n) => "number `{n}`",
+        FloatLit(text) => "number `{floats.general(float_value(text))}`",
+        StrLit(_) => "a string",
+        Ident(s) => "`{s}`",
+        Keyword(s) => "keyword `{s}`",
+        Symbol(s) => "`{s}`",
+        End => "end of file",
+    }
+}
+
+// "expected `)`, found `,`", at token `t`
+fn unexpected(self: Parser, t: lexer.Token, what: Str) -> ParseError {
+    error("E0003", self.span_of(t), "expected {what}, found {describe(t.kind)}")
+}
+
+fn expected(self: Parser, what: Str) -> ParseError {
+    self.unexpected(self.tok(), what)
+}
+
+// Past the symbol `s`, which must be next.
+fn need(self: Parser, s: Str) -> Result[Parser, ParseError] {
+    if self.is_sym(s) { Ok(self.skip()) } else { Err(self.expected("`{s}`")) }
+}
+
+fn need_kw(self: Parser, s: Str) -> Result[Parser, ParseError] {
+    if self.is_kw(s) { Ok(self.skip()) } else { Err(self.expected("`{s}`")) }
+}
+
+// The symbol `s`, which must be next, when its position is needed.
+fn expect(self: Parser, s: Str) -> Parsed[lexer.Token] {
+    if self.is_sym(s) { Ok((self.tok(), self.skip())) } else { Err(self.expected("`{s}`")) }
+}
+
+fn expect_kw(self: Parser, s: Str) -> Parsed[lexer.Token] {
+    if self.is_kw(s) { Ok((self.tok(), self.skip())) } else { Err(self.expected("`{s}`")) }
+}
+
+fn expect_ident(self: Parser) -> Parsed[ast.Name] {
+    match self.kind() {
+        Ident(s) => Ok((ast.Name { text: s, span: self.span() }, self.skip())),
+        Keyword(k) => Err(error("E0003", self.span(), "expected a name, found keyword `{k}`").note("keywords cannot be used as names; pick another name, for example `{k}s` or `my_{k}`")),
+        _ => Err(self.expected("a name")),
+    }
+}
+
+// ---------- building the tree ----------
+
+// A new expression node; selfhost/ids.lmn numbers them once the file is
+// parsed.
+fn mk(desc: ast.ExprDesc, span: ast.Span) -> ast.Expr {
+    ast.Expr { desc, span, id: 0 }
+}
+
+fn merge(a: ast.Span, b: ast.Span) -> ast.Span {
+    ast.merge(a, b)
+}
+
+fn float_value(text: Str) -> Float {
+    // the lexer only makes a FloatLit of digits, a point and an exponent
+    text.replace("_", "").parse_float() ?? 0.0
+}
+
+// A comma-separated list up to the symbol `close`, each item parsed by
+// `item`. A newline also separates items, and a trailing comma is allowed.
+fn comma_list[T](p: Parser, close: Str, item: fn(Parser) -> Parsed[T]) -> Parsed[List[T]] {
+    let mut p = p
+    let mut items: List[T] = []
+    while !p.is_sym(close) {
+        let (x, next) = item(p)?
+        items.push(x)
+        p = next
+        if p.is_sym(",") {
+            p = p.skip()
+        } else if !p.is_sym(close) && !p.nl() {
+            return Err(p.expected("`,` or `{close}`"))
+        }
+    }
+    Ok((items, p.skip()))
+}
+
+// ---------- types ----------
+
+pub fn parse_type(p: Parser) -> Parsed[ast.TyExpr] {
+    let t = p.tok()
+    let start = p.span_of(t)
+    match t.kind {
+        // `dyn Shape` is the type `dyn[Shape]`, `dyn Container[Int]` is
+        // `dyn[Container[Int]]`
+        Keyword("dyn") => {
+            let (a, p) = p.skip().expect_ident()?
+            let (name, p) = if p.is_sym(".") {
+                let (b, p) = p.skip().expect_ident()?
+                (ast.Name { text: a.text + "." + b.text, span: merge(a.span, b.span) }, p)
+            } else {
+                (a, p)
+            }
+            let (args, p) = type_args(p)?
+            let iface = ast.TyExpr { desc: TyName(name.text, args), span: merge(name.span, p.last_span()) }
+            Ok((ast.TyExpr { desc: TyName("dyn", [iface]), span: merge(start, iface.span) }, p))
+        },
+        Symbol("(") => {
+            let p = p.skip()
+            if p.is_sym(")") {
+                return Ok((ast.TyExpr { desc: TyUnit, span: merge(start, p.span()) }, p.skip()))
+            }
+            // `(A, B)` is a tuple type; `(A)` is just A
+            let (ts, p) = comma_list(p, ")", parse_type)?
+            let span = merge(start, p.last_span())
+            if ts.len() == 1 {
+                Ok(({ ts[0] with span }, p))
+            } else {
+                Ok((ast.TyExpr { desc: TyName(ast.tuple_name(ts.len()), ts), span }, p))
+            }
+        },
+        Keyword("fn") => {
+            let p = p.skip().need("(")?
+            let (params, p) = comma_list(p, ")", parse_type)?
+            // `fn(A)` returns nothing, as a function declared without `->`
+            // does: its result is `()`, with an empty span after the `)` so
+            // the formatter writes it back the way it was written
+            if !p.is_sym("->") {
+                let close = p.last_span()
+                return Ok((ast.TyExpr { desc: TyFn(params, ast.TyExpr { desc: TyUnit, span: { close with lo: close.hi } }), span: merge(start, close) }, p))
+            }
+            let (ret, p) = parse_type(p.skip())?
+            Ok((ast.TyExpr { desc: TyFn(params, ret), span: merge(start, ret.span) }, p))
+        },
+        // OCaml's ints have 63 bits, and the OCaml tree keeps a size within
+        // them, so this one does too
+        IntLit(n) => Ok((ast.TyExpr { desc: TyInt(n.min(4611686018427387903)), span: start }, p.skip())),
+        Ident(first) => {
+            let p = p.skip()
+            // a type from another module: `json.Value`
+            let (name, p) = if p.is_sym(".") {
+                let (m, p) = p.skip().expect_ident()?
+                (first + "." + m.text, p)
+            } else {
+                (first, p)
+            }
+            let (args, p) = type_args(p)?
+            Ok((ast.TyExpr { desc: TyName(name, args), span: merge(start, p.last_span()) }, p))
+        },
+        _ => Err(p.unexpected(t, "a type")),
+    }
+}
+
+// `[A, B]` after a type's name, on the same line.
+fn type_args(p: Parser) -> Parsed[List[ast.TyExpr]] {
+    if p.is_sym("[") && !p.nl() {
+        comma_list(p.skip(), "]", parse_type)
+    } else {
+        Ok(([], p))
+    }
+}
+
+// ---------- expressions ----------
+
+// Precedence levels are doubled so a range fits between comparison and
+// arithmetic: `0..<n + 1` is `0..<(n + 1)`.
+fn binop(k: lexer.Kind) -> Option[(Int, ast.BinOp)] {
+    match k {
+        Symbol("||") => Some((2, Or)),
+        Symbol("&&") => Some((4, And)),
+        Symbol("==") => Some((6, Eq)),
+        Symbol("!=") => Some((6, Ne)),
+        Symbol("<") => Some((8, Lt)),
+        Symbol("<=") => Some((8, Le)),
+        Symbol(">") => Some((8, Gt)),
+        Symbol(">=") => Some((8, Ge)),
+        Symbol("..<") => Some((9, Range)),
+        Symbol("+") => Some((10, Add)),
+        Symbol("-") => Some((10, Sub)),
+        Symbol("*") => Some((12, Mul)),
+        Symbol("/") => Some((12, Div)),
+        Symbol("%") => Some((12, Mod)),
+        // as in Go: `|` and `^` with `+`, `&` and the shifts with `*`, so
+        // `x & mask == 0` is `(x & mask) == 0`
+        Symbol("|") => Some((10, BitOr)),
+        Symbol("^") => Some((10, BitXor)),
+        Symbol("&") => Some((12, BitAnd)),
+        Symbol("<<") => Some((12, Shl)),
+        Symbol(">>") => Some((12, Shr)),
+        // tighter than arithmetic: `m.get(k) ?? 0 + 1` is `(m.get(k) ?? 0) + 1`
+        Symbol("??") => Some((14, Else)),
+        _ => None,
+    }
+}
+
+pub fn parse_expr(p: Parser) -> Parsed[ast.Expr] {
+    parse_bin(p, false, 0)
+}
+
+// An expression in the head of `if`, `while`, `for` or `match`, where `{`
+// opens the body: `if x == y {` does not read `y { ... }` as a struct.
+fn parse_expr_ns(p: Parser) -> Parsed[ast.Expr] {
+    parse_bin(p, true, 0)
+}
+
+// Operators that bind tighter than `min`. `|>` is the loosest (level 1,
+// left-associative) and may start a line, so a pipeline can be written one
+// step per line; any other operator must end the line to continue it.
+fn parse_bin(p: Parser, ns: Bool, min: Int) -> Parsed[ast.Expr] {
+    let (first, p) = parse_unary(p, ns)?
+    let mut lhs = first
+    let mut p = p
+    while true {
+        if p.is_sym("|>") {
+            if min >= 1 {
+                break
+            }
+            let (rhs, next) = parse_bin(p.skip(), ns, 1)?
+            if !ast.pipes_into(rhs) {
+                let e = error("E0003", rhs.span, "the right side of `|>` must be a function or a call, as in `x |> f`, `x |> f(a)` or `x |> list.map(g)`")
+                return Err(e.note("`x |> f(a)` means `f(x, a)`: the value goes in as the first argument"))
+            }
+            (lhs, p) = (mk(EPipe(lhs, rhs), merge(lhs.span, rhs.span)), next)
+        } else if p.nl() {
+            break
+        } else {
+            match binop(p.kind()) {
+                Some((level, op)) if level > min => {
+                    let (rhs, next) = parse_bin(p.skip(), ns, level)?
+                    (lhs, p) = (mk(EBin(op, lhs, rhs), merge(lhs.span, rhs.span)), next)
+                },
+                _ => {
+                    break
+                },
+            }
+        }
+    }
+    Ok((lhs, p))
+}
+
+fn parse_unary(p: Parser, ns: Bool) -> Parsed[ast.Expr] {
+    let start = p.span()
+    if p.is_sym("-") || p.is_sym("!") || p.is_sym("~") {
+        let op = if p.is_sym("-") { Neg } else if p.is_sym("!") { Not } else { BitNot }
+        let (e, p) = parse_unary(p.skip(), ns)?
+        return Ok((mk(EUn(op, e), merge(start, e.span)), p))
+    }
+    let (e, p) = parse_primary(p, ns)?
+    parse_postfix(p, ns, e, false)
+}
+
+// Calls, indexes, fields, methods, `?` and `?.` after `e`. With `in_safe`,
+// the rest of a `?.` chain is being parsed: it takes every postfix
+// operation up to a `?`, which applies to the whole chain.
+fn parse_postfix(p: Parser, ns: Bool, e: ast.Expr, in_safe: Bool) -> Parsed[ast.Expr] {
+    let mut p = p
+    let mut e = e
+    while true {
+        let nl = p.nl()
+        if p.is_sym("(") && !nl {
+            let (args, next) = call_args(p.skip(), ns)?
+            (e, p) = (mk(ECall(e, args), merge(e.span, next.last_span())), next)
+        } else if p.is_sym("\{") && !nl && is_lower_var(e) && starts_trailing(p, ns)? {
+            // `catch { ... }`: a trailing closure and no parentheses
+            let (closure, next) = trailing_closure(p, ns)?
+            (e, p) = (mk(ECall(e, closure), merge(e.span, next.last_span())), next)
+        } else if p.is_sym("[") && !nl {
+            let (index, next) = parse_expr(p.skip())?
+            let (close, next) = next.expect("]")?
+            (e, p) = (mk(EIndex(e, index), merge(e.span, p.span_of(close))), next)
+        } else if p.is_sym(".") {
+            (e, p) = parse_member(p.skip(), ns, e)?
+        } else if p.is_sym("?.") {
+            // safe navigation: the rest of the chain runs on the value
+            // inside the Option, and None short-circuits all of it
+            let hole_span = p.span()
+            let after = { p.skip() with safes: p.safes + 1 }
+            let name = "safe$" + after.safes.to_str()
+            let (member, next) = parse_member(after, ns, mk(EVar(name), hole_span))?
+            let (rest, next) = parse_postfix(next, ns, member, true)?
+            let node = mk(ESafe(e, name, rest), merge(e.span, rest.span))
+            if in_safe {
+                return Ok((node, next))
+            }
+            (e, p) = (node, next)
+        } else if p.is_sym("?") && !nl && !in_safe {
+            let mark = p.span()
+            let after = p.skip()
+            // `x? "reading config"`: a string on the same line adds context
+            // to the error
+            match after.kind() {
+                StrLit(_) if !after.nl() => {
+                    let (context, next) = parse_primary(after, ns)?
+                    (e, p) = (mk(ETry(e, Some(context)), merge(e.span, context.span)), next)
+                },
+                _ => {
+                    (e, p) = (mk(ETry(e, None), merge(e.span, mark)), after)
+                },
+            }
+        } else {
+            break
+        }
+    }
+    Ok((e, p))
+}
+
+// A plain lowercase name, the only callee a bare trailing closure can
+// follow: `Point { x: 1 }` is a struct literal.
+fn is_lower_var(e: ast.Expr) -> Bool {
+    match e.desc {
+        EVar(name) => !is_upper(name),
+        _ => false,
+    }
+}
+
+// `.name`, `.name(args)` or `.0`, after the dot.
+fn parse_member(p: Parser, ns: Bool, e: ast.Expr) -> Parsed[ast.Expr] {
+    match p.kind() {
+        IntLit(k) => {
+            let span = p.span()
+            Ok((mk(EField(e, k.to_str(), span), merge(e.span, span)), p.skip()))
+        },
+        _ => {
+            let (name, p) = p.expect_ident()?
+            if p.is_sym("(") && !p.nl() {
+                let (args, p) = call_args(p.skip(), ns)?
+                Ok((mk(EMethod(e, name.text, name.span, args), merge(e.span, p.last_span())), p))
+            } else if p.is_sym("\{") && !p.nl() && starts_trailing(p, ns)? {
+                // `items.each { |x| ... }`
+                let (closure, p) = trailing_closure(p, ns)?
+                Ok((mk(EMethod(e, name.text, name.span, closure), merge(e.span, p.last_span())), p))
+            } else {
+                Ok((mk(EField(e, name.text, name.span), merge(e.span, name.span)), p))
+            }
+        },
+    }
+}
+
+// The arguments of a call whose `(` has been read, with a trailing closure
+// after the `)` if there is one.
+fn call_args(p: Parser, ns: Bool) -> Parsed[List[ast.Expr]] {
+    let (args, p) = comma_list(p, ")", parse_arg)?
+    let (closure, p) = trailing_closure(p, ns)?
+    Ok((args + closure, p))
+}
+
+// A call argument: an expression, or `name: expression` naming the
+// parameter it is for.
+fn parse_arg(p: Parser) -> Parsed[ast.Expr] {
+    match (p.kind(), p.next_kind()) {
+        (Ident(name), Symbol(":")) => {
+            let name_span = p.span()
+            let (value, p) = parse_expr(p.skip().skip())?
+            Ok((mk(ENamed(name, name_span, value), merge(name_span, value.span)), p))
+        },
+        _ => parse_expr(p),
+    }
+}
+
+// Whether the `{` ahead starts a trailing closure. Not in the head of an
+// `if`, `while`, `for`, `match` or group deadline, where `{` opens the
+// body; there a closure goes inside the parentheses. A body that starts
+// with closure parameters is reported, since that is a trailing closure
+// written where it cannot go.
+fn starts_trailing(p: Parser, ns: Bool) -> Result[Bool, ParseError] {
+    if !ns {
+        return Ok(true)
+    }
+    match p.next_kind() {
+        Symbol("|" | "||") => {
+            let e = error("E0003", p.span(), "a trailing closure cannot be used in a condition")
+            Err(e.note("in the head of `if`, `while`, `for` and `match`, `\{` starts the body; pass the closure in parentheses, as in `xs.filter(|x| x > 0)`, or wrap the whole condition in parentheses"))
+        },
+        _ => Ok(false),
+    }
+}
+
+// `f(a) { |x| ... }`: a closure written after the call's parentheses,
+// passed as its last argument. The list holds it, or nothing when there is
+// none.
+fn trailing_closure(p: Parser, ns: Bool) -> Parsed[List[ast.Expr]] {
+    if !(p.is_sym("\{") && !p.nl() && starts_trailing(p, ns)?) {
+        return Ok(([], p))
+    }
+    let open = p.tok()
+    let p = p.skip()
+    let (params, p) = if p.is_sym("||") {
+        ([], p.skip())
+    } else if p.is_sym("|") {
+        comma_list(p.skip(), "|", closure_param)?
+    } else {
+        ([], p)
+    }
+    let (body, p) = parse_block_body(p, open)?
+    Ok(([mk(EClosure(params, mk(EBlock(body), body.span)), body.span)], p))
+}
+
+// `x` or `x: Int` between a closure's bars.
+fn closure_param(p: Parser) -> Parsed[ast.ClosureParam] {
+    let (name, p) = p.expect_ident()?
+    if p.is_sym(":") {
+        let (ty, p) = parse_type(p.skip())?
+        Ok((ast.ClosureParam { name: name.text, ty: Some(ty), span: name.span }, p))
+    } else {
+        Ok((ast.ClosureParam { name: name.text, ty: None, span: name.span }, p))
+    }
+}
+
+fn parse_primary(p: Parser, ns: Bool) -> Parsed[ast.Expr] {
+    let start = p.span()
+    match p.kind() {
+        IntLit(n) => Ok((mk(EInt(n), start), p.skip())),
+        FloatLit(text) => Ok((mk(EFloat(float_value(text)), start), p.skip())),
+        Keyword("true") => Ok((mk(EBool(true), start), p.skip())),
+        Keyword("false") => Ok((mk(EBool(false), start), p.skip())),
+        StrLit(parts) => {
+            let (parts, p) = string_parts(p.skip(), parts)?
+            Ok((mk(EStr(parts), start), p))
+        },
+        Ident(name) => {
+            let p = p.skip()
+            if !ns && is_upper(name) && p.is_sym("\{") {
+                parse_struct_lit(p, name, start)
+            } else if !ns && starts_module_struct(p) {
+                // a struct from another module: `json.Field { ... }`
+                let (b, p) = p.skip().expect_ident()?
+                parse_struct_lit(p, name + "." + b.text, merge(start, b.span))
+            } else {
+                Ok((mk(EVar(name), start), p))
+            }
+        },
+        Symbol("(") => parse_parens(p),
+        Symbol("[") => {
+            let (items, p) = comma_list(p.skip(), "]", parse_expr)?
+            Ok((mk(EList(items), merge(start, p.last_span())), p))
+        },
+        Symbol("\{") => {
+            if is_with_lit(p) {
+                parse_with(p)
+            } else {
+                let (b, p) = parse_block(p)?
+                Ok((mk(EBlock(b), b.span), p))
+            }
+        },
+        Keyword("if") => parse_if(p),
+        Keyword("match") => parse_match(p),
+        Keyword("select") => parse_select(p),
+        Symbol("|") => {
+            let (params, p) = comma_list(p.skip(), "|", closure_param)?
+            let (body, p) = parse_expr(p)?
+            Ok((mk(EClosure(params, body), merge(start, body.span)), p))
+        },
+        Symbol("||") => {
+            let (body, p) = parse_expr(p.skip())?
+            Ok((mk(EClosure([], body), merge(start, body.span)), p))
+        },
+        Keyword("group") => parse_group(p),
+        _ => Err(p.expected("an expression")),
+    }
+}
+
+// After a name: `.Upper {` on the same line, a struct from another module.
+fn starts_module_struct(p: Parser) -> Bool {
+    let upper_next = match p.next_kind() {
+        Ident(b) => is_upper(b),
+        _ => false,
+    }
+    let brace_on_line = !p.toks[(p.pos + 1).min(p.toks.len() - 1)].nl
+    p.is_sym(".") && upper_next && is_symbol(p.kind_at(p.pos + 2), "\{") && brace_on_line
+}
+
+// `()`, `(e)` or a tuple `(a, b)`.
+fn parse_parens(p: Parser) -> Parsed[ast.Expr] {
+    let start = p.span()
+    let p = p.skip()
+    if p.is_sym(")") {
+        return Ok((mk(EUnit, merge(start, p.span())), p.skip()))
+    }
+    let (first, p) = parse_expr(p)?
+    if !p.is_sym(",") {
+        let (close, p) = p.expect(")")?
+        return Ok(({ first with span: merge(start, p.span_of(close)) }, p))
+    }
+    let (rest, p) = comma_list(p.skip(), ")", parse_expr)?
+    let items = [first] + rest
+    let fields = items.with_index().map(|f| ast.FieldInit { name: f.0.to_str(), span: f.1.span, value: f.1 })
+    Ok((mk(EStruct(ast.tuple_name(items.len()), start, fields), merge(start, p.last_span())), p))
+}
+
+// The pieces of a string literal. The code of each interpolation is lexed
+// again, at its place in the file, and parsed as an expression.
+fn string_parts(p: Parser, parts: List[lexer.Part]) -> Parsed[List[ast.StrPart]] {
+    let mut p = p
+    let mut out: List[ast.StrPart] = []
+    for part in parts {
+        match part {
+            Lit(s) => out.push(SPLit(s)),
+            Interp(code, at) => {
+                let (e, next) = interpolation(p, code, at)?
+                out.push(SPExpr(e))
+                p = next
+            },
+        }
+    }
+    Ok((out, p))
+}
+
+fn interpolation(p: Parser, code: Str, at: Int) -> Parsed[ast.Expr] {
+    let toks = match lexer.lex_at(code, at) {
+        Ok(toks) => toks,
+        Err(e) => {
+            return Err(lex_error(e, p.file))
+        },
+    }
+    // its own tokens, but the file's count of `?.`
+    let (e, sub) = parse_expr(Parser { toks, pos: 0, safes: p.safes, file: p.file })?
+    if !sub.at_end() {
+        return Err(sub.expected("`\}` to close the interpolation"))
+    }
+    Ok((e, { p with safes: sub.safes }))
+}
+
+fn lex_error(e: lexer.LexError, file: Int) -> ParseError {
+    error(e.code, ast.Span { file, lo: e.lo, hi: e.hi }, e.message)
+}
+
+// At a `{`: is this `{ base with field: ... }` rather than a block? It is
+// when `with` follows the base on the first line, outside any brackets,
+// and is followed by a field: `with x:`, `with x,` or `with x }`.
+fn is_with_lit(p: Parser) -> Bool {
+    let n = p.toks.len()
+    let mut i = p.pos + 1
+    let mut depth = 0
+    while i < n {
+        let t = p.toks[i]
+        if depth == 0 && t.nl && i > p.pos + 1 {
+            return false
+        }
+        match t.kind {
+            End => {
+                return false
+            },
+            Symbol("(" | "[" | "\{") => {
+                depth = depth + 1
+            },
+            Symbol(")" | "]" | "\}") => {
+                if depth == 0 {
+                    return false
+                }
+                depth = depth - 1
+            },
+            Symbol(";") if depth == 0 => {
+                return false
+            },
+            Ident("with") if depth == 0 && i > p.pos + 1 && i + 2 < n && is_with_field(p.toks[i + 1].kind, p.toks[i + 2].kind) => {
+                return true
+            },
+            _ => (),
+        }
+        i = i + 1
+    }
+    false
+}
+
+fn is_with_field(name: lexer.Kind, after: lexer.Kind) -> Bool {
+    match (name, after) {
+        (Ident(_), Symbol(":" | "," | "\}")) => true,
+        _ => false,
+    }
+}
+
+fn parse_with(p: Parser) -> Parsed[ast.Expr] {
+    let (open, p) = p.expect("\{")?
+    let (base, p) = parse_expr(p)?
+    if !p.is_word("with") {
+        return Err(p.expected("`with`"))
+    }
+    let (fields, p) = comma_list(p.skip(), "\}", field_init)?
+    Ok((mk(EWith(base, fields), merge(p.span_of(open), p.last_span())), p))
+}
+
+// `name: value`, or `name` alone for `name: name`.
+fn field_init(p: Parser) -> Parsed[ast.FieldInit] {
+    let (f, p) = p.expect_ident()?
+    if p.is_sym(":") {
+        let (value, p) = parse_expr(p.skip())?
+        Ok((ast.FieldInit { name: f.text, span: f.span, value }, p))
+    } else {
+        Ok((ast.FieldInit { name: f.text, span: f.span, value: mk(EVar(f.text), f.span) }, p))
+    }
+}
+
+fn parse_struct_lit(p: Parser, name: Str, name_span: ast.Span) -> Parsed[ast.Expr] {
+    let p = p.need("\{")?
+    let (fields, p) = comma_list(p, "\}", field_init)?
+    Ok((mk(EStruct(name, name_span, fields), merge(name_span, p.last_span())), p))
+}
+
+fn parse_if(p: Parser) -> Parsed[ast.Expr] {
+    let (t, p) = p.expect_kw("if")?
+    let (cond, p) = parse_expr_ns(p)?
+    let (then, p) = parse_block(p)?
+    if !p.is_kw("else") {
+        return Ok((mk(EIf(cond, then, None), merge(p.span_of(t), then.span)), p))
+    }
+    let p = p.skip()
+    let (other, p) = if p.is_kw("if") {
+        parse_if(p)?
+    } else {
+        let (b, p) = parse_block(p)?
+        (mk(EBlock(b), b.span), p)
+    }
+    Ok((mk(EIf(cond, then, Some(other)), merge(p.span_of(t), other.span)), p))
+}
+
+// `if cond` after a pattern or a select operation.
+fn parse_guard(p: Parser) -> Parsed[Option[ast.Expr]] {
+    if p.is_kw("if") {
+        let (g, p) = parse_expr(p.skip())?
+        Ok((Some(g), p))
+    } else {
+        Ok((None, p))
+    }
+}
+
+// After an arm of a `match` or `select`: a `,`, a new line or the `}`.
+fn arm_end(p: Parser, what: Str) -> Result[Parser, ParseError] {
+    if p.is_sym(",") {
+        Ok(p.skip())
+    } else if p.is_sym("\}") || p.nl() {
+        Ok(p)
+    } else {
+        Err(p.expected("`,` or a new line between {what}"))
+    }
+}
+
+fn parse_match(p: Parser) -> Parsed[ast.Expr] {
+    let (t, p) = p.expect_kw("match")?
+    let (subject, p) = parse_expr_ns(p)?
+    let mut p = p.need("\{")?
+    let mut arms: List[ast.Arm] = []
+    while !p.is_sym("\}") {
+        let (pat, next) = parse_pat(p)?
+        let (guard, next) = parse_guard(next)?
+        let (body, next) = parse_expr(next.need("=>")?)?
+        arms.push(ast.Arm { pat, guard, body })
+        p = arm_end(next, "match arms")?
+    }
+    Ok((mk(EMatch(subject, arms), merge(p.span_of(t), p.span())), p.skip()))
+}
+
+fn parse_select(p: Parser) -> Parsed[ast.Expr] {
+    let (t, p) = p.expect_kw("select")?
+    let mut p = p.need("\{")?
+    let mut arms: List[ast.SelArm] = []
+    while !p.is_sym("\}") {
+        let start = p.span()
+        let (op, next) = select_op(p)?
+        let (guard, next) = parse_guard(next)?
+        let (body, next) = parse_expr(next.need("=>")?)?
+        arms.push(ast.SelArm { op, guard, body, span: merge(start, body.span) })
+        p = arm_end(next, "select arms")?
+    }
+    Ok((mk(ESelect(arms), merge(p.span_of(t), p.span())), p.skip()))
+}
+
+// What a `select` arm waits for: `v = ch.recv()`, `ch.recv()`,
+// `ch.send(x)`, `clock.after(ms)` or `_`.
+fn select_op(p: Parser) -> Parsed[ast.SelOp] {
+    match (p.kind(), p.next_kind()) {
+        (Ident("_"), Symbol("=>")) => Ok((SelDefault, p.skip())),
+        (Ident(name), Symbol("=")) => {
+            let bound = if name == "_" { None } else { Some(ast.Name { text: name, span: p.span() }) }
+            let (e, p) = parse_expr(p.skip().skip())?
+            match e.desc {
+                EMethod(ch, "recv", _, []) => Ok((SelRecv(bound, ch), p)),
+                _ => Err(error("E0003", e.span, "a `select` arm receives with `name = ch.recv()`")),
+            }
+        },
+        _ => {
+            let (e, p) = parse_expr(p)?
+            match e.desc {
+                EMethod(ch, "recv", _, []) => Ok((SelRecv(None, ch), p)),
+                EMethod(ch, "send", _, [value]) => Ok((SelSend(ch, value), p)),
+                EMethod(clock, "after", _, [ms]) => Ok((SelAfter(clock, ms), p)),
+                _ => Err(error("E0003", e.span, "a `select` arm is `name = ch.recv()`, `ch.send(value)`, `clock.after(ms)` (a timeout) or `_` (when nothing is ready)")),
+            }
+        },
+    }
+}
+
+// `group g interleaved until clock.after(ms) { ... }`
+fn parse_group(p: Parser) -> Parsed[ast.Expr] {
+    let start = p.span()
+    let (name, p) = p.skip().expect_ident()?
+    let interleaved = p.is_word("interleaved")
+    let p = if interleaved { p.skip() } else { p }
+    let (until, p) = if p.is_word("until") {
+        let (d, p) = parse_expr_ns(p.skip())?
+        match d.desc {
+            EMethod(clock, "after", _, [ms]) => (Some(ast.Deadline { clock, ms }), p),
+            _ => {
+                return Err(error("E0003", d.span, "a group deadline is `group g until clock.after(ms) \{ ... \}`"))
+            },
+        }
+    } else {
+        (None, p)
+    }
+    let (body, p) = parse_block(p)?
+    Ok((mk(EGroup(name.text, interleaved, until, body), merge(start, body.span)), p))
+}
+
+// ---------- patterns ----------
+
+fn pat(desc: ast.PatDesc, span: ast.Span) -> ast.Pat {
+    ast.Pat { desc, span }
+}
+
+// A pattern, with alternatives: `A | B`, and a name for the whole: `p as
+// name`, which takes in every alternative before it (`A | B as x` is
+// `(A | B) as x`). Alternatives inside alternatives, `(A | B) | C`, are
+// flattened into one list.
+fn parse_pat(p: Parser) -> Parsed[ast.Pat] {
+    let (first, p) = parse_pat1(p)?
+    let (whole, p) = if !p.is_sym("|") {
+        (first, p)
+    } else {
+        let mut alts = alternatives(first)
+        let mut p = p
+        while p.is_sym("|") {
+            let (alt, next) = parse_pat1(p.skip())?
+            (alts, p) = (alts + alternatives(alt), next)
+        }
+        (pat(POr(alts), merge(first.span, p.last_span())), p)
+    }
+    if !p.is_word("as") {
+        return Ok((whole, p))
+    }
+    let (name, p) = p.skip().expect_ident()?
+    if name.text == "_" {
+        return Err(error("E0003", name.span, "`as` needs a name for the value; `as _` names nothing, so leave it out"))
+    }
+    Ok((pat(PAs(whole, name.text, name.span), merge(whole.span, name.span)), p))
+}
+
+// The fields of a struct pattern after its `\{`: `x`, `x: pattern`, and a
+// last `..` for the fields not named; whether there is a `..`.
+fn struct_pat_fields(p: Parser) -> Parsed[(List[ast.FieldPat], Bool)] {
+    let mut p = p
+    let mut fields: List[ast.FieldPat] = []
+    let mut rest = false
+    while !p.is_sym("\}") {
+        if rest {
+            return Err(error("E0003", p.span(), "`..` comes last in a struct pattern"))
+        }
+        if p.is_sym("..") {
+            rest = true
+            p = p.skip()
+        } else {
+            let (name, next) = p.expect_ident()?
+            let (q, next) = if next.is_sym(":") { parse_pat(next.skip())? } else { (pat(PBind(name.text), name.span), next) }
+            fields.push(ast.FieldPat { name: name.text, span: name.span, pat: q })
+            p = next
+        }
+        if p.is_sym(",") {
+            p = p.skip()
+        } else if !p.is_sym("\}") && !p.nl() {
+            return Err(p.expected("`,` or `\}`"))
+        }
+    }
+    Ok(((fields, rest), p.skip()))
+}
+
+fn alternatives(p: ast.Pat) -> List[ast.Pat] {
+    match p.desc {
+        POr(alts) => alts,
+        _ => [p],
+    }
+}
+
+// The items of a tuple, variant or list pattern up to `close`: patterns,
+// and at most one `..` for the rest, which a list pattern can name:
+// `[first, ..rest]`. This is comma_list, written out, because a second
+// `..` is an error the moment it is read.
+fn pat_items(p: Parser, close: Str, list: Bool) -> Parsed[List[ast.Pat]] {
+    let mut p = p
+    let mut items: List[ast.Pat] = []
+    let mut seen = false
+    while !p.is_sym(close) {
+        let (item, next) = if p.is_sym("..") {
+            if seen {
+                return Err(error("E0003", p.span(), "a pattern can have only one `..`"))
+            }
+            seen = true
+            rest_item(p, list)?
+        } else {
+            parse_pat(p)?
+        }
+        items.push(item)
+        p = next
+        if p.is_sym(",") {
+            p = p.skip()
+        } else if !p.is_sym(close) && !p.nl() {
+            return Err(p.expected("`,` or `{close}`"))
+        }
+    }
+    Ok((items, p.skip()))
+}
+
+// `..`, or in a list `..name`, at the `..`.
+fn rest_item(p: Parser, list: Bool) -> Parsed[ast.Pat] {
+    let dots = p.span()
+    let p = p.skip()
+    match p.kind() {
+        Ident(name) if name != "_" && !p.nl() => {
+            let span = merge(dots, p.span())
+            if !list {
+                let e = error("E0003", span, "only a list pattern can name the rest, as in `[first, ..rest]`")
+                return Err(e.note("here `..` alone stands for the remaining parts"))
+            }
+            Ok((pat(PRest(Some(name)), span), p.skip()))
+        },
+        _ => Ok((pat(PRest(None), dots), p)),
+    }
+}
+
+fn is_rest(p: ast.Pat) -> Bool {
+    match p.desc {
+        PRest(_) => true,
+        _ => false,
+    }
+}
+
+fn parse_pat1(p: Parser) -> Parsed[ast.Pat] {
+    let t = p.tok()
+    let start = p.span_of(t)
+    match t.kind {
+        Ident("_") => Ok((pat(PWild, start), p.skip())),
+        IntLit(n) => Ok((pat(PInt(n), start), p.skip())),
+        Symbol("-") => {
+            let p = p.skip()
+            match p.kind() {
+                IntLit(n) => Ok((pat(PInt(-n), merge(start, p.span())), p.skip())),
+                _ => Err(p.expected("a number")),
+            }
+        },
+        // a string without interpolation: one piece, or none for `""`
+        StrLit([]) => Ok((pat(PStr(""), start), p.skip())),
+        StrLit([Lit(s)]) => Ok((pat(PStr(s), start), p.skip())),
+        StrLit(_) => Err(p.unexpected(t, "a plain string (no interpolation) in a pattern")),
+        Keyword("true") => Ok((pat(PBool(true), start), p.skip())),
+        Keyword("false") => Ok((pat(PBool(false), start), p.skip())),
+        Ident(first) => {
+            let p = p.skip()
+            // `Shape.Rect` names the enum too
+            let (qualifier, variant, p) = if p.is_sym(".") {
+                let (v, p) = p.skip().expect_ident()?
+                (Some(first), v, p)
+            } else {
+                (None, ast.Name { text: first, span: start }, p)
+            }
+            if p.is_sym("(") {
+                let (args, p) = pat_items(p.skip(), ")", false)?
+                Ok((pat(PVariant(qualifier, variant.text, args), merge(start, p.last_span())), p))
+            } else if p.is_sym("\{") && is_upper(variant.text) {
+                // a struct pattern: `Point \{ x, y: 0, .. }`, `geo.Point \{ .. }`
+                let ((fields, rest), p) = struct_pat_fields(p.skip())?
+                let name = match qualifier {
+                    Some(m) => m + "." + variant.text,
+                    None => variant.text,
+                }
+                Ok((pat(PStruct(name, merge(start, variant.span), fields, rest), merge(start, p.last_span())), p))
+            } else if qualifier.is_some() || is_upper(variant.text) {
+                Ok((pat(PVariant(qualifier, variant.text, []), merge(start, variant.span)), p))
+            } else {
+                Ok((pat(PBind(variant.text), start), p))
+            }
+        },
+        Symbol("(") => {
+            let (items, p) = pat_items(p.skip(), ")", false)?
+            let span = merge(start, p.last_span())
+            // `(p)` is p, but `(..)` is a tuple
+            match items {
+                [one] if !is_rest(one) => Ok(({ one with span }, p)),
+                _ => Ok((pat(PTuple(items), span), p)),
+            }
+        },
+        Symbol("[") => {
+            let (items, p) = pat_items(p.skip(), "]", true)?
+            Ok((pat(PList(items), merge(start, p.last_span())), p))
+        },
+        _ => Err(p.unexpected(t, "a pattern")),
+    }
+}
+
+// Names and `_`, in tuples or alone: what `let` and `for` can unpack.
+fn irrefutable_tuple(p: ast.Pat) -> Bool {
+    match p.desc {
+        PBind(_) | PWild => true,
+        PTuple(items) => items.all(|x| irrefutable_tuple(x)),
+        _ => false,
+    }
+}
+
+// ---------- blocks and statements ----------
+
+fn parse_block(p: Parser) -> Parsed[ast.Block] {
+    let (open, p) = p.expect("\{")?
+    parse_block_body(p, open)
+}
+
+// The statements of a block whose `{` (`open`) has been read. The last
+// expression, without a `;`, is the block's value.
+fn parse_block_body(p: Parser, open: lexer.Token) -> Parsed[ast.Block] {
+    let mut p = p
+    let mut stmts: List[ast.Stmt] = []
+    let mut tail: Option[ast.Expr] = None
+    while !p.is_sym("\}") {
+        let (s, next) = parse_stmt(p)?
+        let semi = next.is_sym(";")
+        p = if semi { next.skip() } else { next }
+        if p.is_sym("\}") {
+            match s.desc {
+                SExpr(e) if !semi => {
+                    tail = Some(e)
+                },
+                _ => stmts.push(s),
+            }
+        } else {
+            if !semi && !p.nl() {
+                return Err(error("E0004", p.span(), "expected a new line or `;` before {describe(p.kind())}"))
+            }
+            stmts.push(s)
+        }
+    }
+    let (close, p) = p.expect("\}")?
+    Ok((ast.Block { stmts, tail, span: merge(p.span_of(open), p.span_of(close)) }, p))
+}
+
+fn stmt(desc: ast.StmtDesc, span: ast.Span) -> ast.Stmt {
+    ast.Stmt { desc, span }
+}
+
+fn parse_stmt(p: Parser) -> Parsed[ast.Stmt] {
+    let start = p.span()
+    match p.kind() {
+        Keyword("let") => parse_let(p),
+        Keyword("return") => {
+            let p = p.skip()
+            if p.nl() || p.is_sym("\}") || p.is_sym(";") {
+                return Ok((stmt(SReturn(None), start), p))
+            }
+            let (e, p) = parse_expr(p)?
+            Ok((stmt(SReturn(Some(e)), merge(start, e.span)), p))
+        },
+        Keyword("while") => {
+            let (cond, p) = parse_expr_ns(p.skip())?
+            let (body, p) = parse_block(p)?
+            Ok((stmt(SWhile(cond, body), merge(start, body.span)), p))
+        },
+        Keyword("for") => parse_for(p),
+        Keyword("break") => Ok((stmt(SBreak, start), p.skip())),
+        Keyword("continue") => Ok((stmt(SContinue, start), p.skip())),
+        Keyword("defer") => parse_defer(p),
+        _ => {
+            let (e, p) = parse_expr(p)?
+            if p.is_sym("=") {
+                let (value, p) = parse_expr(p.skip())?
+                Ok((stmt(SAssign(e, value), merge(e.span, value.span)), p))
+            } else {
+                Ok((stmt(SExpr(e), e.span), p))
+            }
+        },
+    }
+}
+
+fn parse_let(p: Parser) -> Parsed[ast.Stmt] {
+    let start = p.span()
+    let p = p.skip()
+    let mutable = p.is_kw("mut")
+    let p = if mutable { p.skip() } else { p }
+    if p.is_sym("(") {
+        // `let (a, b) = e`
+        let (unpack, p) = parse_pat(p)?
+        if !irrefutable_tuple(unpack) {
+            return Err(error("E0003", unpack.span, "`let` can only unpack a tuple into names and `_`, as in `let (a, _) = t`"))
+        }
+        let (e, p) = parse_expr(p.need("=")?)?
+        return Ok((stmt(SLetPat(unpack, e), merge(start, e.span)), p))
+    }
+    if p.is_sym("[") {
+        // `let [a, b] = xs`: a list can have any length
+        let (list, _) = parse_pat(p)?
+        return Err(error("E0003", list.span, "`let` cannot unpack a list: list patterns need `match`").note("a list can have any length, so take it apart with `match`, as in `match xs \{ [a, b] => ..., _ => ... }`"))
+    }
+    let (name, p) = p.expect_ident()?
+    let (ann, p) = if p.is_sym(":") {
+        let (ty, p) = parse_type(p.skip())?
+        (Some(ty), p)
+    } else {
+        (None, p)
+    }
+    let (e, p) = parse_expr(p.need("=")?)?
+    Ok((stmt(SLet(mutable, name.text, name.span, ann, e), merge(start, e.span)), p))
+}
+
+fn parse_for(p: Parser) -> Parsed[ast.Stmt] {
+    let start = p.span()
+    let p = p.skip()
+    if p.is_sym("(") {
+        // `for (k, v) in m.entries() { ... }`
+        let (unpack, p) = parse_pat(p)?
+        if !irrefutable_tuple(unpack) {
+            return Err(error("E0003", unpack.span, "`for` can only unpack a tuple into names and `_`, as in `for (k, v) in m.entries()`"))
+        }
+        let (list, p) = parse_expr_ns(p.need_kw("in")?)?
+        let (body, p) = parse_block(p)?
+        return Ok((stmt(SForPat(unpack, list, body), merge(start, body.span)), p))
+    }
+    let (name, p) = p.expect_ident()?
+    let (list, p) = parse_expr_ns(p.need_kw("in")?)?
+    let (body, p) = parse_block(p)?
+    Ok((stmt(SFor(name.text, name.span, list, body), merge(start, body.span)), p))
+}
+
+// `defer { ... }`, or one expression or assignment: `defer f.close()`,
+// `defer n = n + 1`.
+fn parse_defer(p: Parser) -> Parsed[ast.Stmt] {
+    let start = p.span()
+    let p = p.skip()
+    if p.is_sym("\{") {
+        let (body, p) = parse_block(p)?
+        return Ok((stmt(SDefer(body), merge(start, body.span)), p))
+    }
+    let (s, p) = parse_stmt(p)?
+    let useless_let = error("E0003", s.span, "a `let` after `defer` would bind a name nothing can use").note("wrap statements in braces: `defer \{ ... \}`")
+    match s.desc {
+        SExpr(e) => Ok((stmt(SDefer(ast.Block { stmts: [], tail: Some(e), span: e.span }), merge(start, e.span)), p)),
+        SLet(..) | SLetPat(..) => Err(useless_let),
+        _ => Ok((stmt(SDefer(ast.Block { stmts: [s], tail: None, span: s.span }), merge(start, s.span)), p)),
+    }
+}
+
+// ---------- items ----------
+
+// `[A, B: Shape + Show]`: type parameters, and the interfaces each must
+// satisfy, written as types: `Shape`, `geo.Area`, `Container[Int]`.
+fn bounded_generics(p: Parser) -> Parsed[List[ast.Bound]] {
+    if p.is_sym("[") {
+        comma_list(p.skip(), "]", generic_param)
+    } else {
+        Ok(([], p))
+    }
+}
+
+fn generic_param(p: Parser) -> Parsed[ast.Bound] {
+    let (g, p) = p.expect_ident()?
+    if !p.is_sym(":") {
+        return Ok((ast.Bound { name: g.text, ifaces: [] }, p))
+    }
+    let (first, p) = parse_bound(p.skip())?
+    let mut ifaces = [first]
+    let mut p = p
+    while p.is_sym("+") {
+        let (b, next) = parse_bound(p.skip())?
+        ifaces.push(b)
+        p = next
+    }
+    Ok((ast.Bound { name: g.text, ifaces }, p))
+}
+
+fn parse_bound(p: Parser) -> Parsed[ast.TyExpr] {
+    let start = p.span()
+    let (b, p) = parse_type(p)?
+    match b.desc {
+        TyName(name, _) if name != "dyn" && !ast.is_tuple_name(name) => Ok((b, p)),
+        _ => Err(error("E0003", start, "a bound is an interface, as in `Shape` or `Container[Int]`")),
+    }
+}
+
+fn names(gs: List[ast.Bound]) -> List[Str] {
+    gs.map(|g| g.name)
+}
+
+// The parameters that have bounds; the tree lists only those.
+fn bounds(gs: List[ast.Bound]) -> List[ast.Bound] {
+    gs.filter(|g| !g.ifaces.is_empty())
+}
+
+// The type parameters of an interface or an alias, which take no bounds.
+fn plain_generics(p: Parser) -> Parsed[List[Str]] {
+    let start = p.span()
+    let (gs, p) = bounded_generics(p)?
+    if !bounds(gs).is_empty() {
+        return Err(error("E0003", start, "bounds go on the type parameters of a function, struct or enum"))
+    }
+    Ok((names(gs), p))
+}
+
+fn parse_param(p: Parser) -> Parsed[ast.Param] {
+    let (name, p) = p.expect_ident()?
+    if !p.is_sym(":") {
+        return Err(missing_type(name))
+    }
+    let (ty, p) = parse_type(p.skip())?
+    Ok((ast.Param { name: name.text, span: name.span, ty }, p))
+}
+
+fn missing_type(name: ast.Name) -> ParseError {
+    error("E0008", name.span, "parameter `{name.text}` needs a type, for example `{name.text}: Int`")
+}
+
+fn parse_ret(p: Parser) -> Parsed[Option[ast.TyExpr]] {
+    if p.is_sym("->") {
+        let (ty, p) = parse_type(p.skip())?
+        Ok((Some(ty), p))
+    } else {
+        Ok((None, p))
+    }
+}
+
+// One item. `number` is what a test or benchmark here would be numbered:
+// they are named `test#1`, `bench#2`, ..., which source cannot write, so
+// they cannot be called.
+fn parse_item(p: Parser, number: Int) -> Parsed[ast.Item] {
+    let t = p.tok()
+    match (t.kind, p.next_kind()) {
+        (Ident(kind), StrLit(_)) if kind == "test" || kind == "bench" => {
+            let (d, p) = parse_test(p, kind, number)?
+            Ok((IFn(d), p))
+        },
+        (Keyword("fn"), _) => parse_fn(p),
+        (Keyword("struct"), _) => parse_struct(p),
+        (Keyword("enum"), _) => parse_enum(p),
+        (Keyword("interface"), _) => parse_interface(p),
+        // `type` is a word only here, so it stays usable as a name elsewhere
+        (Ident("type"), Ident(_)) => {
+            let (name, p) = p.skip().expect_ident()?
+            let (generics, p) = plain_generics(p)?
+            let (body, p) = parse_type(p.need("=")?)?
+            Ok((IType(ast.AliasDecl { name: name.text, span: name.span, generics, body, public: false }), p))
+        },
+        _ => Err(p.unexpected(t, "an item (`fn`, `struct`, `enum`, `interface` or `type`)")),
+    }
+}
+
+fn parse_test(p: Parser, kind: Str, number: Int) -> Parsed[ast.FnDecl] {
+    let s = p.skip().tok()
+    let p = p.skip().skip()
+    let name = match s.kind {
+        StrLit([]) => "",
+        StrLit([Lit(n)]) => n,
+        _ => {
+            return Err(error("E0003", p.span_of(s), "a {kind} name must be a plain string, without interpolation"))
+        },
+    }
+    // the capabilities the runner hands the test: `(fs: Fs, clock: Clock)`;
+    // `clock: virtual Clock` asks for a clock on virtual time
+    let (params, p) = if p.is_sym("(") { comma_list(p.skip(), ")", test_param)? } else { ([], p) }
+    let (table, p) = if kind == "test" && p.is_kw("for") { parse_table(p)? } else { (None, p) }
+    let (body, p) = parse_block(p)?
+    let d = ast.FnDecl {
+        name: "{kind}#{number}",
+        span: p.span_of(s),
+        generics: [],
+        params: params.map(|x| x.param),
+        ret: None,
+        body,
+        test: Some(name),
+        bench: kind == "bench",
+        virtual: params.any(|x| x.virtual),
+        table,
+        public: false,
+        bounds: [],
+        foreign: None,
+    }
+    Ok((d, p))
+}
+
+// A test's parameter, and whether it asked for virtual time.
+struct TestParam {
+    param: ast.Param,
+    virtual: Bool,
+}
+
+fn test_param(p: Parser) -> Parsed[TestParam] {
+    let (name, p) = p.expect_ident()?
+    if !p.is_sym(":") {
+        return Err(missing_type(name))
+    }
+    let p = p.skip()
+    let virtual = p.is_word("virtual")
+    if virtual {
+        match p.next_kind() {
+            Ident("Clock") => (),
+            _ => {
+                return Err(error("E0003", p.span(), "only a test's clock can be virtual: `clock: virtual Clock`"))
+            },
+        }
+    }
+    let (ty, p) = parse_type(if virtual { p.skip() } else { p })?
+    Ok((TestParam { param: ast.Param { name: name.text, span: name.span, ty }, virtual }, p))
+}
+
+// A table test: `for (a, b, want) in [(1, 2, 3), (2, 2, 4)]`, each case
+// run on its own.
+fn parse_table(p: Parser) -> Parsed[Option[ast.Table]] {
+    let start = p.span()
+    let (unpack, p) = parse_pat(p.skip())?
+    if !irrefutable_tuple(unpack) {
+        return Err(error("E0003", unpack.span, "a table test names each case's parts, as in `for (a, b, want) in [(1, 2, 3)]`"))
+    }
+    let (cases, p) = parse_expr_ns(p.need_kw("in")?)?
+    match cases.desc {
+        EList([_, ..]) => Ok((Some(ast.Table { pat: unpack, cases }), p)),
+        EList([]) => Err(error("E0003", merge(start, cases.span), "a table test needs at least one case")),
+        _ => {
+            let e = error("E0003", cases.span, "a table test lists its cases in place, as in `for (a, want) in [(1, 2), (2, 4)]`")
+            Err(e.note("each case runs on its own and is named by its text, so the cases must be written out"))
+        },
+    }
+}
+
+fn parse_fn(p: Parser) -> Parsed[ast.Item] {
+    let (name, p) = p.skip().expect_ident()?
+    let (gs, p) = bounded_generics(p)?
+    let (params, p) = comma_list(p.need("(")?, ")", parse_param)?
+    let (ret, p) = parse_ret(p)?
+    let (body, p) = parse_block(p)?
+    let d = ast.FnDecl {
+        name: name.text,
+        span: name.span,
+        generics: names(gs),
+        params,
+        ret,
+        body,
+        test: None,
+        bench: false,
+        virtual: false,
+        table: None,
+        public: false,
+        bounds: bounds(gs),
+        foreign: None,
+    }
+    Ok((IFn(d), p))
+}
+
+fn parse_struct(p: Parser) -> Parsed[ast.Item] {
+    let (name, p) = p.skip().expect_ident()?
+    let (gs, p) = bounded_generics(p)?
+    let (fields, p) = comma_list(p.need("\{")?, "\}", struct_field)?
+    let d = ast.StructDecl {
+        name: name.text,
+        span: name.span,
+        generics: names(gs),
+        fields: fields.map(|f| f.field),
+        bounds: bounds(gs),
+        embeds: fields.filter(|f| f.embedded).map(|f| f.field.name),
+        public: false,
+        foreign: None,
+    }
+    Ok((IStruct(d), p))
+}
+
+struct StructField {
+    field: ast.Field,
+    embedded: Bool,
+}
+
+// A field is `name: Type`, or a bare struct type that is embedded: `User`,
+// `auth.User`, `Pair[Int]`, stored as a field named `User`.
+fn struct_field(p: Parser) -> Parsed[StructField] {
+    if is_symbol(p.next_kind(), ":") || !starts_embedded(p) {
+        let (f, p) = typed_field(p)?
+        return Ok((StructField { field: f, embedded: false }, p))
+    }
+    let (ty, p) = parse_type(p)?
+    let name = match ty.desc {
+        // `auth.User` is the field `User`
+        TyName(n, _) => n.slice((n.last_index_of(".") ?? -1) + 1, n.len()),
+        _ => "",
+    }
+    Ok((StructField { field: ast.Field { name, span: ty.span, ty }, embedded: true }, p))
+}
+
+// An uppercase name, or `module.Upper`.
+fn starts_embedded(p: Parser) -> Bool {
+    match (p.kind(), p.next_kind(), p.kind_at(p.pos + 2)) {
+        (Ident(n), _, _) if is_upper(n) => true,
+        (Ident(_), Symbol("."), Ident(b)) => is_upper(b),
+        _ => false,
+    }
+}
+
+// `name: Type`
+fn typed_field(p: Parser) -> Parsed[ast.Field] {
+    let (f, p) = p.expect_ident()?
+    let (ty, p) = parse_type(p.need(":")?)?
+    Ok((ast.Field { name: f.text, span: f.span, ty }, p))
+}
+
+fn parse_enum(p: Parser) -> Parsed[ast.Item] {
+    let (name, p) = p.skip().expect_ident()?
+    let (gs, p) = bounded_generics(p)?
+    let (variants, p) = comma_list(p.need("\{")?, "\}", parse_variant)?
+    Ok((IEnum(ast.EnumDecl { name: name.text, span: name.span, generics: names(gs), variants, bounds: bounds(gs), public: false }), p))
+}
+
+fn parse_variant(p: Parser) -> Parsed[ast.Variant] {
+    let (v, p) = p.expect_ident()?
+    let (payload, p) = if p.is_sym("(") { comma_list(p.skip(), ")", parse_type)? } else { ([], p) }
+    Ok((ast.Variant { name: v.text, span: v.span, payload }, p))
+}
+
+fn parse_interface(p: Parser) -> Parsed[ast.Item] {
+    let (name, p) = p.skip().expect_ident()?
+    let (generics, p) = plain_generics(p)?
+    let (methods, p) = comma_list(p.need("\{")?, "\}", parse_method)?
+    Ok((IIface(ast.IfaceDecl { name: name.text, span: name.span, generics, methods, public: false }), p))
+}
+
+// `fn name(self, x: T) -> R` in an interface.
+fn parse_method(p: Parser) -> Parsed[ast.Method] {
+    if !p.is_kw("fn") {
+        return Err(p.expected("`fn name(self, ...)` in an interface"))
+    }
+    let (name, p) = p.skip().expect_ident()?
+    let p = p.need("(")?
+    if !p.is_word("self") {
+        return Err(error("E0003", p.span(), "an interface method's first parameter is `self`, without a type"))
+    }
+    let p = p.skip()
+    let (params, p) = if p.is_sym(",") { comma_list(p.skip(), ")", method_param)? } else { ([], p.need(")")?) }
+    let (ret, p) = parse_ret(p)?
+    Ok((ast.Method { name: name.text, span: name.span, params, ret }, p))
+}
+
+fn method_param(p: Parser) -> Parsed[ast.Param] {
+    let (f, p) = typed_field(p)?
+    Ok((ast.Param { name: f.name, span: f.span, ty: f.ty }, p))
+}
+
+// ---------- foreign blocks ----------
+
+// `foreign "lib" { fn name(p: T, ...) -> R  ... }`: C functions from library
+// `lib`, each with a signature and no body. `pub fn` exports one. A `...`
+// among the parameters makes the function variadic: the parameters after it
+// are the variadic arguments this declaration passes. `= "sym"` after the
+// signature names the C function when it differs from the Limen name. A
+// `struct Name { field: T, ... }` in the block declares a C struct passed by
+// value.
+fn parse_foreign(p: Parser) -> Parsed[List[ast.Item]] {
+    let s = p.skip().tok()
+    let lib = match s.kind {
+        StrLit([Lit(l)]) => l,
+        _ => {
+            return Err(error("E0003", p.span_of(s), "a foreign library name must be a plain string, as in `foreign \"sqlite3\" \{ ... \}`"))
+        },
+    }
+    let mut p = p.skip().skip().need("\{")?
+    let mut items: List[ast.Item] = []
+    while !p.is_sym("\}") {
+        if p.at_end() {
+            return Err(p.expected("`\}` to end the foreign block"))
+        }
+        let public = p.is_kw("pub")
+        let q = if public { p.skip() } else { p }
+        let (item, next) = if q.is_kw("struct") { foreign_struct(q, lib, public)? } else { foreign_fn(q, lib, public)? }
+        items.push(item)
+        // one declaration per line (or separated by `;`)
+        if next.is_sym(";") {
+            p = next.skip()
+        } else if next.is_sym("\}") || next.nl() {
+            p = next
+        } else {
+            return Err(next.expected("a new line after a foreign declaration"))
+        }
+    }
+    Ok((items, p.skip()))
+}
+
+fn foreign_struct(p: Parser, lib: Str, public: Bool) -> Parsed[ast.Item] {
+    let (name, p) = p.skip().expect_ident()?
+    if p.is_sym("[") {
+        return Err(error("E0003", p.span(), "a foreign struct cannot have type parameters"))
+    }
+    let (fields, p) = comma_list(p.need("\{")?, "\}", typed_field)?
+    let d = ast.StructDecl { name: name.text, span: name.span, generics: [], fields, bounds: [], embeds: [], public, foreign: Some(ast.ForeignStruct { lib, types: fields.map(|f| f.ty) }) }
+    Ok((IStruct(d), p))
+}
+
+fn foreign_fn(p: Parser, lib: Str, public: Bool) -> Parsed[ast.Item] {
+    if !p.is_kw("fn") {
+        return Err(p.expected("`fn name(...) -> Type` or `struct Name \{ ... \}` in a foreign block"))
+    }
+    let (name, p) = p.skip().expect_ident()?
+    if p.is_sym("[") {
+        return Err(error("E0003", p.span(), "a foreign function cannot have type parameters"))
+    }
+    let (sig, p) = foreign_params(p.need("(")?)?
+    for param in sig.params {
+        if param.name == "self" {
+            return Err(error("E0003", param.span, "a foreign function is not a method: name the parameter something other than `self`"))
+        }
+    }
+    let (ret, p) = parse_ret(p)?
+    let hi = match ret {
+        Some(t) => t.span.hi,
+        None => name.span.hi,
+    }
+    // `= "printf"`: the C function, when it is not the Limen name
+    let (sym, hi, p) = if p.is_sym("=") {
+        let t = p.skip().tok()
+        match t.kind {
+            StrLit([Lit(s)]) => (s, t.hi, p.skip().skip()),
+            _ => {
+                return Err(error("E0003", p.span_of(t), "the C function is named by a plain string, as in `= \"printf\"`"))
+            },
+        }
+    } else {
+        (name.text, hi, p)
+    }
+    if p.is_sym("\{") {
+        return Err(error("E0003", p.span(), "a foreign function has no body: its code is in the C library"))
+    }
+    let d = ast.FnDecl {
+        name: name.text,
+        span: name.span,
+        generics: [],
+        params: sig.params,
+        ret,
+        body: ast.Block { stmts: [], tail: None, span: { name.span with hi } },
+        test: None,
+        bench: false,
+        virtual: false,
+        table: None,
+        public,
+        bounds: [],
+        foreign: Some(ast.Foreign { lib, sym, variadic: sig.variadic, trusted: false }),
+    }
+    Ok((IFn(d), p))
+}
+
+// A foreign function's parameters, and for a variadic one how many come
+// before its `...`.
+struct ForeignParams {
+    params: List[ast.Param],
+    variadic: Option[Int],
+}
+
+// The parameter list after `(`. This is comma_list, written out, because a
+// second `...` is an error the moment it is read.
+fn foreign_params(p: Parser) -> Parsed[ForeignParams] {
+    let mut p = p
+    let mut params: List[ast.Param] = []
+    let mut variadic: Option[Int] = None
+    while !p.is_sym(")") {
+        if p.is_sym("...") {
+            if variadic.is_some() {
+                return Err(error("E0003", p.span(), "a foreign function has one `...`"))
+            }
+            variadic = Some(params.len())
+            p = p.skip()
+        } else {
+            let (param, next) = parse_param(p)?
+            params.push(param)
+            p = next
+        }
+        if p.is_sym(",") {
+            p = p.skip()
+        } else if !p.is_sym(")") && !p.nl() {
+            return Err(p.expected("`,` or `)`"))
+        }
+    }
+    Ok((ForeignParams { params, variadic }, p.skip()))
+}
+
+// ---------- files ----------
+
+fn set_public(item: ast.Item) -> ast.Item {
+    match item {
+        IFn(d) => IFn({ d with public: true }),
+        IStruct(s) => IStruct({ s with public: true }),
+        IEnum(e) => IEnum({ e with public: true }),
+        IIface(i) => IIface({ i with public: true }),
+        IType(a) => IType({ a with public: true }),
+    }
+}
+
+fn is_test(item: ast.Item) -> Bool {
+    match item {
+        IFn(d) => d.test.is_some(),
+        _ => false,
+    }
+}
+
+// What can follow `pub`.
+fn starts_public_item(p: Parser) -> Bool {
+    match p.kind() {
+        Keyword("fn" | "struct" | "enum" | "interface") | Ident("type") => true,
+        _ => false,
+    }
+}
+
+fn starts_foreign(p: Parser) -> Bool {
+    match p.next_kind() {
+        StrLit(_) => p.is_word("foreign"),
+        _ => false,
+    }
+}
+
+// Parse a whole file on its own: its `use` lines and its items.
+pub fn parse(src: Str) -> Result[ast.File, ParseError] {
+    let (f, _) = parse_file(src, 0, 1)?
+    Ok(f)
+}
+
+// Parse file number `file` of a program, numbering its expressions from
+// `first_id` on; returns the tree and the next free id.
+pub fn parse_file(src: Str, file: Int, first_id: Int) -> Result[(ast.File, Int), ParseError] {
+    let f = parse_tokens(src, file)?
+    Ok(ids.file(f, first_id))
+}
+
+fn parse_tokens(src: Str, file: Int) -> Result[ast.File, ParseError] {
+    let toks = match lexer.lex(src) {
+        Ok(toks) => toks,
+        Err(e) => {
+            return Err(lex_error(e, file))
+        },
+    }
+    let mut p = Parser { toks, pos: 0, safes: 0, file }
+    let mut uses: List[ast.Name] = []
+    let mut items: List[ast.Item] = []
+    let mut tests = 0
+    while !p.at_end() {
+        if p.is_kw("use") {
+            let (m, next) = p.skip().expect_ident()?
+            uses.push(m)
+            p = next
+        } else if p.is_kw("pub") {
+            let q = p.skip()
+            if !starts_public_item(q) {
+                return Err(q.expected("`fn`, `struct`, `enum`, `interface` or `type` after `pub`"))
+            }
+            let (item, next) = parse_item(q, tests + 1)?
+            items.push(set_public(item))
+            p = next
+        } else if starts_foreign(p) {
+            let (declared, next) = parse_foreign(p)?
+            (items, p) = (items + declared, next)
+        } else {
+            let (item, next) = parse_item(p, tests + 1)?
+            if is_test(item) {
+                tests = tests + 1
+            }
+            items.push(item)
+            p = next
+        }
+    }
+    Ok(ast.File { uses, items })
+}

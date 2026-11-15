@@ -1,9 +1,9 @@
-# Tessera for VS Code
+# Limen for VS Code
 
 A local extension, not published to the marketplace.
 
-- **Highlighting** for `.tsr` files and for ```` ```tessera ```` blocks in Markdown. Capability types (`Net`, `Fs`, `Clock` and the rest) get their own scope, `support.type.capability.tessera`, so authority entering a function stands out.
-- **The language server** (`tessera lsp`): errors as you type, hover, go to definition, references, rename, completion, quick fixes and semantic highlighting.
+- **Highlighting** for `.lmn` files and for ```` ```limen ```` blocks in Markdown. Capability types (`Net`, `Fs`, `Clock` and the rest) get their own scope, `support.type.capability.limen`, so authority entering a function stands out.
+- **The language server** (`limen lsp`): errors as you type, hover, go to definition, references, rename, completion, quick fixes and semantic highlighting.
 - Comment toggling, bracket matching, auto-closing quotes and indentation.
 
 ## Install
@@ -12,17 +12,17 @@ A local extension, not published to the marketplace.
 editors/vscode/install.sh
 ```
 
-It installs the npm dependencies, runs the grammar test, packages `tessera.vsix` and installs it with `code --install-extension`. Run it again after changing the extension, then reload the VS Code window.
+It installs the npm dependencies, runs the grammar test, packages `limen.vsix` and installs it with `code --install-extension`. Run it again after changing the extension, then reload the VS Code window.
 
-## Finding `tessera`
+## Finding `limen`
 
 The extension runs the first of:
 
-1. the `tessera.path` setting, from your user settings only (a workspace's `.vscode/settings.json` cannot set it);
-2. `tessera` on the PATH;
+1. the `limen.path` setting, from your user settings only (a workspace's `.vscode/settings.json` cannot set it);
+2. `limen` on the PATH;
 3. in a folder you have trusted (VS Code's Workspace Trust), `_build/default/bin/main.exe` in that folder itself (not a folder above it, and not through a symlink leading out of it): this repository, after `dune build`.
 
-So opening a folder you haven't trusted never runs a program that folder supplies. Highlighting works without any of them. Turn the language server off with `tessera.languageServer.enabled`, and restart it with **Tessera: Restart Language Server**.
+So opening a folder you haven't trusted never runs a program that folder supplies. Highlighting works without any of them. Turn the language server off with `limen.languageServer.enabled`, and restart it with **Limen: Restart Language Server**.
 
 ## Coloring capabilities
 
@@ -31,7 +31,7 @@ Themes don't know the capability scope, so capabilities get the theme's color fo
 ```json
 "editor.tokenColorCustomizations": {
   "textMateRules": [
-    { "scope": "support.type.capability.tessera", "settings": { "foreground": "#E5A50A", "fontStyle": "bold" } }
+    { "scope": "support.type.capability.limen", "settings": { "foreground": "#E5A50A", "fontStyle": "bold" } }
   ]
 }
 ```

@@ -1,0 +1,79 @@
+// limen run examples/wordcount.lmn --grant fs=examples:ro
+
+struct Count {
+    word: Str,
+    n: Int,
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let text = root.fs.read("poem.txt")?
+    let counts = count_words(text)
+    for c in top(counts, 3) {
+        root.stdout.print("{c.word}: {c.n}")
+    }
+    // The grant is read-only, so this is refused at runtime.
+    match root.fs.write("out.txt", "nope") {
+        Ok(_) => root.stdout.print("wrote out.txt"),
+        Err(Denied(why)) => root.stdout.print("denied: {why}"),
+        Err(Failed(why)) => root.stdout.print("failed: {why}"),
+    }
+    Ok(())
+}
+
+fn count_words(text: Str) -> List[Count] {
+    let mut counts: List[Count] = []
+    for line in text.lines() {
+        for raw in line.split(" ") {
+            let w = raw.trim().to_lower().replace(",", "").replace(".", "")
+            if w.is_empty() {
+                continue
+            }
+            counts = bump(counts, w)
+        }
+    }
+    counts
+}
+
+fn bump(counts: List[Count], w: Str) -> List[Count] {
+    let mut out = counts
+    let mut i = 0
+    while i < out.len() {
+        if out[i].word == w {
+            out[i].n = out[i].n + 1
+            return out
+        }
+        i = i + 1
+    }
+    out.push(Count { word: w, n: 1 })
+    out
+}
+
+fn top(counts: List[Count], k: Int) -> List[Count] {
+    let mut rest = counts
+    let mut best: List[Count] = []
+    while best.len() < k && !rest.is_empty() {
+        let mut idx = 0
+        let mut i = 1
+        while i < rest.len() {
+            if rest[i].n > rest[idx].n {
+                idx = i
+            }
+            i = i + 1
+        }
+        best.push(rest[idx])
+        rest = remove_at(rest, idx)
+    }
+    best
+}
+
+fn remove_at[T](xs: List[T], idx: Int) -> List[T] {
+    let mut out: List[T] = []
+    let mut i = 0
+    for x in xs {
+        if i != idx {
+            out.push(x)
+        }
+        i = i + 1
+    }
+    out
+}

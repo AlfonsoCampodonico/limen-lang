@@ -1,0 +1,261 @@
+// Two ways the OCaml compiler writes a Float, which the Limen one must
+// write the same: `%h` (hexadecimal, exact), used by the tree dumps that
+// compare the parsers, and `%g` (six significant digits), used in error
+// messages. Limen has no format strings and no access to a Float's bits,
+// so both take the number apart with arithmetic that is exact: scaling by
+// two, and integer digits.
+
+fn is_infinite(x: Float) -> Bool {
+    x != 0.0 && x == x * 2.0
+}
+
+// Below zero, or -0.0.
+pub fn negative(x: Float) -> Bool {
+    x < 0.0 || (x == 0.0 && 1.0 / x < 0.0)
+}
+
+// The smallest normal Float, 2^-1022.
+fn min_normal() -> Float {
+    2.2250738585072014e-308
+}
+
+// `x` as `significand * 2^exponent`, the significand an integer below
+// 2^53: the 53 bits of a normal number, or the 52 of a subnormal one with
+// the exponent at its lowest, -1074. `x` is finite and above zero.
+struct Binary {
+    significand: Int,
+    exponent: Int,
+}
+
+fn binary(x: Float) -> Binary {
+    if x < min_normal() {
+        let mut m = x
+        let mut i = 0
+        while i < 1074 {
+            m = m * 2.0
+            i = i + 1
+        }
+        return Binary { significand: m.to_int(), exponent: -1074 }
+    }
+    // scale into [1, 2); multiplying or dividing a normal number by two
+    // only changes its exponent
+    let mut m = x
+    let mut e = 0
+    while m >= 2.0 {
+        m = m / 2.0
+        e = e + 1
+    }
+    while m < 1.0 {
+        m = m * 2.0
+        e = e - 1
+    }
+    let mut i = 0
+    while i < 52 {
+        m = m * 2.0
+        i = i + 1
+    }
+    Binary { significand: m.to_int(), exponent: e - 52 }
+}
+
+fn hex_digit(d: Int) -> Str {
+    "0123456789abcdef".slice(d, d + 1)
+}
+
+// `x` as OCaml's `%h` writes it: `0x1.8p+0` for 1.5, with the fraction's
+// trailing zeros left out; `0x0.<fraction>p-1022` for a subnormal number.
+pub fn hex(x: Float) -> Str {
+    if x != x {
+        return "nan"
+    }
+    if negative(x) {
+        return "-" + hex(-x)
+    }
+    if x == 0.0 {
+        return "0x0p+0"
+    }
+    if is_infinite(x) {
+        return "infinity"
+    }
+    let b = binary(x)
+    let subnormal = x < min_normal()
+    // the 52 bits after the point, as 13 hex digits
+    let mut fraction = b.significand % 4503599627370496
+    let mut digits: List[Str] = []
+    let mut i = 0
+    while i < 13 {
+        digits.push(hex_digit(fraction % 16))
+        fraction = fraction / 16
+        i = i + 1
+    }
+    let shown = digits.skip_while(|d| d == "0").reverse().join("")
+    let point = if shown == "" { "" } else { "." + shown }
+    if subnormal {
+        return "0x0{point}p-1022"
+    }
+    let e = b.exponent + 52
+    let sign = if e < 0 { "-" } else { "+" }
+    "0x1{point}p{sign}{e.abs()}"
+}
+
+// ---------- %g ----------
+
+// A decimal number with exactly the value of a Float: digits, most
+// significant first and the first one nonzero, and the position of the
+// point, so that the value is 0.d1d2d3... * 10^point.
+struct Decimal {
+    digits: List[Int],
+    point: Int,
+}
+
+// `n * k` for a nonnegative integer written as decimal digits, least
+// significant first, and a small factor `k`.
+fn times(n: List[Int], k: Int) -> List[Int] {
+    let mut out: List[Int] = []
+    let mut carry = 0
+    for d in n {
+        let v = d * k + carry
+        out.push(v % 10)
+        carry = v / 10
+    }
+    while carry > 0 {
+        out.push(carry % 10)
+        carry = carry / 10
+    }
+    out
+}
+
+// `n * k^count`, multiplying by up to 13 factors at a time (5^13 still
+// leaves room in an Int for a digit times it).
+fn times_power(n: List[Int], k: Int, count: Int) -> List[Int] {
+    let mut out = n
+    let mut left = count
+    while left > 0 {
+        let step = left.min(13)
+        let mut factor = 1
+        let mut i = 0
+        while i < step {
+            factor = factor * k
+            i = i + 1
+        }
+        out = times(out, factor)
+        left = left - step
+    }
+    out
+}
+
+fn digits_of(n: Int) -> List[Int] {
+    let mut out: List[Int] = []
+    let mut m = n
+    while m > 0 {
+        out.push(m % 10)
+        m = m / 10
+    }
+    out
+}
+
+// The exact decimal value of a finite `x` above zero. `s * 2^e` is
+// `s * 2^e` as an integer when `e >= 0`, and `s * 5^-e / 10^-e` otherwise.
+fn decimal(x: Float) -> Decimal {
+    let b = binary(x)
+    let n = digits_of(b.significand)
+    if b.exponent >= 0 {
+        let whole = times_power(n, 2, b.exponent).reverse()
+        Decimal { digits: whole, point: whole.len() }
+    } else {
+        let scaled = times_power(n, 5, -b.exponent).reverse()
+        Decimal { digits: scaled, point: scaled.len() + b.exponent }
+    }
+}
+
+// `d` rounded to `count` significant digits, ties to even, as printf
+// rounds the exact value.
+fn rounded(d: Decimal, count: Int) -> Decimal {
+    if d.digits.len() <= count {
+        return d
+    }
+    let kept = d.digits.take(count)
+    let next = d.digits[count]
+    let rest_nonzero = d.digits.skip(count + 1).any(|x| x != 0)
+    let odd = kept[count - 1] % 2 == 1
+    let up = next > 5 || (next == 5 && (rest_nonzero || odd))
+    if !up {
+        return Decimal { digits: kept, point: d.point }
+    }
+    // add one to the last kept digit, carrying leftwards
+    let mut digits = kept.reverse()
+    let mut i = 0
+    let mut carry = true
+    while carry && i < digits.len() {
+        if digits[i] == 9 {
+            digits[i] = 0
+            i = i + 1
+        } else {
+            digits[i] = digits[i] + 1
+            carry = false
+        }
+    }
+    if carry {
+        // 999999 became 1000000: one more digit before the point
+        let mut one = [1]
+        while one.len() < count {
+            one.push(0)
+        }
+        return Decimal { digits: one, point: d.point + 1 }
+    }
+    Decimal { digits: digits.reverse(), point: d.point }
+}
+
+fn text(digits: List[Int]) -> Str {
+    digits.map(|d| d.to_str()).join("")
+}
+
+// "1.500" to "1.5", "2.000" to "2"
+fn trim_fraction(s: Str) -> Str {
+    if s.index_of(".").is_none() {
+        return s
+    }
+    let mut end = s.len()
+    while s.slice(end - 1, end) == "0" {
+        end = end - 1
+    }
+    if s.slice(end - 1, end) == "." {
+        end = end - 1
+    }
+    s.slice(0, end)
+}
+
+// `x` as C's `%g` writes it (OCaml's Printf passes it to C): six significant
+// digits, trailing zeros dropped, and an exponent when the number is below
+// 1e-4 or has more than six digits before the point.
+pub fn general(x: Float) -> Str {
+    if x != x {
+        return "nan"
+    }
+    if negative(x) {
+        return "-" + general(-x)
+    }
+    if x == 0.0 {
+        return "0"
+    }
+    if is_infinite(x) {
+        return "inf"
+    }
+    let d = rounded(decimal(x), 6)
+    let exp = d.point - 1
+    if exp < -4 || exp >= 6 {
+        let mantissa = trim_fraction(text(d.digits.take(1)) + "." + text(d.digits.skip(1)))
+        let sign = if exp < 0 { "-" } else { "+" }
+        let e = exp.abs()
+        let pad = if e < 10 { "0" } else { "" }
+        return "{mantissa}e{sign}{pad}{e}"
+    }
+    if d.point <= 0 {
+        let zeros = "0000".slice(0, -d.point)
+        return trim_fraction("0." + zeros + text(d.digits))
+    }
+    let mut whole = d.digits.take(d.point)
+    while whole.len() < d.point {
+        whole.push(0)
+    }
+    trim_fraction(text(whole) + "." + text(d.digits.skip(d.point)))
+}

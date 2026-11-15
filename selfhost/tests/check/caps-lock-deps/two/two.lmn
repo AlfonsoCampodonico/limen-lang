@@ -1,0 +1,4 @@
+// Calls a, not the b limen.lock recorded.
+foreign "a" {
+    pub fn ask() -> Int
+}

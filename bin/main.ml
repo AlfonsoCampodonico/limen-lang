@@ -1,31 +1,31 @@
-open Tessera
+open Limen
 
 let usage =
-  {|tessera: a small language where I/O needs a capability
+  {|limen: a small language where I/O needs a capability
 
 usage:
-  tessera run FILE [--native] [--grant net=HOST[:PORT]|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST:PORT]... [--grant env=NAME|*]... [--grant exec=PROGRAM|*]... [--grant foreign=LIB|*]... [--seed N] [--no-sandbox] [-- ARGS...]
-  tessera build FILE [-o OUT] [--emit-c]
-  tessera check FILE [--json]
-  tessera caps FILE [--json]
-  tessera explain CODE
-  tessera test FILE [--native] [--run TEXT] [--bench] [--bench-time 1s|100x] [--json]
-  tessera fmt FILE... [--write | --check]
-  tessera doc FILE|MODULE... [--std] [--all] [--html] [-o OUT]
-  tessera lsp                (language server on stdin/stdout)
-  tessera mcp                (MCP server for coding agents, on stdin/stdout)
-  tessera spec               (print the language specification)
-  tessera search [WORDS...]  (search the package index named by TESSERA_INDEX)
-  tessera add NAME[@VERSION] (add a package from the index to tessera.toml, with the caps it declares)
-  tessera index entry [DIR]  (print the index entry for the package's current tag)
+  limen run FILE [--native] [--grant net=HOST[:PORT]|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST:PORT]... [--grant env=NAME|*]... [--grant exec=PROGRAM|*]... [--grant foreign=LIB|*]... [--seed N] [--no-sandbox] [-- ARGS...]
+  limen build FILE [-o OUT] [--emit-c]
+  limen check FILE [--json]
+  limen caps FILE [--json]
+  limen explain CODE
+  limen test FILE [--native] [--run TEXT] [--bench] [--bench-time 1s|100x] [--json]
+  limen fmt FILE... [--write | --check]
+  limen doc FILE|MODULE... [--std] [--all] [--html] [-o OUT]
+  limen lsp                (language server on stdin/stdout)
+  limen mcp                (MCP server for coding agents, on stdin/stdout)
+  limen spec               (print the language specification)
+  limen search [WORDS...]  (search the package index named by LIMEN_INDEX)
+  limen add NAME[@VERSION] (add a package from the index to limen.toml, with the caps it declares)
+  limen index entry [DIR]  (print the index entry for the package's current tag)
 
 Stdout, Stderr, Stdin, Clock and Rand are always granted. Net, Fs, Listen, Env, Exec and Foreign exist only
-when granted, by --grant or by the [grants] table of tessera.toml. --seed makes Rand repeatable; arguments after -- are root.args(). The process runs in an operating-system sandbox
+when granted, by --grant or by the [grants] table of limen.toml. --seed makes Rand repeatable; arguments after -- are root.args(). The process runs in an operating-system sandbox
 limited to those grants (macOS; Linux untested); --no-sandbox turns it off, for debugging.
 |}
 
 let die_usage msg =
-  prerr_string (if msg = "" then usage else "tessera: " ^ msg ^ "\n\n" ^ usage);
+  prerr_string (if msg = "" then usage else "limen: " ^ msg ^ "\n\n" ^ usage);
   exit 2
 
 (* "1 error", "2 warnings" *)
@@ -40,7 +40,7 @@ let warned = ref 0
 let load ?(keep_warnings = false) file =
   let src =
     try In_channel.with_open_bin file In_channel.input_all
-    with Sys_error m -> prerr_endline ("tessera: " ^ m); exit 2
+    with Sys_error m -> prerr_endline ("limen: " ^ m); exit 2
   in
   let items, ds, infos = Modules.load_and_check file src in
   if keep_warnings then (items, ds, infos)
@@ -92,10 +92,10 @@ let parse_grants args =
 let warn_foreign (g : Interp.grants) =
   if g.foreign <> [] then
     prerr_endline
-      (Printf.sprintf "tessera: warning: --grant foreign=%s is full access: C code can do anything this process can, past every other grant"
+      (Printf.sprintf "limen: warning: --grant foreign=%s is full access: C code can do anything this process can, past every other grant"
          (String.concat "," g.foreign))
 
-(* The [grants] of the program's tessera.toml, as `--grant` values. They come
+(* The [grants] of the program's limen.toml, as `--grant` values. They come
    first, so flags add to them (and a --grant fs=... replaces the fs one). *)
 let toml_grants file =
   match Package.load file with
@@ -119,7 +119,7 @@ let rec split_grants = function
     (gs, x :: others)
   | [] -> ([], [])
 
-(* tessera test: run every `test "name" { ... }` block, each isolated. *)
+(* limen test: run every `test "name" { ... }` block, each isolated. *)
 let where_of (sp : Span.t) =
   if sp.file = "" then ""
   else
@@ -166,10 +166,10 @@ type bench_result = { iters : int; ns : int; allocs : int }
    the selected benches) each in its own process. [tests] and [benches] are
    (index, name, takes_fs). *)
 let run_native_tests items tests benches bench =
-  let exe = Filename.concat (Filename.get_temp_dir_name ()) (Printf.sprintf "tessera-test-%d" (Unix.getpid ())) in
+  let exe = Filename.concat (Filename.get_temp_dir_name ()) (Printf.sprintf "limen-test-%d" (Unix.getpid ())) in
   (match Native.build ~tests:true items exe with
    | Ok () -> ()
-   | Error m -> prerr_string m; prerr_endline "tessera: the C compiler failed (this is a bug in tessera)"; exit 1);
+   | Error m -> prerr_string m; prerr_endline "limen: the C compiler failed (this is a bug in limen)"; exit 1);
   let test_results =
     List.map
       (fun (i, name, takes_fs) ->
@@ -189,7 +189,7 @@ let run_native_tests items tests benches bench =
           let status, text, _ = run_test_binary exe args takes_fs in
           let report =
             List.find_map
-              (fun l -> let p = "tessera-bench: " in if String.starts_with ~prefix:p l then Some (String.sub l (String.length p) (String.length l - String.length p)) else None)
+              (fun l -> let p = "limen-bench: " in if String.starts_with ~prefix:p l then Some (String.sub l (String.length p) (String.length l - String.length p)) else None)
               (String.split_on_char '\n' text)
           in
           match (status, report) with
@@ -312,7 +312,7 @@ let cmd_fmt files mode =
   let changed = ref [] in
   List.iter
     (fun file ->
-      let src = try In_channel.with_open_bin file In_channel.input_all with Sys_error m -> prerr_endline ("tessera: " ^ m); exit 2 in
+      let src = try In_channel.with_open_bin file In_channel.input_all with Sys_error m -> prerr_endline ("limen: " ^ m); exit 2 in
       match Fmt.format ~file src with
       | exception Diag.Fatal d -> prerr_string (Diag.render d); exit 1
       | out -> (
@@ -326,7 +326,7 @@ let cmd_fmt files mode =
     exit 1
   end
 
-(* tessera doc: Markdown (or with --html, one static page) from doc comments. *)
+(* limen doc: Markdown (or with --html, one static page) from doc comments. *)
 let cmd_doc args =
   let rec go srcs std all html out = function
     | "--std" :: r -> go srcs true all html out r
@@ -345,7 +345,7 @@ let cmd_doc args =
     List.map
       (fun a ->
         try Doc.load ~all a with
-        | Sys_error m -> prerr_endline ("tessera: " ^ m); exit 2
+        | Sys_error m -> prerr_endline ("limen: " ^ m); exit 2
         | Diag.Fatal d -> prerr_string (Diag.render d); exit 1)
       srcs
   in
@@ -364,7 +364,7 @@ let c_callers (items : Ast.item list) =
         | Ast.IFn { fn_name; fn_foreign = Some fo; _ } ->
           let m = match String.index_opt fn_name '.' with Some k -> String.sub fn_name 0 k | None -> "" in
           let libs, trusted = Option.value ~default:([], fo.ftrusted) (List.assoc_opt m acc) in
-          (m, ((if List.mem fo.flib libs || fo.flib = "tessera" then libs else libs @ [ fo.flib ]), trusted)) :: List.remove_assoc m acc
+          (m, ((if List.mem fo.flib libs || fo.flib = "limen" then libs else libs @ [ fo.flib ]), trusted)) :: List.remove_assoc m acc
         | _ -> acc)
       [] items
   in
@@ -372,10 +372,10 @@ let c_callers (items : Ast.item list) =
     (fun (m, (libs, trusted)) ->
       let who =
         if m = "" then "the program itself (needs --grant foreign)"
-        else if trusted then Printf.sprintf "module `%s` (standard library, trusted by src/std/tessera.toml)" m
+        else if trusted then Printf.sprintf "module `%s` (standard library, trusted by src/std/limen.toml)" m
         else
           match List.assoc_opt m !Modules.module_pkg with
-          | Some dep -> Printf.sprintf "module `%s` (dependency `%s`, trusted in tessera.toml [trust])" m dep
+          | Some dep -> Printf.sprintf "module `%s` (dependency `%s`, trusted in limen.toml [trust])" m dep
           | None -> Printf.sprintf "module `%s` (the program's own, needs --grant foreign)" m
       in
       Printf.sprintf "calls C: %s: %s" who (String.concat ", " libs))
@@ -450,7 +450,7 @@ let cmd_build file out emit_c =
     | Ok () -> (try Sys.remove (out ^ ".c") with Sys_error _ -> ())
     | Error m ->
       prerr_string m;
-      prerr_endline "tessera: the C compiler failed (this is a bug in tessera)";
+      prerr_endline "limen: the C compiler failed (this is a bug in limen)";
       exit 1
 
 let cmd_run_native file grant_args prog_args =
@@ -459,10 +459,10 @@ let cmd_run_native file grant_args prog_args =
   warn_foreign (parse_grants grant_args);
   let items = checked file in
   let dir = Filename.get_temp_dir_name () in
-  let exe = Filename.concat dir (Printf.sprintf "tessera-%d" (Unix.getpid ())) in
+  let exe = Filename.concat dir (Printf.sprintf "limen-%d" (Unix.getpid ())) in
   (match Native.build items exe with
    | Ok () -> ()
-   | Error m -> prerr_string m; prerr_endline "tessera: the C compiler failed (this is a bug in tessera)"; exit 1);
+   | Error m -> prerr_string m; prerr_endline "limen: the C compiler failed (this is a bug in limen)"; exit 1);
   let args =
     List.concat_map
       (fun g ->
@@ -490,7 +490,7 @@ let cmd_run file grant_args prog_args =
     if not (List.mem "no-sandbox" grant_args) then
       match Interp.sandbox grants with
       | Ok _ -> ()
-      | Error m -> Printf.eprintf "tessera: %s (run with --no-sandbox to go without it)\n" m; exit 1
+      | Error m -> Printf.eprintf "limen: %s (run with --no-sandbox to go without it)\n" m; exit 1
   in
   match Interp.run ~before_main ~out ~grants items with
   | Ok (Interp.VEnum ("Result", "Err", [ e ])) ->
@@ -508,7 +508,7 @@ let cmd_run file grant_args prog_args =
 
 (* The package index commands fail with one plain sentence. *)
 let registry f =
-  try f () with Registry.Failed m -> prerr_endline ("tessera: " ^ m); exit 1
+  try f () with Registry.Failed m -> prerr_endline ("limen: " ^ m); exit 1
 
 let () =
   match List.tl (Array.to_list Sys.argv) with

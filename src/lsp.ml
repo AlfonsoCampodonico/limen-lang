@@ -79,7 +79,7 @@ let diag_json text (d : Diag.t) =
   let msg = String.concat "\n" (d.message :: List.map (fun n -> "note: " ^ n) d.notes) in
   J.Obj
     [ ("range", srange text d.span); ("severity", J.Int (match d.severity with Diag.Error -> 1 | Diag.Warning -> 2));
-      ("code", J.String d.code); ("source", J.String "tessera"); ("message", J.String msg) ]
+      ("code", J.String d.code); ("source", J.String "limen"); ("message", J.String msg) ]
 
 let publish uri doc =
   J.Obj
@@ -368,8 +368,8 @@ let member_completions path text off =
           @ List.map (fun (m, mk) -> item 2 m (method_sig m (mk ()))) (Check.methods t)
         | _ -> List.map (fun (m, mk) -> item 2 m (method_sig m (mk ()))) (Check.methods t)
       in
-      (* the built-in methods written in Tessera (std/methods.tsr) *)
-      let tessera_methods =
+      (* the built-in methods written in Limen (std/methods.lmn) *)
+      let limen_methods =
         match Check.builtin_tname t with
         | None -> []
         | Some tn ->
@@ -381,7 +381,7 @@ let member_completions path text off =
               | _ -> None)
             (Lazy.force Prelude.methods)
       in
-      Some (fields @ methods @ tessera_methods)
+      Some (fields @ methods @ limen_methods)
   end
 
 (* Inside the parentheses of `f(` or `x.m(`: the parameter names of [f] (or
@@ -721,7 +721,7 @@ let uri_of_path p = if String.starts_with ~prefix:"file://" p then p else "file:
    an editor can open it. *)
 let std_file p =
   let name = String.sub p 6 (String.length p - 6) in
-  let dir = Filename.concat (Filename.get_temp_dir_name ()) "tessera-std" in
+  let dir = Filename.concat (Filename.get_temp_dir_name ()) "limen-std" in
   (try Unix.mkdir dir 0o755 with Unix.Unix_error _ -> ());
   let f = Filename.concat dir name in
   let text = Option.value ~default:"" (Source.text p) in
@@ -765,7 +765,7 @@ let handle st (msg : J.t) : J.t list =
   let reply r = if id = J.Null then [] else [ response id r ] in
   match J.to_str (J.member "method" msg) with
   | "initialize" ->
-    reply (J.Obj [ ("capabilities", capabilities); ("serverInfo", J.Obj [ ("name", J.String "tessera"); ("version", J.String "0.3") ]) ])
+    reply (J.Obj [ ("capabilities", capabilities); ("serverInfo", J.Obj [ ("name", J.String "limen"); ("version", J.String "0.3") ]) ])
   | "initialized" -> []
   | "shutdown" -> st.shutdown <- true; reply J.Null
   | "exit" -> st.exit <- true; []
@@ -787,7 +787,7 @@ let handle st (msg : J.t) : J.t list =
       let shown sp s doc =
         reply
           (J.Obj
-             [ ("contents", J.Obj [ ("kind", J.String "markdown"); ("value", J.String ("```tessera\n" ^ s ^ "\n```" ^ if doc = "" then "" else "\n\n" ^ doc)) ]);
+             [ ("contents", J.Obj [ ("kind", J.String "markdown"); ("value", J.String ("```limen\n" ^ s ^ "\n```" ^ if doc = "" then "" else "\n\n" ^ doc)) ]);
                ("range", srange d.text sp) ])
       in
       match symbol_hover d items off with
@@ -949,7 +949,7 @@ let serve () =
       | Some body ->
         (match J.parse body with
          | msg -> List.iter (write_message stdout) (handle st msg)
-         | exception J.Error m -> prerr_endline ("tessera lsp: bad JSON: " ^ m));
+         | exception J.Error m -> prerr_endline ("limen lsp: bad JSON: " ^ m));
         loop ()
   in
   loop ();

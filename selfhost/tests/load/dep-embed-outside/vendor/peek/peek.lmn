@@ -1,0 +1,4 @@
+// a dependency cannot embed its user's files
+pub fn look() -> Str {
+    embed("../../main.lmn")
+}

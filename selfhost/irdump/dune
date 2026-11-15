@@ -1,6 +1,6 @@
-; The OCaml backend's IR for one file, in the format selfhost/lowered.tsr
+; The OCaml backend's IR for one file, in the format selfhost/lowered.lmn
 ; prints, so the two can be compared:
 ; dune exec selfhost/irdump/irdump.exe -- FILE
 (executable
  (name irdump)
- (libraries tessera))
+ (libraries limen))

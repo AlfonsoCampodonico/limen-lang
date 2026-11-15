@@ -1,0 +1,396 @@
+// SQL databases through SQLite (the system's libsqlite3), with parameters
+// bound by SQLite itself, never pasted into the SQL text.
+//
+//   let db = sql.open(root.fs, "app.db")?      // --grant fs=DIR
+//   db.exec("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT)", [])?
+//   db.exec("INSERT INTO users (name) VALUES (?)", [sql.Text("Ada")])?
+//   for row in db.query("SELECT id, name FROM users WHERE id > ?", [sql.Int(0)])? {
+//       out.print("{row.int("id") ?? 0} {row.text("name") ?? "?"}")
+//   }
+//   db.close()
+//
+// The module calls SQLite itself: src/std/limen.toml trusts it with C, so a
+// program needs no foreign grant to use it, only the Fs for the database's
+// directory (sql.memory() needs nothing). What it lets SQLite touch stays
+// inside that grant: the file is a path under the granted directory, opened
+// read-only when the Fs is; ATTACH (and VACUUM, which attaches) is turned
+// off, so SQL cannot open other files; the database file is not opened
+// through a symlink, and a symlinked -journal, -wal or -shm leading out of
+// the grant is refused; URI filenames and extensions stay off; temporary
+// tables live in memory.
+
+// ---------- SQLite's C API, as much as this module needs ----------
+
+foreign "sqlite3" {
+    fn sqlite3_open_v2(path: Str, db: Out[Handle], flags: Int32, vfs: Int) -> Int32
+    fn sqlite3_close_v2(db: Handle) -> Int32
+    fn sqlite3_errmsg(db: Handle) -> Str
+    fn sqlite3_errstr(rc: Int32) -> Str
+    fn sqlite3_limit(db: Handle, id: Int32, value: Int32) -> Int32
+    fn sqlite3_busy_timeout(db: Handle, ms: Int32) -> Int32
+    fn sqlite3_exec(db: Handle, sql: Str, callback: Int, arg: Int, err: Out[Handle]) -> Int32
+    fn sqlite3_free(p: Handle)
+    fn sqlite3_changes64(db: Handle) -> Int
+    fn sqlite3_last_insert_rowid(db: Handle) -> Int
+    fn sqlite3_get_autocommit(db: Handle) -> Bool
+    fn sqlite3_prepare_v2(db: Handle, sql: Str, n: Int32, stmt: Out[Handle], tail: Out[Handle]) -> Int32
+    fn sqlite3_sql(stmt: Handle) -> Str
+    fn sqlite3_finalize(stmt: Handle) -> Int32
+    fn sqlite3_step(stmt: Handle) -> Int32
+    fn sqlite3_bind_parameter_count(stmt: Handle) -> Int32
+    fn sqlite3_bind_null(stmt: Handle, i: Int32) -> Int32
+    fn sqlite3_bind_int64(stmt: Handle, i: Int32, v: Int) -> Int32
+    fn sqlite3_bind_double(stmt: Handle, i: Int32, v: Float) -> Int32
+    fn sqlite3_bind_text(stmt: Handle, i: Int32, v: Str, n: Int32, destructor: Int) -> Int32
+    fn sqlite3_bind_blob(stmt: Handle, i: Int32, v: Bytes, n: Int32, destructor: Int) -> Int32
+    fn sqlite3_column_count(stmt: Handle) -> Int32
+    fn sqlite3_column_name(stmt: Handle, i: Int32) -> Str
+    fn sqlite3_column_type(stmt: Handle, i: Int32) -> Int32
+    fn sqlite3_column_int64(stmt: Handle, i: Int32) -> Int
+    fn sqlite3_column_double(stmt: Handle, i: Int32) -> Float
+    fn sqlite3_column_text(stmt: Handle, i: Int32) -> Handle
+    fn sqlite3_column_blob(stmt: Handle, i: Int32) -> Handle
+    fn sqlite3_column_bytes(stmt: Handle, i: Int32) -> Int32
+}
+
+// the runtime's helpers: copy C memory into Bytes, and the handle table
+// that keeps connection pointers out of Limen values
+foreign "limen" {
+    fn limen_copy(p: Handle, n: Int) -> Bytes
+    fn limen_handle_new(p: Handle) -> Int
+    fn limen_handle_acquire(id: Int) -> Handle
+    fn limen_handle_release(id: Int) -> Handle
+    fn limen_handle_close(id: Int) -> Handle
+}
+
+// result codes and flags from sqlite3.h
+fn ok_code() -> Int { 0 }
+
+fn row_code() -> Int { 100 }
+
+fn done_code() -> Int { 101 }
+
+fn open_flags(read_only: Bool) -> Int {
+    // NOFOLLOW (0x01000000), FULLMUTEX (0x00010000): one connection can be
+    // shared by tasks; READONLY (1), or READWRITE (2) | CREATE (4)
+    let base = 16777216 + 65536
+    if read_only { base + 1 } else { base + 2 + 4 }
+}
+
+// SQLITE_TRANSIENT: SQLite copies a bound text or blob before the call returns
+fn transient() -> Int { -1 }
+
+// ---------- values ----------
+
+// A database connection. Close it with `db.close()`. It holds an id in the
+// runtime's handle table, not the connection's pointer, so a Db cannot be
+// forged, and one that was closed gives an error instead of touching freed
+// memory.
+pub struct Db {
+    id: Int,
+}
+
+// One SQL value: a parameter, or a column of a row.
+pub enum Value {
+    Null,
+    Int(Int),
+    Float(Float),
+    Text(Str),
+    Blob(Bytes),
+}
+
+// One result row: column names and values, in the order of the SELECT.
+pub struct Row {
+    columns: List[Str],
+    values: List[Value],
+}
+
+fn fail(db: Handle, what: Str) -> IoError {
+    Failed("sql: {what}: {sqlite3_errmsg(db)}")
+}
+
+fn connect(path: Str, read_only: Bool) -> Result[Db, IoError] {
+    let (rc, h) = sqlite3_open_v2(path, open_flags(read_only), 0)
+    if rc != ok_code() {
+        let msg = if h.addr == 0 { sqlite3_errstr(rc) } else { sqlite3_errmsg(h) }
+        sqlite3_close_v2(h)
+        return Err(Failed("sql: cannot open `{path}`: {msg}"))
+    }
+    // no ATTACH, so SQL cannot reach files outside the Fs grant
+    // (SQLITE_LIMIT_ATTACHED is 7; VACUUM INTO attaches too)
+    sqlite3_limit(h, 7, 0)
+    sqlite3_busy_timeout(h, 5000)
+    // no temporary files outside the grant: temp tables and sorts stay in memory
+    sqlite3_exec(h, "PRAGMA temp_store = MEMORY", 0, 0)
+    Ok(Db { id: limen_handle_new(h) })
+}
+
+// Open (or create) the database file `name` under the directory `fs` grants.
+// A read-only Fs opens it read-only, and then it must exist.
+pub fn open(fs: Fs, name: Str) -> Result[Db, IoError] {
+    let path = fs.full_path(name)?
+    // SQLite also opens `-journal`, `-wal` and `-shm` files next to the
+    // database, following symlinks: refuse one that leads out of the grant
+    for suffix in ["-journal", "-wal", "-shm"] {
+        if fs.full_path(name + suffix).is_err() {
+            return Err(Denied("sql: refusing to open `{name}`: `{name}{suffix}` is a link out of the granted directory or a broken one"))
+        }
+    }
+    connect(path, fs.is_read_only())
+}
+
+// A fresh database in memory, gone when closed. Needs no Fs.
+pub fn memory() -> Result[Db, IoError] {
+    connect(":memory:", false)
+}
+
+fn closed() -> IoError {
+    Failed("sql: the database is closed")
+}
+
+// Run `body` with the connection, counted as in use so a close in another
+// task waits for it; the connection is closed here if a close came meanwhile.
+fn using[T](self: Db, body: fn(Handle) -> Result[T, IoError]) -> Result[T, IoError] {
+    let h = limen_handle_acquire(self.id)
+    if h.addr == 0 {
+        return Err(closed())
+    }
+    let r = catch(|| body(h))
+    let last = limen_handle_release(self.id)
+    if last.addr != 0 {
+        // the last use after a close: the connection goes now
+        let rc = sqlite3_close_v2(last)
+    }
+    match r {
+        Ok(v) => v,
+        Err(msg) => panic(msg),
+    }
+}
+
+// Close the connection; using the Db afterwards gives an error. Operations
+// still running in other tasks finish first.
+pub fn close(self: Db) -> Result[(), IoError] {
+    let h = limen_handle_acquire(self.id)
+    if h.addr == 0 {
+        return Err(closed())
+    }
+    limen_handle_close(self.id)
+    let last = limen_handle_release(self.id)
+    if last.addr == 0 {
+        return Ok(())
+    }
+    let rc = sqlite3_close_v2(last)
+    if rc == ok_code() { Ok(()) } else { Err(Failed("sql: close: {sqlite3_errstr(rc)}")) }
+}
+
+// ---------- statements ----------
+
+fn bind(db: Handle, st: Handle, params: List[Value]) -> Result[(), IoError] {
+    let want = sqlite3_bind_parameter_count(st)
+    if want != params.len() {
+        return Err(Failed("sql: the statement has {want} parameter{if want == 1 { "" } else { "s" }}, but {params.len()} were given"))
+    }
+    let mut i = 1
+    for p in params {
+        let rc = match p {
+            Null => sqlite3_bind_null(st, i),
+            Int(n) => sqlite3_bind_int64(st, i, n),
+            Float(x) => sqlite3_bind_double(st, i, x),
+            Text(s) => sqlite3_bind_text(st, i, s, s.len(), transient()),
+            Blob(b) => sqlite3_bind_blob(st, i, b, b.len(), transient()),
+        }
+        if rc != ok_code() {
+            return Err(fail(db, "binding parameter {i}"))
+        }
+        i = i + 1
+    }
+    Ok(())
+}
+
+// Prepare exactly one statement with its parameters bound.
+fn prepare(db: Handle, text: Str, params: List[Value]) -> Result[Handle, IoError] {
+    let (rc, st, _) = sqlite3_prepare_v2(db, text, text.len())
+    if rc != ok_code() {
+        return Err(fail(db, "prepare"))
+    }
+    if st.addr == 0 {
+        return Err(Failed("sql: no statement in the SQL text"))
+    }
+    // the text SQLite used for this statement; anything after it is a second statement
+    let used = sqlite3_sql(st).len()
+    if text.slice(used, text.len()).trim() != "" && text.slice(used, text.len()).trim() != ";" {
+        sqlite3_finalize(st)
+        return Err(Failed("sql: a statement with parameters must be alone; run several with `exec` and no parameters"))
+    }
+    match bind(db, st, params) {
+        Ok(_) => Ok(st),
+        Err(e) => {
+            sqlite3_finalize(st)
+            Err(e)
+        },
+    }
+}
+
+fn column(st: Handle, i: Int) -> Value {
+    match sqlite3_column_type(st, i) {
+        1 => Int(sqlite3_column_int64(st, i)),
+        2 => Float(sqlite3_column_double(st, i)),
+        3 => {
+            let p = sqlite3_column_text(st, i)
+            Text(limen_copy(p, sqlite3_column_bytes(st, i)).to_str())
+        },
+        4 => {
+            let p = sqlite3_column_blob(st, i)
+            Blob(limen_copy(p, sqlite3_column_bytes(st, i)))
+        },
+        _ => Null,
+    }
+}
+
+// Run SQL that returns no rows; the result is how many rows it changed.
+// With no parameters the text may hold several statements, separated by `;`
+// (a schema, say). With parameters it must be exactly one statement, and
+// each `?` takes the next value of `params`.
+pub fn exec(self: Db, text: Str, params: List[Value]) -> Result[Int, IoError] {
+    self.using(|db| exec_on(db, text, params))
+}
+
+fn exec_on(db: Handle, text: Str, params: List[Value]) -> Result[Int, IoError] {
+    if params.is_empty() {
+        let (rc, err) = sqlite3_exec(db, text, 0, 0)
+        if rc != ok_code() {
+            let msg = if err.addr == 0 { sqlite3_errstr(rc) } else { sqlite3_errmsg(db) }
+            sqlite3_free(err)
+            return Err(Failed("sql: {msg}"))
+        }
+        return Ok(sqlite3_changes64(db))
+    }
+    let st = prepare(db, text, params)?
+    let rc = sqlite3_step(st)
+    let result = if rc == done_code() || rc == row_code() { Ok(sqlite3_changes64(db)) } else { Err(fail(db, "exec")) }
+    sqlite3_finalize(st)
+    result
+}
+
+// Run one statement and collect every row it returns.
+pub fn query(self: Db, text: Str, params: List[Value]) -> Result[List[Row], IoError] {
+    self.using(|db| query_on(db, text, params))
+}
+
+fn query_on(db: Handle, text: Str, params: List[Value]) -> Result[List[Row], IoError] {
+    let st = prepare(db, text, params)?
+    let n = sqlite3_column_count(st)
+    let names = (0..<n).map(|i| sqlite3_column_name(st, i))
+    let mut rows = []
+    let mut rc = sqlite3_step(st)
+    while rc == row_code() {
+        rows.push(Row { columns: names, values: (0..<n).map(|i| column(st, i)) })
+        rc = sqlite3_step(st)
+    }
+    let result = if rc == done_code() { Ok(rows) } else { Err(fail(db, "query")) }
+    sqlite3_finalize(st)
+    result
+}
+
+// The first row, if any: for queries that look one thing up.
+pub fn query_one(self: Db, text: Str, params: List[Value]) -> Result[Option[Row], IoError] {
+    let rows = self.query(text, params)?
+    if rows.is_empty() { Ok(None) } else { Ok(Some(rows[0])) }
+}
+
+// The rowid of the last row inserted through this connection.
+pub fn last_id(self: Db) -> Result[Int, IoError] {
+    self.using(|db| Ok(sqlite3_last_insert_rowid(db)))
+}
+
+// Run `body` in a transaction: committed if it returns Ok, rolled back if it
+// returns Err or panics (the panic then goes on). Transactions do not nest.
+pub fn transaction[T](self: Db, body: fn() -> Result[T, IoError]) -> Result[T, IoError] {
+    if !self.using(|db| Ok(sqlite3_get_autocommit(db)))? {
+        return Err(Failed("sql: a transaction is already open on this connection"))
+    }
+    self.exec("BEGIN", [])?
+    match catch(body) {
+        Ok(Ok(v)) => {
+            match self.exec("COMMIT", []) {
+                Ok(_) => Ok(v),
+                Err(e) => {
+                    self.exec("ROLLBACK", [])
+                    Err(e)
+                },
+            }
+        },
+        Ok(Err(e)) => {
+            self.exec("ROLLBACK", [])
+            Err(e)
+        },
+        Err(msg) => {
+            self.exec("ROLLBACK", [])
+            panic(msg)
+        },
+    }
+}
+
+// ---------- reading rows ----------
+
+fn index(self: Row, name: Str) -> Int {
+    let mut i = 0
+    for c in self.columns {
+        if c == name {
+            return i
+        }
+        i = i + 1
+    }
+    panic("sql: the row has no column `{name}` (it has {self.columns.join(", ")})")
+}
+
+// The value of column `name`. Panics if there is no such column.
+pub fn get(self: Row, name: Str) -> Value {
+    self.values[self.index(name)]
+}
+
+fn wrong(name: Str, want: Str, v: Value) -> Str {
+    "sql: column `{name}` is not {want}: {v}"
+}
+
+// Typed access: None when the column is NULL. Panics if there is no such
+// column or it holds another type (an Int column reads as Float too).
+pub fn int(self: Row, name: Str) -> Option[Int] {
+    match self.get(name) {
+        Int(n) => Some(n),
+        Null => None,
+        v => panic(wrong(name, "an integer", v)),
+    }
+}
+
+pub fn float(self: Row, name: Str) -> Option[Float] {
+    match self.get(name) {
+        Float(x) => Some(x),
+        Int(n) => Some(n.to_float()),
+        Null => None,
+        v => panic(wrong(name, "a number", v)),
+    }
+}
+
+pub fn text(self: Row, name: Str) -> Option[Str] {
+    match self.get(name) {
+        Text(s) => Some(s),
+        Null => None,
+        v => panic(wrong(name, "text", v)),
+    }
+}
+
+pub fn blob(self: Row, name: Str) -> Option[Bytes] {
+    match self.get(name) {
+        Blob(b) => Some(b),
+        Null => None,
+        v => panic(wrong(name, "a blob", v)),
+    }
+}
+
+pub fn is_null(self: Row, name: Str) -> Bool {
+    match self.get(name) {
+        Null => true,
+        _ => false,
+    }
+}

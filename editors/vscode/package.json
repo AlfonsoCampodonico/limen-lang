@@ -1,9 +1,9 @@
 {
-  "name": "tessera",
-  "displayName": "Tessera",
-  "description": "Tessera language support: syntax highlighting, and errors, hover, go to definition, rename and completion from `tessera lsp`.",
+  "name": "limen",
+  "displayName": "Limen",
+  "description": "Limen language support: syntax highlighting, and errors, hover, go to definition, rename and completion from `limen lsp`.",
   "version": "0.1.0",
-  "publisher": "tessera-local",
+  "publisher": "limen-local",
   "private": true,
   "license": "UNLICENSED",
   "engines": {
@@ -14,60 +14,60 @@
   ],
   "main": "./extension.js",
   "activationEvents": [
-    "workspaceContains:**/tessera.toml"
+    "workspaceContains:**/limen.toml"
   ],
   "contributes": {
     "languages": [
       {
-        "id": "tessera",
+        "id": "limen",
         "aliases": [
-          "Tessera",
-          "tessera"
+          "Limen",
+          "limen"
         ],
         "extensions": [
-          ".tsr"
+          ".lmn"
         ],
         "configuration": "./language-configuration.json"
       }
     ],
     "grammars": [
       {
-        "language": "tessera",
-        "scopeName": "source.tessera",
-        "path": "./syntaxes/tessera.tmLanguage.json"
+        "language": "limen",
+        "scopeName": "source.limen",
+        "path": "./syntaxes/limen.tmLanguage.json"
       },
       {
-        "scopeName": "markdown.tessera.codeblock",
-        "path": "./syntaxes/tessera.markdown.tmLanguage.json",
+        "scopeName": "markdown.limen.codeblock",
+        "path": "./syntaxes/limen.markdown.tmLanguage.json",
         "injectTo": [
           "text.html.markdown"
         ],
         "embeddedLanguages": {
-          "meta.embedded.block.tessera": "tessera"
+          "meta.embedded.block.limen": "limen"
         }
       }
     ],
     "configuration": {
-      "title": "Tessera",
+      "title": "Limen",
       "properties": {
-        "tessera.path": {
+        "limen.path": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Path to the `tessera` executable, set in your user settings (a workspace cannot set it). When empty, `tessera` on the PATH is used, or else, in a trusted folder only, the build in that folder (`_build/default/bin/main.exe`).",
+          "markdownDescription": "Path to the `limen` executable, set in your user settings (a workspace cannot set it). When empty, `limen` on the PATH is used, or else, in a trusted folder only, the build in that folder (`_build/default/bin/main.exe`).",
           "scope": "machine"
         },
-        "tessera.languageServer.enabled": {
+        "limen.languageServer.enabled": {
           "type": "boolean",
           "default": true,
-          "description": "Start `tessera lsp` for errors, hover, go to definition, references, rename and completion."
+          "description": "Start `limen lsp` for errors, hover, go to definition, references, rename and completion."
         }
       }
     },
     "commands": [
       {
-        "command": "tessera.restartLanguageServer",
+        "command": "limen.restartLanguageServer",
         "title": "Restart Language Server",
-        "category": "Tessera"
+        "category": "Limen"
       }
     ],
     "semanticTokenTypes": [
@@ -89,34 +89,34 @@
     ],
     "semanticTokenScopes": [
       {
-        "language": "tessera",
+        "language": "limen",
         "scopes": {
           "capability": [
-            "support.type.capability.tessera"
+            "support.type.capability.limen"
           ],
           "namespace": [
-            "entity.name.namespace.tessera"
+            "entity.name.namespace.limen"
           ],
           "struct.capability": [
-            "support.type.capability.tessera"
+            "support.type.capability.limen"
           ],
           "enum.capability": [
-            "support.type.capability.tessera"
+            "support.type.capability.limen"
           ],
           "parameter.capability": [
-            "variable.parameter.capability.tessera"
+            "variable.parameter.capability.limen"
           ],
           "variable.capability": [
-            "variable.other.capability.tessera"
+            "variable.other.capability.limen"
           ],
           "property.capability": [
-            "variable.other.member.capability.tessera"
+            "variable.other.member.capability.limen"
           ]
         }
       }
     ],
     "configurationDefaults": {
-      "[tessera]": {
+      "[limen]": {
         "editor.tabSize": 4,
         "editor.insertSpaces": true,
         "editor.semanticHighlighting.enabled": true
@@ -124,7 +124,7 @@
     }
   },
   "scripts": {
-    "package": "vsce package --allow-missing-repository --skip-license -o tessera.vsix",
+    "package": "vsce package --allow-missing-repository --skip-license -o limen.vsix",
     "test": "node test/grammar.test.js"
   },
   "dependencies": {
@@ -138,9 +138,9 @@
   "capabilities": {
     "untrustedWorkspaces": {
       "supported": "limited",
-      "description": "In a folder you have not trusted, the extension does not run the folder's own build of `tessera`; highlighting and `tessera` from your PATH or user settings still work.",
+      "description": "In a folder you have not trusted, the extension does not run the folder's own build of `limen`; highlighting and `limen` from your PATH or user settings still work.",
       "restrictedConfigurations": [
-        "tessera.path"
+        "limen.path"
       ]
     },
     "virtualWorkspaces": false

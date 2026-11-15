@@ -1,8 +1,0 @@
-// Calls m and c, which tessera.lock recorded as c,m.
-foreign "m" {
-    pub fn cos(x: Int) -> Int
-}
-
-foreign "c" {
-    pub fn puts(s: Str) -> Int
-}

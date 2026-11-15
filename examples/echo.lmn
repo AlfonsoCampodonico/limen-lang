@@ -1,0 +1,47 @@
+// Echo server: one task per connection, all parked on the socket poller
+// while they wait. Serves `limit` connections, then reports.
+//
+//   limen build examples/echo.lmn -o echo
+//   ./echo --grant listen=127.0.0.1:9000
+//   python3 bench/echo_load.py 9000 10000
+
+fn echo(c: Conn) -> Int {
+    let mut total = 0
+    let mut more = true
+    while more {
+        match c.read() {
+            Ok(s) => {
+                if s.is_empty() {
+                    more = false
+                } else {
+                    total = total + s.len()
+                    if c.write(s).is_err() {
+                        more = false
+                    }
+                }
+            },
+            Err(_) => {
+                more = false
+            },
+        }
+    }
+    c.close()
+    total
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let l = root.listen.on("127.0.0.1:9000")?
+    let limit = 10000
+    let served = group g {
+        let mut i = 0
+        while i < limit {
+            match l.accept() {
+                Ok(c) => g.go(|| echo(c)),
+                Err(e) => root.stdout.print("accept failed: {e}"),
+            }
+            i = i + 1
+        }
+    }
+    root.stdout.print("served {served.len()} connections, {served.sum()} bytes echoed")
+    Ok(())
+}

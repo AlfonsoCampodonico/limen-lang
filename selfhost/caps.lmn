@@ -1,0 +1,227 @@
+// What a package lets its dependencies do, as src/package.ml checks it
+// after the type checker: every function of a dependency may only take
+// the capabilities limen.toml grants that dependency (E0320), every
+// function of a standard library module only those src/std/limen.toml
+// declares for it, and a dependency trusted with C may only call the C
+// libraries limen.lock recorded when it was trusted (E0324).
+//
+// Limen has no ambient authority, so the capabilities in a function's
+// signature are all it can ever use: the checker's FnInfo has them.
+use ast
+use diag
+use disk
+use package
+use paths
+use typecheck
+
+// The grants that cover a capability type: `Conn` comes from a network
+// connection or a listener.
+fn grant_of(c: Str) -> List[Str] {
+    match c {
+        "Net" => ["net"],
+        "Conn" => ["net", "listen"],
+        "Listen" | "Listener" => ["listen"],
+        "Root" => [],
+        other => [other.to_lower()],
+    }
+}
+
+// The problems of a loaded and checked program as `limen check` reports
+// them: the checker's errors, or else the capability checks' (each stage
+// only when the one before it found nothing), then the checker's warnings.
+// `std_file` is the number `files` gives src/std/limen.toml, which the
+// loader read with no number of its own.
+pub fn check(fs: Fs, place: disk.Place, files: List[diag.Source], std_file: Int, std_manifest: Option[package.Manifest], std_modules: List[(Str, Str)], manifest: Option[package.Manifest], packages: List[(Str, Str)], items: List[ast.Item], c: typecheck.Checked) -> List[diag.Diag] {
+    let warnings = c.diags.filter(|d| d.warning)
+    let mut errors = c.diags.filter(|d| !d.warning)
+    if errors.is_empty() {
+        let std = std_manifest ?? package.Manifest { name: "", path: "", deps: [], grants: [], trust: [], embed_roots: [] }
+        let numbered = { std with deps: std.deps.map(|d| { d with span: { d.span with file: std_file } }) }
+        errors = enforce(files, true, numbered, std_modules, c.infos)
+    }
+    match manifest {
+        Some(m) if errors.is_empty() => {
+            errors = enforce(files, false, m, packages, c.infos)
+            if errors.is_empty() {
+                errors = foreign_lock(fs, place, m, c_users(items, packages))
+            }
+        },
+        _ => {},
+    }
+    errors + warnings
+}
+
+// E0320: each function of a module that `module_pkg` maps to a dependency
+// takes only capabilities the dependency is granted. With `std`, `pkg` is
+// the standard library's manifest, and a module it does not list may take
+// nothing.
+fn enforce(files: List[diag.Source], std: Bool, pkg: package.Manifest, module_pkg: List[(Str, Str)], infos: List[typecheck.FnInfo]) -> List[diag.Diag] {
+    let mut out: List[diag.Diag] = []
+    for i in infos {
+        let module = match i.name.index_of(".") {
+            Some(k) => i.name.slice(0, k),
+            None => {
+                continue
+            },
+        }
+        let dn = match module_pkg.find(|x| x.0 == module) {
+            Some((_, dn)) => dn,
+            None => {
+                continue
+            },
+        }
+        let dep = pkg.deps.find(|d| d.name == dn)
+        let granted = dep.map(|d| d.caps) ?? []
+        let span = dep.map(|d| d.span) ?? diag.nowhere()
+        let allowed = |c: Str| match c {
+            "Root" => false,
+            "Foreign" => !std && pkg.trust.contains(dn),
+            _ => grant_of(c).any(|g| granted.contains(g)),
+        }
+        let missing = i.caps.filter(|c| c != "Root" && !allowed(c))
+        let missing = if i.caps.contains("Root") { ["Root"] + missing } else { missing }
+        let c = match missing {
+            [c, ..] => c,
+            [] => {
+                continue
+            },
+        }
+        // held through a struct or enum: say which field
+        let through = match i.via.find(|v| v.0 == c) {
+            Some((_, p)) => " through `{p}`",
+            None => "",
+        }
+        let takes = "`{i.name}` takes `{c}`{through} ({where(files, i.span)})"
+        if std {
+            out.push(diag.error("E0320", span, "standard library module `{dn}` uses capability `{c}`, which <std>/limen.toml does not declare").note(takes).note("this is a bug in the standard library: declare the capability in src/std/limen.toml, or stop taking it"))
+            continue
+        }
+        let how = match c {
+            "Root" => "a dependency can never take Root: pass it the narrower capability it needs",
+            "Foreign" => "calling C is full trust: if you trust `{dn}` with everything the program can do, add [trust] foreign = [\"{dn}\"] to limen.toml",
+            _ => "to allow it, add \"{grant_of(c)[0]}\" to its caps",
+        }
+        out.push(diag.error("E0320", span, "dependency `{dn}` uses capability `{c}`, which limen.toml does not grant it").note(takes).note(how))
+    }
+    out
+}
+
+// `FILE:LINE` of the start of `span`.
+fn where(files: List[diag.Source], span: ast.Span) -> Str {
+    let text = files.get(span.file).map(|f| f.text) ?? ""
+    let line = text.slice(0, span.lo.min(text.len())).bytes().count(|b| b == 10) + 1
+    "{diag.path_of(files, span.file)}:{line}"
+}
+
+// Who calls C: each dependency whose modules declare foreign functions,
+// with the libraries they name, the one that last gained a library first,
+// as src/modules.ml's c_users lists them.
+fn c_users(items: List[ast.Item], module_pkg: List[(Str, Str)]) -> List[(Str, List[Str])] {
+    let mut acc: List[(Str, List[Str])] = []
+    for i in items {
+        let (name, lib) = match i {
+            IFn(d) => match d.foreign {
+                Some(f) => (d.name, f.lib),
+                None => {
+                    continue
+                },
+            },
+            _ => {
+                continue
+            },
+        }
+        let module = match name.index_of(".") {
+            Some(k) => name.slice(0, k),
+            None => {
+                continue
+            },
+        }
+        match module_pkg.find(|x| x.0 == module) {
+            Some((_, dep)) => {
+                let libs = acc.find(|x| x.0 == dep).map(|x| x.1) ?? []
+                if !libs.contains(lib) {
+                    acc = [(dep, libs + [lib])] + acc.filter(|x| x.0 != dep)
+                }
+            },
+            None => {},
+        }
+    }
+    acc
+}
+
+// E0324: each trusted dependency's C libraries are the ones limen.lock
+// recorded when it was trusted. Checking only reads limen.lock; a build
+// then records what is new there (`record`).
+fn foreign_lock(fs: Fs, place: disk.Place, pkg: package.Manifest, uses: List[(Str, List[Str])]) -> List[diag.Diag] {
+    let recorded = recorded_libraries(fs, place, pkg)
+    let mut out: List[diag.Diag] = []
+    for (d, libs) in uses {
+        if libs.is_empty() || !pkg.trust.contains(d) {
+            continue
+        }
+        let old = match recorded.find(|x| x.0 == d) {
+            Some((_, old)) => old,
+            None => {
+                continue
+            },
+        }
+        if old.sort() == libs.sort() {
+            continue
+        }
+        let span = pkg.deps.find(|x| x.name == d).map(|x| x.span) ?? diag.nowhere()
+        let added = libs.filter(|l| !old.contains(l)).map(|l| "`" + l + "`").join(", ")
+        let problem = diag.error("E0324", span, "trusted dependency `{d}` now calls C library {added}; limen.lock recorded {old.join(", ")}").note("calling C is full trust: review what changed in the dependency").note("then delete the line `foreign {d} ...` from limen.lock to record the new libraries")
+        out.push(problem)
+    }
+    out
+}
+
+fn lock_path(place: disk.Place, pkg: package.Manifest) -> Str {
+    place.locate(paths.concat(paths.dirname(pkg.path), "limen.lock"))
+}
+
+fn recorded_libraries(fs: Fs, place: disk.Place, pkg: package.Manifest) -> List[(Str, List[Str])] {
+    match fs.read(lock_path(place, pkg)) {
+        Ok(text) => read_foreign_lock(text),
+        Err(_) => [],
+    }
+}
+
+// What a build does after the checks passed, as src/package.ml's
+// check_foreign_lock does when it may write: record in limen.lock the C
+// libraries of each trusted dependency it has no line for, and drop the
+// lines of those that no longer call C. A lock that cannot be written is
+// left as it is.
+pub fn record(fs: Fs, place: disk.Place, pkg: package.Manifest, items: List[ast.Item], packages: List[(Str, Str)]) {
+    let recorded = recorded_libraries(fs, place, pkg)
+    let uses = c_users(items, packages).filter(|u| !u.1.is_empty() && pkg.trust.contains(u.0))
+    let fresh = uses.map(|u| (u.0, recorded.find(|x| x.0 == u.0).map(|x| x.1) ?? u.1))
+    if fresh.sort() == recorded.sort() {
+        return
+    }
+    let path = lock_path(place, pkg)
+    let exists = fs.exists(path)
+    let others = match fs.read(path) {
+        Ok(text) => text.split("\n").filter(|l| {
+            let t = l.trim()
+            t != "" && !t.starts_with("foreign ") && !t.starts_with("#")
+        }),
+        Err(_) => [],
+    }
+    if fresh.is_empty() && others.is_empty() && !exists {
+        return
+    }
+    let header = "# limen.lock: the exact version of each git dependency, and the C libraries of each trusted one, written by limen. Commit it.\n"
+    let text = header + others.map(|l| l + "\n").join("") + fresh.map(|f| "foreign {f.0} {f.1.join(",")}\n").join("")
+    match fs.write(path, text) {
+        _ => {},
+    }
+}
+
+// The `foreign NAME LIB,LIB` lines of limen.lock.
+fn read_foreign_lock(text: Str) -> List[(Str, List[Str])] {
+    text.split("\n").flat_map(|l| match l.trim().split(" ").filter(|w| w != "") {
+        ["foreign", name, libs] => [(name, libs.split(","))],
+        _ => [],
+    })
+}

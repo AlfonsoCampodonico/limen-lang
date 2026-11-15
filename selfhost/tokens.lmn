@@ -1,0 +1,79 @@
+// Prints the tokens of one file as selfhost/lexer.lmn sees them, in the
+// format of selfhost/tokdump (the OCaml lexer's), so the two can be compared:
+//   LO HI NL KIND VALUE
+// Text is escaped the same way on both sides: printable ASCII as it is,
+// except \ and |, which are written \x5c and \x7c like every other byte.
+//
+//   limen run selfhost/tokens.lmn --grant fs=.:ro -- examples/hello.lmn
+use lexer
+
+fn hex(b: Int) -> Str {
+    let digits = "0123456789abcdef"
+    "\\x" + digits.slice(b / 16, b / 16 + 1) + digits.slice(b % 16, b % 16 + 1)
+}
+
+fn esc(s: Str) -> Str {
+    let mut out: List[Str] = []
+    let mut plain: List[Int] = []
+    for b in s.bytes() {
+        if b >= 32 && b <= 126 && b != 92 && b != 124 {
+            plain.push(b)
+        } else {
+            if !plain.is_empty() {
+                out.push(bytes(plain).to_str())
+                plain = []
+            }
+            out.push(hex(b))
+        }
+    }
+    if !plain.is_empty() {
+        out.push(bytes(plain).to_str())
+    }
+    out.join("")
+}
+
+fn part(p: lexer.Part) -> Str {
+    match p {
+        Lit(s) => "L" + esc(s),
+        Interp(s, at) => "I{at}:" + esc(s),
+    }
+}
+
+fn line(t: lexer.Token) -> Str {
+    let (kind, value) = match t.kind {
+        IntLit(v) => ("INT", v.to_str()),
+        FloatLit(s) => ("FLOAT", esc(s)),
+        StrLit(parts) => ("STR", parts.map(|p| part(p)).join("|")),
+        Ident(s) => ("IDENT", s),
+        Keyword(s) => ("KW", s),
+        Symbol(s) => ("SYM", esc(s)),
+        End => ("EOF", ""),
+    }
+    let nl = if t.nl { 1 } else { 0 }
+    "{t.lo} {t.hi} {nl} {kind} {value}"
+}
+
+fn main(root: Root) -> Int {
+    let out = root.stdout
+    let path = root.args().first() ?? {
+        out.print("usage: tokens FILE")
+        return 2
+    }
+    match root.fs.read(path) {
+        Ok(src) => {
+            match lexer.lex(src) {
+                Ok(toks) => {
+                    for t in toks {
+                        out.print(line(t))
+                    }
+                },
+                Err(e) => out.print("ERROR {e.code} {e.lo} {e.hi}"),
+            }
+            0
+        },
+        Err(e) => {
+            out.print("cannot read {path}: {e}")
+            1
+        },
+    }
+}

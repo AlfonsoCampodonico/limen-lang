@@ -1,0 +1,28 @@
+// Pull fields out of log lines with a regex, then summarise them.
+// Run: limen run examples/logscan.lmn
+use format
+use regex
+use time
+
+fn main(root: Root) {
+    let out = root.stdout
+    let log = "2026-11-11T09:15:02Z GET /index.html 200 5120\n2026-11-11T09:15:09Z GET /missing 404 0\nnot a log line\n2026-11-11T10:01:44+01:00 POST /api/orders 201 1048576\n"
+    let line = regex.must("^(?P<at>\\S+) (?P<method>[A-Z]+) (?P<path>\\S+) (?P<status>\\d\{3\}) (?P<bytes>\\d+)$")
+    let mut total = 0
+    for l in log.lines() {
+        match line.find(l) {
+            Some(m) => {
+                let at = time.parse_iso(m.named("at") ?? "") ?? 0
+                let bytes = (m.named("bytes") ?? "0").parse_int() ?? 0
+                total = total + bytes
+                out.print("{time.format(at, "%H:%M:%S")} {format.align_left(m.named("method") ?? "", 5)}{format.align_left(m.named("path") ?? "", 12)}{m.named("status") ?? ""} {format.align_right(format.thousands(bytes), 9)}")
+            },
+            None => out.print("skipped: {l}"),
+        }
+    }
+    out.print("total {format.thousands(total)} bytes")
+    // replace with group references, and split on a pattern
+    let dates = regex.must("(\\d\{4\})-(\\d\{2\})-(\\d\{2\})")
+    out.print(dates.replace("due 2026-12-01, paid 2026-11-30", "$3/$2/$1"))
+    out.print("{regex.must("\\s*[,;]\\s*").split("a, b;c ,d")}")
+}

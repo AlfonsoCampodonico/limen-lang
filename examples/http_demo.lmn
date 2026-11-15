@@ -1,0 +1,74 @@
+// An HTTP server and client talking over loopback, with the json module.
+// Run: limen run examples/http_demo.lmn --grant listen=127.0.0.1:0 --grant net=127.0.0.1
+use http
+use json
+
+fn route(r: http.Request) -> http.Response {
+    if r.path == "/hello" {
+        http.text(200, "hi " + r.method)
+    } else if r.path == "/crash" {
+        // a bug in a handler: the server answers 500 and keeps serving
+        let empty: List[Str] = []
+        http.text(200, empty[0])
+    } else if r.method == "POST" {
+        match json.parse(r.body) {
+            Ok(v) => http.json(201, json.stringify(json.Obj([json.field("got", v)]))),
+            Err(e) => http.text(400, e),
+        }
+    } else {
+        http.text(404, "no " + r.path)
+    }
+}
+
+fn client(net: Net, port: Int) -> Str {
+    let base = "http://127.0.0.1:{port}"
+    let mut log = []
+    for u in ["/hello", "/crash", "/missing"] {
+        match http.get(net, base + u) {
+            Ok(r) => log.push("{r.status} {r.header("content-type") ?? "-"} {r.body}"),
+            Err(e) => log.push("{e}"),
+        }
+    }
+    match http.post(net, base + "/echo", "application/json", "[1, \{\"a\": true\}]") {
+        Ok(r) => log.push("{r.status} {r.body}"),
+        Err(e) => log.push("{e}"),
+    }
+    log.join("\n")
+}
+
+// A server that answers with a chunked body, as many real servers do.
+fn chunked(l: Listener) -> Str {
+    match l.accept() {
+        Ok(c) => {
+            let _ = http.read_request(c)
+            let _ = c.write("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6;x=1\r\n world\r\n0\r\n\r\n")
+            c.close()
+            "chunked sent"
+        },
+        Err(e) => "{e}",
+    }
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let l = root.listen.on("127.0.0.1:0")?
+    let port = l.port()
+    let net = root.net
+    let results = group g {
+        g.go(|| "served {http.serve(l, 4, route)}")
+        g.go(|| client(net, port))
+    }
+    for r in results {
+        root.stdout.print(r)
+    }
+    let l2 = root.listen.on("127.0.0.1:0")?
+    let port2 = l2.port()
+    let more = group g {
+        g.go(|| chunked(l2))
+        g.go(|| match http.get(net, "http://127.0.0.1:{port2}/") {
+            Ok(r) => "{r.status} {r.body}",
+            Err(e) => "{e}",
+        })
+    }
+    root.stdout.print(more.join("\n"))
+    Ok(())
+}
