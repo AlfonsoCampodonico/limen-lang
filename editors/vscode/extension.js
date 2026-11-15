@@ -1,4 +1,4 @@
-// Starts `tessera lsp` for .tessera files. Highlighting needs none of this: it
+// Starts `tessera lsp` for .tsr files. Highlighting needs none of this: it
 // comes from the grammar in syntaxes/.
 const vscode = require("vscode");
 const fs = require("fs");

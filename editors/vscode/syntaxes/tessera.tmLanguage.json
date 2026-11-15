@@ -3,7 +3,7 @@
   "name": "Tessera",
   "scopeName": "source.tessera",
   "fileTypes": [
-    "tessera"
+    "tsr"
   ],
   "patterns": [
     {
@@ -204,7 +204,7 @@
     "keyword": {
       "patterns": [
         {
-          "match": "\\b(if|else|match|for|in|while|return|break|continue|select|defer|group|until|interleaved)\\b",
+          "match": "\\b(if|else|match|for|in|while|return|break|continue|select|defer|group|until)\\b",
           "name": "keyword.control.tessera"
         },
         {
@@ -216,8 +216,12 @@
           "name": "storage.modifier.tessera"
         },
         {
-          "match": "\\b(with)\\b",
+          "match": "\\b(with|as)\\b",
           "name": "keyword.other.with.tessera"
+        },
+        {
+          "match": "\\b(virtual)\\b",
+          "name": "storage.modifier.tessera"
         },
         {
           "match": "\\b(use)\\b",
@@ -234,7 +238,7 @@
       ]
     },
     "capability": {
-      "match": "\\b(Root|Net|Fs|Listen|Env|Exec|Foreign|Stdout|Stdin|Clock|Rand)\\b",
+      "match": "\\b(Root|Net|Fs|Listen|Listener|Conn|Env|Exec|Foreign|Stdout|Stderr|Stdin|Clock|Rand)\\b",
       "name": "support.type.capability.tessera"
     },
     "type": {
@@ -300,12 +304,20 @@
           "name": "keyword.operator.arrow.tessera"
         },
         {
+          "match": "<<|>>",
+          "name": "keyword.operator.bitwise.tessera"
+        },
+        {
           "match": "==|!=|<=|>=|&&|\\|\\||[<>!]",
           "name": "keyword.operator.comparison.tessera"
         },
         {
           "match": "[-+*/%]",
           "name": "keyword.operator.arithmetic.tessera"
+        },
+        {
+          "match": "[&^~]",
+          "name": "keyword.operator.bitwise.tessera"
         },
         {
           "match": "=",

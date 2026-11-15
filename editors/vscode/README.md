@@ -2,7 +2,7 @@
 
 A local extension, not published to the marketplace.
 
-- **Highlighting** for `.tessera` files and for ```` ```tessera ```` blocks in Markdown. Capability types (`Net`, `Fs`, `Clock` and the rest) get their own scope, `support.type.capability.tessera`, so authority entering a function stands out.
+- **Highlighting** for `.tsr` files and for ```` ```tessera ```` blocks in Markdown. Capability types (`Net`, `Fs`, `Clock` and the rest) get their own scope, `support.type.capability.tessera`, so authority entering a function stands out.
 - **The language server** (`tessera lsp`): errors as you type, hover, go to definition, references, rename, completion and quick fixes.
 - Comment toggling, bracket matching, auto-closing quotes and indentation.
 

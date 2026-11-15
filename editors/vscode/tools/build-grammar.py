@@ -2,7 +2,7 @@
 Edit this file, not the JSON: run `python3 tools/build-grammar.py`."""
 import json, os
 
-CAPS = "Root|Net|Fs|Listen|Env|Exec|Foreign|Stdout|Stdin|Clock|Rand"
+CAPS = "Root|Net|Fs|Listen|Listener|Conn|Env|Exec|Foreign|Stdout|Stderr|Stdin|Clock|Rand"
 ID = r"[A-Za-z_][A-Za-z0-9_]*"
 LOWER = r"[a-z_][A-Za-z0-9_]*"
 
@@ -10,7 +10,7 @@ grammar = {
     "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
     "name": "Tessera",
     "scopeName": "source.tessera",
-    "fileTypes": ["tessera"],
+    "fileTypes": ["tsr"],
     "patterns": [{"include": "#code"}],
     "repository": {
         "code": {"patterns": [
@@ -104,7 +104,8 @@ grammar = {
              "name": "keyword.control.tessera"},
             {"match": r"\b(let|fn|struct|enum|interface)\b", "name": "storage.type.tessera"},
             {"match": r"\b(mut|pub|dyn)\b", "name": "storage.modifier.tessera"},
-            {"match": r"\b(with)\b", "name": "keyword.other.with.tessera"},
+            {"match": r"\b(with|as)\b", "name": "keyword.other.with.tessera"},
+            {"match": r"\b(virtual)\b", "name": "storage.modifier.tessera"},
             {"match": r"\b(use)\b", "name": "keyword.other.use.tessera"},
             {"match": r"\b(true|false)\b", "name": "constant.language.boolean.tessera"},
             {"match": r"\bself\b", "name": "variable.language.self.tessera"},
@@ -138,8 +139,10 @@ grammar = {
             {"match": r"\?\?|\?\.|\?", "name": "keyword.operator.option.tessera"},
             {"match": r"\.\.<|\.\.", "name": "keyword.operator.range.tessera"},
             {"match": r"=>|->", "name": "keyword.operator.arrow.tessera"},
+            {"match": r"<<|>>", "name": "keyword.operator.bitwise.tessera"},
             {"match": r"==|!=|<=|>=|&&|\|\||[<>!]", "name": "keyword.operator.comparison.tessera"},
             {"match": r"[-+*/%]", "name": "keyword.operator.arithmetic.tessera"},
+            {"match": r"[&^~]", "name": "keyword.operator.bitwise.tessera"},
             {"match": r"=", "name": "keyword.operator.assignment.tessera"},
             {"match": r"\|", "name": "punctuation.definition.closure.tessera"},
         ]},
