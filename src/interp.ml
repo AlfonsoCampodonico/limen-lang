@@ -1399,7 +1399,53 @@ module Foreign = struct
   let libs : (string, nativeint) Hashtbl.t = Hashtbl.create 4
   let syms : (string * string, nativeint) Hashtbl.t = Hashtbl.create 16
 
-  (* lib<name>.dylib on macOS, lib<name>.so elsewhere; "c" is the program itself *)
+  (* On Linux lib<name>.so is the name the linker looks for (-l<name>), and it
+     may be a linker script rather than the library: glibc's libm.so and
+     libc.so, ncurses' libncurses.so, say, name the real shared object
+     (libm.so.6) in GROUP ( ... ) or INPUT ( ... ). The linker follows the
+     script and the program records the object it names, so the dynamic
+     linker loads that; dlopen cannot read a script ("invalid ELF header").
+     Given dlopen's error for a script, whose message starts with the path it
+     found, the shared objects the script names, in order (AS_NEEDED and -l
+     entries left out). *)
+  let script_targets err =
+    match String.index_opt err ':' with
+    | None -> []
+    | Some i ->
+      let path = String.sub err 0 i in
+      if not (Filename.is_relative path) && Filename.check_suffix path ".so" && Sys.file_exists path then
+        match In_channel.with_open_bin path (fun ic -> really_input_string ic (min 4096 (in_channel_length ic))) with
+        | exception _ -> []
+        | text ->
+          (* drop comments, then split on spaces and parentheses *)
+          let buf = Buffer.create (String.length text) in
+          let i = ref 0 and n = String.length text in
+          while !i < n do
+            if !i + 1 < n && text.[!i] = '/' && text.[!i + 1] = '*' then begin
+              (match Interp_util.find_sub text "*/" (!i + 2) with Some j -> i := j + 2 | None -> i := n);
+              Buffer.add_char buf ' '
+            end
+            else begin
+              let c = text.[!i] in
+              Buffer.add_char buf (if c = '(' || c = ')' || c = ',' || c = '\n' || c = '\t' || c = '\r' then ' ' else c);
+              incr i
+            end
+          done;
+          let words = List.filter (( <> ) "") (String.split_on_char ' ' (Buffer.contents buf)) in
+          let rec go acc depth = function
+            | ("GROUP" | "INPUT") :: rest -> go acc 1 rest
+            | "AS_NEEDED" :: rest -> go acc 2 rest
+            | w :: rest when depth > 0 ->
+              let so = Interp_util.find_sub w ".so" 0 <> None && not (String.starts_with ~prefix:"-l" w) in
+              go (if so && depth = 1 then w :: acc else acc) depth rest
+            | _ :: rest -> go acc 0 rest
+            | [] -> List.rev acc
+          in
+          if String.length text > 0 && text.[0] = '\x7f' then [] else go [] 0 words
+      else []
+
+  (* lib<name>.dylib on macOS, lib<name>.so elsewhere (or what a linker
+     script of that name names); "c" is the program itself *)
   let load lib : (nativeint, string) result =
     match Hashtbl.find_opt libs lib with
     | Some h -> Ok h
@@ -1410,6 +1456,14 @@ module Foreign = struct
           (Error "") names
       in
       let r = if lib = "c" then try_open [ "" ] else try_open [ "lib" ^ lib ^ ".dylib"; "lib" ^ lib ^ ".so" ] in
+      let r =
+        match r with
+        | Error e -> (
+          match script_targets e with
+          | [] -> r
+          | targets -> ( match try_open targets with Ok h -> Ok h | Error _ -> r))
+        | Ok _ -> r
+      in
       (match r with Ok h -> Hashtbl.replace libs lib h | Error _ -> ());
       r
 

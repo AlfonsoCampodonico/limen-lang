@@ -8201,7 +8201,9 @@ fn main(root: Root) {
   ok "caps-grants-json" (code = 0 && Interp_util.find_sub o {|"grants":["exec=echo hi|-n","exec=sh -c"]|} 0 <> None) o;
   let code, _, e = limen_cli [ "run"; gexec; "--grant"; "exec=* -c" ] in
   ok "grants-exec-flag-bad" (code = 2 && Interp_util.find_sub e "exec grant" 0 <> None) (sprintf "code %d, err %S" code e);
-  put "grants/ffi.lmn" "foreign \"c\" {\n    fn abs(n: Int32) -> Int32\n}\n\nforeign \"m\" {\n    fn cbrt(x: Float) -> Float\n}\n\nfn main(root: Root) {\n    root.stdout.print(\"{abs(root.foreign, -2)} {cbrt(root.foreign, 27.0)} {root.foreign.allows(\"z\")}\")\n}\n";
+  (* sqrt, not cbrt: a square root is correctly rounded everywhere (IEEE
+     754), while glibc's cbrt(27.0) is 3.0000000000000004 *)
+  put "grants/ffi.lmn" "foreign \"c\" {\n    fn abs(n: Int32) -> Int32\n}\n\nforeign \"m\" {\n    fn sqrt(x: Float) -> Float\n}\n\nfn main(root: Root) {\n    root.stdout.print(\"{abs(root.foreign, -2)} {sqrt(root.foreign, 9.0)} {root.foreign.allows(\"z\")}\")\n}\n";
   List.iter
     (fun (name, extra) ->
       let code, o, e = limen_cli ([ "run" ] @ extra @ [ Filename.concat pdir "grants/ffi.lmn"; "--grant"; "foreign=c,m" ]) in
