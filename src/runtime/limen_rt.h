@@ -64,6 +64,7 @@ typedef struct WCatch {
 typedef struct { void *v; uint8_t *o; void (*d)(void *); } WCl;
 static inline void w_cl_run(WCl *c) { if (*c->o) { *c->o = 0; c->d(c->v); } }
 static WCatch **w_catch_slot(void); /* the current fiber's innermost boundary, or NULL outside fibers */
+static void w_mark_unwinding(void); /* the current fiber's cancellation is unwinding it */
 
 static inline void w_hdr_unlink(WHdr *h) {
   if (h->prev) { h->prev->next = h->next; h->next->prev = h->prev; h->prev = h->next = NULL; }
@@ -230,6 +231,7 @@ __attribute__((noreturn)) static void w_panic_c(const char *msg, const char *whe
 __attribute__((noreturn)) static void w_cancel_unwind(void) {
   WCatch **slot = w_catch_slot();
   if (!slot || !*slot) w_fatal_c("internal: cancelled outside a task", "?");
+  w_mark_unwinding();
   (*slot)->cancel = 1;
   w_unwind_to(slot, *slot);
 }
@@ -1580,6 +1582,7 @@ struct WFiber {
   struct WSel *wait;                    /* the token of the wait it is parked in, if cancellable */
   WScope *scopes;                       /* deadline scopes it is in, innermost first (under wlock) */
   const char *in_cb;                    /* in a callback from C: where the callback is declared */
+  int unwinding;                        /* its cancellation is unwinding it: checkpoints let defers finish */
   WOut *out;                            /* where its output goes (NULL: stdout); see Cap_print */
   struct WCap *cb_foreign;              /* in a foreign call: its Foreign, for callbacks that take one */
 #ifdef W_ASAN
@@ -1915,6 +1918,7 @@ __attribute__((noinline)) static WCatch **w_catch_slot(void) {
   if (!w || !w->current) return NULL;
   return &w->current->catch_top;
 }
+static void w_mark_unwinding(void) { w_self()->current->unwinding = 1; }
 static void w_prepare_park(void) { __atomic_store_n(&w_current()->park_state, W_PARKING, __ATOMIC_RELEASE); }
 static void w_park_commit(void *p) {
   WFiber *f = (WFiber *)p;
@@ -2037,6 +2041,27 @@ static void w_interrupt_fiber(WFiber *f, int task) {
   if (wake) w_wake(f);
 }
 static void w_cancel_fiber(WFiber *f) { w_interrupt_fiber(f, 1); }
+
+/* ---- checkpoints ----
+   A cancelled task also stops where it does not wait: generated code checks
+   at the top of every loop iteration and on entry to every function. The
+   check is one relaxed load of w_stopping, the number of groups that are
+   cancelling (their deadline passed, or the code running them is being
+   abandoned) and have not been joined yet; only while it is not zero does a
+   check look at the current fiber. So code outside any cancelled group, the
+   main task's included, pays a load and a branch the CPU predicts. A
+   callback from C never stops at a checkpoint (nothing unwinds through C's
+   frames); it stops at the first checkpoint after the foreign call. Once a
+   cancellation is unwinding the fiber, checkpoints let the deferred code it
+   runs finish (a wait in it still stops it); a group body's own deadline,
+   once landed, makes them look again (w_scope_land). */
+static int64_t w_stopping;
+__attribute__((noinline, cold)) static void w_checkpoint(void) {
+  WWorker *w = w_self();
+  if (!w || !w->current || w->current->in_cb || w->current->unwinding) return;
+  if (w_is_cancelled()) w_cancel_unwind();
+}
+#define W_CHECK() do { if (__builtin_expect(__atomic_load_n(&w_stopping, __ATOMIC_RELAXED) != 0, 0)) w_checkpoint(); } while (0)
 static inline int w_tok_claim(WSel *tok, int idx) {
   int zero = 0;
   if (!__atomic_compare_exchange_n(&tok->done, &zero, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return 0;
@@ -2219,6 +2244,7 @@ struct WGroup {
   WFiber *waiter; WSel *wtok;           /* the task joining it, and its wait token */
   int64_t n, cap; WTask **tasks;        /* in spawn order; grown under mu */
   int cancelled;                        /* its deadline passed: tasks started now never run */
+  int stopping;                         /* 1: counted in w_stopping; 2: counted and uncounted (under mu) */
   WFiber *body;                         /* the fiber running its body under the deadline, if any */
   WTimer deadline;                      /* `group g until clock.after(ms)` (pos -1 when none) */
   /* output, under w_out_mu: */
@@ -2367,7 +2393,7 @@ static WGroup *w_group_new(int ordered) {
 /* A group with a deadline ms milliseconds from now. */
 static WGroup *w_group_new_until(int64_t ms, int ordered) {
   WGroup *g = w_group_new(ordered);
-  if (ms <= 0) { g->cancelled = 1; return g; }
+  if (ms <= 0) { g->cancelled = 1; g->stopping = 1; __atomic_fetch_add(&w_stopping, 1, __ATOMIC_RELAXED); return g; }
   g->deadline.at = w_deadline_ms(ms); g->deadline.fire = w_group_deadline; g->deadline.arg = g;
   w_tm_add(&g->deadline);
   return g;
@@ -2376,6 +2402,7 @@ static WGroup *w_group_new_until(int64_t ms, int ordered) {
 static void w_group_cancel(WGroup *g) {
   pthread_mutex_lock(&g->mu);
   __atomic_store_n(&g->cancelled, 1, __ATOMIC_RELEASE);
+  if (!g->stopping) { g->stopping = 1; __atomic_fetch_add(&w_stopping, 1, __ATOMIC_RELAXED); }
   for (int64_t i = 0; i < g->n; i++) if (!g->tasks[i]->done && g->tasks[i]->f) w_cancel_fiber(g->tasks[i]->f);
   if (g->body) w_interrupt_fiber(g->body, 0);   /* the body stops at its next wait too */
   pthread_mutex_unlock(&g->mu);
@@ -2411,6 +2438,7 @@ static void w_scope_land(WCatch *c, WScope *sc) {
   WFiber *f = w_current();
   int mine = c->cancel && __atomic_load_n(sc->stop, __ATOMIC_ACQUIRE) && !__atomic_load_n(&f->cancelled, __ATOMIC_ACQUIRE) && !w_scopes_stopped(sc->prev);
   if (mine) {
+    f->unwinding = 0;   /* the body has stopped; the code after the group runs as usual */
     for (;;) {
       WHdr *h = c->objs.next;
       while (h != &c->objs && h->kind != WK_GROUP) h = h->next;
@@ -2543,6 +2571,11 @@ static void w_group_wait(WGroup *g, int cancellable) {
     }
   } else pthread_mutex_unlock(&g->mu);
   if (g->deadline.fire) w_tm_remove(&g->deadline);
+  /* every task has stopped and the deadline cannot fire any more: the
+     group no longer makes checkpoints look */
+  pthread_mutex_lock(&g->mu);
+  if (g->stopping == 1) { g->stopping = 2; __atomic_fetch_sub(&w_stopping, 1, __ATOMIC_RELAXED); }
+  pthread_mutex_unlock(&g->mu);
   /* every task has finished, so all their output has gone out */
   w_out_lock();
   w_live_remove(g);

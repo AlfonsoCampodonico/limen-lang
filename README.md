@@ -268,7 +268,7 @@ Ordering is structural: `<` and `sort()` work on numbers, strings, `Bool`, and o
 
 Tuples `(Int, Str)` and maps `Map[Str, Int]` are built in: `let (q, r) = divmod(17, 5)`, `counts[w] = counts.get(w) ?? 0 + 1`. Keys can be tuples, structs and enums (`grid[(x, y)]`), and entries change in place: `stats[name].hits = stats[name].hits + 1`. Maps iterate in insertion order, the same in both backends (see [examples/tuples.lmn](examples/tuples.lmn) and [examples/maps.lmn](examples/maps.lmn)).
 
-`group g until clock.after(2000) { ... }` gives a group a deadline: tasks still running then are cancelled (freeing what they own) and the group evaluates to a `List[Option[T]]` with `None` for each of them.
+`group g until clock.after(2000) { ... }` gives a group a deadline: tasks still running then are cancelled (freeing what they own) and the group evaluates to a `List[Option[T]]` with `None` for each of them. A cancelled task stops at its next wait or checkpoint: every loop round and every call is one, so a task that only computes is stopped too, at the cost of one predicted branch while nothing is being cancelled.
 
 `select { v = jobs.recv() if open => ..., out.send(x) => ..., clock.after(500) => ... }` waits on several channels, with guards to turn arms off and an optional timeout (or `_` to not wait at all; see [examples/select.lmn](examples/select.lmn)). `clock.sleep(ms)` parks a task without blocking a thread.
 

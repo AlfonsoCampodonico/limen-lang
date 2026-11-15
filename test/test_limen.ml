@@ -4935,6 +4935,8 @@ fn main(root: Root) {
             }
             inner.len()
         })
+        // computing without waiting: stopped at a checkpoint (a loop's next
+        // round), so it has no result either
         g.go(|| {
             let mut i = 0
             while clock.now_ms() - start < 200 {
@@ -4974,30 +4976,34 @@ fn main(root: Root) {
     })
     out.print("{p}")
 }
-|} "[Some(1), None, None, None, None, None, None, Some(7)]\ntrue\n[None]\n[Some(1)]\nErr(\"boom\")\n";
+|} "[Some(1), None, None, None, None, None, None, None]\ntrue\n[None]\n[Some(1)]\nErr(\"boom\")\n";
   (* The scheduler busy past both a deadline and a later sleep or timeout:
      the timers ring in order, so the deadline stops what was due after it.
-     A task that computes without waiting stalls the interpreter's scheduler
-     (and one native worker) deterministically. *)
-  out "group-until-stalled" {|use time
+     A task in a C call that does not return for a while stalls the
+     interpreter's scheduler (and one native worker) deterministically: a
+     loop no longer does, since its checkpoints let the deadline in. The
+     task finishes without reaching another checkpoint, so it keeps
+     its result. *)
+  out "group-until-stalled" ~grants:{ Interp.no_grants with foreign = [ "c" ] } {|use time
 
-fn busy(clock: Clock, ms: Int) -> Int {
+foreign "c" {
+    fn usleep(us: Int32) -> Int32
+}
+
+fn busy(clock: Clock, f: Foreign, ms: Int) -> Int {
     clock.sleep(5)
-    let until = clock.now_ms() + ms
-    let mut n = 0
-    while clock.now_ms() < until {
-        n = n + 1
-    }
+    usleep(f, ms * 1000)
     1
 }
 
 fn main(root: Root) {
     let out = root.stdout
     let clock = root.clock
+    let f = root.foreign
     let never: Chan[Int] = channel(0)
     // the body's sleep is due after the deadline: the late task never starts
     let late = group g until clock.after(30) {
-        g.go(|| busy(clock, 150))
+        g.go(|| busy(clock, f, 150))
         clock.sleep(100)
         g.go(|| {
             out.print("ran late")
@@ -5015,7 +5021,7 @@ fn main(root: Root) {
             clock.after(120) => 4,
             clock.after(100) => 5,
         })
-        g.go(|| busy(clock, 150))
+        g.go(|| busy(clock, f, 150))
     }
     // a sleep due before the deadline still wins
     let early = group g until clock.after(100) {
@@ -5023,7 +5029,7 @@ fn main(root: Root) {
             clock.sleep(30)
             2
         })
-        g.go(|| busy(clock, 150))
+        g.go(|| busy(clock, f, 150))
     }
     // time.within: the same deadline, through a group of its own
     let within = group g {
@@ -5031,11 +5037,97 @@ fn main(root: Root) {
             clock.sleep(100)
             Ok(2)
         }).is_ok())
-        g.go(|| busy(clock, 150) == 1)
+        g.go(|| busy(clock, f, 150) == 1)
     }
     out.print("{late} {slept} {early} {within}")
 }
 |} "[Some(1)] [None, None, Some(1)] [Some(2), Some(1)] [false, true]\n";
+  (* Checkpoints: a cancelled task stops where it computes without waiting,
+     at a loop's next round or a function's entry, and unwinds as at a wait:
+     defers run, `catch` does not stop it, inner groups are cancelled and
+     joined. Every loop below would run for hours. *)
+  par "cancel-checkpoints" {|fn spin(n: Int) -> Int {
+    let mut i = 0
+    let mut x = 0
+    while i < n {
+        x = (x + i) % 1000
+        i = i + 1
+    }
+    x
+}
+
+// exponential: only a check on entry stops it
+fn deep(n: Int) -> Int {
+    if n == 0 { 1 } else { deep(n - 1) + deep(n - 1) - deep(n - 1) }
+}
+
+fn each(xs: List[Int]) -> Int {
+    let mut s = 0
+    while true {
+        for x in xs {
+            s = (s + x) % 7
+        }
+    }
+    s
+}
+
+// a fused pipeline, over and over
+fn pipeline(xs: List[Int]) -> Int {
+    let mut total = 0
+    while true {
+        total = (total + xs.map(|x| x * 3).filter(|x| x % 2 == 0).map(|x| x + 1).sum()) % 1000
+    }
+    total
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let clock = root.clock
+    let start = clock.now_ms()
+    let xs = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    let r = group g until clock.after(50) {
+        g.go(|| spin(1000000000000000))
+        g.go(|| deep(80))
+        g.go(|| each(xs))
+        g.go(|| pipeline(xs))
+        g.go(|| xs.map(|x| spin(1000000000000000 + x)).len())
+        // the cancellation is unwinding it: the defer's own loops and calls run to the end
+        g.go(|| {
+            defer { out.print("deferred {spin(1000)} {[1, 2, 3].map(|x| x * 2)}") }
+            spin(1000000000000000)
+        })
+        g.go(|| {
+            let c = catch(|| spin(1000000000000000))
+            out.print("caught {c}")
+            1
+        })
+        g.go(|| {
+            let inner = group h {
+                h.go(|| spin(1000000000000000))
+                h.go(|| deep(80))
+                h.go(|| 2)
+            }
+            out.print("inner {inner}")
+            inner.len()
+        })
+        g.go(|| 3)
+    }
+    out.print("{r}")
+    // the body stops computing too: the task after it is never started
+    let b = group g until clock.after(30) {
+        g.go(|| 4)
+        let n = spin(1000000000000000)
+        g.go(|| n)
+    }
+    out.print("{b}")
+    // with no deadline nothing stops: main and its tasks run to the end
+    let free = group g {
+        g.go(|| spin(100000))
+        g.go(|| deep(10))
+    }
+    out.print("{free} {spin(1000)} {clock.now_ms() - start < 5000}")
+}
+|} "deferred 500 [2, 4, 6]\n[None, None, None, None, None, None, None, None, Some(3)]\n[Some(4)]\n[0, 1] 500 true\n";
   par "group-until-stress" {|fn stuck(c: Chan[Int]) -> Int {
     c.recv() ?? -1
 }

@@ -942,6 +942,12 @@ let scope_counter = ref 0
 
 let rec stmts c out ind (ss : I.stmt list) = List.iter (stmt c out ind) ss
 
+(* A loop's body: a cancellation checkpoint first, on every iteration
+   (W_CHECK in the runtime), so a cancelled task stops in code that never waits. *)
+and loop_body c out ind (ss : I.stmt list) =
+  Buffer.add_string out (ind ^ "W_CHECK();\n");
+  stmts c out ind ss
+
 and stmt c out ind (s : I.stmt) =
   let line s = Buffer.add_string out (ind ^ s ^ "\n") in
   match s with
@@ -1063,7 +1069,7 @@ and stmt c out ind (s : I.stmt) =
        line "    }";
        line "  } else {";
        line "  for (;;) {";
-       stmts c out (ind ^ "    ") body;
+       loop_body c out (ind ^ "    ") body;
        line "  }";
        line "  }";
        line "}"
@@ -1079,17 +1085,17 @@ and stmt c out ind (s : I.stmt) =
          let saved_r = c.inrange in
          c.inrange <- List.map (fun (v : I.var) -> (v.id, m.id)) lists @ c.inrange;
          line "  for (;;) {";
-         stmts c out (ind ^ "    ") body;
+         loop_body c out (ind ^ "    ") body;
          line "  }";
          c.inrange <- saved_r;
          line "} else {";
          line "  for (;;) {";
-         stmts c out (ind ^ "    ") body;
+         loop_body c out (ind ^ "    ") body;
          line "  }";
          line "}"
        | None ->
          line "for (;;) {";
-         stmts c out (ind ^ "  ") body;
+         loop_body c out (ind ^ "  ") body;
          line "}"));
     c.uniq <- saved
   | I.Break -> line "break;"
@@ -1228,6 +1234,8 @@ let fn_body c out (f : I.fn) =
         cell_decl c line v true)
       f.captures
   end;
+  (* a checkpoint on entry: deep recursion stops too *)
+  Buffer.add_string out "  W_CHECK();\n";
   stmts c out "  " f.body;
   Buffer.add_string out "  w_unreachable();\n}\n\n";
   c.vols <- [];

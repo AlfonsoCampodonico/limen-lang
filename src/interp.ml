@@ -103,10 +103,12 @@ and claim = { mutable fired : int }
 and waiter = { claim : claim; idx : int; mutable v : value; mutable ok : bool }
 
 (* A task's cancel flag: set by its group's deadline, seen at its next wait. *)
-and task = { mutable cancelled : bool; mutable scopes : group list; sink : sink option }
+and task = { mutable cancelled : bool; mutable scopes : group list; sink : sink option; mutable unwinding : bool }
 (* scopes: the groups whose bodies it is running under their deadline,
    innermost first; a passed deadline stops the body at its next wait too.
-   sink: where its output goes, None for stdout itself. *)
+   sink: where its output goes, None for stdout itself. unwinding: its
+   cancellation is unwinding it, so checkpoints let the defers it runs
+   finish (see checkpoint). *)
 
 (* The output of a task of an ordered group, held until the tasks started
    before it have finished and the group's body has ended (section 10). *)
@@ -735,7 +737,7 @@ let clock_now_ms () =
   | None -> Int64.of_float (Unix.gettimeofday () *. 1000.)
 
 (* The task running now; main and tests run as tasks nobody cancels. *)
-let current = ref { cancelled = false; scopes = []; sink = None }
+let current = ref { cancelled = false; scopes = []; sink = None; unwinding = false }
 
 (* Wait until [cond] holds. A cancelled task stops instead (raising
    Cancelled) unless [cancellable] is false, which is only for joining the
@@ -752,6 +754,39 @@ let wait_until ?io ?tm ?(cancellable = true) cond =
     if cancellable && not (cond ()) then raise Cancelled
   end
 
+(* ---- checkpoints ----
+   A cancelled task also stops where it does not wait: at the top of every
+   loop iteration and on entry to every function, as natively. Here every
+   task shares one thread, so a task that computes without waiting would
+   keep the others, and the deadline's own coroutine, from running: every
+   1024 checkpoints it looks at the clock, and once it has run for 5 ms it
+   steps aside for one round of the scheduler, which rings the timers that
+   are due in order (a group's deadline among them) and lets the other
+   tasks run, as other worker threads would natively. On virtual time it
+   never steps aside: no timer comes due while a task computes, and tasks
+   take turns in start order, as on the native runtime's single thread. A
+   callback from C never stops at a checkpoint (nothing unwinds through C's
+   frames, and C's frames cannot be suspended). Once a cancellation is
+   unwinding the task, checkpoints let the defers it runs finish (a wait in
+   one still stops it), until a group body's own deadline lands. *)
+let cb_depth = ref 0
+let check_ticks = ref 0
+let slice_start = ref 0.
+
+let checkpoint () =
+  if !cb_depth = 0 && not !current.unwinding then begin
+    if stopped !current then raise Cancelled;
+    incr check_ticks;
+    if !check_ticks land 1023 = 0 && !virtual_now = None && not (Queue.is_empty runq) then begin
+      let t = Unix.gettimeofday () in
+      if t -. !slice_start >= 0.005 then begin
+        (try Effect.perform (Block ((fun () -> true), None, None)) with Effect.Unhandled _ -> ());
+        slice_start := Unix.gettimeofday ();
+        if stopped !current then raise Cancelled
+      end
+    end
+  end
+
 (* The POSIX number of an OCaml signal, for exit statuses (128 + n). OCaml
    numbers signals itself; Sys.signal_to_int only exists from 5.4. *)
 let signal_number s =
@@ -762,7 +797,7 @@ let signal_number s =
   match List.assoc_opt s table with Some n -> n | None -> if s > 0 then s else 0
 
 let rec run_fiber t (f : unit -> unit) =
-  Effect.Deep.match_with (fun () -> current := t; f ()) ()
+  Effect.Deep.match_with (fun () -> current := t; slice_start := Unix.gettimeofday (); f ()) ()
     { retc = (fun () -> ());
       exnc = raise;
       effc =
@@ -771,7 +806,7 @@ let rec run_fiber t (f : unit -> unit) =
           | Block (cond, io, tm) ->
             Some
               (fun (k : (a, unit) Effect.Deep.continuation) ->
-                Queue.push (cond, io, tm, fun () -> current := t; Effect.Deep.continue k ()) runq)
+                Queue.push (cond, io, tm, fun () -> current := t; slice_start := Unix.gettimeofday (); Effect.Deep.continue k ()) runq)
           | _ -> None) }
 
 let spawn_fiber t f = Queue.push ((fun () -> true), None, None, fun () -> run_fiber t f) runq
@@ -1590,7 +1625,11 @@ module Foreign = struct
             ps
         in
         let args = if List.length cd.fn_params > List.length ps then cap :: args else args in
-        match (r, call name args) with
+        let res =
+          incr cb_depth;
+          Fun.protect ~finally:(fun () -> decr cb_depth) (fun () -> call name args)
+        in
+        match (r, res) with
         | Ffi.Int32, VInt n -> int32_arg n (sprintf "the result of callback `%s`" name) cd.fn_span
         | Ffi.Int, VInt n -> n
         | Ffi.Float, VFloat x -> Int64.bits_of_float x
@@ -2148,7 +2187,7 @@ let rec eval rt env e : value =
        else begin
          (* the deadline: a coroutine of its own that cancels the tasks when the time comes *)
          let tm = timer_after ms in
-         spawn_fiber { cancelled = false; scopes = []; sink = None } (fun () ->
+         spawn_fiber { cancelled = false; scopes = []; sink = None; unwinding = false } (fun () ->
              wait_until ~tm ~cancellable:false (fun () -> !joined || rung tm);
              if not !joined then cancel_group g)
        end);
@@ -2161,7 +2200,9 @@ let rec eval rt env e : value =
           t.scopes <- g :: t.scopes;
           let leave () = t.scopes <- List.tl t.scopes in
           try ignore (eval_block rt (sc :: env) b); leave () with
-          | Cancelled when g.gcancelled && (not t.cancelled) && not (List.exists (fun o -> o.gcancelled) (List.tl t.scopes)) -> leave ()
+          | Cancelled when g.gcancelled && (not t.cancelled) && not (List.exists (fun o -> o.gcancelled) (List.tl t.scopes)) ->
+            t.unwinding <- false;
+            leave ()
           | e -> leave (); raise e));
        body_ended ();
        wait_until (fun () -> group_finished g)
@@ -2241,6 +2282,7 @@ and apply rt fv args sp =
         ~fns:(Hashtbl.find rt.fns) ~structs:(Hashtbl.find_opt rt.structs)
     else call_fn rt d args
   | VClosure (ps, body, cenv) -> (
+    checkpoint ();
     let sc = scope () in
     List.iter2 (fun p a -> bind sc p a) ps args;
     try eval rt (sc :: cenv) body with Return v -> v)
@@ -2290,6 +2332,7 @@ and apply rt fv args sp =
   | _ -> failwith "internal: not callable"
 
 and call_fn rt d args =
+  checkpoint ();
   let sc = scope () in
   List.iter2 (fun p a -> bind sc p.prm_name a) d.fn_params args;
   match !keeping with
@@ -2347,6 +2390,7 @@ and run_stmts rt env ss tail =
     let run_defer () = ignore (eval_block rt at_defer d) in
     match run_stmts rt env rest tail with
     | v -> run_defer (); v
+    | exception (Cancelled as e) -> !current.unwinding <- true; run_defer (); raise e
     | exception e -> run_defer (); raise e)
   | s :: rest -> exec rt env s; run_stmts rt env rest tail
 
@@ -2361,7 +2405,7 @@ and exec rt env s =
   | SWhile (c, b) -> (
     in_loop @@ fun () ->
     try
-      while as_bool (eval rt env c) do
+      while checkpoint (); as_bool (eval rt env c) do
         try ignore (eval_block rt env b) with Continue_ -> ()
       done
     with Break_ -> ())
@@ -2371,7 +2415,7 @@ and exec rt env s =
     let i = ref lo in
     in_loop @@ fun () ->
     try
-      while !i < hi do
+      while checkpoint (); !i < hi do
         let sc = scope_of n (VInt !i) in
         i := Int64.add !i 1L;
         try ignore (eval_block rt (sc :: env) b) with Continue_ -> ()
@@ -2384,6 +2428,7 @@ and exec rt env s =
       try
         Array.iter
           (fun v ->
+            checkpoint ();
             let sc = scope_of n v in
             try ignore (eval_block rt (sc :: env) b) with Continue_ -> ())
           arr
@@ -2630,7 +2675,7 @@ and call_method rt v name args sp =
       end
       else g.gparent
     in
-    let t = { cancelled = g.gcancelled; scopes = []; sink } in
+    let t = { cancelled = g.gcancelled; scopes = []; sink; unwinding = false } in
     let res = ref (if g.gcancelled then Some Stopped else None) in
     g.tasks <- (t, res) :: g.tasks;
     g.kept <- (go = "go") :: g.kept;
@@ -2783,7 +2828,7 @@ let run ?(before_main = fun () -> ()) ~out ?(err = to_stderr) ~grants (user_item
     Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
     let result = ref None in
     try
-      spawn_fiber { cancelled = false; scopes = []; sink = None } (fun () -> result := Some (call_fn rt d args));
+      spawn_fiber { cancelled = false; scopes = []; sink = None; unwinding = false } (fun () -> result := Some (call_fn rt d args));
       schedule (fun () -> !result <> None) d.fn_span;
       Queue.clear runq;
       (* a `dyn Error` from main is reported by its message *)
@@ -2791,7 +2836,7 @@ let run ?(before_main = fun () -> ()) ~out ?(err = to_stderr) ~grants (user_item
       | ( VEnum ("Result", "Err", [ e ]),
           Some { tdesc = TyName ("Result", [ _; { tdesc = TyName ("dyn", [ { tdesc = TyName ("Error", []); _ } ]); _ } ]); _ } ) ->
         let m = ref None in
-        spawn_fiber { cancelled = false; scopes = []; sink = None } (fun () -> m := Some (call_method rt e "message" [] d.fn_span));
+        spawn_fiber { cancelled = false; scopes = []; sink = None; unwinding = false } (fun () -> m := Some (call_method rt e "message" [] d.fn_span));
         schedule (fun () -> !m <> None) d.fn_span;
         Queue.clear runq;
         Ok (VEnum ("Result", "Err", [ Option.get !m ]))
@@ -2852,7 +2897,7 @@ let run_tests_timed ?(select = fun _ -> true) ~out (user_items : item list) :
           | Error e -> Error e
           | Ok () ->
           try
-            spawn_fiber { cancelled = false; scopes = []; sink = None } (fun () -> ignore (call_fn rt d args); finished := true);
+            spawn_fiber { cancelled = false; scopes = []; sink = None; unwinding = false } (fun () -> ignore (call_fn rt d args); finished := true);
             schedule (fun () -> !finished) d.fn_span;
             Ok ()
           with

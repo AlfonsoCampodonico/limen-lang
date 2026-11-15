@@ -1643,7 +1643,9 @@ fn count_loops(ss: List[ir.Stmt]) -> Int {
 fn loop_body(self: Cg, ind: Str, idx: Int, body: List[ir.Stmt]) -> Cg {
     let mut c = self
     c.loops = idx + 1
-    c.stmts(ind, body)
+    // a cancellation checkpoint first, on every iteration (W_CHECK in the
+    // runtime), so a cancelled task stops in code that never waits
+    c.line(ind, "W_CHECK();").stmts(ind, body)
 }
 
 fn stmt(self: Cg, ind: Str, s: ir.Stmt) -> Cg {
@@ -1990,7 +1992,8 @@ fn fn_body(self: Cg, f: ir.Fn) -> Cg {
             c = c3.put("  {ct}{c3.vol(v)} {var(v)} = {d};\n").cell_decl("  ", v, true)
         }
     }
-    c = c.stmts("  ", f.body).put("  w_unreachable();\n}\n\n")
+    // a checkpoint on entry: deep recursion stops too
+    c = c.put("  W_CHECK();\n").stmts("  ", f.body).put("  w_unreachable();\n}\n\n")
     c.vols = []
     c.plan = pure.no_plan()
     c

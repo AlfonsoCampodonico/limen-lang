@@ -349,8 +349,9 @@ pub fn parse_iso(s: Str) -> Result[Int, Str] {
 // Runs `f` with a deadline: its result if it finishes within `ms`
 // milliseconds, else `Err(Failed("timed out after {ms} ms"))`. `f` runs as a
 // task of a group with that deadline, so at the deadline it stops at its
-// next wait (a socket, a channel, a sleep, a name lookup), its defers run
-// and what it holds is freed. A timeout for anything that waits:
+// next wait (a socket, a channel, a sleep, a name lookup) or checkpoint (a
+// loop's next round, a call), its defers run and what it holds is freed. A
+// timeout for anything that waits or computes:
 // `time.within(clock, 5000, || net.get(url))`.
 pub fn within[T](clock: Clock, ms: Int, f: fn() -> Result[T, IoError]) -> Result[T, IoError] {
     let r = group g until clock.after(ms) {
