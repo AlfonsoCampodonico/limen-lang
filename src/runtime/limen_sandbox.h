@@ -17,8 +17,12 @@
    - programs: starting another program only if Exec is granted, and then
      (unless it is granted `*`) only the granted programs' files and programs
      in system locations, never one the program could have written under the
-     Fs or temporary directory. A program started through Exec inherits the
-     same restrictions; it may also list (not read) the directories above
+     Fs or temporary directory, even when that directory is inside a system
+     location (on Linux that whole system location then stops starting
+     programs) or holds one (`fs=/`): there only the OS's own program
+     directories, which a process that is not root cannot write, still
+     start programs. A program started through Exec inherits the same
+     restrictions; it may also list (not read) the directories above
      the current one, as shells do.
    macOS also refuses Apple events and LaunchServices opens, so the process
    cannot have another application act for it. It still reaches the system's
@@ -107,6 +111,29 @@ static char *w_sb_tmpdir(void) {
     while (n > 1 && r[n - 1] == '/') r[--n] = 0;
   }
   return r;
+}
+
+/* whether the real path a is dir or lies inside it */
+static int w_sb_within(const char *a, const char *dir) {
+  if (!a || !dir) return 0;
+  size_t n = strlen(dir);
+  return strncmp(a, dir, n) == 0 && (a[n] == 0 || a[n] == '/' || (n == 1 && dir[0] == '/'));
+}
+
+/* System directories that start programs even inside a writable Fs
+   directory (`fs=/`, say), since no grant makes them writable: those of
+   the OS or its package manager, root's own and writable by no one else,
+   with no writable directory inside them, and only for a process that is
+   not root. Returns the real path (free it), or NULL. */
+static char *w_sb_sealed(const char *dir, char *const rw[2]) {
+  if (geteuid() == 0) return NULL;
+  char *real = w_sb_real(dir);
+  struct stat st;
+  if (!real || stat(real, &st) != 0 || st.st_uid != 0 || (st.st_mode & 022) || w_sb_within(rw[0], real) || w_sb_within(rw[1], real)) {
+    free(real);
+    return NULL;
+  }
+  return real;
 }
 
 #if defined(__APPLE__)
@@ -198,6 +225,26 @@ static int w_sandbox_enter(const WSandboxSpec *s, char *err, size_t en) {
       for (int i = 0; bins[i]; i++) w_sb_subpath(&b, bins[i]);
       for (char **p = progs; *p; p++) { w_sb_put(&b, " (literal "); w_sb_str(&b, *p); w_sb_put(&b, ")"); }
       w_sb_put(&b, ")))\n");
+      /* the system locations include ones a user can write to (Homebrew's
+         prefix, /usr/local), which may hold the Fs or temporary directory:
+         nothing under a directory this process can write is started, the
+         last matching rule winning, except a granted program by name */
+      char *rw[2] = { s->fs_ro ? NULL : (char *)s->fs_root, tmp };
+      /* (a deny without a path would refuse everything) */
+      if (rw[0] || rw[1]) {
+        w_sb_put(&b, "(deny process-exec* (require-any");
+        w_sb_subpath(&b, rw[0]);
+        w_sb_subpath(&b, rw[1]);
+        w_sb_put(&b, "))\n");
+        const char *sealed[] = { "/System", "/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/lib", "/usr/libexec",
+                                 "/Library/Developer/CommandLineTools", "/Applications/Xcode.app", NULL };
+        for (int i = 0; sealed[i]; i++) {
+          char *real = w_sb_sealed(sealed[i], rw);
+          if (real) { w_sb_put(&b, "(allow process-exec* (subpath "); w_sb_str(&b, real); w_sb_put(&b, "))\n"); }
+          free(real);
+        }
+      }
+      for (char **p = progs; *p; p++) { w_sb_put(&b, "(allow process-exec* (literal "); w_sb_str(&b, *p); w_sb_put(&b, "))\n"); }
     }
     w_sb_free_progs(progs);
   }
@@ -267,6 +314,9 @@ static int w_ll_allow(int ruleset, const char *path, uint64_t access, uint64_t h
   return rc == 0 ? 0 : -1;
 }
 
+/* whether a is b, or one lies inside the other (real paths) */
+static int w_sb_overlap(const char *a, const char *b) { return w_sb_within(a, b) || w_sb_within(b, a); }
+
 static int w_landlock(const WSandboxSpec *s, char *err, size_t en) {
   long abi = syscall(__NR_landlock_create_ruleset, NULL, 0, 1 /* LANDLOCK_CREATE_RULESET_VERSION */);
   if (abi < 1) return 1; /* no Landlock in this kernel */
@@ -284,9 +334,37 @@ static int w_landlock(const WSandboxSpec *s, char *err, size_t en) {
   int rs = (int)syscall(__NR_landlock_create_ruleset, &attr, attr_size, 0);
   if (rs < 0) { snprintf(err, en, "cannot create a Landlock ruleset: %s", strerror(errno)); return -1; }
   uint64_t rd = W_LL_READ_FILE | W_LL_READ_DIR | (s->exec ? W_LL_EXECUTE : 0);
+  /* starting programs: from system locations and the granted programs'
+     files, not from what the program could have written, unless Exec is
+     granted `*` */
+  int exec_any = 0;
+  char **progs = s->exec ? w_sb_progs(s, &exec_any) : NULL;
+  uint64_t no_exec = exec_any ? 0 : W_LL_EXECUTE;
+  /* the directories this process can write: never executable. Landlock
+     only adds rights down a path, so a system location that holds one of
+     them (or lies inside one) loses execute as a whole: only the granted
+     programs' files can then be started from it */
+  char *rw[2] = { s->fs_ro ? NULL : w_sb_real(s->fs_root), s->exec ? w_sb_tmpdir() : NULL };
   const char *sys[] = { "/usr", "/lib", "/lib64", "/lib32", "/bin", "/sbin", "/etc", "/sys", "/opt", NULL };
   int bad = 0;
-  for (int i = 0; sys[i]; i++) bad |= w_ll_allow(rs, sys[i], rd, handled);
+  for (int i = 0; sys[i]; i++) {
+    uint64_t acc = rd;
+    char *real = no_exec ? w_sb_real(sys[i]) : NULL;
+    for (int j = 0; real && j < 2; j++) if (w_sb_overlap(real, rw[j])) acc &= ~no_exec;
+    free(real);
+    bad |= w_ll_allow(rs, sys[i], acc, handled);
+  }
+  /* but the OS's own program directories stay executable when no grant
+     can make them writable */
+  if (no_exec) {
+    const char *sealed[] = { "/usr/bin", "/usr/sbin", "/usr/lib", "/usr/libexec", "/usr/lib64", "/usr/lib32",
+                             "/bin", "/sbin", "/lib", "/lib64", "/lib32", NULL };
+    for (int i = 0; sealed[i]; i++) {
+      char *real = w_sb_sealed(sealed[i], rw);
+      bad |= w_ll_allow(rs, real, rd, handled);
+      free(real);
+    }
+  }
   /* /proc: only this process's own entries, so other processes' command
      lines and state stay hidden. /proc/self resolves to this process's
      directory now; a program started through Exec has its own, so with Exec
@@ -296,12 +374,6 @@ static int w_landlock(const WSandboxSpec *s, char *err, size_t en) {
   bad |= w_ll_allow(rs, "/dev", W_LL_READ_FILE | W_LL_READ_DIR, handled);
   bad |= w_ll_allow(rs, "/dev/null", W_LL_READ_FILE | W_LL_WRITE_FILE | W_LL_TRUNCATE, handled);
   bad |= w_ll_allow(rs, "/dev/tty", W_LL_READ_FILE | W_LL_WRITE_FILE, handled);
-  /* starting programs: from system locations and the granted programs'
-     files, not from what the program could have written, unless Exec is
-     granted `*` */
-  int exec_any = 0;
-  char **progs = s->exec ? w_sb_progs(s, &exec_any) : NULL;
-  uint64_t no_exec = exec_any ? 0 : W_LL_EXECUTE;
   if (s->fs_root) bad |= w_ll_allow(rs, s->fs_root, s->fs_ro ? (W_LL_READ_FILE | W_LL_READ_DIR) : (handled & ~no_exec), handled);
   if (progs) for (char **p = progs; *p; p++) bad |= w_ll_allow(rs, *p, W_LL_READ_FILE | W_LL_EXECUTE, handled);
   w_sb_free_progs(progs);
@@ -312,11 +384,8 @@ static int w_landlock(const WSandboxSpec *s, char *err, size_t en) {
     bad |= w_ll_allow(rs, cd, W_LL_READ_FILE | W_LL_READ_DIR, handled);
     free(cf); free(cd);
   }
-  if (s->exec) {
-    char *tmp = w_sb_tmpdir();
-    bad |= w_ll_allow(rs, tmp, handled & ~no_exec, handled);
-    free(tmp);
-  }
+  bad |= w_ll_allow(rs, rw[1], handled & ~no_exec, handled);
+  free(rw[0]); free(rw[1]);
   if (bad) { close(rs); snprintf(err, en, "cannot add a Landlock rule: %s", strerror(errno)); return -1; }
   if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 || syscall(__NR_landlock_restrict_self, rs, 0) != 0) {
     close(rs);

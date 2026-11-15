@@ -7924,6 +7924,63 @@ fn main(root: Root) {
     [ ("sandbox-exec-interp", [], "echo", "Ok(\"granted\")\nrefused -1\n");
       ("sandbox-exec-native", [ "--native" ], "echo", "Ok(\"granted\")\nrefused -1\n");
       ("sandbox-exec-star", [], "*", "Ok(\"granted\")\nescaped\n") ];
+  (* nor when the Fs directory or the temporary directory lies inside a
+     system location that may start programs (Homebrew's prefix, /usr/local,
+     /opt): C writes a script there and cannot start it. Needs such a
+     location the test can write to; without one it is skipped. *)
+  let sys_writable =
+    List.find_opt
+      (fun d -> try Sys.is_directory d && (Unix.access d [ Unix.W_OK ]; true) with Unix.Unix_error _ | Sys_error _ -> false)
+      [ "/opt/homebrew"; "/opt/local"; "/usr/local"; "/opt" ]
+  in
+  (match sys_writable with
+  | None -> print_endline "skipped sandbox-exec-written: no writable system location"
+  | Some prefix ->
+      let base = Filename.concat prefix (sprintf "limen-sbtest-%d" (Unix.getpid ())) in
+      let fsd = Filename.concat base "fs" and tmpd = Filename.concat base "tmp" in
+      List.iter (fun d -> try Unix.mkdir d 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ()) [ base; fsd; tmpd ];
+      put "sbox/written.lmn"
+        (replace_all "TMP" tmpd
+           {v|foreign "c" {
+    fn creat(path: Str, mode: Int32) -> Int32
+    fn write(fd: Int32, buf: Bytes, n: Int) -> Int
+    fn close(fd: Int32) -> Int32
+    fn execl(path: Str, arg0: Str, ..., end: Int) -> Int32
+}
+
+// writes an executable script (mode 0755) and starts it: a started one prints "escaped"
+fn drop_and_run(c: Foreign, path: Str) -> Str {
+    let fd = creat(c, path, 493)
+    if fd < 0 {
+        return "unwritten"
+    }
+    let script = "#!/bin/sh\necho escaped\n".to_bytes()
+    let n = write(c, fd, script, script.len())
+    let closed = close(c, fd)
+    "refused {execl(c, path, "payload", 0)}"
+}
+
+fn main(root: Root) {
+    root.stdout.print("{root.exec.run("echo", ["granted"]).map(|p| p.stdout.trim())}")
+    root.stdout.print(drop_and_run(root.foreign, root.fs.full_path("payload") ?? ""))
+    root.stdout.print(drop_and_run(root.foreign, "TMP/payload"))
+}
+|v});
+      let swritten = Filename.concat pdir "sbox/written.lmn" in
+      (* the temporary directory comes from TMPDIR, set for the run alone *)
+      let o = Filename.concat pdir "cli.out" and e = Filename.concat pdir "cli.err" in
+      List.iter
+        (fun (name, extra) ->
+          let args = (("run" :: extra) @ [ swritten ]) @ [ "--grant"; "foreign=c"; "--grant"; "fs=" ^ fsd; "--grant"; "exec=echo" ] in
+          let code =
+            Sys.command
+              ("TMPDIR=" ^ Filename.quote tmpd ^ " " ^ String.concat " " (List.map Filename.quote (limen_exe :: args))
+              ^ sprintf " >%s 2>%s" (Filename.quote o) (Filename.quote e))
+          in
+          let o = read_file o and e = read_file e in
+          ok name (code = 0 && o = "Ok(\"granted\")\nrefused -1\nrefused -1\n") (sprintf "%d %S %S" code o e))
+        [ ("sandbox-exec-written-interp", []); ("sandbox-exec-written-native", [ "--native" ]) ];
+      ignore (Sys.command ("rm -rf " ^ Filename.quote base)));
   (* without Net, Listen or Exec, the sandbox also refuses the ways out that
      are not files: another program's Unix socket (here a listener of the
      test's own, which could as well be a Docker daemon or an ssh-agent),
