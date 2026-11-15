@@ -128,7 +128,7 @@ fn cap_methods(c: Str, io: types.Ty) -> List[Method] {
         "Rand" => [m("int", [TInt, TInt], TInt), m("float", [], TFloat), m("bytes", [TInt], TBytes)],
         "Stdin" => [m("read_line", [], types.opt(TStr)), m("read_all", [], TStr)],
         "Env" => [m("get", [TStr], types.opt(TStr))],
-        "Exec" => [m("run", [TStr, TList(TStr)], res(TNamed("ProcessOutput", []))), m("only", [TStr], TCap("Exec"))],
+        "Exec" => [m("run", [TStr, TList(TStr)], res(TNamed("ProcessOutput", []))), m("only", [TStr], TCap("Exec")), m("only_args", [TStr, TList(TStr)], TCap("Exec"))],
         "Foreign" => [m("only", [TStr], TCap("Foreign")), m("allows", [TStr], TBool), m("copy", [TNamed("Handle", []), TInt], TBytes)],
         "Root" => [m("args", [], TList(TStr))],
         _ => [],

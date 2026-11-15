@@ -846,6 +846,7 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
         (sprintf "Cap_fs_info(%s, %s)" (arg 0) (arg 1))
         (sprintf "({ WFileInfo *i_ = (WFileInfo*)r_.ptr; %s v_ = { i_->size, i_->mtime_ms, i_->is_file, i_->is_dir }; free(i_); v_; })" (ctype c fi))
     | "cap_only", TCap Exec -> set (sprintf "Cap_exec_only(%s, %s)" (arg 0) (arg 1))
+    | "cap_only_args", TCap Exec -> set (sprintf "Cap_exec_only_args(%s, %s, %s)" (arg 0) (arg 1) (arg 2))
     | "cap_only", TCap Foreign -> set (sprintf "Cap_foreign_only(%s, %s)" (arg 0) (arg 1))
     | "cap_allows", TCap Foreign -> set (sprintf "Cap_foreign_allows(%s, %s)" (arg 0) (arg 1))
     | "cap_copy", TCap Foreign -> set (sprintf "Cap_foreign_copy(%s, (%s).f0, %s, %s)" (arg 0) (arg 1) (arg 2) (where sp))

@@ -516,7 +516,27 @@ fn grant(kind: Str, v: Value, span: ast.Span, dir: Str, before: List[(Str, Str)]
     if values.any(|v| v == "") {
         return Err(bad("a grant cannot be empty"))
     }
+    if kind == "exec" {
+        for v in values {
+            if !exec_grant_ok(v) {
+                return Err(bad("exec grant `{v}`: write PROGRAM, or PROGRAM ARGS|ARGS... with no empty prefix and not for *"))
+            }
+        }
+    }
     Ok(values.map(|v| (kind, v)))
+}
+
+// An exec grant: a program alone, or a program (not `*`) and argument
+// prefixes, `git status|remote -v`, none of them empty (Caps.exec_entry).
+fn exec_grant_ok(g: Str) -> Bool {
+    match g.index_of(" ") {
+        None => true,
+        Some(i) => {
+            let prog = g.slice(0, i)
+            let rest = g.slice(i + 1, g.len())
+            prog != "" && prog != "*" && !rest.contains("\n") && rest.split("|").all(|p| p.split(" ").any(|w| w != ""))
+        },
+    }
 }
 
 // A URL that is safe to hand to `git clone`: no `-` in front (an option to

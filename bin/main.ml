@@ -4,7 +4,7 @@ let usage =
   {|limen: a small language where I/O needs a capability
 
 usage:
-  limen run FILE [--native] [--grant net=HOST[:PORT]|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST:PORT]... [--grant env=NAME|*]... [--grant exec=PROGRAM|*]... [--grant foreign=LIB|*]... [--seed N] [--no-sandbox] [-- ARGS...]
+  limen run FILE [--native] [--grant net=HOST[:PORT]|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST:PORT]... [--grant env=NAME|*]... [--grant exec=PROGRAM[ ARGS|ARGS...]|*]... [--grant foreign=LIB|*]... [--seed N] [--no-sandbox] [-- ARGS...]
   limen build FILE [-o OUT] [--emit-c]
   limen check FILE [--json]
   limen caps FILE [--json]
@@ -77,7 +77,9 @@ let parse_grants args =
       | Some i when String.sub a 0 i = "env" ->
         { g with env = g.env @ [ String.sub a (i + 1) (String.length a - i - 1) ] }
       | Some i when String.sub a 0 i = "exec" ->
-        { g with exec = g.exec @ [ String.sub a (i + 1) (String.length a - i - 1) ] }
+        let v = String.sub a (i + 1) (String.length a - i - 1) in
+        if Caps.exec_entry v = None then die_usage ("exec grant: " ^ Caps.exec_grant_help);
+        { g with exec = g.exec @ [ v ] }
       | Some i when String.sub a 0 i = "foreign" ->
         { g with foreign = g.foreign @ [ String.sub a (i + 1) (String.length a - i - 1) ] }
       | None when a = "no-sandbox" -> g
@@ -410,7 +412,9 @@ let cmd_caps file json =
       ("{\"functions\":[" ^ String.concat "," (List.map one infos) ^ "],\"embed_roots\":["
       ^ String.concat "," (List.map (fun (r, _) -> Diag.jstr r) !Modules.embed_roots)
       ^ "],\"embeds\":["
-      ^ String.concat "," (List.map emb (List.rev !Modules.embedded)) ^ "]}")
+      ^ String.concat "," (List.map emb (List.rev !Modules.embedded))
+      ^ "],\"grants\":["
+      ^ String.concat "," (List.map Diag.jstr (toml_grants file)) ^ "]}")
   end
   else begin
     let width = List.fold_left (fun w (i : Check.fn_info) -> max w (String.length i.name)) 0 infos in
@@ -428,7 +432,9 @@ let cmd_caps file json =
     List.iter (fun (r, _) -> Printf.printf "embed root %s\n" r) !Modules.embed_roots;
     List.iter
       (fun (m, path, size) -> Printf.printf "embeds %s (%d bytes)%s\n" path size (if m = "" then "" else " in module " ^ m))
-      (List.rev !Modules.embedded)
+      (List.rev !Modules.embedded);
+    (* what limen.toml grants the program, narrowing included: `grant exec=git status|log` *)
+    List.iter (fun g -> Printf.printf "grant %s\n" g) (toml_grants file)
   end
 
 let checked file =

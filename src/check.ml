@@ -598,7 +598,8 @@ let build_methods (t : ty) : (string * (unit -> ty list * ty)) list =
   | TCap Stdin -> [ m "read_line" [] (opt TStr); m "read_all" [] TStr ]
   | TCap Env -> [ m "get" [ TStr ] (opt TStr) ]
   | TCap Exec ->
-    [ m "run" [ TStr; TList TStr ] (res (TNamed ("ProcessOutput", [])) io_err); m "only" [ TStr ] (TCap Exec) ]
+    [ m "run" [ TStr; TList TStr ] (res (TNamed ("ProcessOutput", [])) io_err); m "only" [ TStr ] (TCap Exec);
+      m "only_args" [ TStr; TList TStr ] (TCap Exec) ]
   | TCap Foreign ->
     [ m "only" [ TStr ] (TCap Foreign); m "allows" [ TStr ] TBool; m "copy" [ TNamed ("Handle", []); TInt ] TBytes ]
   | TCap Root -> [ m "args" [] (TList TStr) ]

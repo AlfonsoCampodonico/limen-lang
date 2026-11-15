@@ -1481,6 +1481,7 @@ fn prim(self: Cg, ind: Str, dst: Str, t: types.Ty, name: Str, rt: types.Ty, a: L
             c1.io_result(ind, dst, t, "Cap_fs_info({arg(0)}, {arg(1)})", "(\{ WFileInfo *i_ = (WFileInfo*)r_.ptr; {fi} v_ = \{ i_->size, i_->mtime_ms, i_->is_file, i_->is_dir }; free(i_); v_; })")
         },
         ("cap_only", TCap("Exec")) => c.set(ind, dst, "Cap_exec_only({arg(0)}, {arg(1)})"),
+        ("cap_only_args", TCap("Exec")) => c.set(ind, dst, "Cap_exec_only_args({arg(0)}, {arg(1)}, {arg(2)})"),
         ("cap_only", TCap("Foreign")) => c.set(ind, dst, "Cap_foreign_only({arg(0)}, {arg(1)})"),
         ("cap_allows", TCap("Foreign")) => c.set(ind, dst, "Cap_foreign_allows({arg(0)}, {arg(1)})"),
         ("cap_copy", TCap("Foreign")) => c.set(ind, dst, "Cap_foreign_copy({arg(0)}, ({arg(1)}).f0, {arg(2)}, {c.where(sp)})"),

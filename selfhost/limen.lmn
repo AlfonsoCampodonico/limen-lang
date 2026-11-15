@@ -35,7 +35,7 @@ fn usage() -> Str {
     "limen: a small language where I/O needs a capability
 
 usage:
-  limen run FILE [--native] [--grant net=HOST[:PORT]|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST:PORT]... [--grant env=NAME|*]... [--grant exec=PROGRAM|*]... [--grant foreign=LIB|*]... [--seed N] [--no-sandbox] [-- ARGS...]
+  limen run FILE [--native] [--grant net=HOST[:PORT]|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST:PORT]... [--grant env=NAME|*]... [--grant exec=PROGRAM[ ARGS|ARGS...]|*]... [--grant foreign=LIB|*]... [--seed N] [--no-sandbox] [-- ARGS...]
   limen build FILE [-o OUT] [--emit-c]
   limen check FILE [--json]
   limen caps FILE [--json]
@@ -305,6 +305,10 @@ fn caps_of(cx: Ctx, file: Str) -> Int {
     }
     for e in f.loaded.embedded {
         out.print("embeds {e.path} ({e.size} bytes){if e.module == "" { "" } else { " in module " + e.module }}")
+    }
+    // what limen.toml grants the program, narrowing included: `grant exec=git status|log`
+    for (k, v) in f.loaded.manifest.map(|m| m.grants) ?? [] {
+        out.print("grant {k}={v}")
     }
     0
 }

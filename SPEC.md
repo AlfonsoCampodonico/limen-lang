@@ -725,7 +725,7 @@ The native backend implements this with reference counting and copy-on-write. A 
 | `root.net` | `Net` | only with `--grant net=HOST[:PORT]` (repeatable) or `--grant net=*` |
 | `root.fs` | `Fs` | only with `--grant fs=DIR` or `--grant fs=DIR:ro` |
 | `root.listen` | `Listen` | only with `--grant listen=HOST[:PORT]` (repeatable) |
-| `root.exec` | `Exec` | only with `--grant exec=PROGRAM` (repeatable) or `--grant exec=*` |
+| `root.exec` | `Exec` | only with `--grant exec=PROGRAM` (repeatable), `--grant 'exec=PROGRAM ARGS\|ARGS...'` (that program with arguments starting with one of those, below) or `--grant exec=*` |
 | `root.foreign` | `Foreign` | only with `--grant foreign=LIB` (repeatable) or `--grant foreign=*`: calls into C libraries |
 
 `root.args()` is the `List[Str]` of command-line arguments after `--`: `limen run app.lmn -- a b`.
@@ -737,14 +737,15 @@ An ungranted `Net`, `Fs`, `Listen` or `Exec` still exists, but every operation o
 The rules:
 
 1. Programs cannot create capabilities. They come only from `root`.
-2. Attenuation only narrows. `net.only(host)` returns a `Net` limited to that host, and it is empty if you didn't hold that host. `fs.under(dir)` limits to a subdirectory; `fs.read_only()` removes writing. `exec.only(program)` limits `Exec` to one program; `foreign.only(lib)` limits `Foreign` to one library.
+2. Attenuation only narrows. `net.only(host)` returns a `Net` limited to that host, and it is empty if you didn't hold that host. `fs.under(dir)` limits to a subdirectory; `fs.read_only()` removes writing. `exec.only(program)` limits `Exec` to one program (keeping any argument prefixes it was limited to), and `exec.only_args(program, prefixes)` to that program with arguments starting with one of `prefixes` (below); `foreign.only(lib)` limits `Foreign` to one library.
 3. There is no ambient I/O. Using `print`, `open`, `fetch` and similar names is error E0302, which explains the capability to use instead.
 4. A function whose parameters hold no capability (not even through a struct or enum field, below) and no function type is **pure**: it can only compute (and panic). `limen caps FILE` lists each function's authority. Section 14 says what the compiler does with pure calls. It never runs them in parallel on its own: concurrency stays visible and cancellable in a `group`, where you write it.
 
    A function that would be pure but for parameters of function type is **pure if they are**, when all it does with them is call them or pass them on, as they are, to a function that is itself pure if they are: `fn my_map(xs: List[Int], f: fn(Int) -> Int) -> List[Int]` that only calls `f(x)`. A call of it is then a pure call when the functions it is given are pure: `my_map(xs, |x| x * 2)` is, `my_map(xs, |x| { out.print("{x}"); x })` is not. Storing such a parameter (in a list, a struct, a map), returning it, capturing it in a closure, sending it on a channel or running it as a task makes the function only "pure itself": its calls are never treated as pure. `limen caps` says `pure if f is` (`pure if f and g are`; `"pure_if": ["f", "g"]` in `--json`), and `pure itself, runs callbacks` for the others. A bound on a type parameter (`[T: Named]`) still counts as running callbacks.
 5. Enforcement at runtime:
    - `Net`: http and https URLs only, host allowlist, redirects not followed. `Net.connect` and `Net.connect_tls` use the same allowlist. TLS certificates are always verified (section 10).
-   - `Exec`: the program name must match a grant exactly (`git` and `/usr/bin/git` are different grants), or the grant is `*`. Arguments are passed as a list, never through a shell. The child gets `/dev/null` as stdin, the working directory, `PATH`, and only the environment variables granted with `--grant env=`. A program name without `/` is looked up in `PATH`, as a shell would. Granting a program grants everything that program can do with any arguments, so `exec=sh` is as good as every other grant.
+   - `Exec`: the program name must match a grant exactly (`git` and `/usr/bin/git` are different grants), or the grant is `*`. Arguments are passed as a list, never through a shell. The child gets `/dev/null` as stdin, the working directory, `PATH`, and only the environment variables granted with `--grant env=`. A program name without `/` is looked up in `PATH`, as a shell would. Granting a program grants everything that program can do with any arguments, so `exec=sh` is as good as every other grant, unless the grant limits the arguments.
+   - `Exec` argument prefixes: `--grant 'exec=git status|log|remote -v'` (or `exec.only_args("git", ["status", "log", "remote -v"])`) allows `git` only when its arguments start with one of the prefixes, compared word for word from the first argument: `git status --short` and `git remote -v` run, `git config core.sshCommand ...`, `git -c x=y status`, `git --upload-pack=... status`, `git statusx` and `git` alone are `Err(Denied("exec: `git` is not granted with these arguments"))`. A prefix is one or more words separated by spaces (so a word with a space in it cannot be part of one); no patterns, no shell. What follows a prefix is not checked, so grant the narrowest prefix that does the job: `git fetch` still takes `--upload-pack`. Narrowing keeps only what is held: `only_args` keeps the prefixes that start with one already granted (`"status --short"` under `status`), `only(program)` keeps the program's prefixes, and a grant of `*` cannot have prefixes. Exec has no knobs for the child's environment or directory beyond these, so there is nothing else to narrow.
    - `Listen`: binding is allowed only for granted `host` or `host:port` entries, with or without TLS.
    - `Fs`: paths are relative to the granted directory; absolute paths, `..` escapes and symlinks pointing outside are refused. That holds for both ends of a `rename`, and a read-only `Fs` refuses it, as it refuses every write.
    - `Foreign`: a call checks that the function's library is on the `Foreign` value's list (or the list holds `*`). C code runs with the whole process's authority, so granting a library grants everything that library can do; see below.
@@ -878,9 +879,9 @@ What the kernel enforces:
 | Writing files | under the `Fs` directory, unless it is read-only; the temporary directory if `Exec` is granted (Exec keeps a child's stderr there); `/dev/null` and the terminal |
 | Reading files | under the `Fs` directory; system locations (`/usr`, `/System`, `/Library`, `/etc`, `/dev`, Homebrew's prefix, ...: libraries, time zones, TLS certificates); the temporary directory with `Exec`. Not home directories, other users' files or anything else |
 | Network | nothing unless `Net` or `Listen` is granted; then any host |
-| Starting programs | only if `Exec` is granted. A started program inherits the sandbox: it can read system locations and the `Fs` directory, and list (not read) the directories above the current one, which shells need |
+| Starting programs | only if `Exec` is granted, and then (unless it is granted `*`) only the granted programs' files, resolved through `PATH` when the process starts, and programs in system locations (`/usr`, `/bin`, `/sbin`, `/System`, `/Library`, Homebrew's prefix, Xcode; `/usr`, `/bin`, `/sbin`, `/lib`, `/opt` on Linux), which the granted programs may start in turn: never a file written into the `Fs` directory or the temporary directory unless a grant names it. A started program inherits the sandbox: it can read system locations and the `Fs` directory, and list (not read) the directories above the current one, which shells need |
 
-What stays in Limen's own checks, not the kernel's: which hosts and ports `Net` and `Listen` allow (the kernel allows all networking once either is granted), which programs `Exec` may run, which variables `Env` shows, `Fs`'s refusal of `..` and absolute paths (the kernel sees only the resolved file), and everything inside the process: C code with the foreign grant can still read and corrupt the program's own memory, and through it every capability the program holds.
+What stays in Limen's own checks, not the kernel's: which hosts and ports `Net` and `Listen` allow (the kernel allows all networking once either is granted), which of the programs in system locations `Exec` may run and with which arguments, which variables `Env` shows, `Fs`'s refusal of `..` and absolute paths (the kernel sees only the resolved file), and everything inside the process: C code with the foreign grant can still read and corrupt the program's own memory, and through it every capability the program holds.
 
 How:
 
@@ -1092,7 +1093,7 @@ fn main(root: Root) -> Result[Int, IoError] {
 ```
 
 - `Exec.run(program, args)` runs `program` with the list `args`, waits for it to finish, and returns `Ok(ProcessOutput { code, stdout, stderr })` with its exit status and everything it wrote. A child killed by signal N has code 128 + N.
-- It is `Err(Denied(...))` if the program is not granted, and `Err(Failed(...))` if it cannot be started (for example, not found). A non-zero exit status is not an error; check `code`.
+- It is `Err(Denied(...))` if the program is not granted, or not with these arguments (argument prefixes, section 9), and `Err(Failed(...))` if it cannot be started (for example, not found). A non-zero exit status is not an error; check `code`.
 - Waiting for the child parks only the calling task, so a group can run several programs at once.
 
 ### HTTP
@@ -1303,6 +1304,7 @@ fn main(root: Root) {
 | `Net` | `connect_tls(addr)` | `Result[Conn, IoError]`, a TLS connection whose certificate was verified for `host` |
 | `Exec` | `run(program, args)` | `Result[ProcessOutput, IoError]`: `code`, `stdout`, `stderr` (section 10) |
 | `Exec` | `only(program)` | `Exec`; `program` is a name or `*` |
+| `Exec` | `only_args(program, prefixes)` | `Exec` for `program` with arguments starting with one of `prefixes` (`List[Str]`, each one or more words separated by spaces), those the value already allows (section 9) |
 | `Foreign` | `only(lib)` | `Foreign`; `lib` is a library name or `*` |
 | `Foreign` | `allows(lib)` | `Bool`: whether calls into `lib` are granted |
 | `Foreign` | `copy(p, n)` | `Bytes`: `n` bytes of C memory at `Handle` `p` (section 9) |
@@ -1662,7 +1664,7 @@ yaml = { git = "git@example.com:me/yaml.git", commit = "3f9c2e1d7a" }
 roots = ["../assets"]
 ```
 
-- `[grants]` takes `net`, `fs`, `listen`, `env`, `exec` and `foreign`, each a string or a list of strings written exactly like the text after `--grant KIND=`. `fs` takes one directory, relative to limen.toml, with an optional `:ro`. Stdout, Stderr, Stdin, Clock and Rand are always granted, so listing them is an error. Flags on the command line add to these grants.
+- `[grants]` takes `net`, `fs`, `listen`, `env`, `exec` and `foreign`, each a string or a list of strings written exactly like the text after `--grant KIND=` (`exec = ["git status|log", "make"]`; an empty argument prefix or prefixes for `*` are E0321). `limen caps` lists them, narrowing included (`grant exec=git status|log`, `"grants"` in `--json`). `fs` takes one directory, relative to limen.toml, with an optional `:ro`. Stdout, Stderr, Stdin, Clock and Rand are always granted, so listing them is an error. Flags on the command line add to these grants.
 - Grants belong to the program being run: only the limen.toml found for the main file is read for them. A dependency's own limen.toml never grants anything, so adding or updating a dependency cannot widen what the program may do. A dependency gets capabilities in exactly one way: your code passes them to it, and only of the kinds its `caps` allow. `[grants]` decides what reaches `main`; `caps` decides which of those may cross into each dependency.
 - `[embed] roots` lists directories, relative to limen.toml, whose files the program's own files may `embed` besides those of its package (section 11). Each must exist and be a directory, links followed (E0321 otherwise). Like grants, they belong to the program: a dependency embeds only its own directory's files, and a dependency whose limen.toml has an `[embed]` table is E0321, though its limen.toml is otherwise never read. Embedding reads files at compile time, not at run time, so a root grants the program nothing when it runs; it only decides what can be built into it.
 - A dependency is a directory holding `NAME.lmn`, plus any modules that file uses from the same directory.

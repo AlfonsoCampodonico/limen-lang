@@ -1357,7 +1357,7 @@ module Foreign = struct
   external cb_fail : unit -> unit = "limen_ffi_cb_fail"
   external cstr : int64 -> string = "limen_ffi_cstr"
   external peek : int64 -> int -> string = "limen_ffi_peek"
-  external sandbox_enter : string -> bool -> bool -> bool -> int = "limen_sandbox_enter"
+  external sandbox_enter : string -> bool -> bool -> string -> int = "limen_sandbox_enter"
 
   let permits allowed lib = List.mem "*" allowed || List.mem lib allowed
   let only allowed l = if (l = "*" && List.mem "*" allowed) || (l <> "*" && permits allowed l) then [ l ] else []
@@ -1756,13 +1756,56 @@ end
    comes through a pipe this task waits on, stderr through an unlinked
    temporary file. A child killed by signal N exits with 128 + N. *)
 module Proc = struct
-  let permits allowed p = List.mem "*" allowed || List.mem p allowed
-  let only allowed p = if (p = "*" && List.mem "*" allowed) || (p <> "*" && permits allowed p) then [ p ] else []
+  (* The allowlist entries are Caps.exec_entry's: a program or `*`, then the
+     argument prefixes it is limited to, matched word for word from the
+     first argument. As exec_permits and Cap_exec_only in the C runtime. *)
+  let prog_is e p = let q = Caps.exec_prog e in q = "*" || q = p
+
+  let rec prefix_matches ws args =
+    match (ws, args) with [], _ -> true | w :: ws, a :: args -> w = a && prefix_matches ws args | _ :: _, [] -> false
+
+  let words p = if p = "" then [] else String.split_on_char ' ' p
+
+  (* [args] None: with some arguments *)
+  let permits_args allowed p args =
+    List.exists
+      (fun e ->
+        prog_is e p
+        && match (Caps.exec_prefixes e, args) with [], _ | _, None -> true | ps, Some args -> List.exists (fun q -> prefix_matches (words q) args) ps)
+      allowed
+
+  let permits allowed p = permits_args allowed p None
+
+  let only allowed p =
+    if String.contains p '\n' then []
+    else if p = "*" then if List.mem "*" allowed then [ p ] else []
+    else
+      let mine = List.filter (fun e -> prog_is e p) allowed in
+      if mine = [] then []
+      else if List.exists (fun e -> Caps.exec_prefixes e = []) mine then [ p ]
+      else [ String.concat "\n" (p :: List.concat_map Caps.exec_prefixes mine) ]
+
+  (* `exec.only_args(program, prefixes)`: the prefixes [allowed] covers *)
+  let only_args allowed p qs =
+    if String.contains p '\n' || String.contains p '\000' || p = "*" then []
+    else
+      let covers q =
+        List.exists
+          (fun e ->
+            prog_is e p
+            && match Caps.exec_prefixes e with
+               | [] -> true
+               | ps -> List.exists (fun r -> r = "" || q = r || String.starts_with ~prefix:(r ^ " ") q) ps)
+          allowed
+      in
+      let qs = List.filter_map (fun q -> if String.contains q '\n' || String.contains q '\000' then None else Some (Caps.words q)) qs in
+      match List.filter covers qs with [] -> [] | kept -> [ String.concat "\n" (p :: kept) ]
 
   let run ~env_grant allowed prog args : (int * string * string, Caps.ioerr) result =
     if String.contains prog '\000' then Error (Caps.Failed "exec: the program name contains a NUL byte")
     else if List.exists (fun a -> String.contains a '\000') args then Error (Caps.Failed "exec: an argument contains a NUL byte")
-    else if not (permits allowed prog) then Error (Caps.Denied (sprintf "exec: `%s` is not granted" prog))
+    else if not (permits_args allowed prog (Some args)) then
+      Error (Caps.Denied (sprintf "exec: `%s` is not granted%s" prog (if permits allowed prog then " with these arguments" else "")))
     else
       match Filename.temp_file "limen-exec-" "" with
       | exception Sys_error m -> Error (Caps.Failed m)
@@ -2265,7 +2308,7 @@ and field rt v name =
   | VCap CRoot, "rand" -> VCap CRand
   | VCap CRoot, "stdin" -> VCap CStdin
   | VCap CRoot, "env" -> VCap (CEnv rt.grants.env)
-  | VCap CRoot, "exec" -> VCap (CExec rt.grants.exec)
+  | VCap CRoot, "exec" -> VCap (CExec (List.filter_map Caps.exec_entry rt.grants.exec))
   | VCap CRoot, "foreign" -> VCap (CForeign rt.grants.foreign)
   | _ -> failwith ("internal: field " ^ name)
 
@@ -2767,6 +2810,8 @@ and cap_call rt c name args sp =
   | CForeign allowed, "allows", [ VStr l ] -> VBool (Foreign.permits allowed l)
   | CForeign allowed, "copy", [ VStruct (_, [ (_, VInt p) ]); VInt n ] -> Foreign.copy allowed p n sp
   | CExec allowed, "only", [ VStr p ] -> VCap (CExec (Proc.only allowed p))
+  | CExec allowed, "only_args", [ VStr p; VList qs ] ->
+    VCap (CExec (Proc.only_args allowed p (Array.to_list (Array.map (function VStr q -> q | _ -> failwith "internal: exec prefix") qs))))
   | CExec allowed, "run", [ VStr p; VList args ] ->
     let args = Array.to_list (Array.map (function VStr a -> a | _ -> failwith "internal: exec argument") args) in
     io_result
@@ -2784,7 +2829,7 @@ let exit_code n = Int64.to_int (Int64.logand n 255L)
    operating system enforces it, Ok false when it has no sandbox here. *)
 let sandbox (g : grants) : (bool, string) result =
   let root, ro = match g.fs with Some (r, ro) -> (r, ro) | None -> ("", false) in
-  match Foreign.sandbox_enter root ro (g.net <> [] || g.listen <> []) (g.exec <> []) with
+  match Foreign.sandbox_enter root ro (g.net <> [] || g.listen <> []) (String.concat "\n" (List.map (fun e -> Caps.exec_prog (Option.value ~default:e (Caps.exec_entry e))) g.exec)) with
   | 0 -> Ok true
   | _ -> Ok false
   | exception Failure m -> Error m

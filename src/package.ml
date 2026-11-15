@@ -288,6 +288,7 @@ let parse file src : t =
                   vs
             in
             List.iter (fun v -> if v = "" then raise (Bad (sp, "a grant cannot be empty"))) vs;
+            if g = "exec" then List.iter (fun v -> if Caps.exec_entry v = None then raise (Bad (sp, "exec grant `" ^ v ^ "`: " ^ Caps.exec_grant_help))) vs;
             grants := !grants @ List.map (fun v -> (g, v)) vs
           | "trust", "foreign", VArr names ->
             if !trust <> [] then raise (Bad (sp, "[trust] foreign is listed twice"));

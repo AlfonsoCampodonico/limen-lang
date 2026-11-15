@@ -1047,6 +1047,58 @@ fn client(net: Net, port: Int, k: Int) -> Int {
 |} in
   out "exec-group" ~grants:sh exec_group "[17, 27, 37, 47, 57, 67]\n";
   check_tsan "exec-group" ~grants:sh exec_group "[17, 27, 37, 47, 57, 67]\n";
+  (* narrowed to argument prefixes, matched word for word from the first
+     argument: option injection before or instead of the granted words is
+     refused, whatever follows them is not *)
+  let exec_args = {|fn show(out: Stdout, what: Str, r: Result[ProcessOutput, IoError]) {
+    match r {
+        Ok(p) => out.print("{what}: {p.code} {p.stdout.trim()}"),
+        Err(e) => out.print("{what}: {e}"),
+    }
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let x = root.exec
+    show(out, "config", x.run("git", ["config", "core.sshCommand", "evil"]))
+    show(out, "-c", x.run("git", ["-c", "x=y", "status"]))
+    show(out, "upload-pack", x.run("git", ["--upload-pack=evil", "status"]))
+    show(out, "bare", x.run("git", []))
+    show(out, "statusx", x.run("git", ["statusx"]))
+    show(out, "hi", x.run("echo", ["hi", "there"]))
+    show(out, "-n", x.run("echo", ["-n", "x"]))
+    show(out, "bye", x.run("echo", ["bye"]))
+    show(out, "only", x.only("git").run("git", ["config", "a"]))
+    let e = x.only_args("echo", ["hi   there", "bye"])
+    show(out, "args hi there", e.run("echo", ["hi", "there", "you"]))
+    show(out, "args hi", e.run("echo", ["hi"]))
+    show(out, "args bye", e.run("echo", ["bye"]))
+    show(out, "args -n", e.run("echo", ["-n"]))
+    show(out, "args other", x.only_args("ls", ["-l"]).run("ls", ["-l"]))
+    show(out, "args star", x.only_args("*", ["hi"]).run("echo", ["hi"]))
+    let s = root.exec.only_args("sh", ["-c"])
+    show(out, "sh -c", s.run("sh", ["-c", "echo ok"]))
+    show(out, "sh -e", s.run("sh", ["-e", "-c", "echo ok"]))
+}
+|} in
+  out "exec-args" ~grants:{ Interp.no_grants with exec = [ "git status|log"; "echo hi|-n"; "sh" ] } exec_args
+    "config: Denied(\"exec: `git` is not granted with these arguments\")\n\
+     -c: Denied(\"exec: `git` is not granted with these arguments\")\n\
+     upload-pack: Denied(\"exec: `git` is not granted with these arguments\")\n\
+     bare: Denied(\"exec: `git` is not granted with these arguments\")\n\
+     statusx: Denied(\"exec: `git` is not granted with these arguments\")\n\
+     hi: 0 hi there\n\
+     -n: 0 x\n\
+     bye: Denied(\"exec: `echo` is not granted with these arguments\")\n\
+     only: Denied(\"exec: `git` is not granted with these arguments\")\n\
+     args hi there: 0 hi there you\n\
+     args hi: Denied(\"exec: `echo` is not granted with these arguments\")\n\
+     args bye: Denied(\"exec: `echo` is not granted with these arguments\")\n\
+     args -n: Denied(\"exec: `echo` is not granted with these arguments\")\n\
+     args other: Denied(\"exec: `ls` is not granted\")\n\
+     args star: Denied(\"exec: `echo` is not granted\")\n\
+     sh -c: 0 ok\n\
+     sh -e: Denied(\"exec: `sh` is not granted with these arguments\")\n";
 
   (* ---------- foreign functions (C libraries) ---------- *)
   let libc = { Interp.no_grants with foreign = [ "c" ] } in
@@ -7593,6 +7645,31 @@ fn main(root: Root) {
   end
   else ok "sandbox-binary" false "limen build failed";
   (try Sys.remove escape_file with Sys_error _ -> ());
+  (* with Exec, the sandbox lets the process start only the granted programs
+     and those in system locations: not one it could have written into its
+     Fs directory, even from C *)
+  put "sbox/data/payload" "#!/bin/sh\necho escaped\n";
+  Unix.chmod (Filename.concat pdir "sbox/data/payload") 0o755;
+  put "sbox/exec.lmn"
+    {v|foreign "c" {
+    fn execl(path: Str, arg0: Str, ..., end: Int) -> Int32
+}
+
+fn main(root: Root) {
+    let path = root.fs.full_path("payload") ?? ""
+    root.stdout.print("{root.exec.run("echo", ["granted"]).map(|p| p.stdout.trim())}")
+    let r = execl(root.foreign, path, "payload", 0)
+    root.stdout.print("refused {r}")
+}
+|v};
+  let sexec = Filename.concat pdir "sbox/exec.lmn" in
+  List.iter
+    (fun (name, extra, exec, want) ->
+      let code, o, e = limen_cli ((("run" :: extra) @ [ sexec ]) @ grant @ [ "--grant"; "exec=" ^ exec ]) in
+      ok name (code = 0 && o = want) (sprintf "%d %S %S" code o e))
+    [ ("sandbox-exec-interp", [], "echo", "Ok(\"granted\")\nrefused -1\n");
+      ("sandbox-exec-native", [ "--native" ], "echo", "Ok(\"granted\")\nrefused -1\n");
+      ("sandbox-exec-star", [], "*", "Ok(\"granted\")\nescaped\n") ];
   (* without Net, Listen or Exec, the sandbox also refuses the ways out that
      are not files: another program's Unix socket (here a listener of the
      test's own, which could as well be a Docker daemon or an ssh-agent),
@@ -7708,6 +7785,20 @@ fn main(root: Root) {
   ok "grants-toml-unknown" (grant_err "[grants]\ndisk = \"x\"\n") "unknown grant";
   ok "grants-toml-two-fs" (grant_err "[grants]\nfs = [\"a\", \"b\"]\n") "one fs";
   ok "grants-toml-twice" (grant_err "[grants]\nnet = \"a\"\nnet = \"b\"\n") "listed twice";
+  ok "grants-toml-exec-empty-prefix" (grant_err "[grants]\nexec = \"git status||log\"\n") "an empty argument prefix";
+  ok "grants-toml-exec-star-prefix" (grant_err "[grants]\nexec = \"* status\"\n") "prefixes for *";
+  (* exec narrowed to argument prefixes in limen.toml, and shown by limen caps *)
+  put "grants/limen.toml" "[package]\nname = \"g\"\n\n[grants]\nexec = [\"echo hi|-n\", \"sh -c\"]\n";
+  put "grants/exec.lmn" "fn main(root: Root) {\n    root.stdout.print(\"{root.exec.run(\"echo\", [\"hi\"]).is_ok()} {root.exec.run(\"echo\", [\"bye\"]).is_ok()}\")\n}\n";
+  let gexec = Filename.concat pdir "grants/exec.lmn" in
+  let code, o, e = limen_cli [ "run"; gexec ] in
+  ok "grants-toml-exec-args" (code = 0 && o = "true false\n") (sprintf "code %d, out %S, err %S" code o e);
+  let code, o, e = limen_cli [ "caps"; gexec ] in
+  ok "caps-grants" (code = 0 && o = "main  Root\ngrant exec=echo hi|-n\ngrant exec=sh -c\n") (sprintf "code %d, out %S, err %S" code o e);
+  let code, o, _ = limen_cli [ "caps"; gexec; "--json" ] in
+  ok "caps-grants-json" (code = 0 && Interp_util.find_sub o {|"grants":["exec=echo hi|-n","exec=sh -c"]|} 0 <> None) o;
+  let code, _, e = limen_cli [ "run"; gexec; "--grant"; "exec=* -c" ] in
+  ok "grants-exec-flag-bad" (code = 2 && Interp_util.find_sub e "exec grant" 0 <> None) (sprintf "code %d, err %S" code e);
   Sys.remove (Filename.concat pdir "grants/limen.toml");
   (* a dependency's own limen.toml never grants anything: only the program's does *)
   put "envy/envy.lmn" "pub fn get(env: Env) -> Str {\n    env.get(\"LIMEN_T_A\") ?? \"none\"\n}\n";

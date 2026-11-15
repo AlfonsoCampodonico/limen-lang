@@ -976,6 +976,39 @@ static char **g_args; static int g_nargs;
 static uint64_t g_rand_state;
 static bool g_rand_seeded;
 
+/* An Exec grant, `git` or `git status|remote -v`, as an allowlist entry:
+   the program, then a newline before each argument prefix, its words
+   separated by single spaces (`git\nstatus\nremote -v`). NULL if malformed:
+   an empty prefix, or prefixes for `*`. */
+static char *w_exec_entry(const char *g) {
+  const char *sp = strchr(g, ' ');
+  if (!sp) return strdup(g);
+  size_t pn = (size_t)(sp - g);
+  if (pn == 0 || (pn == 1 && g[0] == '*')) return NULL;
+  size_t n = strlen(g);
+  char *e = (char *)malloc(n + 2);
+  memcpy(e, g, pn);
+  size_t o = pn;
+  const char *p = sp + 1;
+  for (;;) {
+    const char *bar = strchr(p, '|');
+    const char *end = bar ? bar : p + strlen(p);
+    e[o++] = '\n';
+    size_t start = o;
+    for (const char *c = p; c < end;) {
+      while (c < end && *c == ' ') c++;
+      const char *w = c;
+      while (c < end && *c != ' ') c++;
+      if (c > w) { if (o > start) e[o++] = ' '; memcpy(e + o, w, (size_t)(c - w)); o += (size_t)(c - w); }
+    }
+    if (o == start || memchr(e + start, '\n', o - start)) { free(e); return NULL; }
+    if (!bar) break;
+    p = bar + 1;
+  }
+  e[o] = 0;
+  return e;
+}
+
 static void w_usage(const char *m) {
   fprintf(stderr, "%s\nusage: PROGRAM [--grant KIND=VALUE]... [--seed N] [--no-sandbox] [-- ARGS...]\n", m);
   exit(2);
@@ -1013,7 +1046,8 @@ static void w_init(int argc, char **argv) {
       g_env[g_nenv++] = strdup(g + 4);
     } else if (strncmp(g, "exec=", 5) == 0) {
       g_exec = (char **)w_realloc(g_exec, sizeof(char *) * (size_t)(g_nexec + 1));
-      g_exec[g_nexec++] = strdup(g + 5);
+      g_exec[g_nexec] = w_exec_entry(g + 5);
+      if (!g_exec[g_nexec++]) w_usage("exec grant: write PROGRAM, or PROGRAM ARGS|ARGS... with no empty prefix and not for *");
     } else if (strncmp(g, "foreign=", 8) == 0) {
       g_foreign = (char **)w_realloc(g_foreign, sizeof(char *) * (size_t)(g_nforeign + 1));
       g_foreign[g_nforeign++] = strdup(g + 8);
@@ -1025,12 +1059,21 @@ static void w_init(int argc, char **argv) {
   /* restrict the whole process to the grants (limen_sandbox.h), before any
      thread starts; --no-sandbox turns it off, for debugging */
   if (!g_no_sandbox) {
-    WSandboxSpec sb = { g_fs_root, g_fs_root ? (int)g_fs_ro : 0, g_nhosts > 0 || g_nlisten > 0, g_nexec > 0 };
+    /* the programs Exec may start, for the sandbox: each entry's name */
+    WBuf pb; buf_init(&pb);
+    for (int i = 0; i < g_nexec; i++) {
+      const char *nl = strchr(g_exec[i], '\n');
+      if (i > 0) buf_puts(&pb, "\n");
+      buf_putn(&pb, g_exec[i], nl ? (int64_t)(nl - g_exec[i]) : (int64_t)strlen(g_exec[i]));
+    }
+    buf_putn(&pb, "", 1);
+    WSandboxSpec sb = { g_fs_root, g_fs_root ? (int)g_fs_ro : 0, g_nhosts > 0 || g_nlisten > 0, g_nexec > 0, pb.p };
     char err[512];
     if (w_sandbox_enter(&sb, err, sizeof err) < 0) {
       fprintf(stderr, "limen: %s (run with --no-sandbox to go without it)\n", err);
       exit(1);
     }
+    free(pb.p);
   }
 }
 static WCap *w_root(void) { return cap_new(CAP_ROOT); }
@@ -3809,25 +3852,133 @@ static WStr *Cap_foreign_copy(WCap *x, int64_t p, int64_t n, const char *where) 
 
 /* ---------- Exec: run another program ----------
    The allowlist holds program names exactly as granted (`git`, `/usr/bin/env`)
-   or `*`. Arguments go to the program as a list; no shell is involved. The
+   or `*`, each followed by the argument prefixes it is limited to, if any:
+   `git\nstatus\nremote -v` (w_exec_entry) allows `git status ...` and
+   `git remote -v ...`, matched word for word from the first argument.
+   Arguments go to the program as a list; no shell is involved. The
    child gets /dev/null as stdin, our working directory, and only the
    environment variables granted with `--grant env=` (plus PATH), so Exec
    cannot read past the Env grant. Its
    stdout comes through a pipe the task waits on without blocking a worker;
    its stderr goes to an unlinked temporary file, so a child that fills one
    stream while we wait on the other cannot deadlock. */
-static bool exec_permits(WCap *x, const char *prog) {
-  for (int i = 0; i < x->nhosts; i++) if (strcmp(x->hosts[i], "*") == 0 || strcmp(x->hosts[i], prog) == 0) return true;
+static bool exec_prog_is(const char *e, const char *prog) {
+  const char *nl = strchr(e, '\n');
+  size_t n = nl ? (size_t)(nl - e) : strlen(e);
+  return (n == 1 && e[0] == '*') || (strlen(prog) == n && memcmp(e, prog, n) == 0);
+}
+/* Do the words of prefix [p, p + pn) (separated by single spaces) equal
+   the first arguments? An empty prefix allows any. */
+static bool exec_prefix_matches(const char *p, size_t pn, char **args, int64_t nargs) {
+  int64_t i = 0;
+  size_t at = 0;
+  while (at < pn) {
+    size_t end = at;
+    while (end < pn && p[end] != ' ') end++;
+    if (i >= nargs || strlen(args[i]) != end - at || memcmp(args[i], p + at, end - at) != 0) return false;
+    i++;
+    at = end + 1;
+  }
+  return true;
+}
+/* Is `prog` granted, with these arguments (nargs < 0: with some)? */
+static bool exec_permits(WCap *x, const char *prog, char **args, int64_t nargs) {
+  for (int i = 0; i < x->nhosts; i++) {
+    const char *e = x->hosts[i];
+    if (!exec_prog_is(e, prog)) continue;
+    const char *nl = strchr(e, '\n');
+    if (!nl || nargs < 0) return true;
+    while (nl) {
+      const char *p = nl + 1;
+      nl = strchr(p, '\n');
+      if (exec_prefix_matches(p, nl ? (size_t)(nl - p) : strlen(p), args, nargs)) return true;
+    }
+  }
   return false;
+}
+/* Is the prefix `q` (normalized words) covered by what `x` grants `prog`? */
+static bool exec_covers(WCap *x, const char *prog, const char *q) {
+  for (int i = 0; i < x->nhosts; i++) {
+    const char *e = x->hosts[i];
+    if (!exec_prog_is(e, prog)) continue;
+    const char *nl = strchr(e, '\n');
+    if (!nl) return true;
+    while (nl) {
+      const char *p = nl + 1;
+      nl = strchr(p, '\n');
+      size_t pn = nl ? (size_t)(nl - p) : strlen(p);
+      if (pn == 0 || (strlen(q) >= pn && memcmp(q, p, pn) == 0 && (q[pn] == 0 || q[pn] == ' '))) return true;
+    }
+  }
+  return false;
+}
+static WCap *exec_with(char *entry) {
+  WCap *c = cap_new(CAP_EXEC);
+  c->hosts = (char **)w_raw(sizeof(char *));
+  if (entry) { c->hosts[0] = entry; c->nhosts = 1; }
+  return c;
 }
 static WCap *Cap_exec_only(WCap *x, WStr *prog_s) {
   char *prog = strndup(prog_s->data, (size_t)prog_s->len);
-  bool covered = (size_t)prog_s->len == strlen(prog) && exec_permits(x, prog);
-  if (strcmp(prog, "*") == 0) { covered = false; for (int i = 0; i < x->nhosts; i++) if (strcmp(x->hosts[i], "*") == 0) covered = true; }
-  WCap *c = cap_new(CAP_EXEC);
-  c->hosts = (char **)w_raw(sizeof(char *));
-  if (covered) { c->hosts[0] = prog; c->nhosts = 1; } else free(prog);
-  return c;
+  if ((size_t)prog_s->len != strlen(prog) || strchr(prog, '\n')) { free(prog); return exec_with(NULL); }
+  if (strcmp(prog, "*") == 0) {
+    for (int i = 0; i < x->nhosts; i++) if (strcmp(x->hosts[i], "*") == 0) return exec_with(prog);
+    free(prog);
+    return exec_with(NULL);
+  }
+  /* the program with every prefix granted for it, or with none if one
+     entry allows any arguments */
+  WBuf b; buf_init(&b);
+  bool found = false;
+  for (int i = 0; i < x->nhosts; i++) {
+    const char *e = x->hosts[i];
+    if (!exec_prog_is(e, prog)) continue;
+    const char *nl = strchr(e, '\n');
+    if (!nl) { free(b.p); return exec_with(prog); }
+    found = true;
+    buf_puts(&b, nl);
+  }
+  if (!found) { free(b.p); free(prog); return exec_with(NULL); }
+  WStr *rest = buf_take(&b);
+  char *entry = (char *)malloc(strlen(prog) + (size_t)rest->len + 1);
+  memcpy(entry, prog, strlen(prog));
+  memcpy(entry + strlen(prog), rest->data, (size_t)rest->len);
+  entry[strlen(prog) + (size_t)rest->len] = 0;
+  Str_drop(rest);
+  free(prog);
+  return exec_with(entry);
+}
+/* `exec.only_args(program, prefixes)`: the prefixes `x` covers for it */
+static WCap *Cap_exec_only_args(WCap *x, WStr *prog_s, L_Str *qs) {
+  char *prog = strndup(prog_s->data, (size_t)prog_s->len);
+  if ((size_t)prog_s->len != strlen(prog) || strchr(prog, '\n') || strcmp(prog, "*") == 0) { free(prog); return exec_with(NULL); }
+  WBuf b; buf_init(&b);
+  buf_puts(&b, prog);
+  bool any = false;
+  for (int64_t i = 0; i < qs->len; i++) {
+    WStr *q = qs->data[i];
+    if (memchr(q->data, 0, (size_t)q->len) || memchr(q->data, '\n', (size_t)q->len)) continue;
+    /* its words, separated by single spaces */
+    WBuf w; buf_init(&w);
+    int64_t at = 0;
+    while (at < q->len) {
+      while (at < q->len && q->data[at] == ' ') at++;
+      int64_t end = at;
+      while (end < q->len && q->data[end] != ' ') end++;
+      if (end > at) { if (w.len > 0) buf_puts(&w, " "); buf_putn(&w, q->data + at, end - at); }
+      at = end;
+    }
+    WStr *ws = buf_take(&w);
+    char *norm = strndup(ws->data, (size_t)ws->len);
+    Str_drop(ws);
+    if (exec_covers(x, prog, norm)) { buf_puts(&b, "\n"); buf_puts(&b, norm); any = true; }
+    free(norm);
+  }
+  WStr *e = buf_take(&b);
+  char *entry = any ? strndup(e->data, (size_t)e->len) : NULL;
+  Str_drop(e);
+  free(prog);
+  return exec_with(entry);
 }
 typedef struct { int64_t code; WStr *out; WStr *err; } WProc;
 static WIo Cap_exec_run(WCap *x, WStr *prog_s, L_Str *args) {
@@ -3835,17 +3986,19 @@ static WIo Cap_exec_run(WCap *x, WStr *prog_s, L_Str *args) {
   for (int64_t i = 0; i < args->len; i++)
     if (memchr(args->data[i]->data, 0, (size_t)args->data[i]->len)) return io_err(2, "exec: an argument contains a NUL byte");
   char *prog = strndup(prog_s->data, (size_t)prog_s->len);
-  if (!exec_permits(x, prog)) {
-    WBuf b; buf_init(&b);
-    buf_puts(&b, "exec: `"); buf_puts(&b, prog); buf_puts(&b, "` is not granted");
-    free(prog);
-    WIo r = { 1, NULL, buf_take(&b), NULL };
-    return r;
-  }
   char **argv = (char **)w_raw(sizeof(char *) * (size_t)(args->len + 2));
   argv[0] = prog;
   for (int64_t i = 0; i < args->len; i++) argv[i + 1] = strndup(args->data[i]->data, (size_t)args->data[i]->len);
   argv[args->len + 1] = NULL;
+  if (!exec_permits(x, prog, argv + 1, args->len)) {
+    WBuf b; buf_init(&b);
+    buf_puts(&b, "exec: `"); buf_puts(&b, prog);
+    buf_puts(&b, exec_permits(x, prog, NULL, -1) ? "` is not granted with these arguments" : "` is not granted");
+    for (int64_t i = 0; i <= args->len; i++) free(argv[i]);
+    free(argv);
+    WIo r = { 1, NULL, buf_take(&b), NULL };
+    return r;
+  }
   const char *tmp = getenv("TMPDIR");
   char tpl[1024];
   snprintf(tpl, sizeof tpl, "%s/limen-exec-XXXXXX", tmp && tmp[0] ? tmp : "/tmp");
