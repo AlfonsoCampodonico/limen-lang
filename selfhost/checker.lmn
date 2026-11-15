@@ -463,6 +463,19 @@ fn check_var(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, n: Str, sp: ast
             return (TErr, st.report(diag.error("E0310", sp, "`{n}` is a group handle; the only thing you can do with it is `{n}.go(...)`")))
         },
         Some(v) => {
+            let pass = st.arg_of
+            st.arg_of = None
+            if v.kind == KParam && st.cb_params.contains((n, v.span)) {
+                match fx.lookup(n) {
+                    Some((_, false)) if st.calling => {},
+                    Some((_, false)) if pass.is_some() => {
+                        st.cb_passes = [pass ?? ("", 0)] + st.cb_passes
+                    },
+                    _ => {
+                        st.cb_escaped = true
+                    },
+                }
+            }
             return (v.ty, st)
         },
         None => {},
@@ -529,12 +542,6 @@ fn instantiate(st: env.State, s: env.Sig) -> (List[(Str, types.Ty)], types.Ty, e
     (inst, TFn(s.params.map(|p| st.subst(inst, p)), st.subst(inst, s.ret)), st)
 }
 
-// The generic built-ins that compare the values of a type parameter with
-// `==`: the function, the parameter, and the name to report.
-fn comparing_generics() -> List[(Str, Str, Str)] {
-    [("List::chunk_by", "K", "chunk_by"), ("list.index_of", "T", "index_of"), ("std/list.index_of", "T", "index_of")]
-}
-
 // E0201 when built-in `name` compares values of type `t` that have no
 // equality: functions, channels, `dyn` values, capabilities, and values
 // holding a capability, as `==` refuses them.
@@ -552,15 +559,11 @@ pub fn refuse_compare(st: env.State, sp: ast.Span, name: Str, t: types.Ty) -> en
 // The bounds of generic function `name` apply to its type arguments here.
 fn add_bounds(st: env.State, cx: env.Cx, name: Str, inst: List[(Str, types.Ty)], sp: ast.Span) -> env.State {
     let mut st = st
-    for (f, g, shown) in comparing_generics() {
-        if f == name {
-            match inst.find(|p| p.0 == g) {
-                Some((_, t)) => {
-                    st.compared = [(sp, t, shown)] + st.compared
-                },
-                None => {},
-            }
-        }
+    if !inst.is_empty() {
+        st.uses_here = [(sp, name, inst)] + st.uses_here
+    }
+    if st.cur_fn != "" && !st.refs_here.contains(name) {
+        st.refs_here = [name] + st.refs_here
     }
     for b in cx.fn_bounds.get(name) ?? [] {
         match inst.find(|p| p.0 == b.param) {
@@ -846,7 +849,11 @@ fn builtin_call(st: env.State, cx: env.Cx, fx: env.Fx, n: Str, args: List[ast.Ex
                     let next = expect(next, cx, fx, b, t)
                     match next.repr(t) {
                         TFn(..) | TCap(_) | TChan(_) | TAtomic | TShared(_) | TDyn(..) => next.report(diag.error("E0201", sp, "values of type `{next.show(t)}` cannot be compared")),
-                        _ => refuse_compare(next, sp, "assert_eq", t),
+                        _ => {
+                            let mut next = next
+                            next.eq_types = [t] + next.eq_types
+                            refuse_compare(next, sp, "assert_eq", t)
+                        },
                     }
                 },
                 _ => wrong(st, "`assert_eq` takes 2 arguments"),
@@ -983,11 +990,34 @@ fn check_call(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, callee: ast.Ex
                     _ => false,
                 }
                 let ps = if foreign { callback_params(st, cx, fx, args2, ps) } else { ps }
-                for (a, p) in args2.zip(ps) {
+                // a function parameter passed on: pure if the callee is, there
+                let passed_to = match st.desc(callee) {
+                    EVar(g) if !foreign && !fx.is_local(g) && cx.fns.contains(g) => Some(g),
+                    _ => None,
+                }
+                for (k, (a, p)) in args2.zip(ps).with_index() {
+                    match (passed_to, st.desc(a)) {
+                        (Some(g), EVar(_)) => {
+                            st.arg_of = Some((g, k))
+                        },
+                        _ => {},
+                    }
                     st = expect(st, cx, fx, a, p)
+                    st.arg_of = None
                 }
                 if foreign {
                     st = check_callbacks(st, cx, fx, args2, ps)
+                    // a Foreign narrowed here to other libraries: the call would panic
+                    match (ps, args2, st.desc(callee)) {
+                        ([TCap("Foreign"), ..], [a, ..], EVar(n)) => match (cx.foreign_libs.get(n), known_foreign(st, fx, a)) {
+                            (Some(lib), Some(s)) if !s.contains(lib) && !s.contains("*") => {
+                                let grants = if s.is_empty() { "no library" } else { "only " + s.map(|l| "`" + l + "`").join(", ") }
+                                st = st.report(diag.error("E0333", a.span, "`{n}` calls C library `{lib}`, but this Foreign grants {grants}").note("it was narrowed with `only`, so the call would panic; narrow it to the library the function belongs to"))
+                            },
+                            _ => {},
+                        },
+                        _ => {},
+                    }
                 }
             }
             if labelled {
@@ -1010,6 +1040,26 @@ fn check_call(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, callee: ast.Ex
             st = st.report(diag.error("E0108", callee.span, "a value of type `{st.show(t)}` is not a function"))
             (TErr, check_args(st, cx, fx, args))
         },
+    }
+}
+
+// The libraries a Foreign expression is known to be narrowed to: a
+// variable bound to one, or `x.only("lib")`. None when it is not known
+// here.
+fn known_foreign(st: env.State, fx: env.Fx, e: ast.Expr) -> Option[List[Str]] {
+    match st.desc(e) {
+        EVar(m) => match fx.find_var(m) {
+            Some(v) => st.foreign_known.find(|k| k.0 == (m, v.span)).map(|k| k.1),
+            None => None,
+        },
+        EMethod(r, "only", _, [arg]) => match (st.repr(st.type_of(r)), st.desc(arg)) {
+            (TCap("Foreign"), EStr([SPLit(lib)])) => match known_foreign(st, fx, r) {
+                Some(s) => Some(if lib == "*" { s } else if s.contains(lib) || s.contains("*") { [lib] } else { [] }),
+                None => if lib == "*" { None } else { Some([lib]) },
+            },
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -2061,13 +2111,17 @@ fn check_bin(st: env.State, cx: env.Cx, fx: env.Fx, op: ast.BinOp, a: ast.Expr, 
                     _ => (TErr, bad(st)),
                 },
                 Lt | Le | Gt | Ge => (TBool, if unordered(st, cx, t).is_some() { bad(st) } else { st }),
-                _ => match t {
-                    TFn(..) | TCap(_) | TChan(_) | TAtomic | TShared(_) | TDyn(..) => (TBool, bad(st)),
-                    // capabilities have no equality, so neither has a value holding one
-                    _ => match st.held(t) {
-                        Some(h) => (TBool, st.report(diag.error("E0201", sp, "operator `{op_name(op)}` cannot be applied to `{st.show(t)}`").note(h + ", and capabilities cannot be compared"))),
-                        None => (TBool, st),
-                    },
+                _ => {
+                    let mut st = st
+                    st.eq_types = [t] + st.eq_types
+                    match t {
+                        TFn(..) | TCap(_) | TChan(_) | TAtomic | TShared(_) | TDyn(..) => (TBool, bad(st)),
+                        // capabilities have no equality, so neither has a value holding one
+                        _ => match st.held(t) {
+                            Some(h) => (TBool, st.report(diag.error("E0201", sp, "operator `{op_name(op)}` cannot be applied to `{st.show(t)}`").note(h + ", and capabilities cannot be compared"))),
+                            None => (TBool, st),
+                        },
+                    }
                 },
             }
         },
@@ -2712,6 +2766,15 @@ fn check_stmt(st: env.State, cx: env.Cx, fx: env.Fx, s: ast.Stmt) -> (Bool, env.
                     st = next
                     t
                 },
+            }
+            // known before the name is bound: `let c = c.only("z")` narrows the old `c`
+            if !m {
+                match known_foreign(st, fx, e) {
+                    Some(s) => {
+                        st.foreign_known = [((n, nsp), s)] + st.foreign_known
+                    },
+                    None => {},
+                }
             }
             (false, fx.bind(n, env.Var { ty: t, mutable: m, span: nsp, kind: KLet }), st)
         },

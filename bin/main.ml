@@ -4,7 +4,7 @@ let usage =
   {|limen: a small language where I/O needs a capability
 
 usage:
-  limen run FILE [--native] [--grant net=HOST[:PORT]|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST:PORT]... [--grant env=NAME|*]... [--grant exec=PROGRAM|*]... [--grant foreign=LIB|*]... [--seed N] [--no-sandbox] [-- ARGS...]
+  limen run FILE [--native] [--grant net=HOST[:PORT]|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST:PORT]... [--grant env=NAME|*]... [--grant exec=PROGRAM[ ARGS|ARGS...]|*]... [--grant foreign=LIB[,LIB...]|*]... [--seed N] [--no-sandbox] [-- ARGS...]
   limen build FILE [-o OUT] [--emit-c]
   limen check FILE [--json]
   limen caps FILE [--json]
@@ -77,9 +77,14 @@ let parse_grants args =
       | Some i when String.sub a 0 i = "env" ->
         { g with env = g.env @ [ String.sub a (i + 1) (String.length a - i - 1) ] }
       | Some i when String.sub a 0 i = "exec" ->
-        { g with exec = g.exec @ [ String.sub a (i + 1) (String.length a - i - 1) ] }
+        let v = String.sub a (i + 1) (String.length a - i - 1) in
+        if Caps.exec_entry v = None then die_usage ("exec grant: " ^ Caps.exec_grant_help);
+        { g with exec = g.exec @ [ v ] }
       | Some i when String.sub a 0 i = "foreign" ->
-        { g with foreign = g.foreign @ [ String.sub a (i + 1) (String.length a - i - 1) ] }
+        (* one library, or several separated by commas: foreign=z,sqlite3 *)
+        let libs = String.split_on_char ',' (String.sub a (i + 1) (String.length a - i - 1)) in
+        if List.mem "" libs then die_usage "foreign grant: name C libraries, as in foreign=z or foreign=z,sqlite3";
+        { g with foreign = g.foreign @ libs }
       | None when a = "no-sandbox" -> g
       | Some i when String.sub a 0 i = "seed" -> (
         match int_of_string_opt (String.sub a (i + 1) (String.length a - i - 1)) with
@@ -393,23 +398,25 @@ let cmd_caps file json =
   if diags <> [] then (report diags; exit 1);
   let caps_str (i : Check.fn_info) = List.map Types.cap_name i.caps in
   (* a capability held through a struct or enum says where: `Net (via Client.net)` *)
-  let caps_via (i : Check.fn_info) =
-    List.map (fun c -> match List.assoc_opt c i.via with Some p -> Printf.sprintf "%s (via %s)" (Types.cap_name c) p | None -> Types.cap_name c) i.caps
-  in
+  let caps_via (i : Check.fn_info) = List.map (Check.cap_text i) i.caps in
   if json then begin
     let one (i : Check.fn_info) =
-      Printf.sprintf {|{"name":%s,"caps":[%s],"via":{%s},"callbacks":%b,"pure":%b}|} (Diag.jstr i.name)
+      Printf.sprintf {|{"name":%s,"caps":[%s],"via":{%s},"callbacks":%b,"pure":%b,"pure_if":[%s],"libs":[%s]}|} (Diag.jstr i.name)
         (String.concat "," (List.map Diag.jstr (caps_str i)))
         (String.concat "," (List.map (fun (c, p) -> Diag.jstr (Types.cap_name c) ^ ":" ^ Diag.jstr p) i.via))
         i.callbacks
         (i.caps = [] && not i.callbacks)
+        (String.concat "," (List.map Diag.jstr i.pure_if))
+        (String.concat "," (List.map Diag.jstr (if List.mem Types.Foreign i.caps then i.libs else [])))
     in
     let emb (m, path, size) = Printf.sprintf {|{"module":%s,"path":%s,"bytes":%d}|} (Diag.jstr m) (Diag.jstr path) size in
     print_endline
       ("{\"functions\":[" ^ String.concat "," (List.map one infos) ^ "],\"embed_roots\":["
       ^ String.concat "," (List.map (fun (r, _) -> Diag.jstr r) !Modules.embed_roots)
       ^ "],\"embeds\":["
-      ^ String.concat "," (List.map emb (List.rev !Modules.embedded)) ^ "]}")
+      ^ String.concat "," (List.map emb (List.rev !Modules.embedded))
+      ^ "],\"grants\":["
+      ^ String.concat "," (List.map Diag.jstr (toml_grants file)) ^ "]}")
   end
   else begin
     let width = List.fold_left (fun w (i : Check.fn_info) -> max w (String.length i.name)) 0 infos in
@@ -417,8 +424,7 @@ let cmd_caps file json =
       (fun (i : Check.fn_info) ->
         let what =
           match (caps_via i, i.callbacks) with
-          | [], false -> "pure"
-          | [], true -> "pure itself, runs callbacks"
+          | [], _ -> Check.pure_text i
           | cs, cb -> String.concat ", " cs ^ if cb then " + callbacks" else ""
         in
         Printf.printf "%-*s  %s\n" width i.name what)
@@ -428,7 +434,9 @@ let cmd_caps file json =
     List.iter (fun (r, _) -> Printf.printf "embed root %s\n" r) !Modules.embed_roots;
     List.iter
       (fun (m, path, size) -> Printf.printf "embeds %s (%d bytes)%s\n" path size (if m = "" then "" else " in module " ^ m))
-      (List.rev !Modules.embedded)
+      (List.rev !Modules.embedded);
+    (* what limen.toml grants the program, narrowing included: `grant exec=git status|log` *)
+    List.iter (fun g -> Printf.printf "grant %s\n" g) (toml_grants file)
   end
 
 let checked file =

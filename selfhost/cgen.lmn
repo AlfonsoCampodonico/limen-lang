@@ -101,7 +101,7 @@ struct Cg {
     // longjmps back into the function, and the deferred body (and the
     // cleanups after it) must see their latest values and owned flags
     vols: List[Int],
-    pure: Map[Str, Bool],
+    pure: Map[Str, pure.Info],
     // pure calls the current function keeps across a loop
     plan: pure.Plan,
     // the last slot number given, in the whole program
@@ -1647,6 +1647,7 @@ fn prim(self: Cg, ind: Str, dst: Str, t: types.Ty, name: Str, rt: types.Ty, a: L
             c1.io_result(ind, dst, t, "Cap_fs_info({arg(0)}, {arg(1)})", "(\{ WFileInfo *i_ = (WFileInfo*)r_.ptr; {fi} v_ = \{ i_->size, i_->mtime_ms, i_->is_file, i_->is_dir }; free(i_); v_; })")
         },
         ("cap_only", TCap("Exec")) => c.set(ind, dst, "Cap_exec_only({arg(0)}, {arg(1)})"),
+        ("cap_only_args", TCap("Exec")) => c.set(ind, dst, "Cap_exec_only_args({arg(0)}, {arg(1)}, {arg(2)})"),
         ("cap_only", TCap("Foreign")) => c.set(ind, dst, "Cap_foreign_only({arg(0)}, {arg(1)})"),
         ("cap_allows", TCap("Foreign")) => c.set(ind, dst, "Cap_foreign_allows({arg(0)}, {arg(1)})"),
         ("cap_copy", TCap("Foreign")) => c.set(ind, dst, "Cap_foreign_copy({arg(0)}, ({arg(1)}).f0, {arg(2)}, {c.where(sp)})"),
@@ -1685,7 +1686,14 @@ fn prim(self: Cg, ind: Str, dst: Str, t: types.Ty, name: Str, rt: types.Ty, a: L
         ("cap_write", TCap("Fs")) => c.io_result(ind, dst, t, "Cap_fs_write({arg(0)}, {arg(1)}, {arg(2)})", "0"),
         ("cap_exists", _) => c.set(ind, dst, "Cap_fs_exists({arg(0)}, {arg(1)})"),
         ("cap_full_path", TCap("Fs")) => c.io_result(ind, dst, t, "Cap_fs_full_path({arg(0)}, {arg(1)})", "r_.val"),
-        ("cap_is_read_only", TCap("Fs")) => c.set(ind, dst, "({arg(0)})->ro"),
+        ("cap_is_read_only", TCap("Fs")) => c.set(ind, dst, "Cap_fs_is_read_only({arg(0)})"),
+        ("cap_revocable", TCap(_)) => {
+            let c1 = c.line(ind, "\{").line(ind, "  WCap *k_; WCap *c_ = Cap_revocable({arg(0)}, &k_);")
+            let (n, c2) = c1.cname(t)
+            c2.line(ind, "  {dst} = ({n})\{ c_, k_ };").line(ind, "}")
+        },
+        ("cap_revoke", TCap("Revoker")) => c.line(ind, "Cap_revoke({arg(0)});").set(ind, dst, "0"),
+        ("cap_is_revoked", TCap("Revoker")) => c.set(ind, dst, "Cap_is_revoked({arg(0)})"),
         _ => panic("cgen: unknown primitive {name} on {show(rt)}"),
     }
 }

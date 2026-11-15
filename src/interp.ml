@@ -19,6 +19,13 @@ type cap =
   | CEnv of string list
   | CExec of string list
   | CForeign of string list (* libraries, or "*" *)
+  | CRevocable of revoke * cap (* `x.revocable()`: x, withdrawn once the switch is off *)
+  | CRevoker of revoke (* the switch *)
+
+(* A revocation switch: off once revoked; `parent` is the switch of the
+   capability it was made from, if any, so revoking that one withdraws it
+   too. *)
+and revoke = { mutable off : bool; parent : revoke option }
 
 (* A socket that knows when it was closed, so a task waiting on it never
    touches a descriptor number that has been reused. *)
@@ -275,10 +282,19 @@ type rt = {
 let fmt_float x =
   if Float.is_integer x && Float.abs x < 1e16 then sprintf "%.1f" x else sprintf "%.15g" x
 
-let cap_name = function
+let rec cap_name = function
   | CRoot -> "Root" | CNet _ -> "Net" | CFs _ -> "Fs" | CStdout -> "Stdout" | CStderr -> "Stderr" | CClock -> "Clock"
   | CListen _ -> "Listen" | CListener _ -> "Listener" | CConn _ -> "Conn"
   | CRand -> "Rand" | CStdin -> "Stdin" | CEnv _ -> "Env" | CExec _ -> "Exec" | CForeign _ -> "Foreign"
+  | CRevocable (_, c) -> cap_name c
+  | CRevoker _ -> "Revoker"
+
+let rec revoked r = r.off || match r.parent with Some p -> revoked p | None -> false
+let rec under r top = r == top || match r.parent with Some p -> under p top | None -> false
+
+(* The Listeners and Conns obtained through a revocable capability, with its
+   switch: revoking closes those under it. *)
+let revocable_socks : (revoke * sock) list ref = ref []
 
 let rec key_of = function
   | VInt n -> KInt n
@@ -1375,7 +1391,7 @@ module Foreign = struct
   external job_abandon : nativeint -> unit = "limen_ffi_job_abandon"
   external cstr : int64 -> string = "limen_ffi_cstr"
   external peek : int64 -> int -> string = "limen_ffi_peek"
-  external sandbox_enter : string -> bool -> bool -> bool -> int = "limen_sandbox_enter"
+  external sandbox_enter : string -> bool -> bool -> string -> int = "limen_sandbox_enter"
 
   let permits allowed lib = List.mem "*" allowed || List.mem lib allowed
   let only allowed l = if (l = "*" && List.mem "*" allowed) || (l <> "*" && permits allowed l) then [ l ] else []
@@ -1675,7 +1691,14 @@ module Foreign = struct
       if cs.trusted then (VUnit, args)
       else
         match args with
-        | (VCap (CForeign allowed) as cap) :: rest ->
+        | (VCap c as cap) :: rest ->
+          (* a revocable Foreign: refused once revoked *)
+          let rec allowed_of = function
+            | CForeign allowed -> allowed
+            | CRevocable (r, c) -> if revoked r then raise (Panic ("foreign: revoked", sp)) else allowed_of c
+            | _ -> failwith "internal: foreign capability"
+          in
+          let allowed = allowed_of c in
           if not (permits allowed cs.lib) then raise (Panic (Ffi.denied_msg cs.lib, sp));
           (cap, rest)
         | _ -> failwith "internal: foreign capability"
@@ -1798,13 +1821,56 @@ end
    comes through a pipe this task waits on, stderr through an unlinked
    temporary file. A child killed by signal N exits with 128 + N. *)
 module Proc = struct
-  let permits allowed p = List.mem "*" allowed || List.mem p allowed
-  let only allowed p = if (p = "*" && List.mem "*" allowed) || (p <> "*" && permits allowed p) then [ p ] else []
+  (* The allowlist entries are Caps.exec_entry's: a program or `*`, then the
+     argument prefixes it is limited to, matched word for word from the
+     first argument. As exec_permits and Cap_exec_only in the C runtime. *)
+  let prog_is e p = let q = Caps.exec_prog e in q = "*" || q = p
+
+  let rec prefix_matches ws args =
+    match (ws, args) with [], _ -> true | w :: ws, a :: args -> w = a && prefix_matches ws args | _ :: _, [] -> false
+
+  let words p = if p = "" then [] else String.split_on_char ' ' p
+
+  (* [args] None: with some arguments *)
+  let permits_args allowed p args =
+    List.exists
+      (fun e ->
+        prog_is e p
+        && match (Caps.exec_prefixes e, args) with [], _ | _, None -> true | ps, Some args -> List.exists (fun q -> prefix_matches (words q) args) ps)
+      allowed
+
+  let permits allowed p = permits_args allowed p None
+
+  let only allowed p =
+    if String.contains p '\n' then []
+    else if p = "*" then if List.mem "*" allowed then [ p ] else []
+    else
+      let mine = List.filter (fun e -> prog_is e p) allowed in
+      if mine = [] then []
+      else if List.exists (fun e -> Caps.exec_prefixes e = []) mine then [ p ]
+      else [ String.concat "\n" (p :: List.concat_map Caps.exec_prefixes mine) ]
+
+  (* `exec.only_args(program, prefixes)`: the prefixes [allowed] covers *)
+  let only_args allowed p qs =
+    if String.contains p '\n' || String.contains p '\000' || p = "*" then []
+    else
+      let covers q =
+        List.exists
+          (fun e ->
+            prog_is e p
+            && match Caps.exec_prefixes e with
+               | [] -> true
+               | ps -> List.exists (fun r -> r = "" || q = r || String.starts_with ~prefix:(r ^ " ") q) ps)
+          allowed
+      in
+      let qs = List.filter_map (fun q -> if String.contains q '\n' || String.contains q '\000' then None else Some (Caps.words q)) qs in
+      match List.filter covers qs with [] -> [] | kept -> [ String.concat "\n" (p :: kept) ]
 
   let run ~env_grant allowed prog args : (int * string * string, Caps.ioerr) result =
     if String.contains prog '\000' then Error (Caps.Failed "exec: the program name contains a NUL byte")
     else if List.exists (fun a -> String.contains a '\000') args then Error (Caps.Failed "exec: an argument contains a NUL byte")
-    else if not (permits allowed prog) then Error (Caps.Denied (sprintf "exec: `%s` is not granted" prog))
+    else if not (permits_args allowed prog (Some args)) then
+      Error (Caps.Denied (sprintf "exec: `%s` is not granted%s" prog (if permits allowed prog then " with these arguments" else "")))
     else
       match Filename.temp_file "limen-exec-" "" with
       | exception Sys_error m -> Error (Caps.Failed m)
@@ -2308,7 +2374,7 @@ and field rt v name =
   | VCap CRoot, "rand" -> VCap CRand
   | VCap CRoot, "stdin" -> VCap CStdin
   | VCap CRoot, "env" -> VCap (CEnv rt.grants.env)
-  | VCap CRoot, "exec" -> VCap (CExec rt.grants.exec)
+  | VCap CRoot, "exec" -> VCap (CExec (List.filter_map Caps.exec_entry rt.grants.exec))
   | VCap CRoot, "foreign" -> VCap (CForeign rt.grants.foreign)
   | _ -> failwith ("internal: field " ^ name)
 
@@ -2785,6 +2851,18 @@ and sock_result : 'a. ('a, Caps.ioerr) result -> ('a -> value) -> value = fun r 
 
 and cap_call rt c name args sp =
   match (c, name, args) with
+  | CRevoker r, "revoke", [] ->
+    if not r.off then begin
+      r.off <- true;
+      List.iter (fun (r', sk) -> if under r' r then Sock.close sk) !revocable_socks;
+      revocable_socks := List.filter (fun (_, sk) -> not sk.shut) !revocable_socks
+    end;
+    VUnit
+  | CRevoker r, "is_revoked", [] -> VBool (revoked r)
+  | _, "revocable", [] ->
+    let r = { off = false; parent = (match c with CRevocable (p, _) -> Some p | _ -> None) } in
+    VStruct (Ast.tuple_name 2, [ ("0", VCap (CRevocable (r, c))); ("1", VCap (CRevoker r)) ])
+  | CRevocable (r, inner), _, _ -> revocable_call rt r inner name args sp
   | CStdout, "print", [ VStr s ] -> put rt.out !current.sink (s ^ "\n"); VUnit
   | CStdout, "write", [ VStr s ] -> put rt.out !current.sink s; VUnit
   (* stderr is written at once, past the order groups keep for stdout *)
@@ -2843,12 +2921,38 @@ and cap_call rt c name args sp =
   | CForeign allowed, "allows", [ VStr l ] -> VBool (Foreign.permits allowed l)
   | CForeign allowed, "copy", [ VStruct (_, [ (_, VInt p) ]); VInt n ] -> Foreign.copy allowed p n sp
   | CExec allowed, "only", [ VStr p ] -> VCap (CExec (Proc.only allowed p))
+  | CExec allowed, "only_args", [ VStr p; VList qs ] ->
+    VCap (CExec (Proc.only_args allowed p (Array.to_list (Array.map (function VStr q -> q | _ -> failwith "internal: exec prefix") qs))))
   | CExec allowed, "run", [ VStr p; VList args ] ->
     let args = Array.to_list (Array.map (function VStr a -> a | _ -> failwith "internal: exec argument") args) in
     io_result
       (fun (code, o, e) -> VStruct ("ProcessOutput", [ ("code", vint code); ("stdout", VStr o); ("stderr", VStr e) ]))
       (Proc.run ~env_grant:rt.grants.env allowed p args)
   | _ -> failwith ("internal: capability method " ^ name)
+
+(* A method of a revocable capability: what it gives once revoked, the same
+   as the native runtime; before, the inner capability's, with what it
+   narrows to or opens kept under the switch. *)
+and revocable_call rt r inner name args sp =
+  let kind = cap_name inner in
+  let denied () = io_result (fun () -> VUnit) (Error (Caps.Denied (String.lowercase_ascii kind ^ ": revoked"))) in
+  (* a Listener or Conn was closed when its switch went off: it answers as closed *)
+  if revoked r && kind <> "Listener" && kind <> "Conn" then
+    match (kind, name) with
+    | "Fs", ("exists" | "is_dir") | "Foreign", "allows" -> VBool false
+    | "Fs", "is_read_only" -> VBool true
+    | "Env", "get" -> none
+    | "Foreign", "copy" -> raise (Panic ("foreign: revoked", sp))
+    | _, ("only" | "only_args" | "under" | "read_only") -> VCap (CRevocable (r, inner))
+    | _ -> denied ()
+  else
+    let keep sk = revocable_socks := (r, sk) :: List.filter (fun (_, s) -> not s.shut) !revocable_socks in
+    match cap_call rt inner name args sp with
+    | VCap c -> VCap (CRevocable (r, c))
+    | VEnum ("Result", "Ok", [ VCap c ]) ->
+      (match c with CListener (sk, _) | CConn sk -> keep sk | _ -> ());
+      VEnum ("Result", "Ok", [ VCap (CRevocable (r, c)) ])
+    | v -> v
 
 (* The status a process exits with when `main` returns [n]: the low 8 bits,
    as the operating system keeps them (the native backend gets the same from
@@ -2860,7 +2964,7 @@ let exit_code n = Int64.to_int (Int64.logand n 255L)
    operating system enforces it, Ok false when it has no sandbox here. *)
 let sandbox (g : grants) : (bool, string) result =
   let root, ro = match g.fs with Some (r, ro) -> (r, ro) | None -> ("", false) in
-  match Foreign.sandbox_enter root ro (g.net <> [] || g.listen <> []) (g.exec <> []) with
+  match Foreign.sandbox_enter root ro (g.net <> [] || g.listen <> []) (String.concat "\n" (List.map (fun e -> Caps.exec_prog (Option.value ~default:e (Caps.exec_entry e))) g.exec)) with
   | 0 -> Ok true
   | _ -> Ok false
   | exception Failure m -> Error m

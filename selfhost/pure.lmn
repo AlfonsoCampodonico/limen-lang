@@ -3,7 +3,9 @@
 // channel can only compute and panic (SPEC section 9). Here the test is
 // made on the IR and is a little stricter: the body (and every function it
 // calls) also starts no task, makes no channel and calls no closure or
-// `dyn` method, so the same arguments always give the same result.
+// `dyn` method, so the same arguments always give the same result. A
+// function whose only other effects are calls of its function parameters
+// is pure when the functions it is given are (see `analyse`).
 //
 // Two rewrites use it, and neither can be observed by the program:
 //
@@ -81,21 +83,94 @@ fn rhs_of(s: ir.Stmt) -> Option[ir.Rhs] {
     }
 }
 
-// The pure functions of a program, by C name, and whether each is heavy:
-// worth keeping across a loop, not a short scalar computation the C
-// compiler sees through. Calls between functions are taken as pure until
-// shown otherwise (recursion is fine).
-pub fn analyse(p: ir.Program) -> Map[Str, Bool] {
+fn is_fn(t: types.Ty) -> Bool {
+    match t {
+        TFn(..) => true,
+        _ => false,
+    }
+}
+
+// The atoms a statement reads or moves, besides those of its rhs.
+fn stmt_atoms(s: ir.Stmt) -> List[ir.Atom] {
+    match s {
+        Let(_, r) | Init(_, r) | Set(_, r, _) => ir.consumed(r) + ir.borrowed(r),
+        Mutate(_, steps, m) => steps.flat_map(|st| match st {
+            PIndex(i, _) | PIndexU(i) | PKey(i, _) => [i],
+            PField(_) => [],
+        }) + ir.mut_atoms(m),
+        If(a, _, _) | Return(a) | Scope(a, _) => [a],
+        _ => [],
+    }
+}
+
+// The closures a function makes and never reassigns: variable to the
+// lifted function.
+fn closures_of(f: ir.Fn) -> Map[Int, Str] {
+    let mut made: Map[Int, Str] = map()
+    let mut set: List[Int] = []
+    for s in all_stmts(f.body) {
+        match s {
+            Let(v, MkClosure(h, _, _)) => {
+                made[v.id] = h
+            },
+            Set(v, _, _) | Init(v, _) | Decl(v) | Mutate(v, _, _) => {
+                set.push(v.id)
+            },
+            _ => {},
+        }
+    }
+    let mut out: Map[Int, Str] = map()
+    for (id, h) in made.entries() {
+        if !set.contains(id) {
+            out[id] = h
+        }
+    }
+    out
+}
+
+// What is known of a pure function: whether it is heavy (worth keeping
+// across a loop, not a short scalar computation the C compiler sees
+// through), and the positions of its function parameters: a call is pure
+// only when the functions passed there are. `cbs` is empty for a function
+// pure whatever it is passed.
+pub struct Info {
+    heavy: Bool,
+    cbs: List[Int],
+}
+
+// A function's closures and function parameters, and the calls it makes
+// with their arguments.
+struct Calls {
+    clos: Map[Int, Str],
+    own_cbs: List[Int],
+    calls: List[(Str, List[ir.Atom])],
+}
+
+// The pure functions of a program, by C name. Calls between functions are
+// taken as pure until shown otherwise (recursion is fine).
+//
+// A function whose parameters of function type are only called, or passed
+// on where another such function takes a function, is pure when the
+// functions it is passed are (SPEC section 14): its Info lists those
+// positions. A call to it is pure when each argument there is a closure
+// the caller made from a pure function. Storing such a parameter, sending
+// it, capturing it or returning it makes the function impure.
+pub fn analyse(p: ir.Program) -> Map[Str, Info] {
     let names: Map[Str, Bool] = p.fns.fold(map(), |m, f| {
         let mut m = m
         m[f.fname] = true
         m
     })
-    let mut calls: Map[Str, List[Str]] = map()
-    let mut candidates: Map[Str, Bool] = map()
+    let mut calls: Map[Str, Calls] = map()
+    let mut candidates: Map[Str, Info] = map()
     for f in p.fns {
-        let mut ok = (f.params + f.captures).all(|v| pure_type(p.types, v.ty))
-        let mut callees: List[Str] = []
+        let cbs = f.params.filter(|v| is_fn(v.ty)).map(|v| v.id)
+        let is_cb = |a: ir.Atom| match ir.atom_var(a) {
+            Some(v) => cbs.contains(v.id),
+            None => false,
+        }
+        let mut ok = f.params.all(|v| pure_type(p.types, v.ty) || is_fn(v.ty)) && f.captures.all(|v| pure_type(p.types, v.ty))
+        let mut callees: List[(Str, List[ir.Atom])] = []
         let mut scalar_only = f.params.all(|v| is_scalar(v.ty)) && is_scalar(f.ret)
         let mut straight = true
         for s in all_stmts(f.body) {
@@ -113,10 +188,21 @@ pub fn analyse(p: ir.Program) -> Map[Str, Bool] {
                 },
                 _ => {},
             }
+            // a function parameter is only called or passed on
+            let escapes = match (s, rhs_of(s)) {
+                (Set(v, _, _), _) if cbs.contains(v.id) => true,
+                (_, Some(CallClo(c, args))) => !is_cb(c) || args.any(is_cb),
+                // where the callee takes a function: checked below
+                (_, Some(Call(..))) => false,
+                _ => stmt_atoms(s).any(is_cb),
+            }
+            if escapes {
+                ok = false
+            }
             match rhs_of(s) {
-                Some(Call(g, _)) => {
+                Some(Call(g, args)) => {
                     straight = false
-                    callees.push(g)
+                    callees.push((g, args))
                     if !names.contains(g) {
                         ok = false
                     }
@@ -127,31 +213,47 @@ pub fn analyse(p: ir.Program) -> Map[Str, Bool] {
                         ok = false
                     }
                 },
-                Some(CallClo(..)) | Some(CallDyn(..)) | Some(Catch(..)) | Some(Spawn(..)) | Some(GroupNew(..)) | Some(GroupJoin(..)) | Some(ChanNew(..)) | Some(ChanSend(..)) | Some(Select(..)) | Some(SelGot(..)) | Some(RootField(..)) | Some(CallC(..)) => {
+                Some(CallClo(..)) => {
+                    straight = false
+                },
+                Some(CallDyn(..)) | Some(Catch(..)) | Some(Spawn(..)) | Some(GroupNew(..)) | Some(GroupJoin(..)) | Some(ChanNew(..)) | Some(ChanSend(..)) | Some(Select(..)) | Some(SelGot(..)) | Some(RootField(..)) | Some(CallC(..)) => {
                     ok = false
                 },
                 _ => {},
             }
         }
         if ok {
-            candidates[f.fname] = !(scalar_only && straight)
-            calls[f.fname] = callees
+            let pos = f.params.with_index().flat_map(|x| if is_fn(x.1.ty) { [x.0] } else { [] })
+            candidates[f.fname] = Info { heavy: !(scalar_only && straight), cbs: pos }
+            calls[f.fname] = Calls { clos: closures_of(f), own_cbs: cbs, calls: callees }
         }
     }
-    // drop functions that call a non-pure one, until nothing changes; a
-    // function calling a heavy one is heavy
+    // drop functions that call a non-pure one, or pass a function that is
+    // not pure where a conditionally pure one takes one, until nothing
+    // changes; a function calling a heavy one is heavy
     let mut changed = true
     while changed {
         changed = false
-        let mut next: Map[Str, Bool] = map()
-        for (name, heavy) in candidates.entries() {
-            let cs = calls[name]
-            if cs.all(|g| candidates.contains(g)) {
-                let now = heavy || cs.any(|g| candidates.get(g) ?? false)
-                if now != heavy {
+        let mut next: Map[Str, Info] = map()
+        for (name, info) in candidates.entries() {
+            let c = calls[name]
+            let arg_ok = |a: ir.Atom| match ir.atom_var(a) {
+                Some(v) => c.own_cbs.contains(v.id) || closure_pure(candidates, c.clos, v.id),
+                None => false,
+            }
+            let call_ok = |call: (Str, List[ir.Atom])| match candidates.get(call.0) {
+                Some(i) => i.cbs.all(|k| arg_ok(call.1[k])),
+                None => false,
+            }
+            if c.calls.all(call_ok) {
+                let now = info.heavy || c.calls.any(|g| match candidates.get(g.0) {
+                    Some(i) => i.heavy,
+                    None => false,
+                })
+                if now != info.heavy {
                     changed = true
                 }
-                next[name] = now
+                next[name] = { info with heavy: now }
             } else {
                 changed = true
             }
@@ -161,18 +263,41 @@ pub fn analyse(p: ir.Program) -> Map[Str, Bool] {
     candidates
 }
 
-// A call whose result depends only on its arguments.
-fn pure_rhs(pure: Map[Str, Bool], r: ir.Rhs) -> Bool {
+// Is variable `id` a closure made from a function pure whatever it is
+// passed?
+fn closure_pure(pure: Map[Str, Info], clos: Map[Int, Str], id: Int) -> Bool {
+    match clos.get(id) {
+        Some(h) => match pure.get(h) {
+            Some(i) => i.cbs.is_empty(),
+            None => false,
+        },
+        None => false,
+    }
+}
+
+// A call whose result depends only on its arguments: to a pure function,
+// passing a closure made from a pure function wherever it takes one.
+// `clos` are the closures of the function the call is in (closures_of).
+fn pure_rhs(pure: Map[Str, Info], clos: Map[Int, Str], r: ir.Rhs) -> Bool {
     match r {
-        Call(f, _) => pure.contains(f),
+        Call(f, args) => match pure.get(f) {
+            Some(i) => i.cbs.all(|k| match ir.atom_var(args[k]) {
+                Some(v) => closure_pure(pure, clos, v.id),
+                None => false,
+            }),
+            None => false,
+        },
         Prim(n, t, _, _) => pure_prim(n, t),
         _ => false,
     }
 }
 
-fn worth_keeping(pure: Map[Str, Bool], r: ir.Rhs) -> Bool {
+fn worth_keeping(pure: Map[Str, Info], clos: Map[Int, Str], r: ir.Rhs) -> Bool {
     match r {
-        Call(f, _) => pure.get(f) ?? false,
+        Call(f, _) => match pure.get(f) {
+            Some(i) => i.heavy && pure_rhs(pure, clos, r),
+            None => false,
+        },
         Prim(n, t, _, _) => pure_prim(n, t) && heavy_prims().contains(n),
         _ => false,
     }
@@ -245,13 +370,13 @@ fn mentions_any(killed: List[Int], e: (Key, ir.Var)) -> Bool {
 
 // `avail`: calls made earlier on every path to here, with the variable
 // holding each result, the latest first.
-fn cse_block(pure: Map[Str, Bool], avail: List[(Key, ir.Var)], ss: List[ir.Stmt]) -> List[ir.Stmt] {
+fn cse_block(pure: Map[Str, Info], clos: Map[Int, Str], avail: List[(Key, ir.Var)], ss: List[ir.Stmt]) -> List[ir.Stmt] {
     let mut avail = avail
     let mut out: List[ir.Stmt] = []
     for s in ss {
         let kill = |avail: List[(Key, ir.Var)], killed: List[Int]| avail.filter(|e| !mentions_any(killed, e))
         match s {
-            Let(v, r) if pure_rhs(pure, r) => {
+            Let(v, r) if pure_rhs(pure, clos, r) => {
                 let k = key_of(r)
                 match avail.find(|e| same_key(k, e.0)) {
                     Some(e) => out.push(Let(v, Use(V(e.1)))),
@@ -267,22 +392,22 @@ fn cse_block(pure: Map[Str, Bool], avail: List[(Key, ir.Var)], ss: List[ir.Stmt]
                 out.push(s)
             },
             If(c, a, b) => {
-                let a2 = cse_block(pure, avail, a)
-                let b2 = cse_block(pure, avail, b)
+                let a2 = cse_block(pure, clos, avail, a)
+                let b2 = cse_block(pure, clos, avail, b)
                 avail = kill(avail, assigned(a + b))
                 out.push(If(c, a2, b2))
             },
             Loop(body) => {
                 avail = kill(avail, assigned(body))
-                out.push(Loop(cse_block(pure, avail, body)))
+                out.push(Loop(cse_block(pure, clos, avail, body)))
             },
             Guard(n, h, b) => {
                 avail = kill(avail, assigned(h + b))
-                out.push(Guard(n, cse_block(pure, [], h), cse_block(pure, [], b)))
+                out.push(Guard(n, cse_block(pure, clos, [], h), cse_block(pure, clos, [], b)))
             },
             Scope(g, b) => {
                 avail = kill(avail, assigned(b))
-                out.push(Scope(g, cse_block(pure, [], b)))
+                out.push(Scope(g, cse_block(pure, clos, [], b)))
             },
         }
     }
@@ -291,7 +416,7 @@ fn cse_block(pure: Map[Str, Bool], avail: List[(Key, ir.Var)], ss: List[ir.Stmt]
 
 pub fn cse(p: ir.Program) -> ir.Program {
     let pure = analyse(p)
-    { p with fns: p.fns.map(|f| { f with body: cse_block(pure, [], f.body) }) }
+    { p with fns: p.fns.map(|f| { f with body: cse_block(pure, closures_of(f), [], f.body) }) }
 }
 
 // ---------- keeping a call across a loop ----------
@@ -324,7 +449,9 @@ struct LoopInfo {
 }
 
 struct Planner {
-    pure: Map[Str, Bool],
+    pure: Map[Str, Info],
+    // the closures of the function (closures_of)
+    clos: Map[Int, Str],
     loops: List[LoopInfo],
     kept: Map[Int, Slot],
     // the last slot number given, in the whole program
@@ -360,8 +487,8 @@ fn same_each_time(self: Planner, l: Int, a: ir.Atom) -> (Bool, Planner) {
     let mut pl = self
     pl.loops[l].memo[v.id] = false
     let kind_ok = match r {
-        Use(_) | Bin(..) | Negate(..) | Flip(_) | Get(..) | Payload(..) | IsTag(..) | PatTest(..) | Format(_) | MkStruct(..) | MkEnum(..) | MkList(..) => true,
-        Call(..) | Prim(..) => pure_rhs(pl.pure, r),
+        Use(_) | Bin(..) | Negate(..) | Flip(_) | Get(..) | Payload(..) | IsTag(..) | PatTest(..) | Format(_) | MkStruct(..) | MkEnum(..) | MkList(..) | MkClosure(..) => true,
+        Call(..) | Prim(..) => pure_rhs(pl.pure, pl.clos, r),
         _ => false,
     }
     let mut b = kind_ok
@@ -405,7 +532,7 @@ fn walk(self: Planner, outer: List[Int], ss: List[ir.Stmt]) -> Planner {
     let mut pl = self
     for s in ss {
         match s {
-            Let(v, r) | Init(v, r) if !outer.is_empty() && worth_keeping(pl.pure, r) => {
+            Let(v, r) | Init(v, r) if !outer.is_empty() && worth_keeping(pl.pure, pl.clos, r) => {
                 let (l, next) = pl.keep_across(outer, r)
                 pl = next
                 match l {
@@ -444,7 +571,7 @@ fn walk(self: Planner, outer: List[Int], ss: List[ir.Stmt]) -> Planner {
 // The calls of `f` to keep across loops, and the last slot number given
 // (`slot` is the last one before). A defer or a deadline jumps back into
 // the frame with setjmp's rules: such a function keeps the plain code.
-pub fn plan(pure: Map[Str, Bool], f: ir.Fn, slot: Int) -> (Plan, Int) {
+pub fn plan(pure: Map[Str, Info], f: ir.Fn, slot: Int) -> (Plan, Int) {
     let boundary = all_stmts(f.body).any(|s| match s {
         Guard(..) | Scope(..) => true,
         _ => false,
@@ -452,7 +579,7 @@ pub fn plan(pure: Map[Str, Bool], f: ir.Fn, slot: Int) -> (Plan, Int) {
     if boundary {
         return (no_plan(), slot)
     }
-    let pl = Planner { pure, loops: [], kept: map(), slot }.walk([], f.body)
+    let pl = Planner { pure, clos: closures_of(f), loops: [], kept: map(), slot }.walk([], f.body)
     let mut at_loop: Map[Int, List[Slot]] = map()
     for (i, l) in pl.loops.with_index() {
         if !l.slots.is_empty() {

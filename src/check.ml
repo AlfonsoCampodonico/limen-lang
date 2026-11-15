@@ -93,7 +93,21 @@ type fctx = {
 
 (* [via]: for each capability not written in the parameters' types, the
    path through the struct or enum that holds it, `Client.net`. *)
-type fn_info = { name : string; span : Span.t; caps : cap list; via : (cap * string) list; callbacks : bool }
+type fn_info = {
+  name : string;
+  span : Span.t;
+  caps : cap list;
+  via : (cap * string) list;
+  callbacks : bool;
+  libs : string list;
+      (* the C libraries it reaches with a Foreign: its own when it is a
+         foreign function, and those of the functions it uses that take a
+         Foreign, sorted *)
+  pure_if : string list;
+      (* its parameters of function type, when it only calls them or passes
+         them on to a function that is pure if they are: it is pure when
+         the functions it is given are *)
+}
 
 (* The capabilities values of these types hold, in [all_caps] order, each
    with where it comes from when no type writes it: the first type's path. *)
@@ -178,7 +192,7 @@ let unify_at ctx span want got =
   try unify want got
   with Mismatch -> err ctx "E0201" span (sprintf "expected `%s`, found `%s`" (show want) (show got))
 
-let builtin_types = [ "Int"; "Float"; "Bool"; "Str"; "Bytes"; "List"; "Array"; "Chan"; "Atomic"; "Shared"; "Root"; "Net"; "Fs"; "Stdout"; "Stderr"; "Clock"; "Listen"; "Listener"; "Conn"; "Rand"; "Stdin"; "Env"; "Exec"; "Foreign"; "Map" ]
+let builtin_types = [ "Int"; "Float"; "Bool"; "Str"; "Bytes"; "List"; "Array"; "Chan"; "Atomic"; "Shared"; "Root"; "Net"; "Fs"; "Stdout"; "Stderr"; "Clock"; "Listen"; "Listener"; "Conn"; "Rand"; "Stdin"; "Env"; "Exec"; "Foreign"; "Revoker"; "Map" ]
 
 (* Names other languages use for ambient I/O, mapped to the capability way. *)
 let ambient =
@@ -262,6 +276,7 @@ let rec resolve ctx env (te : ty_expr) : ty =
     | "Env" -> simple (TCap Env)
     | "Exec" -> simple (TCap Exec)
     | "Foreign" -> simple (TCap Foreign)
+    | "Revoker" -> simple (TCap Revoker)
     | "Chan" -> if want 1 then TChan (List.hd args') else TErr
     | "Atomic" -> simple TAtomic
     | "Shared" -> if want 1 then TShared (List.hd args') else TErr
@@ -360,6 +375,21 @@ let find_var f name = find_in name f.scopes
 let rec bound_in name = function [] -> false | s :: rest -> (s.vars != no_vars && Hashtbl.mem s.vars name) || bound_in name rest
 let is_local f name = bound_in name f.scopes
 
+(* The Foreign values of the function being checked narrowed to known
+   libraries with `only("lib")`: by variable (name and where it is bound). *)
+let foreign_known : ((string * Span.t) * string list) list ref = ref []
+
+(* The libraries a Foreign expression is known to be narrowed to: a variable
+   bound to one, or `x.only("lib")`. None when it is not known here. *)
+let rec known_foreign f (e : expr) =
+  match e.edesc with
+  | EVar m -> ( match find_var f m with Some v -> List.assoc_opt (m, v.vspan) !foreign_known | None -> None)
+  | EMethod (r, "only", _, [ { edesc = EStr [ SPLit lib ]; _ } ]) when (match repr r.ety with TCap Foreign -> true | _ -> false) -> (
+    match known_foreign f r with
+    | Some s -> Some (if lib = "*" then s else if List.mem lib s || List.mem "*" s then [ lib ] else [])
+    | None -> if lib = "*" then None else Some [ lib ])
+  | _ -> None
+
 let visible_names ctx f =
   List.concat_map (fun s -> List.of_seq (Hashtbl.to_seq_keys s.vars)) f.scopes
   @ List.of_seq (Hashtbl.to_seq_keys ctx.fns)
@@ -395,16 +425,62 @@ let map_keys : (Span.t * ty) list ref = ref []
    authority, as with `==`. *)
 let compared : (Span.t * ty * string) list ref = ref []
 
-(* The generic built-ins that compare the values of a type parameter with
-   `==`: the function, the parameter, and the name to report. *)
-let comparing_generics = [ ("List::chunk_by", "K", "chunk_by"); ("list.index_of", "T", "index_of"); ("std/list.index_of", "T", "index_of") ]
+(* Which type parameters each generic function compares (`==`, `!=`, and
+   the built-ins that compare), found from the bodies: the types compared
+   in the function being checked, the generic functions it uses with their
+   type arguments, and, once every body is checked, the parameters each
+   function compares itself and through the generic functions it calls. A
+   use whose type argument has no equality is then refused (E0201). *)
+let cur_fn = ref ""
+let eq_types : ty list ref = ref []
+let uses_here : (Span.t * string * (string * ty) list) list ref = ref []
+let compares_direct : (string, string list) Hashtbl.t = Hashtbl.create 16
+let generic_uses : (string * Span.t * string * (string * ty) list) list ref = ref []
+
+(* How the function being checked uses its parameters of function type:
+   called, passed on to a function at a parameter (`passes`), or anything
+   else (`escaped`: stored, returned, captured by a closure, sent). *)
+let cb_params : (string * Span.t) list ref = ref []
+let cb_escaped = ref false
+let cb_passes : (string * int) list ref = ref []
+let arg_of : (string * int) option ref = ref None
+let cb_uses : (string, bool * (string * int) list) Hashtbl.t = Hashtbl.create 16
+
+(* The functions each function uses by name (calls, methods, values), for
+   the C libraries it reaches; the library of each foreign function; and
+   (foreign_known, above) the Foreign values narrowed to known libraries. *)
+let refs_here : string list ref = ref []
+let fn_refs : (string, string list) Hashtbl.t = Hashtbl.create 16
+let foreign_libs : (string, string) Hashtbl.t = Hashtbl.create 8
+
+(* pairs, as long as the shorter list *)
+let rec zip a b = match (a, b) with x :: a, y :: b -> (x, y) :: zip a b | _ -> []
+
+let rec params_in acc t =
+  match repr t with
+  | TParam g -> if List.mem g acc then acc else acc @ [ g ]
+  | TList a | TChan a | TGroup a -> params_in acc a
+  | TArray (a, n) -> params_in (params_in acc a) n
+  | TMap (k, v) -> params_in (params_in acc k) v
+  | TFn (ps, r) -> params_in (List.fold_left params_in acc ps) r
+  | TNamed (_, xs) | TDyn (_, xs) -> List.fold_left params_in acc xs
+  | _ -> acc
+
+let rec resolved t =
+  match repr t with
+  | TList a -> TList (resolved a)
+  | TChan a -> TChan (resolved a)
+  | TGroup a -> TGroup (resolved a)
+  | TArray (a, n) -> TArray (resolved a, resolved n)
+  | TMap (k, v) -> TMap (resolved k, resolved v)
+  | TFn (ps, r) -> TFn (List.map resolved ps, resolved r)
+  | TNamed (n, xs) -> TNamed (n, List.map resolved xs)
+  | TDyn (i, xs) -> TDyn (i, List.map resolved xs)
+  | t -> t
 
 let add_bounds fname env sp =
-  List.iter
-    (fun (fn, g, name) ->
-      if fn = fname then
-        match List.assoc_opt g env with Some t -> compared := (sp, t, name) :: !compared | None -> ())
-    comparing_generics;
+  if env <> [] then uses_here := (sp, fname, env) :: !uses_here;
+  if !cur_fn <> "" && not (List.mem fname !refs_here) then refs_here := fname :: !refs_here;
   match Hashtbl.find_opt fn_bounds fname with
   | None -> ()
   | Some bs ->
@@ -499,6 +575,8 @@ let builtin_tname t =
 
 let build_methods (t : ty) : (string * (unit -> ty list * ty)) list =
   let m name ps r = (name, fun () -> (ps, r)) in
+  (* `fs.revocable()`: the same authority, and a switch that withdraws it *)
+  let revocable c = m "revocable" [] (TNamed (Ast.tuple_name 2, [ TCap c; TCap Revoker ])) in
   match t with
   | TStr ->
     [ m "len" [] TInt; m "is_empty" [] TBool; m "lines" [] (TList TStr);
@@ -539,8 +617,8 @@ let build_methods (t : ty) : (string * (unit -> ty list * ty)) list =
   | TNamed ("Result", [ a; e ]) ->
     [ m "is_ok" [] TBool; m "is_err" [] TBool;
       ("map_error", fun () -> let u = fresh () in ([ TFn ([ e ], u) ], res a u)) ]
-  | TCap Net -> [ m "get" [ TStr ] (res (TNamed ("HttpResponse", [])) io_err); m "only" [ TStr ] (TCap Net); m "connect" [ TStr ] (res (TCap Conn) io_err); m "connect_tls" [ TStr ] (res (TCap Conn) io_err) ]
-  | TCap Listen -> [ m "on" [ TStr ] (res (TCap Listener) io_err); m "on_tls" [ TStr; TStr; TStr ] (res (TCap Listener) io_err) ]
+  | TCap Net -> [ m "get" [ TStr ] (res (TNamed ("HttpResponse", [])) io_err); m "only" [ TStr ] (TCap Net); m "connect" [ TStr ] (res (TCap Conn) io_err); m "connect_tls" [ TStr ] (res (TCap Conn) io_err); revocable Net ]
+  | TCap Listen -> [ m "on" [ TStr ] (res (TCap Listener) io_err); m "on_tls" [ TStr; TStr; TStr ] (res (TCap Listener) io_err); revocable Listen ]
   | TCap Listener -> [ m "accept" [] (res (TCap Conn) io_err); m "port" [] TInt; m "close" [] TUnit ]
   | TCap Conn -> [ m "read" [] (res TStr io_err); m "write" [ TStr ] (res TUnit io_err); m "close" [] TUnit ]
   | TCap Fs ->
@@ -549,16 +627,18 @@ let build_methods (t : ty) : (string * (unit -> ty list * ty)) list =
       m "remove" [ TStr ] (res TUnit io_err); m "make_dir" [ TStr ] (res TUnit io_err);
       m "is_dir" [ TStr ] TBool; m "full_path" [ TStr ] (res TStr io_err); m "is_read_only" [] TBool;
       m "exists" [ TStr ] TBool; m "under" [ TStr ] (TCap Fs); m "read_only" [] (TCap Fs);
-      m "rename" [ TStr; TStr ] (res TUnit io_err); m "info" [ TStr ] (res (TNamed ("FileInfo", [])) io_err) ]
+      m "rename" [ TStr; TStr ] (res TUnit io_err); m "info" [ TStr ] (res (TNamed ("FileInfo", [])) io_err); revocable Fs ]
   | TCap (Stdout | Stderr) -> [ m "print" [ TStr ] TUnit; m "write" [ TStr ] TUnit ]
   | TCap Clock -> [ m "now_ms" [] TInt; m "sleep" [ TInt ] TUnit ]
   | TCap Rand -> [ m "int" [ TInt; TInt ] TInt; m "float" [] TFloat; m "bytes" [ TInt ] TBytes ]
   | TCap Stdin -> [ m "read_line" [] (opt TStr); m "read_all" [] TStr ]
-  | TCap Env -> [ m "get" [ TStr ] (opt TStr) ]
+  | TCap Env -> [ m "get" [ TStr ] (opt TStr); revocable Env ]
   | TCap Exec ->
-    [ m "run" [ TStr; TList TStr ] (res (TNamed ("ProcessOutput", [])) io_err); m "only" [ TStr ] (TCap Exec) ]
+    [ m "run" [ TStr; TList TStr ] (res (TNamed ("ProcessOutput", [])) io_err); m "only" [ TStr ] (TCap Exec);
+      m "only_args" [ TStr; TList TStr ] (TCap Exec); revocable Exec ]
   | TCap Foreign ->
-    [ m "only" [ TStr ] (TCap Foreign); m "allows" [ TStr ] TBool; m "copy" [ TNamed ("Handle", []); TInt ] TBytes ]
+    [ m "only" [ TStr ] (TCap Foreign); m "allows" [ TStr ] TBool; m "copy" [ TNamed ("Handle", []); TInt ] TBytes; revocable Foreign ]
+  | TCap Revoker -> [ m "revoke" [] TUnit; m "is_revoked" [] TBool ]
   | TCap Root -> [ m "args" [] (TList TStr) ]
   | TChan a -> [ ("send", fun () -> ([ a ], TUnit)); ("recv", fun () -> ([], opt a)); ("close", fun () -> ([], TUnit)) ]
   | TAtomic -> [ m "get" [] TInt; m "set" [ TInt ] TUnit; m "add" [ TInt ] TInt; m "swap" [ TInt ] TInt; m "compare_and_set" [ TInt; TInt ] TBool ]
@@ -962,7 +1042,16 @@ and check_var ctx f e n sp =
   | Some v when v.vkind = KGroup ->
     err ctx "E0310" sp (sprintf "`%s` is a group handle; the only thing you can do with it is `%s.go(...)`" n n);
     TErr
-  | Some v -> v.vty
+  | Some v ->
+    let pass = !arg_of in
+    arg_of := None;
+    if v.vkind = KParam && List.mem (n, v.vspan) !cb_params then begin
+      match lookup f n with
+      | Some (_, false) when !calling -> ()
+      | Some (_, false) when pass <> None -> cb_passes := Option.get pass :: !cb_passes
+      | _ -> cb_escaped := true
+    end;
+    v.vty
   | None -> (
     let direct = !calling in
     calling := false;
@@ -1151,7 +1240,7 @@ and check_call ?want ctx f e callee args sp =
        expect ctx f b t;
        match repr t with
        | TFn _ | TCap _ | TChan _ | TAtomic | TShared _ | TDyn _ -> err ctx "E0201" sp (sprintf "values of type `%s` cannot be compared" (show t))
-       | _ -> refuse_compare ctx sp "assert_eq" t)
+       | _ -> eq_types := t :: !eq_types; refuse_compare ctx sp "assert_eq" t)
      | _ -> err ctx "E0107" sp "`assert_eq` takes 2 arguments"; check_args ctx f args);
     TUnit
   | EVar "keep" when not (is_local f "keep") && not (Hashtbl.mem ctx.fns "keep") ->
@@ -1256,7 +1345,25 @@ and check_call ?want ctx f e callee args sp =
             | _ -> ps
           in
           List.iter2 (fun a p -> expect ctx f a p) args ps;
-          check_callbacks ctx f args ps
+          check_callbacks ctx f args ps;
+          (* a Foreign narrowed here to other libraries: the call would panic *)
+          (match (ps, args, Hashtbl.find_opt foreign_libs n) with
+           | TCap Foreign :: _, a :: _, Some lib -> (
+             match known_foreign f a with
+             | Some s when not (List.mem lib s || List.mem "*" s) ->
+               err ctx "E0333" a.espan
+                 (sprintf "`%s` calls C library `%s`, but this Foreign grants %s" n lib
+                    (if s = [] then "no library" else "only " ^ String.concat ", " (List.map (fun l -> "`" ^ l ^ "`") s)))
+                 ~notes:[ "it was narrowed with `only`, so the call would panic; narrow it to the library the function belongs to" ]
+             | _ -> ())
+           | _ -> ())
+        | EVar g when (not (is_local f g)) && Hashtbl.mem ctx.fns g ->
+          (* a function parameter passed on: pure if the callee is, there *)
+          List.iteri
+            (fun k (a, p) ->
+              (match a.edesc with EVar _ -> arg_of := Some (g, k) | _ -> ());
+              Fun.protect ~finally:(fun () -> arg_of := None) (fun () -> expect ctx f a p))
+            (List.combine args ps)
         | _ -> List.iter2 (fun a p -> expect ctx f a p) args ps
       end;
       if labelled then begin
@@ -1808,6 +1915,7 @@ and check_bin ctx f op a b sp =
     | Mod | BitAnd | BitOr | BitXor | Shl | Shr -> (match t with TInt | TErr | TVar _ -> t | _ -> bad (); TErr)
     | Lt | Le | Gt | Ge -> (match unordered ctx t with None -> () | Some _ -> bad ()); TBool
     | _ ->
+      eq_types := t :: !eq_types;
       (match t with
        | TFn _ | TCap _ | TChan _ | TAtomic | TShared _ | TDyn _ -> bad ()
        | _ -> (
@@ -2486,6 +2594,8 @@ and check_stmt ctx f s : bool =
         at
       | None -> check_expr ctx f e
     in
+    (* known before the name is bound: `let c = c.only("z")` narrows the old `c` *)
+    (if not m then match known_foreign f e with Some s -> foreign_known := ((n, nsp), s) :: !foreign_known | None -> ());
     bind f n { vty = t; vmut = m; vspan = nsp; vkind = KLet };
     false
   | SAssign (lhs, rhs) ->
@@ -2623,6 +2733,13 @@ let check_pending ctx =
     !map_keys;
   map_keys := [];
   List.iter (fun (sp, t, name) -> refuse_compare ctx sp name t) (List.rev !compared);
+  if !cur_fn <> "" then begin
+    let ps = List.fold_left params_in [] (List.rev_map (fun (_, t, _) -> t) !compared @ List.rev !eq_types) in
+    if ps <> [] then Hashtbl.replace compares_direct !cur_fn ps;
+    List.iter (fun (sp, g, env) -> generic_uses := (!cur_fn, sp, g, List.map (fun (p, t) -> (p, resolved t)) env) :: !generic_uses) (List.rev !uses_here)
+  end;
+  eq_types := [];
+  uses_here := [];
   compared := [];
   let ps = List.rev !pending in
   pending := [];
@@ -2693,7 +2810,20 @@ let check_fn ctx (d : fn_decl) (s : fsig) =
   to_infer := [];
   map_keys := [];
   compared := [];
-  Fun.protect ~finally:(fun () -> check_pending ctx) @@ fun () ->
+  eq_types := [];
+  uses_here := [];
+  cur_fn := d.fn_name;
+  cb_params := List.filter_map (fun (p, t) -> match repr t with TFn _ -> Some (p.prm_name, p.prm_span) | _ -> None) (zip d.fn_params s.ps);
+  cb_escaped := false;
+  cb_passes := [];
+  refs_here := [];
+  foreign_known := [];
+  Fun.protect ~finally:(fun () ->
+      check_pending ctx;
+      Hashtbl.replace cb_uses d.fn_name (!cb_escaped, List.rev !cb_passes);
+      Hashtbl.replace fn_refs d.fn_name (List.rev !refs_here);
+      cb_params := [];
+      cur_fn := "") @@ fun () ->
   let genv = List.map (fun g -> (g, TParam g)) d.fn_gen in
   let scope = { vars = Hashtbl.create 8; barrier = false } in
   List.iter2
@@ -2751,6 +2881,68 @@ let check_self ctx d ps =
 
 let case_note = "in the table case "
 
+(* What `limen caps` says of a function with no capability: `pure`, `pure if
+   f is` (and `f and g are`), or `pure itself, runs callbacks`. *)
+let cap_text (i : fn_info) c =
+  let name = if c = Foreign && i.libs <> [] then sprintf "Foreign (%s)" (String.concat ", " i.libs) else cap_name c in
+  match List.assoc_opt c i.via with Some p -> sprintf "%s (via %s)" name p | None -> name
+
+let pure_text (i : fn_info) =
+  match (i.callbacks, i.pure_if) with
+  | false, _ -> "pure"
+  | true, [] -> "pure itself, runs callbacks"
+  | true, [ f ] -> sprintf "pure if %s is" f
+  | true, fs ->
+    let rev = List.rev fs in
+    sprintf "pure if %s and %s are" (String.concat ", " (List.rev (List.tl rev))) (List.hd rev)
+
+(* Which type parameters each generic function compares, itself or through
+   the generic functions it calls, until nothing changes; then E0201 at
+   every use that gives such a parameter a type without equality. A
+   parameter bounded by `Ordered` or `Key` is refused by its bound. *)
+let refuse_compared_params ctx =
+  let compares = Hashtbl.copy compares_direct in
+  let uses = List.rev !generic_uses in
+  let of_fn g = Option.value ~default:[] (Hashtbl.find_opt compares g) in
+  let changed = ref true in
+  while !changed do
+    changed := false;
+    List.iter
+      (fun (caller, _, g, env) ->
+        let more = List.fold_left (fun acc p -> match List.assoc_opt p env with Some t -> params_in acc t | None -> acc) [] (of_fn g) in
+        let have = of_fn caller in
+        let fresh = List.filter (fun p -> not (List.mem p have)) more in
+        if fresh <> [] then begin
+          Hashtbl.replace compares caller (have @ fresh);
+          changed := true
+        end)
+      uses
+  done;
+  let bounded g p =
+    List.exists
+      (fun (q, bs) -> q = p && List.exists (fun (i, _) -> i = "Ordered" || i = "Key") bs)
+      (Option.value ~default:[] (Hashtbl.find_opt fn_bounds g))
+  in
+  let shown g = match Interp_util.find_sub g "::" 0 with Some i -> String.sub g (i + 2) (String.length g - i - 2) | None -> g in
+  List.iter
+    (fun (_, sp, g, env) ->
+      List.iter
+        (fun p ->
+          match List.assoc_opt p env with
+          | Some t when not (bounded g p) -> (
+            let what = sprintf "`%s` compares values of `%s`" (shown g) p in
+            match t with
+            | TFn _ | TCap _ | TChan _ | TAtomic | TShared _ | TDyn _ -> err ctx "E0201" sp (sprintf "%s, and values of type `%s` cannot be compared" what (show t))
+            | _ -> (
+              match held t with
+              | Some h ->
+                err ctx "E0201" sp (sprintf "%s, and %s" what h)
+                  ~notes:[ "capabilities have no equality, so neither has a value holding one; compare something it holds that is not a capability, as in `xs.any(|x| x.name == name)`" ]
+              | None -> ()))
+          | _ -> ())
+        (of_fn g))
+    uses
+
 let check_program (user_items : item list) : Diag.t list * fn_info list =
   let ctx =
     { structs = Hashtbl.create 16; enums = Hashtbl.create 16; sfields = Hashtbl.create 16;
@@ -2760,7 +2952,12 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
   Hashtbl.reset Types.authority;
   Hashtbl.reset used_methods;
   Hashtbl.reset foreign_fns;
+  Hashtbl.reset foreign_libs;
+  Hashtbl.reset fn_refs;
   Hashtbl.reset reported_bounds;
+  Hashtbl.reset compares_direct;
+  generic_uses := [];
+  Hashtbl.reset cb_uses;
   fn_extents :=
     List.filter_map
       (function IFn d -> Some (d.fn_span.Span.file, d.fn_span.lo, max d.fn_span.hi d.fn_body.bspan.hi) | _ -> None)
@@ -2980,6 +3177,7 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
               (ps, match d.fn_ret with Some te -> resolve ctx env te | None -> TUnit)
             | Some _ -> (
               Hashtbl.replace foreign_fns d.fn_name ();
+              Option.iter (fun (fo : foreign) -> Hashtbl.replace foreign_libs d.fn_name fo.flib) d.fn_foreign;
               (* the Limen type of a C function: Foreign first, Out parameters moved to the result *)
               if d.fn_name = "main" then err ctx "E0330" d.fn_span "`main` cannot be a foreign function";
               match Ffi.of_decl ~structs:(Hashtbl.find_opt ctx.structs) d with
@@ -3073,6 +3271,7 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
     end
   in
   more ();
+  refuse_compared_params ctx;
   let diags =
     List.sort
       (fun (a : Diag.t) (b : Diag.t) -> compare (a.span.file, a.span.lo) (b.span.file, b.span.lo))
@@ -3093,6 +3292,53 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
            else d :: acc)
          [] diags)
   in
+  (* pure if its function parameters are: it holds no capability and no
+     bound, its parameters holding a function are functions, it only calls
+     them or passes them on to such a function, until nothing changes *)
+  let cond = Hashtbl.create 16 in
+  List.iter
+    (fun ((d : fn_decl), s) ->
+      let fns = List.filter_map (fun (p, t) -> match repr t with TFn _ -> Some p.prm_name | _ -> None) (zip d.fn_params s.ps) in
+      match Hashtbl.find_opt cb_uses d.fn_name with
+      | Some (false, passes)
+        when fns <> [] && authority_of s.ps = [] && d.fn_bounds = []
+             && List.for_all (fun t -> (match repr t with TFn _ -> true | _ -> false) || not (has_fn t)) s.ps ->
+        Hashtbl.replace cond d.fn_name (fns, passes)
+      | _ -> ())
+    sigs;
+  let changed = ref true in
+  while !changed do
+    changed := false;
+    Hashtbl.filter_map_inplace
+      (fun _ (fns, passes) -> if List.for_all (fun (g, _) -> Hashtbl.mem cond g) passes then Some (fns, passes) else (changed := true; None))
+      cond
+  done;
+  (* the C libraries each function reaches with a Foreign, until nothing changes *)
+  let libs = Hashtbl.create 16 and takes_foreign = Hashtbl.create 16 in
+  List.iter
+    (fun ((d : fn_decl), s) ->
+      if List.mem_assoc Foreign (authority_of s.ps) then Hashtbl.replace takes_foreign d.fn_name ();
+      (* "limen" is the runtime's own functions (the sql module's helpers), not a library *)
+      Hashtbl.replace libs d.fn_name (match d.fn_foreign with Some fo when fo.flib <> "limen" -> [ fo.flib ] | _ -> []))
+    sigs;
+  let changed = ref true in
+  while !changed do
+    changed := false;
+    List.iter
+      (fun ((d : fn_decl), _) ->
+        let have = Hashtbl.find libs d.fn_name in
+        let more =
+          List.concat_map
+            (fun g -> if Hashtbl.mem takes_foreign g then Option.value ~default:[] (Hashtbl.find_opt libs g) else [])
+            (Option.value ~default:[] (Hashtbl.find_opt fn_refs d.fn_name))
+        in
+        let now = List.sort_uniq compare (have @ more) in
+        if now <> have then begin
+          Hashtbl.replace libs d.fn_name now;
+          changed := true
+        end)
+      sigs
+  done;
   let infos =
     List.map
       (fun ((d : fn_decl), s) ->
@@ -3100,7 +3346,9 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
         { name = d.fn_name; span = d.fn_span;
           caps = List.map fst held;
           via = List.filter_map (fun (c, p) -> Option.map (fun p -> (c, p)) p) held;
-          callbacks = List.exists has_fn s.ps || d.fn_bounds <> [] })
+          callbacks = List.exists has_fn s.ps || d.fn_bounds <> [];
+          libs = Hashtbl.find libs d.fn_name;
+          pure_if = (match Hashtbl.find_opt cond d.fn_name with Some (fns, _) -> fns | None -> []) })
       (* forwarders only pass their arguments on; the methods they call are reported *)
       (List.filter (fun ((d : fn_decl), _) -> d.fn_test = None && d.fn_span.file <> Prelude.methods_file && d.fn_span.Span.file <> Prelude.file && not (Embed.is_forwarder d.fn_name)) sigs)
   in

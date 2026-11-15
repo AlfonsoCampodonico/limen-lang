@@ -100,6 +100,28 @@ let attenuate allowed req =
   in
   if covered then [ req ] else []
 
+(* ---------- Exec ----------
+   An Exec grant, `git` or `git status|remote -v`, as an allowlist entry:
+   the program, then a newline before each argument prefix it is limited
+   to, its words separated by single spaces (`git\nstatus\nremote -v`).
+   None if malformed: an empty prefix, or prefixes for `*`. The C runtime's
+   w_exec_entry does the same. *)
+let words s = String.concat " " (List.filter (fun w -> w <> "") (String.split_on_char ' ' s))
+
+let exec_entry g =
+  match String.index_opt g ' ' with
+  | None -> Some g
+  | Some i ->
+    let prog = String.sub g 0 i in
+    let prefixes = List.map words (String.split_on_char '|' (String.sub g (i + 1) (String.length g - i - 1))) in
+    if prog = "" || prog = "*" || List.exists (fun p -> p = "" || String.contains p '\n') prefixes then None
+    else Some (String.concat "\n" (prog :: prefixes))
+
+let exec_grant_help = "write PROGRAM, or PROGRAM ARGS|ARGS... with no empty prefix and not for *"
+
+let exec_prog e = match String.index_opt e '\n' with Some i -> String.sub e 0 i | None -> e
+let exec_prefixes e = match String.split_on_char '\n' e with _ :: ps -> ps | [] -> []
+
 (* ---------- HTTP for Net.get ----------
    The request and the response parser are shared by nothing else, but the C
    runtime (Cap_net_get) implements exactly the same rules:

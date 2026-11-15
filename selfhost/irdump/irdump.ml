@@ -187,7 +187,12 @@ let program (p : program) libs =
   Printf.printf "libs [%s]\n" (String.concat "," libs);
   let pure = Pure.analyse p in
   let names = List.sort compare (Hashtbl.fold (fun k _ acc -> k :: acc) pure []) in
-  List.iter (fun n -> Printf.printf "pure %s heavy=%b\n" n (Hashtbl.find pure n).Pure.heavy) names;
+  List.iter
+    (fun n ->
+      let i = Hashtbl.find pure n in
+      let cond = if i.Pure.cbs = [] then "" else " if=" ^ String.concat "," (List.map string_of_int i.Pure.cbs) in
+      Printf.printf "pure %s heavy=%b%s\n" n i.Pure.heavy cond)
+    names;
   List.iter
     (fun (f : fn) ->
       plan := Pure.plan pure f;

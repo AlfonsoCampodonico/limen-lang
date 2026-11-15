@@ -1047,6 +1047,58 @@ fn client(net: Net, port: Int, k: Int) -> Int {
 |} in
   out "exec-group" ~grants:sh exec_group "[17, 27, 37, 47, 57, 67]\n";
   check_tsan "exec-group" ~grants:sh exec_group "[17, 27, 37, 47, 57, 67]\n";
+  (* narrowed to argument prefixes, matched word for word from the first
+     argument: option injection before or instead of the granted words is
+     refused, whatever follows them is not *)
+  let exec_args = {|fn show(out: Stdout, what: Str, r: Result[ProcessOutput, IoError]) {
+    match r {
+        Ok(p) => out.print("{what}: {p.code} {p.stdout.trim()}"),
+        Err(e) => out.print("{what}: {e}"),
+    }
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let x = root.exec
+    show(out, "config", x.run("git", ["config", "core.sshCommand", "evil"]))
+    show(out, "-c", x.run("git", ["-c", "x=y", "status"]))
+    show(out, "upload-pack", x.run("git", ["--upload-pack=evil", "status"]))
+    show(out, "bare", x.run("git", []))
+    show(out, "statusx", x.run("git", ["statusx"]))
+    show(out, "hi", x.run("echo", ["hi", "there"]))
+    show(out, "-n", x.run("echo", ["-n", "x"]))
+    show(out, "bye", x.run("echo", ["bye"]))
+    show(out, "only", x.only("git").run("git", ["config", "a"]))
+    let e = x.only_args("echo", ["hi   there", "bye"])
+    show(out, "args hi there", e.run("echo", ["hi", "there", "you"]))
+    show(out, "args hi", e.run("echo", ["hi"]))
+    show(out, "args bye", e.run("echo", ["bye"]))
+    show(out, "args -n", e.run("echo", ["-n"]))
+    show(out, "args other", x.only_args("ls", ["-l"]).run("ls", ["-l"]))
+    show(out, "args star", x.only_args("*", ["hi"]).run("echo", ["hi"]))
+    let s = root.exec.only_args("sh", ["-c"])
+    show(out, "sh -c", s.run("sh", ["-c", "echo ok"]))
+    show(out, "sh -e", s.run("sh", ["-e", "-c", "echo ok"]))
+}
+|} in
+  out "exec-args" ~grants:{ Interp.no_grants with exec = [ "git status|log"; "echo hi|-n"; "sh" ] } exec_args
+    "config: Denied(\"exec: `git` is not granted with these arguments\")\n\
+     -c: Denied(\"exec: `git` is not granted with these arguments\")\n\
+     upload-pack: Denied(\"exec: `git` is not granted with these arguments\")\n\
+     bare: Denied(\"exec: `git` is not granted with these arguments\")\n\
+     statusx: Denied(\"exec: `git` is not granted with these arguments\")\n\
+     hi: 0 hi there\n\
+     -n: 0 x\n\
+     bye: Denied(\"exec: `echo` is not granted with these arguments\")\n\
+     only: Denied(\"exec: `git` is not granted with these arguments\")\n\
+     args hi there: 0 hi there you\n\
+     args hi: Denied(\"exec: `echo` is not granted with these arguments\")\n\
+     args bye: Denied(\"exec: `echo` is not granted with these arguments\")\n\
+     args -n: Denied(\"exec: `echo` is not granted with these arguments\")\n\
+     args other: Denied(\"exec: `ls` is not granted\")\n\
+     args star: Denied(\"exec: `echo` is not granted\")\n\
+     sh -c: 0 ok\n\
+     sh -e: Denied(\"exec: `sh` is not granted with these arguments\")\n";
 
   (* ---------- foreign functions (C libraries) ---------- *)
   let libc = { Interp.no_grants with foreign = [ "c" ] } in
@@ -1088,7 +1140,7 @@ fn main(root: Root) {
     "foreign: library `c` is not granted (grant it with --grant foreign=c)";
   panics "ffi-only" ~grants:{ Interp.no_grants with foreign = [ "*" ] }
     (cdecls
-     ^ "\nfn main(root: Root) {\n    let all = root.foreign\n    let some = all.only(\"sqlite3\")\n    root.stdout.print(\"{strlen(some, \"x\")}\")\n}\n")
+     ^ "\n// narrowed where the checker cannot see it (in sight, it is E0333)\nfn sql_only(f: Foreign) -> Foreign {\n    f.only(\"sqlite3\")\n}\n\nfn main(root: Root) {\n    let all = root.foreign\n    let some = sql_only(all)\n    root.stdout.print(\"{strlen(some, \"x\")}\")\n}\n")
     "foreign: library `c` is not granted (grant it with --grant foreign=c)";
   out "ffi-only-print" ~grants:{ Interp.no_grants with foreign = [ "*" ] }
     (cdecls
@@ -1105,7 +1157,7 @@ fn main(root: Root) {
     "foreign.copy: null pointer";
   (* a panic in a foreign call is caught like any other, and frees what it should *)
   out "ffi-catch" ~grants:libc
-    (cdecls ^ "\nfn main(root: Root) {\n    let f = root.foreign\n    let s = \"abc\" + \"def\"\n    root.stdout.print(\"{catch(|| abs(f.only(\"zlib\"), -1))} {strlen(f, s)}\")\n}\n")
+    (cdecls ^ "\nfn zlib_only(f: Foreign) -> Foreign {\n    f.only(\"zlib\")\n}\n\nfn main(root: Root) {\n    let f = root.foreign\n    let s = \"abc\" + \"def\"\n    root.stdout.print(\"{catch(|| abs(zlib_only(f), -1))} {strlen(f, s)}\")\n}\n")
     "Err(\"foreign: library `c` is not granted (grant it with --grant foreign=c)\") 6\n";
   (* foreign calls from many tasks at once *)
   let ffi_group = cdecls ^ {|
@@ -1853,8 +1905,24 @@ fn main(root: Root) {
   errs "held-contains-late" (holders ^ "fn main(root: Root) {\n" ^ mk ^ "    let xs = []\n    let b = xs.contains(c)\n}\n") [ "E0201" ];
   errs "held-contains-fn" "fn main() {\n    let b = [|| 1].contains(|| 2)\n}\n" [ "E0201" ];
   says "held-index-of" ("use list\n\n" ^ holders ^ "fn main(root: Root) {\n" ^ mk ^ "    let i = list.index_of([c], c)\n}\n") "E0201"
-    "`index_of` compares values, and `Client` holds capability `Net` through `Client.net`";
-  says "held-chunk-by" (holders ^ "fn main(root: Root) {\n" ^ mk ^ "    let g = [c].chunk_by(|x| x)\n}\n") "E0201" "`chunk_by` compares values";
+    "`list.index_of` compares values of `T`, and `Client` holds capability `Net` through `Client.net`";
+  says "held-chunk-by" (holders ^ "fn main(root: Root) {\n" ^ mk ^ "    let g = [c].chunk_by(|x| x)\n}\n") "E0201" "`chunk_by` compares values of `K`";
+  (* generic functions that compare a type parameter refuse a type
+     argument without equality, at the use, transitively *)
+  let eqf = "fn eq[T](a: T, b: T) -> Bool {\n    a == b\n}\n\nfn same[U](a: U, b: U) -> Bool {\n    eq([a], [b])\n}\n\nfn first[T](a: T, b: T) -> T {\n    a\n}\n\nfn has[T](xs: List[T], x: T) -> Bool {\n    xs.contains(x)\n}\n\nfn ne[T](a: T, b: T) -> Bool {\n    a != b\n}\n\nfn sorted[T: Ordered](xs: List[T]) -> List[T] {\n    xs.sort()\n}\n\n" in
+  says "generic-eq" (holders ^ eqf ^ "fn main(root: Root) {\n" ^ mk ^ "    let b = eq(c, c)\n}\n") "E0201"
+    "`eq` compares values of `T`, and `Client` holds capability `Net` through `Client.net`";
+  says "generic-eq-transitive" (holders ^ eqf ^ "fn main(root: Root) {\n" ^ mk ^ "    let b = same(c, c)\n}\n") "E0201"
+    "`same` compares values of `U`, and `Client` holds capability `Net` through `Client.net`";
+  says "generic-eq-fn" (eqf ^ "fn main() {\n    let f = || 1\n    let b = eq(f, f)\n}\n") "E0201"
+    "`eq` compares values of `T`, and values of type `fn() -> Int` cannot be compared";
+  says "generic-eq-chan" (eqf ^ "fn main() {\n    let c: Chan[Int] = channel(1)\n    let b = ne(c, c)\n}\n") "E0201" "`ne` compares values of `T`";
+  says "generic-contains" (holders ^ eqf ^ "fn main(root: Root) {\n    let b = has([root.stdout], root.stdout)\n}\n") "E0201"
+    "`has` compares values of `T`, and values of type `Stdout` cannot be compared";
+  says "generic-eq-dyn" (holders ^ eqf ^ "fn main(root: Root) {\n    let d: dyn Named = Box { item: 1 }\n    let b = eq(d, d)\n}\n") "E0201" "values of type `dyn Named` cannot be compared";
+  errs "generic-eq-ok" (holders ^ eqf ^ "fn main(root: Root) {\n" ^ mk ^ "    let a = eq(1, 2)\n    let b = same(\"x\", \"y\")\n    let d = first(c, c)\n    let e = has([Box { item: 1 }], Box { item: 2 })\n}\n") [];
+  errs "generic-ordered-once" (holders ^ eqf ^ "fn main(root: Root) {\n" ^ mk ^ "    let s = sorted([c])\n}\n") [ "E0111" ];
+  errs "generic-method-eq" (holders ^ "struct Bag[T] {\n    items: List[T],\n}\n\nfn has[T](self: Bag[T], x: T) -> Bool {\n    self.items.any(|y| y == x)\n}\n\nfn main(root: Root) {\n" ^ mk ^ "    let b = Bag { items: [c] }.has(c)\n}\n") [ "E0201" ];
   errs "held-chunk-by-ok" (holders ^ "fn main(root: Root) {\n" ^ mk ^ "    let g = [c].chunk_by(|x| x.name)\n}\n") [];
   says "held-sort" (holders ^ "fn main(root: Root) {\n    let s = [Sink.Nowhere].sort()\n}\n") "E0201"
     "`sort` compares values, and `Sink` holds capability `Stdout` through `Sink.ToOut`";
@@ -7669,6 +7737,21 @@ fn main(root: Root) {
   ok "trust-relock" (cpkg trusted = [] && Interp_util.find_sub (read_file lock) "foreign cdep c,z\n" 0 <> None) (read_file lock);
   put "cdep/cdep.lmn" (cdep_src [ ("c", "getpid") ]);
   Package.write_lock := false;
+  (* the C libraries a trusted dependency may call, named in its caps *)
+  (try Sys.remove lock with Sys_error _ -> ());
+  let narrowed libs = "[package]\nname = \"capp\"\n\n[dependencies]\ncdep = { path = \"../cdep\", caps = [" ^ libs ^ "] }\n\n[trust]\nforeign = [\"cdep\"]\n" in
+  ok "trust-foreign-libs" (cpkg (narrowed "\"foreign=c\"") = []) (show (cpkg (narrowed "\"foreign=c\"")));
+  ok "trust-foreign-libs-list" (cpkg (narrowed "\"foreign=z,c\"") = []) (show (cpkg (narrowed "\"foreign=z,c\"")));
+  let ds = cpkg (narrowed "\"foreign=z\"") in
+  ok "trust-foreign-libs-refused"
+    (codes ds = [ "E0320"; "E0320" ] && List.for_all (fun (d : Diag.t) -> Interp_util.find_sub d.message "calls C library `c`" 0 <> None) ds)
+    (show ds);
+  ok "trust-foreign-libs-empty" (codes (cpkg (narrowed "\"foreign=\"")) = [ "E0321" ]) "foreign= names libraries";
+  (* a function that reaches another dependency's library through a Foreign counts it *)
+  put "cdep/cdep.lmn" (cdep_src [ ("c", "getpid") ] ^ "\npub fn twice(f: Foreign) -> Int {\n    pid(f) * 2\n}\n");
+  let ds = cpkg (narrowed "\"foreign=z\"") in
+  ok "trust-foreign-libs-reach" (List.exists (fun (d : Diag.t) -> List.exists (fun n -> Interp_util.find_sub n "`cdep.twice` reaches `c`" 0 <> None) d.notes) ds) (show ds);
+  put "cdep/cdep.lmn" (cdep_src [ ("c", "getpid") ]);
   Sys.remove (Filename.concat pdir "capp/limen.toml");
 
   (* [grants] in limen.toml: the program's own grants, with --grant flags adding to them *)
@@ -7816,6 +7899,31 @@ fn main(root: Root) {
   end
   else ok "sandbox-binary" false "limen build failed";
   (try Sys.remove escape_file with Sys_error _ -> ());
+  (* with Exec, the sandbox lets the process start only the granted programs
+     and those in system locations: not one it could have written into its
+     Fs directory, even from C *)
+  put "sbox/data/payload" "#!/bin/sh\necho escaped\n";
+  Unix.chmod (Filename.concat pdir "sbox/data/payload") 0o755;
+  put "sbox/exec.lmn"
+    {v|foreign "c" {
+    fn execl(path: Str, arg0: Str, ..., end: Int) -> Int32
+}
+
+fn main(root: Root) {
+    let path = root.fs.full_path("payload") ?? ""
+    root.stdout.print("{root.exec.run("echo", ["granted"]).map(|p| p.stdout.trim())}")
+    let r = execl(root.foreign, path, "payload", 0)
+    root.stdout.print("refused {r}")
+}
+|v};
+  let sexec = Filename.concat pdir "sbox/exec.lmn" in
+  List.iter
+    (fun (name, extra, exec, want) ->
+      let code, o, e = limen_cli ((("run" :: extra) @ [ sexec ]) @ grant @ [ "--grant"; "exec=" ^ exec ]) in
+      ok name (code = 0 && o = want) (sprintf "%d %S %S" code o e))
+    [ ("sandbox-exec-interp", [], "echo", "Ok(\"granted\")\nrefused -1\n");
+      ("sandbox-exec-native", [ "--native" ], "echo", "Ok(\"granted\")\nrefused -1\n");
+      ("sandbox-exec-star", [], "*", "Ok(\"granted\")\nescaped\n") ];
   (* without Net, Listen or Exec, the sandbox also refuses the ways out that
      are not files: another program's Unix socket (here a listener of the
      test's own, which could as well be a Docker daemon or an ssh-agent),
@@ -7931,6 +8039,28 @@ fn main(root: Root) {
   ok "grants-toml-unknown" (grant_err "[grants]\ndisk = \"x\"\n") "unknown grant";
   ok "grants-toml-two-fs" (grant_err "[grants]\nfs = [\"a\", \"b\"]\n") "one fs";
   ok "grants-toml-twice" (grant_err "[grants]\nnet = \"a\"\nnet = \"b\"\n") "listed twice";
+  ok "grants-toml-exec-empty-prefix" (grant_err "[grants]\nexec = \"git status||log\"\n") "an empty argument prefix";
+  ok "grants-toml-exec-star-prefix" (grant_err "[grants]\nexec = \"* status\"\n") "prefixes for *";
+  (* exec narrowed to argument prefixes in limen.toml, and shown by limen caps *)
+  put "grants/limen.toml" "[package]\nname = \"g\"\n\n[grants]\nexec = [\"echo hi|-n\", \"sh -c\"]\n";
+  put "grants/exec.lmn" "fn main(root: Root) {\n    root.stdout.print(\"{root.exec.run(\"echo\", [\"hi\"]).is_ok()} {root.exec.run(\"echo\", [\"bye\"]).is_ok()}\")\n}\n";
+  let gexec = Filename.concat pdir "grants/exec.lmn" in
+  let code, o, e = limen_cli [ "run"; gexec ] in
+  ok "grants-toml-exec-args" (code = 0 && o = "true false\n") (sprintf "code %d, out %S, err %S" code o e);
+  let code, o, e = limen_cli [ "caps"; gexec ] in
+  ok "caps-grants" (code = 0 && o = "main  Root\ngrant exec=echo hi|-n\ngrant exec=sh -c\n") (sprintf "code %d, out %S, err %S" code o e);
+  let code, o, _ = limen_cli [ "caps"; gexec; "--json" ] in
+  ok "caps-grants-json" (code = 0 && Interp_util.find_sub o {|"grants":["exec=echo hi|-n","exec=sh -c"]|} 0 <> None) o;
+  let code, _, e = limen_cli [ "run"; gexec; "--grant"; "exec=* -c" ] in
+  ok "grants-exec-flag-bad" (code = 2 && Interp_util.find_sub e "exec grant" 0 <> None) (sprintf "code %d, err %S" code e);
+  put "grants/ffi.lmn" "foreign \"c\" {\n    fn abs(n: Int32) -> Int32\n}\n\nforeign \"m\" {\n    fn cbrt(x: Float) -> Float\n}\n\nfn main(root: Root) {\n    root.stdout.print(\"{abs(root.foreign, -2)} {cbrt(root.foreign, 27.0)} {root.foreign.allows(\"z\")}\")\n}\n";
+  List.iter
+    (fun (name, extra) ->
+      let code, o, e = limen_cli ([ "run" ] @ extra @ [ Filename.concat pdir "grants/ffi.lmn"; "--grant"; "foreign=c,m" ]) in
+      ok name (code = 0 && o = "2 3.0 false\n") (sprintf "code %d, out %S, err %S" code o e))
+    ([ ("grants-foreign-list", []) ] @ if native_enabled then [ ("grants-foreign-list-native", [ "--native" ]) ] else []);
+  let code, _, e = limen_cli [ "run"; Filename.concat pdir "grants/ffi.lmn"; "--grant"; "foreign=c," ] in
+  ok "grants-foreign-list-bad" (code = 2 && Interp_util.find_sub e "foreign grant" 0 <> None) (sprintf "code %d, err %S" code e);
   Sys.remove (Filename.concat pdir "grants/limen.toml");
   (* a dependency's own limen.toml never grants anything: only the program's does *)
   put "envy/envy.lmn" "pub fn get(env: Env) -> Str {\n    env.get(\"LIMEN_T_A\") ?? \"none\"\n}\n";
@@ -7939,6 +8069,13 @@ fn main(root: Root) {
   put "grants/dep.lmn" "use envy\n\nfn main(root: Root) {\n    root.stdout.print(envy.get(root.env))\n}\n";
   let code, o, e = limen_cli [ "run"; Filename.concat pdir "grants/dep.lmn" ] in
   ok "grants-dep-toml-ignored" (code = 0 && o = "none\n") (sprintf "code %d, out %S, err %S" code o e);
+  (* a dependency may take a Revoker without a grant: it can only withdraw authority *)
+  (try Unix.mkdir (Filename.concat pdir "stopper") 0o755 with Unix.Unix_error _ -> ());
+  put "stopper/stopper.lmn" "pub fn stop(r: Revoker) {\n    r.revoke()\n}\n";
+  put "grants/limen.toml" "[package]\nname = \"g\"\n\n[dependencies]\nstopper = { path = \"../stopper\" }\n";
+  put "grants/stop.lmn" "use stopper\n\nfn main(root: Root) {\n    let (fs, off) = root.fs.revocable()\n    stopper.stop(off)\n    root.stdout.print(\"{off.is_revoked()}\")\n}\n";
+  let code, o, e = limen_cli [ "run"; Filename.concat pdir "grants/stop.lmn" ] in
+  ok "revoke-dep-no-grant" (code = 0 && o = "true\n") (sprintf "code %d, out %S, err %S" code o e);
   Sys.remove (Filename.concat pdir "grants/limen.toml");
 
   (* git dependencies: a local file:// repository, fetched into a temporary
@@ -8214,7 +8351,7 @@ fn main(root: Root) {
   let listed = List.sort compare (List.map (fun (d : Package.dep) -> d.dname) manifest.deps) in
   ok "std-manifest-complete" (listed = List.sort compare (List.map fst Std_text.modules)) (String.concat ", " listed);
   ok "std-manifest-http" (List.exists (fun (d : Package.dep) -> d.dname = "http" && d.caps = [ "net"; "listen" ]) manifest.deps) "http: net, listen";
-  ok "std-manifest-sql" (List.exists (fun (d : Package.dep) -> d.dname = "sql" && d.caps = [ "fs" ]) manifest.deps && manifest.trust = [ "sql" ]) "sql: fs, trusted with C";
+  ok "std-manifest-sql" (List.exists (fun (d : Package.dep) -> d.dname = "sql" && d.caps = [ "fs"; "foreign=sqlite3" ]) manifest.deps && manifest.trust = [ "sql" ]) "sql: fs, sqlite3, trusted with C";
   ok "std-manifest-time" (List.exists (fun (d : Package.dep) -> d.dname = "time" && d.caps = [ "clock"; "fs" ]) manifest.deps) "time: clock (within), fs (load_zone)";
   ok "std-manifest-log" (List.exists (fun (d : Package.dep) -> d.dname = "log" && d.caps = [ "stdout"; "stderr"; "clock" ]) manifest.deps) "log: stdout, stderr, clock";
   ok "std-manifest-path" (List.exists (fun (d : Package.dep) -> d.dname = "path" && d.caps = [ "fs" ]) manifest.deps) "path: fs (walk)";
@@ -8912,6 +9049,283 @@ fn main(root: Root) {
    in
    let calls = count_sub main_body "wf_count(" in
    ok "pure-reused-c" (calls = 6) (sprintf "%d calls" calls));
+
+  (* ---------- pure if the functions it is given are ---------- *)
+  let cond_src = {v|fn my_map(xs: List[Int], f: fn(Int) -> Int) -> List[Int] {
+    let mut out: List[Int] = []
+    for x in xs {
+        out.push(f(x))
+    }
+    out
+}
+
+fn twice(xs: List[Int], g: fn(Int) -> Int) -> List[Int] {
+    my_map(my_map(xs, g), g)
+}
+
+fn both(f: fn(Int) -> Int, g: fn(Int) -> Int, h: fn() -> Int) -> Int {
+    f(1) + g(2) + h()
+}
+
+fn rec(n: Int, f: fn(Int) -> Int) -> Int {
+    if n == 0 { f(0) } else { rec(n - 1, f) }
+}
+
+fn keeps(f: fn(Int) -> Int) -> List[fn(Int) -> Int] {
+    [f]
+}
+
+fn passes_bad(f: fn(Int) -> Int) -> List[fn(Int) -> Int] {
+    keeps(f)
+}
+
+fn captures(xs: List[Int], f: fn(Int) -> Int) -> List[Int] {
+    xs.map(|x| f(x))
+}
+
+fn returns(f: fn(Int) -> Int) -> fn(Int) -> Int {
+    f
+}
+
+fn sends(f: fn() -> Int) -> Int {
+    let c: Chan[Int] = channel(1)
+    c.send(f())
+    let fs: Chan[fn() -> Int] = channel(1)
+    fs.send(f)
+    0
+}
+
+fn tasks(f: fn() -> Int) -> List[Int] {
+    group g {
+        g.go(f)
+    }
+}
+
+fn printer(out: Stdout, f: fn(Int) -> Int) {
+    out.print("{f(1)}")
+}
+
+fn double(x: Int) -> Int {
+    x * 2
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let mut seen = 0
+    for i in 0..<3 {
+        // pure arguments: made once, kept across the loop
+        let a = my_map([1, 2, 3], |x| x * 2)
+        let b = twice([1, 2], double)
+        // an argument that prints: made every time
+        let c = my_map([i], |x| {
+            out.print("call {x}")
+            x
+        })
+        seen = seen + a.len() + b.len() + c.len()
+    }
+    out.print("{seen} {my_map([1], |x| x + 1)} {twice([1], double)} {both(|x| x, |x| x, || 3)} {rec(2, |x| x + 5)}")
+}
+|v} in
+  out "pure-if-run" cond_src "call 0\ncall 1\ncall 2\n18 [2] [4] 6 5\n";
+  (let _, ds, infos = compile "pure-if-caps" cond_src in
+   let find n = List.find (fun (i : Check.fn_info) -> i.name = n) infos in
+   let text n = Check.pure_text (find n) in
+   ok "pure-if-caps-checks" (ds = []) (String.concat " " (codes ds));
+   ok "pure-if-caps" (text "my_map" = "pure if f is" && text "twice" = "pure if g is" && text "both" = "pure if f, g and h are" && text "rec" = "pure if f is")
+     (String.concat "; " (List.map text [ "my_map"; "twice"; "both"; "rec" ]));
+   ok "pure-if-caps-not"
+     (List.for_all (fun n -> text n = "pure itself, runs callbacks") [ "keeps"; "passes_bad"; "captures"; "returns"; "sends"; "tasks" ]
+      && (find "printer").pure_if = [] && (find "double").pure_if = [])
+     (String.concat "; " (List.map text [ "keeps"; "passes_bad"; "captures"; "returns"; "sends"; "tasks" ])));
+  (let items, ds, _ = compile "pure-if-ir" cond_src in
+   if ds <> [] then ok "pure-if-ir" false (String.concat " " (codes ds))
+   else
+     let prog, _ = Lower.lower_program ~tests:false items in
+     let pure = Pure.analyse prog in
+     let info n = Hashtbl.fold (fun k (i : Pure.info) acc -> if Interp_util.find_sub k ("_" ^ n) 0 <> None then Some i else acc) pure None in
+     let cbs n = match info n with Some i -> Some i.Pure.cbs | None -> None in
+     ok "pure-if-ir" (cbs "my_map" = Some [ 1 ] && cbs "twice" = Some [ 1 ] && cbs "both" = Some [ 0; 1; 2 ] && cbs "rec" = Some [ 1 ] && cbs "double" = Some [])
+       (String.concat " " (List.of_seq (Hashtbl.to_seq_keys pure)));
+     ok "pure-if-ir-not" (List.for_all (fun n -> info n = None) [ "keeps"; "passes_bad"; "captures"; "returns"; "sends"; "tasks"; "printer" ])
+       (String.concat " " (List.of_seq (Hashtbl.to_seq_keys pure)));
+     (* natively: the calls with pure closures are kept across the loop, the
+        one with a closure that prints is not *)
+     let c = Native.c_source items in
+     let count_sub s sub =
+       let n = String.length s and m = String.length sub in
+       let rec go i acc = if i + m > n then acc else go (i + 1) (if String.sub s i m = sub then acc + 1 else acc) in
+       go 0 0
+     in
+     ok "pure-if-kept-c" (count_sub c "__builtin_expect(k" = 2) (sprintf "%d kept calls" (count_sub c "__builtin_expect(k")));
+  (* fusion: a stage closure may call a pure closure held in a variable *)
+  let fuse_src = {v|fn main(root: Root) {
+    let out = root.stdout
+    let inc = |x: Int| x + 1
+    let shout = |x: Int| {
+        out.print("saw {x}")
+        x
+    }
+    let a = [1, 2, 3].map(|x| inc(x)).filter(|x| x > 2).map(|x| inc(x) * 10)
+    let b = [1, 2].map(|x| shout(x)).map(|x| x * 10)
+    out.print("{a} {b}")
+}
+|v} in
+  out "pure-if-fusion" fuse_src "saw 1\nsaw 2\n[40, 50] [10, 20]\n";
+  (let items, ds, _ = compile "pure-if-fusion-ir" fuse_src in
+   if ds <> [] then ok "pure-if-fusion-ir" false (String.concat " " (codes ds))
+   else
+     let prog, _ = Lower.lower_program ~tests:false items in
+     let main = List.find (fun (f : Ir.fn) -> Interp_util.find_sub f.fname "main" 0 <> None) prog.fns in
+     let loops = ref 0 in
+     Pure.stmts_iter (function Ir.Loop _ -> incr loops | _ -> ()) main.body;
+     (* `a` is one fused loop; `b` is two, since `shout` prints *)
+     ok "pure-if-fusion-ir" (!loops = 3) (sprintf "%d loops" !loops));
+
+  (* ---------- revocation: authority that can be withdrawn ---------- *)
+  let rv_src = {v|fn main(root: Root) {
+    let out = root.stdout
+    let (fs, off) = root.fs.revocable()
+    let sub = fs.read_only()
+    out.print("before: {fs.write("a.txt", "hi").is_ok()} {fs.read("a.txt")} {sub.exists("a.txt")} {sub.is_read_only()} {off.is_revoked()}")
+    // a task holds the capability while another revokes it
+    let c: Chan[Int] = channel(0)
+    let r = group g {
+        g.go(|| {
+            let _ = c.recv()
+            "task: {sub.read("a.txt")} {fs.write("b.txt", "x")} {fs.exists("a.txt")}"
+        })
+        g.go(|| {
+            off.revoke()
+            c.send(1)
+            "revoked"
+        })
+    }
+    out.print("{r}")
+    out.print("after: {fs.read("a.txt")} {sub.is_dir("")} {fs.is_read_only()} {fs.under("x").list("")} {fs.rename("a.txt", "c.txt")} {off.is_revoked()}")
+    off.revoke()
+    let (fs2, off2) = fs.revocable()
+    out.print("child: {off2.is_revoked()} {fs2.read("a.txt")}")
+    let (fs3, off3) = root.fs.revocable()
+    let (fs4, off4) = fs3.revocable()
+    off4.revoke()
+    out.print("parent: {fs3.exists("a.txt")} {fs4.exists("a.txt")} {off3.is_revoked()} {off4.is_revoked()}")
+    off3.revoke()
+    out.print("parent: {fs3.exists("a.txt")} {off4.is_revoked()}")
+    let (e, eoff) = root.env.revocable()
+    out.print("env: {e.get("LIMEN_RV").is_some()}")
+    eoff.revoke()
+    out.print("env: {e.get("LIMEN_RV")}")
+    let (x, xoff) = root.exec.revocable()
+    let sh = x.only("sh")
+    out.print("exec: {sh.run("sh", ["-c", "echo hi"]).map(|p| p.stdout.trim())}")
+    xoff.revoke()
+    out.print("exec: {sh.run("sh", ["-c", "echo hi"])}")
+    let (n, noff) = root.net.revocable()
+    noff.revoke()
+    out.print("net: {n.get("http://localhost:1/")} {n.only("localhost").connect("localhost:1").is_ok()}")
+}
+|v} in
+  Unix.putenv "LIMEN_RV" "set";
+  (let dir = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "limen-rv-%d" (Unix.getpid ())) in
+   (try Unix.mkdir dir 0o755 with Unix.Unix_error _ -> ());
+   let dir = Unix.realpath dir in
+   out "revoke-caps" ~grants:{ Interp.no_grants with fs = Some (dir, false); env = [ "LIMEN_RV" ]; exec = [ "sh" ]; net = [ "localhost" ] } rv_src
+     "before: true Ok(\"hi\") true true false\n\
+      [\"task: Err(Denied(\\\"fs: revoked\\\")) Err(Denied(\\\"fs: revoked\\\")) false\", \"revoked\"]\n\
+      after: Err(Denied(\"fs: revoked\")) false true Err(Denied(\"fs: revoked\")) Err(Denied(\"fs: revoked\")) true\n\
+      child: true Err(Denied(\"fs: revoked\"))\n\
+      parent: true false false true\n\
+      parent: false true\n\
+      env: true\nenv: None\n\
+      exec: Ok(\"hi\")\nexec: Err(Denied(\"exec: revoked\"))\n\
+      net: Err(Denied(\"net: revoked\")) false\n");
+  (* sockets opened through a revocable Net or Listen are closed at revoke,
+     waking the tasks that wait on them *)
+  let rv_socks = {v|fn main(root: Root) {
+    let out = root.stdout
+    let (l, loff) = root.listen.revocable()
+    let (n, noff) = root.net.revocable()
+    match l.on("127.0.0.1:0") {
+        Ok(lis) => {
+            let port = lis.port()
+            let res = group g {
+                g.go(|| match lis.accept() {
+                    Ok(conn) => match conn.read() {
+                        Ok(s) => "server read {s}",
+                        Err(e) => "server read: {e}",
+                    },
+                    Err(e) => "accept: {e}",
+                })
+                g.go(|| match n.connect("127.0.0.1:{port}") {
+                    Ok(conn) => {
+                        root.clock.sleep(50)
+                        noff.revoke()
+                        "client: {conn.write("x")} {conn.read()}"
+                    },
+                    Err(e) => "connect: {e}",
+                })
+            }
+            out.print("{res}")
+            let more = group g {
+                g.go(|| match lis.accept() {
+                    Ok(_) => "accepted",
+                    Err(e) => "accept: {e}",
+                })
+                g.go(|| {
+                    root.clock.sleep(50)
+                    loff.revoke()
+                    "revoked"
+                })
+            }
+            out.print("{more} {l.on("127.0.0.1:0").map(|x| x.port() > 0)} {lis.port() == port}")
+        },
+        Err(e) => out.print("{e}"),
+    }
+}
+|v} in
+  let rv_socks_want =
+    "[\"server read \", \"client: Err(Failed(\\\"connection is closed\\\")) Err(Failed(\\\"connection is closed\\\"))\"]\n\
+     [\"accept: Failed(\\\"listener is closed\\\")\", \"revoked\"] Err(Denied(\"listen: revoked\")) true\n"
+  in
+  let rv_socks_grants = { Interp.no_grants with net = [ "127.0.0.1" ]; listen = [ "127.0.0.1" ] } in
+  out "revoke-sockets" ~grants:rv_socks_grants rv_socks rv_socks_want;
+  check_tsan "revoke-sockets" ~grants:rv_socks_grants rv_socks rv_socks_want;
+  (* a revoked Foreign: calls panic, allows says no *)
+  out "revoke-foreign" ~grants:{ Interp.no_grants with foreign = [ "c" ] }
+    "foreign \"c\" {\n    fn abs(n: Int32) -> Int32\n}\n\nfn main(root: Root) {\n    let (f, off) = root.foreign.revocable()\n    let c = f.only(\"c\")\n    root.stdout.print(\"{abs(c, -3)} {c.allows(\"c\")}\")\n    off.revoke()\n    root.stdout.print(\"{c.allows(\"c\")} {catch(|| abs(c, -3))} {catch(|| f.copy(Handle { addr: 0 }, 0).len())}\")\n}\n"
+    "3 true\nfalse Err(\"foreign: revoked\") Err(\"foreign: revoked\")\n";
+  (* a Revoker is authority (never pure, no equality) that needs no grant *)
+  (let _, ds, infos =
+     compile "revoke-caps-info" "fn stop(r: Revoker) {\n    r.revoke()\n}\n\nfn split(fs: Fs) -> (Fs, Revoker) {\n    fs.revocable()\n}\n\nfn main(root: Root) {}\n"
+   in
+   let find n = List.find (fun (i : Check.fn_info) -> i.name = n) infos in
+   ok "revoke-caps-info" (ds = [] && (find "stop").caps = [ Types.Revoker ] && (find "split").caps = [ Types.Fs ]) (String.concat " " (codes ds)));
+  errs "revoke-eq" "fn main(root: Root) {\n    let (f, a) = root.fs.revocable()\n    let (g, b) = root.fs.revocable()\n    let same = a == b\n}\n" [ "E0201" ];
+  errs "revoke-stdout" "fn main(root: Root) {\n    let x = root.stdout.revocable()\n}\n" [ "E0105" ];
+
+  (* ---------- Foreign narrowed per library ---------- *)
+  let ffs = "foreign \"c\" {\n    fn getpid() -> Int32\n    fn abs(n: Int32) -> Int32\n}\n\nforeign \"m\" {\n    fn cbrt(x: Float) -> Float\n}\n\n" in
+  says "foreign-narrowed-other" (ffs ^ "fn main(root: Root) {\n    let m = root.foreign.only(\"m\")\n    let p = getpid(m)\n}\n") "E0333"
+    "`getpid` calls C library `c`, but this Foreign grants only `m`";
+  says "foreign-narrowed-none" (ffs ^ "fn main(root: Root) {\n    let c = root.foreign.only(\"c\")\n    let none = c.only(\"m\")\n    let x = cbrt(none, 1.0)\n}\n") "E0333"
+    "but this Foreign grants no library";
+  errs "foreign-narrowed-inline" (ffs ^ "fn main(root: Root) {\n    let x = abs(root.foreign.only(\"m\"), 1)\n}\n") [ "E0333" ];
+  errs "foreign-narrowed-copy" (ffs ^ "fn main(root: Root) {\n    let c = root.foreign.only(\"c\")\n    let d = c\n    let x = cbrt(d, 1.0)\n}\n") [ "E0333" ];
+  errs "foreign-narrowed-shadow" (ffs ^ "fn main(root: Root) {\n    let c = root.foreign.only(\"c\")\n    let c = c.only(\"m\")\n    let x = cbrt(c, 1.0)\n}\n") [ "E0333" ];
+  errs "foreign-narrowed-ok"
+    (ffs ^ "fn main(root: Root) {\n    let c = root.foreign.only(\"c\")\n    let s = root.foreign.only(\"*\")\n    let mut v = root.foreign.only(\"m\")\n    v = root.foreign\n    let x = getpid(c) + abs(s, 1) + getpid(v)\n}\n") [];
+  (let _, ds, infos =
+     compile "foreign-libs-caps"
+       (ffs ^ "fn pid(c: Foreign) -> Int {\n    getpid(c)\n}\n\nfn both(c: Foreign) -> Float {\n    cbrt(c, 8.0) + pid(c).to_float()\n}\n\nfn raw(c: Foreign) -> Bytes {\n    c.copy(Handle { addr: 0 }, 0)\n}\n\nfn main(root: Root) {}\n")
+   in
+   let find n = List.find (fun (i : Check.fn_info) -> i.name = n) infos in
+   let text n = String.concat ", " (List.map (Check.cap_text (find n)) (find n).caps) in
+   ok "foreign-libs-caps" (ds = [] && text "pid" = "Foreign (c)" && text "both" = "Foreign (c, m)" && text "raw" = "Foreign" && text "cbrt" = "Foreign (m)")
+     (String.concat "; " (List.map text [ "pid"; "both"; "raw"; "cbrt" ])));
+  (* several libraries in one grant, both backends *)
+  out "foreign-grant-list" ~grants:{ Interp.no_grants with foreign = [ "c"; "m" ] }
+    (ffs ^ "fn main(root: Root) {\n    let f = root.foreign\n    root.stdout.print(\"{getpid(f) > 0} {cbrt(f, 8.0)} {f.allows(\"c\")} {f.allows(\"m\")} {f.allows(\"z\")}\")\n}\n")
+    "true 2.0 true true false\n";
 
   (* ---------- tuple assignment, or-patterns, `..`, list patterns, list `+`, last_index_of ---------- *)
   out "tuple-assign"

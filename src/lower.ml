@@ -56,6 +56,11 @@ let tmp f ty rhs =
 
 let bind f n v = Hashtbl.replace (List.hd f.scopes) n v
 
+(* Variables never reassigned that hold a pure function: a pure closure
+   literal or a top-level function. A closure that captures one is still
+   pure (fusion, below). *)
+let pure_fn_vars : (int, unit) Hashtbl.t = Hashtbl.create 16
+
 (* Lower a loop body one loop deeper. *)
 let in_loop f k =
   f.loop_depth <- f.loop_depth + 1;
@@ -96,6 +101,20 @@ let rec lookup f n =
           f.caps := !(f.caps) @ [ (outer, inner) ];
           Some inner)))
 
+(* [lookup] without capturing: the variable where it is declared. *)
+let rec peek f n =
+  match List.find_map (fun s -> Hashtbl.find_opt s n) f.scopes with
+  | Some v -> Some v
+  | None -> ( match f.parent with Some p -> peek p n | None -> None)
+
+(* One of pure_fn_vars, or a capture of one. *)
+let rec pure_fn_var f (v : I.var) =
+  Hashtbl.mem pure_fn_vars v.id
+  ||
+  match (List.find_opt (fun (_, (i : I.var)) -> i.id = v.id) !(f.caps), f.parent) with
+  | Some (o, _), Some p -> pure_fn_var p o
+  | _ -> false
+
 (* ---------- types ---------- *)
 
 let rec resolve env (te : ty_expr) : ty =
@@ -129,6 +148,7 @@ let rec resolve env (te : ty_expr) : ty =
     | "Env", _ -> TCap Env
     | "Exec", _ -> TCap Exec
     | "Foreign", _ -> TCap Foreign
+    | "Revoker", _ -> TCap Revoker
     | "Chan", [ x ] -> TChan x
     | "Atomic", _ -> TAtomic
     | "Shared", [ x ] -> TShared x
@@ -1016,16 +1036,17 @@ and apply f prep args ret_ty =
     f.scopes <- List.tl f.scopes;
     r
 
-(* Pure: a closure literal whose free variables hold no capability and no
-   function value. It can then only compute, which is what fusion needs. *)
-and pure_closure f fn =
+(* Pure: a closure literal whose free variables hold no capability, no
+   channel and no function value but a pure one (pure_fn_vars). It can then
+   only compute, which is what fusion needs. *)
+and pure_closure ?(look = lookup) f fn =
   match fn.edesc with
   | EClosure (ps, body) when not (has_escape body) ->
     let free = Free.expr (List.map (fun (n, _, _) -> n) ps) body in
     List.for_all
       (fun n ->
-        match lookup f n with
-        | Some (v : I.var) -> caps_in v.ty [] = [] && not (has_fn v.ty) && not (has_chan v.ty)
+        match look f n with
+        | Some (v : I.var) -> caps_in v.ty [] = [] && ((not (has_fn v.ty)) || pure_fn_var f v) && not (has_chan v.ty)
         | None -> true (* top-level function or constructor *))
       free
   | _ -> false
@@ -1141,9 +1162,14 @@ and lower_stmt f s =
   if not f.dead then
     match s.sdesc with
     | SLetPat _ | SForPat _ -> failwith "destructuring is expanded when modules load"
-    | SLet (_, n, _, _, e) ->
+    | SLet (m, n, _, _, e) ->
+      let pure =
+        (not m)
+        && match e.edesc with EClosure _ -> pure_closure ~look:peek f e | EVar g -> peek f g = None | _ -> false
+      in
       let a = lower f e in
       let v = fresh_var n (tyof f e) in
+      if pure && (match v.ty with TFn _ -> true | _ -> false) then Hashtbl.replace pure_fn_vars v.id ();
       emit f (I.Let (v, I.Atom a));
       bind f n v
     | SAssign ({ edesc = EVar n; _ }, rhs) ->
@@ -1221,6 +1247,7 @@ let lower_fn g c (d : fn_decl) env =
   { I.fname = c; params; captures = []; is_closure = false; ret; body = List.rev f.buf }
 
 let lower_program ?(tests = false) (user_items : item list) : I.program * gctx =
+  Hashtbl.reset pure_fn_vars;
   let g =
     { fns = Hashtbl.create 16; structs = Hashtbl.create 16; enums = Hashtbl.create 16;
       ctors = Hashtbl.create 16; instances = Hashtbl.create 16; queue = []; out = []; counter = 0 }

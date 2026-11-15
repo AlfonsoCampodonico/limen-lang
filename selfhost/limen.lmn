@@ -35,7 +35,7 @@ fn usage() -> Str {
     "limen: a small language where I/O needs a capability
 
 usage:
-  limen run FILE [--native] [--grant net=HOST[:PORT]|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST:PORT]... [--grant env=NAME|*]... [--grant exec=PROGRAM|*]... [--grant foreign=LIB|*]... [--seed N] [--no-sandbox] [-- ARGS...]
+  limen run FILE [--native] [--grant net=HOST[:PORT]|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST:PORT]... [--grant env=NAME|*]... [--grant exec=PROGRAM[ ARGS|ARGS...]|*]... [--grant foreign=LIB[,LIB...]|*]... [--seed N] [--no-sandbox] [-- ARGS...]
   limen build FILE [-o OUT] [--emit-c]
   limen check FILE [--json]
   limen caps FILE [--json]
@@ -285,14 +285,19 @@ fn caps_of(cx: Ctx, file: Str) -> Int {
     let width = infos.fold(0, |w, i| w.max(i.name.len()))
     for i in infos {
         // a capability held through a struct or enum says where: `Net (via Client.net)`
-        let caps = i.caps.map(|c| match i.via.find(|v| v.0 == c) {
-            Some((_, p)) => "{c} (via {p})",
-            None => c,
+        let caps = i.caps.map(|c| {
+            let name = if c == "Foreign" && !i.libs.is_empty() { "Foreign ({i.libs.join(", ")})" } else { c }
+            match i.via.find(|v| v.0 == c) {
+                Some((_, p)) => "{name} (via {p})",
+                None => name,
+            }
         })
-        let what = match (caps, i.callbacks) {
-            ([], false) => "pure",
-            ([], true) => "pure itself, runs callbacks",
-            (cs, cb) => cs.join(", ") + if cb { " + callbacks" } else { "" },
+        let what = match (caps, i.callbacks, i.pure_if) {
+            ([], false, _) => "pure",
+            ([], true, []) => "pure itself, runs callbacks",
+            ([], true, [f]) => "pure if {f} is",
+            ([], true, [..fs, last]) => "pure if {fs.join(", ")} and {last} are",
+            (cs, cb, _) => cs.join(", ") + if cb { " + callbacks" } else { "" },
         }
         out.print(i.name + spaces(width - i.name.len()) + "  " + what)
     }
@@ -303,6 +308,10 @@ fn caps_of(cx: Ctx, file: Str) -> Int {
     }
     for e in f.loaded.embedded {
         out.print("embeds {e.path} ({e.size} bytes){if e.module == "" { "" } else { " in module " + e.module }}")
+    }
+    // what limen.toml grants the program, narrowing included: `grant exec=git status|log`
+    for (k, v) in f.loaded.manifest.map(|m| m.grants) ?? [] {
+        out.print("grant {k}={v}")
     }
     0
 }

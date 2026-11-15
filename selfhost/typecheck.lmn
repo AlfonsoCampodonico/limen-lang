@@ -46,6 +46,14 @@ pub struct FnInfo {
     // struct or enum that holds it, `Client.net`
     via: List[(Str, Str)],
     callbacks: Bool,
+    // the C libraries it reaches with a Foreign: its own when it is a
+    // foreign function, and those of the functions it uses that take a
+    // Foreign, sorted
+    libs: List[Str],
+    // its parameters of function type, when it only calls them or passes
+    // them on to a function that is pure if they are: it is pure when the
+    // functions it is given are
+    pure_if: List[Str],
 }
 
 // A function and its signature.
@@ -129,20 +137,161 @@ pub fn check_program(items: List[ast.Item], files: List[diag.Source], next_id: I
             (st, ds) = check_one(cx, st, ds, f)
         }
     }
+    st = refuse_compared_params(cx, st)
     // forwarders only pass their arguments on; the methods they call are reported
     let reported = sigs.filter(|f| f.decl.test.is_none() && f.decl.span.file != methods_file && f.decl.span.file != prelude_file && !cx.forwarders.contains(f.decl.name))
-    let infos = reported.map(|f| fn_info(st, f))
+    // pure if its function parameters are: it holds no capability and no
+    // bound, its parameters holding a function are functions, it only calls
+    // them or passes them on to such a function, until nothing changes
+    let mut cond: Map[Str, (List[Str], List[(Str, Int)])] = map()
+    for f in sigs {
+        let fns = f.decl.params.zip(f.sig.params).flat_map(|x| match st.repr(x.1) {
+            TFn(..) => [x.0.name],
+            _ => [],
+        })
+        let plain = f.sig.params.all(|t| match st.repr(t) {
+            TFn(..) => true,
+            _ => !st.subst.has_fn(t),
+        })
+        match st.cb_uses.get(f.decl.name) {
+            Some((false, passes)) if !fns.is_empty() && st.authority_of(f.sig.params).is_empty() && f.decl.bounds.is_empty() && plain => {
+                cond[f.decl.name] = (fns, passes)
+            },
+            _ => {},
+        }
+    }
+    let mut changed = true
+    while changed {
+        changed = false
+        let mut next: Map[Str, (List[Str], List[(Str, Int)])] = map()
+        for (name, c) in cond.entries() {
+            if c.1.all(|p| cond.contains(p.0)) {
+                next[name] = c
+            } else {
+                changed = true
+            }
+        }
+        cond = next
+    }
+    // the C libraries each function reaches with a Foreign, until nothing
+    // changes
+    let mut libs: Map[Str, List[Str]] = map()
+    let mut takes_foreign: List[Str] = []
+    for f in sigs {
+        if st.authority_of(f.sig.params).any(|h| h.0 == "Foreign") {
+            takes_foreign.push(f.decl.name)
+        }
+        // "limen" is the runtime's own functions (the sql module's
+        // helpers), not a library
+        libs[f.decl.name] = match f.decl.foreign {
+            Some(fo) if fo.lib != "limen" => [fo.lib],
+            _ => [],
+        }
+    }
+    let mut more_libs = true
+    while more_libs {
+        more_libs = false
+        for f in sigs {
+            let have = libs[f.decl.name]
+            let more = (st.fn_refs.get(f.decl.name) ?? []).flat_map(|g| if takes_foreign.contains(g) { libs.get(g) ?? [] } else { [] })
+            let now = (have + more).distinct().sort()
+            if now != have {
+                libs[f.decl.name] = now
+                more_libs = true
+            }
+        }
+    }
+    let infos = reported.map(|f| fn_info(st, f, cond.get(f.decl.name).map(|c| c.0) ?? [], libs.get(f.decl.name) ?? []))
     Checked { items: items.map(|i| rewritten_item(st, i)), diags: in_order(cx, st.diags), state: st, infos, cx, prelude: pre.map(|i| rewritten_item(st, i)) }
 }
 
-fn fn_info(st: env.State, f: Fn) -> FnInfo {
+// The type parameters in a type, added to `acc` in the order met.
+fn params_in(st: env.State, acc: List[Str], t: types.Ty) -> List[Str] {
+    match st.repr(t) {
+        TParam(g) => if acc.contains(g) { acc } else { acc + [g] },
+        TList(a) | TChan(a) | TGroup(a) => params_in(st, acc, a),
+        TArray(a, n) => params_in(st, params_in(st, acc, a), n),
+        TMap(k, v) => params_in(st, params_in(st, acc, k), v),
+        TFn(ps, r) => {
+            let mut acc = acc
+            for p in ps {
+                acc = params_in(st, acc, p)
+            }
+            params_in(st, acc, r)
+        },
+        TNamed(_, xs) | TDyn(_, xs) => {
+            let mut acc = acc
+            for x in xs {
+                acc = params_in(st, acc, x)
+            }
+            acc
+        },
+        _ => acc,
+    }
+}
+
+// Which type parameters each generic function compares, itself or through
+// the generic functions it calls, until nothing changes; then E0201 at
+// every use that gives such a parameter a type without equality. A
+// parameter bounded by `Ordered` or `Key` is refused by its bound.
+fn refuse_compared_params(cx: env.Cx, st: env.State) -> env.State {
+    let mut st = st
+    let uses = st.generic_uses.reverse()
+    let mut changed = true
+    while changed {
+        changed = false
+        for (caller, _, g, inst) in uses {
+            let mut more: List[Str] = []
+            for p in st.compares.get(g) ?? [] {
+                match inst.find(|x| x.0 == p) {
+                    Some((_, t)) => {
+                        more = params_in(st, more, t)
+                    },
+                    None => {},
+                }
+            }
+            let have = st.compares.get(caller) ?? []
+            let fresh = more.filter(|p| !have.contains(p))
+            if !fresh.is_empty() {
+                st.compares[caller] = have + fresh
+                changed = true
+            }
+        }
+    }
+    for (_, sp, g, inst) in uses {
+        for p in st.compares.get(g) ?? [] {
+            let bounded = (cx.fn_bounds.get(g) ?? []).any(|b| b.param == p && b.bounds.any(|x| x.iface == "Ordered" || x.iface == "Key"))
+            match inst.find(|x| x.0 == p) {
+                Some((_, t)) if !bounded => {
+                    let shown = match g.index_of("::") {
+                        Some(i) => g.slice(i + 2, g.len()),
+                        None => g,
+                    }
+                    let what = "`{shown}` compares values of `{p}`"
+                    let t = st.repr(t)
+                    st = match t {
+                        TFn(..) | TCap(_) | TChan(_) | TAtomic | TShared(_) | TDyn(..) => st.report(diag.error("E0201", sp, "{what}, and values of type `{st.show(t)}` cannot be compared")),
+                        _ => match st.held(t) {
+                            Some(h) => st.report(diag.error("E0201", sp, "{what}, and {h}").note("capabilities have no equality, so neither has a value holding one; compare something it holds that is not a capability, as in `xs.any(|x| x.name == name)`")),
+                            None => st,
+                        },
+                    }
+                },
+                _ => {},
+            }
+        }
+    }
+    st
+}
+
+fn fn_info(st: env.State, f: Fn, pure_if: List[Str], libs: List[Str]) -> FnInfo {
     let held = st.authority_of(f.sig.params)
     let callbacks = f.sig.params.any(|t| st.subst.has_fn(t)) || !f.decl.bounds.is_empty()
     let via = held.flat_map(|h| match h.1 {
         Some(p) => [(h.0, p)],
         None => [],
     })
-    FnInfo { name: f.decl.name, span: f.decl.span, caps: held.map(|h| h.0), via, callbacks }
+    FnInfo { name: f.decl.name, span: f.decl.span, caps: held.map(|h| h.0), via, callbacks, libs, pure_if }
 }
 
 // 2c. the authority each struct and enum holds through its fields
@@ -616,6 +765,12 @@ fn signatures(cx: env.Cx, st: env.State, ds: Decls, items: List[ast.Item]) -> (e
                 // the Limen type of a C function: Foreign first, Out
                 // parameters moved to the result
                 cx.foreign_fns[d.name] = true
+                match d.foreign {
+                    Some(fo) => {
+                        cx.foreign_libs[d.name] = fo.lib
+                    },
+                    None => {},
+                }
                 if d.name == "main" {
                     st = st.report(diag.error("E0330", d.span, "`main` cannot be a foreign function"))
                 }
@@ -848,6 +1003,17 @@ fn check_fn(cx: env.Cx, st: env.State, ds: Decls, d: ast.FnDecl, s: env.Sig) -> 
     st.to_infer = []
     st.map_keys = []
     st.compared = []
+    st.eq_types = []
+    st.uses_here = []
+    st.cur_fn = d.name
+    st.cb_params = d.params.zip(s.params).flat_map(|x| match st.repr(x.1) {
+        TFn(..) => [(x.0.name, x.0.span)],
+        _ => [],
+    })
+    st.cb_escaped = false
+    st.cb_passes = []
+    st.refs_here = []
+    st.foreign_known = []
     let genv = generic_env(d.generics)
     let mut scope = env.Scope { vars: map(), barrier: false }
     for (p, t) in d.params.zip(s.params) {
@@ -857,7 +1023,7 @@ fn check_fn(cx: env.Cx, st: env.State, ds: Decls, d: ast.FnDecl, s: env.Sig) -> 
     if st.subst.has_dyn(s.ret) {
         // the body's value becomes `dyn`, branch by branch
         st = checker.expect_block(st, cx, fx, d.body, s.ret)
-        return check_pending(cx, st, ds)
+        return out_of_fn(check_pending(cx, st, ds))
     }
     let (bt, next) = checker.check_block(st, cx, fx, d.body)
     let (ok, next) = next.unify(s.ret, bt)
@@ -880,7 +1046,16 @@ fn check_fn(cx: env.Cx, st: env.State, ds: Decls, d: ast.FnDecl, s: env.Sig) -> 
         }
         st = st.report(problem)
     }
-    check_pending(cx, st, ds)
+    out_of_fn(check_pending(cx, st, ds))
+}
+
+fn out_of_fn(r: (env.State, Decls)) -> (env.State, Decls) {
+    let (st, ds) = r
+    let mut st = st
+    st.cb_uses[st.cur_fn] = (st.cb_escaped, st.cb_passes.reverse())
+    st.fn_refs[st.cur_fn] = st.refs_here.reverse()
+    st.cb_params = []
+    ({ st with cur_fn: "" }, ds)
 }
 
 // The checks left for when the function's types are known: the key types
@@ -910,6 +1085,20 @@ fn check_pending(cx: env.Cx, st: env.State, ds: Decls) -> (env.State, Decls) {
     for (sp, t, name) in st.compared.reverse() {
         st = checker.refuse_compare(st, sp, name, t)
     }
+    if st.cur_fn != "" {
+        let mut ps: List[Str] = []
+        for t in st.compared.reverse().map(|c| c.1) + st.eq_types.reverse() {
+            ps = params_in(st, ps, t)
+        }
+        if !ps.is_empty() {
+            st.compares[st.cur_fn] = ps
+        }
+        for (sp, g, inst) in st.uses_here.reverse() {
+            st.generic_uses = [(st.cur_fn, sp, g, inst)] + st.generic_uses
+        }
+    }
+    st.eq_types = []
+    st.uses_here = []
     st.compared = []
     let ps = st.pending.reverse()
     st.pending = []

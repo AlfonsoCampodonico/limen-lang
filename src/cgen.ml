@@ -970,6 +970,7 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
         (sprintf "Cap_fs_info(%s, %s)" (arg 0) (arg 1))
         (sprintf "({ WFileInfo *i_ = (WFileInfo*)r_.ptr; %s v_ = { i_->size, i_->mtime_ms, i_->is_file, i_->is_dir }; free(i_); v_; })" (ctype c fi))
     | "cap_only", TCap Exec -> set (sprintf "Cap_exec_only(%s, %s)" (arg 0) (arg 1))
+    | "cap_only_args", TCap Exec -> set (sprintf "Cap_exec_only_args(%s, %s, %s)" (arg 0) (arg 1) (arg 2))
     | "cap_only", TCap Foreign -> set (sprintf "Cap_foreign_only(%s, %s)" (arg 0) (arg 1))
     | "cap_allows", TCap Foreign -> set (sprintf "Cap_foreign_allows(%s, %s)" (arg 0) (arg 1))
     | "cap_copy", TCap Foreign -> set (sprintf "Cap_foreign_copy(%s, (%s).f0, %s, %s)" (arg 0) (arg 1) (arg 2) (where sp))
@@ -1004,7 +1005,14 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     | "cap_write", TCap Fs -> io_result (sprintf "Cap_fs_write(%s, %s, %s)" (arg 0) (arg 1) (arg 2)) "0"
     | "cap_exists", _ -> set (sprintf "Cap_fs_exists(%s, %s)" (arg 0) (arg 1))
     | "cap_full_path", TCap Fs -> io_result (sprintf "Cap_fs_full_path(%s, %s)" (arg 0) (arg 1)) "r_.val"
-    | "cap_is_read_only", TCap Fs -> set (sprintf "(%s)->ro" (arg 0))
+    | "cap_is_read_only", TCap Fs -> set (sprintf "Cap_fs_is_read_only(%s)" (arg 0))
+    | "cap_revocable", TCap _ ->
+      line "{";
+      line (sprintf "  WCap *k_; WCap *c_ = Cap_revocable(%s, &k_);" (arg 0));
+      line (sprintf "  %s = (%s){ c_, k_ };" dst (cname c t));
+      line "}"
+    | "cap_revoke", TCap Revoker -> line (sprintf "Cap_revoke(%s);" (arg 0)); set "0"
+    | "cap_is_revoked", TCap Revoker -> set (sprintf "Cap_is_revoked(%s)" (arg 0))
     | _ ->
       ignore sp;
       failwith (sprintf "cgen: unknown primitive %s on %s" name (show rt)))

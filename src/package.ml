@@ -74,7 +74,15 @@ let grant_of (c : Types.cap) =
   | Env -> [ "env" ]
   | Exec -> [ "exec" ]
   | Foreign -> [ "foreign" ]
+  | Revoker -> []
   | Root -> []
+
+(* The C libraries a dependency's caps limit it to, `"foreign=z,sqlite3"`
+   (with [trust]): None when they name none, and it may call any. *)
+let foreign_libs caps =
+  match List.filter (String.starts_with ~prefix:"foreign=") caps with
+  | [] -> None
+  | fs -> Some (List.concat_map (fun c -> String.split_on_char ',' (String.sub c 8 (String.length c - 8))) fs)
 
 exception Bad of Span.t * string
 
@@ -256,6 +264,10 @@ let parse file src : t =
               (fun c ->
                 if c = "foreign" then
                   raise (Bad (sp, Printf.sprintf "`caps` cannot grant foreign: calling C is full trust; name the dependency in [trust] instead: foreign = [\"%s\"]" d))
+                else if String.starts_with ~prefix:"foreign=" c then begin
+                  if List.exists (fun l -> l = "") (String.split_on_char ',' (String.sub c 8 (String.length c - 8))) then
+                    raise (Bad (sp, "`foreign=` names C libraries: \"foreign=z\" or \"foreign=z,sqlite3\""))
+                end
                 else if not (List.mem c cap_grants) then
                   raise (Bad (sp, Printf.sprintf "unknown capability `%s`; use %s" c (String.concat ", " cap_grants))))
               caps;
@@ -288,6 +300,7 @@ let parse file src : t =
                   vs
             in
             List.iter (fun v -> if v = "" then raise (Bad (sp, "a grant cannot be empty"))) vs;
+            if g = "exec" then List.iter (fun v -> if Caps.exec_entry v = None then raise (Bad (sp, "exec grant `" ^ v ^ "`: " ^ Caps.exec_grant_help))) vs;
             grants := !grants @ List.map (fun v -> (g, v)) vs
           | "trust", "foreign", VArr names ->
             if !trust <> [] then raise (Bad (sp, "[trust] foreign is listed twice"));
@@ -609,17 +622,33 @@ let enforce ?(std = false) (pkg : t) (module_pkg : (string * string) list) (info
             match c with
             | Types.Root -> false
             | Types.Foreign -> (not std) && List.mem dn pkg.trust
+            (* revoking only takes authority away: any code may hold a switch *)
+            | Types.Revoker -> true
             | c -> List.exists (fun g -> List.mem g d.caps) (grant_of c)
           in
           let missing = List.filter (fun c -> c <> Types.Root && not (allowed c)) i.caps in
           let missing = if List.mem Types.Root i.caps then Types.Root :: missing else missing in
+          let where (sp : Span.t) = let l, _ = Source.line_col sp.file sp.lo in Printf.sprintf "%s:%d" sp.file l in
           match missing with
-          | [] -> None
+          | [] -> (
+            (* the C libraries it reaches, when its caps name them *)
+            match foreign_libs d.caps with
+            | Some ok -> (
+              match List.filter (fun l -> not (List.mem l ok)) i.libs with
+              | [] -> None
+              | l :: _ ->
+                Some
+                  (Diag.make "E0320" d.dspan
+                     (if std then Printf.sprintf "standard library module `%s` calls C library `%s`, which %s does not declare" dn l std_file
+                      else Printf.sprintf "dependency `%s` calls C library `%s`, which limen.toml does not grant it" dn l)
+                     ~notes:
+                       [ Printf.sprintf "`%s` reaches `%s` (%s)" i.name l (where i.span);
+                         Printf.sprintf "its caps allow C libraries %s; to allow this one, add \"foreign=%s\" to them" (String.concat ", " ok) l ]))
+            | None -> None)
           | c :: _ ->
             let need = match grant_of c with [] -> "Root, which no dependency can be granted" | g :: _ -> Printf.sprintf "\"%s\"" g in
             (* held through a struct or enum: say which field *)
             let through c = match List.assoc_opt c i.via with Some p -> Printf.sprintf " through `%s`" p | None -> "" in
-            let where (sp : Span.t) = let l, _ = Source.line_col sp.file sp.lo in Printf.sprintf "%s:%d" sp.file l in
             if std then
               Some
                 (Diag.make "E0320" d.dspan

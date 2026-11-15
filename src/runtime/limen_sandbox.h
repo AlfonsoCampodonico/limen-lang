@@ -14,15 +14,19 @@
      Unix sockets, which reach other programs (Linux allows socketpair);
    - signals: only to this process, and with Exec to the programs it starts;
    - /proc (Linux): only this process's own entries, unless Exec is granted;
-   - programs: starting another program only if Exec is granted. A program
-     started through Exec inherits the same restrictions; it may also list
-     (not read) the directories above the current one, as shells do.
+   - programs: starting another program only if Exec is granted, and then
+     (unless it is granted `*`) only the granted programs' files and programs
+     in system locations, never one the program could have written under the
+     Fs or temporary directory. A program started through Exec inherits the
+     same restrictions; it may also list (not read) the directories above
+     the current one, as shells do.
    macOS also refuses Apple events and LaunchServices opens, so the process
    cannot have another application act for it. It still reaches the system's
    Mach services, as every process does; seccomp on Linux refuses x32 system
    calls and io_uring without Net/Listen.
    What stays in Limen, not the kernel: which hosts and ports Net and Listen
-   allow, which programs Exec allows, which environment variables Env shows,
+   allow, which of the programs in system locations Exec allows and with
+   which arguments, which environment variables Env shows,
    Fs's refusal of `..` and absolute paths (the kernel only sees the result).
 
    macOS: a sandbox profile (sandbox_init). Linux: Landlock for files (kernel
@@ -50,7 +54,47 @@ typedef struct {
   int fs_ro;
   int net;             /* Net or Listen granted */
   int exec;            /* Exec granted */
+  const char *exec_progs; /* the programs it names, one per line (`*` for any), or NULL */
 } WSandboxSpec;
+
+/* The programs Exec may start, as files: each granted name resolved as
+   Exec resolves it (a name without `/` through PATH) to its real path.
+   NULL when `*` is granted: any program. Free with w_sb_free_progs. */
+static char **w_sb_progs(const WSandboxSpec *s, int *any) {
+  *any = 0;
+  if (!s->exec_progs) { *any = 1; return NULL; }
+  size_t n = 1;
+  for (const char *c = s->exec_progs; *c; c++) if (*c == '\n') n++;
+  char **out = (char **)calloc(n + 1, sizeof(char *));
+  size_t k = 0;
+  const char *p = s->exec_progs;
+  while (*p || p == s->exec_progs) {
+    const char *nl = strchr(p, '\n');
+    size_t len = nl ? (size_t)(nl - p) : strlen(p);
+    char *name = strndup(p, len);
+    if (strcmp(name, "*") == 0) { *any = 1; free(name); for (size_t i = 0; i < k; i++) free(out[i]); free(out); return NULL; }
+    char *real = NULL;
+    if (strchr(name, '/')) real = realpath(name, NULL);
+    else if (name[0]) {
+      const char *path = getenv("PATH");
+      if (!path || !path[0]) path = "/usr/bin:/bin";
+      for (const char *d = path; !real;) {
+        const char *colon = strchr(d, ':');
+        size_t dn = colon ? (size_t)(colon - d) : strlen(d);
+        char buf[4096];
+        if (snprintf(buf, sizeof buf, "%.*s/%s", (int)dn, dn ? d : ".", name) < (int)sizeof buf && access(buf, X_OK) == 0) real = realpath(buf, NULL);
+        if (!colon) break;
+        d = colon + 1;
+      }
+    }
+    free(name);
+    if (real) out[k++] = real;
+    if (!nl) break;
+    p = nl + 1;
+  }
+  return out;
+}
+static void w_sb_free_progs(char **ps) { if (ps) { for (char **p = ps; *p; p++) free(*p); free(ps); } }
 
 /* a directory's real path, or NULL; free() it */
 static char *w_sb_real(const char *p) { return p && p[0] ? realpath(p, NULL) : NULL; }
@@ -142,6 +186,21 @@ static int w_sandbox_enter(const WSandboxSpec *s, char *err, size_t en) {
   if (s->exec) w_sb_put(&b, "(allow signal (target children))\n");
   if (!s->net) w_sb_put(&b, "(deny network*)\n");
   if (!s->exec) w_sb_put(&b, "(deny process-exec*)\n(deny process-fork)\n");
+  else {
+    /* starting programs: the granted ones, and those in system locations
+       (which the granted ones start in turn); nothing the program could
+       have written, unless it is granted by name */
+    int any;
+    char **progs = w_sb_progs(s, &any);
+    if (!any) {
+      w_sb_put(&b, "(deny process-exec* (require-not (require-any");
+      const char *bins[] = { "/usr", "/bin", "/sbin", "/System", "/Library", "/opt/homebrew", "/opt/local", "/Applications/Xcode.app", NULL };
+      for (int i = 0; bins[i]; i++) w_sb_subpath(&b, bins[i]);
+      for (char **p = progs; *p; p++) { w_sb_put(&b, " (literal "); w_sb_str(&b, *p); w_sb_put(&b, ")"); }
+      w_sb_put(&b, ")))\n");
+    }
+    w_sb_free_progs(progs);
+  }
   free(tmp); free(cert_file); free(cert_dir);
   char *e = NULL;
   int rc = sandbox_init(b.p, 0, &e);
@@ -237,7 +296,15 @@ static int w_landlock(const WSandboxSpec *s, char *err, size_t en) {
   bad |= w_ll_allow(rs, "/dev", W_LL_READ_FILE | W_LL_READ_DIR, handled);
   bad |= w_ll_allow(rs, "/dev/null", W_LL_READ_FILE | W_LL_WRITE_FILE | W_LL_TRUNCATE, handled);
   bad |= w_ll_allow(rs, "/dev/tty", W_LL_READ_FILE | W_LL_WRITE_FILE, handled);
-  if (s->fs_root) bad |= w_ll_allow(rs, s->fs_root, s->fs_ro ? (W_LL_READ_FILE | W_LL_READ_DIR) : handled, handled);
+  /* starting programs: from system locations and the granted programs'
+     files, not from what the program could have written, unless Exec is
+     granted `*` */
+  int exec_any = 0;
+  char **progs = s->exec ? w_sb_progs(s, &exec_any) : NULL;
+  uint64_t no_exec = exec_any ? 0 : W_LL_EXECUTE;
+  if (s->fs_root) bad |= w_ll_allow(rs, s->fs_root, s->fs_ro ? (W_LL_READ_FILE | W_LL_READ_DIR) : (handled & ~no_exec), handled);
+  if (progs) for (char **p = progs; *p; p++) bad |= w_ll_allow(rs, *p, W_LL_READ_FILE | W_LL_EXECUTE, handled);
+  w_sb_free_progs(progs);
   /* OpenSSL's trust store may be named by the environment */
   {
     char *cf = w_sb_real(getenv("SSL_CERT_FILE")), *cd = w_sb_real(getenv("SSL_CERT_DIR"));
@@ -247,7 +314,7 @@ static int w_landlock(const WSandboxSpec *s, char *err, size_t en) {
   }
   if (s->exec) {
     char *tmp = w_sb_tmpdir();
-    bad |= w_ll_allow(rs, tmp, handled, handled);
+    bad |= w_ll_allow(rs, tmp, handled & ~no_exec, handled);
     free(tmp);
   }
   if (bad) { close(rs); snprintf(err, en, "cannot add a Landlock rule: %s", strerror(errno)); return -1; }

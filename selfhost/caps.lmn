@@ -76,6 +76,8 @@ fn enforce(files: List[diag.Source], std: Bool, pkg: package.Manifest, module_pk
         let allowed = |c: Str| match c {
             "Root" => false,
             "Foreign" => !std && pkg.trust.contains(dn),
+            // revoking only takes authority away: any code may hold a switch
+            "Revoker" => true,
             _ => grant_of(c).any(|g| granted.contains(g)),
         }
         let missing = i.caps.filter(|c| c != "Root" && !allowed(c))
@@ -83,6 +85,17 @@ fn enforce(files: List[diag.Source], std: Bool, pkg: package.Manifest, module_pk
         let c = match missing {
             [c, ..] => c,
             [] => {
+                // the C libraries it reaches, when its caps name them
+                match foreign_libs(granted) {
+                    Some(ok) => match i.libs.filter(|l| !ok.contains(l)) {
+                        [l, ..] => {
+                            let what = if std { "standard library module `{dn}` calls C library `{l}`, which <std>/limen.toml does not declare" } else { "dependency `{dn}` calls C library `{l}`, which limen.toml does not grant it" }
+                            out.push(diag.error("E0320", span, what).note("`{i.name}` reaches `{l}` ({where(files, i.span)})").note("its caps allow C libraries {ok.join(", ")}; to allow this one, add \"foreign={l}\" to them"))
+                        },
+                        [] => {},
+                    },
+                    None => {},
+                }
                 continue
             },
         }
@@ -104,6 +117,16 @@ fn enforce(files: List[diag.Source], std: Bool, pkg: package.Manifest, module_pk
         out.push(diag.error("E0320", span, "dependency `{dn}` uses capability `{c}`, which limen.toml does not grant it").note(takes).note(how))
     }
     out
+}
+
+// The C libraries a dependency's caps limit it to, `"foreign=z,sqlite3"`
+// (with [trust]): None when they name none, and it may call any.
+fn foreign_libs(caps: List[Str]) -> Option[List[Str]] {
+    let fs = caps.filter(|c| c.starts_with("foreign="))
+    if fs.is_empty() {
+        return None
+    }
+    Some(fs.flat_map(|c| c.slice(8, c.len()).split(",")))
 }
 
 // `FILE:LINE` of the start of `span`.

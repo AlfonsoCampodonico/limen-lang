@@ -1,5 +1,5 @@
 (* Semantic types and unification. *)
-type cap = Root | Net | Fs | Stdout | Stderr | Clock | Listen | Listener | Conn | Rand | Stdin | Env | Exec | Foreign
+type cap = Root | Net | Fs | Stdout | Stderr | Clock | Listen | Listener | Conn | Rand | Stdin | Env | Exec | Foreign | Revoker
 
 type ty =
   | TInt
@@ -28,7 +28,7 @@ type ty =
 
 and tvar = Unbound of int | Link of ty
 
-let all_caps = [ Root; Net; Fs; Stdout; Stderr; Clock; Listen; Listener; Conn; Rand; Stdin; Env; Exec; Foreign ]
+let all_caps = [ Root; Net; Fs; Stdout; Stderr; Clock; Listen; Listener; Conn; Rand; Stdin; Env; Exec; Foreign; Revoker ]
 
 let cap_name = function
   | Root -> "Root"
@@ -45,6 +45,7 @@ let cap_name = function
   | Env -> "Env"
   | Exec -> "Exec"
   | Foreign -> "Foreign"
+  | Revoker -> "Revoker"
 
 let counter = ref 0
 

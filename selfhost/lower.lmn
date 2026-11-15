@@ -93,6 +93,10 @@ pub struct Lx {
     guards: Int,
     cur: Frame,
     parents: List[Frame],
+    // variables never reassigned that hold a pure function: a pure closure
+    // literal or a top-level function. A closure that captures one is
+    // still pure (fusion, pure_closure).
+    pure_fns: List[Int],
 }
 
 // What a nested block saved of the one around it.
@@ -245,6 +249,33 @@ fn lookup(self: Lx, n: Str) -> (Option[ir.Var], Lx) {
     self.lookup_at(0, n)
 }
 
+// `lookup` without capturing: the variable where it is declared.
+fn peek(self: Lx, n: Str) -> Option[ir.Var] {
+    for depth in 0..<self.parents.len() + 1 {
+        for s in self.frame(depth).scopes {
+            match s.get(n) {
+                Some(v) => {
+                    return Some(v)
+                },
+                None => {},
+            }
+        }
+    }
+    None
+}
+
+// One of `pure_fns`, or a capture of one, in the function `depth` levels
+// out.
+fn pure_fn_var(self: Lx, depth: Int, v: ir.Var) -> Bool {
+    if self.pure_fns.contains(v.id) {
+        return true
+    }
+    match self.frame(depth).caps.find(|c| c.1.id == v.id) {
+        Some(c) if depth < self.parents.len() => self.pure_fn_var(depth + 1, c.0),
+        _ => false,
+    }
+}
+
 fn not_local(self: Lx, n: Str) -> (Bool, Lx) {
     let (found, lx) = self.lookup(n)
     (found.is_none(), lx)
@@ -294,7 +325,7 @@ pub fn resolve(env: List[(Str, types.Ty)], te: ast.TyExpr) -> types.Ty {
 }
 
 fn is_cap(n: Str) -> Bool {
-    ["Root", "Net", "Fs", "Stdout", "Stderr", "Clock", "Listen", "Listener", "Conn", "Rand", "Stdin", "Env", "Exec", "Foreign"].contains(n)
+    ["Root", "Net", "Fs", "Stdout", "Stderr", "Clock", "Listen", "Listener", "Conn", "Rand", "Stdin", "Env", "Exec", "Foreign", "Revoker"].contains(n)
 }
 
 // An array's size: a number, or a type parameter that stands for one.
@@ -1709,7 +1740,7 @@ fn pure_closure(self: Lx, f: ast.Expr) -> (Bool, Lx) {
                 lx = next
                 match found {
                     Some(v) => {
-                        if !s.caps_in(v.ty, []).is_empty() || s.has_fn(v.ty) || s.has_chan(v.ty) {
+                        if !s.caps_in(v.ty, []).is_empty() || (s.has_fn(v.ty) && !lx.pure_fn_var(0, v)) || s.has_chan(v.ty) {
                             return (false, lx)
                         }
                     },
@@ -1720,6 +1751,21 @@ fn pure_closure(self: Lx, f: ast.Expr) -> (Bool, Lx) {
             (true, lx)
         },
         _ => (false, self),
+    }
+}
+
+// `pure_closure` without capturing anything.
+fn pure_closure_peek(self: Lx, f: ast.Expr) -> Bool {
+    match f.desc {
+        EClosure(ps, body) if !free.has_escape(body) => {
+            let s = self.ro.subst
+            free.expr(ps.map(|p| p.name), body).all(|n| match self.peek(n) {
+                Some(v) => s.caps_in(v.ty, []).is_empty() && (!s.has_fn(v.ty) || self.pure_fns.contains(v.id)) && !s.has_chan(v.ty),
+                // a top-level function or constructor
+                None => true,
+            })
+        },
+        _ => false,
     }
 }
 
@@ -1878,9 +1924,21 @@ fn lower_stmt(self: Lx, s: ast.Stmt) -> Lx {
     let lx = self
     match s.desc {
         SLetPat(..) | SForPat(..) => panic("destructuring is expanded when modules load"),
-        SLet(_, n, _, _, e) => {
+        SLet(m, n, _, _, e) => {
+            let pure = !m && match e.desc {
+                EClosure(..) => lx.pure_closure_peek(e),
+                EVar(g) => lx.peek(g).is_none(),
+                _ => false,
+            }
             let (a, lx) = lx.lower(e)
             let (v, lx) = lx.fresh_var(n, lx.tyof(e))
+            let mut lx = lx
+            match v.ty {
+                TFn(..) if pure => {
+                    lx.pure_fns.push(v.id)
+                },
+                _ => {},
+            }
             lx.emit(Let(v, Use(a))).bind(n, v)
         },
         SAssign(lhs, rhs) => match lhs.desc {
@@ -2021,7 +2079,7 @@ pub fn lower_program(checked_prelude: List[ast.Item], user_items: List[ast.Item]
         }
     }
     let ro = Ro { fns, structs, enums, ctors, types: st.types, insts: st.insts, nested: st.nested, subst: st.subst, ifaces: cx.ifaces, iface_gen: cx.iface_gen }
-    let mut lx = Lx { ro, instances: map(), queue: [], next_job: 0, out: [], counter: 0, vars: 0, guards: 0, cur: new_frame([], TUnit), parents: [] }
+    let mut lx = Lx { ro, instances: map(), queue: [], next_job: 0, out: [], counter: 0, vars: 0, guards: 0, cur: new_frame([], TUnit), parents: [], pure_fns: [] }
     let field = |p: ast.Param| match p.ty.desc {
         TyName("Fs", _) => "fs",
         _ => "clock",

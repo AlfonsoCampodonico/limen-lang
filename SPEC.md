@@ -727,8 +727,8 @@ The native backend implements this with reference counting and copy-on-write. A 
 | `root.net` | `Net` | only with `--grant net=HOST[:PORT]` (repeatable) or `--grant net=*` |
 | `root.fs` | `Fs` | only with `--grant fs=DIR` or `--grant fs=DIR:ro` |
 | `root.listen` | `Listen` | only with `--grant listen=HOST[:PORT]` (repeatable) |
-| `root.exec` | `Exec` | only with `--grant exec=PROGRAM` (repeatable) or `--grant exec=*` |
-| `root.foreign` | `Foreign` | only with `--grant foreign=LIB` (repeatable) or `--grant foreign=*`: calls into C libraries |
+| `root.exec` | `Exec` | only with `--grant exec=PROGRAM` (repeatable), `--grant 'exec=PROGRAM ARGS\|ARGS...'` (that program with arguments starting with one of those, below) or `--grant exec=*` |
+| `root.foreign` | `Foreign` | only with `--grant foreign=LIB` (repeatable, or several at once: `foreign=z,sqlite3`) or `--grant foreign=*`: calls into C libraries |
 
 `root.args()` is the `List[Str]` of command-line arguments after `--`: `limen run app.lmn -- a b`.
 
@@ -739,15 +739,36 @@ An ungranted `Net`, `Fs`, `Listen` or `Exec` still exists, but every operation o
 The rules:
 
 1. Programs cannot create capabilities. They come only from `root`.
-2. Attenuation only narrows. `net.only(host)` returns a `Net` limited to that host, and it is empty if you didn't hold that host. `fs.under(dir)` limits to a subdirectory; `fs.read_only()` removes writing. `exec.only(program)` limits `Exec` to one program; `foreign.only(lib)` limits `Foreign` to one library.
+2. Attenuation only narrows. `net.only(host)` returns a `Net` limited to that host, and it is empty if you didn't hold that host. `fs.under(dir)` limits to a subdirectory; `fs.read_only()` removes writing. `exec.only(program)` limits `Exec` to one program (keeping any argument prefixes it was limited to), and `exec.only_args(program, prefixes)` to that program with arguments starting with one of `prefixes` (below); `foreign.only(lib)` limits `Foreign` to one library.
 3. There is no ambient I/O. Using `print`, `open`, `fetch` and similar names is error E0302, which explains the capability to use instead.
 4. A function whose parameters hold no capability (not even through a struct or enum field, below), no function type and no channel, `Atomic` or `Shared` is **pure**: it can only compute (and panic). `limen caps FILE` lists each function's authority. Section 14 says what the compiler does with pure calls. It never runs them in parallel on its own: concurrency stays visible and cancellable in a `group`, where you write it.
+
+   A function that would be pure but for parameters of function type is **pure if they are**, when all it does with them is call them or pass them on, as they are, to a function that is itself pure if they are: `fn my_map(xs: List[Int], f: fn(Int) -> Int) -> List[Int]` that only calls `f(x)`. A call of it is then a pure call when the functions it is given are pure: `my_map(xs, |x| x * 2)` is, `my_map(xs, |x| { out.print("{x}"); x })` is not. Storing such a parameter (in a list, a struct, a map), returning it, capturing it in a closure, sending it on a channel or running it as a task makes the function only "pure itself": its calls are never treated as pure. `limen caps` says `pure if f is` (`pure if f and g are`; `"pure_if": ["f", "g"]` in `--json`), and `pure itself, runs callbacks` for the others. A bound on a type parameter (`[T: Named]`) still counts as running callbacks.
 5. Enforcement at runtime:
    - `Net`: http and https URLs only, host allowlist, redirects not followed. `Net.connect` and `Net.connect_tls` use the same allowlist. TLS certificates are always verified (section 10).
-   - `Exec`: the program name must match a grant exactly (`git` and `/usr/bin/git` are different grants), or the grant is `*`. Arguments are passed as a list, never through a shell. The child gets `/dev/null` as stdin, the working directory, `PATH`, and only the environment variables granted with `--grant env=`. A program name without `/` is looked up in `PATH`, as a shell would. Granting a program grants everything that program can do with any arguments, so `exec=sh` is as good as every other grant.
+   - `Exec`: the program name must match a grant exactly (`git` and `/usr/bin/git` are different grants), or the grant is `*`. Arguments are passed as a list, never through a shell. The child gets `/dev/null` as stdin, the working directory, `PATH`, and only the environment variables granted with `--grant env=`. A program name without `/` is looked up in `PATH`, as a shell would. Granting a program grants everything that program can do with any arguments, so `exec=sh` is as good as every other grant, unless the grant limits the arguments.
+   - `Exec` argument prefixes: `--grant 'exec=git status|log|remote -v'` (or `exec.only_args("git", ["status", "log", "remote -v"])`) allows `git` only when its arguments start with one of the prefixes, compared word for word from the first argument: `git status --short` and `git remote -v` run, `git config core.sshCommand ...`, `git -c x=y status`, `git --upload-pack=... status`, `git statusx` and `git` alone are `Err(Denied("exec: `git` is not granted with these arguments"))`. A prefix is one or more words separated by spaces (so a word with a space in it cannot be part of one); no patterns, no shell. What follows a prefix is not checked, so grant the narrowest prefix that does the job: `git fetch` still takes `--upload-pack`. Narrowing keeps only what is held: `only_args` keeps the prefixes that start with one already granted (`"status --short"` under `status`), `only(program)` keeps the program's prefixes, and a grant of `*` cannot have prefixes. Exec has no knobs for the child's environment or directory beyond these, so there is nothing else to narrow.
    - `Listen`: binding is allowed only for granted `host` or `host:port` entries, with or without TLS.
    - `Fs`: paths are relative to the granted directory; absolute paths, `..` escapes and symlinks pointing outside are refused. That holds for both ends of a `rename`, and a read-only `Fs` refuses it, as it refuses every write.
    - `Foreign`: a call checks that the function's library is on the `Foreign` value's list (or the list holds `*`). C code runs with the whole process's authority, so granting a library grants everything that library can do; see below.
+
+### Revocation
+
+Authority can be lent and taken back. `x.revocable()`, on a `Net`, `Fs`, `Listen`, `Exec`, `Env` or `Foreign`, returns a copy of `x` and a `Revoker`, the switch that withdraws it:
+
+```
+let (fs2, off) = root.fs.revocable()
+plugin.run(fs2.under("plugin"))     // the plugin may keep it, in a task too
+off.revoke()                        // from here on, fs2 and everything made from it are dead
+```
+
+- `off.revoke()` withdraws the copy at once, and everything narrowed from it (`under`, `read_only`, `only`, `only_args`), in every task that holds it. Revoking twice does nothing; `off.is_revoked()` says whether it is revoked, its own switch or one it was made under.
+- After that, an operation with a `Result` gives `Err(Denied("fs: revoked"))` (`net:`, `listen:`, `exec:`); `Fs.exists` and `is_dir` give `false`, `is_read_only` gives `true`; `Env.get` gives `None`, as for a variable that is not granted; `Foreign.allows` gives `false`, and a foreign call or `foreign.copy` through it panics with `foreign: revoked`, as a call into an ungranted library does. Nothing a revoked capability did before is undone.
+- The `Listener`s and `Conn`s obtained through it (`on`, `accept`, `connect`, `connect_tls`) are closed when it is revoked, as `close()` closes them: a task waiting in `accept` or `read` wakes with `Err(Failed("listener is closed"))` or `"connection is closed"`, and so does every later use.
+- A revocable capability can be made revocable again: revoking the outer switch withdraws the inner copy too, not the other way round.
+- `Revoker` is a capability: a function taking one is not pure, and it has no equality, cannot be a map key or `dyn`, and prints as `<Revoker>`. No grant gives one and none is needed: only `revocable()` makes one, and it can only take authority away, so a dependency may take a `Revoker` whatever its `caps` say. `Stdout`, `Stderr`, `Stdin`, `Clock` and `Rand` are not revocable: they are always granted and their operations have no way to fail.
+
+The same in both backends: natively the switch is shared by the threads whose tasks hold the copy, and an operation checks it as it starts, so one already in progress when the switch goes off finishes (a socket's is cut short by the close).
 
 ### Capabilities in structs and enums
 
@@ -770,6 +791,7 @@ A type **holds** a capability when it contains one: written in it (`Net`, `List[
 - Such a function is never pure, so the compiler never reuses or keeps its calls (section 14), and a closure that captures such a value is not fused into a pipeline.
 - A dependency taking a `Client` is checked against its `caps` like one taking a `Net` (E0320): authority cannot cross into a dependency inside a struct.
 - A value holding a capability cannot become `dyn` (E0112), cannot be a map key (E0113) and cannot be compared with `==` or `!=` (E0201): capabilities have no equality, and neither does a value holding one. The built-ins that compare values refuse it the same way (E0201, naming the built-in and the path): `contains` on lists and arrays, `sort`, `chunk_by`'s keys, `list.index_of` and `assert_eq`; those bounded by `Ordered` or `Key` (`min`, `max`, `min_by`, `max_by`, `sort_by`, `distinct`, `distinct_by`, `group_by`, `count_by`, `tally`) refuse it as a type without order or a key (E0111). Compare something it holds that is not a capability instead, `xs.any(|x| x.name == name)`. Use a bounded type parameter, `[T: Named]`, to reach its methods through an interface.
+- Generic functions are held to the same rule where they are used. The compiler finds which type parameters each generic function compares: with `==` or `!=`, with the built-ins above, or by passing them on to another generic function that compares them (`fn same[U](a: U, b: U) -> Bool { eq([a], [b]) }` compares `U`). A use that gives such a parameter a type without equality, one holding a capability, a function, a channel or a `dyn` value, is E0201, naming the function, the parameter and the path: "`eq` compares values of `T`, and `Logger` holds capability `Stdout` through `Logger.out`". A parameter bounded by `Ordered` or `Key` is refused by its bound instead (E0111).
 - It is an ordinary value otherwise: built with a literal, updated with `with`, kept in lists and maps, matched, passed to tasks (each task gets its own copy; capabilities are shared safely between threads). It prints with its capabilities as `<Net>`, which cannot be turned back into one.
 
 Rule 1 still holds: a struct cannot make a capability, only carry one it was given.
@@ -787,6 +809,8 @@ foreign "sqlite3" {
 ```
 
 Calling one takes a `Foreign` capability first, then the other arguments: `sqlite3_libversion(root.foreign)`. Each call checks that the `Foreign` value grants the library (`--grant foreign=sqlite3`), and panics if not. So C is reachable only from code that was handed `Foreign`, `limen caps` lists such functions, and a package dependency can use a foreign block only if the program names it in `[trust] foreign = [...]` in limen.toml (section 18). The library name is the `-l` name: `foreign "sqlite3"` links `-lsqlite3` natively and loads `libsqlite3.dylib` (macOS) or `libsqlite3.so` in the interpreter; `foreign "c"` is the C library itself, which is always there. The function name is the C symbol, unless the declaration names another after its signature: `fn print_int(format: Str, ..., n: Int) -> Int32 = "printf"`. Declarations are one per line; `pub fn` exports one from a module.
+
+**Per library.** A `Foreign` grants a list of libraries, and narrows like the other capabilities: `root.foreign.only("z")` grants only `z` (and nothing if it did not hold `z`), so a function handed it can call the functions of `foreign "z"` blocks and of no other library. A foreign function belongs to its block's library, so where the checker can see what a `Foreign` was narrowed to, a call of another library's function is refused when compiling (E0333): `let z = root.foreign.only("z")` and then `sqlite3_open_v2(z, ...)`, or the same with `root.foreign.only("z")` written in the call. A variable bound with `let` (not `let mut`) keeps what it was narrowed to; a parameter, a field or a reassigned variable is checked at the call, as before. `limen caps` lists the libraries each function reaches with its `Foreign`, `Foreign (z, sqlite3)` (`"libs"` in `--json`): its own library for a foreign function, and for any other the libraries of the functions it uses that take a `Foreign`, however deep. A function that only copies memory (`foreign.copy`) shows `Foreign` alone.
 
 The types that cross the boundary:
 
@@ -871,11 +895,11 @@ Ownership at the boundary:
 The foreign grant is full trust, and Limen treats it that way:
 
 - Only the program grants it: `--grant foreign=LIB` or `[grants] foreign` in the program's own limen.toml. `limen run` prints a one-line warning whenever it is given, since nothing in Limen bounds what C code does; only the operating-system sandbox (below) still does.
-- It does not pass along: a dependency's `caps` cannot include `foreign`. A dependency may declare foreign blocks only when the program names it in `[trust]`, and limen.lock records the C libraries each trusted dependency uses (section 18).
+- It does not pass along: a dependency's `caps` cannot include `foreign`. A dependency may declare foreign blocks only when the program names it in `[trust]`, and limen.lock records the C libraries each trusted dependency uses (section 18). Its caps can also name the libraries it may reach, `caps = ["foreign=z"]`: then a foreign block of another library, or a function that reaches one through another dependency's function taking a `Foreign`, is E0320, naming the function and the library.
 - `limen check` lists every part of the program that calls C, one line each: the program's own files, trusted dependencies, and trusted standard library modules.
-- The standard library calls C only from modules that its manifest, src/std/limen.toml, trusts in the same way (`sql`). Their foreign functions are private to the module and take no `Foreign`, so a program using `sql` grants only an `Fs`; the module is what keeps SQLite inside that grant.
+- The standard library calls C only from modules that its manifest, src/std/limen.toml, trusts in the same way (`sql`, whose caps name its one library, `foreign=sqlite3`). Their foreign functions are private to the module and take no `Foreign`, so a program using `sql` grants only an `Fs`; the module is what keeps SQLite inside that grant.
 
-What the capability lets code do: anything the C functions it declares can do, with the program's full authority, outside every other capability's checks. Limen checks the declared types and the library grant; it cannot check that a declaration matches the C prototype, and a wrong one is undefined behaviour. Keep foreign blocks small, private to a module that wraps them in a safe Limen API (as the `sql` module does), and grant `foreign` only to programs and dependencies you trust.
+What the capability lets code do: anything the C functions it declares can do, with the program's full authority, outside every other capability's checks. Narrowing a `Foreign` to a library limits which library's declared functions Limen code may call; it does not limit what those functions do once called. C runs in the program's process: a C function of a granted library can read and change any of the program's memory, other libraries' and the runtime's included, call anything linked into the process, and so reach every capability the program holds. Only the operating-system sandbox (below) bounds it, and only to the program's grants as a whole. Limen checks the declared types and the library grant; it cannot check that a declaration matches the C prototype, and a wrong one is undefined behaviour. Keep foreign blocks small, private to a module that wraps them in a safe Limen API (as the `sql` module does), and grant `foreign` only to programs and dependencies you trust.
 
 Limits, the same in both backends: at most 8 integer-like (everything but `Float`, `Out` and callbacks included) and 8 `Float` values, each field of a struct by value counting as one; the variadic and callback limits above; structs of 1 to 8 scalar fields, not nested. A foreign function can only be called, not used as a value (E0331): wrap it in a closure. A C call not declared `blocking` holds its worker thread until it returns, like a busy loop; C libraries decide their own thread safety.
 
@@ -892,9 +916,9 @@ What the kernel enforces:
 | Writing files | under the `Fs` directory, unless it is read-only; the temporary directory if `Exec` is granted (Exec keeps a child's stderr there); `/dev/null` and the terminal |
 | Reading files | under the `Fs` directory; system locations (`/usr`, `/System`, `/Library`, `/etc`, `/dev`, Homebrew's prefix, ...: libraries, time zones, TLS certificates); the temporary directory with `Exec`. Not home directories, other users' files or anything else |
 | Network | nothing unless `Net` or `Listen` is granted; then any host |
-| Starting programs | only if `Exec` is granted. A started program inherits the sandbox: it can read system locations and the `Fs` directory, and list (not read) the directories above the current one, which shells need |
+| Starting programs | only if `Exec` is granted, and then (unless it is granted `*`) only the granted programs' files, resolved through `PATH` when the process starts, and programs in system locations (`/usr`, `/bin`, `/sbin`, `/System`, `/Library`, Homebrew's prefix, Xcode; `/usr`, `/bin`, `/sbin`, `/lib`, `/opt` on Linux), which the granted programs may start in turn: never a file written into the `Fs` directory or the temporary directory unless a grant names it. A started program inherits the sandbox: it can read system locations and the `Fs` directory, and list (not read) the directories above the current one, which shells need |
 
-What stays in Limen's own checks, not the kernel's: which hosts and ports `Net` and `Listen` allow (the kernel allows all networking once either is granted), which programs `Exec` may run, which variables `Env` shows, `Fs`'s refusal of `..` and absolute paths (the kernel sees only the resolved file), and everything inside the process: C code with the foreign grant can still read and corrupt the program's own memory, and through it every capability the program holds.
+What stays in Limen's own checks, not the kernel's: which hosts and ports `Net` and `Listen` allow (the kernel allows all networking once either is granted), which of the programs in system locations `Exec` may run and with which arguments, which variables `Env` shows, `Fs`'s refusal of `..` and absolute paths (the kernel sees only the resolved file), and everything inside the process: C code with the foreign grant can still read and corrupt the program's own memory, and through it every capability the program holds.
 
 How:
 
@@ -1135,7 +1159,7 @@ fn main(root: Root) -> Result[Int, IoError] {
 ```
 
 - `Exec.run(program, args)` runs `program` with the list `args`, waits for it to finish, and returns `Ok(ProcessOutput { code, stdout, stderr })` with its exit status and everything it wrote. A child killed by signal N has code 128 + N.
-- It is `Err(Denied(...))` if the program is not granted, and `Err(Failed(...))` if it cannot be started (for example, not found). A non-zero exit status is not an error; check `code`.
+- It is `Err(Denied(...))` if the program is not granted, or not with these arguments (argument prefixes, section 9), and `Err(Failed(...))` if it cannot be started (for example, not found). A non-zero exit status is not an error; check `code`.
 - Waiting for the child parks only the calling task, so a group can run several programs at once.
 
 ### HTTP
@@ -1366,6 +1390,7 @@ fn main(root: Root) {
 | `Net` | `connect_tls(addr)` | `Result[Conn, IoError]`, a TLS connection whose certificate was verified for `host` |
 | `Exec` | `run(program, args)` | `Result[ProcessOutput, IoError]`: `code`, `stdout`, `stderr` (section 10) |
 | `Exec` | `only(program)` | `Exec`; `program` is a name or `*` |
+| `Exec` | `only_args(program, prefixes)` | `Exec` for `program` with arguments starting with one of `prefixes` (`List[Str]`, each one or more words separated by spaces), those the value already allows (section 9) |
 | `Foreign` | `only(lib)` | `Foreign`; `lib` is a library name or `*` |
 | `Foreign` | `allows(lib)` | `Bool`: whether calls into `lib` are granted |
 | `Foreign` | `copy(p, n)` | `Bytes`: `n` bytes of C memory at `Handle` `p` (section 9) |
@@ -1388,6 +1413,9 @@ fn main(root: Root) {
 | `Fs` | `under(dir)`, `read_only()` | `Fs` |
 | `Fs` | `full_path(path)` | `Result[Str, IoError]`: the absolute path, checked as for writing (the file need not exist, its directory must), with the directory part resolved to its real path, for handing to C or another program |
 | `Fs` | `is_read_only()` | `Bool`; an ungranted `Fs` is read-only |
+| `Net`, `Fs`, `Listen`, `Exec`, `Env`, `Foreign` | `revocable()` | `(T, Revoker)`: a copy that the `Revoker` can withdraw (section 9) |
+| `Revoker` | `revoke()` | `()`: withdraws the copy, what was narrowed from it, and closes the sockets opened through it |
+| `Revoker` | `is_revoked()` | `Bool` |
 
 `Rand`'s numbers and bytes all come from the operating system's cryptographically secure generator (`arc4random_buf` on macOS, `getrandom` on Linux, `/dev/urandom` where that is missing), read a buffer at a time, so they are fit for secrets: keys, tokens, passwords, nonces, and `shuffle` or `choice` built on `int`. Natively `int` gives about 380 million numbers a second. With `--seed N` they come from a fast deterministic generator (splitmix64) seeded with `N` instead, the same stream in both backends, so a seeded run repeats: for tests and simulations, never for secrets. `int` maps a seeded number into the range by its remainder, and an unseeded one without bias, by drawing again when the number falls in the uneven part.
 
@@ -1496,9 +1524,9 @@ String interpolation and `to_str()` use these rules. At the top level a `Str` pr
 
 ## 14. Optimizations that affect observable behavior
 
-The native backend may run a chain like `xs.filter(p).map(f).fold(z, g)` as one fused loop, interleaving the stages per element. It does this only when the earlier stages are pure closure literals, which capture no capability (nor a value holding one, section 9) and no function. The only observable difference is **which panic happens first** when more than one stage would panic. Everything else (results, output order, values) is the same.
+The native backend may run a chain like `xs.filter(p).map(f).fold(z, g)` as one fused loop, interleaving the stages per element. It does this only when the earlier stages are pure closure literals, which capture no capability (nor a value holding one, section 9) and no function, except one held in a variable that is never reassigned and was given a pure closure literal or a top-level function (`let inc = |x| x + 1`, then `xs.map(|x| inc(x)).filter(...)`). The only observable difference is **which panic happens first** when more than one stage would panic. Everything else (results, output order, values) is the same.
 
-Other uses of purity change nothing a program can observe. A pure call (to a pure function, or a built-in method such as `split` or `to_upper`) gives the same result for the same arguments, so:
+Other uses of purity change nothing a program can observe. A pure call (to a pure function, or a built-in method such as `split` or `to_upper`, or to a function that is pure if its function arguments are, section 9, given closures made from pure functions: a closure literal capturing no capability and no function, or a top-level function) gives the same result for the same arguments, so:
 
 - **In a loop**, a pure call whose arguments do not change in the loop is made the first time it is reached, and later iterations reuse its result. A loop that runs zero times never makes the call, a call under an `if` runs only once the condition holds, and a call that panics or never returns does so at the same point as before.
 - **In a block**, a second call with the same arguments, where nothing they name was reassigned or changed in between, reuses the first call's result.
@@ -1551,13 +1579,14 @@ Every diagnostic has a stable code. `limen explain CODE` prints its explanation,
 | E0306 | a test parameter that is not `fs: Fs`, `clock: Clock` or `clock: virtual Clock`, or a bench that takes `virtual Clock` |
 | E0310 | misuse of a group handle |
 | E0311 | `return` or `?` leaving a group |
-| E0320 | a dependency takes a capability limen.toml does not grant it |
+| E0320 | a dependency takes a capability limen.toml does not grant it, or reaches a C library its caps do not name |
 | E0321 | malformed limen.toml, an embed root that is not a directory, or a dependency's limen.toml that declares embed roots |
 | E0322 | a git dependency could not be fetched |
 | E0323 | limen.lock does not match: a malformed line, or a dependency whose files changed |
 | E0324 | a trusted dependency calls a C library that limen.lock did not record |
 | E0330 | a foreign function signature with a type that cannot cross to C, too many parameters, or a bad library name |
 | E0331 | a foreign function used as a value instead of called |
+| E0333 | a foreign function given a `Foreign` narrowed with `only` to other libraries |
 | E0401 | module not found, or a qualified name without `use` |
 | E0402 | item is not `pub` |
 | E0403 | module has no such item |
@@ -1661,7 +1690,7 @@ upat       = "_" | IDENT | tuplepat ;
 
 - `limen fmt FILE` prints the canonical formatting (`--write` rewrites, `--check` verifies).
 - `limen lsp` is a language server (diagnostics, hover, definition, references, rename, completion, quick fixes, outline); `limen mcp` is an MCP server exposing check, run, test, format, caps, type-at, references, rename and the spec to coding agents. Rename is refused when it is unsafe: the renamed program must check with no new errors, and the new name must refer to exactly the renamed places.
-- `limen caps FILE` lists each function's authority, saying for a capability held through a struct or enum which field holds it (`Net (via Client.net)`); `limen explain CODE` explains an error.
+- `limen caps FILE` lists each function's authority, saying for a capability held through a struct or enum which field holds it (`Net (via Client.net)`), and for a function with no capability whether it is `pure`, `pure if f is` (section 9) or `pure itself, runs callbacks`; `limen explain CODE` explains an error.
 - `limen search`, `limen add` and `limen index entry` use the package index (section 18).
 - `limen doc FILE|MODULE... [--std] [--all] [--html] [-o OUT]` prints documentation built from doc comments (section 2) and signatures, as Markdown, or with `--html` as one static page. An argument that is not a file names a standard library module; `--std` documents all of them. It lists `pub` items (everything with `--all`); methods appear under their type, and methods on a type the module does not declare (such as `Str`) get their own section. Files are parsed, not type-checked.
 
@@ -1725,11 +1754,11 @@ yaml = { git = "git@example.com:me/yaml.git", commit = "3f9c2e1d7a" }
 roots = ["../assets"]
 ```
 
-- `[grants]` takes `net`, `fs`, `listen`, `env`, `exec` and `foreign`, each a string or a list of strings written exactly like the text after `--grant KIND=`. `fs` takes one directory, relative to limen.toml, with an optional `:ro`. Stdout, Stderr, Stdin, Clock and Rand are always granted, so listing them is an error. Flags on the command line add to these grants.
+- `[grants]` takes `net`, `fs`, `listen`, `env`, `exec` and `foreign`, each a string or a list of strings written exactly like the text after `--grant KIND=` (`exec = ["git status|log", "make"]`; an empty argument prefix or prefixes for `*` are E0321). `limen caps` lists them, narrowing included (`grant exec=git status|log`, `"grants"` in `--json`). `fs` takes one directory, relative to limen.toml, with an optional `:ro`. Stdout, Stderr, Stdin, Clock and Rand are always granted, so listing them is an error. Flags on the command line add to these grants.
 - Grants belong to the program being run: only the limen.toml found for the main file is read for them. A dependency's own limen.toml never grants anything, so adding or updating a dependency cannot widen what the program may do. A dependency gets capabilities in exactly one way: your code passes them to it, and only of the kinds its `caps` allow. `[grants]` decides what reaches `main`; `caps` decides which of those may cross into each dependency.
 - `[embed] roots` lists directories, relative to limen.toml, whose files the program's own files may `embed` besides those of its package (section 11). Each must exist and be a directory, links followed (E0321 otherwise). Like grants, they belong to the program: a dependency embeds only its own directory's files, and a dependency whose limen.toml has an `[embed]` table is E0321, though its limen.toml is otherwise never read. Embedding reads files at compile time, not at run time, so a root grants the program nothing when it runs; it only decides what can be built into it.
 - A dependency is a directory holding `NAME.lmn`, plus any modules that file uses from the same directory.
-- `caps` lists what the dependency may use: `net` (Net and Conn), `listen` (Listen, Listener and Conn), `fs`, `stdout`, `stderr`, `stdin`, `clock`, `rand`, `env`, `exec`. The default is none. No dependency can take `Root`, and `caps` cannot give `foreign` (E0321).
+- `caps` lists what the dependency may use: `net` (Net and Conn), `listen` (Listen, Listener and Conn), `fs`, `stdout`, `stderr`, `stdin`, `clock`, `rand`, `env`, `exec`. The default is none. No dependency can take `Root`, and `caps` cannot give `foreign` (E0321); for a dependency named in `[trust] foreign`, `"foreign=LIB"` (`"foreign=z,sqlite3"`) limits the C libraries it may reach (section 9).
 - `[trust] foreign = ["name", ...]` names the dependencies that may call C: declare foreign blocks and take `Foreign`. Calling C is full trust, since C code is outside every capability check, so it is a separate, explicit list rather than one more cap, and only the program's limen.toml can hold it. An untrusted dependency that calls C is E0320. limen.lock gets a line per trusted dependency that calls C, `foreign NAME LIB,LIB`, written on the first build; when an update makes the dependency declare a library the line does not have, the build stops (E0324) until you review it and delete the line.
 - Limen has no ambient authority, so a function can only use a capability that reaches it as a parameter. The checker therefore knows everything a dependency can ever do from its signatures, and rejects the program (E0320) if a dependency's function takes a capability it was not granted, counting those held by the structs and enums it takes (the note names the field, `through Ctx.fs`). Granting is still only an upper bound: at run time the dependency gets exactly the capabilities you pass it, which can be narrowed with `only` and `under`.
 - A dependency is a local directory (`path`) or a git repository (`git`) at a `tag` or a `commit` (lowercase hex, at least 7 characters). The URL is `https://`, `http://`, `ssh://`, `git://`, `file://` or `user@host:path`. No registry holds the code: the URL is the name of the source, and the package index (below) only points at URLs.

@@ -1,0 +1,12 @@
+// Calls only the libraries its caps name.
+foreign "m" {
+    fn cbrt(x: Float) -> Float
+}
+
+foreign "c" {
+    fn abs(x: Int32) -> Int32
+}
+
+pub fn root(f: Foreign, x: Float) -> Float {
+    cbrt(f, x) + abs(f, -1).to_float()
+}

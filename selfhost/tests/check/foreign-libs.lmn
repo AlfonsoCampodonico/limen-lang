@@ -1,0 +1,49 @@
+// A Foreign narrowed with `only` where the checker can see it refuses a
+// foreign function of another library (E0333); `limen caps` lists the C
+// libraries each function reaches with its Foreign.
+foreign "c" {
+    fn getpid() -> Int32
+    fn abs(n: Int32) -> Int32
+}
+
+foreign "m" {
+    fn cbrt(x: Float) -> Float
+}
+
+fn pid(c: Foreign) -> Int {
+    getpid(c)
+}
+
+fn both(c: Foreign) -> Float {
+    cbrt(c, 8.0) + pid(c).to_float()
+}
+
+fn raw(c: Foreign) -> Bytes {
+    c.copy(Handle { addr: 0 }, 0)
+}
+
+struct Ctx {
+    f: Foreign,
+}
+
+fn held(x: Ctx) -> Int {
+    pid(x.f)
+}
+
+fn main(root: Root) {
+    let c = root.foreign.only("c")
+    let m = root.foreign.only("m")
+    let none = c.only("m")
+    let star = root.foreign.only("*")
+    let ok = getpid(c) + abs(star, 1)
+    let bad = getpid(m)
+    let worse = cbrt(none, 1.0)
+    let inline = abs(root.foreign.only("m"), 1)
+    let c2 = c
+    let bad2 = cbrt(c2, 1.0)
+    let c = c.only("m")
+    let shadowed = getpid(c)
+    let mut v = root.foreign.only("m")
+    v = root.foreign
+    let unknown = getpid(v) + held(Ctx { f: v })
+}

@@ -284,7 +284,7 @@
       ]
     },
     "capability": {
-      "match": "\\b(Root|Net|Fs|Listen|Listener|Conn|Env|Exec|Foreign|Stdout|Stderr|Stdin|Clock|Rand)\\b",
+      "match": "\\b(Root|Net|Fs|Listen|Listener|Conn|Env|Exec|Foreign|Revoker|Stdout|Stderr|Stdin|Clock|Rand)\\b",
       "name": "support.type.capability.limen"
     },
     "type": {

@@ -104,9 +104,11 @@ pub fn methods(t: types.Ty, u: types.Ty) -> List[Method] {
 
 fn cap_methods(c: Str, io: types.Ty) -> List[Method] {
     let res = |t: types.Ty| types.res(t, io)
+    // `fs.revocable()`: the same authority, and a switch that withdraws it
+    let revocable = m("revocable", [], TNamed("#tuple2", [TCap(c), TCap("Revoker")]))
     match c {
-        "Net" => [m("get", [TStr], res(TNamed("HttpResponse", []))), m("only", [TStr], TCap("Net")), m("connect", [TStr], res(TCap("Conn"))), m("connect_tls", [TStr], res(TCap("Conn")))],
-        "Listen" => [m("on", [TStr], res(TCap("Listener"))), m("on_tls", [TStr, TStr, TStr], res(TCap("Listener")))],
+        "Net" => [m("get", [TStr], res(TNamed("HttpResponse", []))), m("only", [TStr], TCap("Net")), m("connect", [TStr], res(TCap("Conn"))), m("connect_tls", [TStr], res(TCap("Conn"))), revocable],
+        "Listen" => [m("on", [TStr], res(TCap("Listener"))), m("on_tls", [TStr, TStr, TStr], res(TCap("Listener"))), revocable],
         "Listener" => [m("accept", [], res(TCap("Conn"))), m("port", [], TInt), m("close", [], TUnit)],
         "Conn" => [m("read", [], res(TStr)), m("write", [TStr], res(TUnit)), m("close", [], TUnit)],
         "Fs" => [
@@ -124,14 +126,16 @@ fn cap_methods(c: Str, io: types.Ty) -> List[Method] {
             m("read_only", [], TCap("Fs")),
             m("rename", [TStr, TStr], res(TUnit)),
             m("info", [TStr], res(TNamed("FileInfo", []))),
+            revocable,
         ],
         "Stdout" | "Stderr" => [m("print", [TStr], TUnit), m("write", [TStr], TUnit)],
         "Clock" => [m("now_ms", [], TInt), m("sleep", [TInt], TUnit)],
         "Rand" => [m("int", [TInt, TInt], TInt), m("float", [], TFloat), m("bytes", [TInt], TBytes)],
         "Stdin" => [m("read_line", [], types.opt(TStr)), m("read_all", [], TStr)],
-        "Env" => [m("get", [TStr], types.opt(TStr))],
-        "Exec" => [m("run", [TStr, TList(TStr)], res(TNamed("ProcessOutput", []))), m("only", [TStr], TCap("Exec"))],
-        "Foreign" => [m("only", [TStr], TCap("Foreign")), m("allows", [TStr], TBool), m("copy", [TNamed("Handle", []), TInt], TBytes)],
+        "Env" => [m("get", [TStr], types.opt(TStr)), revocable],
+        "Exec" => [m("run", [TStr, TList(TStr)], res(TNamed("ProcessOutput", []))), m("only", [TStr], TCap("Exec")), m("only_args", [TStr, TList(TStr)], TCap("Exec")), revocable],
+        "Foreign" => [m("only", [TStr], TCap("Foreign")), m("allows", [TStr], TBool), m("copy", [TNamed("Handle", []), TInt], TBytes), revocable],
+        "Revoker" => [m("revoke", [], TUnit), m("is_revoked", [], TBool)],
         "Root" => [m("args", [], TList(TStr))],
         _ => [],
     }
@@ -166,11 +170,11 @@ pub fn root_fields() -> List[(Str, types.Ty)] {
 }
 
 pub fn type_names() -> List[Str] {
-    ["Int", "Float", "Bool", "Str", "Bytes", "List", "Array", "Chan", "Atomic", "Shared", "Root", "Net", "Fs", "Stdout", "Stderr", "Clock", "Listen", "Listener", "Conn", "Rand", "Stdin", "Env", "Exec", "Foreign", "Map"]
+    ["Int", "Float", "Bool", "Str", "Bytes", "List", "Array", "Chan", "Atomic", "Shared", "Root", "Net", "Fs", "Stdout", "Stderr", "Clock", "Listen", "Listener", "Conn", "Rand", "Stdin", "Env", "Exec", "Foreign", "Revoker", "Map"]
 }
 
 pub fn cap_names() -> List[Str] {
-    ["Root", "Net", "Fs", "Stdout", "Stderr", "Clock", "Listen", "Listener", "Conn", "Rand", "Stdin", "Env", "Exec", "Foreign"]
+    ["Root", "Net", "Fs", "Stdout", "Stderr", "Clock", "Listen", "Listener", "Conn", "Rand", "Stdin", "Env", "Exec", "Foreign", "Revoker"]
 }
 
 // Built-in bounds with no methods: `Ordered` (the type has `<`) and `Key`

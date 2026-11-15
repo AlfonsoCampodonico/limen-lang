@@ -2,7 +2,7 @@
 Edit this file, not the JSON: run `python3 tools/build-grammar.py`."""
 import json, os
 
-CAPS = "Root|Net|Fs|Listen|Listener|Conn|Env|Exec|Foreign|Stdout|Stderr|Stdin|Clock|Rand"
+CAPS = "Root|Net|Fs|Listen|Listener|Conn|Env|Exec|Foreign|Revoker|Stdout|Stderr|Stdin|Clock|Rand"
 ID = r"[A-Za-z_][A-Za-z0-9_]*"
 LOWER = r"[a-z_][A-Za-z0-9_]*"
 

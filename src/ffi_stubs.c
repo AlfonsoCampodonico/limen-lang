@@ -538,14 +538,16 @@ value limen_ffi_peek(value p, value n) {
 /* The interpreter's way into the operating-system sandbox (limen_sandbox.h),
    entered by `limen run` once the program is loaded and its granted foreign
    libraries are resolved, before main starts.
-   limen_sandbox_enter : string -> bool -> bool -> bool -> int
-   (fs root or "", read-only, net, exec) -> 0 enforced, 1 unsupported here;
-   raises Failure with the reason if it could not be entered. */
+   limen_sandbox_enter : string -> bool -> bool -> string -> int
+   (fs root or "", read-only, net, the programs Exec names one per line or
+   "") -> 0 enforced, 1 unsupported here; raises Failure with the reason if
+   it could not be entered. */
 #include <caml/fail.h>
 #include "runtime/limen_sandbox.h"
 value limen_sandbox_enter(value root, value ro, value net, value exec) {
   CAMLparam4(root, ro, net, exec);
-  WSandboxSpec s = { caml_string_length(root) ? String_val(root) : NULL, Bool_val(ro), Bool_val(net), Bool_val(exec) };
+  int has_exec = caml_string_length(exec) > 0;
+  WSandboxSpec s = { caml_string_length(root) ? String_val(root) : NULL, Bool_val(ro), Bool_val(net), has_exec, has_exec ? String_val(exec) : NULL };
   char err[512];
   int rc = w_sandbox_enter(&s, err, sizeof err);
   if (rc < 0) caml_failwith(err);
