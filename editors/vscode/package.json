@@ -5,7 +5,7 @@
   "version": "0.1.0",
   "publisher": "limen-local",
   "private": true,
-  "license": "UNLICENSED",
+  "license": "MIT OR Apache-2.0",
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -124,7 +124,7 @@
     }
   },
   "scripts": {
-    "package": "vsce package --allow-missing-repository --skip-license -o limen.vsix",
+    "package": "vsce package --allow-missing-repository -o limen.vsix",
     "test": "node test/grammar.test.js"
   },
   "dependencies": {

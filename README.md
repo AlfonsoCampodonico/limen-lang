@@ -105,5 +105,15 @@ AddressSanitizer, and the concurrent ones under ThreadSanitizer too.
 
 What's still missing is in [ROADMAP.md](ROADMAP.md).
 
+## Licence
+
+Limen is licensed under either of the [Apache License, Version 2.0](LICENSE-APACHE)
+or the [MIT license](LICENSE-MIT), at your option. That covers the runtime and
+the standard library too, which end up inside every program Limen builds, so
+your programs are yours to license however you like.
+
+Unless you say otherwise, any contribution you submit for inclusion in Limen is
+licensed the same way, with no additional terms.
+
 Limen is Latin for threshold: the line you cross only if you're let in. It was
 called Writ, then Vela, then Tessera, before it found its name.
