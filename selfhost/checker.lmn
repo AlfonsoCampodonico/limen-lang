@@ -516,12 +516,6 @@ fn instantiate(st: env.State, s: env.Sig) -> (List[(Str, types.Ty)], types.Ty, e
     (inst, TFn(s.params.map(|p| st.subst(inst, p)), st.subst(inst, s.ret)), st)
 }
 
-// The generic built-ins that compare the values of a type parameter with
-// `==`: the function, the parameter, and the name to report.
-fn comparing_generics() -> List[(Str, Str, Str)] {
-    [("List::chunk_by", "K", "chunk_by"), ("list.index_of", "T", "index_of"), ("std/list.index_of", "T", "index_of")]
-}
-
 // E0201 when built-in `name` compares values of type `t` that have no
 // equality: functions, channels, `dyn` values, capabilities, and values
 // holding a capability, as `==` refuses them.
@@ -539,15 +533,8 @@ pub fn refuse_compare(st: env.State, sp: ast.Span, name: Str, t: types.Ty) -> en
 // The bounds of generic function `name` apply to its type arguments here.
 fn add_bounds(st: env.State, cx: env.Cx, name: Str, inst: List[(Str, types.Ty)], sp: ast.Span) -> env.State {
     let mut st = st
-    for (f, g, shown) in comparing_generics() {
-        if f == name {
-            match inst.find(|p| p.0 == g) {
-                Some((_, t)) => {
-                    st.compared = [(sp, t, shown)] + st.compared
-                },
-                None => {},
-            }
-        }
+    if !inst.is_empty() {
+        st.uses_here = [(sp, name, inst)] + st.uses_here
     }
     for b in cx.fn_bounds.get(name) ?? [] {
         match inst.find(|p| p.0 == b.param) {
@@ -833,7 +820,11 @@ fn builtin_call(st: env.State, cx: env.Cx, fx: env.Fx, n: Str, args: List[ast.Ex
                     let next = expect(next, cx, fx, b, t)
                     match next.repr(t) {
                         TFn(..) | TCap(_) | TChan(_) | TDyn(..) => next.report(diag.error("E0201", sp, "values of type `{next.show(t)}` cannot be compared")),
-                        _ => refuse_compare(next, sp, "assert_eq", t),
+                        _ => {
+                            let mut next = next
+                            next.eq_types = [t] + next.eq_types
+                            refuse_compare(next, sp, "assert_eq", t)
+                        },
                     }
                 },
                 _ => wrong(st, "`assert_eq` takes 2 arguments"),
@@ -1996,13 +1987,17 @@ fn check_bin(st: env.State, cx: env.Cx, fx: env.Fx, op: ast.BinOp, a: ast.Expr, 
                     _ => (TErr, bad(st)),
                 },
                 Lt | Le | Gt | Ge => (TBool, if unordered(st, cx, t).is_some() { bad(st) } else { st }),
-                _ => match t {
-                    TFn(..) | TCap(_) | TChan(_) | TDyn(..) => (TBool, bad(st)),
-                    // capabilities have no equality, so neither has a value holding one
-                    _ => match st.held(t) {
-                        Some(h) => (TBool, st.report(diag.error("E0201", sp, "operator `{op_name(op)}` cannot be applied to `{st.show(t)}`").note(h + ", and capabilities cannot be compared"))),
-                        None => (TBool, st),
-                    },
+                _ => {
+                    let mut st = st
+                    st.eq_types = [t] + st.eq_types
+                    match t {
+                        TFn(..) | TCap(_) | TChan(_) | TDyn(..) => (TBool, bad(st)),
+                        // capabilities have no equality, so neither has a value holding one
+                        _ => match st.held(t) {
+                            Some(h) => (TBool, st.report(diag.error("E0201", sp, "operator `{op_name(op)}` cannot be applied to `{st.show(t)}`").note(h + ", and capabilities cannot be compared"))),
+                            None => (TBool, st),
+                        },
+                    }
                 },
             }
         },

@@ -1771,8 +1771,24 @@ fn main(root: Root) {
   errs "held-contains-late" (holders ^ "fn main(root: Root) {\n" ^ mk ^ "    let xs = []\n    let b = xs.contains(c)\n}\n") [ "E0201" ];
   errs "held-contains-fn" "fn main() {\n    let b = [|| 1].contains(|| 2)\n}\n" [ "E0201" ];
   says "held-index-of" ("use list\n\n" ^ holders ^ "fn main(root: Root) {\n" ^ mk ^ "    let i = list.index_of([c], c)\n}\n") "E0201"
-    "`index_of` compares values, and `Client` holds capability `Net` through `Client.net`";
-  says "held-chunk-by" (holders ^ "fn main(root: Root) {\n" ^ mk ^ "    let g = [c].chunk_by(|x| x)\n}\n") "E0201" "`chunk_by` compares values";
+    "`list.index_of` compares values of `T`, and `Client` holds capability `Net` through `Client.net`";
+  says "held-chunk-by" (holders ^ "fn main(root: Root) {\n" ^ mk ^ "    let g = [c].chunk_by(|x| x)\n}\n") "E0201" "`chunk_by` compares values of `K`";
+  (* generic functions that compare a type parameter refuse a type
+     argument without equality, at the use, transitively *)
+  let eqf = "fn eq[T](a: T, b: T) -> Bool {\n    a == b\n}\n\nfn same[U](a: U, b: U) -> Bool {\n    eq([a], [b])\n}\n\nfn first[T](a: T, b: T) -> T {\n    a\n}\n\nfn has[T](xs: List[T], x: T) -> Bool {\n    xs.contains(x)\n}\n\nfn ne[T](a: T, b: T) -> Bool {\n    a != b\n}\n\nfn sorted[T: Ordered](xs: List[T]) -> List[T] {\n    xs.sort()\n}\n\n" in
+  says "generic-eq" (holders ^ eqf ^ "fn main(root: Root) {\n" ^ mk ^ "    let b = eq(c, c)\n}\n") "E0201"
+    "`eq` compares values of `T`, and `Client` holds capability `Net` through `Client.net`";
+  says "generic-eq-transitive" (holders ^ eqf ^ "fn main(root: Root) {\n" ^ mk ^ "    let b = same(c, c)\n}\n") "E0201"
+    "`same` compares values of `U`, and `Client` holds capability `Net` through `Client.net`";
+  says "generic-eq-fn" (eqf ^ "fn main() {\n    let f = || 1\n    let b = eq(f, f)\n}\n") "E0201"
+    "`eq` compares values of `T`, and values of type `fn() -> Int` cannot be compared";
+  says "generic-eq-chan" (eqf ^ "fn main() {\n    let c: Chan[Int] = channel(1)\n    let b = ne(c, c)\n}\n") "E0201" "`ne` compares values of `T`";
+  says "generic-contains" (holders ^ eqf ^ "fn main(root: Root) {\n    let b = has([root.stdout], root.stdout)\n}\n") "E0201"
+    "`has` compares values of `T`, and values of type `Stdout` cannot be compared";
+  says "generic-eq-dyn" (holders ^ eqf ^ "fn main(root: Root) {\n    let d: dyn Named = Box { item: 1 }\n    let b = eq(d, d)\n}\n") "E0201" "values of type `dyn Named` cannot be compared";
+  errs "generic-eq-ok" (holders ^ eqf ^ "fn main(root: Root) {\n" ^ mk ^ "    let a = eq(1, 2)\n    let b = same(\"x\", \"y\")\n    let d = first(c, c)\n    let e = has([Box { item: 1 }], Box { item: 2 })\n}\n") [];
+  errs "generic-ordered-once" (holders ^ eqf ^ "fn main(root: Root) {\n" ^ mk ^ "    let s = sorted([c])\n}\n") [ "E0111" ];
+  errs "generic-method-eq" (holders ^ "struct Bag[T] {\n    items: List[T],\n}\n\nfn has[T](self: Bag[T], x: T) -> Bool {\n    self.items.any(|y| y == x)\n}\n\nfn main(root: Root) {\n" ^ mk ^ "    let b = Bag { items: [c] }.has(c)\n}\n") [ "E0201" ];
   errs "held-chunk-by-ok" (holders ^ "fn main(root: Root) {\n" ^ mk ^ "    let g = [c].chunk_by(|x| x.name)\n}\n") [];
   says "held-sort" (holders ^ "fn main(root: Root) {\n    let s = [Sink.Nowhere].sort()\n}\n") "E0201"
     "`sort` compares values, and `Sink` holds capability `Stdout` through `Sink.ToOut`";

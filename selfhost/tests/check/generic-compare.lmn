@@ -1,0 +1,91 @@
+// A generic function that compares values of a type parameter (`==`,
+// `!=`, `assert_eq`, `contains`, or a generic function that does) refuses
+// a type argument without equality where it is used (E0201): one holding
+// a capability, a function, a channel or a `dyn` value. Bounded by
+// `Ordered`, the bound refuses it instead (E0111), once.
+use list
+
+struct Logger {
+    out: Stdout,
+}
+
+struct Bag[T] {
+    items: List[T],
+}
+
+interface Named {
+    fn label(self) -> Str
+}
+
+fn label(self: Logger) -> Str {
+    "log"
+}
+
+fn eq[T](a: T, b: T) -> Bool {
+    a == b
+}
+
+fn ne[A, B](a: A, b: B, c: B) -> Bool {
+    b != c
+}
+
+fn same[U](a: U, b: U) -> Bool {
+    eq([Some(a)], [Some(b)])
+}
+
+fn deep[V](a: V) -> Bool {
+    same((a, 1), (a, 2))
+}
+
+fn first[T](a: T, b: T) -> T {
+    a
+}
+
+fn has[T](self: Bag[T], x: T) -> Bool {
+    self.items.any(|y| y == x)
+}
+
+fn member[T](xs: List[T], x: T) -> Bool {
+    xs.contains(x) || list.index_of(xs, x).is_some()
+}
+
+fn sorted[T: Ordered](xs: List[T]) -> List[T] {
+    xs.sort()
+}
+
+fn rec[T](n: Int, a: T) -> Bool {
+    if n == 0 { false } else { rec(n - 1, a) || eq(n, n) }
+}
+
+fn main(root: Root) {
+    let l = Logger { out: root.stdout }
+    let f = || 1
+    let c: Chan[Int] = channel(1)
+    let d: dyn Named = l
+    let a = eq(l, l)
+    let b = eq(f, f)
+    let e = eq(c, c)
+    let g = eq(d, d)
+    let h = ne(l, 1, 2)
+    let i = ne(1, l, l)
+    let j = same(l, l)
+    let k = deep(root.net)
+    let m = first(l, l)
+    let n = Bag { items: [l] }.has(l)
+    let o = member([root.fs], root.fs)
+    let p = sorted([l])
+    let q = rec(3, l)
+    let r = eq(1, 2) && same("a", "b") && deep(1.5)
+}
+
+test "assert_eq" {
+    assert_eq(1, 1)
+}
+
+fn check_eq[T](a: T) {
+    assert_eq(a, a)
+}
+
+fn use_check(root: Root) {
+    check_eq(root.clock)
+}

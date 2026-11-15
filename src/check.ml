@@ -389,16 +389,42 @@ let map_keys : (Span.t * ty) list ref = ref []
    authority, as with `==`. *)
 let compared : (Span.t * ty * string) list ref = ref []
 
-(* The generic built-ins that compare the values of a type parameter with
-   `==`: the function, the parameter, and the name to report. *)
-let comparing_generics = [ ("List::chunk_by", "K", "chunk_by"); ("list.index_of", "T", "index_of"); ("std/list.index_of", "T", "index_of") ]
+(* Which type parameters each generic function compares (`==`, `!=`, and
+   the built-ins that compare), found from the bodies: the types compared
+   in the function being checked, the generic functions it uses with their
+   type arguments, and, once every body is checked, the parameters each
+   function compares itself and through the generic functions it calls. A
+   use whose type argument has no equality is then refused (E0201). *)
+let cur_fn = ref ""
+let eq_types : ty list ref = ref []
+let uses_here : (Span.t * string * (string * ty) list) list ref = ref []
+let compares_direct : (string, string list) Hashtbl.t = Hashtbl.create 16
+let generic_uses : (string * Span.t * string * (string * ty) list) list ref = ref []
+
+let rec params_in acc t =
+  match repr t with
+  | TParam g -> if List.mem g acc then acc else acc @ [ g ]
+  | TList a | TChan a | TGroup a -> params_in acc a
+  | TArray (a, n) -> params_in (params_in acc a) n
+  | TMap (k, v) -> params_in (params_in acc k) v
+  | TFn (ps, r) -> params_in (List.fold_left params_in acc ps) r
+  | TNamed (_, xs) | TDyn (_, xs) -> List.fold_left params_in acc xs
+  | _ -> acc
+
+let rec resolved t =
+  match repr t with
+  | TList a -> TList (resolved a)
+  | TChan a -> TChan (resolved a)
+  | TGroup a -> TGroup (resolved a)
+  | TArray (a, n) -> TArray (resolved a, resolved n)
+  | TMap (k, v) -> TMap (resolved k, resolved v)
+  | TFn (ps, r) -> TFn (List.map resolved ps, resolved r)
+  | TNamed (n, xs) -> TNamed (n, List.map resolved xs)
+  | TDyn (i, xs) -> TDyn (i, List.map resolved xs)
+  | t -> t
 
 let add_bounds fname env sp =
-  List.iter
-    (fun (fn, g, name) ->
-      if fn = fname then
-        match List.assoc_opt g env with Some t -> compared := (sp, t, name) :: !compared | None -> ())
-    comparing_generics;
+  if env <> [] then uses_here := (sp, fname, env) :: !uses_here;
   match Hashtbl.find_opt fn_bounds fname with
   | None -> ()
   | Some bs ->
@@ -1118,7 +1144,7 @@ and check_call ?want ctx f e callee args sp =
        expect ctx f b t;
        match repr t with
        | TFn _ | TCap _ | TChan _ | TDyn _ -> err ctx "E0201" sp (sprintf "values of type `%s` cannot be compared" (show t))
-       | _ -> refuse_compare ctx sp "assert_eq" t)
+       | _ -> eq_types := t :: !eq_types; refuse_compare ctx sp "assert_eq" t)
      | _ -> err ctx "E0107" sp "`assert_eq` takes 2 arguments"; check_args ctx f args);
     TUnit
   | EVar "keep" when not (is_local f "keep") && not (Hashtbl.mem ctx.fns "keep") ->
@@ -1754,6 +1780,7 @@ and check_bin ctx f op a b sp =
     | Mod | BitAnd | BitOr | BitXor | Shl | Shr -> (match t with TInt | TErr | TVar _ -> t | _ -> bad (); TErr)
     | Lt | Le | Gt | Ge -> (match unordered ctx t with None -> () | Some _ -> bad ()); TBool
     | _ ->
+      eq_types := t :: !eq_types;
       (match t with
        | TFn _ | TCap _ | TChan _ | TDyn _ -> bad ()
        | _ -> (
@@ -2569,6 +2596,13 @@ let check_pending ctx =
     !map_keys;
   map_keys := [];
   List.iter (fun (sp, t, name) -> refuse_compare ctx sp name t) (List.rev !compared);
+  if !cur_fn <> "" then begin
+    let ps = List.fold_left params_in [] (List.rev_map (fun (_, t, _) -> t) !compared @ List.rev !eq_types) in
+    if ps <> [] then Hashtbl.replace compares_direct !cur_fn ps;
+    List.iter (fun (sp, g, env) -> generic_uses := (!cur_fn, sp, g, List.map (fun (p, t) -> (p, resolved t)) env) :: !generic_uses) (List.rev !uses_here)
+  end;
+  eq_types := [];
+  uses_here := [];
   compared := [];
   let ps = List.rev !pending in
   pending := [];
@@ -2639,7 +2673,10 @@ let check_fn ctx (d : fn_decl) (s : fsig) =
   to_infer := [];
   map_keys := [];
   compared := [];
-  Fun.protect ~finally:(fun () -> check_pending ctx) @@ fun () ->
+  eq_types := [];
+  uses_here := [];
+  cur_fn := d.fn_name;
+  Fun.protect ~finally:(fun () -> check_pending ctx; cur_fn := "") @@ fun () ->
   let genv = List.map (fun g -> (g, TParam g)) d.fn_gen in
   let scope = { vars = Hashtbl.create 8; barrier = false } in
   List.iter2
@@ -2697,6 +2734,53 @@ let check_self ctx d ps =
 
 let case_note = "in the table case "
 
+(* Which type parameters each generic function compares, itself or through
+   the generic functions it calls, until nothing changes; then E0201 at
+   every use that gives such a parameter a type without equality. A
+   parameter bounded by `Ordered` or `Key` is refused by its bound. *)
+let refuse_compared_params ctx =
+  let compares = Hashtbl.copy compares_direct in
+  let uses = List.rev !generic_uses in
+  let of_fn g = Option.value ~default:[] (Hashtbl.find_opt compares g) in
+  let changed = ref true in
+  while !changed do
+    changed := false;
+    List.iter
+      (fun (caller, _, g, env) ->
+        let more = List.fold_left (fun acc p -> match List.assoc_opt p env with Some t -> params_in acc t | None -> acc) [] (of_fn g) in
+        let have = of_fn caller in
+        let fresh = List.filter (fun p -> not (List.mem p have)) more in
+        if fresh <> [] then begin
+          Hashtbl.replace compares caller (have @ fresh);
+          changed := true
+        end)
+      uses
+  done;
+  let bounded g p =
+    List.exists
+      (fun (q, bs) -> q = p && List.exists (fun (i, _) -> i = "Ordered" || i = "Key") bs)
+      (Option.value ~default:[] (Hashtbl.find_opt fn_bounds g))
+  in
+  let shown g = match Interp_util.find_sub g "::" 0 with Some i -> String.sub g (i + 2) (String.length g - i - 2) | None -> g in
+  List.iter
+    (fun (_, sp, g, env) ->
+      List.iter
+        (fun p ->
+          match List.assoc_opt p env with
+          | Some t when not (bounded g p) -> (
+            let what = sprintf "`%s` compares values of `%s`" (shown g) p in
+            match t with
+            | TFn _ | TCap _ | TChan _ | TDyn _ -> err ctx "E0201" sp (sprintf "%s, and values of type `%s` cannot be compared" what (show t))
+            | _ -> (
+              match held t with
+              | Some h ->
+                err ctx "E0201" sp (sprintf "%s, and %s" what h)
+                  ~notes:[ "capabilities have no equality, so neither has a value holding one; compare something it holds that is not a capability, as in `xs.any(|x| x.name == name)`" ]
+              | None -> ()))
+          | _ -> ())
+        (of_fn g))
+    uses
+
 let check_program (user_items : item list) : Diag.t list * fn_info list =
   let ctx =
     { structs = Hashtbl.create 16; enums = Hashtbl.create 16; sfields = Hashtbl.create 16;
@@ -2707,6 +2791,8 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
   Hashtbl.reset used_methods;
   Hashtbl.reset foreign_fns;
   Hashtbl.reset reported_bounds;
+  Hashtbl.reset compares_direct;
+  generic_uses := [];
   fn_extents :=
     List.filter_map
       (function IFn d -> Some (d.fn_span.Span.file, d.fn_span.lo, max d.fn_span.hi d.fn_body.bspan.hi) | _ -> None)
@@ -3019,6 +3105,7 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
     end
   in
   more ();
+  refuse_compared_params ctx;
   let diags =
     List.sort
       (fun (a : Diag.t) (b : Diag.t) -> compare (a.span.file, a.span.lo) (b.span.file, b.span.lo))
