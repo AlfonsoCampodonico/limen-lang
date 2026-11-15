@@ -7981,6 +7981,67 @@ fn main(root: Root) {
           ok name (code = 0 && o = "Ok(\"granted\")\nrefused -1\nrefused -1\n") (sprintf "%d %S %S" code o e))
         [ ("sandbox-exec-written-interp", []); ("sandbox-exec-written-native", [ "--native" ]) ];
       ignore (Sys.command ("rm -rf " ^ Filename.quote base)));
+  (* which system directories stay sealed (start programs inside a writable
+     Fs directory): the predicate itself, from the runtime's own text, on
+     directories the test owns (never sealed: not root's) and on system ones.
+     Nothing is sealed for root. *)
+  (let rt = Runtime_text.text in
+   let marker = "/* Limen C runtime. Included verbatim" in
+   let rec find i = if String.sub rt i (String.length marker) = marker then i else find (i + 1) in
+   let sdir = Filename.concat pdir "sealed" in
+   List.iter (fun d -> try Unix.mkdir d 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ()) [ sdir; Filename.concat sdir "tree"; Filename.concat sdir "tree/sub" ];
+   Out_channel.with_open_bin (Filename.concat sdir "tree/sub/file") (fun oc -> output_string oc "x");
+   (try Unix.symlink "/usr/bin" (Filename.concat sdir "link") with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+   Out_channel.with_open_bin (Filename.concat sdir "sb.h") (fun oc -> output_string oc (String.sub rt 0 (find 0)));
+   Out_channel.with_open_bin (Filename.concat sdir "drv.c")
+     (fun oc ->
+       output_string oc
+         {|#include "sb.h"
+int main(int argc, char **argv) {
+  for (int i = 1; i + 2 < argc; i += 3) {
+    char *rw[2] = { argv[i + 2][0] ? argv[i + 2] : NULL, NULL };
+    int r = argv[i][0] == 'c' ? w_sb_chain(argv[i + 1]) : argv[i][0] == 't' ? w_sb_tree(argv[i + 1]) : 0;
+    if (argv[i][0] == 's') { char *s = w_sb_sealed(argv[i + 1], rw); r = s != NULL; free(s); }
+    printf("%d", r);
+  }
+  printf("\n");
+  return 0;
+}
+|});
+   let drv = Filename.concat sdir "drv" in
+   let built = Sys.command (sprintf "%s -o %s %s 2>/dev/null" (Native.cc ()) (Filename.quote drv) (Filename.quote (Filename.concat sdir "drv.c"))) = 0 in
+   ok "sandbox-sealed-build" built "cannot build the sealed-directory driver";
+   if built then begin
+     let real = Unix.realpath sdir in
+     let tree = Filename.concat real "tree" in
+     let root = Unix.geteuid () = 0 || Unix.getuid () = 0 in
+     let macos = Sys.file_exists "/System/Library/CoreServices" in
+     (* (mode, path, writable directory, expected) *)
+     let cases =
+       [ ("chain", "/", "", not root);
+         ("chain", "/usr/bin", "", not root);
+         ("chain", tree, "", false); (* the test's own *)
+         ("chain", Filename.concat tree "sub", "", false);
+         ("chain", Filename.concat real "link", "", false); (* a link of the test's own, to a sealed directory *)
+         ("tree", tree, "", false); (* holds files of the test's own *)
+         ("sealed", "/usr/bin", tree, not root); (* no writable directory holds it: no walk *)
+         ("sealed", tree, real, false);
+         ("sealed", Filename.concat real "link", "", false);
+         ("sealed", "/usr/bin", "/usr/bin/x", false) (* holds a writable directory *) ]
+       @ (if macos then
+            [ ("chain", "/Applications", "", false); (* group admin may write it *)
+              ("sealed", "/Applications/Xcode.app", "/", false);
+              ("sealed", "/usr/bin", "/", not root) (* read-only system volume *) ]
+          else [])
+     in
+     let args = List.concat_map (fun (m, p, w, _) -> [ m; p; w ]) cases in
+     let ic = Unix.open_process_args_in drv (Array.of_list (drv :: args)) in
+     let got = try String.trim (input_line ic) with End_of_file -> "" in
+     ignore (Unix.close_process_in ic);
+     let want = String.concat "" (List.map (fun (_, _, _, e) -> if e then "1" else "0") cases) in
+     ok "sandbox-sealed" (got = want)
+       (sprintf "got %s, want %s for %s" got want (String.concat "; " (List.map (fun (m, p, w, _) -> sprintf "%s %s [%s]" m p w) cases)))
+   end);
   (* without Net, Listen or Exec, the sandbox also refuses the ways out that
      are not files: another program's Unix socket (here a listener of the
      test's own, which could as well be a Docker daemon or an ssh-agent),

@@ -20,10 +20,11 @@
      Fs or temporary directory, even when that directory is inside a system
      location (on Linux that whole system location then stops starting
      programs) or holds one (`fs=/`): there only the OS's own program
-     directories, which a process that is not root cannot write, still
-     start programs. A program started through Exec inherits the same
-     restrictions; it may also list (not read) the directories above
-     the current one, as shells do.
+     directories still start programs, when this process cannot act as root
+     and no one but root can change them, the directories above them or
+     anything inside them (see w_sb_sealed). A program started through Exec
+     inherits the same restrictions; it may also list (not read) the
+     directories above the current one, as shells do.
    macOS also refuses Apple events and LaunchServices opens, so the process
    cannot have another application act for it. It still reaches the system's
    Mach services, as every process does; seccomp on Linux refuses x32 system
@@ -51,7 +52,11 @@
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <dirent.h>
+#include <limits.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 
 typedef struct {
   const char *fs_root; /* realpath of the Fs grant, or NULL */
@@ -121,15 +126,131 @@ static int w_sb_within(const char *a, const char *dir) {
 }
 
 /* System directories that start programs even inside a writable Fs
-   directory (`fs=/`, say), since no grant makes them writable: those of
-   the OS or its package manager, root's own and writable by no one else,
-   with no writable directory inside them, and only for a process that is
-   not root. Returns the real path (free it), or NULL. */
+   directory (`fs=/`, say), since nothing this process does can change
+   them: the OS's own, for a process that is not root and cannot write what
+   it does not own.
+
+   A directory is sealed only when no one but root can change what lies at
+   its path: it and every directory above it up to `/` (on the path as named,
+   where a symbolic link must be root's too, and on its real path) are owned
+   by root, writable by neither group nor others, and not writable by this
+   process (an ACL could allow that). When a writable directory holds it,
+   the program could also write anything inside it that is writable, so then,
+   unless its file system is mounted read-only, everything inside it is
+   checked the same way (files, directories and links, without following
+   links or leaving its file system), up to W_SB_WALK_MAX entries. Whatever
+   cannot be checked is not sealed. */
+#ifndef W_SB_WALK_MAX
+#define W_SB_WALK_MAX 50000
+#endif
+
+/* whether this process is root or can act as root on files: write, chmod
+   or chown what it does not own. Linux: any root uid, or the capabilities
+   that get past file permissions in its permitted set (from which it can
+   raise them); unknown counts as privileged */
+static int w_sb_privileged(void) {
+  if (getuid() == 0 || geteuid() == 0) return 1;
+#if defined(__linux__)
+  uid_t r, e, sv;
+  if (getresuid(&r, &e, &sv) != 0 || sv == 0) return 1;
+  FILE *f = fopen("/proc/self/status", "r");
+  if (!f) return 1;
+  char line[256];
+  int found = 0;
+  unsigned long long prm = 0;
+  while (fgets(line, sizeof line, f)) {
+    if (strncmp(line, "CapPrm:", 7) == 0) {
+      char *end;
+      errno = 0;
+      prm = strtoull(line + 7, &end, 16);
+      found = errno == 0 && end != line + 7;
+      break;
+    }
+  }
+  fclose(f);
+  /* CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_FOWNER, CAP_SYS_ADMIN (mounts) */
+  if (!found || (prm & ((1ULL << 0) | (1ULL << 1) | (1ULL << 3) | (1ULL << 21)))) return 1;
+#endif
+  return 0;
+}
+
+/* an entry (as lstat saw it) that only root can change: root's, and for
+   anything but a symbolic link, writable by neither group nor others nor
+   this process */
+static int w_sb_root_only(int dfd, const char *name, const struct stat *st) {
+  if (st->st_uid != 0) return 0;
+  if (S_ISLNK(st->st_mode)) return 1;
+  if (st->st_mode & 022) return 0;
+  if (faccessat(dfd, name, W_OK, AT_EACCESS) == 0) return 0;
+  return errno == EACCES || errno == EROFS || errno == EPERM;
+}
+
+/* whether the absolute path p and every directory above it are root-only;
+   p must be a directory or a symbolic link */
+static int w_sb_chain(const char *p) {
+  char buf[PATH_MAX];
+  size_t n = p ? strlen(p) : 0;
+  if (n == 0 || p[0] != '/' || n >= sizeof buf) return 0;
+  memcpy(buf, p, n + 1);
+  struct stat st;
+  if (lstat("/", &st) != 0 || !w_sb_root_only(AT_FDCWD, "/", &st)) return 0;
+  for (size_t i = 1; i <= n; i++) {
+    if ((buf[i] != '/' && buf[i] != 0) || buf[i - 1] == '/') continue;
+    char c = buf[i];
+    buf[i] = 0;
+    int ok = lstat(buf, &st) == 0 && (S_ISDIR(st.st_mode) || S_ISLNK(st.st_mode)) && w_sb_root_only(AT_FDCWD, buf, &st);
+    buf[i] = c;
+    if (!ok) return 0;
+  }
+  return 1;
+}
+
+/* everything inside the open directory dfd (closed here) root-only, on
+   device dev; budget counts entries down */
+static int w_sb_walk(int dfd, dev_t dev, long *budget, int depth) {
+  DIR *d = fdopendir(dfd);
+  if (!d) { close(dfd); return 0; }
+  int ok = 1;
+  for (;;) {
+    errno = 0;
+    struct dirent *e = readdir(d);
+    if (!e) { if (errno) ok = 0; break; }
+    if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+    struct stat st;
+    if (--*budget < 0 || fstatat(dirfd(d), e->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0 || st.st_dev != dev ||
+        !w_sb_root_only(dirfd(d), e->d_name, &st)) { ok = 0; break; }
+    if (S_ISDIR(st.st_mode)) {
+      int c = depth < 64 ? openat(dirfd(d), e->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) : -1;
+      if (c < 0 || !w_sb_walk(c, dev, budget, depth + 1)) { ok = 0; break; }
+    }
+  }
+  closedir(d);
+  return ok;
+}
+
+/* whether nothing inside the real directory p can change but by root:
+   it lies on a file system mounted read-only (macOS's sealed system
+   volume), which this process cannot remount, or everything inside it is
+   root-only */
+static int w_sb_tree(const char *p) {
+  int fd = open(p, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  struct stat st;
+  struct statvfs vfs;
+  if (fd < 0) return 0;
+  if (fstat(fd, &st) != 0 || fstatvfs(fd, &vfs) != 0) { close(fd); return 0; }
+  if (vfs.f_flag & ST_RDONLY) { close(fd); return 1; }
+  long budget = W_SB_WALK_MAX;
+  return w_sb_walk(fd, st.st_dev, &budget, 0);
+}
+
+/* Returns the sealed directory's real path (free it), or NULL. rw: the
+   real paths this process can write (either may be NULL). */
 static char *w_sb_sealed(const char *dir, char *const rw[2]) {
-  if (geteuid() == 0) return NULL;
+  if (w_sb_privileged() || !w_sb_chain(dir)) return NULL;
   char *real = w_sb_real(dir);
   struct stat st;
-  if (!real || stat(real, &st) != 0 || st.st_uid != 0 || (st.st_mode & 022) || w_sb_within(rw[0], real) || w_sb_within(rw[1], real)) {
+  if (!real || !w_sb_chain(real) || lstat(real, &st) != 0 || !S_ISDIR(st.st_mode) || w_sb_within(rw[0], real) ||
+      w_sb_within(rw[1], real) || ((w_sb_within(real, rw[0]) || w_sb_within(real, rw[1])) && !w_sb_tree(real))) {
     free(real);
     return NULL;
   }
@@ -236,8 +357,11 @@ static int w_sandbox_enter(const WSandboxSpec *s, char *err, size_t en) {
         w_sb_subpath(&b, rw[0]);
         w_sb_subpath(&b, rw[1]);
         w_sb_put(&b, "))\n");
-        const char *sealed[] = { "/System", "/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/lib", "/usr/libexec",
-                                 "/Library/Developer/CommandLineTools", "/Applications/Xcode.app", NULL };
+        /* the system volume's program directories (SIP keeps them even
+           from root) and the compilers of the Command Line Tools; not all of
+           /System, nor Xcode in /Applications, which admins can rename */
+        const char *sealed[] = { "/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/lib", "/usr/libexec",
+                                 "/Library/Developer/CommandLineTools/usr/bin", "/Library/Developer/CommandLineTools/usr/libexec", NULL };
         for (int i = 0; sealed[i]; i++) {
           char *real = w_sb_sealed(sealed[i], rw);
           if (real) { w_sb_put(&b, "(allow process-exec* (subpath "); w_sb_str(&b, real); w_sb_put(&b, "))\n"); }
