@@ -1,0 +1,30 @@
+// A Revoker is a capability (never pure, no equality, never dyn) that no
+// grant gives: only `revocable()` on Net, Fs, Listen, Exec, Env and
+// Foreign makes one.
+struct Lease {
+    fs: Fs,
+    off: Revoker,
+}
+
+fn stop(r: Revoker) {
+    r.revoke()
+}
+
+fn split(fs: Fs) -> (Fs, Revoker) {
+    fs.revocable()
+}
+
+fn lease(fs: Fs) -> Lease {
+    let (f, off) = fs.revocable()
+    Lease { fs: f, off }
+}
+
+fn main(root: Root) {
+    let (f, a) = root.fs.revocable()
+    let (g, b) = root.fs.revocable()
+    let same = a == b
+    let x = root.stdout.revocable()
+    let keys: Map[Revoker, Int] = map()
+    let all = [root.net.revocable().1, root.listen.revocable().1, root.exec.revocable().1, root.env.revocable().1, root.foreign.revocable().1]
+    let done = all.map(|r| r.is_revoked())
+}

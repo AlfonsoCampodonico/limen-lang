@@ -74,6 +74,7 @@ let grant_of (c : Types.cap) =
   | Env -> [ "env" ]
   | Exec -> [ "exec" ]
   | Foreign -> [ "foreign" ]
+  | Revoker -> []
   | Root -> []
 
 (* The C libraries a dependency's caps limit it to, `"foreign=z,sqlite3"`
@@ -621,6 +622,8 @@ let enforce ?(std = false) (pkg : t) (module_pkg : (string * string) list) (info
             match c with
             | Types.Root -> false
             | Types.Foreign -> (not std) && List.mem dn pkg.trust
+            (* revoking only takes authority away: any code may hold a switch *)
+            | Types.Revoker -> true
             | c -> List.exists (fun g -> List.mem g d.caps) (grant_of c)
           in
           let missing = List.filter (fun c -> c <> Types.Root && not (allowed c)) i.caps in

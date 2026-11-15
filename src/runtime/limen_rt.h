@@ -941,8 +941,12 @@ static void w_dyn_kids(void *o) { WDyn *d = (WDyn *)o; d->vt->h.drop(d); }
 
 /* ---------- capabilities ---------- */
 
-enum { CAP_ROOT, CAP_NET, CAP_FS, CAP_STDOUT, CAP_CLOCK, CAP_LISTEN, CAP_LISTENER, CAP_CONN, CAP_RAND, CAP_STDIN, CAP_ENV, CAP_EXEC, CAP_FOREIGN, CAP_STDERR };
+enum { CAP_ROOT, CAP_NET, CAP_FS, CAP_STDOUT, CAP_CLOCK, CAP_LISTEN, CAP_LISTENER, CAP_CONN, CAP_RAND, CAP_STDIN, CAP_ENV, CAP_EXEC, CAP_FOREIGN, CAP_STDERR, CAP_REVOKER };
 typedef struct WCap WCap;
+/* A revocation switch (`x.revocable()`): once `off`, every capability made
+   from it, narrowed from those or obtained through them, is withdrawn.
+   `parent` is the switch of the capability it was made from, if any. */
+typedef struct WRevoke { int64_t rc; int off; struct WRevoke *parent; } WRevoke;
 struct WCap {
   int64_t rc; int kind;
   char **hosts; int nhosts;   /* Net: allowlist entries */
@@ -951,19 +955,100 @@ struct WCap {
   int64_t inflight; int closing; /* operations in progress; close requested */
   int reading, writing;          /* a task is in a read (or accept) / a write that has had to wait */
   void *tls;                     /* Listener: its SSL_CTX; Conn: its VTls (NULL for plain TCP) */
+  WRevoke *rv;                   /* the switch that can withdraw it (Revoker: its own), or NULL */
+  WCap *rnext, *rprev;           /* Listener, Conn with a switch: in w_revocable_socks, closed at revoke */
 };
 static WCap *cap_new(int kind) { WCap *c = (WCap *)w_alloc_k(sizeof(WCap), WK_CAP); memset(c, 0, sizeof *c); c->rc = 1; c->kind = kind; c->fd = -1; return c; }
 static void w_sock_release_fd(int fd);
 static void w_tls_release(WCap *c);
 static inline WCap *Cap_dup(WCap *c) { w_rc_inc(&c->rc); return c; }
 static inline void Cap_share(WCap *c) { w_rc_share(&c->rc); }
-static void Cap_release(WCap *c) { for (int i = 0; i < c->nhosts; i++) free(c->hosts[i]); free(c->hosts); free(c->root); if (c->tls) w_tls_release(c); if (c->fd >= 0) w_sock_release_fd(c->fd); w_free(c); }
+static void w_rv_release(WCap *c);
+static void Cap_release(WCap *c) { if (c->rv) w_rv_release(c); for (int i = 0; i < c->nhosts; i++) free(c->hosts[i]); free(c->hosts); free(c->root); if (c->tls) w_tls_release(c); if (c->fd >= 0) w_sock_release_fd(c->fd); w_free(c); }
 static void Cap_drop(WCap *c) { if (w_rc_dec(&c->rc)) Cap_release(c); }
 static inline bool Cap_eq(WCap *a, WCap *b) { return a == b; }
 static void Cap_show(WBuf *b, WCap *c, bool top) {
   (void)top;
-  static const char *names[] = { "<Root>", "<Net>", "<Fs>", "<Stdout>", "<Clock>", "<Listen>", "<Listener>", "<Conn>", "<Rand>", "<Stdin>", "<Env>", "<Exec>", "<Foreign>", "<Stderr>" };
+  static const char *names[] = { "<Root>", "<Net>", "<Fs>", "<Stdout>", "<Clock>", "<Listen>", "<Listener>", "<Conn>", "<Rand>", "<Stdin>", "<Env>", "<Exec>", "<Foreign>", "<Stderr>", "<Revoker>" };
   buf_puts(b, names[c->kind]);
+}
+
+/* ---------- revocation ----------
+   `x.revocable()` gives a copy of x tied to a new switch (whose parent is
+   x's, so revoking x's withdraws it too) and a Revoker holding the switch.
+   Narrowing keeps the switch, and so do the Listeners and Conns obtained
+   through it; those sit in w_revocable_socks, and revoking closes the ones
+   under it as close() does, waking the tasks that wait on them. */
+static pthread_mutex_t w_rv_lock = PTHREAD_MUTEX_INITIALIZER;
+static WCap *w_revocable_socks;
+static bool w_rv_off(WRevoke *r) {
+  for (; r; r = r->parent) if (__atomic_load_n(&r->off, __ATOMIC_ACQUIRE)) return true;
+  return false;
+}
+static bool w_revoked(WCap *c) { return c->rv && w_rv_off(c->rv); }
+static bool w_rv_under(WRevoke *r, WRevoke *top) {
+  for (; r; r = r->parent) if (r == top) return true;
+  return false;
+}
+static void w_rv_drop(WRevoke *r) {
+  while (r && w_rc_dec(&r->rc)) { WRevoke *p = r->parent; free(r); r = p; }
+}
+static void Cap_sock_close(WCap *c);
+static void w_rv_release(WCap *c) {
+  if (c->kind == CAP_LISTENER || c->kind == CAP_CONN) {
+    pthread_mutex_lock(&w_rv_lock);
+    if (c->rprev) c->rprev->rnext = c->rnext; else if (w_revocable_socks == c) w_revocable_socks = c->rnext;
+    if (c->rnext) c->rnext->rprev = c->rprev;
+    pthread_mutex_unlock(&w_rv_lock);
+  }
+  w_rv_drop(c->rv);
+  c->rv = NULL;
+}
+/* `to` was made from `from`: it keeps from's switch; a socket is closed at
+   once if that switch is already off */
+static void w_rv_inherit(WCap *to, WCap *from) {
+  if (!from->rv) return;
+  w_rc_inc(&from->rv->rc);
+  to->rv = from->rv;
+  if (to->kind != CAP_LISTENER && to->kind != CAP_CONN) return;
+  pthread_mutex_lock(&w_rv_lock);
+  to->rnext = w_revocable_socks;
+  if (w_revocable_socks) w_revocable_socks->rprev = to;
+  w_revocable_socks = to;
+  bool off = w_rv_off(to->rv);
+  pthread_mutex_unlock(&w_rv_lock);
+  if (off) Cap_sock_close(to);
+}
+static WCap *Cap_copy_kind(WCap *x) {
+  WCap *c = cap_new(x->kind);
+  c->hosts = (char **)w_raw(sizeof(char *) * (size_t)(x->nhosts + 1));
+  for (int i = 0; i < x->nhosts; i++) c->hosts[i] = strdup(x->hosts[i]);
+  c->nhosts = x->nhosts;
+  c->root = x->root ? strdup(x->root) : NULL;
+  c->ro = x->ro;
+  return c;
+}
+/* `x.revocable()`: the copy, and through *revoker its switch */
+static WCap *Cap_revocable(WCap *x, WCap **revoker) {
+  WRevoke *r = (WRevoke *)w_raw(sizeof(WRevoke));
+  /* two holders, the copy and the Revoker; counted atomically (negative),
+     since tasks on other threads may hold either */
+  r->rc = -2; r->off = 0; r->parent = x->rv;
+  if (x->rv) w_rc_inc(&x->rv->rc);
+  WCap *c = Cap_copy_kind(x);
+  c->rv = r;
+  WCap *k = cap_new(CAP_REVOKER);
+  k->rv = r;
+  *revoker = k;
+  return c;
+}
+static bool Cap_is_revoked(WCap *k) { return w_revoked(k); }
+static void Cap_revoke(WCap *k) {
+  WRevoke *r = k->rv;
+  if (!r || __atomic_exchange_n(&r->off, 1, __ATOMIC_ACQ_REL)) return;
+  pthread_mutex_lock(&w_rv_lock);
+  for (WCap *c = w_revocable_socks; c; c = c->rnext) if (w_rv_under(c->rv, r)) Cap_sock_close(c);
+  pthread_mutex_unlock(&w_rv_lock);
 }
 
 static char **g_hosts; static int g_nhosts; static char *g_fs_root; static bool g_fs_ro;
@@ -1232,6 +1317,7 @@ static WStr *Cap_env_get(WCap *env, WStr *name, bool *ok) {
   char *n = strndup(name->data, (size_t)name->len);
   bool allowed = false;
   for (int i = 0; i < env->nhosts; i++) if (strcmp(env->hosts[i], "*") == 0 || strcmp(env->hosts[i], n) == 0) allowed = true;
+  if (w_revoked(env)) allowed = false;
   const char *v = allowed ? getenv(n) : NULL;
   free(n);
   if (!v) { *ok = false; return NULL; }
@@ -1284,6 +1370,7 @@ static WCap *Cap_net_only(WCap *n, WStr *req_s) {
       }
   }
   WCap *c = cap_new(CAP_NET);
+  w_rv_inherit(c, n);
   c->hosts = (char **)w_raw(sizeof(char *));
   if (covered) { c->hosts[0] = req; c->nhosts = 1; } else free(req);
   return c;
@@ -1405,6 +1492,7 @@ static char *fs_resolve(WCap *fs, WStr *rel_s, bool for_write, int *kind, char *
 }
 static WCap *Cap_fs_under(WCap *fs, WStr *rel_s) {
   WCap *c = cap_new(CAP_FS);
+  w_rv_inherit(c, fs);
   c->ro = fs->ro;
   if (!fs->root) return c;
   char *rel = strndup(rel_s->data, (size_t)rel_s->len);
@@ -1419,11 +1507,14 @@ static WCap *Cap_fs_under(WCap *fs, WStr *rel_s) {
 }
 static WCap *Cap_fs_read_only(WCap *fs) {
   WCap *c = cap_new(CAP_FS);
+  w_rv_inherit(c, fs);
   c->root = fs->root ? strdup(fs->root) : NULL;
   c->ro = true;
   return c;
 }
+static bool Cap_fs_is_read_only(WCap *fs) { return fs->ro || w_revoked(fs); }
 static WIo Cap_fs_read(WCap *fs, WStr *rel) {
+  if (w_revoked(fs)) return io_err(1, "fs: revoked");
   int kind; char msg[1024];
   char *p = fs_resolve(fs, rel, false, &kind, msg, sizeof msg);
   if (!p) return io_err(kind, msg);
@@ -1434,6 +1525,7 @@ static WIo Cap_fs_read(WCap *fs, WStr *rel) {
   return io_ok(s);
 }
 static WIo Cap_fs_write(WCap *fs, WStr *rel, WStr *data) {
+  if (w_revoked(fs)) return io_err(1, "fs: revoked");
   if (fs->root && fs->ro) return io_err(1, "fs: this capability is read-only");
   int kind; char msg[1024];
   char *p = fs_resolve(fs, rel, true, &kind, msg, sizeof msg);
@@ -1446,6 +1538,7 @@ static WIo Cap_fs_write(WCap *fs, WStr *rel, WStr *data) {
 }
 /* The absolute path of `rel`, checked as for writing: for handing to C. */
 static WIo Cap_fs_full_path(WCap *fs, WStr *rel) {
+  if (w_revoked(fs)) return io_err(1, "fs: revoked");
   if (memchr(rel->data, 0, (size_t)rel->len)) return io_err(2, "fs: the path contains a NUL byte");
   int kind; char msg[1024];
   char *p = fs_resolve(fs, rel, true, &kind, msg, sizeof msg);
@@ -1468,6 +1561,7 @@ static WIo Cap_fs_full_path(WCap *fs, WStr *rel) {
   return io_ok(s);
 }
 static bool Cap_fs_exists(WCap *fs, WStr *rel) {
+  if (w_revoked(fs)) return false;
   int kind; char msg[1024];
   char *p = fs_resolve(fs, rel, false, &kind, msg, sizeof msg);
   if (!p) return false;
@@ -1477,6 +1571,7 @@ static bool Cap_fs_exists(WCap *fs, WStr *rel) {
   return e;
 }
 static WIo Cap_fs_append(WCap *fs, WStr *rel, WStr *data) {
+  if (w_revoked(fs)) return io_err(1, "fs: revoked");
   if (fs->root && fs->ro) return io_err(1, "fs: this capability is read-only");
   int kind; char msg[1024];
   char *p = fs_resolve(fs, rel, true, &kind, msg, sizeof msg);
@@ -1489,6 +1584,7 @@ static WIo Cap_fs_append(WCap *fs, WStr *rel, WStr *data) {
 }
 static int w_cmp_cstr(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
 static WIo Cap_fs_list(WCap *fs, WStr *rel) {
+  if (w_revoked(fs)) return io_err(1, "fs: revoked");
   int kind; char msg[1024];
   char *p = fs_resolve(fs, rel, false, &kind, msg, sizeof msg);
   if (!p) return io_err(kind, msg);
@@ -1510,6 +1606,7 @@ static WIo Cap_fs_list(WCap *fs, WStr *rel) {
   return io_ok_ptr(out);
 }
 static bool Cap_fs_is_dir(WCap *fs, WStr *rel) {
+  if (w_revoked(fs)) return false;
   int kind; char msg[1024];
   char *p = fs_resolve(fs, rel, false, &kind, msg, sizeof msg);
   if (!p) return false;
@@ -1519,6 +1616,7 @@ static bool Cap_fs_is_dir(WCap *fs, WStr *rel) {
   return r;
 }
 static WIo Cap_fs_remove(WCap *fs, WStr *rel) {
+  if (w_revoked(fs)) return io_err(1, "fs: revoked");
   if (fs->root && fs->ro) return io_err(1, "fs: this capability is read-only");
   int kind; char msg[1024];
   char *p = fs_resolve(fs, rel, false, &kind, msg, sizeof msg);
@@ -1531,6 +1629,7 @@ static WIo Cap_fs_remove(WCap *fs, WStr *rel) {
   return io_ok(NULL);
 }
 static WIo Cap_fs_make_dir(WCap *fs, WStr *rel) {
+  if (w_revoked(fs)) return io_err(1, "fs: revoked");
   if (fs->root && fs->ro) return io_err(1, "fs: this capability is read-only");
   int kind; char msg[1024];
   char *p = fs_resolve(fs, rel, true, &kind, msg, sizeof msg);
@@ -1543,6 +1642,7 @@ static WIo Cap_fs_make_dir(WCap *fs, WStr *rel) {
 /* Move `from` to `to` in one step, replacing what is at `to` (rename(2));
    never the granted directory itself. */
 static WIo Cap_fs_rename(WCap *fs, WStr *from, WStr *to) {
+  if (w_revoked(fs)) return io_err(1, "fs: revoked");
   if (fs->root && fs->ro) return io_err(1, "fs: this capability is read-only");
   int kind; char msg[1024];
   char *a = fs_resolve(fs, from, false, &kind, msg, sizeof msg);
@@ -1559,6 +1659,7 @@ static WIo Cap_fs_rename(WCap *fs, WStr *from, WStr *to) {
    links. */
 typedef struct { int64_t size; int64_t mtime_ms; bool is_file; bool is_dir; } WFileInfo;
 static WIo Cap_fs_info(WCap *fs, WStr *rel) {
+  if (w_revoked(fs)) return io_err(1, "fs: revoked");
   int kind; char msg[1024];
   char *p = fs_resolve(fs, rel, false, &kind, msg, sizeof msg);
   if (!p) return io_err(kind, msg);
@@ -3335,6 +3436,7 @@ static struct addrinfo *w_lookup(const char *h, int port, char *err, size_t en) 
 static WIo w_errno_io(void) { return io_err(2, strerror(errno)); }
 
 static WIo Cap_listen_on(WCap *l, WStr *addr) {
+  if (w_revoked(l)) return io_err(1, "listen: revoked");
   char h[256]; int port;
   if (!w_parse_addr(addr, h, sizeof h, &port)) return io_err(2, "address must be HOST:PORT");
   if (!net_permits(l, h, port)) { char m[400]; snprintf(m, sizeof m, "listen: %s:%d is not granted", h, port); return io_err(1, m); }
@@ -3356,6 +3458,7 @@ static WIo Cap_listen_on(WCap *l, WStr *addr) {
     getsockname(fd, (struct sockaddr *)&s6, &sl);
     WCap *c = cap_new(CAP_LISTENER);
     c->fd = fd; c->port = ntohs(s6.sin6_port);
+    w_rv_inherit(c, l);
     return io_ok_ptr(c);
   }
   struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
@@ -3371,6 +3474,7 @@ static WIo Cap_listen_on(WCap *l, WStr *addr) {
   getsockname(fd, (struct sockaddr *)&sa, &sl);
   WCap *c = cap_new(CAP_LISTENER);
   c->fd = fd; c->port = ntohs(sa.sin_port);
+  w_rv_inherit(c, l);
   return io_ok_ptr(c);
 }
 /* One task at a time may wait to read (or accept) and one to write: an
@@ -3400,6 +3504,7 @@ static WIo Cap_accept(WCap *l) {
       setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
       WCap *conn = cap_new(CAP_CONN);
       conn->fd = c;
+      w_rv_inherit(conn, l);
       if (l->tls && !w_tls_accept(l, conn, &r)) break;
       r = io_ok_ptr(conn);
       break;
@@ -3442,6 +3547,7 @@ static int w_connect_one(struct addrinfo *a, char *err, size_t en) {
   }
 }
 static WIo Cap_net_connect(WCap *n, WStr *addr) {
+  if (w_revoked(n)) return io_err(1, "net: revoked");
   char h[256]; int port;
   if (!w_parse_addr(addr, h, sizeof h, &port)) return io_err(2, "address must be HOST:PORT");
   if (!net_permits(n, h, port)) { char m[400]; snprintf(m, sizeof m, "net: %s:%d is not granted", h, port); return io_err(1, m); }
@@ -3460,6 +3566,7 @@ static WIo Cap_net_connect(WCap *n, WStr *addr) {
   if (fd < 0) return io_err(2, err);
   WCap *c = cap_new(CAP_CONN);
   c->fd = fd;
+  w_rv_inherit(c, n);
   return io_ok_ptr(c);
 }
 /* One read or write on a connection, plain or TLS: the bytes moved (0 at
@@ -3613,6 +3720,7 @@ static int w_tls_step(WCap *c, int wr, char *buf, size_t n, int *dir, char *err,
 }
 static int w_tls_accept(WCap *l, WCap *conn, WIo *r) { (void)l; (void)conn; (void)r; return 1; }
 static WIo Cap_net_connect_tls(WCap *n, WStr *addr) {
+  if (w_revoked(n)) return io_err(1, "net: revoked");
   char h[256]; int port;
   if (!w_parse_addr(addr, h, sizeof h, &port)) return io_err(2, "address must be HOST:PORT");
   if (!net_permits(n, h, port)) { char m[400]; snprintf(m, sizeof m, "net: %s:%d is not granted", h, port); return io_err(1, m); }
@@ -3620,6 +3728,7 @@ static WIo Cap_net_connect_tls(WCap *n, WStr *addr) {
 }
 static WIo Cap_listen_on_tls(WCap *l, WStr *addr, WStr *cert, WStr *key) {
   (void)cert; (void)key;
+  if (w_revoked(l)) return io_err(1, "listen: revoked");
   char h[256]; int port;
   if (!w_parse_addr(addr, h, sizeof h, &port)) return io_err(2, "address must be HOST:PORT");
   if (!net_permits(l, h, port)) { char m[400]; snprintf(m, sizeof m, "listen: %s:%d is not granted", h, port); return io_err(1, m); }
@@ -3735,7 +3844,7 @@ static WStr *Cap_stdin_all(void) {
 #define W_STR_(x) W_STR2_(x)
 #define W_CSYM(s) W_STR_(__USER_LABEL_PREFIX__) s
 static bool Cap_foreign_allows(WCap *x, WStr *lib_s) {
-  if (memchr(lib_s->data, 0, (size_t)lib_s->len)) return false;
+  if (memchr(lib_s->data, 0, (size_t)lib_s->len) || w_revoked(x)) return false;
   for (int i = 0; i < x->nhosts; i++)
     if (strcmp(x->hosts[i], "*") == 0 || ((size_t)lib_s->len == strlen(x->hosts[i]) && memcmp(x->hosts[i], lib_s->data, (size_t)lib_s->len) == 0)) return true;
   return false;
@@ -3746,11 +3855,13 @@ static WCap *Cap_foreign_only(WCap *x, WStr *lib_s) {
   if (strcmp(lib, "*") == 0) { covered = false; for (int i = 0; i < x->nhosts; i++) if (strcmp(x->hosts[i], "*") == 0) covered = true; }
   else covered = Cap_foreign_allows(x, lib_s);
   WCap *c = cap_new(CAP_FOREIGN);
+  w_rv_inherit(c, x);
   c->hosts = (char **)w_raw(sizeof(char *));
   if (covered) { c->hosts[0] = lib; c->nhosts = 1; } else free(lib);
   return c;
 }
 static void w_foreign_check(WCap *x, const char *lib, const char *where) {
+  if (w_revoked(x)) w_panic_c("foreign: revoked", where);
   for (int i = 0; i < x->nhosts; i++) if (strcmp(x->hosts[i], "*") == 0 || strcmp(x->hosts[i], lib) == 0) return;
   char msg[512];
   snprintf(msg, sizeof msg, "foreign: library `%s` is not granted (grant it with --grant foreign=%s)", lib, lib);
@@ -3852,6 +3963,7 @@ static int64_t w_handle_close(int64_t id) {
   return p;
 }
 static WStr *Cap_foreign_copy(WCap *x, int64_t p, int64_t n, const char *where) {
+  if (w_revoked(x)) w_panic_c("foreign: revoked", where);
   if (x->nhosts == 0) w_panic_c("foreign: no library is granted, so C memory cannot be read", where);
   if (n < 0) { char m[128]; snprintf(m, sizeof m, "foreign.copy: negative length %lld", (long long)n); w_panic_c(m, where); }
   if (p == 0 && n > 0) w_panic_c("foreign.copy: null pointer", where);
@@ -3920,19 +4032,20 @@ static bool exec_covers(WCap *x, const char *prog, const char *q) {
   }
   return false;
 }
-static WCap *exec_with(char *entry) {
+static WCap *exec_with(WCap *x, char *entry) {
   WCap *c = cap_new(CAP_EXEC);
+  w_rv_inherit(c, x);
   c->hosts = (char **)w_raw(sizeof(char *));
   if (entry) { c->hosts[0] = entry; c->nhosts = 1; }
   return c;
 }
 static WCap *Cap_exec_only(WCap *x, WStr *prog_s) {
   char *prog = strndup(prog_s->data, (size_t)prog_s->len);
-  if ((size_t)prog_s->len != strlen(prog) || strchr(prog, '\n')) { free(prog); return exec_with(NULL); }
+  if ((size_t)prog_s->len != strlen(prog) || strchr(prog, '\n')) { free(prog); return exec_with(x, NULL); }
   if (strcmp(prog, "*") == 0) {
-    for (int i = 0; i < x->nhosts; i++) if (strcmp(x->hosts[i], "*") == 0) return exec_with(prog);
+    for (int i = 0; i < x->nhosts; i++) if (strcmp(x->hosts[i], "*") == 0) return exec_with(x, prog);
     free(prog);
-    return exec_with(NULL);
+    return exec_with(x, NULL);
   }
   /* the program with every prefix granted for it, or with none if one
      entry allows any arguments */
@@ -3942,11 +4055,11 @@ static WCap *Cap_exec_only(WCap *x, WStr *prog_s) {
     const char *e = x->hosts[i];
     if (!exec_prog_is(e, prog)) continue;
     const char *nl = strchr(e, '\n');
-    if (!nl) { free(b.p); return exec_with(prog); }
+    if (!nl) { free(b.p); return exec_with(x, prog); }
     found = true;
     buf_puts(&b, nl);
   }
-  if (!found) { free(b.p); free(prog); return exec_with(NULL); }
+  if (!found) { free(b.p); free(prog); return exec_with(x, NULL); }
   WStr *rest = buf_take(&b);
   char *entry = (char *)malloc(strlen(prog) + (size_t)rest->len + 1);
   memcpy(entry, prog, strlen(prog));
@@ -3954,12 +4067,12 @@ static WCap *Cap_exec_only(WCap *x, WStr *prog_s) {
   entry[strlen(prog) + (size_t)rest->len] = 0;
   Str_drop(rest);
   free(prog);
-  return exec_with(entry);
+  return exec_with(x, entry);
 }
 /* `exec.only_args(program, prefixes)`: the prefixes `x` covers for it */
 static WCap *Cap_exec_only_args(WCap *x, WStr *prog_s, L_Str *qs) {
   char *prog = strndup(prog_s->data, (size_t)prog_s->len);
-  if ((size_t)prog_s->len != strlen(prog) || strchr(prog, '\n') || strcmp(prog, "*") == 0) { free(prog); return exec_with(NULL); }
+  if ((size_t)prog_s->len != strlen(prog) || strchr(prog, '\n') || strcmp(prog, "*") == 0) { free(prog); return exec_with(x, NULL); }
   WBuf b; buf_init(&b);
   buf_puts(&b, prog);
   bool any = false;
@@ -3986,10 +4099,11 @@ static WCap *Cap_exec_only_args(WCap *x, WStr *prog_s, L_Str *qs) {
   char *entry = any ? strndup(e->data, (size_t)e->len) : NULL;
   Str_drop(e);
   free(prog);
-  return exec_with(entry);
+  return exec_with(x, entry);
 }
 typedef struct { int64_t code; WStr *out; WStr *err; } WProc;
 static WIo Cap_exec_run(WCap *x, WStr *prog_s, L_Str *args) {
+  if (w_revoked(x)) return io_err(1, "exec: revoked");
   if (memchr(prog_s->data, 0, (size_t)prog_s->len)) return io_err(2, "exec: the program name contains a NUL byte");
   for (int64_t i = 0; i < args->len; i++)
     if (memchr(args->data[i]->data, 0, (size_t)args->data[i]->len)) return io_err(2, "exec: an argument contains a NUL byte");
@@ -4236,6 +4350,7 @@ static WIo w_http_parse(const char *d, int64_t n, const char *cut) {
 }
 
 static WIo Cap_net_get(WCap *n, WStr *url_s) {
+  if (w_revoked(n)) return io_err(1, "net: revoked");
   if (memchr(url_s->data, 0, (size_t)url_s->len)) return io_err(2, "URL contains spaces or non-ASCII characters");
   char *url = strndup(url_s->data, (size_t)url_s->len);
   char host[512], err[256]; int port, https; const char *path;

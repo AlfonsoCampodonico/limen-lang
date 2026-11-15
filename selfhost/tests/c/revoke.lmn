@@ -1,0 +1,55 @@
+// Revocation: a revocable copy of a capability and its switch, revoked
+// while a task holds the copy; narrowing keeps the switch.
+fn main(root: Root) {
+    let out = root.stdout
+    let (fs, off) = root.fs.revocable()
+    let sub = fs.read_only()
+    out.print("before: {fs.read("a.txt")} {sub.exists("a.txt")} {sub.is_read_only()} {off.is_revoked()}")
+    let c: Chan[Int] = channel(0)
+    let d: Chan[Int] = channel(0)
+    let r = group g {
+        g.go(|| {
+            let _ = c.recv()
+            "task: {sub.read("a.txt")} {fs.write("b.txt", "x")} {fs.exists("a.txt")}"
+        })
+        g.go(|| {
+            off.revoke()
+            c.send(1)
+            "revoked"
+        })
+    }
+    out.print("{r}")
+    out.print("after: {fs.read("a.txt")} {sub.exists("a.txt")} {fs.is_read_only()} {fs.under("x").list("")} {off.is_revoked()}")
+    let (fs2, off2) = fs.revocable()
+    out.print("child: {off2.is_revoked()} {fs2.read("a.txt")}")
+    let (e, eoff) = root.env.revocable()
+    out.print("env: {e.get("HOME").is_some()}")
+    eoff.revoke()
+    out.print("env: {e.get("HOME")}")
+    let (x, xoff) = root.exec.revocable()
+    let echo = x.only("echo")
+    out.print("exec: {echo.run("echo", ["hi"]).map(|p| p.stdout.trim())}")
+    xoff.revoke()
+    out.print("exec: {echo.run("echo", ["hi"])}")
+    let (n, noff) = root.net.revocable()
+    noff.revoke()
+    out.print("net: {n.get("http://localhost:1/")} {n.connect("localhost:1").is_ok()}")
+    let (l, loff) = root.listen.revocable()
+    match l.on("127.0.0.1:0") {
+        Ok(lis) => {
+            let res = group g {
+                g.go(|| match lis.accept() {
+                    Ok(_) => "accepted",
+                    Err(e) => "accept: {e}",
+                })
+                g.go(|| {
+                    root.clock.sleep(50)
+                    loff.revoke()
+                    "revoked listen"
+                })
+            }
+            out.print("{res} {l.on("127.0.0.1:0").is_ok()}")
+        },
+        Err(e) => out.print("{e}"),
+    }
+}

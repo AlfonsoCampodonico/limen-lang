@@ -76,6 +76,8 @@ fn enforce(files: List[diag.Source], std: Bool, pkg: package.Manifest, module_pk
         let allowed = |c: Str| match c {
             "Root" => false,
             "Foreign" => !std && pkg.trust.contains(dn),
+            // revoking only takes authority away: any code may hold a switch
+            "Revoker" => true,
             _ => grant_of(c).any(|g| granted.contains(g)),
         }
         let missing = i.caps.filter(|c| c != "Root" && !allowed(c))

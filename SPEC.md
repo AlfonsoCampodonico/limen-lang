@@ -750,6 +750,24 @@ The rules:
    - `Fs`: paths are relative to the granted directory; absolute paths, `..` escapes and symlinks pointing outside are refused. That holds for both ends of a `rename`, and a read-only `Fs` refuses it, as it refuses every write.
    - `Foreign`: a call checks that the function's library is on the `Foreign` value's list (or the list holds `*`). C code runs with the whole process's authority, so granting a library grants everything that library can do; see below.
 
+### Revocation
+
+Authority can be lent and taken back. `x.revocable()`, on a `Net`, `Fs`, `Listen`, `Exec`, `Env` or `Foreign`, returns a copy of `x` and a `Revoker`, the switch that withdraws it:
+
+```
+let (fs2, off) = root.fs.revocable()
+plugin.run(fs2.under("plugin"))     // the plugin may keep it, in a task too
+off.revoke()                        // from here on, fs2 and everything made from it are dead
+```
+
+- `off.revoke()` withdraws the copy at once, and everything narrowed from it (`under`, `read_only`, `only`, `only_args`), in every task that holds it. Revoking twice does nothing; `off.is_revoked()` says whether it is revoked, its own switch or one it was made under.
+- After that, an operation with a `Result` gives `Err(Denied("fs: revoked"))` (`net:`, `listen:`, `exec:`); `Fs.exists` and `is_dir` give `false`, `is_read_only` gives `true`; `Env.get` gives `None`, as for a variable that is not granted; `Foreign.allows` gives `false`, and a foreign call or `foreign.copy` through it panics with `foreign: revoked`, as a call into an ungranted library does. Nothing a revoked capability did before is undone.
+- The `Listener`s and `Conn`s obtained through it (`on`, `accept`, `connect`, `connect_tls`) are closed when it is revoked, as `close()` closes them: a task waiting in `accept` or `read` wakes with `Err(Failed("listener is closed"))` or `"connection is closed"`, and so does every later use.
+- A revocable capability can be made revocable again: revoking the outer switch withdraws the inner copy too, not the other way round.
+- `Revoker` is a capability: a function taking one is not pure, and it has no equality, cannot be a map key or `dyn`, and prints as `<Revoker>`. No grant gives one and none is needed: only `revocable()` makes one, and it can only take authority away, so a dependency may take a `Revoker` whatever its `caps` say. `Stdout`, `Stderr`, `Stdin`, `Clock` and `Rand` are not revocable: they are always granted and their operations have no way to fail.
+
+The same in both backends: natively the switch is shared by the threads whose tasks hold the copy, and an operation checks it as it starts, so one already in progress when the switch goes off finishes (a socket's is cut short by the close).
+
 ### Capabilities in structs and enums
 
 A struct field or an enum payload can be a capability, so authority that travels together can be bundled:
@@ -1329,6 +1347,9 @@ fn main(root: Root) {
 | `Fs` | `under(dir)`, `read_only()` | `Fs` |
 | `Fs` | `full_path(path)` | `Result[Str, IoError]`: the absolute path, checked as for writing (the file need not exist, its directory must), with the directory part resolved to its real path, for handing to C or another program |
 | `Fs` | `is_read_only()` | `Bool`; an ungranted `Fs` is read-only |
+| `Net`, `Fs`, `Listen`, `Exec`, `Env`, `Foreign` | `revocable()` | `(T, Revoker)`: a copy that the `Revoker` can withdraw (section 9) |
+| `Revoker` | `revoke()` | `()`: withdraws the copy, what was narrowed from it, and closes the sockets opened through it |
+| `Revoker` | `is_revoked()` | `Bool` |
 
 `Rand`'s numbers and bytes all come from the operating system's cryptographically secure generator (`arc4random_buf` on macOS, `getrandom` on Linux, `/dev/urandom` where that is missing), read a buffer at a time, so they are fit for secrets: keys, tokens, passwords, nonces, and `shuffle` or `choice` built on `int`. Natively `int` gives about 380 million numbers a second. With `--seed N` they come from a fast deterministic generator (splitmix64) seeded with `N` instead, the same stream in both backends, so a seeded run repeats: for tests and simulations, never for secrets. `int` maps a seeded number into the range by its remainder, and an unseeded one without bias, by drawing again when the number falls in the uneven part.
 

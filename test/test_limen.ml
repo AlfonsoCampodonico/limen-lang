@@ -7830,6 +7830,13 @@ fn main(root: Root) {
   put "grants/dep.lmn" "use envy\n\nfn main(root: Root) {\n    root.stdout.print(envy.get(root.env))\n}\n";
   let code, o, e = limen_cli [ "run"; Filename.concat pdir "grants/dep.lmn" ] in
   ok "grants-dep-toml-ignored" (code = 0 && o = "none\n") (sprintf "code %d, out %S, err %S" code o e);
+  (* a dependency may take a Revoker without a grant: it can only withdraw authority *)
+  (try Unix.mkdir (Filename.concat pdir "stopper") 0o755 with Unix.Unix_error _ -> ());
+  put "stopper/stopper.lmn" "pub fn stop(r: Revoker) {\n    r.revoke()\n}\n";
+  put "grants/limen.toml" "[package]\nname = \"g\"\n\n[dependencies]\nstopper = { path = \"../stopper\" }\n";
+  put "grants/stop.lmn" "use stopper\n\nfn main(root: Root) {\n    let (fs, off) = root.fs.revocable()\n    stopper.stop(off)\n    root.stdout.print(\"{off.is_revoked()}\")\n}\n";
+  let code, o, e = limen_cli [ "run"; Filename.concat pdir "grants/stop.lmn" ] in
+  ok "revoke-dep-no-grant" (code = 0 && o = "true\n") (sprintf "code %d, out %S, err %S" code o e);
   Sys.remove (Filename.concat pdir "grants/limen.toml");
 
   (* git dependencies: a local file:// repository, fetched into a temporary
@@ -8934,6 +8941,128 @@ fn main(root: Root) {
      Pure.stmts_iter (function Ir.Loop _ -> incr loops | _ -> ()) main.body;
      (* `a` is one fused loop; `b` is two, since `shout` prints *)
      ok "pure-if-fusion-ir" (!loops = 3) (sprintf "%d loops" !loops));
+
+  (* ---------- revocation: authority that can be withdrawn ---------- *)
+  let rv_src = {v|fn main(root: Root) {
+    let out = root.stdout
+    let (fs, off) = root.fs.revocable()
+    let sub = fs.read_only()
+    out.print("before: {fs.write("a.txt", "hi").is_ok()} {fs.read("a.txt")} {sub.exists("a.txt")} {sub.is_read_only()} {off.is_revoked()}")
+    // a task holds the capability while another revokes it
+    let c: Chan[Int] = channel(0)
+    let r = group g {
+        g.go(|| {
+            let _ = c.recv()
+            "task: {sub.read("a.txt")} {fs.write("b.txt", "x")} {fs.exists("a.txt")}"
+        })
+        g.go(|| {
+            off.revoke()
+            c.send(1)
+            "revoked"
+        })
+    }
+    out.print("{r}")
+    out.print("after: {fs.read("a.txt")} {sub.is_dir("")} {fs.is_read_only()} {fs.under("x").list("")} {fs.rename("a.txt", "c.txt")} {off.is_revoked()}")
+    off.revoke()
+    let (fs2, off2) = fs.revocable()
+    out.print("child: {off2.is_revoked()} {fs2.read("a.txt")}")
+    let (fs3, off3) = root.fs.revocable()
+    let (fs4, off4) = fs3.revocable()
+    off4.revoke()
+    out.print("parent: {fs3.exists("a.txt")} {fs4.exists("a.txt")} {off3.is_revoked()} {off4.is_revoked()}")
+    off3.revoke()
+    out.print("parent: {fs3.exists("a.txt")} {off4.is_revoked()}")
+    let (e, eoff) = root.env.revocable()
+    out.print("env: {e.get("LIMEN_RV").is_some()}")
+    eoff.revoke()
+    out.print("env: {e.get("LIMEN_RV")}")
+    let (x, xoff) = root.exec.revocable()
+    let sh = x.only("sh")
+    out.print("exec: {sh.run("sh", ["-c", "echo hi"]).map(|p| p.stdout.trim())}")
+    xoff.revoke()
+    out.print("exec: {sh.run("sh", ["-c", "echo hi"])}")
+    let (n, noff) = root.net.revocable()
+    noff.revoke()
+    out.print("net: {n.get("http://localhost:1/")} {n.only("localhost").connect("localhost:1").is_ok()}")
+}
+|v} in
+  Unix.putenv "LIMEN_RV" "set";
+  (let dir = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "limen-rv-%d" (Unix.getpid ())) in
+   (try Unix.mkdir dir 0o755 with Unix.Unix_error _ -> ());
+   let dir = Unix.realpath dir in
+   out "revoke-caps" ~grants:{ Interp.no_grants with fs = Some (dir, false); env = [ "LIMEN_RV" ]; exec = [ "sh" ]; net = [ "localhost" ] } rv_src
+     "before: true Ok(\"hi\") true true false\n\
+      [\"task: Err(Denied(\\\"fs: revoked\\\")) Err(Denied(\\\"fs: revoked\\\")) false\", \"revoked\"]\n\
+      after: Err(Denied(\"fs: revoked\")) false true Err(Denied(\"fs: revoked\")) Err(Denied(\"fs: revoked\")) true\n\
+      child: true Err(Denied(\"fs: revoked\"))\n\
+      parent: true false false true\n\
+      parent: false true\n\
+      env: true\nenv: None\n\
+      exec: Ok(\"hi\")\nexec: Err(Denied(\"exec: revoked\"))\n\
+      net: Err(Denied(\"net: revoked\")) false\n");
+  (* sockets opened through a revocable Net or Listen are closed at revoke,
+     waking the tasks that wait on them *)
+  let rv_socks = {v|fn main(root: Root) {
+    let out = root.stdout
+    let (l, loff) = root.listen.revocable()
+    let (n, noff) = root.net.revocable()
+    match l.on("127.0.0.1:0") {
+        Ok(lis) => {
+            let port = lis.port()
+            let res = group g {
+                g.go(|| match lis.accept() {
+                    Ok(conn) => match conn.read() {
+                        Ok(s) => "server read {s}",
+                        Err(e) => "server read: {e}",
+                    },
+                    Err(e) => "accept: {e}",
+                })
+                g.go(|| match n.connect("127.0.0.1:{port}") {
+                    Ok(conn) => {
+                        root.clock.sleep(50)
+                        noff.revoke()
+                        "client: {conn.write("x")} {conn.read()}"
+                    },
+                    Err(e) => "connect: {e}",
+                })
+            }
+            out.print("{res}")
+            let more = group g {
+                g.go(|| match lis.accept() {
+                    Ok(_) => "accepted",
+                    Err(e) => "accept: {e}",
+                })
+                g.go(|| {
+                    root.clock.sleep(50)
+                    loff.revoke()
+                    "revoked"
+                })
+            }
+            out.print("{more} {l.on("127.0.0.1:0").map(|x| x.port() > 0)} {lis.port() == port}")
+        },
+        Err(e) => out.print("{e}"),
+    }
+}
+|v} in
+  let rv_socks_want =
+    "[\"server read \", \"client: Err(Failed(\\\"connection is closed\\\")) Err(Failed(\\\"connection is closed\\\"))\"]\n\
+     [\"accept: Failed(\\\"listener is closed\\\")\", \"revoked\"] Err(Denied(\"listen: revoked\")) true\n"
+  in
+  let rv_socks_grants = { Interp.no_grants with net = [ "127.0.0.1" ]; listen = [ "127.0.0.1" ] } in
+  out "revoke-sockets" ~grants:rv_socks_grants rv_socks rv_socks_want;
+  check_tsan "revoke-sockets" ~grants:rv_socks_grants rv_socks rv_socks_want;
+  (* a revoked Foreign: calls panic, allows says no *)
+  out "revoke-foreign" ~grants:{ Interp.no_grants with foreign = [ "c" ] }
+    "foreign \"c\" {\n    fn abs(n: Int32) -> Int32\n}\n\nfn main(root: Root) {\n    let (f, off) = root.foreign.revocable()\n    let c = f.only(\"c\")\n    root.stdout.print(\"{abs(c, -3)} {c.allows(\"c\")}\")\n    off.revoke()\n    root.stdout.print(\"{c.allows(\"c\")} {catch(|| abs(c, -3))} {catch(|| f.copy(Handle { addr: 0 }, 0).len())}\")\n}\n"
+    "3 true\nfalse Err(\"foreign: revoked\") Err(\"foreign: revoked\")\n";
+  (* a Revoker is authority (never pure, no equality) that needs no grant *)
+  (let _, ds, infos =
+     compile "revoke-caps-info" "fn stop(r: Revoker) {\n    r.revoke()\n}\n\nfn split(fs: Fs) -> (Fs, Revoker) {\n    fs.revocable()\n}\n\nfn main(root: Root) {}\n"
+   in
+   let find n = List.find (fun (i : Check.fn_info) -> i.name = n) infos in
+   ok "revoke-caps-info" (ds = [] && (find "stop").caps = [ Types.Revoker ] && (find "split").caps = [ Types.Fs ]) (String.concat " " (codes ds)));
+  errs "revoke-eq" "fn main(root: Root) {\n    let (f, a) = root.fs.revocable()\n    let (g, b) = root.fs.revocable()\n    let same = a == b\n}\n" [ "E0201" ];
+  errs "revoke-stdout" "fn main(root: Root) {\n    let x = root.stdout.revocable()\n}\n" [ "E0105" ];
 
   (* ---------- Foreign narrowed per library ---------- *)
   let ffs = "foreign \"c\" {\n    fn getpid() -> Int32\n    fn abs(n: Int32) -> Int32\n}\n\nforeign \"m\" {\n    fn cbrt(x: Float) -> Float\n}\n\n" in

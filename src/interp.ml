@@ -19,6 +19,13 @@ type cap =
   | CEnv of string list
   | CExec of string list
   | CForeign of string list (* libraries, or "*" *)
+  | CRevocable of revoke * cap (* `x.revocable()`: x, withdrawn once the switch is off *)
+  | CRevoker of revoke (* the switch *)
+
+(* A revocation switch: off once revoked; `parent` is the switch of the
+   capability it was made from, if any, so revoking that one withdraws it
+   too. *)
+and revoke = { mutable off : bool; parent : revoke option }
 
 (* A socket that knows when it was closed, so a task waiting on it never
    touches a descriptor number that has been reused. *)
@@ -268,10 +275,19 @@ type rt = {
 let fmt_float x =
   if Float.is_integer x && Float.abs x < 1e16 then sprintf "%.1f" x else sprintf "%.15g" x
 
-let cap_name = function
+let rec cap_name = function
   | CRoot -> "Root" | CNet _ -> "Net" | CFs _ -> "Fs" | CStdout -> "Stdout" | CStderr -> "Stderr" | CClock -> "Clock"
   | CListen _ -> "Listen" | CListener _ -> "Listener" | CConn _ -> "Conn"
   | CRand -> "Rand" | CStdin -> "Stdin" | CEnv _ -> "Env" | CExec _ -> "Exec" | CForeign _ -> "Foreign"
+  | CRevocable (_, c) -> cap_name c
+  | CRevoker _ -> "Revoker"
+
+let rec revoked r = r.off || match r.parent with Some p -> revoked p | None -> false
+let rec under r top = r == top || match r.parent with Some p -> under p top | None -> false
+
+(* The Listeners and Conns obtained through a revocable capability, with its
+   switch: revoking closes those under it. *)
+let revocable_socks : (revoke * sock) list ref = ref []
 
 let rec key_of = function
   | VInt n -> KInt n
@@ -1657,7 +1673,14 @@ module Foreign = struct
       if cs.trusted then (VUnit, args)
       else
         match args with
-        | (VCap (CForeign allowed) as cap) :: rest ->
+        | (VCap c as cap) :: rest ->
+          (* a revocable Foreign: refused once revoked *)
+          let rec allowed_of = function
+            | CForeign allowed -> allowed
+            | CRevocable (r, c) -> if revoked r then raise (Panic ("foreign: revoked", sp)) else allowed_of c
+            | _ -> failwith "internal: foreign capability"
+          in
+          let allowed = allowed_of c in
           if not (permits allowed cs.lib) then raise (Panic (Ffi.denied_msg cs.lib, sp));
           (cap, rest)
         | _ -> failwith "internal: foreign capability"
@@ -2752,6 +2775,18 @@ and sock_result : 'a. ('a, Caps.ioerr) result -> ('a -> value) -> value = fun r 
 
 and cap_call rt c name args sp =
   match (c, name, args) with
+  | CRevoker r, "revoke", [] ->
+    if not r.off then begin
+      r.off <- true;
+      List.iter (fun (r', sk) -> if under r' r then Sock.close sk) !revocable_socks;
+      revocable_socks := List.filter (fun (_, sk) -> not sk.shut) !revocable_socks
+    end;
+    VUnit
+  | CRevoker r, "is_revoked", [] -> VBool (revoked r)
+  | _, "revocable", [] ->
+    let r = { off = false; parent = (match c with CRevocable (p, _) -> Some p | _ -> None) } in
+    VStruct (Ast.tuple_name 2, [ ("0", VCap (CRevocable (r, c))); ("1", VCap (CRevoker r)) ])
+  | CRevocable (r, inner), _, _ -> revocable_call rt r inner name args sp
   | CStdout, "print", [ VStr s ] -> put rt.out !current.sink (s ^ "\n"); VUnit
   | CStdout, "write", [ VStr s ] -> put rt.out !current.sink s; VUnit
   (* stderr is written at once, past the order groups keep for stdout *)
@@ -2818,6 +2853,30 @@ and cap_call rt c name args sp =
       (fun (code, o, e) -> VStruct ("ProcessOutput", [ ("code", vint code); ("stdout", VStr o); ("stderr", VStr e) ]))
       (Proc.run ~env_grant:rt.grants.env allowed p args)
   | _ -> failwith ("internal: capability method " ^ name)
+
+(* A method of a revocable capability: what it gives once revoked, the same
+   as the native runtime; before, the inner capability's, with what it
+   narrows to or opens kept under the switch. *)
+and revocable_call rt r inner name args sp =
+  let kind = cap_name inner in
+  let denied () = io_result (fun () -> VUnit) (Error (Caps.Denied (String.lowercase_ascii kind ^ ": revoked"))) in
+  (* a Listener or Conn was closed when its switch went off: it answers as closed *)
+  if revoked r && kind <> "Listener" && kind <> "Conn" then
+    match (kind, name) with
+    | "Fs", ("exists" | "is_dir") | "Foreign", "allows" -> VBool false
+    | "Fs", "is_read_only" -> VBool true
+    | "Env", "get" -> none
+    | "Foreign", "copy" -> raise (Panic ("foreign: revoked", sp))
+    | _, ("only" | "only_args" | "under" | "read_only") -> VCap (CRevocable (r, inner))
+    | _ -> denied ()
+  else
+    let keep sk = revocable_socks := (r, sk) :: List.filter (fun (_, s) -> not s.shut) !revocable_socks in
+    match cap_call rt inner name args sp with
+    | VCap c -> VCap (CRevocable (r, c))
+    | VEnum ("Result", "Ok", [ VCap c ]) ->
+      (match c with CListener (sk, _) | CConn sk -> keep sk | _ -> ());
+      VEnum ("Result", "Ok", [ VCap (CRevocable (r, c)) ])
+    | v -> v
 
 (* The status a process exits with when `main` returns [n]: the low 8 bits,
    as the operating system keeps them (the native backend gets the same from

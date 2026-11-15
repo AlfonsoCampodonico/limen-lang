@@ -1520,7 +1520,14 @@ fn prim(self: Cg, ind: Str, dst: Str, t: types.Ty, name: Str, rt: types.Ty, a: L
         ("cap_write", TCap("Fs")) => c.io_result(ind, dst, t, "Cap_fs_write({arg(0)}, {arg(1)}, {arg(2)})", "0"),
         ("cap_exists", _) => c.set(ind, dst, "Cap_fs_exists({arg(0)}, {arg(1)})"),
         ("cap_full_path", TCap("Fs")) => c.io_result(ind, dst, t, "Cap_fs_full_path({arg(0)}, {arg(1)})", "r_.val"),
-        ("cap_is_read_only", TCap("Fs")) => c.set(ind, dst, "({arg(0)})->ro"),
+        ("cap_is_read_only", TCap("Fs")) => c.set(ind, dst, "Cap_fs_is_read_only({arg(0)})"),
+        ("cap_revocable", TCap(_)) => {
+            let c1 = c.line(ind, "\{").line(ind, "  WCap *k_; WCap *c_ = Cap_revocable({arg(0)}, &k_);")
+            let (n, c2) = c1.cname(t)
+            c2.line(ind, "  {dst} = ({n})\{ c_, k_ };").line(ind, "}")
+        },
+        ("cap_revoke", TCap("Revoker")) => c.line(ind, "Cap_revoke({arg(0)});").set(ind, dst, "0"),
+        ("cap_is_revoked", TCap("Revoker")) => c.set(ind, dst, "Cap_is_revoked({arg(0)})"),
         _ => panic("cgen: unknown primitive {name} on {show(rt)}"),
     }
 }

@@ -192,7 +192,7 @@ let unify_at ctx span want got =
   try unify want got
   with Mismatch -> err ctx "E0201" span (sprintf "expected `%s`, found `%s`" (show want) (show got))
 
-let builtin_types = [ "Int"; "Float"; "Bool"; "Str"; "Bytes"; "List"; "Array"; "Chan"; "Root"; "Net"; "Fs"; "Stdout"; "Stderr"; "Clock"; "Listen"; "Listener"; "Conn"; "Rand"; "Stdin"; "Env"; "Exec"; "Foreign"; "Map" ]
+let builtin_types = [ "Int"; "Float"; "Bool"; "Str"; "Bytes"; "List"; "Array"; "Chan"; "Root"; "Net"; "Fs"; "Stdout"; "Stderr"; "Clock"; "Listen"; "Listener"; "Conn"; "Rand"; "Stdin"; "Env"; "Exec"; "Foreign"; "Revoker"; "Map" ]
 
 (* Names other languages use for ambient I/O, mapped to the capability way. *)
 let ambient =
@@ -276,6 +276,7 @@ let rec resolve ctx env (te : ty_expr) : ty =
     | "Env" -> simple (TCap Env)
     | "Exec" -> simple (TCap Exec)
     | "Foreign" -> simple (TCap Foreign)
+    | "Revoker" -> simple (TCap Revoker)
     | "Chan" -> if want 1 then TChan (List.hd args') else TErr
     | "Map" -> if want 2 then TMap (List.nth args' 0, List.nth args' 1) else TErr
     | _ -> (
@@ -568,6 +569,8 @@ let builtin_tname t =
 
 let build_methods (t : ty) : (string * (unit -> ty list * ty)) list =
   let m name ps r = (name, fun () -> (ps, r)) in
+  (* `fs.revocable()`: the same authority, and a switch that withdraws it *)
+  let revocable c = m "revocable" [] (TNamed (Ast.tuple_name 2, [ TCap c; TCap Revoker ])) in
   match t with
   | TStr ->
     [ m "len" [] TInt; m "is_empty" [] TBool; m "lines" [] (TList TStr);
@@ -608,8 +611,8 @@ let build_methods (t : ty) : (string * (unit -> ty list * ty)) list =
   | TNamed ("Result", [ a; e ]) ->
     [ m "is_ok" [] TBool; m "is_err" [] TBool;
       ("map_error", fun () -> let u = fresh () in ([ TFn ([ e ], u) ], res a u)) ]
-  | TCap Net -> [ m "get" [ TStr ] (res (TNamed ("HttpResponse", [])) io_err); m "only" [ TStr ] (TCap Net); m "connect" [ TStr ] (res (TCap Conn) io_err); m "connect_tls" [ TStr ] (res (TCap Conn) io_err) ]
-  | TCap Listen -> [ m "on" [ TStr ] (res (TCap Listener) io_err); m "on_tls" [ TStr; TStr; TStr ] (res (TCap Listener) io_err) ]
+  | TCap Net -> [ m "get" [ TStr ] (res (TNamed ("HttpResponse", [])) io_err); m "only" [ TStr ] (TCap Net); m "connect" [ TStr ] (res (TCap Conn) io_err); m "connect_tls" [ TStr ] (res (TCap Conn) io_err); revocable Net ]
+  | TCap Listen -> [ m "on" [ TStr ] (res (TCap Listener) io_err); m "on_tls" [ TStr; TStr; TStr ] (res (TCap Listener) io_err); revocable Listen ]
   | TCap Listener -> [ m "accept" [] (res (TCap Conn) io_err); m "port" [] TInt; m "close" [] TUnit ]
   | TCap Conn -> [ m "read" [] (res TStr io_err); m "write" [ TStr ] (res TUnit io_err); m "close" [] TUnit ]
   | TCap Fs ->
@@ -618,17 +621,18 @@ let build_methods (t : ty) : (string * (unit -> ty list * ty)) list =
       m "remove" [ TStr ] (res TUnit io_err); m "make_dir" [ TStr ] (res TUnit io_err);
       m "is_dir" [ TStr ] TBool; m "full_path" [ TStr ] (res TStr io_err); m "is_read_only" [] TBool;
       m "exists" [ TStr ] TBool; m "under" [ TStr ] (TCap Fs); m "read_only" [] (TCap Fs);
-      m "rename" [ TStr; TStr ] (res TUnit io_err); m "info" [ TStr ] (res (TNamed ("FileInfo", [])) io_err) ]
+      m "rename" [ TStr; TStr ] (res TUnit io_err); m "info" [ TStr ] (res (TNamed ("FileInfo", [])) io_err); revocable Fs ]
   | TCap (Stdout | Stderr) -> [ m "print" [ TStr ] TUnit; m "write" [ TStr ] TUnit ]
   | TCap Clock -> [ m "now_ms" [] TInt; m "sleep" [ TInt ] TUnit ]
   | TCap Rand -> [ m "int" [ TInt; TInt ] TInt; m "float" [] TFloat; m "bytes" [ TInt ] TBytes ]
   | TCap Stdin -> [ m "read_line" [] (opt TStr); m "read_all" [] TStr ]
-  | TCap Env -> [ m "get" [ TStr ] (opt TStr) ]
+  | TCap Env -> [ m "get" [ TStr ] (opt TStr); revocable Env ]
   | TCap Exec ->
     [ m "run" [ TStr; TList TStr ] (res (TNamed ("ProcessOutput", [])) io_err); m "only" [ TStr ] (TCap Exec);
-      m "only_args" [ TStr; TList TStr ] (TCap Exec) ]
+      m "only_args" [ TStr; TList TStr ] (TCap Exec); revocable Exec ]
   | TCap Foreign ->
-    [ m "only" [ TStr ] (TCap Foreign); m "allows" [ TStr ] TBool; m "copy" [ TNamed ("Handle", []); TInt ] TBytes ]
+    [ m "only" [ TStr ] (TCap Foreign); m "allows" [ TStr ] TBool; m "copy" [ TNamed ("Handle", []); TInt ] TBytes; revocable Foreign ]
+  | TCap Revoker -> [ m "revoke" [] TUnit; m "is_revoked" [] TBool ]
   | TCap Root -> [ m "args" [] (TList TStr) ]
   | TChan a -> [ ("send", fun () -> ([ a ], TUnit)); ("recv", fun () -> ([], opt a)); ("close", fun () -> ([], TUnit)) ]
   | _ -> []
