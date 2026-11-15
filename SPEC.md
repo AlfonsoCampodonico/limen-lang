@@ -726,7 +726,7 @@ The native backend implements this with reference counting and copy-on-write. A 
 | `root.fs` | `Fs` | only with `--grant fs=DIR` or `--grant fs=DIR:ro` |
 | `root.listen` | `Listen` | only with `--grant listen=HOST[:PORT]` (repeatable) |
 | `root.exec` | `Exec` | only with `--grant exec=PROGRAM` (repeatable), `--grant 'exec=PROGRAM ARGS\|ARGS...'` (that program with arguments starting with one of those, below) or `--grant exec=*` |
-| `root.foreign` | `Foreign` | only with `--grant foreign=LIB` (repeatable) or `--grant foreign=*`: calls into C libraries |
+| `root.foreign` | `Foreign` | only with `--grant foreign=LIB` (repeatable, or several at once: `foreign=z,sqlite3`) or `--grant foreign=*`: calls into C libraries |
 
 `root.args()` is the `List[Str]` of command-line arguments after `--`: `limen run app.lmn -- a b`.
 
@@ -789,6 +789,8 @@ foreign "sqlite3" {
 ```
 
 Calling one takes a `Foreign` capability first, then the other arguments: `sqlite3_libversion(root.foreign)`. Each call checks that the `Foreign` value grants the library (`--grant foreign=sqlite3`), and panics if not. So C is reachable only from code that was handed `Foreign`, `limen caps` lists such functions, and a package dependency can use a foreign block only if the program names it in `[trust] foreign = [...]` in limen.toml (section 18). The library name is the `-l` name: `foreign "sqlite3"` links `-lsqlite3` natively and loads `libsqlite3.dylib` (macOS) or `libsqlite3.so` in the interpreter; `foreign "c"` is the C library itself, which is always there. The function name is the C symbol, unless the declaration names another after its signature: `fn print_int(format: Str, ..., n: Int) -> Int32 = "printf"`. Declarations are one per line; `pub fn` exports one from a module.
+
+**Per library.** A `Foreign` grants a list of libraries, and narrows like the other capabilities: `root.foreign.only("z")` grants only `z` (and nothing if it did not hold `z`), so a function handed it can call the functions of `foreign "z"` blocks and of no other library. A foreign function belongs to its block's library, so where the checker can see what a `Foreign` was narrowed to, a call of another library's function is refused when compiling (E0333): `let z = root.foreign.only("z")` and then `sqlite3_open_v2(z, ...)`, or the same with `root.foreign.only("z")` written in the call. A variable bound with `let` (not `let mut`) keeps what it was narrowed to; a parameter, a field or a reassigned variable is checked at the call, as before. `limen caps` lists the libraries each function reaches with its `Foreign`, `Foreign (z, sqlite3)` (`"libs"` in `--json`): its own library for a foreign function, and for any other the libraries of the functions it uses that take a `Foreign`, however deep. A function that only copies memory (`foreign.copy`) shows `Foreign` alone.
 
 The types that cross the boundary:
 
@@ -858,11 +860,11 @@ Ownership at the boundary:
 The foreign grant is full trust, and Limen treats it that way:
 
 - Only the program grants it: `--grant foreign=LIB` or `[grants] foreign` in the program's own limen.toml. `limen run` prints a one-line warning whenever it is given, since nothing in Limen bounds what C code does; only the operating-system sandbox (below) still does.
-- It does not pass along: a dependency's `caps` cannot include `foreign`. A dependency may declare foreign blocks only when the program names it in `[trust]`, and limen.lock records the C libraries each trusted dependency uses (section 18).
+- It does not pass along: a dependency's `caps` cannot include `foreign`. A dependency may declare foreign blocks only when the program names it in `[trust]`, and limen.lock records the C libraries each trusted dependency uses (section 18). Its caps can also name the libraries it may reach, `caps = ["foreign=z"]`: then a foreign block of another library, or a function that reaches one through another dependency's function taking a `Foreign`, is E0320, naming the function and the library.
 - `limen check` lists every part of the program that calls C, one line each: the program's own files, trusted dependencies, and trusted standard library modules.
-- The standard library calls C only from modules that its manifest, src/std/limen.toml, trusts in the same way (`sql`). Their foreign functions are private to the module and take no `Foreign`, so a program using `sql` grants only an `Fs`; the module is what keeps SQLite inside that grant.
+- The standard library calls C only from modules that its manifest, src/std/limen.toml, trusts in the same way (`sql`, whose caps name its one library, `foreign=sqlite3`). Their foreign functions are private to the module and take no `Foreign`, so a program using `sql` grants only an `Fs`; the module is what keeps SQLite inside that grant.
 
-What the capability lets code do: anything the C functions it declares can do, with the program's full authority, outside every other capability's checks. Limen checks the declared types and the library grant; it cannot check that a declaration matches the C prototype, and a wrong one is undefined behaviour. Keep foreign blocks small, private to a module that wraps them in a safe Limen API (as the `sql` module does), and grant `foreign` only to programs and dependencies you trust.
+What the capability lets code do: anything the C functions it declares can do, with the program's full authority, outside every other capability's checks. Narrowing a `Foreign` to a library limits which library's declared functions Limen code may call; it does not limit what those functions do once called. C runs in the program's process: a C function of a granted library can read and change any of the program's memory, other libraries' and the runtime's included, call anything linked into the process, and so reach every capability the program holds. Only the operating-system sandbox (below) bounds it, and only to the program's grants as a whole. Limen checks the declared types and the library grant; it cannot check that a declaration matches the C prototype, and a wrong one is undefined behaviour. Keep foreign blocks small, private to a module that wraps them in a safe Limen API (as the `sql` module does), and grant `foreign` only to programs and dependencies you trust.
 
 Limits, the same in both backends: at most 8 integer-like (everything but `Float`, `Out` and callbacks included) and 8 `Float` values, each field of a struct by value counting as one; the variadic and callback limits above; structs of 1 to 8 scalar fields, not nested. A foreign function can only be called, not used as a value (E0331): wrap it in a closure. A C call blocks its worker thread until it returns, like a busy loop, and C libraries decide their own thread safety.
 
@@ -1490,13 +1492,14 @@ Every diagnostic has a stable code. `limen explain CODE` prints its explanation,
 | E0306 | a test parameter that is not `fs: Fs`, `clock: Clock` or `clock: virtual Clock`, or a bench that takes `virtual Clock` |
 | E0310 | misuse of a group handle |
 | E0311 | `return` or `?` leaving a group |
-| E0320 | a dependency takes a capability limen.toml does not grant it |
+| E0320 | a dependency takes a capability limen.toml does not grant it, or reaches a C library its caps do not name |
 | E0321 | malformed limen.toml, an embed root that is not a directory, or a dependency's limen.toml that declares embed roots |
 | E0322 | a git dependency could not be fetched |
 | E0323 | limen.lock does not match: a malformed line, or a dependency whose files changed |
 | E0324 | a trusted dependency calls a C library that limen.lock did not record |
 | E0330 | a foreign function signature with a type that cannot cross to C, too many parameters, or a bad library name |
 | E0331 | a foreign function used as a value instead of called |
+| E0333 | a foreign function given a `Foreign` narrowed with `only` to other libraries |
 | E0401 | module not found, or a qualified name without `use` |
 | E0402 | item is not `pub` |
 | E0403 | module has no such item |
@@ -1668,7 +1671,7 @@ roots = ["../assets"]
 - Grants belong to the program being run: only the limen.toml found for the main file is read for them. A dependency's own limen.toml never grants anything, so adding or updating a dependency cannot widen what the program may do. A dependency gets capabilities in exactly one way: your code passes them to it, and only of the kinds its `caps` allow. `[grants]` decides what reaches `main`; `caps` decides which of those may cross into each dependency.
 - `[embed] roots` lists directories, relative to limen.toml, whose files the program's own files may `embed` besides those of its package (section 11). Each must exist and be a directory, links followed (E0321 otherwise). Like grants, they belong to the program: a dependency embeds only its own directory's files, and a dependency whose limen.toml has an `[embed]` table is E0321, though its limen.toml is otherwise never read. Embedding reads files at compile time, not at run time, so a root grants the program nothing when it runs; it only decides what can be built into it.
 - A dependency is a directory holding `NAME.lmn`, plus any modules that file uses from the same directory.
-- `caps` lists what the dependency may use: `net` (Net and Conn), `listen` (Listen, Listener and Conn), `fs`, `stdout`, `stderr`, `stdin`, `clock`, `rand`, `env`, `exec`. The default is none. No dependency can take `Root`, and `caps` cannot give `foreign` (E0321).
+- `caps` lists what the dependency may use: `net` (Net and Conn), `listen` (Listen, Listener and Conn), `fs`, `stdout`, `stderr`, `stdin`, `clock`, `rand`, `env`, `exec`. The default is none. No dependency can take `Root`, and `caps` cannot give `foreign` (E0321); for a dependency named in `[trust] foreign`, `"foreign=LIB"` (`"foreign=z,sqlite3"`) limits the C libraries it may reach (section 9).
 - `[trust] foreign = ["name", ...]` names the dependencies that may call C: declare foreign blocks and take `Foreign`. Calling C is full trust, since C code is outside every capability check, so it is a separate, explicit list rather than one more cap, and only the program's limen.toml can hold it. An untrusted dependency that calls C is E0320. limen.lock gets a line per trusted dependency that calls C, `foreign NAME LIB,LIB`, written on the first build; when an update makes the dependency declare a library the line does not have, the build stops (E0324) until you review it and delete the line.
 - Limen has no ambient authority, so a function can only use a capability that reaches it as a parameter. The checker therefore knows everything a dependency can ever do from its signatures, and rejects the program (E0320) if a dependency's function takes a capability it was not granted, counting those held by the structs and enums it takes (the note names the field, `through Ctx.fs`). Granting is still only an upper bound: at run time the dependency gets exactly the capabilities you pass it, which can be narrowed with `only` and `under`.
 - A dependency is a local directory (`path`) or a git repository (`git`) at a `tag` or a `commit` (lowercase hex, at least 7 characters). The URL is `https://`, `http://`, `ssh://`, `git://`, `file://` or `user@host:path`. No registry holds the code: the URL is the name of the source, and the package index (below) only points at URLs.

@@ -1,0 +1,15 @@
+// Declares a library its caps do not name, and reaches another through a
+// dependency.
+use both
+
+foreign "z" {
+    pub fn zlibVersion() -> Str
+}
+
+foreign "c" {
+    pub fn getpid() -> Int32
+}
+
+pub fn root_of(f: Foreign) -> Float {
+    both.root(f, 8.0)
+}

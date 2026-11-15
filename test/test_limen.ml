@@ -1140,7 +1140,7 @@ fn main(root: Root) {
     "foreign: library `c` is not granted (grant it with --grant foreign=c)";
   panics "ffi-only" ~grants:{ Interp.no_grants with foreign = [ "*" ] }
     (cdecls
-     ^ "\nfn main(root: Root) {\n    let all = root.foreign\n    let some = all.only(\"sqlite3\")\n    root.stdout.print(\"{strlen(some, \"x\")}\")\n}\n")
+     ^ "\n// narrowed where the checker cannot see it (in sight, it is E0333)\nfn sql_only(f: Foreign) -> Foreign {\n    f.only(\"sqlite3\")\n}\n\nfn main(root: Root) {\n    let all = root.foreign\n    let some = sql_only(all)\n    root.stdout.print(\"{strlen(some, \"x\")}\")\n}\n")
     "foreign: library `c` is not granted (grant it with --grant foreign=c)";
   out "ffi-only-print" ~grants:{ Interp.no_grants with foreign = [ "*" ] }
     (cdecls
@@ -1157,7 +1157,7 @@ fn main(root: Root) {
     "foreign.copy: null pointer";
   (* a panic in a foreign call is caught like any other, and frees what it should *)
   out "ffi-catch" ~grants:libc
-    (cdecls ^ "\nfn main(root: Root) {\n    let f = root.foreign\n    let s = \"abc\" + \"def\"\n    root.stdout.print(\"{catch(|| abs(f.only(\"zlib\"), -1))} {strlen(f, s)}\")\n}\n")
+    (cdecls ^ "\nfn zlib_only(f: Foreign) -> Foreign {\n    f.only(\"zlib\")\n}\n\nfn main(root: Root) {\n    let f = root.foreign\n    let s = \"abc\" + \"def\"\n    root.stdout.print(\"{catch(|| abs(zlib_only(f), -1))} {strlen(f, s)}\")\n}\n")
     "Err(\"foreign: library `c` is not granted (grant it with --grant foreign=c)\") 6\n";
   (* foreign calls from many tasks at once *)
   let ffi_group = cdecls ^ {|
@@ -7498,6 +7498,21 @@ fn main(root: Root) {
   ok "trust-relock" (cpkg trusted = [] && Interp_util.find_sub (read_file lock) "foreign cdep c,z\n" 0 <> None) (read_file lock);
   put "cdep/cdep.lmn" (cdep_src [ ("c", "getpid") ]);
   Package.write_lock := false;
+  (* the C libraries a trusted dependency may call, named in its caps *)
+  (try Sys.remove lock with Sys_error _ -> ());
+  let narrowed libs = "[package]\nname = \"capp\"\n\n[dependencies]\ncdep = { path = \"../cdep\", caps = [" ^ libs ^ "] }\n\n[trust]\nforeign = [\"cdep\"]\n" in
+  ok "trust-foreign-libs" (cpkg (narrowed "\"foreign=c\"") = []) (show (cpkg (narrowed "\"foreign=c\"")));
+  ok "trust-foreign-libs-list" (cpkg (narrowed "\"foreign=z,c\"") = []) (show (cpkg (narrowed "\"foreign=z,c\"")));
+  let ds = cpkg (narrowed "\"foreign=z\"") in
+  ok "trust-foreign-libs-refused"
+    (codes ds = [ "E0320"; "E0320" ] && List.for_all (fun (d : Diag.t) -> Interp_util.find_sub d.message "calls C library `c`" 0 <> None) ds)
+    (show ds);
+  ok "trust-foreign-libs-empty" (codes (cpkg (narrowed "\"foreign=\"")) = [ "E0321" ]) "foreign= names libraries";
+  (* a function that reaches another dependency's library through a Foreign counts it *)
+  put "cdep/cdep.lmn" (cdep_src [ ("c", "getpid") ] ^ "\npub fn twice(f: Foreign) -> Int {\n    pid(f) * 2\n}\n");
+  let ds = cpkg (narrowed "\"foreign=z\"") in
+  ok "trust-foreign-libs-reach" (List.exists (fun (d : Diag.t) -> List.exists (fun n -> Interp_util.find_sub n "`cdep.twice` reaches `c`" 0 <> None) d.notes) ds) (show ds);
+  put "cdep/cdep.lmn" (cdep_src [ ("c", "getpid") ]);
   Sys.remove (Filename.concat pdir "capp/limen.toml");
 
   (* [grants] in limen.toml: the program's own grants, with --grant flags adding to them *)
@@ -7799,6 +7814,14 @@ fn main(root: Root) {
   ok "caps-grants-json" (code = 0 && Interp_util.find_sub o {|"grants":["exec=echo hi|-n","exec=sh -c"]|} 0 <> None) o;
   let code, _, e = limen_cli [ "run"; gexec; "--grant"; "exec=* -c" ] in
   ok "grants-exec-flag-bad" (code = 2 && Interp_util.find_sub e "exec grant" 0 <> None) (sprintf "code %d, err %S" code e);
+  put "grants/ffi.lmn" "foreign \"c\" {\n    fn abs(n: Int32) -> Int32\n}\n\nforeign \"m\" {\n    fn cbrt(x: Float) -> Float\n}\n\nfn main(root: Root) {\n    root.stdout.print(\"{abs(root.foreign, -2)} {cbrt(root.foreign, 27.0)} {root.foreign.allows(\"z\")}\")\n}\n";
+  List.iter
+    (fun (name, extra) ->
+      let code, o, e = limen_cli ([ "run" ] @ extra @ [ Filename.concat pdir "grants/ffi.lmn"; "--grant"; "foreign=c,m" ]) in
+      ok name (code = 0 && o = "2 3.0 false\n") (sprintf "code %d, out %S, err %S" code o e))
+    ([ ("grants-foreign-list", []) ] @ if native_enabled then [ ("grants-foreign-list-native", [ "--native" ]) ] else []);
+  let code, _, e = limen_cli [ "run"; Filename.concat pdir "grants/ffi.lmn"; "--grant"; "foreign=c," ] in
+  ok "grants-foreign-list-bad" (code = 2 && Interp_util.find_sub e "foreign grant" 0 <> None) (sprintf "code %d, err %S" code e);
   Sys.remove (Filename.concat pdir "grants/limen.toml");
   (* a dependency's own limen.toml never grants anything: only the program's does *)
   put "envy/envy.lmn" "pub fn get(env: Env) -> Str {\n    env.get(\"LIMEN_T_A\") ?? \"none\"\n}\n";
@@ -8082,7 +8105,7 @@ fn main(root: Root) {
   let listed = List.sort compare (List.map (fun (d : Package.dep) -> d.dname) manifest.deps) in
   ok "std-manifest-complete" (listed = List.sort compare (List.map fst Std_text.modules)) (String.concat ", " listed);
   ok "std-manifest-http" (List.exists (fun (d : Package.dep) -> d.dname = "http" && d.caps = [ "net"; "listen" ]) manifest.deps) "http: net, listen";
-  ok "std-manifest-sql" (List.exists (fun (d : Package.dep) -> d.dname = "sql" && d.caps = [ "fs" ]) manifest.deps && manifest.trust = [ "sql" ]) "sql: fs, trusted with C";
+  ok "std-manifest-sql" (List.exists (fun (d : Package.dep) -> d.dname = "sql" && d.caps = [ "fs"; "foreign=sqlite3" ]) manifest.deps && manifest.trust = [ "sql" ]) "sql: fs, sqlite3, trusted with C";
   ok "std-manifest-time" (List.exists (fun (d : Package.dep) -> d.dname = "time" && d.caps = [ "clock"; "fs" ]) manifest.deps) "time: clock (within), fs (load_zone)";
   ok "std-manifest-log" (List.exists (fun (d : Package.dep) -> d.dname = "log" && d.caps = [ "stdout"; "stderr"; "clock" ]) manifest.deps) "log: stdout, stderr, clock";
   ok "std-manifest-path" (List.exists (fun (d : Package.dep) -> d.dname = "path" && d.caps = [ "fs" ]) manifest.deps) "path: fs (walk)";
@@ -8911,6 +8934,30 @@ fn main(root: Root) {
      Pure.stmts_iter (function Ir.Loop _ -> incr loops | _ -> ()) main.body;
      (* `a` is one fused loop; `b` is two, since `shout` prints *)
      ok "pure-if-fusion-ir" (!loops = 3) (sprintf "%d loops" !loops));
+
+  (* ---------- Foreign narrowed per library ---------- *)
+  let ffs = "foreign \"c\" {\n    fn getpid() -> Int32\n    fn abs(n: Int32) -> Int32\n}\n\nforeign \"m\" {\n    fn cbrt(x: Float) -> Float\n}\n\n" in
+  says "foreign-narrowed-other" (ffs ^ "fn main(root: Root) {\n    let m = root.foreign.only(\"m\")\n    let p = getpid(m)\n}\n") "E0333"
+    "`getpid` calls C library `c`, but this Foreign grants only `m`";
+  says "foreign-narrowed-none" (ffs ^ "fn main(root: Root) {\n    let c = root.foreign.only(\"c\")\n    let none = c.only(\"m\")\n    let x = cbrt(none, 1.0)\n}\n") "E0333"
+    "but this Foreign grants no library";
+  errs "foreign-narrowed-inline" (ffs ^ "fn main(root: Root) {\n    let x = abs(root.foreign.only(\"m\"), 1)\n}\n") [ "E0333" ];
+  errs "foreign-narrowed-copy" (ffs ^ "fn main(root: Root) {\n    let c = root.foreign.only(\"c\")\n    let d = c\n    let x = cbrt(d, 1.0)\n}\n") [ "E0333" ];
+  errs "foreign-narrowed-shadow" (ffs ^ "fn main(root: Root) {\n    let c = root.foreign.only(\"c\")\n    let c = c.only(\"m\")\n    let x = cbrt(c, 1.0)\n}\n") [ "E0333" ];
+  errs "foreign-narrowed-ok"
+    (ffs ^ "fn main(root: Root) {\n    let c = root.foreign.only(\"c\")\n    let s = root.foreign.only(\"*\")\n    let mut v = root.foreign.only(\"m\")\n    v = root.foreign\n    let x = getpid(c) + abs(s, 1) + getpid(v)\n}\n") [];
+  (let _, ds, infos =
+     compile "foreign-libs-caps"
+       (ffs ^ "fn pid(c: Foreign) -> Int {\n    getpid(c)\n}\n\nfn both(c: Foreign) -> Float {\n    cbrt(c, 8.0) + pid(c).to_float()\n}\n\nfn raw(c: Foreign) -> Bytes {\n    c.copy(Handle { addr: 0 }, 0)\n}\n\nfn main(root: Root) {}\n")
+   in
+   let find n = List.find (fun (i : Check.fn_info) -> i.name = n) infos in
+   let text n = String.concat ", " (List.map (Check.cap_text (find n)) (find n).caps) in
+   ok "foreign-libs-caps" (ds = [] && text "pid" = "Foreign (c)" && text "both" = "Foreign (c, m)" && text "raw" = "Foreign" && text "cbrt" = "Foreign (m)")
+     (String.concat "; " (List.map text [ "pid"; "both"; "raw"; "cbrt" ])));
+  (* several libraries in one grant, both backends *)
+  out "foreign-grant-list" ~grants:{ Interp.no_grants with foreign = [ "c"; "m" ] }
+    (ffs ^ "fn main(root: Root) {\n    let f = root.foreign\n    root.stdout.print(\"{getpid(f) > 0} {cbrt(f, 8.0)} {f.allows(\"c\")} {f.allows(\"m\")} {f.allows(\"z\")}\")\n}\n")
+    "true 2.0 true true false\n";
 
   (* ---------- tuple assignment, or-patterns, `..`, list patterns, list `+`, last_index_of ---------- *)
   out "tuple-assign"

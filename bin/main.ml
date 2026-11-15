@@ -4,7 +4,7 @@ let usage =
   {|limen: a small language where I/O needs a capability
 
 usage:
-  limen run FILE [--native] [--grant net=HOST[:PORT]|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST:PORT]... [--grant env=NAME|*]... [--grant exec=PROGRAM[ ARGS|ARGS...]|*]... [--grant foreign=LIB|*]... [--seed N] [--no-sandbox] [-- ARGS...]
+  limen run FILE [--native] [--grant net=HOST[:PORT]|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST:PORT]... [--grant env=NAME|*]... [--grant exec=PROGRAM[ ARGS|ARGS...]|*]... [--grant foreign=LIB[,LIB...]|*]... [--seed N] [--no-sandbox] [-- ARGS...]
   limen build FILE [-o OUT] [--emit-c]
   limen check FILE [--json]
   limen caps FILE [--json]
@@ -81,7 +81,10 @@ let parse_grants args =
         if Caps.exec_entry v = None then die_usage ("exec grant: " ^ Caps.exec_grant_help);
         { g with exec = g.exec @ [ v ] }
       | Some i when String.sub a 0 i = "foreign" ->
-        { g with foreign = g.foreign @ [ String.sub a (i + 1) (String.length a - i - 1) ] }
+        (* one library, or several separated by commas: foreign=z,sqlite3 *)
+        let libs = String.split_on_char ',' (String.sub a (i + 1) (String.length a - i - 1)) in
+        if List.mem "" libs then die_usage "foreign grant: name C libraries, as in foreign=z or foreign=z,sqlite3";
+        { g with foreign = g.foreign @ libs }
       | None when a = "no-sandbox" -> g
       | Some i when String.sub a 0 i = "seed" -> (
         match int_of_string_opt (String.sub a (i + 1) (String.length a - i - 1)) with
@@ -395,17 +398,16 @@ let cmd_caps file json =
   if diags <> [] then (report diags; exit 1);
   let caps_str (i : Check.fn_info) = List.map Types.cap_name i.caps in
   (* a capability held through a struct or enum says where: `Net (via Client.net)` *)
-  let caps_via (i : Check.fn_info) =
-    List.map (fun c -> match List.assoc_opt c i.via with Some p -> Printf.sprintf "%s (via %s)" (Types.cap_name c) p | None -> Types.cap_name c) i.caps
-  in
+  let caps_via (i : Check.fn_info) = List.map (Check.cap_text i) i.caps in
   if json then begin
     let one (i : Check.fn_info) =
-      Printf.sprintf {|{"name":%s,"caps":[%s],"via":{%s},"callbacks":%b,"pure":%b,"pure_if":[%s]}|} (Diag.jstr i.name)
+      Printf.sprintf {|{"name":%s,"caps":[%s],"via":{%s},"callbacks":%b,"pure":%b,"pure_if":[%s],"libs":[%s]}|} (Diag.jstr i.name)
         (String.concat "," (List.map Diag.jstr (caps_str i)))
         (String.concat "," (List.map (fun (c, p) -> Diag.jstr (Types.cap_name c) ^ ":" ^ Diag.jstr p) i.via))
         i.callbacks
         (i.caps = [] && not i.callbacks)
         (String.concat "," (List.map Diag.jstr i.pure_if))
+        (String.concat "," (List.map Diag.jstr (if List.mem Types.Foreign i.caps then i.libs else [])))
     in
     let emb (m, path, size) = Printf.sprintf {|{"module":%s,"path":%s,"bytes":%d}|} (Diag.jstr m) (Diag.jstr path) size in
     print_endline

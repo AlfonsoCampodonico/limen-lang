@@ -1049,8 +1049,16 @@ static void w_init(int argc, char **argv) {
       g_exec[g_nexec] = w_exec_entry(g + 5);
       if (!g_exec[g_nexec++]) w_usage("exec grant: write PROGRAM, or PROGRAM ARGS|ARGS... with no empty prefix and not for *");
     } else if (strncmp(g, "foreign=", 8) == 0) {
-      g_foreign = (char **)w_realloc(g_foreign, sizeof(char *) * (size_t)(g_nforeign + 1));
-      g_foreign[g_nforeign++] = strdup(g + 8);
+      /* one library, or several separated by commas: foreign=z,sqlite3 */
+      for (const char *p = g + 8;;) {
+        const char *comma = strchr(p, ',');
+        size_t n = comma ? (size_t)(comma - p) : strlen(p);
+        if (n == 0) w_usage("foreign grant: name C libraries, as in foreign=z or foreign=z,sqlite3");
+        g_foreign = (char **)w_realloc(g_foreign, sizeof(char *) * (size_t)(g_nforeign + 1));
+        g_foreign[g_nforeign++] = strndup(p, n);
+        if (!comma) break;
+        p = comma + 1;
+      }
     } else if (strncmp(g, "listen=", 7) == 0) {
       g_listen = (char **)w_realloc(g_listen, sizeof(char *) * (size_t)(g_nlisten + 1));
       g_listen[g_nlisten++] = strdup(g + 7);

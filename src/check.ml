@@ -99,6 +99,10 @@ type fn_info = {
   caps : cap list;
   via : (cap * string) list;
   callbacks : bool;
+  libs : string list;
+      (* the C libraries it reaches with a Foreign: its own when it is a
+         foreign function, and those of the functions it uses that take a
+         Foreign, sorted *)
   pure_if : string list;
       (* its parameters of function type, when it only calls them or passes
          them on to a function that is pure if they are: it is pure when
@@ -364,6 +368,21 @@ let find_var f name = find_in name f.scopes
 let rec bound_in name = function [] -> false | s :: rest -> (s.vars != no_vars && Hashtbl.mem s.vars name) || bound_in name rest
 let is_local f name = bound_in name f.scopes
 
+(* The Foreign values of the function being checked narrowed to known
+   libraries with `only("lib")`: by variable (name and where it is bound). *)
+let foreign_known : ((string * Span.t) * string list) list ref = ref []
+
+(* The libraries a Foreign expression is known to be narrowed to: a variable
+   bound to one, or `x.only("lib")`. None when it is not known here. *)
+let rec known_foreign f (e : expr) =
+  match e.edesc with
+  | EVar m -> ( match find_var f m with Some v -> List.assoc_opt (m, v.vspan) !foreign_known | None -> None)
+  | EMethod (r, "only", _, [ { edesc = EStr [ SPLit lib ]; _ } ]) when (match repr r.ety with TCap Foreign -> true | _ -> false) -> (
+    match known_foreign f r with
+    | Some s -> Some (if lib = "*" then s else if List.mem lib s || List.mem "*" s then [ lib ] else [])
+    | None -> if lib = "*" then None else Some [ lib ])
+  | _ -> None
+
 let visible_names ctx f =
   List.concat_map (fun s -> List.of_seq (Hashtbl.to_seq_keys s.vars)) f.scopes
   @ List.of_seq (Hashtbl.to_seq_keys ctx.fns)
@@ -420,6 +439,13 @@ let cb_passes : (string * int) list ref = ref []
 let arg_of : (string * int) option ref = ref None
 let cb_uses : (string, bool * (string * int) list) Hashtbl.t = Hashtbl.create 16
 
+(* The functions each function uses by name (calls, methods, values), for
+   the C libraries it reaches; the library of each foreign function; and
+   (foreign_known, above) the Foreign values narrowed to known libraries. *)
+let refs_here : string list ref = ref []
+let fn_refs : (string, string list) Hashtbl.t = Hashtbl.create 16
+let foreign_libs : (string, string) Hashtbl.t = Hashtbl.create 8
+
 (* pairs, as long as the shorter list *)
 let rec zip a b = match (a, b) with x :: a, y :: b -> (x, y) :: zip a b | _ -> []
 
@@ -447,6 +473,7 @@ let rec resolved t =
 
 let add_bounds fname env sp =
   if env <> [] then uses_here := (sp, fname, env) :: !uses_here;
+  if !cur_fn <> "" && not (List.mem fname !refs_here) then refs_here := fname :: !refs_here;
   match Hashtbl.find_opt fn_bounds fname with
   | None -> ()
   | Some bs ->
@@ -1272,7 +1299,18 @@ and check_call ?want ctx f e callee args sp =
             | _ -> ps
           in
           List.iter2 (fun a p -> expect ctx f a p) args ps;
-          check_callbacks ctx f args ps
+          check_callbacks ctx f args ps;
+          (* a Foreign narrowed here to other libraries: the call would panic *)
+          (match (ps, args, Hashtbl.find_opt foreign_libs n) with
+           | TCap Foreign :: _, a :: _, Some lib -> (
+             match known_foreign f a with
+             | Some s when not (List.mem lib s || List.mem "*" s) ->
+               err ctx "E0333" a.espan
+                 (sprintf "`%s` calls C library `%s`, but this Foreign grants %s" n lib
+                    (if s = [] then "no library" else "only " ^ String.concat ", " (List.map (fun l -> "`" ^ l ^ "`") s)))
+                 ~notes:[ "it was narrowed with `only`, so the call would panic; narrow it to the library the function belongs to" ]
+             | _ -> ())
+           | _ -> ())
         | EVar g when (not (is_local f g)) && Hashtbl.mem ctx.fns g ->
           (* a function parameter passed on: pure if the callee is, there *)
           List.iteri
@@ -2498,6 +2536,8 @@ and check_stmt ctx f s : bool =
         at
       | None -> check_expr ctx f e
     in
+    (* known before the name is bound: `let c = c.only("z")` narrows the old `c` *)
+    (if not m then match known_foreign f e with Some s -> foreign_known := ((n, nsp), s) :: !foreign_known | None -> ());
     bind f n { vty = t; vmut = m; vspan = nsp; vkind = KLet };
     false
   | SAssign (lhs, rhs) ->
@@ -2718,9 +2758,12 @@ let check_fn ctx (d : fn_decl) (s : fsig) =
   cb_params := List.filter_map (fun (p, t) -> match repr t with TFn _ -> Some (p.prm_name, p.prm_span) | _ -> None) (zip d.fn_params s.ps);
   cb_escaped := false;
   cb_passes := [];
+  refs_here := [];
+  foreign_known := [];
   Fun.protect ~finally:(fun () ->
       check_pending ctx;
       Hashtbl.replace cb_uses d.fn_name (!cb_escaped, List.rev !cb_passes);
+      Hashtbl.replace fn_refs d.fn_name (List.rev !refs_here);
       cb_params := [];
       cur_fn := "") @@ fun () ->
   let genv = List.map (fun g -> (g, TParam g)) d.fn_gen in
@@ -2782,6 +2825,10 @@ let case_note = "in the table case "
 
 (* What `limen caps` says of a function with no capability: `pure`, `pure if
    f is` (and `f and g are`), or `pure itself, runs callbacks`. *)
+let cap_text (i : fn_info) c =
+  let name = if c = Foreign && i.libs <> [] then sprintf "Foreign (%s)" (String.concat ", " i.libs) else cap_name c in
+  match List.assoc_opt c i.via with Some p -> sprintf "%s (via %s)" name p | None -> name
+
 let pure_text (i : fn_info) =
   match (i.callbacks, i.pure_if) with
   | false, _ -> "pure"
@@ -2847,6 +2894,8 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
   Hashtbl.reset Types.authority;
   Hashtbl.reset used_methods;
   Hashtbl.reset foreign_fns;
+  Hashtbl.reset foreign_libs;
+  Hashtbl.reset fn_refs;
   Hashtbl.reset reported_bounds;
   Hashtbl.reset compares_direct;
   generic_uses := [];
@@ -3070,6 +3119,7 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
               (ps, match d.fn_ret with Some te -> resolve ctx env te | None -> TUnit)
             | Some _ -> (
               Hashtbl.replace foreign_fns d.fn_name ();
+              Option.iter (fun (fo : foreign) -> Hashtbl.replace foreign_libs d.fn_name fo.flib) d.fn_foreign;
               (* the Limen type of a C function: Foreign first, Out parameters moved to the result *)
               if d.fn_name = "main" then err ctx "E0330" d.fn_span "`main` cannot be a foreign function";
               match Ffi.of_decl ~structs:(Hashtbl.find_opt ctx.structs) d with
@@ -3205,6 +3255,32 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
       (fun _ (fns, passes) -> if List.for_all (fun (g, _) -> Hashtbl.mem cond g) passes then Some (fns, passes) else (changed := true; None))
       cond
   done;
+  (* the C libraries each function reaches with a Foreign, until nothing changes *)
+  let libs = Hashtbl.create 16 and takes_foreign = Hashtbl.create 16 in
+  List.iter
+    (fun ((d : fn_decl), s) ->
+      if List.mem_assoc Foreign (authority_of s.ps) then Hashtbl.replace takes_foreign d.fn_name ();
+      (* "limen" is the runtime's own functions (the sql module's helpers), not a library *)
+      Hashtbl.replace libs d.fn_name (match d.fn_foreign with Some fo when fo.flib <> "limen" -> [ fo.flib ] | _ -> []))
+    sigs;
+  let changed = ref true in
+  while !changed do
+    changed := false;
+    List.iter
+      (fun ((d : fn_decl), _) ->
+        let have = Hashtbl.find libs d.fn_name in
+        let more =
+          List.concat_map
+            (fun g -> if Hashtbl.mem takes_foreign g then Option.value ~default:[] (Hashtbl.find_opt libs g) else [])
+            (Option.value ~default:[] (Hashtbl.find_opt fn_refs d.fn_name))
+        in
+        let now = List.sort_uniq compare (have @ more) in
+        if now <> have then begin
+          Hashtbl.replace libs d.fn_name now;
+          changed := true
+        end)
+      sigs
+  done;
   let infos =
     List.map
       (fun ((d : fn_decl), s) ->
@@ -3213,6 +3289,7 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
           caps = List.map fst held;
           via = List.filter_map (fun (c, p) -> Option.map (fun p -> (c, p)) p) held;
           callbacks = List.exists has_fn s.ps || d.fn_bounds <> [];
+          libs = Hashtbl.find libs d.fn_name;
           pure_if = (match Hashtbl.find_opt cond d.fn_name with Some (fns, _) -> fns | None -> []) })
       (* forwarders only pass their arguments on; the methods they call are reported *)
       (List.filter (fun ((d : fn_decl), _) -> d.fn_test = None && d.fn_span.file <> Prelude.methods_file && d.fn_span.Span.file <> Prelude.file && not (Embed.is_forwarder d.fn_name)) sigs)

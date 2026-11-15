@@ -1,0 +1,12 @@
+# Trusted dependencies whose caps name the C libraries they may call: a
+# library left out is E0320, also when it is reached through another
+# dependency's function that takes a Foreign.
+[package]
+name = "app"
+
+[dependencies]
+zl = { path = "zl", caps = ["foreign=z"] }
+both = { path = "both", caps = ["foreign=m,c"] }
+
+[trust]
+foreign = ["zl", "both"]

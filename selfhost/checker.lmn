@@ -549,6 +549,9 @@ fn add_bounds(st: env.State, cx: env.Cx, name: Str, inst: List[(Str, types.Ty)],
     if !inst.is_empty() {
         st.uses_here = [(sp, name, inst)] + st.uses_here
     }
+    if st.cur_fn != "" && !st.refs_here.contains(name) {
+        st.refs_here = [name] + st.refs_here
+    }
     for b in cx.fn_bounds.get(name) ?? [] {
         match inst.find(|p| p.0 == b.param) {
             Some((_, t)) => {
@@ -973,6 +976,17 @@ fn check_call(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, callee: ast.Ex
                 }
                 if foreign {
                     st = check_callbacks(st, cx, fx, args2, ps)
+                    // a Foreign narrowed here to other libraries: the call would panic
+                    match (ps, args2, st.desc(callee)) {
+                        ([TCap("Foreign"), ..], [a, ..], EVar(n)) => match (cx.foreign_libs.get(n), known_foreign(st, fx, a)) {
+                            (Some(lib), Some(s)) if !s.contains(lib) && !s.contains("*") => {
+                                let grants = if s.is_empty() { "no library" } else { "only " + s.map(|l| "`" + l + "`").join(", ") }
+                                st = st.report(diag.error("E0333", a.span, "`{n}` calls C library `{lib}`, but this Foreign grants {grants}").note("it was narrowed with `only`, so the call would panic; narrow it to the library the function belongs to"))
+                            },
+                            _ => {},
+                        },
+                        _ => {},
+                    }
                 }
             }
             if labelled {
@@ -995,6 +1009,26 @@ fn check_call(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, callee: ast.Ex
             st = st.report(diag.error("E0108", callee.span, "a value of type `{st.show(t)}` is not a function"))
             (TErr, check_args(st, cx, fx, args))
         },
+    }
+}
+
+// The libraries a Foreign expression is known to be narrowed to: a
+// variable bound to one, or `x.only("lib")`. None when it is not known
+// here.
+fn known_foreign(st: env.State, fx: env.Fx, e: ast.Expr) -> Option[List[Str]] {
+    match st.desc(e) {
+        EVar(m) => match fx.find_var(m) {
+            Some(v) => st.foreign_known.find(|k| k.0 == (m, v.span)).map(|k| k.1),
+            None => None,
+        },
+        EMethod(r, "only", _, [arg]) => match (st.repr(st.type_of(r)), st.desc(arg)) {
+            (TCap("Foreign"), EStr([SPLit(lib)])) => match known_foreign(st, fx, r) {
+                Some(s) => Some(if lib == "*" { s } else if s.contains(lib) || s.contains("*") { [lib] } else { [] }),
+                None => if lib == "*" { None } else { Some([lib]) },
+            },
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -2667,6 +2701,15 @@ fn check_stmt(st: env.State, cx: env.Cx, fx: env.Fx, s: ast.Stmt) -> (Bool, env.
                     st = next
                     t
                 },
+            }
+            // known before the name is bound: `let c = c.only("z")` narrows the old `c`
+            if !m {
+                match known_foreign(st, fx, e) {
+                    Some(s) => {
+                        st.foreign_known = [((n, nsp), s)] + st.foreign_known
+                    },
+                    None => {},
+                }
             }
             (false, fx.bind(n, env.Var { ty: t, mutable: m, span: nsp, kind: KLet }), st)
         },

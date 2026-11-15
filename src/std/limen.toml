@@ -13,7 +13,7 @@ http = { path = ".", caps = ["net", "listen"] }
 format = { path = ".", caps = [] }
 time = { path = ".", caps = ["clock", "fs"] }
 regex = { path = ".", caps = [] }
-sql = { path = ".", caps = ["fs"] }
+sql = { path = ".", caps = ["fs", "foreign=sqlite3"] }
 errors = { path = ".", caps = [] }
 hex = { path = ".", caps = [] }
 base64 = { path = ".", caps = [] }

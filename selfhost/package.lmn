@@ -460,6 +460,12 @@ fn dependency(name: Str, fields: List[(Str, Value)], span: ast.Span, dir: Str) -
         if c == "foreign" {
             return Err(bad("`caps` cannot grant foreign: calling C is full trust; name the dependency in [trust] instead: foreign = [\"{name}\"]"))
         }
+        if c.starts_with("foreign=") {
+            if c.slice(8, c.len()).split(",").any(|l| l == "") {
+                return Err(bad("`foreign=` names C libraries: \"foreign=z\" or \"foreign=z,sqlite3\""))
+            }
+            continue
+        }
         if !cap_grants().contains(c) {
             return Err(bad("unknown capability `{c}`; use {cap_grants().join(", ")}"))
         }

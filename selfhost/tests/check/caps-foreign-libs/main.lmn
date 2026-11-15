@@ -1,0 +1,10 @@
+// The program passes its Foreign to both dependencies.
+use both
+use zl
+
+fn main(root: Root) {
+    let f = root.foreign
+    let a = both.root(f, 27.0)
+    let b = zl.root_of(f)
+    let v = zl.zlibVersion(f)
+}
