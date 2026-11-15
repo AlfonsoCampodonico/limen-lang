@@ -89,11 +89,17 @@ type value =
   | VGroup of group
   | VChan of chan
   | VChanFn
+  | VAtomic of int64 ref (* shared, not copied: tasks that capture one change the same Int *)
+  | VShared of shared
   | VBuiltin of string (* assert, assert_eq *)
 
 (* A channel as natively: a buffer of up to [cap] values (none when cap is
    0), and queues of tasks waiting to send and to receive. *)
 and chan = { q : value Queue.t; cap : int; mutable closed : bool; rq : waiter Queue.t; sq : waiter Queue.t }
+
+(* A Shared[T]: the value, and whether an update (or a get or set, while
+   another task's update has stepped aside at a checkpoint) holds it. *)
+and shared = { mutable sv : value; mutable busy : bool }
 
 (* A waiting task. A `select` puts one on every channel it waits on, all
    sharing one claim; the first operation to happen sets [fired] to its
@@ -103,12 +109,13 @@ and claim = { mutable fired : int }
 and waiter = { claim : claim; idx : int; mutable v : value; mutable ok : bool }
 
 (* A task's cancel flag: set by its group's deadline, seen at its next wait. *)
-and task = { mutable cancelled : bool; mutable scopes : group list; sink : sink option; mutable unwinding : bool }
+and task = { mutable cancelled : bool; mutable scopes : group list; sink : sink option; mutable unwinding : bool; mutable updating : Span.t option }
 (* scopes: the groups whose bodies it is running under their deadline,
    innermost first; a passed deadline stops the body at its next wait too.
    sink: where its output goes, None for stdout itself. unwinding: its
    cancellation is unwinding it, so checkpoints let the defers it runs
-   finish (see checkpoint). *)
+   finish (see checkpoint). updating: where the update it is running was
+   called, while its function runs (which must not wait). *)
 
 (* The output of a task of an ordered group, held until the tasks started
    before it have finished and the group's body has ended (section 10). *)
@@ -322,6 +329,8 @@ let rec show ?(top = true) v =
   | VCap c -> "<" ^ cap_name c ^ ">"
   | VGroup _ -> "<group>"
   | VChan _ -> "<chan>"
+  | VAtomic _ -> "<atomic>"
+  | VShared _ -> "<shared>"
   | VChanFn | VBuiltin _ -> "<fn>"
 
 let rec equal a b =
@@ -340,6 +349,8 @@ let rec equal a b =
     (* the same entries, in any order *)
     KM.cardinal a.m = KM.cardinal b.m
     && KM.for_all (fun k (_, v) -> match KM.find_opt k b.m with Some (_, w) -> equal v w | None -> false) a.m
+  | VAtomic x, VAtomic y -> x == y
+  | VShared x, VShared y -> x == y
   | _ -> false
 
 (* (enum, variant) -> position in the declaration, for ordering enum values *)
@@ -575,7 +586,7 @@ let rec plain_type t =
   | TList a | TArray (a, _) -> plain_type a
   | TMap (k, v) -> plain_type k && plain_type v
   | TNamed (n, args) -> List.for_all plain_type args && not (Hashtbl.mem Types.authority n)
-  | TFn _ | TCap _ | TChan _ | TGroup _ | TParam _ | TVar _ | TLen _ | TErr -> false
+  | TFn _ | TCap _ | TChan _ | TAtomic | TShared _ | TGroup _ | TParam _ | TVar _ | TLen _ | TErr -> false
 
 (* The names a function's body may call, and whether it starts tasks,
    selects or makes channels (the ways a computation on plain values could
@@ -737,7 +748,7 @@ let clock_now_ms () =
   | None -> Int64.of_float (Unix.gettimeofday () *. 1000.)
 
 (* The task running now; main and tests run as tasks nobody cancels. *)
-let current = ref { cancelled = false; scopes = []; sink = None; unwinding = false }
+let current = ref { cancelled = false; scopes = []; sink = None; unwinding = false; updating = None }
 
 (* Wait until [cond] holds. A cancelled task stops instead (raising
    Cancelled) unless [cancellable] is false, which is only for joining the
@@ -748,6 +759,9 @@ let stopped t = t.cancelled || List.exists (fun g -> g.gcancelled) t.scopes
 let wait_until ?io ?tm ?(cancellable = true) cond =
   if not (cond ()) then begin
     let t = !current in
+    (match t.updating with
+     | Some sp when cancellable && not (stopped t) -> raise (Panic ("update must not wait", sp))
+     | _ -> ());
     if cancellable && stopped t then raise Cancelled;
     let c = if cancellable then fun () -> cond () || stopped t else cond in
     Effect.perform (Block (c, io, tm));
@@ -2215,7 +2229,7 @@ let rec eval rt env e : value =
        else begin
          (* the deadline: a coroutine of its own that cancels the tasks when the time comes *)
          let tm = timer_after ms in
-         spawn_fiber { cancelled = false; scopes = []; sink = None; unwinding = false } (fun () ->
+         spawn_fiber { cancelled = false; scopes = []; sink = None; unwinding = false; updating = None } (fun () ->
              wait_until ~tm ~cancellable:false (fun () -> !joined || rung tm);
              if not !joined then cancel_group g)
        end);
@@ -2269,6 +2283,7 @@ and eval_var rt env n sp =
       | None ->
         if n = "panic" then VPanicFn
         else if n = "channel" then VChanFn
+        else if n = "atomic" || n = "shared" then VBuiltin n
         else if n = "assert" || n = "assert_eq" || n = "map" || n = "catch" || n = "bytes" || n = "keep" then VBuiltin n
         else raise (Panic ("internal: unbound name " ^ n, sp)))
 
@@ -2355,6 +2370,8 @@ and apply rt fv args sp =
         { q = Queue.create (); cap = (if n > Int64.of_int max_int then max_int else Int64.to_int n); closed = false;
           rq = Queue.create (); sq = Queue.create () }
     | _ -> raise (Panic ("channel capacity cannot be negative", sp)))
+  | VBuiltin "atomic" -> (match args with [ VInt n ] -> VAtomic (ref n) | _ -> failwith "internal: atomic")
+  | VBuiltin "shared" -> (match args with [ v ] -> VShared { sv = v; busy = false } | _ -> failwith "internal: shared")
   | VPanicFn -> (
     match args with [ VStr m ] -> raise (Panic (m, sp)) | _ -> raise (Panic ("panic", sp)))
   | _ -> failwith "internal: not callable"
@@ -2591,6 +2608,31 @@ and limen_method rt n args sp =
   | "Map::merge", [ VMap mv; VMap other ] -> VMap (List.fold_left (fun m (k, v) -> map_put m k v) mv (map_entries other))
   | _ -> call_fn rt (Hashtbl.find rt.fns n) args
 
+(* Shared: one task at a time holds the value (a task's update can step
+   aside at a checkpoint while it holds it); the others wait, as natively,
+   not cancellably: the holder never waits, so it lets go soon. The
+   function of an update must not wait (wait_until), and must not use a
+   Shared at all, as natively. A panic or a cancellation in it leaves the
+   value as it was. *)
+and shared_call rt sh name args sp =
+  let t = !current in
+  if t.updating <> None then raise (Panic ("update must not wait: its function uses a Shared value", sp));
+  wait_until ~cancellable:false (fun () -> not sh.busy);
+  match (name, args) with
+  | "get", [] -> sh.sv
+  | "set", [ v ] -> sh.sv <- v; VUnit
+  | "update", [ f ] ->
+    sh.busy <- true;
+    t.updating <- Some sp;
+    let v =
+      Fun.protect
+        ~finally:(fun () -> t.updating <- None; sh.busy <- false)
+        (fun () -> apply rt f [ sh.sv ] sp)
+    in
+    sh.sv <- v;
+    v
+  | _ -> failwith "internal: shared"
+
 and call_method rt v name args sp =
   let call f xs = apply rt f xs sp in
   let user_method = match v with VStruct (n, _) | VEnum (n, _, _) -> Hashtbl.find_opt rt.fns (n ^ "::" ^ name) | _ -> None in
@@ -2703,7 +2745,7 @@ and call_method rt v name args sp =
       end
       else g.gparent
     in
-    let t = { cancelled = g.gcancelled; scopes = []; sink; unwinding = false } in
+    let t = { cancelled = g.gcancelled; scopes = []; sink; unwinding = false; updating = None } in
     let res = ref (if g.gcancelled then Some Stopped else None) in
     g.tasks <- (t, res) :: g.tasks;
     g.kept <- (go = "go") :: g.kept;
@@ -2721,6 +2763,12 @@ and call_method rt v name args sp =
             advance rt.out g
           | _ -> ());
     VUnit
+  | VAtomic a, "get", [] -> VInt !a
+  | VAtomic a, "set", [ VInt n ] -> a := n; VUnit
+  | VAtomic a, "add", [ VInt n ] -> a := Int64.add !a n; VInt !a
+  | VAtomic a, "swap", [ VInt n ] -> let old = !a in a := n; VInt old
+  | VAtomic a, "compare_and_set", [ VInt old; VInt n ] -> if !a = old then (a := n; VBool true) else VBool false
+  | VShared sh, ("get" | "set" | "update"), _ -> shared_call rt sh name args sp
   | VChan ch, "send", [ v ] -> chan_send ch v sp; VUnit
   | VChan ch, "recv", [] -> ( match chan_recv ch with Some v -> some v | None -> none)
   | VChan ch, "close", [] ->
@@ -2856,7 +2904,7 @@ let run ?(before_main = fun () -> ()) ~out ?(err = to_stderr) ~grants (user_item
     Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
     let result = ref None in
     try
-      spawn_fiber { cancelled = false; scopes = []; sink = None; unwinding = false } (fun () -> result := Some (call_fn rt d args));
+      spawn_fiber { cancelled = false; scopes = []; sink = None; unwinding = false; updating = None } (fun () -> result := Some (call_fn rt d args));
       schedule (fun () -> !result <> None) d.fn_span;
       Queue.clear runq;
       (* a `dyn Error` from main is reported by its message *)
@@ -2864,7 +2912,7 @@ let run ?(before_main = fun () -> ()) ~out ?(err = to_stderr) ~grants (user_item
       | ( VEnum ("Result", "Err", [ e ]),
           Some { tdesc = TyName ("Result", [ _; { tdesc = TyName ("dyn", [ { tdesc = TyName ("Error", []); _ } ]); _ } ]); _ } ) ->
         let m = ref None in
-        spawn_fiber { cancelled = false; scopes = []; sink = None; unwinding = false } (fun () -> m := Some (call_method rt e "message" [] d.fn_span));
+        spawn_fiber { cancelled = false; scopes = []; sink = None; unwinding = false; updating = None } (fun () -> m := Some (call_method rt e "message" [] d.fn_span));
         schedule (fun () -> !m <> None) d.fn_span;
         Queue.clear runq;
         Ok (VEnum ("Result", "Err", [ Option.get !m ]))
@@ -2925,7 +2973,7 @@ let run_tests_timed ?(select = fun _ -> true) ~out (user_items : item list) :
           | Error e -> Error e
           | Ok () ->
           try
-            spawn_fiber { cancelled = false; scopes = []; sink = None; unwinding = false } (fun () -> ignore (call_fn rt d args); finished := true);
+            spawn_fiber { cancelled = false; scopes = []; sink = None; unwinding = false; updating = None } (fun () -> ignore (call_fn rt d args); finished := true);
             schedule (fun () -> !finished) d.fn_span;
             Ok ()
           with

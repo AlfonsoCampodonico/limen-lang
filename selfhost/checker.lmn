@@ -45,7 +45,7 @@ fn inner(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr) -> (types.Ty, env.S
                         let (t, next) = check_expr(st, cx, fx, x)
                         st = next
                         match st.repr(t) {
-                            TFn(..) | TCap(_) | TChan(_) => {
+                            TFn(..) | TCap(_) | TChan(_) | TAtomic | TShared(_) => {
                                 st = st.report(diag.error("E0201", x.span, "cannot interpolate a value of type `{st.show(t)}`"))
                             },
                             _ => {},
@@ -128,7 +128,12 @@ fn inner(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr) -> (types.Ty, env.S
             }
         },
         EMatch(s, arms) => check_match(st, cx, fx, s, arms, e.span, None),
-        ESelect(arms) => check_select(st, cx, fx, arms, e.span),
+        ESelect(arms) => {
+            if st.no_wait > 0 {
+                st = update_waits(st, e.span, "a `select` can wait")
+            }
+            check_select(st, cx, fx, arms, e.span)
+        },
         EBlock(b) => check_block(st, cx, fx, b),
         EClosure(ps, body) => check_closure(st, cx, fx, ps, body, None),
         EStruct(name, nsp, fields) => check_struct_lit(st, cx, fx, name, nsp, fields, e.span),
@@ -153,6 +158,9 @@ fn inner(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr) -> (types.Ty, env.S
         EGroup(name, _, until, b) => {
             let (t, next) = st.fresh()
             st = next
+            if st.no_wait > 0 {
+                st = update_waits(st, e.span, "a `group` waits for its tasks")
+            }
             match until {
                 Some(dl) => {
                     let (ct, next) = check_expr(st, cx, fx, dl.clock)
@@ -261,6 +269,11 @@ fn coerce(st: env.State, cx: env.Cx, e: ast.Expr, t: types.Ty, b: env.Bound) -> 
                     return st.report(d)
                 },
                 None => {},
+            }
+            let kind = st.subst.chan_kind(ct)
+            if st.subst.has_chan(ct) && !st.subst.has_fn(ct) && kind != Some("channel") {
+                let d = diag.error("E0112", e.span, "`{st.show(ct)}` holds an `Atomic` or `Shared` value, so it cannot become `dyn {bn}`").note("shared state must stay visible in types; pass it with a type parameter, as in `[T: " + bn + "]`")
+                return st.report(d)
             }
             if st.subst.has_fn(ct) || st.subst.has_chan(ct) {
                 let d = diag.error("E0112", e.span, "`{st.show(ct)}` holds a function or channel, so it cannot become `dyn {bn}`").note("a function or channel could carry authority out of sight; pass it with a type parameter, as in `[T: " + bn + "]`")
@@ -528,7 +541,7 @@ fn comparing_generics() -> List[(Str, Str, Str)] {
 pub fn refuse_compare(st: env.State, sp: ast.Span, name: Str, t: types.Ty) -> env.State {
     let t = st.repr(t)
     match t {
-        TFn(..) | TCap(_) | TChan(_) | TDyn(..) => st.report(diag.error("E0201", sp, "`{name}` compares values, and values of type `{st.show(t)}` cannot be compared")),
+        TFn(..) | TCap(_) | TChan(_) | TAtomic | TShared(_) | TDyn(..) => st.report(diag.error("E0201", sp, "`{name}` compares values, and values of type `{st.show(t)}` cannot be compared")),
         _ => match st.held(t) {
             Some(h) => st.report(diag.error("E0201", sp, "`{name}` compares values, and {h}").note("capabilities have no equality, so neither has a value holding one; compare something it holds that is not a capability, as in `xs.any(|x| x.name == name)`")),
             None => st,
@@ -832,7 +845,7 @@ fn builtin_call(st: env.State, cx: env.Cx, fx: env.Fx, n: Str, args: List[ast.Ex
                     let (t, next) = check_expr(st, cx, fx, a)
                     let next = expect(next, cx, fx, b, t)
                     match next.repr(t) {
-                        TFn(..) | TCap(_) | TChan(_) | TDyn(..) => next.report(diag.error("E0201", sp, "values of type `{next.show(t)}` cannot be compared")),
+                        TFn(..) | TCap(_) | TChan(_) | TAtomic | TShared(_) | TDyn(..) => next.report(diag.error("E0201", sp, "values of type `{next.show(t)}` cannot be compared")),
                         _ => refuse_compare(next, sp, "assert_eq", t),
                     }
                 },
@@ -856,6 +869,24 @@ fn builtin_call(st: env.State, cx: env.Cx, fx: env.Fx, n: Str, args: List[ast.Ex
             }
             let (t, st) = st.fresh()
             Some((TChan(t), st))
+        },
+        "atomic" => {
+            st = match args {
+                [a] => expect(st, cx, fx, a, TInt),
+                _ => wrong(st, "`atomic` takes 1 argument, its first value"),
+            }
+            Some((TAtomic, st))
+        },
+        "shared" => match args {
+            [a] => {
+                let (t, st) = check_expr(st, cx, fx, a)
+                Some((TShared(t), st))
+            },
+            _ => {
+                let st = wrong(st, "`shared` takes 1 argument, its first value")
+                let (t, st) = st.fresh()
+                Some((TShared(t), st))
+            },
         },
         // catch(|| ...): Ok(value), or Err(message) if anything inside panicked
         "catch" => {
@@ -1610,6 +1641,14 @@ fn builtin_method_call(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv:
             return (TErr, check_args(st, cx, fx, args))
         },
     }
+    if st.no_wait > 0 {
+        match waits(rt, name) {
+            Some(what) => {
+                st = update_waits(st, nsp, "`{name}` on `{st.show(rt)}` {what}")
+            },
+            None => {},
+        }
+    }
     match (name, rt) {
         ("join", TList(a)) => {
             st = st.unify_at(recv.span, TStr, a)
@@ -1628,7 +1667,16 @@ fn builtin_method_call(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv:
         st = check_args(st, cx, fx, args)
     } else {
         for (a, p) in args.zip(m.params) {
-            st = expect(st, cx, fx, a, p)
+            st = match (name, rt, a.desc) {
+                // the function runs holding the lock: it must not wait
+                ("update", TShared(_), EClosure(..)) => {
+                    st.no_wait = st.no_wait + 1
+                    let mut next = expect(st, cx, fx, a, p)
+                    next.no_wait = next.no_wait - 1
+                    next
+                },
+                _ => expect(st, cx, fx, a, p),
+            }
         }
     }
     match (name, rt) {
@@ -1648,6 +1696,23 @@ fn builtin_method_call(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv:
         _ => {},
     }
     (m.result, st)
+}
+
+// E0312: inside a closure literal given to `Shared.update`, which runs
+// holding the value's lock. What else waits (a call of a function that
+// waits) is a panic when it happens: "update must not wait".
+fn waits(rt: types.Ty, name: Str) -> Option[Str] {
+    match (rt, name) {
+        (TChan(_), "send" | "recv") => Some("can wait"),
+        (TShared(_), _) => Some("takes a lock another task can hold"),
+        (TCap("Clock"), "sleep") | (TCap("Stdin"), _) | (TCap("Listener"), "accept") | (TCap("Conn"), "read" | "write") | (TCap("Exec"), "run") => Some("can wait"),
+        (TCap("Net"), "get" | "connect" | "connect_tls") => Some("can wait"),
+        _ => None,
+    }
+}
+
+fn update_waits(st: env.State, sp: ast.Span, what: Str) -> env.State {
+    st.report(diag.error("E0312", sp, "the function given to `update` must not wait: {what}").note("`update` holds the Shared value's lock while its function runs; wait before or after it, and only compute the new value inside"))
 }
 
 fn sort_uniq(xs: List[Str]) -> List[Str] {
@@ -1997,7 +2062,7 @@ fn check_bin(st: env.State, cx: env.Cx, fx: env.Fx, op: ast.BinOp, a: ast.Expr, 
                 },
                 Lt | Le | Gt | Ge => (TBool, if unordered(st, cx, t).is_some() { bad(st) } else { st }),
                 _ => match t {
-                    TFn(..) | TCap(_) | TChan(_) | TDyn(..) => (TBool, bad(st)),
+                    TFn(..) | TCap(_) | TChan(_) | TAtomic | TShared(_) | TDyn(..) => (TBool, bad(st)),
                     // capabilities have no equality, so neither has a value holding one
                     _ => match st.held(t) {
                         Some(h) => (TBool, st.report(diag.error("E0201", sp, "operator `{op_name(op)}` cannot be applied to `{st.show(t)}`").note(h + ", and capabilities cannot be compared"))),

@@ -1,0 +1,61 @@
+// State that server tasks share: a hit counter (an Atomic) and a rate
+// limiter (a Shared map from client to the requests it has left), updated
+// by the task of every connection at once without losing a count.
+// Run: limen run examples/hit_counter.lmn --grant listen=127.0.0.1:0 --grant net=127.0.0.1
+use http
+
+// Each client may make `budget` requests.
+fn take(left: Map[Str, Int], client: Str, budget: Int) -> Map[Str, Int] {
+    let mut m = left
+    m[client] = (left.get(client) ?? budget) - 1
+    m
+}
+
+fn route(r: http.Request, hits: Atomic, left: Shared[Map[Str, Int]]) -> http.Response {
+    let n = hits.add(1)
+    let client = r.header("x-client") ?? "anonymous"
+    // the update is all-or-nothing: no other request of this client gets
+    // between reading what is left and taking one
+    let after = left.update(|m| take(m, client, 3))
+    if (after.get(client) ?? 0) < 0 {
+        http.text(429, "slow down, {client}")
+    } else {
+        http.text(200, "hello {client}, request {n}")
+    }
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let l = root.listen.on("127.0.0.1:0")?
+    let port = l.port()
+    let net = root.net
+    let hits = atomic(0)
+    let left: Shared[Map[Str, Int]] = shared(map())
+    let clients = ["ada", "bob", "cy"]
+    let statuses = group g {
+        g.go(|| {
+            // each connection gets a task of its own
+            let served = http.serve(l, 15, |r| route(r, hits, left))
+            ()
+        })
+        for client in clients {
+            for i in 0..<5 {
+                g.go(|| {
+                    let head = [http.Header { name: "x-client", value: client }]
+                    match http.request(net, "GET", "http://127.0.0.1:{port}/", head, "") {
+                        Ok(resp) => resp.status,
+                        Err(_) => 0,
+                    }
+                })
+            }
+        }
+    }
+    let ok = statuses.filter(|s| s == 200).len()
+    let limited = statuses.filter(|s| s == 429).len()
+    root.stdout.print("{hits.get()} requests: {ok} answered, {limited} limited")
+    let budgets = left.get()
+    for client in clients {
+        let n = budgets.get(client) ?? 0
+        root.stdout.print("{client}: {if n < 0 { 0 } else { n }} left, {if n < 0 { -n } else { 0 }} refused")
+    }
+    Ok(())
+}

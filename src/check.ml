@@ -122,7 +122,7 @@ let err ctx ?notes ?fix code span msg = ctx.diags <- Diag.make ?notes ?fix code 
    holding a capability, as `==` refuses them. *)
 let refuse_compare ctx sp name t =
   match repr t with
-  | (TFn _ | TCap _ | TChan _ | TDyn _) as t ->
+  | (TFn _ | TCap _ | TChan _ | TAtomic | TShared _ | TDyn _) as t ->
     err ctx "E0201" sp (sprintf "`%s` compares values, and values of type `%s` cannot be compared" name (show t))
   | t -> (
     match held t with
@@ -178,7 +178,7 @@ let unify_at ctx span want got =
   try unify want got
   with Mismatch -> err ctx "E0201" span (sprintf "expected `%s`, found `%s`" (show want) (show got))
 
-let builtin_types = [ "Int"; "Float"; "Bool"; "Str"; "Bytes"; "List"; "Array"; "Chan"; "Root"; "Net"; "Fs"; "Stdout"; "Stderr"; "Clock"; "Listen"; "Listener"; "Conn"; "Rand"; "Stdin"; "Env"; "Exec"; "Foreign"; "Map" ]
+let builtin_types = [ "Int"; "Float"; "Bool"; "Str"; "Bytes"; "List"; "Array"; "Chan"; "Atomic"; "Shared"; "Root"; "Net"; "Fs"; "Stdout"; "Stderr"; "Clock"; "Listen"; "Listener"; "Conn"; "Rand"; "Stdin"; "Env"; "Exec"; "Foreign"; "Map" ]
 
 (* Names other languages use for ambient I/O, mapped to the capability way. *)
 let ambient =
@@ -263,6 +263,8 @@ let rec resolve ctx env (te : ty_expr) : ty =
     | "Exec" -> simple (TCap Exec)
     | "Foreign" -> simple (TCap Foreign)
     | "Chan" -> if want 1 then TChan (List.hd args') else TErr
+    | "Atomic" -> simple TAtomic
+    | "Shared" -> if want 1 then TShared (List.hd args') else TErr
     | "Map" -> if want 2 then TMap (List.nth args' 0, List.nth args' 1) else TErr
     | _ -> (
       match List.assoc_opt n env with
@@ -317,7 +319,11 @@ and resolve_bound ctx env (b : ty_expr) : bound option =
 (* Channels and functions cannot hide in a struct or enum; capabilities can,
    and the types holding them are tracked (Types.authority). *)
 let check_storable ctx span t =
-  if has_chan t then
+  if has_chan t && chan_kind t <> Some "channel" then
+    err ctx "E0305" span
+      (sprintf "an `Atomic` or `Shared` value cannot be stored in a struct or enum field, and `%s` holds one" (show t))
+      ~notes:[ "like a channel, pass it as a parameter or capture it in a closure instead" ]
+  else if has_chan t then
     err ctx "E0305" span
       (sprintf "channel type `%s` cannot be stored in a struct or enum field" (show t))
       ~notes:[ "pass the channel as a parameter or capture it in a task's closure instead" ]
@@ -358,7 +364,7 @@ let visible_names ctx f =
   List.concat_map (fun s -> List.of_seq (Hashtbl.to_seq_keys s.vars)) f.scopes
   @ List.of_seq (Hashtbl.to_seq_keys ctx.fns)
   @ List.of_seq (Hashtbl.to_seq_keys ctx.owners)
-  @ [ "panic"; "channel"; "assert"; "assert_eq"; "map"; "catch"; "bytes"; "keep"; "embed"; "embed_bytes"; "embed_dir" ]
+  @ [ "panic"; "channel"; "atomic"; "shared"; "assert"; "assert_eq"; "map"; "catch"; "bytes"; "keep"; "embed"; "embed_bytes"; "embed_dir" ]
 
 (* Generic functions' bounds: function -> type parameter -> interfaces. *)
 let fn_bounds : (string, (string * bound list) list) Hashtbl.t = Hashtbl.create 8
@@ -555,6 +561,8 @@ let build_methods (t : ty) : (string * (unit -> ty list * ty)) list =
     [ m "only" [ TStr ] (TCap Foreign); m "allows" [ TStr ] TBool; m "copy" [ TNamed ("Handle", []); TInt ] TBytes ]
   | TCap Root -> [ m "args" [] (TList TStr) ]
   | TChan a -> [ ("send", fun () -> ([ a ], TUnit)); ("recv", fun () -> ([], opt a)); ("close", fun () -> ([], TUnit)) ]
+  | TAtomic -> [ m "get" [] TInt; m "set" [ TInt ] TUnit; m "add" [ TInt ] TInt; m "swap" [ TInt ] TInt; m "compare_and_set" [ TInt; TInt ] TBool ]
+  | TShared a -> [ ("get", fun () -> ([], a)); ("set", fun () -> ([ a ], TUnit)); ("update", fun () -> ([ TFn ([ a ], a) ], a)) ]
   | _ -> []
 
 (* The methods of a built-in type, by name. Checking asks for them at every
@@ -604,6 +612,24 @@ let unordered ctx t : ty option =
     | t -> Some t
   in
   go t
+
+(* E0312: inside a closure literal given to `Shared.update`, which runs
+   holding the value's lock (natively a task must never wait holding it).
+   [no_wait] counts the enclosing such closures. What else waits (a call of
+   a function that waits) is a panic when it happens: "update must not wait". *)
+let no_wait = ref 0
+
+let waits rt name =
+  match (rt, name) with
+  | TChan _, ("send" | "recv") -> Some "can wait"
+  | TShared _, _ -> Some "takes a lock another task can hold"
+  | TCap Clock, "sleep" | TCap Stdin, _ | TCap Listener, "accept" | TCap Conn, ("read" | "write") | TCap Exec, "run" -> Some "can wait"
+  | TCap Net, ("get" | "connect" | "connect_tls") -> Some "can wait"
+  | _ -> None
+
+let update_waits ctx sp what =
+  err ctx "E0312" sp (sprintf "the function given to `update` must not wait: %s" what)
+    ~notes:[ "`update` holds the Shared value's lock while its function runs; wait before or after it, and only compute the new value inside" ]
 
 let root_fields = [ ("net", TCap Net); ("fs", TCap Fs); ("stdout", TCap Stdout); ("stderr", TCap Stderr); ("clock", TCap Clock); ("listen", TCap Listen);
     ("rand", TCap Rand); ("stdin", TCap Stdin); ("env", TCap Env); ("exec", TCap Exec);
@@ -737,7 +763,7 @@ and check_expr_inner ctx f e : ty =
         | SPExpr x -> (
           let t = check_expr ctx f x in
           match repr t with
-          | TFn _ | TCap _ | TChan _ ->
+          | TFn _ | TCap _ | TChan _ | TAtomic | TShared _ ->
             err ctx "E0201" x.espan (sprintf "cannot interpolate a value of type `%s`" (show t))
           | _ -> ()))
       parts;
@@ -800,7 +826,9 @@ and check_expr_inner ctx f e : ty =
         TErr)
     | Some x -> expect ctx f x tt; tt)
   | EMatch (s, arms) -> check_match ctx f s arms e.espan
-  | ESelect arms -> check_select ctx f arms e.espan
+  | ESelect arms ->
+    if !no_wait > 0 then update_waits ctx e.espan "a `select` can wait";
+    check_select ctx f arms e.espan
   | EBlock b -> check_block ctx f b
   | EClosure (ps, body) -> check_closure ctx f ps body None
   | EStruct (name, nsp, fields) -> check_struct_lit ctx f name nsp fields e.espan
@@ -818,6 +846,7 @@ and check_expr_inner ctx f e : ty =
       ~fix:{ Diag.fmsg = "remove the label"; edits = [ { Diag.at = { nsp with hi = x.espan.lo }; replacement = "" } ] };
     check_expr ctx f x
   | EGroup (name, _, until, b) ->
+    if !no_wait > 0 then update_waits ctx e.espan "a `group` waits for its tasks";
     let t = fresh () in
     Option.iter
       (fun (clk, ms) ->
@@ -897,7 +926,11 @@ and coerce ctx e t ((i, _) as b) =
         (sprintf "%s, so it cannot become `dyn %s`" h bn)
         ~notes:[ "authority must stay visible in types; pass it with a type parameter, as in `[T: " ^ bn ^ "]`" ]
     | None ->
-    if has_fn ct || has_chan ct then
+    if has_chan ct && not (has_fn ct) && chan_kind ct <> Some "channel" then
+      err ctx "E0112" e.espan
+        (sprintf "`%s` holds an `Atomic` or `Shared` value, so it cannot become `dyn %s`" (show ct) bn)
+        ~notes:[ "shared state must stay visible in types; pass it with a type parameter, as in `[T: " ^ bn ^ "]`" ]
+    else if has_fn ct || has_chan ct then
       err ctx "E0112" e.espan
         (sprintf "`%s` holds a function or channel, so it cannot become `dyn %s`" (show ct) bn)
         ~notes:[ "a function or channel could carry authority out of sight; pass it with a type parameter, as in `[T: " ^ bn ^ "]`" ]
@@ -1117,7 +1150,7 @@ and check_call ?want ctx f e callee args sp =
        let t = check_expr ctx f a in
        expect ctx f b t;
        match repr t with
-       | TFn _ | TCap _ | TChan _ | TDyn _ -> err ctx "E0201" sp (sprintf "values of type `%s` cannot be compared" (show t))
+       | TFn _ | TCap _ | TChan _ | TAtomic | TShared _ | TDyn _ -> err ctx "E0201" sp (sprintf "values of type `%s` cannot be compared" (show t))
        | _ -> refuse_compare ctx sp "assert_eq" t)
      | _ -> err ctx "E0107" sp "`assert_eq` takes 2 arguments"; check_args ctx f args);
     TUnit
@@ -1132,6 +1165,15 @@ and check_call ?want ctx f e callee args sp =
      | [ a ] -> expect ctx f a TInt
      | _ -> err ctx "E0107" sp "`channel` takes 1 argument, its capacity"; check_args ctx f args);
     TChan (fresh ())
+  | EVar "atomic" when not (is_local f "atomic") && not (Hashtbl.mem ctx.fns "atomic") ->
+    (match args with
+     | [ a ] -> expect ctx f a TInt
+     | _ -> err ctx "E0107" sp "`atomic` takes 1 argument, its first value"; check_args ctx f args);
+    TAtomic
+  | EVar "shared" when not (is_local f "shared") && not (Hashtbl.mem ctx.fns "shared") -> (
+    match args with
+    | [ a ] -> TShared (check_expr ctx f a)
+    | _ -> err ctx "E0107" sp "`shared` takes 1 argument, its first value"; check_args ctx f args; TShared (fresh ()))
   | EVar "catch" when not (is_local f "catch") && not (Hashtbl.mem ctx.fns "catch") -> (
     (* catch(|| ...): Ok(value), or Err(message) if anything inside panicked *)
     let t = fresh () in
@@ -1560,6 +1602,9 @@ and check_method_value ?rt ctx f e recv name nsp args =
       check_args ctx f args;
       TErr
     | Some mk ->
+      (match waits rt name with
+       | Some what when !no_wait > 0 -> update_waits ctx nsp (sprintf "`%s` on `%s` %s" name (show rt) what)
+       | _ -> ());
       let ps, r = mk () in
       (match (name, rt) with
        | "join", TList a -> unify_at ctx recv.espan TStr a
@@ -1573,7 +1618,16 @@ and check_method_value ?rt ctx f e recv name nsp args =
              (if List.length args = 1 then "was" else "were"));
         check_args ctx f args
       end
-      else List.iter2 (fun a p -> expect ctx f a p) args ps;
+      else
+        List.iter2
+          (fun a p ->
+            match (name, rt, a.edesc) with
+            | "update", TShared _, EClosure _ ->
+              (* the function runs holding the lock: it must not wait *)
+              incr no_wait;
+              Fun.protect ~finally:(fun () -> decr no_wait) (fun () -> expect ctx f a p)
+            | _ -> expect ctx f a p)
+          args ps;
       (match (name, rt) with
        | "sort", TList a -> (
          match unordered ctx a with
@@ -1755,7 +1809,7 @@ and check_bin ctx f op a b sp =
     | Lt | Le | Gt | Ge -> (match unordered ctx t with None -> () | Some _ -> bad ()); TBool
     | _ ->
       (match t with
-       | TFn _ | TCap _ | TChan _ | TDyn _ -> bad ()
+       | TFn _ | TCap _ | TChan _ | TAtomic | TShared _ | TDyn _ -> bad ()
        | _ -> (
          (* capabilities have no equality, so neither has a value holding one *)
          match held t with
@@ -2613,7 +2667,7 @@ let implied_bounds ctx gen ts =
            bs
        | _ -> ());
       List.iter walk args
-    | TList a | TChan a | TGroup a | TArray (a, _) -> walk a
+    | TList a | TChan a | TShared a | TGroup a | TArray (a, _) -> walk a
     | TMap (k, v) -> walk k; walk v
     | TFn (ps, r) -> List.iter walk ps; walk r
     | TDyn (_, xs) -> List.iter walk xs

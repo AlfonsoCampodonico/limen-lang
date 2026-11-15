@@ -1,0 +1,68 @@
+// Atomic and Shared: their types and methods, what update's function may
+// not do (E0312), and the rules of channels: no struct fields (E0305), no
+// `dyn` (E0112), no map keys (E0113), no equality or interpolation (E0201).
+struct Stats {
+    hits: Atomic,
+    names: List[Str],
+}
+
+enum Slot {
+    Empty,
+    Full(Shared[Int]),
+}
+
+interface Named {
+    fn name(self) -> Str
+}
+
+struct Holder[T] {
+    v: T,
+}
+
+fn name(self: Holder[Atomic]) -> Str {
+    "holder"
+}
+
+fn later(clock: Clock, n: Int) -> Int {
+    clock.sleep(1)
+    n
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let clock = root.clock
+    let a = atomic(1)
+    let n: Int = a.add(2)
+    let old: Int = a.swap(3)
+    let ok: Bool = a.compare_and_set(3, 4)
+    a.set(5)
+    let s: Shared[List[Int]] = shared([1])
+    let xs: List[Int] = s.get()
+    s.set([2])
+    let ys: List[Int] = s.update(|v| v + [3])
+    let ch: Chan[Int] = channel(1)
+    let t = shared(0)
+    let bad = t.update(|v| {
+        ch.send(v)
+        let w = ch.recv() ?? 0
+        clock.sleep(1)
+        let k = s.get()
+        let r = group g {
+            g.go(|| 1)
+        }
+        let z = select {
+            q = ch.recv() => 1,
+            _ => 2,
+        }
+        v + w
+    })
+    let fine = t.update(|v| later(clock, v))
+    let nested = t.update(|v| [1, 2].map(|x| x + t.get()).len() + v)
+    let d: dyn Named = Holder { v: atomic(1) }
+    let m: Map[Shared[Int], Int] = map()
+    let e1 = a == a
+    let e2 = s != s
+    out.print("{a} {s}")
+    let wrong: Str = atomic(1).get()
+    let wrong2 = shared(1).update(|v| "x")
+}

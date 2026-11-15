@@ -1,0 +1,40 @@
+// Atomic and Shared as C generation writes them: every Atomic method, and
+// a Shared of a scalar, of a list, of a map and of a struct (get under the
+// lock, set dropping the old value outside it, update calling a closure
+// under the lock with its cleanup), passed to tasks and kept in lists.
+struct Point {
+    x: Int,
+    tags: List[Str],
+}
+
+fn bump(m: Map[Str, Int], k: Str) -> Map[Str, Int] {
+    let mut m2 = m
+    m2[k] = (m.get(k) ?? 0) + 1
+    m2
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let a = atomic(1)
+    let n = a.add(2) + a.swap(3) + a.get()
+    a.set(n)
+    let cas = a.compare_and_set(n, 0)
+    let i = shared(1)
+    let l = shared([1, 2])
+    let m: Shared[Map[Str, Int]] = shared(map())
+    let p = shared(Point { x: 1, tags: ["a"] })
+    let r = group g {
+        for k in 0..<4 {
+            g.go(|| {
+                a.add(1)
+                i.update(|v| v + k)
+                m.update(|mm| bump(mm, "k{k % 2}"))
+                l.update(|xs| xs + [k]).len()
+            })
+        }
+    }
+    p.set(Point { x: 2, tags: p.get().tags + ["b"] })
+    let q = p.update(|pt| Point { x: pt.x + 1, tags: pt.tags })
+    let both = [a, a]
+    out.print("{cas} {a.get()} {i.get()} {l.get().len()} {m.get().len()} {q.x} {q.tags} {r.len()} {both.len()}")
+}

@@ -294,7 +294,7 @@
           "name": "support.function.variant.limen"
         },
         {
-          "match": "\\b(Int|Int32|Float|Bool|Str|Bytes|List|Map|Option|Result|Chan|Error|Handle)\\b",
+          "match": "\\b(Int|Int32|Float|Bool|Str|Bytes|List|Map|Option|Result|Chan|Atomic|Shared|Error|Handle)\\b",
           "name": "support.type.builtin.limen"
         },
         {

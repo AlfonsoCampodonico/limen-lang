@@ -4,7 +4,7 @@ The Limen compiler, written in Limen. Limen is self-hosting: the
 OCaml compiler in `src/` builds this one (stage 1), stage 1 builds itself
 (stage 2), stage 2 builds itself again (stage 3), and stages 2 and 3 emit
 the same C, which is also exactly what the OCaml compiler emits for it
-(about 382,000 lines, the embedded standard library and runtime included). `sh selfhost/bootstrap.sh` runs all three stages and
+(about 397,000 lines, the embedded standard library and runtime included). `sh selfhost/bootstrap.sh` runs all three stages and
 checks that; it takes about three minutes, nearly all of it the C compiler.
 The OCaml compiler stays as the way to build from scratch, and as the
 reference: `sh selfhost/check.sh` requires both compilers to agree on every

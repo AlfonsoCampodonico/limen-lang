@@ -555,7 +555,7 @@ fn implied_bounds(cx: env.Cx, st: env.State, gen: List[Str], ts: List[types.Ty])
                 }
                 args
             },
-            TList(a) | TChan(a) | TGroup(a) | TArray(a, _) => [a],
+            TList(a) | TChan(a) | TShared(a) | TGroup(a) | TArray(a, _) => [a],
             TMap(k, v) => [k, v],
             TFn(ps, r) => ps + [r],
             TDyn(_, xs) => xs,

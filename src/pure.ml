@@ -41,8 +41,9 @@ let heavy_prims =
    capabilities and channels, and `keep` (the benchmark black box). *)
 let pure_prim name t =
   name <> "keep"
-  && (match t with TCap _ | TChan _ -> false | _ -> true)
-  && not (String.starts_with ~prefix:"cap_" name || String.starts_with ~prefix:"chan_" name)
+  && (match t with TCap _ | TChan _ | TAtomic | TShared _ -> false | _ -> true)
+  && not (String.starts_with ~prefix:"cap_" name || String.starts_with ~prefix:"chan_" name
+          || String.starts_with ~prefix:"atomic_" name || String.starts_with ~prefix:"shared_" name)
 
 type info = { heavy : bool (* worth keeping across a loop: not a short scalar computation the C compiler sees through *) }
 

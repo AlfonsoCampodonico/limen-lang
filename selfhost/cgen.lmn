@@ -184,6 +184,15 @@ fn cname(self: Cg, t: types.Ty) -> (Str, Cg) {
             }
             ("Chan", c)
         },
+        TAtomic => ("Atomic", c),
+        // its value's drop and share functions are a channel element's
+        TShared(a) => {
+            (_, c) = c.cname(a)
+            if !c.chan_tys.contains(a) {
+                c.chan_tys.push(a)
+            }
+            ("Shared", c)
+        },
         TList(TInt) => ("L_Int", c),
         TList(TStr) => ("L_Str", c),
         TList(_) | TNamed(..) | TArray(..) | TMap(..) => {
@@ -224,6 +233,8 @@ fn ctype(self: Cg, t: types.Ty) -> (Str, Cg) {
         TCap(_) => ("WCap*", self),
         TGroup(_) => ("WGroup*", self),
         TChan(_) => ("WChan*", self),
+        TAtomic => ("WAtomic*", self),
+        TShared(_) => ("WShared*", self),
         TList(_) | TMap(..) => {
             let (n, c) = self.cname(t)
             (n + "*", c)
@@ -1435,6 +1446,66 @@ fn prim(self: Cg, ind: Str, dst: Str, t: types.Ty, name: Str, rt: types.Ty, a: L
         // the value escapes into an empty asm statement the compiler cannot see through
         ("keep", _) => c.line(ind, "\{ __typeof__({arg(0)}) k_ = {arg(0)}; __asm__ volatile(\"\" : : \"r\"(&k_) : \"memory\"); }").set(ind, dst, "0"),
         ("chan_close", _) => c.line(ind, "w_chan_close({arg(0)}, {c.where(sp)});").set(ind, dst, "0"),
+        // Atomic and Shared (the runtime's "Atomic and Shared")
+        ("atomic_new", _) => c.set(ind, dst, "w_atomic_new({arg(0)})"),
+        ("atomic_get", _) => c.set(ind, dst, "w_atomic_get({arg(0)})"),
+        ("atomic_set", _) => c.line(ind, "w_atomic_set({arg(0)}, {arg(1)});").set(ind, dst, "0"),
+        ("atomic_add", _) => c.set(ind, dst, "w_atomic_add({arg(0)}, {arg(1)})"),
+        ("atomic_swap", _) => c.set(ind, dst, "w_atomic_swap({arg(0)}, {arg(1)})"),
+        ("atomic_compare_and_set", _) => c.set(ind, dst, "w_atomic_cas({arg(0)}, {arg(1)}, {arg(2)})"),
+        ("shared_new", TShared(el)) => {
+            // the value is the Shared's own reference, switched to shared:
+            // any task may read it
+            let (_, c1) = c.cname(rt)
+            let (cn, c2) = c1.cname(el)
+            let (ct, c3) = c2.ctype(el)
+            let fns = if is_scalar(el) { "NULL, NULL" } else { "chdrop_{cn}, chshare_{cn}" }
+            let (dv, c4) = c3.dup_of(el, arg(0))
+            let mut c5 = c4.line(ind, "\{").line(ind, "  WShared *s_ = w_shared_new(sizeof({ct}), {fns});").line(ind, "  {ct} v_ = {dv};")
+            if !is_scalar(el) {
+                c5 = c5.line(ind, "  {cn}_share(v_);")
+            }
+            c5.line(ind, "  memcpy(s_->v, &v_, sizeof v_);").line(ind, "  {dst} = s_;").line(ind, "}")
+        },
+        ("shared_get", TShared(el)) => {
+            // a snapshot: another reference to the value, taken under the lock
+            let (ct, c1) = c.ctype(el)
+            let (dv, c2) = c1.dup_of(el, "v_")
+            c2.line(ind, "\{").line(ind, "  w_shared_lock({arg(0)}, {c2.where(sp)});").line(ind, "  {ct} v_; memcpy(&v_, ({arg(0)})->v, sizeof v_);").line(ind, "  {dst} = {dv};").line(ind, "  w_shared_unlock({arg(0)});").line(ind, "}")
+        },
+        ("shared_set", TShared(el)) => {
+            let (ct, c1) = c.ctype(el)
+            let (dn, c2) = c1.dup_of(el, arg(1))
+            let (cn, c3) = c2.cname(el)
+            let mut c4 = c3.line(ind, "\{").line(ind, "  {ct} n_ = {dn};")
+            if !is_scalar(el) {
+                c4 = c4.line(ind, "  {cn}_share(n_);")
+            }
+            c4 = c4.line(ind, "  w_shared_lock({arg(0)}, {c4.where(sp)});").line(ind, "  {ct} o_; memcpy(&o_, ({arg(0)})->v, sizeof o_); memcpy(({arg(0)})->v, &n_, sizeof n_);").line(ind, "  w_shared_unlock({arg(0)});")
+            if !is_scalar(el) {
+                c4 = c4.line(ind, "  {cn}_drop(o_);")
+            }
+            c4.line(ind, "}").set(ind, dst, "0")
+        },
+        ("shared_update", TShared(el)) => {
+            // the function runs holding the lock, on its own reference to
+            // the value (so it copies what it changes, and a panic or a
+            // cancellation in it leaves the value as it was: the cleanup
+            // lets go of the lock); its result becomes the value
+            let (ct, c1) = c.ctype(el)
+            let (da, c2) = c1.dup_of(el, "a_")
+            let (dr, c3) = c2.dup_of(el, "r_")
+            let (cn, c4) = c3.cname(el)
+            let mut c5 = c4.line(ind, "\{").line(ind, "  WShared *u_ __attribute__((cleanup(w_update_end))) = w_update_begin({arg(0)}, {c4.where(sp)});").line(ind, "  {ct} a_; memcpy(&a_, u_->v, sizeof a_);").line(ind, "  {ct} r_ = (({ct} (*)(WClo*, {ct}))({arg(1)})->fn)({arg(1)}, {da});")
+            if !is_scalar(el) {
+                c5 = c5.line(ind, "  {cn}_share(r_);")
+            }
+            c5 = c5.line(ind, "  {ct} o_; memcpy(&o_, u_->v, sizeof o_); memcpy(u_->v, &r_, sizeof r_);").line(ind, "  {dst} = {dr};").line(ind, "  w_update_end(&u_);").line(ind, "  u_ = NULL;")
+            if !is_scalar(el) {
+                c5 = c5.line(ind, "  {cn}_drop(o_);")
+            }
+            c5.line(ind, "}")
+        },
         ("map_new", TMap(..)) => {
             let (n, c1) = c.cname(rt)
             c1.set(ind, dst, "{n}_new()")

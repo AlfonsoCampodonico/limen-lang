@@ -65,6 +65,7 @@ typedef struct { void *v; uint8_t *o; void (*d)(void *); } WCl;
 static inline void w_cl_run(WCl *c) { if (*c->o) { *c->o = 0; c->d(c->v); } }
 static WCatch **w_catch_slot(void); /* the current fiber's innermost boundary, or NULL outside fibers */
 static void w_mark_unwinding(void); /* the current fiber's cancellation is unwinding it */
+static void w_update_waits(void);   /* a wait refused in update's function: panic */
 
 static inline void w_hdr_unlink(WHdr *h) {
   if (h->prev) { h->prev->next = h->next; h->next->prev = h->prev; h->prev = h->next = NULL; }
@@ -230,6 +231,7 @@ __attribute__((noreturn)) static void w_panic_c(const char *msg, const char *whe
    boundary, and only tasks are cancelled. */
 __attribute__((noreturn)) static void w_cancel_unwind(void) {
   WCatch **slot = w_catch_slot();
+  w_update_waits();
   if (!slot || !*slot) w_fatal_c("internal: cancelled outside a task", "?");
   w_mark_unwinding();
   (*slot)->cancel = 1;
@@ -1583,6 +1585,8 @@ struct WFiber {
   WScope *scopes;                       /* deadline scopes it is in, innermost first (under wlock) */
   const char *in_cb;                    /* in a callback from C: where the callback is declared */
   int unwinding;                        /* its cancellation is unwinding it: checkpoints let defers finish */
+  int in_update;                        /* running the function of a Shared's update: it must not wait */
+  const char *upd_where;                /* where that update was called */
   WOut *out;                            /* where its output goes (NULL: stdout); see Cap_print */
   struct WCap *cb_foreign;              /* in a foreign call: its Foreign, for callbacks that take one */
 #ifdef W_ASAN
@@ -2015,12 +2019,20 @@ static int w_is_cancelled(void) {
 static int w_wait_begin(WSel *tok) {
   WFiber *f = w_current();
   tok->done = 0; tok->fired = -1;
+  if (f->in_update) return 0;   /* update's function must not wait: w_cancel_unwind panics */
   w_flock(f);
   if (w_fiber_stopped(f)) { w_funlock(f); return 0; }
   w_prepare_park();
   f->wait = tok;
   w_funlock(f);
   return 1;
+}
+/* The wait w_wait_begin refused was in the function of a Shared's update,
+   which must not wait: unless the task is cancelled anyway, that is a
+   panic, where the update was called (the caller has let go of its locks). */
+static void w_update_waits(void) {
+  WWorker *w = w_self();
+  if (w && w->current && w->current->in_update && !w_is_cancelled()) w_panic_c("update must not wait", w->current->upd_where);
 }
 /* After waking: the token is no longer the canceller's to claim. */
 static void w_wait_end(void) { WFiber *f = w_current(); w_flock(f); f->wait = NULL; w_funlock(f); }
@@ -3896,6 +3908,161 @@ static void w_block_wait(WBlock *b) {
     w_cancel_unwind();
   }
   b->pooled = 0;
+}
+/* ---------- Atomic and Shared ----------
+   The shared mutable state tasks may hold besides channels. Both are shared,
+   never copied: a task that captures one works on the same one.
+
+   Atomic: an Int read and changed with the processor's atomic operations
+   (sequentially consistent), so `hits.add(1)` from many tasks at once loses
+   no update.
+
+   Shared[T]: a value behind a lock. get() copies it out (a snapshot: values
+   are copy-on-write, so it is a reference count, and a later set or update
+   does not change it), set(v) replaces it, update(f) runs f on it and
+   stores the result, holding the lock throughout, so updates from many
+   tasks apply one at a time. The value inside is always switched to shared
+   (its reference counts atomic), since any task may read it.
+
+   The lock (WLock) never blocks a worker thread for long: a task that finds
+   it held spins briefly, then parks; the holder hands it straight to the
+   first parked task when it lets go. The holder never waits (update's
+   function must not, below), so a held lock is always about to be let go,
+   and waiting for one is not cancellable and never a deadlock.
+
+   update's function must not wait: anything that would park the task while
+   it holds the lock (a channel, a timer, a group, a socket, a blocking C
+   call) and any use of a Shared (this one would deadlock, another could)
+   panics with "update must not wait" instead, where the update was called.
+   The fiber's in_update says it holds one; w_wait_begin refuses to start a
+   wait then, and w_cancel_unwind turns that refusal into the panic. A
+   cancellation or a panic in the function unwinds through the update's
+   cleanup (w_update_end), which lets go of the lock and leaves the value as
+   it was. */
+typedef struct WAtomic { int64_t rc; int64_t v; } WAtomic;
+static WAtomic *w_atomic_new(int64_t v) {
+  WAtomic *a = (WAtomic *)w_alloc_k(sizeof(WAtomic), WK_PLAIN);
+  a->rc = 1;
+  __atomic_store_n(&a->v, v, __ATOMIC_SEQ_CST);
+  return a;
+}
+static inline WAtomic *Atomic_dup(WAtomic *a) { w_rc_inc(&a->rc); return a; }
+static inline void Atomic_drop(WAtomic *a) { if (w_rc_dec(&a->rc)) w_free(a); }
+static inline void Atomic_share(WAtomic *a) { w_rc_share(&a->rc); }
+static inline bool Atomic_eq(WAtomic *a, WAtomic *b) { return a == b; }
+static void Atomic_show(WBuf *b, WAtomic *a, bool top) { (void)a; (void)top; buf_puts(b, "<atomic>"); }
+static inline int64_t w_atomic_get(WAtomic *a) { return __atomic_load_n(&a->v, __ATOMIC_SEQ_CST); }
+static inline void w_atomic_set(WAtomic *a, int64_t v) { __atomic_store_n(&a->v, v, __ATOMIC_SEQ_CST); }
+/* the new value; Int arithmetic wraps, as everywhere */
+static inline int64_t w_atomic_add(WAtomic *a, int64_t n) {
+  return (int64_t)__atomic_add_fetch((uint64_t *)&a->v, (uint64_t)n, __ATOMIC_SEQ_CST);
+}
+/* the old value */
+static inline int64_t w_atomic_swap(WAtomic *a, int64_t v) { return __atomic_exchange_n(&a->v, v, __ATOMIC_SEQ_CST); }
+static inline bool w_atomic_cas(WAtomic *a, int64_t old, int64_t v) {
+  return __atomic_compare_exchange_n(&a->v, &old, v, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+}
+
+/* A task waiting for a WLock, on its own stack. */
+typedef struct WLockWait { WFiber *f; struct WLockWait *next; } WLockWait;
+typedef struct {
+  int held;                             /* 1 while a task holds it */
+  int nwait;                            /* tasks parked or about to park (under mu) */
+  pthread_mutex_t mu;                   /* guards the queue */
+  WLockWait *head, *tail;
+} WLock;
+static void w_lock_init(WLock *l) { memset(l, 0, sizeof *l); pthread_mutex_init(&l->mu, NULL); }
+static void w_lock_acquire(WLock *l) {
+  int zero = 0;
+  /* spin briefly: the holder is running and lets go soon */
+  for (int i = 0; i < 200; i++) {
+    zero = 0;
+    if (__atomic_compare_exchange_n(&l->held, &zero, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
+    w_cpu_relax();
+  }
+  pthread_mutex_lock(&l->mu);
+  __atomic_fetch_add(&l->nwait, 1, __ATOMIC_SEQ_CST);
+  zero = 0;
+  if (__atomic_compare_exchange_n(&l->held, &zero, 1, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) {
+    __atomic_fetch_sub(&l->nwait, 1, __ATOMIC_SEQ_CST);
+    pthread_mutex_unlock(&l->mu);
+    return;
+  }
+  /* park; the releaser hands the lock over (held stays 1) and wakes us */
+  WLockWait me = { w_current(), NULL };
+  if (l->tail) l->tail->next = &me; else l->head = &me;
+  l->tail = &me;
+  w_prepare_park();
+  pthread_mutex_unlock(&l->mu);
+  w_park_now();
+}
+static void w_lock_release(WLock *l) {
+  __atomic_store_n(&l->held, 0, __ATOMIC_SEQ_CST);
+  if (__atomic_load_n(&l->nwait, __ATOMIC_SEQ_CST) == 0) return;
+  WFiber *wake = NULL;
+  pthread_mutex_lock(&l->mu);
+  int zero = 0;
+  /* take it back for the first waiter, unless a spinner got it first */
+  if (l->head && __atomic_compare_exchange_n(&l->held, &zero, 1, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) {
+    WLockWait *w = l->head;
+    l->head = w->next;
+    if (!l->head) l->tail = NULL;
+    __atomic_fetch_sub(&l->nwait, 1, __ATOMIC_SEQ_CST);
+    wake = w->f;
+  }
+  pthread_mutex_unlock(&l->mu);
+  if (wake) w_wake(wake);
+}
+
+typedef struct WShared {
+  int64_t rc;
+  WLock lk;
+  void (*edrop)(void *); void (*eshare)(void *);
+  max_align_t v[];                      /* the value */
+} WShared;
+/* what a panic that abandons a Shared gives back: its value */
+static void w_shared_kids(void *o) { WShared *s = (WShared *)o; if (s->edrop) s->edrop(s->v); }
+static WShared *w_shared_new(size_t esz, void (*edrop)(void *), void (*eshare)(void *)) {
+  WShared *s = (WShared *)w_alloc_k(sizeof(WShared) + (esz ? esz : 1), WK_PLAIN);
+  s->rc = 1; s->edrop = edrop; s->eshare = eshare;
+  w_lock_init(&s->lk);
+  w_set_kids(s, w_shared_kids);
+  return s;
+}
+static inline WShared *Shared_dup(WShared *s) { w_rc_inc(&s->rc); return s; }
+static void Shared_drop(WShared *s) {
+  if (!w_rc_dec(&s->rc)) return;
+  if (s->edrop) s->edrop(s->v);
+  pthread_mutex_destroy(&s->lk.mu);
+  w_free(s);
+}
+static inline void Shared_share(WShared *s) { w_rc_share(&s->rc); }
+static inline bool Shared_eq(WShared *a, WShared *b) { return a == b; }
+static void Shared_show(WBuf *b, WShared *s, bool top) { (void)s; (void)top; buf_puts(b, "<shared>"); }
+/* get and set: the lock for a moment. Inside an update's function, any use
+   of a Shared panics (it could deadlock). */
+static void w_shared_lock(WShared *s, const char *where) {
+  WFiber *f = w_current();
+  if (f->in_update) w_panic_c("update must not wait: its function uses a Shared value", where);
+  w_lock_acquire(&s->lk);
+}
+static inline void w_shared_unlock(WShared *s) { w_lock_release(&s->lk); }
+/* update: the lock while the function runs; the generated code declares
+   the result of w_update_begin with the cleanup w_update_end and clears it
+   once the new value is stored, so a panic or a cancellation in the
+   function lets go of the lock and leaves the value unchanged. */
+static WShared *w_update_begin(WShared *s, const char *where) {
+  w_shared_lock(s, where);
+  WFiber *f = w_current();
+  f->in_update = 1;
+  f->upd_where = where;
+  return s;
+}
+static void w_update_end(void *p) {
+  WShared *s = *(WShared **)p;
+  if (!s) return;
+  w_current()->in_update = 0;
+  w_shared_unlock(s);
 }
 /* Callbacks from C (see ffi_callback_def in cgen.ml). C may call one only
    during its foreign call, on the same thread: that is the calling task's

@@ -66,6 +66,7 @@ Then work through the examples. Every one runs the same in the interpreter and n
 | `methods.lmn`, `interfaces.lmn`, `dyn.lmn`, `shapes.lmn` | methods, structural interfaces, `dyn` values | `limen run examples/dyn.lmn` |
 | `tuples.lmn`, `maps.lmn` | tuples, destructuring, maps | `limen run examples/maps.lmn` |
 | `parallel.lmn`, `select.lmn` | tasks, groups, channels, `select` | `limen run examples/select.lmn` |
+| `hit_counter.lmn` | state server tasks share: an `Atomic` hit counter and a `Shared` rate limiter | `limen run examples/hit_counter.lmn --grant listen=127.0.0.1:0 --grant net=127.0.0.1` |
 | `stdlib.lmn`, `report.lmn`, `logscan.lmn` | `json`, `format`, `time`, `regex` | `limen run examples/logscan.lmn` |
 | `checksum.lmn` | `flags`, `hash`, `hex`, `base64`: digests and HMACs of files or text, with generated help | `limen run examples/checksum.lmn -- --help` |
 | `csvstats.lmn` | `flags`, `csv`, `log`: totals of a CSV on stdin, with skipped rows logged to stderr | `printf 'k,n\na,1\na,2\n' \| limen run examples/csvstats.lmn -- --sum n --by k` |
@@ -268,7 +269,7 @@ Ordering is structural: `<` and `sort()` work on numbers, strings, `Bool`, and o
 
 Tuples `(Int, Str)` and maps `Map[Str, Int]` are built in: `let (q, r) = divmod(17, 5)`, `counts[w] = counts.get(w) ?? 0 + 1`. Keys can be tuples, structs and enums (`grid[(x, y)]`), and entries change in place: `stats[name].hits = stats[name].hits + 1`. Maps iterate in insertion order, the same in both backends (see [examples/tuples.lmn](examples/tuples.lmn) and [examples/maps.lmn](examples/maps.lmn)).
 
-`group g until clock.after(2000) { ... }` gives a group a deadline: tasks still running then are cancelled (freeing what they own) and the group evaluates to a `List[Option[T]]` with `None` for each of them. A cancelled task stops at its next wait or checkpoint: every loop round and every call is one, so a task that only computes is stopped too, at the cost of one predicted branch while nothing is being cancelled.
+`group g until clock.after(2000) { ... }` gives a group a deadline: tasks still running then are cancelled (freeing what they own) and the group evaluates to a `List[Option[T]]` with `None` for each of them. State that tasks share and change is a channel, an `Atomic` (`let hits = atomic(0)`, then `hits.add(1)` from any task) or a `Shared[T]` (`let seen = shared(map())`, then `seen.update(|m| ...)` applies a function under a lock, and `seen.get()` reads a snapshot); see `examples/hit_counter.lmn`. A cancelled task stops at its next wait or checkpoint: every loop round and every call is one, so a task that only computes is stopped too, at the cost of one predicted branch while nothing is being cancelled.
 
 `select { v = jobs.recv() if open => ..., out.send(x) => ..., clock.after(500) => ... }` waits on several channels, with guards to turn arms off and an optional timeout (or `_` to not wait at all; see [examples/select.lmn](examples/select.lmn)). `clock.sleep(ms)` parks a task without blocking a thread.
 

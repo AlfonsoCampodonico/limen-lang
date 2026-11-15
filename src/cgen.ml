@@ -71,6 +71,12 @@ let rec cname c t =
     ignore (cname c a);
     if not (List.mem a c.chan_tys) then c.chan_tys <- c.chan_tys @ [ a ];
     "Chan"
+  | TAtomic -> "Atomic"
+  | TShared a ->
+    (* its value's drop and share functions are a channel element's *)
+    ignore (cname c a);
+    if not (List.mem a c.chan_tys) then c.chan_tys <- c.chan_tys @ [ a ];
+    "Shared"
   | TList TInt -> "L_Int"
   | TList TStr -> "L_Str"
   | TList _ | TNamed _ | TArray _ | TMap _ -> (
@@ -104,6 +110,8 @@ let ctype c t =
   | TCap _ -> "WCap*"
   | TGroup _ -> "WGroup*"
   | TChan _ -> "WChan*"
+  | TAtomic -> "WAtomic*"
+  | TShared _ -> "WShared*"
   | TList _ | TMap _ -> cname c t ^ "*"
   | _ -> cname c t (* structs, enums and arrays are C values *)
 
@@ -760,6 +768,63 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
       line (sprintf "{ __typeof__(%s) k_ = %s; __asm__ volatile(\"\" : : \"r\"(&k_) : \"memory\"); }" (arg 0) (arg 0));
       set "0"
     | "chan_close", _ -> line (sprintf "w_chan_close(%s, %s);" (arg 0) (where sp)); set "0"
+    (* Atomic and Shared (the runtime's "Atomic and Shared") *)
+    | "atomic_new", _ -> set (sprintf "w_atomic_new(%s)" (arg 0))
+    | "atomic_get", _ -> set (sprintf "w_atomic_get(%s)" (arg 0))
+    | "atomic_set", _ -> line (sprintf "w_atomic_set(%s, %s);" (arg 0) (arg 1)); set "0"
+    | "atomic_add", _ -> set (sprintf "w_atomic_add(%s, %s)" (arg 0) (arg 1))
+    | "atomic_swap", _ -> set (sprintf "w_atomic_swap(%s, %s)" (arg 0) (arg 1))
+    | "atomic_compare_and_set", _ -> set (sprintf "w_atomic_cas(%s, %s, %s)" (arg 0) (arg 1) (arg 2))
+    | "shared_new", TShared el ->
+      (* the value is the Shared's own reference, switched to shared: any task may read it *)
+      ignore (cname c rt);
+      let cn = cname c el in
+      let ct = ctype c el in
+      let fns = if is_scalar el then "NULL, NULL" else sprintf "chdrop_%s, chshare_%s" cn cn in
+      line "{";
+      line (sprintf "  WShared *s_ = w_shared_new(sizeof(%s), %s);" ct fns);
+      line (sprintf "  %s v_ = %s;" ct (dup_of c el (arg 0)));
+      if not (is_scalar el) then line (sprintf "  %s_share(v_);" cn);
+      line "  memcpy(s_->v, &v_, sizeof v_);";
+      line (sprintf "  %s = s_;" dst);
+      line "}"
+    | "shared_get", TShared el ->
+      (* a snapshot: another reference to the value, taken under the lock *)
+      let ct = ctype c el in
+      line "{";
+      line (sprintf "  w_shared_lock(%s, %s);" (arg 0) (where sp));
+      line (sprintf "  %s v_; memcpy(&v_, (%s)->v, sizeof v_);" ct (arg 0));
+      line (sprintf "  %s = %s;" dst (dup_of c el "v_"));
+      line (sprintf "  w_shared_unlock(%s);" (arg 0));
+      line "}"
+    | "shared_set", TShared el ->
+      let ct = ctype c el in
+      line "{";
+      line (sprintf "  %s n_ = %s;" ct (dup_of c el (arg 1)));
+      if not (is_scalar el) then line (sprintf "  %s_share(n_);" (cname c el));
+      line (sprintf "  w_shared_lock(%s, %s);" (arg 0) (where sp));
+      line (sprintf "  %s o_; memcpy(&o_, (%s)->v, sizeof o_); memcpy((%s)->v, &n_, sizeof n_);" ct (arg 0) (arg 0));
+      line (sprintf "  w_shared_unlock(%s);" (arg 0));
+      if not (is_scalar el) then line (sprintf "  %s_drop(o_);" (cname c el));
+      line "}";
+      set "0"
+    | "shared_update", TShared el ->
+      (* the function runs holding the lock, on its own reference to the
+         value (so it copies what it changes, and a panic or a cancellation
+         in it leaves the value as it was: the cleanup lets go of the lock);
+         its result becomes the value *)
+      let ct = ctype c el in
+      line "{";
+      line (sprintf "  WShared *u_ __attribute__((cleanup(w_update_end))) = w_update_begin(%s, %s);" (arg 0) (where sp));
+      line (sprintf "  %s a_; memcpy(&a_, u_->v, sizeof a_);" ct);
+      line (sprintf "  %s r_ = ((%s (*)(WClo*, %s))(%s)->fn)(%s, %s);" ct ct ct (arg 1) (arg 1) (dup_of c el "a_"));
+      if not (is_scalar el) then line (sprintf "  %s_share(r_);" (cname c el));
+      line (sprintf "  %s o_; memcpy(&o_, u_->v, sizeof o_); memcpy(u_->v, &r_, sizeof r_);" ct);
+      line (sprintf "  %s = %s;" dst (dup_of c el "r_"));
+      line "  w_update_end(&u_);";
+      line "  u_ = NULL;";
+      if not (is_scalar el) then line (sprintf "  %s_drop(o_);" (cname c el));
+      line "}"
     | "map_new", TMap _ -> set (sprintf "%s_new()" (cname c rt))
     | "map_from", TMap (k, v) ->
       let lt = TList (TNamed (Ast.tuple_name 2, [ k; v ])) in

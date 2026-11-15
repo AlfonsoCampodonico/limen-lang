@@ -87,6 +87,8 @@ Statements are separated by a newline or `;`. Two statements on one line without
 | `ProcessOutput` | `{ code: Int, stdout: Str, stderr: Str }` | From the prelude; returned by `Exec.run`. |
 | `fn(A, B) -> R` | functions and closures | `fn(A, B)` without `-> R` returns `()`, as a function declared without `->` does. |
 | `Chan[T]` | a channel between tasks | Created with `channel(capacity)` (section 10). |
+| `Atomic` | an `Int` tasks share | Created with `atomic(n)`; changed in place, atomically (section 10). |
+| `Shared[T]` | a value tasks share, behind a lock | Created with `shared(v)`; read as snapshots, changed by `set` and `update` (section 10). |
 | `Handle` | `{ addr: Int }` | From the prelude: an opaque C pointer, for foreign functions (section 9). |
 | `FileInfo` | `{ size: Int, modified_ms: Int, is_file: Bool, is_dir: Bool }` | From the prelude; returned by `Fs.info`. |
 | `Root`, `Net`, `Fs`, `Stdout`, `Stderr`, `Clock`, `Listen`, `Listener`, `Conn`, `Rand`, `Stdin`, `Env`, `Exec`, `Foreign` | capabilities | Cannot be created by programs; can be passed, returned and stored in struct fields, enum payloads and collections (section 9). |
@@ -739,7 +741,7 @@ The rules:
 1. Programs cannot create capabilities. They come only from `root`.
 2. Attenuation only narrows. `net.only(host)` returns a `Net` limited to that host, and it is empty if you didn't hold that host. `fs.under(dir)` limits to a subdirectory; `fs.read_only()` removes writing. `exec.only(program)` limits `Exec` to one program; `foreign.only(lib)` limits `Foreign` to one library.
 3. There is no ambient I/O. Using `print`, `open`, `fetch` and similar names is error E0302, which explains the capability to use instead.
-4. A function whose parameters hold no capability (not even through a struct or enum field, below) and no function type is **pure**: it can only compute (and panic). `limen caps FILE` lists each function's authority. Section 14 says what the compiler does with pure calls. It never runs them in parallel on its own: concurrency stays visible and cancellable in a `group`, where you write it.
+4. A function whose parameters hold no capability (not even through a struct or enum field, below), no function type and no channel, `Atomic` or `Shared` is **pure**: it can only compute (and panic). `limen caps FILE` lists each function's authority. Section 14 says what the compiler does with pure calls. It never runs them in parallel on its own: concurrency stays visible and cancellable in a `group`, where you write it.
 5. Enforcement at runtime:
    - `Net`: http and https URLs only, host allowlist, redirects not followed. `Net.connect` and `Net.connect_tls` use the same allowlist. TLS certificates are always verified (section 10).
    - `Exec`: the program name must match a grant exactly (`git` and `/usr/bin/git` are different grants), or the grant is `*`. Arguments are passed as a list, never through a shell. The child gets `/dev/null` as stdin, the working directory, `PATH`, and only the environment variables granted with `--grant env=`. A program name without `/` is looked up in `PATH`, as a shell would. Granting a program grants everything that program can do with any arguments, so `exec=sh` is as good as every other grant.
@@ -916,7 +918,7 @@ let results = group g {
 - When the block ends, every task has finished. Nothing outlives the group.
 - `g` can only be used as `g.go(...)` directly in the body. It cannot be stored, passed, returned, or used inside a closure (E0310).
 - The body cannot leave early with `return` or `?` (E0311), and `break` and `continue` cannot target loops outside the group.
-- Tasks share data by value, so there are no data races. A task reaches the world only through capabilities its closure captured. Spawning is not a capability.
+- Tasks share data by value, so there are no data races. What they can share and change is only what is made for it: channels, and `Atomic` and `Shared` values (below). A task reaches the world only through capabilities its closure captured. Spawning is not a capability.
 - Tasks are lightweight: natively each is a fiber with a small stack, scheduled on one worker thread per core (`LIMEN_THREADS` overrides this), and a task waiting on a group, a channel, a socket, stdin or `clock.sleep(ms)` parks without blocking a thread. The interpreter runs tasks as coroutines on one thread: a task that computes for more than a few milliseconds without waiting steps aside at a checkpoint (below) so the others, and deadlines, get their turn. What tasks print comes out in the same order in both (below).
 - If every task is waiting and nothing can wake one (no socket and no timer can), the program panics with `all tasks are blocked (deadlock)` instead of hanging.
 - A panic in a task ends only that task. The group still waits for the others, then passes the first panic on (section 15).
@@ -1012,6 +1014,35 @@ let reply = select {
 ```
 
 To wait for something until a deadline across a loop, compute the remaining time each round: `clock.after(deadline - clock.now_ms())`.
+
+### Shared state: Atomic and Shared
+
+```
+let hits = atomic(0)                              // an Int tasks share
+let seen: Shared[Map[Str, Int]] = shared(map())   // a value tasks share
+let _ = group g {
+    for page in pages {
+        g.go(|| {
+            hits.add(1)
+            seen.update(|m| {
+                let mut m2 = m
+                m2[page] = (m.get(page) ?? 0) + 1
+                m2
+            })
+        })
+    }
+}
+// hits.get() is pages.len(), and seen counts every page, whatever the order
+```
+
+Besides channels, two built-in types hold state that tasks share and change. Like a channel, each is shared, not copied: tasks that capture the same one see each other's changes, and so does code that passes it on.
+
+- `atomic(n)` makes an `Atomic` holding the `Int` `n`. `a.get()` reads it; `a.set(n)` replaces it; `a.add(n)` adds `n` and returns the **new** value, so `let id = next.add(1)` hands out ids; `a.swap(n)` replaces it and returns the **old** value; `a.compare_and_set(old, new)` replaces it only if it still holds `old`, returning whether it did. Each is one atomic step of the processor, never torn and never lost (`add` wraps on overflow, as Int arithmetic does).
+- `shared(v)` makes a `Shared[T]` holding `v`. `s.get()` returns the value as it is now: a snapshot, which later changes do not touch (values are copy-on-write, so this copies nothing). `s.set(v)` replaces it. `s.update(f)` applies `f: fn(T) -> T` to the value and stores the result, which it also returns, as one step: updates from many tasks apply one at a time, each to the result of the one before, so none is lost. `f` gets its own copy of the value, as any function does, so changing a large list or map in it copies it first; for heavy contention on large values, split the state into several `Shared`s or count with an `Atomic`.
+- If `f` panics, or its task is cancelled while it runs, the value stays as it was and the panic or the cancellation goes on.
+- **`f` must not wait.** It runs holding the value's lock, so it may only compute: no channel operation, `select`, `group`, `clock.sleep`, socket, stdin, program, blocking C call (section 9), and no use of a `Shared` (that one would wait for itself, another could wait for a task that waits for this one). When `f` is a closure literal the compiler checks what is written in it (E0312); what happens in functions it calls is checked as it runs: a wait there panics with `update must not wait` (at the `update`), before it could deadlock. Natively a task waiting for the lock spins briefly and then parks, so it never holds up a worker thread; since the holder never waits, the lock is always about to be let go, and a task waiting for it does not stop for a cancellation until it has it.
+- The rules of channels: a function that takes an `Atomic` or a `Shared` (even in a list or an option) is not pure (section 9); a value holding one cannot become `dyn` (E0112), be a map key (E0113), be compared or interpolated (E0201), and cannot be stored in a struct or enum field (E0305), so everything a function can change in place is visible in its parameters and its captures. They print as `<atomic>` and `<shared>`.
+- Both backends behave the same; natively an `Atomic` is a 64-bit atomic and a `Shared` a reference-counted value behind a lock that parks tasks, the interpreter's tasks take turns on one thread.
 
 ### Time
 
@@ -1258,6 +1289,24 @@ For a missing key with a default, write `m.get(k) ?? default`.
 | `recv()` | `Option[T]` |
 | `close()` | `()` |
 
+### Atomic
+
+| Method | Result |
+| --- | --- |
+| `get()` | `Int` |
+| `set(n)` | `()` |
+| `add(n)` | `Int`: the new value |
+| `swap(n)` | `Int`: the old value |
+| `compare_and_set(old, new)` | `Bool`: whether it held `old` and now holds `new` |
+
+### Shared[T]
+
+| Method | Result |
+| --- | --- |
+| `get()` | `T`: a snapshot |
+| `set(v)` | `()` |
+| `update(f)` | `T`: `f: fn(T) -> T` applied under the lock, its result stored and returned; `f` must not wait (section 10) |
+
 ### Built-in functions
 
 | Function | Meaning |
@@ -1265,6 +1314,8 @@ For a missing key with a default, write `m.get(k) ?? default`.
 | `panic(msg)` | stop with a message and source location (section 15) |
 | `catch(f)` | `Result[T, Str]`: run `f: fn() -> T`; `Err(message)` if it panicked (section 15) |
 | `channel(n)` | a new `Chan[T]` with capacity `n` |
+| `atomic(n)` | a new `Atomic` holding `n` |
+| `shared(v)` | a new `Shared[T]` holding `v` |
 | `map()`, `map(pairs)` | a new `Map[K, V]`, empty or from a `List[(K, V)]` |
 | `bytes(list)` | a new `Bytes` from a `List[Int]` of values 0 to 255 |
 | `assert(cond)` | panic with `assertion failed` unless `cond` is true |

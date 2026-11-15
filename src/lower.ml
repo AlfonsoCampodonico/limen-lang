@@ -130,6 +130,8 @@ let rec resolve env (te : ty_expr) : ty =
     | "Exec", _ -> TCap Exec
     | "Foreign", _ -> TCap Foreign
     | "Chan", [ x ] -> TChan x
+    | "Atomic", _ -> TAtomic
+    | "Shared", [ x ] -> TShared x
     | "Map", [ k; v ] -> TMap (k, v)
     | _ -> ( match List.assoc_opt n env with Some t -> t | None -> TNamed (n, a)))
 
@@ -423,6 +425,12 @@ and lower_call f e callee args ty =
   | EVar "channel" when not_local f "channel" && not (Hashtbl.mem f.g.fns "channel") ->
     let cap = lower f (List.hd args) in
     tmp f ty (I.ChanNew (ty, cap, e.espan))
+  | EVar "atomic" when not_local f "atomic" && not (Hashtbl.mem f.g.fns "atomic") ->
+    let x = lower f (List.hd args) in
+    tmp f ty (I.Prim ("atomic_new", TAtomic, [ x ], e.espan))
+  | EVar "shared" when not_local f "shared" && not (Hashtbl.mem f.g.fns "shared") ->
+    let x = lower f (List.hd args) in
+    tmp f ty (I.Prim ("shared_new", ty, [ x ], e.espan))
   | EVar "catch" when not_local f "catch" && not (Hashtbl.mem f.g.fns "catch") ->
     let c = lower f (List.hd args) in
     let inner = match tyof f (List.hd args) with TFn (_, r) -> r | _ -> TUnit in
@@ -818,7 +826,7 @@ and derive_targs d act =
   let rec m decl act =
     match (decl, act) with
     | TParam g, t -> if not (List.mem_assoc g !found) then found := (g, t) :: !found
-    | TList a, TList b | TChan a, TChan b -> m a b
+    | TList a, TList b | TChan a, TChan b | TShared a, TShared b -> m a b
     | TArray (a, n), TArray (b, k) -> m a b; m n k
     | TNamed (_, xs), TNamed (_, ys) when List.length xs = List.length ys -> List.iter2 m xs ys
     | TFn (xs, r1), TFn (ys, r2) when List.length xs = List.length ys -> List.iter2 m xs ys; m r1 r2
@@ -969,6 +977,8 @@ and lower_method f e recv name args ty =
       | TMap _ -> "map_"
       | TArray _ -> "array_"
       | TChan _ -> "chan_"
+      | TAtomic -> "atomic_"
+      | TShared _ -> "shared_"
       | TCap _ -> "cap_"
       | _ -> failwith ("method on " ^ show rt)
     in

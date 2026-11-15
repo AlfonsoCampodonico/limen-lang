@@ -18,6 +18,8 @@ type ty =
          a type parameter (or variable) standing for one until it is instantiated *)
   | TLen of int (* an array's length, `3` in `Array[Int, 3]`; never a value's type *)
   | TChan of ty (* channel between tasks *)
+  | TAtomic (* an Int tasks share, changed atomically *)
+  | TShared of ty (* a value tasks share, behind a lock *)
   | TMap of ty * ty (* keys (Int, Str, Bool, or tuples, structs and enums of them) to values, in insertion order *)
   | TDyn of string * ty list (* a value of any type that satisfies the interface (with these arguments), boxed with its methods *)
   | TParam of string (* a generic parameter inside its own definition *)
@@ -76,6 +78,8 @@ let rec show t =
   | TArray (a, n) -> "Array[" ^ show a ^ ", " ^ show n ^ "]"
   | TLen n -> string_of_int n
   | TChan a -> "Chan[" ^ show a ^ "]"
+  | TAtomic -> "Atomic"
+  | TShared a -> "Shared[" ^ show a ^ "]"
   | TDyn (i, []) -> "dyn " ^ i
   | TDyn (i, args) -> "dyn " ^ i ^ "[" ^ String.concat ", " (List.map show args) ^ "]"
   | TMap (k, v) -> "Map[" ^ show k ^ ", " ^ show v ^ "]"
@@ -86,7 +90,7 @@ let rec show t =
 let rec occurs r t =
   match repr t with
   | TVar r' -> r == r'
-  | TList a | TGroup a | TChan a -> occurs r a
+  | TList a | TGroup a | TChan a | TShared a -> occurs r a
   | TArray (a, n) -> occurs r a || occurs r n
   | TDyn (_, a) -> List.exists (occurs r) a
   | TMap (k, v) -> occurs r k || occurs r v
@@ -106,7 +110,8 @@ let rec unify a b =
   | TList x, TList y | TGroup x, TGroup y -> unify x y
   | TArray (x, n), TArray (y, m) -> unify n m; unify x y
   | TLen n, TLen m when n = m -> ()
-  | TChan x, TChan y -> unify x y
+  | TChan x, TChan y | TShared x, TShared y -> unify x y
+  | TAtomic, TAtomic -> ()
   | TMap (k1, v1), TMap (k2, v2) -> unify k1 k2; unify v1 v2
   | TFn (p1, r1), TFn (p2, r2) ->
     if List.length p1 <> List.length p2 then raise Mismatch;
@@ -126,6 +131,7 @@ let rec subst env t =
   | TArray (a, n) -> TArray (subst env a, subst env n)
   | TDyn (i, xs) -> TDyn (i, List.map (subst env) xs)
   | TChan a -> TChan (subst env a)
+  | TShared a -> TShared (subst env a)
   | TMap (k, v) -> TMap (subst env k, subst env v)
   | TGroup a -> TGroup (subst env a)
   | TFn (ps, r) -> TFn (List.map (subst env) ps, subst env r)
@@ -145,7 +151,7 @@ let authority : (string, (cap * string) list) Hashtbl.t = Hashtbl.create 16
 let rec caps_in t acc =
   match repr t with
   | TCap c -> if List.mem c acc then acc else c :: acc
-  | TList a | TArray (a, _) -> caps_in a acc
+  | TList a | TArray (a, _) | TShared a -> caps_in a acc
   | TMap (k, v) -> caps_in v (caps_in k acc)
   | TFn (ps, r) -> List.fold_left (fun acc p -> caps_in p acc) (caps_in r acc) ps
   | TNamed (n, args) ->
@@ -160,7 +166,7 @@ let rec caps_in t acc =
 let rec caps_written t acc =
   match repr t with
   | TCap c -> if List.mem c acc then acc else c :: acc
-  | TList a | TArray (a, _) -> caps_written a acc
+  | TList a | TArray (a, _) | TShared a -> caps_written a acc
   | TMap (k, v) -> caps_written v (caps_written k acc)
   | TFn (ps, r) -> List.fold_left (fun acc p -> caps_written p acc) (caps_written r acc) ps
   | TNamed (_, args) -> List.fold_left (fun acc a -> caps_written a acc) acc args
@@ -171,7 +177,7 @@ let rec caps_written t acc =
    first, then its type arguments in order). *)
 let rec via t c =
   match repr t with
-  | TList a | TArray (a, _) -> via a c
+  | TList a | TArray (a, _) | TShared a -> via a c
   | TMap (k, v) -> (match via k c with Some p -> Some p | None -> via v c)
   | TFn (ps, r) -> List.find_map (fun p -> via p c) (ps @ [ r ])
   | TNamed (n, args) -> (
@@ -201,7 +207,7 @@ let compute_authority (names : string list) (fields : string -> (string * ty) li
       and walk path t =
         match repr t with
         | TCap c -> add c path
-        | TList a | TArray (a, _) -> walk path a
+        | TList a | TArray (a, _) | TShared a -> walk path a
         | TMap (k, v) -> walk path k; walk path v
         | TFn (ps, r) -> List.iter (walk path) ps; walk path r
         | TNamed (m, args) -> List.iter (walk path) args; enter m path
@@ -211,21 +217,34 @@ let compute_authority (names : string list) (fields : string -> (string * ty) li
       if !found <> [] then Hashtbl.replace authority n !found)
     names
 
-(* Channels: shared communication, so values holding one are never pure. *)
+(* Channels, Atomics and Shareds: state tasks share, so values holding one
+   are never pure, never `dyn` and never stored in a struct. *)
 let rec has_chan t =
   match repr t with
-  | TChan _ -> true
+  | TChan _ | TAtomic | TShared _ -> true
   | TList a | TArray (a, _) -> has_chan a
   | TMap (k, v) -> has_chan k || has_chan v
   | TFn (ps, r) -> List.exists has_chan ps || has_chan r
   | TNamed (_, args) -> List.exists has_chan args
   | _ -> false
 
+(* What [has_chan] found first: "channel", or the Atomic or Shared type. *)
+let rec chan_kind t =
+  match repr t with
+  | TChan _ -> Some "channel"
+  | TAtomic -> Some "Atomic"
+  | TShared _ -> Some "Shared"
+  | TList a | TArray (a, _) -> chan_kind a
+  | TMap (k, v) -> (match chan_kind k with Some w -> Some w | None -> chan_kind v)
+  | TFn (ps, r) -> List.find_map chan_kind (ps @ [ r ])
+  | TNamed (_, args) -> List.find_map chan_kind args
+  | _ -> None
+
 (* Does [t] mention a `dyn` type? *)
 let rec has_dyn t =
   match repr t with
   | TDyn _ -> true
-  | TList a | TChan a | TArray (a, _) -> has_dyn a
+  | TList a | TChan a | TShared a | TArray (a, _) -> has_dyn a
   | TMap (k, v) -> has_dyn k || has_dyn v
   | TNamed (_, xs) -> List.exists has_dyn xs
   | _ -> false
@@ -233,7 +252,7 @@ let rec has_dyn t =
 let rec has_fn t =
   match repr t with
   | TFn _ -> true
-  | TList a | TArray (a, _) -> has_fn a
+  | TList a | TArray (a, _) | TShared a -> has_fn a
   | TMap (k, v) -> has_fn k || has_fn v
   | TNamed (_, args) -> List.exists has_fn args
   | _ -> false
@@ -248,6 +267,7 @@ let rec zonk env t =
   | TArray (a, n) -> TArray (zonk env a, (match zonk env n with TLen _ as l -> l | _ -> TLen 0))
   | TDyn (i, xs) -> TDyn (i, List.map (zonk env) xs)
   | TChan a -> TChan (zonk env a)
+  | TShared a -> TShared (zonk env a)
   | TMap (k, v) -> TMap (zonk env k, zonk env v)
   | TGroup a -> TGroup (zonk env a)
   | TFn (ps, r) -> TFn (List.map (zonk env) ps, zonk env r)

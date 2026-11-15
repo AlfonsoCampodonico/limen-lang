@@ -74,6 +74,7 @@ pub fn fetch(net: Net, org: Str) -> Result[List[Str], IoError] {
     }
     defer out.print("bye")
     let rs = group g until clock.after(100) { g.go(|| slow(clock, 10, 1)) }
+    let seen: Shared[Atomic] = shared(atomic(0))
     self.x == true
 }
 
@@ -124,6 +125,8 @@ pub type Pair[T] = (T, T)
     ["defer", "keyword.control.limen"],
     ["group", "keyword.control.limen"],
     ["until", "keyword.control.limen"],
+    ["Shared", "support.type.builtin.limen"],
+    ["Atomic", "support.type.builtin.limen"],
     ["Point", "entity.name.type.limen"],
     ["self", "variable.language.self.limen"],
     ["true", "constant.language.boolean.limen"],

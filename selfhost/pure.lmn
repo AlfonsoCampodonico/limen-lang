@@ -43,10 +43,10 @@ fn heavy_prims() -> List[Str] {
 // capabilities and channels, and `keep` (the benchmark black box).
 fn pure_prim(name: Str, t: types.Ty) -> Bool {
     let on_effect = match t {
-        TCap(_) | TChan(_) => true,
+        TCap(_) | TChan(_) | TAtomic | TShared(_) => true,
         _ => false,
     }
-    name != "keep" && !on_effect && !name.starts_with("cap_") && !name.starts_with("chan_")
+    name != "keep" && !on_effect && !name.starts_with("cap_") && !name.starts_with("chan_") && !name.starts_with("atomic_") && !name.starts_with("shared_")
 }
 
 // Every statement of `ss`, each before the ones inside it.

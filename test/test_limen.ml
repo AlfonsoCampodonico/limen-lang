@@ -1297,14 +1297,14 @@ fn main(root: Root) {
     }
     let (n, end) = strtol(f, "42" + "x", 10)
     out.print("{r.sum()} {clock.now_ms() - start < 3500} {strlen(f, "hel" + "lo")} {n} {end.addr != 0} {getenv(f, "LIMEN_NO_SUCH_VARIABLE")} {abs(f, -3)}")
-    let c = group g until clock.after(50) {
+    let c = group g until clock.after(500) {
         g.go(|| {
-            usleep(f, 400000)
+            usleep(f, 2000000)
             1
         })
         g.go(|| 2)
     }
-    out.print("{c} {clock.now_ms() - start < 3500}")
+    out.print("{c} {clock.now_ms() - start < 6000}")
 }
 |} in
   out "ffi-blocking" ~grants:libc blocking_libc "140 true 5 42 true  3\n[None, Some(2)] true\n";
@@ -1404,19 +1404,19 @@ fn main(root: Root) {
     let f = root.foreign
     let clock = root.clock
     let out = root.stdout
-    let r = group g until clock.after(50) {
-        g.go(|| vt_slow_len(f, "abc" + "def", 300))
+    let r = group g until clock.after(500) {
+        g.go(|| vt_slow_len(f, "abc" + "def", 1500))
         g.go(|| {
-            let (_, o) = vt_slow_out(f, 300)
+            let (_, o) = vt_slow_out(f, 1500)
             o
         })
-        g.go(|| vt_slow_name(f, 300).len())
+        g.go(|| vt_slow_name(f, 1500).len())
         g.go(|| vt_slow_len(f, "quick", 1))
     }
     out.print("{r}")
     let (a, b) = vt_slow_out(f, 5)
     out.print("{vt_slow_len(f, "hel" + "lo", 5)} {a} {b} {vt_slow_name(f, 5)}")
-    clock.sleep(500)
+    clock.sleep(1500)
 }
 |} in
   out "ffi-blocking-cancel" ~grants:vt vt_blocking "[None, None, None, Some(5)]\n5 5 10 slow\n";
@@ -2896,6 +2896,14 @@ fn main(root: Root) -> Result[(), IoError] {
     ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] }
     (example "http_demo.lmn")
     "served 4\n200 text/plain; charset=utf-8 hi GET\n500 text/plain; charset=utf-8 internal error\n404 text/plain; charset=utf-8 no /missing\n201 {\"got\":[1,{\"a\":true}]}\nchunked sent\n200 hello world\n";
+  out "example-hit-counter"
+    ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] }
+    (example "hit_counter.lmn")
+    "15 requests: 9 answered, 6 limited\nada: 0 left, 2 refused\nbob: 0 left, 2 refused\ncy: 0 left, 2 refused\n";
+  check_tsan "example-hit-counter"
+    ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] }
+    (example "hit_counter.lmn")
+    "15 requests: 9 answered, 6 limited\nada: 0 left, 2 refused\nbob: 0 left, 2 refused\ncy: 0 left, 2 refused\n";
   out "example-ffi" ~grants:{ Interp.no_grants with foreign = [ "c" ] } (example "ffi.lmn")
     "3.25 kg: 3.25, then [ kg]\n-1e3: -1000.0, then []\n0x1p4!: 16.0, then [!]\nabc: not a number\n: not a number\n";
   (* ---------- sql: SQLite, trusted by the standard library ---------- *)
@@ -3144,7 +3152,8 @@ fn main(root: Root) -> Result[(), IoError] {
     }
     let after = shared.query("SELECT COUNT(*) AS c FROM t", [])?
     let one = other.query("SELECT 1 AS one", [])?
-    out.print("{slow} {after[0].int("c") ?? 0} {one[0].int("one") ?? 0} {clock.now_ms() - start < 5000}")
+    // a billion rows would take minutes: the cancelled queries stopped
+    out.print("{slow} {after[0].int("c") ?? 0} {one[0].int("one") ?? 0} {clock.now_ms() - start < 30000}")
     other.close()?
     shared.close()
 }
@@ -5220,7 +5229,9 @@ fn main(root: Root) {
     let clock = root.clock
     let start = clock.now_ms()
     let xs = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-    let r = group g until clock.after(50) {
+    // long enough for every task to have started, even on a loaded machine
+    // under a sanitizer: a task the deadline finds not yet started never runs
+    let r = group g until clock.after(1000) {
         g.go(|| spin(1000000000000000))
         g.go(|| deep(80))
         g.go(|| each(xs))
@@ -5249,7 +5260,7 @@ fn main(root: Root) {
     }
     out.print("{r}")
     // the body stops computing too: the task after it is never started
-    let b = group g until clock.after(30) {
+    let b = group g until clock.after(500) {
         g.go(|| 4)
         let n = spin(1000000000000000)
         g.go(|| n)
@@ -5263,6 +5274,99 @@ fn main(root: Root) {
     out.print("{free} {spin(1000)} {clock.now_ms() - start < 5000}")
 }
 |} "deferred 500 [2, 4, 6]\n[None, None, None, None, None, None, None, None, Some(3)]\n[Some(4)]\n[0, 1] 500 true\n";
+  (* ---------- shared state: Atomic and Shared ---------- *)
+  (* Many tasks on one Atomic and one Shared: every update counts. A Shared
+     map updated by every task ends with every entry; a snapshot does not
+     change after it is taken; a panic or a cancellation in an update's
+     function leaves the value as it was and lets go of the lock; a
+     function that waits inside an update panics. *)
+  par "shared-state" {|fn spin(n: Int) -> Int {
+    let mut i = 0
+    while i >= 0 {
+        i = i + 1
+    }
+    n
+}
+
+fn later(clock: Clock, n: Int) -> Int {
+    clock.sleep(1)
+    n + 1
+}
+
+fn bump(m: Map[Str, Int], k: Str) -> Map[Str, Int] {
+    let mut m2 = m
+    m2[k] = (m.get(k) ?? 0) + 1
+    m2
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let clock = root.clock
+    let hits = atomic(0)
+    let total = shared(0)
+    let seen: Shared[Map[Str, Int]] = shared(map())
+    let r = group g {
+        for t in 0..<16 {
+            g.go(|| {
+                let mut i = 0
+                while i < 500 {
+                    hits.add(1)
+                    total.update(|n| n + 1)
+                    i = i + 1
+                }
+                seen.update(|m| bump(m, "k{t % 4}"))
+                seen.update(|m| bump(m, "all"))
+                hits.get() >= 500
+            })
+        }
+    }
+    let m = seen.get()
+    out.print("{hits.get()} {total.get()} {r.all(|x| x)} {m.len()} {m.get("all") ?? 0} {m.get("k0") ?? 0} {m.get("k3") ?? 0}")
+    let a = atomic(5)
+    out.print("{a.add(2)} {a.swap(10)} {a.compare_and_set(10, 11)} {a.compare_and_set(10, 12)} {a.get()}")
+    a.set(-1)
+    out.print("{a.add(1)} {[a, a].len()}")
+    let s = shared([1, 2])
+    let before = s.get()
+    let after = s.update(|xs| {
+        let mut ys = xs
+        ys.push(3)
+        ys
+    })
+    s.set(after + [4])
+    out.print("{before} {after} {s.get()}")
+    let p = catch(|| s.update(|xs| {
+        if xs.len() > 0 {
+            panic("no")
+        }
+        xs
+    }))
+    out.print("{p} {s.get()}")
+    let w = catch(|| total.update(|n| later(clock, n)))
+    out.print("{w} {total.get()}")
+    let c = shared(1)
+    let d = group g until clock.after(30) {
+        g.go(|| c.update(|n| spin(n)))
+        g.go(|| c.update(|n| n + 10))
+    }
+    out.print("{d.len()} {c.get() == 1 || c.get() == 11}")
+}
+|} "8000 8000 true 5 16 4 4\n7 7 true false 11\n0 2\n[1, 2] [1, 2, 3] [1, 2, 3, 4]\nErr(\"no\") [1, 2, 3, 4]\nErr(\"update must not wait\") 8000\n2 true\n";
+  errs "shared-update-waits"
+    (main_wrap
+       "    let ch: Chan[Int] = channel(1)\n    let s = shared(0)\n    let t = shared(1)\n    s.update(|n| {\n        ch.send(n)\n        root.clock.sleep(1)\n        let k = t.get()\n        let r = group g {\n            g.go(|| 1)\n        }\n        n + k\n    })\n    let ok = s.update(|n| n + 1)")
+    [ "E0312"; "E0312"; "E0312"; "E0312" ];
+  says "shared-update-waits-msg"
+    (main_wrap "    let ch: Chan[Int] = channel(1)\n    let s = shared(0)\n    s.update(|n| ch.recv() ?? n)")
+    "E0312" "the function given to `update` must not wait: `recv` on `Chan[Int]` can wait";
+  errs "shared-in-struct" "struct Stats {\n    hits: Atomic,\n}\n\nenum State {\n    On(Shared[Int]),\n}\n\nfn main() {\n}\n" [ "E0305"; "E0305" ];
+  errs "shared-compare" (main_wrap "    let a = atomic(1)\n    let b = shared(2)\n    let x = a == a\n    let y = b != b\n    let z = [a].contains(a)") [ "E0201"; "E0201"; "E0201" ];
+  errs "shared-interp" (main_wrap "    let a = atomic(1)\n    out.print(\"{a}\")") [ "E0201" ];
+  errs "shared-key" (main_wrap "    let m: Map[Atomic, Int] = map()") [ "E0113" ];
+  errs "shared-dyn"
+    "interface Named {\n    fn name(self) -> Str\n}\n\nstruct Box[T] {\n    v: T,\n}\n\nfn name(self: Box[Shared[Int]]) -> Str {\n    \"box\"\n}\n\nfn main() {\n    let b: dyn Named = Box { v: shared(1) }\n}\n"
+    [ "E0112" ];
+  errs "shared-types" (main_wrap "    let a: Atomic = atomic(\"x\")\n    let s: Shared[Int] = shared(\"x\")\n    let n: Str = a.add(1)") [ "E0201"; "E0201"; "E0201" ];
   par "group-until-stress" {|fn stuck(c: Chan[Int]) -> Int {
     c.recv() ?? -1
 }

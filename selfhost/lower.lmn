@@ -283,6 +283,8 @@ pub fn resolve(env: List[(Str, types.Ty)], te: ast.TyExpr) -> types.Ty {
                 ("Bytes", _) => TBytes,
                 ("List", [x]) => TList(x),
                 ("Chan", [x]) => TChan(x),
+                ("Atomic", _) => TAtomic,
+                ("Shared", [x]) => TShared(x),
                 ("Map", [k, v]) => TMap(k, v),
                 _ if is_cap(n) => TCap(n),
                 _ => assoc(n) ?? TNamed(n, a),
@@ -823,6 +825,14 @@ fn lower_call(self: Lx, e: ast.Expr, callee: ast.Expr, args: List[ast.Expr], ty:
                     "channel" => {
                         let (cap, lx) = lx.lower(args[0])
                         return lx.tmp(ty, ChanNew(ty, cap, sp))
+                    },
+                    "atomic" => {
+                        let (x, lx) = lx.lower(args[0])
+                        return lx.tmp(ty, Prim("atomic_new", TAtomic, [x], sp))
+                    },
+                    "shared" => {
+                        let (x, lx) = lx.lower(args[0])
+                        return lx.tmp(ty, Prim("shared_new", ty, [x], sp))
                     },
                     "catch" => {
                         let (c, lx) = lx.lower(args[0])
@@ -1438,7 +1448,7 @@ fn derive_targs(d: ast.FnDecl, act: List[types.Ty]) -> List[(Str, types.Ty)] {
 fn match_targs(decl: types.Ty, act: types.Ty, found: List[(Str, types.Ty)]) -> List[(Str, types.Ty)] {
     match (decl, act) {
         (TParam(g), t) => if found.any(|p| p.0 == g) { found } else { [(g, t)] + found },
-        (TList(a), TList(b)) | (TChan(a), TChan(b)) => match_targs(a, b, found),
+        (TList(a), TList(b)) | (TChan(a), TChan(b)) | (TShared(a), TShared(b)) => match_targs(a, b, found),
         (TArray(a, n), TArray(b, k)) => match_targs(n, k, match_targs(a, b, found)),
         (TNamed(_, xs), TNamed(_, ys)) if xs.len() == ys.len() => match_all(xs, ys, found),
         (TFn(xs, r1), TFn(ys, r2)) if xs.len() == ys.len() => match_targs(r1, r2, match_all(xs, ys, found)),
@@ -1558,6 +1568,8 @@ fn lower_method(self: Lx, e: ast.Expr, recv: ast.Expr, name: Str, args: List[ast
                 TMap(..) => "map_",
                 TArray(..) => "array_",
                 TChan(_) => "chan_",
+                TAtomic => "atomic_",
+                TShared(_) => "shared_",
                 TCap(_) => "cap_",
                 _ => panic("method on " + show(rt)),
             }

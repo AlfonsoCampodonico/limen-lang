@@ -767,7 +767,7 @@ let expand_table (it : item) : item list =
 (* An alias may not take a name another item of its module or a built-in
    type has. *)
 let builtin_type_names =
-  [ "Int"; "Int32"; "Float"; "Bool"; "Str"; "Bytes"; "List"; "Map"; "Array"; "Option"; "Result"; "IoError"; "Chan"; "Root"; "Net";
+  [ "Int"; "Int32"; "Float"; "Bool"; "Str"; "Bytes"; "List"; "Map"; "Array"; "Option"; "Result"; "IoError"; "Chan"; "Atomic"; "Shared"; "Root"; "Net";
     "Fs"; "Listen"; "Listener"; "Conn"; "Env"; "Exec"; "Foreign"; "Stdout"; "Stderr"; "Stdin"; "Clock"; "Rand"; "Handle"; "Out" ]
 
 let check_aliases (m : modinfo) =

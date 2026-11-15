@@ -475,7 +475,8 @@ let general_completions doc off =
     in
     labels @ locals @ globals @ kws
     @ [ item 3 "panic" "panic(Str)"; item 3 "assert" "assert(Bool)"; item 3 "assert_eq" "assert_eq(T, T)"; item 3 "keep" "keep(T)";
-        item 3 "channel" "channel(Int) -> Chan[T]"; item 3 "embed" "embed(\"path\") -> Str, read at compile time";
+        item 3 "channel" "channel(Int) -> Chan[T]"; item 3 "atomic" "atomic(Int) -> Atomic"; item 3 "shared" "shared(T) -> Shared[T]";
+        item 3 "embed" "embed(\"path\") -> Str, read at compile time";
         item 3 "embed_bytes" "embed_bytes(\"path\") -> Bytes, read at compile time";
         item 3 "embed_dir" "embed_dir(\"path\") -> Map[Str, Bytes], every file under a directory, read at compile time" ]
 
