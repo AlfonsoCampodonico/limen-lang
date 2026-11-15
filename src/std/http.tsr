@@ -3,6 +3,7 @@
 // be streamed in chunks both ways. The client speaks TLS for https:// URLs
 // (Net.connect_tls); the server speaks TLS when its listener came from
 // Listen.on_tls, with nothing else to change.
+use compress
 use format
 use hex
 use url
@@ -469,10 +470,47 @@ pub fn request_lines(net: Net, method: Str, url: Str, headers: List[Header], bod
 }
 
 // Send a request and read the whole response. The connection is closed
-// afterwards. `net` must allow the URL's host.
+// afterwards. `net` must allow the URL's host. Unless `headers` has an
+// Accept-Encoding, the request says `Accept-Encoding: gzip`, and a body
+// that comes back with `Content-Encoding: gzip` (or `deflate`) is
+// decompressed, up to 64 MB, with that header and Content-Length left out
+// of the response, since they describe the bytes sent and not the body.
 pub fn request(net: Net, method: Str, url: Str, headers: List[Header], body: Str) -> Result[Response, IoError] {
-    let (r, text) = request_fold(net, method, url, headers, body, "", |a, s| a + s)?
-    Ok(Response { status: r.status, headers: r.headers, body: text })
+    let mut all = headers
+    if find_header(headers, "Accept-Encoding").is_none() {
+        all.push(Header { name: "Accept-Encoding", value: "gzip" })
+    }
+    let (r, text) = request_fold(net, method, url, all, body, "", |a, s| a + s)?
+    decoded(Response { status: r.status, headers: r.headers, body: text })
+}
+
+fn max_decoded() -> Int {
+    67108864
+}
+
+// `r` with its body decompressed if it came with `Content-Encoding: gzip`
+// or `deflate` (zlib, or the raw deflate some servers send for it).
+fn decoded(r: Response) -> Result[Response, IoError] {
+    let encoding = (find_header(r.headers, "Content-Encoding") ?? "").trim().to_lower()
+    if r.body == "" || (encoding != "gzip" && encoding != "x-gzip" && encoding != "deflate") {
+        return Ok(r)
+    }
+    let data = r.body.to_bytes()
+    let body = if encoding == "deflate" {
+        match compress.unzlib(data, max_decoded()) {
+            Ok(b) => Ok(b),
+            Err(e) => compress.inflate(data, max_decoded()).map_error(|_| e),
+        }
+    } else {
+        compress.gunzip(data, max_decoded())
+    }
+    match body {
+        Ok(b) => {
+            let kept = r.headers.filter(|h| h.name.to_lower() != "content-encoding" && h.name.to_lower() != "content-length")
+            Ok(Response { status: r.status, headers: kept, body: b.to_str() })
+        },
+        Err(e) => Err(bad("the {encoding} body: {e}")),
+    }
 }
 
 pub fn get(net: Net, url: Str) -> Result[Response, IoError] {

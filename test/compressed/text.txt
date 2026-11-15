@@ -1,0 +1,120 @@
+000 map lazy jumps stream
+001 length capability window lazy over list
+002 distance dog fox map dog length the lazy
+003 stream quick length dog capability fox bytes distance
+004 brown length distance huffman window fox
+005 over code code lazy
+006 literal window quick fox value fox distance
+007 tessera code block stream
+008 over tessera tessera jumps dog fox
+009 capability huffman block block code stream
+010 code tessera window block
+011 block literal list over list
+012 length code length tessera
+013 the bytes map huffman distance code capability window distance
+014 dog lazy the the bytes list distance over block
+015 the huffman fox value over distance bytes jumps
+016 lazy tessera stream code huffman huffman tessera brown the
+017 over code capability over block brown
+018 list distance over brown block huffman value distance
+019 stream block literal brown window fox length
+020 capability jumps distance the brown
+021 list window block huffman block fox bytes map
+022 distance block stream map map
+023 map bytes block distance jumps fox block
+024 bytes lazy huffman stream distance stream window quick
+025 length brown lazy map distance literal literal the
+026 window literal map window literal huffman lazy
+027 stream over quick
+028 huffman block bytes block map bytes list value
+029 over distance jumps length map jumps lazy over
+030 distance literal jumps capability huffman
+031 value capability quick
+032 jumps literal value code
+033 brown distance length brown huffman lazy capability
+034 value dog jumps huffman jumps lazy distance the code
+035 list capability distance bytes distance literal
+036 distance stream distance dog bytes
+037 lazy lazy over huffman map
+038 map length code huffman brown
+039 bytes map map brown stream jumps
+040 list bytes tessera length
+041 over jumps tessera quick tessera quick
+042 stream window length distance map map
+043 huffman jumps length
+044 jumps quick dog distance fox list lazy
+045 over stream jumps bytes distance distance
+046 length bytes literal
+047 fox bytes length over huffman quick quick length
+048 capability huffman capability
+049 length list tessera over huffman window
+050 literal map quick jumps
+051 over bytes bytes quick lazy
+052 literal bytes quick code value literal code
+053 dog code brown bytes length window
+054 code literal tessera map
+055 tessera dog over window
+056 over value huffman
+057 literal map fox bytes capability stream
+058 literal quick list quick capability capability distance over lazy
+059 brown the capability huffman jumps block over block map
+060 dog dog length tessera dog stream dog capability length
+061 brown bytes the tessera
+062 window value tessera over lazy
+063 fox code literal list length dog capability literal
+064 the block list literal value length brown tessera
+065 quick literal block stream
+066 bytes capability bytes dog quick the huffman
+067 block the quick length bytes quick tessera length distance
+068 distance map quick fox lazy tessera literal brown lazy
+069 value huffman bytes capability
+070 distance tessera capability huffman
+071 code stream bytes lazy
+072 tessera tessera dog tessera list value distance brown list
+073 tessera over lazy brown brown distance
+074 value dog code the list the map
+075 over huffman window window lazy huffman
+076 over over distance
+077 code block literal quick
+078 brown distance literal stream stream code
+079 quick value literal jumps literal dog fox
+080 huffman jumps huffman stream bytes
+081 stream list jumps stream code stream quick
+082 map brown quick map tessera bytes
+083 value literal length list
+084 length code brown huffman over the length value
+085 list fox fox stream distance
+086 jumps block bytes huffman
+087 huffman lazy map
+088 fox the over capability distance capability literal window
+089 length distance quick bytes over brown brown
+090 length quick list huffman huffman
+091 lazy fox huffman dog value length lazy map fox
+092 huffman bytes window over stream
+093 code lazy capability quick map value block
+094 the the jumps literal window huffman fox literal
+095 fox lazy value jumps
+096 window window length lazy lazy capability
+097 dog dog quick dog brown huffman map stream
+098 over distance huffman length code block literal huffman
+099 stream capability map stream lazy map literal stream
+100 lazy jumps window value block
+101 window fox jumps dog length
+102 literal code length value brown window brown
+103 huffman block block block brown over distance bytes jumps
+104 brown block distance capability stream stream value
+105 jumps huffman length fox
+106 capability length literal list code fox length block over
+107 the distance bytes code map code fox map
+108 length stream distance the brown block huffman
+109 huffman value tessera bytes jumps distance
+110 over fox lazy block huffman jumps quick block
+111 quick stream quick list capability distance list capability over
+112 huffman value bytes value block quick stream lazy distance
+113 block brown map over literal window huffman fox
+114 dog capability block code bytes literal dog
+115 dog fox brown brown length
+116 code fox length value capability
+117 list lazy capability block
+118 fox block bytes
+119 capability code block block brown list

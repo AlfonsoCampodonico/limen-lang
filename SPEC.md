@@ -1693,7 +1693,7 @@ The standard library is checked like a dependency. `src/std/tessera.toml` lists 
 
 | Module | May take |
 | --- | --- |
-| `json`, `list`, `text`, `format`, `regex`, `errors`, `hex`, `base64`, `hash`, `csv`, `url`, `flags` | nothing: pure |
+| `json`, `list`, `text`, `format`, `regex`, `errors`, `hex`, `base64`, `hash`, `csv`, `url`, `flags`, `compress` | nothing: pure |
 | `http` | `net` (Net, Conn) and `listen` (Listener, Conn) |
 | `time` | `clock` and `fs`, for `within` and `load_zone` alone |
 | `sql` | `fs` (the database file's directory); trusted with C (`[trust] foreign = ["sql"]`) to call SQLite |
@@ -1754,8 +1754,8 @@ HTTP/1.1, plain or over TLS. The server keeps connections alive between requests
 | `struct Header { name, value }`, `req.header(name)`, `resp.header(name)`, `find_header(headers, name)` | headers; lookup ignores case |
 | `struct Request { method, path, version, headers, body }` | `version` is `"HTTP/1.1"` or `"HTTP/1.0"` |
 | `struct Response { status: Int, headers, body }`, `text(status, body)`, `json(status, body)`, `reason(status)` | |
-| `get(net, url)`, `post(net, url, content_type, body)`, `request(net, method, url, headers, body)` | `Result[Response, IoError]`; `http://` and `https://` URLs, read with the `url` module: the request names the path and query (`/` when there is no path), never the `#fragment`, which stays with the client; an IPv6 host is written in brackets (`http://[::1]:8080/`); a URL `url.parse` rejects is an error with its message. Chunked responses decoded, one connection per request |
-| `request_fold(net, method, url, headers, body, init, f)` | `Result[(Response, T), IoError]`: the body is passed to `f: fn(T, Str) -> T` piece by piece as it arrives instead of being held in memory; the response comes back with an empty body |
+| `get(net, url)`, `post(net, url, content_type, body)`, `request(net, method, url, headers, body)` | `Result[Response, IoError]`; `http://` and `https://` URLs, read with the `url` module: the request names the path and query (`/` when there is no path), never the `#fragment`, which stays with the client; an IPv6 host is written in brackets (`http://[::1]:8080/`); a URL `url.parse` rejects is an error with its message. Chunked responses decoded, one connection per request. Unless `headers` has an Accept-Encoding, the request says `Accept-Encoding: gzip`, and a body sent with `Content-Encoding: gzip` or `deflate` is decompressed with the `compress` module (up to 64 MiB; damaged data is an error), the response then leaving out Content-Encoding and Content-Length, which describe the bytes sent |
+| `request_fold(net, method, url, headers, body, init, f)` | `Result[(Response, T), IoError]`: the body is passed to `f: fn(T, Str) -> T` piece by piece as it arrives instead of being held in memory, as it was sent (not decompressed: it asks for no encoding unless `headers` does); the response comes back with an empty body |
 | `request_lines(net, method, url, headers, body, f)` | `Result[Response, IoError]`: for a stream that may never end (a Kubernetes watch, server-sent events, a log follow), each line of a 2xx body is passed to `f: fn(Str) -> Bool` as soon as it has arrived, without its `\n` or `\r\n`; `f` returns `false` to stop, and the connection is closed. Any other status is returned with its whole body, and `f` is not called |
 | `serve_forever(listener, handler) -> IoError` | serve every connection in its own task until the listener is closed (by another task holding it) or fails; returns that error. The tasks are an `interleaved` group (section 10): what a handler prints goes out at once |
 | `serve(listener, count, handler) -> Int` | the same for `count` connections; returns how many requests were answered |
@@ -2016,6 +2016,36 @@ fn main(root: Root) -> Result[(), Str] {
 }
 ```
 
+### compress
+
+Compression with DEFLATE (RFC 1951), raw or in its two wrappers: zlib (RFC 1950), as HTTP's `deflate` and PNG use it, and gzip (RFC 1952), the `.gz` files and HTTP's `gzip`. Pure functions over `Bytes`, written in Tessera, so they need no C library and behave the same everywhere.
+
+| Item | Meaning |
+| --- | --- |
+| `gzip(data, level) -> Bytes`, `gunzip(data, max) -> Result[Bytes, Str]` | the gzip format, as `gzip -c` writes it (no file name or time in the header); `gunzip` reads every member of a file made by joining several, and skips a header's name, comment and extra field, checking its CRC if it has one |
+| `zlib(data, level) -> Bytes`, `unzlib(data, max) -> Result[Bytes, Str]` | the zlib format: a two-byte header, the stream and an Adler-32. A preset dictionary is not supported (an error) |
+| `deflate(data, level) -> Bytes`, `inflate(data, max) -> Result[Bytes, Str]` | a raw deflate stream, without header or checksum |
+| `crc32(data) -> Int`, `adler32(data) -> Int` | the checksums gzip and zlib use: `crc32("abc".to_bytes())` is `891568578` (`0x352441c2`) |
+
+- `level` is 0 to 9: 0 stores the data as it is, 1 is fastest, 9 compresses most, and 6 is the usual choice; another level panics. Repeats are found with hash chains, as zlib finds them (from level 4 a repeat is put off when the next byte starts a longer one), and each block of about 16,000 symbols is written with Huffman codes made for it, with the fixed codes or stored, whichever is smallest. The result is about the size zlib makes at the same level. The output is the same for the same input and level, in both backends.
+- `max` is the most bytes the result may have. Decompressing stops with an error as soon as it would pass it, so a few kilobytes made to expand to gigabytes (a decompression bomb) cost no more than `max` bytes of memory; pass the most you are prepared to hold. A negative `max` panics.
+- Decompressing checks everything it reads, and hostile data is an error, never a panic or a read out of bounds: data cut off, a block of the reserved type, a stored block whose length does not match its complement, impossible or incomplete Huffman codes, a code that is not in its code, a distance back past the start, a checksum or length that does not match, bytes after the end. Messages start with `compress:`: `compress: the gzip data's CRC-32 does not match`.
+- Natively, compressing runs at about 16 MB/s at level 6 (60 at level 1) and decompressing at about 120 MB/s, a few times slower than zlib's C.
+
+```
+use compress
+
+fn main(root: Root) -> Result[(), Str] {
+    let page = "<p>hello</p>".to_bytes()
+    let packed = compress.gzip(page, 6)
+    let back = compress.gunzip(packed, 1048576)?      // at most 1 MB
+    root.stdout.print("{packed.len()} {back == page}")
+    Ok(())
+}
+```
+
+`http.request` (and `get` and `post`) ask for gzip and decompress a body sent with `Content-Encoding: gzip` or `deflate` (section 19, http).
+
 ### flags
 
 Command-line flags. A program declares what it takes, parses `root.args()` and prints help built from the declarations. Pure: the arguments go in and the help comes back as text.
@@ -2130,7 +2160,7 @@ fn main(root: Root) {
 The core language is close to complete; what is missing is mostly around it.
 
 - Platforms: no Windows (fibers, the poller and the sandbox are macOS and Linux only); x86-64 has not run on real hardware; no cross-compilation or WebAssembly target.
-- Standard library: no compression, no encryption or public-key signatures (hashing and HMAC only), and Unicode support stops at `chars()`.
+- Standard library: no encryption or public-key signatures (hashing and HMAC only), compression only of whole values (no streaming inflate), and Unicode support stops at `chars()`.
 - Tooling: no debugger mapping (native code is C without `#line`), profiler or test coverage; cold builds spend about 3 s in the C compiler for a 600-line program; no incremental checking.
 - Distribution: no prebuilt releases or Homebrew formula; the package index has no hosted default; no stability promise yet.
 - Language: no default parameter values, no integer types besides `Int` outside FFI, no code generation for repetitive cases such as JSON for a struct, and C callbacks cannot be kept for later.

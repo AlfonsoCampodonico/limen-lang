@@ -9,6 +9,7 @@
   (glob_files %{project_root}/selfhost/*.tsr)
   (glob_files tls/*.pem)
   (glob_files tls/*.py)
+  (glob_files compressed/*)
   (source_tree zoneinfo)))
 
 ; `tessera lsp` end to end over stdio.

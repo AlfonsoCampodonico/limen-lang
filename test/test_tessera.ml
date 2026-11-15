@@ -3432,6 +3432,205 @@ fn main(root: Root) {
 }
 |v}
     "588 0\nba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\na9993e364706816aba3e25717850c26c9cd0d89d\nf96b697d7cb7938d525a2f31aaf161d0\n5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843\n3 true true\ncdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0\n";
+  (* ---------- compress: deflate, zlib and gzip ---------- *)
+  let compress_dir =
+    let d = Filename.concat (Sys.getcwd ()) "compressed" in
+    if Sys.file_exists d then d else Filename.concat (Sys.getcwd ()) "test/compressed"
+  in
+  let fixture f = read_file (Filename.concat compress_dir f) in
+  let hex_of s = String.concat "" (List.map (fun c -> sprintf "%02x" (Char.code c)) (List.of_seq (String.to_seq s))) in
+  let of_hex h = String.init (String.length h / 2) (fun i -> Char.chr (int_of_string ("0x" ^ String.sub h (2 * i) 2))) in
+  let rec replace_all key by s =
+    match Interp_util.find_sub s key 0 with
+    | Some i -> String.sub s 0 i ^ by ^ replace_all key by (String.sub s (i + String.length key) (String.length s - i - String.length key))
+    | None -> s
+  in
+  let compress_src =
+    {v|use compress
+use hash
+use hex
+
+fn h(s: Str) -> Bytes {
+    hex.decode(s) ?? bytes([])
+}
+
+fn flip(b: Bytes, at: Int) -> Bytes {
+    let mut xs = b.to_list()
+    xs[at] = xs[at] ^ 1
+    bytes(xs)
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let text = h("TEXT")
+    let random = h("RANDOM")
+    let hello = "hello, tessera\n".to_bytes()
+    let text_gz = h("TEXT_GZ")
+    // files made by the system's gzip (with a name, without, several
+    // members, a stored block, nothing) and by zlib
+    out.print("{compress.gunzip(h("HELLO_GZ"), 100) == Ok(hello)} {compress.gunzip(text_gz, 10000) == Ok(text)} {compress.gunzip(h("MULTI_GZ"), 10000) == Ok(hello + text)}")
+    out.print("{compress.gunzip(h("RANDOM_GZ"), 1000) == Ok(random)} {compress.gunzip(h("EMPTY_GZ"), 0)} {compress.unzlib(h("TEXT_ZLIB"), 10000) == Ok(text)}")
+    // the most output allowed
+    out.print("{compress.gunzip(text_gz, 5175)} {compress.gunzip(text_gz, 5176).is_ok()} {compress.unzlib(h("TEXT_ZLIB"), 100)}")
+    // what this compressor writes, pinned in both backends
+    for level in [0, 1, 6, 9] {
+        let g = compress.gzip(text, level)
+        out.print("gzip {level}: {g.len()} {hash.sha256_hex(g).slice(0, 16)} {compress.gunzip(g, 6000) == Ok(text)}")
+    }
+    let z = compress.zlib(text, 6)
+    out.print("zlib: {z.len()} {hash.sha256_hex(z).slice(0, 16)} {compress.unzlib(z, 6000) == Ok(text)}")
+    // round trips of awkward inputs at every level
+    let long = bytes((0..<40000).map(|i| (i / 300 + i % 7) % 256))
+    let inputs = [bytes([]), "a".to_bytes(), "abcabcabcabcabcabcabcabc".to_bytes(), bytes((0..<1000).map(|_| 0)), random, text, long]
+    let mut sizes: List[Str] = []
+    let mut right = 0
+    for d in inputs {
+        for level in [0, 1, 3, 4, 6, 9] {
+            let raw = compress.deflate(d, level)
+            if compress.inflate(raw, d.len()) == Ok(d) && compress.unzlib(compress.zlib(d, level), d.len()) == Ok(d) {
+                right = right + 1
+            }
+            if level == 6 {
+                sizes.push("{d.len()}:{raw.len()}")
+            }
+        }
+    }
+    out.print("{right}/42 {sizes.join(" ")}")
+    out.print("{compress.crc32("abc".to_bytes())} {compress.crc32(bytes([]))} {compress.adler32("Wikipedia".to_bytes())} {compress.adler32(bytes([]))}")
+    // damaged data is an error, never a panic
+    let mut cut_errors = 0
+    for k in 0..<text_gz.len() {
+        if compress.gunzip(text_gz.slice(0, k), 10000).is_err() {
+            cut_errors = cut_errors + 1
+        }
+    }
+    out.print("{cut_errors}/{text_gz.len()} prefixes refused")
+    let n = text_gz.len()
+    let errors = [
+        compress.gunzip("hello".to_bytes(), 100),
+        compress.gunzip(text_gz.slice(0, n - 3), 10000),
+        compress.gunzip(flip(text_gz, n - 8), 10000),
+        compress.gunzip(flip(text_gz, n - 2), 10000),
+        compress.gunzip(text_gz + bytes([0]), 10000),
+        compress.gunzip(flip(text_gz, 2), 10000),
+        compress.gunzip(bytes([31, 139, 8, 224]) + text_gz.slice(4, n), 10000),
+        compress.unzlib(bytes([120, 2, 0, 0, 0, 0]), 100),
+        compress.unzlib(bytes([120, 187, 0, 0, 0, 0]), 100),
+        compress.unzlib(flip(z, z.len() - 1), 10000),
+        compress.inflate(bytes([7]), 100),
+        compress.inflate(bytes([1, 5, 0, 0, 0]), 100),
+        compress.inflate(bytes([1, 1, 0, 254, 255, 65, 66]), 100),
+        compress.inflate(bytes([3, 0, 0]), 100),
+    ]
+    for e in errors {
+        out.print("{e}")
+    }
+    // a bomb: 1 MB of zeros in about a kilobyte, refused past the maximum
+    let bomb = compress.gzip(bytes((0..<1000000).map(|_| 0)), 9)
+    out.print("{bomb.len() < 1500} {compress.gunzip(bomb, 100000)}")
+}
+|v}
+  in
+  let compress_src =
+    List.fold_left
+      (fun src (key, file) -> replace_all key (hex_of (fixture file)) src)
+      compress_src
+      [ ("TEXT_GZ", "text.txt.gz"); ("TEXT_ZLIB", "text.zlib"); ("TEXT", "text.txt"); ("RANDOM_GZ", "random.bin.gz"); ("RANDOM", "random.bin");
+        ("HELLO_GZ", "hello.txt.gz"); ("MULTI_GZ", "multi.gz"); ("EMPTY_GZ", "empty.gz") ]
+  in
+  out "std-compress" compress_src
+    "true true true\ntrue Ok(bytes([])) true\nErr(\"compress: the data is larger than the maximum of 5175 bytes\") true Err(\"compress: the data is larger than the maximum of 100 bytes\")\ngzip 0: 5199 bec8b302680a3573 true\ngzip 1: 1512 98c59e7bcb9c34cf true\ngzip 6: 1405 87496569e7b30cd6 true\ngzip 9: 1405 0643a64ac9596a67 true\nzlib: 1393 9e286361fc07fc8a true\n42/42 0:2 1:3 24:6 1000:10 400:405 5176:1387 40000:633\n891568578 0 300286872 1\n1395/1395 prefixes refused\nErr(\"compress: not gzip data\")\nErr(\"compress: the data is cut off\")\nErr(\"compress: the gzip data's CRC-32 does not match\")\nErr(\"compress: the gzip data's length does not match\")\nErr(\"compress: bytes after the end of the gzip data, at byte 1395\")\nErr(\"compress: gzip compression method 9 is not deflate\")\nErr(\"compress: reserved gzip header flags are set\")\nErr(\"compress: not zlib data\")\nErr(\"compress: zlib data with a preset dictionary is not supported\")\nErr(\"compress: the zlib data's Adler-32 does not match\")\nErr(\"compress: a block of the reserved type 3\")\nErr(\"compress: a stored block's length does not match its complement\")\nErr(\"compress: bytes after the end of the deflate data, at byte 6\")\nErr(\"compress: bytes after the end of the deflate data, at byte 2\")\ntrue Err(\"compress: the data is larger than the maximum of 100000 bytes\")\n";
+  panics "std-compress-level" "use compress\n\nfn main(root: Root) {\n    root.stdout.print(\"{compress.gzip(bytes([]), 10)}\")\n}\n" "compress: level 10 is not 0 to 9";
+  (* what this compressor writes, read back by the system's gzip and by zlib *)
+  if selected "std-compress-system" then begin
+    let text = fixture "text.txt" in
+    let src =
+      replace_all "TEXT" (hex_of text)
+        "use compress\nuse hex\n\nfn main(root: Root) {\n    let text = hex.decode(\"TEXT\") ?? bytes([])\n    for level in [0, 1, 6, 9] {\n        root.stdout.print(hex.encode(compress.gzip(text, level)))\n    }\n    root.stdout.print(hex.encode(compress.zlib(text, 9)))\n}\n"
+    in
+    match run "std-compress-system" src with
+    | Error e -> ok "std-compress-system" false e
+    | Ok (got, _) ->
+      let lines = List.filter (fun l -> l <> "") (String.split_on_char '\n' got) in
+      let f = Filename.concat tmpdir "compress-system" in
+      let read_back cmd data =
+        Out_channel.with_open_bin f (fun oc -> output_string oc data);
+        let ic = Unix.open_process_args_in (List.hd cmd) (Array.of_list (cmd @ [ f ])) in
+        let s = In_channel.input_all ic in
+        ignore (Unix.close_process_in ic);
+        s
+      in
+      let gz = List.filteri (fun i _ -> i < 4) lines and zl = List.nth lines 4 in
+      let py = [ "python3"; "-c"; "import sys, zlib; sys.stdout.buffer.write(zlib.decompress(open(sys.argv[1], 'rb').read()))" ] in
+      ok "std-compress-system"
+        (List.length lines = 5
+         && List.for_all (fun l -> read_back [ "gzip"; "-dc" ] (of_hex l) = text) gz
+         && read_back py (of_hex zl) = text)
+        got
+  end;
+  (* the http client asks for gzip and decompresses gzip and deflate bodies *)
+  out "std-http-gzip" ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] }
+    {v|use compress
+use http
+
+fn text() -> Bytes {
+    "a body that compresses well, a body that compresses well, again and again\n".to_bytes()
+}
+
+fn serve(l: Listener, n: Int) -> Str {
+    let mut seen: List[Str] = []
+    for i in 0..<n {
+        match l.accept() {
+            Ok(c) => {
+                let asked = match http.read_request(c) {
+                    Ok(r) => r.header("accept-encoding") ?? "-",
+                    Err(e) => "{e}",
+                }
+                seen.push(asked)
+                let (encoding, data) = match i {
+                    0 => ("gzip", compress.gzip(text(), 6)),
+                    1 => ("deflate", compress.zlib(text(), 6)),
+                    2 => ("deflate", compress.deflate(text(), 1)),
+                    3 => ("gzip", bytes([31, 139, 8, 0, 1, 2])),
+                    _ => ("", text()),
+                }
+                let head = if encoding == "" { "" } else { "Content-Encoding: {encoding}\r\n" }
+                let _ = c.write("HTTP/1.1 200 OK\r\nContent-Length: {data.len()}\r\n{head}\r\n" + data.to_str())
+                c.close()
+            },
+            Err(e) => seen.push("{e}"),
+        }
+    }
+    seen.join(" ")
+}
+
+fn client(net: Net, port: Int) -> Str {
+    let mut log: List[Str] = []
+    for i in 0..<5 {
+        let headers = if i == 4 { [http.Header { name: "Accept-Encoding", value: "identity" }] } else { [] }
+        match http.request(net, "GET", "http://127.0.0.1:{port}/", headers, "") {
+            Ok(r) => log.push("{r.status} {r.body.to_bytes() == text()} {r.header("content-encoding")} {r.header("content-length")}"),
+            Err(e) => log.push("{e}"),
+        }
+    }
+    log.join("\n")
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let l = root.listen.on("127.0.0.1:0")?
+    let port = l.port()
+    let net = root.net
+    let results = group g {
+        g.go(|| serve(l, 5))
+        g.go(|| client(net, port))
+    }
+    for r in results {
+        root.stdout.print(r)
+    }
+    Ok(())
+}
+|v}
+    "gzip gzip gzip gzip identity\n200 true None None\n200 true None None\n200 true None None\nFailed(\"http: the gzip body: compress: the data is cut off\")\n200 true None Some(\"74\")\n";
   out "std-http-keepalive-stream" ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] }
     {v|use http
 
