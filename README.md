@@ -107,6 +107,7 @@ To write your own: `tessera check` gives errors with fixes, `tessera explain E03
   - completion: members after `.` (fields, methods, capabilities on `root`, and after a module name such as `json.` its public functions, types and variants), otherwise locals, functions, types and keywords
   - the checker's auto-fixes as quick fixes
   - an outline of the file
+  - semantic tokens (full and by range): a module qualifier (`http` in `http.read_request`) is a `namespace`, a value (`c` in `c.write`) a `parameter` or `variable` (`readonly` unless `let mut`), and so on for types, variants, functions, methods and fields; the built-in capabilities are the token type `capability`, and the modifier `capability` marks every type, field, parameter and variable whose type holds authority
 
   Positions count bytes, which is exact for ASCII source.
 - **Grammar ([grammar/tessera.gbnf](grammar/tessera.gbnf)):** in llama.cpp's GBNF format, for constrained decoding. It accepts every example, benchmark and test-suite program, and rejects the hand-written invalid cases. It is slightly more permissive than the parser: keywords aren't excluded from identifiers. It requires a space after keywords (`if x {`), which is the canonical style.

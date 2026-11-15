@@ -1,6 +1,6 @@
 (* Language server: diagnostics, hover (types and doc comments), go to
    definition, find references, rename, completion, quick fixes from the
-   checker's auto-fixes, and document symbols. Definitions, references and
+   checker's auto-fixes, document symbols and semantic tokens. Definitions, references and
    rename work across the modules the open file uses (see Refs).
    [handle] is pure request -> messages, so it can be tested without stdio.
    Positions: LSP lines and characters are mapped to byte offsets, which is
@@ -8,8 +8,13 @@
 open Ast
 module J = Json
 
-(* [items]: the whole checked program, every module the file uses included *)
-type doc = { path : string; text : string; items : item list option; diags : Diag.t list; occs : Refs.occ list }
+(* A semantic token: where it starts and its length in bytes, its type and modifiers. *)
+type sem = { at : int; len : int; kind : string; mods : string list }
+
+(* [items]: the whole checked program, every module the file uses included;
+   [sem]: the file's semantic tokens, worked out with the checker's state
+   right after the analysis *)
+type doc = { path : string; text : string; items : item list option; diags : Diag.t list; occs : Refs.occ list; sem : sem list }
 type state = { docs : (string, doc) Hashtbl.t; mutable shutdown : bool; mutable exit : bool }
 
 let create () = { docs = Hashtbl.create 8; shutdown = false; exit = false }
@@ -474,6 +479,197 @@ let general_completions doc off =
         item 3 "embed_bytes" "embed_bytes(\"path\") -> Bytes, read at compile time";
         item 3 "embed_dir" "embed_dir(\"path\") -> Map[Str, Bytes], every file under a directory, read at compile time" ]
 
+(* ---------- semantic tokens ----------
+
+   What the checker knows that a TextMate grammar cannot: whether `x` in
+   `x.f` is a module or a value, a parameter or a local, and which values
+   and types hold authority. `capability` is its own token type for the
+   built-in capabilities (`Net`, `Fs`, ...) and a modifier on everything
+   else whose type holds one: a struct that keeps a `Net`, a parameter of
+   that struct's type, a field holding an `Fs`. *)
+
+let token_types =
+  [ "namespace"; "type"; "struct"; "enum"; "interface"; "enumMember"; "function"; "method"; "parameter"; "variable"; "property"; "capability" ]
+
+let token_modifiers = [ "declaration"; "readonly"; "mutable"; "capability"; "defaultLibrary" ]
+
+let cap_names = List.map Types.cap_name Types.all_caps
+let holds_authority t = Types.caps_in t [] <> []
+
+let rec te_holds (te : ty_expr) =
+  match te.tdesc with
+  | TyName (n, args) -> List.mem n cap_names || Hashtbl.mem Types.authority n || List.exists te_holds args
+  | TyFn (ps, r) -> List.exists te_holds (r :: ps)
+  | TyUnit | TyInt _ -> false
+
+(* Every statement of [b] and of the blocks inside it. *)
+let each_stmt g b =
+  let rec stmts b =
+    List.iter
+      (fun s ->
+        g s;
+        match s.sdesc with
+        | SWhile (_, b) | SFor (_, _, _, b) | SForPat (_, _, b) | SDefer b -> stmts b
+        | _ -> ())
+      b.stmts
+  in
+  stmts b;
+  walk_block (fun e -> match e.edesc with EBlock b | EIf (_, b, _) | EGroup (_, _, _, b) -> stmts b | _ -> ()) b
+
+(* The tokens of the file at [path], in order. [occs] are the names Refs
+   found, which decide most kinds; walking the bodies adds the built-in
+   methods, fields and functions, and the source's own tokens the module
+   names (`use m`, `m.f`). *)
+let semantic_tokens path text (items : item list) (occs : Refs.occ list) =
+  let local (sp : Span.t) = "l:" ^ sp.file ^ "#" ^ string_of_int sp.lo in
+  let params = Hashtbl.create 16 and mutables = Hashtbl.create 16 and caps = Hashtbl.create 16 in
+  let ty_at = Hashtbl.create 64 and field_caps = Hashtbl.create 16 and kinds = Hashtbl.create 16 in
+  let extra = ref [] in
+  let found (sp : Span.t) name kind mods =
+    match Refs.name_span sp name with Some sp when sp.file = path -> extra := { at = sp.lo; len = sp.hi - sp.lo; kind; mods } :: !extra | _ -> ()
+  in
+  let rec tys (te : ty_expr) =
+    match te.tdesc with
+    | TyName (n, args) ->
+      if List.mem n cap_names then found te.tspan n "capability" [];
+      List.iter tys args
+    | TyFn (ps, r) -> List.iter tys ps; tys r
+    | TyUnit | TyInt _ -> ()
+  in
+  let stmt s =
+    match s.sdesc with
+    | SLet (m, _, nsp, t, e) ->
+      Hashtbl.replace ty_at nsp.lo e.ety;
+      if m then Hashtbl.replace mutables (local nsp) ();
+      Option.iter tys t
+    | SFor (_, nsp, e, _) -> (
+      match Types.repr e.ety with Types.TList t | Types.TArray (t, _) -> Hashtbl.replace ty_at nsp.lo t | _ -> ())
+    | _ -> ()
+  in
+  let expr e =
+    match e.edesc with
+    | EVar n ->
+      Hashtbl.replace ty_at e.espan.lo e.ety;
+      if n <> "" && not (String.contains n '.' || String.contains n ':' || String.contains n '$') then
+        if n.[0] >= 'A' && n.[0] <= 'Z' then found e.espan n "enumMember" [ "defaultLibrary" ]
+        else (match Types.repr e.ety with Types.TFn _ -> found e.espan n "function" [ "defaultLibrary" ] | _ -> ())
+    | EMethod (_, name, nsp, _) -> found nsp name "method" []
+    | EField (_, name, nsp) -> found nsp name "property" (if holds_authority e.ety then [ "capability" ] else [])
+    | EClosure (ps, _) ->
+      let pts = match Types.repr e.ety with Types.TFn (pts, _) when List.length pts = List.length ps -> pts | _ -> [] in
+      List.iteri
+        (fun i (_, t, (sp : Span.t)) ->
+          Hashtbl.replace params (local sp) ();
+          Option.iter tys t;
+          match List.nth_opt pts i with Some pt -> Hashtbl.replace ty_at sp.lo pt | None -> ())
+        ps
+    | _ -> ()
+  in
+  List.iter
+    (function
+      | IFn _ -> ()
+      | IStruct s ->
+        Hashtbl.replace kinds s.st_name "struct";
+        List.iter (fun (f, _, te) -> if te_holds te then Hashtbl.replace field_caps ("d:" ^ s.st_name ^ "#" ^ f) ()) s.st_fields
+      | IEnum e -> Hashtbl.replace kinds e.en_name "enum"
+      | IIface i -> Hashtbl.replace kinds i.if_name "interface"
+      | IType a -> Hashtbl.replace kinds a.ty_name "type")
+    items;
+  List.iter
+    (function
+      | IFn d ->
+        List.iter
+          (fun p ->
+            Hashtbl.replace params (local p.prm_span) ();
+            if te_holds p.prm_ty then Hashtbl.replace caps (local p.prm_span) ();
+            tys p.prm_ty)
+          d.fn_params;
+        Option.iter tys d.fn_ret;
+        each_stmt stmt d.fn_body;
+        walk_block expr d.fn_body
+      | IStruct s -> List.iter (fun (_, _, te) -> tys te) s.st_fields
+      | IEnum e -> List.iter (fun (_, _, tes) -> List.iter tys tes) e.en_variants
+      | IIface i -> List.iter (fun (_, _, ps, r) -> List.iter (fun p -> tys p.prm_ty) ps; Option.iter tys r) i.if_methods
+      | IType a -> tys a.ty_body)
+    (mine path items);
+  let occs = List.filter (fun (o : Refs.occ) -> o.sp.file = path && o.name <> "_") occs in
+  (* a local holds authority when a use or its definition has such a type *)
+  List.iter
+    (fun (o : Refs.occ) ->
+      if o.key.[0] = 'l' then
+        match Hashtbl.find_opt ty_at o.sp.lo with Some t when holds_authority t -> Hashtbl.replace caps o.key () | _ -> ())
+    occs;
+  let named (o : Refs.occ) =
+    let name = String.sub o.key 2 (String.length o.key - 2) in
+    let kind, mods =
+      match o.key.[0] with
+      | 'f' -> ((if Interp_util.find_sub name "::" 0 <> None then "method" else "function"), [])
+      | 't' -> (Option.value ~default:"type" (Hashtbl.find_opt kinds name), if Hashtbl.mem Types.authority name then [ "capability" ] else [])
+      | 'v' -> ("enumMember", [])
+      | 'd' -> ("property", if Hashtbl.mem field_caps o.key then [ "capability" ] else [])
+      | 'm' -> ("method", [])
+      | _ ->
+        ( (if Hashtbl.mem params o.key then "parameter" else "variable"),
+          (if Hashtbl.mem mutables o.key then [ "mutable" ] else [ "readonly" ]) @ if Hashtbl.mem caps o.key then [ "capability" ] else [] )
+    in
+    (* `S { name }` is a field and a local at once: the local wins *)
+    let rank = if o.key.[0] = 'l' then 0 else 1 in
+    (o.sp.lo, rank, { at = o.sp.lo; len = o.sp.hi - o.sp.lo; kind; mods = (if o.def then [ "declaration" ] else []) @ mods })
+  in
+  let named = List.map (fun (_, _, s) -> s) (List.sort compare (List.map named occs)) in
+  (* module names, from the source: `use m`, and `m.` before a name where m is a module this file uses *)
+  let uses = uses_of text in
+  let modules = ref [] in
+  let rec scan base src =
+    match Lexer.lex ~base path src with
+    | exception Diag.Fatal _ -> ()
+    | t ->
+      for i = 0 to t.count - 1 do
+        let tok k = if k >= 0 && k < t.count then t.toks.(k) else Lexer.EOF in
+        match t.toks.(i) with
+        | Lexer.IDENT m when tok (i - 1) = Lexer.KW "use" -> modules := { at = Lexer.lo t i; len = String.length m; kind = "namespace"; mods = [] } :: !modules
+        | Lexer.IDENT m
+          when List.mem m uses && tok (i + 1) = Lexer.SYM "." && Lexer.hi t i = Lexer.lo t (i + 1)
+               && (match tok (i + 2) with Lexer.IDENT _ -> true | _ -> false)
+               && tok (i - 1) <> Lexer.SYM "." && tok (i - 1) <> Lexer.SYM "?." ->
+          modules := { at = Lexer.lo t i; len = String.length m; kind = "namespace"; mods = [] } :: !modules
+        | Lexer.STR parts -> List.iter (function Lexer.Interp (code, off) -> scan off code | Lexer.Lit _ -> ()) parts
+        | _ -> ()
+      done
+  in
+  scan 0 text;
+  let seen = Hashtbl.create 64 in
+  let keep acc s = if Hashtbl.mem seen s.at then acc else (Hashtbl.replace seen s.at (); s :: acc) in
+  (* a name Refs knows first, then a module name (unless a local shadows it), then what the walk found *)
+  let all = List.fold_left keep [] (named @ !modules @ !extra) in
+  List.sort (fun a b -> compare a.at b.at) all
+
+(* LSP's encoding: each token as five numbers, its line and start relative
+   to the previous token's, its length, its type and its modifiers as bits.
+   Only the tokens starting in [lo, hi). *)
+let encode_tokens text ?(lo = 0) ?(hi = max_int) toks =
+  let index x l = let rec go i = function [] -> -1 | y :: r -> if y = x then i else go (i + 1) r in go 0 l in
+  let line = ref 0 and line_start = ref 0 and scanned = ref 0 in
+  let prev_line = ref 0 and prev_col = ref 0 in
+  let out = ref [] in
+  List.iter
+    (fun s ->
+      if s.at >= lo && s.at < hi then begin
+        while !scanned < s.at && !scanned < String.length text do
+          if text.[!scanned] = '\n' then (incr line; line_start := !scanned + 1);
+          incr scanned
+        done;
+        let col = s.at - !line_start in
+        let dl = !line - !prev_line in
+        let dc = if dl = 0 then col - !prev_col else col in
+        let bits = List.fold_left (fun b m -> let i = index m token_modifiers in if i < 0 then b else b lor (1 lsl i)) 0 s.mods in
+        out := bits :: index s.kind token_types :: s.len :: dc :: dl :: !out;
+        prev_line := !line;
+        prev_col := col
+      end)
+    toks;
+  J.Obj [ ("data", J.List (List.rev_map (fun n -> J.Int n) !out)) ]
+
 (* ---------- protocol ---------- *)
 
 let response id result = J.Obj [ ("jsonrpc", J.String "2.0"); ("id", id); ("result", result) ]
@@ -486,7 +682,14 @@ let capabilities =
     [ ("textDocumentSync", J.Int 1); ("hoverProvider", J.Bool true); ("definitionProvider", J.Bool true);
       ("completionProvider", J.Obj [ ("triggerCharacters", J.List [ J.String "." ]) ]);
       ("codeActionProvider", J.Bool true); ("documentSymbolProvider", J.Bool true); ("referencesProvider", J.Bool true);
-      ("renameProvider", J.Obj [ ("prepareProvider", J.Bool true) ]) ]
+      ("renameProvider", J.Obj [ ("prepareProvider", J.Bool true) ]);
+      ( "semanticTokensProvider",
+        J.Obj
+          [ ( "legend",
+              J.Obj
+                [ ("tokenTypes", J.List (List.map (fun s -> J.String s) token_types));
+                  ("tokenModifiers", J.List (List.map (fun s -> J.String s) token_modifiers)) ] );
+            ("full", J.Bool true); ("range", J.Bool true) ] ) ]
 
 (* Other open files are read from the editor, not from disk. *)
 let set_overlay st path =
@@ -497,7 +700,8 @@ let open_doc st uri text =
   set_overlay st path;
   let items, diags = analyze path text in
   let occs = match items with Some it -> Refs.index it | None -> [] in
-  let d = { path; text; items; diags; occs } in
+  let sem = match items with Some it -> semantic_tokens path text it occs | None -> [] in
+  let d = { path; text; items; diags; occs; sem } in
   Hashtbl.replace st.docs uri d;
   [ publish uri d ]
 
@@ -694,6 +898,18 @@ let handle st (msg : J.t) : J.t list =
                 | IType a -> sym a.ty_name 26 a.ty_span a.ty_span)
               items))
     | _ -> reply (J.List []))
+  | "textDocument/semanticTokens/full" -> (
+    match Hashtbl.find_opt st.docs (J.to_str (J.path params [ "textDocument"; "uri" ])) with
+    | Some d -> reply (encode_tokens d.text d.sem)
+    | None -> reply J.Null)
+  | "textDocument/semanticTokens/range" -> (
+    match Hashtbl.find_opt st.docs (J.to_str (J.path params [ "textDocument"; "uri" ])) with
+    | Some d ->
+      let r = J.member "range" params in
+      let lo = offset_of d.text (J.to_int (J.path r [ "start"; "line" ])) (J.to_int (J.path r [ "start"; "character" ])) in
+      let hi = offset_of d.text (J.to_int (J.path r [ "end"; "line" ])) (J.to_int (J.path r [ "end"; "character" ])) in
+      reply (encode_tokens d.text ~lo ~hi d.sem)
+    | None -> reply J.Null)
   | m -> if id = J.Null then [] else [ error id (-32601) ("method not supported: " ^ m) ]
 
 (* ---------- stdio transport ---------- *)

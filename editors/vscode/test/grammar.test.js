@@ -172,6 +172,16 @@ pub type Pair[T] = (T, T)
   check("multi-line closing", scopeOf(ml, '        """') === "punctuation.definition.string.end.tessera", scopeOf(ml, '        """'));
   check("code after multi-line", scopeOf(ml, "let") === "storage.type.tessera", scopeOf(ml, "let"));
   check("multi-line ends at top level", ml.stack.depth === 1, `depth ${ml.stack.depth}`);
+  // the language server's custom semantic token type and modifiers are
+  // declared, and fall back to the grammar's scopes in themes without rules
+  const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")).contributes;
+  check("semantic type capability", pkg.semanticTokenTypes.some((t) => t.id === "capability"));
+  check("semantic modifiers", ["capability", "mutable"].every((m) => pkg.semanticTokenModifiers.some((t) => t.id === m)));
+  const scopes = pkg.semanticTokenScopes.find((s) => s.language === "tessera").scopes;
+  check("capability scope", scopes.capability[0] === "support.type.capability.tessera", JSON.stringify(scopes));
+  check("namespace scope", scopes.namespace[0] === "entity.name.namespace.tessera", JSON.stringify(scopes));
+  check("capability struct scope", scopes["struct.capability"][0] === "support.type.capability.tessera", JSON.stringify(scopes));
+
   // `""` is still an empty string, not the start of a multi-line one
   const empty = tokenize(grammar, `let e = ""\nlet f = 1\n`);
   check("empty string", scopeOf(empty, "let", 1) === "storage.type.tessera", scopeOf(empty, "let", 1));

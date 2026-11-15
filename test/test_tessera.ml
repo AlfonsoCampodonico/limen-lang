@@ -2515,6 +2515,96 @@ fn main(root: Root) {
   ok "lsp-quickfix" (new_text = "mut ") (J.to_string actions);
   let syms = result (Lsp.handle st (req "textDocument/documentSymbol" (J.Obj [ ("textDocument", J.Obj [ ("uri", J.String uri) ]) ]))) in
   ok "lsp-symbols" (match syms with J.List l -> List.length l = 3 | _ -> false) (J.to_string syms);
+  (* semantic tokens: modules, values, and what holds authority *)
+  let sem_uri = "file:///tmp/lsp-sem.tsr" in
+  let sem_doc =
+    {|use text
+
+struct Client {
+    net: Net,
+    name: Str,
+}
+
+enum Shape {
+    Dot,
+    Box(Int),
+}
+
+fn fetch(c: Client, n: Int) -> Str {
+    let mut count = n
+    count = count + 1
+    let label = text.repeat(c.name, count)
+    "{text.pad_left(label, 3, " ")}"
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let s = Box(2)
+    let parts = [1, 2].map(|x| x + 1)
+    out.print(fetch(Client { net: root.net, name: "x" }, parts.len()))
+}
+|}
+  in
+  ignore (Lsp.handle st (note "textDocument/didOpen" (J.Obj [ ("textDocument", J.Obj [ ("uri", J.String sem_uri); ("text", J.String sem_doc) ]) ])));
+  let legend k = match J.path init [ "capabilities"; "semanticTokensProvider"; "legend"; k ] with J.List l -> List.map J.to_str l | _ -> [] in
+  let sem_types = legend "tokenTypes" and sem_mods = legend "tokenModifiers" in
+  let sem_lines = Array.of_list (String.split_on_char '\n' sem_doc) in
+  let rec decode line col = function
+    | dl :: dc :: len :: ty :: bits :: rest ->
+      let line = line + dl in
+      let col = if dl = 0 then col + dc else dc in
+      (String.sub sem_lines.(line) col len, List.nth sem_types ty, List.filteri (fun i _ -> bits land (1 lsl i) <> 0) sem_mods) :: decode line col rest
+    | _ -> []
+  in
+  let sem_request m extra =
+    match result (Lsp.handle st (req m (J.Obj (("textDocument", J.Obj [ ("uri", J.String sem_uri) ]) :: extra)))) with
+    | J.Obj _ as r -> ( match J.member "data" r with J.List l -> decode 0 0 (List.map J.to_int l) | _ -> [])
+    | _ -> []
+  in
+  let full = sem_request "textDocument/semanticTokens/full" [] in
+  let show_tok (t, k, ms) = sprintf "%s:%s%s" t k (String.concat "" (List.map (fun m -> "." ^ m) ms)) in
+  let sem_case ?(nth = 1) word want =
+    let got = match List.filteri (fun i _ -> i = nth - 1) (List.filter (fun (t, _, _) -> t = word) full) with [ x ] -> show_tok x | _ -> "none" in
+    ok ("lsp-semantic-" ^ word ^ "-" ^ string_of_int nth) (got = want) (sprintf "got %s, want %s; all: %s" got want (String.concat " " (List.map show_tok full)))
+  in
+  ok "lsp-semantic-legend" (List.mem "namespace" sem_types && List.mem "capability" sem_types && List.mem "capability" sem_mods) (String.concat "," sem_types);
+  sem_case "text" "text:namespace";
+  sem_case "Client" "Client:struct.declaration.capability";
+  sem_case "net" "net:property.declaration.capability";
+  sem_case "Net" "Net:capability";
+  sem_case "name" "name:property.declaration";
+  sem_case "Shape" "Shape:enum.declaration";
+  sem_case "Dot" "Dot:enumMember.declaration";
+  sem_case "fetch" "fetch:function.declaration";
+  sem_case "c" "c:parameter.declaration.readonly.capability";
+  sem_case "n" "n:parameter.declaration.readonly";
+  sem_case "count" "count:variable.declaration.mutable";
+  sem_case ~nth:2 "count" "count:variable.mutable";
+  sem_case ~nth:2 "text" "text:namespace";
+  sem_case "repeat" "repeat:function";
+  sem_case ~nth:2 "c" "c:parameter.readonly.capability";
+  sem_case ~nth:2 "name" "name:property";
+  (* inside an interpolation too *)
+  sem_case ~nth:3 "text" "text:namespace";
+  sem_case "pad_left" "pad_left:function";
+  sem_case "Root" "Root:capability";
+  sem_case "root" "root:parameter.declaration.readonly.capability";
+  sem_case "out" "out:variable.declaration.readonly.capability";
+  sem_case "stdout" "stdout:property.capability";
+  sem_case "s" "s:variable.declaration.readonly";
+  sem_case ~nth:2 "Box" "Box:enumMember";
+  sem_case "x" "x:parameter.declaration.readonly";
+  sem_case "map" "map:method";
+  sem_case "print" "print:method";
+  sem_case ~nth:2 "net" "net:property.capability";
+  sem_case ~nth:3 "net" "net:property.capability";
+  (* the range request gives the tokens of those lines only, positions from the document's start *)
+  let range_toks =
+    sem_request "textDocument/semanticTokens/range"
+      [ ("range", J.Obj [ ("start", J.Obj [ ("line", J.Int 20); ("character", J.Int 0) ]); ("end", J.Obj [ ("line", J.Int 21); ("character", J.Int 0) ]) ]) ]
+  in
+  ok "lsp-semantic-range" (List.map (fun (t, _, _) -> t) range_toks = [ "out"; "root"; "stdout" ])
+    (String.concat " " (List.map show_tok range_toks));
   ok "lsp-unknown-method" (match Lsp.handle st (req "workspace/symbol" (J.Obj [])) with [ m ] -> J.member "error" m <> J.Null | _ -> false) "error";
   ok "lsp-shutdown" (Lsp.handle st (req "shutdown" J.Null) <> [] && st.Lsp.shutdown) "shutdown";
   ok "json-roundtrip"

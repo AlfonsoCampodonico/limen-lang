@@ -3,7 +3,7 @@
 A local extension, not published to the marketplace.
 
 - **Highlighting** for `.tessera` files and for ```` ```tessera ```` blocks in Markdown. Capability types (`Net`, `Fs`, `Clock` and the rest) get their own scope, `support.type.capability.tessera`, so authority entering a function stands out.
-- **The language server** (`tessera lsp`): errors as you type, hover, go to definition, references, rename, completion and quick fixes.
+- **The language server** (`tessera lsp`): errors as you type, hover, go to definition, references, rename, completion, quick fixes and semantic highlighting.
 - Comment toggling, bracket matching, auto-closing quotes and indentation.
 
 ## Install
@@ -33,6 +33,17 @@ Themes don't know the capability scope, so capabilities get the theme's color fo
   "textMateRules": [
     { "scope": "support.type.capability.tessera", "settings": { "foreground": "#E5A50A", "fontStyle": "bold" } }
   ]
+}
+```
+
+With the language server running, semantic highlighting adds what the grammar cannot know: a module (`http` in `http.read_request`) is a `namespace`, a value (`c` in `c.write`) a `parameter` or `variable`, and anything whose type holds authority (a struct keeping a `Net`, a parameter of that struct's type, a field holding an `Fs`) has the `capability` modifier; the built-in capabilities are the `capability` token type. Without a theme rule they fall back to the TextMate scopes above. To color all authority alike:
+
+```json
+"editor.semanticTokenColorCustomizations": {
+  "rules": {
+    "capability": { "foreground": "#E5A50A", "fontStyle": "bold" },
+    "*.capability": { "foreground": "#E5A50A" }
+  }
 }
 ```
 
