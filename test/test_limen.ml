@@ -5176,10 +5176,12 @@ fn main(root: Root) {
             inner.len()
         })
         // computing without waiting: stopped at a checkpoint (a loop's next
-        // round), so it has no result either
+        // round), so it has no result either. The loop would run for 5 s,
+        // so only a missed cancellation, not a deadline seen late under
+        // load, gives it one (and makes the elapsed time below false)
         g.go(|| {
             let mut i = 0
-            while clock.now_ms() - start < 200 {
+            while clock.now_ms() - start < 5000 {
                 i = i + 1
             }
             7
