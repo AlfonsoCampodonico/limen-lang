@@ -8690,6 +8690,137 @@ fn main(root: Root) {
    let calls = count_sub main_body "wf_count(" in
    ok "pure-reused-c" (calls = 6) (sprintf "%d calls" calls));
 
+  (* ---------- pure if the functions it is given are ---------- *)
+  let cond_src = {v|fn my_map(xs: List[Int], f: fn(Int) -> Int) -> List[Int] {
+    let mut out: List[Int] = []
+    for x in xs {
+        out.push(f(x))
+    }
+    out
+}
+
+fn twice(xs: List[Int], g: fn(Int) -> Int) -> List[Int] {
+    my_map(my_map(xs, g), g)
+}
+
+fn both(f: fn(Int) -> Int, g: fn(Int) -> Int, h: fn() -> Int) -> Int {
+    f(1) + g(2) + h()
+}
+
+fn rec(n: Int, f: fn(Int) -> Int) -> Int {
+    if n == 0 { f(0) } else { rec(n - 1, f) }
+}
+
+fn keeps(f: fn(Int) -> Int) -> List[fn(Int) -> Int] {
+    [f]
+}
+
+fn passes_bad(f: fn(Int) -> Int) -> List[fn(Int) -> Int] {
+    keeps(f)
+}
+
+fn captures(xs: List[Int], f: fn(Int) -> Int) -> List[Int] {
+    xs.map(|x| f(x))
+}
+
+fn returns(f: fn(Int) -> Int) -> fn(Int) -> Int {
+    f
+}
+
+fn sends(f: fn() -> Int) -> Int {
+    let c: Chan[Int] = channel(1)
+    c.send(f())
+    let fs: Chan[fn() -> Int] = channel(1)
+    fs.send(f)
+    0
+}
+
+fn tasks(f: fn() -> Int) -> List[Int] {
+    group g {
+        g.go(f)
+    }
+}
+
+fn printer(out: Stdout, f: fn(Int) -> Int) {
+    out.print("{f(1)}")
+}
+
+fn double(x: Int) -> Int {
+    x * 2
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let mut seen = 0
+    for i in 0..<3 {
+        // pure arguments: made once, kept across the loop
+        let a = my_map([1, 2, 3], |x| x * 2)
+        let b = twice([1, 2], double)
+        // an argument that prints: made every time
+        let c = my_map([i], |x| {
+            out.print("call {x}")
+            x
+        })
+        seen = seen + a.len() + b.len() + c.len()
+    }
+    out.print("{seen} {my_map([1], |x| x + 1)} {twice([1], double)} {both(|x| x, |x| x, || 3)} {rec(2, |x| x + 5)}")
+}
+|v} in
+  out "pure-if-run" cond_src "call 0\ncall 1\ncall 2\n18 [2] [4] 6 5\n";
+  (let _, ds, infos = compile "pure-if-caps" cond_src in
+   let find n = List.find (fun (i : Check.fn_info) -> i.name = n) infos in
+   let text n = Check.pure_text (find n) in
+   ok "pure-if-caps-checks" (ds = []) (String.concat " " (codes ds));
+   ok "pure-if-caps" (text "my_map" = "pure if f is" && text "twice" = "pure if g is" && text "both" = "pure if f, g and h are" && text "rec" = "pure if f is")
+     (String.concat "; " (List.map text [ "my_map"; "twice"; "both"; "rec" ]));
+   ok "pure-if-caps-not"
+     (List.for_all (fun n -> text n = "pure itself, runs callbacks") [ "keeps"; "passes_bad"; "captures"; "returns"; "sends"; "tasks" ]
+      && (find "printer").pure_if = [] && (find "double").pure_if = [])
+     (String.concat "; " (List.map text [ "keeps"; "passes_bad"; "captures"; "returns"; "sends"; "tasks" ])));
+  (let items, ds, _ = compile "pure-if-ir" cond_src in
+   if ds <> [] then ok "pure-if-ir" false (String.concat " " (codes ds))
+   else
+     let prog, _ = Lower.lower_program ~tests:false items in
+     let pure = Pure.analyse prog in
+     let info n = Hashtbl.fold (fun k (i : Pure.info) acc -> if Interp_util.find_sub k ("_" ^ n) 0 <> None then Some i else acc) pure None in
+     let cbs n = match info n with Some i -> Some i.Pure.cbs | None -> None in
+     ok "pure-if-ir" (cbs "my_map" = Some [ 1 ] && cbs "twice" = Some [ 1 ] && cbs "both" = Some [ 0; 1; 2 ] && cbs "rec" = Some [ 1 ] && cbs "double" = Some [])
+       (String.concat " " (List.of_seq (Hashtbl.to_seq_keys pure)));
+     ok "pure-if-ir-not" (List.for_all (fun n -> info n = None) [ "keeps"; "passes_bad"; "captures"; "returns"; "sends"; "tasks"; "printer" ])
+       (String.concat " " (List.of_seq (Hashtbl.to_seq_keys pure)));
+     (* natively: the calls with pure closures are kept across the loop, the
+        one with a closure that prints is not *)
+     let c = Native.c_source items in
+     let count_sub s sub =
+       let n = String.length s and m = String.length sub in
+       let rec go i acc = if i + m > n then acc else go (i + 1) (if String.sub s i m = sub then acc + 1 else acc) in
+       go 0 0
+     in
+     ok "pure-if-kept-c" (count_sub c "__builtin_expect(k" = 2) (sprintf "%d kept calls" (count_sub c "__builtin_expect(k")));
+  (* fusion: a stage closure may call a pure closure held in a variable *)
+  let fuse_src = {v|fn main(root: Root) {
+    let out = root.stdout
+    let inc = |x: Int| x + 1
+    let shout = |x: Int| {
+        out.print("saw {x}")
+        x
+    }
+    let a = [1, 2, 3].map(|x| inc(x)).filter(|x| x > 2).map(|x| inc(x) * 10)
+    let b = [1, 2].map(|x| shout(x)).map(|x| x * 10)
+    out.print("{a} {b}")
+}
+|v} in
+  out "pure-if-fusion" fuse_src "saw 1\nsaw 2\n[40, 50] [10, 20]\n";
+  (let items, ds, _ = compile "pure-if-fusion-ir" fuse_src in
+   if ds <> [] then ok "pure-if-fusion-ir" false (String.concat " " (codes ds))
+   else
+     let prog, _ = Lower.lower_program ~tests:false items in
+     let main = List.find (fun (f : Ir.fn) -> Interp_util.find_sub f.fname "main" 0 <> None) prog.fns in
+     let loops = ref 0 in
+     Pure.stmts_iter (function Ir.Loop _ -> incr loops | _ -> ()) main.body;
+     (* `a` is one fused loop; `b` is two, since `shout` prints *)
+     ok "pure-if-fusion-ir" (!loops = 3) (sprintf "%d loops" !loops));
+
   (* ---------- tuple assignment, or-patterns, `..`, list patterns, list `+`, last_index_of ---------- *)
   out "tuple-assign"
     {|fn step(n: Int) -> Result[(Int, Int), Str] {

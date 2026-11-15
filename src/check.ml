@@ -93,7 +93,17 @@ type fctx = {
 
 (* [via]: for each capability not written in the parameters' types, the
    path through the struct or enum that holds it, `Client.net`. *)
-type fn_info = { name : string; span : Span.t; caps : cap list; via : (cap * string) list; callbacks : bool }
+type fn_info = {
+  name : string;
+  span : Span.t;
+  caps : cap list;
+  via : (cap * string) list;
+  callbacks : bool;
+  pure_if : string list;
+      (* its parameters of function type, when it only calls them or passes
+         them on to a function that is pure if they are: it is pure when
+         the functions it is given are *)
+}
 
 (* The capabilities values of these types hold, in [all_caps] order, each
    with where it comes from when no type writes it: the first type's path. *)
@@ -400,6 +410,18 @@ let eq_types : ty list ref = ref []
 let uses_here : (Span.t * string * (string * ty) list) list ref = ref []
 let compares_direct : (string, string list) Hashtbl.t = Hashtbl.create 16
 let generic_uses : (string * Span.t * string * (string * ty) list) list ref = ref []
+
+(* How the function being checked uses its parameters of function type:
+   called, passed on to a function at a parameter (`passes`), or anything
+   else (`escaped`: stored, returned, captured by a closure, sent). *)
+let cb_params : (string * Span.t) list ref = ref []
+let cb_escaped = ref false
+let cb_passes : (string * int) list ref = ref []
+let arg_of : (string * int) option ref = ref None
+let cb_uses : (string, bool * (string * int) list) Hashtbl.t = Hashtbl.create 16
+
+(* pairs, as long as the shorter list *)
+let rec zip a b = match (a, b) with x :: a, y :: b -> (x, y) :: zip a b | _ -> []
 
 let rec params_in acc t =
   match repr t with
@@ -955,7 +977,16 @@ and check_var ctx f e n sp =
   | Some v when v.vkind = KGroup ->
     err ctx "E0310" sp (sprintf "`%s` is a group handle; the only thing you can do with it is `%s.go(...)`" n n);
     TErr
-  | Some v -> v.vty
+  | Some v ->
+    let pass = !arg_of in
+    arg_of := None;
+    if v.vkind = KParam && List.mem (n, v.vspan) !cb_params then begin
+      match lookup f n with
+      | Some (_, false) when !calling -> ()
+      | Some (_, false) when pass <> None -> cb_passes := Option.get pass :: !cb_passes
+      | _ -> cb_escaped := true
+    end;
+    v.vty
   | None -> (
     let direct = !calling in
     calling := false;
@@ -1241,6 +1272,13 @@ and check_call ?want ctx f e callee args sp =
           in
           List.iter2 (fun a p -> expect ctx f a p) args ps;
           check_callbacks ctx f args ps
+        | EVar g when (not (is_local f g)) && Hashtbl.mem ctx.fns g ->
+          (* a function parameter passed on: pure if the callee is, there *)
+          List.iteri
+            (fun k (a, p) ->
+              (match a.edesc with EVar _ -> arg_of := Some (g, k) | _ -> ());
+              Fun.protect ~finally:(fun () -> arg_of := None) (fun () -> expect ctx f a p))
+            (List.combine args ps)
         | _ -> List.iter2 (fun a p -> expect ctx f a p) args ps
       end;
       if labelled then begin
@@ -2676,7 +2714,14 @@ let check_fn ctx (d : fn_decl) (s : fsig) =
   eq_types := [];
   uses_here := [];
   cur_fn := d.fn_name;
-  Fun.protect ~finally:(fun () -> check_pending ctx; cur_fn := "") @@ fun () ->
+  cb_params := List.filter_map (fun (p, t) -> match repr t with TFn _ -> Some (p.prm_name, p.prm_span) | _ -> None) (zip d.fn_params s.ps);
+  cb_escaped := false;
+  cb_passes := [];
+  Fun.protect ~finally:(fun () ->
+      check_pending ctx;
+      Hashtbl.replace cb_uses d.fn_name (!cb_escaped, List.rev !cb_passes);
+      cb_params := [];
+      cur_fn := "") @@ fun () ->
   let genv = List.map (fun g -> (g, TParam g)) d.fn_gen in
   let scope = { vars = Hashtbl.create 8; barrier = false } in
   List.iter2
@@ -2733,6 +2778,17 @@ let check_self ctx d ps =
   | _ -> ()
 
 let case_note = "in the table case "
+
+(* What `limen caps` says of a function with no capability: `pure`, `pure if
+   f is` (and `f and g are`), or `pure itself, runs callbacks`. *)
+let pure_text (i : fn_info) =
+  match (i.callbacks, i.pure_if) with
+  | false, _ -> "pure"
+  | true, [] -> "pure itself, runs callbacks"
+  | true, [ f ] -> sprintf "pure if %s is" f
+  | true, fs ->
+    let rev = List.rev fs in
+    sprintf "pure if %s and %s are" (String.concat ", " (List.rev (List.tl rev))) (List.hd rev)
 
 (* Which type parameters each generic function compares, itself or through
    the generic functions it calls, until nothing changes; then E0201 at
@@ -2793,6 +2849,7 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
   Hashtbl.reset reported_bounds;
   Hashtbl.reset compares_direct;
   generic_uses := [];
+  Hashtbl.reset cb_uses;
   fn_extents :=
     List.filter_map
       (function IFn d -> Some (d.fn_span.Span.file, d.fn_span.lo, max d.fn_span.hi d.fn_body.bspan.hi) | _ -> None)
@@ -3126,6 +3183,27 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
            else d :: acc)
          [] diags)
   in
+  (* pure if its function parameters are: it holds no capability and no
+     bound, its parameters holding a function are functions, it only calls
+     them or passes them on to such a function, until nothing changes *)
+  let cond = Hashtbl.create 16 in
+  List.iter
+    (fun ((d : fn_decl), s) ->
+      let fns = List.filter_map (fun (p, t) -> match repr t with TFn _ -> Some p.prm_name | _ -> None) (zip d.fn_params s.ps) in
+      match Hashtbl.find_opt cb_uses d.fn_name with
+      | Some (false, passes)
+        when fns <> [] && authority_of s.ps = [] && d.fn_bounds = []
+             && List.for_all (fun t -> (match repr t with TFn _ -> true | _ -> false) || not (has_fn t)) s.ps ->
+        Hashtbl.replace cond d.fn_name (fns, passes)
+      | _ -> ())
+    sigs;
+  let changed = ref true in
+  while !changed do
+    changed := false;
+    Hashtbl.filter_map_inplace
+      (fun _ (fns, passes) -> if List.for_all (fun (g, _) -> Hashtbl.mem cond g) passes then Some (fns, passes) else (changed := true; None))
+      cond
+  done;
   let infos =
     List.map
       (fun ((d : fn_decl), s) ->
@@ -3133,7 +3211,8 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
         { name = d.fn_name; span = d.fn_span;
           caps = List.map fst held;
           via = List.filter_map (fun (c, p) -> Option.map (fun p -> (c, p)) p) held;
-          callbacks = List.exists has_fn s.ps || d.fn_bounds <> [] })
+          callbacks = List.exists has_fn s.ps || d.fn_bounds <> [];
+          pure_if = (match Hashtbl.find_opt cond d.fn_name with Some (fns, _) -> fns | None -> []) })
       (* forwarders only pass their arguments on; the methods they call are reported *)
       (List.filter (fun ((d : fn_decl), _) -> d.fn_test = None && d.fn_span.file <> Prelude.methods_file && d.fn_span.Span.file <> Prelude.file && not (Embed.is_forwarder d.fn_name)) sigs)
   in

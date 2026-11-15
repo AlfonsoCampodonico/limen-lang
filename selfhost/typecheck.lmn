@@ -46,6 +46,10 @@ pub struct FnInfo {
     // struct or enum that holds it, `Client.net`
     via: List[(Str, Str)],
     callbacks: Bool,
+    // its parameters of function type, when it only calls them or passes
+    // them on to a function that is pure if they are: it is pure when the
+    // functions it is given are
+    pure_if: List[Str],
 }
 
 // A function and its signature.
@@ -132,7 +136,40 @@ pub fn check_program(items: List[ast.Item], files: List[diag.Source], next_id: I
     st = refuse_compared_params(cx, st)
     // forwarders only pass their arguments on; the methods they call are reported
     let reported = sigs.filter(|f| f.decl.test.is_none() && f.decl.span.file != methods_file && f.decl.span.file != prelude_file && !cx.forwarders.contains(f.decl.name))
-    let infos = reported.map(|f| fn_info(st, f))
+    // pure if its function parameters are: it holds no capability and no
+    // bound, its parameters holding a function are functions, it only calls
+    // them or passes them on to such a function, until nothing changes
+    let mut cond: Map[Str, (List[Str], List[(Str, Int)])] = map()
+    for f in sigs {
+        let fns = f.decl.params.zip(f.sig.params).flat_map(|x| match st.repr(x.1) {
+            TFn(..) => [x.0.name],
+            _ => [],
+        })
+        let plain = f.sig.params.all(|t| match st.repr(t) {
+            TFn(..) => true,
+            _ => !st.subst.has_fn(t),
+        })
+        match st.cb_uses.get(f.decl.name) {
+            Some((false, passes)) if !fns.is_empty() && st.authority_of(f.sig.params).is_empty() && f.decl.bounds.is_empty() && plain => {
+                cond[f.decl.name] = (fns, passes)
+            },
+            _ => {},
+        }
+    }
+    let mut changed = true
+    while changed {
+        changed = false
+        let mut next: Map[Str, (List[Str], List[(Str, Int)])] = map()
+        for (name, c) in cond.entries() {
+            if c.1.all(|p| cond.contains(p.0)) {
+                next[name] = c
+            } else {
+                changed = true
+            }
+        }
+        cond = next
+    }
+    let infos = reported.map(|f| fn_info(st, f, cond.get(f.decl.name).map(|c| c.0) ?? []))
     Checked { items: items.map(|i| rewritten_item(st, i)), diags: in_order(cx, st.diags), state: st, infos, cx, prelude: pre.map(|i| rewritten_item(st, i)) }
 }
 
@@ -215,14 +252,14 @@ fn refuse_compared_params(cx: env.Cx, st: env.State) -> env.State {
     st
 }
 
-fn fn_info(st: env.State, f: Fn) -> FnInfo {
+fn fn_info(st: env.State, f: Fn, pure_if: List[Str]) -> FnInfo {
     let held = st.authority_of(f.sig.params)
     let callbacks = f.sig.params.any(|t| st.subst.has_fn(t)) || !f.decl.bounds.is_empty()
     let via = held.flat_map(|h| match h.1 {
         Some(p) => [(h.0, p)],
         None => [],
     })
-    FnInfo { name: f.decl.name, span: f.decl.span, caps: held.map(|h| h.0), via, callbacks }
+    FnInfo { name: f.decl.name, span: f.decl.span, caps: held.map(|h| h.0), via, callbacks, pure_if }
 }
 
 // 2c. the authority each struct and enum holds through its fields
@@ -931,6 +968,12 @@ fn check_fn(cx: env.Cx, st: env.State, ds: Decls, d: ast.FnDecl, s: env.Sig) -> 
     st.eq_types = []
     st.uses_here = []
     st.cur_fn = d.name
+    st.cb_params = d.params.zip(s.params).flat_map(|x| match st.repr(x.1) {
+        TFn(..) => [(x.0.name, x.0.span)],
+        _ => [],
+    })
+    st.cb_escaped = false
+    st.cb_passes = []
     let genv = generic_env(d.generics)
     let mut scope = env.Scope { vars: map(), barrier: false }
     for (p, t) in d.params.zip(s.params) {
@@ -968,6 +1011,9 @@ fn check_fn(cx: env.Cx, st: env.State, ds: Decls, d: ast.FnDecl, s: env.Sig) -> 
 
 fn out_of_fn(r: (env.State, Decls)) -> (env.State, Decls) {
     let (st, ds) = r
+    let mut st = st
+    st.cb_uses[st.cur_fn] = (st.cb_escaped, st.cb_passes.reverse())
+    st.cb_params = []
     ({ st with cur_fn: "" }, ds)
 }
 

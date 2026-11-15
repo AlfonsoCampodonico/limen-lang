@@ -89,11 +89,13 @@ let check_diag (d : Diag.t) =
 
 (* What `limen caps` reports of a function: CAPS NAME FILE LO HI, its
    capabilities in brackets (each held through a struct or enum with its
-   path, `Net=Client.net`), and whether it runs callbacks. *)
+   path, `Net=Client.net`), whether it runs callbacks, and the function
+   parameters it is pure if (`if=f,g`, when there are). *)
 let caps_line (i : Check.fn_info) =
-  Printf.printf "CAPS %s %s %d %d [%s] %b\n" i.name i.span.file i.span.lo i.span.hi
+  Printf.printf "CAPS %s %s %d %d [%s] %b%s\n" i.name i.span.file i.span.lo i.span.hi
     (String.concat "," (List.map (fun c -> match List.assoc_opt c i.via with Some p -> Types.cap_name c ^ "=" ^ p | None -> Types.cap_name c) i.caps))
     i.callbacks
+    (if i.pure_if = [] then "" else " if=" ^ String.concat "," i.pure_if)
 
 let load_diag (d : Diag.t) =
   Printf.printf "ERROR %s %s %d %d\n" d.code d.span.file d.span.lo d.span.hi;

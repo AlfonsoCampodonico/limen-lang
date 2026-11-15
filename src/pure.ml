@@ -3,7 +3,9 @@
    compute and panic (SPEC section 9). Here the test is made on the IR and
    is a little stricter: the body (and every function it calls) also starts
    no task, makes no channel and calls no closure or `dyn` method, so the
-   same arguments always give the same result.
+   same arguments always give the same result. A function whose only other
+   effects are calls of its function parameters is pure when the functions
+   it is given are (see analyse).
 
    Two rewrites use it, and neither can be observed by the program:
 
@@ -44,7 +46,13 @@ let pure_prim name t =
   && (match t with TCap _ | TChan _ -> false | _ -> true)
   && not (String.starts_with ~prefix:"cap_" name || String.starts_with ~prefix:"chan_" name)
 
-type info = { heavy : bool (* worth keeping across a loop: not a short scalar computation the C compiler sees through *) }
+type info = {
+  heavy : bool; (* worth keeping across a loop: not a short scalar computation the C compiler sees through *)
+  cbs : int list;
+      (* the positions of its function parameters: a call is pure only when
+         the functions passed there are (conditionally pure); [] for a
+         function pure whatever it is passed *)
+}
 
 let rec stmts_iter f ss =
   List.iter
@@ -59,16 +67,49 @@ let rec stmts_iter f ss =
 
 let rhs_of = function Let (_, r) | Init (_, r) | Set (_, r, _) -> Some r | _ -> None
 
+let is_fn = function TFn _ -> true | _ -> false
+
+(* The atoms a statement reads or moves, besides those of its rhs. *)
+let stmt_atoms = function
+  | Let (_, r) | Init (_, r) | Set (_, r, _) -> consumed r @ borrowed r
+  | Mutate (_, steps, m) ->
+    List.filter_map (function PIndex (i, _) | PIndexU i | PKey (i, _) -> Some i | PField _ -> None) steps @ mut_atoms m
+  | If (a, _, _) | Return a | Scope (a, _) -> [ a ]
+  | _ -> []
+
+(* The closures a function makes and never reassigns: variable to the
+   lifted function. *)
+let closures_of (f : fn) =
+  let made = Hashtbl.create 8 and set = Hashtbl.create 8 in
+  stmts_iter
+    (function
+      | Let (v, MkClosure (h, _, _)) -> Hashtbl.replace made v.id h
+      | Set (v, _, _) | Init (v, _) | Decl v | Mutate (v, _, _) -> Hashtbl.replace set v.id ()
+      | _ -> ())
+    f.body;
+  Hashtbl.filter_map_inplace (fun id h -> if Hashtbl.mem set id then None else Some h) made;
+  made
+
 (* The pure functions of a program, by C name. Calls between functions are
-   taken as pure until shown otherwise (recursion is fine). *)
+   taken as pure until shown otherwise (recursion is fine).
+
+   A function whose parameters of function type are only called, or passed
+   on where another such function takes a function, is pure when the
+   functions it is passed are (SPEC section 14): its info lists those
+   positions. A call to it is pure when each argument there is a closure the
+   caller made from a pure function. Storing such a parameter, sending it,
+   capturing it or returning it makes the function impure. *)
 let analyse (p : program) : (string, info) Hashtbl.t =
   let by_name = Hashtbl.create 64 in
   List.iter (fun (f : fn) -> Hashtbl.replace by_name f.fname f) p.fns;
   let calls = Hashtbl.create 64 in
   let candidates = Hashtbl.create 64 in
+  let cb_of (f : fn) = List.filter (fun (v : var) -> is_fn v.ty) f.params in
   List.iter
     (fun (f : fn) ->
-      let ok = ref (List.for_all (fun (v : var) -> pure_type v.ty) (f.params @ f.captures)) in
+      let cbs = cb_of f in
+      let is_cb a = match atom_var a with Some v -> List.exists (fun (c : var) -> c.id = v.id) cbs | None -> false in
+      let ok = ref (List.for_all (fun (v : var) -> pure_type v.ty || is_fn v.ty) f.params && List.for_all (fun (v : var) -> pure_type v.ty) f.captures) in
       let callees = ref [] in
       let scalar_only = ref (List.for_all (fun (v : var) -> is_scalar v.ty) f.params && is_scalar f.ret) in
       let straight = ref true in
@@ -79,35 +120,56 @@ let analyse (p : program) : (string, info) Hashtbl.t =
            | Loop _ -> straight := false
            | Scope _ -> ok := false
            | _ -> ());
+          (* a function parameter is only called or passed on *)
+          (match (s, rhs_of s) with
+           | Set (v, _, _), _ when List.exists (fun (c : var) -> c.id = v.id) cbs -> ok := false
+           | _, Some (CallClo (c, args)) -> if not (is_cb c) || List.exists is_cb args then ok := false
+           | _, Some (Call _) -> () (* where the callee takes a function: checked below *)
+           | _ -> if List.exists is_cb (stmt_atoms s) then ok := false);
           match rhs_of s with
-          | Some (Call (g, _)) ->
+          | Some (Call (g, args)) ->
             straight := false;
-            callees := g :: !callees;
+            callees := (g, args) :: !callees;
             if not (Hashtbl.mem by_name g) then ok := false
           | Some (Prim (n, t, _, _)) -> straight := false; if not (pure_prim n t) then ok := false
+          | Some (CallClo _) -> straight := false
           | Some
-              ( CallClo _ | CallDyn _ | Catch _ | Spawn _ | GroupNew _ | GroupJoin _ | ChanNew _ | ChanSend _ | Select _
+              ( CallDyn _ | Catch _ | Spawn _ | GroupNew _ | GroupJoin _ | ChanNew _ | ChanSend _ | Select _
               | SelGot _ | RootField _ | CallC _ ) ->
             ok := false
           | _ -> ())
         f.body;
       if !ok then begin
-        Hashtbl.replace candidates f.fname { heavy = not (!scalar_only && !straight) };
-        Hashtbl.replace calls f.fname !callees
+        let ids = List.map (fun (v : var) -> v.id) f.params in
+        let pos = List.filter_map (fun (c : var) -> List.find_index (fun id -> id = c.id) ids) cbs in
+        Hashtbl.replace candidates f.fname { heavy = not (!scalar_only && !straight); cbs = pos };
+        Hashtbl.replace calls f.fname (closures_of f, List.map (fun (c : var) -> c.id) cbs, !callees)
       end)
     p.fns;
-  (* drop functions that call a non-pure one, until nothing changes; a
-     function calling a heavy one is heavy *)
+  (* drop functions that call a non-pure one, or pass a function that is not
+     pure where a conditionally pure one takes one, until nothing changes;
+     a function calling a heavy one is heavy *)
   let changed = ref true in
   while !changed do
     changed := false;
+    let pure_now = Hashtbl.copy candidates in
     Hashtbl.filter_map_inplace
       (fun name info ->
-        let cs = Hashtbl.find calls name in
-        if List.for_all (Hashtbl.mem candidates) cs then begin
-          let heavy = info.heavy || List.exists (fun g -> match Hashtbl.find_opt candidates g with Some i -> i.heavy | None -> false) cs in
+        let clos, own_cbs, cs = Hashtbl.find calls name in
+        let arg_ok a =
+          match atom_var a with
+          | Some v -> List.mem v.id own_cbs || (match Hashtbl.find_opt clos v.id with Some h -> (match Hashtbl.find_opt pure_now h with Some i -> i.cbs = [] | None -> false) | None -> false)
+          | None -> false
+        in
+        let call_ok (g, args) =
+          match Hashtbl.find_opt pure_now g with
+          | Some i -> List.for_all (fun k -> arg_ok (List.nth args k)) i.cbs
+          | None -> false
+        in
+        if List.for_all call_ok cs then begin
+          let heavy = info.heavy || List.exists (fun (g, _) -> match Hashtbl.find_opt pure_now g with Some i -> i.heavy | None -> false) cs in
           if heavy <> info.heavy then changed := true;
-          Some { heavy }
+          Some { info with heavy }
         end
         else begin
           changed := true;
@@ -117,14 +179,26 @@ let analyse (p : program) : (string, info) Hashtbl.t =
   done;
   candidates
 
-(* A call whose result depends only on its arguments. *)
-let pure_rhs pure = function
-  | Call (f, _) -> Hashtbl.mem pure f
+(* A call whose result depends only on its arguments: to a pure function,
+   passing a closure made from a pure function wherever it takes one.
+   [clos] are the closures of the function the call is in (closures_of). *)
+let pure_rhs pure clos = function
+  | Call (f, args) -> (
+    match Hashtbl.find_opt pure f with
+    | Some i ->
+      List.for_all
+        (fun k ->
+          match atom_var (List.nth args k) with
+          | Some v -> (
+            match Hashtbl.find_opt clos v.id with Some h -> (match Hashtbl.find_opt pure h with Some j -> j.cbs = [] | None -> false) | None -> false)
+          | None -> false)
+        i.cbs
+    | None -> false)
   | Prim (n, t, _, _) -> pure_prim n t
   | _ -> false
 
-let worth_keeping pure = function
-  | Call (f, _) -> ( match Hashtbl.find_opt pure f with Some i -> i.heavy | None -> false)
+let worth_keeping pure clos = function
+  | Call (f, _) as r -> ( match Hashtbl.find_opt pure f with Some i -> i.heavy && pure_rhs pure clos r | None -> false)
   | Prim (n, t, _, _) -> pure_prim n t && List.mem n heavy_prims
   | _ -> false
 
@@ -168,6 +242,8 @@ let same_key (K (a, b, xs)) (K (c, d, ys)) =
   && List.for_all2 (fun x y -> match (x, y) with KF p, KF q -> Int64.bits_of_float p = Int64.bits_of_float q | _ -> x = y) xs ys
 
 let cse_fn pure (f : fn) : fn =
+  let clos = closures_of f in
+  let pure_rhs pure = pure_rhs pure clos in
   let rec block avail ss =
     let avail = ref avail in
     let out =
@@ -225,7 +301,7 @@ type plan = {
 
 let no_plan () = { at_loop = []; kept = Hashtbl.create 1 }
 
-type loop = { lbody : stmt list; lassigned : S.t; defs : (int, rhs) Hashtbl.t; memo : (int, bool) Hashtbl.t; mutable slots : slot list }
+type loop = { lbody : stmt list; lassigned : S.t; defs : (int, rhs) Hashtbl.t; memo : (int, bool) Hashtbl.t; mutable slots : slot list; lclos : (int, string) Hashtbl.t }
 
 let slot_counter = ref 0
 
@@ -247,8 +323,9 @@ let rec same_each_time pure l a =
         Hashtbl.replace l.memo v.id false;
         let b =
           (match r with
-           | Atom _ | Bin _ | Neg _ | Not _ | Get _ | Payload _ | IsTag _ | PatTest _ | Interp _ | MkStruct _ | MkEnum _ | MkList _ -> true
-           | Call _ | Prim _ -> pure_rhs pure r
+           | Atom _ | Bin _ | Neg _ | Not _ | Get _ | Payload _ | IsTag _ | PatTest _ | Interp _ | MkStruct _ | MkEnum _ | MkList _
+           | MkClosure _ -> true
+           | Call _ | Prim _ -> pure_rhs pure l.lclos r
            | _ -> false)
           && List.for_all (same_each_time pure l) (consumed r @ borrowed r)
         in
@@ -264,11 +341,12 @@ let plan pure (f : fn) : plan =
   else begin
     let kept = Hashtbl.create 8 in
     let loops = ref [] in
+    let clos = closures_of f in
     let rec walk (outer : loop list) ss =
       List.iter
         (fun s ->
           match s with
-          | (Let (v, r) | Init (v, r)) when outer <> [] && worth_keeping pure r -> (
+          | (Let (v, r) | Init (v, r)) when outer <> [] && worth_keeping pure clos r -> (
             let atoms = consumed r @ borrowed r in
             (* the outermost loop the arguments do not change in *)
             match List.find_opt (fun l -> List.for_all (same_each_time pure l) atoms) (List.rev outer) with
@@ -282,7 +360,7 @@ let plan pure (f : fn) : plan =
           | Loop body ->
             let defs = Hashtbl.create 16 in
             stmts_iter (function Let (v, r) -> Hashtbl.replace defs v.id r | _ -> ()) body;
-            let l = { lbody = body; lassigned = assigned body; defs; memo = Hashtbl.create 16; slots = [] } in
+            let l = { lbody = body; lassigned = assigned body; defs; memo = Hashtbl.create 16; slots = []; lclos = clos } in
             loops := l :: !loops;
             walk (l :: outer) body
           | _ -> ())

@@ -450,6 +450,19 @@ fn check_var(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, n: Str, sp: ast
             return (TErr, st.report(diag.error("E0310", sp, "`{n}` is a group handle; the only thing you can do with it is `{n}.go(...)`")))
         },
         Some(v) => {
+            let pass = st.arg_of
+            st.arg_of = None
+            if v.kind == KParam && st.cb_params.contains((n, v.span)) {
+                match fx.lookup(n) {
+                    Some((_, false)) if st.calling => {},
+                    Some((_, false)) if pass.is_some() => {
+                        st.cb_passes = [pass ?? ("", 0)] + st.cb_passes
+                    },
+                    _ => {
+                        st.cb_escaped = true
+                    },
+                }
+            }
             return (v.ty, st)
         },
         None => {},
@@ -943,8 +956,20 @@ fn check_call(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, callee: ast.Ex
                     _ => false,
                 }
                 let ps = if foreign { callback_params(st, cx, fx, args2, ps) } else { ps }
-                for (a, p) in args2.zip(ps) {
+                // a function parameter passed on: pure if the callee is, there
+                let passed_to = match st.desc(callee) {
+                    EVar(g) if !foreign && !fx.is_local(g) && cx.fns.contains(g) => Some(g),
+                    _ => None,
+                }
+                for (k, (a, p)) in args2.zip(ps).with_index() {
+                    match (passed_to, st.desc(a)) {
+                        (Some(g), EVar(_)) => {
+                            st.arg_of = Some((g, k))
+                        },
+                        _ => {},
+                    }
                     st = expect(st, cx, fx, a, p)
+                    st.arg_of = None
                 }
                 if foreign {
                     st = check_callbacks(st, cx, fx, args2, ps)

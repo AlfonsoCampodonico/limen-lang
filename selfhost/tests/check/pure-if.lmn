@@ -1,0 +1,54 @@
+// Pure if the functions it is given are: a function that only calls its
+// function parameters, or passes them on to such a function, is pure
+// when its arguments there are. Storing, returning, capturing or sending
+// one is not.
+fn my_map(xs: List[Int], f: fn(Int) -> Int) -> List[Int] {
+    let mut out: List[Int] = []
+    for x in xs {
+        out.push(f(x))
+    }
+    out
+}
+
+fn twice(xs: List[Int], g: fn(Int) -> Int) -> List[Int] {
+    my_map(my_map(xs, g), g)
+}
+
+fn both(f: fn(Int) -> Int, g: fn(Int) -> Int, h: fn() -> Int) -> Int {
+    f(1) + g(2) + h()
+}
+
+fn keeps(f: fn(Int) -> Int) -> List[fn(Int) -> Int] {
+    [f]
+}
+
+fn captures(xs: List[Int], f: fn(Int) -> Int) -> List[Int] {
+    xs.map(|x| f(x))
+}
+
+fn passes_bad(f: fn(Int) -> Int) -> List[fn(Int) -> Int] {
+    keeps(f)
+}
+
+fn sends(f: fn() -> Int) {
+    let c: Chan[Int] = channel(1)
+    let _ = group g {
+        g.go(|| c.send(f()))
+    }
+}
+
+fn returns(f: fn(Int) -> Int) -> fn(Int) -> Int {
+    f
+}
+
+fn rec(n: Int, f: fn(Int) -> Int) -> Int {
+    if n == 0 { f(0) } else { rec(n - 1, f) }
+}
+
+fn printer(out: Stdout, f: fn(Int) -> Int) {
+    out.print("{f(1)}")
+}
+
+fn main(root: Root) {
+    let xs = my_map([1], |x| x * 2)
+}

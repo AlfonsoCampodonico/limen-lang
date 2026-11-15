@@ -276,7 +276,9 @@ pub fn program(files: List[diag.Source], p: ir.Program, libs: List[Str]) -> List
     out.push("libs [{libs.join(",")}]")
     let pure_fns = pure.analyse(p)
     for name in pure_fns.keys().sort() {
-        out.push("pure {name} heavy={pure_fns[name]}")
+        let i = pure_fns[name]
+        let cond = if i.cbs.is_empty() { "" } else { " if=" + i.cbs.map(|k| "{k}").join(",") }
+        out.push("pure {name} heavy={i.heavy}{cond}")
     }
     let mut slot = 0
     for f in p.fns {

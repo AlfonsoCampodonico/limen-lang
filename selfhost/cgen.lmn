@@ -98,7 +98,7 @@ struct Cg {
     // longjmps back into the function, and the deferred body (and the
     // cleanups after it) must see their latest values and owned flags
     vols: List[Int],
-    pure: Map[Str, Bool],
+    pure: Map[Str, pure.Info],
     // pure calls the current function keeps across a loop
     plan: pure.Plan,
     // the last slot number given, in the whole program

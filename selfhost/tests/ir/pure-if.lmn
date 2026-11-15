@@ -1,0 +1,48 @@
+// Calls of functions that are pure if their function arguments are: kept
+// across a loop and reused when the closures passed are pure, and stage
+// closures that call a pure closure held in a variable are fused.
+fn my_map(xs: List[Int], f: fn(Int) -> Int) -> List[Int] {
+    let mut out: List[Int] = []
+    for x in xs {
+        out.push(f(x))
+    }
+    out
+}
+
+fn twice(xs: List[Int], g: fn(Int) -> Int) -> List[Int] {
+    my_map(my_map(xs, g), g)
+}
+
+fn double(x: Int) -> Int {
+    x * 2
+}
+
+fn main(root: Root) {
+    let xs = [1, 2, 3]
+    let mut total = 0
+    for i in 0..<3 {
+        let ys = my_map(xs, |x| x * 2)
+        let zs = twice(xs, double)
+        total = total + ys.len() + zs.len() + i
+    }
+    root.stdout.print("{total}")
+    fused(root)
+}
+
+fn fused(root: Root) {
+    let out = root.stdout
+    let inc = |x: Int| x + 1
+    let d = double
+    let shout = |x: Int| {
+        out.print("saw {x}")
+        x
+    }
+    let a = [1, 2, 3].map(|x| inc(x)).filter(|x| x > 2).map(|x| d(x))
+    let b = [1, 2].map(|x| shout(x)).map(|x| x * 10)
+    let c = [1, 2, 3].map(|x| my_map([x], inc)[0]).filter(|x| x % 2 == 0)
+    let e = [1, 2].map(|x| {
+        let g = |y: Int| y + x
+        g(1)
+    }).map(|x| inc(x))
+    out.print("{a} {b} {c} {e}")
+}

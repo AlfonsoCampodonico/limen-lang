@@ -398,11 +398,12 @@ let cmd_caps file json =
   in
   if json then begin
     let one (i : Check.fn_info) =
-      Printf.sprintf {|{"name":%s,"caps":[%s],"via":{%s},"callbacks":%b,"pure":%b}|} (Diag.jstr i.name)
+      Printf.sprintf {|{"name":%s,"caps":[%s],"via":{%s},"callbacks":%b,"pure":%b,"pure_if":[%s]}|} (Diag.jstr i.name)
         (String.concat "," (List.map Diag.jstr (caps_str i)))
         (String.concat "," (List.map (fun (c, p) -> Diag.jstr (Types.cap_name c) ^ ":" ^ Diag.jstr p) i.via))
         i.callbacks
         (i.caps = [] && not i.callbacks)
+        (String.concat "," (List.map Diag.jstr i.pure_if))
     in
     let emb (m, path, size) = Printf.sprintf {|{"module":%s,"path":%s,"bytes":%d}|} (Diag.jstr m) (Diag.jstr path) size in
     print_endline
@@ -417,8 +418,7 @@ let cmd_caps file json =
       (fun (i : Check.fn_info) ->
         let what =
           match (caps_via i, i.callbacks) with
-          | [], false -> "pure"
-          | [], true -> "pure itself, runs callbacks"
+          | [], _ -> Check.pure_text i
           | cs, cb -> String.concat ", " cs ^ if cb then " + callbacks" else ""
         in
         Printf.printf "%-*s  %s\n" width i.name what)

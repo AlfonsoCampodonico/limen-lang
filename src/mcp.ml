@@ -133,7 +133,7 @@ let call name args =
            (List.map
               (fun (i : Check.fn_info) ->
                 let caps = List.map (fun c -> match List.assoc_opt c i.via with Some p -> Types.cap_name c ^ " (via " ^ p ^ ")" | None -> Types.cap_name c) i.caps in
-                i.name ^ ": " ^ (match (caps, i.callbacks) with [], false -> "pure" | [], true -> "pure itself, runs callbacks" | cs, cb -> String.concat ", " cs ^ if cb then " + callbacks" else ""))
+                i.name ^ ": " ^ (match (caps, i.callbacks) with [], _ -> Check.pure_text i | cs, cb -> String.concat ", " cs ^ if cb then " + callbacks" else ""))
               infos))
     | _, ds, _ -> text_result ~is_error:true (Diag.list_to_json ds))
   | "limen_type_at" -> (
