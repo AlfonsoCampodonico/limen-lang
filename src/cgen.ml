@@ -37,6 +37,7 @@ type ctx = {
       (* callback wrappers: (Limen function's C name, whether it takes a
          Foreign first, parameters, result) -> (wrapper name, Limen name,
          where the function is declared) *)
+  mutable bjobs : string list; (* blocking calls' jobs, vbj<n>_: each one's struct and the function that makes the call *)
   mutable vols : int list;
       (* variables of the current function a `defer` needs volatile: a panic
          longjmps back into the function, and the deferred body (and the
@@ -533,14 +534,22 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     let pass_foreign = List.exists (fun (_, _, _, tf) -> tf) cbs in
     let rest = ref vals and cbs = ref cbs and outs = ref [] in
     let fixed = match cs.fixed with Some k -> k | None -> List.length cs.params in
+    (* a blocking call's arguments go into its job: (field, C type, value) *)
+    let fields = ref [] in
     let cargs =
       List.mapi
         (fun i (p : Ffi.param) ->
           if p.out then begin
-            let o = sprintf "o%d_" i in
-            line (sprintf "  %s %s = 0;" (Ffi.c_name p.cty) o);
-            outs := (o, p.cty) :: !outs;
-            "&" ^ o
+            if cs.blocking then begin
+              outs := (sprintf "j_->o%d" i, p.cty) :: !outs;
+              sprintf "&j->o%d" i
+            end
+            else begin
+              let o = sprintf "o%d_" i in
+              line (sprintf "  %s %s = 0;" (Ffi.c_name p.cty) o);
+              outs := (o, p.cty) :: !outs;
+              "&" ^ o
+            end
           end
           else
             match p.cty with
@@ -550,7 +559,18 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
               | [] -> failwith "cgen: foreign callback")
             | t ->
               let v = match !rest with v :: r -> rest := r; v | [] -> failwith "cgen: foreign arity" in
-              ffi_arg c ~variadic:(i >= fixed) t v (sprintf "argument `%s` of `%s`" p.name cs.sym) (where sp))
+              if cs.blocking then begin
+                (* a Str or Bytes is lent to C through a reference the job keeps *)
+                let x =
+                  match t with
+                  | Ffi.Str -> sprintf "(const char *)w_block_keep(&j_->h, %s)" v
+                  | Ffi.Bytes -> sprintf "w_block_keep(&j_->h, %s)" v
+                  | _ -> ffi_arg c ~variadic:(i >= fixed) t v (sprintf "argument `%s` of `%s`" p.name cs.sym) (where sp)
+                in
+                fields := (sprintf "a%d" i, (if i >= fixed && (t = Ffi.Int32 || t = Ffi.Bool) then "int" else ffi_ctype c t), x) :: !fields;
+                sprintf "j->a%d" i
+              end
+              else ffi_arg c ~variadic:(i >= fixed) t v (sprintf "argument `%s` of `%s`" p.name cs.sym) (where sp))
         cs.params
     in
     let outs = List.rev !outs in
@@ -562,6 +582,44 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
            String.concat ", " (List.map (fun (p : Ffi.param) -> ffi_ctype c p.cty ^ if p.out then " *" else "") ptys)
            ^ if cs.fixed <> None then ", ..." else "")
     in
+    if cs.blocking then begin
+      (* Blocking calls: the call runs on the blocking-call pool, from a job
+         holding its arguments, out-parameters and result (WBlock in the
+         runtime), while the task waits. A struct's C type is named by
+         ffi_ctype already, for the prototype. *)
+      let fields = List.rev !fields in
+      let n = sprintf "vbj%d_" (List.length c.bjobs) in
+      let call = sprintf "((%s)vf_%s)(%s)" proto cs.sym (String.concat ", " cargs) in
+      let rty = ffi_ctype c cs.ret in
+      let members =
+        List.mapi (fun i (p : Ffi.param) -> if p.out then [ sprintf "%s o%d;" (Ffi.c_name p.cty) i ] else []) cs.params
+        |> List.concat
+      in
+      let members = List.map (fun (f, ty, _) -> sprintf "%s %s;" ty f) fields @ members in
+      let members = members @ (match cs.ret with Ffi.Unit | Ffi.Str -> [] | _ -> [ sprintf "%s r;" rty ]) in
+      let body =
+        match cs.ret with
+        | Ffi.Unit -> sprintf "%s;" call
+        | Ffi.Str -> sprintf "j->h.res = w_ffi_str(%s);" call
+        | _ -> sprintf "j->r = %s;" call
+      in
+      c.bjobs <-
+        c.bjobs
+        @ [ sprintf "typedef struct { WBlock h; %s } %s;\nstatic void %srun(WBlock *b_) { %s *j = (%s *)b_; %s }\n" (String.concat " " members) n n n n body ];
+      line (sprintf "  %s *j_ __attribute__((cleanup(w_block_end))) = (%s *)w_block_new(sizeof(%s), %srun);" n n n n);
+      List.iter (fun (f, _, x) -> line (sprintf "  j_->%s = %s;" f x)) fields;
+      line "  w_block_wait(&j_->h);";
+      let vals =
+        (match cs.ret with Ffi.Unit -> [] | Ffi.Str -> [ "w_block_str(&j_->h)" ] | _ -> [ ffi_result c cs.ret "j_->r" ])
+        @ List.map (fun (o, t) -> ffi_result c t o) outs
+      in
+      (match vals with
+       | [] -> line (sprintf "  %s = 0;" dst)
+       | [ v ] -> line (sprintf "  %s = %s;" dst v)
+       | vs -> line (sprintf "  %s = (%s){ %s };" dst (cname c t) (String.concat ", " vs)));
+      line "}"
+    end
+    else begin
     let call = sprintf "((%s)vf_%s)(%s)" proto cs.sym (String.concat ", " cargs) in
     (* the Foreign value for callbacks that take one, kept on the task's fiber *)
     if pass_foreign then begin
@@ -577,6 +635,7 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
      | [ v ] -> line (sprintf "  %s = %s;" dst v)
      | vs -> line (sprintf "  %s = (%s){ %s };" dst (cname c t) (String.concat ", " vs)));
     line "}"
+    end
   | I.CallDyn (k, ps, r, recv, args) ->
     let sigt = sprintf "%s (*)(%s)" (ctype c r) (String.concat ", " ("WDyn*" :: List.map (ctype c) ps)) in
     set (sprintf "((%s)(%s)->vt->m[%d])(%s)" sigt (a recv) k (String.concat ", " (a recv :: List.map a args)))
@@ -1607,7 +1666,7 @@ let program (g : Lower.gctx) (prog : I.program) : string =
   let c =
     { g; names = Hashtbl.create 32; types = []; lits = Hashtbl.create 32; lit_order = []; boxed = [];
       envs = Hashtbl.create 16; uniq = []; task_tys = []; inrange = []; chan_tys = []; dyns = []; cell_tys = []; vols = [];
-      cmp_tys = []; sort_tys = []; hash_tys = []; csyms = []; cstructs = []; cbs = [];
+      cmp_tys = []; sort_tys = []; hash_tys = []; csyms = []; cstructs = []; cbs = []; bjobs = [];
       pure = Pure.analyse prog; plan = Pure.no_plan (); slotted = [] }
   in
   (* bodies first: this discovers every type and literal *)
@@ -1816,5 +1875,5 @@ let program (g : Lower.gctx) (prog : I.program) : string =
       (* each foreign C function under a private name, bound to its symbol by
          an asm label, so it clashes with no header's declaration of it *)
       String.concat "" (List.map (fun sym -> sprintf "extern void vf_%s(void) __asm__(W_CSYM(\"%s\"));\n" sym sym) c.csyms);
-      cbdefs;
+      cbdefs ^ String.concat "" c.bjobs;
       "/* ---- dyn vtables ---- */"; Buffer.contents dynbuf; Buffer.contents bodies; Buffer.contents main ]

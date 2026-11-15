@@ -40,9 +40,10 @@ tparams  ::= "(" ws (tparam (isep tparam)* (ws ",")?)? ws ")" sp
 tparam   ::= param | ident sp ":" sp "virtual" sp1 "Clock"
 fn       ::= "fn" sp1 ident sp bgenerics? sp "(" ws (param (isep param)* (ws ",")?)? ws ")" (sp "->" sp type)? sp block
 # C functions from a library: signatures only, one per line, and C structs.
-# `...` makes a function variadic; `= "name"` names the C function.
+# `...` makes a function variadic; `= "name"` names the C function;
+# `blocking fn` runs the call off the task's thread.
 foreign  ::= "foreign" sp1 plainstr sp "{" ws (fitem (stsep fitem)* stsep?)? ws "}"
-fitem    ::= ("pub" sp1)? (ffn | fstruct)
+fitem    ::= ("pub" sp1)? (("blocking" sp1)? ffn | fstruct)
 ffn      ::= "fn" sp1 ident sp "(" ws fparams? ws ")" (sp "->" sp type)? (sp "=" sp plainstr)?
 fparams  ::= (param isep)* "..." (isep param)* (ws ",")? | param (isep param)* (ws ",")?
 fstruct  ::= "struct" sp1 ident sp "{" ws (param (isep param)* (ws ",")?)? ws "}"

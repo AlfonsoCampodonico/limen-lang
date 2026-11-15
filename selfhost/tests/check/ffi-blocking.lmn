@@ -1,0 +1,22 @@
+// Blocking foreign functions: no callbacks (E0330), not in library
+// `limen`, and the same Limen types as any foreign function.
+foreign "c" {
+    struct Div { quot: Int32, rem: Int32 }
+    blocking fn usleep(us: Int32) -> Int32
+    blocking fn qsort(base: Handle, n: Int, size: Int, cmp: fn(Handle, Handle) -> Int32)
+    blocking fn strtol(s: Str, end: Out[Handle], base: Int32) -> Int
+    blocking fn div(a: Int32, b: Int32) -> Div
+    blocking fn getenv(name: Str) -> Str
+}
+
+foreign "limen" {
+    blocking fn limen_copy(p: Handle, n: Int) -> Bytes
+}
+
+fn main(root: Root) {
+    let f = root.foreign
+    let (n, end) = strtol(f, "42", 10)
+    let d: Div = div(f, 7, 2)
+    let s: Str = getenv(f, "HOME")
+    let r: Int = usleep(f, 10)
+}

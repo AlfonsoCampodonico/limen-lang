@@ -1,0 +1,13 @@
+// `blocking fn` in a foreign block, with and without `pub`, beside a word
+// `blocking` used as a name elsewhere.
+foreign "sqlite3" {
+    blocking fn sqlite3_step(stmt: Handle) -> Int32
+    pub blocking fn sqlite3_close_v2(db: Handle) -> Int32
+    fn sqlite3_column_int64(stmt: Handle, i: Int32) -> Int
+    blocking fn sleep_ms(ms: Int) -> Int32 = "usleep"
+}
+
+fn blocking(n: Int) -> Int {
+    let blocking = n + 1
+    blocking
+}

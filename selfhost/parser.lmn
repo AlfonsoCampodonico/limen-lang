@@ -1492,7 +1492,10 @@ fn parse_foreign(p: Parser) -> Parsed[List[ast.Item]] {
         }
         let public = p.is_kw("pub")
         let q = if public { p.skip() } else { p }
-        let (item, next) = if q.is_kw("struct") { foreign_struct(q, lib, public)? } else { foreign_fn(q, lib, public)? }
+        // `blocking fn`: a word only here, not a keyword
+        let blocking = q.is_word("blocking") && q.skip().is_kw("fn")
+        let q = if blocking { q.skip() } else { q }
+        let (item, next) = if q.is_kw("struct") { foreign_struct(q, lib, public)? } else { foreign_fn(q, lib, public, blocking)? }
         items.push(item)
         // one declaration per line (or separated by `;`)
         if next.is_sym(";") {
@@ -1516,7 +1519,7 @@ fn foreign_struct(p: Parser, lib: Str, public: Bool) -> Parsed[ast.Item] {
     Ok((IStruct(d), p))
 }
 
-fn foreign_fn(p: Parser, lib: Str, public: Bool) -> Parsed[ast.Item] {
+fn foreign_fn(p: Parser, lib: Str, public: Bool, blocking: Bool) -> Parsed[ast.Item] {
     if !p.is_kw("fn") {
         return Err(p.expected("`fn name(...) -> Type` or `struct Name \{ ... \}` in a foreign block"))
     }
@@ -1563,7 +1566,7 @@ fn foreign_fn(p: Parser, lib: Str, public: Bool) -> Parsed[ast.Item] {
         table: None,
         public,
         bounds: [],
-        foreign: Some(ast.Foreign { lib, sym, variadic: sig.variadic, trusted: false }),
+        foreign: Some(ast.Foreign { lib, sym, variadic: sig.variadic, trusted: false, blocking }),
     }
     Ok((IFn(d), p))
 }

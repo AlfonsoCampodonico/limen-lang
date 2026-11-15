@@ -55,3 +55,10 @@ static int64_t vt_total;
 void vt_note(int64_t n) { vt_total += n; }
 int64_t vt_noted(void) { int64_t t = vt_total; vt_total = 0; return t; }
 void vt_times(void (*f)(int64_t), int64_t n) { for (int64_t i = 1; i <= n; i++) f(i); }
+
+/* blocking calls: slow on purpose, and reading or writing what they were
+   lent only after the wait, when a cancelled task has long unwound */
+#include <unistd.h>
+int64_t vt_slow_len(const char *s, int64_t ms) { usleep((useconds_t)(ms * 1000)); return (int64_t)strlen(s); }
+int64_t vt_slow_out(int64_t ms, int64_t *out) { usleep((useconds_t)(ms * 1000)); *out = ms * 2; return ms; }
+const char *vt_slow_name(int64_t ms) { usleep((useconds_t)(ms * 1000)); return "slow"; }

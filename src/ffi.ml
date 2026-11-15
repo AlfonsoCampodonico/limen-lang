@@ -44,8 +44,11 @@ type param = { name : string; cty : cty; out : bool }
 
 (* [trusted]: from a standard library module trusted to call C (see
    Ast.foreign); no Foreign capability is passed or checked. [fixed]: for a
-   variadic function, how many parameters come before the `...`. *)
-type csig = { lib : string; sym : string; params : param list; ret : cty; trusted : bool; fixed : int option }
+   variadic function, how many parameters come before the `...`.
+   [blocking]: declared `blocking fn`: natively the call runs on a thread of
+   the blocking-call pool while the calling task waits (cgen.ml, "blocking
+   calls"); the interpreter runs it on a thread of its own. *)
+type csig = { lib : string; sym : string; params : param list; ret : cty; trusted : bool; fixed : int option; blocking : bool }
 
 (* What the interpreter's call stubs (ffi_stubs.c) can pass, and so the
    limits of both backends: at most 8 integer-like and 8 Float values, each
@@ -188,8 +191,8 @@ let runtime_fns =
 (* The C signature of a foreign declaration, or the errors in it. [structs]
    finds a struct declaration by its (qualified) name. *)
 let of_decl ?(structs : string -> Ast.struct_decl option = fun _ -> None) (d : Ast.fn_decl) : (csig, (Span.t * string) list) result =
-  let lib, sym, trusted, variadic =
-    match d.fn_foreign with Some fo -> (fo.flib, fo.fsym, fo.ftrusted, fo.fvariadic) | None -> invalid_arg "Ffi.of_decl"
+  let lib, sym, trusted, variadic, blocking =
+    match d.fn_foreign with Some fo -> (fo.flib, fo.fsym, fo.ftrusted, fo.fvariadic, fo.fblocking) | None -> invalid_arg "Ffi.of_decl"
   in
   let errs = ref [] in
   let err sp m = errs := (sp, m) :: !errs in
@@ -325,7 +328,11 @@ let of_decl ?(structs : string -> Ast.struct_decl option = fun _ -> None) (d : A
    | Some (ps, r) when runtime_lib && (List.map (fun p -> if p.out then Unit else p.cty) params <> ps || ret <> r) ->
      err d.fn_span (Printf.sprintf "`%s` is declared with the wrong types for the runtime's helper" sym)
    | _ -> ());
-  match !errs with [] -> Ok { lib; sym; params; ret; trusted; fixed = variadic } | es -> Error (List.rev es)
+  (* a blocking call runs on another thread, where C cannot call back into the task *)
+  if blocking && runtime_lib then err d.fn_span "library `limen` is the runtime's own: its helpers are never `blocking`";
+  if blocking && List.exists (fun p -> match p.cty with Fn _ -> true | _ -> false) params then
+    err d.fn_span "a `blocking` function cannot take a callback: C may call one only during the call, on the calling task's own thread";
+  match !errs with [] -> Ok { lib; sym; params; ret; trusted; fixed = variadic; blocking } | es -> Error (List.rev es)
 
 (* Libraries a program's foreign declarations name, each once, in order. *)
 let libs (items : Ast.item list) =

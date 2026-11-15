@@ -1,0 +1,4 @@
+// `blocking` goes only before `fn`.
+foreign "c" {
+    blocking struct Div { quot: Int32, rem: Int32 }
+}

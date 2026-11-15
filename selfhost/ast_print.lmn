@@ -237,7 +237,8 @@ fn function(d: ast.FnDecl) -> Str {
 fn foreign_prefix(f: ast.Foreign, name: Str) -> Str {
     let sym = if f.sym != name { "=" + f.sym + " " } else { "" }
     let variadic = f.variadic.map(|k| "...{k} ") ?? ""
-    "foreign " + escaped(f.lib) + " " + sym + variadic
+    let blocking = if f.blocking { "blocking " } else { "" }
+    "foreign " + escaped(f.lib) + " " + sym + variadic + blocking
 }
 
 fn is_public(i: ast.Item) -> Bool {

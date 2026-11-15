@@ -1355,6 +1355,10 @@ module Foreign = struct
   external cb_free : bool -> int -> unit = "limen_ffi_cb_free"
   external cb_addr : bool -> int -> nativeint = "limen_ffi_cb_addr"
   external cb_fail : unit -> unit = "limen_ffi_cb_fail"
+  external job_start : nativeint -> int -> carg array -> float array -> int -> nativeint * int = "limen_ffi_job_start"
+  external job_done : nativeint -> bool = "limen_ffi_job_done"
+  external job_finish : nativeint -> int * int64 array * int64 array = "limen_ffi_job_finish"
+  external job_abandon : nativeint -> unit = "limen_ffi_job_abandon"
   external cstr : int64 -> string = "limen_ffi_cstr"
   external peek : int64 -> int -> string = "limen_ffi_peek"
   external sandbox_enter : string -> bool -> bool -> bool -> int = "limen_sandbox_enter"
@@ -1703,6 +1707,30 @@ module Foreign = struct
     let kind, sret = ret_kind cs.ret in
     let status, words, outs =
       match cs.fixed with
+      | _ when cs.blocking && !cb_depth = 0 ->
+        (* a blocking call runs on a thread of its own while the task waits
+           for it like for a socket; a cancelled task leaves it behind, and
+           the thread frees what it holds when C returns. In a callback
+           from C the task cannot wait, and the call runs here. *)
+        let ints, floats, flags =
+          match cs.fixed with
+          | None -> let ints, floats = place ~sret cargs in (ints, floats, 0)
+          | Some k ->
+            let word_of = function Word c -> c | Small n -> AInt n | Dbl x -> AInt (Int64.bits_of_float x) | Agg _ -> AInt 0L in
+            let ints, floats =
+              if Lazy.force abi = Apple then (List.map word_of cargs, [])
+              else
+                ( List.filter_map (function Dbl _ -> None | a -> Some (word_of a)) cargs,
+                  List.filter_map (function Dbl x -> Some x | _ -> None) cargs )
+            in
+            (Array.of_list ints, Array.of_list floats, k + 256)
+        in
+        let job, fd = job_start fp flags ints floats kind in
+        if job = 0n then raise (Panic ("foreign: cannot start a thread for a blocking call", sp));
+        let s = { fd = (Obj.magic fd : Unix.file_descr); shut = false; reading = false; writing = false; tls = Tls.Plain } in
+        (try wait_until ~io:(s, false) ~cancellable:(not !current.unwinding) (fun () -> job_done job)
+         with e -> job_abandon job; raise e);
+        job_finish job
       | None ->
         let ints, floats = place ~sret cargs in
         call_c fp ints floats kind copy

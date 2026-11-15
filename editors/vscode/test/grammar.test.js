@@ -82,7 +82,7 @@ interface Shape { fn area(self) -> Float }
 
 test "ports" for (a, b) in [(1, 2)] { assert_eq(a, b) }
 bench "build" { 1 }
-foreign "c" { fn open(path: Str, flags: Int32) -> Int32 }
+foreign "c" { blocking fn open(path: Str, flags: Int32) -> Int32 }
 let test = 1
 pub type Pair[T] = (T, T)
 `;
@@ -134,6 +134,7 @@ pub type Pair[T] = (T, T)
     ["test", "keyword.other.test.limen"],
     ["bench", "keyword.other.test.limen"],
     ["foreign", "storage.modifier.foreign.limen"],
+    ["blocking", "storage.modifier.blocking.limen"],
     ["type", "storage.type.alias.limen"],
     ["Pair", "entity.name.type.limen"],
   ];

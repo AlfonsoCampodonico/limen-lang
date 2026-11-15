@@ -118,6 +118,7 @@ let item = function
      | Some fo ->
        "foreign " ^ String.escaped fo.flib ^ " " ^ (if fo.fsym <> d.fn_name then "=" ^ fo.fsym ^ " " else "")
        ^ (match fo.fvariadic with Some k -> "..." ^ string_of_int k ^ " " | None -> "")
+       ^ (if fo.fblocking then "blocking " else "")
      | None -> "")
     ^ (if d.fn_pub then "pub " else "")
     ^ "fn " ^ d.fn_name ^ "["

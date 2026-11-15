@@ -48,6 +48,7 @@
    skipping only C frames, which then ends the program. */
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <errno.h>
 #include <pthread.h>
 #include <setjmp.h>
 #include <stdint.h>
@@ -270,6 +271,155 @@ value limen_ffi_call_var(value fn, value flags, value ints, value floats, value 
   limen_cb_jmp = prev;
   for (int k = 0; k < nown; k++) free(owned[k]);
   CAMLreturn(limen_result(status, w, status ? 0 : 1, slots, status ? 0 : no));
+}
+
+/* ---- blocking calls ----
+   A function declared `blocking fn` runs on a thread of its own, so the
+   interpreter's other tasks go on while C works (natively it runs on the
+   blocking-call pool). limen_ffi_job_start copies the arguments (strings
+   included: the OCaml heap may move meanwhile), starts the thread and
+   returns the job with the read end of a pipe the thread writes to when the
+   call has returned; the task waits on that descriptor as on a socket. A
+   cancelled task abandons the job (limen_ffi_job_abandon) and the thread
+   frees it when C returns. Blocking functions take no callbacks. */
+typedef struct {
+  void *f; int fixed; int var; int kind;
+  int64_t iv[NI]; double fv[8]; int64_t slots[NI]; int no;
+  void *owned[NI]; int nown;
+  int64_t w[16]; int nw;
+  int fds[2];
+  int state; /* 0 running, 1 done, 2 abandoned (under mu) */
+  pthread_mutex_t mu;
+} limen_job;
+
+static void limen_job_free(limen_job *j) {
+  for (int k = 0; k < j->nown; k++) free(j->owned[k]);
+  close(j->fds[0]);
+  close(j->fds[1]);
+  pthread_mutex_destroy(&j->mu);
+  free(j);
+}
+
+static void *limen_job_thread(void *p) {
+  limen_job *j = p;
+  int64_t *iv = j->iv;
+  double *fv = j->fv;
+  void *f = j->f;
+  int64_t *w = j->w;
+  j->nw = 1;
+  if (j->var) {
+    int fixed = j->fixed;
+#if defined(__aarch64__) && defined(__APPLE__)
+    if (j->kind == 1) { double d = 0; VCALL(double, d); memcpy(w, &d, 8); }
+    else { VCALL(int64_t, w[0]); }
+#else
+    (void)fixed;
+    if (j->kind == 1) {
+      double d = ((double (*)(int64_t, ...))f)(iv[0], iv[1], iv[2], iv[3], iv[4], iv[5], iv[6], iv[7], iv[8], iv[9], iv[10], iv[11],
+                                               iv[12], iv[13], AD8);
+      memcpy(w, &d, 8);
+    } else
+      w[0] = ((int64_t (*)(int64_t, ...))f)(iv[0], iv[1], iv[2], iv[3], iv[4], iv[5], iv[6], iv[7], iv[8], iv[9], iv[10], iv[11], iv[12],
+                                            iv[13], AD8);
+#endif
+  } else {
+    switch (j->kind) {
+    case 1: { double d = ((limen_gd)f)(AI24, AD8); memcpy(w, &d, 8); break; }
+    case 2: { limen_ii x = ((limen_gii)f)(AI24, AD8); memcpy(w, &x, 16); j->nw = 2; break; }
+    case 3: { limen_dd x = ((limen_gdd)f)(AI24, AD8); memcpy(w, &x, 16); j->nw = 2; break; }
+    case 4: { limen_id x = ((limen_gid)f)(AI24, AD8); memcpy(w, &x, 16); j->nw = 2; break; }
+    case 5: { limen_di x = ((limen_gdi)f)(AI24, AD8); memcpy(w, &x, 16); j->nw = 2; break; }
+    case 6: { limen_d3 x = ((limen_gd3)f)(AI24, AD8); memcpy(w, &x, 24); j->nw = 3; break; }
+    case 7: { limen_d4 x = ((limen_gd4)f)(AI24, AD8); memcpy(w, &x, 32); j->nw = 4; break; }
+    case 8: { limen_big x = ((limen_gbig)f)(AI24, AD8); memcpy(w, &x, sizeof x); j->nw = 16; break; }
+    default: w[0] = ((limen_gi)f)(AI24, AD8); break;
+    }
+  }
+  pthread_mutex_lock(&j->mu);
+  if (j->state == 2) {
+    pthread_mutex_unlock(&j->mu);
+    limen_job_free(j);
+    return NULL;
+  }
+  j->state = 1;
+  pthread_mutex_unlock(&j->mu);
+  ssize_t k;
+  do k = write(j->fds[1], "x", 1); while (k < 0 && errno == EINTR);
+  return NULL;
+}
+
+/* limen_ffi_job_start : nativeint -> int -> arg array -> float array -> int -> nativeint * int
+   (function, fixed + 256 * variadic, integer words, doubles, result kind)
+   -> (job, descriptor to wait on); a job of 0 if no thread could start. */
+value limen_ffi_job_start(value fn, value flags, value ints, value floats, value kind) {
+  CAMLparam5(fn, flags, ints, floats, kind);
+  CAMLlocal2(r, jv);
+  limen_job *j = calloc(1, sizeof *j);
+  if (!j) { fputs("panic: out of memory\n", stderr); exit(1); }
+  j->f = (void *)Nativeint_val(fn);
+  j->fixed = Int_val(flags) & 255;
+  j->var = Int_val(flags) >> 8;
+  j->kind = Int_val(kind);
+  mlsize_t n = Wosize_val(ints);
+  for (mlsize_t k = 0; k < n && k < NI; k++) j->iv[k] = limen_word(Field(ints, k), 1, j->slots, &j->no, j->owned, &j->nown);
+  mlsize_t nf = Wosize_val(floats) / Double_wosize;
+  for (mlsize_t k = 0; k < nf && k < 8; k++) j->fv[k] = Double_flat_field(floats, k);
+  /* out-parameters point at the job's slots, which outlive the call */
+  pthread_mutex_init(&j->mu, NULL);
+  pthread_t th;
+  pthread_attr_t at;
+  int ok = pipe(j->fds) == 0;
+  if (ok) {
+    pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    pthread_attr_setstacksize(&at, (size_t)4 << 20);
+    ok = pthread_create(&th, &at, limen_job_thread, j) == 0;
+    pthread_attr_destroy(&at);
+    if (!ok) { close(j->fds[0]); close(j->fds[1]); }
+  }
+  if (!ok) {
+    for (int k = 0; k < j->nown; k++) free(j->owned[k]);
+    pthread_mutex_destroy(&j->mu);
+    free(j);
+    j = NULL;
+  }
+  jv = caml_copy_nativeint((intnat)j);
+  r = caml_alloc_tuple(2);
+  Store_field(r, 0, jv);
+  Store_field(r, 1, Val_int(j ? j->fds[0] : -1));
+  CAMLreturn(r);
+}
+
+/* limen_ffi_job_done : nativeint -> bool */
+value limen_ffi_job_done(value jv) {
+  limen_job *j = (limen_job *)Nativeint_val(jv);
+  pthread_mutex_lock(&j->mu);
+  int d = j->state == 1;
+  pthread_mutex_unlock(&j->mu);
+  return Val_bool(d);
+}
+
+/* limen_ffi_job_finish : nativeint -> int * int64 array * int64 array
+   The results of a job that is done, as limen_ffi_call gives them; frees it. */
+value limen_ffi_job_finish(value jv) {
+  CAMLparam1(jv);
+  CAMLlocal1(r);
+  limen_job *j = (limen_job *)Nativeint_val(jv);
+  r = limen_result(0, j->w, j->nw, j->slots, j->no);
+  limen_job_free(j);
+  CAMLreturn(r);
+}
+
+/* limen_ffi_job_abandon : nativeint -> unit
+   Its task was cancelled: the thread frees the job once C returns. */
+value limen_ffi_job_abandon(value jv) {
+  limen_job *j = (limen_job *)Nativeint_val(jv);
+  pthread_mutex_lock(&j->mu);
+  int done = j->state == 1;
+  if (!done) j->state = 2;
+  pthread_mutex_unlock(&j->mu);
+  if (done) limen_job_free(j);
+  return Val_unit;
 }
 
 /* ---- callbacks ---- */

@@ -182,8 +182,9 @@ and fn_decl = {
    [fsym] is the function's own name unless the declaration names another
    (`fn print_int(...) -> Int32 = "printf"`). [fvariadic]: for a variadic
    function (`...` among its parameters), how many parameters come before
-   the `...`. *)
-and foreign = { flib : string; fsym : string; ftrusted : bool; fvariadic : int option }
+   the `...`. [fblocking]: declared `blocking fn`, so natively a call runs
+   on a thread of the blocking-call pool while the task waits (SPEC 9). *)
+and foreign = { flib : string; fsym : string; ftrusted : bool; fvariadic : int option; fblocking : bool }
 
 type struct_decl = {
   st_name : string;

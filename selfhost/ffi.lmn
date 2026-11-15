@@ -46,6 +46,9 @@ pub struct CSig {
     ret: CTy,
     trusted: Bool,
     fixed: Option[Int],
+    // declared `blocking fn`: natively the call runs on the blocking-call
+    // pool while the calling task waits
+    blocking: Bool,
 }
 
 // What the interpreter's call stubs can pass, and so the limits of both
@@ -229,7 +232,7 @@ fn last_part(n: Str) -> Str {
 // the order src/ffi.ml finds them. `structs` are the program's structs by
 // (qualified) name.
 pub fn of_decl(d: ast.FnDecl, structs: Map[Str, ast.StructDecl]) -> Result[CSig, List[(ast.Span, Str)]] {
-    let f = d.foreign ?? ast.Foreign { lib: "", sym: "", variadic: None, trusted: false }
+    let f = d.foreign ?? ast.Foreign { lib: "", sym: "", variadic: None, trusted: false, blocking: false }
     let mut errs: List[(ast.Span, Str)] = []
     // the boundary type a written type names, if it is a plain one
     let base = |errs: List[(ast.Span, Str)], te: ast.TyExpr| match te.desc {
@@ -405,7 +408,17 @@ pub fn of_decl(d: ast.FnDecl, structs: Map[Str, ast.StructDecl]) -> Result[CSig,
         },
         _ => {},
     }
-    if errs.is_empty() { Ok(CSig { lib: f.lib, sym: f.sym, params, ret, trusted: f.trusted, fixed: f.variadic }) } else { Err(errs) }
+    // a blocking call runs on another thread, where C cannot call back into the task
+    if f.blocking && runtime_lib {
+        errs.push((d.span, "library `limen` is the runtime's own: its helpers are never `blocking`"))
+    }
+    if f.blocking && params.any(|p| match p.cty {
+        Fn(..) => true,
+        _ => false,
+    }) {
+        errs.push((d.span, "a `blocking` function cannot take a callback: C may call one only during the call, on the calling task's own thread"))
+    }
+    if errs.is_empty() { Ok(CSig { lib: f.lib, sym: f.sym, params, ret, trusted: f.trusted, fixed: f.variadic, blocking: f.blocking }) } else { Err(errs) }
 }
 
 // The libraries a program's foreign declarations name, each once, in

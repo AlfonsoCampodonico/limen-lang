@@ -60,7 +60,7 @@ let rec cty (c : Ffi.cty) =
 let csig (s : Ffi.csig) =
   let fixed = match s.fixed with Some k -> string_of_int k | None -> "-" in
   let ps = String.concat ", " (List.map (fun (p : Ffi.param) -> p.name ^ ":" ^ cty p.cty ^ if p.out then " out" else "") s.params) in
-  Printf.sprintf "%s %s trusted=%b fixed=%s (%s) -> %s" s.lib s.sym s.trusted fixed ps (cty s.ret)
+  Printf.sprintf "%s %s trusted=%b fixed=%s (%s) -> %s%s" s.lib s.sym s.trusted fixed ps (cty s.ret) (if s.blocking then " blocking" else "")
 
 let ipart = function
   | IStr s -> "\"" ^ String.escaped s ^ "\""

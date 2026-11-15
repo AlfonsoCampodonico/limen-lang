@@ -29,6 +29,9 @@
           "include": "#foreign-block"
         },
         {
+          "include": "#blocking-fn"
+        },
+        {
           "include": "#fn-decl"
         },
         {
@@ -181,6 +184,14 @@
       "captures": {
         "1": {
           "name": "keyword.other.test.limen"
+        }
+      }
+    },
+    "blocking-fn": {
+      "match": "\\b(blocking)\\b(?=\\s+fn\\b)",
+      "captures": {
+        "1": {
+          "name": "storage.modifier.blocking.limen"
         }
       }
     },

@@ -283,6 +283,8 @@ pub struct Foreign {
     sym: Str,
     variadic: Option[Int],
     trusted: Bool,
+    // declared `blocking fn`: natively the call runs on the blocking-call pool
+    blocking: Bool,
 }
 
 pub struct FnDecl {

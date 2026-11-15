@@ -100,7 +100,7 @@ fn csig(s: ffi.CSig) -> Str {
         None => "-",
     }
     let ps = s.params.map(|p| p.name + ":" + cty(p.cty) + if p.out { " out" } else { "" }).join(", ")
-    "{s.lib} {s.sym} trusted={s.trusted} fixed={fixed} ({ps}) -> {cty(s.ret)}"
+    "{s.lib} {s.sym} trusted={s.trusted} fixed={fixed} ({ps}) -> {cty(s.ret)}{if s.blocking { " blocking" } else { "" }}"
 }
 
 fn ipart(p: ir.IPart) -> Str {

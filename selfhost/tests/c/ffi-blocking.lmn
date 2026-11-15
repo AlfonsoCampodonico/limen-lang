@@ -1,0 +1,26 @@
+// Blocking calls as C generation writes them: a job per call, with Str
+// and Bytes arguments kept alive, Out parameters in the job, Int32 and
+// Bool in the variadic part, a struct, a Str and no result. `vt_*` are in
+// no library: this file is for comparing the C, which does not link.
+foreign "c" {
+    struct Span { start: Int, live: Bool, at: Handle, width: Int32 }
+    blocking fn usleep(us: Int32) -> Int32
+    blocking fn memcmp(a: Bytes, b: Bytes, n: Int) -> Int32
+    blocking fn strtol(s: Str, end: Out[Handle], base: Int32) -> Int
+    blocking fn frexp(x: Float, exp: Out[Int32]) -> Float
+    blocking fn printf(format: Str, ..., n: Int32, b: Bool, s: Str) -> Int32
+    blocking fn vt_span(s: Span, k: Int) -> Span
+    blocking fn vt_name(n: Int) -> Str
+    blocking fn vt_note(n: Int)
+    blocking fn vt_on(on: Bool, x: Float) -> Bool
+}
+
+fn main(root: Root) {
+    let f = root.foreign
+    let out = root.stdout
+    let (n, end) = strtol(f, "4" + "2", 10)
+    let (m, e) = frexp(f, 8.0)
+    let s = vt_span(f, Span { start: 1, live: true, at: end, width: 3 }, 2)
+    vt_note(f, n)
+    out.print("{usleep(f, 1)} {memcmp(f, bytes([1, 2]), bytes([1, 3]), 2)} {n} {m} {e} {s} {vt_name(f, 3)} {vt_on(f, true, 0.5)} {printf(f, "%d %d %s\n", 1, false, "x")}")
+}

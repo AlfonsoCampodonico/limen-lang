@@ -999,6 +999,8 @@ let parse_foreign st =
   while not (is_sym st "}") do
     if cur st = EOF then fail (peek st) "`}` to end the foreign block";
     let pub = if is_kw st "pub" then (skip st; true) else false in
+    (* `blocking fn`: a word only here, not a keyword *)
+    let blocking = match (cur st, next st) with IDENT "blocking", KW "fn" -> skip st; true | _ -> false in
     if is_kw st "struct" then begin
       skip st;
       let name, nsp = expect_ident st in
@@ -1055,7 +1057,7 @@ let parse_foreign st =
       items :=
         IFn
           { fn_name = name; fn_span = nsp; fn_gen = []; fn_params = params; fn_ret = ret; fn_body = body; fn_test = None; fn_bench = false; fn_virtual = false;
-            fn_table = None; fn_pub = pub; fn_bounds = []; fn_foreign = Some { flib = lib; fsym = sym; ftrusted = false; fvariadic = !variadic } }
+            fn_table = None; fn_pub = pub; fn_bounds = []; fn_foreign = Some { flib = lib; fsym = sym; ftrusted = false; fvariadic = !variadic; fblocking = blocking } }
         :: !items
     end;
     (* one declaration per line (or separated by `;`) *)

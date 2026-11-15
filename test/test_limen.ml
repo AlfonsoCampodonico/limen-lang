@@ -1261,6 +1261,55 @@ fn main(root: Root) {
 |} in
   out "ffi-callback-group" ~grants:libc qsort_group "[900, 901, 901, 901, 901, 901, 901, 900]\n";
   check_tsan "ffi-callback-group" ~grants:libc qsort_group "[900, 901, 901, 901, 901, 901, 901, 900]\n";
+  (* `blocking fn`: the call runs off the task's thread (natively on the
+     blocking-call pool, in the interpreter on a thread of its own), so 40
+     calls sleeping a second in C at once take about a second, and a task
+     that only sleeps 20 ms meanwhile is not held up (inline, they would
+     take every worker thread, natively, and run one after another in the
+     interpreter). A task cancelled while its call is in C stops waiting at
+     once; the call ends in the background. A call not declared blocking
+     still runs inline. *)
+  let blocking_libc = {|foreign "c" {
+    blocking fn usleep(us: Int32) -> Int32
+    blocking fn strlen(s: Str) -> Int
+    blocking fn strtol(s: Str, end: Out[Handle], base: Int32) -> Int
+    blocking fn getenv(name: Str) -> Str
+    fn abs(n: Int32) -> Int32
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let clock = root.clock
+    let f = root.foreign
+    let start = clock.now_ms()
+    let r = group g {
+        for i in 0..<40 {
+            g.go(|| {
+                usleep(f, 1000000)
+                1
+            })
+        }
+        g.go(|| {
+            let t0 = clock.now_ms()
+            clock.sleep(20)
+            if clock.now_ms() - t0 < 600 { 100 } else { 0 }
+        })
+    }
+    let (n, end) = strtol(f, "42" + "x", 10)
+    out.print("{r.sum()} {clock.now_ms() - start < 3500} {strlen(f, "hel" + "lo")} {n} {end.addr != 0} {getenv(f, "LIMEN_NO_SUCH_VARIABLE")} {abs(f, -3)}")
+    let c = group g until clock.after(50) {
+        g.go(|| {
+            usleep(f, 400000)
+            1
+        })
+        g.go(|| 2)
+    }
+    out.print("{c} {clock.now_ms() - start < 3500}")
+}
+|} in
+  out "ffi-blocking" ~grants:libc blocking_libc "140 true 5 42 true  3\n[None, Some(2)] true\n";
+  check_tsan "ffi-blocking" ~grants:libc blocking_libc "140 true 5 42 true  3\n[None, Some(2)] true\n";
+  errs "ffi-blocking-callback" "foreign \"c\" {\n    blocking fn qsort(base: Handle, n: Int, size: Int, compare: fn(Handle, Handle) -> Int32)\n}\n\nfn main() {\n}\n" [ "E0330" ];
   (* structs of every shape the calling conventions treat differently, and
      callbacks, against a small C library (test/ffi_test.c) built here *)
   (* next to the test binary, not in $TMPDIR: dune gives each run a temporary
@@ -1339,6 +1388,39 @@ fn note_square(f: Foreign, n: Int) {
     vt_note(f, n * n)
 }
 |} in
+  (* A task cancelled while a blocking call is in C: the call goes on with
+     the string it was lent and writes its out-parameter after the task has
+     unwound and freed everything it owned (AddressSanitizer would see a
+     use after free), and its Str result is freed with the job. The program
+     waits for the abandoned calls before it ends, so the leak check sees
+     them finished. *)
+  let vt_blocking = {|foreign "limentest" {
+    blocking fn vt_slow_len(s: Str, ms: Int) -> Int
+    blocking fn vt_slow_out(ms: Int, out: Out[Int]) -> Int
+    blocking fn vt_slow_name(ms: Int) -> Str
+}
+
+fn main(root: Root) {
+    let f = root.foreign
+    let clock = root.clock
+    let out = root.stdout
+    let r = group g until clock.after(50) {
+        g.go(|| vt_slow_len(f, "abc" + "def", 300))
+        g.go(|| {
+            let (_, o) = vt_slow_out(f, 300)
+            o
+        })
+        g.go(|| vt_slow_name(f, 300).len())
+        g.go(|| vt_slow_len(f, "quick", 1))
+    }
+    out.print("{r}")
+    let (a, b) = vt_slow_out(f, 5)
+    out.print("{vt_slow_len(f, "hel" + "lo", 5)} {a} {b} {vt_slow_name(f, 5)}")
+    clock.sleep(500)
+}
+|} in
+  out "ffi-blocking-cancel" ~grants:vt vt_blocking "[None, None, None, Some(5)]\n5 5 10 slow\n";
+  check_tsan "ffi-blocking-cancel" ~grants:vt vt_blocking "[None, None, None, Some(5)]\n5 5 10 slow\n";
   out "ffi-struct-shapes" ~grants:vt
     (vtdecls ^ {|
 fn main(root: Root) {
@@ -3016,6 +3098,59 @@ fn main(root: Root) -> Result[(), IoError] {
   out "sql-no-fs" ~grants:sqlg
     "use sql\n\nfn main(root: Root) {\n    root.stdout.print(\"{sql.open(root.fs, \"x.db\")}\")\n}\n"
     "Err(Denied(\"fs: not granted (run with --grant fs=DIR)\"))\n";
+  (* SQLite's slow calls are blocking: tasks with a connection each query in
+     parallel, and a deadline stops a long query at once (the cancelled task
+     interrupts it, finalizes the statement and ends its use of the
+     connection), leaving the connection usable. *)
+  let sql_tasks = {v|use sql
+
+fn main(root: Root) -> Result[(), IoError] {
+    let out = root.stdout
+    let clock = root.clock
+    let start = clock.now_ms()
+    let shared = sql.memory()?
+    shared.exec("CREATE TABLE t (task INTEGER, n INTEGER)", [])?
+    let counts = group g {
+        for task in 0..<8 {
+            g.go(|| {
+                let own = sql.memory()
+                let mut i = 0
+                while i < 50 {
+                    shared.exec("INSERT INTO t (task, n) VALUES (?, ?)", [sql.Int(task), sql.Int(i)])
+                    i = i + 1
+                }
+                let mine = shared.query("SELECT COUNT(*) AS c FROM t WHERE task = ?", [sql.Int(task)])
+                let squares = match own {
+                    Ok(db) => {
+                        let s = db.query("WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 20000) SELECT SUM(x * x) AS s FROM c", [])
+                        db.close()
+                        s.map(|rows| rows[0].int("s") ?? 0) ?? -1
+                    },
+                    Err(_) => -1,
+                }
+                (mine.map(|rows| rows[0].int("c") ?? 0) ?? -1, squares)
+            })
+        }
+    }
+    out.print("{counts.map(|p| p.0)} {counts.all(|p| p.1 == 2666866670000)}")
+    let total = shared.query("SELECT COUNT(*) AS c, SUM(n) AS s FROM t", [])?
+    out.print("{total[0].int("c") ?? 0} {total[0].int("s") ?? 0}")
+    // one slow statement per connection: one waiting for the connection
+    // when cancelled would still run once it got it
+    let other = sql.memory()?
+    let slow = group g until clock.after(50) {
+        g.go(|| shared.query("WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 1000000000) SELECT COUNT(*) AS n FROM c", []).is_ok())
+        g.go(|| other.exec("WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 1000000000) SELECT COUNT(*) FROM c", []).is_ok())
+    }
+    let after = shared.query("SELECT COUNT(*) AS c FROM t", [])?
+    let one = other.query("SELECT 1 AS one", [])?
+    out.print("{slow} {after[0].int("c") ?? 0} {one[0].int("one") ?? 0} {clock.now_ms() - start < 5000}")
+    other.close()?
+    shared.close()
+}
+|v} in
+  out "sql-tasks" sql_tasks "[50, 50, 50, 50, 50, 50, 50, 50] true\n400 9800\n[None, None] 400 1 true\n";
+  check_tsan "sql-tasks" sql_tasks "[50, 50, 50, 50, 50, 50, 50, 50] true\n400 9800\n[None, None] 400 1 true\n";
   (* one connection shared by tasks *)
   let sql_group = {v|use sql
 

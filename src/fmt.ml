@@ -819,7 +819,7 @@ let foreign_sig (d : fn_decl) =
   let params =
     match fo.fvariadic with Some k -> List.filteri (fun i _ -> i < k) params @ [ "..." ] @ List.filteri (fun i _ -> i >= k) params | None -> params
   in
-  (if d.fn_pub then "pub " else "") ^ "fn " ^ d.fn_name ^ "(" ^ String.concat ", " params ^ ")"
+  (if d.fn_pub then "pub " else "") ^ (if fo.fblocking then "blocking " else "") ^ "fn " ^ d.fn_name ^ "(" ^ String.concat ", " params ^ ")"
   ^ (match d.fn_ret with Some t -> " -> " ^ ty t | None -> "")
   ^ if fo.fsym <> d.fn_name then " = \"" ^ escape fo.fsym ^ "\"" else ""
 

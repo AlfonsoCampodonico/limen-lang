@@ -94,6 +94,9 @@ struct Cg {
     csyms: List[Str],
     cstructs: List[CStruct],
     wrappers: List[Wrapper],
+    // blocking calls' jobs, vbj<n>_: each one's struct and the function
+    // that makes the call
+    bjobs: List[Str],
     // variables of the current function a `defer` needs volatile: a panic
     // longjmps back into the function, and the deferred body (and the
     // cleanups after it) must see their latest values and owned flags
@@ -1231,8 +1234,15 @@ fn call_c(self: Cg, ind: Str, dst: Str, t: types.Ty, cs: ffi.CSig, args: List[ir
     let mut outs: List[(Str, ffi.CTy)] = []
     let fixed = cs.fixed ?? cs.params.len()
     let mut cargs: List[Str] = []
+    // a blocking call's arguments go into its job: (field, C type, value)
+    let mut fields: List[(Str, Str, Str)] = []
     for (i, p) in cs.params.with_index() {
         if p.out {
+            if cs.blocking {
+                outs.push(("j_->o{i}", p.cty))
+                cargs.push("&j->o{i}")
+                continue
+            }
             let o = "o{i}_"
             c = c.line(ind, "  {ffi.c_name(p.cty)} {o} = 0;")
             outs.push((o, p.cty))
@@ -1257,9 +1267,31 @@ fn call_c(self: Cg, ind: Str, dst: Str, t: types.Ty, cs: ffi.CSig, args: List[ir
                     },
                     [] => panic("cgen: foreign arity"),
                 }
-                let (a, c2) = c.ffi_arg(i >= fixed, ty, v, "argument `{p.name}` of `{cs.sym}`", c.where(sp))
-                c = c2
-                cargs.push(a)
+                if cs.blocking {
+                    // a Str or Bytes is lent to C through a reference the job keeps
+                    let x = match ty {
+                        Str => "(const char *)w_block_keep(&j_->h, {v})",
+                        Bytes => "w_block_keep(&j_->h, {v})",
+                        _ => {
+                            let (a, c2) = c.ffi_arg(i >= fixed, ty, v, "argument `{p.name}` of `{cs.sym}`", c.where(sp))
+                            c = c2
+                            a
+                        },
+                    }
+                    let ft = if i >= fixed && (ty == Int32 || ty == Bool) {
+                        "int"
+                    } else {
+                        let (ct, c2) = c.ffi_ctype(ty)
+                        c = c2
+                        ct
+                    }
+                    fields.push(("a{i}", ft, x))
+                    cargs.push("j->a{i}")
+                } else {
+                    let (a, c2) = c.ffi_arg(i >= fixed, ty, v, "argument `{p.name}` of `{cs.sym}`", c.where(sp))
+                    c = c2
+                    cargs.push(a)
+                }
             },
         }
     }
@@ -1273,6 +1305,9 @@ fn call_c(self: Cg, ind: Str, dst: Str, t: types.Ty, cs: ffi.CSig, args: List[ir
     c = c3
     let proto = "{rt} (*)({if ptys.is_empty() { "void" } else { ptys.join(", ") + if cs.fixed.is_some() { ", ..." } else { "" } }})"
     let call = "(({proto})vf_{cs.sym})({cargs.join(", ")})"
+    if cs.blocking {
+        return c.blocking_call(ind, dst, t, cs, fields, outs, call)
+    }
     // the Foreign value for callbacks that take one, kept on the task's fiber
     if pass_foreign {
         c = c.line(ind, "  WFiber *cf_ = w_current();").line(ind, "  WCap *cfp_ = cf_->cb_foreign;").line(ind, "  cf_->cb_foreign = {xs[0]};")
@@ -1307,6 +1342,66 @@ fn call_c(self: Cg, ind: Str, dst: Str, t: types.Ty, cs: ffi.CSig, args: List[ir
         vs => {
             let (n, c7) = c.cname(t)
             c7.line(ind, "  {dst} = ({n})\{ {vs.join(", ")} };")
+        },
+    }
+    c.line(ind, "}")
+}
+
+// Blocking calls: the call runs on the blocking-call pool, from a job
+// holding its arguments, out-parameters and result (WBlock in the
+// runtime), while the task waits. A struct's C type is named by
+// ffi_ctype already, for the prototype.
+fn blocking_call(self: Cg, ind: Str, dst: Str, t: types.Ty, cs: ffi.CSig, fields: List[(Str, Str, Str)], outs: List[(Str, ffi.CTy)], call: Str) -> Cg {
+    let mut c = self
+    let n = "vbj{c.bjobs.len()}_"
+    let (rty, c1) = c.ffi_ctype(cs.ret)
+    c = c1
+    let mut members = fields.map(|f| "{f.1} {f.0};")
+    for (i, p) in cs.params.with_index() {
+        if p.out {
+            members.push("{ffi.c_name(p.cty)} o{i};")
+        }
+    }
+    match cs.ret {
+        Unit | Str => {},
+        _ => members.push("{rty} r;"),
+    }
+    let body = match cs.ret {
+        Unit => "{call};",
+        Str => "j->h.res = w_ffi_str({call});",
+        _ => "j->r = {call};",
+    }
+    c.bjobs.push("typedef struct \{ WBlock h; {members.join(" ")} } {n};\nstatic void {n}run(WBlock *b_) \{ {n} *j = ({n} *)b_; {body} }\n")
+    c = c.line(ind, "  {n} *j_ __attribute__((cleanup(w_block_end))) = ({n} *)w_block_new(sizeof({n}), {n}run);")
+    for f in fields {
+        c = c.line(ind, "  j_->{f.0} = {f.2};")
+    }
+    c = c.line(ind, "  w_block_wait(&j_->h);")
+    // the out-parameters' values first: OCaml makes the right operand of
+    // `@` first
+    let mut outv: List[Str] = []
+    for o in outs {
+        let (v, c5) = c.ffi_result(o.1, o.0)
+        c = c5
+        outv.push(v)
+    }
+    let mut vals: List[Str] = []
+    match cs.ret {
+        Unit => {},
+        Str => vals.push("w_block_str(&j_->h)"),
+        _ => {
+            let (v, c6) = c.ffi_result(cs.ret, "j_->r")
+            c = c6
+            vals.push(v)
+        },
+    }
+    vals = vals + outv
+    c = match vals {
+        [] => c.line(ind, "  {dst} = 0;"),
+        [v] => c.line(ind, "  {dst} = {v};"),
+        vs => {
+            let (tn, c7) = c.cname(t)
+            c7.line(ind, "  {dst} = ({tn})\{ {vs.join(", ")} };")
         },
     }
     c.line(ind, "}")
@@ -2626,6 +2721,7 @@ pub fn program(ro: lower.Ro, files: List[diag.Source], prog: ir.Program, runtime
         csyms: [],
         cstructs: [],
         wrappers: [],
+        bjobs: [],
         vols: [],
         pure: pure.analyse(prog),
         plan: pure.no_plan(),
@@ -2749,7 +2845,7 @@ pub fn program(ro: lower.Ro, files: List[diag.Source], prog: ir.Program, runtime
     // each foreign C function under a private name, bound to its symbol by
     // an asm label, so it clashes with no header's declaration of it
     let externs = c.csyms.map(|sym| "extern void vf_{sym}(void) __asm__(W_CSYM(\"{sym}\"));\n")
-    (if c.tls { tls_marker() } else { "" }) + [runtime, "/* ---- types ---- */", tys.join(""), "/* ---- literals ---- */", lits.join(""), "/* ---- closures ---- */", envs.join(""), tasks.join(""), "/* ---- functions ---- */", protos.join(""), externs.join(""), cbdefs.join(""), "/* ---- dyn vtables ---- */", dynbuf.join(""), bodies, main].join("\n")
+    (if c.tls { tls_marker() } else { "" }) + [runtime, "/* ---- types ---- */", tys.join(""), "/* ---- literals ---- */", lits.join(""), "/* ---- closures ---- */", envs.join(""), tasks.join(""), "/* ---- functions ---- */", protos.join(""), externs.join(""), cbdefs.join("") + c.bjobs.join(""), "/* ---- dyn vtables ---- */", dynbuf.join(""), bodies, main].join("\n")
 }
 
 // `main` of the C program: a test binary's, or the one that runs the

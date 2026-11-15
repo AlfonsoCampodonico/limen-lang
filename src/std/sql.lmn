@@ -21,22 +21,28 @@
 
 // ---------- SQLite's C API, as much as this module needs ----------
 
+// The calls that can take long (opening and closing files, running SQL,
+// waiting up to the busy timeout for another connection's lock, finishing
+// a statement) are `blocking`: natively they run on the blocking-call pool,
+// so a slow query holds up only its own task. The others only read what a
+// statement or a connection holds, and run on the task's thread.
 foreign "sqlite3" {
-    fn sqlite3_open_v2(path: Str, db: Out[Handle], flags: Int32, vfs: Int) -> Int32
-    fn sqlite3_close_v2(db: Handle) -> Int32
+    blocking fn sqlite3_open_v2(path: Str, db: Out[Handle], flags: Int32, vfs: Int) -> Int32
+    blocking fn sqlite3_close_v2(db: Handle) -> Int32
     fn sqlite3_errmsg(db: Handle) -> Str
     fn sqlite3_errstr(rc: Int32) -> Str
     fn sqlite3_limit(db: Handle, id: Int32, value: Int32) -> Int32
     fn sqlite3_busy_timeout(db: Handle, ms: Int32) -> Int32
-    fn sqlite3_exec(db: Handle, sql: Str, callback: Int, arg: Int, err: Out[Handle]) -> Int32
+    blocking fn sqlite3_exec(db: Handle, sql: Str, callback: Int, arg: Int, err: Out[Handle]) -> Int32
+    fn sqlite3_interrupt(db: Handle)
     fn sqlite3_free(p: Handle)
     fn sqlite3_changes64(db: Handle) -> Int
     fn sqlite3_last_insert_rowid(db: Handle) -> Int
     fn sqlite3_get_autocommit(db: Handle) -> Bool
-    fn sqlite3_prepare_v2(db: Handle, sql: Str, n: Int32, stmt: Out[Handle], tail: Out[Handle]) -> Int32
+    blocking fn sqlite3_prepare_v2(db: Handle, sql: Str, n: Int32, stmt: Out[Handle], tail: Out[Handle]) -> Int32
     fn sqlite3_sql(stmt: Handle) -> Str
-    fn sqlite3_finalize(stmt: Handle) -> Int32
-    fn sqlite3_step(stmt: Handle) -> Int32
+    blocking fn sqlite3_finalize(stmt: Handle) -> Int32
+    blocking fn sqlite3_step(stmt: Handle) -> Int32
     fn sqlite3_bind_parameter_count(stmt: Handle) -> Int32
     fn sqlite3_bind_null(stmt: Handle, i: Int32) -> Int32
     fn sqlite3_bind_int64(stmt: Handle, i: Int32, v: Int) -> Int32
@@ -150,18 +156,20 @@ fn closed() -> IoError {
 
 // Run `body` with the connection, counted as in use so a close in another
 // task waits for it; the connection is closed here if a close came meanwhile.
+// The use ends however `body` ends, a cancellation of the task included.
 fn using[T](self: Db, body: fn(Handle) -> Result[T, IoError]) -> Result[T, IoError] {
     let h = limen_handle_acquire(self.id)
     if h.addr == 0 {
         return Err(closed())
     }
-    let r = catch(|| body(h))
-    let last = limen_handle_release(self.id)
-    if last.addr != 0 {
-        // the last use after a close: the connection goes now
-        let rc = sqlite3_close_v2(last)
+    defer {
+        let last = limen_handle_release(self.id)
+        if last.addr != 0 {
+            // the last use after a close: the connection goes now
+            let rc = sqlite3_close_v2(last)
+        }
     }
-    match r {
+    match catch(|| body(h)) {
         Ok(v) => v,
         Err(msg) => panic(msg),
     }
@@ -256,8 +264,16 @@ pub fn exec(self: Db, text: Str, params: List[Value]) -> Result[Int, IoError] {
 }
 
 fn exec_on(db: Handle, text: Str, params: List[Value]) -> Result[Int, IoError] {
+    // a task cancelled while its SQL runs stops that SQL (sqlite3_interrupt
+    // stops whatever statement the connection is running)
+    let mut running = false
+    defer if running {
+        sqlite3_interrupt(db)
+    }
     if params.is_empty() {
+        running = true
         let (rc, err) = sqlite3_exec(db, text, 0, 0)
+        running = false
         if rc != ok_code() {
             let msg = if err.addr == 0 { sqlite3_errstr(rc) } else { sqlite3_errmsg(db) }
             sqlite3_free(err)
@@ -266,10 +282,12 @@ fn exec_on(db: Handle, text: Str, params: List[Value]) -> Result[Int, IoError] {
         return Ok(sqlite3_changes64(db))
     }
     let st = prepare(db, text, params)?
+    // finalized however this ends, a cancellation included
+    defer sqlite3_finalize(st)
+    running = true
     let rc = sqlite3_step(st)
-    let result = if rc == done_code() || rc == row_code() { Ok(sqlite3_changes64(db)) } else { Err(fail(db, "exec")) }
-    sqlite3_finalize(st)
-    result
+    running = false
+    if rc == done_code() || rc == row_code() { Ok(sqlite3_changes64(db)) } else { Err(fail(db, "exec")) }
 }
 
 // Run one statement and collect every row it returns.
@@ -279,17 +297,28 @@ pub fn query(self: Db, text: Str, params: List[Value]) -> Result[List[Row], IoEr
 
 fn query_on(db: Handle, text: Str, params: List[Value]) -> Result[List[Row], IoError] {
     let st = prepare(db, text, params)?
+    // finalized however this ends; a task cancelled while the statement
+    // runs stops it first
+    let mut running = false
+    defer {
+        if running {
+            sqlite3_interrupt(db)
+        }
+        sqlite3_finalize(st)
+    }
     let n = sqlite3_column_count(st)
     let names = (0..<n).map(|i| sqlite3_column_name(st, i))
     let mut rows = []
+    running = true
     let mut rc = sqlite3_step(st)
+    running = false
     while rc == row_code() {
         rows.push(Row { columns: names, values: (0..<n).map(|i| column(st, i)) })
+        running = true
         rc = sqlite3_step(st)
+        running = false
     }
-    let result = if rc == done_code() { Ok(rows) } else { Err(fail(db, "query")) }
-    sqlite3_finalize(st)
-    result
+    if rc == done_code() { Ok(rows) } else { Err(fail(db, "query")) }
 }
 
 // The first row, if any: for queries that look one thing up.
@@ -310,7 +339,14 @@ pub fn transaction[T](self: Db, body: fn() -> Result[T, IoError]) -> Result[T, I
         return Err(Failed("sql: a transaction is already open on this connection"))
     }
     self.exec("BEGIN", [])?
-    match catch(body) {
+    // a cancellation passes every `catch`: roll back then too
+    let mut settled = false
+    defer if !settled {
+        let _ = self.exec("ROLLBACK", [])
+    }
+    let r = catch(body)
+    settled = true
+    match r {
         Ok(Ok(v)) => {
             match self.exec("COMMIT", []) {
                 Ok(_) => Ok(v),

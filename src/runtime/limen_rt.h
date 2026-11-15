@@ -3713,6 +3713,190 @@ static int32_t w_ffi_i32(int64_t v, const char *arg, const char *where) {
   return (int32_t)v;
 }
 static WStr *w_ffi_str(const char *p) { return p ? Str_from(p, (int64_t)strlen(p)) : Str_new(0); }
+/* ---------- blocking C calls ----------
+   A foreign function declared `blocking fn` (and the calls of the std sql
+   module that wait on SQLite) runs on a thread of the blocking-call pool,
+   not on the worker thread that runs the task: the task parks until the
+   call returns, so a slow C call holds up only its own task. The pool
+   starts a thread whenever a call finds none idle, up to
+   LIMEN_BLOCKING_THREADS (64 by default); past that, calls queue.
+
+   Generated code (cgen.ml, "blocking calls") makes a job: a WBlock header,
+   then the C arguments, the out-parameters and the result; vbj<n>_run makes
+   the call with them. A Str or Bytes argument is lent to C by keeping a
+   reference to it in the job (w_block_keep), so it stays alive however the
+   task ends; a Str result is copied on the pool thread at once, while C's
+   string is still valid. The job's variable has a cleanup (w_block_end), so
+   it is freed however the task leaves it, a panic in an argument included.
+   A cancelled task stops waiting and unwinds at once; the call goes on in
+   the background and the pool thread frees the job when it returns, dropping what it kept and the result (a Handle the call
+   returned is lost, as C memory nobody frees). Once a cancellation is
+   unwinding the task (deferred code), a blocking call is waited for to the
+   end, as checkpoints let that code finish. */
+typedef struct WBlock {
+  void (*run)(struct WBlock *);
+  struct WBlock *next;
+  WFiber *f; WSel tok;
+  int state;                            /* 0 queued or running, 1 done, 2 abandoned by its task (under w_bl_mu) */
+  int pooled;                           /* the pool holds it: from submission until the task takes it back */
+  int nkeep; WStr *keep[16];            /* the Str and Bytes arguments lent to C */
+  WStr *res;                            /* a Str result, copied on the pool thread */
+} WBlock;
+static pthread_mutex_t w_bl_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t w_bl_cv = PTHREAD_COND_INITIALIZER;
+static WBlock *w_bl_head, *w_bl_tail;
+static int w_bl_threads, w_bl_idle, w_bl_spinning, w_bl_max;
+/* A call that returns quickly costs a round trip between threads. So that
+   it costs no sleep and wakeup on either side, a pool thread that has
+   finished a call watches the queue for W_BL_SPIN_NS before it sleeps, and
+   a task that has handed over a call watches for its end as long before it
+   parks: a loop over a query's rows, one sqlite3_step each, then never
+   waits for a thread to wake. */
+#define W_BL_SPIN_NS 50000
+static inline void w_cpu_relax(void) {
+#if defined(__x86_64__)
+  __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(__arm64__)
+  __asm__ volatile("yield");
+#endif
+}
+static int64_t w_real_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+static void *w_block_new(size_t n, void (*run)(WBlock *)) {
+  WBlock *b = (WBlock *)calloc(1, n);
+  if (!b) w_oom();
+  b->run = run;
+  return b;
+}
+static const void *w_block_keep(WBlock *b, WStr *s) {
+  Str_share(s);
+  b->keep[b->nkeep++] = Str_dup(s);
+  return s->data;
+}
+static void w_block_free(WBlock *b) {
+  for (int i = 0; i < b->nkeep; i++) Str_drop(b->keep[i]);
+  if (b->res) Str_drop(b->res);
+  free(b);
+}
+/* The job's variable goes out of scope, normally or unwinding (generated
+   code declares it with this cleanup): freed, unless a cancelled task left
+   it to the pool, which frees it when C returns. */
+static void w_block_end(void *p) {
+  WBlock *b = *(WBlock **)p;
+  if (b && !b->pooled) w_block_free(b);
+}
+/* The Str result, now the task's (on its boundary's list, like anything it allocates). */
+static WStr *w_block_str(WBlock *b) {
+  WStr *s = b->res;
+  b->res = NULL;
+  WCatch **slot = w_catch_slot();
+  if (slot && *slot) w_hdr_link(&(*slot)->objs, (WHdr *)s - 1);
+  return s;
+}
+static void *w_bl_thread(void *arg) {
+  (void)arg;
+  pthread_mutex_lock(&w_bl_mu);
+  for (;;) {
+    if (!w_bl_head) {
+      /* watch the queue for a while before sleeping */
+      w_bl_spinning++;
+      pthread_mutex_unlock(&w_bl_mu);
+      int64_t until = w_real_ns() + W_BL_SPIN_NS;
+      for (int i = 1; !__atomic_load_n(&w_bl_head, __ATOMIC_ACQUIRE); i++) {
+        w_cpu_relax();
+        if ((i & 63) == 0 && w_real_ns() > until) break;
+      }
+      pthread_mutex_lock(&w_bl_mu);
+      w_bl_spinning--;
+    }
+    while (!w_bl_head) { w_bl_idle++; pthread_cond_wait(&w_bl_cv, &w_bl_mu); w_bl_idle--; }
+    WBlock *b = w_bl_head;
+    __atomic_store_n(&w_bl_head, b->next, __ATOMIC_RELAXED);
+    if (!w_bl_head) w_bl_tail = NULL;
+    pthread_mutex_unlock(&w_bl_mu);
+    b->run(b);
+    pthread_mutex_lock(&w_bl_mu);
+    if (b->state == 2) { pthread_mutex_unlock(&w_bl_mu); w_block_free(b); pthread_mutex_lock(&w_bl_mu); continue; }
+    b->state = 1;
+    WFiber *f = b->f;
+    int claimed = w_tok_claim(&b->tok, 0);
+    pthread_mutex_unlock(&w_bl_mu);
+    if (claimed) w_wake(f);
+    pthread_mutex_lock(&w_bl_mu);
+  }
+  return NULL;
+}
+/* Hand the job to the pool (with w_bl_mu held). */
+static void w_bl_submit(WBlock *b) {
+  if (!w_bl_max) {
+    const char *e = getenv("LIMEN_BLOCKING_THREADS");
+    w_bl_max = e && atoi(e) > 0 ? atoi(e) : 64;
+  }
+  b->next = NULL;
+  b->pooled = 1;
+  if (w_bl_tail) w_bl_tail->next = b; else __atomic_store_n(&w_bl_head, b, __ATOMIC_RELEASE);
+  w_bl_tail = b;
+  if (w_bl_spinning > 0) { /* a watching thread takes it */ }
+  else if (w_bl_idle > 0) pthread_cond_signal(&w_bl_cv);
+  else if (w_bl_threads < w_bl_max) {
+    pthread_t th; pthread_attr_t at;
+    pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    pthread_attr_setstacksize(&at, (size_t)4 << 20);   /* C libraries expect a thread's usual stack */
+    if (pthread_create(&th, &at, w_bl_thread, NULL) == 0) w_bl_threads++;
+    else if (w_bl_threads == 0) w_fatal_c("cannot start a thread for a blocking C call", "?");
+    pthread_attr_destroy(&at);
+  }
+}
+/* Run the job on the pool and wait for it. A cancelled task abandons it and
+   unwinds; the job is then the pool's to free. */
+static void w_block_wait(WBlock *b) {
+  WFiber *f = w_current();
+  /* in a callback from C the task cannot park (C's frames are on its
+     stack): the call runs here, as C is already blocking this thread */
+  if (f->in_cb) { b->run(b); return; }
+  int cancellable = !f->unwinding;
+  b->f = f;
+  pthread_mutex_lock(&w_bl_mu);
+  if (cancellable) {
+    if (!w_wait_begin(&b->tok)) { pthread_mutex_unlock(&w_bl_mu); w_cancel_unwind(); }
+  } else {
+    b->tok.done = 0; b->tok.fired = -1;
+    w_prepare_park();
+  }
+  w_bl_submit(b);
+  __atomic_fetch_add(&w_io_waiters, 1, __ATOMIC_SEQ_CST);   /* the pool will wake it: not a deadlock */
+  pthread_mutex_unlock(&w_bl_mu);
+  /* Watch for the call's end before parking. A waker (the pool thread, or
+     the canceller) leaves the fiber W_NOTIFIED as the last thing it does to
+     it, so once that shows, nothing touches the fiber any more and it goes
+     on without parking. */
+  int64_t until = w_real_ns() + W_BL_SPIN_NS;
+  int quick = 0;
+  for (int i = 1;; i++) {
+    if (__atomic_load_n(&f->park_state, __ATOMIC_ACQUIRE) == W_NOTIFIED) {
+      __atomic_store_n(&f->park_state, W_RUNNING, __ATOMIC_RELEASE);
+      quick = 1;
+      break;
+    }
+    w_cpu_relax();
+    if ((i & 63) == 0 && w_real_ns() > until) break;
+  }
+  if (!quick) w_park_now();
+  __atomic_fetch_sub(&w_io_waiters, 1, __ATOMIC_SEQ_CST);
+  if (cancellable) w_wait_end();
+  if (w_tok_fired(&b->tok) == W_CANCEL) {
+    /* done already: the job is the task's again; otherwise the pool's */
+    pthread_mutex_lock(&w_bl_mu);
+    if (b->state == 1) b->pooled = 0; else b->state = 2;
+    pthread_mutex_unlock(&w_bl_mu);
+    w_cancel_unwind();
+  }
+  b->pooled = 0;
+}
 /* Callbacks from C (see ffi_callback_def in cgen.ml). C may call one only
    during its foreign call, on the same thread: that is the calling task's
    fiber, which the callback runs on. A thread Limen did not start has none. */
