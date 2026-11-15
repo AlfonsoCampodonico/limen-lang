@@ -207,6 +207,106 @@ pub fn default_port(scheme: Str) -> Option[Int] {
     }
 }
 
+// ---------- resolving references ----------
+
+// The URL that the reference `ref` names when it appears in the document
+// at `base`, as RFC 3986 section 5.2 has it: a link's `href` made
+// absolute. A reference with a scheme stands alone; one starting with
+// `//` keeps only the base's scheme; `/x` replaces the path; `x` and
+// `../x` are taken relative to the base's directory; `?q` and `#f` change
+// only the query or the fragment. `.` and `..` segments are removed, and
+// `..` never climbs above the root. The base must have a scheme.
+//
+//     resolve(base, "../g?y")    // base http://a/b/c/d;p?q: http://a/b/g?y
+pub fn resolve(base: Url, ref: Str) -> Result[Url, Str] {
+    if base.scheme == "" {
+        return Err("url: the base `{base.to_str()}` has no scheme")
+    }
+    let r = parse(ref)?
+    // whether `ref` has an authority and a query, even an empty one, which
+    // its parts cannot tell
+    let before = ref.slice(0, ref.index_of("#") ?? ref.len())
+    let has_query = before.contains("?")
+    let after_scheme = if r.scheme == "" { before } else { before.slice((before.index_of(":") ?? 0) + 1, before.len()) }
+    let has_authority = after_scheme.starts_with("//")
+    let mut t = r
+    if r.scheme != "" || has_authority {
+        t.path = remove_dot_segments(r.path)
+    } else {
+        t.user = base.user
+        t.password = base.password
+        t.host = base.host
+        t.port = base.port
+        if r.path == "" {
+            t.path = base.path
+            if !has_query {
+                t.query = base.query
+            }
+        } else if r.path.starts_with("/") {
+            t.path = remove_dot_segments(r.path)
+        } else {
+            t.path = remove_dot_segments(merge(base, r.path))
+        }
+    }
+    t.scheme = if r.scheme == "" { base.scheme } else { r.scheme }
+    Ok(t)
+}
+
+// `resolve` on text: `resolve_str("http://a/b/c/d", "../e")` is
+// `Ok("http://a/b/e")`.
+pub fn resolve_str(base: Str, ref: Str) -> Result[Str, Str] {
+    Ok((resolve(parse(base)?, ref)?).to_str())
+}
+
+// A relative path joined to the base's directory: everything up to its
+// last `/` (RFC 3986 section 5.2.3).
+fn merge(base: Url, path: Str) -> Str {
+    if base.path == "" && (base.host != "" || base.user != "" || base.port.is_some()) {
+        return "/" + path
+    }
+    match base.path.last_index_of("/") {
+        Some(k) => base.path.slice(0, k + 1) + path,
+        None => path,
+    }
+}
+
+// `path` without its `.` and `..` segments, each `..` taking away the
+// segment before it (RFC 3986 section 5.2.4):
+// `remove_dot_segments("/a/b/c/./../../g")` is `"/a/g"`. A `..` at the
+// root stays at the root.
+pub fn remove_dot_segments(path: Str) -> Str {
+    let mut input = path
+    // the output, a segment at a time, each with the `/` before it
+    let mut out: List[Str] = []
+    while input != "" {
+        if input.starts_with("../") {
+            input = input.slice(3, input.len())
+        } else if input.starts_with("./") {
+            input = input.slice(2, input.len())
+        } else if input.starts_with("/./") {
+            input = input.slice(2, input.len())
+        } else if input == "/." {
+            input = "/"
+        } else if input.starts_with("/../") || input == "/.." {
+            input = if input == "/.." { "/" } else { input.slice(3, input.len()) }
+            if !out.is_empty() {
+                out = out.take(out.len() - 1)
+            }
+        } else if input == "." || input == ".." {
+            input = ""
+        } else {
+            let start = if input.starts_with("/") { 1 } else { 0 }
+            let end = match input.slice(start, input.len()).index_of("/") {
+                Some(k) => k + start,
+                None => input.len(),
+            }
+            out.push(input.slice(0, end))
+            input = input.slice(end, input.len())
+        }
+    }
+    out.join("")
+}
+
 // ---------- percent-encoding ----------
 
 // `s` with every byte but the unreserved ones (letters, digits, `-`, `.`,

@@ -3167,6 +3167,51 @@ fn main(root: Root) {
 }
 |v}
     "Ok([[\"a\", \"b\"], [\"1\", \"x, y\"]])\nOk([[\"name\", \"quote\"], [\"Ada\", \"said \\\"hi\\\"\\r\\nthen left\"], [\"Bob\", \"\", \"\"], [\"\", \"\"], [\"\"]])\nOk([[\"x\"]]) Ok([]) Ok([]) Ok([[\"a\"]]) Ok([[\"a\", \"\"]]) Ok([[\"\", \"\"]])\nOk([[\"a\", \"b;c\"], [\"1\", \"2\"]]) Ok([[\"a\", \"b\"]])\nOk([{\"id\": \"1\", \"name\": \"Ada\"}, {\"id\": \"2\", \"name\": \"Lin, B\"}])\nErr(\"csv: line 1: a quoted field is not closed\")\nErr(\"csv: line 1: a quote inside an unquoted field; quote the whole field and double the quote\")\nErr(\"csv: line 1: `,` or a line break must follow a closing quote\")\nErr(\"csv: line 3: `,` or a line break must follow a closing quote\")\nErr(\"csv: line 1: the header names `h` twice\")\nErr(\"csv: line 2: 1 field, but the header has 2\")\nErr(\"csv: line 2: 3 fields, but the header has 2\")\nErr(\"csv: the separator must be one byte other than a quote or a line break, not `\\\"`\") Err(\"csv: the separator must be one byte other than a quote or a line break, not `,,`\")\na,\"b,c\",\"say \"\"hi\"\"\"\n\"line\nbreak\",,\"cr\r\"\n\"\"\n\n\nOk([[\"a\", \"b,c\", \"say \\\"hi\\\"\"], [\"line\\nbreak\", \"\", \"cr\\r\"], [\"\"]])\na\t\"b\tc\"\nd;e\tf\n\nid,name\n1,Ada\n2,\n\nplain \"a,b\" \"\"\"\"\n";
+  (* url.resolve against every example of RFC 3986 section 5.4 *)
+  out "std-url-resolve"
+    {v|use url
+
+fn main(root: Root) {
+    let out = root.stdout
+    let base = url.parse("http://a/b/c/d;p?q") ?? url.Url { scheme: "", user: "", password: "", host: "", port: None, path: "", query: "", fragment: "" }
+    let normal = [
+        ("g:h", "g:h"), ("g", "http://a/b/c/g"), ("./g", "http://a/b/c/g"), ("g/", "http://a/b/c/g/"),
+        ("/g", "http://a/g"), ("//g", "http://g"), ("?y", "http://a/b/c/d;p?y"), ("g?y", "http://a/b/c/g?y"),
+        ("#s", "http://a/b/c/d;p?q#s"), ("g#s", "http://a/b/c/g#s"), ("g?y#s", "http://a/b/c/g?y#s"),
+        (";x", "http://a/b/c/;x"), ("g;x", "http://a/b/c/g;x"), ("g;x?y#s", "http://a/b/c/g;x?y#s"),
+        ("", "http://a/b/c/d;p?q"), (".", "http://a/b/c/"), ("./", "http://a/b/c/"), ("..", "http://a/b/"),
+        ("../", "http://a/b/"), ("../g", "http://a/b/g"), ("../..", "http://a/"), ("../../", "http://a/"),
+        ("../../g", "http://a/g"),
+    ]
+    let abnormal = [
+        ("../../../g", "http://a/g"), ("../../../../g", "http://a/g"), ("/./g", "http://a/g"), ("/../g", "http://a/g"),
+        ("g.", "http://a/b/c/g."), (".g", "http://a/b/c/.g"), ("g..", "http://a/b/c/g.."), ("..g", "http://a/b/c/..g"),
+        ("./../g", "http://a/b/g"), ("./g/.", "http://a/b/c/g/"), ("g/./h", "http://a/b/c/g/h"), ("g/../h", "http://a/b/c/h"),
+        ("g;x=1/./y", "http://a/b/c/g;x=1/y"), ("g;x=1/../y", "http://a/b/c/y"),
+        ("g?y/./x", "http://a/b/c/g?y/./x"), ("g?y/../x", "http://a/b/c/g?y/../x"),
+        ("g#s/./x", "http://a/b/c/g#s/./x"), ("g#s/../x", "http://a/b/c/g#s/../x"),
+        ("http:g", "http:g"),
+    ]
+    for cases in [normal, abnormal] {
+        let mut right = 0
+        for (r, want) in cases {
+            let got = url.resolve(base, r).map(|u| u.to_str())
+            if got == Ok(want) {
+                right = right + 1
+            } else {
+                out.print("{r}: {got}, want {want}")
+            }
+        }
+        out.print("{right}/{cases.len()}")
+    }
+    let u = url.resolve(base, "//user:pw@h:81/x/../y?z#f") ?? base
+    out.print("{u.user} {u.password} {u.host} {u.port} {u.path} {u.query} {u.fragment}")
+    out.print("{url.resolve_str("http://example.com", "a/b")} {url.resolve_str("https://x.org/docs/", "../img/a.png")} {url.resolve_str("http://x/a/b", "?")}")
+    out.print("{url.resolve_str("/relative", "x")} {url.resolve_str("http://a/b", "%zz")} {url.resolve_str("http://a/b", "1x:y")}")
+    out.print("{url.remove_dot_segments("/a/b/c/./../../g")} {url.remove_dot_segments("mid/content=5/../6")} {url.remove_dot_segments("../a/./b/..")} {url.remove_dot_segments("/..")}")
+}
+|v}
+    "23/23\n19/19\nuser pw h Some(81) /y z f\nOk(\"http://example.com/a/b\") Ok(\"https://x.org/img/a.png\") Ok(\"http://x/a/b\")\nErr(\"url: the base `/relative` has no scheme\") Ok(\"http://a/%zz\") Ok(\"http://a/1x:y\")\n/a/g mid/6 a/ /\n";
   out "std-url"
     {v|use url
 

@@ -1995,6 +1995,9 @@ URLs (RFC 3986): parsing one into its parts and back, percent-encoding, and quer
 | `parse(s) -> Result[Url, Str]` | an absolute URL or a reference without a scheme (`/a?b`, `//host/x`); a bad scheme, a port that is not a number up to 65535, an unclosed `[`, a space in the host or a control character is an error naming the byte |
 | `u.to_str()` | the URL as text, `user` and `password` encoded; `parse(s)?.to_str()` gives `s` back for URLs in the usual form |
 | `u.params() -> Result[List[(Str, Str)], Str]` | the query's pairs, as `parse_query` reads them |
+| `resolve(base: Url, ref: Str) -> Result[Url, Str]` | the URL that the reference `ref` names in the document at `base`, as RFC 3986 section 5.2 resolves it (a link's `href` made absolute): a reference with a scheme stands alone, `//host/x` keeps the base's scheme, `/x` replaces the path, `x` and `../x` go from the base's directory, `?q` and `#f` change only the query or the fragment. Dot segments are removed, and `..` stops at the root: with the base `http://a/b/c/d;p?q`, `"../g"` is `http://a/b/g` and `"../../../g"` is `http://a/g`. An error if `ref` does not parse or `base` has no scheme |
+| `resolve_str(base: Str, ref: Str) -> Result[Str, Str]` | the same on text: `resolve_str("https://x.org/docs/", "../img/a.png")` is `Ok("https://x.org/img/a.png")` |
+| `remove_dot_segments(path) -> Str` | the path without its `.` and `..` segments (RFC 3986 section 5.2.4): `"/a/b/c/./../../g"` is `"/a/g"` |
 | `default_port(scheme) -> Option[Int]` | 80 for `http` and `ws`, 443 for `https` and `wss`, 21 for `ftp` |
 | `encode(s)`, `encode_path(s)` | every byte but letters, digits and `-._~` as `%XX` (`encode_path` keeps `/` too): `encode("a b&c")` is `"a%20b%26c"` |
 | `decode(s) -> Result[Str, Str]` | each `%XX` as its byte; a `%` without two hex digits is an error |
