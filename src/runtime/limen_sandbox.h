@@ -150,9 +150,17 @@ static int w_sb_within(const char *a, const char *dir) {
    raise them); unknown counts as privileged */
 static int w_sb_privileged(void) {
   if (getuid() == 0 || geteuid() == 0) return 1;
+  /* started set-user-ID or set-group-ID, or running with ids that differ:
+     a saved id may be root's (macOS has no portable way to read it) */
+  if (getuid() != geteuid() || getgid() != getegid()) return 1;
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+  if (issetugid()) return 1;
+#endif
 #if defined(__linux__)
   uid_t r, e, sv;
-  if (getresuid(&r, &e, &sv) != 0 || sv == 0) return 1;
+  if (getresuid(&r, &e, &sv) != 0 || sv == 0 || r != e || e != sv) return 1;
+  gid_t gr, ge, gs;
+  if (getresgid(&gr, &ge, &gs) != 0 || gr != ge || ge != gs) return 1;
   FILE *f = fopen("/proc/self/status", "r");
   if (!f) return 1;
   char line[256];
@@ -168,8 +176,9 @@ static int w_sb_privileged(void) {
     }
   }
   fclose(f);
-  /* CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_FOWNER, CAP_SYS_ADMIN (mounts) */
-  if (!found || (prm & ((1ULL << 0) | (1ULL << 1) | (1ULL << 3) | (1ULL << 21)))) return 1;
+  /* any permitted capability counts: many of them lead to the others
+     (CAP_SETUID, CAP_SETPCAP, CAP_SYS_PTRACE, ...) */
+  if (!found || prm != 0) return 1;
 #endif
   return 0;
 }
@@ -229,16 +238,19 @@ static int w_sb_walk(int dfd, dev_t dev, long *budget, int depth) {
 }
 
 /* whether nothing inside the real directory p can change but by root:
-   it lies on a file system mounted read-only (macOS's sealed system
-   volume), which this process cannot remount, or everything inside it is
-   root-only */
+   on macOS, it lies on the read-only sealed system volume, which this
+   process cannot remount; otherwise everything inside it is root-only (on
+   Linux a read-only mount proves nothing: it can be a bind mount of a
+   writable directory, so the tree is always walked) */
 static int w_sb_tree(const char *p) {
   int fd = open(p, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   struct stat st;
   struct statvfs vfs;
   if (fd < 0) return 0;
   if (fstat(fd, &st) != 0 || fstatvfs(fd, &vfs) != 0) { close(fd); return 0; }
+#if defined(__APPLE__)
   if (vfs.f_flag & ST_RDONLY) { close(fd); return 1; }
+#endif
   long budget = W_SB_WALK_MAX;
   return w_sb_walk(fd, st.st_dev, &budget, 0);
 }
