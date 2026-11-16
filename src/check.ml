@@ -48,8 +48,14 @@ let pending : (Span.t * ty * bound * string) list ref = ref []
    the type is known (see [infer_pending]). *)
 let to_infer : (ty * bound) list ref = ref []
 
+(* Struct and enum types made or written with type arguments, in the
+   function or signature being checked: the arguments are what their fields
+   hold, so the rules of fields apply to them (see [check_stored]). *)
+let stored : (Span.t * ty) list ref = ref []
+
 (* A use of struct or enum [n] with these type arguments: its bounds apply. *)
 let add_type_bounds n args sp =
+  if args <> [] then stored := (sp, TNamed (n, args)) :: !stored;
   match Hashtbl.find_opt type_bounds n with
   | Some (gen, bs) when List.length gen = List.length args ->
     let env = List.combine gen args in
@@ -99,6 +105,7 @@ type fn_info = {
   caps : cap list;
   via : (cap * string) list;
   callbacks : bool;
+  shares : bool; (* it takes a channel, Atomic or Shared: state tasks share, so it is not pure *)
   libs : string list;
       (* the C libraries it reaches with a Foreign: its own when it is a
          foreign function, and those of the functions it uses that take a
@@ -121,6 +128,28 @@ let authority_of ts =
       else Some (c, List.find_map (fun t -> via t c) ts))
     all_caps
 
+(* The types a function reaches through the methods of its type
+   parameters' bounds, with the methods' paths: `x.give()` in
+   `fn f[T: Giver](x: T)` gets what `Giver.give`'s parameter and result
+   types hold. *)
+let bound_types bounds =
+  List.concat_map
+    (fun (_, bs) -> List.concat_map (fun ((i, _) as b) -> List.map (fun (m, (ps, r)) -> (i ^ "." ^ m, ps @ [ r ])) (iface_methods b)) bs)
+    bounds
+
+(* The capabilities a function with parameter types [ps] and these bounds
+   holds, in [all_caps] order: those of [authority_of ps], then those only
+   its bounds' methods reach, each with the first method's path. *)
+let fn_authority ps bounds =
+  let held = authority_of ps in
+  let through = bound_types bounds in
+  List.filter_map
+    (fun c ->
+      match List.assoc_opt c held with
+      | Some p -> Some (c, p)
+      | None -> List.find_map (fun (path, ts) -> if List.exists (fun t -> List.mem c (caps_in t [])) ts then Some (c, Some path) else None) through)
+    all_caps
+
 (* "`T` holds capability `C`", and through which field when T does not
    write it, for the messages that refuse a type holding authority. *)
 let held t =
@@ -131,14 +160,27 @@ let held t =
 
 let err ctx ?notes ?fix code span msg = ctx.diags <- Diag.make ?notes ?fix code span msg :: ctx.diags
 
+(* How deep each rule looks into a type (Types.refused). Equality refuses
+   shared state, functions and `dyn` values anywhere in the type, and a
+   capability written at its top (one held anywhere is [held]'s). Printing
+   refuses shared state anywhere, and a function or capability at the top:
+   inside a value they print as `<fn>` and `<Net>`. A struct or enum field,
+   and so a type argument of a struct or enum, refuses shared state and
+   functions anywhere. *)
+let equality = { state = Deep; fns = Deep; dyns = Deep; caps = Top }
+let printing = { state = Deep; fns = Top; dyns = Never; caps = Top }
+let storing = { state = Deep; fns = Deep; dyns = Never; caps = Never }
+
+let holds_uncomparable t u = sprintf "`%s` holds `%s`, which cannot be compared" (show t) (show u)
+
 (* E0201 when built-in [name] compares values of type [t] that have no
    equality: functions, channels, `dyn` values, capabilities, and values
-   holding a capability, as `==` refuses them. *)
+   holding one of them, as `==` refuses them. *)
 let refuse_compare ctx sp name t =
-  match repr t with
-  | (TFn _ | TCap _ | TChan _ | TAtomic | TShared _ | TDyn _) as t ->
-    err ctx "E0201" sp (sprintf "`%s` compares values, and values of type `%s` cannot be compared" name (show t))
-  | t -> (
+  match refused equality t with
+  | Some Itself -> err ctx "E0201" sp (sprintf "`%s` compares values, and values of type `%s` cannot be compared" name (show t))
+  | Some (Inside u) -> err ctx "E0201" sp (sprintf "`%s` compares values, and %s" name (holds_uncomparable t u))
+  | None -> (
     match held t with
     | Some h ->
       err ctx "E0201" sp (sprintf "`%s` compares values, and %s" name h)
@@ -334,18 +376,39 @@ and resolve_bound ctx env (b : ty_expr) : bound option =
 (* Channels and functions cannot hide in a struct or enum; capabilities can,
    and the types holding them are tracked (Types.authority). *)
 let check_storable ctx span t =
-  if has_chan t && chan_kind t <> Some "channel" then
-    err ctx "E0305" span
-      (sprintf "an `Atomic` or `Shared` value cannot be stored in a struct or enum field, and `%s` holds one" (show t))
-      ~notes:[ "like a channel, pass it as a parameter or capture it in a closure instead" ]
-  else if has_chan t then
-    err ctx "E0305" span
-      (sprintf "channel type `%s` cannot be stored in a struct or enum field" (show t))
-      ~notes:[ "pass the channel as a parameter or capture it in a task's closure instead" ]
-  else if has_fn t then
-    err ctx "E0304" span
-      (sprintf "function type `%s` cannot be stored in a struct or enum field" (show t))
-      ~notes:[ "a stored closure could carry a capability out of sight; pass it as a parameter instead" ]
+  match refused storing t with
+  | None -> ()
+  | Some found -> (
+    match kind (match found with Itself -> t | Inside u -> u) with
+    | State "channel" ->
+      err ctx "E0305" span
+        (sprintf "channel type `%s` cannot be stored in a struct or enum field" (show t))
+        ~notes:[ "pass the channel as a parameter or capture it in a task's closure instead" ]
+    | State _ ->
+      err ctx "E0305" span
+        (sprintf "an `Atomic` or `Shared` value cannot be stored in a struct or enum field, and `%s` holds one" (show t))
+        ~notes:[ "like a channel, pass it as a parameter or capture it in a closure instead" ]
+    | Func | Plain | Cap _ | Dyn | Named _ ->
+      err ctx "E0304" span
+        (sprintf "function type `%s` cannot be stored in a struct or enum field" (show t))
+        ~notes:[ "a stored closure could carry a capability out of sight; pass it as a parameter instead" ])
+
+(* A struct or enum of the program's own, not a tuple or one of the
+   prelude's (Option and Result hold values as a List does). *)
+let own_type ctx n =
+  (not (is_tuple_name n))
+  &&
+  match Hashtbl.find_opt ctx.structs n with
+  | Some s -> s.st_span.file <> Prelude.file
+  | None -> ( match Hashtbl.find_opt ctx.enums n with Some e -> e.en_span.file <> Prelude.file | None -> false)
+
+(* The struct and enum types made or written with type arguments since the
+   last call: an argument is what a field holds, so it cannot be or hold a
+   channel, Atomic, Shared or function (E0305, E0304), however deep. *)
+let check_stored ctx =
+  let ts = List.rev !stored in
+  stored := [];
+  List.iter (fun (sp, t) -> match repr t with TNamed (n, _) when own_type ctx n -> check_storable ctx sp t | _ -> ()) ts
 
 (* ---------- scopes ---------- *)
 
@@ -842,10 +905,12 @@ and check_expr_inner ctx f e : ty =
         | SPLit _ -> ()
         | SPExpr x -> (
           let t = check_expr ctx f x in
-          match repr t with
-          | TFn _ | TCap _ | TChan _ | TAtomic | TShared _ ->
+          match refused printing t with
+          | Some Itself -> err ctx "E0201" x.espan (sprintf "cannot interpolate a value of type `%s`" (show t))
+          | Some (Inside u) ->
             err ctx "E0201" x.espan (sprintf "cannot interpolate a value of type `%s`" (show t))
-          | _ -> ()))
+              ~notes:[ sprintf "`%s` holds `%s`, which cannot be interpolated" (show t) (show u) ]
+          | None -> ()))
       parts;
     TStr
   | EVar n -> check_var ctx f e n e.espan
@@ -1238,9 +1303,9 @@ and check_call ?want ctx f e callee args sp =
      | [ a; b ] -> (
        let t = check_expr ctx f a in
        expect ctx f b t;
-       match repr t with
-       | TFn _ | TCap _ | TChan _ | TAtomic | TShared _ | TDyn _ -> err ctx "E0201" sp (sprintf "values of type `%s` cannot be compared" (show t))
-       | _ -> eq_types := t :: !eq_types; refuse_compare ctx sp "assert_eq" t)
+       match refused equality t with
+       | Some Itself -> err ctx "E0201" sp (sprintf "values of type `%s` cannot be compared" (show t))
+       | Some (Inside _) | None -> eq_types := t :: !eq_types; refuse_compare ctx sp "assert_eq" t)
      | _ -> err ctx "E0107" sp "`assert_eq` takes 2 arguments"; check_args ctx f args);
     TUnit
   | EVar "keep" when not (is_local f "keep") && not (Hashtbl.mem ctx.fns "keep") ->
@@ -1916,9 +1981,11 @@ and check_bin ctx f op a b sp =
     | Lt | Le | Gt | Ge -> (match unordered ctx t with None -> () | Some _ -> bad ()); TBool
     | _ ->
       eq_types := t :: !eq_types;
-      (match t with
-       | TFn _ | TCap _ | TChan _ | TAtomic | TShared _ | TDyn _ -> bad ()
-       | _ -> (
+      (match refused equality t with
+       | Some Itself -> bad ()
+       | Some (Inside u) ->
+         err ctx "E0201" sp (sprintf "operator `%s` cannot be applied to `%s`" name (show t)) ~notes:[ holds_uncomparable t u ]
+       | None -> (
          (* capabilities have no equality, so neither has a value holding one *)
          match held t with
          | Some h ->
@@ -2734,6 +2801,22 @@ let check_pending ctx =
   map_keys := [];
   List.iter (fun (sp, t, name) -> refuse_compare ctx sp name t) (List.rev !compared);
   if !cur_fn <> "" then begin
+    (* a generic function's result made with this use's type arguments:
+       `wrap(atomic(1))` where `fn wrap[T](x: T) -> Box[T]` makes a
+       `Box[Atomic]` *)
+    List.iter
+      (fun (sp, g, env) ->
+        match Hashtbl.find_opt ctx.fns g with
+        | Some s ->
+          let made u =
+            match repr u with
+            | TNamed (n, _) when own_type ctx n && params_in [] u <> [] && refused storing (subst env u) <> None -> Some (subst env u)
+            | _ -> None
+          in
+          Option.iter (fun t -> stored := (sp, t) :: !stored) (find_map made s.ret)
+        | None -> ())
+      (List.rev !uses_here);
+    check_stored ctx;
     let ps = List.fold_left params_in [] (List.rev_map (fun (_, t, _) -> t) !compared @ List.rev !eq_types) in
     if ps <> [] then Hashtbl.replace compares_direct !cur_fn ps;
     List.iter (fun (sp, g, env) -> generic_uses := (!cur_fn, sp, g, List.map (fun (p, t) -> (p, resolved t)) env) :: !generic_uses) (List.rev !uses_here)
@@ -2810,6 +2893,7 @@ let check_fn ctx (d : fn_decl) (s : fsig) =
   to_infer := [];
   map_keys := [];
   compared := [];
+  stored := [];
   eq_types := [];
   uses_here := [];
   cur_fn := d.fn_name;
@@ -2882,13 +2966,15 @@ let check_self ctx d ps =
 let case_note = "in the table case "
 
 (* What `limen caps` says of a function with no capability: `pure`, `pure if
-   f is` (and `f and g are`), or `pure itself, runs callbacks`. *)
+   f is` (and `f and g are`), `pure itself, runs callbacks`, or, when it
+   takes state tasks share, `shares state` (`, runs callbacks`). *)
 let cap_text (i : fn_info) c =
   let name = if c = Foreign && i.libs <> [] then sprintf "Foreign (%s)" (String.concat ", " i.libs) else cap_name c in
   match List.assoc_opt c i.via with Some p -> sprintf "%s (via %s)" name p | None -> name
 
 let pure_text (i : fn_info) =
   match (i.callbacks, i.pure_if) with
+  | cb, _ when i.shares -> if cb then "shares state, runs callbacks" else "shares state"
   | false, _ -> "pure"
   | true, [] -> "pure itself, runs callbacks"
   | true, [ f ] -> sprintf "pure if %s is" f
@@ -2931,9 +3017,10 @@ let refuse_compared_params ctx =
           match List.assoc_opt p env with
           | Some t when not (bounded g p) -> (
             let what = sprintf "`%s` compares values of `%s`" (shown g) p in
-            match t with
-            | TFn _ | TCap _ | TChan _ | TAtomic | TShared _ | TDyn _ -> err ctx "E0201" sp (sprintf "%s, and values of type `%s` cannot be compared" what (show t))
-            | _ -> (
+            match refused equality t with
+            | Some Itself -> err ctx "E0201" sp (sprintf "%s, and values of type `%s` cannot be compared" what (show t))
+            | Some (Inside u) -> err ctx "E0201" sp (sprintf "%s, and %s" what (holds_uncomparable t u))
+            | None -> (
               match held t with
               | Some h ->
                 err ctx "E0201" sp (sprintf "%s, and %s" what h)
@@ -3163,7 +3250,10 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
       match Hashtbl.find_opt ctx.sfields n with
       | Some fs -> Some fs
       | None -> Option.map (List.concat_map (fun (v, ts) -> List.map (fun t -> (v, t)) ts)) (Hashtbl.find_opt ctx.variants n));
-  (* 3. function signatures *)
+  (* 3. function signatures; the struct and enum types written in them are
+     checked one signature at a time (those of fields and payloads were
+     checked whole) *)
+  stored := [];
   let sigs =
     List.filter_map
       (function
@@ -3198,6 +3288,7 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
           Hashtbl.replace fn_cur_bounds d.fn_name all;
           Hashtbl.replace fn_kinds d.fn_name (List.of_seq (Hashtbl.to_seq param_kinds));
           take_pending all;
+          check_stored ctx;
           (* a clash with a built-in method written in Limen is reported by check_self *)
           let builtin_clash = match Hashtbl.find_opt method_owner d.fn_name with Some (_, fl) -> fl = Prelude.methods_file | None -> false in
           if String.contains d.fn_name ':' && not builtin_clash then Hashtbl.replace method_owner d.fn_name (d.fn_pub, d.fn_span.file);
@@ -3301,7 +3392,7 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
       let fns = List.filter_map (fun (p, t) -> match repr t with TFn _ -> Some p.prm_name | _ -> None) (zip d.fn_params s.ps) in
       match Hashtbl.find_opt cb_uses d.fn_name with
       | Some (false, passes)
-        when fns <> [] && authority_of s.ps = [] && d.fn_bounds = []
+        when fns <> [] && authority_of s.ps = [] && d.fn_bounds = [] && not (List.exists has_chan s.ps)
              && List.for_all (fun t -> (match repr t with TFn _ -> true | _ -> false) || not (has_fn t)) s.ps ->
         Hashtbl.replace cond d.fn_name (fns, passes)
       | _ -> ())
@@ -3342,11 +3433,13 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
   let infos =
     List.map
       (fun ((d : fn_decl), s) ->
-        let held = authority_of s.ps in
+        let bounds = Option.value ~default:[] (Hashtbl.find_opt fn_cur_bounds d.fn_name) in
+        let held = fn_authority s.ps bounds in
         { name = d.fn_name; span = d.fn_span;
           caps = List.map fst held;
           via = List.filter_map (fun (c, p) -> Option.map (fun p -> (c, p)) p) held;
           callbacks = List.exists has_fn s.ps || d.fn_bounds <> [];
+          shares = List.exists has_chan (s.ps @ List.concat_map snd (bound_types bounds));
           libs = Hashtbl.find libs d.fn_name;
           pure_if = (match Hashtbl.find_opt cond d.fn_name with Some (fns, _) -> fns | None -> []) })
       (* forwarders only pass their arguments on; the methods they call are reported *)

@@ -46,6 +46,9 @@ pub struct FnInfo {
     // struct or enum that holds it, `Client.net`
     via: List[(Str, Str)],
     callbacks: Bool,
+    // it takes a channel, Atomic or Shared: state tasks share, so it is not
+    // pure
+    shares: Bool,
     // the C libraries it reaches with a Foreign: its own when it is a
     // foreign function, and those of the functions it uses that take a
     // Foreign, sorted
@@ -154,7 +157,7 @@ pub fn check_program(items: List[ast.Item], files: List[diag.Source], next_id: I
             _ => !st.subst.has_fn(t),
         })
         match st.cb_uses.get(f.decl.name) {
-            Some((false, passes)) if !fns.is_empty() && st.authority_of(f.sig.params).is_empty() && f.decl.bounds.is_empty() && plain => {
+            Some((false, passes)) if !fns.is_empty() && st.authority_of(f.sig.params).is_empty() && f.decl.bounds.is_empty() && plain && !f.sig.params.any(|t| st.subst.has_chan(t)) => {
                 cond[f.decl.name] = (fns, passes)
             },
             _ => {},
@@ -201,7 +204,7 @@ pub fn check_program(items: List[ast.Item], files: List[diag.Source], next_id: I
             }
         }
     }
-    let infos = reported.map(|f| fn_info(st, f, cond.get(f.decl.name).map(|c| c.0) ?? [], libs.get(f.decl.name) ?? []))
+    let infos = reported.map(|f| fn_info(cx, st, f, cond.get(f.decl.name).map(|c| c.0) ?? [], libs.get(f.decl.name) ?? []))
     Checked { items: items.map(|i| rewritten_item(st, i)), diags: in_order(cx, st.diags), state: st, infos, cx, prelude: pre.map(|i| rewritten_item(st, i)) }
 }
 
@@ -269,9 +272,10 @@ fn refuse_compared_params(cx: env.Cx, st: env.State) -> env.State {
                     }
                     let what = "`{shown}` compares values of `{p}`"
                     let t = st.repr(t)
-                    st = match t {
-                        TFn(..) | TCap(_) | TChan(_) | TAtomic | TShared(_) | TDyn(..) => st.report(diag.error("E0201", sp, "{what}, and values of type `{st.show(t)}` cannot be compared")),
-                        _ => match st.held(t) {
+                    st = match st.subst.refused(env.equality(), t) {
+                        Some(Itself) => st.report(diag.error("E0201", sp, "{what}, and values of type `{st.show(t)}` cannot be compared")),
+                        Some(Inside(u)) => st.report(diag.error("E0201", sp, "{what}, and {st.holds_uncomparable(t, u)}")),
+                        None => match st.held(t) {
                             Some(h) => st.report(diag.error("E0201", sp, "{what}, and {h}").note("capabilities have no equality, so neither has a value holding one; compare something it holds that is not a capability, as in `xs.any(|x| x.name == name)`")),
                             None => st,
                         },
@@ -284,14 +288,39 @@ fn refuse_compared_params(cx: env.Cx, st: env.State) -> env.State {
     st
 }
 
-fn fn_info(st: env.State, f: Fn, pure_if: List[Str], libs: List[Str]) -> FnInfo {
-    let held = st.authority_of(f.sig.params)
+// The types a function reaches through the methods of its type
+// parameters' bounds, with the methods' paths: `x.give()` in
+// `fn f[T: Giver](x: T)` gets what `Giver.give`'s parameter and result
+// types hold.
+fn bound_types(cx: env.Cx, st: env.State, bounds: List[env.Bounds]) -> List[(Str, List[types.Ty])] {
+    bounds.flat_map(|bs| bs.bounds.flat_map(|b| checker.iface_methods(st, cx, b).map(|m| ("{b.iface}.{m.name}", m.params + [m.ret]))))
+}
+
+// The capabilities a function with parameter types `ps` and these bounds
+// holds, in the order of builtins.cap_names: those of authority_of, then
+// those only its bounds' methods reach, each with the first method's path.
+fn fn_authority(cx: env.Cx, st: env.State, ps: List[types.Ty], bounds: List[env.Bounds]) -> List[(Str, Option[Str])] {
+    let held = st.authority_of(ps)
+    let through = bound_types(cx, st, bounds)
+    builtins.cap_names().flat_map(|c| match held.find(|h| h.0 == c) {
+        Some(h) => [h],
+        None => match through.find(|x| x.1.any(|t| st.subst.caps_in(t, []).contains(c))) {
+            Some((path, _)) => [(c, Some(path))],
+            None => [],
+        },
+    })
+}
+
+fn fn_info(cx: env.Cx, st: env.State, f: Fn, pure_if: List[Str], libs: List[Str]) -> FnInfo {
+    let bounds = cx.fn_cur_bounds.get(f.decl.name) ?? []
+    let held = fn_authority(cx, st, f.sig.params, bounds)
     let callbacks = f.sig.params.any(|t| st.subst.has_fn(t)) || !f.decl.bounds.is_empty()
+    let shares = (f.sig.params + bound_types(cx, st, bounds).flat_map(|x| x.1)).any(|t| st.subst.has_chan(t))
     let via = held.flat_map(|h| match h.1 {
         Some(p) => [(h.0, p)],
         None => [],
     })
-    FnInfo { name: f.decl.name, span: f.decl.span, caps: held.map(|h| h.0), via, callbacks, libs, pure_if }
+    FnInfo { name: f.decl.name, span: f.decl.span, caps: held.map(|h| h.0), via, callbacks, shares, libs, pure_if }
 }
 
 // 2c. the authority each struct and enum holds through its fields
@@ -730,10 +759,12 @@ fn merge_bounds(a: List[env.Bounds], b: List[env.Bounds]) -> List[env.Bounds] {
     acc
 }
 
-// 3. function signatures
+// 3. function signatures; the struct and enum types written in them are
+// checked one signature at a time (those of fields and payloads were
+// checked whole)
 fn signatures(cx: env.Cx, st: env.State, ds: Decls, items: List[ast.Item]) -> (env.Cx, env.State, Decls, List[Fn]) {
     let mut cx = cx
-    let mut st = st
+    let mut st = { st with stored: [] }
     let mut ds = ds
     let mut sigs: List[Fn] = []
     for i in items {
@@ -803,6 +834,7 @@ fn signatures(cx: env.Cx, st: env.State, ds: Decls, items: List[ast.Item]) -> (e
         cx.fn_cur_bounds[d.name] = all
         cx.fn_kinds[d.name] = st.kinds.entries()
         (st, ds) = take_pending(st, ds, all)
+        st = st.check_stored(cx)
         // a clash with a built-in method written in Limen is reported by check_self
         let builtin_clash = match cx.method_owner.get(d.name) {
             Some((_, f)) => f == cx.methods_file,
@@ -1003,6 +1035,7 @@ fn check_fn(cx: env.Cx, st: env.State, ds: Decls, d: ast.FnDecl, s: env.Sig) -> 
     st.to_infer = []
     st.map_keys = []
     st.compared = []
+    st.stored = []
     st.eq_types = []
     st.uses_here = []
     st.cur_fn = d.name
@@ -1086,6 +1119,27 @@ fn check_pending(cx: env.Cx, st: env.State, ds: Decls) -> (env.State, Decls) {
         st = checker.refuse_compare(st, sp, name, t)
     }
     if st.cur_fn != "" {
+        // a generic function's result made with this use's type arguments:
+        // `wrap(atomic(1))` where `fn wrap[T](x: T) -> Box[T]` makes a
+        // `Box[Atomic]`
+        for (sp, g, inst) in st.uses_here.reverse() {
+            match cx.fns.get(g) {
+                Some(s) => {
+                    let made = st.subst.find_map(s.ret, |u| match st.repr(u) {
+                        TNamed(n, _) if env.own_type(cx, n) && !params_in(st, [], u).is_empty() && st.subst.refused(env.storing(), st.subst(inst, u)).is_some() => Some(st.subst(inst, u)),
+                        _ => None,
+                    })
+                    match made {
+                        Some(t) => {
+                            st.stored = [(sp, t)] + st.stored
+                        },
+                        None => {},
+                    }
+                },
+                None => {},
+            }
+        }
+        st = st.check_stored(cx)
         let mut ps: List[Str] = []
         for t in st.compared.reverse().map(|c| c.1) + st.eq_types.reverse() {
             ps = params_in(st, ps, t)

@@ -5463,7 +5463,26 @@ fn main(root: Root) {
   errs "shared-key" (main_wrap "    let m: Map[Atomic, Int] = map()") [ "E0113" ];
   errs "shared-dyn"
     "interface Named {\n    fn name(self) -> Str\n}\n\nstruct Box[T] {\n    v: T,\n}\n\nfn name(self: Box[Shared[Int]]) -> Str {\n    \"box\"\n}\n\nfn main() {\n    let b: dyn Named = Box { v: shared(1) }\n}\n"
-    [ "E0112" ];
+    [ "E0305"; "E0305"; "E0112" ];
+  (* a type argument of a struct or enum is what its fields hold: shared
+     state and functions are refused there as in a field, however deep, where
+     the type is made, written, or made by a generic function *)
+  let box = "struct Box[T] {\n    item: T,\n}\n\n" in
+  errs "stored-arg-atomic" (box ^ "fn main() {\n    let b = Box { item: atomic(0) }\n}\n") [ "E0305" ];
+  errs "stored-arg-closure" (box ^ "fn main(root: Root) {\n    let out = root.stdout\n    let b = Box { item: || out.print(\"hi\") }\n}\n") [ "E0304" ];
+  errs "stored-arg-signature" (box ^ "fn f(b: Box[List[Chan[Int]]]) -> Int {\n    0\n}\n\nfn main() {\n}\n") [ "E0305" ];
+  errs "stored-arg-variant" "enum Slot[T] {\n    Full(T),\n    Empty,\n}\n\nfn main() {\n    let s = Full(shared(1))\n}\n" [ "E0305" ];
+  errs "stored-arg-generic-result" (box ^ "fn wrap[T](x: T) -> Box[T] {\n    Box { item: x }\n}\n\nfn main() {\n    let b = wrap(atomic(1))\n    let ok = wrap(1)\n}\n") [ "E0305" ];
+  errs "stored-arg-values"
+    "fn main() {\n    let a = atomic(1)\n    let o = Some(a)\n    let r: Result[Chan[Int], Str] = Ok(channel(1))\n    let fs = [|| 1]\n    let t = (a, 1)\n}\n" [];
+  (* equality and interpolation look as deep *)
+  errs "eq-deep"
+    "fn main() {\n    let a = atomic(1)\n    let s = shared(1)\n    let fs = [|| 1]\n    let x = [a] == [a]\n    let y = Some(a) != Some(a)\n    let z = (s, 1) == (s, 1)\n    let w = fs == fs\n    assert_eq([s], [s])\n}\n"
+    [ "E0201"; "E0201"; "E0201"; "E0201"; "E0201" ];
+  says "eq-deep-note" "fn main() {\n    let a = atomic(1)\n    let x = [a] == [a]\n}\n" "E0201" "`List[Atomic]` holds `Atomic`, which cannot be compared";
+  errs "eq-deep-generic" "fn same[U](a: U, b: U) -> Bool {\n    a == b\n}\n\nfn main() {\n    let x = same([atomic(1)], [atomic(1)])\n}\n" [ "E0201" ];
+  errs "interp-deep" "fn main(root: Root) {\n    let a = atomic(1)\n    root.stdout.print(\"{Some(a)} {[channel(1)]}\")\n}\n" [ "E0201"; "E0201" ];
+  errs "interp-deep-prints" "fn main(root: Root) {\n    root.stdout.print(\"{[|| 1]} {[root.net]}\")\n}\n" [];
   errs "shared-types" (main_wrap "    let a: Atomic = atomic(\"x\")\n    let s: Shared[Int] = shared(\"x\")\n    let n: Str = a.add(1)") [ "E0201"; "E0201"; "E0201" ];
   par "group-until-stress" {|fn stuck(c: Chan[Int]) -> Int {
     c.recv() ?? -1
@@ -7646,6 +7665,26 @@ fn main(root: Root) {
     (codes ds = [ "E0320" ] && List.exists (fun n -> Interp_util.find_sub n "through `launder.Ctx.disk.Real`" 0 <> None) (List.hd ds).notes)
     (String.concat "; " (List.map (fun (d : Diag.t) -> d.code ^ " " ^ d.message ^ " " ^ String.concat " " d.notes) ds));
   ok "pkg-struct-granted" (codes (laundered "[package]\nname = \"app\"\n[dependencies]\nlaunder = { path = \"../launder\", caps = [\"stdout\", \"fs\"] }\n") = []) "granted";
+  (* nor through a channel, nor through the methods of a type parameter's
+     bound *)
+  (try Unix.mkdir (Filename.concat pdir "hide") 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+  put "hide/hide.lmn"
+    "pub interface Giver {\n    fn give(self) -> Stdout\n}\n\npub fn via_chan(c: Chan[Stdout]) {\n    match c.recv() {\n        Some(o) => o.print(\"chan\"),\n        None => (),\n    }\n}\n\npub fn via_iface[T: Giver](x: T) {\n    x.give().print(\"iface\")\n}\n";
+  let hidden toml =
+    put "app/limen.toml" toml;
+    let src = "use hide\n\nstruct G {\n    o: Stdout,\n}\n\nfn give(self: G) -> Stdout {\n    self.o\n}\n\nfn main(root: Root) {\n    let c = channel(1)\n    c.send(root.stdout)\n    hide.via_chan(c)\n    hide.via_iface(G { o: root.stdout })\n}\n" in
+    let path = Filename.concat pdir "app/hide_main.lmn" in
+    put "app/hide_main.lmn" src;
+    let _, ds, _ = Modules.load_and_check path src in
+    ds
+  in
+  let ds = hidden "[package]\nname = \"app\"\n[dependencies]\nhide = { path = \"../hide\" }\n" in
+  ok "pkg-chan-iface-hidden"
+    (codes ds = [ "E0320"; "E0320" ]
+     && List.exists (fun (d : Diag.t) -> List.exists (fun n -> Interp_util.find_sub n "`hide.via_chan` takes `Stdout`" 0 <> None) d.notes) ds
+     && List.exists (fun (d : Diag.t) -> List.exists (fun n -> Interp_util.find_sub n "through `hide.Giver.give`" 0 <> None) d.notes) ds)
+    (String.concat "; " (List.map (fun (d : Diag.t) -> d.code ^ " " ^ d.message ^ " " ^ String.concat " " d.notes) ds));
+  ok "pkg-chan-iface-granted" (codes (hidden "[package]\nname = \"app\"\n[dependencies]\nhide = { path = \"../hide\", caps = [\"stdout\"] }\n") = []) "granted";
   (* embed stays inside the package: the main program's (app/, where its
      limen.toml is) and each dependency's own directory *)
   put "app/data.txt" "app data";
@@ -9287,6 +9326,25 @@ fn main(root: Root) {
      (List.for_all (fun n -> text n = "pure itself, runs callbacks") [ "keeps"; "passes_bad"; "captures"; "returns"; "sends"; "tasks" ]
       && (find "printer").pure_if = [] && (find "double").pure_if = [])
      (String.concat "; " (List.map text [ "keeps"; "passes_bad"; "captures"; "returns"; "sends"; "tasks" ])));
+  (* channels, Atomics and Shareds: what they carry counts, and a function
+     taking one shares state, so it is not pure *)
+  (let _, ds, infos =
+     compile "caps-shared-state"
+       "fn take(c: Chan[Int]) -> Int {\n    c.recv() ?? -1\n}\n\nfn say(c: Chan[Stdout]) {\n    match c.recv() {\n        Some(o) => o.print(\"x\"),\n        None => (),\n    }\n}\n\nfn bump(t: (Atomic, Int)) -> Int {\n    t.0.add(t.1)\n}\n\nfn later(s: Shared[Int], f: fn(Int) -> Int) -> Int {\n    f(s.get())\n}\n\nfn net(c: Chan[Option[Net]]) {\n}\n\nfn main(root: Root) {\n}\n"
+   in
+   let find n = List.find (fun (i : Check.fn_info) -> i.name = n) infos in
+   let text n = Check.pure_text (find n) in
+   ok "caps-shared-state-checks" (ds = []) (String.concat " " (codes ds));
+   ok "caps-shared-state"
+     (text "take" = "shares state" && text "bump" = "shares state" && text "later" = "shares state, runs callbacks"
+      && (find "later").pure_if = [] && (find "say").caps = [ Types.Stdout ] && (find "net").caps = [ Types.Net ])
+     (String.concat "; " (List.map text [ "take"; "bump"; "later" ])));
+  (let _, ds, infos =
+     compile "caps-bound-methods"
+       "interface Giver {\n    fn give(self) -> Stdout\n}\n\nfn via[T: Giver](x: T) {\n    x.give().print(\"x\")\n}\n\nfn main(root: Root) {\n}\n"
+   in
+   let i = List.find (fun (i : Check.fn_info) -> i.name = "via") infos in
+   ok "caps-bound-methods" (ds = [] && i.caps = [ Types.Stdout ] && i.via = [ (Types.Stdout, "Giver.give") ]) (Check.cap_text i Types.Stdout));
   (let items, ds, _ = compile "pure-if-ir" cond_src in
    if ds <> [] then ok "pure-if-ir" false (String.concat " " (codes ds))
    else

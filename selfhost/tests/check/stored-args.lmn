@@ -1,0 +1,64 @@
+// Shared state and functions cannot hide in a generic struct or enum: a
+// type argument is what a field holds, so it is refused where the type is
+// made or written (E0305, E0304), however deep; Option, Result, lists and
+// tuples hold values. Equality and interpolation look as deep (E0201), and
+// a function taking a channel, Atomic or Shared is not pure.
+struct Box[T] {
+    item: T,
+}
+
+enum Either[A, B] {
+    Left(A),
+    Right(B),
+}
+
+fn wrap[T](x: T) -> Box[T] {
+    Box { item: x }
+}
+
+fn same[U](a: U, b: U) -> Bool {
+    a == b
+}
+
+fn bump(b: Box[Atomic]) -> Int {
+    b.item.add(1)
+}
+
+fn deep(b: Box[List[Chan[Int]]]) -> Int {
+    0
+}
+
+fn take(c: Chan[Int]) -> Int {
+    c.recv() ?? -1
+}
+
+fn say(c: Chan[Stdout]) {
+    match c.recv() {
+        Some(o) => o.print("said"),
+        None => (),
+    }
+}
+
+fn pair(t: (Atomic, Int)) -> Int {
+    t.0.add(t.1)
+}
+
+fn later(s: Shared[Int], f: fn(Int) -> Int) -> Int {
+    f(s.get())
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let a = atomic(1)
+    let b = Box { item: atomic(0) }
+    let c = Box { item: || out.print("hi") }
+    let d: Either[Int, Chan[Int]] = Left(1)
+    let e = wrap(atomic(2))
+    let fine = Some(a)
+    let fns = [|| 1]
+    out.print("{[a] == [a]} {Some(a) == Some(a)} {fine}")
+    out.print("{same([a], [a])} {fns == fns} {pair((a, 1))}")
+    let s = shared(1)
+    assert_eq([s], [s])
+    out.print("{[fns.len()]} {take(channel(1))} {later(s, |x| x)}")
+}

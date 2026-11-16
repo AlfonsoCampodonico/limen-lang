@@ -293,6 +293,7 @@ fn caps_of(cx: Ctx, file: Str) -> Int {
             }
         })
         let what = match (caps, i.callbacks, i.pure_if) {
+            ([], cb, _) if i.shares => if cb { "shares state, runs callbacks" } else { "shares state" },
             ([], false, _) => "pure",
             ([], true, []) => "pure itself, runs callbacks",
             ([], true, [f]) => "pure if {f} is",
