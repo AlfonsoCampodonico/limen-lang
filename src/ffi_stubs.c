@@ -613,3 +613,132 @@ value limen_os_random(value buf) {
 #endif
   return Val_bool(got == n);
 }
+
+/* Fs for the interpreter: the same walk through directory descriptors as
+   the native runtime (w_fs_at and the functions after it in
+   limen_sandbox.h), so both backends reach the same files and say the same
+   things. `top` is the granted directory, `root` the capability's.
+   limen_fs_op : int -> string -> string -> string -> string -> int * string
+   op: 0 read, 1 write, 2 append, 3 list (names separated by NUL bytes),
+   4 remove, 5 make_dir, 6 rename (a to b), 7 full_path, 8 under (kind 0
+   and the new root, or kind 1: not inside). b is the data for write and
+   append. The int is 0 for Ok (the string is the result), 1 for Denied and
+   2 for Failed (the string is the message). */
+#include <dirent.h>
+static value limen_fs_pair(int kind, const char *s, size_t n) {
+  CAMLparam0();
+  CAMLlocal2(r, str);
+  str = caml_alloc_initialized_string(n, s);
+  r = caml_alloc_tuple(2);
+  Store_field(r, 0, Val_int(kind));
+  Store_field(r, 1, str);
+  CAMLreturn(r);
+}
+value limen_fs_op(value op, value top, value root, value a, value b) {
+  CAMLparam5(op, top, root, a, b);
+  CAMLlocal1(r);
+  const char *t = String_val(top), *ro = String_val(root);
+  const char *ap = String_val(a);
+  size_t an = caml_string_length(a);
+  WFsErr e;
+  e.kind = 2; e.msg[0] = 0;
+  switch (Int_val(op)) {
+    case 0: {
+      int fd = w_fs_open(t, ro, ap, an, W_FS_READ, &e);
+      if (fd < 0) break;
+      size_t cap = 65536, n = 0;
+      char *buf = (char *)w_sb_alloc(cap);
+      for (;;) {
+        if (n == cap) { cap *= 2; buf = (char *)realloc(buf, cap); if (!buf) w_sb_oom(); }
+        ssize_t k = read(fd, buf + n, cap - n);
+        if (k < 0 && errno == EINTR) continue;
+        if (k <= 0) break;
+        n += (size_t)k;
+      }
+      close(fd);
+      r = limen_fs_pair(0, buf, n);
+      free(buf);
+      CAMLreturn(r);
+    }
+    case 1: case 2: {
+      int fd = w_fs_open(t, ro, ap, an, Int_val(op) == 1 ? W_FS_WRITE : W_FS_APPEND, &e);
+      if (fd < 0) break;
+      /* the data is copied: the OCaml string may move while write waits */
+      size_t n = caml_string_length(b);
+      char *d = (char *)w_sb_alloc(n);
+      memcpy(d, String_val(b), n);
+      int err = w_fs_write_all(fd, d, n);
+      free(d);
+      close(fd);
+      if (err) { e.kind = 2; snprintf(e.msg, sizeof e.msg, "fs: `%.*s`: %s", (int)an, ap, strerror(err)); break; }
+      CAMLreturn(limen_fs_pair(0, "", 0));
+    }
+    case 3: {
+      DIR *d = w_fs_opendir(t, ro, ap, an, &e);
+      if (!d) break;
+      size_t cap = 256, n = 0;
+      char *buf = (char *)w_sb_alloc(cap);
+      struct dirent *de;
+      while ((de = readdir(d))) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+        size_t l = strlen(de->d_name);
+        while (n + l + 1 > cap) { cap *= 2; buf = (char *)realloc(buf, cap); if (!buf) w_sb_oom(); }
+        memcpy(buf + n, de->d_name, l + 1);
+        n += l + 1;
+      }
+      closedir(d);
+      r = limen_fs_pair(0, buf, n);
+      free(buf);
+      CAMLreturn(r);
+    }
+    case 4: if (w_fs_remove(t, ro, ap, an, &e) == 0) CAMLreturn(limen_fs_pair(0, "", 0)); break;
+    case 5: if (w_fs_mkdir(t, ro, ap, an, &e) == 0) CAMLreturn(limen_fs_pair(0, "", 0)); break;
+    case 6:
+      if (w_fs_rename(t, ro, ap, an, String_val(b), caml_string_length(b), &e) == 0) CAMLreturn(limen_fs_pair(0, "", 0));
+      break;
+    case 7: {
+      char *p = w_fs_full_path(t, ro, ap, an, &e);
+      if (!p) break;
+      r = limen_fs_pair(0, p, strlen(p));
+      free(p);
+      CAMLreturn(r);
+    }
+    case 8: {
+      char *p = w_fs_under(t, ro, ap, an);
+      if (!p) CAMLreturn(limen_fs_pair(1, "", 0));
+      r = limen_fs_pair(0, p, strlen(p));
+      free(p);
+      CAMLreturn(r);
+    }
+  }
+  CAMLreturn(limen_fs_pair(e.kind, e.msg, strlen(e.msg)));
+}
+
+/* What a path names, following links, as Fs.info, exists and is_dir see it.
+   limen_fs_stat : string -> string -> string -> int * string * int * int * bool * bool
+   (kind and message as limen_fs_op, size, modification time in
+   milliseconds, is a file, is a directory) */
+value limen_fs_stat(value top, value root, value rel) {
+  CAMLparam3(top, root, rel);
+  CAMLlocal2(r, m);
+  WFsErr e;
+  struct stat st;
+  int rc = w_fs_stat(String_val(top), String_val(root), String_val(rel), caml_string_length(rel), &st, &e);
+  r = caml_alloc_tuple(6);
+  if (rc != 0) {
+    m = caml_copy_string(e.msg);
+    Store_field(r, 0, Val_int(e.kind)); Store_field(r, 1, m);
+    Store_field(r, 2, Val_long(0)); Store_field(r, 3, Val_long(0)); Store_field(r, 4, Val_false); Store_field(r, 5, Val_false);
+    CAMLreturn(r);
+  }
+#ifdef __APPLE__
+  int64_t ms = (int64_t)st.st_mtimespec.tv_sec * 1000 + st.st_mtimespec.tv_nsec / 1000000;
+#else
+  int64_t ms = (int64_t)st.st_mtim.tv_sec * 1000 + st.st_mtim.tv_nsec / 1000000;
+#endif
+  m = caml_copy_string("");
+  Store_field(r, 0, Val_int(0)); Store_field(r, 1, m);
+  Store_field(r, 2, Val_long((intnat)st.st_size)); Store_field(r, 3, Val_long((intnat)ms));
+  Store_field(r, 4, Val_bool(S_ISREG(st.st_mode))); Store_field(r, 5, Val_bool(S_ISDIR(st.st_mode)));
+  CAMLreturn(r);
+}

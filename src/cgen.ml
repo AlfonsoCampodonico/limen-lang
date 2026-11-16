@@ -1598,11 +1598,16 @@ let rec type_defs c (out : Buffer.t) =
           p "}"
         end;
         p (sprintf "static void %s_drop(%s v) {" n ct);
-        if boxed then p "  if (!w_rc_dec(&v->rc)) return;";
-        p (sprintf "  switch (v%stag) {" acc);
-        cases (fun _ k i pt -> if not (is_scalar pt) then p (sprintf "      %s_drop(v%su.v%d.f%d);" (cname c pt) acc k i));
-        p "  }";
-        if boxed then p "  w_free(v);";
+        if boxed then begin
+          (* through w_release, which frees a long chain without recursing *)
+          p "  if (!w_rc_dec(&v->rc)) return;";
+          p "  w_release(v);"
+        end
+        else begin
+          p (sprintf "  switch (v%stag) {" acc);
+          cases (fun _ k i pt -> if not (is_scalar pt) then p (sprintf "      %s_drop(v%su.v%d.f%d);" (cname c pt) acc k i));
+          p "  }"
+        end;
         p "}";
         p (sprintf "static void %s_share(%s v) {" n ct);
         if boxed then p "  if (!w_rc_share(&v->rc)) return;";

@@ -2542,23 +2542,23 @@ fn value_fns(self: Cg, t: types.Ty) -> (List[Str], Cg) {
             }
             out.push("static void {n}_drop({ct} v) \{")
             if boxed {
+                // through w_release, which frees a long chain without recursing
                 out.push("  if (!w_rc_dec(&v->rc)) return;")
-            }
-            out.push("  switch (v{acc}tag) \{")
-            for (k, v) in vs.with_index() {
-                out.push("    case {k}: \{")
-                for (i, pt) in v.1.with_index() {
-                    if !is_scalar(pt) {
-                        let (pn, c2) = c.cname(pt)
-                        c = c2
-                        out.push("      {pn}_drop(v{acc}u.v{k}.f{i});")
+                out.push("  w_release(v);")
+            } else {
+                out.push("  switch (v{acc}tag) \{")
+                for (k, v) in vs.with_index() {
+                    out.push("    case {k}: \{")
+                    for (i, pt) in v.1.with_index() {
+                        if !is_scalar(pt) {
+                            let (pn, c2) = c.cname(pt)
+                            c = c2
+                            out.push("      {pn}_drop(v{acc}u.v{k}.f{i});")
+                        }
                     }
+                    out.push("      break; }")
                 }
-                out.push("      break; }")
-            }
-            out.push("  }")
-            if boxed {
-                out.push("  w_free(v);")
+                out.push("  }")
             }
             out.push("}")
             out.push("static void {n}_share({ct} v) \{")

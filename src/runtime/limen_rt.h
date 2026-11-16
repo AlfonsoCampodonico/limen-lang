@@ -95,6 +95,37 @@ static void w_free(void *p) {
   __atomic_fetch_sub(&w_live, 1, __ATOMIC_RELAXED);
   free(h);
 }
+/* Free an object whose count has reached zero: drop what it refers to
+   (its kids function), then free it, by kind. Dropping a child that dies
+   too does not recurse: the child is queued and the outermost call frees
+   the queue, so a list of a million `Option[Node]`s, or a list of lists as
+   deep, is freed with constant stack. Dropping never waits, so the queue
+   can be the thread's. */
+typedef struct { int64_t rc, len, cap; void *data; } WListAny;
+typedef struct { int64_t rc, len, n, cap, icap; void *keys, *vals, *live, *idx; } WMapAny;
+static __thread WHdr *w_rel_queue;
+static __thread int w_rel_busy;
+static void w_release(void *o) {
+  WHdr *h = (WHdr *)o - 1;
+  w_hdr_unlink(h);
+  h->next = w_rel_queue;
+  w_rel_queue = h;
+  if (w_rel_busy) return;
+  w_rel_busy = 1;
+  while ((h = w_rel_queue)) {
+    w_rel_queue = h->next;
+    h->next = NULL;
+    void *p = h + 1;
+    if (h->kids) h->kids(p);
+    if (h->kind == WK_LIST) w_free(((WListAny *)p)->data);
+    else if (h->kind == WK_MAP) {
+      WMapAny *m = (WMapAny *)p;
+      w_free(m->keys); w_free(m->vals); w_free(m->live); w_free(m->idx);
+    }
+    w_free(p);
+  }
+  w_rel_busy = 0;
+}
 /* Start a boundary's list; its parent is the current innermost boundary. */
 static void w_catch_init(WCatch *c) {
   c->msg = NULL; c->where = NULL; c->unwinding = 0; c->cancel = 0;
@@ -169,6 +200,8 @@ static void *w_realloc(void *p, size_t n) {
   if (!q) w_oom();
   return q;
 }
+static char *w_strdup(const char *c) { char *p = strdup(c); if (!p) w_oom(); return p; }
+static char *w_strndup(const char *c, size_t n) { char *p = strndup(c, n); if (!p) w_oom(); return p; }
 static void w_leakcheck(void) {
   if (getenv("LIMEN_LEAKCHECK")) fprintf(stderr, "limen-leakcheck: %lld live\n", (long long)__atomic_load_n(&w_live, __ATOMIC_ACQUIRE));
 }
@@ -219,8 +252,8 @@ __attribute__((noreturn)) static void w_panic_c(const char *msg, const char *whe
   WCatch **slot = w_catch_slot();
   if (slot && *slot) {
     WCatch *c = *slot;
-    c->msg = strdup(msg);
-    c->where = strdup(where);
+    c->msg = w_strdup(msg);
+    c->where = w_strdup(where);
     w_unwind_to(slot, c);
   }
   w_fatal_c(msg, where);
@@ -399,12 +432,7 @@ static inline int64_t w_idx(int64_t i, int64_t n, const char *where) {
     return l;                                                                                 \
   }                                                                                           \
   static inline L *L##_dup(L *l) { w_rc_inc(&l->rc); return l; }                              \
-  static void L##_drop(L *l) {                                                                \
-    if (w_rc_dec(&l->rc)) {                                                                   \
-      for (int64_t i = 0; i < l->len; i++) P##_drop(l->data[i]);                              \
-      w_free(l->data); w_free(l);                                                             \
-    }                                                                                         \
-  }                                                                                           \
+  static void L##_drop(L *l) { if (w_rc_dec(&l->rc)) w_release(l); }                         \
   __attribute__((noinline, cold)) static void L##_copy(L **p) {                              \
     L *l = *p;                                                                                \
     L *c = L##_new(l->len);                                                                   \
@@ -575,12 +603,7 @@ __attribute__((noreturn)) static void w_panic_key(WBuf *key, const char *where) 
     return m;                                                                                 \
   }                                                                                           \
   static inline M *M##_dup(M *m) { w_rc_inc(&m->rc); return m; }                              \
-  static void M##_drop(M *m) {                                                                \
-    if (w_rc_dec(&m->rc)) {                                                                   \
-      for (int64_t i = 0; i < m->n; i++) if (m->live[i]) { KN##_drop(m->keys[i]); VN##_drop(m->vals[i]); } \
-      w_free(m->keys); w_free(m->vals); w_free(m->live); w_free(m->idx); w_free(m);           \
-    }                                                                                         \
-  }                                                                                           \
+  static void M##_drop(M *m) { if (w_rc_dec(&m->rc)) w_release(m); }                         \
   static void M##_share(M *m) {                                                               \
     if (w_rc_share(&m->rc))                                                                   \
       for (int64_t i = 0; i < m->n; i++) if (m->live[i]) { KN##_share(m->keys[i]); VN##_share(m->vals[i]); } \
@@ -889,7 +912,7 @@ static WStr *Float_to_fixed(double x, int64_t d) {
   if (d > 30) d = 30;
   int n = snprintf(NULL, 0, "%.*f", (int)d, x);
   WStr *s = Str_new(n);
-  char *b = (char *)malloc((size_t)n + 1);
+  char *b = (char *)w_raw((size_t)n + 1);
   snprintf(b, (size_t)n + 1, "%.*f", (int)d, x);
   memcpy(s->data, b, (size_t)n);
   free(b);
@@ -923,7 +946,12 @@ static bool Str_parse_float(WStr *s, double *out) {
 typedef struct WClo WClo;
 struct WClo { int64_t rc; void *fn; void (*drop)(WClo *); void (*share)(WClo *); };
 static inline WClo *Clo_dup(WClo *c) { w_rc_inc(&c->rc); return c; }
-static void Clo_drop(WClo *c) { if (w_rc_dec(&c->rc)) { if (c->drop) c->drop(c); w_free(c); } }
+static void Clo_drop(WClo *c) {
+  if (!w_rc_dec(&c->rc)) return;
+  if (((WHdr *)c - 1)->kids == (void (*)(void *))c->drop) { w_release(c); return; }  /* captures that hold closures */
+  if (c->drop) c->drop(c);
+  w_free(c);
+}
 static void Clo_share(WClo *c) { if (w_rc_share(&c->rc) && c->share) c->share(c); }
 static inline bool Clo_eq(WClo *a, WClo *b) { return a == b; }
 static void Clo_show(WBuf *b, WClo *c, bool top) { (void)c; (void)top; buf_puts(b, "<fn>"); }
@@ -1024,9 +1052,9 @@ static void w_rv_inherit(WCap *to, WCap *from) {
 static WCap *Cap_copy_kind(WCap *x) {
   WCap *c = cap_new(x->kind);
   c->hosts = (char **)w_raw(sizeof(char *) * (size_t)(x->nhosts + 1));
-  for (int i = 0; i < x->nhosts; i++) c->hosts[i] = strdup(x->hosts[i]);
+  for (int i = 0; i < x->nhosts; i++) c->hosts[i] = w_strdup(x->hosts[i]);
   c->nhosts = x->nhosts;
-  c->root = x->root ? strdup(x->root) : NULL;
+  c->root = x->root ? w_strdup(x->root) : NULL;
   c->ro = x->ro;
   return c;
 }
@@ -1069,11 +1097,11 @@ static bool g_rand_seeded;
    an empty prefix, or prefixes for `*`. */
 static char *w_exec_entry(const char *g) {
   const char *sp = strchr(g, ' ');
-  if (!sp) return strdup(g);
+  if (!sp) return w_strdup(g);
   size_t pn = (size_t)(sp - g);
   if (pn == 0 || (pn == 1 && g[0] == '*')) return NULL;
   size_t n = strlen(g);
-  char *e = (char *)malloc(n + 2);
+  char *e = (char *)w_raw(n + 2);
   memcpy(e, g, pn);
   size_t o = pn;
   const char *p = sp + 1;
@@ -1118,9 +1146,9 @@ static void w_init(int argc, char **argv) {
     const char *g = argv[++i];
     if (strncmp(g, "net=", 4) == 0) {
       g_hosts = (char **)w_realloc(g_hosts, sizeof(char *) * (size_t)(g_nhosts + 1));
-      g_hosts[g_nhosts++] = strdup(g + 4);
+      g_hosts[g_nhosts++] = w_strdup(g + 4);
     } else if (strncmp(g, "fs=", 3) == 0) {
-      char *v = strdup(g + 3);
+      char *v = w_strdup(g + 3);
       size_t n = strlen(v);
       if (n > 3 && strcmp(v + n - 3, ":ro") == 0) { v[n - 3] = 0; g_fs_ro = true; }
       char *r = realpath(v, NULL);
@@ -1130,7 +1158,7 @@ static void w_init(int argc, char **argv) {
       g_fs_root = r;
     } else if (strncmp(g, "env=", 4) == 0) {
       g_env = (char **)w_realloc(g_env, sizeof(char *) * (size_t)(g_nenv + 1));
-      g_env[g_nenv++] = strdup(g + 4);
+      g_env[g_nenv++] = w_strdup(g + 4);
     } else if (strncmp(g, "exec=", 5) == 0) {
       g_exec = (char **)w_realloc(g_exec, sizeof(char *) * (size_t)(g_nexec + 1));
       g_exec[g_nexec] = w_exec_entry(g + 5);
@@ -1142,13 +1170,13 @@ static void w_init(int argc, char **argv) {
         size_t n = comma ? (size_t)(comma - p) : strlen(p);
         if (n == 0) w_usage("foreign grant: name C libraries, as in foreign=z or foreign=z,sqlite3");
         g_foreign = (char **)w_realloc(g_foreign, sizeof(char *) * (size_t)(g_nforeign + 1));
-        g_foreign[g_nforeign++] = strndup(p, n);
+        g_foreign[g_nforeign++] = w_strndup(p, n);
         if (!comma) break;
         p = comma + 1;
       }
     } else if (strncmp(g, "listen=", 7) == 0) {
       g_listen = (char **)w_realloc(g_listen, sizeof(char *) * (size_t)(g_nlisten + 1));
-      g_listen[g_nlisten++] = strdup(g + 7);
+      g_listen[g_nlisten++] = w_strdup(g + 7);
     } else w_usage("unknown grant");
   }
   /* restrict the whole process to the grants (limen_sandbox.h), before any
@@ -1177,13 +1205,13 @@ static WCap *Cap_root_field(WCap *root, const char *f) {
   if (strcmp(f, "net") == 0) {
     WCap *c = cap_new(CAP_NET);
     c->hosts = (char **)w_raw(sizeof(char *) * (size_t)(g_nhosts + 1));
-    for (int i = 0; i < g_nhosts; i++) c->hosts[i] = strdup(g_hosts[i]);
+    for (int i = 0; i < g_nhosts; i++) c->hosts[i] = w_strdup(g_hosts[i]);
     c->nhosts = g_nhosts;
     return c;
   }
   if (strcmp(f, "fs") == 0) {
     WCap *c = cap_new(CAP_FS);
-    c->root = g_fs_root ? strdup(g_fs_root) : NULL;
+    c->root = g_fs_root ? w_strdup(g_fs_root) : NULL;
     c->ro = g_fs_root ? g_fs_ro : true;
     return c;
   }
@@ -1192,21 +1220,21 @@ static WCap *Cap_root_field(WCap *root, const char *f) {
   if (strcmp(f, "listen") == 0) {
     WCap *c = cap_new(CAP_LISTEN);
     c->hosts = (char **)w_raw(sizeof(char *) * (size_t)(g_nlisten + 1));
-    for (int i = 0; i < g_nlisten; i++) c->hosts[i] = strdup(g_listen[i]);
+    for (int i = 0; i < g_nlisten; i++) c->hosts[i] = w_strdup(g_listen[i]);
     c->nhosts = g_nlisten;
     return c;
   }
   if (strcmp(f, "exec") == 0) {
     WCap *c = cap_new(CAP_EXEC);
     c->hosts = (char **)w_raw(sizeof(char *) * (size_t)(g_nexec + 1));
-    for (int i = 0; i < g_nexec; i++) c->hosts[i] = strdup(g_exec[i]);
+    for (int i = 0; i < g_nexec; i++) c->hosts[i] = w_strdup(g_exec[i]);
     c->nhosts = g_nexec;
     return c;
   }
   if (strcmp(f, "foreign") == 0) {
     WCap *c = cap_new(CAP_FOREIGN);
     c->hosts = (char **)w_raw(sizeof(char *) * (size_t)(g_nforeign + 1));
-    for (int i = 0; i < g_nforeign; i++) c->hosts[i] = strdup(g_foreign[i]);
+    for (int i = 0; i < g_nforeign; i++) c->hosts[i] = w_strdup(g_foreign[i]);
     c->nhosts = g_nforeign;
     return c;
   }
@@ -1215,7 +1243,7 @@ static WCap *Cap_root_field(WCap *root, const char *f) {
   if (strcmp(f, "env") == 0) {
     WCap *c = cap_new(CAP_ENV);
     c->hosts = (char **)w_raw(sizeof(char *) * (size_t)(g_nenv + 1));
-    for (int i = 0; i < g_nenv; i++) c->hosts[i] = strdup(g_env[i]);
+    for (int i = 0; i < g_nenv; i++) c->hosts[i] = w_strdup(g_env[i]);
     c->nhosts = g_nenv;
     return c;
   }
@@ -1316,7 +1344,7 @@ static L_Str *Cap_args(void) {
   return out;
 }
 static WStr *Cap_env_get(WCap *env, WStr *name, bool *ok) {
-  char *n = strndup(name->data, (size_t)name->len);
+  char *n = w_strndup(name->data, (size_t)name->len);
   bool allowed = false;
   for (int i = 0; i < env->nhosts; i++) if (strcmp(env->hosts[i], "*") == 0 || strcmp(env->hosts[i], n) == 0) allowed = true;
   if (w_revoked(env)) allowed = false;
@@ -1355,7 +1383,7 @@ static bool net_permits(WCap *n, const char *host, int port) {
   return false;
 }
 static WCap *Cap_net_only(WCap *n, WStr *req_s) {
-  char *req = strndup(req_s->data, (size_t)req_s->len);
+  char *req = w_strndup(req_s->data, (size_t)req_s->len);
   bool covered = false;
   if (strcmp(req, "*") == 0) {
     for (int i = 0; i < n->nhosts; i++) if (strcmp(n->hosts[i], "*") == 0) covered = true;
@@ -1441,164 +1469,82 @@ static WStr *read_fd(int fd) {
   return buf_take(&b);
 }
 
-/* Normalise `rel` under `root`; returns malloc'd path or NULL with err set. */
-static char *fs_normalize(const char *root, const char *rel, const char **err) {
-  if (rel[0] == '/') { *err = "absolute paths are not allowed; paths are relative to the granted directory"; return NULL; }
-  char **parts = (char **)w_raw(sizeof(char *) * (strlen(rel) + 1));
-  int np = 0;
-  char *copy = strdup(rel), *save = NULL;
-  for (char *p = strtok_r(copy, "/", &save); p; p = strtok_r(NULL, "/", &save)) {
-    if (strcmp(p, ".") == 0) continue;
-    if (strcmp(p, "..") == 0) {
-      if (np == 0) { free(copy); free(parts); *err = "path escapes the granted directory"; return NULL; }
-      np--; continue;
-    }
-    parts[np++] = p;
-  }
-  WBuf b; buf_init(&b);
-  buf_puts(&b, root);
-  for (int i = 0; i < np; i++) { buf_puts(&b, "/"); buf_puts(&b, parts[i]); }
-  buf_putn(&b, "", 1);
-  free(copy); free(parts);
-  return b.p;
-}
-static bool fs_inside(const char *root, const char *p) {
-  size_t n = strlen(root);
-  if (strcmp(root, "/") == 0) return p[0] == '/';
-  return strncmp(root, p, n) == 0 && (p[n] == 0 || p[n] == '/');
-}
-static char *dirname_of(const char *p) {
-  char *d = strdup(p);
-  char *s = strrchr(d, '/');
-  if (s && s != d) *s = 0; else if (s) s[1] = 0;
-  return d;
-}
-/* Resolve; on error returns NULL and fills kind/msg. */
-static char *fs_resolve(WCap *fs, WStr *rel_s, bool for_write, int *kind, char *msg, size_t mn) {
-  if (!fs->root) { *kind = 1; snprintf(msg, mn, "fs: not granted (run with --grant fs=DIR)"); return NULL; }
-  char *rel = strndup(rel_s->data, (size_t)rel_s->len);
-  const char *err = NULL;
-  char *p = fs_normalize(fs->root, rel, &err);
-  if (!p) { *kind = 1; snprintf(msg, mn, "fs: %s", err); free(rel); return NULL; }
-  struct stat st;
-  bool exists = stat(p, &st) == 0 || lstat(p, &st) == 0;
-  char *target = (for_write && !exists) ? dirname_of(p) : strdup(p);
-  char *real = realpath(target, NULL);
-  free(target);
-  if (real && fs_inside(fs->root, real)) { free(real); free(rel); return p; }
-  if (real) { *kind = 1; snprintf(msg, mn, "fs: path resolves outside the granted directory"); }
-  else if (for_write) { *kind = 2; snprintf(msg, mn, "fs: directory of `%s` does not exist", rel); }
-  else { *kind = 2; snprintf(msg, mn, "fs: `%s` does not exist", rel); }
-  free(real); free(p); free(rel);
-  return NULL;
-}
-static WCap *Cap_fs_under(WCap *fs, WStr *rel_s) {
+/* Fs: every operation walks its path with the functions in
+   limen_sandbox.h (w_fs_at and the ones after it), which the interpreter
+   uses too, from the granted directory g_fs_root down to the capability's
+   root and on to the file, through directory descriptors. */
+#define W_FS_NOT_GRANTED "fs: not granted (run with --grant fs=DIR)"
+#define W_FS_TOP (g_fs_root ? g_fs_root : "/")
+static WIo w_fs_fail(WFsErr *e) { return io_err(e->kind, e->msg); }
+static WCap *Cap_fs_under(WCap *fs, WStr *rel) {
   WCap *c = cap_new(CAP_FS);
   w_rv_inherit(c, fs);
   c->ro = fs->ro;
   if (!fs->root) return c;
-  char *rel = strndup(rel_s->data, (size_t)rel_s->len);
-  const char *err = NULL;
-  char *p = fs_normalize(fs->root, rel, &err);
-  free(rel);
-  if (!p) return c;
-  char *real = realpath(p, NULL);
-  if (real) { if (fs_inside(fs->root, real)) c->root = real; else free(real); free(p); }
-  else c->root = p;
+  c->root = w_fs_under(W_FS_TOP, fs->root, rel->data, (size_t)rel->len);
   return c;
 }
 static WCap *Cap_fs_read_only(WCap *fs) {
   WCap *c = cap_new(CAP_FS);
   w_rv_inherit(c, fs);
-  c->root = fs->root ? strdup(fs->root) : NULL;
+  c->root = fs->root ? w_strdup(fs->root) : NULL;
   c->ro = true;
   return c;
 }
 static bool Cap_fs_is_read_only(WCap *fs) { return fs->ro || w_revoked(fs); }
 static WIo Cap_fs_read(WCap *fs, WStr *rel) {
   if (w_revoked(fs)) return io_err(1, "fs: revoked");
-  int kind; char msg[1024];
-  char *p = fs_resolve(fs, rel, false, &kind, msg, sizeof msg);
-  if (!p) return io_err(kind, msg);
-  FILE *f = fopen(p, "rb");
-  if (!f) { snprintf(msg, sizeof msg, "%s: %s", p, strerror(errno)); free(p); return io_err(2, msg); }
-  WStr *s = read_fd(fileno(f));
-  fclose(f); free(p);
+  if (!fs->root) return io_err(1, W_FS_NOT_GRANTED);
+  WFsErr e;
+  int fd = w_fs_open(W_FS_TOP, fs->root, rel->data, (size_t)rel->len, W_FS_READ, &e);
+  if (fd < 0) return w_fs_fail(&e);
+  WStr *s = read_fd(fd);
+  close(fd);
   return io_ok(s);
 }
-static WIo Cap_fs_write(WCap *fs, WStr *rel, WStr *data) {
+static WIo w_fs_put(WCap *fs, WStr *rel, WStr *data, int mode) {
   if (w_revoked(fs)) return io_err(1, "fs: revoked");
   if (fs->root && fs->ro) return io_err(1, "fs: this capability is read-only");
-  int kind; char msg[1024];
-  char *p = fs_resolve(fs, rel, true, &kind, msg, sizeof msg);
-  if (!p) return io_err(kind, msg);
-  FILE *f = fopen(p, "wb");
-  if (!f) { snprintf(msg, sizeof msg, "%s: %s", p, strerror(errno)); free(p); return io_err(2, msg); }
-  fwrite(data->data, 1, (size_t)data->len, f);
-  fclose(f); free(p);
+  if (!fs->root) return io_err(1, W_FS_NOT_GRANTED);
+  WFsErr e;
+  int fd = w_fs_open(W_FS_TOP, fs->root, rel->data, (size_t)rel->len, mode, &e);
+  if (fd < 0) return w_fs_fail(&e);
+  int err = w_fs_write_all(fd, data->data, (size_t)data->len);
+  close(fd);
+  if (err) { char msg[1300]; snprintf(msg, sizeof msg, "fs: `%.*s`: %s", (int)rel->len, rel->data, strerror(err)); return io_err(2, msg); }
   return io_ok(NULL);
 }
+static WIo Cap_fs_write(WCap *fs, WStr *rel, WStr *data) { return w_fs_put(fs, rel, data, W_FS_WRITE); }
+static WIo Cap_fs_append(WCap *fs, WStr *rel, WStr *data) { return w_fs_put(fs, rel, data, W_FS_APPEND); }
 /* The absolute path of `rel`, checked as for writing: for handing to C. */
 static WIo Cap_fs_full_path(WCap *fs, WStr *rel) {
   if (w_revoked(fs)) return io_err(1, "fs: revoked");
-  if (memchr(rel->data, 0, (size_t)rel->len)) return io_err(2, "fs: the path contains a NUL byte");
-  int kind; char msg[1024];
-  char *p = fs_resolve(fs, rel, true, &kind, msg, sizeof msg);
-  if (!p) return io_err(kind, msg);
-  /* the real directory (checked inside the root just now) and the last
-     name, so no symlinked directory on the way can be swapped later */
-  if (strcmp(p, fs->root) != 0) {
-    char *dir = dirname_of(p);
-    char *rd = realpath(dir, NULL);
-    const char *base = strrchr(p, '/') + 1;
-    free(dir);
-    if (!rd || !fs_inside(fs->root, rd)) { free(rd); free(p); return io_err(1, "fs: path resolves outside the granted directory"); }
-    char *q = (char *)w_raw(strlen(rd) + strlen(base) + 2);
-    sprintf(q, "%s%s%s", rd, strcmp(rd, "/") == 0 ? "" : "/", base);
-    free(rd); free(p);
-    p = q;
-  }
+  if (!fs->root) return io_err(1, W_FS_NOT_GRANTED);
+  WFsErr e;
+  char *p = w_fs_full_path(W_FS_TOP, fs->root, rel->data, (size_t)rel->len, &e);
+  if (!p) return w_fs_fail(&e);
   WStr *s = Str_from(p, (int64_t)strlen(p));
   free(p);
   return io_ok(s);
 }
 static bool Cap_fs_exists(WCap *fs, WStr *rel) {
-  if (w_revoked(fs)) return false;
-  int kind; char msg[1024];
-  char *p = fs_resolve(fs, rel, false, &kind, msg, sizeof msg);
-  if (!p) return false;
-  struct stat st;
-  bool e = stat(p, &st) == 0;
-  free(p);
-  return e;
-}
-static WIo Cap_fs_append(WCap *fs, WStr *rel, WStr *data) {
-  if (w_revoked(fs)) return io_err(1, "fs: revoked");
-  if (fs->root && fs->ro) return io_err(1, "fs: this capability is read-only");
-  int kind; char msg[1024];
-  char *p = fs_resolve(fs, rel, true, &kind, msg, sizeof msg);
-  if (!p) return io_err(kind, msg);
-  FILE *f = fopen(p, "ab");
-  if (!f) { snprintf(msg, sizeof msg, "%s: %s", p, strerror(errno)); free(p); return io_err(2, msg); }
-  fwrite(data->data, 1, (size_t)data->len, f);
-  fclose(f); free(p);
-  return io_ok(NULL);
+  if (w_revoked(fs) || !fs->root) return false;
+  WFsErr e; struct stat st;
+  return w_fs_stat(W_FS_TOP, fs->root, rel->data, (size_t)rel->len, &st, &e) == 0;
 }
 static int w_cmp_cstr(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
 static WIo Cap_fs_list(WCap *fs, WStr *rel) {
   if (w_revoked(fs)) return io_err(1, "fs: revoked");
-  int kind; char msg[1024];
-  char *p = fs_resolve(fs, rel, false, &kind, msg, sizeof msg);
-  if (!p) return io_err(kind, msg);
-  DIR *d = opendir(p);
-  free(p);
-  if (!d) { snprintf(msg, sizeof msg, "fs: `%.*s` is not a directory", (int)rel->len, rel->data); return io_err(2, msg); }
+  if (!fs->root) return io_err(1, W_FS_NOT_GRANTED);
+  WFsErr e;
+  DIR *d = w_fs_opendir(W_FS_TOP, fs->root, rel->data, (size_t)rel->len, &e);
+  if (!d) return w_fs_fail(&e);
   char **names = NULL; int n = 0;
-  struct dirent *e;
-  while ((e = readdir(d))) {
-    if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+  struct dirent *de;
+  while ((de = readdir(d))) {
+    if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
     names = (char **)w_realloc(names, sizeof(char *) * (size_t)(n + 1));
-    names[n++] = strdup(e->d_name);
+    names[n++] = w_strdup(de->d_name);
   }
   closedir(d);
   if (n > 1) qsort(names, (size_t)n, sizeof(char *), w_cmp_cstr); /* never qsort(NULL, 0): glibc marks it nonnull */
@@ -1608,37 +1554,24 @@ static WIo Cap_fs_list(WCap *fs, WStr *rel) {
   return io_ok_ptr(out);
 }
 static bool Cap_fs_is_dir(WCap *fs, WStr *rel) {
-  if (w_revoked(fs)) return false;
-  int kind; char msg[1024];
-  char *p = fs_resolve(fs, rel, false, &kind, msg, sizeof msg);
-  if (!p) return false;
-  struct stat st;
-  bool r = stat(p, &st) == 0 && S_ISDIR(st.st_mode);
-  free(p);
-  return r;
+  if (w_revoked(fs) || !fs->root) return false;
+  WFsErr e; struct stat st;
+  return w_fs_stat(W_FS_TOP, fs->root, rel->data, (size_t)rel->len, &st, &e) == 0 && S_ISDIR(st.st_mode);
 }
 static WIo Cap_fs_remove(WCap *fs, WStr *rel) {
   if (w_revoked(fs)) return io_err(1, "fs: revoked");
   if (fs->root && fs->ro) return io_err(1, "fs: this capability is read-only");
-  int kind; char msg[1024];
-  char *p = fs_resolve(fs, rel, false, &kind, msg, sizeof msg);
-  if (!p) return io_err(kind, msg);
-  if (strcmp(p, fs->root) == 0) { free(p); return io_err(1, "fs: cannot remove the granted directory itself"); }
-  struct stat st;
-  int rc = (lstat(p, &st) == 0 && S_ISDIR(st.st_mode)) ? rmdir(p) : unlink(p);
-  free(p);
-  if (rc != 0) { snprintf(msg, sizeof msg, "fs: `%.*s`: %s", (int)rel->len, rel->data, strerror(errno)); return io_err(2, msg); }
+  if (!fs->root) return io_err(1, W_FS_NOT_GRANTED);
+  WFsErr e;
+  if (w_fs_remove(W_FS_TOP, fs->root, rel->data, (size_t)rel->len, &e) != 0) return w_fs_fail(&e);
   return io_ok(NULL);
 }
 static WIo Cap_fs_make_dir(WCap *fs, WStr *rel) {
   if (w_revoked(fs)) return io_err(1, "fs: revoked");
   if (fs->root && fs->ro) return io_err(1, "fs: this capability is read-only");
-  int kind; char msg[1024];
-  char *p = fs_resolve(fs, rel, true, &kind, msg, sizeof msg);
-  if (!p) return io_err(kind, msg);
-  int rc = mkdir(p, 0755);
-  free(p);
-  if (rc != 0) { snprintf(msg, sizeof msg, "fs: `%.*s`: %s", (int)rel->len, rel->data, strerror(errno)); return io_err(2, msg); }
+  if (!fs->root) return io_err(1, W_FS_NOT_GRANTED);
+  WFsErr e;
+  if (w_fs_mkdir(W_FS_TOP, fs->root, rel->data, (size_t)rel->len, &e) != 0) return w_fs_fail(&e);
   return io_ok(NULL);
 }
 /* Move `from` to `to` in one step, replacing what is at `to` (rename(2));
@@ -1646,15 +1579,9 @@ static WIo Cap_fs_make_dir(WCap *fs, WStr *rel) {
 static WIo Cap_fs_rename(WCap *fs, WStr *from, WStr *to) {
   if (w_revoked(fs)) return io_err(1, "fs: revoked");
   if (fs->root && fs->ro) return io_err(1, "fs: this capability is read-only");
-  int kind; char msg[1024];
-  char *a = fs_resolve(fs, from, false, &kind, msg, sizeof msg);
-  if (!a) return io_err(kind, msg);
-  char *b = fs_resolve(fs, to, true, &kind, msg, sizeof msg);
-  if (!b) { free(a); return io_err(kind, msg); }
-  if (strcmp(a, fs->root) == 0 || strcmp(b, fs->root) == 0) { free(a); free(b); return io_err(1, "fs: cannot rename the granted directory itself"); }
-  int rc = rename(a, b);
-  free(a); free(b);
-  if (rc != 0) { snprintf(msg, sizeof msg, "fs: `%.*s`: %s", (int)from->len, from->data, strerror(errno)); return io_err(2, msg); }
+  if (!fs->root) return io_err(1, W_FS_NOT_GRANTED);
+  WFsErr e;
+  if (w_fs_rename(W_FS_TOP, fs->root, from->data, (size_t)from->len, to->data, (size_t)to->len, &e) != 0) return w_fs_fail(&e);
   return io_ok(NULL);
 }
 /* Fs.info: size, modification time in milliseconds and kind, following
@@ -1662,16 +1589,9 @@ static WIo Cap_fs_rename(WCap *fs, WStr *from, WStr *to) {
 typedef struct { int64_t size; int64_t mtime_ms; bool is_file; bool is_dir; } WFileInfo;
 static WIo Cap_fs_info(WCap *fs, WStr *rel) {
   if (w_revoked(fs)) return io_err(1, "fs: revoked");
-  int kind; char msg[1024];
-  char *p = fs_resolve(fs, rel, false, &kind, msg, sizeof msg);
-  if (!p) return io_err(kind, msg);
-  struct stat st;
-  if (stat(p, &st) != 0) {
-    snprintf(msg, sizeof msg, "fs: `%.*s`: %s", (int)rel->len, rel->data, strerror(errno));
-    free(p);
-    return io_err(2, msg);
-  }
-  free(p);
+  if (!fs->root) return io_err(1, W_FS_NOT_GRANTED);
+  WFsErr e; struct stat st;
+  if (w_fs_stat(W_FS_TOP, fs->root, rel->data, (size_t)rel->len, &st, &e) != 0) return w_fs_fail(&e);
   WFileInfo *i = (WFileInfo *)w_raw(sizeof(WFileInfo));
   i->size = (int64_t)st.st_size;
 #ifdef __APPLE__
@@ -2010,6 +1930,62 @@ static void w_sched_loop(WWorker *w, int is_main) {
   }
 }
 
+/* ---- stack overflow ----
+   Every fiber's stack has a guard region at its low end (w_fiber_new), so
+   running past the stack faults there. A handler for SIGSEGV and SIGBUS, on
+   an alternate signal stack of each worker thread (the fiber's own stack
+   is the one that ran out), recognises a fault in the current fiber's guard
+   region and ends the program as an unhandled panic does: `panic: stack
+   overflow` on stderr and exit status 1. A stack overflow cannot be caught.
+   Any other fault goes to the handler that was there before (the default,
+   or a sanitizer's). */
+static WFiber *w_main_fiber;
+static struct sigaction w_old_segv, w_old_bus;
+static void w_sig_puts(const char *m) { size_t n = strlen(m); while (n > 0) { ssize_t k = write(2, m, n); if (k <= 0) break; m += k; n -= (size_t)k; } }
+static void w_sig_putu(uint64_t v) {
+  char b[24]; int i = 23; b[i] = 0;
+  do { b[--i] = (char)('0' + v % 10); v /= 10; } while (v);
+  w_sig_puts(b + i);
+}
+static void w_stack_fault(int sig, siginfo_t *si, void *uc) {
+  (void)uc;
+  WWorker *w = w_self_tls;
+  WFiber *f = w ? w->current : NULL;
+  long page = sysconf(_SC_PAGESIZE);
+  size_t guard = (W_GUARD_BYTES + (size_t)page - 1) / (size_t)page * (size_t)page;
+  char *a = (char *)si->si_addr;
+  if (f && f->map && a >= f->map && a < f->map + guard) {
+    w_sig_puts("panic: stack overflow\n  --> ");
+    if (f == w_main_fiber) w_sig_puts("main, whose stack is ");
+    else w_sig_puts("a task, whose stack is ");
+    w_sig_putu((uint64_t)(f->map_size - guard) / 1024);
+    w_sig_puts(" KB");
+    if (f != w_main_fiber) w_sig_puts(" (LIMEN_STACK_KB sets it)");
+    w_sig_puts("\n");
+    _exit(1);
+  }
+  /* not ours: put the previous handler back and let the fault happen again */
+  sigaction(sig, sig == SIGBUS ? &w_old_bus : &w_old_segv, NULL);
+}
+#define W_ALTSTACK_BYTES (64 * 1024)
+static void w_altstack(void) {
+  stack_t ss;
+  size_t n = W_ALTSTACK_BYTES + (size_t)SIGSTKSZ;
+  ss.ss_sp = mmap(NULL, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+  if (ss.ss_sp == MAP_FAILED) return;
+  ss.ss_size = n; ss.ss_flags = 0;
+  if (sigaltstack(&ss, NULL) != 0) munmap(ss.ss_sp, n);
+}
+static void w_stack_fault_install(void) {
+  struct sigaction sa;
+  memset(&sa, 0, sizeof sa);
+  sa.sa_sigaction = w_stack_fault;
+  sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+  sigemptyset(&sa.sa_mask);
+  sigaction(SIGSEGV, &sa, &w_old_segv);
+  sigaction(SIGBUS, &sa, &w_old_bus);
+}
+
 static WWorker *w_worker_new(void) {
   WWorker *w = (WWorker *)w_raw(sizeof(WWorker));
   memset(w, 0, sizeof *w);
@@ -2023,6 +1999,7 @@ static WWorker *w_worker_new(void) {
   w_workers[w->id] = w;
   __atomic_fetch_add(&w_nworkers, 1, __ATOMIC_RELEASE);
   w_self_tls = w;
+  w_altstack();
   return w;
 }
 
@@ -2111,10 +2088,12 @@ void w_fiber_main(WFiber *f) {
 static void w_run(void (*entry)(void *), void *arg) {
   const char *e = getenv("LIMEN_STACK_KB");
   if (e && atol(e) > 0) w_stack_size = (size_t)atol(e) * 1024;
+  w_stack_fault_install();
   pthread_mutex_lock(&w_global_mu);
   WWorker *w = w_worker_new();
   pthread_mutex_unlock(&w_global_mu);
   WFiber *m = w_fiber_new(entry, arg, (size_t)256 << 20); /* main gets a large, lazily committed stack */
+  w_main_fiber = m;
   w_ready(m);
   w_sched_loop(w, 1);
   /* main has returned, so every task has finished; wait for the workers to
@@ -2934,8 +2913,6 @@ static void w_chan_close(WChan *c, const char *where) {
 
 /* ---------- releasing what a panic abandoned ---------- */
 
-typedef struct { int64_t rc, len, cap; void *data; } WListAny;
-typedef struct { int64_t rc, len, n, cap, icap; void *keys, *vals, *live, *idx; } WMapAny;
 
 #define W_DYING (INT64_MAX / 4)
 
@@ -3862,7 +3839,7 @@ static bool Cap_foreign_allows(WCap *x, WStr *lib_s) {
   return false;
 }
 static WCap *Cap_foreign_only(WCap *x, WStr *lib_s) {
-  char *lib = strndup(lib_s->data, (size_t)lib_s->len);
+  char *lib = w_strndup(lib_s->data, (size_t)lib_s->len);
   bool covered;
   if (strcmp(lib, "*") == 0) { covered = false; for (int i = 0; i < x->nhosts; i++) if (strcmp(x->hosts[i], "*") == 0) covered = true; }
   else covered = Cap_foreign_allows(x, lib_s);
@@ -4398,7 +4375,7 @@ static WCap *exec_with(WCap *x, char *entry) {
   return c;
 }
 static WCap *Cap_exec_only(WCap *x, WStr *prog_s) {
-  char *prog = strndup(prog_s->data, (size_t)prog_s->len);
+  char *prog = w_strndup(prog_s->data, (size_t)prog_s->len);
   if ((size_t)prog_s->len != strlen(prog) || strchr(prog, '\n')) { free(prog); return exec_with(x, NULL); }
   if (strcmp(prog, "*") == 0) {
     for (int i = 0; i < x->nhosts; i++) if (strcmp(x->hosts[i], "*") == 0) return exec_with(x, prog);
@@ -4419,7 +4396,7 @@ static WCap *Cap_exec_only(WCap *x, WStr *prog_s) {
   }
   if (!found) { free(b.p); free(prog); return exec_with(x, NULL); }
   WStr *rest = buf_take(&b);
-  char *entry = (char *)malloc(strlen(prog) + (size_t)rest->len + 1);
+  char *entry = (char *)w_raw(strlen(prog) + (size_t)rest->len + 1);
   memcpy(entry, prog, strlen(prog));
   memcpy(entry + strlen(prog), rest->data, (size_t)rest->len);
   entry[strlen(prog) + (size_t)rest->len] = 0;
@@ -4429,7 +4406,7 @@ static WCap *Cap_exec_only(WCap *x, WStr *prog_s) {
 }
 /* `exec.only_args(program, prefixes)`: the prefixes `x` covers for it */
 static WCap *Cap_exec_only_args(WCap *x, WStr *prog_s, L_Str *qs) {
-  char *prog = strndup(prog_s->data, (size_t)prog_s->len);
+  char *prog = w_strndup(prog_s->data, (size_t)prog_s->len);
   if ((size_t)prog_s->len != strlen(prog) || strchr(prog, '\n') || strcmp(prog, "*") == 0) { free(prog); return exec_with(x, NULL); }
   WBuf b; buf_init(&b);
   buf_puts(&b, prog);
@@ -4448,13 +4425,13 @@ static WCap *Cap_exec_only_args(WCap *x, WStr *prog_s, L_Str *qs) {
       at = end;
     }
     WStr *ws = buf_take(&w);
-    char *norm = strndup(ws->data, (size_t)ws->len);
+    char *norm = w_strndup(ws->data, (size_t)ws->len);
     Str_drop(ws);
     if (exec_covers(x, prog, norm)) { buf_puts(&b, "\n"); buf_puts(&b, norm); any = true; }
     free(norm);
   }
   WStr *e = buf_take(&b);
-  char *entry = any ? strndup(e->data, (size_t)e->len) : NULL;
+  char *entry = any ? w_strndup(e->data, (size_t)e->len) : NULL;
   Str_drop(e);
   free(prog);
   return exec_with(x, entry);
@@ -4465,10 +4442,10 @@ static WIo Cap_exec_run(WCap *x, WStr *prog_s, L_Str *args) {
   if (memchr(prog_s->data, 0, (size_t)prog_s->len)) return io_err(2, "exec: the program name contains a NUL byte");
   for (int64_t i = 0; i < args->len; i++)
     if (memchr(args->data[i]->data, 0, (size_t)args->data[i]->len)) return io_err(2, "exec: an argument contains a NUL byte");
-  char *prog = strndup(prog_s->data, (size_t)prog_s->len);
+  char *prog = w_strndup(prog_s->data, (size_t)prog_s->len);
   char **argv = (char **)w_raw(sizeof(char *) * (size_t)(args->len + 2));
   argv[0] = prog;
-  for (int64_t i = 0; i < args->len; i++) argv[i + 1] = strndup(args->data[i]->data, (size_t)args->data[i]->len);
+  for (int64_t i = 0; i < args->len; i++) argv[i + 1] = w_strndup(args->data[i]->data, (size_t)args->data[i]->len);
   argv[args->len + 1] = NULL;
   if (!exec_permits(x, prog, argv + 1, args->len)) {
     WBuf b; buf_init(&b);
@@ -4664,7 +4641,7 @@ static WIo w_http_parse(const char *d, int64_t n, const char *cut) {
   }
   bool chunked = false;
   if (te) {
-    char *low = strndup(te->data, (size_t)te->len);
+    char *low = w_strndup(te->data, (size_t)te->len);
     lower_ascii(low);
     chunked = w_find_bytes(low, (int64_t)strlen(low), "chunked", 0) >= 0;
     free(low);
@@ -4710,7 +4687,7 @@ static WIo w_http_parse(const char *d, int64_t n, const char *cut) {
 static WIo Cap_net_get(WCap *n, WStr *url_s) {
   if (w_revoked(n)) return io_err(1, "net: revoked");
   if (memchr(url_s->data, 0, (size_t)url_s->len)) return io_err(2, "URL contains spaces or non-ASCII characters");
-  char *url = strndup(url_s->data, (size_t)url_s->len);
+  char *url = w_strndup(url_s->data, (size_t)url_s->len);
   char host[512], err[256]; int port, https; const char *path;
   if (!parse_url(url, host, sizeof host, &port, &https, &path, err, sizeof err)) { free(url); return io_err(2, err); }
   if (!net_permits(n, host, port)) {
