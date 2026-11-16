@@ -38,18 +38,16 @@ through `Clock`, with defaults and a way to set them.
   program is 2 to 3 s today, nearly all of it the C compiler.
 - A profiler and test coverage.
 
-## 4. Open source, licence, CI, fuzzing
+## 4. CI, fuzzing, review
 
-- Pick a licence. Without one the published binaries are all rights
-  reserved.
-- Decide on opening the source (repo `limen-lang` is private). It also
-  decides homebrew-core and Debian or Ubuntu packaging, which need public
-  source.
+- Done on 2026-11-15: MIT or Apache 2.0, and the source is public. That
+  opens homebrew-core and Debian or Ubuntu packaging.
 - CI on real x86-64 Linux and macOS. `dev/linux/run.sh` covers arm64 Linux
   in Docker; amd64 runs only emulated, where ThreadSanitizer can't start.
 - Fuzz the lexer, parser, checker and runtime (HTTP parsing, compression,
   JSON). Then an outside security review: five sandbox findings in a row on
-  2026-11-15 say there are more.
+  2026-11-15 say there are more, and a review on 2026-11-16 found three
+  capability holes, an Fs race and HTTP request smuggling (all fixed).
 
 ## 5. Platforms
 
@@ -64,10 +62,30 @@ through `Clock`, with defaults and a way to set them.
   query instead of one per row. Work in progress is in
   `~/Github/Personal/limen-sqlite-wip/` (a patch and `limen_sql.h`).
 - The interpreter starts a thread per blocking C call instead of using a pool.
-- `limen caps` prints `pure` for a function that takes an `Atomic`, a `Shared`
-  or a channel, though such a function is not pure.
 - No checkpoints in a single built-in operation (a sort) or in the fast path
   of fill loops, so those can't be cancelled midway.
+
+## Open from the 2026-11-16 review
+
+- One definition of each built-in: today each is written twice, in the
+  interpreter (`interp.ml`) and the C runtime, and only the tests keep them
+  in step. The NUL-path difference came from this.
+- `full_path` returns a path string, so C code that opens it (SQLite) can
+  still race a directory swap after the check.
+- `share`, `==` and printing recurse on deep values, and `dyn` values are
+  dropped recursively: a very deep value can still overflow a task's stack.
+- Stack overflow can't be caught, and a task's buffered output is lost when
+  it happens.
+- Bound authority covers an interface's own methods, not bounds of bounds.
+- JSON: a lone `\ud800` escape becomes U+FFFD, duplicate keys are accepted,
+  there is no nesting limit, and numbers over 400 characters fail to parse.
+- Reference cycles through `Shared` or channels leak (documented in
+  SPEC.md section 8); no cycle collector is planned.
+- Design questions: no shared mutable references (stateful code threads
+  state by hand, as the self-hosted compiler shows); E0304 rules out
+  callback tables while generics already allow them; a group's value is the
+  list of every task's result, so a long-running server group keeps one per
+  connection.
 
 ## Distribution
 

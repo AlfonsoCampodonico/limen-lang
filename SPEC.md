@@ -2278,8 +2278,8 @@ The core language is close to complete; what is missing is mostly around it.
 - Platforms: no Windows (fibers, the poller and the sandbox are macOS and Linux only); x86-64 has not run on real hardware; no cross-compilation or WebAssembly target.
 - Standard library: no encryption or public-key signatures (hashing and HMAC only), compression only of whole values (no streaming inflate), and Unicode support stops at `chars()`.
 - Tooling: no debugger mapping (native code is C without `#line`), profiler or test coverage; cold builds spend about 3 s in the C compiler for a 600-line program; no incremental checking.
-- Distribution: no prebuilt releases or Homebrew formula; the package index has no hosted default; no stability promise yet.
+- Distribution: releases for macOS on Apple silicon (Homebrew) and Linux on x86-64 and arm64 (`.deb` and tarballs), but no apt repository; the package index has no hosted default; no stability promise yet.
 - Language: no default parameter values, no integer types besides `Int` outside FFI, no code generation for repetitive cases such as JSON for a struct, and C callbacks cannot be kept for later.
 - A native backend other than C: Cranelift was decided against, since native code is C compiled by the system's compiler.
 
-See the design doc's "Toward a full language" and Known gaps for the details.
+[ROADMAP.md](ROADMAP.md) has the details, in order.
