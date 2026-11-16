@@ -93,8 +93,9 @@ through `Clock`, with defaults and a way to set them.
   work. Needs a GPG key that stays on the maintainer's machine.
 - One release script that builds macOS and both Linux architectures, writes
   `SHA256SUMS`, uploads to the release and bumps the Homebrew formula.
-  Today it is three steps: `dune build --profile release` on the Mac,
-  `dev/release/linux.sh VERSION`, then `gh release` by hand.
+  Today it is three steps: `dev/release/macos.sh VERSION` (OpenSSL linked
+  statically), `dev/release/linux.sh VERSION`, then `gh release` and the
+  formula by hand.
 - The package index exists but is empty and has no hosted default.
 - A stability promise: what 1.0 means and how versions change after it.
 

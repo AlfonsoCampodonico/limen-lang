@@ -174,7 +174,7 @@ let run_native_tests items tests benches bench =
   let exe = Filename.concat (Filename.get_temp_dir_name ()) (Printf.sprintf "limen-test-%d" (Unix.getpid ())) in
   (match Native.build ~tests:true items exe with
    | Ok () -> ()
-   | Error m -> prerr_string m; prerr_endline "limen: the C compiler failed (this is a bug in limen)"; exit 1);
+   | Error m -> prerr_string (Native.cc_failed m); exit 1);
   let test_results =
     List.map
       (fun (i, name, takes_fs) ->
@@ -457,8 +457,7 @@ let cmd_build file out emit_c =
     match Native.build items out with
     | Ok () -> (try Sys.remove (out ^ ".c") with Sys_error _ -> ())
     | Error m ->
-      prerr_string m;
-      prerr_endline "limen: the C compiler failed (this is a bug in limen)";
+      prerr_string (Native.cc_failed m);
       exit 1
 
 let cmd_run_native file grant_args prog_args =
@@ -470,7 +469,7 @@ let cmd_run_native file grant_args prog_args =
   let exe = Filename.concat dir (Printf.sprintf "limen-%d" (Unix.getpid ())) in
   (match Native.build items exe with
    | Ok () -> ()
-   | Error m -> prerr_string m; prerr_endline "limen: the C compiler failed (this is a bug in limen)"; exit 1);
+   | Error m -> prerr_string (Native.cc_failed m); exit 1);
   let args =
     List.concat_map
       (fun g ->

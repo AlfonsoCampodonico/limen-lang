@@ -10,7 +10,9 @@
 
    Clients verify the server's certificate chain against the default trust
    store (SSL_CERT_FILE / SSL_CERT_DIR when set, as for every OpenSSL
-   program, else the store OpenSSL was built with) and its name or IP
+   program, else the store OpenSSL was built with, else the system's own
+   bundle when that store isn't there: a statically linked limen on a Mac
+   without Homebrew) and its name or IP
    address against the host that was dialled. Servers do not ask for client
    certificates. TLS 1.2 is the minimum both ways. */
 #include <openssl/ssl.h>
@@ -23,6 +25,7 @@
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <arpa/inet.h>
 
 /* One connection. The lock is held only around a single non-blocking
@@ -75,6 +78,21 @@ static void vtls_client_init(void) {
     vtls_queue_err(vtls_client_err, sizeof vtls_client_err, "cannot load the trusted certificates");
     SSL_CTX_free(c);
     return;
+  }
+  /* The store OpenSSL was built with may not exist on this machine (a
+     release binary linked against Homebrew's OpenSSL, run without
+     Homebrew). Then use the system's bundle, unless the environment names
+     a store. */
+  if (!getenv("SSL_CERT_FILE") && !getenv("SSL_CERT_DIR") &&
+      access(X509_get_default_cert_file(), R_OK) != 0 &&
+      access(X509_get_default_cert_dir(), R_OK) != 0) {
+    static const char *const bundles[] = {
+      "/etc/ssl/cert.pem",                      /* macOS, Alpine, BSDs */
+      "/etc/ssl/certs/ca-certificates.crt",     /* Debian, Ubuntu */
+      "/etc/pki/tls/certs/ca-bundle.crt",       /* Fedora, RHEL */
+    };
+    for (size_t i = 0; i < sizeof bundles / sizeof *bundles; i++)
+      if (access(bundles[i], R_OK) == 0 && SSL_CTX_load_verify_locations(c, bundles[i], NULL) == 1) break;
   }
   ERR_clear_error();
   vtls_client_ctx = c;

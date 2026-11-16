@@ -38,6 +38,7 @@
  (deps
   openssl_config.sh
   (env_var LIMEN_OPENSSL)
+  (env_var LIMEN_OPENSSL_STATIC)
   (env_var CC))
  (action
   (run sh %{dep:openssl_config.sh} tls_cflags.sexp tls_libs.sexp openssl_config.ml)))

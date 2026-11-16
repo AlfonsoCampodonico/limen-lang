@@ -131,11 +131,26 @@ let run_cc argv =
   | Unix.WEXITED 0 -> Ok ()
   | _ -> Error (o ^ e)
 
+(* What a native build says when OpenSSL isn't there for a TLS program. *)
+let tls_missing = "limen: this program uses TLS, which needs OpenSSL's headers and libraries: on macOS `brew install openssl@3`, on Debian or Ubuntu `apt install libssl-dev`"
+
+(* Whether [text] contains [word]. *)
+let mentions text word =
+  let n = String.length text and m = String.length word in
+  let rec at i = i + m <= n && (String.sub text i m = word || at (i + 1)) in
+  at 0
+
 let compile_c ?flags ?(libs = []) c_text exe : (unit, string) result =
   let c_file = exe ^ ".c" in
   let c_text, tls_cflags, tls_libs = prepare c_text in
   Out_channel.with_open_bin c_file (fun oc -> output_string oc c_text);
   let argv = command ?flags ~cflags:tls_cflags ~libs:(tls_libs @ link_flags libs) c_file exe in
+  let run_cc argv =
+    match run_cc argv with
+    | Error out when tls_cflags <> [] && mentions out "openssl/" ->
+      Error (out ^ "\n" ^ tls_missing ^ "\n")
+    | r -> r
+  in
   match cache_dir () with
   | None -> run_cc argv
   | Some dir -> (
@@ -167,3 +182,9 @@ let build ?flags ?tests items exe =
     Error
       (m ^ Printf.sprintf "limen: the program links foreign libraries (%s); check that they are installed where the C compiler finds them\n"
              (String.concat ", " libs))
+
+(* The message for a failed C compile: the compiler's output, then either
+   the TLS hint (already in it) or the note that this is limen's fault. *)
+let cc_failed m =
+  if mentions m tls_missing then m
+  else m ^ "limen: the C compiler failed (this is a bug in limen)\n"
