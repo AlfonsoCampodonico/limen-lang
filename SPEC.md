@@ -1848,8 +1848,8 @@ match start(root.fs) {
 | --- | --- |
 | `enum Value { Null, Bool(Bool), Num(Float), Str(Str), Arr(List[Value]), Obj(List[Field]) }` | a JSON value; objects keep their fields in order |
 | `struct Field { key: Str, value: Value }`, `field(key, value)` | an object member |
-| `parse(s) -> Result[Value, Str]` | the error names what was expected and the byte offset |
-| `stringify(v) -> Str` | compact JSON; integral numbers print without `.0` |
+| `parse(s) -> Result[Value, Str]` | the error names what was expected and the byte offset. Numbers follow RFC 8259 exactly (`01`, `1.`, `.5` and `+1` are errors); one beyond `Float`'s range (`1e999`) is an error, one too small to tell from zero reads as `0` |
+| `stringify(v) -> Str` | compact JSON; integral numbers print without `.0`, others in the fewest digits (17 at most) that read back as the same `Float`; NaN and the infinities, which JSON cannot write, print as `null` |
 | `quote(s) -> Str` | a JSON string literal |
 | `v.get(key)`, `v.at(i)` | methods: `Option[Value]`, an object member or an array item |
 | `v.as_str()`, `as_num()`, `as_int()`, `as_bool()`, `as_list()` | methods: `Option` of the payload, `None` for another kind |
@@ -1874,6 +1874,8 @@ HTTP/1.1, plain or over TLS. The server keeps connections alive between requests
 | `serve_stream(conn, handler) -> Int` | like `serve_conn` for a handler `fn(Request, Conn) -> Result[(), IoError]` that writes its own response; an error or panic closes the connection |
 | `write_head(conn, status, headers)`, `write_chunk(conn, piece)`, `end_body(conn)` | write a response whose body follows in pieces (`Transfer-Encoding: chunked`) |
 | `read_request(conn)`, `write_response(conn, r)` | one message on a connection; `write_response` says the connection will close |
+
+Messages are read strictly, against request smuggling (RFC 9112): lines end in CRLF, and a bare CR or LF, a NUL, a folded header line, a header name that is not a token (`Content-Length : 5`), a control byte in a header value, a Content-Length that is not digits or two that differ, a Transfer-Encoding other than `chunked`, one beside a Content-Length, or one in an HTTP/1.0 request is a malformed request (400, connection closed). The client refuses the same in a response, except that a Transfer-Encoding not ending in `chunked` reads to the end of the connection. Writing is strict too: `write_response`, `write_head` and the client return an error, with nothing sent, for a header name that is not a token, a value holding CR, LF, NUL or another control byte (response splitting), a status outside 100 to 999, a Transfer-Encoding header on a whole message, or a Content-Length that is not digits; `write_head` also refuses Content-Length and Transfer-Encoding, since it frames the body itself. A handler of `serve_conn` or `handle` whose response cannot be sent gets 500 instead.
 
 Limits: request heads up to 64 KiB, request bodies up to 8 MiB (read whole, chunked or not), 1000 requests per connection. There are no timeouts yet, so an idle keep-alive connection holds its task until the client closes it, and `serve_forever` keeps a small record per finished connection until it returns.
 

@@ -102,17 +102,64 @@ fn bad(msg: Str) -> IoError {
     Failed("http: " + msg)
 }
 
-// The start line and headers of a message (without the blank line).
+// A byte a token may hold (RFC 9110 5.6.2): letters, digits and
+// ! # $ % & ' * + - . ^ _ ` | ~
+fn token_byte(b: Int) -> Bool {
+    (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || "!#$%&'*+-.^_`|~".bytes().contains(b)
+}
+
+// Whether `s` is a token, as header names and methods must be.
+fn is_token(s: Str) -> Bool {
+    s != "" && s.bytes().all(|b| token_byte(b))
+}
+
+// Whether `s` can go in a header value, a start line or a reason phrase:
+// no control bytes (CR, LF and NUL above all) other than the tab.
+fn is_field_text(s: Str) -> Bool {
+    s.bytes().all(|b| (b >= 32 || b == 9) && b != 127)
+}
+
+// The start line and headers of a message (without the blank line). Lines
+// end in CRLF; a bare CR or LF, a NUL, a header name that is not a token
+// (`Content-Length : 5`), a folded line (one starting with a space or tab)
+// or a control byte in a value is an error rather than something to guess at.
 fn parse_head(text: Str) -> Result[Head, IoError] {
+    let bs = text.bytes()
+    let mut j = 0
+    while j < bs.len() {
+        let b = bs[j]
+        if b == 0 {
+            return Err(bad("NUL in the headers"))
+        }
+        if b == 13 && (j + 1 >= bs.len() || bs[j + 1] != 10) {
+            return Err(bad("bare CR in the headers"))
+        }
+        if b == 10 && (j == 0 || bs[j - 1] != 13) {
+            return Err(bad("bare LF in the headers"))
+        }
+        j = j + 1
+    }
     let lines = text.split("\r\n")
+    if !is_field_text(lines[0]) {
+        return Err(bad("control character in the start line"))
+    }
     let mut headers = []
     let mut i = 1
     while i < lines.len() {
         let l = lines[i]
-        match l.index_of(":") {
-            Some(k) => headers.push(Header { name: l.slice(0, k).trim(), value: l.slice(k + 1, l.len()).trim() }),
-            None => { return Err(bad("malformed header line")) },
+        if l.starts_with(" ") || l.starts_with("\t") {
+            return Err(bad("folded header line"))
         }
+        let k = l.index_of(":") ?? { return Err(bad("malformed header line")) }
+        let name = l.slice(0, k)
+        let value = l.slice(k + 1, l.len())
+        if !is_token(name) {
+            return Err(bad("malformed header name"))
+        }
+        if !is_field_text(value) {
+            return Err(bad("control character in a header value"))
+        }
+        headers.push(Header { name, value: value.trim() })
         i = i + 1
     }
     Ok(Head { first: lines[0], headers })
@@ -126,6 +173,10 @@ fn read_head(c: Conn, buf: Str) -> Result[Option[(Str, Str)], IoError] {
         match data.index_of("\r\n\r\n") {
             Some(i) => { return Ok(Some((data.slice(0, i), data.slice(i + 4, data.len())))) },
             None => (),
+        }
+        // a head ended by bare LFs would never match; refuse it at once
+        if data.contains("\n\n") {
+            return Err(bad("bare LF in the headers"))
         }
         if data.len() > max_head() {
             return Err(bad("headers too large"))
@@ -142,14 +193,44 @@ fn read_head(c: Conn, buf: Str) -> Result[Option[(Str, Str)], IoError] {
     Ok(None)
 }
 
-fn content_length(headers: List[Header]) -> Result[Int, IoError] {
-    match find_header(headers, "Content-Length") {
-        Some(v) => match v.parse_int() {
-            Some(n) => if n >= 0 { Ok(n) } else { Err(bad("negative Content-Length")) },
-            None => Err(bad("bad Content-Length")),
-        },
-        None => Ok(0),
+// The Content-Length of a message, None without one. Every Content-Length
+// header must be digits only, and when there are several they must agree:
+// two lengths that differ are how one request gets smuggled inside another.
+fn content_length(headers: List[Header]) -> Result[Option[Int], IoError] {
+    let mut found = None
+    for h in headers {
+        if h.name.to_lower() == "content-length" {
+            let v = h.value
+            if v == "" || v.len() > 18 || !v.bytes().all(|b| b >= 48 && b <= 57) {
+                return Err(bad("bad Content-Length"))
+            }
+            let n = v.parse_int() ?? { return Err(bad("bad Content-Length")) }
+            if found.is_some() && found != Some(n) {
+                return Err(bad("conflicting Content-Length headers"))
+            }
+            found = Some(n)
+        }
     }
+    Ok(found)
+}
+
+// The transfer codings of a message, lowercased, from every
+// Transfer-Encoding header in order; None without one.
+fn transfer_codings(headers: List[Header]) -> Option[List[Str]] {
+    let mut found = false
+    let mut codings = []
+    for h in headers {
+        if h.name.to_lower() == "transfer-encoding" {
+            found = true
+            for t in h.value.to_lower().split(",") {
+                let c = t.trim()
+                if c != "" {
+                    codings.push(c)
+                }
+            }
+        }
+    }
+    if found { Some(codings) } else { None }
 }
 
 // Whether a comma-separated header such as Connection lists `token`.
@@ -158,10 +239,6 @@ fn has_token(headers: List[Header], name: Str, token: Str) -> Bool {
         Some(v) => v.to_lower().split(",").map(|t| t.trim()).contains(token),
         None => false,
     }
-}
-
-fn is_chunked(headers: List[Header]) -> Bool {
-    has_token(headers, "Transfer-Encoding", "chunked")
 }
 
 fn hex_value(s: Str) -> Option[Int] {
@@ -293,19 +370,42 @@ fn read_chunked[T](c: Conn, buf: Str, limit: Int, init: T, f: fn(T, Str) -> T, s
     Ok((acc, data))
 }
 
-fn head_text(first: Str, headers: List[Header], body: Str) -> Str {
-    let mut s = first + "\r\n"
-    let mut has_len = false
+// Refuse headers that would not go out as the caller meant: a name that is
+// not a token, or a value with CR, LF, NUL or another control byte, which
+// would let it end the header early and start another (response splitting).
+fn check_headers(headers: List[Header]) -> Result[(), IoError] {
     for h in headers {
-        if h.name.to_lower() == "content-length" {
-            has_len = true
+        if !is_token(h.name) {
+            return Err(bad("a header name is not a token"))
         }
+        if !is_field_text(h.value) {
+            return Err(bad("the value of header {h.name} holds a control character"))
+        }
+    }
+    Ok(())
+}
+
+// A whole message: the start line, the headers and a Content-Length (unless
+// one is given), then the body. An error for a bad header, a start line with
+// a control byte, a Transfer-Encoding (the body goes whole) or a
+// Content-Length that is not a length.
+fn head_text(first: Str, headers: List[Header], body: Str) -> Result[Str, IoError] {
+    if !is_field_text(first) {
+        return Err(bad("control character in the start line"))
+    }
+    check_headers(headers)?
+    if transfer_codings(headers).is_some() {
+        return Err(bad("a whole message cannot have a Transfer-Encoding header"))
+    }
+    let given = content_length(headers)?
+    let mut s = first + "\r\n"
+    for h in headers {
         s = s + h.name + ": " + h.value + "\r\n"
     }
-    if !has_len {
+    if given.is_none() {
         s = s + "Content-Length: {body.len()}\r\n"
     }
-    s + "\r\n" + body
+    Ok(s + "\r\n" + body)
 }
 
 // ---------- client ----------
@@ -350,6 +450,9 @@ fn read_status(c: Conn) -> Result[(Response, Str), IoError] {
     if parts.len() < 2 || !parts[0].starts_with("HTTP/") {
         return Err(bad("malformed status line"))
     }
+    if parts[1].len() != 3 || !parts[1].bytes().all(|b| b >= 48 && b <= 57) {
+        return Err(bad("malformed status line"))
+    }
     let status = parts[1].parse_int() ?? { return Err(bad("malformed status line")) }
     Ok((Response { status, headers: h.headers, body: "" }, rest))
 }
@@ -361,28 +464,47 @@ fn read_body[T](c: Conn, method: Str, resp: Response, rest: Str, init: T, f: fn(
     if method == "HEAD" || status == 204 || status == 304 || (status >= 100 && status < 200) {
         return Ok(init)
     }
-    if is_chunked(resp.headers) {
-        let (acc, _) = read_chunked(c, rest, -1, init, f, stop)?
-        return Ok(acc)
-    }
-    match find_header(resp.headers, "Content-Length") {
-        Some(_) => {
-            let (acc, _) = read_sized(c, rest, content_length(resp.headers)?, init, f, stop)?
-            Ok(acc)
+    let length = content_length(resp.headers)?
+    match transfer_codings(resp.headers) {
+        Some(codings) => {
+            // both framings at once is how responses get split: refuse it
+            if length.is_some() {
+                return Err(bad("both Transfer-Encoding and Content-Length"))
+            }
+            // RFC 9112 6.3: chunked last means chunked; anything else runs
+            // until the server closes
+            if codings.len() > 0 && codings[codings.len() - 1] == "chunked" {
+                let (acc, _) = read_chunked(c, rest, -1, init, f, stop)?
+                return Ok(acc)
+            }
+            read_to_end(c, rest, init, f, stop)
         },
-        None => read_to_end(c, rest, init, f, stop),
+        None => match length {
+            Some(n) => {
+                let (acc, _) = read_sized(c, rest, n, init, f, stop)?
+                Ok(acc)
+            },
+            None => read_to_end(c, rest, init, f, stop),
+        },
     }
 }
 
 // Connect for `url` and send the request; the connection, ready for the response.
 fn send_request(net: Net, method: Str, url: Str, headers: List[Header], body: Str) -> Result[Conn, IoError] {
     let u = target(url)?
-    let c = if u.tls { net.connect_tls(u.addr)? } else { net.connect(u.addr)? }
+    if !is_token(method) {
+        return Err(bad("the method is not a token"))
+    }
+    if !u.path.bytes().all(|b| b > 32 && b != 127) {
+        return Err(bad("the URL path holds a space or control character"))
+    }
     let mut all = [Header { name: "Host", value: u.host }, Header { name: "Connection", value: "close" }]
     for h in headers {
         all.push(h)
     }
-    match c.write(head_text("{method} {u.path} HTTP/1.1", all, body)) {
+    let message = head_text("{method} {u.path} HTTP/1.1", all, body)?
+    let c = if u.tls { net.connect_tls(u.addr)? } else { net.connect(u.addr)? }
+    match c.write(message) {
         Ok(_) => Ok(c),
         Err(e) => {
             c.close()
@@ -530,13 +652,32 @@ fn read_message(c: Conn, buf: Str) -> Result[Option[(Request, Str)], IoError] {
     let (text, rest) = read_head(c, buf)? ?? { return Ok(None) }
     let h = parse_head(text)?
     let parts = h.first.split(" ")
-    if parts.len() != 3 || !parts[2].starts_with("HTTP/1.") {
+    if parts.len() != 3 || !is_token(parts[0]) || parts[1] == "" || (parts[2] != "HTTP/1.1" && parts[2] != "HTTP/1.0") {
         return Err(bad("malformed request line"))
     }
-    let (body, after) = if is_chunked(h.headers) {
+    // RFC 9112 6.1 and 6.3, the strict way: a Transfer-Encoding must be
+    // exactly `chunked`, never beside a Content-Length and never in an
+    // HTTP/1.0 request; anything else is refused, not guessed at.
+    let length = content_length(h.headers)?
+    let chunked = match transfer_codings(h.headers) {
+        Some(codings) => {
+            if length.is_some() {
+                return Err(bad("both Transfer-Encoding and Content-Length"))
+            }
+            if parts[2] == "HTTP/1.0" {
+                return Err(bad("Transfer-Encoding in an HTTP/1.0 request"))
+            }
+            if codings != ["chunked"] {
+                return Err(bad("unsupported Transfer-Encoding"))
+            }
+            true
+        },
+        None => false,
+    }
+    let (body, after) = if chunked {
         read_chunked(c, rest, max_body(), "", |a, s| a + s, |_| false)?
     } else {
-        let n = content_length(h.headers)?
+        let n = length ?? 0
         if n > max_body() {
             return Err(bad("request body too large"))
         }
@@ -571,19 +712,40 @@ fn send(c: Conn, r: Response, keep: Bool, head_only: Bool) -> Result[(), IoError
     if find_header(hs, "Connection").is_none() {
         hs.push(Header { name: "Connection", value: if keep { "keep-alive" } else { "close" } })
     }
-    let t = head_text("HTTP/1.1 {r.status} {reason(r.status)}", hs, r.body)
+    if r.status < 100 || r.status > 999 {
+        return Err(bad("the status {r.status} is not three digits"))
+    }
+    let t = head_text("HTTP/1.1 {r.status} {reason(r.status)}", hs, r.body)?
     c.write(if head_only { t.slice(0, t.len() - r.body.len()) } else { t })
 }
 
-// Write a whole response, saying the connection will close.
+// `r`, or a 500 if it could not be sent as it is (a bad header or status).
+fn sendable(r: Response) -> Response {
+    let ok = r.status >= 100 && r.status <= 999 && check_headers(r.headers).is_ok() && transfer_codings(r.headers).is_none() && content_length(r.headers).is_ok()
+    if ok { r } else { text(500, "internal error") }
+}
+
+// Write a whole response, saying the connection will close. An error, with
+// nothing written, for a header name that is not a token, a header value
+// with CR, LF, NUL or another control byte, a Transfer-Encoding header, a
+// Content-Length that is not digits, or a status outside 100 to 999.
 pub fn write_response(c: Conn, r: Response) -> Result[(), IoError] {
     send(c, r, false, false)
 }
 
 // Start a response whose body follows in pieces: the status line and
 // headers, with `Transfer-Encoding: chunked`. Then call `write_chunk` for
-// each piece and `end_body` once.
+// each piece and `end_body` once. Headers are refused as in
+// `write_response`, and so is any Content-Length or Transfer-Encoding,
+// which would contradict the chunked body.
 pub fn write_head(c: Conn, status: Int, headers: List[Header]) -> Result[(), IoError] {
+    if status < 100 || status > 999 {
+        return Err(bad("the status {status} is not three digits"))
+    }
+    check_headers(headers)?
+    if find_header(headers, "Content-Length").is_some() || transfer_codings(headers).is_some() {
+        return Err(bad("write_head sets the framing itself: no Content-Length or Transfer-Encoding"))
+    }
     let mut s = "HTTP/1.1 {status} {reason(status)}\r\n"
     for h in headers {
         s = s + h.name + ": " + h.value + "\r\n"
@@ -610,7 +772,7 @@ pub fn end_body(c: Conn) -> Result[(), IoError] {
 // True if it was answered.
 pub fn handle(c: Conn, handler: fn(Request) -> Response) -> Bool {
     let r = match read_request(c) {
-        Ok(req) => catch(|| handler(req)) ?? text(500, "internal error"),
+        Ok(req) => sendable(catch(|| handler(req)) ?? text(500, "internal error")),
         Err(_) => text(400, "bad request\n"),
     }
     let ok = write_response(c, r).is_ok()
@@ -630,7 +792,7 @@ pub fn serve_conn(c: Conn, handler: fn(Request) -> Response) -> Int {
     while open {
         match read_message(c, buf) {
             Ok(Some((req, rest))) => {
-                let r = catch(|| handler(req)) ?? text(500, "internal error")
+                let r = sendable(catch(|| handler(req)) ?? text(500, "internal error"))
                 let keep = keeps_alive(req) && n + 1 < max_requests() && !has_token(r.headers, "Connection", "close")
                 if send(c, r, keep, req.method == "HEAD").is_ok() {
                     n = n + 1

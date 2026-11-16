@@ -3296,6 +3296,34 @@ fn main(root: Root) -> Result[(), IoError] {
     "use json\n\nfn main(root: Root) {\n    for s in [\"\\{\\\"a\\\": [1, 2.5e1, \\\"\\\\u0041\\\"]\\}\", \"[1 2]\", \"\\\"\\\\x\\\"\"] {\n        match json.parse(s) {\n            Ok(v) => root.stdout.print(json.stringify(v)),\n            Err(e) => root.stdout.print(e),\n        }\n    }\n}\n"
     "{\"a\":[1,25,\"A\"]}\nexpected `,` or `]` at byte 3\nexpected a valid escape at byte 1\n";
 
+  (* RFC 8259 numbers only, nothing out of Float's range, no inf or nan
+     written, and every number written so it reads back the same *)
+  out "std-json-numbers"
+    {v|use json
+fn main(root: Root) {
+    let out = root.stdout
+    for s in ["01", "-01", "1.", ".5", "+1", "-", "1e", "1e+", "1.e5", "0", "-0", "1.5e-3", "1E+2", "1e999", "-1e999", "1e-999", "[1e999]", "0.1", "[0.30000000000000004, 1e21, 1e-7, 123456789012345678901234567890, 1.7976931348623157e308, 5e-324, 2.2250738585072014e-308, 100, 1e16, 12345.678, -2.5]"] {
+        match json.parse(s) {
+            Ok(v) => out.print("{s} => {json.stringify(v)}"),
+            Err(e) => out.print("{s} => error: {e}"),
+        }
+    }
+    out.print(json.stringify(json.Arr([json.Num(1.0 / 0.0), json.Num(-1.0 / 0.0), json.Num(0.0 / 0.0), json.Num(0.1 + 0.2), json.Num(1.0 / 3.0), json.Num(-2.0 / 3.0)])))
+    let mut bad = 0
+    let mut x = 0.000001234567
+    for i in 0..<400 {
+        x = x * 1.37 + 0.1 / (i.to_float() + 3.0)
+        if x > 1e200 { x = x * 1e-250 }
+        for y in [x, 1.0 / x, 0.0 - x] {
+            let back = json.parse(json.stringify(json.Num(y))) ?? json.Null
+            if back != json.Num(y) { bad = bad + 1 }
+        }
+    }
+    out.print("round-trip failures: {bad}")
+}
+|v}
+    "01 => error: expected end of input at byte 1\n-01 => error: expected end of input at byte 2\n1. => error: expected a digit after `.` at byte 2\n.5 => error: expected a value at byte 0\n+1 => error: expected a value at byte 0\n- => error: expected a value at byte 0\n1e => error: expected a digit in the exponent at byte 2\n1e+ => error: expected a digit in the exponent at byte 3\n1.e5 => error: expected a digit after `.` at byte 2\n0 => 0\n-0 => 0\n1.5e-3 => 0.0015\n1E+2 => 100\n1e999 => error: expected a number within Float's range at byte 0\n-1e999 => error: expected a number within Float's range at byte 0\n1e-999 => 0\n[1e999] => error: expected a number within Float's range at byte 1\n0.1 => 0.1\n[0.30000000000000004, 1e21, 1e-7, 123456789012345678901234567890, 1.7976931348623157e308, 5e-324, 2.2250738585072014e-308, 100, 1e16, 12345.678, -2.5] => [0.30000000000000004,1e+21,1e-07,1.2345678901234568e+29,1.7976931348623157e+308,4.94065645841247e-324,2.2250738585072014e-308,100,10000000000000000,12345.678,-2.5]\n[null,null,null,0.30000000000000004,0.3333333333333333,-0.6666666666666666]\nround-trip failures: 0\n";
+
   out "std-format"
     {v|use format
 
@@ -4178,6 +4206,166 @@ fn main(root: Root) -> Result[(), IoError] {
 }
 |v}
     "served 6\nHTTP/1.1 200 OK|Content-Type: text/plain; charset=utf-8|Connection: keep-alive|Content-Length: 21||GET /a HTTP/1.1 body=HTTP/1.1 200 OK|Content-Type: text/plain; charset=utf-8|Connection: keep-alive|Content-Length: 27||POST /b HTTP/1.1 body=abcdeHTTP/1.1 500 Internal Server Error|Content-Type: text/plain; charset=utf-8|Connection: keep-alive|Content-Length: 14||internal errorHTTP/1.1 200 OK|Content-Type: text/plain; charset=utf-8|Connection: close|Content-Length: 21||GET /c HTTP/1.1 body=\nHTTP/1.1 200 OK|Content-Type: text/plain; charset=utf-8|Connection: close|Content-Length: 23||GET /old HTTP/1.0 body=\nHTTP/1.1 200 OK|Content-Type: text/plain; charset=utf-8|Connection: close|Content-Length: 22||\nHTTP/1.1 400 Bad Request|Content-Type: text/plain; charset=utf-8|Connection: close|Content-Length: 12||bad request\n\nforever: Failed(\"listener is closed\")\nstream: Failed(\"listener is closed\")\n200 close GET /x HTTP/1.1 body=\n200 POST /y HTTP/1.1 body=hello\n200 chunked one two three\n13 bytes\nFailed(\"http: connection closed before the response\")\n";
+  (* request smuggling and response splitting: the server refuses ambiguous
+     framing, bad header names and values, folded lines and bare line
+     breaks with 400; writing refuses what would split a response; the
+     client is as strict both ways *)
+  out "std-http-strict" ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] }
+    {v|use http
+
+fn route(r: http.Request) -> http.Response {
+    if r.path == "/split" {
+        return http.Response { status: 200, headers: [http.Header { name: "X-A", value: "1\r\nSet-Cookie: evil=1" }], body: "no" }
+    }
+    http.text(200, "{r.method} {r.path} body={r.body}")
+}
+
+fn stream(r: http.Request, c: Conn) -> Result[(), IoError] {
+    let bad = [http.Header { name: "X-A", value: "1\r\nSet-Cookie: evil=1" }]
+    let mut log = []
+    for e in [
+        http.write_response(c, http.Response { status: 200, headers: bad, body: "" }),
+        http.write_response(c, http.Response { status: 200, headers: [http.Header { name: "Bad Name", value: "1" }], body: "" }),
+        http.write_response(c, http.Response { status: 200, headers: [http.Header { name: "X-Nul", value: "a" + 0.to_char() }], body: "" }),
+        http.write_response(c, http.Response { status: 200, headers: [http.Header { name: "Content-Length", value: "1, 2" }], body: "" }),
+        http.write_response(c, http.Response { status: 2000, headers: [], body: "" }),
+        http.write_head(c, 200, bad),
+        http.write_head(c, 200, [http.Header { name: "Content-Length", value: "3" }]),
+    ] {
+        match e {
+            Ok(_) => log.push("written"),
+            Err(e) => log.push("{e}"),
+        }
+    }
+    http.write_response(c, http.text(200, log.join("\n")))
+}
+
+// Send raw bytes, then read until the server closes the connection; the
+// status line of each response.
+fn raw(net: Net, port: Int, data: Str) -> Str {
+    match net.connect("127.0.0.1:{port}") {
+        Ok(c) => {
+            let _ = c.write(data)
+            let mut got = ""
+            let mut open = true
+            while open {
+                match c.read() {
+                    Ok(s) => if s == "" { open = false } else { got = got + s },
+                    Err(_) => { open = false },
+                }
+            }
+            c.close()
+            got.split("\r\n").filter(|l| l.starts_with("HTTP/") || l.starts_with("POST") || l.starts_with("GET")).join(" / ")
+        },
+        Err(e) => "{e}",
+    }
+}
+
+fn requests() -> List[Str] {
+    let nul = 0.to_char()
+    [
+        "POST /a HTTP/1.1\r\nHost: x\r\nContent-Length : 5\r\nContent-Length: 0\r\n\r\nGET /smuggled HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        "POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nContent-Length: 0\r\n\r\nhello",
+        "POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: +5\r\n\r\nhello",
+        "POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 5, 5\r\n\r\nhello",
+        "POST /a HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\nContent-Length: 5\r\n\r\nhello",
+        "POST /a HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nContent-Length: 3\r\n\r\n0\r\n\r\n",
+        "POST /a HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: identity\r\n\r\n",
+        "POST /a HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n",
+        "POST /a HTTP/1.0\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        "GET /a HTTP/1.1\r\nHost: x\r\nX-A: 1\r\n folded\r\n\r\n",
+        "GET /a HTTP/1.1\nHost: x\n\n",
+        "GET /a HTTP/1.1\r\nX-A: 1\nX-B: 2\r\n\r\n",
+        "GET /a HTTP/1.1\r\nX-A: 1\rX-B: 2\r\n\r\n",
+        "GET /a HTTP/1.1\r\nX-A: 1" + nul + "\r\n\r\n",
+        "GET /a HTTP/1.1\r\nX A: 1\r\n\r\n",
+        "GET /a HTTP/1.1\r\n: 1\r\n\r\n",
+        "GET /a HTTP/9.9\r\n\r\n",
+        "G(T /a HTTP/1.1\r\n\r\n",
+        "POST /ok HTTP/1.1\r\nContent-Length: 5\r\ncontent-length: 5\r\nConnection: close\r\n\r\nhello",
+        "POST /ok HTTP/1.1\r\nTransfer-Encoding: Chunked\r\nConnection: close\r\n\r\n2\r\nhi\r\n0\r\n\r\n",
+        "GET /split HTTP/1.1\r\nConnection: close\r\n\r\n",
+    ]
+}
+
+// A server that answers one request with `reply`, whatever it was.
+fn fake(l: Listener, reply: Str) {
+    match l.accept() {
+        Ok(c) => {
+            let mut got = ""
+            while !got.contains("\r\n\r\n") {
+                let s = c.read() ?? ""
+                if s == "" { got = "\r\n\r\n" } else { got = got + s }
+            }
+            let _ = c.write(reply)
+            c.close()
+        },
+        Err(_) => (),
+    }
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let out = root.stdout
+    let net = root.net
+    let l = root.listen.on("127.0.0.1:0")?
+    let port = l.port()
+    let reqs = requests()
+    let first = group g {
+        g.go(|| "served {http.serve(l, reqs.len(), route)}")
+        g.go(|| reqs.map(|r| raw(net, port, r)).join("\n"))
+    }
+    out.print(first.join("\n"))
+    let l2 = root.listen.on("127.0.0.1:0")?
+    let p2 = l2.port()
+    let second = group g {
+        g.go(|| match l2.accept() { Ok(c) => "{http.serve_stream(c, stream)}", Err(e) => "{e}" })
+        g.go(|| match http.get(net, "http://127.0.0.1:{p2}/") {
+            Ok(r) => r.body,
+            Err(e) => "{e}",
+        })
+    }
+    out.print(second.join("\n"))
+    // the client refuses to send what would split its request
+    let u = "http://127.0.0.1:1/"
+    for h in [http.Header { name: "X-A", value: "1\r\nX-B: 2" }, http.Header { name: "X:A", value: "1" }, http.Header { name: "Transfer-Encoding", value: "chunked" }] {
+        match http.request(net, "GET", u, [h], "") {
+            Ok(r) => out.print("{r.status}"),
+            Err(e) => out.print("{e}"),
+        }
+    }
+    match http.request(net, "GE T", u, [], "") {
+        Ok(r) => out.print("{r.status}"),
+        Err(e) => out.print("{e}"),
+    }
+    // and reads responses as strictly as the server reads requests
+    let replies = [
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 3\r\n\r\nabc",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 3\r\n\r\n3\r\nabc\r\n0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nX-A: 1\r\n folded\r\nContent-Length: 3\r\n\r\nabc",
+        "HTTP/1.1 200 OK\r\nX-A: 1\nContent-Length: 3\r\n\r\nabc",
+        "HTTP/1.1 +20 OK\r\nContent-Length: 3\r\n\r\nabc",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\nraw to the end",
+        "HTTP/1.1 200 OK\r\nContent-Length: 3\r\ncontent-length: 3\r\n\r\nabc",
+    ]
+    for reply in replies {
+        let l3 = root.listen.on("127.0.0.1:0")?
+        let p3 = l3.port()
+        let got = group g {
+            g.go(|| {
+                fake(l3, reply)
+                ""
+            })
+            g.go(|| match http.request(net, "GET", "http://127.0.0.1:{p3}/", [http.Header { name: "Accept-Encoding", value: "identity" }], "") {
+                Ok(r) => "{r.status} {r.body}",
+                Err(e) => "{e}",
+            })
+        }
+        out.print(got[1])
+    }
+    Ok(())
+}
+|v}
+    "served 3\nHTTP/1.1 400 Bad Request\nHTTP/1.1 400 Bad Request\nHTTP/1.1 400 Bad Request\nHTTP/1.1 400 Bad Request\nHTTP/1.1 400 Bad Request\nHTTP/1.1 400 Bad Request\nHTTP/1.1 400 Bad Request\nHTTP/1.1 400 Bad Request\nHTTP/1.1 400 Bad Request\nHTTP/1.1 400 Bad Request\nHTTP/1.1 400 Bad Request\nHTTP/1.1 400 Bad Request\nHTTP/1.1 400 Bad Request\nHTTP/1.1 400 Bad Request\nHTTP/1.1 400 Bad Request\nHTTP/1.1 400 Bad Request\nHTTP/1.1 400 Bad Request\nHTTP/1.1 400 Bad Request\nHTTP/1.1 200 OK / POST /ok body=hello\nHTTP/1.1 200 OK / POST /ok body=hi\nHTTP/1.1 500 Internal Server Error\n1\nFailed(\"http: the value of header X-A holds a control character\")\nFailed(\"http: a header name is not a token\")\nFailed(\"http: the value of header X-Nul holds a control character\")\nFailed(\"http: bad Content-Length\")\nFailed(\"http: the status 2000 is not three digits\")\nFailed(\"http: the value of header X-A holds a control character\")\nFailed(\"http: write_head sets the framing itself: no Content-Length or Transfer-Encoding\")\nFailed(\"http: the value of header X-A holds a control character\")\nFailed(\"http: a header name is not a token\")\nFailed(\"http: a whole message cannot have a Transfer-Encoding header\")\nFailed(\"http: the method is not a token\")\nFailed(\"http: conflicting Content-Length headers\")\nFailed(\"http: both Transfer-Encoding and Content-Length\")\nFailed(\"http: folded header line\")\nFailed(\"http: bare LF in the headers\")\nFailed(\"http: malformed status line\")\n200 raw to the end\n200 abc\n";
   (* ---------- TLS ----------
      test/tls holds a test CA (ca.pem, trusted through SSL_CERT_FILE, set at
      the top of this file), a server certificate for localhost and
