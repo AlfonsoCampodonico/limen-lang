@@ -91,11 +91,13 @@ let check_diag (d : Diag.t) =
    capabilities in brackets (each held through a struct or enum with its
    path, `Net=Client.net`), whether it runs callbacks, and the function
    parameters it is pure if (`if=f,g`, when there are), and the C libraries
-   it reaches (`libs=z`, when there are). *)
+   it reaches (`libs=z`, when there are); `shares` when it takes a channel,
+   Atomic or Shared. *)
 let caps_line (i : Check.fn_info) =
-  Printf.printf "CAPS %s %s %d %d [%s] %b%s%s\n" i.name i.span.file i.span.lo i.span.hi
+  Printf.printf "CAPS %s %s %d %d [%s] %b%s%s%s\n" i.name i.span.file i.span.lo i.span.hi
     (String.concat "," (List.map (fun c -> match List.assoc_opt c i.via with Some p -> Types.cap_name c ^ "=" ^ p | None -> Types.cap_name c) i.caps))
     i.callbacks
+    (if i.shares then " shares" else "")
     (if i.pure_if = [] then "" else " if=" ^ String.concat "," i.pure_if)
     (if i.libs = [] then "" else " libs=" ^ String.concat "," i.libs)
 

@@ -1,0 +1,19 @@
+use hidden
+
+struct G {
+    o: Stdout,
+}
+
+fn give(self: G) -> Stdout {
+    self.o
+}
+
+fn main(root: Root) {
+    let c = channel(1)
+    c.send(root.stdout)
+    hidden.via_chan(c)
+    hidden.via_iface(G { o: root.stdout })
+    let n = channel(1)
+    n.send(1)
+    root.stdout.print("{hidden.ints(n)}")
+}

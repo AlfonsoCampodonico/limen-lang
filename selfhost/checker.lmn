@@ -44,11 +44,10 @@ fn inner(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr) -> (types.Ty, env.S
                     SPExpr(x) => {
                         let (t, next) = check_expr(st, cx, fx, x)
                         st = next
-                        match st.repr(t) {
-                            TFn(..) | TCap(_) | TChan(_) | TAtomic | TShared(_) => {
-                                st = st.report(diag.error("E0201", x.span, "cannot interpolate a value of type `{st.show(t)}`"))
-                            },
-                            _ => {},
+                        st = match st.subst.refused(env.printing(), t) {
+                            Some(Itself) => st.report(diag.error("E0201", x.span, "cannot interpolate a value of type `{st.show(t)}`")),
+                            Some(Inside(u)) => st.report(diag.error("E0201", x.span, "cannot interpolate a value of type `{st.show(t)}`").note("`{st.show(t)}` holds `{st.show(u)}`, which cannot be interpolated")),
+                            None => st,
                         }
                     },
                     SPLit(_) => {},
@@ -544,12 +543,13 @@ fn instantiate(st: env.State, s: env.Sig) -> (List[(Str, types.Ty)], types.Ty, e
 
 // E0201 when built-in `name` compares values of type `t` that have no
 // equality: functions, channels, `dyn` values, capabilities, and values
-// holding a capability, as `==` refuses them.
+// holding one of them, as `==` refuses them.
 pub fn refuse_compare(st: env.State, sp: ast.Span, name: Str, t: types.Ty) -> env.State {
     let t = st.repr(t)
-    match t {
-        TFn(..) | TCap(_) | TChan(_) | TAtomic | TShared(_) | TDyn(..) => st.report(diag.error("E0201", sp, "`{name}` compares values, and values of type `{st.show(t)}` cannot be compared")),
-        _ => match st.held(t) {
+    match st.subst.refused(env.equality(), t) {
+        Some(Itself) => st.report(diag.error("E0201", sp, "`{name}` compares values, and values of type `{st.show(t)}` cannot be compared")),
+        Some(Inside(u)) => st.report(diag.error("E0201", sp, "`{name}` compares values, and {st.holds_uncomparable(t, u)}")),
+        None => match st.held(t) {
             Some(h) => st.report(diag.error("E0201", sp, "`{name}` compares values, and {h}").note("capabilities have no equality, so neither has a value holding one; compare something it holds that is not a capability, as in `xs.any(|x| x.name == name)`")),
             None => st,
         },
@@ -847,9 +847,9 @@ fn builtin_call(st: env.State, cx: env.Cx, fx: env.Fx, n: Str, args: List[ast.Ex
                 [a, b] => {
                     let (t, next) = check_expr(st, cx, fx, a)
                     let next = expect(next, cx, fx, b, t)
-                    match next.repr(t) {
-                        TFn(..) | TCap(_) | TChan(_) | TAtomic | TShared(_) | TDyn(..) => next.report(diag.error("E0201", sp, "values of type `{next.show(t)}` cannot be compared")),
-                        _ => {
+                    match next.subst.refused(env.equality(), t) {
+                        Some(Itself) => next.report(diag.error("E0201", sp, "values of type `{next.show(t)}` cannot be compared")),
+                        Some(Inside(_)) | None => {
                             let mut next = next
                             next.eq_types = [t] + next.eq_types
                             refuse_compare(next, sp, "assert_eq", t)
@@ -1269,7 +1269,7 @@ fn builtin_method(st: env.State, cx: env.Cx, t: types.Ty, name: Str, file: Int) 
 
 // The interface methods of bound `b`, its parameters replaced by the
 // bound's arguments.
-fn iface_methods(st: env.State, cx: env.Cx, b: env.Bound) -> List[env.IfaceMethod] {
+pub fn iface_methods(st: env.State, cx: env.Cx, b: env.Bound) -> List[env.IfaceMethod] {
     let ms = cx.ifaces.get(b.iface) ?? []
     match cx.iface_gen.get(b.iface) {
         Some(gs) if !gs.is_empty() && gs.len() == b.args.len() => {
@@ -2114,10 +2114,11 @@ fn check_bin(st: env.State, cx: env.Cx, fx: env.Fx, op: ast.BinOp, a: ast.Expr, 
                 _ => {
                     let mut st = st
                     st.eq_types = [t] + st.eq_types
-                    match t {
-                        TFn(..) | TCap(_) | TChan(_) | TAtomic | TShared(_) | TDyn(..) => (TBool, bad(st)),
+                    match st.subst.refused(env.equality(), t) {
+                        Some(Itself) => (TBool, bad(st)),
+                        Some(Inside(u)) => (TBool, st.report(diag.error("E0201", sp, "operator `{op_name(op)}` cannot be applied to `{st.show(t)}`").note(st.holds_uncomparable(t, u)))),
                         // capabilities have no equality, so neither has a value holding one
-                        _ => match st.held(t) {
+                        None => match st.held(t) {
                             Some(h) => (TBool, st.report(diag.error("E0201", sp, "operator `{op_name(op)}` cannot be applied to `{st.show(t)}`").note(h + ", and capabilities cannot be compared"))),
                             None => (TBool, st),
                         },

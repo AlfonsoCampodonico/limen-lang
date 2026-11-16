@@ -1,0 +1,8 @@
+# Authority cannot reach a dependency out of sight: a capability carried by
+# a channel, or returned by a method of a type parameter's bound, counts
+# against its grant (E0320).
+[package]
+name = "app"
+
+[dependencies]
+hidden = { path = "hidden" }

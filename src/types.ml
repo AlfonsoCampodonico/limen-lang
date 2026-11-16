@@ -88,16 +88,50 @@ let rec show t =
   | TVar _ -> "_"
   | TErr -> "?"
 
-let rec occurs r t =
+(* The types directly inside [t], in order: every walk over a type goes
+   through here. There is no wildcard, so a new type constructor does not
+   compile until it says what it holds, and every analysis below then sees
+   inside it. *)
+let children t =
   match repr t with
-  | TVar r' -> r == r'
-  | TList a | TGroup a | TChan a | TShared a -> occurs r a
-  | TArray (a, n) -> occurs r a || occurs r n
-  | TDyn (_, a) -> List.exists (occurs r) a
-  | TMap (k, v) -> occurs r k || occurs r v
-  | TFn (ps, b) -> List.exists (occurs r) ps || occurs r b
-  | TNamed (_, a) -> List.exists (occurs r) a
-  | _ -> false
+  | TInt | TFloat | TBool | TStr | TBytes | TUnit | TCap _ | TLen _ | TAtomic | TParam _ | TVar _ | TErr -> []
+  | TList a | TGroup a | TChan a | TShared a -> [ a ]
+  | TArray (a, n) -> [ a; n ]
+  | TMap (k, v) -> [ k; v ]
+  | TFn (ps, r) -> ps @ [ r ]
+  | TNamed (_, args) | TDyn (_, args) -> args
+
+(* [f] folded over every type inside [t], children first, then [t]. *)
+let rec fold f acc t = f (List.fold_left (fold f) acc (children t)) t
+
+(* The first result [f] gives, trying [t] first, then the types inside it
+   in order. *)
+let rec find_map f t = match f t with Some _ as r -> r | None -> List.find_map (find_map f) (children t)
+
+let exists p t = find_map (fun u -> if p u then Some () else None) t <> None
+
+(* What a type is at its top, for the rules about authority, shared state
+   and equality. *)
+type kind =
+  | Plain (* data, or a container whose items [children] gives *)
+  | Cap of cap
+  | State of string (* state tasks share: "channel", "Atomic" or "Shared" *)
+  | Func
+  | Dyn
+  | Named of string (* a struct or enum, which may hold authority through its fields *)
+
+let kind t =
+  match repr t with
+  | TInt | TFloat | TBool | TStr | TBytes | TUnit | TLen _ | TParam _ | TVar _ | TErr | TList _ | TArray _ | TMap _ | TGroup _ -> Plain
+  | TCap c -> Cap c
+  | TChan _ -> State "channel"
+  | TAtomic -> State "Atomic"
+  | TShared _ -> State "Shared"
+  | TFn _ -> Func
+  | TDyn _ -> Dyn
+  | TNamed (n, _) -> Named n
+
+let occurs r t = exists (fun u -> match repr u with TVar r' -> r == r' | _ -> false) t
 
 exception Mismatch
 
@@ -147,45 +181,33 @@ let rec subst env t =
    capability has no entry. *)
 let authority : (string, (cap * string) list) Hashtbl.t = Hashtbl.create 16
 
+let add_cap c acc = if List.mem c acc then acc else c :: acc
+
 (* Capabilities a value of the type holds: written in the type, or reached
    through the fields and payloads of the structs and enums in it. *)
-let rec caps_in t acc =
-  match repr t with
-  | TCap c -> if List.mem c acc then acc else c :: acc
-  | TList a | TArray (a, _) | TShared a -> caps_in a acc
-  | TMap (k, v) -> caps_in v (caps_in k acc)
-  | TFn (ps, r) -> List.fold_left (fun acc p -> caps_in p acc) (caps_in r acc) ps
-  | TNamed (n, args) ->
-    let acc = List.fold_left (fun acc a -> caps_in a acc) acc args in
-    (match Hashtbl.find_opt authority n with
-     | Some held -> List.fold_left (fun acc (c, _) -> if List.mem c acc then acc else c :: acc) acc held
-     | None -> acc)
-  | _ -> acc
+let caps_in t acc =
+  fold
+    (fun acc u ->
+      match kind u with
+      | Cap c -> add_cap c acc
+      | Named n -> (match Hashtbl.find_opt authority n with Some held -> List.fold_left (fun acc (c, _) -> add_cap c acc) acc held | None -> acc)
+      | Plain | State _ | Func | Dyn -> acc)
+    acc t
 
 (* The capabilities written in the type itself, not those its structs and
    enums hold through their fields. *)
-let rec caps_written t acc =
-  match repr t with
-  | TCap c -> if List.mem c acc then acc else c :: acc
-  | TList a | TArray (a, _) | TShared a -> caps_written a acc
-  | TMap (k, v) -> caps_written v (caps_written k acc)
-  | TFn (ps, r) -> List.fold_left (fun acc p -> caps_written p acc) (caps_written r acc) ps
-  | TNamed (_, args) -> List.fold_left (fun acc a -> caps_written a acc) acc args
-  | _ -> acc
+let caps_written t acc = fold (fun acc u -> match kind u with Cap c -> add_cap c acc | Plain | State _ | Func | Dyn | Named _ -> acc) acc t
 
 (* Where a type that does not write capability [c] gets it from: the path
    through the first struct or enum in it that holds [c] (its own entry
    first, then its type arguments in order). *)
-let rec via t c =
-  match repr t with
-  | TList a | TArray (a, _) | TShared a -> via a c
-  | TMap (k, v) -> (match via k c with Some p -> Some p | None -> via v c)
-  | TFn (ps, r) -> List.find_map (fun p -> via p c) (ps @ [ r ])
-  | TNamed (n, args) -> (
-    match Option.bind (Hashtbl.find_opt authority n) (List.assoc_opt c) with
-    | Some p -> Some p
-    | None -> List.find_map (fun a -> via a c) args)
-  | _ -> None
+let via t c =
+  find_map
+    (fun u ->
+      match kind u with
+      | Named n -> Option.bind (Hashtbl.find_opt authority n) (List.assoc_opt c)
+      | Plain | Cap _ | State _ | Func | Dyn -> None)
+    t
 
 (* Fill [authority] for the program's structs and enums: [fields] gives a
    type's fields (a variant's payloads are named by the variant), in
@@ -206,13 +228,7 @@ let compute_authority (names : string list) (fields : string -> (string * ty) li
           | None -> ()
         end
       and walk path t =
-        match repr t with
-        | TCap c -> add c path
-        | TList a | TArray (a, _) | TShared a -> walk path a
-        | TMap (k, v) -> walk path k; walk path v
-        | TFn (ps, r) -> List.iter (walk path) ps; walk path r
-        | TNamed (m, args) -> List.iter (walk path) args; enter m path
-        | _ -> ()
+        fold (fun () u -> match kind u with Cap c -> add c path | Named m -> enter m path | Plain | State _ | Func | Dyn -> ()) () t
       in
       enter n n;
       if !found <> [] then Hashtbl.replace authority n !found)
@@ -220,43 +236,49 @@ let compute_authority (names : string list) (fields : string -> (string * ty) li
 
 (* Channels, Atomics and Shareds: state tasks share, so values holding one
    are never pure, never `dyn` and never stored in a struct. *)
-let rec has_chan t =
-  match repr t with
-  | TChan _ | TAtomic | TShared _ -> true
-  | TList a | TArray (a, _) -> has_chan a
-  | TMap (k, v) -> has_chan k || has_chan v
-  | TFn (ps, r) -> List.exists has_chan ps || has_chan r
-  | TNamed (_, args) -> List.exists has_chan args
-  | _ -> false
+let has_chan t = exists (fun u -> match kind u with State _ -> true | Plain | Cap _ | Func | Dyn | Named _ -> false) t
 
 (* What [has_chan] found first: "channel", or the Atomic or Shared type. *)
-let rec chan_kind t =
-  match repr t with
-  | TChan _ -> Some "channel"
-  | TAtomic -> Some "Atomic"
-  | TShared _ -> Some "Shared"
-  | TList a | TArray (a, _) -> chan_kind a
-  | TMap (k, v) -> (match chan_kind k with Some w -> Some w | None -> chan_kind v)
-  | TFn (ps, r) -> List.find_map chan_kind (ps @ [ r ])
-  | TNamed (_, args) -> List.find_map chan_kind args
-  | _ -> None
+let chan_kind t = find_map (fun u -> match kind u with State w -> Some w | Plain | Cap _ | Func | Dyn | Named _ -> None) t
 
 (* Does [t] mention a `dyn` type? *)
-let rec has_dyn t =
-  match repr t with
-  | TDyn _ -> true
-  | TList a | TChan a | TShared a | TArray (a, _) -> has_dyn a
-  | TMap (k, v) -> has_dyn k || has_dyn v
-  | TNamed (_, xs) -> List.exists has_dyn xs
-  | _ -> false
+let has_dyn t = exists (fun u -> match kind u with Dyn -> true | Plain | Cap _ | State _ | Func | Named _ -> false) t
 
-let rec has_fn t =
-  match repr t with
-  | TFn _ -> true
-  | TList a | TArray (a, _) | TShared a -> has_fn a
-  | TMap (k, v) -> has_fn k || has_fn v
-  | TNamed (_, args) -> List.exists has_fn args
-  | _ -> false
+let has_fn t = exists (fun u -> match kind u with Func -> true | Plain | Cap _ | State _ | Dyn | Named _ -> false) t
+
+(* How far a rule looks into a type for a kind of value: not at all, at the
+   type itself only, or anywhere in it (element, key, payload, parameter
+   and result types, and the type arguments of structs and enums). *)
+type depth = Never | Top | Deep
+
+(* What a rule refuses, and how deep it looks for each: state tasks share
+   (channels, Atomics, Shareds), functions, `dyn` values, and capabilities
+   written in the type (those held through a struct's fields are
+   [caps_in]'s, which the rules about authority ask separately). *)
+type policy = { state : depth; fns : depth; dyns : depth; caps : depth }
+
+type found = Itself | Inside of ty
+
+(* The part of [t] that [p] refuses: [t] itself, or else the first type
+   inside it whose kind [p] refuses at any depth, shared state first, then
+   functions, `dyn` values and capabilities. *)
+let refused p t =
+  let reach u =
+    match kind u with
+    | State _ -> p.state
+    | Func -> p.fns
+    | Dyn -> p.dyns
+    | Cap _ -> p.caps
+    | Plain | Named _ -> Never
+  in
+  if reach t <> Never then Some Itself
+  else
+    let deep k = find_map (fun u -> if k u && reach u = Deep then Some (Inside (repr u)) else None) t in
+    List.find_map deep
+      [ (fun u -> match kind u with State _ -> true | Plain | Cap _ | Func | Dyn | Named _ -> false);
+        (fun u -> kind u = Func);
+        (fun u -> kind u = Dyn);
+        (fun u -> match kind u with Cap _ -> true | Plain | State _ | Func | Dyn | Named _ -> false) ]
 
 (* Substitute generics and default any still-unknown type to (). The result
    contains no TVar or TParam, which is what code generation needs. *)

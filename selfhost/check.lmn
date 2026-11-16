@@ -84,7 +84,8 @@ fn main(root: Root) -> Int {
         })
         let cond = if i.pure_if.is_empty() { "" } else { " if=" + i.pure_if.join(",") }
         let libs = if i.libs.is_empty() { "" } else { " libs=" + i.libs.join(",") }
-        out.print("CAPS {i.name} {diag.path_of(files, i.span.file)} {i.span.lo} {i.span.hi} [{caps.join(",")}] {i.callbacks}{cond}{libs}")
+        let shares = if i.shares { " shares" } else { "" }
+        out.print("CAPS {i.name} {diag.path_of(files, i.span.file)} {i.span.lo} {i.span.hi} [{caps.join(",")}] {i.callbacks}{shares}{cond}{libs}")
     }
     for i in c.items {
         out.print(ast_print.item_line(i))

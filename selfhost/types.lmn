@@ -135,17 +135,81 @@ pub fn show(self: Subst, t: Ty) -> Str {
     }
 }
 
+// The types directly inside `t`, in order: every walk over a type goes
+// through here. There is no wildcard, so a new type does not compile until
+// it says what it holds, and every analysis below then sees inside it.
+pub fn children(self: Subst, t: Ty) -> List[Ty] {
+    match self.repr(t) {
+        TInt | TFloat | TBool | TStr | TBytes | TUnit | TCap(_) | TLen(_) | TAtomic | TParam(_) | TVar(_) | TErr => [],
+        TList(a) | TGroup(a) | TChan(a) | TShared(a) => [a],
+        TArray(a, n) => [a, n],
+        TMap(k, v) => [k, v],
+        TFn(ps, r) => ps + [r],
+        TNamed(_, args) | TDyn(_, args) => args,
+    }
+}
+
+// `f` folded over every type inside `t`, children first, then `t`.
+pub fn fold[A](self: Subst, t: Ty, acc: A, f: fn(A, Ty) -> A) -> A {
+    f(self.children(t).fold(acc, |got, c| self.fold(c, got, f)), t)
+}
+
+// The first result `f` gives, trying `t` first, then the types inside it in
+// order.
+pub fn find_map[X](self: Subst, t: Ty, f: fn(Ty) -> Option[X]) -> Option[X] {
+    match f(t) {
+        Some(x) => Some(x),
+        None => {
+            for c in self.children(t) {
+                match self.find_map(c, f) {
+                    Some(x) => {
+                        return Some(x)
+                    },
+                    None => {},
+                }
+            }
+            None
+        },
+    }
+}
+
+pub fn exists(self: Subst, t: Ty, p: fn(Ty) -> Bool) -> Bool {
+    self.find_map(t, |u| if p(u) { Some(()) } else { None }).is_some()
+}
+
+// What a type is at its top, for the rules about authority, shared state
+// and equality.
+pub enum Kind {
+    // data, or a container whose items `children` gives
+    KPlain,
+    KCap(Str),
+    // state tasks share: "channel", "Atomic" or "Shared"
+    KState(Str),
+    KFn,
+    KDyn,
+    // a struct or enum, which may hold authority through its fields
+    KNamed(Str),
+}
+
+pub fn kind(self: Subst, t: Ty) -> Kind {
+    match self.repr(t) {
+        TInt | TFloat | TBool | TStr | TBytes | TUnit | TLen(_) | TParam(_) | TVar(_) | TErr | TList(_) | TArray(..) | TMap(..) | TGroup(_) => KPlain,
+        TCap(c) => KCap(c),
+        TChan(_) => KState("channel"),
+        TAtomic => KState("Atomic"),
+        TShared(_) => KState("Shared"),
+        TFn(..) => KFn,
+        TDyn(..) => KDyn,
+        TNamed(n, _) => KNamed(n),
+    }
+}
+
 // Does variable `v` occur in `t`?
 fn occurs(self: Subst, v: Int, t: Ty) -> Bool {
-    match self.repr(t) {
+    self.exists(t, |u| match self.repr(u) {
         TVar(w) => v == w,
-        TList(a) | TGroup(a) | TChan(a) | TShared(a) => self.occurs(v, a),
-        TArray(a, n) => self.occurs(v, a) || self.occurs(v, n),
-        TDyn(_, args) | TNamed(_, args) => args.any(|a| self.occurs(v, a)),
-        TMap(k, x) => self.occurs(v, k) || self.occurs(v, x),
-        TFn(ps, r) => ps.any(|p| self.occurs(v, p)) || self.occurs(v, r),
         _ => false,
-    }
+    })
 }
 
 // Make `a` and `b` the same type, linking variables where needed. False
@@ -220,62 +284,37 @@ pub fn subst(self: Subst, env: List[(Str, Ty)], t: Ty) -> Ty {
     }
 }
 
+fn add_cap(c: Str, acc: List[Str]) -> List[Str] {
+    if acc.contains(c) { acc } else { [c] + acc }
+}
+
 // The capabilities a value of type `t` holds: written in the type, or
-// reached through the fields and payloads of the structs and enums in it,
-// in the order OCaml's caps_in finds them (it puts each new one in front).
+// reached through the fields and payloads of the structs and enums in it.
 pub fn caps_in(self: Subst, t: Ty, acc: List[Str]) -> List[Str] {
-    match self.repr(t) {
-        TCap(c) => if acc.contains(c) { acc } else { [c] + acc },
-        TList(a) | TArray(a, _) | TShared(a) => self.caps_in(a, acc),
-        TMap(k, v) => self.caps_in(v, self.caps_in(k, acc)),
-        TFn(ps, r) => ps.fold(self.caps_in(r, acc), |got, p| self.caps_in(p, got)),
-        TNamed(n, args) => {
-            let got = args.fold(acc, |got, a| self.caps_in(a, got))
-            (self.authority.get(n) ?? []).fold(got, |got, held| if got.contains(held.0) { got } else { [held.0] + got })
-        },
-        _ => acc,
-    }
+    self.fold(t, acc, |got, u| match self.kind(u) {
+        KCap(c) => add_cap(c, got),
+        KNamed(n) => (self.authority.get(n) ?? []).fold(got, |got, held| add_cap(held.0, got)),
+        KPlain | KState(_) | KFn | KDyn => got,
+    })
 }
 
 // The capabilities written in `t` itself, not those its structs and enums
 // hold through their fields.
 pub fn caps_written(self: Subst, t: Ty, acc: List[Str]) -> List[Str] {
-    match self.repr(t) {
-        TCap(c) => if acc.contains(c) { acc } else { [c] + acc },
-        TList(a) | TArray(a, _) | TShared(a) => self.caps_written(a, acc),
-        TMap(k, v) => self.caps_written(v, self.caps_written(k, acc)),
-        TFn(ps, r) => ps.fold(self.caps_written(r, acc), |got, p| self.caps_written(p, got)),
-        TNamed(_, args) => args.fold(acc, |got, a| self.caps_written(a, got)),
-        _ => acc,
-    }
+    self.fold(t, acc, |got, u| match self.kind(u) {
+        KCap(c) => add_cap(c, got),
+        KPlain | KState(_) | KFn | KDyn | KNamed(_) => got,
+    })
 }
 
 // Where a type that does not write capability `c` gets it from: the path
 // through the first struct or enum in it that holds `c` (its own entry
 // first, then its type arguments in order).
 pub fn via(self: Subst, t: Ty, c: Str) -> Option[Str] {
-    match self.repr(t) {
-        TList(a) | TArray(a, _) | TShared(a) => self.via(a, c),
-        TMap(k, v) => first_via(self, [k, v], c),
-        TFn(ps, r) => first_via(self, ps + [r], c),
-        TNamed(n, args) => match (self.authority.get(n) ?? []).find(|held| held.0 == c) {
-            Some(held) => Some(held.1),
-            None => first_via(self, args, c),
-        },
-        _ => None,
-    }
-}
-
-fn first_via(s: Subst, ts: List[Ty], c: Str) -> Option[Str] {
-    for t in ts {
-        match s.via(t, c) {
-            Some(p) => {
-                return Some(p)
-            },
-            None => {},
-        }
-    }
-    None
+    self.find_map(t, |u| match self.kind(u) {
+        KNamed(n) => (self.authority.get(n) ?? []).find(|held| held.0 == c).map(|held| held.1),
+        KPlain | KCap(_) | KState(_) | KFn | KDyn => None,
+    })
 }
 
 // The authority each of the structs and enums `names` holds through its
@@ -312,89 +351,105 @@ fn enter(s: Subst, fields: Map[Str, List[(Str, Ty)]], m: Str, path: Str, found: 
 }
 
 fn walk(s: Subst, fields: Map[Str, List[(Str, Ty)]], path: Str, t: Ty, found: List[(Str, Str)], seen: List[Str]) -> (List[(Str, Str)], List[Str]) {
-    match s.repr(t) {
-        TCap(c) => (if found.any(|held| held.0 == c) { found } else { found + [(c, path)] }, seen),
-        TList(a) | TArray(a, _) | TShared(a) => walk(s, fields, path, a, found, seen),
-        TMap(k, v) => {
-            let (f1, s1) = walk(s, fields, path, k, found, seen)
-            walk(s, fields, path, v, f1, s1)
-        },
-        TFn(ps, r) => {
-            let mut acc = (found, seen)
-            for p in ps + [r] {
-                acc = walk(s, fields, path, p, acc.0, acc.1)
-            }
-            acc
-        },
-        TNamed(m, args) => {
-            let mut acc = (found, seen)
-            for a in args {
-                acc = walk(s, fields, path, a, acc.0, acc.1)
-            }
-            enter(s, fields, m, path, acc.0, acc.1)
-        },
-        _ => (found, seen),
-    }
+    s.fold(t, (found, seen), |acc, u| match s.kind(u) {
+        KCap(c) => (if acc.0.any(|held| held.0 == c) { acc.0 } else { acc.0 + [(c, path)] }, acc.1),
+        KNamed(m) => enter(s, fields, m, path, acc.0, acc.1),
+        KPlain | KState(_) | KFn | KDyn => acc,
+    })
 }
 
 // Channels, Atomics and Shareds: state tasks share, so a value that
 // holds one is never pure, never `dyn` and never stored in a struct.
 pub fn has_chan(self: Subst, t: Ty) -> Bool {
-    match self.repr(t) {
-        TChan(_) | TAtomic | TShared(_) => true,
-        TList(a) | TArray(a, _) => self.has_chan(a),
-        TMap(k, v) => self.has_chan(k) || self.has_chan(v),
-        TFn(ps, r) => ps.any(|p| self.has_chan(p)) || self.has_chan(r),
-        TNamed(_, args) => args.any(|a| self.has_chan(a)),
-        _ => false,
-    }
+    self.chan_kind(t).is_some()
 }
 
 // What has_chan found first: "channel", or the Atomic or Shared type.
 pub fn chan_kind(self: Subst, t: Ty) -> Option[Str] {
-    match self.repr(t) {
-        TChan(_) => Some("channel"),
-        TAtomic => Some("Atomic"),
-        TShared(_) => Some("Shared"),
-        TList(a) | TArray(a, _) => self.chan_kind(a),
-        TMap(k, v) => first_kind(self, [k, v]),
-        TFn(ps, r) => first_kind(self, ps + [r]),
-        TNamed(_, args) => first_kind(self, args),
-        _ => None,
+    self.find_map(t, |u| match self.kind(u) {
+        KState(w) => Some(w),
+        KPlain | KCap(_) | KFn | KDyn | KNamed(_) => None,
+    })
+}
+
+// Does `t` mention a `dyn` type?
+pub fn has_dyn(self: Subst, t: Ty) -> Bool {
+    self.exists(t, |u| match self.kind(u) {
+        KDyn => true,
+        KPlain | KCap(_) | KState(_) | KFn | KNamed(_) => false,
+    })
+}
+
+pub fn has_fn(self: Subst, t: Ty) -> Bool {
+    self.exists(t, |u| match self.kind(u) {
+        KFn => true,
+        KPlain | KCap(_) | KState(_) | KDyn | KNamed(_) => false,
+    })
+}
+
+// How far a rule looks into a type for a kind of value: not at all, at the
+// type itself only, or anywhere in it (element, key, payload, parameter and
+// result types, and the type arguments of structs and enums).
+pub enum Depth {
+    Never,
+    Top,
+    Deep,
+}
+
+// What a rule refuses, and how deep it looks for each: state tasks share
+// (channels, Atomics, Shareds), functions, `dyn` values, and capabilities
+// written in the type (those held through a struct's fields are caps_in's,
+// which the rules about authority ask separately).
+pub struct Policy {
+    state: Depth,
+    fns: Depth,
+    dyns: Depth,
+    caps: Depth,
+}
+
+pub enum Found {
+    Itself,
+    Inside(Ty),
+}
+
+fn reach(self: Subst, p: Policy, u: Ty) -> Depth {
+    match self.kind(u) {
+        KState(_) => p.state,
+        KFn => p.fns,
+        KDyn => p.dyns,
+        KCap(_) => p.caps,
+        KPlain | KNamed(_) => Never,
     }
 }
 
-fn first_kind(s: Subst, ts: List[Ty]) -> Option[Str] {
-    for t in ts {
-        match s.chan_kind(t) {
-            Some(k) => {
-                return Some(k)
+// Which of the refused kinds `u` is, in the order they are looked for:
+// shared state, functions, `dyn` values, capabilities.
+fn refused_rank(self: Subst, u: Ty) -> Int {
+    match self.kind(u) {
+        KState(_) => 0,
+        KFn => 1,
+        KDyn => 2,
+        KCap(_) => 3,
+        KPlain | KNamed(_) => -1,
+    }
+}
+
+// The part of `t` that `p` refuses: `t` itself, or else the first type
+// inside it whose kind `p` refuses at any depth, shared state first, then
+// functions, `dyn` values and capabilities.
+pub fn refused(self: Subst, p: Policy, t: Ty) -> Option[Found] {
+    if self.reach(p, t) != Never {
+        return Some(Itself)
+    }
+    for rank in 0..<4 {
+        match self.find_map(t, |u| if self.refused_rank(u) == rank && self.reach(p, u) == Deep { Some(self.repr(u)) } else { None }) {
+            Some(u) => {
+                return Some(Inside(u))
             },
             None => {},
         }
     }
     None
-}
-
-// Does `t` mention a `dyn` type?
-pub fn has_dyn(self: Subst, t: Ty) -> Bool {
-    match self.repr(t) {
-        TDyn(..) => true,
-        TList(a) | TChan(a) | TShared(a) | TArray(a, _) => self.has_dyn(a),
-        TMap(k, v) => self.has_dyn(k) || self.has_dyn(v),
-        TNamed(_, args) => args.any(|a| self.has_dyn(a)),
-        _ => false,
-    }
-}
-
-pub fn has_fn(self: Subst, t: Ty) -> Bool {
-    match self.repr(t) {
-        TFn(..) => true,
-        TList(a) | TArray(a, _) | TShared(a) => self.has_fn(a),
-        TMap(k, v) => self.has_fn(k) || self.has_fn(v),
-        TNamed(_, args) => args.any(|a| self.has_fn(a)),
-        _ => false,
-    }
 }
 
 // `t` for code generation: the type parameters of `env` replaced by their

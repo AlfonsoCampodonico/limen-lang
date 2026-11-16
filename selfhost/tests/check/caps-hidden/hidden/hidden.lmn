@@ -1,0 +1,26 @@
+pub interface Giver {
+    fn give(self) -> Stdout
+}
+
+pub interface Taker {
+    fn take(self, f: fn(Fs))
+}
+
+pub fn via_chan(c: Chan[Stdout]) {
+    match c.recv() {
+        Some(o) => o.print("via chan"),
+        None => (),
+    }
+}
+
+pub fn via_iface[T: Giver](x: T) {
+    x.give().print("via interface")
+}
+
+pub fn via_callback[T: Taker](x: T) {
+    x.take(|fs| fs.remove("x") ?? ())
+}
+
+pub fn ints(c: Chan[Int]) -> Int {
+    c.recv() ?? 0
+}
