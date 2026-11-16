@@ -36,7 +36,7 @@ fn usage() -> Str {
 
 usage:
   limen run FILE [--native] [--grant net=HOST[:PORT]|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST:PORT]... [--grant env=NAME|*]... [--grant exec=PROGRAM[ ARGS|ARGS...]|*]... [--grant foreign=LIB[,LIB...]|*]... [--seed N] [--no-sandbox] [-- ARGS...]
-  limen build FILE [-o OUT] [--emit-c]
+  limen build FILE [-o OUT] [--dev] [--emit-c]
   limen check FILE [--json]
   limen caps FILE [--json]
   limen explain CODE
@@ -104,6 +104,7 @@ fn main(root: Root) -> Int {
             let mut target: Option[Str] = None
             let mut emit_c = false
             let mut tests = false
+            let mut dev = false
             let mut i = 0
             while i < rest.len() {
                 let a = rest[i]
@@ -116,6 +117,8 @@ fn main(root: Root) -> Int {
                     emit_c = true
                 } else if a == "--tests" {
                     tests = true
+                } else if a == "--dev" {
+                    dev = true
                 } else if file.is_none() {
                     file = Some(a)
                 } else {
@@ -124,7 +127,7 @@ fn main(root: Root) -> Int {
                 i = i + 1
             }
             match file {
-                Some(f) => build(cx, root.exec, root.env, f, target, emit_c, tests),
+                Some(f) => build(cx, root.exec, root.env, f, target, dev, emit_c, tests),
                 None => die_usage(err, "build needs a FILE"),
             }
         },
@@ -333,7 +336,7 @@ fn default_output(file: Str) -> Str {
     }
 }
 
-fn build(cx: Ctx, exec: Exec, env: Env, file: Str, target: Option[Str], emit_c: Bool, tests: Bool) -> Int {
+fn build(cx: Ctx, exec: Exec, env: Env, file: Str, target: Option[Str], dev: Bool, emit_c: Bool, tests: Bool) -> Int {
     let (out, err, fs) = (cx.out, cx.err, cx.fs)
     let f = match load(err, fs, cx.place, file) {
         Ok(f) => f,
@@ -381,8 +384,8 @@ fn build(cx: Ctx, exec: Exec, env: Env, file: Str, target: Option[Str], emit_c: 
         }
     }
     let n = native.setting(env, cx.place)
-    let builder = native.Builder { setting: n, exec, fs }
-    match builder.build(c_text, sources.tls(), ffi.libs(c.items), exe) {
+    let builder = native.Builder { setting: n, exec, fs, dev, runtime: sources.runtime(), header: sources.runtime_header(), tls_text: sources.tls() }
+    match builder.build(c_text, ffi.libs(c.items), exe) {
         Ok(_) => {
             n.remove_c(fs, exe)
             0

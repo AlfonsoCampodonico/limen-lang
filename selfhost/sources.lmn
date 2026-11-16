@@ -15,9 +15,16 @@ pub fn std() -> Map[Str, Str] {
     files
 }
 
-// The C every program starts with: the sandbox, then the runtime.
+// The C every program starts with: the sandbox, then the runtime's
+// declarations and definitions.
 pub fn runtime() -> Str {
-    embed("../src/runtime/limen_sandbox.h") + embed("../src/runtime/limen_rt.h")
+    embed("../src/runtime/limen_sandbox.h") + runtime_header() + embed("../src/runtime/limen_rt.c")
+}
+
+// The runtime's declarations alone, which each piece of a split build
+// includes.
+pub fn runtime_header() -> Str {
+    embed("../src/runtime/limen_rt.h")
 }
 
 // The TLS core, pasted in ahead of the runtime when a program may use TLS.

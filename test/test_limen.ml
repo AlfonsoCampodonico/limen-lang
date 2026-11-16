@@ -8200,15 +8200,17 @@ fn main(root: Root) {
   ok "errors-and-warnings-count" (code = 1 && String.ends_with ~suffix:"\n1 error, 1 warning\n" e) (sprintf "code %d, err %S" code e);
 
   (* the build cache: the same program again is a copy of the first build
-     wherever it goes, a changed program builds anew, and LIMEN_CACHE=off
-     never touches the cache *)
+     wherever it goes, a changed program builds anew against the runtime
+     object the first build kept, and LIMEN_CACHE=off never touches the
+     cache. Entries without a dot are binaries. *)
   (let dir = Filename.concat pdir "own-cache" in
    let prog = Filename.concat pdir "cached.lmn" in
    let write text = Out_channel.with_open_bin prog (fun oc -> output_string oc text) in
    let build ?(cache = dir) out =
      Sys.command (sprintf "LIMEN_CACHE=%s %s build %s -o %s >/dev/null 2>&1" (Filename.quote cache) (Filename.quote limen_exe) (Filename.quote prog) (Filename.quote out))
    in
-   let entries () = try Array.length (Sys.readdir dir) with Sys_error _ -> 0 in
+   let entries () = try List.length (List.filter (fun f -> not (String.contains f '.')) (Array.to_list (Sys.readdir dir))) with Sys_error _ -> 0 in
+   let objects () = try List.length (List.filter (fun f -> Filename.check_suffix f ".o") (Array.to_list (Sys.readdir dir))) with Sys_error _ -> 0 in
    let out n = Filename.concat pdir n in
    write "fn main(root: Root) {\n    root.stdout.print(\"cached\")\n}\n";
    let c1 = build (out "cached1") in
@@ -8219,11 +8221,11 @@ fn main(root: Root) {
    let ran = Sys.command (sprintf "%s > %s" (Filename.quote (out "cached2")) (Filename.quote (out "cached2.out"))) = 0 && read_file (out "cached2.out") = "cached\n" in
    write "fn main(root: Root) {\n    root.stdout.print(\"changed\")\n}\n";
    let c3 = build (out "cached3") in
-   let n3 = entries () in
+   let n3 = entries () and o3 = objects () in
    let c4 = build ~cache:"off" (out "cached4") in
    let n4 = entries () in
-   ok "build-cache" (same && ran && n1 = 1 && n2 = 1 && c3 = 0 && n3 = 2 && c4 = 0 && n4 = 2)
-     (sprintf "codes %d %d %d %d, entries %d %d %d %d, same %b, ran %b" c1 c2 c3 c4 n1 n2 n3 n4 same ran));
+   ok "build-cache" (same && ran && n1 = 1 && n2 = 1 && c3 = 0 && n3 = 2 && o3 = 1 && c4 = 0 && n4 = 2)
+     (sprintf "codes %d %d %d %d, entries %d %d %d %d, runtime objects %d, same %b, ran %b" c1 c2 c3 c4 n1 n2 n3 n4 o3 same ran));
   (* the examples' own tests, in both backends: the CRUD API's call its
      router directly, the operator's need no cluster *)
   List.iter
@@ -8410,7 +8412,7 @@ fn main(root: Root) {
      directories the test owns (never sealed: not root's) and on system ones.
      Nothing is sealed for root. *)
   (let rt = Runtime_text.text in
-   let marker = "/* Limen C runtime. Included verbatim" in
+   let marker = "/* Limen C runtime: the declarations." in
    let rec find i = if String.sub rt i (String.length marker) = marker then i else find (i + 1) in
    let sdir = Filename.concat pdir "sealed" in
    List.iter (fun d -> try Unix.mkdir d 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ()) [ sdir; Filename.concat sdir "tree"; Filename.concat sdir "tree/sub" ];

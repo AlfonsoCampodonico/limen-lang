@@ -50,18 +50,20 @@ The things newcomers hit in their first hour.
 Done when `todo_api.lmn` is noticeably shorter with nothing hand-written
 that the compiler could have written.
 
-## 0.6: debugging and build speed
+## 0.6: debugging
+
+Build speed is done. The runtime is compiled once and cached, with its
+declarations precompiled; a program's C is cut into pieces that compile in
+parallel; development builds (`limen build --dev`, `limen run --native`,
+`limen test --native`) skip optimisation. Hello world builds in 0.05 s and
+`todo_api.lmn` in 0.65 s optimised (it took 4 s), 0.2 s with `--dev`.
 
 - `#line` directives in the generated C, so lldb, gdb, the sanitizers and
   crash traces point at Limen lines.
-- Separate compilation: the runtime and standard library built once and
-  linked, with `-O0` for development. A cold build of an HTTP program takes
-  2 to 3 s today, nearly all of it in the C compiler.
 - Incremental checking for the language server.
 - A profiler and test coverage.
 
-Done when a crash in a native build shows the Limen line that caused it, and
-rebuilding after a one-line change takes under a second.
+Done when a crash in a native build shows the Limen line that caused it.
 
 ## 0.7: streams and the libraries people ask for
 
@@ -138,6 +140,10 @@ book and SPEC.md describe 1.0 exactly.
 
 - The interpreter starts a thread per blocking C call instead of using a
   pool.
+- A program cut into pieces calls its own functions across pieces as
+  ordinary external calls, so the C compiler can't change how they are
+  called. One piece keeps everything static; a large program could keep
+  static what no other piece calls.
 - No cancellation checkpoints inside a single built-in operation (a sort) or
   in the fast path of fill loops.
 

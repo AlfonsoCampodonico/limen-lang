@@ -13,6 +13,15 @@ let sprintf = Printf.sprintf
 let uses_tls = ref false
 let tls_marker = "/* limen: uses tls */\n"
 
+(* Whether [text] contains [word]. *)
+let contains text word =
+  let n = String.length text and m = String.length word in
+  let rec at i = i + m <= n && (String.sub text i m = word || at (i + 1)) in
+  at 0
+
+(* Follows the runtime in a program where no task can be cancelled. *)
+let no_checkpoints = "/* no group here has a deadline, so no task is ever cancelled */\n#undef W_CHECK\n#define W_CHECK() do { } while (0)"
+
 type ctx = {
   g : Lower.gctx;
   names : (string, string) Hashtbl.t; (* show t -> C name *)
@@ -1945,9 +1954,8 @@ let program (g : Lower.gctx) (prog : I.program) : string =
   List.iter
     (fun (n, s) -> Buffer.add_string lits (sprintf "static WStr %s = { 0, %d, (char*)%s };\n" n (String.length s) (c_string s)))
     c.lit_order;
-  (if !uses_tls then tls_marker else "")
-  ^ String.concat "\n"
-    [ Runtime_text.text; "/* ---- types ---- */"; Buffer.contents types; "/* ---- literals ---- */";
+  let program =
+    [ "/* ---- types ---- */"; Buffer.contents types; "/* ---- literals ---- */";
       Buffer.contents lits; "/* ---- closures ---- */"; Buffer.contents envs; Buffer.contents tasks; "/* ---- functions ---- */";
       Buffer.contents protos;
       (* each foreign C function under a private name, bound to its symbol by
@@ -1955,3 +1963,13 @@ let program (g : Lower.gctx) (prog : I.program) : string =
       String.concat "" (List.map (fun sym -> sprintf "extern void vf_%s(void) __asm__(W_CSYM(\"%s\"));\n" sym sym) c.csyms);
       cbdefs ^ String.concat "" c.bjobs;
       "/* ---- dyn vtables ---- */"; Buffer.contents dynbuf; Buffer.contents bodies; Buffer.contents main ]
+  in
+  (* Only a group with a deadline can cancel a task (the deadline cancels
+     the group, and a cancelled group's tasks are cancelled with it). In a
+     program with none, every checkpoint is a load of a counter that stays
+     0: say so, so the C compiler drops them from loops. *)
+  let never_stops =
+    if List.exists (fun part -> contains part "w_group_new_until(") program then []
+    else [ no_checkpoints ]
+  in
+  (if !uses_tls then tls_marker else "") ^ String.concat "\n" ((Runtime_text.text :: never_stops) @ program)

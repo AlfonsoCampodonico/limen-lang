@@ -114,10 +114,11 @@ pub fn link_flags(libs: List[Str]) -> List[Str] {
     libs.filter(|l| l != "c").map(|l| "-l" + l)
 }
 
-// The compiler's command line, as argv: -O3, no FMA contraction (float
-// results must not depend on the C compiler), wrapping integers.
-pub fn command(self: Setting, cflags: List[Str], libs: List[Str], c_file: Str, exe: Str) -> List[Str] {
-    [self.cc(), "-O3"] + cflags + ["-fwrapv", "-ffp-contract=off", "-fstack-clash-protection", "-fexceptions", "-w", "-o", exe, c_file] + libs + ["-lm"]
+// The compiler's command line, as argv: -O3, or -O0 for a development
+// build (`--dev`, faster to compile), no FMA contraction
+// (float results must not depend on the C compiler), wrapping integers.
+pub fn command(self: Setting, dev: Bool, cflags: List[Str], libs: List[Str], c_file: Str, exe: Str) -> List[Str] {
+    [self.cc(), if dev { "-O0" } else { "-O3" }] + cflags + ["-fwrapv", "-ffp-contract=off", "-fstack-clash-protection", "-fexceptions", "-w", "-o", exe, c_file] + libs + ["-lm"]
 }
 
 // ---------- the build cache ----------
@@ -263,46 +264,413 @@ fn run_cc(self: Setting, exec: Exec, argv: List[Str]) -> Result[(), Str] {
 }
 
 // A build, with what it needs both the Exec and the Fs for: the C
-// compiler's identity for the cache key, and the cache itself.
+// compiler's identity for the cache key, and the cache itself. `runtime`
+// is the whole runtime, `header` its declarations and `tls_text` the TLS
+// core (sources.lmn).
 pub struct Builder {
     setting: Setting,
     exec: Exec,
     fs: Fs,
+    dev: Bool,
+    runtime: Str,
+    header: Str,
+    tls_text: Str,
+}
+
+// The flags every compile shares.
+fn c_flags() -> List[Str] {
+    ["-fwrapv", "-ffp-contract=off", "-fstack-clash-protection", "-fexceptions", "-w"]
+}
+
+fn opt(self: Builder) -> Str {
+    if self.dev { "-O0" } else { "-O3" }
+}
+
+// ---------- split builds ----------
+//
+// As src/native.ml has it: the runtime is compiled once, as an object kept
+// in the build cache, and its declarations once, as a precompiled header
+// where the C compiler is clang; the program is cut into pieces of about
+// piece_lines() lines that compile at the same time against a shared
+// header. A small program is one piece, compiled and linked in one step.
+
+fn piece_lines() -> Int {
+    3000
+}
+
+fn pieces_max() -> Int {
+    16
+}
+
+// The runtime's functions are W_RT, `static` unless this says otherwise
+// (limen_rt.h).
+fn object_mode() -> Str {
+    "#define W_RT\n"
+}
+
+fn tls_defines() -> Str {
+    "#ifndef _GNU_SOURCE\n#define _GNU_SOURCE\n#endif\n#define LIMEN_TLS 1\n"
+}
+
+// The change in brace depth over `line`, outside strings, characters and
+// comments.
+fn brace_delta(line: Str) -> Int {
+    let b = line.bytes()
+    let n = b.len()
+    let mut d = 0
+    let mut q = 0
+    let mut i = 0
+    while i < n {
+        let c = b[i]
+        if q != 0 {
+            if c == 92 {
+                i = i + 2
+            } else {
+                if c == q {
+                    q = 0
+                }
+                i = i + 1
+            }
+            continue
+        }
+        if c == 47 && i + 1 < n && b[i + 1] == 42 {
+            match line.slice(i + 2, n).index_of("*/") {
+                Some(j) => {
+                    i = i + 4 + j
+                    continue
+                },
+                None => {
+                    return d
+                },
+            }
+        }
+        if c == 47 && i + 1 < n && b[i + 1] == 47 {
+            return d
+        }
+        if c == 34 || c == 39 {
+            q = c
+        } else if c == 123 {
+            d = d + 1
+        } else if c == 125 {
+            d = d - 1
+        }
+        i = i + 1
+    }
+    d
+}
+
+fn unstatic(s: Str) -> Str {
+    s.slice(7, s.len())
+}
+
+// The name a declaration or definition declares: the word before its
+// first parenthesis.
+fn name_of(s: Str) -> Str {
+    let p = s.index_of("(") ?? 0
+    let b = s.bytes()
+    let mut i = p
+    while i > 0 && word_byte(b[i - 1]) {
+        i = i - 1
+    }
+    s.slice(i, p)
+}
+
+fn word_byte(c: Int) -> Bool {
+    (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95
+}
+
+// The program's C (what follows the runtime) as the header its pieces
+// share and the pieces, as split_program in src/native.ml cuts it; None
+// for a shape it does not expect, and the program compiles as one file.
+pub fn split_program(text: Str) -> Option[(Str, List[Str])] {
+    let lines = text.split("\n")
+    let n = lines.len()
+    // the header; a prototype waits to learn whether its function moves to
+    // a piece (a function a macro defines stays static): (text, prototype)
+    let mut shared: List[(Str, Bool)] = []
+    let mut moved: Map[Str, Bool] = map()
+    let mut vars: List[Str] = []
+    let mut defs: List[(Int, Str)] = []
+    let mut i = 0
+    while i < n {
+        let start = i
+        let first = lines[start]
+        let mut d = brace_delta(first)
+        while d > 0 {
+            i = i + 1
+            if i >= n {
+                return None
+            }
+            d = d + brace_delta(lines[i])
+        }
+        if d < 0 {
+            return None
+        }
+        let last = i
+        i = i + 1
+        let item = lines.skip(start).take(last - start + 1).join("\n")
+        if first.starts_with("static inline ") || first.starts_with("static const ") {
+            shared.push((item, false))
+        } else if first.starts_with("int main(") {
+            defs.push((last - start + 1, item))
+        } else if first.starts_with("static ") {
+            let signature = match first.index_of(") \{") {
+                Some(k) if !first.slice(0, k).contains(" = ") => Some(k),
+                _ => None,
+            }
+            let assigns = first.index_of(" = ")
+            match signature {
+                // a definition
+                Some(k) => {
+                    moved[name_of(first)] = true
+                    shared.push((unstatic(first.slice(0, k + 1)) + ";", false))
+                    defs.push((last - start + 1, unstatic(item)))
+                },
+                // a prototype
+                None if assigns.is_none() && last == start && first.contains("(") && first.ends_with(");") => shared.push((first, true)),
+                // a variable
+                None if lines[last].ends_with(";") && (assigns.is_some() || last == start) => {
+                    let decl = match assigns {
+                        Some(k) => first.slice(0, k),
+                        None => first.slice(0, first.len() - 1),
+                    }
+                    shared.push(("extern " + unstatic(decl) + ";", false))
+                    vars.push(unstatic(item))
+                },
+                None => {
+                    return None
+                },
+            }
+        } else {
+            shared.push((item, false))
+        }
+    }
+    let header = shared.map(|e| {
+        let (t, proto) = e
+        if proto && moved.contains(name_of(t)) { unstatic(t) + "\n" } else { t + "\n" }
+    })
+    let total = defs.fold(0, |a, p| a + p.0)
+    let wanted = (total + piece_lines() - 1) / piece_lines()
+    let count = if wanted < 1 { 1 } else if wanted > pieces_max() { pieces_max() } else { wanted }
+    // one piece: the program as it was generated, everything still static,
+    // so the C compiler may change how its functions are called
+    if count == 1 {
+        return Some(("", [text]))
+    }
+    let mut pieces: List[List[Str]] = []
+    while pieces.len() < count {
+        pieces.push([])
+    }
+    pieces[0] = vars.map(|v| v + "\n")
+    let mut acc = 0
+    for (k, t) in defs {
+        let share = acc * count / (if total < 1 { 1 } else { total })
+        let at = if share > count - 1 { count - 1 } else { share }
+        pieces[at].push(t + "\n")
+        acc = acc + k
+    }
+    Some((header.join(""), pieces.map(|p| p.join(""))))
+}
+
+// Run every command at once: Ok, or the output of the first that failed.
+fn run_all(self: Setting, exec: Exec, jobs: List[List[Str]]) -> Result[(), Str] {
+    let results = group g {
+        for argv in jobs {
+            g.go(|| self.run_cc(exec, argv))
+        }
+    }
+    for r in results {
+        r?
+    }
+    Ok(())
+}
+
+// `name` in the cache directory `dir`, made by `make` (given a path to
+// write) unless it is there already: its path, or None when it could not
+// be made. It is made under a temporary name and renamed into place.
+fn cached_file(self: Builder, dir: Str, name: Str, make: fn(Str) -> Bool) -> Option[Str] {
+    let n = self.setting
+    let path = paths.concat(dir, name)
+    if self.fs.exists(n.in_fs(path)) {
+        let _ = self.exec.run("touch", [path])
+        return Some(path)
+    }
+    let tmp = path + ".tmp" + hash.md5_hex(n.place.absolute(n.in_fs(path)).to_bytes()).slice(0, 8)
+    if make(tmp) && self.fs.rename(n.in_fs(tmp), n.in_fs(path)).is_ok() {
+        return Some(path)
+    }
+    let _ = self.fs.remove(n.in_fs(tmp))
+    None
+}
+
+fn write(self: Builder, path: Str, text: Str) -> Bool {
+    self.fs.write(self.setting.in_fs(path), text).is_ok()
+}
+
+// The runtime's declarations precompiled, in the cache, where the C
+// compiler can (clang): the path, or None. The header stays next to its
+// precompiled form, which records it; a compiler that cannot (gcc writes a
+// header it cannot load through -include-pch) is remembered with a marker.
+fn precompiled(self: Builder, dir: Str, decls: Str, cflags: List[Str], tmp: Str) -> Option[Str] {
+    let (n, exec) = (self.setting, self.exec)
+    let pch_argv = |h: Str, o: Str| [n.cc(), self.opt()] + cflags + c_flags() + ["-x", "c-header", "-o", o, h]
+    let k = self.cache_key(decls, pch_argv("decls.h", "decls.pch"))
+    if self.fs.exists(n.in_fs(paths.concat(dir, k + ".nopch"))) {
+        return None
+    }
+    let h = paths.concat(dir, k + ".h")
+    let made = n.make_dirs(self.fs, n.in_fs(dir)) && (self.fs.exists(n.in_fs(h)) || self.cached_file(dir, k + ".h", |out| self.write(out, decls)).is_some())
+    let works = |out: Str| {
+        let probe = paths.concat(tmp, "probe.c")
+        self.write(probe, "int limen_probe;\n") && n.run_cc(exec, pch_argv(h, out)).is_ok() && n.run_cc(exec, [n.cc(), self.opt(), "-include-pch", out] + cflags + c_flags() + ["-fsyntax-only", probe]).is_ok()
+    }
+    let pch = if made { self.cached_file(dir, k + ".pch", works) } else { None }
+    if pch.is_none() {
+        let _ = self.write(paths.concat(dir, k + ".nopch"), "")
+    }
+    pch
+}
+
+// Build `exe` from the program's shared header and pieces, with the
+// runtime as an object, as build_split in src/native.ml does. `prefix`
+// goes ahead of the runtime (the TLS defines and core, or nothing),
+// `defines` ahead of the declarations in each piece. Objects and the
+// precompiled header live in the cache when the Fs reaches one; the rest
+// goes in `tmp`.
+fn build_split(self: Builder, cflags: List[Str], libs: List[Str], prefix: Str, defines: Str, tmp: Str, shared: Str, pieces: List[Str], exe: Str) -> Result[(), Str] {
+    let (n, exec, fs) = (self.setting, self.exec, self.fs)
+    let dir = self.usable_cache()
+    let obj_argv = |c: Str, o: Str| [n.cc(), self.opt()] + cflags + c_flags() + ["-c", "-o", o, c]
+    // the runtime, compiled once
+    let rt_text = object_mode() + prefix + self.runtime
+    let rt_key = self.cache_key(rt_text, obj_argv("prog.c", "prog.o")) + ".o"
+    let rt_cached = match dir {
+        Some(d) if fs.exists(n.in_fs(paths.concat(d, rt_key))) => Some(paths.concat(d, rt_key)),
+        _ => None,
+    }
+    // the declarations, precompiled where the compiler can
+    let decls = object_mode() + defines + self.header
+    let pch = match dir {
+        Some(d) => self.precompiled(d, decls, cflags, tmp),
+        None => None,
+    }
+    let use_pch = match pch {
+        Some(p) => ["-include-pch", p],
+        None => [],
+    }
+    let head = if pch.is_none() { decls + "\n" } else { "" }
+    let mut files: List[Str] = []
+    for (i, text) in pieces.with_index() {
+        let f = paths.concat(tmp, "piece{i}.c")
+        if !self.write(f, head + shared + "\n" + text) {
+            return Err("limen: cannot write {f}\n")
+        }
+        files.push(f)
+    }
+    if rt_cached.is_some() && files.len() == 1 {
+        // one piece, the runtime ready: compile and link in one step
+        return n.run_cc(exec, [n.cc(), self.opt()] + use_pch + cflags + c_flags() + ["-o", exe, files[0], rt_cached ?? ""] + libs + ["-lm"])
+    }
+    let mut jobs: List[List[Str]] = []
+    let rt_obj = match rt_cached {
+        Some(p) => p,
+        None => {
+            let c = paths.concat(tmp, "runtime.c")
+            if !self.write(c, rt_text) {
+                return Err("limen: cannot write {c}\n")
+            }
+            jobs.push(obj_argv(c, paths.concat(tmp, "runtime.o")))
+            paths.concat(tmp, "runtime.o")
+        },
+    }
+    let objs = files.map(|f| f.slice(0, f.len() - 2) + ".o")
+    for (i, f) in files.with_index() {
+        jobs.push([n.cc(), self.opt()] + use_pch + cflags + c_flags() + ["-c", "-o", objs[i], f])
+    }
+    n.run_all(exec, jobs)?
+    match (dir, rt_cached) {
+        (Some(d), None) => {
+            let _ = self.copy(rt_obj, paths.concat(d, rt_key), n.place.absolute(n.in_fs(paths.concat(d, rt_key))))
+        },
+        _ => {},
+    }
+    n.run_cc(exec, [n.cc(), self.opt(), "-o", exe, rt_obj] + objs + libs + ["-lm"])
+}
+
+// The cache directory, when the Fs reaches it.
+fn usable_cache(self: Builder) -> Option[Str] {
+    match self.setting.cache_dir(self.fs) {
+        Some(d) if paths.is_relative(self.setting.in_fs(d)) => Some(d),
+        _ => None,
+    }
+}
+
+// Compile the program, split when its C has the expected shape, else as
+// one file next to the binary. With nowhere to keep the runtime, a program
+// of one piece is one file too, which leaves out the parts of the runtime
+// it doesn't use.
+fn compile(self: Builder, c_text: Str, text: Str, cflags: List[Str], all_libs: List[Str], exe: Str) -> Result[(), Str] {
+    let (n, fs) = (self.setting, self.fs)
+    let tls = c_text.starts_with(tls_marker())
+    let body = if tls { c_text.slice(tls_marker().len(), c_text.len()) } else { c_text }
+    let parts = match if body.starts_with(self.runtime) { split_program(body.slice(self.runtime.len(), body.len())) } else { None } {
+        Some((_, pieces)) if pieces.len() == 1 && self.usable_cache().is_none() => None,
+        p => p,
+    }
+    match parts {
+        Some((shared, pieces)) => {
+            let tmp = exe + ".pieces"
+            let _ = fs.make_dir(n.in_fs(tmp))
+            let r = self.build_split(cflags, all_libs, if tls { tls_defines() + self.tls_text } else { "" }, if tls { tls_defines() } else { "" }, tmp, shared, pieces, exe)
+            match fs.list(n.in_fs(tmp)) {
+                Ok(names) => {
+                    for name in names {
+                        let _ = fs.remove(n.in_fs(paths.concat(tmp, name)))
+                    }
+                },
+                Err(_) => {},
+            }
+            let _ = fs.remove(n.in_fs(tmp))
+            r
+        },
+        None => {
+            let c_file = exe + ".c"
+            match fs.write(n.in_fs(c_file), text) {
+                Ok(_) => {},
+                Err(e) => {
+                    return Err("limen: cannot write {c_file}: {e}\n")
+                },
+            }
+            n.run_cc(self.exec, n.command(self.dev, cflags, all_libs, c_file, exe))
+        },
+    }
 }
 
 // Compile `c_text` to `exe` (a path as the user gave it), through the
 // cache. Err holds the compiler's output.
-fn compile_c(self: Builder, c_text: Str, tls_text: Str, libs: List[Str], exe: Str) -> Result[(), Str] {
+fn compile_c(self: Builder, c_text: Str, libs: List[Str], exe: Str) -> Result[(), Str] {
     let (n, exec, fs) = (self.setting, self.exec, self.fs)
-    let c_file = exe + ".c"
-    let (text, cflags, tls_libs) = n.prepare(exec, c_text, tls_text)
-    match fs.write(n.in_fs(c_file), text) {
-        Ok(_) => {},
-        Err(e) => {
-            return Err("limen: cannot write {c_file}: {e}\n")
-        },
-    }
+    let (text, cflags, tls_libs) = n.prepare(exec, c_text, self.tls_text)
     let all_libs = tls_libs + link_flags(libs)
-    let argv = n.command(cflags, all_libs, c_file, exe)
     let dir = match n.cache_dir(fs) {
         // only a cache the Fs reaches: outside it, every build compiles
         Some(d) if !paths.is_relative(n.in_fs(d)) => {
-            return n.run_cc(exec, argv)
+            return self.compile(c_text, text, cflags, all_libs, exe)
         },
         Some(d) => d,
         None => {
-            return n.run_cc(exec, argv)
+            return self.compile(c_text, text, cflags, all_libs, exe)
         },
     }
     // the key leaves out where this build's files go
-    let shape = n.command(cflags, all_libs, "prog.c", "prog")
+    let shape = n.command(self.dev, cflags, all_libs, "prog.c", "prog")
     let cached = paths.concat(dir, self.cache_key(text, shape))
     let target = n.place.absolute(n.in_fs(exe))
     if fs.exists(n.in_fs(cached)) && self.copy(cached, exe, target) {
         let _ = exec.run("touch", [cached])
         return Ok(())
     }
-    n.run_cc(exec, argv)?
+    self.compile(c_text, text, cflags, all_libs, exe)?
     if n.make_dirs(fs, n.in_fs(dir)) && self.copy(exe, cached, target) {
         n.prune(fs, dir)
     }
@@ -312,8 +680,8 @@ fn compile_c(self: Builder, c_text: Str, tls_text: Str, libs: List[Str], exe: St
 // Compile the program's C to `exe`; `libs` are the foreign libraries it
 // links (ffi.libs). A failure most likely means a missing library: then
 // say which ones the program links.
-pub fn build(self: Builder, c_text: Str, tls_text: Str, libs: List[Str], exe: Str) -> Result[(), Str] {
-    match self.compile_c(c_text, tls_text, libs, exe) {
+pub fn build(self: Builder, c_text: Str, libs: List[Str], exe: Str) -> Result[(), Str] {
+    match self.compile_c(c_text, libs, exe) {
         Ok(_) => Ok(()),
         Err(m) if libs.is_empty() => Err(m),
         Err(m) => Err(m + "limen: the program links foreign libraries ({libs.join(", ")}); check that they are installed where the C compiler finds them\n"),

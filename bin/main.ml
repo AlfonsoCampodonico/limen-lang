@@ -5,7 +5,7 @@ let usage =
 
 usage:
   limen run FILE [--native] [--grant net=HOST[:PORT]|*]... [--grant fs=DIR[:ro]] [--grant listen=HOST:PORT]... [--grant env=NAME|*]... [--grant exec=PROGRAM[ ARGS|ARGS...]|*]... [--grant foreign=LIB[,LIB...]|*]... [--seed N] [--no-sandbox] [-- ARGS...]
-  limen build FILE [-o OUT] [--emit-c]
+  limen build FILE [-o OUT] [--dev] [--emit-c]
   limen check FILE [--json]
   limen caps FILE [--json]
   limen explain CODE
@@ -172,7 +172,9 @@ type bench_result = { iters : int; ns : int; allocs : int }
    (index, name, takes_fs). *)
 let run_native_tests items tests benches bench =
   let exe = Filename.concat (Filename.get_temp_dir_name ()) (Printf.sprintf "limen-test-%d" (Unix.getpid ())) in
-  (match Native.build ~tests:true items exe with
+  (* benchmarks measure the optimised program; tests build fast *)
+  let flags = if bench = None then Some Native.dev_flags else None in
+  (match Native.build ?flags ~tests:true items exe with
    | Ok () -> ()
    | Error m -> prerr_string (Native.cc_failed m); exit 1);
   let test_results =
@@ -448,13 +450,13 @@ let checked file =
   end;
   items
 
-let cmd_build file out emit_c =
+let cmd_build file out dev emit_c =
   Package.write_lock := true;
   let items = checked file in
   let out = match out with Some o -> o | None -> Filename.remove_extension (Filename.basename file) in
   if emit_c then Out_channel.with_open_bin (out ^ ".c") (fun oc -> output_string oc (Native.c_source items))
   else
-    match Native.build items out with
+    match Native.build ?flags:(if dev then Some Native.dev_flags else None) items out with
     | Ok () -> (try Sys.remove (out ^ ".c") with Sys_error _ -> ())
     | Error m ->
       prerr_string (Native.cc_failed m);
@@ -467,7 +469,7 @@ let cmd_run_native file grant_args prog_args =
   let items = checked file in
   let dir = Filename.get_temp_dir_name () in
   let exe = Filename.concat dir (Printf.sprintf "limen-%d" (Unix.getpid ())) in
-  (match Native.build items exe with
+  (match Native.build ~flags:Native.dev_flags items exe with
    | Ok () -> ()
    | Error m -> prerr_string (Native.cc_failed m); exit 1);
   let args =
@@ -565,13 +567,14 @@ let () =
     | gs, ([ "--native"; file ] | [ file; "--native" ]) -> cmd_run_native file gs prog_args
     | _ -> die_usage "run needs exactly one FILE")
   | "build" :: rest ->
-    let rec go file out emit = function
-      | "-o" :: o :: r -> go file (Some o) emit r
-      | "--emit-c" :: r -> go file out true r
-      | f :: r when file = None -> go (Some f) out emit r
-      | [] -> ( match file with Some f -> cmd_build f out emit | None -> die_usage "build needs a FILE")
+    let rec go file out dev emit = function
+      | "-o" :: o :: r -> go file (Some o) dev emit r
+      | "--dev" :: r -> go file out true emit r
+      | "--emit-c" :: r -> go file out dev true r
+      | f :: r when file = None -> go (Some f) out dev emit r
+      | [] -> ( match file with Some f -> cmd_build f out dev emit | None -> die_usage "build needs a FILE")
       | _ -> die_usage "bad build arguments"
     in
-    go None None false rest
+    go None None false false rest
   | [] | [ ("-h" | "--help" | "help") ] -> print_string usage
   | _ -> die_usage ""

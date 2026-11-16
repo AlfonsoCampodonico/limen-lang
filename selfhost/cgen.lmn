@@ -32,6 +32,11 @@ pub fn tls_marker() -> Str {
     "/* limen: uses tls */\n"
 }
 
+// Follows the runtime in a program where no task can be cancelled.
+pub fn no_checkpoints() -> Str {
+    "/* no group here has a deadline, so no task is ever cancelled */\n#undef W_CHECK\n#define W_CHECK() do \{ } while (0)"
+}
+
 // A `dyn` vtable to define: its key, the boxed type, its methods.
 struct DynBox {
     key: Str,
@@ -2777,7 +2782,7 @@ fn quoted(s: Str) -> Str {
 
 // The program as C: `files` are the program's files (with the prelude's
 // and the built-in methods'), so panics can say where they happened;
-// `runtime` is the runtime header (limen_sandbox.h then limen_rt.h).
+// `runtime` is the whole runtime (limen_sandbox.h, limen_rt.h, limen_rt.c).
 pub fn program(ro: lower.Ro, files: List[diag.Source], prog: ir.Program, runtime: Str) -> Str {
     let mut c = Cg {
         ro,
@@ -2924,7 +2929,13 @@ pub fn program(ro: lower.Ro, files: List[diag.Source], prog: ir.Program, runtime
     // each foreign C function under a private name, bound to its symbol by
     // an asm label, so it clashes with no header's declaration of it
     let externs = c.csyms.map(|sym| "extern void vf_{sym}(void) __asm__(W_CSYM(\"{sym}\"));\n")
-    (if c.tls { tls_marker() } else { "" }) + [runtime, "/* ---- types ---- */", tys.join(""), "/* ---- literals ---- */", lits.join(""), "/* ---- closures ---- */", envs.join(""), tasks.join(""), "/* ---- functions ---- */", protos.join(""), externs.join(""), cbdefs.join("") + c.bjobs.join(""), "/* ---- dyn vtables ---- */", dynbuf.join(""), bodies, main].join("\n")
+    let program = ["/* ---- types ---- */", tys.join(""), "/* ---- literals ---- */", lits.join(""), "/* ---- closures ---- */", envs.join(""), tasks.join(""), "/* ---- functions ---- */", protos.join(""), externs.join(""), cbdefs.join("") + c.bjobs.join(""), "/* ---- dyn vtables ---- */", dynbuf.join(""), bodies, main]
+    // Only a group with a deadline can cancel a task (the deadline cancels
+    // the group, and a cancelled group's tasks are cancelled with it). In a
+    // program with none, every checkpoint is a load of a counter that stays
+    // 0: say so, so the C compiler drops them from loops.
+    let never_stops = if program.any(|part| part.contains("w_group_new_until(")) { [] } else { [no_checkpoints()] }
+    (if c.tls { tls_marker() } else { "" }) + ([runtime] + never_stops + program).join("\n")
 }
 
 // `main` of the C program: a test binary's, or the one that runs the
