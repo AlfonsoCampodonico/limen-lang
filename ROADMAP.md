@@ -1,115 +1,148 @@
 # Roadmap
 
-What Limen still needs to be a full language, in the order I'd do it. Written
-on 2026-11-15, after 0.2.0. The design doc has the history and the decisions;
-this is the list to pick up from.
+Where Limen goes from 0.3.2 to 1.0, one release at a time. Each release has
+one goal and a test for when it's done; the items under it are what stands
+between here and that test. There are no dates: this is a one-person
+project, and the order matters more than the calendar.
 
-Before starting any of it: `dune build`, `dune exec ./test/test_limen.exe`,
-`sh selfhost/check.sh` and `sh selfhost/bootstrap.sh` must pass, and every
-change goes into both compilers (`src/` and `selfhost/`).
+The short version: make a Limen server safe to run on the internet, then
+make the language less tedious to write, then make it pleasant to debug,
+then harden it, then promise not to break it.
 
-## 1. HTTP server timeouts
+Updated 2026-11-16, after 0.3.2.
 
-The most serious gap for anyone running a Limen server. Today an idle
-keep-alive connection holds its task until the client closes it, and
-`serve_forever` keeps a record per finished connection until it returns
-(SPEC, `http` section). Add a read timeout for the request head and body, an
-idle timeout between keep-alive requests, and a total cap per connection,
-through `Clock`, with defaults and a way to set them.
+## 0.4: a server you can leave running
 
-## 2. What newcomers hit first
+A Limen web service, exposed to the internet, that stays up and keeps its
+memory flat.
 
-- Hex and binary literals: `0xff` and `0b1010` are syntax errors today. The
-  hash constants in `src/std/hash.lmn` are written in decimal because of it.
+- HTTP server timeouts: for the request head, the body, idle keep-alive time
+  and the whole connection, through `Clock`, with defaults and a way to set
+  them. Today one slow client holds a task for as long as it likes.
+- `serve_forever` keeps a record per finished connection, because a group's
+  value is the list of every task's result. A long-running group needs a way
+  not to collect them.
+- `json.Int(Int)`, so ids and counts above 2^53 survive the trip out.
+- SQLite back to its old speed: a scan of 102k rows went from 11 ms to about
+  65 ms when the calls moved off the worker threads. One pool job per query
+  instead of one per row (work in progress in `limen-sqlite-wip/`).
+- `full_path` hands C code (SQLite) a path string that can still race a
+  directory swap after the check.
+- Fuzz the HTTP parser and JSON, the two things a server reads from
+  strangers.
+- CI on real x86-64 Linux and macOS. Only arm64 Linux runs today, in Docker.
+
+Done when `examples/todo_api.lmn`, deployed, survives a slowloris client and
+a day of load with flat memory.
+
+## 0.5: less to write
+
+The things newcomers hit in their first hour.
+
+- Converting a struct to and from JSON (and SQL rows) without writing every
+  field by hand. Today that is a third of `todo_api.lmn`.
+- Closure parameter types inferred inside a tuple in a list literal, so
+  `[("GET /", |r, p| ...)]` checks.
+- Hex and binary literals (`0xff`, `0b1010`) and a `\u{...}` string escape.
 - Default parameter values.
-- Lazy sequences: lists are always built in full, so a large file can't be
-  streamed line by line through a pipeline. Decide between an iterator
-  interface the pipelines fuse over and generators.
-- Smaller: integer types besides `Int` outside FFI (bytes, `u32`), a
-  character type, Unicode beyond `chars()`, struct patterns in `let` and
-  `for`, a `\u{...}` string escape.
+- Struct patterns in `let` and `for`.
 
-## 3. Debugging and build speed
+Done when `todo_api.lmn` is noticeably shorter with nothing hand-written
+that the compiler could have written.
+
+## 0.6: debugging and build speed
 
 - `#line` directives in the generated C, so lldb, gdb, the sanitizers and
   crash traces point at Limen lines.
-- Separate compilation: build the runtime and the standard library once and
-  link them, with `-O0` for development builds. A cold build of an HTTP
-  program is 2 to 3 s today, nearly all of it the C compiler.
+- Separate compilation: the runtime and standard library built once and
+  linked, with `-O0` for development. A cold build of an HTTP program takes
+  2 to 3 s today, nearly all of it in the C compiler.
+- Incremental checking for the language server.
 - A profiler and test coverage.
 
-## 4. CI, fuzzing, review
+Done when a crash in a native build shows the Limen line that caused it, and
+rebuilding after a one-line change takes under a second.
 
-- Done on 2026-11-15: MIT or Apache 2.0, and the source is public. That
-  opens homebrew-core and Debian or Ubuntu packaging.
-- CI on real x86-64 Linux and macOS. `dev/linux/run.sh` covers arm64 Linux
-  in Docker; amd64 runs only emulated, where ThreadSanitizer can't start.
-- Fuzz the lexer, parser, checker and runtime (HTTP parsing, compression,
-  JSON). Then an outside security review: five sandbox findings in a row on
-  2026-11-15 say there are more, and a review on 2026-11-16 found three
-  capability holes, an Fs race and HTTP request smuggling (all fixed).
+## 0.7: streams and the libraries people ask for
 
-## 5. Platforms
-
-- Windows: fibers, the poller and the sandbox are macOS and Linux only.
-- Intel Macs: no build yet.
-- Cross-compilation and a WebAssembly target.
-
-## Open from 2026-11-15
-
-- SQLite got slower when its calls moved off the worker threads: a full scan
-  of 102k rows went from 11 ms to about 65 ms. The fix is one pool job per
-  query instead of one per row. Work in progress is in
-  `~/Github/Personal/limen-sqlite-wip/` (a patch and `limen_sql.h`).
-- The interpreter starts a thread per blocking C call instead of using a pool.
-- No checkpoints in a single built-in operation (a sort) or in the fast path
-  of fill loops, so those can't be cancelled midway.
-
-## Open from the 2026-11-16 review
-
-- One definition of each built-in: today each is written twice, in the
-  interpreter (`interp.ml`) and the C runtime, and only the tests keep them
-  in step. The NUL-path difference came from this.
-- `full_path` returns a path string, so C code that opens it (SQLite) can
-  still race a directory swap after the check.
-- `share`, `==` and printing recurse on deep values, and `dyn` values are
-  dropped recursively: a very deep value can still overflow a task's stack.
-- Stack overflow can't be caught, and a task's buffered output is lost when
-  it happens.
-- Bound authority covers an interface's own methods, not bounds of bounds.
-- JSON: a lone `\ud800` escape becomes U+FFFD, duplicate keys are accepted,
-  there is no nesting limit, and numbers over 400 characters fail to parse.
-- Reference cycles through `Shared` or channels leak (documented in
-  SPEC.md section 8); no cycle collector is planned.
-- JSON has no integer: `json.Value` holds `Num(Float)`, so an id or a
-  count above 2^53 loses precision on the way out. Add `Int(Int)`.
-- The HTTP server has no timeouts: an idle keep-alive connection holds its
-  task until the client goes, which is one slow client per task on the open
-  internet.
-- Closure parameter types aren't inferred inside a tuple in a list literal
-  (`[("GET /", |r, p| ...)]` is E0207); `http.on` exists partly to work
-  around it.
-- Design questions: no shared mutable references (stateful code threads
-  state by hand, as the self-hosted compiler shows); E0304 rules out
-  callback tables while generics already allow them; a group's value is the
-  list of every task's result, so a long-running server group keeps one per
-  connection.
-
-## Distribution
-
-- A signed apt repository, so `sudo apt install limen` and `apt upgrade`
-  work. Needs a GPG key that stays on the maintainer's machine.
-- One release script that builds macOS and both Linux architectures, writes
-  `SHA256SUMS`, uploads to the release and bumps the Homebrew formula.
-  Today it is three steps: `dev/release/macos.sh VERSION` (OpenSSL linked
-  statically), `dev/release/linux.sh VERSION`, then `gh release` and the
-  formula by hand.
-- The package index exists but is empty and has no hosted default.
-- A stability promise: what 1.0 means and how versions change after it.
-
-## Standard library
-
-- Postgres and MySQL clients (only SQLite today).
+- Lazy sequences, so a large file goes through a pipeline line by line
+  instead of being read whole. Decide between an iterator interface the
+  pipelines fuse over and generators.
+- Streaming decompression.
+- A Postgres client.
 - WebSockets.
 - Encryption and public-key signatures beyond TLS.
-- Streaming decompression.
+- Integer types besides `Int` outside FFI (bytes, `u32`) and a character
+  type with Unicode beyond `chars()`.
+
+Done when a program can read a gzipped log larger than memory, line by
+line, and write rows to Postgres.
+
+## 0.8: hardening, and the breaking decisions
+
+Everything that would break programs has to be decided before 1.0, so it
+happens here.
+
+- The design questions: shared mutable references (stateful code threads
+  state by hand today, as the self-hosted compiler shows); E0304, which rules
+  out callback tables while generics allow them; what a group returns.
+- One definition of each built-in. Each is written twice, in the
+  interpreter and the C runtime, and only the tests keep them in step: the
+  NUL-path difference came from this.
+- Bound authority through bounds of bounds, not just an interface's own
+  methods.
+- `share`, `==`, printing and dropping `dyn` values without recursion, so a
+  deep value can't overflow a task's stack.
+- The JSON edges: a lone `\ud800`, duplicate keys, a nesting limit, numbers
+  over 400 characters.
+- Fuzz the lexer, parser, checker and the rest of the runtime.
+- An outside security review of the sandbox and the capability checks.
+  Two reviews in two days found ten holes, so there are more.
+
+Done when the review's findings are fixed and nothing on the list of
+breaking changes is still open.
+
+## 0.9: installing and sharing
+
+- A signed apt repository, so `apt upgrade` updates Limen.
+- Homebrew core, and Intel Macs.
+- One release script: build all three, write `SHA256SUMS`, upload, bump the
+  formula. Today it is three scripts and two steps by hand.
+- A hosted package index as the default (it exists, but is empty and you
+  point `LIMEN_INDEX` at one).
+
+Done when someone can install Limen, add a package and publish their own
+without reading anything but the book.
+
+## 1.0
+
+A stability promise: code that builds on 1.0 builds on every 1.x, what
+counts as breaking, and how editions or deprecations work after it. The
+book and SPEC.md describe 1.0 exactly.
+
+## After 1.0
+
+- Windows. Fibers, the poller and the sandbox are macOS and Linux only.
+- Cross-compilation and a WebAssembly target.
+- MySQL.
+
+## Known and not planned
+
+- Reference cycles through `Shared` or channels leak (SPEC.md section 8).
+  They are rare and can only be built on purpose; a cycle collector would
+  cost every program for them.
+- Stack overflow can't be caught, and a task's buffered output is lost when
+  it happens.
+
+## Smaller, whenever
+
+- The interpreter starts a thread per blocking C call instead of using a
+  pool.
+- No cancellation checkpoints inside a single built-in operation (a sort) or
+  in the fast path of fill loops.
+
+## Before any change
+
+`dune build`, `dune exec ./test/test_limen.exe`, `sh selfhost/check.sh` and
+`sh selfhost/bootstrap.sh` must pass, and every change goes into both
+compilers (`src/` and `selfhost/`).
