@@ -11,14 +11,16 @@
 //
 //   limen run examples/todo_api.lmn --grant listen=127.0.0.1:0 --grant net=127.0.0.1
 //
-// To serve for real, on port 8080 (or `serve PORT`) with the database in todos.db:
+// To serve for real, on 127.0.0.1:8080 (or `serve ADDRESS`, such as
+// `serve [::]:8080` for every interface) with the database in todos.db:
 //
 //   limen run examples/todo_api.lmn --grant listen=127.0.0.1:8080 --grant fs=. -- serve
 //   curl -X POST localhost:8080/todos -d '{"title": "buy milk"}'
 //   curl localhost:8080/todos
 //
-// The handlers get the database and nothing else: they cannot reach the
-// network or any file, whatever the requests say.
+// The handlers get the database and a way to log failures to stderr, and
+// nothing else: they cannot reach the network or any file, whatever the
+// requests say.
 use http
 use json
 use sql
@@ -36,33 +38,63 @@ fn setup(db: sql.Db) -> Result[(), IoError] {
     Ok(())
 }
 
-fn from_row(row: sql.Row) -> Todo {
-    Todo { id: row.int("id") ?? 0, title: row.text("title") ?? "", done: row.int("done") == Some(1) }
+// A missing column is an error, not a todo with id 0.
+fn column[T](v: Option[T], name: Str) -> Result[T, IoError] {
+    match v {
+        Some(x) => Ok(x),
+        None => Err(Failed("todos: no `{name}` column in the row")),
+    }
+}
+
+fn from_row(row: sql.Row) -> Result[Todo, IoError] {
+    Ok(Todo {
+        id: column(row.int("id"), "id")?,
+        title: column(row.text("title"), "title")?,
+        done: column(row.int("done"), "done")? == 1,
+    })
+}
+
+fn one(row: Option[sql.Row]) -> Result[Option[Todo], IoError] {
+    match row {
+        Some(r) => Ok(Some(from_row(r)?)),
+        None => Ok(None),
+    }
 }
 
 fn all(db: sql.Db) -> Result[List[Todo], IoError] {
-    let rows = db.query("SELECT id, title, done FROM todos ORDER BY id", [])?
-    Ok(rows.map(from_row))
+    let mut todos: List[Todo] = []
+    for row in db.query("SELECT id, title, done FROM todos ORDER BY id", [])? {
+        todos.push(from_row(row)?)
+    }
+    Ok(todos)
 }
 
 fn find(db: sql.Db, id: Int) -> Result[Option[Todo], IoError] {
-    let row = db.query_one("SELECT id, title, done FROM todos WHERE id = ?", [sql.Int(id)])?
-    Ok(row.map(from_row))
+    one(db.query_one("SELECT id, title, done FROM todos WHERE id = ?", [sql.Int(id)])?)
 }
 
 // RETURNING gives the new row's id from the insert itself, so two requests
 // at once cannot see each other's id
 fn create(db: sql.Db, title: Str) -> Result[Todo, IoError] {
-    let row = db.query_one("INSERT INTO todos (title) VALUES (?) RETURNING id, title, done", [sql.Text(title)])?
-    match row {
-        Some(r) => Ok(from_row(r)),
+    match one(db.query_one("INSERT INTO todos (title) VALUES (?) RETURNING id, title, done", [sql.Text(title)])?)? {
+        Some(t) => Ok(t),
         None => Err(Failed("insert returned no row")),
     }
 }
 
-fn save(db: sql.Db, t: Todo) -> Result[(), IoError] {
-    db.exec("UPDATE todos SET title = ?, done = ? WHERE id = ?", [sql.Text(t.title), sql.Int(if t.done { 1 } else { 0 }), sql.Int(t.id)])?
-    Ok(())
+// One statement, so two changes at once cannot undo each other: a field
+// left out (NULL) keeps the value the row has when the update runs.
+fn change(db: sql.Db, id: Int, c: Changes) -> Result[Option[Todo], IoError] {
+    let title = match c.title {
+        Some(t) => sql.Text(t),
+        None => sql.Null,
+    }
+    let done = match c.done {
+        Some(true) => sql.Int(1),
+        Some(false) => sql.Int(0),
+        None => sql.Null,
+    }
+    one(db.query_one("UPDATE todos SET title = COALESCE(?, title), done = COALESCE(?, done) WHERE id = ? RETURNING id, title, done", [title, done, sql.Int(id)])?)
 }
 
 fn remove(db: sql.Db, id: Int) -> Result[Bool, IoError] {
@@ -116,32 +148,33 @@ fn read_changes(body: Str) -> Result[Changes, Str] {
 
 // ---------- routes ----------
 
-fn route(db: sql.Db, r: http.Request) -> http.Response {
-    // "/todos/3?x=1" -> ["todos", "3"]
-    let path = r.path.split("?")[0]
-    let parts = path.split("/").filter(|p| !p.is_empty())
-    if parts.is_empty() || parts[0] != "todos" || parts.len() > 2 {
-        return problem(404, "no route for {path}")
+fn routes(db: sql.Db, log: fn(Str)) -> List[http.Route] {
+    [
+        http.on("GET /todos", |r, p| served(log, r, list_todos(db))),
+        http.on("POST /todos", |r, p| served(log, r, create_todo(db, r.body))),
+        http.on("GET /todos/:id", |r, p| by_id(log, r, p, |id| get_todo(db, id))),
+        http.on("PATCH /todos/:id", |r, p| by_id(log, r, p, |id| update_todo(db, id, r.body))),
+        http.on("DELETE /todos/:id", |r, p| by_id(log, r, p, |id| delete_todo(db, id))),
+    ]
+}
+
+// A database failure is the server's fault, not the request's: it is logged
+// and answered with 500, without the details.
+fn served(log: fn(Str), r: http.Request, answer: Result[http.Response, IoError]) -> http.Response {
+    match answer {
+        Ok(resp) => resp,
+        Err(e) => {
+            log("{r.method} {r.path}: {e}")
+            problem(500, "the database failed")
+        },
     }
-    let answer = if parts.len() == 1 {
-        match r.method {
-            "GET" => list_todos(db),
-            "POST" => create_todo(db, r.body),
-            _ => Ok(problem(405, "use GET or POST on /todos")),
-        }
-    } else {
-        match parts[1].parse_int() {
-            None => Ok(problem(404, "no todo `{parts[1]}`")),
-            Some(id) => match r.method {
-                "GET" => get_todo(db, id),
-                "PATCH" => update_todo(db, id, r.body),
-                "DELETE" => delete_todo(db, id),
-                _ => Ok(problem(405, "use GET, PATCH or DELETE on /todos/{id}")),
-            },
-        }
+}
+
+fn by_id(log: fn(Str), r: http.Request, p: http.Params, f: fn(Int) -> Result[http.Response, IoError]) -> http.Response {
+    match p.int("id") {
+        Some(id) => served(log, r, f(id)),
+        None => problem(404, "no todo `{p.get("id") ?? ""}`"),
     }
-    // a database failure is the server's fault, not the request's
-    answer ?? problem(500, "the database failed")
 }
 
 fn list_todos(db: sql.Db) -> Result[http.Response, IoError] {
@@ -175,13 +208,9 @@ fn update_todo(db: sql.Db, id: Int, body: Str) -> Result[http.Response, IoError]
         Ok(c) => c,
         Err(e) => { return Ok(problem(400, e)) },
     }
-    match find(db, id)? {
+    match change(db, id, changes)? {
+        Some(t) => Ok(reply(200, to_json(t))),
         None => Ok(problem(404, "no todo {id}")),
-        Some(t) => {
-            let updated = { t with title: changes.title ?? t.title, done: changes.done ?? t.done }
-            save(db, updated)?
-            Ok(reply(200, to_json(updated)))
-        },
     }
 }
 
@@ -199,7 +228,7 @@ fn call(net: Net, base: Str, method: Str, path: Str, body: Str) -> Str {
     let line = "{method} {path}"
     match http.request(net, method, base + path, [http.Header { name: "content-type", value: "application/json" }], body) {
         Ok(r) if r.body.is_empty() => "{line} -> {r.status}",
-        Ok(r) => "{line} -> {r.status} {r.body}",
+        Ok(r) => "{line} -> {r.status} {r.body.trim()}",
         Err(e) => "{line} -> {e}",
     }
 }
@@ -240,12 +269,18 @@ fn demo(root: Root) -> Result[(), IoError] {
     let l = root.listen.on("127.0.0.1:0")?
     let port = l.port()
     let net = root.net
-    // the client opens one connection per call, so the server stops after 11
+    let api = routes(db, |line| root.stderr.print(line))
+    // the client closes the listener when it is done, which stops the server
     let results = group g {
         g.go(|| {
-            let _ = http.serve(l, 11, |r| route(db, r))
+            let _ = http.serve_forever(l, |r| http.route(r, api))
+            []
         })
-        g.go(|| demo_client(net, port))
+        g.go(|| {
+            let lines = demo_client(net, port)
+            l.close()
+            lines
+        })
     }
     for lines in results {
         for line in lines {
@@ -260,13 +295,14 @@ fn main(root: Root) -> Result[(), IoError] {
     if args.is_empty() || args[0] != "serve" {
         return demo(root)
     }
-    // `serve` or `serve PORT`; the listen grant must allow that port
-    let port = if args.len() > 1 { args[1] } else { "8080" }
+    // `serve` or `serve ADDRESS`; the listen grant must allow that address
+    let address = if args.len() > 1 { args[1] } else { "127.0.0.1:8080" }
     let db = sql.open(root.fs, "todos.db")?
     setup(db)?
-    let l = root.listen.on("127.0.0.1:{port}")?
-    root.stdout.print("serving todos on http://127.0.0.1:{port}")
-    Err(http.serve_forever(l, |r| route(db, r)))
+    let l = root.listen.on(address)?
+    root.stdout.print("serving todos on {address}")
+    let api = routes(db, |line| root.stderr.print(line))
+    Err(http.serve_forever(l, |r| http.route(r, api)))
 }
 
 // ---------- tests ----------
@@ -286,7 +322,8 @@ fn fresh() -> sql.Db {
 }
 
 fn send(db: sql.Db, method: Str, path: Str, body: Str) -> http.Response {
-    route(db, http.Request { method, path, version: "HTTP/1.1", headers: [], body })
+    let r = http.Request { method, path, version: "HTTP/1.1", headers: [], body }
+    http.route(r, routes(db, |line| {}))
 }
 
 fn todo(id: Int, title: Str, done: Bool) -> Result[json.Value, Str] {
@@ -339,4 +376,18 @@ test "refused" for (method, path, req, status) in [
     ("PUT", "/todos", "", 405),
 ] {
     assert_eq(send(fresh(), method, path, req).status, status)
+}
+
+test "a path with the wrong method lists the right ones" {
+    let r = send(fresh(), "PUT", "/todos/1", "")
+    assert_eq(r.status, 405)
+    assert_eq(r.header("allow"), Some("GET, PATCH, DELETE, HEAD"))
+}
+
+test "a database failure is a 500, without the details" {
+    let db = fresh()
+    let _ = db.close()
+    let r = send(db, "GET", "/todos", "")
+    assert_eq(r.status, 500)
+    assert_eq(json.parse(r.body), Ok(json.Obj([json.field("error", json.Str("the database failed"))])))
 }

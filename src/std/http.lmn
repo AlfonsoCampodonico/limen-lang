@@ -894,3 +894,141 @@ pub fn accept_forever(l: Listener, f: fn(Conn) -> Int) -> IoError {
 pub fn serve_forever(l: Listener, handler: fn(Request) -> Response) -> IoError {
     accept_forever(l, |c| serve_conn(c, handler))
 }
+
+// ---------- routing ----------
+
+// What a route's pattern captured from the path: `id` in
+// "GET /todos/:id". Values are percent-decoded.
+pub struct Params {
+    pairs: List[(Str, Str)],
+}
+
+// The value captured as `:name` or `*name`.
+pub fn get(self: Params, name: Str) -> Option[Str] {
+    self.pairs.find(|p| p.0 == name).map(|p| p.1)
+}
+
+// The value captured as `:name`, if it is a whole number.
+pub fn int(self: Params, name: Str) -> Option[Int] {
+    self.get(name).flat_map(|s| s.parse_int())
+}
+
+// A pattern and the handler for requests that match it. The pattern is a
+// method, a space and a path ("GET /todos/:id"), or a path alone for any
+// method. In the path, `:name` matches one segment and `*name`, last,
+// matches the rest, possibly nothing.
+pub type Route = (Str, fn(Request, Params) -> Response)
+
+fn bad_pattern(pattern: Str, why: Str) -> (Str, List[Str]) {
+    panic("http.route: pattern `{pattern}` {why}")
+}
+
+// "GET /todos/:id" -> ("GET", ["todos", ":id"])
+fn parse_pattern(pattern: Str) -> (Str, List[Str]) {
+    let words = pattern.split(" ")
+    let (method, path) = match words.len() {
+        1 => ("", words[0]),
+        2 => (words[0], words[1]),
+        _ => { return bad_pattern(pattern, "has more than a method and a path") },
+    }
+    if method != "" && !is_token(method) {
+        return bad_pattern(pattern, "has a method that is not a token")
+    }
+    if !path.starts_with("/") {
+        return bad_pattern(pattern, "has a path that does not start with `/`")
+    }
+    let segs = path.split("/").filter(|s| !s.is_empty())
+    for (i, s) in segs.with_index() {
+        if s.starts_with("*") && i + 1 < segs.len() {
+            return bad_pattern(pattern, "has `{s}` before its last segment")
+        }
+    }
+    (method, segs)
+}
+
+// "/todos/a%20b?x=1" -> Some(["todos", "a b"]); None if an escape is malformed.
+// Empty segments are dropped, so "/todos/" is "/todos".
+fn segments(path: Str) -> Option[List[Str]] {
+    let mut out: List[Str] = []
+    for s in path.split("?")[0].split("/") {
+        if !s.is_empty() {
+            match url.decode(s) {
+                Ok(d) => out.push(d),
+                Err(_) => { return None },
+            }
+        }
+    }
+    Some(out)
+}
+
+fn capture_name(seg: Str) -> Option[Str] {
+    if seg.starts_with(":") || seg.starts_with("*") {
+        Some(seg.slice(1, seg.len()))
+    } else {
+        None
+    }
+}
+
+fn capture(pattern: List[Str], path: List[Str]) -> Option[List[(Str, Str)]] {
+    let mut out: List[(Str, Str)] = []
+    for (i, seg) in pattern.with_index() {
+        if seg.starts_with("*") {
+            out.push((capture_name(seg) ?? "", path.skip(i).join("/")))
+            return Some(out)
+        }
+        if i >= path.len() {
+            return None
+        }
+        match capture_name(seg) {
+            Some(name) => out.push((name, path[i])),
+            None => {
+                if seg != path[i] {
+                    return None
+                }
+            },
+        }
+    }
+    if pattern.len() == path.len() { Some(out) } else { None }
+}
+
+// A route, with its pattern checked now: `http.on("GET /todos/:id", |r, p| ...)`.
+// A malformed pattern panics.
+pub fn on(pattern: Str, handler: fn(Request, Params) -> Response) -> Route {
+    let _ = parse_pattern(pattern)
+    (pattern, handler)
+}
+
+// Answer `r` with the first route whose pattern matches its method and path
+// (the query string is ignored, and a GET route answers HEAD too). When a
+// path matches but no method does, the answer is 405 with an `Allow`
+// header; when no path matches, 404. A malformed pattern panics, which
+// `serve_conn` answers with 500.
+pub fn route(r: Request, routes: List[Route]) -> Response {
+    let path = match segments(r.path) {
+        Some(p) => p,
+        None => { return text(400, "bad request\n") },
+    }
+    let mut allowed: List[Str] = []
+    for (pattern, handler) in routes {
+        let (method, segs) = parse_pattern(pattern)
+        match capture(segs, path) {
+            None => {},
+            Some(pairs) => {
+                if method == "" || method == r.method || (method == "GET" && r.method == "HEAD") {
+                    return handler(r, Params { pairs })
+                }
+                if !allowed.contains(method) {
+                    allowed.push(method)
+                }
+            },
+        }
+    }
+    if allowed.is_empty() {
+        return text(404, "not found\n")
+    }
+    if allowed.contains("GET") && !allowed.contains("HEAD") {
+        allowed.push("HEAD")
+    }
+    let r405 = text(405, "method not allowed\n")
+    { r405 with headers: r405.headers + [Header { name: "Allow", value: allowed.join(", ") }] }
+}

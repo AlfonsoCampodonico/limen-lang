@@ -3432,7 +3432,7 @@ fn main(root: Root) -> Result[(), IoError] {
   out "example-todo-api"
     ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] }
     (example "todo_api.lmn")
-    "POST /todos -> 201 {\"id\":1,\"title\":\"buy milk\",\"done\":false}\nPOST /todos -> 201 {\"id\":2,\"title\":\"write the README\",\"done\":false}\nPOST /todos -> 400 {\"error\":\"a todo needs a title\"}\nGET /todos -> 200 [{\"id\":1,\"title\":\"buy milk\",\"done\":false},{\"id\":2,\"title\":\"write the README\",\"done\":false}]\nPATCH /todos/1 -> 200 {\"id\":1,\"title\":\"buy milk\",\"done\":true}\nGET /todos/1 -> 200 {\"id\":1,\"title\":\"buy milk\",\"done\":true}\nPATCH /todos/2 -> 400 {\"error\":\"title must be a string\"}\nDELETE /todos/2 -> 204\nDELETE /todos/2 -> 404 {\"error\":\"no todo 2\"}\nGET /todos -> 200 [{\"id\":1,\"title\":\"buy milk\",\"done\":true}]\nGET /users -> 404 {\"error\":\"no route for /users\"}\n";
+    "POST /todos -> 201 {\"id\":1,\"title\":\"buy milk\",\"done\":false}\nPOST /todos -> 201 {\"id\":2,\"title\":\"write the README\",\"done\":false}\nPOST /todos -> 400 {\"error\":\"a todo needs a title\"}\nGET /todos -> 200 [{\"id\":1,\"title\":\"buy milk\",\"done\":false},{\"id\":2,\"title\":\"write the README\",\"done\":false}]\nPATCH /todos/1 -> 200 {\"id\":1,\"title\":\"buy milk\",\"done\":true}\nGET /todos/1 -> 200 {\"id\":1,\"title\":\"buy milk\",\"done\":true}\nPATCH /todos/2 -> 400 {\"error\":\"title must be a string\"}\nDELETE /todos/2 -> 204\nDELETE /todos/2 -> 404 {\"error\":\"no todo 2\"}\nGET /todos -> 200 [{\"id\":1,\"title\":\"buy milk\",\"done\":true}]\nGET /users -> 404 not found\n";
   (* std code is checked like user code: a json error names the byte *)
   out "std-json-errors"
     "use json\n\nfn main(root: Root) {\n    for s in [\"\\{\\\"a\\\": [1, 2.5e1, \\\"\\\\u0041\\\"]\\}\", \"[1 2]\", \"\\\"\\\\x\\\"\"] {\n        match json.parse(s) {\n            Ok(v) => root.stdout.print(json.stringify(v)),\n            Err(e) => root.stdout.print(e),\n        }\n    }\n}\n"
@@ -3511,6 +3511,31 @@ fn main(root: Root) {
     "2025-11-11T18:22:05.123Z\ntime.DateTime { year: 2025, month: 11, day: 11, hour: 18, minute: 22, second: 5, ms: 123, weekday: 2, yday: 315 }\n1970-01-01T00:00:00.000Z 1969-12-31T23:59:59.999Z 2000-02-29T00:00:00.000Z -000001-12-31T00:00:00.000Z +010000-01-01T00:00:00.000Z\ntime.DateTime { year: 1969, month: 12, day: 31, hour: 23, minute: 59, second: 59, ms: 999, weekday: 3, yday: 365 }\nTue 11 Nov 2025 06:22 PM, day 315, week day 2, 1762885325 +0000 UTC % %q 100%\n2025-11-11 12:52 -05:30 -0530 2025-11-11T19:22:05.123+01:00 2025-11-11\n2024-02-29T05:00:00.000Z 2023-01-15T00:00:00.000Z 2025-01-01T00:00:00.000Z 2024-02-29T00:00:00.000Z\n1794355200000 2026-11-11T00:00:00.000Z\n1794421325123 2026-11-11T18:22:05.123Z\n1794421325123 2026-11-11T18:22:05.123Z\n1794421320000 2026-11-11T18:22:00.000Z\n-1 1969-12-31T23:59:59.999Z\n1709146800000 2024-02-28T19:00:00.000Z\ntime: day 29 is out of range for 2023-02\ntime: month 13 is out of range\ntime: 24:00:00 is not a valid time\ntime: expected `:` at byte 13\ntime: expected digits at byte 20\ntime: expected `Z`, an offset or end of input at byte 16\ntime: expected a four-digit year at byte 0\ntime: expected end of input at byte 21\nfalse true 28 ? Sunday\ntrue 1767315600000\n";
   out "std-report-example" (example "report.lmn")
     "Mon 09 Nov caf\195\169        1,234.50\nTue 10 Nov books          98.12\nWed 11 Nov rent    1,500,000.00\n                   1,501,332.62\norder #000042, id 0xbeef\ndue 2026-12-01T08:30:00.000Z, week 2026-305\nprinted in true\n";
+  out "std-http-route"
+    {v|use http
+
+fn req(method: Str, path: Str) -> http.Request {
+    http.Request { method, path, version: "HTTP/1.1", headers: [], body: "" }
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let routes = [
+        http.on("GET /todos", |r, p| http.text(200, "list")),
+        http.on("POST /todos", |r, p| http.text(201, "made")),
+        http.on("GET /todos/:id", |r, p| http.text(200, "todo {p.int("id")} {p.get("id")}")),
+        http.on("DELETE /todos/:id", |r, p| http.text(204, "")),
+        http.on("/files/*rest", |r, p| http.text(200, "file [{p.get("rest") ?? "?"}] {r.method}")),
+    ]
+    for (m, path) in [("GET", "/todos"), ("GET", "/todos/?x=1"), ("POST", "/todos"), ("GET", "/todos/7"), ("GET", "/todos/a%20b"), ("PUT", "/todos/7"), ("PUT", "/todos"), ("HEAD", "/todos"), ("GET", "/users"), ("GET", "/todos/7/x"), ("PATCH", "/files/a/b%2Fc"), ("GET", "/files"), ("GET", "/todos/%zz")] {
+        let resp = http.route(req(m, path), routes)
+        out.print("{m} {path} -> {resp.status} {resp.body.trim()} {resp.header("allow")}")
+    }
+    let bad = catch(|| http.route(req("GET", "/"), [http.on("GET todos", |r, p| http.text(200, ""))]))
+    out.print("{bad}")
+}
+|v}
+    "GET /todos -> 200 list None\nGET /todos/?x=1 -> 200 list None\nPOST /todos -> 201 made None\nGET /todos/7 -> 200 todo Some(7) Some(\"7\") None\nGET /todos/a%20b -> 200 todo None Some(\"a b\") None\nPUT /todos/7 -> 405 method not allowed Some(\"GET, DELETE, HEAD\")\nPUT /todos -> 405 method not allowed Some(\"GET, POST, HEAD\")\nHEAD /todos -> 200 list None\nGET /users -> 404 not found None\nGET /todos/7/x -> 404 not found None\nPATCH /files/a/b%2Fc -> 200 file [a/b/c] PATCH None\nGET /files -> 200 file [] GET None\nGET /todos/%zz -> 400 bad request None\nErr(\"http.route: pattern `GET todos` has a path that does not start with `/`\")\n";
   out "std-regex"
     {v|use regex
 
@@ -8208,8 +8233,8 @@ fn main(root: Root) {
       let last = List.nth_opt (List.rev (String.split_on_char '\n' (String.trim o))) 0 |> Option.value ~default:"" in
       ok name (code = 0 && String.starts_with ~prefix:summary last) (o ^ e))
     [
-      ("example-todo-api-tests", "todo_api.lmn", "12 tests, 0 failed", []);
-      ("example-todo-api-tests-native", "todo_api.lmn", "12 tests, 0 failed", [ "--native" ]);
+      ("example-todo-api-tests", "todo_api.lmn", "14 tests, 0 failed", []);
+      ("example-todo-api-tests-native", "todo_api.lmn", "14 tests, 0 failed", [ "--native" ]);
       ("example-site-operator-tests", "site_operator.lmn", "19 tests, 0 failed", []);
       ("example-site-operator-tests-native", "site_operator.lmn", "19 tests, 0 failed", [ "--native" ]);
     ];

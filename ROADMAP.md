@@ -81,6 +81,14 @@ through `Clock`, with defaults and a way to set them.
   there is no nesting limit, and numbers over 400 characters fail to parse.
 - Reference cycles through `Shared` or channels leak (documented in
   SPEC.md section 8); no cycle collector is planned.
+- JSON has no integer: `json.Value` holds `Num(Float)`, so an id or a
+  count above 2^53 loses precision on the way out. Add `Int(Int)`.
+- The HTTP server has no timeouts: an idle keep-alive connection holds its
+  task until the client goes, which is one slow client per task on the open
+  internet.
+- Closure parameter types aren't inferred inside a tuple in a list literal
+  (`[("GET /", |r, p| ...)]` is E0207); `http.on` exists partly to work
+  around it.
 - Design questions: no shared mutable references (stateful code threads
   state by hand, as the self-hosted compiler shows); E0304 rules out
   callback tables while generics already allow them; a group's value is the

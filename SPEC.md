@@ -1870,6 +1870,9 @@ HTTP/1.1, plain or over TLS. The server keeps connections alive between requests
 | `request_fold(net, method, url, headers, body, init, f)` | `Result[(Response, T), IoError]`: the body is passed to `f: fn(T, Str) -> T` piece by piece as it arrives instead of being held in memory, as it was sent (not decompressed: it asks for no encoding unless `headers` does); the response comes back with an empty body |
 | `request_lines(net, method, url, headers, body, f)` | `Result[Response, IoError]`: for a stream that may never end (a Kubernetes watch, server-sent events, a log follow), each line of a 2xx body is passed to `f: fn(Str) -> Bool` as soon as it has arrived, without its `\n` or `\r\n`; `f` returns `false` to stop, and the connection is closed. Any other status is returned with its whole body, and `f` is not called |
 | `serve_forever(listener, handler) -> IoError` | serve every connection in its own task until the listener is closed (by another task holding it) or fails; returns that error. The tasks are an `interleaved` group (section 10): what a handler prints goes out at once |
+| `route(request, routes) -> Response` | answer with the first `Route` whose pattern matches the method and path, calling its handler; 404 when no path matches, 405 with an `Allow` header when a path matches but no method does (below) |
+| `on(pattern, handler) -> Route`, `type Route = (Str, fn(Request, Params) -> Response)` | a route, its pattern checked now (a malformed one panics) |
+| `struct Params`, `p.get(name) -> Option[Str]`, `p.int(name) -> Option[Int]` | what a pattern captured, percent-decoded; `int` is `None` unless the value is a whole number |
 | `serve(listener, count, handler) -> Int` | the same for `count` connections; returns how many requests were answered |
 | `serve_conn(conn, handler) -> Int` | answer requests on one connection until the client closes it or asks to (`Connection: close`, or HTTP/1.0 without keep-alive); 400 and close on a malformed request, 500 if the handler panics, headers only for HEAD |
 | `handle(conn, handler) -> Bool` | answer one request, then close |
@@ -1895,7 +1898,31 @@ fn main(root: Root) -> Result[(), IoError] {
 }
 ```
 
-The handler is a plain function value, so it gets no capability unless a closure captures one. A streamed response:
+The handler is a plain function value, so it gets no capability unless a closure captures one.
+
+A route pattern is a method, one space and a path (`"GET /todos/:id"`), or a path alone for any method. The path starts with `/`; in it `:name` matches one segment and `*name`, which must be last, matches the remaining segments joined with `/`, possibly none. `route` drops the query string, splits the path on `/`, ignores empty segments (so `/todos/` is `/todos`) and percent-decodes each one, answering 400 if an escape is malformed; literal segments are compared after decoding, and `..` is a segment like any other. Routes are tried in order and the first whose path and method match wins; a GET route also answers HEAD, and 405's `Allow` lists the methods of every route whose path matched, with HEAD when GET is there. The 404 and 405 bodies are plain text. A malformed pattern (no leading `/`, a method that is not a token, more than one space, `*name` before the end) panics in `on`, or in `route` for a tuple built by hand.
+
+```
+use http
+
+fn routes(db: sql.Db) -> List[http.Route] {
+    [
+        http.on("GET /todos", |r, p| list(db)),
+        http.on("GET /todos/:id", |r, p| match p.int("id") {
+            Some(id) => show(db, id),
+            None => http.text(404, "no such todo"),
+        }),
+    ]
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let api = routes(sql.open(root.fs, "todos.db")?)
+    let l = root.listen.on("127.0.0.1:8080")?
+    Err(http.serve_forever(l, |r| http.route(r, api)))
+}
+```
+
+A streamed response:
 
 ```
 fn numbers(r: http.Request, c: Conn) -> Result[(), IoError] {
