@@ -1739,6 +1739,148 @@ fn main(root: Root) -> Result[(), IoError] {
       (main_wrap "    out.print(\"{root.fs.read(\"link/hosts\")}\")")
       "Err(Denied(\"fs: path resolves outside the granted directory\"))\n"
   end;
+  (* Links inside the grant are followed, links out are refused, however the
+     path reaches them; remove and rename act on a link itself. *)
+  let fresh_dir tag =
+    let d = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "limen-%s-%d" tag (Unix.getpid ())) in
+    ignore (Sys.command (Filename.quote_command "rm" [ "-rf"; d ]));
+    Unix.mkdir d 0o755;
+    Unix.realpath d
+  in
+  let put p s = Out_channel.with_open_bin p (fun oc -> output_string oc s) in
+  let link_dir = fresh_dir "fslinks" in
+  List.iter (fun d -> Unix.mkdir (Filename.concat link_dir d) 0o755) [ "jail"; "jail/d"; "jail/d2"; "jail/n"; "jail/n/m" ];
+  put (Filename.concat link_dir "outside.txt") "secret";
+  put (Filename.concat link_dir "jail/d/x") "public";
+  List.iter (fun (target, l) -> Unix.symlink target (Filename.concat link_dir l))
+    [ ("../../outside.txt", "jail/d2/x"); ("d", "jail/in"); (link_dir ^ "/jail/d", "jail/abs"); ("..", "jail/up"); ("in/../d2", "jail/via"); ("../../d/x", "jail/n/m/l"); ("../..", "jail/n/m/up2"); ("../../..", "jail/n/m/out") ];
+  out "fs-links" ~grants:{ Interp.no_grants with fs = Some (link_dir, false) }
+    (main_wrap
+       {|    let fs = root.fs.under("jail")
+    out.print("{fs.read("in/x")} {fs.read("abs/x")} {fs.read("in/../d/x")} {fs.read("via/x")}")
+    out.print("{fs.read("up/outside.txt")} {fs.read("d2/x")} {fs.exists("d2/x")} {fs.under("up").read("outside.txt")}")
+    out.print("{fs.list("in")} {fs.is_dir("abs")} {fs.under("in").read("x")} {fs.info("in").map(|i| i.is_dir)}")
+    out.print("{fs.rename("in", "in2")} {fs.is_dir("d")} {fs.read("in2/x")} {fs.rename("in2", "in")}")
+    out.print("{fs.rename("d", "d1")} {fs.rename("d2", "d")} {fs.read("d/x")} {fs.rename("d", "d2")} {fs.rename("d1", "d")}")
+    out.print("{fs.read("n/m/l")} {fs.read("n/m/up2/d/x")} {fs.read("n/m/out/outside.txt")}")|})
+    "Ok(\"public\") Ok(\"public\") Ok(\"public\") Err(Denied(\"fs: path resolves outside the granted directory\"))\nErr(Denied(\"fs: path resolves outside the granted directory\")) Err(Denied(\"fs: path resolves outside the granted directory\")) false Err(Denied(\"fs: not granted (run with --grant fs=DIR)\"))\nOk([\"x\"]) true Ok(\"public\") Ok(true)\nOk(()) true Ok(\"public\") Ok(())\nOk(()) Ok(()) Err(Denied(\"fs: path resolves outside the granted directory\")) Ok(()) Ok(())\nOk(\"public\") Ok(\"public\") Err(Denied(\"fs: path resolves outside the granted directory\"))\n";
+  (* A directory swapped for one holding a link out, between the check of a
+     path and its use, used to let the read follow the link outside. *)
+  let race_src n =
+    main_wrap
+      (sprintf
+         {|    let fs = root.fs.under("jail")
+    let done = atomic(0)
+    let leaks = atomic(0)
+    let _ = group g {
+        g.go(|| {
+            let mut i = 0
+            while i < %d && done.get() == 0 {
+                let _ = fs.rename("d", "d1")
+                let _ = fs.rename("d2", "d")
+                let _ = fs.rename("d", "d2")
+                let _ = fs.rename("d1", "d")
+                i = i + 1
+            }
+            done.set(1)
+        })
+        g.go(|| {
+            while done.get() == 0 {
+                match fs.read("d/x") {
+                    Ok(s) => if s == "secret" { leaks.add(1); done.set(1) },
+                    Err(_) => {},
+                }
+            }
+        })
+    }
+    out.print("leaks={leaks.get()}")|}
+         n)
+  in
+  let race_dir tag =
+    let d = fresh_dir ("fsrace-" ^ tag) in
+    List.iter (fun x -> Unix.mkdir (Filename.concat d x) 0o755) [ "jail"; "jail/d"; "jail/d2" ];
+    put (Filename.concat d "outside.txt") "secret";
+    put (Filename.concat d "jail/d/x") "public";
+    Unix.symlink "../../outside.txt" (Filename.concat d "jail/d2/x");
+    { Interp.no_grants with fs = Some (d, false) }
+  in
+  out "fs-swap-race" ~grants:(race_dir "asan") (race_src 3000) "leaks=0\n";
+  check_tsan "fs-swap-race" ~grants:(race_dir "tsan") (race_src 3000) "leaks=0\n";
+  (* Freeing a long chain takes constant stack: these were freed by recursion,
+     one native frame per link, and a task's 1 MB stack ran out. *)
+  out "drop-long-chain"
+    {|struct Node { value: Int, next: Option[Node] }
+struct Tree { kids: List[Tree] }
+fn chain(n: Int) -> Int {
+    let mut head: Option[Node] = None
+    let mut i = 0
+    while i < n {
+        head = Some(Node { value: i, next: head })
+        i = i + 1
+    }
+    match head { Some(x) => x.value, None => 0 }
+}
+fn nest(n: Int) -> Int {
+    let mut t = Tree { kids: [] }
+    let mut i = 0
+    while i < n {
+        t = Tree { kids: [t] }
+        i = i + 1
+    }
+    t.kids.len()
+}
+fn closures(n: Int) -> Int {
+    let mut f = || 0
+    let mut i = 0
+    while i < n {
+        let g = f
+        f = || g() + 1
+        i = i + 1
+    }
+    n
+}
+fn main(root: Root) {
+    let r = group g {
+        g.go(|| chain(200000))
+        g.go(|| nest(200000))
+        g.go(|| closures(200000))
+    }
+    root.stdout.print("{r} {chain(300000)}")
+}
+|}
+    "[199999, 1, 200000] 299999\n";
+  (* Recursion deeper than a task's stack: natively a message and status 1,
+     not a silent crash (the interpreter's stack is larger) *)
+  if native_for "stack-overflow" && selected "stack-overflow" then
+    run_native "stack-overflow"
+      {|fn depth(n: Int, s: Str) -> Str {
+    if n == 0 { s } else {
+        let r = depth(n - 1, s + "")
+        "{r.len() + n % 3}"
+    }
+}
+fn main(root: Root) {
+    root.stdout.print("{group g { g.go(|| depth(1000000, "")) }}")
+}
+|}
+      (function
+        | Error m -> ok "stack-overflow/native" false m
+        | Ok (code, o, e) ->
+          ok "stack-overflow/native"
+            (code = 1 && o = "" && String.starts_with ~prefix:"panic: stack overflow\n  --> a task, whose stack is 1024 KB" e)
+            (sprintf "exit %d, stdout %S, stderr %S" code o e));
+  (* NUL bytes in paths: refused alike by every operation in both backends
+     (C would see a shorter path); reading a directory is an error in both *)
+  out "fs-nul" ~grants:rw
+    (main_wrap
+       {|    let fs = root.fs
+    out.print("{fs.write("nul.txt\0junk", "x")} {fs.read("a.txt\0zz")} {fs.append("a\0", "x")} {fs.exists("nul.txt")}")
+    out.print("{fs.under("sub").read("\0")} {fs.under("sub\0").read("b.txt")} {fs.exists("a.txt\0")} {fs.is_dir("sub\0")}")
+    out.print("{fs.list("sub\0")} {fs.info("a.txt\0")} {fs.remove("a.txt\0")} {fs.make_dir("n\0")} {fs.rename("a.txt\0", "q")} {fs.rename("a.txt", "q\0")}")
+    out.print("{fs.read("").is_err()} {fs.read("sub").is_err()} {fs.write("sub", "x").is_err()} {fs.read("a.txt")}")|})
+    (let nul = "Err(Failed(\"fs: the path contains a NUL byte\"))" in
+     sprintf "%s %s %s false\n%s Err(Denied(\"fs: not granted (run with --grant fs=DIR)\")) false false\n%s %s %s %s %s %s\ntrue true true Ok(\"alpha\")\n"
+       nul nul nul nul nul nul nul nul nul nul);
 
   (* Stderr: always granted, written at once and apart from stdout *)
   let stderr_src = main_wrap "    out.print(\"one\")\n    root.stderr.print(\"two\")\n    root.stderr.write(\"three\")\n    out.write(\"four\\n\")" in

@@ -2419,8 +2419,8 @@ and field rt v name =
   | VCap CRoot, "net" -> VCap (CNet rt.grants.net)
   | VCap CRoot, "fs" -> (
     match rt.grants.fs with
-    | Some (root, ro) -> VCap (CFs { Caps.root = Some root; ro })
-    | None -> VCap (CFs { Caps.root = None; ro = true }))
+    | Some (root, ro) -> VCap (CFs { Caps.root = Some root; ro; top = root })
+    | None -> VCap (CFs { Caps.root = None; ro = true; top = "/" }))
   | VCap CRoot, "stdout" -> VCap CStdout
   | VCap CRoot, "stderr" -> VCap CStderr
   | VCap CRoot, "clock" -> VCap CClock
@@ -3121,7 +3121,7 @@ let run_tests_timed ?(select = fun _ -> true) ~out (user_items : item list) :
           List.map
             (fun (p : param) ->
               match (p.prm_ty.tdesc, dir) with
-              | TyName ("Fs", _), Some dir -> VCap (CFs { Caps.root = Some dir; ro = false })
+              | TyName ("Fs", _), Some dir -> VCap (CFs { Caps.root = Some dir; ro = false; top = dir })
               | _ -> VCap CClock)
             d.fn_params
         in

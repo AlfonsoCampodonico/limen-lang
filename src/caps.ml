@@ -230,155 +230,70 @@ let parse_http ?(cut = false) data : (int * (string * string) list * string, ioe
 
 (* ---------- filesystem ---------- *)
 
-type fs = { root : string option; ro : bool }
+(* [top] is the granted directory, [root] this capability's (None: not
+   granted). Every operation walks the path in C (limen_sandbox.h, through
+   ffi_stubs.c), as the native runtime does: through directory descriptors,
+   reading each symbolic link instead of letting the kernel follow it, so a
+   directory swapped for a link while the walk goes on cannot lead out of
+   the root. *)
+type fs = { root : string option; ro : bool; top : string }
 
 let not_granted = Denied "fs: not granted (run with --grant fs=DIR)"
-
-let normalize root rel : (string, string) result =
-  if rel <> "" && rel.[0] = '/' then Error "absolute paths are not allowed; paths are relative to the granted directory"
-  else
-    let rec go acc = function
-      | [] -> Ok (List.rev acc)
-      | ("" | ".") :: r -> go acc r
-      | ".." :: r -> ( match acc with [] -> Error "path escapes the granted directory" | _ :: a -> go a r)
-      | p :: r -> go (p :: acc) r
-    in
-    Result.map
-      (fun ps -> if ps = [] then root else Filename.concat root (String.concat "/" ps))
-      (go [] (String.split_on_char '/' rel))
-
-let inside root p = p = root || String.starts_with ~prefix:(if root = "/" then "/" else root ^ "/") p
-let real p = try Some (Unix.realpath p) with Unix.Unix_error _ -> None
-
-(* Resolve [rel] under the root, rejecting `..` escapes and symlinks that point outside. *)
-let resolve fs rel ~for_write =
-  match fs.root with
-  | None -> Error not_granted
-  | Some root -> (
-    match normalize root rel with
-    | Error m -> Error (Denied ("fs: " ^ m))
-    | Ok p -> (
-      (* lstat, as the C runtime does: a dangling symlink exists, and is
-         checked by where it points, not by its directory *)
-      let present = try ignore (Unix.lstat p); true with Unix.Unix_error _ -> false in
-      let target = if for_write && not present then Filename.dirname p else p in
-      match real target with
-      | Some rp when inside root rp -> Ok p
-      | Some _ -> Error (Denied "fs: path resolves outside the granted directory")
-      | None ->
-        if for_write then Error (Failed (sprintf "fs: directory of `%s` does not exist" rel))
-        else Error (Failed (sprintf "fs: `%s` does not exist" rel))))
-
-let under fs rel =
-  match fs.root with
-  | None -> fs
-  | Some root -> (
-    match normalize root rel with
-    | Error _ -> { fs with root = None }
-    | Ok p -> (
-      match real p with
-      | Some rp when inside root rp -> { fs with root = Some rp }
-      | Some _ -> { fs with root = None }
-      | None -> { fs with root = Some p }))
-
-let read fs rel : (string, ioerr) result =
-  match resolve fs rel ~for_write:false with
-  | Error e -> Error e
-  | Ok p -> ( try Ok (In_channel.with_open_bin p In_channel.input_all) with Sys_error m -> Error (Failed m))
-
-let write fs rel data : (unit, ioerr) result =
-  if fs.root <> None && fs.ro then Error (Denied "fs: this capability is read-only")
-  else
-    match resolve fs rel ~for_write:true with
-    | Error e -> Error e
-    | Ok p -> (
-      try Ok (Out_channel.with_open_bin p (fun oc -> Out_channel.output_string oc data))
-      with Sys_error m -> Error (Failed m))
-
-(* The absolute path of [rel], checked as for writing (the file need not
-   exist, its directory must), for handing to C or another program. *)
-let full_path fs rel : (string, ioerr) result =
-  if String.contains rel '\000' then Error (Failed "fs: the path contains a NUL byte")
-  else
-    match resolve fs rel ~for_write:true with
-    | Error e -> Error e
-    | Ok p when Some p = fs.root -> Ok p
-    | Ok p -> (
-      (* the real directory and the last name, as natively *)
-      match (real (Filename.dirname p), fs.root) with
-      | Some rd, Some root when inside root rd -> Ok (Filename.concat rd (Filename.basename p))
-      | _ -> Error (Denied "fs: path resolves outside the granted directory"))
-
-let exists fs rel = match resolve fs rel ~for_write:false with Ok p -> Sys.file_exists p | Error _ -> false
-
 let read_only_err = Denied "fs: this capability is read-only"
 
-let append fs rel data : (unit, ioerr) result =
-  if fs.root <> None && fs.ro then Error read_only_err
-  else
-    match resolve fs rel ~for_write:true with
-    | Error e -> Error e
-    | Ok p -> (
-      try
-        Ok (Out_channel.with_open_gen [ Open_wronly; Open_append; Open_creat; Open_binary ] 0o644 p (fun oc ->
-                Out_channel.output_string oc data))
-      with Sys_error m -> Error (Failed m))
-
-(* Names in a directory, sorted, without `.` and `..`. *)
-let list fs rel : (string list, ioerr) result =
-  match resolve fs rel ~for_write:false with
-  | Error e -> Error e
-  | Ok p -> (
-    try Ok (List.sort compare (Array.to_list (Sys.readdir p)))
-    with Sys_error _ -> Error (Failed (sprintf "fs: `%s` is not a directory" rel)))
-
-let is_dir fs rel = match resolve fs rel ~for_write:false with Ok p -> (try Sys.is_directory p with Sys_error _ -> false) | Error _ -> false
-
-(* A file or an empty directory; never the granted directory itself. *)
-let remove fs rel : (unit, ioerr) result =
-  if fs.root <> None && fs.ro then Error read_only_err
-  else
-    match resolve fs rel ~for_write:false with
-    | Error e -> Error e
-    | Ok p when Some p = fs.root -> Error (Denied "fs: cannot remove the granted directory itself")
-    | Ok p -> (
-      try if Sys.is_directory p then Unix.rmdir p else Unix.unlink p; Ok ()
-      with Unix.Unix_error (e, _, _) -> Error (Failed (sprintf "fs: `%s`: %s" rel (Unix.error_message e))))
+external fs_op : int -> string -> string -> string -> string -> int * string = "limen_fs_op"
+external fs_stat : string -> string -> string -> int * string * int * int * bool * bool = "limen_fs_stat"
 
 (* A file's modification time in milliseconds (following links), as the
    native runtime has it; -1 when it cannot be read. *)
 external mtime_ms : string -> int = "limen_mtime_ms"
 
-(* Size, modification time and kind of [rel], following links:
-   (size, modified_ms, is_file, is_dir). *)
-let info fs rel : (int * int * bool * bool, ioerr) result =
-  match resolve fs rel ~for_write:false with
-  | Error e -> Error e
-  | Ok p -> (
-    match Unix.stat p with
-    | st -> Ok (st.st_size, mtime_ms p, st.st_kind = Unix.S_REG, st.st_kind = Unix.S_DIR)
-    | exception Unix.Unix_error (e, _, _) -> Error (Failed (sprintf "fs: `%s`: %s" rel (Unix.error_message e))))
+let fs_result = function 0, s -> Ok s | 1, m -> Error (Denied m) | _, m -> Error (Failed m)
+
+let op fs n a b = match fs.root with None -> Error not_granted | Some root -> fs_result (fs_op n fs.top root a b)
+let write_op fs n a b = if fs.root <> None && fs.ro then Error read_only_err else op fs n a b
+
+let under fs rel =
+  match fs.root with
+  | None -> fs
+  | Some root -> ( match fs_op 8 fs.top root rel "" with 0, r -> { fs with root = Some r } | _ -> { fs with root = None })
+
+let read fs rel : (string, ioerr) result = op fs 0 rel ""
+let write fs rel data : (unit, ioerr) result = Result.map ignore (write_op fs 1 rel data)
+let append fs rel data : (unit, ioerr) result = Result.map ignore (write_op fs 2 rel data)
+
+(* The absolute path of [rel], checked as for writing (the file need not
+   exist, its directory must), for handing to C or another program: the
+   real directory and the last name. *)
+let full_path fs rel : (string, ioerr) result = op fs 7 rel ""
+
+(* Names in a directory, sorted, without `.` and `..`. *)
+let list fs rel : (string list, ioerr) result =
+  Result.map
+    (fun s -> List.sort compare (List.filter (fun n -> n <> "") (String.split_on_char '\000' s)))
+    (op fs 3 rel "")
+
+(* A file or an empty directory; never the granted directory itself. *)
+let remove fs rel : (unit, ioerr) result = Result.map ignore (write_op fs 4 rel "")
+let make_dir fs rel : (unit, ioerr) result = Result.map ignore (write_op fs 5 rel "")
 
 (* Move [from] to [to] in one step, replacing what is at [to]; never the
    granted directory itself. *)
-let rename fs from to_ : (unit, ioerr) result =
-  if fs.root <> None && fs.ro then Error read_only_err
-  else
-    match (resolve fs from ~for_write:false, resolve fs to_ ~for_write:true) with
-    | Error e, _ | _, Error e -> Error e
-    | Ok a, Ok b when Some a = fs.root || Some b = fs.root -> Error (Denied "fs: cannot rename the granted directory itself")
-    | Ok a, Ok b -> (
-      try Unix.rename a b; Ok ()
-      with Unix.Unix_error (e, _, _) -> Error (Failed (sprintf "fs: `%s`: %s" from (Unix.error_message e))))
+let rename fs from to_ : (unit, ioerr) result = Result.map ignore (write_op fs 6 from to_)
 
-let make_dir fs rel : (unit, ioerr) result =
-  if fs.root <> None && fs.ro then Error read_only_err
-  else
-    match resolve fs rel ~for_write:true with
-    | Error e -> Error e
-    | Ok p -> (
-      try Unix.mkdir p 0o755; Ok ()
-      with Unix.Unix_error (e, _, _) -> Error (Failed (sprintf "fs: `%s`: %s" rel (Unix.error_message e))))
+(* Size, modification time in milliseconds and kind of [rel], following
+   links: (size, modified_ms, is_file, is_dir). *)
+let info fs rel : (int * int * bool * bool, ioerr) result =
+  match fs.root with
+  | None -> Error not_granted
+  | Some root -> (
+    match fs_stat fs.top root rel with
+    | 0, _, size, ms, f, d -> Ok (size, ms, f, d)
+    | 1, m, _, _, _, _ -> Error (Denied m)
+    | _, m, _, _, _, _ -> Error (Failed m))
+
+let exists fs rel = Result.is_ok (info fs rel)
+let is_dir fs rel = match info fs rel with Ok (_, _, _, d) -> d | Error _ -> false
 
 (* ---------- test directories ----------
    A test that takes `fs: Fs` gets a fresh directory, removed afterwards. *)
