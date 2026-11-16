@@ -83,7 +83,9 @@ pub fn as_list(self: Value) -> Option[List[Value]] {
 
 // ---------- writing ----------
 
-// Compact JSON text for `v`.
+// Compact JSON text for `v`. JSON has no infinity or NaN, so those numbers
+// are written as `null`, as JavaScript does; every other number is written
+// in the fewest digits that read back as the same Float.
 pub fn stringify(v: Value) -> Str {
     match v {
         Null => "null",
@@ -96,10 +98,131 @@ pub fn stringify(v: Value) -> Str {
 }
 
 fn num_text(x: Float) -> Str {
-    if x == x.to_int().to_float() && x.abs() < 1000000000000000.0 {
-        x.to_int().to_str()
+    if x != x || x - x != 0.0 {
+        // NaN or an infinity
+        return "null"
+    }
+    if x.abs() < 100000000000000000.0 && x == x.to_int().to_float() {
+        return x.to_int().to_str()
+    }
+    // Float's to_str keeps 15 significant digits, enough for most numbers;
+    // the rest need 16 or 17
+    let s = x.to_str()
+    if s.parse_float() == Some(x) {
+        return s
+    }
+    if x < 0.0 {
+        "-" + longer(0.0 - x, s.slice(1, s.len()))
     } else {
-        x.to_str()
+        longer(x, s)
+    }
+}
+
+fn pow10(n: Int) -> Int {
+    let mut p = 1
+    for _ in 0..<n {
+        p = p * 10
+    }
+    p
+}
+
+// The power of ten of the first significant digit of `s`, a positive
+// number as Float's to_str writes it: `1.5e+22`, `0.00012` or `123.25`.
+fn decimal_exponent(s: Str) -> Int {
+    match s.index_of("e") {
+        Some(k) => {
+            let e = s.slice(k + 1, s.len())
+            let n = if e.starts_with("+") { e.slice(1, e.len()) } else { e }
+            n.parse_int() ?? 0
+        },
+        None => {
+            let point = s.index_of(".") ?? s.len()
+            let bs = s.bytes()
+            let mut i = 0
+            while i < bs.len() && (bs[i] == 48 || bs[i] == 46) {
+                i = i + 1
+            }
+            if i < point { point - i - 1 } else { point - i }
+        },
+    }
+}
+
+// `m * 10^e` read as a Float.
+fn scaled(m: Int, e: Int) -> Float {
+    "{m}e{e}".parse_float() ?? 0.0
+}
+
+// The shortest text for a positive finite `x` that needs more than the 15
+// digits of `s`, its to_str. With q chosen so x / 10^q lies in [10^16,
+// 10^18], it finds the whole numbers m from `low` to `high` for which
+// m * 10^q reads back as x (reading text rounds to nearest, so they are
+// one unbroken run, found by bisection). Then, with 16 digits and else
+// 17, it takes the one in that run nearest its middle, which is nearest x
+// (to within the 18th digit; any of them reads back as x).
+fn longer(x: Float, s: Str) -> Str {
+    let q = decimal_exponent(s) - 17
+    // the largest m with m * 10^q <= x
+    let mut lo = pow10(16)
+    let mut hi = pow10(18)
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2
+        if scaled(mid, q) <= x { lo = mid } else { hi = mid }
+    }
+    let high = lo
+    // the smallest m with m * 10^q >= x
+    lo = pow10(16)
+    hi = high
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2
+        if scaled(mid, q) >= x { hi = mid } else { lo = mid }
+    }
+    let low = hi
+    let n = high.to_str().len()
+    for p in [16, 17] {
+        if p <= n {
+            let unit = pow10(n - p)
+            let first = (low + unit - 1) / unit
+            let last = high / unit
+            if first <= last {
+                let middle = ((low + high) / unit + 1) / 2
+                let m = if middle < first { first } else if middle > last { last } else { middle }
+                return digits_text(m, q + n - p)
+            }
+        }
+    }
+    digits_text(high, q)
+}
+
+fn zeros(n: Int) -> Str {
+    let mut s = ""
+    for _ in 0..<n {
+        s = s + "0"
+    }
+    s
+}
+
+// `m * 10^e` written out as JSON: plain when the point falls near the
+// digits (`0.30000000000000004`, `123.45678901234568`), with an exponent
+// otherwise (`1.2345678901234567e+29`).
+fn digits_text(m: Int, e: Int) -> Str {
+    let mut d = m.to_str()
+    let mut ex = e
+    while d.len() > 1 && d.ends_with("0") {
+        d = d.slice(0, d.len() - 1)
+        ex = ex + 1
+    }
+    let n = d.len()
+    let point = n + ex
+    if ex >= 0 && point <= 21 {
+        d + zeros(ex)
+    } else if point > 0 && point <= 21 {
+        d.slice(0, point) + "." + d.slice(point, n)
+    } else if point <= 0 && point > -6 {
+        "0." + zeros(0 - point) + d
+    } else {
+        let rest = if n > 1 { "." + d.slice(1, n) } else { "" }
+        let sign = if point - 1 >= 0 { "+" } else { "" }
+        d.slice(0, 1) + rest + "e" + sign + "{point - 1}"
     }
 }
 
@@ -201,15 +324,53 @@ fn value(t: Text, i: Int) -> Result[Parsed, Str] {
     }
 }
 
+fn is_digit(t: Text, j: Int) -> Bool {
+    j < t.bs.len() && t.bs[j] >= 48 && t.bs[j] <= 57
+}
+
+// The digits from `j` on: where they stop.
+fn digits(t: Text, j: Int) -> Int {
+    let mut k = j
+    while is_digit(t, k) {
+        k = k + 1
+    }
+    k
+}
+
+// A number, by RFC 8259's grammar exactly:
+// `-`? (`0` | [1-9][0-9]*) (`.` [0-9]+)? ([eE] [+-]? [0-9]+)?
+// so `01`, `1.`, `.5` and `+1` are not numbers. One too large for a Float
+// (`1e999`) is an error; one too small to tell from zero reads as 0.
 fn number(t: Text, i: Int) -> Result[Parsed, Str] {
     let mut j = i
-    while j < t.bs.len() && ((t.bs[j] >= 48 && t.bs[j] <= 57) || t.bs[j] == 45 || t.bs[j] == 43 || t.bs[j] == 46 || t.bs[j] == 101 || t.bs[j] == 69) {
+    if j < t.bs.len() && t.bs[j] == 45 {
         j = j + 1
     }
-    match t.s.slice(i, j).parse_float() {
-        Some(x) => Ok(Parsed { value: Num(x), pos: j }),
-        None => Err(fail("a value", i)),
+    if !is_digit(t, j) {
+        return Err(fail("a value", i))
     }
+    j = if t.bs[j] == 48 { j + 1 } else { digits(t, j) }
+    if j < t.bs.len() && t.bs[j] == 46 {
+        if !is_digit(t, j + 1) {
+            return Err(fail("a digit after `.`", j + 1))
+        }
+        j = digits(t, j + 1)
+    }
+    if j < t.bs.len() && (t.bs[j] == 101 || t.bs[j] == 69) {
+        let mut k = j + 1
+        if k < t.bs.len() && (t.bs[k] == 43 || t.bs[k] == 45) {
+            k = k + 1
+        }
+        if !is_digit(t, k) {
+            return Err(fail("a digit in the exponent", k))
+        }
+        j = digits(t, k)
+    }
+    let x = t.s.slice(i, j).parse_float() ?? { return Err(fail("a number", i)) }
+    if x - x != 0.0 {
+        return Err(fail("a number within Float's range", i))
+    }
+    Ok(Parsed { value: Num(x), pos: j })
 }
 
 fn array(t: Text, i: Int) -> Result[Parsed, Str] {
