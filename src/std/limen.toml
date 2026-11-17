@@ -9,7 +9,7 @@ name = "std"
 json = { path = ".", caps = [] }
 list = { path = ".", caps = [] }
 text = { path = ".", caps = [] }
-http = { path = ".", caps = ["net", "listen"] }
+http = { path = ".", caps = ["net", "listen", "clock"] }
 format = { path = ".", caps = [] }
 time = { path = ".", caps = ["clock", "fs"] }
 regex = { path = ".", caps = [] }

@@ -302,7 +302,8 @@ fn main(root: Root) -> Result[(), IoError] {
     let l = root.listen.on(address)?
     root.stdout.print("serving todos on {address}")
     let api = routes(db, |line| root.stderr.print(line))
-    Err(http.serve_forever(l, |r| http.route(r, api)))
+    // time limits per connection, so a slow client cannot hold a task forever
+    Err(http.server(root.clock).serve_forever(l, |r| http.route(r, api)))
 }
 
 // ---------- tests ----------

@@ -110,7 +110,7 @@ fn cap_methods(c: Str, io: types.Ty) -> List[Method] {
         "Net" => [m("get", [TStr], res(TNamed("HttpResponse", []))), m("only", [TStr], TCap("Net")), m("connect", [TStr], res(TCap("Conn"))), m("connect_tls", [TStr], res(TCap("Conn"))), revocable],
         "Listen" => [m("on", [TStr], res(TCap("Listener"))), m("on_tls", [TStr, TStr, TStr], res(TCap("Listener"))), revocable],
         "Listener" => [m("accept", [], res(TCap("Conn"))), m("port", [], TInt), m("close", [], TUnit)],
-        "Conn" => [m("read", [], res(TStr)), m("write", [TStr], res(TUnit)), m("close", [], TUnit)],
+        "Conn" => [m("read", [], res(TStr)), m("write", [TStr], res(TUnit)), m("read_within", [TCap("Clock"), TInt], res(TStr)), m("write_within", [TCap("Clock"), TInt, TStr], res(TUnit)), m("close", [], TUnit)],
         "Fs" => [
             m("read", [TStr], res(TStr)),
             m("write", [TStr, TStr], res(TUnit)),

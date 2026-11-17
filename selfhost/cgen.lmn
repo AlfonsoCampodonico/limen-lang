@@ -1687,6 +1687,8 @@ fn prim(self: Cg, ind: Str, dst: Str, t: types.Ty, name: Str, rt: types.Ty, a: L
         ("cap_read_only", _) => c.set(ind, dst, "Cap_fs_read_only({arg(0)})"),
         ("cap_read", TCap("Conn")) => c.io_result(ind, dst, t, "Cap_conn_read({arg(0)})", "r_.val"),
         ("cap_write", TCap("Conn")) => c.io_result(ind, dst, t, "Cap_conn_write({arg(0)}, {arg(1)})", "0"),
+        ("cap_read_within", TCap("Conn")) => c.io_result(ind, dst, t, "Cap_conn_read_within({arg(0)}, {arg(1)}, {arg(2)})", "r_.val"),
+        ("cap_write_within", TCap("Conn")) => c.io_result(ind, dst, t, "Cap_conn_write_within({arg(0)}, {arg(1)}, {arg(2)}, {arg(3)})", "0"),
         ("cap_on", _) => c.io_result(ind, dst, t, "Cap_listen_on({arg(0)}, {arg(1)})", "(WCap*)r_.ptr"),
         ("cap_accept", _) => c.io_result(ind, dst, t, "Cap_accept({arg(0)})", "(WCap*)r_.ptr"),
         ("cap_connect", _) => c.io_result(ind, dst, t, "Cap_net_connect({arg(0)}, {arg(1)})", "(WCap*)r_.ptr"),

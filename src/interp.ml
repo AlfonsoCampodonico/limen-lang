@@ -1088,9 +1088,15 @@ let rec schedule finished sp =
    Non-blocking sockets; a task that would block waits in the scheduler. *)
 module Sock = struct
   (* retry after the scheduler's next round of waiting for I/O, or as soon as the socket is closed *)
-  let wait sk write =
+  let wait ?within sk write =
     let e = !io_epoch in
-    wait_until ~io:(sk, write) (fun () -> sk.shut || !io_epoch > e)
+    match within with
+    | None -> wait_until ~io:(sk, write) (fun () -> sk.shut || !io_epoch > e)
+    | Some (tm, _) -> wait_until ~io:(sk, write) ~tm (fun () -> sk.shut || !io_epoch > e || rung tm)
+
+  (* read_within and write_within: whether the deadline has passed, and the error then *)
+  let late = function Some (tm, _) -> rung tm | None -> false
+  let late_err = function Some (_, ms) -> Error (Caps.Failed (sprintf "timed out after %Ld ms" ms)) | None -> assert false
 
   (* Run [op] as this socket's reader (or writer): [op claim] calls [claim ()]
      before each wait (a writer also before its first byte), which is false
@@ -1249,7 +1255,7 @@ module Sock = struct
     | n -> `Wait (n = Tls.want_write)
     | exception Failure m -> `Failed m
 
-  let read sk =
+  let read ?within sk =
     one_at_a_time sk false (fun claim ->
         let b = Bytes.create 65536 in
         let rec go () =
@@ -1259,19 +1265,19 @@ module Sock = struct
             | Tls.Session s -> (
               match tls_step s 0 b 0 65536 with
               | `Done n -> Ok (Bytes.sub_string b 0 n)
-              | `Wait w -> if claim () then (wait sk w; go ()) else busy "reading this connection"
+              | `Wait w -> if late within then late_err within else if claim () then (wait ?within sk w; go ()) else busy "reading this connection"
               | `Failed m -> Error (Caps.Failed m))
             | _ ->
             match Unix.read sk.fd b 0 65536 with
             | n -> Ok (Bytes.sub_string b 0 n)
             | exception Unix.Unix_error (Unix.EINTR, _, _) -> go ()
             | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _) ->
-              if claim () then (wait sk false; go ()) else busy "reading this connection"
+              if late within then late_err within else if claim () then (wait ?within sk false; go ()) else busy "reading this connection"
             | exception Unix.Unix_error (e, _, _) -> failed e
         in
         go ())
 
-  let write sk s =
+  let write ?within sk s =
     one_at_a_time sk true (fun claim ->
         let rec go off =
           if sk.shut then closed_err "connection"
@@ -1281,14 +1287,14 @@ module Sock = struct
             | Tls.Session t -> (
               match tls_step t 1 (Bytes.unsafe_of_string s) off (min (String.length s - off) 0x3fffffff) with
               | `Done n -> go (off + n)
-              | `Wait w -> if claim () then (wait sk w; go off) else busy "writing this connection"
+              | `Wait w -> if late within then late_err within else if claim () then (wait ?within sk w; go off) else busy "writing this connection"
               | `Failed m -> Error (Caps.Failed m))
             | _ ->
             match Unix.single_write_substring sk.fd s off (String.length s - off) with
             | n -> go (off + n)
             | exception Unix.Unix_error (Unix.EINTR, _, _) -> go off
             | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _) ->
-              if claim () then (wait sk true; go off) else busy "writing this connection"
+              if late within then late_err within else if claim () then (wait ?within sk true; go off) else busy "writing this connection"
             | exception Unix.Unix_error (e, _, _) -> failed e
         in
         (* a writer holds the slot from its first byte: a second writer that
@@ -3002,6 +3008,12 @@ and cap_call rt c name args sp =
   | (CListener (fd, _) | CConn fd), "close", [] -> Sock.close fd; VUnit
   | CConn fd, "read", [] -> sock_result (Sock.read fd) (fun s -> VStr s)
   | CConn fd, "write", [ VStr s ] -> sock_result (Sock.write fd s) (fun () -> VUnit)
+  | CConn fd, "read_within", [ _; VInt ms ] ->
+    let ms = max ms 0L in
+    sock_result (Sock.read ~within:(timer_after ms, ms) fd) (fun s -> VStr s)
+  | CConn fd, "write_within", [ _; VInt ms; VStr s ] ->
+    let ms = max ms 0L in
+    sock_result (Sock.write ~within:(timer_after ms, ms) fd s) (fun () -> VUnit)
   | CForeign allowed, "only", [ VStr l ] -> VCap (CForeign (Foreign.only allowed l))
   | CForeign allowed, "allows", [ VStr l ] -> VBool (Foreign.permits allowed l)
   | CForeign allowed, "copy", [ VStruct (_, [ (_, VInt p) ]); VInt n ] -> Foreign.copy allowed p n sp

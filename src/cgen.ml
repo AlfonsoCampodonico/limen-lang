@@ -1009,6 +1009,8 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     | "cap_read_only", _ -> set (sprintf "Cap_fs_read_only(%s)" (arg 0))
     | "cap_read", TCap Conn -> io_result (sprintf "Cap_conn_read(%s)" (arg 0)) "r_.val"
     | "cap_write", TCap Conn -> io_result (sprintf "Cap_conn_write(%s, %s)" (arg 0) (arg 1)) "0"
+    | "cap_read_within", TCap Conn -> io_result (sprintf "Cap_conn_read_within(%s, %s, %s)" (arg 0) (arg 1) (arg 2)) "r_.val"
+    | "cap_write_within", TCap Conn -> io_result (sprintf "Cap_conn_write_within(%s, %s, %s, %s)" (arg 0) (arg 1) (arg 2) (arg 3)) "0"
     | "cap_on", _ -> io_result (sprintf "Cap_listen_on(%s, %s)" (arg 0) (arg 1)) "(WCap*)r_.ptr"
     | "cap_accept", _ -> io_result (sprintf "Cap_accept(%s)" (arg 0)) "(WCap*)r_.ptr"
     | "cap_connect", _ -> io_result (sprintf "Cap_net_connect(%s, %s)" (arg 0) (arg 1)) "(WCap*)r_.ptr"

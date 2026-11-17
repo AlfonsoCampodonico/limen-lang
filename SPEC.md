@@ -1403,6 +1403,7 @@ fn main(root: Root) {
 | `Listener`, `Conn` | `close()` | `()` |
 | `Conn` | `read()` | `Result[Str, IoError]`; `""` when the peer closed |
 | `Conn` | `write(s)` | `Result[(), IoError]` |
+| `Conn` | `read_within(clock, ms)`, `write_within(clock, ms, s)` | as `read` and `write`, but `Err(Failed("timed out after MS ms"))` once `ms` milliseconds pass while waiting on the peer; the connection stays usable. The wait is a timer in the scheduler, so it costs about nothing when data is ready |
 | `Fs` | `read(path)` | `Result[Str, IoError]` |
 | `Fs` | `write(path, text)` | `Result[(), IoError]` |
 | `Fs` | `append(path, text)` | `Result[(), IoError]`, creating the file if needed |
@@ -1880,12 +1881,16 @@ HTTP/1.1, plain or over TLS. The server keeps connections alive between requests
 | `handle(conn, handler) -> Bool` | answer one request, then close |
 | `accept_forever(listener, f) -> IoError` | run `f: fn(Conn) -> Int` on each accepted connection in its own task, until accepting fails; an `interleaved` group too |
 | `serve_stream(conn, handler) -> Int` | like `serve_conn` for a handler `fn(Request, Conn) -> Result[(), IoError]` that writes its own response; an error or panic closes the connection |
+| `server(clock) -> Server`, `struct Server { clock, head_ms, body_ms, write_ms, idle_ms, conn_ms }` | time limits for a server's connections (below), defaults 10 s, 30 s, 30 s, 60 s and 10 minutes; `0` turns one off |
+| `s.serve_forever(listener, handler)`, `s.serve(listener, count, handler)`, `s.serve_conn(conn, handler)`, `s.serve_stream(conn, handler)` | the functions of the same name, within the limits of `Server` `s` |
 | `write_head(conn, status, headers)`, `write_chunk(conn, piece)`, `end_body(conn)` | write a response whose body follows in pieces (`Transfer-Encoding: chunked`) |
 | `read_request(conn)`, `write_response(conn, r)` | one message on a connection; `write_response` says the connection will close |
 
 Messages are read strictly, against request smuggling (RFC 9112): lines end in CRLF, and a bare CR or LF, a NUL, a folded header line, a header name that is not a token (`Content-Length : 5`), a control byte in a header value, a Content-Length that is not digits or two that differ, a Transfer-Encoding other than `chunked`, one beside a Content-Length, or one in an HTTP/1.0 request is a malformed request (400, connection closed). The client refuses the same in a response, except that a Transfer-Encoding not ending in `chunked` reads to the end of the connection. Writing is strict too: `write_response`, `write_head` and the client return an error, with nothing sent, for a header name that is not a token, a value holding CR, LF, NUL or another control byte (response splitting), a status outside 100 to 999, a Transfer-Encoding header on a whole message, or a Content-Length that is not digits; `write_head` also refuses Content-Length and Transfer-Encoding, since it frames the body itself. A handler of `serve_conn` or `handle` whose response cannot be sent gets 500 instead.
 
-Limits: request heads up to 64 KiB, request bodies up to 8 MiB (read whole, chunked or not), 1000 requests per connection. There are no timeouts yet, so an idle keep-alive connection holds its task until the client closes it, and `serve_forever` keeps a small record per finished connection until it returns.
+Limits: request heads up to 64 KiB, request bodies up to 8 MiB (read whole, chunked or not), 1000 requests per connection.
+
+Time limits come from a `Server`, `http.server(root.clock)`, whose methods serve as the functions do. Without one, a client may take as long as it likes, so one that sends a byte now and then (slowloris) holds a task forever: use a `Server` for anything that listens on a network. Its limits: `head_ms` for a request's line and headers, from when the server starts waiting for them (the first request) or from its first byte (later ones); `body_ms` for the body after the headers; `write_ms` for sending the response; `idle_ms` for a kept-alive connection waiting for its next request; `conn_ms` for the whole connection, handlers included, after which its task is cancelled. A request that runs out of time once it has started gets 408 and the connection closes; a client that sends nothing, or stays idle too long, is closed without a reply. The reads and writes use `Conn.read_within` and `write_within`, so the limits cost about nothing per request; `conn_ms` is a group with a deadline per connection. `serve_forever` still keeps a small record per finished connection until it returns.
 
 ```
 use http

@@ -165,9 +165,21 @@ fn parse_head(text: Str) -> Result[Head, IoError] {
     Ok(Head { first: lines[0], headers })
 }
 
+// A point in time a read or write must finish by, on the Clock that
+// measures it, or none (the client, and servers without limits).
+type By = Option[(Clock, Int)]
+
+// The next bytes from `c`, by `by`.
+fn read_by(c: Conn, by: By) -> Result[Str, IoError] {
+    match by {
+        Some((clock, at)) => c.read_within(clock, (at - clock.now_ms()).max(0)),
+        None => c.read(),
+    }
+}
+
 // Read from `c` until `buf` holds a whole head: its text and the bytes after
 // the blank line. None if the peer closed before sending anything.
-fn read_head(c: Conn, buf: Str) -> Result[Option[(Str, Str)], IoError] {
+fn read_head(c: Conn, buf: Str, by: By) -> Result[Option[(Str, Str)], IoError] {
     let mut data = buf
     while true {
         match data.index_of("\r\n\r\n") {
@@ -181,7 +193,7 @@ fn read_head(c: Conn, buf: Str) -> Result[Option[(Str, Str)], IoError] {
         if data.len() > max_head() {
             return Err(bad("headers too large"))
         }
-        let chunk = c.read()?
+        let chunk = read_by(c, by)?
         if chunk == "" {
             if data == "" {
                 return Ok(None)
@@ -261,7 +273,7 @@ fn hex_value(s: Str) -> Option[Int] {
 // piece to `f` as it arrives. The folded value and the bytes after the body.
 // Once `stop` is true of the folded value, it returns at once without
 // reading the rest (the caller then closes the connection).
-fn read_sized[T](c: Conn, buf: Str, n: Int, init: T, f: fn(T, Str) -> T, stop: fn(T) -> Bool) -> Result[(T, Str), IoError] {
+fn read_sized[T](c: Conn, buf: Str, n: Int, init: T, f: fn(T, Str) -> T, stop: fn(T) -> Bool, by: By) -> Result[(T, Str), IoError] {
     let mut acc = init
     let mut left = n
     let mut data = buf
@@ -279,7 +291,7 @@ fn read_sized[T](c: Conn, buf: Str, n: Int, init: T, f: fn(T, Str) -> T, stop: f
                 return Ok((acc, ""))
             }
         }
-        data = c.read()?
+        data = read_by(c, by)?
         if data == "" {
             return Err(bad("connection closed before the body was complete"))
         }
@@ -301,8 +313,8 @@ fn read_to_end[T](c: Conn, buf: Str, init: T, f: fn(T, Str) -> T, stop: fn(T) ->
 }
 
 // Read more of a chunked body into `data`, failing if the peer closed.
-fn more(c: Conn, data: Str) -> Result[Str, IoError] {
-    let chunk = c.read()?
+fn more(c: Conn, data: Str, by: By) -> Result[Str, IoError] {
+    let chunk = read_by(c, by)?
     if chunk == "" {
         return Err(bad("truncated chunk"))
     }
@@ -312,7 +324,7 @@ fn more(c: Conn, data: Str) -> Result[Str, IoError] {
 // Read a `Transfer-Encoding: chunked` body, decoding it as it arrives and
 // passing each piece to `f`. `limit` caps the decoded size (-1: no cap).
 // The folded value and the bytes after the body and its trailers.
-fn read_chunked[T](c: Conn, buf: Str, limit: Int, init: T, f: fn(T, Str) -> T, stop: fn(T) -> Bool) -> Result[(T, Str), IoError] {
+fn read_chunked[T](c: Conn, buf: Str, limit: Int, init: T, f: fn(T, Str) -> T, stop: fn(T) -> Bool, by: By) -> Result[(T, Str), IoError] {
     let mut acc = init
     let mut data = buf
     let mut total = 0
@@ -322,7 +334,7 @@ fn read_chunked[T](c: Conn, buf: Str, limit: Int, init: T, f: fn(T, Str) -> T, s
             if data.len() > 4096 {
                 return Err(bad("bad chunk size"))
             }
-            data = more(c, data)?
+            data = more(c, data, by)?
             continue
         }
         // a chunk size may carry `;extensions`
@@ -345,7 +357,7 @@ fn read_chunked[T](c: Conn, buf: Str, limit: Int, init: T, f: fn(T, Str) -> T, s
                 } else if data.len() > max_head() {
                     return Err(bad("trailers too large"))
                 } else {
-                    data = more(c, data)?
+                    data = more(c, data, by)?
                 }
             }
         }
@@ -353,14 +365,14 @@ fn read_chunked[T](c: Conn, buf: Str, limit: Int, init: T, f: fn(T, Str) -> T, s
         if limit >= 0 && total > limit {
             return Err(bad("body too large"))
         }
-        let (a, rest) = read_sized(c, data, size, acc, f, stop)?
+        let (a, rest) = read_sized(c, data, size, acc, f, stop, by)?
         acc = a
         data = rest
         if stop(acc) {
             return Ok((acc, ""))
         }
         while data.len() < 2 {
-            data = more(c, data)?
+            data = more(c, data, by)?
         }
         if !data.starts_with("\r\n") {
             return Err(bad("missing CRLF after a chunk"))
@@ -444,7 +456,7 @@ fn target(text: Str) -> Result[Target, IoError] {
 
 // A response's status line and headers, and the bytes read after them.
 fn read_status(c: Conn) -> Result[(Response, Str), IoError] {
-    let (text, rest) = read_head(c, "")? ?? { return Err(bad("connection closed before the response")) }
+    let (text, rest) = read_head(c, "", None)? ?? { return Err(bad("connection closed before the response")) }
     let h = parse_head(text)?
     let parts = h.first.split(" ")
     if parts.len() < 2 || !parts[0].starts_with("HTTP/") {
@@ -474,14 +486,14 @@ fn read_body[T](c: Conn, method: Str, resp: Response, rest: Str, init: T, f: fn(
             // RFC 9112 6.3: chunked last means chunked; anything else runs
             // until the server closes
             if codings.len() > 0 && codings[codings.len() - 1] == "chunked" {
-                let (acc, _) = read_chunked(c, rest, -1, init, f, stop)?
+                let (acc, _) = read_chunked(c, rest, -1, init, f, stop, None)?
                 return Ok(acc)
             }
             read_to_end(c, rest, init, f, stop)
         },
         None => match length {
             Some(n) => {
-                let (acc, _) = read_sized(c, rest, n, init, f, stop)?
+                let (acc, _) = read_sized(c, rest, n, init, f, stop, None)?
                 Ok(acc)
             },
             None => read_to_end(c, rest, init, f, stop),
@@ -648,8 +660,8 @@ pub fn post(net: Net, url: Str, content_type: Str, body: Str) -> Result[Response
 // Read one request, the first bytes already in `buf`: the request and the
 // bytes after it (the start of the next one). None if the peer closed
 // before sending anything.
-fn read_message(c: Conn, buf: Str) -> Result[Option[(Request, Str)], IoError] {
-    let (text, rest) = read_head(c, buf)? ?? { return Ok(None) }
+fn read_message(c: Conn, buf: Str, limits: Option[Server], head_by: By) -> Result[Option[(Request, Str)], IoError] {
+    let (text, rest) = read_head(c, buf, head_by)? ?? { return Ok(None) }
     let h = parse_head(text)?
     let parts = h.first.split(" ")
     if parts.len() != 3 || !is_token(parts[0]) || parts[1] == "" || (parts[2] != "HTTP/1.1" && parts[2] != "HTTP/1.0") {
@@ -674,14 +686,15 @@ fn read_message(c: Conn, buf: Str) -> Result[Option[(Request, Str)], IoError] {
         },
         None => false,
     }
+    let n = length ?? 0
+    if !chunked && n > max_body() {
+        return Err(bad("request body too large"))
+    }
+    let body_by = deadline(limits, |s| s.body_ms)
     let (body, after) = if chunked {
-        read_chunked(c, rest, max_body(), "", |a, s| a + s, |_| false)?
+        read_chunked(c, rest, max_body(), "", |a, s| a + s, |_| false, body_by)?
     } else {
-        let n = length ?? 0
-        if n > max_body() {
-            return Err(bad("request body too large"))
-        }
-        read_sized(c, rest, n, "", |a, s| a + s, |_| false)?
+        read_sized(c, rest, n, "", |a, s| a + s, |_| false, body_by)?
     }
     Ok(Some((Request { method: parts[0], path: parts[1], version: parts[2], headers: h.headers, body }, after)))
 }
@@ -690,7 +703,7 @@ fn read_message(c: Conn, buf: Str) -> Result[Option[(Request, Str)], IoError] {
 // sends more than 64 KiB of headers or 8 MiB of body. Chunked request
 // bodies are decoded.
 pub fn read_request(c: Conn) -> Result[Request, IoError] {
-    match read_message(c, "")? {
+    match read_message(c, "", None, None)? {
         Some((r, _)) => Ok(r),
         None => Err(bad("connection closed before the request was complete")),
     }
@@ -707,7 +720,7 @@ fn keeps_alive(r: Request) -> Bool {
     true
 }
 
-fn send(c: Conn, r: Response, keep: Bool, head_only: Bool) -> Result[(), IoError] {
+fn send(c: Conn, r: Response, keep: Bool, head_only: Bool, by: By) -> Result[(), IoError] {
     let mut hs = r.headers
     if find_header(hs, "Connection").is_none() {
         hs.push(Header { name: "Connection", value: if keep { "keep-alive" } else { "close" } })
@@ -716,7 +729,11 @@ fn send(c: Conn, r: Response, keep: Bool, head_only: Bool) -> Result[(), IoError
         return Err(bad("the status {r.status} is not three digits"))
     }
     let t = head_text("HTTP/1.1 {r.status} {reason(r.status)}", hs, r.body)?
-    c.write(if head_only { t.slice(0, t.len() - r.body.len()) } else { t })
+    let out = if head_only { t.slice(0, t.len() - r.body.len()) } else { t }
+    match by {
+        Some((clock, at)) => c.write_within(clock, (at - clock.now_ms()).max(0), out),
+        None => c.write(out),
+    }
 }
 
 // `r`, or a 500 if it could not be sent as it is (a bad header or status).
@@ -730,7 +747,7 @@ fn sendable(r: Response) -> Response {
 // with CR, LF, NUL or another control byte, a Transfer-Encoding header, a
 // Content-Length that is not digits, or a status outside 100 to 999.
 pub fn write_response(c: Conn, r: Response) -> Result[(), IoError] {
-    send(c, r, false, false)
+    send(c, r, false, false, None)
 }
 
 // Start a response whose body follows in pieces: the status line and
@@ -785,17 +802,43 @@ pub fn handle(c: Conn, handler: fn(Request) -> Response) -> Bool {
 // Requests may be pipelined. A malformed request gets 400 and ends the
 // connection; a handler that panics gets 500 and the connection goes on.
 // HEAD requests get the headers only. Returns how many were answered.
+// No time limits: a client may take as long as it likes (see `Server`).
 pub fn serve_conn(c: Conn, handler: fn(Request) -> Response) -> Int {
+    let n = conn_loop(c, None, handler, atomic(0))
+    c.close()
+    n
+}
+
+fn conn_loop(c: Conn, limits: Option[Server], handler: fn(Request) -> Response, answered: Atomic) -> Int {
     let mut buf = ""
-    let mut n = 0
     let mut open = true
     while open {
-        match read_message(c, buf) {
+        // wait for a request's first bytes: idle time between requests,
+        // part of the head's time for the first one. A client that sends
+        // nothing in that time is closed without a reply.
+        let first = answered.get() == 0
+        let mut head_by = deadline(limits, |s| s.head_ms)
+        if buf == "" {
+            let wait_by = if first { head_by } else { deadline(limits, |s| s.idle_ms) }
+            match read_by(c, wait_by) {
+                Ok(more) => {
+                    buf = more
+                    if more == "" {
+                        return answered.get()
+                    }
+                },
+                Err(_) => { return answered.get() },
+            }
+            if !first {
+                head_by = deadline(limits, |s| s.head_ms)
+            }
+        }
+        match read_message(c, buf, limits, head_by) {
             Ok(Some((req, rest))) => {
                 let r = sendable(catch(|| handler(req)) ?? text(500, "internal error"))
-                let keep = keeps_alive(req) && n + 1 < max_requests() && !has_token(r.headers, "Connection", "close")
-                if send(c, r, keep, req.method == "HEAD").is_ok() {
-                    n = n + 1
+                let keep = keeps_alive(req) && answered.get() + 1 < max_requests() && !has_token(r.headers, "Connection", "close")
+                if send(c, r, keep, req.method == "HEAD", deadline(limits, |s| s.write_ms)).is_ok() {
+                    let _ = answered.add(1)
                 } else {
                     open = false
                 }
@@ -805,14 +848,14 @@ pub fn serve_conn(c: Conn, handler: fn(Request) -> Response) -> Int {
                 buf = rest
             },
             Ok(None) => { open = false },
-            Err(_) => {
-                let _ = send(c, text(400, "bad request\n"), false, false)
+            Err(e) => {
+                let r = if is_timeout(e) { text(408, "request timeout\n") } else { text(400, "bad request\n") }
+                let _ = send(c, r, false, false, deadline(limits, |s| s.write_ms))
                 open = false
             },
         }
     }
-    c.close()
-    n
+    answered.get()
 }
 
 // Like `serve_conn`, for handlers that write the response themselves: a
@@ -821,33 +864,58 @@ pub fn serve_conn(c: Conn, handler: fn(Request) -> Response) -> Int {
 // returns an error or panics closes the connection. Returns how many
 // requests were handled.
 pub fn serve_stream(c: Conn, handler: fn(Request, Conn) -> Result[(), IoError]) -> Int {
+    let n = stream_loop(c, None, handler, atomic(0))
+    c.close()
+    n
+}
+
+fn stream_loop(c: Conn, limits: Option[Server], handler: fn(Request, Conn) -> Result[(), IoError], handled: Atomic) -> Int {
     let mut buf = ""
-    let mut n = 0
     let mut open = true
     while open {
-        match read_message(c, buf) {
+        // wait for a request's first bytes: idle time between requests,
+        // part of the head's time for the first one. A client that sends
+        // nothing in that time is closed without a reply.
+        let first = handled.get() == 0
+        let mut head_by = deadline(limits, |s| s.head_ms)
+        if buf == "" {
+            let wait_by = if first { head_by } else { deadline(limits, |s| s.idle_ms) }
+            match read_by(c, wait_by) {
+                Ok(more) => {
+                    buf = more
+                    if more == "" {
+                        return handled.get()
+                    }
+                },
+                Err(_) => { return handled.get() },
+            }
+            if !first {
+                head_by = deadline(limits, |s| s.head_ms)
+            }
+        }
+        match read_message(c, buf, limits, head_by) {
             Ok(Some((req, rest))) => {
                 let ok = match catch(|| handler(req, c)) {
                     Ok(Ok(_)) => true,
                     _ => false,
                 }
                 if ok {
-                    n = n + 1
+                    let _ = handled.add(1)
                 }
-                if !ok || !keeps_alive(req) || n >= max_requests() {
+                if !ok || !keeps_alive(req) || handled.get() >= max_requests() {
                     open = false
                 }
                 buf = rest
             },
             Ok(None) => { open = false },
-            Err(_) => {
-                let _ = send(c, text(400, "bad request\n"), false, false)
+            Err(e) => {
+                let r = if is_timeout(e) { text(408, "request timeout\n") } else { text(400, "bad request\n") }
+                let _ = send(c, r, false, false, deadline(limits, |s| s.write_ms))
                 open = false
             },
         }
     }
-    c.close()
-    n
+    handled.get()
 }
 
 // Accept `count` connections, each served by `serve_conn` in its own task,
@@ -893,6 +961,94 @@ pub fn accept_forever(l: Listener, f: fn(Conn) -> Int) -> IoError {
 // (by another task holding it) or fails; returns that error.
 pub fn serve_forever(l: Listener, handler: fn(Request) -> Response) -> IoError {
     accept_forever(l, |c| serve_conn(c, handler))
+}
+
+// ---------- time limits ----------
+
+// Time limits for a server's connections, with the Clock that measures
+// them. Without them one slow client holds a task for as long as it likes,
+// sending a byte now and then (slowloris). Make one with `server(clock)`
+// and change the fields you want; `0` turns a limit off.
+//
+//   let s = http.server(root.clock)
+//   s.serve_forever(listener, handler)
+pub struct Server {
+    clock: Clock,
+    head_ms: Int,    // a request's line and headers, from when the server starts reading them
+    body_ms: Int,    // its body, after the headers
+    write_ms: Int,   // sending a response
+    idle_ms: Int,    // a kept-alive connection waiting for its next request
+    conn_ms: Int,    // the whole connection, handlers included
+}
+
+// The default limits: 10 s for the headers, 30 s for the body and for
+// writing the response, 60 s idle between requests, 10 minutes for a
+// connection. A request that runs out of time before it is complete gets
+// 408 and the connection is closed; an idle connection is just closed.
+pub fn server(clock: Clock) -> Server {
+    Server { clock, head_ms: 10000, body_ms: 30000, write_ms: 30000, idle_ms: 60000, conn_ms: 600000 }
+}
+
+// When a phase whose limit `ms` picks must end, starting now; none
+// without limits or when the limit is 0.
+fn deadline(limits: Option[Server], ms: fn(Server) -> Int) -> By {
+    match limits {
+        Some(s) => if ms(s) > 0 { Some((s.clock, s.clock.now_ms() + ms(s))) } else { None },
+        None => None,
+    }
+}
+
+fn is_timeout(e: IoError) -> Bool {
+    match e {
+        Failed(m) => m.starts_with("timed out after "),
+        _ => false,
+    }
+}
+
+// The whole connection within `conn_ms`, then closed. Returns how many
+// requests `run` answered, including those before a timeout.
+fn whole_conn(self: Server, c: Conn, run: fn(Atomic) -> Int) -> Int {
+    let count = atomic(0)
+    if self.conn_ms <= 0 {
+        let _ = run(count)
+    } else {
+        let _ = group g interleaved until self.clock.after(self.conn_ms) {
+            g.go(|| run(count))
+        }
+    }
+    c.close()
+    count.get()
+}
+
+// `serve_conn` within these limits.
+pub fn serve_conn(self: Server, c: Conn, handler: fn(Request) -> Response) -> Int {
+    self.whole_conn(c, |count| conn_loop(c, Some(self), handler, count))
+}
+
+// `serve_stream` within these limits. The handler's own writes count
+// toward the connection's limit only.
+pub fn serve_stream(self: Server, c: Conn, handler: fn(Request, Conn) -> Result[(), IoError]) -> Int {
+    self.whole_conn(c, |count| stream_loop(c, Some(self), handler, count))
+}
+
+// `serve` within these limits.
+pub fn serve(self: Server, l: Listener, count: Int, handler: fn(Request) -> Response) -> Int {
+    let answered = group g interleaved {
+        let mut i = 0
+        while i < count {
+            match l.accept() {
+                Ok(c) => g.go(|| self.serve_conn(c, handler)),
+                Err(_) => { i = count },
+            }
+            i = i + 1
+        }
+    }
+    answered.sum()
+}
+
+// `serve_forever` within these limits.
+pub fn serve_forever(self: Server, l: Listener, handler: fn(Request) -> Response) -> IoError {
+    accept_forever(l, |c| self.serve_conn(c, handler))
 }
 
 // ---------- routing ----------

@@ -683,7 +683,10 @@ let build_methods (t : ty) : (string * (unit -> ty list * ty)) list =
   | TCap Net -> [ m "get" [ TStr ] (res (TNamed ("HttpResponse", [])) io_err); m "only" [ TStr ] (TCap Net); m "connect" [ TStr ] (res (TCap Conn) io_err); m "connect_tls" [ TStr ] (res (TCap Conn) io_err); revocable Net ]
   | TCap Listen -> [ m "on" [ TStr ] (res (TCap Listener) io_err); m "on_tls" [ TStr; TStr; TStr ] (res (TCap Listener) io_err); revocable Listen ]
   | TCap Listener -> [ m "accept" [] (res (TCap Conn) io_err); m "port" [] TInt; m "close" [] TUnit ]
-  | TCap Conn -> [ m "read" [] (res TStr io_err); m "write" [ TStr ] (res TUnit io_err); m "close" [] TUnit ]
+  | TCap Conn ->
+    [ m "read" [] (res TStr io_err); m "write" [ TStr ] (res TUnit io_err);
+      m "read_within" [ TCap Clock; TInt ] (res TStr io_err); m "write_within" [ TCap Clock; TInt; TStr ] (res TUnit io_err);
+      m "close" [] TUnit ]
   | TCap Fs ->
     [ m "read" [ TStr ] (res TStr io_err); m "write" [ TStr; TStr ] (res TUnit io_err);
       m "append" [ TStr; TStr ] (res TUnit io_err); m "list" [ TStr ] (res (TList TStr) io_err);
@@ -766,7 +769,7 @@ let waits rt name =
   match (rt, name) with
   | TChan _, ("send" | "recv") -> Some "can wait"
   | TShared _, _ -> Some "takes a lock another task can hold"
-  | TCap Clock, "sleep" | TCap Stdin, _ | TCap Listener, "accept" | TCap Conn, ("read" | "write") | TCap Exec, "run" -> Some "can wait"
+  | TCap Clock, "sleep" | TCap Stdin, _ | TCap Listener, "accept" | TCap Conn, ("read" | "write" | "read_within" | "write_within") | TCap Exec, "run" -> Some "can wait"
   | TCap Net, ("get" | "connect" | "connect_tls") -> Some "can wait"
   | _ -> None
 

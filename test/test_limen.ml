@@ -1679,6 +1679,95 @@ fn main(root: Root) -> Result[(), IoError] {
   in
   let http_grants = { Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] } in
   out "net-get-http" ~grants:http_grants http_src http_want;
+  (* Conn.read_within and write_within: an error once the time has passed *)
+  out "conn-within" ~grants:http_grants {v|fn main(root: Root) -> Result[(), IoError] {
+    let out = root.stdout
+    let clock = root.clock
+    let l = root.listen.on("127.0.0.1:0")?
+    let addr = "127.0.0.1:{l.port()}"
+    let net = root.net.only("127.0.0.1")
+    let r = group g {
+        g.go(|| {
+            let c = l.accept() ?? { return "no accept" }
+            let t = clock.now_ms()
+            let first = c.read_within(clock, 100)
+            let waited = clock.now_ms() - t
+            let second = c.read_within(clock, 1000)
+            c.close()
+            "{first} {waited >= 90 && waited < 600} {second}"
+        })
+        g.go(|| {
+            let c = net.connect(addr) ?? { return "no connect" }
+            clock.sleep(300)
+            let w = c.write_within(clock, 1000, "hello")
+            clock.sleep(100)
+            c.close()
+            "{w}"
+        })
+    }
+    out.print(r.join("\n"))
+    Ok(())
+}
+|v}
+    "Err(Failed(\"timed out after 100 ms\")) true Ok(\"hello\")\nOk(())\n";
+  (* http.Server's limits: a slowloris head and a stalled body get 408, an
+     idle keep-alive connection and a silent client are closed *)
+  out "http-server-limits" ~grants:http_grants {v|use http
+
+// read until the peer closes
+fn read_all(c: Conn) -> Str {
+    let mut got = ""
+    while true {
+        let chunk = c.read() ?? ""
+        if chunk == "" {
+            return got
+        }
+        got = got + chunk
+    }
+    got
+}
+
+fn status(reply: Str) -> Str {
+    reply.slice(0, 12)
+}
+
+fn clients(net: Net, addr: Str) -> Result[Str, IoError] {
+        // slowloris: half a head, then nothing
+        let c = net.connect(addr)?
+        c.write("GET /slow HTTP/1.1\r\nHost: x\r\n")?
+        let head = status(read_all(c))
+        // a body that never comes
+        let d = net.connect(addr)?
+        d.write("POST /body HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabc")?
+        let body = status(read_all(d))
+        // kept alive, then idle: answered, then closed without a reply
+        let e = net.connect(addr)?
+        e.write("GET /idle HTTP/1.1\r\nHost: x\r\n\r\n")?
+        let idle = read_all(e)
+        // a client that sends nothing at all
+        let f = net.connect(addr)?
+        let silent = read_all(f)
+        Ok("{head} | {body} | {idle.starts_with("HTTP/1.1 200")} {idle.contains("hi /idle")} | {silent.len()}")
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let out = root.stdout
+    let clock = root.clock
+    let l = root.listen.on("127.0.0.1:0")?
+    let addr = "127.0.0.1:{l.port()}"
+    let net = root.net.only("127.0.0.1")
+    let s = http.Server { clock, head_ms: 200, body_ms: 200, write_ms: 1000, idle_ms: 200, conn_ms: 3000 }
+    let start = clock.now_ms()
+    let results = group g {
+        g.go(|| "served {s.serve(l, 4, |r| http.text(200, "hi {r.path}"))}")
+        g.go(|| "{clients(net, addr)}")
+    }
+    out.print(results.join("\n"))
+    out.print("{clock.now_ms() - start < 2500}")
+    Ok(())
+}
+|v}
+    "served 1\nOk(\"HTTP/1.1 408 | HTTP/1.1 408 | true true | 0\")\ntrue\n";
   check_tsan "net-get-http" ~grants:http_grants http_src http_want;
   let dir = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "limen-test-%d" (Unix.getpid ())) in
   (try Unix.mkdir dir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
@@ -8922,7 +9011,7 @@ fn main(root: Root) {
   let manifest = Lazy.force Package.std_manifest in
   let listed = List.sort compare (List.map (fun (d : Package.dep) -> d.dname) manifest.deps) in
   ok "std-manifest-complete" (listed = List.sort compare (List.map fst Std_text.modules)) (String.concat ", " listed);
-  ok "std-manifest-http" (List.exists (fun (d : Package.dep) -> d.dname = "http" && d.caps = [ "net"; "listen" ]) manifest.deps) "http: net, listen";
+  ok "std-manifest-http" (List.exists (fun (d : Package.dep) -> d.dname = "http" && d.caps = [ "net"; "listen"; "clock" ]) manifest.deps) "http: net, listen, clock (server time limits)";
   ok "std-manifest-sql" (List.exists (fun (d : Package.dep) -> d.dname = "sql" && d.caps = [ "fs"; "foreign=sqlite3" ]) manifest.deps && manifest.trust = [ "sql" ]) "sql: fs, sqlite3, trusted with C";
   ok "std-manifest-time" (List.exists (fun (d : Package.dep) -> d.dname = "time" && d.caps = [ "clock"; "fs" ]) manifest.deps) "time: clock (within), fs (load_zone)";
   ok "std-manifest-log" (List.exists (fun (d : Package.dep) -> d.dname = "log" && d.caps = [ "stdout"; "stderr"; "clock" ]) manifest.deps) "log: stdout, stderr, clock";

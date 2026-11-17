@@ -2390,7 +2390,11 @@ W_RT void w_poll_start(void) {
    is already waiting on it in that direction (or fd is out of range), -2
    if the task was cancelled (the caller cleans up, then calls
    w_cancel_unwind()), and -3 if the poller cannot watch fd. */
-W_RT int w_wait_fd(int fd, int write) {
+W_RT int w_wait_fd(int fd, int write) { return w_wait_fd_until(fd, write, 0); }
+/* w_wait_fd with a deadline `at` (monotonic ns, 0 for none): -4 when it
+   passes first. A timer claims the wait as the poller would; the timed-out
+   task then takes itself off the descriptor, as a cancelled one does. */
+W_RT int w_wait_fd_until(int fd, int write, int64_t at) {
   if (fd < 0 || fd >= W_MAX_FD) return -1;
   pthread_once(&w_poll_once, w_poll_start);
   WFdState *st = &w_fds[fd];
@@ -2419,19 +2423,28 @@ W_RT int w_wait_fd(int fd, int write) {
   WSel **tslot = write ? &st->wt : &st->rt;
   if (*ready) { *ready = 0; pthread_mutex_unlock(w_fd_lock(fd)); return 0; }
   if (*slot) { pthread_mutex_unlock(w_fd_lock(fd)); return -1; }
+  if (at && w_mono_ns() >= at) { pthread_mutex_unlock(w_fd_lock(fd)); return -4; }
   WSel tok;
+  WTimer t;
   if (!w_wait_begin(&tok)) { pthread_mutex_unlock(w_fd_lock(fd)); return -2; }
   __atomic_fetch_add(&w_io_waiters, 1, __ATOMIC_SEQ_CST);
   *slot = w_current(); *tslot = &tok;
   pthread_mutex_unlock(w_fd_lock(fd));
+  if (at) {
+    memset(&t, 0, sizeof t);
+    t.at = at; t.pos = -1; t.f = w_current(); t.sel = &tok; t.idx = 1;
+    w_tm_add(&t);
+  }
   w_park_now();
   w_wait_end();
   __atomic_fetch_sub(&w_io_waiters, 1, __ATOMIC_SEQ_CST);
-  if (w_tok_fired(&tok) == W_CANCEL) {
+  if (at) w_tm_remove(&t);
+  int fired = w_tok_fired(&tok);
+  if (fired == W_CANCEL || fired == 1) {
     pthread_mutex_lock(w_fd_lock(fd));
     if (*tslot == &tok) { *slot = NULL; *tslot = NULL; }
     pthread_mutex_unlock(w_fd_lock(fd));
-    return -2;
+    return fired == 1 ? -4 : -2;
   }
   return 0;
 }
@@ -2761,12 +2774,34 @@ W_RT ssize_t w_conn_step(WCap *c, int fd, int wr, char *buf, size_t n, int *dir,
    direction dir: 0 when it is, -1 if another task holds that side, -2 if
    cancelled. When TLS has to wait on the other side, which that side's
    task may already be waiting on, it naps briefly instead. */
-W_RT int w_conn_wait(int fd, int own, int dir) {
-  int wr = w_wait_fd(fd, dir);
-  if (wr == -1 && dir != own) return w_nap(1);
-  return wr == -2 ? -2 : wr < 0 ? -1 : 0;
+W_RT int w_conn_wait(int fd, int own, int dir) { return w_conn_wait_until(fd, own, dir, 0); }
+/* The same with a deadline (0 for none): -4 once it has passed. */
+W_RT int w_conn_wait_until(int fd, int own, int dir, int64_t at) {
+  int wr = w_wait_fd_until(fd, dir, at);
+  if (wr == -1 && dir != own) {
+    if (at && w_mono_ns() >= at) return -4;
+    return w_nap(1);
+  }
+  return wr == -2 ? -2 : wr == -4 ? -4 : wr < 0 ? -1 : 0;
 }
-W_RT WIo Cap_conn_read(WCap *c) {
+W_RT WIo Cap_conn_read(WCap *c) { return Cap_conn_read_until(c, 0, 0); }
+W_RT WIo Cap_conn_write(WCap *c, WStr *s) { return Cap_conn_write_until(c, s, 0, 0); }
+static WIo w_timed_out(int64_t ms) {
+  char m[64];
+  snprintf(m, sizeof m, "timed out after %lld ms", (long long)ms);
+  return io_err(2, m);
+}
+/* Conn.read_within(clock, ms) and write_within(clock, ms, s): as read and
+   write, but an error once ms milliseconds have passed while waiting. */
+W_RT WIo Cap_conn_read_within(WCap *c, WCap *clock, int64_t ms) {
+  (void)clock;
+  return Cap_conn_read_until(c, w_deadline_ms(ms < 0 ? 0 : ms), ms);
+}
+W_RT WIo Cap_conn_write_within(WCap *c, WCap *clock, int64_t ms, WStr *s) {
+  (void)clock;
+  return Cap_conn_write_until(c, s, w_deadline_ms(ms < 0 ? 0 : ms), ms);
+}
+W_RT WIo Cap_conn_read_until(WCap *c, int64_t at, int64_t ms) {
   int fd = w_sock_enter(c);
   if (fd < 0) return io_err(2, "connection is closed");
   char *buf = (char *)w_raw(65536);
@@ -2779,8 +2814,9 @@ W_RT WIo Cap_conn_read(WCap *c) {
     if (n >= 0 && !w_sock_closing(c)) { r = io_ok(Str_from(buf, n)); break; }
     if (n == -1 && !w_sock_closing(c)) {
       if (!w_sock_claim(&c->reading, &held)) { r = io_err(2, "another task is already reading this connection"); break; }
-      int wr = w_conn_wait(fd, 0, dir);
+      int wr = w_conn_wait_until(fd, 0, dir, at);
       if (wr == -2) { cancelled = 1; break; }
+      if (wr == -4) { r = w_timed_out(ms); break; }
       if (wr < 0) { r = io_err(2, "another task is already reading this connection"); break; }
       continue;
     }
@@ -2793,7 +2829,7 @@ W_RT WIo Cap_conn_read(WCap *c) {
   if (cancelled) w_cancel_unwind();
   return r;
 }
-W_RT WIo Cap_conn_write(WCap *c, WStr *s) {
+W_RT WIo Cap_conn_write_until(WCap *c, WStr *s, int64_t at, int64_t ms) {
   int fd = w_sock_enter(c);
   if (fd < 0) return io_err(2, "connection is closed");
   int64_t off = 0;
@@ -2810,8 +2846,9 @@ W_RT WIo Cap_conn_write(WCap *c, WStr *s) {
     if (n >= 0) { off += n; continue; }
     if (n == -1) {
       if (!w_sock_claim(&c->writing, &held)) { r = io_err(2, "another task is already writing this connection"); break; }
-      int wr = w_conn_wait(fd, 1, dir);
+      int wr = w_conn_wait_until(fd, 1, dir, at);
       if (wr == -2) { cancelled = 1; break; }
+      if (wr == -4) { r = w_timed_out(ms); break; }
       if (wr < 0) { r = io_err(2, "another task is already writing this connection"); break; }
       continue;
     }

@@ -12,18 +12,19 @@ then harden it, then promise not to break it.
 This file is the plan. The design doc keeps the reasons and the history of
 what was done; its older lists of what was missing point here.
 
-Updated 2026-11-17, after 0.3.3. Done since: an SQL statement is one call
-on the blocking-call pool instead of one per row, so a scan of 102k rows
-takes 15 ms natively (it took 61 ms).
+Updated 2026-11-17, after 0.3.3. Done since: an SQL statement is one call on
+the blocking-call pool instead of one per row, so a scan of 102k rows takes
+15 ms natively (it took 61 ms). HTTP server time limits:
+`http.server(clock)` gives a `Server` with limits for the head, the body,
+the write, idle keep-alive and the whole connection, on new
+`Conn.read_within` and `write_within` deadlines, so they cost about nothing
+per request.
 
 ## 0.4: a server you can leave running
 
 A Limen web service, exposed to the internet, that stays up and keeps its
 memory flat.
 
-- HTTP server timeouts: for the request head, the body, idle keep-alive time
-  and the whole connection, through `Clock`, with defaults and a way to set
-  them. Today one slow client holds a task for as long as it likes.
 - `serve_forever` keeps a record per finished connection, because a group's
   value is the list of every task's result. A long-running group needs a way
   not to collect them.

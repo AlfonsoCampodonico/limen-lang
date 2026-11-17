@@ -1121,6 +1121,7 @@ W_RT void w_fd_event(int fd, int readable, int writable);
 W_RT void *w_poller(void *arg);
 W_RT void w_poll_start(void);
 W_RT int w_wait_fd(int fd, int write);
+W_RT int w_wait_fd_until(int fd, int write, int64_t at);
 W_RT void w_fd_wake_all(int fd);
 W_RT void w_sock_release_fd(int fd);
 W_RT int w_sock_enter(WCap *c);
@@ -1159,8 +1160,13 @@ W_RT WIo Cap_net_connect(WCap *n, WStr *addr);
 W_RT int w_tls_step(WCap *c, int wr, char *buf, size_t n, int *dir, char *err, size_t en);
 W_RT ssize_t w_conn_step(WCap *c, int fd, int wr, char *buf, size_t n, int *dir, char *err, size_t en);
 W_RT int w_conn_wait(int fd, int own, int dir);
+W_RT int w_conn_wait_until(int fd, int own, int dir, int64_t at);
 W_RT WIo Cap_conn_read(WCap *c);
 W_RT WIo Cap_conn_write(WCap *c, WStr *s);
+W_RT WIo Cap_conn_read_until(WCap *c, int64_t at, int64_t ms);
+W_RT WIo Cap_conn_write_until(WCap *c, WStr *s, int64_t at, int64_t ms);
+W_RT WIo Cap_conn_read_within(WCap *c, WCap *clock, int64_t ms);
+W_RT WIo Cap_conn_write_within(WCap *c, WCap *clock, int64_t ms, WStr *s);
 
 /* ---------- TLS ----------
    On the core in limen_tls.h, pasted ahead of this header (with LIMEN_TLS
