@@ -946,7 +946,11 @@ pub fn accept_forever(l: Listener, f: fn(Conn) -> Int) -> IoError {
         let mut open = true
         while open {
             match l.accept() {
-                Ok(c) => g.go(|| f(c)),
+                // a task that returns () keeps nothing once it ends, so
+                // a server that runs for days stays the same size
+                Ok(c) => g.go(|| {
+                    let _ = f(c)
+                }),
                 Err(e) => {
                     stop = e
                     open = false

@@ -2918,7 +2918,21 @@ and call_method rt v name args sp =
           | Some k when k.sgroup == g ->
             k.sdone <- true;
             advance rt.out g
-          | _ -> ());
+          | _ ->
+            (* nothing will read it again (no result, no panic, no held
+               output): drop it now, so a group that runs for ever stays
+               small, as natively *)
+            if go = "#go" && (match !res with Some (Failed _) -> false | _ -> true) then begin
+              let rec drop ts ks =
+                match (ts, ks) with
+                | ((_, r) :: ts', _ :: ks') when r == res -> (ts', ks')
+                | (x :: ts', k :: ks') -> let ts'', ks'' = drop ts' ks' in (x :: ts'', k :: ks'')
+                | _ -> (ts, ks)
+              in
+              let ts, ks = drop g.tasks g.kept in
+              g.tasks <- ts;
+              g.kept <- ks
+            end);
     VUnit
   | VAtomic a, "get", [] -> VInt !a
   | VAtomic a, "set", [ VInt n ] -> a := n; VUnit

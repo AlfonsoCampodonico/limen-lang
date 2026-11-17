@@ -1,0 +1,58 @@
+# Build and test Limen on real machines: x86-64 and arm64 Linux, and macOS
+# on Apple silicon and Intel. The same checks as before any change (see
+# ROADMAP.md), plus short fuzz runs of the HTTP server and JSON.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-13]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System packages (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev libsqlite3-dev pkg-config clang
+
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: 5.3
+
+      - name: Dune
+        run: opam install -y dune
+
+      - name: Build
+        run: opam exec -- dune build --root .
+
+      - name: Compiler tests
+        run: opam exec -- dune exec --root . ./test/test_limen.exe
+
+      - name: Runtest
+        run: opam exec -- dune build --root . @runtest
+
+      - name: Grammar suite
+        run: opam exec -- bash grammar/check-suite.sh
+
+      - name: Self-hosted compiler check
+        run: DUNE_ROOT=$PWD LIMEN_BOOK=none opam exec -- sh selfhost/check.sh
+
+      - name: Bootstrap
+        run: DUNE_ROOT=$PWD opam exec -- sh selfhost/bootstrap.sh
+
+      - name: Fuzz JSON and the HTTP server
+        run: |
+          L=./_build/default/bin/main.exe
+          $L build fuzz/json.lmn -o fj
+          ./fj --seed ${{ github.run_number }} -- 300000 | tee fj.log
+          grep -q ", 0 problems" fj.log
+          $L build fuzz/http.lmn -o fh
+          ./fh --grant listen=127.0.0.1:0 --grant net=127.0.0.1 --seed ${{ github.run_number }} -- 10000 | tee fh.log
+          grep -q ", 0 problems" fh.log

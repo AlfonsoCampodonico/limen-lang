@@ -12,28 +12,22 @@ then harden it, then promise not to break it.
 This file is the plan. The design doc keeps the reasons and the history of
 what was done; its older lists of what was missing point here.
 
-Updated 2026-11-17, after 0.3.3. Done since: an SQL statement is one call on
-the blocking-call pool instead of one per row, so a scan of 102k rows takes
-15 ms natively (it took 61 ms). HTTP server time limits:
-`http.server(clock)` gives a `Server` with limits for the head, the body,
-the write, idle keep-alive and the whole connection, on new
-`Conn.read_within` and `write_within` deadlines, so they cost about nothing
-per request.
+Updated 2026-11-17, after 0.3.3. Done since, for 0.4: an SQL statement is
+one call on the blocking-call pool, so a scan of 102k rows takes 15 ms
+natively (it took 61 ms); HTTP server time limits (`http.server(clock)`, on
+new `Conn.read_within` and `write_within` deadlines, about free per
+request); a group frees each finished `()` task at once, so `serve_forever`
+stays flat (a million tasks: 5.6 MB, was 171 MB); `json.Int`; fuzzers for
+the HTTP server and JSON in `fuzz/` (3 million JSON inputs and 60,000
+requests, nothing found); CI on x86-64 and arm64 Linux and on macOS.
 
 ## 0.4: a server you can leave running
 
 A Limen web service, exposed to the internet, that stays up and keeps its
 memory flat.
 
-- `serve_forever` keeps a record per finished connection, because a group's
-  value is the list of every task's result. A long-running group needs a way
-  not to collect them.
-- `json.Int(Int)`, so ids and counts above 2^53 survive the trip out.
 - `full_path` hands C code (SQLite) a path string that can still race a
   directory swap after the check.
-- Fuzz the HTTP parser and JSON, the two things a server reads from
-  strangers.
-- CI on real x86-64 Linux and macOS. Only arm64 Linux runs today, in Docker.
 
 Done when `examples/todo_api.lmn`, deployed, survives a slowloris client and
 a day of load with flat memory.

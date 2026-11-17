@@ -3573,7 +3573,7 @@ fn main(root: Root) {
         if x > 1e200 { x = x * 1e-250 }
         for y in [x, 1.0 / x, 0.0 - x] {
             let back = json.parse(json.stringify(json.Num(y))) ?? json.Null
-            if back != json.Num(y) { bad = bad + 1 }
+            if back.as_num() != Some(y) { bad = bad + 1 }
         }
     }
     out.print("round-trip failures: {bad}")
@@ -3581,6 +3581,65 @@ fn main(root: Root) {
 |v}
     "01 => error: expected end of input at byte 1\n-01 => error: expected end of input at byte 2\n1. => error: expected a digit after `.` at byte 2\n.5 => error: expected a value at byte 0\n+1 => error: expected a value at byte 0\n- => error: expected a value at byte 0\n1e => error: expected a digit in the exponent at byte 2\n1e+ => error: expected a digit in the exponent at byte 3\n1.e5 => error: expected a digit after `.` at byte 2\n0 => 0\n-0 => 0\n1.5e-3 => 0.0015\n1E+2 => 100\n1e999 => error: expected a number within Float's range at byte 0\n-1e999 => error: expected a number within Float's range at byte 0\n1e-999 => 0\n[1e999] => error: expected a number within Float's range at byte 1\n0.1 => 0.1\n[0.30000000000000004, 1e21, 1e-7, 123456789012345678901234567890, 1.7976931348623157e308, 5e-324, 2.2250738585072014e-308, 100, 1e16, 12345.678, -2.5] => [0.30000000000000004,1e+21,1e-07,1.2345678901234568e+29,1.7976931348623157e+308,4.94065645841247e-324,2.2250738585072014e-308,100,10000000000000000,12345.678,-2.5]\n[null,null,null,0.30000000000000004,0.3333333333333333,-0.6666666666666666]\nround-trip failures: 0\n";
 
+  (* json.Int: whole numbers that fit an Int stay exact both ways, so ids
+     above 2^53 survive; anything else is a Num *)
+  out "json-int"
+    {v|use json
+
+fn main(root: Root) {
+    let out = root.stdout
+    let big = 9007199254740993
+    let s = json.stringify(json.Obj([json.field("id", json.Int(big)), json.field("x", json.Num(1.5))]))
+    out.print(s)
+    let v = json.parse(s) ?? json.Null
+    out.print("{v.get("id").map(|x| x.as_int())} {v.get("id").map(|x| x.as_num())} {json.stringify(v) == s}")
+    out.print("{json.parse("[1, -0, 1.0, 1e2, 9223372036854775807, 9223372036854775808, -9223372036854775808]")}")
+}
+|v}
+    "{\"id\":9007199254740993,\"x\":1.5}\nSome(Some(9007199254740993)) Some(Some(9007199254740992.0)) true\nOk(Arr([Int(1), Num(-0.0), Num(1.0), Num(100.0), Int(9223372036854775807), Num(9.22337203685478e+18), Int(-9223372036854775808)]))\n";
+  (* a group's finished () tasks are freed as they end, natively and in the
+     interpreter, without changing what the group returns or passes on *)
+  out "group-frees-unit-tasks"
+    {v|fn main(root: Root) {
+    let done: Chan[Int] = channel(1)
+    let a = group g interleaved {
+        for i in 0..<5000 {
+            g.go(|| {
+                let _ = done.send(i)
+            })
+            let _ = done.recv()
+        }
+        g.go(|| 7)
+        g.go(|| {
+            let _ = 1
+        })
+        g.go(|| 8)
+    }
+    let b = group g {
+        for i in 0..<5000 {
+            g.go(|| {
+                let _ = done.send(i)
+            })
+            let _ = done.recv()
+        }
+        g.go(|| 7)
+        g.go(|| 8)
+    }
+    root.stdout.print("{a}")
+    root.stdout.print("{b}")
+    let p = catch(|| group g interleaved {
+        for i in 0..<100 {
+            g.go(|| {
+                if i == 50 {
+                    panic("task {i}")
+                }
+            })
+        }
+    })
+    root.stdout.print("{p}")
+}
+|v}
+    "[7, 8]\n[7, 8]\nErr(\"task 50\")\n";
   out "std-format"
     {v|use format
 

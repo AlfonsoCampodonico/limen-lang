@@ -967,13 +967,19 @@ struct WTask {
   WFiber *f;                            /* its fiber while it runs (under g->mu) */
   int done, cancelled;                  /* finished; ended by cancellation (no result) */
   bool keep;                            /* its result goes in the group's list (not a () task) */
+  bool linked;                          /* its output is in the group's start-order list */
+  int64_t idx;                          /* its place in g->tasks (under g->mu) */
   WOut out;                             /* its output, in an ordered group */
   max_align_t slot[];
 };
 struct WGroup {
   int64_t rc; pthread_mutex_t mu; int64_t pending;
   WFiber *waiter; WSel *wtok;           /* the task joining it, and its wait token */
-  int64_t n, cap; WTask **tasks;        /* in spawn order; grown under mu */
+  int64_t n, cap; WTask **tasks;        /* in spawn order; grown under mu. A finished task
+                                           nobody needs any more (no result, no panic, no held
+                                           output) is freed at once and leaves NULL here, so a
+                                           group that runs for ever (a server) stays small */
+  int64_t holes;                        /* how many of tasks are NULL */
   int cancelled;                        /* its deadline passed: tasks started now never run */
   int stopping;                         /* 1: counted in w_stopping; 2: counted and uncounted (under mu) */
   WFiber *body;                         /* the fiber running its body under the deadline, if any */

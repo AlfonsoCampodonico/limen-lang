@@ -2,10 +2,14 @@
 // fields out of it.
 use hex
 
+// A number is `Int` when it was written as a whole number that fits an Int
+// (no `.` or exponent), so ids and counts above 2^53 survive a round trip;
+// any other number is `Num`.
 pub enum Value {
     Null,
     Bool(Bool),
     Num(Float),
+    Int(Int),
     Str(Str),
     Arr(List[Value]),
     Obj(List[Field]),
@@ -56,6 +60,7 @@ pub fn as_str(self: Value) -> Option[Str] {
 pub fn as_num(self: Value) -> Option[Float] {
     match self {
         Num(x) => Some(x),
+        Int(n) => Some(n.to_float()),
         _ => None,
     }
 }
@@ -63,6 +68,7 @@ pub fn as_num(self: Value) -> Option[Float] {
 pub fn as_int(self: Value) -> Option[Int] {
     match self {
         Num(x) => if x == x.to_int().to_float() { Some(x.to_int()) } else { None },
+        Int(n) => Some(n),
         _ => None,
     }
 }
@@ -91,6 +97,7 @@ pub fn stringify(v: Value) -> Str {
         Null => "null",
         Bool(b) => b.to_str(),
         Num(x) => num_text(x),
+        Int(n) => n.to_str(),
         Str(s) => quote(s),
         Arr(items) => "[" + items.map(|x| stringify(x)).join(",") + "]",
         Obj(fields) => "\{" + fields.map(|f| quote(f.key) + ":" + stringify(f.value)).join(",") + "\}",
@@ -350,6 +357,7 @@ fn number(t: Text, i: Int) -> Result[Parsed, Str] {
         return Err(fail("a value", i))
     }
     j = if t.bs[j] == 48 { j + 1 } else { digits(t, j) }
+    let whole = j
     if j < t.bs.len() && t.bs[j] == 46 {
         if !is_digit(t, j + 1) {
             return Err(fail("a digit after `.`", j + 1))
@@ -365,6 +373,13 @@ fn number(t: Text, i: Int) -> Result[Parsed, Str] {
             return Err(fail("a digit in the exponent", k))
         }
         j = digits(t, k)
+    }
+    // a whole number that fits an Int stays exact; `-0` keeps its sign as a Float
+    if whole == j && t.s.slice(i, j) != "-0" {
+        match t.s.slice(i, j).parse_int() {
+            Some(n) => { return Ok(Parsed { value: Int(n), pos: j }) },
+            None => (),
+        }
     }
     let x = t.s.slice(i, j).parse_float() ?? { return Err(fail("a number", i)) }
     if x - x != 0.0 {

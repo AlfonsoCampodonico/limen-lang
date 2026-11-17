@@ -106,7 +106,7 @@ fn remove(db: sql.Db, id: Int) -> Result[Bool, IoError] {
 
 fn to_json(t: Todo) -> json.Value {
     json.Obj([
-        json.field("id", json.Num(t.id.to_float())),
+        json.field("id", json.Int(t.id)),
         json.field("title", json.Str(t.title)),
         json.field("done", json.Bool(t.done)),
     ])

@@ -112,7 +112,7 @@ fn str(s: Str) -> json.Value {
 }
 
 fn num(n: Int) -> json.Value {
-    json.Num(n.to_float())
+    json.Int(n)
 }
 
 fn one(v: json.Value) -> json.Value {

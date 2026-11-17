@@ -1,0 +1,160 @@
+// Fuzz the HTTP server: send mutated requests to a real server and check
+// that it never panics, never hangs past its time limits, and answers
+// every connection with nothing or with well-formed responses (200, 400 or
+// 408).
+//
+//   limen build fuzz/http.lmn -o /tmp/fh
+//   /tmp/fh --grant listen=127.0.0.1:0 --grant net=127.0.0.1 --seed 1 -- 20000
+use http
+
+fn seeds() -> List[Str] {
+    [
+        "GET / HTTP/1.1\r\nHost: x\r\n\r\n",
+        "GET /a?b=c HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        "HEAD / HTTP/1.1\r\nHost: x\r\n\r\n",
+        "GET / HTTP/1.0\r\n\r\n",
+        "POST /p HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello",
+        "POST /p HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        "POST /p HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3;ext=1\r\nabc\r\n0\r\nTrailer: t\r\n\r\n",
+        "GET /1 HTTP/1.1\r\nHost: x\r\n\r\nGET /2 HTTP/1.1\r\nHost: x\r\n\r\n",
+        "POST / HTTP/1.1\r\nContent-Length: 3\r\nContent-Length: 4\r\n\r\nabcd",
+        "POST / HTTP/1.1\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        "GET / HTTP/1.1\r\nX: a\r\n b\r\n\r\n",
+        "GET / HTTP/1.1\nHost: x\n\n",
+    ]
+}
+
+fn pieces() -> List[Str] {
+    ["\r\n", "\r", "\n", ":", " ", "\t", "Content-Length: ", "Transfer-Encoding: chunked\r\n", "Connection: keep-alive\r\n", "0\r\n\r\n", "ffffffffffffffff", "-1", "99999999999", "1", ";", 0.to_char(), 127.to_char(), 255.to_char(), "HTTP/1.1", "GET ", "/", "%", "\r\n\r\n"]
+}
+
+fn mutate(rand: Rand, s: Str) -> Str {
+    let mut t = s
+    let rounds = rand.int(0, 4)
+    for _ in 0..<rounds {
+        let n = t.len()
+        let at = if n == 0 { 0 } else { rand.int(0, n + 1) }
+        let what = rand.int(0, 5)
+        if what == 0 && n > 0 {
+            let k = rand.int(0, n)
+            t = t.slice(0, k) + t.slice(k + 1, n)
+        } else if what == 1 {
+            let p = pieces()
+            t = t.slice(0, at) + p[rand.int(0, p.len())] + t.slice(at, n)
+        } else if what == 2 && n > 0 {
+            let k = rand.int(0, n)
+            t = t.slice(0, k) + rand.int(0, 256).to_char() + t.slice(k + 1, n)
+        } else if what == 3 {
+            t = t.slice(0, at)
+        } else {
+            let s2 = seeds()
+            t = t + s2[rand.int(0, s2.len())]
+        }
+    }
+    t
+}
+
+// Whether `reply` is a run of whole responses, each with an allowed status
+// and a Content-Length its body matches (a HEAD response has no body).
+fn well_formed(reply: Str) -> Bool {
+    let mut rest = reply
+    while rest != "" {
+        if !rest.starts_with("HTTP/1.1 ") {
+            return false
+        }
+        let status = rest.slice(9, 12)
+        if status != "200" && status != "400" && status != "408" {
+            return false
+        }
+        let end = rest.index_of("\r\n\r\n") ?? { return false }
+        let head = rest.slice(0, end)
+        let length = match head.index_of("Content-Length: ") {
+            Some(i) => head.slice(i + 16, head.len()).split("\r\n")[0].parse_int() ?? -1,
+            None => -1,
+        }
+        if length < 0 {
+            return false
+        }
+        rest = rest.slice(end + 4, rest.len())
+        // a HEAD response: no body, the next response (or nothing) follows
+        if !rest.starts_with("HTTP/1.1 ") && rest != "" {
+            if rest.len() < length {
+                return false
+            }
+            rest = rest.slice(length, rest.len())
+        }
+    }
+    true
+}
+
+// Send one input on a fresh connection and read everything the server sends back.
+fn exchange(net: Net, clock: Clock, addr: Str, input: Str) -> Result[Str, IoError] {
+    let c = net.connect(addr)?
+    let _ = c.write_within(clock, 1000, input)
+    let mut got = ""
+    while true {
+        match c.read_within(clock, 2000) {
+            Ok("") => {
+                c.close()
+                return Ok(got)
+            },
+            Ok(chunk) => { got = got + chunk },
+            Err(e) => {
+                c.close()
+                return Err(e)
+            },
+        }
+    }
+    Ok(got)
+}
+
+fn client(net: Net, clock: Clock, rand: Rand, addr: Str, n: Int) -> List[Str] {
+    let corpus = seeds()
+    let mut problems = []
+    for _ in 0..<n {
+        let input = mutate(rand, corpus[rand.int(0, corpus.len())])
+        match exchange(net, clock, addr, input) {
+            Ok(reply) => {
+                if !well_formed(reply) {
+                    problems.push("BAD REPLY to {input.bytes()}: {reply.slice(0, 200)}")
+                }
+            },
+            Err(e) => problems.push("HUNG on {input.bytes()}: {e}"),
+        }
+    }
+    problems
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let out = root.stdout
+    let clock = root.clock
+    let rand = root.rand
+    let args = root.args()
+    let n = if args.is_empty() { 2000 } else { args[0].parse_int() ?? 2000 }
+    let l = root.listen.on("127.0.0.1:0")?
+    let addr = "127.0.0.1:{l.port()}"
+    let net = root.net.only("127.0.0.1")
+    let s = http.Server { clock, head_ms: 50, body_ms: 50, write_ms: 500, idle_ms: 50, conn_ms: 1500 }
+    let clients = 16
+    let found = group g {
+        g.go(|| {
+            let _ = s.serve_forever(l, |r| http.text(200, "{r.method} {r.path} {r.body.len()}"))
+            []
+        })
+        g.go(|| {
+            let all = group cg {
+                for _ in 0..<clients {
+                    cg.go(|| client(net, clock, rand, addr, n / clients))
+                }
+            }
+            l.close()
+            all.flat_map(|p| p)
+        })
+    }
+    let problems = found.flat_map(|p| p)
+    for p in problems.take(20) {
+        out.print(p)
+    }
+    out.print("{n} inputs, {problems.len()} problems")
+    Ok(())
+}

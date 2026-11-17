@@ -1194,10 +1194,10 @@ fn rhs_into(self: Cg, ind: Str, dst: Str, t: types.Ty, r: ir.Rhs) -> Cg {
                 let (none, c3) = c.mk_enum(el, 1, [])
                 let (some, c4) = c3.mk_enum(el, 0, ["r_"])
                 let (ct, c5) = c4.ctype(rt)
-                c = c5.line(ind, "  for (int64_t i_ = 0; i_ < g_->n; i_++) \{").line(ind, "    if (!g_->tasks[i_]->keep) continue;").line(ind, "    if (g_->tasks[i_]->cancelled) l_->data[l_->len++] = {none};").line(ind, "    else \{ {ct} r_; memcpy(&r_, g_->tasks[i_]->slot, sizeof({ct})); l_->data[l_->len++] = {some}; }").line(ind, "  }")
+                c = c5.line(ind, "  for (int64_t i_ = 0; i_ < g_->n; i_++) \{").line(ind, "    if (!g_->tasks[i_] || !g_->tasks[i_]->keep) continue;").line(ind, "    if (g_->tasks[i_]->cancelled) l_->data[l_->len++] = {none};").line(ind, "    else \{ {ct} r_; memcpy(&r_, g_->tasks[i_]->slot, sizeof({ct})); l_->data[l_->len++] = {some}; }").line(ind, "  }")
             } else {
                 let (ct, c3) = c.ctype(el)
-                c = c3.line(ind, "  for (int64_t i_ = 0; i_ < g_->n; i_++) if (g_->tasks[i_]->keep) memcpy(&l_->data[l_->len++], g_->tasks[i_]->slot, sizeof({ct}));")
+                c = c3.line(ind, "  for (int64_t i_ = 0; i_ < g_->n; i_++) if (g_->tasks[i_] && g_->tasks[i_]->keep) memcpy(&l_->data[l_->len++], g_->tasks[i_]->slot, sizeof({ct}));")
             }
             c.line(ind, "  w_group_release_tasks(g_);").line(ind, "  {dst} = l_;").line(ind, "}")
         },

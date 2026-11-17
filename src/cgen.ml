@@ -726,13 +726,13 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
       (* a cancelled task has no result: None *)
       let rt = match el with TNamed ("Option", [ r ]) -> r | _ -> TUnit in
       line "  for (int64_t i_ = 0; i_ < g_->n; i_++) {";
-      line "    if (!g_->tasks[i_]->keep) continue;";
+      line "    if (!g_->tasks[i_] || !g_->tasks[i_]->keep) continue;";
       line (sprintf "    if (g_->tasks[i_]->cancelled) l_->data[l_->len++] = %s;" (mk_enum c el 1 []));
       line (sprintf "    else { %s r_; memcpy(&r_, g_->tasks[i_]->slot, sizeof(%s)); l_->data[l_->len++] = %s; }" (ctype c rt) (ctype c rt) (mk_enum c el 0 [ "r_" ]));
       line "  }"
     end
     else
-      line (sprintf "  for (int64_t i_ = 0; i_ < g_->n; i_++) if (g_->tasks[i_]->keep) memcpy(&l_->data[l_->len++], g_->tasks[i_]->slot, sizeof(%s));" (ctype c el));
+      line (sprintf "  for (int64_t i_ = 0; i_ < g_->n; i_++) if (g_->tasks[i_] && g_->tasks[i_]->keep) memcpy(&l_->data[l_->len++], g_->tasks[i_]->slot, sizeof(%s));" (ctype c el));
     line "  w_group_release_tasks(g_);";
     line (sprintf "  %s = l_;" dst);
     line "}"

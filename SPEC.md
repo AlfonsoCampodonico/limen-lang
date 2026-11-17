@@ -940,7 +940,7 @@ let results = group g {
 ```
 
 - `group g { body }` runs `body`, in which `g.go(f)` starts `f: fn() -> T` as a task. The group evaluates to a `List[T]` of the task results **in the order the tasks were started**.
-- A task whose closure returns `()` runs for its effect and adds nothing to the list, so one group can mix them with tasks that return a value: the list holds the results of the value tasks, which must all have one type. A group of only `()` tasks evaluates to an empty list. To drop a value a task would return, end its body with a statement: `g.go(|| { log(x); })`. The rule is decided by the closure's type as written, so in generic code a task returning `T` always adds an item, even when `T` is `()`.
+- A task whose closure returns `()` runs for its effect and adds nothing to the list, so one group can mix them with tasks that return a value: the list holds the results of the value tasks, which must all have one type. A group of only `()` tasks evaluates to an empty list. To drop a value a task would return, end its body with a statement: `g.go(|| { log(x); })`. The rule is decided by the closure's type as written, so in generic code a task returning `T` always adds an item, even when `T` is `()`. A `()` task that finished without a panic is freed at once, natively and in the interpreter, unless its group still holds its output for start order (section 10, below): so a group that runs for ever, such as a server accepting connections, stays the same size. A task that returns a value is kept until the group ends, since its value goes in the list.
 - When the block ends, every task has finished. Nothing outlives the group.
 - `g` can only be used as `g.go(...)` directly in the body. It cannot be stored, passed, returned, or used inside a closure (E0310).
 - The body cannot leave early with `return` or `?` (E0311), and `break` and `continue` cannot target loops outside the group.
@@ -1852,13 +1852,13 @@ match start(root.fs) {
 
 | Item | Meaning |
 | --- | --- |
-| `enum Value { Null, Bool(Bool), Num(Float), Str(Str), Arr(List[Value]), Obj(List[Field]) }` | a JSON value; objects keep their fields in order |
+| `enum Value { Null, Bool(Bool), Num(Float), Int(Int), Str(Str), Arr(List[Value]), Obj(List[Field]) }` | a JSON value; objects keep their fields in order. A number written as a whole number that fits an `Int` (no `.` or exponent, not `-0`) parses as `Int`, exactly, so ids and counts above 2^53 survive a round trip; any other number is a `Num`. A whole-number `Num` prints as digits (`1000.0` as `1000`) and so reads back as an `Int` of the same value |
 | `struct Field { key: Str, value: Value }`, `field(key, value)` | an object member |
 | `parse(s) -> Result[Value, Str]` | the error names what was expected and the byte offset. Numbers follow RFC 8259 exactly (`01`, `1.`, `.5` and `+1` are errors); one beyond `Float`'s range (`1e999`) is an error, one too small to tell from zero reads as `0` |
 | `stringify(v) -> Str` | compact JSON; integral numbers print without `.0`, others in the fewest digits (17 at most) that read back as the same `Float`; NaN and the infinities, which JSON cannot write, print as `null` |
 | `quote(s) -> Str` | a JSON string literal |
 | `v.get(key)`, `v.at(i)` | methods: `Option[Value]`, an object member or an array item |
-| `v.as_str()`, `as_num()`, `as_int()`, `as_bool()`, `as_list()` | methods: `Option` of the payload, `None` for another kind |
+| `v.as_str()`, `as_num()`, `as_int()`, `as_bool()`, `as_list()` | methods: `Option` of the payload, `None` for another kind; `as_num` reads an `Int` too, and `as_int` a `Num` that is a whole number |
 
 ### http
 
@@ -1890,7 +1890,7 @@ Messages are read strictly, against request smuggling (RFC 9112): lines end in C
 
 Limits: request heads up to 64 KiB, request bodies up to 8 MiB (read whole, chunked or not), 1000 requests per connection.
 
-Time limits come from a `Server`, `http.server(root.clock)`, whose methods serve as the functions do. Without one, a client may take as long as it likes, so one that sends a byte now and then (slowloris) holds a task forever: use a `Server` for anything that listens on a network. Its limits: `head_ms` for a request's line and headers, from when the server starts waiting for them (the first request) or from its first byte (later ones); `body_ms` for the body after the headers; `write_ms` for sending the response; `idle_ms` for a kept-alive connection waiting for its next request; `conn_ms` for the whole connection, handlers included, after which its task is cancelled. A request that runs out of time once it has started gets 408 and the connection closes; a client that sends nothing, or stays idle too long, is closed without a reply. The reads and writes use `Conn.read_within` and `write_within`, so the limits cost about nothing per request; `conn_ms` is a group with a deadline per connection. `serve_forever` still keeps a small record per finished connection until it returns.
+Time limits come from a `Server`, `http.server(root.clock)`, whose methods serve as the functions do. Without one, a client may take as long as it likes, so one that sends a byte now and then (slowloris) holds a task forever: use a `Server` for anything that listens on a network. Its limits: `head_ms` for a request's line and headers, from when the server starts waiting for them (the first request) or from its first byte (later ones); `body_ms` for the body after the headers; `write_ms` for sending the response; `idle_ms` for a kept-alive connection waiting for its next request; `conn_ms` for the whole connection, handlers included, after which its task is cancelled. A request that runs out of time once it has started gets 408 and the connection closes; a client that sends nothing, or stays idle too long, is closed without a reply. The reads and writes use `Conn.read_within` and `write_within`, so the limits cost about nothing per request; `conn_ms` is a group with a deadline per connection. `serve_forever` runs each connection as a task that returns `()`, which the group frees as soon as it ends (section 10), so a server's memory stays flat however long it runs.
 
 ```
 use http

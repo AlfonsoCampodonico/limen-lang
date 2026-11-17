@@ -1,0 +1,141 @@
+// Fuzz json.parse: mutate valid and broken JSON at random and check that
+// parse never panics, and that whatever it accepts prints and parses back
+// to the same value (numbers compared as JSON sees them).
+//
+//   limen build fuzz/json.lmn -o /tmp/fj && /tmp/fj --seed 1 -- 200000
+use json
+
+fn seeds() -> List[Str] {
+    [
+        "null",
+        "true",
+        "false",
+        "0",
+        "-0",
+        "1",
+        "-1",
+        "1.5",
+        "-2.25e-3",
+        "1e308",
+        "1E-400",
+        "9007199254740993",
+        "9223372036854775807",
+        "-9223372036854775808",
+        "9223372036854775808",
+        "\"\"",
+        "\"a\\\"b\\\\c\\/d\\b\\f\\n\\r\\t\"",
+        "\"\\u00e9\\ud83d\\ude00\"",
+        "\"\\ud800\"",
+        "\"héllo\"",
+        "[]",
+        "[1,2,3]",
+        "[[[]]]",
+        "\{}",
+        "\{\"a\":1}",
+        "\{\"a\":\{\"b\":[1,\{\"c\":null}]}}",
+        "\{\"a\":1,\"a\":2}",
+        " [ 1 , 2 ] ",
+        "[1,]",
+        "\{\"a\"}",
+        "01",
+        "1.",
+        ".5",
+        "+1",
+        "\"\\x\"",
+        "[",
+        "\{",
+        "\"",
+    ]
+}
+
+// Pieces worth splicing in: the grammar's own punctuation and edges.
+fn pieces() -> List[Str] {
+    ["[", "]", "\{", "}", ",", ":", "\"", "\\", "\\u", "\\ud800", "e", "E", "-", "+", ".", "0", "9", " ", "\n", "null", "true", "1e999", 0.to_char(), 255.to_char(), "\"k\":"]
+}
+
+fn mutate(rand: Rand, s: Str) -> Str {
+    let mut t = s
+    let rounds = rand.int(1, 5)
+    for _ in 0..<rounds {
+        let n = t.len()
+        let at = if n == 0 { 0 } else { rand.int(0, n + 1) }
+        let what = rand.int(0, 6)
+        if what == 0 && n > 0 {
+            // drop a byte
+            let k = rand.int(0, n)
+            t = t.slice(0, k) + t.slice(k + 1, n)
+        } else if what == 1 {
+            // splice in a piece
+            let p = pieces()
+            t = t.slice(0, at) + p[rand.int(0, p.len())] + t.slice(at, n)
+        } else if what == 2 && n > 0 {
+            // replace a byte with any byte
+            let k = rand.int(0, n)
+            t = t.slice(0, k) + rand.int(0, 256).to_char() + t.slice(k + 1, n)
+        } else if what == 3 {
+            // nest it
+            t = if rand.int(0, 2) == 0 { "[" + t + "]" } else { "\{\"k\":" + t + "}" }
+        } else if what == 4 && n > 0 {
+            // cut it short
+            t = t.slice(0, at)
+        } else {
+            // join two seeds
+            let s2 = seeds()
+            t = t + s2[rand.int(0, s2.len())]
+        }
+    }
+    t
+}
+
+// The same value with every number as JSON sees it: a Float that is a whole
+// number (`1000.0`, `-0.0`) prints as `1000` or `0` and reads back as an Int.
+// Compared past 2^53 as Floats, since there an Int and a Float can be the
+// same JSON number.
+fn norm(v: json.Value) -> json.Value {
+    match v {
+        // past 2^53 a Float's shortest digits name a nearby Int with the same Float value
+        json.Num(x) => if x == x.to_int().to_float() && x.abs() < 9007199254740992.0 { json.Int(x.to_int()) } else { v },
+        json.Int(n) => if n.abs() < 9007199254740992 { v } else { json.Num(n.to_float()) },
+        json.Arr(items) => json.Arr(items.map(|x| norm(x))),
+        json.Obj(fields) => json.Obj(fields.map(|f| json.field(f.key, norm(f.value)))),
+        _ => v,
+    }
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let out = root.stdout
+    let rand = root.rand
+    let args = root.args()
+    let n = if args.is_empty() { 20000 } else { args[0].parse_int() ?? 20000 }
+    let corpus = seeds()
+    let mut accepted = 0
+    let mut bad = 0
+    for i in 0..<n {
+        let input = mutate(rand, corpus[rand.int(0, corpus.len())])
+        match catch(|| json.parse(input)) {
+            Err(msg) => {
+                bad = bad + 1
+                out.print("PANIC on {json.quote(input)}: {msg}")
+            },
+            Ok(Ok(v)) => {
+                accepted = accepted + 1
+                let text = json.stringify(v)
+                match catch(|| json.parse(text)) {
+                    Ok(Ok(back)) => {
+                        if norm(back) != norm(v) {
+                            bad = bad + 1
+                            out.print("ROUND TRIP {json.quote(input)}: {v} became {back}")
+                        }
+                    },
+                    other => {
+                        bad = bad + 1
+                        out.print("REPARSE {json.quote(input)} printed {json.quote(text)}: {other}")
+                    },
+                }
+            },
+            Ok(Err(_)) => (),
+        }
+    }
+    out.print("{n} inputs, {accepted} accepted, {bad} problems")
+    Ok(())
+}

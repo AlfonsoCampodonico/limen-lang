@@ -1810,7 +1810,7 @@ W_RT void w_group_cancel(WGroup *g) {
   pthread_mutex_lock(&g->mu);
   __atomic_store_n(&g->cancelled, 1, __ATOMIC_RELEASE);
   if (!g->stopping) { g->stopping = 1; __atomic_fetch_add(&w_stopping, 1, __ATOMIC_RELAXED); }
-  for (int64_t i = 0; i < g->n; i++) if (!g->tasks[i]->done && g->tasks[i]->f) w_cancel_fiber(g->tasks[i]->f);
+  for (int64_t i = 0; i < g->n; i++) if (g->tasks[i] && !g->tasks[i]->done && g->tasks[i]->f) w_cancel_fiber(g->tasks[i]->f);
   if (g->body) w_interrupt_fiber(g->body, 0);   /* the body stops at its next wait too */
   pthread_mutex_unlock(&g->mu);
 }
@@ -1897,11 +1897,15 @@ W_RT void w_task_entry(void *p) {
   pthread_mutex_lock(&g->mu);
   WFiber *wake = NULL;
   t->done = 1; t->f = NULL;
+  /* nothing will read it again: free it now, not when the group ends */
+  int gone = !t->keep && !t->linked && !t->pmsg;
+  if (gone) { g->tasks[t->idx] = NULL; g->holes++; }
   if (--g->pending == 0 && g->waiter) {
     if (w_tok_claim(g->wtok, 0)) wake = g->waiter;
     g->waiter = NULL; g->wtok = NULL;
   }
   pthread_mutex_unlock(&g->mu);
+  if (gone) w_free(t);
   if (wake) w_wake(wake);
 }
 /* The closure and everything it references become shared before any other
@@ -1911,20 +1915,28 @@ W_RT void w_spawn(WGroup *g, WClo *fn, void (*run)(WTask *), size_t slot, bool k
   pthread_once(&w_pool_once, w_pool_start);
   Clo_share(fn);
   WTask *t = (WTask *)w_alloc(sizeof(WTask) + slot);
-  t->fn = fn; t->run = run; t->g = g; t->pmsg = NULL; t->pwhere = NULL; t->f = NULL; t->done = 0; t->cancelled = 0; t->keep = keep;
+  t->fn = fn; t->run = run; t->g = g; t->pmsg = NULL; t->pwhere = NULL; t->f = NULL; t->done = 0; t->cancelled = 0; t->keep = keep; t->linked = 0;
   memset(&t->out, 0, sizeof t->out);
   t->out.g = g;
   WFiber *f = w_fiber_new(w_task_entry, t, w_stack_size);
   /* an ordered group holds the task's output in its WOut */
   w_out_lock();
   if (g->ordered) {
+    t->linked = 1;
     if (g->last) g->last->next = &t->out; else g->first = &t->out;
     g->last = &t->out;
     f->out = &t->out;
   } else f->out = g->parent;
   w_out_unlock();
   pthread_mutex_lock(&g->mu);
+  if (g->n == g->cap && g->holes * 2 >= g->n) {
+    /* mostly freed tasks: close the gaps, keeping spawn order */
+    int64_t k = 0;
+    for (int64_t i = 0; i < g->n; i++) if (g->tasks[i]) { g->tasks[k] = g->tasks[i]; g->tasks[k]->idx = k; k++; }
+    g->n = k; g->holes = 0;
+  }
   if (g->n == g->cap) { g->cap *= 2; g->tasks = (WTask **)w_realloc(g->tasks, w_bytes(g->cap, sizeof(WTask *))); }
+  t->idx = g->n;
   g->tasks[g->n++] = t;
   if (g->cancelled) {   /* past the deadline: the task never runs */
     t->done = 1; t->cancelled = 1;
@@ -1993,13 +2005,13 @@ W_RT void w_group_cleanup(WGroup *g) {
   w_group_wait(g, 0);
 }
 W_RT void w_group_release_tasks(WGroup *g) {
-  for (int64_t i = 0; i < g->n; i++) { free(g->tasks[i]->pmsg); free(g->tasks[i]->pwhere); free(g->tasks[i]->out.buf); w_free(g->tasks[i]); }
-  g->n = 0;
+  for (int64_t i = 0; i < g->n; i++) if (g->tasks[i]) { free(g->tasks[i]->pmsg); free(g->tasks[i]->pwhere); free(g->tasks[i]->out.buf); w_free(g->tasks[i]); }
+  g->n = 0; g->holes = 0;
 }
 /* After every task finished: pass on the first panic, in spawn order. */
 W_RT void w_group_reraise(WGroup *g) {
   for (int64_t i = 0; i < g->n; i++)
-    if (g->tasks[i]->pmsg) {
+    if (g->tasks[i] && g->tasks[i]->pmsg) {
       char m[1024], w[512];
       snprintf(m, sizeof m, "%s", g->tasks[i]->pmsg);
       snprintf(w, sizeof w, "%s", g->tasks[i]->pwhere);
