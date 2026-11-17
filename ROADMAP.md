@@ -26,9 +26,6 @@ requests, nothing found); CI on x86-64 and arm64 Linux and on macOS.
 A Limen web service, exposed to the internet, that stays up and keeps its
 memory flat.
 
-- `full_path` hands C code (SQLite) a path string that can still race a
-  directory swap after the check.
-
 Done when `examples/todo_api.lmn`, deployed, survives a slowloris client and
 a day of load with flat memory.
 
@@ -97,6 +94,13 @@ happens here.
 - The JSON edges: a lone `\ud800`, duplicate keys, a nesting limit, numbers
   over 400 characters.
 - Fuzz the lexer, parser, checker and the rest of the runtime.
+- `full_path` hands SQLite a path string that another process with write
+  access to the granted directory could race with a symlink swap after the
+  check. The OS sandbox (Landlock, the macOS profile) refuses what such a
+  swap would reach; closing it in Limen itself needs an SQLite VFS that
+  opens every file with `openat` from a held directory, since SQLite
+  resolves symlinks in any path it is given (so `/proc/self/fd/N/...` does
+  not help).
 - An outside security review of the sandbox and the capability checks.
   Two reviews in two days found ten holes, so there are more.
 

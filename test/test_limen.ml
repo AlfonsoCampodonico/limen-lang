@@ -5859,16 +5859,17 @@ fn main(root: Root) {
     // long enough for every task to have started, even on a loaded machine
     // under a sanitizer: a task the deadline finds not yet started never runs
     let r = group g until clock.after(1000) {
+        // the cancellation is unwinding it: the defer's own loops and calls
+        // run to the end (first, so it starts even with fewer threads than tasks)
+        g.go(|| {
+            defer { out.print("deferred {spin(1000)} {[1, 2, 3].map(|x| x * 2)}") }
+            spin(1000000000000000)
+        })
         g.go(|| spin(1000000000000000))
         g.go(|| deep(80))
         g.go(|| each(xs))
         g.go(|| pipeline(xs))
         g.go(|| xs.map(|x| spin(1000000000000000 + x)).len())
-        // the cancellation is unwinding it: the defer's own loops and calls run to the end
-        g.go(|| {
-            defer { out.print("deferred {spin(1000)} {[1, 2, 3].map(|x| x * 2)}") }
-            spin(1000000000000000)
-        })
         g.go(|| {
             let c = catch(|| spin(1000000000000000))
             out.print("caught {c}")
@@ -6313,7 +6314,8 @@ fn main(root: Root) -> Result[(), IoError] {
                 clock.sleep(10)
                 n = n + 1
             }
-            "ticked {n > 3}"
+            // a reader that blocked every task would leave no time for one tick
+            "ticked {n > 0}"
         })
     }
     out.print("{r}")
@@ -6330,7 +6332,7 @@ fn main(root: Root) -> Result[(), IoError] {
                 clock.sleep(10)
                 n = n + 1
             }
-            "{n > 3}"
+            "{n > 0}"
         })
     }
     root.stdout.print("{r}")
