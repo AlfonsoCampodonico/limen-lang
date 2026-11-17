@@ -9,6 +9,9 @@ The short version: make a Limen server safe to run on the internet, then
 make the language less tedious to write, then make it pleasant to debug,
 then harden it, then promise not to break it.
 
+This file is the plan. The design doc keeps the reasons and the history of
+what was done; its older lists of what was missing point here.
+
 Updated 2026-11-17, after 0.3.3. Done since: an SQL statement is one call
 on the blocking-call pool instead of one per row, so a scan of 102k rows
 takes 15 ms natively (it took 61 ms).
@@ -74,7 +77,9 @@ Done when a crash in a native build shows the Limen line that caused it.
 - WebSockets.
 - Encryption and public-key signatures beyond TLS.
 - Integer types besides `Int` outside FFI (bytes, `u32`) and a character
-  type with Unicode beyond `chars()`.
+  type with Unicode beyond `chars()` (case folding, normalisation).
+- C callbacks that C can keep and call later, for libraries that call back
+  on their own schedule.
 
 Done when a program can read a gzipped log larger than memory, line by
 line, and write rows to Postgres.
@@ -111,6 +116,11 @@ breaking changes is still open.
   formula. Today it is three scripts and two steps by hand.
 - A hosted package index as the default (it exists, but is empty and you
   point `LIMEN_INDEX` at one).
+- The self-hosted compiler as the default for `check`, `caps` and `build`,
+  shipped as one generated C file, so building Limen needs only a C
+  compiler. Then decide whether the interpreter, formatter, language
+  server, `doc` and the MCP server move to Limen or stay in OCaml.
+- A playground and short videos beside the book.
 
 Done when someone can install Limen, add a package and publish their own
 without reading anything but the book.
@@ -145,6 +155,8 @@ book and SPEC.md describe 1.0 exactly.
   static what no other piece calls.
 - No cancellation checkpoints inside a single built-in operation (a sort) or
   in the fast path of fill loops.
+- `Fs` can't set the executable bit or file times, or read a link, so the
+  build cache still runs `cp`, `touch` and `readlink` through `Exec`.
 
 ## Before any change
 
