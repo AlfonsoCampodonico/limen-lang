@@ -1768,6 +1768,13 @@ fn main(root: Root) -> Result[(), IoError] {
 }
 |v}
     "served 1\nOk(\"HTTP/1.1 408 | HTTP/1.1 408 | true true | 0\")\ntrue\n";
+  (* a status line names the statuses the server itself sends *)
+  out "http-reasons" {|use http
+
+fn main(root: Root) {
+    root.stdout.print([200, 400, 404, 405, 408, 413, 429, 500, 503, 299].map(http.reason).join("|"))
+}
+|} "OK|Bad Request|Not Found|Method Not Allowed|Request Timeout|Payload Too Large|Too Many Requests|Internal Server Error|Service Unavailable|Status\n";
   check_tsan "net-get-http" ~grants:http_grants http_src http_want;
   let dir = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "limen-test-%d" (Unix.getpid ())) in
   (try Unix.mkdir dir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());

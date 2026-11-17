@@ -331,7 +331,7 @@ let embed_dir (m : modinfo) path sp : expr_desc option =
           let rec walk dir key_prefix acc =
             match acc with
             | Error _ -> acc
-            | Ok files ->
+            | Ok _ ->
               let names = Sys.readdir dir |> Array.to_list |> List.filter (fun n -> n <> "" && n.[0] <> '.') |> List.sort compare in
               List.fold_left
                 (fun acc n ->
