@@ -1389,6 +1389,10 @@ module Foreign = struct
   external job_done : nativeint -> bool = "limen_ffi_job_done"
   external job_finish : nativeint -> int * int64 array * int64 array = "limen_ffi_job_finish"
   external job_abandon : nativeint -> unit = "limen_ffi_job_abandon"
+  external sql_start : nativeint array -> nativeint -> string -> string -> int -> nativeint * int = "limen_sql_start"
+  external sql_done : nativeint -> bool = "limen_sql_done"
+  external sql_stop : nativeint -> unit = "limen_sql_stop"
+  external sql_finish : nativeint -> string = "limen_sql_finish"
   external cstr : int64 -> string = "limen_ffi_cstr"
   external peek : int64 -> int -> string = "limen_ffi_peek"
   external sandbox_enter : string -> bool -> bool -> string -> int = "limen_sandbox_enter"
@@ -1531,6 +1535,33 @@ module Foreign = struct
         e.closed <- true;
         if e.uses = 0 then (Hashtbl.remove handles id; handle e.ptr) else handle 0L
       | _ -> handle 0L)
+    | "limen_sql_run", [ VStruct (_, [ (_, VInt db) ]); VStr text; VBytes params; VInt mode ] ->
+      (* one statement on a thread of its own (limen_sql_start); a cancelled
+         task stops it and still waits for it, as natively *)
+      let sym s =
+        match Hashtbl.find_opt syms ("sqlite3", s) with
+        | Some p -> p
+        | None -> ( match Hashtbl.find_opt libs "sqlite3" with Some l -> dl_sym l s | None -> 0n)
+      in
+      let api = Array.of_list (List.map sym Ffi.sql_syms) in
+      if Array.exists (fun p -> p = 0n) api then failwith "internal: limen_sql_run without SQLite's functions";
+      let job, fd = sql_start api (Int64.to_nativeint db) text params (Int64.to_int mode) in
+      if job = 0n then raise (Panic ("sql: cannot start a thread for a statement", sp));
+      let s = { fd = (Obj.magic fd : Unix.file_descr); shut = false; reading = false; writing = false; tls = Tls.Plain } in
+      (try wait_until ~io:(s, false) ~cancellable:(not !current.unwinding) (fun () -> sql_done job)
+       with e ->
+         sql_stop job;
+         wait_until ~io:(s, false) ~cancellable:false (fun () -> sql_done job);
+         ignore (sql_finish job);
+         raise e);
+      VBytes (sql_finish job)
+    | "limen_bytes_int", [ VBytes b; VInt at ] ->
+      if at < 0L || Int64.add at 8L > Int64.of_int (String.length b) then raise (Panic ("limen_bytes_int: no 8 bytes there", sp));
+      VInt (String.get_int64_ne b (Int64.to_int at))
+    | "limen_bytes_float", [ VBytes b; VInt at ] ->
+      if at < 0L || Int64.add at 8L > Int64.of_int (String.length b) then raise (Panic ("limen_bytes_float: no 8 bytes there", sp));
+      VFloat (Int64.float_of_bits (String.get_int64_ne b (Int64.to_int at)))
+    | "limen_float_bits", [ VFloat x ] -> VInt (Int64.bits_of_float x)
     | _ -> failwith ("internal: runtime helper " ^ sym)
 
   (* ---- the calling convention (see the comment at the top of ffi_stubs.c) ---- *)

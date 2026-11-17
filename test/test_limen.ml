@@ -3280,6 +3280,32 @@ fn main(root: Root) -> Result[(), IoError] {
 |v} in
   out "sql-file" ~grants:{ sqlg with fs = Some (sqlreal, false) } sql_file
     "true\nSome(\"saved\")\nErr(Failed(\"sql: exec: attempt to write a readonly database\"))\ntrue\nErr(Denied(\"fs: path escapes the granted directory\"))\nErr(Denied(\"fs: absolute paths are not allowed; paths are relative to the granted directory\"))\nErr(Failed(\"fs: directory of `no/such/dir.db` does not exist\"))\n";
+  (* a statement waiting on another connection's lock stops when its task
+     is cancelled, instead of sleeping out the 5-second busy timeout *)
+  out "sql-busy-cancel" ~grants:{ sqlg with fs = Some (sqlreal, false) }
+    {v|use sql
+
+fn main(root: Root) -> Result[(), IoError] {
+    let fs = root.fs
+    let clock = root.clock
+    let holder = sql.open(fs, "busy.db")?
+    holder.exec("CREATE TABLE IF NOT EXISTS t (x)", [])?
+    holder.exec("BEGIN IMMEDIATE", [])?
+    let other = sql.open(fs, "busy.db")?
+    let start = clock.now_ms()
+    let r = group g until clock.after(50) {
+        g.go(|| other.exec("INSERT INTO t VALUES (?)", [sql.Int(1)]).is_ok())
+    }
+    let quick = clock.now_ms() - start < 2000
+    holder.exec("COMMIT", [])?
+    let after = other.exec("INSERT INTO t VALUES (?)", [sql.Int(2)])
+    root.stdout.print("{r} {quick} {after}")
+    other.close()?
+    holder.close()?
+    fs.remove("busy.db")
+}
+|v}
+    "[None] true Ok(1)\n";
   (* SQLite follows symlinked sidecar files: open refuses ones that leave the grant *)
   let outside = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "limen-sql-outside-%d" (Unix.getpid ())) in
   Out_channel.with_open_bin outside (fun oc -> output_string oc "keep");

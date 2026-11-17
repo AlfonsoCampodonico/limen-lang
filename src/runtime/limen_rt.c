@@ -3166,9 +3166,66 @@ W_RT void w_block_wait(WBlock *b) {
   if (cancellable) w_wait_end();
   /* cancelled: the job stays pooled and w_block_end, as the task unwinds,
      either frees it (C has returned) or leaves it to the pool */
-  if (w_tok_fired(&b->tok) == W_CANCEL) w_cancel_unwind();
+  if (w_tok_fired(&b->tok) == W_CANCEL) {
+    /* a call that can be told to stop is told, and waited for (not
+       cancellably), so it never outlives the task: what it was lent and
+       what it works on (an SQL connection) are then never used after the
+       task let go */
+    if (b->stoppable) {
+      pthread_mutex_lock(&w_bl_mu);
+      if (b->state == 0) {
+        __atomic_store_n(&b->stop, 1, __ATOMIC_RELEASE);
+        b->tok.done = 0; b->tok.fired = -1;
+        w_prepare_park();
+        __atomic_fetch_add(&w_io_waiters, 1, __ATOMIC_SEQ_CST);
+        pthread_mutex_unlock(&w_bl_mu);
+        w_park_now();
+        __atomic_fetch_sub(&w_io_waiters, 1, __ATOMIC_SEQ_CST);
+      } else pthread_mutex_unlock(&w_bl_mu);
+    }
+    w_cancel_unwind();
+  }
   b->pooled = 0;
 }
+/* ---------- SQL statements ----------
+   The std sql module runs each statement as one blocking call
+   (limen_sql_run): w_sql_core (limen_sql.h) on the pool, with the SQLite
+   functions the generated code passes in. A cancelled task stops the
+   statement and waits for it. */
+typedef struct { WBlock h; void *api[W_SQL_NAPI]; void *db; const char *text, *params; int64_t tlen, plen; int mode; } WSqlJob;
+static void w_sql_job_run(WBlock *b) {
+  WSqlJob *j = (WSqlJob *)b;
+  WSqlBuf o = { 0 };
+  w_sql_core(j->api, j->db, j->text, j->tlen, j->params, j->plen, j->mode, &b->stop, &o);
+  b->res = Str_from(o.p, o.len);
+  free(o.p);
+}
+W_RT WStr *w_sql_run(const void *const *api, int64_t db, WStr *text, WStr *params, int64_t mode) {
+  WSqlJob *j __attribute__((cleanup(w_block_end))) = (WSqlJob *)w_block_new(sizeof(WSqlJob), w_sql_job_run);
+  memcpy(j->api, api, sizeof j->api);
+  j->db = (void *)(intptr_t)db;
+  j->text = text->data; j->tlen = text->len;
+  j->params = params->data; j->plen = params->len;
+  j->mode = (int)mode;
+  j->h.stoppable = 1;
+  w_block_wait(&j->h);
+  return w_block_str(&j->h);
+}
+/* The int64 or double at byte `at` of Bytes (the machine's order), and a
+   Float's bits: for the sql module's results and parameters. */
+W_RT int64_t w_bytes_int(WStr *b, int64_t at, const char *where) {
+  if (at < 0 || at > b->len - 8) w_panic_c("limen_bytes_int: no 8 bytes there", where);
+  int64_t v;
+  memcpy(&v, b->data + at, 8);
+  return v;
+}
+W_RT double w_bytes_float(WStr *b, int64_t at, const char *where) {
+  if (at < 0 || at > b->len - 8) w_panic_c("limen_bytes_float: no 8 bytes there", where);
+  double v;
+  memcpy(&v, b->data + at, 8);
+  return v;
+}
+W_RT int64_t w_float_bits(double x) { int64_t v; memcpy(&v, &x, 8); return v; }
 W_RT WAtomic *w_atomic_new(int64_t v) {
   WAtomic *a = (WAtomic *)w_alloc_k(sizeof(WAtomic), WK_PLAIN);
   a->rc = 1;

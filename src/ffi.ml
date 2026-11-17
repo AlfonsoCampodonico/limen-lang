@@ -183,10 +183,27 @@ let struct_fields (s : Ast.struct_decl) : ((string * cty) list, (Span.t * string
      the id is unknown or closed) and counts a use in progress;
      limen_handle_release(id) ends that use. limen_handle_close(id) closes the
      id; the pointer comes back (to free) from whichever of close and the
-     last release happens last, and NULL from the others. *)
+     last release happens last, and NULL from the others.
+   - limen_sql_run(db, text, params, mode): run SQL on an SQLite connection
+     as one blocking call (runtime/limen_sql.h, which describes the encoded
+     parameters, the modes and the result). It calls the SQLite functions
+     [sql_syms], which the module using it must declare.
+   - limen_bytes_int(b, at), limen_bytes_float(b, at): the int64 or double
+     at byte [at] of [b], in the machine's byte order; limen_float_bits(x):
+     the bits of a Float, as an Int. *)
 let runtime_fns =
   [ ("limen_copy", ([ Handle; Int ], Bytes)); ("limen_handle_new", ([ Handle ], Int)); ("limen_handle_acquire", ([ Int ], Handle));
-    ("limen_handle_release", ([ Int ], Handle)); ("limen_handle_close", ([ Int ], Handle)) ]
+    ("limen_handle_release", ([ Int ], Handle)); ("limen_handle_close", ([ Int ], Handle));
+    ("limen_sql_run", ([ Handle; Str; Bytes; Int ], Bytes)); ("limen_bytes_int", ([ Bytes; Int ], Int));
+    ("limen_bytes_float", ([ Bytes; Int ], Float)); ("limen_float_bits", ([ Float ], Int)) ]
+
+(* The SQLite functions limen_sql_run calls, in the order of its table
+   (the W_SQL_* enum in runtime/limen_sql.h). *)
+let sql_syms =
+  [ "sqlite3_prepare_v2"; "sqlite3_step"; "sqlite3_finalize"; "sqlite3_bind_parameter_count"; "sqlite3_bind_null";
+    "sqlite3_bind_int64"; "sqlite3_bind_double"; "sqlite3_bind_text"; "sqlite3_bind_blob"; "sqlite3_column_count";
+    "sqlite3_column_name"; "sqlite3_column_type"; "sqlite3_column_int64"; "sqlite3_column_double"; "sqlite3_column_text";
+    "sqlite3_column_blob"; "sqlite3_column_bytes"; "sqlite3_errmsg"; "sqlite3_changes64"; "sqlite3_progress_handler"; "sqlite3_busy_handler" ]
 
 (* The C signature of a foreign declaration, or the errors in it. [structs]
    finds a struct declaration by its (qualified) name. *)

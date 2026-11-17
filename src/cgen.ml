@@ -40,6 +40,7 @@ type ctx = {
   mutable sort_tys : ty list; (* list types that need <CName>_sort *)
   mutable hash_tys : ty list; (* composite map key types that need <CName>_hash *)
   mutable csyms : string list; (* C functions that foreign calls name *)
+  mutable sql_api : bool; (* limen_sql_run is called: emit the table of SQLite functions it uses *)
   mutable cstructs : (string * string * (string * Ffi.cty) list) list;
       (* C structs passed by value: Limen name, C name, fields *)
   mutable cbs : ((string * bool * Ffi.cty list * Ffi.cty) * (string * string * Span.t)) list;
@@ -533,6 +534,13 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     match (sym, List.map a args) with
     | "limen_copy", [ p; n ] -> set (sprintf "w_ffi_copy((%s).f0, %s, %s)" p n (where sp))
     | "limen_handle_new", [ p ] -> set (sprintf "w_handle_new((%s).f0)" p)
+    | "limen_sql_run", [ db; text; params; mode ] ->
+      List.iter (fun sym -> if not (List.mem sym c.csyms) then c.csyms <- c.csyms @ [ sym ]) Ffi.sql_syms;
+      c.sql_api <- true;
+      set (sprintf "w_sql_run(w_sql_api, (%s).f0, %s, %s, %s)" db text params mode)
+    | "limen_bytes_int", [ b; at ] -> set (sprintf "w_bytes_int(%s, %s, %s)" b at (where sp))
+    | "limen_bytes_float", [ b; at ] -> set (sprintf "w_bytes_float(%s, %s, %s)" b at (where sp))
+    | "limen_float_bits", [ x ] -> set (sprintf "w_float_bits(%s)" x)
     | ("limen_handle_acquire" | "limen_handle_release" | "limen_handle_close"), [ id ] ->
       set (sprintf "(%s){ w_%s(%s) }" hd (let p = String.length "limen_" in String.sub sym p (String.length sym - p)) id)
     | _ -> failwith ("cgen: runtime helper " ^ sym))
@@ -1753,7 +1761,7 @@ let program (g : Lower.gctx) (prog : I.program) : string =
   let c =
     { g; names = Hashtbl.create 32; types = []; lits = Hashtbl.create 32; lit_order = []; boxed = [];
       envs = Hashtbl.create 16; uniq = []; task_tys = []; inrange = []; chan_tys = []; dyns = []; cell_tys = []; vols = [];
-      cmp_tys = []; sort_tys = []; hash_tys = []; csyms = []; cstructs = []; cbs = []; bjobs = [];
+      cmp_tys = []; sort_tys = []; hash_tys = []; csyms = []; sql_api = false; cstructs = []; cbs = []; bjobs = [];
       pure = Pure.analyse prog; plan = Pure.no_plan (); slotted = [] }
   in
   (* bodies first: this discovers every type and literal *)
@@ -1960,7 +1968,12 @@ let program (g : Lower.gctx) (prog : I.program) : string =
       Buffer.contents protos;
       (* each foreign C function under a private name, bound to its symbol by
          an asm label, so it clashes with no header's declaration of it *)
-      String.concat "" (List.map (fun sym -> sprintf "extern void vf_%s(void) __asm__(W_CSYM(\"%s\"));\n" sym sym) c.csyms);
+      String.concat "" (List.map (fun sym -> sprintf "extern void vf_%s(void) __asm__(W_CSYM(\"%s\"));\n" sym sym) c.csyms)
+      (* the SQLite functions limen_sql_run calls, in the order of its table *)
+      ^ (if c.sql_api then
+           sprintf "static const void *const w_sql_api[] = { %s };\n"
+             (String.concat ", " (List.map (fun sym -> sprintf "(const void *)vf_%s" sym) Ffi.sql_syms))
+         else "");
       cbdefs ^ String.concat "" c.bjobs;
       "/* ---- dyn vtables ---- */"; Buffer.contents dynbuf; Buffer.contents bodies; Buffer.contents main ]
   in

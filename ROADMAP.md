@@ -1,6 +1,6 @@
 # Roadmap
 
-Where Limen goes from 0.3.2 to 1.0, one release at a time. Each release has
+Where Limen goes from 0.3.3 to 1.0, one release at a time. Each release has
 one goal and a test for when it's done; the items under it are what stands
 between here and that test. There are no dates: this is a one-person
 project, and the order matters more than the calendar.
@@ -9,7 +9,9 @@ The short version: make a Limen server safe to run on the internet, then
 make the language less tedious to write, then make it pleasant to debug,
 then harden it, then promise not to break it.
 
-Updated 2026-11-16, after 0.3.2.
+Updated 2026-11-17, after 0.3.3. Done since: an SQL statement is one call
+on the blocking-call pool instead of one per row, so a scan of 102k rows
+takes 15 ms natively (it took 61 ms).
 
 ## 0.4: a server you can leave running
 
@@ -23,9 +25,6 @@ memory flat.
   value is the list of every task's result. A long-running group needs a way
   not to collect them.
 - `json.Int(Int)`, so ids and counts above 2^53 survive the trip out.
-- SQLite back to its old speed: a scan of 102k rows went from 11 ms to about
-  65 ms when the calls moved off the worker threads. One pool job per query
-  instead of one per row (work in progress in `limen-sqlite-wip/`).
 - `full_path` hands C code (SQLite) a path string that can still race a
   directory swap after the check.
 - Fuzz the HTTP parser and JSON, the two things a server reads from

@@ -21,11 +21,13 @@
 
 // ---------- SQLite's C API, as much as this module needs ----------
 
-// The calls that can take long (opening and closing files, running SQL,
-// waiting up to the busy timeout for another connection's lock, finishing
-// a statement) are `blocking`: natively they run on the blocking-call pool,
-// so a slow query holds up only its own task. The others only read what a
-// statement or a connection holds, and run on the task's thread.
+// A statement runs as one call into the runtime (limen_sql_run, below),
+// which prepares it, binds the parameters, steps through every row and
+// copies the columns on the blocking-call pool, so a slow query holds up
+// only its own task and a row costs no round trip between threads. The
+// functions it calls are declared here so the program links them; it is
+// the only caller of most. Opening and closing, which can wait on the disk,
+// are `blocking` too.
 foreign "sqlite3" {
     blocking fn sqlite3_open_v2(path: Str, db: Out[Handle], flags: Int32, vfs: Int) -> Int32
     blocking fn sqlite3_close_v2(db: Handle) -> Int32
@@ -34,15 +36,12 @@ foreign "sqlite3" {
     fn sqlite3_limit(db: Handle, id: Int32, value: Int32) -> Int32
     fn sqlite3_busy_timeout(db: Handle, ms: Int32) -> Int32
     blocking fn sqlite3_exec(db: Handle, sql: Str, callback: Int, arg: Int, err: Out[Handle]) -> Int32
-    fn sqlite3_interrupt(db: Handle)
-    fn sqlite3_free(p: Handle)
     fn sqlite3_changes64(db: Handle) -> Int
     fn sqlite3_last_insert_rowid(db: Handle) -> Int
     fn sqlite3_get_autocommit(db: Handle) -> Bool
-    blocking fn sqlite3_prepare_v2(db: Handle, sql: Str, n: Int32, stmt: Out[Handle], tail: Out[Handle]) -> Int32
-    fn sqlite3_sql(stmt: Handle) -> Str
-    blocking fn sqlite3_finalize(stmt: Handle) -> Int32
-    blocking fn sqlite3_step(stmt: Handle) -> Int32
+    fn sqlite3_prepare_v2(db: Handle, sql: Str, n: Int32, stmt: Out[Handle], tail: Out[Handle]) -> Int32
+    fn sqlite3_finalize(stmt: Handle) -> Int32
+    fn sqlite3_step(stmt: Handle) -> Int32
     fn sqlite3_bind_parameter_count(stmt: Handle) -> Int32
     fn sqlite3_bind_null(stmt: Handle, i: Int32) -> Int32
     fn sqlite3_bind_int64(stmt: Handle, i: Int32, v: Int) -> Int32
@@ -57,24 +56,25 @@ foreign "sqlite3" {
     fn sqlite3_column_text(stmt: Handle, i: Int32) -> Handle
     fn sqlite3_column_blob(stmt: Handle, i: Int32) -> Handle
     fn sqlite3_column_bytes(stmt: Handle, i: Int32) -> Int32
+    fn sqlite3_progress_handler(db: Handle, n: Int32, handler: Int, arg: Int)
+    fn sqlite3_busy_handler(db: Handle, handler: Int, arg: Int) -> Int32
 }
 
-// the runtime's helpers: copy C memory into Bytes, and the handle table
-// that keeps connection pointers out of Limen values
+// the runtime's helpers: the handle table that keeps connection pointers
+// out of Limen values, a statement as one call, and reading its result
 foreign "limen" {
-    fn limen_copy(p: Handle, n: Int) -> Bytes
     fn limen_handle_new(p: Handle) -> Int
     fn limen_handle_acquire(id: Int) -> Handle
     fn limen_handle_release(id: Int) -> Handle
     fn limen_handle_close(id: Int) -> Handle
+    fn limen_sql_run(db: Handle, text: Str, params: Bytes, mode: Int) -> Bytes
+    fn limen_bytes_int(b: Bytes, at: Int) -> Int
+    fn limen_bytes_float(b: Bytes, at: Int) -> Float
+    fn limen_float_bits(x: Float) -> Int
 }
 
 // result codes and flags from sqlite3.h
 fn ok_code() -> Int { 0 }
-
-fn row_code() -> Int { 100 }
-
-fn done_code() -> Int { 101 }
 
 fn open_flags(read_only: Bool) -> Int {
     // NOFOLLOW (0x01000000), FULLMUTEX (0x00010000): one connection can be
@@ -82,9 +82,6 @@ fn open_flags(read_only: Bool) -> Int {
     let base = 16777216 + 65536
     if read_only { base + 1 } else { base + 2 + 4 }
 }
-
-// SQLITE_TRANSIENT: SQLite copies a bound text or blob before the call returns
-fn transient() -> Int { -1 }
 
 // ---------- values ----------
 
@@ -193,132 +190,126 @@ pub fn close(self: Db) -> Result[(), IoError] {
 
 // ---------- statements ----------
 
-fn bind(db: Handle, st: Handle, params: List[Value]) -> Result[(), IoError] {
-    let want = sqlite3_bind_parameter_count(st)
-    if want != params.len() {
-        return Err(Failed("sql: the statement has {want} parameter{if want == 1 { "" } else { "s" }}, but {params.len()} were given"))
-    }
-    let mut i = 1
+// How limen_sql_run runs the text (src/runtime/limen_sql.h): every
+// statement, rows ignored; one statement, one step; one statement, every row.
+fn all_mode() -> Int { 0 }
+
+fn once_mode() -> Int { 1 }
+
+fn rows_mode() -> Int { 2 }
+
+// The parameters as limen_sql_run reads them: the count and `;`, then each
+// one, `n`, `i<n>;`, `f<the double's bits>;`, `t<length>;<bytes>` or
+// `b<length>;<bytes>`.
+fn encode(params: List[Value]) -> Bytes {
+    let mut parts = ["{params.len()};"]
     for p in params {
-        let rc = match p {
-            Null => sqlite3_bind_null(st, i),
-            Int(n) => sqlite3_bind_int64(st, i, n),
-            Float(x) => sqlite3_bind_double(st, i, x),
-            Text(s) => sqlite3_bind_text(st, i, s, s.len(), transient()),
-            Blob(b) => sqlite3_bind_blob(st, i, b, b.len(), transient()),
-        }
-        if rc != ok_code() {
-            return Err(fail(db, "binding parameter {i}"))
-        }
-        i = i + 1
+        parts.push(match p {
+            Null => "n",
+            Int(n) => "i{n};",
+            Float(x) => "f{limen_float_bits(x)};",
+            Text(s) => "t{s.len()};{s}",
+            Blob(b) => "b{b.len()};{b.to_str()}",
+        })
     }
-    Ok(())
+    parts.join("").to_bytes()
 }
 
-// Prepare exactly one statement with its parameters bound.
-fn prepare(db: Handle, text: Str, params: List[Value]) -> Result[Handle, IoError] {
-    let (rc, st, _) = sqlite3_prepare_v2(db, text, text.len())
-    if rc != ok_code() {
-        return Err(fail(db, "prepare"))
-    }
-    if st.addr == 0 {
-        return Err(Failed("sql: no statement in the SQL text"))
-    }
-    // the text SQLite used for this statement; anything after it is a second statement
-    let used = sqlite3_sql(st).len()
-    if text.slice(used, text.len()).trim() != "" && text.slice(used, text.len()).trim() != ";" {
-        sqlite3_finalize(st)
-        return Err(Failed("sql: a statement with parameters must be alone; run several with `exec` and no parameters"))
-    }
-    match bind(db, st, params) {
-        Ok(_) => Ok(st),
-        Err(e) => {
-            sqlite3_finalize(st)
-            Err(e)
-        },
-    }
+// What one statement gave: the rows changed, and the columns and rows of a
+// query.
+struct Ran {
+    changes: Int,
+    columns: List[Str],
+    rows: List[Row],
 }
 
-fn column(st: Handle, i: Int) -> Value {
-    match sqlite3_column_type(st, i) {
-        1 => Int(sqlite3_column_int64(st, i)),
-        2 => Float(sqlite3_column_double(st, i)),
-        3 => {
-            let p = sqlite3_column_text(st, i)
-            Text(limen_copy(p, sqlite3_column_bytes(st, i)).to_str())
-        },
-        4 => {
-            let p = sqlite3_column_blob(st, i)
-            Blob(limen_copy(p, sqlite3_column_bytes(st, i)))
-        },
-        _ => Null,
+// A length-prefixed string of the result at byte `at`, and where the next
+// thing starts.
+fn text_at(r: Bytes, at: Int) -> (Str, Int) {
+    let n = limen_bytes_int(r, at)
+    (r.slice(at + 8, at + 8 + n).to_str(), at + 8 + n)
+}
+
+// Run `text` on the connection as one call, and read what it returns (the
+// layout is described in src/runtime/limen_sql.h). `what` names the
+// operation in errors.
+fn run(db: Handle, text: Str, params: List[Value], mode: Int, what: Str) -> Result[Ran, IoError] {
+    let r = limen_sql_run(db, text, encode(params), mode)
+    let failed = limen_bytes_int(r, 0)
+    if failed != 0 {
+        let (msg, _) = text_at(r, 32)
+        let num = limen_bytes_int(r, 16)
+        return Err(Failed(match failed {
+            1 => if mode == all_mode() { "sql: {msg}" } else { "sql: prepare: {msg}" },
+            2 => "sql: no statement in the SQL text",
+            3 => "sql: a statement with parameters must be alone; run several with `exec` and no parameters",
+            4 => "sql: the statement has {num} parameter{if num == 1 { "" } else { "s" }}, but {params.len()} were given",
+            5 => "sql: binding parameter {num}: {msg}",
+            6 => if mode == all_mode() { "sql: {msg}" } else { "sql: {what}: {msg}" },
+            _ => "sql: {what}: stopped",
+        }))
     }
+    let changes = limen_bytes_int(r, 24)
+    if mode != rows_mode() {
+        return Ok(Ran { changes, columns: [], rows: [] })
+    }
+    let n = limen_bytes_int(r, 32)
+    let mut at = 40
+    let mut columns = []
+    for _ in 0..<n {
+        let (name, next) = text_at(r, at)
+        columns.push(name)
+        at = next
+    }
+    let mut rows = []
+    let end = r.len()
+    while at < end {
+        let mut values = []
+        for _ in 0..<n {
+            let kind = r[at]
+            at = at + 1
+            if kind == 1 {
+                values.push(Int(limen_bytes_int(r, at)))
+                at = at + 8
+            } else if kind == 2 {
+                values.push(Float(limen_bytes_float(r, at)))
+                at = at + 8
+            } else if kind == 3 {
+                let (s, next) = text_at(r, at)
+                values.push(Text(s))
+                at = next
+            } else if kind == 4 {
+                let len = limen_bytes_int(r, at)
+                values.push(Blob(r.slice(at + 8, at + 8 + len)))
+                at = at + 8 + len
+            } else {
+                values.push(Null)
+            }
+        }
+        rows.push(Row { columns, values })
+    }
+    Ok(Ran { changes, columns, rows })
 }
 
 // Run SQL that returns no rows; the result is how many rows it changed.
 // With no parameters the text may hold several statements, separated by `;`
 // (a schema, say). With parameters it must be exactly one statement, and
 // each `?` takes the next value of `params`.
+//
+// A task cancelled while its SQL runs stops it: the statement gives up at
+// its next step, or within a thousand of SQLite's instructions inside one,
+// and the task waits for that before it unwinds. Other tasks' statements on
+// the same connection go on.
 pub fn exec(self: Db, text: Str, params: List[Value]) -> Result[Int, IoError] {
-    self.using(|db| exec_on(db, text, params))
-}
-
-fn exec_on(db: Handle, text: Str, params: List[Value]) -> Result[Int, IoError] {
-    // a task cancelled while its SQL runs stops that SQL (sqlite3_interrupt
-    // stops whatever statement the connection is running)
-    let mut running = false
-    defer if running {
-        sqlite3_interrupt(db)
-    }
-    if params.is_empty() {
-        running = true
-        let (rc, err) = sqlite3_exec(db, text, 0, 0)
-        running = false
-        if rc != ok_code() {
-            let msg = if err.addr == 0 { sqlite3_errstr(rc) } else { sqlite3_errmsg(db) }
-            sqlite3_free(err)
-            return Err(Failed("sql: {msg}"))
-        }
-        return Ok(sqlite3_changes64(db))
-    }
-    let st = prepare(db, text, params)?
-    // finalized however this ends, a cancellation included
-    defer sqlite3_finalize(st)
-    running = true
-    let rc = sqlite3_step(st)
-    running = false
-    if rc == done_code() || rc == row_code() { Ok(sqlite3_changes64(db)) } else { Err(fail(db, "exec")) }
+    let mode = if params.is_empty() { all_mode() } else { once_mode() }
+    let ran = self.using(|db| run(db, text, params, mode, "exec"))?
+    Ok(ran.changes)
 }
 
 // Run one statement and collect every row it returns.
 pub fn query(self: Db, text: Str, params: List[Value]) -> Result[List[Row], IoError] {
-    self.using(|db| query_on(db, text, params))
-}
-
-fn query_on(db: Handle, text: Str, params: List[Value]) -> Result[List[Row], IoError] {
-    let st = prepare(db, text, params)?
-    // finalized however this ends; a task cancelled while the statement
-    // runs stops it first
-    let mut running = false
-    defer {
-        if running {
-            sqlite3_interrupt(db)
-        }
-        sqlite3_finalize(st)
-    }
-    let n = sqlite3_column_count(st)
-    let names = (0..<n).map(|i| sqlite3_column_name(st, i))
-    let mut rows = []
-    running = true
-    let mut rc = sqlite3_step(st)
-    running = false
-    while rc == row_code() {
-        rows.push(Row { columns: names, values: (0..<n).map(|i| column(st, i)) })
-        running = true
-        rc = sqlite3_step(st)
-        running = false
-    }
-    if rc == done_code() { Ok(rows) } else { Err(fail(db, "query")) }
+    let ran = self.using(|db| run(db, text, params, rows_mode(), "query"))?
+    Ok(ran.rows)
 }
 
 // The first row, if any: for queries that look one thing up.

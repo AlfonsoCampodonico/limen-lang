@@ -1212,8 +1212,8 @@ W_RT void w_foreign_check(WCap *x, const char *lib, const char *where);
 W_RT int32_t w_ffi_i32(int64_t v, const char *arg, const char *where);
 W_RT WStr *w_ffi_str(const char *p);
 /* ---------- blocking C calls ----------
-   A foreign function declared `blocking fn` (and the calls of the std sql
-   module that wait on SQLite) runs on a thread of the blocking-call pool,
+   A foreign function declared `blocking fn` (and each statement of the std
+   sql module, w_sql_run) runs on a thread of the blocking-call pool,
    not on the worker thread that runs the task: the task parks until the
    call returns, so a slow C call holds up only its own task. The pool
    starts a thread whenever a call finds none idle, up to
@@ -1227,8 +1227,10 @@ W_RT WStr *w_ffi_str(const char *p);
    string is still valid. The job's variable has a cleanup (w_block_end), so
    it is freed however the task leaves it, a panic in an argument included.
    A cancelled task stops waiting and unwinds at once; the call goes on in
-   the background and the pool thread frees the job when it returns, dropping what it kept and the result (a Handle the call
-   returned is lost, as C memory nobody frees). Once a cancellation is
+   the background and the pool thread frees the job when it returns,
+   dropping what it kept and the result (a Handle the call returned is
+   lost, as C memory nobody frees). A stoppable job (an SQL statement) is
+   told to stop instead and waited for, so it never outlives the task. Once a cancellation is
    unwinding the task (deferred code), a blocking call is waited for to the
    end, as checkpoints let that code finish. */
 typedef struct WBlock {
@@ -1239,6 +1241,8 @@ typedef struct WBlock {
   int pooled;                           /* the pool holds it: from submission until the task takes it back */
   int nkeep; WStr *keep[16];            /* the Str and Bytes arguments lent to C */
   WStr *res;                            /* a Str result, copied on the pool thread */
+  int stoppable;                        /* the call watches `stop`: a cancelled task sets it and waits for the call to end */
+  int stop;
 } WBlock;
 extern pthread_mutex_t w_bl_mu;
 extern pthread_cond_t w_bl_cv;
@@ -1248,8 +1252,8 @@ extern int w_bl_threads, w_bl_idle, w_bl_spinning, w_bl_max;
    it costs no sleep and wakeup on either side, a pool thread that has
    finished a call watches the queue for W_BL_SPIN_NS before it sleeps, and
    a task that has handed over a call watches for its end as long before it
-   parks: a loop over a query's rows, one sqlite3_step each, then never
-   waits for a thread to wake. */
+   parks: a loop of short blocking calls then never waits for a thread to
+   wake. */
 #define W_BL_SPIN_NS 50000
 static inline void w_cpu_relax(void) {
 #if defined(__x86_64__)
@@ -1267,6 +1271,12 @@ W_RT WStr *w_block_str(WBlock *b);
 W_RT void *w_bl_thread(void *arg);
 W_RT void w_bl_submit(WBlock *b);
 W_RT void w_block_wait(WBlock *b);
+/* The std sql module's helpers (Ffi.runtime_fns): one SQL statement as one
+   blocking call (limen_sql.h), and reading what it returns. */
+W_RT WStr *w_sql_run(const void *const *api, int64_t db, WStr *text, WStr *params, int64_t mode);
+W_RT int64_t w_bytes_int(WStr *b, int64_t at, const char *where);
+W_RT double w_bytes_float(WStr *b, int64_t at, const char *where);
+W_RT int64_t w_float_bits(double x);
 /* ---------- Atomic and Shared ----------
    The shared mutable state tasks may hold besides channels. Both are shared,
    never copied: a task that captures one works on the same one.

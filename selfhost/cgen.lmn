@@ -97,6 +97,8 @@ struct Cg {
     hash_tys: List[types.Ty],
     // C functions that foreign calls name
     csyms: List[Str],
+    // limen_sql_run is called: emit the table of SQLite functions it uses
+    sql_api: Bool,
     cstructs: List[CStruct],
     wrappers: List[Wrapper],
     // blocking calls' jobs, vbj<n>_: each one's struct and the function
@@ -1046,6 +1048,19 @@ fn rhs_into(self: Cg, ind: Str, dst: Str, t: types.Ty, r: ir.Rhs) -> Cg {
             match (cs.sym, xs) {
                 ("limen_copy", [p, n]) => c2.set(ind, dst, "w_ffi_copy(({p}).f0, {n}, {c2.where(sp)})"),
                 ("limen_handle_new", [p]) => c2.set(ind, dst, "w_handle_new(({p}).f0)"),
+                ("limen_sql_run", [db, text, params, mode]) => {
+                    let mut c3 = c2
+                    for sym in ffi.sql_syms() {
+                        if !c3.csyms.contains(sym) {
+                            c3.csyms.push(sym)
+                        }
+                    }
+                    c3.sql_api = true
+                    c3.set(ind, dst, "w_sql_run(w_sql_api, ({db}).f0, {text}, {params}, {mode})")
+                },
+                ("limen_bytes_int", [b, at]) => c2.set(ind, dst, "w_bytes_int({b}, {at}, {c2.where(sp)})"),
+                ("limen_bytes_float", [b, at]) => c2.set(ind, dst, "w_bytes_float({b}, {at}, {c2.where(sp)})"),
+                ("limen_float_bits", [x]) => c2.set(ind, dst, "w_float_bits({x})"),
                 ("limen_handle_acquire" | "limen_handle_release" | "limen_handle_close", [id]) => c2.set(ind, dst, "({hd})\{ w_{cs.sym.slice("limen_".len(), cs.sym.len())}({id}) }"),
                 _ => panic("cgen: runtime helper " + cs.sym),
             }
@@ -2803,6 +2818,7 @@ pub fn program(ro: lower.Ro, files: List[diag.Source], prog: ir.Program, runtime
         sort_tys: [],
         hash_tys: [],
         csyms: [],
+        sql_api: false,
         cstructs: [],
         wrappers: [],
         bjobs: [],
@@ -2928,7 +2944,11 @@ pub fn program(ro: lower.Ro, files: List[diag.Source], prog: ir.Program, runtime
     let lits = c.lit_order.map(|p| "static WStr {p.0} = \{ 0, {p.1.len()}, (char*){c_string(p.1)} };\n")
     // each foreign C function under a private name, bound to its symbol by
     // an asm label, so it clashes with no header's declaration of it
-    let externs = c.csyms.map(|sym| "extern void vf_{sym}(void) __asm__(W_CSYM(\"{sym}\"));\n")
+    let mut externs = c.csyms.map(|sym| "extern void vf_{sym}(void) __asm__(W_CSYM(\"{sym}\"));\n")
+    // the SQLite functions limen_sql_run calls, in the order of its table
+    if c.sql_api {
+        externs.push("static const void *const w_sql_api[] = \{ {ffi.sql_syms().map(|sym| "(const void *)vf_" + sym).join(", ")} };\n")
+    }
     let program = ["/* ---- types ---- */", tys.join(""), "/* ---- literals ---- */", lits.join(""), "/* ---- closures ---- */", envs.join(""), tasks.join(""), "/* ---- functions ---- */", protos.join(""), externs.join(""), cbdefs.join("") + c.bjobs.join(""), "/* ---- dyn vtables ---- */", dynbuf.join(""), bodies, main]
     // Only a group with a deadline can cancel a task (the deadline cancels
     // the group, and a cancelled group's tasks are cancelled with it). In a

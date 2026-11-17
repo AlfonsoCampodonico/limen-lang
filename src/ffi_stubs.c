@@ -742,3 +742,119 @@ value limen_fs_stat(value top, value root, value rel) {
   Store_field(r, 4, Val_bool(S_ISREG(st.st_mode))); Store_field(r, 5, Val_bool(S_ISDIR(st.st_mode)));
   CAMLreturn(r);
 }
+
+/* ---- SQL statements (the std sql module's limen_sql_run) ----
+   One statement runs on a thread of its own, through w_sql_core
+   (runtime/limen_sql.h, shared with the native runtime), while its task
+   waits on the pipe like a socket. The text and parameters are copied, so
+   the OCaml heap can move. A cancelled task sets `stop`, which makes the
+   statement give up, and still waits for the thread (limen_sql_finish), so
+   the connection is never used after the task let it go. */
+#include "runtime/limen_sql.h"
+
+typedef struct {
+  void *api[W_SQL_NAPI];
+  void *db;
+  char *text, *params;
+  int64_t tlen, plen;
+  int mode, stop;
+  WSqlBuf out;
+  int fds[2];
+  int state; /* 0 running, 1 done (under mu) */
+  pthread_mutex_t mu;
+} limen_sql_job;
+
+static void *limen_sql_thread(void *p) {
+  limen_sql_job *j = p;
+  w_sql_core(j->api, j->db, j->text, j->tlen, j->params, j->plen, j->mode, &j->stop, &j->out);
+  pthread_mutex_lock(&j->mu);
+  ssize_t k;
+  do k = write(j->fds[1], "x", 1); while (k < 0 && errno == EINTR);
+  j->state = 1;
+  pthread_mutex_unlock(&j->mu);
+  return NULL;
+}
+
+static char *limen_sql_copy(value s) {
+  mlsize_t n = caml_string_length(s);
+  char *p = malloc(n ? n : 1);
+  if (!p) { fputs("panic: out of memory\n", stderr); exit(1); }
+  memcpy(p, String_val(s), n);
+  return p;
+}
+
+static void limen_sql_free(limen_sql_job *j) {
+  free(j->text);
+  free(j->params);
+  free(j->out.p);
+  close(j->fds[0]);
+  close(j->fds[1]);
+  pthread_mutex_destroy(&j->mu);
+  free(j);
+}
+
+/* limen_sql_start : nativeint array -> nativeint -> string -> string -> int -> nativeint * int
+   (SQLite's functions in W_SQL_* order, the connection, the text, the
+   encoded parameters, the mode) -> (job, descriptor to wait on); a job of 0
+   if no thread could start. */
+value limen_sql_start(value api, value db, value text, value params, value mode) {
+  CAMLparam5(api, db, text, params, mode);
+  CAMLlocal2(r, jv);
+  limen_sql_job *j = calloc(1, sizeof *j);
+  if (!j) { fputs("panic: out of memory\n", stderr); exit(1); }
+  for (int k = 0; k < W_SQL_NAPI && k < (int)Wosize_val(api); k++) j->api[k] = (void *)Nativeint_val(Field(api, k));
+  j->db = (void *)Nativeint_val(db);
+  j->text = limen_sql_copy(text); j->tlen = (int64_t)caml_string_length(text);
+  j->params = limen_sql_copy(params); j->plen = (int64_t)caml_string_length(params);
+  j->mode = Int_val(mode);
+  pthread_mutex_init(&j->mu, NULL);
+  int ok = pipe(j->fds) == 0;
+  if (ok) {
+    pthread_t th;
+    pthread_attr_t at;
+    pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    pthread_attr_setstacksize(&at, (size_t)4 << 20);
+    ok = pthread_create(&th, &at, limen_sql_thread, j) == 0;
+    pthread_attr_destroy(&at);
+    if (!ok) { close(j->fds[0]); close(j->fds[1]); }
+  }
+  if (!ok) {
+    free(j->text); free(j->params);
+    pthread_mutex_destroy(&j->mu);
+    free(j);
+    j = NULL;
+  }
+  jv = caml_copy_nativeint((intnat)j);
+  r = caml_alloc_tuple(2);
+  Store_field(r, 0, jv);
+  Store_field(r, 1, Val_int(j ? j->fds[0] : -1));
+  CAMLreturn(r);
+}
+
+/* limen_sql_done : nativeint -> bool */
+value limen_sql_done(value jv) {
+  limen_sql_job *j = (limen_sql_job *)Nativeint_val(jv);
+  pthread_mutex_lock(&j->mu);
+  int d = j->state == 1;
+  pthread_mutex_unlock(&j->mu);
+  return Val_bool(d);
+}
+
+/* limen_sql_stop : nativeint -> unit (the statement gives up soon) */
+value limen_sql_stop(value jv) {
+  limen_sql_job *j = (limen_sql_job *)Nativeint_val(jv);
+  __atomic_store_n(&j->stop, 1, __ATOMIC_RELEASE);
+  return Val_unit;
+}
+
+/* limen_sql_finish : nativeint -> string
+   The result of a job that is done (see limen_sql.h); frees it. */
+value limen_sql_finish(value jv) {
+  CAMLparam1(jv);
+  CAMLlocal1(r);
+  limen_sql_job *j = (limen_sql_job *)Nativeint_val(jv);
+  r = caml_alloc_initialized_string((mlsize_t)j->out.len, j->out.p ? j->out.p : "");
+  limen_sql_free(j);
+  CAMLreturn(r);
+}
