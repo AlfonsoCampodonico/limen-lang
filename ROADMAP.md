@@ -12,29 +12,29 @@ then harden it, then promise not to break it.
 This file is the plan. The design doc keeps the reasons and the history of
 what was done; its older lists of what was missing point here.
 
-Updated 2026-11-17, after 0.3.3. Done since, for 0.4: an SQL statement is
-one call on the blocking-call pool, so a scan of 102k rows takes 15 ms
-natively (it took 61 ms); HTTP server time limits (`http.server(clock)`, on
-new `Conn.read_within` and `write_within` deadlines, about free per
-request); a group frees each finished `()` task at once, so `serve_forever`
-stays flat (a million tasks: 5.6 MB, was 171 MB); `json.Int`; fuzzers for
-the HTTP server and JSON in `fuzz/` (3 million JSON inputs and 60,000
-requests, nothing found); CI on x86-64 and arm64 Linux and on macOS.
+Updated 2026-11-18, after 0.4.0.
 
-## 0.4: a server you can leave running
+## 0.4: a server you can leave running (done, 0.4.0)
 
 A Limen web service, exposed to the internet, that stays up and keeps its
-memory flat.
+memory flat. `examples/todo_api.lmn`, run natively: 500 slowloris clients
+each got 408 at 10 s while normal requests answered in under 8 ms, and 11.5
+hours of load (136 million requests, no errors) held the server at 4 MB. The
+run was meant to be 24 hours; the machine restarted first. Deployed on Cloud
+it served the API, and Cloud's proxy dropped slow clients at 15 s without
+slowing anyone else.
 
-Done when `examples/todo_api.lmn`, deployed, survives a slowloris client and
-a day of load with flat memory.
+What made it: HTTP server time limits (`http.server(clock)`), each SQL
+statement as one blocking call, finished tasks freed at once so
+`serve_forever` stays flat, `json.Int`, fuzzers for the HTTP server and JSON,
+and CI on x86-64 and arm64 Linux and on macOS.
 
 ## 0.5: less to write
 
 The things newcomers hit in their first hour.
 
 - Converting a struct to and from SQL rows without writing every field by
-  hand. JSON is done: `json.encode(x)` and `json.decode(s)` work for any
+  hand. JSON is done, and shipped early in 0.4.0: `json.encode(x)` and `json.decode(s)` work for any
   type made of JSON's parts, and the compiler writes the conversion for
   each type they are used with, so `todo_api.lmn` lost its hand-written
   JSON code.
