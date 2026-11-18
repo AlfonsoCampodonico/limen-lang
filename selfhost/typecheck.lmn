@@ -1207,6 +1207,11 @@ fn enclosing_fn(ds: Decls, sp: ast.Span) -> Int {
 
 // The tree with each expression in its last form, as OCaml's writes into
 // the tree leave it.
+// `items` with the expressions `st` rewrote in their new form.
+pub fn rewrite_items(st: env.State, items: List[ast.Item]) -> List[ast.Item] {
+    items.map(|i| rewritten_item(st, i))
+}
+
 fn rewritten_item(st: env.State, i: ast.Item) -> ast.Item {
     match i {
         IFn(d) => {

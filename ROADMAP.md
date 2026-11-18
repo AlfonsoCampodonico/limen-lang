@@ -33,8 +33,11 @@ a day of load with flat memory.
 
 The things newcomers hit in their first hour.
 
-- Converting a struct to and from JSON (and SQL rows) without writing every
-  field by hand. Today that is a third of `todo_api.lmn`.
+- Converting a struct to and from SQL rows without writing every field by
+  hand. JSON is done: `json.encode(x)` and `json.decode(s)` work for any
+  type made of JSON's parts, and the compiler writes the conversion for
+  each type they are used with, so `todo_api.lmn` lost its hand-written
+  JSON code.
 - Closure parameter types inferred inside a tuple in a list literal, so
   `[("GET /", |r, p| ...)]` checks.
 - Hex and binary literals (`0xff`, `0b1010`) and a `\u{...}` string escape.

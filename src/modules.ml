@@ -948,6 +948,17 @@ let load_and_check path src : item list * Diag.t list * Check.fn_info list =
     | [], (_ :: _ as ds) -> ([], ds, [])
     | items, _ ->
       let ds, infos = Check.check_program items in
+      (* `json.encode` and `json.decode` get their conversions written once
+         the types are known, and the program is checked again with them *)
+      let items, ds, infos =
+        match List.find_opt (fun (_, std) -> std = "json") !std_loaded with
+        | Some (json, _) when Diag.errors ds = [] -> (
+          match Derive.expand ~json items with
+          | None -> (items, ds, infos)
+          | Some (items, (_ :: _ as errs)) -> (items, errs @ ds, infos)
+          | Some (items, []) -> let ds, infos = Check.check_program items in (items, ds, infos))
+        | _ -> (items, ds, infos)
+      in
       (* standard library modules are checked against src/std/limen.toml,
          with or without a limen.toml of the program's own *)
       let warnings = Diag.warnings ds in

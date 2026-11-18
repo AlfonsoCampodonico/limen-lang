@@ -19,6 +19,7 @@
 use ast
 use caps
 use cgen
+use derive
 use diag
 use disk
 use ffi
@@ -171,6 +172,24 @@ fn front(fs: Fs, place: disk.Place, file: Str) -> Front {
     }
     let c = typecheck.check_program(p.items, p.files, p.next_id, methods, p.forwarders)
     let files = p.files + [diag.Source { path: prelude.file_name(), text: prelude.text() }, diag.Source { path: prelude.methods_name(), text: methods }, diag.Source { path: "<std>/limen.toml", text: std.get("limen.toml") ?? "" }]
+    // `json.encode` and `json.decode` get their conversions written once
+    // the types are known, and the program is checked again with them
+    let json = p.std_modules.find(|m| m.1 == "json").map(|m| m.0)
+    let (p, c) = match json {
+        Some(name) if c.diags.all(|d| d.warning) => match derive.expand(name, p.items, c) {
+            None => (p, c),
+            Some(x) if !x.diags.is_empty() => {
+                let diags = x.diags + c.diags.filter(|d| d.warning)
+                let p = { p with items: x.items }
+                return Front { loaded: p, checked: Some(c), files, errors: diags.filter(|d| !d.warning), warnings: diags.filter(|d| d.warning) }
+            },
+            Some(x) => {
+                let p = { p with items: x.items, next_id: x.next_id }
+                (p, typecheck.check_program(p.items, p.files, p.next_id, methods, p.forwarders))
+            },
+        },
+        _ => (p, c),
+    }
     let diags = caps.check(fs, place, files, files.len() - 1, p.std_manifest, p.std_modules, p.manifest, p.packages, p.items, c)
     Front { loaded: p, checked: Some(c), files, errors: diags.filter(|d| !d.warning), warnings: diags.filter(|d| d.warning) }
 }

@@ -3554,7 +3554,7 @@ fn main(root: Root) -> Result[(), IoError] {
   out "example-todo-api"
     ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] }
     (example "todo_api.lmn")
-    "POST /todos -> 201 {\"id\":1,\"title\":\"buy milk\",\"done\":false}\nPOST /todos -> 201 {\"id\":2,\"title\":\"write the README\",\"done\":false}\nPOST /todos -> 400 {\"error\":\"a todo needs a title\"}\nGET /todos -> 200 [{\"id\":1,\"title\":\"buy milk\",\"done\":false},{\"id\":2,\"title\":\"write the README\",\"done\":false}]\nPATCH /todos/1 -> 200 {\"id\":1,\"title\":\"buy milk\",\"done\":true}\nGET /todos/1 -> 200 {\"id\":1,\"title\":\"buy milk\",\"done\":true}\nPATCH /todos/2 -> 400 {\"error\":\"title must be a string\"}\nDELETE /todos/2 -> 204\nDELETE /todos/2 -> 404 {\"error\":\"no todo 2\"}\nGET /todos -> 200 [{\"id\":1,\"title\":\"buy milk\",\"done\":true}]\nGET /users -> 404 not found\n";
+    "POST /todos -> 201 {\"id\":1,\"title\":\"buy milk\",\"done\":false}\nPOST /todos -> 201 {\"id\":2,\"title\":\"write the README\",\"done\":false}\nPOST /todos -> 400 {\"error\":\"a todo needs a title\"}\nGET /todos -> 200 [{\"id\":1,\"title\":\"buy milk\",\"done\":false},{\"id\":2,\"title\":\"write the README\",\"done\":false}]\nPATCH /todos/1 -> 200 {\"id\":1,\"title\":\"buy milk\",\"done\":true}\nGET /todos/1 -> 200 {\"id\":1,\"title\":\"buy milk\",\"done\":true}\nPATCH /todos/2 -> 400 {\"error\":\"`title`: expected a string, found a number\"}\nDELETE /todos/2 -> 204\nDELETE /todos/2 -> 404 {\"error\":\"no todo 2\"}\nGET /todos -> 200 [{\"id\":1,\"title\":\"buy milk\",\"done\":true}]\nGET /users -> 404 not found\n";
   (* std code is checked like user code: a json error names the byte *)
   out "std-json-errors"
     "use json\n\nfn main(root: Root) {\n    for s in [\"\\{\\\"a\\\": [1, 2.5e1, \\\"\\\\u0041\\\"]\\}\", \"[1 2]\", \"\\\"\\\\x\\\"\"] {\n        match json.parse(s) {\n            Ok(v) => root.stdout.print(json.stringify(v)),\n            Err(e) => root.stdout.print(e),\n        }\n    }\n}\n"
@@ -3604,6 +3604,113 @@ fn main(root: Root) {
 }
 |v}
     "{\"id\":9007199254740993,\"x\":1.5}\nSome(Some(9007199254740993)) Some(Some(9007199254740992.0)) true\nOk(Arr([Int(1), Num(-0.0), Num(1.0), Num(100.0), Int(9223372036854775807), Num(9.22337203685478e+18), Int(-9223372036854775808)]))\n";
+  (* json.encode and json.decode: the compiler writes the conversion for
+     each type, through nested structs, enums, lists, maps, tuples and
+     Options, and decoding names where in the document it went wrong *)
+  out "json-encode-decode"
+    {v|use json
+
+struct Todo {
+    id: Int,
+    title: Str,
+    done: Bool,
+    tags: List[Str],
+    note: Option[Str],
+}
+
+enum Shape {
+    Point,
+    Circle(Float),
+    Rect(Float, Float),
+}
+
+struct Pair[A, B] {
+    first: A,
+    second: B,
+}
+
+struct Node {
+    value: Int,
+    next: Option[Node],
+}
+
+struct Doc {
+    todos: List[Todo],
+    shapes: List[Shape],
+    counts: Map[Str, Int],
+    pair: (Int, Str),
+    raw: json.Value,
+    both: Pair[Int, Option[Shape]],
+    chain: Node,
+    result: Result[Int, Str],
+}
+
+fn read(s: Str) -> Result[Todo, Str] {
+    let t: Todo = json.decode(s)?
+    Ok(Todo { id: t.id + 1, title: t.title, done: t.done, tags: t.tags, note: t.note })
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let t = Todo { id: 1, title: "buy milk", done: false, tags: ["home"], note: None }
+    out.print(json.encode(t))
+    let mut counts: Map[Str, Int] = map()
+    counts["a"] = 1
+    let d = Doc {
+        todos: [t],
+        shapes: [Shape.Point, Shape.Circle(1.5), Shape.Rect(2.0, 3.0)],
+        counts,
+        pair: (7, "x"),
+        raw: json.Arr([json.Null, json.Int(1)]),
+        both: Pair { first: 1, second: Some(Shape.Point) },
+        chain: Node { value: 1, next: Some(Node { value: 2, next: None }) },
+        result: Err("no"),
+    }
+    let s = json.encode(d)
+    out.print(s)
+    let back: Result[Doc, Str] = json.decode(s)
+    out.print("round trip: {back == Ok(d)}")
+    out.print("{read("\{\"id\": 2, \"title\": \"x\", \"done\": true, \"tags\": [], \"extra\": 1\}")}")
+    for bad in [
+        "[1]",
+        "\{\"id\": \"2\"\}",
+        "\{\"id\": 2\}",
+        "\{\"id\": 2.5, \"title\": \"x\", \"done\": true, \"tags\": []\}",
+        "\{\"id\": 2, \"title\": \"x\", \"done\": true, \"tags\": [1]\}",
+        "\{\"id\": 2,",
+    ] {
+        out.print("{read(bad)}")
+    }
+    let shapes: Result[List[Shape], Str] = json.decode("[\"Point\", \{\"Circle\": 2\}, \{\"Rect\": [1]\}]")
+    out.print("{shapes}")
+    let other: Result[List[Shape], Str] = json.decode("[\"Square\"]")
+    out.print("{other}")
+    out.print([1, 2].map(json.encode).join(" "))
+}
+|v}
+    "{\"id\":1,\"title\":\"buy milk\",\"done\":false,\"tags\":[\"home\"],\"note\":null}\n{\"todos\":[{\"id\":1,\"title\":\"buy milk\",\"done\":false,\"tags\":[\"home\"],\"note\":null}],\"shapes\":[\"Point\",{\"Circle\":1.5},{\"Rect\":[2,3]}],\"counts\":{\"a\":1},\"pair\":[7,\"x\"],\"raw\":[null,1],\"both\":{\"first\":1,\"second\":\"Point\"},\"chain\":{\"value\":1,\"next\":{\"value\":2,\"next\":null}},\"result\":{\"Err\":\"no\"}}\nround trip: true\nOk(Todo { id: 3, title: \"x\", done: true, tags: [], note: None })\nErr(\"expected an object, found an array\")\nErr(\"`id`: expected a whole number, found a string\")\nErr(\"`title` is missing\")\nErr(\"`id`: expected a whole number, found a number\")\nErr(\"`tags[0]`: expected a string, found a number\")\nErr(\"expected a string key at byte 9\")\nErr(\"`[2].Rect`: expected an array of 2 items, found an array\")\nErr(\"`[0]`: no variant `Square`; expected one of `Point`, `Circle`, `Rect`\")\n1 2\n";
+  (* the type must be known where they are used, and must have a JSON form *)
+  errs "json-encode-errors"
+    {v|use json
+struct H { out: Stdout, n: Int }
+fn g[T](x: T) -> Str { json.encode(x) }
+fn main(root: Root) {
+    root.stdout.print(json.encode(H { out: root.stdout, n: 1 }))
+    root.stdout.print(g(1))
+    let r = json.decode("1")
+    let m: Map[Int, Str] = map()
+    root.stdout.print(json.encode(m))
+}
+|v}
+    [ "E0212"; "E0212"; "E0212"; "E0212" ];
+  says "json-encode-says"
+    {v|use json
+struct H { out: Stdout, n: Int }
+fn main(root: Root) {
+    root.stdout.print(json.encode(H { out: root.stdout, n: 1 }))
+}
+|v}
+    "E0212" "it holds `Stdout`";
   (* a group's finished () tasks are freed as they end, natively and in the
      interpreter, without changing what the group returns or passes on *)
   out "group-frees-unit-tasks"

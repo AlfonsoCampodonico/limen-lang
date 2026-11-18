@@ -1,0 +1,524 @@
+// `json.encode(x)` and `json.decode(s)`: the compiler writes the
+// conversion, as src/derive.ml does.
+//
+// The standard json module declares both as generic functions whose
+// bodies never run, so the checker types every use like any call. Once a
+// program has checked, this pass finds each use, takes the type it was used
+// at, and writes ordinary Limen functions for that type and every type
+// inside it, into the json module: `json.to$N(x: T) -> json.Value` and
+// `json.from$N(v: json.Value, at: Str) -> Result[T, Str]`, built from the
+// helpers at the end of json.lmn. Each use is pointed at a wrapper,
+// `json.encode$N` or `json.decode$N`, and the program is checked again with
+// the new functions. The functions come out in the order src/derive.ml
+// writes them, so both compilers emit the same C.
+use ast
+use diag
+use env
+use ids
+use typecheck
+use types
+use walk
+
+// What has been written so far.
+struct Gen {
+    // the json module's name in this program: "json" or "std/json"
+    q: Str,
+    // the use being expanded, for every node written
+    sp: ast.Span,
+    structs: Map[Str, ast.StructDecl],
+    enums: Map[Str, ast.EnumDecl],
+    // a type, shown, and its number
+    names: Map[Str, Int],
+    count: Int,
+    // the functions written, in order
+    out: List[ast.Item],
+    subst: types.Subst,
+}
+
+// A type without its JSON form: what holds it, and the state when it was
+// found (src/derive.ml raises Unsupported, keeping what it wrote).
+struct Fail {
+    what: Str,
+    g: Gen,
+}
+
+fn ex(g: Gen, d: ast.ExprDesc) -> ast.Expr {
+    ast.Expr { desc: d, span: g.sp, id: 0 }
+}
+
+fn var(g: Gen, n: Str) -> ast.Expr {
+    ex(g, EVar(n))
+}
+
+fn call(g: Gen, f: Str, args: List[ast.Expr]) -> ast.Expr {
+    ex(g, ECall(var(g, f), args))
+}
+
+fn text(g: Gen, s: Str) -> ast.Expr {
+    ex(g, EStr([SPLit(s)]))
+}
+
+fn num(g: Gen, n: Int) -> ast.Expr {
+    ex(g, EInt(n))
+}
+
+fn jf(g: Gen, n: Str) -> Str {
+    g.q + "." + n
+}
+
+fn te(g: Gen, d: ast.TyDesc) -> ast.TyExpr {
+    ast.TyExpr { desc: d, span: g.sp }
+}
+
+fn pat(g: Gen, d: ast.PatDesc) -> ast.Pat {
+    ast.Pat { desc: d, span: g.sp }
+}
+
+fn only(g: Gen, e: ast.Expr) -> ast.Block {
+    ast.Block { stmts: [], tail: Some(e), span: g.sp }
+}
+
+fn try_(g: Gen, e: ast.Expr) -> ast.Expr {
+    ex(g, ETry(e, None))
+}
+
+fn ok(g: Gen, e: ast.Expr) -> ast.Expr {
+    call(g, "Ok", [e])
+}
+
+fn let_(g: Gen, n: Str, e: ast.Expr) -> ast.Stmt {
+    ast.Stmt { desc: SLet(false, n, g.sp, None, e), span: g.sp }
+}
+
+fn show(g: Gen, t: types.Ty) -> Str {
+    g.subst.show(t)
+}
+
+fn quoted(g: Gen, t: types.Ty) -> Str {
+    "`{show(g, t)}`"
+}
+
+// A type as written, for a generated function's parameters and result.
+fn written(g: Gen, t: types.Ty) -> Result[ast.TyExpr, Str] {
+    match t {
+        TInt => Ok(te(g, TyName("Int", []))),
+        TFloat => Ok(te(g, TyName("Float", []))),
+        TBool => Ok(te(g, TyName("Bool", []))),
+        TStr => Ok(te(g, TyName("Str", []))),
+        TUnit => Ok(te(g, TyUnit)),
+        TList(a) => Ok(te(g, TyName("List", [written(g, a)?]))),
+        TMap(k, v) => Ok(te(g, TyName("Map", [written(g, k)?, written(g, v)?]))),
+        TNamed(n, args) => Ok(te(g, TyName(n, written_all(g, args)?))),
+        _ => Err(show(g, t)),
+    }
+}
+
+fn written_all(g: Gen, ts: List[types.Ty]) -> Result[List[ast.TyExpr], Str] {
+    let mut out: List[ast.TyExpr] = []
+    for x in ts {
+        out.push(written(g, x)?)
+    }
+    Ok(out)
+}
+
+// The type of a declared field or payload, with the declaration's type
+// parameters replaced by `env`.
+fn field_ty(env: List[(Str, types.Ty)], t: ast.TyExpr) -> Result[types.Ty, Str] {
+    match t.desc {
+        TyUnit => Ok(TUnit),
+        TyName(n, []) if env.any(|p| p.0 == n) => Ok(env.find(|p| p.0 == n).map(|p| p.1) ?? TErr),
+        TyName("Int", []) => Ok(TInt),
+        TyName("Float", []) => Ok(TFloat),
+        TyName("Bool", []) => Ok(TBool),
+        TyName("Str", []) => Ok(TStr),
+        TyName("Bytes", []) => Ok(TBytes),
+        TyName("List", [a]) => Ok(TList(field_ty(env, a)?)),
+        TyName("Map", [k, v]) => Ok(TMap(field_ty(env, k)?, field_ty(env, v)?)),
+        TyName(n, _) if is_cap(n) => Err("`{n}`"),
+        TyName(n, _) if ["Array", "dyn", "Chan", "Atomic", "Shared", "Group"].contains(n) => Err("`{n}`"),
+        TyName(n, args) => {
+            let mut out: List[types.Ty] = []
+            for a in args {
+                out.push(field_ty(env, a)?)
+            }
+            Ok(TNamed(n, out))
+        },
+        TyFn(..) => Err("a function"),
+        TyInt(_) => Err("a number"),
+    }
+}
+
+fn is_cap(n: Str) -> Bool {
+    ["Root", "Net", "Fs", "Stdout", "Stderr", "Clock", "Listen", "Listener", "Conn", "Rand", "Stdin", "Env", "Exec", "Foreign", "Revoker"].contains(n)
+}
+
+fn fn_item(g: Gen, name: Str, params: List[ast.Param], ret: ast.TyExpr, body: ast.Block) -> ast.Item {
+    IFn(ast.FnDecl { name, span: g.sp, generics: [], params, ret: Some(ret), body, test: None, bench: false, virtual: false, table: None, public: false, bounds: [], foreign: None })
+}
+
+fn param(g: Gen, n: Str, t: ast.TyExpr) -> ast.Param {
+    ast.Param { name: n, span: g.sp, ty: t }
+}
+
+fn value_ty(g: Gen) -> types.Ty {
+    TNamed(jf(g, "Value"), [])
+}
+
+// The encoder and decoder of `t`, as function names: a helper of
+// json.lmn for the simple types, written ones otherwise.
+fn coders(g: Gen, t: types.Ty) -> Result[((Str, Str), Gen), Fail] {
+    match t {
+        TInt => Ok(((jf(g, "of_int"), jf(g, "from_int")), g)),
+        TFloat => Ok(((jf(g, "of_float"), jf(g, "from_float")), g)),
+        TStr => Ok(((jf(g, "of_str"), jf(g, "from_str")), g)),
+        TBool => Ok(((jf(g, "of_bool"), jf(g, "from_bool")), g)),
+        TNamed(n, []) if n == jf(g, "Value") => Ok(((jf(g, "of_value"), jf(g, "from_value")), g)),
+        _ => {
+            let key = show(g, t)
+            match g.names.get(key) {
+                Some(k) => Ok(((jf(g, "to${k}"), jf(g, "from${k}")), g)),
+                None => {
+                    let mut g = g
+                    g.count = g.count + 1
+                    let k = g.count
+                    g.names[key] = k
+                    let to = jf(g, "to${k}")
+                    let from = jf(g, "from${k}")
+                    let ((enc, dec), g2) = bodies(g, t)?
+                    let mut g = g2
+                    let fail = |what: Str| Fail { what, g }
+                    let vt = match written(g, value_ty(g)) {
+                        Ok(x) => x,
+                        Err(w) => { return Err(fail(w)) },
+                    }
+                    let tt = match written(g, t) {
+                        Ok(x) => x,
+                        Err(w) => { return Err(fail(w)) },
+                    }
+                    let rt = match written(g, TNamed("Result", [t, TStr])) {
+                        Ok(x) => x,
+                        Err(w) => { return Err(fail(w)) },
+                    }
+                    let st = match written(g, TStr) {
+                        Ok(x) => x,
+                        Err(w) => { return Err(fail(w)) },
+                    }
+                    g.out = g.out + [fn_item(g, to, [param(g, "x", tt)], vt, enc), fn_item(g, from, [param(g, "v", vt), param(g, "at", st)], rt, dec)]
+                    Ok(((to, from), g))
+                },
+            }
+        },
+    }
+}
+
+fn encoder(g: Gen, t: types.Ty) -> Result[(Str, Gen), Fail] {
+    let ((e, _), g) = coders(g, t)?
+    Ok((e, g))
+}
+
+fn decoder(g: Gen, t: types.Ty) -> Result[(Str, Gen), Fail] {
+    let ((_, d), g) = coders(g, t)?
+    Ok((d, g))
+}
+
+fn unsupported(g: Gen, what: Str) -> Fail {
+    Fail { what, g }
+}
+
+fn fields_of(g: Gen, env: List[(Str, types.Ty)], tys: List[ast.TyExpr]) -> Result[List[types.Ty], Fail] {
+    let mut out: List[types.Ty] = []
+    for t in tys {
+        match field_ty(env, t) {
+            Ok(x) => out.push(x),
+            Err(w) => { return Err(unsupported(g, w)) },
+        }
+    }
+    Ok(out)
+}
+
+// `n` values from an array of exactly `n` items at `at`, decoded by the
+// decoders of `tys`: a `let` of the items, and the expressions.
+fn items_of(g: Gen, v: ast.Expr, at: ast.Expr, tys: List[types.Ty]) -> Result[((ast.Stmt, List[ast.Expr]), Gen), Fail] {
+    let s = let_(g, "items", try_(g, call(g, jf(g, "from_items"), [v, at, num(g, tys.len())])))
+    let mut g = g
+    let mut es: List[ast.Expr] = []
+    let mut i = 0
+    for t in tys {
+        let (d, g2) = decoder(g, t)?
+        g = g2
+        es.push(try_(g, call(g, d, [ex(g, EIndex(var(g, "items"), num(g, i))), call(g, jf(g, "item_at"), [at, num(g, i)])])))
+        i = i + 1
+    }
+    Ok(((s, es), g))
+}
+
+// The bodies of `t`'s encoder (of `x`) and decoder (of `v` at `at`).
+fn bodies(g: Gen, t: types.Ty) -> Result[((ast.Block, ast.Block), Gen), Fail] {
+    let x = var(g, "x")
+    let v = var(g, "v")
+    let at = var(g, "at")
+    match t {
+        TNamed("Option", [a]) => {
+            let ((e, d), g) = coders(g, a)?
+            Ok(((only(g, call(g, jf(g, "of_option"), [x, var(g, e)])), only(g, call(g, jf(g, "from_option"), [v, at, var(g, d)]))), g))
+        },
+        TList(a) => {
+            let ((e, d), g) = coders(g, a)?
+            Ok(((only(g, call(g, jf(g, "of_list"), [ex(g, EMethod(x, "map", g.sp, [var(g, e)]))])), only(g, call(g, jf(g, "from_list"), [v, at, var(g, d)]))), g))
+        },
+        TMap(k, a) => match k {
+            TStr => {
+                let ((e, d), g) = coders(g, a)?
+                Ok(((only(g, call(g, jf(g, "of_map"), [x, var(g, e)])), only(g, call(g, jf(g, "from_map"), [v, at, var(g, d)]))), g))
+            },
+            _ => Err(unsupported(g, "{quoted(g, t)} (a map's keys must be `Str`)")),
+        },
+        TNamed(n, args) if ast.is_tuple_name(n) => {
+            let mut g = g
+            let mut parts: List[ast.Expr] = []
+            let mut i = 0
+            for a in args {
+                let (e, g2) = encoder(g, a)?
+                g = g2
+                parts.push(call(g, e, [ex(g, EField(x, "{i}", g.sp))]))
+                i = i + 1
+            }
+            let enc = call(g, jf(g, "of_list"), [ex(g, EList(parts))])
+            let ((s, es), g) = items_of(g, v, at, args)?
+            let mut inits: List[ast.FieldInit] = []
+            let mut j = 0
+            for e in es {
+                inits.push(ast.FieldInit { name: "{j}", span: g.sp, value: e })
+                j = j + 1
+            }
+            Ok(((only(g, enc), ast.Block { stmts: [s], tail: Some(ok(g, ex(g, EStruct(n, g.sp, inits)))), span: g.sp }), g))
+        },
+        TNamed(n, args) if g.structs.contains(n) => {
+            let sd = g.structs[n]
+            let env = sd.generics.zip(args)
+            let fts = fields_of(g, env, sd.fields.map(|f| f.ty))?
+            let fs = sd.fields.map(|f| f.name).zip(fts)
+            let mut g = g
+            let mut members: List[ast.Expr] = []
+            for (f, ft) in fs {
+                let (e, g2) = encoder(g, ft)?
+                g = g2
+                members.push(call(g, jf(g, "field"), [text(g, f), call(g, e, [ex(g, EField(x, f, g.sp))])]))
+            }
+            let enc = call(g, jf(g, "of_fields"), [ex(g, EList(members))])
+            let check = ast.Stmt { desc: SExpr(try_(g, call(g, jf(g, "need_object"), [v, at]))), span: g.sp }
+            let mut inits: List[ast.FieldInit] = []
+            for (f, ft) in fs {
+                let (d, g2) = decoder(g, ft)?
+                g = g2
+                inits.push(ast.FieldInit { name: f, span: g.sp, value: try_(g, call(g, jf(g, "member"), [v, at, text(g, f), var(g, d)])) })
+            }
+            Ok(((only(g, enc), ast.Block { stmts: [check], tail: Some(ok(g, ex(g, EStruct(n, g.sp, inits)))), span: g.sp }), g))
+        },
+        TNamed(n, args) if g.enums.contains(n) => {
+            let ed = g.enums[n]
+            let env = ed.generics.zip(args)
+            let mut vs: List[(Str, List[types.Ty])] = []
+            for vr in ed.variants {
+                vs.push((vr.name, fields_of(g, env, vr.payload)?))
+            }
+            let mut g = g
+            let mut arms: List[ast.Arm] = []
+            for (vn, ts) in vs {
+                let names = ts.len() |> names_for
+                let body = if ts.is_empty() {
+                    call(g, jf(g, "of_str"), [text(g, vn)])
+                } else if ts.len() == 1 {
+                    let (e, g2) = encoder(g, ts[0])?
+                    g = g2
+                    call(g, jf(g, "of_variant"), [text(g, vn), call(g, e, [var(g, "p0")])])
+                } else {
+                    let mut parts: List[ast.Expr] = []
+                    let mut i = 0
+                    for a in ts {
+                        let (e, g2) = encoder(g, a)?
+                        g = g2
+                        parts.push(call(g, e, [var(g, names[i])]))
+                        i = i + 1
+                    }
+                    call(g, jf(g, "of_variant"), [text(g, vn), call(g, jf(g, "of_list"), [ex(g, EList(parts))])])
+                }
+                arms.push(ast.Arm { pat: pat(g, PVariant(Some(n), vn, names.map(|p| pat(g, PBind(p))))), guard: None, body })
+            }
+            let enc = ex(g, EMatch(x, arms))
+            let got = var(g, "got")
+            let name = ex(g, EField(got, "0", g.sp))
+            let payload = ex(g, EField(got, "1", g.sp))
+            let inner = call(g, jf(g, "inside"), [at, name])
+            let mut darms: List[ast.Arm] = []
+            for (vn, ts) in vs {
+                let made = if ts.is_empty() {
+                    ok(g, ex(g, EField(var(g, n), vn, g.sp)))
+                } else if ts.len() == 1 {
+                    let (d, g2) = decoder(g, ts[0])?
+                    g = g2
+                    ok(g, ex(g, EMethod(var(g, n), vn, g.sp, [try_(g, call(g, d, [payload, inner]))])))
+                } else {
+                    let ((s, es), g2) = items_of(g, payload, inner, ts)?
+                    g = g2
+                    ex(g, EBlock(ast.Block { stmts: [s], tail: Some(ok(g, ex(g, EMethod(var(g, n), vn, g.sp, es)))), span: g.sp }))
+                }
+                darms.push(ast.Arm { pat: pat(g, PStr(vn)), guard: None, body: made })
+            }
+            let names = vs.map(|p| "`{p.0}`").join(", ")
+            let other = ast.Arm { pat: pat(g, PWild), guard: None, body: call(g, "Err", [call(g, jf(g, "no_variant"), [at, name, text(g, names)])]) }
+            let s = let_(g, "got", try_(g, call(g, jf(g, "from_variant"), [v, at])))
+            Ok(((only(g, enc), ast.Block { stmts: [s], tail: Some(ex(g, EMatch(name, darms + [other]))), span: g.sp }), g))
+        },
+        _ => Err(unsupported(g, quoted(g, t))),
+    }
+}
+
+fn names_for(n: Int) -> List[Str] {
+    (0..<n).map(|i| "p{i}")
+}
+
+// A type with every variable the checker linked replaced by its type.
+fn deep(s: types.Subst, t: types.Ty) -> types.Ty {
+    let all = |ts: List[types.Ty]| ts.map(|x| deep(s, x))
+    match s.repr(t) {
+        TList(a) => TList(deep(s, a)),
+        TChan(a) => TChan(deep(s, a)),
+        TShared(a) => TShared(deep(s, a)),
+        TGroup(a) => TGroup(deep(s, a)),
+        TMap(a, b) => TMap(deep(s, a), deep(s, b)),
+        TArray(a, b) => TArray(deep(s, a), deep(s, b)),
+        TNamed(n, args) => TNamed(n, all(args)),
+        TDyn(n, args) => TDyn(n, all(args)),
+        TFn(ps, r) => TFn(all(ps), deep(s, r)),
+        other => other,
+    }
+}
+
+// Is the type known all the way down?
+fn concrete(t: types.Ty) -> Bool {
+    match t {
+        TParam(_) | TVar(_) => false,
+        TList(a) | TChan(a) | TShared(a) | TGroup(a) => concrete(a),
+        TMap(a, b) | TArray(a, b) => concrete(a) && concrete(b),
+        TNamed(_, args) | TDyn(_, args) => args.all(concrete),
+        TFn(ps, r) => ps.all(concrete) && concrete(r),
+        _ => true,
+    }
+}
+
+// What expanding a checked program gives: its items with every use pointed
+// at its conversion and the conversions added, the problems, and the id the
+// next expression can have.
+pub struct Expanded {
+    items: List[ast.Item],
+    diags: List[diag.Diag],
+    next_id: Int,
+}
+
+// The loaded program's `items`, which checked as `c`, with `json.encode`
+// and `json.decode` pointed at their conversions; None when it uses
+// neither. `json` is the json module's name in the program. The items are
+// the loaded ones, not the checker's rewritten ones, so checking the result
+// is checking a new program; the uses keep their ids, which `c` knows.
+pub fn expand(json: Str, items: List[ast.Item], c: typecheck.Checked) -> Option[Expanded] {
+    let encode = json + ".encode"
+    let decode = json + ".decode"
+    let mut structs: Map[Str, ast.StructDecl] = map()
+    let mut enums: Map[Str, ast.EnumDecl] = map()
+    // the prelude's types too: Result is an enum like any other
+    for i in c.prelude + items {
+        match i {
+            IStruct(s) => {
+                structs[s.name] = s
+            },
+            IEnum(e) => {
+                enums[e.name] = e
+            },
+            _ => {},
+        }
+    }
+    let mut g = Gen { q: json, sp: ast.Span { file: 0, lo: 0, hi: 0 }, structs, enums, names: map(), count: 0, out: [], subst: c.state.subst }
+    let mut wrappers: Map[Str, Str] = map()
+    let mut diags: List[diag.Diag] = []
+    let mut rewrites: Map[Int, ast.ExprDesc] = map()
+    let mut found = false
+    // a table test's case, then the body
+    for e in items.flat_map(fn_exprs) {
+        match e.desc {
+            EVar(n) if n == encode || n == decode => {
+                found = true
+                g.sp = e.span
+                let t = match c.state.insts.get(e.id) {
+                    Some([(_, t)]) => deep(c.state.subst, t),
+                    _ => TErr,
+                }
+                let what = if n == encode { "json.encode" } else { "json.decode" }
+                if !concrete(t) {
+                    let it = match t {
+                        TParam(p) => "the type parameter `{p}`",
+                        _ => "not known yet",
+                    }
+                    let note = if n == decode { "say the type: `let t: Todo = json.decode(s)?`" } else { "convert where the type is known, and pass the text" }
+                    diags.push(diag.error("E0212", e.span, "`{what}` needs to know the type it converts here, and it is {it}").note(note))
+                } else {
+                    let key = what + " " + show(g, t)
+                    match wrappers.get(key) {
+                        Some(w) => {
+                            rewrites[e.id] = EVar(w)
+                        },
+                        None => match coders(g, t) {
+                            Ok(((to, from), g2)) => {
+                                g = g2
+                                let kind = if n == encode { "encode" } else { "decode" }
+                                let w = jf(g, "{kind}${wrappers.len() + 1}")
+                                // the types here have a JSON form, so they can be written
+                                let written_t = written(g, t) ?? te(g, TyUnit)
+                                let str_t = te(g, TyName("Str", []))
+                                let item = if n == encode {
+                                    fn_item(g, w, [param(g, "x", written_t)], str_t, only(g, call(g, jf(g, "stringify"), [call(g, to, [var(g, "x")])])))
+                                } else {
+                                    let rt = written(g, TNamed("Result", [t, TStr])) ?? te(g, TyUnit)
+                                    fn_item(g, w, [param(g, "s", str_t)], rt, only(g, call(g, jf(g, "from_text"), [var(g, "s"), var(g, from)])))
+                                }
+                                g.out = g.out + [item]
+                                wrappers[key] = w
+                                rewrites[e.id] = EVar(w)
+                            },
+                            Err(f) => {
+                                g = f.g
+                                let msg = if f.what == quoted(g, t) {
+                                    "`{what}` cannot convert {quoted(g, t)}: it has no JSON form"
+                                } else {
+                                    "`{what}` cannot convert {quoted(g, t)}: it holds {f.what}, which has no JSON form"
+                                }
+                                diags.push(diag.error("E0212", e.span, msg).note("JSON holds Int, Float, Str, Bool, json.Value, Option, List, Map with Str keys, tuples, and structs and enums of those"))
+                            },
+                        },
+                    }
+                }
+            },
+            _ => {},
+        }
+    }
+    if !found {
+        return None
+    }
+    let items = typecheck.rewrite_items({ c.state with rewrites }, items)
+    let mut next = c.state.next_id
+    let mut more: List[ast.Item] = []
+    for i in g.out {
+        let (i2, n2) = ids.item(i, next)
+        more.push(i2)
+        next = n2
+    }
+    Some(Expanded { items: items + more, diags, next_id: next })
+}
+
+fn fn_exprs(i: ast.Item) -> List[ast.Expr] {
+    match i {
+        IFn(d) => (d.table.map(|t| walk.expr(t.cases)) ?? []) + walk.block(d.body),
+        _ => [],
+    }
+}
+

@@ -1859,6 +1859,10 @@ match start(root.fs) {
 | `quote(s) -> Str` | a JSON string literal |
 | `v.get(key)`, `v.at(i)` | methods: `Option[Value]`, an object member or an array item |
 | `v.as_str()`, `as_num()`, `as_int()`, `as_bool()`, `as_list()` | methods: `Option` of the payload, `None` for another kind; `as_num` reads an `Int` too, and `as_int` a `Num` that is a whole number |
+| `encode(x) -> Str` | the JSON text for any value whose type is made of `Int`, `Float`, `Str`, `Bool`, `Value`, `Option`, `List`, `Map` with `Str` keys, tuples, and structs and enums of those. A struct is an object with its fields in declared order; `None` is `null`; a tuple is an array; an enum's unit variant is its name as a string, `"Point"`, and a variant with a payload an object with one member, `{"Circle": 1.5}`, or for several items `{"Rect": [2, 3]}` |
+| `decode(s) -> Result[T, Str]` | reads such a value back: `let t: Todo = json.decode(body)?`. Members the struct does not have are ignored; a missing one reads as `null`, so an `Option` field may be left out and any other is an error. The error says where: "`todos[2].title`: expected a string, found a number", "`id` is missing" |
+
+The compiler writes the conversions for each type `encode` and `decode` are used with, as ordinary functions, so the type must be known where they are used: `let r = json.decode(s)` alone, or `json.encode(x)` inside a generic function where `x` has a type parameter's type, is E0212. So is a type with no JSON form, one holding a capability, a function, a channel, `Bytes`, an array or a `dyn` value, with the message saying which part.
 
 ### http
 
