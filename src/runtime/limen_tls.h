@@ -15,6 +15,7 @@
    without Homebrew) and its name or IP
    address against the host that was dialled. Servers do not ask for client
    certificates. TLS 1.2 is the minimum both ways. */
+#include <limits.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/pem.h>
@@ -266,6 +267,9 @@ static int vcrypto(int op, const unsigned char *a, size_t an, const unsigned cha
     if (an != 32) { snprintf(err, en, "crypto: a key is 32 bytes, not %zu", an); return -1; }
     if (bn != 12) { snprintf(err, en, "crypto: a nonce is 12 bytes, not %zu", bn); return -1; }
     if (op == 2 && dn < 16) { snprintf(err, en, "crypto: the message is shorter than its tag"); return -1; }
+    /* OpenSSL takes an int length: refuse what it cannot take whole, so
+       nothing is left unencrypted or uninitialised */
+    if (cn > (size_t)INT_MAX || dn > (size_t)INT_MAX - 32) { snprintf(err, en, "crypto: at most 2 GB at a time"); return -1; }
     size_t textn = op == 1 ? dn : dn - 16;
     unsigned char *o = (unsigned char *)malloc(textn + 16 + 1);
     EVP_CIPHER_CTX *x = EVP_CIPHER_CTX_new();
@@ -274,7 +278,7 @@ static int vcrypto(int op, const unsigned char *a, size_t an, const unsigned cha
     ok = ok && EVP_CIPHER_CTX_ctrl(x, EVP_CTRL_AEAD_SET_IVLEN, 12, NULL) == 1;
     ok = ok && EVP_CipherInit_ex(x, NULL, NULL, a, b, op == 1) == 1;
     ok = ok && (cn == 0 || EVP_CipherUpdate(x, NULL, &len, c, (int)cn) == 1);
-    ok = ok && (textn == 0 || EVP_CipherUpdate(x, o, &len, d, (int)textn) == 1);
+    ok = ok && (textn == 0 || (EVP_CipherUpdate(x, o, &len, d, (int)textn) == 1 && (size_t)len == textn));
     if (ok && op == 2) ok = EVP_CIPHER_CTX_ctrl(x, EVP_CTRL_AEAD_SET_TAG, 16, (void *)(d + textn)) == 1;
     int fin = ok ? EVP_CipherFinal_ex(x, o + textn, &len) : 0;
     if (ok && op == 1 && fin == 1) ok = EVP_CIPHER_CTX_ctrl(x, EVP_CTRL_AEAD_GET_TAG, 16, o + textn) == 1;
