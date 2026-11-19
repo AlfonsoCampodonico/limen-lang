@@ -133,6 +133,16 @@ compare_dev_c() {
   same "$1/$2"
 }
 
+# compare_profile_c DIR FILE: the C of a build with --profile
+compare_profile_c() {
+  rm -f "$out/cw.c" "$out/cg.c"
+  (cd "$1" && "$limen_abs" build "$2" --emit-c --profile -o "$out/cw") > "$out/want" 2> "$out/want.err" && echo "exit 0" >> "$out/want" || echo "exit $?" >> "$out/want"
+  (cd "$1" && tsc build "$2" --emit-c --profile -o "$out/cg") > "$out/got" 2> "$out/got.err" && echo "exit 0" >> "$out/got" || echo "exit $?" >> "$out/got"
+  if [ -f "$out/cw.c" ]; then cat "$out/cw.c" >> "$out/want"; fi
+  if [ -f "$out/cg.c" ]; then cat "$out/cg.c" >> "$out/got"; fi
+  same "$1/$2"
+}
+
 # compare_test_c DIR FILE: the test binary's C, from selfhost/cdump and
 # from `build --emit-c --tests`
 compare_test_c() {
@@ -230,6 +240,7 @@ check "files compile to the same C" compare_c -- $programs
 check "edge cases compile to the same C" compare_c -- $c_cases
 check "edge cases compile to the same development C" compare_dev_c -- $c_cases
 check "examples compile to the same development C" compare_dev_c -- $(ls examples/*.lmn)
+check "edge cases compile to the same profiled C" compare_profile_c -- $c_cases
 with_tests=$(grep -l '^test \|^bench ' $programs $c_cases)
 check "test binaries compile to the same C" compare_test_c -- $with_tests
 if [ -d "$book" ]; then

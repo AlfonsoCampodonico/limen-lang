@@ -29,6 +29,8 @@ pub struct Ro {
     // whether to mark where each Limen statement starts (ir.Line), for
     // `#line` in the C of a development build
     lines: Bool,
+    // `--profile`: count calls and sample the CPU, function by function
+    profile: Bool,
     fns: Map[Str, ast.FnDecl],
     structs: Map[Str, ast.StructDecl],
     enums: Map[Str, ast.EnumDecl],
@@ -2056,7 +2058,7 @@ fn lower_fn(self: Lx, job: Job) -> (ir.Fn, Lx) {
 // The checked program (its prelude, then its own items, as the checker
 // returned them) in the IR. With `tests`, the program is its tests and
 // benchmarks instead of `main`.
-pub fn lower_program(checked_prelude: List[ast.Item], user_items: List[ast.Item], cx: env.Cx, st: env.State, tests: Bool, lines: Bool) -> (ir.Program, Ro) {
+pub fn lower_program(checked_prelude: List[ast.Item], user_items: List[ast.Item], cx: env.Cx, st: env.State, tests: Bool, lines: Bool, profile: Bool = false) -> (ir.Program, Ro) {
     let mut fns: Map[Str, ast.FnDecl] = map()
     let mut structs: Map[Str, ast.StructDecl] = map()
     let mut enums: Map[Str, ast.EnumDecl] = map()
@@ -2086,7 +2088,7 @@ pub fn lower_program(checked_prelude: List[ast.Item], user_items: List[ast.Item]
             ctors[v] = first_owner[v]
         }
     }
-    let ro = Ro { lines, fns, structs, enums, ctors, types: st.types, insts: st.insts, nested: st.nested, subst: st.subst, ifaces: cx.ifaces, iface_gen: cx.iface_gen }
+    let ro = Ro { lines, profile, fns, structs, enums, ctors, types: st.types, insts: st.insts, nested: st.nested, subst: st.subst, ifaces: cx.ifaces, iface_gen: cx.iface_gen }
     let mut lx = Lx { ro, instances: map(), queue: [], next_job: 0, out: [], counter: 0, vars: 0, guards: 0, cur: new_frame([], TUnit), parents: [], pure_fns: [] }
     let field = |p: ast.Param| match p.ty.desc {
         TyName("Fs", _) => "fs",

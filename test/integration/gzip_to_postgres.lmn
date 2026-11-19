@@ -1,0 +1,51 @@
+use postgres
+use stream
+
+struct Line {
+    level: Str,
+    took: Int,
+}
+
+// a batch of rows waiting to be written, and how many went in so far
+struct Batch {
+    rows: List[Line],
+    written: Int,
+}
+
+fn parse(line: Str) -> Line {
+    let words = line.split(" ")
+    Line { level: words[1], took: words[5].parse_int() ?? 0 }
+}
+
+fn flush(db: postgres.Db, b: Batch) -> Batch {
+    if b.rows.is_empty() {
+        return b
+    }
+    let mut params: List[postgres.Value] = []
+    let mut marks: List[Str] = []
+    for (i, r) in b.rows.with_index() {
+        params = params + postgres.values(r)
+        marks.push("(${2 * i + 1}, ${2 * i + 2})")
+    }
+    match db.exec("INSERT INTO lines (level, took) VALUES {marks.join(", ")}", params) {
+        Ok(_) => Batch { rows: [], written: b.written + b.rows.len() },
+        Err(e) => panic("insert: {e}"),
+    }
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let db = postgres.connect(root.net, root.rand, "postgres://app:secret@localhost:PGTLSPORT/app")?
+    db.exec("DROP TABLE IF EXISTS lines; CREATE TABLE lines (level TEXT NOT NULL, took INT NOT NULL)")?
+    let start = Batch { rows: [], written: 0 }
+    let done = db.transaction(|| stream.fold_gzip_lines(root.fs, "big.log.gz", start, |b, line| {
+        let mut next = { b with rows: b.rows + [parse(line)] }
+        if next.rows.len() == 1000 {
+            next = flush(db, next)
+        }
+        next
+    }))?
+    let last = flush(db, done)
+    let count = db.query_one("SELECT count(*) AS n, count(*) FILTER (WHERE level = 'ERROR') AS errors FROM lines")?
+    root.stdout.print("wrote {last.written} rows; the table has {count.map(|r| r.int("n")) ?? None} rows, {count.map(|r| r.int("errors")) ?? None} errors")
+    Ok(())
+}

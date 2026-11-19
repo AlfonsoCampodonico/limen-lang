@@ -259,6 +259,9 @@ let under fs rel =
   | Some root -> ( match fs_op 8 fs.top root rel "" with 0, r -> { fs with root = Some r } | _ -> { fs with root = None })
 
 let read fs rel : (string, ioerr) result = op fs 0 rel ""
+
+(* Up to [n] bytes of [rel] from [off]: a piece of a file larger than memory. *)
+let read_at fs rel off n : (string, ioerr) result = op fs 9 rel (Printf.sprintf "%Ld %Ld" off n)
 let write fs rel data : (unit, ioerr) result = Result.map ignore (write_op fs 1 rel data)
 let append fs rel data : (unit, ioerr) result = Result.map ignore (write_op fs 2 rel data)
 

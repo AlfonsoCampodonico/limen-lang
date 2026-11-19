@@ -1,0 +1,12 @@
+fn upgrade(net: Net) -> Result[Str, IoError] {
+    let c = net.connect("db.internal:5432")?
+    c.write("ask for TLS")?
+    c.start_tls("db.internal")?
+    c.write("over TLS now")?
+    c.read()
+}
+
+fn main(root: Root) {
+    root.stdout.print("{upgrade(root.net)}")
+    root.stdout.print("{root.fs.read_at("big.bin", 1_000_000, 4096)}")
+}

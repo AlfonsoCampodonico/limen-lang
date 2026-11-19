@@ -13,8 +13,12 @@
 // default since Postgres 14), where the server proves it knows the
 // password too; the nonce comes from `Rand`. MD5 and cleartext logins send
 // what an impostor could reuse or read, so they are refused unless the
-// caller asks for them with `weak_login: true`. Connections are plain TCP: TLS is not supported
-// yet.
+// caller asks for them with `weak_login: true`.
+//
+// The connection is TLS, with the server's certificate checked against its
+// host name, unless the address ends in `?sslmode=disable`: Postgres asks
+// for TLS inside the plain connection (SSLRequest), and the client starts
+// it there with `Conn.start_tls`.
 //
 // A `Db` is one connection, used by one task at a time: a query is a
 // request and its whole answer. For a server, `postgres.pool` opens a few
@@ -71,7 +75,22 @@ pub fn connect(net: Net, rand: Rand, address: Str, weak_login: Bool = false) -> 
     let path = if u.path.starts_with("/") { u.path.slice(1, u.path.len()) } else { u.path }
     let database = if path == "" { user } else { url.decode(path) ?? path }
     let host = if u.host.contains(":") { "[{u.host}]" } else { u.host }
+    let plain = match sslmode(u.query) {
+        Ok(p) => p,
+        Err(e) => {
+            return Err(Failed(e))
+        },
+    }
     let conn = net.connect("{host}:{u.port ?? 5432}")?
+    if !plain {
+        match start_tls(conn, u.host) {
+            Ok(_) => {},
+            Err(e) => {
+                conn.close()
+                return Err(e)
+            },
+        }
+    }
     let db = Db { conn }
     match db.log_in(rand, user, password, database, weak_login) {
         Ok(_) => Ok(db),
@@ -79,6 +98,38 @@ pub fn connect(net: Net, rand: Rand, address: Str, weak_login: Bool = false) -> 
             let _ = conn.close()
             Err(e)
         },
+    }
+}
+
+// Whether the address asks for a plain connection: `sslmode=disable`. Any
+// other mode is TLS with the certificate checked, which is the only TLS
+// Limen speaks.
+fn sslmode(query: Str) -> Result[Bool, Str] {
+    for pair in query.split("&") {
+        if pair.starts_with("sslmode=") {
+            let mode = pair.slice(8, pair.len())
+            if mode == "disable" {
+                return Ok(true)
+            }
+            if ["allow", "prefer", "require", "verify-ca", "verify-full"].contains(mode) {
+                return Ok(false)
+            }
+            return Err("postgres: sslmode `{mode}` is not one Postgres knows")
+        }
+    }
+    Ok(false)
+}
+
+// Ask for TLS (SSLRequest) and start it when the server agrees.
+fn start_tls(conn: Conn, host: Str) -> Result[(), IoError] {
+    conn.write(bytes(int32(8) + int32(80877103)).to_str())?
+    let answer = conn.read()?
+    if answer == "S" {
+        conn.start_tls(host)
+    } else if answer == "N" {
+        Err(Failed("postgres: the server does not offer TLS; add ?sslmode=disable to the address to connect without it"))
+    } else {
+        Err(Failed("postgres: the server's answer to the TLS request is not one Postgres sends"))
     }
 }
 

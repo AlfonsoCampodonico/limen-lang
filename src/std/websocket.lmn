@@ -1,0 +1,302 @@
+// WebSockets (RFC 6455), written in Limen over a `Conn`: a server
+// upgrades an HTTP request, a client connects to a `ws://` or `wss://`
+// address, and both send and receive messages.
+//
+//   // a server: echo every text message
+//   http.accept_forever(l, |c| http.serve_stream(c, |r, conn| {
+//       let ws = websocket.accept(r, conn)?
+//       websocket.fold_messages(ws, (), |_, m| match m {
+//           Text(t) => { let _ = ws.send(t) },
+//           _ => {},
+//       })
+//   }))
+//
+//   // a client
+//   let ws = websocket.connect(root.net, root.rand, "wss://example.com/chat")?
+//   ws.send("hello")?
+//
+// Receiving is a fold, as reading a stream is: `fold_messages` hands every
+// message to `f` until the connection closes, answering pings and joining
+// fragments on the way. A message larger than `max` bytes (16 MB unless
+// given) closes the connection with 1009. A client masks what it sends
+// with random keys from `Rand`, as the protocol requires.
+
+use base64
+use hash
+use http
+use url
+
+// One end of a WebSocket.
+pub struct Socket {
+    conn: Conn,
+    // a client's randomness for masking; a server does not mask
+    rand: Option[Rand],
+}
+
+// A message.
+pub enum Message {
+    Text(Str),
+    Binary(Bytes),
+    // the other end closed the connection: its code and reason
+    Close(Int, Str),
+}
+
+// ---------- the opening handshake ----------
+
+// Whether `r` asks to become a WebSocket.
+pub fn is_upgrade(r: http.Request) -> Bool {
+    let upgrade = (r.header("upgrade") ?? "").to_lower()
+    let connection = (r.header("connection") ?? "").to_lower()
+    r.method == "GET" && upgrade == "websocket" && connection.contains("upgrade")
+}
+
+// Answer the upgrade request `r` on `conn` (from `http.serve_stream`) and
+// return the server's end of the WebSocket. A request that is not a
+// WebSocket upgrade is answered with 400 and is an Err.
+pub fn accept(r: http.Request, conn: Conn) -> Result[Socket, IoError] {
+    let key = r.header("sec-websocket-key") ?? ""
+    let version = r.header("sec-websocket-version") ?? ""
+    if !is_upgrade(r) || key == "" || version != "13" {
+        let _ = http.write_response(conn, http.text(400, "a WebSocket upgrade request is needed here\n"))
+        return Err(Failed("websocket: not an upgrade request"))
+    }
+    conn.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept_key(key)}\r\n\r\n")?
+    Ok(Socket { conn, rand: None })
+}
+
+// The Sec-WebSocket-Accept for a Sec-WebSocket-Key.
+pub fn accept_key(key: Str) -> Str {
+    base64.encode(hash.sha1((key.trim() + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").to_bytes()))
+}
+
+// Connect to a WebSocket server at `address`, `ws://host:port/path` or
+// `wss://...` (over TLS, its certificate checked).
+pub fn connect(net: Net, rand: Rand, address: Str) -> Result[Socket, IoError] {
+    let u = match url.parse(address) {
+        Ok(u) => u,
+        Err(e) => {
+            return Err(Failed("websocket: {e}"))
+        },
+    }
+    let tls = u.scheme == "wss"
+    if !tls && u.scheme != "ws" {
+        return Err(Failed("websocket: the address starts with ws:// or wss://, not {u.scheme}://"))
+    }
+    let host = if u.host.contains(":") { "[{u.host}]" } else { u.host }
+    let port = u.port ?? (if tls { 443 } else { 80 })
+    let conn = if tls { net.connect_tls("{host}:{port}")? } else { net.connect("{host}:{port}")? }
+    let path = (if u.path == "" { "/" } else { u.path }) + (if u.query == "" { "" } else { "?" + u.query })
+    let key = base64.encode(rand.bytes(16))
+    let shown_host = if (tls && port == 443) || (!tls && port == 80) { host } else { "{host}:{port}" }
+    conn.write("GET {path} HTTP/1.1\r\nHost: {shown_host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n")?
+    // the response's head, up to the blank line; nothing follows it until
+    // this end speaks
+    let mut head = ""
+    while !head.contains("\r\n\r\n") {
+        let more = conn.read()?
+        if more == "" {
+            conn.close()
+            return Err(Failed("websocket: the server closed the connection during the handshake"))
+        }
+        head = head + more
+        if head.len() > 65536 {
+            conn.close()
+            return Err(Failed("websocket: the server's handshake is too long"))
+        }
+    }
+    let lines = head.split("\r\n")
+    let status = lines[0].split(" ")
+    if status.len() < 2 || status[1] != "101" {
+        conn.close()
+        return Err(Failed("websocket: the server answered `{lines[0]}`, not 101"))
+    }
+    let mut accepted = ""
+    for line in lines.skip(1) {
+        let i = line.index_of(":") ?? -1
+        if i > 0 && line.slice(0, i).trim().to_lower() == "sec-websocket-accept" {
+            accepted = line.slice(i + 1, line.len()).trim()
+        }
+    }
+    if accepted != accept_key(key) {
+        conn.close()
+        return Err(Failed("websocket: the server's Sec-WebSocket-Accept does not match"))
+    }
+    Ok(Socket { conn, rand: Some(rand) })
+}
+
+// ---------- sending ----------
+
+// Send a text message.
+pub fn send(self: Socket, text: Str) -> Result[(), IoError] {
+    self.frame(1, text.to_bytes())
+}
+
+// Send a binary message.
+pub fn send_bytes(self: Socket, data: Bytes) -> Result[(), IoError] {
+    self.frame(2, data)
+}
+
+// Ask the other end to answer (it sends a pong, which `fold_messages`
+// takes in silently): a keep-alive.
+pub fn ping(self: Socket, data: Str = "") -> Result[(), IoError] {
+    self.frame(9, data.to_bytes())
+}
+
+// Start closing: tell the other end, which answers, and `fold_messages`
+// then ends. 1000 is a normal close.
+pub fn close(self: Socket, code: Int = 1000, reason: Str = "") -> Result[(), IoError] {
+    self.frame(8, bytes([code >> 8 & 255, code & 255]) + reason.to_bytes())
+}
+
+fn frame(self: Socket, opcode: Int, payload: Bytes) -> Result[(), IoError] {
+    let n = payload.len()
+    let masked = self.rand.is_some()
+    let mark = if masked { 128 } else { 0 }
+    let mut head = [128 | opcode]
+    if n < 126 {
+        head.push(mark | n)
+    } else if n < 65536 {
+        head = head + [mark | 126, n >> 8 & 255, n & 255]
+    } else {
+        head = head + [mark | 127] + (0..<8).map(|i| n >> (56 - 8 * i) & 255)
+    }
+    let body = match self.rand {
+        Some(r) => {
+            let key = r.bytes(4)
+            let p = payload.to_list()
+            let k = key.to_list()
+            key + bytes((0..<n).map(|i| p[i] ^ k[i % 4]))
+        },
+        None => payload,
+    }
+    self.conn.write((bytes(head) + body).to_str())
+}
+
+// ---------- receiving ----------
+
+// Every message the other end sends, handed to `f` with what `f` returned
+// for the message before, from `init`, until the connection closes; what
+// `f` returned last. A close from the other end is handed to `f` as
+// `Close` and answered. Pings are answered and pongs ignored.
+pub fn fold_messages[T](ws: Socket, init: T, f: fn(T, Message) -> T, max: Int = 16_777_216) -> Result[T, IoError] {
+    let mut acc = init
+    let mut buf = bytes([])
+    let mut at = 0
+    // a message in fragments: its opcode and the parts so far
+    let mut kind = 0
+    let mut parts: List[Bytes] = []
+    let mut size = 0
+    while true {
+        match parse_frame(buf, at, max) {
+            Some(fr) => {
+                at = fr.next
+                if fr.length > max {
+                    let _ = ws.close(1009, "message too big")
+                    ws.conn.close()
+                    return Err(Failed("websocket: a message larger than {max} bytes"))
+                }
+                if fr.opcode == 9 {
+                    ws.frame(10, fr.payload)?
+                } else if fr.opcode == 10 {
+                    // a pong: nothing to do
+                } else if fr.opcode == 8 {
+                    let code = if fr.payload.len() >= 2 { fr.payload[0] << 8 | fr.payload[1] } else { 1005 }
+                    let reason = if fr.payload.len() > 2 { fr.payload.slice(2, fr.payload.len()).to_str() } else { "" }
+                    let _ = ws.frame(8, fr.payload.slice(0, 2.min(fr.payload.len())))
+                    ws.conn.close()
+                    return Ok(f(acc, Close(code, reason)))
+                } else {
+                    if fr.opcode != 0 {
+                        kind = fr.opcode
+                        parts = []
+                        size = 0
+                    }
+                    parts.push(fr.payload)
+                    size = size + fr.payload.len()
+                    if size > max {
+                        let _ = ws.close(1009, "message too big")
+                        ws.conn.close()
+                        return Err(Failed("websocket: a message larger than {max} bytes"))
+                    }
+                    if fr.fin {
+                        let whole = parts.fold(bytes([]), |a, p| a + p)
+                        acc = f(acc, if kind == 1 { Text(whole.to_str()) } else { Binary(whole) })
+                        parts = []
+                        size = 0
+                    }
+                }
+            },
+            None => {
+                let more = ws.conn.read()?
+                if more == "" {
+                    return Ok(acc)
+                }
+                buf = buf.slice(at, buf.len()) + more.to_bytes()
+                at = 0
+            },
+        }
+    }
+    Ok(acc)
+}
+
+struct Frame {
+    fin: Bool,
+    opcode: Int,
+    length: Int,
+    payload: Bytes,
+    next: Int,
+}
+
+// The frame starting at `at`, unmasked; None while it has not all arrived.
+// A frame longer than `max` is reported as soon as its length is known,
+// with no payload, so it is refused without waiting for it.
+fn parse_frame(b: Bytes, at: Int, max: Int) -> Option[Frame] {
+    let n = b.len()
+    if n - at < 2 {
+        return None
+    }
+    let fin = b[at] & 128 != 0
+    let opcode = b[at] & 15
+    let masked = b[at + 1] & 128 != 0
+    let mut length = b[at + 1] & 127
+    let mut p = at + 2
+    if length == 126 {
+        if n - p < 2 {
+            return None
+        }
+        length = b[p] << 8 | b[p + 1]
+        p = p + 2
+    } else if length == 127 {
+        if n - p < 8 {
+            return None
+        }
+        length = 0
+        for i in 0..<8 {
+            length = length << 8 | b[p + i]
+        }
+        p = p + 8
+    }
+    if length < 0 || length > max {
+        return Some(Frame { fin, opcode, length: if length < 0 { 0x7fff_ffff_ffff } else { length }, payload: bytes([]), next: p })
+    }
+    let mask = if masked {
+        if n - p < 4 {
+            return None
+        }
+        p = p + 4
+        b.slice(p - 4, p).to_list()
+    } else {
+        []
+    }
+    if n - p < length {
+        return None
+    }
+    let raw = b.slice(p, p + length)
+    let payload = if masked {
+        let r = raw.to_list()
+        bytes((0..<length).map(|i| r[i] ^ mask[i % 4]))
+    } else {
+        raw
+    }
+    Some(Frame { fin, opcode, length, payload, next: p + length })
+}

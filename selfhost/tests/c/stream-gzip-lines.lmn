@@ -1,0 +1,19 @@
+use stream
+
+struct Counts {
+    lines: Int,
+    errors: Int,
+    longest: Int,
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let gz = stream.fold_gzip_lines(root.fs, "big.log.gz", Counts { lines: 0, errors: 0, longest: 0 }, |c, line| Counts {
+        lines: c.lines + 1,
+        errors: c.errors + (if line.contains("ERROR") { 1 } else { 0 }),
+        longest: c.longest.max(line.len()),
+    })?
+    root.stdout.print("gzip: {gz.lines} lines, {gz.errors} errors, longest {gz.longest}")
+    let plain = stream.fold_lines(root.fs, "a.log", 0, |n, line| if line.ends_with("\r") { n + 1 } else { n })?
+    root.stdout.print("plain: {plain} lines still ending in \\r")
+    Ok(())
+}

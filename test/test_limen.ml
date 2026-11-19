@@ -819,6 +819,106 @@ fn area(s: Shape) -> Float { match s { Dot => 0.0, Box(w, h) => w * h } }
     }
     out.print("{total.sum()}")|})
     "499500\n";
+  (* ---------- streams: files a piece at a time, plain and gzipped ---------- *)
+  (let dir = Filename.concat tmpdir "stream" in
+   (try Unix.mkdir tmpdir 0o755 with Unix.Unix_error _ -> ());
+   (try Unix.mkdir dir 0o755 with Unix.Unix_error _ -> ());
+   let g = { Interp.no_grants with fs = Some (dir, false) } in
+   out "stream-folds" ~grants:g
+     {|use compress
+use stream
+
+fn main(root: Root) -> Result[(), IoError] {
+    let mut text = ""
+    for i in 0..<5000 {
+        text = text + "line {i}" + (if i % 3 == 0 { "\r\n" } else { "\n" })
+    }
+    root.fs.write("plain.txt", text + "no newline at the end")?
+    // two gzip members, as `cat a.gz b.gz` makes
+    let half = text.len() / 2
+    let gz = compress.gzip(text.slice(0, half).to_bytes(), 6) + compress.gzip(text.slice(half, text.len()).to_bytes(), 1)
+    root.fs.write("text.gz", gz.to_str())?
+    let lines = stream.fold_lines(root.fs, "plain.txt", 0, |n, _| n + 1)?
+    let last = stream.fold_lines(root.fs, "plain.txt", "", |_, l| l)?
+    let crs = stream.fold_lines(root.fs, "plain.txt", 0, |n, l| if l.contains("\r") { n + 1 } else { n })?
+    let bytes_read = stream.fold_chunks(root.fs, "plain.txt", 0, |n, c| n + c.len(), size: 1000)?
+    let gz_lines = stream.fold_gzip_lines(root.fs, "text.gz", 0, |n, _| n + 1)?
+    let gz_sum = stream.fold_gzip_lines(root.fs, "text.gz", 0, |n, l| n + (l.slice(5, l.len()).parse_int() ?? 0))?
+    root.stdout.print("{lines} {last} {crs} {bytes_read == text.len() + 21} {gz_lines} {gz_sum}")
+    root.fs.write("bad.gz", "not gzip at all")?
+    root.stdout.print("{stream.fold_gzip_lines(root.fs, "bad.gz", 0, |n, _| n + 1)}")
+    root.stdout.print("{root.fs.read_at("plain.txt", 5, 4)} {root.fs.read_at("plain.txt", 999_999, 4)} {root.fs.read_at("plain.txt", -1, 4)}")
+    Ok(())
+}
+|}
+     "5001 no newline at the end 0 true 5000 12497500\nErr(Failed(\"stream: `bad.gz`: compress: not gzip data\"))\nOk(bytes([48, 13, 10, 108])) Ok(bytes([])) Err(Failed(\"fs: read_at needs an offset and a count of at least 0\"))\n");
+  (* ---------- WebSockets: a server and a client in one program ---------- *)
+  par "websocket-loopback" ~grants:{ Interp.no_grants with net = [ "127.0.0.1" ]; listen = [ "127.0.0.1" ] }
+    {|use http
+use websocket
+
+fn main(root: Root) -> Result[(), IoError] {
+    root.stdout.print(websocket.accept_key("dGhlIHNhbXBsZSBub25jZQ=="))
+    let l = root.listen.on("127.0.0.1:0")?
+    let port = l.port()
+    let got = group g {
+        g.go(|| {
+            let c = l.accept()?
+            http.serve_stream(c, |r, conn| {
+                let ws = websocket.accept(r, conn)?
+                websocket.fold_messages(ws, (), |_, m| match m {
+                    Text(t) => {
+                        let _ = ws.send(t.to_upper())
+                    },
+                    Binary(b) => {
+                        let _ = ws.send_bytes(bytes(b.to_list().reverse()))
+                    },
+                    Close(_, _) => {},
+                })
+            })
+            Ok("")
+        })
+        g.go(|| {
+            let ws = websocket.connect(root.net, root.rand, "ws://127.0.0.1:{port}/")?
+            ws.send("hello")?
+            ws.send_bytes(bytes([1, 2, 3]))?
+            ws.send((0..<70_000).map(|_| "x").join(""))?
+            ws.ping()?
+            let seen = websocket.fold_messages(ws, [], |acc: List[Str], m| {
+                let line = match m {
+                    Text(t) => if t.len() > 10 { "{t.len()}" } else { t },
+                    Binary(b) => "{b}",
+                    Close(code, _) => "close {code}",
+                }
+                if acc.len() == 2 {
+                    let _ = ws.close()
+                }
+                acc + [line]
+            })?
+            Ok(seen.join("; "))
+        })
+    }
+    for r in got {
+        match r {
+            Ok(s) if s != "" => root.stdout.print(s),
+            Err(e) => root.stdout.print("{e}"),
+            _ => {},
+        }
+    }
+    Ok(())
+}
+|}
+    "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\nHELLO; bytes([3, 2, 1]); 70000; close 1000\n";
+  (* ---------- coverage: the lines a program's tests ran ---------- *)
+  (let src = "fn sign(x: Int) -> Str {\n    if x < 0 {\n        return \"negative\"\n    }\n    \"not negative\"\n}\n\ntest \"positive\" {\n    assert(sign(3) == \"not negative\")\n}\n\nfn main(root: Root) {}\n" in
+   let items, ds, _ = compile "coverage" src in
+   let ran = Hashtbl.create 16 in
+   Interp.coverage := Some ran;
+   let _ = if ds = [] then Interp.run_tests ~out:ignore items else [] in
+   Interp.coverage := None;
+   let report = Coverage.to_text (Coverage.report items ran) in
+   let has s sub = let n = String.length s and m = String.length sub in let rec go i = i + m <= n && (String.sub s i m = sub || go (i + 1)) in go 0 in
+   ok "coverage-report" (has report "66% (2 of 3)" && has report "not run: 3") report);
   (* ---------- sockets: an echo server and 50 clients in one program ---------- *)
   let sock_grants = { Interp.no_grants with net = [ "127.0.0.1" ]; listen = [ "127.0.0.1" ] } in
   par "socket-echo" ~grants:sock_grants
@@ -7390,6 +7490,18 @@ fn main(root: Root) {
      | None -> false
    in
    ok "dev-lines" (pinned && List.exists (String.starts_with ~prefix:"#line 3 ") lines) "no pinned #line marks in the C");
+  (* --profile: calls counted per function, CPU sampled, a report at exit *)
+  (let src = "fn fib(n: Int) -> Int {\n    if n < 2 { n } else { fib(n - 1) + fib(n - 2) }\n}\n\nfn main(root: Root) {\n    root.stdout.print(\"{fib(20)}\")\n}\n" in
+   let items, ds, _ = compile "profile" src in
+   let exe = Filename.concat (Filename.get_temp_dir_name ()) (Printf.sprintf "limen-profile-%d" (Unix.getpid ())) in
+   Cgen.profile := true;
+   let built = Fun.protect ~finally:(fun () -> Cgen.profile := false) (fun () -> ds = [] && Native.build items exe = Ok ()) in
+   let err = exe ^ ".err" in
+   let code = if built then Sys.command (Printf.sprintf "%s > /dev/null 2> %s" (Filename.quote exe) (Filename.quote err)) else -1 in
+   let report = try In_channel.with_open_bin err In_channel.input_all with Sys_error _ -> "" in
+   (try Sys.remove exe; Sys.remove err with Sys_error _ -> ());
+   let has s sub = let n = String.length s and m = String.length sub in let rec go i = i + m <= n && (String.sub s i m = sub || go (i + 1)) in go 0 in
+   ok "profile-report" (code = 0 && has report "profile: " && has report "21891  fib") report);
   errs "with-unknown-field" "struct P {\n    x: Int,\n}\n\nfn main(root: Root) {\n    let p = P { x: 1 }\n    let q = { p with y: 2 }\n}\n" [ "E0103" ];
   errs "with-twice" "struct P {\n    x: Int,\n}\n\nfn main(root: Root) {\n    let p = P { x: 1 }\n    let q = { p with x: 2, x: 3 }\n}\n" [ "E0106" ];
   errs "with-field-type" "struct P {\n    x: Int,\n}\n\nfn main(root: Root) {\n    let p = P { x: 1 }\n    let q = { p with x: \"a\" }\n}\n" [ "E0201" ];
@@ -9244,9 +9356,11 @@ fn main(root: Root) {
   ok "std-manifest-path" (List.exists (fun (d : Package.dep) -> d.dname = "path" && d.caps = [ "fs" ]) manifest.deps) "path: fs (walk)";
   ok "std-manifest-uuid" (List.exists (fun (d : Package.dep) -> d.dname = "uuid" && d.caps = [ "rand"; "clock" ]) manifest.deps) "uuid: rand, clock";
   ok "std-manifest-postgres" (List.exists (fun (d : Package.dep) -> d.dname = "postgres" && d.caps = [ "net"; "rand" ]) manifest.deps) "postgres: net, rand (SCRAM's nonce)";
+  ok "std-manifest-stream" (List.exists (fun (d : Package.dep) -> d.dname = "stream" && d.caps = [ "fs" ]) manifest.deps) "stream: fs";
+  ok "std-manifest-websocket" (List.exists (fun (d : Package.dep) -> d.dname = "websocket" && d.caps = [ "net"; "rand" ]) manifest.deps) "websocket: net, rand (a client's masks)";
   ok "std-manifest-redis" (List.exists (fun (d : Package.dep) -> d.dname = "redis" && d.caps = [ "net" ]) manifest.deps) "redis: net";
   ok "std-manifest-pure"
-    (List.for_all (fun (d : Package.dep) -> List.mem d.dname [ "http"; "sql"; "time"; "log"; "path"; "uuid"; "postgres"; "redis" ] || d.caps = []) manifest.deps)
+    (List.for_all (fun (d : Package.dep) -> List.mem d.dname [ "http"; "sql"; "time"; "log"; "path"; "uuid"; "postgres"; "redis"; "stream"; "websocket" ] || d.caps = []) manifest.deps)
     "the others are pure";
   let real_std = !Modules.std_modules in
   let std_errs name extra src =

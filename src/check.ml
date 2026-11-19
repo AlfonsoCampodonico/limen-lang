@@ -692,9 +692,10 @@ let build_methods (t : ty) : (string * (unit -> ty list * ty)) list =
   | TCap Conn ->
     [ m "read" [] (res TStr io_err); m "write" [ TStr ] (res TUnit io_err);
       m "read_within" [ TCap Clock; TInt ] (res TStr io_err); m "write_within" [ TCap Clock; TInt; TStr ] (res TUnit io_err);
+      m "start_tls" [ TStr ] (res TUnit io_err);
       m "close" [] TUnit ]
   | TCap Fs ->
-    [ m "read" [ TStr ] (res TStr io_err); m "write" [ TStr; TStr ] (res TUnit io_err);
+    [ m "read" [ TStr ] (res TStr io_err); m "read_at" [ TStr; TInt; TInt ] (res TBytes io_err); m "write" [ TStr; TStr ] (res TUnit io_err);
       m "append" [ TStr; TStr ] (res TUnit io_err); m "list" [ TStr ] (res (TList TStr) io_err);
       m "remove" [ TStr ] (res TUnit io_err); m "make_dir" [ TStr ] (res TUnit io_err);
       m "is_dir" [ TStr ] TBool; m "full_path" [ TStr ] (res TStr io_err); m "is_read_only" [] TBool;
@@ -775,7 +776,7 @@ let waits rt name =
   match (rt, name) with
   | TChan _, ("send" | "recv") -> Some "can wait"
   | TShared _, _ -> Some "takes a lock another task can hold"
-  | TCap Clock, "sleep" | TCap Stdin, _ | TCap Listener, "accept" | TCap Conn, ("read" | "write" | "read_within" | "write_within") | TCap Exec, "run" -> Some "can wait"
+  | TCap Clock, "sleep" | TCap Stdin, _ | TCap Listener, "accept" | TCap Conn, ("read" | "write" | "read_within" | "write_within" | "start_tls") | TCap Exec, "run" -> Some "can wait"
   | TCap Net, ("get" | "connect" | "connect_tls") -> Some "can wait"
   | _ -> None
 

@@ -1,0 +1,85 @@
+// Files larger than memory, a piece at a time. Each function folds: it
+// hands every piece (a chunk of bytes, or a line) to `f` with what `f`
+// returned for the piece before, starting from `init`, and returns what
+// `f` returned last. Memory stays at about a chunk, however large the
+// file:
+//
+//   let errors = stream.fold_lines(root.fs, "app.log", 0, |n, line| if line.contains("ERROR") { n + 1 } else { n })?
+//   let rows = stream.fold_gzip_lines(root.fs, "big.log.gz", [], |acc, line| ...)?
+//
+// The file is read with `fs.read_at`, so nothing stays open between
+// pieces. Lines end at `\n`, and a `\r` before it is dropped; a last line
+// without a newline counts too. A gzipped file is decompressed as it is
+// read, with every member's checksum checked.
+
+use compress
+
+// Every chunk of `path`, `size` bytes each (the last may be shorter).
+pub fn fold_chunks[T](fs: Fs, path: Str, init: T, f: fn(T, Bytes) -> T, size: Int = 65536) -> Result[T, IoError] {
+    if size < 1 {
+        return Err(Failed("stream: a chunk size of at least 1, not {size}"))
+    }
+    let mut acc = init
+    let mut at = 0
+    while true {
+        let chunk = fs.read_at(path, at, size)?
+        if chunk.is_empty() {
+            return Ok(acc)
+        }
+        acc = f(acc, chunk)
+        at = at + chunk.len()
+    }
+    Ok(acc)
+}
+
+// Every line of `path`.
+pub fn fold_lines[T](fs: Fs, path: Str, init: T, f: fn(T, Str) -> T) -> Result[T, IoError] {
+    let st = fold_chunks(fs, path, Lines { acc: init, rest: "" }, |s: Lines[T], chunk: Bytes| feed(s, chunk, f))?
+    Ok(finish(st, f))
+}
+
+// Every chunk of what the gzip file `path` holds, decompressed as it is
+// read.
+pub fn fold_gzip_chunks[T](fs: Fs, path: Str, init: T, f: fn(T, Bytes) -> T) -> Result[T, IoError] {
+    // the reading error, kept whole: a gzip error is a string
+    match compress.fold_gunzip(|at| fs.read_at(path, at, 65536).map_error(|e| "{e}"), init, f) {
+        Ok(acc) => Ok(acc),
+        Err(e) => Err(Failed("stream: `{path}`: {e}")),
+    }
+}
+
+// Every line of what the gzip file `path` holds.
+pub fn fold_gzip_lines[T](fs: Fs, path: Str, init: T, f: fn(T, Str) -> T) -> Result[T, IoError] {
+    let st = fold_gzip_chunks(fs, path, Lines { acc: init, rest: "" }, |s: Lines[T], chunk: Bytes| feed(s, chunk, f))?
+    Ok(finish(st, f))
+}
+
+// Run `f` on every line of `path`, for its effect.
+pub fn each_line(fs: Fs, path: Str, f: fn(Str)) -> Result[(), IoError] {
+    fold_lines(fs, path, (), |_, line| f(line))
+}
+
+// The fold over lines so far, and the start of a line whose end has not
+// arrived yet.
+struct Lines[T] {
+    acc: T,
+    rest: Str,
+}
+
+fn feed[T](s: Lines[T], chunk: Bytes, f: fn(T, Str) -> T) -> Lines[T] {
+    let parts = (s.rest + chunk.to_str()).split("\n")
+    let mut acc = s.acc
+    // every part but the last ended with a newline
+    for line in parts.take(parts.len() - 1) {
+        acc = f(acc, trim_cr(line))
+    }
+    Lines { acc, rest: parts.last() ?? "" }
+}
+
+fn finish[T](s: Lines[T], f: fn(T, Str) -> T) -> T {
+    if s.rest == "" { s.acc } else { f(s.acc, trim_cr(s.rest)) }
+}
+
+fn trim_cr(line: Str) -> Str {
+    if line.ends_with("\r") { line.slice(0, line.len() - 1) } else { line }
+}

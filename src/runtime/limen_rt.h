@@ -756,6 +756,7 @@ struct WFiber {
   WScope *scopes;                       /* deadline scopes it is in, innermost first (under wlock) */
   const char *in_cb;                    /* in a callback from C: where the callback is declared */
   int unwinding;                        /* its cancellation is unwinding it: checkpoints let defers finish */
+  int32_t prof;                         /* `--profile`: the function it was in when it switched out */
   int in_update;                        /* running the function of a Shared's update: it must not wait */
   const char *upd_where;                /* where that update was called */
   WOut *out;                            /* where its output goes (NULL: stdout); see Cap_print */
@@ -1186,6 +1187,16 @@ W_RT void w_tls_close_notify(WCap *c);
 W_RT int w_tls_step(WCap *c, int wr, char *buf, size_t n, int *dir, char *err, size_t en);
 W_RT int w_tls_accept(WCap *l, WCap *conn, WIo *r);
 W_RT WIo Cap_net_connect_tls(WCap *n, WStr *addr);
+W_RT WIo Cap_conn_start_tls(WCap *c, WStr *host);
+W_RT WIo Cap_fs_read_at(WCap *fs, WStr *rel, int64_t off, int64_t n);
+/* `--profile`: a sampling CPU profile. Every function counts its calls and
+   says it is the thread's current one (W_PROF, at its start, restored as it
+   leaves); a timer samples the current function every millisecond of CPU,
+   and the report goes to stderr at exit. */
+W_RT int32_t w_prof_enter(int32_t id);
+W_RT void w_prof_leave(int32_t *prev);
+W_RT void w_prof_start(const char *const *names, int64_t *calls, int64_t *samples, int32_t n);
+#define W_PROF(id) int32_t w_prof_prev_ __attribute__((cleanup(w_prof_leave))) = w_prof_enter(id)
 W_RT WIo Cap_listen_on_tls(WCap *l, WStr *addr, WStr *cert, WStr *key);
 
 /* ---------- stdin ----------

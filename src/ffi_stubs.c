@@ -691,6 +691,31 @@ value limen_fs_op(value op, value top, value root, value a, value b) {
       free(buf);
       CAMLreturn(r);
     }
+    case 9: {
+      /* read_at: b is "OFFSET COUNT" */
+      long long off = -1, cnt = -1;
+      if (sscanf(String_val(b), "%lld %lld", &off, &cnt) != 2 || off < 0 || cnt < 0) {
+        e.kind = 2; snprintf(e.msg, sizeof e.msg, "fs: read_at needs an offset and a count of at least 0"); break;
+      }
+      if (cnt > (64LL << 20)) { e.kind = 2; snprintf(e.msg, sizeof e.msg, "fs: read_at reads at most 64 MB at a time"); break; }
+      int fd = w_fs_open(t, ro, ap, an, W_FS_READ, &e);
+      if (fd < 0) break;
+      char *buf = (char *)w_sb_alloc(cnt > 0 ? (size_t)cnt : 1);
+      long long got = 0;
+      int err = 0;
+      while (got < cnt) {
+        ssize_t k = pread(fd, buf + got, (size_t)(cnt - got), (off_t)(off + got));
+        if (k < 0 && errno == EINTR) continue;
+        if (k < 0) { err = errno; break; }
+        if (k == 0) break;
+        got += k;
+      }
+      close(fd);
+      if (err) { free(buf); e.kind = 2; snprintf(e.msg, sizeof e.msg, "fs: `%.*s`: %s", (int)an, ap, strerror(err)); break; }
+      r = limen_fs_pair(0, buf, (size_t)got);
+      free(buf);
+      CAMLreturn(r);
+    }
     case 4: if (w_fs_remove(t, ro, ap, an, &e) == 0) CAMLreturn(limen_fs_pair(0, "", 0)); break;
     case 5: if (w_fs_mkdir(t, ro, ap, an, &e) == 0) CAMLreturn(limen_fs_pair(0, "", 0)); break;
     case 6:

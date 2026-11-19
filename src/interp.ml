@@ -1334,6 +1334,32 @@ module Sock = struct
           in
           go ()))
 
+  (* Conn.start_tls: the client handshake on a connection already open,
+     checking the server's certificate against [host]. It holds the reading
+     and the writing side, so no other task's bytes land in it; a failed
+     handshake closes the connection. *)
+  let start_tls sk host =
+    if sk.shut then closed_err "connection"
+    else if sk.tls <> Tls.Plain then Error (Caps.Failed "tls: the connection already speaks TLS")
+    else if host = "" || String.length host >= 256 || String.contains host '\000' then Error (Caps.Failed "tls: start_tls needs the server's host name")
+    else if sk.reading || sk.writing then busy "using this connection"
+    else begin
+      sk.reading <- true;
+      sk.writing <- true;
+      let finish r = sk.reading <- false; sk.writing <- false; (match r with Error _ -> close sk | Ok _ -> ()); r in
+      match Tls.client sk.fd host with
+      | exception Failure m -> finish (Error (Caps.Failed m))
+      | s ->
+        sk.tls <- Tls.Session s;
+        let rec go () =
+          match tls_step s 2 Bytes.empty 0 0 with
+          | `Done _ -> finish (Ok ())
+          | `Wait w -> (match wait sk w with () -> go () | exception e -> ignore (finish (Error (Caps.Failed "cancelled"))); raise e)
+          | `Failed m -> finish (Error (Caps.Failed m))
+        in
+        go ()
+    end
+
   (* Listen.on_tls: a listener whose connections speak TLS with this
      certificate and key (PEM text). *)
   let listen_tls allowed addr cert key =
@@ -2101,6 +2127,14 @@ let rec pmatch p v binds =
     List.exists (fun alt -> pmatch alt v binds || (binds.vars <- saved; false)) alts
   | _ -> false
 
+
+(* `limen test --coverage`: where each statement and block value that ran
+   starts, as (file, offset). None when coverage is off, which costs one
+   load per statement. *)
+let coverage : (string * int, unit) Hashtbl.t option ref = ref None
+
+let covered (sp : Span.t) = match !coverage with Some t -> Hashtbl.replace t (sp.file, sp.lo) () | None -> ()
+
 let rec eval rt env e : value =
   match e.edesc with
   | EInt n -> VInt n
@@ -2584,7 +2618,7 @@ and eval_block rt env b =
    leaving the block. *)
 and run_stmts rt env ss tail =
   match ss with
-  | [] -> ( match tail with Some e -> eval rt env e | None -> VUnit)
+  | [] -> ( match tail with Some e -> covered e.espan; eval rt env e | None -> VUnit)
   | { sdesc = SDefer d; _ } :: rest -> (
     (* the scopes as they are now: later lets are not seen, but the values
        of the names already there are, as they are when it runs *)
@@ -2594,7 +2628,7 @@ and run_stmts rt env ss tail =
     | v -> run_defer (); v
     | exception (Cancelled as e) -> !current.unwinding <- true; run_defer (); raise e
     | exception e -> run_defer (); raise e)
-  | s :: rest -> exec rt env s; run_stmts rt env rest tail
+  | s :: rest -> covered s.sspan; exec rt env s; run_stmts rt env rest tail
 
 and exec rt env s =
   match s.sdesc with
@@ -3008,6 +3042,7 @@ and cap_call rt c name args sp =
   | CFs fs, "under", [ VStr p ] -> VCap (CFs (Caps.under fs p))
   | CFs fs, "read_only", [] -> VCap (CFs { fs with ro = true })
   | CFs fs, "read", [ VStr p ] -> io_result (fun s -> VStr s) (Caps.read fs p)
+  | CFs fs, "read_at", [ VStr p; VInt off; VInt n ] -> io_result (fun s -> VBytes s) (Caps.read_at fs p off n)
   | CFs fs, "write", [ VStr p; VStr data ] -> io_result (fun () -> VUnit) (Caps.write fs p data)
   | CFs fs, "exists", [ VStr p ] -> VBool (Caps.exists fs p)
   | CFs fs, "full_path", [ VStr p ] -> io_result (fun s -> VStr s) (Caps.full_path fs p)
@@ -3022,6 +3057,7 @@ and cap_call rt c name args sp =
   | (CListener (fd, _) | CConn fd), "close", [] -> Sock.close fd; VUnit
   | CConn fd, "read", [] -> sock_result (Sock.read fd) (fun s -> VStr s)
   | CConn fd, "write", [ VStr s ] -> sock_result (Sock.write fd s) (fun () -> VUnit)
+  | CConn fd, "start_tls", [ VStr host ] -> sock_result (Sock.start_tls fd host) (fun () -> VUnit)
   | CConn fd, "read_within", [ _; VInt ms ] ->
     let ms = max ms 0L in
     sock_result (Sock.read ~within:(timer_after ms, ms) fd) (fun s -> VStr s)

@@ -67,6 +67,9 @@ struct Wrapper {
 
 struct Cg {
     ro: lower.Ro,
+    // `--profile`: each function's number, from 1 in the order the
+    // functions are written; 0 is time outside them
+    prof_ids: Map[Str, Int],
     files: List[diag.Source],
     // where each line of each file starts, for `file:line:col`
     starts: List[List[Int]],
@@ -348,8 +351,15 @@ fn where(self: Cg, sp: ast.Span) -> Str {
     c_string("{diag.path_of(self.files, sp.file)}:{l}:{col}")
 }
 
+// A variable's C name: its Limen name and its number (`total_15`), so a
+// debugger and the C itself show which variable is which. Characters C
+// does not allow in a name (the `$` of the compiler's own variables)
+// become `_`; a variable with no name is `v15`. The number keeps every
+// name apart from the others and from C's own.
 fn var(v: ir.Var) -> Str {
-    "v{v.id}"
+    let n = bytes(v.name.bytes().map(|b| if (b >= 97 && b <= 122) || (b >= 65 && b <= 90) || (b >= 48 && b <= 57) || b == 95 { b } else { 95 })).to_str()
+    let first = if n.is_empty() { 0 } else { n.bytes()[0] }
+    if n.is_empty() || (first >= 48 && first <= 57) { "v{v.id}" } else { "{n}_{v.id}" }
 }
 
 fn float_lit(x: Float) -> Str {
@@ -1687,6 +1697,11 @@ fn prim(self: Cg, ind: Str, dst: Str, t: types.Ty, name: Str, rt: types.Ty, a: L
         ("cap_read_only", _) => c.set(ind, dst, "Cap_fs_read_only({arg(0)})"),
         ("cap_read", TCap("Conn")) => c.io_result(ind, dst, t, "Cap_conn_read({arg(0)})", "r_.val"),
         ("cap_write", TCap("Conn")) => c.io_result(ind, dst, t, "Cap_conn_write({arg(0)}, {arg(1)})", "0"),
+        ("cap_start_tls", TCap("Conn")) => {
+            let mut c1 = c
+            c1.tls = true
+            c1.io_result(ind, dst, t, "Cap_conn_start_tls({arg(0)}, {arg(1)})", "0")
+        },
         ("cap_read_within", TCap("Conn")) => c.io_result(ind, dst, t, "Cap_conn_read_within({arg(0)}, {arg(1)}, {arg(2)})", "r_.val"),
         ("cap_write_within", TCap("Conn")) => c.io_result(ind, dst, t, "Cap_conn_write_within({arg(0)}, {arg(1)}, {arg(2)}, {arg(3)})", "0"),
         ("cap_on", _) => c.io_result(ind, dst, t, "Cap_listen_on({arg(0)}, {arg(1)})", "(WCap*)r_.ptr"),
@@ -1705,6 +1720,7 @@ fn prim(self: Cg, ind: Str, dst: Str, t: types.Ty, name: Str, rt: types.Ty, a: L
         ("cap_port", _) => c.set(ind, dst, "(int64_t)({arg(0)})->port"),
         ("cap_close", _) => c.line(ind, "Cap_sock_close({arg(0)});").set(ind, dst, "0"),
         ("cap_read", _) => c.io_result(ind, dst, t, "Cap_fs_read({arg(0)}, {arg(1)})", "r_.val"),
+        ("cap_read_at", _) => c.io_result(ind, dst, t, "Cap_fs_read_at({arg(0)}, {arg(1)}, {arg(2)}, {arg(3)})", "r_.val"),
         ("cap_write", TCap("Fs")) => c.io_result(ind, dst, t, "Cap_fs_write({arg(0)}, {arg(1)}, {arg(2)})", "0"),
         ("cap_exists", _) => c.set(ind, dst, "Cap_fs_exists({arg(0)}, {arg(1)})"),
         ("cap_full_path", TCap("Fs")) => c.io_result(ind, dst, t, "Cap_fs_full_path({arg(0)}, {arg(1)})", "r_.val"),
@@ -2229,6 +2245,12 @@ fn fn_body(self: Cg, f: ir.Fn) -> Cg {
             let (ct, c3) = c2.ctype(v.ty)
             c = c3.put("  {ct}{c3.vol(v)} {var(v)} = {d};\n").cell_decl("  ", v, true)
         }
+    }
+    match c.prof_ids.get(f.fname) {
+        Some(k) => {
+            c = c.put("  W_PROF({k});\n")
+        },
+        None => {},
     }
     // a checkpoint on entry: deep recursion stops too
     c = c.put("  W_CHECK();\n").stmts("  ", f.body).put("  w_unreachable();\n}\n\n")
@@ -2847,6 +2869,7 @@ pub fn program(ro: lower.Ro, files: List[diag.Source], prog: ir.Program, runtime
         ro,
         files,
         starts: files.map(|f| line_starts(f.text)),
+        prof_ids: map(),
         names: map(),
         types: [],
         lits: map(),
@@ -2875,6 +2898,11 @@ pub fn program(ro: lower.Ro, files: List[diag.Source], prog: ir.Program, runtime
         scopes: 0,
         tls: false,
         out: [],
+    }
+    if ro.profile {
+        for (i, f) in prog.fns.with_index() {
+            c.prof_ids[f.fname] = i + 1
+        }
     }
     // bodies first: this names every type and literal
     for f in prog.fns {
@@ -3071,7 +3099,19 @@ fn main_fn(self: Cg, prog: ir.Program) -> (Str, Cg) {
         c = c1
         m.push("static {ct} wmain_result_;")
         m.push("static void wmain_entry_(void* a) \{ (void)a; wmain_result_ = {prog.main}({if prog.main_takes_root { "w_root()" } else { "" }}); w_main_finished(); }")
-        m = m + ["int main(int argc, char** argv) \{", "  w_init(argc, argv);", "  w_run(wmain_entry_, NULL);", "  {ct} r_ = wmain_result_;"]
+        if c.ro.profile {
+            // a function's name without the `wf_` C names start with
+            let n = prog.fns.len() + 1
+            let shown = prog.fns.map(|f| if f.fname.starts_with("wf_") { f.fname.slice(3, f.fname.len()) } else { f.fname })
+            m.push("static const char *const w_prof_names_[{n}] = \{ \"(runtime and C)\"{shown.map(|x| ", \"{x}\"").join("")} };")
+            m.push("static int64_t w_prof_calls_[{n}];")
+            m.push("static int64_t w_prof_samples_[{n}];")
+        }
+        m = m + ["int main(int argc, char** argv) \{", "  w_init(argc, argv);"]
+        if c.ro.profile {
+            m.push("  w_prof_start(w_prof_names_, w_prof_calls_, w_prof_samples_, {prog.fns.len() + 1});")
+        }
+        m = m + ["  w_run(wmain_entry_, NULL);", "  {ct} r_ = wmain_result_;"]
         match rt {
             TNamed("Result", [_, et]) => {
                 let (te, c2) = c.tag_expr(rt, "r_")

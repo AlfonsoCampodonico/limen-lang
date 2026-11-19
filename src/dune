@@ -89,7 +89,7 @@
 ; Embed the standard library modules (written in Limen).
 (rule
  (targets std_text.ml)
- (deps std/json.lmn std/list.lmn std/text.lmn std/http.lmn std/format.lmn std/time.lmn std/regex.lmn std/sql.lmn std/errors.lmn std/hex.lmn std/base64.lmn std/hash.lmn std/csv.lmn std/url.lmn std/flags.lmn std/log.lmn std/path.lmn std/uuid.lmn std/compress.lmn std/postgres.lmn std/redis.lmn std/limen.toml)
+ (deps std/json.lmn std/list.lmn std/text.lmn std/http.lmn std/format.lmn std/time.lmn std/regex.lmn std/sql.lmn std/errors.lmn std/hex.lmn std/base64.lmn std/hash.lmn std/csv.lmn std/url.lmn std/flags.lmn std/log.lmn std/path.lmn std/uuid.lmn std/compress.lmn std/postgres.lmn std/redis.lmn std/stream.lmn std/websocket.lmn std/limen.toml)
  (action
   (with-stdout-to
    std_text.ml
@@ -137,6 +137,10 @@
     (cat std/postgres.lmn)
     (echo "|xxstdxx});\n(\"redis\", {xxstdxx|")
     (cat std/redis.lmn)
+    (echo "|xxstdxx});\n(\"stream\", {xxstdxx|")
+    (cat std/stream.lmn)
+    (echo "|xxstdxx});\n(\"websocket\", {xxstdxx|")
+    (cat std/websocket.lmn)
     (echo "|xxstdxx}) ]\n")
     (echo "let manifest = {xxstdxx|")
     (cat std/limen.toml)

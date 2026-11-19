@@ -1,0 +1,15 @@
+use postgres
+use redis
+
+fn main(root: Root) -> Result[(), IoError] {
+    let db = postgres.connect(root.net, root.rand, "postgres://app:secret@localhost:PGTLSPORT/app")?
+    let row = db.query_one("SELECT ssl, version FROM pg_stat_ssl WHERE pid = pg_backend_pid()")?
+    root.stdout.print("tls: {row.map(|r| r.int("ssl")) ?? None} {row.map(|r| r.text("version")) ?? None}")
+    let plain = postgres.connect(root.net, root.rand, "postgres://app:secret@localhost:PGTLSPORT/app?sslmode=disable")?
+    let p = plain.query_one("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")?
+    root.stdout.print("disable: {p.map(|r| r.int("ssl")) ?? None}")
+    let c = redis.connect(root.net, "rediss://localhost:REDISTLSPORT")?
+    c.set("tls", "yes")?
+    root.stdout.print("redis over tls: {c.get("tls")?}")
+    Ok(())
+}

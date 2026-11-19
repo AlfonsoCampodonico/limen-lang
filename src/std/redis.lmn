@@ -10,8 +10,10 @@
 //
 // The common commands have methods; `run` sends any other, as its words,
 // and returns the reply. Each word goes as its own bulk string, so a key or
-// value can hold any bytes, spaces and newlines included. Connections are
-// plain TCP: TLS is not supported yet.
+// value can hold any bytes, spaces and newlines included. An address
+// starting with `rediss://` connects over TLS, with the server's
+// certificate checked; `redis://` and a bare `host:port` connect in plain
+// TCP.
 //
 // A `Client` is one connection, used by one task at a time: a command is a
 // request and its reply. For a server, `redis.pool` opens a few and
@@ -36,10 +38,16 @@ pub enum Reply {
     Many(List[Reply]),
 }
 
-// Connect to `address` (`host:port`), and log in when `password` is given
-// (`AUTH`; with `user` too for an ACL user).
+// Connect to `address` (`host:port`, `redis://host:port`, or
+// `rediss://host:port` for TLS; the port defaults to 6379), and log in when
+// `password` is given (`AUTH`; with `user` too for an ACL user).
 pub fn connect(net: Net, address: Str, password: Str = "", user: Str = "") -> Result[Client, IoError] {
-    let c = Client { conn: net.connect(address)? }
+    let tls = address.starts_with("rediss://")
+    let rest = if tls { address.slice(9, address.len()) } else if address.starts_with("redis://") { address.slice(8, address.len()) } else { address }
+    let hostport = if rest.ends_with("/") { rest.slice(0, rest.len() - 1) } else { rest }
+    let target = if hostport.contains("]:") || (!hostport.starts_with("[") && hostport.contains(":")) { hostport } else { hostport + ":6379" }
+    let conn = if tls { net.connect_tls(target)? } else { net.connect(target)? }
+    let c = Client { conn }
     if password != "" {
         let words = if user == "" { ["AUTH", password] } else { ["AUTH", user, password] }
         match c.run(words) {

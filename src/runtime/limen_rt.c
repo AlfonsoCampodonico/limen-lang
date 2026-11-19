@@ -981,6 +981,33 @@ W_RT WIo Cap_fs_read(WCap *fs, WStr *rel) {
   close(fd);
   return io_ok(s);
 }
+/* Fs.read_at(path, offset, n): up to n bytes from offset, fewer at the end
+   of the file and none past it; for reading a file larger than memory a
+   piece at a time. The file is opened as for read, each time, so no open
+   file outlives the call. */
+#define W_READ_AT_MAX ((int64_t)64 << 20)
+W_RT WIo Cap_fs_read_at(WCap *fs, WStr *rel, int64_t off, int64_t n) {
+  if (w_revoked(fs)) return io_err(1, "fs: revoked");
+  if (!fs->root) return io_err(1, W_FS_NOT_GRANTED);
+  if (off < 0 || n < 0) return io_err(2, "fs: read_at needs an offset and a count of at least 0");
+  if (n > W_READ_AT_MAX) return io_err(2, "fs: read_at reads at most 64 MB at a time");
+  WFsErr e;
+  int fd = w_fs_open(W_FS_TOP, fs->root, rel->data, (size_t)rel->len, W_FS_READ, &e);
+  if (fd < 0) return w_fs_fail(&e);
+  WStr *s = Str_new(n);
+  int64_t got = 0;
+  while (got < n) {
+    ssize_t k = pread(fd, s->data + got, (size_t)(n - got), (off_t)(off + got));
+    if (k < 0 && errno == EINTR) continue;
+    if (k < 0) { int err = errno; close(fd); Str_drop(s); char m[1300]; snprintf(m, sizeof m, "fs: `%.*s`: %s", (int)rel->len, rel->data, strerror(err)); return io_err(2, m); }
+    if (k == 0) break;
+    got += k;
+  }
+  close(fd);
+  s->len = got;
+  s->data[got] = 0;
+  return io_ok(s);
+}
 W_RT WIo w_fs_put(WCap *fs, WStr *rel, WStr *data, int mode) {
   if (w_revoked(fs)) return io_err(1, "fs: revoked");
   if (fs->root && fs->ro) return io_err(1, "fs: this capability is read-only");
@@ -1142,7 +1169,77 @@ __attribute__((noinline)) W_RT WWorker *w_self(void) {
   return w;
 }
 
+/* ---------- `--profile` ---------- */
+
+static __thread int32_t w_prof_cur;
+static const char *const *w_prof_names;
+static int64_t *w_prof_calls, *w_prof_samples;
+static int32_t w_prof_n;
+static int64_t w_prof_t0;
+
+W_RT int32_t w_prof_enter(int32_t id) {
+  int32_t prev = w_prof_cur;
+  if (w_prof_calls) __atomic_add_fetch(&w_prof_calls[id], 1, __ATOMIC_RELAXED);
+  w_prof_cur = id;
+  return prev;
+}
+W_RT void w_prof_leave(int32_t *prev) { w_prof_cur = *prev; }
+static void w_prof_tick(int sig) {
+  (void)sig;
+  int32_t c = w_prof_cur;
+  if (c >= 0 && c < w_prof_n) __atomic_add_fetch(&w_prof_samples[c], 1, __ATOMIC_RELAXED);
+}
+static int w_prof_cmp(const void *a, const void *b) {
+  int64_t x = w_prof_samples[*(const int32_t *)a], y = w_prof_samples[*(const int32_t *)b];
+  return x < y ? 1 : x > y ? -1 : *(const int32_t *)a - *(const int32_t *)b;
+}
+static void w_prof_report(void) {
+  struct itimerval off; memset(&off, 0, sizeof off);
+  setitimer(ITIMER_PROF, &off, NULL);
+  int64_t total = 0;
+  for (int32_t i = 0; i < w_prof_n; i++) total += w_prof_samples[i];
+  int32_t *order = malloc(sizeof(int32_t) * (size_t)w_prof_n);
+  if (!order) return;
+  for (int32_t i = 0; i < w_prof_n; i++) order[i] = i;
+  qsort(order, (size_t)w_prof_n, sizeof(int32_t), w_prof_cmp);
+  /* the CPU the process used, shared out by the samples: the timer's
+     period is a request the system rounds */
+  struct rusage ru; getrusage(RUSAGE_SELF, &ru);
+  double cpu = (double)ru.ru_utime.tv_sec + (double)ru.ru_utime.tv_usec / 1e6 + (double)ru.ru_stime.tv_sec + (double)ru.ru_stime.tv_usec / 1e6;
+  double wall = (double)(w_mono_ns() - w_prof_t0) / 1e9;
+  fprintf(stderr, "\nprofile: %.2f s of CPU in %.2f s, %lld samples\n", cpu, wall, (long long)total);
+  fprintf(stderr, "  %9s %6s %12s  %s\n", "own CPU", "", "calls", "function");
+  int shown = 0;
+  for (int32_t k = 0; k < w_prof_n && shown < 25; k++) {
+    int32_t i = order[k];
+    if (w_prof_samples[i] == 0 && w_prof_calls[i] == 0) continue;
+    if (w_prof_samples[i] == 0 && shown >= 10) continue;
+    double share = total ? (double)w_prof_samples[i] / (double)total : 0.0;
+    fprintf(stderr, "  %7.3f s %5.1f%% %12lld  %s\n", share * cpu, 100.0 * share, (long long)w_prof_calls[i], w_prof_names[i]);
+    shown++;
+  }
+  free(order);
+}
+/* Called at the start of main in a program built with --profile. Index 0
+   is "runtime and C": time outside any Limen function. */
+W_RT void w_prof_start(const char *const *names, int64_t *calls, int64_t *samples, int32_t n) {
+  w_prof_names = names; w_prof_calls = calls; w_prof_samples = samples; w_prof_n = n;
+  w_prof_t0 = w_mono_ns();
+  struct sigaction sa; memset(&sa, 0, sizeof sa);
+  sa.sa_handler = w_prof_tick; sa.sa_flags = SA_RESTART;
+  sigemptyset(&sa.sa_mask);
+  sigaction(SIGPROF, &sa, NULL);
+  struct itimerval t; memset(&t, 0, sizeof t);
+  t.it_interval.tv_usec = 1000; t.it_value.tv_usec = 1000;
+  setitimer(ITIMER_PROF, &t, NULL);
+  atexit(w_prof_report);
+}
+
 W_RT void w_switch(WFiber *from, WFiber *to, int from_exiting) {
+  /* with --profile, the function each task is in goes with it (w_prof_calls
+     is set before any other thread starts, and never again) */
+  int prof = w_prof_calls != NULL;
+  if (prof) from->prof = w_prof_cur;
 #ifdef W_ASAN
   void *fake = NULL;
   __sanitizer_start_switch_fiber(from_exiting ? NULL : &fake, to->asan_bottom, to->asan_size);
@@ -1153,6 +1250,7 @@ W_RT void w_switch(WFiber *from, WFiber *to, int from_exiting) {
   __tsan_switch_to_fiber(to->tsan, 0);
 #endif
   w_ctx_switch(&from->sp, to->sp);
+  if (prof) w_prof_cur = from->prof;
 #ifdef W_ASAN
   {
     WWorker *w = w_self();
@@ -2914,6 +3012,47 @@ W_RT WIo Cap_net_connect_tls(WCap *n, WStr *addr) {
     if (wr < 0) { Cap_sock_close(c); Cap_drop(c); return io_err(2, "cannot wait on socket"); }
   }
 }
+/* Conn.start_tls(host): a client TLS handshake on a connection that is
+   already open, for protocols that start TLS inside plain TCP (Postgres's
+   SSLRequest, Redis behind a proxy, SMTP's STARTTLS). The server's
+   certificate is checked against host, as in connect_tls. The handshake
+   holds both the reading and the writing slot, so no other task's bytes
+   can land in the middle of it; a failed handshake closes the
+   connection, which can no longer be trusted. */
+W_RT WIo Cap_conn_start_tls(WCap *c, WStr *host) {
+  int fd = w_sock_enter(c);
+  if (fd < 0) return io_err(2, "connection is closed");
+  if (c->tls) { w_sock_leave(c); return io_err(2, "tls: the connection already speaks TLS"); }
+  if (host->len <= 0 || host->len >= 256 || memchr(host->data, 0, (size_t)host->len)) { w_sock_leave(c); return io_err(2, "tls: start_tls needs the server's host name"); }
+  int rh = 0, wh = 0;
+  if (!w_sock_claim(&c->reading, &rh) || !w_sock_claim(&c->writing, &wh)) {
+    w_sock_unclaim(&c->reading, rh); w_sock_unclaim(&c->writing, wh); w_sock_leave(c);
+    return io_err(2, "another task is using this connection");
+  }
+  char h[256], err[300];
+  memcpy(h, host->data, (size_t)host->len); h[host->len] = 0;
+  WIo r = io_ok(NULL);
+  int cancelled = 0;
+  VTls *t = vtls_client(fd, h, err, sizeof err);
+  if (!t) r = io_err(2, err);
+  else {
+    c->tls = t;
+    for (;;) {
+      if (w_sock_closing(c)) { r = io_err(2, "connection is closed"); break; }
+      int k = vtls_step(t, VTLS_HANDSHAKE, NULL, 0, err, sizeof err);
+      if (k == 0) break;
+      if (k == VTLS_ERROR) { r = io_err(2, err); break; }
+      int wr = w_wait_fd(fd, k == VTLS_WANT_WRITE);
+      if (wr == -2) { cancelled = 1; break; }
+      if (wr < 0) { r = io_err(2, "cannot wait on socket"); break; }
+    }
+  }
+  w_sock_unclaim(&c->reading, rh); w_sock_unclaim(&c->writing, wh);
+  w_sock_leave(c);
+  if (r.kind != 0 || cancelled) Cap_sock_close(c);
+  if (cancelled) w_cancel_unwind();
+  return r;
+}
 W_RT WIo Cap_listen_on_tls(WCap *l, WStr *addr, WStr *cert, WStr *key) {
   WIo r = Cap_listen_on(l, addr);
   if (r.kind != 0) return r;
@@ -2939,6 +3078,7 @@ W_RT WIo Cap_net_connect_tls(WCap *n, WStr *addr) {
   if (!net_permits(n, h, port)) { char m[400]; snprintf(m, sizeof m, "net: %s:%d is not granted", h, port); return io_err(1, m); }
   return io_err(2, W_NO_TLS);
 }
+W_RT WIo Cap_conn_start_tls(WCap *c, WStr *host) { (void)c; (void)host; return io_err(2, W_NO_TLS); }
 W_RT WIo Cap_listen_on_tls(WCap *l, WStr *addr, WStr *cert, WStr *key) {
   (void)cert; (void)key;
   if (w_revoked(l)) return io_err(1, "listen: revoked");

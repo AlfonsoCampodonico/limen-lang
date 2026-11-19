@@ -229,7 +229,7 @@ let ns_per_op b =
   let v = float_of_int b.ns /. float_of_int (max 1 b.iters) in
   if v < 10. then Printf.sprintf "%.2f" v else if v < 100. then Printf.sprintf "%.1f" v else Printf.sprintf "%.0f" v
 
-type test_opts = { native : bool; bench : (int * int) option; pattern : string option; json : bool }
+type test_opts = { native : bool; bench : (int * int) option; pattern : string option; json : bool; coverage : bool }
 
 let cmd_test file (o : test_opts) =
   Package.write_lock := true;
@@ -254,6 +254,8 @@ let cmd_test file (o : test_opts) =
   let start = Unix.gettimeofday () in
   (* a test's own output goes to stdout; with --json, it would break the JSON *)
   let out s = if not o.json then (print_string s; flush stdout) in
+  if o.coverage && (o.native || o.bench <> None) then die_usage "--coverage runs the tests interpreted: leave out --native and --bench";
+  if o.coverage then Interp.coverage := Some (Hashtbl.create 1024);
   let test_results, bench_results =
     if o.native || o.bench <> None then run_native_tests items tests benches o.bench
     else
@@ -290,7 +292,18 @@ let cmd_test file (o : test_opts) =
     in
     print_endline
       (to_string
-         (Obj [ ("tests", List tests); ("benches", List benches); ("passed", Int passed); ("failed", Int failed); ("seconds", Float (micro total)) ]))
+         (Obj
+            ([ ("tests", List tests); ("benches", List benches); ("passed", Int passed); ("failed", Int failed); ("seconds", Float (micro total)) ]
+            @
+            match !Interp.coverage with
+            | None -> []
+            | Some ran ->
+              [ ( "coverage",
+                  List
+                    (List.map
+                       (fun (f : Coverage.file) ->
+                         Obj [ ("file", String f.path); ("lines", Int f.lines); ("ran", Int f.run); ("missed", List (List.map (fun l -> Int l) f.missed)) ])
+                       (Coverage.report items ran)) ) ])))
   end
   else begin
     let fail name (m, w) =
@@ -312,7 +325,8 @@ let cmd_test file (o : test_opts) =
     Printf.printf "%s%s, %d failed (%s)\n"
       (count (List.length test_results) "test")
       (if bench_results = [] then "" else ", " ^ count (List.length bench_results) "bench")
-      failed (fmt_secs total)
+      failed (fmt_secs total);
+    match !Interp.coverage with Some ran -> print_string (Coverage.to_text (Coverage.report items ran)) | None -> ()
   end;
   exit (if failed = 0 then 0 else 1)
 
@@ -545,13 +559,14 @@ let () =
       | "--bench-time" :: t :: r -> go file { o with bench = Some (parse_bench_time t) } r
       | "--run" :: p :: r -> go file { o with pattern = Some p } r
       | "--json" :: r -> go file { o with json = true } r
+      | "--coverage" :: r -> go file { o with coverage = true } r
       | ("--bench-time" | "--run") :: [] -> die_usage "--bench-time and --run need a value"
       | a :: _ when String.length a > 1 && a.[0] = '-' -> die_usage ("unknown test option " ^ a)
       | f :: r when file = None -> go (Some f) o r
       | _ :: _ -> die_usage "test takes one FILE"
       | [] -> ( match file with Some f -> cmd_test f o | None -> die_usage "test needs a FILE")
     in
-    go None { native = false; bench = None; pattern = None; json = false } rest
+    go None { native = false; bench = None; pattern = None; json = false; coverage = false } rest
   | "doc" :: rest -> cmd_doc rest
   | "fmt" :: rest -> (
     let mode = if List.mem "--write" rest then `Write else if List.mem "--check" rest then `Check else `Print in
@@ -569,11 +584,15 @@ let () =
     match split_grants rest with
     | gs, [ file ] -> cmd_run file gs prog_args
     | gs, ([ "--native"; file ] | [ file; "--native" ]) -> cmd_run_native file gs prog_args
+    | gs, [ a; b; c ] when List.sort compare [ a; b; c ] |> List.filter (fun x -> x = "--native" || x = "--profile") |> List.length = 2 ->
+      Cgen.profile := true;
+      cmd_run_native (List.find (fun x -> x <> "--native" && x <> "--profile") [ a; b; c ]) gs prog_args
     | _ -> die_usage "run needs exactly one FILE")
   | "build" :: rest ->
     let rec go file out dev emit = function
       | "-o" :: o :: r -> go file (Some o) dev emit r
       | "--dev" :: r -> go file out true emit r
+      | "--profile" :: r -> Cgen.profile := true; go file out dev emit r
       | "--emit-c" :: r -> go file out dev true r
       | f :: r when file = None -> go (Some f) out dev emit r
       | [] -> ( match file with Some f -> cmd_build f out dev emit | None -> die_usage "build needs a FILE")

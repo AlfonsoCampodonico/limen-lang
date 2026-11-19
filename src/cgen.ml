@@ -152,7 +152,15 @@ let where (sp : Span.t) =
   let l, col = Source.line_col sp.file sp.lo in
   c_string (sprintf "%s:%d:%d" sp.file l col)
 
-let var (v : I.var) = sprintf "v%d" v.id
+(* A variable's C name: its Limen name and its number (`total_15`), so a
+   debugger and the C itself show which variable is which. Characters C
+   does not allow in a name (the `$` of the compiler's own variables)
+   become `_`; a variable with no name is `v15`. The number keeps every
+   name apart from the others and from C's own. *)
+let var (v : I.var) =
+  let ok c = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c = '_' in
+  let n = String.map (fun c -> if ok c then c else '_') v.name in
+  if n = "" || (n.[0] >= '0' && n.[0] <= '9') then sprintf "v%d" v.id else sprintf "%s_%d" n v.id
 
 let float_lit x =
   if Float.is_nan x then "NAN"
@@ -1009,6 +1017,7 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     | "cap_read_only", _ -> set (sprintf "Cap_fs_read_only(%s)" (arg 0))
     | "cap_read", TCap Conn -> io_result (sprintf "Cap_conn_read(%s)" (arg 0)) "r_.val"
     | "cap_write", TCap Conn -> io_result (sprintf "Cap_conn_write(%s, %s)" (arg 0) (arg 1)) "0"
+    | "cap_start_tls", TCap Conn -> uses_tls := true; io_result (sprintf "Cap_conn_start_tls(%s, %s)" (arg 0) (arg 1)) "0"
     | "cap_read_within", TCap Conn -> io_result (sprintf "Cap_conn_read_within(%s, %s, %s)" (arg 0) (arg 1) (arg 2)) "r_.val"
     | "cap_write_within", TCap Conn -> io_result (sprintf "Cap_conn_write_within(%s, %s, %s, %s)" (arg 0) (arg 1) (arg 2) (arg 3)) "0"
     | "cap_on", _ -> io_result (sprintf "Cap_listen_on(%s, %s)" (arg 0) (arg 1)) "(WCap*)r_.ptr"
@@ -1021,6 +1030,7 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     | "cap_port", _ -> set (sprintf "(int64_t)(%s)->port" (arg 0))
     | "cap_close", _ -> line (sprintf "Cap_sock_close(%s);" (arg 0)); set "0"
     | "cap_read", _ -> io_result (sprintf "Cap_fs_read(%s, %s)" (arg 0) (arg 1)) "r_.val"
+    | "cap_read_at", _ -> io_result (sprintf "Cap_fs_read_at(%s, %s, %s, %s)" (arg 0) (arg 1) (arg 2) (arg 3)) "r_.val"
     | "cap_write", TCap Fs -> io_result (sprintf "Cap_fs_write(%s, %s, %s)" (arg 0) (arg 1) (arg 2)) "0"
     | "cap_exists", _ -> set (sprintf "Cap_fs_exists(%s, %s)" (arg 0) (arg 1))
     | "cap_full_path", TCap Fs -> io_result (sprintf "Cap_fs_full_path(%s, %s)" (arg 0) (arg 1)) "r_.val"
@@ -1419,6 +1429,12 @@ let guard_vols (body : I.stmt list) =
   in
   S.elements (walk S.empty body)
 
+(* `--profile`: each function counts its calls and marks itself current
+   (W_PROF), numbered from 1 in the order the functions are written; 0 is
+   time outside them. *)
+let profile = ref false
+let profile_ids : (string, int) Hashtbl.t = Hashtbl.create 64
+
 let fn_body c out (f : I.fn) =
   c.vols <- guard_vols f.body;
   c.plan <- Pure.plan c.pure f;
@@ -1434,6 +1450,7 @@ let fn_body c out (f : I.fn) =
         cell_decl c line v true)
       f.captures
   end;
+  (match Hashtbl.find_opt profile_ids f.fname with Some k when !profile -> Buffer.add_string out (sprintf "  W_PROF(%d);\n" k) | _ -> ());
   (* a checkpoint on entry: deep recursion stops too *)
   Buffer.add_string out "  W_CHECK();\n";
   stmts c out "  " f.body;
@@ -1817,6 +1834,8 @@ let program (g : Lower.gctx) (prog : I.program) : string =
   in
   (* bodies first: this discovers every type and literal *)
   let bodies = Buffer.create 65536 in
+  Hashtbl.reset profile_ids;
+  if !profile then List.iteri (fun i (f : I.fn) -> Hashtbl.replace profile_ids f.fname (i + 1)) prog.fns;
   List.iter (fun f -> fn_body c bodies f) prog.fns;
   let protos = Buffer.create 4096 in
   List.iter (fun (f : I.fn) -> Buffer.add_string protos (signature c f ^ ";\n")) prog.fns;
@@ -1968,8 +1987,18 @@ let program (g : Lower.gctx) (prog : I.program) : string =
   mp (sprintf "static %s wmain_result_;" (ctype c rt));
   mp (sprintf "static void wmain_entry_(void* a) { (void)a; wmain_result_ = %s(%s); w_main_finished(); }" prog.main
         (if prog.main_takes_root then "w_root()" else ""));
+  if !profile then begin
+    (* a function's name without the `wf_` C names start with *)
+    let shown n = if String.starts_with ~prefix:"wf_" n then String.sub n 3 (String.length n - 3) else n in
+    let n = List.length prog.fns + 1 in
+    mp (sprintf "static const char *const w_prof_names_[%d] = { \"(runtime and C)\"%s };" n
+          (String.concat "" (List.map (fun (f : I.fn) -> sprintf ", \"%s\"" (shown f.fname)) prog.fns)));
+    mp (sprintf "static int64_t w_prof_calls_[%d];" n);
+    mp (sprintf "static int64_t w_prof_samples_[%d];" n)
+  end;
   mp "int main(int argc, char** argv) {";
   mp "  w_init(argc, argv);";
+  if !profile then mp (sprintf "  w_prof_start(w_prof_names_, w_prof_calls_, w_prof_samples_, %d);" (List.length prog.fns + 1));
   mp "  w_run(wmain_entry_, NULL);";
   mp (sprintf "  %s r_ = wmain_result_;" (ctype c rt));
   (match rt with

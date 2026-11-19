@@ -1,0 +1,3 @@
+tls: Some(1) Some("TLSv1.3")
+disable: Some(0)
+redis over tls: Some("yes")

@@ -1,0 +1,62 @@
+use http
+use websocket
+
+fn main(root: Root) -> Result[(), IoError] {
+    // the RFC's example key
+    root.stdout.print("accept key: {websocket.accept_key("dGhlIHNhbXBsZSBub25jZQ==")}")
+    let l = root.listen.on("127.0.0.1:0")?
+    let port = l.port()
+    let got = group g {
+        // the server: echo text upper-cased, binary reversed, then close when asked
+        g.go(|| {
+            let c = l.accept()?
+            http.serve_stream(c, |r, conn| {
+                let ws = websocket.accept(r, conn)?
+                let n = websocket.fold_messages(ws, 0, |count, m| {
+                    match m {
+                        Text(t) => {
+                            let _ = ws.send(t.to_upper())
+                        },
+                        Binary(b) => {
+                            let _ = ws.send_bytes(bytes(b.to_list().reverse()))
+                        },
+                        Close(code, _) => {},
+                    }
+                    count + 1
+                })?
+                root.stdout.print("server saw {n} messages")
+                Ok(())
+            })
+            Ok("")
+        })
+        // the client
+        g.go(|| {
+            let ws = websocket.connect(root.net, root.rand, "ws://127.0.0.1:{port}/echo")?
+            ws.send("hello")?
+            ws.send_bytes(bytes([1, 2, 3]))?
+            let big = (0..<200_000).map(|_| "x").join("")
+            ws.send(big)?
+            ws.ping("are you there")?
+            let seen = websocket.fold_messages(ws, [], |acc: List[Str], m| {
+                let line = match m {
+                    Text(t) => if t.len() > 100 { "text of {t.len()} bytes, {t.slice(0, 3)}..." } else { "text {t}" },
+                    Binary(b) => "binary {b}",
+                    Close(code, reason) => "close {code} {reason}",
+                }
+                if acc.len() == 2 {
+                    let _ = ws.close(1000, "done")
+                }
+                acc + [line]
+            })?
+            Ok(seen.join("; "))
+        })
+    }
+    for r in got {
+        match r {
+            Ok(s) if s != "" => root.stdout.print("client got: {s}"),
+            Err(e) => root.stdout.print("error: {e}"),
+            _ => {},
+        }
+    }
+    Ok(())
+}

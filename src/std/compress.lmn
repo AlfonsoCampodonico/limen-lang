@@ -92,6 +92,94 @@ pub fn gunzip(data: Bytes, max: Int) -> Result[Bytes, Str] {
     Ok(pieces.join("").to_bytes())
 }
 
+// A gzip stream that arrives in pieces, decompressed as it comes:
+// `more(offset)` gives the stream's bytes from `offset` on (empty at the
+// end), and each piece of what it holds goes to `f`, which folds it into
+// `init`. Memory stays at about 100 KB however large the data is, so a
+// file larger than memory can be read with `fs.read_at` a piece at a time
+// (`stream.fold_gzip_lines` does that). Every member's CRC-32 and length
+// are checked, as in `gunzip`.
+pub fn fold_gunzip[T](more: fn(Int) -> Result[Bytes, Str], init: T, f: fn(T, Bytes) -> T) -> Result[T, Str] {
+    let mut data = more(0)?
+    let mut base = 0
+    let mut pos = 0
+    let mut eof = data.is_empty()
+    let mut acc = init
+    let mut first = true
+    while true {
+        // the header, with its name and comment, within the next 64 KB
+        while data.len() - pos < 65536 && !eof {
+            (data, base, pos, eof) = refill(data, base, pos, more)?
+        }
+        let n = data.len()
+        if !first && pos >= n {
+            return Ok(acc)
+        }
+        if n - pos < 2 || data[pos] != 31 || data[pos + 1] != 139 {
+            return Err(if first { "compress: not gzip data" } else { "compress: bytes after the end of the gzip data, at byte {base + pos}" })
+        }
+        if n - pos < 18 {
+            return Err(cut())
+        }
+        if data[pos + 2] != 8 {
+            return Err("compress: gzip compression method {data[pos + 2]} is not deflate")
+        }
+        let flags = data[pos + 3]
+        if flags & 224 != 0 {
+            return Err("compress: reserved gzip header flags are set")
+        }
+        let mut p = pos + 10
+        if flags & 4 != 0 {
+            if p + 2 > n {
+                return Err(cut())
+            }
+            p = p + 2 + (data[p] | data[p + 1] << 8)
+        }
+        if flags & 8 != 0 {
+            p = skip_zero_terminated(data, p)?
+        }
+        if flags & 16 != 0 {
+            p = skip_zero_terminated(data, p)?
+        }
+        if flags & 2 != 0 {
+            if p + 2 > n {
+                return Err(cut())
+            }
+            let want = data[p] | data[p + 1] << 8
+            if crc32(data.slice(pos, p)) & 65535 != want {
+                return Err("compress: the gzip header's CRC does not match")
+            }
+            p = p + 2
+        }
+        if p > n {
+            return Err(cut())
+        }
+        // the data, its CRC-32 and length kept as it goes by
+        let r = inflate_core(data, p, base, more, 0x7fff_ffff_ffff_ffff, (acc, 0, 0), |st: (T, Int, Int), piece: Bytes| (f(st.0, piece), crc32_more(st.1, piece), st.2 + piece.len()))?
+        data = r.data
+        base = r.base
+        pos = r.pos
+        eof = r.eof
+        while data.len() - pos < 8 && !eof {
+            (data, base, pos, eof) = refill(data, base, pos, more)?
+        }
+        if data.len() - pos < 8 {
+            return Err(cut())
+        }
+        let (folded, crc, length) = r.acc
+        if read_little(data, pos) != crc {
+            return Err("compress: the gzip data's CRC-32 does not match")
+        }
+        if read_little(data, pos + 4) != length & 0xffff_ffff {
+            return Err("compress: the gzip data's length does not match")
+        }
+        acc = folded
+        pos = pos + 8
+        first = false
+    }
+    Ok(acc)
+}
+
 // `data` in the zlib format at `level` (0 to 9): a two-byte header, the
 // deflate stream, and an Adler-32 checksum.
 pub fn zlib(data: Bytes, level: Int) -> Bytes {
@@ -161,8 +249,14 @@ pub fn inflate(data: Bytes, max: Int) -> Result[Bytes, Str] {
 // The CRC-32 of `data`, as gzip, zip and PNG use it: `crc32("abc".to_bytes())`
 // is `891568578` (`0x352441c2`).
 pub fn crc32(data: Bytes) -> Int {
+    crc32_more(0, data)
+}
+
+// The CRC-32 of what came before and then `data`, from `crc`, the CRC-32
+// of what came before (0 at the start): for data that arrives in pieces.
+pub fn crc32_more(crc: Int, data: Bytes) -> Int {
     let table = crc_table()
-    let mut c = 0xffff_ffff
+    let mut c = crc ^ 0xffff_ffff
     for i in 0..<data.len() {
         c = table[(c ^ data[i]) & 255] ^ c >> 8
     }
@@ -397,14 +491,19 @@ fn decode(h: Huff, bits: Int, have: Int) -> Int {
 
 // The data of the deflate stream starting at byte `start` of `data`, at
 // most `max` bytes, and the byte after the stream's end.
-fn inflate_at(data: Bytes, start: Int, max: Int) -> Result[(Bytes, Int), Str] {
-    let n = data.len()
+fn inflate_core[T](first: Bytes, start: Int, first_base: Int, more: fn(Int) -> Result[Bytes, Str], max: Int, init: T, f: fn(T, Bytes) -> T) -> Result[Inflated[T], Str] {
+    // the input: `data` holds the source's bytes from offset `base`, and
+    // `more` gives the next ones when they run low
+    let mut data = first
+    let mut base = first_base
+    let mut eof = false
+    let mut n = data.len()
     let mut pos = start
     let mut bits = 0
     let mut have = 0
-    // the output: finished pieces, and the last bytes as Ints, the most
-    // recent 32 KB of which back-references can copy from
-    let mut pieces: List[Str] = []
+    // the output: what is finished goes to `f`; the last bytes stay as
+    // Ints, the most recent 32 KB of which back-references can copy from
+    let mut acc = init
     let mut out: List[Int] = []
     let mut total = 0
     let lbase = length_base()
@@ -413,6 +512,10 @@ fn inflate_at(data: Bytes, start: Int, max: Int) -> Result[(Bytes, Int), Str] {
     let dextra = dist_extra()
     let mut last = false
     while !last {
+        if n - pos < 64 && !eof {
+            (data, base, pos, eof) = refill(data, base, pos, more)?
+            n = data.len()
+        }
         while have < 3 && pos < n {
             bits = bits | data[pos] << have
             pos = pos + 1
@@ -431,6 +534,10 @@ fn inflate_at(data: Bytes, start: Int, max: Int) -> Result[(Bytes, Int), Str] {
             pos = pos - have / 8
             bits = 0
             have = 0
+            while pos + 4 > n && !eof {
+                (data, base, pos, eof) = refill(data, base, pos, more)?
+                n = data.len()
+            }
             if pos + 4 > n {
                 return Err(cut())
             }
@@ -440,6 +547,10 @@ fn inflate_at(data: Bytes, start: Int, max: Int) -> Result[(Bytes, Int), Str] {
                 return Err("compress: a stored block's length does not match its complement")
             }
             pos = pos + 4
+            while pos + len > n && !eof {
+                (data, base, pos, eof) = refill(data, base, pos, more)?
+                n = data.len()
+            }
             if pos + len > n {
                 return Err(cut())
             }
@@ -480,6 +591,10 @@ fn inflate_at(data: Bytes, start: Int, max: Int) -> Result[(Bytes, Int), Str] {
                 let order = length_order()
                 let mut clens = (0..<19).map(|_| 0)
                 for i in 0..<ncode {
+                    if n - pos < 64 && !eof {
+                        (data, base, pos, eof) = refill(data, base, pos, more)?
+                        n = data.len()
+                    }
                     while have < 3 && pos < n {
                         bits = bits | data[pos] << have
                         pos = pos + 1
@@ -495,6 +610,10 @@ fn inflate_at(data: Bytes, start: Int, max: Int) -> Result[(Bytes, Int), Str] {
                 let ch = huff(clens, "code length", false)?
                 let mut lens: List[Int] = []
                 while lens.len() < nlit + ndist {
+                    if n - pos < 64 && !eof {
+                        (data, base, pos, eof) = refill(data, base, pos, more)?
+                        n = data.len()
+                    }
                     while have <= 48 && pos < n {
                         bits = bits | data[pos] << have
                         pos = pos + 1
@@ -538,6 +657,10 @@ fn inflate_at(data: Bytes, start: Int, max: Int) -> Result[(Bytes, Int), Str] {
             // the block's symbols, up to end-of-block (256)
             let mut done = false
             while !done {
+                if n - pos < 64 && !eof {
+                    (data, base, pos, eof) = refill(data, base, pos, more)?
+                    n = data.len()
+                }
                 while have <= 48 && pos < n {
                     bits = bits | data[pos] << have
                     pos = pos + 1
@@ -602,7 +725,7 @@ fn inflate_at(data: Bytes, start: Int, max: Int) -> Result[(Bytes, Int), Str] {
                 // keep 32 KB for back-references and hand the rest on
                 if out.len() >= 98304 {
                     let keep = out.len() - 32768
-                    pieces.push(bytes(out.take(keep)).to_str())
+                    acc = f(acc, bytes(out.take(keep)))
                     out = out.skip(keep)
                 }
             }
@@ -610,8 +733,40 @@ fn inflate_at(data: Bytes, start: Int, max: Int) -> Result[(Bytes, Int), Str] {
     }
     // the stream ends at the byte holding its last bit
     pos = pos - have / 8
-    pieces.push(bytes(out).to_str())
-    Ok((pieces.join("").to_bytes(), pos))
+    if !out.is_empty() {
+        acc = f(acc, bytes(out))
+    }
+    Ok(Inflated { acc, total, data, base, pos, eof })
+}
+
+// What a deflate stream gave, and the input after it: the source's bytes
+// from `base` in `data`, of which `pos` is the first not part of the stream.
+struct Inflated[T] {
+    acc: T,
+    total: Int,
+    data: Bytes,
+    base: Int,
+    pos: Int,
+    eof: Bool,
+}
+
+// More input: the bytes after what `data` holds, keeping the 8 before
+// `pos` (a stored block gives back bytes read ahead). Whether the source
+// has ended.
+fn refill(data: Bytes, base: Int, pos: Int, more: fn(Int) -> Result[Bytes, Str]) -> Result[(Bytes, Int, Int, Bool), Str] {
+    let got = more(base + data.len())?
+    if got.is_empty() {
+        return Ok((data, base, pos, true))
+    }
+    let keep = (pos - 8).max(0)
+    Ok((data.slice(keep, data.len()) + got, base + keep, pos - keep, false))
+}
+
+// A deflate stream in `data` from `start`, all of it there: its bytes, and
+// where it ends.
+fn inflate_at(data: Bytes, start: Int, max: Int) -> Result[(Bytes, Int), Str] {
+    let r = inflate_core(data, start, 0, |_| Ok(bytes([])), max, [], |pieces: List[Str], b| pieces + [b.to_str()])?
+    Ok((r.acc.join("").to_bytes(), r.pos))
 }
 
 fn too_big(max: Int) -> Str {

@@ -14,7 +14,10 @@ type sem = { at : int; len : int; kind : string; mods : string list }
 (* [items]: the whole checked program, every module the file uses included;
    [sem]: the file's semantic tokens, worked out with the checker's state
    right after the analysis *)
-type doc = { path : string; text : string; items : item list option; diags : Diag.t list; occs : Refs.occ list; sem : sem list }
+(* A document as last checked. The reference index and the semantic tokens
+   are built on first use (a hover, a rename, highlighting), not on every
+   change: diagnostics go out as soon as the program is checked. *)
+type doc = { path : string; text : string; items : item list option; diags : Diag.t list; occs : Refs.occ list Lazy.t; sem : sem list Lazy.t }
 type state = { docs : (string, doc) Hashtbl.t; mutable shutdown : bool; mutable exit : bool }
 
 let create () = { docs = Hashtbl.create 8; shutdown = false; exit = false }
@@ -704,8 +707,8 @@ let open_doc st uri text =
   let path = path_of_uri uri in
   set_overlay st path;
   let items, diags = analyze path text in
-  let occs = match items with Some it -> Refs.index it | None -> [] in
-  let sem = match items with Some it -> semantic_tokens path text it occs | None -> [] in
+  let occs = lazy (match items with Some it -> Refs.index it | None -> []) in
+  let sem = lazy (match items with Some it -> semantic_tokens path text it (Lazy.force occs) | None -> []) in
   let d = { path; text; items; diags; occs; sem } in
   Hashtbl.replace st.docs uri d;
   [ publish uri d ]
@@ -745,9 +748,9 @@ let location st (sp : Span.t) =
 
 (* Hover for a name defined elsewhere: its declaration and doc comment. *)
 let symbol_hover d items off =
-  match Refs.at d.occs d.path off with
+  match Refs.at (Lazy.force d.occs) d.path off with
   | Some o when o.key.[0] <> 'l' -> (
-    match Refs.definition d.occs o.key with
+    match Refs.definition (Lazy.force d.occs) o.key with
     | Some def -> (
       let text = Option.value ~default:"" (Source.text def.sp.file) in
       match smallest_at ~file:def.sp.file def.sp.lo (hover_items text items) with
@@ -805,23 +808,23 @@ let handle st (msg : J.t) : J.t list =
   | "textDocument/definition" -> (
     match position st params with
     | Some (_, d, off) -> (
-      match Refs.at d.occs d.path off with
-      | Some o -> ( match Refs.definition d.occs o.key with Some def -> reply (location st def.sp) | None -> reply J.Null)
+      match Refs.at (Lazy.force d.occs) d.path off with
+      | Some o -> ( match Refs.definition (Lazy.force d.occs) o.key with Some def -> reply (location st def.sp) | None -> reply J.Null)
       | None -> reply J.Null)
     | _ -> reply J.Null)
   | "textDocument/references" -> (
     match position st params with
     | Some (_, d, off) -> (
       let with_decl = J.path params [ "context"; "includeDeclaration" ] <> J.Bool false in
-      match Refs.at d.occs d.path off with
+      match Refs.at (Lazy.force d.occs) d.path off with
       | Some o ->
-        reply (J.List (List.filter_map (fun (r : Refs.occ) -> if r.def && not with_decl then None else Some (location st r.sp)) (Refs.references d.occs o.key)))
+        reply (J.List (List.filter_map (fun (r : Refs.occ) -> if r.def && not with_decl then None else Some (location st r.sp)) (Refs.references (Lazy.force d.occs) o.key)))
       | None -> reply J.Null)
     | None -> reply J.Null)
   | "textDocument/prepareRename" -> (
     match position st params with
     | Some (_, d, off) -> (
-      match Refs.at d.occs d.path off with
+      match Refs.at (Lazy.force d.occs) d.path off with
       | Some o -> reply (J.Obj [ ("range", srange d.text o.sp); ("placeholder", J.String o.name) ])
       | None -> reply J.Null)
     | None -> reply J.Null)
@@ -905,7 +908,7 @@ let handle st (msg : J.t) : J.t list =
     | _ -> reply (J.List []))
   | "textDocument/semanticTokens/full" -> (
     match Hashtbl.find_opt st.docs (J.to_str (J.path params [ "textDocument"; "uri" ])) with
-    | Some d -> reply (encode_tokens d.text d.sem)
+    | Some d -> reply (encode_tokens d.text (Lazy.force d.sem))
     | None -> reply J.Null)
   | "textDocument/semanticTokens/range" -> (
     match Hashtbl.find_opt st.docs (J.to_str (J.path params [ "textDocument"; "uri" ])) with
@@ -913,28 +916,60 @@ let handle st (msg : J.t) : J.t list =
       let r = J.member "range" params in
       let lo = offset_of d.text (J.to_int (J.path r [ "start"; "line" ])) (J.to_int (J.path r [ "start"; "character" ])) in
       let hi = offset_of d.text (J.to_int (J.path r [ "end"; "line" ])) (J.to_int (J.path r [ "end"; "character" ])) in
-      reply (encode_tokens d.text ~lo ~hi d.sem)
+      reply (encode_tokens d.text ~lo ~hi (Lazy.force d.sem))
     | None -> reply J.Null)
   | m -> if id = J.Null then [] else [ error id (-32601) ("method not supported: " ^ m) ]
 
 (* ---------- stdio transport ---------- *)
 
-let read_message ic =
-  let rec headers len =
-    match In_channel.input_line ic with
-    | None -> None
-    | Some l ->
-      let l = String.trim l in
-      if l = "" then len
-      else
-        match String.index_opt l ':' with
-        | Some i when String.lowercase_ascii (String.sub l 0 i) = "content-length" ->
-          headers (int_of_string_opt (String.trim (String.sub l (i + 1) (String.length l - i - 1))))
-        | _ -> headers len
-  in
-  match headers None with
+(* stdin, read with Unix.read into a buffer of our own, so the server can
+   tell whether another message has already arrived (an OCaml channel keeps
+   that to itself). *)
+let inbuf = Buffer.create 65536
+
+(* Read what stdin has; with [block], wait for something. False at the end
+   of input. *)
+let fill block =
+  let ready = block || (match Unix.select [ Unix.stdin ] [] [] 0. with r, _, _ -> r <> [] | exception Unix.Unix_error _ -> false) in
+  if not ready then true
+  else begin
+    let b = Bytes.create 65536 in
+    match Unix.read Unix.stdin b 0 65536 with
+    | 0 -> false
+    | n -> Buffer.add_subbytes inbuf b 0 n; true
+    | exception Unix.Unix_error (Unix.EINTR, _, _) -> true
+  end
+
+(* A complete message at the front of [inbuf], taken off it. *)
+let take_message () =
+  let s = Buffer.contents inbuf in
+  let rec header_end i = if i + 3 >= String.length s then None else if String.sub s i 4 = "\r\n\r\n" then Some i else header_end (i + 1) in
+  match header_end 0 with
   | None -> None
-  | Some n -> ( match In_channel.really_input_string ic n with Some s -> Some s | None -> None)
+  | Some h ->
+    let len =
+      List.fold_left
+        (fun acc l ->
+          match String.index_opt l ':' with
+          | Some i when String.lowercase_ascii (String.trim (String.sub l 0 i)) = "content-length" ->
+            int_of_string_opt (String.trim (String.sub l (i + 1) (String.length l - i - 1)))
+          | _ -> acc)
+        None (String.split_on_char '\n' (String.sub s 0 h))
+    in
+    match len with
+    | Some n when String.length s >= h + 4 + n ->
+      let body = String.sub s (h + 4) n in
+      let rest = String.sub s (h + 4 + n) (String.length s - h - 4 - n) in
+      Buffer.clear inbuf;
+      Buffer.add_string inbuf rest;
+      Some body
+    | _ -> None
+
+(* The next message, waiting for it; None at the end of input. *)
+let rec read_message () =
+  match take_message () with
+  | Some m -> Some m
+  | None -> if fill true then read_message () else None
 
 let write_message oc (j : J.t) =
   let s = J.to_string j in
@@ -947,15 +982,38 @@ let serve () =
   set_binary_mode_in stdin true;
   set_binary_mode_out stdout true;
   let st = create () in
+  let run body =
+    match J.parse body with
+    | msg -> List.iter (write_message stdout) (handle st msg)
+    | exception J.Error m -> prerr_endline ("limen lsp: bad JSON: " ^ m)
+  in
+  (* While typing, edits arrive faster than a large program checks: of the
+     changes already waiting, only the newest of each document is checked. *)
+  let change_uri body =
+    match J.parse body with
+    | msg when J.to_str (J.member "method" msg) = "textDocument/didChange" -> Some (J.to_str (J.path (J.member "params" msg) [ "textDocument"; "uri" ]))
+    | _ -> None
+    | exception J.Error _ -> None
+  in
   let rec loop () =
     if not st.exit then
-      match read_message stdin with
+      match read_message () with
       | None -> ()
-      | Some body ->
-        (match J.parse body with
-         | msg -> List.iter (write_message stdout) (handle st msg)
-         | exception J.Error m -> prerr_endline ("limen lsp: bad JSON: " ^ m));
+      | Some first ->
+        let batch = first :: drain [] in
+        let rec keep = function
+          | [] -> []
+          | b :: rest -> (
+            match change_uri b with
+            | Some u when List.exists (fun b' -> change_uri b' = Some u) rest -> keep rest
+            | _ -> b :: keep rest)
+        in
+        List.iter (fun b -> if not st.exit then run b) (keep batch);
         loop ()
+  and drain acc =
+    match take_message () with
+    | Some m -> drain (m :: acc)
+    | None -> if fill false && Buffer.length inbuf > 0 then (match take_message () with Some m -> drain (m :: acc) | None -> List.rev acc) else List.rev acc
   in
   loop ();
   exit (if st.shutdown then 0 else 1)

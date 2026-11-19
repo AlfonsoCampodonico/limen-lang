@@ -1801,7 +1801,7 @@ fn waits(rt: types.Ty, name: Str) -> Option[Str] {
     match (rt, name) {
         (TChan(_), "send" | "recv") => Some("can wait"),
         (TShared(_), _) => Some("takes a lock another task can hold"),
-        (TCap("Clock"), "sleep") | (TCap("Stdin"), _) | (TCap("Listener"), "accept") | (TCap("Conn"), "read" | "write" | "read_within" | "write_within") | (TCap("Exec"), "run") => Some("can wait"),
+        (TCap("Clock"), "sleep") | (TCap("Stdin"), _) | (TCap("Listener"), "accept") | (TCap("Conn"), "read" | "write" | "read_within" | "write_within" | "start_tls") | (TCap("Exec"), "run") => Some("can wait"),
         (TCap("Net"), "get" | "connect" | "connect_tls") => Some("can wait"),
         _ => None,
     }

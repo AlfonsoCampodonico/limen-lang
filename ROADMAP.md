@@ -12,7 +12,7 @@ then harden it, then promise not to break it.
 This file is the plan. The design doc keeps the reasons and the history of
 what was done; its older lists of what was missing point here.
 
-Updated 2026-11-19, after 0.6.0.
+Updated 2026-11-19, after 0.7.0.
 
 ## 0.4: a server you can leave running (done, 0.4.0)
 
@@ -60,10 +60,15 @@ parallel; development builds (`limen build --dev`, `limen run --native`,
 - `#line` directives in the generated C, so lldb, gdb, the sanitizers and
   crash traces point at Limen lines. Done: development builds mark every
   Limen statement and compile with `-g`; under lldb a crash in C called
-  from Limen shows the Limen calls that led to it. Variables still show
-  their C names.
-- Incremental checking for the language server.
-- A profiler and test coverage.
+  from Limen shows the Limen calls that led to it. Variables are named
+  after their Limen names in the C (`total_15`), so a debugger shows them.
+- Incremental checking for the language server. Done in part: diagnostics
+  go out before the reference index is built (on demand now), and of
+  edits that arrive faster than a check, only the newest is checked. A
+  change still checks the whole program (0.1 s to 0.3 s for the largest
+  here); checking only what changed is left.
+- A profiler and test coverage. Done: `limen build --profile` (own CPU
+  time and calls per function, sampled) and `limen test --coverage`.
 
 Done when a crash in a native build shows the Limen line that caused it
 (it does, in a development build).
@@ -71,13 +76,15 @@ Done when a crash in a native build shows the Limen line that caused it
 ## 0.7: streams and the libraries people ask for
 
 - Lazy sequences, so a large file goes through a pipeline line by line
-  instead of being read whole. Decide between an iterator interface the
-  pipelines fuse over and generators.
-- Streaming decompression.
+  instead of being read whole. Decided: folds, as `http.request_fold`
+  already does, since Limen has neither mutable iterators nor generators
+  and a fold needs neither. Done: `fs.read_at` and the `stream` module.
+- Streaming decompression. Done: `compress.fold_gunzip` and
+  `stream.fold_gzip_lines`.
 - A Postgres client. Done early, with Redis: `postgres` and `redis` in
-  the standard library, written in Limen over plain TCP, with pools. Left:
-  TLS for both, which needs a way to start TLS on an open `Conn`.
-- WebSockets.
+  the standard library, written in Limen, with pools and TLS (Postgres
+  through `Conn.start_tls`, verified by default).
+- WebSockets. Done: the `websocket` module, server and client.
 - Encryption and public-key signatures beyond TLS.
 - Integer types besides `Int` outside FFI (bytes, `u32`) and a character
   type with Unicode beyond `chars()` (case folding, normalisation).
