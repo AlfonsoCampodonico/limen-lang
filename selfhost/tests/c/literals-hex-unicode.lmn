@@ -1,0 +1,10 @@
+fn main(root: Root) {
+    let mask = 0xff_00 | 0b1010
+    let biggest = 0x7fff_ffff_ffff_ffff
+    let t = (0x1, 0b0)
+    root.stdout.print("{mask} {biggest} {t.0}")
+    root.stdout.print("caf\u{e9} \u{1F600} {"\u{41}\u{0}"} \u{10ffff}")
+    root.stdout.print("""
+        smile \u{263a} and \{braces\}
+        """)
+}

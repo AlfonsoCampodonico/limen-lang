@@ -1,0 +1,17 @@
+use http
+
+fn routes() -> List[http.Route] {
+    [("GET /", |r, p| http.text(200, "hi")), ("GET /x", |r, p| http.text(200, r.path))]
+}
+
+fn main(root: Root) {
+    root.stdout.print("{routes().len()}")
+    let t: (Str, fn(Str) -> Int) = ("len", |s| s.len())
+    root.stdout.print("{t.1("abc")}")
+    let ops: List[(Str, fn(Int, Int) -> Int)] = [("add", |x, y| x + y), ("mul", |x, y| x * y)]
+    for (name, f) in ops {
+        root.stdout.print("{name} {f(3, 4)}")
+    }
+    let nested: List[(Str, (Int, fn(Int) -> Int))] = [("double", (2, |x| x * 2))]
+    root.stdout.print("{(nested[0].1).1(5)}")
+}

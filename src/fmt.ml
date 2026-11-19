@@ -752,7 +752,11 @@ let item c (it : item) =
     trailing c d.fn_body.bspan.hi
   | IFn d ->
     new_line c 0;
-    let params = List.map (fun p -> p.prm_name ^ ": " ^ ty p.prm_ty) d.fn_params in
+    let params =
+      List.map
+        (fun p -> p.prm_name ^ ": " ^ ty p.prm_ty ^ match p.prm_default with Some e -> " = " ^ bare_slice c e.espan | None -> "")
+        d.fn_params
+    in
     add c ((if d.fn_pub then "pub " else "") ^ "fn " ^ d.fn_name ^ bgens d.fn_gen d.fn_bounds);
     if breaks_after_open c d.fn_span.hi '(' && params <> [] then begin
       add c "(";

@@ -1,0 +1,7 @@
+use sql
+
+fn get[T](db: sql.Db) -> Result[List[T], IoError] {
+    db.all("SELECT 1")
+}
+
+fn main(root: Root) {}

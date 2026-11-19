@@ -1,0 +1,7 @@
+use sql
+
+fn get(db: sql.Db) -> Result[Option[Int], IoError] {
+    db.one("SELECT 1")
+}
+
+fn main(root: Root) {}

@@ -20,7 +20,7 @@ pub fn gzip(data: Bytes, level: Int) -> Bytes {
     let body = deflate(data, level)
     let flag = if level == 9 { 2 } else if level == 1 { 4 } else { 0 }
     let crc = crc32(data)
-    let size = data.len() & 4294967295
+    let size = data.len() & 0xffff_ffff
     bytes([31, 139, 8, 0, 0, 0, 0, 0, flag, 255]) + body + bytes(little(crc) + little(size))
 }
 
@@ -82,7 +82,7 @@ pub fn gunzip(data: Bytes, max: Int) -> Result[Bytes, Str] {
         if read_little(data, end) != crc32(out) {
             return Err("compress: the gzip data's CRC-32 does not match")
         }
-        if read_little(data, end + 4) != out.len() & 4294967295 {
+        if read_little(data, end + 4) != out.len() & 0xffff_ffff {
             return Err("compress: the gzip data's length does not match")
         }
         pieces.push(out.to_str())
@@ -162,11 +162,11 @@ pub fn inflate(data: Bytes, max: Int) -> Result[Bytes, Str] {
 // is `891568578` (`0x352441c2`).
 pub fn crc32(data: Bytes) -> Int {
     let table = crc_table()
-    let mut c = 4294967295
+    let mut c = 0xffff_ffff
     for i in 0..<data.len() {
         c = table[(c ^ data[i]) & 255] ^ c >> 8
     }
-    c ^ 4294967295
+    c ^ 0xffff_ffff
 }
 
 // The Adler-32 checksum of `data`, as zlib uses it.
@@ -225,7 +225,7 @@ fn crc_table() -> List[Int] {
     for n in 0..<256 {
         let mut c = n
         for _ in 0..<8 {
-            c = if c & 1 == 1 { 3988292384 ^ c >> 1 } else { c >> 1 }
+            c = if c & 1 == 1 { 0xedb88320 ^ c >> 1 } else { c >> 1 }
         }
         table.push(c)
     }

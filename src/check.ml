@@ -576,6 +576,12 @@ let foreign_fns : (string, unit) Hashtbl.t = Hashtbl.create 8
    (keyed `Interface::method`, without `self`). *)
 let param_names : (string, string list) Hashtbl.t = Hashtbl.create 64
 
+(* The default values of a function's parameters, keyed like [param_names]
+   and in the same order: `None` for a parameter that must be passed. A call
+   that leaves an argument out gets the default itself, checked once where
+   the function is declared. *)
+let param_defaults : (string, expr option list) Hashtbl.t = Hashtbl.create 64
+
 let is_named (a : expr) = match a.edesc with ENamed _ -> true | _ -> false
 
 let unlabel (a : expr) = match a.edesc with ENamed (_, _, v) -> v | _ -> a
@@ -1052,8 +1058,27 @@ and expect ctx f e want =
     e.ety <- t;
     unify_at ctx e.espan want t
   | EBlock b, _ -> expect_block ctx f b want; e.ety <- want
+  (* the expected type reaches into a list or tuple literal when an item
+     needs it: a closure whose parameters have no types, as in
+     `[("GET /", |r, p| ...)]` *)
+  | EList es, TList el when List.exists needs_type es ->
+    List.iter (fun x -> expect ctx f x el) es;
+    e.ety <- want
+  | EStruct (n, _, fields), TNamed (tn, ts)
+    when is_tuple_name n && n = tn && List.length fields = List.length ts && List.exists (fun (_, _, x) -> needs_type x) fields ->
+    List.iter2 (fun (_, _, x) t -> expect ctx f x t) fields ts;
+    e.ety <- want
   | _, TDyn (i, a) -> coerce ctx e (check_expr ctx f e) (i, a)
   | _ -> expect_plain ctx f e want
+
+(* Whether [e] needs the expected type to be checked: a closure with a
+   parameter that has no type, alone or inside a list or tuple literal. *)
+and needs_type (e : expr) =
+  match e.edesc with
+  | EClosure (ps, _) -> List.exists (fun (_, t, _) -> t = None) ps
+  | EList es -> List.exists needs_type es
+  | EStruct (n, _, fields) when is_tuple_name n -> List.exists (fun (_, _, x) -> needs_type x) fields
+  | _ -> false
 
 (* A value used where `dyn I` is expected: box it if its type satisfies I. *)
 and coerce ctx e t ((i, _) as b) =
@@ -1175,8 +1200,8 @@ and check_args ctx f args = List.iter (fun a -> ignore (check_expr ctx f (unlabe
    the arguments in parameter order without their labels, or None after
    reporting what is wrong. [names] are the callee's parameter names, or why
    it has none. *)
-and order_args ctx ~what ~sp names args =
-  if not (List.exists is_named args) then Some args
+and order_args ?(defaults = []) ctx ~what ~sp names args =
+  if not (List.exists is_named args) && List.length args >= List.length defaults then Some args
   else
     match names with
     | Error why ->
@@ -1216,6 +1241,8 @@ and order_args ctx ~what ~sp names args =
         err ctx "E0107" sp
           (sprintf "%s takes %d argument%s but %d %s supplied" what n (plural n) total (if total = 1 then "was" else "were"))
       end;
+      (* a parameter left out takes its default *)
+      List.iteri (fun j d -> match (slots.(j), d) with None, Some (d : expr) -> slots.(j) <- Some d | _ -> ()) (List.filteri (fun j _ -> j < n) defaults);
       let missing = ref (List.filteri (fun j _ -> slots.(j) = None) names) in
       let notes = [ sprintf "its parameters are: %s" (if names = [] then "none" else String.concat ", " names) ] in
       (match (!unknown, !missing) with
@@ -1245,7 +1272,7 @@ and order_args ctx ~what ~sp names args =
           (fun m ->
             ok := false;
             err ctx "E0107" sp (sprintf "%s is missing the argument for parameter `%s`" what m)
-              ~notes:[ "every parameter must be passed; Limen has no default values" ])
+              ~notes:[ "every parameter without a default value must be passed" ])
           !missing;
       if !ok then Some (List.map Option.get (Array.to_list slots)) else None
 
@@ -1293,6 +1320,9 @@ and method_params key =
   match Hashtbl.find_opt param_names key with
   | Some (_ :: ps) -> Ok ps
   | _ -> Error "this method takes its arguments by position"
+
+(* Default values of the method [key]'s parameters, without `self`. *)
+and method_defaults key = match Hashtbl.find_opt param_defaults key with Some (_ :: ds) -> ds | _ -> []
 
 and check_call ?want ctx f e callee args sp =
   match callee.edesc with
@@ -1381,10 +1411,16 @@ and check_call ?want ctx f e callee args sp =
        | Some w, (EVar _ | EField _) when (match repr r with TNamed (n, _) -> Hashtbl.mem ctx.enums n | _ -> false) ->
          (try unify r w with Mismatch -> ())
        | _ -> ());
-      match order_args ctx ~what ~sp names args with
+      let defaults =
+        match callee.edesc with
+        | EVar n when not (is_local f n) -> Option.value ~default:[] (Hashtbl.find_opt param_defaults n)
+        | _ -> []
+      in
+      match order_args ~defaults ctx ~what ~sp names args with
       | None -> check_args ctx f args; r
       | Some args' ->
-      let labelled = List.exists is_named args in
+      (* reordered by labels, or with defaults filled in: the call is rewritten *)
+      let labelled = List.exists is_named args || List.length args' <> List.length args in
       let args, written = (args', List.map unlabel args) in
       if List.length ps <> List.length args then begin
         err ctx "E0107" sp
@@ -1661,10 +1697,10 @@ and check_method_value ?rt ctx f e recv name nsp args =
     match t with
     | TFn (p0 :: ps, r) -> (
       unify_at ctx recv.espan p0 rt;
-      match order_args ctx ~what:(sprintf "method `%s`" name) ~sp:nsp (method_params key) args with
+      match order_args ~defaults:(method_defaults key) ctx ~what:(sprintf "method `%s`" name) ~sp:nsp (method_params key) args with
       | None -> check_args ctx f args; r
       | Some args' ->
-      let labelled = List.exists is_named args in
+      let labelled = List.exists is_named args || List.length args' <> List.length args in
       let args, written = (args', recv :: List.map unlabel args) in
       if List.length ps <> List.length args then begin
         err ctx "E0107" nsp
@@ -1699,10 +1735,13 @@ and check_method_value ?rt ctx f e recv name nsp args =
     match t with
     | TFn (p0 :: ps, r) -> (
       unify_at ctx recv.espan p0 rt;
-      match order_args ctx ~what:(sprintf "method `%s`" name) ~sp:nsp (method_params (n ^ "::" ^ name)) args with
+      match
+        order_args ~defaults:(method_defaults (n ^ "::" ^ name)) ctx ~what:(sprintf "method `%s`" name) ~sp:nsp
+          (method_params (n ^ "::" ^ name)) args
+      with
       | None -> check_args ctx f args; r
       | Some args' ->
-      let labelled = List.exists is_named args in
+      let labelled = List.exists is_named args || List.length args' <> List.length args in
       let args, written = (args', recv :: List.map unlabel args) in
       if List.length ps <> List.length args then begin
         err ctx "E0107" nsp
@@ -2917,8 +2956,23 @@ let check_fn ctx (d : fn_decl) (s : fsig) =
     (fun p t -> Hashtbl.replace scope.vars p.prm_name { vty = t; vmut = false; vspan = p.prm_span; vkind = KParam })
     d.fn_params s.ps;
   let f = { ret_ty = s.ret; scopes = [ scope ]; loops = 0; genv; in_group = 0; in_defer = 0; ret_te = d.fn_ret } in
+  (* a default is checked here, once, against a type that is the same at
+     every call: one without the function's type parameters *)
+  List.iter2
+    (fun p t ->
+      match p.prm_default with
+      | Some dv when Types.exists (fun u -> match u with TParam _ -> true | _ -> false) t ->
+        err ctx "E0123" dv.espan
+          (sprintf "`%s` cannot have a default: its type `%s` uses a type parameter" p.prm_name (show t))
+          ~notes:[ "a default is checked once, so its type must be the same at every call" ]
+      | Some dv -> expect ctx { f with scopes = [] } dv t
+      | None -> ())
+    d.fn_params s.ps;
   match repr s.ret with
   | t when has_dyn t -> expect_block ctx f d.fn_body s.ret (* the body's value becomes `dyn`, branch by branch *)
+  | _ when (match d.fn_body.tail with Some x -> needs_type x | None -> false) ->
+    (* a closure in the body's value takes its types from the return type *)
+    expect_block ctx f d.fn_body s.ret
   | _ ->
   let bt = check_block ctx f d.fn_body in
   try unify s.ret bt
@@ -3053,6 +3107,7 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
       (function IFn d -> Some (d.fn_span.Span.file, d.fn_span.lo, max d.fn_span.hi d.fn_body.bspan.hi) | _ -> None)
       user_items;
   Hashtbl.reset param_names;
+  Hashtbl.reset param_defaults;
   Hashtbl.reset ifaces;
   List.iter (fun b -> Hashtbl.replace ifaces b []) builtin_bounds;
   Hashtbl.reset fn_bounds;
@@ -3282,6 +3337,8 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
           let s = { gen = d.fn_gen; ps; ret } in
           if d.fn_foreign = None && not (Hashtbl.mem ctx.fns d.fn_name) then
             Hashtbl.replace param_names d.fn_name (List.map (fun p -> p.prm_name) d.fn_params);
+          if d.fn_foreign = None && (not (Hashtbl.mem ctx.fns d.fn_name)) && List.exists (fun p -> p.prm_default <> None) d.fn_params then
+            Hashtbl.replace param_defaults d.fn_name (List.map (fun p -> p.prm_default) d.fn_params);
           check_self ctx d ps;
           let declared =
             List.filter_map (fun (g, tes) -> match List.filter_map (resolve_bound ctx env) tes with [] -> None | bs -> Some (g, bs)) d.fn_bounds

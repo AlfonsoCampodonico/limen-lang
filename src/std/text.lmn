@@ -12,7 +12,7 @@ pub fn repeat(s: Str, n: Int) -> Str {
 }
 
 // `s` padded on the left with `fill` to at least `width` bytes.
-pub fn pad_left(s: Str, width: Int, fill: Str) -> Str {
+pub fn pad_left(s: Str, width: Int, fill: Str = " ") -> Str {
     let mut out = s
     while out.len() < width && fill != "" {
         out = fill + out
@@ -21,7 +21,7 @@ pub fn pad_left(s: Str, width: Int, fill: Str) -> Str {
 }
 
 // `s` padded on the right with `fill` to at least `width` bytes.
-pub fn pad_right(s: Str, width: Int, fill: Str) -> Str {
+pub fn pad_right(s: Str, width: Int, fill: Str = " ") -> Str {
     let mut out = s
     while out.len() < width && fill != "" {
         out = out + fill

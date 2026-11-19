@@ -2,7 +2,7 @@
 // bound by SQLite itself, never pasted into the SQL text.
 //
 //   let db = sql.open(root.fs, "app.db")?      // --grant fs=DIR
-//   db.exec("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT)", [])?
+//   db.exec("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT)")?
 //   db.exec("INSERT INTO users (name) VALUES (?)", [sql.Text("Ada")])?
 //   for row in db.query("SELECT id, name FROM users WHERE id > ?", [sql.Int(0)])? {
 //       out.print("{row.int("id") ?? 0} {row.text("name") ?? "?"}")
@@ -300,20 +300,20 @@ fn run(db: Handle, text: Str, params: List[Value], mode: Int, what: Str) -> Resu
 // its next step, or within a thousand of SQLite's instructions inside one,
 // and the task waits for that before it unwinds. Other tasks' statements on
 // the same connection go on.
-pub fn exec(self: Db, text: Str, params: List[Value]) -> Result[Int, IoError] {
+pub fn exec(self: Db, text: Str, params: List[Value] = []) -> Result[Int, IoError] {
     let mode = if params.is_empty() { all_mode() } else { once_mode() }
     let ran = self.using(|db| run(db, text, params, mode, "exec"))?
     Ok(ran.changes)
 }
 
 // Run one statement and collect every row it returns.
-pub fn query(self: Db, text: Str, params: List[Value]) -> Result[List[Row], IoError] {
+pub fn query(self: Db, text: Str, params: List[Value] = []) -> Result[List[Row], IoError] {
     let ran = self.using(|db| run(db, text, params, rows_mode(), "query"))?
     Ok(ran.rows)
 }
 
 // The first row, if any: for queries that look one thing up.
-pub fn query_one(self: Db, text: Str, params: List[Value]) -> Result[Option[Row], IoError] {
+pub fn query_one(self: Db, text: Str, params: List[Value] = []) -> Result[Option[Row], IoError] {
     let rows = self.query(text, params)?
     if rows.is_empty() { Ok(None) } else { Ok(Some(rows[0])) }
 }
@@ -329,30 +329,30 @@ pub fn transaction[T](self: Db, body: fn() -> Result[T, IoError]) -> Result[T, I
     if !self.using(|db| Ok(sqlite3_get_autocommit(db)))? {
         return Err(Failed("sql: a transaction is already open on this connection"))
     }
-    self.exec("BEGIN", [])?
+    self.exec("BEGIN")?
     // a cancellation passes every `catch`: roll back then too
     let mut settled = false
     defer if !settled {
-        let _ = self.exec("ROLLBACK", [])
+        let _ = self.exec("ROLLBACK")
     }
     let r = catch(body)
     settled = true
     match r {
         Ok(Ok(v)) => {
-            match self.exec("COMMIT", []) {
+            match self.exec("COMMIT") {
                 Ok(_) => Ok(v),
                 Err(e) => {
-                    self.exec("ROLLBACK", [])
+                    self.exec("ROLLBACK")
                     Err(e)
                 },
             }
         },
         Ok(Err(e)) => {
-            self.exec("ROLLBACK", [])
+            self.exec("ROLLBACK")
             Err(e)
         },
         Err(msg) => {
-            self.exec("ROLLBACK", [])
+            self.exec("ROLLBACK")
             panic(msg)
         },
     }
@@ -419,5 +419,156 @@ pub fn is_null(self: Row, name: Str) -> Bool {
     match self.get(name) {
         Null => true,
         _ => false,
+    }
+}
+
+// ---------- structs as rows ----------
+//
+// `sql.decode(row)`, `db.all(text, params)`, `db.one(text, params)` and
+// `sql.values(x)` convert between rows and your own structs:
+//
+//   struct Todo { id: Int, title: Str, done: Bool }
+//   let todos: List[Todo] = db.all("SELECT id, title, done FROM todos")?
+//   db.exec("INSERT INTO todos (id, title, done) VALUES (?, ?, ?)", sql.values(t))?
+//
+// The compiler writes the conversion for each struct they are used with
+// (src/derive.ml): each field reads the column of the same name, and
+// writes in the order the struct declares its fields. A field is Int,
+// Float, Str, Bool (stored as 0 or 1), Bytes, or an Option of one of those
+// for a column that may be NULL. The bodies here never run.
+
+// The struct `T` read from `row`, each field from the column of its name.
+pub fn decode[T](row: Row) -> Result[T, IoError] {
+    panic("sql.decode: the compiler writes this for each struct it is used with")
+}
+
+// Every row the query returns, each read as a `T`.
+pub fn all[T](self: Db, text: Str, params: List[Value] = []) -> Result[List[T], IoError] {
+    panic("sql.all: the compiler writes this for each struct it is used with")
+}
+
+// The first row the query returns, if any, read as a `T`.
+pub fn one[T](self: Db, text: Str, params: List[Value] = []) -> Result[Option[T], IoError] {
+    panic("sql.one: the compiler writes this for each struct it is used with")
+}
+
+// The fields of `x` as parameters, in the order the struct declares them.
+pub fn values[T](x: T) -> List[Value] {
+    panic("sql.values: the compiler writes this for each struct it is used with")
+}
+
+// What the written conversions are made of. `owner` is the struct's name,
+// for the errors.
+
+fn column_of(row: Row, field: Str, owner: Str) -> Result[Value, IoError] {
+    for (i, c) in row.columns.with_index() {
+        if c == field {
+            return Ok(row.values[i])
+        }
+    }
+    Err(Failed("sql: no column `{field}` for `{owner}.{field}`; the row has {row.columns.join(", ")}"))
+}
+
+fn holds(v: Value) -> Str {
+    match v {
+        Null => "NULL",
+        Int(_) => "an integer",
+        Float(_) => "a number",
+        Text(_) => "text",
+        Blob(_) => "a blob",
+    }
+}
+
+fn mismatch(v: Value, field: Str, owner: Str, want: Str) -> IoError {
+    Failed("sql: column `{field}` holds {holds(v)}, but `{owner}.{field}` is {want}")
+}
+
+fn required[T](v: Option[T], field: Str, owner: Str) -> Result[T, IoError] {
+    match v {
+        Some(x) => Ok(x),
+        None => Err(Failed("sql: column `{field}` is NULL, but `{owner}.{field}` is not an Option")),
+    }
+}
+
+fn int_at(row: Row, field: Str, owner: Str) -> Result[Option[Int], IoError] {
+    match column_of(row, field, owner)? {
+        Int(n) => Ok(Some(n)),
+        Null => Ok(None),
+        v => Err(mismatch(v, field, owner, "an `Int`")),
+    }
+}
+
+fn float_at(row: Row, field: Str, owner: Str) -> Result[Option[Float], IoError] {
+    match column_of(row, field, owner)? {
+        Float(x) => Ok(Some(x)),
+        Int(n) => Ok(Some(n.to_float())),
+        Null => Ok(None),
+        v => Err(mismatch(v, field, owner, "a `Float`")),
+    }
+}
+
+fn str_at(row: Row, field: Str, owner: Str) -> Result[Option[Str], IoError] {
+    match column_of(row, field, owner)? {
+        Text(s) => Ok(Some(s)),
+        Null => Ok(None),
+        v => Err(mismatch(v, field, owner, "a `Str`")),
+    }
+}
+
+fn bool_at(row: Row, field: Str, owner: Str) -> Result[Option[Bool], IoError] {
+    match column_of(row, field, owner)? {
+        Int(n) => Ok(Some(n != 0)),
+        Null => Ok(None),
+        v => Err(mismatch(v, field, owner, "a `Bool` (stored as 0 or 1)")),
+    }
+}
+
+fn bytes_at(row: Row, field: Str, owner: Str) -> Result[Option[Bytes], IoError] {
+    match column_of(row, field, owner)? {
+        Blob(b) => Ok(Some(b)),
+        Null => Ok(None),
+        v => Err(mismatch(v, field, owner, "`Bytes`")),
+    }
+}
+
+fn of_int(x: Int) -> Value {
+    Int(x)
+}
+
+fn of_float(x: Float) -> Value {
+    Float(x)
+}
+
+fn of_str(x: Str) -> Value {
+    Text(x)
+}
+
+fn of_bool(x: Bool) -> Value {
+    Int(if x { 1 } else { 0 })
+}
+
+fn of_bytes(x: Bytes) -> Value {
+    Blob(x)
+}
+
+fn of_option[T](x: Option[T], f: fn(T) -> Value) -> Value {
+    match x {
+        Some(v) => f(v),
+        None => Null,
+    }
+}
+
+fn rows_as[T](rows: List[Row], read: fn(Row) -> Result[T, IoError]) -> Result[List[T], IoError] {
+    let mut out: List[T] = []
+    for r in rows {
+        out.push(read(r)?)
+    }
+    Ok(out)
+}
+
+fn row_as[T](row: Option[Row], read: fn(Row) -> Result[T, IoError]) -> Result[Option[T], IoError] {
+    match row {
+        Some(r) => Ok(Some(read(r)?)),
+        None => Ok(None),
     }
 }

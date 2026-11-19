@@ -12,7 +12,7 @@ then harden it, then promise not to break it.
 This file is the plan. The design doc keeps the reasons and the history of
 what was done; its older lists of what was missing point here.
 
-Updated 2026-11-18, after 0.4.0.
+Updated 2026-11-19, after 0.5.0.
 
 ## 0.4: a server you can leave running (done, 0.4.0)
 
@@ -29,23 +29,25 @@ statement as one blocking call, finished tasks freed at once so
 `serve_forever` stays flat, `json.Int`, fuzzers for the HTTP server and JSON,
 and CI on x86-64 and arm64 Linux and on macOS.
 
-## 0.5: less to write
+## 0.5: less to write (done, 0.5.0)
 
 The things newcomers hit in their first hour.
 
-- Converting a struct to and from SQL rows without writing every field by
-  hand. JSON is done, and shipped early in 0.4.0: `json.encode(x)` and `json.decode(s)` work for any
-  type made of JSON's parts, and the compiler writes the conversion for
-  each type they are used with, so `todo_api.lmn` lost its hand-written
-  JSON code.
-- Closure parameter types inferred inside a tuple in a list literal, so
-  `[("GET /", |r, p| ...)]` checks.
+- Converting a struct to and from JSON and SQL rows without writing every
+  field by hand: `json.encode(x)` and `json.decode(s)` (shipped early in
+  0.4.0), and `db.all(text, params)`, `db.one(text, params)`,
+  `sql.decode(row)` and `sql.values(x)`. The compiler writes the
+  conversion for each type they are used with.
+- Closure parameter types inferred inside a list or tuple literal, so
+  `[("GET /", |r, p| ...)]` checks where the type is known.
 - Hex and binary literals (`0xff`, `0b1010`) and a `\u{...}` string escape.
-- Default parameter values.
-- Struct patterns in `let` and `for`.
+- Default parameter values, constants only: `fn join(xs: List[Str], sep:
+  Str = ", ")`. The standard library uses them where callers passed the
+  same thing every time (`db.exec("CREATE TABLE ...")`).
+- Struct patterns in `let` and `for`: `for Todo { id, title, .. } in todos`.
 
-Done when `todo_api.lmn` is noticeably shorter with nothing hand-written
-that the compiler could have written.
+`todo_api.lmn` went from 394 lines in 0.4.0 to 351, with no JSON or row
+code written by hand.
 
 ## 0.6: debugging
 

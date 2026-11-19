@@ -1,0 +1,36 @@
+use sql
+
+struct Todo {
+    id: Int,
+    title: Str,
+    done: Bool,
+    note: Option[Str],
+    score: Float,
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let db = sql.memory()?
+    db.exec("CREATE TABLE todos (id INTEGER PRIMARY KEY, title TEXT, done INTEGER, note TEXT, score REAL)")?
+    let t = Todo { id: 1, title: "write", done: false, note: None, score: 2.5 }
+    db.exec("INSERT INTO todos VALUES (?, ?, ?, ?, ?)", sql.values(t))?
+    db.exec("INSERT INTO todos VALUES (?, ?, ?, ?, ?)", sql.values(Todo { id: 2, title: "ship", done: true, note: Some("soon"), score: 3.0 }))?
+    let all: List[Todo] = db.all("SELECT * FROM todos ORDER BY id")?
+    for x in all {
+        root.stdout.print("{x.id} {x.title} {x.done} {x.note ?? "-"} {x.score}")
+    }
+    let one: Option[Todo] = db.one("SELECT * FROM todos WHERE id = ?", [sql.Int(2)])?
+    root.stdout.print("{one.map(|t| t.title) ?? "none"}")
+    let none: Option[Todo] = db.one("SELECT * FROM todos WHERE id = 9")?
+    root.stdout.print("{none.is_none()}")
+    for row in db.query("SELECT * FROM todos")? {
+        let t: Todo = sql.decode(row)?
+        root.stdout.print(t.title)
+    }
+    let bad: Result[List[Todo], IoError] = db.all("SELECT id, title FROM todos")
+    root.stdout.print("{bad}")
+    let nul: Result[List[Todo], IoError] = db.all("SELECT id, NULL AS title, done, note, score FROM todos")
+    root.stdout.print("{nul}")
+    let wrong: Result[List[Todo], IoError] = db.all("SELECT id, title, 'x' AS done, note, score FROM todos")
+    root.stdout.print("{wrong}")
+    Ok(())
+}

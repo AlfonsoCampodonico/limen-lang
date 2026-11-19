@@ -1,0 +1,32 @@
+struct Point {
+    x: Int,
+    y: Int,
+}
+
+struct Line {
+    from: Point,
+    to: Point,
+    name: Str,
+}
+
+struct Pair[A, B] {
+    a: A,
+    b: B,
+}
+
+fn main(root: Root) {
+    let p = Point { x: 1, y: 2 }
+    let Point { x, y } = p
+    root.stdout.print("{x} {y}")
+    let l = Line { from: p, to: Point { x: 5, y: 6 }, name: "l" }
+    let Line { from: Point { x: x1, .. }, to: Point { y: y2, .. }, .. } = l
+    root.stdout.print("{x1} {y2}")
+    let Pair { a, b: (c, _) } = Pair { a: "s", b: (true, 3) }
+    root.stdout.print("{a} {c}")
+    for Point { x, y: _ } in [p, Point { x: 9, y: 0 }] {
+        root.stdout.print("x={x}")
+    }
+    for (i, Point { y, .. }) in [p].with_index() {
+        root.stdout.print("{i}: {y}")
+    }
+}

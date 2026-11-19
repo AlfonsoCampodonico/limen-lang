@@ -197,7 +197,7 @@ fn generics(gs: List[Str], bounds: List[ast.Bound]) -> Str {
 }
 
 fn params(ps: List[ast.Param]) -> Str {
-    commas(ps, |p| p.name + ":" + ty(p.ty))
+    commas(ps, |p| p.name + ":" + ty(p.ty) + (p.default.map(|e| "=" + expr(e)) ?? ""))
 }
 
 fn ret(t: Option[ast.TyExpr]) -> Str {

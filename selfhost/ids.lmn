@@ -37,6 +37,12 @@ pub fn item(i: ast.Item, next: Int) -> (ast.Item, Int) {
 }
 
 fn function(d: ast.FnDecl, next: Int) -> (ast.FnDecl, Int) {
+    // parameters' defaults first, then a table test's cases, then the body
+    let (params, next) = each(d.params, next, |prm, n| {
+        let (default, n) = maybe(prm.default, n, expr)
+        ({ prm with default }, n)
+    })
+    let d = { d with params }
     let (table, n) = maybe(d.table, next, |t, n| {
         let (cases, n) = expr(t.cases, n)
         ({ t with cases }, n)

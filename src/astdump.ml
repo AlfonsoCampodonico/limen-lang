@@ -124,7 +124,7 @@ let item = function
     ^ "fn " ^ d.fn_name ^ "["
     ^ gens d.fn_gen d.fn_bounds
     ^ "]("
-    ^ String.concat "," (List.map (fun p -> p.prm_name ^ ":" ^ ty p.prm_ty) d.fn_params)
+    ^ String.concat "," (List.map (fun p -> p.prm_name ^ ":" ^ ty p.prm_ty ^ match p.prm_default with Some e -> "=" ^ expr e | None -> "") d.fn_params)
     ^ ")" ^ (match d.fn_ret with Some t -> ty t | None -> "") ^ block d.fn_body
   | IStruct s -> (match s.st_foreign with Some (l, _) -> "foreign " ^ String.escaped l ^ " " | None -> "") ^ "struct " ^ s.st_name ^ "[" ^ gens s.st_gen s.st_bounds ^ "]{" ^ String.concat "," (List.map (fun (f, _, t) -> if List.mem f s.st_embeds then "embed " ^ ty t else f ^ ":" ^ ty t) s.st_fields) ^ "}"
   | IEnum e ->

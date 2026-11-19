@@ -1,0 +1,11 @@
+use sql
+
+struct Bag {
+    items: List[Int],
+}
+
+fn get(db: sql.Db) -> Result[List[Bag], IoError] {
+    db.all("SELECT 1")
+}
+
+fn main(root: Root) {}

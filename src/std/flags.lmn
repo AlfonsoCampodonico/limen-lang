@@ -68,12 +68,12 @@ pub fn spec(program: Str, about: Str) -> Spec {
 }
 
 // A boolean flag, `--name` (and `-short` unless `short` is ""): `p.bool(name)`.
-pub fn flag(self: Spec, name: Str, short: Str, help: Str) -> Spec {
+pub fn flag(self: Spec, name: Str, short: Str = "", help: Str = "") -> Spec {
     self.add(Flag { name, short, help, takes_value: false, value_name: "", default: None, required: false })
 }
 
 // A flag with a value, `--name VALUE`: `p.get(name)`, `p.int(name)`, ...
-pub fn option(self: Spec, name: Str, short: Str, help: Str) -> Spec {
+pub fn option(self: Spec, name: Str, short: Str = "", help: Str = "") -> Spec {
     self.add(Flag { name, short, help, takes_value: true, value_name: name.to_upper().replace("-", "_"), default: None, required: false })
 }
 
@@ -130,7 +130,7 @@ pub fn value_name(self: Spec, name: Str) -> Spec {
 }
 
 // A required positional argument, after those declared before it.
-pub fn positional(self: Spec, name: Str, help: Str) -> Spec {
+pub fn positional(self: Spec, name: Str, help: Str = "") -> Spec {
     let mut positionals = self.positionals
     positionals.push(Arg { name, help })
     { self with positionals }
@@ -138,7 +138,7 @@ pub fn positional(self: Spec, name: Str, help: Str) -> Spec {
 
 // Any number of arguments after the positional ones (none without this):
 // `p.rest()`.
-pub fn rest(self: Spec, name: Str, help: Str) -> Spec {
+pub fn rest(self: Spec, name: Str, help: Str = "") -> Spec {
     { self with rest_name: name, rest_help: help }
 }
 

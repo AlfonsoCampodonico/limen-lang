@@ -10,7 +10,7 @@ use text
 
 fn setup(db: sql.Db) -> Result[(), IoError] {
     db.exec("CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, tag TEXT NOT NULL, body TEXT NOT NULL, stars INTEGER)
-        ; CREATE INDEX IF NOT EXISTS notes_tag ON notes (tag)", [])?
+        ; CREATE INDEX IF NOT EXISTS notes_tag ON notes (tag)")?
     Ok(())
 }
 
@@ -47,7 +47,7 @@ fn demo(out: Stdout) -> Result[(), IoError] {
     })?
     list(db, out, "reading")?
     list(db, out, "films")?
-    match db.query_one("SELECT count(*) AS n FROM notes", [])? {
+    match db.query_one("SELECT count(*) AS n FROM notes")? {
         Some(row) => out.print("{row.int("n") ?? 0} notes"),
         None => (),
     }

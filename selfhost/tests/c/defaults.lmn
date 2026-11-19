@@ -1,0 +1,35 @@
+struct Greeter {
+    name: Str,
+}
+
+fn greet(self: Greeter, greeting: Str = "hello", times: Int = 1) -> Str {
+    let mut out = []
+    for _ in 0..<times {
+        out.push("{greeting}, {self.name}")
+    }
+    out.join("; ")
+}
+
+fn join(xs: List[Str], sep: Str = ", ", last: Option[Str] = None, extra: List[Str] = []) -> Str {
+    let all = xs.map(|x| x)
+    let s = all.join(sep)
+    match last {
+        Some(l) => "{s}{sep}{l}{extra.len()}",
+        None => "{s}{extra.len()}",
+    }
+}
+
+fn scale(x: Float, by: Float = -1.5, flag: Bool = true) -> Float {
+    if flag { x * by } else { x }
+}
+
+fn main(root: Root) {
+    let g = Greeter { name: "Ada" }
+    root.stdout.print(g.greet())
+    root.stdout.print(g.greet("hi"))
+    root.stdout.print(g.greet(times: 2))
+    root.stdout.print(join(["a", "b"]))
+    root.stdout.print(join(["a", "b"], " | "))
+    root.stdout.print(join(["a", "b"], last: Some("z")))
+    root.stdout.print("{scale(2.0)} {scale(2.0, flag: false)}")
+}

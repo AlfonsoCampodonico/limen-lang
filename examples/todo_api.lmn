@@ -34,49 +34,25 @@ struct Todo {
 // ---------- storage ----------
 
 fn setup(db: sql.Db) -> Result[(), IoError] {
-    db.exec("CREATE TABLE IF NOT EXISTS todos (id INTEGER PRIMARY KEY, title TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0)", [])?
+    db.exec("CREATE TABLE IF NOT EXISTS todos (id INTEGER PRIMARY KEY, title TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0)")?
     Ok(())
 }
 
-// A missing column is an error, not a todo with id 0.
-fn column[T](v: Option[T], name: Str) -> Result[T, IoError] {
-    match v {
-        Some(x) => Ok(x),
-        None => Err(Failed("todos: no `{name}` column in the row")),
-    }
-}
-
-fn from_row(row: sql.Row) -> Result[Todo, IoError] {
-    Ok(Todo {
-        id: column(row.int("id"), "id")?,
-        title: column(row.text("title"), "title")?,
-        done: column(row.int("done"), "done")? == 1,
-    })
-}
-
-fn one(row: Option[sql.Row]) -> Result[Option[Todo], IoError] {
-    match row {
-        Some(r) => Ok(Some(from_row(r)?)),
-        None => Ok(None),
-    }
-}
+// `db.all` and `db.one` read each row into a Todo, field by field by
+// column name: the compiler writes the conversion.
 
 fn all(db: sql.Db) -> Result[List[Todo], IoError] {
-    let mut todos: List[Todo] = []
-    for row in db.query("SELECT id, title, done FROM todos ORDER BY id", [])? {
-        todos.push(from_row(row)?)
-    }
-    Ok(todos)
+    db.all("SELECT id, title, done FROM todos ORDER BY id")
 }
 
 fn find(db: sql.Db, id: Int) -> Result[Option[Todo], IoError] {
-    one(db.query_one("SELECT id, title, done FROM todos WHERE id = ?", [sql.Int(id)])?)
+    db.one("SELECT id, title, done FROM todos WHERE id = ?", [sql.Int(id)])
 }
 
 // RETURNING gives the new row's id from the insert itself, so two requests
 // at once cannot see each other's id
 fn create(db: sql.Db, title: Str) -> Result[Todo, IoError] {
-    match one(db.query_one("INSERT INTO todos (title) VALUES (?) RETURNING id, title, done", [sql.Text(title)])?)? {
+    match db.one("INSERT INTO todos (title) VALUES (?) RETURNING id, title, done", [sql.Text(title)])? {
         Some(t) => Ok(t),
         None => Err(Failed("insert returned no row")),
     }
@@ -85,16 +61,8 @@ fn create(db: sql.Db, title: Str) -> Result[Todo, IoError] {
 // One statement, so two changes at once cannot undo each other: a field
 // left out (NULL) keeps the value the row has when the update runs.
 fn change(db: sql.Db, id: Int, c: Changes) -> Result[Option[Todo], IoError] {
-    let title = match c.title {
-        Some(t) => sql.Text(t),
-        None => sql.Null,
-    }
-    let done = match c.done {
-        Some(true) => sql.Int(1),
-        Some(false) => sql.Int(0),
-        None => sql.Null,
-    }
-    one(db.query_one("UPDATE todos SET title = COALESCE(?, title), done = COALESCE(?, done) WHERE id = ? RETURNING id, title, done", [title, done, sql.Int(id)])?)
+    // `sql.values(c)` is the title and done, NULL where they were left out
+    db.one("UPDATE todos SET title = COALESCE(?, title), done = COALESCE(?, done) WHERE id = ? RETURNING id, title, done", sql.values(c) + [sql.Int(id)])
 }
 
 fn remove(db: sql.Db, id: Int) -> Result[Bool, IoError] {

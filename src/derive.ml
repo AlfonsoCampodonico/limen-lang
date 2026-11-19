@@ -1,4 +1,6 @@
-(* `json.encode(x)` and `json.decode(s)`: the compiler writes the conversion.
+(* `json.encode(x)` and `json.decode(s)`, and `sql.decode(row)`,
+   `db.all(text, params)`, `db.one(text, params)` and `sql.values(x)`: the
+   compiler writes the conversion.
 
    The standard json module declares both as generic functions whose bodies
    never run, so the checker types every use like any call. Once a program
@@ -16,7 +18,14 @@
    parameter is E0212, since the interpreter does not instantiate generic
    functions. Types that have no JSON form (capabilities, functions,
    channels, `Bytes`, arrays, maps without `Str` keys, `dyn` values, `()`)
-   are E0212 too, naming where in the type they are. *)
+   are E0212 too, naming where in the type they are.
+
+   The sql module's work the same way, for structs whose fields are Int,
+   Float, Str, Bool, Bytes or an Option of one: `sql.row$N(row: Row) ->
+   Result[T, IoError]` reads each field from the column of its name, and
+   `sql.values$N(x: T) -> List[Value]` writes the fields in order. A use of
+   `decode` or `values` is pointed at them; a call `db.all(...)` or
+   `db.one(...)` becomes a call of a wrapper, `sql.all$N(db, ...)`. *)
 open Ast
 open Types
 
@@ -52,6 +61,7 @@ let rec written st t =
   | TFloat -> te st (TyName ("Float", []))
   | TBool -> te st (TyName ("Bool", []))
   | TStr -> te st (TyName ("Str", []))
+  | TBytes -> te st (TyName ("Bytes", []))
   | TUnit -> te st TyUnit
   | TList a -> te st (TyName ("List", [ written st a ]))
   | TMap (k, v) -> te st (TyName ("Map", [ written st k; written st v ]))
@@ -105,7 +115,7 @@ let rec coders st t : string * string =
             fn_test = None; fn_bench = false; fn_virtual = false; fn_table = None; fn_pub = false; fn_bounds = [];
             fn_foreign = None }
       in
-      let prm n t = { prm_name = n; prm_span = st.sp; prm_ty = t } in
+      let prm n t = { prm_name = n; prm_span = st.sp; prm_ty = t; prm_default = None } in
       st.out <- fn from [ prm "v" (written st (value_ty st)); prm "at" (written st TStr) ]
                   (written st (TNamed ("Result", [ t; TStr ]))) dec
                 :: fn to_ [ prm "x" (written st t) ] (written st (value_ty st)) enc :: st.out;
@@ -205,6 +215,69 @@ and bodies st t : block * block =
     (only enc, block st [ s ] (ex st (EMatch (name, darms @ [ other ]))))
   | t -> raise (Unsupported (sprintf "`%s`" (show t)))
 
+(* ---------- SQL rows ---------- *)
+
+(* The helper suffix for a column type, if [t] is one. *)
+let column t = match repr t with TInt -> Some "int" | TFloat -> Some "float" | TStr -> Some "str" | TBool -> Some "bool" | TBytes -> Some "bytes" | _ -> None
+
+(* The struct's name without its module, for errors. *)
+let short n = match String.rindex_opt n '.' with Some i -> String.sub n (i + 1) (String.length n - i - 1) | None -> n
+
+(* The reader and writer of the struct [t] as rows, `sql.row$N` and
+   `sql.values$N`, written the first time [t] is asked for. [st.q] is the
+   sql module's name here. *)
+let row_coders st t : string * string =
+  let key = "row " ^ show t in
+  match Hashtbl.find_opt st.names key with
+  | Some k -> (jf st (sprintf "row$%d" k), jf st (sprintf "values$%d" k))
+  | None -> (
+    match repr t with
+    | TNamed (n, args) when Hashtbl.mem st.structs n && not (is_tuple_name n) ->
+      let sd = Hashtbl.find st.structs n in
+      let env = List.combine sd.st_gen args in
+      let fs =
+        List.map
+          (fun (f, _, fte) ->
+            try (f, field_ty env fte)
+            with Unsupported w -> raise (Unsupported (sprintf "its field `%s` holds %s, which is not a column type" f w)))
+          sd.st_fields
+      in
+      let owner = short n in
+      let row = var st "row" and x = var st "x" in
+      let parts =
+        List.map
+          (fun (f, ft) ->
+            let at k = try_ st (call st (jf st (k ^ "_at")) [ row; str st f; str st owner ]) in
+            let value = ex st (EField (x, f, st.sp)) in
+            match (column ft, repr ft) with
+            | Some k, _ -> (try_ st (call st (jf st "required") [ at k; str st f; str st owner ]), call st (jf st ("of_" ^ k)) [ value ])
+            | None, TNamed ("Option", [ a ]) when column a <> None ->
+              let k = Option.get (column a) in
+              (at k, call st (jf st "of_option") [ value; var st (jf st ("of_" ^ k)) ])
+            | _ -> raise (Unsupported (sprintf "its field `%s` is a `%s`, which is not a column type" f (show ft))))
+          fs
+      in
+      st.count <- st.count + 1;
+      let k = st.count in
+      Hashtbl.replace st.names key k;
+      let reader = jf st (sprintf "row$%d" k) and writer = jf st (sprintf "values$%d" k) in
+      let fn name params ret body =
+        IFn
+          { fn_name = name; fn_span = st.sp; fn_gen = []; fn_params = params; fn_ret = Some ret; fn_body = body;
+            fn_test = None; fn_bench = false; fn_virtual = false; fn_table = None; fn_pub = false; fn_bounds = [];
+            fn_foreign = None }
+      in
+      let prm n t = { prm_name = n; prm_span = st.sp; prm_ty = t; prm_default = None } in
+      let value_list = TList (TNamed (jf st "Value", [])) in
+      let made = ex st (EStruct (n, st.sp, List.map2 (fun (f, _) (r, _) -> (f, st.sp, r)) fs parts)) in
+      st.out <-
+        fn writer [ prm "x" (written st t) ] (written st value_list) (block st [] (ex st (EList (List.map snd parts))))
+        :: fn reader [ prm "row" (written st (TNamed (jf st "Row", []))) ] (written st (TNamed ("Result", [ t; TNamed ("IoError", []) ])))
+             (block st [] (call st "Ok" [ made ]))
+        :: st.out;
+      (reader, writer)
+    | _ -> raise (Unsupported "it is not a struct"))
+
 (* Every expression of a function body, outermost first, in source order. *)
 let rec iter_expr f (e : expr) =
   f e;
@@ -270,63 +343,128 @@ let rec concrete t =
   | TFn (ps, r) -> List.for_all concrete ps && concrete r
   | _ -> true
 
-(* The program with every `json.encode` and `json.decode` pointed at its
-   conversion and those conversions added, or None when it uses neither. *)
-let expand ~json:q (items : item list) : (item list * Diag.t list) option =
+(* The program with every `json.encode` and `json.decode`, and every
+   `sql.decode`, `sql.values`, `db.all` and `db.one`, pointed at its
+   conversion and those conversions added, or None when it uses none of
+   them. [json] and [sql] are those modules' names here, when loaded. *)
+let expand ?json ?sql (items : item list) : (item list * Diag.t list) option =
   begin
-    let encode = q ^ ".encode" and decode = q ^ ".decode" in
     let structs = Hashtbl.create 16 and enums = Hashtbl.create 16 in
     (* the prelude's types too: Result is an enum like any other *)
     List.iter (function IStruct s -> Hashtbl.replace structs s.st_name s | IEnum e -> Hashtbl.replace enums e.en_name e | _ -> ()) (Prelude.items () @ items);
-    let st = { q; sp = Span.dummy; structs; enums; names = Hashtbl.create 16; count = 0; out = []; diags = [] } in
+    let mk q = { q; sp = Span.dummy; structs; enums; names = Hashtbl.create 16; count = 0; out = []; diags = [] } in
+    let js = mk (Option.value ~default:"" json) and ss = mk (Option.value ~default:"" sql) in
     let wrappers = Hashtbl.create 16 in
     let found = ref false in
+    let is_json n = json <> None && (n = jf js "encode" || n = jf js "decode") in
+    let is_sql n = sql <> None && (n = jf ss "decode" || n = jf ss "values") in
+    let fn_item w sp params ret body =
+      IFn
+        { fn_name = w; fn_span = sp; fn_gen = []; fn_params = params; fn_ret = Some ret; fn_body = body;
+          fn_test = None; fn_bench = false; fn_virtual = false; fn_table = None; fn_pub = false; fn_bounds = [];
+          fn_foreign = None }
+    in
+    (* the type a use converts, or an E0212 when it is not known *)
+    let known st (e : expr) what note =
+      st.sp <- e.espan;
+      let t = match e.einst with [ (_, t) ] -> repr t | _ -> TErr in
+      if concrete t then Some t
+      else begin
+        st.diags <-
+          Diag.make "E0212" e.espan
+            (sprintf "`%s` needs to know the type it converts here, and it is %s" what
+               (match t with TParam p -> sprintf "the type parameter `%s`" p | _ -> "not known yet"))
+            ~notes:[ note ]
+          :: st.diags;
+        None
+      end
+    in
+    let no_form st (e : expr) what t inner holds =
+      st.diags <-
+        Diag.make "E0212" e.espan
+          (if inner = sprintf "`%s`" (show t) then sprintf "`%s` cannot convert `%s`: it has no %s form" what (show t) holds
+           else if holds = "SQL" then sprintf "`%s` cannot convert `%s`: %s" what (show t) inner
+           else sprintf "`%s` cannot convert `%s`: it holds %s, which has no %s form" what (show t) inner holds)
+          ~notes:
+            [ (if holds = "SQL" then "a row is read into a struct whose fields are Int, Float, Str, Bool, Bytes, or an Option of one of those"
+               else "JSON holds Int, Float, Str, Bool, json.Value, Option, List, Map with Str keys, tuples, and structs and enums of those") ]
+        :: st.diags
+    in
     let visit (e : expr) =
       match e.edesc with
-      | EVar n when n = encode || n = decode -> (
+      | EVar n when is_json n -> (
         found := true;
-        st.sp <- e.espan;
-        let t = match e.einst with [ (_, t) ] -> repr t | _ -> TErr in
-        let what = if n = encode then "json.encode" else "json.decode" in
-        if not (concrete t) then
-          st.diags <-
-            Diag.make "E0212" e.espan
-              (sprintf "`%s` needs to know the type it converts here, and it is %s" what
-                 (match t with TParam p -> sprintf "the type parameter `%s`" p | _ -> "not known yet"))
-              ~notes:[ (if n = decode then "say the type: `let t: Todo = json.decode(s)?`" else "convert where the type is known, and pass the text") ]
-            :: st.diags
-        else
+        let st = js in
+        let encode = n = jf st "encode" in
+        let what = if encode then "json.encode" else "json.decode" in
+        match known st e what (if encode then "convert where the type is known, and pass the text" else "say the type: `let t: Todo = json.decode(s)?`") with
+        | None -> ()
+        | Some t -> (
           let key = what ^ " " ^ show t in
           match Hashtbl.find_opt wrappers key with
           | Some w -> e.edesc <- EVar w; e.einst <- []
           | None -> (
             try
               let to_, from = coders st t in
-              let w = jf st (sprintf "%s$%d" (if n = encode then "encode" else "decode") (Hashtbl.length wrappers + 1)) in
-              let prm n t = { prm_name = n; prm_span = e.espan; prm_ty = t } in
+              let w = jf st (sprintf "%s$%d" (if encode then "encode" else "decode") (Hashtbl.length wrappers + 1)) in
+              let prm n t = { prm_name = n; prm_span = e.espan; prm_ty = t; prm_default = None } in
               let body, params, ret =
-                if n = encode then (block st [] (call st (jf st "stringify") [ call st to_ [ var st "x" ] ]), [ prm "x" (written st t) ], written st TStr)
+                if encode then (block st [] (call st (jf st "stringify") [ call st to_ [ var st "x" ] ]), [ prm "x" (written st t) ], written st TStr)
                 else (block st [] (call st (jf st "from_text") [ var st "s"; var st from ]), [ prm "s" (written st TStr) ], written st (TNamed ("Result", [ t; TStr ])))
               in
-              st.out <-
-                IFn
-                  { fn_name = w; fn_span = e.espan; fn_gen = []; fn_params = params; fn_ret = Some ret; fn_body = body;
-                    fn_test = None; fn_bench = false; fn_virtual = false; fn_table = None; fn_pub = false; fn_bounds = [];
-                    fn_foreign = None }
-                :: st.out;
+              st.out <- fn_item w e.espan params ret body :: st.out;
               Hashtbl.replace wrappers key w;
               e.edesc <- EVar w;
               e.einst <- []
-            with Unsupported inner ->
-              st.diags <-
-                Diag.make "E0212" e.espan
-                  (if inner = sprintf "`%s`" (show t) then sprintf "`%s` cannot convert `%s`: it has no JSON form" what (show t)
-                   else sprintf "`%s` cannot convert `%s`: it holds %s, which has no JSON form" what (show t) inner)
-                  ~notes:[ "JSON holds Int, Float, Str, Bool, json.Value, Option, List, Map with Str keys, tuples, and structs and enums of those" ]
-                :: st.diags))
+            with Unsupported inner -> no_form st e what t inner "JSON")))
+      | EVar n when is_sql n -> (
+        found := true;
+        let st = ss in
+        let what = if n = jf st "decode" then "sql.decode" else "sql.values" in
+        match known st e what (if what = "sql.decode" then "say the type: `let t: Todo = sql.decode(row)?`" else "convert where the type is known") with
+        | None -> ()
+        | Some t -> (
+          try
+            let reader, writer = row_coders st t in
+            e.edesc <- EVar (if what = "sql.decode" then reader else writer);
+            e.einst <- []
+          with Unsupported inner -> no_form st e what t inner "SQL"))
+      | EMethod (recv, (("all" | "one") as m), _, args)
+        when sql <> None && (match repr recv.ety with TNamed (n, []) -> n = jf ss "Db" | _ -> false) -> (
+        found := true;
+        let st = ss in
+        let what = "db." ^ m in
+        match known st e what (sprintf "say the type: `let t: %s = db.%s(...)?`" (if m = "all" then "List[Todo]" else "Option[Todo]") m) with
+        | None -> ()
+        | Some t -> (
+          let key = what ^ " " ^ show t in
+          let point w = e.edesc <- ECall ({ (var st w) with espan = e.espan }, recv :: args); e.einst <- [] in
+          match Hashtbl.find_opt wrappers key with
+          | Some w -> point w
+          | None -> (
+            try
+              let reader, _ = row_coders st t in
+              let w = jf st (sprintf "%s$%d" m (Hashtbl.length wrappers + 1)) in
+              let prm n t = { prm_name = n; prm_span = e.espan; prm_ty = t; prm_default = None } in
+              let db = TNamed (jf st "Db", []) and values = TList (TNamed (jf st "Value", [])) in
+              let query = if m = "all" then "query" else "query_one" in
+              let rows = try_ st (ex st (EMethod (var st "self", query, st.sp, [ var st "text"; var st "params" ]))) in
+              let body = block st [] (call st (jf st (if m = "all" then "rows_as" else "row_as")) [ rows; var st reader ]) in
+              let ret = TNamed ("Result", [ (if m = "all" then TList t else TNamed ("Option", [ t ])); TNamed ("IoError", []) ]) in
+              st.out <-
+                fn_item w e.espan
+                  [ prm "self" (written st db); prm "text" (written st TStr);
+                    (* as the method it stands for, so a call that left it out still fits *)
+                    { (prm "params" (written st values)) with prm_default = Some (ex st (EList [])) } ]
+                  (written st ret) body
+                :: st.out;
+              Hashtbl.replace wrappers key w;
+              point w
+            with Unsupported inner -> no_form st e what t inner "SQL")))
       | _ -> ()
     in
     (* a table test's case, then the body, as selfhost/walk.lmn orders them *)
     List.iter (function IFn d -> Option.iter (fun (_, c) -> iter_expr visit c) d.fn_table; iter_block visit d.fn_body | _ -> ()) items;
-    if not !found then None else Some (items @ List.rev st.out, List.rev st.diags)
+    if not !found then None
+    else Some (items @ List.rev js.out @ List.rev ss.out, List.rev js.diags @ List.rev ss.diags)
   end

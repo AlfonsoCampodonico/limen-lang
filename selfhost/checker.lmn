@@ -189,7 +189,7 @@ fn inner(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr) -> (types.Ty, env.S
 
 // Check `e` against an expected type; closures get their parameter types
 // from it.
-fn expect(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, want: types.Ty) -> env.State {
+pub fn expect(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, want: types.Ty) -> env.State {
     let mut st = st
     match (st.desc(e), st.repr(want)) {
         (EList(es), TArray(el, n)) => {
@@ -235,11 +235,37 @@ fn expect(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, want: types.Ty) ->
             st.set_type(e, t).unify_at(e.span, want, t)
         },
         (EBlock(b), _) => expect_block(st, cx, fx, b, want).set_type(e, want),
+        // the expected type reaches into a list or tuple literal when an
+        // item needs it: a closure whose parameters have no types, as in
+        // `[("GET /", |r, p| ...)]`
+        (EList(es), TList(el)) if es.any(|x| needs_type(st, x)) => {
+            for x in es {
+                st = expect(st, cx, fx, x, el)
+            }
+            st.set_type(e, want)
+        },
+        (EStruct(n, _, fields), TNamed(tn, ts)) if ast.is_tuple_name(n) && n == tn && fields.len() == ts.len() && fields.any(|x| needs_type(st, x.value)) => {
+            for (x, t) in fields.zip(ts) {
+                st = expect(st, cx, fx, x.value, t)
+            }
+            st.set_type(e, want)
+        },
         (_, TDyn(i, a)) => {
             let (t, st) = check_expr(st, cx, fx, e)
             coerce(st, cx, e, t, env.Bound { iface: i, args: a })
         },
         _ => expect_plain(st, cx, fx, e, want),
+    }
+}
+
+// Whether `e` needs the expected type to be checked: a closure with a
+// parameter that has no type, alone or inside a list or tuple literal.
+pub fn needs_type(st: env.State, e: ast.Expr) -> Bool {
+    match st.desc(e) {
+        EClosure(ps, _) => ps.any(|p| p.ty.is_none()),
+        EList(es) => es.any(|x| needs_type(st, x)),
+        EStruct(n, _, fields) if ast.is_tuple_name(n) => fields.any(|x| needs_type(st, x.value)),
+        _ => false,
     }
 }
 
@@ -650,9 +676,9 @@ fn unlabel(st: env.State, a: ast.Expr) -> ast.Expr {
 // goes. Returns the arguments in parameter order without their labels, or
 // None after reporting what is wrong. `names` are the callee's parameter
 // names, or why it has none.
-fn order_args(st: env.State, what: Str, sp: ast.Span, names: Result[List[Str], Str], args: List[ast.Expr]) -> (Option[List[ast.Expr]], env.State) {
+fn order_args(st: env.State, what: Str, sp: ast.Span, names: Result[List[Str], Str], defaults: List[Option[ast.Expr]], args: List[ast.Expr]) -> (Option[List[ast.Expr]], env.State) {
     let mut st = st
-    if !args.any(|a| is_named(st, a)) {
+    if !args.any(|a| is_named(st, a)) && args.len() >= defaults.len() {
         return (Some(args), st)
     }
     let names = match names {
@@ -718,6 +744,12 @@ fn order_args(st: env.State, what: Str, sp: ast.Span, names: Result[List[Str], S
         ok = false
         st = st.report(diag.error("E0107", sp, "{what} takes {n} argument{env.plural(n)} but {total} {env.was_were(total)} supplied"))
     }
+    // a parameter left out takes its default
+    for (j, d) in defaults.with_index() {
+        if j < n && slots[j].is_none() {
+            slots[j] = d
+        }
+    }
     let mut missing = names.with_index().filter(|p| slots[p.0].is_none()).map(|p| p.1)
     let list = if names.is_empty() { "none" } else { names.join(", ") }
     let with_notes = |d: diag.Diag| d.note("its parameters are: {list}")
@@ -751,7 +783,7 @@ fn order_args(st: env.State, what: Str, sp: ast.Span, names: Result[List[Str], S
     if misplaced.is_empty() && extra == 0 && !dup {
         for m in missing {
             ok = false
-            st = st.report(diag.error("E0107", sp, "{what} is missing the argument for parameter `{m}`").note("every parameter must be passed; Limen has no default values"))
+            st = st.report(diag.error("E0107", sp, "{what} is missing the argument for parameter `{m}`").note("every parameter without a default value must be passed"))
         }
     }
     if !ok {
@@ -822,6 +854,14 @@ fn method_params(cx: env.Cx, key: Str) -> Result[List[Str], Str] {
     match cx.param_names.get(key) {
         Some([_, ..ps]) => Ok(ps),
         _ => Err("this method takes its arguments by position"),
+    }
+}
+
+// Default values of the method `key`'s parameters, without `self`.
+fn method_defaults(cx: env.Cx, key: Str) -> List[Option[ast.Expr]] {
+    match cx.param_defaults.get(key) {
+        Some([_, ..ds]) => ds,
+        _ => [],
     }
 }
 
@@ -971,7 +1011,11 @@ fn check_call(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, callee: ast.Ex
                 },
                 _ => {},
             }
-            let (ordered, next) = order_args(st, what, sp, names, args)
+            let defaults = match st.desc(callee) {
+                EVar(n) if !fx.is_local(n) => cx.param_defaults.get(n) ?? [],
+                _ => [],
+            }
+            let (ordered, next) = order_args(st, what, sp, names, defaults, args)
             st = next
             let args2 = match ordered {
                 None => {
@@ -979,7 +1023,8 @@ fn check_call(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, callee: ast.Ex
                 },
                 Some(a) => a,
             }
-            let labelled = args.any(|a| is_named(st, a))
+            // reordered by labels, or with defaults filled in: the call is rewritten
+            let labelled = args.any(|a| is_named(st, a)) || args2.len() != args.len()
             let written = args.map(|a| unlabel(st, a))
             if ps.len() != args2.len() {
                 st = st.report(diag.error("E0107", sp, "this function takes {ps.len()} argument{env.plural(ps.len())} but {args2.len()} {env.was_were(args2.len())} supplied"))
@@ -1430,8 +1475,8 @@ fn check_method(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv: ast.Ex
 // The arguments of a method call after the receiver: put in parameter
 // order, counted, and checked against the parameter types `ps`. Returns
 // them, or None when order_args reported a problem with the labels.
-fn method_args(st: env.State, cx: env.Cx, fx: env.Fx, name: Str, nsp: ast.Span, names: Result[List[Str], Str], args: List[ast.Expr], ps: List[types.Ty]) -> (Option[List[ast.Expr]], env.State) {
-    let (ordered, st) = order_args(st, "method `{name}`", nsp, names, args)
+fn method_args(st: env.State, cx: env.Cx, fx: env.Fx, name: Str, nsp: ast.Span, names: Result[List[Str], Str], defaults: List[Option[ast.Expr]], args: List[ast.Expr], ps: List[types.Ty]) -> (Option[List[ast.Expr]], env.State) {
+    let (ordered, st) = order_args(st, "method `{name}`", nsp, names, defaults, args)
     let args2 = match ordered {
         None => {
             return (None, check_args(st, cx, fx, args))
@@ -1503,14 +1548,15 @@ fn check_method_value(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv: 
             match t {
                 TFn([p0, ..ps], r) => {
                     st = st.unify_at(recv.span, p0, rt)
-                    let (ordered, next) = method_args(st, cx, fx, name, nsp, method_params(cx, key), args, ps)
+                    let (ordered, next) = method_args(st, cx, fx, name, nsp, method_params(cx, key), method_defaults(cx, key), args, ps)
                     st = next
                     match ordered {
                         Some(args2) => {
                             let (f, next) = st.node(EVar(key), nsp)
                             st = next.set_type(f, t).set_inst(f, inst)
                             st = st.rewrite(e, ECall(f, [recv] + args2))
-                            if labelled {
+                            // reordered by labels, or with defaults filled in
+                            if labelled || args2.len() != args.len() {
                                 st = keep_order(st, e, written, r)
                             }
                         },
@@ -1555,10 +1601,10 @@ fn check_method_value(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv: 
             match t {
                 TFn([p0, ..ps], r) => {
                     st = st.unify_at(recv.span, p0, rt)
-                    let (ordered, next) = method_args(st, cx, fx, name, nsp, method_params(cx, key), args, ps)
+                    let (ordered, next) = method_args(st, cx, fx, name, nsp, method_params(cx, key), method_defaults(cx, key), args, ps)
                     st = next
                     match ordered {
-                        Some(args2) if labelled => {
+                        Some(args2) if labelled || args2.len() != args.len() => {
                             st = st.rewrite(e, EMethod(recv, name, nsp, args2))
                             st = keep_order(st, e, written, r)
                         },
@@ -1600,7 +1646,7 @@ fn bound_method(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv: ast.Ex
             }
             let labelled = args.any(|a| is_named(st, a))
             let written = [recv] + args.map(|a| unlabel(st, a))
-            let (ordered, next) = method_args(st, cx, fx, name, nsp, names, args, m.params)
+            let (ordered, next) = method_args(st, cx, fx, name, nsp, names, [], args, m.params)
             st = next
             match ordered {
                 Some(args2) if labelled => {

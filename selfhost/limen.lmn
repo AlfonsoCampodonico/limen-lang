@@ -172,11 +172,13 @@ fn front(fs: Fs, place: disk.Place, file: Str) -> Front {
     }
     let c = typecheck.check_program(p.items, p.files, p.next_id, methods, p.forwarders)
     let files = p.files + [diag.Source { path: prelude.file_name(), text: prelude.text() }, diag.Source { path: prelude.methods_name(), text: methods }, diag.Source { path: "<std>/limen.toml", text: std.get("limen.toml") ?? "" }]
-    // `json.encode` and `json.decode` get their conversions written once
-    // the types are known, and the program is checked again with them
+    // `json.encode`, `json.decode` and the sql module's row conversions get
+    // their conversions written once the types are known, and the program
+    // is checked again with them
     let json = p.std_modules.find(|m| m.1 == "json").map(|m| m.0)
-    let (p, c) = match json {
-        Some(name) if c.diags.all(|d| d.warning) => match derive.expand(name, p.items, c) {
+    let sql = p.std_modules.find(|m| m.1 == "sql").map(|m| m.0)
+    let (p, c) = match (json, sql) {
+        (Some(_), _) | (_, Some(_)) if c.diags.all(|d| d.warning) => match derive.expand(json, sql, p.items, c) {
             None => (p, c),
             Some(x) if !x.diags.is_empty() => {
                 let diags = x.diags + c.diags.filter(|d| d.warning)

@@ -1,0 +1,7 @@
+use sql
+
+fn get(r: sql.Row) -> Result[(Int, Str), IoError] {
+    sql.decode(r)
+}
+
+fn main(root: Root) {}

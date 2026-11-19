@@ -423,6 +423,26 @@ let main_wrap body = "fn main(root: Root) {\n    let out = root.stdout\n" ^ body
 let () =
   (* ---------- running programs ---------- *)
   out "hello" "fn main(root: Root) { root.stdout.print(\"hi\") }" "hi\n";
+  out "hex-binary-unicode"
+    (main_wrap "    out.print(\"{0xff} {0b1010} {0x7fff_ffff_ffff_ffff} {0xFF_00}\")\n    out.print(\"caf\\u{e9} \\u{1F600}!\")")
+    "255 10 9223372036854775807 65280\ncaf\xc3\xa9 \xf0\x9f\x98\x80!\n";
+  out "let-for-struct-patterns"
+    "struct Point {\n    x: Int,\n    y: Int,\n}\n\nstruct Line {\n    from: Point,\n    to: Point,\n}\n\nfn main(root: Root) {\n    let p = Point { x: 1, y: 2 }\n    let Point { x, y } = p\n    let Line { from: Point { x: a, .. }, to: Point { y: b, .. } } = Line { from: p, to: Point { x: 5, y: 6 } }\n    root.stdout.print(\"{x} {y} {a} {b}\")\n    for Point { x, y: _ } in [p, Point { x: 9, y: 0 }] {\n        root.stdout.print(\"x={x}\")\n    }\n}\n"
+    "1 2 1 6\nx=1\nx=9\n";
+  out "default-params"
+    "struct G {\n    name: Str,\n}\n\nfn greet(self: G, word: Str = \"hello\", times: Int = 1) -> Str {\n    \"{word} {self.name} {times}\"\n}\n\nfn join(xs: List[Str], sep: Str = \", \", last: Option[Str] = None) -> Str {\n    xs.join(sep) + (last ?? \"\")\n}\n\nfn main(root: Root) {\n    let g = G { name: \"Ada\" }\n    root.stdout.print(g.greet())\n    root.stdout.print(g.greet(times: 2))\n    root.stdout.print(join([\"a\", \"b\"]))\n    root.stdout.print(join([\"a\", \"b\"], last: Some(\"!\")))\n}\n"
+    "hello Ada 1\nhello Ada 2\na, b\na, b!\n";
+  errs "default-not-constant" "fn f(x: Int = 1 + 2) {}\nfn main(root: Root) {}\n" [ "E0123" ];
+  errs "default-generic" "fn f[T](x: List[T] = []) {}\nfn main(root: Root) {}\n" [ "E0123" ];
+  errs "default-wrong-type" "fn f(x: Int = \"s\") {}\nfn main(root: Root) {}\n" [ "E0201" ];
+  errs "default-still-required" "fn f(a: Int, b: Int = 2) {}\nfn main(root: Root) { f() }\n" [ "E0107" ];
+  out "closures-in-tuples"
+    "fn pick() -> List[(Str, fn(Int) -> Int)] {\n    [(\"inc\", |x| x + 1), (\"neg\", |x| -x)]\n}\n\nfn main(root: Root) {\n    let t: (Str, fn(Str) -> Int) = (\"len\", |s| s.len())\n    for (n, f) in pick() {\n        root.stdout.print(\"{n} {f(t.1(\"ab\"))}\")\n    }\n}\n"
+    "inc 3\nneg -2\n";
+  out "sql-rows" "use sql\n\nstruct Todo {\n    id: Int,\n    title: Str,\n    done: Bool,\n    note: Option[Str],\n    score: Float,\n}\n\nfn main(root: Root) -> Result[(), IoError] {\n    let db = sql.memory()?\n    db.exec(\"CREATE TABLE todos (id INTEGER PRIMARY KEY, title TEXT, done INTEGER, note TEXT, score REAL)\", [])?\n    let t = Todo { id: 1, title: \"write\", done: false, note: None, score: 2.5 }\n    db.exec(\"INSERT INTO todos VALUES (?, ?, ?, ?, ?)\", sql.values(t))?\n    db.exec(\"INSERT INTO todos VALUES (?, ?, ?, ?, ?)\", sql.values(Todo { id: 2, title: \"ship\", done: true, note: Some(\"soon\"), score: 3.0 }))?\n    let all: List[Todo] = db.all(\"SELECT * FROM todos ORDER BY id\", [])?\n    for x in all {\n        root.stdout.print(\"{x.id} {x.title} {x.done} {x.note ?? \"-\"} {x.score}\")\n    }\n    let one: Option[Todo] = db.one(\"SELECT * FROM todos WHERE id = ?\", [sql.Int(2)])?\n    root.stdout.print(\"{one.map(|t| t.title) ?? \"none\"}\")\n    let none: Option[Todo] = db.one(\"SELECT * FROM todos WHERE id = 9\", [])?\n    root.stdout.print(\"{none.is_none()}\")\n    for row in db.query(\"SELECT * FROM todos\", [])? {\n        let t: Todo = sql.decode(row)?\n        root.stdout.print(t.title)\n    }\n    let bad: Result[List[Todo], IoError] = db.all(\"SELECT id, title FROM todos\", [])\n    root.stdout.print(\"{bad}\")\n    let nul: Result[List[Todo], IoError] = db.all(\"SELECT id, NULL AS title, done, note, score FROM todos\", [])\n    root.stdout.print(\"{nul}\")\n    let wrong: Result[List[Todo], IoError] = db.all(\"SELECT id, title, 'x' AS done, note, score FROM todos\", [])\n    root.stdout.print(\"{wrong}\")\n    Ok(())\n}\n"
+    "1 write false - 2.5\n2 ship true soon 3.0\nship\ntrue\nwrite\nship\nErr(Failed(\"sql: no column `done` for `Todo.done`; the row has id, title\"))\nErr(Failed(\"sql: column `title` is NULL, but `Todo.title` is not an Option\"))\nErr(Failed(\"sql: column `done` holds text, but `Todo.done` is a `Bool` (stored as 0 or 1)\"))\n";
+  errs "sql-rows-generic" "use sql\n\nfn get[T](db: sql.Db) -> Result[List[T], IoError] {\n    db.all(\"SELECT 1\", [])\n}\n\nfn main(root: Root) {}\n" [ "E0212" ];
+  errs "sql-rows-not-struct" "use sql\n\nfn get(r: sql.Row) -> Result[(Int, Str), IoError] {\n    sql.decode(r)\n}\n\nfn main(root: Root) {}\n" [ "E0212" ];
   out "arith" (main_wrap "    out.print(\"{1 + 2 * 3} {7 / 2} {7 % 3} {2.5 * 2.0} {-(4)}\")") "7 3 1 5.0 -4\n";
   out "strings"
     (main_wrap "    let s = \"a,b,,c\"\n    out.print(s.split(\",\").join(\"|\"))\n    out.print(\" x \".trim().to_upper() + \"!\")")
@@ -5431,6 +5451,12 @@ fn main(root: Root) -> Result[(), IoError] {
   out "int64" "fn main(root: Root) {\n    let out = root.stdout\n    let max = 9223372036854775807\n    let min = -max - 1\n    out.print(\"{max} {min} {max + 1} {min - 1} {max * 2} {min / -1} {min % -1}\")\n    out.print(\"{min.abs()} {(-7) / 2} {(-7) % 2} {7 % -2}\")\n    out.print(\"{4611686018427387904 * 2} {3037000500 * 3037000500}\")\n    out.print(\"{1.0e19.to_int()} {(-1.0e19).to_int()} {9.0e18.to_int()} {(0.0 / 0.0).to_int()}\")\n    out.print(\"{\"9223372036854775807\".parse_int()} {\"-9223372036854775808\".parse_int()} {\"9223372036854775808\".parse_int()}\")\n    out.print(\"{max.to_float()} {[1, 2, 3].get(max)} {\"abc\".slice(-max, max)} {[max, max].sum()}\")\n    match max {\n        9223372036854775807 => out.print(\"matched max\"),\n        _ => out.print(\"no\"),\n    }\n}\n"
     "9223372036854775807 -9223372036854775808 -9223372036854775808 9223372036854775807 -2 -9223372036854775808 0\n-9223372036854775808 -3 -1 1\n-9223372036854775808 -9223372036709301616\n9223372036854775807 -9223372036854775808 9000000000000000000 0\nSome(9223372036854775807) Some(-9223372036854775808) None\n9.22337203685478e+18 None abc -2\nmatched max\n";
   errs "int-literal-too-large" (main_wrap "    let x = 9223372036854775808") [ "E0005" ];
+  errs "hex-no-digits" (main_wrap "    let x = 0x") [ "E0005" ];
+  errs "binary-bad-digit" (main_wrap "    let x = 0b102") [ "E0005" ];
+  errs "hex-too-large" (main_wrap "    let x = 0x8000_0000_0000_0000") [ "E0005" ];
+  errs "unicode-surrogate" (main_wrap "    let x = \"\\u{d800}\"") [ "E0006" ];
+  errs "unicode-past-end" (main_wrap "    let x = \"\\u{110000}\"") [ "E0006" ];
+  errs "unicode-no-braces" (main_wrap "    let x = \"\\u41\"") [ "E0006" ];
 
   (* ---------- select ---------- *)
   (* defer: every way out of a block, in both backends *)

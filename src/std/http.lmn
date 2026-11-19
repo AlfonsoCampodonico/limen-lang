@@ -616,7 +616,7 @@ pub fn request_lines(net: Net, method: Str, url: Str, headers: List[Header], bod
 // that comes back with `Content-Encoding: gzip` (or `deflate`) is
 // decompressed, up to 64 MB, with that header and Content-Length left out
 // of the response, since they describe the bytes sent and not the body.
-pub fn request(net: Net, method: Str, url: Str, headers: List[Header], body: Str) -> Result[Response, IoError] {
+pub fn request(net: Net, method: Str, url: Str, headers: List[Header] = [], body: Str = "") -> Result[Response, IoError] {
     let mut all = headers
     if find_header(headers, "Accept-Encoding").is_none() {
         all.push(Header { name: "Accept-Encoding", value: "gzip" })

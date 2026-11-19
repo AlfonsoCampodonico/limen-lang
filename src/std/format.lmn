@@ -84,7 +84,7 @@ pub fn parse_base(s: Str, radix: Int) -> Option[Int] {
 
 // Put `sep` between groups of three digits in the integer part of a number
 // already written out: `grouped("-1234567.891", ",")` is "-1,234,567.891".
-pub fn grouped(number: Str, sep: Str) -> Str {
+pub fn grouped(number: Str, sep: Str = ",") -> Str {
     let bs = number.bytes()
     let mut start = 0
     if bs.len() > 0 && (bs[0] == 45 || bs[0] == 43) {

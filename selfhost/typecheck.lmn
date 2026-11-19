@@ -823,6 +823,9 @@ fn signatures(cx: env.Cx, st: env.State, ds: Decls, items: List[ast.Item]) -> (e
         let s = env.Sig { gen: d.generics, params: ps, ret }
         if d.foreign.is_none() && !cx.fns.contains(d.name) {
             cx.param_names[d.name] = d.params.map(|p| p.name)
+            if d.params.any(|p| p.default.is_some()) {
+                cx.param_defaults[d.name] = d.params.map(|p| p.default)
+            }
         }
         st = check_self(cx, st, d, ps)
         let (declared, next) = resolve_bounds(cx, st, d.generics, d.bounds)
@@ -1053,8 +1056,35 @@ fn check_fn(cx: env.Cx, st: env.State, ds: Decls, d: ast.FnDecl, s: env.Sig) -> 
         scope.vars[p.name] = env.Var { ty: t, mutable: false, span: p.span, kind: KParam }
     }
     let fx = env.Fx { ret: s.ret, scopes: [scope], loops: 0, genv, in_group: 0, in_defer: 0, ret_te: d.ret }
+    // a default is checked here, once, against a type that is the same at
+    // every call: one without the function's type parameters
+    for (p, t) in d.params.zip(s.params) {
+        match p.default {
+            Some(dv) => {
+                let generic = st.subst.exists(t, |u| match u {
+                    TParam(_) => true,
+                    _ => false,
+                })
+                if generic {
+                    st = st.report(diag.error("E0123", dv.span, "`{p.name}` cannot have a default: its type `{st.show(t)}` uses a type parameter").note("a default is checked once, so its type must be the same at every call"))
+                } else {
+                    st = checker.expect(st, cx, { fx with scopes: [] }, dv, t)
+                }
+            },
+            None => {},
+        }
+    }
     if st.subst.has_dyn(s.ret) {
         // the body's value becomes `dyn`, branch by branch
+        st = checker.expect_block(st, cx, fx, d.body, s.ret)
+        return out_of_fn(check_pending(cx, st, ds))
+    }
+    let tail_needs = match d.body.tail {
+        Some(x) => checker.needs_type(st, x),
+        None => false,
+    }
+    if tail_needs {
+        // a closure in the body's value takes its types from the return type
         st = checker.expect_block(st, cx, fx, d.body, s.ret)
         return out_of_fn(check_pending(cx, st, ds))
     }

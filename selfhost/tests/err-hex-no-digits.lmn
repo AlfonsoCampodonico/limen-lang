@@ -1,0 +1,3 @@
+fn main(root: Root) {
+    let x = 0x
+}

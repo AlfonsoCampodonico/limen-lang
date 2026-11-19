@@ -258,6 +258,9 @@ pub struct Param {
     name: Str,
     span: Span,
     ty: TyExpr,
+    // its default value, a constant (`sep: Str = ", "`), used when a call
+    // leaves the argument out
+    default: Option[Expr],
 }
 
 // A type parameter and the interfaces it must satisfy: `T: Shape + Show`.

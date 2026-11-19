@@ -1020,11 +1020,27 @@ fn parse_pat1(p: Parser) -> Parsed[ast.Pat] {
     }
 }
 
-// Names and `_`, in tuples or alone: what `let` and `for` can unpack.
+// What `let` and `for` can take apart: names and `_`, in tuples and struct
+// patterns, as deep as they like.
 fn irrefutable_tuple(p: ast.Pat) -> Bool {
     match p.desc {
         PBind(_) | PWild => true,
         PTuple(items) => items.all(|x| irrefutable_tuple(x)),
+        PStruct(_, _, fields, _) => fields.all(|f| irrefutable_tuple(f.pat)),
+        _ => false,
+    }
+}
+
+// Whether a struct pattern starts `k` tokens after the current one:
+// `Point \{` or `geo.Point \{`.
+fn struct_pat_ahead(p: Parser, k: Int) -> Bool {
+    let at = p.pos + k
+    match (p.kind_at(at), p.kind_at(at + 1)) {
+        (Ident(v), Symbol("\{")) => is_upper(v),
+        (Ident(_), Symbol(".")) => match (p.kind_at(at + 2), p.kind_at(at + 3)) {
+            (Ident(v), Symbol("\{")) => is_upper(v),
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -1106,11 +1122,11 @@ fn parse_let(p: Parser) -> Parsed[ast.Stmt] {
     let p = p.skip()
     let mutable = p.is_kw("mut")
     let p = if mutable { p.skip() } else { p }
-    if p.is_sym("(") {
-        // `let (a, b) = e`
+    if p.is_sym("(") || struct_pat_ahead(p, 0) {
+        // `let (a, b) = e`, `let Point \{ x, y } = p`
         let (unpack, p) = parse_pat(p)?
         if !irrefutable_tuple(unpack) {
-            return Err(error("E0003", unpack.span, "`let` can only unpack a tuple into names and `_`, as in `let (a, _) = t`"))
+            return Err(error("E0003", unpack.span, "`let` can only take apart tuples and structs into names and `_`, as in `let (a, _) = t` or `let Point \{ x, .. } = p`"))
         }
         let (e, p) = parse_expr(p.need("=")?)?
         return Ok((stmt(SLetPat(unpack, e), merge(start, e.span)), p))
@@ -1134,11 +1150,11 @@ fn parse_let(p: Parser) -> Parsed[ast.Stmt] {
 fn parse_for(p: Parser) -> Parsed[ast.Stmt] {
     let start = p.span()
     let p = p.skip()
-    if p.is_sym("(") {
-        // `for (k, v) in m.entries() { ... }`
+    if p.is_sym("(") || struct_pat_ahead(p, 0) {
+        // `for (k, v) in m.entries() \{ ... }`, `for Todo \{ id, .. } in todos \{ ... }`
         let (unpack, p) = parse_pat(p)?
         if !irrefutable_tuple(unpack) {
-            return Err(error("E0003", unpack.span, "`for` can only unpack a tuple into names and `_`, as in `for (k, v) in m.entries()`"))
+            return Err(error("E0003", unpack.span, "`for` can only take apart tuples and structs into names and `_`, as in `for (k, v) in m.entries()` or `for Todo \{ id, .. } in todos`"))
         }
         let (list, p) = parse_expr_ns(p.need_kw("in")?)?
         let (body, p) = parse_block(p)?
@@ -1230,7 +1246,37 @@ fn parse_param(p: Parser) -> Parsed[ast.Param] {
         return Err(missing_type(name))
     }
     let (ty, p) = parse_type(p.skip())?
-    Ok((ast.Param { name: name.text, span: name.span, ty }, p))
+    Ok((ast.Param { name: name.text, span: name.span, ty, default: None }, p))
+}
+
+// A function's own parameter (not a foreign function's): `name: Type`, or
+// `name: Type = constant` with a default.
+fn parse_fn_param(p: Parser) -> Parsed[ast.Param] {
+    let (param, p) = parse_param(p)?
+    if !p.is_sym("=") {
+        return Ok((param, p))
+    }
+    let (e, p) = parse_expr(p.skip())?
+    if !is_constant(e) {
+        return Err(error("E0123", e.span, "the default for `{param.name}` must be a constant").note("a default is the same at every call: a number, a plain string, `true`, `false`, `None` or `[]`"))
+    }
+    Ok(({ param with default: Some(e) }, p))
+}
+
+// Whether `e` can be a parameter's default: a constant, the same at every
+// call.
+fn is_constant(e: ast.Expr) -> Bool {
+    match e.desc {
+        EInt(_) | EFloat(_) | EBool(_) | EUnit => true,
+        EStr([]) | EStr([SPLit(_)]) => true,
+        EUn(Neg, x) => match x.desc {
+            EInt(_) | EFloat(_) => true,
+            _ => false,
+        },
+        EVar("None") => true,
+        EList([]) => true,
+        _ => false,
+    }
 }
 
 fn missing_type(name: ast.Name) -> ParseError {
@@ -1326,7 +1372,7 @@ fn test_param(p: Parser) -> Parsed[TestParam] {
         }
     }
     let (ty, p) = parse_type(if virtual { p.skip() } else { p })?
-    Ok((TestParam { param: ast.Param { name: name.text, span: name.span, ty }, virtual }, p))
+    Ok((TestParam { param: ast.Param { name: name.text, span: name.span, ty, default: None }, virtual }, p))
 }
 
 // A table test: `for (a, b, want) in [(1, 2, 3), (2, 2, 4)]`, each case
@@ -1351,7 +1397,7 @@ fn parse_table(p: Parser) -> Parsed[Option[ast.Table]] {
 fn parse_fn(p: Parser) -> Parsed[ast.Item] {
     let (name, p) = p.skip().expect_ident()?
     let (gs, p) = bounded_generics(p)?
-    let (params, p) = comma_list(p.need("(")?, ")", parse_param)?
+    let (params, p) = comma_list(p.need("(")?, ")", parse_fn_param)?
     let (ret, p) = parse_ret(p)?
     let (body, p) = parse_block(p)?
     let d = ast.FnDecl {
@@ -1464,7 +1510,7 @@ fn parse_method(p: Parser) -> Parsed[ast.Method] {
 
 fn method_param(p: Parser) -> Parsed[ast.Param] {
     let (f, p) = typed_field(p)?
-    Ok((ast.Param { name: f.name, span: f.span, ty: f.ty }, p))
+    Ok((ast.Param { name: f.name, span: f.span, ty: f.ty, default: None }, p))
 }
 
 // ---------- foreign blocks ----------

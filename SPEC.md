@@ -30,9 +30,9 @@ fn parse_names(body: Str) -> List[Str] {   // no capabilities: cannot do I/O
 - **Doc comments:** the `//` lines directly above an item, a struct field, an enum variant or an interface method, with no blank line in between, document it. The comment block at the very top of a file, followed by a blank line, documents the module. `limen doc` reads them; there is no special marker.
 - **Identifiers:** `[A-Za-z_][A-Za-z0-9_]*`. By convention types and enum variants start with an uppercase letter, everything else lowercase. Patterns rely on this (section 7).
 - **Keywords:** `fn let mut if else match for in while return struct enum true false group break continue pub use interface dyn select defer`. `type`, `test`, `bench`, `foreign`, `until`, `interleaved` and `with` are words only where they start their construct, so they stay usable as names: a field can be called `type`.
-- **Integers:** decimal digits, `_` allowed as a separator (`1_000_000`). A literal must fit in 64 bits: up to `9223372036854775807` (E0005).
+- **Integers:** decimal digits, `_` allowed as a separator (`1_000_000`); hex after `0x` (`0xff`, `0xFF_00`) and binary after `0b` (`0b1010`), with `_` too. A literal must fit in an `Int`: up to `9223372036854775807`, or `0x7fff_ffff_ffff_ffff` (E0005). A hex or binary literal with no digits, or a digit its base does not have (`0b102`), is E0005 too.
 - **Floats:** digits with a fraction (`1.5`), an exponent (`1e9`, `2.5E-3`), or both. `_` is allowed. There is no leading-dot form (`.5`).
-- **Strings:** `"..."`, may span lines. Escapes: `\n \t \r \\ \" \{ \} \0`. Any other escape is error E0006.
+- **Strings:** `"..."`, may span lines. Escapes: `\n \t \r \\ \" \{ \} \0`, and `\u{...}` with 1 to 6 hex digits for a Unicode character, written as its UTF-8 bytes (`"caf\u{e9}"` is `"café"`). A code point past `10ffff`, or from `d800` to `dfff` (reserved for UTF-16), is not a character. Any other escape is error E0006.
 - **Interpolation:** `{expr}` inside a string evaluates any expression, including ones with their own strings: `"{xs.join(", ")}"`. An empty `{}` is error E0007; write `\{` for a literal brace.
 - **Multi-line strings:** `"""` at the end of a line opens one, its text is on the lines that follow, and `"""` on a line of its own closes it; code may follow the closing `"""` on that line. The closing line's indentation (its spaces and tabs, byte for byte) is taken off every line, and the line breaks right after the opening `"""` and right before the closing one are not part of the string:
   ```
@@ -111,7 +111,7 @@ t.0 + 1                           // fields by position
 for (n, s) in [(1, "a"), (2, "b")] { ... }
 ```
 
-Tuples compare and print like structs: `(1, "a") == (1, "a")`, and `(1, "a")` prints as `(1, "a")`. `let` and `for` can only unpack into names and `_`; `match` takes any patterns, such as `(true, 0)`.
+Tuples compare and print like structs: `(1, "a") == (1, "a")`, and `(1, "a")` prints as `(1, "a")`. `let` and `for` can only unpack into names and `_` (in tuples and struct patterns); `match` takes any patterns, such as `(true, 0)`.
 
 ### Maps
 
@@ -154,6 +154,7 @@ fn swap[A, B](p: Pair[A, B]) -> Pair[B, A] {
 ```
 
 - A function without `-> T` returns `()`.
+- A parameter can have a default value, used when a call leaves the argument out: `fn join(xs: List[Str], sep: Str = ", ")` is called `join(xs)` or `join(xs, " | ")`. A default is a constant (a number, a plain string, `true`, `false`, `None` or `[]`), anything else is E0123. It is checked once, where the function is declared, so the parameter's type cannot use the function's type parameters (E0123). Parameters with defaults can come anywhere: the ones before a later required parameter are filled by name, `f(b: 2)`. Methods take defaults too; foreign functions and interface methods do not. A function used as a value (`let g = join`) has its full type, `fn(List[Str], Str) -> Str`, and every argument is passed.
 - The body's last expression, without `;`, is the return value. `return e` returns early.
 - Generic parameters go in `[...]` after the name. They are instantiated at each use and are never written at call sites: `swap(p)`.
 - A type parameter written as an array's size stands for a length, inferred at each call: `fn sum[N](xs: Array[Int, N]) -> Int` takes an array of any length, and `fn first[T, N](xs: Array[T, N]) -> T` any element type too. Inside, `xs.len()` is that length. The function is compiled once per length used, like the rest of generics. A parameter cannot be both a length and a type (E0102), and it is not a value: use `xs.len()`.
@@ -477,7 +478,7 @@ Both operands must have the same type. The **ordered** types are `Int`, `Float`,
 
 ### Closures
 
-`|x, y: Int| expr` or `|| expr`. Parameter types are optional when the context gives them (`xs.map(|x| x + 1)`). A closure captures the variables it uses **by value**, when it is created, and it cannot assign to them (E0205). Inside a closure, `return` and `?` leave the closure, not the enclosing function.
+`|x, y: Int| expr` or `|| expr`. Parameter types are optional when the context gives them (`xs.map(|x| x + 1)`). The context reaches into list and tuple literals, so a closure inside one gets its types from the type expected there: `let ops: List[(Str, fn(Int, Int) -> Int)] = [("add", |a, b| a + b)]`, or a function returning `List[http.Route]` whose body is `[("GET /", |r, p| ...)]`. A closure captures the variables it uses **by value**, when it is created, and it cannot assign to them (E0205). Inside a closure, `return` and `?` leave the closure, not the enclosing function.
 
 **Trailing closures.** A block written right after a call's parentheses, on the same line, is a closure passed as the last argument. Its parameters, if any, come first inside the braces:
 
@@ -560,7 +561,7 @@ server.describe(prefix: "to", upper: true)
 ```
 
 - Positional arguments come first, then named ones in any order. A named argument is `name: expr`, with the parameter's name as declared.
-- Every parameter is passed exactly once. Labels only say which is which: Limen has no default values, so leaving one out is still E0107.
+- Every parameter is passed exactly once, except one with a default value (section 4), which may be left out; leaving out any other is E0107. A named argument skips the defaults before it: `connect(host, port, retries: 1)` leaves the others between at their defaults.
 - They work for functions and methods declared with `fn`, generic ones included, for methods called through an interface bound or a `dyn` value (the names are the interface's), and for functions of other modules. They do not work where the callee has no parameter names: closures and other function values (a type like `fn(Int) -> Int` has none), enum variants, built-in methods and functions, and foreign functions. A label there is E0122, with a fix that removes it.
 - An unknown name, a parameter passed twice, and a positional argument after a named one are E0122 (except a closure written last, which fills the last parameter: that is how a trailing closure combines with labels). When the right name is clear (one unknown label and one parameter left over, or a positional argument where one parameter is missing) the error carries a fix.
 - The arguments run in the order they are written, not in the parameter order, so `connect(retries: next(), port: other())` calls `next` first. Renaming a parameter changes the labels callers can use: it is part of the function's interface, like its types.
@@ -580,8 +581,10 @@ while cond { ... }
 for x in list_or_array { ... }
 for i in 0..<n { ... }    // 0, 1, ..., n - 1
 let (a, b) = pair         // unpack a tuple
+let Point { x, y } = p    // unpack a struct (`..` for the fields left out)
 (x, p) = step(p)?         // assign a tuple's items to existing variables
 for (k, v) in m.entries() { ... }
+for Todo { id, title, .. } in todos { ... }
 m[key] = value            // insert into a map (needs mut)
 break
 continue
@@ -681,7 +684,7 @@ match tokens {
 
 **As-patterns.** `p as name` matches what `p` matches and binds the whole value to `name` too, next to the names `p` binds: `Some(Point { x, .. } as p) => p.y + x`, `[first, ..] as all => all.len()`. `as` takes in everything before it: `A | B as x` is `(A | B) as x`, binding `x` whichever alternative matched; to name one alternative, use parentheses, `(A as x) | B`, and then every alternative must bind `x` (E0210). `as _` is E0003; leave it out. The name is written after the pattern, as in OCaml, F# and Python, rather than with a sign before it.
 
-`let`, `for` and table tests unpack only names, `_` and tuples of those (`let (a, b) = pair`); the other patterns need a `match`. `let [a, b] = xs` says so (E0003): a list can have any length, so it is taken apart with `match`.
+`let` and `for` unpack names, `_`, and tuples and struct patterns of those, as deep as they go (`let (a, b) = pair`, `let Line { from: Point { x, .. }, .. } = l`, `for Todo { id, title, .. } in todos`); table tests unpack tuples only. A struct pattern there is checked as in a `match`: the value must be that struct (E0201), each field must exist (E0103), and every field is named unless the pattern ends in `..` (E0206). The other patterns, which can fail to match, need a `match`. `let [a, b] = xs` says so (E0003): a list can have any length, so it is taken apart with `match`.
 
 An arm can have a guard, `if cond` after the pattern, as in a `select`: the arm applies only when its pattern matches **and** the guard is true, otherwise matching goes on with the next arm. The guard sees the pattern's bindings and must be a `Bool` (E0201). Guards run in order, only until an arm applies.
 
@@ -1873,7 +1876,7 @@ HTTP/1.1, plain or over TLS. The server keeps connections alive between requests
 | `struct Header { name, value }`, `req.header(name)`, `resp.header(name)`, `find_header(headers, name)` | headers; lookup ignores case |
 | `struct Request { method, path, version, headers, body }` | `version` is `"HTTP/1.1"` or `"HTTP/1.0"` |
 | `struct Response { status: Int, headers, body }`, `text(status, body)`, `json(status, body)`, `reason(status)` | |
-| `get(net, url)`, `post(net, url, content_type, body)`, `request(net, method, url, headers, body)` | `Result[Response, IoError]`; `http://` and `https://` URLs, read with the `url` module: the request names the path and query (`/` when there is no path), never the `#fragment`, which stays with the client; an IPv6 host is written in brackets (`http://[::1]:8080/`); a URL `url.parse` rejects is an error with its message. Chunked responses decoded, one connection per request. Unless `headers` has an Accept-Encoding, the request says `Accept-Encoding: gzip`, and a body sent with `Content-Encoding: gzip` or `deflate` is decompressed with the `compress` module (up to 64 MiB; damaged data is an error), the response then leaving out Content-Encoding and Content-Length, which describe the bytes sent |
+| `get(net, url)`, `post(net, url, content_type, body)`, `request(net, method, url, headers = [], body = "")` | `Result[Response, IoError]`; `http://` and `https://` URLs, read with the `url` module: the request names the path and query (`/` when there is no path), never the `#fragment`, which stays with the client; an IPv6 host is written in brackets (`http://[::1]:8080/`); a URL `url.parse` rejects is an error with its message. Chunked responses decoded, one connection per request. Unless `headers` has an Accept-Encoding, the request says `Accept-Encoding: gzip`, and a body sent with `Content-Encoding: gzip` or `deflate` is decompressed with the `compress` module (up to 64 MiB; damaged data is an error), the response then leaving out Content-Encoding and Content-Length, which describe the bytes sent |
 | `request_fold(net, method, url, headers, body, init, f)` | `Result[(Response, T), IoError]`: the body is passed to `f: fn(T, Str) -> T` piece by piece as it arrives instead of being held in memory, as it was sent (not decompressed: it asks for no encoding unless `headers` does); the response comes back with an empty body |
 | `request_lines(net, method, url, headers, body, f)` | `Result[Response, IoError]`: for a stream that may never end (a Kubernetes watch, server-sent events, a log follow), each line of a 2xx body is passed to `f: fn(Str) -> Bool` as soon as it has arrived, without its `\n` or `\r\n`; `f` returns `false` to stop, and the connection is closed. Any other status is returned with its whole body, and `f` is not called |
 | `serve_forever(listener, handler) -> IoError` | serve every connection in its own task until the listener is closed (by another task holding it) or fails; returns that error. The tasks are an `interleaved` group (section 10): what a handler prints goes out at once |
@@ -1958,7 +1961,7 @@ Number formatting. Fixed decimals are the Float method `x.to_fixed(d)`; this mod
 | Item | Meaning |
 | --- | --- |
 | `thousands(n)` | `"1,234,567"` |
-| `grouped(number, sep)` | `sep` between groups of three digits in the integer part of a number already written out: `grouped(x.to_fixed(2), " ")` is `"1 234 567.89"` |
+| `grouped(number, sep = ",")` | `sep` between groups of three digits in the integer part of a number already written out: `grouped(x.to_fixed(2), " ")` is `"1 234 567.89"` |
 | `zero_pad(n, width)` | zeros after the sign up to `width` characters: `zero_pad(-7, 4)` is `"-007"` |
 | `percent(x, decimals)` | `percent(0.4567, 1)` is `"45.7%"` |
 | `hex(n)`, `base(n, radix)` | lowercase digits in base 16 or 2 to 36, with `-` for negatives: `hex(255)` is `"ff"`; another radix panics |
@@ -2034,7 +2037,7 @@ fn main(root: Root) {
 
 ### text
 
-`repeat(s, n)`, `pad_left(s, width, fill)`, `pad_right(s, width, fill)`, `count(s, sub)`, `words(s)`, and byte tests `is_digit(b)`, `is_alpha(b)`, `is_space(b)` for use with `bytes()`.
+`repeat(s, n)`, `pad_left(s, width, fill = " ")`, `pad_right(s, width, fill = " ")`, `count(s, sub)`, `words(s)`, and byte tests `is_digit(b)`, `is_alpha(b)`, `is_space(b)` for use with `bytes()`.
 
 ### sql
 
@@ -2045,7 +2048,7 @@ use sql
 
 fn main(root: Root) -> Result[(), IoError] {
     let db = sql.open(root.fs, "app.db")?          // --grant fs=DIR
-    db.exec("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER)", [])?
+    db.exec("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER)")?
     db.exec("INSERT INTO users (name, age) VALUES (?, ?)", [sql.Text("Ada"), sql.Int(36)])?
     for row in db.query("SELECT id, name, age FROM users WHERE age > ?", [sql.Int(30)])? {
         root.stdout.print("{row.int("id") ?? 0} {row.text("name") ?? ""}")
@@ -2059,6 +2062,15 @@ fn main(root: Root) -> Result[(), IoError] {
 - Values go in as parameters, never into the SQL text: each `?` takes the next item of `params`, a `List[sql.Value]`, which is `sql.Null`, `sql.Int(n)`, `sql.Float(x)`, `sql.Text(s)` or `sql.Blob(bytes)`. The number of `?`s must match the list.
 - `exec` returns the number of rows changed. With no parameters its text may hold several statements separated by `;` (a schema); with parameters it must be exactly one.
 - `query` runs one statement and returns every row as a `List[sql.Row]`; `query_one` returns the first, as an `Option`. A row holds `columns` (names) and `values`. `row.get(name)` is the `Value`; `row.int(name)`, `row.float(name)` (an integer reads as a float too), `row.text(name)` and `row.blob(name)` are `Option`s, `None` for NULL; `row.is_null(name)`. Asking for a column the row does not have, or reading one as the wrong type, panics: that is a bug in the query or the code, not a condition to handle.
+- `params` defaults to `[]` on `exec`, `query`, `query_one`, `all` and `one`: `db.exec("CREATE TABLE ...")`.
+- **Rows as structs.** `db.all(text, params)` returns every row read into a struct, `db.one(text, params)` the first as an `Option`, and `sql.decode(row)` reads one row; `sql.values(x)` is a struct's fields as parameters, in the order the struct declares them:
+  ```
+  struct User { id: Int, name: Str, age: Option[Int] }
+
+  let users: List[User] = db.all("SELECT id, name, age FROM users WHERE age > ?", [sql.Int(30)])?
+  db.exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", sql.values(u))?
+  ```
+  Each field reads the column of its name, so a query names the columns the struct has (`SELECT *` works when they match). A field is `Int`, `Float` (an integer column reads as a float too), `Str`, `Bool` (stored as `0` or `1`), `Bytes`, or an `Option` of one of those, `None` for NULL. A column the row does not have, NULL in a field that is not an `Option`, and a value of the wrong type are `Err(Failed(...))` naming the column and the field: rows come from outside the program, so unlike `row.int(name)` this does not panic. As with `json.encode`, the compiler writes the conversion for each struct it is used with, so the struct must be known where the call is (E0212); a type that is not a struct, or a field of another type, is E0212 too.
 - `db.transaction(|| { ...; Ok(v) })` runs the closure between `BEGIN` and `COMMIT`. If it returns `Err` or panics, the transaction is rolled back and the error (or the panic) goes on. Transactions do not nest: starting one inside another is an `Err`.
 - `db.last_id()` is the rowid of the last row inserted through the connection, as a `Result[Int, IoError]`.
 - SQLite stays inside the grants. `ATTACH` is turned off, and with it `VACUUM` (which attaches a temporary database; `VACUUM INTO` would write anywhere), so SQL cannot open other files. The database file is not opened through a symlink, and `open` refuses a database whose `-journal`, `-wal` or `-shm` file is a symlink out of the granted directory (or a broken one), since SQLite follows those. URI filenames and extensions are off (SQLite's defaults, which the module never changes), and temporary tables and sorts stay in memory. What remains are races no Limen code can cause: another process that can write to the directory swapping in such a symlink while the database is open, or swapping a directory on the database's path for a symlink between the check and SQLite's open (SQLite opens by path and follows symlinks in it). The operating-system sandbox, built from the same grant, refuses what either swap would reach; closing them in Limen itself is on the roadmap (0.8). SQLite writes its journal next to the database, inside the granted directory. A busy database is waited on for up to 5 seconds.
@@ -2230,9 +2242,9 @@ fn main(root: Root) -> Result[Int, Str] {
 | Item | Meaning |
 | --- | --- |
 | `spec(program, about) -> Spec` | a spec with a sentence for the help |
-| `s.flag(name, short, help)` | a boolean flag, `--name` and `-short` (`short` may be `""`) |
-| `s.option(name, short, help)` | a flag with a value; `.default(v)`, `.required()` and `.value_name(n)` after it change it |
-| `s.positional(name, help)`, `s.rest(name, help)` | a required positional argument; any number after them (none without `rest`) |
+| `s.flag(name, short = "", help = "")` | a boolean flag, `--name` and `-short` (`short` may be `""`, or left out: `s.flag("verbose", help: "say more")`) |
+| `s.option(name, short = "", help = "")` | a flag with a value; `.default(v)`, `.required()` and `.value_name(n)` after it change it |
+| `s.positional(name, help = "")`, `s.rest(name, help = "")` | a required positional argument; any number after them (none without `rest`) |
 | `s.parse(args) -> Result[Parsed, Str]` | the flags and arguments given |
 | `s.usage()`, `s.help()` | the usage line, and the whole help with every flag, its default and whether it is required |
 | `p.bool(name)`, `p.count(name)` | whether a boolean flag was given, and how many times (`-vvv` is 3) |

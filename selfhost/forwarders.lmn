@@ -214,7 +214,7 @@ fn forwarder(structs: Map[Str, ast.StructDecl], s: ast.StructDecl, path: List[St
         args.push(ast.Expr { desc: EVar(p.name), span: sp, id })
     }
     let call = ast.Expr { desc: EMethod(recv, method_name(d.name), sp, args), span: sp, id: id + 1 }
-    let receiver = ast.Param { name: "self", span: sp, ty: named(s.name, s.generics.map(|g| named(g, []))) }
+    let receiver = ast.Param { name: "self", span: sp, ty: named(s.name, s.generics.map(|g| named(g, []))), default: None }
     let f = { d with
         name: s.name + "::" + method_name(d.name),
         generics: s.generics + renamed.map(|r| r.1),

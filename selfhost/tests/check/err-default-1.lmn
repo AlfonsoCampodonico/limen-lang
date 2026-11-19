@@ -1,0 +1,2 @@
+fn f(x: Int = "s") {}
+fn main(root: Root) {}

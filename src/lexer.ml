@@ -140,6 +140,17 @@ let skip_indent src j =
   while !k < n && (src.[!k] = ' ' || src.[!k] = '\t') do incr k done;
   !k
 
+(* The index after the escape whose backslash is at [j]: `\u{...}` runs to
+   its closing brace, every other escape is two bytes. *)
+let esc_end src j =
+  let n = String.length src in
+  if j + 2 < n && src.[j + 1] = 'u' && src.[j + 2] = '{' then begin
+    let k = ref (j + 3) in
+    while !k < n && !k < j + 12 && src.[!k] <> '}' && src.[!k] <> '"' && src.[!k] <> '\n' do incr k done;
+    if !k < n && src.[!k] = '}' then !k + 1 else j + 2
+  end
+  else j + 2
+
 (* Index just past the string literal starting at [i] (a '"'). Handles
    escapes and nested interpolations, so `"{xs.join("-")}"` works, and
    multi-line strings. *)
@@ -153,7 +164,7 @@ let rec skip_string src i on_eof =
       else
         match src.[j] with
         | '"' -> j + 1
-        | '\\' -> go (j + 2)
+        | '\\' -> go (esc_end src j)
         | '{' -> go (skip_braces src (j + 1) on_eof)
         | _ -> go (j + 1)
     in
@@ -186,7 +197,7 @@ and ml_close src i on_eof =
     else
       match src.[j] with
       | '\n' -> line (j + 1)
-      | '\\' -> if j + 1 < n && src.[j + 1] = '\n' then line (j + 2) else rest (j + 2)
+      | '\\' -> if j + 1 < n && src.[j + 1] = '\n' then line (j + 2) else rest (esc_end src j)
       | '{' -> rest (skip_braces src (j + 1) on_eof)
       | _ -> rest (j + 1)
   in
@@ -232,6 +243,37 @@ let lex ?(base = 0) file (src : string) : tokens =
       let lo = !i in
       while !i < n && src.[!i] <> '\n' do incr i done;
       if base = 0 then comments := (lo, !i, String.trim (String.sub src lo (!i - lo))) :: !comments
+    end
+    else if c = '0' && !i + 1 < n && (src.[!i + 1] = 'x' || src.[!i + 1] = 'b') then begin
+      (* 0xff, 0b1010: a whole number in base 16 or 2, which must fit in Int *)
+      let lo = !i in
+      let hex = src.[!i + 1] = 'x' in
+      let radix = if hex then 16 else 2 in
+      let digit c =
+        if c >= '0' && c <= '9' then Char.code c - 48
+        else if c >= 'a' && c <= 'f' then Char.code c - 87
+        else if c >= 'A' && c <= 'F' then Char.code c - 55
+        else 99
+      in
+      i := !i + 2;
+      let v = ref 0L and big = ref false and seen = ref false in
+      while !i < n && (is_ident src.[!i]) do
+        let c = src.[!i] in
+        if c <> '_' then begin
+          let d = digit c in
+          if d >= radix then
+            fail "E0005" !i (!i + 1)
+              (Printf.sprintf "`%c` is not a %s digit" c (if hex then "hex" else "binary"));
+          seen := true;
+          if Int64.compare !v (Int64.div (Int64.sub Int64.max_int (Int64.of_int d)) (Int64.of_int radix)) > 0 then big := true
+          else v := Int64.add (Int64.mul !v (Int64.of_int radix)) (Int64.of_int d)
+        end;
+        incr i
+      done;
+      if not !seen then
+        fail "E0005" lo !i (Printf.sprintf "`%s` has no digits; write it as in `%s`" (String.sub src lo (!i - lo)) (if hex then "0xff" else "0b1010"));
+      if !big then fail "E0005" lo !i (Printf.sprintf "integer literal `%s` is too large" (String.sub src lo (!i - lo)));
+      push (INT !v) lo !i
     end
     else if is_digit c then begin
       let lo = !i in
@@ -281,18 +323,31 @@ let lex ?(base = 0) file (src : string) : tokens =
           Buffer.clear buf
         end
       in
-      (* the escape `\e` at [j] *)
+      (* the escape `\e` at [j]; the index after it *)
       let escape j =
         let e = src.[j + 1] in
+        let one ch = Buffer.add_char buf ch; j + 2 in
         match e with
-        | 'n' -> Buffer.add_char buf '\n'
-        | 't' -> Buffer.add_char buf '\t'
-        | 'r' -> Buffer.add_char buf '\r'
-        | '\\' -> Buffer.add_char buf '\\'
-        | '"' -> Buffer.add_char buf '"'
-        | '{' -> Buffer.add_char buf '{'
-        | '}' -> Buffer.add_char buf '}'
-        | '0' -> Buffer.add_char buf '\000'
+        | 'n' -> one '\n'
+        | 't' -> one '\t'
+        | 'r' -> one '\r'
+        | '\\' -> one '\\'
+        | '"' -> one '"'
+        | '{' -> one '{'
+        | '}' -> one '}'
+        | '0' -> one '\000'
+        | 'u' ->
+          let hi = esc_end src j in
+          let digits = if hi > j + 2 then String.sub src (j + 3) (hi - j - 4) else "" in
+          let is_hex c = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') in
+          if hi = j + 2 || digits = "" || String.length digits > 6 || not (String.for_all is_hex digits) then
+            fail "E0006" j (if hi > j + 2 then hi else j + 2) "`\\u` takes 1 to 6 hex digits in braces, as in `\\u{e9}`";
+          let cp = int_of_string ("0x" ^ digits) in
+          if cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF) then
+            fail "E0006" j hi (Printf.sprintf "`\\u{%s}` is not a Unicode character%s" digits
+              (if cp > 0x10FFFF then ": the last is `10ffff`" else ": `d800` to `dfff` are reserved for UTF-16"));
+          Buffer.add_utf_8_uchar buf (Uchar.of_int cp);
+          hi
         | _ -> fail "E0006" j (j + 2) (Printf.sprintf "unknown escape `\\%c`" e)
       in
       (* the interpolation opened at [open_at], which must close before
@@ -363,7 +418,7 @@ let lex ?(base = 0) file (src : string) : tokens =
                 if at >= ce then fail "E0009" !j (!j + 1) "a `\\` at the end of the last line has no next line to join";
                 j := start_line (at + 1)
               end
-              else (escape !j; j := !j + 2)
+              else j := escape !j
             end
             else if c = '{' then j := interp !j ce
             else (Buffer.add_char buf c; incr j)
@@ -380,8 +435,7 @@ let lex ?(base = 0) file (src : string) : tokens =
           if c = '"' then (closed := true; incr i)
           else if c = '\\' then begin
             if !i + 1 >= n then fail "E0002" lo n "unterminated string literal";
-            escape !i;
-            i := !i + 2
+            i := escape !i
           end
           else if c = '{' then i := interp !i n
           else (Buffer.add_char buf c; incr i)

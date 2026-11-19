@@ -1,0 +1,3 @@
+fn f(a: Int = 1, b: Int) {}
+fn g() { f(5) }
+fn main(root: Root) {}

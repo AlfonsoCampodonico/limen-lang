@@ -150,7 +150,11 @@ let struct_decl items t =
 
 let fn_signature text (d : fn_decl) =
   let gens = Doc.generics ~text d.fn_gen d.fn_bounds in
-  let ps = List.map (fun p -> p.prm_name ^ ": " ^ slice text p.prm_ty.tspan) d.fn_params in
+  let ps =
+    List.map
+      (fun p -> p.prm_name ^ ": " ^ slice text p.prm_ty.tspan ^ match p.prm_default with Some e -> " = " ^ slice text e.espan | None -> "")
+      d.fn_params
+  in
   (* a variadic foreign function's `...` *)
   let ps = match d.fn_foreign with Some { fvariadic = Some k; _ } -> List.filteri (fun i _ -> i < k) ps @ [ "..." ] @ List.filteri (fun i _ -> i >= k) ps | _ -> ps in
   let ret = match d.fn_ret with Some te -> " -> " ^ slice text te.tspan | None -> "" in

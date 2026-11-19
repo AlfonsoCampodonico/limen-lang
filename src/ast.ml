@@ -84,8 +84,6 @@ type bounds = (string * ty_expr list) list
 
 (* [ety] and [einst] are filled in by the checker: the expression's type, and
    for a reference to a generic function, the type arguments it was used at. *)
-type param = { prm_name : string; prm_span : span; prm_ty : ty_expr }
-
 type expr = {
   mutable edesc : expr_desc; (* the checker wraps a value in EDyn where a `dyn` is expected *)
   espan : span;
@@ -143,6 +141,10 @@ and sel_op =
   | SelAfter of expr * expr (* `clock.after(ms)`: clock, milliseconds *)
   | SelDefault
 and arm = { apat : pat; aguard : expr option (* `if cond`: the arm applies only when true *); abody : expr }
+
+(* A function's parameter; [prm_default] is its default value, a constant
+   (`sep: Str = ", "`), used when a call leaves the argument out. *)
+and param = { prm_name : string; prm_span : span; prm_ty : ty_expr; prm_default : expr option }
 and block = { stmts : stmt list; tail : expr option; bspan : span }
 and stmt = { sdesc : stmt_desc; sspan : span }
 and stmt_desc =

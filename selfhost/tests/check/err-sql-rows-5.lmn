@@ -1,0 +1,11 @@
+use sql
+
+struct Holder {
+    fs: Fs,
+}
+
+fn put(h: Holder) -> List[sql.Value] {
+    sql.values(h)
+}
+
+fn main(root: Root) {}

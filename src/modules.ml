@@ -571,30 +571,41 @@ let rec expr env locals (e : expr) : expr =
   if d == e.edesc && not env.fresh then e else { e with edesc = d }
 
 (* `let (a, (b, _)) = e` becomes `let t = e; let a = t.0; let u = t.1; let b = u.0`,
-   and `for (k, v) in xs { body }` becomes `for t in xs { let (k, v) = t; body }`. *)
+   and `for (k, v) in xs { body }` becomes `for t in xs { let (k, v) = t; body }`.
+   A struct pattern checks the value's type with a match that cannot fail:
+   `let Point { x, y: (a, _) } = e` becomes
+   `let t = match e { Point { x: _, y: _ } as s => s }; let x = t.x; ...`,
+   so the checker reports a wrong type, an unknown field or a missing `..`
+   at the pattern, as it does in `match`. *)
 and unpack_counter = ref 0
 
 and unpack (p : pat) (e : expr) : stmt list =
   incr unpack_counter;
   let tmp = "tuple$" ^ string_of_int !unpack_counter in
   let mk d = { edesc = d; espan = p.pspan; ety = Types.TErr; einst = []; ecallee = None } in
-  let first = { sdesc = SLet (false, tmp, p.pspan, None, e); sspan = p.pspan } in
-  let rest =
-    match p.pdesc with
-    | PTuple ps ->
-      List.concat
-        (List.mapi
-           (fun i (sub : pat) ->
-             let field = mk (EField (mk (EVar tmp), string_of_int i, sub.pspan)) in
-             match sub.pdesc with
-             | PBind n -> [ { sdesc = SLet (false, n, sub.pspan, None, field); sspan = sub.pspan } ]
-             | PWild -> []
-             | _ -> unpack sub field)
-           ps)
-    | PBind n -> [ { sdesc = SLet (false, n, p.pspan, None, mk (EVar tmp)); sspan = p.pspan } ]
-    | _ -> []
+  let part name (sub : pat) =
+    let field = mk (EField (mk (EVar tmp), name, sub.pspan)) in
+    match sub.pdesc with
+    | PBind n -> [ { sdesc = SLet (false, n, sub.pspan, None, field); sspan = sub.pspan } ]
+    | PWild -> []
+    | _ -> unpack sub field
   in
-  first :: rest
+  match p.pdesc with
+  | PStruct (name, nsp, fields, rest) ->
+    let whole = "struct$" ^ string_of_int !unpack_counter in
+    let shape = { p with pdesc = PStruct (name, nsp, List.map (fun (f, fsp, q) -> (f, fsp, { q with pdesc = PWild })) fields, rest) } in
+    let arm = { apat = { p with pdesc = PAs (shape, whole, p.pspan) }; aguard = None; abody = mk (EVar whole) } in
+    { sdesc = SLet (false, tmp, p.pspan, None, mk (EMatch (e, [ arm ]))); sspan = p.pspan }
+    :: List.concat_map (fun (f, _, q) -> part f q) fields
+  | _ ->
+    let first = { sdesc = SLet (false, tmp, p.pspan, None, e); sspan = p.pspan } in
+    let rest =
+      match p.pdesc with
+      | PTuple ps -> List.concat (List.mapi (fun i sub -> part (string_of_int i) sub) ps)
+      | PBind n -> [ { sdesc = SLet (false, n, p.pspan, None, mk (EVar tmp)); sspan = p.pspan } ]
+      | _ -> []
+    in
+    first :: rest
 
 (* `(a, (b, _)) = e` becomes `let $assign1 = e; a = $assign1.0;
    let $assign2 = $assign1.1; b = $assign2.0`: the right side first, then
@@ -951,9 +962,10 @@ let load_and_check path src : item list * Diag.t list * Check.fn_info list =
       (* `json.encode` and `json.decode` get their conversions written once
          the types are known, and the program is checked again with them *)
       let items, ds, infos =
-        match List.find_opt (fun (_, std) -> std = "json") !std_loaded with
-        | Some (json, _) when Diag.errors ds = [] -> (
-          match Derive.expand ~json items with
+        let loaded name = Option.map fst (List.find_opt (fun (_, std) -> std = name) !std_loaded) in
+        match (loaded "json", loaded "sql") with
+        | (Some _ as json), sql | json, (Some _ as sql) when Diag.errors ds = [] -> (
+          match Derive.expand ?json ?sql items with
           | None -> (items, ds, infos)
           | Some (items, (_ :: _ as errs)) -> (items, errs @ ds, infos)
           | Some (items, []) -> let ds, infos = Check.check_program items in (items, ds, infos))

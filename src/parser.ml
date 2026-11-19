@@ -63,8 +63,23 @@ let mk d sp = { edesc = d; espan = sp; ety = Types.TErr; einst = []; ecallee = N
    formatted file parses to the same tree *)
 let safe_count = ref 0
 
+(* What `let` and `for` can take apart: names and `_`, in tuples and struct
+   patterns, as deep as they like. *)
 let rec irrefutable_tuple (p : pat) =
-  match p.pdesc with PBind _ | PWild -> true | PTuple ps -> List.for_all irrefutable_tuple ps | _ -> false
+  match p.pdesc with
+  | PBind _ | PWild -> true
+  | PTuple ps -> List.for_all irrefutable_tuple ps
+  | PStruct (_, _, fs, _) -> List.for_all (fun (_, _, q) -> irrefutable_tuple q) fs
+  | _ -> false
+
+(* Whether a struct pattern starts [k] tokens after the current one:
+   `Point {` or `geo.Point {`. *)
+let struct_pat_ahead ?(k = 0) st =
+  let at i = tok_at st (st.pos + k + i) in
+  match (at 0, at 1) with
+  | IDENT v, SYM "{" -> is_upper v
+  | IDENT _, SYM "." -> ( match (at 2, at 3) with IDENT v, SYM "{" -> is_upper v | _ -> false)
+  | _ -> false
 
 let comma_list st close f =
   let rec go acc =
@@ -709,11 +724,14 @@ and parse_stmt st =
   | KW "let" ->
     skip st;
     let m = if is_kw st "mut" then (skip st; true) else false in
-    if is_sym st "(" then begin
-      (* `let (a, b) = e` *)
+    if is_sym st "(" || struct_pat_ahead st then begin
+      (* `let (a, b) = e`, `let Point { x, y } = p` *)
       let p = parse_pat st in
       if not (irrefutable_tuple p) then
-        raise (Diag.Fatal (Diag.make "E0003" p.pspan "`let` can only unpack a tuple into names and `_`, as in `let (a, _) = t`"));
+        raise
+          (Diag.Fatal
+             (Diag.make "E0003" p.pspan
+                "`let` can only take apart tuples and structs into names and `_`, as in `let (a, _) = t` or `let Point { x, .. } = p`"));
       need_sym st "=";
       let e = parse_expr st in
       mks (SLetPat (p, e)) (merge sp e.espan)
@@ -744,11 +762,14 @@ and parse_stmt st =
     let c = parse_expr_ns st in
     let b = parse_block st in
     mks (SWhile (c, b)) (merge sp b.bspan)
-  | KW "for" when (match next st with SYM "(" -> true | _ -> false) ->
+  | KW "for" when (match next st with SYM "(" -> true | _ -> false) || struct_pat_ahead ~k:1 st ->
     skip st;
     let p = parse_pat st in
     if not (irrefutable_tuple p) then
-      raise (Diag.Fatal (Diag.make "E0003" p.pspan "`for` can only unpack a tuple into names and `_`, as in `for (k, v) in m.entries()`"));
+      raise
+        (Diag.Fatal
+           (Diag.make "E0003" p.pspan
+              "`for` can only take apart tuples and structs into names and `_`, as in `for (k, v) in m.entries()` or `for Todo { id, .. } in todos`"));
     need_kw st "in";
     let e = parse_expr_ns st in
     let b = parse_block st in
@@ -827,12 +848,40 @@ let parse_generics st =
 
 let test_count = ref 0
 
-let parse_param st =
+(* Whether [e] can be a parameter's default: a constant, the same at every
+   call. *)
+let rec is_constant (e : expr) =
+  match e.edesc with
+  | EInt _ | EFloat _ | EBool _ | EUnit -> true
+  | EStr ([] | [ SPLit _ ]) -> true
+  | EUn (Neg, ({ edesc = EInt _ | EFloat _; _ } as _n)) -> true
+  | EVar "None" -> true
+  | EList [] -> true
+  | _ -> false
+
+(* A parameter: `name: Type`, and in a function's own parameters (not a
+   foreign function's) a default, `name: Type = constant`. *)
+let parse_param ?(defaults = false) st =
   let pn, psp = expect_ident st in
   if not (is_sym st ":") then
     raise (Diag.Fatal (Diag.make "E0008" psp (Printf.sprintf "parameter `%s` needs a type, for example `%s: Int`" pn pn)));
   skip st;
-  { prm_name = pn; prm_span = psp; prm_ty = parse_type st }
+  let ty = parse_type st in
+  let default =
+    if defaults && is_sym st "=" then begin
+      skip st;
+      let e = parse_expr st in
+      if not (is_constant e) then
+        raise
+          (Diag.Fatal
+             (Diag.make "E0123" e.espan
+                ~notes:[ "a default is the same at every call: a number, a plain string, `true`, `false`, `None` or `[]`" ]
+                (Printf.sprintf "the default for `%s` must be a constant" pn)));
+      Some e
+    end
+    else None
+  in
+  { prm_name = pn; prm_span = psp; prm_ty = ty; prm_default = default }
 
 let parse_item st =
   let t = peek st in
@@ -859,7 +908,7 @@ let parse_item st =
        | IDENT "virtual", _ ->
          raise (Diag.Fatal (Diag.make "E0003" (cur_span st) "only a test's clock can be virtual: `clock: virtual Clock`"))
        | _ -> ());
-      { prm_name = pn; prm_span = psp; prm_ty = parse_type st }
+      { prm_name = pn; prm_span = psp; prm_ty = parse_type st; prm_default = None }
     in
     let params = if accept_sym st "(" then comma_list st ")" test_param else [] in
     (* a table test: `for (a, b, want) in [(1, 2, 3), (2, 2, 4)]`, each case run on its own *)
@@ -895,7 +944,7 @@ let parse_item st =
     let name, nsp = expect_ident st in
     let gen, bounds = split_generics (parse_bounded_generics st) in
     need_sym st "(";
-    let params = comma_list st ")" parse_param in
+    let params = comma_list st ")" (parse_param ~defaults:true) in
     let ret = if accept_sym st "->" then Some (parse_type st) else None in
     let body = parse_block st in
     IFn { fn_name = name; fn_span = nsp; fn_gen = gen; fn_params = params; fn_ret = ret; fn_body = body; fn_test = None; fn_bench = false; fn_virtual = false; fn_table = None; fn_pub = false; fn_bounds = bounds; fn_foreign = None }
@@ -963,7 +1012,7 @@ let parse_item st =
               comma_list st ")" (fun st ->
                   let pn, psp = expect_ident st in
                   need_sym st ":";
-                  { prm_name = pn; prm_span = psp; prm_ty = parse_type st })
+                  { prm_name = pn; prm_span = psp; prm_ty = parse_type st; prm_default = None })
             else (need_sym st ")"; [])
           in
           let ret = if accept_sym st "->" then Some (parse_type st) else None in

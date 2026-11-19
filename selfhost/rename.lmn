@@ -855,33 +855,59 @@ fn expand_stmts(st: State, stmts: List[ast.Stmt]) -> (List[ast.Stmt], State) {
 }
 
 // `let (a, (b, _)) = e` as `let t = e; let a = t.0; let u = t.1;
-// let b = u.0`.
+// let b = u.0`. A struct pattern checks the value's type with a match that
+// cannot fail: `let Point \{ x, y: (a, _) } = e` as
+// `let t = match e \{ Point \{ x: _, y: _ } as s => s }; let x = t.x; ...`,
+// so the checker reports a wrong type, an unknown field or a missing `..`
+// at the pattern, as it does in `match`.
 fn unpack(st: State, p: ast.Pat, e: ast.Expr) -> (List[ast.Stmt], State) {
     let (n, st) = st.temp()
     let tmp = "tuple$" + n.to_str()
-    let first = ast.Stmt { desc: SLet(false, tmp, p.span, None, e), span: p.span }
     match p.desc {
+        PStruct(name, name_span, fields, rest) => {
+            let whole = "struct$" + n.to_str()
+            let wild = fields.map(|f| ast.FieldPat { name: f.name, span: f.span, pat: ast.Pat { desc: PWild, span: f.pat.span } })
+            let shape = ast.Pat { desc: PStruct(name, name_span, wild, rest), span: p.span }
+            let (body, st) = st.node(EVar(whole), p.span)
+            let arm = ast.Arm { pat: ast.Pat { desc: PAs(shape, whole, p.span), span: p.span }, guard: None, body }
+            let (checked, st) = st.node(EMatch(e, [arm]), p.span)
+            let mut st = st
+            let mut out = [ast.Stmt { desc: SLet(false, tmp, p.span, None, checked), span: p.span }]
+            for f in fields {
+                let (more, after) = unpack_part(st, tmp, f.name, f.pat, p.span)
+                out = out + more
+                st = after
+            }
+            (out, st)
+        },
         PTuple(parts) => {
             let mut st = st
-            let mut out = [first]
+            let mut out = [ast.Stmt { desc: SLet(false, tmp, p.span, None, e), span: p.span }]
             for (i, sub) in parts.with_index() {
-                let (var, after) = st.node(EVar(tmp), p.span)
-                let (part, after) = after.node(EField(var, i.to_str(), sub.span), p.span)
-                let (more, after) = match sub.desc {
-                    PBind(name) => ([ast.Stmt { desc: SLet(false, name, sub.span, None, part), span: sub.span }], after),
-                    PWild => ([], after),
-                    _ => unpack(after, sub, part),
-                }
+                let (more, after) = unpack_part(st, tmp, i.to_str(), sub, p.span)
                 out = out + more
                 st = after
             }
             (out, st)
         },
         PBind(name) => {
+            let first = ast.Stmt { desc: SLet(false, tmp, p.span, None, e), span: p.span }
             let (var, st) = st.node(EVar(tmp), p.span)
             ([first, ast.Stmt { desc: SLet(false, name, p.span, None, var), span: p.span }], st)
         },
-        _ => ([first], st),
+        _ => ([ast.Stmt { desc: SLet(false, tmp, p.span, None, e), span: p.span }], st),
+    }
+}
+
+// The statements for the part `field` of the temporary `tmp`, taken apart
+// by `sub`.
+fn unpack_part(st: State, tmp: Str, field: Str, sub: ast.Pat, span: ast.Span) -> (List[ast.Stmt], State) {
+    let (var, st) = st.node(EVar(tmp), span)
+    let (part, st) = st.node(EField(var, field, sub.span), span)
+    match sub.desc {
+        PBind(name) => ([ast.Stmt { desc: SLet(false, name, sub.span, None, part), span: sub.span }], st),
+        PWild => ([], st),
+        _ => unpack(st, sub, part),
     }
 }
 
