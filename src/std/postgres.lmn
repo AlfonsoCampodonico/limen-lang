@@ -10,8 +10,10 @@
 // Rows are read as `sql` rows are: `row.int("id")`, or into a struct with
 // `db.all`, `db.one` and `postgres.decode(row)`, which the compiler writes
 // for each struct as it does for `sql`. Logging in takes SCRAM-SHA-256 (the
-// default since Postgres 14), MD5 or a cleartext password; the nonce of
-// SCRAM comes from `Rand`. Connections are plain TCP: TLS is not supported
+// default since Postgres 14), where the server proves it knows the
+// password too; the nonce comes from `Rand`. MD5 and cleartext logins send
+// what an impostor could reuse or read, so they are refused unless the
+// caller asks for them with `weak_login: true`. Connections are plain TCP: TLS is not supported
 // yet.
 //
 // A `Db` is one connection, used by one task at a time: a query is a
@@ -49,8 +51,9 @@ pub struct Row {
 
 // Connect and log in. `address` is `postgres://user:password@host:port/database`
 // (`postgresql://` too); the port defaults to 5432 and the database to the
-// user's name.
-pub fn connect(net: Net, rand: Rand, address: Str) -> Result[Db, IoError] {
+// user's name. Only SCRAM-SHA-256 is accepted unless `weak_login` is true,
+// which allows MD5 and cleartext passwords too.
+pub fn connect(net: Net, rand: Rand, address: Str, weak_login: Bool = false) -> Result[Db, IoError] {
     let u = match url.parse(address) {
         Ok(u) => u,
         Err(e) => {
@@ -70,7 +73,7 @@ pub fn connect(net: Net, rand: Rand, address: Str) -> Result[Db, IoError] {
     let host = if u.host.contains(":") { "[{u.host}]" } else { u.host }
     let conn = net.connect("{host}:{u.port ?? 5432}")?
     let db = Db { conn }
-    match db.log_in(rand, user, password, database) {
+    match db.log_in(rand, user, password, database, weak_login) {
         Ok(_) => Ok(db),
         Err(e) => {
             let _ = conn.close()
@@ -79,12 +82,15 @@ pub fn connect(net: Net, rand: Rand, address: Str) -> Result[Db, IoError] {
     }
 }
 
-fn log_in(self: Db, rand: Rand, user: Str, password: Str, database: Str) -> Result[(), IoError] {
+fn log_in(self: Db, rand: Rand, user: Str, password: Str, database: Str, weak_login: Bool) -> Result[(), IoError] {
     let body = int32(196608) + cstr("user") + cstr(user) + cstr("database") + cstr(database) + cstr("client_encoding") + cstr("UTF8") + [0]
     self.send(int32(body.len() + 4) + body)?
     let mut r = Reader { conn: self.conn, buf: bytes([]), at: 0 }
     // the SCRAM exchange so far, when the server asked for it
     let mut scram: Option[Scram] = None
+    // whether the server proved it knows the password (SCRAM's last step)
+    let mut proved = false
+    let weak = |how: Str| Failed("postgres: the server asks for {how}, which an impostor could exploit; pass `weak_login: true` to allow it")
     while true {
         let (m, after) = r.next()?
         r = after
@@ -93,10 +99,20 @@ fn log_in(self: Db, rand: Rand, user: Str, password: Str, database: Str) -> Resu
             82 => {
                 let code = m.code_at(0)
                 if code == 0 {
+                    // a server that started SCRAM must finish it
+                    if scram.is_some() && !proved {
+                        return Err(Failed("postgres: the server accepted the login without proving it knows the password"))
+                    }
                     continue
                 } else if code == 3 {
+                    if !weak_login {
+                        return Err(weak("the password in cleartext"))
+                    }
                     self.send(message(112, cstr(password)))?
                 } else if code == 5 {
+                    if !weak_login {
+                        return Err(weak("an MD5 login"))
+                    }
                     let inner = hash.md5_hex((password + user).to_bytes())
                     let outer = hash.md5_hex(inner.to_bytes() + m.data.slice(4, 8))
                     self.send(message(112, cstr("md5" + outer)))?
@@ -120,7 +136,10 @@ fn log_in(self: Db, rand: Rand, user: Str, password: Str, database: Str) -> Resu
                     scram = Some(s2)
                 } else if code == 12 {
                     match scram {
-                        Some(s) => scram_check(s, m.data.slice(4, m.data.len()).to_str())?,
+                        Some(s) => {
+                            scram_check(s, m.data.slice(4, m.data.len()).to_str())?
+                            proved = true
+                        },
                         None => {
                             return Err(Failed("postgres: the server ended a login that did not start"))
                         },
@@ -133,8 +152,11 @@ fn log_in(self: Db, rand: Rand, user: Str, password: Str, database: Str) -> Resu
             69 => {
                 return Err(server_error(m))
             },
-            // 'Z': ready for queries
+            // 'Z': ready for queries, after a login that was checked
             90 => {
+                if scram.is_some() && !proved {
+                    return Err(Failed("postgres: the server accepted the login without proving it knows the password"))
+                }
                 return Ok(())
             },
             // 'S' parameter status, 'K' the key for cancelling, 'N' notices
@@ -538,10 +560,10 @@ fn message(kind: Int, body: List[Int]) -> List[Int] {
 // ---------- a pool of connections ----------
 
 // `size` connections, each lent to one task at a time by `using`.
-pub fn pool(net: Net, rand: Rand, address: Str, size: Int) -> Result[Chan[Db], IoError] {
+pub fn pool(net: Net, rand: Rand, address: Str, size: Int, weak_login: Bool = false) -> Result[Chan[Db], IoError] {
     let c: Chan[Db] = channel(size)
     for _ in 0..<size {
-        c.send(connect(net, rand, address)?)
+        c.send(connect(net, rand, address, weak_login)?)
     }
     Ok(c)
 }

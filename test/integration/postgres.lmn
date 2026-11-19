@@ -8,8 +8,8 @@ struct Sample {
     flag: Bool,
 }
 
-fn login(root: Root, address: Str) -> Str {
-    match postgres.connect(root.net, root.rand, address) {
+fn login(root: Root, address: Str, weak: Bool) -> Str {
+    match postgres.connect(root.net, root.rand, address, weak_login: weak) {
         Ok(db) => {
             db.close()
             "ok"
@@ -19,9 +19,11 @@ fn login(root: Root, address: Str) -> Str {
 }
 
 fn main(root: Root) -> Result[(), IoError] {
-    root.stdout.print("md5: {login(root, "postgres://mduser:mdpw@127.0.0.1:PGPORT/app")}")
-    root.stdout.print("cleartext: {login(root, "postgres://plain:plainpw@127.0.0.1:PGPORT/app")}")
-    root.stdout.print("wrong: {login(root, "postgres://app:nope@127.0.0.1:PGPORT/app")}")
+    root.stdout.print("md5 refused: {login(root, "postgres://mduser:mdpw@127.0.0.1:PGPORT/app", false)}")
+    root.stdout.print("cleartext refused: {login(root, "postgres://plain:plainpw@127.0.0.1:PGPORT/app", false)}")
+    root.stdout.print("md5: {login(root, "postgres://mduser:mdpw@127.0.0.1:PGPORT/app", true)}")
+    root.stdout.print("cleartext: {login(root, "postgres://plain:plainpw@127.0.0.1:PGPORT/app", true)}")
+    root.stdout.print("wrong: {login(root, "postgres://app:nope@127.0.0.1:PGPORT/app", false)}")
 
     let address = "postgres://app:secret@127.0.0.1:PGPORT/app"
     let db = postgres.connect(root.net, root.rand, address)?

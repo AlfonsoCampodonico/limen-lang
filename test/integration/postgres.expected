@@ -1,3 +1,5 @@
+md5 refused: Failed("postgres: the server asks for an MD5 login, which an impostor could exploit; pass `weak_login: true` to allow it")
+cleartext refused: Failed("postgres: the server asks for the password in cleartext, which an impostor could exploit; pass `weak_login: true` to allow it")
 md5: ok
 cleartext: ok
 wrong: Failed("postgres: password authentication failed for user \"app\" (28P01)")
