@@ -44,6 +44,7 @@ type ctx = {
   mutable cstructs : (string * string * (string * Ffi.cty) list) list;
       (* C structs passed by value: Limen name, C name, fields *)
   mutable cbs : ((string * bool * Ffi.cty list * Ffi.cty) * (string * string * Span.t)) list;
+  mutable kepts : Ffi.cty list list; (* the C signatures of kept callbacks, each with its trampolines *)
       (* callback wrappers: (Limen function's C name, whether it takes a
          Foreign first, parameters, result) -> (wrapper name, Limen name,
          where the function is declared) *)
@@ -58,7 +59,7 @@ type ctx = {
 }
 
 let is_enum c = function TNamed (n, _) -> Hashtbl.mem c.g.enums n | _ -> false
-let is_scalar = function TInt | TFloat | TBool | TUnit -> true | _ -> false
+let is_scalar = function TInt | TFloat | TBool | TUnit | TUInt _ -> true | _ -> false
 
 let rec cname c t =
   match t with
@@ -68,6 +69,7 @@ let rec cname c t =
   | TUnit -> "Unit"
   | TStr -> "Str"
   | TBytes -> "Bytes"
+  | TUInt n -> "UInt" ^ string_of_int n
   | TFn (ps, r) ->
     List.iter (fun p -> ignore (cname c p)) ps;
     ignore (cname c r);
@@ -115,6 +117,7 @@ let ctype c t =
   | TBool -> "bool"
   | TUnit -> "W_Unit"
   | TStr | TBytes -> "WStr*"
+  | TUInt n -> sprintf "uint%d_t" n
   | TFn _ -> "WClo*"
   | TDyn _ -> "WDyn*"
   | TCap _ -> "WCap*"
@@ -261,6 +264,7 @@ let rec cmp_prefix c t =
   | TBytes -> "Bytes"
   | TBool -> "Bool"
   | TUnit -> "Unit"
+  | TUInt n -> "UInt" ^ string_of_int n
   | _ ->
     let n = cname c t in
     if not (List.exists (fun u -> cname c u = n) c.cmp_tys) then begin
@@ -282,6 +286,7 @@ let rec hash_prefix c t =
   | TBytes -> "Bytes"
   | TBool -> "Bool"
   | TUnit -> "Unit"
+  | TUInt n -> "UInt" ^ string_of_int n
   | _ ->
     let n = cname c t in
     if not (List.exists (fun u -> cname c u = n) c.hash_tys) then begin
@@ -306,13 +311,20 @@ let binop c op t a b sp =
   | TInt, BitXor -> sprintf "(%s ^ %s)" a b
   | TInt, Shl -> sprintf "w_shl(%s, %s, %s)" a b (where sp)
   | TInt, Shr -> sprintf "w_shr(%s, %s, %s)" a b (where sp)
+  | TUInt n, (Add | Sub | Mul | BitAnd | BitOr | BitXor) ->
+    let o = match op with Add -> "+" | Sub -> "-" | Mul -> "*" | BitAnd -> "&" | BitOr -> "|" | _ -> "^" in
+    sprintf "((uint%d_t)(%s %s %s))" n a o b
+  | TUInt n, Div -> sprintf "((uint%d_t)w_udiv(%s, %s, %s))" n a b (where sp)
+  | TUInt n, Mod -> sprintf "((uint%d_t)w_umod(%s, %s, %s))" n a b (where sp)
+  | TUInt n, Shl -> sprintf "((uint%d_t)w_ushl_n(%s, %s, %d))" n a b n
+  | TUInt n, Shr -> sprintf "((uint%d_t)w_ushr_n(%s, %s, %d))" n a b n
   | TFloat, Add -> sprintf "(%s + %s)" a b
   | TFloat, Sub -> sprintf "(%s - %s)" a b
   | TFloat, Mul -> sprintf "(%s * %s)" a b
   | TFloat, Div -> sprintf "(%s / %s)" a b
   | (TStr | TBytes), Add -> sprintf "Str_concat(%s, %s)" a b
   | TList _, Add -> sprintf "%s_concat(%s, %s)" (cname c t) a b
-  | (TInt | TFloat | TBool), (Lt | Le | Gt | Ge | Eq | Ne) ->
+  | (TInt | TFloat | TBool | TUInt _), (Lt | Le | Gt | Ge | Eq | Ne) ->
     let o = match op with Lt -> "<" | Le -> "<=" | Gt -> ">" | Ge -> ">=" | Eq -> "==" | _ -> "!=" in
     sprintf "(%s %s %s)" a o b
   | TStr, (Lt | Le | Gt | Ge) ->
@@ -340,7 +352,18 @@ let rec ffi_ctype c (t : Ffi.cty) =
       c.cstructs <- c.cstructs @ [ (n, cn, fs) ];
       cn)
   | Ffi.Fn (ps, r) -> sprintf "%s (*)(%s)" (ffi_ctype c r) (if ps = [] then "void" else String.concat ", " (List.map (ffi_ctype c) ps))
+  | Ffi.Kept ps -> ffi_ctype c (Ffi.Fn (ps, Ffi.Unit))
   | t -> Ffi.c_name t
+
+(* The number of a kept callback's C signature, its trampolines named
+   vkt<n>_ (an array of W_KEPT), registered on first use. *)
+let kept_sig c ps =
+  let rec find i = function [] -> None | q :: r -> if q = ps then Some i else find (i + 1) r in
+  match find 0 c.kepts with
+  | Some i -> i
+  | None ->
+    c.kepts <- c.kepts @ [ ps ];
+    List.length c.kepts - 1
 
 (* A Limen value [v] as the C value of boundary type [t]. [what] names it in
    an Int32 range panic. In the variadic part of a call, Int32 and Bool go as
@@ -365,6 +388,7 @@ let ffi_arg c ?(variadic = false) (t : Ffi.cty) v what wh =
       | _ -> x
     in
     sprintf "(%s){ %s }" (ffi_ctype c t) (String.concat ", " (List.mapi field fs))
+  | Ffi.Kept ps -> sprintf "vkt%d_[w_kept_slot(%s, %s)]" (kept_sig c ps) v wh
   | Ffi.Unit | Ffi.Fn _ -> "0"
 
 (* A C value [e] of boundary type [t] as a Limen value. *)
@@ -438,6 +462,44 @@ let ffi_callback_def c ((fn, takes_foreign, ps, r), (w, vname, sp)) =
   p "  f_->in_cb = prev_;";
   if r <> Ffi.Unit then p "  return r_;";
   p "}";
+  Buffer.contents b
+
+(* A kept callback signature's trampolines: W_KEPT functions with C's
+   parameters, each building the channel's value from them and sending it
+   on its slot's channel (w_kept_send), and the array C's pointers come
+   from. *)
+let kept_def c i ps =
+  let b = Buffer.create 1024 in
+  let p s = Buffer.add_string b (s ^ "\n") in
+  let hd = cname c Ffi.handle_ty in
+  let elem = Ffi.kept_elem ps in
+  let cps = List.mapi (fun k t -> sprintf "%s a%d" (ffi_ctype c t) k) ps in
+  let params = if ps = [] then "void" else String.concat ", " cps in
+  let conv k t =
+    let a = sprintf "a%d" k in
+    match t with
+    | Ffi.Int32 -> sprintf "(int64_t)%s" a
+    | Ffi.Bool -> sprintf "(%s != 0)" a
+    | Ffi.Handle -> sprintf "(%s){ (int64_t)(intptr_t)%s }" hd a
+    | Ffi.Str -> sprintf "w_ffi_str(%s)" a
+    | _ -> a
+  in
+  let value =
+    match ps with
+    | [] -> "0"
+    | [ t ] -> conv 0 t
+    | ps -> sprintf "(%s){ %s }" (cname c elem) (String.concat ", " (List.mapi conv ps))
+  in
+  p (sprintf "static void vkt%d_fire(int64_t i_%s) {" i (String.concat "" (List.map (fun x -> ", " ^ x) cps)));
+  p (sprintf "  %s v_ = %s;" (ctype c elem) value);
+  p "  w_kept_send(i_, &v_);";
+  p "}";
+  let names = List.init 32 (fun k -> sprintf "vkt%d_%d" i k) in
+  List.iteri
+    (fun k n ->
+      p (sprintf "static void %s(%s) { vkt%d_fire(%d%s); }" n params i k (String.concat "" (List.mapi (fun j _ -> sprintf ", a%d" j) ps))))
+    names;
+  p (sprintf "static void (*const vkt%d_[W_KEPT])(%s) = { %s };" i params (String.concat ", " names));
   Buffer.contents b
 
 (* Emit statements that store [rhs] into the C lvalue [dst] of type [t]. *)
@@ -549,6 +611,7 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     | "limen_bytes_int", [ b; at ] -> set (sprintf "w_bytes_int(%s, %s, %s)" b at (where sp))
     | "limen_bytes_float", [ b; at ] -> set (sprintf "w_bytes_float(%s, %s, %s)" b at (where sp))
     | "limen_float_bits", [ x ] -> set (sprintf "w_float_bits(%s)" x)
+    | "limen_crypto", [ op; x1; x2; x3; x4 ] -> uses_tls := true; set (sprintf "w_crypto(%s, %s, %s, %s, %s)" op x1 x2 x3 x4)
     | ("limen_handle_acquire" | "limen_handle_release" | "limen_handle_close"), [ id ] ->
       set (sprintf "(%s){ w_%s(%s) }" hd (let p = String.length "limen_" in String.sub sym p (String.length sym - p)) id)
     | _ -> failwith ("cgen: runtime helper " ^ sym))
@@ -956,6 +1019,18 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     | "int_to_float", _ -> set (sprintf "(double)%s" (arg 0))
     | "int_abs", _ -> set (sprintf "w_abs(%s)" (arg 0))
     | "int_shift_right_unsigned", _ -> set (sprintf "w_ushr(%s, %s, %s)" (arg 0) (arg 1) (where sp))
+    | ("int_to_uint8" | "uint_to_uint8"), _ -> set (sprintf "(uint8_t)(%s)" (arg 0))
+    | ("int_to_uint16" | "uint_to_uint16"), _ -> set (sprintf "(uint16_t)(%s)" (arg 0))
+    | ("int_to_uint32" | "uint_to_uint32"), _ -> set (sprintf "(uint32_t)(%s)" (arg 0))
+    | ("int_to_uint64" | "uint_to_uint64"), _ -> set (sprintf "(uint64_t)(%s)" (arg 0))
+    | "uint_to_int", _ -> set (sprintf "(int64_t)(%s)" (arg 0))
+    | "uint_to_str", _ -> show_into [ `Val (arg 0, rt) ]
+    | "uint_to_float", _ -> set (sprintf "w_u2f(%s)" (arg 0))
+    | "uint_min", _ -> set (sprintf "(%s < %s ? %s : %s)" (arg 0) (arg 1) (arg 0) (arg 1))
+    | "uint_max", _ -> set (sprintf "(%s > %s ? %s : %s)" (arg 0) (arg 1) (arg 0) (arg 1))
+    | ("uint_rotate_left" | "uint_rotate_right"), _ ->
+      let bits = match rt with TUInt n -> n | _ -> 64 in
+      set (sprintf "(uint%d_t)w_urot(%s, %s, %d, %d)" bits (arg 0) (arg 1) bits (if name = "uint_rotate_left" then 1 else 0))
     | "float_to_int", _ -> set (sprintf "w_f2i(%s)" (arg 0))
     | "float_abs", _ -> set (sprintf "fabs(%s)" (arg 0))
     | "float_sqrt", _ -> set (sprintf "sqrt(%s)" (arg 0))
@@ -1149,7 +1224,81 @@ let pin_lines text =
     String.concat "\n" out
   end
 
-let rec stmts c out ind (ss : I.stmt list) = List.iter (stmt c out ind) ss
+(* A long run of tests of one integer against a literal, each failing into the
+   next, as a `match` on integer literals lowers to: the variable, the
+   (literal, body) arms in order, and what runs when none matches. The
+   chain becomes a C `switch`, which compiles to a jump table or a binary
+   search, where nested `if`s are a linear scan that also runs into the C
+   compiler's nesting limit after a couple of thousand arms. A `break` in
+   an arm would leave the switch instead of the loop, so then it stays. *)
+let switch_min = 8
+
+let rec has_break (ss : I.stmt list) =
+  List.exists
+    (function
+      | I.Break -> true
+      | I.If (_, a, b) -> has_break a || has_break b
+      | I.Guard (_, d, p) -> has_break d || has_break p
+      | I.Scope (_, b) -> has_break b
+      | _ -> false)
+    ss
+
+let int_test = function
+  | I.Let (t, I.PatTest (I.V x, (TInt | TUInt _), { Ast.pdesc = Ast.PInt k; _ })) -> Some (t, x, k)
+  | _ -> None
+
+let int_chain (ss : I.stmt list) =
+  (* what comes around the next test writes no C: a development build's
+     line mark, or the end of a scalar such as the last test's flag *)
+  let quiet = function I.Line _ | I.Drop { ty = TInt | TFloat | TBool | TUnit | TUInt _; _ } -> true | _ -> false in
+  let rec go (x : I.var) acc ss =
+    match List.filter (fun s -> not (quiet s)) ss with
+    | [ l; I.If (I.V t', a, b) ] -> (
+      match int_test l with
+      | Some (t, x', k) when t.id = t'.id && x'.id = x.id -> go x ((k, a) :: acc) b
+      | _ -> (List.rev acc, ss))
+    | _ -> (List.rev acc, ss)
+  in
+  match ss with
+  | l :: I.If (I.V t', a, b) :: rest -> (
+    match int_test l with
+    | Some (t, x, k) when t.id = t'.id ->
+      let arms, default = go x [ (k, a) ] b in
+      let ks = List.map fst arms in
+      (* a repeated literal (its later arm never runs) would be a repeated
+         C case: such a match stays as it is *)
+      if
+        List.length arms >= switch_min
+        && List.length (List.sort_uniq compare ks) = List.length ks
+        && not (List.exists (fun (_, a) -> has_break a) arms || has_break default)
+      then Some (x, arms, default, rest)
+      else None
+    | _ -> None)
+  | _ -> None
+
+let rec stmts c out ind (ss : I.stmt list) =
+  match int_chain ss with
+  | Some (x, arms, default, rest) ->
+    let line s = Buffer.add_string out (ind ^ s ^ "\n") in
+    line (sprintf "switch (%s) {" (var x));
+    List.iter
+      (fun (k, a) ->
+        line (sprintf "case %s: {" (atom c (I.AInt k)));
+        stmts c out (ind ^ "  ") a;
+        line "  break;";
+        line "}")
+      arms;
+    line "default: {";
+    stmts c out (ind ^ "  ") default;
+    line "}";
+    line "}";
+    stmts c out ind rest
+  | None -> (
+    match ss with
+    | [] -> ()
+    | s :: rest ->
+      stmt c out ind s;
+      stmts c out ind rest)
 
 (* A loop's body: a cancellation checkpoint first, on every iteration
    (W_CHECK in the runtime), so a cancelled task stops in code that never waits. *)
@@ -1829,7 +1978,7 @@ let program (g : Lower.gctx) (prog : I.program) : string =
   let c =
     { g; names = Hashtbl.create 32; types = []; lits = Hashtbl.create 32; lit_order = []; boxed = [];
       envs = Hashtbl.create 16; uniq = []; task_tys = []; inrange = []; chan_tys = []; dyns = []; cell_tys = []; vols = [];
-      cmp_tys = []; sort_tys = []; hash_tys = []; csyms = []; sql_api = false; cstructs = []; cbs = []; bjobs = [];
+      cmp_tys = []; sort_tys = []; hash_tys = []; csyms = []; sql_api = false; cstructs = []; cbs = []; kepts = []; bjobs = [];
       pure = Pure.analyse prog; plan = Pure.no_plan (); slotted = [] }
   in
   (* bodies first: this discovers every type and literal *)
@@ -2031,6 +2180,7 @@ let program (g : Lower.gctx) (prog : I.program) : string =
   end;
   (* callback wrappers, after the prototypes of the functions they call *)
   let cbdefs = String.concat "" (List.map (ffi_callback_def c) c.cbs) in
+  let cbdefs = cbdefs ^ String.concat "" (List.mapi (kept_def c) c.kepts) in
   let types = Buffer.create 16384 in
   type_defs c types;
   List.iter

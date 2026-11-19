@@ -303,6 +303,10 @@ let rec resolve ctx env (te : ty_expr) : ty =
     | "Bool" -> simple TBool
     | "Str" -> simple TStr
     | "Bytes" -> simple TBytes
+    | "UInt8" -> simple (TUInt 8)
+    | "UInt16" -> simple (TUInt 16)
+    | "UInt32" -> simple (TUInt 32)
+    | "UInt64" -> simple (TUInt 64)
     | "List" -> if want 1 then TList (List.hd args') else TErr
     | "Root" -> simple (TCap Root)
     | "Net" -> simple (TCap Net)
@@ -637,6 +641,7 @@ let builtin_tname t =
   | TBool -> Some "Bool"
   | TStr -> Some "Str"
   | TBytes -> Some "Bytes"
+  | TUInt n -> Some ("UInt" ^ string_of_int n)
   | TList _ -> Some "List"
   | TMap _ -> Some "Map"
   | TNamed (("Option" | "Result" | "IoError") as n, _) -> Some n
@@ -660,7 +665,13 @@ let build_methods (t : ty) : (string * (unit -> ty list * ty)) list =
       m "to_list" [] (TList TInt); m "to_str" [] TStr ]
   | TInt ->
     [ m "to_str" [] TStr; m "to_float" [] TFloat; m "abs" [] TInt; m "to_char" [] TStr; m "min" [ TInt ] TInt;
-      m "max" [ TInt ] TInt; m "shift_right_unsigned" [ TInt ] TInt ]
+      m "max" [ TInt ] TInt; m "shift_right_unsigned" [ TInt ] TInt;
+      (* to an unsigned type, keeping the low bits: wraps *)
+      m "to_uint8" [] (TUInt 8); m "to_uint16" [] (TUInt 16); m "to_uint32" [] (TUInt 32); m "to_uint64" [] (TUInt 64) ]
+  | TUInt n ->
+    [ m "to_int" [] TInt; m "to_str" [] TStr; m "to_float" [] TFloat; m "min" [ TUInt n ] (TUInt n); m "max" [ TUInt n ] (TUInt n);
+      m "to_uint8" [] (TUInt 8); m "to_uint16" [] (TUInt 16); m "to_uint32" [] (TUInt 32); m "to_uint64" [] (TUInt 64);
+      m "rotate_left" [ TInt ] (TUInt n); m "rotate_right" [ TInt ] (TUInt n) ]
   | TFloat -> [ m "to_str" [] TStr; m "to_int" [] TInt; m "abs" [] TFloat; m "sqrt" [] TFloat;
       m "to_fixed" [ TInt ] TStr ]
   | TBool -> [ m "to_str" [] TStr ]
@@ -743,7 +754,7 @@ let unordered ctx t : ty option =
   let seen = Hashtbl.create 8 in
   let rec go t =
     match repr t with
-    | TInt | TFloat | TStr | TBytes | TBool | TUnit | TVar _ | TErr -> None
+    | TInt | TFloat | TStr | TBytes | TBool | TUnit | TUInt _ | TVar _ | TErr -> None
     | TParam g when bounded g "Ordered" -> None
     | TList a | TArray (a, _) -> go a
     | TNamed (n, args) as nt -> (
@@ -941,7 +952,7 @@ and check_expr_inner ctx f e : ty =
   | EUn (BitNot, a) -> (
     let t = check_expr ctx f a in
     match repr t with
-    | TInt | TErr -> t
+    | TInt | TUInt _ | TErr -> t
     | TVar _ -> unify_at ctx a.espan TInt t; TInt
     | _ ->
       err ctx "E0201" a.espan (sprintf "operator `~` cannot be applied to `%s`" (show t));
@@ -1029,6 +1040,19 @@ and check_expr_inner ctx f e : ty =
 (* Check [e] against an expected type; closures get their parameter types from it. *)
 and expect ctx f e want =
   match (e.edesc, repr want) with
+  (* an integer literal where an unsigned integer is expected is one, if it fits *)
+  | EInt v, TUInt bits ->
+    if Int64.compare v 0L < 0 || (bits < 64 && Int64.compare v (Int64.shift_left 1L bits) >= 0) then
+      err ctx "E0201" e.espan
+        (sprintf "%Ld does not fit in a `UInt%d`, which holds 0 to %s" v bits
+           (if bits = 64 then "18446744073709551615" else Int64.to_string (Int64.sub (Int64.shift_left 1L bits) 1L)));
+    e.ety <- want
+  | EUn (Neg, { edesc = EInt _; _ }), TUInt bits ->
+    err ctx "E0201" e.espan (sprintf "a `UInt%d` cannot be negative" bits);
+    e.ety <- want
+  | EList es, TList el when (match repr el with TUInt _ -> true | _ -> false) ->
+    List.iter (fun x -> expect ctx f x el) es;
+    e.ety <- want
   | EList es, TArray (el, n) ->
     List.iter (fun x -> expect ctx f x el) es;
     (match repr n with
@@ -2006,7 +2030,16 @@ and check_bin ctx f op a b sp =
       ignore (check_expr ctx f b);
       TErr)
   | _ -> (
-    expect ctx f b ta;
+    (* a literal on the left takes the right's type: `1 + x` with x a UInt8 *)
+    let ta =
+      match (a.edesc, repr ta) with
+      | EInt _, TInt -> (
+        let tb = check_expr ctx f b in
+        match repr tb with
+        | TUInt _ -> expect ctx f a tb; tb
+        | _ -> unify_at ctx b.espan ta tb; ta)
+      | _ -> expect ctx f b ta; ta
+    in
     let t = repr ta in
     let name =
       match op with
@@ -2018,9 +2051,10 @@ and check_bin ctx f op a b sp =
       err ctx "E0201" sp (sprintf "operator `%s` cannot be applied to `%s`" name (show t))
     in
     match op with
-    | Add -> (match t with TInt | TFloat | TStr | TBytes | TList _ | TErr | TVar _ -> t | _ -> bad (); TErr)
-    | Sub | Mul | Div -> (match t with TInt | TFloat | TErr | TVar _ -> t | _ -> bad (); TErr)
-    | Mod | BitAnd | BitOr | BitXor | Shl | Shr -> (match t with TInt | TErr | TVar _ -> t | _ -> bad (); TErr)
+    | Add -> (match t with TInt | TFloat | TStr | TBytes | TUInt _ | TList _ | TErr | TVar _ -> t | _ -> bad (); TErr)
+    | Sub | Mul | Div -> (match t with TInt | TFloat | TUInt _ | TErr | TVar _ -> t | _ -> bad (); TErr)
+    | Mod | BitAnd | BitOr | BitXor -> (match t with TInt | TUInt _ | TErr | TVar _ -> t | _ -> bad (); TErr)
+    | Shl | Shr -> (match t with TInt | TUInt _ | TErr | TVar _ -> t | _ -> bad (); TErr)
     | Lt | Le | Gt | Ge -> (match unordered ctx t with None -> () | Some _ -> bad ()); TBool
     | _ ->
       eq_types := t :: !eq_types;
@@ -2246,7 +2280,15 @@ and check_pat ctx f t p =
   match p.pdesc with
   | PWild -> ()
   | PBind n -> bind f n { vty = t; vmut = false; vspan = p.pspan; vkind = KPat }
-  | PInt _ -> unify_at ctx p.pspan t TInt
+  | PInt v -> (
+    match repr t with
+    (* an unsigned integer matches literals that fit in it *)
+    | TUInt bits ->
+      if Int64.compare v 0L < 0 then err ctx "E0201" p.pspan (sprintf "a `UInt%d` cannot be negative" bits)
+      else if bits < 64 && Int64.compare v (Int64.shift_left 1L bits) >= 0 then
+        err ctx "E0201" p.pspan
+          (sprintf "%Ld does not fit in a `UInt%d`, which holds 0 to %s" v bits (Int64.to_string (Int64.sub (Int64.shift_left 1L bits) 1L)))
+    | _ -> unify_at ctx p.pspan t TInt)
   | PStr _ -> unify_at ctx p.pspan t TStr
   | PBool _ -> unify_at ctx p.pspan t TBool
   | PTuple ps when List.exists is_rest ps -> (
@@ -2795,7 +2837,7 @@ let unkeyable ctx t : ty option =
   let seen = Hashtbl.create 8 in
   let rec go t =
     match repr t with
-    | TInt | TStr | TBytes | TBool | TVar _ | TErr -> None
+    | TInt | TStr | TBytes | TBool | TUInt _ | TVar _ | TErr -> None
     | TParam g when bounded g "Key" -> None
     | TNamed (n, args) as nt -> (
       let key = show nt in
@@ -2971,7 +3013,8 @@ let check_fn ctx (d : fn_decl) (s : fsig) =
     d.fn_params s.ps;
   match repr s.ret with
   | t when has_dyn t -> expect_block ctx f d.fn_body s.ret (* the body's value becomes `dyn`, branch by branch *)
-  | _ when (match d.fn_body.tail with Some x -> needs_type x | None -> false) ->
+  | _ when (match d.fn_body.tail with Some x -> needs_type x | None -> false)
+           || (match (d.fn_body.tail, repr s.ret) with Some { edesc = EInt _ | EList _; _ }, (TUInt _ | TList (TUInt _)) -> true | _ -> false) ->
     (* a closure in the body's value takes its types from the return type *)
     expect_block ctx f d.fn_body s.ret
   | _ ->

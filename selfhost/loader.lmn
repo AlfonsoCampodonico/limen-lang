@@ -354,7 +354,7 @@ fn visit(fs: Fs, std: Map[Str, Str], setup: Setup, loading: Loading, m: rename.M
 // ---------- items ----------
 
 fn builtin_type_names() -> List[Str] {
-    ["Int", "Int32", "Float", "Bool", "Str", "Bytes", "List", "Map", "Array", "Option", "Result", "IoError", "Chan", "Atomic", "Shared", "Root", "Net", "Fs", "Listen", "Listener", "Conn", "Env", "Exec", "Foreign", "Revoker", "Stdout", "Stderr", "Stdin", "Clock", "Rand", "Handle", "Out"]
+    ["Int", "Int32", "Float", "Bool", "Str", "Bytes", "List", "Map", "Array", "Option", "Result", "IoError", "Chan", "Atomic", "Shared", "Root", "Net", "Fs", "Listen", "Listener", "Conn", "Env", "Exec", "Foreign", "Revoker", "Stdout", "Stderr", "Stdin", "Clock", "Rand", "Handle", "Out", "Kept"]
 }
 
 // An alias may not take the name of another item of its module or of a

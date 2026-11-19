@@ -209,11 +209,36 @@ W_RT void buf_escaped(WBuf *b, WStr *s);
 #define Unit_eq(a, b) true
 #define Unit_cmp(a, b) 0
 #define Int_share(x) ((void)0)
+#define UInt8_dup(x) (x)
+#define UInt16_dup(x) (x)
+#define UInt32_dup(x) (x)
+#define UInt64_dup(x) (x)
+#define UInt8_drop(x) ((void)0)
+#define UInt16_drop(x) ((void)0)
+#define UInt32_drop(x) ((void)0)
+#define UInt64_drop(x) ((void)0)
+#define UInt8_share(x) ((void)0)
+#define UInt16_share(x) ((void)0)
+#define UInt32_share(x) ((void)0)
+#define UInt64_share(x) ((void)0)
+#define UInt8_eq(a, b) ((a) == (b))
+#define UInt16_eq(a, b) ((a) == (b))
+#define UInt32_eq(a, b) ((a) == (b))
+#define UInt64_eq(a, b) ((a) == (b))
+#define UInt8_cmp(a, b) ((a) < (b) ? -1 : ((a) > (b) ? 1 : 0))
+#define UInt16_cmp(a, b) ((a) < (b) ? -1 : ((a) > (b) ? 1 : 0))
+#define UInt32_cmp(a, b) ((a) < (b) ? -1 : ((a) > (b) ? 1 : 0))
+#define UInt64_cmp(a, b) ((a) < (b) ? -1 : ((a) > (b) ? 1 : 0))
+#define UInt8_show(b, x, t) UInt_show(b, (uint64_t)(x), t)
+#define UInt16_show(b, x, t) UInt_show(b, (uint64_t)(x), t)
+#define UInt32_show(b, x, t) UInt_show(b, (uint64_t)(x), t)
+#define UInt64_show(b, x, t) UInt_show(b, (uint64_t)(x), t)
 #define Float_share(x) ((void)0)
 #define Bool_share(x) ((void)0)
 #define Unit_share(x) ((void)0)
 W_RT int Float_cmp(double a, double b);
 W_RT void Int_show(WBuf *b, int64_t x, bool top);
+W_RT void UInt_show(WBuf *b, uint64_t x, bool top);
 W_RT void Float_show(WBuf *b, double x, bool top);
 W_RT void Bool_show(WBuf *b, bool x, bool top);
 W_RT void Unit_show(WBuf *b, W_Unit x, bool top);
@@ -246,6 +271,28 @@ static inline int64_t w_ushr(int64_t a, int64_t n, const char *where) {
   if (n < 0) w_panic_c("negative shift count", where);
   return n >= 64 ? 0 : (int64_t)((uint64_t)a >> n);
 }
+/* UInt8 to UInt64: C's unsigned types, which wrap; the operators cast
+   back to the type, since C promotes the narrow ones to int. Division by
+   zero panics, and a shift of the type's width or more shifts every bit
+   out. */
+static inline uint64_t w_udiv(uint64_t a, uint64_t b, const char *where) {
+  if (b == 0) w_panic_c("division by zero", where);
+  return a / b;
+}
+static inline uint64_t w_umod(uint64_t a, uint64_t b, const char *where) {
+  if (b == 0) w_panic_c("division by zero", where);
+  return a % b;
+}
+static inline uint64_t w_ushl_n(uint64_t a, uint64_t n, int bits) { return n >= (uint64_t)bits ? 0 : a << n; }
+static inline uint64_t w_ushr_n(uint64_t a, uint64_t n, int bits) { return n >= (uint64_t)bits ? 0 : a >> n; }
+static inline uint64_t w_urot(uint64_t x, int64_t k, int bits, int left) {
+  int64_t r = k % bits; if (r < 0) r += bits;
+  if (!left) r = (bits - r) % bits;
+  if (r == 0) return x;
+  uint64_t m = bits == 64 ? ~(uint64_t)0 : (((uint64_t)1 << bits) - 1);
+  return ((x << r) | (x >> (bits - r))) & m;
+}
+static inline double w_u2f(uint64_t x) { return (double)x; }
 static inline int64_t w_f2i(double x) {
   if (isnan(x)) return 0;
   if (x >= 9.2e18) return INT64_MAX;
@@ -381,6 +428,11 @@ W_RT void w_seed_hash(void);
   } while (0)
 W_RT uint64_t w_siphash13(const unsigned char *in, size_t len);
 static inline uint64_t Int_hash(int64_t x) { return w_siphash13((const unsigned char *)&x, sizeof x); }
+static inline uint64_t UInt_hash_(uint64_t x) { return w_siphash13((const unsigned char *)&x, sizeof x); }
+#define UInt8_hash(x) UInt_hash_((uint64_t)(x))
+#define UInt16_hash(x) UInt_hash_((uint64_t)(x))
+#define UInt32_hash(x) UInt_hash_((uint64_t)(x))
+#define UInt64_hash(x) UInt_hash_((uint64_t)(x))
 static inline uint64_t Unit_hash(W_Unit u) { (void)u; return 0; }
 static inline uint64_t Bool_hash(bool b) { return b ? 0x51ED27F1ULL : 0x2545F491ULL; }
 /* Combine the hashes of a struct's fields (boost's hash_combine). */
@@ -1189,6 +1241,7 @@ W_RT int w_tls_accept(WCap *l, WCap *conn, WIo *r);
 W_RT WIo Cap_net_connect_tls(WCap *n, WStr *addr);
 W_RT WIo Cap_conn_start_tls(WCap *c, WStr *host);
 W_RT WIo Cap_fs_read_at(WCap *fs, WStr *rel, int64_t off, int64_t n);
+W_RT WStr *w_crypto(int64_t op, WStr *a, WStr *b, WStr *c, WStr *d);
 /* `--profile`: a sampling CPU profile. Every function counts its calls and
    says it is the thread's current one (W_PROF, at its start, restored as it
    leaves); a timer samples the current function every millisecond of CPU,
@@ -1234,6 +1287,10 @@ W_RT WCap *Cap_foreign_only(WCap *x, WStr *lib_s);
 W_RT void w_foreign_check(WCap *x, const char *lib, const char *where);
 W_RT int32_t w_ffi_i32(int64_t v, const char *arg, const char *where);
 W_RT WStr *w_ffi_str(const char *p);
+#define W_KEPT 32
+W_RT int64_t w_kept_slot(WChan *c, const char *where);
+W_RT void w_kept_send(int64_t i, void *v);
+W_RT void w_kept_release(void);
 /* ---------- blocking C calls ----------
    A foreign function declared `blocking fn` (and each statement of the std
    sql module, w_sql_run) runs on a thread of the blocking-call pool,

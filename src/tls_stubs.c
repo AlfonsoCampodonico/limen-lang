@@ -97,6 +97,29 @@ value limen_tls_ctx_free(value c) {
 
 value limen_tls_available(value u) { (void)u; return Val_true; }
 
+/* crypto : int -> string -> string -> string -> string -> string
+   the result after a status byte, as w_crypto gives it */
+value limen_crypto_op(value op, value a, value b, value c, value d) {
+  CAMLparam5(op, a, b, c, d);
+  CAMLlocal1(r);
+  unsigned char *out = NULL; size_t n = 0; char err[300];
+  int k = vcrypto(Int_val(op), (const unsigned char *)String_val(a), caml_string_length(a), (const unsigned char *)String_val(b), caml_string_length(b),
+                  (const unsigned char *)String_val(c), caml_string_length(c), (const unsigned char *)String_val(d), caml_string_length(d), &out, &n, err, sizeof err);
+  if (k != 0) {
+    size_t m = strlen(err);
+    r = caml_alloc_string(m + 1);
+    Bytes_val(r)[0] = 1;
+    memcpy(Bytes_val(r) + 1, err, m);
+    CAMLreturn(r);
+  }
+  r = caml_alloc_string(n + 1);
+  Bytes_val(r)[0] = 0;
+  if (n) memcpy(Bytes_val(r) + 1, out, n);
+  OPENSSL_cleanse(out, n);
+  free(out);
+  CAMLreturn(r);
+}
+
 #else
 
 value limen_tls_client(value fd, value host) { (void)fd; (void)host; caml_failwith(NO_TLS); }
@@ -106,5 +129,12 @@ value limen_tls_step(value t, value op, value b, value o, value l) { (void)t; (v
 value limen_tls_close(value t) { (void)t; return Val_unit; }
 value limen_tls_ctx_free(value c) { (void)c; return Val_unit; }
 value limen_tls_available(value u) { (void)u; return Val_false; }
+value limen_crypto_op(value op, value a, value b, value c, value d) {
+  (void)op; (void)a; (void)b; (void)c; (void)d;
+  value r = caml_alloc_string(1 + strlen(NO_TLS));
+  Bytes_val(r)[0] = 1;
+  memcpy(Bytes_val(r) + 1, NO_TLS, strlen(NO_TLS));
+  return r;
+}
 
 #endif

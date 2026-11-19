@@ -20,6 +20,9 @@ pub enum Ty {
     TStr,
     // immutable bytes
     TBytes,
+    // UInt8, UInt16, UInt32, UInt64: unsigned integers of that many bits,
+    // whose arithmetic wraps modulo 2^bits
+    TUInt(Int),
     TUnit,
     TList(Ty),
     TFn(List[Ty], Ty),
@@ -113,6 +116,7 @@ pub fn show(self: Subst, t: Ty) -> Str {
         TBool => "Bool",
         TStr => "Str",
         TBytes => "Bytes",
+        TUInt(n) => "UInt{n}",
         TUnit => "()",
         TList(a) => "List[{self.show(a)}]",
         TFn(ps, r) => "fn({all(ps)}) -> {self.show(r)}",
@@ -140,7 +144,7 @@ pub fn show(self: Subst, t: Ty) -> Str {
 // it says what it holds, and every analysis below then sees inside it.
 pub fn children(self: Subst, t: Ty) -> List[Ty] {
     match self.repr(t) {
-        TInt | TFloat | TBool | TStr | TBytes | TUnit | TCap(_) | TLen(_) | TAtomic | TParam(_) | TVar(_) | TErr => [],
+        TInt | TFloat | TBool | TStr | TBytes | TUInt(_) | TUnit | TCap(_) | TLen(_) | TAtomic | TParam(_) | TVar(_) | TErr => [],
         TList(a) | TGroup(a) | TChan(a) | TShared(a) => [a],
         TArray(a, n) => [a, n],
         TMap(k, v) => [k, v],
@@ -193,7 +197,7 @@ pub enum Kind {
 
 pub fn kind(self: Subst, t: Ty) -> Kind {
     match self.repr(t) {
-        TInt | TFloat | TBool | TStr | TBytes | TUnit | TLen(_) | TParam(_) | TVar(_) | TErr | TList(_) | TArray(..) | TMap(..) | TGroup(_) => KPlain,
+        TInt | TFloat | TBool | TStr | TBytes | TUInt(_) | TUnit | TLen(_) | TParam(_) | TVar(_) | TErr | TList(_) | TArray(..) | TMap(..) | TGroup(_) => KPlain,
         TCap(c) => KCap(c),
         TChan(_) => KState("channel"),
         TAtomic => KState("Atomic"),
@@ -230,6 +234,7 @@ pub fn unify(self: Subst, a: Ty, b: Ty) -> (Bool, Subst) {
             (true, s)
         },
         (TInt, TInt) | (TFloat, TFloat) | (TBool, TBool) | (TStr, TStr) | (TBytes, TBytes) | (TUnit, TUnit) => (true, self),
+        (TUInt(m), TUInt(n)) if m == n => (true, self),
         (TList(x), TList(y)) | (TGroup(x), TGroup(y)) | (TChan(x), TChan(y)) | (TShared(x), TShared(y)) => self.unify(x, y),
         (TAtomic, TAtomic) => (true, self),
         // the length first, as OCaml does

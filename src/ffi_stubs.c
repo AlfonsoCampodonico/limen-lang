@@ -49,6 +49,7 @@
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <setjmp.h>
 #include <stdint.h>
@@ -520,6 +521,126 @@ value limen_ffi_cb_fail(value unit) {
   return Val_unit;
 }
 
+/* ---- kept callbacks ----
+   C may keep a kept callback's pointer (`Kept[fn(...)]`) and call it at any
+   time, from any thread, so such a call never enters OCaml: it copies its
+   arguments, and the strings among them (the slot's mask names which
+   integer words those are), onto a queue and writes a byte to a pipe. The
+   interpreter's scheduler watches the pipe and turns each call into a value
+   on the slot's channel (Interp.Foreign.kept_drain). A slot stays on for the
+   rest of the program, since C may still hold its pointer. */
+typedef struct LKept {
+  struct LKept *next;
+  int slot;
+  int64_t a[8];
+  double d[8];
+  char *s[8];
+} LKept;
+static pthread_mutex_t limen_kept_mu = PTHREAD_MUTEX_INITIALIZER;
+static LKept *limen_kept_head, *limen_kept_tail;
+static int limen_kept_mask[NCB], limen_kept_on[NCB];
+static int limen_kept_pipe[2] = { -1, -1 };
+
+static void limen_kept_run(int slot, int64_t *a, double *d) {
+  pthread_mutex_lock(&limen_kept_mu);
+  int on = limen_kept_on[slot], mask = limen_kept_mask[slot];
+  pthread_mutex_unlock(&limen_kept_mu);
+  if (!on) return;
+  LKept *e = (LKept *)calloc(1, sizeof *e);
+  if (!e) return;
+  e->slot = slot;
+  memcpy(e->a, a, sizeof e->a);
+  memcpy(e->d, d, sizeof e->d);
+  for (int k = 0; k < 8; k++)
+    if (mask & (1 << k)) e->s[k] = strdup(a[k] ? (const char *)(intptr_t)a[k] : "");
+  pthread_mutex_lock(&limen_kept_mu);
+  if (limen_kept_tail) limen_kept_tail->next = e; else limen_kept_head = e;
+  limen_kept_tail = e;
+  pthread_mutex_unlock(&limen_kept_mu);
+  char b = 1;
+  if (write(limen_kept_pipe[1], &b, 1) < 0) { /* full: the reader is behind and will drain anyway */ }
+}
+
+#define KTRAMP(n)                                                                                                         \
+  static void limen_kt_##n(int64_t a0, int64_t a1, int64_t a2, int64_t a3, int64_t a4, int64_t a5, int64_t a6, int64_t a7, \
+                           double d0, double d1, double d2, double d3, double d4, double d5, double d6, double d7) {     \
+    int64_t a[8] = { a0, a1, a2, a3, a4, a5, a6, a7 };                                                                   \
+    double d[8] = { d0, d1, d2, d3, d4, d5, d6, d7 };                                                                    \
+    limen_kept_run(n, a, d);                                                                                              \
+  }
+KTRAMP(0) KTRAMP(1) KTRAMP(2) KTRAMP(3) KTRAMP(4) KTRAMP(5) KTRAMP(6) KTRAMP(7) KTRAMP(8) KTRAMP(9) KTRAMP(10) KTRAMP(11)
+KTRAMP(12) KTRAMP(13) KTRAMP(14) KTRAMP(15) KTRAMP(16) KTRAMP(17) KTRAMP(18) KTRAMP(19) KTRAMP(20) KTRAMP(21) KTRAMP(22)
+KTRAMP(23) KTRAMP(24) KTRAMP(25) KTRAMP(26) KTRAMP(27) KTRAMP(28) KTRAMP(29) KTRAMP(30) KTRAMP(31)
+static void *const limen_kt_addrs[NCB] = {
+  (void *)limen_kt_0, (void *)limen_kt_1, (void *)limen_kt_2, (void *)limen_kt_3, (void *)limen_kt_4, (void *)limen_kt_5,
+  (void *)limen_kt_6, (void *)limen_kt_7, (void *)limen_kt_8, (void *)limen_kt_9, (void *)limen_kt_10, (void *)limen_kt_11,
+  (void *)limen_kt_12, (void *)limen_kt_13, (void *)limen_kt_14, (void *)limen_kt_15, (void *)limen_kt_16, (void *)limen_kt_17,
+  (void *)limen_kt_18, (void *)limen_kt_19, (void *)limen_kt_20, (void *)limen_kt_21, (void *)limen_kt_22, (void *)limen_kt_23,
+  (void *)limen_kt_24, (void *)limen_kt_25, (void *)limen_kt_26, (void *)limen_kt_27, (void *)limen_kt_28, (void *)limen_kt_29,
+  (void *)limen_kt_30, (void *)limen_kt_31 };
+
+/* limen_ffi_kept_open : int -> int -> nativeint: turn slot [k] on, its
+   string words [mask]; its trampoline */
+value limen_ffi_kept_open(value k, value mask) {
+  CAMLparam2(k, mask);
+  pthread_mutex_lock(&limen_kept_mu);
+  if (limen_kept_pipe[0] < 0 && pipe(limen_kept_pipe) == 0) {
+    for (int i = 0; i < 2; i++) {
+      fcntl(limen_kept_pipe[i], F_SETFL, fcntl(limen_kept_pipe[i], F_GETFL) | O_NONBLOCK);
+      fcntl(limen_kept_pipe[i], F_SETFD, FD_CLOEXEC);
+    }
+  }
+  limen_kept_mask[Int_val(k)] = Int_val(mask);
+  limen_kept_on[Int_val(k)] = 1;
+  pthread_mutex_unlock(&limen_kept_mu);
+  CAMLreturn(caml_copy_nativeint((intnat)limen_kt_addrs[Int_val(k)]));
+}
+
+/* limen_ffi_kept_fd : unit -> int: the pipe the scheduler watches (-1 before any slot) */
+value limen_ffi_kept_fd(value unit) {
+  (void)unit;
+  return Val_int(limen_kept_pipe[0]);
+}
+
+/* limen_ffi_kept_take : unit -> (int * int64 array * float array * string array) list:
+   every call queued so far, oldest first */
+value limen_ffi_kept_take(value unit) {
+  CAMLparam1(unit);
+  CAMLlocal5(list, cell, item, ia, fa);
+  CAMLlocal2(sa, x);
+  char buf[256];
+  if (limen_kept_pipe[0] >= 0) while (read(limen_kept_pipe[0], buf, sizeof buf) > 0) {}
+  pthread_mutex_lock(&limen_kept_mu);
+  LKept *e = limen_kept_head;
+  limen_kept_head = limen_kept_tail = NULL;
+  pthread_mutex_unlock(&limen_kept_mu);
+  /* reversed, so consing below gives the oldest first */
+  LKept *rev = NULL;
+  while (e) { LKept *n = e->next; e->next = rev; rev = e; e = n; }
+  list = Val_emptylist;
+  while (rev) {
+    LKept *n = rev->next;
+    ia = caml_alloc(8, 0);
+    for (int k = 0; k < 8; k++) { x = caml_copy_int64(rev->a[k]); Store_field(ia, k, x); }
+    fa = caml_alloc(8 * Double_wosize, Double_array_tag);
+    for (int k = 0; k < 8; k++) Store_double_flat_field(fa, k, rev->d[k]);
+    sa = caml_alloc(8, 0);
+    for (int k = 0; k < 8; k++) { x = caml_copy_string(rev->s[k] ? rev->s[k] : ""); Store_field(sa, k, x); free(rev->s[k]); }
+    item = caml_alloc_tuple(4);
+    Store_field(item, 0, Val_int(rev->slot));
+    Store_field(item, 1, ia);
+    Store_field(item, 2, fa);
+    Store_field(item, 3, sa);
+    cell = caml_alloc(2, 0);
+    Store_field(cell, 0, item);
+    Store_field(cell, 1, list);
+    list = cell;
+    free(rev);
+    rev = n;
+  }
+  CAMLreturn(list);
+}
+
 /* limen_ffi_cstr : int64 -> string (the NUL-terminated string at the address; "" for NULL) */
 value limen_ffi_cstr(value p) {
   CAMLparam1(p);
@@ -581,6 +702,7 @@ value limen_mtime_ms(value path) {
    missing. Returns false if none of them gave enough bytes.
    limen_os_random : bytes -> bool */
 #include <errno.h>
+#include <fcntl.h>
 #include <fcntl.h>
 #if defined(__linux__)
 #include <sys/random.h>

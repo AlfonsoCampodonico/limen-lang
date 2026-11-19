@@ -919,6 +919,108 @@ fn main(root: Root) -> Result[(), IoError] {
    let report = Coverage.to_text (Coverage.report items ran) in
    let has s sub = let n = String.length s and m = String.length sub in let rec go i = i + m <= n && (String.sub s i m = sub || go (i + 1)) in go 0 in
    ok "coverage-report" (has report "66% (2 of 3)" && has report "not run: 3") report);
+  (* ---------- UInt8 to UInt64: wrapping unsigned arithmetic ---------- *)
+  out "uint" {|// FNV-1a, 32-bit: a hash written with wrapping unsigned arithmetic
+fn fnv1a(s: Str) -> UInt32 {
+    let mut h: UInt32 = 2166136261
+    for b in s.bytes() {
+        h = (h ^ b.to_uint32()) * 16777619
+    }
+    h
+}
+
+fn main(root: Root) {
+    let a: UInt8 = 250
+    let b: UInt8 = 10
+    root.stdout.print("{a + b} {b - a} {a * b} {a / b} {a % b} {~a} {a & 0x0f} {a | 1} {a ^ b}")
+    root.stdout.print("{a << 4} {a >> 4} {a << 8} {a >> 9} {a < b} {a > b} {a == 250}")
+    let big: UInt64 = 0x7fff_ffff_ffff_ffff
+    let bigger = big + 1
+    let max = bigger + big
+    root.stdout.print("{bigger} {max} {max / 3} {max > big} {max.to_int()} {(-1).to_uint64()}")
+    let w: UInt32 = 0x8000_0001
+    root.stdout.print("{w.rotate_left(1)} {w.rotate_right(1)} {w.rotate_left(33)} {fnv1a("hello")}")
+    let xs: List[UInt16] = [300, 2, 65535]
+    root.stdout.print("{xs} {xs.sort()} {xs.map(|x| x + 1)}")
+    let mut m: Map[UInt8, Str] = map()
+    m[a] = "a"
+    m[b] = "b"
+    root.stdout.print("{m.get(a)} {m.keys()}")
+    root.stdout.print("{1000.to_uint8()} {(-1).to_uint16()} {a.to_int() + 1000} {a.to_uint32() * 1000} {a.to_float()} {a.min(b)} {a.max(b)}")
+}
+|}
+    "4 16 196 25 0 5 10 251 240\n160 15 0 0 false true true\n9223372036854775808 18446744073709551615 6148914691236517205 true -1 18446744073709551615\n3 3221225472 3 1335831723\n[300, 2, 65535] [2, 300, 65535] [301, 3, 0]\nSome(\"a\") [250, 10]\n232 65535 1250 250000 250.0 10 250\n";
+  errs "uint-too-big" "fn main(root: Root) {\n    let a: UInt8 = 256\n}\n" [ "E0201" ];
+  errs "uint-negative" "fn main(root: Root) {\n    let a: UInt8 = -1\n}\n" [ "E0201" ];
+  errs "uint-mixed" "fn main(root: Root) {\n    let a: UInt8 = 5\n    let n = 3\n    let c = a + n\n}\n" [ "E0201" ];
+  errs "uint-negate" "fn main(root: Root) {\n    let a: UInt32 = 5\n    let c = -a\n}\n" [ "E0201" ];
+  out "uint-match" "fn main(root: Root) {\n    let b: UInt8 = 255\n    let s = match b {\n        0 => \"zero\",\n        255 => \"top\",\n        _ => \"other\",\n    }\n    root.stdout.print(s)\n}\n" "top\n";
+  errs "uint-pattern-too-big" "fn main(root: Root) {\n    let b: UInt8 = 1\n    match b {\n        256 => (),\n        _ => (),\n    }\n}\n" [ "E0201" ];
+  errs "uint-pattern-negative" "fn main(root: Root) {\n    let b: UInt8 = 1\n    match b {\n        -1 => (),\n        _ => (),\n    }\n}\n" [ "E0201" ];
+  (* ---------- unicode: case folding and normal forms ---------- *)
+  out "unicode"
+    {|use unicode
+
+fn main(root: Root) {
+    root.stdout.print("{unicode.code_points("aé€😀")}")
+    root.stdout.print("{unicode.fold("Straße") == unicode.fold("STRASSE")} {unicode.upper("ﬁx straße")} {unicode.lower("ΑΒΓ")}")
+    root.stdout.print("{unicode.nfc("e\u{301}") == "\u{e9}"} {unicode.nfd("\u{e9}").len()} {unicode.code_points(unicode.nfc("\u{1100}\u{1161}\u{11a8}"))}")
+    root.stdout.print("{unicode.code_points(unicode.nfd("a\u{301}\u{327}"))} {unicode.code_points(unicode.nfc("a\u{327}\u{301}"))} {unicode.code_points(unicode.nfd("각"))}")
+    root.stdout.print("{unicode.same_ignoring_case("Café", "CAFE\u{301}")} {unicode.from_code_points([72, 233])}")
+}
+|}
+    "[97, 233, 8364, 128512]\ntrue FIX STRASSE αβγ\ntrue 3 [44033]\n[97, 807, 769] [225, 807] [4352, 4449, 4520]\ntrue Hé\n";
+  (* ---------- crypto: the RFCs' test vectors ---------- *)
+  (if Tls.available () then
+     out "crypto-vectors" {|use crypto
+use hex
+
+fn h(s: Str) -> Bytes {
+    match hex.decode(s) {
+        Ok(b) => b,
+        Err(e) => panic(e),
+    }
+}
+
+fn main(root: Root) {
+    // RFC 8439, 2.8.2
+    let key = h("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")
+    let nonce = h("070000004041424344454647")
+    let aad = h("50515253c0c1c2c3c4c5c6c7").to_str()
+    let text = "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.".to_bytes()
+    match crypto.encrypt(key, nonce, text, aad) {
+        Ok(c) => {
+            root.stdout.print("tag {hex.encode(c.slice(c.len() - 16, c.len()))}")
+            root.stdout.print("starts {hex.encode(c.slice(0, 8))}")
+            root.stdout.print("decrypts {crypto.decrypt(key, nonce, c, aad).map(|p| p == text)}")
+        },
+        Err(e) => root.stdout.print(e),
+    }
+    // RFC 8032, test 1
+    let sk = h("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+    let pk = crypto.public_key(sk)
+    root.stdout.print("public {hex.encode(pk)}")
+    let sig = crypto.sign(sk, bytes([]))
+    root.stdout.print("signature {hex.encode(sig)}")
+    root.stdout.print("verifies {crypto.verify(pk, bytes([]), sig)}, forged {crypto.verify(pk, bytes([1]), sig)}")
+    // RFC 7748, 6.1
+    let alice = h("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
+    let bob = h("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb")
+    root.stdout.print("alice public {hex.encode(crypto.agreement_public(alice))}")
+    let s1 = crypto.agree(alice, crypto.agreement_public(bob))
+    let s2 = crypto.agree(bob, crypto.agreement_public(alice))
+    root.stdout.print("shared {s1.map(|s| hex.encode(s))}, same {s1 == s2}")
+    // seal and open
+    let k = crypto.key(root.rand)
+    let sealed = crypto.seal(root.rand, k, "hello".to_bytes(), associated: "id 7")
+    root.stdout.print("open {crypto.open(k, sealed, associated: "id 7").map(|b| b.to_str())}")
+    root.stdout.print("wrong data {crypto.open(k, sealed, associated: "id 8")}")
+    let changed = sealed.slice(0, 20) + bytes([sealed[20] ^ 1]) + sealed.slice(21, sealed.len())
+    root.stdout.print("changed {crypto.open(k, changed, associated: "id 7").is_err()}")
+}
+|}
+       "tag 1ae10b594f09e26a7e902ecbd0600691\nstarts d31a8d34648e60db\ndecrypts Ok(true)\npublic d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a\nsignature e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b\nverifies true, forged false\nalice public 8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a\nshared Ok(\"4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742\"), same true\nopen Ok(\"hello\")\nwrong data Err(\"crypto: the message was changed, or the key, nonce or associated data is not the one it was sealed with\")\nchanged true\n");
+  (* ---------- sockets: an echo server and 50 clients in one program ---------- *)
   (* ---------- sockets: an echo server and 50 clients in one program ---------- *)
   let sock_grants = { Interp.no_grants with net = [ "127.0.0.1" ]; listen = [ "127.0.0.1" ] } in
   par "socket-echo" ~grants:sock_grants
@@ -1411,6 +1513,40 @@ fn main(root: Root) {
   panics "ffi-callback-int32" ~grants:libc
     (qdecls ^ "\nfn main(root: Root) {\n    let f = root.foreign\n    let buf = malloc(f, 2)\n    memcpy(f, buf, bytes([2, 1]), 2)\n    qsort(f, buf, 2, 1, too_big)\n}\n")
     "in a callback from C: foreign: 3000000000 does not fit in Int32 (the result of callback `too_big`)";
+  (* kept callbacks: pthread_create keeps the pointer and calls it later,
+     from threads of its own; each call is a value on the channel *)
+  let kept_decls = {|foreign "c" {
+    fn pthread_create(thread: Out[Handle], attr: Handle, start: Kept[fn(Handle)], arg: Handle) -> Int32
+    fn pthread_join(thread: Handle, result: Handle) -> Int32
+}
+|} in
+  out "ffi-kept-threads" ~grants:libc
+    (kept_decls ^ {|
+fn main(root: Root) {
+    let f = root.foreign
+    let started: Chan[Handle] = channel(0)
+    let mut threads: List[Handle] = []
+    for i in 1..<6 {
+        let (rc, t) = pthread_create(f, Handle { addr: 0 }, started, Handle { addr: i * 10 })
+        threads.push(t)
+    }
+    let mut got: List[Int] = []
+    for _ in 1..<6 {
+        match started.recv() {
+            Some(h) => got.push(h.addr),
+            None => {},
+        }
+    }
+    for t in threads {
+        let _ = pthread_join(f, t, Handle { addr: 0 })
+    }
+    root.stdout.print("{got.sort()}")
+}
+|})
+    "[10, 20, 30, 40, 50]\n";
+  errs "ffi-kept-result" "foreign \"c\" {\n    fn f(cb: Kept[fn(Int) -> Int])\n}\n\nfn main(root: Root) {}\n" [ "E0330" ];
+  errs "ffi-kept-not-fn" "foreign \"c\" {\n    fn f(cb: Kept[Int])\n}\n\nfn main(root: Root) {}\n" [ "E0330" ];
+  errs "ffi-kept-wrong-chan" (kept_decls ^ "\nfn main(root: Root) {\n    let c: Chan[Int] = channel(1)\n    let _ = pthread_create(root.foreign, Handle { addr: 0 }, c, Handle { addr: 0 })\n}\n") [ "E0201" ];
   (* callbacks from many tasks at once, each on its own task's thread *)
   let qsort_group = qdecls ^ {|
 fn main(root: Root) {
@@ -9350,7 +9486,7 @@ fn main(root: Root) {
   let listed = List.sort compare (List.map (fun (d : Package.dep) -> d.dname) manifest.deps) in
   ok "std-manifest-complete" (listed = List.sort compare (List.map fst Std_text.modules)) (String.concat ", " listed);
   ok "std-manifest-http" (List.exists (fun (d : Package.dep) -> d.dname = "http" && d.caps = [ "net"; "listen"; "clock" ]) manifest.deps) "http: net, listen, clock (server time limits)";
-  ok "std-manifest-sql" (List.exists (fun (d : Package.dep) -> d.dname = "sql" && d.caps = [ "fs"; "foreign=sqlite3" ]) manifest.deps && manifest.trust = [ "sql" ]) "sql: fs, sqlite3, trusted with C";
+  ok "std-manifest-sql" (List.exists (fun (d : Package.dep) -> d.dname = "sql" && d.caps = [ "fs"; "foreign=sqlite3" ]) manifest.deps && manifest.trust = [ "sql"; "crypto" ]) "sql: fs, sqlite3, trusted with C";
   ok "std-manifest-time" (List.exists (fun (d : Package.dep) -> d.dname = "time" && d.caps = [ "clock"; "fs" ]) manifest.deps) "time: clock (within), fs (load_zone)";
   ok "std-manifest-log" (List.exists (fun (d : Package.dep) -> d.dname = "log" && d.caps = [ "stdout"; "stderr"; "clock" ]) manifest.deps) "log: stdout, stderr, clock";
   ok "std-manifest-path" (List.exists (fun (d : Package.dep) -> d.dname = "path" && d.caps = [ "fs" ]) manifest.deps) "path: fs (walk)";
@@ -9358,9 +9494,10 @@ fn main(root: Root) {
   ok "std-manifest-postgres" (List.exists (fun (d : Package.dep) -> d.dname = "postgres" && d.caps = [ "net"; "rand" ]) manifest.deps) "postgres: net, rand (SCRAM's nonce)";
   ok "std-manifest-stream" (List.exists (fun (d : Package.dep) -> d.dname = "stream" && d.caps = [ "fs" ]) manifest.deps) "stream: fs";
   ok "std-manifest-websocket" (List.exists (fun (d : Package.dep) -> d.dname = "websocket" && d.caps = [ "net"; "rand" ]) manifest.deps) "websocket: net, rand (a client's masks)";
+  ok "std-manifest-crypto" (List.exists (fun (d : Package.dep) -> d.dname = "crypto" && d.caps = [ "rand" ]) manifest.deps) "crypto: rand (keys and nonces), trusted with the runtime's OpenSSL helper";
   ok "std-manifest-redis" (List.exists (fun (d : Package.dep) -> d.dname = "redis" && d.caps = [ "net" ]) manifest.deps) "redis: net";
   ok "std-manifest-pure"
-    (List.for_all (fun (d : Package.dep) -> List.mem d.dname [ "http"; "sql"; "time"; "log"; "path"; "uuid"; "postgres"; "redis"; "stream"; "websocket" ] || d.caps = []) manifest.deps)
+    (List.for_all (fun (d : Package.dep) -> List.mem d.dname [ "http"; "sql"; "time"; "log"; "path"; "uuid"; "postgres"; "redis"; "stream"; "websocket"; "crypto" ] || d.caps = []) manifest.deps)
     "the others are pure";
   let real_std = !Modules.std_modules in
   let std_errs name extra src =
@@ -10051,7 +10188,19 @@ fn main(root: Root) {
      String.concat "\n" (from lines)
    in
    let calls = count_sub main_body "wf_count(" in
-   ok "pure-reused-c" (calls = 6) (sprintf "%d calls" calls));
+   ok "pure-reused-c" (calls = 6) (sprintf "%d calls" calls);
+   (* a long match on integer literals is a C switch; a short one, or one
+      whose arm breaks out of a loop, stays a chain of tests *)
+   let arms n = String.concat "" (List.init n (fun i -> sprintf "        %d => %d,\n" i (i * 10))) in
+   let switch_src =
+     sprintf
+       "fn long(n: Int) -> Int {\n    match n {\n%s        _ => -1,\n    }\n}\n\nfn short(n: Int) -> Int {\n    match n {\n%s        _ => -1,\n    }\n}\n\nfn main(root: Root) {\n    let mut i = 0\n    while true {\n        match i {\n%s            _ => {\n                break\n            },\n        }\n        i = i + 1\n    }\n    root.stdout.print(\"{long(3)} {short(2)} {i}\")\n}\n"
+       (arms 2000) (arms 3)
+       (String.concat "" (List.init 9 (fun i -> sprintf "            %d => {},\n" i)))
+   in
+   let c = c_of "int-switch-c" switch_src in
+   ok "int-switch-c" (count_sub c "switch (n_" = 1 && count_sub c "switch (i_" = 0) "one switch, in `long`";
+   out "int-switch-run" switch_src "30 20 9\n");
 
   (* ---------- pure if the functions it is given are ---------- *)
   let cond_src = {v|fn my_map(xs: List[Int], f: fn(Int) -> Int) -> List[Int] {

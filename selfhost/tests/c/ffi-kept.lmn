@@ -1,0 +1,41 @@
+// Kept callbacks: C keeps the pointer and calls it later, from any thread;
+// each call is a value on the channel the pointer was made from.
+foreign "c" {
+    fn pthread_create(thread: Out[Handle], attr: Handle, start: Kept[fn(Handle)], arg: Handle) -> Int32
+    fn pthread_join(thread: Handle, result: Handle) -> Int32
+    fn atexit(f: Kept[fn()]) -> Int32
+    // never called with no items: here for a tuple with a string
+    fn qsort(base: Handle, n: Int, size: Int, compare: Kept[fn(Str, Int32, Float, Bool)])
+}
+
+fn main(root: Root) {
+    let f = root.foreign
+    let started: Chan[Handle] = channel(0)
+    let mut threads: List[Handle] = []
+    for i in 1..<6 {
+        let (rc, t) = pthread_create(f, Handle { addr: 0 }, started, Handle { addr: i * 10 })
+        if rc == 0 {
+            threads.push(t)
+        }
+    }
+    let mut got: List[Int] = []
+    for _ in 1..<6 {
+        match started.recv() {
+            Some(h) => got.push(h.addr),
+            None => {},
+        }
+    }
+    for t in threads {
+        let _ = pthread_join(f, t, Handle { addr: 0 })
+    }
+    // the same channel again is the same slot
+    let again = pthread_create(f, Handle { addr: 0 }, started, Handle { addr: 7 })
+    let seventh = started.recv()
+    let _ = pthread_join(f, again.1, Handle { addr: 0 })
+    // C calls this one after the program ends: dropped
+    let at_end: Chan[()] = channel(1)
+    let _ = atexit(f, at_end)
+    let rows: Chan[(Str, Int, Float, Bool)] = channel(1)
+    qsort(f, Handle { addr: 0 }, 0, 8, rows)
+    root.stdout.print("{got.sort()} {seventh}")
+}

@@ -56,6 +56,7 @@ let rec cty (c : Ffi.cty) =
   | Unit -> "Unit"
   | Struct (n, fs) -> Printf.sprintf "Struct(%s{%s})" n (String.concat "," (List.map (fun (f, t) -> f ^ ":" ^ cty t) fs))
   | Fn (ps, r) -> Printf.sprintf "Fn(%s)->%s" (String.concat "," (List.map cty ps)) (cty r)
+  | Kept ps -> Printf.sprintf "Kept(%s)" (String.concat "," (List.map cty ps))
 
 let csig (s : Ffi.csig) =
   let fixed = match s.fixed with Some k -> string_of_int k | None -> "-" in

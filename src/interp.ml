@@ -37,6 +37,7 @@ and sock = { fd : Unix.file_descr; mutable shut : bool; mutable reading : bool; 
 (* Map keys: Int, Str, Bool, and tuples, structs and enums of them. *)
 type mkey =
   | KInt of int64
+  | KUInt of int * int64
   | KStr of string
   | KBytes of string
   | KBool of bool
@@ -45,11 +46,12 @@ type mkey =
 
 (* Any total order will do (maps iterate in insertion order, kept apart),
    so keys are compared directly instead of through the generic compare. *)
-let key_tag = function KInt _ -> 0 | KStr _ -> 1 | KBytes _ -> 2 | KBool _ -> 3 | KStruct _ -> 4 | KEnum _ -> 5
+let key_tag = function KInt _ -> 0 | KStr _ -> 1 | KBytes _ -> 2 | KBool _ -> 3 | KStruct _ -> 4 | KEnum _ -> 5 | KUInt _ -> 6
 
 let rec compare_key a b =
   match (a, b) with
   | KInt x, KInt y -> Int64.compare x y
+  | KUInt (_, x), KUInt (_, y) -> Int64.unsigned_compare x y
   | KStr x, KStr y | KBytes x, KBytes y -> String.compare x y
   | KBool x, KBool y -> Bool.compare x y
   | KStruct (n, fs), KStruct (m, gs) ->
@@ -76,6 +78,7 @@ end)
 
 type value =
   | VInt of int64 (* 64-bit and wrapping, as in native code *)
+  | VUInt of int * int64 (* a UInt8 to UInt64: its bits, and its value, below 2^bits (all 64 bits used for UInt64) *)
   | VMap of vmap
   | VFloat of float
   | VBool of bool
@@ -298,6 +301,7 @@ let revocable_socks : (revoke * sock) list ref = ref []
 
 let rec key_of = function
   | VInt n -> KInt n
+  | VUInt (b, n) -> KUInt (b, n)
   | VStr s -> KStr s
   | VBytes s -> KBytes s
   | VBool b -> KBool b
@@ -307,6 +311,7 @@ let rec key_of = function
 
 let rec val_of_key = function
   | KInt n -> VInt n
+  | KUInt (b, n) -> VUInt (b, n)
   | KStr s -> VStr s
   | KBytes s -> VBytes s
   | KBool b -> VBool b
@@ -328,6 +333,7 @@ let map_put mv k v =
 let rec show ?(top = true) v =
   match v with
   | VInt n -> Int64.to_string n
+  | VUInt (_, n) -> Printf.sprintf "%Lu" n
   | VFloat x -> fmt_float x
   | VBool b -> string_of_bool b
   | VStr s -> if top then s else "\"" ^ String.escaped s ^ "\""
@@ -352,6 +358,7 @@ let rec show ?(top = true) v =
 let rec equal a b =
   match (a, b) with
   | VInt x, VInt y -> x = y
+  | VUInt (_, x), VUInt (_, y) -> x = y
   | VFloat x, VFloat y -> x = y
   | VBool x, VBool y -> x = y
   | VStr x, VStr y -> x = y
@@ -384,6 +391,7 @@ let rec compare_v a b =
   in
   match (a, b) with
   | VInt x, VInt y -> compare x y
+  | VUInt (_, x), VUInt (_, y) -> Int64.unsigned_compare x y
   | VFloat x, VFloat y -> compare x y
   | VStr x, VStr y | VBytes x, VBytes y -> compare x y
   | VBool x, VBool y -> compare x y
@@ -598,7 +606,7 @@ let in_loop f =
    channel or group in it, and fully known (not a type parameter). *)
 let rec plain_type t =
   match Types.repr t with
-  | Types.TInt | TFloat | TBool | TUnit | TStr | TBytes | TDyn _ -> true
+  | Types.TInt | TFloat | TBool | TUnit | TStr | TBytes | TUInt _ | TDyn _ -> true
   | TList a | TArray (a, _) -> plain_type a
   | TMap (k, v) -> plain_type k && plain_type v
   | TNamed (n, args) -> List.for_all plain_type args && not (Hashtbl.mem Types.authority n)
@@ -664,8 +672,35 @@ let snapshot env =
   List.iter (fun s -> List.iter (fun (k, v) -> if lookup k !out = None then out := (k, ref (settle v)) :: !out) s.vars) env;
   { vars = List.rev !out }
 
+(* The low [bits] bits of [n]: an unsigned value wraps modulo 2^bits. *)
+let wrap bits n = if bits = 64 then n else Int64.logand n (Int64.sub (Int64.shift_left 1L bits) 1L)
+
+let ubinop bits op x y sp =
+  let u v = VUInt (bits, wrap bits v) in
+  match op with
+  | Add -> u (Int64.add x y)
+  | Sub -> u (Int64.sub x y)
+  | Mul -> u (Int64.mul x y)
+  | (Div | Mod) when y = 0L -> raise (Panic ("division by zero", sp))
+  | Div -> VUInt (bits, Int64.unsigned_div x y)
+  | Mod -> VUInt (bits, Int64.unsigned_rem x y)
+  | BitAnd -> VUInt (bits, Int64.logand x y)
+  | BitOr -> VUInt (bits, Int64.logor x y)
+  | BitXor -> VUInt (bits, Int64.logxor x y)
+  (* as natively: a count of [bits] or more shifts every bit out *)
+  | Shl -> if Int64.unsigned_compare y (Int64.of_int bits) >= 0 then VUInt (bits, 0L) else u (Int64.shift_left x (Int64.to_int y))
+  | Shr -> if Int64.unsigned_compare y (Int64.of_int bits) >= 0 then VUInt (bits, 0L) else VUInt (bits, Int64.shift_right_logical x (Int64.to_int y))
+  | Eq -> VBool (x = y)
+  | Ne -> VBool (x <> y)
+  | Lt -> VBool (Int64.unsigned_compare x y < 0)
+  | Le -> VBool (Int64.unsigned_compare x y <= 0)
+  | Gt -> VBool (Int64.unsigned_compare x y > 0)
+  | Ge -> VBool (Int64.unsigned_compare x y >= 0)
+  | _ -> failwith "internal: bad unsigned operands"
+
 let binop op a b sp =
   match (op, a, b) with
+  | _, VUInt (bits, x), VUInt (_, y) -> ubinop bits op x y sp
   (* integers first, compared directly rather than through compare_v *)
   | Lt, VInt x, VInt y -> VBool (Int64.compare x y < 0)
   | Le, VInt x, VInt y -> VBool (Int64.compare x y <= 0)
@@ -1012,8 +1047,15 @@ let sleep_ms (ms : int64) =
     if stopped !current then raise Cancelled
   end
 
+(* Kept callbacks (Foreign.kept_drain): the calls C made since the last
+   look, turned into values on their channels, and the pipe that says one
+   came. Nothing until a program gives C one. *)
+let kept_drain : (unit -> unit) ref = ref (fun () -> ())
+let kept_fd : Unix.file_descr option ref = ref None
+
 (* Run tasks until [finished ()]. *)
 let rec schedule finished sp =
+  !kept_drain ();
   if not (finished ()) then begin
     let n = Queue.length runq in
     let rec pick i =
@@ -1052,6 +1094,8 @@ let rec schedule finished sp =
       let waits =
         Queue.fold (fun acc (_, io, _, _) -> match io with Some ((s : sock), w) when not s.shut -> (s.fd, w) :: acc | _ -> acc) [] runq
       in
+      (* C may call a kept callback at any time: not a deadlock *)
+      let waits = match !kept_fd with Some fd -> (fd, false) :: waits | None -> waits in
       (* the timer due first; of two due together, the one set first *)
       let first =
         Queue.fold
@@ -1417,6 +1461,9 @@ module Foreign = struct
   external cb_free : bool -> int -> unit = "limen_ffi_cb_free"
   external cb_addr : bool -> int -> nativeint = "limen_ffi_cb_addr"
   external cb_fail : unit -> unit = "limen_ffi_cb_fail"
+  external kept_open : int -> int -> nativeint = "limen_ffi_kept_open"
+  external kept_pipe : unit -> int = "limen_ffi_kept_fd"
+  external kept_take : unit -> (int * int64 array * float array * string array) list = "limen_ffi_kept_take"
   external job_start : nativeint -> int -> carg array -> float array -> int -> nativeint * int = "limen_ffi_job_start"
   external job_done : nativeint -> bool = "limen_ffi_job_done"
   external job_finish : nativeint -> int * int64 array * int64 array = "limen_ffi_job_finish"
@@ -1543,6 +1590,7 @@ module Foreign = struct
     in
     match (sym, args) with
     | "limen_copy", [ VStruct (_, [ (_, VInt p) ]); VInt n ] -> copy [ "limen" ] p n sp
+    | "limen_crypto", [ VInt op; VBytes a; VBytes b; VBytes c; VBytes d ] -> VBytes (Tls.crypto (Int64.to_int op) a b c d)
     | "limen_handle_new", [ VStruct (_, [ (_, VInt p) ]) ] ->
       let rec fresh () =
         let id = Int64.logand (Random.State.int64 (Lazy.force id_rng) Int64.max_int) 0x3FFFFFFFFFFFFFFFL in
@@ -1603,6 +1651,71 @@ module Foreign = struct
   let abi = lazy (match abi_kind () with 0 -> X64 | 1 -> Arm64 | _ -> Apple)
 
   let int32 n = Int64.of_int32 (Int64.to_int32 n)
+
+  (* Kept callbacks: a slot per channel and C signature, for the rest of
+     the program (C may still hold the pointer), 32 at most as natively. *)
+  let kept_slots : (chan * Ffi.cty list) option array = Array.make 32 None
+
+  let kept_take_all () =
+    List.iter
+      (fun (k, a, d, strs) ->
+        match kept_slots.(k) with
+        | None -> ()
+        | Some (ch, cps) ->
+          let i = ref 0 and f = ref 0 in
+          let vs =
+            List.map
+              (fun (t : Ffi.cty) ->
+                match t with
+                | Ffi.Float -> let x = d.(!f) in incr f; VFloat x
+                | t -> (
+                  let n = a.(!i) and str = strs.(!i) in
+                  incr i;
+                  match t with
+                  | Ffi.Int32 -> VInt (int32 n)
+                  | Ffi.Bool -> VBool (int32 n <> 0L)
+                  | Ffi.Handle -> handle n
+                  | Ffi.Str -> VStr str
+                  | _ -> VInt n))
+              cps
+          in
+          let v = match vs with [] -> VUnit | [ v ] -> v | vs -> VStruct (Ast.tuple_name (List.length vs), List.mapi (fun i v -> (string_of_int i, v)) vs) in
+          (* never waits: a waiting receiver gets it, or it is queued past
+             the capacity; a closed channel drops it *)
+          if not ch.closed then match pop_live ch.rq with Some r -> r.v <- v; r.ok <- true | None -> Queue.push v ch.q)
+      (kept_take ())
+
+  (* A new program: the last one's channels are gone, and C's calls still
+     queued for them are dropped. *)
+  let kept_reset () =
+    if !kept_fd <> None then ignore (kept_take ());
+    Array.fill kept_slots 0 32 None;
+    kept_fd := None;
+    kept_drain := fun () -> ()
+
+  (* The pointer C gets for [ch] under C signature [cps]. *)
+  let kept_ptr ch cps sp =
+    let rec find k = if k = 32 then None else match kept_slots.(k) with Some (c, ps) when c == ch && ps = cps -> Some k | _ -> find (k + 1) in
+    let rec free k = if k = 32 then -1 else if kept_slots.(k) = None then k else free (k + 1) in
+    let k =
+      match find 0 with
+      | Some k -> k
+      | None ->
+        let k = free 0 in
+        if k < 0 then raise (Panic ("foreign: C keeps 32 channels already, the most a program can give it", sp));
+        kept_slots.(k) <- Some (ch, cps);
+        k
+    in
+    (* the string arguments, by their integer word *)
+    let mask, _ =
+      List.fold_left
+        (fun (m, i) (t : Ffi.cty) -> match t with Ffi.Float -> (m, i) | Ffi.Str -> (m lor (1 lsl i), i + 1) | _ -> (m, i + 1))
+        (0, 0) cps
+    in
+    let p = kept_open k mask in
+    kept_fd := Some (Obj.magic (kept_pipe ()) : Unix.file_descr);
+    kept_drain := kept_take_all;
+    p
 
   let int32_arg n what sp =
     if n < -2147483648L || n > 2147483647L then raise (Panic (sprintf "foreign: %Ld does not fit in Int32 (%s)" n what, sp));
@@ -1850,6 +1963,7 @@ module Foreign = struct
             taken := (pool, k) :: !taken;
             Hashtbl.replace cb_handlers ((if pool then 32 else 0) + k) (cb_handler ~call ~cap (m, fns m) cps r);
             Word (AInt (Int64.of_nativeint (cb_addr pool k)))
+          | Ffi.Kept cps, VChan ch -> Word (AInt (Int64.of_nativeint (kept_ptr ch cps sp)))
           | _ -> failwith "internal: foreign argument"
         in
         c :: conv ps args
@@ -2099,6 +2213,7 @@ let rec pmatch p v binds =
   | PWild, _ -> true
   | PBind n, _ -> bind binds n v; true
   | PInt n, VInt m -> Int64.equal n m
+  | PInt n, VUInt (_, m) -> Int64.equal n m
   | PStr s, VStr t -> s = t
   | PBool b, VBool c -> b = c
   | PVariant (_, vn, args), VEnum (_, vn', vals) ->
@@ -2137,7 +2252,7 @@ let covered (sp : Span.t) = match !coverage with Some t -> Hashtbl.replace t (sp
 
 let rec eval rt env e : value =
   match e.edesc with
-  | EInt n -> VInt n
+  | EInt n -> (match Types.repr e.ety with Types.TUInt b -> VUInt (b, n) | _ -> VInt n)
   | EFloat x -> VFloat x
   | EBool b -> VBool b
   | EUnit -> VUnit
@@ -2165,7 +2280,11 @@ let rec eval rt env e : value =
   | EUn (Neg, a) -> (
     match eval rt env a with VInt n -> VInt (Int64.neg n) | VFloat x -> VFloat (-.x) | _ -> failwith "internal: neg")
   | EUn (Not, a) -> VBool (not (as_bool (eval rt env a)))
-  | EUn (BitNot, a) -> (match eval rt env a with VInt n -> VInt (Int64.lognot n) | _ -> failwith "internal: bitwise not")
+  | EUn (BitNot, a) -> (
+    match eval rt env a with
+    | VInt n -> VInt (Int64.lognot n)
+    | VUInt (b, n) -> VUInt (b, wrap b (Int64.lognot n))
+    | _ -> failwith "internal: bitwise not")
   | ENamed _ -> failwith "internal: the checker puts named arguments in order"
   | ECall ({ ecallee = Some d; _ }, args) when d.fn_foreign = None -> (
     (* a call to a known top-level function: no name to look up *)
@@ -2880,6 +2999,22 @@ and call_method rt v name args sp =
   | VInt a, "max", [ VInt b ] -> VInt (max a b)
   | VInt n, "to_str", [] -> VStr (Int64.to_string n)
   | VInt n, "to_float", [] -> VFloat (Int64.to_float n)
+  | (VInt n | VUInt (_, n)), ("to_uint8" | "to_uint16" | "to_uint32" | "to_uint64"), [] ->
+    let b = match name with "to_uint8" -> 8 | "to_uint16" -> 16 | "to_uint32" -> 32 | _ -> 64 in
+    VUInt (b, wrap b n)
+  | VUInt (_, n), "to_int", [] -> VInt n
+  | VUInt (_, n), "to_str", [] -> VStr (Printf.sprintf "%Lu" n)
+  | VUInt (_, n), "to_float", [] ->
+    (* all 64 bits unsigned: the top bit is 2^63, not the sign *)
+    VFloat (if n >= 0L then Int64.to_float n else Int64.to_float (Int64.shift_right_logical n 1) *. 2. +. Int64.to_float (Int64.logand n 1L))
+  | VUInt (b, x), "min", [ VUInt (_, y) ] -> VUInt (b, if Int64.unsigned_compare x y <= 0 then x else y)
+  | VUInt (b, x), "max", [ VUInt (_, y) ] -> VUInt (b, if Int64.unsigned_compare x y >= 0 then x else y)
+  | VUInt (b, x), ("rotate_left" | "rotate_right"), [ VInt k ] ->
+    let k = Int64.to_int (Int64.rem k (Int64.of_int b)) in
+    let k = if k < 0 then k + b else k in
+    let k = if name = "rotate_right" then (b - k) mod b else k in
+    if k = 0 then VUInt (b, x)
+    else VUInt (b, wrap b (Int64.logor (Int64.shift_left x k) (Int64.shift_right_logical x (b - k))))
   | VInt n, "abs", [] -> VInt (if n < 0L then Int64.neg n else n)
   | VInt _, "shift_right_unsigned", [ VInt k ] when k < 0L -> raise (Panic ("negative shift count", sp))
   | VInt n, "shift_right_unsigned", [ VInt k ] -> VInt (if k >= 64L then 0L else Int64.shift_right_logical n (Int64.to_int k))
@@ -3152,6 +3287,7 @@ let run ?(before_main = fun () -> ()) ~out ?(err = to_stderr) ~grants (user_item
     live_groups := [];
     held_bytes := 0;
     Stdin.reset ();
+    Foreign.kept_reset ();
     Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
     let result = ref None in
     try
@@ -3234,6 +3370,7 @@ let run_tests_timed ?(select = fun _ -> true) ~out (user_items : item list) :
         Queue.clear runq;
         live_groups := [];
         virtual_now := None;
+        Foreign.kept_reset ();
         Option.iter Caps.remove_tree dir;
         Some (name, r, Unix.gettimeofday () -. start)
       | _ -> None)

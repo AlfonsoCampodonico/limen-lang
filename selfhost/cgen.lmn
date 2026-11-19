@@ -104,6 +104,8 @@ struct Cg {
     sql_api: Bool,
     cstructs: List[CStruct],
     wrappers: List[Wrapper],
+    // the C signatures of kept callbacks, each with its trampolines
+    kepts: List[List[ffi.CTy]],
     // blocking calls' jobs, vbj<n>_: each one's struct and the function
     // that makes the call
     bjobs: List[Str],
@@ -133,7 +135,7 @@ fn show(t: types.Ty) -> Str {
 
 fn is_scalar(t: types.Ty) -> Bool {
     match t {
-        TInt | TFloat | TBool | TUnit => true,
+        TInt | TFloat | TBool | TUnit | TUInt(_) => true,
         _ => false,
     }
 }
@@ -174,6 +176,7 @@ fn cname(self: Cg, t: types.Ty) -> (Str, Cg) {
         TUnit => ("Unit", c),
         TStr => ("Str", c),
         TBytes => ("Bytes", c),
+        TUInt(n) => ("UInt{n}", c),
         TFn(ps, r) => {
             for p in ps {
                 (_, c) = c.cname(p)
@@ -238,6 +241,7 @@ fn ctype(self: Cg, t: types.Ty) -> (Str, Cg) {
         TBool => ("bool", self),
         TUnit => ("W_Unit", self),
         TStr | TBytes => ("WStr*", self),
+        TUInt(n) => ("uint{n}_t", self),
         TFn(..) => ("WClo*", self),
         TDyn(..) => ("WDyn*", self),
         TCap(_) => ("WCap*", self),
@@ -584,6 +588,7 @@ fn cmp_prefix(self: Cg, t: types.Ty) -> (Str, Cg) {
         TFloat => ("Float", self),
         TStr => ("Str", self),
         TBytes => ("Bytes", self),
+        TUInt(n) => ("UInt{n}", self),
         TBool => ("Bool", self),
         TUnit => ("Unit", self),
         _ => {
@@ -621,6 +626,7 @@ fn hash_prefix(self: Cg, t: types.Ty) -> (Str, Cg) {
         TInt => ("Int", self),
         TStr => ("Str", self),
         TBytes => ("Bytes", self),
+        TUInt(n) => ("UInt{n}", self),
         TBool => ("Bool", self),
         TUnit => ("Unit", self),
         _ => {
@@ -661,6 +667,17 @@ fn cmp_op(op: ast.BinOp) -> Str {
     }
 }
 
+fn arith_op(op: ast.BinOp) -> Str {
+    match op {
+        Add => "+",
+        Sub => "-",
+        Mul => "*",
+        BitAnd => "&",
+        BitOr => "|",
+        _ => "^",
+    }
+}
+
 fn binop(self: Cg, op: ast.BinOp, t: types.Ty, a: Str, b: Str, sp: ast.Span) -> (Str, Cg) {
     match (t, op) {
         (TInt, Add) | (TFloat, Add) => ("({a} + {b})", self),
@@ -673,13 +690,18 @@ fn binop(self: Cg, op: ast.BinOp, t: types.Ty, a: Str, b: Str, sp: ast.Span) -> 
         (TInt, BitXor) => ("({a} ^ {b})", self),
         (TInt, Shl) => ("w_shl({a}, {b}, {self.where(sp)})", self),
         (TInt, Shr) => ("w_shr({a}, {b}, {self.where(sp)})", self),
+        (TUInt(n), Add | Sub | Mul | BitAnd | BitOr | BitXor) => ("((uint{n}_t)({a} {arith_op(op)} {b}))", self),
+        (TUInt(n), Div) => ("((uint{n}_t)w_udiv({a}, {b}, {self.where(sp)}))", self),
+        (TUInt(n), Mod) => ("((uint{n}_t)w_umod({a}, {b}, {self.where(sp)}))", self),
+        (TUInt(n), Shl) => ("((uint{n}_t)w_ushl_n({a}, {b}, {n}))", self),
+        (TUInt(n), Shr) => ("((uint{n}_t)w_ushr_n({a}, {b}, {n}))", self),
         (TFloat, Div) => ("({a} / {b})", self),
         (TStr, Add) | (TBytes, Add) => ("Str_concat({a}, {b})", self),
         (TList(_), Add) => {
             let (n, c) = self.cname(t)
             ("{n}_concat({a}, {b})", c)
         },
-        (TInt, Lt | Le | Gt | Ge | Eq | Ne) | (TFloat, Lt | Le | Gt | Ge | Eq | Ne) | (TBool, Lt | Le | Gt | Ge | Eq | Ne) => ("({a} {cmp_op(op)} {b})", self),
+        (TInt, Lt | Le | Gt | Ge | Eq | Ne) | (TFloat, Lt | Le | Gt | Ge | Eq | Ne) | (TBool, Lt | Le | Gt | Ge | Eq | Ne) | (TUInt(_), Lt | Le | Gt | Ge | Eq | Ne) => ("({a} {cmp_op(op)} {b})", self),
         (TStr, Lt | Le | Gt | Ge) => ("(Str_cmp({a}, {b}) {cmp_op(op)} 0)", self),
         (_, Eq) => {
             let (n, c) = self.cname(t)
@@ -740,8 +762,22 @@ fn ffi_ctype(self: Cg, t: ffi.CTy) -> (Str, Cg) {
             let (cr, c2) = c.ffi_ctype(r)
             ("{cr} (*)({if ps.is_empty() { "void" } else { cps.join(", ") }})", c2)
         },
+        Kept(ps) => self.ffi_ctype(Fn(ps, Unit)),
         _ => (ffi.c_name(t), self),
     }
+}
+
+// The number of a kept callback's C signature, its trampolines named
+// vkt<n>_ (an array of W_KEPT), registered on first use.
+fn kept_sig(self: Cg, ps: List[ffi.CTy]) -> (Int, Cg) {
+    for (i, q) in self.kepts.with_index() {
+        if q == ps {
+            return (i, self)
+        }
+    }
+    let mut c = self
+    c.kepts.push(ps)
+    (c.kepts.len() - 1, c)
 }
 
 fn i32_arg(v: Str, what: Str, wh: Str) -> Str {
@@ -774,6 +810,10 @@ fn ffi_arg(self: Cg, variadic: Bool, t: ffi.CTy, v: Str, what: Str, wh: Str) -> 
             }
             let (cn, c) = self.ffi_ctype(t)
             ("({cn})\{ {items.join(", ")} }", c)
+        },
+        Kept(ps) => {
+            let (i, c) = self.kept_sig(ps)
+            ("vkt{i}_[w_kept_slot({v}, {wh})]", c)
         },
         Unit | Fn(..) => ("0", self),
     }
@@ -875,6 +915,54 @@ fn ffi_callback_def(self: Cg, w: Wrapper) -> (Str, Cg) {
         b.push("  return r_;")
     }
     b.push("}")
+    (b.map(|l| l + "\n").join(""), c)
+}
+
+// A kept callback signature's trampolines: W_KEPT functions with C's
+// parameters, each building the channel's value from them and sending it
+// on its slot's channel (w_kept_send), and the array C's pointers come
+// from.
+fn kept_def(self: Cg, i: Int, ps: List[ffi.CTy]) -> (Str, Cg) {
+    let mut c = self
+    let mut b: List[Str] = []
+    let (hd, c1) = c.cname(handle_ty())
+    c = c1
+    let elem = ffi.kept_elem(ps)
+    let mut cps: List[Str] = []
+    for (k, t) in ps.with_index() {
+        let (ct, next) = c.ffi_ctype(t)
+        c = next
+        cps.push("{ct} a{k}")
+    }
+    let params = if ps.is_empty() { "void" } else { cps.join(", ") }
+    let conv = |k: Int, t: ffi.CTy| match t {
+        Int32 => "(int64_t)a{k}",
+        Bool => "(a{k} != 0)",
+        Handle => "({hd})\{ (int64_t)(intptr_t)a{k} }",
+        Str => "w_ffi_str(a{k})",
+        _ => "a{k}",
+    }
+    let value = match ps.len() {
+        0 => "0",
+        1 => conv(0, ps[0]),
+        _ => {
+            let (en, c2) = c.cname(elem)
+            c = c2
+            "({en})\{ {ps.with_index().map(|p| conv(p.0, p.1)).join(", ")} }"
+        },
+    }
+    let (et, c3) = c.ctype(elem)
+    c = c3
+    b.push("static void vkt{i}_fire(int64_t i_{cps.map(|x| ", " + x).join("")}) \{")
+    b.push("  {et} v_ = {value};")
+    b.push("  w_kept_send(i_, &v_);")
+    b.push("}")
+    let names = (0..<32).map(|k| "vkt{i}_{k}")
+    let fwd = ps.with_index().map(|p| ", a{p.0}").join("")
+    for (k, n) in names.with_index() {
+        b.push("static void {n}({params}) \{ vkt{i}_fire({k}{fwd}); }")
+    }
+    b.push("static void (*const vkt{i}_[W_KEPT])({params}) = \{ {names.join(", ")} };")
     (b.map(|l| l + "\n").join(""), c)
 }
 
@@ -1071,6 +1159,11 @@ fn rhs_into(self: Cg, ind: Str, dst: Str, t: types.Ty, r: ir.Rhs) -> Cg {
                 ("limen_bytes_int", [b, at]) => c2.set(ind, dst, "w_bytes_int({b}, {at}, {c2.where(sp)})"),
                 ("limen_bytes_float", [b, at]) => c2.set(ind, dst, "w_bytes_float({b}, {at}, {c2.where(sp)})"),
                 ("limen_float_bits", [x]) => c2.set(ind, dst, "w_float_bits({x})"),
+                ("limen_crypto", [op, x1, x2, x3, x4]) => {
+                    let mut c3 = c2
+                    c3.tls = true
+                    c3.set(ind, dst, "w_crypto({op}, {x1}, {x2}, {x3}, {x4})")
+                },
                 ("limen_handle_acquire" | "limen_handle_release" | "limen_handle_close", [id]) => c2.set(ind, dst, "({hd})\{ w_{cs.sym.slice("limen_".len(), cs.sym.len())}({id}) }"),
                 _ => panic("cgen: runtime helper " + cs.sym),
             }
@@ -1649,6 +1742,22 @@ fn prim(self: Cg, ind: Str, dst: Str, t: types.Ty, name: Str, rt: types.Ty, a: L
         ("int_to_float", _) => c.set(ind, dst, "(double){arg(0)}"),
         ("int_abs", _) => c.set(ind, dst, "w_abs({arg(0)})"),
         ("int_shift_right_unsigned", _) => c.set(ind, dst, "w_ushr({arg(0)}, {arg(1)}, {c.where(sp)})"),
+        ("int_to_uint8" | "uint_to_uint8", _) => c.set(ind, dst, "(uint8_t)({arg(0)})"),
+        ("int_to_uint16" | "uint_to_uint16", _) => c.set(ind, dst, "(uint16_t)({arg(0)})"),
+        ("int_to_uint32" | "uint_to_uint32", _) => c.set(ind, dst, "(uint32_t)({arg(0)})"),
+        ("int_to_uint64" | "uint_to_uint64", _) => c.set(ind, dst, "(uint64_t)({arg(0)})"),
+        ("uint_to_int", _) => c.set(ind, dst, "(int64_t)({arg(0)})"),
+        ("uint_to_str", _) => c.show_into(ind, dst, [Value(arg(0), rt, true)]),
+        ("uint_to_float", _) => c.set(ind, dst, "w_u2f({arg(0)})"),
+        ("uint_min", _) => c.set(ind, dst, "({arg(0)} < {arg(1)} ? {arg(0)} : {arg(1)})"),
+        ("uint_max", _) => c.set(ind, dst, "({arg(0)} > {arg(1)} ? {arg(0)} : {arg(1)})"),
+        ("uint_rotate_left" | "uint_rotate_right", _) => {
+            let bits = match rt {
+                TUInt(n) => n,
+                _ => 64,
+            }
+            c.set(ind, dst, "(uint{bits}_t)w_urot({arg(0)}, {arg(1)}, {bits}, {if name == "uint_rotate_left" { 1 } else { 0 }})")
+        },
         ("float_to_int", _) => c.set(ind, dst, "w_f2i({arg(0)})"),
         ("float_abs", _) => c.set(ind, dst, "fabs({arg(0)})"),
         ("float_sqrt", _) => c.set(ind, dst, "sqrt({arg(0)})"),
@@ -1838,7 +1947,153 @@ fn kept_or(self: Cg, ind: Str, v: ir.Var, r: ir.Rhs) -> Cg {
 // ---------- statements ----------
 
 fn stmts(self: Cg, ind: Str, ss: List[ir.Stmt]) -> Cg {
-    ss.fold(self, |c, s| c.stmt(ind, s))
+    let mut c = self
+    let mut i = 0
+    while i < ss.len() {
+        match int_chain(ss, i) {
+            Some(ch) => {
+                c = c.switch_of(ind, ch)
+                // a chain starts with its first test and its `if`
+                i = i + 2
+            },
+            None => {
+                c = c.stmt(ind, ss[i])
+                i = i + 1
+            },
+        }
+    }
+    c
+}
+
+// A long run of tests of one integer against a literal, each failing into
+// the next, as a `match` on integer literals lowers to. The chain becomes
+// a C `switch`, which compiles to a jump table or a binary search, where
+// nested `if`s are a linear scan that also runs into the C compiler's
+// nesting limit after a couple of thousand arms. A `break` in an arm would
+// leave the switch instead of the loop, so then it stays.
+struct IntChain {
+    // the integer tested
+    x: ir.Var,
+    // each literal and what runs when it matches, in order
+    arms: List[(Int, List[ir.Stmt])],
+    // what runs when none does
+    fallback: List[ir.Stmt],
+}
+
+fn switch_min() -> Int {
+    8
+}
+
+fn has_break(ss: List[ir.Stmt]) -> Bool {
+    for s in ss {
+        let found = match s {
+            Break => true,
+            If(_, a, b) => has_break(a) || has_break(b),
+            Guard(_, d, p) => has_break(d) || has_break(p),
+            Scope(_, b) => has_break(b),
+            _ => false,
+        }
+        if found {
+            return true
+        }
+    }
+    false
+}
+
+// The flag, the integer and the literal of a test `flag = x == literal`.
+fn int_test(s: ir.Stmt) -> Option[(ir.Var, ir.Var, Int)] {
+    match s {
+        Let(t, PatTest(V(x), ty, p)) => match ty {
+            TInt | TUInt(_) => match p.desc {
+                PInt(k) => Some((t, x, k)),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+// The test at `ss[i]` and the `if` on it, when they start a chain.
+fn int_chain(ss: List[ir.Stmt], i: Int) -> Option[IntChain] {
+    if i + 1 >= ss.len() {
+        return None
+    }
+    let (t0, x, k0) = match int_test(ss[i]) {
+        Some(found) => found,
+        None => {
+            return None
+        },
+    }
+    let (a0, b0) = match ss[i + 1] {
+        If(V(c), a, b) if c.id == t0.id => (a, b),
+        _ => {
+            return None
+        },
+    }
+    let mut arms = [(k0, a0)]
+    let mut tail = b0
+    while true {
+        // what comes around the next test writes no C: a development
+        // build's line mark, or the end of a scalar such as the last
+        // test's flag
+        let rest = tail.filter(|s| !is_quiet(s))
+        if rest.len() != 2 {
+            break
+        }
+        let next = match int_test(rest[0]) {
+            Some((t, x2, k)) if x2.id == x.id => match rest[1] {
+                If(V(c), a, b) if c.id == t.id => Some((k, a, b)),
+                _ => None,
+            },
+            _ => None,
+        }
+        match next {
+            Some((k, a, b)) => {
+                arms.push((k, a))
+                tail = b
+            },
+            None => {
+                break
+            },
+        }
+    }
+    if arms.len() < switch_min() {
+        return None
+    }
+    // a repeated literal (its later arm never runs) would be a repeated C
+    // case: such a match stays as it is
+    let ks = arms.map(|arm| arm.0).sort()
+    for n in 1..<ks.len() {
+        if ks[n] == ks[n - 1] {
+            return None
+        }
+    }
+    if has_break(tail) {
+        return None
+    }
+    for arm in arms {
+        if has_break(arm.1) {
+            return None
+        }
+    }
+    Some(IntChain { x, arms, fallback: tail })
+}
+
+fn is_quiet(s: ir.Stmt) -> Bool {
+    match s {
+        Line(_) => true,
+        Drop(v) => is_scalar(v.ty),
+        _ => false,
+    }
+}
+
+fn switch_of(self: Cg, ind: Str, ch: IntChain) -> Cg {
+    let mut c = self.line(ind, "switch ({var(ch.x)}) \{")
+    for arm in ch.arms {
+        c = c.line(ind, "case {int_lit(arm.0)}: \{").stmts(ind + "  ", arm.1).line(ind, "  break;").line(ind, "}")
+    }
+    c.line(ind, "default: \{").stmts(ind + "  ", ch.fallback).line(ind, "}").line(ind, "}")
 }
 
 // The loops in `ss`, as the planner counts them: through `if` and loops.
@@ -2888,6 +3143,7 @@ pub fn program(ro: lower.Ro, files: List[diag.Source], prog: ir.Program, runtime
         sql_api: false,
         cstructs: [],
         wrappers: [],
+        kepts: [],
         bjobs: [],
         vols: [],
         pure: pure.analyse(prog),
@@ -3000,6 +3256,11 @@ pub fn program(ro: lower.Ro, files: List[diag.Source], prog: ir.Program, runtime
     let mut cbdefs: List[Str] = []
     for w in c.wrappers {
         let (d, c1) = c.ffi_callback_def(w)
+        c = c1
+        cbdefs.push(d)
+    }
+    for (i, ps) in c.kepts.with_index() {
+        let (d, c1) = c.kept_def(i, ps)
         c = c1
         cbdefs.push(d)
     }

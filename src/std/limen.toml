@@ -29,9 +29,11 @@ postgres = { path = ".", caps = ["net", "rand"] }
 redis = { path = ".", caps = ["net"] }
 stream = { path = ".", caps = ["fs"] }
 websocket = { path = ".", caps = ["net", "rand"] }
+crypto = { path = ".", caps = ["rand"] }
+unicode = { path = ".", caps = [] }
 
 # Modules whose foreign blocks are part of the standard library's trusted
 # base: their C calls need no Foreign capability, so a program using them
 # only grants what the module's own functions take (sql: an Fs).
 [trust]
-foreign = ["sql"]
+foreign = ["sql", "crypto"]

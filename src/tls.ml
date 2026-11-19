@@ -24,6 +24,10 @@ external close : session -> unit = "limen_tls_close"
 external ctx_free : ctx -> unit = "limen_tls_ctx_free"
 external available : unit -> bool = "limen_tls_available"
 
+(* The crypto module's runtime helper: [crypto op a b c d], the result after
+   a status byte (runtime/limen_tls.h, vcrypto). *)
+external crypto : int -> string -> string -> string -> string -> string = "limen_crypto_op"
+
 let want_read = -1
 let want_write = -2
 

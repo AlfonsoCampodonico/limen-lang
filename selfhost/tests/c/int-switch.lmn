@@ -1,0 +1,113 @@
+// A match on integer literals with enough arms becomes a C switch; one
+// with a `break` for an outer loop, a repeated literal, a guard or too few
+// arms stays a chain of tests.
+fn day(n: Int) -> Str {
+    match n {
+        1 => "mon",
+        2 => "tue",
+        3 => "wed",
+        4 => "thu",
+        5 => "fri",
+        6 => "sat",
+        7 => "sun",
+        -100 => "neg",
+        0x7fff_ffff_ffff_ffff => "max",
+        _ => "?",
+    }
+}
+
+fn small(b: UInt8) -> Int {
+    match b {
+        0 => 10,
+        1 => 11,
+        2 => 12,
+        3 => 13,
+        4 => 14,
+        5 => 15,
+        6 => 16,
+        255 => 99,
+        x => x.to_int(),
+    }
+}
+
+fn repeated(n: Int) -> Int {
+    match n {
+        1 => 1,
+        2 => 2,
+        3 => 3,
+        4 => 4,
+        5 => 5,
+        6 => 6,
+        7 => 7,
+        1 => 100,
+        _ => 0,
+    }
+}
+
+fn guarded(n: Int, big: Bool) -> Int {
+    match n {
+        1 => 1,
+        2 => 2,
+        3 => 3,
+        4 if big => 40,
+        4 => 4,
+        5 => 5,
+        6 => 6,
+        7 => 7,
+        8 => 8,
+        _ => 0,
+    }
+}
+
+fn main(root: Root) {
+    let mut out: List[Str] = []
+    for n in [0, 1, 4, 7, 8, -100, 0x7fff_ffff_ffff_ffff] {
+        out.push(day(n))
+    }
+    root.stdout.print(out.join(" "))
+    let bs: List[UInt8] = [0, 6, 7, 255]
+    root.stdout.print("{bs.map(|b| small(b))} {repeated(1)} {guarded(4, true)} {guarded(4, false)} {guarded(8, true)}")
+    // a `break` inside an arm leaves the loop, not a switch
+    let mut i = 0
+    let mut seen: List[Int] = []
+    while true {
+        match i {
+            0 => seen.push(0),
+            1 => seen.push(10),
+            2 => seen.push(20),
+            3 => seen.push(30),
+            4 => seen.push(40),
+            5 => seen.push(50),
+            6 => seen.push(60),
+            7 => {
+                break
+            },
+            _ => seen.push(-1),
+        }
+        i = i + 1
+    }
+    // and `continue` inside a switch still continues the loop
+    let mut odd: List[Int] = []
+    for k in 0..<12 {
+        match k % 9 {
+            0 => {
+                continue
+            },
+            1 => odd.push(k),
+            2 => {
+                continue
+            },
+            3 => odd.push(k),
+            4 => {
+                continue
+            },
+            5 => odd.push(k),
+            6 => {
+                continue
+            },
+            7 => odd.push(k),
+            _ => odd.push(-k),
+        }
+    }
+    root.stdout.print("{seen} {odd}")
+}

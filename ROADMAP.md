@@ -85,11 +85,20 @@ Done when a crash in a native build shows the Limen line that caused it
   the standard library, written in Limen, with pools and TLS (Postgres
   through `Conn.start_tls`, verified by default).
 - WebSockets. Done: the `websocket` module, server and client.
-- Encryption and public-key signatures beyond TLS.
+- Encryption and public-key signatures beyond TLS. Done: the `crypto`
+  module, ChaCha20-Poly1305, Ed25519 and X25519 on OpenSSL, with no
+  algorithm to choose.
 - Integer types besides `Int` outside FFI (bytes, `u32`) and a character
-  type with Unicode beyond `chars()` (case folding, normalisation).
+  type with Unicode beyond `chars()` (case folding, normalisation). Done:
+  `UInt8` to `UInt64`, wrapping, never mixed with `Int`. Decided: no
+  character type; a character stays a one-character `Str` and its number
+  an `Int`, and the `unicode` module (Unicode 17.0) folds case, maps it in
+  full and normalises to NFC and NFD. A long `match` on integer literals
+  now compiles to a C `switch`, which its tables needed.
 - C callbacks that C can keep and call later, for libraries that call back
-  on their own schedule.
+  on their own schedule. Done: `Kept[fn(...)]`, whose argument is a
+  channel. Each call from C, from any thread, sends its arguments on it
+  without waiting, so no Limen code runs on C's threads.
 
 Done when a program can read a gzipped log larger than memory, line by
 line, and write rows to Postgres.

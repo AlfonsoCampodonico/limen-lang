@@ -1,0 +1,46 @@
+use crypto
+use hex
+
+fn h(s: Str) -> Bytes {
+    match hex.decode(s) {
+        Ok(b) => b,
+        Err(e) => panic(e),
+    }
+}
+
+fn main(root: Root) {
+    // RFC 8439, 2.8.2
+    let key = h("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")
+    let nonce = h("070000004041424344454647")
+    let aad = h("50515253c0c1c2c3c4c5c6c7").to_str()
+    let text = "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.".to_bytes()
+    match crypto.encrypt(key, nonce, text, aad) {
+        Ok(c) => {
+            root.stdout.print("tag {hex.encode(c.slice(c.len() - 16, c.len()))}")
+            root.stdout.print("starts {hex.encode(c.slice(0, 8))}")
+            root.stdout.print("decrypts {crypto.decrypt(key, nonce, c, aad).map(|p| p == text)}")
+        },
+        Err(e) => root.stdout.print(e),
+    }
+    // RFC 8032, test 1
+    let sk = h("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+    let pk = crypto.public_key(sk)
+    root.stdout.print("public {hex.encode(pk)}")
+    let sig = crypto.sign(sk, bytes([]))
+    root.stdout.print("signature {hex.encode(sig)}")
+    root.stdout.print("verifies {crypto.verify(pk, bytes([]), sig)}, forged {crypto.verify(pk, bytes([1]), sig)}")
+    // RFC 7748, 6.1
+    let alice = h("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
+    let bob = h("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb")
+    root.stdout.print("alice public {hex.encode(crypto.agreement_public(alice))}")
+    let s1 = crypto.agree(alice, crypto.agreement_public(bob))
+    let s2 = crypto.agree(bob, crypto.agreement_public(alice))
+    root.stdout.print("shared {s1.map(|s| hex.encode(s))}, same {s1 == s2}")
+    // seal and open
+    let k = crypto.key(root.rand)
+    let sealed = crypto.seal(root.rand, k, "hello".to_bytes(), associated: "id 7")
+    root.stdout.print("open {crypto.open(k, sealed, associated: "id 7").map(|b| b.to_str())}")
+    root.stdout.print("wrong data {crypto.open(k, sealed, associated: "id 8")}")
+    let changed = sealed.slice(0, 20) + bytes([sealed[20] ^ 1]) + sealed.slice(21, sealed.len())
+    root.stdout.print("changed {crypto.open(k, changed, associated: "id 7").is_err()}")
+}

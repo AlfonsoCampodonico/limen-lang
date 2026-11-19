@@ -71,6 +71,7 @@ Statements are separated by a newline or `;`. Two statements on one line without
 | Type | Values | Notes |
 | --- | --- | --- |
 | `Int` | 64-bit signed integers | Arithmetic wraps on overflow, the same in both backends. `x / -1` and `x % -1` wrap too instead of trapping, `abs()` of the smallest Int is itself, and `Float.to_int()` saturates (NaN gives 0). |
+| `UInt8`, `UInt16`, `UInt32`, `UInt64` | unsigned integers of 8, 16, 32 and 64 bits | Arithmetic wraps modulo 2^bits; a shift by the width or more gives 0. An integer literal takes the type where one is expected (`let b: UInt8 = 255`, `[1, 2]` as a `List[UInt16]`, a match arm) and must fit (E0201); there is no unary minus. A UInt does not mix with `Int` (E0201): convert with `n.to_uint8()` and the like, which wrap, and `u.to_int()`. For bytes, hashes and C's formats. |
 | `Float` | IEEE 754 double | No fused multiply-add, so both backends give identical results. |
 | `Bool` | `true`, `false` | |
 | `Str` | immutable byte strings | `len()` counts bytes. |
@@ -94,7 +95,7 @@ Statements are separated by a newline or `;`. Two statements on one line without
 | `Root`, `Net`, `Fs`, `Stdout`, `Stderr`, `Clock`, `Listen`, `Listener`, `Conn`, `Rand`, `Stdin`, `Env`, `Exec`, `Foreign` | capabilities | Cannot be created by programs; can be passed, returned and stored in struct fields, enum payloads and collections (section 9). |
 | user `struct` and `enum` | | Optionally generic (section 4). |
 
-There is no separate character type: a character is a `Str` holding one UTF-8 code point. `s.chars()` gives them as a `List[Str]`, `for c in s.chars() { ... }` visits them, and `s.bytes()` gives the bytes (section 11). One type for text keeps the API small; `len()` still counts bytes.
+There is no separate character type: a character is a `Str` holding one UTF-8 code point, and its number an `Int`. `s.chars()` gives them as a `List[Str]`, `for c in s.chars() { ... }` visits them, `s.bytes()` gives the bytes (section 11), and the `unicode` module the code points, full case mapping, case folding and the normal forms NFC and NFD (section 19). One type for text keeps the API small; `len()` still counts bytes.
 
 `lo..<hi` is the `List[Int]` from `lo` up to but not including `hi`, empty when `hi <= lo`. It counts in loops, `for i in 0..<n { ... }`, without building the list, and is a list everywhere else: `(1..<4).map(|x| x * x)`. There is one form, exclusive, spelled `..<` as in Swift and Kotlin so it cannot be misread; for an inclusive end write `0..<n + 1`.
 
@@ -647,7 +648,7 @@ Used in `match` arms:
 | --- | --- |
 | `_` | anything |
 | `name` (lowercase) | anything, binding it to `name` |
-| `42`, `-1`, `"text"`, `true` | that literal |
+| `42`, `-1`, `"text"`, `true` | that literal; an integer literal matches a `UInt` value too, and must fit in it |
 | `Variant` (uppercase) | a payload-less variant |
 | `Variant(p1, p2)` | a variant, matching its payload against sub-patterns |
 | `Enum.Variant(...)` | a variant, qualified |
@@ -887,9 +888,25 @@ qsort(f, buf, n, 1, by_byte)
 
 - The argument is a top-level function, named (E0332): C calls it with its arguments alone, so it has nowhere to keep a closure's captured values. A callback may take a `Foreign` first, before what C passes: it gets the Foreign value the foreign call was given, so it can read C memory and call C. It has no other capability.
 - Its parameters are `Int`, `Int32`, `Float`, `Bool`, `Str` and `Handle` (at most 8 integer-like and 8 `Float`); a `Str` is copied from the NUL-terminated C string. It returns one of those but `Str`, or `()`; an `Int32` result out of range is a panic.
-- C may call it only during the foreign call that was given it, and on the same thread. If C keeps the pointer and calls it after the call returns, or from another thread, the behaviour is undefined (both backends stop the program where they can tell).
+- C may call it only during the foreign call that was given it, and on the same thread. If C keeps the pointer and calls it after the call returns, or from another thread, the behaviour is undefined (both backends stop the program where they can tell). For a callback C keeps, use `Kept` (below).
 - Nothing unwinds through C's frames. A panic in a callback ends the program with `panic: in a callback from C: ...`, past every `catch` and task boundary, and so does waiting in one (on a group, a channel, a timer or input), which would leave C's frames on a task that moves.
 - A callback can make foreign calls with callbacks of their own. The interpreter has room for 32 callbacks in use at once (each foreign call takes its own until it returns); more is a panic there.
+
+**Kept callbacks.** A library that calls back on its own schedule (a timer, an event loop, a thread it starts) keeps the pointer and calls it later, perhaps from a thread of its own, where no Limen code can run. A parameter `Kept[fn(A, B)]` is such a pointer, and its argument is a channel: each call from C sends its arguments on it, and a task receives them as any other message.
+
+```
+foreign "c" {
+    fn pthread_create(thread: Out[Handle], attr: Handle, start: Kept[fn(Handle)], arg: Handle) -> Int32
+}
+
+let started: Chan[Handle] = channel(0)
+let (rc, t) = pthread_create(f, Handle { addr: 0 }, started, Handle { addr: 1 })
+let arg = started.recv()                        // Some(Handle { addr: 1 }), from the new thread
+```
+
+- The parameters are those of a callback, and it returns nothing (`Kept[fn(...) -> T]` is error E0330): C gets no answer from a channel. The channel carries the one parameter, a tuple of several (`Chan[(Handle, Int)]` for `Kept[fn(Handle, Int32)]`), or `()` for none; an `Int32` arrives as an `Int`, a `Str` is copied when C calls.
+- A call from C never waits: a task waiting to receive gets the value at once; otherwise it is queued, past the channel's capacity if need be. On a closed channel it is dropped.
+- The pointer stays valid for the rest of the program, since C may hold it: the same channel always gives the same pointer, and a program can give C 32 channels at most (more is a panic). While C holds one, a task waiting on it is not a deadlock.
 
 Ownership at the boundary:
 
@@ -1227,7 +1244,8 @@ Binary data, kept apart from text so a byte buffer is never printed or concatena
 
 | Type | Methods |
 | --- | --- |
-| `Int` | `to_str()`, `to_float()`, `abs()`, `min(n)`, `max(n)`, `to_char()` (the UTF-8 text of a code point, `65.to_char()` is `"A"`; invalid code points give U+FFFD), `shift_right_unsigned(n)` (`>>` shifting in zeros instead of the sign: `(-1).shift_right_unsigned(60)` is `15`; a count of 64 or more gives `0`, a negative one panics) |
+| `Int` | `to_uint8()`, `to_uint16()`, `to_uint32()`, `to_uint64()` (wrapping: `(-1).to_uint8()` is `255`), `to_str()`, `to_float()`, `abs()`, `min(n)`, `max(n)`, `to_char()` (the UTF-8 text of a code point, `65.to_char()` is `"A"`; invalid code points give U+FFFD), `shift_right_unsigned(n)` (`>>` shifting in zeros instead of the sign: `(-1).shift_right_unsigned(60)` is `15`; a count of 64 or more gives `0`, a negative one panics) |
+| `UInt8` to `UInt64` | `to_int()` (a `UInt64` past the largest `Int` wraps to a negative one), `to_float()`, `to_str()`, `to_uint8()` to `to_uint64()` (wrapping), `min(n)`, `max(n)`, `rotate_left(n)`, `rotate_right(n)` (by `n` modulo the width) |
 | `Float` | `to_str()`, `to_int()` (truncates; NaN gives 0), `abs()`, `sqrt()`, `to_fixed(d)` (exactly `d` decimals, 0 to 30, rounded as C's printf rounds: `3.14159.to_fixed(2)` is `"3.14"`; NaN and infinities give `nan`, `inf`, `-inf`) |
 | `Bool` | `to_str()` |
 
@@ -1817,13 +1835,18 @@ The standard library is checked like a dependency. `src/std/limen.toml` lists th
 
 | Module | May take |
 | --- | --- |
-| `json`, `list`, `text`, `format`, `regex`, `errors`, `hex`, `base64`, `hash`, `csv`, `url`, `flags`, `compress` | nothing: pure |
+| `json`, `list`, `text`, `format`, `regex`, `errors`, `hex`, `base64`, `hash`, `csv`, `url`, `flags`, `compress`, `unicode` | nothing: pure |
 | `http` | `net` (Net, Conn) and `listen` (Listener, Conn) |
 | `time` | `clock` and `fs`, for `within` and `load_zone` alone |
 | `sql` | `fs` (the database file's directory); trusted with C (`[trust] foreign = ["sql"]`) to call SQLite |
 | `log` | `stdout`, `stderr` and `clock`: a Logger holds where it writes and, for timestamps, a clock |
 | `path` | `fs`, for `walk` alone |
 | `uuid` | `rand` and `clock`, for `v4` and `v7` alone |
+| `postgres` | `net` and `rand` (SCRAM's nonce) |
+| `redis` | `net` |
+| `stream` | `fs` |
+| `websocket` | `net` and `rand` (a client's masking keys) |
+| `crypto` | `rand` (keys and nonces); trusted with the runtime's own helper, which calls OpenSSL as TLS does |
 
 A module missing from the list may take nothing. `limen caps FILE` shows what each std function takes. What stays trusted, and why:
 
@@ -2213,6 +2236,31 @@ fn checksum(chunks: List[Bytes]) -> Str {
 }
 ```
 
+### crypto
+
+Encryption and signatures beyond TLS, on OpenSSL as TLS is. The algorithms are fixed, so there is nothing to choose wrong: ChaCha20-Poly1305 for sealing (RFC 8439), Ed25519 for signatures (RFC 8032) and X25519 for agreeing a key (RFC 7748). Keys are plain `Bytes`; keep secret ones out of logs, since printing shows them. Fresh keys and nonces come from `Rand`, so a function that makes one takes it.
+
+| Item | Meaning |
+| --- | --- |
+| `key(rand) -> Bytes` | a fresh 32-byte secret key for `seal` and `open` |
+| `seal(rand, key, plaintext, associated: Str = "") -> Bytes` | encrypted and authenticated under a fresh random nonce: 12 bytes of nonce, the ciphertext, a 16-byte tag. `associated` is authenticated but not encrypted (a header, a record's id); `open` needs the same |
+| `open(key, sealed, associated = "") -> Result[Bytes, Str]` | what `seal` sealed, or an Err when the key or the associated data differs or any byte was changed |
+| `encrypt(key, nonce, plaintext, associated = "")`, `decrypt(...)` | ChaCha20-Poly1305 with a nonce you choose, for another program's format; a nonce must never repeat under one key |
+| `signing_key(rand)`, `public_key(signing)`, `sign(signing, message) -> Bytes`, `verify(public, message, signature) -> Bool` | Ed25519: a 32-byte secret, its 32-byte public key, 64-byte signatures |
+| `agreement_key(rand)`, `agreement_public(private)`, `agree(private, peer_public) -> Result[Bytes, Str]` | X25519: both sides get the same 32-byte secret from their own private key and the other's public key; hash it with what the two sides agreed on before using it as a key. An all-zero result (a bad public key) is an Err |
+
+A key of the wrong size is a panic where it was passed. The interpreter and native programs give the same bytes; both are checked against the RFCs' test vectors.
+
+```
+use crypto
+
+fn main(root: Root) {
+    let key = crypto.key(root.rand)
+    let sealed = crypto.seal(root.rand, key, "a secret".to_bytes())
+    root.stdout.print("{crypto.open(key, sealed).map(|b| b.to_str())}")      // Ok("a secret")
+}
+```
+
 ### csv
 
 CSV as RFC 4180 has it: fields separated by commas, quoted with `"` when they hold a comma, a quote (written twice) or a line break, and lines ending in `\n` or `\r\n`. Reading is a little lenient: rows may differ in length (`parse_maps` checks them against the header), blank lines are skipped, and a UTF-8 byte order mark at the start is dropped. Pure functions.
@@ -2225,6 +2273,20 @@ CSV as RFC 4180 has it: fields separated by commas, quoted with `"` when they ho
 | `write(rows) -> Str`, `write_with(rows, sep)` | one line per row, each ending in `\n`; fields are quoted only when they need it |
 | `write_maps(header, rows) -> Str` | a header line, then each map's values in the header's order, `""` for a name the map lacks |
 | `escape(field) -> Str` | one field as it goes in a line: `escape("a,b")` is `"\"a,b\""` |
+
+### unicode
+
+Text beyond `chars()`, from Unicode 17.0: case folding for comparing text people typed, full upper and lower case, and the normal forms NFC and NFD, so the same text typed two ways compares equal. Pure functions; the tables are generated as functions, so a native program looks a code point up with one `switch` and builds nothing when it starts.
+
+| Item | Meaning |
+| --- | --- |
+| `code_points(s) -> List[Int]`, `from_code_points(cps) -> Str` | the code points of the UTF-8 text, and back; a malformed byte reads as U+FFFD |
+| `fold(s)` | case-folded, the form to compare in when case does not matter: `fold("Straße") == fold("STRASSE")` |
+| `upper(s)`, `lower(s)` | the full mappings, which can change the length: `upper("ß")` is `"SS"`, where `Str.to_upper` changes ASCII alone. Per code point, so a final sigma lowers to `σ` |
+| `nfd(s)`, `nfc(s)` | taken apart into base characters and combining marks in their canonical order, and put back together into the fewest characters: `nfc("e\u{301}") == "\u{e9}"` |
+| `same_ignoring_case(a, b) -> Bool` | `fold(nfd(a)) == fold(nfd(b))` |
+
+There are no compatibility forms (NFKC, NFKD) and no locale rules, such as Turkish dotted and dotless i.
 
 ### url
 
@@ -2403,10 +2465,10 @@ fn main(root: Root) {
 The core language is close to complete; what is missing is mostly around it.
 
 - Platforms: no Windows (fibers, the poller and the sandbox are macOS and Linux only); x86-64 has not run on real hardware; no cross-compilation or WebAssembly target.
-- Standard library: no encryption or public-key signatures (hashing and HMAC only), compression only of whole values (no streaming inflate), and Unicode support stops at `chars()`.
-- Tooling: no debugger mapping (native code is C without `#line`), profiler or test coverage; no incremental checking.
+- Standard library: no compatibility normal forms (NFKC, NFKD) or locale-specific case rules in `unicode`.
+- Tooling: no incremental checking; test coverage only in the interpreter.
 - Distribution: releases for macOS on Apple silicon (Homebrew) and Linux on x86-64 and arm64 (`.deb` and tarballs), but no apt repository; the package index has no hosted default; no stability promise yet.
-- Language: no default parameter values, no integer types besides `Int` outside FFI, no code generation for repetitive cases such as JSON for a struct, and C callbacks cannot be kept for later.
+- Language: no signed integer types other than `Int` outside FFI, and conversions the compiler writes only for JSON and SQL rows.
 - A native backend other than C: Cranelift was decided against, since native code is C compiled by the system's compiler.
 
 [ROADMAP.md](ROADMAP.md) has the details, in order.

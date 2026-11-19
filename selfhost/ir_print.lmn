@@ -91,6 +91,7 @@ fn cty(c: ffi.CTy) -> Str {
         Unit => "Unit",
         Struct(n, fs) => "Struct({n}\{" + fs.map(|f| f.0 + ":" + cty(f.1)).join(",") + "})",
         Fn(ps, r) => "Fn(" + ps.map(cty).join(",") + ")->" + cty(r),
+        Kept(ps) => "Kept(" + ps.map(cty).join(",") + ")",
     }
 }
 

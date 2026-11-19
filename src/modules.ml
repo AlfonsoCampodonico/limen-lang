@@ -779,7 +779,7 @@ let expand_table (it : item) : item list =
    type has. *)
 let builtin_type_names =
   [ "Int"; "Int32"; "Float"; "Bool"; "Str"; "Bytes"; "List"; "Map"; "Array"; "Option"; "Result"; "IoError"; "Chan"; "Atomic"; "Shared"; "Root"; "Net";
-    "Fs"; "Listen"; "Listener"; "Conn"; "Env"; "Exec"; "Foreign"; "Revoker"; "Stdout"; "Stderr"; "Stdin"; "Clock"; "Rand"; "Handle"; "Out" ]
+    "Fs"; "Listen"; "Listener"; "Conn"; "Env"; "Exec"; "Foreign"; "Revoker"; "Stdout"; "Stderr"; "Stdin"; "Clock"; "Rand"; "Handle"; "Out"; "Kept" ]
 
 let check_aliases (m : modinfo) =
   List.iter

@@ -137,6 +137,10 @@ let rec resolve env (te : ty_expr) : ty =
     | "Bool", _ -> TBool
     | "Str", _ -> TStr
     | "Bytes", _ -> TBytes
+    | "UInt8", _ -> TUInt 8
+    | "UInt16", _ -> TUInt 16
+    | "UInt32", _ -> TUInt 32
+    | "UInt64", _ -> TUInt 64
     | "List", [ x ] -> TList x
     | "Root", _ -> TCap Root
     | "Net", _ -> TCap Net
@@ -291,10 +295,12 @@ let rec lower f (e : expr) : I.atom =
     | EUn (Not, a) ->
       let x = lower f a in
       tmp f TBool (I.Not x)
-    | EUn (BitNot, a) ->
-      (* `~x` is `x ^ -1` *)
+    | EUn (BitNot, a) -> (
+      (* `~x` is `x ^ -1`, or x xor every bit of its unsigned type *)
       let x = lower f a in
-      tmp f TInt (I.Bin (BitXor, TInt, x, I.AInt (-1L), e.espan))
+      match tyof f a with
+      | TUInt n as t -> tmp f t (I.Bin (BitXor, t, x, I.AInt (if n = 64 then -1L else Int64.sub (Int64.shift_left 1L n) 1L), e.espan))
+      | _ -> tmp f TInt (I.Bin (BitXor, TInt, x, I.AInt (-1L), e.espan)))
     | ECall (callee, args) -> lower_call f e callee args ty
     | ENamed _ -> failwith "internal: the checker puts named arguments in order"
     | EMethod ({ edesc = EVar en; _ }, name, _, args) when is_enum_name f en ->
@@ -994,6 +1000,7 @@ and lower_method f e recv name args ty =
       match rt with
       | TStr -> "str_"
       | TBytes -> "bytes_"
+      | TUInt _ -> "uint_"
       | TInt -> "int_"
       | TFloat -> "float_"
       | TBool -> "bool_"

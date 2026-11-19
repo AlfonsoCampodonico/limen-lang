@@ -16,6 +16,7 @@
      Out[T]         T *             T is Int, Int32, Float or Handle: an out-parameter
      a C struct     struct { ... }  declared in the block, passed and returned by value
      fn(A) -> R     function ptr    a callback: a top-level Limen function C calls
+     Kept[fn(A)]    function ptr    a callback C keeps: a channel each call sends A on
 
    A Str result is copied from a NUL-terminated C string (NULL gives ""). A
    function's Limen type takes a Foreign capability first, then the parameters
@@ -39,6 +40,9 @@ type cty =
   | Unit
   | Struct of string * (string * cty) list (* a C struct by value: its Limen name and its fields *)
   | Fn of cty list * cty (* a callback: C calls a top-level Limen function through it *)
+  | Kept of cty list
+      (* a callback C may keep and call at any time, from any thread: each
+         call sends its arguments on a channel, and returns nothing *)
 
 type param = { name : string; cty : cty; out : bool }
 
@@ -74,6 +78,15 @@ let rec limen_ty = function
   | Unit -> TUnit
   | Struct (n, _) -> TNamed (n, [])
   | Fn (ps, r) -> TFn (List.map limen_ty ps, limen_ty r)
+  | Kept ps -> TChan (kept_elem ps)
+
+(* What a kept callback's channel carries: its one parameter, a tuple of
+   several, or `()` for none. *)
+and kept_elem ps =
+  match ps with
+  | [] -> TUnit
+  | [ p ] -> limen_ty p
+  | ps -> TNamed (Ast.tuple_name (List.length ps), List.map limen_ty ps)
 
 let c_name = function
   | Int -> "int64_t"
@@ -84,7 +97,7 @@ let c_name = function
   | Bytes -> "const void *"
   | Handle -> "void *"
   | Unit -> "void"
-  | Struct _ | Fn _ -> invalid_arg "Ffi.c_name" (* named by the native backend *)
+  | Struct _ | Fn _ | Kept _ -> invalid_arg "Ffi.c_name" (* named by the native backend *)
 
 (* The integer-like and Float values a parameter list passes, a struct's
    fields each counting as one. *)
@@ -144,7 +157,7 @@ let ident_ok s =
   && String.for_all (fun c -> (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c = '_') s
 
 let boundary_types =
-  "Int, Int32, Float, Bool, Str, Bytes, Handle, a struct declared in a foreign block, a callback `fn(...) -> T`, or Out[Int | Int32 | Float | Handle] for a parameter"
+  "Int, Int32, Float, Bool, Str, Bytes, Handle, a struct declared in a foreign block, a callback `fn(...) -> T`, a kept callback `Kept[fn(...)]`, or Out[Int | Int32 | Float | Handle] for a parameter"
 
 let field_cty (te : Ast.ty_expr) =
   match te.tdesc with
@@ -190,12 +203,16 @@ let struct_fields (s : Ast.struct_decl) : ((string * cty) list, (Span.t * string
      [sql_syms], which the module using it must declare.
    - limen_bytes_int(b, at), limen_bytes_float(b, at): the int64 or double
      at byte [at] of [b], in the machine's byte order; limen_float_bits(x):
-     the bits of a Float, as an Int. *)
+     the bits of a Float, as an Int.
+   - limen_crypto(op, a, b, c, d): the crypto module's operations on
+     OpenSSL (vcrypto in runtime/limen_tls.h), the result after a status
+     byte. A program that calls it links OpenSSL, as a TLS program does. *)
 let runtime_fns =
   [ ("limen_copy", ([ Handle; Int ], Bytes)); ("limen_handle_new", ([ Handle ], Int)); ("limen_handle_acquire", ([ Int ], Handle));
     ("limen_handle_release", ([ Int ], Handle)); ("limen_handle_close", ([ Int ], Handle));
     ("limen_sql_run", ([ Handle; Str; Bytes; Int ], Bytes)); ("limen_bytes_int", ([ Bytes; Int ], Int));
-    ("limen_bytes_float", ([ Bytes; Int ], Float)); ("limen_float_bits", ([ Float ], Int)) ]
+    ("limen_bytes_float", ([ Bytes; Int ], Float)); ("limen_float_bits", ([ Float ], Int));
+    ("limen_crypto", ([ Int; Bytes; Bytes; Bytes; Bytes ], Bytes)) ]
 
 (* The SQLite functions limen_sql_run calls, in the order of its table
    (the W_SQL_* enum in runtime/limen_sql.h). *)
@@ -277,6 +294,15 @@ let of_decl ?(structs : string -> Ast.struct_decl option = fun _ -> None) (d : A
             err inner.tspan "an `Out` parameter holds an Int, Int32, Float or Handle";
             { name = p.prm_name; cty = Int; out = true })
         | TyFn _ -> { name = p.prm_name; cty = Option.get (callback te); out = false }
+        | TyName ("Kept", [ ({ tdesc = TyFn (_, r); _ } as inner) ]) -> (
+          match callback inner with
+          | Some (Fn (ps, Unit)) -> { name = p.prm_name; cty = Kept ps; out = false }
+          | _ ->
+            err r.tspan "a kept callback returns nothing: C gets no answer from a channel";
+            { name = p.prm_name; cty = Kept []; out = false })
+        | TyName ("Kept", _) ->
+          err te.tspan "`Kept` holds the callback's C type, as in `Kept[fn(Handle, Int32)]`";
+          { name = p.prm_name; cty = Kept []; out = false }
         | _ -> (
           match base te with
           | Some t -> { name = p.prm_name; cty = t; out = false }
@@ -337,7 +363,7 @@ let of_decl ?(structs : string -> Ast.struct_decl option = fun _ -> None) (d : A
      List.iteri
        (fun i p ->
          match p.cty with
-         | (Struct _ | Fn _) when not p.out -> err spans.(k + i) "an argument after `...` is Int, Int32, Float, Bool, Str, Bytes or Handle"
+         | (Struct _ | Fn _ | Kept _) when not p.out -> err spans.(k + i) "an argument after `...` is Int, Int32, Float, Bool, Str, Bytes or Handle"
          | _ when p.out -> err spans.(k + i) "an `Out` parameter goes before `...`"
          | _ -> ())
        rest);

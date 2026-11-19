@@ -243,3 +243,110 @@ static void vtls_free(VTls *t) {
   pthread_mutex_destroy(&t->mu);
   free(t);
 }
+
+/* ---------- cryptography beyond TLS: the crypto module ----------
+
+   One entry point for the std module's runtime helper limen_crypto, so
+   both backends run the same code. op 1 seals with ChaCha20-Poly1305 (a:
+   the 32-byte key, b: the 12-byte nonce, c: associated data, d: the
+   plaintext; out: ciphertext then the 16-byte tag), 2 opens (d:
+   ciphertext then tag), 3 gives the Ed25519 public key of a 32-byte seed
+   (a), 4 signs d with the seed a, 5 verifies the signature c of d against
+   the public key a (out: one byte, 1 or 0), 6 gives the X25519 public key
+   of the private key a, 7 agrees a shared secret from the private key a
+   and the peer's public key b (refusing the all-zero result of a
+   low-order point). 0 and *out (malloc'd) on success, -1 and err on
+   failure. */
+#include <openssl/evp.h>
+static int vcrypto(int op, const unsigned char *a, size_t an, const unsigned char *b, size_t bn,
+                   const unsigned char *c, size_t cn, const unsigned char *d, size_t dn,
+                   unsigned char **out, size_t *outn, char *err, size_t en) {
+  *out = NULL; *outn = 0;
+  if (op == 1 || op == 2) {
+    if (an != 32) { snprintf(err, en, "crypto: a key is 32 bytes, not %zu", an); return -1; }
+    if (bn != 12) { snprintf(err, en, "crypto: a nonce is 12 bytes, not %zu", bn); return -1; }
+    if (op == 2 && dn < 16) { snprintf(err, en, "crypto: the message is shorter than its tag"); return -1; }
+    size_t textn = op == 1 ? dn : dn - 16;
+    unsigned char *o = (unsigned char *)malloc(textn + 16 + 1);
+    EVP_CIPHER_CTX *x = EVP_CIPHER_CTX_new();
+    int len = 0, ok = o && x;
+    ok = ok && EVP_CipherInit_ex(x, EVP_chacha20_poly1305(), NULL, NULL, NULL, op == 1) == 1;
+    ok = ok && EVP_CIPHER_CTX_ctrl(x, EVP_CTRL_AEAD_SET_IVLEN, 12, NULL) == 1;
+    ok = ok && EVP_CipherInit_ex(x, NULL, NULL, a, b, op == 1) == 1;
+    ok = ok && (cn == 0 || EVP_CipherUpdate(x, NULL, &len, c, (int)cn) == 1);
+    ok = ok && (textn == 0 || EVP_CipherUpdate(x, o, &len, d, (int)textn) == 1);
+    if (ok && op == 2) ok = EVP_CIPHER_CTX_ctrl(x, EVP_CTRL_AEAD_SET_TAG, 16, (void *)(d + textn)) == 1;
+    int fin = ok ? EVP_CipherFinal_ex(x, o + textn, &len) : 0;
+    if (ok && op == 1 && fin == 1) ok = EVP_CIPHER_CTX_ctrl(x, EVP_CTRL_AEAD_GET_TAG, 16, o + textn) == 1;
+    if (x) EVP_CIPHER_CTX_free(x);
+    if (!ok || fin != 1) {
+      free(o);
+      if (ok && op == 2) snprintf(err, en, "crypto: the message was changed, or the key, nonce or associated data is not the one it was sealed with");
+      else snprintf(err, en, "crypto: ChaCha20-Poly1305 failed");
+      return -1;
+    }
+    *out = o; *outn = op == 1 ? textn + 16 : textn;
+    return 0;
+  }
+  if (op == 3 || op == 6) {
+    if (an != 32) { snprintf(err, en, "crypto: a private key is 32 bytes, not %zu", an); return -1; }
+    EVP_PKEY *k = EVP_PKEY_new_raw_private_key(op == 3 ? EVP_PKEY_ED25519 : EVP_PKEY_X25519, NULL, a, 32);
+    unsigned char *o = (unsigned char *)malloc(32);
+    size_t n = 32;
+    int ok = k && o && EVP_PKEY_get_raw_public_key(k, o, &n) == 1 && n == 32;
+    if (k) EVP_PKEY_free(k);
+    if (!ok) { free(o); snprintf(err, en, "crypto: cannot make the public key"); return -1; }
+    *out = o; *outn = 32;
+    return 0;
+  }
+  if (op == 4) {
+    if (an != 32) { snprintf(err, en, "crypto: a signing key is 32 bytes, not %zu", an); return -1; }
+    EVP_PKEY *k = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL, a, 32);
+    EVP_MD_CTX *m = EVP_MD_CTX_new();
+    unsigned char *o = (unsigned char *)malloc(64);
+    size_t n = 64;
+    int ok = k && m && o && EVP_DigestSignInit(m, NULL, NULL, NULL, k) == 1 && EVP_DigestSign(m, o, &n, d, dn) == 1 && n == 64;
+    if (m) EVP_MD_CTX_free(m);
+    if (k) EVP_PKEY_free(k);
+    if (!ok) { free(o); snprintf(err, en, "crypto: Ed25519 signing failed"); return -1; }
+    *out = o; *outn = 64;
+    return 0;
+  }
+  if (op == 5) {
+    unsigned char *o = (unsigned char *)malloc(1);
+    if (!o) { snprintf(err, en, "crypto: out of memory"); return -1; }
+    o[0] = 0;
+    if (an == 32 && cn == 64) {
+      EVP_PKEY *k = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, NULL, a, 32);
+      EVP_MD_CTX *m = EVP_MD_CTX_new();
+      if (k && m && EVP_DigestVerifyInit(m, NULL, NULL, NULL, k) == 1 && EVP_DigestVerify(m, c, cn, d, dn) == 1) o[0] = 1;
+      if (m) EVP_MD_CTX_free(m);
+      if (k) EVP_PKEY_free(k);
+      ERR_clear_error();
+    }
+    *out = o; *outn = 1;
+    return 0;
+  }
+  if (op == 7) {
+    if (an != 32 || bn != 32) { snprintf(err, en, "crypto: X25519 keys are 32 bytes"); return -1; }
+    EVP_PKEY *k = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, NULL, a, 32);
+    EVP_PKEY *p = EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, NULL, b, 32);
+    EVP_PKEY_CTX *x = k ? EVP_PKEY_CTX_new(k, NULL) : NULL;
+    unsigned char *o = (unsigned char *)malloc(32);
+    size_t n = 32;
+    int ok = k && p && x && o && EVP_PKEY_derive_init(x) == 1 && EVP_PKEY_derive_set_peer(x, p) == 1 && EVP_PKEY_derive(x, o, &n) == 1 && n == 32;
+    if (x) EVP_PKEY_CTX_free(x);
+    if (p) EVP_PKEY_free(p);
+    if (k) EVP_PKEY_free(k);
+    if (ok) {
+      unsigned char z = 0;
+      for (int i = 0; i < 32; i++) z |= o[i];
+      if (!z) ok = 0;
+    }
+    if (!ok) { free(o); ERR_clear_error(); snprintf(err, en, "crypto: no shared secret with that public key"); return -1; }
+    *out = o; *outn = 32;
+    return 0;
+  }
+  snprintf(err, en, "crypto: unknown operation %d", op);
+  return -1;
+}

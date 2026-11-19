@@ -1,0 +1,9 @@
+use unicode
+
+fn main(root: Root) {
+    root.stdout.print("{unicode.code_points("aé€😀")} {unicode.code_points(bytes([0x61, 0xff, 0xe2, 0x82]).to_str())}")
+    root.stdout.print("{unicode.fold("Straße") == unicode.fold("STRASSE")} {unicode.upper("ﬁx straße")} {unicode.lower("ΑΒΓ İ")}")
+    root.stdout.print("{unicode.nfc("e\u{301}") == "\u{e9}"} {unicode.nfd("\u{e9}").len()} {unicode.code_points(unicode.nfc("\u{1100}\u{1161}\u{11a8}"))}")
+    root.stdout.print("{unicode.code_points(unicode.nfd("a\u{301}\u{327}"))} {unicode.code_points(unicode.nfc("a\u{327}\u{301}"))}")
+    root.stdout.print("{unicode.same_ignoring_case("Café", "CAFE\u{301}")} {unicode.from_code_points([72, 233, 0x1f600])}")
+}

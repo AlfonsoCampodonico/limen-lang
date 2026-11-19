@@ -5,7 +5,8 @@
 //
 //   Int, Int32, Float, Bool, Str, Bytes, Handle, a C struct declared in the
 //   block (passed by value), a callback `fn(A) -> R` (a top-level Limen
-//   function C calls), and Out[T] for a parameter C writes to.
+//   function C calls), a kept callback `Kept[fn(A)]` (a channel each call
+//   from C sends its arguments on), and Out[T] for a parameter C writes to.
 //
 // A function's Limen type takes a Foreign capability first (unless the
 // standard library module declaring it is trusted), then the parameters
@@ -27,6 +28,9 @@ pub enum CTy {
     Struct(Str, List[(Str, CTy)]),
     // a callback: C calls a top-level Limen function through it
     Fn(List[CTy], CTy),
+    // a callback C may keep and call at any time, from any thread: each
+    // call sends its arguments on a channel, and returns nothing
+    Kept(List[CTy]),
 }
 
 pub struct CParam {
@@ -86,6 +90,17 @@ fn limen_ty(c: CTy) -> types.Ty {
         Unit => TUnit,
         Struct(n, _) => TNamed(n, []),
         Fn(ps, r) => TFn(ps.map(limen_ty), limen_ty(r)),
+        Kept(ps) => TChan(kept_elem(ps)),
+    }
+}
+
+// What a kept callback's channel carries: its one parameter, a tuple of
+// several, or `()` for none.
+pub fn kept_elem(ps: List[CTy]) -> types.Ty {
+    match ps.len() {
+        0 => TUnit,
+        1 => limen_ty(ps[0]),
+        n => TNamed(ast.tuple_name(n), ps.map(limen_ty)),
     }
 }
 
@@ -101,7 +116,7 @@ pub fn c_name(c: CTy) -> Str {
         Bytes => "const void *",
         Handle => "void *",
         Unit => "void",
-        Struct(..) | Fn(..) => panic("ffi.c_name: a struct or callback is named by the backend"),
+        Struct(..) | Fn(..) | Kept(..) => panic("ffi.c_name: a struct or callback is named by the backend"),
     }
 }
 
@@ -173,7 +188,7 @@ fn is_alnum(c: Int) -> Bool {
 }
 
 fn boundary_types() -> Str {
-    "Int, Int32, Float, Bool, Str, Bytes, Handle, a struct declared in a foreign block, a callback `fn(...) -> T`, or Out[Int | Int32 | Float | Handle] for a parameter"
+    "Int, Int32, Float, Bool, Str, Bytes, Handle, a struct declared in a foreign block, a callback `fn(...) -> T`, a kept callback `Kept[fn(...)]`, or Out[Int | Int32 | Float | Handle] for a parameter"
 }
 
 fn field_cty(te: ast.TyExpr) -> Option[CTy] {
@@ -221,6 +236,7 @@ fn runtime_fns() -> List[(Str, List[CTy], CTy)] {
         ("limen_bytes_int", [Bytes, Int], Int),
         ("limen_bytes_float", [Bytes, Int], Float),
         ("limen_float_bits", [Float], Int),
+        ("limen_crypto", [Int, Bytes, Bytes, Bytes, Bytes], Bytes),
     ]
 }
 
@@ -280,42 +296,27 @@ pub fn of_decl(d: ast.FnDecl, structs: Map[Str, ast.StructDecl]) -> Result[CSig,
                 }
             },
             TyFn(cps, r) => {
-                // a callback: its parameters, then its result
-                let mut ps: List[CTy] = []
-                for cp in cps {
-                    let (got, next) = base(errs, cp)
+                let (cty, next) = callback(errs, te, cps, r, base)
+                errs = next
+                CParam { name: p.name, cty, out: false }
+            },
+            TyName("Kept", [inner]) if is_fn_type(inner) => match inner.desc {
+                TyFn(cps, r) => {
+                    let (cty, next) = callback(errs, inner, cps, r, base)
                     errs = next
-                    match got {
-                        Some(Int) | Some(Int32) | Some(Float) | Some(Bool) | Some(Str) | Some(Handle) => ps.push(got ?? Int),
+                    match cty {
+                        Fn(ps, Unit) => CParam { name: p.name, cty: Kept(ps), out: false },
                         _ => {
-                            errs.push((cp.span, "a callback's parameter is Int, Int32, Float, Bool, Str or Handle"))
-                            ps.push(Int)
+                            errs.push((r.span, "a kept callback returns nothing: C gets no answer from a channel"))
+                            CParam { name: p.name, cty: Kept([]), out: false }
                         },
                     }
-                }
-                let ret = match r.desc {
-                    TyUnit => Unit,
-                    _ => {
-                        let (got, next) = base(errs, r)
-                        errs = next
-                        match got {
-                            Some(Int) | Some(Int32) | Some(Float) | Some(Bool) | Some(Handle) => got ?? Unit,
-                            Some(Str) => {
-                                errs.push((r.span, "a callback cannot return Str: C would not know who frees it"))
-                                Unit
-                            },
-                            _ => {
-                                errs.push((r.span, "a callback returns Int, Int32, Float, Bool, Handle or nothing"))
-                                Unit
-                            },
-                        }
-                    },
-                }
-                let fl = ps.count(|t| t == Float)
-                if ps.len() - fl > max_ints() || fl > max_floats() {
-                    errs.push((te.span, "a callback takes at most {max_ints()} integer-like and {max_floats()} Float parameters"))
-                }
-                CParam { name: p.name, cty: Fn(ps, ret), out: false }
+                },
+                _ => CParam { name: p.name, cty: Kept([]), out: false },
+            },
+            TyName("Kept", _) => {
+                errs.push((te.span, "`Kept` holds the callback's C type, as in `Kept[fn(Handle, Int32)]`"))
+                CParam { name: p.name, cty: Kept([]), out: false }
             },
             _ => {
                 let (got, next) = base(errs, te)
@@ -405,7 +406,7 @@ pub fn of_decl(d: ast.FnDecl, structs: Map[Str, ast.StructDecl]) -> Result[CSig,
             }
             for (i, p) in rest.with_index() {
                 match p.cty {
-                    Struct(..) | Fn(..) if !p.out => errs.push((spans[k + i], "an argument after `...` is Int, Int32, Float, Bool, Str, Bytes or Handle")),
+                    Struct(..) | Fn(..) | Kept(..) if !p.out => errs.push((spans[k + i], "an argument after `...` is Int, Int32, Float, Bool, Str, Bytes or Handle")),
                     _ if p.out => errs.push((spans[k + i], "an `Out` parameter goes before `...`")),
                     _ => {},
                 }
@@ -429,6 +430,55 @@ pub fn of_decl(d: ast.FnDecl, structs: Map[Str, ast.StructDecl]) -> Result[CSig,
         errs.push((d.span, "a `blocking` function cannot take a callback: C may call one only during the call, on the calling task's own thread"))
     }
     if errs.is_empty() { Ok(CSig { lib: f.lib, sym: f.sym, params, ret, trusted: f.trusted, fixed: f.variadic, blocking: f.blocking }) } else { Err(errs) }
+}
+
+// A callback's C type, `fn(A, ...) -> R`, from its written parameters `cps`
+// and result `r` (`te` is all of it); what is wrong with them is added to
+// `errs`.
+fn callback(errs0: List[(ast.Span, Str)], te: ast.TyExpr, cps: List[ast.TyExpr], r: ast.TyExpr, base: fn(List[(ast.Span, Str)], ast.TyExpr) -> (Option[CTy], List[(ast.Span, Str)])) -> (CTy, List[(ast.Span, Str)]) {
+    let mut errs = errs0
+    let mut ps: List[CTy] = []
+    for cp in cps {
+        let (got, next) = base(errs, cp)
+        errs = next
+        match got {
+            Some(Int) | Some(Int32) | Some(Float) | Some(Bool) | Some(Str) | Some(Handle) => ps.push(got ?? Int),
+            _ => {
+                errs.push((cp.span, "a callback's parameter is Int, Int32, Float, Bool, Str or Handle"))
+                ps.push(Int)
+            },
+        }
+    }
+    let ret = match r.desc {
+        TyUnit => Unit,
+        _ => {
+            let (got, next) = base(errs, r)
+            errs = next
+            match got {
+                Some(Int) | Some(Int32) | Some(Float) | Some(Bool) | Some(Handle) => got ?? Unit,
+                Some(Str) => {
+                    errs.push((r.span, "a callback cannot return Str: C would not know who frees it"))
+                    Unit
+                },
+                _ => {
+                    errs.push((r.span, "a callback returns Int, Int32, Float, Bool, Handle or nothing"))
+                    Unit
+                },
+            }
+        },
+    }
+    let fl = ps.count(|t| t == Float)
+    if ps.len() - fl > max_ints() || fl > max_floats() {
+        errs.push((te.span, "a callback takes at most {max_ints()} integer-like and {max_floats()} Float parameters"))
+    }
+    (Fn(ps, ret), errs)
+}
+
+fn is_fn_type(te: ast.TyExpr) -> Bool {
+    match te.desc {
+        TyFn(..) => true,
+        _ => false,
+    }
 }
 
 // The libraries a program's foreign declarations name, each once, in

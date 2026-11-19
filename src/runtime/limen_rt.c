@@ -93,6 +93,7 @@ W_RT void *w_realloc(void *p, size_t n) {
 W_RT char *w_strdup(const char *c) { char *p = strdup(c); if (!p) w_oom(); return p; }
 W_RT char *w_strndup(const char *c, size_t n) { char *p = strndup(c, n); if (!p) w_oom(); return p; }
 W_RT void w_leakcheck(void) {
+  w_kept_release();
   if (getenv("LIMEN_LEAKCHECK")) fprintf(stderr, "limen-leakcheck: %lld live\n", (long long)__atomic_load_n(&w_live, __ATOMIC_ACQUIRE));
 }
 /* Errors no boundary can handle: report and exit, after the output tasks
@@ -210,6 +211,7 @@ W_RT int Float_cmp(double a, double b) {
 }
 
 W_RT void Int_show(WBuf *b, int64_t x, bool top) { (void)top; char t[32]; snprintf(t, sizeof t, "%lld", (long long)x); buf_puts(b, t); }
+W_RT void UInt_show(WBuf *b, uint64_t x, bool top) { (void)top; char t[32]; snprintf(t, sizeof t, "%llu", (unsigned long long)x); buf_puts(b, t); }
 W_RT void Float_show(WBuf *b, double x, bool top) { (void)top; char t[64]; fmt_float(t, sizeof t, x); buf_puts(b, t); }
 W_RT void Bool_show(WBuf *b, bool x, bool top) { (void)top; buf_puts(b, x ? "true" : "false"); }
 W_RT void Unit_show(WBuf *b, W_Unit x, bool top) { (void)x; (void)top; buf_puts(b, "()"); }
@@ -3012,6 +3014,20 @@ W_RT WIo Cap_net_connect_tls(WCap *n, WStr *addr) {
     if (wr < 0) { Cap_sock_close(c); Cap_drop(c); return io_err(2, "cannot wait on socket"); }
   }
 }
+/* The crypto module's runtime helper (vcrypto in limen_tls.h): the result
+   after a status byte, 0 for success, 1 for an error message. */
+W_RT WStr *w_crypto(int64_t op, WStr *a, WStr *b, WStr *c, WStr *d) {
+  unsigned char *out = NULL; size_t n = 0; char err[300];
+  int r = vcrypto((int)op, (const unsigned char *)a->data, (size_t)a->len, (const unsigned char *)b->data, (size_t)b->len,
+                  (const unsigned char *)c->data, (size_t)c->len, (const unsigned char *)d->data, (size_t)d->len, &out, &n, err, sizeof err);
+  if (r != 0) { size_t m = strlen(err); WStr *s = Str_new((int64_t)m + 1); s->data[0] = 1; memcpy(s->data + 1, err, m); return s; }
+  WStr *s = Str_new((int64_t)n + 1);
+  s->data[0] = 0;
+  if (n) memcpy(s->data + 1, out, n);
+  OPENSSL_cleanse(out, n);
+  free(out);
+  return s;
+}
 /* Conn.start_tls(host): a client TLS handshake on a connection that is
    already open, for protocols that start TLS inside plain TCP (Postgres's
    SSLRequest, Redis behind a proxy, SMTP's STARTTLS). The server's
@@ -3079,6 +3095,11 @@ W_RT WIo Cap_net_connect_tls(WCap *n, WStr *addr) {
   return io_err(2, W_NO_TLS);
 }
 W_RT WIo Cap_conn_start_tls(WCap *c, WStr *host) { (void)c; (void)host; return io_err(2, W_NO_TLS); }
+W_RT WStr *w_crypto(int64_t op, WStr *a, WStr *b, WStr *c, WStr *d) {
+  (void)op; (void)a; (void)b; (void)c; (void)d;
+  const char *m = "crypto: this program was built without OpenSSL";
+  WStr *s = Str_new((int64_t)strlen(m) + 1); s->data[0] = 1; memcpy(s->data + 1, m, strlen(m)); return s;
+}
 W_RT WIo Cap_listen_on_tls(WCap *l, WStr *addr, WStr *cert, WStr *key) {
   (void)cert; (void)key;
   if (w_revoked(l)) return io_err(1, "listen: revoked");
@@ -3210,6 +3231,80 @@ W_RT int32_t w_ffi_i32(int64_t v, const char *arg, const char *where) {
   return (int32_t)v;
 }
 W_RT WStr *w_ffi_str(const char *p) { return p ? Str_from(p, (int64_t)strlen(p)) : Str_new(0); }
+/* Kept callbacks (`Kept[fn(...)]`): C may keep the function pointer it was
+   given and call it at any time, from any thread. The pointer is one of
+   W_KEPT trampolines the program has for that C signature, and its number
+   is a slot here holding the channel it was made from; each call builds
+   the value and sends it with w_kept_send. A slot stays taken for the rest
+   of the program (C may still hold the pointer), so the same channel always
+   gets the same slot, and a program has W_KEPT channels at most. */
+WChan *w_kept_ch[W_KEPT];
+pthread_mutex_t w_kept_mu = PTHREAD_MUTEX_INITIALIZER;
+W_RT int64_t w_kept_slot(WChan *c, const char *where) {
+  pthread_mutex_lock(&w_kept_mu);
+  for (int i = 0; i < W_KEPT; i++)
+    if (w_kept_ch[i] == c) { pthread_mutex_unlock(&w_kept_mu); return i; }
+  for (int i = 0; i < W_KEPT; i++)
+    if (!w_kept_ch[i]) {
+      Chan_share(c);
+      w_kept_ch[i] = Chan_dup(c);
+      /* C may send at any time, so a task waiting on it is not deadlocked */
+      __atomic_fetch_add(&w_io_waiters, 1, __ATOMIC_SEQ_CST);
+      pthread_mutex_unlock(&w_kept_mu);
+      return i;
+    }
+  pthread_mutex_unlock(&w_kept_mu);
+  char msg[160];
+  snprintf(msg, sizeof msg, "foreign: C keeps %d channels already, the most a program can give it", W_KEPT);
+  w_panic_c(msg, where);
+}
+/* Send [v] (owned) on slot [i]'s channel from wherever C called: never
+   waits, since the caller may be a thread that is not a task. A waiting
+   receiver gets it at once; otherwise it is queued, the channel growing
+   when full. On a closed channel, or once the program is ending, it is
+   dropped. */
+W_RT void w_kept_send(int64_t i, void *v) {
+  pthread_mutex_lock(&w_kept_mu);
+  WChan *c = w_kept_ch[i];
+  if (c) Chan_dup(c);
+  pthread_mutex_unlock(&w_kept_mu);
+  if (!c) return;
+  if (c->eshare) c->eshare(v);
+  pthread_mutex_lock(&c->mu);
+  if (c->closed) {
+    pthread_mutex_unlock(&c->mu);
+    if (c->edrop) c->edrop(v);
+    Chan_drop(c);
+    return;
+  }
+  WChWait *r = w_chq_pop_live(&c->rq, &c->rq_t);
+  if (r) {
+    memcpy(r->val, v, c->esz); r->ok = 1;
+    pthread_mutex_unlock(&c->mu);
+    w_wake(r->f);
+    Chan_drop(c);
+    return;
+  }
+  if (c->len == c->cap) {
+    int64_t cap = c->cap ? c->cap * 2 : 16;
+    char *buf = (char *)w_raw(w_bytes(cap, c->esz));
+    for (int64_t k = 0; k < c->len; k++) memcpy(buf + k * c->esz, c->buf + ((c->head + k) % c->cap) * c->esz, c->esz);
+    free(c->buf);
+    c->buf = buf; c->cap = cap; c->head = 0;
+  }
+  memcpy(c->buf + ((c->head + c->len) % c->cap) * c->esz, v, c->esz);
+  c->len++;
+  pthread_mutex_unlock(&c->mu);
+  Chan_drop(c);
+}
+/* The program is ending: let go of the kept channels (a late call from C
+   finds its slot empty and is dropped). */
+W_RT void w_kept_release(void) {
+  pthread_mutex_lock(&w_kept_mu);
+  for (int i = 0; i < W_KEPT; i++)
+    if (w_kept_ch[i]) { Chan_drop(w_kept_ch[i]); w_kept_ch[i] = NULL; }
+  pthread_mutex_unlock(&w_kept_mu);
+}
 pthread_mutex_t w_bl_mu = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t w_bl_cv = PTHREAD_COND_INITIALIZER;
 WBlock *w_bl_head, *w_bl_tail;

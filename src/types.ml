@@ -7,6 +7,9 @@ type ty =
   | TBool
   | TStr
   | TBytes (* immutable bytes; natively a WStr *)
+  | TUInt of int
+      (* UInt8, UInt16, UInt32, UInt64: unsigned integers of that many bits,
+         whose arithmetic wraps modulo 2^bits *)
   | TUnit
   | TList of ty
   | TFn of ty list * ty
@@ -68,6 +71,7 @@ let rec show t =
   | TBool -> "Bool"
   | TStr -> "Str"
   | TBytes -> "Bytes"
+  | TUInt n -> "UInt" ^ string_of_int n
   | TUnit -> "()"
   | TList a -> "List[" ^ show a ^ "]"
   | TFn (ps, r) -> "fn(" ^ String.concat ", " (List.map show ps) ^ ") -> " ^ show r
@@ -94,7 +98,7 @@ let rec show t =
    inside it. *)
 let children t =
   match repr t with
-  | TInt | TFloat | TBool | TStr | TBytes | TUnit | TCap _ | TLen _ | TAtomic | TParam _ | TVar _ | TErr -> []
+  | TInt | TFloat | TBool | TStr | TBytes | TUInt _ | TUnit | TCap _ | TLen _ | TAtomic | TParam _ | TVar _ | TErr -> []
   | TList a | TGroup a | TChan a | TShared a -> [ a ]
   | TArray (a, n) -> [ a; n ]
   | TMap (k, v) -> [ k; v ]
@@ -122,7 +126,7 @@ type kind =
 
 let kind t =
   match repr t with
-  | TInt | TFloat | TBool | TStr | TBytes | TUnit | TLen _ | TParam _ | TVar _ | TErr | TList _ | TArray _ | TMap _ | TGroup _ -> Plain
+  | TInt | TFloat | TBool | TStr | TBytes | TUInt _ | TUnit | TLen _ | TParam _ | TVar _ | TErr | TList _ | TArray _ | TMap _ | TGroup _ -> Plain
   | TCap c -> Cap c
   | TChan _ -> State "channel"
   | TAtomic -> State "Atomic"
@@ -142,6 +146,7 @@ let rec unify a b =
   | TVar r1, TVar r2 when r1 == r2 -> ()
   | TVar r, t | t, TVar r -> if occurs r t then raise Mismatch else r := Link t
   | TInt, TInt | TFloat, TFloat | TBool, TBool | TStr, TStr | TBytes, TBytes | TUnit, TUnit -> ()
+  | TUInt m, TUInt n when m = n -> ()
   | TList x, TList y | TGroup x, TGroup y -> unify x y
   | TArray (x, n), TArray (y, m) -> unify n m; unify x y
   | TLen n, TLen m when n = m -> ()

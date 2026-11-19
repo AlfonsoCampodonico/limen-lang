@@ -77,7 +77,7 @@ fn inner(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr) -> (types.Ty, env.S
         EUn(BitNot, a) => {
             let (t, st) = check_expr(st, cx, fx, a)
             match st.repr(t) {
-                TInt | TErr => (t, st),
+                TInt | TUInt(_) | TErr => (t, st),
                 TVar(_) => (TInt, st.unify_at(a.span, TInt, t)),
                 _ => (TErr, st.report(diag.error("E0201", a.span, "operator `~` cannot be applied to `{st.show(t)}`"))),
             }
@@ -192,6 +192,21 @@ fn inner(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr) -> (types.Ty, env.S
 pub fn expect(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, want: types.Ty) -> env.State {
     let mut st = st
     match (st.desc(e), st.repr(want)) {
+        // an integer literal where an unsigned integer is expected is one, if it fits
+        (EInt(v), TUInt(bits)) => {
+            if v < 0 || (bits < 64 && v >= 1 << bits) {
+                let top = if bits == 64 { "18446744073709551615" } else { "{(1 << bits) - 1}" }
+                st = st.report(diag.error("E0201", e.span, "{v} does not fit in a `UInt{bits}`, which holds 0 to {top}"))
+            }
+            st.set_type(e, want)
+        },
+        (EUn(Neg, x), TUInt(bits)) if is_int_literal(st, x) => st.report(diag.error("E0201", e.span, "a `UInt{bits}` cannot be negative")).set_type(e, want),
+        (EList(es), TList(el)) if is_uint(st, el) => {
+            for x in es {
+                st = expect(st, cx, fx, x, el)
+            }
+            st.set_type(e, want)
+        },
         (EList(es), TArray(el, n)) => {
             for x in es {
                 st = expect(st, cx, fx, x, el)
@@ -255,6 +270,20 @@ pub fn expect(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, want: types.Ty
             coerce(st, cx, e, t, env.Bound { iface: i, args: a })
         },
         _ => expect_plain(st, cx, fx, e, want),
+    }
+}
+
+fn is_int_literal(st: env.State, e: ast.Expr) -> Bool {
+    match st.desc(e) {
+        EInt(_) => true,
+        _ => false,
+    }
+}
+
+fn is_uint(st: env.State, t: types.Ty) -> Bool {
+    match st.repr(t) {
+        TUInt(_) => true,
+        _ => false,
     }
 }
 
@@ -1865,7 +1894,7 @@ pub fn unkeyable(st: env.State, cx: env.Cx, t: types.Ty) -> Option[types.Ty] {
 fn first_in_way(st: env.State, cx: env.Cx, t: types.Ty, keys: Bool, seen: List[Str]) -> (Option[types.Ty], List[Str]) {
     let rt = st.repr(t)
     match rt {
-        TInt | TStr | TBytes | TBool | TVar(_) | TErr => (None, seen),
+        TInt | TStr | TBytes | TBool | TUInt(_) | TVar(_) | TErr => (None, seen),
         TFloat | TUnit if !keys => (None, seen),
         TParam(g) if bounded(st, g, if keys { "Key" } else { "Ordered" }) => (None, seen),
         TList(a) | TArray(a, _) if !keys => first_in_way(st, cx, a, keys, seen),
@@ -2140,20 +2169,30 @@ fn check_bin(st: env.State, cx: env.Cx, fx: env.Fx, op: ast.BinOp, a: ast.Expr, 
             },
         },
         _ => {
-            let st = expect(st, cx, fx, b, ta)
+            // a literal on the left takes the right's type: `1 + x` with x a UInt8
+            let (ta, st) = match (st.desc(a), st.repr(ta)) {
+                (EInt(_), TInt) => {
+                    let (tb, st2) = check_expr(st, cx, fx, b)
+                    match st2.repr(tb) {
+                        TUInt(_) => (tb, expect(st2, cx, fx, a, tb)),
+                        _ => (ta, st2.unify_at(b.span, ta, tb)),
+                    }
+                },
+                _ => (ta, expect(st, cx, fx, b, ta)),
+            }
             let t = st.repr(ta)
             let bad = |st: env.State| st.report(diag.error("E0201", sp, "operator `{op_name(op)}` cannot be applied to `{st.show(t)}`"))
             match op {
                 Add => match t {
-                    TInt | TFloat | TStr | TBytes | TList(_) | TErr | TVar(_) => (t, st),
+                    TInt | TFloat | TStr | TBytes | TUInt(_) | TList(_) | TErr | TVar(_) => (t, st),
                     _ => (TErr, bad(st)),
                 },
                 Sub | Mul | Div => match t {
-                    TInt | TFloat | TErr | TVar(_) => (t, st),
+                    TInt | TFloat | TUInt(_) | TErr | TVar(_) => (t, st),
                     _ => (TErr, bad(st)),
                 },
                 Mod | BitAnd | BitOr | BitXor | Shl | Shr => match t {
-                    TInt | TErr | TVar(_) => (t, st),
+                    TInt | TUInt(_) | TErr | TVar(_) => (t, st),
                     _ => (TErr, bad(st)),
                 },
                 Lt | Le | Gt | Ge => (TBool, if unordered(st, cx, t).is_some() { bad(st) } else { st }),
@@ -2433,7 +2472,19 @@ fn check_pat(st: env.State, cx: env.Cx, fx: env.Fx, t: types.Ty, p: ast.Pat) -> 
     match p.desc {
         PWild => (fx, st),
         PBind(n) => (bind(fx, n, t, p.span), st),
-        PInt(_) => (fx, st.unify_at(p.span, t, TInt)),
+        PInt(v) => match st.repr(t) {
+            // an unsigned integer matches literals that fit in it
+            TUInt(bits) => {
+                if v < 0 {
+                    (fx, st.report(diag.error("E0201", p.span, "a `UInt{bits}` cannot be negative")))
+                } else if bits < 64 && v >= 1 << bits {
+                    (fx, st.report(diag.error("E0201", p.span, "{v} does not fit in a `UInt{bits}`, which holds 0 to {(1 << bits) - 1}")))
+                } else {
+                    (fx, st)
+                }
+            },
+            _ => (fx, st.unify_at(p.span, t, TInt)),
+        },
         PStr(_) => (fx, st.unify_at(p.span, t, TStr)),
         PBool(_) => (fx, st.unify_at(p.span, t, TBool)),
         PTuple(ps) if ps.any(exhaust.is_rest) => match st.repr(t) {

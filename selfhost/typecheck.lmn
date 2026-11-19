@@ -1079,7 +1079,14 @@ fn check_fn(cx: env.Cx, st: env.State, ds: Decls, d: ast.FnDecl, s: env.Sig) -> 
         st = checker.expect_block(st, cx, fx, d.body, s.ret)
         return out_of_fn(check_pending(cx, st, ds))
     }
-    let tail_needs = match d.body.tail {
+    let literal_uint = match (d.body.tail, st.repr(s.ret)) {
+        (Some(x), TUInt(_)) | (Some(x), TList(TUInt(_))) => match x.desc {
+            EInt(_) | EList(_) => true,
+            _ => false,
+        },
+        _ => false,
+    }
+    let tail_needs = literal_uint || match d.body.tail {
         Some(x) => checker.needs_type(st, x),
         None => false,
     }

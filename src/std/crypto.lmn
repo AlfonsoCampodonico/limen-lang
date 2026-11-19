@@ -1,0 +1,128 @@
+// Encryption and signatures beyond TLS, on OpenSSL (as TLS is): sealing
+// data with a secret key, signing it so others can check who wrote it,
+// and agreeing a secret key with someone over an open channel.
+//
+//   let key = crypto.key(root.rand)                   // 32 random bytes; keep it secret
+//   let sealed = crypto.seal(root.rand, key, "a secret".to_bytes())
+//   let back = crypto.open(key, sealed)?              // Err if anything was changed
+//
+//   let signer = crypto.signing_key(root.rand)
+//   let public = crypto.public_key(signer)            // give this out
+//   let sig = crypto.sign(signer, message)
+//   crypto.verify(public, message, sig)               // true or false
+//
+// The algorithms are fixed, so there is nothing to choose wrong:
+// ChaCha20-Poly1305 for sealing (RFC 8439), Ed25519 for signatures
+// (RFC 8032) and X25519 for agreeing keys (RFC 7748). Keys are plain
+// `Bytes`: keep secret ones out of logs, since printing shows them.
+
+foreign "limen" {
+    fn limen_crypto(op: Int, a: Bytes, b: Bytes, c: Bytes, d: Bytes) -> Bytes
+}
+
+// ---------- sealing: secret-key encryption with integrity ----------
+
+// A fresh secret key for `seal` and `open`: 32 random bytes.
+pub fn key(rand: Rand) -> Bytes {
+    rand.bytes(32)
+}
+
+// `plaintext` encrypted and authenticated with `key`, under a fresh random
+// nonce that goes in front of it: 12 bytes of nonce, the ciphertext, and a
+// 16-byte tag. `associated` is data that is not encrypted but is
+// authenticated with it (a header, a record's id): `open` needs the same.
+pub fn seal(rand: Rand, key: Bytes, plaintext: Bytes, associated: Str = "") -> Bytes {
+    let nonce = rand.bytes(12)
+    match encrypt(key, nonce, plaintext, associated) {
+        Ok(c) => nonce + c,
+        Err(e) => panic(e),
+    }
+}
+
+// What `seal` sealed, or an Err when the key or associated data is not the
+// one it was sealed with or any byte was changed.
+pub fn open(key: Bytes, sealed: Bytes, associated: Str = "") -> Result[Bytes, Str] {
+    if sealed.len() < 28 {
+        return Err("crypto: too short to be sealed data")
+    }
+    decrypt(key, sealed.slice(0, 12), sealed.slice(12, sealed.len()), associated)
+}
+
+// ChaCha20-Poly1305 with a nonce you choose: the ciphertext, then the
+// 16-byte tag. A nonce must never be used twice with the same key; `seal`
+// takes care of that, so use these only to work with another program's
+// format.
+pub fn encrypt(key: Bytes, nonce: Bytes, plaintext: Bytes, associated: Str = "") -> Result[Bytes, Str] {
+    run(1, key, nonce, associated.to_bytes(), plaintext)
+}
+
+pub fn decrypt(key: Bytes, nonce: Bytes, ciphertext: Bytes, associated: Str = "") -> Result[Bytes, Str] {
+    run(2, key, nonce, associated.to_bytes(), ciphertext)
+}
+
+// ---------- signatures: Ed25519 ----------
+
+// A fresh signing key: 32 random bytes. Keep it secret.
+pub fn signing_key(rand: Rand) -> Bytes {
+    rand.bytes(32)
+}
+
+// The public key of a signing key, for others to check signatures with.
+pub fn public_key(signing: Bytes) -> Bytes {
+    value(run(3, signing, empty(), empty(), empty()))
+}
+
+// The 64-byte signature of `message` with `signing`.
+pub fn sign(signing: Bytes, message: Bytes) -> Bytes {
+    value(run(4, signing, empty(), empty(), message))
+}
+
+// Whether `signature` is `public`'s signature of `message`.
+pub fn verify(public: Bytes, message: Bytes, signature: Bytes) -> Bool {
+    match run(5, public, empty(), signature, message) {
+        Ok(b) => b == bytes([1]),
+        Err(_) => false,
+    }
+}
+
+// ---------- agreeing a key: X25519 ----------
+
+// A fresh private key for agreeing: 32 random bytes. Keep it secret.
+pub fn agreement_key(rand: Rand) -> Bytes {
+    rand.bytes(32)
+}
+
+// The public key to send the other side.
+pub fn agreement_public(private: Bytes) -> Bytes {
+    value(run(6, private, empty(), empty(), empty()))
+}
+
+// The secret both sides get from their own private key and the other's
+// public key. Hash it with what the two sides agreed on before using it
+// as a key (`hash.hmac_sha256(secret, "my protocol v1".to_bytes())`).
+pub fn agree(private: Bytes, peer_public: Bytes) -> Result[Bytes, Str] {
+    run(7, private, peer_public, empty(), empty())
+}
+
+// ---------- the runtime's side ----------
+
+fn empty() -> Bytes {
+    bytes([])
+}
+
+fn run(op: Int, a: Bytes, b: Bytes, c: Bytes, d: Bytes) -> Result[Bytes, Str] {
+    let r = limen_crypto(op, a, b, c, d)
+    if r.is_empty() {
+        return Err("crypto: no answer")
+    }
+    let rest = r.slice(1, r.len())
+    if r[0] == 0 { Ok(rest) } else { Err(rest.to_str()) }
+}
+
+// A key's wrong size is the caller's mistake: say so where it happened.
+fn value(r: Result[Bytes, Str]) -> Bytes {
+    match r {
+        Ok(b) => b,
+        Err(e) => panic(e),
+    }
+}
