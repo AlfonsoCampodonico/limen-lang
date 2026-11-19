@@ -386,7 +386,7 @@ fn cse_block(pure: Map[Str, Info], clos: Map[Int, Str], avail: List[(Key, ir.Var
                     },
                 }
             },
-            Let(..) | Drop(_) | Break | Continue | Return(_) | GuardEnd(_) => out.push(s),
+            Let(..) | Drop(_) | Break | Continue | Return(_) | GuardEnd(_) | Line(_) => out.push(s),
             Set(v, _, _) | Mutate(v, _, _) | Init(v, _) | Decl(v) => {
                 avail = kill(avail, [v.id])
                 out.push(s)

@@ -258,7 +258,7 @@ let cse_fn pure (f : fn) : fn =
             | _ ->
               avail := (k, v) :: !avail;
               s)
-          | Let _ | Drop _ | Break | Continue | Return _ | GuardEnd _ -> s
+          | Let _ | Drop _ | Break | Continue | Return _ | GuardEnd _ | Line _ -> s
           | Set (v, _, _) | Mutate (v, _, _) | Init (v, _) | Decl v ->
             avail := List.filter (fun e -> not (mentions_any (S.singleton v.id) e)) !avail;
             s

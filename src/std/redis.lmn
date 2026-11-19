@@ -1,0 +1,240 @@
+// Redis over its protocol (RESP2), written in Limen: no C library, only
+// the `Net` the program was granted.
+//
+//   let cache = redis.connect(root.net, "cache.internal:6379")?
+//   cache.set("todo:1", json.encode(t), ttl: 60)?
+//   match cache.get("todo:1")? {
+//       Some(text) => ...,
+//       None => ...,
+//   }
+//
+// The common commands have methods; `run` sends any other, as its words,
+// and returns the reply. Each word goes as its own bulk string, so a key or
+// value can hold any bytes, spaces and newlines included. Connections are
+// plain TCP: TLS is not supported yet.
+//
+// A `Client` is one connection, used by one task at a time: a command is a
+// request and its reply. For a server, `redis.pool` opens a few and
+// `redis.using(pool, |c| ...)` lends one to each request.
+
+// One connection.
+pub struct Client {
+    conn: Conn,
+}
+
+// A reply, as Redis sends it.
+pub enum Reply {
+    // `+OK`
+    Simple(Str),
+    // `-ERR ...`: the command failed; `run` returns these as an Err
+    Problem(Str),
+    Number(Int),
+    // a string, which may hold any bytes
+    Bulk(Str),
+    // no value: a missing key
+    Nil,
+    Many(List[Reply]),
+}
+
+// Connect to `address` (`host:port`), and log in when `password` is given
+// (`AUTH`; with `user` too for an ACL user).
+pub fn connect(net: Net, address: Str, password: Str = "", user: Str = "") -> Result[Client, IoError] {
+    let c = Client { conn: net.connect(address)? }
+    if password != "" {
+        let words = if user == "" { ["AUTH", password] } else { ["AUTH", user, password] }
+        match c.run(words) {
+            Ok(_) => {},
+            Err(e) => {
+                let _ = c.conn.close()
+                return Err(e)
+            },
+        }
+    }
+    Ok(c)
+}
+
+// Close the connection.
+pub fn close(self: Client) {
+    self.conn.close()
+}
+
+// ---------- commands ----------
+
+// The value of `key`, or None when it has none.
+pub fn get(self: Client, key: Str) -> Result[Option[Str], IoError] {
+    match self.run(["GET", key])? {
+        Bulk(s) => Ok(Some(s)),
+        Nil => Ok(None),
+        r => Err(unexpected("GET", r)),
+    }
+}
+
+// Set `key` to `value`; with `ttl`, it expires after that many seconds.
+pub fn set(self: Client, key: Str, value: Str, ttl: Int = 0) -> Result[(), IoError] {
+    let words = if ttl > 0 { ["SET", key, value, "EX", ttl.to_str()] } else { ["SET", key, value] }
+    match self.run(words)? {
+        Simple(_) => Ok(()),
+        r => Err(unexpected("SET", r)),
+    }
+}
+
+// Remove `key`; whether it was there.
+pub fn del(self: Client, key: Str) -> Result[Bool, IoError] {
+    Ok(self.number(["DEL", key])? > 0)
+}
+
+// Whether `key` has a value.
+pub fn exists(self: Client, key: Str) -> Result[Bool, IoError] {
+    Ok(self.number(["EXISTS", key])? > 0)
+}
+
+// Add `by` to the number at `key` (0 when it has none); the new number.
+pub fn incr(self: Client, key: Str, by: Int = 1) -> Result[Int, IoError] {
+    self.number(["INCRBY", key, by.to_str()])
+}
+
+// Let `key` expire after `seconds`; whether it exists.
+pub fn expire(self: Client, key: Str, seconds: Int) -> Result[Bool, IoError] {
+    Ok(self.number(["EXPIRE", key, seconds.to_str()])? > 0)
+}
+
+// The seconds before `key` expires: -1 when it does not, -2 when it does
+// not exist.
+pub fn ttl(self: Client, key: Str) -> Result[Int, IoError] {
+    self.number(["TTL", key])
+}
+
+// Send `message` to the subscribers of `channel`; how many got it.
+pub fn publish(self: Client, channel: Str, message: Str) -> Result[Int, IoError] {
+    self.number(["PUBLISH", channel, message])
+}
+
+// Whether the server answers.
+pub fn ping(self: Client) -> Result[Bool, IoError] {
+    match self.run(["PING"])? {
+        Simple("PONG") => Ok(true),
+        _ => Ok(false),
+    }
+}
+
+fn number(self: Client, words: List[Str]) -> Result[Int, IoError] {
+    match self.run(words)? {
+        Number(n) => Ok(n),
+        r => Err(unexpected(words[0], r)),
+    }
+}
+
+fn unexpected(command: Str, r: Reply) -> IoError {
+    Failed("redis: {command} answered {r}")
+}
+
+// Send a command, its name and arguments as words, and return the reply. An
+// error reply (`-ERR ...`) is an Err.
+pub fn run(self: Client, words: List[Str]) -> Result[Reply, IoError] {
+    let mut out = "*{words.len()}\r\n"
+    for w in words {
+        out = out + "${w.len()}\r\n{w}\r\n"
+    }
+    self.conn.write(out)?
+    let mut buf = bytes([])
+    while true {
+        match parse(buf, 0) {
+            Some((reply, _)) => {
+                return match reply {
+                    Problem(m) => Err(Failed("redis: {m}")),
+                    r => Ok(r),
+                }
+            },
+            None => {
+                let more = self.conn.read()?
+                if more == "" {
+                    return Err(Failed("redis: the server closed the connection"))
+                }
+                buf = buf + more.to_bytes()
+            },
+        }
+    }
+    Err(Failed("redis: unreachable"))
+}
+
+// ---------- replies ----------
+
+// The reply starting at `at`, and where the next one starts; None while it
+// has not all arrived.
+fn parse(b: Bytes, at: Int) -> Option[(Reply, Int)] {
+    let end = line_end(b, at)?
+    let head = b.slice(at + 1, end).to_str()
+    let next = end + 2
+    if at >= b.len() {
+        return None
+    }
+    let kind = b[at]
+    if kind == 43 {
+        Some((Simple(head), next))
+    } else if kind == 45 {
+        Some((Problem(head), next))
+    } else if kind == 58 {
+        Some((Number(head.parse_int() ?? 0), next))
+    } else if kind == 36 {
+        let size = head.parse_int() ?? -1
+        if size < 0 {
+            return Some((Nil, next))
+        }
+        // the string, then \r\n
+        if b.len() < next + size + 2 {
+            return None
+        }
+        Some((Bulk(b.slice(next, next + size).to_str()), next + size + 2))
+    } else if kind == 42 {
+        let count = head.parse_int() ?? -1
+        if count < 0 {
+            return Some((Nil, next))
+        }
+        let mut items: List[Reply] = []
+        let mut i = next
+        for _ in 0..<count {
+            let (item, after) = parse(b, i)?
+            items.push(item)
+            i = after
+        }
+        Some((Many(items), i))
+    } else {
+        Some((Problem("redis: a reply this client cannot read: {head}"), next))
+    }
+}
+
+// Where the `\r\n` after `at` starts; None while it has not arrived.
+fn line_end(b: Bytes, at: Int) -> Option[Int] {
+    let mut i = at
+    while i + 1 < b.len() {
+        if b[i] == 13 && b[i + 1] == 10 {
+            return Some(i)
+        }
+        i = i + 1
+    }
+    None
+}
+
+// ---------- a pool of connections ----------
+
+// `size` connections, each lent to one task at a time by `using`.
+pub fn pool(net: Net, address: Str, size: Int, password: Str = "", user: Str = "") -> Result[Chan[Client], IoError] {
+    let c: Chan[Client] = channel(size)
+    for _ in 0..<size {
+        c.send(connect(net, address, password, user)?)
+    }
+    Ok(c)
+}
+
+// Run `body` with a connection from `pool`, waiting for one when all are
+// in use; it goes back when `body` returns or panics.
+pub fn using[T](pool: Chan[Client], body: fn(Client) -> Result[T, IoError]) -> Result[T, IoError] {
+    let c = match pool.recv() {
+        Some(x) => x,
+        None => {
+            return Err(Failed("redis: the pool is closed"))
+        },
+    }
+    defer pool.send(c)
+    body(c)
+}

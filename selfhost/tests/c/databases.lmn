@@ -1,0 +1,40 @@
+use postgres
+use redis
+use sql
+
+struct Todo {
+    id: Int,
+    title: Str,
+    done: Bool,
+}
+
+// the same struct through both databases: each gets its own conversions
+fn copy(lite: sql.Db, pg: postgres.Db) -> Result[Int, IoError] {
+    let todos: List[Todo] = lite.all("SELECT id, title, done FROM todos")?
+    for t in todos {
+        pg.exec("INSERT INTO todos (id, title, done) VALUES ($1, $2, $3)", postgres.values(t))?
+    }
+    let back: List[Todo] = pg.all("SELECT id, title, done FROM todos")?
+    let first: Option[Todo] = pg.one("SELECT id, title, done FROM todos WHERE id = $1", [postgres.Int(1)])?
+    Ok(back.len() + (first.map(|t| t.id) ?? 0))
+}
+
+fn cached(c: redis.Client, key: Str) -> Result[Str, IoError] {
+    match c.get(key)? {
+        Some(v) => Ok(v),
+        None => {
+            c.set(key, "fresh", ttl: 30)?
+            Ok("fresh")
+        },
+    }
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let lite = sql.memory()?
+    lite.exec("CREATE TABLE todos (id INTEGER, title TEXT, done INTEGER)")?
+    let pool = postgres.pool(root.net, root.rand, "postgres://app:secret@127.0.0.1:55433/app", 2)?
+    let n = postgres.using(pool, |pg| copy(lite, pg))?
+    let c = redis.connect(root.net, "127.0.0.1:56380")?
+    root.stdout.print("{n} {cached(c, "k")?}")
+    Ok(())
+}

@@ -963,9 +963,11 @@ let load_and_check path src : item list * Diag.t list * Check.fn_info list =
          the types are known, and the program is checked again with them *)
       let items, ds, infos =
         let loaded name = Option.map fst (List.find_opt (fun (_, std) -> std = name) !std_loaded) in
-        match (loaded "json", loaded "sql") with
-        | (Some _ as json), sql | json, (Some _ as sql) when Diag.errors ds = [] -> (
-          match Derive.expand ?json ?sql items with
+        (* the modules that read rows into structs, in this order *)
+        let rows = List.filter_map loaded [ "sql"; "postgres" ] in
+        match loaded "json" with
+        | json when (json <> None || rows <> []) && Diag.errors ds = [] -> (
+          match Derive.expand ?json ~rows items with
           | None -> (items, ds, infos)
           | Some (items, (_ :: _ as errs)) -> (items, errs @ ds, infos)
           | Some (items, []) -> let ds, infos = Check.check_program items in (items, ds, infos))

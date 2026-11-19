@@ -1938,7 +1938,49 @@ fn stmt(self: Cg, ind: Str, s: ir.Stmt) -> Cg {
             let g = "g{n}_"
             c.line(ind, "if ({g}slot) *{g}slot = {g}.prev;").line(ind, "w_catch_end(&{g});")
         },
+        Line(sp) => c.put(c.line_directive(sp) + "\n"),
     }
+}
+
+// `#line N "file"` for where `sp` starts, so a debugger, the sanitizers
+// and crash traces show the Limen line.
+fn line_directive(self: Cg, sp: ast.Span) -> Str {
+    let (l, _) = self.line_col(sp.file, sp.lo)
+    let path = diag.path_of(self.files, sp.file).replace("\\", "\\\\").replace("\"", "\\\"")
+    "#line {l} \"{path}\""
+}
+
+// A `#line` counts on from itself: the C line after it is that line, the
+// next one the line after. A statement's C takes several lines, so every
+// line up to the next mark gets the mark again, and stays on the Limen
+// line. A function's closing `\}` (alone at the start of a line) gets
+// `#line 1 "<generated>"` instead, so the code the compiler adds between
+// functions is not taken for Limen lines.
+fn pin_lines(text: Str) -> Str {
+    if !text.contains("#line ") {
+        return text
+    }
+    let mut out: List[Str] = []
+    let mut cur: Option[Str] = None
+    for l in text.split("\n") {
+        if l.starts_with("#line ") {
+            cur = Some(l)
+        } else {
+            match cur {
+                Some(_) if l == "\}" => {
+                    out.push("#line 1 \"<generated>\"")
+                    out.push(l)
+                    cur = None
+                },
+                Some(d) => {
+                    out.push(d)
+                    out.push(l)
+                },
+                None => out.push(l),
+            }
+        }
+    }
+    out.join("\n")
 }
 
 fn mutate(self: Cg, ind: Str, v: ir.Var, steps: List[ir.Step], m: ir.Mutation) -> Cg {
@@ -2137,7 +2179,7 @@ fn scan1(s: ir.Stmt) -> Uses {
         Drop(v) => Uses { declared: [], used: [v.id] },
         Guard(_, h, b) => join_uses(scan(h), scan(b)),
         Scope(_, b) => scan(b),
-        Break | Continue | GuardEnd(_) => no_uses(),
+        Break | Continue | GuardEnd(_) | Line(_) => no_uses(),
     }
 }
 
@@ -2956,6 +2998,7 @@ pub fn program(ro: lower.Ro, files: List[diag.Source], prog: ir.Program, runtime
     // the group, and a cancelled group's tasks are cancelled with it). In a
     // program with none, every checkpoint is a load of a counter that stays
     // 0: say so, so the C compiler drops them from loops.
+    let program = if ro.lines { program.map(pin_lines) } else { program }
     let never_stops = if program.any(|part| part.contains("w_group_new_until(")) { [] } else { [no_checkpoints()] }
     (if c.tls { tls_marker() } else { "" }) + ([runtime] + never_stops + program).join("\n")
 }

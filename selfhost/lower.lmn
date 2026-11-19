@@ -26,6 +26,9 @@ use types
 
 // What lowering reads and never changes: the checked program.
 pub struct Ro {
+    // whether to mark where each Limen statement starts (ir.Line), for
+    // `#line` in the C of a development build
+    lines: Bool,
     fns: Map[Str, ast.FnDecl],
     structs: Map[Str, ast.StructDecl],
     enums: Map[Str, ast.EnumDecl],
@@ -1841,14 +1844,19 @@ fn lower_stmts(self: Lx, ss: List[ast.Stmt], tail: Option[ast.Expr]) -> (ir.Atom
                 return lx.lower_defer(d, ss.skip(i + 1), tail)
             },
             _ => {
-                lx = lx.lower_stmt(s)
+                lx = lx.mark(s.span).lower_stmt(s)
             },
         }
     }
     match tail {
-        Some(e) => lx.lower(e),
+        Some(e) => lx.mark(e.span).lower(e),
         None => (AUnit, lx),
     }
+}
+
+// Where the next statement starts, in a development build.
+fn mark(self: Lx, sp: ast.Span) -> Lx {
+    if self.ro.lines { self.emit(Line(sp)) } else { self }
 }
 
 // `defer d` followed by `rest`: the rest runs under a guard whose handler
@@ -2048,7 +2056,7 @@ fn lower_fn(self: Lx, job: Job) -> (ir.Fn, Lx) {
 // The checked program (its prelude, then its own items, as the checker
 // returned them) in the IR. With `tests`, the program is its tests and
 // benchmarks instead of `main`.
-pub fn lower_program(checked_prelude: List[ast.Item], user_items: List[ast.Item], cx: env.Cx, st: env.State, tests: Bool) -> (ir.Program, Ro) {
+pub fn lower_program(checked_prelude: List[ast.Item], user_items: List[ast.Item], cx: env.Cx, st: env.State, tests: Bool, lines: Bool) -> (ir.Program, Ro) {
     let mut fns: Map[Str, ast.FnDecl] = map()
     let mut structs: Map[Str, ast.StructDecl] = map()
     let mut enums: Map[Str, ast.EnumDecl] = map()
@@ -2078,7 +2086,7 @@ pub fn lower_program(checked_prelude: List[ast.Item], user_items: List[ast.Item]
             ctors[v] = first_owner[v]
         }
     }
-    let ro = Ro { fns, structs, enums, ctors, types: st.types, insts: st.insts, nested: st.nested, subst: st.subst, ifaces: cx.ifaces, iface_gen: cx.iface_gen }
+    let ro = Ro { lines, fns, structs, enums, ctors, types: st.types, insts: st.insts, nested: st.nested, subst: st.subst, ifaces: cx.ifaces, iface_gen: cx.iface_gen }
     let mut lx = Lx { ro, instances: map(), queue: [], next_job: 0, out: [], counter: 0, vars: 0, guards: 0, cur: new_frame([], TUnit), parents: [], pure_fns: [] }
     let field = |p: ast.Param| match p.ty.desc {
         TyName("Fs", _) => "fs",

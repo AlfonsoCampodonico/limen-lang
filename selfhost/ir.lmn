@@ -158,6 +158,9 @@ pub enum Stmt {
     GuardEnd(Int),
     // the body of a group with a deadline
     Scope(Atom, List[Stmt]),
+    // where the Limen statement that follows starts: `#line` in the C of a
+    // development build; it does nothing at run time
+    Line(ast.Span),
 }
 
 pub enum Mutation {

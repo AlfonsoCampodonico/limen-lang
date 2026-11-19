@@ -1,0 +1,49 @@
+use postgres
+
+struct Sample {
+    id: Int,
+    note: Option[Str],
+    ratio: Float,
+    blob: Bytes,
+    flag: Bool,
+}
+
+fn login(root: Root, address: Str) -> Str {
+    match postgres.connect(root.net, root.rand, address) {
+        Ok(db) => {
+            db.close()
+            "ok"
+        },
+        Err(e) => "{e}",
+    }
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    root.stdout.print("md5: {login(root, "postgres://mduser:mdpw@127.0.0.1:PGPORT/app")}")
+    root.stdout.print("cleartext: {login(root, "postgres://plain:plainpw@127.0.0.1:PGPORT/app")}")
+    root.stdout.print("wrong: {login(root, "postgres://app:nope@127.0.0.1:PGPORT/app")}")
+
+    let address = "postgres://app:secret@127.0.0.1:PGPORT/app"
+    let db = postgres.connect(root.net, root.rand, address)?
+    db.exec("DROP TABLE IF EXISTS samples; CREATE TABLE samples (id INT PRIMARY KEY, note TEXT, ratio DOUBLE PRECISION, blob BYTEA, flag BOOLEAN)")?
+    let s = Sample { id: 1, note: None, ratio: 0.25, blob: bytes([0, 255, 10, 13]), flag: true }
+    db.exec("INSERT INTO samples VALUES ($1, $2, $3, $4, $5)", postgres.values(s))?
+    db.exec("INSERT INTO samples VALUES ($1, $2, $3, $4, $5)", postgres.values({ s with id: 2, note: Some("é \"quoted\""), flag: false }))?
+    let back: List[Sample] = db.all("SELECT * FROM samples ORDER BY id")?
+    root.stdout.print("{back}")
+
+    // many rows: the reply arrives over many reads
+    db.exec("INSERT INTO samples SELECT g, 'n' || g, g / 7.0, '\\x00', g % 2 = 0 FROM generate_series(3, 20002) g")?
+    let n = (db.query("SELECT * FROM samples")?).len()
+    root.stdout.print("rows {n}")
+
+    // the pool: 20 tasks share 4 connections
+    let pool = postgres.pool(root.net, root.rand, address, 4)?
+    let counts = group g {
+        for i in 0..<20 {
+            g.go(|| postgres.using(pool, |c| c.query("SELECT pg_sleep(0.02), $1::int AS i", [postgres.Int(i)])).map(|rows| rows.len()))
+        }
+    }
+    root.stdout.print("pool {counts.filter(|r| r == Ok(1)).len()} of 20")
+    Ok(())
+}

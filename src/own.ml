@@ -52,7 +52,7 @@ and live_stmt ?(pin = S.empty) s out ~brk ~cont : ann * S.t =
   | Break -> plain brk
   | Continue -> plain cont
   | Return a -> plain (ids [ a ])
-  | Drop _ | GuardEnd _ -> plain out
+  | Drop _ | GuardEnd _ | Line _ -> plain out
   | Scope (g, body) ->
     (* the deadline can stop the body anywhere; the code after reads only
        what is live after it, which the body keeps (owned flags tell the

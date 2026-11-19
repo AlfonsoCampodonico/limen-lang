@@ -75,6 +75,6 @@ fn main(root: Root) -> Int {
 }
 
 fn dump(c: typecheck.Checked, files: List[diag.Source], libs: List[Str], tests: Bool) -> Str {
-    let (prog, _) = lower.lower_program(c.prelude, c.items, c.cx, c.state, tests)
+    let (prog, _) = lower.lower_program(c.prelude, c.items, c.cx, c.state, tests, false)
     ir_print.program(files, own.program(pure.cse(prog)), libs).join("\n")
 }

@@ -71,7 +71,7 @@ pub fn escapes(v: ir.Var, body: List[ir.Stmt]) -> Bool {
         Loop(b) => escapes(v, b),
         // code after a panic or deadline can see the list: keep the checks
         Guard(..) | Scope(..) => true,
-        Break | Continue | Drop(_) | GuardEnd(_) => false,
+        Break | Continue | Drop(_) | GuardEnd(_) | Line(_) => false,
     })
 }
 

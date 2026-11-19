@@ -20,7 +20,7 @@
    channels, `Bytes`, arrays, maps without `Str` keys, `dyn` values, `()`)
    are E0212 too, naming where in the type they are.
 
-   The sql module's work the same way, for structs whose fields are Int,
+   The sql and postgres modules' work the same way, for structs whose fields are Int,
    Float, Str, Bool, Bytes or an Option of one: `sql.row$N(row: Row) ->
    Result[T, IoError]` reads each field from the column of its name, and
    `sql.values$N(x: T) -> List[Value]` writes the fields in order. A use of
@@ -347,17 +347,22 @@ let rec concrete t =
    `sql.decode`, `sql.values`, `db.all` and `db.one`, pointed at its
    conversion and those conversions added, or None when it uses none of
    them. [json] and [sql] are those modules' names here, when loaded. *)
-let expand ?json ?sql (items : item list) : (item list * Diag.t list) option =
+let expand ?json ?(rows = []) (items : item list) : (item list * Diag.t list) option =
   begin
     let structs = Hashtbl.create 16 and enums = Hashtbl.create 16 in
     (* the prelude's types too: Result is an enum like any other *)
     List.iter (function IStruct s -> Hashtbl.replace structs s.st_name s | IEnum e -> Hashtbl.replace enums e.en_name e | _ -> ()) (Prelude.items () @ items);
     let mk q = { q; sp = Span.dummy; structs; enums; names = Hashtbl.create 16; count = 0; out = []; diags = [] } in
-    let js = mk (Option.value ~default:"" json) and ss = mk (Option.value ~default:"" sql) in
+    let js = mk (Option.value ~default:"" json) in
+    (* the modules that read rows into structs, each writing its own conversions *)
+    let rgs = List.map mk rows in
     let wrappers = Hashtbl.create 16 in
     let found = ref false in
     let is_json n = json <> None && (n = jf js "encode" || n = jf js "decode") in
-    let is_sql n = sql <> None && (n = jf ss "decode" || n = jf ss "values") in
+    let row_module n = List.find_opt (fun st -> n = jf st "decode" || n = jf st "values") rgs in
+    let db_module (recv : expr) =
+      match repr recv.ety with TNamed (n, []) -> List.find_opt (fun st -> n = jf st "Db") rgs | _ -> None
+    in
     let fn_item w sp params ret body =
       IFn
         { fn_name = w; fn_span = sp; fn_gen = []; fn_params = params; fn_ret = Some ret; fn_body = body;
@@ -417,27 +422,30 @@ let expand ?json ?sql (items : item list) : (item list * Diag.t list) option =
               e.edesc <- EVar w;
               e.einst <- []
             with Unsupported inner -> no_form st e what t inner "JSON")))
-      | EVar n when is_sql n -> (
+      | EVar n when row_module n <> None -> (
         found := true;
-        let st = ss in
-        let what = if n = jf st "decode" then "sql.decode" else "sql.values" in
-        match known st e what (if what = "sql.decode" then "say the type: `let t: Todo = sql.decode(row)?`" else "convert where the type is known") with
+        let st = Option.get (row_module n) in
+        (* `sql`, also when the program names the module `std/sql` *)
+        let m = match String.rindex_opt st.q '/' with Some i -> String.sub st.q (i + 1) (String.length st.q - i - 1) | None -> st.q in
+        let decode = n = jf st "decode" in
+        let what = m ^ (if decode then ".decode" else ".values") in
+        match known st e what (if decode then sprintf "say the type: `let t: Todo = %s.decode(row)?`" m else "convert where the type is known") with
         | None -> ()
         | Some t -> (
           try
             let reader, writer = row_coders st t in
-            e.edesc <- EVar (if what = "sql.decode" then reader else writer);
+            e.edesc <- EVar (if decode then reader else writer);
             e.einst <- []
           with Unsupported inner -> no_form st e what t inner "SQL"))
-      | EMethod (recv, (("all" | "one") as m), _, args)
-        when sql <> None && (match repr recv.ety with TNamed (n, []) -> n = jf ss "Db" | _ -> false) -> (
+      | EMethod (recv, (("all" | "one") as m), _, args) when db_module recv <> None -> (
         found := true;
-        let st = ss in
+        let st = Option.get (db_module recv) in
         let what = "db." ^ m in
         match known st e what (sprintf "say the type: `let t: %s = db.%s(...)?`" (if m = "all" then "List[Todo]" else "Option[Todo]") m) with
         | None -> ()
         | Some t -> (
-          let key = what ^ " " ^ show t in
+          (* the module too: the same struct can be read from sql and postgres *)
+          let key = st.q ^ " " ^ what ^ " " ^ show t in
           let point w = e.edesc <- ECall ({ (var st w) with espan = e.espan }, recv :: args); e.einst <- [] in
           match Hashtbl.find_opt wrappers key with
           | Some w -> point w
@@ -466,5 +474,8 @@ let expand ?json ?sql (items : item list) : (item list * Diag.t list) option =
     (* a table test's case, then the body, as selfhost/walk.lmn orders them *)
     List.iter (function IFn d -> Option.iter (fun (_, c) -> iter_expr visit c) d.fn_table; iter_block visit d.fn_body | _ -> ()) items;
     if not !found then None
-    else Some (items @ List.rev js.out @ List.rev ss.out, List.rev js.diags @ List.rev ss.diags)
+    else
+      Some
+        ( items @ List.rev js.out @ List.concat_map (fun st -> List.rev st.out) rgs,
+          List.rev js.diags @ List.concat_map (fun st -> List.rev st.diags) rgs )
   end

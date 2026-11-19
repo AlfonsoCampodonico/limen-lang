@@ -1,0 +1,6 @@
+no password: Ok(Err(Failed("redis: NOAUTH Authentication required.")))
+ping true
+binary back true
+Many([Bulk("1"), Bulk("2"), Nil])
+del true false exists true
+pool ok 30, counter Some("30")

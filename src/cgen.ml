@@ -1091,6 +1091,54 @@ let kept_or c out ind (v : I.var) r =
 
 let scope_counter = ref 0
 
+(* `#line N "file"` for where [sp] starts, so a debugger, the sanitizers
+   and crash traces show the Limen line. The line starts of each file are
+   found once. *)
+let line_starts : (string, int array) Hashtbl.t = Hashtbl.create 8
+
+let line_directive (sp : Span.t) =
+  let starts =
+    match Hashtbl.find_opt line_starts sp.file with
+    | Some a -> a
+    | None ->
+      let text = Option.value ~default:"" (Source.text sp.file) in
+      let acc = ref [ 0 ] in
+      String.iteri (fun i ch -> if ch = '\n' then acc := (i + 1) :: !acc) text;
+      let a = Array.of_list (List.rev !acc) in
+      Hashtbl.replace line_starts sp.file a;
+      a
+  in
+  (* the last line start at or before sp.lo *)
+  let rec find lo hi = if lo >= hi then lo else let mid = (lo + hi + 1) / 2 in if starts.(mid) <= sp.lo then find mid hi else find lo (mid - 1) in
+  let ln = find 0 (Array.length starts - 1) + 1 in
+  let file = String.concat "\\\\" (String.split_on_char '\\' sp.file) in
+  let file = String.concat "\\\"" (String.split_on_char '"' file) in
+  sprintf "#line %d \"%s\"" ln file
+
+(* A `#line` counts on from itself: the C line after it is that line, the
+   next one the line after. A statement's C takes several lines, so every
+   line up to the next mark gets the mark again, and stays on the Limen
+   line. A function's closing `}` (alone at the start of a line) gets
+   `#line 1 "<generated>"` instead, so the code the compiler adds between
+   functions is not taken for Limen lines. *)
+let pin_lines text =
+  if not (contains text "#line ") then text
+  else begin
+    let cur = ref None in
+    let out =
+      List.concat_map
+        (fun l ->
+          if String.starts_with ~prefix:"#line " l then (cur := Some l; [])
+          else
+            match !cur with
+            | Some _ when l = "}" -> cur := None; [ "#line 1 \"<generated>\""; l ]
+            | Some d -> [ d; l ]
+            | None -> [ l ])
+        (String.split_on_char '\n' text)
+    in
+    String.concat "\n" out
+  end
+
 let rec stmts c out ind (ss : I.stmt list) = List.iter (stmt c out ind) ss
 
 (* A loop's body: a cancellation checkpoint first, on every iteration
@@ -1311,6 +1359,7 @@ and stmt c out ind (s : I.stmt) =
     let g = sprintf "g%d_" n in
     line (sprintf "if (%sslot) *%sslot = %s.prev;" g g g);
     line (sprintf "w_catch_end(&%s);" g)
+  | I.Line sp -> Buffer.add_string out (line_directive sp ^ "\n")
 
 let signature c (f : I.fn) =
   let ps = List.map (fun (v : I.var) -> sprintf "%s%s %s" (ctype c v.ty) (vol c v) (var v)) f.params in
@@ -1349,7 +1398,7 @@ let guard_vols (body : I.stmt list) =
       let d1, u1 = scan h and d2, u2 = scan b in
       (S.union d1 d2, S.union u1 u2)
     | I.Scope (_, b) -> scan b
-    | I.Break | I.Continue | I.GuardEnd _ -> (S.empty, S.empty)
+    | I.Break | I.Continue | I.GuardEnd _ | I.Line _ -> (S.empty, S.empty)
   in
   let rec walk acc ss =
     List.fold_left
@@ -1987,4 +2036,5 @@ let program (g : Lower.gctx) (prog : I.program) : string =
     if List.exists (fun part -> contains part "w_group_new_until(") program then []
     else [ no_checkpoints ]
   in
+  let program = if !Lower.lines then List.map pin_lines program else program in
   (if !uses_tls then tls_marker else "") ^ String.concat "\n" ((Runtime_text.text :: never_stops) @ program)

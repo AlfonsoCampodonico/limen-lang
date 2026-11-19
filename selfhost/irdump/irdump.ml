@@ -176,6 +176,7 @@ and stmt ind s =
     line "body";
     block deeper b
   | GuardEnd n -> line (Printf.sprintf "guardend %d" n)
+  | Line sp -> line (Printf.sprintf "line %d" sp.lo)
   | Scope (g, b) ->
     line ("scope " ^ atom g);
     block deeper b

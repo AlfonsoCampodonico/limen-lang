@@ -1,0 +1,762 @@
+// Postgres over its wire protocol (version 3), written in Limen: no C
+// library, only the `Net` the program was granted.
+//
+//   let db = postgres.connect(root.net, root.rand, "postgres://app:secret@db.internal/app")?
+//   db.exec("CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL)")?
+//   db.exec("INSERT INTO todos (title) VALUES ($1)", [postgres.Text("write")])?
+//   let todos: List[Todo] = db.all("SELECT id, title FROM todos WHERE id > $1", [postgres.Int(0)])?
+//
+// Values go in as parameters, `$1`, `$2`, ..., never into the SQL text.
+// Rows are read as `sql` rows are: `row.int("id")`, or into a struct with
+// `db.all`, `db.one` and `postgres.decode(row)`, which the compiler writes
+// for each struct as it does for `sql`. Logging in takes SCRAM-SHA-256 (the
+// default since Postgres 14), MD5 or a cleartext password; the nonce of
+// SCRAM comes from `Rand`. Connections are plain TCP: TLS is not supported
+// yet.
+//
+// A `Db` is one connection, used by one task at a time: a query is a
+// request and its whole answer. For a server, `postgres.pool` opens a few
+// and `postgres.using(pool, |db| ...)` lends one to each request.
+
+use base64
+use hash
+use url
+
+// One connection.
+pub struct Db {
+    conn: Conn,
+}
+
+// One value: a parameter, or a column of a row. A `bool` column reads as
+// `Int(1)` or `Int(0)`, `bytea` as `Blob`, the integer types as `Int`,
+// `real` and `double precision` as `Float`, and the rest (`numeric`,
+// `text`, dates, `json`) as their text.
+pub enum Value {
+    Null,
+    Int(Int),
+    Float(Float),
+    Text(Str),
+    Blob(Bytes),
+}
+
+// One result row: column names and values, in the order of the SELECT.
+pub struct Row {
+    columns: List[Str],
+    values: List[Value],
+}
+
+// ---------- connecting ----------
+
+// Connect and log in. `address` is `postgres://user:password@host:port/database`
+// (`postgresql://` too); the port defaults to 5432 and the database to the
+// user's name.
+pub fn connect(net: Net, rand: Rand, address: Str) -> Result[Db, IoError] {
+    let u = match url.parse(address) {
+        Ok(u) => u,
+        Err(e) => {
+            return Err(Failed("postgres: {e}"))
+        },
+    }
+    if u.scheme != "postgres" && u.scheme != "postgresql" {
+        return Err(Failed("postgres: the address starts with postgres://, not {u.scheme}://"))
+    }
+    let user = url.decode(u.user) ?? u.user
+    let password = url.decode(u.password) ?? u.password
+    if user == "" {
+        return Err(Failed("postgres: the address names no user"))
+    }
+    let path = if u.path.starts_with("/") { u.path.slice(1, u.path.len()) } else { u.path }
+    let database = if path == "" { user } else { url.decode(path) ?? path }
+    let host = if u.host.contains(":") { "[{u.host}]" } else { u.host }
+    let conn = net.connect("{host}:{u.port ?? 5432}")?
+    let db = Db { conn }
+    match db.log_in(rand, user, password, database) {
+        Ok(_) => Ok(db),
+        Err(e) => {
+            let _ = conn.close()
+            Err(e)
+        },
+    }
+}
+
+fn log_in(self: Db, rand: Rand, user: Str, password: Str, database: Str) -> Result[(), IoError] {
+    let body = int32(196608) + cstr("user") + cstr(user) + cstr("database") + cstr(database) + cstr("client_encoding") + cstr("UTF8") + [0]
+    self.send(int32(body.len() + 4) + body)?
+    let mut r = Reader { conn: self.conn, buf: bytes([]), at: 0 }
+    // the SCRAM exchange so far, when the server asked for it
+    let mut scram: Option[Scram] = None
+    while true {
+        let (m, after) = r.next()?
+        r = after
+        match m.kind {
+            // 'R': authentication
+            82 => {
+                let code = m.code_at(0)
+                if code == 0 {
+                    continue
+                } else if code == 3 {
+                    self.send(message(112, cstr(password)))?
+                } else if code == 5 {
+                    let inner = hash.md5_hex((password + user).to_bytes())
+                    let outer = hash.md5_hex(inner.to_bytes() + m.data.slice(4, 8))
+                    self.send(message(112, cstr("md5" + outer)))?
+                } else if code == 10 {
+                    if !m.data.slice(4, m.data.len()).to_str().contains("SCRAM-SHA-256") {
+                        return Err(Failed("postgres: the server offers no login this client knows (SCRAM-SHA-256, MD5, password)"))
+                    }
+                    let s = scram_start(rand)
+                    let first = "n,," + s.first_bare
+                    self.send(message(112, cstr("SCRAM-SHA-256") + int32(first.len()) + first.to_bytes().to_list()))?
+                    scram = Some(s)
+                } else if code == 11 {
+                    let s = match scram {
+                        Some(s) => s,
+                        None => {
+                            return Err(Failed("postgres: the server continued a login that did not start"))
+                        },
+                    }
+                    let (final, s2) = scram_final(s, password, m.data.slice(4, m.data.len()).to_str())?
+                    self.send(message(112, final.to_bytes().to_list()))?
+                    scram = Some(s2)
+                } else if code == 12 {
+                    match scram {
+                        Some(s) => scram_check(s, m.data.slice(4, m.data.len()).to_str())?,
+                        None => {
+                            return Err(Failed("postgres: the server ended a login that did not start"))
+                        },
+                    }
+                } else {
+                    return Err(Failed("postgres: the server asks for a login this client does not know (code {code})"))
+                }
+            },
+            // 'E': an error, such as a wrong password
+            69 => {
+                return Err(server_error(m))
+            },
+            // 'Z': ready for queries
+            90 => {
+                return Ok(())
+            },
+            // 'S' parameter status, 'K' the key for cancelling, 'N' notices
+            _ => {},
+        }
+    }
+    Ok(())
+}
+
+// Close the connection.
+pub fn close(self: Db) {
+    let _ = self.send(message(88, []))
+    self.conn.close()
+}
+
+// ---------- SCRAM-SHA-256 (RFC 5802, RFC 7677) ----------
+
+struct Scram {
+    nonce: Str,
+    first_bare: Str,
+    // after the server's first message: what the server must sign
+    auth: Str,
+    salted: Bytes,
+}
+
+fn scram_start(rand: Rand) -> Scram {
+    let nonce = base64.encode(rand.bytes(18))
+    // Postgres takes the user from the startup message, so the name here is empty
+    Scram { nonce, first_bare: "n=,r={nonce}", auth: "", salted: bytes([]) }
+}
+
+fn scram_final(s: Scram, password: Str, server_first: Str) -> Result[(Str, Scram), IoError] {
+    let mut nonce = ""
+    let mut salt = ""
+    let mut rounds = 0
+    for part in server_first.split(",") {
+        if part.starts_with("r=") {
+            nonce = part.slice(2, part.len())
+        } else if part.starts_with("s=") {
+            salt = part.slice(2, part.len())
+        } else if part.starts_with("i=") {
+            rounds = part.slice(2, part.len()).parse_int() ?? 0
+        }
+    }
+    if !nonce.starts_with(s.nonce) || rounds < 1 {
+        return Err(Failed("postgres: the server's SCRAM reply does not fit the login"))
+    }
+    let salt_bytes = match base64.decode(salt) {
+        Ok(b) => b,
+        Err(e) => {
+            return Err(Failed("postgres: the server's SCRAM salt: {e}"))
+        },
+    }
+    let salted = pbkdf2(password.to_bytes(), salt_bytes, rounds)
+    let client_key = hash.hmac_sha256(salted, "Client Key".to_bytes())
+    let stored = hash.sha256(client_key)
+    let without_proof = "c=biws,r={nonce}"
+    let auth = s.first_bare + "," + server_first + "," + without_proof
+    let signature = hash.hmac_sha256(stored, auth.to_bytes())
+    let proof = xor(client_key, signature)
+    Ok(("{without_proof},p={base64.encode(proof)}", { s with auth, salted }))
+}
+
+// The server proves it knew the password too.
+fn scram_check(s: Scram, server_final: Str) -> Result[(), IoError] {
+    let server_key = hash.hmac_sha256(s.salted, "Server Key".to_bytes())
+    let want = base64.encode(hash.hmac_sha256(server_key, s.auth.to_bytes()))
+    if server_final.trim() != "v=" + want {
+        return Err(Failed("postgres: the server could not prove it knows the password"))
+    }
+    Ok(())
+}
+
+// PBKDF2 with HMAC-SHA-256, one block of 32 bytes: SCRAM's Hi().
+fn pbkdf2(password: Bytes, salt: Bytes, rounds: Int) -> Bytes {
+    let mut u = hash.hmac_sha256(password, salt + bytes([0, 0, 0, 1]))
+    let mut out = u.to_list()
+    for _ in 1..<rounds {
+        u = hash.hmac_sha256(password, u)
+        let ub = u.to_list()
+        for i in 0..<out.len() {
+            out[i] = out[i] ^ ub[i]
+        }
+    }
+    bytes(out)
+}
+
+fn xor(a: Bytes, b: Bytes) -> Bytes {
+    let (x, y) = (a.to_list(), b.to_list())
+    bytes(x.zip(y).map(|p| p.0 ^ p.1))
+}
+
+// ---------- running statements ----------
+
+// Run a statement and return the number of rows it changed. With no
+// parameters the text may hold several statements separated by `;` (a
+// schema); with parameters it is one, and `$1`, `$2`, ... take them in
+// order.
+pub fn exec(self: Db, text: Str, params: List[Value] = []) -> Result[Int, IoError] {
+    let (_, changed) = self.run(text, params)?
+    Ok(changed)
+}
+
+// Run one statement and return every row.
+pub fn query(self: Db, text: Str, params: List[Value] = []) -> Result[List[Row], IoError] {
+    let (rows, _) = self.run(text, params)?
+    Ok(rows)
+}
+
+// The first row, if any.
+pub fn query_one(self: Db, text: Str, params: List[Value] = []) -> Result[Option[Row], IoError] {
+    let rows = self.query(text, params)?
+    if rows.is_empty() { Ok(None) } else { Ok(Some(rows[0])) }
+}
+
+// Run `body` in a transaction: committed if it returns Ok, rolled back if
+// it returns Err or panics (the panic then goes on).
+pub fn transaction[T](self: Db, body: fn() -> Result[T, IoError]) -> Result[T, IoError] {
+    self.exec("BEGIN")?
+    let mut settled = false
+    defer if !settled {
+        let _ = self.exec("ROLLBACK")
+    }
+    let r = catch(body)
+    settled = true
+    match r {
+        Ok(Ok(v)) => {
+            self.exec("COMMIT")?
+            Ok(v)
+        },
+        Ok(Err(e)) => {
+            let _ = self.exec("ROLLBACK")
+            Err(e)
+        },
+        Err(p) => {
+            let _ = self.exec("ROLLBACK")
+            panic(p)
+        },
+    }
+}
+
+// The rows of a statement and how many rows it changed. Without parameters
+// it goes as one simple query; with them, as Parse, Bind, Describe,
+// Execute and Sync, every value in text form.
+fn run(self: Db, text: Str, params: List[Value]) -> Result[(List[Row], Int), IoError] {
+    if params.is_empty() {
+        self.send(message(81, cstr(text)))?
+    } else {
+        let mut bind = cstr("") + cstr("") + int16(0) + int16(params.len())
+        for p in params {
+            match param_text(p) {
+                Some(t) => {
+                    let b = t.to_bytes().to_list()
+                    bind = bind + int32(b.len()) + b
+                },
+                None => {
+                    bind = bind + int32(-1)
+                },
+            }
+        }
+        bind = bind + int16(0)
+        let parse = message(80, cstr("") + cstr(text) + int16(0))
+        let describe = message(68, [80] + cstr(""))
+        let execute = message(69, cstr("") + int32(0))
+        self.send(parse + message(66, bind) + describe + execute + message(83, []))?
+    }
+    let mut r = Reader { conn: self.conn, buf: bytes([]), at: 0 }
+    let mut columns: List[Str] = []
+    let mut types: List[Int] = []
+    let mut rows: List[Row] = []
+    let mut changed = 0
+    let mut failed: Option[IoError] = None
+    while true {
+        let (m, after) = r.next()?
+        r = after
+        match m.kind {
+            // 'T': the columns of the rows that follow
+            84 => {
+                let (cs, ts) = m.columns()
+                columns = cs
+                types = ts
+            },
+            // 'D': a row
+            68 => {
+                rows.push(Row { columns, values: m.row(types) })
+            },
+            // 'C': a statement finished, `INSERT 0 3`, `UPDATE 2`, `SELECT 5`
+            67 => {
+                let tag = m.data.slice(0, m.data.len() - 1).to_str()
+                changed = tag.split(" ").last().map(|n| n.parse_int() ?? 0) ?? 0
+            },
+            // 'E': an error; the server still sends 'Z' after it
+            69 => {
+                if failed.is_none() {
+                    failed = Some(server_error(m))
+                }
+            },
+            // 'Z': ready again
+            90 => {
+                return match failed {
+                    Some(e) => Err(e),
+                    None => Ok((rows, changed)),
+                }
+            },
+            _ => {},
+        }
+    }
+    Ok((rows, changed))
+}
+
+fn param_text(v: Value) -> Option[Str] {
+    match v {
+        Null => None,
+        Int(n) => Some(n.to_str()),
+        Float(x) => Some(x.to_str()),
+        Text(s) => Some(s),
+        Blob(b) => Some("\\x" + hex_of(b)),
+    }
+}
+
+fn hex_of(b: Bytes) -> Str {
+    let digits = "0123456789abcdef"
+    b.to_list().map(|x| digits.slice(x / 16, x / 16 + 1) + digits.slice(x % 16, x % 16 + 1)).join("")
+}
+
+fn server_error(m: Msg) -> IoError {
+    let mut text = ""
+    let mut code = ""
+    let mut detail = ""
+    let mut i = 0
+    let d = m.data
+    while i < d.len() && d[i] != 0 {
+        let field = d[i]
+        let mut j = i + 1
+        while j < d.len() && d[j] != 0 {
+            j = j + 1
+        }
+        let value = d.slice(i + 1, j).to_str()
+        if field == 77 {
+            text = value
+        } else if field == 67 {
+            code = value
+        } else if field == 68 {
+            detail = value
+        }
+        i = j + 1
+    }
+    let more = if detail == "" { "" } else { ": {detail}" }
+    Failed("postgres: {text}{more} ({code})")
+}
+
+fn send(self: Db, data: List[Int]) -> Result[(), IoError] {
+    self.conn.write(bytes(data).to_str())
+}
+
+// ---------- messages ----------
+
+// A message from the server: its type byte and what follows the length.
+struct Msg {
+    kind: Int,
+    data: Bytes,
+}
+
+// What has been read from the connection and not yet taken apart.
+struct Reader {
+    conn: Conn,
+    buf: Bytes,
+    at: Int,
+}
+
+// The next message, reading more when it has not all arrived.
+fn next(self: Reader) -> Result[(Msg, Reader), IoError] {
+    let mut r = self
+    while true {
+        let have = r.buf.len() - r.at
+        if have >= 5 {
+            let size = be32(r.buf, r.at + 1)
+            if have >= size + 1 {
+                let m = Msg { kind: r.buf[r.at], data: r.buf.slice(r.at + 5, r.at + 1 + size) }
+                r.at = r.at + 1 + size
+                return Ok((m, r))
+            }
+        }
+        let more = r.conn.read()?
+        if more == "" {
+            return Err(Failed("postgres: the server closed the connection"))
+        }
+        r = Reader { conn: r.conn, buf: r.buf.slice(r.at, r.buf.len()) + more.to_bytes(), at: 0 }
+    }
+    Err(Failed("postgres: unreachable"))
+}
+
+fn code_at(self: Msg, at: Int) -> Int {
+    be32(self.data, at)
+}
+
+// The names and type ids of a RowDescription's columns.
+fn columns(self: Msg) -> (List[Str], List[Int]) {
+    let d = self.data
+    let n = be16(d, 0)
+    let mut names: List[Str] = []
+    let mut types: List[Int] = []
+    let mut i = 2
+    for _ in 0..<n {
+        let mut j = i
+        while d[j] != 0 {
+            j = j + 1
+        }
+        names.push(d.slice(i, j).to_str())
+        // table id (4), column number (2), then the type id (4)
+        types.push(be32(d, j + 7))
+        // type size (2), type modifier (4), format (2)
+        i = j + 19
+    }
+    (names, types)
+}
+
+// The values of a DataRow, by the columns' types.
+fn row(self: Msg, types: List[Int]) -> List[Value] {
+    let d = self.data
+    let n = be16(d, 0)
+    let mut out: List[Value] = []
+    let mut i = 2
+    for k in 0..<n {
+        let size = be32(d, i)
+        i = i + 4
+        if size < 0 {
+            out.push(Null)
+        } else {
+            let text = d.slice(i, i + size).to_str()
+            out.push(typed(text, types.get(k) ?? 25))
+            i = i + size
+        }
+    }
+    out
+}
+
+// A column's text as a Value, by its type id (pg_type.oid).
+fn typed(text: Str, oid: Int) -> Value {
+    if oid == 16 {
+        Int(if text == "t" { 1 } else { 0 })
+    } else if oid == 20 || oid == 21 || oid == 23 || oid == 26 {
+        match text.parse_int() {
+            Some(n) => Int(n),
+            None => Text(text),
+        }
+    } else if oid == 700 || oid == 701 {
+        match text.parse_float() {
+            Some(x) => Float(x),
+            None => Text(text),
+        }
+    } else if oid == 17 && text.starts_with("\\x") {
+        Blob(unhex(text.slice(2, text.len())))
+    } else {
+        Text(text)
+    }
+}
+
+fn unhex(s: Str) -> Bytes {
+    let bs = s.bytes()
+    let mut out: List[Int] = []
+    let mut i = 0
+    while i + 1 < bs.len() {
+        out.push(nibble(bs[i]) * 16 + nibble(bs[i + 1]))
+        i = i + 2
+    }
+    bytes(out)
+}
+
+fn nibble(b: Int) -> Int {
+    if b >= 97 { b - 87 } else if b >= 65 { b - 55 } else { b - 48 }
+}
+
+fn be32(b: Bytes, at: Int) -> Int {
+    let v = (b[at] << 24) | (b[at + 1] << 16) | (b[at + 2] << 8) | b[at + 3]
+    if v >= 0x8000_0000 { v - 0x1_0000_0000 } else { v }
+}
+
+fn be16(b: Bytes, at: Int) -> Int {
+    (b[at] << 8) | b[at + 1]
+}
+
+fn int32(n: Int) -> List[Int] {
+    let v = if n < 0 { n + 0x1_0000_0000 } else { n }
+    [(v >> 24) & 0xff, (v >> 16) & 0xff, (v >> 8) & 0xff, v & 0xff]
+}
+
+fn int16(n: Int) -> List[Int] {
+    [(n >> 8) & 0xff, n & 0xff]
+}
+
+fn cstr(s: Str) -> List[Int] {
+    s.to_bytes().to_list() + [0]
+}
+
+// A message to the server: its type byte, its length, then `body`.
+fn message(kind: Int, body: List[Int]) -> List[Int] {
+    [kind] + int32(body.len() + 4) + body
+}
+
+// ---------- a pool of connections ----------
+
+// `size` connections, each lent to one task at a time by `using`.
+pub fn pool(net: Net, rand: Rand, address: Str, size: Int) -> Result[Chan[Db], IoError] {
+    let c: Chan[Db] = channel(size)
+    for _ in 0..<size {
+        c.send(connect(net, rand, address)?)
+    }
+    Ok(c)
+}
+
+// Run `body` with a connection from `pool`, waiting for one when all are
+// in use; it goes back when `body` returns or panics.
+pub fn using[T](pool: Chan[Db], body: fn(Db) -> Result[T, IoError]) -> Result[T, IoError] {
+    let db = match pool.recv() {
+        Some(d) => d,
+        None => {
+            return Err(Failed("postgres: the pool is closed"))
+        },
+    }
+    defer pool.send(db)
+    body(db)
+}
+
+// ---------- rows ----------
+
+fn index(self: Row, name: Str) -> Int {
+    for (i, c) in self.columns.with_index() {
+        if c == name {
+            return i
+        }
+    }
+    panic("postgres: the row has no column `{name}` (it has {self.columns.join(", ")})")
+}
+
+// The value of column `name`. Panics if there is no such column.
+pub fn get(self: Row, name: Str) -> Value {
+    self.values[self.index(name)]
+}
+
+fn wrong(name: Str, want: Str, v: Value) -> Str {
+    "postgres: column `{name}` is not {want}: {v}"
+}
+
+// Typed access: None when the column is NULL. Panics if there is no such
+// column or it holds another type (an Int column reads as Float too).
+pub fn int(self: Row, name: Str) -> Option[Int] {
+    match self.get(name) {
+        Int(n) => Some(n),
+        Null => None,
+        v => panic(wrong(name, "an integer", v)),
+    }
+}
+
+pub fn float(self: Row, name: Str) -> Option[Float] {
+    match self.get(name) {
+        Float(x) => Some(x),
+        Int(n) => Some(n.to_float()),
+        Null => None,
+        v => panic(wrong(name, "a number", v)),
+    }
+}
+
+pub fn text(self: Row, name: Str) -> Option[Str] {
+    match self.get(name) {
+        Text(s) => Some(s),
+        Null => None,
+        v => panic(wrong(name, "text", v)),
+    }
+}
+
+pub fn blob(self: Row, name: Str) -> Option[Bytes] {
+    match self.get(name) {
+        Blob(b) => Some(b),
+        Null => None,
+        v => panic(wrong(name, "a blob", v)),
+    }
+}
+
+pub fn is_null(self: Row, name: Str) -> Bool {
+    match self.get(name) {
+        Null => true,
+        _ => false,
+    }
+}
+
+// ---------- structs as rows ----------
+//
+// As in `sql`: the compiler writes these for each struct they are used
+// with (src/derive.ml). The bodies here never run.
+
+// The struct `T` read from `row`, each field from the column of its name.
+pub fn decode[T](row: Row) -> Result[T, IoError] {
+    panic("postgres.decode: the compiler writes this for each struct it is used with")
+}
+
+// Every row the query returns, each read as a `T`.
+pub fn all[T](self: Db, text: Str, params: List[Value] = []) -> Result[List[T], IoError] {
+    panic("postgres.all: the compiler writes this for each struct it is used with")
+}
+
+// The first row the query returns, if any, read as a `T`.
+pub fn one[T](self: Db, text: Str, params: List[Value] = []) -> Result[Option[T], IoError] {
+    panic("postgres.one: the compiler writes this for each struct it is used with")
+}
+
+// The fields of `x` as parameters, in the order the struct declares them.
+pub fn values[T](x: T) -> List[Value] {
+    panic("postgres.values: the compiler writes this for each struct it is used with")
+}
+
+fn column_of(row: Row, field: Str, owner: Str) -> Result[Value, IoError] {
+    for (i, c) in row.columns.with_index() {
+        if c == field {
+            return Ok(row.values[i])
+        }
+    }
+    Err(Failed("postgres: no column `{field}` for `{owner}.{field}`; the row has {row.columns.join(", ")}"))
+}
+
+fn holds(v: Value) -> Str {
+    match v {
+        Null => "NULL",
+        Int(_) => "an integer",
+        Float(_) => "a number",
+        Text(_) => "text",
+        Blob(_) => "a blob",
+    }
+}
+
+fn mismatch(v: Value, field: Str, owner: Str, want: Str) -> IoError {
+    Failed("postgres: column `{field}` holds {holds(v)}, but `{owner}.{field}` is {want}")
+}
+
+fn required[T](v: Option[T], field: Str, owner: Str) -> Result[T, IoError] {
+    match v {
+        Some(x) => Ok(x),
+        None => Err(Failed("postgres: column `{field}` is NULL, but `{owner}.{field}` is not an Option")),
+    }
+}
+
+fn int_at(row: Row, field: Str, owner: Str) -> Result[Option[Int], IoError] {
+    match column_of(row, field, owner)? {
+        Int(n) => Ok(Some(n)),
+        Null => Ok(None),
+        v => Err(mismatch(v, field, owner, "an `Int`")),
+    }
+}
+
+fn float_at(row: Row, field: Str, owner: Str) -> Result[Option[Float], IoError] {
+    match column_of(row, field, owner)? {
+        Float(x) => Ok(Some(x)),
+        Int(n) => Ok(Some(n.to_float())),
+        Null => Ok(None),
+        v => Err(mismatch(v, field, owner, "a `Float`")),
+    }
+}
+
+fn str_at(row: Row, field: Str, owner: Str) -> Result[Option[Str], IoError] {
+    match column_of(row, field, owner)? {
+        Text(s) => Ok(Some(s)),
+        Null => Ok(None),
+        v => Err(mismatch(v, field, owner, "a `Str`")),
+    }
+}
+
+fn bool_at(row: Row, field: Str, owner: Str) -> Result[Option[Bool], IoError] {
+    match column_of(row, field, owner)? {
+        Int(n) => Ok(Some(n != 0)),
+        Null => Ok(None),
+        v => Err(mismatch(v, field, owner, "a `Bool`")),
+    }
+}
+
+fn bytes_at(row: Row, field: Str, owner: Str) -> Result[Option[Bytes], IoError] {
+    match column_of(row, field, owner)? {
+        Blob(b) => Ok(Some(b)),
+        Null => Ok(None),
+        v => Err(mismatch(v, field, owner, "`Bytes`")),
+    }
+}
+
+fn of_int(x: Int) -> Value {
+    Int(x)
+}
+
+fn of_float(x: Float) -> Value {
+    Float(x)
+}
+
+fn of_str(x: Str) -> Value {
+    Text(x)
+}
+
+// A Bool parameter goes as the text `true` or `false`, which a `boolean`
+// column takes; it reads back as Int(1) or Int(0).
+fn of_bool(x: Bool) -> Value {
+    Text(if x { "true" } else { "false" })
+}
+
+fn of_bytes(x: Bytes) -> Value {
+    Blob(x)
+}
+
+fn of_option[T](x: Option[T], f: fn(T) -> Value) -> Value {
+    match x {
+        Some(v) => f(v),
+        None => Null,
+    }
+}
+
+fn rows_as[T](rows: List[Row], read: fn(Row) -> Result[T, IoError]) -> Result[List[T], IoError] {
+    let mut out: List[T] = []
+    for r in rows {
+        out.push(read(r)?)
+    }
+    Ok(out)
+}
+
+fn row_as[T](row: Option[Row], read: fn(Row) -> Result[T, IoError]) -> Result[Option[T], IoError] {
+    match row {
+        Some(r) => Ok(Some(read(r)?)),
+        None => Ok(None),
+    }
+}

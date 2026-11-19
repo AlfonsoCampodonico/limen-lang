@@ -174,6 +174,7 @@ let run_native_tests items tests benches bench =
   let exe = Filename.concat (Filename.get_temp_dir_name ()) (Printf.sprintf "limen-test-%d" (Unix.getpid ())) in
   (* benchmarks measure the optimised program; tests build fast *)
   let flags = if bench = None then Some Native.dev_flags else None in
+  Lower.lines := bench = None;
   (match Native.build ?flags ~tests:true items exe with
    | Ok () -> ()
    | Error m -> prerr_string (Native.cc_failed m); exit 1);
@@ -454,6 +455,8 @@ let cmd_build file out dev emit_c =
   Package.write_lock := true;
   let items = checked file in
   let out = match out with Some o -> o | None -> Filename.remove_extension (Filename.basename file) in
+  (* a development build marks Limen lines in its C *)
+  Lower.lines := dev;
   if emit_c then Out_channel.with_open_bin (out ^ ".c") (fun oc -> output_string oc (Native.c_source items))
   else
     match Native.build ?flags:(if dev then Some Native.dev_flags else None) items out with
@@ -469,6 +472,7 @@ let cmd_run_native file grant_args prog_args =
   let items = checked file in
   let dir = Filename.get_temp_dir_name () in
   let exe = Filename.concat dir (Printf.sprintf "limen-%d" (Unix.getpid ())) in
+  Lower.lines := true;
   (match Native.build ~flags:Native.dev_flags items exe with
    | Ok () -> ()
    | Error m -> prerr_string (Native.cc_failed m); exit 1);

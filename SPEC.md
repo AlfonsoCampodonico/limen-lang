@@ -1698,6 +1698,7 @@ upat       = "_" | IDENT | tuplepat ;
 ## 17. Tools
 
 - `limen build FILE` compiles the program's C with optimisation (`-O3`), for the binary you ship. `limen build --dev`, `limen run --native` and `limen test --native` compile it without (`-O0`), which builds faster and runs slower; `limen test --bench` always builds optimised, so benchmarks measure the program you ship. Unoptimised code uses more stack per call, so very deep recursion reaches a task's stack limit sooner.
+- **Debugging.** A development build's C marks every Limen statement with `#line N "file.lmn"`, on every C line the statement becomes, and is compiled with `-g`, so lldb, gdb, the sanitizers and crash traces show Limen files and lines: `breakpoint set --file app.lmn --line 15` stops there, and a crash in C called from Limen shows the chain of Limen calls that led to it (`bt` in lldb: `wf_deep(...) at app.lmn:7`). The code the compiler adds between functions shows as `<generated>`. On macOS the debug information is collected next to the binary (`app.dSYM`, by `dsymutil`), and such a build is not taken from or put in the build cache, whose binaries' debug maps would name object files that are gone. Variables still show their C names (`v6`). `limen build --emit-c --dev` writes the marked C; an optimised build's C has no marks.
 - How a native build is put together: the runtime is compiled once, as an object kept in the build cache, and its declarations once, as a precompiled header where the C compiler is clang. The program's C is cut into pieces of about 3,000 lines that compile at the same time against a shared header, then linked with the runtime; a smaller program is one piece, compiled and linked in one step. Measured on an Apple silicon Mac with the runtime already cached: hello world builds in 0.05 s, a 400-line HTTP and SQLite service in 0.65 s optimised and 0.2 s with `--dev`, and the self-hosted compiler (420,000 lines of C) in about 11 s. The first build with a new C compiler or flags compiles the runtime too, which takes about 0.8 s. The finished binary is cached by the exact C text and command line, so building an unchanged program again costs only the front end, a few hundredths of a second. With `LIMEN_CACHE=off`, a one-piece program is compiled as one file, which leaves out the parts of the runtime it doesn't use. `limen build --emit-c` writes that one file, which needs nothing but a C compiler.
 - `limen fmt FILE` prints the canonical formatting (`--write` rewrites, `--check` verifies).
 - `limen lsp` is a language server (diagnostics, hover, definition, references, rename, completion, quick fixes, outline); `limen mcp` is an MCP server exposing check, run, test, format, caps, type-at, references, rename and the spec to coding agents. Rename is refused when it is unsafe: the renamed program must check with no new errors, and the new name must refer to exactly the renamed places.
@@ -2076,6 +2077,51 @@ fn main(root: Root) -> Result[(), IoError] {
 - SQLite stays inside the grants. `ATTACH` is turned off, and with it `VACUUM` (which attaches a temporary database; `VACUUM INTO` would write anywhere), so SQL cannot open other files. The database file is not opened through a symlink, and `open` refuses a database whose `-journal`, `-wal` or `-shm` file is a symlink out of the granted directory (or a broken one), since SQLite follows those. URI filenames and extensions are off (SQLite's defaults, which the module never changes), and temporary tables and sorts stay in memory. What remains are races no Limen code can cause: another process that can write to the directory swapping in such a symlink while the database is open, or swapping a directory on the database's path for a symlink between the check and SQLite's open (SQLite opens by path and follows symlinks in it). The operating-system sandbox, built from the same grant, refuses what either swap would reach; closing them in Limen itself is on the roadmap (0.8). SQLite writes its journal next to the database, inside the granted directory. A busy database is waited on for up to 5 seconds.
 - A statement runs as one call into the runtime, on the blocking-call pool (section 9): it is prepared, bound, stepped through every row and finalized there, and the rows come back together. A slow query, or a wait of up to 5 seconds for a busy database, holds up only its own task, and a row costs no round trip between threads (a scan of 102,400 rows takes about 15 ms natively). Opening and closing run on the pool too. On a connection shared by tasks, SQLite runs one statement at a time; the others wait for it on the pool.
 - A task cancelled during a query (a group deadline, `time.within`) stops it: the statement gives up at its next row, within a thousand of SQLite's instructions while it computes one, or within a millisecond while it waits for another connection's lock, and the task waits for that before it unwinds, so the connection is never used after the task let go and stays usable. An open transaction is rolled back. Only the cancelled task's statement stops: other tasks' statements on the same connection go on. A cancelled task whose statement is still waiting for the connection waits with it, and its statement stops as soon as it starts.
+
+### postgres
+
+Postgres through its wire protocol (version 3), written in Limen: no C library, and nothing to grant but the server's host (`--grant net=db.internal`).
+
+```
+use postgres
+
+struct Todo { id: Int, title: Str, done: Bool }
+
+fn main(root: Root) -> Result[(), IoError] {
+    let db = postgres.connect(root.net, root.rand, "postgres://app:secret@db.internal/app")?
+    db.exec("CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL DEFAULT false)")?
+    db.exec("INSERT INTO todos (title) VALUES ($1)", [postgres.Text("write")])?
+    let todos: List[Todo] = db.all("SELECT id, title, done FROM todos WHERE id > $1", [postgres.Int(0)])?
+    db.close()
+}
+```
+
+- `postgres.connect(net, rand, address)` connects and logs in. `address` is `postgres://user:password@host:port/database` (`postgresql://` too; percent-escapes in the parts are decoded); the port defaults to 5432 and the database to the user's name. Logging in takes SCRAM-SHA-256 (Postgres's default since 14; the server must prove it knows the password too), MD5 or a cleartext password; `Rand` gives SCRAM's nonce. A refused login is `Err(Failed("postgres: password authentication failed for user \"app\" (28P01)"))`, the server's message and its SQLSTATE code, as every server error is.
+- Connections are plain TCP. TLS is not supported yet: Postgres starts it inside the plain connection, and a `Conn` cannot be turned into a TLS one.
+- `exec(text, params = [])`, `query`, `query_one`, `all`, `one`, `transaction` and `close` are as in `sql`, with Postgres's placeholders: `$1`, `$2`, ... take `params` in order. Without parameters a statement goes as one simple query, so `exec` may hold several statements separated by `;`; with them it goes as Parse, Bind, Execute and Sync, each value as text. `exec` returns the rows the statement changed, from the server's `INSERT 0 3`.
+- `postgres.Value` has the same variants as `sql.Value`: `Null`, `Int`, `Float`, `Text`, `Blob`. A column reads by its type: `bool` as `Int(1)` or `Int(0)`, `smallint`, `integer`, `bigint` and `oid` as `Int`, `real` and `double precision` as `Float`, `bytea` as `Blob`, and everything else (`numeric`, `text`, dates, `json`) as `Text`, the server's text for it. A struct's `Bool` field goes as the text `true` or `false`.
+- `postgres.decode(row)`, `db.all(text, params)`, `db.one(text, params)` and `postgres.values(x)` convert rows and structs as `sql`'s do: the compiler writes the conversion for each struct, and a row that does not fit is an `Err` naming the column and the field.
+- A `Db` is one connection, used by one task at a time: a statement is a request and its whole answer. `postgres.pool(net, rand, address, size)` opens `size` connections and returns them in a `Chan[Db]`; `postgres.using(pool, |db| ...)` takes one, waiting while all are in use, runs the closure, and puts the connection back however the closure ends. A server shares the pool with every request.
+
+### redis
+
+Redis through its protocol (RESP2), written in Limen: no C library, and nothing to grant but the server's host.
+
+```
+use redis
+
+let cache = redis.connect(root.net, "cache.internal:6379")?
+cache.set("todo:1", json.encode(t), ttl: 60)?
+match cache.get("todo:1")? {
+    Some(text) => ...,
+    None => ...,
+}
+```
+
+- `redis.connect(net, address, password = "", user = "")` connects to `host:port`, and logs in with `AUTH` when given a password (and a user, for an ACL user).
+- Methods for the common commands: `get(key) -> Option[Str]`, `set(key, value, ttl = 0)` (with `ttl`, `SET ... EX`), `del(key) -> Bool`, `exists(key) -> Bool`, `incr(key, by = 1) -> Int`, `expire(key, seconds) -> Bool`, `ttl(key) -> Int` (-1 for no expiry, -2 for no key), `publish(channel, message) -> Int` and `ping() -> Bool`. `run(words)` sends any other command, as its words, and returns the reply, a `redis.Reply`: `Simple(Str)`, `Number(Int)`, `Bulk(Str)`, `Nil`, `Many(List[Reply])`. Each word goes as its own bulk string, so keys and values may hold any bytes. An error reply (`-ERR ...`) is `Err(Failed("redis: ..."))`.
+- Connections are plain TCP; TLS is not supported yet.
+- A `Client` is one connection, used by one task at a time. `redis.pool(net, address, size, password = "", user = "")` and `redis.using(pool, |c| ...)` lend connections to tasks as `postgres.pool` does.
 
 ### hex
 

@@ -49,6 +49,10 @@ let new_fctx g genv ret parent =
 
 let emit f s = if not f.dead then f.buf <- s :: f.buf
 
+(* Whether to mark where each Limen statement starts (I.Line), for `#line`
+   in the C of a development build. *)
+let lines = ref false
+
 let tmp f ty rhs =
   let v = fresh_var "t" ty in
   emit f (I.Let (v, rhs));
@@ -1105,11 +1109,15 @@ and lower_block_inner f b = lower_stmts f b.stmts b.tail
 
 and lower_stmts f ss tail =
   match ss with
-  | [] -> ( match tail with Some e -> lower f e | None -> I.AUnit)
+  | [] -> ( match tail with Some e -> mark f e.espan; lower f e | None -> I.AUnit)
   | { sdesc = SDefer d; _ } :: rest when not f.dead -> lower_defer f d rest tail
   | s :: rest ->
+    mark f s.sspan;
     lower_stmt f s;
     lower_stmts f rest tail
+
+(* Where the next statement starts, in a development build. *)
+and mark f sp = if !lines then emit f (I.Line sp)
 
 (* `defer d` followed by [rest]: the rest runs under a guard whose handler is
    [d] (for panics and cancellations); every normal way out of the rest runs

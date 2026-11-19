@@ -118,7 +118,7 @@ pub fn link_flags(libs: List[Str]) -> List[Str] {
 // build (`--dev`, faster to compile), no FMA contraction
 // (float results must not depend on the C compiler), wrapping integers.
 pub fn command(self: Setting, dev: Bool, cflags: List[Str], libs: List[Str], c_file: Str, exe: Str) -> List[Str] {
-    [self.cc(), if dev { "-O0" } else { "-O3" }] + cflags + ["-fwrapv", "-ffp-contract=off", "-fstack-clash-protection", "-fexceptions", "-w", "-o", exe, c_file] + libs + ["-lm"]
+    [self.cc()] + (if dev { ["-O0", "-g"] } else { ["-O3"] }) + cflags + ["-fwrapv", "-ffp-contract=off", "-fstack-clash-protection", "-fexceptions", "-w", "-o", exe, c_file] + libs + ["-lm"]
 }
 
 // ---------- the build cache ----------
@@ -282,8 +282,11 @@ fn c_flags() -> List[Str] {
     ["-fwrapv", "-ffp-contract=off", "-fstack-clash-protection", "-fexceptions", "-w"]
 }
 
-fn opt(self: Builder) -> Str {
-    if self.dev { "-O0" } else { "-O3" }
+// A development build has `-g` too, which keeps the C's `#line`
+// directives as debug information: lldb, gdb and crash traces show Limen
+// lines.
+fn opt(self: Builder) -> List[Str] {
+    if self.dev { ["-O0", "-g"] } else { ["-O3"] }
 }
 
 // ---------- split builds ----------
@@ -513,7 +516,7 @@ fn write(self: Builder, path: Str, text: Str) -> Bool {
 // header it cannot load through -include-pch) is remembered with a marker.
 fn precompiled(self: Builder, dir: Str, decls: Str, cflags: List[Str], tmp: Str) -> Option[Str] {
     let (n, exec) = (self.setting, self.exec)
-    let pch_argv = |h: Str, o: Str| [n.cc(), self.opt()] + cflags + c_flags() + ["-x", "c-header", "-o", o, h]
+    let pch_argv = |h: Str, o: Str| [n.cc()] + self.opt() + cflags + c_flags() + ["-x", "c-header", "-o", o, h]
     let k = self.cache_key(decls, pch_argv("decls.h", "decls.pch"))
     if self.fs.exists(n.in_fs(paths.concat(dir, k + ".nopch"))) {
         return None
@@ -522,7 +525,7 @@ fn precompiled(self: Builder, dir: Str, decls: Str, cflags: List[Str], tmp: Str)
     let made = n.make_dirs(self.fs, n.in_fs(dir)) && (self.fs.exists(n.in_fs(h)) || self.cached_file(dir, k + ".h", |out| self.write(out, decls)).is_some())
     let works = |out: Str| {
         let probe = paths.concat(tmp, "probe.c")
-        self.write(probe, "int limen_probe;\n") && n.run_cc(exec, pch_argv(h, out)).is_ok() && n.run_cc(exec, [n.cc(), self.opt(), "-include-pch", out] + cflags + c_flags() + ["-fsyntax-only", probe]).is_ok()
+        self.write(probe, "int limen_probe;\n") && n.run_cc(exec, pch_argv(h, out)).is_ok() && n.run_cc(exec, [n.cc()] + self.opt() + ["-include-pch", out] + cflags + c_flags() + ["-fsyntax-only", probe]).is_ok()
     }
     let pch = if made { self.cached_file(dir, k + ".pch", works) } else { None }
     if pch.is_none() {
@@ -540,7 +543,7 @@ fn precompiled(self: Builder, dir: Str, decls: Str, cflags: List[Str], tmp: Str)
 fn build_split(self: Builder, cflags: List[Str], libs: List[Str], prefix: Str, defines: Str, tmp: Str, shared: Str, pieces: List[Str], exe: Str) -> Result[(), Str] {
     let (n, exec, fs) = (self.setting, self.exec, self.fs)
     let dir = self.usable_cache()
-    let obj_argv = |c: Str, o: Str| [n.cc(), self.opt()] + cflags + c_flags() + ["-c", "-o", o, c]
+    let obj_argv = |c: Str, o: Str| [n.cc()] + self.opt() + cflags + c_flags() + ["-c", "-o", o, c]
     // the runtime, compiled once
     let rt_text = object_mode() + prefix + self.runtime
     let rt_key = self.cache_key(rt_text, obj_argv("prog.c", "prog.o")) + ".o"
@@ -569,7 +572,7 @@ fn build_split(self: Builder, cflags: List[Str], libs: List[Str], prefix: Str, d
     }
     if rt_cached.is_some() && files.len() == 1 {
         // one piece, the runtime ready: compile and link in one step
-        return n.run_cc(exec, [n.cc(), self.opt()] + use_pch + cflags + c_flags() + ["-o", exe, files[0], rt_cached ?? ""] + libs + ["-lm"])
+        return n.run_cc(exec, [n.cc()] + self.opt() + use_pch + cflags + c_flags() + ["-o", exe, files[0], rt_cached ?? ""] + libs + ["-lm"])
     }
     let mut jobs: List[List[Str]] = []
     let rt_obj = match rt_cached {
@@ -585,7 +588,7 @@ fn build_split(self: Builder, cflags: List[Str], libs: List[Str], prefix: Str, d
     }
     let objs = files.map(|f| f.slice(0, f.len() - 2) + ".o")
     for (i, f) in files.with_index() {
-        jobs.push([n.cc(), self.opt()] + use_pch + cflags + c_flags() + ["-c", "-o", objs[i], f])
+        jobs.push([n.cc()] + self.opt() + use_pch + cflags + c_flags() + ["-c", "-o", objs[i], f])
     }
     n.run_all(exec, jobs)?
     match (dir, rt_cached) {
@@ -594,7 +597,14 @@ fn build_split(self: Builder, cflags: List[Str], libs: List[Str], prefix: Str, d
         },
         _ => {},
     }
-    n.run_cc(exec, [n.cc(), self.opt(), "-o", exe, rt_obj] + objs + libs + ["-lm"])
+    n.run_cc(exec, [n.cc()] + self.opt() + ["-o", exe, rt_obj] + objs + libs + ["-lm"])?
+    // on macOS the debug information stays in the object files, which go
+    // away: collect it next to the program (Linux keeps it in the program,
+    // and has no dsymutil)
+    if self.dev {
+        let _ = exec.run("/usr/bin/dsymutil", [exe])
+    }
+    Ok(())
 }
 
 // The cache directory, when the Fs reaches it.
@@ -661,6 +671,11 @@ fn compile_c(self: Builder, c_text: Str, libs: List[Str], exe: Str) -> Result[()
         None => {
             return self.compile(c_text, text, cflags, all_libs, exe)
         },
+    }
+    // a cached program's debug map names object files that are gone, so a
+    // development build links afresh and keeps its debug information
+    if self.dev {
+        return self.compile(c_text, text, cflags, all_libs, exe)
     }
     // the key leaves out where this build's files go
     let shape = n.command(self.dev, cflags, all_libs, "prog.c", "prog")

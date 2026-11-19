@@ -92,6 +92,10 @@ type stmt =
   | Scope of atom * stmt list
       (* the body of a group with a deadline: the deadline stops it at its
          next wait, and the code after it (the join) goes on *)
+  | Line of Span.t
+      (* where the Limen statement that follows starts: `#line` in the C,
+         so debuggers and crash traces point at Limen lines. Emitted only
+         in development builds; it does nothing at run time *)
 
 and mutation =
   | MSet of atom

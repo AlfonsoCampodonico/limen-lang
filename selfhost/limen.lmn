@@ -176,9 +176,10 @@ fn front(fs: Fs, place: disk.Place, file: Str) -> Front {
     // their conversions written once the types are known, and the program
     // is checked again with them
     let json = p.std_modules.find(|m| m.1 == "json").map(|m| m.0)
-    let sql = p.std_modules.find(|m| m.1 == "sql").map(|m| m.0)
-    let (p, c) = match (json, sql) {
-        (Some(_), _) | (_, Some(_)) if c.diags.all(|d| d.warning) => match derive.expand(json, sql, p.items, c) {
+    // the modules that read rows into structs, in this order
+    let rows = ["sql", "postgres"].flat_map(|name| p.std_modules.find(|m| m.1 == name).map(|m| [m.0]) ?? [])
+    let (p, c) = match json {
+        _ if (json.is_some() || !rows.is_empty()) && c.diags.all(|d| d.warning) => match derive.expand(json, rows, p.items, c) {
             None => (p, c),
             Some(x) if !x.diags.is_empty() => {
                 let diags = x.diags + c.diags.filter(|d| d.warning)
@@ -394,7 +395,8 @@ fn build(cx: Ctx, exec: Exec, env: Env, file: Str, target: Option[Str], dev: Boo
         },
     }
     let exe = target ?? default_output(file)
-    let c_text = c_source(c, f.files, sources.runtime(), tests)
+    // a development build marks Limen lines in its C
+    let c_text = c_source(c, f.files, sources.runtime(), tests, dev)
     if emit_c {
         return match fs.write(cx.place.locate(exe + ".c"), c_text) {
             Ok(_) => 0,
@@ -422,7 +424,7 @@ fn build(cx: Ctx, exec: Exec, env: Env, file: Str, target: Option[Str], dev: Boo
 // The program's C, as Native.c_source makes it: lowered (as the test
 // binary, with `tests`), repeated pure calls reused, ownership placed,
 // then C generation.
-fn c_source(c: typecheck.Checked, files: List[diag.Source], runtime: Str, tests: Bool) -> Str {
-    let (prog, ro) = lower.lower_program(c.prelude, c.items, c.cx, c.state, tests)
+fn c_source(c: typecheck.Checked, files: List[diag.Source], runtime: Str, tests: Bool, dev: Bool) -> Str {
+    let (prog, ro) = lower.lower_program(c.prelude, c.items, c.cx, c.state, tests, dev)
     cgen.program(ro, files, own.program(pure.cse(prog)), runtime)
 }

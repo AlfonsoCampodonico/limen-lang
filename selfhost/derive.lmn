@@ -534,7 +534,7 @@ pub struct Expanded {
 // loaded. The items are the loaded ones, not the checker's rewritten ones,
 // so checking the result is checking a new program; the uses keep their
 // ids, which `c` knows.
-pub fn expand(json: Option[Str], sql: Option[Str], items: List[ast.Item], c: typecheck.Checked) -> Option[Expanded] {
+pub fn expand(json: Option[Str], rows: List[Str], items: List[ast.Item], c: typecheck.Checked) -> Option[Expanded] {
     let mut structs: Map[Str, ast.StructDecl] = map()
     let mut enums: Map[Str, ast.EnumDecl] = map()
     // the prelude's types too: Result is an enum like any other
@@ -551,17 +551,19 @@ pub fn expand(json: Option[Str], sql: Option[Str], items: List[ast.Item], c: typ
     }
     let span0 = ast.Span { file: 0, lo: 0, hi: 0 }
     let mut g = Gen { q: json ?? "", sp: span0, structs, enums, names: map(), count: 0, out: [], subst: c.state.subst }
-    let mut sg = Gen { q: sql ?? "", sp: span0, structs, enums, names: map(), count: 0, out: [], subst: c.state.subst }
+    // the modules that read rows into structs, each writing its own
+    // conversions, and their problems
+    let mut rgs = rows.map(|q| Gen { q, sp: span0, structs, enums, names: map(), count: 0, out: [], subst: c.state.subst })
+    let mut rdiags: List[List[diag.Diag]] = rows.map(|_| [])
     let mut wrappers: Map[Str, Str] = map()
     let mut diags: List[diag.Diag] = []
-    let mut sdiags: List[diag.Diag] = []
     let mut rewrites: Map[Int, ast.ExprDesc] = map()
     // the ids of the expressions written into the uses: after every id the
     // program has, before the written functions'
     let mut next = c.state.next_id
     let mut found = false
     let is_json = |n: Str| json.is_some() && (n == jf(g, "encode") || n == jf(g, "decode"))
-    let is_sql = |n: Str| sql.is_some() && (n == jf(sg, "decode") || n == jf(sg, "values"))
+    let row_module = |n: Str| rgs.with_index().find(|p| n == jf(p.1, "decode") || n == jf(p.1, "values")).map(|p| p.0)
     // a table test's case, then the body
     for e in items.flat_map(fn_exprs) {
         match e.desc {
@@ -606,34 +608,47 @@ pub fn expand(json: Option[Str], sql: Option[Str], items: List[ast.Item], c: typ
                     },
                 }
             },
-            EVar(n) if is_sql(n) => {
+            EVar(n) if row_module(n).is_some() => {
                 found = true
+                let j = row_module(n) ?? 0
+                let mut sg = rgs[j]
                 sg.sp = e.span
-                let what = if n == jf(sg, "decode") { "sql.decode" } else { "sql.values" }
-                let note = if what == "sql.decode" { "say the type: `let t: Todo = sql.decode(row)?`" } else { "convert where the type is known" }
+                // `sql`, also when the program names the module `std/sql`
+                let m = sg.q.split("/").last() ?? sg.q
+                let decode = n == jf(sg, "decode")
+                let what = m + (if decode { ".decode" } else { ".values" })
+                let note = if decode { "say the type: `let t: Todo = {m}.decode(row)?`" } else { "convert where the type is known" }
                 match known(c, e, what, note) {
-                    Err(d) => sdiags.push(d),
+                    Err(d) => {
+                        rdiags[j] = rdiags[j] + [d]
+                    },
                     Ok(t) => match row_coders(sg, t) {
                         Ok(((reader, writer), g2)) => {
                             sg = g2
-                            rewrites[e.id] = EVar(if what == "sql.decode" { reader } else { writer })
+                            rewrites[e.id] = EVar(if decode { reader } else { writer })
                         },
                         Err(f) => {
                             sg = f.g
-                            sdiags.push(no_form(sg, e, what, t, f.what, "SQL"))
+                            rdiags[j] = rdiags[j] + [no_form(sg, e, what, t, f.what, "SQL")]
                         },
                     },
                 }
+                rgs[j] = sg
             },
-            EMethod(recv, m, _, args) if sql.is_some() && (m == "all" || m == "one") && is_db(c, recv, jf(sg, "Db")) => {
+            EMethod(recv, m, _, args) if (m == "all" || m == "one") && db_module(c, recv, rgs).is_some() => {
                 found = true
+                let j = db_module(c, recv, rgs) ?? 0
+                let mut sg = rgs[j]
                 sg.sp = e.span
                 let what = "db." + m
                 let want = if m == "all" { "List[Todo]" } else { "Option[Todo]" }
                 match known(c, e, what, "say the type: `let t: {want} = db.{m}(...)?`") {
-                    Err(d) => sdiags.push(d),
+                    Err(d) => {
+                        rdiags[j] = rdiags[j] + [d]
+                    },
                     Ok(t) => {
-                        let key = what + " " + show(sg, t)
+                        // the module too: the same struct can be read from sql and postgres
+                        let key = sg.q + " " + what + " " + show(sg, t)
                         let w = match wrappers.get(key) {
                             Some(w) => Some(w),
                             None => match row_coders(sg, t) {
@@ -646,7 +661,7 @@ pub fn expand(json: Option[Str], sql: Option[Str], items: List[ast.Item], c: typ
                                 },
                                 Err(f) => {
                                     sg = f.g
-                                    sdiags.push(no_form(sg, e, what, t, f.what, "SQL"))
+                                    rdiags[j] = rdiags[j] + [no_form(sg, e, what, t, f.what, "SQL")]
                                     None
                                 },
                             },
@@ -661,6 +676,7 @@ pub fn expand(json: Option[Str], sql: Option[Str], items: List[ast.Item], c: typ
                         }
                     },
                 }
+                rgs[j] = sg
             },
             _ => {},
         }
@@ -670,12 +686,12 @@ pub fn expand(json: Option[Str], sql: Option[Str], items: List[ast.Item], c: typ
     }
     let items = typecheck.rewrite_items({ c.state with rewrites }, items)
     let mut more: List[ast.Item] = []
-    for i in g.out + sg.out {
+    for i in g.out + rgs.flat_map(|x| x.out) {
         let (i2, n2) = ids.item(i, next)
         more.push(i2)
         next = n2
     }
-    Some(Expanded { items: items + more, diags: diags + sdiags, next_id: next })
+    Some(Expanded { items: items + more, diags: diags + rdiags.flat_map(|d| d), next_id: next })
 }
 
 // The type a use converts, or an E0212 when it is not known.
@@ -712,14 +728,14 @@ fn no_form(g: Gen, e: ast.Expr, what: Str, t: types.Ty, inner: Str, holds: Str) 
     diag.error("E0212", e.span, msg).note(note)
 }
 
-// Whether `recv` is the sql module's `Db`.
-fn is_db(c: typecheck.Checked, recv: ast.Expr, db: Str) -> Bool {
+// Which of the row modules `gens` has `recv`'s type as its `Db`.
+fn db_module(c: typecheck.Checked, recv: ast.Expr, gens: List[Gen]) -> Option[Int] {
     match c.state.types.get(recv.id) {
         Some(t) => match deep(c.state.subst, t) {
-            TNamed(n, []) => n == db,
-            _ => false,
+            TNamed(n, []) => gens.with_index().find(|p| n == jf(p.1, "Db")).map(|p| p.0),
+            _ => None,
         },
-        None => false,
+        None => None,
     }
 }
 

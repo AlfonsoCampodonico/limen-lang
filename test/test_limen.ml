@@ -7365,6 +7365,31 @@ fn main(root: Root) {
    and upto = function [] | "}" :: _ -> [] | l :: r -> l :: upto r in
    let body = String.concat "\n" (from (String.split_on_char '\n' c)) in
    ok "with-reuse" (body <> "" && not (has body "_dup(")) body);
+  (* a development build pins each line of a statement's C to its Limen
+     line, and resets to <generated> at the end of the function *)
+  (let src = "fn twice(x: Int) -> Int {\n    let y = x + x\n    y\n}\n\nfn main(root: Root) {\n    root.stdout.print(\"{twice(2)}\")\n}\n" in
+   let items, ds, _ = compile "dev-lines" src in
+   Lower.lines := true;
+   let c = Fun.protect ~finally:(fun () -> Lower.lines := false) (fun () -> if ds = [] then Native.c_source items else "") in
+   let lines = String.split_on_char '\n' c in
+   let rec after_mark = function
+     | m :: l :: rest when String.starts_with ~prefix:"#line 2 " m -> Some (l, rest)
+     | _ :: rest -> after_mark rest
+     | [] -> None
+   in
+   let pinned =
+     match after_mark lines with
+     | Some (_, rest) ->
+       (* every line of the body up to its end has a mark right before it *)
+       let rec check = function
+         | m :: "}" :: _ -> m = "#line 1 \"<generated>\""
+         | m :: _ :: rest -> String.starts_with ~prefix:"#line " m && check rest
+         | _ -> false
+       in
+       check rest
+     | None -> false
+   in
+   ok "dev-lines" (pinned && List.exists (String.starts_with ~prefix:"#line 3 ") lines) "no pinned #line marks in the C");
   errs "with-unknown-field" "struct P {\n    x: Int,\n}\n\nfn main(root: Root) {\n    let p = P { x: 1 }\n    let q = { p with y: 2 }\n}\n" [ "E0103" ];
   errs "with-twice" "struct P {\n    x: Int,\n}\n\nfn main(root: Root) {\n    let p = P { x: 1 }\n    let q = { p with x: 2, x: 3 }\n}\n" [ "E0106" ];
   errs "with-field-type" "struct P {\n    x: Int,\n}\n\nfn main(root: Root) {\n    let p = P { x: 1 }\n    let q = { p with x: \"a\" }\n}\n" [ "E0201" ];
@@ -9218,8 +9243,10 @@ fn main(root: Root) {
   ok "std-manifest-log" (List.exists (fun (d : Package.dep) -> d.dname = "log" && d.caps = [ "stdout"; "stderr"; "clock" ]) manifest.deps) "log: stdout, stderr, clock";
   ok "std-manifest-path" (List.exists (fun (d : Package.dep) -> d.dname = "path" && d.caps = [ "fs" ]) manifest.deps) "path: fs (walk)";
   ok "std-manifest-uuid" (List.exists (fun (d : Package.dep) -> d.dname = "uuid" && d.caps = [ "rand"; "clock" ]) manifest.deps) "uuid: rand, clock";
+  ok "std-manifest-postgres" (List.exists (fun (d : Package.dep) -> d.dname = "postgres" && d.caps = [ "net"; "rand" ]) manifest.deps) "postgres: net, rand (SCRAM's nonce)";
+  ok "std-manifest-redis" (List.exists (fun (d : Package.dep) -> d.dname = "redis" && d.caps = [ "net" ]) manifest.deps) "redis: net";
   ok "std-manifest-pure"
-    (List.for_all (fun (d : Package.dep) -> List.mem d.dname [ "http"; "sql"; "time"; "log"; "path"; "uuid" ] || d.caps = []) manifest.deps)
+    (List.for_all (fun (d : Package.dep) -> List.mem d.dname [ "http"; "sql"; "time"; "log"; "path"; "uuid"; "postgres"; "redis" ] || d.caps = []) manifest.deps)
     "the others are pure";
   let real_std = !Modules.std_modules in
   let std_errs name extra src =

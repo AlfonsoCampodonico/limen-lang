@@ -122,6 +122,17 @@ compare_c() {
   same "$1/$2"
 }
 
+# compare_dev_c DIR FILE: the C of a development build, with its `#line`
+# directives
+compare_dev_c() {
+  rm -f "$out/cw.c" "$out/cg.c"
+  (cd "$1" && "$limen_abs" build "$2" --emit-c --dev -o "$out/cw") > "$out/want" 2> "$out/want.err" && echo "exit 0" >> "$out/want" || echo "exit $?" >> "$out/want"
+  (cd "$1" && tsc build "$2" --emit-c --dev -o "$out/cg") > "$out/got" 2> "$out/got.err" && echo "exit 0" >> "$out/got" || echo "exit $?" >> "$out/got"
+  if [ -f "$out/cw.c" ]; then cat "$out/cw.c" >> "$out/want"; fi
+  if [ -f "$out/cg.c" ]; then cat "$out/cg.c" >> "$out/got"; fi
+  same "$1/$2"
+}
+
 # compare_test_c DIR FILE: the test binary's C, from selfhost/cdump and
 # from `build --emit-c --tests`
 compare_test_c() {
@@ -217,6 +228,8 @@ check "files lower the same" compare_ir -- $programs
 check "edge cases lower the same" compare_ir -- $ir_cases
 check "files compile to the same C" compare_c -- $programs
 check "edge cases compile to the same C" compare_c -- $c_cases
+check "edge cases compile to the same development C" compare_dev_c -- $c_cases
+check "examples compile to the same development C" compare_dev_c -- $(ls examples/*.lmn)
 with_tests=$(grep -l '^test \|^bench ' $programs $c_cases)
 check "test binaries compile to the same C" compare_test_c -- $with_tests
 if [ -d "$book" ]; then

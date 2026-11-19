@@ -1,0 +1,6 @@
+md5: ok
+cleartext: ok
+wrong: Failed("postgres: password authentication failed for user \"app\" (28P01)")
+[Sample { id: 1, note: None, ratio: 0.25, blob: bytes([0, 255, 10, 13]), flag: true }, Sample { id: 2, note: Some("\195\169 \"quoted\""), ratio: 0.25, blob: bytes([0, 255, 10, 13]), flag: false }]
+rows 20002
+pool 20 of 20

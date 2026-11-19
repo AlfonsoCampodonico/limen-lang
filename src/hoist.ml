@@ -30,7 +30,7 @@ let escapes (v : var) body =
     | If (_, a, b) -> List.exists go a || List.exists go b
     | Loop b -> List.exists go b
     | Guard _ | Scope _ -> true (* code after a panic or deadline can see the list: keep the checks *)
-    | Decl _ | Break | Continue | Drop _ | GuardEnd _ -> false
+    | Decl _ | Break | Continue | Drop _ | GuardEnd _ | Line _ -> false
   in
   List.exists go body
 

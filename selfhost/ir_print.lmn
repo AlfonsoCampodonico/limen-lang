@@ -251,6 +251,7 @@ fn stmt(self: Printer, out: List[Str], ind: Str, s: ir.Stmt) -> (List[Str], Prin
             (out, pr) = pr.block(out, deeper, b)
         },
         GuardEnd(n) => out.push(ind + "guardend {n}"),
+        Line(sp) => out.push(ind + "line {sp.lo}"),
         Scope(g, b) => {
             out.push(ind + "scope {atom(g)}")
             (out, pr) = pr.block(out, deeper, b)

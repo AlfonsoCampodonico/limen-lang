@@ -34,8 +34,11 @@ let prepare c_text =
    operator example, 23k lines of C with the http module: 2.7 s, not 2.1 s). *)
 (* A development build: `limen run --native`, `limen test --native` (but
    not `--bench`) and `limen build --dev`. Without optimisation the C
-   compiler is faster, and the program runs the same, only slower. *)
-let dev_flags = [ "-O0" ]
+   compiler is faster, and the program runs the same, only slower. Its C
+   has `#line` directives (Lower.lines) and `-g` keeps them as debug
+   information, so lldb, gdb, the sanitizers and crash traces show Limen
+   files and lines. *)
+let dev_flags = [ "-O0"; "-g" ]
 
 let c_flags = [ "-fwrapv"; "-ffp-contract=off"; "-fstack-clash-protection"; "-fexceptions"; "-w" ]
 
@@ -338,6 +341,15 @@ let write_file path text = Out_channel.with_open_bin path (fun oc -> output_stri
    defines and core, or nothing); [defines] what goes ahead of the
    declarations in each piece. Objects and the precompiled header live in
    the cache when there is one, and in [tmp] otherwise. *)
+(* On macOS a linked program's debug information stays in the object
+   files, which a build deletes, so a development build (`-g`) collects it
+   next to the program with dsymutil, as clang does itself when it
+   compiles and links in one step. Linux keeps it in the program. *)
+let needs_dsym flags = match flags with Some fs -> List.mem "-g" fs && Sys.file_exists "/usr/bin/dsymutil" | None -> false
+
+let keep_debug_info flags exe =
+  if needs_dsym flags then ignore (Sys.command (Printf.sprintf "/usr/bin/dsymutil %s 2>/dev/null" (Filename.quote exe)))
+
 let build_split ?flags ~cflags ~libs ~prefix ~defines ~tmp (shared, pieces) exe =
   let dir = cache_dir () in
   let key text argv = cache_key text argv in
@@ -402,7 +414,8 @@ let build_split ?flags ~cflags ~libs ~prefix ~defines ~tmp (shared, pieces) exe 
        | Some d, None -> (try mkdir_p d; copy_file rt_obj (Filename.concat d rt_key) with Sys_error _ | Unix.Unix_error _ -> ())
        | _ -> ());
       Option.iter (fun d -> prune ~ext:"" d cache_keep; prune ~ext:".o" d object_keep) dir;
-      run_cc (link_command ?flags ~libs (rt_obj :: List.map (fun f -> Filename.chop_suffix f ".c" ^ ".o") piece_files) exe)
+      Result.map (fun () -> keep_debug_info flags exe)
+        (run_cc (link_command ?flags ~libs (rt_obj :: List.map (fun f -> Filename.chop_suffix f ".c" ^ ".o") piece_files) exe))
 
 let compile_c ?flags ?(libs = []) c_text exe : (unit, string) result =
   let full, tls_cflags, tls_libs = prepare c_text in
@@ -443,6 +456,9 @@ let compile_c ?flags ?(libs = []) c_text exe : (unit, string) result =
   in
   match cache_dir () with
   | None -> compile ()
+  (* a cached program's debug map names object files that are gone, so a
+     development build on macOS links afresh and keeps its debug information *)
+  | Some _ when needs_dsym flags -> compile ()
   | Some dir -> (
     (* the key leaves out where this build's files go *)
     let shape = command ?flags ~cflags:tls_cflags ~libs "prog.c" "prog" in

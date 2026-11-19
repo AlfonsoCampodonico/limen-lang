@@ -1,0 +1,26 @@
+use redis
+
+fn main(root: Root) -> Result[(), IoError] {
+    let admin = redis.connect(root.net, "127.0.0.1:REDISPORT")?
+    admin.run(["CONFIG", "SET", "requirepass", "s3cret"])?
+    let denied = redis.connect(root.net, "127.0.0.1:REDISPORT")
+    root.stdout.print("no password: {denied.map(|c| c.ping())}")
+    let c = redis.connect(root.net, "127.0.0.1:REDISPORT", password: "s3cret")?
+    root.stdout.print("ping {c.ping()?}")
+    let raw = bytes([0, 255, 13, 10, 36, 42]).to_str()
+    c.set("raw", raw)?
+    root.stdout.print("binary back {(c.get("raw")? ?? "") == raw}")
+    c.set("a", "1")?
+    c.set("b", "2")?
+    root.stdout.print("{c.run(["MGET", "a", "b", "nope"])?}")
+    root.stdout.print("del {c.del("a")?} {c.del("a")?} exists {c.exists("b")?}")
+    let pool = redis.pool(root.net, "127.0.0.1:REDISPORT", 3, password: "s3cret")?
+    let results = group g {
+        for i in 0..<30 {
+            g.go(|| redis.using(pool, |x| x.incr("counter")))
+        }
+    }
+    root.stdout.print("pool ok {results.filter(|r| r.is_ok()).len()}, counter {c.get("counter")?}")
+    c.run(["CONFIG", "SET", "requirepass", ""])?
+    Ok(())
+}
