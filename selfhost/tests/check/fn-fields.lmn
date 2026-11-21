@@ -5,7 +5,7 @@
 // `assert_eq`, `contains` and a generic function that compares), no `dyn`
 // (E0112, also as an error converted to `dyn Error`), no map key (E0113,
 // and E0111 through `Key`), and a function taking one runs callbacks, via
-// the field.
+// the field, an enum's payload or a generic type's argument.
 struct Route {
     run: fn(),
 }
@@ -43,6 +43,13 @@ fn serve(a: App) {
     for r in a.routes {
         (r.run)()
     }
+}
+
+fn run(c: Chain) -> Int {
+    0
+}
+
+fn boxed(b: Box[App]) {
 }
 
 fn convert(a: App) -> Result[Int, dyn Error] {
