@@ -12,7 +12,7 @@ then harden it, then promise not to break it.
 This file is the plan. The design doc keeps the reasons and the history of
 what was done; its older lists of what was missing point here.
 
-Updated 2026-11-19, after 0.7.0.
+Updated 2026-11-21, after 0.7.3.
 
 ## 0.4: a server you can leave running (done, 0.4.0)
 
@@ -109,7 +109,8 @@ Everything that would break programs has to be decided before 1.0, so it
 happens here.
 
 - The design questions, decided: Limen never gets references that can be
-  stored; functions in fields (done, E0304 is no longer reported); a group
+  stored; functions in fields (done, shipped early in 0.7.3; E0304 is no longer
+  reported); a group
   keeps its list of results, so a group that runs for ever uses tasks that
   return nothing and a channel (documented).
 - One definition of each built-in. Each is written twice, in the
