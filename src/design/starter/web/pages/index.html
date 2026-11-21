@@ -1,0 +1,58 @@
+<section class="hero">
+  <div class="wrap hero-inner">
+    <div class="hero-text">
+      <a class="release" href="/about">A website in Limen</a>
+      <h1>__NAME__</h1>
+      <p class="lead">This page is pages/index.html, served by main.lmn. Change it, add pages next to it, and rebuild: the binary carries the whole site.</p>
+      <div class="actions">
+        <a class="button button-primary" href="/about">About this site</a>
+        <a class="button button-secondary" href="https://book.limen-lang.org/">Read the Limen book</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="wrap">
+    <div class="section-head">
+      <p class="eyebrow">How it works</p>
+      <h2>Three files to know</h2>
+      <p>Everything else is plain HTML and CSS.</p>
+    </div>
+    <ol class="features">
+      <li class="feature">
+        <div class="feature-title"><span class="feature-no">01</span><h3>Routes</h3></div>
+        <div class="feature-body">
+          <p>Each route is a method, a path and a function that answers it. A path with no route is a 404.</p>
+          <div class="window snippet-window editor">
+            <div class="window-bar"><span class="dots"><i></i><i></i><i></i></span><span class="window-title">main.lmn</span></div>
+            <pre><code><span class="line"><span class="k">fn</span> <span class="f">routes</span>(s: <span class="t">Site</span>) -&gt; <span class="t">List</span>[http.<span class="t">Route</span>] {</span><span class="line">    [</span><span class="line">        http.<span class="f">on</span>(<span class="s">"GET /"</span>, |r, p| <span class="f">page</span>(s, <span class="s">"Home"</span>, <span class="s">"index.html"</span>)),</span><span class="line">        http.<span class="f">on</span>(<span class="s">"GET /about"</span>, |r, p| <span class="f">page</span>(s, <span class="s">"About"</span>, <span class="s">"about.html"</span>)),</span><span class="line">    ]</span><span class="line">}</span></code></pre>
+          </div>
+        </div>
+      </li>
+      <li class="feature">
+        <div class="feature-title"><span class="feature-no">02</span><h3>Grants</h3></div>
+        <div class="feature-body">
+          <p>The program can only listen on the address limen.toml grants it. It reads no files when it runs: the pages are built in.</p>
+          <div class="window snippet-window editor">
+            <div class="window-bar"><span class="dots"><i></i><i></i><i></i></span><span class="window-title">limen.toml</span></div>
+            <pre><code><span class="line">[grants]</span><span class="line"><span class="cap">listen</span> = <span class="s">"127.0.0.1:8080"</span></span></code></pre>
+          </div>
+        </div>
+      </li>
+      <li class="feature">
+        <div class="feature-title"><span class="feature-no">03</span><h3>Running it</h3></div>
+        <div class="feature-body">
+          <p>Run it while you work on it, test it, then build one binary to deploy.</p>
+          <div class="terminal snippet-window">
+            <div class="window-bar"><span class="dots"><i></i><i></i><i></i></span><span class="window-title">terminal</span></div>
+            <pre><code><span class="prompt">$</span> <span class="cmd">limen test main.lmn</span>
+3 tests, 0 failed (1ms)
+<span class="prompt">$</span> <span class="cmd">limen run main.lmn</span>
+serving on http://127.0.0.1:8080</code></pre>
+          </div>
+        </div>
+      </li>
+    </ol>
+  </div>
+</section>

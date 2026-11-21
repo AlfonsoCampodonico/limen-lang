@@ -18,7 +18,8 @@
 # each, the checker's in selfhost/tests/check, the lowering's in
 # selfhost/tests/ir, C generation's in selfhost/tests/c), and on the
 # book's examples when the book is checked out next to this repository
-# (or at $LIMEN_BOOK).
+# (or at $LIMEN_BOOK). With the book there, it also checks that the design
+# copied from it into src/design (dev/design_sync.py) is still the same.
 set -e
 cd "$(dirname "$0")/.."
 dune build ./bin/main.exe ./selfhost/tokdump/tokdump.exe ./selfhost/astdump/astdump.exe ./selfhost/loaddump/loaddump.exe ./selfhost/checkdump/checkdump.exe ./selfhost/irdump/irdump.exe ./selfhost/cdump/cdump.exe
@@ -31,6 +32,9 @@ irdump=$PWD/_build/default/selfhost/irdump/irdump.exe
 cdump=$PWD/_build/default/selfhost/cdump/cdump.exe
 limen_abs=$PWD/$limen
 book=${LIMEN_BOOK:-../limen-book}/examples
+if [ -d "${LIMEN_BOOK:-../limen-book}/tools" ]; then
+  python3 dev/design_sync.py --check "${LIMEN_BOOK:-../limen-book}"
+fi
 # in the repository, so the Limen compiler's grant (see tsc) holds it
 mkdir -p _build
 out=$(mktemp -d "$PWD/_build/check.XXXXXX")

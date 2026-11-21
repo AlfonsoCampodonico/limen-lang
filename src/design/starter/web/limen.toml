@@ -1,0 +1,7 @@
+[package]
+name = "__NAME__"
+
+# What `limen run` grants the program: the address it serves on. It reads
+# no files at run time (the pages are built in), so it needs no `fs`.
+[grants]
+listen = "127.0.0.1:8080"

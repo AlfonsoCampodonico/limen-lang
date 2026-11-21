@@ -12,6 +12,7 @@ usage:
   limen test FILE [--native] [--run TEXT] [--bench] [--bench-time 1s|100x] [--json]
   limen fmt FILE... [--write | --check]
   limen doc FILE|MODULE... [--std] [--all] [--html] [-o OUT]
+  limen new DIR [--web]    (a project to start from; --web, a small website in the Limen design)
   limen lsp                (language server on stdin/stdout)
   limen mcp                (MCP server for coding agents, on stdin/stdout)
   limen spec               (print the language specification)
@@ -348,6 +349,23 @@ let cmd_fmt files mode =
     exit 1
   end
 
+(* limen new: a project to start from; --web, a small website. *)
+let cmd_new args =
+  let web = List.mem "--web" args in
+  match List.filter (fun a -> a <> "--web") args with
+  | [ dir ] when dir = "" || dir.[0] <> '-' -> (
+    match Scaffold.create ~web dir with
+    | Ok _ ->
+      let main = Filename.concat dir "main.lmn" in
+      print_string
+        (Printf.sprintf "created %s%s
+
+  limen run %s
+  limen test %s
+" dir (if web then ", a website" else "") main main)
+    | Error m -> prerr_endline ("limen: " ^ m); exit 1)
+  | _ -> die_usage "new takes a DIR, and optionally --web"
+
 (* limen doc: Markdown (or with --html, one static page) from doc comments. *)
 let cmd_doc args =
   let rec go srcs std all html out = function
@@ -570,6 +588,7 @@ let () =
     in
     go None { native = false; bench = None; pattern = None; json = false; coverage = false } rest
   | "doc" :: rest -> cmd_doc rest
+  | "new" :: rest -> cmd_new rest
   | "fmt" :: rest -> (
     let mode = if List.mem "--write" rest then `Write else if List.mem "--check" rest then `Check else `Print in
     match List.filter (fun a -> a <> "--write" && a <> "--check") rest with

@@ -1,0 +1,16 @@
+// __NAME__
+//
+//   limen run main.lmn
+//   limen test main.lmn
+
+fn greeting(name: Str) -> Str {
+    "Hello, {name}."
+}
+
+fn main(root: Root) {
+    root.stdout.print(greeting("world"))
+}
+
+test "the greeting names who it greets" {
+    assert_eq(greeting("Ada"), "Hello, Ada.")
+}

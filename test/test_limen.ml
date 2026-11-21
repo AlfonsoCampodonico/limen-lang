@@ -9953,6 +9953,46 @@ fn main(root: Root) {
   ok "http-error-page-tokens"
     (List.length page_light >= 10 && List.length page_dark >= 5 && differ = [])
     ("differ from src/design/limen.css: " ^ String.concat ", " differ);
+  (* limen new: a plain program and a website, each passing its own tests on
+     both backends, with nothing fetched from elsewhere *)
+  if selected "new" then begin
+    let limen_exe = Filename.concat (Filename.dirname (Filename.dirname Sys.executable_name)) "bin/main.exe" in
+    let base = Filename.concat tmpdir "new" in
+    ignore (Sys.command (Filename.quote_command "rm" [ "-rf"; base ]));
+    let run args =
+      let outf = Filename.temp_file "limen-new" ".out" in
+      let code = Sys.command (Filename.quote_command limen_exe args ~stdout:outf ~stderr:outf) in
+      let text = In_channel.with_open_bin outf In_channel.input_all in
+      Sys.remove outf;
+      (code, text)
+    in
+    List.iter
+      (fun (web, name, tests) ->
+        let dir = Filename.concat base name in
+        let made = Scaffold.create ~web dir in
+        ok ("new-" ^ name) (Result.is_ok made) (match made with Error m -> m | Ok _ -> "");
+        let main = Filename.concat dir "main.lmn" in
+        List.iter
+          (fun flags ->
+            let code, text = run ([ "test" ] @ flags @ [ main ]) in
+            let want = sprintf "%d test%s, 0 failed" tests (if tests = 1 then "" else "s") in
+            ok (sprintf "new-%s-test%s" name (String.concat "" flags)) (code = 0 && Interp_util.find_sub text want 0 <> None) text)
+          [ []; [ "--native" ] ];
+        let code, text = run [ "fmt"; "--check"; main ] in
+        ok ("new-" ^ name ^ "-fmt") (code = 0) text)
+      [ (false, "hello", 1); (true, "demo-site", 3) ];
+    let site = Filename.concat base "demo-site" in
+    let read p = In_channel.with_open_bin (Filename.concat site p) In_channel.input_all in
+    let has s sub = Interp_util.find_sub s sub 0 <> None in
+    let toml = read "limen.toml" and layout = read "pages/layout.html" and css = read "assets/style.css" in
+    ok "new-web-files"
+      (has toml "name = \"demo-site\"" && has layout "<title>$title · demo-site</title>" && has css "url(\"/assets/fonts/Inter.woff2\")"
+       && has css "--code-bg:" && Sys.file_exists (Filename.concat site "assets/fonts/JetBrainsMono-Regular.woff2")
+       && List.for_all (fun p -> not (has (read p) "src=\"http") && not (has (read p) "url(http") && not (has (read p) "@import")) [ "pages/layout.html"; "pages/index.html"; "assets/style.css" ])
+      layout;
+    ok "new-not-empty" (Result.is_error (Scaffold.create ~web:true site)) "wrote into a directory that is not empty";
+    ok "new-bad-name" (Result.is_error (Scaffold.create ~web:false (Filename.concat base "no spaces"))) "took a name with a space"
+  end;
   (* every standard library module documents without error, and its functions have docs *)
   let std = List.map (fun n -> Doc.load n) (Doc.std_names ()) in
   let std_md = Doc.markdown std in

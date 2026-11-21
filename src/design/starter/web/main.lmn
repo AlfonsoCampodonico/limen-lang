@@ -1,0 +1,121 @@
+// __NAME__: a small website.
+//
+//   limen run main.lmn      serves it on http://127.0.0.1:8080
+//   limen test main.lmn     runs the tests at the bottom
+use http
+use path
+
+// Where it serves: limen.toml must grant the same address.
+fn address() -> Str {
+    "127.0.0.1:8080"
+}
+
+// The pages and assets, read into the program when it is built.
+struct Site {
+    layout: Str,
+    pages: Map[Str, Bytes],
+    assets: Map[Str, Bytes],
+}
+
+fn site() -> Site {
+    Site { layout: embed("pages/layout.html"), pages: embed_dir("pages"), assets: embed_dir("assets") }
+}
+
+// A page from pages/, inside the layout.
+fn page(s: Site, title: Str, file: Str) -> http.Response {
+    match s.pages.get(file) {
+        Some(body) => {
+            let html = s.layout.replace("$title", title).replace("$content", body.to_str())
+            http.Response { status: 200, headers: [http.Header { name: "Content-Type", value: "text/html; charset=utf-8" }], body: html }
+        },
+        None => http.error_page(404, "There is no page {file}."),
+    }
+}
+
+fn content_type(file: Str) -> Str {
+    match path.ext(file) {
+        ".css" => "text/css; charset=utf-8",
+        ".js" => "text/javascript; charset=utf-8",
+        ".svg" => "image/svg+xml",
+        ".woff2" => "font/woff2",
+        ".png" => "image/png",
+        _ => "application/octet-stream",
+    }
+}
+
+// A file from assets/, which browsers may keep for an hour.
+fn asset(s: Site, r: http.Request, file: Str) -> http.Response {
+    match s.assets.get(file) {
+        Some(data) => http.Response {
+            status: 200,
+            headers: [http.Header { name: "Content-Type", value: content_type(file) }, http.Header { name: "Cache-Control", value: "public, max-age=3600" }],
+            body: data.to_str(),
+        },
+        None => if http.accepts_html(r) { http.error_page(404, "There is no file {file}.") } else { http.text(404, "not found\n") },
+    }
+}
+
+fn routes(s: Site) -> List[http.Route] {
+    [
+        http.on("GET /", |r, p| page(s, "Home", "index.html")),
+        http.on("GET /about", |r, p| page(s, "About", "about.html")),
+        http.on("GET /assets/*file", |r, p| asset(s, r, p.get("file") ?? "")),
+    ]
+}
+
+// Answer a request. A browser that asks for a page there is none of gets
+// the 404 inside the site's layout; other clients get the router's answer.
+fn answer(s: Site, routes: List[http.Route], r: http.Request) -> http.Response {
+    let resp = http.route(r, routes)
+    if resp.status != 404 || !http.accepts_html(r) || r.path.starts_with("/assets/") {
+        return resp
+    }
+    let body = """
+        <div class="wrap"><section class="error-page">
+        <p class="error-status">404</p>
+        <h1>Not found</h1>
+        <p>Nothing is served at {r.path.replace("&", "&amp;").replace("<", "&lt;")}.</p>
+        <p><a href="/">Go to the home page</a></p>
+        </section></div>
+        """
+    { resp with headers: [http.Header { name: "Content-Type", value: "text/html; charset=utf-8" }], body: s.layout.replace("$title", "Not found").replace("$content", body) }
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let s = site()
+    let routes = routes(s)
+    let l = root.listen.on(address())?
+    root.stdout.print("serving on http://{address()}")
+    Err(http.server(root.clock).serve_forever(l, |r| answer(s, routes, r)))
+}
+
+fn get(file: Str, accept: Str) -> http.Response {
+    let r = http.Request { method: "GET", path: file, version: "HTTP/1.1", headers: [http.Header { name: "Accept", value: accept }], body: "" }
+    let s = site()
+    answer(s, routes(s), r)
+}
+
+test "the home page is HTML inside the layout" {
+    let r = get("/", "text/html")
+    assert_eq(r.status, 200)
+    assert_eq(r.header("content-type"), Some("text/html; charset=utf-8"))
+    assert(r.body.contains("<title>Home"))
+    assert(r.body.contains("<main"))
+    assert(!r.body.contains("$content"))
+}
+
+test "the stylesheet is served as CSS" {
+    let r = get("/assets/style.css", "text/css")
+    assert_eq(r.status, 200)
+    assert_eq(r.header("content-type"), Some("text/css; charset=utf-8"))
+    assert(r.body.contains("--brand:"))
+}
+
+test "a path with no page is a 404, in the layout for browsers" {
+    let page = get("/nowhere", "text/html")
+    assert_eq(page.status, 404)
+    assert(page.body.contains("<title>Not found"))
+    assert(page.body.contains("Nothing is served at /nowhere."))
+    assert_eq(get("/nowhere", "*/*").body, "not found\n")
+    assert_eq(get("/assets/nothing.css", "text/css").status, 404)
+}

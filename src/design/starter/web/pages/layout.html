@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>$title · __NAME__</title>
+<link rel="icon" href="/assets/logo.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/assets/style.css">
+<script>
+try { var t = localStorage.getItem("theme"); if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; } catch (e) {}
+</script>
+</head>
+<body>
+<header class="nav">
+  <div class="wrap nav-row">
+    <a class="brand" href="/"><span class="brand-mark"><svg viewBox="0 0 180 180" aria-hidden="true"><rect width="180" height="180" rx="36" fill="#14233F"/><path d="M42 32H76V118L138 148H42Z" fill="#FFE7B0"/><path d="M76 32L91 39V111L76 118Z" fill="#0A1426"/></svg></span>__NAME__</a>
+    <nav class="nav-links" aria-label="Main">
+      <a href="/">Home</a>
+      <a href="/about">About</a>
+    </nav>
+    <div class="nav-end">
+      <button class="icon-button theme" type="button" aria-label="Switch between light and dark">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4.5"/><path d="M12 2.5v2.5M12 19v2.5M2.5 12H5M19 12h2.5M5.3 5.3l1.8 1.8M16.9 16.9l1.8 1.8M5.3 18.7l1.8-1.8M16.9 7.1l1.8-1.8"/></svg>
+      </button>
+    </div>
+  </div>
+</header>
+<main>
+$content
+</main>
+<footer class="footer">
+  <div class="wrap footer-row">
+    <div class="footer-sign">
+      <a class="brand" href="/"><span class="brand-mark"><svg viewBox="0 0 180 180" aria-hidden="true"><rect width="180" height="180" rx="36" fill="#14233F"/><path d="M42 32H76V118L138 148H42Z" fill="#FFE7B0"/><path d="M76 32L91 39V111L76 118Z" fill="#0A1426"/></svg></span>__NAME__</a>
+      <p class="footer-note">Built with Limen.</p>
+    </div>
+    <nav class="footer-links" aria-label="Footer">
+      <a href="/">Home</a>
+      <a href="/about">About</a>
+    </nav>
+  </div>
+</footer>
+<script src="/assets/theme.js" defer></script>
+</body>
+</html>

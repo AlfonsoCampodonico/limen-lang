@@ -1,0 +1,8 @@
+[package]
+name = "__NAME__"
+
+# What `limen run` grants the program. Stdout, Stderr, Stdin, Clock and Rand
+# are always granted; add the rest only as the program needs them:
+# [grants]
+# fs = "data"
+# net = ["api.example.com"]
