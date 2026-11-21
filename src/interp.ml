@@ -330,30 +330,40 @@ let map_put mv k v =
   | Some (o, _) -> { mv with m = KM.add k (o, v) mv.m }
   | None -> { m = KM.add k (mv.next, v) mv.m; next = mv.next + 1 }
 
-let rec show ?(top = true) v =
-  match v with
-  | VInt n -> Int64.to_string n
-  | VUInt (_, n) -> Printf.sprintf "%Lu" n
-  | VFloat x -> fmt_float x
-  | VBool b -> string_of_bool b
-  | VStr s -> if top then s else "\"" ^ String.escaped s ^ "\""
-  | VBytes s -> "bytes([" ^ String.concat ", " (List.init (String.length s) (fun i -> string_of_int (Char.code s.[i]))) ^ "])"
-  | VUnit -> "()"
-  | VList a -> "[" ^ String.concat ", " (Array.to_list (Array.map (show ~top:false) a)) ^ "]"
-  | VMap mv ->
-    "{" ^ String.concat ", " (List.map (fun (k, v) -> show ~top:false k ^ ": " ^ show ~top:false v) (map_entries mv)) ^ "}"
-  | VStruct (n, fs) when Ast.is_tuple_name n -> "(" ^ String.concat ", " (List.map (fun (_, x) -> show ~top:false x) fs) ^ ")"
-  | VStruct (n, fs) ->
-    n ^ " { " ^ String.concat ", " (List.map (fun (k, x) -> k ^ ": " ^ show ~top:false x) fs) ^ " }"
-  | VEnum (_, vn, []) -> vn
-  | VEnum (_, vn, args) -> vn ^ "(" ^ String.concat ", " (List.map (show ~top:false) args) ^ ")"
-  | VClosure _ | VFn _ | VCtor _ | VPanicFn -> "<fn>"
-  | VCap c -> "<" ^ cap_name c ^ ">"
-  | VGroup _ -> "<group>"
-  | VChan _ -> "<chan>"
-  | VAtomic _ -> "<atomic>"
-  | VShared _ -> "<shared>"
-  | VChanFn | VBuiltin _ -> "<fn>"
+(* Into one buffer: building each level's string and concatenating made
+   printing a value as deep as it is long quadratic. *)
+let show ?(top = true) v =
+  let b = Buffer.create 64 in
+  let s = Buffer.add_string b in
+  let rec go top v =
+    let each sep f xs = List.iteri (fun i x -> if i > 0 then s sep; f x) xs in
+    match v with
+    | VInt n -> s (Int64.to_string n)
+    | VUInt (_, n) -> s (Printf.sprintf "%Lu" n)
+    | VFloat x -> s (fmt_float x)
+    | VBool x -> s (string_of_bool x)
+    | VStr x -> if top then s x else (s "\""; s (String.escaped x); s "\"")
+    | VBytes x ->
+      s "bytes([";
+      String.iteri (fun i c -> if i > 0 then s ", "; s (string_of_int (Char.code c))) x;
+      s "])"
+    | VUnit -> s "()"
+    | VList a -> s "["; Array.iteri (fun i x -> if i > 0 then s ", "; go false x) a; s "]"
+    | VMap mv -> s "{"; each ", " (fun (k, v) -> go false k; s ": "; go false v) (map_entries mv); s "}"
+    | VStruct (n, fs) when Ast.is_tuple_name n -> s "("; each ", " (fun (_, x) -> go false x) fs; s ")"
+    | VStruct (n, fs) -> s n; s " { "; each ", " (fun (k, x) -> s k; s ": "; go false x) fs; s " }"
+    | VEnum (_, vn, []) -> s vn
+    | VEnum (_, vn, args) -> s vn; s "("; each ", " (go false) args; s ")"
+    | VClosure _ | VFn _ | VCtor _ | VPanicFn -> s "<fn>"
+    | VCap c -> s "<"; s (cap_name c); s ">"
+    | VGroup _ -> s "<group>"
+    | VChan _ -> s "<chan>"
+    | VAtomic _ -> s "<atomic>"
+    | VShared _ -> s "<shared>"
+    | VChanFn | VBuiltin _ -> s "<fn>"
+  in
+  go top v;
+  Buffer.contents b
 
 let rec equal a b =
   match (a, b) with
