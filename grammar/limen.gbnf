@@ -38,7 +38,10 @@ bench    ::= "bench" sp1 plainstr sp tparams? block
 tparams  ::= "(" ws (tparam (isep tparam)* (ws ",")?)? ws ")" sp
 # `clock: virtual Clock`: a clock on virtual time
 tparam   ::= param | ident sp ":" sp "virtual" sp1 "Clock"
-fn       ::= "fn" sp1 ident sp bgenerics? sp "(" ws (param (isep param)* (ws ",")?)? ws ")" (sp "->" sp type)? sp block
+fn       ::= "fn" sp1 ident sp bgenerics? sp "(" ws (dparam (isep dparam)* (ws ",")?)? ws ")" (sp "->" sp type)? sp block
+# a parameter with a default value, a constant: `sep: Str = ", "`
+dparam   ::= param (sp "=" ws dvalue)?
+dvalue   ::= "-"? (float | int) | plainstr | "true" | "false" | "None" | "(" ws ")" | "[" ws "]"
 # C functions from a library: signatures only, one per line, and C structs.
 # `...` makes a function variadic; `= "name"` names the C function;
 # `blocking fn` runs the call off the task's thread.
@@ -69,13 +72,14 @@ block ::= "{" ws (stmt (stsep stmt)* (sp ";")?)? ws "}"
 stmt  ::= let | return | while | for | defer | "break" | "continue" | expr (sp "=" ws expr)?
 # `defer` takes a block, or one statement other than `let`
 defer  ::= "defer" sp1 (block | return | while | for | "break" | "continue" | expr (sp "=" ws expr)?)
-let    ::= "let" sp1 ("mut" sp1)? (ident sp (":" sp type sp)? | upat sp) "=" ws expr
+let    ::= "let" sp1 ("mut" sp1)? (ident sp (":" sp type sp)? | upat sp | spat sp) "=" ws expr
 tpat   ::= "(" ws pattern (isep pattern)* (ws ",")? ws ")"
-# unpacking in `let` and `for`: names, `_` and nested tuples only
+# unpacking in `let` and `for`: names, `_` and nested tuples, or a struct
+# pattern (`let Point { x, y } = p`)
 upat   ::= "(" ws (ident | upat) (isep (ident | upat))* (ws ",")? ws ")"
 return ::= "return" (sp1 expr)?
 while  ::= "while" sp1 expr sp block
-for    ::= "for" sp1 (ident sp1 | upat sp) "in" sp1 expr sp block
+for    ::= "for" sp1 (ident sp1 | upat sp | spat sp) "in" sp1 expr sp block
 
 # ---------- expressions ----------
 # `|>` may also start a line, to continue a pipeline
@@ -122,7 +126,8 @@ fpat    ::= ident (sp ":" ws pattern)?
 # ---------- tokens ----------
 ident  ::= [A-Za-z_] [A-Za-z0-9_]*
 upper  ::= [A-Z] [A-Za-z0-9_]*
-int    ::= [0-9] [0-9_]*
+# decimal, hexadecimal (`0xff`) or binary (`0b1010`)
+int    ::= "0x" [0-9a-fA-F] [0-9a-fA-F_]* | "0b" [01] [01_]* | [0-9] [0-9_]*
 float  ::= [0-9] [0-9_]* ("." [0-9] [0-9_]* exp? | exp)
 exp    ::= [eE] [+-]? [0-9]+
 string ::= mlstr | "\"" (strchar | escape | interp)* "\""
@@ -143,5 +148,12 @@ mlpfirst ::= [^ \t\n"\\{] | escape | mljoin | "\"" mlpnq | "\"\"" mlpnq
 mlpnq    ::= [^"\n\\{] | escape | mljoin
 mlpchar  ::= [^\n\\{] | escape | mljoin
 strchar ::= [^"\\{]
-escape  ::= "\\" [ntr\\"{}0]
+# `\u{e9}`: a Unicode character in 1 to 6 hex digits, at most 10ffff and
+# not a surrogate (d800 to dfff)
+escape  ::= "\\" [ntr\\"{}0] | "\\u{" ucode "}"
+hex     ::= [0-9a-fA-F]
+ucode   ::= hex | hex hex | hex hex hex | ucode4 | ucode5 | ucode6
+ucode4  ::= [0-9a-cA-Ce-fE-F] hex hex hex | [dD] [0-7] hex hex
+ucode5  ::= [1-9a-fA-F] hex hex hex hex | "0" ucode4
+ucode6  ::= "10" hex hex hex hex | "0" ucode5
 interp  ::= "{" ws expr ws "}"

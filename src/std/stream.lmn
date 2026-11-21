@@ -11,7 +11,6 @@
 // pieces. Lines end at `\n`, and a `\r` before it is dropped; a last line
 // without a newline counts too. A gzipped file is decompressed as it is
 // read, with every member's checksum checked.
-
 use compress
 
 // Every chunk of `path`, `size` bytes each (the last may be shorter).

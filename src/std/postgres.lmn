@@ -23,7 +23,6 @@
 // A `Db` is one connection, used by one task at a time: a query is a
 // request and its whole answer. For a server, `postgres.pool` opens a few
 // and `postgres.using(pool, |db| ...)` lends one to each request.
-
 use base64
 use hash
 use url

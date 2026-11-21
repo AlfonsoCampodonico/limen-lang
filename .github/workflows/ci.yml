@@ -1,5 +1,5 @@
 # Build and test Limen on real machines: x86-64 and arm64 Linux, and macOS
-# on Apple silicon and Intel. The same checks as before any change (see
+# on Apple silicon. The same checks as before any change (see
 # ROADMAP.md), plus short fuzz runs of the HTTP server and JSON.
 name: ci
 
@@ -13,8 +13,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-13]
+        # no Intel macOS: those runners are being retired (see ROADMAP.md, 0.9)
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
     runs-on: ${{ matrix.os }}
+    # each step has its own limit, so a hang fails in minutes; this is the sum
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
 
@@ -39,21 +42,27 @@ jobs:
         run: opam exec -- dune build --root .
 
       - name: Compiler tests
+        timeout-minutes: 60
         run: opam exec -- dune exec --root . ./test/test_limen.exe
 
       - name: Runtest
+        timeout-minutes: 15
         run: opam exec -- dune build --root . @runtest
 
       - name: Grammar suite
+        timeout-minutes: 15
         run: opam exec -- bash grammar/check-suite.sh
 
       - name: Self-hosted compiler check
+        timeout-minutes: 30
         run: DUNE_ROOT=$PWD LIMEN_BOOK=none opam exec -- sh selfhost/check.sh
 
       - name: Bootstrap
+        timeout-minutes: 30
         run: DUNE_ROOT=$PWD opam exec -- sh selfhost/bootstrap.sh
 
       - name: Fuzz JSON and the HTTP server
+        timeout-minutes: 15
         run: |
           L=./_build/default/bin/main.exe
           $L build fuzz/json.lmn -o fj

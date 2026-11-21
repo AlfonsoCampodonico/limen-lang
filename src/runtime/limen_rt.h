@@ -776,15 +776,29 @@ W_RT int64_t Cap_now_ms(void);
    after the switch means a waker can never resume a fiber that is still
    running. */
 
-#if defined(__has_feature)
+/* GCC before 14 has no __has_feature; it says so with __SANITIZE_*__. Without
+   this, a gcc build never told the sanitizers about fiber switches: TSan's
+   shadow stack underflowed and it faulted in its own code, then deadlocked
+   in our fault handler's sigaction (the CI hang on arm64 Linux). */
+#if defined(__SANITIZE_ADDRESS__)
+#define W_ASAN 1
+#elif defined(__has_feature)
 #if __has_feature(address_sanitizer)
 #define W_ASAN 1
-#include <sanitizer/common_interface_defs.h>
 #endif
+#endif
+#if defined(__SANITIZE_THREAD__)
+#define W_TSAN 1
+#elif defined(__has_feature)
 #if __has_feature(thread_sanitizer)
 #define W_TSAN 1
-#include <sanitizer/tsan_interface.h>
 #endif
+#endif
+#ifdef W_ASAN
+#include <sanitizer/common_interface_defs.h>
+#endif
+#ifdef W_TSAN
+#include <sanitizer/tsan_interface.h>
 #endif
 #include <sys/mman.h>
 #include <sched.h>
@@ -840,7 +854,11 @@ W_RT void w_frame_init(void **frame, WFiber *f);
 #else
 #define W_ASM_SYM(s) #s
 #endif
-#define W_FRAME_WORDS 8
+/* six saved registers and the return address. Odd on purpose: after
+   w_ctx_switch's ret into w_ctx_tramp, %rsp must be 16-byte aligned, as
+   before any call, so w_fiber_main starts with the stack the ABI promises
+   (with 8 it was 8 bytes off, and aligned SSE stores on the stack faulted) */
+#define W_FRAME_WORDS 7
 W_RT void w_frame_init(void **frame, WFiber *f);
 #else
 #error "Limen fibers need arm64 or x86_64"
