@@ -421,7 +421,10 @@ let expand ?json ?(rows = []) (items : item list) : (item list * Diag.t list) op
               Hashtbl.replace wrappers key w;
               e.edesc <- EVar w;
               e.einst <- []
-            with Unsupported inner -> no_form st e what t inner "JSON")))
+            with Unsupported inner ->
+              (* a function held through a struct's fields is named by its path *)
+              let inner = match fn_via t with Some p when inner = "a function" -> sprintf "a function through `%s`" p | _ -> inner in
+              no_form st e what t inner "JSON")))
       | EVar n when row_module n <> None -> (
         found := true;
         let st = Option.get (row_module n) in

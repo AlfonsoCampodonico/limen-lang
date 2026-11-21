@@ -2327,8 +2327,18 @@ fn main(root: Root) {
   errs "ambient-print" (main_wrap "    print(\"x\")") [ "E0302" ];
   errs "cap-in-struct" "struct C { n: Net }\nenum E { A(Fs), B }\nfn main(root: Root) {}" [];
   errs "chan-in-struct-still" "struct C { n: Net, c: Chan[Int] }\nfn main(root: Root) {}" [ "E0305" ];
-  errs "fn-of-cap-in-struct" "struct C { f: fn(Net) }\nfn main(root: Root) {}" [ "E0304" ];
-  errs "fn-in-struct" "struct C { f: fn(Int) -> Int }\nfn main(root: Root) {}" [ "E0304" ];
+  errs "fn-in-struct" "struct C { f: fn(Int) -> Int }\nfn main(root: Root) {}" [];
+  errs "fn-of-cap-in-struct" "struct C { f: fn(Net) }\nfn main(root: Root) {}" [];
+  (* a type holding a function through its fields is treated as holding a
+     function everywhere *)
+  let deep = "struct Route { run: fn() }\nstruct App { routes: List[Route] }\ninterface Named { fn name(self) -> Str }\nfn name(self: App) -> Str { \"app\" }\n" in
+  errs "fn-field-eq" (deep ^ "fn main(root: Root) { let a = App { routes: [] }\n let _ = a == a }") [ "E0201" ];
+  says "fn-field-eq-says" (deep ^ "fn main(root: Root) { let a = App { routes: [] }\n let _ = a == a }") "E0201" "`App.routes.run`";
+  errs "fn-field-dyn" (deep ^ "fn main(root: Root) { let d: dyn Named = App { routes: [] } }") [ "E0112" ];
+  errs "fn-field-key" (deep ^ "fn main(root: Root) { let m: Map[App, Int] = map() }") [ "E0113" ];
+  errs "fn-field-json" (deep ^ "use json\nfn main(root: Root) { let _ = json.encode(App { routes: [] }) }") [ "E0212" ];
+  says "fn-field-json-says" (deep ^ "use json\nfn main(root: Root) { let _ = json.encode(App { routes: [] }) }") "E0212" "`App.routes.run`";
+  errs "fn-field-recursive" "enum Chain { Link(fn() -> Int, Chain), End }\nfn main(root: Root) { let c = Link(|| 1, End) }" [];
   errs "generic-cap-visible-ok" "struct Box[T] { v: T }\nfn f(b: Box[Net]) {}\nfn main(root: Root) {}" [];
   errs "bad-main" "fn main(x: Int) {}" [ "E0303" ];
   errs "immutable" (main_wrap "    let n = 1\n    n = 2") [ "E0205" ];
@@ -6375,7 +6385,7 @@ fn main(root: Root) {
      the type is made, written, or made by a generic function *)
   let box = "struct Box[T] {\n    item: T,\n}\n\n" in
   errs "stored-arg-atomic" (box ^ "fn main() {\n    let b = Box { item: atomic(0) }\n}\n") [ "E0305" ];
-  errs "stored-arg-closure" (box ^ "fn main(root: Root) {\n    let out = root.stdout\n    let b = Box { item: || out.print(\"hi\") }\n}\n") [ "E0304" ];
+  errs "stored-arg-closure" (box ^ "fn main(root: Root) {\n    let out = root.stdout\n    let b = Box { item: || out.print(\"hi\") }\n}\n") [];
   errs "stored-arg-signature" (box ^ "fn f(b: Box[List[Chan[Int]]]) -> Int {\n    0\n}\n\nfn main() {\n}\n") [ "E0305" ];
   errs "stored-arg-variant" "enum Slot[T] {\n    Full(T),\n    Empty,\n}\n\nfn main() {\n    let s = Full(shared(1))\n}\n" [ "E0305" ];
   errs "stored-arg-generic-result" (box ^ "fn wrap[T](x: T) -> Box[T] {\n    Box { item: x }\n}\n\nfn main() {\n    let b = wrap(atomic(1))\n    let ok = wrap(1)\n}\n") [ "E0305" ];

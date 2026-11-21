@@ -186,6 +186,13 @@ let rec subst env t =
    capability has no entry. *)
 let authority : (string, (cap * string) list) Hashtbl.t = Hashtbl.create 16
 
+(* The struct and enum types that hold a function through their own fields
+   and payloads, by name, each with the path to the first one, `Route.run`
+   or `App.routes.run` (type arguments are not counted here; [fn_path]
+   walks them where the type is used). Filled with [authority] (see
+   [compute_authority]); a type holding no function has no entry. *)
+let fn_holders : (string, string) Hashtbl.t = Hashtbl.create 16
+
 let add_cap c acc = if List.mem c acc then acc else c :: acc
 
 (* Capabilities a value of the type holds: written in the type, or reached
@@ -214,17 +221,19 @@ let via t c =
       | Plain | Cap _ | State _ | Func | Dyn -> None)
     t
 
-(* Fill [authority] for the program's structs and enums: [fields] gives a
-   type's fields (a variant's payloads are named by the variant), in
-   declaration order, with its type parameters as TParam. Each type is
-   walked depth first from its first field, every type entered once, so
-   recursive types end. *)
+(* Fill [authority] and [fn_holders] for the program's structs and enums:
+   [fields] gives a type's fields (a variant's payloads are named by the
+   variant), in declaration order, with its type parameters as TParam.
+   Each type is walked depth first from its first field, every type entered
+   once, so recursive types end. *)
 let compute_authority (names : string list) (fields : string -> (string * ty) list option) =
   Hashtbl.reset authority;
+  Hashtbl.reset fn_holders;
   List.iter
     (fun n ->
-      let seen = Hashtbl.create 8 and found = ref [] in
+      let seen = Hashtbl.create 8 and found = ref [] and fn = ref None in
       let add c path = if not (List.mem_assoc c !found) then found := !found @ [ (c, path) ] in
+      let add_fn path = if !fn = None then fn := Some path in
       let rec enter m path =
         if not (Hashtbl.mem seen m) then begin
           Hashtbl.replace seen m ();
@@ -233,10 +242,11 @@ let compute_authority (names : string list) (fields : string -> (string * ty) li
           | None -> ()
         end
       and walk path t =
-        fold (fun () u -> match kind u with Cap c -> add c path | Named m -> enter m path | Plain | State _ | Func | Dyn -> ()) () t
+        fold (fun () u -> match kind u with Cap c -> add c path | Func -> add_fn path | Named m -> enter m path | Plain | State _ | Dyn -> ()) () t
       in
       enter n n;
-      if !found <> [] then Hashtbl.replace authority n !found)
+      if !found <> [] then Hashtbl.replace authority n !found;
+      Option.iter (Hashtbl.replace fn_holders n) !fn)
     names
 
 (* Channels, Atomics and Shareds: state tasks share, so values holding one
@@ -249,7 +259,29 @@ let chan_kind t = find_map (fun u -> match kind u with State w -> Some w | Plain
 (* Does [t] mention a `dyn` type? *)
 let has_dyn t = exists (fun u -> match kind u with Dyn -> true | Plain | Cap _ | State _ | Func | Named _ -> false) t
 
-let has_fn t = exists (fun u -> match kind u with Func -> true | Plain | Cap _ | State _ | Dyn | Named _ -> false) t
+(* Where a type holds a function, if it does: the first function type
+   written in it (itself or inside it), shown, as `fn() -> Int`, or the path
+   through the first struct or enum in it that holds one in its fields, as
+   `App.routes.run`, whichever comes first (the type itself first, then the
+   types inside it in order). *)
+let fn_path t =
+  find_map
+    (fun u ->
+      match kind u with
+      | Func -> Some (show u)
+      | Named n -> Hashtbl.find_opt fn_holders n
+      | Plain | Cap _ | State _ | Dyn -> None)
+    t
+
+let has_fn t = fn_path t <> None
+
+(* Does [t] write a function type, itself or inside it, rather than only
+   hold one through a struct's or enum's fields? *)
+let writes_fn t = exists (fun u -> kind u = Func) t
+
+(* The path through which [t] holds a function when it does not write one:
+   `App.routes.run`. *)
+let fn_via t = if writes_fn t then None else fn_path t
 
 (* How far a rule looks into a type for a kind of value: not at all, at the
    type itself only, or anywhere in it (element, key, payload, parameter
@@ -268,20 +300,24 @@ type found = Itself | Inside of ty
    inside it whose kind [p] refuses at any depth, shared state first, then
    functions, `dyn` values and capabilities. *)
 let refused p t =
+  (* a struct or enum holding a function through its fields counts as one
+     for a policy that looks for functions anywhere *)
+  let holds_fn u = match kind u with Named n -> p.fns = Deep && Hashtbl.mem fn_holders n | Plain | Cap _ | State _ | Func | Dyn -> false in
   let reach u =
     match kind u with
     | State _ -> p.state
     | Func -> p.fns
     | Dyn -> p.dyns
     | Cap _ -> p.caps
-    | Plain | Named _ -> Never
+    | Named _ -> if holds_fn u then p.fns else Never
+    | Plain -> Never
   in
   if reach t <> Never then Some Itself
   else
     let deep k = find_map (fun u -> if k u && reach u = Deep then Some (Inside (repr u)) else None) t in
     List.find_map deep
       [ (fun u -> match kind u with State _ -> true | Plain | Cap _ | Func | Dyn | Named _ -> false);
-        (fun u -> kind u = Func);
+        (fun u -> kind u = Func || holds_fn u);
         (fun u -> kind u = Dyn);
         (fun u -> match kind u with Cap _ -> true | Plain | State _ | Func | Dyn | Named _ -> false) ]
 

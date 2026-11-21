@@ -1,7 +1,8 @@
 (* Type checker. Collects every error instead of stopping at the first, and
    enforces the capability rules:
    - there is no ambient I/O (E0302),
-   - capabilities and functions cannot hide in struct/enum fields (E0301, E0304),
+   - capabilities and functions held through struct/enum fields are tracked
+     (Types.authority, Types.fn_holders),
    - main receives the root capability (E0303). *)
 open Ast
 open Types
@@ -165,21 +166,34 @@ let err ctx ?notes ?fix code span msg = ctx.diags <- Diag.make ?notes ?fix code 
    capability written at its top (one held anywhere is [held]'s). Printing
    refuses shared state anywhere, and a function or capability at the top:
    inside a value they print as `<fn>` and `<Net>`. A struct or enum field,
-   and so a type argument of a struct or enum, refuses shared state and
-   functions anywhere. *)
+   and so a type argument of a struct or enum, refuses shared state
+   anywhere; functions can be stored, and a type holding one through its
+   fields is refused wherever a function is (Types.fn_holders). *)
 let equality = { state = Deep; fns = Deep; dyns = Deep; caps = Top }
 let printing = { state = Deep; fns = Top; dyns = Never; caps = Top }
-let storing = { state = Deep; fns = Deep; dyns = Never; caps = Never }
+let storing = { state = Deep; fns = Never; dyns = Never; caps = Never }
 
 let holds_uncomparable t u = sprintf "`%s` holds `%s`, which cannot be compared" (show t) (show u)
+
+(* "`T` holds a function through `App.routes.run`", for a type that holds
+   one only through a struct's or enum's fields. *)
+let holds_fn_through t = Option.map (fun p -> sprintf "`%s` holds a function through `%s`" (show t) p) (fn_via t)
+
+(* Why [t], which [refused] found refuses at [found], cannot be compared. *)
+let uncomparable t found =
+  match found with
+  | Itself -> (match (kind t, holds_fn_through t) with Named _, Some h -> Some h | _ -> None)
+  | Inside u -> (match (kind u, holds_fn_through t) with Named _, Some h -> Some h | _ -> Some (holds_uncomparable t u))
 
 (* E0201 when built-in [name] compares values of type [t] that have no
    equality: functions, channels, `dyn` values, capabilities, and values
    holding one of them, as `==` refuses them. *)
 let refuse_compare ctx sp name t =
   match refused equality t with
-  | Some Itself -> err ctx "E0201" sp (sprintf "`%s` compares values, and values of type `%s` cannot be compared" name (show t))
-  | Some (Inside u) -> err ctx "E0201" sp (sprintf "`%s` compares values, and %s" name (holds_uncomparable t u))
+  | Some found -> (
+    match uncomparable t found with
+    | Some why -> err ctx "E0201" sp (sprintf "`%s` compares values, and %s" name why)
+    | None -> err ctx "E0201" sp (sprintf "`%s` compares values, and values of type `%s` cannot be compared" name (show t)))
   | None -> (
     match held t with
     | Some h ->
@@ -377,8 +391,9 @@ and resolve_bound ctx env (b : ty_expr) : bound option =
     None
   | _ -> err ctx "E0102" b.tspan "a bound is an interface"; None
 
-(* Channels and functions cannot hide in a struct or enum; capabilities can,
-   and the types holding them are tracked (Types.authority). *)
+(* Channels cannot hide in a struct or enum; capabilities and functions can,
+   and the types holding them are tracked (Types.authority,
+   Types.fn_holders). *)
 let check_storable ctx span t =
   match refused storing t with
   | None -> ()
@@ -392,10 +407,7 @@ let check_storable ctx span t =
       err ctx "E0305" span
         (sprintf "an `Atomic` or `Shared` value cannot be stored in a struct or enum field, and `%s` holds one" (show t))
         ~notes:[ "like a channel, pass it as a parameter or capture it in a closure instead" ]
-    | Func | Plain | Cap _ | Dyn | Named _ ->
-      err ctx "E0304" span
-        (sprintf "function type `%s` cannot be stored in a struct or enum field" (show t))
-        ~notes:[ "a stored closure could carry a capability out of sight; pass it as a parameter instead" ])
+    | Func | Plain | Cap _ | Dyn | Named _ -> (* [storing] refuses only shared state *) ())
 
 (* A struct or enum of the program's own, not a tuple or one of the
    prelude's (Option and Result hold values as a List does). *)
@@ -408,7 +420,7 @@ let own_type ctx n =
 
 (* The struct and enum types made or written with type arguments since the
    last call: an argument is what a field holds, so it cannot be or hold a
-   channel, Atomic, Shared or function (E0305, E0304), however deep. *)
+   channel, Atomic or Shared (E0305), however deep. *)
 let check_stored ctx =
   let ts = List.rev !stored in
   stored := [];
@@ -1130,7 +1142,9 @@ and coerce ctx e t ((i, _) as b) =
         ~notes:[ "shared state must stay visible in types; pass it with a type parameter, as in `[T: " ^ bn ^ "]`" ]
     else if has_fn ct || has_chan ct then
       err ctx "E0112" e.espan
-        (sprintf "`%s` holds a function or channel, so it cannot become `dyn %s`" (show ct) bn)
+        (match holds_fn_through ct with
+         | Some h -> sprintf "%s, so it cannot become `dyn %s`" h bn
+         | None -> sprintf "`%s` holds a function or channel, so it cannot become `dyn %s`" (show ct) bn)
         ~notes:[ "a function or channel could carry authority out of sight; pass it with a type parameter, as in `[T: " ^ bn ^ "]`" ]
     else begin
       match satisfies ctx ct b with
@@ -1362,8 +1376,8 @@ and check_call ?want ctx f e callee args sp =
        let t = check_expr ctx f a in
        expect ctx f b t;
        match refused equality t with
-       | Some Itself -> err ctx "E0201" sp (sprintf "values of type `%s` cannot be compared" (show t))
-       | Some (Inside _) | None -> eq_types := t :: !eq_types; refuse_compare ctx sp "assert_eq" t)
+       | Some Itself when uncomparable t Itself = None -> err ctx "E0201" sp (sprintf "values of type `%s` cannot be compared" (show t))
+       | Some _ | None -> eq_types := t :: !eq_types; refuse_compare ctx sp "assert_eq" t)
      | _ -> err ctx "E0107" sp "`assert_eq` takes 2 arguments"; check_args ctx f args);
     TUnit
   | EVar "keep" when not (is_local f "keep") && not (Hashtbl.mem ctx.fns "keep") ->
@@ -1913,7 +1927,7 @@ and error_conversion ctx e =
     (match held ct with
     | Some h -> Some h
     | None ->
-    if has_fn ct || has_chan ct then Some (sprintf "`%s` holds a function or channel" (show ct))
+    if has_fn ct || has_chan ct then Some (match holds_fn_through ct with Some h -> h | None -> sprintf "`%s` holds a function or channel" (show ct))
     else satisfies ctx ct ("Error", []))
   | t -> Some (sprintf "`%s` does not satisfy `Error`" (show t))
 
@@ -2059,9 +2073,10 @@ and check_bin ctx f op a b sp =
     | _ ->
       eq_types := t :: !eq_types;
       (match refused equality t with
-       | Some Itself -> bad ()
-       | Some (Inside u) ->
-         err ctx "E0201" sp (sprintf "operator `%s` cannot be applied to `%s`" name (show t)) ~notes:[ holds_uncomparable t u ]
+       | Some found -> (
+         match uncomparable t found with
+         | Some why -> err ctx "E0201" sp (sprintf "operator `%s` cannot be applied to `%s`" name (show t)) ~notes:[ why ]
+         | None -> bad ())
        | None -> (
          (* capabilities have no equality, so neither has a value holding one *)
          match held t with
@@ -2878,7 +2893,11 @@ let check_pending ctx =
       match unkeyable ctx k with
       | None -> ()
       | Some t ->
-        let inner = if show t = show (repr k) then "" else sprintf " (it holds `%s`)" (show t) in
+        let inner =
+          match fn_via k with
+          | Some p -> sprintf " (it holds a function through `%s`)" p
+          | None -> if show t = show (repr k) then "" else sprintf " (it holds `%s`)" (show t)
+        in
         err ctx "E0113" sp (sprintf "`%s` cannot be a map key%s" (show (repr k)) inner)
           ~notes:("keys are Int, Str, Bool, and tuples, structs and enums made of them; Float, List and Map cannot be keys"
                   :: match t with TParam g -> [ sprintf "a type parameter can be a key with the bound `[%s: Key]`" g ] | _ -> []))
@@ -3119,8 +3138,10 @@ let refuse_compared_params ctx =
           | Some t when not (bounded g p) -> (
             let what = sprintf "`%s` compares values of `%s`" (shown g) p in
             match refused equality t with
-            | Some Itself -> err ctx "E0201" sp (sprintf "%s, and values of type `%s` cannot be compared" what (show t))
-            | Some (Inside u) -> err ctx "E0201" sp (sprintf "%s, and %s" what (holds_uncomparable t u))
+            | Some found -> (
+              match uncomparable t found with
+              | Some why -> err ctx "E0201" sp (sprintf "%s, and %s" what why)
+              | None -> err ctx "E0201" sp (sprintf "%s, and values of type `%s` cannot be compared" what (show t)))
             | None -> (
               match held t with
               | Some h ->
