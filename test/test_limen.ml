@@ -5487,6 +5487,15 @@ fn main(root: Root) -> Result[(), IoError] {
    let got = try Fmt.format ~file:"fmt-multiline.lmn" src with Diag.Fatal d -> "error: " ^ d.message in
    ok "fmt-multiline-string" (got = want) (sprintf "got:\n%s\nwant:\n%s" got want);
    check_fmt "fmt-multiline-string" src ());
+  (* a function held in a field is called with brackets, `(h.on_get)("/")`;
+     without them it reads as a method call, so fmt must keep them *)
+  (let src = "struct H {\n    on_get: fn(Str) -> Str,\n}\n\nfn main(h: H, xs: List[H]) {\n    let a = (h.on_get)(\"/\")\n    let b = (xs[0].on_get)(\"/\")\n    let c = (a.b.c)(1)\n    let d = f(1)\n    let e = (|x| x)(1)\n    let g = f(1)(2)\n}\n" in
+   let want = src in
+   let got = try Fmt.format ~file:"fmt-called-field.lmn" src with Diag.Fatal d -> "error: " ^ d.message in
+   ok "fmt-called-field" (got = want) (sprintf "got:\n%s\nwant:\n%s" got want);
+   ok "fmt-called-field-idempotent"
+     (try Fmt.format ~file:"fmt-called-field2.lmn" got = got with Diag.Fatal _ -> false) "not idempotent";
+   check_fmt "fmt-called-field" src ());
   ok "unknown-method-lists-methods"
     (let _, ds, _ = compile "unknown-method" (main_wrap "    let n = [1].size_of()") in
      List.exists (fun (d : Diag.t) -> List.exists (fun n -> String.starts_with ~prefix:"`List[Int]` has: " n) d.notes) ds)

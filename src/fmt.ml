@@ -325,7 +325,8 @@ and expr_inner c ind e =
     add c (match op with Neg -> "-" | Not -> "!" | BitNot -> "~");
     expr c ind ~min:16 a
   | ECall (f, args) ->
-    expr c ind ~min:16 f;
+    (* a field holding a function is called as `(h.f)(x)`; `h.f(x)` is a method call *)
+    (match f.edesc with EField _ -> add c "("; expr c ind f; add c ")" | _ -> expr c ind ~min:16 f);
     call_args c ind f.espan.hi e.espan.hi args
   | ENamed (n, _, x) ->
     add c (n ^ ": ");
