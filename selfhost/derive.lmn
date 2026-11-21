@@ -768,4 +768,3 @@ fn fn_exprs(i: ast.Item) -> List[ast.Expr] {
         _ => [],
     }
 }
-

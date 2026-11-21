@@ -31,7 +31,9 @@ irdump=$PWD/_build/default/selfhost/irdump/irdump.exe
 cdump=$PWD/_build/default/selfhost/cdump/cdump.exe
 limen_abs=$PWD/$limen
 book=${LIMEN_BOOK:-../limen-book}/examples
-out=$(mktemp -d)
+# in the repository, so the Limen compiler's grant (see tsc) holds it
+mkdir -p _build
+out=$(mktemp -d "$PWD/_build/check.XXXXXX")
 trap 'rm -rf "$out"' EXIT
 "$limen" build selfhost/tokens.lmn -o "$out/tokens"
 "$limen" build selfhost/parse.lmn -o "$out/parse"
@@ -99,11 +101,22 @@ compare_ir() {
 }
 
 # tsc ARGS...: the Limen compiler, in the current directory, granted
-# what it reads and writes (everything, for this test: the programs and
-# the scratch directory are far apart), the programs a build runs and the
-# variables it reads
+# what it reads and writes: this repository (where $out is), or with the
+# book the directory that holds both. Never a system directory: on Linux a
+# writable grant over /usr or /lib leaves the C compiler unable to start.
+# Then the programs a build runs and the variables it reads.
+tsc_grant=$PWD
+if [ -d "$book" ]; then
+  while [ "$tsc_grant" != / ] && case "$bookdir/" in "$tsc_grant/"*) false ;; *) true ;; esac; do
+    tsc_grant=$(dirname "$tsc_grant")
+  done
+  if [ "$tsc_grant" = / ]; then
+    echo "the book ($bookdir) and this repository share no directory but /: put them side by side, or set LIMEN_BOOK=none" >&2
+    exit 1
+  fi
+fi
 tsc() {
-  "$out/tsc" --grant fs=/ \
+  "$out/tsc" --grant "fs=$tsc_grant" \
     --grant env=PWD --grant env=CC --grant env=PATH --grant env=HOME \
     --grant env=LIMEN_CACHE --grant env=XDG_CACHE_HOME --grant env=DEVELOPER_DIR --grant env=LIMEN_OPENSSL \
     --grant env=LIBRARY_PATH --grant env=CPATH --grant env=C_INCLUDE_PATH --grant env=SDKROOT --grant env=MACOSX_DEPLOYMENT_TARGET \
