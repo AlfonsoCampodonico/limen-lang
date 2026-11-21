@@ -18,6 +18,20 @@
  (flags
   (:standard -w +a-4-9-40-41-42-44-45-70 -warn-error -a)))
 
+; The design shared with limen-lang.org (src/design, kept in step by
+; dev/design_sync.py) and the `limen new` templates, as `Design_files.files`.
+(rule
+ (targets design_files.ml)
+ (deps
+  design/limen.css
+  design/logo.svg
+  (glob_files design/fonts/*)
+  (glob_files_rec design/starter/**))
+ (action
+  (with-stdout-to
+   design_files.ml
+   (run %{exe:design/embed_files.exe} %{deps}))))
+
 ; Embed the C runtime as OCaml strings: `text`, all of it as one program
 ; starts (the sandbox, the declarations, the SQL core, the definitions), and `header`, the
 ; declarations alone, which each piece of a split build includes.

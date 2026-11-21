@@ -249,25 +249,69 @@ let prose s =
 
 let anchor parts = String.concat "-" (List.map (String.map (fun c -> if c = ':' || c = ' ' then '-' else c)) parts)
 
-let style =
-  {|:root{--bg:#fff;--fg:#1d1d1f;--muted:#6e6e73;--line:#e5e5ea;--code:#f5f5f7;--link:#0a58ca}
-@media (prefers-color-scheme:dark){:root{--bg:#161618;--fg:#ececf0;--muted:#9a9aa2;--line:#2e2e33;--code:#222226;--link:#7ab0ff}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.55 system-ui,-apple-system,sans-serif}
-a{color:var(--link);text-decoration:none}a:hover{text-decoration:underline}
-.wrap{display:flex;max-width:1100px;margin:0 auto}nav{flex:0 0 220px;padding:24px 16px;border-right:1px solid var(--line);position:sticky;top:0;align-self:flex-start;max-height:100vh;overflow:auto;font-size:14px}
-nav ul{list-style:none;margin:0 0 12px;padding:0}nav li{margin:2px 0}nav .mod{font-weight:600;margin-top:12px}
-main{flex:1;min-width:0;padding:24px 32px}h1{font-size:28px;margin:32px 0 8px}h1:first-child{margin-top:0}h2{font-size:20px;margin:28px 0 8px;border-bottom:1px solid var(--line);padding-bottom:4px}
-h3{font-size:17px;margin:22px 0 6px}h4{font-size:15px;margin:16px 0 6px;color:var(--muted)}
-pre{background:var(--code);padding:10px 12px;border-radius:6px;overflow:auto;font-size:14px;margin:6px 0}code{font:14px ui-monospace,SFMono-Regular,Menlo,monospace}
-p code{background:var(--code);padding:1px 4px;border-radius:4px}dl{margin:6px 0 6px 12px}dt{font-family:ui-monospace,Menlo,monospace;font-size:14px}dd{margin:0 0 6px 16px;color:var(--muted)}
-.kind{color:var(--muted);font-weight:400}
-@media (max-width:720px){.wrap{display:block}nav{position:static;border-right:0;border-bottom:1px solid var(--line);max-height:none}main{padding:16px}}|}
+(* Signatures in the book's highlighting classes: keywords, types, function
+   names, strings, numbers and comments, and capabilities in ochre, the one
+   colour the design keeps for them. *)
+let cap_types =
+  [ "Root"; "Net"; "Fs"; "Stdout"; "Stderr"; "Clock"; "Listen"; "Listener"; "Conn"; "Rand"; "Stdin"; "Env"; "Exec"; "Foreign"; "Revoker" ]
+
+let keywords =
+  [ "pub"; "fn"; "struct"; "enum"; "interface"; "let"; "mut"; "self"; "use"; "dyn"; "if"; "else"; "match"; "for"; "in"; "return"; "true"; "false" ]
+
+let highlight s =
+  let b = Buffer.create (String.length s * 2) in
+  let n = String.length s in
+  let span cls text = Buffer.add_string b (Printf.sprintf "<span class=\"%s\">%s</span>" cls (escape text)) in
+  let is_word c = c = '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') in
+  let last_word = ref "" in
+  let rec go i =
+    if i < n then
+      let c = s.[i] in
+      if c = '/' && i + 1 < n && s.[i + 1] = '/' then begin
+        let j = match String.index_from_opt s i '\n' with Some j -> j | None -> n in
+        span "c" (String.sub s i (j - i));
+        go j
+      end
+      else if c = '"' then begin
+        let rec close j = if j >= n then n else if s.[j] = '\\' then close (j + 2) else if s.[j] = '"' then j + 1 else close (j + 1) in
+        let j = min n (close (i + 1)) in
+        span "s" (String.sub s i (j - i));
+        go j
+      end
+      else if c >= '0' && c <= '9' then begin
+        let rec stop j = if j < n && (is_word s.[j] || s.[j] = '.') then stop (j + 1) else j in
+        let j = stop i in
+        span "n" (String.sub s i (j - i));
+        go j
+      end
+      else if is_word c then begin
+        let rec stop j = if j < n && is_word s.[j] then stop (j + 1) else j in
+        let j = stop i in
+        let w = String.sub s i (j - i) in
+        if List.mem w keywords then span "k" w
+        else if !last_word = "fn" then span "f" w
+        else if List.mem w cap_types then span "cap" w
+        else if w.[0] >= 'A' && w.[0] <= 'Z' then span "t" w
+        else Buffer.add_string b w;
+        last_word := w;
+        go j
+      end
+      else begin
+        Buffer.add_string b (escape (String.make 1 c));
+        go (i + 1)
+      end
+  in
+  go 0;
+  Buffer.contents b
 
 let html ?(title = "Limen documentation") (mods : module_doc list) =
   let b = Buffer.create 8192 in
   let p s = Buffer.add_string b s in
-  p "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n";
-  p ("<title>" ^ escape title ^ "</title>\n<style>\n" ^ style ^ "\n</style>\n</head>\n<body>\n<div class=\"wrap\">\n<nav>\n");
+  p "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<meta name=\"generator\" content=\"limen doc\">\n";
+  p ("<title>" ^ escape title ^ "</title>\n<style>\n" ^ Design.css ^ "</style>\n</head>\n<body>\n");
+  p ("<header class=\"nav\">\n<div class=\"wrap nav-row\">\n<a class=\"brand\" href=\"#\"><span class=\"brand-mark\">" ^ Design.mark ^ "</span>" ^ escape title
+     ^ "</a>\n<span class=\"nav-note\">API reference</span>\n</div>\n</header>\n");
+  p "<div class=\"wrap doc\">\n<nav class=\"doc-side\" aria-label=\"Contents\">\n";
   List.iter
     (fun md ->
       p (Printf.sprintf "<div class=\"mod\"><a href=\"#%s\">%s</a></div>\n<ul>\n" (anchor [ md.md_name ]) (escape md.md_name));
@@ -275,12 +319,12 @@ let html ?(title = "Limen documentation") (mods : module_doc list) =
       List.iter (fun e -> p (Printf.sprintf "<li><a href=\"#%s\">%s()</a></li>\n" (anchor [ md.md_name; e.e_name ]) (escape e.e_name))) md.md_fns;
       p "</ul>\n")
     mods;
-  p "</nav>\n<main>\n";
-  let pre s = p ("<pre><code>" ^ escape s ^ "</code></pre>\n") in
+  p "</nav>\n<main class=\"doc-main\">\n";
+  let pre s = p ("<div class=\"window doc-sig\"><pre><code>" ^ highlight s ^ "</code></pre></div>\n") in
   let methods md owner ms =
     List.iter
       (fun m ->
-        p (Printf.sprintf "<div id=\"%s\">" (anchor [ md.md_name; owner; m.m_name ]));
+        p (Printf.sprintf "<div class=\"doc-method\" id=\"%s\">" (anchor [ md.md_name; owner; m.m_name ]));
         pre m.m_sig;
         p (prose m.m_doc);
         p "</div>\n")
@@ -288,29 +332,32 @@ let html ?(title = "Limen documentation") (mods : module_doc list) =
   in
   List.iter
     (fun md ->
-      p (Printf.sprintf "<h1 id=\"%s\"><span class=\"kind\">module</span> %s</h1>\n" (anchor [ md.md_name ]) (escape md.md_name));
+      p (Printf.sprintf "<section class=\"doc-module\">\n<p class=\"eyebrow\">Module</p>\n<h1 id=\"%s\">%s</h1>\n" (anchor [ md.md_name ]) (escape md.md_name));
       p (prose md.md_doc);
       if md.md_types <> [] then p "<h2>Types</h2>\n";
       List.iter
         (fun e ->
-          p (Printf.sprintf "<h3 id=\"%s\"><span class=\"kind\">%s</span> %s</h3>\n" (anchor [ md.md_name; e.e_name ]) e.e_kind (escape e.e_name));
+          p (Printf.sprintf "<article class=\"doc-item\" id=\"%s\">\n<h3><span class=\"kind\">%s</span>%s</h3>\n" (anchor [ md.md_name; e.e_name ]) e.e_kind (escape e.e_name));
           pre e.e_sig;
           p (prose e.e_doc);
           if e.e_members <> [] then begin
-            p "<dl>\n";
-            List.iter (fun m -> p (Printf.sprintf "<dt>%s</dt><dd>%s</dd>\n" (escape m.m_name) (prose m.m_doc))) e.e_members;
-            p "</dl>\n"
+            p "<table class=\"bench doc-members\">\n<tbody>\n";
+            List.iter (fun m -> p (Printf.sprintf "<tr><th scope=\"row\">%s</th><td>%s</td></tr>\n" (escape m.m_name) (prose m.m_doc))) e.e_members;
+            p "</tbody>\n</table>\n"
           end;
-          if e.e_methods <> [] then (p "<h4>Methods</h4>\n"; methods md e.e_name e.e_methods))
+          if e.e_methods <> [] then (p "<h4>Methods</h4>\n"; methods md e.e_name e.e_methods);
+          p "</article>\n")
         md.md_types;
       List.iter (fun (t, ms) -> p (Printf.sprintf "<h2>Methods on %s</h2>\n" (escape t)); methods md t ms) md.md_extra;
       if md.md_fns <> [] then p "<h2>Functions</h2>\n";
       List.iter
         (fun e ->
-          p (Printf.sprintf "<h3 id=\"%s\"><span class=\"kind\">fn</span> %s</h3>\n" (anchor [ md.md_name; e.e_name ]) (escape e.e_name));
+          p (Printf.sprintf "<article class=\"doc-item\" id=\"%s\">\n<h3><span class=\"kind\">fn</span>%s</h3>\n" (anchor [ md.md_name; e.e_name ]) (escape e.e_name));
           pre e.e_sig;
-          p (prose e.e_doc))
-        md.md_fns)
+          p (prose e.e_doc);
+          p "</article>\n")
+        md.md_fns;
+      p "</section>\n")
     mods;
   p "</main>\n</div>\n</body>\n</html>\n";
   Buffer.contents b

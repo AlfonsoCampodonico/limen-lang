@@ -57,6 +57,76 @@ pub fn json(status: Int, body: Str) -> Response {
     Response { status, headers: [Header { name: "Content-Type", value: "application/json" }], body }
 }
 
+// A page for an error status in the design of limen-lang.org, light or dark
+// as the visitor's system is, with nothing fetched: the status, its reason
+// and `detail` (HTML-escaped). The router and the server answer with it
+// instead of plain text when the request accepts HTML; call it to answer
+// errors of your own the same way.
+pub fn error_page(status: Int, detail: Str) -> Response {
+    let why = escape_html(reason(status))
+    // the heading in sentence case, as the design writes labels
+    let heading = why.slice(0, 1) + why.slice(1, why.len()).to_lower()
+    let body = """
+        <!doctype html>
+        <html lang="en">
+        <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>{status} {why}</title>
+        <style>
+        {error_css()}</style>
+        </head>
+        <body>
+        <main class="error-page">
+        <p class="error-status">{status}</p>
+        <h1>{heading}</h1>
+        <p>{escape_html(detail)}</p>
+        <p><a href="/">Go to the home page</a></p>
+        </main>
+        </body>
+        </html>
+
+        """
+    Response { status, headers: [Header { name: "Content-Type", value: "text/html; charset=utf-8" }], body }
+}
+
+// True when the request's Accept header names `text/html`, as a browser's
+// does. Clients that leave it out, like curl and most API clients, get the
+// plain-text errors.
+pub fn accepts_html(r: Request) -> Bool {
+    match r.header("Accept") {
+        Some(a) => a.to_lower().contains("text/html"),
+        None => false,
+    }
+}
+
+// The error page for a request that accepts HTML, else `plain` as text.
+fn error_for(r: Request, status: Int, detail: Str, plain: Str) -> Response {
+    if accepts_html(r) { error_page(status, detail) } else { text(status, plain) }
+}
+
+fn escape_html(s: Str) -> Str {
+    s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;")
+}
+
+// The error page's stylesheet: a trimmed copy of the compiler's
+// src/design/limen.css (tokens and the `.error-page` rules), which comes
+// from limen-book. A test checks every token here against that file.
+fn error_css() -> Str {
+    """
+    :root \{ --bg: #ffffff; --line: #e7e5e4; --ink: #0c0a09; --ink-2: #44403c; --ink-3: #78716c; --brand: #1f3a70; --brand-ink: #24498f; --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace; --text-sm: 14px; --text-md: 16px; --text-3xl: 40px; --space-3: 12px; --space-4: 16px; --space-6: 24px; --space-24: 96px; color-scheme: light; \}
+    @media (prefers-color-scheme: dark) \{ :root \{ --bg: #0c0b0a; --line: #2a2826; --ink: #f5f4f2; --ink-2: #cfcbc6; --ink-3: #8f8a84; --brand: #3a62b0; --brand-ink: #9dbbf5; color-scheme: dark; \} \}
+    body \{ margin: 0; background: var(--bg); color: var(--ink); font: 400 var(--text-md)/1.6 var(--font-sans); -webkit-font-smoothing: antialiased; \}
+    p \{ margin: 0 0 var(--space-4); color: var(--ink-2); \}
+    a \{ color: var(--brand-ink); text-underline-offset: 3px; \}
+    h1 \{ margin: 0; color: var(--ink); font-weight: 600; letter-spacing: -.02em; \}
+    .error-page \{ max-width: 640px; margin: 0 auto; padding: var(--space-24) var(--space-6); \}
+    .error-status \{ margin: 0 0 var(--space-3); color: var(--ink-3); font: 500 var(--text-sm)/1 var(--font-mono); \}
+    .error-page h1 \{ font-size: var(--text-3xl); line-height: 1.1; letter-spacing: -.03em; margin-bottom: var(--space-4); \}
+
+    """
+}
+
 pub fn reason(status: Int) -> Str {
     match status {
         200 => "OK",
@@ -743,6 +813,11 @@ fn send(c: Conn, r: Response, keep: Bool, head_only: Bool, by: By) -> Result[(),
     }
 }
 
+// The answer when the handler for `req` panicked.
+fn failed(req: Request) -> Response {
+    error_for(req, 500, "The server ran into an error while answering this request.", "internal error")
+}
+
 // `r`, or a 500 if it could not be sent as it is (a bad header or status).
 fn sendable(r: Response) -> Response {
     let ok = r.status >= 100 && r.status <= 999 && check_headers(r.headers).is_ok() && transfer_codings(r.headers).is_none() && content_length(r.headers).is_ok()
@@ -796,7 +871,7 @@ pub fn end_body(c: Conn) -> Result[(), IoError] {
 // True if it was answered.
 pub fn handle(c: Conn, handler: fn(Request) -> Response) -> Bool {
     let r = match read_request(c) {
-        Ok(req) => sendable(catch(|| handler(req)) ?? text(500, "internal error")),
+        Ok(req) => sendable(catch(|| handler(req)) ?? failed(req)),
         Err(_) => text(400, "bad request\n"),
     }
     let ok = write_response(c, r).is_ok()
@@ -842,7 +917,7 @@ fn conn_loop(c: Conn, limits: Option[Server], handler: fn(Request) -> Response, 
         }
         match read_message(c, buf, limits, head_by) {
             Ok(Some((req, rest))) => {
-                let r = sendable(catch(|| handler(req)) ?? text(500, "internal error"))
+                let r = sendable(catch(|| handler(req)) ?? failed(req))
                 let keep = keeps_alive(req) && answered.get() + 1 < max_requests() && !has_token(r.headers, "Connection", "close")
                 if send(c, r, keep, req.method == "HEAD", deadline(limits, |s| s.write_ms)).is_ok() {
                     let _ = answered.add(1)
@@ -1191,11 +1266,11 @@ pub fn route(r: Request, routes: List[Route]) -> Response {
         }
     }
     if allowed.is_empty() {
-        return text(404, "not found\n")
+        return error_for(r, 404, "Nothing is served at {r.path}.", "not found\n")
     }
     if allowed.contains("GET") && !allowed.contains("HEAD") {
         allowed.push("HEAD")
     }
-    let r405 = text(405, "method not allowed\n")
+    let r405 = error_for(r, 405, "{r.path} does not answer {r.method}. It answers {allowed.join(", ")}.", "method not allowed\n")
     { r405 with headers: r405.headers + [Header { name: "Allow", value: allowed.join(", ") }] }
 }

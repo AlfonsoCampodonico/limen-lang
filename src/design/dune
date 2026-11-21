@@ -1,0 +1,3 @@
+; Writes the files under src/design as an OCaml list, for ../dune.
+(executable
+ (name embed_files))

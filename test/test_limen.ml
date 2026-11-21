@@ -4335,6 +4335,57 @@ fn main(root: Root) {
 }
 |v}
     "GET /todos -> 200 list None\nGET /todos/?x=1 -> 200 list None\nPOST /todos -> 201 made None\nGET /todos/7 -> 200 todo Some(7) Some(\"7\") None\nGET /todos/a%20b -> 200 todo None Some(\"a b\") None\nPUT /todos/7 -> 405 method not allowed Some(\"GET, DELETE, HEAD\")\nPUT /todos -> 405 method not allowed Some(\"GET, POST, HEAD\")\nHEAD /todos -> 200 list None\nGET /users -> 404 not found None\nGET /todos/7/x -> 404 not found None\nPATCH /files/a/b%2Fc -> 200 file [a/b/c] PATCH None\nGET /files -> 200 file [] GET None\nGET /todos/%zz -> 400 bad request None\nErr(\"http.route: pattern `GET todos` has a path that does not start with `/`\")\n";
+  (* browsers (Accept: text/html) get the error pages in the site's design;
+     other clients keep the plain-text bodies *)
+  out "std-http-error-pages"
+    ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] }
+    {v|use http
+
+fn req(method: Str, path: Str, accept: Str) -> http.Request {
+    http.Request { method, path, version: "HTTP/1.1", headers: [http.Header { name: "accept", value: accept }], body: "" }
+}
+
+fn show(out: Stdout, r: http.Response) {
+    let b = r.body
+    out.print("{r.status} {r.header("content-type") ?? "-"} {r.header("allow") ?? "-"} doctype={b.starts_with("<!doctype html>")} dark={b.contains("prefers-color-scheme: dark")} url={b.contains("url(")} script={b.contains("<script")}")
+    let start = b.index_of("<h1>") ?? 0
+    let end = b.index_of("</main>") ?? b.len()
+    out.print(b.slice(start, end).replace("\n", " ").trim())
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let out = root.stdout
+    let routes = [
+        http.on("GET /todos", |r, p| http.text(200, "list")),
+        http.on("GET /boom", |r, p| panic("no")),
+    ]
+    let html = "text/html,application/xhtml+xml,*/*;q=0.8"
+    show(out, http.route(req("GET", "/<b>&x", html), routes))
+    show(out, http.route(req("DELETE", "/todos", "TEXT/HTML"), routes))
+    show(out, http.route(req("GET", "/nope", "application/json"), routes))
+    show(out, http.route(req("GET", "/nope", ""), routes))
+    show(out, http.error_page(403, "Sign in to see <this>."))
+    out.print("{http.accepts_html(req("GET", "/", html))} {http.accepts_html(http.Request { method: "GET", path: "/", version: "HTTP/1.1", headers: [], body: "" })}")
+    let l = root.listen.on("127.0.0.1:0")?
+    let url = "http://127.0.0.1:{l.port()}/boom"
+    let net = root.net
+    let _ = group g {
+        g.go(|| {
+            let _ = http.serve(l, 2, |r| http.route(r, routes))
+        })
+        g.go(|| {
+            for accept in [html, "*/*"] {
+                match http.request(net, "GET", url, [http.Header { name: "Accept", value: accept }]) {
+                    Ok(r) => show(out, r),
+                    Err(e) => out.print("{e}"),
+                }
+            }
+        })
+    }
+    Ok(())
+}
+|v}
+    "404 text/html; charset=utf-8 - doctype=true dark=true url=false script=false\n<h1>Not found</h1> <p>Nothing is served at /&lt;b&gt;&amp;x.</p> <p><a href=\"/\">Go to the home page</a></p>\n405 text/html; charset=utf-8 GET, HEAD doctype=true dark=true url=false script=false\n<h1>Method not allowed</h1> <p>/todos does not answer DELETE. It answers GET, HEAD.</p> <p><a href=\"/\">Go to the home page</a></p>\n404 text/plain; charset=utf-8 - doctype=false dark=false url=false script=false\nnot found\n404 text/plain; charset=utf-8 - doctype=false dark=false url=false script=false\nnot found\n403 text/html; charset=utf-8 - doctype=true dark=true url=false script=false\n<h1>Forbidden</h1> <p>Sign in to see &lt;this&gt;.</p> <p><a href=\"/\">Go to the home page</a></p>\ntrue false\n500 text/html; charset=utf-8 - doctype=true dark=true url=false script=false\n<h1>Internal server error</h1> <p>The server ran into an error while answering this request.</p> <p><a href=\"/\">Go to the home page</a></p>\n500 text/plain; charset=utf-8 - doctype=false dark=false url=false script=false\ninternal error\n";
   out "std-regex"
     {v|use regex
 
@@ -9862,8 +9913,46 @@ fn main(root: Root) {
   let hp s = Interp_util.find_sub page s 0 <> None in
   ok "doc-html"
     (hp "<!doctype html>" && hp "<p>How far from the origin.</p>" && hp "<h2>Methods on Str</h2>"
-     && hp "id=\"geom-Point\"" && hp "pick[T: Area](xs: List[T], i: Int) -&gt; T" && hp "<p>Geometry helpers.</p>\n<p>Second paragraph.</p>")
+     && hp "id=\"geom-Point\"" && hp "<span class=\"f\">pick</span>[<span class=\"t\">T</span>: <span class=\"t\">Area</span>](xs: <span class=\"t\">List</span>[<span class=\"t\">T</span>], i: <span class=\"t\">Int</span>) -&gt; <span class=\"t\">T</span>" && hp "<p>Geometry helpers.</p>\n<p>Second paragraph.</p>")
     page;
+  (* the page carries the design shared with limen-lang.org and fetches nothing *)
+  ok "doc-html-design"
+    (hp "--code-bg:" && hp "prefers-color-scheme: dark" && hp "class=\"brand-mark\"><svg viewBox" && hp "<th scope=\"row\">x</th>"
+     && (not (hp "src=\"http")) && (not (hp "href=\"http")) && (not (hp "url(")) && (not (hp "@import")) && not (hp "<script"))
+    page;
+  let hl = Doc.highlight "pub fn get(net: Net, url: Str) -> Result[Str, IoError] // \"x\" < 1" in
+  ok "doc-html-highlight"
+    (hl = "<span class=\"k\">pub</span> <span class=\"k\">fn</span> <span class=\"f\">get</span>(net: <span class=\"cap\">Net</span>, url: <span class=\"t\">Str</span>) -&gt; <span class=\"t\">Result</span>[<span class=\"t\">Str</span>, <span class=\"t\">IoError</span>] <span class=\"c\">// &quot;x&quot; &lt; 1</span>")
+    hl;
+  (* the error pages' trimmed stylesheet in std/http.lmn keeps the tokens of
+     src/design/limen.css (which comes from limen-book) *)
+  let tokens_in text start stop =
+    match Interp_util.find_sub text start 0 with
+    | None -> []
+    | Some i ->
+      let i = i + String.length start in
+      let j = match Interp_util.find_sub text stop i with Some j -> j | None -> String.length text in
+      List.filter_map
+        (fun d ->
+          (* the part after any comment *)
+          let d = match Interp_util.find_sub d "*/" 0 with Some c -> String.sub d (c + 2) (String.length d - c - 2) | None -> d in
+          let d = match Interp_util.find_sub d "*/" 0 with Some c -> String.sub d (c + 2) (String.length d - c - 2) | None -> d in
+          match String.index_opt d ':' with
+          | Some k when String.length (String.trim d) > 2 && String.sub (String.trim d) 0 2 = "--" ->
+            Some (String.trim (String.sub d 0 k), String.trim (String.sub d (k + 1) (String.length d - k - 1)))
+          | _ -> None)
+        (String.split_on_char ';' (String.sub text i (j - i)))
+  in
+  let http_src = List.assoc "http" !Modules.std_modules in
+  let page_light = tokens_in http_src ":root \\{" "\\}" and page_dark = tokens_in http_src "dark) \\{ :root \\{" "\\}" in
+  let site_light = tokens_in Design.css ":root {" "}" and site_dark = tokens_in Design.css ":root:not([data-theme=\"light\"]) {" "}" in
+  let differ =
+    List.filter_map (fun (k, v) -> if List.assoc_opt k site_light = Some v then None else Some k) page_light
+    @ List.filter_map (fun (k, v) -> if List.assoc_opt k site_dark = Some v then None else Some ("dark " ^ k)) page_dark
+  in
+  ok "http-error-page-tokens"
+    (List.length page_light >= 10 && List.length page_dark >= 5 && differ = [])
+    ("differ from src/design/limen.css: " ^ String.concat ", " differ);
   (* every standard library module documents without error, and its functions have docs *)
   let std = List.map (fun n -> Doc.load n) (Doc.std_names ()) in
   let std_md = Doc.markdown std in
