@@ -106,6 +106,7 @@ type fn_info = {
   caps : cap list;
   via : (cap * string) list;
   callbacks : bool;
+  callbacks_via : string option; (* the path to the function a parameter holds through a field, `Handlers.on_get` *)
   shares : bool; (* it takes a channel, Atomic or Shared: state tasks share, so it is not pure *)
   libs : string list;
       (* the C libraries it reaches with a Foreign: its own when it is a
@@ -2937,7 +2938,12 @@ let check_pending ctx =
       let why =
         match i with
         | "Ordered" -> Option.map (fun u -> sprintf "`%s` has no order: numbers, strings, Bool, and lists, tuples, structs and enums of them are ordered" (show u)) (unordered ctx t)
-        | "Key" -> Option.map (fun u -> sprintf "`%s` cannot be a map key: keys are Int, Str, Bytes, Bool, and tuples, structs and enums of them" (show u)) (unkeyable ctx t)
+        | "Key" ->
+          Option.map
+            (fun u ->
+              let shown = match fn_via t with Some p -> sprintf "`%s` (it holds a function through `%s`)" (show (repr t)) p | None -> sprintf "`%s`" (show u) in
+              sprintf "%s cannot be a map key: keys are Int, Str, Bytes, Bool, and tuples, structs and enums of them" shown)
+            (unkeyable ctx t)
         | _ -> satisfies ctx t b
       in
       match why with
@@ -3096,7 +3102,7 @@ let pure_text (i : fn_info) =
   match (i.callbacks, i.pure_if) with
   | cb, _ when i.shares -> if cb then "shares state, runs callbacks" else "shares state"
   | false, _ -> "pure"
-  | true, [] -> "pure itself, runs callbacks"
+  | true, [] -> (match i.callbacks_via with Some p -> sprintf "pure itself, runs callbacks (via %s)" p | None -> "pure itself, runs callbacks")
   | true, [ f ] -> sprintf "pure if %s is" f
   | true, fs ->
     let rev = List.rev fs in
@@ -3564,6 +3570,7 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
           caps = List.map fst held;
           via = List.filter_map (fun (c, p) -> Option.map (fun p -> (c, p)) p) held;
           callbacks = List.exists has_fn s.ps || d.fn_bounds <> [];
+          callbacks_via = List.find_map fn_via s.ps;
           shares = List.exists has_chan (s.ps @ List.concat_map snd (bound_types bounds));
           libs = Hashtbl.find libs d.fn_name;
           pure_if = (match Hashtbl.find_opt cond d.fn_name with Some (fns, _) -> fns | None -> []) })

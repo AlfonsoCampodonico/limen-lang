@@ -348,6 +348,25 @@ let check_tsan name ?(grants = Interp.no_grants) ?feed src want =
     end
   end
 
+let fn_field_table = {|struct Server { name: Str }
+fn handle(self: Server, path: Str) -> Str { "{self.name}: {path}" }
+struct Handlers { on_get: fn(Str) -> Str, on_missing: fn(Str) -> Str }
+enum Chain { Link(fn(Int) -> Int, Chain), End }
+fn apply(c: Chain, x: Int) -> Int { match c { Link(f, rest) => apply(rest, f(x)), End => x } }
+fn shout(h: Handlers, p: Str) -> Str { (h.on_get)(p).to_upper() }
+fn main(root: Root) {
+    let out = root.stdout
+    let tags = ["a", "b"]
+    let srv = Server { name: "srv" }
+    let h = Handlers { on_get: srv.handle, on_missing: |p| "missing {p} {tags}" }
+    out.print((h.on_get)("/"))
+    out.print((h.on_missing)("/x"))
+    out.print("{apply(Link(|x| x + 1, Link(|x| x * 10, End)), 1)}")
+    let loud = Handlers { on_get: |p| { out.print("called"); p }, on_missing: |p| p }
+    for _ in 0..<2 { let _ = shout(loud, "x") }
+}
+|}
+
 let out name ?grants ?modules ?feed src want =
   if selected name then begin
   (match run ?grants ?modules ?feed name src with
@@ -2336,6 +2355,11 @@ fn main(root: Root) {
   says "fn-field-eq-says" (deep ^ "fn main(root: Root) { let a = App { routes: [] }\n let _ = a == a }") "E0201" "`App.routes.run`";
   errs "fn-field-dyn" (deep ^ "fn main(root: Root) { let d: dyn Named = App { routes: [] } }") [ "E0112" ];
   errs "fn-field-key" (deep ^ "fn main(root: Root) { let m: Map[App, Int] = map() }") [ "E0113" ];
+  says "fn-field-key-bound-says"
+    (deep ^ "fn keyed[K: Key](k: K) -> Int { 1 }\nfn main(root: Root) { let a = App { routes: [] }\n let _ = keyed(a) }")
+    "E0111" "`App` (it holds a function through `App.routes.run`) cannot be a map key";
+  out "fn-field-table" fn_field_table
+    "srv: /\nmissing /x [\"a\", \"b\"]\n20\ncalled\ncalled\n";
   errs "fn-field-json" (deep ^ "use json\nfn main(root: Root) { let _ = json.encode(App { routes: [] }) }") [ "E0212" ];
   says "fn-field-json-says" (deep ^ "use json\nfn main(root: Root) { let _ = json.encode(App { routes: [] }) }") "E0212" "`App.routes.run`";
   errs "fn-field-recursive" "enum Chain { Link(fn() -> Int, Chain), End }\nfn main(root: Root) { let c = Link(|| 1, End) }" [];
@@ -6381,7 +6405,7 @@ fn main(root: Root) {
     "interface Named {\n    fn name(self) -> Str\n}\n\nstruct Box[T] {\n    v: T,\n}\n\nfn name(self: Box[Shared[Int]]) -> Str {\n    \"box\"\n}\n\nfn main() {\n    let b: dyn Named = Box { v: shared(1) }\n}\n"
     [ "E0305"; "E0305"; "E0112" ];
   (* a type argument of a struct or enum is what its fields hold: shared
-     state and functions are refused there as in a field, however deep, where
+     state is refused there as in a field, however deep, where
      the type is made, written, or made by a generic function *)
   let box = "struct Box[T] {\n    item: T,\n}\n\n" in
   errs "stored-arg-atomic" (box ^ "fn main() {\n    let b = Box { item: atomic(0) }\n}\n") [ "E0305" ];
@@ -9194,6 +9218,17 @@ fn main(root: Root) {
   ok "caps-grants" (code = 0 && o = "main  Root\ngrant exec=echo hi|-n\ngrant exec=sh -c\n") (sprintf "code %d, out %S, err %S" code o e);
   let code, o, _ = limen_cli [ "caps"; gexec; "--json" ] in
   ok "caps-grants-json" (code = 0 && Interp_util.find_sub o {|"grants":["exec=echo hi|-n","exec=sh -c"]|} 0 <> None) o;
+  (if selected "fn-field-caps" then begin
+    let f = Filename.temp_file "fnfield" ".lmn" in
+    let oc = open_out f in
+    output_string oc fn_field_table;
+    close_out oc;
+    let code, o, e = limen_cli [ "caps"; f ] in
+    ok "fn-field-caps" (code = 0 && Interp_util.find_sub o "shout           pure itself, runs callbacks (via Handlers.on_get)" 0 <> None) (sprintf "code %d, out %S, err %S" code o e);
+    let code, o, e = limen_cli [ "caps"; f; "--json" ] in
+    ok "fn-field-caps-json" (code = 0 && Interp_util.find_sub o {|"callbacks_via":"Handlers.on_get"|} 0 <> None) (sprintf "code %d, out %S, err %S" code o e);
+    Sys.remove f
+  end);
   let code, _, e = limen_cli [ "run"; gexec; "--grant"; "exec=* -c" ] in
   ok "grants-exec-flag-bad" (code = 2 && Interp_util.find_sub e "exec grant" 0 <> None) (sprintf "code %d, err %S" code e);
   (* sqrt, not cbrt: a square root is correctly rounded everywhere (IEEE

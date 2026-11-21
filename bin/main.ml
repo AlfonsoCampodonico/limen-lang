@@ -418,10 +418,12 @@ let cmd_caps file json =
   let caps_via (i : Check.fn_info) = List.map (Check.cap_text i) i.caps in
   if json then begin
     let one (i : Check.fn_info) =
-      Printf.sprintf {|{"name":%s,"caps":[%s],"via":{%s},"callbacks":%b,"shares":%b,"pure":%b,"pure_if":[%s],"libs":[%s]}|} (Diag.jstr i.name)
+      Printf.sprintf {|{"name":%s,"caps":[%s],"via":{%s},"callbacks":%b,%s"shares":%b,"pure":%b,"pure_if":[%s],"libs":[%s]}|} (Diag.jstr i.name)
         (String.concat "," (List.map Diag.jstr (caps_str i)))
         (String.concat "," (List.map (fun (c, p) -> Diag.jstr (Types.cap_name c) ^ ":" ^ Diag.jstr p) i.via))
-        i.callbacks i.shares
+        i.callbacks
+        (match i.callbacks_via with Some p -> Printf.sprintf {|"callbacks_via":%s,|} (Diag.jstr p) | None -> "")
+        i.shares
         (i.caps = [] && not i.callbacks && not i.shares)
         (String.concat "," (List.map Diag.jstr i.pure_if))
         (String.concat "," (List.map Diag.jstr (if List.mem Types.Foreign i.caps then i.libs else [])))
