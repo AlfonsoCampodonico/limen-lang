@@ -354,6 +354,8 @@ struct Handlers { on_get: fn(Str) -> Str, on_missing: fn(Str) -> Str }
 enum Chain { Link(fn(Int) -> Int, Chain), End }
 fn apply(c: Chain, x: Int) -> Int { match c { Link(f, rest) => apply(rest, f(x)), End => x } }
 fn shout(h: Handlers, p: Str) -> Str { (h.on_get)(p).to_upper() }
+fn size(h: Handlers, n: Int) -> Int { (h.on_get)("x").len() + n }
+fn size_all(hs: List[Handlers], n: Int) -> Int { (hs[0].on_get)("x").len() + n }
 fn main(root: Root) {
     let out = root.stdout
     let tags = ["a", "b"]
@@ -366,6 +368,10 @@ fn main(root: Root) {
     for _ in 0..<2 { let _ = shout(loud, "x") }
     let _ = shout(loud, "x")
     let _ = shout(loud, "x")
+    let mut t = 0
+    for _ in 0..<4 { t = t + size(loud, 1) }
+    for _ in 0..<4 { t = t + size_all([loud], 1) }
+    out.print("{t}")
 }
 |}
 
@@ -2361,7 +2367,7 @@ fn main(root: Root) {
     (deep ^ "fn keyed[K: Key](k: K) -> Int { 1 }\nfn main(root: Root) { let a = App { routes: [] }\n let _ = keyed(a) }")
     "E0111" "`App` (it holds a function through `App.routes.run`) cannot be a map key";
   out "fn-field-table" fn_field_table
-    "srv: /\nmissing /x [\"a\", \"b\"]\n20\ncalled\ncalled\ncalled\ncalled\n";
+    "srv: /\nmissing /x [\"a\", \"b\"]\n20\ncalled\ncalled\ncalled\ncalled\ncalled\ncalled\ncalled\ncalled\ncalled\ncalled\ncalled\ncalled\n16\n";
   errs "fn-field-json" (deep ^ "use json\nfn main(root: Root) { let _ = json.encode(App { routes: [] }) }") [ "E0212" ];
   says "fn-field-json-says" (deep ^ "use json\nfn main(root: Root) { let _ = json.encode(App { routes: [] }) }") "E0212" "`App.routes.run`";
   errs "fn-field-recursive" "enum Chain { Link(fn() -> Int, Chain), End }\nfn main(root: Root) { let c = Link(|| 1, End) }" [];

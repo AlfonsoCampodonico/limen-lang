@@ -609,7 +609,7 @@ let rec plain_type t =
   | Types.TInt | TFloat | TBool | TUnit | TStr | TBytes | TUInt _ | TDyn _ -> true
   | TList a | TArray (a, _) -> plain_type a
   | TMap (k, v) -> plain_type k && plain_type v
-  | TNamed (n, args) -> List.for_all plain_type args && not (Hashtbl.mem Types.authority n)
+  | TNamed (n, args) -> List.for_all plain_type args && not (Hashtbl.mem Types.authority n) && not (Hashtbl.mem Types.fn_holders n)
   | TFn _ | TCap _ | TChan _ | TAtomic | TShared _ | TGroup _ | TParam _ | TVar _ | TLen _ | TErr -> false
 
 (* The names a function's body may call, and whether it starts tasks,
