@@ -1,7 +1,8 @@
 // Bounds of bounds: the `dyn` interfaces a bound's methods mention, in a
 // result, a parameter or a callback's type, are bounds on the values
 // inside, so their methods' authority counts too, with the path through
-// them. An interface that mentions itself is entered once.
+// them, through the outermost `dyn` first. An interface is entered once
+// whatever its arguments, so one that grows them still ends.
 interface Inner {
     fn give(self) -> Stdout
 }
@@ -59,6 +60,31 @@ interface Box[T] {
 
 fn boxed[B: Box[dyn Leaf]](b: B) {
     let _ = b.open().dial().get("http://y")
+}
+
+interface Grow[T] {
+    fn next(self) -> dyn Grow[Option[T]]
+    fn val(self) -> T
+}
+
+fn grow[X: Grow[Int]](x: X) {
+    let _ = x.next().val()
+}
+
+interface Wraps {
+    fn wrap(self) -> dyn Box[dyn Leaf]
+}
+
+fn wrapped[W: Wraps](w: W) {
+    let _ = w.wrap().open().dial().get("http://z")
+}
+
+interface Hands {
+    fn hand(self) -> dyn Grow[Stdout]
+}
+
+fn handed[X: Grow[Int], H: Hands](x: X, h: H) {
+    h.hand().val().print("h")
 }
 
 fn both[T: Outer](x: T, out: Stdout) {

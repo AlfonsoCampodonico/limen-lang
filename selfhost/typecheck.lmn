@@ -297,42 +297,51 @@ fn refuse_compared_params(cx: env.Cx, st: env.State) -> env.State {
 // parameters' bounds, with the methods' paths: `x.give()` in
 // `fn f[T: Giver](x: T)` gets what `Giver.give`'s parameter and result
 // types hold. Followed through bounds of bounds: the interface of each
-// `dyn` type a method's parameters or result mention is a bound on the
-// value inside, so its methods are reached too, with the path through
-// them, `Outer.get, Inner.give`. Breadth first, so the shortest path comes
-// first; each interface is entered once, so one that mentions itself
-// ends.
-fn reached_types(cx: env.Cx, st: env.State, bounds: List[env.Bounds]) -> List[(Str, List[types.Ty])] {
-    let mut seen: List[Str] = []
-    let mut queue: List[(Str, env.Bound)] = []
-    for b in bounds.flat_map(|bs| bs.bounds) {
-        let k = st.show_bound(b)
-        if !seen.contains(k) {
-            seen.push(k)
-            queue.push(("", b))
-        }
+// `dyn` type a method's signature mentions is a bound on the value inside,
+// so its methods are reached too, with the path through them,
+// `Outer.get, Inner.give`. Breadth first, so the shortest path comes
+// first, and the outermost `dyn` first: in `dyn Box[dyn Leaf]`, `Leaf` is
+// reached through `Box`'s methods, and only through its arguments
+// directly when they do not reach it. Each interface is entered once
+// whatever its arguments, so one that mentions itself, even with growing
+// arguments (`dyn Grow[Option[T]]`), ends; what a later mention's
+// arguments hold is already counted by the method that mentions it, and
+// the `dyn` types inside them are followed.
+fn outer_dyns(st: env.State, t: types.Ty) -> List[env.Bound] {
+    match st.subst.repr(t) {
+        TDyn(j, ja) => [env.Bound { iface: j, args: ja }],
+        u => st.subst.children(u).flat_map(|c| outer_dyns(st, c)),
     }
+}
+
+// The interfaces reached_types has entered, by name, and those still to
+// walk, each with its path so far.
+struct Reach {
+    seen: List[Str],
+    queue: List[(Str, env.Bound)],
+}
+
+fn reach(r: Reach, st: env.State, pre: Str, b: env.Bound) -> Reach {
+    if !r.seen.contains(b.iface) {
+        return { r with seen: r.seen + [b.iface], queue: r.queue + [(pre, b)] }
+    }
+    b.args.flat_map(|a| outer_dyns(st, a)).fold(r, |got, d| reach(got, st, pre, d))
+}
+
+fn reached_types(cx: env.Cx, st: env.State, bounds: List[env.Bounds]) -> List[(Str, List[types.Ty])] {
+    let mut r = bounds.flat_map(|bs| bs.bounds).fold(Reach { seen: [], queue: [] }, |got, b| reach(got, st, "", b))
     let mut out: List[(Str, List[types.Ty])] = []
     let mut next = 0
-    while next < queue.len() {
-        let (pre, b) = queue[next]
+    while next < r.queue.len() {
+        let (pre, b) = r.queue[next]
         next = next + 1
         for m in checker.iface_methods(st, cx, b) {
             let path = "{pre}{b.iface}.{m.name}"
             let ts = m.params + [m.ret]
             out.push((path, ts))
-            let found = ts.fold([], |acc, t| st.subst.fold(t, acc, |got, u| match st.subst.repr(u) {
-                TDyn(j, ja) => got + [env.Bound { iface: j, args: ja }],
-                _ => got,
-            }))
-            for d in found {
-                let k = st.show_bound(d)
-                if !seen.contains(k) {
-                    seen.push(k)
-                    queue.push(("{path}, ", d))
-                }
-            }
+            r = ts.flat_map(|t| outer_dyns(st, t)).fold(r, |got, d| reach(got, st, "{path}, ", d))
         }
+        r = b.args.flat_map(|a| outer_dyns(st, a)).fold(r, |got, d| reach(got, st, pre, d))
     }
     out
 }
@@ -340,10 +349,10 @@ fn reached_types(cx: env.Cx, st: env.State, bounds: List[env.Bounds]) -> List[(S
 // The capabilities a function with parameter types `ps` and these bounds
 // holds, in the order of builtins.cap_names: those of authority_of, then
 // those only its bounds' methods reach, and the methods of the bounds they
-// mention (reached_types), each with the first method's path.
-fn fn_authority(cx: env.Cx, st: env.State, ps: List[types.Ty], bounds: List[env.Bounds]) -> List[(Str, Option[Str])] {
+// mention (reached_types, given as `through`), each with the first
+// method's path.
+fn fn_authority(st: env.State, ps: List[types.Ty], through: List[(Str, List[types.Ty])]) -> List[(Str, Option[Str])] {
     let held = st.authority_of(ps)
-    let through = reached_types(cx, st, bounds)
     builtins.cap_names().flat_map(|c| match held.find(|h| h.0 == c) {
         Some(h) => [h],
         None => match through.find(|x| x.1.any(|t| st.subst.caps_in(t, []).contains(c))) {
@@ -355,13 +364,14 @@ fn fn_authority(cx: env.Cx, st: env.State, ps: List[types.Ty], bounds: List[env.
 
 fn fn_info(cx: env.Cx, st: env.State, f: Fn, pure_if: List[Str], libs: List[Str]) -> FnInfo {
     let bounds = cx.fn_cur_bounds.get(f.decl.name) ?? []
-    let held = fn_authority(cx, st, f.sig.params, bounds)
+    let through = reached_types(cx, st, bounds)
+    let held = fn_authority(st, f.sig.params, through)
     let callbacks = f.sig.params.any(|t| st.subst.has_fn(t)) || !f.decl.bounds.is_empty()
     let callbacks_via = f.sig.params.flat_map(|t| match st.subst.fn_via(t) {
         Some(p) => [p],
         None => [],
     }).first()
-    let shares = (f.sig.params + reached_types(cx, st, bounds).flat_map(|x| x.1)).any(|t| st.subst.has_chan(t))
+    let shares = (f.sig.params + through.flat_map(|x| x.1)).any(|t| st.subst.has_chan(t))
     let via = held.flat_map(|h| match h.1 {
         Some(p) => [(h.0, p)],
         None => [],

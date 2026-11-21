@@ -134,40 +134,48 @@ let authority_of ts =
    parameters' bounds, with the methods' paths: `x.give()` in
    `fn f[T: Giver](x: T)` gets what `Giver.give`'s parameter and result
    types hold. Followed through bounds of bounds: the interface of each
-   `dyn` type a method's parameters or result mention is a bound on the
-   value inside, so its methods are reached too, with the path through
-   them, `Outer.get, Inner.give`. Breadth first, so the shortest path comes
-   first; each interface is entered once, so one that mentions itself
-   ends. *)
+   `dyn` type a method's signature mentions is a bound on the value inside,
+   so its methods are reached too, with the path through them,
+   `Outer.get, Inner.give`. Breadth first, so the shortest path comes
+   first, and the outermost `dyn` first: in `dyn Box[dyn Leaf]`, `Leaf` is
+   reached through `Box`'s methods, and only through its arguments
+   directly when they do not reach it. Each interface is entered once
+   whatever its arguments, so one that mentions itself, even with growing
+   arguments (`dyn Grow[Option[T]]`), ends; what a later mention's
+   arguments hold is already counted by the method that mentions it, and
+   the `dyn` types inside them are followed. *)
+let rec outer_dyns t = match repr t with TDyn (j, ja) -> [ (j, ja) ] | _ -> List.concat_map outer_dyns (children t)
+
 let reached_types bounds =
   let seen = Hashtbl.create 8 and out = ref [] and q = Queue.create () in
-  let visit pre b =
-    let k = show_bound b in
-    if not (Hashtbl.mem seen k) then begin
-      Hashtbl.replace seen k ();
+  let rec visit pre ((j, ja) as b) =
+    if not (Hashtbl.mem seen j) then begin
+      Hashtbl.replace seen j ();
       Queue.push (pre, b) q
     end
+    else List.iter (visit pre) (List.concat_map outer_dyns ja)
   in
   List.iter (fun (_, bs) -> List.iter (visit "") bs) bounds;
   while not (Queue.is_empty q) do
-    let pre, ((i, _) as b) = Queue.pop q in
+    let pre, ((i, args) as b) = Queue.pop q in
     List.iter
       (fun (m, (ps, r)) ->
         let path = pre ^ i ^ "." ^ m in
         let ts = ps @ [ r ] in
         out := (path, ts) :: !out;
-        List.iter (fold (fun () u -> match repr u with TDyn (j, ja) -> visit (path ^ ", ") (j, ja) | _ -> ()) ()) ts)
-      (iface_methods b)
+        List.iter (visit (path ^ ", ")) (List.concat_map outer_dyns ts))
+      (iface_methods b);
+    List.iter (visit pre) (List.concat_map outer_dyns args)
   done;
   List.rev !out
 
 (* The capabilities a function with parameter types [ps] and these bounds
    holds, in [all_caps] order: those of [authority_of ps], then those only
    its bounds' methods reach, and the methods of the bounds they mention
-   ([reached_types]), each with the first method's path. *)
-let fn_authority ps bounds =
+   ([reached_types], given as [through]), each with the first method's
+   path. *)
+let fn_authority ps through =
   let held = authority_of ps in
-  let through = reached_types bounds in
   List.filter_map
     (fun c ->
       match List.assoc_opt c held with
@@ -3609,13 +3617,14 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
     List.map
       (fun ((d : fn_decl), s) ->
         let bounds = Option.value ~default:[] (Hashtbl.find_opt fn_cur_bounds d.fn_name) in
-        let held = fn_authority s.ps bounds in
+        let through = reached_types bounds in
+        let held = fn_authority s.ps through in
         { name = d.fn_name; span = d.fn_span;
           caps = List.map fst held;
           via = List.filter_map (fun (c, p) -> Option.map (fun p -> (c, p)) p) held;
           callbacks = List.exists has_fn s.ps || d.fn_bounds <> [];
           callbacks_via = List.find_map fn_via s.ps;
-          shares = List.exists has_chan (s.ps @ List.concat_map snd (reached_types bounds));
+          shares = List.exists has_chan (s.ps @ List.concat_map snd through);
           libs = Hashtbl.find libs d.fn_name;
           pure_if = (match Hashtbl.find_opt cond d.fn_name with Some (fns, _) -> fns | None -> []) })
       (* forwarders only pass their arguments on; the methods they call are reported *)

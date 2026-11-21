@@ -118,8 +118,9 @@ happens here.
   NUL-path difference came from this.
 - Bound authority through bounds of bounds, not just an interface's own
   methods (done: the `dyn` interfaces a bound's methods take or return are
-  followed to any depth, each entered once, and `limen caps` and E0320 name
-  the path, `Outer.get, Inner.give`).
+  followed to any depth, outermost first, each interface entered once
+  whatever its arguments, and `limen caps` and E0320 name the path,
+  `Outer.get, Inner.give`).
 - `share`, `==`, printing and dropping `dyn` values without recursion, so a
   deep value can't overflow a task's stack (done: each recurses a few dozen
   levels and keeps the rest on a work stack, natively; the interpreter's

@@ -10733,9 +10733,11 @@ fn main(root: Root) {
    ok "caps-bound-methods" (ds = [] && i.caps = [ Types.Stdout ] && i.via = [ (Types.Stdout, "Giver.give") ]) (Check.cap_text i Types.Stdout));
   (* bounds of bounds: the `dyn` interfaces a bound's methods mention (in
      a result, a parameter, a callback's type) are bounds too, followed to
-     any depth; an interface that mentions itself is entered once *)
+     any depth, the outermost `dyn` first; an interface is entered once
+     whatever its arguments, so one that grows them ends, and a capability
+     in a later mention's arguments still counts *)
   (let src =
-     "interface Inner {\n    fn give(self) -> Stdout\n}\n\ninterface Outer {\n    fn get(self) -> dyn Inner\n}\n\nfn get_out[T: Outer](x: T) {\n    x.get().give().print(\"x\")\n}\n\ninterface Taker {\n    fn take(self, f: fn(Fs))\n}\n\ninterface Maker {\n    fn make(self) -> fn() -> dyn Taker\n}\n\nfn made[M: Maker](m: M) {\n    let f = m.make()\n    f().take(|fs| fs.remove(\"x\") ?? ())\n}\n\ninterface Leaf {\n    fn dial(self) -> Net\n}\n\ninterface Node {\n    fn next(self) -> dyn Node\n    fn leaf(self) -> Option[dyn Leaf]\n}\n\nfn walk[N: Node](n: N) {\n    match n.next().next().leaf() {\n        Some(l) => {\n            let _ = l.dial().get(\"http://x\")\n        },\n        None => (),\n    }\n}\n\ninterface Loop {\n    fn again(self) -> dyn Loop\n}\n\nfn spin[L: Loop](l: L) {\n    let _ = l.again().again()\n}\n\nfn both[T: Outer](x: T, out: Stdout) {\n    out.print(\"y\")\n}\n\nfn main(root: Root) {\n}\n"
+     "interface Inner {\n    fn give(self) -> Stdout\n}\n\ninterface Outer {\n    fn get(self) -> dyn Inner\n}\n\nfn get_out[T: Outer](x: T) {\n    x.get().give().print(\"x\")\n}\n\ninterface Taker {\n    fn take(self, f: fn(Fs))\n}\n\ninterface Maker {\n    fn make(self) -> fn() -> dyn Taker\n}\n\nfn made[M: Maker](m: M) {\n    let f = m.make()\n    f().take(|fs| fs.remove(\"x\") ?? ())\n}\n\ninterface Leaf {\n    fn dial(self) -> Net\n}\n\ninterface Node {\n    fn next(self) -> dyn Node\n    fn leaf(self) -> Option[dyn Leaf]\n}\n\nfn walk[N: Node](n: N) {\n    match n.next().next().leaf() {\n        Some(l) => {\n            let _ = l.dial().get(\"http://x\")\n        },\n        None => (),\n    }\n}\n\ninterface Loop {\n    fn again(self) -> dyn Loop\n}\n\nfn spin[L: Loop](l: L) {\n    let _ = l.again().again()\n}\n\ninterface Grow[T] {\n    fn next(self) -> dyn Grow[Option[T]]\n    fn val(self) -> T\n}\n\nfn grow[X: Grow[Int]](x: X) {\n    let _ = x.next().val()\n}\n\ninterface Box[T] {\n    fn open(self) -> T\n}\n\ninterface Wraps {\n    fn wrap(self) -> dyn Box[dyn Leaf]\n}\n\nfn wrapped[W: Wraps](w: W) {\n    let _ = w.wrap().open().dial().get(\"http://z\")\n}\n\ninterface Hands {\n    fn hand(self) -> dyn Grow[Stdout]\n}\n\nfn handed[X: Grow[Int], H: Hands](x: X, h: H) {\n    h.hand().val().print(\"h\")\n}\n\nfn both[T: Outer](x: T, out: Stdout) {\n    out.print(\"y\")\n}\n\nfn main(root: Root) {\n}\n"
    in
    let _, ds, infos = compile "caps-bound-bounds" src in
    let find n = List.find (fun (i : Check.fn_info) -> i.name = n) infos in
@@ -10746,8 +10748,11 @@ fn main(root: Root) {
       && text "made" = "Fs (via Maker.make, Taker.take)"
       && text "walk" = "Net (via Node.leaf, Leaf.dial)"
       && (find "spin").caps = []
-      && text "both" = "Stdout")
-     (String.concat "; " (List.map text [ "get_out"; "made"; "walk"; "spin"; "both" ])));
+      && text "both" = "Stdout"
+      && (find "grow").caps = []
+      && text "wrapped" = "Net (via Wraps.wrap, Box.open, Leaf.dial)"
+      && text "handed" = "Stdout (via Hands.hand)")
+     (String.concat "; " (List.map text [ "get_out"; "made"; "walk"; "spin"; "both"; "grow"; "wrapped"; "handed" ])));
   (let items, ds, _ = compile "pure-if-ir" cond_src in
    if ds <> [] then ok "pure-if-ir" false (String.concat " " (codes ds))
    else
