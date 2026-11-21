@@ -122,6 +122,9 @@ happens here.
   deep value can't overflow a task's stack (done: each recurses a few dozen
   levels and keeps the rest on a work stack, natively; the interpreter's
   printing no longer takes quadratic time on a deep value).
+- The same for the walks still left recursive: ordering (`<`, `sort`) and
+  hashing a deep map key, natively and in the interpreter, and a check of
+  `json.encode` on a deep value.
 - The JSON edges: a lone `\ud800`, duplicate keys, a nesting limit, numbers
   over 400 characters.
 - Fuzz the lexer, parser, checker and the rest of the runtime.
