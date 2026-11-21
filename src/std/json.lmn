@@ -345,15 +345,16 @@ fn value(t: Text, i: Int) -> Result[Parsed, Str] {
             let id = open[d].id
             // a few keys are compared one by one, more through the map
             let n = open[d].fields.len()
-            if n == 16 {
+            let many = n >= few_keys()
+            if n == few_keys() {
                 for f in open[d].fields {
                     seen[(id, f.key)] = true
                 }
             }
-            if (n < 16 && has_key(open[d].fields, name)) || (n >= 16 && seen.contains((id, name))) {
+            if (!many && has_key(open[d].fields, name)) || (many && seen.contains((id, name))) {
                 return Err("duplicate key `{name}` at byte {j}")
             }
-            if n >= 16 {
+            if many {
                 seen[(id, name)] = true
             }
             open[d].key = name
@@ -363,16 +364,15 @@ fn value(t: Text, i: Int) -> Result[Parsed, Str] {
             return Err(fail("a value", j))
         }
         let b = t.bs[j]
-        let mut done = Parsed { value: Null, pos: j }
-        if b == 91 || b == 123 {
+        let mut done = if b == 91 || b == 123 {
             if depth == 512 {
                 return Err("nested deeper than 512 at byte {j}")
             }
             let k = skip(t, j + 1)
             if b == 91 && k < t.bs.len() && t.bs[k] == 93 {
-                done = Parsed { value: Arr([]), pos: k + 1 }
+                Parsed { value: Arr([]), pos: k + 1 }
             } else if b == 123 && k < t.bs.len() && t.bs[k] == 125 {
-                done = Parsed { value: Obj([]), pos: k + 1 }
+                Parsed { value: Obj([]), pos: k + 1 }
             } else {
                 opened = opened + 1
                 let o = Open { obj: b == 123, items: [], fields: [], key: "", id: opened }
@@ -387,7 +387,7 @@ fn value(t: Text, i: Int) -> Result[Parsed, Str] {
                 continue
             }
         } else {
-            done = scalar(t, j)?
+            scalar(t, j)?
         }
         // `done` is a whole value: add it to the array or object it is in,
         // and close each one that ends after it
@@ -423,7 +423,14 @@ fn value(t: Text, i: Int) -> Result[Parsed, Str] {
             depth = d
         }
     }
+    // not reached: the loop ends only by returning, but a `while` has no value
     Err(fail("a value", j))
+}
+
+// How many members an object has before its keys go into the map of keys
+// rather than being compared one by one.
+fn few_keys() -> Int {
+    16
 }
 
 fn has_key(fields: List[Field], name: Str) -> Bool {

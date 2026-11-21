@@ -4036,6 +4036,11 @@ fn main(root: Root) {
     show(out, "20 keys", "\{" + keys + "}")
     show(out, "20 keys, k3 again", "\{" + keys + ",\"k3\":0}")
     show(out, "20 keys, k18 again", "\{" + keys + ",\"k18\":0}")
+    show(out, "two siblings of 20 keys", "[\{" + keys + "},\{" + keys + "}]")
+    show(out, "20 keys around 20 keys", "\{" + keys + ",\"c\":\{" + keys + "}}")
+    show(out, "k5 again after a child of 20 keys", "\{" + keys + ",\"c\":\{" + keys + "},\"k5\":0}")
+    show(out, "c again after a child of 20 keys", "\{\"c\":\{" + keys + "},\"c\":0}")
+    show(out, "lone surrogate in a key", "\{\"\\udc00\":1}")
     show(out, "array depth 512", times("[", 512) + times("]", 512))
     show(out, "array depth 513", times("[", 513) + times("]", 513))
     show(out, "mixed depth 512", nest(512))
@@ -4075,6 +4080,11 @@ fn main(root: Root) {
 20 keys => ok, 161 bytes
 20 keys, k3 again => error: duplicate key `k3` at byte 161
 20 keys, k18 again => error: duplicate key `k18` at byte 161
+two siblings of 20 keys => ok, 325 bytes
+20 keys around 20 keys => ok, 327 bytes
+k5 again after a child of 20 keys => error: duplicate key `k5` at byte 327
+c again after a child of 20 keys => error: duplicate key `c` at byte 167
+lone surrogate in a key => error: lone surrogate \udc00 at byte 2
 array depth 512 => ok, 1024 bytes
 array depth 513 => error: nested deeper than 512 at byte 512
 mixed depth 512 => ok, 2049 bytes
