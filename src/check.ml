@@ -1829,10 +1829,21 @@ and check_method_value ?rt ctx f e recv name nsp args =
       check_args ctx f args;
       TErr
     | None ->
+      let field_recv () =
+        let src = Option.value ~default:"" (Source.text recv.espan.file) in
+        if recv.espan.hi <= String.length src then String.sub src recv.espan.lo (recv.espan.hi - recv.espan.lo) else "h"
+      in
+      let held_field =
+        match rt with
+        | TNamed (n, _) when Hashtbl.mem ctx.sfields n -> (match List.assoc_opt name (Hashtbl.find ctx.sfields n) with Some ft -> has_fn ft | None -> false)
+        | _ -> false
+      in
       let notes =
         match rt with
         | TNamed (n, _) when Hashtbl.mem ctx.sfields n && List.mem_assoc name (Hashtbl.find ctx.sfields n) ->
-          [ sprintf "`%s` is a field; access it without parentheses" name ]
+          if has_fn (List.assoc name (Hashtbl.find ctx.sfields n)) then
+            [ sprintf "`%s` is a field holding a function; call it as `(%s.%s)(...)`" name (field_recv ()) name ]
+          else [ sprintf "`%s` is a field; access it without parentheses" name ]
         | TCap Root when List.mem_assoc name root_fields ->
           [ sprintf "`%s` is a field of `Root`; write `root.%s`" name name ]
         | TCap Clock when name = "after" ->
@@ -1849,6 +1860,10 @@ and check_method_value ?rt ctx f e recv name nsp args =
           notes @ [ sprintf "`%s` has: %s" (show rt) (String.concat ", " (List.sort_uniq compare (List.map fst ms @ match builtin_tname rt with Some tn -> Prelude.method_names tn | None -> []))) ]
         else notes
       in
+      if held_field then
+        err ctx "E0105" nsp (sprintf "no method `%s` on type `%s`" name (show rt)) ~notes
+          ~fix:{ Diag.fmsg = "call the field with brackets"; edits = [ { Diag.at = Span.merge recv.espan nsp; replacement = sprintf "(%s.%s)" (field_recv ()) name } ] }
+      else
       did_you_mean ctx ~notes "E0105" nsp
         (sprintf "no method `%s` on type `%s`" name (show rt))
         name (List.map fst ms @ (match rt with TNamed (n, _) -> user_methods ctx n | _ -> [])
@@ -1888,7 +1903,8 @@ and check_method_value ?rt ctx f e recv name nsp args =
          | None -> ()
          | Some _ when held (repr a) <> None -> refuse_compare ctx nsp "sort" a
          | Some t ->
-           err ctx "E0201" nsp (sprintf "`List[%s]` cannot be sorted: `%s` has no order" (show a) (show t))
+           let shown = match fn_via a with Some p -> sprintf "`%s` (it holds a function through `%s`)" (show (repr a)) p | None -> sprintf "`%s`" (show t) in
+           err ctx "E0201" nsp (sprintf "`List[%s]` cannot be sorted: %s has no order" (show a) shown)
              ~notes:[ "numbers, strings, Bool, and lists, tuples, structs and enums of them are ordered; to sort by a key use `xs.sort_by(key)`, for another order `list.sort_by(xs, less)`" ])
        | "contains", (TList a | TArray (a, _)) -> compared := (nsp, a, "contains") :: !compared
        | _ -> ());
@@ -2937,7 +2953,12 @@ let check_pending ctx =
       if not (Hashtbl.mem reported_bounds key) then
       let why =
         match i with
-        | "Ordered" -> Option.map (fun u -> sprintf "`%s` has no order: numbers, strings, Bool, and lists, tuples, structs and enums of them are ordered" (show u)) (unordered ctx t)
+        | "Ordered" ->
+          Option.map
+            (fun u ->
+              let shown = match fn_via t with Some p -> sprintf "`%s` (it holds a function through `%s`)" (show (repr t)) p | None -> sprintf "`%s`" (show u) in
+              sprintf "%s has no order: numbers, strings, Bool, and lists, tuples, structs and enums of them are ordered" shown)
+            (unordered ctx t)
         | "Key" ->
           Option.map
             (fun u ->

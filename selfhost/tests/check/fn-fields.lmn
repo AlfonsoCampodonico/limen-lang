@@ -5,7 +5,9 @@
 // `assert_eq`, `contains` and a generic function that compares), no `dyn`
 // (E0112, also as an error converted to `dyn Error`), no map key (E0113,
 // and E0111 through `Key`), and a function taking one runs callbacks, via
-// the field, an enum's payload or a generic type's argument.
+// the field, an enum's payload or a generic type's argument. Calling a
+// field with `r.run()` says to write `(r.run)()` and fixes it, and the
+// ordering errors (`sort`, `Ordered`) name the path too.
 struct Route {
     run: fn(),
 }
@@ -32,6 +34,10 @@ fn name(self: App) -> Str {
 }
 
 fn keyed[K: Key](k: K) -> Int {
+    1
+}
+
+fn ranked[T: Ordered](t: T) -> Int {
     1
 }
 
@@ -70,4 +76,9 @@ fn main(root: Root) {
     let c = Link(|| 1, End)
     let b = Box { item: || 1 }
     serve(a)
+    let r = Route { run: || {} }
+    r.run()
+    let mut xs = [a]
+    xs.sort()
+    let _ = ranked(a)
 }

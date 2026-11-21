@@ -2366,6 +2366,16 @@ fn main(root: Root) {
   says "fn-field-key-bound-says"
     (deep ^ "fn keyed[K: Key](k: K) -> Int { 1 }\nfn main(root: Root) { let a = App { routes: [] }\n let _ = keyed(a) }")
     "E0111" "`App` (it holds a function through `App.routes.run`) cannot be a map key";
+  says "fn-field-call-says" (deep ^ "fn main(root: Root) { let r = Route { run: || {} }\n r.run() }") "E0105" "`run` is a field holding a function; call it as `(r.run)(...)`";
+  says "fn-field-call-plain-says" "struct P { n: Int }\nfn main(root: Root) { let p = P { n: 1 }\n let _ = p.n() }" "E0105" "`n` is a field; access it without parentheses";
+  (if selected "fn-field-call-fix" then
+    let src = deep ^ "fn main(root: Root) { let r = Route { run: || {} }\n r.run() }" in
+    let _, ds, _ = compile "fn-field-call-fix" src in
+    ok "fn-field-call-fix" (Interp_util.find_sub (apply_fixes src ds) "(r.run)()" 0 <> None) (apply_fixes src ds));
+  says "fn-field-sort-says" (deep ^ "fn main(root: Root) { let mut xs = [App { routes: [] }]\n xs.sort() }") "E0201" "`App` (it holds a function through `App.routes.run`) has no order";
+  says "fn-field-ordered-says"
+    (deep ^ "fn ranked[T: Ordered](t: T) -> Int { 1 }\nfn main(root: Root) { let a = App { routes: [] }\n let _ = ranked(a) }")
+    "E0111" "`App` (it holds a function through `App.routes.run`) has no order";
   out "fn-field-table" fn_field_table
     "srv: /\nmissing /x [\"a\", \"b\"]\n20\ncalled\ncalled\ncalled\ncalled\ncalled\ncalled\ncalled\ncalled\ncalled\ncalled\ncalled\ncalled\n16\n";
   errs "fn-field-json" (deep ^ "use json\nfn main(root: Root) { let _ = json.encode(App { routes: [] }) }") [ "E0212" ];

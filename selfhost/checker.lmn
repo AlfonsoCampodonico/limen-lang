@@ -1741,9 +1741,22 @@ fn builtin_method_call(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv:
                 None => [],
             }
             let mut d = diag.error("E0105", nsp, "no method `{name}` on type `{st.show(rt)}`")
+            let src = cx.text_of(recv.span.file)
+            let field_recv = if recv.span.hi <= src.len() { src.slice(recv.span.lo, recv.span.hi) } else { "h" }
+            let held_field = match rt {
+                TNamed(n, _) => match (cx.sfields.get(n) ?? []).find(|f| f.0 == name) {
+                    Some(f) => st.subst.has_fn(f.1),
+                    None => false,
+                },
+                _ => false,
+            }
             match rt {
                 TNamed(n, _) if (cx.sfields.get(n) ?? []).any(|f| f.0 == name) => {
-                    d = d.note("`{name}` is a field; access it without parentheses")
+                    if held_field {
+                        d = d.note("`{name}` is a field holding a function; call it as `({field_recv}.{name})(...)`")
+                    } else {
+                        d = d.note("`{name}` is a field; access it without parentheses")
+                    }
                 },
                 TCap("Root") if builtins.root_fields().any(|f| f.0 == name) => {
                     d = d.note("`{name}` is a field of `Root`; write `root.{name}`")
@@ -1768,7 +1781,11 @@ fn builtin_method_call(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv:
                 TNamed(n, _) => user_methods(cx, n),
                 _ => [],
             }
-            st = st.did_you_mean(d, name, names + users + builtin_names)
+            if held_field {
+                st = st.report(d.fix("call the field with brackets", ast.merge(recv.span, nsp), "({field_recv}.{name})"))
+            } else {
+                st = st.did_you_mean(d, name, names + users + builtin_names)
+            }
             return (TErr, check_args(st, cx, fx, args))
         },
     }
@@ -1816,7 +1833,11 @@ fn builtin_method_call(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv:
                 st = refuse_compare(st, nsp, "sort", a)
             },
             Some(t) => {
-                let d = diag.error("E0201", nsp, "`List[{st.show(a)}]` cannot be sorted: `{st.show(t)}` has no order").note("numbers, strings, Bool, and lists, tuples, structs and enums of them are ordered; to sort by a key use `xs.sort_by(key)`, for another order `list.sort_by(xs, less)`")
+                let shown = match st.subst.fn_via(a) {
+                    Some(path) => "`{st.show(st.repr(a))}` (it holds a function through `{path}`)",
+                    None => "`{st.show(t)}`",
+                }
+                let d = diag.error("E0201", nsp, "`List[{st.show(a)}]` cannot be sorted: {shown} has no order").note("numbers, strings, Bool, and lists, tuples, structs and enums of them are ordered; to sort by a key use `xs.sort_by(key)`, for another order `list.sort_by(xs, less)`")
                 st = st.report(d)
             },
             None => {},
@@ -1884,7 +1905,13 @@ fn unordered(st: env.State, cx: env.Cx, t: types.Ty) -> Option[types.Ty] {
 
 // Why type `t` does not satisfy the bound `Ordered`, if it does not.
 pub fn unordered_why(st: env.State, cx: env.Cx, t: types.Ty) -> Option[Str] {
-    unordered(st, cx, t).map(|u| "`{st.show(u)}` has no order: numbers, strings, Bool, and lists, tuples, structs and enums of them are ordered")
+    unordered(st, cx, t).map(|u| {
+        let shown = match st.subst.fn_via(t) {
+            Some(path) => "`{st.show(st.repr(t))}` (it holds a function through `{path}`)",
+            None => "`{st.show(u)}`",
+        }
+        "{shown} has no order: numbers, strings, Bool, and lists, tuples, structs and enums of them are ordered"
+    })
 }
 
 // Map keys: Int, Str, Bool, and tuples, structs and enums made of them.
