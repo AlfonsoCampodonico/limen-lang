@@ -193,6 +193,57 @@ W_RT WStr *buf_take(WBuf *b);
 W_RT void fmt_float(char *out, size_t n, double x);
 W_RT void buf_escaped(WBuf *b, WStr *s);
 
+/* Deep values without deep recursion. Sharing, comparing and showing a
+   value recurse into the objects it holds (enums that contain themselves,
+   lists, maps, `dyn`, closures) only W_DEEP objects deep; past that, the
+   object is put on a work stack of the thread's, and the outermost call
+   finishes the stack before it returns, so a list of a million `Cons`es
+   takes no more native stack than a short one. Like dropping (w_release),
+   none of these waits or runs Limen code, so the stacks can be the
+   thread's.
+   - w_share(o, kids): kids shares what o holds; o's count is shared already.
+   - w_eq(f, a, b, i): f compares two objects, its i saying where to resume
+     (a list's next element); an object put on the stack counts as equal for
+     now and is compared later, in the order the recursion would have taken,
+     and the first difference ends the whole comparison. A map finding a key
+     needs a real answer, so it holds the stack (w_eq_hold) while it looks.
+   - w_show(b, f, v, i): f writes v to b. An object put on the stack is
+     written later; the text written after it in the meantime is moved to a
+     second stack and written back after it, so the output is the same. */
+#define W_DEEP 32
+typedef bool (*WEqFn)(void *, void *, int64_t);
+typedef void (*WShowFn)(WBuf *, void *, int64_t);
+extern __thread int w_sh_busy, w_sh_depth;
+extern __thread int w_eq_busy, w_eq_depth;
+extern __thread int64_t w_eq_n;
+extern __thread WBuf *w_show_buf;
+extern __thread int w_show_depth;
+extern __thread int64_t w_show_n;
+W_RT void w_share_outer(void *o, void (*kids)(void *));
+W_RT void w_share_push(void *o, void (*kids)(void *));
+W_RT bool w_eq_outer(WEqFn f, void *a, void *b, int64_t i);
+W_RT void w_eq_push(WEqFn f, void *a, void *b, int64_t i);
+W_RT void w_show_outer(WBuf *b, WShowFn f, void *v, int64_t i);
+W_RT void w_show_push(WBuf *b, WShowFn f, void *v, int64_t i);
+static inline void w_share(void *o, void (*kids)(void *)) {
+  if (__builtin_expect(w_sh_busy && w_sh_depth < W_DEEP, 1)) { w_sh_depth++; kids(o); w_sh_depth--; }
+  else if (!w_sh_busy) w_share_outer(o, kids);
+  else w_share_push(o, kids);
+}
+static inline bool w_eq(WEqFn f, void *a, void *b, int64_t i) {
+  if (__builtin_expect(w_eq_busy && w_eq_depth < W_DEEP, 1)) { w_eq_depth++; bool r = f(a, b, i); w_eq_depth--; return r; }
+  if (!w_eq_busy) return w_eq_outer(f, a, b, i);
+  w_eq_push(f, a, b, i);
+  return true;
+}
+static inline int w_eq_hold(void) { int h = w_eq_busy; w_eq_busy = 0; return h; }
+static inline void w_eq_resume(int h) { w_eq_busy = h; }
+static inline void w_show(WBuf *b, WShowFn f, void *v, int64_t i) {
+  if (__builtin_expect(w_show_buf == b && w_show_depth < W_DEEP, 1)) { w_show_depth++; f(b, v, i); w_show_depth--; }
+  else if (w_show_buf != b) w_show_outer(b, f, v, i);
+  else w_show_push(b, f, v, i);
+}
+
 #define Int_dup(x) (x)
 #define Int_drop(x) ((void)0)
 #define Int_eq(a, b) ((a) == (b))
@@ -332,9 +383,8 @@ static inline int64_t w_idx(int64_t i, int64_t n, const char *where) {
     *p = c;                                                                                   \
     L##_drop(l);                                                                              \
   }                                                                                           \
-  static void L##_share(L *l) {                                                               \
-    if (w_rc_share(&l->rc)) for (int64_t i = 0; i < l->len; i++) P##_share(l->data[i]);       \
-  }                                                                                           \
+  static void L##_share_kids(void *o) { L *l = (L *)o; for (int64_t i = 0; i < l->len; i++) P##_share(l->data[i]); } \
+  static void L##_share(L *l) { if (w_rc_share(&l->rc)) w_share(l, L##_share_kids); }        \
   static inline void L##_unique(L **p) { if (__builtin_expect(!w_rc_unique(&(*p)->rc), 0)) L##_copy(p); } \
   __attribute__((noinline)) static void L##_grow(L *l) {                                     \
     if (l->cap > INT64_MAX / 2) w_oom();                                                      \
@@ -355,16 +405,30 @@ static inline int64_t w_idx(int64_t i, int64_t n, const char *where) {
     if (i < 0 || i >= l->len) w_panic_index(i, l->len, where);                                \
     return &l->data[i];                                                                       \
   }                                                                                           \
-  static bool L##_eq(L *a, L *b) {                                                            \
-    if (a->len != b->len) return false;                                                       \
-    for (int64_t i = 0; i < a->len; i++) if (!P##_eq(a->data[i], b->data[i])) return false;  \
+  /* from element i on; once an element is left on the stack, the rest of   \
+     the list goes on after it */                                                             \
+  static bool L##_eq_k(void *pa, void *pb, int64_t i) {                                       \
+    L *a = (L *)pa, *b = (L *)pb;                                                             \
+    for (; i < a->len; i++) {                                                                 \
+      int64_t n = w_eq_n;                                                                     \
+      if (!P##_eq(a->data[i], b->data[i])) return false;                                      \
+      if (w_eq_n != n) { if (i + 1 < a->len) w_eq_push(L##_eq_k, a, b, i + 1); return true; } \
+    }                                                                                         \
     return true;                                                                              \
   }                                                                                           \
-  static void L##_show(WBuf *b, L *l, bool top) {                                             \
-    (void)top; buf_puts(b, "[");                                                              \
-    for (int64_t i = 0; i < l->len; i++) { if (i) buf_puts(b, ", "); P##_show(b, l->data[i], false); } \
+  static bool L##_eq(L *a, L *b) { return a->len == b->len && w_eq(L##_eq_k, a, b, 0); }     \
+  static void L##_show_k(WBuf *b, void *o, int64_t i) {                                       \
+    L *l = (L *)o;                                                                            \
+    if (i == 0) buf_puts(b, "[");                                                             \
+    for (; i < l->len; i++) {                                                                 \
+      if (i) buf_puts(b, ", ");                                                               \
+      int64_t n = w_show_n;                                                                   \
+      P##_show(b, l->data[i], false);                                                         \
+      if (w_show_n != n && i + 1 < l->len) { w_show_push(b, L##_show_k, l, i + 1); return; }  \
+    }                                                                                         \
     buf_puts(b, "]");                                                                         \
   }                                                                                           \
+  static void L##_show(WBuf *b, L *l, bool top) { (void)top; w_show(b, L##_show_k, l, 0); }  \
   static L *L##_slice(L *l, int64_t from, int64_t to) {                                       \
     if (from < 0) from = 0; if (to > l->len) to = l->len; if (to < from) to = from;           \
     L *c = L##_new(to - from);                                                                \
@@ -461,10 +525,11 @@ __attribute__((noreturn)) W_RT void w_panic_key(WBuf *key, const char *where);
   }                                                                                           \
   static inline M *M##_dup(M *m) { w_rc_inc(&m->rc); return m; }                              \
   static void M##_drop(M *m) { if (w_rc_dec(&m->rc)) w_release(m); }                         \
-  static void M##_share(M *m) {                                                               \
-    if (w_rc_share(&m->rc))                                                                   \
-      for (int64_t i = 0; i < m->n; i++) if (m->live[i]) { KN##_share(m->keys[i]); VN##_share(m->vals[i]); } \
+  static void M##_share_kids(void *o) {                                                       \
+    M *m = (M *)o;                                                                            \
+    for (int64_t i = 0; i < m->n; i++) if (m->live[i]) { KN##_share(m->keys[i]); VN##_share(m->vals[i]); } \
   }                                                                                           \
+  static void M##_share(M *m) { if (w_rc_share(&m->rc)) w_share(m, M##_share_kids); }        \
   static int64_t M##_find(M *m, K k) {                                                        \
     uint64_t mask = (uint64_t)m->icap - 1;                                                    \
     for (uint64_t h = KN##_hash(k) & mask;; h = (h + 1) & mask) {                             \
@@ -536,14 +601,20 @@ __attribute__((noreturn)) W_RT void w_panic_key(WBuf *key, const char *where);
     KN##_drop(k);                                                                             \
   }                                                                                           \
   static inline V *M##_get(M *m, K k) { int64_t j = M##_find(m, k); return j < 0 ? NULL : &m->vals[j]; } \
-  static bool M##_eq(M *a, M *b) {                                                            \
-    if (a->len != b->len) return false;                                                       \
+  static bool M##_eq_k(void *pa, void *pb, int64_t from) {                                    \
+    M *a = (M *)pa, *b = (M *)pb;                                                             \
+    (void)from;                                                                               \
     for (int64_t i = 0; i < a->n; i++)                                                        \
-      if (a->live[i]) { V *w = M##_get(b, a->keys[i]); if (!w || !VN##_eq(a->vals[i], *w)) return false; } \
+      if (a->live[i]) {                                                                       \
+        int h = w_eq_hold(); V *w = M##_get(b, a->keys[i]); w_eq_resume(h);                   \
+        if (!w || !VN##_eq(a->vals[i], *w)) return false;                                     \
+      }                                                                                       \
     return true;                                                                              \
   }                                                                                           \
-  static void M##_show(WBuf *b, M *m, bool top) {                                             \
-    (void)top;                                                                                \
+  static bool M##_eq(M *a, M *b) { return a->len == b->len && w_eq(M##_eq_k, a, b, 0); }     \
+  static void M##_show_k(WBuf *b, void *o, int64_t from) {                                    \
+    M *m = (M *)o;                                                                            \
+    (void)from;                                                                               \
     buf_puts(b, "{");                                                                         \
     bool first = true;                                                                        \
     for (int64_t i = 0; i < m->n; i++)                                                        \
@@ -554,6 +625,7 @@ __attribute__((noreturn)) W_RT void w_panic_key(WBuf *key, const char *where);
       }                                                                                       \
     buf_puts(b, "}");                                                                         \
   }                                                                                           \
+  static void M##_show(WBuf *b, M *m, bool top) { (void)top; w_show(b, M##_show_k, m, 0); }  \
   static V *M##_slot(M *m, K k, const char *where) {                                         \
     V *v = M##_get(m, k);                                                                     \
     if (!v) { WBuf kb; buf_init(&kb); KN##_show(&kb, k, false); w_panic_key(&kb, where); }   \

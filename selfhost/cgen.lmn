@@ -2902,9 +2902,12 @@ fn value_fns(self: Cg, t: types.Ty) -> (List[Str], Cg) {
                 out.push("  }")
             }
             out.push("}")
-            out.push("static void {n}_share({ct} v) \{")
+            // A boxed enum's share, == and show go through w_share, w_eq and
+            // w_show, which recurse only so deep and keep the rest on a stack
             if boxed {
-                out.push("  if (!w_rc_share(&v->rc)) return;")
+                out = out + ["static void {n}_share_kids(void* o) \{", "  {n} v = ({n})o;"]
+            } else {
+                out.push("static void {n}_share({ct} v) \{")
             }
             out.push("  switch (v{acc}tag) \{")
             for (k, v) in vs.with_index() {
@@ -2919,7 +2922,12 @@ fn value_fns(self: Cg, t: types.Ty) -> (List[Str], Cg) {
                 out.push("      break; }")
             }
             out = out + ["  }", "}"]
-            out.push("static bool {n}_eq({ct} a, {ct} b) \{")
+            if boxed {
+                out = out + ["static void {n}_share({ct} v) \{", "  if (w_rc_share(&v->rc)) w_share(v, {n}_share_kids);", "}"]
+                out = out + ["static bool {n}_eq_kids(void* pa, void* pb, int64_t i) \{", "  {n} a = ({n})pa, b = ({n})pb;", "  (void)i;"]
+            } else {
+                out.push("static bool {n}_eq({ct} a, {ct} b) \{")
+            }
             out.push("  if (a{acc}tag != b{acc}tag) return false;")
             out.push("  switch (a{acc}tag) \{")
             for (k, v) in vs.with_index() {
@@ -2932,7 +2940,13 @@ fn value_fns(self: Cg, t: types.Ty) -> (List[Str], Cg) {
                 out.push("      break; }")
             }
             out = out + ["  }", "  return true;\n}"]
-            out = out + ["static void {n}_show(WBuf* b, {ct} v, bool top) \{", "  (void)top;", "  switch (v{acc}tag) \{"]
+            if boxed {
+                out = out + ["static bool {n}_eq({ct} a, {ct} b) \{", "  return w_eq({n}_eq_kids, a, b, 0);", "}"]
+                out = out + ["static void {n}_show_kids(WBuf* b, void* o, int64_t i) \{", "  {n} v = ({n})o;", "  (void)i;"]
+            } else {
+                out = out + ["static void {n}_show(WBuf* b, {ct} v, bool top) \{", "  (void)top;"]
+            }
+            out.push("  switch (v{acc}tag) \{")
             for (k, v) in vs.with_index() {
                 out.push("    case {k}:")
                 out.push("      buf_puts(b, {c_string(if v.1.is_empty() { v.0 } else { v.0 + "(" })});")
@@ -2950,6 +2964,9 @@ fn value_fns(self: Cg, t: types.Ty) -> (List[Str], Cg) {
                 out.push("      break;")
             }
             out.push("  }\n}")
+            if boxed {
+                out = out + ["static void {n}_show(WBuf* b, {ct} v, bool top) \{", "  (void)top;", "  w_show(b, {n}_show_kids, v, 0);", "}"]
+            }
         } else {
             let fs = c.fields_of(t)
             out.push("static {ct} {n}_dup({ct} v) \{")

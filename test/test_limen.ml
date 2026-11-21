@@ -2228,6 +2228,98 @@ fn main(root: Root) {
 }
 |}
     "[199999, 1, 200000] 299999\n";
+  (* Printing, comparing, sharing and dropping (through `dyn`) a value as
+     deep as it is long, inside tasks: these recursed once per node, and a
+     task's 1 MB stack ran out. *)
+  out "deep-values"
+    {|enum L { Cons(Int, L), Nil }
+struct Tree { kids: List[Tree] }
+struct M { m: Map[Int, M] }
+interface Named { fn name(self) -> Str }
+struct Link { next: Option[dyn Named] }
+fn name(self: Link) -> Str { "link" }
+fn build(n: Int, last: Int) -> L {
+    let mut l = Cons(last, Nil)
+    let mut i = 1
+    while i < n {
+        l = Cons(i, l)
+        i = i + 1
+    }
+    l
+}
+fn count(l: L) -> Int {
+    let mut n = 0
+    let mut cur = l
+    let mut going = true
+    while going {
+        match cur {
+            Cons(_, rest) => {
+                n = n + 1
+                cur = rest
+            }
+            Nil => { going = false }
+        }
+    }
+    n
+}
+fn nest(n: Int) -> Tree {
+    let mut t = Tree { kids: [] }
+    for _ in 0..<n { t = Tree { kids: [t] } }
+    t
+}
+fn maps(n: Int) -> M {
+    let mut t = M { m: map() }
+    for i in 0..<n {
+        let mut m = map()
+        m[i] = t
+        t = M { m: m }
+    }
+    t
+}
+fn links(n: Int) -> dyn Named {
+    let mut d: dyn Named = Link { next: None }
+    for _ in 0..<n { d = Link { next: Some(d) } }
+    d
+}
+fn shows(n: Int, k: Int) -> Str {
+    let s = "{build(n, 0)}"
+    "{s.len()} {s.slice(0, 18)} {"{nest(k)}".len()} {"{maps(k)}".len()} {"{links(k)}".len()}"
+}
+fn eqs(n: Int, k: Int) -> Str {
+    let a = build(n, 0)
+    "{a == build(n, 0)} {a == build(n, 1)} {a != build(n - 1, 0)} {nest(k) == nest(k)} {nest(k) == nest(k + 1)} {maps(k) == maps(k)}"
+}
+fn shares(n: Int, k: Int) -> Str {
+    let ch: Chan[L] = channel(1)
+    ch.send(build(n, 0))
+    let s = shared(nest(k))
+    let m = maps(k)
+    let d = links(n)
+    let r = group g {
+        g.go(|| count(ch.recv() ?? Nil))
+        g.go(|| s.get().kids.len())
+        g.go(|| m.m.len())
+        g.go(|| d.name().len())
+    }
+    "{r}"
+}
+fn drops(n: Int) -> Int {
+    let d = links(n)
+    d.name().len()
+}
+fn main(root: Root) {
+    let n = 1000000
+    let k = 200000
+    let r = group g {
+        g.go(|| shows(n, k))
+        g.go(|| eqs(n, k))
+        g.go(|| shares(n, k))
+        g.go(|| "{drops(n)}")
+    }
+    for line in r { root.stdout.print(line) }
+}
+|}
+    "13888893 Cons(999999, Cons( 3400017 3688901 4200019\ntrue false true true false true\n[1000000, 1, 1, 4]\n4\n";
   (* Recursion deeper than a task's stack: natively a message and status 1,
      not a silent crash (the interpreter's stack is larger) *)
   if native_for "stack-overflow" && selected "stack-overflow" then

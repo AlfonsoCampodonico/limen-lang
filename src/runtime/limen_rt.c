@@ -47,6 +47,115 @@ W_RT void w_release(void *o) {
   }
   w_rel_busy = 0;
 }
+/* The work stacks of w_share, w_eq and w_show (limen_rt.h). Each grows as
+   needed and is given back when a large one empties. */
+static void *w_stack_grow(void *p, int64_t *cap, int64_t need, size_t size) {
+  if (need <= *cap) return p;
+  int64_t c = *cap ? *cap : 64;
+  while (c < need) { if (c > INT64_MAX / 2) w_oom(); c *= 2; }
+  *cap = c;
+  return w_realloc(p, w_bytes(c, size));
+}
+#define W_STACK_KEEP 4096
+typedef struct { void (*kids)(void *); void *o; } WShareItem;
+__thread int w_sh_busy, w_sh_depth;
+static __thread WShareItem *w_sh_st;
+static __thread int64_t w_sh_n, w_sh_cap;
+W_RT void w_share_push(void *o, void (*kids)(void *)) {
+  w_sh_st = (WShareItem *)w_stack_grow(w_sh_st, &w_sh_cap, w_sh_n + 1, sizeof(WShareItem));
+  w_sh_st[w_sh_n++] = (WShareItem){ kids, o };
+}
+W_RT void w_share_outer(void *o, void (*kids)(void *)) {
+  w_sh_busy = 1; w_sh_depth = 0;
+  kids(o);
+  while (w_sh_n > 0) { WShareItem it = w_sh_st[--w_sh_n]; it.kids(it.o); }
+  if (w_sh_cap > W_STACK_KEEP) { free(w_sh_st); w_sh_st = NULL; w_sh_cap = 0; }
+  w_sh_busy = 0;
+}
+typedef struct { WEqFn f; void *a, *b; int64_t i; } WEqItem;
+__thread int w_eq_busy, w_eq_depth;
+__thread int64_t w_eq_n;
+static __thread WEqItem *w_eq_st;
+static __thread int64_t w_eq_cap;
+W_RT void w_eq_push(WEqFn f, void *a, void *b, int64_t i) {
+  w_eq_st = (WEqItem *)w_stack_grow(w_eq_st, &w_eq_cap, w_eq_n + 1, sizeof(WEqItem));
+  w_eq_st[w_eq_n++] = (WEqItem){ f, a, b, i };
+}
+/* f, then reverse what it left on the stack, so the first is compared first */
+static bool w_eq_step(WEqFn f, void *a, void *b, int64_t i) {
+  int64_t mark = w_eq_n;
+  bool ok = f(a, b, i);
+  for (int64_t lo = mark, hi = w_eq_n - 1; lo < hi; lo++, hi--) { WEqItem t = w_eq_st[lo]; w_eq_st[lo] = w_eq_st[hi]; w_eq_st[hi] = t; }
+  return ok;
+}
+W_RT bool w_eq_outer(WEqFn f, void *a, void *b, int64_t i) {
+  int depth = w_eq_depth;
+  int64_t base = w_eq_n;
+  w_eq_busy = 1; w_eq_depth = 0;
+  bool ok = w_eq_step(f, a, b, i);
+  while (ok && w_eq_n > base) { WEqItem it = w_eq_st[--w_eq_n]; ok = w_eq_step(it.f, it.a, it.b, it.i); }
+  w_eq_n = base;
+  if (base == 0 && w_eq_cap > W_STACK_KEEP) { free(w_eq_st); w_eq_st = NULL; w_eq_cap = 0; }
+  w_eq_busy = 0; w_eq_depth = depth;
+  return ok;
+}
+/* f == NULL: i bytes of text, on top of the text stack */
+typedef struct { WShowFn f; void *v; int64_t i, pos; } WShowItem;
+__thread WBuf *w_show_buf;
+__thread int w_show_depth;
+__thread int64_t w_show_n;
+static __thread WShowItem *w_show_st, *w_show_tmp;
+static __thread int64_t w_show_cap, w_show_tmp_cap;
+static __thread char *w_text;
+static __thread int64_t w_text_n, w_text_cap;
+W_RT void w_show_push(WBuf *b, WShowFn f, void *v, int64_t i) {
+  w_show_st = (WShowItem *)w_stack_grow(w_show_st, &w_show_cap, w_show_n + 1, sizeof(WShowItem));
+  w_show_st[w_show_n++] = (WShowItem){ f, v, i, b->len };
+}
+/* f, then cut the text written after the first object it left on the stack
+   into pieces, one after each such object, and order the stack so that
+   popping it writes each object and then its piece */
+static void w_show_step(WBuf *b, WShowFn f, void *v, int64_t i) {
+  int64_t mark = w_show_n;
+  f(b, v, i);
+  int64_t k = w_show_n - mark;
+  if (k == 0) return;
+  w_show_tmp = (WShowItem *)w_stack_grow(w_show_tmp, &w_show_tmp_cap, k, sizeof(WShowItem));
+  memcpy(w_show_tmp, w_show_st + mark, (size_t)k * sizeof(WShowItem));
+  w_show_st = (WShowItem *)w_stack_grow(w_show_st, &w_show_cap, mark + 2 * k, sizeof(WShowItem));
+  w_show_n = mark;
+  int64_t end = b->len;
+  for (int64_t j = k - 1; j >= 0; j--) {
+    int64_t p = w_show_tmp[j].pos, len = end - p;
+    if (len > 0) {
+      w_text = (char *)w_stack_grow(w_text, &w_text_cap, w_text_n + len, 1);
+      memcpy(w_text + w_text_n, b->p + p, (size_t)len);
+      w_text_n += len;
+      w_show_st[w_show_n++] = (WShowItem){ NULL, NULL, len, 0 };
+    }
+    w_show_st[w_show_n++] = w_show_tmp[j];
+    end = p;
+  }
+  b->len = w_show_tmp[0].pos;
+  if (w_show_tmp_cap > W_STACK_KEEP) { free(w_show_tmp); w_show_tmp = NULL; w_show_tmp_cap = 0; }
+}
+W_RT void w_show_outer(WBuf *b, WShowFn f, void *v, int64_t i) {
+  WBuf *buf = w_show_buf;
+  int depth = w_show_depth;
+  int64_t base = w_show_n;
+  w_show_buf = b; w_show_depth = 0;
+  w_show_step(b, f, v, i);
+  while (w_show_n > base) {
+    WShowItem it = w_show_st[--w_show_n];
+    if (it.f) w_show_step(b, it.f, it.v, it.i);
+    else { w_text_n -= it.i; buf_putn(b, w_text + w_text_n, it.i); }
+  }
+  if (base == 0) {
+    if (w_show_cap > W_STACK_KEEP) { free(w_show_st); w_show_st = NULL; w_show_cap = 0; }
+    if (w_text_cap > 16 * W_STACK_KEEP) { free(w_text); w_text = NULL; w_text_cap = 0; }
+  }
+  w_show_buf = buf; w_show_depth = depth;
+}
 /* Start a boundary's list; its parent is the current innermost boundary. */
 W_RT void w_catch_init(WCatch *c) {
   c->msg = NULL; c->where = NULL; c->unwinding = 0; c->cancel = 0;
@@ -492,11 +601,14 @@ W_RT void Clo_drop(WClo *c) {
   if (c->drop) c->drop(c);
   w_free(c);
 }
-W_RT void Clo_share(WClo *c) { if (w_rc_share(&c->rc) && c->share) c->share(c); }
+W_RT void Clo_share(WClo *c) { if (w_rc_share(&c->rc) && c->share) w_share(c, (void (*)(void *))c->share); }
 W_RT void Clo_show(WBuf *b, WClo *c, bool top) { (void)c; (void)top; buf_puts(b, "<fn>"); }
-W_RT void Dyn_drop(WDyn *d) { if (w_rc_dec(&d->rc)) { d->vt->h.drop(d); w_free(d); } }
-W_RT void Dyn_share(WDyn *d) { if (w_rc_share(&d->rc)) d->vt->h.share(d); }
-W_RT void Dyn_show(WBuf *b, WDyn *d, bool top) { d->vt->h.show(b, d, top); }
+/* through w_release (its kids are w_dyn_kids), so a long chain of `dyn`
+   values is freed without recursing */
+W_RT void Dyn_drop(WDyn *d) { if (w_rc_dec(&d->rc)) w_release(d); }
+W_RT void Dyn_share(WDyn *d) { if (w_rc_share(&d->rc)) w_share(d, (void (*)(void *))d->vt->h.share); }
+static void w_dyn_show_k(WBuf *b, void *o, int64_t top) { WDyn *d = (WDyn *)o; d->vt->h.show(b, d, top != 0); }
+W_RT void Dyn_show(WBuf *b, WDyn *d, bool top) { w_show(b, w_dyn_show_k, d, top); }
 W_RT void w_dyn_kids(void *o) { WDyn *d = (WDyn *)o; d->vt->h.drop(d); }
 W_RT WCap *cap_new(int kind) { WCap *c = (WCap *)w_alloc_k(sizeof(WCap), WK_CAP); memset(c, 0, sizeof *c); c->rc = 1; c->kind = kind; c->fd = -1; return c; }
 W_RT void Cap_release(WCap *c) { if (c->rv) w_rv_release(c); for (int i = 0; i < c->nhosts; i++) free(c->hosts[i]); free(c->hosts); free(c->root); if (c->tls) w_tls_release(c); if (c->fd >= 0) w_sock_release_fd(c->fd); w_free(c); }
@@ -3560,7 +3672,11 @@ W_RT void w_lock_release(WLock *l) {
   if (wake) w_wake(wake);
 }
 /* what a panic that abandons a Shared gives back: its value */
-W_RT void w_shared_kids(void *o) { WShared *s = (WShared *)o; if (s->edrop) s->edrop(s->v); }
+W_RT void w_shared_kids(void *o) {
+  WShared *s = (WShared *)o;
+  if (s->edrop) s->edrop(s->v);
+  pthread_mutex_destroy(&s->lk.mu);
+}
 W_RT WShared *w_shared_new(size_t esz, void (*edrop)(void *), void (*eshare)(void *)) {
   WShared *s = (WShared *)w_alloc_k(sizeof(WShared) + (esz ? esz : 1), WK_PLAIN);
   s->rc = 1; s->edrop = edrop; s->eshare = eshare;
@@ -3568,12 +3684,8 @@ W_RT WShared *w_shared_new(size_t esz, void (*edrop)(void *), void (*eshare)(voi
   w_set_kids(s, w_shared_kids);
   return s;
 }
-W_RT void Shared_drop(WShared *s) {
-  if (!w_rc_dec(&s->rc)) return;
-  if (s->edrop) s->edrop(s->v);
-  pthread_mutex_destroy(&s->lk.mu);
-  w_free(s);
-}
+/* through w_release, as a `dyn` value is */
+W_RT void Shared_drop(WShared *s) { if (w_rc_dec(&s->rc)) w_release(s); }
 W_RT void Shared_show(WBuf *b, WShared *s, bool top) { (void)s; (void)top; buf_puts(b, "<shared>"); }
 /* get and set: the lock for a moment. Inside an update's function, any use
    of a Shared panics (it could deadlock). */

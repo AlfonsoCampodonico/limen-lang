@@ -1843,21 +1843,44 @@ let rec type_defs c (out : Buffer.t) =
           p "  }"
         end;
         p "}";
-        p (sprintf "static void %s_share(%s v) {" n ct);
-        if boxed then p "  if (!w_rc_share(&v->rc)) return;";
+        (* A boxed enum's share, == and show go through w_share, w_eq and
+           w_show, which recurse only so deep and keep the rest on a stack *)
+        if boxed then begin
+          p (sprintf "static void %s_share_kids(void* o) {" n);
+          p (sprintf "  %s v = (%s)o;" n n)
+        end
+        else p (sprintf "static void %s_share(%s v) {" n ct);
         p (sprintf "  switch (v%stag) {" acc);
         cases (fun _ k i pt -> if not (is_scalar pt) then p (sprintf "      %s_share(v%su.v%d.f%d);" (cname c pt) acc k i));
         p "  }";
         p "}";
-        p (sprintf "static bool %s_eq(%s a, %s b) {" n ct ct);
+        if boxed then begin
+          p (sprintf "static void %s_share(%s v) {" n ct);
+          p (sprintf "  if (w_rc_share(&v->rc)) w_share(v, %s_share_kids);" n);
+          p "}";
+          p (sprintf "static bool %s_eq_kids(void* pa, void* pb, int64_t i) {" n);
+          p (sprintf "  %s a = (%s)pa, b = (%s)pb;" n n n);
+          p "  (void)i;"
+        end
+        else p (sprintf "static bool %s_eq(%s a, %s b) {" n ct ct);
         p (sprintf "  if (a%stag != b%stag) return false;" acc acc);
         p (sprintf "  switch (a%stag) {" acc);
         cases (fun _ k i pt ->
             p (sprintf "      if (!(%s)) return false;" (binop c Ast.Eq pt (sprintf "a%su.v%d.f%d" acc k i) (sprintf "b%su.v%d.f%d" acc k i) Span.dummy)));
         p "  }";
         p "  return true;\n}";
-        p (sprintf "static void %s_show(WBuf* b, %s v, bool top) {" n ct);
-        p "  (void)top;";
+        if boxed then begin
+          p (sprintf "static bool %s_eq(%s a, %s b) {" n ct ct);
+          p (sprintf "  return w_eq(%s_eq_kids, a, b, 0);" n);
+          p "}";
+          p (sprintf "static void %s_show_kids(WBuf* b, void* o, int64_t i) {" n);
+          p (sprintf "  %s v = (%s)o;" n n);
+          p "  (void)i;"
+        end
+        else begin
+          p (sprintf "static void %s_show(WBuf* b, %s v, bool top) {" n ct);
+          p "  (void)top;"
+        end;
         p (sprintf "  switch (v%stag) {" acc);
         List.iteri
           (fun k (vn, ps) ->
@@ -1871,7 +1894,13 @@ let rec type_defs c (out : Buffer.t) =
             if ps <> [] then p "      buf_puts(b, \")\");";
             p "      break;")
           vs;
-        p "  }\n}"
+        p "  }\n}";
+        if boxed then begin
+          p (sprintf "static void %s_show(WBuf* b, %s v, bool top) {" n ct);
+          p "  (void)top;";
+          p (sprintf "  w_show(b, %s_show_kids, v, 0);" n);
+          p "}"
+        end
       end
       else begin
         let fs = Lower.field_types c.g t in
