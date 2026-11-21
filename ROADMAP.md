@@ -119,7 +119,9 @@ happens here.
 - Bound authority through bounds of bounds, not just an interface's own
   methods.
 - `share`, `==`, printing and dropping `dyn` values without recursion, so a
-  deep value can't overflow a task's stack.
+  deep value can't overflow a task's stack (done: each recurses a few dozen
+  levels and keeps the rest on a work stack, natively; the interpreter's
+  printing no longer takes quadratic time on a deep value).
 - The JSON edges: a lone `\ud800`, duplicate keys, a nesting limit, numbers
   over 400 characters.
 - Fuzz the lexer, parser, checker and the rest of the runtime.
