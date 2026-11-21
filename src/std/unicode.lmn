@@ -98,8 +98,11 @@ pub fn nfc(s: Str) -> Str {
 
 // Hangul syllables are taken apart and put together by formula.
 fn s_base() -> Int { 0xac00 }
+
 fn l_base() -> Int { 0x1100 }
+
 fn v_base() -> Int { 0x1161 }
+
 fn t_base() -> Int { 0x11a7 }
 
 fn decompose(cps: List[Int]) -> List[Int] {

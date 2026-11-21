@@ -20,7 +20,6 @@
 // fragments on the way. A message larger than `max` bytes (16 MB unless
 // given) closes the connection with 1009. A client masks what it sends
 // with random keys from `Rand`, as the protocol requires.
-
 use base64
 use hash
 use http
