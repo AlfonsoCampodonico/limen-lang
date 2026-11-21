@@ -1,0 +1,8 @@
+# Nor through a bound of a bound: a capability the methods of a `dyn`
+# interface reach, where a bound's method returns one, counts against the
+# dependency's grant (E0320), with the path through both methods.
+[package]
+name = "app"
+
+[dependencies]
+nested = { path = "nested" }

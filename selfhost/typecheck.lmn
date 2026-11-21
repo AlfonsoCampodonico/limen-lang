@@ -296,17 +296,54 @@ fn refuse_compared_params(cx: env.Cx, st: env.State) -> env.State {
 // The types a function reaches through the methods of its type
 // parameters' bounds, with the methods' paths: `x.give()` in
 // `fn f[T: Giver](x: T)` gets what `Giver.give`'s parameter and result
-// types hold.
-fn bound_types(cx: env.Cx, st: env.State, bounds: List[env.Bounds]) -> List[(Str, List[types.Ty])] {
-    bounds.flat_map(|bs| bs.bounds.flat_map(|b| checker.iface_methods(st, cx, b).map(|m| ("{b.iface}.{m.name}", m.params + [m.ret]))))
+// types hold. Followed through bounds of bounds: the interface of each
+// `dyn` type a method's parameters or result mention is a bound on the
+// value inside, so its methods are reached too, with the path through
+// them, `Outer.get, Inner.give`. Breadth first, so the shortest path comes
+// first; each interface is entered once, so one that mentions itself
+// ends.
+fn reached_types(cx: env.Cx, st: env.State, bounds: List[env.Bounds]) -> List[(Str, List[types.Ty])] {
+    let mut seen: List[Str] = []
+    let mut queue: List[(Str, env.Bound)] = []
+    for b in bounds.flat_map(|bs| bs.bounds) {
+        let k = st.show_bound(b)
+        if !seen.contains(k) {
+            seen.push(k)
+            queue.push(("", b))
+        }
+    }
+    let mut out: List[(Str, List[types.Ty])] = []
+    let mut next = 0
+    while next < queue.len() {
+        let (pre, b) = queue[next]
+        next = next + 1
+        for m in checker.iface_methods(st, cx, b) {
+            let path = "{pre}{b.iface}.{m.name}"
+            let ts = m.params + [m.ret]
+            out.push((path, ts))
+            let found = ts.fold([], |acc, t| st.subst.fold(t, acc, |got, u| match st.subst.repr(u) {
+                TDyn(j, ja) => got + [env.Bound { iface: j, args: ja }],
+                _ => got,
+            }))
+            for d in found {
+                let k = st.show_bound(d)
+                if !seen.contains(k) {
+                    seen.push(k)
+                    queue.push(("{path}, ", d))
+                }
+            }
+        }
+    }
+    out
 }
 
 // The capabilities a function with parameter types `ps` and these bounds
 // holds, in the order of builtins.cap_names: those of authority_of, then
-// those only its bounds' methods reach, each with the first method's path.
+// those only its bounds' methods reach, and the methods of the bounds they
+// mention (reached_types), each with the first method's path.
 fn fn_authority(cx: env.Cx, st: env.State, ps: List[types.Ty], bounds: List[env.Bounds]) -> List[(Str, Option[Str])] {
     let held = st.authority_of(ps)
-    let through = bound_types(cx, st, bounds)
+    let through = reached_types(cx, st, bounds)
     builtins.cap_names().flat_map(|c| match held.find(|h| h.0 == c) {
         Some(h) => [h],
         None => match through.find(|x| x.1.any(|t| st.subst.caps_in(t, []).contains(c))) {
@@ -324,7 +361,7 @@ fn fn_info(cx: env.Cx, st: env.State, f: Fn, pure_if: List[Str], libs: List[Str]
         Some(p) => [p],
         None => [],
     }).first()
-    let shares = (f.sig.params + bound_types(cx, st, bounds).flat_map(|x| x.1)).any(|t| st.subst.has_chan(t))
+    let shares = (f.sig.params + reached_types(cx, st, bounds).flat_map(|x| x.1)).any(|t| st.subst.has_chan(t))
     let via = held.flat_map(|h| match h.1 {
         Some(p) => [(h.0, p)],
         None => [],

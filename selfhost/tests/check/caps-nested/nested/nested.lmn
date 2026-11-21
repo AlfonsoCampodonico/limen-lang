@@ -1,0 +1,24 @@
+pub interface Inner {
+    fn give(self) -> Stdout
+}
+
+pub interface Outer {
+    fn get(self) -> dyn Inner
+}
+
+pub interface Chain {
+    fn next(self) -> dyn Chain
+    fn inner(self) -> dyn Inner
+}
+
+pub fn via_outer[T: Outer](x: T) {
+    x.get().give().print("via outer")
+}
+
+pub fn via_chain[C: Chain](c: C) {
+    c.next().next().inner().give().print("via chain")
+}
+
+pub fn depth() -> Int {
+    2
+}

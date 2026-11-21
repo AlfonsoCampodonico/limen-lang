@@ -1,0 +1,69 @@
+// Bounds of bounds: the `dyn` interfaces a bound's methods mention, in a
+// result, a parameter or a callback's type, are bounds on the values
+// inside, so their methods' authority counts too, with the path through
+// them. An interface that mentions itself is entered once.
+interface Inner {
+    fn give(self) -> Stdout
+}
+
+interface Outer {
+    fn get(self) -> dyn Inner
+}
+
+fn get_out[T: Outer](x: T) {
+    x.get().give().print("x")
+}
+
+interface Taker {
+    fn take(self, f: fn(Fs))
+}
+
+interface Maker {
+    fn make(self) -> fn() -> dyn Taker
+}
+
+fn made[M: Maker](m: M) {
+    let f = m.make()
+    f().take(|fs| fs.remove("x") ?? ())
+}
+
+interface Leaf {
+    fn dial(self) -> Net
+}
+
+interface Node {
+    fn next(self) -> dyn Node
+    fn leaf(self) -> Option[dyn Leaf]
+}
+
+fn walk[N: Node](n: N) {
+    match n.next().next().leaf() {
+        Some(l) => {
+            let _ = l.dial().get("http://x")
+        },
+        None => (),
+    }
+}
+
+interface Loop {
+    fn again(self) -> dyn Loop
+}
+
+fn spin[L: Loop](l: L) {
+    let _ = l.again().again()
+}
+
+interface Box[T] {
+    fn open(self) -> T
+}
+
+fn boxed[B: Box[dyn Leaf]](b: B) {
+    let _ = b.open().dial().get("http://y")
+}
+
+fn both[T: Outer](x: T, out: Stdout) {
+    out.print("y")
+}
+
+fn main(root: Root) {
+}

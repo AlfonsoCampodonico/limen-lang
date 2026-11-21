@@ -1,0 +1,5 @@
+use nested
+
+fn main(root: Root) {
+    root.stdout.print("{nested.depth()}")
+}

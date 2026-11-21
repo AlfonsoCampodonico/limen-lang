@@ -8944,6 +8944,25 @@ fn main(root: Root) {
      && List.exists (fun (d : Diag.t) -> List.exists (fun n -> Interp_util.find_sub n "through `hide.Giver.give`" 0 <> None) d.notes) ds)
     (String.concat "; " (List.map (fun (d : Diag.t) -> d.code ^ " " ^ d.message ^ " " ^ String.concat " " d.notes) ds));
   ok "pkg-chan-iface-granted" (codes (hidden "[package]\nname = \"app\"\n[dependencies]\nhide = { path = \"../hide\", caps = [\"stdout\"] }\n") = []) "granted";
+  (* nor through a bound of a bound: a `dyn` interface a bound's method
+     returns, whose own methods reach the capability *)
+  (try Unix.mkdir (Filename.concat pdir "nest") 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+  put "nest/nest.lmn"
+    "pub interface Inner {\n    fn give(self) -> Stdout\n}\n\npub interface Outer {\n    fn get(self) -> dyn Inner\n}\n\npub fn nested[T: Outer](x: T) {\n    x.get().give().print(\"nested\")\n}\n";
+  let nested toml =
+    put "app/limen.toml" toml;
+    let src = "use nest\n\nfn main(root: Root) {\n}\n" in
+    let path = Filename.concat pdir "app/nest_main.lmn" in
+    put "app/nest_main.lmn" src;
+    let _, ds, _ = Modules.load_and_check path src in
+    ds
+  in
+  let ds = nested "[package]\nname = \"app\"\n[dependencies]\nnest = { path = \"../nest\" }\n" in
+  ok "pkg-bound-bounds-hidden"
+    (codes ds = [ "E0320" ]
+     && List.exists (fun n -> Interp_util.find_sub n "`nest.nested` takes `Stdout` through `nest.Outer.get, nest.Inner.give`" 0 <> None) (List.hd ds).notes)
+    (String.concat "; " (List.map (fun (d : Diag.t) -> d.code ^ " " ^ d.message ^ " " ^ String.concat " " d.notes) ds));
+  ok "pkg-bound-bounds-granted" (codes (nested "[package]\nname = \"app\"\n[dependencies]\nnest = { path = \"../nest\", caps = [\"stdout\"] }\n") = []) "granted";
   (* embed stays inside the package: the main program's (app/, where its
      limen.toml is) and each dependency's own directory *)
   put "app/data.txt" "app data";
@@ -10712,6 +10731,23 @@ fn main(root: Root) {
    in
    let i = List.find (fun (i : Check.fn_info) -> i.name = "via") infos in
    ok "caps-bound-methods" (ds = [] && i.caps = [ Types.Stdout ] && i.via = [ (Types.Stdout, "Giver.give") ]) (Check.cap_text i Types.Stdout));
+  (* bounds of bounds: the `dyn` interfaces a bound's methods mention (in
+     a result, a parameter, a callback's type) are bounds too, followed to
+     any depth; an interface that mentions itself is entered once *)
+  (let src =
+     "interface Inner {\n    fn give(self) -> Stdout\n}\n\ninterface Outer {\n    fn get(self) -> dyn Inner\n}\n\nfn get_out[T: Outer](x: T) {\n    x.get().give().print(\"x\")\n}\n\ninterface Taker {\n    fn take(self, f: fn(Fs))\n}\n\ninterface Maker {\n    fn make(self) -> fn() -> dyn Taker\n}\n\nfn made[M: Maker](m: M) {\n    let f = m.make()\n    f().take(|fs| fs.remove(\"x\") ?? ())\n}\n\ninterface Leaf {\n    fn dial(self) -> Net\n}\n\ninterface Node {\n    fn next(self) -> dyn Node\n    fn leaf(self) -> Option[dyn Leaf]\n}\n\nfn walk[N: Node](n: N) {\n    match n.next().next().leaf() {\n        Some(l) => {\n            let _ = l.dial().get(\"http://x\")\n        },\n        None => (),\n    }\n}\n\ninterface Loop {\n    fn again(self) -> dyn Loop\n}\n\nfn spin[L: Loop](l: L) {\n    let _ = l.again().again()\n}\n\nfn both[T: Outer](x: T, out: Stdout) {\n    out.print(\"y\")\n}\n\nfn main(root: Root) {\n}\n"
+   in
+   let _, ds, infos = compile "caps-bound-bounds" src in
+   let find n = List.find (fun (i : Check.fn_info) -> i.name = n) infos in
+   let text n = String.concat ", " (List.map (Check.cap_text (find n)) (find n).caps) in
+   ok "caps-bound-bounds-checks" (ds = []) (String.concat " " (codes ds));
+   ok "caps-bound-bounds"
+     (text "get_out" = "Stdout (via Outer.get, Inner.give)"
+      && text "made" = "Fs (via Maker.make, Taker.take)"
+      && text "walk" = "Net (via Node.leaf, Leaf.dial)"
+      && (find "spin").caps = []
+      && text "both" = "Stdout")
+     (String.concat "; " (List.map text [ "get_out"; "made"; "walk"; "spin"; "both" ])));
   (let items, ds, _ = compile "pure-if-ir" cond_src in
    if ds <> [] then ok "pure-if-ir" false (String.concat " " (codes ds))
    else

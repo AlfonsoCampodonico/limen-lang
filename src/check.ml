@@ -133,18 +133,41 @@ let authority_of ts =
 (* The types a function reaches through the methods of its type
    parameters' bounds, with the methods' paths: `x.give()` in
    `fn f[T: Giver](x: T)` gets what `Giver.give`'s parameter and result
-   types hold. *)
-let bound_types bounds =
-  List.concat_map
-    (fun (_, bs) -> List.concat_map (fun ((i, _) as b) -> List.map (fun (m, (ps, r)) -> (i ^ "." ^ m, ps @ [ r ])) (iface_methods b)) bs)
-    bounds
+   types hold. Followed through bounds of bounds: the interface of each
+   `dyn` type a method's parameters or result mention is a bound on the
+   value inside, so its methods are reached too, with the path through
+   them, `Outer.get, Inner.give`. Breadth first, so the shortest path comes
+   first; each interface is entered once, so one that mentions itself
+   ends. *)
+let reached_types bounds =
+  let seen = Hashtbl.create 8 and out = ref [] and q = Queue.create () in
+  let visit pre b =
+    let k = show_bound b in
+    if not (Hashtbl.mem seen k) then begin
+      Hashtbl.replace seen k ();
+      Queue.push (pre, b) q
+    end
+  in
+  List.iter (fun (_, bs) -> List.iter (visit "") bs) bounds;
+  while not (Queue.is_empty q) do
+    let pre, ((i, _) as b) = Queue.pop q in
+    List.iter
+      (fun (m, (ps, r)) ->
+        let path = pre ^ i ^ "." ^ m in
+        let ts = ps @ [ r ] in
+        out := (path, ts) :: !out;
+        List.iter (fold (fun () u -> match repr u with TDyn (j, ja) -> visit (path ^ ", ") (j, ja) | _ -> ()) ()) ts)
+      (iface_methods b)
+  done;
+  List.rev !out
 
 (* The capabilities a function with parameter types [ps] and these bounds
    holds, in [all_caps] order: those of [authority_of ps], then those only
-   its bounds' methods reach, each with the first method's path. *)
+   its bounds' methods reach, and the methods of the bounds they mention
+   ([reached_types]), each with the first method's path. *)
 let fn_authority ps bounds =
   let held = authority_of ps in
-  let through = bound_types bounds in
+  let through = reached_types bounds in
   List.filter_map
     (fun c ->
       match List.assoc_opt c held with
@@ -3592,7 +3615,7 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
           via = List.filter_map (fun (c, p) -> Option.map (fun p -> (c, p)) p) held;
           callbacks = List.exists has_fn s.ps || d.fn_bounds <> [];
           callbacks_via = List.find_map fn_via s.ps;
-          shares = List.exists has_chan (s.ps @ List.concat_map snd (bound_types bounds));
+          shares = List.exists has_chan (s.ps @ List.concat_map snd (reached_types bounds));
           libs = Hashtbl.find libs d.fn_name;
           pure_if = (match Hashtbl.find_opt cond d.fn_name with Some (fns, _) -> fns | None -> []) })
       (* forwarders only pass their arguments on; the methods they call are reported *)
