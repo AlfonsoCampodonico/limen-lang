@@ -3988,6 +3988,107 @@ fn main(root: Root) {
 |v}
     "01 => error: expected end of input at byte 1\n-01 => error: expected end of input at byte 2\n1. => error: expected a digit after `.` at byte 2\n.5 => error: expected a value at byte 0\n+1 => error: expected a value at byte 0\n- => error: expected a value at byte 0\n1e => error: expected a digit in the exponent at byte 2\n1e+ => error: expected a digit in the exponent at byte 3\n1.e5 => error: expected a digit after `.` at byte 2\n0 => 0\n-0 => 0\n1.5e-3 => 0.0015\n1E+2 => 100\n1e999 => error: expected a number within Float's range at byte 0\n-1e999 => error: expected a number within Float's range at byte 0\n1e-999 => 0\n[1e999] => error: expected a number within Float's range at byte 1\n0.1 => 0.1\n[0.30000000000000004, 1e21, 1e-7, 123456789012345678901234567890, 1.7976931348623157e308, 5e-324, 2.2250738585072014e-308, 100, 1e16, 12345.678, -2.5] => [0.30000000000000004,1e+21,1e-07,1.2345678901234568e+29,1.7976931348623157e+308,4.94065645841247e-324,2.2250738585072014e-308,100,10000000000000000,12345.678,-2.5]\n[null,null,null,0.30000000000000004,0.3333333333333333,-0.6666666666666666]\nround-trip failures: 0\n";
 
+  (* the JSON edges: a lone surrogate, a duplicate key, nesting past 512 and
+     a number past 400 characters are errors, each just inside its limit is
+     not; json.decode reads through the same parser, and a task's 1 MB stack
+     reaches the nesting limit natively without overflowing *)
+  out "json-edges"
+    {v|
+use json
+
+fn times(s: Str, n: Int) -> Str {
+    let mut out = ""
+    for _ in 0..<n {
+        out = out + s
+    }
+    out
+}
+
+fn nest(n: Int) -> Str {
+    times("[\{\"k\":", n / 2) + times("[", n % 2) + "1" + times("]", n % 2) + times("}]", n / 2)
+}
+
+struct Item {
+    id: Int,
+    name: Str,
+}
+
+fn show(out: Stdout, label: Str, s: Str) {
+    match json.parse(s) {
+        Ok(v) => {
+            let text = json.stringify(v)
+            if text.len() > 60 {
+                out.print("{label} => ok, {text.len()} bytes")
+            } else {
+                out.print("{label} => {text}")
+            }
+        },
+        Err(e) => out.print("{label} => error: {e}"),
+    }
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    for s in ["\"\\ud800\"", "\"a\\uD800b\"", "\"\\udc00\"", "\"\\ud800\\u0041\"", "\"\\ud800\\ud800\"", "\"\\ud800\\n\"", "\"\\ud83d\\ude00\"", "\{\"id\":1,\"id\":2}", "[\{\"a\":\{\"id\":1,\"x\":2,\"id\":3}}]", "\{\"id\":1,\"name\":2}", "\{\"\\u0069d\":1,\"id\":2}"] {
+        show(out, s, s)
+    }
+    let keys = (0..<20).map(|i| "\"k{i}\":{i}").join(",")
+    show(out, "20 keys", "\{" + keys + "}")
+    show(out, "20 keys, k3 again", "\{" + keys + ",\"k3\":0}")
+    show(out, "20 keys, k18 again", "\{" + keys + ",\"k18\":0}")
+    show(out, "array depth 512", times("[", 512) + times("]", 512))
+    show(out, "array depth 513", times("[", 513) + times("]", 513))
+    show(out, "mixed depth 512", nest(512))
+    show(out, "mixed depth 513", nest(513))
+    show(out, "object depth 513", times("\{\"a\":", 513) + "1" + times("}", 513))
+    show(out, "400 characters", "-1." + times("0", 397))
+    show(out, "401 characters", "[-1." + times("0", 398) + "]")
+    show(out, "401 digits", times("9", 401))
+    let d: Result[Item, Str] = json.decode("\{\"id\":1,\"name\":\"a\",\"id\":2}")
+    out.print("decode duplicate: {d}")
+    let m: Result[Map[Str, Int], Str] = json.decode("\{\"a\":1,\"a\":2}")
+    out.print("decode map duplicate: {m}")
+    let ok: Result[Item, Str] = json.decode(json.encode(Item { id: 7, name: "b" }))
+    out.print("round trip: {ok}")
+    let deep: Result[List[Int], Str] = json.decode(times("[", 513) + times("]", 513))
+    out.print("decode deep: {deep}")
+    let rs = group g {
+        g.go(|| json.parse(times("[", 513) + times("]", 513)).is_ok())
+        g.go(|| json.parse(times("[", 512) + times("]", 512)).is_ok())
+        g.go(|| json.parse(nest(513)).is_ok())
+        g.go(|| json.parse(nest(512)).is_ok())
+    }
+    out.print("in a task: {rs}")
+}
+|v}
+    {w|"\ud800" => error: lone surrogate \ud800 at byte 1
+"a\uD800b" => error: lone surrogate \uD800 at byte 2
+"\udc00" => error: lone surrogate \udc00 at byte 1
+"\ud800\u0041" => error: lone surrogate \ud800 at byte 1
+"\ud800\ud800" => error: lone surrogate \ud800 at byte 1
+"\ud800\n" => error: lone surrogate \ud800 at byte 1
+"\ud83d\ude00" => "😀"
+{"id":1,"id":2} => error: duplicate key `id` at byte 8
+[{"a":{"id":1,"x":2,"id":3}}] => error: duplicate key `id` at byte 20
+{"id":1,"name":2} => {"id":1,"name":2}
+{"\u0069d":1,"id":2} => error: duplicate key `id` at byte 13
+20 keys => ok, 161 bytes
+20 keys, k3 again => error: duplicate key `k3` at byte 161
+20 keys, k18 again => error: duplicate key `k18` at byte 161
+array depth 512 => ok, 1024 bytes
+array depth 513 => error: nested deeper than 512 at byte 512
+mixed depth 512 => ok, 2049 bytes
+mixed depth 513 => error: nested deeper than 512 at byte 1536
+object depth 513 => error: nested deeper than 512 at byte 2560
+400 characters => -1
+401 characters => error: number longer than 400 characters at byte 1
+401 digits => error: number longer than 400 characters at byte 0
+decode duplicate: Err("duplicate key `id` at byte 19")
+decode map duplicate: Err("duplicate key `a` at byte 7")
+round trip: Ok(Item { id: 7, name: "b" })
+decode deep: Err("nested deeper than 512 at byte 512")
+in a task: [false, true, false, true]
+|w};
   (* json.Int: whole numbers that fit an Int stay exact both ways, so ids
      above 2^53 survive; anything else is a Num *)
   out "json-int"

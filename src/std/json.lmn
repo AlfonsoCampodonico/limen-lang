@@ -27,7 +27,8 @@ pub fn field(key: Str, value: Value) -> Field {
 
 // ---------- reading values (methods on Value) ----------
 
-// The value of `key` in an object (the first one, if repeated): `v.get("name")`.
+// The value of `key` in an object: `v.get("name")`. `parse` refuses an
+// object that repeats a key; in one built with a key twice, the first wins.
 pub fn get(self: Value, key: Str) -> Option[Value] {
     match self {
         Obj(fields) => {
@@ -278,6 +279,11 @@ struct Text {
 }
 
 // Parse JSON text. The error says what was expected and at which byte.
+// Where RFC 8259 leaves the choice to the parser, this one refuses: half a
+// surrogate pair (`"\ud800"`), which no Str can hold; an object that
+// repeats a key, which two parsers could read two ways; more than 512
+// arrays and objects inside each other; and a number longer than 400
+// characters.
 pub fn parse(s: Str) -> Result[Value, Str] {
     let t = Text { s, bs: s.bytes() }
     let p = value(t, skip(t, 0))?
@@ -308,26 +314,154 @@ fn lit(t: Text, i: Int, word: Str, v: Value) -> Result[Parsed, Str] {
     }
 }
 
+// An array or object the parser is inside: its items so far, or for an
+// object its members so far and the key of the member whose value comes
+// next. `id` tells its keys from other objects' in the map of keys.
+struct Open {
+    obj: Bool,
+    items: List[Value],
+    fields: List[Field],
+    key: Str,
+    id: Int,
+}
+
+// The value starting at byte `i`. Arrays and objects are tracked in a list
+// rather than by recursion, so deep nesting costs no stack; more than 512
+// of them inside each other is an error.
 fn value(t: Text, i: Int) -> Result[Parsed, Str] {
-    if i >= t.bs.len() {
-        return Err(fail("a value", i))
+    // the open ones, outermost first; slots from `depth` on are spare
+    let mut open: List[Open] = []
+    let mut depth = 0
+    // the keys of objects with many members, by object
+    let mut seen: Map[(Int, Str), Bool] = map()
+    let mut opened = 0
+    let mut j = i
+    let mut want_key = false
+    while true {
+        if want_key {
+            let k = key(t, j)?
+            let name = k.value.as_str() ?? ""
+            let d = depth - 1
+            let id = open[d].id
+            // a few keys are compared one by one, more through the map
+            let n = open[d].fields.len()
+            if n == 16 {
+                for f in open[d].fields {
+                    seen[(id, f.key)] = true
+                }
+            }
+            if (n < 16 && has_key(open[d].fields, name)) || (n >= 16 && seen.contains((id, name))) {
+                return Err("duplicate key `{name}` at byte {j}")
+            }
+            if n >= 16 {
+                seen[(id, name)] = true
+            }
+            open[d].key = name
+            j = k.pos
+        }
+        if j >= t.bs.len() {
+            return Err(fail("a value", j))
+        }
+        let b = t.bs[j]
+        let mut done = Parsed { value: Null, pos: j }
+        if b == 91 || b == 123 {
+            if depth == 512 {
+                return Err("nested deeper than 512 at byte {j}")
+            }
+            let k = skip(t, j + 1)
+            if b == 91 && k < t.bs.len() && t.bs[k] == 93 {
+                done = Parsed { value: Arr([]), pos: k + 1 }
+            } else if b == 123 && k < t.bs.len() && t.bs[k] == 125 {
+                done = Parsed { value: Obj([]), pos: k + 1 }
+            } else {
+                opened = opened + 1
+                let o = Open { obj: b == 123, items: [], fields: [], key: "", id: opened }
+                if depth < open.len() {
+                    open[depth] = o
+                } else {
+                    open.push(o)
+                }
+                depth = depth + 1
+                want_key = b == 123
+                j = k
+                continue
+            }
+        } else {
+            done = scalar(t, j)?
+        }
+        // `done` is a whole value: add it to the array or object it is in,
+        // and close each one that ends after it
+        while true {
+            if depth == 0 {
+                return Ok(done)
+            }
+            let d = depth - 1
+            let k = skip(t, done.pos)
+            let more = k < t.bs.len() && t.bs[k] == 44
+            if open[d].obj {
+                open[d].fields.push(Field { key: open[d].key, value: done.value })
+                if !more && (k >= t.bs.len() || t.bs[k] != 125) {
+                    return Err(fail("`,` or `\}`", k))
+                }
+                if !more {
+                    done = Parsed { value: Obj(open[d].fields), pos: k + 1 }
+                }
+            } else {
+                open[d].items.push(done.value)
+                if !more && (k >= t.bs.len() || t.bs[k] != 93) {
+                    return Err(fail("`,` or `]`", k))
+                }
+                if !more {
+                    done = Parsed { value: Arr(open[d].items), pos: k + 1 }
+                }
+            }
+            if more {
+                want_key = open[d].obj
+                j = skip(t, k + 1)
+                break
+            }
+            depth = d
+        }
     }
-    let b = t.bs[i]
-    if b == 123 {
-        object(t, i + 1)
-    } else if b == 91 {
-        array(t, i + 1)
-    } else if b == 34 {
-        let p = string(t, i + 1)?
-        Ok(p)
+    Err(fail("a value", j))
+}
+
+fn has_key(fields: List[Field], name: Str) -> Bool {
+    for f in fields {
+        if f.key == name {
+            return true
+        }
+    }
+    false
+}
+
+// An object member's key at byte `j` and the `:` after it: where its value
+// starts.
+fn key(t: Text, j: Int) -> Result[Parsed, Str] {
+    if j >= t.bs.len() || t.bs[j] != 34 {
+        return Err(fail("a string key", j))
+    }
+    let k = string(t, j + 1)?
+    let c = skip(t, k.pos)
+    if c >= t.bs.len() || t.bs[c] != 58 {
+        return Err(fail("`:`", c))
+    }
+    Ok(Parsed { value: k.value, pos: skip(t, c + 1) })
+}
+
+// A string, number, `true`, `false` or `null` at byte `j`.
+fn scalar(t: Text, j: Int) -> Result[Parsed, Str] {
+    let b = t.bs[j]
+    if b == 34 {
+        string(t, j + 1)
     } else if b == 116 {
-        lit(t, i, "true", Bool(true))
+        lit(t, j, "true", Bool(true))
     } else if b == 102 {
-        lit(t, i, "false", Bool(false))
+        lit(t, j, "false", Bool(false))
     } else if b == 110 {
-        lit(t, i, "null", Null)
+        lit(t, j, "null", Null)
     } else {
-        number(t, i)
+        number(t, j)
     }
 }
 
@@ -347,7 +481,9 @@ fn digits(t: Text, j: Int) -> Int {
 // A number, by RFC 8259's grammar exactly:
 // `-`? (`0` | [1-9][0-9]*) (`.` [0-9]+)? ([eE] [+-]? [0-9]+)?
 // so `01`, `1.`, `.5` and `+1` are not numbers. One too large for a Float
-// (`1e999`) is an error; one too small to tell from zero reads as 0.
+// (`1e999`) is an error; one too small to tell from zero reads as 0. One
+// longer than 400 characters is an error too, so a huge literal can't cost
+// much time or memory: no Float needs that many digits.
 fn number(t: Text, i: Int) -> Result[Parsed, Str] {
     let mut j = i
     if j < t.bs.len() && t.bs[j] == 45 {
@@ -374,6 +510,9 @@ fn number(t: Text, i: Int) -> Result[Parsed, Str] {
         }
         j = digits(t, k)
     }
+    if j - i > 400 {
+        return Err("number longer than 400 characters at byte {i}")
+    }
     // a whole number that fits an Int stays exact; `-0` keeps its sign as a Float
     if whole == j && t.s.slice(i, j) != "-0" {
         match t.s.slice(i, j).parse_int() {
@@ -386,57 +525,6 @@ fn number(t: Text, i: Int) -> Result[Parsed, Str] {
         return Err(fail("a number within Float's range", i))
     }
     Ok(Parsed { value: Num(x), pos: j })
-}
-
-fn array(t: Text, i: Int) -> Result[Parsed, Str] {
-    let mut items = []
-    let mut j = skip(t, i)
-    if j < t.bs.len() && t.bs[j] == 93 {
-        return Ok(Parsed { value: Arr(items), pos: j + 1 })
-    }
-    while true {
-        let p = value(t, j)?
-        items.push(p.value)
-        j = skip(t, p.pos)
-        if j < t.bs.len() && t.bs[j] == 44 {
-            j = skip(t, j + 1)
-        } else if j < t.bs.len() && t.bs[j] == 93 {
-            return Ok(Parsed { value: Arr(items), pos: j + 1 })
-        } else {
-            return Err(fail("`,` or `]`", j))
-        }
-    }
-    Err(fail("`]`", j))
-}
-
-fn object(t: Text, i: Int) -> Result[Parsed, Str] {
-    let mut fields = []
-    let mut j = skip(t, i)
-    if j < t.bs.len() && t.bs[j] == 125 {
-        return Ok(Parsed { value: Obj(fields), pos: j + 1 })
-    }
-    while true {
-        if j >= t.bs.len() || t.bs[j] != 34 {
-            return Err(fail("a string key", j))
-        }
-        let k = string(t, j + 1)?
-        j = skip(t, k.pos)
-        if j >= t.bs.len() || t.bs[j] != 58 {
-            return Err(fail("`:`", j))
-        }
-        let v = value(t, skip(t, j + 1))?
-        let key = k.value.as_str() ?? ""
-        fields.push(Field { key, value: v.value })
-        j = skip(t, v.pos)
-        if j < t.bs.len() && t.bs[j] == 44 {
-            j = skip(t, j + 1)
-        } else if j < t.bs.len() && t.bs[j] == 125 {
-            return Ok(Parsed { value: Obj(fields), pos: j + 1 })
-        } else {
-            return Err(fail("`,` or `\}`", j))
-        }
-    }
-    Err(fail("`\}`", j))
 }
 
 // Four hex digits at `i`, or -1.
@@ -493,13 +581,19 @@ fn string(t: Text, i: Int) -> Result[Parsed, Str] {
                     return Err(fail("four hex digits", j))
                 }
                 j = j + 4
-                // a surrogate pair
+                // a surrogate pair; half of one alone is no character, and a
+                // Str holds only characters
+                let mut paired = false
                 if c >= 55296 && c <= 56319 && j + 6 <= t.bs.len() && t.bs[j] == 92 && t.bs[j + 1] == 117 {
                     let lo = hex_at(t, j + 2)
                     if lo >= 56320 && lo <= 57343 {
                         c = 65536 + (c - 55296) * 1024 + (lo - 56320)
                         j = j + 6
+                        paired = true
                     }
+                }
+                if !paired && c >= 55296 && c <= 57343 {
+                    return Err("lone surrogate {t.s.slice(j - 6, j)} at byte {j - 6}")
                 }
                 out = out + c.to_char()
             } else {

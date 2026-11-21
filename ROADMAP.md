@@ -126,7 +126,8 @@ happens here.
   hashing a deep map key, natively and in the interpreter, and a check of
   `json.encode` on a deep value.
 - The JSON edges: a lone `\ud800`, duplicate keys, a nesting limit, numbers
-  over 400 characters.
+  over 400 characters (done: each is a parse error, and the parser reads
+  nesting without recursion, so it can't overflow a task's stack).
 - Fuzz the lexer, parser, checker and the rest of the runtime.
 - `full_path` hands SQLite a path string that another process with write
   access to the granted directory could race with a symlink swap after the
