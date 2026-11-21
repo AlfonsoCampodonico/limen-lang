@@ -108,9 +108,10 @@ line, and write rows to Postgres.
 Everything that would break programs has to be decided before 1.0, so it
 happens here.
 
-- The design questions: shared mutable references (stateful code threads
-  state by hand today, as the self-hosted compiler shows); E0304, which rules
-  out callback tables while generics allow them; what a group returns.
+- The design questions, decided: Limen never gets references that can be
+  stored; functions in fields (done, E0304 is no longer reported); a group
+  keeps its list of results, so a group that runs for ever uses tasks that
+  return nothing and a channel (documented).
 - One definition of each built-in. Each is written twice, in the
   interpreter and the C runtime, and only the tests keep them in step: the
   NUL-path difference came from this.
@@ -133,6 +134,14 @@ happens here.
 
 Done when the review's findings are fixed and nothing on the list of
 breaking changes is still open.
+
+## 0.8.x or 0.9: `mut` parameters
+
+Stateful code threads state by hand today, as the self-hosted compiler shows.
+A `mut` parameter would let a function change its caller's value without a
+stored reference. The design doc has the options and the open questions; the
+rewrite of the self-hosted compiler to use it is the proof that it is worth
+having.
 
 ## 0.9: installing and sharing
 
