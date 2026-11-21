@@ -10,14 +10,19 @@
 set -e
 cd "$(dirname "$0")/.."
 dune build ./bin/main.exe
-out=$(mktemp -d)
+# the stages live in the repository, so one directory holds everything the
+# compiler reads and writes
+mkdir -p _build
+out=$(mktemp -d "$PWD/_build/bootstrap.XXXXXX")
 trap 'rm -rf "$out"' EXIT
-# the self-hosted compiler and the only authority it gets: files, the
-# settings it reads, and the programs a build runs
+# the self-hosted compiler and the only authority it gets: this repository
+# (never a system directory: on Linux a writable grant over /usr or /lib
+# leaves the C compiler unable to start), the settings it reads, and the
+# programs a build runs
 tsc() {
   bin=$1
   shift
-  "$bin" --grant fs=/ \
+  "$bin" --grant "fs=$PWD" \
     --grant env=PWD --grant env=CC --grant env=PATH --grant env=HOME \
     --grant env=LIMEN_CACHE --grant env=XDG_CACHE_HOME --grant env=DEVELOPER_DIR --grant env=LIMEN_OPENSSL \
     --grant env=LIBRARY_PATH --grant env=CPATH --grant env=C_INCLUDE_PATH --grant env=SDKROOT --grant env=MACOSX_DEPLOYMENT_TARGET \
