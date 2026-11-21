@@ -28,6 +28,7 @@
      (the same warm colour as the lamplight in the logo) */
   --brand: #1f3a70;
   --brand-ink: #24498f;
+  --mark-tile: #14233F; --mark-light: #FFE7B0; --mark-leaf: #0A1426;
   --brand-soft: #e9eef8;
   /* the logo tile's edge: none on light, a faint one on dark, where the
      night-blue tile would otherwise sink into the page */
