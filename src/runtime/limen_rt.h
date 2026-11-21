@@ -776,15 +776,29 @@ W_RT int64_t Cap_now_ms(void);
    after the switch means a waker can never resume a fiber that is still
    running. */
 
-#if defined(__has_feature)
+/* GCC before 14 has no __has_feature; it says so with __SANITIZE_*__. Without
+   this, a gcc build never told the sanitizers about fiber switches: TSan's
+   shadow stack underflowed and it faulted in its own code, then deadlocked
+   in our fault handler's sigaction (the CI hang on arm64 Linux). */
+#if defined(__SANITIZE_ADDRESS__)
+#define W_ASAN 1
+#elif defined(__has_feature)
 #if __has_feature(address_sanitizer)
 #define W_ASAN 1
-#include <sanitizer/common_interface_defs.h>
 #endif
+#endif
+#if defined(__SANITIZE_THREAD__)
+#define W_TSAN 1
+#elif defined(__has_feature)
 #if __has_feature(thread_sanitizer)
 #define W_TSAN 1
-#include <sanitizer/tsan_interface.h>
 #endif
+#endif
+#ifdef W_ASAN
+#include <sanitizer/common_interface_defs.h>
+#endif
+#ifdef W_TSAN
+#include <sanitizer/tsan_interface.h>
 #endif
 #include <sys/mman.h>
 #include <sched.h>
