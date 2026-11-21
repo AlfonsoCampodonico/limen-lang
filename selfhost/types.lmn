@@ -69,17 +69,24 @@ pub fn io_err() -> Ty {
 
 // What the type variables stand for: the type each linked variable was
 // unified with, and the number the next new variable gets. It also carries
-// the authority each struct and enum holds through its fields (set once
-// the declarations are known, see `with_authority`), which every question
-// about a type's capabilities needs.
+// the authority each struct and enum holds through its fields, and the
+// path to the first function each holds through them (set once the
+// declarations are known, see `with_authority`), which every question
+// about a type's capabilities and functions needs.
 pub struct Subst {
     links: Map[Int, Ty],
     next: Int,
     authority: Map[Str, List[(Str, Str)]],
+    // the struct and enum types that hold a function through their own
+    // fields and payloads, each with the path to the first one, `Route.run`
+    // or `App.routes.run` (type arguments are not counted here; fn_path
+    // walks them where the type is used); a type holding no function has
+    // no entry
+    fn_holders: Map[Str, Str],
 }
 
 pub fn empty() -> Subst {
-    Subst { links: map(), next: 1, authority: map() }
+    Subst { links: map(), next: 1, authority: map(), fn_holders: map() }
 }
 
 pub fn fresh(self: Subst) -> (Ty, Subst) {
@@ -324,42 +331,59 @@ pub fn via(self: Subst, t: Ty, c: Str) -> Option[Str] {
 
 // The authority each of the structs and enums `names` holds through its
 // own fields and payloads: each capability with the first path that
-// reaches it, `Client.net` or `App.client.net`. `fields` gives a type's
+// reaches it, `Client.net` or `App.client.net`; and the path to the first
+// function each holds through them (fn_holders). `fields` gives a type's
 // fields (a variant's payloads named by the variant) in declaration order,
 // its type parameters as TParam. Each type is walked depth first from its
 // first field, every type entered once, so recursive types end; type
-// arguments are not counted here (caps_in walks them where the type is
-// used). A type holding no capability gets no entry.
+// arguments are not counted here (caps_in and fn_path walk them where the
+// type is used). A type holding no capability gets no authority entry, and
+// one holding no function no fn_holders entry.
 pub fn with_authority(self: Subst, names: List[Str], fields: Map[Str, List[(Str, Ty)]]) -> Subst {
     let mut table: Map[Str, List[(Str, Str)]] = map()
+    let mut holders: Map[Str, Str] = map()
     for n in names {
-        let found = enter(self, fields, n, n, [], []).0
-        if !found.is_empty() {
-            table[n] = found
+        let w = enter(self, fields, n, n, Walked { found: [], func: None, seen: [] })
+        if !w.found.is_empty() {
+            table[n] = w.found
+        }
+        match w.func {
+            Some(p) => {
+                holders[n] = p
+            },
+            None => {},
         }
     }
-    { self with authority: table }
+    { self with authority: table, fn_holders: holders }
 }
 
-// Enter type `m`, reached by `path`: the capabilities found so far and the
-// types entered.
-fn enter(s: Subst, fields: Map[Str, List[(Str, Ty)]], m: Str, path: Str, found: List[(Str, Str)], seen: List[Str]) -> (List[(Str, Str)], List[Str]) {
-    if seen.contains(m) {
-        return (found, seen)
+// What a walk over the fields has found so far: the capabilities, each
+// with its first path, the path to the first function, and the types
+// entered.
+struct Walked {
+    found: List[(Str, Str)],
+    func: Option[Str],
+    seen: List[Str],
+}
+
+// Enter type `m`, reached by `path`.
+fn enter(s: Subst, fields: Map[Str, List[(Str, Ty)]], m: Str, path: Str, w: Walked) -> Walked {
+    if w.seen.contains(m) {
+        return w
     }
-    let mut found = found
-    let mut seen = seen + [m]
+    let mut w = { w with seen: w.seen + [m] }
     for (f, t) in fields.get(m) ?? [] {
-        (found, seen) = walk(s, fields, path + "." + f, t, found, seen)
+        w = walk(s, fields, path + "." + f, t, w)
     }
-    (found, seen)
+    w
 }
 
-fn walk(s: Subst, fields: Map[Str, List[(Str, Ty)]], path: Str, t: Ty, found: List[(Str, Str)], seen: List[Str]) -> (List[(Str, Str)], List[Str]) {
-    s.fold(t, (found, seen), |acc, u| match s.kind(u) {
-        KCap(c) => (if acc.0.any(|held| held.0 == c) { acc.0 } else { acc.0 + [(c, path)] }, acc.1),
-        KNamed(m) => enter(s, fields, m, path, acc.0, acc.1),
-        KPlain | KState(_) | KFn | KDyn => acc,
+fn walk(s: Subst, fields: Map[Str, List[(Str, Ty)]], path: Str, t: Ty, w: Walked) -> Walked {
+    s.fold(t, w, |acc, u| match s.kind(u) {
+        KCap(c) => if acc.found.any(|held| held.0 == c) { acc } else { { acc with found: acc.found + [(c, path)] } },
+        KFn => if acc.func.is_some() { acc } else { { acc with func: Some(path) } },
+        KNamed(m) => enter(s, fields, m, path, acc),
+        KPlain | KState(_) | KDyn => acc,
     })
 }
 
@@ -385,11 +409,36 @@ pub fn has_dyn(self: Subst, t: Ty) -> Bool {
     })
 }
 
+// Where a type holds a function, if it does: the first function type
+// written in it (itself or inside it), shown, as `fn() -> Int`, or the path
+// through the first struct or enum in it that holds one in its fields, as
+// `App.routes.run`, whichever comes first (the type itself first, then the
+// types inside it in order).
+pub fn fn_path(self: Subst, t: Ty) -> Option[Str] {
+    self.find_map(t, |u| match self.kind(u) {
+        KFn => Some(self.show(u)),
+        KNamed(n) => self.fn_holders.get(n),
+        KPlain | KCap(_) | KState(_) | KDyn => None,
+    })
+}
+
 pub fn has_fn(self: Subst, t: Ty) -> Bool {
+    self.fn_path(t).is_some()
+}
+
+// Does `t` write a function type, itself or inside it, rather than only
+// hold one through a struct's or enum's fields?
+pub fn writes_fn(self: Subst, t: Ty) -> Bool {
     self.exists(t, |u| match self.kind(u) {
         KFn => true,
         KPlain | KCap(_) | KState(_) | KDyn | KNamed(_) => false,
     })
+}
+
+// The path through which `t` holds a function when it does not write one:
+// `App.routes.run`.
+pub fn fn_via(self: Subst, t: Ty) -> Option[Str] {
+    if self.writes_fn(t) { None } else { self.fn_path(t) }
 }
 
 // How far a rule looks into a type for a kind of value: not at all, at the
@@ -417,25 +466,37 @@ pub enum Found {
     Inside(Ty),
 }
 
+// A struct or enum holding a function through its fields counts as one
+// for a policy that looks for functions anywhere.
+fn holds_fn(self: Subst, p: Policy, u: Ty) -> Bool {
+    match self.kind(u) {
+        KNamed(n) => p.fns == Deep && self.fn_holders.contains(n),
+        KPlain | KCap(_) | KState(_) | KFn | KDyn => false,
+    }
+}
+
 fn reach(self: Subst, p: Policy, u: Ty) -> Depth {
     match self.kind(u) {
         KState(_) => p.state,
         KFn => p.fns,
         KDyn => p.dyns,
         KCap(_) => p.caps,
-        KPlain | KNamed(_) => Never,
+        KNamed(_) => if self.holds_fn(p, u) { p.fns } else { Never },
+        KPlain => Never,
     }
 }
 
 // Which of the refused kinds `u` is, in the order they are looked for:
-// shared state, functions, `dyn` values, capabilities.
-fn refused_rank(self: Subst, u: Ty) -> Int {
+// shared state, functions (and the structs and enums `p` counts as one),
+// `dyn` values, capabilities.
+fn refused_rank(self: Subst, p: Policy, u: Ty) -> Int {
     match self.kind(u) {
         KState(_) => 0,
         KFn => 1,
         KDyn => 2,
         KCap(_) => 3,
-        KPlain | KNamed(_) => -1,
+        KNamed(_) => if self.holds_fn(p, u) { 1 } else { -1 },
+        KPlain => -1,
     }
 }
 
@@ -447,7 +508,7 @@ pub fn refused(self: Subst, p: Policy, t: Ty) -> Option[Found] {
         return Some(Itself)
     }
     for rank in 0..<4 {
-        match self.find_map(t, |u| if self.refused_rank(u) == rank && self.reach(p, u) == Deep { Some(self.repr(u)) } else { None }) {
+        match self.find_map(t, |u| if self.refused_rank(p, u) == rank && self.reach(p, u) == Deep { Some(self.repr(u)) } else { None }) {
             Some(u) => {
                 return Some(Inside(u))
             },

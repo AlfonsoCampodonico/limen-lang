@@ -46,6 +46,9 @@ pub struct FnInfo {
     // struct or enum that holds it, `Client.net`
     via: List[(Str, Str)],
     callbacks: Bool,
+    // the path to the function a parameter holds through a field,
+    // `Handlers.on_get`
+    callbacks_via: Option[Str],
     // it takes a channel, Atomic or Shared: state tasks share, so it is not
     // pure
     shares: Bool,
@@ -273,8 +276,10 @@ fn refuse_compared_params(cx: env.Cx, st: env.State) -> env.State {
                     let what = "`{shown}` compares values of `{p}`"
                     let t = st.repr(t)
                     st = match st.subst.refused(env.equality(), t) {
-                        Some(Itself) => st.report(diag.error("E0201", sp, "{what}, and values of type `{st.show(t)}` cannot be compared")),
-                        Some(Inside(u)) => st.report(diag.error("E0201", sp, "{what}, and {st.holds_uncomparable(t, u)}")),
+                        Some(found) => match st.uncomparable(t, found) {
+                            Some(why) => st.report(diag.error("E0201", sp, "{what}, and {why}")),
+                            None => st.report(diag.error("E0201", sp, "{what}, and values of type `{st.show(t)}` cannot be compared")),
+                        },
                         None => match st.held(t) {
                             Some(h) => st.report(diag.error("E0201", sp, "{what}, and {h}").note("capabilities have no equality, so neither has a value holding one; compare something it holds that is not a capability, as in `xs.any(|x| x.name == name)`")),
                             None => st,
@@ -315,12 +320,16 @@ fn fn_info(cx: env.Cx, st: env.State, f: Fn, pure_if: List[Str], libs: List[Str]
     let bounds = cx.fn_cur_bounds.get(f.decl.name) ?? []
     let held = fn_authority(cx, st, f.sig.params, bounds)
     let callbacks = f.sig.params.any(|t| st.subst.has_fn(t)) || !f.decl.bounds.is_empty()
+    let callbacks_via = f.sig.params.flat_map(|t| match st.subst.fn_via(t) {
+        Some(p) => [p],
+        None => [],
+    }).first()
     let shares = (f.sig.params + bound_types(cx, st, bounds).flat_map(|x| x.1)).any(|t| st.subst.has_chan(t))
     let via = held.flat_map(|h| match h.1 {
         Some(p) => [(h.0, p)],
         None => [],
     })
-    FnInfo { name: f.decl.name, span: f.decl.span, caps: held.map(|h| h.0), via, callbacks, shares, libs, pure_if }
+    FnInfo { name: f.decl.name, span: f.decl.span, caps: held.map(|h| h.0), via, callbacks, callbacks_via, shares, libs, pure_if }
 }
 
 // 2c. the authority each struct and enum holds through its fields
@@ -1138,7 +1147,10 @@ fn check_pending(cx: env.Cx, st: env.State, ds: Decls) -> (env.State, Decls) {
         match checker.unkeyable(st, cx, k) {
             Some(t) => {
                 let shown = st.show(st.repr(k))
-                let inner = if st.show(t) == shown { "" } else { " (it holds `{st.show(t)}`)" }
+                let inner = match st.subst.fn_via(k) {
+                    Some(p) => " (it holds a function through `{p}`)",
+                    None => if st.show(t) == shown { "" } else { " (it holds `{st.show(t)}`)" },
+                }
                 let mut d = diag.error("E0113", sp, "`{shown}` cannot be a map key{inner}").note("keys are Int, Str, Bool, and tuples, structs and enums made of them; Float, List and Map cannot be keys")
                 match t {
                     TParam(g) => {
@@ -1201,7 +1213,13 @@ fn check_pending(cx: env.Cx, st: env.State, ds: Decls) -> (env.State, Decls) {
         }
         let why = match i {
             "Ordered" => checker.unordered_why(st, cx, p.ty),
-            "Key" => checker.unkeyable(st, cx, p.ty).map(|u| "`{st.show(u)}` cannot be a map key: keys are Int, Str, Bytes, Bool, and tuples, structs and enums of them"),
+            "Key" => checker.unkeyable(st, cx, p.ty).map(|u| {
+                let shown = match st.subst.fn_via(p.ty) {
+                    Some(path) => "`{st.show(st.repr(p.ty))}` (it holds a function through `{path}`)",
+                    None => "`{st.show(u)}`",
+                }
+                "{shown} cannot be a map key: keys are Int, Str, Bytes, Bool, and tuples, structs and enums of them"
+            }),
             _ => {
                 let (why, next) = checker.satisfies(st, cx, p.ty, p.bound)
                 st = next

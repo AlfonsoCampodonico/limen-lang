@@ -89,14 +89,16 @@ let check_diag (d : Diag.t) =
 
 (* What `limen caps` reports of a function: CAPS NAME FILE LO HI, its
    capabilities in brackets (each held through a struct or enum with its
-   path, `Net=Client.net`), whether it runs callbacks, and the function
-   parameters it is pure if (`if=f,g`, when there are), and the C libraries
-   it reaches (`libs=z`, when there are); `shares` when it takes a channel,
-   Atomic or Shared. *)
+   path, `Net=Client.net`), whether it runs callbacks (and through which
+   field, `via=Handlers.on_get`, when a parameter holds the function through
+   one), and the function parameters it is pure if (`if=f,g`, when there
+   are), and the C libraries it reaches (`libs=z`, when there are);
+   `shares` when it takes a channel, Atomic or Shared. *)
 let caps_line (i : Check.fn_info) =
-  Printf.printf "CAPS %s %s %d %d [%s] %b%s%s%s\n" i.name i.span.file i.span.lo i.span.hi
+  Printf.printf "CAPS %s %s %d %d [%s] %b%s%s%s%s\n" i.name i.span.file i.span.lo i.span.hi
     (String.concat "," (List.map (fun c -> match List.assoc_opt c i.via with Some p -> Types.cap_name c ^ "=" ^ p | None -> Types.cap_name c) i.caps))
     i.callbacks
+    (match i.callbacks_via with Some p -> " via=" ^ p | None -> "")
     (if i.shares then " shares" else "")
     (if i.pure_if = [] then "" else " if=" ^ String.concat "," i.pure_if)
     (if i.libs = [] then "" else " libs=" ^ String.concat "," i.libs)

@@ -5,8 +5,9 @@
 // errors, or else those of the capability checks of selfhost/caps.lmn,
 // then the checker's warnings); then what `limen caps` reports of each
 // function: CAPS NAME FILE LO HI, its capabilities, whether it runs
-// callbacks, the function parameters it is pure if (`if=f`) and the C
-// libraries it reaches (`libs=z`); then each item of the program as the
+// callbacks (and through which field, `via=Handlers.on_get`), the function
+// parameters it is pure if (`if=f`) and the C libraries it reaches
+// (`libs=z`); then each item of the program as the
 // checker rewrote it, and under it one line per expression, in the order
 // selfhost/walk.lmn visits them: its type, the type arguments of a generic function's use, `nested`
 // for `a?.b` whose rest is an Option already, and `dyn I` for a value
@@ -85,7 +86,11 @@ fn main(root: Root) -> Int {
         let cond = if i.pure_if.is_empty() { "" } else { " if=" + i.pure_if.join(",") }
         let libs = if i.libs.is_empty() { "" } else { " libs=" + i.libs.join(",") }
         let shares = if i.shares { " shares" } else { "" }
-        out.print("CAPS {i.name} {diag.path_of(files, i.span.file)} {i.span.lo} {i.span.hi} [{caps.join(",")}] {i.callbacks}{shares}{cond}{libs}")
+        let via = match i.callbacks_via {
+            Some(p) => " via=" + p,
+            None => "",
+        }
+        out.print("CAPS {i.name} {diag.path_of(files, i.span.file)} {i.span.lo} {i.span.hi} [{caps.join(",")}] {i.callbacks}{via}{shares}{cond}{libs}")
     }
     for i in c.items {
         out.print(ast_print.item_line(i))

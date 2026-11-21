@@ -1,0 +1,53 @@
+// Functions in struct fields and enum payloads: a method value and a
+// closure capturing a list stored in a struct, a recursive enum of
+// closures, and a field called as `(h.on_get)(p)`. A function taking a
+// struct that holds a function runs callbacks, so its calls are neither
+// reused nor kept across a loop, nor merged within a block. It prints
+// srv: /, missing /x ["a", "b"], 20, then called four times.
+struct Server {
+    name: Str,
+}
+
+fn handle(self: Server, path: Str) -> Str {
+    "{self.name}: {path}"
+}
+
+struct Handlers {
+    on_get: fn(Str) -> Str,
+    on_missing: fn(Str) -> Str,
+}
+
+enum Chain {
+    Link(fn(Int) -> Int, Chain),
+    End,
+}
+
+fn apply(c: Chain, x: Int) -> Int {
+    match c {
+        Link(f, rest) => apply(rest, f(x)),
+        End => x,
+    }
+}
+
+fn shout(h: Handlers, p: Str) -> Str {
+    (h.on_get)(p).to_upper()
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let tags = ["a", "b"]
+    let srv = Server { name: "srv" }
+    let h = Handlers { on_get: srv.handle, on_missing: |p| "missing {p} {tags}" }
+    out.print((h.on_get)("/"))
+    out.print((h.on_missing)("/x"))
+    out.print("{apply(Link(|x| x + 1, Link(|x| x * 10, End)), 1)}")
+    let loud = Handlers { on_get: |p| {
+        out.print("called")
+        p
+    }, on_missing: |p| p }
+    for _ in 0..<2 {
+        let _ = shout(loud, "x")
+    }
+    let _ = shout(loud, "x")
+    let _ = shout(loud, "x")
+}

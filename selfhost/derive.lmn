@@ -601,7 +601,12 @@ pub fn expand(json: Option[Str], rows: List[Str], items: List[ast.Item], c: type
                                 },
                                 Err(f) => {
                                     g = f.g
-                                    diags.push(no_form(g, e, what, t, f.what, "JSON"))
+                                    // a function held through a struct's fields is named by its path
+                                    let inner = match g.subst.fn_via(t) {
+                                        Some(p) if f.what == "a function" => "a function through `{p}`",
+                                        _ => f.what,
+                                    }
+                                    diags.push(no_form(g, e, what, t, inner, "JSON"))
                                 },
                             },
                         }

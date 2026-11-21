@@ -1,0 +1,66 @@
+// Functions can be stored in struct and enum fields, recursive ones and
+// generic ones' type arguments included, and E0304 is no longer reported.
+// A type holding a function through its fields is treated as holding one
+// everywhere, and the messages name the path: no `==` (E0201, also through
+// `assert_eq`, `contains` and a generic function that compares), no `dyn`
+// (E0112, also as an error converted to `dyn Error`), no map key (E0113,
+// and E0111 through `Key`), and a function taking one runs callbacks, via
+// the field.
+struct Route {
+    run: fn(),
+}
+
+struct App {
+    routes: List[Route],
+}
+
+enum Chain {
+    Link(fn() -> Int, Chain),
+    End,
+}
+
+struct Box[T] {
+    item: T,
+}
+
+interface Named {
+    fn name(self) -> Str
+}
+
+fn name(self: App) -> Str {
+    "app"
+}
+
+fn keyed[K: Key](k: K) -> Int {
+    1
+}
+
+fn same[U](a: U, b: U) -> Bool {
+    a == b
+}
+
+fn serve(a: App) {
+    for r in a.routes {
+        (r.run)()
+    }
+}
+
+fn convert(a: App) -> Result[Int, dyn Error] {
+    let r: Result[Int, App] = Err(a)
+    let n = r?
+    Ok(n)
+}
+
+fn main(root: Root) {
+    let a = App { routes: [] }
+    let _ = a == a
+    let d: dyn Named = App { routes: [] }
+    let m: Map[App, Int] = map()
+    let _ = keyed(a)
+    let _ = same(a, a)
+    assert_eq(a, a)
+    let _ = [a].contains(a)
+    let c = Link(|| 1, End)
+    let b = Box { item: || 1 }
+    serve(a)
+}

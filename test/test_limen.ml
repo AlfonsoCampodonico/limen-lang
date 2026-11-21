@@ -364,6 +364,8 @@ fn main(root: Root) {
     out.print("{apply(Link(|x| x + 1, Link(|x| x * 10, End)), 1)}")
     let loud = Handlers { on_get: |p| { out.print("called"); p }, on_missing: |p| p }
     for _ in 0..<2 { let _ = shout(loud, "x") }
+    let _ = shout(loud, "x")
+    let _ = shout(loud, "x")
 }
 |}
 
@@ -2359,7 +2361,7 @@ fn main(root: Root) {
     (deep ^ "fn keyed[K: Key](k: K) -> Int { 1 }\nfn main(root: Root) { let a = App { routes: [] }\n let _ = keyed(a) }")
     "E0111" "`App` (it holds a function through `App.routes.run`) cannot be a map key";
   out "fn-field-table" fn_field_table
-    "srv: /\nmissing /x [\"a\", \"b\"]\n20\ncalled\ncalled\n";
+    "srv: /\nmissing /x [\"a\", \"b\"]\n20\ncalled\ncalled\ncalled\ncalled\n";
   errs "fn-field-json" (deep ^ "use json\nfn main(root: Root) { let _ = json.encode(App { routes: [] }) }") [ "E0212" ];
   says "fn-field-json-says" (deep ^ "use json\nfn main(root: Root) { let _ = json.encode(App { routes: [] }) }") "E0212" "`App.routes.run`";
   errs "fn-field-recursive" "enum Chain { Link(fn() -> Int, Chain), End }\nfn main(root: Root) { let c = Link(|| 1, End) }" [];

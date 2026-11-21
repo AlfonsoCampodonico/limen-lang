@@ -1,6 +1,6 @@
 // What a type holding a capability cannot do: become `dyn` (E0112, also
 // as an error converted to `dyn Error`), be a map key (E0113), be compared
-// (E0201). Channels and functions still cannot be stored (E0305, E0304).
+// (E0201). Channels still cannot be stored (E0305); functions can.
 struct Client {
     net: Net,
     name: Str,

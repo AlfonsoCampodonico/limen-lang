@@ -1,8 +1,9 @@
-// Shared state and functions cannot hide in a generic struct or enum: a
-// type argument is what a field holds, so it is refused where the type is
-// made or written (E0305, E0304), however deep; Option, Result, lists and
-// tuples hold values. Equality and interpolation look as deep (E0201), and
-// a function taking a channel, Atomic or Shared is not pure.
+// Shared state cannot hide in a generic struct or enum: a type argument
+// is what a field holds, so it is refused where the type is made or
+// written (E0305), however deep; Option, Result, lists and tuples hold
+// values. A function can be a type argument as it can be a field.
+// Equality and interpolation look as deep (E0201), and a function taking a
+// channel, Atomic or Shared is not pure.
 struct Box[T] {
     item: T,
 }

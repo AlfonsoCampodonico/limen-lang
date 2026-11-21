@@ -1,0 +1,15 @@
+// A struct holding a function through its fields has no JSON form, and
+// E0212 names the path to the function.
+use json
+
+struct Route {
+    run: fn(),
+}
+
+struct App {
+    routes: List[Route],
+}
+
+fn main(root: Root) {
+    let _ = json.encode(App { routes: [] })
+}

@@ -330,7 +330,11 @@ fn coerce(st: env.State, cx: env.Cx, e: ast.Expr, t: types.Ty, b: env.Bound) -> 
                 return st.report(d)
             }
             if st.subst.has_fn(ct) || st.subst.has_chan(ct) {
-                let d = diag.error("E0112", e.span, "`{st.show(ct)}` holds a function or channel, so it cannot become `dyn {bn}`").note("a function or channel could carry authority out of sight; pass it with a type parameter, as in `[T: " + bn + "]`")
+                let message = match st.holds_fn_through(ct) {
+                    Some(h) => "{h}, so it cannot become `dyn {bn}`",
+                    None => "`{st.show(ct)}` holds a function or channel, so it cannot become `dyn {bn}`",
+                }
+                let d = diag.error("E0112", e.span, message).note("a function or channel could carry authority out of sight; pass it with a type parameter, as in `[T: " + bn + "]`")
                 return st.report(d)
             }
             match satisfies(st, cx, ct, b) {
@@ -602,8 +606,10 @@ fn instantiate(st: env.State, s: env.Sig) -> (List[(Str, types.Ty)], types.Ty, e
 pub fn refuse_compare(st: env.State, sp: ast.Span, name: Str, t: types.Ty) -> env.State {
     let t = st.repr(t)
     match st.subst.refused(env.equality(), t) {
-        Some(Itself) => st.report(diag.error("E0201", sp, "`{name}` compares values, and values of type `{st.show(t)}` cannot be compared")),
-        Some(Inside(u)) => st.report(diag.error("E0201", sp, "`{name}` compares values, and {st.holds_uncomparable(t, u)}")),
+        Some(found) => match st.uncomparable(t, found) {
+            Some(why) => st.report(diag.error("E0201", sp, "`{name}` compares values, and {why}")),
+            None => st.report(diag.error("E0201", sp, "`{name}` compares values, and values of type `{st.show(t)}` cannot be compared")),
+        },
         None => match st.held(t) {
             Some(h) => st.report(diag.error("E0201", sp, "`{name}` compares values, and {h}").note("capabilities have no equality, so neither has a value holding one; compare something it holds that is not a capability, as in `xs.any(|x| x.name == name)`")),
             None => st,
@@ -917,8 +923,8 @@ fn builtin_call(st: env.State, cx: env.Cx, fx: env.Fx, n: Str, args: List[ast.Ex
                     let (t, next) = check_expr(st, cx, fx, a)
                     let next = expect(next, cx, fx, b, t)
                     match next.subst.refused(env.equality(), t) {
-                        Some(Itself) => next.report(diag.error("E0201", sp, "values of type `{next.show(t)}` cannot be compared")),
-                        Some(Inside(_)) | None => {
+                        Some(Itself) if next.uncomparable(t, Itself).is_none() => next.report(diag.error("E0201", sp, "values of type `{next.show(t)}` cannot be compared")),
+                        Some(_) | None => {
                             let mut next = next
                             next.eq_types = [t] + next.eq_types
                             refuse_compare(next, sp, "assert_eq", t)
@@ -1966,7 +1972,7 @@ fn error_conversion(st: env.State, cx: env.Cx, e: types.Ty) -> (Option[Str], env
                 None => {},
             }
             if st.subst.has_fn(ct) || st.subst.has_chan(ct) {
-                return (Some("`{st.show(ct)}` holds a function or channel"), st)
+                return (Some(st.holds_fn_through(ct) ?? "`{st.show(ct)}` holds a function or channel"), st)
             }
             satisfies(st, cx, ct, env.Bound { iface: "Error", args: [] })
         },
@@ -2200,8 +2206,10 @@ fn check_bin(st: env.State, cx: env.Cx, fx: env.Fx, op: ast.BinOp, a: ast.Expr, 
                     let mut st = st
                     st.eq_types = [t] + st.eq_types
                     match st.subst.refused(env.equality(), t) {
-                        Some(Itself) => (TBool, bad(st)),
-                        Some(Inside(u)) => (TBool, st.report(diag.error("E0201", sp, "operator `{op_name(op)}` cannot be applied to `{st.show(t)}`").note(st.holds_uncomparable(t, u)))),
+                        Some(found) => match st.uncomparable(t, found) {
+                            Some(why) => (TBool, st.report(diag.error("E0201", sp, "operator `{op_name(op)}` cannot be applied to `{st.show(t)}`").note(why))),
+                            None => (TBool, bad(st)),
+                        },
                         // capabilities have no equality, so neither has a value holding one
                         None => match st.held(t) {
                             Some(h) => (TBool, st.report(diag.error("E0201", sp, "operator `{op_name(op)}` cannot be applied to `{st.show(t)}`").note(h + ", and capabilities cannot be compared"))),
