@@ -840,7 +840,11 @@ W_RT void w_frame_init(void **frame, WFiber *f);
 #else
 #define W_ASM_SYM(s) #s
 #endif
-#define W_FRAME_WORDS 8
+/* six saved registers and the return address. Odd on purpose: after
+   w_ctx_switch's ret into w_ctx_tramp, %rsp must be 16-byte aligned, as
+   before any call, so w_fiber_main starts with the stack the ABI promises
+   (with 8 it was 8 bytes off, and aligned SSE stores on the stack faulted) */
+#define W_FRAME_WORDS 7
 W_RT void w_frame_init(void **frame, WFiber *f);
 #else
 #error "Limen fibers need arm64 or x86_64"
