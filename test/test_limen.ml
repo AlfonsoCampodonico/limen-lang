@@ -2320,6 +2320,73 @@ fn main(root: Root) {
 }
 |}
     "13888893 Cons(999999, Cons( 3400017 3688901 4200019\ntrue false true true false true\n[1000000, 1, 1, 4]\n4\n";
+  (* Ordering, sorting, hashing a map key and json.encode on a value as deep
+     as it is long, inside tasks: these recursed once per node too. The
+     tuples check that the deep part decides before a later field does. *)
+  out "deep-walks"
+    {|use json
+enum L { Cons(Int, L), Nil }
+struct K { l: L, n: Int }
+fn build(n: Int, last: Int) -> L {
+    let mut l = Cons(last, Nil)
+    let mut i = 1
+    while i < n {
+        l = Cons(i, l)
+        i = i + 1
+    }
+    l
+}
+fn tail(l: L) -> Int {
+    let mut cur = l
+    let mut last = -1
+    let mut going = true
+    while going {
+        match cur {
+            Cons(x, rest) => {
+                last = x
+                cur = rest
+            }
+            Nil => { going = false }
+        }
+    }
+    last
+}
+fn orders(n: Int) -> Str {
+    let a = build(n, 0)
+    let b = build(n, 1)
+    let s = [b, build(n, 2), a, build(n, 0)].sort()
+    let t = [(b, 0), (a, 9), (a, 1)].sort()
+    let firsts = "{tail(s[0])}{tail(s[1])}{tail(s[2])}{tail(s[3])} {tail(t[0].0)}{t[0].1}{t[1].1}{t[2].1}"
+    "{a < b} {b < a} {a <= build(n, 0)} {a < build(n, 0)} {build(n - 1, 0) < a} {(a, 9) < (b, 0)} {(a, 1) < (a, 0)} {[a, a] < [a, b]} {firsts}"
+}
+fn keys(n: Int) -> Str {
+    let mut m: Map[L, Int] = map()
+    m[build(n, 0)] = 1
+    m[build(n, 1)] = 2
+    m[build(n, 0)] = 3
+    let mut k: Map[K, Int] = map()
+    k[K { l: build(n, 0), n: 1 }] = 4
+    let mut p: Map[(Int, L), Int] = map()
+    p[(1, build(n, 1))] = 5
+    "{m.len()} {m[build(n, 0)]} {m[build(n, 1)]} {m.get(build(n, 2))} {k[K { l: build(n, 0), n: 1 }]} {k.get(K { l: build(n, 0), n: 2 })} {p[(1, build(n, 1))]}"
+}
+fn encodes(n: Int) -> Str {
+    let mut v = json.Int(7)
+    for _ in 0..<n { v = json.Arr([v, json.Null]) }
+    let s = json.encode(v)
+    "{s.len()} {s.slice(0, 4)} {s.slice(s.len() - 12, s.len())}"
+}
+fn main(root: Root) {
+    let n = 1000000
+    let r = group g {
+        g.go(|| orders(n))
+        g.go(|| keys(n))
+        g.go(|| encodes(n))
+    }
+    for line in r { root.stdout.print(line) }
+}
+|}
+    "true false true false true true false true 0012 0190\n2 3 2 None 4 None 5\n7000001 [[[[ ,null],null]\n";
   (* Recursion deeper than a task's stack: natively a message and status 1,
      not a silent crash (the interpreter's stack is larger) *)
   if native_for "stack-overflow" && selected "stack-overflow" then

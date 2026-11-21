@@ -209,7 +209,19 @@ W_RT void buf_escaped(WBuf *b, WStr *s);
      needs a real answer, so it holds the stack (w_eq_hold) while it looks.
    - w_show(b, f, v, i): f writes v to b. An object put on the stack is
      written later; the text written after it in the meantime is moved to a
-     second stack and written back after it, so the output is the same. */
+     second stack and written back after it, so the output is the same.
+   - w_cmp(f, a, b, i): f orders two objects (negative, zero, positive),
+     resuming at i as w_eq's does. An object put on the stack counts as
+     equal for now and is ordered later, in the order the recursion would
+     have taken. A difference found after something was put on the stack in
+     the same step comes later in that order, so it goes on the stack too, as
+     an answer (w_cmp_res), and the first difference off the stack decides.
+   - w_hash(f, o): f hashes o from part i on, starting from h. A hash needs
+     its parts' hashes, so when a part goes on the stack, every call waiting
+     for it goes on the stack too (w_hash_wait), with the hash so far, and
+     each resumes once the part below it is done. The hash is the same as
+     the recursion's. Parts are passed by address, so a struct's address
+     must outlive the walk: the public X_hash always starts a fresh one. */
 #define W_DEEP 32
 typedef bool (*WEqFn)(void *, void *, int64_t);
 typedef void (*WShowFn)(WBuf *, void *, int64_t);
@@ -242,6 +254,36 @@ static inline void w_show(WBuf *b, WShowFn f, void *v, int64_t i) {
   if (__builtin_expect(w_show_buf == b && w_show_depth < W_DEEP, 1)) { w_show_depth++; f(b, v, i); w_show_depth--; }
   else if (w_show_buf != b) w_show_outer(b, f, v, i);
   else w_show_push(b, f, v, i);
+}
+typedef int (*WCmpFn)(void *, void *, int64_t);
+typedef uint64_t (*WHashFn)(void *, int64_t, uint64_t);
+extern __thread int w_cmp_busy, w_cmp_depth;
+extern __thread int64_t w_cmp_n, w_cmp_base;
+extern __thread int w_hash_busy, w_hash_depth, w_hash_susp;
+W_RT int w_cmp_outer(WCmpFn f, void *a, void *b, int64_t i);
+W_RT void w_cmp_push(WCmpFn f, void *a, void *b, int64_t i);
+W_RT uint64_t w_hash_outer(WHashFn f, void *o);
+W_RT void w_hash_push(WHashFn f, void *o);
+W_RT void w_hash_wait(WHashFn f, void *o, int64_t i, uint64_t h);
+static inline int w_cmp(WCmpFn f, void *a, void *b, int64_t i) {
+  if (__builtin_expect(w_cmp_busy && w_cmp_depth < W_DEEP, 1)) { w_cmp_depth++; int r = f(a, b, i); w_cmp_depth--; return r; }
+  if (!w_cmp_busy) return w_cmp_outer(f, a, b, i);
+  w_cmp_push(f, a, b, i);
+  return 0;
+}
+/* r, a difference just found: the answer now, or on the stack if something
+   before it in the order is still to come */
+static inline int w_cmp_res(int r) {
+  if (__builtin_expect(w_cmp_n == w_cmp_base, 1)) return r;
+  w_cmp_push(NULL, NULL, NULL, r);
+  return 0;
+}
+#define W_HASH_SEED 0x2545F4914F6CDD1DULL
+static inline uint64_t w_hash(WHashFn f, void *o) {
+  if (__builtin_expect(w_hash_busy && w_hash_depth < W_DEEP, 1)) { w_hash_depth++; uint64_t h = f(o, 0, W_HASH_SEED); w_hash_depth--; return h; }
+  if (!w_hash_busy) return w_hash_outer(f, o);
+  w_hash_push(f, o);
+  return 0;
 }
 
 #define Int_dup(x) (x)
@@ -606,6 +648,7 @@ __attribute__((noreturn)) W_RT void w_panic_key(WBuf *key, const char *where);
     (void)from;                                                                               \
     for (int64_t i = 0; i < a->n; i++)                                                        \
       if (a->live[i]) {                                                                       \
+        /* a key lookup needs a real answer: its own == starts a fresh walk */                \
         int h = w_eq_hold(); V *w = M##_get(b, a->keys[i]); w_eq_resume(h);                   \
         if (!w || !VN##_eq(a->vals[i], *w)) return false;                                     \
       }                                                                                       \

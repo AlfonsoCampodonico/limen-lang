@@ -3022,36 +3022,150 @@ fn value_fns(self: Cg, t: types.Ty) -> (List[Str], Cg) {
     (out, c)
 }
 
+// Part j of the key type `n`, at `x`, in its _hash_k
+fn hash_part(self: Cg, n: Str, j: Int, e: types.Ty, x: Str) -> (List[Str], Cg) {
+    let (hp, c) = self.hash_prefix(e)
+    if c.flat(e) {
+        return (["  if (i <= {j}) h = w_hash_mix(h, {hp}_hash({x}));"], c)
+    }
+    let amp = if c.is_boxed(e) { "" } else { "&" }
+    let lines = [
+        "  if (i <= {j}) \{",
+        "    uint64_t k_ = w_hash({hp}_hash_k, {amp}{x});",
+        "    if (w_hash_susp) \{ w_hash_wait({n}_hash_k, o, {j}, h); return 0; }",
+        "    h = w_hash_mix(h, k_);",
+        "  }",
+    ]
+    (lines, c)
+}
+
+// An item of the list or boxed enum `n`, inside a block: when it put
+// something on the stack, the rest goes on after it, from item `next`
+// (empty: nothing follows)
+fn cmp_item(self: Cg, n: Str, e: types.Ty, x: Str, y: Str, next: Str) -> (List[Str], Cg) {
+    let (cp, c) = self.cmp_prefix(e)
+    let deep = next != "" && !c.flat(e)
+    let mut lines: List[Str] = []
+    if deep {
+        lines.push("    int64_t m_ = w_cmp_n;")
+    }
+    lines.push("    int r_ = {cp}_cmp({x}, {y}); if (r_) return w_cmp_res(r_);")
+    if deep {
+        lines.push("    if (w_cmp_n != m_) \{ w_cmp_push({n}_cmp_k, a, b, {next}); return 0; }")
+    }
+    (lines, c)
+}
+
+// A type is flat when no enum that holds itself is inside it, so its
+// values are only so deep: its order and hash are plain recursion. Any
+// other goes through w_cmp and w_hash (limen_rt.h): a list or boxed enum
+// orders from item i on, so it can go on the stack and resume there, and a
+// key hashes from part i on.
+fn flat(self: Cg, t: types.Ty) -> Bool {
+    self.flat_in(t, [])
+}
+
+fn flat_in(self: Cg, t: types.Ty, seen: List[Str]) -> Bool {
+    match t {
+        TInt | TFloat | TStr | TBytes | TBool | TUnit | TUInt(_) => true,
+        TList(e) | TArray(e, _) => self.flat_in(e, seen),
+        TNamed(..) => {
+            let n = show(t)
+            if seen.contains(n) || self.is_boxed(t) {
+                return false
+            }
+            for e in self.parts(t) {
+                if !self.flat_in(e, seen + [n]) {
+                    return false
+                }
+            }
+            true
+        },
+        _ => true,
+    }
+}
+
 // Order functions, item by item as the interpreter compares; and hash
 // functions for tuple, struct and enum map keys.
 fn cmp_defs(self: Cg) -> (List[Str], Cg) {
     let mut c = self
     let mut out: List[Str] = []
     for t in c.hash_tys {
+        if !c.flat(t) {
+            let (n, c1) = c.cname(t)
+            c = c1
+            out.push("static uint64_t {n}_hash_k(void* o, int64_t i, uint64_t h);")
+        }
+    }
+    for t in c.hash_tys {
         let (n, c1) = c.cname(t)
         let (ct, c2) = c1.ctype(t)
         c = c2
         out.push("static uint64_t {n}_hash({ct} v) \{")
-        out.push("  uint64_t h = 0x2545F4914F6CDD1DULL; (void)v;")
+        if c.flat(t) {
+            out.push("  uint64_t h = 0x2545F4914F6CDD1DULL; (void)v;")
+            if c.is_enum(t) {
+                let acc = acc_of(c.is_boxed(t))
+                out.push("  h = w_hash_mix(h, Int_hash(v{acc}tag));")
+                out.push("  switch (v{acc}tag) \{")
+                for (k, v) in c.variants_of(t).with_index() {
+                    out.push("    case {k}:")
+                    for (i, pt) in v.1.with_index() {
+                        let (hp, c3) = c.hash_prefix(pt)
+                        c = c3
+                        out.push("  h = w_hash_mix(h, {hp}_hash(v{acc}u.v{k}.f{i}));")
+                    }
+                    out.push("      break;")
+                }
+                out.push("  }")
+            } else {
+                for (i, f) in c.fields_of(t).with_index() {
+                    let (hp, c3) = c.hash_prefix(f.1)
+                    c = c3
+                    out.push("  h = w_hash_mix(h, {hp}_hash(v.f{i}));")
+                }
+            }
+            out.push("  return h;")
+        } else {
+            let arg = if c.is_boxed(t) { "v" } else { "&v" }
+            out.push("  return w_hash_outer({n}_hash_k, {arg});")
+        }
+        out.push("}")
+    }
+    // the kids of the keys that are not flat, after every _hash
+    for t in c.hash_tys {
+        if c.flat(t) {
+            continue
+        }
+        let (n, c1) = c.cname(t)
+        let (ct, c2) = c1.ctype(t)
+        c = c2
+        out.push("static uint64_t {n}_hash_k(void* o, int64_t i, uint64_t h) \{")
+        if c.is_boxed(t) {
+            out.push("  {ct} v = ({ct})o;")
+        } else {
+            out.push("  {ct}* v = ({ct}*)o;")
+        }
+        // part j: a flat one is hashed at once; any other through w_hash,
+        // and if it went on the stack, this call waits for it there
         if c.is_enum(t) {
-            let acc = acc_of(c.is_boxed(t))
-            out.push("  h = w_hash_mix(h, Int_hash(v{acc}tag));")
-            out.push("  switch (v{acc}tag) \{")
+            out.push("  if (i <= 0) h = w_hash_mix(h, Int_hash(v->tag));")
+            out.push("  switch (v->tag) \{")
             for (k, v) in c.variants_of(t).with_index() {
                 out.push("    case {k}:")
                 for (i, pt) in v.1.with_index() {
-                    let (hp, c3) = c.hash_prefix(pt)
+                    let (lines, c3) = c.hash_part(n, i + 1, pt, "v->u.v{k}.f{i}")
                     c = c3
-                    out.push("  h = w_hash_mix(h, {hp}_hash(v{acc}u.v{k}.f{i}));")
+                    out = out + lines
                 }
                 out.push("      break;")
             }
             out.push("  }")
         } else {
             for (i, f) in c.fields_of(t).with_index() {
-                let (hp, c3) = c.hash_prefix(f.1)
+                let (lines, c3) = c.hash_part(n, i, f.1, "v->f{i}")
                 c = c3
-                out.push("  h = w_hash_mix(h, {hp}_hash(v.f{i}));")
+                out = out + lines
             }
         }
         out.push("  return h;")
@@ -3067,6 +3181,50 @@ fn cmp_defs(self: Cg) -> (List[Str], Cg) {
         let (n, c1) = c.cname(t)
         let (ct, c2) = c1.ctype(t)
         c = c2
+        let fl = c.flat(t)
+        // a difference: as it is in a flat type, else through w_cmp_res
+        let ret = if fl { "r_" } else { "w_cmp_res(r_)" }
+        let kids = match t {
+            TList(_) => !fl,
+            _ => !fl && c.is_enum(t) && c.is_boxed(t),
+        }
+        if kids {
+            out.push("static int {n}_cmp_k(void* pa, void* pb, int64_t i) \{")
+            out.push("  {ct} a = ({ct})pa;")
+            out.push("  {ct} b = ({ct})pb;")
+            match t {
+                TList(e) => {
+                    out.push("  int64_t n_ = a->len < b->len ? a->len : b->len;")
+                    out.push("  for (; i < n_; i++) \{")
+                    let (lines, c3) = c.cmp_item(n, e, "a->data[i]", "b->data[i]", "i + 1")
+                    c = c3
+                    out = out + lines
+                    out.push("  }")
+                    out.push("  return a->len == b->len ? 0 : w_cmp_res(a->len < b->len ? -1 : 1);")
+                },
+                _ => {
+                    out.push("  if (a->tag != b->tag) return w_cmp_res(a->tag < b->tag ? -1 : 1);")
+                    out.push("  switch (a->tag) \{")
+                    for (k, v) in c.variants_of(t).with_index() {
+                        out.push("    case {k}:")
+                        for (i, pt) in v.1.with_index() {
+                            let next = if i < v.1.len() - 1 { "{i + 1}" } else { "" }
+                            out.push("  if (i <= {i}) \{")
+                            let (lines, c3) = c.cmp_item(n, pt, "a->u.v{k}.f{i}", "b->u.v{k}.f{i}", next)
+                            c = c3
+                            out = out + lines
+                            out.push("  }")
+                        }
+                        out.push("      break;")
+                    }
+                    out.push("  }")
+                    out.push("  return 0;")
+                },
+            }
+            out.push("}")
+            out.push("static int {n}_cmp({ct} a, {ct} b) \{ return w_cmp({n}_cmp_k, a, b, 0); }")
+            continue
+        }
         out.push("static int {n}_cmp({ct} a, {ct} b) \{")
         out.push("  (void)a; (void)b;")
         match t {
@@ -3075,26 +3233,28 @@ fn cmp_defs(self: Cg) -> (List[Str], Cg) {
                 out.push("  for (int64_t i = 0; i < n_; i++)")
                 let (cp, c3) = c.cmp_prefix(e)
                 c = c3
-                out.push("  \{ int r_ = {cp}_cmp(a->data[i], b->data[i]); if (r_) return r_; }")
+                out.push("  \{ int r_ = {cp}_cmp(a->data[i], b->data[i]); if (r_) return {ret}; }")
                 out.push("  return a->len < b->len ? -1 : a->len > b->len;")
             },
             TArray(e, TLen(k)) => {
                 out.push("  for (int64_t i = 0; i < {k}; i++)")
                 let (cp, c3) = c.cmp_prefix(e)
                 c = c3
-                out.push("  \{ int r_ = {cp}_cmp(a.a[i], b.a[i]); if (r_) return r_; }")
+                out.push("  \{ int r_ = {cp}_cmp(a.a[i], b.a[i]); if (r_) return {ret}; }")
                 out.push("  return 0;")
             },
             _ => if c.is_enum(t) {
                 let acc = acc_of(c.is_boxed(t))
-                out.push("  if (a{acc}tag != b{acc}tag) return a{acc}tag < b{acc}tag ? -1 : 1;")
+                let diff = "a{acc}tag < b{acc}tag ? -1 : 1"
+                let r = if fl { diff } else { "w_cmp_res({diff})" }
+                out.push("  if (a{acc}tag != b{acc}tag) return {r};")
                 out.push("  switch (a{acc}tag) \{")
                 for (k, v) in c.variants_of(t).with_index() {
                     out.push("    case {k}:")
                     for (i, pt) in v.1.with_index() {
                         let (cp, c3) = c.cmp_prefix(pt)
                         c = c3
-                        out.push("  \{ int r_ = {cp}_cmp(a{acc}u.v{k}.f{i}, b{acc}u.v{k}.f{i}); if (r_) return r_; }")
+                        out.push("  \{ int r_ = {cp}_cmp(a{acc}u.v{k}.f{i}, b{acc}u.v{k}.f{i}); if (r_) return {ret}; }")
                     }
                     out.push("      break;")
                 }
@@ -3104,7 +3264,7 @@ fn cmp_defs(self: Cg) -> (List[Str], Cg) {
                 for (i, f) in c.fields_of(t).with_index() {
                     let (cp, c3) = c.cmp_prefix(f.1)
                     c = c3
-                    out.push("  \{ int r_ = {cp}_cmp(a.f{i}, b.f{i}); if (r_) return r_; }")
+                    out.push("  \{ int r_ = {cp}_cmp(a.f{i}, b.f{i}); if (r_) return {ret}; }")
                 }
                 out.push("  return 0;")
             },

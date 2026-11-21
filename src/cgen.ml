@@ -1938,35 +1938,150 @@ let rec type_defs c (out : Buffer.t) =
   cmp_defs c p
 
 (* Order functions: item by item, as Interp.compare_v; and hash functions
-   for tuple, struct and enum map keys. *)
+   for tuple, struct and enum map keys. A type is flat when no enum that
+   holds itself is inside it, so its values are only so deep: its order and
+   hash are plain recursion. Any other goes through w_cmp and w_hash
+   (limen_rt.h): a list or boxed enum orders from item i on, so it can go on
+   the stack and resume there, and a key hashes from part i on. *)
+and flat c t =
+  let rec go seen t =
+    match t with
+    | TInt | TFloat | TStr | TBytes | TBool | TUnit | TUInt _ -> true
+    | TList e | TArray (e, _) -> go seen e
+    | TNamed _ ->
+      let n = cname c t in
+      (not (List.mem n seen)) && (not (is_boxed c t))
+      &&
+      let seen = n :: seen in
+      if is_enum c t then List.for_all (fun (_, ps) -> List.for_all (go seen) ps) (Lower.variants c.g t)
+      else List.for_all (fun (_, ft) -> go seen ft) (Lower.field_types c.g t)
+    | _ -> true
+  in
+  go [] t
+
 and cmp_defs c p =
+  List.iter (fun t -> if not (flat c t) then p (sprintf "static uint64_t %s_hash_k(void* o, int64_t i, uint64_t h);" (cname c t))) c.hash_tys;
   List.iter
     (fun t ->
       let n = cname c t and ct = ctype c t in
-      let item e x = p (sprintf "  h = w_hash_mix(h, %s_hash(%s));" (hash_prefix c e) x) in
       p (sprintf "static uint64_t %s_hash(%s v) {" n ct);
-      p "  uint64_t h = 0x2545F4914F6CDD1DULL; (void)v;";
-      (match t with
-       | TNamed _ when is_enum c t ->
-         let acc = if is_boxed c t then "->" else "." in
-         p (sprintf "  h = w_hash_mix(h, Int_hash(v%stag));" acc);
-         p (sprintf "  switch (v%stag) {" acc);
-         List.iteri
-           (fun k (_, ps) ->
-             p (sprintf "    case %d:" k);
-             List.iteri (fun i pt -> item pt (sprintf "v%su.v%d.f%d" acc k i)) ps;
-             p "      break;")
-           (Lower.variants c.g t);
-         p "  }"
-       | _ -> List.iteri (fun i (_, ft) -> item ft (sprintf "v.f%d" i)) (Lower.field_types c.g t));
-      p "  return h;";
-      p "}")
+      if flat c t then begin
+        let item e x = p (sprintf "  h = w_hash_mix(h, %s_hash(%s));" (hash_prefix c e) x) in
+        p "  uint64_t h = 0x2545F4914F6CDD1DULL; (void)v;";
+        (match t with
+         | TNamed _ when is_enum c t ->
+           let acc = if is_boxed c t then "->" else "." in
+           p (sprintf "  h = w_hash_mix(h, Int_hash(v%stag));" acc);
+           p (sprintf "  switch (v%stag) {" acc);
+           List.iteri
+             (fun k (_, ps) ->
+               p (sprintf "    case %d:" k);
+               List.iteri (fun i pt -> item pt (sprintf "v%su.v%d.f%d" acc k i)) ps;
+               p "      break;")
+             (Lower.variants c.g t);
+           p "  }"
+         | _ -> List.iteri (fun i (_, ft) -> item ft (sprintf "v.f%d" i)) (Lower.field_types c.g t));
+        p "  return h;";
+        p "}"
+      end
+      else begin
+        let boxed = is_boxed c t in
+        p (sprintf "  return w_hash_outer(%s_hash_k, %s);" n (if boxed then "v" else "&v"));
+        p "}"
+      end)
+    c.hash_tys;
+  (* the kids of the keys that are not flat, after every _hash *)
+  List.iter
+    (fun t ->
+      if not (flat c t) then begin
+        let n = cname c t and ct = ctype c t in
+        let boxed = is_boxed c t in
+        (* part j: a flat one is hashed at once; any other through w_hash, and
+           if it went on the stack, this call waits for it there *)
+        let item j e x =
+          if flat c e then p (sprintf "  if (i <= %d) h = w_hash_mix(h, %s_hash(%s));" j (hash_prefix c e) x)
+          else begin
+            let hp = hash_prefix c e in
+            p (sprintf "  if (i <= %d) {" j);
+            p (sprintf "    uint64_t k_ = w_hash(%s_hash_k, %s%s);" hp (if is_boxed c e then "" else "&") x);
+            p (sprintf "    if (w_hash_susp) { w_hash_wait(%s_hash_k, o, %d, h); return 0; }" n j);
+            p "    h = w_hash_mix(h, k_);";
+            p "  }"
+          end
+        in
+        p (sprintf "static uint64_t %s_hash_k(void* o, int64_t i, uint64_t h) {" n);
+        if boxed then p (sprintf "  %s v = (%s)o;" ct ct) else p (sprintf "  %s* v = (%s*)o;" ct ct);
+        (match t with
+         | TNamed _ when is_enum c t ->
+           p "  if (i <= 0) h = w_hash_mix(h, Int_hash(v->tag));";
+           p "  switch (v->tag) {";
+           List.iteri
+             (fun k (_, ps) ->
+               p (sprintf "    case %d:" k);
+               List.iteri (fun i pt -> item (i + 1) pt (sprintf "v->u.v%d.f%d" k i)) ps;
+               p "      break;")
+             (Lower.variants c.g t);
+           p "  }"
+         | _ -> List.iteri (fun i (_, ft) -> item i ft (sprintf "v->f%d" i)) (Lower.field_types c.g t));
+        p "  return h;";
+        p "}"
+      end)
     c.hash_tys;
   List.iter (fun t -> p (sprintf "static int %s_cmp(%s a, %s b);" (cname c t) (ctype c t) (ctype c t))) c.cmp_tys;
   List.iter
     (fun t ->
       let n = cname c t and ct = ctype c t in
-      let item e x y = p (sprintf "  { int r_ = %s_cmp(%s, %s); if (r_) return r_; }" (cmp_prefix c e) x y) in
+      let fl = flat c t in
+      (* a difference: as it is in a flat type, else through w_cmp_res *)
+      let ret = if fl then "r_" else "w_cmp_res(r_)" in
+      let item e x y = p (sprintf "  { int r_ = %s_cmp(%s, %s); if (r_) return %s; }" (cmp_prefix c e) x y ret) in
+      (* item j of a list or boxed enum, inside a block: when it put
+         something on the stack, the rest goes on after it, from item next *)
+      let cursor e x y next =
+        p (sprintf "    int r_ = %s_cmp(%s, %s); if (r_) return w_cmp_res(r_);" (cmp_prefix c e) x y);
+        match next with
+        | Some j when not (flat c e) -> p (sprintf "    if (w_cmp_n != m_) { w_cmp_push(%s_cmp_k, a, b, %s); return 0; }" n j)
+        | _ -> ()
+      in
+      let mark e next = if next <> None && not (flat c e) then p "    int64_t m_ = w_cmp_n;" in
+      match t with
+      | TList e when not fl ->
+        p (sprintf "static int %s_cmp_k(void* pa, void* pb, int64_t i) {" n);
+        p (sprintf "  %s a = (%s)pa;" ct ct);
+        p (sprintf "  %s b = (%s)pb;" ct ct);
+        p "  int64_t n_ = a->len < b->len ? a->len : b->len;";
+        p "  for (; i < n_; i++) {";
+        mark e (Some "i + 1");
+        cursor e "a->data[i]" "b->data[i]" (Some "i + 1");
+        p "  }";
+        p "  return a->len == b->len ? 0 : w_cmp_res(a->len < b->len ? -1 : 1);";
+        p "}";
+        p (sprintf "static int %s_cmp(%s a, %s b) { return w_cmp(%s_cmp_k, a, b, 0); }" n ct ct n)
+      | TNamed _ when is_enum c t && is_boxed c t && not fl ->
+        p (sprintf "static int %s_cmp_k(void* pa, void* pb, int64_t i) {" n);
+        p (sprintf "  %s a = (%s)pa;" ct ct);
+        p (sprintf "  %s b = (%s)pb;" ct ct);
+        p "  if (a->tag != b->tag) return w_cmp_res(a->tag < b->tag ? -1 : 1);";
+        p "  switch (a->tag) {";
+        List.iteri
+          (fun k (_, ps) ->
+            p (sprintf "    case %d:" k);
+            let last = List.length ps - 1 in
+            List.iteri
+              (fun i pt ->
+                let next = if i < last then Some (string_of_int (i + 1)) else None in
+                p (sprintf "  if (i <= %d) {" i);
+                mark pt next;
+                cursor pt (sprintf "a->u.v%d.f%d" k i) (sprintf "b->u.v%d.f%d" k i) next;
+                p "  }")
+              ps;
+            p "      break;")
+          (Lower.variants c.g t);
+        p "  }";
+        p "  return 0;";
+        p "}";
+        p (sprintf "static int %s_cmp(%s a, %s b) { return w_cmp(%s_cmp_k, a, b, 0); }" n ct ct n)
+      | _ ->
       p (sprintf "static int %s_cmp(%s a, %s b) {" n ct ct);
       p "  (void)a; (void)b;";
       (match t with
@@ -1981,7 +2096,7 @@ and cmp_defs c p =
          p "  return 0;"
        | TNamed _ when is_enum c t ->
          let acc = if is_boxed c t then "->" else "." in
-         p (sprintf "  if (a%stag != b%stag) return a%stag < b%stag ? -1 : 1;" acc acc acc acc);
+         p (sprintf "  if (a%stag != b%stag) return %s;" acc acc (if fl then sprintf "a%stag < b%stag ? -1 : 1" acc acc else sprintf "w_cmp_res(a%stag < b%stag ? -1 : 1)" acc acc));
          p (sprintf "  switch (a%stag) {" acc);
          List.iteri
            (fun k (_, ps) ->

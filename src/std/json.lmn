@@ -92,17 +92,80 @@ pub fn as_list(self: Value) -> Option[List[Value]] {
 
 // Compact JSON text for `v`. JSON has no infinity or NaN, so those numbers
 // are written as `null`, as JavaScript does; every other number is written
-// in the fewest digits that read back as the same Float.
+// in the fewest digits that read back as the same Float. The arrays and
+// objects being written are tracked in a list rather than by recursion, so
+// a deep value costs no stack.
 pub fn stringify(v: Value) -> Str {
-    match v {
-        Null => "null",
-        Bool(b) => b.to_str(),
-        Num(x) => num_text(x),
-        Int(n) => n.to_str(),
-        Str(s) => quote(s),
-        Arr(items) => "[" + items.map(|x| stringify(x)).join(",") + "]",
-        Obj(fields) => "\{" + fields.map(|f| quote(f.key) + ":" + stringify(f.value)).join(",") + "\}",
+    let mut out: List[Str] = []
+    // the open ones, outermost first; slots from `depth` on are spare
+    let mut open: List[Writing] = []
+    let mut depth = 0
+    let mut next = v
+    let mut going = true
+    while going {
+        match next {
+            Null => out.push("null"),
+            Bool(b) => out.push(b.to_str()),
+            Num(x) => out.push(num_text(x)),
+            Int(n) => out.push(n.to_str()),
+            Str(s) => out.push(quote(s)),
+            Arr(items) => {
+                out.push("[")
+                let w = Writing { obj: false, items, fields: [], at: 0 }
+                if depth < open.len() {
+                    open[depth] = w
+                } else {
+                    open.push(w)
+                }
+                depth = depth + 1
+            },
+            Obj(fields) => {
+                out.push("\{")
+                let w = Writing { obj: true, items: [], fields, at: 0 }
+                if depth < open.len() {
+                    open[depth] = w
+                } else {
+                    open.push(w)
+                }
+                depth = depth + 1
+            },
+        }
+        // the next value to write, closing each array and object that has
+        // none left
+        going = false
+        while depth > 0 && !going {
+            let d = depth - 1
+            let at = open[d].at
+            let n = if open[d].obj { open[d].fields.len() } else { open[d].items.len() }
+            if at < n {
+                if at > 0 {
+                    out.push(",")
+                }
+                if open[d].obj {
+                    out.push(quote(open[d].fields[at].key) + ":")
+                    next = open[d].fields[at].value
+                } else {
+                    next = open[d].items[at]
+                }
+                open[d].at = at + 1
+                going = true
+            } else {
+                out.push(if open[d].obj { "\}" } else { "]" })
+                // let go of the finished one's items now, not when its slot is reused
+                open[d] = Writing { obj: false, items: [], fields: [], at: 0 }
+                depth = d
+            }
+        }
     }
+    out.join("")
+}
+
+// An array or object being written, and the position of its next item.
+struct Writing {
+    obj: Bool,
+    items: List[Value],
+    fields: List[Field],
+    at: Int,
 }
 
 fn num_text(x: Float) -> Str {

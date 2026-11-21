@@ -1,0 +1,32 @@
+// Ordering and hashing types that hold themselves (through w_cmp and
+// w_hash) next to flat ones (plain recursion): lists, boxed and unboxed
+// enums, structs, tuples and arrays.
+enum L { Cons(Int, L), Nil }
+enum Two { Leaf(Str), Pair(Two, Two) }
+enum Maybe { Some2(L), None2 }
+struct Tree { v: Int, kids: List[Tree], tail: L }
+struct Flat { a: Int, b: (Str, Bool) }
+
+fn chain(n: Int) -> L {
+    let mut l = Nil
+    for i in 0..<n { l = Cons(i, l) }
+    l
+}
+
+fn main(root: Root) {
+    let t = Tree { v: 1, kids: [Tree { v: 2, kids: [], tail: Nil }], tail: chain(3) }
+    let u = Tree { v: 1, kids: [], tail: chain(2) }
+    let p = Pair(Leaf("a"), Pair(Leaf("b"), Leaf("c")))
+    let arr = [chain(1), chain(2)]
+    root.stdout.print("{t < u} {[t, u].sort().len()} {p < Leaf("z")} {(chain(2), 1) < (chain(2), 2)} {arr.max()} {[Flat { a: 1, b: ("x", true) }].sort().len()}")
+    root.stdout.print("{[Some2(chain(1)), None2].sort()} {[[chain(1)], [chain(0)]].sort()}")
+    let mut m: Map[L, Int] = map()
+    m[chain(2)] = 1
+    let mut n: Map[(Str, Two), Int] = map()
+    n[("k", p)] = 2
+    let mut o: Map[Maybe, Int] = map()
+    o[Some2(chain(3))] = 3
+    let mut f: Map[Flat, Int] = map()
+    f[Flat { a: 1, b: ("x", true) }] = 4
+    root.stdout.print("{m[chain(2)]} {n[("k", p)]} {o[Some2(chain(3))]} {f[Flat { a: 1, b: ("x", true) }]}")
+}

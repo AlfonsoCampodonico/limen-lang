@@ -48,9 +48,12 @@ W_RT void w_release(void *o) {
   w_rel_busy = 0;
 }
 /* The work stacks of w_share, w_eq and w_show (limen_rt.h). Each grows as
-   needed and is given back when a large one empties. */
+   needed and is given back when a large one empties, or when the thread
+   ends (w_stacks_free). */
+static void w_stacks_owned(void);
 static void *w_stack_grow(void *p, int64_t *cap, int64_t need, size_t size) {
   if (need <= *cap) return p;
+  if (!*cap) w_stacks_owned();
   int64_t c = *cap ? *cap : 64;
   while (c < need) { if (c > INT64_MAX / 2) w_oom(); c *= 2; }
   *cap = c;
@@ -155,6 +158,91 @@ W_RT void w_show_outer(WBuf *b, WShowFn f, void *v, int64_t i) {
     if (w_text_cap > 16 * W_STACK_KEEP) { free(w_text); w_text = NULL; w_text_cap = 0; }
   }
   w_show_buf = buf; w_show_depth = depth;
+}
+/* f == NULL: an answer found ahead of time, i (w_cmp_res) */
+typedef struct { WCmpFn f; void *a, *b; int64_t i; } WCmpItem;
+__thread int w_cmp_busy, w_cmp_depth;
+__thread int64_t w_cmp_n, w_cmp_base;
+static __thread WCmpItem *w_cmp_st;
+static __thread int64_t w_cmp_cap;
+W_RT void w_cmp_push(WCmpFn f, void *a, void *b, int64_t i) {
+  w_cmp_st = (WCmpItem *)w_stack_grow(w_cmp_st, &w_cmp_cap, w_cmp_n + 1, sizeof(WCmpItem));
+  w_cmp_st[w_cmp_n++] = (WCmpItem){ f, a, b, i };
+}
+/* as w_eq_step; f answers only if it left nothing on the stack */
+static int w_cmp_step(WCmpItem it) {
+  if (!it.f) return (int)it.i;
+  int64_t mark = w_cmp_n;
+  w_cmp_base = mark;
+  int r = it.f(it.a, it.b, it.i);
+  for (int64_t lo = mark, hi = w_cmp_n - 1; lo < hi; lo++, hi--) { WCmpItem t = w_cmp_st[lo]; w_cmp_st[lo] = w_cmp_st[hi]; w_cmp_st[hi] = t; }
+  return r;
+}
+W_RT int w_cmp_outer(WCmpFn f, void *a, void *b, int64_t i) {
+  int depth = w_cmp_depth, busy = w_cmp_busy;
+  int64_t base = w_cmp_n, sbase = w_cmp_base;
+  w_cmp_busy = 1; w_cmp_depth = 0;
+  int r = w_cmp_step((WCmpItem){ f, a, b, i });
+  while (r == 0 && w_cmp_n > base) r = w_cmp_step(w_cmp_st[--w_cmp_n]);
+  w_cmp_n = base; w_cmp_base = sbase;
+  if (base == 0 && w_cmp_cap > W_STACK_KEEP) { free(w_cmp_st); w_cmp_st = NULL; w_cmp_cap = 0; }
+  w_cmp_busy = busy; w_cmp_depth = depth;
+  return r;
+}
+/* A fresh part, or (wait) a call waiting at part i, with h the hash before
+   that part's */
+typedef struct { WHashFn f; void *o; int64_t i; uint64_t h; int wait; } WHashItem;
+__thread int w_hash_busy, w_hash_depth, w_hash_susp;
+static __thread WHashItem *w_hash_st;
+static __thread int64_t w_hash_n, w_hash_cap;
+W_RT void w_hash_push(WHashFn f, void *o) {
+  w_hash_st = (WHashItem *)w_stack_grow(w_hash_st, &w_hash_cap, w_hash_n + 1, sizeof(WHashItem));
+  w_hash_st[w_hash_n++] = (WHashItem){ f, o, 0, W_HASH_SEED, 0 };
+  w_hash_susp = 1;
+}
+W_RT void w_hash_wait(WHashFn f, void *o, int64_t i, uint64_t h) {
+  w_hash_st = (WHashItem *)w_stack_grow(w_hash_st, &w_hash_cap, w_hash_n + 1, sizeof(WHashItem));
+  w_hash_st[w_hash_n++] = (WHashItem){ f, o, i, h, 1 };
+}
+/* f from part i; if a part went on the stack, the part is pushed first and
+   then each waiting call, innermost first, so reverse them: the part runs
+   next, and each waiting call resumes after the one it waits for */
+static uint64_t w_hash_step(WHashFn f, void *o, int64_t i, uint64_t h) {
+  int64_t mark = w_hash_n;
+  w_hash_susp = 0;
+  uint64_t r = f(o, i, h);
+  if (!w_hash_susp) return r;
+  w_hash_susp = 0;
+  for (int64_t lo = mark, hi = w_hash_n - 1; lo < hi; lo++, hi--) { WHashItem t = w_hash_st[lo]; w_hash_st[lo] = w_hash_st[hi]; w_hash_st[hi] = t; }
+  return 0;
+}
+W_RT uint64_t w_hash_outer(WHashFn f, void *o) {
+  int depth = w_hash_depth, busy = w_hash_busy, susp = w_hash_susp;
+  int64_t base = w_hash_n;
+  w_hash_busy = 1; w_hash_depth = 0;
+  uint64_t h = w_hash_step(f, o, 0, W_HASH_SEED);
+  while (w_hash_n > base) {
+    WHashItem it = w_hash_st[--w_hash_n];
+    if (it.wait) { it.h = w_hash_mix(it.h, h); it.i++; }
+    h = w_hash_step(it.f, it.o, it.i, it.h);
+  }
+  if (base == 0 && w_hash_cap > W_STACK_KEEP) { free(w_hash_st); w_hash_st = NULL; w_hash_cap = 0; }
+  w_hash_busy = busy; w_hash_depth = depth; w_hash_susp = susp;
+  return h;
+}
+/* The work stacks are the thread's: a thread that ends gives them back */
+static pthread_key_t w_stacks_key;
+static pthread_once_t w_stacks_once = PTHREAD_ONCE_INIT;
+static void w_stacks_free(void *unused) {
+  (void)unused;
+  free(w_sh_st); free(w_eq_st); free(w_show_st); free(w_show_tmp); free(w_text); free(w_cmp_st); free(w_hash_st);
+  w_sh_st = NULL; w_eq_st = NULL; w_show_st = NULL; w_show_tmp = NULL; w_text = NULL; w_cmp_st = NULL; w_hash_st = NULL;
+  w_sh_cap = w_eq_cap = w_show_cap = w_show_tmp_cap = w_text_cap = w_cmp_cap = w_hash_cap = 0;
+}
+static void w_stacks_key_new(void) { pthread_key_create(&w_stacks_key, w_stacks_free); }
+static void w_stacks_owned(void) {
+  pthread_once(&w_stacks_once, w_stacks_key_new);
+  pthread_setspecific(w_stacks_key, (void *)1);
 }
 /* Start a boundary's list; its parent is the current innermost boundary. */
 W_RT void w_catch_init(WCatch *c) {
