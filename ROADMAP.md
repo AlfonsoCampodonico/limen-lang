@@ -127,7 +127,12 @@ happens here.
   printing no longer takes quadratic time on a deep value).
 - The same for the walks still left recursive: ordering (`<`, `sort`) and
   hashing a deep map key, natively and in the interpreter, and a check of
-  `json.encode` on a deep value.
+  `json.encode` on a deep value (done: natively ordering and hashing keep the
+  rest on a work stack as `==` does, with the same answers and hashes; the
+  interpreter's walks already fit OCaml's growing stack; `json.stringify`
+  writes with a list rather than recursion, and no longer takes quadratic
+  time on a deep value. The conversions `json.encode` writes for a struct
+  chain still recurse once per level).
 - The JSON edges: a lone `\ud800`, duplicate keys, a nesting limit, numbers
   over 400 characters (done: each is a parse error, and the parser reads
   nesting without recursion, so it can't overflow a task's stack).
