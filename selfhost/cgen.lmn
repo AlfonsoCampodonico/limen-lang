@@ -98,6 +98,8 @@ struct Cg {
     sort_tys: List[types.Ty],
     // composite map key types that need <CName>_hash
     hash_tys: List[types.Ty],
+    // `flat`'s answers, worked out once per type when cmp_defs starts
+    flats: Map[Str, Bool],
     // C functions that foreign calls name
     csyms: List[Str],
     // limen_sql_run is called: emit the table of SQLite functions it uses
@@ -3057,31 +3059,57 @@ fn cmp_item(self: Cg, n: Str, e: types.Ty, x: Str, y: Str, next: Str) -> (List[S
 }
 
 // A type is flat when no enum that holds itself is inside it, so its
-// values are only so deep: its order and hash are plain recursion. Any
-// other goes through w_cmp and w_hash (limen_rt.h): a list or boxed enum
-// orders from item i on, so it can go on the stack and resume there, and a
-// key hashes from part i on.
+// values are only so deep: its order and hash are plain recursion (worked
+// out once per type). Any other goes through w_cmp and w_hash
+// (limen_rt.h): a list or boxed enum orders from item i on, so it can go on
+// the stack and resume there, and a key hashes from part i on.
 fn flat(self: Cg, t: types.Ty) -> Bool {
-    self.flat_in(t, [])
+    match self.flats.get(show(t)) {
+        Some(b) => b,
+        None => self.flat_in(t, [], self.flats).0,
+    }
 }
 
-fn flat_in(self: Cg, t: types.Ty, seen: List[Str]) -> Bool {
+// The answers for `ts` and the types inside them
+fn flat_table(self: Cg, ts: List[types.Ty]) -> Map[Str, Bool] {
+    let mut memo: Map[Str, Bool] = map()
+    for t in ts {
+        let (_, m) = self.flat_in(t, [], memo)
+        memo = m
+    }
+    memo
+}
+
+fn flat_in(self: Cg, t: types.Ty, seen: List[Str], memo: Map[Str, Bool]) -> (Bool, Map[Str, Bool]) {
     match t {
-        TInt | TFloat | TStr | TBytes | TBool | TUnit | TUInt(_) => true,
-        TList(e) | TArray(e, _) => self.flat_in(e, seen),
+        TInt | TFloat | TStr | TBytes | TBool | TUnit | TUInt(_) => (true, memo),
+        TList(e) | TArray(e, _) => self.flat_in(e, seen, memo),
         TNamed(..) => {
             let n = show(t)
-            if seen.contains(n) || self.is_boxed(t) {
-                return false
+            match memo.get(n) {
+                Some(b) => { return (b, memo) },
+                None => {},
             }
-            for e in self.parts(t) {
-                if !self.flat_in(e, seen + [n]) {
-                    return false
+            if seen.contains(n) {
+                return (false, memo)
+            }
+            // a false answer found on the way is true of every type on it
+            let mut m = memo
+            let mut r = !self.is_boxed(t)
+            if r {
+                for e in self.parts(t) {
+                    let (b, m2) = self.flat_in(e, seen + [n], m)
+                    m = m2
+                    if !b {
+                        r = false
+                        break
+                    }
                 }
             }
-            true
+            m[n] = r
+            (r, m)
         },
-        _ => true,
+        _ => (true, memo),
     }
 }
 
@@ -3090,6 +3118,7 @@ fn flat_in(self: Cg, t: types.Ty, seen: List[Str]) -> Bool {
 fn cmp_defs(self: Cg) -> (List[Str], Cg) {
     let mut c = self
     let mut out: List[Str] = []
+    c.flats = c.flat_table(c.hash_tys + c.cmp_tys)
     for t in c.hash_tys {
         if !c.flat(t) {
             let (n, c1) = c.cname(t)
@@ -3316,6 +3345,7 @@ pub fn program(ro: lower.Ro, files: List[diag.Source], prog: ir.Program, runtime
         cmp_tys: [],
         sort_tys: [],
         hash_tys: [],
+        flats: map(),
         csyms: [],
         sql_api: false,
         cstructs: [],

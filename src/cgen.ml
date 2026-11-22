@@ -1664,6 +1664,9 @@ let topo c =
 let named_decl c t =
   match t with TNamed (n, _) -> n | _ -> ""
 
+(* [flat]'s answers by C name, for the program being written *)
+let flat_memo : (string, bool) Hashtbl.t = Hashtbl.create 64
+
 let rec type_defs c (out : Buffer.t) =
   let p s = Buffer.add_string out (s ^ "\n") in
   compute_boxed c;
@@ -1940,7 +1943,8 @@ let rec type_defs c (out : Buffer.t) =
 (* Order functions: item by item, as Interp.compare_v; and hash functions
    for tuple, struct and enum map keys. A type is flat when no enum that
    holds itself is inside it, so its values are only so deep: its order and
-   hash are plain recursion. Any other goes through w_cmp and w_hash
+   hash are plain recursion (worked out once per type). Any other goes
+   through w_cmp and w_hash
    (limen_rt.h): a list or boxed enum orders from item i on, so it can go on
    the stack and resume there, and a key hashes from part i on. *)
 and flat c t =
@@ -1948,13 +1952,24 @@ and flat c t =
     match t with
     | TInt | TFloat | TStr | TBytes | TBool | TUnit | TUInt _ -> true
     | TList e | TArray (e, _) -> go seen e
-    | TNamed _ ->
+    | TNamed _ -> (
       let n = cname c t in
-      (not (List.mem n seen)) && (not (is_boxed c t))
-      &&
-      let seen = n :: seen in
-      if is_enum c t then List.for_all (fun (_, ps) -> List.for_all (go seen) ps) (Lower.variants c.g t)
-      else List.for_all (fun (_, ft) -> go seen ft) (Lower.field_types c.g t)
+      match Hashtbl.find_opt flat_memo n with
+      | Some b -> b
+      | None ->
+        if List.mem n seen then false
+        else begin
+          (* a false answer found on the way is true of every type on it *)
+          let seen = n :: seen in
+          let r =
+            (not (is_boxed c t))
+            &&
+            if is_enum c t then List.for_all (fun (_, ps) -> List.for_all (go seen) ps) (Lower.variants c.g t)
+            else List.for_all (fun (_, ft) -> go seen ft) (Lower.field_types c.g t)
+          in
+          Hashtbl.replace flat_memo n r;
+          r
+        end)
     | _ -> true
   in
   go [] t
@@ -2119,6 +2134,7 @@ and cmp_defs c p =
 
 let program (g : Lower.gctx) (prog : I.program) : string =
   uses_tls := false;
+  Hashtbl.reset flat_memo;
   let c =
     { g; names = Hashtbl.create 32; types = []; lits = Hashtbl.create 32; lit_order = []; boxed = [];
       envs = Hashtbl.create 16; uniq = []; task_tys = []; inrange = []; chan_tys = []; dyns = []; cell_tys = []; vols = [];
