@@ -6,8 +6,9 @@
    never run, so the checker types every use like any call. Once a program
    has checked, this pass finds each use, takes the type it was used at, and
    writes ordinary Limen functions for that type and every type inside it,
-   into the json module: `json.put$N(x: T) -> List[json.Part]`, the text in
-   pieces, and `json.from$N(v: json.Value, at: Str) -> Result[T, Str]`,
+   into the json module: `json.to$N(x: T) -> json.Value` (for a type that
+   holds a type that holds itself, `json.put$N(x: T) -> List[json.Part]`,
+   the text in pieces) and `json.from$N(v: json.Value, at: Str) -> Result[T, Str]`,
    built from the helpers at the end of json.lmn; for a type that holds
    itself also `json.step$N`, its decoder a step at a time. Each use is pointed at a wrapper,
    `json.encode$N` or `json.decode$N`, and the program is checked again with
@@ -130,25 +131,45 @@ let cyclic st t =
   in
   go (kids st t)
 
+(* Is no type that holds itself inside [t], [t] included? Then its values
+   are only so deep, and it is encoded as before: a json.Value, then
+   `stringify`. *)
+let plain st t =
+  let seen = Hashtbl.create 8 in
+  let rec go = function
+    | [] -> true
+    | u :: rest ->
+      let k = show u in
+      if Hashtbl.mem seen k then go rest
+      else begin
+        Hashtbl.replace seen k ();
+        (not (cyclic st u)) && go (kids st u @ rest)
+      end
+  in
+  go [ t ]
+
 (* The encoder and decoder of [t], as function names: a helper of json.lmn
-   for the simple types, written ones otherwise. A type that holds itself
-   has a third, its decoder a step at a time, `step$N`. *)
+   for the simple types, written ones otherwise. The encoder of a plain
+   type is `to$N`, giving a json.Value; any other's is `put$N`, giving the
+   text in pieces. A type that holds itself has a third, its decoder a step
+   at a time, `step$N`. *)
 let rec coders st t : string * string =
   match repr t with
-  | TInt -> (jf st "put_int", jf st "from_int")
-  | TFloat -> (jf st "put_float", jf st "from_float")
-  | TStr -> (jf st "put_str", jf st "from_str")
-  | TBool -> (jf st "put_bool", jf st "from_bool")
-  | TNamed (n, []) when n = jf st "Value" -> (jf st "put_value", jf st "from_value")
+  | TInt -> (jf st "of_int", jf st "from_int")
+  | TFloat -> (jf st "of_float", jf st "from_float")
+  | TStr -> (jf st "of_str", jf st "from_str")
+  | TBool -> (jf st "of_bool", jf st "from_bool")
+  | TNamed (n, []) when n = jf st "Value" -> (jf st "of_value", jf st "from_value")
   | t -> (
     let key = show t in
+    let enc_name k = jf st (sprintf (if plain st t then "to$%d" else "put$%d") k) in
     match Hashtbl.find_opt st.names key with
-    | Some k -> (jf st (sprintf "put$%d" k), jf st (sprintf "from$%d" k))
+    | Some k -> (enc_name k, jf st (sprintf "from$%d" k))
     | None ->
       st.count <- st.count + 1;
       let k = st.count in
       Hashtbl.replace st.names key k;
-      let put = jf st (sprintf "put$%d" k) and from = jf st (sprintf "from$%d" k) in
+      let put = enc_name k and from = jf st (sprintf "from$%d" k) in
       let enc, dec, step = bodies st t in
       let fn ?(gen = []) name params ret body =
         IFn
@@ -160,7 +181,7 @@ let rec coders st t : string * string =
       let parts = te st (TyName ("List", [ te st (TyName (jf st "Part", [])) ])) in
       let result = written st (TNamed ("Result", [ t; TStr ])) in
       let dec_params = [ prm "v" (written st (value_ty st)); prm "at" (written st TStr) ] in
-      let encoder = fn put [ prm "x" (written st t) ] parts enc in
+      let encoder = fn put [ prm "x" (written st t) ] (if plain st t then written st (value_ty st) else parts) enc in
       (match step with
        | None -> st.out <- fn from dec_params result dec :: encoder :: st.out
        | Some body ->
@@ -185,10 +206,23 @@ and bodies st t : block * block * block option =
   let ok e = call st "Ok" [ e ] in
   let int n = ex st (EInt (Int64.of_int n)) in
   let need ts = List.iter (fun a -> ignore (coders st a)) ts in
+  (* old encoder: a part's Value *)
+  let enc_of a e = let p, _ = coders st a in call st p [ e ] in
+  (* the pieces of a part: a plain one's Value as text, later when it holds
+     itself *)
   let put_of a e =
     let p, _ = coders st a in
-    if cyclic st a then call st (jf st "later") [ ex st (EClosure ([], call st p [ e ])) ] else call st p [ e ]
+    let simple = match repr a with TInt -> Some "put_int" | TFloat -> Some "put_float" | TStr -> Some "put_str" | TBool -> Some "put_bool" | TNamed (n, []) when n = jf st "Value" -> Some "put_value" | _ -> None in
+    match simple with
+    | Some h -> call st (jf st h) [ e ]
+    | None ->
+    if plain st a then call st (jf st "put_value") [ call st p [ e ] ]
+    else if cyclic st a then call st (jf st "later") [ ex st (EClosure ([], call st p [ e ])) ]
+    else call st p [ e ]
   in
+  let fields_obj fs = call st (jf st "of_fields") [ ex st (EList (List.map (fun (n, e) -> call st (jf st "field") [ str st n; e ]) fs)) ] in
+  let list_of es = call st (jf st "of_list") [ ex st (EList es) ] in
+  let pl = plain st t in
   let dec_of a v at = let _, d = coders st a in try_ st (call st d [ v; at ]) in
   let items_of n v at decs =
     let s = { sdesc = SLet (false, "items", st.sp, None, try_ st (call st (jf st "from_items") [ v; at; int n ])); sspan = st.sp } in
@@ -230,13 +264,13 @@ and bodies st t : block * block * block option =
   | TNamed ("Option", [ a ]) ->
     need [ a ];
     let e, d = coders st a in
-    ( only (call st (jf st "put_option") [ x; fnv e ]),
+    ( only (if pl then call st (jf st "of_option") [ x; fnv e ] else call st (jf st "put_option") [ x; fnv e ]),
       only (call st (jf st "from_option") [ v; at; fnv d ]),
       if self then Some (only (call st (jf st "option_k") [ v; at; fnv (step_name st a); var st "k" ])) else None )
   | TList a ->
     need [ a ];
     let e, d = coders st a in
-    ( only (call st (jf st "put_list") [ x; fnv e ]),
+    ( only (if pl then call st (jf st "of_list") [ ex st (EMethod (x, "map", st.sp, [ fnv e ])) ] else call st (jf st "put_list") [ x; fnv e ]),
       only (call st (jf st "from_list") [ v; at; fnv d ]),
       if self then Some (only (call st (jf st "list_k") [ v; at; fnv (step_name st a); var st "k" ])) else None )
   | TMap (k, a) -> (
@@ -244,13 +278,16 @@ and bodies st t : block * block * block option =
     | TStr ->
       need [ a ];
       let e, d = coders st a in
-      ( only (call st (jf st "put_map") [ x; fnv e ]),
+      ( only (if pl then call st (jf st "of_map") [ x; fnv e ] else call st (jf st "put_map") [ x; fnv e ]),
         only (call st (jf st "from_map") [ v; at; fnv d ]),
         if self then Some (only (call st (jf st "map_k") [ v; at; fnv (step_name st a); var st "k" ])) else None )
     | k -> raise (Unsupported (sprintf "`%s` (a map's keys must be `Str`)" (show (TMap (k, a))))))
   | TNamed (n, args) when is_tuple_name n ->
     need args;
-    let enc = call st (jf st "put_items") [ ex st (EList (List.mapi (fun i a -> put_of a (ex st (EField (x, string_of_int i, st.sp)))) args)) ] in
+    let enc =
+      if pl then list_of (List.mapi (fun i a -> enc_of a (ex st (EField (x, string_of_int i, st.sp)))) args)
+      else call st (jf st "put_items") [ ex st (EList (List.mapi (fun i a -> put_of a (ex st (EField (x, string_of_int i, st.sp)))) args)) ]
+    in
     let s, es = items_of (List.length args) v at args in
     let build es = ex st (EStruct (n, st.sp, List.mapi (fun i e -> (string_of_int i, st.sp, e)) es)) in
     (only enc, block st [ s ] (ok (build es)), if self then Some (only (items_then v at args (ok (build (ds (List.length args)))))) else None)
@@ -260,6 +297,8 @@ and bodies st t : block * block * block option =
     let fs = List.map (fun (f, _, fte) -> (f, field_ty env fte)) sd.st_fields in
     need (List.map snd fs);
     let enc =
+      if pl then fields_obj (List.map (fun (f, ft) -> (f, enc_of ft (ex st (EField (x, f, st.sp))))) fs)
+      else
       call st (jf st "put_fields")
         [ ex st (EList (List.map (fun (f, _) -> str st f) fs)); ex st (EList (List.map (fun (f, ft) -> put_of ft (ex st (EField (x, f, st.sp)))) fs)) ]
     in
@@ -296,6 +335,9 @@ and bodies st t : block * block * block option =
           let names = List.mapi (fun i _ -> sprintf "p%d" i) ts in
           let body =
             match ts with
+            | [] when pl -> call st (jf st "of_str") [ str st vn ]
+            | [ a ] when pl -> call st (jf st "of_variant") [ str st vn; enc_of a (var st "p0") ]
+            | _ when pl -> call st (jf st "of_variant") [ str st vn; list_of (List.map2 (fun a p -> enc_of a (var st p)) ts names) ]
             | [] -> call st (jf st "put_str") [ str st vn ]
             | [ a ] -> call st (jf st "put_variant") [ str st vn; put_of a (var st "p0") ]
             | _ -> call st (jf st "put_variant") [ str st vn; call st (jf st "put_items") [ ex st (EList (List.map2 (fun a p -> put_of a (var st p)) ts names)) ] ]
@@ -543,7 +585,7 @@ let expand ?json ?(rows = []) (items : item list) : (item list * Diag.t list) op
               let w = jf st (sprintf "%s$%d" (if encode then "encode" else "decode") (Hashtbl.length wrappers + 1)) in
               let prm n t = { prm_name = n; prm_span = e.espan; prm_ty = t; prm_default = None } in
               let body, params, ret =
-                if encode then (block st [] (call st (jf st "write") [ call st to_ [ var st "x" ] ]), [ prm "x" (written st t) ], written st TStr)
+                if encode then (block st [] (call st (jf st (if plain st t then "stringify" else "write")) [ call st to_ [ var st "x" ] ]), [ prm "x" (written st t) ], written st TStr)
                 else (block st [] (call st (jf st "from_text") [ var st "s"; var st from ]), [ prm "s" (written st TStr) ], written st (TNamed ("Result", [ t; TStr ])))
               in
               st.out <- fn_item w e.espan params ret body :: st.out;

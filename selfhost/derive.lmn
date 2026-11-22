@@ -6,8 +6,9 @@
 // bodies never run, so the checker types every use like any call. Once a
 // program has checked, this pass finds each use, takes the type it was used
 // at, and writes ordinary Limen functions for that type and every type
-// inside it, into the json module: `json.put$N(x: T) -> List[json.Part]`,
-// the text in pieces, and `json.from$N(v: json.Value, at: Str) ->
+// inside it, into the json module: `json.to$N(x: T) -> json.Value` (for a
+// type that holds a type that holds itself, `json.put$N(x: T) ->
+// List[json.Part]`, the text in pieces) and `json.from$N(v: json.Value, at: Str) ->
 // Result[T, Str]`, built from the helpers at the end of json.lmn; for a
 // type that holds itself also `json.step$N`, its decoder a step at a time. Each use is pointed at a wrapper,
 // `json.encode$N` or `json.decode$N`, and the program is checked again with
@@ -240,9 +241,33 @@ fn cyclic(g: Gen, t: types.Ty) -> Bool {
     false
 }
 
+// Is no type that holds itself inside `t`, `t` included? Then its values
+// are only so deep, and it is encoded as before: a json.Value, then
+// `stringify`.
+fn plain(g: Gen, t: types.Ty) -> Bool {
+    let mut seen: Map[Str, Bool] = map()
+    let mut todo = [t]
+    while !todo.is_empty() {
+        let u = todo[0]
+        let k = show(g, u)
+        if seen.contains(k) {
+            todo = todo.skip(1)
+        } else {
+            seen[k] = true
+            if cyclic(g, u) {
+                return false
+            }
+            todo = kids(g, u) + todo.skip(1)
+        }
+    }
+    true
+}
+
 // The encoder and decoder of `t`, as function names: a helper of
-// json.lmn for the simple types, written ones otherwise. A type that holds
-// itself has a third, its decoder a step at a time, `step$N`.
+// json.lmn for the simple types, written ones otherwise. The encoder of a
+// plain type is `to$N`, giving a json.Value; any other's is `put$N`, giving
+// the text in pieces. A type that holds itself has a third, its decoder a
+// step at a time, `step$N`.
 fn coders(g: Gen, t: types.Ty) -> Result[((Str, Str), Gen), Fail] {
     match g.names.get(show(g, t)) {
         Some(_) => { return Ok((names_of(g, t), g)) },
@@ -258,7 +283,7 @@ fn coders(g: Gen, t: types.Ty) -> Result[((Str, Str), Gen), Fail] {
     g.count = g.count + 1
     let k = g.count
     g.names[key] = k
-    let put = jf(g, "put${k}")
+    let put = names_of(g, t).0
     let from = jf(g, "from${k}")
     let ((enc, dec, step), g2) = bodies(g, t)?
     let mut g = g2
@@ -281,7 +306,7 @@ fn coders(g: Gen, t: types.Ty) -> Result[((Str, Str), Gen), Fail] {
     }
     let parts = te(g, TyName("List", [te(g, TyName(jf(g, "Part"), []))]))
     let dec_params = [param(g, "v", vt), param(g, "at", st)]
-    let encoder = fn_item(g, put, [param(g, "x", tt)], parts, enc)
+    let encoder = fn_item(g, put, [param(g, "x", tt)], if plain(g, t) { vt } else { parts }, enc)
     match step {
         None => {
             g.out = g.out + [encoder, fn_item(g, from, dec_params, rt, dec)]
@@ -304,14 +329,15 @@ fn coders(g: Gen, t: types.Ty) -> Result[((Str, Str), Gen), Fail] {
 // The names of a type's coders, once they are written.
 fn names_of(g: Gen, t: types.Ty) -> (Str, Str) {
     match t {
-        TInt => (jf(g, "put_int"), jf(g, "from_int")),
-        TFloat => (jf(g, "put_float"), jf(g, "from_float")),
-        TStr => (jf(g, "put_str"), jf(g, "from_str")),
-        TBool => (jf(g, "put_bool"), jf(g, "from_bool")),
-        TNamed(n, []) if n == jf(g, "Value") => (jf(g, "put_value"), jf(g, "from_value")),
+        TInt => (jf(g, "of_int"), jf(g, "from_int")),
+        TFloat => (jf(g, "of_float"), jf(g, "from_float")),
+        TStr => (jf(g, "of_str"), jf(g, "from_str")),
+        TBool => (jf(g, "of_bool"), jf(g, "from_bool")),
+        TNamed(n, []) if n == jf(g, "Value") => (jf(g, "of_value"), jf(g, "from_value")),
         _ => {
             let k = g.names.get(show(g, t)) ?? 0
-            (jf(g, "put${k}"), jf(g, "from${k}"))
+            let kind = if plain(g, t) { "to" } else { "put" }
+            (jf(g, "{kind}${k}"), jf(g, "from${k}"))
         },
     }
 }
@@ -346,10 +372,29 @@ fn fields_of(g: Gen, env: List[(Str, types.Ty)], tys: List[ast.TyExpr]) -> Resul
     Ok(out)
 }
 
-// The parts of `a`'s value `e`: later, when `a` holds itself.
+// A part's Value, encoded as before
+fn enc_of(g: Gen, a: types.Ty, e: ast.Expr) -> ast.Expr {
+    call(g, names_of(g, a).0, [e])
+}
+
+// The pieces of a part: a plain one's Value as text, later when it holds
+// itself
 fn put_of(g: Gen, a: types.Ty, e: ast.Expr) -> ast.Expr {
     let p = names_of(g, a).0
-    if cyclic(g, a) {
+    let simple = match a {
+        TInt => "put_int",
+        TFloat => "put_float",
+        TStr => "put_str",
+        TBool => "put_bool",
+        TNamed(n, []) if n == jf(g, "Value") => "put_value",
+        _ => "",
+    }
+    if simple != "" {
+        return call(g, jf(g, simple), [e])
+    }
+    if plain(g, a) {
+        call(g, jf(g, "put_value"), [call(g, p, [e])])
+    } else if cyclic(g, a) {
         call(g, jf(g, "later"), [ex(g, EClosure([], call(g, p, [e])))])
     } else {
         call(g, p, [e])
@@ -434,25 +479,26 @@ fn bodies(g: Gen, t: types.Ty) -> Result[((ast.Block, ast.Block, Option[ast.Bloc
     let at = var(g, "at")
     let k = var(g, "k")
     let self_ = cyclic(g, t)
+    let pl = plain(g, t)
     match t {
         TNamed("Option", [a]) => {
             let g = need(g, [a])?
             let (e, d) = names_of(g, a)
             let step = if self_ { Some(only(g, call(g, jf(g, "option_k"), [v, at, var(g, step_of(g, a)), k]))) } else { None }
-            Ok(((only(g, call(g, jf(g, "put_option"), [x, var(g, e)])), only(g, call(g, jf(g, "from_option"), [v, at, var(g, d)])), step), g))
+            Ok(((only(g, if pl { call(g, jf(g, "of_option"), [x, var(g, e)]) } else { call(g, jf(g, "put_option"), [x, var(g, e)]) }), only(g, call(g, jf(g, "from_option"), [v, at, var(g, d)])), step), g))
         },
         TList(a) => {
             let g = need(g, [a])?
             let (e, d) = names_of(g, a)
             let step = if self_ { Some(only(g, call(g, jf(g, "list_k"), [v, at, var(g, step_of(g, a)), k]))) } else { None }
-            Ok(((only(g, call(g, jf(g, "put_list"), [x, var(g, e)])), only(g, call(g, jf(g, "from_list"), [v, at, var(g, d)])), step), g))
+            Ok(((only(g, if pl { call(g, jf(g, "of_list"), [ex(g, EMethod(x, "map", g.sp, [var(g, e)]))]) } else { call(g, jf(g, "put_list"), [x, var(g, e)]) }), only(g, call(g, jf(g, "from_list"), [v, at, var(g, d)])), step), g))
         },
         TMap(kt, a) => match kt {
             TStr => {
                 let g = need(g, [a])?
                 let (e, d) = names_of(g, a)
                 let step = if self_ { Some(only(g, call(g, jf(g, "map_k"), [v, at, var(g, step_of(g, a)), k]))) } else { None }
-                Ok(((only(g, call(g, jf(g, "put_map"), [x, var(g, e)])), only(g, call(g, jf(g, "from_map"), [v, at, var(g, d)])), step), g))
+                Ok(((only(g, if pl { call(g, jf(g, "of_map"), [x, var(g, e)]) } else { call(g, jf(g, "put_map"), [x, var(g, e)]) }), only(g, call(g, jf(g, "from_map"), [v, at, var(g, d)])), step), g))
             },
             _ => Err(unsupported(g, "{quoted(g, t)} (a map's keys must be `Str`)")),
         },
@@ -460,9 +506,10 @@ fn bodies(g: Gen, t: types.Ty) -> Result[((ast.Block, ast.Block, Option[ast.Bloc
             let g = need(g, args)?
             let mut parts: List[ast.Expr] = []
             for (i, a) in args.with_index() {
-                parts.push(put_of(g, a, ex(g, EField(x, "{i}", g.sp))))
+                let xi = ex(g, EField(x, "{i}", g.sp))
+                parts.push(if pl { enc_of(g, a, xi) } else { put_of(g, a, xi) })
             }
-            let enc = call(g, jf(g, "put_items"), [ex(g, EList(parts))])
+            let enc = if pl { call(g, jf(g, "of_list"), [ex(g, EList(parts))]) } else { call(g, jf(g, "put_items"), [ex(g, EList(parts))]) }
             let (s, es) = items_of(g, v, at, args)
             let build = |es: List[ast.Expr]| ex(g, EStruct(n, g.sp, es.with_index().map(|p| ast.FieldInit { name: "{p.0}", span: g.sp, value: p.1 })))
             let step = if self_ { Some(only(g, items_then(g, v, at, args, ok(g, build(ds(g, args.len())))))) } else { None }
@@ -474,7 +521,11 @@ fn bodies(g: Gen, t: types.Ty) -> Result[((ast.Block, ast.Block, Option[ast.Bloc
             let fts = fields_of(g, env, sd.fields.map(|f| f.ty))?
             let fs = sd.fields.map(|f| f.name).zip(fts)
             let g = need(g, fts)?
-            let enc = call(g, jf(g, "put_fields"), [ex(g, EList(fs.map(|p| text(g, p.0)))), ex(g, EList(fs.map(|p| put_of(g, p.1, ex(g, EField(x, p.0, g.sp))))))])
+            let enc = if pl {
+                call(g, jf(g, "of_fields"), [ex(g, EList(fs.map(|p| call(g, jf(g, "field"), [text(g, p.0), enc_of(g, p.1, ex(g, EField(x, p.0, g.sp)))]))))])
+            } else {
+                call(g, jf(g, "put_fields"), [ex(g, EList(fs.map(|p| text(g, p.0)))), ex(g, EList(fs.map(|p| put_of(g, p.1, ex(g, EField(x, p.0, g.sp))))))])
+            }
             let check = ast.Stmt { desc: SExpr(try_(g, call(g, jf(g, "need_object"), [v, at]))), span: g.sp }
             let mut inits: List[ast.FieldInit] = []
             let mut parts: List[StepPart] = []
@@ -504,7 +555,17 @@ fn bodies(g: Gen, t: types.Ty) -> Result[((ast.Block, ast.Block, Option[ast.Bloc
             let mut arms: List[ast.Arm] = []
             for (vn, ts) in vs {
                 let names = ts.len() |> names_for
-                let body = if ts.is_empty() {
+                let body = if pl && ts.is_empty() {
+                    call(g, jf(g, "of_str"), [text(g, vn)])
+                } else if pl && ts.len() == 1 {
+                    call(g, jf(g, "of_variant"), [text(g, vn), enc_of(g, ts[0], var(g, "p0"))])
+                } else if pl {
+                    let mut parts: List[ast.Expr] = []
+                    for (i, a) in ts.with_index() {
+                        parts.push(enc_of(g, a, var(g, names[i])))
+                    }
+                    call(g, jf(g, "of_variant"), [text(g, vn), call(g, jf(g, "of_list"), [ex(g, EList(parts))])])
+                } else if ts.is_empty() {
                     call(g, jf(g, "put_str"), [text(g, vn)])
                 } else if ts.len() == 1 {
                     call(g, jf(g, "put_variant"), [text(g, vn), put_of(g, ts[0], var(g, "p0"))])
@@ -769,7 +830,7 @@ pub fn expand(json: Option[Str], rows: List[Str], items: List[ast.Item], c: type
                                     let written_t = written(g, t) ?? te(g, TyUnit)
                                     let str_t = te(g, TyName("Str", []))
                                     let item = if encode {
-                                        fn_item(g, w, [param(g, "x", written_t)], str_t, only(g, call(g, jf(g, "write"), [call(g, to, [var(g, "x")])])))
+                                        fn_item(g, w, [param(g, "x", written_t)], str_t, only(g, call(g, jf(g, if plain(g, t) { "stringify" } else { "write" }), [call(g, to, [var(g, "x")])])))
                                     } else {
                                         let rt = written(g, TNamed("Result", [t, TStr])) ?? te(g, TyUnit)
                                         fn_item(g, w, [param(g, "s", str_t)], rt, only(g, call(g, jf(g, "from_text"), [var(g, "s"), var(g, from)])))

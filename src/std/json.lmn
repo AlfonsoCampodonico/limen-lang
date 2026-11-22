@@ -693,12 +693,58 @@ pub fn decode[T](s: Str) -> Result[T, Str] {
     panic("json.decode: the compiler writes this for each type")
 }
 
-// What the compiler's conversions are made of. An encoder gives the text
-// of a value in pieces; a piece of a type that holds itself is left for
-// later, so `write` puts the text together with a list rather than by
+// What the compiler's conversions are made of. An encoder of a type that
+// holds a type that holds itself gives the text of a value in pieces; a
+// piece of a type that holds itself is left for later, so `write` puts the text together with a list rather than by
 // recursion, and a value as deep as it is long fits a task's stack. A
 // decoder takes the value and where it sits in the document
 // (`todos[2].title`, "" at the top), for the error message.
+
+// A type with no type that holds itself inside it is encoded as before:
+// a Value, then `stringify`.
+
+fn of_int(x: Int) -> Value {
+    Int(x)
+}
+
+fn of_float(x: Float) -> Value {
+    Num(x)
+}
+
+fn of_str(x: Str) -> Value {
+    Str(x)
+}
+
+fn of_bool(x: Bool) -> Value {
+    Bool(x)
+}
+
+fn of_value(x: Value) -> Value {
+    x
+}
+
+fn of_option[T](x: Option[T], f: fn(T) -> Value) -> Value {
+    match x {
+        Some(y) => f(y),
+        None => Null,
+    }
+}
+
+fn of_map[V](m: Map[Str, V], f: fn(V) -> Value) -> Value {
+    Obj(m.entries().map(|e| field(e.0, f(e.1))))
+}
+
+fn of_variant(name: Str, payload: Value) -> Value {
+    Obj([field(name, payload)])
+}
+
+fn of_list(items: List[Value]) -> Value {
+    Arr(items)
+}
+
+fn of_fields(fields: List[Field]) -> Value {
+    Obj(fields)
+}
 
 enum Part {
     Text(Str),
