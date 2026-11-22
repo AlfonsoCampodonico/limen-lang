@@ -68,6 +68,8 @@ typedef struct {
 static __thread WStacks *w_stk;
 static pthread_key_t w_stacks_key;
 static pthread_once_t w_stacks_once = PTHREAD_ONCE_INIT;
+/* w_stk still points at the block after this has freed it; nothing reads
+   it then, since the thread is ending and runs no more Limen code */
 static void w_stacks_free(void *p) {
   WStacks *s = (WStacks *)p;
   free(s->sh); free(s->eq); free(s->show); free(s->show_tmp); free(s->text); free(s->cmp); free(s->hash);
