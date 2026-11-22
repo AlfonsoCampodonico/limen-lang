@@ -80,9 +80,10 @@ let compile ?(modules = []) name src =
   in
   match Parser.parse_file file src with
   | exception Diag.Fatal d ->
-    (* a literal out of range (E0005) or nesting past the parser's limit
-       (E0010) is valid syntax, so it is not a grammar rejection *)
-    if d.code <> "E0005" && d.code <> "E0010" then dump name src false;
+    (* a literal out of range (E0005), or nesting or a chain past the
+       parser's limits (E0010, E0011), is valid syntax, so it is not a
+       grammar rejection *)
+    if d.code <> "E0005" && d.code <> "E0010" && d.code <> "E0011" then dump name src false;
     ([], [ d ], [])
   | _ -> (
     dump name src true;
@@ -5997,7 +5998,9 @@ fn main(root: Root) -> Result[(), IoError] {
   panics "rand-bytes-negative" (main_wrap "    out.print(\"{root.rand.bytes(-1)}\")") "rand.bytes: negative length -1";
   (* found by fuzz/front: deep nesting and long chains overflowed the
      self-hosted compiler's stack and took quadratic time in both
-     compilers; past 256 levels a program is refused with E0010 *)
+     compilers; past 256 levels of nesting a program is refused with E0010,
+     and a chain (operators, calls, `else if`s) past 50,000 links with
+     E0011, but a chain is not nesting *)
   let rep n x = String.concat "" (List.init n (fun _ -> x)) in
   let deep n o c = main_wrap ("    let x = " ^ rep n o ^ "1" ^ rep n c ^ "\n    out.print(\"{x}\")") in
   errs "deep-parens" (deep 300 "(" ")") [ "E0010" ];
@@ -6005,14 +6008,21 @@ fn main(root: Root) -> Result[(), IoError] {
   errs "deep-blocks" (deep 300 "{ " " }") [ "E0010" ];
   errs "deep-interpolation" (deep 300 "\"{" "}\"") [ "E0010" ];
   errs "deep-unary" (deep 300 "-" "") [ "E0010" ];
-  errs "deep-binary-chain" (deep 1 "1" (rep 300 " + 1")) [ "E0010" ];
-  errs "deep-call-chain" (main_wrap ("    let x = \"a\"" ^ rep 150 ".len().to_str()")) [ "E0010" ];
-  errs "deep-else-if" (main_wrap ("    let x = " ^ rep 300 "if false { 1 } else " ^ "{ 0 }")) [ "E0010" ];
+  errs "chain-binary" (deep 1 "1" (rep 5000 " + 1")) [];
+  errs "chain-call" (main_wrap ("    let x = \"a\"" ^ rep 3000 ".len().to_str()" ^ "\n    out.print(x)")) [];
+  errs "chain-pipe" ("fn inc(x: Int) -> Int {\n    x + 1\n}\n\n" ^ main_wrap ("    let x = 0" ^ rep 5000 " |> inc" ^ "\n    out.print(\"{x}\")")) [];
+  errs "chain-else-if" (main_wrap ("    let k = 7\n    let x = " ^ rep 5000 "if k == 1 { 1 } else " ^ "{ 0 }\n    out.print(\"{x}\")")) [];
+  errs "chain-binary-too-long" (deep 1 "1" (rep 50001 " + 1")) [ "E0011" ];
+  errs "chain-call-too-long" (main_wrap ("    let x = \"a\"" ^ rep 50001 ".len()")) [ "E0011" ];
+  errs "chain-else-if-too-long" (main_wrap ("    let x = " ^ rep 50002 "if false { 1 } else " ^ "{ 0 }")) [ "E0011" ];
+  out "chain-else-if-runs"
+    (main_wrap ("    let k = 777\n    let x = " ^ String.concat "" (List.init 1000 (fun i -> sprintf "if k == %d { %d } else " i i)) ^ "{ 0 }\n    out.print(\"{x}\")"))
+    "777\n";
   errs "deep-type" ("fn f(x: " ^ rep 300 "Option[" ^ "Int" ^ rep 300 "]" ^ ") {}\n\nfn main(root: Root) {}\n") [ "E0010" ];
   errs "deep-pattern" (main_wrap ("    match 1 {\n        " ^ rep 300 "Some(" ^ "y" ^ rep 300 ")" ^ " => (),\n        _ => (),\n    }")) [ "E0010" ];
   says "deep-says" (deep 100000 "(" ")") "E0010" "nested more than 256 deep";
   out "deep-within" (deep 250 "(" ")") "1\n";
-  out "deep-chain-within" (deep 1 "1" (rep 200 " + 1")) "211\n";
+  out "deep-chain-within" (deep 1 "1" (rep 1000 " + 1")) "1011\n";
   errs "interp-escaped-quote" (main_wrap "    out.print(\"{\\\"x\\\".len()}\")\n    out.print(\"later\")") [ "E0006" ];
   (* multi-line strings: the closing line's indentation comes off every
      line; escapes, interpolation (a multi-line string inside one too), `\`

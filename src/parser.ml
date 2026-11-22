@@ -8,12 +8,20 @@ open Lexer
 type st = { toks : tokens; mutable pos : int; file : string; mutable depth : int }
 
 (* How deep expressions, types and patterns may nest. [depth] counts the
-   operands, types and patterns being parsed inside one another, each link
-   of a chain of operators or of calls, fields and indexes (`a + b + c`,
-   `x.f().g()`), and each `else if`: past [max_depth] the program is refused
-   (E0010) rather than overflow the stack or take quadratic time in this
-   parser and the passes after it. *)
+   operands, types and patterns being parsed inside one another (brackets,
+   blocks, unary operators, interpolations): past [max_depth] the program
+   is refused (E0010) rather than overflow the stack or take quadratic time
+   in this parser and the passes after it. A chain (`a + b + c`,
+   `x.f().g()`, `else if`) is not nesting: its operands are parsed at the
+   chain's own depth. *)
 let max_depth = 256
+
+(* How long a chain may be: the links of one chain of operators, of calls,
+   fields and indexes, or of `else if`s. A chain is parsed with a loop, but
+   the passes after it (the self-hosted compiler's checker on a pipeline,
+   which becomes calls inside calls) still recurse once per link, so past
+   [max_chain] the program is refused (E0011). *)
+let max_chain = 50000
 
 (* The token at [st.pos], its kind and whether a newline came before it,
    read without building a token. *)
@@ -40,6 +48,17 @@ let enter st =
             (Printf.sprintf "nested more than %d deep" max_depth)))
 
 let leave st n = st.depth <- st.depth - n
+
+(* One more link of a chain that already has [links], at the token being
+   looked at. *)
+let link st links =
+  if links >= max_chain then
+    raise
+      (Diag.Fatal
+         (Diag.make "E0011" (span st.toks st.pos)
+            ~notes:[ "name a part with `let` and use the name, or split it into functions" ]
+            (Printf.sprintf "a chain of more than %d links" max_chain)));
+  links + 1
 
 let fail (t : token) expected =
   raise
@@ -233,8 +252,7 @@ and parse_bin st ns minp =
     let tok = cur st in
     match if sym_is tok "|>" then None else if cur_nl st then None else binop_of tok with
     | _ when sym_is tok "|>" && minp < 1 ->
-      enter st;
-      incr links;
+      links := link st !links;
       skip st;
       let rhs = parse_bin st ns 1 in
       if pipe_call !lhs rhs = None then
@@ -245,14 +263,12 @@ and parse_bin st ns minp =
                 "the right side of `|>` must be a function or a call, as in `x |> f`, `x |> f(a)` or `x |> list.map(g)`"));
       lhs := mk (EPipe (!lhs, rhs)) (merge (!lhs).espan rhs.espan)
     | Some (p, op) when p > minp ->
-      enter st;
-      incr links;
+      links := link st !links;
       skip st;
       let rhs = parse_bin st ns p in
       lhs := mk (EBin (op, !lhs, rhs)) (merge (!lhs).espan rhs.espan)
     | _ -> go := false
   done;
-  leave st !links;
   !lhs
 
 and parse_unary st ns =
@@ -284,33 +300,31 @@ and parse_unary1 st ns =
    operation up to a `?` (that one applies to the whole chain). *)
 and parse_postfix ?(in_safe = false) ?(links = 0) st ns e =
   let nl = cur_nl st in
-  (* each operation is a link of the chain, one level deeper *)
-  let link () = enter st; links + 1 in
   match cur st with
   | SYM "(" when not nl ->
-    let links = link () in
+    let links = link st links in
     skip st;
     let args = call_args st ns in
     parse_postfix ~in_safe ~links st ns (mk (ECall (e, args)) (merge e.espan (last_span st)))
   | SYM "{" when (not nl) && (match e.edesc with EVar n -> not (is_upper n) | _ -> false) && starts_trailing st ns ->
+    let links = link st links in
     (* `catch { ... }`: a trailing closure and no parentheses *)
-    let links = link () in
     let args = trailing_closure st ns in
     parse_postfix ~in_safe ~links st ns (mk (ECall (e, args)) (merge e.espan (last_span st)))
   | SYM "[" when not nl ->
-    let links = link () in
+    let links = link st links in
     skip st;
     let i = parse_expr st in
     let r = expect_sym st "]" in
     parse_postfix ~in_safe ~links st ns (mk (EIndex (e, i)) (merge e.espan r.span))
   | SYM "." ->
-    let links = link () in
+    let links = link st links in
     skip st;
     parse_postfix ~in_safe ~links st ns (parse_member st ns e)
   | SYM "?." ->
+    let links = link st links in
     (* safe navigation: the rest of the chain runs on the value inside the
        Option, and None short-circuits all of it *)
-    let links = link () in
     let sp = cur_span st in
     skip st;
     incr safe_count;
@@ -318,9 +332,9 @@ and parse_postfix ?(in_safe = false) ?(links = 0) st ns e =
     let hole = mk (EVar x) sp in
     let rest = parse_postfix ~in_safe:true st ns (parse_member st ns hole) in
     let node = mk (ESafe (e, x, rest, false)) (merge e.espan rest.espan) in
-    if in_safe then (leave st links; node) else parse_postfix ~in_safe ~links st ns node
+    if in_safe then node else parse_postfix ~in_safe ~links st ns node
   | SYM "?" when (not nl) && not in_safe -> (
-    let links = link () in
+    let links = link st links in
     let sp = cur_span st in
     skip st;
     (* `x? "reading config"`: a string on the same line adds context to the error *)
@@ -329,7 +343,7 @@ and parse_postfix ?(in_safe = false) ?(links = 0) st ns e =
       let c = parse_primary st ns in
       parse_postfix ~in_safe ~links st ns (mk (ETry (e, Some c)) (merge e.espan c.espan))
     | _ -> parse_postfix ~in_safe ~links st ns (mk (ETry (e, None)) (merge e.espan sp)))
-  | _ -> leave st links; e
+  | _ -> e
 
 (* `.name`, `.name(args)` or `.0` after the dot *)
 and parse_member st ns e =
@@ -542,19 +556,16 @@ and parse_struct_lit st name nsp =
   in
   mk (EStruct (name, nsp, fields)) (merge nsp (last_span st))
 
-and parse_if st =
+and parse_if ?(links = 0) st =
   let t = expect_kw st "if" in
   let c = parse_expr_ns st in
   let b = parse_block st in
   if is_kw st "else" then begin
     skip st;
     let e =
-      if is_kw st "if" then begin
-        enter st;
-        let e = parse_if st in
-        leave st 1;
-        e
-      end
+      if is_kw st "if" then
+        let links = link st links in
+        parse_if ~links st
       else
         let b2 = parse_block st in
         mk (EBlock b2) b2.bspan

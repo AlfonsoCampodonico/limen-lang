@@ -31,12 +31,20 @@ pub struct Parser {
 
 // How deep expressions, types and patterns may nest, as in src/parser.ml:
 // `depth` counts the operands, types and patterns being parsed inside one
-// another, each link of a chain of operators or of calls, fields and
-// indexes (`a + b + c`, `x.f().g()`), and each `else if`. Past it the
+// another (brackets, blocks, unary operators, interpolations). Past it the
 // program is refused (E0010) rather than overflow the stack or take
-// quadratic time here and in the passes after.
+// quadratic time here and in the passes after. A chain (`a + b + c`,
+// `x.f().g()`, `else if`) is not nesting.
 fn max_depth() -> Int {
     256
+}
+
+// How long a chain may be, as in src/parser.ml: the links of one chain of
+// operators, of calls, fields and indexes, or of `else if`s. The passes
+// after the parser still recurse once per link of some chains (a pipeline
+// becomes calls inside calls), so past it the program is refused (E0011).
+fn max_chain() -> Int {
+    50000
 }
 
 pub struct ParseError {
@@ -171,6 +179,16 @@ fn deeper(self: Parser) -> Result[Parser, ParseError] {
         return Err(e.note("name a part with `let` and use the name, or split it into functions"))
     }
     Ok({ self with depth: self.depth + 1 })
+}
+
+// One more link of a chain that already has `links`, at the token being
+// looked at.
+fn link(self: Parser, links: Int) -> Result[Int, ParseError] {
+    if links >= max_chain() {
+        let e = error("E0011", self.span(), "a chain of more than {max_chain()} links")
+        return Err(e.note("name a part with `let` and use the name, or split it into functions"))
+    }
+    Ok(links + 1)
 }
 
 // Past the symbol `s`, which must be next.
@@ -361,17 +379,17 @@ fn parse_expr_ns(p: Parser) -> Parsed[ast.Expr] {
 // left-associative) and may start a line, so a pipeline can be written one
 // step per line; any other operator must end the line to continue it.
 fn parse_bin(p: Parser, ns: Bool, min: Int) -> Parsed[ast.Expr] {
-    let depth = p.depth
     let (first, p) = parse_unary(p, ns)?
     let mut lhs = first
     let mut p = p
+    let mut links = 0
     while true {
         if p.is_sym("|>") {
             if min >= 1 {
                 break
             }
-            // each link of the chain is a level deeper
-            let (rhs, next) = parse_bin((p.deeper()?).skip(), ns, 1)?
+            links = p.link(links)?
+            let (rhs, next) = parse_bin(p.skip(), ns, 1)?
             if !ast.pipes_into(rhs) {
                 let e = error("E0003", rhs.span, "the right side of `|>` must be a function or a call, as in `x |> f`, `x |> f(a)` or `x |> list.map(g)`")
                 return Err(e.note("`x |> f(a)` means `f(x, a)`: the value goes in as the first argument"))
@@ -382,7 +400,8 @@ fn parse_bin(p: Parser, ns: Bool, min: Int) -> Parsed[ast.Expr] {
         } else {
             match binop(p.kind()) {
                 Some((level, op)) if level > min => {
-                    let (rhs, next) = parse_bin((p.deeper()?).skip(), ns, level)?
+                    links = p.link(links)?
+                    let (rhs, next) = parse_bin(p.skip(), ns, level)?
                     (lhs, p) = (mk(EBin(op, lhs, rhs), merge(lhs.span, rhs.span)), next)
                 },
                 _ => {
@@ -391,7 +410,7 @@ fn parse_bin(p: Parser, ns: Bool, min: Int) -> Parsed[ast.Expr] {
             }
         }
     }
-    Ok((lhs, { p with depth }))
+    Ok((lhs, p))
 }
 
 fn parse_unary(p: Parser, ns: Bool) -> Parsed[ast.Expr] {
@@ -414,32 +433,32 @@ fn parse_unary1(p: Parser, ns: Bool) -> Parsed[ast.Expr] {
 // the rest of a `?.` chain is being parsed: it takes every postfix
 // operation up to a `?`, which applies to the whole chain.
 fn parse_postfix(p: Parser, ns: Bool, e: ast.Expr, in_safe: Bool) -> Parsed[ast.Expr] {
-    let depth = p.depth
     let mut p = p
     let mut e = e
-    // each operation is a link of the chain, a level deeper
+    let mut links = 0
     while true {
         let nl = p.nl()
         if p.is_sym("(") && !nl {
-            p = p.deeper()?
+            links = p.link(links)?
             let (args, next) = call_args(p.skip(), ns)?
             (e, p) = (mk(ECall(e, args), merge(e.span, next.last_span())), next)
         } else if p.is_sym("\{") && !nl && is_lower_var(e) && starts_trailing(p, ns)? {
             // `catch { ... }`: a trailing closure and no parentheses
-            p = p.deeper()?
+            links = p.link(links)?
             let (closure, next) = trailing_closure(p, ns)?
             (e, p) = (mk(ECall(e, closure), merge(e.span, next.last_span())), next)
         } else if p.is_sym("[") && !nl {
-            p = p.deeper()?
+            links = p.link(links)?
             let (index, next) = parse_expr(p.skip())?
             let (close, next) = next.expect("]")?
             (e, p) = (mk(EIndex(e, index), merge(e.span, p.span_of(close))), next)
         } else if p.is_sym(".") {
-            (e, p) = parse_member((p.deeper()?).skip(), ns, e)?
+            links = p.link(links)?
+            (e, p) = parse_member(p.skip(), ns, e)?
         } else if p.is_sym("?.") {
             // safe navigation: the rest of the chain runs on the value
             // inside the Option, and None short-circuits all of it
-            p = p.deeper()?
+            links = p.link(links)?
             let hole_span = p.span()
             let after = { p.skip() with safes: p.safes + 1 }
             let name = "safe$" + after.safes.to_str()
@@ -447,11 +466,11 @@ fn parse_postfix(p: Parser, ns: Bool, e: ast.Expr, in_safe: Bool) -> Parsed[ast.
             let (rest, next) = parse_postfix(next, ns, member, true)?
             let node = mk(ESafe(e, name, rest), merge(e.span, rest.span))
             if in_safe {
-                return Ok((node, { next with depth }))
+                return Ok((node, next))
             }
             (e, p) = (node, next)
         } else if p.is_sym("?") && !nl && !in_safe {
-            p = p.deeper()?
+            links = p.link(links)?
             let mark = p.span()
             let after = p.skip()
             // `x? "reading config"`: a string on the same line adds context
@@ -469,7 +488,7 @@ fn parse_postfix(p: Parser, ns: Bool, e: ast.Expr, in_safe: Bool) -> Parsed[ast.
             break
         }
     }
-    Ok((e, { p with depth }))
+    Ok((e, p))
 }
 
 // A plain lowercase name, the only callee a bare trailing closure can
@@ -610,7 +629,7 @@ fn parse_primary(p: Parser, ns: Bool) -> Parsed[ast.Expr] {
                 Ok((mk(EBlock(b), b.span), p))
             }
         },
-        Keyword("if") => parse_if(p),
+        Keyword("if") => parse_if(p, 0),
         Keyword("match") => parse_match(p),
         Keyword("select") => parse_select(p),
         Symbol("|") => {
@@ -764,7 +783,8 @@ fn parse_struct_lit(p: Parser, name: Str, name_span: ast.Span) -> Parsed[ast.Exp
     Ok((mk(EStruct(name, name_span, fields), merge(name_span, p.last_span())), p))
 }
 
-fn parse_if(p: Parser) -> Parsed[ast.Expr] {
+// `links`: the `else if`s before this one.
+fn parse_if(p: Parser, links: Int) -> Parsed[ast.Expr] {
     let (t, p) = p.expect_kw("if")?
     let (cond, p) = parse_expr_ns(p)?
     let (then, p) = parse_block(p)?
@@ -773,8 +793,7 @@ fn parse_if(p: Parser) -> Parsed[ast.Expr] {
     }
     let p = p.skip()
     let (other, p) = if p.is_kw("if") {
-        let (e, next) = parse_if(p.deeper()?)?
-        (e, { next with depth: p.depth })
+        parse_if(p, p.link(links)?)?
     } else {
         let (b, p) = parse_block(p)?
         (mk(EBlock(b), b.span), p)
