@@ -1795,7 +1795,7 @@ W_RT void w_run(void (*entry)(void *), void *arg) {
   pthread_mutex_lock(&w_global_mu);
   WWorker *w = w_worker_new();
   pthread_mutex_unlock(&w_global_mu);
-  WFiber *m = w_fiber_new(entry, arg, (size_t)256 << 20); /* main gets a large, lazily committed stack */
+  WFiber *m = w_fiber_new(entry, arg, (size_t)1 << 30); /* main gets a large, lazily committed stack */
   w_main_fiber = m;
   w_ready(m);
   w_sched_loop(w, 1);
