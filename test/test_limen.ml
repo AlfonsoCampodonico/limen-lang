@@ -3645,6 +3645,13 @@ fn main(root: Root) {
        ^ "    out.print(65.to_char() + 233.to_char() + 8364.to_char() + 128512.to_char() + (-1).to_char().len().to_str())\n"
        ^ "    out.print(\"{3.min(5)} {3.max(5)} {(-2).min(-7)}\")"))
     "h\195\169llo|world||h\n8 -1\n[65, 98] 2\n2500.0 -1.0 true true\nAé€\240\159\152\1283\n3 5 -7\n";
+  (* found by fuzz/front: natively a number over 400 characters was None, so
+     the self-hosted lexer read a long float literal as 0 *)
+  out "str-parse-float-long"
+    (main_wrap
+       ("    let mut s = \"1.\"\n    for _ in 0..<1000 { s = s + \"4\" }\n"
+       ^ "    out.print(\"{s.parse_float()} {(s + \"e-3\").parse_float()} {(s + \"x\").parse_float()} {(\"9\" + s.slice(2, 1002)).parse_float()}\")"))
+    "Some(1.44444444444444) Some(0.00144444444444444) None Some(inf)\n";
 
   (* ---------- the standard library ---------- *)
   let example f =

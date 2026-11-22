@@ -695,7 +695,7 @@ W_RT bool Str_parse_float(WStr *s, double *out) {
   int64_t a = 0, b = s->len;
   while (a < b && is_ws(s->data[a])) a++;
   while (b > a && is_ws(s->data[b - 1])) b--;
-  if (a == b || b - a > 400) return false;
+  if (a == b) return false;
   bool digit = false;
   for (int64_t i = a; i < b; i++) {
     char c = s->data[i];
@@ -703,12 +703,16 @@ W_RT bool Str_parse_float(WStr *s, double *out) {
     else if (!(c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E')) return false;
   }
   if (!digit) return false;
-  char t[408];
+  /* any length, as the interpreter reads it */
+  char small[408];
+  char *t = b - a < (int64_t)sizeof small ? small : (char *)w_raw((size_t)(b - a) + 1);
   memcpy(t, s->data + a, (size_t)(b - a));
   t[b - a] = 0;
   char *end;
   double x = strtod(t, &end);
-  if (end != t + (b - a)) return false;
+  bool ok = end == t + (b - a);
+  if (t != small) free(t);
+  if (!ok) return false;
   *out = x;
   return true;
 }
