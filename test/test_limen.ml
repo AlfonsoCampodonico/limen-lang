@@ -35,6 +35,9 @@ let dump name src parsed =
   match Sys.getenv_opt "LIMEN_DUMP_DIR" with
   | None -> ()
   | Some _ when (not parsed) && List.mem name grammar_superset -> ()
+  (* chains of thousands of links test the compiler's limits; the grammar
+     checker takes minutes on them *)
+  | Some _ when String.starts_with ~prefix:"chain-" name -> ()
   | Some dir ->
     let sub = Filename.concat dir (if parsed then "accept" else "reject") in
     (try Unix.mkdir dir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
