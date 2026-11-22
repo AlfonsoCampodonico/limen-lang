@@ -4762,6 +4762,17 @@ fn main(root: Root) {
 }
 |}
     "Some(true) false\ntrue Ok(true)\n";
+  (* found by fuzz/regexes.lmn: each capture inside another made every
+     byte searched cost more, so a deep pattern took seconds on a few bytes *)
+  out "std-regex-depth" {|use regex
+use text
+
+fn main(root: Root) {
+    let out = root.stdout
+    out.print("{regex.compile(text.repeat("(", 250) + "a" + text.repeat(")", 250)).is_ok()} {regex.compile(text.repeat("(?:", 251) + "a" + text.repeat(")", 251))}")
+}
+|}
+    "true Err(\"regex: groups nested deeper than 250 at byte 750\")\n";
   out "std-csv"
     {v|use csv
 
