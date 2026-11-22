@@ -4772,6 +4772,19 @@ fn main(root: Root) {
 }
 |v}
     "Ok([[\"a\", \"b\"], [\"1\", \"x, y\"]])\nOk([[\"name\", \"quote\"], [\"Ada\", \"said \\\"hi\\\"\\r\\nthen left\"], [\"Bob\", \"\", \"\"], [\"\", \"\"], [\"\"]])\nOk([[\"x\"]]) Ok([]) Ok([]) Ok([[\"a\"]]) Ok([[\"a\", \"\"]]) Ok([[\"\", \"\"]])\nOk([[\"a\", \"b;c\"], [\"1\", \"2\"]]) Ok([[\"a\", \"b\"]])\nOk([{\"id\": \"1\", \"name\": \"Ada\"}, {\"id\": \"2\", \"name\": \"Lin, B\"}])\nErr(\"csv: line 1: a quoted field is not closed\")\nErr(\"csv: line 1: a quote inside an unquoted field; quote the whole field and double the quote\")\nErr(\"csv: line 1: `,` or a line break must follow a closing quote\")\nErr(\"csv: line 3: `,` or a line break must follow a closing quote\")\nErr(\"csv: line 1: the header names `h` twice\")\nErr(\"csv: line 2: 1 field, but the header has 2\")\nErr(\"csv: line 2: 3 fields, but the header has 2\")\nErr(\"csv: the separator must be one byte other than a quote or a line break, not `\\\"`\") Err(\"csv: the separator must be one byte other than a quote or a line break, not `,,`\")\na,\"b,c\",\"say \"\"hi\"\"\"\n\"line\nbreak\",,\"cr\r\"\n\"\"\n\n\nOk([[\"a\", \"b,c\", \"say \\\"hi\\\"\"], [\"line\\nbreak\", \"\", \"cr\\r\"], [\"\"]])\na\t\"b\tc\"\nd;e\tf\n\nid,name\n1,Ada\n2,\n\nplain \"a,b\" \"\"\"\"\n";
+  (* found by fuzz/formats.lmn: a first field starting with a byte order
+     mark lost it on reading back *)
+  out "std-csv-bom-field" {|use csv
+
+fn main(root: Root) {
+    let out = root.stdout
+    // a field starting with a byte order mark is quoted, or reading would skip the mark
+    let rows = [["\u{feff}a", "b"], ["\u{feff}"]]
+    let text = csv.write(rows)
+    out.print("{text.bytes().take(4)} {csv.parse(text) == Ok(rows)} {csv.escape("\u{feff}x").len()}")
+}
+|}
+    "[34, 239, 187, 191] true 6\n";
   (* url.resolve against every example of RFC 3986 section 5.4 *)
   out "std-url-resolve"
     {v|use url

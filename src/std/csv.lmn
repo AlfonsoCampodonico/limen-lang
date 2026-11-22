@@ -76,13 +76,15 @@ pub fn write_maps(header: List[Str], rows: List[Map[Str, Str]]) -> Str {
 }
 
 // `field` as it goes in a comma-separated line: in quotes, with its quotes
-// doubled, if it holds a comma, a quote or a line break; otherwise as is.
+// doubled, if it holds a comma, a quote or a line break, or starts with a
+// byte order mark (which reading skips at the start of the text);
+// otherwise as is.
 pub fn escape(field: Str) -> Str {
     escape_with(field, ",")
 }
 
 fn escape_with(field: Str, sep: Str) -> Str {
-    if field.contains(sep) || field.contains("\"") || field.contains("\n") || field.contains("\r") {
+    if field.contains(sep) || field.contains("\"") || field.contains("\n") || field.contains("\r") || field.starts_with("\u{feff}") {
         "\"" + field.replace("\"", "\"\"") + "\""
     } else {
         field
