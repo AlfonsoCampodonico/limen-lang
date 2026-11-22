@@ -415,6 +415,10 @@ pub fn zone_from_tzif(name: Str, data: Bytes) -> Result[Zone, Str] {
     let counts = |at: Int| [be(bs, at + 20, 4), be(bs, at + 24, 4), be(bs, at + 28, 4), be(bs, at + 32, 4), be(bs, at + 36, 4), be(bs, at + 40, 4)]
     // isutcnt, isstdcnt, leapcnt, timecnt, typecnt, charcnt
     let c1 = counts(0)
+    // read as signed, so a damaged count can be negative
+    if c1.any(|k| k < 0) {
+        return bad
+    }
     let v1_size = c1[3] * 5 + c1[4] * 6 + c1[5] + c1[2] * 8 + c1[1] + c1[0]
     let mut at = 0
     let mut width = 4
@@ -426,6 +430,9 @@ pub fn zone_from_tzif(name: Str, data: Bytes) -> Result[Zone, Str] {
         }
         c = counts(at)
         width = 8
+        if c.any(|k| k < 0) {
+            return bad
+        }
     }
     let timecnt = c[3]
     let typecnt = c[4]

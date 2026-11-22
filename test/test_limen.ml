@@ -7065,6 +7065,22 @@ UTC: 2026-07-01T12:00:00.000+00:00 UTC false | 2026-01-15T12:00:00.000+00:00 UTC
 Err(Failed(\"time: `../etc/passwd` is not a zone name\"))\n\
 true\n\
 Err(\"time: `x` is not a TZif zone file\")\n";
+  (* found by fuzz/inflate.lmn: a damaged TZif count read as negative
+     panicked *)
+  out "std-time-tzif-negative-count" {|use time
+
+fn main(root: Root) {
+    let out = root.stdout
+    // a TZif header whose count of transitions, read as signed, is negative
+    let header = "TZif".to_bytes() + bytes([0]) + bytes((0..<15).map(|_| 0))
+    let counts = bytes([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0])
+    let rest = bytes((0..<40).map(|_| 0))
+    out.print("{time.zone_from_tzif("x", header + counts + rest)}")
+    let v2 = "TZif".to_bytes() + bytes([50]) + bytes((0..<15).map(|_| 0)) + bytes([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0]) + bytes((0..<6).map(|_| 0))
+    out.print("{time.zone_from_tzif("y", v2 + header.slice(0, 4) + bytes([50]) + bytes((0..<15).map(|_| 0)) + counts + rest)}")
+}
+|}
+    "Err(\"time: `x` is not a TZif zone file\")\nErr(\"time: `y` is not a TZif zone file\")\n";
   par "time-within" ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] } {|use time
 
 fn main(root: Root) -> Result[(), IoError] {
