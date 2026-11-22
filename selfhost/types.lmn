@@ -115,6 +115,38 @@ pub fn repr(self: Subst, t: Ty) -> Ty {
     t
 }
 
+// Link every variable on the way from `t` to its representative straight
+// to it, as OCaml's repr does to its cells, so a long chain of variables
+// (`a ?? b ?? c ...` makes one) is not walked again on every use.
+fn compress(self: Subst, t: Ty) -> Subst {
+    let mut on_way: List[Int] = []
+    let mut t = t
+    while true {
+        match t {
+            TVar(v) => match self.links.get(v) {
+                Some(linked) => {
+                    on_way.push(v)
+                    t = linked
+                },
+                None => {
+                    break
+                },
+            },
+            _ => {
+                break
+            },
+        }
+    }
+    if on_way.len() < 2 {
+        return self
+    }
+    let mut s = self
+    for v in on_way {
+        s.links[v] = t
+    }
+    s
+}
+
 pub fn show(self: Subst, t: Ty) -> Str {
     let all = |ts: List[Ty]| ts.map(|x| self.show(x)).join(", ")
     match self.repr(t) {
@@ -227,38 +259,39 @@ fn occurs(self: Subst, v: Int, t: Ty) -> Bool {
 // when they cannot be; the links made before the mismatch was found stay,
 // as they do in OCaml, where the cells were already written.
 pub fn unify(self: Subst, a: Ty, b: Ty) -> (Bool, Subst) {
-    let a = self.repr(a)
-    let b = self.repr(b)
+    let s = self.compress(a).compress(b)
+    let a = s.repr(a)
+    let b = s.repr(b)
     match (a, b) {
-        (TErr, _) | (_, TErr) => (true, self),
-        (TVar(x), TVar(y)) if x == y => (true, self),
+        (TErr, _) | (_, TErr) => (true, s),
+        (TVar(x), TVar(y)) if x == y => (true, s),
         (TVar(v), t) | (t, TVar(v)) => {
-            if self.occurs(v, t) {
-                return (false, self)
+            if s.occurs(v, t) {
+                return (false, s)
             }
-            let mut s = self
+            let mut s = s
             s.links[v] = t
             (true, s)
         },
-        (TInt, TInt) | (TFloat, TFloat) | (TBool, TBool) | (TStr, TStr) | (TBytes, TBytes) | (TUnit, TUnit) => (true, self),
-        (TUInt(m), TUInt(n)) if m == n => (true, self),
-        (TList(x), TList(y)) | (TGroup(x), TGroup(y)) | (TChan(x), TChan(y)) | (TShared(x), TShared(y)) => self.unify(x, y),
-        (TAtomic, TAtomic) => (true, self),
+        (TInt, TInt) | (TFloat, TFloat) | (TBool, TBool) | (TStr, TStr) | (TBytes, TBytes) | (TUnit, TUnit) => (true, s),
+        (TUInt(m), TUInt(n)) if m == n => (true, s),
+        (TList(x), TList(y)) | (TGroup(x), TGroup(y)) | (TChan(x), TChan(y)) | (TShared(x), TShared(y)) => s.unify(x, y),
+        (TAtomic, TAtomic) => (true, s),
         // the length first, as OCaml does
-        (TArray(x, n), TArray(y, m)) => self.unify_all([n, x], [m, y]),
-        (TLen(n), TLen(m)) if n == m => (true, self),
-        (TMap(k1, v1), TMap(k2, v2)) => self.unify_all([k1, v1], [k2, v2]),
+        (TArray(x, n), TArray(y, m)) => s.unify_all([n, x], [m, y]),
+        (TLen(n), TLen(m)) if n == m => (true, s),
+        (TMap(k1, v1), TMap(k2, v2)) => s.unify_all([k1, v1], [k2, v2]),
         (TFn(p1, r1), TFn(p2, r2)) => {
             if p1.len() != p2.len() {
-                return (false, self)
+                return (false, s)
             }
-            self.unify_all(p1 + [r1], p2 + [r2])
+            s.unify_all(p1 + [r1], p2 + [r2])
         },
-        (TNamed(n1, a1), TNamed(n2, a2)) if n1 == n2 && a1.len() == a2.len() => self.unify_all(a1, a2),
-        (TCap(c1), TCap(c2)) if c1 == c2 => (true, self),
-        (TParam(x), TParam(y)) if x == y => (true, self),
-        (TDyn(x, xs), TDyn(y, ys)) if x == y && xs.len() == ys.len() => self.unify_all(xs, ys),
-        _ => (false, self),
+        (TNamed(n1, a1), TNamed(n2, a2)) if n1 == n2 && a1.len() == a2.len() => s.unify_all(a1, a2),
+        (TCap(c1), TCap(c2)) if c1 == c2 => (true, s),
+        (TParam(x), TParam(y)) if x == y => (true, s),
+        (TDyn(x, xs), TDyn(y, ys)) if x == y && xs.len() == ys.len() => s.unify_all(xs, ys),
+        _ => (false, s),
     }
 }
 

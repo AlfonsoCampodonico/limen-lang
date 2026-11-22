@@ -6,58 +6,90 @@ use ast
 // The expressions of an item: a table test's cases and a function's body.
 pub fn item(i: ast.Item) -> List[ast.Expr] {
     match i {
-        IFn(d) => maybe(d.table.map(|t| t.cases)) + block(d.body),
+        IFn(d) => from(maybe(d.table.map(|t| t.cases)) + block_kids(d.body)),
         IStruct(_) | IEnum(_) | IIface(_) | IType(_) => [],
     }
 }
 
 pub fn expr(e: ast.Expr) -> List[ast.Expr] {
-    [e] + below(e)
+    from([e])
 }
 
 pub fn block(b: ast.Block) -> List[ast.Expr] {
+    from(block_kids(b))
+}
+
+// `roots` and every expression inside them, each before the ones inside
+// it. Through a stack of expressions still to visit rather than
+// recursion, so a long chain (`a + b + c ...`, `x.f().g()...`, `else if`)
+// costs time in proportion to its length and no stack.
+fn from(roots: List[ast.Expr]) -> List[ast.Expr] {
+    let mut out: List[ast.Expr] = []
+    let mut stack = roots.reverse()
+    let mut top = stack.len()
+    while top > 0 {
+        top = top - 1
+        let e = stack[top]
+        out.push(e)
+        let kids = below(e)
+        let mut k = kids.len()
+        while k > 0 {
+            k = k - 1
+            if top < stack.len() {
+                stack[top] = kids[k]
+            } else {
+                stack.push(kids[k])
+            }
+            top = top + 1
+        }
+    }
+    out
+}
+
+// The expressions directly in a block: those of its statements, with the
+// statements of the blocks those hold, and its tail.
+fn block_kids(b: ast.Block) -> List[ast.Expr] {
     b.stmts.flat_map(stmt) + maybe(b.tail)
 }
 
 fn stmt(s: ast.Stmt) -> List[ast.Expr] {
     match s.desc {
-        SLet(_, _, _, _, e) | SExpr(e) | SLetPat(_, e) => expr(e),
-        SAssign(a, b) => expr(a) + expr(b),
+        SLet(_, _, _, _, e) | SExpr(e) | SLetPat(_, e) => [e],
+        SAssign(a, b) => [a, b],
         SReturn(e) => maybe(e),
-        SWhile(c, body) | SFor(_, _, c, body) | SForPat(_, c, body) => expr(c) + block(body),
-        SDefer(body) => block(body),
+        SWhile(c, body) | SFor(_, _, c, body) | SForPat(_, c, body) => [c] + block_kids(body),
+        SDefer(body) => block_kids(body),
         SBreak | SContinue => [],
     }
 }
 
 fn maybe(e: Option[ast.Expr]) -> List[ast.Expr] {
-    e.map(expr) ?? []
+    match e {
+        Some(x) => [x],
+        None => [],
+    }
 }
 
-fn all(es: List[ast.Expr]) -> List[ast.Expr] {
-    es.flat_map(expr)
-}
-
-// The expressions inside `e`, all the way down.
+// The expressions directly inside `e`, as written.
 fn below(e: ast.Expr) -> List[ast.Expr] {
     match e.desc {
         EInt(_) | EFloat(_) | EBool(_) | EUnit | EVar(_) => [],
         EStr(parts) => parts.flat_map(|part| match part {
-            SPExpr(x) => expr(x),
+            SPExpr(x) => [x],
             SPLit(_) => [],
         }),
-        EList(items) => all(items),
-        EBin(_, a, b) | EPipe(a, b) | EIndex(a, b) | ESafe(a, _, b) => expr(a) + expr(b),
-        EUn(_, a) | EField(a, _, _) | ENamed(_, _, a) | EClosure(_, a) | EDyn(a, _) => expr(a),
-        ECall(f, args) | EMethod(f, _, _, args) => expr(f) + all(args),
-        ETry(a, context) => expr(a) + maybe(context),
-        EIf(c, then, other) => expr(c) + block(then) + maybe(other),
-        EMatch(s, arms) => expr(s) + arms.flat_map(|a| maybe(a.guard) + expr(a.body)),
-        EBlock(b) => block(b),
-        EStruct(_, _, fields) => all(fields.map(|f| f.value)),
-        EWith(base, fields) => expr(base) + all(fields.map(|f| f.value)),
-        EGroup(_, _, until, b) => all(until.map(|d| [d.clock, d.ms]) ?? []) + block(b),
-        ESelect(arms) => arms.flat_map(|a| all(sel_op(a.op)) + maybe(a.guard) + expr(a.body)),
+        EList(items) => items,
+        EBin(_, a, b) | EPipe(a, b) | EIndex(a, b) | ESafe(a, _, b) => [a, b],
+        EUn(_, a) | EField(a, _, _) | ENamed(_, _, a) | EClosure(_, a) | EDyn(a, _) => [a],
+        ECall(f, args) | EMethod(f, _, _, args) => [f] + args,
+        ETry(a, context) => [a] + maybe(context),
+        EIf(c, then, other) => [c] + block_kids(then) + maybe(other),
+        EMatch(s, arms) => [s] + arms.flat_map(|a| maybe(a.guard) + [a.body]),
+        EBlock(b) => block_kids(b),
+        EStruct(_, _, fields) => fields.map(|f| f.value),
+        EWith(base, fields) => [base] + fields.map(|f| f.value),
+        EGroup(_, _, until, b) => (until.map(|d| [d.clock, d.ms]) ?? []) + block_kids(b),
+        ESelect(arms) => arms.flat_map(|a| sel_op(a.op) + maybe(a.guard) + [a.body]),
     }
 }
 

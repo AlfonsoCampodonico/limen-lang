@@ -2183,7 +2183,38 @@ fn op_name(op: ast.BinOp) -> Str {
 }
 
 fn check_bin(st: env.State, cx: env.Cx, fx: env.Fx, op: ast.BinOp, a: ast.Expr, b: ast.Expr, sp: ast.Span) -> (types.Ty, env.State) {
-    let (ta, st) = check_expr(st, cx, fx, a)
+    // the operators of a chain `x + y + z ...` on the left of this one,
+    // outermost first: checked from the innermost out with a loop, in the
+    // order recursion would take, so a long chain takes no stack
+    let mut spine: List[(ast.BinOp, ast.Expr, ast.Expr, ast.Expr)] = []
+    let mut left = a
+    while true {
+        match st.desc(left) {
+            EBin(op2, a2, b2) => {
+                spine.push((op2, a2, b2, left))
+                left = a2
+            },
+            _ => {
+                break
+            },
+        }
+    }
+    let (first, st) = check_expr(st, cx, fx, left)
+    let mut ta = first
+    let mut st = st
+    let mut k = spine.len()
+    while k > 0 {
+        k = k - 1
+        let (op2, a2, b2, node) = spine[k]
+        let (t, next) = check_bin_rest(st, cx, fx, op2, a2, b2, node.span, ta)
+        ta = t
+        st = next.set_type(node, t)
+    }
+    check_bin_rest(st, cx, fx, op, a, b, sp, ta)
+}
+
+// `a op b` once `a` is checked and has type `ta`.
+fn check_bin_rest(st: env.State, cx: env.Cx, fx: env.Fx, op: ast.BinOp, a: ast.Expr, b: ast.Expr, sp: ast.Span, ta: types.Ty) -> (types.Ty, env.State) {
     match op {
         And | Or => (TBool, expect(st.unify_at(a.span, TBool, ta), cx, fx, b, TBool)),
         // `lo..<hi`: the Ints from lo up to but not including hi
