@@ -12,7 +12,7 @@ then harden it, then promise not to break it.
 This file is the plan. The design doc keeps the reasons and the history of
 what was done; its older lists of what was missing point here.
 
-Updated 2026-11-21, after 0.7.3.
+Updated 2026-11-22, after 0.7.4.
 
 ## 0.4: a server you can leave running (done, 0.4.0)
 
@@ -104,6 +104,8 @@ Done when a program can read a gzipped log larger than memory, line by
 line, and write rows to Postgres.
 
 ## 0.8: hardening, and the breaking decisions
+
+The items marked done below shipped early, in 0.7.3 and 0.7.4.
 
 Everything that would break programs has to be decided before 1.0, so it
 happens here.
