@@ -159,16 +159,29 @@ fn literal(b: Int, fold: Bool) -> Node {
 }
 
 // The length of the UTF-8 sequence that a lead byte starts.
-fn wide_len(b: Int) -> Int {
-    if b >= 240 {
-        4
-    } else if b >= 224 {
-        3
-    } else if b >= 192 {
-        2
+// The length of the character at `i`: its UTF-8 bytes if they are well
+// formed, else 1 for the byte alone, as `chars()` and `split("")` take
+// them (so a stray byte never swallows the `)` or `.` after it).
+fn char_len(bs: List[Int], i: Int) -> Int {
+    let b = bs[i]
+    let (n, lo, hi) = if b >= 0xc2 && b <= 0xdf {
+        (2, 0x80, 0xbf)
+    } else if b >= 0xe0 && b <= 0xef {
+        (3, if b == 0xe0 { 0xa0 } else { 0x80 }, if b == 0xed { 0x9f } else { 0xbf })
+    } else if b >= 0xf0 && b <= 0xf4 {
+        (4, if b == 0xf0 { 0x90 } else { 0x80 }, if b == 0xf4 { 0x8f } else { 0xbf })
     } else {
-        1
+        (1, 0, 0)
     }
+    if n == 1 || i + n > bs.len() || bs[i + 1] < lo || bs[i + 1] > hi {
+        return 1
+    }
+    for k in 2..<n {
+        if bs[i + k] < 0x80 || bs[i + k] > 0xbf {
+            return 1
+        }
+    }
+    n
 }
 
 // The byte of two hex digits at `at`, or -1.
@@ -259,10 +272,7 @@ fn lex_class(bs: List[Int], start: Int, fold: Bool) -> Result[(Node, Int), Str] 
             }
         }
         if b >= 128 {
-            let n = wide_len(b)
-            if i + n > bs.len() {
-                return Err(fail("invalid UTF-8", i))
-            }
+            let n = char_len(bs, i)
             wide.push(NBytes(bs.skip(i).take(n)))
             i = i + n
             if i + 1 < bs.len() && bs[i] == 45 && bs[i + 1] != 93 {
@@ -489,7 +499,7 @@ fn lex(p: Str) -> Result[Lexed, Str] {
             toks.push(TAtom(NAssert(if multi { 3 } else { 1 })))
             i = i + 1
         } else if b >= 128 {
-            let n = wide_len(b)
+            let n = char_len(bs, i)
             toks.push(TAtom(NBytes(bs.skip(i).take(n))))
             i = i + n
         } else {
