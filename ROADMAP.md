@@ -131,8 +131,9 @@ happens here.
   rest on a work stack as `==` does, with the same answers and hashes; the
   interpreter's walks already fit OCaml's growing stack; `json.stringify`
   writes with a list rather than recursion, and no longer takes quadratic
-  time on a deep value. The conversions `json.encode` writes for a struct
-  chain still recurse once per level).
+  time on a deep value; the conversions `json.encode` and `json.decode`
+  write for a type that holds itself encode in pieces left for later and
+  decode a step at a time, so they no longer recurse once per level).
 - The JSON edges: a lone `\ud800`, duplicate keys, a nesting limit, numbers
   over 400 characters (done: each is a parse error, and the parser reads
   nesting without recursion, so it can't overflow a task's stack).
