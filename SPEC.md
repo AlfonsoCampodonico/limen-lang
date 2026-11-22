@@ -1568,7 +1568,7 @@ Every diagnostic has a stable code. `limen explain CODE` prints its explanation,
 | --- | --- |
 | W0001 | a renamed built-in method (`map_err`, now `map_error`) |
 | W0002 | a `match` arm, or an alternative of an or-pattern, that can never match |
-| E0001-E0009 | lexing and parsing: bad character, unclosed string, unexpected token, missing newline, integer too large, bad escape, empty interpolation, untyped parameter, misshapen multi-line string |
+| E0001-E0010 | lexing and parsing: bad character, unclosed string, unexpected token, missing newline, integer too large, bad escape, empty interpolation, untyped parameter, misshapen multi-line string, nested more than 256 deep (each operand, argument, item, block, type argument and sub-pattern inside another is a level, and so is each link of a chain such as `a + b + c` or `x.f().g()`, and each `else if`) |
 | E0101 | unknown name (with a suggestion) |
 | E0102 | unknown type, or a struct pattern naming something that is not a struct |
 | E0103 | unknown field |

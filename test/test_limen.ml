@@ -80,8 +80,9 @@ let compile ?(modules = []) name src =
   in
   match Parser.parse_file file src with
   | exception Diag.Fatal d ->
-    (* a literal out of range (E0005) is valid syntax, so it is not a grammar rejection *)
-    if d.code <> "E0005" then dump name src false;
+    (* a literal out of range (E0005) or nesting past the parser's limit
+       (E0010) is valid syntax, so it is not a grammar rejection *)
+    if d.code <> "E0005" && d.code <> "E0010" then dump name src false;
     ([], [ d ], [])
   | _ -> (
     dump name src true;
@@ -5923,6 +5924,24 @@ fn main(root: Root) -> Result[(), IoError] {
             "    out.print(\"{bad} {seen.all(|n| n > 2000)} {big == big} {wide < 8} {a != b} {r.int(5, 6)}\")" ]))
     "0 true true true true 5\n";
   panics "rand-bytes-negative" (main_wrap "    out.print(\"{root.rand.bytes(-1)}\")") "rand.bytes: negative length -1";
+  (* found by fuzz/front: deep nesting and long chains overflowed the
+     self-hosted compiler's stack and took quadratic time in both
+     compilers; past 256 levels a program is refused with E0010 *)
+  let rep n x = String.concat "" (List.init n (fun _ -> x)) in
+  let deep n o c = main_wrap ("    let x = " ^ rep n o ^ "1" ^ rep n c ^ "\n    out.print(\"{x}\")") in
+  errs "deep-parens" (deep 300 "(" ")") [ "E0010" ];
+  errs "deep-lists" (deep 300 "[" "]") [ "E0010" ];
+  errs "deep-blocks" (deep 300 "{ " " }") [ "E0010" ];
+  errs "deep-interpolation" (deep 300 "\"{" "}\"") [ "E0010" ];
+  errs "deep-unary" (deep 300 "-" "") [ "E0010" ];
+  errs "deep-binary-chain" (deep 1 "1" (rep 300 " + 1")) [ "E0010" ];
+  errs "deep-call-chain" (main_wrap ("    let x = \"a\"" ^ rep 150 ".len().to_str()")) [ "E0010" ];
+  errs "deep-else-if" (main_wrap ("    let x = " ^ rep 300 "if false { 1 } else " ^ "{ 0 }")) [ "E0010" ];
+  errs "deep-type" ("fn f(x: " ^ rep 300 "Option[" ^ "Int" ^ rep 300 "]" ^ ") {}\n\nfn main(root: Root) {}\n") [ "E0010" ];
+  errs "deep-pattern" (main_wrap ("    match 1 {\n        " ^ rep 300 "Some(" ^ "y" ^ rep 300 ")" ^ " => (),\n        _ => (),\n    }")) [ "E0010" ];
+  says "deep-says" (deep 100000 "(" ")") "E0010" "nested more than 256 deep";
+  out "deep-within" (deep 250 "(" ")") "1\n";
+  out "deep-chain-within" (deep 1 "1" (rep 200 " + 1")) "211\n";
   errs "interp-escaped-quote" (main_wrap "    out.print(\"{\\\"x\\\".len()}\")\n    out.print(\"later\")") [ "E0006" ];
   (* multi-line strings: the closing line's indentation comes off every
      line; escapes, interpolation (a multi-line string inside one too), `\`
