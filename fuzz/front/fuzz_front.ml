@@ -10,8 +10,8 @@
    to the self-hosted compiler's `check`: a crash, a hang, or a
    disagreement with the OCaml checker on whether the program has errors is
    a problem. With --exact LIMEN (bin/main.exe) as well, any difference
-   between what `limen check` and the self-hosted compiler print is
-   counted and shown, apart from the problems.
+   between what `limen check` and the self-hosted compiler print (stdout,
+   stderr and exit status) is a problem too.
 
      dune build ./fuzz/front/fuzz_front.exe
      _build/default/fuzz/front/fuzz_front.exe --seed 1 --count 5000 examples selfhost/tests
@@ -22,8 +22,11 @@
    directory under --work (a fresh temporary directory by default), so a
    program's modules and embedded files are still there.
 
+   An input that takes longer than the time limit is run once more, and is
+   a problem only if it is slow again (a busy machine is not a hang).
    --replay checks the files named instead, as they are, once each. --save
-   DIR keeps every problem's input. The last line is `N inputs, K problems`. *)
+   DIR keeps every problem's input. The last line is `N inputs, K problems`.
+   A temporary work directory is removed at the end. *)
 open Limen
 
 let sprintf = Printf.sprintf
@@ -314,13 +317,13 @@ let status = function
 let () =
   let seed = ref (int_of_float (Unix.gettimeofday ()) land 0xffffff) in
   let count = ref 1000 in
-  let secs = ref 10. in
+  let secs = ref 30. in
   let selfhost = ref None and exact = ref None and save = ref None and work = ref None and replay = ref false in
   let paths = ref [] in
   Arg.parse
     [ ("--seed", Arg.Set_int seed, "N  the random seed");
       ("--count", Arg.Set_int count, "N  how many mutants");
-      ("--time", Arg.Set_float secs, "S  the time limit for one input, in seconds (10)");
+      ("--time", Arg.Set_float secs, "S  the time limit for one input, in seconds (30)");
       ("--selfhost", Arg.String (fun s -> selfhost := Some s), "BIN  the self-hosted compiler, selfhost/limen.lmn built");
       ("--exact", Arg.String (fun s -> exact := Some s), "LIMEN  compare everything `limen check` prints with the self-hosted compiler's");
       ("--save", Arg.String (fun s -> save := Some s), "DIR  keep each problem's input here");
@@ -331,6 +334,7 @@ let () =
   let abs p = if Filename.is_relative p then Filename.concat (Sys.getcwd ()) p else p in
   let files = List.rev (List.fold_left lmn_files [] (List.rev_map abs !paths)) in
   if files = [] then (prerr_endline "fuzz_front: no .lmn files"; exit 2);
+  let temporary = !work = None in
   let work =
     match !work with
     | Some w -> (try Unix.mkdir w 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ()); abs w
@@ -403,13 +407,10 @@ let () =
   in
   let note_diff input msg =
     incr differ;
-    match !save with
-    | Some d ->
-      let f = Filename.concat d (sprintf "differs-%d-%d.lmn" !seed !differ) in
-      write_file f input;
-      write_file (f ^ ".txt") msg
-    | None -> if !differ <= 10 then Printf.printf "DIFFERS: %s\n%!" (String.sub msg 0 (min 300 (String.length msg)))
+    report "differs" input (String.sub msg 0 (min 2000 (String.length msg)))
   in
+  (* once more when it was too slow: only slow twice is a problem *)
+  let again run = match run () with None -> run () | r -> r in
   for i = 0 to n - 1 do
     let p = if !replay then corpus.(i) else pick rand corpus in
     let input = if !replay then p.src else mutate rand corpus p in
@@ -417,7 +418,12 @@ let () =
     let path = if !replay then p.path else Filename.concat (Filename.concat work rel) p.base in
     if not !replay then write_file path input;
     let what = sprintf "#%d, from %s" i p.path in
-    (match check_ocaml !secs path input with
+    let ocaml =
+      match check_ocaml !secs path input with
+      | Problem m when String.ends_with ~suffix:"time limit" m -> check_ocaml !secs path input
+      | r -> r
+    in
+    (match ocaml with
      | Problem m -> report "ocaml" input (sprintf "%s: %s" what m)
      | Fine has -> (
        if has then incr with_errors;
@@ -427,7 +433,7 @@ let () =
          let dir = Filename.dirname path in
          let grant = if !replay then "/" else work in
          let out = Filename.concat work "selfhost.out" in
-         match run_limited !secs dir bin [| "--grant"; "fs=" ^ grant ^ ":ro"; "--grant"; "env=PWD"; "--"; "check"; p.base |] out with
+         match again (fun () -> run_limited !secs dir bin [| "--grant"; "fs=" ^ grant ^ ":ro"; "--grant"; "env=PWD"; "--"; "check"; p.base |] out) with
          | None -> report "selfhost" input (sprintf "%s: the self-hosted compiler took longer than %gs" what !secs)
          | Some (Unix.WEXITED (0 | 1 as code)) -> (
            let got = read_file out in
@@ -440,7 +446,7 @@ let () =
              | None -> ()
              | Some limen -> (
                let want_out = Filename.concat work "limen.out" in
-               match run_limited !secs dir limen [| "check"; p.base |] want_out with
+               match again (fun () -> run_limited !secs dir limen [| "check"; p.base |] want_out) with
                | Some st ->
                  let want = read_file want_out in
                  if want <> got || st <> Unix.WEXITED code then
@@ -450,5 +456,6 @@ let () =
     if not !replay then write_file path p.src
   done;
   if !exact <> None then Printf.printf "%d inputs print differently in the two compilers\n" !differ;
+  if temporary then ignore (Sys.command (Filename.quote_command "rm" [ "-rf"; work ]));
   Printf.printf "%d inputs, %d parsed, %d with errors, %d problems\n" n !parsed !with_errors !problems;
   exit (if !problems = 0 then 0 else 1)

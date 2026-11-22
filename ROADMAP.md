@@ -142,7 +142,9 @@ happens here.
   and `fuzz/formats.lmn`, `regexes.lmn`, `inflate.lmn` and `ws/frames.lmn`
   the readers of URLs, CSV, base64, hex, UUIDs, times, Unicode, regexes,
   gzip, TZif and WebSocket frames; what they found is fixed, and
-  expressions, types and patterns now nest at most 256 deep, E0010).
+  expressions, types and patterns now nest at most 256 deep, E0010, and
+  a chain of operators, calls or `else if`s has at most 50,000 links,
+  E0011).
 - `full_path` hands SQLite a path string that another process with write
   access to the granted directory could race with a symlink swap after the
   check. The OS sandbox (Landlock, the macOS profile) refuses what such a

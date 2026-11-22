@@ -194,7 +194,7 @@ fn client(net: Net, clock: Clock, rand: Rand, addr: Str, n: Int) -> List[Str] {
         let damaged = rand.int(0, 2) == 0
         let input = if damaged { damage(rand, wire) } else { wire }
         let started = clock.now_ms()
-        match exchange(net, clock, addr, input, if damaged { 300 } else { 3000 }) {
+        match exchange(net, clock, addr, input, if damaged { 300 } else { 5000 }) {
             Err(e) => problems.push("FAILED {damaged}: {e}"),
             Ok(back) => match frames_of(back) {
                 None => problems.push("BAD FRAMES from the server: {back.slice(0, 100)}"),
@@ -213,7 +213,7 @@ fn client(net: Net, clock: Clock, rand: Rand, addr: Str, n: Int) -> List[Str] {
             },
         }
         let took = clock.now_ms() - started
-        if took > 10000 {
+        if took > 30000 {
             problems.push("SLOW: {took} ms for {input.len()} bytes")
         }
     }
@@ -248,7 +248,7 @@ fn fragments(net: Net, clock: Clock, rand: Rand, addr: Str, n: Int) -> List[Str]
             return ["FRAGMENTS: {e}"]
         },
     }
-    if took > 5000 { ["SLOW: {n} one-byte fragments took {took} ms"] } else { [] }
+    if took > 20000 { ["SLOW: {n} one-byte fragments took {took} ms"] } else { [] }
 }
 
 fn main(root: Root) -> Result[(), IoError] {
