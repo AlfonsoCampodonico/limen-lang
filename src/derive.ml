@@ -39,6 +39,8 @@ type st = {
   structs : (string, struct_decl) Hashtbl.t;
   enums : (string, enum_decl) Hashtbl.t;
   names : (string, int) Hashtbl.t; (* a type, shown -> its number *)
+  cyc : (string, bool) Hashtbl.t; (* [cyclic]'s answers, by type shown *)
+  pln : (string, bool) Hashtbl.t; (* [plain]'s *)
   mutable count : int;
   mutable out : item list; (* reversed *)
   mutable diags : Diag.t list;
@@ -112,41 +114,70 @@ let kids st t =
     | _ -> []
   with Unsupported _ | Invalid_argument _ -> []
 
+(* Every type reachable from [t] whose answer is not known yet, answered at
+   once: the strongly connected parts of the graph of what holds what
+   (Tarjan), a type holding itself when its part has more than one type or
+   it holds itself directly. Linear in the types, where asking each type
+   alone would be quadratic. *)
+let classify st t =
+  let idx = Hashtbl.create 16 and low = Hashtbl.create 16 and on = Hashtbl.create 16 in
+  let stack = ref [] and next = ref 0 in
+  let rec connect v =
+    let k = show v in
+    Hashtbl.replace idx k !next;
+    Hashtbl.replace low k !next;
+    incr next;
+    stack := v :: !stack;
+    Hashtbl.replace on k ();
+    List.iter
+      (fun w ->
+        let wk = show w in
+        if Hashtbl.mem st.cyc wk then ()
+        else if not (Hashtbl.mem idx wk) then begin
+          connect w;
+          Hashtbl.replace low k (min (Hashtbl.find low k) (Hashtbl.find low wk))
+        end
+        else if Hashtbl.mem on wk then Hashtbl.replace low k (min (Hashtbl.find low k) (Hashtbl.find idx wk)))
+      (kids st v);
+    if Hashtbl.find low k = Hashtbl.find idx k then begin
+      let rec pop acc =
+        match !stack with
+        | u :: rest ->
+          stack := rest;
+          Hashtbl.remove on (show u);
+          if show u = k then u :: acc else pop (u :: acc)
+        | [] -> acc
+      in
+      let part = pop [] in
+      let many = List.length part > 1 in
+      List.iter
+        (fun u ->
+          let uk = show u in
+          Hashtbl.replace st.cyc uk (many || List.exists (fun w -> show w = uk) (kids st u)))
+        part
+    end
+  in
+  if not (Hashtbl.mem st.cyc (show t)) then connect t
+
 (* Does [t] hold itself? Then a value can be as deep as it is long, so its
    encoder leaves those parts for later and its decoder goes a step at a
    time (json.lmn), rather than recursing once per level. *)
 let cyclic st t =
-  let target = show t in
-  let seen = Hashtbl.create 8 in
-  let rec go = function
-    | [] -> false
-    | u :: rest ->
-      let k = show u in
-      if k = target then true
-      else if Hashtbl.mem seen k then go rest
-      else begin
-        Hashtbl.replace seen k ();
-        go (kids st u @ rest)
-      end
-  in
-  go (kids st t)
+  classify st t;
+  Hashtbl.find st.cyc (show t)
 
 (* Is no type that holds itself inside [t], [t] included? Then its values
    are only so deep, and it is encoded as before: a json.Value, then
-   `stringify`. *)
-let plain st t =
-  let seen = Hashtbl.create 8 in
-  let rec go = function
-    | [] -> true
-    | u :: rest ->
-      let k = show u in
-      if Hashtbl.mem seen k then go rest
-      else begin
-        Hashtbl.replace seen k ();
-        (not (cyclic st u)) && go (kids st u @ rest)
-      end
-  in
-  go [ t ]
+   `stringify`. A type that is not inside itself has parts that are not
+   inside it either, so this recursion ends. *)
+let rec plain st t =
+  let k = show t in
+  match Hashtbl.find_opt st.pln k with
+  | Some b -> b
+  | None ->
+    let b = (not (cyclic st t)) && List.for_all (plain st) (kids st t) in
+    Hashtbl.replace st.pln k b;
+    b
 
 (* The encoder and decoder of [t], as function names: a helper of json.lmn
    for the simple types, written ones otherwise. The encoder of a plain
@@ -188,9 +219,9 @@ let rec coders st t : string * string =
          (* the decoder runs the steps *)
          let start = call st (jf st "stop") [ var st "r" ] in
          let dec = block st [] (call st (jf st "run") [ call st (jf st (sprintf "step$%d" k)) [ var st "v"; var st "at"; ex st (EClosure ([ ("r", None, st.sp) ], start)) ] ]) in
-         let next = te st (TyName (jf st "Next", [ te st (TyName ("R", [])) ])) in
+         let next = te st (TyName (jf st "Next", [ te st (TyName ("R$", [])) ])) in
          let kont = te st (TyFn ([ result ], next)) in
-         let stepper = fn ~gen:[ "R" ] (jf st (sprintf "step$%d" k)) (dec_params @ [ prm "k" kont ]) next body in
+         let stepper = fn ~gen:[ "R$" ] (jf st (sprintf "step$%d" k)) (dec_params @ [ prm "k" kont ]) next body in
          st.out <- fn from dec_params result dec :: stepper :: encoder :: st.out);
       (put, from))
 
@@ -523,7 +554,7 @@ let expand ?json ?(rows = []) (items : item list) : (item list * Diag.t list) op
     let structs = Hashtbl.create 16 and enums = Hashtbl.create 16 in
     (* the prelude's types too: Result is an enum like any other *)
     List.iter (function IStruct s -> Hashtbl.replace structs s.st_name s | IEnum e -> Hashtbl.replace enums e.en_name e | _ -> ()) (Prelude.items () @ items);
-    let mk q = { q; sp = Span.dummy; structs; enums; names = Hashtbl.create 16; count = 0; out = []; diags = [] } in
+    let mk q = { q; sp = Span.dummy; structs; enums; names = Hashtbl.create 16; cyc = Hashtbl.create 16; pln = Hashtbl.create 16; count = 0; out = []; diags = [] } in
     let js = mk (Option.value ~default:"" json) in
     (* the modules that read rows into structs, each writing its own conversions *)
     let rgs = List.map mk rows in

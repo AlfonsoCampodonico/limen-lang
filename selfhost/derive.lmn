@@ -38,6 +38,9 @@ struct Gen {
     enums: Map[Str, ast.EnumDecl],
     // a type, shown, and its number
     names: Map[Str, Int],
+    // `cyclic`'s and `plain`'s answers, by type shown (`classify`)
+    cyc: Map[Str, Bool],
+    pln: Map[Str, Bool],
     count: Int,
     // the functions written, in order
     out: List[ast.Item],
@@ -222,45 +225,119 @@ fn kids(g: Gen, t: types.Ty) -> List[types.Ty] {
 // encoder leaves those parts for later and its decoder goes a step at a
 // time (json.lmn), rather than recursing once per level.
 fn cyclic(g: Gen, t: types.Ty) -> Bool {
-    let target = show(g, t)
-    let mut seen: Map[Str, Bool] = map()
-    let mut todo = kids(g, t)
-    while !todo.is_empty() {
-        let u = todo[0]
-        let k = show(g, u)
-        if k == target {
-            return true
+    match g.cyc.get(show(g, t)) {
+        Some(b) => b,
+        None => connected(g, t).cyc.get(show(g, t)) ?? false,
+    }
+}
+
+// The state of `connected`'s walk.
+struct Scc {
+    idx: Map[Str, Int],
+    low: Map[Str, Int],
+    on: Map[Str, Bool],
+    // the walk's stack; slots from `depth` on are spare
+    stack: List[types.Ty],
+    depth: Int,
+    next: Int,
+    // the answers found
+    cyc: Map[Str, Bool],
+}
+
+// Every type reachable from `t` whose answer is not known yet, answered
+// at once: the strongly connected parts of the graph of what holds what
+// (Tarjan), a type holding itself when its part has more than one type or
+// it holds itself directly. Linear in the types, where asking each type
+// alone would be quadratic.
+fn connected(g: Gen, t: types.Ty) -> Scc {
+    let s = Scc { idx: map(), low: map(), on: map(), stack: [], depth: 0, next: 0, cyc: map() }
+    if g.cyc.contains(show(g, t)) {
+        return s
+    }
+    connect(g, t, s)
+}
+
+fn connect(g: Gen, v: types.Ty, s0: Scc) -> Scc {
+    let k = show(g, v)
+    let mut s = s0
+    s.idx[k] = s.next
+    s.low[k] = s.next
+    s.next = s.next + 1
+    if s.depth < s.stack.len() {
+        s.stack[s.depth] = v
+    } else {
+        s.stack.push(v)
+    }
+    s.depth = s.depth + 1
+    s.on[k] = true
+    for w in kids(g, v) {
+        let wk = show(g, w)
+        if g.cyc.contains(wk) || s.cyc.contains(wk) {
+            continue
         }
-        if seen.contains(k) {
-            todo = todo.skip(1)
-        } else {
-            seen[k] = true
-            todo = kids(g, u) + todo.skip(1)
+        if !s.idx.contains(wk) {
+            s = connect(g, w, s)
+            s.low[k] = s.low[k].min(s.low[wk])
+        } else if s.on.get(wk) ?? false {
+            s.low[k] = s.low[k].min(s.idx[wk])
         }
     }
-    false
+    if s.low[k] == s.idx[k] {
+        let mut part: List[types.Ty] = []
+        let mut going = true
+        while going {
+            s.depth = s.depth - 1
+            let u = s.stack[s.depth]
+            let uk = show(g, u)
+            s.on[uk] = false
+            part.push(u)
+            going = uk != k
+        }
+        let many = part.len() > 1
+        for u in part {
+            let uk = show(g, u)
+            s.cyc[uk] = many || kids(g, u).any(|w| show(g, w) == uk)
+        }
+    }
+    s
 }
 
 // Is no type that holds itself inside `t`, `t` included? Then its values
 // are only so deep, and it is encoded as before: a json.Value, then
-// `stringify`.
+// `stringify`. A type that is not inside itself has parts that are not
+// inside it either, so this recursion ends.
 fn plain(g: Gen, t: types.Ty) -> Bool {
-    let mut seen: Map[Str, Bool] = map()
-    let mut todo = [t]
-    while !todo.is_empty() {
-        let u = todo[0]
-        let k = show(g, u)
-        if seen.contains(k) {
-            todo = todo.skip(1)
-        } else {
-            seen[k] = true
-            if cyclic(g, u) {
-                return false
-            }
-            todo = kids(g, u) + todo.skip(1)
+    match g.pln.get(show(g, t)) {
+        Some(b) => b,
+        None => !cyclic(g, t) && kids(g, t).all(|u| plain(g, u)),
+    }
+}
+
+// Work out `cyclic` and `plain` for `t` and the parts plain needs, once
+// for the whole pass.
+fn classify(g: Gen, t: types.Ty) -> Gen {
+    let k = show(g, t)
+    if g.pln.contains(k) {
+        return g
+    }
+    let mut g = g
+    for e in connected(g, t).cyc.entries() {
+        g.cyc[e.0] = e.1
+    }
+    let c = g.cyc.get(k) ?? false
+    if c {
+        g.pln[k] = false
+        return g
+    }
+    let mut p = true
+    for u in kids(g, t) {
+        g = classify(g, u)
+        if !(g.pln.get(show(g, u)) ?? true) {
+            p = false
         }
     }
-    true
+    g.pln[k] = p
+    g
 }
 
 // The encoder and decoder of `t`, as function names: a helper of
@@ -279,7 +356,7 @@ fn coders(g: Gen, t: types.Ty) -> Result[((Str, Str), Gen), Fail] {
         _ => {},
     }
     let key = show(g, t)
-    let mut g = g
+    let mut g = classify(g, t)
     g.count = g.count + 1
     let k = g.count
     g.names[key] = k
@@ -317,9 +394,9 @@ fn coders(g: Gen, t: types.Ty) -> Result[((Str, Str), Gen), Fail] {
             let start = call(g, jf(g, "stop"), [var(g, "r")])
             let stepper_name = jf(g, "step${k}")
             let run = only(g, call(g, jf(g, "run"), [call(g, stepper_name, [var(g, "v"), var(g, "at"), ex(g, EClosure(r, start))])]))
-            let next = te(g, TyName(jf(g, "Next"), [te(g, TyName("R", []))]))
+            let next = te(g, TyName(jf(g, "Next"), [te(g, TyName("R$", []))]))
             let kont = te(g, TyFn([rt], next))
-            let stepper = fn_gen(g, stepper_name, ["R"], dec_params + [param(g, "k", kont)], next, body)
+            let stepper = fn_gen(g, stepper_name, ["R$"], dec_params + [param(g, "k", kont)], next, body)
             g.out = g.out + [encoder, stepper, fn_item(g, from, dec_params, rt, run)]
         },
     }
@@ -790,10 +867,10 @@ pub fn expand(json: Option[Str], rows: List[Str], items: List[ast.Item], c: type
         }
     }
     let span0 = ast.Span { file: 0, lo: 0, hi: 0 }
-    let mut g = Gen { q: json ?? "", sp: span0, structs, enums, names: map(), count: 0, out: [], subst: c.state.subst }
+    let mut g = Gen { q: json ?? "", sp: span0, structs, enums, names: map(), cyc: map(), pln: map(), count: 0, out: [], subst: c.state.subst }
     // the modules that read rows into structs, each writing its own
     // conversions, and their problems
-    let mut rgs = rows.map(|q| Gen { q, sp: span0, structs, enums, names: map(), count: 0, out: [], subst: c.state.subst })
+    let mut rgs = rows.map(|q| Gen { q, sp: span0, structs, enums, names: map(), cyc: map(), pln: map(), count: 0, out: [], subst: c.state.subst })
     let mut rdiags: List[List[diag.Diag]] = rows.map(|_| [])
     let mut wrappers: Map[Str, Str] = map()
     let mut diags: List[diag.Diag] = []

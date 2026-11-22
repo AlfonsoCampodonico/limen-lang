@@ -1,0 +1,19 @@
+// A user type named R next to the step decoders' own type parameter.
+use json
+struct R { v: Int, next: Option[R] }
+enum Q[R] { Cons(R, Q[R]), Nil }
+enum Tree[T] { Leaf(T), Node(Tree[T], Tree[T]) }
+fn main(root: Root) {
+    let r = R { v: 1, next: Some(R { v: 2, next: None }) }
+    let s = json.encode(r)
+    let b: Result[R, Str] = json.decode(s)
+    let q: Q[Int] = Q.Cons(1, Q.Nil)
+    let qs = json.encode(q)
+    let qb: Result[Q[Int], Str] = json.decode(qs)
+    let t: Tree[R] = Tree.Node(Tree.Leaf(r), Tree.Leaf(R { v: 3, next: None }))
+    let ts = json.encode(t)
+    let tb: Result[Tree[R], Str] = json.decode(ts)
+    root.stdout.print("{s} {b == Ok(r)}")
+    root.stdout.print("{qs} {qb == Ok(q)}")
+    root.stdout.print("{ts} {tb == Ok(t)}")
+}

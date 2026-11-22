@@ -2504,6 +2504,29 @@ fn main(root: Root) {
 }
 |}
     ~want_out:"17888895 {\"Cons\":[999 ]}]}]}]}]}]} | 23888894 {\"value\":999 }}}}}}}}}}}} | 11000000 {\"kids\":[{\"k ]}]}]}]}]}]} | Err(\"nested deeper than 512 at byte 4096\")\ntrue true true 2099 ns[1]`: no variant `Nope`; expected one of `Cons`, `Nil`\n" ~want_err_prefix:None;
+  (* A program's own type named R: the step decoders' type parameter is a
+     name source cannot write, so it shadows nothing *)
+  out "json-type-named-r"
+    {|use json
+struct R { v: Int, next: Option[R] }
+enum Q[R] { Cons(R, Q[R]), Nil }
+enum Tree[T] { Leaf(T), Node(Tree[T], Tree[T]) }
+fn main(root: Root) {
+    let r = R { v: 1, next: Some(R { v: 2, next: None }) }
+    let s = json.encode(r)
+    let b: Result[R, Str] = json.decode(s)
+    let q: Q[Int] = Q.Cons(1, Q.Nil)
+    let qs = json.encode(q)
+    let qb: Result[Q[Int], Str] = json.decode(qs)
+    let t: Tree[R] = Tree.Node(Tree.Leaf(r), Tree.Leaf(R { v: 3, next: None }))
+    let ts = json.encode(t)
+    let tb: Result[Tree[R], Str] = json.decode(ts)
+    root.stdout.print("{s} {b == Ok(r)}")
+    root.stdout.print("{qs} {qb == Ok(q)}")
+    root.stdout.print("{ts} {tb == Ok(t)}")
+}
+|}
+    "{\"v\":1,\"next\":{\"v\":2,\"next\":null}} true\n{\"Cons\":[1,\"Nil\"]} true\n{\"Node\":[{\"Leaf\":{\"v\":1,\"next\":{\"v\":2,\"next\":null}}},{\"Leaf\":{\"v\":3,\"next\":null}}]} true\n";
   (* Recursion deeper than a task's stack: natively a message and status 1,
      not a silent crash (the interpreter's stack is larger) *)
   if native_for "stack-overflow" && selected "stack-overflow" then
