@@ -95,6 +95,19 @@ static void vtls_client_init(void) {
     for (size_t i = 0; i < sizeof bundles / sizeof *bundles; i++)
       if (access(bundles[i], R_OK) == 0 && SSL_CTX_load_verify_locations(c, bundles[i], NULL) == 1) break;
   }
+  /* Work out the trusted certificates' extensions (key ids, usage) now,
+     while no other thread can see them. OpenSSL otherwise fills them in on
+     first use, under the certificate's lock with a lock-free acquire/release
+     check in front. That is correct, but ThreadSanitizer cannot see the
+     atomics inside an uninstrumented libcrypto, so two handshakes checking
+     their chains against the same CA at once read as a race on the CA's key
+     id. Certificates an SSL_CERT_DIR lookup loads later are still filled in
+     lazily, which is just as safe. */
+  STACK_OF(X509_OBJECT) *objs = X509_STORE_get0_objects(SSL_CTX_get_cert_store(c));
+  for (int i = 0; i < sk_X509_OBJECT_num(objs); i++) {
+    X509 *x = X509_OBJECT_get0_X509(sk_X509_OBJECT_value(objs, i));
+    if (x) (void)X509_check_purpose(x, -1, 0);
+  }
   ERR_clear_error();
   vtls_client_ctx = c;
 }

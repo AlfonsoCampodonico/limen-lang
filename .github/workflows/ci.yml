@@ -15,6 +15,15 @@ jobs:
       matrix:
         # no Intel macOS: those runners are being retired (see ROADMAP.md, 0.9)
         os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
+        ocaml: ["5.3"]
+        exclude:
+          - os: macos-15
+            ocaml: "5.3"
+        include:
+          # 5.3 dies at exit on macos-15 ("Failed to reset signal stack (err
+          # 22)") after every test has passed; 5.5 is what development uses
+          - os: macos-15
+            ocaml: "5.5"
     runs-on: ${{ matrix.os }}
     # each step has its own limit, so a hang fails in minutes; this is the sum
     timeout-minutes: 180
@@ -33,7 +42,7 @@ jobs:
 
       - uses: ocaml/setup-ocaml@v3
         with:
-          ocaml-compiler: 5.3
+          ocaml-compiler: ${{ matrix.ocaml }}
 
       - name: Dune
         run: opam install -y dune
