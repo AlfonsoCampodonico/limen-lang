@@ -47,23 +47,66 @@ W_RT void w_release(void *o) {
   }
   w_rel_busy = 0;
 }
-/* The work stacks of w_share, w_eq and w_show (limen_rt.h). Each grows as
-   needed and is given back when a large one empties, or when the thread
-   ends (w_stacks_free). */
-static void w_stacks_owned(void);
+/* The work stacks of w_share, w_eq, w_show, w_cmp and w_hash (limen_rt.h).
+   Each grows as needed and is given back when a large one empties, or when
+   the thread ends: they hang off one block of the thread's, which is also
+   the value of a pthread key, so the key's destructor frees them without
+   reading thread-local variables (not safe in a destructor on Darwin). */
+typedef struct { void (*kids)(void *); void *o; } WShareItem;
+typedef struct { WEqFn f; void *a, *b; int64_t i; } WEqItem;
+/* f == NULL: i bytes of text, on top of the text stack */
+typedef struct { WShowFn f; void *v; int64_t i, pos; } WShowItem;
+/* f == NULL: an answer found ahead of time, i (w_cmp_res) */
+typedef struct { WCmpFn f; void *a, *b; int64_t i; } WCmpItem;
+/* A fresh part, or (wait) a call waiting at part i, with h the hash before
+   that part's */
+typedef struct { WHashFn f; void *o; int64_t i; uint64_t h; int wait; } WHashItem;
+typedef struct {
+  WShareItem *sh; WEqItem *eq; WShowItem *show, *show_tmp; char *text; WCmpItem *cmp; WHashItem *hash;
+  int64_t sh_cap, eq_cap, show_cap, show_tmp_cap, text_cap, cmp_cap, hash_cap;
+} WStacks;
+static __thread WStacks *w_stk;
+static pthread_key_t w_stacks_key;
+static pthread_once_t w_stacks_once = PTHREAD_ONCE_INIT;
+static void w_stacks_free(void *p) {
+  WStacks *s = (WStacks *)p;
+  free(s->sh); free(s->eq); free(s->show); free(s->show_tmp); free(s->text); free(s->cmp); free(s->hash);
+  free(s);
+}
+static void w_stacks_key_new(void) { pthread_key_create(&w_stacks_key, w_stacks_free); }
+__attribute__((noinline)) static WStacks *w_stk_new(void) {
+  WStacks *s = (WStacks *)calloc(1, sizeof *s);
+  if (!s) w_oom();
+  pthread_once(&w_stacks_once, w_stacks_key_new);
+  pthread_setspecific(w_stacks_key, s);
+  w_stk = s;
+  return s;
+}
+static inline WStacks *w_stk_get(void) { return __builtin_expect(w_stk != NULL, 1) ? w_stk : w_stk_new(); }
+#define w_sh_st (w_stk_get()->sh)
+#define w_sh_cap (w_stk_get()->sh_cap)
+#define w_eq_st (w_stk_get()->eq)
+#define w_eq_cap (w_stk_get()->eq_cap)
+#define w_show_st (w_stk_get()->show)
+#define w_show_cap (w_stk_get()->show_cap)
+#define w_show_tmp (w_stk_get()->show_tmp)
+#define w_show_tmp_cap (w_stk_get()->show_tmp_cap)
+#define w_text (w_stk_get()->text)
+#define w_text_cap (w_stk_get()->text_cap)
+#define w_cmp_st (w_stk_get()->cmp)
+#define w_cmp_cap (w_stk_get()->cmp_cap)
+#define w_hash_st (w_stk_get()->hash)
+#define w_hash_cap (w_stk_get()->hash_cap)
 static void *w_stack_grow(void *p, int64_t *cap, int64_t need, size_t size) {
   if (need <= *cap) return p;
-  if (!*cap) w_stacks_owned();
   int64_t c = *cap ? *cap : 64;
   while (c < need) { if (c > INT64_MAX / 2) w_oom(); c *= 2; }
   *cap = c;
   return w_realloc(p, w_bytes(c, size));
 }
 #define W_STACK_KEEP 4096
-typedef struct { void (*kids)(void *); void *o; } WShareItem;
 __thread int w_sh_busy, w_sh_depth;
-static __thread WShareItem *w_sh_st;
-static __thread int64_t w_sh_n, w_sh_cap;
+static __thread int64_t w_sh_n;
 W_RT void w_share_push(void *o, void (*kids)(void *)) {
   w_sh_st = (WShareItem *)w_stack_grow(w_sh_st, &w_sh_cap, w_sh_n + 1, sizeof(WShareItem));
   w_sh_st[w_sh_n++] = (WShareItem){ kids, o };
@@ -75,11 +118,8 @@ W_RT void w_share_outer(void *o, void (*kids)(void *)) {
   if (w_sh_cap > W_STACK_KEEP) { free(w_sh_st); w_sh_st = NULL; w_sh_cap = 0; }
   w_sh_busy = 0;
 }
-typedef struct { WEqFn f; void *a, *b; int64_t i; } WEqItem;
 __thread int w_eq_busy, w_eq_depth;
 __thread int64_t w_eq_n;
-static __thread WEqItem *w_eq_st;
-static __thread int64_t w_eq_cap;
 W_RT void w_eq_push(WEqFn f, void *a, void *b, int64_t i) {
   w_eq_st = (WEqItem *)w_stack_grow(w_eq_st, &w_eq_cap, w_eq_n + 1, sizeof(WEqItem));
   w_eq_st[w_eq_n++] = (WEqItem){ f, a, b, i };
@@ -102,15 +142,10 @@ W_RT bool w_eq_outer(WEqFn f, void *a, void *b, int64_t i) {
   w_eq_busy = 0; w_eq_depth = depth;
   return ok;
 }
-/* f == NULL: i bytes of text, on top of the text stack */
-typedef struct { WShowFn f; void *v; int64_t i, pos; } WShowItem;
 __thread WBuf *w_show_buf;
 __thread int w_show_depth;
 __thread int64_t w_show_n;
-static __thread WShowItem *w_show_st, *w_show_tmp;
-static __thread int64_t w_show_cap, w_show_tmp_cap;
-static __thread char *w_text;
-static __thread int64_t w_text_n, w_text_cap;
+static __thread int64_t w_text_n;
 W_RT void w_show_push(WBuf *b, WShowFn f, void *v, int64_t i) {
   w_show_st = (WShowItem *)w_stack_grow(w_show_st, &w_show_cap, w_show_n + 1, sizeof(WShowItem));
   w_show_st[w_show_n++] = (WShowItem){ f, v, i, b->len };
@@ -159,12 +194,8 @@ W_RT void w_show_outer(WBuf *b, WShowFn f, void *v, int64_t i) {
   }
   w_show_buf = buf; w_show_depth = depth;
 }
-/* f == NULL: an answer found ahead of time, i (w_cmp_res) */
-typedef struct { WCmpFn f; void *a, *b; int64_t i; } WCmpItem;
 __thread int w_cmp_busy, w_cmp_depth;
 __thread int64_t w_cmp_n, w_cmp_base;
-static __thread WCmpItem *w_cmp_st;
-static __thread int64_t w_cmp_cap;
 W_RT void w_cmp_push(WCmpFn f, void *a, void *b, int64_t i) {
   w_cmp_st = (WCmpItem *)w_stack_grow(w_cmp_st, &w_cmp_cap, w_cmp_n + 1, sizeof(WCmpItem));
   w_cmp_st[w_cmp_n++] = (WCmpItem){ f, a, b, i };
@@ -189,12 +220,8 @@ W_RT int w_cmp_outer(WCmpFn f, void *a, void *b, int64_t i) {
   w_cmp_busy = busy; w_cmp_depth = depth;
   return r;
 }
-/* A fresh part, or (wait) a call waiting at part i, with h the hash before
-   that part's */
-typedef struct { WHashFn f; void *o; int64_t i; uint64_t h; int wait; } WHashItem;
 __thread int w_hash_busy, w_hash_depth, w_hash_susp;
-static __thread WHashItem *w_hash_st;
-static __thread int64_t w_hash_n, w_hash_cap;
+static __thread int64_t w_hash_n;
 W_RT void w_hash_push(WHashFn f, void *o) {
   w_hash_st = (WHashItem *)w_stack_grow(w_hash_st, &w_hash_cap, w_hash_n + 1, sizeof(WHashItem));
   w_hash_st[w_hash_n++] = (WHashItem){ f, o, 0, W_HASH_SEED, 0 };
@@ -230,20 +257,20 @@ W_RT uint64_t w_hash_outer(WHashFn f, void *o) {
   w_hash_busy = busy; w_hash_depth = depth; w_hash_susp = susp;
   return h;
 }
-/* The work stacks are the thread's: a thread that ends gives them back */
-static pthread_key_t w_stacks_key;
-static pthread_once_t w_stacks_once = PTHREAD_ONCE_INIT;
-static void w_stacks_free(void *unused) {
-  (void)unused;
-  free(w_sh_st); free(w_eq_st); free(w_show_st); free(w_show_tmp); free(w_text); free(w_cmp_st); free(w_hash_st);
-  w_sh_st = NULL; w_eq_st = NULL; w_show_st = NULL; w_show_tmp = NULL; w_text = NULL; w_cmp_st = NULL; w_hash_st = NULL;
-  w_sh_cap = w_eq_cap = w_show_cap = w_show_tmp_cap = w_text_cap = w_cmp_cap = w_hash_cap = 0;
-}
-static void w_stacks_key_new(void) { pthread_key_create(&w_stacks_key, w_stacks_free); }
-static void w_stacks_owned(void) {
-  pthread_once(&w_stacks_once, w_stacks_key_new);
-  pthread_setspecific(w_stacks_key, (void *)1);
-}
+#undef w_sh_st
+#undef w_sh_cap
+#undef w_eq_st
+#undef w_eq_cap
+#undef w_show_st
+#undef w_show_cap
+#undef w_show_tmp
+#undef w_show_tmp_cap
+#undef w_text
+#undef w_text_cap
+#undef w_cmp_st
+#undef w_cmp_cap
+#undef w_hash_st
+#undef w_hash_cap
 /* Start a boundary's list; its parent is the current innermost boundary. */
 W_RT void w_catch_init(WCatch *c) {
   c->msg = NULL; c->where = NULL; c->unwinding = 0; c->cancel = 0;
