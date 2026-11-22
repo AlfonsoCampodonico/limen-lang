@@ -4785,6 +4785,26 @@ fn main(root: Root) {
 }
 |}
     "[34, 239, 187, 191] true 6\n";
+  (* found by fuzz/formats.lmn: `to_str` wrote text that `parse` read as
+     another URL, or refused *)
+  out "std-url-brackets-and-slashes" {|use url
+
+fn main(root: Root) {
+    let out = root.stdout
+    // a bracket belongs only around a whole IPv6 address
+    out.print("{url.parse("http://::1]:80/x")} {url.parse("http://a[b/x")} {url.parse("http://[::1]:80/x").map(|u| u.host)}")
+    // what only brackets let through goes back in them
+    out.print("{url.parse("http://[a[b]:8/").map(|u| u.to_str())} {url.parse("http://[[1]:8").map(|u| url.parse(u.to_str()) == Ok(u))}")
+    // a password alone keeps the authority it is in
+    out.print("{url.parse("//:pw@").map(|u| u.to_str())} {url.parse("http://[a b]:8")}")
+    // a path starting with `//` keeps an empty host before it
+    match url.parse("////host/x?y") {
+        Ok(u) => out.print("{u.host == ""} {u.path} {u.to_str()} {url.parse(u.to_str()) == Ok(u)}"),
+        Err(e) => out.print(e),
+    }
+}
+|}
+    "Err(\"url: `]` inside the host at byte 10\") Err(\"url: `[` inside the host at byte 8\") Ok(\"::1\")\nOk(\"http://[a[b]:8/\") Ok(true)\nOk(\"//:pw@\") Err(\"url: a space in the host at byte 9\")\ntrue //host/x ////host/x?y true\n";
   (* url.resolve against every example of RFC 3986 section 5.4 *)
   out "std-url-resolve"
     {v|use url

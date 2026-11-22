@@ -112,6 +112,12 @@ fn read_authority(u: Url, authority: Str, at: Int) -> Result[Url, Str] {
         match hostport.index_of("]") {
             Some(k) => {
                 out.host = hostport.slice(1, k)
+                match out.host.index_of(" ") {
+                    Some(j) => {
+                        return Err("url: a space in the host at byte {start + 1 + j}")
+                    },
+                    None => (),
+                }
                 let after = hostport.slice(k + 1, hostport.len())
                 if after.starts_with(":") {
                     port_text = after.slice(1, after.len())
@@ -139,6 +145,17 @@ fn read_authority(u: Url, authority: Str, at: Int) -> Result[Url, Str] {
             },
             None => (),
         }
+        // brackets go only around a whole IPv6 address
+        let bracket = match out.host.index_of("[") {
+            Some(k) => Some(k),
+            None => out.host.index_of("]"),
+        }
+        match bracket {
+            Some(k) => {
+                return Err("url: `{out.host.slice(k, k + 1)}` inside the host at byte {start + k}")
+            },
+            None => (),
+        }
     }
     if port_text != "" {
         let p = port_text.bytes()
@@ -160,8 +177,10 @@ pub fn to_str(self: Url) -> Str {
     if self.scheme != "" {
         out = self.scheme + ":"
     }
-    // `file:///etc/hosts`: an empty host is written when the path is absolute
-    if self.host != "" || self.user != "" || self.port.is_some() || (self.scheme != "" && self.path.starts_with("/")) {
+    // `file:///etc/hosts`: an empty host is written when the path is
+    // absolute, and before a path starting with `//`, which would read as
+    // a host
+    if self.host != "" || self.user != "" || self.password != "" || self.port.is_some() || (self.scheme != "" && self.path.starts_with("/")) || self.path.starts_with("//") {
         out = out + "//"
         if self.user != "" || self.password != "" {
             out = out + encode(self.user)
@@ -170,7 +189,9 @@ pub fn to_str(self: Url) -> Str {
             }
             out = out + "@"
         }
-        out = out + if self.host.contains(":") { "[" + self.host + "]" } else { self.host }
+        // in brackets as it was read: an IPv6 address, or anything else
+        // with a `[` that only brackets let through
+        out = out + if self.host.contains(":") || self.host.contains("[") { "[" + self.host + "]" } else { self.host }
         match self.port {
             Some(p) => {
                 out = out + ":{p}"
