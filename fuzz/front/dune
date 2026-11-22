@@ -1,0 +1,6 @@
+; The front-end fuzzer: mutated programs through the lexer, parser and
+; checker in-process, and through the self-hosted checker. See
+; fuzz/README.md.
+(executable
+ (name fuzz_front)
+ (libraries limen unix))

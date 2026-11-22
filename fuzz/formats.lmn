@@ -1,0 +1,343 @@
+// Fuzz the readers of text from outside: URLs and query strings, CSV,
+// base64, hex, UUIDs, ISO 8601 times, Unicode and the number parsers.
+// Each gets mutated input and must never panic or take long; whatever it
+// accepts must print back to something it reads as the same value, and
+// values made at random must survive a trip through text.
+//
+//   limen build fuzz/formats.lmn -o /tmp/ff && /tmp/ff --seed 1 -- 100000
+use base64
+use csv
+use hex
+use text
+use time
+use unicode
+use url
+use uuid
+
+fn seeds() -> List[Str] {
+    [
+        "",
+        "https://ana:secret@example.com:8443/docs/a%20b?q=1&q=2#top",
+        "http://[::1]:80/x",
+        "file:///etc/hosts",
+        "//host/x?y",
+        "/a/b/../c/./d",
+        "mailto:a@b",
+        "a:b:c",
+        "q=a+b&tag=x&tag=y&&=&k",
+        "%41%zz%",
+        "a,b\n1,\"x, y\"\n",
+        "\"a\"\"b\",c\r\n\"\"\n,\n",
+        "\u{feff}h1,h2\nv1,v2\n",
+        "aGk=",
+        "aGk",
+        "SGVsbG8sIHdvcmxkIQ==",
+        "-_-_",
+        "00ff10AB",
+        "f81d4fae-7dec-41d0-a765-00a0c91e6bf6",
+        "\{f81d4fae-7dec-41d0-a765-00a0c91e6bf6}",
+        "urn:uuid:F81D4FAE7DEC41D0A76500A0C91E6BF6",
+        "2026-11-11",
+        "2026-11-11T18:22:05.123456+01:00",
+        "2024-02-29 23:59:60Z",
+        "0000-01-01T00:00",
+        "9999-12-31T23:59:59.999-23:59",
+        "Straße ﬁx e\u{301} \u{1f600} ΣΑΣ",
+        "-9223372036854775808",
+        "9223372036854775807",
+        "1.5e-308",
+        "4.9e-324",
+        "1e308",
+    ]
+}
+
+fn pieces() -> List[Str] {
+    [
+        ":", "/", "//", "?", "#", "@", "[", "]", "%", "%2", "%2F", "+", "&", "=", ",", "\"", "\n", "\r\n", "\r", ";", " ", "\t", "-", ".", "..",
+        "=", "==", "T", "Z", "+01:00", "-", "e", "E", "0", "9", "\u{301}", "\u{feff}", "\u{1f600}", "ß", "İ", "ǅ", "\u{fffd}", 0.to_char(),
+        127.to_char(), 255.to_char(),
+    ]
+}
+
+fn mutate(rand: Rand, s: Str) -> Str {
+    let mut t = s
+    let rounds = rand.int(0, 5)
+    for _ in 0..<rounds {
+        let n = t.len()
+        let at = if n == 0 { 0 } else { rand.int(0, n + 1) }
+        let what = rand.int(0, 6)
+        if what == 0 && n > 0 {
+            let k = rand.int(0, n)
+            t = t.slice(0, k) + t.slice(k + 1, n)
+        } else if what == 1 {
+            let p = pieces()
+            t = t.slice(0, at) + p[rand.int(0, p.len())] + t.slice(at, n)
+        } else if what == 2 && n > 0 {
+            let k = rand.int(0, n)
+            t = t.slice(0, k) + rand.int(0, 256).to_char() + t.slice(k + 1, n)
+        } else if what == 3 && n > 0 {
+            // a raw byte, not a character
+            let k = rand.int(0, n)
+            t = t.slice(0, k) + rand.bytes(1).to_str() + t.slice(k + 1, n)
+        } else if what == 4 {
+            t = t.slice(0, at)
+        } else {
+            let s2 = seeds()
+            t = t + s2[rand.int(0, s2.len())]
+        }
+    }
+    t
+}
+
+// A short string of characters and raw bytes picked from all over.
+fn any_str(rand: Rand) -> Str {
+    let mut t = ""
+    for _ in 0..<rand.int(0, 12) {
+        let k = rand.int(0, 5)
+        t = t + if k == 0 { rand.bytes(1).to_str() } else if k == 1 { rand.int(0, 0x110000).to_char() } else if k == 2 { rand.int(32, 127).to_char() } else { pieces()[rand.int(0, pieces().len())] }
+    }
+    t
+}
+
+// `s` quoted, with control bytes, quotes, backslashes and bytes past
+// ASCII written as escapes, so a problem prints on one line.
+fn show(s: Str) -> Str {
+    let digits = "0123456789abcdef"
+    let mut out = "\""
+    for b in s.bytes() {
+        if b == 34 || b == 92 {
+            out = out + "\\" + b.to_char()
+        } else if b < 32 || b >= 127 {
+            out = out + "\\x" + digits.slice(b >> 4, (b >> 4) + 1) + digits.slice(b & 15, (b & 15) + 1)
+        } else {
+            out = out + b.to_char()
+        }
+    }
+    out + "\""
+}
+
+struct Report {
+    out: Stdout,
+}
+
+fn problem(r: Report, what: Str, input: Str, detail: Str) -> Int {
+    r.out.print("{what} {show(input)}: {detail}")
+    1
+}
+
+fn check_url(r: Report, rand: Rand, s: Str) -> Int {
+    let mut bad = 0
+    match url.parse(s) {
+        Ok(u) => {
+            let back = url.parse(u.to_str())
+            if back != Ok(u) {
+                bad = bad + problem(r, "URL ROUND TRIP", s, "{u} printed {show(u.to_str())}, read back as {back}")
+            }
+            match url.resolve(u, mutate(rand, seeds()[rand.int(0, 10)])) {
+                Ok(t) => {
+                    let again = url.parse(t.to_str())
+                    if again != Ok(t) {
+                        bad = bad + problem(r, "URL RESOLVE", s, "{t} printed {show(t.to_str())}, read back as {again}")
+                    }
+                },
+                Err(_) => (),
+            }
+        },
+        Err(_) => (),
+    }
+    if url.decode(url.encode(s)) != Ok(s) || url.decode(url.encode_path(s)) != Ok(s) {
+        bad = bad + problem(r, "URL ENCODE", s, "{url.decode(url.encode(s))} {url.decode(url.encode_path(s))}")
+    }
+    match url.parse_query(s) {
+        Ok(pairs) => {
+            let back = url.parse_query(url.build_query(pairs))
+            if back != Ok(pairs) {
+                bad = bad + problem(r, "QUERY ROUND TRIP", s, "{pairs} became {back}")
+            }
+        },
+        Err(_) => (),
+    }
+    let pairs = (0..<rand.int(0, 4)).map(|_| (any_str(rand), any_str(rand)))
+    if url.parse_query(url.build_query(pairs)) != Ok(pairs) {
+        bad = bad + problem(r, "QUERY BUILD", url.build_query(pairs), "{pairs} became {url.parse_query(url.build_query(pairs))}")
+    }
+    bad
+}
+
+fn check_csv(r: Report, rand: Rand, s: Str) -> Int {
+    let mut bad = 0
+    match csv.parse(s) {
+        Ok(rows) => {
+            let back = csv.parse(csv.write(rows))
+            if back != Ok(rows) {
+                bad = bad + problem(r, "CSV ROUND TRIP", s, "{rows} printed {show(csv.write(rows))}, read back as {back}")
+            }
+        },
+        Err(_) => (),
+    }
+    let _ = csv.parse_maps(s)
+    let _ = csv.parse_with(s, "\t")
+    // rows of at least one field: an empty row has no line of its own
+    let rows = (0..<rand.int(0, 4)).map(|_| (0..<rand.int(1, 4)).map(|_| any_str(rand)))
+    let back = csv.parse(csv.write(rows))
+    if back != Ok(rows) {
+        bad = bad + problem(r, "CSV WRITE", csv.write(rows), "{rows} read back as {back}")
+    }
+    bad
+}
+
+fn check_codes(r: Report, rand: Rand, s: Str) -> Int {
+    let mut bad = 0
+    // what decodes is the one way to write those bytes, padded or not
+    match base64.decode(s) {
+        Ok(b) => {
+            if base64.encode_with(b, url: false, pad: s.contains("=")) != s {
+                bad = bad + problem(r, "BASE64", s, "decoded to {b}, which encodes as {base64.encode(b)}")
+            }
+        },
+        Err(_) => (),
+    }
+    match base64.decode_url(s) {
+        Ok(b) => {
+            if base64.encode_with(b, url: true, pad: s.contains("=")) != s {
+                bad = bad + problem(r, "BASE64 URL", s, "decoded to {b}, which encodes as {base64.encode_url(b)}")
+            }
+        },
+        Err(_) => (),
+    }
+    match hex.decode(s) {
+        Ok(b) => {
+            if hex.encode(b) != s.to_lower() {
+                bad = bad + problem(r, "HEX", s, "decoded to {b}, which encodes as {hex.encode(b)}")
+            }
+        },
+        Err(_) => (),
+    }
+    let data = rand.bytes(rand.int(0, 40))
+    if base64.decode(base64.encode(data)) != Ok(data) || base64.decode_url(base64.encode_url(data)) != Ok(data) || hex.decode(hex.encode_upper(data)) != Ok(data) {
+        bad = bad + problem(r, "ENCODE", hex.encode(data), "did not decode back")
+    }
+    match uuid.parse(s) {
+        Ok(u) => {
+            if u.bytes.len() != 16 || uuid.parse(u.to_str()) != Ok(u) {
+                bad = bad + problem(r, "UUID", s, "{u.bytes} printed {u.to_str()}")
+            }
+        },
+        Err(_) => (),
+    }
+    let u = uuid.from_random(rand.bytes(16))
+    if uuid.parse(u.to_str()) != Ok(u) || uuid.parse(u.to_str().to_upper()) != Ok(u) {
+        bad = bad + problem(r, "UUID PRINT", u.to_str(), "did not read back")
+    }
+    bad
+}
+
+fn check_time(r: Report, rand: Rand, s: Str) -> Int {
+    let mut bad = 0
+    match time.parse_iso(s) {
+        Ok(ms) => {
+            if time.parse_iso(time.iso(ms)) != Ok(ms) {
+                bad = bad + problem(r, "TIME", s, "{ms} printed {time.iso(ms)}, read back as {time.parse_iso(time.iso(ms))}")
+            }
+        },
+        Err(_) => (),
+    }
+    // any moment from year 1 to 9998, printed in UTC and at an offset
+    // (which near year 0 or 9999 could write a five-digit local year)
+    let ms = rand.int(-62135596800000, 253370764800000)
+    let off = rand.int(-1439, 1440)
+    if time.parse_iso(time.iso(ms)) != Ok(ms) || time.parse_iso(time.iso_at(ms, off)) != Ok(ms) {
+        bad = bad + problem(r, "TIME PRINT", time.iso_at(ms, off), "{ms} read back as {time.parse_iso(time.iso(ms))} and {time.parse_iso(time.iso_at(ms, off))}")
+    }
+    bad
+}
+
+fn check_unicode(r: Report, rand: Rand, s: Str) -> Int {
+    let mut bad = 0
+    let cps = unicode.code_points(s)
+    let clean = unicode.from_code_points(cps)
+    if unicode.code_points(clean) != cps {
+        bad = bad + problem(r, "CODE POINTS", s, "{cps} became {unicode.code_points(clean)}")
+    }
+    let c = unicode.nfc(s)
+    let d = unicode.nfd(s)
+    if unicode.nfc(c) != c || unicode.nfd(d) != d || unicode.nfc(d) != c || unicode.nfd(c) != d {
+        bad = bad + problem(r, "NORMAL FORMS", s, "nfc {show(c)}, nfd {show(d)}")
+    }
+    let f = unicode.fold(s)
+    // (not `same_ignoring_case(upper(s), lower(s))`: `ı` upper-cases to
+    // `I`, which folds to `i`)
+    if unicode.fold(f) != f || !unicode.same_ignoring_case(s, unicode.fold(s)) {
+        bad = bad + problem(r, "CASE", s, "fold {show(f)}")
+    }
+    let made = (0..<rand.int(0, 8)).map(|_| if rand.int(0, 3) == 0 { rand.int(0, 0x110000) } else { rand.int(0, 0x3000) }).filter(|cp| cp < 0xd800 || cp > 0xdfff)
+    if unicode.code_points(unicode.from_code_points(made)) != made {
+        bad = bad + problem(r, "FROM CODE POINTS", "{made}", "became {unicode.code_points(unicode.from_code_points(made))}")
+    }
+    bad
+}
+
+// Whether `y` is `x` to the 15 significant digits a Float prints with.
+fn close(x: Float, y: Float) -> Bool {
+    x == y || (x - y).abs() <= x.abs() * 0.00000000000001
+}
+
+fn check_numbers(r: Report, rand: Rand, s: Str) -> Int {
+    let mut bad = 0
+    match s.parse_int() {
+        Some(n) => {
+            if n.to_str().parse_int() != Some(n) {
+                bad = bad + problem(r, "INT", s, "read as {n}")
+            }
+        },
+        None => (),
+    }
+    match s.parse_float() {
+        Some(x) => {
+            let back = x.to_str().parse_float()
+            if x == x && !close(x, back ?? 0.0) {
+                bad = bad + problem(r, "FLOAT", s, "read as {x}, printed {x.to_str()}, read back as {back}")
+            }
+        },
+        None => (),
+    }
+    let n = rand.int(-9223372036854775807, 9223372036854775807) >> rand.int(0, 63)
+    let x = "{if rand.int(0, 2) == 0 { "-" } else { "" }}{rand.int(1, 9007199254740992)}e{rand.int(-340, 300)}".parse_float() ?? 0.0
+    if n.to_str().parse_int() != Some(n) || !close(x, x.to_str().parse_float() ?? 0.0) {
+        bad = bad + problem(r, "NUMBER PRINT", "{n} {x}", "read back as {n.to_str().parse_int()} {x.to_str().parse_float()}")
+    }
+    bad
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let out = root.stdout
+    let rand = root.rand
+    let clock = root.clock
+    let args = root.args()
+    let n = if args.is_empty() { 20000 } else { args[0].parse_int() ?? 20000 }
+    let corpus = seeds()
+    let r = Report { out }
+    let checks = [check_url, check_csv, check_codes, check_time, check_unicode, check_numbers]
+    let names = ["url", "csv", "codes", "time", "unicode", "numbers"]
+    let mut bad = 0
+    for _ in 0..<n {
+        let input = if rand.int(0, 8) == 0 { any_str(rand) } else { mutate(rand, corpus[rand.int(0, corpus.len())]) }
+        for (k, check) in checks.with_index() {
+            let started = clock.now_ms()
+            match catch(|| check(r, rand, input)) {
+                Ok(b) => {
+                    bad = bad + b
+                },
+                Err(msg) => {
+                    bad = bad + problem(r, "PANIC in {names[k]} on", input, msg)
+                },
+            }
+            let took = clock.now_ms() - started
+            if took > 2000 {
+                bad = bad + problem(r, "SLOW {names[k]} on", input, "{took} ms")
+            }
+        }
+    }
+    out.print("{n} inputs, {bad} problems")
+    Ok(())
+}

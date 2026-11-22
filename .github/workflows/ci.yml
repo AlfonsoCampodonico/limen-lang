@@ -71,3 +71,24 @@ jobs:
           $L build fuzz/http.lmn -o fh
           ./fh --grant listen=127.0.0.1:0 --grant net=127.0.0.1 --seed ${{ github.run_number }} -- 10000 | tee fh.log
           grep -q ", 0 problems" fh.log
+
+      - name: Fuzz the front end and the readers of outside data
+        timeout-minutes: 20
+        run: |
+          L=./_build/default/bin/main.exe
+          $L build fuzz/formats.lmn -o ff
+          ./ff --seed ${{ github.run_number }} -- 200000 | tee ff.log
+          grep -q ", 0 problems" ff.log
+          $L build fuzz/regexes.lmn -o fr
+          ./fr --seed ${{ github.run_number }} -- 3000 | tee fr.log
+          grep -q ", 0 problems" fr.log
+          $L build fuzz/inflate.lmn -o fi
+          ./fi --grant fs=test/zoneinfo:ro --seed ${{ github.run_number }} -- 20000 | tee fi.log
+          grep -q ", 0 problems" fi.log
+          $L build fuzz/ws/frames.lmn -o fw
+          ./fw --grant listen=127.0.0.1:0 --grant net=127.0.0.1 --seed ${{ github.run_number }} -- 2000 | tee fw.log
+          grep -q ", 0 problems" fw.log
+          $L build selfhost/limen.lmn -o tsc
+          ./_build/default/fuzz/front/fuzz_front.exe --seed ${{ github.run_number }} --count 2000 --selfhost $PWD/tsc --exact $PWD/$L \
+            examples selfhost/tests fuzz src/std bench | tee fz.log
+          grep -q ", 0 problems" fz.log

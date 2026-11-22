@@ -1,0 +1,305 @@
+// Fuzz the WebSocket server (in a directory of its own, where `use http`
+// is the standard library's and not fuzz/http.lmn): clients upgrade a
+// connection to a real server that echoes every message, then send
+// frames, masked as clients must, in random sizes and fragments, with
+// pings, and a close. Untouched, every message must come back whole,
+// every ping get its pong and the close its answer; with the frames
+// damaged, the server must never panic or hang and must send only
+// well-formed frames. One client sends a message in thousands of one-byte
+// fragments, which must not take long.
+//
+//   limen build fuzz/ws/frames.lmn -o /tmp/fw
+//   /tmp/fw --grant listen=127.0.0.1:0 --grant net=127.0.0.1 --seed 1 -- 2000
+use http
+use websocket
+
+fn handshake() -> Str {
+    "GET /chat HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+}
+
+// One frame from a client: masked with a random key.
+fn frame(rand: Rand, fin: Bool, opcode: Int, payload: Bytes) -> Bytes {
+    let n = payload.len()
+    let mut head = [(if fin { 128 } else { 0 }) | opcode]
+    if n < 126 {
+        head.push(128 | n)
+    } else if n < 65536 {
+        head = head + [128 | 126, n >> 8 & 255, n & 255]
+    } else {
+        head = head + [128 | 127] + (0..<8).map(|i| n >> (56 - 8 * i) & 255)
+    }
+    let key = rand.bytes(4)
+    let p = payload.to_list()
+    let k = key.to_list()
+    bytes(head) + key + bytes((0..<n).map(|i| p[i] ^ k[i % 4]))
+}
+
+enum Sent {
+    Message(Int, Bytes),
+    Ping(Bytes),
+}
+
+// A random conversation: the frames to send and what each should bring
+// back, ending with a close.
+fn conversation(rand: Rand) -> (Bytes, List[Sent]) {
+    let mut wire = bytes([])
+    let mut sent: List[Sent] = []
+    for _ in 0..<rand.int(0, 6) {
+        if rand.int(0, 4) == 0 {
+            let p = rand.bytes(rand.int(0, 126))
+            wire = wire + frame(rand, true, 9, p)
+            sent.push(Ping(p))
+        } else {
+            let kind = rand.int(1, 3)
+            let size = if rand.int(0, 10) == 0 { rand.int(126, 70000) } else { rand.int(0, 200) }
+            let body = if kind == 1 { (0..<size).map(|_| "aé€😀".chars()[rand.int(0, 4)]).join("").slice(0, size).to_bytes() } else { rand.bytes(size) }
+            // in fragments, a ping may come between them
+            let pieces = rand.int(1, 4)
+            let mut at = 0
+            for i in 0..<pieces {
+                let end = if i == pieces - 1 { body.len() } else { at + rand.int(0, body.len() - at + 1) }
+                wire = wire + frame(rand, i == pieces - 1, if i == 0 { kind } else { 0 }, body.slice(at, end))
+                at = end
+                if i < pieces - 1 && rand.int(0, 3) == 0 {
+                    wire = wire + frame(rand, true, 9, bytes([]))
+                    sent.push(Ping(bytes([])))
+                }
+            }
+            sent.push(Message(kind, body))
+        }
+    }
+    wire = wire + frame(rand, true, 8, bytes([3, 232]))
+    (wire, sent)
+}
+
+fn damage(rand: Rand, b: Bytes) -> Bytes {
+    let mut t = b
+    for _ in 0..<rand.int(1, 4) {
+        let n = t.len()
+        let what = rand.int(0, 4)
+        if n == 0 {
+            t = rand.bytes(rand.int(1, 16))
+        } else if what == 0 {
+            let k = rand.int(0, n)
+            t = t.slice(0, k) + bytes([t[k] ^ (1 << rand.int(0, 8))]) + t.slice(k + 1, n)
+        } else if what == 1 {
+            let k = rand.int(0, n)
+            t = t.slice(0, k) + rand.bytes(rand.int(1, 10)) + t.slice(k + 1, n)
+        } else if what == 2 {
+            t = t.slice(0, rand.int(0, n))
+        } else {
+            // a frame header's length bytes, early on
+            let k = rand.int(0, if n < 12 { n } else { 12 })
+            t = t.slice(0, k) + bytes([[0, 126, 127, 255][rand.int(0, 4)]]) + t.slice(k + 1, n)
+        }
+    }
+    t
+}
+
+struct Got {
+    opcode: Int,
+    payload: Bytes,
+}
+
+// The frames the server sent, which a server never masks; None if they
+// are not well formed (a frame cut off at the end is fine: the connection
+// may have closed while it was being sent).
+fn frames_of(b: Bytes) -> Option[List[Got]] {
+    let mut out: List[Got] = []
+    let mut at = 0
+    let n = b.len()
+    while at < n {
+        if n - at < 2 {
+            return Some(out)
+        }
+        let opcode = b[at] & 15
+        if b[at] & 112 != 0 || b[at + 1] & 128 != 0 || !(opcode == 1 || opcode == 2 || opcode == 8 || opcode == 9 || opcode == 10) {
+            return None
+        }
+        let mut length = b[at + 1] & 127
+        let mut p = at + 2
+        if length == 126 {
+            if n - p < 2 {
+                return Some(out)
+            }
+            length = b[p] << 8 | b[p + 1]
+            p = p + 2
+        } else if length == 127 {
+            if n - p < 8 {
+                return Some(out)
+            }
+            length = 0
+            for i in 0..<8 {
+                length = length << 8 | b[p + i]
+            }
+            p = p + 8
+        }
+        if n - p < length {
+            return Some(out)
+        }
+        out.push(Got { opcode, payload: b.slice(p, p + length) })
+        at = p + length
+    }
+    Some(out)
+}
+
+// Send `wire` after the handshake and read what comes back, up to `ms`
+// milliseconds of silence.
+fn exchange(net: Net, clock: Clock, addr: Str, wire: Bytes, ms: Int) -> Result[Bytes, Str] {
+    let c = net.connect(addr).map_error(|e| "connect: {e}")?
+    let _ = c.write_within(clock, 2000, handshake())
+    let mut got = ""
+    while !got.contains("\r\n\r\n") {
+        match c.read_within(clock, 2000) {
+            Ok("") => {
+                c.close()
+                return Err("closed during the handshake: {got}")
+            },
+            Ok(more) => {
+                got = got + more
+            },
+            Err(e) => {
+                c.close()
+                return Err("no answer to the handshake: {e}")
+            },
+        }
+    }
+    if !got.starts_with("HTTP/1.1 101 ") {
+        c.close()
+        return Err("handshake answered {got}")
+    }
+    let mut back = got.slice((got.index_of("\r\n\r\n") ?? 0) + 4, got.len())
+    let _ = c.write_within(clock, 5000, wire.to_str())
+    while true {
+        match c.read_within(clock, ms) {
+            Ok("") => {
+                break
+            },
+            Ok(more) => {
+                back = back + more
+            },
+            Err(_) => {
+                break
+            },
+        }
+    }
+    c.close()
+    Ok(back.to_bytes())
+}
+
+fn client(net: Net, clock: Clock, rand: Rand, addr: Str, n: Int) -> List[Str] {
+    let mut problems = []
+    for _ in 0..<n {
+        let (wire, sent) = conversation(rand)
+        let damaged = rand.int(0, 2) == 0
+        let input = if damaged { damage(rand, wire) } else { wire }
+        let started = clock.now_ms()
+        match exchange(net, clock, addr, input, if damaged { 300 } else { 3000 }) {
+            Err(e) => problems.push("FAILED {damaged}: {e}"),
+            Ok(back) => match frames_of(back) {
+                None => problems.push("BAD FRAMES from the server: {back.slice(0, 100)}"),
+                Some(got) => {
+                    if !damaged {
+                        // each message echoed, each ping answered, then the close
+                        let want = sent.map(|s| match s {
+                            Message(k, b) => Got { opcode: k, payload: b },
+                            Ping(p) => Got { opcode: 10, payload: p },
+                        }) + [Got { opcode: 8, payload: bytes([3, 232]) }]
+                        if got != want {
+                            problems.push("WRONG ECHO: sent {sent.len()} messages and pings, got {got.map(|g| (g.opcode, g.payload.len()))}, want {want.map(|g| (g.opcode, g.payload.len()))}")
+                        }
+                    }
+                },
+            },
+        }
+        let took = clock.now_ms() - started
+        if took > 10000 {
+            problems.push("SLOW: {took} ms for {input.len()} bytes")
+        }
+    }
+    problems
+}
+
+// A message of `n` one-byte fragments: the server must join them in time
+// proportional to `n`.
+fn fragments(net: Net, clock: Clock, rand: Rand, addr: Str, n: Int) -> List[Str] {
+    let mut wire = frame(rand, false, 2, bytes([1]))
+    let one = frame(rand, false, 0, bytes([2]))
+    let mut more: List[Str] = []
+    for _ in 0..<n - 2 {
+        more.push(one.to_str())
+    }
+    wire = wire + more.join("").to_bytes() + frame(rand, true, 0, bytes([3])) + frame(rand, true, 8, bytes([3, 232]))
+    let started = clock.now_ms()
+    let r = exchange(net, clock, addr, wire, 20000)
+    let took = clock.now_ms() - started
+    match r {
+        Ok(back) => match frames_of(back) {
+            Some(got) => {
+                if got.len() != 2 || got[0].payload.len() != n {
+                    return ["FRAGMENTS: {n} fragments came back as {got.map(|g| (g.opcode, g.payload.len()))}"]
+                }
+            },
+            None => {
+                return ["FRAGMENTS: bad frames from the server"]
+            },
+        },
+        Err(e) => {
+            return ["FRAGMENTS: {e}"]
+        },
+    }
+    if took > 5000 { ["SLOW: {n} one-byte fragments took {took} ms"] } else { [] }
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let out = root.stdout
+    let clock = root.clock
+    let rand = root.rand
+    let args = root.args()
+    let n = if args.is_empty() { 1000 } else { args[0].parse_int() ?? 1000 }
+    let l = root.listen.on("127.0.0.1:0")?
+    let addr = "127.0.0.1:{l.port()}"
+    let net = root.net.only("127.0.0.1")
+    let panics = atomic(0)
+    let clients = 8
+    let found = group g {
+        g.go(|| {
+            let _ = http.accept_forever(l, |c| http.serve_stream(c, |r, conn| {
+                let ws = websocket.accept(r, conn)?
+                match catch(|| websocket.fold_messages(ws, (), |_, m| match m {
+                    Text(t) => {
+                        let _ = ws.send(t)
+                    },
+                    Binary(b) => {
+                        let _ = ws.send_bytes(b)
+                    },
+                    Close(_, _) => {},
+                })) {
+                    Ok(_) => (),
+                    Err(msg) => {
+                        panics.add(1)
+                        out.print("PANIC in the server: {msg}")
+                    },
+                }
+                Ok(())
+            }))
+            []
+        })
+        g.go(|| {
+            let all = group cg {
+                for _ in 0..<clients {
+                    cg.go(|| client(net, clock, rand, addr, n / clients))
+                }
+                cg.go(|| fragments(net, clock, rand, addr, 200000))
+            }
+            l.close()
+            all.flat_map(|p| p)
+        })
+    }
+    let problems = found.flat_map(|p| p)
+    for p in problems.take(20) {
+        out.print(p)
+    }
+    out.print("{n} inputs, {problems.len() + panics.get()} problems")
+    Ok(())
+}

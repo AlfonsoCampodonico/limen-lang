@@ -1,0 +1,250 @@
+// Fuzz the regex engine with patterns and text from outside: `compile`
+// must never panic on a pattern, nor any search on a text, and a search
+// must stay fast whatever the pattern (the engine never backtracks). What
+// it finds must hold together: `matches` agrees with `\A(?:p)\z`, a match's
+// offsets name its text, `find_all` gives matches in order without
+// overlaps, `split` and `replace` put the text back together, an escaped
+// string matches itself, and `(?:p)`, `(p)` and `p|p` find what `p` finds.
+//
+//   limen build fuzz/regexes.lmn -o /tmp/fr && /tmp/fr --seed 1 -- 20000
+use regex
+use text
+
+fn seeds() -> List[Str] {
+    [
+        "a",
+        "",
+        "abc|abd",
+        "a*b+c?",
+        "a*?b+?c??",
+        "(a|b)*c",
+        "x\{2,3}",
+        "x\{2,}y\{3}z\{0,1}",
+        "[a-z0-9_]+@[a-z]+\\.com",
+        "[^\\d\\s]",
+        "\\bword\\b",
+        "^\\w+$",
+        "(?m)^line$",
+        "(?i)HeLLo",
+        "(?s)a.b",
+        "(?P<year>\\d\{4})-(?P<month>\\d\\d)",
+        "(?<n>x)(?:y)",
+        "\\x41\\n\\t\\.",
+        "é+|[éa]",
+        ".*",
+        "(a*)*",
+        "(|a)+",
+        "\\A\\z",
+        "[\\]\\-]",
+        "a\{,3}",
+        "(",
+        "[",
+        "*",
+        "a\{3,2}",
+        "\\",
+    ]
+}
+
+fn pieces() -> List[Str] {
+    [
+        "a", "b", "é", ".", "*", "+", "?", "*?", "+?", "|", "(", ")", "(?:", "(?P<g>", "(?<h>", "[", "]", "[^", "-", "^", "$", "\\d", "\\w", "\\s",
+        "\\D", "\\W", "\\S", "\\b", "\\B", "\\A", "\\z", "\\x", "\\x4", "\\x41", "\\n", "\\", "\{", "}", "\{2}", "\{1,3}", "\{0,}", "\{99999}",
+        "(?i)", "(?m)", "(?s)", "(?", ",", "0", 0.to_char(), 255.to_char(), "\u{1f600}",
+    ]
+}
+
+fn mutate(rand: Rand, s: Str) -> Str {
+    let mut t = s
+    let rounds = rand.int(0, 5)
+    for _ in 0..<rounds {
+        let n = t.len()
+        let at = if n == 0 { 0 } else { rand.int(0, n + 1) }
+        let what = rand.int(0, 6)
+        if what == 0 && n > 0 {
+            let k = rand.int(0, n)
+            t = t.slice(0, k) + t.slice(k + 1, n)
+        } else if what == 1 || what == 2 {
+            let p = pieces()
+            t = t.slice(0, at) + p[rand.int(0, p.len())] + t.slice(at, n)
+        } else if what == 3 && n > 0 {
+            let k = rand.int(0, n)
+            t = t.slice(0, k) + rand.bytes(1).to_str() + t.slice(k + 1, n)
+        } else if what == 4 {
+            // a group around a part, or the whole
+            let lo = rand.int(0, at + 1)
+            t = t.slice(0, lo) + "(" + t.slice(lo, at) + ")" + t.slice(at, n)
+        } else {
+            let s2 = seeds()
+            t = t + s2[rand.int(0, s2.len())]
+        }
+    }
+    t
+}
+
+// Text to search: letters the patterns use, digits, spaces, line breaks,
+// other characters and raw bytes.
+fn subject(rand: Rand) -> Str {
+    let alphabet = ["a", "b", "c", "x", "y", "z", "A", "B", "0", "9", " ", "\n", "_", "-", ".", "@", "é", "\u{1f600}", "\{", "}", "$"]
+    let mut t = ""
+    for _ in 0..<rand.int(0, 24) {
+        let k = rand.int(0, 12)
+        t = t + if k == 0 { rand.bytes(1).to_str() } else { alphabet[rand.int(0, alphabet.len())] }
+    }
+    t
+}
+
+// `s` quoted, with control bytes, quotes, backslashes and bytes past
+// ASCII written as escapes, so a problem prints on one line.
+fn show(s: Str) -> Str {
+    let digits = "0123456789abcdef"
+    let mut out = "\""
+    for b in s.bytes() {
+        if b == 34 || b == 92 {
+            out = out + "\\" + b.to_char()
+        } else if b < 32 || b >= 127 {
+            out = out + "\\x" + digits.slice(b >> 4, (b >> 4) + 1) + digits.slice(b & 15, (b & 15) + 1)
+        } else {
+            out = out + b.to_char()
+        }
+    }
+    out + "\""
+}
+
+fn span(m: Option[regex.Match]) -> Option[(Int, Int)] {
+    m.map(|x| (x.start, x.end))
+}
+
+// What is wrong with searching `s` for `re`, if anything.
+fn check(pattern: Str, re: regex.Regex, s: Str) -> Option[Str] {
+    let m = re.find(s)
+    // `matches` is about the whole text, as the pattern between `\A` and `\z`
+    match regex.compile("\\A(?:" + pattern + ")\\z") {
+        Ok(whole) => {
+            if re.matches(s) != whole.find(s).is_some() || (re.matches(s) && m.is_none()) {
+                return Some("matches says {re.matches(s)}, find says {m.is_some()}, `\\A(?:...)\\z` says {whole.find(s).is_some()}")
+            }
+        },
+        Err(_) => (),
+    }
+    match m {
+        Some(x) => {
+            if x.start < 0 || x.start > x.end || x.end > s.len() || s.slice(x.start, x.end) != x.text || x.capture(0) != Some(x.text) {
+                return Some("the match {x.start}..{x.end} {show(x.text)} is not where it says")
+            }
+        },
+        None => (),
+    }
+    let all = re.find_all(s)
+    let mut last = -1
+    let mut rebuilt = ""
+    let mut at = 0
+    for x in all {
+        if x.start < at || x.end < x.start || x.end > s.len() || (x.start == x.end && x.end == last) {
+            return Some("find_all: {x.start}..{x.end} after {at}")
+        }
+        rebuilt = rebuilt + s.slice(at, x.start) + x.text
+        at = x.end
+        last = x.end
+    }
+    if rebuilt + s.slice(at, s.len()) != s {
+        return Some("the matches of find_all do not put the text back together")
+    }
+    if span(all.first()) != span(m) {
+        return Some("find_all starts at {span(all.first())}, find at {span(m)}")
+    }
+    if re.replace(s, "$0") != s || re.replace(s, "$$") != re.replace_with(s, |_| "$") {
+        return Some("replace with `$0` or `$$` changed the text: {show(re.replace(s, "$0"))}")
+    }
+    if re.split(s).join("") != re.replace(s, "") {
+        return Some("split joined is {show(re.split(s).join(""))}, replace with nothing is {show(re.replace(s, ""))}")
+    }
+    // the same pattern written another way finds the same; not with a
+    // flag, which applies to the end of the pattern, or a group name,
+    // which can't be there twice
+    if !pattern.contains("(?") {
+        for other in ["(?:" + pattern + ")", "(" + pattern + ")", "(?:" + pattern + ")|(?:" + pattern + ")"] {
+            match regex.compile(other) {
+                Ok(r2) => {
+                    if span(r2.find(s)) != span(m) {
+                        return Some("{show(other)} finds {span(r2.find(s))}, the pattern {span(m)}")
+                    }
+                },
+                Err(e) => {
+                    if !e.contains("too large") {
+                        return Some("{show(other)} does not compile: {e}")
+                    }
+                },
+            }
+        }
+    }
+    None
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let out = root.stdout
+    let rand = root.rand
+    let clock = root.clock
+    let args = root.args()
+    let n = if args.is_empty() { 5000 } else { args[0].parse_int() ?? 5000 }
+    let corpus = seeds()
+    let mut compiled = 0
+    let mut bad = 0
+    for i in 0..<n {
+        let pattern = if i % 50 == 49 {
+            // a deep or long pattern
+            let k = rand.int(1, 5000)
+            let p = pieces()[rand.int(0, 6)]
+            if rand.int(0, 2) == 0 { text.repeat("(", k) + p + text.repeat(")", k) } else { text.repeat(p + "|", k) + p }
+        } else {
+            mutate(rand, corpus[rand.int(0, corpus.len())])
+        }
+        let started = clock.now_ms()
+        match catch(|| regex.compile(pattern)) {
+            Err(msg) => {
+                bad = bad + 1
+                out.print("PANIC compiling {show(pattern)}: {msg}")
+            },
+            Ok(Err(_)) => (),
+            Ok(Ok(re)) => {
+                compiled = compiled + 1
+                for _ in 0..<4 {
+                    // long text for a short pattern: a search costs the
+                    // pattern's size times the text's length
+                    let s = if rand.int(0, 8) == 0 && pattern.len() < 200 { text.repeat(subject(rand), rand.int(1, 200)) } else { subject(rand) }
+                    match catch(|| check(pattern, re, s)) {
+                        Err(msg) => {
+                            bad = bad + 1
+                            out.print("PANIC searching {show(s)} for {show(pattern)}: {msg}")
+                        },
+                        Ok(Some(why)) => {
+                            bad = bad + 1
+                            out.print("WRONG {show(pattern)} on {show(s)}: {why}")
+                        },
+                        Ok(None) => (),
+                    }
+                }
+                // an escaped string matches itself, and only from the start
+                let lit = subject(rand)
+                match regex.compile("\\A" + regex.escape(lit)) {
+                    Ok(r) => {
+                        if r.find(lit + "x").map(|m| m.text) != Some(lit) {
+                            bad = bad + 1
+                            out.print("ESCAPE {show(lit)}: {show(regex.escape(lit))} finds {r.find(lit + "x").map(|m| m.text)}")
+                        }
+                    },
+                    Err(e) => {
+                        bad = bad + 1
+                        out.print("ESCAPE {show(lit)}: {show(regex.escape(lit))} does not compile: {e}")
+                    },
+                }
+            },
+        }
+        let took = clock.now_ms() - started
+        if took > 3000 {
+            bad = bad + 1
+            out.print("SLOW {show(pattern.slice(0, 200))} ({pattern.len()} bytes): {took} ms")
+        }
+    }
+    out.print("{n} inputs, {compiled} compiled, {bad} problems")
+    Ok(())
+}

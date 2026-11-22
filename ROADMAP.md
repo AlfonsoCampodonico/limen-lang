@@ -137,7 +137,12 @@ happens here.
 - The JSON edges: a lone `\ud800`, duplicate keys, a nesting limit, numbers
   over 400 characters (done: each is a parse error, and the parser reads
   nesting without recursion, so it can't overflow a task's stack).
-- Fuzz the lexer, parser, checker and the rest of the runtime.
+- Fuzz the lexer, parser, checker and the rest of the runtime (done:
+  `fuzz/front` runs mutated programs through both compilers' front ends,
+  and `fuzz/formats.lmn`, `regexes.lmn`, `inflate.lmn` and `ws/frames.lmn`
+  the readers of URLs, CSV, base64, hex, UUIDs, times, Unicode, regexes,
+  gzip, TZif and WebSocket frames; what they found is fixed, and
+  expressions, types and patterns now nest at most 256 deep, E0010).
 - `full_path` hands SQLite a path string that another process with write
   access to the granted directory could race with a symlink swap after the
   check. The OS sandbox (Landlock, the macOS profile) refuses what such a

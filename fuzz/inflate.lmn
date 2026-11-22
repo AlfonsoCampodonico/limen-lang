@@ -1,0 +1,221 @@
+// Fuzz the readers of binary data from outside: gzip, zlib and raw
+// deflate streams, and TZif zone files. Compressed data at random levels
+// must decompress to what went in, and refuse a maximum one byte short;
+// damaged streams must give an error or data within the maximum, never a
+// panic, and streaming with `fold_gunzip` must agree with `gunzip`.
+// Damaged zone files must give a zone or an error, never a panic.
+//
+//   limen build fuzz/inflate.lmn -o /tmp/fi
+//   /tmp/fi --grant fs=test/zoneinfo:ro --seed 1 -- 20000
+//
+// Without the grant, the zone files are left out.
+use compress
+use time
+
+// Data to compress: random bytes, runs, text with repeats and nothing.
+fn data(rand: Rand) -> Bytes {
+    let n = rand.int(0, 3000)
+    match rand.int(0, 5) {
+        0 => rand.bytes(n),
+        1 => bytes((0..<n).map(|_| 0)),
+        2 => bytes((0..<n).map(|i| i % 7 * 31 % 256)),
+        3 => {
+            let words = ["the ", "cat ", "sat ", "on ", "a ", "mat ", "\n", "and ", "then "]
+            (0..<n / 4).map(|_| words[rand.int(0, words.len())]).join("").to_bytes()
+        },
+        _ => bytes([]),
+    }
+}
+
+// `b` with a few bytes changed, cut, dropped or added.
+fn damage(rand: Rand, b: Bytes) -> Bytes {
+    let mut t = b
+    for _ in 0..<rand.int(1, 4) {
+        let n = t.len()
+        let what = rand.int(0, 6)
+        if n == 0 {
+            t = rand.bytes(rand.int(0, 20))
+        } else if what == 0 {
+            // one bit
+            let k = rand.int(0, n)
+            t = t.slice(0, k) + bytes([t[k] ^ (1 << rand.int(0, 8))]) + t.slice(k + 1, n)
+        } else if what == 1 {
+            let k = rand.int(0, n)
+            t = t.slice(0, k) + rand.bytes(1) + t.slice(k + 1, n)
+        } else if what == 2 {
+            t = t.slice(0, rand.int(0, n))
+        } else if what == 3 {
+            let k = rand.int(0, n)
+            t = t.slice(0, k) + t.slice(k + 1, n)
+        } else if what == 4 {
+            let k = rand.int(0, n + 1)
+            t = t.slice(0, k) + rand.bytes(rand.int(1, 8)) + t.slice(k, n)
+        } else {
+            // a header field: a byte near the start
+            let k = rand.int(0, if n < 12 { n } else { 12 })
+            t = t.slice(0, k) + rand.bytes(1) + t.slice(k + 1, n)
+        }
+    }
+    t
+}
+
+fn show(b: Bytes) -> Str {
+    let digits = "0123456789abcdef"
+    let shown = if b.len() > 64 { b.slice(0, 64) } else { b }
+    let mut out = ""
+    for x in shown.to_list() {
+        out = out + digits.slice(x >> 4, (x >> 4) + 1) + digits.slice(x & 15, (x & 15) + 1)
+    }
+    if b.len() > 64 { out + "... ({b.len()} bytes)" } else { out }
+}
+
+// What is wrong with compressing `d` at `level`, if anything.
+fn round_trip(d: Bytes, level: Int) -> Option[Str] {
+    let n = d.len()
+    let gz = compress.gzip(d, level)
+    if compress.gunzip(gz, n) != Ok(d) {
+        return Some("gunzip(gzip) at level {level} is {compress.gunzip(gz, n)}")
+    }
+    if compress.unzlib(compress.zlib(d, level), n) != Ok(d) {
+        return Some("unzlib(zlib) at level {level}")
+    }
+    if compress.inflate(compress.deflate(d, level), n) != Ok(d) {
+        return Some("inflate(deflate) at level {level}")
+    }
+    if n > 0 && compress.gunzip(gz, n - 1).is_ok() {
+        return Some("gunzip gave {n} bytes with a maximum of {n - 1}")
+    }
+    // two members read as one, and streamed in pieces
+    if compress.gunzip(gz + gz, 2 * n) != Ok(d + d) {
+        return Some("two gzip members")
+    }
+    None
+}
+
+// What is wrong with reading damaged `c`, if anything.
+fn damaged(c: Bytes, max: Int, chunk: Int) -> Option[Str] {
+    let g = compress.gunzip(c, max)
+    for (name, r) in [("gunzip", g), ("unzlib", compress.unzlib(c, max)), ("inflate", compress.inflate(c, max))] {
+        match r {
+            Ok(out) => {
+                if out.len() > max {
+                    return Some("{name} gave {out.len()} bytes with a maximum of {max}")
+                }
+            },
+            Err(_) => (),
+        }
+    }
+    // streaming has no maximum, so compare it where gunzip had room
+    let more = |off: Int| Ok(c.slice(off, off + chunk))
+    let streamed = compress.fold_gunzip(more, bytes([]), |acc: Bytes, piece: Bytes| acc + piece)
+    match (g, streamed) {
+        (Ok(a), Ok(b)) => {
+            if a != b {
+                return Some("fold_gunzip gave {b.len()} bytes, gunzip {a.len()}")
+            }
+        },
+        (Ok(_), Err(e)) => {
+            return Some("fold_gunzip failed where gunzip did not: {e}")
+        },
+        (Err(e), Ok(b)) => {
+            if b.len() <= max {
+                return Some("gunzip failed ({e}) where fold_gunzip gave {b.len()} bytes")
+            }
+        },
+        (Err(_), Err(_)) => (),
+    }
+    None
+}
+
+fn zones(fs: Fs) -> List[(Str, Bytes)] {
+    let mut out: List[(Str, Bytes)] = []
+    let mut dirs = [""]
+    while !dirs.is_empty() {
+        let d = dirs[0]
+        dirs = dirs.skip(1)
+        for name in fs.list(d) ?? [] {
+            let p = if d == "" { name } else { d + "/" + name }
+            if fs.is_dir(p) {
+                dirs.push(p)
+            } else {
+                match fs.read_at(p, 0, 1000000) {
+                    Ok(b) => {
+                        if time.zone_from_tzif(p, b).is_ok() {
+                            out.push((p, b))
+                        }
+                    },
+                    Err(_) => (),
+                }
+            }
+        }
+    }
+    out
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let out = root.stdout
+    let rand = root.rand
+    let clock = root.clock
+    let args = root.args()
+    let n = if args.is_empty() { 5000 } else { args[0].parse_int() ?? 5000 }
+    let tz = zones(root.fs)
+    let mut bad = 0
+    for i in 0..<n {
+        let started = clock.now_ms()
+        let d = data(rand)
+        let level = rand.int(0, 10)
+        match catch(|| round_trip(d, level)) {
+            Err(msg) => {
+                bad = bad + 1
+                out.print("PANIC compressing {show(d)} at level {level}: {msg}")
+            },
+            Ok(Some(why)) => {
+                bad = bad + 1
+                out.print("WRONG {show(d)}: {why}")
+            },
+            Ok(None) => (),
+        }
+        let kind = rand.int(0, 3)
+        let c = damage(rand, if kind == 0 { compress.gzip(d, level) } else if kind == 1 { compress.zlib(d, level) } else { compress.deflate(d, level) })
+        let max = if rand.int(0, 2) == 0 { d.len() + rand.int(0, 100) } else { rand.int(0, 100000) }
+        match catch(|| damaged(c, max, rand.int(1, 70000))) {
+            Err(msg) => {
+                bad = bad + 1
+                out.print("PANIC reading {show(c)}: {msg}")
+            },
+            Ok(Some(why)) => {
+                bad = bad + 1
+                out.print("WRONG reading {show(c)}: {why}")
+            },
+            Ok(None) => (),
+        }
+        if !tz.is_empty() {
+            let (name, b) = tz[i % tz.len()]
+            let z = damage(rand, b)
+            match catch(|| time.zone_from_tzif(name, z)) {
+                Err(msg) => {
+                    bad = bad + 1
+                    out.print("PANIC reading the zone {name} as {show(z)}: {msg}")
+                },
+                Ok(Ok(zone)) => {
+                    let t = rand.int(-5000000000000, 5000000000000)
+                    match catch(|| (time.offset_in(t, zone), time.abbr_in(t, zone))) {
+                        Err(msg) => {
+                            bad = bad + 1
+                            out.print("PANIC using the zone {name} read from {show(z)} at {t}: {msg}")
+                        },
+                        Ok(_) => (),
+                    }
+                },
+                Ok(Err(_)) => (),
+            }
+        }
+        let took = clock.now_ms() - started
+        if took > 3000 {
+            bad = bad + 1
+            out.print("SLOW {show(c)}: {took} ms")
+        }
+    }
+    out.print("{n} inputs, {tz.len()} zone files, {bad} problems")
+    Ok(())
+}
