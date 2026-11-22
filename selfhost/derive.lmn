@@ -6,9 +6,10 @@
 // bodies never run, so the checker types every use like any call. Once a
 // program has checked, this pass finds each use, takes the type it was used
 // at, and writes ordinary Limen functions for that type and every type
-// inside it, into the json module: `json.to$N(x: T) -> json.Value` and
-// `json.from$N(v: json.Value, at: Str) -> Result[T, Str]`, built from the
-// helpers at the end of json.lmn. Each use is pointed at a wrapper,
+// inside it, into the json module: `json.put$N(x: T) -> List[json.Part]`,
+// the text in pieces, and `json.from$N(v: json.Value, at: Str) ->
+// Result[T, Str]`, built from the helpers at the end of json.lmn; for a
+// type that holds itself also `json.step$N`, its decoder a step at a time. Each use is pointed at a wrapper,
 // `json.encode$N` or `json.decode$N`, and the program is checked again with
 // the new functions. The functions come out in the order src/derive.ml
 // writes them, so both compilers emit the same C.
@@ -172,61 +173,162 @@ fn value_ty(g: Gen) -> types.Ty {
     TNamed(jf(g, "Value"), [])
 }
 
-// The encoder and decoder of `t`, as function names: a helper of
-// json.lmn for the simple types, written ones otherwise.
-fn coders(g: Gen, t: types.Ty) -> Result[((Str, Str), Gen), Fail] {
+fn fn_gen(g: Gen, name: Str, generics: List[Str], params: List[ast.Param], ret: ast.TyExpr, body: ast.Block) -> ast.Item {
+    IFn(ast.FnDecl { name, span: g.sp, generics, params, ret: Some(ret), body, test: None, bench: false, virtual: false, table: None, public: false, bounds: [], foreign: None })
+}
+
+// What a type holds, for `cyclic`: nothing for a type converted by a
+// helper, and nothing when a part has no JSON form (that is reported when
+// its conversion is written).
+fn kids(g: Gen, t: types.Ty) -> List[types.Ty] {
     match t {
-        TInt => Ok(((jf(g, "of_int"), jf(g, "from_int")), g)),
-        TFloat => Ok(((jf(g, "of_float"), jf(g, "from_float")), g)),
-        TStr => Ok(((jf(g, "of_str"), jf(g, "from_str")), g)),
-        TBool => Ok(((jf(g, "of_bool"), jf(g, "from_bool")), g)),
-        TNamed(n, []) if n == jf(g, "Value") => Ok(((jf(g, "of_value"), jf(g, "from_value")), g)),
-        _ => {
-            let key = show(g, t)
-            match g.names.get(key) {
-                Some(k) => Ok(((jf(g, "to${k}"), jf(g, "from${k}")), g)),
-                None => {
-                    let mut g = g
-                    g.count = g.count + 1
-                    let k = g.count
-                    g.names[key] = k
-                    let to = jf(g, "to${k}")
-                    let from = jf(g, "from${k}")
-                    let ((enc, dec), g2) = bodies(g, t)?
-                    let mut g = g2
-                    let fail = |what: Str| Fail { what, g }
-                    let vt = match written(g, value_ty(g)) {
-                        Ok(x) => x,
-                        Err(w) => { return Err(fail(w)) },
-                    }
-                    let tt = match written(g, t) {
-                        Ok(x) => x,
-                        Err(w) => { return Err(fail(w)) },
-                    }
-                    let rt = match written(g, TNamed("Result", [t, TStr])) {
-                        Ok(x) => x,
-                        Err(w) => { return Err(fail(w)) },
-                    }
-                    let st = match written(g, TStr) {
-                        Ok(x) => x,
-                        Err(w) => { return Err(fail(w)) },
-                    }
-                    g.out = g.out + [fn_item(g, to, [param(g, "x", tt)], vt, enc), fn_item(g, from, [param(g, "v", vt), param(g, "at", st)], rt, dec)]
-                    Ok(((to, from), g))
-                },
+        TNamed(n, []) if n == jf(g, "Value") => [],
+        TNamed("Option", [a]) => [a],
+        TList(a) => [a],
+        TMap(_, a) => [a],
+        TNamed(n, args) if ast.is_tuple_name(n) => args,
+        TNamed(n, args) if g.structs.contains(n) => {
+            let sd = g.structs[n]
+            let env = sd.generics.zip(args)
+            let mut out: List[types.Ty] = []
+            for f in sd.fields {
+                match field_ty(env, f.ty) {
+                    Ok(x) => out.push(x),
+                    Err(_) => { return [] },
+                }
             }
+            out
+        },
+        TNamed(n, args) if g.enums.contains(n) => {
+            let ed = g.enums[n]
+            let env = ed.generics.zip(args)
+            let mut out: List[types.Ty] = []
+            for vr in ed.variants {
+                for pt in vr.payload {
+                    match field_ty(env, pt) {
+                        Ok(x) => out.push(x),
+                        Err(_) => { return [] },
+                    }
+                }
+            }
+            out
+        },
+        _ => [],
+    }
+}
+
+// Does `t` hold itself? Then a value can be as deep as it is long, so its
+// encoder leaves those parts for later and its decoder goes a step at a
+// time (json.lmn), rather than recursing once per level.
+fn cyclic(g: Gen, t: types.Ty) -> Bool {
+    let target = show(g, t)
+    let mut seen: Map[Str, Bool] = map()
+    let mut todo = kids(g, t)
+    while !todo.is_empty() {
+        let u = todo[0]
+        let k = show(g, u)
+        if k == target {
+            return true
+        }
+        if seen.contains(k) {
+            todo = todo.skip(1)
+        } else {
+            seen[k] = true
+            todo = kids(g, u) + todo.skip(1)
+        }
+    }
+    false
+}
+
+// The encoder and decoder of `t`, as function names: a helper of
+// json.lmn for the simple types, written ones otherwise. A type that holds
+// itself has a third, its decoder a step at a time, `step$N`.
+fn coders(g: Gen, t: types.Ty) -> Result[((Str, Str), Gen), Fail] {
+    match g.names.get(show(g, t)) {
+        Some(_) => { return Ok((names_of(g, t), g)) },
+        None => {},
+    }
+    match t {
+        TInt | TFloat | TStr | TBool => { return Ok((names_of(g, t), g)) },
+        TNamed(n, []) if n == jf(g, "Value") => { return Ok((names_of(g, t), g)) },
+        _ => {},
+    }
+    let key = show(g, t)
+    let mut g = g
+    g.count = g.count + 1
+    let k = g.count
+    g.names[key] = k
+    let put = jf(g, "put${k}")
+    let from = jf(g, "from${k}")
+    let ((enc, dec, step), g2) = bodies(g, t)?
+    let mut g = g2
+    let fail = |what: Str| Fail { what, g }
+    let vt = match written(g, value_ty(g)) {
+        Ok(x) => x,
+        Err(w) => { return Err(fail(w)) },
+    }
+    let tt = match written(g, t) {
+        Ok(x) => x,
+        Err(w) => { return Err(fail(w)) },
+    }
+    let rt = match written(g, TNamed("Result", [t, TStr])) {
+        Ok(x) => x,
+        Err(w) => { return Err(fail(w)) },
+    }
+    let st = match written(g, TStr) {
+        Ok(x) => x,
+        Err(w) => { return Err(fail(w)) },
+    }
+    let parts = te(g, TyName("List", [te(g, TyName(jf(g, "Part"), []))]))
+    let dec_params = [param(g, "v", vt), param(g, "at", st)]
+    let encoder = fn_item(g, put, [param(g, "x", tt)], parts, enc)
+    match step {
+        None => {
+            g.out = g.out + [encoder, fn_item(g, from, dec_params, rt, dec)]
+        },
+        Some(body) => {
+            // the decoder runs the steps
+            let r = [ast.ClosureParam { name: "r", ty: None, span: g.sp }]
+            let start = call(g, jf(g, "stop"), [var(g, "r")])
+            let stepper_name = jf(g, "step${k}")
+            let run = only(g, call(g, jf(g, "run"), [call(g, stepper_name, [var(g, "v"), var(g, "at"), ex(g, EClosure(r, start))])]))
+            let next = te(g, TyName(jf(g, "Next"), [te(g, TyName("R", []))]))
+            let kont = te(g, TyFn([rt], next))
+            let stepper = fn_gen(g, stepper_name, ["R"], dec_params + [param(g, "k", kont)], next, body)
+            g.out = g.out + [encoder, stepper, fn_item(g, from, dec_params, rt, run)]
+        },
+    }
+    Ok(((put, from), g))
+}
+
+// The names of a type's coders, once they are written.
+fn names_of(g: Gen, t: types.Ty) -> (Str, Str) {
+    match t {
+        TInt => (jf(g, "put_int"), jf(g, "from_int")),
+        TFloat => (jf(g, "put_float"), jf(g, "from_float")),
+        TStr => (jf(g, "put_str"), jf(g, "from_str")),
+        TBool => (jf(g, "put_bool"), jf(g, "from_bool")),
+        TNamed(n, []) if n == jf(g, "Value") => (jf(g, "put_value"), jf(g, "from_value")),
+        _ => {
+            let k = g.names.get(show(g, t)) ?? 0
+            (jf(g, "put${k}"), jf(g, "from${k}"))
         },
     }
 }
 
-fn encoder(g: Gen, t: types.Ty) -> Result[(Str, Gen), Fail] {
-    let ((e, _), g) = coders(g, t)?
-    Ok((e, g))
+fn step_of(g: Gen, t: types.Ty) -> Str {
+    let k = g.names.get(show(g, t)) ?? 0
+    jf(g, "step${k}")
 }
 
-fn decoder(g: Gen, t: types.Ty) -> Result[(Str, Gen), Fail] {
-    let ((_, d), g) = coders(g, t)?
-    Ok((d, g))
+// The coders of the parts, written first, in order.
+fn need(g: Gen, ts: List[types.Ty]) -> Result[Gen, Fail] {
+    let mut g = g
+    for t in ts {
+        let (_, g2) = coders(g, t)?
+        g = g2
+    }
+    Ok(g)
 }
 
 fn unsupported(g: Gen, what: Str) -> Fail {
@@ -244,84 +346,152 @@ fn fields_of(g: Gen, env: List[(Str, types.Ty)], tys: List[ast.TyExpr]) -> Resul
     Ok(out)
 }
 
-// `n` values from an array of exactly `n` items at `at`, decoded by the
-// decoders of `tys`: a `let` of the items, and the expressions.
-fn items_of(g: Gen, v: ast.Expr, at: ast.Expr, tys: List[types.Ty]) -> Result[((ast.Stmt, List[ast.Expr]), Gen), Fail] {
-    let s = let_(g, "items", try_(g, call(g, jf(g, "from_items"), [v, at, num(g, tys.len())])))
-    let mut g = g
-    let mut es: List[ast.Expr] = []
-    let mut i = 0
-    for t in tys {
-        let (d, g2) = decoder(g, t)?
-        g = g2
-        es.push(try_(g, call(g, d, [ex(g, EIndex(var(g, "items"), num(g, i))), call(g, jf(g, "item_at"), [at, num(g, i)])])))
-        i = i + 1
+// The parts of `a`'s value `e`: later, when `a` holds itself.
+fn put_of(g: Gen, a: types.Ty, e: ast.Expr) -> ast.Expr {
+    let p = names_of(g, a).0
+    if cyclic(g, a) {
+        call(g, jf(g, "later"), [ex(g, EClosure([], call(g, p, [e])))])
+    } else {
+        call(g, p, [e])
     }
-    Ok(((s, es), g))
 }
 
-// The bodies of `t`'s encoder (of `x`) and decoder (of `v` at `at`).
-fn bodies(g: Gen, t: types.Ty) -> Result[((ast.Block, ast.Block), Gen), Fail] {
+// `n` values from an array of exactly `n` items at `at`, decoded by the
+// decoders of `tys`: a `let` of the items, and the expressions.
+fn items_of(g: Gen, v: ast.Expr, at: ast.Expr, tys: List[types.Ty]) -> (ast.Stmt, List[ast.Expr]) {
+    let s = let_(g, "items", try_(g, call(g, jf(g, "from_items"), [v, at, num(g, tys.len())])))
+    let mut es: List[ast.Expr] = []
+    for (i, t) in tys.with_index() {
+        es.push(try_(g, call(g, names_of(g, t).1, [ex(g, EIndex(var(g, "items"), num(g, i))), call(g, jf(g, "item_at"), [at, num(g, i)])])))
+    }
+    (s, es)
+}
+
+// ---- decoding a step at a time ----
+
+// A part to decode: its type, how to decode it at once, and the function
+// and arguments that decode it a step at a time (the next step is added).
+struct StepPart {
+    ty: types.Ty,
+    direct: ast.Expr,
+    f: Str,
+    args: List[ast.Expr],
+}
+
+fn go_(g: Gen, e: ast.Expr) -> ast.Expr {
+    call(g, jf(g, "go"), [ex(g, EClosure([], e))])
+}
+
+// hand `e` on
+fn kont(g: Gen, e: ast.Expr) -> ast.Expr {
+    go_(g, call(g, "k", [e]))
+}
+
+fn on_ok(g: Gen, r: ast.Expr, name: Str, body: ast.Expr) -> ast.Expr {
+    let bind = if name == "_" { pat(g, PWild) } else { pat(g, PBind(name)) }
+    let good = ast.Arm { pat: pat(g, PVariant(None, "Ok", [bind])), guard: None, body }
+    let bad = ast.Arm { pat: pat(g, PVariant(None, "Err", [pat(g, PBind("e"))])), guard: None, body: kont(g, call(g, "Err", [var(g, "e")])) }
+    ex(g, EMatch(r, [good, bad]))
+}
+
+// decode the parts in order, binding d0, d1, ..., then hand on `made`
+fn seq(g: Gen, parts: List[StepPart], i: Int, made: ast.Expr) -> ast.Expr {
+    if i == parts.len() {
+        return kont(g, made)
+    }
+    let p = parts[i]
+    let name = "d{i}"
+    let rest = seq(g, parts, i + 1, made)
+    if cyclic(g, p.ty) {
+        let r = [ast.ClosureParam { name: "r", ty: None, span: g.sp }]
+        go_(g, call(g, p.f, p.args + [ex(g, EClosure(r, on_ok(g, var(g, "r"), name, rest)))]))
+    } else {
+        on_ok(g, p.direct, name, rest)
+    }
+}
+
+fn ds(g: Gen, n: Int) -> List[ast.Expr] {
+    (0..<n).map(|i| var(g, "d{i}"))
+}
+
+// the parts of an array of exactly `ts` items at `at`, then `made`
+fn items_then(g: Gen, v: ast.Expr, at: ast.Expr, ts: List[types.Ty], made: ast.Expr) -> ast.Expr {
+    let mut parts: List[StepPart] = []
+    for (i, a) in ts.with_index() {
+        let iv = ex(g, EIndex(var(g, "items"), num(g, i)))
+        let iat = call(g, jf(g, "item_at"), [at, num(g, i)])
+        parts.push(StepPart { ty: a, direct: call(g, names_of(g, a).1, [iv, iat]), f: step_of(g, a), args: [iv, iat] })
+    }
+    on_ok(g, call(g, jf(g, "from_items"), [v, at, num(g, ts.len())]), "items", seq(g, parts, 0, made))
+}
+
+// The bodies of `t`'s encoder (of `x`) and decoder (of `v` at `at`), and
+// when `t` holds itself, its decoder a step at a time (of `v` at `at`, on
+// to `k`). The parts' conversions are written first, in order.
+fn bodies(g: Gen, t: types.Ty) -> Result[((ast.Block, ast.Block, Option[ast.Block]), Gen), Fail] {
     let x = var(g, "x")
     let v = var(g, "v")
     let at = var(g, "at")
+    let k = var(g, "k")
+    let self_ = cyclic(g, t)
     match t {
         TNamed("Option", [a]) => {
-            let ((e, d), g) = coders(g, a)?
-            Ok(((only(g, call(g, jf(g, "of_option"), [x, var(g, e)])), only(g, call(g, jf(g, "from_option"), [v, at, var(g, d)]))), g))
+            let g = need(g, [a])?
+            let (e, d) = names_of(g, a)
+            let step = if self_ { Some(only(g, call(g, jf(g, "option_k"), [v, at, var(g, step_of(g, a)), k]))) } else { None }
+            Ok(((only(g, call(g, jf(g, "put_option"), [x, var(g, e)])), only(g, call(g, jf(g, "from_option"), [v, at, var(g, d)])), step), g))
         },
         TList(a) => {
-            let ((e, d), g) = coders(g, a)?
-            Ok(((only(g, call(g, jf(g, "of_list"), [ex(g, EMethod(x, "map", g.sp, [var(g, e)]))])), only(g, call(g, jf(g, "from_list"), [v, at, var(g, d)]))), g))
+            let g = need(g, [a])?
+            let (e, d) = names_of(g, a)
+            let step = if self_ { Some(only(g, call(g, jf(g, "list_k"), [v, at, var(g, step_of(g, a)), k]))) } else { None }
+            Ok(((only(g, call(g, jf(g, "put_list"), [x, var(g, e)])), only(g, call(g, jf(g, "from_list"), [v, at, var(g, d)])), step), g))
         },
-        TMap(k, a) => match k {
+        TMap(kt, a) => match kt {
             TStr => {
-                let ((e, d), g) = coders(g, a)?
-                Ok(((only(g, call(g, jf(g, "of_map"), [x, var(g, e)])), only(g, call(g, jf(g, "from_map"), [v, at, var(g, d)]))), g))
+                let g = need(g, [a])?
+                let (e, d) = names_of(g, a)
+                let step = if self_ { Some(only(g, call(g, jf(g, "map_k"), [v, at, var(g, step_of(g, a)), k]))) } else { None }
+                Ok(((only(g, call(g, jf(g, "put_map"), [x, var(g, e)])), only(g, call(g, jf(g, "from_map"), [v, at, var(g, d)])), step), g))
             },
             _ => Err(unsupported(g, "{quoted(g, t)} (a map's keys must be `Str`)")),
         },
         TNamed(n, args) if ast.is_tuple_name(n) => {
-            let mut g = g
+            let g = need(g, args)?
             let mut parts: List[ast.Expr] = []
-            let mut i = 0
-            for a in args {
-                let (e, g2) = encoder(g, a)?
-                g = g2
-                parts.push(call(g, e, [ex(g, EField(x, "{i}", g.sp))]))
-                i = i + 1
+            for (i, a) in args.with_index() {
+                parts.push(put_of(g, a, ex(g, EField(x, "{i}", g.sp))))
             }
-            let enc = call(g, jf(g, "of_list"), [ex(g, EList(parts))])
-            let ((s, es), g) = items_of(g, v, at, args)?
-            let mut inits: List[ast.FieldInit] = []
-            let mut j = 0
-            for e in es {
-                inits.push(ast.FieldInit { name: "{j}", span: g.sp, value: e })
-                j = j + 1
-            }
-            Ok(((only(g, enc), ast.Block { stmts: [s], tail: Some(ok(g, ex(g, EStruct(n, g.sp, inits)))), span: g.sp }), g))
+            let enc = call(g, jf(g, "put_items"), [ex(g, EList(parts))])
+            let (s, es) = items_of(g, v, at, args)
+            let build = |es: List[ast.Expr]| ex(g, EStruct(n, g.sp, es.with_index().map(|p| ast.FieldInit { name: "{p.0}", span: g.sp, value: p.1 })))
+            let step = if self_ { Some(only(g, items_then(g, v, at, args, ok(g, build(ds(g, args.len())))))) } else { None }
+            Ok(((only(g, enc), ast.Block { stmts: [s], tail: Some(ok(g, build(es))), span: g.sp }, step), g))
         },
         TNamed(n, args) if g.structs.contains(n) => {
             let sd = g.structs[n]
             let env = sd.generics.zip(args)
             let fts = fields_of(g, env, sd.fields.map(|f| f.ty))?
             let fs = sd.fields.map(|f| f.name).zip(fts)
-            let mut g = g
-            let mut members: List[ast.Expr] = []
-            for (f, ft) in fs {
-                let (e, g2) = encoder(g, ft)?
-                g = g2
-                members.push(call(g, jf(g, "field"), [text(g, f), call(g, e, [ex(g, EField(x, f, g.sp))])]))
-            }
-            let enc = call(g, jf(g, "of_fields"), [ex(g, EList(members))])
+            let g = need(g, fts)?
+            let enc = call(g, jf(g, "put_fields"), [ex(g, EList(fs.map(|p| text(g, p.0)))), ex(g, EList(fs.map(|p| put_of(g, p.1, ex(g, EField(x, p.0, g.sp))))))])
             let check = ast.Stmt { desc: SExpr(try_(g, call(g, jf(g, "need_object"), [v, at]))), span: g.sp }
             let mut inits: List[ast.FieldInit] = []
-            for (f, ft) in fs {
-                let (d, g2) = decoder(g, ft)?
-                g = g2
-                inits.push(ast.FieldInit { name: f, span: g.sp, value: try_(g, call(g, jf(g, "member"), [v, at, text(g, f), var(g, d)])) })
+            let mut parts: List[StepPart] = []
+            let mut made: List[ast.FieldInit] = []
+            for (i, p) in fs.with_index() {
+                let (f, ft) = p
+                let member = call(g, jf(g, "member"), [v, at, text(g, f), var(g, names_of(g, ft).1)])
+                inits.push(ast.FieldInit { name: f, span: g.sp, value: try_(g, member) })
+                parts.push(StepPart { ty: ft, direct: member, f: jf(g, "member_k"), args: [v, at, text(g, f), var(g, step_of(g, ft))] })
+                made.push(ast.FieldInit { name: f, span: g.sp, value: var(g, "d{i}") })
             }
-            Ok(((only(g, enc), ast.Block { stmts: [check], tail: Some(ok(g, ex(g, EStruct(n, g.sp, inits)))), span: g.sp }), g))
+            let step = if self_ {
+                Some(only(g, on_ok(g, call(g, jf(g, "need_object"), [v, at]), "_", seq(g, parts, 0, ok(g, ex(g, EStruct(n, g.sp, made)))))))
+            } else {
+                None
+            }
+            Ok(((only(g, enc), ast.Block { stmts: [check], tail: Some(ok(g, ex(g, EStruct(n, g.sp, inits)))), span: g.sp }, step), g))
         },
         TNamed(n, args) if g.enums.contains(n) => {
             let ed = g.enums[n]
@@ -330,26 +500,20 @@ fn bodies(g: Gen, t: types.Ty) -> Result[((ast.Block, ast.Block), Gen), Fail] {
             for vr in ed.variants {
                 vs.push((vr.name, fields_of(g, env, vr.payload)?))
             }
-            let mut g = g
+            let g = need(g, vs.flat_map(|p| p.1))?
             let mut arms: List[ast.Arm] = []
             for (vn, ts) in vs {
                 let names = ts.len() |> names_for
                 let body = if ts.is_empty() {
-                    call(g, jf(g, "of_str"), [text(g, vn)])
+                    call(g, jf(g, "put_str"), [text(g, vn)])
                 } else if ts.len() == 1 {
-                    let (e, g2) = encoder(g, ts[0])?
-                    g = g2
-                    call(g, jf(g, "of_variant"), [text(g, vn), call(g, e, [var(g, "p0")])])
+                    call(g, jf(g, "put_variant"), [text(g, vn), put_of(g, ts[0], var(g, "p0"))])
                 } else {
                     let mut parts: List[ast.Expr] = []
-                    let mut i = 0
-                    for a in ts {
-                        let (e, g2) = encoder(g, a)?
-                        g = g2
-                        parts.push(call(g, e, [var(g, names[i])]))
-                        i = i + 1
+                    for (i, a) in ts.with_index() {
+                        parts.push(put_of(g, a, var(g, names[i])))
                     }
-                    call(g, jf(g, "of_variant"), [text(g, vn), call(g, jf(g, "of_list"), [ex(g, EList(parts))])])
+                    call(g, jf(g, "put_variant"), [text(g, vn), call(g, jf(g, "put_items"), [ex(g, EList(parts))])])
                 }
                 arms.push(ast.Arm { pat: pat(g, PVariant(Some(n), vn, names.map(|p| pat(g, PBind(p))))), guard: None, body })
             }
@@ -359,24 +523,39 @@ fn bodies(g: Gen, t: types.Ty) -> Result[((ast.Block, ast.Block), Gen), Fail] {
             let payload = ex(g, EField(got, "1", g.sp))
             let inner = call(g, jf(g, "inside"), [at, name])
             let mut darms: List[ast.Arm] = []
+            let mut sarms: List[ast.Arm] = []
             for (vn, ts) in vs {
                 let made = if ts.is_empty() {
                     ok(g, ex(g, EField(var(g, n), vn, g.sp)))
                 } else if ts.len() == 1 {
-                    let (d, g2) = decoder(g, ts[0])?
-                    g = g2
-                    ok(g, ex(g, EMethod(var(g, n), vn, g.sp, [try_(g, call(g, d, [payload, inner]))])))
+                    ok(g, ex(g, EMethod(var(g, n), vn, g.sp, [try_(g, call(g, names_of(g, ts[0]).1, [payload, inner]))])))
                 } else {
-                    let ((s, es), g2) = items_of(g, payload, inner, ts)?
-                    g = g2
+                    let (s, es) = items_of(g, payload, inner, ts)
                     ex(g, EBlock(ast.Block { stmts: [s], tail: Some(ok(g, ex(g, EMethod(var(g, n), vn, g.sp, es)))), span: g.sp }))
                 }
                 darms.push(ast.Arm { pat: pat(g, PStr(vn)), guard: None, body: made })
+                let built = |es: List[ast.Expr]| ok(g, if ts.is_empty() { ex(g, EField(var(g, n), vn, g.sp)) } else { ex(g, EMethod(var(g, n), vn, g.sp, es)) })
+                let sbody = if ts.is_empty() {
+                    kont(g, built([]))
+                } else if ts.len() == 1 {
+                    let a = ts[0]
+                    seq(g, [StepPart { ty: a, direct: call(g, names_of(g, a).1, [payload, inner]), f: step_of(g, a), args: [payload, inner] }], 0, built(ds(g, 1)))
+                } else {
+                    items_then(g, payload, inner, ts, built(ds(g, ts.len())))
+                }
+                sarms.push(ast.Arm { pat: pat(g, PStr(vn)), guard: None, body: sbody })
             }
             let names = vs.map(|p| "`{p.0}`").join(", ")
-            let other = ast.Arm { pat: pat(g, PWild), guard: None, body: call(g, "Err", [call(g, jf(g, "no_variant"), [at, name, text(g, names)])]) }
+            let no = call(g, "Err", [call(g, jf(g, "no_variant"), [at, name, text(g, names)])])
+            let other = ast.Arm { pat: pat(g, PWild), guard: None, body: no }
             let s = let_(g, "got", try_(g, call(g, jf(g, "from_variant"), [v, at])))
-            Ok(((only(g, enc), ast.Block { stmts: [s], tail: Some(ex(g, EMatch(name, darms + [other]))), span: g.sp }), g))
+            let step = if self_ {
+                let sother = ast.Arm { pat: pat(g, PWild), guard: None, body: kont(g, no) }
+                Some(only(g, on_ok(g, call(g, jf(g, "from_variant"), [v, at]), "got", ex(g, EMatch(name, sarms + [sother])))))
+            } else {
+                None
+            }
+            Ok(((only(g, enc), ast.Block { stmts: [s], tail: Some(ex(g, EMatch(name, darms + [other]))), span: g.sp }, step), g))
         },
         _ => Err(unsupported(g, quoted(g, t))),
     }
@@ -590,7 +769,7 @@ pub fn expand(json: Option[Str], rows: List[Str], items: List[ast.Item], c: type
                                     let written_t = written(g, t) ?? te(g, TyUnit)
                                     let str_t = te(g, TyName("Str", []))
                                     let item = if encode {
-                                        fn_item(g, w, [param(g, "x", written_t)], str_t, only(g, call(g, jf(g, "stringify"), [call(g, to, [var(g, "x")])])))
+                                        fn_item(g, w, [param(g, "x", written_t)], str_t, only(g, call(g, jf(g, "write"), [call(g, to, [var(g, "x")])])))
                                     } else {
                                         let rt = written(g, TNamed("Result", [t, TStr])) ?? te(g, TyUnit)
                                         fn_item(g, w, [param(g, "s", str_t)], rt, only(g, call(g, jf(g, "from_text"), [var(g, "s"), var(g, from)])))

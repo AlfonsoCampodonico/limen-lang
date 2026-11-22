@@ -693,43 +693,250 @@ pub fn decode[T](s: Str) -> Result[T, Str] {
     panic("json.decode: the compiler writes this for each type")
 }
 
-// What the compiler's conversions are made of. A decoder takes the value
-// and where it sits in the document (`todos[2].title`, "" at the top), for
-// the error message.
+// What the compiler's conversions are made of. An encoder gives the text
+// of a value in pieces; a piece of a type that holds itself is left for
+// later, so `write` puts the text together with a list rather than by
+// recursion, and a value as deep as it is long fits a task's stack. A
+// decoder takes the value and where it sits in the document
+// (`todos[2].title`, "" at the top), for the error message.
 
-fn of_int(x: Int) -> Value {
-    Int(x)
+enum Part {
+    Text(Str),
+    Later(fn() -> List[Part]),
 }
 
-fn of_float(x: Float) -> Value {
-    Num(x)
+// A list of pieces being written, and the position of the next.
+struct Pieces {
+    parts: List[Part],
+    at: Int,
 }
 
-fn of_str(x: Str) -> Value {
-    Str(x)
+fn write(parts: List[Part]) -> Str {
+    let mut out: List[Str] = []
+    // the lists being written, outermost first; slots from `depth` on are spare
+    let mut open: List[Pieces] = [Pieces { parts, at: 0 }]
+    let mut depth = 1
+    while depth > 0 {
+        let d = depth - 1
+        let at = open[d].at
+        if at == open[d].parts.len() {
+            open[d] = Pieces { parts: [], at: 0 }
+            depth = d
+        } else {
+            open[d].at = at + 1
+            match open[d].parts[at] {
+                Text(s) => out.push(s),
+                Later(f) => {
+                    let p = Pieces { parts: f(), at: 0 }
+                    if depth < open.len() {
+                        open[depth] = p
+                    } else {
+                        open.push(p)
+                    }
+                    depth = depth + 1
+                },
+            }
+        }
+    }
+    out.join("")
 }
 
-fn of_bool(x: Bool) -> Value {
-    Bool(x)
+fn later(f: fn() -> List[Part]) -> List[Part] {
+    [Later(f)]
 }
 
-fn of_value(x: Value) -> Value {
-    x
+fn put_int(x: Int) -> List[Part] {
+    [Text(x.to_str())]
 }
 
-fn of_option[T](x: Option[T], f: fn(T) -> Value) -> Value {
+fn put_float(x: Float) -> List[Part] {
+    [Text(num_text(x))]
+}
+
+fn put_str(x: Str) -> List[Part] {
+    [Text(quote(x))]
+}
+
+fn put_bool(x: Bool) -> List[Part] {
+    [Text(x.to_str())]
+}
+
+fn put_value(x: Value) -> List[Part] {
+    [Text(stringify(x))]
+}
+
+fn put_option[T](x: Option[T], f: fn(T) -> List[Part]) -> List[Part] {
     match x {
         Some(y) => f(y),
-        None => Null,
+        None => [Text("null")],
     }
 }
 
-fn of_map[V](m: Map[Str, V], f: fn(V) -> Value) -> Value {
-    Obj(m.entries().map(|e| field(e.0, f(e.1))))
+fn put_list[T](xs: List[T], f: fn(T) -> List[Part]) -> List[Part] {
+    let mut out = [Text("[")]
+    for (i, x) in xs.with_index() {
+        if i > 0 {
+            out.push(Text(","))
+        }
+        for p in f(x) {
+            out.push(p)
+        }
+    }
+    out.push(Text("]"))
+    out
 }
 
-fn of_variant(name: Str, payload: Value) -> Value {
-    Obj([field(name, payload)])
+fn put_items(items: List[List[Part]]) -> List[Part] {
+    let mut out = [Text("[")]
+    for (i, ps) in items.with_index() {
+        if i > 0 {
+            out.push(Text(","))
+        }
+        for p in ps {
+            out.push(p)
+        }
+    }
+    out.push(Text("]"))
+    out
+}
+
+fn put_map[V](m: Map[Str, V], f: fn(V) -> List[Part]) -> List[Part] {
+    put_fields(m.keys(), m.values().map(f))
+}
+
+fn put_fields(keys: List[Str], values: List[List[Part]]) -> List[Part] {
+    let mut out: List[Part] = []
+    for (i, k) in keys.with_index() {
+        out.push(Text(if i > 0 { "," } else { "\{" } + quote(k) + ":"))
+        for p in values[i] {
+            out.push(p)
+        }
+    }
+    out.push(Text(if keys.is_empty() { "\{\}" } else { "\}" }))
+    out
+}
+
+fn put_variant(name: Str, payload: List[Part]) -> List[Part] {
+    let mut out = [Text("\{" + quote(name) + ":")]
+    for p in payload {
+        out.push(p)
+    }
+    out.push(Text("\}"))
+    out
+}
+
+// A decoder of a type that holds itself takes what to do with the result,
+// and gives back the next step rather than calling it, so `run` takes the
+// steps one by one, with a list rather than by recursion.
+enum Next[R] {
+    Stop(R),
+    Go(fn() -> Next[R]),
+}
+
+fn run[R](n: Next[R]) -> R {
+    let mut c = n
+    let mut more = true
+    while more {
+        match c {
+            Go(f) => { c = f() },
+            Stop(_) => { more = false },
+        }
+    }
+    match c {
+        Stop(r) => r,
+        Go(_) => panic("json: a decoding step left over"),
+    }
+}
+
+fn go[R](f: fn() -> Next[R]) -> Next[R] {
+    Go(f)
+}
+
+fn stop[R](r: R) -> Next[R] {
+    Stop(r)
+}
+
+// What a list or map decoded so far holds, newest first.
+enum Acc[T] {
+    More(T, Acc[T]),
+    Empty,
+}
+
+fn acc_list[T](acc: Acc[T]) -> List[T] {
+    let mut out: List[T] = []
+    let mut cur = acc
+    let mut going = true
+    while going {
+        match cur {
+            More(x, rest) => {
+                out.push(x)
+                cur = rest
+            },
+            Empty => { going = false },
+        }
+    }
+    out.reverse()
+}
+
+fn option_k[T, R](v: Value, at: Str, f: fn(Value, Str, fn(Result[T, Str]) -> Next[R]) -> Next[R], k: fn(Result[Option[T], Str]) -> Next[R]) -> Next[R] {
+    match v {
+        Null => Go(|| k(Ok(None))),
+        _ => Go(|| f(v, at, |r| match r {
+            Ok(x) => Go(|| k(Ok(Some(x)))),
+            Err(e) => Go(|| k(Err(e))),
+        })),
+    }
+}
+
+fn list_k[T, R](v: Value, at: Str, f: fn(Value, Str, fn(Result[T, Str]) -> Next[R]) -> Next[R], k: fn(Result[List[T], Str]) -> Next[R]) -> Next[R] {
+    match v {
+        Arr(items) => items_k(items, 0, at, Empty, f, k),
+        _ => Go(|| k(Err(wrong(at, "an array", v)))),
+    }
+}
+
+fn items_k[T, R](items: List[Value], i: Int, at: Str, acc: Acc[T], f: fn(Value, Str, fn(Result[T, Str]) -> Next[R]) -> Next[R], k: fn(Result[List[T], Str]) -> Next[R]) -> Next[R] {
+    if i == items.len() {
+        return Go(|| k(Ok(acc_list(acc))))
+    }
+    Go(|| f(items[i], "{at}[{i}]", |r| match r {
+        Ok(x) => items_k(items, i + 1, at, More(x, acc), f, k),
+        Err(e) => Go(|| k(Err(e))),
+    }))
+}
+
+fn map_k[V, R](v: Value, at: Str, f: fn(Value, Str, fn(Result[V, Str]) -> Next[R]) -> Next[R], k: fn(Result[Map[Str, V], Str]) -> Next[R]) -> Next[R] {
+    match v {
+        Obj(fields) => members_k(fields, 0, at, Empty, f, k),
+        _ => Go(|| k(Err(wrong(at, "an object", v)))),
+    }
+}
+
+fn members_k[V, R](fields: List[Field], i: Int, at: Str, acc: Acc[(Str, V)], f: fn(Value, Str, fn(Result[V, Str]) -> Next[R]) -> Next[R], k: fn(Result[Map[Str, V], Str]) -> Next[R]) -> Next[R] {
+    if i == fields.len() {
+        let mut out: Map[Str, V] = map()
+        for e in acc_list(acc) {
+            out[e.0] = e.1
+        }
+        return Go(|| k(Ok(out)))
+    }
+    let key = fields[i].key
+    Go(|| f(fields[i].value, inside(at, key), |r| match r {
+        Ok(x) => members_k(fields, i + 1, at, More((key, x), acc), f, k),
+        Err(e) => Go(|| k(Err(e))),
+    }))
+}
+
+// as `member`, a step at a time
+fn member_k[T, R](v: Value, at: Str, key: Str, f: fn(Value, Str, fn(Result[T, Str]) -> Next[R]) -> Next[R], k: fn(Result[T, Str]) -> Next[R]) -> Next[R] {
+    let path = inside(at, key)
+    match v.get(key) {
+        Some(x) => Go(|| f(x, path, k)),
+        None => Go(|| f(Null, path, |r| match r {
+            Ok(x) => Go(|| k(Ok(x))),
+            Err(_) => Go(|| k(Err("`{path}` is missing"))),
+        })),
+    }
 }
 
 fn from_text[T](s: Str, f: fn(Value, Str) -> Result[T, Str]) -> Result[T, Str] {
@@ -873,12 +1080,4 @@ fn from_variant(v: Value, at: Str) -> Result[(Str, Value), Str] {
 fn no_variant(at: Str, name: Str, names: Str) -> Str {
     let place = if at.is_empty() { "" } else { "`{at}`: " }
     "{place}no variant `{name}`; expected one of {names}"
-}
-
-fn of_list(items: List[Value]) -> Value {
-    Arr(items)
-}
-
-fn of_fields(fields: List[Field]) -> Value {
-    Obj(fields)
 }

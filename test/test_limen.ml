@@ -2387,6 +2387,65 @@ fn main(root: Root) {
 }
 |}
     "true false true false true true false true 0012 0190\n2 3 2 None 4 None 5\n7000001 [[[[ ,null],null]\n";
+  (* json.encode and json.decode of types that hold themselves, inside
+     tasks: the conversions the compiler writes recursed once per level.
+     Encoding leaves those parts for later and decoding goes a step at a
+     time, so a million levels encode; decoding stops at json.parse's 512. *)
+  out "deep-json"
+    {|use json
+enum L { Cons(Int, L), Nil }
+struct Node { value: Int, next: Option[Node] }
+struct Tree { kids: List[Tree] }
+fn chain(n: Int) -> L {
+    let mut l = Nil
+    for i in 0..<n { l = Cons(i, l) }
+    l
+}
+fn nodes(n: Int) -> Node {
+    let mut c = Node { value: 0, next: None }
+    for i in 1..<n { c = Node { value: i, next: Some(c) } }
+    c
+}
+fn nest(n: Int) -> Tree {
+    let mut t = Tree { kids: [] }
+    for _ in 1..<n { t = Tree { kids: [t] } }
+    t
+}
+fn ends(s: Str) -> Str {
+    "{s.len()} {s.slice(0, 12)} {s.slice(s.len() - 12, s.len())}"
+}
+fn encodes(n: Int) -> Str {
+    let a = json.encode(chain(n))
+    let b = json.encode(nodes(n))
+    let c = json.encode(nest(n))
+    let back: Result[L, Str] = json.decode(a)
+    "{ends(a)} | {ends(b)} | {ends(c)} | {back}"
+}
+// decoding stops at 512 arrays and objects inside each other (json.parse)
+fn decodes() -> Str {
+    let a = json.encode(chain(256))
+    let b = json.encode(nodes(512))
+    let c = json.encode(nest(256))
+    let ra: Result[L, Str] = json.decode(a)
+    let rb: Result[Node, Str] = json.decode(b)
+    let rc: Result[Tree, Str] = json.decode(c)
+    let bad = a.replace("\"Nil\"", "\"Nope\"")
+    let rbad: Result[L, Str] = json.decode(bad)
+    let msg = match rbad {
+        Ok(_) => "ok",
+        Err(e) => "{e.len()} {e.slice(e.len() - 56, e.len())}",
+    }
+    "{ra == Ok(chain(256))} {rb == Ok(nodes(512))} {rc == Ok(nest(256))} {msg}"
+}
+fn main(root: Root) {
+    let r = group g {
+        g.go(|| encodes(1000000))
+        g.go(|| decodes())
+    }
+    for line in r { root.stdout.print(line) }
+}
+|}
+    "17888895 {\"Cons\":[999 ]}]}]}]}]}]} | 23888894 {\"value\":999 }}}}}}}}}}}} | 11000000 {\"kids\":[{\"k ]}]}]}]}]}]} | Err(\"nested deeper than 512 at byte 4096\")\ntrue true true 2099 ns[1]`: no variant `Nope`; expected one of `Cons`, `Nil`\n";
   (* Recursion deeper than a task's stack: natively a message and status 1,
      not a silent crash (the interpreter's stack is larger) *)
   if native_for "stack-overflow" && selected "stack-overflow" then

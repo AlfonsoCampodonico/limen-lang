@@ -1,0 +1,42 @@
+// json.encode and json.decode of types that hold themselves (encoded in
+// pieces, decoded a step at a time) next to flat ones, with the errors.
+use json
+enum L { Cons(Int, L), Nil }
+enum E { Leaf(Str), Two(E, E), Many(List[E]), Named(Map[Str, E]), Tup((Int, E)), Opt(Option[E]), Raw(json.Value) }
+struct Node { value: Int, next: Option[Node] }
+struct Tree { name: Str, kids: List[Tree], extra: Map[Str, Tree], pair: (Float, Option[Tree]) }
+struct Flat { a: Int, b: Str, c: List[Bool], d: Option[Float], m: Map[Str, Int], t: (Int, Str) }
+struct Wrap { flat: Flat, trees: List[Tree], l: L }
+fn main(root: Root) {
+    let out = root.stdout
+    let l = Cons(1, Cons(2, Nil))
+    let mut m: Map[Str, E] = map()
+    m["x"] = E.Leaf("q\"uote")
+    m["y"] = E.Two(E.Leaf("a"), E.Many([]))
+    let e = E.Many([E.Leaf("a"), E.Two(E.Leaf("b"), E.Tup((3, E.Opt(None)))), E.Named(m), E.Opt(Some(E.Raw(json.Arr([json.Num(1.5), json.Null]))))])
+    let n = Node { value: 1, next: Some(Node { value: 2, next: None }) }
+    let mut ex: Map[Str, Tree] = map()
+    ex["k"] = Tree { name: "inner", kids: [], extra: map(), pair: (2.5, None) }
+    let t = Tree { name: "root", kids: [Tree { name: "c", kids: [], extra: map(), pair: (0.1, None) }], extra: ex, pair: (1.0, Some(Tree { name: "p", kids: [], extra: map(), pair: (3.0, None) })) }
+    let mut fm: Map[Str, Int] = map()
+    fm["z"] = 26
+    let f = Flat { a: -3, b: "é\n", c: [true, false], d: None, m: fm, t: (7, "s") }
+    let w = Wrap { flat: f, trees: [t, t], l }
+    let texts = [json.encode(l), json.encode(e), json.encode(n), json.encode(t), json.encode(f), json.encode(w)]
+    for s in texts { out.print(s) }
+    let rl: Result[L, Str] = json.decode(texts[0])
+    let re: Result[E, Str] = json.decode(texts[1])
+    let rn: Result[Node, Str] = json.decode(texts[2])
+    let rt: Result[Tree, Str] = json.decode(texts[3])
+    let rf: Result[Flat, Str] = json.decode(texts[4])
+    let rw: Result[Wrap, Str] = json.decode(texts[5])
+    out.print("{rl == Ok(l)} {re == Ok(e)} {rn == Ok(n)} {rt == Ok(t)} {rf == Ok(f)} {rw == Ok(w)}")
+    let bad_l = ["\{\"Cons\":[1,\{\"Cons\":[2,\"Nope\"]\}]\}", "\{\"Cons\":[1]\}", "\{\"Cons\":[\"x\",\"Nil\"]\}", "3", "\{\"Cons\":[1,\"Nil\"],\"b\":1\}"]
+    for s in bad_l { let r: Result[L, Str] = json.decode(s); out.print("{r}") }
+    let bad_n = ["\{\"value\":1,\"next\":\{\"value\":2,\"next\":\{\"next\":null\}\}\}", "\{\"value\":1\}", "\{\"value\":1,\"next\":5\}", "[]"]
+    for s in bad_n { let r: Result[Node, Str] = json.decode(s); out.print("{r}") }
+    let bad_t = ["\{\"name\":\"a\",\"kids\":[\{\"name\":1\}],\"extra\":\{\},\"pair\":[1,null]\}", "\{\"name\":\"a\",\"kids\":[],\"extra\":\{\"q\":3\},\"pair\":[1,null]\}", "\{\"name\":\"a\",\"kids\":[],\"extra\":\{\},\"pair\":[1]\}", "\{\"name\":\"a\",\"kids\":5,\"extra\":\{\},\"pair\":[1,null]\}", "\{\"name\":\"a\",\"kids\":[],\"extra\":[],\"pair\":[1,null]\}"]
+    for s in bad_t { let r: Result[Tree, Str] = json.decode(s); out.print("{r}") }
+    let bad_e = ["\{\"Many\":[\{\"Two\":[\"Leaf\"]\}]\}", "\{\"Opt\":\{\"Tup\":[1,\{\"Leaf\":2\}]\}\}", "\{\"Named\":\{\"a\":\{\"Bad\":1\}\}\}", "\{\"Two\":[\{\"Leaf\":\"a\"\},\{\"Leaf\":\"b\"\}]\}"]
+    for s in bad_e { let r: Result[E, Str] = json.decode(s); out.print("{r}") }
+}

@@ -6,9 +6,10 @@
    never run, so the checker types every use like any call. Once a program
    has checked, this pass finds each use, takes the type it was used at, and
    writes ordinary Limen functions for that type and every type inside it,
-   into the json module: `json.to$N(x: T) -> json.Value` and
-   `json.from$N(v: json.Value, at: Str) -> Result[T, Str]`, built from the
-   helpers at the end of json.lmn. Each use is pointed at a wrapper,
+   into the json module: `json.put$N(x: T) -> List[json.Part]`, the text in
+   pieces, and `json.from$N(v: json.Value, at: Str) -> Result[T, Str]`,
+   built from the helpers at the end of json.lmn; for a type that holds
+   itself also `json.step$N`, its decoder a step at a time. Each use is pointed at a wrapper,
    `json.encode$N` or `json.decode$N`, and the program is checked again with
    the new functions, so the interpreter and the C backend run them as any
    other code. `$` cannot be written in source, so the names are the
@@ -90,80 +91,178 @@ let rec field_ty env (t : ty_expr) =
 
 let value_ty st = TNamed (jf st "Value", [])
 
+(* What a type holds, for [cyclic]: nothing for a type converted by a
+   helper, and nothing when a part has no JSON form (that is reported when
+   its conversion is written). *)
+let kids st t =
+  try
+    match repr t with
+    | TNamed (n, []) when n = jf st "Value" -> []
+    | TNamed ("Option", [ a ]) | TList a | TMap (_, a) -> [ a ]
+    | TNamed (n, args) when is_tuple_name n -> args
+    | TNamed (n, args) when Hashtbl.mem st.structs n ->
+      let sd = Hashtbl.find st.structs n in
+      let env = List.combine sd.st_gen args in
+      List.map (fun (_, _, fte) -> field_ty env fte) sd.st_fields
+    | TNamed (n, args) when Hashtbl.mem st.enums n ->
+      let ed = Hashtbl.find st.enums n in
+      let env = List.combine ed.en_gen args in
+      List.concat_map (fun (_, _, ts) -> List.map (field_ty env) ts) ed.en_variants
+    | _ -> []
+  with Unsupported _ | Invalid_argument _ -> []
+
+(* Does [t] hold itself? Then a value can be as deep as it is long, so its
+   encoder leaves those parts for later and its decoder goes a step at a
+   time (json.lmn), rather than recursing once per level. *)
+let cyclic st t =
+  let target = show t in
+  let seen = Hashtbl.create 8 in
+  let rec go = function
+    | [] -> false
+    | u :: rest ->
+      let k = show u in
+      if k = target then true
+      else if Hashtbl.mem seen k then go rest
+      else begin
+        Hashtbl.replace seen k ();
+        go (kids st u @ rest)
+      end
+  in
+  go (kids st t)
+
 (* The encoder and decoder of [t], as function names: a helper of json.lmn
-   for the simple types, written ones otherwise. *)
+   for the simple types, written ones otherwise. A type that holds itself
+   has a third, its decoder a step at a time, `step$N`. *)
 let rec coders st t : string * string =
   match repr t with
-  | TInt -> (jf st "of_int", jf st "from_int")
-  | TFloat -> (jf st "of_float", jf st "from_float")
-  | TStr -> (jf st "of_str", jf st "from_str")
-  | TBool -> (jf st "of_bool", jf st "from_bool")
-  | TNamed (n, []) when n = jf st "Value" -> (jf st "of_value", jf st "from_value")
+  | TInt -> (jf st "put_int", jf st "from_int")
+  | TFloat -> (jf st "put_float", jf st "from_float")
+  | TStr -> (jf st "put_str", jf st "from_str")
+  | TBool -> (jf st "put_bool", jf st "from_bool")
+  | TNamed (n, []) when n = jf st "Value" -> (jf st "put_value", jf st "from_value")
   | t -> (
     let key = show t in
     match Hashtbl.find_opt st.names key with
-    | Some k -> (jf st (sprintf "to$%d" k), jf st (sprintf "from$%d" k))
+    | Some k -> (jf st (sprintf "put$%d" k), jf st (sprintf "from$%d" k))
     | None ->
       st.count <- st.count + 1;
       let k = st.count in
       Hashtbl.replace st.names key k;
-      let to_ = jf st (sprintf "to$%d" k) and from = jf st (sprintf "from$%d" k) in
-      let enc, dec = bodies st t in
-      let fn name params ret body =
+      let put = jf st (sprintf "put$%d" k) and from = jf st (sprintf "from$%d" k) in
+      let enc, dec, step = bodies st t in
+      let fn ?(gen = []) name params ret body =
         IFn
-          { fn_name = name; fn_span = st.sp; fn_gen = []; fn_params = params; fn_ret = Some ret; fn_body = body;
+          { fn_name = name; fn_span = st.sp; fn_gen = gen; fn_params = params; fn_ret = Some ret; fn_body = body;
             fn_test = None; fn_bench = false; fn_virtual = false; fn_table = None; fn_pub = false; fn_bounds = [];
             fn_foreign = None }
       in
       let prm n t = { prm_name = n; prm_span = st.sp; prm_ty = t; prm_default = None } in
-      st.out <- fn from [ prm "v" (written st (value_ty st)); prm "at" (written st TStr) ]
-                  (written st (TNamed ("Result", [ t; TStr ]))) dec
-                :: fn to_ [ prm "x" (written st t) ] (written st (value_ty st)) enc :: st.out;
-      (to_, from))
+      let parts = te st (TyName ("List", [ te st (TyName (jf st "Part", [])) ])) in
+      let result = written st (TNamed ("Result", [ t; TStr ])) in
+      let dec_params = [ prm "v" (written st (value_ty st)); prm "at" (written st TStr) ] in
+      let encoder = fn put [ prm "x" (written st t) ] parts enc in
+      (match step with
+       | None -> st.out <- fn from dec_params result dec :: encoder :: st.out
+       | Some body ->
+         (* the decoder runs the steps *)
+         let start = call st (jf st "stop") [ var st "r" ] in
+         let dec = block st [] (call st (jf st "run") [ call st (jf st (sprintf "step$%d" k)) [ var st "v"; var st "at"; ex st (EClosure ([ ("r", None, st.sp) ], start)) ] ]) in
+         let next = te st (TyName (jf st "Next", [ te st (TyName ("R", [])) ])) in
+         let kont = te st (TyFn ([ result ], next)) in
+         let stepper = fn ~gen:[ "R" ] (jf st (sprintf "step$%d" k)) (dec_params @ [ prm "k" kont ]) next body in
+         st.out <- fn from dec_params result dec :: stepper :: encoder :: st.out);
+      (put, from))
 
-(* The bodies of [t]'s encoder (of `x`) and decoder (of `v` at `at`). *)
-and bodies st t : block * block =
+and step_name st t = jf st (sprintf "step$%d" (Hashtbl.find st.names (show t)))
+
+(* The bodies of [t]'s encoder (of `x`) and decoder (of `v` at `at`), and
+   when [t] holds itself, its decoder a step at a time (of `v` at `at`, on
+   to `k`). The parts' conversions are written first, in order. *)
+and bodies st t : block * block * block option =
   let x = var st "x" and v = var st "v" and at = var st "at" in
   let fnv n = var st n in
-  let enc_of t e = let e', _ = coders st t in call st e' [ e ] in
-  let dec_of t v at = let _, d = coders st t in try_ st (call st d [ v; at ]) in
   let only e = block st [] e in
-  let fields_obj fs = call st (jf st "of_fields") [ ex st (EList (List.map (fun (n, e) -> call st (jf st "field") [ str st n; e ]) fs)) ] in
-  let list_of es = call st (jf st "of_list") [ ex st (EList es) ] in
   let ok e = call st "Ok" [ e ] in
-  (* [n] values from an array of exactly [n] items at [at], decoded by
-     [decs]: a `let` of the items, and the expressions *)
+  let int n = ex st (EInt (Int64.of_int n)) in
+  let need ts = List.iter (fun a -> ignore (coders st a)) ts in
+  let put_of a e =
+    let p, _ = coders st a in
+    if cyclic st a then call st (jf st "later") [ ex st (EClosure ([], call st p [ e ])) ] else call st p [ e ]
+  in
+  let dec_of a v at = let _, d = coders st a in try_ st (call st d [ v; at ]) in
   let items_of n v at decs =
-    let s = { sdesc = SLet (false, "items", st.sp, None, try_ st (call st (jf st "from_items") [ v; at; ex st (EInt (Int64.of_int n)) ])); sspan = st.sp } in
-    let es =
-      List.mapi
-        (fun i t -> dec_of t (ex st (EIndex (var st "items", ex st (EInt (Int64.of_int i))))) (call st (jf st "item_at") [ at; ex st (EInt (Int64.of_int i)) ]))
-        decs
-    in
+    let s = { sdesc = SLet (false, "items", st.sp, None, try_ st (call st (jf st "from_items") [ v; at; int n ])); sspan = st.sp } in
+    let es = List.mapi (fun i t -> dec_of t (ex st (EIndex (var st "items", int i))) (call st (jf st "item_at") [ at; int i ])) decs in
     (s, es)
   in
+  (* a step at a time: [kont e] hands e on, [seq parts made] decodes the
+     parts in order, each [(type, direct, by_step)] binding d0, d1, ...,
+     then hands on [made] *)
+  let go e = call st (jf st "go") [ ex st (EClosure ([], e)) ] in
+  let kont e = go (call st "k" [ e ]) in
+  let fail = { apat = pat st (PVariant (None, "Err", [ pat st (PBind "e") ])); aguard = None; abody = kont (call st "Err" [ var st "e" ]) } in
+  let on_ok r name body =
+    let bind = if name = "_" then PWild else PBind name in
+    ex st (EMatch (r, [ { apat = pat st (PVariant (None, "Ok", [ pat st bind ])); aguard = None; abody = body }; fail ]))
+  in
+  let seq parts made =
+    let rec loop i = function
+      | [] -> kont made
+      | (a, direct, by_step) :: rest ->
+        let name = sprintf "d%d" i in
+        if cyclic st a then go (by_step (ex st (EClosure ([ ("r", None, st.sp) ], on_ok (var st "r") name (loop (i + 1) rest)))))
+        else on_ok (direct ()) name (loop (i + 1) rest)
+    in
+    loop 0 parts
+  in
+  let ds n = List.init n (fun i -> var st (sprintf "d%d" i)) in
+  (* the parts of an array of exactly [ts] items at [at] *)
+  let item_parts at ts =
+    List.mapi
+      (fun i a ->
+        let iv = ex st (EIndex (var st "items", int i)) and iat = call st (jf st "item_at") [ at; int i ] in
+        (a, (fun () -> call st (snd (coders st a)) [ iv; iat ]), fun kk -> call st (step_name st a) [ iv; iat; kk ]))
+      ts
+  in
+  let items_then v at ts made = on_ok (call st (jf st "from_items") [ v; at; int (List.length ts) ]) "items" (seq (item_parts at ts) made) in
+  let self = cyclic st t in
   match repr t with
   | TNamed ("Option", [ a ]) ->
+    need [ a ];
     let e, d = coders st a in
-    (only (call st (jf st "of_option") [ x; fnv e ]), only (call st (jf st "from_option") [ v; at; fnv d ]))
+    ( only (call st (jf st "put_option") [ x; fnv e ]),
+      only (call st (jf st "from_option") [ v; at; fnv d ]),
+      if self then Some (only (call st (jf st "option_k") [ v; at; fnv (step_name st a); var st "k" ])) else None )
   | TList a ->
+    need [ a ];
     let e, d = coders st a in
-    (only (call st (jf st "of_list") [ ex st (EMethod (x, "map", st.sp, [ fnv e ])) ]), only (call st (jf st "from_list") [ v; at; fnv d ]))
+    ( only (call st (jf st "put_list") [ x; fnv e ]),
+      only (call st (jf st "from_list") [ v; at; fnv d ]),
+      if self then Some (only (call st (jf st "list_k") [ v; at; fnv (step_name st a); var st "k" ])) else None )
   | TMap (k, a) -> (
     match repr k with
     | TStr ->
+      need [ a ];
       let e, d = coders st a in
-      (only (call st (jf st "of_map") [ x; fnv e ]), only (call st (jf st "from_map") [ v; at; fnv d ]))
+      ( only (call st (jf st "put_map") [ x; fnv e ]),
+        only (call st (jf st "from_map") [ v; at; fnv d ]),
+        if self then Some (only (call st (jf st "map_k") [ v; at; fnv (step_name st a); var st "k" ])) else None )
     | k -> raise (Unsupported (sprintf "`%s` (a map's keys must be `Str`)" (show (TMap (k, a))))))
   | TNamed (n, args) when is_tuple_name n ->
-    let enc = list_of (List.mapi (fun i a -> enc_of a (ex st (EField (x, string_of_int i, st.sp)))) args) in
+    need args;
+    let enc = call st (jf st "put_items") [ ex st (EList (List.mapi (fun i a -> put_of a (ex st (EField (x, string_of_int i, st.sp)))) args)) ] in
     let s, es = items_of (List.length args) v at args in
-    (only enc, block st [ s ] (ok (ex st (EStruct (n, st.sp, List.mapi (fun i e -> (string_of_int i, st.sp, e)) es)))))
+    let build es = ex st (EStruct (n, st.sp, List.mapi (fun i e -> (string_of_int i, st.sp, e)) es)) in
+    (only enc, block st [ s ] (ok (build es)), if self then Some (only (items_then v at args (ok (build (ds (List.length args)))))) else None)
   | TNamed (n, args) when Hashtbl.mem st.structs n ->
     let sd = Hashtbl.find st.structs n in
     let env = List.combine sd.st_gen args in
     let fs = List.map (fun (f, _, fte) -> (f, field_ty env fte)) sd.st_fields in
-    let enc = fields_obj (List.map (fun (f, ft) -> (f, enc_of ft (ex st (EField (x, f, st.sp))))) fs) in
+    need (List.map snd fs);
+    let enc =
+      call st (jf st "put_fields")
+        [ ex st (EList (List.map (fun (f, _) -> str st f) fs)); ex st (EList (List.map (fun (f, ft) -> put_of ft (ex st (EField (x, f, st.sp)))) fs)) ]
+    in
     let check = { sdesc = SExpr (try_ st (call st (jf st "need_object") [ v; at ])); sspan = st.sp } in
     let dec =
       ex st
@@ -173,20 +272,33 @@ and bodies st t : block * block =
                (fun (f, ft) -> (f, st.sp, try_ st (call st (jf st "member") [ v; at; str st f; fnv (snd (coders st ft)) ])))
                fs ))
     in
-    (only enc, block st [ check ] (ok dec))
+    let step () =
+      let parts =
+        List.map
+          (fun (f, ft) ->
+            ( ft,
+              (fun () -> call st (jf st "member") [ v; at; str st f; fnv (snd (coders st ft)) ]),
+              fun kk -> call st (jf st "member_k") [ v; at; str st f; fnv (step_name st ft); kk ] ))
+          fs
+      in
+      let made = ok (ex st (EStruct (n, st.sp, List.mapi (fun i (f, _) -> (f, st.sp, var st (sprintf "d%d" i))) fs))) in
+      only (on_ok (call st (jf st "need_object") [ v; at ]) "_" (seq parts made))
+    in
+    (only enc, block st [ check ] (ok dec), if self then Some (step ()) else None)
   | TNamed (n, args) when Hashtbl.mem st.enums n ->
     let ed = Hashtbl.find st.enums n in
     let env = List.combine ed.en_gen args in
     let vs = List.map (fun (vn, _, ts) -> (vn, List.map (field_ty env) ts)) ed.en_variants in
+    need (List.concat_map snd vs);
     let arms =
       List.map
         (fun (vn, ts) ->
           let names = List.mapi (fun i _ -> sprintf "p%d" i) ts in
           let body =
             match ts with
-            | [] -> str st vn |> fun s -> call st (jf st "of_str") [ s ]
-            | [ a ] -> call st (jf st "of_variant") [ str st vn; enc_of a (var st "p0") ]
-            | _ -> call st (jf st "of_variant") [ str st vn; list_of (List.map2 (fun a p -> enc_of a (var st p)) ts names) ]
+            | [] -> call st (jf st "put_str") [ str st vn ]
+            | [ a ] -> call st (jf st "put_variant") [ str st vn; put_of a (var st "p0") ]
+            | _ -> call st (jf st "put_variant") [ str st vn; call st (jf st "put_items") [ ex st (EList (List.map2 (fun a p -> put_of a (var st p)) ts names)) ] ]
           in
           { apat = pat st (PVariant (Some n, vn, List.map (fun p -> pat st (PBind p)) names)); aguard = None; abody = body })
         vs
@@ -212,7 +324,24 @@ and bodies st t : block * block =
     let names = String.concat ", " (List.map (fun (vn, _) -> sprintf "`%s`" vn) vs) in
     let other = { apat = pat st PWild; aguard = None; abody = call st "Err" [ call st (jf st "no_variant") [ at; name; str st names ] ] } in
     let s = { sdesc = SLet (false, "got", st.sp, None, try_ st (call st (jf st "from_variant") [ v; at ])); sspan = st.sp } in
-    (only enc, block st [ s ] (ex st (EMatch (name, darms @ [ other ]))))
+    let step () =
+      let sarms =
+        List.map
+          (fun (vn, ts) ->
+            let made es = ok (if ts = [] then ex st (EField (var st n, vn, st.sp)) else ex st (EMethod (var st n, vn, st.sp, es))) in
+            let body =
+              match ts with
+              | [] -> kont (made [])
+              | [ a ] -> seq [ (a, (fun () -> call st (snd (coders st a)) [ payload; inner ]), fun kk -> call st (step_name st a) [ payload; inner; kk ]) ] (made (ds 1))
+              | _ -> items_then payload inner ts (made (ds (List.length ts)))
+            in
+            { apat = pat st (PStr vn); aguard = None; abody = body })
+          vs
+      in
+      let other = { apat = pat st PWild; aguard = None; abody = kont (call st "Err" [ call st (jf st "no_variant") [ at; name; str st names ] ]) } in
+      only (on_ok (call st (jf st "from_variant") [ v; at ]) "got" (ex st (EMatch (name, sarms @ [ other ]))))
+    in
+    (only enc, block st [ s ] (ex st (EMatch (name, darms @ [ other ]))), if self then Some (step ()) else None)
   | t -> raise (Unsupported (sprintf "`%s`" (show t)))
 
 (* ---------- SQL rows ---------- *)
@@ -414,7 +543,7 @@ let expand ?json ?(rows = []) (items : item list) : (item list * Diag.t list) op
               let w = jf st (sprintf "%s$%d" (if encode then "encode" else "decode") (Hashtbl.length wrappers + 1)) in
               let prm n t = { prm_name = n; prm_span = e.espan; prm_ty = t; prm_default = None } in
               let body, params, ret =
-                if encode then (block st [] (call st (jf st "stringify") [ call st to_ [ var st "x" ] ]), [ prm "x" (written st t) ], written st TStr)
+                if encode then (block st [] (call st (jf st "write") [ call st to_ [ var st "x" ] ]), [ prm "x" (written st t) ], written st TStr)
                 else (block st [] (call st (jf st "from_text") [ var st "s"; var st from ]), [ prm "s" (written st TStr) ], written st (TNamed ("Result", [ t; TStr ])))
               in
               st.out <- fn_item w e.espan params ret body :: st.out;
