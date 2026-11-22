@@ -343,7 +343,13 @@ pub fn parse_iso(s: Str) -> Result[Int, Str] {
         return Err("time: offset {pad(oh, 2)}:{pad(om, 2)} is out of range")
     }
     let off = minutes(oh * 60 + om)
-    Ok(if z == 43 { local - off } else { local + off })
+    let t = if z == 43 { local - off } else { local + off }
+    // an offset can move a time in year 9999 or 0 past what `iso` writes
+    // with four digits
+    if t < date(0, 1, 1) || t >= date(10000, 1, 1) {
+        return Err("time: `{s.trim()}` is outside the years 0 to 9999 in UTC")
+    }
+    Ok(t)
 }
 
 // Runs `f` with a deadline: its result if it finishes within `ms`

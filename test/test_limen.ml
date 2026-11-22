@@ -4601,6 +4601,19 @@ fn main(root: Root) -> Result[(), IoError] {
 }
 |v}
     "404 text/html; charset=utf-8 - doctype=true dark=true url=false script=false\n<h1>Not found</h1> <p>Nothing is served at /&lt;b&gt;&amp;x.</p> <p><a href=\"/\">Go to the home page</a></p>\n405 text/html; charset=utf-8 GET, HEAD doctype=true dark=true url=false script=false\n<h1>Method not allowed</h1> <p>/todos does not answer DELETE. It answers GET, HEAD.</p> <p><a href=\"/\">Go to the home page</a></p>\n404 text/plain; charset=utf-8 - doctype=false dark=false url=false script=false\nnot found\n404 text/plain; charset=utf-8 - doctype=false dark=false url=false script=false\nnot found\n403 text/html; charset=utf-8 - doctype=true dark=true url=false script=false\n<h1>Forbidden</h1> <p>Sign in to see &lt;this&gt;.</p> <p><a href=\"/\">Go to the home page</a></p>\ntrue false\n500 text/html; charset=utf-8 - doctype=true dark=true url=false script=false\n<h1>Internal server error</h1> <p>The server ran into an error while answering this request.</p> <p><a href=\"/\">Go to the home page</a></p>\n500 text/plain; charset=utf-8 - doctype=false dark=false url=false script=false\ninternal error\n";
+  (* found by fuzz/formats.lmn: an offset could move a time past the years
+     `iso` writes *)
+  out "std-time-iso-range" {|use time
+
+fn main(root: Root) {
+    let out = root.stdout
+    // an offset moves these past what `iso` writes with four digits
+    out.print("{time.parse_iso("9999-12-31T23:59:59.999-00:01")} {time.parse_iso("0000-01-01T00:00+00:01")}")
+    let last = time.parse_iso("9999-12-31T23:59:59.999Z") ?? 0
+    out.print("{time.iso(last)} {time.parse_iso("0000-01-01T00:00Z")} {time.parse_iso("9999-12-31T23:59:59.999+01:00")}")
+}
+|}
+    "Err(\"time: `9999-12-31T23:59:59.999-00:01` is outside the years 0 to 9999 in UTC\") Err(\"time: `0000-01-01T00:00+00:01` is outside the years 0 to 9999 in UTC\")\n9999-12-31T23:59:59.999Z Ok(-62167219200000) Ok(253402297199999)\n";
   out "std-regex"
     {v|use regex
 
