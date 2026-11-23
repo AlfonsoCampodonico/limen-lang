@@ -160,7 +160,10 @@ pub fn check_program(items: List[ast.Item], files: List[diag.Source], next_id: I
             _ => !st.subst.has_fn(t),
         })
         match st.cb_uses.get(f.decl.name) {
-            Some((false, passes)) if !fns.is_empty() && st.authority_of(f.sig.params).is_empty() && f.decl.bounds.is_empty() && plain && !f.sig.params.any(|t| st.subst.has_chan(t)) && !f.decl.params.zip(f.sig.params).any(|x| x.0.mutable && st.subst.has_fn(x.1)) => {
+            Some((false, passes)) if !fns.is_empty() && st.authority_of(f.sig.params).is_empty() && f.decl.bounds.is_empty() && plain && !f.sig.params.any(|t| st.subst.has_chan(t)) && !f.decl.params.zip(f.sig.params).any(|x| x.0.mutable && match st.repr(x.1) {
+                TFn(..) => true,
+                _ => false,
+            }) => {
                 cond[f.decl.name] = (fns, passes)
             },
             _ => {},

@@ -988,7 +988,10 @@ let rec place_path (e : expr) =
   | _ -> None
 
 (* Two places overlap when they share a root and, walked together, never
-   name two different fields before one of them ends. *)
+   name two different fields before one of them ends. Roots are compared
+   by name, so this is conservative under shadowing: a `mut` place on a
+   name a nested block shadows can be refused although it is another
+   variable. *)
 let overlaps (ra, sa) (rb, sb) =
   let rec go = function
     | PName x :: xs, PName y :: ys -> x = y && go (xs, ys)
@@ -1037,16 +1040,39 @@ and block_kids (b : block) =
     b.stmts
   @ Option.to_list b.tail
 
-(* The places that calls inside [e] change, outside closures: their `mut`
-   arguments and receivers, and the lists and maps they `push` to or
-   `remove` from; each with where it is written. *)
-let rec changed_in (e : expr) =
+(* A place a call changes is (where it is written, its path, whether it is
+   written `mut`): a `mut` argument or receiver is, the receiver of `push`
+   or `remove` is not. Two such places clash when they overlap and at least
+   one is written `mut`, so code without `mut` is never refused. *)
+let clash (_, p, w) (_, q, v) = (w || v) && overlaps p q
+
+let changes_receiver m (r : expr) = match (m, repr r.ety) with ("push", TList _) | ("remove", TMap _) -> true | _ -> false
+
+(* The places call [e] changes itself, in written order. *)
+let own_places (e : expr) =
+  let at w (x : expr) = Option.map (fun p -> (x.espan, p, w)) (place_path x) in
+  let muts xs = List.filter_map (fun (x : expr) -> match x.edesc with EMut _ -> at true x | _ -> None) xs in
+  match e.edesc with
+  | ECall (_, args) -> muts args
+  | EMethod (r, m, _, args) when changes_receiver m r -> Option.to_list (at false r) @ muts args
+  | EMethod (r, _, _, args) -> muts (r :: args)
+  | _ -> []
+
+(* What is inside the parts of a call: the indexes of a `mut` place, the
+   whole of anything else. *)
+let inside_parts xs = List.concat_map (fun (x : expr) -> match x.edesc with EMut p -> expr_kids p | _ -> [ x ]) xs
+
+(* The places that calls inside [e] change, outside closures, leaving out
+   those a call between [e] and them already refuses, [above] being the
+   places those calls change themselves. *)
+let rec changed_in above (e : expr) =
   match e.edesc with
   | EClosure _ -> []
-  | EMut x -> Option.to_list (Option.map (fun p -> (e.espan, p)) (place_path x)) @ List.concat_map changed_in (expr_kids x)
-  | EMethod (r, m, _, args) when (match (m, repr r.ety) with ("push", TList _) | ("remove", TMap _) -> true | _ -> false) ->
-    Option.to_list (Option.map (fun p -> (r.espan, p)) (place_path r)) @ List.concat_map changed_in (expr_kids r @ args)
-  | _ -> List.concat_map changed_in (expr_kids e)
+  | ECall _ | EMethod _ ->
+    let own = own_places e in
+    List.filter (fun c -> not (List.exists (clash c) above)) own
+    @ List.concat_map (changed_in (own @ above)) (inside_parts (expr_kids e))
+  | _ -> List.concat_map (changed_in above) (expr_kids e)
 
 let rec check_expr ctx f e : ty =
   let t = check_expr_inner ctx f e in
@@ -2214,33 +2240,30 @@ and mut_receiver ctx f key (recv : expr) =
 
 (* E0214: the `mut` places of one call, [changed] (the receiver of `push`
    or `remove`) and the `mut` ones among [parts] (its receiver and
-   arguments, in written order), may not overlap, nor may a place that a
-   call inside them changes. *)
+   arguments, in written order), may not clash, nor may a place that a
+   call inside them changes clash with one of them. *)
 and mut_overlap ctx ?changed parts =
-  let place (x : expr) = Option.map (fun p -> (x.espan, p)) (place_path x) in
+  let at w (x : expr) = Option.map (fun p -> (x.espan, p, w)) (place_path x) in
   let own =
-    Option.to_list (Option.bind changed place)
-    @ List.filter_map (fun (x : expr) -> match x.edesc with EMut _ -> place x | _ -> None) parts
+    Option.to_list (Option.bind changed (at false))
+    @ List.filter_map (fun (x : expr) -> match x.edesc with EMut _ -> at true x | _ -> None) parts
   in
   let rec later seen = function
     | [] -> ()
-    | (sp, p) :: rest ->
-      if List.exists (overlaps p) seen then
+    | ((sp, _, _) as c) :: rest ->
+      if List.exists (clash c) seen then
         err ctx "E0214" sp "this `mut` argument overlaps another one of the same call"
           ~notes:[ "a call changes each value through one `mut` argument: `mut p.x, mut p.y` are separate, but two elements of one list or map are not (take them out and put them back)" ];
-      later (p :: seen) rest
+      later (c :: seen) rest
   in
   later [] own;
-  if own <> [] then begin
-    let inside (x : expr) = match x.edesc with EMut p -> List.concat_map changed_in (expr_kids p) | _ -> changed_in x in
-    let nested = (match changed with Some r -> List.concat_map changed_in (expr_kids r) | None -> []) @ List.concat_map inside parts in
+  if own <> [] then
     List.iter
-      (fun (sp, p) ->
-        if List.exists (fun (_, q) -> overlaps p q) own then
+      (fun ((sp, _, _) as c) ->
+        if List.exists (clash c) own then
           err ctx "E0214" sp "this changes a value that the enclosing call also takes as `mut`"
             ~notes:[ "make that call first, on its own line, and pass its result" ])
-      nested
-  end
+      (List.concat_map (changed_in []) (inside_parts (Option.to_list changed @ parts)))
 
 (* Can errors of type [e] become `dyn Error`? None if so, else why not. *)
 and error_conversion ctx e =
@@ -3851,7 +3874,7 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
       match Hashtbl.find_opt cb_uses d.fn_name with
       | Some (false, passes)
         when fns <> [] && authority_of s.ps = [] && d.fn_bounds = [] && not (List.exists has_chan s.ps)
-             && not (List.exists (fun (p, t) -> p.prm_mut && has_fn t) (zip d.fn_params s.ps))
+             && not (List.exists (fun (p, t) -> p.prm_mut && (match repr t with TFn _ -> true | _ -> false)) (zip d.fn_params s.ps))
              && List.for_all (fun t -> (match repr t with TFn _ -> true | _ -> false) || not (has_fn t)) s.ps ->
         Hashtbl.replace cond d.fn_name (fns, passes)
       | _ -> ())

@@ -11798,7 +11798,7 @@ fn main(root: Root) {
   says "mut-piped-not-place" (mut_decls ^ main_wrap "    plain(1) |> bump") "E0213" "call `bump(mut x)`";
   says "mut-param-note" "fn f(n: Int) {\n    n = 1\n}\nfn main(root: Root) {}\n" "E0205" "declare it `mut n` to change the caller's value";
   ok "mut-explained" (List.for_all (fun c -> List.mem_assoc c Diag.explanations) [ "E0213"; "E0214"; "E0215" ]) "no explanation";
-  let two = "struct P {\n    x: Int,\n    y: Int,\n}\n\nfn two(mut a: Int, mut b: Int) {}\n\nfn put(mut a: Int, b: Int) {}\n\nfn pt(mut p: P, mut v: Int) {}\n\nfn next(mut n: Int) -> Int {\n    n\n}\n\nfn take(mut xs: List[Int]) -> Int {\n    0\n}\n\nfn both(mut xs: List[Int], ys: List[Int]) -> Int {\n    0\n}\n\nstruct Buf {\n    items: List[Int],\n}\n\nfn grab(mut self: Buf, mut more: List[Int]) {}\n\n" in
+  let two = "struct P {\n    x: Int,\n    y: Int,\n}\n\nfn two(mut a: Int, mut b: Int) {}\n\nfn put(mut a: Int, b: Int) {}\n\nfn put2(mut a: Int, b: Int) -> Int {\n    0\n}\n\nfn pt(mut p: P, mut v: Int) {}\n\nfn next(mut n: Int) -> Int {\n    n\n}\n\nfn take(mut xs: List[Int]) -> Int {\n    0\n}\n\nfn both(mut xs: List[Int], ys: List[Int]) -> Int {\n    0\n}\n\nstruct Buf {\n    items: List[Int],\n}\n\nfn grab(mut self: Buf, mut more: List[Int]) {}\n\n" in
   let m body = two ^ main_wrap ("    let mut k = 0\n    let mut j = 0\n    let mut p = P { x: 0, y: 0 }\n    let mut xs = [1, 2]\n    let mut mm = map([(\"a\", 1)])\n    let mut b = Buf { items: [] }\n" ^ body) in
   says "mut-overlap-same" (m "    two(mut k, mut k)") "E0214" "this `mut` argument overlaps another one of the same call";
   errs "mut-overlap-prefix" (m "    pt(mut p, mut p.x)") [ "E0214" ];
@@ -11815,6 +11815,15 @@ fn main(root: Root) {
   errs "mut-distinct-tuple" (m "    let mut t = (1, 2)\n    two(mut t.0, mut t.1)") [];
   errs "mut-nested-index" (m "    two(mut xs[next(mut k)], mut k)") [ "E0214" ];
   errs "mut-nested-block" (m "    put(mut k, {\n        let n = next(mut k)\n        n\n    })") [ "E0214" ];
+  errs "mut-no-mut-push" (m "    xs.push({\n        xs.push(1)\n        2\n    })") [];
+  errs "mut-no-mut-push-if" (m "    let c = true\n    xs.push(if c {\n        xs.push(0)\n        1\n    } else {\n        2\n    })") [];
+  errs "mut-no-mut-remove" (m "    mm.remove({\n        mm.remove(\"a\")\n        \"b\"\n    })") [];
+  errs "mut-no-mut-shadowed" (m "    xs.push({\n        let mut xs = [0]\n        xs.push(1)\n        xs.len()\n    })") [];
+  errs "mut-nested-push-in-mut" (m "    let n = take(mut xs) + {\n        xs.push(1)\n        0\n    }") [];
+  errs "mut-nested-into-push" (m "    let n = both(mut xs, {\n        xs.push(1)\n        []\n    })") [ "E0214" ];
+  (* nesting three deep: each place is reported once *)
+  (let _, ds, _ = compile "mut-nested-once" (m "    two(mut k, mut j)\n    put(mut k, put2(mut k, next(mut k)))") in
+   ok "mut-nested-once" (List.length (List.filter (fun (d : Diag.t) -> d.code = "E0214") ds) = 2) (String.concat ", " (codes ds)));
   errs "mut-overlap-promoted" "struct Inner {\n    n: Int,\n}\nstruct Outer {\n    Inner,\n}\nfn whole(mut o: Outer, mut v: Int) {}\nfn main(root: Root) {\n    let mut o = Outer { Inner: Inner { n: 0 } }\n    whole(mut o, mut o.n)\n}\n" [ "E0214" ];
   (let _, ds, infos = compile "mut-pure" (two ^ "fn bump(mut n: Int) {\n    n = n + 1\n}\n\nfn swap_cb(mut f: fn() -> Int) {\n    f = || 1\n}\n\nfn main(root: Root) {}\n") in
    let text n = Check.pure_text (List.find (fun (i : Check.fn_info) -> i.name = n) infos) in
