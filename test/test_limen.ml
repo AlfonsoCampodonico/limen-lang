@@ -999,6 +999,10 @@ fn main(root: Root) {
 }
 |}
     "4 16 196 25 0 5 10 251 240\n160 15 0 0 false true true\n9223372036854775808 18446744073709551615 6148914691236517205 true -1 18446744073709551615\n3 3221225472 3 1335831723\n[300, 2, 65535] [2, 300, 65535] [301, 3, 0]\nSome(\"a\") [250, 10]\n232 65535 1250 250000 250.0 10 250\n";
+  out "uint-to-float-rounding"
+    (main_wrap {|    let x = (-9223372036854775807 - 1).to_uint64() + 1025.to_uint64()
+    out.print("{x} {x.to_float().to_fixed(0)} {(-1).to_uint64().to_float().to_fixed(0)} {9007199254740993.to_uint64().to_float().to_fixed(0)} {255.to_uint8().to_float()}")|})
+    "9223372036854776833 9223372036854777856 18446744073709551616 9007199254740992 255.0\n";
   errs "uint-too-big" "fn main(root: Root) {\n    let a: UInt8 = 256\n}\n" [ "E0201" ];
   errs "uint-negative" "fn main(root: Root) {\n    let a: UInt8 = -1\n}\n" [ "E0201" ];
   errs "uint-mixed" "fn main(root: Root) {\n    let a: UInt8 = 5\n    let n = 3\n    let c = a + n\n}\n" [ "E0201" ];

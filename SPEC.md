@@ -1246,7 +1246,7 @@ Binary data, kept apart from text so a byte buffer is never printed or concatena
 | Type | Methods |
 | --- | --- |
 | `Int` | `to_uint8()`, `to_uint16()`, `to_uint32()`, `to_uint64()` (wrapping: `(-1).to_uint8()` is `255`), `to_str()`, `to_float()`, `abs()`, `min(n)`, `max(n)`, `to_char()` (the UTF-8 text of a code point, `65.to_char()` is `"A"`; invalid code points give U+FFFD), `shift_right_unsigned(n)` (`>>` shifting in zeros instead of the sign: `(-1).shift_right_unsigned(60)` is `15`; a count of 64 or more gives `0`, a negative one panics) |
-| `UInt8` to `UInt64` | `to_int()` (a `UInt64` past the largest `Int` wraps to a negative one), `to_float()`, `to_str()`, `to_uint8()` to `to_uint64()` (wrapping), `min(n)`, `max(n)`, `rotate_left(n)`, `rotate_right(n)` (by `n` modulo the width) |
+| `UInt8` to `UInt64` | `to_int()` (a `UInt64` past the largest `Int` wraps to a negative one), `to_float()` (the nearest `Float`, ties to even, as IEEE 754 rounds: `(2^63 + 1025).to_float()` is `9223372036854777856.0`), `to_str()`, `to_uint8()` to `to_uint64()` (wrapping), `min(n)`, `max(n)`, `rotate_left(n)`, `rotate_right(n)` (by `n` modulo the width) |
 | `Float` | `to_str()`, `to_int()` (truncates; NaN gives 0), `abs()`, `sqrt()`, `to_fixed(d)` (exactly `d` decimals, 0 to 30, rounded as C's printf rounds: `3.14159.to_fixed(2)` is `"3.14"`; NaN and infinities give `nan`, `inf`, `-inf`) |
 | `Bool` | `to_str()` |
 

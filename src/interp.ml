@@ -497,12 +497,8 @@ let vint n = VInt (Int64.of_int n)
 (* An Int used as a count or position, clamped to 0..n. *)
 let clamp (k : int64) n = if k < 0L then 0 else if k > Int64.of_int n then n else Int64.to_int k
 
-(* Float to Int as the native w_f2i: NaN is 0, out of range saturates. *)
-let float_to_int x =
-  if Float.is_nan x then 0L
-  else if x >= 9.2e18 then Int64.max_int
-  else if x <= -9.2e18 then Int64.min_int
-  else Int64.of_float x
+(* Float to Int, the C definition native code uses. *)
+let float_to_int = Core.f2i
 
 let strs l = VList (Array.of_list (List.map (fun s -> VStr s) l))
 
@@ -3015,9 +3011,7 @@ and call_method rt v name args sp =
     VUInt (b, wrap b n)
   | VUInt (_, n), "to_int", [] -> VInt n
   | VUInt (_, n), "to_str", [] -> VStr (Printf.sprintf "%Lu" n)
-  | VUInt (_, n), "to_float", [] ->
-    (* all 64 bits unsigned: the top bit is 2^63, not the sign *)
-    VFloat (if n >= 0L then Int64.to_float n else Int64.to_float (Int64.shift_right_logical n 1) *. 2. +. Int64.to_float (Int64.logand n 1L))
+  | VUInt (_, n), "to_float", [] -> VFloat (Core.u2f n)
   | VUInt (b, x), "min", [ VUInt (_, y) ] -> VUInt (b, if Int64.unsigned_compare x y <= 0 then x else y)
   | VUInt (b, x), "max", [ VUInt (_, y) ] -> VUInt (b, if Int64.unsigned_compare x y >= 0 then x else y)
   | VUInt (b, x), ("rotate_left" | "rotate_right"), [ VInt k ] ->

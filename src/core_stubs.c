@@ -7,6 +7,7 @@
    strings comes back as a string array, built in two passes: count, then
    allocate and fill. */
 #define _GNU_SOURCE
+#include "runtime/limen_core_inline.h"
 #include "runtime/limen_core.h"
 #include <string.h>
 #include <caml/alloc.h>
@@ -31,3 +32,10 @@ value limen_core_lines(value s) {
   }
   CAMLreturn(out);
 }
+
+/* Numeric stubs: no allocation, unboxed in native code, boxed _byte variants
+   for bytecode. The int64 of u2f is the UInt's 64 bits. */
+double limen_core_u2f(int64_t x) { return lc_u2f((uint64_t)x); }
+value limen_core_u2f_byte(value x) { return caml_copy_double(lc_u2f((uint64_t)Int64_val(x))); }
+int64_t limen_core_f2i(double x) { return lc_f2i(x); }
+value limen_core_f2i_byte(value x) { return caml_copy_int64(lc_f2i(Double_val(x))); }

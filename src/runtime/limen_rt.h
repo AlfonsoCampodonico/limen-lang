@@ -388,13 +388,8 @@ static inline uint64_t w_urot(uint64_t x, int64_t k, int bits, int left) {
   uint64_t m = bits == 64 ? ~(uint64_t)0 : (((uint64_t)1 << bits) - 1);
   return ((x << r) | (x >> (bits - r))) & m;
 }
-static inline double w_u2f(uint64_t x) { return (double)x; }
-static inline int64_t w_f2i(double x) {
-  if (isnan(x)) return 0;
-  if (x >= 9.2e18) return INT64_MAX;
-  if (x <= -9.2e18) return INT64_MIN;
-  return (int64_t)x;
-}
+static inline double w_u2f(uint64_t x) { return lc_u2f(x); }
+static inline int64_t w_f2i(double x) { return lc_f2i(x); }
 static inline int64_t w_abs(int64_t x) { return x < 0 ? (int64_t)(0 - (uint64_t)x) : x; }
 __attribute__((noreturn)) W_RT void w_panic_index(int64_t i, int64_t len, const char *where);
 
