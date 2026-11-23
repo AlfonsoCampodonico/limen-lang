@@ -625,8 +625,12 @@ W_RT WStr *Float_to_fixed(double x, int64_t d) {
   size_t n = lc_to_fixed(t, sizeof t, x, d);
   return Str_from(t, (int64_t)n);
 }
-/* A decimal float (lc_parse_float). */
-W_RT bool Str_parse_float(WStr *s, double *out) { return lc_parse_float(s->data, (size_t)s->len, out); }
+/* A decimal float (lc_parse_float); out of memory for a long copy is w_oom. */
+W_RT bool Str_parse_float(WStr *s, double *out) {
+  lc_float_parse r = lc_parse_float(s->data, (size_t)s->len, out);
+  if (r == LC_FLOAT_OOM) w_oom();
+  return r == LC_FLOAT_OK;
+}
 W_RT void Clo_drop(WClo *c) {
   if (!w_rc_dec(&c->rc)) return;
   if (((WHdr *)c - 1)->kids == (void (*)(void *))c->drop) { w_release(c); return; }  /* captures that hold closures */

@@ -11,6 +11,7 @@
 #include "runtime/limen_core.h"
 #include <string.h>
 #include <caml/alloc.h>
+#include <caml/fail.h>
 #include <caml/memory.h>
 #include <caml/mlvalues.h>
 
@@ -127,7 +128,10 @@ value limen_core_parse_float(value s) {
   CAMLparam1(s);
   CAMLlocal2(out, boxed);
   double x;
-  if (!lc_parse_float(String_val(s), caml_string_length(s), &x)) CAMLreturn(Val_none);
+  lc_float_parse r = lc_parse_float(String_val(s), caml_string_length(s), &x);
+  /* nothing allocated on the OCaml heap yet, so raising here is safe */
+  if (r == LC_FLOAT_OOM) caml_raise_out_of_memory();
+  if (r == LC_FLOAT_BAD) CAMLreturn(Val_none);
   boxed = caml_copy_double(x);
   out = caml_alloc_some(boxed);
   CAMLreturn(out);

@@ -147,21 +147,29 @@ LC_FN bool lc_parse_int(const char *s, size_t n, int64_t *out) {
   return true;
 }
 
+/* The length snprintf wrote into a buffer of cap bytes, given the k it
+   returned: never more than cap - 1, so a caller cannot read past the end. */
+LC_FN size_t lc_written(int k, size_t cap) {
+  if (k < 0 || cap == 0) return 0;
+  return (size_t)k < cap ? (size_t)k : cap - 1;
+}
+
 /* Float.to_str and a Float in interpolation: one decimal for a whole number
-   under 1e16, else 15 significant digits. LC_FLOAT_MAX bytes always hold it
-   (the longest, such as "-1.23456789012346e-308", is 22 bytes and the NUL). Returns
-   the length. */
+   under 1e16, else 15 significant digits. LC_FLOAT_MAX bytes always hold
+   it (the longest, such as "-1.23456789012346e-308", is 22 bytes and the
+   NUL). Returns the length written, which a smaller cap cuts short. */
 #define LC_FLOAT_MAX 32
 LC_FN size_t lc_fmt_float(char *out, size_t cap, double x) {
   int k;
   if (x == floor(x) && fabs(x) < 1e16) k = snprintf(out, cap, "%.1f", x);
   else k = snprintf(out, cap, "%.15g", x);
-  return k < 0 ? 0 : (size_t)k;
+  return lc_written(k, cap);
 }
 
 /* Float.to_fixed: nan, inf or -inf, else d decimals (clamped to 0..30)
    rounded as printf does. LC_FIXED_MAX bytes always hold it: -DBL_MAX with
-   30 decimals is 341 bytes. Returns the length. */
+   30 decimals is 341 bytes. Returns the length written, which a smaller
+   cap cuts short. */
 #define LC_FIXED_MAX 352
 LC_FN size_t lc_to_fixed(char *out, size_t cap, double x, int64_t d) {
   int k;
@@ -172,37 +180,39 @@ LC_FN size_t lc_to_fixed(char *out, size_t cap, double x, int64_t d) {
     if (d > 30) d = 30;
     k = snprintf(out, cap, "%.*f", (int)d, x);
   }
-  return k < 0 ? 0 : (size_t)k;
+  return lc_written(k, cap);
 }
 
 /* Str.parse_float: a decimal float, digits with an optional sign, point and
    exponent, surrounding spaces (lc_trim) allowed; no hex, nan or inf. Any
    length: strtod needs a NUL-terminated copy, on the stack up to 407 bytes
-   and from malloc past that (false if malloc fails). */
-LC_FN bool lc_parse_float(const char *s, size_t n, double *out) {
+   and from malloc past that. LC_FLOAT_OOM when that malloc fails, which
+   the caller turns into its out-of-memory failure, never into None. */
+typedef enum { LC_FLOAT_OK, LC_FLOAT_BAD, LC_FLOAT_OOM } lc_float_parse;
+LC_FN lc_float_parse lc_parse_float(const char *s, size_t n, double *out) {
   size_t a, b;
   lc_trim(s, n, &a, &b);
-  if (a == b) return false;
+  if (a == b) return LC_FLOAT_BAD;
   bool digit = false;
   for (size_t i = a; i < b; i++) {
     char c = s[i];
     if (c >= '0' && c <= '9') digit = true;
-    else if (!(c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E')) return false;
+    else if (!(c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E')) return LC_FLOAT_BAD;
   }
-  if (!digit) return false;
+  if (!digit) return LC_FLOAT_BAD;
   size_t len = b - a;
   char small[408];
   char *t = len < sizeof small ? small : (char *)malloc(len + 1);
-  if (!t) return false;
+  if (!t) return LC_FLOAT_OOM;
   memcpy(t, s + a, len);
   t[len] = 0;
   char *end;
   double x = strtod(t, &end);
   bool ok = end == t + len;
   if (t != small) free(t);
-  if (!ok) return false;
+  if (!ok) return LC_FLOAT_BAD;
   *out = x;
-  return true;
+  return LC_FLOAT_OK;
 }
 
 #endif
