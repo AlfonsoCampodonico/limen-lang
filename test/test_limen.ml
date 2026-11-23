@@ -4031,6 +4031,44 @@ fn main(root: Root) -> Result[(), IoError] {
     "use sql\n\nfn main(root: Root) {\n    for name in [\"evil.db\", \"broken.db\", \"fine.db\", \"walout.db\", \"shmout.db\"] {\n        root.stdout.print(\"{sql.open(root.fs, name).is_err()}\")\n    }\n    match sql.open(root.fs, \"evil.db\") {\n        Err(Denied(m)) => root.stdout.print(m.slice(0, 50)),\n        _ => root.stdout.print(\"opened\"),\n    }\n    match sql.open(root.fs, \"fine.db\") {\n        Ok(db) => root.stdout.print(\"{db.exec(\"CREATE TABLE IF NOT EXISTS t (x)\", [])} {db.close()}\"),\n        Err(e) => root.stdout.print(\"{e}\"),\n    }\n    let gone = root.fs.remove(\"fine.db\").is_ok()\n}\n"
     "true\ntrue\ntrue\ntrue\ntrue\nsql: refusing to open `evil.db`: `evil.db-journal`\nDenied(\"sql: refusing to open `fine.db`: `fine.db-shm` is a symbolic link\")\n";
   ok "sql-sidecar-untouched" (read_file outside = "keep") (read_file outside);
+  (* what SQLite itself refuses: a side file made a link after open is not followed, and the link's target is left alone *)
+  if selected "sql-swap-wal" then begin
+    let src = {v|use sql
+
+foreign "limentest" {
+    fn vt_symlink(target: Str, link: Str) -> Int32
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let fs = root.fs
+    let out = root.stdout
+    for f in ["swap.db", "swap.db-wal", "swap.db-shm", "swap-victim"] {
+        fs.remove(f)
+    }
+    let a = sql.open(fs, "swap.db")?
+    a.query("PRAGMA journal_mode=WAL")?
+    a.exec("CREATE TABLE t (x)")?
+    a.exec("INSERT INTO t VALUES (1)")?
+    a.close()?
+    // macOS leaves these behind
+    fs.remove("swap.db-wal")
+    fs.remove("swap.db-shm")
+    fs.write("swap-victim", "known text")?
+    let db = sql.open(fs, "swap.db")?
+    let made = vt_symlink(root.foreign, "swap-victim", fs.full_path("swap.db-wal")?)
+    out.print("link {made}")
+    out.print("{db.exec("INSERT INTO t VALUES (2)")}")
+    out.print(fs.read("swap-victim")?)
+    db.close()
+    for f in ["swap.db", "swap.db-wal", "swap.db-shm", "swap-victim"] {
+        fs.remove(f)
+    }
+    Ok(())
+}
+|v} in
+    out "sql-swap-wal" ~grants:{ sqlg with fs = Some (sqlreal, false); foreign = [ "limentest" ] } src
+      "link 0\nErr(Failed(\"sql: unable to open database file\"))\nknown text\n"
+  end;
   (* a Db holds an id, not a pointer: forged, closed and twice-closed ones are errors *)
   out "sql-handles"
     {v|use sql

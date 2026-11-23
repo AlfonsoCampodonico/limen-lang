@@ -12,12 +12,13 @@
 // The module calls SQLite itself: src/std/limen.toml trusts it with C, so a
 // program needs no foreign grant to use it, only the Fs for the database's
 // directory (sql.memory() needs nothing). What it lets SQLite touch stays
-// inside that grant: the file is a path under the granted directory, opened
-// read-only when the Fs is; ATTACH (and VACUUM, which attaches) is turned
-// off, so SQL cannot open other files; the database file is not opened
-// through a symlink, and one whose -journal, -wal or -shm is a symlink is
-// refused; URI filenames and extensions stay off; temporary tables live in
-// memory.
+// inside that grant: open walks to the database from the grant as every Fs
+// operation does (read-only when the Fs is), refuses a database whose name,
+// -journal, -wal or -shm is a symbolic link, and SQLite itself never follows
+// a link it finds in place of a side file later, nor writes once the
+// database has been moved; ATTACH (and VACUUM, which attaches) is turned
+// off, so SQL cannot open other files; URI filenames and extensions stay
+// off; temporary tables live in memory.
 
 // ---------- SQLite's C API, as much as this module needs ----------
 

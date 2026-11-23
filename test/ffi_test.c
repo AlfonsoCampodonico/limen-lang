@@ -65,6 +65,7 @@ const char *vt_slow_name(int64_t ms) { usleep((useconds_t)(ms * 1000)); return "
 
 /* For the sql tests: whether a lock is held on byte `offset` of `path`, as
    another process sees it (a process never sees its own): 1, 0, or -1. */
+#include <errno.h>
 #include <fcntl.h>
 #include <sys/wait.h>
 int32_t vt_lock_held(const char *path, int64_t offset) {
@@ -80,4 +81,9 @@ int32_t vt_lock_held(const char *path, int64_t offset) {
   int st;
   if (pid < 0 || waitpid(pid, &st, 0) != pid || !WIFEXITED(st) || WEXITSTATUS(st) == 2) return -1;
   return WEXITSTATUS(st);
+}
+
+/* For the sql tests: make `link` a symbolic link to `target`; 0, or errno. */
+int32_t vt_symlink(const char *target, const char *link) {
+  return symlink(target, link) == 0 ? 0 : errno;
 }

@@ -126,3 +126,25 @@ refuses what the swap would reach; this closes it in Limen itself. It is the
   for several connections in one process to one database.
 - Whether `xOpen` uses the walk directly or a small helper added to
   `limen_sandbox.h`.
+
+## Outcome
+
+The VFS was not built. Testing showed SQLite itself (3.46 on Linux, 3.54 on
+macOS) already:
+
+- opens `-journal`, `-wal` and `-shm` without following a symbolic link: one
+  planted after `sql.open` makes the next write fail with "unable to open
+  database file" and the link's target is untouched (pinned by the test
+  `sql-swap-wal`);
+- refuses to write when the database's directory is swapped for a link to
+  another directory ("attempt to write a readonly database"), because it
+  notices the database moved.
+
+One case is left: a process that can write both inside the granted directory
+and in a directory outside it on the same filesystem can hard-link the
+database into the outside directory and swap the database's directory for a
+link to it, and SQLite then creates its rollback journal there. The OS
+sandbox refuses such writes outside the grant, so that is left to it.
+
+Task 2's helper (`limen_sql_open`) shipped: it walks from the grant and
+refuses a symlinked side file up front.

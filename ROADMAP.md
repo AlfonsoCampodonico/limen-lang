@@ -150,10 +150,9 @@ happens here.
 - `full_path` hands SQLite a path string that another process with write
   access to the granted directory could race with a symlink swap after the
   check. The OS sandbox (Landlock, the macOS profile) refuses what such a
-  swap would reach; closing it in Limen itself needs an SQLite VFS that
-  opens every file with `openat` from a held directory, since SQLite
-  resolves symlinks in any path it is given (so `/proc/self/fd/N/...` does
-  not help).
+  swap would reach (decided: SQLite already refuses links in place of its
+  side files and a moved database; the one case left needs write access
+  outside the grant, which the OS sandbox refuses, so no VFS).
 - An outside security review of the sandbox and the capability checks.
   Two reviews in two days found ten holes, so there are more.
 
