@@ -40,9 +40,9 @@ let guard_counter = ref 0
 
 let var_counter = ref 0
 
-let fresh_var name ty =
+let fresh_var ?(by_ref = false) name ty =
   incr var_counter;
-  { I.id = !var_counter; name; ty }
+  { I.id = !var_counter; name; ty; by_ref }
 
 let new_fctx g genv ret parent =
   { g; genv; scopes = [ Hashtbl.create 8 ]; buf = []; dead = false; ret; parent; caps = ref []; defers = []; loop_depth = 0 }
@@ -502,8 +502,7 @@ and lower_call f e callee args ty =
     tmp f ty (I.CallC (cs, xs, cbs, e.espan))
   | EVar n when not_local f n && Hashtbl.mem f.g.fns n ->
     let c = instance f.g n (List.map (fun (k, t) -> (k, zonk f.genv t)) callee.einst) in
-    let xs = List.map (lower f) args in
-    tmp f ty (I.Call (c, xs))
+    call f c args ty
   | EVar n when not_local f n && Hashtbl.mem f.g.ctors n ->
     let xs = List.map (lower f) args in
     tmp f ty (I.MkEnum (ty, tag_of f.g ty n, xs))
@@ -514,6 +513,27 @@ and lower_call f e callee args ty =
     let c = lower f callee in
     let xs = List.map (lower f) args in
     tmp f ty (I.CallClo (c, xs))
+
+(* A call of a top-level function or a method: a plain Call, or with a
+   `mut` argument a CallMut, its arguments lowered in order, each `mut`
+   place to its variable and steps. *)
+and call f c args ty =
+  if List.exists (fun (a : expr) -> match a.edesc with EMut _ -> true | _ -> false) args then begin
+    let xs =
+      List.map
+        (fun (a : expr) ->
+          match a.edesc with
+          | EMut p ->
+            let v, steps = lower_place f p in
+            I.ByPlace (v, steps)
+          | _ -> I.ByValue (lower f a))
+        args
+    in
+    tmp f ty (I.CallMut (c, xs))
+  end
+  else
+    let xs = List.map (lower f) args in
+    tmp f ty (I.Call (c, xs))
 
 (* A chain of field and index reads, so `a[i].x` is one Get, not two copies. *)
 and access f e : I.atom * ty * I.step list =
@@ -900,8 +920,7 @@ and lower_method f e recv name args ty =
       end
     in
     let c = instance f.g key targs in
-    let xs = List.map (lower f) (recv :: args) in
-    tmp f ty (I.Call (c, xs))
+    call f c (recv :: args) ty
   | _ ->
   let sp = e.espan in
   let branch_init r cond then_ else_ =
@@ -1253,7 +1272,7 @@ let lower_fn g c (d : fn_decl) env =
   let params =
     List.map
       (fun p ->
-        let v = fresh_var p.prm_name (resolve env p.prm_ty) in
+        let v = fresh_var ~by_ref:p.prm_mut p.prm_name (resolve env p.prm_ty) in
         bind f p.prm_name v;
         v)
       d.fn_params

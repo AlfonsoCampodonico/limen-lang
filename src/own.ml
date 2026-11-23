@@ -16,9 +16,12 @@ and sub = NoSub | IfSub of ablock * ablock | LoopSub of ablock | GuardSub of abl
 and ablock = { stmts : ann list; lin : S.t }
 
 let ids atoms = List.fold_left (fun acc a -> match atom_var a with Some v -> S.add v.id acc | None -> acc) S.empty atoms
-let step_atoms steps = List.filter_map (function PIndex (a, _) | PIndexU a | PKey (a, _) -> Some a | PField _ -> None) steps
 
 let rhs_uses r = ids (consumed r @ borrowed r)
+
+(* The function's `mut` parameters: owned all through it and never
+   released, since the caller's place keeps the value. *)
+let by_ref = ref S.empty
 
 (* [pin]: variables a defer's handler reads; they stay live at every point
    of its guarded statements, since a panic can leave them anywhere. *)
@@ -63,7 +66,7 @@ and live_stmt ?(pin = S.empty) s out ~brk ~cont : ann * S.t =
     (* A panic can leave the body anywhere, and the handler then reads what
        it uses: those variables stay live, so retained and never moved or
        dropped, all through the body. *)
-    let hb = live_block h S.empty ~brk:S.empty ~cont:S.empty in
+    let hb = live_block ~pin:!by_ref h S.empty ~brk:S.empty ~cont:S.empty in
     let pin = S.union pin hb.lin in
     let bb = live_block ~pin b out ~brk ~cont in
     ({ s; out; sub = GuardSub (hb, bb) }, S.union pin bb.lin)
@@ -71,6 +74,7 @@ and live_stmt ?(pin = S.empty) s out ~brk ~cont : ann * S.t =
 (* ---------- forward pass ---------- *)
 
 let fn_vars : (int, var) Hashtbl.t = Hashtbl.create 64
+
 let drops set = List.map (fun id -> Drop (Hashtbl.find fn_vars id)) (S.elements set)
 
 (* Rewrite the consumed atoms of a statement: move or retain. *)
@@ -107,6 +111,19 @@ let rewrite_rhs r ~live_after ~owned =
   | Call (n, args) ->
     let xs, o = c args in
     (Call (n, xs), o)
+  | CallMut (n, args) ->
+    (* the values are consumed; each place's variable and step atoms are
+       borrowed, so a value that names one is retained *)
+    let xs, o = c (consumed r) in
+    let rest = ref xs in
+    let args =
+      List.map
+        (function
+          | ByValue _ -> ( match !rest with x :: tl -> rest := tl; ByValue x | [] -> failwith "callmut atoms")
+          | ByPlace _ as p -> p)
+        args
+    in
+    (CallMut (n, args), o)
   | CallClo (f, args) ->
     let xs, o = c args in
     (CallClo (f, xs), o)
@@ -200,9 +217,10 @@ and fwd_stmt (a : ann) owned ~brk ~cont : stmt list * S.t =
     let sb, ob = fwd_block bb owned ~brk ~cont in
     ([ Scope (g, sb) ], ob)
   | Guard (n, _, _), GuardSub (hb, bb) ->
-    (* the handler owns nothing from outside: its uses retain, and the frame's
-       cleanups drop the variables as the panic goes on *)
-    let sh, _ = fwd_block hb S.empty ~brk:S.empty ~cont:S.empty in
+    (* the handler owns nothing from outside but the `mut` parameters: its
+       uses retain, and the frame's cleanups drop the variables as the
+       panic goes on *)
+    let sh, _ = fwd_block hb !by_ref ~brk:S.empty ~cont:S.empty in
     let sb, ob = fwd_block bb owned ~brk ~cont in
     (* what the handler kept alive and nothing after needs *)
     let left = S.diff ob a.out in
@@ -210,8 +228,8 @@ and fwd_stmt (a : ann) owned ~brk ~cont : stmt list * S.t =
   | Break, _ -> (drops (S.diff owned brk) @ [ Break ], S.empty)
   | Continue, _ -> (drops (S.diff owned cont) @ [ Continue ], S.empty)
   | Return x, _ ->
-    let xs, o = consume [ x ] ~live_after:S.empty ~borrowed:S.empty ~owned in
-    (drops o @ [ Return (List.hd xs) ], S.empty)
+    let xs, o = consume [ x ] ~live_after:S.empty ~borrowed:!by_ref ~owned in
+    (drops (S.diff o !by_ref) @ [ Return (List.hd xs) ], S.empty)
   | s, _ -> ([ s ], owned)
 
 let rec collect_vars stmts =
@@ -231,7 +249,8 @@ let fn (f : fn) : fn =
   Hashtbl.reset fn_vars;
   List.iter (fun (v : var) -> Hashtbl.replace fn_vars v.id v) (f.params @ f.captures);
   collect_vars f.body;
-  let b = live_block f.body S.empty ~brk:S.empty ~cont:S.empty in
+  by_ref := List.fold_left (fun acc (v : var) -> if v.by_ref then S.add v.id acc else acc) S.empty f.params;
+  let b = live_block ~pin:!by_ref f.body S.empty ~brk:S.empty ~cont:S.empty in
   let owned = List.fold_left (fun acc (v : var) -> S.add v.id acc) S.empty (f.params @ f.captures) in
   let body, _ = fwd_block b owned ~brk:S.empty ~cont:S.empty in
   { f with body }

@@ -127,6 +127,13 @@ fn rhs(self: Printer, r: ir.Rhs) -> Str {
         Negate(t, a) => "neg {show(t)} {atom(a)}",
         Flip(a) => "not {atom(a)}",
         Call(f, args) => "call {f}({atoms(args)})",
+        CallMut(f, args) => {
+            let shown = args.map(|x| match x {
+                ByValue(a) => atom(a),
+                ByPlace(v, ss) => "mut " + var(v) + self.steps(ss),
+            })
+            "call {f}({shown.join(", ")})"
+        },
         CallClo(c, args) => "callclo {atom(c)}({atoms(args)})",
         Prim(n, t, args, sp) => "prim {n} {show(t)}({atoms(args)}) {self.span(sp)}",
         MkStruct(t, xs) => "struct {show(t)}({atoms(xs)})",
@@ -287,7 +294,8 @@ pub fn program(files: List[diag.Source], p: ir.Program, libs: List[Str]) -> List
         let (plan, next) = pure.plan(pure_fns, f, slot)
         slot = next
         let caps = if f.captures.is_empty() { "" } else { " captures(" + f.captures.map(var_decl).join(", ") + ")" }
-        out.push("fn {f.fname}({f.params.map(var_decl).join(", ")}) -> {show(f.ret)}{if f.is_closure { " closure" } else { "" }}{caps}")
+        let params = f.params.map(|v| (if v.by_ref { "mut " } else { "" }) + var_decl(v))
+        out.push("fn {f.fname}({params.join(", ")}) -> {show(f.ret)}{if f.is_closure { " closure" } else { "" }}{caps}")
         let pr = Printer { files, plan, loops: 0, uniq: [] }
         let (lines, _) = pr.block(out, "  ", f.body)
         out = lines

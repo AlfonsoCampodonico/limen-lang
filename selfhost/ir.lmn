@@ -16,6 +16,9 @@ pub struct Var {
     id: Int,
     name: Str,
     ty: types.Ty,
+    // a `mut` parameter's variable in its own function, which holds a
+    // pointer to the caller's place (captures and temporaries never)
+    by_ref: Bool,
 }
 
 pub enum Atom {
@@ -39,6 +42,13 @@ pub enum Step {
     PIndexU(Atom),
     // a map entry by key; panics when the key is missing
     PKey(Atom, ast.Span),
+}
+
+// An argument of a call with `mut` arguments: a value, or the caller's
+// place (a variable and the steps into it) that the callee changes.
+pub enum Arg {
+    ByValue(Atom),
+    ByPlace(Var, List[Step]),
 }
 
 // One method of a `dyn` value's vtable: the C function implementing it,
@@ -70,6 +80,8 @@ pub enum Rhs {
     Flip(Atom),
     // consumed
     Call(Str, List[Atom]),
+    // values consumed, places borrowed and changed
+    CallMut(Str, List[Arg]),
     // closure borrowed, arguments consumed
     CallClo(Atom, List[Atom]),
     // a built-in method on the receiver type; borrowed
@@ -214,6 +226,10 @@ pub fn consumed(r: Rhs) -> List[Atom] {
     match r {
         Use(a) => [a],
         Call(_, args) | CallClo(_, args) => args,
+        CallMut(_, args) => args.flat_map(|a| match a {
+            ByValue(x) => [x],
+            ByPlace(..) => [],
+        }),
         MkStruct(_, xs) | MkEnum(_, _, xs) | MkList(_, xs) | MkClosure(_, _, xs) => xs,
         Spawn(_, c, _, _) => [c],
         ChanSend(_, v, _) => [v],
@@ -231,6 +247,10 @@ pub fn consumed(r: Rhs) -> List[Atom] {
 pub fn borrowed(r: Rhs) -> List[Atom] {
     match r {
         Use(_) | Call(..) | MkStruct(..) | MkEnum(..) | MkList(..) | MkClosure(..) => [],
+        CallMut(_, args) => args.flat_map(|a| match a {
+            ByValue(_) => [],
+            ByPlace(v, steps) => [V(v)] + step_atoms(steps),
+        }),
         CallClo(c, _) => [c],
         CallDyn(_, _, _, recv, _) => [recv],
         Catch(c, _) => [c],
@@ -265,6 +285,17 @@ pub fn step_atoms(steps: List[Step]) -> List[Atom] {
         PIndex(a, _) | PIndexU(a) | PKey(a, _) => [a],
         PField(_) => [],
     })
+}
+
+// The variables whose places a call with `mut` arguments changes.
+pub fn place_roots(r: Rhs) -> List[Var] {
+    match r {
+        CallMut(_, args) => args.flat_map(|a| match a {
+            ByPlace(v, _) => [v],
+            ByValue(_) => [],
+        }),
+        _ => [],
+    }
 }
 
 pub fn atom_var(a: Atom) -> Option[Var] {

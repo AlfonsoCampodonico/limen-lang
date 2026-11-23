@@ -83,10 +83,13 @@ let stmt_atoms = function
 let closures_of (f : fn) =
   let made = Hashtbl.create 8 and set = Hashtbl.create 8 in
   stmts_iter
-    (function
-      | Let (v, MkClosure (h, _, _)) -> Hashtbl.replace made v.id h
-      | Set (v, _, _) | Init (v, _) | Decl v | Mutate (v, _, _) -> Hashtbl.replace set v.id ()
-      | _ -> ())
+    (fun s ->
+      (match s with
+       | Let (v, MkClosure (h, _, _)) -> Hashtbl.replace made v.id h
+       | Set (v, _, _) | Init (v, _) | Decl v | Mutate (v, _, _) -> Hashtbl.replace set v.id ()
+       | _ -> ());
+      (* a closure passed as a `mut` argument may be replaced *)
+      List.iter (fun (v : var) -> Hashtbl.replace set v.id ()) (match rhs_of s with Some r -> place_roots r | None -> []))
     f.body;
   Hashtbl.filter_map_inplace (fun id h -> if Hashtbl.mem set id then None else Some h) made;
   made
@@ -105,7 +108,9 @@ let analyse (p : program) : (string, info) Hashtbl.t =
   List.iter (fun (f : fn) -> Hashtbl.replace by_name f.fname f) p.fns;
   let calls = Hashtbl.create 64 in
   let candidates = Hashtbl.create 64 in
-  let cb_of (f : fn) = List.filter (fun (v : var) -> is_fn v.ty) f.params in
+  (* a `mut` parameter of function type is the caller's place, never a
+     condition of purity: calling it makes the function impure *)
+  let cb_of (f : fn) = List.filter (fun (v : var) -> is_fn v.ty && not v.by_ref) f.params in
   List.iter
     (fun (f : fn) ->
       let cbs = cb_of f in
@@ -125,12 +130,17 @@ let analyse (p : program) : (string, info) Hashtbl.t =
           (match (s, rhs_of s) with
            | Set (v, _, _), _ when List.exists (fun (c : var) -> c.id = v.id) cbs -> ok := false
            | _, Some (CallClo (c, args)) -> if not (is_cb c) || List.exists is_cb args then ok := false
-           | _, Some (Call _) -> () (* where the callee takes a function: checked below *)
+           | _, Some (Call _ | CallMut _) -> () (* where the callee takes a function: checked below *)
            | _ -> if List.exists is_cb (stmt_atoms s) then ok := false);
           match rhs_of s with
           | Some (Call (g, args)) ->
             straight := false;
             callees := (g, args) :: !callees;
+            if not (Hashtbl.mem by_name g) then ok := false
+          | Some (CallMut (g, args)) ->
+            (* as a Call: pure when the callee is; never kept or reused itself *)
+            straight := false;
+            callees := (g, List.map (function ByValue a -> a | ByPlace (v, _) -> V v) args) :: !callees;
             if not (Hashtbl.mem by_name g) then ok := false
           | Some (Prim (n, t, _, _)) -> straight := false; if not (pure_prim n t) then ok := false
           | Some (CallClo _) -> straight := false
@@ -211,6 +221,8 @@ let assigned ss =
       | Set (v, _, _) | Mutate (v, _, _) | Init (v, _) | Decl v -> acc := S.add v.id !acc
       | _ -> ())
     ss;
+  (* and those a call changes through a `mut` argument *)
+  stmts_iter (fun s -> match rhs_of s with Some r -> List.iter (fun (v : var) -> acc := S.add v.id !acc) (place_roots r) | None -> ()) ss;
   !acc
 
 (* ---------- reusing a repeated call ---------- *)
@@ -258,9 +270,16 @@ let cse_fn pure (f : fn) : fn =
             | _ ->
               avail := (k, v) :: !avail;
               s)
+          | Let (_, r) when place_roots r <> [] ->
+            (* a call with `mut` arguments changes their variables *)
+            let killed = S.of_list (List.map (fun (w : var) -> w.id) (place_roots r)) in
+            avail := List.filter (fun e -> not (mentions_any killed e)) !avail;
+            s
           | Let _ | Drop _ | Break | Continue | Return _ | GuardEnd _ | Line _ -> s
           | Set (v, _, _) | Mutate (v, _, _) | Init (v, _) | Decl v ->
-            avail := List.filter (fun e -> not (mentions_any (S.singleton v.id) e)) !avail;
+            let roots = match rhs_of s with Some r -> place_roots r | None -> [] in
+            let killed = S.of_list (List.map (fun (w : var) -> w.id) (v :: roots)) in
+            avail := List.filter (fun e -> not (mentions_any killed e)) !avail;
             s
           | If (c, a, b) ->
             let a' = block !avail a and b' = block !avail b in

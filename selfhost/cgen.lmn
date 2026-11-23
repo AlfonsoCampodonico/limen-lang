@@ -362,10 +362,16 @@ fn where(self: Cg, sp: ast.Span) -> Str {
 // does not allow in a name (the `$` of the compiler's own variables)
 // become `_`; a variable with no name is `v15`. The number keeps every
 // name apart from the others and from C's own.
-fn var(v: ir.Var) -> Str {
+fn var_name(v: ir.Var) -> Str {
     let n = bytes(v.name.bytes().map(|b| if (b >= 97 && b <= 122) || (b >= 65 && b <= 90) || (b >= 48 && b <= 57) || b == 95 { b } else { 95 })).to_str()
     let first = if n.is_empty() { 0 } else { n.bytes()[0] }
     if n.is_empty() || (first >= 48 && first <= 57) { "v{v.id}" } else { "{n}_{v.id}" }
+}
+
+// A `mut` parameter is a pointer to the caller's place: every use goes
+// through it.
+fn var(v: ir.Var) -> Str {
+    if v.by_ref { "(*{var_name(v)})" } else { var_name(v) }
 }
 
 fn float_lit(x: Float) -> Str {
@@ -1076,6 +1082,34 @@ fn rhs_into(self: Cg, ind: Str, dst: Str, t: types.Ty, r: ir.Rhs) -> Cg {
         Call(f, args) => {
             let (xs, c1) = c.atoms(args)
             c1.set(ind, dst, "{f}({xs.join(", ")})")
+        },
+        CallMut(f, args) => {
+            // the values first, in order, so a value that names a place is
+            // retained before the place is made unique; then a pointer to
+            // each place
+            c = c.line(ind, "\{")
+            for (k, x) in args.with_index() {
+                match x {
+                    ByValue(a) => {
+                        let (ct, c1) = c.ctype(ir.atom_ty(a))
+                        let (ax, c2) = c1.atom(a)
+                        c = c2.line(ind, "  {ct} a{k}_ = {ax};")
+                    },
+                    ByPlace(..) => {},
+                }
+            }
+            let mut xs: List[Str] = []
+            for (k, x) in args.with_index() {
+                match x {
+                    ByValue(_) => xs.push("a{k}_"),
+                    ByPlace(v, steps) => {
+                        let (p, _, c1) = c.place_ptr(ind, "r{k}_", v, steps)
+                        c = c1
+                        xs.push(p)
+                    },
+                }
+            }
+            c.line(ind, "  {dst} = {f}({xs.join(", ")});").line(ind, "}")
         },
         CallClo(f, args) => {
             let fv = atom_var(f)
@@ -1882,8 +1916,10 @@ fn owns_memory(t: types.Ty) -> Bool {
     }
 }
 
+// A `mut` parameter is never volatile: its pointer never changes, and
+// writes through it reach memory before any call that can panic.
 fn vol(self: Cg, v: ir.Var) -> Str {
-    if intset.mem(self.vols, v.id) { " volatile" } else { "" }
+    if intset.mem(self.vols, v.id) && !v.by_ref { " volatile" } else { "" }
 }
 
 // Note that owned locals of type `t` need w_dp_<CName>.
@@ -1896,8 +1932,9 @@ fn add_cell_ty(self: Cg, t: types.Ty) -> Cg {
     c
 }
 
+// A `mut` parameter has no cleanup: the caller's place owns the value.
 fn cell_decl(self: Cg, ind: Str, v: ir.Var, on: Bool) -> Cg {
-    if !owns_memory(v.ty) {
+    if !owns_memory(v.ty) || v.by_ref {
         return self
     }
     let c = self.add_cell_ty(v.ty).line(ind, "uint8_t{self.vol(v)} {var(v)}_o = {if on { 1 } else { 0 }};")
@@ -1907,7 +1944,7 @@ fn cell_decl(self: Cg, ind: Str, v: ir.Var, on: Bool) -> Cg {
 }
 
 fn set_owned(self: Cg, ind: Str, v: ir.Var, on: Bool) -> Cg {
-    if owns_memory(v.ty) { self.line(ind, "{var(v)}_o = {if on { 1 } else { 0 }};") } else { self }
+    if owns_memory(v.ty) && !v.by_ref { self.line(ind, "{var(v)}_o = {if on { 1 } else { 0 }};") } else { self }
 }
 
 // Clear the flags of the variables an rhs moves out of, before it runs.
@@ -2261,13 +2298,16 @@ fn pin_lines(text: Str) -> Str {
     out.join("\n")
 }
 
-fn mutate(self: Cg, ind: Str, v: ir.Var, steps: List[ir.Step], m: ir.Mutation) -> Cg {
-    let (vt, c0) = self.release_moved(ind, ir.mut_atoms(m)).line(ind, "\{").ctype(v.ty)
-    let mut c = c0.line(ind, "  {vt}* p0_ = ({vt}*)&{var(v)};")
-    let mut p = "p0_"
+// A pointer to the place `v` and `steps`, made unique on the way (the
+// checks a loop hoisted are skipped): the C names `prefix`0_, `prefix`1_
+// and so on, one per step. Returns the last and the place's type.
+fn place_ptr(self: Cg, ind: Str, prefix: Str, v: ir.Var, steps: List[ir.Step]) -> (Str, types.Ty, Cg) {
+    let (vt, c0) = self.ctype(v.ty)
+    let mut c = c0.line(ind, "  {vt}* {prefix}0_ = ({vt}*)&{var(v)};")
+    let mut p = "{prefix}0_"
     let mut t = v.ty
     for (i, step) in steps.with_index() {
-        let q = "p{i + 1}_"
+        let q = "{prefix}{i + 1}_"
         match step {
             PField(k) => {
                 let ft = c.fields_of(t)[k].1
@@ -2316,6 +2356,12 @@ fn mutate(self: Cg, ind: Str, v: ir.Var, steps: List[ir.Step], m: ir.Mutation) -
         }
         p = q
     }
+    (p, t, c)
+}
+
+fn mutate(self: Cg, ind: Str, v: ir.Var, steps: List[ir.Step], m: ir.Mutation) -> Cg {
+    let (p, t, c0) = self.release_moved(ind, ir.mut_atoms(m)).line(ind, "\{").place_ptr(ind, "p", v, steps)
+    let mut c = c0
     c = match m {
         MSet(x) => {
             if !is_scalar(t) {
@@ -2407,7 +2453,7 @@ fn signature(self: Cg, f: ir.Fn) -> (Str, Cg) {
     for v in f.params {
         let (ct, c1) = c.ctype(v.ty)
         c = c1
-        ps.push("{ct}{c.vol(v)} {var(v)}")
+        ps.push(if v.by_ref { "{ct}* {var_name(v)}" } else { "{ct}{c.vol(v)} {var(v)}" })
     }
     let (rt, c2) = c.ctype(f.ret)
     ("static {rt} {f.fname}({if ps.is_empty() { "void" } else { ps.join(", ") }})", c2)
@@ -2496,7 +2542,7 @@ fn fn_body(self: Cg, f: ir.Fn) -> Cg {
     c.slotted = []
     let (sig, c1) = c.signature(f)
     c = c1.put(sig + " \{\n")
-    // parameters are owned by the function
+    // parameters are owned by the function (`mut` ones by the caller)
     for v in f.params {
         c = c.cell_decl("  ", v, true)
     }

@@ -1,5 +1,5 @@
-// `mut` parameters and `mut` arguments, without `main`: parsed, loaded
-// and checked
+// `mut` parameters and `mut` arguments: parsed, loaded, checked, lowered
+// and compiled
 struct Buf {
     items: List[Int],
 }
@@ -12,7 +12,7 @@ fn bump(mut n: Int, by: Int) {
     n = n + by
 }
 
-fn calls() {
+fn main() {
     let mut b = Buf { items: [] }
     b.add(1)
     let mut k = 0

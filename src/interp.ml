@@ -2748,7 +2748,9 @@ and run_body rt d sc =
     | exception e -> keeping := saved; raise e)
 
 (* A call with `mut` arguments: each place gets what the callee wrote
-   however the call ends (a value, a return, a panic or a cancellation). *)
+   however the call ends (a value, a return, a panic or a cancellation).
+   A write-back cannot raise: its key or index was checked when the place
+   was read before the call, and nothing can change the root during it. *)
 and mut_call rt d cells =
   Fun.protect ~finally:(fun () -> List.iter (fun (_, back) -> back ()) cells) (fun () -> call_fn_cells rt d (List.map fst cells))
 

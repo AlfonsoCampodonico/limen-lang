@@ -16,14 +16,17 @@ let mutated_lists body =
 
 let mentions (v : var) atoms = List.exists (fun a -> match atom_var a with Some w -> w.id = v.id | None -> false) atoms
 
+let is_root (v : var) r = List.exists (fun (w : var) -> w.id = v.id) (place_roots r)
+
 (* Could the list's reference count rise inside the loop? Any retain or move
    of the variable, or a reassignment, rules the hoist out; so does a list
    declared inside the loop, which does not exist yet where the hoisted check
-   would go. *)
+   would go, and a list passed as a `mut` argument, which the callee may
+   share. *)
 let escapes (v : var) body =
   let rec go = function
-    | Let (w, r) | Init (w, r) -> w.id = v.id || mentions v (consumed r)
-    | Set (w, r, _) -> w.id = v.id || mentions v (consumed r)
+    | Let (w, r) | Init (w, r) -> w.id = v.id || mentions v (consumed r) || is_root v r
+    | Set (w, r, _) -> w.id = v.id || mentions v (consumed r) || is_root v r
     | Decl w when w.id = v.id -> true
     | Mutate (_, _, m) -> mentions v (mut_atoms m)
     | Return a -> mentions v [ a ]
@@ -81,7 +84,10 @@ let versionable body =
   match body with
   | Let (c, Bin (((Ast.Lt | Ast.Le) as cmp), Types.TInt, V m, n, _)) :: If (V c', _, _) :: _ when c.id = c'.id -> (
     let ss = all_stmts body in
-    let assigns_of (w : var) = List.filter (function Set (x, _, _) | Let (x, _) | Init (x, _) -> x.id = w.id | _ -> false) ss in
+    (* a `mut` argument counts as an assignment of its variable *)
+    let assigns_of (w : var) =
+      List.filter (function Set (x, r, _) | Let (x, r) | Init (x, r) -> x.id = w.id || is_root w r | _ -> false) ss
+    in
     let invariant = function V (w : var) -> assigns_of w = [] | AInt _ -> true | _ -> false in
     (* m's only assignment: m = t, with t = m + step *)
     let incr =

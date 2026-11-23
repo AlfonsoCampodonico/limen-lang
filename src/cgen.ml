@@ -160,10 +160,14 @@ let where (sp : Span.t) =
    does not allow in a name (the `$` of the compiler's own variables)
    become `_`; a variable with no name is `v15`. The number keeps every
    name apart from the others and from C's own. *)
-let var (v : I.var) =
+let var_name (v : I.var) =
   let ok c = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c = '_' in
   let n = String.map (fun c -> if ok c then c else '_') v.name in
   if n = "" || (n.[0] >= '0' && n.[0] <= '9') then sprintf "v%d" v.id else sprintf "%s_%d" n v.id
+
+(* A `mut` parameter is a pointer to the caller's place: every use goes
+   through it. *)
+let var (v : I.var) = if v.by_ref then sprintf "(*%s)" (var_name v) else var_name v
 
 let float_lit x =
   if Float.is_nan x then "NAN"
@@ -502,6 +506,42 @@ let kept_def c i ps =
   p (sprintf "static void (*const vkt%d_[W_KEPT])(%s) = { %s };" i params (String.concat ", " names));
   Buffer.contents b
 
+(* A pointer to the place [v] and [steps], made unique on the way (the
+   checks a loop hoisted are skipped): the C names [prefix]0_, [prefix]1_
+   and so on, one per step. Returns the last and the place's type. *)
+let place_ptr c line prefix (v : I.var) steps =
+  line (sprintf "  %s* %s0_ = (%s*)&%s;" (ctype c v.ty) prefix (ctype c v.ty) (var v));
+  List.fold_left
+    (fun (p, t) (i, step) ->
+      let q = sprintf "%s%d_" prefix (i + 1) in
+      match step with
+      | I.PField k ->
+        let ft = snd (List.nth (Lower.field_types c.g t) k) in
+        line (sprintf "  %s* %s = &(%s->f%d);" (ctype c ft) q p k);
+        (q, ft)
+      | I.PIndex (ia, sp) -> (
+        match t with
+        | TList el ->
+          if not (i = 0 && List.mem v.id c.uniq) then line (sprintf "  %s_unique(%s);" (cname c t) p);
+          let proven = i = 0 && (match ia with I.V iv -> List.mem (v.id, iv.id) c.inrange | _ -> false) in
+          if proven then line (sprintf "  %s* %s = &(*%s)->data[%s];" (ctype c el) q p (atom c ia))
+          else line (sprintf "  %s* %s = %s_at(*%s, %s, %s);" (ctype c el) q (cname c t) p (atom c ia) (where sp));
+          (q, el)
+        | TArray (el, TLen n) ->
+          line (sprintf "  %s* %s = &(%s->a[w_idx(%s, %d, %s)]);" (ctype c el) q p (atom c ia) n (where sp));
+          (q, el)
+        | _ -> failwith "mutate index")
+      | I.PKey (k, sp) -> (
+        match t with
+        | TMap (_, vt) ->
+          line (sprintf "  %s_unique(%s);" (cname c t) p);
+          line (sprintf "  %s* %s = %s_slot(*%s, %s, %s);" (ctype c vt) q (cname c t) p (atom c k) (where sp));
+          (q, vt)
+        | _ -> failwith "mutate key")
+      | I.PIndexU _ -> failwith "mutate through unchecked index")
+    (prefix ^ "0_", v.ty)
+    (List.mapi (fun i s -> (i, s)) steps)
+
 (* Emit statements that store [rhs] into the C lvalue [dst] of type [t]. *)
 let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
   let line s = Buffer.add_string out (ind ^ s ^ "\n") in
@@ -538,6 +578,28 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
   | I.Neg (_, x) -> set (sprintf "(-%s)" (a x))
   | I.Not x -> set (sprintf "(!%s)" (a x))
   | I.Call (f, args) -> set (sprintf "%s(%s)" f (String.concat ", " (List.map a args)))
+  | I.CallMut (f, args) ->
+    (* the values first, in order, so a value that names a place is
+       retained before the place is made unique; then a pointer to each
+       place *)
+    line "{";
+    List.iteri
+      (fun k -> function
+        | I.ByValue x ->
+          let ct = ctype c (I.atom_ty x) in
+          let ax = a x in
+          line (sprintf "  %s a%d_ = %s;" ct k ax)
+        | I.ByPlace _ -> ())
+      args;
+    let xs =
+      List.mapi
+        (fun k -> function
+          | I.ByValue _ -> sprintf "a%d_" k
+          | I.ByPlace (v, steps) -> fst (place_ptr c line (sprintf "r%d_" k) v steps))
+        args
+    in
+    line (sprintf "  %s = %s(%s);" dst f (String.concat ", " xs));
+    line "}"
   | I.CallClo (f, args) ->
     let fv = match f with I.V v | I.VDup v -> v | _ -> failwith "callclo" in
     let ps, r = match fv.ty with TFn (ps, r) -> (ps, r) | _ -> failwith "callclo type" in
@@ -1139,16 +1201,19 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
    stays on the boundary's list, and w_catch_release waits for them first. *)
 let owns_memory _c t = not (is_scalar t) && (match t with TGroup _ -> false | _ -> true)
 
-let vol c (v : I.var) = if List.mem v.id c.vols then " volatile" else ""
+(* A `mut` parameter is never volatile: its pointer never changes, and
+   writes through it reach memory before any call that can panic. *)
+let vol c (v : I.var) = if List.mem v.id c.vols && not v.by_ref then " volatile" else ""
 
+(* A `mut` parameter has no cleanup: the caller's place owns the value. *)
 let cell_decl c line (v : I.var) on =
-  if owns_memory c v.ty then begin
+  if owns_memory c v.ty && not v.by_ref then begin
     if not (List.exists (fun t -> cname c t = cname c v.ty) c.cell_tys) then c.cell_tys <- c.cell_tys @ [ v.ty ];
     line (sprintf "uint8_t%s %s_o = %d;" (vol c v) (var v) (if on then 1 else 0));
     line (sprintf "WCl %s_cl __attribute__((cleanup(w_cl_run))) = { (void*)&%s, (uint8_t*)&%s_o, w_dp_%s };" (var v) (var v) (var v) (cname c v.ty))
   end
 
-let set_owned c line (v : I.var) on = if owns_memory c v.ty then line (sprintf "%s_o = %d;" (var v) (if on then 1 else 0))
+let set_owned c line (v : I.var) on = if owns_memory c v.ty && not v.by_ref then line (sprintf "%s_o = %d;" (var v) (if on then 1 else 0))
 
 (* clear the flags of variables an rhs moves out of, before it runs *)
 let release_moved c line atoms =
@@ -1338,39 +1403,7 @@ and stmt c out ind (s : I.stmt) =
   | I.Mutate (v, steps, m) ->
     release_moved c line (I.mut_atoms m);
     line "{";
-    line (sprintf "  %s* p0_ = (%s*)&%s;" (ctype c v.ty) (ctype c v.ty) (var v));
-    let p, t =
-      List.fold_left
-        (fun (p, t) (i, step) ->
-          let q = sprintf "p%d_" (i + 1) in
-          match step with
-          | I.PField k ->
-            let ft = snd (List.nth (Lower.field_types c.g t) k) in
-            line (sprintf "  %s* %s = &(%s->f%d);" (ctype c ft) q p k);
-            (q, ft)
-          | I.PIndex (ia, sp) -> (
-            match t with
-            | TList el ->
-              if not (i = 0 && List.mem v.id c.uniq) then line (sprintf "  %s_unique(%s);" (cname c t) p);
-              let proven = i = 0 && (match ia with I.V iv -> List.mem (v.id, iv.id) c.inrange | _ -> false) in
-              if proven then line (sprintf "  %s* %s = &(*%s)->data[%s];" (ctype c el) q p (atom c ia))
-              else line (sprintf "  %s* %s = %s_at(*%s, %s, %s);" (ctype c el) q (cname c t) p (atom c ia) (where sp));
-              (q, el)
-            | TArray (el, TLen n) ->
-              line (sprintf "  %s* %s = &(%s->a[w_idx(%s, %d, %s)]);" (ctype c el) q p (atom c ia) n (where sp));
-              (q, el)
-            | _ -> failwith "mutate index")
-          | I.PKey (k, sp) -> (
-            match t with
-            | TMap (_, vt) ->
-              line (sprintf "  %s_unique(%s);" (cname c t) p);
-              line (sprintf "  %s* %s = %s_slot(*%s, %s, %s);" (ctype c vt) q (cname c t) p (atom c k) (where sp));
-              (q, vt)
-            | _ -> failwith "mutate key")
-          | I.PIndexU _ -> failwith "mutate through unchecked index")
-        ("p0_", v.ty)
-        (List.mapi (fun i s -> (i, s)) steps)
-    in
+    let p, t = place_ptr c line "p" v steps in
     (match m with
      | I.MSet x ->
        if not (is_scalar t) then line (sprintf "  %s_drop(*%s);" (cname c t) p);
@@ -1527,7 +1560,11 @@ and stmt c out ind (s : I.stmt) =
   | I.Line sp -> Buffer.add_string out (line_directive sp ^ "\n")
 
 let signature c (f : I.fn) =
-  let ps = List.map (fun (v : I.var) -> sprintf "%s%s %s" (ctype c v.ty) (vol c v) (var v)) f.params in
+  let ps =
+    List.map
+      (fun (v : I.var) -> if v.by_ref then sprintf "%s* %s" (ctype c v.ty) (var_name v) else sprintf "%s%s %s" (ctype c v.ty) (vol c v) (var v))
+      f.params
+  in
   let ps = if f.is_closure then "WClo* self_" :: ps else ps in
   sprintf "static %s %s(%s)" (ctype c f.ret) f.fname (if ps = [] then "void" else String.concat ", " ps)
 
@@ -1595,7 +1632,7 @@ let fn_body c out (f : I.fn) =
   c.plan <- Pure.plan c.pure f;
   Buffer.add_string out (signature c f ^ " {\n");
   let line s = Buffer.add_string out ("  " ^ s ^ "\n") in
-  (* parameters are owned by the function *)
+  (* parameters are owned by the function (`mut` ones by the caller) *)
   List.iter (fun (v : I.var) -> cell_decl c line v true) f.params;
   if f.captures <> [] then begin
     Buffer.add_string out (sprintf "  struct Env_%s* env_ = (struct Env_%s*)self_;\n" f.fname f.fname);

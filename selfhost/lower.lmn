@@ -141,7 +141,7 @@ pub fn show(t: types.Ty) -> Str {
 fn fresh_var(self: Lx, name: Str, ty: types.Ty) -> (ir.Var, Lx) {
     let mut lx = self
     lx.vars = lx.vars + 1
-    (ir.Var { id: lx.vars, name, ty }, lx)
+    (ir.Var { id: lx.vars, name, ty, by_ref: false }, lx)
 }
 
 fn emit(self: Lx, s: ir.Stmt) -> Lx {
@@ -914,8 +914,7 @@ fn lower_call(self: Lx, e: ast.Expr, callee: ast.Expr, args: List[ast.Expr], ty:
                     Some(_) => {
                         let targs = lx.inst_of(callee)
                         let (c, lx) = lx.instance(n, targs)
-                        let (xs, lx) = lx.lower_all(args)
-                        return lx.tmp(ty, Call(c, xs))
+                        return lx.call(c, args, ty)
                     },
                     None => {},
                 }
@@ -939,6 +938,37 @@ fn lower_call(self: Lx, e: ast.Expr, callee: ast.Expr, args: List[ast.Expr], ty:
         },
         _ => self.call_value(callee, args, ty),
     }
+}
+
+// A call of a top-level function or a method: a plain Call, or with a
+// `mut` argument a CallMut, its arguments lowered in order, each `mut`
+// place to its variable and steps.
+fn call(self: Lx, c: Str, args: List[ast.Expr], ty: types.Ty) -> (ir.Atom, Lx) {
+    let is_mut = |a: ast.Expr| match a.desc {
+        EMut(_) => true,
+        _ => false,
+    }
+    if !args.any(is_mut) {
+        let (xs, lx) = self.lower_all(args)
+        return lx.tmp(ty, Call(c, xs))
+    }
+    let mut lx = self
+    let mut xs: List[ir.Arg] = []
+    for a in args {
+        match a.desc {
+            EMut(p) => {
+                let (v, steps, next) = lx.lower_place(p)
+                lx = next
+                xs.push(ByPlace(v, steps))
+            },
+            _ => {
+                let (x, next) = lx.lower(a)
+                lx = next
+                xs.push(ByValue(x))
+            },
+        }
+    }
+    lx.tmp(ty, CallMut(c, xs))
 }
 
 // A call of a closure value.
@@ -1546,8 +1576,7 @@ fn lower_method(self: Lx, e: ast.Expr, recv: ast.Expr, name: Str, args: List[ast
             // type parameter: read the instantiation off the actual types
             let targs = if d.generics.all(|g| env.any(|p| p.0 == g)) { env } else { derive_targs(d, ([recv] + args).map(|x| lx.tyof(x))) }
             let (c, lx) = lx.instance(key, targs)
-            let (xs, lx) = lx.lower_all([recv] + args)
-            return lx.tmp(ty, Call(c, xs))
+            return lx.call(c, [recv] + args, ty)
         },
         _ => {},
     }
@@ -2054,6 +2083,7 @@ fn lower_fn(self: Lx, job: Job) -> (ir.Fn, Lx) {
     let mut params: List[ir.Var] = []
     for p in d.params {
         let (v, next) = lx.fresh_var(p.name, resolve(env, p.ty))
+        let v = { v with by_ref: p.mutable }
         lx = next.bind(p.name, v)
         params.push(v)
     }

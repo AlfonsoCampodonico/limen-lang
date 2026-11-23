@@ -3,7 +3,9 @@
    (Own) decides where to retain (VDup) and where to release (Drop). *)
 open Types
 
-type var = { id : int; name : string; ty : ty }
+(* [by_ref]: a `mut` parameter's variable in its own function, which
+   holds a pointer to the caller's place (captures and temporaries never) *)
+type var = { id : int; name : string; ty : ty; by_ref : bool }
 
 type atom =
   | V of var (* use of a variable; a move when consumed *)
@@ -21,12 +23,17 @@ type step =
   | PIndexU of atom (* index already proven in range (compiler-generated loops) *)
   | PKey of atom * Span.t (* map entry by key; panics when the key is missing *)
 
+(* An argument of a call with `mut` arguments: a value, or the caller's
+   place (a variable and the steps into it) that the callee changes *)
+type arg = ByValue of atom | ByPlace of var * step list
+
 type rhs =
   | Atom of atom (* consumed *)
   | Bin of Ast.binop * ty * atom * atom * Span.t (* operand type; borrowed *)
   | Neg of ty * atom
   | Not of atom
   | Call of string * atom list (* consumed *)
+  | CallMut of string * arg list (* values consumed, places borrowed and changed *)
   | CallClo of atom * atom list (* closure borrowed, args consumed *)
   | Prim of string * ty * atom list * Span.t (* builtin method on receiver type; borrowed *)
   | MkStruct of ty * atom list (* consumed *)
@@ -103,6 +110,13 @@ and mutation =
   | MPut of atom * atom (* map: key, value *)
   | MRemove of atom (* map: key *)
 
+let step_atoms steps = List.filter_map (function PIndex (a, _) | PIndexU a | PKey (a, _) -> Some a | PField _ -> None) steps
+
+(* The variables whose places a call with `mut` arguments changes. *)
+let place_roots = function
+  | CallMut (_, args) -> List.filter_map (function ByPlace (v, _) -> Some v | ByValue _ -> None) args
+  | _ -> []
+
 let mut_atoms = function MSet a | MPush a | MRemove a -> [ a ] | MPut (k, v) -> [ k; v ]
 
 type fn = {
@@ -122,6 +136,7 @@ type program = { fns : fn list; main : string; main_takes_root : bool; main_ret 
 let consumed = function
   | Atom a -> [ a ]
   | Call (_, args) -> args
+  | CallMut (_, args) -> List.filter_map (function ByValue a -> Some a | ByPlace _ -> None) args
   | CallClo (_, args) -> args
   | MkStruct (_, xs) | MkEnum (_, _, xs) | MkList (_, xs) | MkClosure (_, _, xs) -> xs
   | Spawn (_, c, _, _) -> [ c ]
@@ -133,6 +148,7 @@ let consumed = function
 
 let borrowed = function
   | Atom _ | Call _ | MkStruct _ | MkEnum _ | MkList _ | MkClosure _ -> []
+  | CallMut (_, args) -> List.concat_map (function ByValue _ -> [] | ByPlace (v, steps) -> V v :: step_atoms steps) args
   | CallClo (c, _) -> [ c ]
   | CallDyn (_, _, _, r, _) -> [ r ]
   | Catch (c, _) -> [ c ]
@@ -156,3 +172,11 @@ let borrowed = function
   | ChanSend (c, _, _) -> [ c ]
 
 let atom_var = function V v | VDup v -> Some v | _ -> None
+
+let atom_ty = function
+  | V v | VDup v -> v.ty
+  | AInt _ -> TInt
+  | AFloat _ -> TFloat
+  | ABool _ -> TBool
+  | AUnit -> TUnit
+  | AStr _ -> TStr
