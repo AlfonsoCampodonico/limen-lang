@@ -24,9 +24,12 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+#include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define LC_FN static inline
@@ -141,6 +144,64 @@ LC_FN bool lc_parse_int(const char *s, size_t n, int64_t *out) {
   if (!neg && v > (uint64_t)INT64_MAX) return false;
   if (neg && v > (uint64_t)INT64_MAX + 1) return false;
   *out = neg ? (int64_t)(0 - v) : (int64_t)v;
+  return true;
+}
+
+/* Float.to_str and a Float in interpolation: one decimal for a whole number
+   under 1e16, else 15 significant digits. LC_FLOAT_MAX bytes always hold it
+   (the longest, such as "-1.23456789012346e-308", is 22 bytes and the NUL). Returns
+   the length. */
+#define LC_FLOAT_MAX 32
+LC_FN size_t lc_fmt_float(char *out, size_t cap, double x) {
+  int k;
+  if (x == floor(x) && fabs(x) < 1e16) k = snprintf(out, cap, "%.1f", x);
+  else k = snprintf(out, cap, "%.15g", x);
+  return k < 0 ? 0 : (size_t)k;
+}
+
+/* Float.to_fixed: nan, inf or -inf, else d decimals (clamped to 0..30)
+   rounded as printf does. LC_FIXED_MAX bytes always hold it: -DBL_MAX with
+   30 decimals is 341 bytes. Returns the length. */
+#define LC_FIXED_MAX 352
+LC_FN size_t lc_to_fixed(char *out, size_t cap, double x, int64_t d) {
+  int k;
+  if (isnan(x)) k = snprintf(out, cap, "nan");
+  else if (isinf(x)) k = snprintf(out, cap, x > 0 ? "inf" : "-inf");
+  else {
+    if (d < 0) d = 0;
+    if (d > 30) d = 30;
+    k = snprintf(out, cap, "%.*f", (int)d, x);
+  }
+  return k < 0 ? 0 : (size_t)k;
+}
+
+/* Str.parse_float: a decimal float, digits with an optional sign, point and
+   exponent, surrounding spaces (lc_trim) allowed; no hex, nan or inf. Any
+   length: strtod needs a NUL-terminated copy, on the stack up to 407 bytes
+   and from malloc past that (false if malloc fails). */
+LC_FN bool lc_parse_float(const char *s, size_t n, double *out) {
+  size_t a, b;
+  lc_trim(s, n, &a, &b);
+  if (a == b) return false;
+  bool digit = false;
+  for (size_t i = a; i < b; i++) {
+    char c = s[i];
+    if (c >= '0' && c <= '9') digit = true;
+    else if (!(c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E')) return false;
+  }
+  if (!digit) return false;
+  size_t len = b - a;
+  char small[408];
+  char *t = len < sizeof small ? small : (char *)malloc(len + 1);
+  if (!t) return false;
+  memcpy(t, s + a, len);
+  t[len] = 0;
+  char *end;
+  double x = strtod(t, &end);
+  bool ok = end == t + len;
+  if (t != small) free(t);
+  if (!ok) return false;
+  *out = x;
   return true;
 }
 

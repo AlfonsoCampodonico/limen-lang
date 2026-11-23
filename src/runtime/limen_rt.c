@@ -403,10 +403,8 @@ W_RT void buf_putn(WBuf *b, const char *s, int64_t n) {
 W_RT void buf_puts(WBuf *b, const char *s) { buf_putn(b, s, (int64_t)strlen(s)); }
 W_RT WStr *buf_take(WBuf *b) { WStr *s = Str_from(b->p, b->len); free(b->p); return s; }
 
-W_RT void fmt_float(char *out, size_t n, double x) {
-  if (x == floor(x) && fabs(x) < 1e16) snprintf(out, n, "%.1f", x);
-  else snprintf(out, n, "%.15g", x);
-}
+/* A Float as Float.to_str prints it (lc_fmt_float). */
+W_RT void fmt_float(char *out, size_t n, double x) { lc_fmt_float(out, n, x); }
 
 /* Same escaping as OCaml's String.escaped, so output matches the interpreter. */
 W_RT void buf_escaped(WBuf *b, WStr *s) {
@@ -438,7 +436,7 @@ W_RT int Float_cmp(double a, double b) {
 
 W_RT void Int_show(WBuf *b, int64_t x, bool top) { (void)top; char t[32]; snprintf(t, sizeof t, "%lld", (long long)x); buf_puts(b, t); }
 W_RT void UInt_show(WBuf *b, uint64_t x, bool top) { (void)top; char t[32]; snprintf(t, sizeof t, "%llu", (unsigned long long)x); buf_puts(b, t); }
-W_RT void Float_show(WBuf *b, double x, bool top) { (void)top; char t[64]; fmt_float(t, sizeof t, x); buf_puts(b, t); }
+W_RT void Float_show(WBuf *b, double x, bool top) { (void)top; char t[LC_FLOAT_MAX]; fmt_float(t, sizeof t, x); buf_puts(b, t); }
 W_RT void Bool_show(WBuf *b, bool x, bool top) { (void)top; buf_puts(b, x ? "true" : "false"); }
 W_RT void Unit_show(WBuf *b, W_Unit x, bool top) { (void)x; (void)top; buf_puts(b, "()"); }
 W_RT void Str_show(WBuf *b, WStr *s, bool top) { if (top) buf_putn(b, s->data, s->len); else buf_escaped(b, s); }
@@ -526,7 +524,6 @@ W_RT L_Str *Str_lines(WStr *s) {
   while (lc_lines_next(s->data, (size_t)s->len, &pos, &start, &len)) L_Str_push(&out, Str_from(s->data + start, (int64_t)len));
   return out;
 }
-W_RT bool is_ws(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f'; }
 W_RT WStr *Str_trim(WStr *s) {
   size_t a, b;
   lc_trim(s->data, (size_t)s->len, &a, &b);
@@ -597,8 +594,6 @@ W_RT int64_t Bytes_at(WStr *s, int64_t i, const char *where) {
   }
   return (int64_t)(unsigned char)s->data[i];
 }
-/* The length of the UTF-8 character at s[i] (lc_utf8_len). */
-W_RT int64_t w_utf8_len(const unsigned char *s, int64_t i, int64_t n) { return (int64_t)lc_utf8_len(s, (size_t)i, (size_t)n); }
 /* The characters (UTF-8 code points) of a string, each as a string. */
 W_RT L_Str *Str_chars(WStr *s) {
   L_Str *out = L_Str_new(s->len);
@@ -624,47 +619,14 @@ W_RT WStr *Int_to_char(int64_t n) {
   size_t k = lc_utf8_encode(n, b);
   return Str_from(b, (int64_t)k);
 }
-/* Fixed-point text with [d] decimals (clamped to 0..30), rounded as printf
-   does; the interpreter uses the same printf. */
+/* Fixed-point text with [d] decimals, clamped to 0..30 (lc_to_fixed). */
 W_RT WStr *Float_to_fixed(double x, int64_t d) {
-  if (isnan(x)) return Str_from("nan", 3);
-  if (isinf(x)) return x > 0 ? Str_from("inf", 3) : Str_from("-inf", 4);
-  if (d < 0) d = 0;
-  if (d > 30) d = 30;
-  int n = snprintf(NULL, 0, "%.*f", (int)d, x);
-  WStr *s = Str_new(n);
-  char *b = (char *)w_raw((size_t)n + 1);
-  snprintf(b, (size_t)n + 1, "%.*f", (int)d, x);
-  memcpy(s->data, b, (size_t)n);
-  free(b);
-  return s;
+  char t[LC_FIXED_MAX];
+  size_t n = lc_to_fixed(t, sizeof t, x, d);
+  return Str_from(t, (int64_t)n);
 }
-/* A decimal float: digits with optional sign, point and exponent; no hex, nan or inf. */
-W_RT bool Str_parse_float(WStr *s, double *out) {
-  int64_t a = 0, b = s->len;
-  while (a < b && is_ws(s->data[a])) a++;
-  while (b > a && is_ws(s->data[b - 1])) b--;
-  if (a == b) return false;
-  bool digit = false;
-  for (int64_t i = a; i < b; i++) {
-    char c = s->data[i];
-    if (c >= '0' && c <= '9') digit = true;
-    else if (!(c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E')) return false;
-  }
-  if (!digit) return false;
-  /* any length, as the interpreter reads it */
-  char small[408];
-  char *t = b - a < (int64_t)sizeof small ? small : (char *)w_raw((size_t)(b - a) + 1);
-  memcpy(t, s->data + a, (size_t)(b - a));
-  t[b - a] = 0;
-  char *end;
-  double x = strtod(t, &end);
-  bool ok = end == t + (b - a);
-  if (t != small) free(t);
-  if (!ok) return false;
-  *out = x;
-  return true;
-}
+/* A decimal float (lc_parse_float). */
+W_RT bool Str_parse_float(WStr *s, double *out) { return lc_parse_float(s->data, (size_t)s->len, out); }
 W_RT void Clo_drop(WClo *c) {
   if (!w_rc_dec(&c->rc)) return;
   if (((WHdr *)c - 1)->kids == (void (*)(void *))c->drop) { w_release(c); return; }  /* captures that hold closures */

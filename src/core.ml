@@ -27,3 +27,13 @@ external of_code : int64 -> string = "limen_core_of_code"
 
 (* A decimal Int with an optional sign and surrounding spaces (lc_parse_int). *)
 external parse_int : string -> int64 option = "limen_core_parse_int"
+
+(* A Float as Float.to_str prints it (lc_fmt_float). *)
+external fmt_float : float -> string = "limen_core_fmt_float"
+
+(* nan, inf, -inf, or [d] decimals clamped to 0..30 (lc_to_fixed). *)
+external to_fixed : float -> int64 -> string = "limen_core_to_fixed"
+
+(* A decimal float with optional sign, point, exponent and surrounding
+   spaces; no hex, nan or inf (lc_parse_float). *)
+external parse_float : string -> float option = "limen_core_parse_float"

@@ -282,8 +282,8 @@ type rt = {
 
 (* ---------- printing and comparison ---------- *)
 
-let fmt_float x =
-  if Float.is_integer x && Float.abs x < 1e16 then sprintf "%.1f" x else sprintf "%.15g" x
+(* The C definition native code uses. *)
+let fmt_float = Core.fmt_float
 
 let rec cap_name = function
   | CRoot -> "Root" | CNet _ -> "Net" | CFs _ -> "Fs" | CStdout -> "Stdout" | CStderr -> "Stderr" | CClock -> "Clock"
@@ -440,11 +440,7 @@ let split_on s sep = Array.to_list (Core.split s sep)
 let replace_all s a b = if a = "" then s else String.concat b (split_on s a)
 
 (* A decimal float: digits with optional sign, point and exponent; no hex, nan or inf. *)
-let parse_float s =
-  let s = String.trim s in
-  let ok_char c = (c >= '0' && c <= '9') || c = '.' || c = '-' || c = '+' || c = 'e' || c = 'E' in
-  if s = "" || (not (String.for_all ok_char s)) || not (String.exists (fun c -> c >= '0' && c <= '9') s) then None
-  else float_of_string_opt s
+let parse_float = Core.parse_float
 
 let vint n = VInt (Int64.of_int n)
 
@@ -2979,13 +2975,7 @@ and call_method rt v name args sp =
   | VFloat x, "to_int", [] -> VInt (float_to_int x)
   | VFloat x, "abs", [] -> VFloat (Float.abs x)
   | VFloat x, "sqrt", [] -> VFloat (Float.sqrt x)
-  | VFloat x, "to_fixed", [ VInt d ] ->
-    let d = Int64.to_int (Int64.max 0L (Int64.min 30L d)) in
-    VStr
-      (if Float.is_nan x then "nan"
-       else if x = Float.infinity then "inf"
-       else if x = Float.neg_infinity then "-inf"
-       else sprintf "%.*f" d x)
+  | VFloat x, "to_fixed", [ VInt d ] -> VStr (Core.to_fixed x d)
   | VBool b, "to_str", [] -> VStr (string_of_bool b)
   | VList a, "len", [] -> vint (Array.length a)
   | VList a, "to_list", [] -> VList a

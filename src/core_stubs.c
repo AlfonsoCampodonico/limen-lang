@@ -107,3 +107,28 @@ double limen_core_u2f(int64_t x) { return lc_u2f((uint64_t)x); }
 value limen_core_u2f_byte(value x) { return caml_copy_double(lc_u2f((uint64_t)Int64_val(x))); }
 int64_t limen_core_f2i(double x) { return lc_f2i(x); }
 value limen_core_f2i_byte(value x) { return caml_copy_int64(lc_f2i(Double_val(x))); }
+
+value limen_core_fmt_float(value x) {
+  CAMLparam1(x);
+  char t[LC_FLOAT_MAX];
+  size_t k = lc_fmt_float(t, sizeof t, Double_val(x));
+  /* t is on the C stack, so the GC cannot move it */
+  CAMLreturn(caml_alloc_initialized_string(k, t));
+}
+
+value limen_core_to_fixed(value x, value d) {
+  CAMLparam2(x, d);
+  char t[LC_FIXED_MAX];
+  size_t k = lc_to_fixed(t, sizeof t, Double_val(x), Int64_val(d));
+  CAMLreturn(caml_alloc_initialized_string(k, t));
+}
+
+value limen_core_parse_float(value s) {
+  CAMLparam1(s);
+  CAMLlocal2(out, boxed);
+  double x;
+  if (!lc_parse_float(String_val(s), caml_string_length(s), &x)) CAMLreturn(Val_none);
+  boxed = caml_copy_double(x);
+  out = caml_alloc_some(boxed);
+  CAMLreturn(out);
+}

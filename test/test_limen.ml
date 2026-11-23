@@ -690,6 +690,28 @@ fn walk(t: Tree) -> List[Int] {
     }
     out.print("{ok}")|})
     "300\n";
+  out "str-core-edges"
+    (main_wrap {|    let long = "ab".split("abc")
+    out.print("{"".split("")} {"aaa".split("aa")} {long}")
+    out.print("{"-9223372036854775808".parse_int()} {"-9223372036854775809".parse_int()} {"+5".parse_int()} {"-".parse_int()}")
+    out.print("{55296.to_char().bytes()} {(-1).to_char().bytes()}")
+    out.print("{bytes([226, 130]).to_str().chars().len()} {bytes([192, 128]).to_str().chars().len()} {bytes([224, 128, 128]).to_str().chars().len()} {bytes([237, 160, 128]).to_str().chars().len()}")|})
+    "[] [\"\", \"a\"] [\"ab\"]\nSome(-9223372036854775808) None Some(5) None\n[239, 191, 189] [239, 191, 189]\n2 2 3 3\n";
+  out "float-parse-long"
+    (main_wrap {|    let mut zs: List[Str] = []
+    for i in 0..<10000 {
+        zs.push("0")
+    }
+    let z = zs.join("")
+    let a = ("1." + z.slice(0, 405)).parse_float()
+    let b = ("1." + z.slice(0, 406)).parse_float()
+    let c = ("1." + z.slice(0, 407)).parse_float()
+    out.print("{a} {b} {c} {(z + "2.5").parse_float()} {(z + "1e").parse_float()}")|})
+    "Some(1.0) Some(1.0) Some(1.0) Some(2.5) None\n";
+  out "float-parse-nul" (main_wrap {|    out.print("{("1" + bytes([0]).to_str()).parse_float()}")|}) "None\n";
+  out "float-to-fixed-huge"
+    (main_wrap {|    out.print("{1.7976931348623157e308.to_fixed(30).len()} {(-1.7976931348623157e308).to_fixed(30).len()} {(-1.7976931348623157e308).to_fixed(30).slice(0, 4)}")|})
+    "340 341 -179\n";
   out "numbers"
     (main_wrap {|    out.print("{7 / -2} {-7 % 3} {2.0 / 4.0} {1.0 / 3.0} {(2.7).to_int()} {(-3).abs()} {10.to_float() * 1.5} {0.1 + 0.2}")|})
     "-3 -1 0.5 0.333333333333333 2 3 15.0 0.3\n";
