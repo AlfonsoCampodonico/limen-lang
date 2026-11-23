@@ -388,6 +388,33 @@ let out name ?grants ?modules ?feed src want =
   check_native name ?grants ?modules ?feed src ~want_out:want ~want_err_prefix:None
   end
 
+(* Where two outputs first part: "line N: interpreter "...", native "..."". *)
+let first_diff a b =
+  let la = String.split_on_char '\n' a and lb = String.split_on_char '\n' b in
+  let rec go n la lb =
+    match (la, lb) with
+    | x :: la, y :: lb when x = y -> go (n + 1) la lb
+    | x :: _, y :: _ -> sprintf "line %d: interpreter %S, native %S" n x y
+    | x :: _, [] -> sprintf "line %d: interpreter %S, native has no such line" n x
+    | [], y :: _ -> sprintf "line %d: interpreter has no such line, native %S" n y
+    | [], [] -> "no difference"
+  in
+  go 1 la lb
+
+(* The cross-check (test/crosscheck.ml): no expected output, only the
+   interpreter's and the native build's, which must agree line for line. *)
+let same name ?grants src =
+  if selected name then
+    match run ?grants name src with
+    | Error e -> ok name false (sprintf "interpreter: %s (seed %d)" e Crosscheck.seed)
+    | Ok (got, _) ->
+      if native_for name then
+        run_native ?grants name src (function
+          | Error m -> ok (name ^ "/native") false m
+          | Ok (code, o, e) ->
+            ok (name ^ "/native") (o = got) (sprintf "%s (seed %d)" (first_diff got o) Crosscheck.seed);
+            ok (name ^ "/native-clean") (code = 0 && e = "limen-leakcheck: 0 live\n") (sprintf "exit %d, stderr %S" code e))
+
 let errs ?modules name src want =
   if selected name then
   let _, ds, _ = compile ?modules name src in
@@ -11743,6 +11770,13 @@ fn main(root: Root) {
     (main_wrap {|    let s = "a/b/c"
     out.print("{s.last_index_of("/")} {s.index_of("/")} {s.last_index_of("x")} {s.last_index_of("")} {"".last_index_of("")} {"aaa".last_index_of("aa")} {s.last_index_of("a/b/c/")}")|})
     "Some(3) Some(1) None Some(5) Some(0) Some(1) None\n";
+
+  (* every built-in, interpreter against native (test/crosscheck.ml) *)
+  List.iter
+    (fun (name, src, rseed) ->
+      let grants = { Interp.no_grants with seed = rseed } in
+      same name ~grants src)
+    (Crosscheck.programs ~seed:Crosscheck.seed);
 
   drain ();
   Printf.printf "%d/%d passed\n" (!total - !failed) !total;
