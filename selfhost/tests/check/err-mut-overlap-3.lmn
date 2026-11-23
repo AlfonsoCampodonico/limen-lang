@@ -1,0 +1,53 @@
+struct P {
+    x: Int,
+    y: Int,
+}
+
+struct Buf {
+    items: List[Int],
+}
+
+struct Inner {
+    n: Int,
+}
+
+struct Outer {
+    Inner,
+}
+
+fn two(mut a: Int, mut b: Int) {}
+
+fn put(mut a: Int, b: Int) {}
+
+fn pt(mut p: P, mut v: Int) {}
+
+fn whole(mut o: Outer, mut v: Int) {}
+
+fn next(mut n: Int) -> Int {
+    n
+}
+
+fn take(mut xs: List[Int]) -> Int {
+    0
+}
+
+fn both(mut xs: List[Int], ys: List[Int]) -> Int {
+    0
+}
+
+fn grab(mut self: Buf, mut more: List[Int]) {}
+
+fn bump2(mut self: Int, mut other: Int) {}
+
+fn main(root: Root) {
+    let mut k = 0
+    let mut j = 0
+    let mut p = P { x: 0, y: 0 }
+    let mut xs = [1, 2]
+    let mut ys = [3]
+    let mut mm = map([("a", 1)])
+    let mut b = Buf { items: [] }
+    let mut t = (1, 2)
+    let mut o = Outer { Inner: Inner { n: 0 } }
+    b.grab(mut b.items)
+}

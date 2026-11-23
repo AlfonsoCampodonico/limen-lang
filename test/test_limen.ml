@@ -11798,6 +11798,34 @@ fn main(root: Root) {
   says "mut-piped-not-place" (mut_decls ^ main_wrap "    plain(1) |> bump") "E0213" "call `bump(mut x)`";
   says "mut-param-note" "fn f(n: Int) {\n    n = 1\n}\nfn main(root: Root) {}\n" "E0205" "declare it `mut n` to change the caller's value";
   ok "mut-explained" (List.for_all (fun c -> List.mem_assoc c Diag.explanations) [ "E0213"; "E0214"; "E0215" ]) "no explanation";
+  let two = "struct P {\n    x: Int,\n    y: Int,\n}\n\nfn two(mut a: Int, mut b: Int) {}\n\nfn put(mut a: Int, b: Int) {}\n\nfn pt(mut p: P, mut v: Int) {}\n\nfn next(mut n: Int) -> Int {\n    n\n}\n\nfn take(mut xs: List[Int]) -> Int {\n    0\n}\n\nfn both(mut xs: List[Int], ys: List[Int]) -> Int {\n    0\n}\n\nstruct Buf {\n    items: List[Int],\n}\n\nfn grab(mut self: Buf, mut more: List[Int]) {}\n\n" in
+  let m body = two ^ main_wrap ("    let mut k = 0\n    let mut j = 0\n    let mut p = P { x: 0, y: 0 }\n    let mut xs = [1, 2]\n    let mut mm = map([(\"a\", 1)])\n    let mut b = Buf { items: [] }\n" ^ body) in
+  says "mut-overlap-same" (m "    two(mut k, mut k)") "E0214" "this `mut` argument overlaps another one of the same call";
+  errs "mut-overlap-prefix" (m "    pt(mut p, mut p.x)") [ "E0214" ];
+  errs "mut-overlap-receiver" (m "    b.grab(mut b.items)") [ "E0214" ];
+  errs "mut-overlap-elements" (m "    two(mut xs[0], mut xs[1])") [ "E0214" ];
+  errs "mut-overlap-entries" (m "    two(mut mm[\"a\"], mut mm[\"b\"])") [ "E0214" ];
+  errs "mut-distinct-fields" (m "    two(mut p.x, mut p.y)") [];
+  errs "mut-and-plain" (m "    let n = both(mut xs, xs)") [];
+  says "mut-nested" (m "    put(mut k, next(mut k))") "E0214" "this changes a value that the enclosing call also takes as `mut`";
+  errs "mut-nested-push" (m "    xs.push(take(mut xs))") [ "E0214" ];
+  errs "mut-nested-other" (m "    put(mut k, next(mut j))") [];
+  errs "mut-overlap-labelled" (m "    two(b: mut k, a: mut k)") [ "E0214" ];
+  errs "mut-overlap-tuple" (m "    let mut t = (1, 2)\n    two(mut t.0, mut t.0)") [ "E0214" ];
+  errs "mut-distinct-tuple" (m "    let mut t = (1, 2)\n    two(mut t.0, mut t.1)") [];
+  errs "mut-nested-index" (m "    two(mut xs[next(mut k)], mut k)") [ "E0214" ];
+  errs "mut-nested-block" (m "    put(mut k, {\n        let n = next(mut k)\n        n\n    })") [ "E0214" ];
+  errs "mut-overlap-promoted" "struct Inner {\n    n: Int,\n}\nstruct Outer {\n    Inner,\n}\nfn whole(mut o: Outer, mut v: Int) {}\nfn main(root: Root) {\n    let mut o = Outer { Inner: Inner { n: 0 } }\n    whole(mut o, mut o.n)\n}\n" [ "E0214" ];
+  (let _, ds, infos = compile "mut-pure" (two ^ "fn bump(mut n: Int) {\n    n = n + 1\n}\n\nfn swap_cb(mut f: fn() -> Int) {\n    f = || 1\n}\n\nfn main(root: Root) {}\n") in
+   let text n = Check.pure_text (List.find (fun (i : Check.fn_info) -> i.name = n) infos) in
+   ok "mut-pure" (ds = [] && text "bump" = "pure" && text "swap_cb" = "pure itself, runs callbacks") (text "bump" ^ "; " ^ text "swap_cb"));
+  (* a `mut` function parameter is the caller's place, never a condition of purity *)
+  (let _, ds, infos = compile "mut-pure-calls" "fn run(mut f: fn() -> Int, g: fn() -> Int) -> Int {\n    f() + g()\n}\n\nfn main(root: Root) {}\n" in
+   let text = Check.pure_text (List.find (fun (i : Check.fn_info) -> i.name = "run") infos) in
+   ok "mut-pure-calls" (ds = [] && text = "pure itself, runs callbacks") text);
+  (let _, ds, infos = compile "mut-pure-if" "fn apply(mut n: Int, f: fn(Int) -> Int) {\n    n = f(n)\n}\n\nfn main(root: Root) {}\n" in
+   let text = Check.pure_text (List.find (fun (i : Check.fn_info) -> i.name = "apply") infos) in
+   ok "mut-pure-if" (ds = [] && text = "pure if f is") text);
 
   drain ();
   Printf.printf "%d/%d passed\n" (!total - !failed) !total;

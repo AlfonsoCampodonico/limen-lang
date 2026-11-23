@@ -18,6 +18,7 @@ use diag
 use env
 use exhaust
 use types
+use walk
 
 // ---------- expressions ----------
 
@@ -1161,6 +1162,7 @@ fn check_call(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, callee: ast.Ex
                     }
                 }
             }
+            st = mut_overlap(st, None, written)
             if labelled {
                 st = st.rewrite(e, ECall(callee, args2))
                 st = keep_order(st, e, written, r)
@@ -1693,6 +1695,7 @@ fn check_method_value(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv: 
                     st = next
                     match ordered {
                         Some(args2) => {
+                            st = mut_overlap(st, None, written)
                             let (f, next) = st.node(EVar(key), nsp)
                             st = next.set_type(f, t).set_inst(f, inst)
                             st = st.rewrite(e, ECall(f, [recv] + args2))
@@ -1745,11 +1748,14 @@ fn check_method_value(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv: 
                     let (ordered, next) = method_args(st, cx, fx, key, name, nsp, method_params(cx, key), method_defaults(cx, key), args, ps)
                     st = next
                     match ordered {
-                        Some(args2) if labelled || args2.len() != args.len() => {
-                            st = st.rewrite(e, EMethod(recv, name, nsp, args2))
-                            st = keep_order(st, e, written, r)
+                        Some(args2) => {
+                            st = mut_overlap(st, None, written)
+                            if labelled || args2.len() != args.len() {
+                                st = st.rewrite(e, EMethod(recv, name, nsp, args2))
+                                st = keep_order(st, e, written, r)
+                            }
                         },
-                        _ => {},
+                        None => {},
                     }
                     (r, st)
                 },
@@ -1932,6 +1938,12 @@ fn builtin_method_call(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv:
                 _ => expect(st, cx, fx, a, p),
             }
         }
+    }
+    match (name, rt) {
+        ("push", TList(_)) | ("remove", TMap(..)) => {
+            st = mut_overlap(st, Some(recv), args)
+        },
+        _ => {},
     }
     match (name, rt) {
         ("sort", TList(a)) => match unordered(st, cx, a) {
@@ -2201,6 +2213,134 @@ fn mut_receiver(st: env.State, cx: env.Cx, fx: env.Fx, key: Str, recv: ast.Expr)
             st.rewrite(recv, EMut(inner))
         },
     }
+}
+
+// ---------- overlapping `mut` places ----------
+
+// A step of the path of a `mut` place: a field or tuple item by name, or
+// any index of a list, array or map, since its value is not known when
+// checking.
+enum PStep {
+    PName(Str),
+    PAny,
+}
+
+// The path of a `mut` place: its root variable, then its steps.
+fn place_path(st: env.State, e: ast.Expr) -> Option[(Str, List[PStep])] {
+    match st.desc(e) {
+        EVar(n) => Some((n, [])),
+        EField(a, n, _) => place_path(st, a).map(|p| (p.0, p.1 + [PName(n)])),
+        EIndex(a, _) => place_path(st, a).map(|p| (p.0, p.1 + [PAny])),
+        EMut(x) => place_path(st, x),
+        _ => None,
+    }
+}
+
+// Two places overlap when they share a root and, walked together, never
+// name two different fields before one of them ends.
+fn overlaps(a: (Str, List[PStep]), b: (Str, List[PStep])) -> Bool {
+    if a.0 != b.0 {
+        return false
+    }
+    let mut k = 0
+    while k < a.1.len() && k < b.1.len() {
+        match (a.1[k], b.1[k]) {
+            (PName(x), PName(y)) if x != y => {
+                return false
+            },
+            _ => {},
+        }
+        k = k + 1
+    }
+    true
+}
+
+// The expressions directly inside `e`, in its form now; none for a
+// closure.
+fn expr_kids(st: env.State, e: ast.Expr) -> List[ast.Expr] {
+    match st.desc(e) {
+        EInt(_) | EFloat(_) | EBool(_) | EUnit | EVar(_) | EClosure(..) => [],
+        EStr(parts) => parts.flat_map(|part| match part {
+            SPExpr(x) => [x],
+            SPLit(_) => [],
+        }),
+        EList(items) => items,
+        EBin(_, a, b) | EPipe(a, b) | EIndex(a, b) | ESafe(a, _, b) => [a, b],
+        EUn(_, a) | EField(a, _, _) | ENamed(_, _, a) | EMut(a) | EDyn(a, _) => [a],
+        ECall(f, args) | EMethod(f, _, _, args) => [f] + args,
+        ETry(a, context) => [a] + (context.map(|c| [c]) ?? []),
+        EIf(c, then, other) => [c] + walk.block_kids(then) + (other.map(|o| [o]) ?? []),
+        EMatch(x, arms) => [x] + arms.flat_map(|a| (a.guard.map(|g| [g]) ?? []) + [a.body]),
+        EBlock(b) => walk.block_kids(b),
+        EStruct(_, _, fields) => fields.map(|f| f.value),
+        EWith(base, fields) => [base] + fields.map(|f| f.value),
+        EGroup(_, _, until, b) => (until.map(|d| [d.clock, d.ms]) ?? []) + walk.block_kids(b),
+        ESelect(arms) => arms.flat_map(|a| walk.sel_op(a.op) + (a.guard.map(|g| [g]) ?? []) + [a.body]),
+    }
+}
+
+// Where `x` is written, with its path, if it is a place.
+fn place_at(st: env.State, x: ast.Expr) -> List[(ast.Span, (Str, List[PStep]))] {
+    place_path(st, x).map(|p| [(x.span, p)]) ?? []
+}
+
+// The places that calls inside `e` change, outside closures: their `mut`
+// arguments and receivers, and the lists and maps they `push` to or
+// `remove` from; each with where it is written.
+fn changed_in(st: env.State, e: ast.Expr) -> List[(ast.Span, (Str, List[PStep]))] {
+    match st.desc(e) {
+        EClosure(..) => [],
+        EMut(x) => place_at(st, e) + expr_kids(st, x).flat_map(|k| changed_in(st, k)),
+        EMethod(r, m, _, args) if changes_receiver(st, r, m) => place_at(st, r) + (expr_kids(st, r) + args).flat_map(|k| changed_in(st, k)),
+        _ => expr_kids(st, e).flat_map(|k| changed_in(st, k)),
+    }
+}
+
+fn changes_receiver(st: env.State, r: ast.Expr, m: Str) -> Bool {
+    match (m, st.repr(st.type_of(r))) {
+        ("push", TList(_)) | ("remove", TMap(..)) => true,
+        _ => false,
+    }
+}
+
+// E0214: the `mut` places of one call, `changed` (the receiver of `push`
+// or `remove`) and the `mut` ones among `parts` (its receiver and
+// arguments, in written order), may not overlap, nor may a place that a
+// call inside them changes.
+fn mut_overlap(st: env.State, changed: Option[ast.Expr], parts: List[ast.Expr]) -> env.State {
+    let mut st = st
+    let first = match changed {
+        Some(r) => place_at(st, r),
+        None => [],
+    }
+    let own = first + parts.flat_map(|x| match st.desc(x) {
+        EMut(_) => place_at(st, x),
+        _ => [],
+    })
+    let mut seen: List[(Str, List[PStep])] = []
+    for (sp, p) in own {
+        if seen.any(|q| overlaps(p, q)) {
+            st = st.report(diag.error("E0214", sp, "this `mut` argument overlaps another one of the same call").note("a call changes each value through one `mut` argument: `mut p.x, mut p.y` are separate, but two elements of one list or map are not (take them out and put them back)"))
+        }
+        seen.push(p)
+    }
+    if own.is_empty() {
+        return st
+    }
+    let before = match changed {
+        Some(r) => expr_kids(st, r).flat_map(|k| changed_in(st, k)),
+        None => [],
+    }
+    let nested = before + parts.flat_map(|x| match st.desc(x) {
+        EMut(p) => expr_kids(st, p).flat_map(|k| changed_in(st, k)),
+        _ => changed_in(st, x),
+    })
+    for (sp, p) in nested {
+        if own.any(|o| overlaps(p, o.1)) {
+            st = st.report(diag.error("E0214", sp, "this changes a value that the enclosing call also takes as `mut`").note("make that call first, on its own line, and pass its result"))
+        }
+    }
+    st
 }
 
 // ---------- `?`, operators, closures, literals ----------

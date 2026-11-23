@@ -1,0 +1,19 @@
+// a `mut` parameter does not make a function impure; a function-typed one
+// is the caller's place, so the function runs callbacks, never "pure if"
+fn bump(mut n: Int) {
+    n = n + 1
+}
+
+fn swap_cb(mut f: fn() -> Int) {
+    f = || 1
+}
+
+fn run(mut f: fn() -> Int, g: fn() -> Int) -> Int {
+    f() + g()
+}
+
+fn apply(mut n: Int, f: fn(Int) -> Int) {
+    n = f(n)
+}
+
+fn main(root: Root) {}

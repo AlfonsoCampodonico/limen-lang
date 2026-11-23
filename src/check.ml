@@ -974,6 +974,80 @@ let methods_named ctx suffix =
   end;
   Hashtbl.find_all methods_index suffix
 
+(* The path of a `mut` place: its root variable, then each field or tuple
+   item by name; any index of a list, array or map is [PAny], since its
+   value is not known when checking. *)
+type pstep = PName of string | PAny
+
+let rec place_path (e : expr) =
+  match e.edesc with
+  | EVar n -> Some (n, [])
+  | EField (a, n, _) -> Option.map (fun (r, ss) -> (r, ss @ [ PName n ])) (place_path a)
+  | EIndex (a, _) -> Option.map (fun (r, ss) -> (r, ss @ [ PAny ])) (place_path a)
+  | EMut x -> place_path x
+  | _ -> None
+
+(* Two places overlap when they share a root and, walked together, never
+   name two different fields before one of them ends. *)
+let overlaps (ra, sa) (rb, sb) =
+  let rec go = function
+    | PName x :: xs, PName y :: ys -> x = y && go (xs, ys)
+    | _ :: xs, _ :: ys -> go (xs, ys)
+    | _ -> true
+  in
+  ra = rb && go (sa, sb)
+
+(* The expressions directly inside [e]. *)
+let rec expr_kids (e : expr) =
+  match e.edesc with
+  | EInt _ | EFloat _ | EBool _ | EUnit | EVar _ | EClosure _ -> []
+  | EStr parts -> List.filter_map (function SPExpr x -> Some x | SPLit _ -> None) parts
+  | EList es -> es
+  | EBin (_, a, b) | EIndex (a, b) | EPipe (a, b) | ESafe (a, _, b, _) -> [ a; b ]
+  | EUn (_, a) | EField (a, _, _) | EDyn (a, _) | ENamed (_, _, a) | EMut a -> [ a ]
+  | ECall (c, args) -> c :: args
+  | EMethod (r, _, _, args) -> r :: args
+  | ETry (a, c) -> a :: Option.to_list c
+  | EIf (c, b, els) -> (c :: block_kids b) @ Option.to_list els
+  | EMatch (x, arms) -> x :: List.concat_map (fun a -> Option.to_list a.aguard @ [ a.abody ]) arms
+  | EBlock b -> block_kids b
+  | EStruct (_, _, fs) -> List.map (fun (_, _, x) -> x) fs
+  | EWith (b, fs) -> b :: List.map (fun (_, _, x) -> x) fs
+  | EGroup (_, _, d, b) -> (match d with Some (c, ms) -> [ c; ms ] | None -> []) @ block_kids b
+  | ESelect arms ->
+    List.concat_map
+      (fun a ->
+        (match a.sop with
+         | SelRecv (_, c) -> [ c ]
+         | SelSend (c, x) | SelAfter (c, x) -> [ c; x ]
+         | SelDefault -> [])
+        @ Option.to_list a.sguard @ [ a.sbody ])
+      arms
+
+and block_kids (b : block) =
+  List.concat_map
+    (fun s ->
+      match s.sdesc with
+      | SLet (_, _, _, _, x) | SExpr x | SLetPat (_, x) -> [ x ]
+      | SAssign (a, x) -> [ a; x ]
+      | SReturn x -> Option.to_list x
+      | SWhile (c, b) | SFor (_, _, c, b) | SForPat (_, c, b) -> c :: block_kids b
+      | SBreak | SContinue -> []
+      | SDefer b -> block_kids b)
+    b.stmts
+  @ Option.to_list b.tail
+
+(* The places that calls inside [e] change, outside closures: their `mut`
+   arguments and receivers, and the lists and maps they `push` to or
+   `remove` from; each with where it is written. *)
+let rec changed_in (e : expr) =
+  match e.edesc with
+  | EClosure _ -> []
+  | EMut x -> Option.to_list (Option.map (fun p -> (e.espan, p)) (place_path x)) @ List.concat_map changed_in (expr_kids x)
+  | EMethod (r, m, _, args) when (match (m, repr r.ety) with ("push", TList _) | ("remove", TMap _) -> true | _ -> false) ->
+    Option.to_list (Option.map (fun p -> (r.espan, p)) (place_path r)) @ List.concat_map changed_in (expr_kids r @ args)
+  | _ -> List.concat_map changed_in (expr_kids e)
+
 let rec check_expr ctx f e : ty =
   let t = check_expr_inner ctx f e in
   (match e.edesc with ECall _ | EMethod _ -> infer_pending ctx | _ -> ());
@@ -1595,6 +1669,7 @@ and check_call ?want ctx f e callee args sp =
           check_fn_args ~passed_to:g ctx f ~who:g ~csp:callee.espan ~names ~muts args ps
         | _ -> List.iter2 (fun a p -> expect ctx f a p) args ps
       end;
+      mut_overlap ctx written;
       if labelled then begin
         e.edesc <- ECall (callee, args);
         keep_order e written r
@@ -1861,6 +1936,7 @@ and check_method_value ?rt ctx f e recv name nsp args =
         check_args ctx f args
       end
       else check_method_args ctx f key name nsp args ps;
+      mut_overlap ctx written;
       e.edesc <- ECall ({ edesc = EVar key; espan = nsp; ety = t; einst = env; ecallee = None }, recv :: args);
       if labelled then keep_order e written r;
       r)
@@ -1903,6 +1979,7 @@ and check_method_value ?rt ctx f e recv name nsp args =
         check_args ctx f args
       end
       else check_method_args ctx f (n ^ "::" ^ name) name nsp args ps;
+      mut_overlap ctx written;
       if labelled then begin
         e.edesc <- EMethod (recv, name, nsp, args);
         keep_order e written r
@@ -2010,6 +2087,9 @@ and check_method_value ?rt ctx f e recv name nsp args =
               Fun.protect ~finally:(fun () -> decr no_wait) (fun () -> expect ctx f a p)
             | _ -> expect ctx f a p)
           args ps;
+      (match (name, rt) with
+       | "push", TList _ | "remove", TMap _ -> mut_overlap ctx ~changed:recv args
+       | _ -> ());
       (match (name, rt) with
        | "sort", TList a -> (
          match unordered ctx a with
@@ -2131,6 +2211,36 @@ and mut_receiver ctx f key (recv : expr) =
       check_place ctx f recv;
       check_target ctx f recv;
       recv.edesc <- EMut { recv with edesc = recv.edesc }
+
+(* E0214: the `mut` places of one call, [changed] (the receiver of `push`
+   or `remove`) and the `mut` ones among [parts] (its receiver and
+   arguments, in written order), may not overlap, nor may a place that a
+   call inside them changes. *)
+and mut_overlap ctx ?changed parts =
+  let place (x : expr) = Option.map (fun p -> (x.espan, p)) (place_path x) in
+  let own =
+    Option.to_list (Option.bind changed place)
+    @ List.filter_map (fun (x : expr) -> match x.edesc with EMut _ -> place x | _ -> None) parts
+  in
+  let rec later seen = function
+    | [] -> ()
+    | (sp, p) :: rest ->
+      if List.exists (overlaps p) seen then
+        err ctx "E0214" sp "this `mut` argument overlaps another one of the same call"
+          ~notes:[ "a call changes each value through one `mut` argument: `mut p.x, mut p.y` are separate, but two elements of one list or map are not (take them out and put them back)" ];
+      later (p :: seen) rest
+  in
+  later [] own;
+  if own <> [] then begin
+    let inside (x : expr) = match x.edesc with EMut p -> List.concat_map changed_in (expr_kids p) | _ -> changed_in x in
+    let nested = (match changed with Some r -> List.concat_map changed_in (expr_kids r) | None -> []) @ List.concat_map inside parts in
+    List.iter
+      (fun (sp, p) ->
+        if List.exists (fun (_, q) -> overlaps p q) own then
+          err ctx "E0214" sp "this changes a value that the enclosing call also takes as `mut`"
+            ~notes:[ "make that call first, on its own line, and pass its result" ])
+      nested
+  end
 
 (* Can errors of type [e] become `dyn Error`? None if so, else why not. *)
 and error_conversion ctx e =
@@ -3220,7 +3330,8 @@ let check_fn ctx (d : fn_decl) (s : fsig) =
   eq_types := [];
   uses_here := [];
   cur_fn := d.fn_name;
-  cb_params := List.filter_map (fun (p, t) -> match repr t with TFn _ -> Some (p.prm_name, p.prm_span) | _ -> None) (zip d.fn_params s.ps);
+  (* a `mut` one is the caller's place: the function runs callbacks, pure if or not *)
+  cb_params := List.filter_map (fun (p, t) -> match repr t with TFn _ when not p.prm_mut -> Some (p.prm_name, p.prm_span) | _ -> None) (zip d.fn_params s.ps);
   cb_escaped := false;
   cb_passes := [];
   refs_here := [];
@@ -3740,6 +3851,7 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
       match Hashtbl.find_opt cb_uses d.fn_name with
       | Some (false, passes)
         when fns <> [] && authority_of s.ps = [] && d.fn_bounds = [] && not (List.exists has_chan s.ps)
+             && not (List.exists (fun (p, t) -> p.prm_mut && has_fn t) (zip d.fn_params s.ps))
              && List.for_all (fun t -> (match repr t with TFn _ -> true | _ -> false) || not (has_fn t)) s.ps ->
         Hashtbl.replace cond d.fn_name (fns, passes)
       | _ -> ())

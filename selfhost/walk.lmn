@@ -48,7 +48,7 @@ fn from(roots: List[ast.Expr]) -> List[ast.Expr] {
 
 // The expressions directly in a block: those of its statements, with the
 // statements of the blocks those hold, and its tail.
-fn block_kids(b: ast.Block) -> List[ast.Expr] {
+pub fn block_kids(b: ast.Block) -> List[ast.Expr] {
     b.stmts.flat_map(stmt) + maybe(b.tail)
 }
 
@@ -93,7 +93,7 @@ fn below(e: ast.Expr) -> List[ast.Expr] {
     }
 }
 
-fn sel_op(o: ast.SelOp) -> List[ast.Expr] {
+pub fn sel_op(o: ast.SelOp) -> List[ast.Expr] {
     match o {
         SelRecv(_, ch) => [ch],
         SelSend(ch, v) => [ch, v],

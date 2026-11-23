@@ -160,7 +160,7 @@ pub fn check_program(items: List[ast.Item], files: List[diag.Source], next_id: I
             _ => !st.subst.has_fn(t),
         })
         match st.cb_uses.get(f.decl.name) {
-            Some((false, passes)) if !fns.is_empty() && st.authority_of(f.sig.params).is_empty() && f.decl.bounds.is_empty() && plain && !f.sig.params.any(|t| st.subst.has_chan(t)) => {
+            Some((false, passes)) if !fns.is_empty() && st.authority_of(f.sig.params).is_empty() && f.decl.bounds.is_empty() && plain && !f.sig.params.any(|t| st.subst.has_chan(t)) && !f.decl.params.zip(f.sig.params).any(|x| x.0.mutable && st.subst.has_fn(x.1)) => {
                 cond[f.decl.name] = (fns, passes)
             },
             _ => {},
@@ -1101,8 +1101,9 @@ fn check_fn(cx: env.Cx, st: env.State, ds: Decls, d: ast.FnDecl, s: env.Sig) -> 
     st.eq_types = []
     st.uses_here = []
     st.cur_fn = d.name
+    // a `mut` one is the caller's place: the function runs callbacks, pure if or not
     st.cb_params = d.params.zip(s.params).flat_map(|x| match st.repr(x.1) {
-        TFn(..) => [(x.0.name, x.0.span)],
+        TFn(..) if !x.0.mutable => [(x.0.name, x.0.span)],
         _ => [],
     })
     st.cb_escaped = false
