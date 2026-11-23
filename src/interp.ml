@@ -659,6 +659,8 @@ let body_refs (d : fn_decl) =
   blk d.fn_body;
   (!names, !racy)
 
+let is_mut (a : Ast.expr) = match a.edesc with EMut _ -> true | _ -> false
+
 (* The list a variable is building, read without settling it: for reads
    that cannot keep the list (an element, its length). *)
 let peek env (e : Ast.expr) = match e.edesc with EVar n -> (match find_var env n with Some { contents = VBuf b } -> Some b | _ -> None) | _ -> None
@@ -2303,6 +2305,23 @@ let rec eval rt env e : value =
     | _ -> failwith "internal: bitwise not")
   | ENamed _ -> failwith "internal: the checker puts named arguments in order"
   | EMut _ -> failwith "internal: a mut argument outside a call"
+  | ECall (c, args) when List.exists is_mut args ->
+    (* a call with `mut` arguments: never kept, since it changes the caller *)
+    let d =
+      match c.ecallee with
+      | Some d -> d
+      | None -> ( match eval rt env c with VFn n -> Hashtbl.find rt.fns n | _ -> failwith "internal: a mut call of a value")
+    in
+    mut_call rt d (List.map (arg_cell rt env) args)
+  | EMethod (recv, name, _, args) when is_mut recv || List.exists is_mut args ->
+    let recv = arg_cell rt env recv in
+    let args = List.map (arg_cell rt env) args in
+    let d =
+      match !(fst recv) with
+      | VStruct (n, _) | VEnum (n, _, _) -> Hashtbl.find_opt rt.fns (n ^ "::" ^ name)
+      | _ -> None
+    in
+    (match d with Some d -> mut_call rt d (recv :: args) | None -> failwith ("internal: a mut call of method " ^ name))
   | ECall ({ ecallee = Some d; _ }, args) when d.fn_foreign = None -> (
     (* a call to a known top-level function: no name to look up *)
     let avs = List.map (eval rt env) args in
@@ -2707,6 +2726,17 @@ and call_fn rt d args =
   checkpoint ();
   let sc = scope () in
   List.iter2 (fun p a -> bind sc p.prm_name a) d.fn_params args;
+  run_body rt d sc
+
+(* A call whose parameters are bound to these cells: a `mut` parameter's
+   cell is the caller's own variable, or one written back to its place. *)
+and call_fn_cells rt d cells =
+  checkpoint ();
+  let sc = scope () in
+  List.iter2 (fun p c -> sc.vars <- (p.prm_name, c) :: sc.vars) d.fn_params cells;
+  run_body rt d sc
+
+and run_body rt d sc =
   match !keeping with
   | None -> ( try eval_block rt [ sc ] d.fn_body with Return v -> v)
   | saved -> (
@@ -2716,6 +2746,66 @@ and call_fn rt d args =
     | v -> keeping := saved; v
     | exception Return v -> keeping := saved; v
     | exception e -> keeping := saved; raise e)
+
+(* A call with `mut` arguments: each place gets what the callee wrote
+   however the call ends (a value, a return, a panic or a cancellation). *)
+and mut_call rt d cells =
+  Fun.protect ~finally:(fun () -> List.iter (fun (_, back) -> back ()) cells) (fun () -> call_fn_cells rt d (List.map fst cells))
+
+(* The cell an argument is passed in, and what to do once the call ends.
+   `mut x` passes the variable's own cell. `mut p` for a path evaluates
+   its indexes once, left to right, reads the place (panicking as reading
+   it does) into a fresh cell and writes that cell back to the place; the
+   caller's place cannot be seen during the call, so writing it back at
+   the end is the same as changing it in place. Any other argument is a
+   fresh cell holding its value. *)
+and arg_cell rt env (a : expr) =
+  match a.edesc with
+  | EMut { edesc = EVar n; _ } -> (
+    match find_var env n with Some r -> (r, ignore) | None -> failwith "internal: a mut variable")
+  | EMut p ->
+    let rec steps (x : expr) =
+      match x.edesc with
+      | EVar n -> ( match find_var env n with Some r -> (r, []) | None -> failwith "internal: a mut variable")
+      | EField (b, f, _) -> let r, ss = steps b in (r, `Field f :: ss)
+      | EIndex (b, i) -> let r, ss = steps b in (r, `Index (eval rt env i, x.espan) :: ss)
+      | _ -> failwith "internal: a mut place"
+    in
+    let root, rev_steps = steps p in
+    let path = List.rev rev_steps in
+    let get v = function
+      | `Field f -> field rt v f
+      | `Index (k, sp) -> (
+        match (v, k) with
+        | VMap mv, k -> (
+          match KM.find_opt (key_of k) mv.m with
+          | Some (_, x) -> x
+          | None -> raise (Panic (sprintf "key %s is not in the map" (show ~top:false k), sp)))
+        | VList arr, VInt i ->
+          if i < 0L || i >= Int64.of_int (Array.length arr) then
+            raise (Panic (sprintf "index %Ld is out of range for a list of length %d" i (Array.length arr), sp));
+          arr.(Int64.to_int i)
+        | _ -> failwith "internal: a mut index")
+    in
+    let rec put v path x =
+      match path with
+      | [] -> x
+      | (`Field f as s) :: rest -> (
+        match v with
+        | VStruct (sn, fs) -> VStruct (sn, List.map (fun (k, y) -> if same_name k f then (k, put (get v s) rest x) else (k, y)) fs)
+        | _ -> failwith "internal: a mut field")
+      | (`Index (k, _) as s) :: rest -> (
+        match (v, k) with
+        | VMap mv, k -> VMap (map_put mv k (put (get v s) rest x))
+        | VList arr, VInt i ->
+          let arr' = Array.copy arr in
+          arr'.(Int64.to_int i) <- put (get v s) rest x;
+          VList arr'
+        | _ -> failwith "internal: a mut index")
+    in
+    let cell = ref (List.fold_left get (settle root) path) in
+    (cell, fun () -> root := put (settle root) path (settle cell))
+  | _ -> (ref (eval rt env a), ignore)
 
 (* Pure: no task, select or channel anywhere it can reach, no C function,
    no interface bounds; together with plain argument types at the call,
