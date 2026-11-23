@@ -33,6 +33,74 @@ value limen_core_lines(value s) {
   CAMLreturn(out);
 }
 
+/* Copies s[start..start+len) into a new OCaml string. s is a root the
+   caller registered; it is read again after the allocation, which may move it. */
+static value core_sub(value s, size_t start, size_t len) {
+  CAMLparam1(s);
+  CAMLlocal1(piece);
+  piece = caml_alloc_string(len);
+  memcpy(Bytes_val(piece), String_val(s) + start, len);
+  CAMLreturn(piece);
+}
+
+value limen_core_split(value s, value sep) {
+  CAMLparam2(s, sep);
+  CAMLlocal2(out, piece);
+  size_t n = caml_string_length(s), m = caml_string_length(sep);
+  size_t pos = 0, start, len, count = 0;
+  while (lc_split_next(String_val(s), n, String_val(sep), m, &pos, &start, &len)) count++;
+  out = caml_alloc(count, 0);
+  pos = 0;
+  for (size_t i = 0; i < count; i++) {
+    /* String_val read afresh each time: the last piece may have moved them */
+    lc_split_next(String_val(s), n, String_val(sep), m, &pos, &start, &len);
+    piece = core_sub(s, start, len);
+    Store_field(out, i, piece);
+  }
+  CAMLreturn(out);
+}
+
+value limen_core_trim(value s) {
+  CAMLparam1(s);
+  size_t a, b;
+  lc_trim(String_val(s), caml_string_length(s), &a, &b);
+  CAMLreturn(core_sub(s, a, b - a));
+}
+
+value limen_core_chars(value s) {
+  CAMLparam1(s);
+  CAMLlocal2(out, piece);
+  size_t n = caml_string_length(s), count = 0;
+  for (size_t i = 0; i < n; count++) i += lc_utf8_len((const unsigned char *)String_val(s), i, n);
+  out = caml_alloc(count, 0);
+  size_t i = 0;
+  for (size_t c = 0; c < count; c++) {
+    size_t k = lc_utf8_len((const unsigned char *)String_val(s), i, n);
+    piece = core_sub(s, i, k);
+    Store_field(out, c, piece);
+    i += k;
+  }
+  CAMLreturn(out);
+}
+
+value limen_core_of_code(value cp) {
+  CAMLparam1(cp);
+  char b[4];
+  size_t k = lc_utf8_encode(Int64_val(cp), b);
+  /* b is on the C stack, so the GC cannot move it */
+  CAMLreturn(caml_alloc_initialized_string(k, b));
+}
+
+value limen_core_parse_int(value s) {
+  CAMLparam1(s);
+  CAMLlocal2(out, boxed);
+  int64_t v;
+  if (!lc_parse_int(String_val(s), caml_string_length(s), &v)) CAMLreturn(Val_none);
+  boxed = caml_copy_int64(v);
+  out = caml_alloc_some(boxed);
+  CAMLreturn(out);
+}
+
 /* Numeric stubs: no allocation, unboxed in native code, boxed _byte variants
    for bytecode. The int64 of u2f is the UInt's 64 bits. */
 double limen_core_u2f(int64_t x) { return lc_u2f((uint64_t)x); }

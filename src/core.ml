@@ -10,3 +10,20 @@ external f2i : (float [@unboxed]) -> (int64 [@unboxed]) = "limen_core_f2i_byte" 
 
 (* A UInt's 64 bits to the nearest Float, ties to even (lc_u2f). *)
 external u2f : (int64 [@unboxed]) -> (float [@unboxed]) = "limen_core_u2f_byte" "limen_core_u2f" [@@noalloc]
+
+(* [s] split on [sep] (lc_split_next): one piece per byte for an empty [sep],
+   else the pieces between non-overlapping occurrences, always at least one. *)
+external split : string -> string -> string array = "limen_core_split"
+
+(* [s] without leading and trailing space, \t, \n, \r and \f (lc_trim). *)
+external trim : string -> string = "limen_core_trim"
+
+(* [s]'s UTF-8 characters, a byte that starts none on its own (lc_utf8_len). *)
+external chars : string -> string array = "limen_core_chars"
+
+(* The UTF-8 encoding of a code point, U+FFFD for anything that is not one
+   (lc_utf8_encode). *)
+external of_code : int64 -> string = "limen_core_of_code"
+
+(* A decimal Int with an optional sign and surrounding spaces (lc_parse_int). *)
+external parse_int : string -> int64 option = "limen_core_parse_int"

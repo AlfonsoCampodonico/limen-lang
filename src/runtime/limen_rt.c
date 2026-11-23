@@ -514,14 +514,10 @@ W_RT int64_t Str_rfind(WStr *s, WStr *sub) {
   return -1;
 }
 W_RT L_Str *Str_split(WStr *s, WStr *sep) {
-  L_Str *out = L_Str_new(4);
-  if (sep->len == 0) {
-    for (int64_t i = 0; i < s->len; i++) L_Str_push(&out, Str_from(s->data + i, 1));
-    return out;
-  }
-  int64_t from = 0, i;
-  while ((i = Str_find(s, sep, from)) >= 0) { L_Str_push(&out, Str_from(s->data + from, i - from)); from = i + sep->len; }
-  L_Str_push(&out, Str_from(s->data + from, s->len - from));
+  L_Str *out = L_Str_new(sep->len == 0 ? s->len : 4);
+  size_t pos = 0, start, len;
+  while (lc_split_next(s->data, (size_t)s->len, sep->data, (size_t)sep->len, &pos, &start, &len))
+    L_Str_push(&out, Str_from(s->data + start, (int64_t)len));
   return out;
 }
 W_RT L_Str *Str_lines(WStr *s) {
@@ -532,10 +528,9 @@ W_RT L_Str *Str_lines(WStr *s) {
 }
 W_RT bool is_ws(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f'; }
 W_RT WStr *Str_trim(WStr *s) {
-  int64_t a = 0, b = s->len;
-  while (a < b && is_ws(s->data[a])) a++;
-  while (b > a && is_ws(s->data[b - 1])) b--;
-  return Str_from(s->data + a, b - a);
+  size_t a, b;
+  lc_trim(s->data, (size_t)s->len, &a, &b);
+  return Str_from(s->data + a, (int64_t)(b - a));
 }
 W_RT WStr *Str_map_case(WStr *s, bool upper) {
   WStr *r = Str_from(s->data, s->len);
@@ -555,27 +550,7 @@ W_RT WStr *Str_replace(WStr *s, WStr *a, WStr *b) {
 }
 W_RT bool Str_starts(WStr *s, WStr *p) { return p->len <= s->len && memcmp(s->data, p->data, (size_t)p->len) == 0; }
 W_RT bool Str_ends(WStr *s, WStr *p) { return p->len <= s->len && memcmp(s->data + s->len - p->len, p->data, (size_t)p->len) == 0; }
-/* Decimal integer with optional sign, surrounding whitespace allowed. */
-W_RT bool Str_parse_int(WStr *s, int64_t *out) {
-  int64_t a = 0, b = s->len;
-  while (a < b && is_ws(s->data[a])) a++;
-  while (b > a && is_ws(s->data[b - 1])) b--;
-  if (a == b) return false;
-  bool neg = false;
-  if (s->data[a] == '-' || s->data[a] == '+') { neg = s->data[a] == '-'; a++; }
-  if (a == b) return false;
-  uint64_t v = 0;
-  for (int64_t i = a; i < b; i++) {
-    char c = s->data[i];
-    if (c < '0' || c > '9') return false;
-    if (v > (UINT64_MAX - (uint64_t)(c - '0')) / 10) return false;
-    v = v * 10 + (uint64_t)(c - '0');
-  }
-  if (!neg && v > (uint64_t)INT64_MAX) return false;
-  if (neg && v > (uint64_t)INT64_MAX + 1) return false;
-  *out = neg ? (int64_t)(0 - v) : (int64_t)v;
-  return true;
-}
+W_RT bool Str_parse_int(WStr *s, int64_t *out) { return lc_parse_int(s->data, (size_t)s->len, out); }
 
 /* Byte offsets, clamped to the string. */
 W_RT WStr *Str_slice(WStr *s, int64_t lo, int64_t hi) {
@@ -622,27 +597,13 @@ W_RT int64_t Bytes_at(WStr *s, int64_t i, const char *where) {
   }
   return (int64_t)(unsigned char)s->data[i];
 }
-/* The length of the UTF-8 character at s[i], or 1 for a byte that does not
-   start a well-formed one (as Interp.utf8_len). */
-W_RT int64_t w_utf8_len(const unsigned char *s, int64_t i, int64_t n) {
-  unsigned char b = s[i];
-  int64_t k;
-  unsigned char lo = 0x80, hi = 0xBF;
-  if (b < 0x80) return 1;
-  else if (b >= 0xC2 && b <= 0xDF) k = 2;
-  else if (b >= 0xE0 && b <= 0xEF) { k = 3; if (b == 0xE0) lo = 0xA0; if (b == 0xED) hi = 0x9F; }
-  else if (b >= 0xF0 && b <= 0xF4) { k = 4; if (b == 0xF0) lo = 0x90; if (b == 0xF4) hi = 0x8F; }
-  else return 1;
-  if (i + k > n) return 1;
-  if (s[i + 1] < lo || s[i + 1] > hi) return 1;
-  for (int64_t j = 2; j < k; j++) if (s[i + j] < 0x80 || s[i + j] > 0xBF) return 1;
-  return k;
-}
+/* The length of the UTF-8 character at s[i] (lc_utf8_len). */
+W_RT int64_t w_utf8_len(const unsigned char *s, int64_t i, int64_t n) { return (int64_t)lc_utf8_len(s, (size_t)i, (size_t)n); }
 /* The characters (UTF-8 code points) of a string, each as a string. */
 W_RT L_Str *Str_chars(WStr *s) {
   L_Str *out = L_Str_new(s->len);
   for (int64_t i = 0; i < s->len;) {
-    int64_t k = w_utf8_len((const unsigned char *)s->data, i, s->len);
+    int64_t k = (int64_t)lc_utf8_len((const unsigned char *)s->data, (size_t)i, (size_t)s->len);
     L_Str_push(&out, Str_from(s->data + i, k));
     i += k;
   }
@@ -659,14 +620,9 @@ W_RT L_Int *L_Int_range(int64_t lo, int64_t hi) {
 }
 /* The UTF-8 encoding of a code point; U+FFFD for anything that is not one. */
 W_RT WStr *Int_to_char(int64_t n) {
-  if (n < 0 || n > 0x10FFFF || (n >= 0xD800 && n <= 0xDFFF)) n = 0xFFFD;
   char b[4];
-  int k;
-  if (n < 0x80) { b[0] = (char)n; k = 1; }
-  else if (n < 0x800) { b[0] = (char)(0xC0 | (n >> 6)); b[1] = (char)(0x80 | (n & 0x3F)); k = 2; }
-  else if (n < 0x10000) { b[0] = (char)(0xE0 | (n >> 12)); b[1] = (char)(0x80 | ((n >> 6) & 0x3F)); b[2] = (char)(0x80 | (n & 0x3F)); k = 3; }
-  else { b[0] = (char)(0xF0 | (n >> 18)); b[1] = (char)(0x80 | ((n >> 12) & 0x3F)); b[2] = (char)(0x80 | ((n >> 6) & 0x3F)); b[3] = (char)(0x80 | (n & 0x3F)); k = 4; }
-  return Str_from(b, k);
+  size_t k = lc_utf8_encode(n, b);
+  return Str_from(b, (int64_t)k);
 }
 /* Fixed-point text with [d] decimals (clamped to 0..30), rounded as printf
    does; the interpreter uses the same printf. */

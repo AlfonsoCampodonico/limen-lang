@@ -435,62 +435,16 @@ let find_last_sub s sub =
   let rec go i = if i < 0 then None else if String.sub s i m = sub then Some i else go (i - 1) in
   go (n - m)
 
-let split_on s sep =
-  if sep = "" then List.init (String.length s) (fun i -> String.make 1 s.[i])
-  else
-    let rec go from acc =
-      match find_sub s sep from with
-      | Some i -> go (i + String.length sep) (String.sub s from (i - from) :: acc)
-      | None -> List.rev (String.sub s from (String.length s - from) :: acc)
-    in
-    go 0 []
+let split_on s sep = Array.to_list (Core.split s sep)
 
 let replace_all s a b = if a = "" then s else String.concat b (split_on s a)
 
-(* Decimal only, optional sign, surrounding whitespace allowed (same as the C runtime). *)
 (* A decimal float: digits with optional sign, point and exponent; no hex, nan or inf. *)
 let parse_float s =
   let s = String.trim s in
   let ok_char c = (c >= '0' && c <= '9') || c = '.' || c = '-' || c = '+' || c = 'e' || c = 'E' in
   if s = "" || (not (String.for_all ok_char s)) || not (String.exists (fun c -> c >= '0' && c <= '9') s) then None
   else float_of_string_opt s
-
-(* The UTF-8 encoding of a code point; U+FFFD for anything that is not one. *)
-let utf8_of_code n =
-  let n = if n < 0 || n > 0x10FFFF || (n >= 0xD800 && n <= 0xDFFF) then 0xFFFD else n in
-  let b = Buffer.create 4 in
-  Buffer.add_utf_8_uchar b (Uchar.of_int n);
-  Buffer.contents b
-
-(* The length of the UTF-8 character at s.[i], or 1 for a byte that does not
-   start a well-formed one (as the native w_utf8_len). *)
-let utf8_len s i =
-  let n = String.length s in
-  let b = Char.code s.[i] in
-  let byte j = Char.code s.[j] in
-  let cont k lo hi =
-    if i + k > n then 1
-    else if byte (i + 1) < lo || byte (i + 1) > hi then 1
-    else if List.for_all (fun j -> byte (i + j) >= 0x80 && byte (i + j) <= 0xBF) (List.init (k - 2) (fun j -> j + 2)) then k
-    else 1
-  in
-  if b < 0x80 then 1
-  else if b >= 0xC2 && b <= 0xDF then cont 2 0x80 0xBF
-  else if b >= 0xE0 && b <= 0xEF then cont 3 (if b = 0xE0 then 0xA0 else 0x80) (if b = 0xED then 0x9F else 0xBF)
-  else if b >= 0xF0 && b <= 0xF4 then cont 4 (if b = 0xF0 then 0x90 else 0x80) (if b = 0xF4 then 0x8F else 0xBF)
-  else 1
-
-let chars s =
-  let rec go i acc = if i >= String.length s then List.rev acc else let k = utf8_len s i in go (i + k) (String.sub s i k :: acc) in
-  go 0 []
-
-let parse_decimal s =
-  let s = String.trim s in
-  let n = String.length s in
-  let start = if n > 0 && (s.[0] = '-' || s.[0] = '+') then 1 else 0 in
-  if n = start then None
-  else if String.exists (fun c -> c < '0' || c > '9') (String.sub s start (n - start)) then None
-  else Int64.of_string_opt s
 
 let vint n = VInt (Int64.of_int n)
 
@@ -499,8 +453,6 @@ let clamp (k : int64) n = if k < 0L then 0 else if k > Int64.of_int n then n els
 
 (* Float to Int, the C definition native code uses. *)
 let float_to_int = Core.f2i
-
-let strs l = VList (Array.of_list (List.map (fun s -> VStr s) l))
 
 (* ---------- evaluation ---------- *)
 
@@ -2971,15 +2923,15 @@ and call_method rt v name args sp =
   | VStr s, "len", [] -> vint (String.length s)
   | VStr s, "is_empty", [] -> VBool (s = "")
   | VStr s, "lines", [] -> VList (Array.map (fun l -> VStr l) (Core.lines s))
-  | VStr s, "split", [ VStr sep ] -> strs (split_on s sep)
-  | VStr s, "trim", [] -> VStr (String.trim s)
+  | VStr s, "split", [ VStr sep ] -> VList (Array.map (fun p -> VStr p) (Core.split s sep))
+  | VStr s, "trim", [] -> VStr (Core.trim s)
   | VStr s, "contains", [ VStr t ] -> VBool (find_sub s t 0 <> None)
   | VStr s, "starts_with", [ VStr t ] -> VBool (String.starts_with ~prefix:t s)
   | VStr s, "ends_with", [ VStr t ] -> VBool (String.ends_with ~suffix:t s)
   | VStr s, "to_upper", [] -> VStr (String.uppercase_ascii s)
   | VStr s, "to_lower", [] -> VStr (String.lowercase_ascii s)
   | VStr s, "replace", [ VStr a; VStr b ] -> VStr (replace_all s a b)
-  | VStr s, "parse_int", [] -> ( match parse_decimal s with Some n -> some (VInt n) | None -> none)
+  | VStr s, "parse_int", [] -> ( match Core.parse_int s with Some n -> some (VInt n) | None -> none)
   | VStr s, "parse_float", [] -> ( match parse_float s with Some x -> some (VFloat x) | None -> none)
   | VStr s, "slice", [ VInt lo; VInt hi ] ->
     let n = String.length s in
@@ -2988,7 +2940,7 @@ and call_method rt v name args sp =
     VStr (String.sub s lo (hi - lo))
   | VStr s, "index_of", [ VStr t ] -> ( match find_sub s t 0 with Some i -> some (vint i) | None -> none)
   | VStr s, "last_index_of", [ VStr t ] -> ( match find_last_sub s t with Some i -> some (vint i) | None -> none)
-  | VStr s, "chars", [] -> strs (chars s)
+  | VStr s, "chars", [] -> VList (Array.map (fun c -> VStr c) (Core.chars s))
   | VStr s, "to_bytes", [] -> VBytes s
   | VBytes b, "len", [] -> vint (String.length b)
   | VBytes b, "is_empty", [] -> VBool (b = "")
@@ -3001,7 +2953,7 @@ and call_method rt v name args sp =
   | VBytes b, "to_list", [] -> VList (Array.init (String.length b) (fun i -> vint (Char.code b.[i])))
   | VBytes b, "to_str", [] -> VStr b
   | VStr s, "bytes", [] -> VList (Array.init (String.length s) (fun i -> vint (Char.code s.[i])))
-  | VInt n, "to_char", [] -> VStr (utf8_of_code (if n < 0L || n > 0x10FFFFL then -1 else Int64.to_int n))
+  | VInt n, "to_char", [] -> VStr (Core.of_code n)
   | VInt a, "min", [ VInt b ] -> VInt (min a b)
   | VInt a, "max", [ VInt b ] -> VInt (max a b)
   | VInt n, "to_str", [] -> VStr (Int64.to_string n)

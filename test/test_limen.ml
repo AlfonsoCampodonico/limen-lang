@@ -671,6 +671,25 @@ fn walk(t: Tree) -> List[Int] {
     }
     out.print("{ok}")|})
     "300\n";
+  out "str-nul-builtins"
+    (main_wrap {|    let z = bytes([0]).to_str()
+    out.print("{("1" + z).parse_int()} {z.trim().len()} {("a" + z + "b").split(z)} {(z + "x" + z).chars().len()} {(" 7" + z).trim().len()}")|})
+    "None 1 [\"a\", \"b\"] 3 2\n";
+  out "str-split-gc"
+    (main_wrap {|    let mut parts: List[Str] = []
+    for i in 0..<1000 {
+        parts.push("x{i}")
+    }
+    let s = parts.join(",")
+    let c = parts.join("")
+    let mut ok = 0
+    for i in 0..<300 {
+        if s.split(",").join(",") == s && s.split(",").len() == 1000 && c.chars().join("") == c && c.split("").join("") == c {
+            ok = ok + 1
+        }
+    }
+    out.print("{ok}")|})
+    "300\n";
   out "numbers"
     (main_wrap {|    out.print("{7 / -2} {-7 % 3} {2.0 / 4.0} {1.0 / 3.0} {(2.7).to_int()} {(-3).abs()} {10.to_float() * 1.5} {0.1 + 0.2}")|})
     "-3 -1 0.5 0.333333333333333 2 3 15.0 0.3\n";
