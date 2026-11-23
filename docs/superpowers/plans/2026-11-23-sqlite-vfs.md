@@ -20,7 +20,7 @@
 - SQLite's functions reach C only through the `w_sql_api` table (`W_SQL_*` enum, `Ffi.sql_syms`, `ffi.sql_syms()`), in one order everywhere. No `sqlite3.h`; the VFS structs are declared by hand: `sqlite3_vfs` version 3, `sqlite3_io_methods` version 3.
 - SQLite 3.37 or later (the code already calls `sqlite3_changes64`, added in 3.37.0).
 - macOS and Linux, x86-64 and arm64; page sizes up to 64 KB (arm64 Linux kernels), so `-shm` regions are mapped in page-sized groups.
-- No new error codes or messages a program can see. The one visible change: a `-journal`, `-wal` or `-shm` that is a symlink is refused even when it points inside the grant, with the same `Denied` message as today.
+- No new error codes or messages a program can see. The one visible change: a `-journal`, `-wal` or `-shm` that is a symlink is refused even when it points inside the grant, with the message "sql: refusing to open `{name}`: `{name}{suffix}` is a symbolic link" (the spec changes the wording).
 - `sql.memory()` is unchanged (default VFS). Opening is not `blocking`: library `limen` helpers never are (`src/ffi.ml:375`); it runs on the calling task's thread, as an Fs operation does.
 - SPEC.md is updated where it describes this behaviour. The book (`~/Github/Personal/limen-book`) does not describe side files or links (ch14 line 132 says only that the database stays in the grant), so it needs no change; never push it.
 
