@@ -11755,6 +11755,43 @@ fn main(root: Root) {
   says "mut-closure" (main_wrap "    let f = |mut x: Int| x") "E0003" "a closure cannot take a `mut` parameter";
   says "mut-test-param" "test \"t\" (mut fs: Fs) {}\n" "E0003" "a test's parameters cannot be `mut`";
   errs "mut-outside-call" (main_wrap "    let mut x = 1\n    let y = mut x") [ "E0003" ];
+  let mut_decls = "struct Buf {\n    items: List[Int],\n}\n\nfn add(mut self: Buf, x: Int) {\n    self.items.push(x)\n}\n\nfn bump(mut n: Int) {\n    n = n + 1\n}\n\nfn plain(n: Int) -> Int {\n    n\n}\n\n" in
+  errs "mut-call-ok" (mut_decls ^ main_wrap "    let mut k = 0\n    bump(mut k)\n    let mut b = Buf { items: [1] }\n    b.add(1)\n    let mut bs = [b]\n    bs[0].add(2)\n    bump(mut bs[0].items[0])\n    let mut m = map([(\"a\", b)])\n    m[\"a\"].add(3)\n    bump(mut m[\"a\"].items[0])") [];
+  errs "mut-param-assign" "fn f(mut xs: List[Int]) {\n    xs = [1]\n    xs[0] = 2\n    xs.push(3)\n}\nfn main(root: Root) {}" [];
+  errs "mut-root-let" (mut_decls ^ main_wrap "    let k = 0\n    bump(mut k)") [ "E0205" ];
+  errs "mut-root-param" (mut_decls ^ "fn g(n: Int) {\n    bump(mut n)\n}\nfn main(root: Root) {}") [ "E0205" ];
+  errs "mut-in-closure" (mut_decls ^ main_wrap "    let mut k = 0\n    let f = || bump(mut k)") [ "E0205" ];
+  errs "mut-self-not-mut" (mut_decls ^ main_wrap "    let b = Buf { items: [] }\n    b.add(1)") [ "E0205" ];
+  errs "mut-not-place" (mut_decls ^ main_wrap "    bump(mut plain(1))") [ "E0209" ];
+  errs "mut-bytes" (mut_decls ^ main_wrap "    let mut bs = bytes([1])\n    bump(mut bs[0])") [ "E0209" ];
+  says "mut-missing" (mut_decls ^ main_wrap "    let mut k = 0\n    bump(k)") "E0213" "`bump` changes its parameter `n`, so the argument must be written with `mut`";
+  says "mut-extra" (mut_decls ^ main_wrap "    let mut k = 0\n    let j = plain(mut k)") "E0213" "`plain` does not change its parameter `n`, so the argument is written without `mut`";
+  says "mut-to-closure" (main_wrap "    let mut k = 0\n    let f = |n: Int| n\n    let j = f(mut k)") "E0213" "`mut` is only for an argument whose parameter is declared `mut`";
+  errs "mut-to-builtin" (main_wrap "    let mut k = 1\n    let ys = [1, 2].take(mut k)") [ "E0213" ];
+  errs "mut-piped" (mut_decls ^ main_wrap "    let mut k = 0\n    k |> bump") [ "E0213" ];
+  says "mut-exact-type" "interface Named {\n    fn name(self) -> Str\n}\nstruct P {\n    x: Int,\n}\nfn name(self: P) -> Str {\n    \"p\"\n}\nfn rename(mut n: dyn Named) {}\nfn main(root: Root) {\n    let mut p = P { x: 1 }\n    rename(mut p)\n}\n" "E0201" "a `mut` argument must have exactly the parameter's type";
+  says "mut-fn-value" (mut_decls ^ main_wrap "    let g = bump") "E0215" "`bump` has a `mut` parameter, so it can only be called, not used as a value";
+  says "mut-method-value" (mut_decls ^ main_wrap "    let mut b = Buf { items: [] }\n    let g = b.add") "E0215" "`add` has a `mut` parameter, so it can only be called, not used as a value";
+  errs "mut-main" "fn main(mut root: Root) {}" [ "E0303" ];
+  errs "mut-forwarder" "struct Inner {\n    n: Int,\n}\nfn bump(mut self: Inner) {\n    self.n = self.n + 1\n}\nstruct Outer {\n    Inner,\n}\nfn main(root: Root) {\n    let mut o = Outer { Inner: Inner { n: 0 } }\n    o.bump()\n}\n" [];
+  errs "mut-builtin-type-method" "fn bump(mut self: Int) {\n    self = self + 1\n}\nfn main(root: Root) {\n    let mut k = 0\n    k.bump()\n}\n" [];
+  (* the fixes: missing marker added, extra one removed, and the result checks clean *)
+  List.iter
+    (fun (name, body) ->
+      if selected name then begin
+        let src = mut_decls ^ main_wrap body in
+        let _, ds, _ = compile name src in
+        let fixed = apply_fixes src ds in
+        let _, ds2, _ = compile (name ^ "-fixed") fixed in
+        ok name (codes ds = [ "E0213" ] && Diag.errors ds2 = []) fixed
+      end)
+    [ ("mut-fix-missing", "    let mut k = 0\n    bump(k)"); ("mut-fix-extra", "    let mut k = 0\n    let j = plain(mut k)") ];
+  if selected "mut-no-fix-piped" then
+    ok "mut-no-fix-piped"
+      (let _, ds, _ = compile "mut-piped2" (mut_decls ^ main_wrap "    let mut k = 0\n    k |> bump") in
+       List.for_all (fun (d : Diag.t) -> d.fix = None) ds)
+      "a piped value got a fix";
+  ok "mut-explained" (List.for_all (fun c -> List.mem_assoc c Diag.explanations) [ "E0213"; "E0214"; "E0215" ]) "no explanation";
 
   drain ();
   Printf.printf "%d/%d passed\n" (!total - !failed) !total;

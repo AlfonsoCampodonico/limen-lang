@@ -882,6 +882,9 @@ fn signatures(cx: env.Cx, st: env.State, ds: Decls, items: List[ast.Item]) -> (e
             if d.params.any(|p| p.default.is_some()) {
                 cx.param_defaults[d.name] = d.params.map(|p| p.default)
             }
+            if d.params.any(|p| p.mutable) {
+                cx.param_muts[d.name] = d.params.map(|p| p.mutable)
+            }
         }
         st = check_self(cx, st, d, ps)
         let (declared, next) = resolve_bounds(cx, st, d.generics, d.bounds)
@@ -1031,7 +1034,7 @@ fn check_main(st: env.State, d: ast.FnDecl, s: env.Sig) -> env.State {
         TNamed("Result", [t, _]) => unit_or_int(t),
         _ => false,
     }
-    if !s.gen.is_empty() || !(ok_params && ok_ret) {
+    if !s.gen.is_empty() || !(ok_params && ok_ret) || d.params.any(|p| p.mutable) {
         return st.report(diag.error("E0303", d.span, "`main` has the wrong signature").note("write `fn main(root: Root)`, `fn main(root: Root) -> Int` (the exit code) or `fn main(root: Root) -> Result[(), E]`"))
     }
     st

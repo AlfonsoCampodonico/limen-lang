@@ -209,12 +209,19 @@ fn forwarder(structs: Map[Str, ast.StructDecl], s: ast.StructDecl, path: List[St
         recv = ast.Expr { desc: EField(recv, f, sp), span: sp, id }
     }
     let mut args: List[ast.Expr] = []
+    // a `mut` parameter is passed on as `mut`; the receiver takes the
+    // method's own `self`
     for p in params {
         id = id + 1
-        args.push(ast.Expr { desc: EVar(p.name), span: sp, id })
+        let mut arg = ast.Expr { desc: EVar(p.name), span: sp, id }
+        if p.mutable {
+            id = id + 1
+            arg = ast.Expr { desc: EMut(arg), span: sp, id }
+        }
+        args.push(arg)
     }
     let call = ast.Expr { desc: EMethod(recv, method_name(d.name), sp, args), span: sp, id: id + 1 }
-    let receiver = ast.Param { name: "self", span: sp, ty: named(s.name, s.generics.map(|g| named(g, []))), default: None, mutable: false }
+    let receiver = ast.Param { name: "self", span: sp, ty: named(s.name, s.generics.map(|g| named(g, []))), default: None, mutable: d.params.first().map(|p| p.mutable) ?? false }
     let f = { d with
         name: s.name + "::" + method_name(d.name),
         generics: s.generics + renamed.map(|r| r.1),

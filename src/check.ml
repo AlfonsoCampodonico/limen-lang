@@ -630,6 +630,25 @@ let param_names : (string, string list) Hashtbl.t = Hashtbl.create 64
    the function is declared. *)
 let param_defaults : (string, expr option list) Hashtbl.t = Hashtbl.create 64
 
+(* Which parameters are `mut`, keyed like [param_names] and in the same
+   order: only for the functions and methods with at least one. *)
+let param_muts : (string, bool list) Hashtbl.t = Hashtbl.create 16
+
+let has_mut key = List.mem true (Option.value ~default:[] (Hashtbl.find_opt param_muts key))
+
+(* A method [key] whose receiver is `mut self`. *)
+let mut_self key = match Hashtbl.find_opt param_muts key with Some (true :: _) -> true | _ -> false
+
+(* The text at [sp]. *)
+let source_of (sp : Span.t) =
+  match Source.text sp.file with
+  | Some src when sp.hi <= String.length src -> String.sub src sp.lo (sp.hi - sp.lo)
+  | _ -> ""
+
+(* The fix that takes the `mut` off argument [a], `mut x`. *)
+let remove_mut (a : expr) (x : expr) =
+  { Diag.fmsg = "remove `mut`"; edits = [ { Diag.at = { a.espan with hi = x.espan.lo }; replacement = "" } ] }
+
 let is_named (a : expr) = match a.edesc with ENamed _ -> true | _ -> false
 
 let unlabel (a : expr) = match a.edesc with ENamed (_, _, v) -> v | _ -> a
@@ -1055,7 +1074,12 @@ and check_expr_inner ctx f e : ty =
     err ctx "E0122" nsp (sprintf "`%s:` names a parameter, but this call takes its arguments by position" n)
       ~fix:{ Diag.fmsg = "remove the label"; edits = [ { Diag.at = { nsp with hi = x.espan.lo }; replacement = "" } ] };
     check_expr ctx f x
-  | EMut x -> check_expr ctx f x (* until `mut` arguments are checked: the place's type *)
+  | EMut x ->
+    (* a call to a function or method declared with `fn` checks its `mut`
+       arguments itself; any other callee has no `mut` parameter *)
+    err ctx "E0213" e.espan "`mut` is only for an argument whose parameter is declared `mut`, and this callee has none"
+      ~fix:(remove_mut e x);
+    check_expr ctx f x
   | EGroup (name, _, until, b) ->
     if !no_wait > 0 then update_waits ctx e.espan "a `group` waits for its tasks";
     let t = fresh () in
@@ -1225,6 +1249,10 @@ and check_var ctx f e n sp =
       err ctx "E0331" sp (sprintf "foreign function `%s` can only be called, not used as a value" n)
         ~notes:[ sprintf "wrap it in a closure, as in `|x| %s(foreign, x)`" n ];
       TErr
+    | Some _ when has_mut n && not direct ->
+      err ctx "E0215" sp (sprintf "`%s` has a `mut` parameter, so it can only be called, not used as a value" n)
+        ~notes:[ sprintf "a `mut` argument is a place, which only a direct call can pass: call `%s(...)` by name" n ];
+      TErr
     | Some s ->
       let env, t = instantiate s in
       e.einst <- env;
@@ -1263,7 +1291,14 @@ and check_var ctx f e n sp =
           did_you_mean ctx ~notes "E0101" sp (sprintf "unknown name `%s`" n) n (visible_names ctx f);
           TErr)))
 
-and check_args ctx f args = List.iter (fun a -> ignore (check_expr ctx f (unlabel a))) args
+(* Arguments checked anyway, where the call is already wrong: a `mut`
+   marker says nothing more there. *)
+and check_args ctx f args =
+  List.iter
+    (fun a ->
+      let a = unlabel a in
+      match a.edesc with EMut x -> a.ety <- check_expr ctx f x | _ -> ignore (check_expr ctx f a))
+    args
 
 (* Named arguments, `connect(host, retries: 3)`: positional arguments first,
    then named ones in any order, every parameter passed exactly once (there
@@ -1353,7 +1388,9 @@ and order_args ?(defaults = []) ctx ~what ~sp names args =
    `{ let $arg1 = first; let $arg2 = second; call($arg2, $arg1) }`, the lets
    in written order. Literals, names, closures and field reads have no
    effect, so they stay in place. [written] is the arguments as written,
-   after the receiver if there is one. *)
+   after the receiver if there is one. A `mut` argument stays in the call,
+   as the place it is; the indexes in it that have an effect are what moves,
+   the place reading their temporaries. *)
 and keep_order e written r =
   let rec pure (x : expr) =
     match x.edesc with
@@ -1362,9 +1399,17 @@ and keep_order e written r =
     | EField (a, _, _) | EDyn (a, _) -> pure a
     | _ -> false
   in
-  let effects = List.filter (fun x -> not (pure x)) written in
+  let rec place_effects (x : expr) =
+    match x.edesc with
+    | EField (a, _, _) -> place_effects a
+    | EIndex (a, i) -> place_effects a @ if pure i then [] else [ i ]
+    | _ -> []
+  in
+  let effects = List.concat_map (fun (x : expr) -> match x.edesc with EMut p -> place_effects p | _ -> if pure x then [] else [ x ]) written in
   let final = match e.edesc with ECall (_, xs) -> xs | EMethod (rv, _, _, xs) -> rv :: xs | _ -> [] in
-  let in_final = List.filter (fun x -> List.memq x effects) final in
+  let in_final =
+    List.concat_map (fun (x : expr) -> match x.edesc with EMut p -> place_effects p | _ -> if List.memq x effects then [ x ] else []) final
+  in
   if List.length in_final = List.length effects && not (List.for_all2 ( == ) in_final effects) then begin
     let temps =
       List.map (fun (x : expr) -> incr arg_counter; (x, sprintf "$arg%d" !arg_counter)) effects
@@ -1374,6 +1419,14 @@ and keep_order e written r =
       | Some n -> { edesc = EVar n; espan = x.espan; ety = x.ety; einst = []; ecallee = None }
       | None -> x
     in
+    (* a `mut` place reads the temporaries of its indexes *)
+    let rec place (x : expr) =
+      match x.edesc with
+      | EField (a, _, _) -> place a
+      | EIndex (a, i) -> place a; x.edesc <- EIndex (a, var i)
+      | _ -> ()
+    in
+    List.iter (fun (x : expr) -> match x.edesc with EMut p -> place p | _ -> ()) final;
     let desc =
       match e.edesc with
       | ECall (c, xs) -> ECall (c, List.map var xs)
@@ -1534,12 +1587,9 @@ and check_call ?want ctx f e callee args sp =
              | _ -> ())
            | _ -> ())
         | EVar g when (not (is_local f g)) && Hashtbl.mem ctx.fns g ->
-          (* a function parameter passed on: pure if the callee is, there *)
-          List.iteri
-            (fun k (a, p) ->
-              (match a.edesc with EVar _ -> arg_of := Some (g, k) | _ -> ());
-              Fun.protect ~finally:(fun () -> arg_of := None) (fun () -> expect ctx f a p))
-            (List.combine args ps)
+          let names = Option.value ~default:[] (Hashtbl.find_opt param_names g) in
+          let muts = Option.value ~default:[] (Hashtbl.find_opt param_muts g) in
+          check_fn_args ~passed_to:g ctx f ~who:g ~csp:callee.espan ~names ~muts args ps
         | _ -> List.iter2 (fun a p -> expect ctx f a p) args ps
       end;
       if labelled then begin
@@ -1604,6 +1654,7 @@ and field_of ctx f e recv t name nsp =
       let fs = struct_fields ctx n args in
       match List.assoc_opt name fs with
       | Some ft -> ft
+      | None when mut_method ctx t name nsp.file -> mut_value ctx name nsp
       | None ->
         let notes = if Hashtbl.mem ctx.fns (n ^ "::" ^ name) then [ sprintf "`%s` is a method; call it with parentheses: `.%s()`" name name ] else [] in
         did_you_mean ctx ~notes "E0103" nsp (sprintf "struct `%s` has no field `%s`" n name) name (List.map fst fs);
@@ -1620,6 +1671,7 @@ and field_of ctx f e recv t name nsp =
       err ctx "E0207" recv.espan "the type of this value is not known here; add a type annotation";
       TErr
     | _ when arity <> None -> method_value ctx f e recv t name nsp (Option.get arity)
+    | _ when mut_method ctx t name nsp.file -> mut_value ctx name nsp
     | t ->
       let notes =
         if List.mem_assoc name (methods t) then [ sprintf "`%s` changes its receiver in place, so it cannot be a value; call it as `%s(...)`" name name ] else []
@@ -1630,6 +1682,8 @@ and field_of ctx f e recv t name nsp =
 (* How many arguments (besides the receiver) method [name] of a value of
    type [t] takes, if it has one that can be used as a value. *)
 and method_arity ?(file = "") ctx t name =
+  if mut_method ctx t name file then None
+  else
   match builtin_method ctx t name file with
   | Some key -> Some (List.length (Hashtbl.find ctx.fns key).ps - 1)
   | None ->
@@ -1639,6 +1693,18 @@ and method_arity ?(file = "") ctx t name =
   | TParam g -> List.find_map (fun b -> Option.map (fun (ps, _) -> List.length ps) (List.assoc_opt name (iface_methods b))) (bounds_of g)
   | (TList _ | TMap _) when name = "push" || name = "remove" -> None (* they change the receiver *)
   | t -> Option.map (fun mk -> List.length (fst (mk ()))) (List.assoc_opt name (methods t))
+
+(* Whether method [name] of a value of type [t] has a `mut` parameter: it
+   can only be called. *)
+and mut_method ctx t name file =
+  match builtin_method ctx t name file with
+  | Some key -> has_mut key
+  | None -> ( match repr t with TNamed (n, _) when builtin_tname t = None -> has_mut (n ^ "::" ^ name) | _ -> false)
+
+and mut_value ctx name nsp =
+  err ctx "E0215" nsp (sprintf "`%s` has a `mut` parameter, so it can only be called, not used as a value" name)
+    ~notes:[ sprintf "a `mut` argument is a place, which only a direct call can pass: call `.%s(...)` on the value" name ];
+  TErr
 
 (* `x.name` without a call, where `name` is a method: a closure that calls it
    on the value `x` had when the expression ran, as if written
@@ -1702,7 +1768,16 @@ and check_method ctx f e recv name nsp args =
 
 (* [rt]: the receiver's type, when [recv] is already checked *)
 and check_method_value ?rt ctx f e recv name nsp args =
-  let rt = repr (match rt with Some t -> t | None -> check_expr ctx f recv) in
+  let rt =
+    match (rt, recv.edesc) with
+    | Some t, _ -> repr t
+    | None, EMut x ->
+      (* checked again (a table test's copy): the receiver of a `mut self` method *)
+      let t = check_expr ctx f x in
+      recv.ety <- t;
+      repr t
+    | None, _ -> repr (check_expr ctx f recv)
+  in
   let name =
     match rt with
     | TNamed ("Result", _) when name = "map_err" ->
@@ -1769,6 +1844,7 @@ and check_method_value ?rt ctx f e recv name nsp args =
     match t with
     | TFn (p0 :: ps, r) -> (
       unify_at ctx recv.espan p0 rt;
+      mut_receiver ctx f key recv;
       match order_args ~defaults:(method_defaults key) ctx ~what:(sprintf "method `%s`" name) ~sp:nsp (method_params key) args with
       | None -> check_args ctx f args; r
       | Some args' ->
@@ -1780,7 +1856,7 @@ and check_method_value ?rt ctx f e recv name nsp args =
              (plural (List.length ps)) (List.length args) (if List.length args = 1 then "was" else "were"));
         check_args ctx f args
       end
-      else List.iter2 (fun a p -> expect ctx f a p) args ps;
+      else check_method_args ctx f key name nsp args ps;
       e.edesc <- ECall ({ edesc = EVar key; espan = nsp; ety = t; einst = env; ecallee = None }, recv :: args);
       if labelled then keep_order e written r;
       r)
@@ -1807,6 +1883,7 @@ and check_method_value ?rt ctx f e recv name nsp args =
     match t with
     | TFn (p0 :: ps, r) -> (
       unify_at ctx recv.espan p0 rt;
+      mut_receiver ctx f (n ^ "::" ^ name) recv;
       match
         order_args ~defaults:(method_defaults (n ^ "::" ^ name)) ctx ~what:(sprintf "method `%s`" name) ~sp:nsp
           (method_params (n ^ "::" ^ name)) args
@@ -1821,7 +1898,7 @@ and check_method_value ?rt ctx f e recv name nsp args =
              (plural (List.length ps)) (List.length args) (if List.length args = 1 then "was" else "were"));
         check_args ctx f args
       end
-      else List.iter2 (fun a p -> expect ctx f a p) args ps;
+      else check_method_args ctx f (n ^ "::" ^ name) name nsp args ps;
       if labelled then begin
         e.edesc <- EMethod (recv, name, nsp, args);
         keep_order e written r
@@ -1966,6 +2043,83 @@ and check_place ctx f e =
     | None -> err ctx "E0209" e.espan "this cannot be assigned to")
   | EField (r, _, _) | EIndex (r, _) -> check_place ctx f r
   | _ -> err ctx "E0209" e.espan "only variables, fields and list elements can be assigned to"
+
+(* What cannot be changed in place even though it is a place: the target
+   of an assignment or a `mut` argument, after it is checked. *)
+and check_target ctx _f (lhs : expr) =
+  match lhs.edesc with
+  | EBlock _ -> err ctx "E0209" lhs.espan "a method cannot be assigned to"
+  | EIndex (b, _) when repr b.ety = TBytes ->
+    err ctx "E0209" lhs.espan "`Bytes` cannot be changed in place"
+      ~notes:[ "build a new value: `b.slice(0, i) + bytes([x]) + b.slice(i + 1, b.len())`" ]
+  | _ -> ()
+
+(* The arguments of a call to a function or method declared with `fn`, in
+   parameter order, checked against its parameter types [ps]: a `mut`
+   parameter takes a `mut` place, and only it does. [who] names the callee,
+   written at [csp]; [names] and [muts] are its parameters' names and which
+   of them are `mut`. *)
+and check_fn_args ?passed_to ctx f ~who ~csp ~names ~muts args ps =
+  let nth l k d = Option.value ~default:d (List.nth_opt l k) in
+  List.iteri
+    (fun k ((a : expr), p) ->
+      let pn = nth names k "" in
+      match (a.edesc, nth muts k false) with
+      | EMut x, true -> check_mut_arg ctx f a x p
+      | EMut x, false ->
+        err ctx "E0213" a.espan
+          (sprintf "`%s` does not change its parameter `%s`, so the argument is written without `mut`" who pn)
+          ~fix:(remove_mut a x);
+        expect ctx f x p;
+        a.ety <- p
+      | _, m ->
+        if m then begin
+          (* a value piped in starts before the callee *)
+          let piped = a.espan.lo < csp.Span.lo in
+          let fix =
+            match a.edesc with
+            | (EVar _ | EField _ | EIndex _) when not piped ->
+              Some { Diag.fmsg = "add `mut`"; edits = [ { Diag.at = Span.at_start a.espan; replacement = "mut " } ] }
+            | _ -> None
+          in
+          let notes =
+            if piped then [ sprintf "a value piped with `|>` cannot be passed as `mut`; call `%s(mut %s)`" who (source_of a.espan) ] else []
+          in
+          err ctx ?fix ~notes "E0213" a.espan
+            (sprintf "`%s` changes its parameter `%s`, so the argument must be written with `mut`" who pn)
+        end;
+        (* a function parameter passed on: pure if the callee is, there *)
+        (match (passed_to, a.edesc) with Some g, EVar _ -> arg_of := Some (g, k) | _ -> ());
+        Fun.protect ~finally:(fun () -> arg_of := None) (fun () -> expect ctx f a p))
+    (List.combine args ps)
+
+(* A method's arguments after the receiver; [key] is `Type::name`. *)
+and check_method_args ctx f key name nsp args ps =
+  let names = match method_params key with Ok ns -> ns | Error _ -> [] in
+  let muts = match Hashtbl.find_opt param_muts key with Some (_ :: ms) -> ms | _ -> [] in
+  check_fn_args ctx f ~who:name ~csp:nsp ~names ~muts args ps
+
+(* `mut x` for a `mut` parameter: [x] is a place the caller may change,
+   of exactly the parameter's type (no conversion makes a place). *)
+and check_mut_arg ctx f (a : expr) (x : expr) p =
+  check_place ctx f x;
+  let t = check_expr ctx f x in
+  check_target ctx f x;
+  (try unify p t
+   with Mismatch ->
+     err ctx "E0201" x.espan
+       (sprintf "a `mut` argument must have exactly the parameter's type: expected `%s`, found `%s`" (show p) (show t)));
+  a.ety <- p
+
+(* The receiver of a call to method [key]: for `mut self`, a place the
+   caller may change, which the backends see as `mut recv`. *)
+and mut_receiver ctx f key (recv : expr) =
+  if mut_self key then
+    match recv.edesc with
+    | EMut x -> check_place ctx f x (* checked again: a table test's copy *)
+    | _ ->
+      check_place ctx f recv;
+      recv.edesc <- EMut { recv with edesc = recv.edesc }
 
 (* Can errors of type [e] become `dyn Error`? None if so, else why not. *)
 and error_conversion ctx e =
@@ -2818,12 +2972,7 @@ and check_stmt ctx f s : bool =
     check_place ctx f lhs;
     let is_group = match lhs.edesc with EVar n -> (match lookup f n with Some (v, _) -> v.vkind = KGroup | None -> false) | _ -> false in
     let lt = if is_group then TErr else check_expr ctx f lhs in
-    (match lhs.edesc with
-     | EBlock _ -> err ctx "E0209" lhs.espan "a method cannot be assigned to"
-     | EIndex (b, _) when repr b.ety = TBytes ->
-       err ctx "E0209" lhs.espan "`Bytes` cannot be changed in place"
-         ~notes:[ "build a new value: `b.slice(0, i) + bytes([x]) + b.slice(i + 1, b.len())`" ]
-     | _ -> ());
+    check_target ctx f lhs;
     expect ctx f rhs lt;
     false
   | SExpr e -> ignore (check_expr ctx f e); false
@@ -2891,7 +3040,7 @@ let check_main ctx (d : fn_decl) (s : fsig) =
     | TNamed ("Result", [ t; _ ]) -> (match repr t with TUnit | TInt -> true | _ -> false)
     | _ -> false
   in
-  if s.gen <> [] || not (ok_params && ok_ret) then
+  if s.gen <> [] || not (ok_params && ok_ret) || List.exists (fun p -> p.prm_mut) d.fn_params then
     err ctx "E0303" d.fn_span "`main` has the wrong signature"
       ~notes:[ "write `fn main(root: Root)`, `fn main(root: Root) -> Int` (the exit code) or `fn main(root: Root) -> Result[(), E]`" ]
 
@@ -3232,6 +3381,7 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
       user_items;
   Hashtbl.reset param_names;
   Hashtbl.reset param_defaults;
+  Hashtbl.reset param_muts;
   Hashtbl.reset ifaces;
   List.iter (fun b -> Hashtbl.replace ifaces b []) builtin_bounds;
   Hashtbl.reset fn_bounds;
@@ -3461,6 +3611,8 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
           let s = { gen = d.fn_gen; ps; ret } in
           if d.fn_foreign = None && not (Hashtbl.mem ctx.fns d.fn_name) then
             Hashtbl.replace param_names d.fn_name (List.map (fun p -> p.prm_name) d.fn_params);
+          if d.fn_foreign = None && (not (Hashtbl.mem ctx.fns d.fn_name)) && List.exists (fun p -> p.prm_mut) d.fn_params then
+            Hashtbl.replace param_muts d.fn_name (List.map (fun p -> p.prm_mut) d.fn_params);
           if d.fn_foreign = None && (not (Hashtbl.mem ctx.fns d.fn_name)) && List.exists (fun p -> p.prm_default <> None) d.fn_params then
             Hashtbl.replace param_defaults d.fn_name (List.map (fun p -> p.prm_default) d.fn_params);
           check_self ctx d ps;

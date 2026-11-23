@@ -1,0 +1,80 @@
+// `mut` parameters and arguments that check: places through fields,
+// elements and map entries, `mut self` receivers, forwarders, a method on
+// a built-in type, and labels that move arguments past a `mut` place
+struct Buf {
+    items: List[Int],
+}
+
+fn add(mut self: Buf, x: Int) {
+    self.items.push(x)
+}
+
+fn bump(mut n: Int) {
+    n = n + 1
+}
+
+fn plain(n: Int) -> Int {
+    n
+}
+
+fn f(mut xs: List[Int]) {
+    xs = [1]
+    xs[0] = 2
+    xs.push(3)
+    f(mut xs)
+}
+
+struct Inner {
+    n: Int,
+}
+
+fn grow(mut self: Inner, by: Int) {
+    self.n = self.n + by
+}
+
+fn give(self: Inner, mut n: Int) {
+    n = n + self.n
+}
+
+struct Outer {
+    Inner,
+}
+
+fn twice(mut self: Int) {
+    self = self * 2
+}
+
+fn put(a: Int, mut xs: List[Int], b: Int) {
+    xs.push(a + b)
+}
+
+fn idx() -> Int {
+    0
+}
+
+fn calls() {
+    let mut k = 0
+    bump(mut k)
+    let mut b = Buf { items: [1] }
+    b.add(1)
+    let mut bs = [b]
+    bs[0].add(2)
+    bump(mut bs[0].items[0])
+    let mut m = map([("a", b)])
+    m["a"].add(3)
+    bump(mut m["a"].items[0])
+    let mut o = Outer { Inner: Inner { n: 0 } }
+    o.grow(2)
+    o.Inner.grow(by: 1)
+    o.give(mut k)
+    k.twice()
+    let mut ls = [[1]]
+    put(b: idx(), xs: mut ls[idx()], a: idx() + 1)
+    put(1, mut ls[0], 2)
+    bs[idx()].add(x: plain(1))
+    let j = plain(k)
+}
+
+fn main(root: Root) {
+    calls()
+}

@@ -154,8 +154,12 @@ fn inner(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr) -> (types.Ty, env.S
             let d = diag.error("E0122", nsp, "`{n}:` names a parameter, but this call takes its arguments by position").fix("remove the label", { nsp with hi: x.span.lo }, "")
             check_expr(st.report(d), cx, fx, x)
         },
-        // until `mut` arguments are checked: the place's type
-        EMut(x) => check_expr(st, cx, fx, x),
+        // a call to a function or method declared with `fn` checks its
+        // `mut` arguments itself; any other callee has no `mut` parameter
+        EMut(x) => {
+            let d = diag.error("E0213", e.span, "`mut` is only for an argument whose parameter is declared `mut`, and this callee has none").fix("remove `mut`", { e.span with hi: x.span.lo }, "")
+            check_expr(st.report(d), cx, fx, x)
+        },
         EGroup(name, _, until, b) => {
             let (t, next) = st.fresh()
             st = next
@@ -547,6 +551,10 @@ fn check_var(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, n: Str, sp: ast
             let d = diag.error("E0331", sp, "foreign function `{n}` can only be called, not used as a value").note("wrap it in a closure, as in `|x| {n}(foreign, x)`")
             return (TErr, st.report(d))
         },
+        Some(_) if cx.has_mut(n) && !direct => {
+            let d = diag.error("E0215", sp, "`{n}` has a `mut` parameter, so it can only be called, not used as a value").note("a `mut` argument is a place, which only a direct call can pass: call `{n}(...)` by name")
+            return (TErr, st.report(d))
+        },
         Some(s) => {
             let (inst, t, next) = instantiate(st, s)
             st = next.set_inst(e, inst)
@@ -681,11 +689,22 @@ fn struct_fields(st: env.State, cx: env.Cx, n: Str, args: List[types.Ty]) -> Lis
     (cx.sfields.get(n) ?? []).map(|f| (f.0, st.subst(inst, f.1)))
 }
 
+// Arguments checked anyway, where the call is already wrong: a `mut`
+// marker says nothing more there.
 fn check_args(st: env.State, cx: env.Cx, fx: env.Fx, args: List[ast.Expr]) -> env.State {
     let mut st = st
     for a in args {
-        let (_, next) = check_expr(st, cx, fx, unlabel(st, a))
-        st = next
+        let x = unlabel(st, a)
+        match st.desc(x) {
+            EMut(p) => {
+                let (t, next) = check_expr(st, cx, fx, p)
+                st = next.set_type(x, t)
+            },
+            _ => {
+                let (_, next) = check_expr(st, cx, fx, x)
+                st = next
+            },
+        }
     }
     st
 }
@@ -835,17 +854,25 @@ fn order_args(st: env.State, what: Str, sp: ast.Span, names: Result[List[Str], S
 // `{ let $arg1 = first; let $arg2 = second; call($arg2, $arg1) }`, the lets
 // in written order. Literals, names, closures and field reads have no
 // effect, so they stay in place. `written` is the arguments as written,
-// after the receiver if there is one.
+// after the receiver if there is one. A `mut` argument stays in the call,
+// as the place it is; the indexes in it that have an effect are what
+// moves, the place reading their temporaries.
 fn keep_order(st: env.State, e: ast.Expr, written: List[ast.Expr], r: types.Ty) -> env.State {
     let mut st = st
-    let effects = written.filter(|x| !pure(st, x))
+    let effects = written.flat_map(|x| match st.desc(x) {
+        EMut(p) => place_effects(st, p),
+        _ => if pure(st, x) { [] } else { [x] },
+    })
     let ids = effects.map(|x| x.id)
     let call_args = match st.desc(e) {
         ECall(_, xs) => xs,
         EMethod(rv, _, _, xs) => [rv] + xs,
         _ => [],
     }
-    let in_call = call_args.filter(|x| ids.contains(x.id)).map(|x| x.id)
+    let in_call = call_args.flat_map(|x| match st.desc(x) {
+        EMut(p) => place_effects(st, p).map(|y| y.id),
+        _ => if ids.contains(x.id) { [x.id] } else { [] },
+    })
     if in_call.len() != ids.len() || in_call == ids {
         return st
     }
@@ -862,6 +889,15 @@ fn keep_order(st: env.State, e: ast.Expr, written: List[ast.Expr], r: types.Ty) 
         vars.push((x.id, v))
     }
     let var = |x: ast.Expr| vars.find(|v| v.0 == x.id).map(|v| v.1) ?? x
+    // a `mut` place reads the temporaries of its indexes
+    for x in call_args {
+        match st.desc(x) {
+            EMut(p) => {
+                st = place_reads(st, p, vars)
+            },
+            _ => {},
+        }
+    }
     let desc = match st.desc(e) {
         ECall(c, xs) => ECall(c, xs.map(var)),
         EMethod(rv, m, nsp, xs) => EMethod(var(rv), m, nsp, xs.map(var)),
@@ -872,6 +908,27 @@ fn keep_order(st: env.State, e: ast.Expr, written: List[ast.Expr], r: types.Ty) 
     st = st.set_inst(call, st.inst_of(e))
     let lets = effects.map(|x| ast.Stmt { desc: SLet(false, temps.find(|t| t.0 == x.id).map(|t| t.1) ?? "", x.span, None, x), span: x.span })
     st.rewrite(e, EBlock(ast.Block { stmts: lets, tail: Some(call), span: e.span }))
+}
+
+// The indexes in a `mut` place that have an effect, in written order.
+fn place_effects(st: env.State, x: ast.Expr) -> List[ast.Expr] {
+    match st.desc(x) {
+        EField(a, _, _) => place_effects(st, a),
+        EIndex(a, i) => place_effects(st, a) + if pure(st, i) { [] } else { [i] },
+        _ => [],
+    }
+}
+
+// A `mut` place with its indexes reading their temporaries, `vars`.
+fn place_reads(st: env.State, x: ast.Expr, vars: List[(Int, ast.Expr)]) -> env.State {
+    match st.desc(x) {
+        EField(a, _, _) => place_reads(st, a, vars),
+        EIndex(a, i) => {
+            let st = place_reads(st, a, vars)
+            st.rewrite(x, EIndex(a, vars.find(|v| v.0 == i.id).map(|v| v.1) ?? i))
+        },
+        _ => st,
+    }
 }
 
 fn pure(st: env.State, x: ast.Expr) -> Bool {
@@ -1077,15 +1134,15 @@ fn check_call(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, callee: ast.Ex
                     EVar(g) if !foreign && !fx.is_local(g) && cx.fns.contains(g) => Some(g),
                     _ => None,
                 }
-                for (k, (a, p)) in args2.zip(ps).with_index() {
-                    match (passed_to, st.desc(a)) {
-                        (Some(g), EVar(_)) => {
-                            st.arg_of = Some((g, k))
-                        },
-                        _ => {},
-                    }
-                    st = expect(st, cx, fx, a, p)
-                    st.arg_of = None
+                match passed_to {
+                    Some(g) => {
+                        st = check_fn_args(st, cx, fx, passed_to, g, callee.span, cx.param_names.get(g) ?? [], cx.param_muts.get(g) ?? [], args2, ps)
+                    },
+                    None => {
+                        for (a, p) in args2.zip(ps) {
+                            st = expect(st, cx, fx, a, p)
+                        }
+                    },
                 }
                 if foreign {
                     st = check_callbacks(st, cx, fx, args2, ps)
@@ -1234,6 +1291,11 @@ fn field_of(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv: ast.Expr, 
                 None => match arity {
                     Some(k) => method_value(st, cx, fx, e, recv, t, name, nsp, k),
                     None => {
+                        let (is_mut, next) = mut_method(st, cx, nsp.file, t, name)
+                        st = next
+                        if is_mut {
+                            return mut_value(st, name, nsp)
+                        }
                         let mut d = diag.error("E0103", nsp, "struct `{n}` has no field `{name}`")
                         if cx.fns.contains(n + "::" + name) {
                             d = d.note("`{name}` is a method; call it with parentheses: `.{name}()`")
@@ -1255,6 +1317,11 @@ fn field_of(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv: ast.Expr, 
         _ => match arity {
             Some(k) => method_value(st, cx, fx, e, recv, t, name, nsp, k),
             None => {
+                let (is_mut, next) = mut_method(st, cx, nsp.file, t, name)
+                st = next
+                if is_mut {
+                    return mut_value(st, name, nsp)
+                }
                 let mut d = diag.error("E0103", nsp, "`{st.show(rt)}` has no field `{name}`")
                 if builtins.names(rt).contains(name) {
                     d = d.note("`{name}` changes its receiver in place, so it cannot be a value; call it as `{name}(...)`")
@@ -1268,6 +1335,10 @@ fn field_of(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv: ast.Expr, 
 // How many arguments (besides the receiver) method `name` of a value of
 // type `t` takes, if it has one that can be used as a value.
 fn method_arity(st: env.State, cx: env.Cx, file: Int, t: types.Ty, name: Str) -> (Option[Int], env.State) {
+    let (is_mut, st) = mut_method(st, cx, file, t, name)
+    if is_mut {
+        return (None, st)
+    }
     let (key, st) = builtin_method(st, cx, t, name, file)
     match key {
         Some(k) => {
@@ -1297,6 +1368,24 @@ fn method_arity(st: env.State, cx: env.Cx, file: Int, t: types.Ty, name: Str) ->
         _ => builtins.find(rt, TErr, name).map(|m| m.params.len()),
     }
     (arity, st)
+}
+
+// Whether method `name` of a value of type `t` has a `mut` parameter: it
+// can only be called.
+fn mut_method(st: env.State, cx: env.Cx, file: Int, t: types.Ty, name: Str) -> (Bool, env.State) {
+    let (key, st) = builtin_method(st, cx, t, name, file)
+    match key {
+        Some(k) => (cx.has_mut(k), st),
+        None => match st.repr(t) {
+            TNamed(n, _) if builtins.type_name(st.repr(t)).is_none() => (cx.has_mut(n + "::" + name), st),
+            _ => (false, st),
+        },
+    }
+}
+
+fn mut_value(st: env.State, name: Str, nsp: ast.Span) -> (types.Ty, env.State) {
+    let d = diag.error("E0215", nsp, "`{name}` has a `mut` parameter, so it can only be called, not used as a value").note("a `mut` argument is a place, which only a direct call can pass: call `.{name}(...)` on the value")
+    (TErr, st.report(d))
 }
 
 // `x.name` without a call, where `name` is a method: a closure that calls
@@ -1512,7 +1601,8 @@ fn check_method(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv: ast.Ex
 // The arguments of a method call after the receiver: put in parameter
 // order, counted, and checked against the parameter types `ps`. Returns
 // them, or None when order_args reported a problem with the labels.
-fn method_args(st: env.State, cx: env.Cx, fx: env.Fx, name: Str, nsp: ast.Span, names: Result[List[Str], Str], defaults: List[Option[ast.Expr]], args: List[ast.Expr], ps: List[types.Ty]) -> (Option[List[ast.Expr]], env.State) {
+// `key` is the method's `Type::name`, or "" for an interface's.
+fn method_args(st: env.State, cx: env.Cx, fx: env.Fx, key: Str, name: Str, nsp: ast.Span, names: Result[List[Str], Str], defaults: List[Option[ast.Expr]], args: List[ast.Expr], ps: List[types.Ty]) -> (Option[List[ast.Expr]], env.State) {
     let (ordered, st) = order_args(st, "method `{name}`", nsp, names, defaults, args)
     let args2 = match ordered {
         None => {
@@ -1525,10 +1615,12 @@ fn method_args(st: env.State, cx: env.Cx, fx: env.Fx, name: Str, nsp: ast.Span, 
         let k = ps.len()
         st = st.report(diag.error("E0107", nsp, "method `{name}` takes {k} argument{env.plural(k)} besides `self`, but {args2.len()} {env.was_were(args2.len())} supplied"))
         st = check_args(st, cx, fx, args2)
-    } else {
+    } else if key == "" {
         for (a, p) in args2.zip(ps) {
             st = expect(st, cx, fx, a, p)
         }
+    } else {
+        st = check_method_args(st, cx, fx, key, name, nsp, args2, ps)
     }
     (Some(args2), st)
 }
@@ -1538,10 +1630,19 @@ fn check_method_value(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv: 
     let mut st = st
     let rt = match rt {
         Some(t) => st.repr(t),
-        None => {
-            let (t, next) = check_expr(st, cx, fx, recv)
-            st = next
-            st.repr(t)
+        None => match st.desc(recv) {
+            // checked again (a table test's copy): the receiver of a `mut
+            // self` method
+            EMut(x) => {
+                let (t, next) = check_expr(st, cx, fx, x)
+                st = next.set_type(recv, t)
+                st.repr(t)
+            },
+            _ => {
+                let (t, next) = check_expr(st, cx, fx, recv)
+                st = next
+                st.repr(t)
+            },
         },
     }
     let mut name = name
@@ -1584,8 +1685,8 @@ fn check_method_value(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv: 
             st = add_bounds(next, cx, key, inst, nsp)
             match t {
                 TFn([p0, ..ps], r) => {
-                    st = st.unify_at(recv.span, p0, rt)
-                    let (ordered, next) = method_args(st, cx, fx, name, nsp, method_params(cx, key), method_defaults(cx, key), args, ps)
+                    st = mut_receiver(st.unify_at(recv.span, p0, rt), cx, fx, key, recv)
+                    let (ordered, next) = method_args(st, cx, fx, key, name, nsp, method_params(cx, key), method_defaults(cx, key), args, ps)
                     st = next
                     match ordered {
                         Some(args2) => {
@@ -1637,8 +1738,8 @@ fn check_method_value(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv: 
             }
             match t {
                 TFn([p0, ..ps], r) => {
-                    st = st.unify_at(recv.span, p0, rt)
-                    let (ordered, next) = method_args(st, cx, fx, name, nsp, method_params(cx, key), method_defaults(cx, key), args, ps)
+                    st = mut_receiver(st.unify_at(recv.span, p0, rt), cx, fx, key, recv)
+                    let (ordered, next) = method_args(st, cx, fx, key, name, nsp, method_params(cx, key), method_defaults(cx, key), args, ps)
                     st = next
                     match ordered {
                         Some(args2) if labelled || args2.len() != args.len() => {
@@ -1683,7 +1784,7 @@ fn bound_method(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv: ast.Ex
             }
             let labelled = args.any(|a| is_named(st, a))
             let written = [recv] + args.map(|a| unlabel(st, a))
-            let (ordered, next) = method_args(st, cx, fx, name, nsp, names, [], args, m.params)
+            let (ordered, next) = method_args(st, cx, fx, "", name, nsp, names, [], args, m.params)
             st = next
             match ordered {
                 Some(args2) if labelled => {
@@ -1982,6 +2083,119 @@ fn check_place(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr) -> env.State 
         },
         EField(r, _, _) | EIndex(r, _) => check_place(st, cx, fx, r),
         _ => st.report(diag.error("E0209", e.span, "only variables, fields and list elements can be assigned to")),
+    }
+}
+
+// What cannot be changed in place even though it is a place: the target of
+// an assignment or a `mut` argument, after it is checked.
+fn check_target(st: env.State, lhs: ast.Expr) -> env.State {
+    match st.desc(lhs) {
+        EBlock(_) => st.report(diag.error("E0209", lhs.span, "a method cannot be assigned to")),
+        EIndex(b, _) if st.repr(st.type_of(b)) == TBytes => {
+            let d = diag.error("E0209", lhs.span, "`Bytes` cannot be changed in place").note("build a new value: `b.slice(0, i) + bytes([x]) + b.slice(i + 1, b.len())`")
+            st.report(d)
+        },
+        _ => st,
+    }
+}
+
+// The arguments of a call to a function or method declared with `fn`, in
+// parameter order, checked against its parameter types `ps`: a `mut`
+// parameter takes a `mut` place, and only it does. `who` names the callee,
+// written at `csp`; `names` and `muts` are its parameters' names and which
+// of them are `mut`; `passed_to` the function a function parameter passed
+// on goes to.
+fn check_fn_args(st: env.State, cx: env.Cx, fx: env.Fx, passed_to: Option[Str], who: Str, csp: ast.Span, names: List[Str], muts: List[Bool], args: List[ast.Expr], ps: List[types.Ty]) -> env.State {
+    let mut st = st
+    for (k, (a, p)) in args.zip(ps).with_index() {
+        let pn = names.get(k) ?? ""
+        let m = muts.get(k) ?? false
+        match st.desc(a) {
+            EMut(x) => {
+                if m {
+                    st = check_mut_arg(st, cx, fx, a, x, p)
+                } else {
+                    let d = diag.error("E0213", a.span, "`{who}` does not change its parameter `{pn}`, so the argument is written without `mut`").fix("remove `mut`", { a.span with hi: x.span.lo }, "")
+                    st = expect(st.report(d), cx, fx, x, p).set_type(a, p)
+                }
+            },
+            desc => {
+                if m {
+                    // a value piped in starts before the callee
+                    let piped = a.span.lo < csp.lo
+                    let mut d = diag.error("E0213", a.span, "`{who}` changes its parameter `{pn}`, so the argument must be written with `mut`")
+                    if piped {
+                        d = d.note("a value piped with `|>` cannot be passed as `mut`; call `{who}(mut {source_of(cx, a.span)})`")
+                    } else {
+                        match desc {
+                            EVar(_) | EField(..) | EIndex(..) => {
+                                d = d.fix("add `mut`", { a.span with hi: a.span.lo }, "mut ")
+                            },
+                            _ => {},
+                        }
+                    }
+                    st = st.report(d)
+                }
+                // a function parameter passed on: pure if the callee is, there
+                match (passed_to, desc) {
+                    (Some(g), EVar(_)) => {
+                        st.arg_of = Some((g, k))
+                    },
+                    _ => {},
+                }
+                st = expect(st, cx, fx, a, p)
+                st.arg_of = None
+            },
+        }
+    }
+    st
+}
+
+// The text at `sp`.
+fn source_of(cx: env.Cx, sp: ast.Span) -> Str {
+    let src = cx.text_of(sp.file)
+    if sp.hi <= src.len() { src.slice(sp.lo, sp.hi) } else { "" }
+}
+
+// A method's arguments after the receiver; `key` is `Type::name`.
+fn check_method_args(st: env.State, cx: env.Cx, fx: env.Fx, key: Str, name: Str, nsp: ast.Span, args: List[ast.Expr], ps: List[types.Ty]) -> env.State {
+    let names = match method_params(cx, key) {
+        Ok(ns) => ns,
+        Err(_) => [],
+    }
+    let muts = match cx.param_muts.get(key) {
+        Some([_, ..ms]) => ms,
+        _ => [],
+    }
+    check_fn_args(st, cx, fx, None, name, nsp, names, muts, args, ps)
+}
+
+// `mut x` for a `mut` parameter: `x` is a place the caller may change, of
+// exactly the parameter's type (no conversion makes a place).
+fn check_mut_arg(st: env.State, cx: env.Cx, fx: env.Fx, a: ast.Expr, x: ast.Expr, p: types.Ty) -> env.State {
+    let st = check_place(st, cx, fx, x)
+    let (t, st) = check_expr(st, cx, fx, x)
+    let st = check_target(st, x)
+    let (ok, st) = st.unify(p, t)
+    let st = if ok { st } else { st.report(diag.error("E0201", x.span, "a `mut` argument must have exactly the parameter's type: expected `{st.show(p)}`, found `{st.show(t)}`")) }
+    st.set_type(a, p)
+}
+
+// The receiver of a call to method `key`: for `mut self`, a place the
+// caller may change, which the backends see as `mut recv`.
+fn mut_receiver(st: env.State, cx: env.Cx, fx: env.Fx, key: Str, recv: ast.Expr) -> env.State {
+    if !cx.mut_self(key) {
+        return st
+    }
+    match st.desc(recv) {
+        // checked again: a table test's copy
+        EMut(x) => check_place(st, cx, fx, x),
+        d => {
+            let st = check_place(st, cx, fx, recv)
+            let (inner, st) = st.node(d, recv.span)
+            let st = st.set_type(inner, st.type_of(recv)).set_inst(inner, st.inst_of(recv))
+            st.rewrite(recv, EMut(inner))
+        },
     }
 }
 
@@ -2960,16 +3174,7 @@ fn check_stmt(st: env.State, cx: env.Cx, fx: env.Fx, s: ast.Stmt) -> (Bool, env.
                 st = next
                 t
             }
-            match st.desc(lhs) {
-                EBlock(_) => {
-                    st = st.report(diag.error("E0209", lhs.span, "a method cannot be assigned to"))
-                },
-                EIndex(b, _) if st.repr(st.type_of(b)) == TBytes => {
-                    let d = diag.error("E0209", lhs.span, "`Bytes` cannot be changed in place").note("build a new value: `b.slice(0, i) + bytes([x]) + b.slice(i + 1, b.len())`")
-                    st = st.report(d)
-                },
-                _ => {},
-            }
+            st = check_target(st, lhs)
             (false, fx, expect(st, cx, fx, rhs, lt))
         },
         SExpr(e) => (false, fx, check_expr(st, cx, fx, e).1),
