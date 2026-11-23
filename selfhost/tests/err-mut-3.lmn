@@ -1,0 +1,4 @@
+foreign "c" {
+    fn abs(mut n: Int) -> Int
+}
+fn main(root: Root) {}

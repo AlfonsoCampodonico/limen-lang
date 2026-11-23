@@ -170,7 +170,7 @@ fn fn_item(g: Gen, name: Str, params: List[ast.Param], ret: ast.TyExpr, body: as
 }
 
 fn param(g: Gen, n: Str, t: ast.TyExpr) -> ast.Param {
-    ast.Param { name: n, span: g.sp, ty: t, default: None }
+    ast.Param { name: n, span: g.sp, ty: t, default: None, mutable: false }
 }
 
 fn value_ty(g: Gen) -> types.Ty {

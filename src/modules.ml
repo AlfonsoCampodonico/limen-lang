@@ -466,6 +466,7 @@ let rec expr env locals (e : expr) : expr =
       let c' = ex c in
       if c' == c && args' == args then e.edesc else ECall (c', args')
     | ENamed (n, sp, a) -> let a' = ex a in if a' == a then e.edesc else ENamed (n, sp, a')
+    | EMut a -> let a' = ex a in if a' == a then e.edesc else EMut a'
     | EMethod ({ edesc = EVar a; espan = asp; _ }, name, nsp, args) when is_module env locals a -> (
       let args = List.map ex args in
       match Hashtbl.find_opt env.mods a with

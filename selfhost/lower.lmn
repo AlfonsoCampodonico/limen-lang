@@ -608,6 +608,7 @@ pub fn lower(self: Lx, e: ast.Expr) -> (ir.Atom, Lx) {
         },
         ECall(callee, args) => lx.lower_call(e, callee, args, ty),
         ENamed(..) => panic("internal: the checker puts named arguments in order"),
+        EMut(_) => panic("internal: a mut argument outside a call"),
         EMethod(recv, name, _, args) => lx.lower_method_expr(e, recv, name, args, ty),
         EField(recv, name, _) => {
             let (is_ctor, lx) = match recv.desc {

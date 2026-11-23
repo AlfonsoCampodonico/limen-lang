@@ -1,0 +1,21 @@
+// `mut` parameters and `mut` arguments, without `main`: parsed, loaded
+// and checked
+struct Buf {
+    items: List[Int],
+}
+
+fn add(mut self: Buf, x: Int) {
+    self.items.push(x)
+}
+
+fn bump(mut n: Int, by: Int) {
+    n = n + by
+}
+
+fn calls() {
+    let mut b = Buf { items: [] }
+    b.add(1)
+    let mut k = 0
+    bump(mut k, 2)
+    bump(by: 3, n: mut k)
+}

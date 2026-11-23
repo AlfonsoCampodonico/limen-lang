@@ -154,6 +154,8 @@ fn inner(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr) -> (types.Ty, env.S
             let d = diag.error("E0122", nsp, "`{n}:` names a parameter, but this call takes its arguments by position").fix("remove the label", { nsp with hi: x.span.lo }, "")
             check_expr(st.report(d), cx, fx, x)
         },
+        // until `mut` arguments are checked: the place's type
+        EMut(x) => check_expr(st, cx, fx, x),
         EGroup(name, _, until, b) => {
             let (t, next) = st.fresh()
             st = next

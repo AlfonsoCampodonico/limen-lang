@@ -161,6 +161,9 @@ pub enum ExprDesc {
     ESafe(Expr, Str, Expr),
     // `name: value`, a call argument naming its parameter
     ENamed(Str, Span, Expr),
+    // `mut place`, a call argument for a `mut` parameter: the callee changes
+    // the caller's place. Its span runs from `mut` to the end of the place.
+    EMut(Expr),
     // a value boxed as `dyn Interface`: never written, the checker puts it
     // where a value of a struct or enum is used as a `dyn`
     EDyn(Expr, Str),
@@ -261,6 +264,8 @@ pub struct Param {
     // its default value, a constant (`sep: Str = ", "`), used when a call
     // leaves the argument out
     default: Option[Expr],
+    // written `mut name: Type`: the callee changes the caller's place
+    mutable: Bool,
 }
 
 // A type parameter and the interfaces it must satisfy: `T: Shape + Show`.

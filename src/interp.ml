@@ -634,7 +634,7 @@ let body_refs (d : fn_decl) =
     | EStr ps -> List.iter (function SPExpr x -> ex x | SPLit _ -> ()) ps
     | EList es -> List.iter ex es
     | EBin (_, a, b) | EIndex (a, b) | EPipe (a, b) -> ex a; ex b
-    | EUn (_, a) | ETry (a, None) | EField (a, _, _) | ENamed (_, _, a) | EDyn (a, _) -> ex a
+    | EUn (_, a) | ETry (a, None) | EField (a, _, _) | ENamed (_, _, a) | EMut a | EDyn (a, _) -> ex a
     | ETry (a, Some c) -> ex a; ex c
     | ECall (c, args) -> ex c; List.iter ex args
     | EMethod (r, m, _, args) -> names := ("::" ^ m) :: !names; ex r; List.iter ex args
@@ -2302,6 +2302,7 @@ let rec eval rt env e : value =
     | VUInt (b, n) -> VUInt (b, wrap b (Int64.lognot n))
     | _ -> failwith "internal: bitwise not")
   | ENamed _ -> failwith "internal: the checker puts named arguments in order"
+  | EMut _ -> failwith "internal: a mut argument outside a call"
   | ECall ({ ecallee = Some d; _ }, args) when d.fn_foreign = None -> (
     (* a call to a known top-level function: no name to look up *)
     let avs = List.map (eval rt env) args in

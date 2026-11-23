@@ -80,7 +80,7 @@ fn below(e: ast.Expr) -> List[ast.Expr] {
         }),
         EList(items) => items,
         EBin(_, a, b) | EPipe(a, b) | EIndex(a, b) | ESafe(a, _, b) => [a, b],
-        EUn(_, a) | EField(a, _, _) | ENamed(_, _, a) | EClosure(_, a) | EDyn(a, _) => [a],
+        EUn(_, a) | EField(a, _, _) | ENamed(_, _, a) | EMut(a) | EClosure(_, a) | EDyn(a, _) => [a],
         ECall(f, args) | EMethod(f, _, _, args) => [f] + args,
         ETry(a, context) => [a] + maybe(context),
         EIf(c, then, other) => [c] + block_kids(then) + maybe(other),

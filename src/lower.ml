@@ -303,6 +303,7 @@ let rec lower f (e : expr) : I.atom =
       | _ -> tmp f TInt (I.Bin (BitXor, TInt, x, I.AInt (-1L), e.espan)))
     | ECall (callee, args) -> lower_call f e callee args ty
     | ENamed _ -> failwith "internal: the checker puts named arguments in order"
+    | EMut _ -> failwith "internal: a mut argument outside a call"
     | EMethod ({ edesc = EVar en; _ }, name, _, args) when is_enum_name f en ->
       let xs = List.map (lower f) args in
       tmp f ty (I.MkEnum (ty, tag_of f.g ty name, xs))

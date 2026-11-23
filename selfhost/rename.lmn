@@ -439,6 +439,10 @@ pub fn expr(st: State, cx: Context, locals: List[Str], e: ast.Expr) -> (ast.Expr
             let (a, st) = ex(st, a)
             set(e, ENamed(n, span, a), st)
         },
+        EMut(a) => {
+            let (a, st) = ex(st, a)
+            set(e, EMut(a), st)
+        },
         EDyn(a, iface) => {
             let (a, st) = ex(st, a)
             set(e, EDyn(a, iface), st)

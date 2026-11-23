@@ -1,0 +1,4 @@
+interface I {
+    fn f(self, mut n: Int)
+}
+fn main(root: Root) {}

@@ -1055,6 +1055,7 @@ and check_expr_inner ctx f e : ty =
     err ctx "E0122" nsp (sprintf "`%s:` names a parameter, but this call takes its arguments by position" n)
       ~fix:{ Diag.fmsg = "remove the label"; edits = [ { Diag.at = { nsp with hi = x.espan.lo }; replacement = "" } ] };
     check_expr ctx f x
+  | EMut x -> check_expr ctx f x (* until `mut` arguments are checked: the place's type *)
   | EGroup (name, _, until, b) ->
     if !no_wait > 0 then update_waits ctx e.espan "a `group` waits for its tasks";
     let t = fresh () in
@@ -3073,7 +3074,7 @@ let check_fn ctx (d : fn_decl) (s : fsig) =
   let genv = List.map (fun g -> (g, TParam g)) d.fn_gen in
   let scope = { vars = Hashtbl.create 8; barrier = false } in
   List.iter2
-    (fun p t -> Hashtbl.replace scope.vars p.prm_name { vty = t; vmut = false; vspan = p.prm_span; vkind = KParam })
+    (fun p t -> Hashtbl.replace scope.vars p.prm_name { vty = t; vmut = p.prm_mut; vspan = p.prm_span; vkind = KParam })
     d.fn_params s.ps;
   let f = { ret_ty = s.ret; scopes = [ scope ]; loops = 0; genv; in_group = 0; in_defer = 0; ret_te = d.fn_ret } in
   (* a default is checked here, once, against a type that is the same at

@@ -1109,7 +1109,7 @@ fn check_fn(cx: env.Cx, st: env.State, ds: Decls, d: ast.FnDecl, s: env.Sig) -> 
     let genv = generic_env(d.generics)
     let mut scope = env.Scope { vars: map(), barrier: false }
     for (p, t) in d.params.zip(s.params) {
-        scope.vars[p.name] = env.Var { ty: t, mutable: false, span: p.span, kind: KParam }
+        scope.vars[p.name] = env.Var { ty: t, mutable: p.mutable, span: p.span, kind: KParam }
     }
     let fx = env.Fx { ret: s.ret, scopes: [scope], loops: 0, genv, in_group: 0, in_defer: 0, ret_te: d.ret }
     // a default is checked here, once, against a type that is the same at
@@ -1381,6 +1381,7 @@ fn expr(st: env.State, e: ast.Expr) -> ast.Expr {
         EWith(b, fs) => EWith(x(b), inits(fs)),
         ESafe(b, n, rest) => ESafe(x(b), n, x(rest)),
         ENamed(n, nsp, v) => ENamed(n, nsp, x(v)),
+        EMut(v) => EMut(x(v)),
         EDyn(v, i) => EDyn(x(v), i),
     }
     { e with desc }

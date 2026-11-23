@@ -11723,6 +11723,39 @@ fn main(root: Root) {
     out.print("{s.last_index_of("/")} {s.index_of("/")} {s.last_index_of("x")} {s.last_index_of("")} {"".last_index_of("")} {"aaa".last_index_of("aa")} {s.last_index_of("a/b/c/")}")|})
     "Some(3) Some(1) None Some(5) Some(0) Some(1) None\n";
 
+  (* ---------- mut parameters ---------- *)
+  let mut_src = {|struct Buf {
+    items: List[Int],
+}
+
+fn add(mut self: Buf, x: Int) {
+    self.items.push(x)
+}
+
+fn bump(mut n: Int, by: Int) {
+    n = n + by
+}
+
+fn main(root: Root) {
+    let mut b = Buf { items: [] }
+    b.add(1)
+    let mut k = 0
+    bump(mut k, 2)
+    bump(by: 3, n: mut k)
+}
+|} in
+  ok "mut-fmt" (Fmt.format ~file:"mut-fmt.lmn" mut_src = mut_src) (Fmt.format ~file:"mut-fmt.lmn" mut_src);
+  ok "mut-fmt-spacing" (Fmt.format ~file:"mut-fmt2.lmn" "fn f(mut   n: Int) {}\nfn main(root: Root) { let mut k = 0\n f(mut    k) }\n"
+    = "fn f(mut n: Int) {}\n\nfn main(root: Root) {\n    let mut k = 0\n    f(mut k)\n}\n") "spacing";
+  errs "mut-parses" mut_src [];
+  says "mut-default" "fn f(mut n: Int = 0) {}\nfn main(root: Root) {}" "E0123" "`n` is `mut`, so it cannot have a default";
+  says "mut-interface" "interface I {\n    fn f(self, mut n: Int)\n}\nfn main(root: Root) {}" "E0003" "an interface method cannot take a `mut` parameter";
+  says "mut-foreign" "foreign \"c\" {\n    fn abs(mut n: Int) -> Int\n}\nfn main(root: Root) {}" "E0003" "a foreign function cannot take a `mut` parameter";
+  says "mut-fn-type" "fn f(g: fn(mut Int)) {}\nfn main(root: Root) {}" "E0003" "a function type cannot have a `mut` parameter";
+  says "mut-closure" (main_wrap "    let f = |mut x: Int| x") "E0003" "a closure cannot take a `mut` parameter";
+  says "mut-test-param" "test \"t\" (mut fs: Fs) {}\n" "E0003" "a test's parameters cannot be `mut`";
+  errs "mut-outside-call" (main_wrap "    let mut x = 1\n    let y = mut x") [ "E0003" ];
+
   drain ();
   Printf.printf "%d/%d passed\n" (!total - !failed) !total;
   if !failed > 0 then exit 1

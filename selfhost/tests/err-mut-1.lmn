@@ -1,0 +1,2 @@
+fn f(mut n: Int = 0) {}
+fn main(root: Root) {}

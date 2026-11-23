@@ -145,7 +145,7 @@ let forwarder structs (s : struct_decl) path (d : fn_decl) : fn_decl option =
         fn_name = s.st_name ^ "::" ^ method_name d.fn_name;
         fn_gen = s.st_gen @ List.map snd renamed;
         fn_params =
-          { prm_name = "self"; prm_span = sp; prm_ty = tyn s.st_name (List.map (fun g -> tyn g []) s.st_gen); prm_default = None }
+          { prm_name = "self"; prm_span = sp; prm_ty = tyn s.st_name (List.map (fun g -> tyn g []) s.st_gen); prm_default = None; prm_mut = false }
           :: List.map (fun p -> { p with prm_ty = subst env p.prm_ty }) params;
         fn_ret = Option.map (subst env) d.fn_ret;
         fn_body = { stmts = []; tail = Some call; bspan = sp };

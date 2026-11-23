@@ -79,6 +79,7 @@ let rec expr (e : expr) =
       arms
   | ESafe (b, _, rest, _) -> expr b; expr rest
   | ENamed (_, nsp, x) -> sp nsp; expr x
+  | EMut x -> expr x
 
 and block b =
   sp b.bspan;

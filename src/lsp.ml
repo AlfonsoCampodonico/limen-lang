@@ -102,7 +102,7 @@ let rec walk_expr (f : expr -> unit) e =
   | EUn (_, a) | ETry (a, None) | EField (a, _, _) -> w a
   | ETry (a, Some c) -> w a; w c
   | ECall (c, args) -> w c; List.iter w args
-  | ENamed (_, _, a) -> w a
+  | ENamed (_, _, a) | EMut a -> w a
   | EMethod (r, _, _, args) -> w r; List.iter w args
   | EIf (c, b, eo) -> w c; walk_block f b; Option.iter w eo
   | EMatch (s, arms) -> w s; List.iter (fun a -> Option.iter w a.aguard; w a.abody) arms

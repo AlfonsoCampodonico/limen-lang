@@ -25,7 +25,7 @@ let rec fv bound acc e =
   | EUn (_, a) | ETry (a, None) | EField (a, _, _) -> go acc a
   | ETry (a, Some c) -> go (go acc a) c
   | ECall (c, args) -> List.fold_left go (go acc c) args
-  | ENamed (_, _, a) -> go acc a
+  | ENamed (_, _, a) | EMut a -> go acc a
   | EMethod (r, _, _, args) -> List.fold_left go (go acc r) args
   | EIf (c, b, eo) ->
     let acc = fv_block bound (go acc c) b in
@@ -84,7 +84,7 @@ let rec has_escape e =
   | EBin (_, a, b) | EIndex (a, b) | EPipe (a, b) -> has_escape a || has_escape b
   | EUn (_, a) | EField (a, _, _) -> has_escape a
   | ECall (c, args) -> has_escape c || List.exists has_escape args
-  | ENamed (_, _, a) -> has_escape a
+  | ENamed (_, _, a) | EMut a -> has_escape a
   | EMethod (r, _, _, args) -> has_escape r || List.exists has_escape args
   | EIf (c, b, eo) -> has_escape c || block_escape b || (match eo with Some x -> has_escape x | None -> false)
   | EMatch (s, arms) ->
