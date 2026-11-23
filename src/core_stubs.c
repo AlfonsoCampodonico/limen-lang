@@ -1,5 +1,5 @@
 /* The interpreter's way to the built-ins written once in C
-   (runtime/limen_core.h), declared to OCaml in core.ml.
+   (runtime/limen_core.h and limen_core_inline.h), declared to OCaml in core.ml.
 
    GC safety: an allocation can run the minor GC, which moves small strings,
    so no stub keeps a char * into an OCaml string across one. Stubs keep
