@@ -99,12 +99,71 @@ let rec finite_random st =
 
 (* ---------- programs ---------- *)
 
+(* Exact forms, for results the printer would round or a summary would hide.
+   [bits x]: a Float's exact value as sign, 53-bit significand and binary
+   exponent ("6755399441055744p-52" is 1.5), or nan, inf, -inf, 0, -0. A
+   program cannot read a Float's bits (limen_float_bits is the standard
+   library's), so it scales by powers of two instead: that is exact in IEEE
+   754 as long as nothing overflows or becomes subnormal, which scaling down
+   a number of at least 2 and scaling up any positive number never do, and
+   a significand in [1, 2) times 2^52 is an integer below 2^53, which to_int
+   keeps exactly. [digest xs]: a position-sensitive hash of some strings. *)
+let exact =
+  {|fn bits(x: Float) -> Str {
+    if x != x {
+        return "nan"
+    }
+    if x == 1.0 / 0.0 {
+        return "inf"
+    }
+    if x == -1.0 / 0.0 {
+        return "-inf"
+    }
+    if x == 0.0 {
+        return if 1.0 / x < 0.0 { "-0" } else { "0" }
+    }
+    let mut a = if x < 0.0 { -x } else { x }
+    let mut e = 0
+    let big = 18446744073709551616.0
+    while a >= big {
+        a = a / big
+        e = e + 64
+    }
+    while a >= 2.0 {
+        a = a / 2.0
+        e = e + 1
+    }
+    while a < 1.0 / big {
+        a = a * big
+        e = e - 64
+    }
+    while a < 1.0 {
+        a = a * 2.0
+        e = e - 1
+    }
+    let m = (a * 4503599627370496.0).to_int()
+    "{if x < 0.0 { "-" } else { "" }}{m}p{e - 52}"
+}
+
+fn digest(xs: List[Str]) -> Int {
+    let mut h = 7
+    for x in xs {
+        h = h * 1000003 + x.len()
+        for c in x.bytes() {
+            h = h * 31 + c
+        }
+    }
+    h
+}
+
+|}
+
 let main body = "fn main(root: Root) {\n    let out = root.stdout\n" ^ body ^ "}\n"
 
 let str_program st =
   let inputs = str_edges @ List.init 200 (fun _ -> str_random st) in
   let defs, xs = chunked ~per:10 "inputs" "Str" (List.map slit inputs) in
-  defs
+  exact ^ defs
   ^ {|// 1 or 0, to keep the lines short
 fn b(x: Bool) -> Int {
     if x { 1 } else { 0 }
@@ -120,19 +179,22 @@ fn str_one(out: Stdout, k: Int, s: Str, t: Str) {
     let cs = s.chars()
     let bs = s.bytes()
     let sp = s.split("")
-    out.print("{p} -> {s.len()} {s.is_empty()} {r(s, s.trim())} {r(s, s.to_upper())} {r(s, s.to_lower())} {s.parse_int()} {s.parse_float()} bytes {bs.sum()} {bs.min()} {bs.max()} chars {cs.map(|c| "{c.len()}").join("")} {b(cs.join("") == s)} replace {r(s, s.replace("", "x"))} {r(s, s.replace("a", ""))} {r(s, s.replace("aa", "b"))} plus {(s + t).len()} {b((s + t).starts_with(s))}{b((s + t).ends_with(t))}")
+    out.print("{p} -> {s.len()} {s.is_empty()} {r(s, s.trim())} {r(s, s.to_upper())} {r(s, s.to_lower())} {s.parse_int()} {s.parse_float().map(|f| bits(f))} bytes {bs} chars {cs.map(|c| "{c.len()}").join("")} {b(cs.join("") == s)} replace {r(s, s.replace("", "x"))} {r(s, s.replace("a", ""))} {r(s, s.replace("aa", "b"))} plus {(s + t).len()} {b((s + t).starts_with(s))}{b((s + t).ends_with(t))}")
     out.print("{p} lines -> {s.lines()} split {sp.len()} {b(sp.all(|x| x.len() == 1))}{b(sp.join("") == s)} {s.split(",")} {s.split("\n")} {s.split("aa")} {s.split("\r\n")}")
     let needles = ["", "a", "aa", ",", "\r\n", bytes([195]).to_str(), t]
     let found = needles.map(|n| "{b(s.contains(n))}{b(s.starts_with(n))}{b(s.ends_with(n))}:{s.index_of(n) ?? -1}:{s.last_index_of(n) ?? -1}")
     let ends = [-1, 0, 1, s.len(), s.len() + 1, -9223372036854775807 - 1, 9223372036854775807]
     let mut lens: List[Int] = []
+    let mut pieces: List[Str] = []
     for lo in ends {
         for hi in ends {
-            lens.push(s.slice(lo, hi).len())
+            let x = s.slice(lo, hi)
+            lens.push(x.len())
+            pieces.push(x)
         }
     }
     let some = ends.map(|lo| r(s, s.slice(lo, s.len())))
-    out.print("{p} find {[t]} -> {found} slice {lens.map(|n| "{n}").join(",")} {some.join(" ")}")
+    out.print("{p} find {[t]} -> {found} slice {lens.map(|n| "{n}").join(",")} {digest(pieces)} {some.join(" ")}")
 }
 
 |}
@@ -172,9 +234,9 @@ let int_program st =
   let rand = List.init 200 (fun _ -> (rand64 st, pick ())) in
   let da, ra = chunked "ra" "Int" (List.map (fun (a, _) -> ilit a) rand) in
   let db, rb = chunked "rb" "Int" (List.map (fun (_, b) -> ilit b) rand) in
-  da ^ db
+  exact ^ da ^ db
   ^ {|fn int_one(out: Stdout, a: Int) {
-    out.print("int {a} -> {a.abs()} {a.to_float()} {a.to_str()} {a.to_uint8()} {a.to_uint16()} {a.to_uint32()} {a.to_uint64()} {-a} {~a}")
+    out.print("int {a} -> {a.abs()} {bits(a.to_float())} {a.to_str()} {a.to_uint8()} {a.to_uint16()} {a.to_uint32()} {a.to_uint64()} {-a} {~a}")
 }
 
 fn int_pair(out: Stdout, a: Int, b: Int) {
@@ -216,7 +278,9 @@ let uint_program st =
   let fns w =
     sprintf
       {|fn u%d_one(out: Stdout, a: UInt%d) {
-    out.print("u%d {a} -> {a.to_int()} {a.to_str()} {a.to_float()} {a.to_float().to_fixed(0)} {~a} {[-1, 0, 1, %d, %d].map(|n| (a.rotate_left(n), a.rotate_right(n)))}")
+    out.print("u%d {a} -> {a.to_int()} {a.to_str()} {bits(a.to_float())} {a.to_float().to_fixed(0)} {~a} {a.to_uint8()} {a.to_uint16()} {a.to_uint32()} {a.to_uint64()} {[-1, 0, 1, %d, %d].map(|n| (a.rotate_left(n), a.rotate_right(n)))}")
+    // shift counts either side of the width
+    out.print("u%d {a} shift -> {[%d, %d, %d].map(|n| (a << n.to_uint%d(), a >> n.to_uint%d()))}")
 }
 
 fn u%d_pair(out: Stdout, a: UInt%d, b: UInt%d) {
@@ -225,7 +289,7 @@ fn u%d_pair(out: Stdout, a: UInt%d, b: UInt%d) {
 }
 
 |}
-      w w w w (w + 1) w w w w w
+      w w w w (w + 1) w (w - 1) w (w + 1) w w w w w w w
   in
   let parts w =
     let e = edges w in
@@ -253,15 +317,15 @@ fn u%d_pair(out: Stdout, a: UInt%d, b: UInt%d) {
     (fns w ^ da ^ db, call)
   in
   let ps = List.map parts widths in
-  String.concat "" (List.map fst ps) ^ main (String.concat "" (List.map snd ps))
+  exact ^ String.concat "" (List.map fst ps) ^ main (String.concat "" (List.map snd ps))
 
 let float_program st =
   let rand = List.init 200 (fun _ -> finite_random st) in
   let lit x = sprintf "(%s, \"%s\")" (flit x) (flit x) in
   let defs, rs = chunked "rs" "(Float, Str)" (List.map lit rand) in
-  defs
+  exact ^ defs
   ^ {|fn float_one(out: Stdout, x: Float, src: Str) {
-    out.print("float {src} -> {x.to_str()} {x} {[x]} {x.to_int()} {x.abs()} {x.sqrt()}")
+    out.print("float {src} -> {bits(x)} {x.to_str()} {x} {[x]} {x.to_int()} {bits(x.abs())} {bits(x.sqrt())}")
     // "=" where to_fixed gives what the count before it gave
     let fx = [-1, 0, 1, 2, 15, 30, 31].map(|d| x.to_fixed(d))
     let shown = fx.with_index().map(|p| if p.0 > 0 && fx[p.0 - 1] == p.1 { "=" } else { p.1 })
@@ -271,7 +335,7 @@ let float_program st =
 fn float_pair(out: Stdout, a: (Float, Str), b: (Float, Str)) {
     let x = a.0
     let y = b.0
-    out.print("float {a.1} {b.1} -> {x + y} {x - y} {x * y} {x / y} {x < y} {x <= y} {x > y} {x >= y} {x == y} {x != y}")
+    out.print("float {a.1} {b.1} -> {bits(x + y)} {bits(x - y)} {bits(x * y)} {bits(x / y)} {x < y} {x <= y} {x > y} {x >= y} {x == y} {x != y}")
 }
 
 |}
@@ -298,14 +362,14 @@ let order_program st =
   let n = min (List.length fs) (List.length ss) in
   let ss = List.filteri (fun i _ -> i < n) ss in
   let defs, sexp = chunked ~per:10 "ss" "Str" (List.map slit ss) in
-  defs
+  exact ^ defs
   ^ main
     (sprintf
        {|    let fs = %s
     let ss = %s
     let bs = ss.map(|s| s.to_bytes())
     let ts = fs.zip(ss)
-    out.print("order floats -> {fs.sort()}")
+    out.print("order floats -> {fs.sort().map(|x| bits(x))}")
     out.print("order floats by index -> {fs.with_index().map(|p| (p.1, p.0)).sort().map(|p| p.1)}")
     out.print("order strs -> {ss.sort()}")
     out.print("order bytes -> {bs.sort()}")
@@ -328,7 +392,8 @@ let order_program st =
        sexp)
 
 let rand_program =
-  main
+  exact
+  ^ main
     {|    let r = root.rand
     let spans = [(0, 1), (0, 2), (-5, 5), (0, 4611686018427387905), (-9223372036854775807 - 1, 9223372036854775807)]
     for sp in spans {
@@ -338,7 +403,7 @@ let rand_program =
     }
     for k in 0..<50 {
         let f = r.float()
-        out.print("rand float {k} -> {f} {(f * 9007199254740992.0).to_int()}")
+        out.print("rand float {k} -> {f} {bits(f)}")
     }
     for n in [0, 1, 7, 8, 9, 17] {
         for k in 0..<50 {
