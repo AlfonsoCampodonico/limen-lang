@@ -4021,15 +4021,15 @@ fn main(root: Root) -> Result[(), IoError] {
 }
 |v}
     "[None] true Ok(1)\n";
-  (* SQLite follows symlinked sidecar files: open refuses ones that leave the grant *)
+  (* SQLite follows symlinked sidecar files: open refuses any that is a link, inside the grant or not *)
   let outside = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "limen-sql-outside-%d" (Unix.getpid ())) in
   Out_channel.with_open_bin outside (fun oc -> output_string oc "keep");
   Out_channel.with_open_bin (Filename.concat sqlreal "fine-target") (fun oc -> output_string oc "");
   List.iter (fun (link, target) -> (try Unix.unlink (Filename.concat sqlreal link) with Unix.Unix_error _ -> ()); Unix.symlink target (Filename.concat sqlreal link))
-    [ ("evil.db-journal", outside); ("broken.db-wal", "/limen-no-such-dir/x"); ("fine.db-shm", "fine-target") ];
+    [ ("evil.db-journal", outside); ("broken.db-wal", "/limen-no-such-dir/x"); ("fine.db-shm", "fine-target"); ("walout.db-wal", outside); ("shmout.db-shm", outside) ];
   out "sql-sidecar-links" ~grants:{ sqlg with fs = Some (sqlreal, false) }
-    "use sql\n\nfn main(root: Root) {\n    for name in [\"evil.db\", \"broken.db\"] {\n        root.stdout.print(\"{sql.open(root.fs, name).is_err()}\")\n    }\n    match sql.open(root.fs, \"evil.db\") {\n        Err(Denied(m)) => root.stdout.print(m.slice(0, 50)),\n        _ => root.stdout.print(\"opened\"),\n    }\n    match sql.open(root.fs, \"fine.db\") {\n        Ok(db) => root.stdout.print(\"{db.exec(\"CREATE TABLE IF NOT EXISTS t (x)\", [])} {db.close()}\"),\n        Err(e) => root.stdout.print(\"{e}\"),\n    }\n    let gone = root.fs.remove(\"fine.db\").is_ok()\n}\n"
-    "true\ntrue\nsql: refusing to open `evil.db`: `evil.db-journal`\nOk(0) Ok(())\n";
+    "use sql\n\nfn main(root: Root) {\n    for name in [\"evil.db\", \"broken.db\", \"fine.db\", \"walout.db\", \"shmout.db\"] {\n        root.stdout.print(\"{sql.open(root.fs, name).is_err()}\")\n    }\n    match sql.open(root.fs, \"evil.db\") {\n        Err(Denied(m)) => root.stdout.print(m.slice(0, 50)),\n        _ => root.stdout.print(\"opened\"),\n    }\n    match sql.open(root.fs, \"fine.db\") {\n        Ok(db) => root.stdout.print(\"{db.exec(\"CREATE TABLE IF NOT EXISTS t (x)\", [])} {db.close()}\"),\n        Err(e) => root.stdout.print(\"{e}\"),\n    }\n    let gone = root.fs.remove(\"fine.db\").is_ok()\n}\n"
+    "true\ntrue\ntrue\ntrue\ntrue\nsql: refusing to open `evil.db`: `evil.db-journal`\nDenied(\"sql: refusing to open `fine.db`: `fine.db-shm` is a symbolic link\")\n";
   ok "sql-sidecar-untouched" (read_file outside = "keep") (read_file outside);
   (* a Db holds an id, not a pointer: forged, closed and twice-closed ones are errors *)
   out "sql-handles"

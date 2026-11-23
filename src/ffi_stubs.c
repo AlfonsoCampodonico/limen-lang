@@ -1005,3 +1005,36 @@ value limen_sql_finish(value jv) {
   limen_sql_free(j);
   CAMLreturn(r);
 }
+
+/* limen_sql_open : nativeint array -> string -> string -> int -> string
+   (SQLite's functions in W_SQL_* order, the Fs root, the database's name,
+   sqlite3_open_v2's flags) -> the result of w_sql_open_core (limen_sql.h).
+   The interpreter's Fs keeps its granted directory in its value
+   (caps.ml), out of this stub's reach, so the walk starts from the granted
+   directory the sandbox code keeps (w_fs_top_path). That is the Fs's own:
+   sql.open walks to the root (fs.full_path(".")) just before, which keeps
+   that directory, and the interpreter runs one granted directory at a time
+   (limen_sandbox.h). A root outside the kept directory is refused. */
+value limen_sql_open(value api, value root, value name, value flags) {
+  CAMLparam4(api, root, name, flags);
+  CAMLlocal1(r);
+  void *fns[W_SQL_NAPI] = { 0 };
+  for (int k = 0; k < W_SQL_NAPI && k < (int)Wosize_val(api); k++) fns[k] = (void *)Nativeint_val(Field(api, k));
+  mlsize_t rl = caml_string_length(root), nl = caml_string_length(name);
+  char *ro = malloc(rl + 1), *nm = malloc(nl + 1);
+  if (!ro || !nm) { fputs("panic: out of memory\n", stderr); exit(1); }
+  memcpy(ro, String_val(root), rl); ro[rl] = 0;
+  memcpy(nm, String_val(name), nl); nm[nl] = 0;
+  pthread_mutex_lock(&w_fs_top_mu);
+  char *top = w_fs_top_path ? w_sb_strndup(w_fs_top_path, strlen(w_fs_top_path)) : NULL;
+  pthread_mutex_unlock(&w_fs_top_mu);
+  WSqlBuf out = { 0 };
+  if (!top || !w_fs_inside(top, ro))
+    w_sql_open_result(&out, W_SQL_OPEN_DENIED, 0, NULL, "fs: not granted (run with --grant fs=DIR)");
+  else
+    w_sql_open_core((const void *const *)fns, top, ro, nm, (size_t)nl, Int_val(flags), &out);
+  free(top); free(ro); free(nm);
+  r = caml_alloc_initialized_string((mlsize_t)out.len, out.p ? out.p : "");
+  free(out.p);
+  CAMLreturn(r);
+}

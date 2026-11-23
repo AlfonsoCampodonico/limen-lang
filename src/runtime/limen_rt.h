@@ -1487,6 +1487,7 @@ W_RT void w_block_wait(WBlock *b);
 /* The std sql module's helpers (Ffi.runtime_fns): one SQL statement as one
    blocking call (limen_sql.h), and reading what it returns. */
 W_RT WStr *w_sql_run(const void *const *api, int64_t db, WStr *text, WStr *params, int64_t mode);
+W_RT WStr *w_sql_open(const void *const *api, WStr *root, WStr *name, int64_t flags);
 W_RT int64_t w_bytes_int(WStr *b, int64_t at, const char *where);
 W_RT double w_bytes_float(WStr *b, int64_t at, const char *where);
 W_RT int64_t w_float_bits(double x);

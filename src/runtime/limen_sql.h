@@ -41,23 +41,38 @@
      a type byte (0 NULL, 1 integer, 2 float, 3 text, 4 blob), then an
      int64 or a double, or an int64 length and the bytes
    otherwise:
-     SQLite's message for the connection, as int64 length + bytes. */
+     SQLite's message for the connection, as int64 length + bytes.
+
+   Opening (w_sql_open_core, for limen_sql_open) walks to the database from
+   the granted directory as every Fs operation does (w_fs_entry in
+   limen_sandbox.h, which comes first), refuses a -journal, -wal or -shm
+   next to it that is a symbolic link, and opens it through SQLite's default
+   VFS by its absolute path. Its result, in the machine's byte order:
+     what, rc, db   three int64: W_SQL_OPEN_*, sqlite3_open_v2's result code
+                    and the connection it gave (to close, even on an error)
+   then a message as int64 length + bytes: for W_SQL_OPEN_DENIED and
+   W_SQL_OPEN_FAILED the whole error; for W_SQL_OPEN_OK and W_SQL_OPEN_SQLITE
+   the database's absolute path, as w_fs_full_path gives it, for messages. */
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 enum {
   W_SQL_PREPARE, W_SQL_STEP, W_SQL_FINALIZE, W_SQL_PARAM_COUNT, W_SQL_BIND_NULL, W_SQL_BIND_INT64, W_SQL_BIND_DOUBLE,
   W_SQL_BIND_TEXT, W_SQL_BIND_BLOB, W_SQL_COLUMN_COUNT, W_SQL_COLUMN_NAME, W_SQL_COLUMN_TYPE, W_SQL_COLUMN_INT64,
   W_SQL_COLUMN_DOUBLE, W_SQL_COLUMN_TEXT, W_SQL_COLUMN_BLOB, W_SQL_COLUMN_BYTES, W_SQL_ERRMSG, W_SQL_CHANGES64,
-  W_SQL_PROGRESS_HANDLER, W_SQL_BUSY_HANDLER, W_SQL_NAPI
+  W_SQL_PROGRESS_HANDLER, W_SQL_BUSY_HANDLER, W_SQL_OPEN_V2, W_SQL_VFS_FIND, W_SQL_VFS_REGISTER, W_SQL_NAPI
 };
 /* the symbols, in the order of the enum (cgen.ml and interp.ml fill the table from Ffi.sql_syms) */
 
 /* what: */
 enum { W_SQL_OK, W_SQL_EPREPARE, W_SQL_ENONE, W_SQL_EALONE, W_SQL_ECOUNT, W_SQL_EBIND, W_SQL_ESTEP, W_SQL_ESTOPPED };
+/* what, for opening: */
+enum { W_SQL_OPEN_OK, W_SQL_OPEN_DENIED, W_SQL_OPEN_FAILED, W_SQL_OPEN_SQLITE };
 /* mode: */
 enum { W_SQL_ALL, W_SQL_ONCE, W_SQL_ROWS };   /* every statement of the text, rows ignored; one statement, one step; one statement, every row */
 
@@ -241,4 +256,58 @@ done:
   w_sqlbuf_set(out, 16, num);
   if (what == W_SQL_OK) w_sqlbuf_set(out, 24, ((int64_t (*)(void *))api[W_SQL_CHANGES64])(db));
   w_sql_stop = outer;
+}
+
+static void w_sql_open_result(WSqlBuf *out, int64_t what, int64_t rc, void *db, const char *msg) {
+  out->len = 0;
+  w_sqlbuf_int(out, what);
+  w_sqlbuf_int(out, rc);
+  w_sqlbuf_int(out, (int64_t)(intptr_t)db);
+  w_sqlbuf_bytes(out, msg, (int64_t)strlen(msg));
+}
+
+/* Open the database `name` (nlen bytes, not NUL-terminated) under the Fs
+   root `root`, within the granted directory `top`; the result is described
+   at the top of this file. SQLite opens -journal, -wal and -shm files next
+   to the database itself, following links, so a link there is refused,
+   whether it leads out of the grant or not. */
+static void w_sql_open_core(const void *const *api, const char *top, const char *root, const char *name, size_t nlen, int flags, WSqlBuf *out) {
+  WFsErr e;
+  WFsAt at;
+  if (memchr(name, 0, nlen)) { w_sql_open_result(out, W_SQL_OPEN_FAILED, 0, NULL, "fs: the path contains a NUL byte"); return; }
+  if (w_fs_entry(top, root, name, nlen, W_FS_FOLLOW | W_FS_CREATE, &at, &e) != 0) {
+    w_sql_open_result(out, e.kind == 1 ? W_SQL_OPEN_DENIED : W_SQL_OPEN_FAILED, 0, NULL, e.msg);
+    return;
+  }
+  /* the path shown in messages and handed to SQLite, as w_fs_full_path builds it */
+  char *shown;
+  if (at.is_root) shown = w_sb_strndup(root, strlen(root));
+  else {
+    size_t n = strlen(at.dir) + strlen(at.name) + 2;
+    shown = (char *)w_sb_alloc(n);
+    snprintf(shown, n, "%s%s%s", at.dir, strcmp(at.dir, "/") == 0 ? "" : "/", at.name);
+  }
+  static const char *const suffixes[] = { "-journal", "-wal", "-shm" };
+  for (int i = 0; i < 3; i++) {
+    size_t n = strlen(at.name) + strlen(suffixes[i]) + 1;
+    char *side = (char *)w_sb_alloc(n);
+    snprintf(side, n, "%s%s", at.name, suffixes[i]);
+    struct stat st;
+    int link = fstatat(at.dfd, side, &st, AT_SYMLINK_NOFOLLOW) == 0 && S_ISLNK(st.st_mode);
+    free(side);
+    if (link) {
+      size_t m = 2 * nlen + strlen(suffixes[i]) + 64;
+      char *msg = (char *)w_sb_alloc(m);
+      snprintf(msg, m, "sql: refusing to open `%.*s`: `%.*s%s` is a symbolic link", (int)nlen, name, (int)nlen, name, suffixes[i]);
+      w_sql_open_result(out, W_SQL_OPEN_DENIED, 0, NULL, msg);
+      free(msg); free(shown);
+      w_fs_at_free(&at);
+      return;
+    }
+  }
+  w_fs_at_free(&at);
+  void *db = NULL;
+  int rc = ((int (*)(const char *, void **, int, const char *))api[W_SQL_OPEN_V2])(shown, &db, flags, NULL);
+  w_sql_open_result(out, rc == 0 ? W_SQL_OPEN_OK : W_SQL_OPEN_SQLITE, rc, db, shown);
+  free(shown);
 }

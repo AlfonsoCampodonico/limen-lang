@@ -40,7 +40,7 @@ type ctx = {
   mutable sort_tys : ty list; (* list types that need <CName>_sort *)
   mutable hash_tys : ty list; (* composite map key types that need <CName>_hash *)
   mutable csyms : string list; (* C functions that foreign calls name *)
-  mutable sql_api : bool; (* limen_sql_run is called: emit the table of SQLite functions it uses *)
+  mutable sql_api : bool; (* limen_sql_run or limen_sql_open is called: emit the table of SQLite functions they use *)
   mutable cstructs : (string * string * (string * Ffi.cty) list) list;
       (* C structs passed by value: Limen name, C name, fields *)
   mutable cbs : ((string * bool * Ffi.cty list * Ffi.cty) * (string * string * Span.t)) list;
@@ -601,13 +601,19 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
   | I.CallC ({ lib = "limen"; sym; _ }, args, _, sp) -> (
     (* the runtime's own helpers (Ffi.runtime_fns) *)
     let hd = cname c Ffi.handle_ty in
+    let use_sql_api () =
+      List.iter (fun sym -> if not (List.mem sym c.csyms) then c.csyms <- c.csyms @ [ sym ]) Ffi.sql_syms;
+      c.sql_api <- true
+    in
     match (sym, List.map a args) with
     | "limen_copy", [ p; n ] -> set (sprintf "w_ffi_copy((%s).f0, %s, %s)" p n (where sp))
     | "limen_handle_new", [ p ] -> set (sprintf "w_handle_new((%s).f0)" p)
     | "limen_sql_run", [ db; text; params; mode ] ->
-      List.iter (fun sym -> if not (List.mem sym c.csyms) then c.csyms <- c.csyms @ [ sym ]) Ffi.sql_syms;
-      c.sql_api <- true;
+      use_sql_api ();
       set (sprintf "w_sql_run(w_sql_api, (%s).f0, %s, %s, %s)" db text params mode)
+    | "limen_sql_open", [ root; name; flags ] ->
+      use_sql_api ();
+      set (sprintf "w_sql_open(w_sql_api, %s, %s, %s)" root name flags)
     | "limen_bytes_int", [ b; at ] -> set (sprintf "w_bytes_int(%s, %s, %s)" b at (where sp))
     | "limen_bytes_float", [ b; at ] -> set (sprintf "w_bytes_float(%s, %s, %s)" b at (where sp))
     | "limen_float_bits", [ x ] -> set (sprintf "w_float_bits(%s)" x)

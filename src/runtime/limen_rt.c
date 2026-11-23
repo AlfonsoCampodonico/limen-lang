@@ -3728,6 +3728,21 @@ W_RT WStr *w_sql_run(const void *const *api, int64_t db, WStr *text, WStr *param
   w_block_wait(&j->h);
   return w_block_str(&j->h);
 }
+/* Opening a database (limen_sql_open): w_sql_open_core (limen_sql.h) walks
+   from the granted directory to it and opens it, on the calling thread, as
+   the module's sqlite3_open_v2 did. */
+W_RT WStr *w_sql_open(const void *const *api, WStr *root, WStr *name, int64_t flags) {
+  char *r = (char *)malloc((size_t)root->len + 1), *n = (char *)malloc((size_t)name->len + 1);
+  if (!r || !n) { fputs("panic: out of memory\n", stderr); exit(1); }
+  memcpy(r, root->data, (size_t)root->len); r[root->len] = 0;
+  memcpy(n, name->data, (size_t)name->len); n[name->len] = 0;
+  WSqlBuf o = { 0 };
+  w_sql_open_core(api, W_FS_TOP, r, n, (size_t)name->len, (int)flags, &o);
+  free(r); free(n);
+  WStr *s = Str_from(o.p, o.len);
+  free(o.p);
+  return s;
+}
 /* The int64 or double at byte `at` of Bytes (the machine's order), and a
    Float's bits: for the sql module's results and parameters. */
 W_RT int64_t w_bytes_int(WStr *b, int64_t at, const char *where) {

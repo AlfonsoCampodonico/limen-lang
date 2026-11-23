@@ -1482,6 +1482,7 @@ module Foreign = struct
   external sql_done : nativeint -> bool = "limen_sql_done"
   external sql_stop : nativeint -> unit = "limen_sql_stop"
   external sql_finish : nativeint -> string = "limen_sql_finish"
+  external sql_open : nativeint array -> string -> string -> int -> string = "limen_sql_open"
   external cstr : int64 -> string = "limen_ffi_cstr"
   external peek : int64 -> int -> string = "limen_ffi_peek"
   external sandbox_enter : string -> bool -> bool -> string -> int = "limen_sandbox_enter"
@@ -1598,6 +1599,17 @@ module Foreign = struct
       | Some e -> e.ptr
       | None -> 0L
     in
+    (* SQLite's functions for limen_sql_run and limen_sql_open, in the order of Ffi.sql_syms *)
+    let sql_api () =
+      let find s =
+        match Hashtbl.find_opt syms ("sqlite3", s) with
+        | Some p -> p
+        | None -> ( match Hashtbl.find_opt libs "sqlite3" with Some l -> dl_sym l s | None -> 0n)
+      in
+      let api = Array.of_list (List.map find Ffi.sql_syms) in
+      if Array.exists (fun p -> p = 0n) api then failwith ("internal: " ^ sym ^ " without SQLite's functions");
+      api
+    in
     match (sym, args) with
     | "limen_copy", [ VStruct (_, [ (_, VInt p) ]); VInt n ] -> copy [ "limen" ] p n sp
     | "limen_crypto", [ VInt op; VBytes a; VBytes b; VBytes c; VBytes d ] -> VBytes (Tls.crypto (Int64.to_int op) a b c d)
@@ -1628,14 +1640,7 @@ module Foreign = struct
     | "limen_sql_run", [ VStruct (_, [ (_, VInt db) ]); VStr text; VBytes params; VInt mode ] ->
       (* one statement on a thread of its own (limen_sql_start); a cancelled
          task stops it and still waits for it, as natively *)
-      let sym s =
-        match Hashtbl.find_opt syms ("sqlite3", s) with
-        | Some p -> p
-        | None -> ( match Hashtbl.find_opt libs "sqlite3" with Some l -> dl_sym l s | None -> 0n)
-      in
-      let api = Array.of_list (List.map sym Ffi.sql_syms) in
-      if Array.exists (fun p -> p = 0n) api then failwith "internal: limen_sql_run without SQLite's functions";
-      let job, fd = sql_start api (Int64.to_nativeint db) text params (Int64.to_int mode) in
+      let job, fd = sql_start (sql_api ()) (Int64.to_nativeint db) text params (Int64.to_int mode) in
       if job = 0n then raise (Panic ("sql: cannot start a thread for a statement", sp));
       let s = { fd = (Obj.magic fd : Unix.file_descr); shut = false; reading = false; writing = false; tls = Tls.Plain } in
       (try wait_until ~io:(s, false) ~cancellable:(not !current.unwinding) (fun () -> sql_done job)
@@ -1645,6 +1650,7 @@ module Foreign = struct
          ignore (sql_finish job);
          raise e);
       VBytes (sql_finish job)
+    | "limen_sql_open", [ VStr root; VStr name; VInt flags ] -> VBytes (sql_open (sql_api ()) root name (Int64.to_int flags))
     | "limen_bytes_int", [ VBytes b; VInt at ] ->
       if at < 0L || Int64.add at 8L > Int64.of_int (String.length b) then raise (Panic ("limen_bytes_int: no 8 bytes there", sp));
       VInt (String.get_int64_ne b (Int64.to_int at))
