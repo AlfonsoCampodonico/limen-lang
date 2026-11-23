@@ -918,6 +918,9 @@ let satisfies ctx t ((i, args) as b : bound) : string option =
       match List.find_map (fun b' -> List.assoc_opt m (iface_methods b')) (bounds_of g) with
       | Some (ps', r') -> trial (TFn (ps', r'))
       | None -> Some (sprintf "type parameter `%s` is not bounded by `%s`; add it: `[%s: %s]`" g name g name))
+    | TNamed (n, _) when has_mut (n ^ "::" ^ m) ->
+      (* a bound or `dyn` calls it as a value, with a plain receiver *)
+      Some (sprintf "its `%s` has a `mut` parameter, so it cannot implement `%s`" m name)
     | TNamed (n, _) when Hashtbl.mem ctx.fns (n ^ "::" ^ m) -> (
       let _, ft = instantiate (Hashtbl.find ctx.fns (n ^ "::" ^ m)) in
       match ft with
@@ -1772,7 +1775,8 @@ and check_method_value ?rt ctx f e recv name nsp args =
     match (rt, recv.edesc) with
     | Some t, _ -> repr t
     | None, EMut x ->
-      (* checked again (a table test's copy): the receiver of a `mut self` method *)
+      (* checked again: a table test's cases share one body, so the receiver
+         of a `mut self` method is already wrapped by the first check *)
       let t = check_expr ctx f x in
       recv.ety <- t;
       repr t
@@ -2036,7 +2040,7 @@ and check_place ctx f e =
               edits = [ { Diag.at = Span.at_start v.vspan; replacement = "mut " } ] }
       | KParam ->
         err ctx "E0205" e.espan (sprintf "cannot modify parameter `%s`" n)
-          ~notes:[ sprintf "parameters are immutable; make a copy with `let mut %s = %s`" n n ]
+          ~notes:[ sprintf "parameters are immutable; declare it `mut %s` to change the caller's value, or make a copy with `let mut %s = %s`" n n n ]
       | KPat -> err ctx "E0205" e.espan (sprintf "cannot modify `%s`, pattern and loop bindings are immutable" n)
       | KGroup -> err ctx "E0310" e.espan (sprintf "`%s` is a group handle; the only thing you can do with it is `%s.go(...)`" n n))
     | Some _ -> ()
@@ -2076,14 +2080,16 @@ and check_fn_args ?passed_to ctx f ~who ~csp ~names ~muts args ps =
         if m then begin
           (* a value piped in starts before the callee *)
           let piped = a.espan.lo < csp.Span.lo in
+          let place = match a.edesc with EVar _ | EField _ | EIndex _ -> true | _ -> false in
           let fix =
-            match a.edesc with
-            | (EVar _ | EField _ | EIndex _) when not piped ->
+            if place && not piped then
               Some { Diag.fmsg = "add `mut`"; edits = [ { Diag.at = Span.at_start a.espan; replacement = "mut " } ] }
-            | _ -> None
+            else None
           in
           let notes =
-            if piped then [ sprintf "a value piped with `|>` cannot be passed as `mut`; call `%s(mut %s)`" who (source_of a.espan) ] else []
+            if piped then
+              [ sprintf "a value piped with `|>` cannot be passed as `mut`; call `%s(mut %s)`" who (if place then source_of a.espan else "x") ]
+            else []
           in
           err ctx ?fix ~notes "E0213" a.espan
             (sprintf "`%s` changes its parameter `%s`, so the argument must be written with `mut`" who pn)
@@ -2116,9 +2122,14 @@ and check_mut_arg ctx f (a : expr) (x : expr) p =
 and mut_receiver ctx f key (recv : expr) =
   if mut_self key then
     match recv.edesc with
-    | EMut x -> check_place ctx f x (* checked again: a table test's copy *)
+    | EMut x ->
+      (* checked again: a table test's cases share one body, so the first
+         check already wrapped it *)
+      check_place ctx f x;
+      check_target ctx f x
     | _ ->
       check_place ctx f recv;
+      check_target ctx f recv;
       recv.edesc <- EMut { recv with edesc = recv.edesc }
 
 (* Can errors of type [e] become `dyn Error`? None if so, else why not. *)

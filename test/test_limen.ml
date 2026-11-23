@@ -11791,6 +11791,12 @@ fn main(root: Root) {
       (let _, ds, _ = compile "mut-piped2" (mut_decls ^ main_wrap "    let mut k = 0\n    k |> bump") in
        List.for_all (fun (d : Diag.t) -> d.fix = None) ds)
       "a piped value got a fix";
+  errs "mut-self-bytes" "fn bump(mut self: Int) {\n    self = self + 1\n}\nfn main(root: Root) {\n    let mut bs = bytes([1])\n    bs[0].bump()\n}\n" [ "E0209" ];
+  let named = "interface Named {\n    fn name(self) -> Str\n}\nstruct P {\n    x: Int,\n}\nfn name(mut self: P) -> Str {\n    \"p\"\n}\n" in
+  says "mut-iface-dyn" (named ^ "fn main(root: Root) {\n    let p: dyn Named = P { x: 1 }\n}\n") "E0111" "its `name` has a `mut` parameter, so it cannot implement `Named`";
+  says "mut-iface-bound" (named ^ "fn show[T: Named](x: T) -> Str {\n    x.name()\n}\nfn main(root: Root) {\n    let s = show(P { x: 1 })\n}\n") "E0111" "its `name` has a `mut` parameter, so it cannot implement `Named`";
+  says "mut-piped-not-place" (mut_decls ^ main_wrap "    plain(1) |> bump") "E0213" "call `bump(mut x)`";
+  says "mut-param-note" "fn f(n: Int) {\n    n = 1\n}\nfn main(root: Root) {}\n" "E0205" "declare it `mut n` to change the caller's value";
   ok "mut-explained" (List.for_all (fun c -> List.mem_assoc c Diag.explanations) [ "E0213"; "E0214"; "E0215" ]) "no explanation";
 
   drain ();

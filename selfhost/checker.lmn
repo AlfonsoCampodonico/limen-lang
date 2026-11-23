@@ -459,6 +459,8 @@ fn method_fits(st: env.State, cx: env.Cx, t: types.Ty, name: Str, m: env.IfaceMe
             }
             (Some("type parameter `{g}` is not bounded by `{name}`; add it: `[{g}: {name}]`"), st)
         },
+        // a bound or `dyn` calls it as a value, with a plain receiver
+        TNamed(n, _) if cx.has_mut(key(n)) => (Some("its `{m.name}` has a `mut` parameter, so it cannot implement `{name}`"), st),
         TNamed(n, _) if cx.fns.contains(key(n)) => {
             let (_, ft, st) = instantiate(st, cx.fns.get(key(n)) ?? env.Sig { gen: [], params: [], ret: TErr })
             match ft {
@@ -1631,8 +1633,9 @@ fn check_method_value(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv: 
     let rt = match rt {
         Some(t) => st.repr(t),
         None => match st.desc(recv) {
-            // checked again (a table test's copy): the receiver of a `mut
-            // self` method
+            // checked again: a table test's cases share one body, so the
+            // receiver of a `mut self` method is already wrapped by the
+            // first check
             EMut(x) => {
                 let (t, next) = check_expr(st, cx, fx, x)
                 st = next.set_type(recv, t)
@@ -2074,7 +2077,7 @@ fn check_place(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr) -> env.State 
             Some((_, true)) => st.report(diag.error("E0205", e.span, "cannot modify `{n}` inside a closure").note("closures capture variables by value; return the new value from the closure instead")),
             Some((v, false)) if !v.mutable => match v.kind {
                 KLet => st.report(diag.error("E0205", e.span, "cannot modify `{n}`, it is not declared `mut`").fix("declare it as `let mut {n}`", { v.span with hi: v.span.lo }, "mut ")),
-                KParam => st.report(diag.error("E0205", e.span, "cannot modify parameter `{n}`").note("parameters are immutable; make a copy with `let mut {n} = {n}`")),
+                KParam => st.report(diag.error("E0205", e.span, "cannot modify parameter `{n}`").note("parameters are immutable; declare it `mut {n}` to change the caller's value, or make a copy with `let mut {n} = {n}`")),
                 KPat => st.report(diag.error("E0205", e.span, "cannot modify `{n}`, pattern and loop bindings are immutable")),
                 KGroup => st.report(diag.error("E0310", e.span, "`{n}` is a group handle; the only thing you can do with it is `{n}.go(...)`")),
             },
@@ -2124,15 +2127,15 @@ fn check_fn_args(st: env.State, cx: env.Cx, fx: env.Fx, passed_to: Option[Str], 
                     // a value piped in starts before the callee
                     let piped = a.span.lo < csp.lo
                     let mut d = diag.error("E0213", a.span, "`{who}` changes its parameter `{pn}`, so the argument must be written with `mut`")
+                    let place = match desc {
+                        EVar(_) | EField(..) | EIndex(..) => true,
+                        _ => false,
+                    }
                     if piped {
-                        d = d.note("a value piped with `|>` cannot be passed as `mut`; call `{who}(mut {source_of(cx, a.span)})`")
-                    } else {
-                        match desc {
-                            EVar(_) | EField(..) | EIndex(..) => {
-                                d = d.fix("add `mut`", { a.span with hi: a.span.lo }, "mut ")
-                            },
-                            _ => {},
-                        }
+                        let shown = if place { source_of(cx, a.span) } else { "x" }
+                        d = d.note("a value piped with `|>` cannot be passed as `mut`; call `{who}(mut {shown})`")
+                    } else if place {
+                        d = d.fix("add `mut`", { a.span with hi: a.span.lo }, "mut ")
                     }
                     st = st.report(d)
                 }
@@ -2188,10 +2191,11 @@ fn mut_receiver(st: env.State, cx: env.Cx, fx: env.Fx, key: Str, recv: ast.Expr)
         return st
     }
     match st.desc(recv) {
-        // checked again: a table test's copy
-        EMut(x) => check_place(st, cx, fx, x),
+        // checked again: a table test's cases share one body, so the first
+        // check already wrapped it
+        EMut(x) => check_target(check_place(st, cx, fx, x), x),
         d => {
-            let st = check_place(st, cx, fx, recv)
+            let st = check_target(check_place(st, cx, fx, recv), recv)
             let (inner, st) = st.node(d, recv.span)
             let st = st.set_type(inner, st.type_of(recv)).set_inst(inner, st.inst_of(recv))
             st.rewrite(recv, EMut(inner))
