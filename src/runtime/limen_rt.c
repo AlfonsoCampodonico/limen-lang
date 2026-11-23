@@ -526,15 +526,8 @@ W_RT L_Str *Str_split(WStr *s, WStr *sep) {
 }
 W_RT L_Str *Str_lines(WStr *s) {
   L_Str *out = L_Str_new(4);
-  int64_t from = 0;
-  for (int64_t i = 0; i <= s->len; i++) {
-    if (i == s->len || s->data[i] == '\n') {
-      int64_t end = i;
-      if (end > from && s->data[end - 1] == '\r') end--;
-      if (!(i == s->len && from == s->len)) L_Str_push(&out, Str_from(s->data + from, end - from));
-      from = i + 1;
-    }
-  }
+  size_t pos = 0, start, len;
+  while (lc_lines_next(s->data, (size_t)s->len, &pos, &start, &len)) L_Str_push(&out, Str_from(s->data + start, (int64_t)len));
   return out;
 }
 W_RT bool is_ws(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f'; }

@@ -8,11 +8,12 @@
   (flags
    (:standard
     (:include tls_cflags.sexp))))
- ; the interpreter's calls into C libraries (foreign blocks)
+ ; the interpreter's calls into C libraries (foreign blocks), and its way to
+ ; the built-ins written once in C (runtime/limen_core.h, through core_stubs)
  (foreign_stubs
   (language c)
-  (names ffi_stubs)
-  (extra_deps runtime/limen_sandbox.h runtime/limen_sql.h))
+  (names ffi_stubs core_stubs)
+  (extra_deps runtime/limen_sandbox.h runtime/limen_sql.h runtime/limen_core.h))
  (c_library_flags
   (:include tls_libs.sexp))
  (flags
@@ -33,11 +34,12 @@
    (run %{exe:design/embed_files.exe} %{deps}))))
 
 ; Embed the C runtime as OCaml strings: `text`, all of it as one program
-; starts (the sandbox, the declarations, the SQL core, the definitions), and `header`, the
-; declarations alone, which each piece of a split build includes.
+; starts (the sandbox, the declarations, the SQL core, the shared built-ins, the
+; definitions), and `header`, the declarations alone, which each piece of a split
+; build includes.
 (rule
  (targets runtime_text.ml)
- (deps runtime/limen_rt.h runtime/limen_sql.h runtime/limen_rt.c runtime/limen_sandbox.h)
+ (deps runtime/limen_rt.h runtime/limen_sql.h runtime/limen_core.h runtime/limen_rt.c runtime/limen_sandbox.h)
  (action
   (with-stdout-to
    runtime_text.ml
@@ -46,6 +48,7 @@
     (cat runtime/limen_sandbox.h)
     (cat runtime/limen_rt.h)
     (cat runtime/limen_sql.h)
+    (cat runtime/limen_core.h)
     (cat runtime/limen_rt.c)
     (echo "|xxrtxx}\n")
     (echo "let header = {xxrtxx|")

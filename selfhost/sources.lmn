@@ -16,9 +16,10 @@ pub fn std() -> Map[Str, Str] {
 }
 
 // The C every program starts with: the sandbox, then the runtime's
-// declarations, the SQL core and the definitions.
+// declarations, the SQL core, the shared built-ins (limen_core.h) and the
+// definitions, in the order src/dune pastes them.
 pub fn runtime() -> Str {
-    embed("../src/runtime/limen_sandbox.h") + runtime_header() + embed("../src/runtime/limen_sql.h") + embed("../src/runtime/limen_rt.c")
+    embed("../src/runtime/limen_sandbox.h") + runtime_header() + embed("../src/runtime/limen_sql.h") + embed("../src/runtime/limen_core.h") + embed("../src/runtime/limen_rt.c")
 }
 
 // The runtime's declarations alone, which each piece of a split build

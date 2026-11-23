@@ -627,6 +627,23 @@ fn walk(t: Tree) -> List[Int] {
     out.print("{s.lines()} {s.trim().split(", ")} {"abc".split("")}")
     out.print("{s.contains("World")} {"aXbXc".replace("X", "--")} {"q\"t"} {["tab\t"]}")|})
     "[\"  Hello, World\", \"second line\", \"\", \"last\"] [\"Hello\", \"World\\r\\nsecond line\\n\\nlast\"] [\"a\", \"b\", \"c\"]\ntrue a--b--c q\"t [\"tab\\t\"]\n";
+  out "str-lines-cr"
+    (main_wrap {|    out.print("{"\r".lines()} {"a\n\r".lines()} {"a\r\nb\r\n".lines()} {"".lines()} {"\n".lines()} {"a\n\n".lines()} {"\r\n\r".lines()}")|})
+    "[] [\"a\"] [\"a\", \"b\"] [] [\"\"] [\"a\", \"\"] [\"\"]\n";
+  out "str-lines-gc"
+    (main_wrap {|    let mut parts: List[Str] = []
+    for i in 0..<1000 {
+        parts.push("x{i}")
+    }
+    let s = parts.join("\n")
+    let mut ok = 0
+    for i in 0..<300 {
+        if s.lines().join("\n") == s && s.lines().len() == 1000 {
+            ok = ok + 1
+        }
+    }
+    out.print("{ok}")|})
+    "300\n";
   out "numbers"
     (main_wrap {|    out.print("{7 / -2} {-7 % 3} {2.0 / 4.0} {1.0 / 3.0} {(2.7).to_int()} {(-3).abs()} {10.to_float() * 1.5} {0.1 + 0.2}")|})
     "-3 -1 0.5 0.333333333333333 2 3 15.0 0.3\n";

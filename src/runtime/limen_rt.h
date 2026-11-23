@@ -4,11 +4,14 @@
    The runtime is two files. This one holds what generated code needs to see:
    includes, macros, types, the small functions it inlines, and a prototype
    or extern declaration for everything else. limen_rt.c holds the rest of
-   the definitions. A native build compiles limen_sandbox.h, this file and
-   limen_rt.c as one object, once per C compiler and set of flags, and keeps
-   it in the build cache; each piece of a program includes only this file.
-   `limen build --emit-c` writes all three ahead of the program, as one file
-   that needs nothing else.
+   the definitions. Beside them: limen_sandbox.h (the sandbox), limen_sql.h
+   (the SQL core) and limen_core.h (the built-ins written once, shared with
+   the interpreter). A native build compiles limen_sandbox.h, this file,
+   limen_sql.h, limen_core.h and limen_rt.c, in that order, as one object,
+   once per C compiler and set of flags, and keeps it in the build cache;
+   each piece of a program includes only this file. `limen build --emit-c`
+   writes all of them ahead of the program, as one file that needs nothing
+   else.
 
    So: a function the program calls goes in limen_rt.c, marked W_RT, with
    its prototype here; one small and hot enough to be worth inlining into

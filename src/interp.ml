@@ -447,11 +447,6 @@ let split_on s sep =
 
 let replace_all s a b = if a = "" then s else String.concat b (split_on s a)
 
-let lines s =
-  let ls = String.split_on_char '\n' s in
-  let ls = List.map (fun l -> if String.ends_with ~suffix:"\r" l then String.sub l 0 (String.length l - 1) else l) ls in
-  match List.rev ls with "" :: rest -> List.rev rest | _ -> ls
-
 (* Decimal only, optional sign, surrounding whitespace allowed (same as the C runtime). *)
 (* A decimal float: digits with optional sign, point and exponent; no hex, nan or inf. *)
 let parse_float s =
@@ -2979,7 +2974,7 @@ and call_method rt v name args sp =
     VList (Array.of_list (List.map (fun (k, v) -> VStruct (Ast.tuple_name 2, [ ("0", k); ("1", v) ])) (map_entries mv)))
   | VStr s, "len", [] -> vint (String.length s)
   | VStr s, "is_empty", [] -> VBool (s = "")
-  | VStr s, "lines", [] -> strs (lines s)
+  | VStr s, "lines", [] -> VList (Array.map (fun l -> VStr l) (Core.lines s))
   | VStr s, "split", [ VStr sep ] -> strs (split_on s sep)
   | VStr s, "trim", [] -> VStr (String.trim s)
   | VStr s, "contains", [ VStr t ] -> VBool (find_sub s t 0 <> None)

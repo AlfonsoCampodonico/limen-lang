@@ -3329,7 +3329,8 @@ fn quoted(s: Str) -> Str {
 
 // The program as C: `files` are the program's files (with the prelude's
 // and the built-in methods'), so panics can say where they happened;
-// `runtime` is the whole runtime (limen_sandbox.h, limen_rt.h, limen_rt.c).
+// `runtime` is the whole runtime (limen_sandbox.h, limen_rt.h, limen_sql.h,
+// limen_core.h, limen_rt.c).
 pub fn program(ro: lower.Ro, files: List[diag.Source], prog: ir.Program, runtime: Str) -> Str {
     let mut c = Cg {
         ro,
