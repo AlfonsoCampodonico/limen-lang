@@ -62,3 +62,22 @@ void vt_times(void (*f)(int64_t), int64_t n) { for (int64_t i = 1; i <= n; i++) 
 int64_t vt_slow_len(const char *s, int64_t ms) { usleep((useconds_t)(ms * 1000)); return (int64_t)strlen(s); }
 int64_t vt_slow_out(int64_t ms, int64_t *out) { usleep((useconds_t)(ms * 1000)); *out = ms * 2; return ms; }
 const char *vt_slow_name(int64_t ms) { usleep((useconds_t)(ms * 1000)); return "slow"; }
+
+/* For the sql tests: whether a lock is held on byte `offset` of `path`, as
+   another process sees it (a process never sees its own): 1, 0, or -1. */
+#include <fcntl.h>
+#include <sys/wait.h>
+int32_t vt_lock_held(const char *path, int64_t offset) {
+  pid_t pid = fork();
+  if (pid == 0) {
+    int fd = open(path, O_RDONLY);
+    struct flock fl;
+    memset(&fl, 0, sizeof fl);
+    fl.l_type = F_WRLCK; fl.l_whence = SEEK_SET; fl.l_start = (off_t)offset; fl.l_len = 1;
+    if (fd < 0 || fcntl(fd, F_GETLK, &fl) != 0) _exit(2);
+    _exit(fl.l_type == F_UNLCK ? 0 : 1);
+  }
+  int st;
+  if (pid < 0 || waitpid(pid, &st, 0) != pid || !WIFEXITED(st) || WEXITSTATUS(st) == 2) return -1;
+  return WEXITSTATUS(st);
+}

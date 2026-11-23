@@ -4085,6 +4085,115 @@ fn main(root: Root) -> Result[(), IoError] {
   out "sql-no-fs" ~grants:sqlg
     "use sql\n\nfn main(root: Root) {\n    root.stdout.print(\"{sql.open(root.fs, \"x.db\")}\")\n}\n"
     "Err(Denied(\"fs: not granted (run with --grant fs=DIR)\"))\n";
+  (* what SQLite does with files today, pinned before it opens them itself *)
+  if selected "sql-locks-survive-close" then begin
+    let src = {v|use sql
+
+foreign "limentest" {
+    fn vt_lock_held(path: Str, offset: Int) -> Int32
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let fs = root.fs
+    let f = root.foreign
+    fs.remove("held.db")
+    let a = sql.open(fs, "held.db")?
+    a.exec("CREATE TABLE t (x)")?
+    let path = fs.full_path("held.db")?
+    // SQLite's RESERVED byte, 0x40000001
+    let reserved = 1073741825
+    a.exec("BEGIN IMMEDIATE")?
+    let before = vt_lock_held(f, path, reserved)
+    let b = sql.open(fs, "held.db")?
+    b.query("SELECT COUNT(*) AS n FROM t")?
+    b.close()?
+    let after = vt_lock_held(f, path, reserved)
+    a.exec("COMMIT")?
+    root.stdout.print("{before} {after} {vt_lock_held(f, path, reserved)}")
+    a.close()?
+    fs.remove("held.db")
+    Ok(())
+}
+|v} in
+    match run ~grants:{ sqlg with fs = Some (sqlreal, false); foreign = [ "limentest" ] } "sql-locks-survive-close" src with
+    | Ok (got, _) -> ok "sql-locks-survive-close" (got = "1 1 0\n") (sprintf "got %S, want %S" got "1 1 0\n")
+    | Error e -> ok "sql-locks-survive-close" false e
+  end;
+  let sql_wal = {v|use sql
+
+fn count(db: sql.Db) -> Int {
+    match db.query("SELECT COUNT(*) AS n FROM t") {
+        Ok(rows) => rows[0].int("n") ?? -1,
+        Err(_) => -1,
+    }
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let out = root.stdout
+    let fs = root.fs
+    for f in ["wal.db", "wal.db-wal", "wal.db-shm"] {
+        fs.remove(f)
+    }
+    let a = sql.open(fs, "wal.db")?
+    a.exec("PRAGMA journal_mode = WAL")?
+    a.exec("PRAGMA wal_autocheckpoint = 0")?
+    a.exec("CREATE TABLE t (x)")?
+    a.exec("CREATE TABLE big (b BLOB)")?
+    // more frames than the -shm's first 32 KB region indexes (4062)
+    a.exec("INSERT INTO big SELECT zeroblob(3000) FROM (WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 4200) SELECT x FROM c)")?
+    a.exec("INSERT INTO t VALUES (1)")?
+    let mode = a.query("PRAGMA journal_mode")?[0].text("journal_mode") ?? "?"
+    let b = sql.open(fs, "wal.db")?
+    let blobs = b.query("SELECT COUNT(*) AS n FROM big")?[0].int("n") ?? -1
+    // a reads from a snapshot while b writes: rollback mode would make b wait out the busy timeout
+    a.exec("BEGIN")?
+    let before = count(a)
+    let wrote = b.exec("INSERT INTO t VALUES (?)", [sql.Int(2)])
+    let during = count(a)
+    a.exec("COMMIT")?
+    let after = count(a)
+    let ro = sql.open(fs.read_only(), "wal.db")?
+    out.print("{mode} {fs.exists("wal.db-wal")} {fs.exists("wal.db-shm")} {blobs} {before} {wrote} {during} {after} {count(ro)}")
+    ro.close()?
+    b.close()?
+    a.close()?
+    out.print("{fs.exists("wal.db-wal")} {fs.exists("wal.db-shm")}")
+    let cold = sql.open(fs.read_only(), "wal.db")?
+    out.print("{count(cold)}")
+    cold.close()?
+    for f in ["wal.db", "wal.db-wal", "wal.db-shm"] {
+        fs.remove(f)
+    }
+    Ok(())
+}
+|v} in
+  let sql_wal_want = "wal true true 4200 1 Ok(1) 1 2 2\ntrue true\n2\n" in
+  out "sql-wal" ~grants:{ sqlg with fs = Some (sqlreal, false) } sql_wal sql_wal_want;
+  (let tdir = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "limen-sql-tsan-%d" (Unix.getpid ())) in
+   (try Unix.mkdir tdir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+   check_tsan "sql-wal" ~grants:{ sqlg with fs = Some (Unix.realpath tdir, false) } sql_wal sql_wal_want);
+  (let link = Filename.concat sqlreal "link.db" in
+   (try Unix.unlink link with Unix.Unix_error _ -> ());
+   (try Unix.symlink "real.db" link with Unix.Unix_error _ -> ());
+   out "sql-db-link" ~grants:{ sqlg with fs = Some (sqlreal, false) }
+     "use sql\n\nfn main(root: Root) {\n    root.stdout.print(\"{sql.open(root.fs, \"link.db\")}\")\n}\n"
+     (sprintf "Err(Failed(\"sql: cannot open `%s/link.db`: unable to open database file\"))\n" sqlreal));
+  if Unix.geteuid () <> 0 then begin
+    let rofile = Filename.concat sqlreal "ro-file.db" in
+    (try Unix.chmod rofile 0o644; Unix.unlink rofile with Unix.Unix_error _ -> ());
+    close_out (open_out rofile);
+    Unix.chmod rofile 0o444;
+    out "sql-readonly-file" ~grants:{ sqlg with fs = Some (sqlreal, false) }
+      {v|use sql
+
+fn main(root: Root) -> Result[(), IoError] {
+    let db = sql.open(root.fs, "ro-file.db")?
+    root.stdout.print("{db.query("SELECT 1 AS one")?[0].int("one")} {db.exec("CREATE TABLE t (x)")}")
+    db.close()
+}
+|v}
+      "Some(1) Err(Failed(\"sql: attempt to write a readonly database\"))\n"
+  end;
   (* SQLite's slow calls are blocking: tasks with a connection each query in
      parallel, and a deadline stops a long query at once (the cancelled task
      interrupts it, finalizes the statement and ends its use of the
