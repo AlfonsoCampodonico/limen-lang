@@ -136,3 +136,21 @@ value limen_core_parse_float(value s) {
   out = caml_alloc_some(boxed);
   CAMLreturn(out);
 }
+
+/* Order stubs: no allocation, so no roots; called noalloc. */
+intnat limen_core_float_cmp(double a, double b) { return lc_float_cmp(a, b); }
+value limen_core_float_cmp_byte(value a, value b) { return Val_int(lc_float_cmp(Double_val(a), Double_val(b))); }
+value limen_core_str_cmp(value a, value b) {
+  return Val_int(lc_bytes_cmp(String_val(a), caml_string_length(a), String_val(b), caml_string_length(b)));
+}
+
+value limen_core_escaped(value s) {
+  CAMLparam1(s);
+  CAMLlocal1(out);
+  size_t n = caml_string_length(s);
+  size_t k = lc_escaped_len(String_val(s), n);
+  out = caml_alloc_string(k);
+  /* String_val read after the allocation, which may have moved s */
+  lc_escape(String_val(s), n, (char *)Bytes_val(out));
+  CAMLreturn(out);
+}

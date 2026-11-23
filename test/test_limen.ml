@@ -712,6 +712,40 @@ fn walk(t: Tree) -> List[Int] {
   out "float-to-fixed-huge"
     (main_wrap {|    out.print("{1.7976931348623157e308.to_fixed(30).len()} {(-1.7976931348623157e308).to_fixed(30).len()} {(-1.7976931348623157e308).to_fixed(30).slice(0, 4)}")|})
     "340 341 -179\n";
+  (* Core's order and escaping against OCaml's compare and String.escaped,
+     which the interpreter used before they were written once in C *)
+  if selected "core-order-escape" then begin
+    let fs = [ nan; -.nan; neg_infinity; -1.5; -0.0; 0.0; 5e-324; 1.0; infinity ] in
+    let sg c = compare c 0 in
+    List.iter
+      (fun a ->
+        List.iter
+          (fun b ->
+            ok "core-order-escape" (Core.float_cmp a b = sg (compare a b)) (sprintf "float_cmp %h %h = %d" a b (Core.float_cmp a b)))
+          fs)
+      fs;
+    let ss = [ ""; "a"; "a\000"; "a\000b"; "ab"; "b"; "\255"; "\128a"; "abc" ] in
+    List.iter
+      (fun a -> List.iter (fun b -> ok "core-order-escape" (Core.str_cmp a b = sg (compare a b)) (sprintf "str_cmp %S %S" a b)) ss)
+      ss;
+    let all = String.init 256 Char.chr in
+    List.iter
+      (fun s -> ok "core-order-escape" (Core.escaped s = "\"" ^ String.escaped s ^ "\"") (sprintf "escaped %S" s))
+      [ ""; all; String.make 600 '\n'; "\"\\'\b\t\r\n\127" ]
+  end;
+  (* buf_escaped's 512-byte stack buffer: escaped lengths either side of it *)
+  out "str-escape-long"
+    (main_wrap {|    for n in [253, 254, 255, 600] {
+        let mut ps: List[Str] = []
+        for i in 0..<n {
+            ps.push("\n")
+        }
+        let xs = [ps.join("") + "\"", bytes([0, 255]).to_str()]
+        let s = "{xs}"
+        out.print("{n} {s.len()} {s.slice(0, 6)} {s.slice(s.len() - 18, s.len())}")
+    }|})
+    (String.concat ""
+       (List.map (fun n -> sprintf "%d %d [\"\\n\\n \\n\\\"\", \"\\000\\255\"]\n" n ((2 * n) + 18)) [ 253; 254; 255; 600 ]));
   out "numbers"
     (main_wrap {|    out.print("{7 / -2} {-7 % 3} {2.0 / 4.0} {1.0 / 3.0} {(2.7).to_int()} {(-3).abs()} {10.to_float() * 1.5} {0.1 + 0.2}")|})
     "-3 -1 0.5 0.333333333333333 2 3 15.0 0.3\n";

@@ -342,7 +342,7 @@ let show ?(top = true) v =
     | VUInt (_, n) -> s (Printf.sprintf "%Lu" n)
     | VFloat x -> s (fmt_float x)
     | VBool x -> s (string_of_bool x)
-    | VStr x -> if top then s x else (s "\""; s (String.escaped x); s "\"")
+    | VStr x -> s (if top then x else Core.escaped x)
     | VBytes x ->
       s "bytes([";
       String.iteri (fun i c -> if i > 0 then s ", "; s (string_of_int (Char.code c))) x;
@@ -402,8 +402,8 @@ let rec compare_v a b =
   match (a, b) with
   | VInt x, VInt y -> compare x y
   | VUInt (_, x), VUInt (_, y) -> Int64.unsigned_compare x y
-  | VFloat x, VFloat y -> compare x y
-  | VStr x, VStr y | VBytes x, VBytes y -> compare x y
+  | VFloat x, VFloat y -> Core.float_cmp x y
+  | VStr x, VStr y | VBytes x, VBytes y -> Core.str_cmp x y
   | VBool x, VBool y -> compare x y
   | VList x, VList y -> lex (Array.to_list x) (Array.to_list y)
   | VStruct (_, xs), VStruct (_, ys) -> lex (List.map snd xs) (List.map snd ys)

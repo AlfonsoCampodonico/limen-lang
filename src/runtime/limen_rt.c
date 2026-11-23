@@ -383,12 +383,7 @@ W_RT WStr *Str_new(int64_t len) {
   return s;
 }
 W_RT WStr *Str_from(const char *p, int64_t len) { WStr *s = Str_new(len); memcpy(s->data, p, (size_t)len); return s; }
-W_RT int Str_cmp(WStr *a, WStr *b) {
-  int64_t n = a->len < b->len ? a->len : b->len;
-  int c = memcmp(a->data, b->data, (size_t)n);
-  if (c) return c < 0 ? -1 : 1;
-  return a->len < b->len ? -1 : (a->len > b->len ? 1 : 0);
-}
+W_RT int Str_cmp(WStr *a, WStr *b) { return lc_bytes_cmp(a->data, (size_t)a->len, b->data, (size_t)b->len); }
 W_RT WStr *Str_concat(WStr *a, WStr *b) {
   WStr *s = Str_new(a->len + b->len);
   memcpy(s->data, a->data, (size_t)a->len); memcpy(s->data + a->len, b->data, (size_t)b->len);
@@ -406,33 +401,19 @@ W_RT WStr *buf_take(WBuf *b) { WStr *s = Str_from(b->p, b->len); free(b->p); ret
 /* A Float as Float.to_str prints it (lc_fmt_float). */
 W_RT void fmt_float(char *out, size_t n, double x) { lc_fmt_float(out, n, x); }
 
-/* Same escaping as OCaml's String.escaped, so output matches the interpreter. */
+/* A Str as it prints inside a container (lc_escape), through a stack
+   buffer, or one from w_raw for a longer string. */
 W_RT void buf_escaped(WBuf *b, WStr *s) {
-  char tmp[8];
-  buf_puts(b, "\"");
-  for (int64_t i = 0; i < s->len; i++) {
-    unsigned char c = (unsigned char)s->data[i];
-    switch (c) {
-      case '"': buf_puts(b, "\\\""); break;
-      case '\\': buf_puts(b, "\\\\"); break;
-      case '\n': buf_puts(b, "\\n"); break;
-      case '\t': buf_puts(b, "\\t"); break;
-      case '\r': buf_puts(b, "\\r"); break;
-      case '\b': buf_puts(b, "\\b"); break;
-      default:
-        if (c >= 32 && c <= 126) buf_putn(b, (const char *)&c, 1);
-        else { snprintf(tmp, sizeof tmp, "\\%03u", c); buf_puts(b, tmp); }
-    }
-  }
-  buf_puts(b, "\"");
+  char small[512];
+  size_t k = lc_escaped_len(s->data, (size_t)s->len);
+  char *t = k <= sizeof small ? small : (char *)w_raw(k);
+  lc_escape(s->data, (size_t)s->len, t);
+  buf_putn(b, t, (int64_t)k);
+  if (t != small) free(t);
 }
 
-/* Total order with nan first, like OCaml's compare (used by sort). */
-W_RT int Float_cmp(double a, double b) {
-  if (isnan(a)) return isnan(b) ? 0 : -1;
-  if (isnan(b)) return 1;
-  return a < b ? -1 : (a > b ? 1 : 0);
-}
+/* Float's total order (lc_float_cmp), used by sort. */
+W_RT int Float_cmp(double a, double b) { return lc_float_cmp(a, b); }
 
 W_RT void Int_show(WBuf *b, int64_t x, bool top) { (void)top; char t[32]; snprintf(t, sizeof t, "%lld", (long long)x); buf_puts(b, t); }
 W_RT void UInt_show(WBuf *b, uint64_t x, bool top) { (void)top; char t[32]; snprintf(t, sizeof t, "%llu", (unsigned long long)x); buf_puts(b, t); }

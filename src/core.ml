@@ -37,3 +37,15 @@ external to_fixed : float -> int64 -> string = "limen_core_to_fixed"
 (* A decimal float with optional sign, point, exponent and surrounding
    spaces; no hex, nan or inf (lc_parse_float). *)
 external parse_float : string -> float option = "limen_core_parse_float"
+
+(* Float's total order (lc_float_cmp): NaN first and equal to itself, -0.0
+   equal to 0.0; -1, 0 or 1. *)
+external float_cmp : (float [@unboxed]) -> (float [@unboxed]) -> (int [@untagged])
+  = "limen_core_float_cmp_byte" "limen_core_float_cmp"
+[@@noalloc]
+
+(* Str and Bytes order (lc_bytes_cmp): byte by byte, then length; -1, 0 or 1. *)
+external str_cmp : string -> string -> int = "limen_core_str_cmp" [@@noalloc]
+
+(* [s] as it prints inside a container, quotes included (lc_escape). *)
+external escaped : string -> string = "limen_core_escaped"

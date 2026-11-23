@@ -215,4 +215,61 @@ LC_FN lc_float_parse lc_parse_float(const char *s, size_t n, double *out) {
   return LC_FLOAT_OK;
 }
 
+/* Float's total order, for sort and for Floats inside containers: NaN
+   first and equal to itself, -0.0 equal to 0.0. -1, 0 or 1. */
+LC_FN int lc_float_cmp(double a, double b) {
+  if (a != a) return b != b ? 0 : -1;
+  if (b != b) return 1;
+  return a < b ? -1 : (a > b ? 1 : 0);
+}
+
+/* Str and Bytes order: byte by byte as unsigned, then the shorter first.
+   -1, 0 or 1. */
+LC_FN int lc_bytes_cmp(const char *a, size_t an, const char *b, size_t bn) {
+  int c = memcmp(a, b, an < bn ? an : bn);
+  if (c) return c < 0 ? -1 : 1;
+  return an < bn ? -1 : (an > bn ? 1 : 0);
+}
+
+/* A Str inside a container (SPEC.md, How values print): quoted, with ",
+   \, newline, tab, \r and \b escaped and any other byte outside 32..126
+   as \ddd, three decimal digits. lc_escaped_len is its length, quotes
+   included; lc_escape writes exactly that many bytes to out, no NUL. */
+LC_FN size_t lc_escaped_len(const char *s, size_t n) {
+  size_t k = 2;
+  for (size_t i = 0; i < n; i++) {
+    unsigned char c = (unsigned char)s[i];
+    if (c == '"' || c == '\\' || c == '\n' || c == '\t' || c == '\r' || c == '\b') k += 2;
+    else if (c >= 32 && c <= 126) k += 1;
+    else k += 4;
+  }
+  return k;
+}
+LC_FN void lc_escape(const char *s, size_t n, char *out) {
+  size_t k = 0;
+  out[k++] = '"';
+  for (size_t i = 0; i < n; i++) {
+    unsigned char c = (unsigned char)s[i];
+    char e = 0;
+    switch (c) {
+      case '"': e = '"'; break;
+      case '\\': e = '\\'; break;
+      case '\n': e = 'n'; break;
+      case '\t': e = 't'; break;
+      case '\r': e = 'r'; break;
+      case '\b': e = 'b'; break;
+      default: break;
+    }
+    if (e) { out[k++] = '\\'; out[k++] = e; }
+    else if (c >= 32 && c <= 126) out[k++] = (char)c;
+    else {
+      out[k++] = '\\';
+      out[k++] = (char)('0' + c / 100);
+      out[k++] = (char)('0' + c / 10 % 10);
+      out[k++] = (char)('0' + c % 10);
+    }
+  }
+  out[k] = '"';
+}
+
 #endif
