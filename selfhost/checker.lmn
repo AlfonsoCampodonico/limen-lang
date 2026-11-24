@@ -2346,6 +2346,29 @@ fn changed_in(st: env.State, above: List[Changed], e: ast.Expr) -> List[Changed]
     }
 }
 
+// The places assigned (`p = v`) in a block, with where each is written:
+// its statements and those of the blocks they hold.
+fn block_assigns(st: env.State, b: ast.Block) -> List[(ast.Span, (Str, List[PStep]))] {
+    b.stmts.flat_map(|s| match s.desc {
+        SAssign(a, _) => place_path(st, a).map(|p| [(a.span, p)]) ?? [],
+        SWhile(_, body) | SFor(_, _, _, body) | SForPat(_, _, body) | SDefer(body) => block_assigns(st, body),
+        _ => [],
+    })
+}
+
+// The places assigned inside `e`, outside closures: those of the blocks
+// directly in it, then those of the expressions inside it.
+fn assigned_in(st: env.State, e: ast.Expr) -> List[(ast.Span, (Str, List[PStep]))] {
+    let here = match st.desc(e) {
+        EClosure(..) => {
+            return []
+        },
+        EBlock(b) | EIf(_, b, _) | EGroup(_, _, _, b) => block_assigns(st, b),
+        _ => [],
+    }
+    here + expr_kids(st, e).flat_map(|k| assigned_in(st, k))
+}
+
 // E0214: the `mut` places of one call, `changed` (the receiver of `push`
 // or `remove`) and the `mut` ones among `parts` (its receiver and
 // arguments, in written order), may not clash, nor may a place that a
@@ -2377,6 +2400,13 @@ fn mut_overlap(st: env.State, changed: Option[ast.Expr], parts: List[ast.Expr]) 
     for c in inside_parts(st, whole).flat_map(|k| changed_in(st, [], k)) {
         if own.any(|o| clash(c, o)) {
             st = st.report(diag.error("E0214", c.at, "this changes a value that the enclosing call also takes as `mut`").note("make that call first, on its own line, and pass its result"))
+        }
+    }
+    // an assignment in another argument would change the place the callee
+    // is given, or what the caller reads back
+    for a in inside_parts(st, whole).flat_map(|k| assigned_in(st, k)) {
+        if own.any(|o| o.written && overlaps(a.1, o.path)) {
+            st = st.report(diag.error("E0214", a.0, "this assigns a value that the enclosing call takes as `mut`").note("assign it before the call, on its own line"))
         }
     }
     st

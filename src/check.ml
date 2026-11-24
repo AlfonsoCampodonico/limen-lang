@@ -1074,6 +1074,25 @@ let rec changed_in above (e : expr) =
     @ List.concat_map (changed_in (own @ above)) (inside_parts (expr_kids e))
   | _ -> List.concat_map (changed_in above) (expr_kids e)
 
+(* The places assigned (`p = v`) inside [e], outside closures, with where
+   each is written: a block's statements and those of the blocks they
+   hold, then the expressions inside [e]. *)
+let rec block_assigns (b : block) =
+  List.concat_map
+    (fun s ->
+      match s.sdesc with
+      | SAssign (a, _) -> Option.to_list (Option.map (fun p -> (a.espan, p)) (place_path a))
+      | SWhile (_, b) | SFor (_, _, _, b) | SForPat (_, _, b) | SDefer b -> block_assigns b
+      | SLet _ | SExpr _ | SLetPat _ | SReturn _ | SBreak | SContinue -> [])
+    b.stmts
+
+let rec assigned_in (e : expr) =
+  match e.edesc with
+  | EClosure _ -> []
+  | _ ->
+    (match e.edesc with EBlock b | EIf (_, b, _) | EGroup (_, _, _, b) -> block_assigns b | _ -> [])
+    @ List.concat_map assigned_in (expr_kids e)
+
 let rec check_expr ctx f e : ty =
   let t = check_expr_inner ctx f e in
   (match e.edesc with ECall _ | EMethod _ -> infer_pending ctx | _ -> ());
@@ -2263,7 +2282,15 @@ and mut_overlap ctx ?changed parts =
         if List.exists (clash c) own then
           err ctx "E0214" sp "this changes a value that the enclosing call also takes as `mut`"
             ~notes:[ "make that call first, on its own line, and pass its result" ])
-      (List.concat_map (changed_in []) (inside_parts (Option.to_list changed @ parts)))
+      (List.concat_map (changed_in []) (inside_parts (Option.to_list changed @ parts)));
+  (* an assignment in another argument would change the place the callee
+     is given, or what the caller reads back *)
+  List.iter
+    (fun (sp, p) ->
+      if List.exists (fun (_, q, w) -> w && overlaps p q) own then
+        err ctx "E0214" sp "this assigns a value that the enclosing call takes as `mut`"
+          ~notes:[ "assign it before the call, on its own line" ])
+    (List.concat_map assigned_in (inside_parts (Option.to_list changed @ parts)))
 
 (* Can errors of type [e] become `dyn Error`? None if so, else why not. *)
 and error_conversion ctx e =

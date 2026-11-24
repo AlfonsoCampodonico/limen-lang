@@ -71,7 +71,7 @@ fn maybe(e: Option[ast.Expr]) -> List[ast.Expr] {
 }
 
 // The expressions directly inside `e`, as written.
-fn below(e: ast.Expr) -> List[ast.Expr] {
+pub fn below(e: ast.Expr) -> List[ast.Expr] {
     match e.desc {
         EInt(_) | EFloat(_) | EBool(_) | EUnit | EVar(_) => [],
         EStr(parts) => parts.flat_map(|part| match part {

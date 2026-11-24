@@ -232,6 +232,21 @@ let is_enum_name f n = not_local f n && Hashtbl.mem f.g.enums n
 
 (* ---------- expressions ---------- *)
 
+let rec root_of (e : expr) = match e.edesc with EVar n -> Some n | EField (a, _, _) | EIndex (a, _) | EMut a -> root_of a | _ -> None
+
+(* Does [e] change variable [n] outside closures: assign a place in it,
+   pass one as `mut`, or push to or remove from it? *)
+let rec changes n (e : expr) =
+  match e.edesc with
+  | EClosure _ -> false
+  | _ ->
+    (match e.edesc with
+     | EMut p -> root_of p = Some n
+     | EMethod (r, m, _, _) -> Check.changes_receiver m r && root_of r = Some n
+     | EBlock b | EIf (_, b, _) | EGroup (_, _, _, b) -> List.exists (fun (_, (r, _)) -> r = n) (Check.block_assigns b)
+     | _ -> false)
+    || List.exists (changes n) (Check.expr_kids e)
+
 let rec lower f (e : expr) : I.atom =
   if f.dead then I.AUnit
   else
@@ -504,36 +519,72 @@ and lower_call f e callee args ty =
     let c = instance f.g n (List.map (fun (k, t) -> (k, zonk f.genv t)) callee.einst) in
     call f c args ty
   | EVar n when not_local f n && Hashtbl.mem f.g.ctors n ->
-    let xs = List.map (lower f) args in
+    let xs = lower_args f args in
     tmp f ty (I.MkEnum (ty, tag_of f.g ty n, xs))
   | EField ({ edesc = EVar en; _ }, v, _) when is_enum_name f en ->
-    let xs = List.map (lower f) args in
+    let xs = lower_args f args in
     tmp f ty (I.MkEnum (ty, tag_of f.g ty v, xs))
   | _ ->
     let c = lower f callee in
-    let xs = List.map (lower f) args in
+    let xs = lower_args f args in
     tmp f ty (I.CallClo (c, xs))
+
+(* The arguments of a call, left to right. A variable argument that a
+   later argument changes is copied where it is written, so the call is
+   given the value it had there. *)
+and lower_args f args =
+  let rec go = function
+    | [] -> []
+    | (a : expr) :: rest ->
+      let x = lower_arg f a rest in
+      x :: go rest
+  in
+  go args
+
+and lower_arg f (a : expr) rest =
+  match (a.edesc, lower f a) with
+  | EVar n, (I.V v as x) -> if List.exists (changes n) rest then tmp f v.ty (I.Atom x) else x
+  | _, x -> x
 
 (* A call of a top-level function or a method: a plain Call, or with a
    `mut` argument a CallMut, its arguments lowered in order, each `mut`
    place to its variable and steps. *)
 and call f c args ty =
   if List.exists (fun (a : expr) -> match a.edesc with EMut _ -> true | _ -> false) args then begin
-    let xs =
-      List.map
-        (fun (a : expr) ->
-          match a.edesc with
-          | EMut p ->
-            let v, steps = lower_place f p in
-            I.ByPlace (v, steps)
-          | _ -> I.ByValue (lower f a))
-        args
+    let rec go = function
+      | [] -> []
+      | (a : expr) :: rest -> (
+        match a.edesc with
+        | EMut p -> let x = mut_arg f p in x :: go rest
+        | _ -> let x = lower_arg f a rest in I.ByValue x :: go rest)
     in
+    let xs = go args in
     tmp f ty (I.CallMut (c, xs))
   end
   else
-    let xs = List.map (lower f) args in
+    let xs = lower_args f args in
     tmp f ty (I.Call (c, xs))
+
+(* A `mut` place, where it is written: its indexes and keys copied, so a
+   later argument cannot move it, and read up to the last of them, so a
+   missing element panics there; the pointer to it is taken at the call. *)
+and mut_arg f p =
+  let v, steps = lower_place f p in
+  let snap = function I.V w as x -> tmp f w.ty (I.Atom x) | x -> x in
+  let steps =
+    List.map (function I.PIndex (a, sp) -> I.PIndex (snap a, sp) | I.PKey (a, sp) -> I.PKey (snap a, sp) | s -> s) steps
+  in
+  (* the innermost index or key of the place, and how many steps lead to it *)
+  let rec last (x : expr) =
+    match x.edesc with
+    | EField (r, _, _) -> last r
+    | EIndex _ -> Some (tyof f x, depth x)
+    | _ -> None
+  and depth (x : expr) = match x.edesc with EField (r, _, _) | EIndex (r, _) -> 1 + depth r | _ -> 0 in
+  (match last p with
+   | Some (t, n) -> ignore (tmp f t (I.Get (I.V v, v.ty, List.filteri (fun i _ -> i < n) steps)))
+   | None -> ());
+  I.ByPlace (v, steps)
 
 (* A chain of field and index reads, so `a[i].x` is one Get, not two copies. *)
 and access f e : I.atom * ty * I.step list =

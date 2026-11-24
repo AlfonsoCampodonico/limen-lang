@@ -23,6 +23,7 @@ use ffi
 use free
 use ir
 use types
+use walk
 
 // What lowering reads and never changes: the checked program.
 pub struct Ro {
@@ -919,7 +920,7 @@ fn lower_call(self: Lx, e: ast.Expr, callee: ast.Expr, args: List[ast.Expr], ty:
                     None => {},
                 }
                 if lx.ro.ctors.contains(n) {
-                    let (xs, lx) = lx.lower_all(args)
+                    let (xs, lx) = lx.lower_args(args)
                     return lx.tmp(ty, MkEnum(ty, tag_of(lx.ro, ty, n), xs))
                 }
             }
@@ -931,7 +932,7 @@ fn lower_call(self: Lx, e: ast.Expr, callee: ast.Expr, args: List[ast.Expr], ty:
                 _ => (false, self),
             }
             if is_ctor {
-                let (xs, lx) = lx.lower_all(args)
+                let (xs, lx) = lx.lower_args(args)
                 return lx.tmp(ty, MkEnum(ty, tag_of(lx.ro, ty, v), xs))
             }
             lx.call_value(callee, args, ty)
@@ -949,20 +950,20 @@ fn call(self: Lx, c: Str, args: List[ast.Expr], ty: types.Ty) -> (ir.Atom, Lx) {
         _ => false,
     }
     if !args.any(is_mut) {
-        let (xs, lx) = self.lower_all(args)
+        let (xs, lx) = self.lower_args(args)
         return lx.tmp(ty, Call(c, xs))
     }
     let mut lx = self
     let mut xs: List[ir.Arg] = []
-    for a in args {
+    for (k, a) in args.with_index() {
         match a.desc {
             EMut(p) => {
-                let (v, steps, next) = lx.lower_place(p)
+                let (x, next) = lx.mut_arg(p)
                 lx = next
-                xs.push(ByPlace(v, steps))
+                xs.push(x)
             },
             _ => {
-                let (x, next) = lx.lower(a)
+                let (x, next) = lx.lower_arg(a, args.skip(k + 1))
                 lx = next
                 xs.push(ByValue(x))
             },
@@ -971,10 +972,115 @@ fn call(self: Lx, c: Str, args: List[ast.Expr], ty: types.Ty) -> (ir.Atom, Lx) {
     lx.tmp(ty, CallMut(c, xs))
 }
 
+// A `mut` place, where it is written: its indexes and keys copied, so a
+// later argument cannot move it, and read up to the last of them, so a
+// missing element panics there; the pointer to it is taken at the call.
+fn mut_arg(self: Lx, p: ast.Expr) -> (ir.Arg, Lx) {
+    let (v, steps, lx0) = self.lower_place(p)
+    let mut lx = lx0
+    let mut snapped: List[ir.Step] = []
+    for st in steps {
+        match st {
+            PIndex(V(w), sp) => {
+                let (t, next) = lx.tmp(w.ty, Use(V(w)))
+                lx = next
+                snapped.push(PIndex(t, sp))
+            },
+            PKey(V(w), sp) => {
+                let (t, next) = lx.tmp(w.ty, Use(V(w)))
+                lx = next
+                snapped.push(PKey(t, sp))
+            },
+            _ => snapped.push(st),
+        }
+    }
+    match lx.last_index(p) {
+        Some((t, n)) => {
+            let (_, next) = lx.tmp(t, Get(V(v), v.ty, snapped.take(n)))
+            lx = next
+        },
+        None => {},
+    }
+    (ByPlace(v, snapped), lx)
+}
+
+// The innermost index or key of a place, and how many steps lead to it.
+fn last_index(self: Lx, x: ast.Expr) -> Option[(types.Ty, Int)] {
+    match x.desc {
+        EField(r, _, _) => self.last_index(r),
+        EIndex(..) => Some((self.tyof(x), place_depth(x))),
+        _ => None,
+    }
+}
+
+fn place_depth(x: ast.Expr) -> Int {
+    match x.desc {
+        EField(r, _, _) | EIndex(r, _) => 1 + place_depth(r),
+        _ => 0,
+    }
+}
+
+// The arguments of a call, left to right. A variable argument that a
+// later argument changes is copied where it is written, so the call is
+// given the value it had there.
+fn lower_args(self: Lx, args: List[ast.Expr]) -> (List[ir.Atom], Lx) {
+    let mut lx = self
+    let mut xs: List[ir.Atom] = []
+    for (k, a) in args.with_index() {
+        let (x, next) = lx.lower_arg(a, args.skip(k + 1))
+        lx = next
+        xs.push(x)
+    }
+    (xs, lx)
+}
+
+fn lower_arg(self: Lx, a: ast.Expr, rest: List[ast.Expr]) -> (ir.Atom, Lx) {
+    let (x, lx) = self.lower(a)
+    match (a.desc, x) {
+        (EVar(n), V(v)) if rest.any(|r| lx.changes(n, r)) => lx.tmp(v.ty, Use(x)),
+        _ => (x, lx),
+    }
+}
+
+fn root_of(e: ast.Expr) -> Option[Str] {
+    match e.desc {
+        EVar(n) => Some(n),
+        EField(a, _, _) | EIndex(a, _) | EMut(a) => root_of(a),
+        _ => None,
+    }
+}
+
+// Does `e` change variable `n` outside closures: assign a place in it,
+// pass one as `mut`, or push to or remove from it?
+fn changes(self: Lx, n: Str, e: ast.Expr) -> Bool {
+    let here = match e.desc {
+        EClosure(..) => {
+            return false
+        },
+        EMut(p) => root_of(p) == Some(n),
+        EMethod(r, m, _, _) => root_of(r) == Some(n) && match (m, self.tyof(r)) {
+            ("push", TList(_)) | ("remove", TMap(..)) => true,
+            _ => false,
+        },
+        EBlock(b) | EIf(_, b, _) | EGroup(_, _, _, b) => assigns(n, b),
+        _ => false,
+    }
+    here || walk.below(e).any(|k| self.changes(n, k))
+}
+
+// Does a statement of `b`, or of a block it holds, assign a place in `n`?
+fn assigns(n: Str, b: ast.Block) -> Bool {
+    b.stmts.any(|s| match s.desc {
+        SAssign(a, _) => root_of(a) == Some(n),
+        SWhile(_, body) | SFor(_, _, _, body) | SForPat(_, _, body) | SDefer(body) => assigns(n, body),
+        _ => false,
+    })
+}
+
 // A call of a closure value.
 fn call_value(self: Lx, callee: ast.Expr, args: List[ast.Expr], ty: types.Ty) -> (ir.Atom, Lx) {
     let (c, lx) = self.lower(callee)
-    let (xs, lx) = lx.lower_all(args)
+    let (xs, lx) = lx.lower_args(args)
     lx.tmp(ty, CallClo(c, xs))
 }
 
