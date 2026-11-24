@@ -668,6 +668,8 @@ value limen_ffi_peek(value p, value n) {
    it could not be entered. */
 #include <caml/fail.h>
 #include "runtime/limen_sandbox.h"
+#include "runtime/limen_core_inline.h"
+#include "runtime/limen_core.h"
 value limen_sandbox_enter(value root, value ro, value net, value exec) {
   CAMLparam4(root, ro, net, exec);
   int has_exec = caml_string_length(exec) > 0;
@@ -680,60 +682,22 @@ value limen_sandbox_enter(value root, value ro, value net, value exec) {
 
 /* A file's modification time in whole milliseconds, as the native runtime's
    Fs.info gives it: OCaml's Unix.stat has it only as a float, which cannot
-   always give the same millisecond back. Follows links; -1 when the file
-   cannot be read.
+   always give the same millisecond back (lc_mtime_ms). Follows links; -1
+   when the file cannot be read.
    limen_mtime_ms : string -> int */
-#include <sys/stat.h>
 value limen_mtime_ms(value path) {
   CAMLparam1(path);
   struct stat st;
   if (stat(String_val(path), &st) != 0) CAMLreturn(Val_long(-1));
-#ifdef __APPLE__
-  int64_t ms = (int64_t)st.st_mtimespec.tv_sec * 1000 + st.st_mtimespec.tv_nsec / 1000000;
-#else
-  int64_t ms = (int64_t)st.st_mtim.tv_sec * 1000 + st.st_mtim.tv_nsec / 1000000;
-#endif
-  CAMLreturn(Val_long(ms));
+  CAMLreturn(Val_long(lc_mtime_ms(&st)));
 }
 
 /* Fill a buffer from the operating system's cryptographically secure
-   generator, as the native runtime's Rand does without --seed:
-   arc4random_buf on macOS, getrandom on Linux, /dev/urandom where that is
-   missing. Returns false if none of them gave enough bytes.
+   generator (lc_os_random, the native runtime's Rand without --seed too).
+   Returns false if the generators gave fewer bytes.
    limen_os_random : bytes -> bool */
-#include <errno.h>
-#include <fcntl.h>
-#include <fcntl.h>
-#if defined(__linux__)
-#include <sys/random.h>
-#endif
 value limen_os_random(value buf) {
-  unsigned char *p = Bytes_val(buf);
-  size_t n = caml_string_length(buf), got = 0;
-#if defined(__APPLE__)
-  arc4random_buf(p, n);
-  got = n;
-#else
-#if defined(__linux__)
-  while (got < n) {
-    ssize_t r = getrandom(p + got, n - got, 0);
-    if (r < 0 && errno == EINTR) continue;
-    if (r <= 0) break;
-    got += (size_t)r;
-  }
-#endif
-  if (got < n) {
-    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
-    while (fd >= 0 && got < n) {
-      ssize_t r = read(fd, p + got, n - got);
-      if (r < 0 && errno == EINTR) continue;
-      if (r <= 0) break;
-      got += (size_t)r;
-    }
-    if (fd >= 0) close(fd);
-  }
-#endif
-  return Val_bool(got == n);
+  return Val_bool(lc_os_random(Bytes_val(buf), caml_string_length(buf)) == 0);
 }
 
 /* Fs for the interpreter: the same walk through directory descriptors as
@@ -878,11 +842,7 @@ value limen_fs_stat(value top, value root, value rel) {
     Store_field(r, 2, Val_long(0)); Store_field(r, 3, Val_long(0)); Store_field(r, 4, Val_false); Store_field(r, 5, Val_false);
     CAMLreturn(r);
   }
-#ifdef __APPLE__
-  int64_t ms = (int64_t)st.st_mtimespec.tv_sec * 1000 + st.st_mtimespec.tv_nsec / 1000000;
-#else
-  int64_t ms = (int64_t)st.st_mtim.tv_sec * 1000 + st.st_mtim.tv_nsec / 1000000;
-#endif
+  int64_t ms = lc_mtime_ms(&st);
   m = caml_copy_string("");
   Store_field(r, 0, Val_int(0)); Store_field(r, 1, m);
   Store_field(r, 2, Val_long((intnat)st.st_size)); Store_field(r, 3, Val_long((intnat)ms));

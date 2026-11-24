@@ -49,3 +49,21 @@ external str_cmp : string -> string -> int = "limen_core_str_cmp" [@@noalloc]
 
 (* [s] as it prints inside a container, quotes included (lc_escape). *)
 external escaped : string -> string = "limen_core_escaped"
+
+(* Rand with --seed: splitmix64. The state advances by [golden] in
+   interp.ml; [mix64] turns it into the output (lc_mix64). *)
+let golden = 0x9E3779B97F4A7C15L
+
+external mix64 : (int64 [@unboxed]) -> (int64 [@unboxed]) = "limen_core_mix64_byte" "limen_core_mix64" [@@noalloc]
+
+(* 2^64 mod span, below which an unseeded Rand.int rejects a draw (lc_rand_skip). *)
+external rand_skip : (int64 [@unboxed]) -> (int64 [@unboxed]) = "limen_core_rand_skip_byte" "limen_core_rand_skip" [@@noalloc]
+
+(* A draw's top 53 bits as a Float in [0, 1) (lc_rand_unit). *)
+external rand_unit : (int64 [@unboxed]) -> (float [@unboxed]) = "limen_core_rand_unit_byte" "limen_core_rand_unit" [@@noalloc]
+
+(* [rand_le b off k z]: z's low [k] <= 8 bytes, low first, into b at [off];
+   the caller checks they fit (lc_rand_le). *)
+external rand_le : bytes -> (int [@untagged]) -> (int [@untagged]) -> (int64 [@unboxed]) -> unit
+  = "limen_core_rand_le_byte" "limen_core_rand_le"
+[@@noalloc]

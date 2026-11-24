@@ -881,39 +881,10 @@ W_RT WCap *Cap_root_field(WCap *root, const char *f) {
   }
   return cap_new(CAP_CLOCK);
 }
-W_RT uint64_t w_rand_next(void) {
-  uint64_t z = __atomic_add_fetch(&g_rand_state, 0x9E3779B97F4A7C15ULL, __ATOMIC_RELAXED);
-  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-  z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-  return z ^ (z >> 31);
-}
+W_RT uint64_t w_rand_next(void) { return lc_mix64(__atomic_add_fetch(&g_rand_state, LC_GOLDEN, __ATOMIC_RELAXED)); }
 /* `n` bytes from the operating system's secure generator. */
 W_RT void w_os_random(unsigned char *p, int64_t n, const char *where) {
-#if defined(__APPLE__)
-  (void)where;
-  arc4random_buf(p, (size_t)n);
-#else
-  int64_t got = 0;
-#if defined(__linux__)
-  while (got < n) {
-    ssize_t r = getrandom(p + got, (size_t)(n - got), 0);
-    if (r < 0 && errno == EINTR) continue;
-    if (r <= 0) break;
-    got += r;
-  }
-#endif
-  if (got < n) {
-    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
-    while (fd >= 0 && got < n) {
-      ssize_t r = read(fd, p + got, (size_t)(n - got));
-      if (r < 0 && errno == EINTR) continue;
-      if (r <= 0) break;
-      got += r;
-    }
-    if (fd >= 0) close(fd);
-  }
-  if (got < n) w_panic_c("rand: cannot read the system's secure random generator", where);
-#endif
+  if (lc_os_random(p, (size_t)n) != 0) w_panic_c("rand: cannot read the system's secure random generator", where);
 }
 __thread unsigned char w_rand_buf[W_RAND_BUF];
 __thread int w_rand_left;
@@ -934,11 +905,11 @@ W_RT int64_t Cap_rand_int(int64_t lo, int64_t hi, const char *where) {
   uint64_t span = (uint64_t)hi - (uint64_t)lo;
   if (g_rand_seeded) return (int64_t)((uint64_t)lo + w_rand_next() % span);
   /* the draws below 2^64 mod span would make the low values likelier */
-  uint64_t skip = -span % span, z;
+  uint64_t skip = lc_rand_skip(span), z;
   do z = w_rand_u64(where); while (z < skip);
   return (int64_t)((uint64_t)lo + z % span);
 }
-W_RT double Cap_rand_float(void) { return (double)(w_rand_u64("rand.float") >> 11) * 0x1.0p-53; }
+W_RT double Cap_rand_float(void) { return lc_rand_unit(w_rand_u64("rand.float")); }
 /* Rand.bytes: `n` bytes from the operating system's secure generator, for
    keys, tokens and UUIDs. With --seed they come from splitmix64 instead, so
    a seeded run repeats: each output gives eight bytes, low byte first, the
@@ -948,10 +919,7 @@ W_RT WStr *Cap_rand_bytes(int64_t n, const char *where) {
   WStr *s = Str_new(n);
   unsigned char *p = (unsigned char *)s->data;
   if (g_rand_seeded) {
-    for (int64_t i = 0; i < n; i += 8) {
-      uint64_t z = w_rand_next();
-      for (int64_t j = 0; j < 8 && i + j < n; j++) p[i + j] = (unsigned char)(z >> (8 * j));
-    }
+    for (int64_t i = 0; i < n; i += 8) lc_rand_le(w_rand_next(), p + i, (size_t)(n - i < 8 ? n - i : 8));
     return s;
   }
   w_os_random(p, n, where);
@@ -1228,11 +1196,7 @@ W_RT WIo Cap_fs_info(WCap *fs, WStr *rel) {
   if (w_fs_stat(W_FS_TOP, fs->root, rel->data, (size_t)rel->len, &st, &e) != 0) return w_fs_fail(&e);
   WFileInfo *i = (WFileInfo *)w_raw(sizeof(WFileInfo));
   i->size = (int64_t)st.st_size;
-#ifdef __APPLE__
-  i->mtime_ms = (int64_t)st.st_mtimespec.tv_sec * 1000 + st.st_mtimespec.tv_nsec / 1000000;
-#else
-  i->mtime_ms = (int64_t)st.st_mtim.tv_sec * 1000 + st.st_mtim.tv_nsec / 1000000;
-#endif
+  i->mtime_ms = lc_mtime_ms(&st);
   i->is_file = S_ISREG(st.st_mode);
   i->is_dir = S_ISDIR(st.st_mode);
   return io_ok_ptr(i);

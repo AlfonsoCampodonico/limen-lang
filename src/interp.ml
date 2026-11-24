@@ -202,11 +202,8 @@ let no_grants = { net = []; fs = None; listen = []; env = []; exec = []; foreign
 let rand_state = ref 0L
 
 let rand_next () =
-  rand_state := Int64.add !rand_state 0x9E3779B97F4A7C15L;
-  let z = !rand_state in
-  let z = Int64.mul (Int64.logxor z (Int64.shift_right_logical z 30)) 0xBF58476D1CE4E5B9L in
-  let z = Int64.mul (Int64.logxor z (Int64.shift_right_logical z 27)) 0x94D049BB133111EBL in
-  Int64.logxor z (Int64.shift_right_logical z 31)
+  rand_state := Int64.add !rand_state Core.golden;
+  Core.mix64 !rand_state
 
 let rand_seeded = ref false
 
@@ -242,7 +239,7 @@ let rand_int lo hi sp =
   let span = Int64.sub hi lo in
   if !rand_seeded then Int64.add lo (Int64.unsigned_rem (rand_next ()) span)
   else begin
-    let skip = Int64.unsigned_rem (Int64.neg span) span in
+    let skip = Core.rand_skip span in
     let rec draw () =
       let z = rand_u64 sp in
       if Int64.unsigned_compare z skip < 0 then draw () else z
@@ -259,10 +256,7 @@ let rand_bytes n sp =
   if !rand_seeded then begin
     let i = ref 0 in
     while !i < n do
-      let z = rand_next () in
-      for j = 0 to min 7 (n - !i - 1) do
-        Bytes.set b (!i + j) (Char.chr (Int64.to_int (Int64.logand (Int64.shift_right_logical z (8 * j)) 0xFFL)))
-      done;
+      Core.rand_le b !i (min 8 (n - !i)) (rand_next ());
       i := !i + 8
     done
   end
@@ -3091,7 +3085,7 @@ and cap_call rt c name args sp =
   | CStderr, "write", [ VStr s ] -> rt.err s; VUnit
   | CClock, "now_ms", [] -> VInt (clock_now_ms ())
   | CClock, "sleep", [ VInt ms ] -> sleep_ms ms; VUnit
-  | CRand, "float", [] -> VFloat (Int64.to_float (Int64.shift_right_logical (rand_u64 sp) 11) *. 0x1p-53)
+  | CRand, "float", [] -> VFloat (Core.rand_unit (rand_u64 sp))
   | CRand, "bytes", [ VInt n ] -> VBytes (rand_bytes (Int64.to_int n) sp)
   | CStdin, "read_line", [] -> (
     unhold rt.out !current.sink;

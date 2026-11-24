@@ -6269,6 +6269,14 @@ fn main(root: Root) -> Result[(), IoError] {
             "    out.print(\"{bad} {seen.all(|n| n > 2000)} {big == big} {wide < 8} {a != b} {r.int(5, 6)}\")" ]))
     "0 true true true true 5\n";
   panics "rand-bytes-negative" (main_wrap "    out.print(\"{root.rand.bytes(-1)}\")") "rand.bytes: negative length -1";
+  (* seeded Rand over a span past 2^63, a small span, floats and bytes(n)
+     for n not a multiple of 8: one stream in both backends (lc_mix64,
+     lc_rand_unit, lc_rand_le) *)
+  same "rand-wide-span" ~grants:{ Interp.no_grants with seed = Some 7 }
+    (main_wrap {|    let r = root.rand
+    for i in 0..<20 {
+        out.print("{r.int(-9223372036854775807 - 1, 9223372036854775807)} {r.int(0, 3)} {r.float()} {r.bytes(i)}")
+    }|});
   (* found by fuzz/front: deep nesting and long chains overflowed the
      self-hosted compiler's stack and took quadratic time in both
      compilers; past 256 levels of nesting a program is refused with E0010,

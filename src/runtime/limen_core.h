@@ -31,6 +31,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#if defined(__linux__)
+#include <sys/random.h>
+#endif
 
 #define LC_FN static inline
 
@@ -270,6 +277,68 @@ LC_FN void lc_escape(const char *s, size_t n, char *out) {
     }
   }
   out[k] = '"';
+}
+
+/* Rand with --seed: splitmix64. The state stays with each backend (an
+   atomic add natively, a ref in the interpreter) and only ever advances by
+   LC_GOLDEN; lc_mix64 turns the advanced state into the output. */
+#define LC_GOLDEN 0x9E3779B97F4A7C15ULL
+LC_FN uint64_t lc_mix64(uint64_t z) {
+  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+  z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+  return z ^ (z >> 31);
+}
+
+/* Rand.int without --seed rejects the draws below this, 2^64 mod span, so
+   every value of the span is as likely as the others. */
+LC_FN uint64_t lc_rand_skip(uint64_t span) { return -span % span; }
+
+/* Rand.float: the top 53 bits of a draw, in [0, 1). */
+LC_FN double lc_rand_unit(uint64_t z) { return (double)(z >> 11) * 0x1.0p-53; }
+
+/* Rand.bytes with --seed: the low k <= 8 bytes of a draw, low byte first. */
+LC_FN void lc_rand_le(uint64_t z, unsigned char *p, size_t k) {
+  for (size_t j = 0; j < k && j < 8; j++) p[j] = (unsigned char)(z >> (8 * j));
+}
+
+/* n bytes from the operating system's cryptographically secure generator:
+   arc4random_buf on macOS, getrandom on Linux, /dev/urandom where that is
+   missing. 0, or -1 if the generators gave fewer bytes. */
+LC_FN int lc_os_random(unsigned char *p, size_t n) {
+#if defined(__APPLE__)
+  arc4random_buf(p, n);
+  return 0;
+#else
+  size_t got = 0;
+#if defined(__linux__)
+  while (got < n) {
+    ssize_t r = getrandom(p + got, n - got, 0);
+    if (r < 0 && errno == EINTR) continue;
+    if (r <= 0) break;
+    got += (size_t)r;
+  }
+#endif
+  if (got < n) {
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    while (fd >= 0 && got < n) {
+      ssize_t r = read(fd, p + got, n - got);
+      if (r < 0 && errno == EINTR) continue;
+      if (r <= 0) break;
+      got += (size_t)r;
+    }
+    if (fd >= 0) close(fd);
+  }
+  return got == n ? 0 : -1;
+#endif
+}
+
+/* Fs.info's mtime: a file's modification time in whole milliseconds. */
+LC_FN int64_t lc_mtime_ms(const struct stat *st) {
+#ifdef __APPLE__
+  return (int64_t)st->st_mtimespec.tv_sec * 1000 + st->st_mtimespec.tv_nsec / 1000000;
+#else
+  return (int64_t)st->st_mtim.tv_sec * 1000 + st->st_mtim.tv_nsec / 1000000;
+#endif
 }
 
 #endif

@@ -109,6 +109,23 @@ value limen_core_u2f_byte(value x) { return caml_copy_double(lc_u2f((uint64_t)In
 int64_t limen_core_f2i(double x) { return lc_f2i(x); }
 value limen_core_f2i_byte(value x) { return caml_copy_int64(lc_f2i(Double_val(x))); }
 
+/* Rand: splitmix64's output, the skip below which a draw is rejected, a
+   draw as a Float, and a seeded draw's low bytes written into a buffer
+   (the caller checks off + k fits). The state stays in interp.ml. */
+int64_t limen_core_mix64(int64_t z) { return (int64_t)lc_mix64((uint64_t)z); }
+value limen_core_mix64_byte(value z) { return caml_copy_int64((int64_t)lc_mix64((uint64_t)Int64_val(z))); }
+int64_t limen_core_rand_skip(int64_t span) { return (int64_t)lc_rand_skip((uint64_t)span); }
+value limen_core_rand_skip_byte(value span) { return caml_copy_int64((int64_t)lc_rand_skip((uint64_t)Int64_val(span))); }
+double limen_core_rand_unit(int64_t z) { return lc_rand_unit((uint64_t)z); }
+value limen_core_rand_unit_byte(value z) { return caml_copy_double(lc_rand_unit((uint64_t)Int64_val(z))); }
+value limen_core_rand_le(value b, intnat off, intnat k, int64_t z) {
+  lc_rand_le((uint64_t)z, Bytes_val(b) + off, (size_t)k);
+  return Val_unit;
+}
+value limen_core_rand_le_byte(value b, value off, value k, value z) {
+  return limen_core_rand_le(b, Long_val(off), Long_val(k), Int64_val(z));
+}
+
 value limen_core_fmt_float(value x) {
   CAMLparam1(x);
   char t[LC_FLOAT_MAX];
