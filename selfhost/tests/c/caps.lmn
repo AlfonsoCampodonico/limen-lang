@@ -9,8 +9,12 @@ fn files(fs: Fs) -> Result[Str, IoError] {
     let names = fs.list("data")?
     let text = sub.read("a.txt")?
     let full = fs.full_path("data/a.txt")?
+    sub.copy("a.txt", "b.txt")?
+    sub.touch("b.txt")?
+    sub.set_executable("b.txt", true)?
+    let link = sub.read_link("b.txt").is_ok()
     sub.remove("a.txt")?
-    Ok("{names} {text} {full.len() > 0} {fs.exists("data")} {fs.is_dir("data")} {ro.is_read_only()}")
+    Ok("{names} {text} {full.len() > 0} {fs.exists("data")} {fs.is_dir("data")} {ro.is_read_only()} {link}")
 }
 
 fn network(net: Net, listen: Listen) -> Result[Str, IoError] {

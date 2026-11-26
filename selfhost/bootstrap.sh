@@ -26,7 +26,7 @@ tsc() {
     --grant env=PWD --grant env=CC --grant env=PATH --grant env=HOME \
     --grant env=LIMEN_CACHE --grant env=XDG_CACHE_HOME --grant env=DEVELOPER_DIR --grant env=LIMEN_OPENSSL \
     --grant env=LIBRARY_PATH --grant env=CPATH --grant env=C_INCLUDE_PATH --grant env=SDKROOT --grant env=MACOSX_DEPLOYMENT_TARGET \
-    --grant "exec=${CC:-cc}" --grant exec=readlink --grant exec=cp --grant exec=touch --grant exec=pkg-config \
+    --grant "exec=${CC:-cc}" --grant exec=readlink --grant exec=pkg-config \
     -- "$@"
 }
 step() { printf '%-44s' "$1"; start=$(date +%s); }

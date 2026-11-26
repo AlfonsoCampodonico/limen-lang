@@ -6,17 +6,15 @@
 // Everything goes through the capabilities it is handed. The Fs reads and
 // writes files: the C file, and the cache directory, which is used only
 // when the Fs grants it (otherwise every build compiles); it gives the size
-// and modification time of the compiler for the cache key (Fs.info), and
-// moves a finished copy into place in one step (Fs.rename). What the Fs
-// cannot do, the compiler asks small programs to do through the Exec:
+// and modification time of the compiler for the cache key (Fs.info),
+// copies a binary keeping it executable (Fs.copy), makes a cache hit the
+// most recently used entry (Fs.touch) and moves a finished file into place
+// in one step (Fs.rename). What the Fs cannot do, the compiler asks small
+// programs to do through the Exec:
 //
 //   cc (or $CC)   compiles
-//   readlink      where /var/db/xcode_select_link points (macOS): the Fs
-//                 does not read links
-//   cp            copies a binary keeping it executable: the Fs writes
-//                 files without the executable bit
-//   touch         a cache hit becomes the most recently used entry: the Fs
-//                 cannot set a file's time
+//   readlink      where /var/db/xcode_select_link points (macOS): that link
+//                 is outside any Fs grant
 //   pkg-config    finds OpenSSL, for a program that may use TLS
 //
 // and reads these variables through the Env: CC, PATH, LIMEN_CACHE,
@@ -202,17 +200,11 @@ fn cache_key(self: Builder, c_text: Str, argv: List[Str]) -> Str {
     hash.md5_hex(([c_text, self.compiler_id()] + env + argv).join("\0").to_bytes())
 }
 
-// Copy binary `from` to `to`, executable, replacing `to` in one step: cp
-// gives the copy the mode of an executable source, and the Fs renames it
-// into place. The temporary name is told apart by a digest of where the
-// copy goes, so two builds writing the same entry do not share it.
-fn copy(self: Builder, from: Str, to: Str, tag: Str) -> Bool {
-    let tmp = to + ".tmp" + hash.md5_hex(tag.to_bytes()).slice(0, 8)
-    let copied = match self.exec.run("cp", [from, tmp]) {
-        Ok(p) => p.code == 0,
-        Err(_) => false,
-    }
-    copied && self.fs.rename(self.setting.in_fs(tmp), self.setting.in_fs(to)).is_ok()
+// Copy binary `from` to `to`, executable, replacing `to` in one step:
+// `Fs.copy` keeps the mode of an executable source and writes under a
+// temporary name of its own before renaming it into place.
+fn copy(self: Builder, from: Str, to: Str) -> Bool {
+    self.fs.copy(self.setting.in_fs(from), self.setting.in_fs(to)).is_ok()
 }
 
 // Make directory `dir` (a path in the Fs) and those above it.
@@ -495,7 +487,7 @@ fn cached_file(self: Builder, dir: Str, name: Str, make: fn(Str) -> Bool) -> Opt
     let n = self.setting
     let path = paths.concat(dir, name)
     if self.fs.exists(n.in_fs(path)) {
-        let _ = self.exec.run("touch", [path])
+        let _ = self.fs.touch(n.in_fs(path))
         return Some(path)
     }
     let tmp = path + ".tmp" + hash.md5_hex(n.place.absolute(n.in_fs(path)).to_bytes()).slice(0, 8)
@@ -593,7 +585,7 @@ fn build_split(self: Builder, cflags: List[Str], libs: List[Str], prefix: Str, d
     n.run_all(exec, jobs)?
     match (dir, rt_cached) {
         (Some(d), None) => {
-            let _ = self.copy(rt_obj, paths.concat(d, rt_key), n.place.absolute(n.in_fs(paths.concat(d, rt_key))))
+            let _ = self.copy(rt_obj, paths.concat(d, rt_key))
         },
         _ => {},
     }
@@ -680,13 +672,12 @@ fn compile_c(self: Builder, c_text: Str, libs: List[Str], exe: Str) -> Result[()
     // the key leaves out where this build's files go
     let shape = n.command(self.dev, cflags, all_libs, "prog.c", "prog")
     let cached = paths.concat(dir, self.cache_key(text, shape))
-    let target = n.place.absolute(n.in_fs(exe))
-    if fs.exists(n.in_fs(cached)) && self.copy(cached, exe, target) {
-        let _ = exec.run("touch", [cached])
+    if fs.exists(n.in_fs(cached)) && self.copy(cached, exe) {
+        let _ = fs.touch(n.in_fs(cached))
         return Ok(())
     }
     self.compile(c_text, text, cflags, all_libs, exe)?
-    if n.make_dirs(fs, n.in_fs(dir)) && self.copy(exe, cached, target) {
+    if n.make_dirs(fs, n.in_fs(dir)) && self.copy(exe, cached) {
         n.prune(fs, dir)
     }
     Ok(())

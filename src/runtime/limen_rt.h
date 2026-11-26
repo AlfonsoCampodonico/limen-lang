@@ -865,6 +865,10 @@ W_RT bool Cap_fs_is_dir(WCap *fs, WStr *rel);
 W_RT WIo Cap_fs_remove(WCap *fs, WStr *rel);
 W_RT WIo Cap_fs_make_dir(WCap *fs, WStr *rel);
 W_RT WIo Cap_fs_rename(WCap *fs, WStr *from, WStr *to);
+W_RT WIo Cap_fs_copy(WCap *fs, WStr *from, WStr *to);
+W_RT WIo Cap_fs_touch(WCap *fs, WStr *rel);
+W_RT WIo Cap_fs_set_executable(WCap *fs, WStr *rel, bool on);
+W_RT WIo Cap_fs_read_link(WCap *fs, WStr *rel);
 /* Fs.info: size, modification time in milliseconds and kind, following
    links. */
 typedef struct { int64_t size; int64_t mtime_ms; bool is_file; bool is_dir; } WFileInfo;

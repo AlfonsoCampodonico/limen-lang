@@ -1140,6 +1140,10 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     | "cap_make_dir", TCap Fs -> io_result (sprintf "Cap_fs_make_dir(%s, %s)" (arg 0) (arg 1)) "0"
     | "cap_is_dir", TCap Fs -> set (sprintf "Cap_fs_is_dir(%s, %s)" (arg 0) (arg 1))
     | "cap_rename", TCap Fs -> io_result (sprintf "Cap_fs_rename(%s, %s, %s)" (arg 0) (arg 1) (arg 2)) "0"
+    | "cap_copy", TCap Fs -> io_result (sprintf "Cap_fs_copy(%s, %s, %s)" (arg 0) (arg 1) (arg 2)) "0"
+    | "cap_touch", TCap Fs -> io_result (sprintf "Cap_fs_touch(%s, %s)" (arg 0) (arg 1)) "0"
+    | "cap_set_executable", TCap Fs -> io_result (sprintf "Cap_fs_set_executable(%s, %s, %s)" (arg 0) (arg 1) (arg 2)) "0"
+    | "cap_read_link", TCap Fs -> io_result (sprintf "Cap_fs_read_link(%s, %s)" (arg 0) (arg 1)) "r_.val"
     | "cap_info", TCap Fs ->
       let fi = TNamed ("FileInfo", []) in
       io_result

@@ -1883,6 +1883,10 @@ fn prim(mut self: Cg, ind: Str, dst: Str, t: types.Ty, name: Str, rt: types.Ty, 
         ("cap_make_dir", TCap("Fs")) => self.io_result(ind, dst, t, "Cap_fs_make_dir({arg(0)}, {arg(1)})", "0"),
         ("cap_is_dir", TCap("Fs")) => self.set(ind, dst, "Cap_fs_is_dir({arg(0)}, {arg(1)})"),
         ("cap_rename", TCap("Fs")) => self.io_result(ind, dst, t, "Cap_fs_rename({arg(0)}, {arg(1)}, {arg(2)})", "0"),
+        ("cap_copy", TCap("Fs")) => self.io_result(ind, dst, t, "Cap_fs_copy({arg(0)}, {arg(1)}, {arg(2)})", "0"),
+        ("cap_touch", TCap("Fs")) => self.io_result(ind, dst, t, "Cap_fs_touch({arg(0)}, {arg(1)})", "0"),
+        ("cap_set_executable", TCap("Fs")) => self.io_result(ind, dst, t, "Cap_fs_set_executable({arg(0)}, {arg(1)}, {arg(2)})", "0"),
+        ("cap_read_link", TCap("Fs")) => self.io_result(ind, dst, t, "Cap_fs_read_link({arg(0)}, {arg(1)})", "r_.val"),
         ("cap_info", TCap("Fs")) => {
             let fi = self.ctype(TNamed("FileInfo", []))
             self.io_result(ind, dst, t, "Cap_fs_info({arg(0)}, {arg(1)})", "(\{ WFileInfo *i_ = (WFileInfo*)r_.ptr; {fi} v_ = \{ i_->size, i_->mtime_ms, i_->is_file, i_->is_dir }; free(i_); v_; })")

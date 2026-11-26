@@ -2278,6 +2278,114 @@ fn main(root: Root) {
     out.print("{fs.rename("d", "d1")} {fs.rename("d2", "d")} {fs.read("d/x")} {fs.rename("d", "d2")} {fs.rename("d1", "d")}")
     out.print("{fs.read("n/m/l")} {fs.read("n/m/up2/d/x")} {fs.read("n/m/out/outside.txt")}")|})
     "Ok(\"public\") Ok(\"public\") Ok(\"public\") Err(Denied(\"fs: path resolves outside the granted directory\"))\nErr(Denied(\"fs: path resolves outside the granted directory\")) Err(Denied(\"fs: path resolves outside the granted directory\")) false Err(Denied(\"fs: not granted (run with --grant fs=DIR)\"))\nOk([\"x\"]) true Ok(\"public\") Ok(true)\nOk(()) true Ok(\"public\") Ok(())\nOk(()) Ok(()) Err(Denied(\"fs: path resolves outside the granted directory\")) Ok(()) Ok(())\nOk(\"public\") Ok(\"public\") Err(Denied(\"fs: path resolves outside the granted directory\"))\n";
+  (* copy, touch, set_executable and read_link, walked from the grant like
+     every other Fs operation. Each run starts from what the one before left. *)
+  (* the three execute bits as `ls -l` shows them ("xxx" or "---"); not
+     `test -x`, which the macOS sandbox answers as a check of whether the
+     program may start the file *)
+  let runs_fn =
+    {v|fn runs(fs: Fs, ex: Exec, p: Str) -> Str {
+    match ex.run("ls", ["-l", fs.full_path(p) ?? ""]) {
+        Ok(o) => "{o.stdout.slice(3, 4)}{o.stdout.slice(6, 7)}{o.stdout.slice(9, 10)}",
+        Err(e) => "{e}",
+    }
+}
+
+|v}
+  in
+  let copy_dir = fresh_dir "fscopy" in
+  put (Filename.concat copy_dir "a.txt") "alpha";
+  put (Filename.concat copy_dir "x.sh") "run me";
+  Unix.chmod (Filename.concat copy_dir "x.sh") 0o755;
+  put (Filename.concat copy_dir "big.bin") (String.init 150_000 (fun i -> Char.chr (i * 7 mod 256)));
+  out "fs-copy" ~grants:{ Interp.no_grants with fs = Some (copy_dir, false); exec = [ "ls" ] }
+    (runs_fn
+     ^ {v|fn main(root: Root) {
+    let out = root.stdout
+    let fs = root.fs
+    let ex = root.exec
+    for p in ["y.sh", "b.txt", "big2.bin"] { let _ = fs.remove(p) }
+    out.print("{fs.copy("x.sh", "y.sh")} {fs.read("y.sh")} {runs(fs, ex, "x.sh")} {runs(fs, ex, "y.sh")}")
+    out.print("{fs.copy("a.txt", "b.txt")} {fs.read("b.txt")} {runs(fs, ex, "b.txt")}")
+    out.print("{fs.copy("big.bin", "big2.bin")} {(fs.read("big2.bin") ?? "x") == (fs.read("big.bin") ?? "y")} {fs.info("big2.bin").map(|i| i.size)}")
+    out.print("{fs.copy("nope", "c.txt")} {fs.copy("a.txt", "../c.txt")} {fs.copy("../a.txt", "c.txt")} {fs.copy("a.txt", "nodir/c.txt")}")
+    out.print("{fs.list("")}")
+}
+|v})
+    "Ok(()) Ok(\"run me\") xxx xxx\nOk(()) Ok(\"alpha\") ---\nOk(()) true Ok(150000)\nErr(Failed(\"fs: `nope` does not exist\")) Err(Denied(\"fs: path escapes the granted directory\")) Err(Denied(\"fs: path escapes the granted directory\")) Err(Failed(\"fs: directory of `nodir/c.txt` does not exist\"))\nOk([\"a.txt\", \"b.txt\", \"big.bin\", \"big2.bin\", \"x.sh\", \"y.sh\"])\n";
+  let rep_dir = fresh_dir "fscopyrep" in
+  put (Filename.concat rep_dir "src.txt") "new";
+  out "fs-copy-replace" ~grants:{ Interp.no_grants with fs = Some (rep_dir, false) }
+    (main_wrap
+       {v|    let fs = root.fs
+    let _ = fs.write("dst.txt", "the old contents")
+    out.print("{fs.copy("src.txt", "dst.txt")} {fs.read("dst.txt")}")
+    let _ = fs.write("dst.txt", "kept")
+    out.print("{fs.copy("missing", "dst.txt")} {fs.read("dst.txt")} {fs.copy("dst.txt", "dst.txt")} {fs.read("dst.txt")}")
+    out.print("{fs.list("")}")|v})
+    "Ok(()) Ok(\"new\")\nErr(Failed(\"fs: `missing` does not exist\")) Ok(\"kept\") Ok(()) Ok(\"kept\")\nOk([\"dst.txt\", \"src.txt\"])\n";
+  let cl_dir = fresh_dir "fscopylink" in
+  Unix.mkdir (Filename.concat cl_dir "jail") 0o755;
+  put (Filename.concat cl_dir "outside.txt") "secret";
+  put (Filename.concat cl_dir "jail/a.txt") "alpha";
+  Unix.symlink "../outside.txt" (Filename.concat cl_dir "jail/out");
+  Unix.symlink (Filename.concat cl_dir "outside.txt") (Filename.concat cl_dir "jail/absout");
+  out "fs-copy-link-out" ~grants:{ Interp.no_grants with fs = Some (cl_dir, false) }
+    (main_wrap
+       {v|    let fs = root.fs.under("jail")
+    out.print("{fs.copy("a.txt", "out")} {fs.copy("a.txt", "absout")} {fs.copy("out", "b.txt")} {fs.exists("b.txt")}")
+    out.print("{root.fs.read("outside.txt")} {fs.list("")}")|v})
+    "Err(Denied(\"fs: path resolves outside the granted directory\")) Err(Denied(\"fs: path resolves outside the granted directory\")) Err(Denied(\"fs: path resolves outside the granted directory\")) false\nOk(\"secret\") Ok([\"a.txt\", \"absout\", \"out\"])\n";
+  let touch_dir = fresh_dir "fstouch" in
+  Unix.mkdir (Filename.concat touch_dir "sub") 0o755;
+  put (Filename.concat touch_dir "old.txt") "old";
+  out "fs-touch" ~grants:{ Interp.no_grants with fs = Some (touch_dir, false) }
+    (main_wrap
+       {v|    let fs = root.fs
+    let _ = fs.remove("new.txt")
+    out.print("{fs.touch("new.txt")} {fs.read("new.txt")} {fs.info("new.txt").map(|i| i.is_file)}")
+    let before = fs.info("old.txt").map(|i| i.modified_ms) ?? 0
+    root.clock.sleep(30)
+    let t = fs.touch("old.txt")
+    let after = fs.info("old.txt").map(|i| i.modified_ms) ?? 0
+    out.print("{t} {after > before} {fs.read("old.txt")} {fs.touch("sub")}")
+    out.print("{fs.touch("../x")} {fs.touch("nodir/x")} {fs.touch("")}")|v})
+    "Ok(()) Ok(\"\") Ok(true)\nOk(()) true Ok(\"old\") Ok(())\nErr(Denied(\"fs: path escapes the granted directory\")) Err(Failed(\"fs: directory of `nodir/x` does not exist\")) Ok(())\n";
+  let exec_dir = fresh_dir "fsexec" in
+  out "fs-set-executable" ~grants:{ Interp.no_grants with fs = Some (exec_dir, false); exec = [ "ls" ] }
+    (runs_fn
+     ^ {v|fn main(root: Root) {
+    let out = root.stdout
+    let fs = root.fs
+    let ex = root.exec
+    let _ = fs.write("s.sh", "echo hi")
+    out.print("{runs(fs, ex, "s.sh")} {fs.set_executable("s.sh", true)} {runs(fs, ex, "s.sh")}")
+    out.print("{fs.set_executable("s.sh", false)} {runs(fs, ex, "s.sh")} {fs.read("s.sh")}")
+    out.print("{fs.set_executable("nope", true)} {fs.set_executable("../s.sh", true)}")
+}
+|v})
+    "--- Ok(()) xxx\nOk(()) --- Ok(\"echo hi\")\nErr(Failed(\"fs: `nope` does not exist\")) Err(Denied(\"fs: path escapes the granted directory\"))\n";
+  let rl_dir = fresh_dir "fsreadlink" in
+  Unix.mkdir (Filename.concat rl_dir "sub") 0o755;
+  put (Filename.concat rl_dir "a.txt") "alpha";
+  List.iter (fun (target, l) -> Unix.symlink target (Filename.concat rl_dir l))
+    [ ("a.txt", "l"); ("../a.txt", "sub/l2"); ("nowhere", "dangling"); ("../outside", "up"); ("sub", "dl") ];
+  out "fs-read-link" ~grants:{ Interp.no_grants with fs = Some (rl_dir, false) }
+    (main_wrap
+       {v|    let fs = root.fs
+    out.print("{fs.read_link("l")} {fs.read_link("sub/l2")} {fs.read_link("dangling")} {fs.read_link("up")}")
+    out.print("{fs.read_link("dl/l2")} {fs.read_only().read_link("l")} {fs.under("sub").read_link("l2")}")
+    out.print("{fs.read_link("a.txt")} {fs.read_link("sub")} {fs.read_link("nope")} {fs.read_link("../l")}")|v})
+    "Ok(\"a.txt\") Ok(\"../a.txt\") Ok(\"nowhere\") Ok(\"../outside\")\nOk(\"../a.txt\") Ok(\"a.txt\") Ok(\"../a.txt\")\nErr(Failed(\"fs: `a.txt` is not a symbolic link\")) Err(Failed(\"fs: `sub` is not a symbolic link\")) Err(Failed(\"fs: `nope` does not exist\")) Err(Denied(\"fs: path escapes the granted directory\"))\n";
+  let ro_dir = fresh_dir "fsnewro" in
+  put (Filename.concat ro_dir "a.txt") "alpha";
+  Unix.symlink "a.txt" (Filename.concat ro_dir "l");
+  out "fs-new-ro" ~grants:{ Interp.no_grants with fs = Some (ro_dir, false) }
+    (main_wrap
+       {v|    let ro = root.fs.read_only()
+    out.print("{ro.copy("a.txt", "b.txt")} {ro.touch("a.txt")} {ro.set_executable("a.txt", true)}")
+    out.print("{ro.exists("b.txt")} {ro.read_link("l")}")|v})
+    "Err(Denied(\"fs: this capability is read-only\")) Err(Denied(\"fs: this capability is read-only\")) Err(Denied(\"fs: this capability is read-only\"))\nfalse Ok(\"a.txt\")\n";
   (* A directory swapped for one holding a link out, between the check of a
      path and its use, used to let the read follow the link outside. *)
   let race_src n =

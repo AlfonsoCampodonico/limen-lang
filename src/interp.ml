@@ -3211,6 +3211,10 @@ and cap_call rt c name args sp =
   | CFs fs, "make_dir", [ VStr p ] -> io_result (fun () -> VUnit) (Caps.make_dir fs p)
   | CFs fs, "is_dir", [ VStr p ] -> VBool (Caps.is_dir fs p)
   | CFs fs, "rename", [ VStr a; VStr b ] -> io_result (fun () -> VUnit) (Caps.rename fs a b)
+  | CFs fs, "copy", [ VStr a; VStr b ] -> io_result (fun () -> VUnit) (Caps.copy fs a b)
+  | CFs fs, "touch", [ VStr p ] -> io_result (fun () -> VUnit) (Caps.touch fs p)
+  | CFs fs, "set_executable", [ VStr p; VBool on ] -> io_result (fun () -> VUnit) (Caps.set_executable fs p on)
+  | CFs fs, "read_link", [ VStr p ] -> io_result (fun s -> VStr s) (Caps.read_link fs p)
   | CFs fs, "info", [ VStr p ] ->
     io_result
       (fun (size, ms, is_file, is_dir) ->

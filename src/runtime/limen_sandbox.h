@@ -1095,6 +1095,121 @@ static int w_fs_rename(const char *top, const char *root, const char *from, size
   return rc == 0 ? 0 : -1;
 }
 
+static void w_fs_is_link(WFsErr *e, const char *rel, size_t len) {
+  e->kind = 2;
+  snprintf(e->msg, sizeof e->msg, "fs: `%.*s` is a symbolic link", (int)len, rel);
+}
+
+/* Copy `from` (following links) to `to`: the bytes, 64 KB at a time, and
+   the permission bits, the executable ones with them. The copy is written
+   under a temporary name beside `to` and renamed over it, so a copy that
+   fails leaves `to` as it was. `to` is walked as rename walks it: a link
+   there that leads out of the root is refused, and one inside it is
+   replaced, never written through. */
+static int w_fs_copy(const char *top, const char *root, const char *from, size_t fl, const char *to, size_t tl, WFsErr *e) {
+  static unsigned long seq;
+  int in = w_fs_open(top, root, from, fl, W_FS_READ, e);
+  if (in < 0) return -1;
+  struct stat st;
+  if (fstat(in, &st) != 0) { int err = errno; close(in); w_fs_sys(e, from, fl, err); return -1; }
+  WFsAt b;
+  if (w_fs_entry(top, root, to, tl, W_FS_FOLLOW | W_FS_CREATE, &b, e) != 0) { close(in); return -1; }
+  if (b.is_root) {
+    close(in); w_fs_at_free(&b);
+    e->kind = 1; snprintf(e->msg, sizeof e->msg, "fs: cannot copy over the granted directory itself");
+    return -1;
+  }
+  char tmp[64];
+  int out = -1, err = 0;
+  for (int i = 0; i < 100; i++) {
+    snprintf(tmp, sizeof tmp, ".limen-copy-%ld-%lu", (long)getpid(), __atomic_add_fetch(&seq, 1, __ATOMIC_RELAXED));
+    out = openat(b.dfd, tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC | O_NOCTTY, (mode_t)(st.st_mode & 0777));
+    if (out >= 0 || errno != EEXIST) break;
+  }
+  if (out < 0) { err = errno; close(in); w_fs_at_free(&b); w_fs_sys(e, to, tl, err); return -1; }
+  char *buf = (char *)w_sb_alloc(65536);
+  for (;;) {
+    ssize_t k = read(in, buf, 65536);
+    if (k < 0 && errno == EINTR) continue;
+    if (k < 0) { err = errno; break; }
+    if (k == 0) break;
+    if ((err = w_fs_write_all(out, buf, (size_t)k)) != 0) break;
+  }
+  free(buf);
+  close(in);
+  if (close(out) != 0 && !err) err = errno;
+  if (!err && renameat(b.dfd, tmp, b.dfd, b.name) != 0) err = errno;
+  if (err) unlinkat(b.dfd, tmp, 0);
+  w_fs_at_free(&b);
+  if (err) { w_fs_sys(e, to, tl, err); return -1; }
+  return 0;
+}
+
+/* The entry `rel` names, open without following a final link (walked as
+   remove walks it), for changing its times or mode through the descriptor;
+   with `create`, an empty file is made when nothing is there. -1 with e
+   set; a final link is refused. */
+static int w_fs_open_entry(const char *top, const char *root, const char *rel, size_t len, int create, WFsErr *e) {
+  WFsAt at;
+  if (w_fs_entry(top, root, rel, len, W_FS_FOLLOW | (create ? W_FS_CREATE : W_FS_EXIST), &at, e) != 0) return -1;
+  int base = O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC | O_NOCTTY;
+  int fd = openat(at.dfd, at.name, O_RDONLY | base);
+  if (fd < 0 && errno == EACCES) fd = openat(at.dfd, at.name, O_WRONLY | base);
+  if (fd < 0 && errno == ENOENT && create) fd = openat(at.dfd, at.name, O_WRONLY | O_CREAT | base, 0666);
+  int err = errno;
+  w_fs_at_free(&at);
+  if (fd >= 0) return fd;
+  if (err == ELOOP) w_fs_is_link(e, rel, len);
+  else if (err == ENOENT) w_fs_missing(e, 0, rel, len);
+  else w_fs_sys(e, rel, len, err);
+  return -1;
+}
+
+/* Set the modified (and accessed) time to now, making an empty file when
+   nothing is there. */
+static int w_fs_touch(const char *top, const char *root, const char *rel, size_t len, WFsErr *e) {
+  int fd = w_fs_open_entry(top, root, rel, len, 1, e);
+  if (fd < 0) return -1;
+  int rc = futimens(fd, NULL), err = errno;
+  close(fd);
+  if (rc != 0) { w_fs_sys(e, rel, len, err); return -1; }
+  return 0;
+}
+
+/* Set or clear all three execute bits. */
+static int w_fs_set_executable(const char *top, const char *root, const char *rel, size_t len, int on, WFsErr *e) {
+  int fd = w_fs_open_entry(top, root, rel, len, 0, e);
+  if (fd < 0) return -1;
+  struct stat st;
+  int rc = fstat(fd, &st);
+  if (rc == 0) rc = fchmod(fd, (mode_t)((on ? st.st_mode | 0111 : st.st_mode & ~(mode_t)0111) & 07777));
+  int err = errno;
+  close(fd);
+  if (rc != 0) { w_fs_sys(e, rel, len, err); return -1; }
+  return 0;
+}
+
+/* The text of the link `rel` names, not following it (links on the way to
+   it are walked as always); malloc'd, with its length in *n, or NULL with
+   e set. */
+static char *w_fs_read_link(const char *top, const char *root, const char *rel, size_t len, size_t *n, WFsErr *e) {
+  WFsAt at;
+  if (w_fs_at(top, root, rel, len, W_FS_EXIST, &at, e) != 0) return NULL;
+  char *buf = (char *)w_sb_alloc(PATH_MAX + 1);
+  ssize_t k = readlinkat(at.dfd, at.name, buf, PATH_MAX);
+  int err = errno;
+  w_fs_at_free(&at);
+  if (k < 0) {
+    free(buf);
+    if (err == EINVAL) { e->kind = 2; snprintf(e->msg, sizeof e->msg, "fs: `%.*s` is not a symbolic link", (int)len, rel); }
+    else w_fs_sys(e, rel, len, err);
+    return NULL;
+  }
+  buf[k] = 0;
+  *n = (size_t)k;
+  return buf;
+}
+
 /* The absolute path of `rel`, checked as for writing (its directory must
    exist), for handing to C: the real directory and the last name, so no
    link on the way can be swapped later. malloc'd, or NULL with e set. */

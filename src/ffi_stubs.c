@@ -707,8 +707,9 @@ value limen_os_random(value buf) {
    limen_fs_op : int -> string -> string -> string -> string -> int * string
    op: 0 read, 1 write, 2 append, 3 list (names separated by NUL bytes),
    4 remove, 5 make_dir, 6 rename (a to b), 7 full_path, 8 under (kind 0
-   and the new root, or kind 1: not inside). b is the data for write and
-   append. The int is 0 for Ok (the string is the result), 1 for Denied and
+   and the new root, or kind 1: not inside), 9 read_at, 10 copy (a to b),
+   11 touch, 12 set_executable (b is "1" to set, "0" to clear), 13
+   read_link. b is the data for write and append. The int is 0 for Ok (the string is the result), 1 for Denied and
    2 for Failed (the string is the message). */
 #include <dirent.h>
 static value limen_fs_pair(int kind, const char *s, size_t n) {
@@ -811,6 +812,21 @@ value limen_fs_op(value op, value top, value root, value a, value b) {
       char *p = w_fs_full_path(t, ro, ap, an, &e);
       if (!p) break;
       r = limen_fs_pair(0, p, strlen(p));
+      free(p);
+      CAMLreturn(r);
+    }
+    case 10:
+      if (w_fs_copy(t, ro, ap, an, String_val(b), caml_string_length(b), &e) == 0) CAMLreturn(limen_fs_pair(0, "", 0));
+      break;
+    case 11: if (w_fs_touch(t, ro, ap, an, &e) == 0) CAMLreturn(limen_fs_pair(0, "", 0)); break;
+    case 12:
+      if (w_fs_set_executable(t, ro, ap, an, String_val(b)[0] == '1', &e) == 0) CAMLreturn(limen_fs_pair(0, "", 0));
+      break;
+    case 13: {
+      size_t n;
+      char *p = w_fs_read_link(t, ro, ap, an, &n, &e);
+      if (!p) break;
+      r = limen_fs_pair(0, p, n);
       free(p);
       CAMLreturn(r);
     }

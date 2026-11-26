@@ -109,10 +109,10 @@ What each file does, in pipeline order:
   build cache, keyed as the OCaml compiler keys it (MD5, from the standard
   library's `hash` module), so
   the two compilers share it. The Fs gives the C compiler's size and
-  modification time for the key (`Fs.info`) and moves a finished copy
-  into place (`Fs.rename`); what it cannot do (read the link xcode-select
-  keeps, copy a binary keeping it executable, touch a cache entry) it
-  asks `readlink`, `cp` and `touch` to do through the Exec; OpenSSL is
+  modification time for the key (`Fs.info`), copies a binary keeping it
+  executable (`Fs.copy`), touches a cache entry (`Fs.touch`) and moves a
+  finished file into place (`Fs.rename`); the link xcode-select keeps is
+  outside the Fs, so it asks `readlink` through the Exec; OpenSSL is
   found through `LIMEN_OPENSSL` or `pkg-config`. A `Builder` holds the
   Exec and the Fs for the steps that need both (the cache key, the cache);
   the others take only the one they use.
@@ -135,7 +135,7 @@ dune build && _build/default/bin/main.exe build selfhost/limen.lmn -o tsc
   --grant env=PWD --grant env=CC --grant env=PATH --grant env=HOME \
   --grant env=LIMEN_CACHE --grant env=XDG_CACHE_HOME --grant env=DEVELOPER_DIR --grant env=LIMEN_OPENSSL \
   --grant env=LIBRARY_PATH --grant env=CPATH --grant env=C_INCLUDE_PATH --grant env=SDKROOT --grant env=MACOSX_DEPLOYMENT_TARGET \
-  --grant exec=cc --grant exec=readlink --grant exec=cp --grant exec=touch --grant exec=pkg-config \
+  --grant exec=cc --grant exec=readlink --grant exec=pkg-config \
   -- build examples/hello.lmn -o hello
 ```
 

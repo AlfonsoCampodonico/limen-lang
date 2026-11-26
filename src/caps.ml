@@ -284,6 +284,19 @@ let make_dir fs rel : (unit, ioerr) result = Result.map ignore (write_op fs 5 re
    granted directory itself. *)
 let rename fs from to_ : (unit, ioerr) result = Result.map ignore (write_op fs 6 from to_)
 
+(* Copy [from] to [to_], the bytes and the permission bits, replacing what
+   is at [to_]; a failed copy leaves it as it was. *)
+let copy fs from to_ : (unit, ioerr) result = Result.map ignore (write_op fs 10 from to_)
+
+(* Set the modified time to now, making an empty file when it is missing. *)
+let touch fs rel : (unit, ioerr) result = Result.map ignore (write_op fs 11 rel "")
+
+(* Set or clear all three execute bits. *)
+let set_executable fs rel on : (unit, ioerr) result = Result.map ignore (write_op fs 12 rel (if on then "1" else "0"))
+
+(* The text of a symbolic link, not followed. *)
+let read_link fs rel : (string, ioerr) result = op fs 13 rel ""
+
 (* Size, modification time in milliseconds and kind of [rel], following
    links: (size, modified_ms, is_file, is_dir). *)
 let info fs rel : (int * int * bool * bool, ioerr) result =

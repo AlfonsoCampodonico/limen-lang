@@ -1190,6 +1190,46 @@ W_RT WIo Cap_fs_rename(WCap *fs, WStr *from, WStr *to) {
   if (w_fs_rename(W_FS_TOP, fs->root, from->data, (size_t)from->len, to->data, (size_t)to->len, &e) != 0) return w_fs_fail(&e);
   return io_ok(NULL);
 }
+/* Fs.copy(from, to): the bytes and the permission bits, through a
+   temporary name and a rename, replacing what is at `to`. */
+W_RT WIo Cap_fs_copy(WCap *fs, WStr *from, WStr *to) {
+  if (w_revoked(fs)) return io_err(1, "fs: revoked");
+  if (fs->root && fs->ro) return io_err(1, "fs: this capability is read-only");
+  if (!fs->root) return io_err(1, W_FS_NOT_GRANTED);
+  WFsErr e;
+  if (w_fs_copy(W_FS_TOP, fs->root, from->data, (size_t)from->len, to->data, (size_t)to->len, &e) != 0) return w_fs_fail(&e);
+  return io_ok(NULL);
+}
+/* Fs.touch(path): the modified time set to now; an empty file when missing. */
+W_RT WIo Cap_fs_touch(WCap *fs, WStr *rel) {
+  if (w_revoked(fs)) return io_err(1, "fs: revoked");
+  if (fs->root && fs->ro) return io_err(1, "fs: this capability is read-only");
+  if (!fs->root) return io_err(1, W_FS_NOT_GRANTED);
+  WFsErr e;
+  if (w_fs_touch(W_FS_TOP, fs->root, rel->data, (size_t)rel->len, &e) != 0) return w_fs_fail(&e);
+  return io_ok(NULL);
+}
+/* Fs.set_executable(path, on): all three execute bits set or cleared. */
+W_RT WIo Cap_fs_set_executable(WCap *fs, WStr *rel, bool on) {
+  if (w_revoked(fs)) return io_err(1, "fs: revoked");
+  if (fs->root && fs->ro) return io_err(1, "fs: this capability is read-only");
+  if (!fs->root) return io_err(1, W_FS_NOT_GRANTED);
+  WFsErr e;
+  if (w_fs_set_executable(W_FS_TOP, fs->root, rel->data, (size_t)rel->len, on, &e) != 0) return w_fs_fail(&e);
+  return io_ok(NULL);
+}
+/* Fs.read_link(path): the link's own text, not followed. */
+W_RT WIo Cap_fs_read_link(WCap *fs, WStr *rel) {
+  if (w_revoked(fs)) return io_err(1, "fs: revoked");
+  if (!fs->root) return io_err(1, W_FS_NOT_GRANTED);
+  WFsErr e;
+  size_t n;
+  char *t = w_fs_read_link(W_FS_TOP, fs->root, rel->data, (size_t)rel->len, &n, &e);
+  if (!t) return w_fs_fail(&e);
+  WStr *s = Str_from(t, (int64_t)n);
+  free(t);
+  return io_ok(s);
+}
 W_RT WIo Cap_fs_info(WCap *fs, WStr *rel) {
   if (w_revoked(fs)) return io_err(1, "fs: revoked");
   if (!fs->root) return io_err(1, W_FS_NOT_GRANTED);
