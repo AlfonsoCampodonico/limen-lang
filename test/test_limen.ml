@@ -11867,6 +11867,9 @@ fn main(root: Root) {
    errs "mut-assign-root-var" (decls ^ "fn put(mut a: Int, b: Int) {\n    a = a * 10 + b\n}\n\n" ^ main_wrap "    let mut k = 1\n    put(mut k, {\n        k = 3\n        1\n    })\n    out.print(\"{k}\")") [ "E0214" ];
    errs "mut-assign-other-field" (decls ^ "struct Two {\n    items: List[Int],\n    n: Int,\n}\n\nfn addn(mut xs: List[Int], n: Int) {\n    xs.push(n)\n}\n\n" ^ main_wrap "    let mut t = Two { items: [], n: 0 }\n    addn(mut t.items, {\n        t.n = 4\n        1\n    })\n    out.print(\"{t.items} {t.n}\")") [];
    (* a `mut` place's index is taken where it is written, and checked there *)
+   says "mut-assign-index" (decls ^ main_wrap "    let mut ys = [[0, 0], [0, 0]]\n    let mut j = 1\n    setp(mut ys[j][{\n        j = 0\n        0\n    }], 5)\n    out.print(\"{ys} {j}\")") "E0214" "this assigns a variable that another index of the same `mut` place reads";
+   (* without `mut` it is accepted, and both backends agree *)
+   out "mut-assign-index-plain" (main_wrap "    let mut ys = [[0, 0], [0, 0]]\n    let mut j = 1\n    ys[j][{\n        j = 0\n        0\n    }] = 5\n    out.print(\"{ys} {j}\")") "[[5, 0], [0, 0]] 0\n";
    out "mut-native-index-snapshot" (decls ^ "fn put(mut x: Int, v: Int) {\n    x = v\n}\n\n" ^ main_wrap "    let mut ys = [0, 0]\n    let mut j = 0\n    put(mut ys[j], {\n        j = 1\n        5\n    })\n    out.print(\"{ys} {j}\")") "[5, 0] 1\n";
    panics "mut-native-check-first" (decls ^ "fn put(mut x: Int, v: Int) {\n    x = v\n}\n\n" ^ main_wrap "    let mut xs = [0]\n    put(mut xs[3], {\n        out.print(\"later arg ran\")\n        1\n    })") "index 3 is out of range for a list of length 1";
    panics "mut-native-key-first" (decls ^ main_wrap "    let mut m = map([(\"a\", 1)])\n    setp(mut m[\"b\"], side(out, \"later\", 1))") "key \"b\" is not in the map";

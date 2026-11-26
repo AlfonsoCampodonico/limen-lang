@@ -2409,7 +2409,44 @@ fn mut_overlap(st: env.State, changed: Option[ast.Expr], parts: List[ast.Expr]) 
             st = st.report(diag.error("E0214", a.0, "this assigns a value that the enclosing call takes as `mut`").note("assign it before the call, on its own line"))
         }
     }
+    // an index of a `mut` place assigning a variable another index of it
+    // reads: the backends would find different places
+    for x in parts {
+        match st.desc(x) {
+            EMut(p) => {
+                let ixs = place_indexes(st, p)
+                for (k, i) in ixs.with_index() {
+                    for a in assigned_in(st, i) {
+                        let (sp, path) = a
+                        let name = path.0
+                        if ixs.with_index().any(|m| m.0 != k && reads(st, name, m.1)) {
+                            st = st.report(diag.error("E0214", sp, "this assigns a variable that another index of the same `mut` place reads").note("assign it before the call, on its own line"))
+                        }
+                    }
+                }
+            },
+            _ => {},
+        }
+    }
     st
+}
+
+// The indexes and keys of a place, in written order.
+fn place_indexes(st: env.State, e: ast.Expr) -> List[ast.Expr] {
+    match st.desc(e) {
+        EField(a, _, _) | EMut(a) => place_indexes(st, a),
+        EIndex(a, i) => place_indexes(st, a) + [i],
+        _ => [],
+    }
+}
+
+// Does `e` read variable `n` outside closures?
+fn reads(st: env.State, n: Str, e: ast.Expr) -> Bool {
+    let here = match st.desc(e) {
+        EVar(m) => m == n,
+        _ => false,
+    }
+    here || expr_kids(st, e).any(|k| reads(st, n, k))
 }
 
 // ---------- `?`, operators, closures, literals ----------

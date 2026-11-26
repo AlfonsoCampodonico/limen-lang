@@ -1093,6 +1093,16 @@ let rec assigned_in (e : expr) =
     (match e.edesc with EBlock b | EIf (_, b, _) | EGroup (_, _, _, b) -> block_assigns b | _ -> [])
     @ List.concat_map assigned_in (expr_kids e)
 
+(* The indexes and keys of a place, in written order. *)
+let rec place_indexes (e : expr) =
+  match e.edesc with
+  | EField (a, _, _) | EMut a -> place_indexes a
+  | EIndex (a, i) -> place_indexes a @ [ i ]
+  | _ -> []
+
+(* Does [e] read variable [n] outside closures? *)
+let rec reads n (e : expr) = (match e.edesc with EVar m -> m = n | _ -> false) || List.exists (reads n) (expr_kids e)
+
 let rec check_expr ctx f e : ty =
   let t = check_expr_inner ctx f e in
   (match e.edesc with ECall _ | EMethod _ -> infer_pending ctx | _ -> ());
@@ -2290,7 +2300,25 @@ and mut_overlap ctx ?changed parts =
       if List.exists (fun (_, q, w) -> w && overlaps p q) own then
         err ctx "E0214" sp "this assigns a value that the enclosing call takes as `mut`"
           ~notes:[ "assign it before the call, on its own line" ])
-    (List.concat_map assigned_in (inside_parts (Option.to_list changed @ parts)))
+    (List.concat_map assigned_in (inside_parts (Option.to_list changed @ parts)));
+  (* an index of a `mut` place assigning a variable another index of it
+     reads: the backends would find different places *)
+  List.iter
+    (fun (x : expr) ->
+      match x.edesc with
+      | EMut p ->
+        let ixs = place_indexes p in
+        List.iteri
+          (fun k i ->
+            List.iter
+              (fun (sp, (r, _)) ->
+                if List.exists (fun (m, j) -> m <> k && reads r j) (List.mapi (fun m j -> (m, j)) ixs) then
+                  err ctx "E0214" sp "this assigns a variable that another index of the same `mut` place reads"
+                    ~notes:[ "assign it before the call, on its own line" ])
+              (assigned_in i))
+          ixs
+      | _ -> ())
+    parts
 
 (* Can errors of type [e] become `dyn Error`? None if so, else why not. *)
 and error_conversion ctx e =
