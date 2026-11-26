@@ -247,6 +247,10 @@ let rec changes n (e : expr) =
      | _ -> false)
     || List.exists (changes n) (Check.expr_kids e)
 
+(* The indexes and keys of a place, left to right. *)
+let rec place_keys (e : expr) =
+  match e.edesc with EField (r, _, _) -> place_keys r | EIndex (r, i) -> place_keys r @ [ i ] | _ -> []
+
 let rec lower f (e : expr) : I.atom =
   if f.dead then I.AUnit
   else
@@ -322,12 +326,12 @@ let rec lower f (e : expr) : I.atom =
       let xs = lower_args f args in
       tmp f ty (I.MkEnum (ty, tag_of f.g ty name, xs))
     | EMethod (recv, "remove", _, [ k ]) when (match tyof f recv with TMap _ -> true | _ -> false) ->
-      let v, steps = lower_place f recv in
+      let v, steps = lower_place f recv [ k ] in
       let ka = lower f k in
       emit f (I.Mutate (v, steps, I.MRemove ka));
       I.AUnit
     | EMethod (recv, "push", _, [ a ]) when (match tyof f recv with TList _ -> true | _ -> false) ->
-      let v, steps = lower_place f recv in
+      let v, steps = lower_place f recv [ a ] in
       let x = lower f a in
       emit f (I.Mutate (v, steps, I.MPush x));
       I.AUnit
@@ -558,7 +562,7 @@ and call f c args ty =
    later argument cannot move it, and read up to the last of them, so a
    missing element panics there; the pointer to it is taken at the call. *)
 and mut_arg f p =
-  let v, steps = lower_place f p in
+  let v, steps = lower_place f p [] in
   let snap = function I.V w as x -> tmp f w.ty (I.Atom x) | x -> x in
   let steps =
     List.map (function I.PIndex (a, sp) -> I.PIndex (snap a, sp) | I.PKey (a, sp) -> I.PKey (snap a, sp) | s -> s) steps
@@ -602,20 +606,24 @@ and access f e later : I.atom * ty * I.step list =
     (tmp f (tyof f e) (I.RootField (a, name)), tyof f e, [])
   | _ -> (lower_arg f e later, tyof f e, [])
 
-and lower_place f e : I.var * I.step list =
+(* The variable at the root of an assignable path, and the steps to the
+   place, its indexes and keys lowered left to right. [later] are what
+   comes after the place (an argument): a variable they or a later index
+   change is copied where it is written, as for reads. *)
+and lower_place f e later : I.var * I.step list =
   match e.edesc with
   | EVar n -> ( match lookup f n with Some v -> (v, []) | None -> failwith ("place " ^ n))
   | EField (r, name, _) ->
-    let v, s = lower_place f r in
+    let v, s = lower_place f r later in
     (v, s @ [ I.PField (field_index f.g (tyof f r) name) ])
   | EIndex (r, k) when (match tyof f r with TMap _ -> true | _ -> false) ->
     (* `m[k].x = v`: the entry, changed in place *)
-    let v, s = lower_place f r in
-    let ka = lower f k in
+    let v, s = lower_place f r (k :: later) in
+    let ka = lower_arg f k later in
     (v, s @ [ I.PKey (ka, e.espan) ])
   | EIndex (r, i) ->
-    let v, s = lower_place f r in
-    let ia = lower f i in
+    let v, s = lower_place f r (i :: later) in
+    let ia = lower_arg f i later in
     (v, s @ [ I.PIndex (ia, e.espan) ])
   | _ -> failwith "place"
 
@@ -1286,15 +1294,16 @@ and lower_stmt f s =
       let a = lower f rhs in
       let v = match lookup f n with Some v -> v | None -> failwith "assign" in
       emit f (I.Set (v, I.Atom a, ref false))
-    | SAssign ({ edesc = EIndex (m, k); _ }, rhs) when (match tyof f m with TMap _ -> true | _ -> false) ->
-      (* `m[k] = v` inserts or replaces *)
-      let a = lower f rhs in
+    | SAssign (({ edesc = EIndex (m, k); _ } as lhs), rhs) when (match tyof f m with TMap _ -> true | _ -> false) ->
+      (* `m[k] = v` inserts or replaces: the value first, then the place's
+         indexes and keys, left to right *)
+      let a = lower_arg f rhs (place_keys lhs) in
+      let v, steps = lower_place f m [ k ] in
       let ka = lower f k in
-      let v, steps = lower_place f m in
       emit f (I.Mutate (v, steps, I.MPut (ka, a)))
     | SAssign (lhs, rhs) ->
-      let a = lower f rhs in
-      let v, steps = lower_place f lhs in
+      let a = lower_arg f rhs (place_keys lhs) in
+      let v, steps = lower_place f lhs [] in
       emit f (I.Mutate (v, steps, I.MSet a))
     | SExpr e -> ignore (lower f e)
     | SReturn eo ->

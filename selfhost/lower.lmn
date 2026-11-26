@@ -758,13 +758,13 @@ fn lower_method_expr(mut self: Lx, e: ast.Expr, recv: ast.Expr, name: Str, args:
         return self.tmp(ty, MkEnum(ty, tag_of(self.ro, ty, name), xs))
     }
     if name == "remove" && one && is_map(rt) {
-        let (v, steps) = self.lower_place(recv)
+        let (v, steps) = self.lower_place(recv, [args[0]])
         let ka = self.lower(args[0])
         self.emit(Mutate(v, steps, MRemove(ka)))
         return AUnit
     }
     if name == "push" && one && is_list(rt) {
-        let (v, steps) = self.lower_place(recv)
+        let (v, steps) = self.lower_place(recv, [args[0]])
         let x = self.lower(args[0])
         self.emit(Mutate(v, steps, MPush(x)))
         return AUnit
@@ -961,7 +961,7 @@ fn call(mut self: Lx, c: Str, args: List[ast.Expr], ty: types.Ty) -> ir.Atom {
 // later argument cannot move it, and read up to the last of them, so a
 // missing element panics there; the pointer to it is taken at the call.
 fn mut_arg(mut self: Lx, p: ast.Expr) -> ir.Arg {
-    let (v, steps) = self.lower_place(p)
+    let (v, steps) = self.lower_place(p, [])
     let mut snapped: List[ir.Step] = []
     for st in steps {
         match st {
@@ -1020,6 +1020,15 @@ fn lower_arg(mut self: Lx, a: ast.Expr, rest: List[ast.Expr]) -> ir.Atom {
     match (a.desc, x) {
         (EVar(n), V(v)) if rest.any(|r| self.changes(n, r)) => self.tmp(v.ty, Use(x)),
         _ => x,
+    }
+}
+
+// The indexes and keys of a place, left to right.
+fn place_keys(e: ast.Expr) -> List[ast.Expr] {
+    match e.desc {
+        EField(r, _, _) => place_keys(r),
+        EIndex(r, i) => place_keys(r) + [i],
+        _ => [],
     }
 }
 
@@ -1136,26 +1145,28 @@ fn access(mut self: Lx, e: ast.Expr, later: List[ast.Expr]) -> (ir.Atom, types.T
 }
 
 // The variable at the root of an assignable path, and the steps to the
-// place.
-fn lower_place(mut self: Lx, e: ast.Expr) -> (ir.Var, List[ir.Step]) {
+// place, its indexes and keys lowered left to right. `later` are what
+// comes after the place (an argument): a variable they or a later index
+// change is copied where it is written, as for reads.
+fn lower_place(mut self: Lx, e: ast.Expr, later: List[ast.Expr]) -> (ir.Var, List[ir.Step]) {
     match e.desc {
         EVar(n) => match self.lookup(n) {
             Some(v) => (v, []),
             None => panic("place " + n),
         },
         EField(r, name, _) => {
-            let (v, s) = self.lower_place(r)
+            let (v, s) = self.lower_place(r, later)
             (v, s + [PField(field_index(self.ro, self.tyof(r), name))])
         },
         EIndex(r, k) if is_map(self.tyof(r)) => {
             // `m[k].x = v`: the entry, changed in place
-            let (v, s) = self.lower_place(r)
-            let ka = self.lower(k)
+            let (v, s) = self.lower_place(r, [k] + later)
+            let ka = self.lower_arg(k, later)
             (v, s + [PKey(ka, e.span)])
         },
         EIndex(r, i) => {
-            let (v, s) = self.lower_place(r)
-            let ia = self.lower(i)
+            let (v, s) = self.lower_place(r, [i] + later)
+            let ia = self.lower_arg(i, later)
             (v, s + [PIndex(ia, e.span)])
         },
         _ => panic("place"),
@@ -2170,15 +2181,16 @@ fn lower_stmt(mut self: Lx, s: ast.Stmt) {
                 }
             },
             EIndex(m, k) if is_map(self.tyof(m)) => {
-                // `m[k] = v` inserts or replaces
-                let a = self.lower(rhs)
+                // `m[k] = v` inserts or replaces: the value first, then
+                // the place's indexes and keys, left to right
+                let a = self.lower_arg(rhs, place_keys(lhs))
+                let (v, steps) = self.lower_place(m, [k])
                 let ka = self.lower(k)
-                let (v, steps) = self.lower_place(m)
                 self.emit(Mutate(v, steps, MPut(ka, a)))
             },
             _ => {
-                let a = self.lower(rhs)
-                let (v, steps) = self.lower_place(lhs)
+                let a = self.lower_arg(rhs, place_keys(lhs))
+                let (v, steps) = self.lower_place(lhs, [])
                 self.emit(Mutate(v, steps, MSet(a)))
             },
         },

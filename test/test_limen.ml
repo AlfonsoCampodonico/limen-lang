@@ -12081,7 +12081,7 @@ fn main(root: Root) {
    (* a `mut` place's index is taken where it is written, and checked there *)
    says "mut-assign-index" (decls ^ main_wrap "    let mut ys = [[0, 0], [0, 0]]\n    let mut j = 1\n    setp(mut ys[j][{\n        j = 0\n        0\n    }], 5)\n    out.print(\"{ys} {j}\")") "E0214" "this assigns a variable that another index of the same `mut` place reads";
    (* without `mut` it is accepted, and both backends agree *)
-   out "mut-assign-index-plain" (main_wrap "    let mut ys = [[0, 0], [0, 0]]\n    let mut j = 1\n    ys[j][{\n        j = 0\n        0\n    }] = 5\n    out.print(\"{ys} {j}\")") "[[5, 0], [0, 0]] 0\n";
+   out "mut-assign-index-plain" (main_wrap "    let mut ys = [[0, 0], [0, 0]]\n    let mut j = 1\n    ys[j][{\n        j = 0\n        0\n    }] = 5\n    out.print(\"{ys} {j}\")") "[[0, 0], [5, 0]] 0\n";
    out "mut-native-index-snapshot" (decls ^ "fn put(mut x: Int, v: Int) {\n    x = v\n}\n\n" ^ main_wrap "    let mut ys = [0, 0]\n    let mut j = 0\n    put(mut ys[j], {\n        j = 1\n        5\n    })\n    out.print(\"{ys} {j}\")") "[5, 0] 1\n";
    panics "mut-native-check-first" (decls ^ "fn put(mut x: Int, v: Int) {\n    x = v\n}\n\n" ^ main_wrap "    let mut xs = [0]\n    put(mut xs[3], {\n        out.print(\"later arg ran\")\n        1\n    })") "index 3 is out of range for a list of length 1";
    panics "mut-native-key-first" (decls ^ main_wrap "    let mut m = map([(\"a\", 1)])\n    setp(mut m[\"b\"], side(out, \"later\", 1))") "key \"b\" is not in the map";
@@ -12105,6 +12105,17 @@ fn main(root: Root) {
     order "order-select-send" "    let c: Chan[Int] = channel(1)\n    let mut k = 1\n    let r = select {\n        c.send(k) => 1,\n        c.send(bump(mut k)) => 2,\n    }\n    out.print(\"{r} {c.recv()} {k}\")" "1 Some(1) 2\n";
     order "order-closure-callee" "    let mut f = |x: Int| x + 1\n    out.print(\"{f(setf(mut f))} {f(1)}\")" "2 100\n";
     order "order-assign-list" "    let mut k = 1\n    let xs = [k, {\n        k = 5\n        2\n    }]\n    out.print(\"{xs} {k}\")" "[1, 2] 5\n");
+  (* a place's root, indexes and keys are evaluated once, left to right,
+     after the right-hand side; a variable index is read where it is written *)
+  (let decls = "fn side[T](out: Stdout, s: Str, v: T) -> T {\n    out.print(s)\n    v\n}\n\n" in
+   let place name body want = out name (decls ^ main_wrap body) want in
+   place "place-once-nested" "    let mut ys = [[1, 2], [3, 4]]\n    let mut j = 1\n    ys[j][{\n        j = 0\n        0\n    }] = 5\n    out.print(\"{ys} {j}\")" "[[1, 2], [5, 4]] 0\n";
+   place "place-once-side" "    let mut xs = [0, 0]\n    xs[side(out, \"i\", 0)] = 9\n    let mut ys = [[0, 0], [0, 0]]\n    ys[side(out, \"i\", 0)][side(out, \"k\", 1)] = 9\n    out.print(\"{xs} {ys}\")" "i\ni\nk\n[9, 0] [[0, 9], [0, 0]]\n";
+   place "place-once-map" "    let mut n = map([(\"a\", 0)])\n    n[side(out, \"k\", \"a\")] = 1\n    let mut m = map([(\"a\", map([(\"b\", 0)]))])\n    m[side(out, \"k\", \"a\")][\"b\"] = 2\n    out.print(\"{n} {m}\")" "k\nk\n{\"a\": 1} {\"a\": {\"b\": 2}}\n";
+   place "place-once-push" "    let mut ys = [[1], [2]]\n    ys[side(out, \"i\", 0)].push(7)\n    out.print(\"{ys}\")" "i\n[[1, 7], [2]]\n";
+   place "place-once-remove" "    let mut ms = [map([(\"a\", 1), (\"b\", 2)])]\n    ms[side(out, \"i\", 0)].remove(side(out, \"k\", \"a\"))\n    out.print(\"{ms}\")" "i\nk\n[{\"b\": 2}]\n";
+   place "place-rhs-first" "    let mut xs = [0]\n    xs[side(out, \"i\", 0)] = side(out, \"v\", 5)\n    out.print(\"{xs}\")" "v\ni\n[5]\n";
+   place "place-rhs-var" "    let mut xs = [0, 0]\n    let mut j = 1\n    xs[{\n        j = 0\n        1\n    }] = j\n    out.print(\"{xs} {j}\")" "[0, 1] 0\n");
 
   drain ();
   Printf.printf "%d/%d passed\n" (!total - !failed) !total;

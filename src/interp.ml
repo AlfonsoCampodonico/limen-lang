@@ -2277,13 +2277,14 @@ let rec eval rt env e : value =
     let fv = eval rt env c in
     let avs = List.map (eval rt env) args in
     apply rt fv avs e.espan
-  | EMethod (recv, "remove", _, [ arg ]) when (match eval rt env recv with VMap _ -> true | _ -> false) -> (
-    match eval rt env recv with
-    | VMap mv ->
-      let k = key_of (eval rt env arg) in
-      assign rt env recv (VMap { mv with m = KM.remove k mv.m });
-      VUnit
-    | _ -> failwith "internal: remove")
+  | EMethod (recv, "remove", _, [ arg ]) when (match Types.repr recv.ety with TMap _ -> true | _ -> false) ->
+    (* the place first, then the key *)
+    let root, path = place rt env recv in
+    let k = key_of (eval rt env arg) in
+    root :=
+      place_change rt (settle root) path (fun cur ->
+          match cur () with VMap mv -> VMap { mv with m = KM.remove k mv.m } | _ -> failwith "internal: remove");
+    VUnit
   | EMethod ({ edesc = EVar n; _ }, "push", _, [ arg ]) when (match find_var env n with Some { contents = VList _ | VBuf _ } -> true | _ -> false) ->
     (* in place, growing by doubling; the argument first, since it may read
        the list (which turns it back into an ordinary one) *)
@@ -2297,13 +2298,14 @@ let rec eval rt env e : value =
     b.items.(b.len) <- v;
     b.len <- b.len + 1;
     VUnit
-  | EMethod (recv, "push", _, [ arg ]) -> (
-    match eval rt env recv with
-    | VList arr ->
-      let v = eval rt env arg in
-      assign rt env recv (VList (Array.append arr [| v |]));
-      VUnit
-    | _ -> failwith "internal: push")
+  | EMethod (recv, "push", _, [ arg ]) ->
+    (* the place first, then the argument *)
+    let root, path = place rt env recv in
+    let v = eval rt env arg in
+    root :=
+      place_change rt (settle root) path (fun cur ->
+          match cur () with VList arr -> VList (Array.append arr [| v |]) | _ -> failwith "internal: push");
+    VUnit
   | EMethod ({ edesc = EVar en; _ }, name, _, args) when find_var env en = None && Hashtbl.mem rt.enums en ->
     apply rt (ctor_value rt en name) (List.map (eval rt env) args) e.espan
   | EMethod (recv, name, _, args) -> (
@@ -2343,7 +2345,9 @@ let rec eval rt env e : value =
       b.items.(Int64.to_int k)
     | _ -> failwith "internal: index")
   | EIndex (a, i) -> (
-    match (eval rt env a, eval rt env i) with
+    (* the collection, then the index *)
+    let av = eval rt env a in
+    match (av, eval rt env i) with
     | VMap mv, k -> (
       match KM.find_opt (key_of k) mv.m with
       | Some (_, v) -> v
@@ -2699,48 +2703,59 @@ and arg_cell rt env (a : expr) =
   | EMut { edesc = EVar n; _ } -> (
     match find_var env n with Some r -> (r, ignore) | None -> failwith "internal: a mut variable")
   | EMut p ->
-    let rec steps (x : expr) =
-      match x.edesc with
-      | EVar n -> ( match find_var env n with Some r -> (r, []) | None -> failwith "internal: a mut variable")
-      | EField (b, f, _) -> let r, ss = steps b in (r, `Field f :: ss)
-      | EIndex (b, i) -> let r, ss = steps b in (r, `Index (eval rt env i, x.espan) :: ss)
-      | _ -> failwith "internal: a mut place"
-    in
-    let root, rev_steps = steps p in
-    let path = List.rev rev_steps in
-    let get v = function
-      | `Field f -> field rt v f
-      | `Index (k, sp) -> (
-        match (v, k) with
-        | VMap mv, k -> (
-          match KM.find_opt (key_of k) mv.m with
-          | Some (_, x) -> x
-          | None -> raise (Panic (sprintf "key %s is not in the map" (show ~top:false k), sp)))
-        | VList arr, VInt i ->
-          if i < 0L || i >= Int64.of_int (Array.length arr) then
-            raise (Panic (sprintf "index %Ld is out of range for a list of length %d" i (Array.length arr), sp));
-          arr.(Int64.to_int i)
-        | _ -> failwith "internal: a mut index")
-    in
-    let rec put v path x =
-      match path with
-      | [] -> x
-      | (`Field f as s) :: rest -> (
-        match v with
-        | VStruct (sn, fs) -> VStruct (sn, List.map (fun (k, y) -> if same_name k f then (k, put (get v s) rest x) else (k, y)) fs)
-        | _ -> failwith "internal: a mut field")
-      | (`Index (k, _) as s) :: rest -> (
-        match (v, k) with
-        | VMap mv, k -> VMap (map_put mv k (put (get v s) rest x))
-        | VList arr, VInt i ->
-          let arr' = Array.copy arr in
-          arr'.(Int64.to_int i) <- put (get v s) rest x;
-          VList arr'
-        | _ -> failwith "internal: a mut index")
-    in
-    let cell = ref (List.fold_left get (settle root) path) in
-    (cell, fun () -> root := put (settle root) path (settle cell))
+    let root, path = place rt env p in
+    let cell = ref (List.fold_left (place_get rt) (settle root) path) in
+    (cell, fun () -> root := place_change rt (settle root) path (fun _ -> settle cell))
   | _ -> (ref (eval rt env a), ignore)
+
+(* A place: its root variable's cell and the steps to it, each index and
+   key evaluated once, left to right, as written. *)
+and place rt env (p : expr) =
+  let rec steps (x : expr) =
+    match x.edesc with
+    | EVar n -> ( match find_var env n with Some r -> (r, []) | None -> failwith "internal: a place's variable")
+    | EField (b, f, _) -> let r, ss = steps b in (r, `Field f :: ss)
+    | EIndex (b, i) -> let r, ss = steps b in (r, `Index (eval rt env i, x.espan) :: ss)
+    | _ -> failwith "internal: a place"
+  in
+  let root, rev_steps = steps p in
+  (root, List.rev rev_steps)
+
+(* One step down a place, panicking as reading it does. *)
+and place_get rt v = function
+  | `Field f -> field rt v f
+  | `Index (k, sp) -> (
+    match (v, k) with
+    | VMap mv, k -> (
+      match KM.find_opt (key_of k) mv.m with
+      | Some (_, x) -> x
+      | None -> raise (Panic (Core.msg_key (show ~top:false k), sp)))
+    | VList arr, VInt i ->
+      if i < 0L || i >= Int64.of_int (Array.length arr) then
+        raise (Panic (Core.msg_list_index i (Array.length arr), sp));
+      arr.(Int64.to_int i)
+    | _ -> failwith "internal: a place's index")
+
+(* [v] with the value at [path] replaced by [g] of it; [g] gets the old
+   value to read on demand, since a map entry being set need not exist.
+   Value semantics: every container on the way is rebuilt. *)
+and place_change rt v path g =
+  match path with
+  | [] -> g (fun () -> v)
+  | (`Field f as s) :: rest -> (
+    match v with
+    | VStruct (sn, fs) -> VStruct (sn, List.map (fun (k, y) -> if same_name k f then (k, place_change rt (place_get rt v s) rest g) else (k, y)) fs)
+    | _ -> failwith "internal: a place's field")
+  | (`Index (k, sp) as s) :: rest -> (
+    match (v, k) with
+    | VMap mv, k -> VMap (map_put mv k (if rest = [] then g (fun () -> place_get rt v s) else place_change rt (place_get rt v s) rest g))
+    | VList arr, VInt i ->
+      if i < 0L || i >= Int64.of_int (Array.length arr) then
+        raise (Panic (Core.msg_list_index i (Array.length arr), sp));
+      let arr' = Array.copy arr in
+      arr'.(Int64.to_int i) <- place_change rt arr.(Int64.to_int i) rest g;
+      VList arr'
+    | _ -> failwith "internal: a place's index")
 
 (* Pure: no task, select or channel anywhere it can reach, no C function,
    no interface bounds; together with plain argument types at the call,
@@ -2835,14 +2850,11 @@ and exec rt env s =
   | SContinue -> raise Continue_
   | SDefer _ -> failwith "internal: defer outside a block"
 
-(* Value semantics: assigning into a field or element rebuilds the container. *)
+(* Value semantics: assigning into a field or element rebuilds the container.
+   The place's indexes and keys are evaluated once, left to right. *)
 and assign rt env lhs v =
   match lhs.edesc with
   | EVar n -> ( match find_var env n with Some r -> r := v | None -> failwith "internal: assign")
-  | EField (r, f, _) -> (
-    match eval rt env r with
-    | VStruct (sn, fs) -> assign rt env r (VStruct (sn, List.map (fun (k, x) -> if same_name k f then (k, v) else (k, x)) fs))
-    | _ -> failwith "internal: assign field")
   | EIndex ({ edesc = EVar n; _ }, i) when (match find_var env n with Some { contents = VList _ | VBuf _ } -> true | _ -> false) -> (
     (* in place, in a list this variable owns *)
     match eval rt env i with
@@ -2852,17 +2864,9 @@ and assign rt env lhs v =
         raise (Panic (Core.msg_list_index k b.len, lhs.espan));
       b.items.(Int64.to_int k) <- v
     | _ -> failwith "internal: assign index")
-  | EIndex (r, i) -> (
-    match (eval rt env r, eval rt env i) with
-    | VMap mv, k -> assign rt env r (VMap (map_put mv k v))
-    | VList arr, VInt k ->
-      if k < 0L || k >= Int64.of_int (Array.length arr) then
-        raise (Panic (Core.msg_list_index k (Array.length arr), lhs.espan));
-      let a = Array.copy arr in
-      a.(Int64.to_int k) <- v;
-      assign rt env r (VList a)
-    | _ -> failwith "internal: assign index")
-  | _ -> failwith "internal: assign target"
+  | _ ->
+    let root, path = place rt env lhs in
+    root := place_change rt (settle root) path (fun _ -> v)
 
 (* The built-in methods written in Limen (std/methods.lmn), done directly:
    pushing onto a list copies it here, so the Limen loops would be quadratic.
