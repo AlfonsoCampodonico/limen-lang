@@ -8,8 +8,8 @@
 // The OCaml generator keeps a mutable context: naming a type for the first
 // time gives it the next number (T0, T1, ...) and queues its definition, a
 // string literal gets the next `litN`, and so on. Here the context is one
-// value, `Cg`, threaded through every step, and every function that can
-// name something returns the context with what it named. The numbers
+// value, `Cg`, and every function that can name something takes it as
+// `mut self` and adds what it named. The numbers
 // depend on the order things are first named in, so this follows OCaml's
 // order of evaluation where it matters: OCaml evaluates the arguments of
 // a call, and so of a `sprintf`, from right to left.
@@ -169,91 +169,90 @@ fn parts(self: Cg, t: types.Ty) -> List[types.Ty] {
 // The C name of a type. A composite type is numbered the first time it is
 // named, and the types inside it are named next, so they get definitions
 // too; it joins `types` after them.
-fn cname(self: Cg, t: types.Ty) -> (Str, Cg) {
-    let mut c = self
+fn cname(mut self: Cg, t: types.Ty) -> Str {
     match t {
-        TInt => ("Int", c),
-        TFloat => ("Float", c),
-        TBool => ("Bool", c),
-        TUnit => ("Unit", c),
-        TStr => ("Str", c),
-        TBytes => ("Bytes", c),
-        TUInt(n) => ("UInt{n}", c),
+        TInt => "Int",
+        TFloat => "Float",
+        TBool => "Bool",
+        TUnit => "Unit",
+        TStr => "Str",
+        TBytes => "Bytes",
+        TUInt(n) => "UInt{n}",
         TFn(ps, r) => {
             for p in ps {
-                (_, c) = c.cname(p)
+                let _ = self.cname(p)
             }
-            (_, c) = c.cname(r)
-            ("Clo", c)
+            let _ = self.cname(r)
+            "Clo"
         },
-        TCap(_) => ("Cap", c),
-        TDyn(..) => ("Dyn", c),
+        TCap(_) => "Cap",
+        TDyn(..) => "Dyn",
         TGroup(a) => {
-            (_, c) = c.cname(a)
-            ("Group", c)
+            let _ = self.cname(a)
+            "Group"
         },
         TChan(a) => {
-            (_, c) = c.cname(a)
-            if !c.chan_tys.contains(a) {
-                c.chan_tys.push(a)
+            let _ = self.cname(a)
+            if !self.chan_tys.contains(a) {
+                self.chan_tys.push(a)
             }
-            ("Chan", c)
+            "Chan"
         },
-        TAtomic => ("Atomic", c),
+        TAtomic => "Atomic",
         // its value's drop and share functions are a channel element's
         TShared(a) => {
-            (_, c) = c.cname(a)
-            if !c.chan_tys.contains(a) {
-                c.chan_tys.push(a)
+            let _ = self.cname(a)
+            if !self.chan_tys.contains(a) {
+                self.chan_tys.push(a)
             }
-            ("Shared", c)
+            "Shared"
         },
-        TList(TInt) => ("L_Int", c),
-        TList(TStr) => ("L_Str", c),
+        TList(TInt) => "L_Int",
+        TList(TStr) => "L_Str",
         TList(_) | TNamed(..) | TArray(..) | TMap(..) => {
             let k = show(t)
-            match c.names.get(k) {
+            match self.names.get(k) {
                 Some(n) => {
-                    return (n, c)
+                    return n
                 },
                 None => {},
             }
-            let n = "T{c.names.len()}"
-            c.names[k] = n
+            let n = "T{self.names.len()}"
+            self.names[k] = n
             let inside = match t {
                 TList(e) | TArray(e, _) => [e],
                 TMap(kt, vt) => [kt, vt],
-                _ => c.parts(t),
+                _ => self.parts(t),
             }
             for e in inside {
-                (_, c) = c.cname(e)
+                let _ = self.cname(e)
             }
-            c.types.push(t)
-            (n, c)
+            self.types.push(t)
+            n
         },
         _ => panic("cgen: non-concrete type " + show(t)),
     }
 }
 
 // The C type of a value of type `t`.
-fn ctype(self: Cg, t: types.Ty) -> (Str, Cg) {
+fn ctype(mut self: Cg, t: types.Ty) -> Str {
     match t {
-        TInt => ("int64_t", self),
-        TFloat => ("double", self),
-        TBool => ("bool", self),
-        TUnit => ("W_Unit", self),
-        TStr | TBytes => ("WStr*", self),
-        TUInt(n) => ("uint{n}_t", self),
-        TFn(..) => ("WClo*", self),
-        TDyn(..) => ("WDyn*", self),
-        TCap(_) => ("WCap*", self),
-        TGroup(_) => ("WGroup*", self),
-        TChan(_) => ("WChan*", self),
-        TAtomic => ("WAtomic*", self),
-        TShared(_) => ("WShared*", self),
+        TInt => "int64_t",
+        TFloat => "double",
+        TBool => "bool",
+        TUnit => "W_Unit",
+        TStr | TBytes => "WStr*",
+        TUInt(n) => "uint{n}_t",
+        TFn(..) => "WClo*",
+        TDyn(..) => "WDyn*",
+        TCap(_) => "WCap*",
+        TGroup(_) => "WGroup*",
+        TChan(_) => "WChan*",
+        TAtomic => "WAtomic*",
+        TShared(_) => "WShared*",
         TList(_) | TMap(..) => {
-            let (n, c) = self.cname(t)
-            (n + "*", c)
+            let n = self.cname(t)
+            n + "*"
         },
         // structs, enums and arrays are C values
         _ => self.cname(t),
@@ -262,17 +261,15 @@ fn ctype(self: Cg, t: types.Ty) -> (Str, Cg) {
 
 // Whether `t` has the C name of one of `ts`: types with the same C name
 // share their generated functions (every closure type is `Clo`).
-fn named_in(self: Cg, ts: List[types.Ty], t: types.Ty) -> (Bool, Cg) {
-    let mut c = self
+fn named_in(mut self: Cg, ts: List[types.Ty], t: types.Ty) -> Bool {
     for u in ts {
-        let (b, c1) = c.cname(t)
-        let (a, c2) = c1.cname(u)
-        c = c2
+        let b = self.cname(t)
+        let a = self.cname(u)
         if a == b {
-            return (true, c)
+            return true
         }
     }
-    (false, c)
+    false
 }
 
 // ---------- literals ----------
@@ -303,15 +300,14 @@ pub fn c_string(s: Str) -> Str {
     parts.join("")
 }
 
-fn lit(self: Cg, s: Str) -> (Str, Cg) {
+fn lit(mut self: Cg, s: Str) -> Str {
     match self.lits.get(s) {
-        Some(n) => (n, self),
+        Some(n) => n,
         None => {
-            let mut c = self
-            let n = "lit{c.lits.len()}"
-            c.lits[s] = n
-            c.lit_order.push((n, s))
-            (n, c)
+            let n = "lit{self.lits.len()}"
+            self.lits[s] = n
+            self.lit_order.push((n, s))
+            n
         },
     }
 }
@@ -390,83 +386,78 @@ fn int_lit(n: Int) -> Str {
     if n == -9223372036854775807 - 1 { "INT64_MIN" } else { "INT64_C({n})" }
 }
 
-fn atom(self: Cg, a: ir.Atom) -> (Str, Cg) {
+fn atom(mut self: Cg, a: ir.Atom) -> Str {
     match a {
-        V(v) => (var(v), self),
+        V(v) => var(v),
         VDup(v) => self.dup_of(v.ty, var(v)),
-        AInt(n) => (int_lit(n), self),
-        AFloat(x) => (float_lit(x), self),
-        ABool(b) => (if b { "true" } else { "false" }, self),
-        AUnit => ("0", self),
+        AInt(n) => int_lit(n),
+        AFloat(x) => float_lit(x),
+        ABool(b) => if b { "true" } else { "false" },
+        AUnit => "0",
         AStr(s) => {
-            let (n, c) = self.lit(s)
-            ("(&{n})", c)
+            let n = self.lit(s)
+            "(&{n})"
         },
     }
 }
 
 // The atoms, left to right, as List.map takes them.
-fn atoms(self: Cg, xs: List[ir.Atom]) -> (List[Str], Cg) {
-    let mut c = self
+fn atoms(mut self: Cg, xs: List[ir.Atom]) -> List[Str] {
     let mut out: List[Str] = []
     for x in xs {
-        let (s, next) = c.atom(x)
-        c = next
+        let s = self.atom(x)
         out.push(s)
     }
-    (out, c)
+    out
 }
 
 // ---------- enum helpers ----------
 
-fn tag_expr(self: Cg, t: types.Ty, e: Str) -> (Str, Cg) {
-    let (n, c) = self.cname(t)
-    ("{n}_tag({e})", c)
+fn tag_expr(mut self: Cg, t: types.Ty, e: Str) -> Str {
+    let n = self.cname(t)
+    "{n}_tag({e})"
 }
 
-fn payload_expr(self: Cg, t: types.Ty, e: Str, k: Int, i: Int) -> (Str, Cg) {
-    let (n, c) = self.cname(t)
-    ("{n}_p_{k}_{i}({e})", c)
+fn payload_expr(mut self: Cg, t: types.Ty, e: Str, k: Int, i: Int) -> Str {
+    let n = self.cname(t)
+    "{n}_p_{k}_{i}({e})"
 }
 
-fn mk_enum(self: Cg, t: types.Ty, k: Int, args: List[Str]) -> (Str, Cg) {
-    let (n, c) = self.cname(t)
-    ("{n}_mk_{k}({args.join(", ")})", c)
+fn mk_enum(mut self: Cg, t: types.Ty, k: Int, args: List[Str]) -> Str {
+    let n = self.cname(t)
+    "{n}_mk_{k}({args.join(", ")})"
 }
 
 // A new reference to `e`, of type `t`.
-fn dup_of(self: Cg, t: types.Ty, e: Str) -> (Str, Cg) {
+fn dup_of(mut self: Cg, t: types.Ty, e: Str) -> Str {
     if is_scalar(t) {
-        return (e, self)
+        return e
     }
-    let (n, c) = self.cname(t)
-    ("{n}_dup({e})", c)
+    let n = self.cname(t)
+    "{n}_dup({e})"
 }
 
 // Follow a chain of steps from `root`: the lvalue and its type.
-fn walk(self: Cg, root: Str, rty: types.Ty, steps: List[ir.Step]) -> (Str, types.Ty, Cg) {
-    let mut c = self
+fn walk(mut self: Cg, root: Str, rty: types.Ty, steps: List[ir.Step]) -> (Str, types.Ty) {
     let mut e = root
     let mut t = rty
     for step in steps {
         match step {
             PField(k) => {
-                let ft = c.fields_of(t)[k].1
+                let ft = self.fields_of(t)[k].1
                 e = "({e}).f{k}"
                 t = ft
             },
             PIndex(i, sp) => {
-                let wh = c.where(sp)
-                let (ia, c1) = c.atom(i)
+                let wh = self.where(sp)
+                let ia = self.atom(i)
                 match t {
                     TList(el) => {
-                        let (n, c2) = c1.cname(t)
-                        c = c2
+                        let n = self.cname(t)
                         e = "(*{n}_at({e}, {ia}, {wh}))"
                         t = el
                     },
                     TArray(el, TLen(len)) => {
-                        c = c1
                         e = "({e}).a[w_idx({ia}, {len}, {wh})]"
                         t = el
                     },
@@ -474,8 +465,7 @@ fn walk(self: Cg, root: Str, rty: types.Ty, steps: List[ir.Step]) -> (Str, types
                 }
             },
             PIndexU(i) => {
-                let (ia, c1) = c.atom(i)
-                c = c1
+                let ia = self.atom(i)
                 match t {
                     TList(el) => {
                         e = "({e})->data[{ia}]"
@@ -490,10 +480,9 @@ fn walk(self: Cg, root: Str, rty: types.Ty, steps: List[ir.Step]) -> (Str, types
             },
             PKey(k, sp) => match t {
                 TMap(_, vt) => {
-                    let wh = c.where(sp)
-                    let (ka, c1) = c.atom(k)
-                    let (n, c2) = c1.cname(t)
-                    c = c2
+                    let wh = self.where(sp)
+                    let ka = self.atom(k)
+                    let n = self.cname(t)
                     e = "(*{n}_slot({e}, {ka}, {wh}))"
                     t = vt
                 },
@@ -501,43 +490,40 @@ fn walk(self: Cg, root: Str, rty: types.Ty, steps: List[ir.Step]) -> (Str, types
             },
         }
     }
-    (e, t, c)
+    (e, t)
 }
 
 // The C condition for value `e` of type `t` matching pattern `p`.
-fn pat_cond(self: Cg, e: Str, t: types.Ty, p: ast.Pat) -> (Str, Cg) {
-    let mut c = self
+fn pat_cond(mut self: Cg, e: Str, t: types.Ty, p: ast.Pat) -> Str {
     match p.desc {
-        PWild | PBind(_) | PRest(_) => ("true", c),
-        PInt(n) => (if n == -9223372036854775807 - 1 { "({e} == INT64_MIN)" } else { "({e} == INT64_C({n}))" }, c),
-        PBool(b) => ("({e} == {if b { "true" } else { "false" }})", c),
+        PWild | PBind(_) | PRest(_) => "true",
+        PInt(n) => if n == -9223372036854775807 - 1 { "({e} == INT64_MIN)" } else { "({e} == INT64_C({n}))" },
+        PBool(b) => "({e} == {if b { "true" } else { "false" }})",
         PStr(s) => {
-            let (n, c1) = c.lit(s)
-            ("Str_eq({e}, &{n})", c1)
+            let n = self.lit(s)
+            "Str_eq({e}, &{n})"
         },
         PVariant(_, vn, args) => {
-            let k = lower.tag_of(c.ro, t, vn)
-            let ptys = c.variants_of(t).find(|v| v.0 == vn).map(|v| v.1) ?? []
+            let k = lower.tag_of(self.ro, t, vn)
+            let ptys = self.variants_of(t).find(|v| v.0 == vn).map(|v| v.1) ?? []
             let mut subs: List[Str] = []
             for (i, pair) in exhaust.fill_rest(args, ptys.len()).zip(ptys).with_index() {
-                let (pe, c1) = c.payload_expr(t, e, k, i)
-                let (s, c2) = c1.pat_cond(pe, pair.1, pair.0)
-                c = c2
+                let pe = self.payload_expr(t, e, k, i)
+                let s = self.pat_cond(pe, pair.1, pair.0)
                 subs.push(s)
             }
-            let (te, c3) = c.tag_expr(t, e)
-            ((["({te} == {k})"] + subs.filter(|s| s != "true")).join(" && "), c3)
+            let te = self.tag_expr(t, e)
+            (["({te} == {k})"] + subs.filter(|s| s != "true")).join(" && ")
         },
         PTuple(ps) => {
-            let fts = c.fields_of(t)
+            let fts = self.fields_of(t)
             let mut subs: List[Str] = []
             for (i, pair) in exhaust.fill_rest(ps, fts.len()).zip(fts.map(|f| f.1)).with_index() {
-                let (s, c1) = c.pat_cond("({e}).f{i}", pair.1, pair.0)
-                c = c1
+                let s = self.pat_cond("({e}).f{i}", pair.1, pair.0)
                 subs.push(s)
             }
             let real = subs.filter(|s| s != "true")
-            (if real.is_empty() { "true" } else { real.join(" && ") }, c)
+            if real.is_empty() { "true" } else { real.join(" && ") }
         },
         PList(ps) => {
             let el = match t {
@@ -552,114 +538,106 @@ fn pat_cond(self: Cg, e: Str, t: types.Ty, p: ast.Pat) -> (Str, Cg) {
             // `before @ after`: OCaml makes the right operand first
             let mut tail: List[Str] = []
             for (i, q) in after.with_index() {
-                let (s, c1) = c.pat_cond("({e})->data[{len} - {j - i}]", el, q)
-                c = c1
+                let s = self.pat_cond("({e})->data[{len} - {j - i}]", el, q)
                 tail.push(s)
             }
             let mut head: List[Str] = []
             for (i, q) in before.with_index() {
-                let (s, c1) = c.pat_cond("({e})->data[{i}]", el, q)
-                c = c1
+                let s = self.pat_cond("({e})->data[{i}]", el, q)
                 head.push(s)
             }
-            (([size] + (head + tail).filter(|s| s != "true")).join(" && "), c)
+            ([size] + (head + tail).filter(|s| s != "true")).join(" && ")
         },
         PStruct(_, _, fields, _) => {
-            let fts = c.fields_of(t)
+            let fts = self.fields_of(t)
             let mut subs: List[Str] = []
             for (i, pair) in exhaust.struct_items(fields, fts.map(|f| f.0), p.span).zip(fts.map(|f| f.1)).with_index() {
-                let (s, c1) = c.pat_cond("({e}).f{i}", pair.1, pair.0)
-                c = c1
+                let s = self.pat_cond("({e}).f{i}", pair.1, pair.0)
                 subs.push(s)
             }
             let real = subs.filter(|s| s != "true")
-            (if real.is_empty() { "true" } else { real.join(" && ") }, c)
+            if real.is_empty() { "true" } else { real.join(" && ") }
         },
-        PAs(q, _, _) => c.pat_cond(e, t, q),
+        PAs(q, _, _) => self.pat_cond(e, t, q),
         POr(alts) => {
             let mut conds: List[Str] = []
             for q in alts {
-                let (s, c1) = c.pat_cond(e, t, q)
-                c = c1
+                let s = self.pat_cond(e, t, q)
                 conds.push(s)
             }
-            (if conds.contains("true") { "true" } else { "(" + conds.join(" || ") + ")" }, c)
+            if conds.contains("true") { "true" } else { "(" + conds.join(" || ") + ")" }
         },
     }
 }
 
 // The prefix of the order function for `t` (used as <prefix>_cmp);
 // composite types get one generated, and so do the types inside them.
-fn cmp_prefix(self: Cg, t: types.Ty) -> (Str, Cg) {
+fn cmp_prefix(mut self: Cg, t: types.Ty) -> Str {
     match t {
-        TInt => ("Int", self),
-        TFloat => ("Float", self),
-        TStr => ("Str", self),
-        TBytes => ("Bytes", self),
-        TUInt(n) => ("UInt{n}", self),
-        TBool => ("Bool", self),
-        TUnit => ("Unit", self),
+        TInt => "Int",
+        TFloat => "Float",
+        TStr => "Str",
+        TBytes => "Bytes",
+        TUInt(n) => "UInt{n}",
+        TBool => "Bool",
+        TUnit => "Unit",
         _ => {
-            let (n, c0) = self.cname(t)
-            let mut c = c0
+            let n = self.cname(t)
             let mut known = false
-            for u in c.cmp_tys {
-                let (un, c1) = c.cname(u)
-                c = c1
+            for u in self.cmp_tys {
+                let un = self.cname(u)
                 if un == n {
                     known = true
                     break
                 }
             }
             if !known {
-                c.cmp_tys.push(t)
+                self.cmp_tys.push(t)
                 let inside = match t {
                     TList(e) | TArray(e, _) => [e],
-                    TNamed(..) => c.parts(t),
+                    TNamed(..) => self.parts(t),
                     _ => panic("cgen: no order on " + show(t)),
                 }
                 for e in inside {
-                    (_, c) = c.cmp_prefix(e)
+                    let _ = self.cmp_prefix(e)
                 }
             }
-            (n, c)
+            n
         },
     }
 }
 
 // The prefix of the hash function for map key type `t`; tuple, struct and
 // enum keys get one generated, and so do the types inside them.
-fn hash_prefix(self: Cg, t: types.Ty) -> (Str, Cg) {
+fn hash_prefix(mut self: Cg, t: types.Ty) -> Str {
     match t {
-        TInt => ("Int", self),
-        TStr => ("Str", self),
-        TBytes => ("Bytes", self),
-        TUInt(n) => ("UInt{n}", self),
-        TBool => ("Bool", self),
-        TUnit => ("Unit", self),
+        TInt => "Int",
+        TStr => "Str",
+        TBytes => "Bytes",
+        TUInt(n) => "UInt{n}",
+        TBool => "Bool",
+        TUnit => "Unit",
         _ => {
-            let (n, c0) = self.cname(t)
-            let mut c = c0
+            let n = self.cname(t)
             let mut known = false
-            for u in c.hash_tys {
-                let (un, c1) = c.cname(u)
-                c = c1
+            for u in self.hash_tys {
+                let un = self.cname(u)
                 if un == n {
                     known = true
                     break
                 }
             }
             if !known {
-                c.hash_tys.push(t)
+                self.hash_tys.push(t)
                 let inside = match t {
-                    TNamed(..) => c.parts(t),
+                    TNamed(..) => self.parts(t),
                     _ => panic("cgen: no hash for " + show(t)),
                 }
                 for e in inside {
-                    (_, c) = c.hash_prefix(e)
+                    let _ = self.hash_prefix(e)
                 }
             }
-            (n, c)
+            n
         },
     }
 }
@@ -686,42 +664,42 @@ fn arith_op(op: ast.BinOp) -> Str {
     }
 }
 
-fn binop(self: Cg, op: ast.BinOp, t: types.Ty, a: Str, b: Str, sp: ast.Span) -> (Str, Cg) {
+fn binop(mut self: Cg, op: ast.BinOp, t: types.Ty, a: Str, b: Str, sp: ast.Span) -> Str {
     match (t, op) {
-        (TInt, Add) | (TFloat, Add) => ("({a} + {b})", self),
-        (TInt, Sub) | (TFloat, Sub) => ("({a} - {b})", self),
-        (TInt, Mul) | (TFloat, Mul) => ("({a} * {b})", self),
-        (TInt, Div) => ("w_div({a}, {b}, {self.where(sp)})", self),
-        (TInt, Mod) => ("w_mod({a}, {b}, {self.where(sp)})", self),
-        (TInt, BitAnd) => ("({a} & {b})", self),
-        (TInt, BitOr) => ("({a} | {b})", self),
-        (TInt, BitXor) => ("({a} ^ {b})", self),
-        (TInt, Shl) => ("w_shl({a}, {b}, {self.where(sp)})", self),
-        (TInt, Shr) => ("w_shr({a}, {b}, {self.where(sp)})", self),
-        (TUInt(n), Add | Sub | Mul | BitAnd | BitOr | BitXor) => ("((uint{n}_t)({a} {arith_op(op)} {b}))", self),
-        (TUInt(n), Div) => ("((uint{n}_t)w_udiv({a}, {b}, {self.where(sp)}))", self),
-        (TUInt(n), Mod) => ("((uint{n}_t)w_umod({a}, {b}, {self.where(sp)}))", self),
-        (TUInt(n), Shl) => ("((uint{n}_t)w_ushl_n({a}, {b}, {n}))", self),
-        (TUInt(n), Shr) => ("((uint{n}_t)w_ushr_n({a}, {b}, {n}))", self),
-        (TFloat, Div) => ("({a} / {b})", self),
-        (TStr, Add) | (TBytes, Add) => ("Str_concat({a}, {b})", self),
+        (TInt, Add) | (TFloat, Add) => "({a} + {b})",
+        (TInt, Sub) | (TFloat, Sub) => "({a} - {b})",
+        (TInt, Mul) | (TFloat, Mul) => "({a} * {b})",
+        (TInt, Div) => "w_div({a}, {b}, {self.where(sp)})",
+        (TInt, Mod) => "w_mod({a}, {b}, {self.where(sp)})",
+        (TInt, BitAnd) => "({a} & {b})",
+        (TInt, BitOr) => "({a} | {b})",
+        (TInt, BitXor) => "({a} ^ {b})",
+        (TInt, Shl) => "w_shl({a}, {b}, {self.where(sp)})",
+        (TInt, Shr) => "w_shr({a}, {b}, {self.where(sp)})",
+        (TUInt(n), Add | Sub | Mul | BitAnd | BitOr | BitXor) => "((uint{n}_t)({a} {arith_op(op)} {b}))",
+        (TUInt(n), Div) => "((uint{n}_t)w_udiv({a}, {b}, {self.where(sp)}))",
+        (TUInt(n), Mod) => "((uint{n}_t)w_umod({a}, {b}, {self.where(sp)}))",
+        (TUInt(n), Shl) => "((uint{n}_t)w_ushl_n({a}, {b}, {n}))",
+        (TUInt(n), Shr) => "((uint{n}_t)w_ushr_n({a}, {b}, {n}))",
+        (TFloat, Div) => "({a} / {b})",
+        (TStr, Add) | (TBytes, Add) => "Str_concat({a}, {b})",
         (TList(_), Add) => {
-            let (n, c) = self.cname(t)
-            ("{n}_concat({a}, {b})", c)
+            let n = self.cname(t)
+            "{n}_concat({a}, {b})"
         },
-        (TInt, Lt | Le | Gt | Ge | Eq | Ne) | (TFloat, Lt | Le | Gt | Ge | Eq | Ne) | (TBool, Lt | Le | Gt | Ge | Eq | Ne) | (TUInt(_), Lt | Le | Gt | Ge | Eq | Ne) => ("({a} {cmp_op(op)} {b})", self),
-        (TStr, Lt | Le | Gt | Ge) => ("(Str_cmp({a}, {b}) {cmp_op(op)} 0)", self),
+        (TInt, Lt | Le | Gt | Ge | Eq | Ne) | (TFloat, Lt | Le | Gt | Ge | Eq | Ne) | (TBool, Lt | Le | Gt | Ge | Eq | Ne) | (TUInt(_), Lt | Le | Gt | Ge | Eq | Ne) => "({a} {cmp_op(op)} {b})",
+        (TStr, Lt | Le | Gt | Ge) => "(Str_cmp({a}, {b}) {cmp_op(op)} 0)",
         (_, Eq) => {
-            let (n, c) = self.cname(t)
-            ("{n}_eq({a}, {b})", c)
+            let n = self.cname(t)
+            "{n}_eq({a}, {b})"
         },
         (_, Ne) => {
-            let (n, c) = self.cname(t)
-            ("(!{n}_eq({a}, {b}))", c)
+            let n = self.cname(t)
+            "(!{n}_eq({a}, {b}))"
         },
         (_, Lt | Le | Gt | Ge) => {
-            let (n, c) = self.cmp_prefix(t)
-            ("({n}_cmp({a}, {b}) {cmp_op(op)} 0)", c)
+            let n = self.cmp_prefix(t)
+            "({n}_cmp({a}, {b}) {cmp_op(op)} 0)"
         },
         _ => panic("cgen binop on " + show(t)),
     }
@@ -729,13 +707,11 @@ fn binop(self: Cg, op: ast.BinOp, t: types.Ty, a: Str, b: Str, sp: ast.Span) -> 
 
 // ---------- writing ----------
 
-fn put(self: Cg, s: Str) -> Cg {
-    let mut c = self
-    c.out.push(s)
-    c
+fn put(mut self: Cg, s: Str) {
+    self.out.push(s)
 }
 
-fn line(self: Cg, ind: Str, s: Str) -> Cg {
+fn line(mut self: Cg, ind: Str, s: Str) {
     self.put(ind + s + "\n")
 }
 
@@ -748,44 +724,40 @@ fn handle_ty() -> types.Ty {
 // The C type of a boundary type: a C struct gets a typedef of its own
 // (VFS<n>, fields c0, c1, ... at C's layout), a callback is a pointer to a
 // function.
-fn ffi_ctype(self: Cg, t: ffi.CTy) -> (Str, Cg) {
+fn ffi_ctype(mut self: Cg, t: ffi.CTy) -> Str {
     match t {
         Struct(n, fs) => match self.cstructs.find(|s| s.name == n) {
-            Some(s) => (s.cname, self),
+            Some(s) => s.cname,
             None => {
-                let mut c = self
-                let cn = "VFS{c.cstructs.len()}"
-                c.cstructs.push(CStruct { name: n, cname: cn, fields: fs })
-                (cn, c)
+                let cn = "VFS{self.cstructs.len()}"
+                self.cstructs.push(CStruct { name: n, cname: cn, fields: fs })
+                cn
             },
         },
         Fn(ps, r) => {
-            let mut c = self
             let mut cps: List[Str] = []
             for p in ps {
-                let (s, next) = c.ffi_ctype(p)
-                c = next
+                let s = self.ffi_ctype(p)
                 cps.push(s)
             }
-            let (cr, c2) = c.ffi_ctype(r)
-            ("{cr} (*)({if ps.is_empty() { "void" } else { cps.join(", ") }})", c2)
+            let cr = self.ffi_ctype(r)
+            "{cr} (*)({if ps.is_empty() { "void" } else { cps.join(", ") }})"
         },
         Kept(ps) => self.ffi_ctype(Fn(ps, Unit)),
-        _ => (ffi.c_name(t), self),
+        _ => ffi.c_name(t),
     }
 }
 
 // The number of a kept callback's C signature, its trampolines named
 // vkt<n>_ (an array of W_KEPT), registered on first use.
-fn kept_sig(self: Cg, ps: List[ffi.CTy]) -> (Int, Cg) {
+fn kept_sig(mut self: Cg, ps: List[ffi.CTy]) -> Int {
     for (i, q) in self.kepts.with_index() {
         if q == ps {
-            return (i, self)
+            return i
         }
     }
-    let mut c = self
-    c.kepts.push(ps)
-    (c.kepts.len() - 1, c)
+    self.kepts.push(ps)
+    self.kepts.len() - 1
 }
 
 fn i32_arg(v: Str, what: Str, wh: Str) -> Str {
@@ -796,15 +768,15 @@ fn i32_arg(v: Str, what: Str, wh: Str) -> Str {
 // in an Int32 range panic. In the variadic part of a call, Int32 and Bool
 // go as int and Int as int64_t, written out so C's promotions see the
 // right type.
-fn ffi_arg(self: Cg, variadic: Bool, t: ffi.CTy, v: Str, what: Str, wh: Str) -> (Str, Cg) {
+fn ffi_arg(mut self: Cg, variadic: Bool, t: ffi.CTy, v: Str, what: Str, wh: Str) -> Str {
     match t {
-        Int => (if variadic { "(int64_t){v}" } else { v }, self),
-        Float => (if variadic { "(double){v}" } else { v }, self),
-        Int32 => (if variadic { "(int){i32_arg(v, what, wh)}" } else { i32_arg(v, what, wh) }, self),
-        Bool => ("({if variadic { "(int)" } else { "" }}({v} ? 1 : 0))", self),
-        Str => ("(const char *)({v})->data", self),
-        Bytes => ("(const void *)({v})->data", self),
-        Handle => ("(void *)(intptr_t)({v}).f0", self),
+        Int => if variadic { "(int64_t){v}" } else { v },
+        Float => if variadic { "(double){v}" } else { v },
+        Int32 => if variadic { "(int){i32_arg(v, what, wh)}" } else { i32_arg(v, what, wh) },
+        Bool => "({if variadic { "(int)" } else { "" }}({v} ? 1 : 0))",
+        Str => "(const char *)({v})->data",
+        Bytes => "(const void *)({v})->data",
+        Handle => "(void *)(intptr_t)({v}).f0",
         Struct(n, fs) => {
             let mut items: List[Str] = []
             for (i, f) in fs.with_index() {
@@ -816,20 +788,20 @@ fn ffi_arg(self: Cg, variadic: Bool, t: ffi.CTy, v: Str, what: Str, wh: Str) -> 
                     _ => x,
                 })
             }
-            let (cn, c) = self.ffi_ctype(t)
-            ("({cn})\{ {items.join(", ")} }", c)
+            let cn = self.ffi_ctype(t)
+            "({cn})\{ {items.join(", ")} }"
         },
         Kept(ps) => {
-            let (i, c) = self.kept_sig(ps)
-            ("vkt{i}_[w_kept_slot({v}, {wh})]", c)
+            let i = self.kept_sig(ps)
+            "vkt{i}_[w_kept_slot({v}, {wh})]"
         },
-        Unit | Fn(..) => ("0", self),
+        Unit | Fn(..) => "0",
     }
 }
 
 // A C value `e` of boundary type `t` as a Limen value.
-fn ffi_result(self: Cg, t: ffi.CTy, e: Str) -> (Str, Cg) {
-    let (hd, c) = self.cname(handle_ty())
+fn ffi_result(mut self: Cg, t: ffi.CTy, e: Str) -> Str {
+    let hd = self.cname(handle_ty())
     let one = |t: ffi.CTy, e: Str| match t {
         Int | Float => e,
         Int32 => "(int64_t){e}",
@@ -844,23 +816,22 @@ fn ffi_result(self: Cg, t: ffi.CTy, e: Str) -> (Str, Cg) {
                 let (i, f) = p
                 one(f.1, "{e}.c{i}")
             })
-            let (sn, c2) = c.cname(TNamed(n, []))
-            ("({sn})\{ {items.join(", ")} }", c2)
+            let sn = self.cname(TNamed(n, []))
+            "({sn})\{ {items.join(", ")} }"
         },
-        _ => (one(t, e), c),
+        _ => one(t, e),
     }
 }
 
 // The wrapper C calls for callback `cb` (a top-level function), made on
 // first use.
-fn ffi_callback(self: Cg, cb: ir.Callback, ps: List[ffi.CTy], r: ffi.CTy) -> (Str, Cg) {
+fn ffi_callback(mut self: Cg, cb: ir.Callback, ps: List[ffi.CTy], r: ffi.CTy) -> Str {
     match self.wrappers.find(|w| w.fname == cb.cname && w.takes_foreign == cb.takes_foreign && w.params == ps && w.ret == r) {
-        Some(w) => (w.name, self),
+        Some(w) => w.name,
         None => {
-            let mut c = self
-            let w = "vcb{c.wrappers.len()}_"
-            c.wrappers.push(Wrapper { fname: cb.cname, takes_foreign: cb.takes_foreign, params: ps, ret: r, name: w, vname: cb.name, span: cb.span })
-            (w, c)
+            let w = "vcb{self.wrappers.len()}_"
+            self.wrappers.push(Wrapper { fname: cb.cname, takes_foreign: cb.takes_foreign, params: ps, ret: r, name: w, vname: cb.name, span: cb.span })
+            w
         },
     }
 }
@@ -869,25 +840,21 @@ fn ffi_callback(self: Cg, cb: ir.Callback, ps: List[ffi.CTy], r: ffi.CTy) -> (St
 // compiled Limen function under a panic boundary of its own, and
 // converts its result. Nothing may unwind through C's frames, so a panic
 // there ends the program (w_cb_fatal), and so does waiting (see w_park).
-fn ffi_callback_def(self: Cg, w: Wrapper) -> (Str, Cg) {
-    let mut c = self
+fn ffi_callback_def(mut self: Cg, w: Wrapper) -> Str {
     let mut b: List[Str] = []
-    let wh = c.where(w.span)
+    let wh = self.where(w.span)
     let mut params: List[Str] = []
     for (i, t) in w.params.with_index() {
-        let (ct, next) = c.ffi_ctype(t)
-        c = next
+        let ct = self.ffi_ctype(t)
         params.push("{ct} a{i}")
     }
-    let (rt, c1) = c.ffi_ctype(w.ret)
-    c = c1
+    let rt = self.ffi_ctype(w.ret)
     b.push("static {rt} {w.name}({if params.is_empty() { "void" } else { params.join(", ") }}) \{")
     b.push("  WFiber *f_ = w_cb_fiber({wh});")
     b.push("  const char *prev_ = f_->in_cb;")
     b.push("  f_->in_cb = {wh};")
     if w.ret != Unit {
-        let (rt2, c2) = c.ffi_ctype(w.ret)
-        c = c2
+        let rt2 = self.ffi_ctype(w.ret)
         b.push("  {rt2} volatile r_ = 0;")
     }
     b.push("  WCatch c_;")
@@ -896,8 +863,7 @@ fn ffi_callback_def(self: Cg, w: Wrapper) -> (Str, Cg) {
     b.push("  if (_setjmp(c_.jb) == 0) \{")
     b.push("    WCatch *guard_ __attribute__((cleanup(w_catch_land))) = &c_;")
     b.push("    *slot_ = &c_;")
-    let (hd, c3) = c.cname(handle_ty())
-    c = c3
+    let hd = self.cname(handle_ty())
     let args = w.params.with_index().map(|p| match p.1 {
         Int32 => "(int64_t)a{p.0}",
         Bool => "(a{p.0} != 0)",
@@ -923,23 +889,20 @@ fn ffi_callback_def(self: Cg, w: Wrapper) -> (Str, Cg) {
         b.push("  return r_;")
     }
     b.push("}")
-    (b.map(|l| l + "\n").join(""), c)
+    b.map(|l| l + "\n").join("")
 }
 
 // A kept callback signature's trampolines: W_KEPT functions with C's
 // parameters, each building the channel's value from them and sending it
 // on its slot's channel (w_kept_send), and the array C's pointers come
 // from.
-fn kept_def(self: Cg, i: Int, ps: List[ffi.CTy]) -> (Str, Cg) {
-    let mut c = self
+fn kept_def(mut self: Cg, i: Int, ps: List[ffi.CTy]) -> Str {
     let mut b: List[Str] = []
-    let (hd, c1) = c.cname(handle_ty())
-    c = c1
+    let hd = self.cname(handle_ty())
     let elem = ffi.kept_elem(ps)
     let mut cps: List[Str] = []
     for (k, t) in ps.with_index() {
-        let (ct, next) = c.ffi_ctype(t)
-        c = next
+        let ct = self.ffi_ctype(t)
         cps.push("{ct} a{k}")
     }
     let params = if ps.is_empty() { "void" } else { cps.join(", ") }
@@ -954,13 +917,11 @@ fn kept_def(self: Cg, i: Int, ps: List[ffi.CTy]) -> (Str, Cg) {
         0 => "0",
         1 => conv(0, ps[0]),
         _ => {
-            let (en, c2) = c.cname(elem)
-            c = c2
+            let en = self.cname(elem)
             "({en})\{ {ps.with_index().map(|p| conv(p.0, p.1)).join(", ")} }"
         },
     }
-    let (et, c3) = c.ctype(elem)
-    c = c3
+    let et = self.ctype(elem)
     b.push("static void vkt{i}_fire(int64_t i_{cps.map(|x| ", " + x).join("")}) \{")
     b.push("  {et} v_ = {value};")
     b.push("  w_kept_send(i_, &v_);")
@@ -971,7 +932,7 @@ fn kept_def(self: Cg, i: Int, ps: List[ffi.CTy]) -> (Str, Cg) {
         b.push("static void {n}({params}) \{ vkt{i}_fire({k}{fwd}); }")
     }
     b.push("static void (*const vkt{i}_[W_KEPT])({params}) = \{ {names.join(", ")} };")
-    (b.map(|l| l + "\n").join(""), c)
+    b.map(|l| l + "\n").join("")
 }
 
 // ---------- right-hand sides ----------
@@ -983,56 +944,58 @@ enum Shown {
     Value(Str, types.Ty, Bool),
 }
 
-fn set(self: Cg, ind: Str, dst: Str, e: Str) -> Cg {
+fn set(mut self: Cg, ind: Str, dst: Str, e: Str) {
     self.line(ind, "{dst} = {e};")
 }
 
 // limen_sql_run or limen_sql_open is called: the SQLite functions they use
 // are linked and their table emitted
-fn use_sql_api(self: Cg) -> Cg {
-    let mut c = self
+fn use_sql_api(mut self: Cg) {
     for sym in ffi.sql_syms() {
-        if !c.csyms.contains(sym) {
-            c.csyms.push(sym)
+        if !self.csyms.contains(sym) {
+            self.csyms.push(sym)
         }
     }
-    c.sql_api = true
-    c
+    self.sql_api = true
 }
 
-fn show_into(self: Cg, ind: Str, dst: Str, parts: List[Shown]) -> Cg {
-    let mut c = self.line(ind, "\{").line(ind, "  WBuf b_; buf_init(&b_);")
+fn show_into(mut self: Cg, ind: Str, dst: Str, parts: List[Shown]) {
+    self.line(ind, "\{")
+    self.line(ind, "  WBuf b_; buf_init(&b_);")
     for part in parts {
         match part {
             Text(s) => {
-                c = c.line(ind, "  buf_putn(&b_, {c_string(s)}, {s.len()});")
+                self.line(ind, "  buf_putn(&b_, {c_string(s)}, {s.len()});")
             },
             Value(e, ty, top) => {
-                let (n, c1) = c.cname(ty)
-                c = c1.line(ind, "  {n}_show(&b_, {e}, {top});")
+                let n = self.cname(ty)
+                self.line(ind, "  {n}_show(&b_, {e}, {top});")
             },
         }
     }
-    c.line(ind, "  {dst} = buf_take(&b_);").line(ind, "}")
+    self.line(ind, "  {dst} = buf_take(&b_);")
+    self.line(ind, "}")
 }
 
 // An I/O operation's WIo result as a Result[_, IoError]: `ok` is the Ok
 // value, read from `r_`.
-fn io_result(self: Cg, ind: Str, dst: Str, t: types.Ty, call: Str, ok: Str) -> Cg {
+fn io_result(mut self: Cg, ind: Str, dst: Str, t: types.Ty, call: Str, ok: Str) {
     let ioe = types.io_err()
-    let c = self.line(ind, "\{").line(ind, "  WIo r_ = {call};")
-    let (failed, c1) = c.mk_enum(ioe, 1, ["r_.msg"])
-    let (denied, c2) = c1.mk_enum(ioe, 0, ["r_.msg"])
-    let (err, c3) = c2.mk_enum(t, 1, ["(r_.kind == 1 ? {denied} : {failed})"])
-    let (good, c4) = c3.mk_enum(t, 0, [ok])
-    c4.line(ind, "  if (r_.kind == 0) {dst} = {good}; else {dst} = {err};").line(ind, "}")
+    self.line(ind, "\{")
+    self.line(ind, "  WIo r_ = {call};")
+    let failed = self.mk_enum(ioe, 1, ["r_.msg"])
+    let denied = self.mk_enum(ioe, 0, ["r_.msg"])
+    let err = self.mk_enum(t, 1, ["(r_.kind == 1 ? {denied} : {failed})"])
+    let good = self.mk_enum(t, 0, [ok])
+    self.line(ind, "  if (r_.kind == 0) {dst} = {good}; else {dst} = {err};")
+    self.line(ind, "}")
 }
 
 // `cond ? Some(value) : None`, into `dst` of Option type `t`.
-fn opt_from(self: Cg, ind: Str, dst: Str, t: types.Ty, cond: Str, value: Str) -> Cg {
-    let (none, c1) = self.mk_enum(t, 1, [])
-    let (some, c2) = c1.mk_enum(t, 0, [value])
-    c2.set(ind, dst, "({cond}) ? {some} : {none}")
+fn opt_from(mut self: Cg, ind: Str, dst: Str, t: types.Ty, cond: Str, value: Str) {
+    let none = self.mk_enum(t, 1, [])
+    let some = self.mk_enum(t, 0, [value])
+    self.set(ind, dst, "({cond}) ? {some} : {none}")
 }
 
 fn is_array(t: types.Ty) -> Bool {
@@ -1054,46 +1017,45 @@ fn vtable_key(i: Str) -> Str {
 }
 
 // Write the statements that store `r` into the C lvalue `dst` of type `t`.
-fn rhs_into(self: Cg, ind: Str, dst: Str, t: types.Ty, r: ir.Rhs) -> Cg {
-    let mut c = self
+fn rhs_into(mut self: Cg, ind: Str, dst: Str, t: types.Ty, r: ir.Rhs) {
     match r {
         Use(x) => {
-            let (a, c1) = c.atom(x)
-            c1.set(ind, dst, a)
+            let a = self.atom(x)
+            self.set(ind, dst, a)
         },
         Bin(op, ty, x, y, sp) => {
-            let (b, c1) = c.atom(y)
-            let (a, c2) = c1.atom(x)
-            let (e, c3) = c2.binop(op, ty, a, b, sp)
-            c3.set(ind, dst, e)
+            let b = self.atom(y)
+            let a = self.atom(x)
+            let e = self.binop(op, ty, a, b, sp)
+            self.set(ind, dst, e)
         },
         Negate(TInt, x) => {
-            let (a, c1) = c.atom(x)
-            c1.set(ind, dst, "(int64_t)(0 - (uint64_t){a})")
+            let a = self.atom(x)
+            self.set(ind, dst, "(int64_t)(0 - (uint64_t){a})")
         },
         Negate(_, x) => {
-            let (a, c1) = c.atom(x)
-            c1.set(ind, dst, "(-{a})")
+            let a = self.atom(x)
+            self.set(ind, dst, "(-{a})")
         },
         Flip(x) => {
-            let (a, c1) = c.atom(x)
-            c1.set(ind, dst, "(!{a})")
+            let a = self.atom(x)
+            self.set(ind, dst, "(!{a})")
         },
         Call(f, args) => {
-            let (xs, c1) = c.atoms(args)
-            c1.set(ind, dst, "{f}({xs.join(", ")})")
+            let xs = self.atoms(args)
+            self.set(ind, dst, "{f}({xs.join(", ")})")
         },
         CallMut(f, args) => {
             // the values first, in order, so a value that names a place is
             // retained before the place is made unique; then a pointer to
             // each place
-            c = c.line(ind, "\{")
+            self.line(ind, "\{")
             for (k, x) in args.with_index() {
                 match x {
                     ByValue(a) => {
-                        let (ct, c1) = c.ctype(ir.atom_ty(a))
-                        let (ax, c2) = c1.atom(a)
-                        c = c2.line(ind, "  {ct} a{k}_ = {ax};")
+                        let ct = self.ctype(ir.atom_ty(a))
+                        let ax = self.atom(a)
+                        self.line(ind, "  {ct} a{k}_ = {ax};")
                     },
                     ByPlace(..) => {},
                 }
@@ -1103,13 +1065,13 @@ fn rhs_into(self: Cg, ind: Str, dst: Str, t: types.Ty, r: ir.Rhs) -> Cg {
                 match x {
                     ByValue(_) => xs.push("a{k}_"),
                     ByPlace(v, steps) => {
-                        let (p, _, c1) = c.place_ptr(ind, "r{k}_", v, steps)
-                        c = c1
+                        let (p, _) = self.place_ptr(ind, "r{k}_", v, steps)
                         xs.push(p)
                     },
                 }
             }
-            c.line(ind, "  {dst} = {f}({xs.join(", ")});").line(ind, "}")
+            self.line(ind, "  {dst} = {f}({xs.join(", ")});")
+            self.line(ind, "}")
         },
         CallClo(f, args) => {
             let fv = atom_var(f)
@@ -1119,168 +1081,207 @@ fn rhs_into(self: Cg, ind: Str, dst: Str, t: types.Ty, r: ir.Rhs) -> Cg {
             }
             let mut cps = ["WClo*"]
             for p in ps {
-                let (s, c1) = c.ctype(p)
-                c = c1
+                let s = self.ctype(p)
                 cps.push(s)
             }
-            let (cr, c2) = c.ctype(rt)
-            let (xs, c3) = c2.atoms(args)
-            c3.set(ind, dst, "(({cr} (*)({cps.join(", ")}))({var(fv)})->fn)({([var(fv)] + xs).join(", ")})")
+            let cr = self.ctype(rt)
+            let xs = self.atoms(args)
+            self.set(ind, dst, "(({cr} (*)({cps.join(", ")}))({var(fv)})->fn)({([var(fv)] + xs).join(", ")})")
         },
         MkDyn(ty, i, x, ms) => {
-            let (n, c1) = c.cname(ty)
-            c = c1
+            let n = self.cname(ty)
             let key = n + "_as_" + vtable_key(i)
-            if !c.dyns.any(|d| d.key == key) {
-                c.dyns.push(DynBox { key, ty, methods: ms })
+            if !self.dyns.any(|d| d.key == key) {
+                self.dyns.push(DynBox { key, ty, methods: ms })
             }
-            let (a, c2) = c.atom(x)
-            c2.line(ind, "\{").line(ind, "  struct Dyn_{key}* d_ = (struct Dyn_{key}*)w_alloc_k(sizeof(struct Dyn_{key}), WK_PLAIN);").line(ind, "  d_->base.rc = 1; d_->base.vt = (const WVt*)&Dyn_{key}_vt; d_->val = {a};").line(ind, "  w_set_kids(d_, w_dyn_kids);").line(ind, "  {dst} = (WDyn*)d_;").line(ind, "}")
+            let a = self.atom(x)
+            self.line(ind, "\{")
+            self.line(ind, "  struct Dyn_{key}* d_ = (struct Dyn_{key}*)w_alloc_k(sizeof(struct Dyn_{key}), WK_PLAIN);")
+            self.line(ind, "  d_->base.rc = 1; d_->base.vt = (const WVt*)&Dyn_{key}_vt; d_->val = {a};")
+            self.line(ind, "  w_set_kids(d_, w_dyn_kids);")
+            self.line(ind, "  {dst} = (WDyn*)d_;")
+            self.line(ind, "}")
         },
         Select(id, ops, has_default, sp) => {
             let n = ops.len()
-            c = c.line(ind, "WSelOp sel{id}_ops[{n}];")
+            self.line(ind, "WSelOp sel{id}_ops[{n}];")
             for (i, op) in ops.with_index() {
                 match op {
                     SRecv(ch, el, on) => {
-                        let (ct, c1) = c.ctype(el)
-                        let (o, c2) = c1.line(ind, "{ct} sel{id}_v{i};").atom(on)
-                        let (ca, c3) = c2.atom(ch)
-                        c = c3.line(ind, "sel{id}_ops[{i}] = (WSelOp)\{ {ca}, 0, &sel{id}_v{i}, 0, {o} };")
+                        let ct = self.ctype(el)
+                        self.line(ind, "{ct} sel{id}_v{i};")
+                        let o = self.atom(on)
+                        let ca = self.atom(ch)
+                        self.line(ind, "sel{id}_ops[{i}] = (WSelOp)\{ {ca}, 0, &sel{id}_v{i}, 0, {o} };")
                     },
                     SSend(ch, v, el, on) => {
-                        let (va, c1) = c.atom(v)
-                        let (ct, c2) = c1.ctype(el)
-                        let (o, c3) = c2.line(ind, "{ct} sel{id}_s{i} = {va};").atom(on)
-                        let (ca, c4) = c3.atom(ch)
-                        c = c4.line(ind, "sel{id}_ops[{i}] = (WSelOp)\{ {ca}, 1, &sel{id}_s{i}, 0, {o} };")
+                        let va = self.atom(v)
+                        let ct = self.ctype(el)
+                        self.line(ind, "{ct} sel{id}_s{i} = {va};")
+                        let o = self.atom(on)
+                        let ca = self.atom(ch)
+                        self.line(ind, "sel{id}_ops[{i}] = (WSelOp)\{ {ca}, 1, &sel{id}_s{i}, 0, {o} };")
                     },
                     SAfter(_, ms, on) => {
-                        let (m, c1) = c.atom(ms)
-                        let (o, c2) = c1.atom(on)
-                        c = c2.line(ind, "sel{id}_ops[{i}] = (WSelOp)\{ NULL, 2, NULL, 0, {o}, {m} };")
+                        let m = self.atom(ms)
+                        let o = self.atom(on)
+                        self.line(ind, "sel{id}_ops[{i}] = (WSelOp)\{ NULL, 2, NULL, 0, {o}, {m} };")
                     },
                 }
             }
-            c = c.set(ind, dst, "w_select(sel{id}_ops, {n}, {if has_default { 1 } else { 0 }}, {c.where(sp)})")
+            self.set(ind, dst, "w_select(sel{id}_ops, {n}, {if has_default { 1 } else { 0 }}, {self.where(sp)})")
             // a value that was not sent is still ours
             for (i, op) in ops.with_index() {
                 match op {
                     SSend(_, _, el, _) if !is_scalar(el) => {
-                        let (en, c1) = c.cname(el)
-                        c = c1.line(ind, "if ({dst} != {i}) {en}_drop(sel{id}_s{i});")
+                        let en = self.cname(el)
+                        self.line(ind, "if ({dst} != {i}) {en}_drop(sel{id}_s{i});")
                     },
                     _ => {},
                 }
             }
-            c
         },
         SelGot(id, i, ot) => {
-            let (none, c1) = c.mk_enum(ot, 1, [])
-            let (some, c2) = c1.mk_enum(ot, 0, ["sel{id}_v{i}"])
-            c2.set(ind, dst, "(sel{id}_ops[{i}].ok ? {some} : {none})")
+            let none = self.mk_enum(ot, 1, [])
+            let some = self.mk_enum(ot, 0, ["sel{id}_v{i}"])
+            self.set(ind, dst, "(sel{id}_ops[{i}].ok ? {some} : {none})")
         },
         Catch(clo, rt) => {
             // run the closure under a panic boundary: Ok(value), or Err(message)
             let fv = var(atom_var(clo))
-            let (ct, c1) = c.ctype(rt)
-            let (ok, c2) = c1.mk_enum(t, 0, ["r_"])
-            let (err, c3) = c2.mk_enum(t, 1, ["m_"])
-            c3.line(ind, "\{").line(ind, "  WCatch c_;").line(ind, "  w_catch_init(&c_);").line(ind, "  WCatch **slot_ = w_catch_slot();").line(ind, "  if (_setjmp(c_.jb) == 0) \{").line(ind, "    WCatch *guard_ __attribute__((cleanup(w_catch_land))) = &c_;").line(ind, "    *slot_ = &c_;").line(ind, "    {ct} r_ = (({ct} (*)(WClo*))({fv})->fn)({fv});").line(ind, "    *slot_ = c_.prev;").line(ind, "    w_catch_end(&c_);").line(ind, "    {dst} = {ok};").line(ind, "  } else \{").line(ind, "    w_catch_release(&c_);").line(ind, "    if (c_.cancel) w_cancel_unwind();   /* a cancellation passes through `catch` */").line(ind, "    WStr *m_ = Str_from(c_.msg, (int64_t)strlen(c_.msg));").line(ind, "    free(c_.msg); free(c_.where);").line(ind, "    {dst} = {err};").line(ind, "  }").line(ind, "}")
+            let ct = self.ctype(rt)
+            let ok = self.mk_enum(t, 0, ["r_"])
+            let err = self.mk_enum(t, 1, ["m_"])
+            self.line(ind, "\{")
+            self.line(ind, "  WCatch c_;")
+            self.line(ind, "  w_catch_init(&c_);")
+            self.line(ind, "  WCatch **slot_ = w_catch_slot();")
+            self.line(ind, "  if (_setjmp(c_.jb) == 0) \{")
+            self.line(ind, "    WCatch *guard_ __attribute__((cleanup(w_catch_land))) = &c_;")
+            self.line(ind, "    *slot_ = &c_;")
+            self.line(ind, "    {ct} r_ = (({ct} (*)(WClo*))({fv})->fn)({fv});")
+            self.line(ind, "    *slot_ = c_.prev;")
+            self.line(ind, "    w_catch_end(&c_);")
+            self.line(ind, "    {dst} = {ok};")
+            self.line(ind, "  } else \{")
+            self.line(ind, "    w_catch_release(&c_);")
+            self.line(ind, "    if (c_.cancel) w_cancel_unwind();   /* a cancellation passes through `catch` */")
+            self.line(ind, "    WStr *m_ = Str_from(c_.msg, (int64_t)strlen(c_.msg));")
+            self.line(ind, "    free(c_.msg); free(c_.where);")
+            self.line(ind, "    {dst} = {err};")
+            self.line(ind, "  }")
+            self.line(ind, "}")
         },
         CallC(cs, args, _, sp) if cs.lib == "limen" => {
             // the runtime's own helpers (ffi.runtime_fns)
-            let (hd, c1) = c.cname(handle_ty())
-            let (xs, c2) = c1.atoms(args)
+            let hd = self.cname(handle_ty())
+            let xs = self.atoms(args)
             match (cs.sym, xs) {
-                ("limen_copy", [p, n]) => c2.set(ind, dst, "w_ffi_copy(({p}).f0, {n}, {c2.where(sp)})"),
-                ("limen_handle_new", [p]) => c2.set(ind, dst, "w_handle_new(({p}).f0)"),
-                ("limen_sql_run", [db, text, params, mode]) => c2.use_sql_api().set(ind, dst, "w_sql_run(w_sql_api, ({db}).f0, {text}, {params}, {mode})"),
-                ("limen_sql_open", [root, name, flags]) => c2.use_sql_api().set(ind, dst, "w_sql_open(w_sql_api, {root}, {name}, {flags})"),
-                ("limen_bytes_int", [b, at]) => c2.set(ind, dst, "w_bytes_int({b}, {at}, {c2.where(sp)})"),
-                ("limen_bytes_float", [b, at]) => c2.set(ind, dst, "w_bytes_float({b}, {at}, {c2.where(sp)})"),
-                ("limen_float_bits", [x]) => c2.set(ind, dst, "w_float_bits({x})"),
-                ("limen_crypto", [op, x1, x2, x3, x4]) => {
-                    let mut c3 = c2
-                    c3.tls = true
-                    c3.set(ind, dst, "w_crypto({op}, {x1}, {x2}, {x3}, {x4})")
+                ("limen_copy", [p, n]) => self.set(ind, dst, "w_ffi_copy(({p}).f0, {n}, {self.where(sp)})"),
+                ("limen_handle_new", [p]) => self.set(ind, dst, "w_handle_new(({p}).f0)"),
+                ("limen_sql_run", [db, text, params, mode]) => {
+                    self.use_sql_api()
+                    self.set(ind, dst, "w_sql_run(w_sql_api, ({db}).f0, {text}, {params}, {mode})")
                 },
-                ("limen_handle_acquire" | "limen_handle_release" | "limen_handle_close", [id]) => c2.set(ind, dst, "({hd})\{ w_{cs.sym.slice("limen_".len(), cs.sym.len())}({id}) }"),
+                ("limen_sql_open", [root, name, flags]) => {
+                    self.use_sql_api()
+                    self.set(ind, dst, "w_sql_open(w_sql_api, {root}, {name}, {flags})")
+                },
+                ("limen_bytes_int", [b, at]) => self.set(ind, dst, "w_bytes_int({b}, {at}, {self.where(sp)})"),
+                ("limen_bytes_float", [b, at]) => self.set(ind, dst, "w_bytes_float({b}, {at}, {self.where(sp)})"),
+                ("limen_float_bits", [x]) => self.set(ind, dst, "w_float_bits({x})"),
+                ("limen_crypto", [op, x1, x2, x3, x4]) => {
+                    self.tls = true
+                    self.set(ind, dst, "w_crypto({op}, {x1}, {x2}, {x3}, {x4})")
+                },
+                ("limen_handle_acquire" | "limen_handle_release" | "limen_handle_close", [id]) => self.set(ind, dst, "({hd})\{ w_{cs.sym.slice("limen_".len(), cs.sym.len())}({id}) }"),
                 _ => panic("cgen: runtime helper " + cs.sym),
             }
         },
-        CallC(cs, args, cbs, sp) => c.call_c(ind, dst, t, cs, args, cbs, sp),
+        CallC(cs, args, cbs, sp) => self.call_c(ind, dst, t, cs, args, cbs, sp),
         CallDyn(k, ps, rt, recv, args) => {
             let mut cps = ["WDyn*"]
             for p in ps {
-                let (s, c1) = c.ctype(p)
-                c = c1
+                let s = self.ctype(p)
                 cps.push(s)
             }
-            let (cr, c2) = c.ctype(rt)
-            let (xs, c3) = c2.atoms(args)
-            let (ra, c4) = c3.atom(recv)
-            c4.set(ind, dst, "(({cr} (*)({cps.join(", ")}))({ra})->vt->m[{k}])({([ra] + xs).join(", ")})")
+            let cr = self.ctype(rt)
+            let xs = self.atoms(args)
+            let ra = self.atom(recv)
+            self.set(ind, dst, "(({cr} (*)({cps.join(", ")}))({ra})->vt->m[{k}])({([ra] + xs).join(", ")})")
         },
         MkStruct(ty, args) => {
-            let (xs, c1) = c.atoms(args)
-            let (n, c2) = c1.cname(ty)
-            c2.set(ind, dst, if args.is_empty() { "({n})\{0}" } else { "({n})\{ {xs.join(", ")} }" })
+            let xs = self.atoms(args)
+            let n = self.cname(ty)
+            self.set(ind, dst, if args.is_empty() { "({n})\{0}" } else { "({n})\{ {xs.join(", ")} }" })
         },
         MkEnum(ty, k, args) => {
-            let (xs, c1) = c.atoms(args)
-            let (e, c2) = c1.mk_enum(ty, k, xs)
-            c2.set(ind, dst, e)
+            let xs = self.atoms(args)
+            let e = self.mk_enum(ty, k, xs)
+            self.set(ind, dst, e)
         },
         MkList(ty, args) if is_array(ty) => {
-            let (xs, c1) = c.atoms(args)
-            let (n, c2) = c1.cname(ty)
-            c2.set(ind, dst, if args.is_empty() { "({n})\{0}" } else { "({n})\{ \{ {xs.join(", ")} } }" })
+            let xs = self.atoms(args)
+            let n = self.cname(ty)
+            self.set(ind, dst, if args.is_empty() { "({n})\{0}" } else { "({n})\{ \{ {xs.join(", ")} } }" })
         },
         MkList(ty, args) => {
-            let (n, c1) = c.cname(ty)
-            c = c1.line(ind, "\{").line(ind, "  {n}* l_ = {n}_new({args.len()});")
+            let n = self.cname(ty)
+            self.line(ind, "\{")
+            self.line(ind, "  {n}* l_ = {n}_new({args.len()});")
             for (i, x) in args.with_index() {
-                let (a, c2) = c.atom(x)
-                c = c2.line(ind, "  l_->data[{i}] = {a};")
+                let a = self.atom(x)
+                self.line(ind, "  l_->data[{i}] = {a};")
             }
-            c.line(ind, "  l_->len = {args.len()};").line(ind, "  {dst} = l_;").line(ind, "}")
+            self.line(ind, "  l_->len = {args.len()};")
+            self.line(ind, "  {dst} = l_;")
+            self.line(ind, "}")
         },
-        MkClosure(fname, _, []) => c.line(ind, "\{").line(ind, "  WClo* k_ = (WClo*)w_alloc_k(sizeof(WClo), WK_PLAIN);").line(ind, "  k_->rc = 1; k_->fn = (void*){fname}; k_->drop = NULL; k_->share = NULL;").line(ind, "  {dst} = k_;").line(ind, "}"),
+        MkClosure(fname, _, []) => {
+            self.line(ind, "\{")
+            self.line(ind, "  WClo* k_ = (WClo*)w_alloc_k(sizeof(WClo), WK_PLAIN);")
+            self.line(ind, "  k_->rc = 1; k_->fn = (void*){fname}; k_->drop = NULL; k_->share = NULL;")
+            self.line(ind, "  {dst} = k_;")
+            self.line(ind, "}")
+        },
         MkClosure(fname, _, args) => {
-            c = c.line(ind, "\{").line(ind, "  struct Env_{fname}* e_ = (struct Env_{fname}*)w_alloc_k(sizeof(struct Env_{fname}), WK_PLAIN);").line(ind, "  e_->base.rc = 1; e_->base.fn = (void*){fname}; e_->base.drop = Env_{fname}_drop; e_->base.share = Env_{fname}_share;").line(ind, "  w_set_kids(e_, (void (*)(void*))Env_{fname}_drop);")
+            self.line(ind, "\{")
+            self.line(ind, "  struct Env_{fname}* e_ = (struct Env_{fname}*)w_alloc_k(sizeof(struct Env_{fname}), WK_PLAIN);")
+            self.line(ind, "  e_->base.rc = 1; e_->base.fn = (void*){fname}; e_->base.drop = Env_{fname}_drop; e_->base.share = Env_{fname}_share;")
+            self.line(ind, "  w_set_kids(e_, (void (*)(void*))Env_{fname}_drop);")
             for (i, x) in args.with_index() {
-                let (a, c1) = c.atom(x)
-                c = c1.line(ind, "  e_->c{i} = {a};")
+                let a = self.atom(x)
+                self.line(ind, "  e_->c{i} = {a};")
             }
-            c.line(ind, "  {dst} = (WClo*)e_;").line(ind, "}")
+            self.line(ind, "  {dst} = (WClo*)e_;")
+            self.line(ind, "}")
         },
         Get(root, rty, steps) => {
             let steps = match (root, steps) {
-                (V(v) | VDup(v), [PIndex(V(i), _), ..rest]) if c.inrange.contains((v.id, i.id)) => [PIndexU(V(i))] + rest,
+                (V(v) | VDup(v), [PIndex(V(i), _), ..rest]) if self.inrange.contains((v.id, i.id)) => [PIndexU(V(i))] + rest,
                 _ => steps,
             }
-            let (ra, c1) = c.atom(root)
-            let (e, ft, c2) = c1.walk(ra, rty, steps)
-            let (d, c3) = c2.dup_of(ft, e)
-            c3.set(ind, dst, d)
+            let ra = self.atom(root)
+            let (e, ft) = self.walk(ra, rty, steps)
+            let d = self.dup_of(ft, e)
+            self.set(ind, dst, d)
         },
         Payload(x, ety, k, i) => {
-            let pt = c.variants_of(ety)[k].1[i]
-            let (a, c1) = c.atom(x)
-            let (pe, c2) = c1.payload_expr(ety, a, k, i)
-            let (d, c3) = c2.dup_of(pt, pe)
-            c3.set(ind, dst, d)
+            let pt = self.variants_of(ety)[k].1[i]
+            let a = self.atom(x)
+            let pe = self.payload_expr(ety, a, k, i)
+            let d = self.dup_of(pt, pe)
+            self.set(ind, dst, d)
         },
         IsTag(x, ety, k) => {
-            let (a, c1) = c.atom(x)
-            let (te, c2) = c1.tag_expr(ety, a)
-            c2.set(ind, dst, "({te} == {k})")
+            let a = self.atom(x)
+            let te = self.tag_expr(ety, a)
+            self.set(ind, dst, "({te} == {k})")
         },
         PatTest(x, ty, p) => {
-            let (a, c1) = c.atom(x)
-            let (e, c2) = c1.pat_cond(a, ty, p)
-            c2.set(ind, dst, e)
+            let a = self.atom(x)
+            let e = self.pat_cond(a, ty, p)
+            self.set(ind, dst, e)
         },
         Format(ps) => {
             let mut shown: List[Shown] = []
@@ -1288,46 +1289,49 @@ fn rhs_into(self: Cg, ind: Str, dst: Str, t: types.Ty, r: ir.Rhs) -> Cg {
                 match p {
                     IStr(s) => shown.push(Text(s)),
                     IVal(x, ty) => {
-                        let (a, c1) = c.atom(x)
-                        c = c1
+                        let a = self.atom(x)
                         shown.push(Value(a, ty, true))
                     },
                     IValQ(x, ty) => {
-                        let (a, c1) = c.atom(x)
-                        c = c1
+                        let a = self.atom(x)
                         shown.push(Value(a, ty, false))
                     },
                 }
             }
-            c.show_into(ind, dst, shown)
+            self.show_into(ind, dst, shown)
         },
         RootField(x, f) => {
-            let (a, c1) = c.atom(x)
-            c1.set(ind, dst, "Cap_root_field({a}, {c_string(f)})")
+            let a = self.atom(x)
+            self.set(ind, dst, "Cap_root_field({a}, {c_string(f)})")
         },
-        GroupNew(None, il) => c.set(ind, dst, "w_group_new({if il { 0 } else { 1 }})"),
+        GroupNew(None, il) => self.set(ind, dst, "w_group_new({if il { 0 } else { 1 }})"),
         GroupNew(Some((_, ms)), il) => {
-            let (m, c1) = c.atom(ms)
-            c1.set(ind, dst, "w_group_new_until({m}, {if il { 0 } else { 1 }})")
+            let m = self.atom(ms)
+            self.set(ind, dst, "w_group_new_until({m}, {if il { 0 } else { 1 }})")
         },
         Spawn(g, task, rt, keep) => {
-            if !c.task_tys.contains(rt) {
-                c.task_tys.push(rt)
+            if !self.task_tys.contains(rt) {
+                self.task_tys.push(rt)
             }
-            let (ct, c1) = c.ctype(rt)
-            let (n, c2) = c1.cname(rt)
-            let (ta, c3) = c2.atom(task)
-            let (ga, c4) = c3.atom(g)
-            c4.line(ind, "w_spawn({ga}, {ta}, wtask_{n}, sizeof({ct}), {keep});").set(ind, dst, "0")
+            let ct = self.ctype(rt)
+            let n = self.cname(rt)
+            let ta = self.atom(task)
+            let ga = self.atom(g)
+            self.line(ind, "w_spawn({ga}, {ta}, wtask_{n}, sizeof({ct}), {keep});")
+            self.set(ind, dst, "0")
         },
         GroupJoin(g, lty, until) => {
             let el = match lty {
                 TList(e) => e,
                 _ => TUnit,
             }
-            let (n, c1) = c.cname(lty)
-            let (ga, c2) = c1.atom(g)
-            c = c2.line(ind, "\{").line(ind, "  WGroup* g_ = {ga};").line(ind, "  w_group_wait(g_, 1);").line(ind, "  w_group_reraise(g_);").line(ind, "  {n}* l_ = {n}_new(g_->n);")
+            let n = self.cname(lty)
+            let ga = self.atom(g)
+            self.line(ind, "\{")
+            self.line(ind, "  WGroup* g_ = {ga};")
+            self.line(ind, "  w_group_wait(g_, 1);")
+            self.line(ind, "  w_group_reraise(g_);")
+            self.line(ind, "  {n}* l_ = {n}_new(g_->n);")
             // tasks that return () are not kept: the list holds the others' results
             if until {
                 // a cancelled task has no result: None
@@ -1335,31 +1339,36 @@ fn rhs_into(self: Cg, ind: Str, dst: Str, t: types.Ty, r: ir.Rhs) -> Cg {
                     TNamed("Option", [r]) => r,
                     _ => TUnit,
                 }
-                let (none, c3) = c.mk_enum(el, 1, [])
-                let (some, c4) = c3.mk_enum(el, 0, ["r_"])
-                let (ct, c5) = c4.ctype(rt)
-                c = c5.line(ind, "  for (int64_t i_ = 0; i_ < g_->n; i_++) \{").line(ind, "    if (!g_->tasks[i_] || !g_->tasks[i_]->keep) continue;").line(ind, "    if (g_->tasks[i_]->cancelled) l_->data[l_->len++] = {none};").line(ind, "    else \{ {ct} r_; memcpy(&r_, g_->tasks[i_]->slot, sizeof({ct})); l_->data[l_->len++] = {some}; }").line(ind, "  }")
+                let none = self.mk_enum(el, 1, [])
+                let some = self.mk_enum(el, 0, ["r_"])
+                let ct = self.ctype(rt)
+                self.line(ind, "  for (int64_t i_ = 0; i_ < g_->n; i_++) \{")
+                self.line(ind, "    if (!g_->tasks[i_] || !g_->tasks[i_]->keep) continue;")
+                self.line(ind, "    if (g_->tasks[i_]->cancelled) l_->data[l_->len++] = {none};")
+                self.line(ind, "    else \{ {ct} r_; memcpy(&r_, g_->tasks[i_]->slot, sizeof({ct})); l_->data[l_->len++] = {some}; }")
+                self.line(ind, "  }")
             } else {
-                let (ct, c3) = c.ctype(el)
-                c = c3.line(ind, "  for (int64_t i_ = 0; i_ < g_->n; i_++) if (g_->tasks[i_] && g_->tasks[i_]->keep) memcpy(&l_->data[l_->len++], g_->tasks[i_]->slot, sizeof({ct}));")
+                let ct = self.ctype(el)
+                self.line(ind, "  for (int64_t i_ = 0; i_ < g_->n; i_++) if (g_->tasks[i_] && g_->tasks[i_]->keep) memcpy(&l_->data[l_->len++], g_->tasks[i_]->slot, sizeof({ct}));")
             }
-            c.line(ind, "  w_group_release_tasks(g_);").line(ind, "  {dst} = l_;").line(ind, "}")
+            self.line(ind, "  w_group_release_tasks(g_);")
+            self.line(ind, "  {dst} = l_;")
+            self.line(ind, "}")
         },
         ChanNew(TChan(el), cap, sp) => {
-            (_, c) = c.cname(TChan(el))
-            let wh = c.where(sp)
+            let _ = self.cname(TChan(el))
+            let wh = self.where(sp)
             let mut share = "NULL"
             let mut drop = "NULL"
             if !is_scalar(el) {
-                let (en, c1) = c.cname(el)
-                let (en2, c2) = c1.cname(el)
-                c = c2
+                let en = self.cname(el)
+                let en2 = self.cname(el)
                 share = "chshare_" + en
                 drop = "chdrop_" + en2
             }
-            let (ct, c3) = c.ctype(el)
-            let (a, c4) = c3.atom(cap)
-            c4.set(ind, dst, "w_chan_new({a}, sizeof({ct}), {drop}, {share}, {wh})")
+            let ct = self.ctype(el)
+            let a = self.atom(cap)
+            self.set(ind, dst, "w_chan_new({a}, sizeof({ct}), {drop}, {share}, {wh})")
         },
         ChanNew(..) => panic("channel type"),
         ChanSend(ch, v, sp) => {
@@ -1367,18 +1376,23 @@ fn rhs_into(self: Cg, ind: Str, dst: Str, t: types.Ty, r: ir.Rhs) -> Cg {
                 TChan(e) => e,
                 _ => TUnit,
             }
-            let (va, c1) = c.atom(v)
-            let (ct, c2) = c1.ctype(el)
-            let (ca, c3) = c2.line(ind, "\{").line(ind, "  {ct} v_ = {va};").atom(ch)
-            c3.line(ind, "  w_chan_send({ca}, &v_, {c3.where(sp)});").line(ind, "}").set(ind, dst, "0")
+            let va = self.atom(v)
+            let ct = self.ctype(el)
+            self.line(ind, "\{")
+            self.line(ind, "  {ct} v_ = {va};")
+            let ca = self.atom(ch)
+            self.line(ind, "  w_chan_send({ca}, &v_, {self.where(sp)});")
+            self.line(ind, "}")
+            self.set(ind, dst, "0")
         },
         Panic(m, sp) => {
-            let (a, c1) = c.line(ind, "memset(&{dst}, 0, sizeof {dst});").atom(m)
-            c1.line(ind, "w_panic_c(({a})->data, {c1.where(sp)});")
+            self.line(ind, "memset(&{dst}, 0, sizeof {dst});")
+            let a = self.atom(m)
+            self.line(ind, "w_panic_c(({a})->data, {self.where(sp)});")
         },
         Prim(name, rt, args, sp) => {
-            let (xs, c1) = c.atoms(args)
-            c1.prim(ind, dst, t, name, rt, xs, sp)
+            let xs = self.atoms(args)
+            self.prim(ind, dst, t, name, rt, xs, sp)
         },
     }
 }
@@ -1386,19 +1400,17 @@ fn rhs_into(self: Cg, ind: Str, dst: Str, t: types.Ty, r: ir.Rhs) -> Cg {
 // A call into C: the Foreign checked (unless trusted), the arguments
 // converted, callbacks passed as their wrappers, out-parameters as
 // locals, and the results converted back.
-fn call_c(self: Cg, ind: Str, dst: Str, t: types.Ty, cs: ffi.CSig, args: List[ir.Atom], cbs: List[ir.Callback], sp: ast.Span) -> Cg {
-    let mut c = self
-    if !c.csyms.contains(cs.sym) {
-        c.csyms.push(cs.sym)
+fn call_c(mut self: Cg, ind: Str, dst: Str, t: types.Ty, cs: ffi.CSig, args: List[ir.Atom], cbs: List[ir.Callback], sp: ast.Span) {
+    if !self.csyms.contains(cs.sym) {
+        self.csyms.push(cs.sym)
     }
-    c = c.line(ind, "\{")
-    let (xs, c1) = c.atoms(args)
-    c = c1
+    self.line(ind, "\{")
+    let xs = self.atoms(args)
     let mut rest = xs
     if !cs.trusted {
         match xs {
             [cap, ..vs] => {
-                c = c.line(ind, "  w_foreign_check({cap}, {c_string(cs.lib)}, {c.where(sp)});")
+                self.line(ind, "  w_foreign_check({cap}, {c_string(cs.lib)}, {self.where(sp)});")
                 rest = vs
             },
             [] => panic("cgen: foreign call"),
@@ -1419,7 +1431,7 @@ fn call_c(self: Cg, ind: Str, dst: Str, t: types.Ty, cs: ffi.CSig, args: List[ir
                 continue
             }
             let o = "o{i}_"
-            c = c.line(ind, "  {ffi.c_name(p.cty)} {o} = 0;")
+            self.line(ind, "  {ffi.c_name(p.cty)} {o} = 0;")
             outs.push((o, p.cty))
             cargs.push("&" + o)
             continue
@@ -1428,8 +1440,7 @@ fn call_c(self: Cg, ind: Str, dst: Str, t: types.Ty, cs: ffi.CSig, args: List[ir
             Fn(ps, r) => match left {
                 [cb, ..more] => {
                     left = more
-                    let (w, c2) = c.ffi_callback(cb, ps, r)
-                    c = c2
+                    let w = self.ffi_callback(cb, ps, r)
                     cargs.push(w)
                 },
                 [] => panic("cgen: foreign callback"),
@@ -1448,23 +1459,20 @@ fn call_c(self: Cg, ind: Str, dst: Str, t: types.Ty, cs: ffi.CSig, args: List[ir
                         Str => "(const char *)w_block_keep(&j_->h, {v})",
                         Bytes => "w_block_keep(&j_->h, {v})",
                         _ => {
-                            let (a, c2) = c.ffi_arg(i >= fixed, ty, v, "argument `{p.name}` of `{cs.sym}`", c.where(sp))
-                            c = c2
+                            let a = self.ffi_arg(i >= fixed, ty, v, "argument `{p.name}` of `{cs.sym}`", self.where(sp))
                             a
                         },
                     }
                     let ft = if i >= fixed && (ty == Int32 || ty == Bool) {
                         "int"
                     } else {
-                        let (ct, c2) = c.ffi_ctype(ty)
-                        c = c2
+                        let ct = self.ffi_ctype(ty)
                         ct
                     }
                     fields.push(("a{i}", ft, x))
                     cargs.push("j->a{i}")
                 } else {
-                    let (a, c2) = c.ffi_arg(i >= fixed, ty, v, "argument `{p.name}` of `{cs.sym}`", c.where(sp))
-                    c = c2
+                    let a = self.ffi_arg(i >= fixed, ty, v, "argument `{p.name}` of `{cs.sym}`", self.where(sp))
                     cargs.push(a)
                 }
             },
@@ -1472,65 +1480,61 @@ fn call_c(self: Cg, ind: Str, dst: Str, t: types.Ty, cs: ffi.CSig, args: List[ir
     }
     let mut ptys: List[Str] = []
     for p in cs.params.take(fixed) {
-        let (pt, c2) = c.ffi_ctype(p.cty)
-        c = c2
+        let pt = self.ffi_ctype(p.cty)
         ptys.push(pt + if p.out { " *" } else { "" })
     }
-    let (rt, c3) = c.ffi_ctype(cs.ret)
-    c = c3
+    let rt = self.ffi_ctype(cs.ret)
     let proto = "{rt} (*)({if ptys.is_empty() { "void" } else { ptys.join(", ") + if cs.fixed.is_some() { ", ..." } else { "" } }})"
     let call = "(({proto})vf_{cs.sym})({cargs.join(", ")})"
     if cs.blocking {
-        return c.blocking_call(ind, dst, t, cs, fields, outs, call)
+        return self.blocking_call(ind, dst, t, cs, fields, outs, call)
     }
     // the Foreign value for callbacks that take one, kept on the task's fiber
     if pass_foreign {
-        c = c.line(ind, "  WFiber *cf_ = w_current();").line(ind, "  WCap *cfp_ = cf_->cb_foreign;").line(ind, "  cf_->cb_foreign = {xs[0]};")
+        self.line(ind, "  WFiber *cf_ = w_current();")
+        self.line(ind, "  WCap *cfp_ = cf_->cb_foreign;")
+        self.line(ind, "  cf_->cb_foreign = {xs[0]};")
     }
     if cs.ret == Unit {
-        c = c.line(ind, "  {call};")
+        self.line(ind, "  {call};")
     } else {
-        let (rt2, c4) = c.ffi_ctype(cs.ret)
-        c = c4.line(ind, "  {rt2} r_ = {call};")
+        let rt2 = self.ffi_ctype(cs.ret)
+        self.line(ind, "  {rt2} r_ = {call};")
     }
     if pass_foreign {
-        c = c.line(ind, "  cf_->cb_foreign = cfp_;")
+        self.line(ind, "  cf_->cb_foreign = cfp_;")
     }
     // the out-parameters' values first: OCaml makes the right operand of
     // `@` first
     let mut outv: List[Str] = []
     for o in outs {
-        let (v, c5) = c.ffi_result(o.1, o.0)
-        c = c5
+        let v = self.ffi_result(o.1, o.0)
         outv.push(v)
     }
     let mut vals: List[Str] = []
     if cs.ret != Unit {
-        let (v, c6) = c.ffi_result(cs.ret, "r_")
-        c = c6
+        let v = self.ffi_result(cs.ret, "r_")
         vals.push(v)
     }
     vals = vals + outv
-    c = match vals {
-        [] => c.line(ind, "  {dst} = 0;"),
-        [v] => c.line(ind, "  {dst} = {v};"),
+    match vals {
+        [] => self.line(ind, "  {dst} = 0;"),
+        [v] => self.line(ind, "  {dst} = {v};"),
         vs => {
-            let (n, c7) = c.cname(t)
-            c7.line(ind, "  {dst} = ({n})\{ {vs.join(", ")} };")
+            let n = self.cname(t)
+            self.line(ind, "  {dst} = ({n})\{ {vs.join(", ")} };")
         },
     }
-    c.line(ind, "}")
+    self.line(ind, "}")
 }
 
 // Blocking calls: the call runs on the blocking-call pool, from a job
 // holding its arguments, out-parameters and result (WBlock in the
 // runtime), while the task waits. A struct's C type is named by
 // ffi_ctype already, for the prototype.
-fn blocking_call(self: Cg, ind: Str, dst: Str, t: types.Ty, cs: ffi.CSig, fields: List[(Str, Str, Str)], outs: List[(Str, ffi.CTy)], call: Str) -> Cg {
-    let mut c = self
-    let n = "vbj{c.bjobs.len()}_"
-    let (rty, c1) = c.ffi_ctype(cs.ret)
-    c = c1
+fn blocking_call(mut self: Cg, ind: Str, dst: Str, t: types.Ty, cs: ffi.CSig, fields: List[(Str, Str, Str)], outs: List[(Str, ffi.CTy)], call: Str) {
+    let n = "vbj{self.bjobs.len()}_"
+    let rty = self.ffi_ctype(cs.ret)
     let mut members = fields.map(|f| "{f.1} {f.0};")
     for (i, p) in cs.params.with_index() {
         if p.out {
@@ -1546,18 +1550,17 @@ fn blocking_call(self: Cg, ind: Str, dst: Str, t: types.Ty, cs: ffi.CSig, fields
         Str => "j->h.res = w_ffi_str({call});",
         _ => "j->r = {call};",
     }
-    c.bjobs.push("typedef struct \{ WBlock h; {members.join(" ")} } {n};\nstatic void {n}run(WBlock *b_) \{ {n} *j = ({n} *)b_; {body} }\n")
-    c = c.line(ind, "  {n} *j_ __attribute__((cleanup(w_block_end))) = ({n} *)w_block_new(sizeof({n}), {n}run);")
+    self.bjobs.push("typedef struct \{ WBlock h; {members.join(" ")} } {n};\nstatic void {n}run(WBlock *b_) \{ {n} *j = ({n} *)b_; {body} }\n")
+    self.line(ind, "  {n} *j_ __attribute__((cleanup(w_block_end))) = ({n} *)w_block_new(sizeof({n}), {n}run);")
     for f in fields {
-        c = c.line(ind, "  j_->{f.0} = {f.2};")
+        self.line(ind, "  j_->{f.0} = {f.2};")
     }
-    c = c.line(ind, "  w_block_wait(&j_->h);")
+    self.line(ind, "  w_block_wait(&j_->h);")
     // the out-parameters' values first: OCaml makes the right operand of
     // `@` first
     let mut outv: List[Str] = []
     for o in outs {
-        let (v, c5) = c.ffi_result(o.1, o.0)
-        c = c5
+        let v = self.ffi_result(o.1, o.0)
         outv.push(v)
     }
     let mut vals: List[Str] = []
@@ -1565,340 +1568,404 @@ fn blocking_call(self: Cg, ind: Str, dst: Str, t: types.Ty, cs: ffi.CSig, fields
         Unit => {},
         Str => vals.push("w_block_str(&j_->h)"),
         _ => {
-            let (v, c6) = c.ffi_result(cs.ret, "j_->r")
-            c = c6
+            let v = self.ffi_result(cs.ret, "j_->r")
             vals.push(v)
         },
     }
     vals = vals + outv
-    c = match vals {
-        [] => c.line(ind, "  {dst} = 0;"),
-        [v] => c.line(ind, "  {dst} = {v};"),
+    match vals {
+        [] => self.line(ind, "  {dst} = 0;"),
+        [v] => self.line(ind, "  {dst} = {v};"),
         vs => {
-            let (tn, c7) = c.cname(t)
-            c7.line(ind, "  {dst} = ({tn})\{ {vs.join(", ")} };")
+            let tn = self.cname(t)
+            self.line(ind, "  {dst} = ({tn})\{ {vs.join(", ")} };")
         },
     }
-    c.line(ind, "}")
+    self.line(ind, "}")
 }
 
 // A built-in method on receiver type `rt`, its arguments `a` already C.
-fn prim(self: Cg, ind: Str, dst: Str, t: types.Ty, name: Str, rt: types.Ty, a: List[Str], sp: ast.Span) -> Cg {
-    let c = self
+fn prim(mut self: Cg, ind: Str, dst: Str, t: types.Ty, name: Str, rt: types.Ty, a: List[Str], sp: ast.Span) {
     let arg = |i: Int| a[i]
     match (name, rt) {
-        ("list_len" | "array_len", TArray(_, TLen(n))) => c.set(ind, dst, "{n}"),
+        ("list_len" | "array_len", TArray(_, TLen(n))) => self.set(ind, dst, "{n}"),
         ("array_get", TArray(el, TLen(n))) => {
-            let (v, c1) = c.dup_of(el, "({arg(0)}).a[{arg(1)}]")
-            c1.opt_from(ind, dst, t, "{arg(1)} >= 0 && {arg(1)} < {n}", v)
+            let v = self.dup_of(el, "({arg(0)}).a[{arg(1)}]")
+            self.opt_from(ind, dst, t, "{arg(1)} >= 0 && {arg(1)} < {n}", v)
         },
         ("array_contains", TArray(el, TLen(n))) => {
-            let (eq, c1) = c.binop(Eq, el, "({arg(0)}).a[i_]", arg(1), diag.nowhere())
-            c1.set(ind, dst, "(\{ bool f_ = false; for (int64_t i_ = 0; i_ < {n}; i_++) if ({eq}) \{ f_ = true; break; } f_; })")
+            let eq = self.binop(Eq, el, "({arg(0)}).a[i_]", arg(1), diag.nowhere())
+            self.set(ind, dst, "(\{ bool f_ = false; for (int64_t i_ = 0; i_ < {n}; i_++) if ({eq}) \{ f_ = true; break; } f_; })")
         },
         ("array_to_list", TArray(el, TLen(n))) => {
-            let (ln, c1) = c.cname(TList(el))
-            let (v, c2) = c1.dup_of(el, "({arg(0)}).a[i_]")
-            c2.line(ind, "\{").line(ind, "  {ln}* l_ = {ln}_new({n});").line(ind, "  for (int64_t i_ = 0; i_ < {n}; i_++) l_->data[i_] = {v};").line(ind, "  l_->len = {n};").line(ind, "  {dst} = l_;").line(ind, "}")
+            let ln = self.cname(TList(el))
+            let v = self.dup_of(el, "({arg(0)}).a[i_]")
+            self.line(ind, "\{")
+            self.line(ind, "  {ln}* l_ = {ln}_new({n});")
+            self.line(ind, "  for (int64_t i_ = 0; i_ < {n}; i_++) l_->data[i_] = {v};")
+            self.line(ind, "  l_->len = {n};")
+            self.line(ind, "  {dst} = l_;")
+            self.line(ind, "}")
         },
         ("chan_recv", TChan(el)) => {
-            let (ct, c1) = c.ctype(el)
-            let (none, c2) = c1.line(ind, "\{").line(ind, "  {ct} v_;").mk_enum(t, 1, [])
-            let (some, c3) = c2.mk_enum(t, 0, ["v_"])
-            c3.line(ind, "  {dst} = w_chan_recv({arg(0)}, &v_) ? {some} : {none};").line(ind, "}")
+            let ct = self.ctype(el)
+            self.line(ind, "\{")
+            self.line(ind, "  {ct} v_;")
+            let none = self.mk_enum(t, 1, [])
+            let some = self.mk_enum(t, 0, ["v_"])
+            self.line(ind, "  {dst} = w_chan_recv({arg(0)}, &v_) ? {some} : {none};")
+            self.line(ind, "}")
         },
         // the value escapes into an empty asm statement the compiler cannot see through
-        ("keep", _) => c.line(ind, "\{ __typeof__({arg(0)}) k_ = {arg(0)}; __asm__ volatile(\"\" : : \"r\"(&k_) : \"memory\"); }").set(ind, dst, "0"),
-        ("chan_close", _) => c.line(ind, "w_chan_close({arg(0)}, {c.where(sp)});").set(ind, dst, "0"),
+        ("keep", _) => {
+            self.line(ind, "\{ __typeof__({arg(0)}) k_ = {arg(0)}; __asm__ volatile(\"\" : : \"r\"(&k_) : \"memory\"); }")
+            self.set(ind, dst, "0")
+        },
+        ("chan_close", _) => {
+            self.line(ind, "w_chan_close({arg(0)}, {self.where(sp)});")
+            self.set(ind, dst, "0")
+        },
         // Atomic and Shared (the runtime's "Atomic and Shared")
-        ("atomic_new", _) => c.set(ind, dst, "w_atomic_new({arg(0)})"),
-        ("atomic_get", _) => c.set(ind, dst, "w_atomic_get({arg(0)})"),
-        ("atomic_set", _) => c.line(ind, "w_atomic_set({arg(0)}, {arg(1)});").set(ind, dst, "0"),
-        ("atomic_add", _) => c.set(ind, dst, "w_atomic_add({arg(0)}, {arg(1)})"),
-        ("atomic_swap", _) => c.set(ind, dst, "w_atomic_swap({arg(0)}, {arg(1)})"),
-        ("atomic_compare_and_set", _) => c.set(ind, dst, "w_atomic_cas({arg(0)}, {arg(1)}, {arg(2)})"),
+        ("atomic_new", _) => self.set(ind, dst, "w_atomic_new({arg(0)})"),
+        ("atomic_get", _) => self.set(ind, dst, "w_atomic_get({arg(0)})"),
+        ("atomic_set", _) => {
+            self.line(ind, "w_atomic_set({arg(0)}, {arg(1)});")
+            self.set(ind, dst, "0")
+        },
+        ("atomic_add", _) => self.set(ind, dst, "w_atomic_add({arg(0)}, {arg(1)})"),
+        ("atomic_swap", _) => self.set(ind, dst, "w_atomic_swap({arg(0)}, {arg(1)})"),
+        ("atomic_compare_and_set", _) => self.set(ind, dst, "w_atomic_cas({arg(0)}, {arg(1)}, {arg(2)})"),
         ("shared_new", TShared(el)) => {
             // the value is the Shared's own reference, switched to shared:
             // any task may read it
-            let (_, c1) = c.cname(rt)
-            let (cn, c2) = c1.cname(el)
-            let (ct, c3) = c2.ctype(el)
+            let _ = self.cname(rt)
+            let cn = self.cname(el)
+            let ct = self.ctype(el)
             let fns = if is_scalar(el) { "NULL, NULL" } else { "chdrop_{cn}, chshare_{cn}" }
-            let (dv, c4) = c3.dup_of(el, arg(0))
-            let mut c5 = c4.line(ind, "\{").line(ind, "  WShared *s_ = w_shared_new(sizeof({ct}), {fns});").line(ind, "  {ct} v_ = {dv};")
+            let dv = self.dup_of(el, arg(0))
+            self.line(ind, "\{")
+            self.line(ind, "  WShared *s_ = w_shared_new(sizeof({ct}), {fns});")
+            self.line(ind, "  {ct} v_ = {dv};")
             if !is_scalar(el) {
-                c5 = c5.line(ind, "  {cn}_share(v_);")
+                self.line(ind, "  {cn}_share(v_);")
             }
-            c5.line(ind, "  memcpy(s_->v, &v_, sizeof v_);").line(ind, "  {dst} = s_;").line(ind, "}")
+            self.line(ind, "  memcpy(s_->v, &v_, sizeof v_);")
+            self.line(ind, "  {dst} = s_;")
+            self.line(ind, "}")
         },
         ("shared_get", TShared(el)) => {
             // a snapshot: another reference to the value, taken under the lock
-            let (ct, c1) = c.ctype(el)
-            let (dv, c2) = c1.dup_of(el, "v_")
-            c2.line(ind, "\{").line(ind, "  w_shared_lock({arg(0)}, {c2.where(sp)});").line(ind, "  {ct} v_; memcpy(&v_, ({arg(0)})->v, sizeof v_);").line(ind, "  {dst} = {dv};").line(ind, "  w_shared_unlock({arg(0)});").line(ind, "}")
+            let ct = self.ctype(el)
+            let dv = self.dup_of(el, "v_")
+            self.line(ind, "\{")
+            self.line(ind, "  w_shared_lock({arg(0)}, {self.where(sp)});")
+            self.line(ind, "  {ct} v_; memcpy(&v_, ({arg(0)})->v, sizeof v_);")
+            self.line(ind, "  {dst} = {dv};")
+            self.line(ind, "  w_shared_unlock({arg(0)});")
+            self.line(ind, "}")
         },
         ("shared_set", TShared(el)) => {
-            let (ct, c1) = c.ctype(el)
-            let (dn, c2) = c1.dup_of(el, arg(1))
-            let (cn, c3) = c2.cname(el)
-            let mut c4 = c3.line(ind, "\{").line(ind, "  {ct} n_ = {dn};")
+            let ct = self.ctype(el)
+            let dn = self.dup_of(el, arg(1))
+            let cn = self.cname(el)
+            self.line(ind, "\{")
+            self.line(ind, "  {ct} n_ = {dn};")
             if !is_scalar(el) {
-                c4 = c4.line(ind, "  {cn}_share(n_);")
+                self.line(ind, "  {cn}_share(n_);")
             }
-            c4 = c4.line(ind, "  w_shared_lock({arg(0)}, {c4.where(sp)});").line(ind, "  {ct} o_; memcpy(&o_, ({arg(0)})->v, sizeof o_); memcpy(({arg(0)})->v, &n_, sizeof n_);").line(ind, "  w_shared_unlock({arg(0)});")
+            self.line(ind, "  w_shared_lock({arg(0)}, {self.where(sp)});")
+            self.line(ind, "  {ct} o_; memcpy(&o_, ({arg(0)})->v, sizeof o_); memcpy(({arg(0)})->v, &n_, sizeof n_);")
+            self.line(ind, "  w_shared_unlock({arg(0)});")
             if !is_scalar(el) {
-                c4 = c4.line(ind, "  {cn}_drop(o_);")
+                self.line(ind, "  {cn}_drop(o_);")
             }
-            c4.line(ind, "}").set(ind, dst, "0")
+            self.line(ind, "}")
+            self.set(ind, dst, "0")
         },
         ("shared_update", TShared(el)) => {
             // the function runs holding the lock, on its own reference to
             // the value (so it copies what it changes, and a panic or a
             // cancellation in it leaves the value as it was: the cleanup
             // lets go of the lock); its result becomes the value
-            let (ct, c1) = c.ctype(el)
-            let (da, c2) = c1.dup_of(el, "a_")
-            let (dr, c3) = c2.dup_of(el, "r_")
-            let (cn, c4) = c3.cname(el)
-            let mut c5 = c4.line(ind, "\{").line(ind, "  WShared *u_ __attribute__((cleanup(w_update_end))) = w_update_begin({arg(0)}, {c4.where(sp)});").line(ind, "  {ct} a_; memcpy(&a_, u_->v, sizeof a_);").line(ind, "  {ct} r_ = (({ct} (*)(WClo*, {ct}))({arg(1)})->fn)({arg(1)}, {da});")
+            let ct = self.ctype(el)
+            let da = self.dup_of(el, "a_")
+            let dr = self.dup_of(el, "r_")
+            let cn = self.cname(el)
+            self.line(ind, "\{")
+            self.line(ind, "  WShared *u_ __attribute__((cleanup(w_update_end))) = w_update_begin({arg(0)}, {self.where(sp)});")
+            self.line(ind, "  {ct} a_; memcpy(&a_, u_->v, sizeof a_);")
+            self.line(ind, "  {ct} r_ = (({ct} (*)(WClo*, {ct}))({arg(1)})->fn)({arg(1)}, {da});")
             if !is_scalar(el) {
-                c5 = c5.line(ind, "  {cn}_share(r_);")
+                self.line(ind, "  {cn}_share(r_);")
             }
-            c5 = c5.line(ind, "  {ct} o_; memcpy(&o_, u_->v, sizeof o_); memcpy(u_->v, &r_, sizeof r_);").line(ind, "  {dst} = {dr};").line(ind, "  w_update_end(&u_);").line(ind, "  u_ = NULL;")
+            self.line(ind, "  {ct} o_; memcpy(&o_, u_->v, sizeof o_); memcpy(u_->v, &r_, sizeof r_);")
+            self.line(ind, "  {dst} = {dr};")
+            self.line(ind, "  w_update_end(&u_);")
+            self.line(ind, "  u_ = NULL;")
             if !is_scalar(el) {
-                c5 = c5.line(ind, "  {cn}_drop(o_);")
+                self.line(ind, "  {cn}_drop(o_);")
             }
-            c5.line(ind, "}")
+            self.line(ind, "}")
         },
         ("map_new", TMap(..)) => {
-            let (n, c1) = c.cname(rt)
-            c1.set(ind, dst, "{n}_new()")
+            let n = self.cname(rt)
+            self.set(ind, dst, "{n}_new()")
         },
         ("map_from", TMap(k, v)) => {
-            let (n, c1) = c.cname(rt)
-            let (dv, c2) = c1.dup_of(v, "({arg(0)})->data[i_].f1")
-            let (dk, c3) = c2.dup_of(k, "({arg(0)})->data[i_].f0")
-            let c4 = c3.line(ind, "\{").line(ind, "  {n}* m_ = {n}_new();").line(ind, "  for (int64_t i_ = 0; i_ < ({arg(0)})->len; i_++) {n}_put(&m_, {dk}, {dv});")
-            let (_, c5) = c4.cname(TList(TNamed(ast.tuple_name(2), [k, v])))
-            c5.line(ind, "  {dst} = m_;").line(ind, "}")
+            let n = self.cname(rt)
+            let dv = self.dup_of(v, "({arg(0)})->data[i_].f1")
+            let dk = self.dup_of(k, "({arg(0)})->data[i_].f0")
+            self.line(ind, "\{")
+            self.line(ind, "  {n}* m_ = {n}_new();")
+            self.line(ind, "  for (int64_t i_ = 0; i_ < ({arg(0)})->len; i_++) {n}_put(&m_, {dk}, {dv});")
+            let _ = self.cname(TList(TNamed(ast.tuple_name(2), [k, v])))
+            self.line(ind, "  {dst} = m_;")
+            self.line(ind, "}")
         },
         ("map_at", TMap(..)) => {
-            let (n, c1) = c.cname(rt)
-            c1.set(ind, dst, "{n}_at({arg(0)}, {arg(1)}, {c1.where(sp)})")
+            let n = self.cname(rt)
+            self.set(ind, dst, "{n}_at({arg(0)}, {arg(1)}, {self.where(sp)})")
         },
         ("map_get", TMap(_, v)) => {
-            let (n, c1) = c.cname(rt)
-            let (vt, c2) = c1.ctype(v)
-            let (dv, c3) = c2.line(ind, "\{").line(ind, "  {vt}* p_ = {n}_get({arg(0)}, {arg(1)});").dup_of(v, "*p_")
-            let (none, c4) = c3.mk_enum(t, 1, [])
-            let (some, c5) = c4.mk_enum(t, 0, [dv])
-            c5.line(ind, "  {dst} = p_ ? {some} : {none};").line(ind, "}")
+            let n = self.cname(rt)
+            let vt = self.ctype(v)
+            self.line(ind, "\{")
+            self.line(ind, "  {vt}* p_ = {n}_get({arg(0)}, {arg(1)});")
+            let dv = self.dup_of(v, "*p_")
+            let none = self.mk_enum(t, 1, [])
+            let some = self.mk_enum(t, 0, [dv])
+            self.line(ind, "  {dst} = p_ ? {some} : {none};")
+            self.line(ind, "}")
         },
         ("map_contains", TMap(..)) => {
-            let (n, c1) = c.cname(rt)
-            c1.set(ind, dst, "({n}_find({arg(0)}, {arg(1)}) >= 0)")
+            let n = self.cname(rt)
+            self.set(ind, dst, "({n}_find({arg(0)}, {arg(1)}) >= 0)")
         },
-        ("map_len", _) => c.set(ind, dst, "({arg(0)})->len"),
-        ("map_is_empty", _) => c.set(ind, dst, "(({arg(0)})->len == 0)"),
+        ("map_len", _) => self.set(ind, dst, "({arg(0)})->len"),
+        ("map_is_empty", _) => self.set(ind, dst, "(({arg(0)})->len == 0)"),
         ("map_keys" | "map_values" | "map_entries", TMap(k, v)) => {
-            let (ln, c1) = c.cname(t)
-            let (item, c2) = match name {
-                "map_keys" => c1.dup_of(k, "(m_)->keys[i_]"),
-                "map_values" => c1.dup_of(v, "(m_)->vals[i_]"),
+            let ln = self.cname(t)
+            let item = match name {
+                "map_keys" => self.dup_of(k, "(m_)->keys[i_]"),
+                "map_values" => self.dup_of(v, "(m_)->vals[i_]"),
                 _ => {
-                    let (dv, c3) = c1.dup_of(v, "(m_)->vals[i_]")
-                    let (dk, c4) = c3.dup_of(k, "(m_)->keys[i_]")
-                    let (tn, c5) = c4.cname(TNamed(ast.tuple_name(2), [k, v]))
-                    ("({tn})\{ {dk}, {dv} }", c5)
+                    let dv = self.dup_of(v, "(m_)->vals[i_]")
+                    let dk = self.dup_of(k, "(m_)->keys[i_]")
+                    let tn = self.cname(TNamed(ast.tuple_name(2), [k, v]))
+                    "({tn})\{ {dk}, {dv} }"
                 },
             }
-            let (mn, c6) = c2.cname(rt)
-            c6.line(ind, "\{").line(ind, "  {mn}* m_ = {arg(0)};").line(ind, "  {ln}* l_ = {ln}_new(m_->len);").line(ind, "  for (int64_t i_ = 0; i_ < m_->n; i_++) if (m_->live[i_]) {ln}_push_u(&l_, {item});").line(ind, "  {dst} = l_;").line(ind, "}")
+            let mn = self.cname(rt)
+            self.line(ind, "\{")
+            self.line(ind, "  {mn}* m_ = {arg(0)};")
+            self.line(ind, "  {ln}* l_ = {ln}_new(m_->len);")
+            self.line(ind, "  for (int64_t i_ = 0; i_ < m_->n; i_++) if (m_->live[i_]) {ln}_push_u(&l_, {item});")
+            self.line(ind, "  {dst} = l_;")
+            self.line(ind, "}")
         },
-        ("list_len" | "str_len", _) => c.set(ind, dst, "({arg(0)})->len"),
-        ("list_is_empty" | "str_is_empty", _) => c.set(ind, dst, "(({arg(0)})->len == 0)"),
+        ("list_len" | "str_len", _) => self.set(ind, dst, "({arg(0)})->len"),
+        ("list_is_empty" | "str_is_empty", _) => self.set(ind, dst, "(({arg(0)})->len == 0)"),
         ("list_get", TList(el)) => {
-            let (v, c1) = c.dup_of(el, "({arg(0)})->data[{arg(1)}]")
-            c1.opt_from(ind, dst, t, "{arg(1)} >= 0 && {arg(1)} < ({arg(0)})->len", v)
+            let v = self.dup_of(el, "({arg(0)})->data[{arg(1)}]")
+            self.opt_from(ind, dst, t, "{arg(1)} >= 0 && {arg(1)} < ({arg(0)})->len", v)
         },
         ("list_first", TList(el)) => {
-            let (v, c1) = c.dup_of(el, "({arg(0)})->data[0]")
-            c1.opt_from(ind, dst, t, "({arg(0)})->len > 0", v)
+            let v = self.dup_of(el, "({arg(0)})->data[0]")
+            self.opt_from(ind, dst, t, "({arg(0)})->len > 0", v)
         },
         ("list_last", TList(el)) => {
-            let (v, c1) = c.dup_of(el, "({arg(0)})->data[({arg(0)})->len - 1]")
-            c1.opt_from(ind, dst, t, "({arg(0)})->len > 0", v)
+            let v = self.dup_of(el, "({arg(0)})->data[({arg(0)})->len - 1]")
+            self.opt_from(ind, dst, t, "({arg(0)})->len > 0", v)
         },
-        ("list_contains", _) => c.named_call(ind, dst, rt, "_contains({arg(0)}, {arg(1)})"),
-        ("list_reverse", _) => c.named_call(ind, dst, rt, "_reverse({arg(0)})"),
+        ("list_contains", _) => self.named_call(ind, dst, rt, "_contains({arg(0)}, {arg(1)})"),
+        ("list_reverse", _) => self.named_call(ind, dst, rt, "_reverse({arg(0)})"),
         ("list_sort", TList(el)) => {
-            let (_, c1) = c.cmp_prefix(el)
-            let mut c2 = c1
+            let _ = self.cmp_prefix(el)
             match el {
                 TInt | TStr | TFloat => {},
                 _ => {
-                    let (known, c3) = c2.named_in(c2.sort_tys, rt)
-                    c2 = c3
+                    let known = self.named_in(self.sort_tys, rt)
                     if !known {
-                        c2.sort_tys.push(rt)
+                        self.sort_tys.push(rt)
                     }
                 },
             }
-            c2.named_call(ind, dst, rt, "_sort({arg(0)})")
+            self.named_call(ind, dst, rt, "_sort({arg(0)})")
         },
-        ("list_slice", _) => c.named_call(ind, dst, rt, "_slice({arg(0)}, {arg(1)}, {arg(2)})"),
-        ("list_take", _) => c.named_call(ind, dst, rt, "_slice({arg(0)}, 0, {arg(1)})"),
-        ("list_skip", _) => c.named_call(ind, dst, rt, "_slice({arg(0)}, {arg(1)}, ({arg(0)})->len)"),
-        ("list_join", _) => c.set(ind, dst, "L_Str_join({arg(0)}, {arg(1)})"),
-        ("list_sum", _) => c.set(ind, dst, "L_Int_sum({arg(0)})"),
-        ("str_lines", _) => c.set(ind, dst, "Str_lines({arg(0)})"),
-        ("str_split", _) => c.set(ind, dst, "Str_split({arg(0)}, {arg(1)})"),
-        ("str_trim", _) => c.set(ind, dst, "Str_trim({arg(0)})"),
-        ("str_contains", _) => c.set(ind, dst, "(Str_find({arg(0)}, {arg(1)}, 0) >= 0)"),
-        ("str_starts_with", _) => c.set(ind, dst, "Str_starts({arg(0)}, {arg(1)})"),
-        ("str_ends_with", _) => c.set(ind, dst, "Str_ends({arg(0)}, {arg(1)})"),
-        ("str_to_upper", _) => c.set(ind, dst, "Str_map_case({arg(0)}, true)"),
-        ("str_to_lower", _) => c.set(ind, dst, "Str_map_case({arg(0)}, false)"),
-        ("str_replace", _) => c.set(ind, dst, "Str_replace({arg(0)}, {arg(1)}, {arg(2)})"),
-        ("str_parse_int", _) => c.found(ind, dst, t, "int64_t n_;", "Str_parse_int({arg(0)}, &n_)", "n_"),
-        ("str_parse_float", _) => c.found(ind, dst, t, "double x_;", "Str_parse_float({arg(0)}, &x_)", "x_"),
-        ("str_slice", _) => c.set(ind, dst, "Str_slice({arg(0)}, {arg(1)}, {arg(2)})"),
-        ("str_index_of", _) => c.found(ind, dst, t, "int64_t i_ = Str_find({arg(0)}, {arg(1)}, 0);", "i_ >= 0", "i_"),
-        ("str_last_index_of", _) => c.found(ind, dst, t, "int64_t i_ = Str_rfind({arg(0)}, {arg(1)});", "i_ >= 0", "i_"),
-        ("str_bytes", _) => c.set(ind, dst, "Str_bytes({arg(0)})"),
-        ("str_chars", _) => c.set(ind, dst, "Str_chars({arg(0)})"),
-        ("str_to_bytes" | "bytes_to_str", _) => c.set(ind, dst, "Str_dup({arg(0)})"),
-        ("bytes_new", _) => c.set(ind, dst, "Bytes_from_list({arg(0)}, {c.where(sp)})"),
-        ("bytes_at", _) => c.set(ind, dst, "Bytes_at({arg(0)}, {arg(1)}, {c.where(sp)})"),
-        ("bytes_len", _) => c.set(ind, dst, "({arg(0)})->len"),
-        ("bytes_is_empty", _) => c.set(ind, dst, "(({arg(0)})->len == 0)"),
-        ("bytes_get", _) => c.opt_from(ind, dst, t, "{arg(1)} >= 0 && {arg(1)} < ({arg(0)})->len", "(int64_t)(unsigned char)({arg(0)})->data[{arg(1)}]"),
-        ("bytes_slice", _) => c.set(ind, dst, "Str_slice({arg(0)}, {arg(1)}, {arg(2)})"),
-        ("bytes_to_list", _) => c.set(ind, dst, "Str_bytes({arg(0)})"),
-        ("int_range", _) => c.set(ind, dst, "L_Int_range({arg(0)}, {arg(1)})"),
-        ("int_to_char", _) => c.set(ind, dst, "Int_to_char({arg(0)})"),
-        ("int_min", _) => c.set(ind, dst, "({arg(0)} < {arg(1)} ? {arg(0)} : {arg(1)})"),
-        ("int_max", _) => c.set(ind, dst, "({arg(0)} > {arg(1)} ? {arg(0)} : {arg(1)})"),
-        ("int_to_str" | "float_to_str" | "bool_to_str", _) => c.show_into(ind, dst, [Value(arg(0), rt, true)]),
-        ("int_to_float", _) => c.set(ind, dst, "(double){arg(0)}"),
-        ("int_abs", _) => c.set(ind, dst, "w_abs({arg(0)})"),
-        ("int_shift_right_unsigned", _) => c.set(ind, dst, "w_ushr({arg(0)}, {arg(1)}, {c.where(sp)})"),
-        ("int_to_uint8" | "uint_to_uint8", _) => c.set(ind, dst, "(uint8_t)({arg(0)})"),
-        ("int_to_uint16" | "uint_to_uint16", _) => c.set(ind, dst, "(uint16_t)({arg(0)})"),
-        ("int_to_uint32" | "uint_to_uint32", _) => c.set(ind, dst, "(uint32_t)({arg(0)})"),
-        ("int_to_uint64" | "uint_to_uint64", _) => c.set(ind, dst, "(uint64_t)({arg(0)})"),
-        ("uint_to_int", _) => c.set(ind, dst, "(int64_t)({arg(0)})"),
-        ("uint_to_str", _) => c.show_into(ind, dst, [Value(arg(0), rt, true)]),
-        ("uint_to_float", _) => c.set(ind, dst, "w_u2f({arg(0)})"),
-        ("uint_min", _) => c.set(ind, dst, "({arg(0)} < {arg(1)} ? {arg(0)} : {arg(1)})"),
-        ("uint_max", _) => c.set(ind, dst, "({arg(0)} > {arg(1)} ? {arg(0)} : {arg(1)})"),
+        ("list_slice", _) => self.named_call(ind, dst, rt, "_slice({arg(0)}, {arg(1)}, {arg(2)})"),
+        ("list_take", _) => self.named_call(ind, dst, rt, "_slice({arg(0)}, 0, {arg(1)})"),
+        ("list_skip", _) => self.named_call(ind, dst, rt, "_slice({arg(0)}, {arg(1)}, ({arg(0)})->len)"),
+        ("list_join", _) => self.set(ind, dst, "L_Str_join({arg(0)}, {arg(1)})"),
+        ("list_sum", _) => self.set(ind, dst, "L_Int_sum({arg(0)})"),
+        ("str_lines", _) => self.set(ind, dst, "Str_lines({arg(0)})"),
+        ("str_split", _) => self.set(ind, dst, "Str_split({arg(0)}, {arg(1)})"),
+        ("str_trim", _) => self.set(ind, dst, "Str_trim({arg(0)})"),
+        ("str_contains", _) => self.set(ind, dst, "(Str_find({arg(0)}, {arg(1)}, 0) >= 0)"),
+        ("str_starts_with", _) => self.set(ind, dst, "Str_starts({arg(0)}, {arg(1)})"),
+        ("str_ends_with", _) => self.set(ind, dst, "Str_ends({arg(0)}, {arg(1)})"),
+        ("str_to_upper", _) => self.set(ind, dst, "Str_map_case({arg(0)}, true)"),
+        ("str_to_lower", _) => self.set(ind, dst, "Str_map_case({arg(0)}, false)"),
+        ("str_replace", _) => self.set(ind, dst, "Str_replace({arg(0)}, {arg(1)}, {arg(2)})"),
+        ("str_parse_int", _) => self.found(ind, dst, t, "int64_t n_;", "Str_parse_int({arg(0)}, &n_)", "n_"),
+        ("str_parse_float", _) => self.found(ind, dst, t, "double x_;", "Str_parse_float({arg(0)}, &x_)", "x_"),
+        ("str_slice", _) => self.set(ind, dst, "Str_slice({arg(0)}, {arg(1)}, {arg(2)})"),
+        ("str_index_of", _) => self.found(ind, dst, t, "int64_t i_ = Str_find({arg(0)}, {arg(1)}, 0);", "i_ >= 0", "i_"),
+        ("str_last_index_of", _) => self.found(ind, dst, t, "int64_t i_ = Str_rfind({arg(0)}, {arg(1)});", "i_ >= 0", "i_"),
+        ("str_bytes", _) => self.set(ind, dst, "Str_bytes({arg(0)})"),
+        ("str_chars", _) => self.set(ind, dst, "Str_chars({arg(0)})"),
+        ("str_to_bytes" | "bytes_to_str", _) => self.set(ind, dst, "Str_dup({arg(0)})"),
+        ("bytes_new", _) => self.set(ind, dst, "Bytes_from_list({arg(0)}, {self.where(sp)})"),
+        ("bytes_at", _) => self.set(ind, dst, "Bytes_at({arg(0)}, {arg(1)}, {self.where(sp)})"),
+        ("bytes_len", _) => self.set(ind, dst, "({arg(0)})->len"),
+        ("bytes_is_empty", _) => self.set(ind, dst, "(({arg(0)})->len == 0)"),
+        ("bytes_get", _) => self.opt_from(ind, dst, t, "{arg(1)} >= 0 && {arg(1)} < ({arg(0)})->len", "(int64_t)(unsigned char)({arg(0)})->data[{arg(1)}]"),
+        ("bytes_slice", _) => self.set(ind, dst, "Str_slice({arg(0)}, {arg(1)}, {arg(2)})"),
+        ("bytes_to_list", _) => self.set(ind, dst, "Str_bytes({arg(0)})"),
+        ("int_range", _) => self.set(ind, dst, "L_Int_range({arg(0)}, {arg(1)})"),
+        ("int_to_char", _) => self.set(ind, dst, "Int_to_char({arg(0)})"),
+        ("int_min", _) => self.set(ind, dst, "({arg(0)} < {arg(1)} ? {arg(0)} : {arg(1)})"),
+        ("int_max", _) => self.set(ind, dst, "({arg(0)} > {arg(1)} ? {arg(0)} : {arg(1)})"),
+        ("int_to_str" | "float_to_str" | "bool_to_str", _) => self.show_into(ind, dst, [Value(arg(0), rt, true)]),
+        ("int_to_float", _) => self.set(ind, dst, "(double){arg(0)}"),
+        ("int_abs", _) => self.set(ind, dst, "w_abs({arg(0)})"),
+        ("int_shift_right_unsigned", _) => self.set(ind, dst, "w_ushr({arg(0)}, {arg(1)}, {self.where(sp)})"),
+        ("int_to_uint8" | "uint_to_uint8", _) => self.set(ind, dst, "(uint8_t)({arg(0)})"),
+        ("int_to_uint16" | "uint_to_uint16", _) => self.set(ind, dst, "(uint16_t)({arg(0)})"),
+        ("int_to_uint32" | "uint_to_uint32", _) => self.set(ind, dst, "(uint32_t)({arg(0)})"),
+        ("int_to_uint64" | "uint_to_uint64", _) => self.set(ind, dst, "(uint64_t)({arg(0)})"),
+        ("uint_to_int", _) => self.set(ind, dst, "(int64_t)({arg(0)})"),
+        ("uint_to_str", _) => self.show_into(ind, dst, [Value(arg(0), rt, true)]),
+        ("uint_to_float", _) => self.set(ind, dst, "w_u2f({arg(0)})"),
+        ("uint_min", _) => self.set(ind, dst, "({arg(0)} < {arg(1)} ? {arg(0)} : {arg(1)})"),
+        ("uint_max", _) => self.set(ind, dst, "({arg(0)} > {arg(1)} ? {arg(0)} : {arg(1)})"),
         ("uint_rotate_left" | "uint_rotate_right", _) => {
             let bits = match rt {
                 TUInt(n) => n,
                 _ => 64,
             }
-            c.set(ind, dst, "(uint{bits}_t)w_urot({arg(0)}, {arg(1)}, {bits}, {if name == "uint_rotate_left" { 1 } else { 0 }})")
+            self.set(ind, dst, "(uint{bits}_t)w_urot({arg(0)}, {arg(1)}, {bits}, {if name == "uint_rotate_left" { 1 } else { 0 }})")
         },
-        ("float_to_int", _) => c.set(ind, dst, "w_f2i({arg(0)})"),
-        ("float_abs", _) => c.set(ind, dst, "fabs({arg(0)})"),
-        ("float_sqrt", _) => c.set(ind, dst, "sqrt({arg(0)})"),
-        ("float_to_fixed", _) => c.set(ind, dst, "Float_to_fixed({arg(0)}, {arg(1)})"),
-        ("cap_print", TCap("Stdout")) => c.line(ind, "Cap_print({arg(1)}, true);").set(ind, dst, "0"),
-        ("cap_write", TCap("Stdout")) => c.line(ind, "Cap_print({arg(1)}, false);").set(ind, dst, "0"),
-        ("cap_print", TCap("Stderr")) => c.line(ind, "Cap_eprint({arg(1)}, true);").set(ind, dst, "0"),
-        ("cap_write", TCap("Stderr")) => c.line(ind, "Cap_eprint({arg(1)}, false);").set(ind, dst, "0"),
-        ("cap_now_ms", _) => c.set(ind, dst, "Cap_now_ms()"),
-        ("cap_sleep", TCap("Clock")) => c.line(ind, "Cap_sleep({arg(1)});").set(ind, dst, "0"),
-        ("cap_int", TCap("Rand")) => c.set(ind, dst, "Cap_rand_int({arg(1)}, {arg(2)}, {c.where(sp)})"),
-        ("cap_float", TCap("Rand")) => c.set(ind, dst, "Cap_rand_float()"),
-        ("cap_bytes", TCap("Rand")) => c.set(ind, dst, "Cap_rand_bytes({arg(1)}, {c.where(sp)})"),
-        ("cap_args", TCap("Root")) => c.set(ind, dst, "Cap_args()"),
-        ("cap_read_line", TCap("Stdin")) => c.found(ind, dst, t, "bool ok_;\n{ind}  WStr *s_ = Cap_stdin_line(&ok_);", "ok_", "s_"),
-        ("cap_read_all", TCap("Stdin")) => c.set(ind, dst, "Cap_stdin_all()"),
-        ("cap_get", TCap("Env")) => c.found(ind, dst, t, "bool ok_;\n{ind}  WStr *s_ = Cap_env_get({arg(0)}, {arg(1)}, &ok_);", "ok_", "s_"),
-        ("cap_append", TCap("Fs")) => c.io_result(ind, dst, t, "Cap_fs_append({arg(0)}, {arg(1)}, {arg(2)})", "0"),
-        ("cap_list", TCap("Fs")) => c.io_result(ind, dst, t, "Cap_fs_list({arg(0)}, {arg(1)})", "(L_Str*)r_.ptr"),
-        ("cap_remove", TCap("Fs")) => c.io_result(ind, dst, t, "Cap_fs_remove({arg(0)}, {arg(1)})", "0"),
-        ("cap_make_dir", TCap("Fs")) => c.io_result(ind, dst, t, "Cap_fs_make_dir({arg(0)}, {arg(1)})", "0"),
-        ("cap_is_dir", TCap("Fs")) => c.set(ind, dst, "Cap_fs_is_dir({arg(0)}, {arg(1)})"),
-        ("cap_rename", TCap("Fs")) => c.io_result(ind, dst, t, "Cap_fs_rename({arg(0)}, {arg(1)}, {arg(2)})", "0"),
+        ("float_to_int", _) => self.set(ind, dst, "w_f2i({arg(0)})"),
+        ("float_abs", _) => self.set(ind, dst, "fabs({arg(0)})"),
+        ("float_sqrt", _) => self.set(ind, dst, "sqrt({arg(0)})"),
+        ("float_to_fixed", _) => self.set(ind, dst, "Float_to_fixed({arg(0)}, {arg(1)})"),
+        ("cap_print", TCap("Stdout")) => {
+            self.line(ind, "Cap_print({arg(1)}, true);")
+            self.set(ind, dst, "0")
+        },
+        ("cap_write", TCap("Stdout")) => {
+            self.line(ind, "Cap_print({arg(1)}, false);")
+            self.set(ind, dst, "0")
+        },
+        ("cap_print", TCap("Stderr")) => {
+            self.line(ind, "Cap_eprint({arg(1)}, true);")
+            self.set(ind, dst, "0")
+        },
+        ("cap_write", TCap("Stderr")) => {
+            self.line(ind, "Cap_eprint({arg(1)}, false);")
+            self.set(ind, dst, "0")
+        },
+        ("cap_now_ms", _) => self.set(ind, dst, "Cap_now_ms()"),
+        ("cap_sleep", TCap("Clock")) => {
+            self.line(ind, "Cap_sleep({arg(1)});")
+            self.set(ind, dst, "0")
+        },
+        ("cap_int", TCap("Rand")) => self.set(ind, dst, "Cap_rand_int({arg(1)}, {arg(2)}, {self.where(sp)})"),
+        ("cap_float", TCap("Rand")) => self.set(ind, dst, "Cap_rand_float()"),
+        ("cap_bytes", TCap("Rand")) => self.set(ind, dst, "Cap_rand_bytes({arg(1)}, {self.where(sp)})"),
+        ("cap_args", TCap("Root")) => self.set(ind, dst, "Cap_args()"),
+        ("cap_read_line", TCap("Stdin")) => self.found(ind, dst, t, "bool ok_;\n{ind}  WStr *s_ = Cap_stdin_line(&ok_);", "ok_", "s_"),
+        ("cap_read_all", TCap("Stdin")) => self.set(ind, dst, "Cap_stdin_all()"),
+        ("cap_get", TCap("Env")) => self.found(ind, dst, t, "bool ok_;\n{ind}  WStr *s_ = Cap_env_get({arg(0)}, {arg(1)}, &ok_);", "ok_", "s_"),
+        ("cap_append", TCap("Fs")) => self.io_result(ind, dst, t, "Cap_fs_append({arg(0)}, {arg(1)}, {arg(2)})", "0"),
+        ("cap_list", TCap("Fs")) => self.io_result(ind, dst, t, "Cap_fs_list({arg(0)}, {arg(1)})", "(L_Str*)r_.ptr"),
+        ("cap_remove", TCap("Fs")) => self.io_result(ind, dst, t, "Cap_fs_remove({arg(0)}, {arg(1)})", "0"),
+        ("cap_make_dir", TCap("Fs")) => self.io_result(ind, dst, t, "Cap_fs_make_dir({arg(0)}, {arg(1)})", "0"),
+        ("cap_is_dir", TCap("Fs")) => self.set(ind, dst, "Cap_fs_is_dir({arg(0)}, {arg(1)})"),
+        ("cap_rename", TCap("Fs")) => self.io_result(ind, dst, t, "Cap_fs_rename({arg(0)}, {arg(1)}, {arg(2)})", "0"),
         ("cap_info", TCap("Fs")) => {
-            let (fi, c1) = c.ctype(TNamed("FileInfo", []))
-            c1.io_result(ind, dst, t, "Cap_fs_info({arg(0)}, {arg(1)})", "(\{ WFileInfo *i_ = (WFileInfo*)r_.ptr; {fi} v_ = \{ i_->size, i_->mtime_ms, i_->is_file, i_->is_dir }; free(i_); v_; })")
+            let fi = self.ctype(TNamed("FileInfo", []))
+            self.io_result(ind, dst, t, "Cap_fs_info({arg(0)}, {arg(1)})", "(\{ WFileInfo *i_ = (WFileInfo*)r_.ptr; {fi} v_ = \{ i_->size, i_->mtime_ms, i_->is_file, i_->is_dir }; free(i_); v_; })")
         },
-        ("cap_only", TCap("Exec")) => c.set(ind, dst, "Cap_exec_only({arg(0)}, {arg(1)})"),
-        ("cap_only_args", TCap("Exec")) => c.set(ind, dst, "Cap_exec_only_args({arg(0)}, {arg(1)}, {arg(2)})"),
-        ("cap_only", TCap("Foreign")) => c.set(ind, dst, "Cap_foreign_only({arg(0)}, {arg(1)})"),
-        ("cap_allows", TCap("Foreign")) => c.set(ind, dst, "Cap_foreign_allows({arg(0)}, {arg(1)})"),
-        ("cap_copy", TCap("Foreign")) => c.set(ind, dst, "Cap_foreign_copy({arg(0)}, ({arg(1)}).f0, {arg(2)}, {c.where(sp)})"),
+        ("cap_only", TCap("Exec")) => self.set(ind, dst, "Cap_exec_only({arg(0)}, {arg(1)})"),
+        ("cap_only_args", TCap("Exec")) => self.set(ind, dst, "Cap_exec_only_args({arg(0)}, {arg(1)}, {arg(2)})"),
+        ("cap_only", TCap("Foreign")) => self.set(ind, dst, "Cap_foreign_only({arg(0)}, {arg(1)})"),
+        ("cap_allows", TCap("Foreign")) => self.set(ind, dst, "Cap_foreign_allows({arg(0)}, {arg(1)})"),
+        ("cap_copy", TCap("Foreign")) => self.set(ind, dst, "Cap_foreign_copy({arg(0)}, ({arg(1)}).f0, {arg(2)}, {self.where(sp)})"),
         ("cap_run", TCap("Exec")) => {
-            let (po, c1) = c.ctype(TNamed("ProcessOutput", []))
-            c1.io_result(ind, dst, t, "Cap_exec_run({arg(0)}, {arg(1)}, {arg(2)})", "(\{ WProc *p_ = (WProc*)r_.ptr; {po} v_ = \{ p_->code, p_->out, p_->err }; free(p_); v_; })")
+            let po = self.ctype(TNamed("ProcessOutput", []))
+            self.io_result(ind, dst, t, "Cap_exec_run({arg(0)}, {arg(1)}, {arg(2)})", "(\{ WProc *p_ = (WProc*)r_.ptr; {po} v_ = \{ p_->code, p_->out, p_->err }; free(p_); v_; })")
         },
-        ("cap_only", _) => c.set(ind, dst, "Cap_net_only({arg(0)}, {arg(1)})"),
+        ("cap_only", _) => self.set(ind, dst, "Cap_net_only({arg(0)}, {arg(1)})"),
         ("cap_get", _) => {
-            let mut c1 = c
-            c1.tls = true
-            let (ht, c2) = c1.ctype(TNamed("HttpResponse", []))
-            let (mt, c3) = c2.cname(TMap(TStr, TStr))
-            c3.io_result(ind, dst, t, "Cap_net_get({arg(0)}, {arg(1)})", "(\{ WHttp *h_ = (WHttp*)r_.ptr; {mt}* m_ = {mt}_new(); for (int i_ = 0; i_ < h_->n; i_++) {mt}_put(&m_, h_->names[i_], h_->values[i_]); {ht} v_ = \{ h_->status, m_, h_->body }; free(h_->names); free(h_->values); free(h_); v_; })")
+            self.tls = true
+            let ht = self.ctype(TNamed("HttpResponse", []))
+            let mt = self.cname(TMap(TStr, TStr))
+            self.io_result(ind, dst, t, "Cap_net_get({arg(0)}, {arg(1)})", "(\{ WHttp *h_ = (WHttp*)r_.ptr; {mt}* m_ = {mt}_new(); for (int i_ = 0; i_ < h_->n; i_++) {mt}_put(&m_, h_->names[i_], h_->values[i_]); {ht} v_ = \{ h_->status, m_, h_->body }; free(h_->names); free(h_->values); free(h_); v_; })")
         },
-        ("cap_under", _) => c.set(ind, dst, "Cap_fs_under({arg(0)}, {arg(1)})"),
-        ("cap_read_only", _) => c.set(ind, dst, "Cap_fs_read_only({arg(0)})"),
-        ("cap_read", TCap("Conn")) => c.io_result(ind, dst, t, "Cap_conn_read({arg(0)})", "r_.val"),
-        ("cap_write", TCap("Conn")) => c.io_result(ind, dst, t, "Cap_conn_write({arg(0)}, {arg(1)})", "0"),
+        ("cap_under", _) => self.set(ind, dst, "Cap_fs_under({arg(0)}, {arg(1)})"),
+        ("cap_read_only", _) => self.set(ind, dst, "Cap_fs_read_only({arg(0)})"),
+        ("cap_read", TCap("Conn")) => self.io_result(ind, dst, t, "Cap_conn_read({arg(0)})", "r_.val"),
+        ("cap_write", TCap("Conn")) => self.io_result(ind, dst, t, "Cap_conn_write({arg(0)}, {arg(1)})", "0"),
         ("cap_start_tls", TCap("Conn")) => {
-            let mut c1 = c
-            c1.tls = true
-            c1.io_result(ind, dst, t, "Cap_conn_start_tls({arg(0)}, {arg(1)})", "0")
+            self.tls = true
+            self.io_result(ind, dst, t, "Cap_conn_start_tls({arg(0)}, {arg(1)})", "0")
         },
-        ("cap_read_within", TCap("Conn")) => c.io_result(ind, dst, t, "Cap_conn_read_within({arg(0)}, {arg(1)}, {arg(2)})", "r_.val"),
-        ("cap_write_within", TCap("Conn")) => c.io_result(ind, dst, t, "Cap_conn_write_within({arg(0)}, {arg(1)}, {arg(2)}, {arg(3)})", "0"),
-        ("cap_on", _) => c.io_result(ind, dst, t, "Cap_listen_on({arg(0)}, {arg(1)})", "(WCap*)r_.ptr"),
-        ("cap_accept", _) => c.io_result(ind, dst, t, "Cap_accept({arg(0)})", "(WCap*)r_.ptr"),
-        ("cap_connect", _) => c.io_result(ind, dst, t, "Cap_net_connect({arg(0)}, {arg(1)})", "(WCap*)r_.ptr"),
+        ("cap_read_within", TCap("Conn")) => self.io_result(ind, dst, t, "Cap_conn_read_within({arg(0)}, {arg(1)}, {arg(2)})", "r_.val"),
+        ("cap_write_within", TCap("Conn")) => self.io_result(ind, dst, t, "Cap_conn_write_within({arg(0)}, {arg(1)}, {arg(2)}, {arg(3)})", "0"),
+        ("cap_on", _) => self.io_result(ind, dst, t, "Cap_listen_on({arg(0)}, {arg(1)})", "(WCap*)r_.ptr"),
+        ("cap_accept", _) => self.io_result(ind, dst, t, "Cap_accept({arg(0)})", "(WCap*)r_.ptr"),
+        ("cap_connect", _) => self.io_result(ind, dst, t, "Cap_net_connect({arg(0)}, {arg(1)})", "(WCap*)r_.ptr"),
         ("cap_connect_tls", _) => {
-            let mut c1 = c
-            c1.tls = true
-            c1.io_result(ind, dst, t, "Cap_net_connect_tls({arg(0)}, {arg(1)})", "(WCap*)r_.ptr")
+            self.tls = true
+            self.io_result(ind, dst, t, "Cap_net_connect_tls({arg(0)}, {arg(1)})", "(WCap*)r_.ptr")
         },
         ("cap_on_tls", _) => {
-            let mut c1 = c
-            c1.tls = true
-            c1.io_result(ind, dst, t, "Cap_listen_on_tls({arg(0)}, {arg(1)}, {arg(2)}, {arg(3)})", "(WCap*)r_.ptr")
+            self.tls = true
+            self.io_result(ind, dst, t, "Cap_listen_on_tls({arg(0)}, {arg(1)}, {arg(2)}, {arg(3)})", "(WCap*)r_.ptr")
         },
-        ("cap_port", _) => c.set(ind, dst, "(int64_t)({arg(0)})->port"),
-        ("cap_close", _) => c.line(ind, "Cap_sock_close({arg(0)});").set(ind, dst, "0"),
-        ("cap_read", _) => c.io_result(ind, dst, t, "Cap_fs_read({arg(0)}, {arg(1)})", "r_.val"),
-        ("cap_read_at", _) => c.io_result(ind, dst, t, "Cap_fs_read_at({arg(0)}, {arg(1)}, {arg(2)}, {arg(3)})", "r_.val"),
-        ("cap_write", TCap("Fs")) => c.io_result(ind, dst, t, "Cap_fs_write({arg(0)}, {arg(1)}, {arg(2)})", "0"),
-        ("cap_exists", _) => c.set(ind, dst, "Cap_fs_exists({arg(0)}, {arg(1)})"),
-        ("cap_full_path", TCap("Fs")) => c.io_result(ind, dst, t, "Cap_fs_full_path({arg(0)}, {arg(1)})", "r_.val"),
-        ("cap_is_read_only", TCap("Fs")) => c.set(ind, dst, "Cap_fs_is_read_only({arg(0)})"),
+        ("cap_port", _) => self.set(ind, dst, "(int64_t)({arg(0)})->port"),
+        ("cap_close", _) => {
+            self.line(ind, "Cap_sock_close({arg(0)});")
+            self.set(ind, dst, "0")
+        },
+        ("cap_read", _) => self.io_result(ind, dst, t, "Cap_fs_read({arg(0)}, {arg(1)})", "r_.val"),
+        ("cap_read_at", _) => self.io_result(ind, dst, t, "Cap_fs_read_at({arg(0)}, {arg(1)}, {arg(2)}, {arg(3)})", "r_.val"),
+        ("cap_write", TCap("Fs")) => self.io_result(ind, dst, t, "Cap_fs_write({arg(0)}, {arg(1)}, {arg(2)})", "0"),
+        ("cap_exists", _) => self.set(ind, dst, "Cap_fs_exists({arg(0)}, {arg(1)})"),
+        ("cap_full_path", TCap("Fs")) => self.io_result(ind, dst, t, "Cap_fs_full_path({arg(0)}, {arg(1)})", "r_.val"),
+        ("cap_is_read_only", TCap("Fs")) => self.set(ind, dst, "Cap_fs_is_read_only({arg(0)})"),
         ("cap_revocable", TCap(_)) => {
-            let c1 = c.line(ind, "\{").line(ind, "  WCap *k_; WCap *c_ = Cap_revocable({arg(0)}, &k_);")
-            let (n, c2) = c1.cname(t)
-            c2.line(ind, "  {dst} = ({n})\{ c_, k_ };").line(ind, "}")
+            self.line(ind, "\{")
+            self.line(ind, "  WCap *k_; WCap *c_ = Cap_revocable({arg(0)}, &k_);")
+            let n = self.cname(t)
+            self.line(ind, "  {dst} = ({n})\{ c_, k_ };")
+            self.line(ind, "}")
         },
-        ("cap_revoke", TCap("Revoker")) => c.line(ind, "Cap_revoke({arg(0)});").set(ind, dst, "0"),
-        ("cap_is_revoked", TCap("Revoker")) => c.set(ind, dst, "Cap_is_revoked({arg(0)})"),
+        ("cap_revoke", TCap("Revoker")) => {
+            self.line(ind, "Cap_revoke({arg(0)});")
+            self.set(ind, dst, "0")
+        },
+        ("cap_is_revoked", TCap("Revoker")) => self.set(ind, dst, "Cap_is_revoked({arg(0)})"),
         _ => panic("cgen: unknown primitive {name} on {show(rt)}"),
     }
 }
 
 // `<CName of rt><rest>`, into dst.
-fn named_call(self: Cg, ind: Str, dst: Str, rt: types.Ty, rest: Str) -> Cg {
-    let (n, c) = self.cname(rt)
-    c.set(ind, dst, n + rest)
+fn named_call(mut self: Cg, ind: Str, dst: Str, rt: types.Ty, rest: Str) {
+    let n = self.cname(rt)
+    self.set(ind, dst, n + rest)
 }
 
 // A lookup that may find nothing, into dst of Option type `t`: `decl`
 // declares what the lookup fills, `cond` says whether it found `value`.
-fn found(self: Cg, ind: Str, dst: Str, t: types.Ty, decl: Str, cond: Str, value: Str) -> Cg {
-    let c = self.line(ind, "\{").line(ind, "  " + decl)
-    let (none, c1) = c.mk_enum(t, 1, [])
-    let (some, c2) = c1.mk_enum(t, 0, [value])
-    c2.line(ind, "  {dst} = {cond} ? {some} : {none};").line(ind, "}")
+fn found(mut self: Cg, ind: Str, dst: Str, t: types.Ty, decl: Str, cond: Str, value: Str) {
+    self.line(ind, "\{")
+    self.line(ind, "  " + decl)
+    let none = self.mk_enum(t, 1, [])
+    let some = self.mk_enum(t, 0, [value])
+    self.line(ind, "  {dst} = {cond} ? {some} : {none};")
+    self.line(ind, "}")
 }
 
 // ---------- owned locals: unwinding drops them after a panic ----------
@@ -1923,90 +1990,94 @@ fn vol(self: Cg, v: ir.Var) -> Str {
 }
 
 // Note that owned locals of type `t` need w_dp_<CName>.
-fn add_cell_ty(self: Cg, t: types.Ty) -> Cg {
-    let (known, c) = self.named_in(self.cell_tys, t)
-    let mut c = c
+fn add_cell_ty(mut self: Cg, t: types.Ty) {
+    let known = self.named_in(self.cell_tys, t)
     if !known {
-        c.cell_tys.push(t)
+        self.cell_tys.push(t)
     }
-    c
 }
 
 // A `mut` parameter has no cleanup: the caller's place owns the value.
-fn cell_decl(self: Cg, ind: Str, v: ir.Var, on: Bool) -> Cg {
+fn cell_decl(mut self: Cg, ind: Str, v: ir.Var, on: Bool) {
     if !owns_memory(v.ty) || v.by_ref {
-        return self
+        return
     }
-    let c = self.add_cell_ty(v.ty).line(ind, "uint8_t{self.vol(v)} {var(v)}_o = {if on { 1 } else { 0 }};")
-    let (n, c1) = c.cname(v.ty)
+    self.add_cell_ty(v.ty)
+    self.line(ind, "uint8_t{self.vol(v)} {var(v)}_o = {if on { 1 } else { 0 }};")
+    let n = self.cname(v.ty)
     let x = var(v)
-    c1.line(ind, "WCl {x}_cl __attribute__((cleanup(w_cl_run))) = \{ (void*)&{x}, (uint8_t*)&{x}_o, w_dp_{n} };")
+    self.line(ind, "WCl {x}_cl __attribute__((cleanup(w_cl_run))) = \{ (void*)&{x}, (uint8_t*)&{x}_o, w_dp_{n} };")
 }
 
-fn set_owned(self: Cg, ind: Str, v: ir.Var, on: Bool) -> Cg {
-    if owns_memory(v.ty) && !v.by_ref { self.line(ind, "{var(v)}_o = {if on { 1 } else { 0 }};") } else { self }
+fn set_owned(mut self: Cg, ind: Str, v: ir.Var, on: Bool) {
+    if owns_memory(v.ty) && !v.by_ref {
+        self.line(ind, "{var(v)}_o = {if on { 1 } else { 0 }};")
+    }
 }
 
 // Clear the flags of the variables an rhs moves out of, before it runs.
-fn release_moved(self: Cg, ind: Str, xs: List[ir.Atom]) -> Cg {
-    let mut c = self
+fn release_moved(mut self: Cg, ind: Str, xs: List[ir.Atom]) {
     for x in xs {
         match x {
             V(v) => {
-                c = c.set_owned(ind, v, false)
+                self.set_owned(ind, v, false)
             },
             _ => {},
         }
     }
-    c
 }
 
 // The value of a pure call kept across a loop (pure.plan): the first time,
 // make the call and keep a reference in its slot; after that, take the
 // kept value and release what the call would have consumed.
-fn kept_or(self: Cg, ind: Str, v: ir.Var, r: ir.Rhs) -> Cg {
+fn kept_or(mut self: Cg, ind: Str, v: ir.Var, r: ir.Rhs) {
     let sl = match self.plan.kept.get(v.id) {
         Some(sl) => sl,
         None => {
-            return self.release_moved(ind, ir.consumed(r)).rhs_into(ind, var(v), v.ty, r)
+            self.release_moved(ind, ir.consumed(r))
+            self.rhs_into(ind, var(v), v.ty, r)
+            return
         },
     }
     let k = "k{sl.sid}_"
-    let mut c = self.line(ind, "if (__builtin_expect({k}_o, 1)) \{")
+    self.line(ind, "if (__builtin_expect({k}_o, 1)) \{")
     for x in ir.consumed(r) {
         match x {
             V(w) if !is_scalar(w.ty) => {
-                let (n, c1) = c.set_owned(ind + "  ", w, false).cname(w.ty)
-                c = c1.line(ind, "  {n}_drop({var(w)});")
+                self.set_owned(ind + "  ", w, false)
+                let n = self.cname(w.ty)
+                self.line(ind, "  {n}_drop({var(w)});")
             },
             _ => {},
         }
     }
-    let (d, c2) = c.dup_of(v.ty, k)
-    c = c2.line(ind, "  {var(v)} = {d};").line(ind, "} else \{").release_moved(ind + "  ", ir.consumed(r)).rhs_into(ind + "  ", var(v), v.ty, r)
-    let (d2, c3) = c.dup_of(v.ty, var(v))
-    c3.line(ind, "  {k} = {d2}; {k}_o = 1;").line(ind, "}")
+    let d = self.dup_of(v.ty, k)
+    self.line(ind, "  {var(v)} = {d};")
+    self.line(ind, "} else \{")
+    self.release_moved(ind + "  ", ir.consumed(r))
+    self.rhs_into(ind + "  ", var(v), v.ty, r)
+    let d2 = self.dup_of(v.ty, var(v))
+    self.line(ind, "  {k} = {d2}; {k}_o = 1;")
+    self.line(ind, "}")
 }
 
 // ---------- statements ----------
 
-fn stmts(self: Cg, ind: Str, ss: List[ir.Stmt]) -> Cg {
-    let mut c = self
+fn stmts(mut self: Cg, ind: Str, ss: List[ir.Stmt]) {
     let mut i = 0
     while i < ss.len() {
         match int_chain(ss, i) {
             Some(ch) => {
-                c = c.switch_of(ind, ch)
+                self.switch_of(ind, ch)
                 // a chain starts with its first test and its `if`
                 i = i + 2
             },
             None => {
-                c = c.stmt(ind, ss[i])
+                self.stmt(ind, ss[i])
                 i = i + 1
             },
         }
     }
-    c
 }
 
 // A long run of tests of one integer against a literal, each failing into
@@ -2132,12 +2203,18 @@ fn is_quiet(s: ir.Stmt) -> Bool {
     }
 }
 
-fn switch_of(self: Cg, ind: Str, ch: IntChain) -> Cg {
-    let mut c = self.line(ind, "switch ({var(ch.x)}) \{")
+fn switch_of(mut self: Cg, ind: Str, ch: IntChain) {
+    self.line(ind, "switch ({var(ch.x)}) \{")
     for arm in ch.arms {
-        c = c.line(ind, "case {int_lit(arm.0)}: \{").stmts(ind + "  ", arm.1).line(ind, "  break;").line(ind, "}")
+        self.line(ind, "case {int_lit(arm.0)}: \{")
+        self.stmts(ind + "  ", arm.1)
+        self.line(ind, "  break;")
+        self.line(ind, "}")
     }
-    c.line(ind, "default: \{").stmts(ind + "  ", ch.fallback).line(ind, "}").line(ind, "}")
+    self.line(ind, "default: \{")
+    self.stmts(ind + "  ", ch.fallback)
+    self.line(ind, "}")
+    self.line(ind, "}")
 }
 
 // The loops in `ss`, as the planner counts them: through `if` and loops.
@@ -2151,81 +2228,97 @@ fn count_loops(ss: List[ir.Stmt]) -> Int {
 
 // The body of loop number `idx`, written at `ind`: loops inside it are
 // numbered from idx + 1 each time it is written.
-fn loop_body(self: Cg, ind: Str, idx: Int, body: List[ir.Stmt]) -> Cg {
-    let mut c = self
-    c.loops = idx + 1
+fn loop_body(mut self: Cg, ind: Str, idx: Int, body: List[ir.Stmt]) {
+    self.loops = idx + 1
     // a cancellation checkpoint first, on every iteration (W_CHECK in the
     // runtime), so a cancelled task stops in code that never waits
-    c.line(ind, "W_CHECK();").stmts(ind, body)
+    self.line(ind, "W_CHECK();")
+    self.stmts(ind, body)
 }
 
-fn stmt(self: Cg, ind: Str, s: ir.Stmt) -> Cg {
-    let mut c = self
+fn stmt(mut self: Cg, ind: Str, s: ir.Stmt) {
     match s {
         Let(v, r) => {
-            let (ct, c1) = c.ctype(v.ty)
-            c1.line(ind, "{ct}{c1.vol(v)} {var(v)};").cell_decl(ind, v, false).kept_or(ind, v, r).set_owned(ind, v, true)
+            let ct = self.ctype(v.ty)
+            self.line(ind, "{ct}{self.vol(v)} {var(v)};")
+            self.cell_decl(ind, v, false)
+            self.kept_or(ind, v, r)
+            self.set_owned(ind, v, true)
         },
         Decl(v) => {
-            let (ct, c1) = c.ctype(v.ty)
-            c1.line(ind, "{ct}{c1.vol(v)} {var(v)};").cell_decl(ind, v, false)
+            let ct = self.ctype(v.ty)
+            self.line(ind, "{ct}{self.vol(v)} {var(v)};")
+            self.cell_decl(ind, v, false)
         },
-        Init(v, r) => c.kept_or(ind, v, r).set_owned(ind, v, true),
+        Init(v, r) => {
+            self.kept_or(ind, v, r)
+            self.set_owned(ind, v, true)
+        },
         Set(v, r, release) => {
-            let (ct, c1) = c.release_moved(ind, ir.consumed(r)).line(ind, "\{").ctype(v.ty)
-            c = c1.line(ind, "  {ct} n_;").rhs_into(ind + "  ", "n_", v.ty, r)
+            self.release_moved(ind, ir.consumed(r))
+            self.line(ind, "\{")
+            let ct = self.ctype(v.ty)
+            self.line(ind, "  {ct} n_;")
+            self.rhs_into(ind + "  ", "n_", v.ty, r)
             if release && !is_scalar(v.ty) {
-                let (n, c2) = c.cname(v.ty)
-                c = c2.line(ind, "  {n}_drop({var(v)});")
+                let n = self.cname(v.ty)
+                self.line(ind, "  {n}_drop({var(v)});")
             }
-            c.line(ind, "  {var(v)} = n_;").line(ind, "}").set_owned(ind, v, true)
+            self.line(ind, "  {var(v)} = n_;")
+            self.line(ind, "}")
+            self.set_owned(ind, v, true)
         },
-        Mutate(v, steps, m) => c.mutate(ind, v, steps, m),
+        Mutate(v, steps, m) => self.mutate(ind, v, steps, m),
         If(cond, a, b) => {
-            let (ca, c1) = c.atom(cond)
-            c = c1.line(ind, "if ({ca}) \{").stmts(ind + "  ", a)
+            let ca = self.atom(cond)
+            self.line(ind, "if ({ca}) \{")
+            self.stmts(ind + "  ", a)
             if !b.is_empty() {
-                c = c.line(ind, "} else \{").stmts(ind + "  ", b)
+                self.line(ind, "} else \{")
+                self.stmts(ind + "  ", b)
             }
-            c.line(ind, "}")
+            self.line(ind, "}")
         },
         Loop(body) => {
-            let idx = c.loops
-            match c.plan.at_loop.get(idx) {
-                Some(slots) if !c.slotted.contains(idx) => {
+            let idx = self.loops
+            match self.plan.at_loop.get(idx) {
+                Some(slots) if !self.slotted.contains(idx) => {
                     // Slots for the pure calls kept across this loop:
                     // filled the first time each call runs, released when
                     // the loop is left by any way.
-                    c.slotted = [idx] + c.slotted
-                    c = c.line(ind, "\{")
+                    self.slotted = [idx] + self.slotted
+                    self.line(ind, "\{")
                     for sl in slots {
                         let k = "k{sl.sid}_"
-                        let (ct, c1) = c.ctype(sl.ty)
-                        c = c1.line(ind, "  {ct} {k}; uint8_t {k}_o = 0;")
+                        let ct = self.ctype(sl.ty)
+                        self.line(ind, "  {ct} {k}; uint8_t {k}_o = 0;")
                         if owns_memory(sl.ty) {
-                            let (n, c2) = c.add_cell_ty(sl.ty).cname(sl.ty)
-                            c = c2.line(ind, "  WCl {k}_cl __attribute__((cleanup(w_cl_run))) = \{ (void*)&{k}, (uint8_t*)&{k}_o, w_dp_{n} };")
+                            self.add_cell_ty(sl.ty)
+                            let n = self.cname(sl.ty)
+                            self.line(ind, "  WCl {k}_cl __attribute__((cleanup(w_cl_run))) = \{ (void*)&{k}, (uint8_t*)&{k}_o, w_dp_{n} };")
                         }
                     }
-                    c = c.stmt(ind + "  ", s)
-                    c.slotted = c.slotted.skip(1)
-                    c.line(ind, "}")
+                    self.stmt(ind + "  ", s)
+                    self.slotted = self.slotted.skip(1)
+                    self.line(ind, "}")
                 },
-                _ => c.plain_loop(ind, idx, body),
+                _ => self.plain_loop(ind, idx, body),
             }
         },
-        Break => c.line(ind, "break;"),
-        Continue => c.line(ind, "continue;"),
+        Break => self.line(ind, "break;"),
+        Continue => self.line(ind, "continue;"),
         Return(x) => {
-            let (a, c1) = c.release_moved(ind, [x]).atom(x)
-            c1.line(ind, "return {a};")
+            self.release_moved(ind, [x])
+            let a = self.atom(x)
+            self.line(ind, "return {a};")
         },
         Drop(v) => {
             if is_scalar(v.ty) {
-                return c
+                return
             }
-            let (n, c1) = c.set_owned(ind, v, false).cname(v.ty)
-            c1.line(ind, "{n}_drop({var(v)});")
+            self.set_owned(ind, v, false)
+            let n = self.cname(v.ty)
+            self.line(ind, "{n}_drop({var(v)});")
         },
         Guard(n, handler, body) => {
             // A defer. The rest of its block runs under a panic boundary;
@@ -2237,23 +2330,54 @@ fn stmt(self: Cg, ind: Str, s: ir.Stmt) -> Cg {
             // allocated stays with the enclosing boundary: an outer
             // variable may now point at it.
             let g = "g{n}_"
-            c.line(ind, "\{").line(ind, "  WCatch {g};").line(ind, "  w_catch_init(&{g});").line(ind, "  WCatch **{g}slot = w_catch_slot();").line(ind, "  if (_setjmp({g}.jb) == 0) \{").line(ind, "    WCatch *{g}land __attribute__((cleanup(w_catch_land))) = &{g};").line(ind, "    if ({g}slot) *{g}slot = &{g};").stmts(ind + "    ", body).line(ind, "  } else \{").line(ind, "    w_catch_end(&{g});").line(ind, "    int cancel_ = {g}.cancel;").line(ind, "    char m_[1024] = \"\", w_[512] = \"\";").line(ind, "    if (!cancel_) \{ snprintf(m_, sizeof m_, \"%s\", {g}.msg); snprintf(w_, sizeof w_, \"%s\", {g}.where); free({g}.msg); free({g}.where); }").stmts(ind + "    ", handler).line(ind, "    if (cancel_) w_cancel_unwind();").line(ind, "    w_panic_c(m_, w_);").line(ind, "  }").line(ind, "}")
+            self.line(ind, "\{")
+            self.line(ind, "  WCatch {g};")
+            self.line(ind, "  w_catch_init(&{g});")
+            self.line(ind, "  WCatch **{g}slot = w_catch_slot();")
+            self.line(ind, "  if (_setjmp({g}.jb) == 0) \{")
+            self.line(ind, "    WCatch *{g}land __attribute__((cleanup(w_catch_land))) = &{g};")
+            self.line(ind, "    if ({g}slot) *{g}slot = &{g};")
+            self.stmts(ind + "    ", body)
+            self.line(ind, "  } else \{")
+            self.line(ind, "    w_catch_end(&{g});")
+            self.line(ind, "    int cancel_ = {g}.cancel;")
+            self.line(ind, "    char m_[1024] = \"\", w_[512] = \"\";")
+            self.line(ind, "    if (!cancel_) \{ snprintf(m_, sizeof m_, \"%s\", {g}.msg); snprintf(w_, sizeof w_, \"%s\", {g}.where); free({g}.msg); free({g}.where); }")
+            self.stmts(ind + "    ", handler)
+            self.line(ind, "    if (cancel_) w_cancel_unwind();")
+            self.line(ind, "    w_panic_c(m_, w_);")
+            self.line(ind, "  }")
+            self.line(ind, "}")
         },
         Scope(g, body) => {
             // A group body under its deadline: the deadline cancels it at
             // its next wait, like a task, and it unwinds to this boundary;
             // then the join after it goes on. A panic, or a cancellation
             // from further out, passes on (w_scope_land).
-            c.scopes = c.scopes + 1
-            let b = "s{c.scopes}_"
-            let (ga, c1) = c.atom(g)
-            c1.line(ind, "\{").line(ind, "  WScope {b}sc; w_scope_push(&{b}sc, {ga});").line(ind, "  WCatch {b};").line(ind, "  w_catch_init(&{b});").line(ind, "  WCatch **{b}slot = w_catch_slot();").line(ind, "  if (_setjmp({b}.jb) == 0) \{").line(ind, "    WCatch *{b}land __attribute__((cleanup(w_catch_land))) = &{b};").line(ind, "    *{b}slot = &{b};").stmts(ind + "    ", body).line(ind, "    *{b}slot = {b}.prev;").line(ind, "    w_catch_end(&{b});").line(ind, "  } else w_scope_land(&{b}, &{b}sc);").line(ind, "  w_scope_pop(&{b}sc);").line(ind, "}")
+            self.scopes = self.scopes + 1
+            let b = "s{self.scopes}_"
+            let ga = self.atom(g)
+            self.line(ind, "\{")
+            self.line(ind, "  WScope {b}sc; w_scope_push(&{b}sc, {ga});")
+            self.line(ind, "  WCatch {b};")
+            self.line(ind, "  w_catch_init(&{b});")
+            self.line(ind, "  WCatch **{b}slot = w_catch_slot();")
+            self.line(ind, "  if (_setjmp({b}.jb) == 0) \{")
+            self.line(ind, "    WCatch *{b}land __attribute__((cleanup(w_catch_land))) = &{b};")
+            self.line(ind, "    *{b}slot = &{b};")
+            self.stmts(ind + "    ", body)
+            self.line(ind, "    *{b}slot = {b}.prev;")
+            self.line(ind, "    w_catch_end(&{b});")
+            self.line(ind, "  } else w_scope_land(&{b}, &{b}sc);")
+            self.line(ind, "  w_scope_pop(&{b}sc);")
+            self.line(ind, "}")
         },
         GuardEnd(n) => {
             let g = "g{n}_"
-            c.line(ind, "if ({g}slot) *{g}slot = {g}.prev;").line(ind, "w_catch_end(&{g});")
+            self.line(ind, "if ({g}slot) *{g}slot = {g}.prev;")
+            self.line(ind, "w_catch_end(&{g});")
         },
-        Line(sp) => c.put(c.line_directive(sp) + "\n"),
+        Line(sp) => self.put(self.line_directive(sp) + "\n"),
     }
 }
 
@@ -2301,53 +2425,54 @@ fn pin_lines(text: Str) -> Str {
 // A pointer to the place `v` and `steps`, made unique on the way (the
 // checks a loop hoisted are skipped): the C names `prefix`0_, `prefix`1_
 // and so on, one per step. Returns the last and the place's type.
-fn place_ptr(self: Cg, ind: Str, prefix: Str, v: ir.Var, steps: List[ir.Step]) -> (Str, types.Ty, Cg) {
-    let (vt, c0) = self.ctype(v.ty)
-    let mut c = c0.line(ind, "  {vt}* {prefix}0_ = ({vt}*)&{var(v)};")
+fn place_ptr(mut self: Cg, ind: Str, prefix: Str, v: ir.Var, steps: List[ir.Step]) -> (Str, types.Ty) {
+    let vt = self.ctype(v.ty)
+    self.line(ind, "  {vt}* {prefix}0_ = ({vt}*)&{var(v)};")
     let mut p = "{prefix}0_"
     let mut t = v.ty
     for (i, step) in steps.with_index() {
         let q = "{prefix}{i + 1}_"
         match step {
             PField(k) => {
-                let ft = c.fields_of(t)[k].1
-                let (ct, c1) = c.ctype(ft)
-                c = c1.line(ind, "  {ct}* {q} = &({p}->f{k});")
+                let ft = self.fields_of(t)[k].1
+                let ct = self.ctype(ft)
+                self.line(ind, "  {ct}* {q} = &({p}->f{k});")
                 t = ft
             },
             PIndex(ia, sp) => match t {
                 TList(el) => {
-                    if !(i == 0 && c.uniq.contains(v.id)) {
-                        let (n, c1) = c.cname(t)
-                        c = c1.line(ind, "  {n}_unique({p});")
+                    if !(i == 0 && self.uniq.contains(v.id)) {
+                        let n = self.cname(t)
+                        self.line(ind, "  {n}_unique({p});")
                     }
                     let proven = i == 0 && match ia {
-                        V(iv) => c.inrange.contains((v.id, iv.id)),
+                        V(iv) => self.inrange.contains((v.id, iv.id)),
                         _ => false,
                     }
-                    let wh = c.where(sp)
-                    let (a, c1) = c.atom(ia)
-                    let (n, c2) = c1.cname(t)
-                    let (ct, c3) = c2.ctype(el)
-                    c = if proven { c3.line(ind, "  {ct}* {q} = &(*{p})->data[{a}];") } else { c3.line(ind, "  {ct}* {q} = {n}_at(*{p}, {a}, {wh});") }
+                    let wh = self.where(sp)
+                    let a = self.atom(ia)
+                    let n = self.cname(t)
+                    let ct = self.ctype(el)
+                    if proven { self.line(ind, "  {ct}* {q} = &(*{p})->data[{a}];") } else { self.line(ind, "  {ct}* {q} = {n}_at(*{p}, {a}, {wh});") }
                     t = el
                 },
                 TArray(el, TLen(n)) => {
-                    let wh = c.where(sp)
-                    let (a, c1) = c.atom(ia)
-                    let (ct, c2) = c1.ctype(el)
-                    c = c2.line(ind, "  {ct}* {q} = &({p}->a[w_idx({a}, {n}, {wh})]);")
+                    let wh = self.where(sp)
+                    let a = self.atom(ia)
+                    let ct = self.ctype(el)
+                    self.line(ind, "  {ct}* {q} = &({p}->a[w_idx({a}, {n}, {wh})]);")
                     t = el
                 },
                 _ => panic("mutate index"),
             },
             PKey(k, sp) => match t {
                 TMap(_, vt2) => {
-                    let (n, c1) = c.cname(t)
-                    let wh = c1.where(sp)
-                    let (a, c2) = c1.line(ind, "  {n}_unique({p});").atom(k)
-                    let (ct, c3) = c2.ctype(vt2)
-                    c = c3.line(ind, "  {ct}* {q} = {n}_slot(*{p}, {a}, {wh});")
+                    let n = self.cname(t)
+                    let wh = self.where(sp)
+                    self.line(ind, "  {n}_unique({p});")
+                    let a = self.atom(k)
+                    let ct = self.ctype(vt2)
+                    self.line(ind, "  {ct}* {q} = {n}_slot(*{p}, {a}, {wh});")
                     t = vt2
                 },
                 _ => panic("mutate key"),
@@ -2356,107 +2481,128 @@ fn place_ptr(self: Cg, ind: Str, prefix: Str, v: ir.Var, steps: List[ir.Step]) -
         }
         p = q
     }
-    (p, t, c)
+    (p, t)
 }
 
-fn mutate(self: Cg, ind: Str, v: ir.Var, steps: List[ir.Step], m: ir.Mutation) -> Cg {
-    let (p, t, c0) = self.release_moved(ind, ir.mut_atoms(m)).line(ind, "\{").place_ptr(ind, "p", v, steps)
-    let mut c = c0
-    c = match m {
+fn mutate(mut self: Cg, ind: Str, v: ir.Var, steps: List[ir.Step], m: ir.Mutation) {
+    self.release_moved(ind, ir.mut_atoms(m))
+    self.line(ind, "\{")
+    let (p, t) = self.place_ptr(ind, "p", v, steps)
+    match m {
         MSet(x) => {
             if !is_scalar(t) {
-                let (n, c1) = c.cname(t)
-                c = c1.line(ind, "  {n}_drop(*{p});")
+                let n = self.cname(t)
+                self.line(ind, "  {n}_drop(*{p});")
             }
-            let (a, c2) = c.atom(x)
-            c2.line(ind, "  *{p} = {a};")
+            let a = self.atom(x)
+            self.line(ind, "  *{p} = {a};")
         },
         MPush(x) => {
-            let unchecked = steps.is_empty() && c.uniq.contains(v.id)
-            let (a, c1) = c.atom(x)
-            let (n, c2) = c1.cname(t)
-            c2.line(ind, "  {n}_push{if unchecked { "_u" } else { "" }}({p}, {a});")
+            let unchecked = steps.is_empty() && self.uniq.contains(v.id)
+            let a = self.atom(x)
+            let n = self.cname(t)
+            self.line(ind, "  {n}_push{if unchecked { "_u" } else { "" }}({p}, {a});")
         },
         MPut(k, x) => {
-            let (xa, c1) = c.atom(x)
-            let (ka, c2) = c1.atom(k)
-            let (n, c3) = c2.cname(t)
-            c3.line(ind, "  {n}_put({p}, {ka}, {xa});")
+            let xa = self.atom(x)
+            let ka = self.atom(k)
+            let n = self.cname(t)
+            self.line(ind, "  {n}_put({p}, {ka}, {xa});")
         },
         MRemove(k) => {
-            let (ka, c1) = c.atom(k)
-            let (n, c2) = c1.cname(t)
-            c2.line(ind, "  {n}_remove({p}, {ka});")
+            let ka = self.atom(k)
+            let n = self.cname(t)
+            self.line(ind, "  {n}_remove({p}, {ka});")
         },
     }
-    c.line(ind, "}")
+    self.line(ind, "}")
 }
 
 // A loop without slots, as C: the lists it keeps unique made unique once
 // before it, then a fill in one go, a versioned loop, or a plain one.
-fn plain_loop(self: Cg, ind: Str, idx: Int, body: List[ir.Stmt]) -> Cg {
-    let mut c = self
+fn plain_loop(mut self: Cg, ind: Str, idx: Int, body: List[ir.Stmt]) {
     // A list that the loop mutates but never shares (no retain, no move,
     // no reassignment) stays unique: make it unique once, here, and skip
     // the copy-on-write check on every write inside the loop.
-    let saved = c.uniq
+    let saved = self.uniq
     let hoisted = hoist.mutated_lists(body).filter(|v| !saved.contains(v.id) && !hoist.escapes(v, body))
     for v in hoisted {
-        let (n, c1) = c.cname(v.ty)
-        c = c1.line(ind, "{n}_unique(&{var(v)});")
+        let n = self.cname(v.ty)
+        self.line(ind, "{n}_unique(&{var(v)});")
     }
-    c.uniq = hoisted.map(|v| v.id) + saved
+    self.uniq = hoisted.map(|v| v.id) + saved
     match hoist.fill_loop(body) {
         Some(f) => {
             // Fill in one go: reserve once, then a plain store loop the C
             // compiler vectorises.
-            let (ln, c1) = c.cname(f.v.ty)
+            let ln = self.cname(f.v.ty)
             let el = match f.v.ty {
                 TList(e) => e,
                 _ => TUnit,
             }
-            let (na, c2) = c1.line(ind, "\{").line(ind, "  int64_t cnt_;").atom(f.n)
-            let (ct, c3) = c2.line(ind, "  if (!__builtin_sub_overflow({na}, {var(f.i)}, &cnt_) && cnt_ < INT64_MAX - 1) \{").line(ind, "    cnt_ += {if f.inclusive { 1 } else { 0 }};").line(ind, "    int64_t want_;").line(ind, "    if (cnt_ > 0 && __builtin_add_overflow({var(f.v)}->len, cnt_, &want_)) w_oom();").line(ind, "    if (cnt_ > 0) \{").line(ind, "      {ln}_reserve(&{var(f.v)}, want_);").ctype(el)
-            let (xa, c4) = c3.line(ind, "      {ct}* d_ = {var(f.v)}->data + {var(f.v)}->len;").atom(f.x)
-            c = c4.line(ind, "      for (int64_t k_ = 0; k_ < cnt_; k_++) d_[k_] = {xa};").line(ind, "      {var(f.v)}->len += cnt_; {var(f.i)} += cnt_;").line(ind, "    }").line(ind, "  } else \{").line(ind, "  for (;;) \{").loop_body(ind + "    ", idx, body).line(ind, "  }").line(ind, "  }").line(ind, "}")
+            self.line(ind, "\{")
+            self.line(ind, "  int64_t cnt_;")
+            let na = self.atom(f.n)
+            self.line(ind, "  if (!__builtin_sub_overflow({na}, {var(f.i)}, &cnt_) && cnt_ < INT64_MAX - 1) \{")
+            self.line(ind, "    cnt_ += {if f.inclusive { 1 } else { 0 }};")
+            self.line(ind, "    int64_t want_;")
+            self.line(ind, "    if (cnt_ > 0 && __builtin_add_overflow({var(f.v)}->len, cnt_, &want_)) w_oom();")
+            self.line(ind, "    if (cnt_ > 0) \{")
+            self.line(ind, "      {ln}_reserve(&{var(f.v)}, want_);")
+            let ct = self.ctype(el)
+            self.line(ind, "      {ct}* d_ = {var(f.v)}->data + {var(f.v)}->len;")
+            let xa = self.atom(f.x)
+            self.line(ind, "      for (int64_t k_ = 0; k_ < cnt_; k_++) d_[k_] = {xa};")
+            self.line(ind, "      {var(f.v)}->len += cnt_; {var(f.i)} += cnt_;")
+            self.line(ind, "    }")
+            self.line(ind, "  } else \{")
+            self.line(ind, "  for (;;) \{")
+            self.loop_body(ind + "    ", idx, body)
+            self.line(ind, "  }")
+            self.line(ind, "  }")
+            self.line(ind, "}")
         },
         None => match hoist.versionable(body) {
             Some(vs) => {
                 // Loop versioning: one range check up front, no bounds
                 // checks inside.
-                let (step, c1) = c.atom(vs.step)
-                let (n, c2) = c1.atom(vs.n)
-                c = c2
+                let step = self.atom(vs.step)
+                let n = self.atom(vs.n)
                 let conds = ["{var(vs.m)} >= 0", "{step} >= 0", "{n} <= INT64_MAX - {step}"] + vs.lists.map(|v| "{n} {if vs.inclusive { "<" } else { "<=" }} {var(v)}->len")
-                c = c.line(ind, "if ({conds.join(" && ")}) \{")
-                let saved_r = c.inrange
-                c.inrange = vs.lists.map(|v| (v.id, vs.m.id)) + c.inrange
-                c = c.line(ind, "  for (;;) \{").loop_body(ind + "    ", idx, body).line(ind, "  }")
-                c.inrange = saved_r
-                c = c.line(ind, "} else \{").line(ind, "  for (;;) \{").loop_body(ind + "    ", idx, body).line(ind, "  }").line(ind, "}")
+                self.line(ind, "if ({conds.join(" && ")}) \{")
+                let saved_r = self.inrange
+                self.inrange = vs.lists.map(|v| (v.id, vs.m.id)) + self.inrange
+                self.line(ind, "  for (;;) \{")
+                self.loop_body(ind + "    ", idx, body)
+                self.line(ind, "  }")
+                self.inrange = saved_r
+                self.line(ind, "} else \{")
+                self.line(ind, "  for (;;) \{")
+                self.loop_body(ind + "    ", idx, body)
+                self.line(ind, "  }")
+                self.line(ind, "}")
             },
             None => {
-                c = c.line(ind, "for (;;) \{").loop_body(ind + "  ", idx, body).line(ind, "}")
+                self.line(ind, "for (;;) \{")
+                self.loop_body(ind + "  ", idx, body)
+                self.line(ind, "}")
             },
         },
     }
-    c.loops = idx + 1 + count_loops(body)
-    c.uniq = saved
-    c
+    self.loops = idx + 1 + count_loops(body)
+    self.uniq = saved
 }
 
 // ---------- functions ----------
 
-fn signature(self: Cg, f: ir.Fn) -> (Str, Cg) {
-    let mut c = self
+fn signature(mut self: Cg, f: ir.Fn) -> Str {
     let mut ps: List[Str] = if f.is_closure { ["WClo* self_"] } else { [] }
     for v in f.params {
-        let (ct, c1) = c.ctype(v.ty)
-        c = c1
-        ps.push(if v.by_ref { "{ct}* {var_name(v)}" } else { "{ct}{c.vol(v)} {var(v)}" })
+        let ct = self.ctype(v.ty)
+        ps.push(if v.by_ref { "{ct}* {var_name(v)}" } else { "{ct}{self.vol(v)} {var(v)}" })
     }
-    let (rt, c2) = c.ctype(f.ret)
-    ("static {rt} {f.fname}({if ps.is_empty() { "void" } else { ps.join(", ") }})", c2)
+    let rt = self.ctype(f.ret)
+    "static {rt} {f.fname}({if ps.is_empty() { "void" } else { ps.join(", ") }})"
 }
 
 fn atom_ids(xs: List[ir.Atom]) -> List[Int] {
@@ -2534,37 +2680,38 @@ fn vols_in(acc: List[Int], ss: List[ir.Stmt]) -> List[Int] {
     })
 }
 
-fn fn_body(self: Cg, f: ir.Fn) -> Cg {
-    let mut c = self
-    c.vols = guard_vols(f.body)
-    (c.plan, c.slot) = pure.plan(c.pure, f, c.slot)
-    c.loops = 0
-    c.slotted = []
-    let (sig, c1) = c.signature(f)
-    c = c1.put(sig + " \{\n")
+fn fn_body(mut self: Cg, f: ir.Fn) {
+    self.vols = guard_vols(f.body)
+    (self.plan, self.slot) = pure.plan(self.pure, f, self.slot)
+    self.loops = 0
+    self.slotted = []
+    let sig = self.signature(f)
+    self.put(sig + " \{\n")
     // parameters are owned by the function (`mut` ones by the caller)
     for v in f.params {
-        c = c.cell_decl("  ", v, true)
+        self.cell_decl("  ", v, true)
     }
     if !f.captures.is_empty() {
-        c = c.put("  struct Env_{f.fname}* env_ = (struct Env_{f.fname}*)self_;\n")
+        self.put("  struct Env_{f.fname}* env_ = (struct Env_{f.fname}*)self_;\n")
         for (i, v) in f.captures.with_index() {
-            let (d, c2) = c.dup_of(v.ty, "env_->c{i}")
-            let (ct, c3) = c2.ctype(v.ty)
-            c = c3.put("  {ct}{c3.vol(v)} {var(v)} = {d};\n").cell_decl("  ", v, true)
+            let d = self.dup_of(v.ty, "env_->c{i}")
+            let ct = self.ctype(v.ty)
+            self.put("  {ct}{self.vol(v)} {var(v)} = {d};\n")
+            self.cell_decl("  ", v, true)
         }
     }
-    match c.prof_ids.get(f.fname) {
+    match self.prof_ids.get(f.fname) {
         Some(k) => {
-            c = c.put("  W_PROF({k});\n")
+            self.put("  W_PROF({k});\n")
         },
         None => {},
     }
     // a checkpoint on entry: deep recursion stops too
-    c = c.put("  W_CHECK();\n").stmts("  ", f.body).put("  w_unreachable();\n}\n\n")
-    c.vols = []
-    c.plan = pure.no_plan()
-    c
+    self.put("  W_CHECK();\n")
+    self.stmts("  ", f.body)
+    self.put("  w_unreachable();\n}\n\n")
+    self.vols = []
+    self.plan = pure.no_plan()
 }
 
 // ---------- type definitions ----------
@@ -2609,21 +2756,18 @@ fn reaches_self(self: Cg, t: types.Ty) -> Bool {
     false
 }
 
-fn compute_boxed(self: Cg) -> Cg {
-    let mut c = self
+fn compute_boxed(mut self: Cg) {
     let mut boxed: List[Str] = []
-    for t in c.types {
+    for t in self.types {
         match t {
-            TNamed(..) if c.is_enum(t) && c.reaches_self(t) => {
-                let (n, c1) = c.cname(t)
-                c = c1
+            TNamed(..) if self.is_enum(t) && self.reaches_self(t) => {
+                let n = self.cname(t)
                 boxed.push(n)
             },
             _ => {},
         }
     }
-    c.boxed = boxed
-    c
+    self.boxed = boxed
 }
 
 fn is_boxed(self: Cg, t: types.Ty) -> Bool {
@@ -2641,7 +2785,7 @@ fn topo(self: Cg) -> List[types.Ty] {
     for t in self.types {
         match t {
             TNamed(..) | TArray(..) => {
-                (done, order) = self.visit(t, [], done, order)
+                self.visit(t, [], mut done, mut order)
             },
             _ => {},
         }
@@ -2649,23 +2793,20 @@ fn topo(self: Cg) -> List[types.Ty] {
     order
 }
 
-fn visit(self: Cg, t: types.Ty, visiting: List[types.Ty], done: List[types.Ty], order: List[types.Ty]) -> (List[types.Ty], List[types.Ty]) {
+fn visit(self: Cg, t: types.Ty, visiting: List[types.Ty], mut done: List[types.Ty], mut order: List[types.Ty]) {
     if done.contains(t) {
-        return (done, order)
+        return
     }
     if visiting.contains(t) {
         panic("recursive type needs an enum to break the cycle: " + show(t))
     }
-    let mut d = done
-    let mut o = order
     for u in self.contents(t) {
         if !self.is_boxed(u) {
-            (d, o) = self.visit(u, visiting + [t], d, o)
+            self.visit(u, visiting + [t], mut done, mut order)
         }
     }
-    d.push(t)
-    o.push(t)
-    (d, o)
+    done.push(t)
+    order.push(t)
 }
 
 fn list_depth(t: types.Ty) -> Int {
@@ -2681,38 +2822,35 @@ fn acc_of(boxed: Bool) -> Str {
 
 // The C definitions of the program's composite types and their
 // functions, in pieces.
-fn type_defs(self: Cg) -> (List[Str], Cg) {
-    let mut c = self.compute_boxed()
+fn type_defs(mut self: Cg) -> List[Str] {
+    self.compute_boxed()
     let mut out: List[Str] = []
-    let lists = c.types.filter(|t| match t {
+    let lists = self.types.filter(|t| match t {
         TList(_) => true,
         _ => false,
     })
-    let maps = c.types.filter(|t| match t {
+    let maps = self.types.filter(|t| match t {
         TMap(..) => true,
         _ => false,
     })
-    let named = c.topo()
+    let named = self.topo()
     // forward typedefs
     for t in lists + named {
-        let (n, c1) = c.cname(t)
-        c = c1
+        let n = self.cname(t)
         out.push(match t {
             TList(_) => "typedef struct {n} {n};",
-            _ => if c.is_boxed(t) { "typedef struct {n}_box* {n};" } else { "typedef struct {n} {n};" },
+            _ => if self.is_boxed(t) { "typedef struct {n}_box* {n};" } else { "typedef struct {n} {n};" },
         })
     }
     for t in maps {
-        let (n, c1) = c.cname(t)
-        c = c1
+        let n = self.cname(t)
         out.push("typedef struct {n} {n};")
     }
     for t in lists {
         match t {
             TList(e) => {
-                let (et, c1) = c.ctype(e)
-                let (n, c2) = c1.cname(t)
-                c = c2
+                let et = self.ctype(e)
+                let n = self.cname(t)
                 out.push("LIMEN_LIST_STRUCT({n}, {et})")
             },
             _ => {},
@@ -2721,10 +2859,9 @@ fn type_defs(self: Cg) -> (List[Str], Cg) {
     for t in maps {
         match t {
             TMap(k, v) => {
-                let (vt, c1) = c.ctype(v)
-                let (kt, c2) = c1.ctype(k)
-                let (n, c3) = c2.cname(t)
-                c = c3
+                let vt = self.ctype(v)
+                let kt = self.ctype(k)
+                let n = self.cname(t)
                 out.push("LIMEN_MAP_STRUCT({n}, {kt}, {vt})")
             },
             _ => {},
@@ -2732,23 +2869,20 @@ fn type_defs(self: Cg) -> (List[Str], Cg) {
     }
     // map prototypes: lists and structs of maps refer to them
     for t in maps {
-        let (n, c1) = c.cname(t)
-        c = c1
+        let n = self.cname(t)
         out.push("static {n}* {n}_dup({n}* m);\nstatic void {n}_drop({n}* m);\nstatic void {n}_share({n}* m);\nstatic bool {n}_eq({n}* a, {n}* b);\nstatic void {n}_show(WBuf* b, {n}* m, bool top);")
     }
     // struct bodies
     for t in named {
-        let (n, c1) = c.cname(t)
-        c = c1
+        let n = self.cname(t)
         match t {
             TArray(e, TLen(k)) => {
-                let (et, c2) = c.ctype(e)
-                c = c2
+                let et = self.ctype(e)
                 out.push("struct {n} \{ {et} a[{k.max(1)}]; };")
             },
-            _ => if c.is_enum(t) {
-                let vs = c.variants_of(t)
-                let boxed = c.is_boxed(t)
+            _ => if self.is_enum(t) {
+                let vs = self.variants_of(t)
+                let boxed = self.is_boxed(t)
                 out.push("struct {n}{if boxed { "_box" } else { "" }} \{{if boxed { " int64_t rc;" } else { "" }} int32_t tag;")
                 if vs.any(|v| !v.1.is_empty()) {
                     out.push("  union \{")
@@ -2756,8 +2890,7 @@ fn type_defs(self: Cg) -> (List[Str], Cg) {
                         if !v.1.is_empty() {
                             let mut fs: List[Str] = []
                             for (i, pt) in v.1.with_index() {
-                                let (ct, c2) = c.ctype(pt)
-                                c = c2
+                                let ct = self.ctype(pt)
                                 fs.push("{ct} f{i};")
                             }
                             out.push("    struct \{ {fs.join(" ")} } v{k};")
@@ -2768,9 +2901,8 @@ fn type_defs(self: Cg) -> (List[Str], Cg) {
                 out.push("};")
             } else {
                 let mut fs: List[Str] = []
-                for (i, f) in c.fields_of(t).with_index() {
-                    let (ct, c2) = c.ctype(f.1)
-                    c = c2
+                for (i, f) in self.fields_of(t).with_index() {
+                    let ct = self.ctype(f.1)
                     fs.push("{ct} f{i};")
                 }
                 out.push("struct {n} \{ {if fs.is_empty() { "char empty_;" } else { fs.join(" ") }} };")
@@ -2779,36 +2911,33 @@ fn type_defs(self: Cg) -> (List[Str], Cg) {
     }
     // prototypes
     for t in named {
-        let (n, c1) = c.cname(t)
-        let (ct, c2) = c1.ctype(t)
-        c = c2
+        let n = self.cname(t)
+        let ct = self.ctype(t)
         out.push("static {ct} {n}_dup({ct} v);")
         out.push("static void {n}_drop({ct} v);")
         out.push("static bool {n}_eq({ct} a, {ct} b);")
         out.push("static void {n}_show(WBuf* b, {ct} v, bool top);")
         out.push("static void {n}_share({ct} v);")
-        if c.is_boxed(t) {
+        if self.is_boxed(t) {
             out.push("static void {n}_kids(void* o);")
         }
     }
     // enum constructors and accessors
     for t in named {
-        if !c.is_enum(t) {
+        if !self.is_enum(t) {
             continue
         }
-        let (n, c1) = c.cname(t)
-        c = c1
-        let boxed = c.is_boxed(t)
+        let n = self.cname(t)
+        let boxed = self.is_boxed(t)
         let acc = acc_of(boxed)
         out.push("#define {n}_tag(v) ((v){acc}tag)")
-        for (k, v) in c.variants_of(t).with_index() {
+        for (k, v) in self.variants_of(t).with_index() {
             for (i, _) in v.1.with_index() {
                 out.push("#define {n}_p_{k}_{i}(v) ((v){acc}u.v{k}.f{i})")
             }
             let mut params: List[Str] = []
             for (i, pt) in v.1.with_index() {
-                let (ct, c2) = c.ctype(pt)
-                c = c2
+                let ct = self.ctype(pt)
                 params.push("{ct} a{i}")
             }
             out.push("static inline {n} {n}_mk_{k}({if params.is_empty() { "void" } else { params.join(", ") }}) \{")
@@ -2825,10 +2954,9 @@ fn type_defs(self: Cg) -> (List[Str], Cg) {
     for t in lists.sort_by(list_depth) {
         match t {
             TList(e) => {
-                let (en, c1) = c.cname(e)
-                let (et, c2) = c1.ctype(e)
-                let (n, c3) = c2.cname(t)
-                c = c3
+                let en = self.cname(e)
+                let et = self.ctype(e)
+                let n = self.cname(t)
                 out.push("LIMEN_LIST_FUNCS({n}, {et}, {en})")
                 if e == TFloat {
                     out.push("LIMEN_LIST_SORT({n}, double, Float)")
@@ -2840,26 +2968,24 @@ fn type_defs(self: Cg) -> (List[Str], Cg) {
     for t in maps {
         match t {
             TMap(k, _) => {
-                (_, c) = c.hash_prefix(k)
+                let _ = self.hash_prefix(k)
             },
             _ => {},
         }
     }
-    for t in c.hash_tys {
-        let (ct, c1) = c.ctype(t)
-        let (n, c2) = c1.cname(t)
-        c = c2
+    for t in self.hash_tys {
+        let ct = self.ctype(t)
+        let n = self.cname(t)
         out.push("static uint64_t {n}_hash({ct} v);")
     }
     for t in maps {
         match t {
             TMap(k, v) => {
-                let (vn, c1) = c.cname(v)
-                let (vt, c2) = c1.ctype(v)
-                let (kn, c3) = c2.cname(k)
-                let (kt, c4) = c3.ctype(k)
-                let (n, c5) = c4.cname(t)
-                c = c5
+                let vn = self.cname(v)
+                let vt = self.ctype(v)
+                let kn = self.cname(k)
+                let kt = self.ctype(k)
+                let n = self.cname(t)
                 out.push("LIMEN_MAP_FUNCS({n}, {kt}, {kn}, {vt}, {vn})")
             },
             _ => {},
@@ -2867,36 +2993,32 @@ fn type_defs(self: Cg) -> (List[Str], Cg) {
     }
     // dup/drop/eq/show definitions
     for t in named {
-        let (ls, c1) = c.value_fns(t)
-        c = c1
+        let ls = self.value_fns(t)
         out = out + ls
     }
-    let (ls, c2) = c.cmp_defs()
-    (out + ls, c2)
+    let ls = self.cmp_defs()
+    out + ls
 }
 
 // The dup, drop, share, eq and show functions of a named type or array.
-fn value_fns(self: Cg, t: types.Ty) -> (List[Str], Cg) {
-    let (n, c0) = self.cname(t)
-    let (ct, c1) = c0.ctype(t)
-    let mut c = c1
+fn value_fns(mut self: Cg, t: types.Ty) -> List[Str] {
+    let n = self.cname(t)
+    let ct = self.ctype(t)
     let mut out: List[Str] = []
     match t {
         TArray(e, TLen(k)) => {
-            let (en, c2) = c.cname(e)
-            c = c2
+            let en = self.cname(e)
             let each = |f: Str| if is_scalar(e) { [] } else { ["  for (int64_t i = 0; i < {k}; i++) {f};"] }
             out = out + ["static {ct} {n}_dup({ct} v) \{"] + each("v.a[i] = {en}_dup(v.a[i])") + ["  return v;\n}"]
             out = out + ["static void {n}_drop({ct} v) \{", "  (void)v;"] + each("{en}_drop(v.a[i])") + ["}"]
             out = out + ["static void {n}_share({ct} v) \{", "  (void)v;"] + each("{en}_share(v.a[i])") + ["}"]
-            let (eq, c3) = c.binop(Eq, e, "a.a[i]", "b.a[i]", diag.nowhere())
-            c = c3
+            let eq = self.binop(Eq, e, "a.a[i]", "b.a[i]", diag.nowhere())
             out = out + ["static bool {n}_eq({ct} a, {ct} b) \{", "  for (int64_t i = 0; i < {k}; i++) if (!({eq})) return false;", "  (void)a; (void)b; return true;\n}"]
             out = out + ["static void {n}_show(WBuf* b, {ct} v, bool top) \{", "  (void)top; buf_puts(b, \"[\");", "  for (int64_t i = 0; i < {k}; i++) \{ if (i) buf_puts(b, \", \"); {en}_show(b, v.a[i], false); }", "  buf_puts(b, \"]\");\n}"]
         },
-        _ => if c.is_enum(t) {
-            let vs = c.variants_of(t)
-            let boxed = c.is_boxed(t)
+        _ => if self.is_enum(t) {
+            let vs = self.variants_of(t)
+            let boxed = self.is_boxed(t)
             let acc = acc_of(boxed)
             // one `case` per variant, with what `f` writes for each of its
             // payloads
@@ -2909,8 +3031,7 @@ fn value_fns(self: Cg, t: types.Ty) -> (List[Str], Cg) {
                     out.push("    case {k}: \{")
                     for (i, pt) in v.1.with_index() {
                         if !is_scalar(pt) {
-                            let (pn, c2) = c.cname(pt)
-                            c = c2
+                            let pn = self.cname(pt)
                             out.push("      v.u.v{k}.f{i} = {pn}_dup(v.u.v{k}.f{i});")
                         }
                     }
@@ -2925,8 +3046,7 @@ fn value_fns(self: Cg, t: types.Ty) -> (List[Str], Cg) {
                     out.push("    case {k}: \{")
                     for (i, pt) in v.1.with_index() {
                         if !is_scalar(pt) {
-                            let (pn, c2) = c.cname(pt)
-                            c = c2
+                            let pn = self.cname(pt)
                             out.push("      {pn}_drop(v->u.v{k}.f{i});")
                         }
                     }
@@ -2945,8 +3065,7 @@ fn value_fns(self: Cg, t: types.Ty) -> (List[Str], Cg) {
                     out.push("    case {k}: \{")
                     for (i, pt) in v.1.with_index() {
                         if !is_scalar(pt) {
-                            let (pn, c2) = c.cname(pt)
-                            c = c2
+                            let pn = self.cname(pt)
                             out.push("      {pn}_drop(v{acc}u.v{k}.f{i});")
                         }
                     }
@@ -2967,8 +3086,7 @@ fn value_fns(self: Cg, t: types.Ty) -> (List[Str], Cg) {
                 out.push("    case {k}: \{")
                 for (i, pt) in v.1.with_index() {
                     if !is_scalar(pt) {
-                        let (pn, c2) = c.cname(pt)
-                        c = c2
+                        let pn = self.cname(pt)
                         out.push("      {pn}_share(v{acc}u.v{k}.f{i});")
                     }
                 }
@@ -2986,8 +3104,7 @@ fn value_fns(self: Cg, t: types.Ty) -> (List[Str], Cg) {
             for (k, v) in vs.with_index() {
                 out.push("    case {k}: \{")
                 for (i, pt) in v.1.with_index() {
-                    let (eq, c2) = c.binop(Eq, pt, "a{acc}u.v{k}.f{i}", "b{acc}u.v{k}.f{i}", diag.nowhere())
-                    c = c2
+                    let eq = self.binop(Eq, pt, "a{acc}u.v{k}.f{i}", "b{acc}u.v{k}.f{i}", diag.nowhere())
                     out.push("      if (!({eq})) return false;")
                 }
                 out.push("      break; }")
@@ -3007,8 +3124,7 @@ fn value_fns(self: Cg, t: types.Ty) -> (List[Str], Cg) {
                     if i > 0 {
                         out.push("      buf_puts(b, \", \");")
                     }
-                    let (pn, c2) = c.cname(pt)
-                    c = c2
+                    let pn = self.cname(pt)
                     out.push("      {pn}_show(b, v{acc}u.v{k}.f{i}, false);")
                 }
                 if !v.1.is_empty() {
@@ -3021,12 +3137,11 @@ fn value_fns(self: Cg, t: types.Ty) -> (List[Str], Cg) {
                 out = out + ["static void {n}_show(WBuf* b, {ct} v, bool top) \{", "  (void)top;", "  w_show(b, {n}_show_kids, v, 0);", "}"]
             }
         } else {
-            let fs = c.fields_of(t)
+            let fs = self.fields_of(t)
             out.push("static {ct} {n}_dup({ct} v) \{")
             for (i, f) in fs.with_index() {
                 if !is_scalar(f.1) {
-                    let (fn_, c2) = c.cname(f.1)
-                    c = c2
+                    let fn_ = self.cname(f.1)
                     out.push("  v.f{i} = {fn_}_dup(v.f{i});")
                 }
             }
@@ -3034,8 +3149,7 @@ fn value_fns(self: Cg, t: types.Ty) -> (List[Str], Cg) {
             out = out + ["static void {n}_drop({ct} v) \{", "  (void)v;"]
             for (i, f) in fs.with_index() {
                 if !is_scalar(f.1) {
-                    let (fn_, c2) = c.cname(f.1)
-                    c = c2
+                    let fn_ = self.cname(f.1)
                     out.push("  {fn_}_drop(v.f{i});")
                 }
             }
@@ -3043,16 +3157,14 @@ fn value_fns(self: Cg, t: types.Ty) -> (List[Str], Cg) {
             out = out + ["static void {n}_share({ct} v) \{", "  (void)v;"]
             for (i, f) in fs.with_index() {
                 if !is_scalar(f.1) {
-                    let (fn_, c2) = c.cname(f.1)
-                    c = c2
+                    let fn_ = self.cname(f.1)
                     out.push("  {fn_}_share(v.f{i});")
                 }
             }
             out.push("}")
             out = out + ["static bool {n}_eq({ct} a, {ct} b) \{", "  (void)a; (void)b;"]
             for (i, f) in fs.with_index() {
-                let (eq, c2) = c.binop(Eq, f.1, "a.f{i}", "b.f{i}", diag.nowhere())
-                c = c2
+                let eq = self.binop(Eq, f.1, "a.f{i}", "b.f{i}", diag.nowhere())
                 out.push("  if (!({eq})) return false;")
             }
             out.push("  return true;\n}")
@@ -3065,23 +3177,22 @@ fn value_fns(self: Cg, t: types.Ty) -> (List[Str], Cg) {
             out.push("  buf_puts(b, {c_string(if tuple { "(" } else { name + " \{ " })});")
             for (i, f) in fs.with_index() {
                 out.push("  buf_puts(b, {c_string((if i > 0 { ", " } else { "" }) + if tuple { "" } else { f.0 + ": " })});")
-                let (fn_, c2) = c.cname(f.1)
-                c = c2
+                let fn_ = self.cname(f.1)
                 out.push("  {fn_}_show(b, v.f{i}, false);")
             }
             out.push(if tuple { "  buf_puts(b, \")\");\n}" } else { "  buf_puts(b, \" }\");\n}" })
         },
     }
-    (out, c)
+    out
 }
 
 // Part j of the key type `n`, at `x`, in its _hash_k
-fn hash_part(self: Cg, n: Str, j: Int, e: types.Ty, x: Str) -> (List[Str], Cg) {
-    let (hp, c) = self.hash_prefix(e)
-    if c.flat(e) {
-        return (["  if (i <= {j}) h = w_hash_mix(h, {hp}_hash({x}));"], c)
+fn hash_part(mut self: Cg, n: Str, j: Int, e: types.Ty, x: Str) -> List[Str] {
+    let hp = self.hash_prefix(e)
+    if self.flat(e) {
+        return ["  if (i <= {j}) h = w_hash_mix(h, {hp}_hash({x}));"]
     }
-    let amp = if c.is_boxed(e) { "" } else { "&" }
+    let amp = if self.is_boxed(e) { "" } else { "&" }
     let lines = [
         "  if (i <= {j}) \{",
         "    uint64_t k_ = w_hash({hp}_hash_k, {amp}{x});",
@@ -3089,15 +3200,15 @@ fn hash_part(self: Cg, n: Str, j: Int, e: types.Ty, x: Str) -> (List[Str], Cg) {
         "    h = w_hash_mix(h, k_);",
         "  }",
     ]
-    (lines, c)
+    lines
 }
 
 // An item of the list or boxed enum `n`, inside a block: when it put
 // something on the stack, the rest goes on after it, from item `next`
 // (empty: nothing follows)
-fn cmp_item(self: Cg, n: Str, e: types.Ty, x: Str, y: Str, next: Str) -> (List[Str], Cg) {
-    let (cp, c) = self.cmp_prefix(e)
-    let deep = next != "" && !c.flat(e)
+fn cmp_item(mut self: Cg, n: Str, e: types.Ty, x: Str, y: Str, next: Str) -> List[Str] {
+    let cp = self.cmp_prefix(e)
+    let deep = next != "" && !self.flat(e)
     let mut lines: List[Str] = []
     if deep {
         lines.push("    int64_t m_ = w_cmp_n;")
@@ -3106,7 +3217,7 @@ fn cmp_item(self: Cg, n: Str, e: types.Ty, x: Str, y: Str, next: Str) -> (List[S
     if deep {
         lines.push("    if (w_cmp_n != m_) \{ w_cmp_push({n}_cmp_k, a, b, {next}); return 0; }")
     }
-    (lines, c)
+    lines
 }
 
 // A type is flat when no enum that holds itself is inside it, so its
@@ -3117,7 +3228,10 @@ fn cmp_item(self: Cg, n: Str, e: types.Ty, x: Str, y: Str, next: Str) -> (List[S
 fn flat(self: Cg, t: types.Ty) -> Bool {
     match self.flats.get(show(t)) {
         Some(b) => b,
-        None => self.flat_in(t, [], self.flats).0,
+        None => {
+            let mut memo = self.flats
+            self.flat_in(t, [], mut memo)
+        },
     }
 }
 
@@ -3125,148 +3239,136 @@ fn flat(self: Cg, t: types.Ty) -> Bool {
 fn flat_table(self: Cg, ts: List[types.Ty]) -> Map[Str, Bool] {
     let mut memo: Map[Str, Bool] = map()
     for t in ts {
-        let (_, m) = self.flat_in(t, [], memo)
-        memo = m
+        let _ = self.flat_in(t, [], mut memo)
     }
     memo
 }
 
-fn flat_in(self: Cg, t: types.Ty, seen: List[Str], memo: Map[Str, Bool]) -> (Bool, Map[Str, Bool]) {
+fn flat_in(self: Cg, t: types.Ty, seen: List[Str], mut memo: Map[Str, Bool]) -> Bool {
     match t {
-        TInt | TFloat | TStr | TBytes | TBool | TUnit | TUInt(_) => (true, memo),
-        TList(e) | TArray(e, _) => self.flat_in(e, seen, memo),
+        TInt | TFloat | TStr | TBytes | TBool | TUnit | TUInt(_) => true,
+        TList(e) | TArray(e, _) => self.flat_in(e, seen, mut memo),
         TNamed(..) => {
             let n = show(t)
             match memo.get(n) {
-                Some(b) => { return (b, memo) },
+                Some(b) => { return b },
                 None => {},
             }
             if seen.contains(n) {
-                return (false, memo)
+                return false
             }
             // a false answer found on the way is true of every type on it
-            let mut m = memo
             let mut r = !self.is_boxed(t)
             if r {
                 for e in self.parts(t) {
-                    let (b, m2) = self.flat_in(e, seen + [n], m)
-                    m = m2
+                    let b = self.flat_in(e, seen + [n], mut memo)
                     if !b {
                         r = false
                         break
                     }
                 }
             }
-            m[n] = r
-            (r, m)
+            memo[n] = r
+            r
         },
-        _ => (true, memo),
+        _ => true,
     }
 }
 
+
 // Order functions, item by item as the interpreter compares; and hash
 // functions for tuple, struct and enum map keys.
-fn cmp_defs(self: Cg) -> (List[Str], Cg) {
-    let mut c = self
+fn cmp_defs(mut self: Cg) -> List[Str] {
     let mut out: List[Str] = []
-    c.flats = c.flat_table(c.hash_tys + c.cmp_tys)
-    for t in c.hash_tys {
-        if !c.flat(t) {
-            let (n, c1) = c.cname(t)
-            c = c1
+    self.flats = self.flat_table(self.hash_tys + self.cmp_tys)
+    for t in self.hash_tys {
+        if !self.flat(t) {
+            let n = self.cname(t)
             out.push("static uint64_t {n}_hash_k(void* o, int64_t i, uint64_t h);")
         }
     }
-    for t in c.hash_tys {
-        let (n, c1) = c.cname(t)
-        let (ct, c2) = c1.ctype(t)
-        c = c2
+    for t in self.hash_tys {
+        let n = self.cname(t)
+        let ct = self.ctype(t)
         out.push("static uint64_t {n}_hash({ct} v) \{")
-        if c.flat(t) {
+        if self.flat(t) {
             out.push("  uint64_t h = 0x2545F4914F6CDD1DULL; (void)v;")
-            if c.is_enum(t) {
-                let acc = acc_of(c.is_boxed(t))
+            if self.is_enum(t) {
+                let acc = acc_of(self.is_boxed(t))
                 out.push("  h = w_hash_mix(h, Int_hash(v{acc}tag));")
                 out.push("  switch (v{acc}tag) \{")
-                for (k, v) in c.variants_of(t).with_index() {
+                for (k, v) in self.variants_of(t).with_index() {
                     out.push("    case {k}:")
                     for (i, pt) in v.1.with_index() {
-                        let (hp, c3) = c.hash_prefix(pt)
-                        c = c3
+                        let hp = self.hash_prefix(pt)
                         out.push("  h = w_hash_mix(h, {hp}_hash(v{acc}u.v{k}.f{i}));")
                     }
                     out.push("      break;")
                 }
                 out.push("  }")
             } else {
-                for (i, f) in c.fields_of(t).with_index() {
-                    let (hp, c3) = c.hash_prefix(f.1)
-                    c = c3
+                for (i, f) in self.fields_of(t).with_index() {
+                    let hp = self.hash_prefix(f.1)
                     out.push("  h = w_hash_mix(h, {hp}_hash(v.f{i}));")
                 }
             }
             out.push("  return h;")
         } else {
-            let arg = if c.is_boxed(t) { "v" } else { "&v" }
+            let arg = if self.is_boxed(t) { "v" } else { "&v" }
             out.push("  return w_hash_outer({n}_hash_k, {arg});")
         }
         out.push("}")
     }
     // the kids of the keys that are not flat, after every _hash
-    for t in c.hash_tys {
-        if c.flat(t) {
+    for t in self.hash_tys {
+        if self.flat(t) {
             continue
         }
-        let (n, c1) = c.cname(t)
-        let (ct, c2) = c1.ctype(t)
-        c = c2
+        let n = self.cname(t)
+        let ct = self.ctype(t)
         out.push("static uint64_t {n}_hash_k(void* o, int64_t i, uint64_t h) \{")
-        if c.is_boxed(t) {
+        if self.is_boxed(t) {
             out.push("  {ct} v = ({ct})o;")
         } else {
             out.push("  {ct}* v = ({ct}*)o;")
         }
         // part j: a flat one is hashed at once; any other through w_hash,
         // and if it went on the stack, this call waits for it there
-        if c.is_enum(t) {
+        if self.is_enum(t) {
             out.push("  if (i <= 0) h = w_hash_mix(h, Int_hash(v->tag));")
             out.push("  switch (v->tag) \{")
-            for (k, v) in c.variants_of(t).with_index() {
+            for (k, v) in self.variants_of(t).with_index() {
                 out.push("    case {k}:")
                 for (i, pt) in v.1.with_index() {
-                    let (lines, c3) = c.hash_part(n, i + 1, pt, "v->u.v{k}.f{i}")
-                    c = c3
+                    let lines = self.hash_part(n, i + 1, pt, "v->u.v{k}.f{i}")
                     out = out + lines
                 }
                 out.push("      break;")
             }
             out.push("  }")
         } else {
-            for (i, f) in c.fields_of(t).with_index() {
-                let (lines, c3) = c.hash_part(n, i, f.1, "v->f{i}")
-                c = c3
+            for (i, f) in self.fields_of(t).with_index() {
+                let lines = self.hash_part(n, i, f.1, "v->f{i}")
                 out = out + lines
             }
         }
         out.push("  return h;")
         out.push("}")
     }
-    for t in c.cmp_tys {
-        let (ct, c1) = c.ctype(t)
-        let (n, c2) = c1.cname(t)
-        c = c2
+    for t in self.cmp_tys {
+        let ct = self.ctype(t)
+        let n = self.cname(t)
         out.push("static int {n}_cmp({ct} a, {ct} b);")
     }
-    for t in c.cmp_tys {
-        let (n, c1) = c.cname(t)
-        let (ct, c2) = c1.ctype(t)
-        c = c2
-        let fl = c.flat(t)
+    for t in self.cmp_tys {
+        let n = self.cname(t)
+        let ct = self.ctype(t)
+        let fl = self.flat(t)
         // a difference: as it is in a flat type, else through w_cmp_res
         let ret = if fl { "r_" } else { "w_cmp_res(r_)" }
         let kids = match t {
             TList(_) => !fl,
-            _ => !fl && c.is_enum(t) && c.is_boxed(t),
+            _ => !fl && self.is_enum(t) && self.is_boxed(t),
         }
         if kids {
             out.push("static int {n}_cmp_k(void* pa, void* pb, int64_t i) \{")
@@ -3276,8 +3378,7 @@ fn cmp_defs(self: Cg) -> (List[Str], Cg) {
                 TList(e) => {
                     out.push("  int64_t n_ = a->len < b->len ? a->len : b->len;")
                     out.push("  for (; i < n_; i++) \{")
-                    let (lines, c3) = c.cmp_item(n, e, "a->data[i]", "b->data[i]", "i + 1")
-                    c = c3
+                    let lines = self.cmp_item(n, e, "a->data[i]", "b->data[i]", "i + 1")
                     out = out + lines
                     out.push("  }")
                     out.push("  return a->len == b->len ? 0 : w_cmp_res(a->len < b->len ? -1 : 1);")
@@ -3285,13 +3386,12 @@ fn cmp_defs(self: Cg) -> (List[Str], Cg) {
                 _ => {
                     out.push("  if (a->tag != b->tag) return w_cmp_res(a->tag < b->tag ? -1 : 1);")
                     out.push("  switch (a->tag) \{")
-                    for (k, v) in c.variants_of(t).with_index() {
+                    for (k, v) in self.variants_of(t).with_index() {
                         out.push("    case {k}:")
                         for (i, pt) in v.1.with_index() {
                             let next = if i < v.1.len() - 1 { "{i + 1}" } else { "" }
                             out.push("  if (i <= {i}) \{")
-                            let (lines, c3) = c.cmp_item(n, pt, "a->u.v{k}.f{i}", "b->u.v{k}.f{i}", next)
-                            c = c3
+                            let lines = self.cmp_item(n, pt, "a->u.v{k}.f{i}", "b->u.v{k}.f{i}", next)
                             out = out + lines
                             out.push("  }")
                         }
@@ -3311,29 +3411,26 @@ fn cmp_defs(self: Cg) -> (List[Str], Cg) {
             TList(e) => {
                 out.push("  int64_t n_ = a->len < b->len ? a->len : b->len;")
                 out.push("  for (int64_t i = 0; i < n_; i++)")
-                let (cp, c3) = c.cmp_prefix(e)
-                c = c3
+                let cp = self.cmp_prefix(e)
                 out.push("  \{ int r_ = {cp}_cmp(a->data[i], b->data[i]); if (r_) return {ret}; }")
                 out.push("  return a->len < b->len ? -1 : a->len > b->len;")
             },
             TArray(e, TLen(k)) => {
                 out.push("  for (int64_t i = 0; i < {k}; i++)")
-                let (cp, c3) = c.cmp_prefix(e)
-                c = c3
+                let cp = self.cmp_prefix(e)
                 out.push("  \{ int r_ = {cp}_cmp(a.a[i], b.a[i]); if (r_) return {ret}; }")
                 out.push("  return 0;")
             },
-            _ => if c.is_enum(t) {
-                let acc = acc_of(c.is_boxed(t))
+            _ => if self.is_enum(t) {
+                let acc = acc_of(self.is_boxed(t))
                 let diff = "a{acc}tag < b{acc}tag ? -1 : 1"
                 let r = if fl { diff } else { "w_cmp_res({diff})" }
                 out.push("  if (a{acc}tag != b{acc}tag) return {r};")
                 out.push("  switch (a{acc}tag) \{")
-                for (k, v) in c.variants_of(t).with_index() {
+                for (k, v) in self.variants_of(t).with_index() {
                     out.push("    case {k}:")
                     for (i, pt) in v.1.with_index() {
-                        let (cp, c3) = c.cmp_prefix(pt)
-                        c = c3
+                        let cp = self.cmp_prefix(pt)
                         out.push("  \{ int r_ = {cp}_cmp(a{acc}u.v{k}.f{i}, b{acc}u.v{k}.f{i}); if (r_) return {ret}; }")
                     }
                     out.push("      break;")
@@ -3341,9 +3438,8 @@ fn cmp_defs(self: Cg) -> (List[Str], Cg) {
                 out.push("  }")
                 out.push("  return 0;")
             } else {
-                for (i, f) in c.fields_of(t).with_index() {
-                    let (cp, c3) = c.cmp_prefix(f.1)
-                    c = c3
+                for (i, f) in self.fields_of(t).with_index() {
+                    let cp = self.cmp_prefix(f.1)
                     out.push("  \{ int r_ = {cp}_cmp(a.f{i}, b.f{i}); if (r_) return {ret}; }")
                 }
                 out.push("  return 0;")
@@ -3351,19 +3447,18 @@ fn cmp_defs(self: Cg) -> (List[Str], Cg) {
         }
         out.push("}")
     }
-    for t in c.sort_tys {
+    for t in self.sort_tys {
         match t {
             TList(e) => {
-                let (cp, c1) = c.cmp_prefix(e)
-                let (et, c2) = c1.ctype(e)
-                let (n, c3) = c2.cname(t)
-                c = c3
+                let cp = self.cmp_prefix(e)
+                let et = self.ctype(e)
+                let n = self.cname(t)
                 out.push("LIMEN_LIST_SORT({n}, {et}, {cp})")
             },
             _ => {},
         }
     }
-    (out, c)
+    out
 }
 
 // ---------- the program ----------
@@ -3420,13 +3515,12 @@ pub fn program(ro: lower.Ro, files: List[diag.Source], prog: ir.Program, runtime
     }
     // bodies first: this names every type and literal
     for f in prog.fns {
-        c = c.fn_body(f)
+        c.fn_body(f)
     }
     let bodies = c.out.join("")
     let mut protos: List[Str] = []
     for f in prog.fns {
-        let (sig, c1) = c.signature(f)
-        c = c1
+        let sig = c.signature(f)
         protos.push(sig + ";\n")
     }
     let mut envs: List[Str] = []
@@ -3436,8 +3530,7 @@ pub fn program(ro: lower.Ro, files: List[diag.Source], prog: ir.Program, runtime
         }
         let mut cs: List[Str] = []
         for (i, v) in f.captures.with_index() {
-            let (ct, c1) = c.ctype(v.ty)
-            c = c1
+            let ct = c.ctype(v.ty)
             cs.push("{ct} c{i};")
         }
         envs.push("struct Env_{f.fname} \{ WClo base; {cs.join(" ")} };\n")
@@ -3445,8 +3538,7 @@ pub fn program(ro: lower.Ro, files: List[diag.Source], prog: ir.Program, runtime
             envs.push("static void Env_{f.fname}_{what}(WClo* k) \{\n  struct Env_{f.fname}* e = (struct Env_{f.fname}*)k;\n  (void)e;\n")
             for (i, v) in f.captures.with_index() {
                 if !is_scalar(v.ty) {
-                    let (n, c1) = c.cname(v.ty)
-                    c = c1
+                    let n = c.cname(v.ty)
                     envs.push("  {n}_{what}(e->c{i});\n")
                 }
             }
@@ -3456,15 +3548,13 @@ pub fn program(ro: lower.Ro, files: List[diag.Source], prog: ir.Program, runtime
     let mut dynbuf: List[Str] = []
     // drop-through-pointer functions for owned locals
     for t in c.cell_tys {
-        let (ct, c1) = c.ctype(t)
-        let (n, c2) = c1.cname(t)
-        c = c2
+        let ct = c.ctype(t)
+        let n = c.cname(t)
         dynbuf.push("static void w_dp_{n}(void* p) \{ {n}_drop(*({ct}*)p); }\n")
     }
     for d in c.dyns {
-        let (ct, c1) = c.ctype(d.ty)
-        let (cn, c2) = c1.cname(d.ty)
-        c = c2
+        let ct = c.ctype(d.ty)
+        let cn = c.cname(d.ty)
         let key = d.key
         let p = "((struct Dyn_{key}*)d)->val"
         dynbuf.push("struct Dyn_{key} \{ WDyn base; {ct} val; };\n")
@@ -3474,13 +3564,11 @@ pub fn program(ro: lower.Ro, files: List[diag.Source], prog: ir.Program, runtime
         for (k, m) in d.methods.with_index() {
             let mut params = ["WDyn* d"]
             for (j, pt) in m.params.with_index() {
-                let (pc, c3) = c.ctype(pt)
-                c = c3
+                let pc = c.ctype(pt)
                 params.push("{pc} a{j}")
             }
             let self_arg = if is_scalar(d.ty) { p } else { "{cn}_dup({p})" }
-            let (rc, c4) = c.ctype(m.ret)
-            c = c4
+            let rc = c.ctype(m.ret)
             let args = [self_arg] + m.params.with_index().map(|q| "a{q.0}")
             dynbuf.push("static {rc} Dyn_{key}_m{k}({params.join(", ")}) \{ return {m.fname}({args.join(", ")}); }\n")
         }
@@ -3490,40 +3578,33 @@ pub fn program(ro: lower.Ro, files: List[diag.Source], prog: ir.Program, runtime
     let mut tasks: List[Str] = []
     for t in c.chan_tys {
         if !is_scalar(t) {
-            let (ct, c1) = c.ctype(t)
-            let (n, c2) = c1.cname(t)
-            c = c2
+            let ct = c.ctype(t)
+            let n = c.cname(t)
             tasks.push("static void chdrop_{n}(void* p) \{ {n}_drop(*({ct}*)p); }\nstatic void chshare_{n}(void* p) \{ {n}_share(*({ct}*)p); }\n")
         }
     }
     for t in c.task_tys {
         let mut share = ""
         if !is_scalar(t) {
-            let (n0, c0) = c.cname(t)
-            c = c0
+            let n0 = c.cname(t)
             share = "{n0}_share(r);"
         }
-        let (ct, c1) = c.ctype(t)
-        let (n, c2) = c1.cname(t)
-        c = c2
+        let ct = c.ctype(t)
+        let n = c.cname(t)
         tasks.push("static void wtask_{n}(WTask* t) \{\n  {ct} r = (({ct} (*)(WClo*))t->fn->fn)(t->fn);\n  {share}\n  memcpy(t->slot, &r, sizeof r);\n  Clo_drop(t->fn);\n}\n")
     }
-    let (main, c5) = c.main_fn(prog)
-    c = c5
+    let main = c.main_fn(prog)
     // callback wrappers, after the prototypes of the functions they call
     let mut cbdefs: List[Str] = []
     for w in c.wrappers {
-        let (d, c1) = c.ffi_callback_def(w)
-        c = c1
+        let d = c.ffi_callback_def(w)
         cbdefs.push(d)
     }
     for (i, ps) in c.kepts.with_index() {
-        let (d, c1) = c.kept_def(i, ps)
-        c = c1
+        let d = c.kept_def(i, ps)
         cbdefs.push(d)
     }
-    let (defs, c6) = c.type_defs()
-    c = c6
+    let defs = c.type_defs()
     let mut tys = defs.map(|l| l + "\n")
     for s in c.cstructs {
         let fields = s.fields.with_index().map(|q| {
@@ -3553,8 +3634,7 @@ pub fn program(ro: lower.Ro, files: List[diag.Source], prog: ir.Program, runtime
 // `main` of the C program: a test binary's, or the one that runs the
 // program's `main` as the main fiber and turns its result into the exit
 // status.
-fn main_fn(self: Cg, prog: ir.Program) -> (Str, Cg) {
-    let mut c = self
+fn main_fn(mut self: Cg, prog: ir.Program) -> Str {
     let mut m: List[Str] = []
     let rt = prog.main_ret
     if !prog.tests.is_empty() || !prog.benches.is_empty() {
@@ -3614,11 +3694,10 @@ fn main_fn(self: Cg, prog: ir.Program) -> (Str, Cg) {
     } else {
         // main runs as the main fiber, so it can wait on groups, channels
         // and sockets
-        let (ct, c1) = c.ctype(rt)
-        c = c1
+        let ct = self.ctype(rt)
         m.push("static {ct} wmain_result_;")
         m.push("static void wmain_entry_(void* a) \{ (void)a; wmain_result_ = {prog.main}({if prog.main_takes_root { "w_root()" } else { "" }}); w_main_finished(); }")
-        if c.ro.profile {
+        if self.ro.profile {
             // a function's name without the `wf_` C names start with
             let n = prog.fns.len() + 1
             let shown = prog.fns.map(|f| if f.fname.starts_with("wf_") { f.fname.slice(3, f.fname.len()) } else { f.fname })
@@ -3627,29 +3706,26 @@ fn main_fn(self: Cg, prog: ir.Program) -> (Str, Cg) {
             m.push("static int64_t w_prof_samples_[{n}];")
         }
         m = m + ["int main(int argc, char** argv) \{", "  w_init(argc, argv);"]
-        if c.ro.profile {
+        if self.ro.profile {
             m.push("  w_prof_start(w_prof_names_, w_prof_calls_, w_prof_samples_, {prog.fns.len() + 1});")
         }
         m = m + ["  w_run(wmain_entry_, NULL);", "  {ct} r_ = wmain_result_;"]
         match rt {
             TNamed("Result", [_, et]) => {
-                let (te, c2) = c.tag_expr(rt, "r_")
-                c = c2
+                let te = self.tag_expr(rt, "r_")
                 m.push("  if ({te} == 1) \{")
                 m.push("    WBuf b_; buf_init(&b_); buf_puts(&b_, \"error: \");")
                 match et {
                     TDyn("Error", []) => {
                         // a `dyn Error` is reported by its message: method
                         // 0 of its vtable
-                        let (d, c3) = c.payload_expr(rt, "r_", 1, 0)
-                        c = c3
+                        let d = self.payload_expr(rt, "r_", 1, 0)
                         m.push("    WStr* m_ = ((WStr* (*)(WDyn*))({d})->vt->m[0])({d});")
                         m.push("    Str_show(&b_, m_, true); Str_drop(m_);")
                     },
                     _ => {
-                        let (pe, c3) = c.payload_expr(rt, "r_", 1, 0)
-                        let (en, c4) = c3.cname(et)
-                        c = c4
+                        let pe = self.payload_expr(rt, "r_", 1, 0)
+                        let en = self.cname(et)
                         m.push("    {en}_show(&b_, {pe}, true);")
                     },
                 }
@@ -3663,8 +3739,7 @@ fn main_fn(self: Cg, prog: ir.Program) -> (Str, Cg) {
         let code = match rt {
             TInt => "(int)(r_ & 255)",
             TNamed("Result", [TInt, _]) => {
-                let (pe, c2) = c.payload_expr(rt, "r_", 0, 0)
-                c = c2
+                let pe = self.payload_expr(rt, "r_", 0, 0)
                 "(int)({pe} & 255)"
             },
             _ => "0",
@@ -3673,11 +3748,10 @@ fn main_fn(self: Cg, prog: ir.Program) -> (Str, Cg) {
         if is_scalar(rt) {
             m.push("  (void)r_;")
         } else {
-            let (n, c2) = c.cname(rt)
-            c = c2
+            let n = self.cname(rt)
             m.push("  {n}_drop(r_);")
         }
         m = m + ["  fflush(stdout);", "  w_leakcheck();", "  return code_;", "}"]
     }
-    (m.map(|l| l + "\n").join(""), c)
+    m.map(|l| l + "\n").join("")
 }
