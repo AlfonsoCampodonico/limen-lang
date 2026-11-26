@@ -12116,6 +12116,18 @@ fn main(root: Root) {
    place "place-once-remove" "    let mut ms = [map([(\"a\", 1), (\"b\", 2)])]\n    ms[side(out, \"i\", 0)].remove(side(out, \"k\", \"a\"))\n    out.print(\"{ms}\")" "i\nk\n[{\"b\": 2}]\n";
    place "place-rhs-first" "    let mut xs = [0]\n    xs[side(out, \"i\", 0)] = side(out, \"v\", 5)\n    out.print(\"{xs}\")" "v\ni\n[5]\n";
    place "place-rhs-var" "    let mut xs = [0, 0]\n    let mut j = 1\n    xs[{\n        j = 0\n        1\n    }] = j\n    out.print(\"{xs} {j}\")" "[0, 1] 0\n");
+  (* a write through a long list's row changes the list in place: 200,000
+     writes and 100,000 pushes into rows of a 20,000-row list *)
+  (let name = "place-in-place-fast" in
+   if selected name then begin
+     let src = main_wrap "    let mut rows: List[List[Int]] = []\n    for _ in 0..<20000 {\n        rows.push([0])\n    }\n    for i in 0..<200000 {\n        rows[i % 20000][0] = i\n    }\n    for i in 0..<100000 {\n        rows[i % 20000].push(i)\n    }\n    out.print(\"{rows[19999]}\")" in
+     let t0 = Unix.gettimeofday () in
+     let r = run name src in
+     let secs = Unix.gettimeofday () -. t0 in
+     let want = "[199999, 19999, 39999, 59999, 79999, 99999]\n" in
+     (match r with Ok (got, _) -> ok name (got = want) (sprintf "got %S, want %S" got want) | Error e -> ok name false e);
+     ok (name ^ "-time") (secs < 2.) (sprintf "took %.1f s" secs)
+   end);
 
   drain ();
   Printf.printf "%d/%d passed\n" (!total - !failed) !total;

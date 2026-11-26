@@ -2281,9 +2281,8 @@ let rec eval rt env e : value =
     (* the place first, then the key *)
     let root, path = place rt env recv in
     let k = key_of (eval rt env arg) in
-    root :=
-      place_change rt (settle root) path (fun cur ->
-          match cur () with VMap mv -> VMap { mv with m = KM.remove k mv.m } | _ -> failwith "internal: remove");
+    place_set rt root path (fun cur ->
+        match cur () with VMap mv -> VMap { mv with m = KM.remove k mv.m } | _ -> failwith "internal: remove");
     VUnit
   | EMethod ({ edesc = EVar n; _ }, "push", _, [ arg ]) when (match find_var env n with Some { contents = VList _ | VBuf _ } -> true | _ -> false) ->
     (* in place, growing by doubling; the argument first, since it may read
@@ -2302,9 +2301,8 @@ let rec eval rt env e : value =
     (* the place first, then the argument *)
     let root, path = place rt env recv in
     let v = eval rt env arg in
-    root :=
-      place_change rt (settle root) path (fun cur ->
-          match cur () with VList arr -> VList (Array.append arr [| v |]) | _ -> failwith "internal: push");
+    place_set rt root path (fun cur ->
+        match cur () with VList arr -> VList (Array.append arr [| v |]) | _ -> failwith "internal: push");
     VUnit
   | EMethod ({ edesc = EVar en; _ }, name, _, args) when find_var env en = None && Hashtbl.mem rt.enums en ->
     apply rt (ctor_value rt en name) (List.map (eval rt env) args) e.espan
@@ -2705,7 +2703,7 @@ and arg_cell rt env (a : expr) =
   | EMut p ->
     let root, path = place rt env p in
     let cell = ref (List.fold_left (place_get rt) (settle root) path) in
-    (cell, fun () -> root := place_change rt (settle root) path (fun _ -> settle cell))
+    (cell, fun () -> place_set rt root path (fun _ -> settle cell))
   | _ -> (ref (eval rt env a), ignore)
 
 (* A place: its root variable's cell and the steps to it, each index and
@@ -2735,6 +2733,19 @@ and place_get rt v = function
         raise (Panic (Core.msg_list_index i (Array.length arr), sp));
       arr.(Int64.to_int i)
     | _ -> failwith "internal: a place's index")
+
+(* Change the value at [path] from [root]'s cell with [g], as
+   [place_change] does. A list the variable holds is changed in place at
+   the first index (made its own first), so a write into a row of a long
+   list does not copy the whole list. *)
+and place_set rt root path g =
+  match (path, !root) with
+  | `Index (VInt k, sp) :: rest, (VList _ | VBuf _) ->
+    let b = own root in
+    if k < 0L || k >= Int64.of_int b.len then raise (Panic (Core.msg_list_index k b.len, sp));
+    let i = Int64.to_int k in
+    b.items.(i) <- place_change rt b.items.(i) rest g
+  | _ -> root := place_change rt (settle root) path g
 
 (* [v] with the value at [path] replaced by [g] of it; [g] gets the old
    value to read on demand, since a map entry being set need not exist.
@@ -2866,7 +2877,7 @@ and assign rt env lhs v =
     | _ -> failwith "internal: assign index")
   | _ ->
     let root, path = place rt env lhs in
-    root := place_change rt (settle root) path (fun _ -> v)
+    place_set rt root path (fun _ -> v)
 
 (* The built-in methods written in Limen (std/methods.lmn), done directly:
    pushing onto a list copies it here, so the Limen loops would be quadratic.

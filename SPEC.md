@@ -553,9 +553,9 @@ let report = read_orders(text)
 
 `f(a, b)` calls a function or closure. The number of arguments must match (E0107). `panic(msg: Str)` aborts the program with a message and source location; it can be used where any type is expected.
 
-Evaluation order is left to right: the callee (or a method's receiver), then the arguments in the order they are written. For assignment, the right-hand side is evaluated first, then the target's root and its indexes and keys left to right, each exactly once; a variable used as an index is read where it is written.
+Evaluation order is left to right: the callee (or a method's receiver), then the arguments in the order they are written. For assignment, the right-hand side is evaluated first, then the target's indexes and keys left to right, each exactly once; a variable used as an index is read where it is written, and the root variable is written as it is after them.
 
-**`mut` arguments.** `f(mut place)` passes a place to a `mut` parameter (section 4), and the callee changes that place. The place's indexes are evaluated where the argument is written, in the order above; a plain argument holds the value it had where it is written. A named argument can be `mut` too: `bump(n: mut k)`.
+**`mut` arguments.** `f(mut place)` passes a place to a `mut` parameter (section 4), and the callee changes that place. The place's indexes are evaluated where the argument is written, left to right, as written; a plain argument holds the value it had where it is written. A named argument can be `mut` too: `bump(n: mut k)`.
 
 **Named arguments.** An argument can name the parameter it is for, which reads better than a row of bare numbers and booleans:
 
