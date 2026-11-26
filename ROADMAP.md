@@ -12,7 +12,7 @@ then harden it, then promise not to break it.
 This file is the plan. The design doc keeps the reasons and the history of
 what was done; its older lists of what was missing point here.
 
-Updated 2026-11-22, after 0.7.4.
+Updated 2026-11-26, with 0.8 built and not yet released.
 
 ## 0.4: a server you can leave running (done, 0.4.0)
 
@@ -167,7 +167,7 @@ happens here.
 Done when the review's findings are fixed and nothing on the list of
 breaking changes is still open.
 
-## 0.8.x or 0.9: `mut` parameters (done)
+## `mut` parameters (done, in 0.8)
 
 A function changes its caller's value through a `mut` parameter, without a
 stored reference: `fn roll(mut seed: Int) -> Int` is called `roll(mut seed)`,
