@@ -89,7 +89,7 @@ let generics ?(text = "") names bounds =
 let fn_sig text (d : fn_decl) =
   let ps =
     List.map
-      (fun p -> p.prm_name ^ ": " ^ slice text p.prm_ty.tspan ^ match p.prm_default with Some e -> " = " ^ slice text e.espan | None -> "")
+      (fun p -> (if p.prm_mut then "mut " else "") ^ p.prm_name ^ ": " ^ slice text p.prm_ty.tspan ^ match p.prm_default with Some e -> " = " ^ slice text e.espan | None -> "")
       d.fn_params
   in
   (* a variadic foreign function's `...` *)

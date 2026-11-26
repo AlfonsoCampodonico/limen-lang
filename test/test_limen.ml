@@ -3571,6 +3571,10 @@ fn main(root: Root) {
     let parts = [1, 2].map(|x| x + 1)
     out.print(fetch(Client { net: root.net, name: "x" }, parts.len()))
 }
+
+fn bump(mut m: Int) {
+    m = m + 1
+}
 |}
   in
   ignore (Lsp.handle st (note "textDocument/didOpen" (J.Obj [ ("textDocument", J.Obj [ ("uri", J.String sem_uri); ("text", J.String sem_doc) ]) ])));
@@ -3626,6 +3630,9 @@ fn main(root: Root) {
   sem_case "print" "print:method";
   sem_case ~nth:2 "net" "net:property.capability";
   sem_case ~nth:3 "net" "net:property.capability";
+  (* a `mut` parameter may be assigned: mutable, not readonly *)
+  sem_case "m" "m:parameter.declaration.mutable";
+  sem_case ~nth:2 "m" "m:parameter.mutable";
   (* the range request gives the tokens of those lines only, positions from the document's start *)
   let range_toks =
     sem_request "textDocument/semanticTokens/range"
@@ -3633,6 +3640,38 @@ fn main(root: Root) {
   in
   ok "lsp-semantic-range" (List.map (fun (t, _, _) -> t) range_toks = [ "out"; "root"; "stdout" ])
     (String.concat " " (List.map show_tok range_toks));
+  (* mut parameters: the hover shows the marker, and the E0213 fix inserts it *)
+  let mut_uri = "file:///tmp/lsp-mut.lmn" in
+  let mut_doc = "fn bump(mut n: Int) {\n    n = n + 1\n}\n\nfn main(root: Root) {\n    let mut k = 0\n    bump(k)\n    root.stdout.print(\"{k}\")\n}\n" in
+  ignore (Lsp.handle st (note "textDocument/didOpen" (J.Obj [ ("textDocument", J.Obj [ ("uri", J.String mut_uri); ("text", J.String mut_doc) ]) ])));
+  let mut_pos needle k =
+    let l, c = at mut_doc needle k in
+    (l, c)
+  in
+  let hl, hc = mut_pos "bump(k)" 0 in
+  let mut_hover =
+    J.to_str
+      (J.path
+         (result (Lsp.handle st (req "textDocument/hover" (J.Obj [ ("textDocument", J.Obj [ ("uri", J.String mut_uri) ]); ("position", J.Obj [ ("line", J.Int hl); ("character", J.Int hc) ]) ]))))
+         [ "contents"; "value" ])
+  in
+  ok "lsp-hover-mut" (mut_hover = "```limen\nfn bump(mut n: Int)\n```") mut_hover;
+  let kl, kc = mut_pos "k)" 0 in
+  let mut_actions =
+    result
+      (Lsp.handle st
+         (req "textDocument/codeAction"
+            (J.Obj
+               [ ("textDocument", J.Obj [ ("uri", J.String mut_uri) ]);
+                 ("range", J.Obj [ ("start", J.Obj [ ("line", J.Int kl); ("character", J.Int kc) ]); ("end", J.Obj [ ("line", J.Int kl); ("character", J.Int (kc + 1)) ]) ]);
+                 ("context", J.Obj [ ("diagnostics", J.List []) ]) ])))
+  in
+  let mut_text =
+    match mut_actions with
+    | J.List [ a ] -> ( match J.path a [ "edit"; "changes"; mut_uri ] with J.List [ e ] -> J.to_str (J.member "newText" e) | _ -> "")
+    | _ -> ""
+  in
+  ok "lsp-quickfix-mut" (mut_text = "mut ") (J.to_string mut_actions);
   ok "lsp-unknown-method" (match Lsp.handle st (req "workspace/symbol" (J.Obj [])) with [ m ] -> J.member "error" m <> J.Null | _ -> false) "error";
   ok "lsp-shutdown" (Lsp.handle st (req "shutdown" J.Null) <> [] && st.Lsp.shutdown) "shutdown";
   ok "json-roundtrip"
@@ -10395,6 +10434,8 @@ fn main(root: Root) {
     "// Geometry helpers.\n//\n// Second paragraph.\n\n// A point.\npub struct Point {\n    // Distance from the left.\n    x: Float,\n    y: Float,\n}\n\n// not a doc: a blank line follows\n\n// How far from the origin.\npub fn norm(self: Point) -> Float {\n    self.x\n}\n\npub enum Shape {\n    // A round one.\n    Circle(Float),\n    Dot,\n}\n\n// Things with an area.\npub interface Area {\n    // The area, in square units.\n    fn area(self) -> Float\n}\n\n// Shouts.\npub fn loud(self: Str) -> Str {\n    self.upper()\n}\n\n// Private.\nfn hidden() -> Int {\n    1\n}\n\npub fn pick[T: Area](xs: List[T], i: Int) -> T {\n    xs[i]\n}\n"
   in
   let md = Doc.load_source "geom" "geom.lmn" doc_src in
+  let mutmd = Doc.markdown [ Doc.load_source "m" "m.lmn" "pub fn bump(mut n: Int) {\n    n = n + 1\n}\n" ] in
+  ok "doc-mut" (Interp_util.find_sub mutmd "fn bump(mut n: Int)" 0 <> None) mutmd;
   let mdtext = Doc.markdown [ md ] in
   let has s = Interp_util.find_sub mdtext s 0 <> None in
   ok "doc-markdown"

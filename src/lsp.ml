@@ -155,7 +155,7 @@ let fn_signature text (d : fn_decl) =
   let gens = Doc.generics ~text d.fn_gen d.fn_bounds in
   let ps =
     List.map
-      (fun p -> p.prm_name ^ ": " ^ slice text p.prm_ty.tspan ^ match p.prm_default with Some e -> " = " ^ slice text e.espan | None -> "")
+      (fun p -> (if p.prm_mut then "mut " else "") ^ p.prm_name ^ ": " ^ slice text p.prm_ty.tspan ^ match p.prm_default with Some e -> " = " ^ slice text e.espan | None -> "")
       d.fn_params
   in
   (* a variadic foreign function's `...` *)
@@ -589,6 +589,7 @@ let semantic_tokens path text (items : item list) (occs : Refs.occ list) =
         List.iter
           (fun p ->
             Hashtbl.replace params (local p.prm_span) ();
+            if p.prm_mut then Hashtbl.replace mutables (local p.prm_span) ();
             if te_holds p.prm_ty then Hashtbl.replace caps (local p.prm_span) ();
             tys p.prm_ty)
           d.fn_params;
