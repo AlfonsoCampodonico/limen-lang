@@ -159,13 +159,26 @@ happens here.
 Done when the review's findings are fixed and nothing on the list of
 breaking changes is still open.
 
-## 0.8.x or 0.9: `mut` parameters
+## 0.8.x or 0.9: `mut` parameters (done)
 
-Stateful code threads state by hand today, as the self-hosted compiler shows.
-A `mut` parameter would let a function change its caller's value without a
-stored reference. The design doc has the options and the open questions; the
-rewrite of the self-hosted compiler to use it is the proof that it is worth
-having.
+A function changes its caller's value through a `mut` parameter, without a
+stored reference: `fn roll(mut seed: Int) -> Int` is called `roll(mut seed)`,
+and a `mut self` method is called `buf.add(1)`, as `push` is. The argument is
+a place whose root is `mut`, of exactly the parameter's type, and a `mut`
+parameter takes no default. Three new errors: E0213 when an argument's `mut`
+does not match its parameter (with a fix), E0214 when the `mut` places of one
+call overlap or another argument changes one of them, and E0215 when a
+function with a `mut` parameter is used as a value. Both compilers check it,
+and both backends run it: the interpreter passes the caller's variable, or
+a cell it writes back to a field or element however the call ends, and the C
+backend a pointer to the caller's place, so a value held once is still
+changed in place. Limen still never gets references that can be stored:
+storing, returning, capturing or sending a `mut` parameter takes a copy. Not
+yet: `mut` parameters in interface methods, foreign functions and function
+types (SPEC.md section 20).
+
+The self-hosted compiler is being rewritten to thread its state through `mut`
+parameters, the proof that they are enough.
 
 ## 0.9: installing and sharing
 
