@@ -12,7 +12,7 @@ then harden it, then promise not to break it.
 This file is the plan. The design doc keeps the reasons and the history of
 what was done; its older lists of what was missing point here.
 
-Updated 2026-11-26, with 0.8 built and not yet released.
+Updated 2026-11-26, after 0.8.0.
 
 ## 0.4: a server you can leave running (done, 0.4.0)
 
@@ -103,7 +103,7 @@ Done when a crash in a native build shows the Limen line that caused it
 Done when a program can read a gzipped log larger than memory, line by
 line, and write rows to Postgres.
 
-## 0.8: hardening, and the breaking decisions
+## 0.8: hardening, and the breaking decisions (done, 0.8.0, without the outside review)
 
 The items marked done below shipped early, in 0.7.3 and 0.7.4.
 
@@ -162,7 +162,8 @@ happens here.
   side files and a moved database; the one case left needs write access
   outside the grant, which the OS sandbox refuses, so no VFS).
 - An outside security review of the sandbox and the capability checks.
-  Two reviews in two days found ten holes, so there are more.
+  Two reviews in two days found ten holes, so there are more. Not done: 0.8.0
+  shipped without it, and it moves to 0.9.
 
 Done when the review's findings are fixed and nothing on the list of
 breaking changes is still open.
@@ -193,6 +194,8 @@ the loader. The parser and lexer keep threading their state by design.
 
 ## 0.9: installing and sharing
 
+- The outside security review of the sandbox and the capability checks,
+  carried over from 0.8.
 - A signed apt repository, so `apt upgrade` updates Limen.
 - Homebrew core, and Intel Macs.
 - One release script: build all three, write `SHA256SUMS`, upload, bump the
