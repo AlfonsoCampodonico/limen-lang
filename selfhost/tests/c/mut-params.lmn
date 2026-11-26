@@ -2,9 +2,9 @@
 // fields, list elements and map entries, a plain argument naming the list
 // a `mut` element comes from, a panic through a variable root and a path,
 // and a callee that keeps a copy of the list it changes in a loop; and
-// operands, literal parts, interpolations, receivers, indexes and range
-// bounds read as written when a later one changes them, through a `mut`
-// argument or an assignment
+// operands, literal parts, interpolations, receivers, indexes, range
+// bounds, select operands and a called closure read as written when a
+// later one changes them, through a `mut` argument or an assignment
 struct Buf {
     items: List[Int],
 }
@@ -49,6 +49,11 @@ fn addget(mut xs: List[Int]) -> Int {
     42
 }
 
+fn setf(mut g: fn(Int) -> Int) -> Int {
+    g = |x: Int| x * 100
+    1
+}
+
 fn order(out: Stdout) {
     let mut k = 1
     out.print("{k} {next(mut k)}")
@@ -84,6 +89,14 @@ fn order(out: Stdout) {
         2
     }]
     out.print("{n} {s} {zs}")
+    let c: Chan[Int] = channel(1)
+    k = 1
+    let r = select {
+        c.send(k) => 1,
+        c.send(next(mut k)) => 2,
+    }
+    let mut f = |x: Int| x + 1
+    out.print("{r} {c.recv()} {f(setf(mut f))} {f(1)}")
 }
 
 fn basic(out: Stdout) {

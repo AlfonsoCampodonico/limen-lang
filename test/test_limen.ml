@@ -11918,7 +11918,7 @@ fn main(root: Root) {
    out "call-arg-snapshot" "fn pl(a: Int, b: Int) -> Int {\n    a * 10 + b\n}\n\nfn both(xs: List[Int], n: Int) -> Str {\n    \"{xs} {n}\"\n}\n\nfn main(root: Root) {\n    let out = root.stdout\n    let mut i = 1\n    let r = pl(i, {\n        i = 3\n        1\n    })\n    let mut xs = [1]\n    let s = both(xs, {\n        xs.push(2)\n        xs.len()\n    })\n    let f = |a: Int, b: Int| a * 10 + b\n    let mut k = 1\n    let t = f(k, {\n        k = 2\n        2\n    })\n    out.print(\"{r} {i} {s} {xs} {t}\")\n}\n" "11 3 [1] 2 [1, 2] 12\n");
    (* natively too, an operand or a part of a literal is the value it had
       where it is written when a later one changes it *)
-   (let decls = "struct P {\n    a: Int,\n    b: Int,\n}\n\nfn bump(mut n: Int) -> Int {\n    n = n + 1\n    n\n}\n\nfn addget(mut xs: List[Int]) -> Int {\n    xs.push(42)\n    42\n}\n\nfn pl(mut xs: List[Int]) -> Int {\n    xs.push(9)\n    0\n}\n\n" in
+   (let decls = "struct P {\n    a: Int,\n    b: Int,\n}\n\nfn bump(mut n: Int) -> Int {\n    n = n + 1\n    n\n}\n\nfn addget(mut xs: List[Int]) -> Int {\n    xs.push(42)\n    42\n}\n\nfn pl(mut xs: List[Int]) -> Int {\n    xs.push(9)\n    0\n}\n\nfn setf(mut g: fn(Int) -> Int) -> Int {\n    g = |x: Int| x * 100\n    1\n}\n\n" in
     let order name body want = out name (decls ^ "fn main(root: Root) {\n    let out = root.stdout\n" ^ body ^ "\n}\n") want in
     order "order-interp" "    let mut k = 1\n    out.print(\"{k} {bump(mut k)}\")" "1 2\n";
     order "order-list" "    let mut k = 1\n    out.print(\"{[k, bump(mut k)]}\")" "[1, 2]\n";
@@ -11931,6 +11931,8 @@ fn main(root: Root) {
     order "order-index" "    let xs = [10, 20, 30]\n    let mut j = 0\n    let ys = [[1, 2], [3, 4]]\n    let mut i = 0\n    out.print(\"{xs[j] + bump(mut j)} {ys[i][bump(mut i)]}\")" "11 2\n";
     order "order-range" "    let mut k = 1\n    let mut c = 0\n    for _ in k..<bump(mut k) {\n        c = c + 1\n    }\n    out.print(\"{c}\")" "1\n";
     order "order-assign-binop" "    let mut i = 1\n    let n = i + {\n        i = 3\n        1\n    }\n    out.print(\"{n} {i}\")" "2 3\n";
+    order "order-select-send" "    let c: Chan[Int] = channel(1)\n    let mut k = 1\n    let r = select {\n        c.send(k) => 1,\n        c.send(bump(mut k)) => 2,\n    }\n    out.print(\"{r} {c.recv()} {k}\")" "1 Some(1) 2\n";
+    order "order-closure-callee" "    let mut f = |x: Int| x + 1\n    out.print(\"{f(setf(mut f))} {f(1)}\")" "2 100\n";
     order "order-assign-list" "    let mut k = 1\n    let xs = [k, {\n        k = 5\n        2\n    }]\n    out.print(\"{xs} {k}\")" "[1, 2] 5\n");
 
   drain ();

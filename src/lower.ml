@@ -526,7 +526,7 @@ and lower_call f e callee args ty =
     let xs = lower_args f args in
     tmp f ty (I.MkEnum (ty, tag_of f.g ty v, xs))
   | _ ->
-    let c = lower f callee in
+    let c = lower_arg f callee args in
     let xs = lower_args f args in
     tmp f ty (I.CallClo (c, xs))
 
@@ -779,25 +779,36 @@ and lower_match f e s arms ty =
 and lower_select f e arms ty =
   f.g.counter <- f.g.counter + 1;
   let id = f.g.counter in
-  (* channels and send values first, in order *)
-  let ops =
-    List.filter_map
-      (fun a ->
-        let on = match a.sguard with Some g -> lower f g | None -> I.ABool true in
+  (* channels and send values first, in order, each arm's guard before
+     them; a variable a later one changes is copied where it is written *)
+  let parts a =
+    (match a.sguard with Some g -> [ g ] | None -> [])
+    @ match a.sop with SelRecv (_, ch) -> [ ch ] | SelSend (ch, v) -> [ ch; v ] | SelAfter (clk, ms) -> [ clk; ms ] | SelDefault -> []
+  in
+  let rec go = function
+    | [] -> []
+    | a :: rest ->
+      let later = List.concat_map parts rest in
+      let on = match a.sguard with Some g -> lower f g | None -> I.ABool true in
+      let op =
         match a.sop with
         | SelRecv (_, ch) ->
           let el = match tyof f ch with TChan t -> t | _ -> TUnit in
-          Some (I.SRecv (lower f ch, el, on))
+          Some (I.SRecv (lower_arg f ch later, el, on))
         | SelSend (ch, v) ->
           let el = match tyof f ch with TChan t -> t | _ -> TUnit in
-          let ca = lower f ch in
-          Some (I.SSend (ca, lower f v, el, on))
+          let ca = lower_arg f ch (v :: later) in
+          let va = lower_arg f v later in
+          Some (I.SSend (ca, va, el, on))
         | SelAfter (clk, ms) ->
-          let ca = lower f clk in
-          Some (I.SAfter (ca, lower f ms, on))
-        | SelDefault -> None)
-      arms
+          let ca = lower_arg f clk (ms :: later) in
+          let ma = lower_arg f ms later in
+          Some (I.SAfter (ca, ma, on))
+        | SelDefault -> None
+      in
+      (match op with Some o -> [ o ] | None -> []) @ go rest
   in
+  let ops = go arms in
   let has_default = List.exists (fun a -> a.sop = SelDefault) arms in
   let k = tmp f TInt (I.Select (id, ops, has_default, e.espan)) in
   let r = fresh_var "s" ty in

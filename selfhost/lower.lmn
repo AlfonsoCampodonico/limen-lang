@@ -1076,7 +1076,7 @@ fn assigns(n: Str, b: ast.Block) -> Bool {
 
 // A call of a closure value.
 fn call_value(mut self: Lx, callee: ast.Expr, args: List[ast.Expr], ty: types.Ty) -> ir.Atom {
-    let c = self.lower(callee)
+    let c = self.lower_arg(callee, args)
     let xs = self.lower_args(args)
     self.tmp(ty, CallClo(c, xs))
 }
@@ -1386,9 +1386,14 @@ fn chan_elem(t: types.Ty) -> types.Ty {
 fn lower_select(mut self: Lx, e: ast.Expr, arms: List[ast.SelArm], ty: types.Ty) -> ir.Atom {
     self.counter = self.counter + 1
     let id = self.counter
-    // channels and send values first, in order
+    // channels and send values first, in order, each arm's guard before
+    // them; a variable a later one changes is copied where it is written
     let mut ops: List[ir.Sel] = []
-    for a in arms {
+    for (i, a) in arms.with_index() {
+        let mut later: List[ast.Expr] = []
+        for b in arms.skip(i + 1) {
+            later = later + sel_parts(b)
+        }
         let on = match a.guard {
             Some(g) => {
                 let x = self.lower(g)
@@ -1399,18 +1404,18 @@ fn lower_select(mut self: Lx, e: ast.Expr, arms: List[ast.SelArm], ty: types.Ty)
         match a.op {
             SelRecv(_, ch) => {
                 let el = chan_elem(self.tyof(ch))
-                let c = self.lower(ch)
+                let c = self.lower_arg(ch, later)
                 ops.push(SRecv(c, el, on))
             },
             SelSend(ch, v) => {
                 let el = chan_elem(self.tyof(ch))
-                let c = self.lower(ch)
-                let x = self.lower(v)
+                let c = self.lower_arg(ch, [v] + later)
+                let x = self.lower_arg(v, later)
                 ops.push(SSend(c, x, el, on))
             },
             SelAfter(clk, ms) => {
-                let c = self.lower(clk)
-                let m = self.lower(ms)
+                let c = self.lower_arg(clk, [ms] + later)
+                let m = self.lower_arg(ms, later)
                 ops.push(SAfter(c, m, on))
             },
             SelDefault => {},
@@ -1433,6 +1438,21 @@ fn lower_select(mut self: Lx, e: ast.Expr, arms: List[ast.SelArm], ty: types.Ty)
     }
     self.select_chain(e, id, k, r, numbered)
     V(r)
+}
+
+// The expressions of a `select` arm, in the order they are evaluated:
+// its guard, then its channel and value, or clock and milliseconds.
+fn sel_parts(a: ast.SelArm) -> List[ast.Expr] {
+    let g = match a.guard {
+        Some(g) => [g],
+        None => [],
+    }
+    g + match a.op {
+        SelRecv(_, ch) => [ch],
+        SelSend(ch, v) => [ch, v],
+        SelAfter(clk, ms) => [clk, ms],
+        SelDefault => [],
+    }
 }
 
 fn is_default(op: ast.SelOp) -> Bool {
