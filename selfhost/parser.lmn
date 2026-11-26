@@ -1788,7 +1788,9 @@ pub fn parse(src: Str) -> Result[ast.File, ParseError] {
 // `first_id` on; returns the tree and the next free id.
 pub fn parse_file(src: Str, file: Int, first_id: Int) -> Result[(ast.File, Int), ParseError] {
     let f = parse_tokens(src, file)?
-    Ok(ids.file(f, first_id))
+    let mut next = first_id
+    let f = ids.file(f, mut next)
+    Ok((f, next))
 }
 
 fn parse_tokens(src: Str, file: Int) -> Result[ast.File, ParseError] {
