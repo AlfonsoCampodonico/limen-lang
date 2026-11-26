@@ -7387,8 +7387,11 @@ fn main(root: Root) {
 |} "deferred 500 [2, 4, 6]\n[None, None, None, None, None, None, None, None, Some(3)]\n[Some(4)]\n[0, 1] 500 true\n";
   (* Cancellation inside a sort: the sort checks as it merges (the
      interpreter's as it compares), so a sort far longer than the deadline
-     does not run to the end. No checkpoint follows the sort in the first
-     task, so only a check inside it leaves the task without a result. *)
+     stops part way. Each sort runs in a group's body, which starts at once
+     in both backends, under a 5 ms deadline: a 3-million-element sort takes
+     far longer anywhere. Only a check inside the sort stops it before `done`
+     is set; without one the sort finishes and the next checkpoint stops the
+     body after it. The wall-clock bound is only a backstop. *)
   out "sort-cancel" {|fn main(root: Root) {
     let out = root.stdout
     let clock = root.clock
@@ -7399,32 +7402,37 @@ fn main(root: Root) {
         i = i + 1
     }
     let start = clock.now_ms()
-    let one = group g until clock.after(50) {
-        g.go(|| xs.sort().len())
+    let one = group g until clock.after(5) {
+        let mut done = false
+        defer { out.print("sort {done}") }
+        let ys = xs.sort()
+        done = true
+        g.go(|| ys.len())
     }
-    let keyed = group g until clock.after(50) {
-        g.go(|| xs.sort_by(|x| 0 - x).len())
+    let keyed = group g until clock.after(5) {
+        let mut done = false
+        defer { out.print("sort_by {done}") }
+        let ys = xs.sort_by(|x| 0 - x)
+        done = true
+        g.go(|| ys.len())
     }
-    // sorts in a loop: the group ends near the deadline, not after all of them
-    let many = group g until clock.after(50) {
-        g.go(|| {
-            let mut k = 0
-            let mut s = 0
-            while k < 100 {
-                s = s + xs.sort()[k]
-                k = k + 1
-            }
-            s
-        })
+    // sorts in a loop: it stops inside the first, not after it
+    let many = group g until clock.after(5) {
+        let mut k = 0
+        defer { out.print("sorts done {k}") }
+        let mut s = 0
+        while k < 100 {
+            s = s + xs.sort()[k]
+            k = k + 1
+        }
+        g.go(|| s)
     }
-    out.print("{one} {keyed} {many} {clock.now_ms() - start < 2000}")
+    out.print("{one} {keyed} {many} {clock.now_ms() - start < 10000}")
 }
-|} "[None] [None] [None] true\n";
-  (* A cancelled sort leaves the list as it was: the caller's, after a task
-     sorting its copy is cancelled, and the copy itself, which a defer sees
-     as the cancellation unwinds a group's body (a body starts at once,
-     where a task might start only after the deadline). In this order a
-     sort takes several times the deadline, even natively. *)
+|} "sort false\nsort_by false\nsorts done 0\n[] [] [] true\n";
+  (* A cancelled sort leaves the list as it was: the copy being sorted,
+     which a defer sees as the cancellation unwinds the group's body, and
+     the caller's, after a task sorting its own copy is cancelled. *)
   out "sort-cancel-keeps" {|fn main(root: Root) {
     let out = root.stdout
     let clock = root.clock
@@ -7435,7 +7443,16 @@ fn main(root: Root) {
         i = i + 1
     }
     out.print("{xs.take(3)} {xs.len()}")
-    let r = group g until clock.after(50) {
+    let b = group g until clock.after(5) {
+        let mut ys = xs
+        let mut done = false
+        defer { out.print("deferred {done} {ys.take(3)} {ys.len()}") }
+        ys = ys.sort()
+        done = true
+        g.go(|| ys.len())
+    }
+    out.print("{b} {xs.take(3)} {xs.len()}")
+    let r = group g until clock.after(5) {
         g.go(|| {
             let mut ys = xs
             ys = ys.sort()
@@ -7443,36 +7460,30 @@ fn main(root: Root) {
         })
     }
     out.print("{r} {xs.take(3)} {xs.len()}")
-    let b = group g until clock.after(50) {
-        let mut ys = xs
-        defer { out.print("deferred {ys.take(3)} {ys.len()}") }
-        ys = ys.sort()
-        g.go(|| ys.len())
-    }
-    out.print("{b} {xs.take(3)} {xs.len()}")
 }
-|} "[0, 7919, 15838] 3000000\n[None] [0, 7919, 15838] 3000000\ndeferred [0, 7919, 15838] 3000000\n[] [0, 7919, 15838] 3000000\n";
+|} "[0, 7919, 15838] 3000000\ndeferred false [0, 7919, 15838] 3000000\n[] [0, 7919, 15838] 3000000\n[None] [0, 7919, 15838] 3000000\n";
   (* Cancellation inside a fill loop: the fast path (reserve once, then a
-     store loop) checks between chunks, so 200 million pushes stop near the
-     deadline and the task has no result. *)
+     store loop) checks between chunks, so 50 million pushes stop part way,
+     with the list's length and the counter in step for the defer. *)
   out "fill-cancel" {|fn main(root: Root) {
     let out = root.stdout
     let clock = root.clock
     let start = clock.now_ms()
-    let r = group g until clock.after(50) {
-        g.go(|| {
-            let mut xs: List[Int] = []
-            let mut i = 0
-            while i < 200000000 {
-                xs.push(7)
-                i = i + 1
-            }
-            xs.len()
-        })
+    let r = group g until clock.after(5) {
+        let mut xs: List[Int] = []
+        let mut i = 0
+        let mut done = false
+        defer { out.print("{done} {xs.len() == i}") }
+        while i < 50000000 {
+            xs.push(7)
+            i = i + 1
+        }
+        done = true
+        g.go(|| xs.len())
     }
-    out.print("{r} {clock.now_ms() - start < 2000}")
+    out.print("{r} {clock.now_ms() - start < 10000}")
 }
-|} "[None] true\n";
+|} "false true\n[] true\n";
   (* ---------- shared state: Atomic and Shared ---------- *)
   (* Many tasks on one Atomic and one Shared: every update counts. A Shared
      map updated by every task ends with every entry; a snapshot does not

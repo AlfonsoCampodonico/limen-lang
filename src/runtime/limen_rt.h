@@ -512,7 +512,12 @@ static inline void w_raw_drop(void *p) { free(*(void **)p); }
         if ((++merges & 4095) == 0) W_CHECK();                                                \
         int64_t mid = lo + w < n ? lo + w : n, hi = lo + 2 * w < n ? lo + 2 * w : n;          \
         int64_t i = lo, j = mid, k = lo;                                                      \
-        while (i < mid && j < hi) b[k++] = P##_cmp(a[j], a[i]) < 0 ? a[j++] : a[i++];         \
+        /* a branch, not a select: a select makes each step wait for the     \
+           last comparison's loads, which is slow when elements are pointers */ \
+        while (i < mid && j < hi) {                                                           \
+          if (P##_cmp(a[j], a[i]) < 0) b[k++] = a[j++];                                       \
+          else b[k++] = a[i++];                                                               \
+        }                                                                                     \
         while (i < mid) b[k++] = a[i++];                                                      \
         while (j < hi) b[k++] = a[j++];                                                       \
       }                                                                                       \
