@@ -11916,6 +11916,22 @@ fn main(root: Root) {
    panics "mut-native-key-first" (decls ^ main_wrap "    let mut m = map([(\"a\", 1)])\n    setp(mut m[\"b\"], side(out, \"later\", 1))") "key \"b\" is not in the map";
    (* native bug fix: a variable argument is the value it had where it is written *)
    out "call-arg-snapshot" "fn pl(a: Int, b: Int) -> Int {\n    a * 10 + b\n}\n\nfn both(xs: List[Int], n: Int) -> Str {\n    \"{xs} {n}\"\n}\n\nfn main(root: Root) {\n    let out = root.stdout\n    let mut i = 1\n    let r = pl(i, {\n        i = 3\n        1\n    })\n    let mut xs = [1]\n    let s = both(xs, {\n        xs.push(2)\n        xs.len()\n    })\n    let f = |a: Int, b: Int| a * 10 + b\n    let mut k = 1\n    let t = f(k, {\n        k = 2\n        2\n    })\n    out.print(\"{r} {i} {s} {xs} {t}\")\n}\n" "11 3 [1] 2 [1, 2] 12\n");
+   (* natively too, an operand or a part of a literal is the value it had
+      where it is written when a later one changes it *)
+   (let decls = "struct P {\n    a: Int,\n    b: Int,\n}\n\nfn bump(mut n: Int) -> Int {\n    n = n + 1\n    n\n}\n\nfn addget(mut xs: List[Int]) -> Int {\n    xs.push(42)\n    42\n}\n\nfn pl(mut xs: List[Int]) -> Int {\n    xs.push(9)\n    0\n}\n\n" in
+    let order name body want = out name (decls ^ "fn main(root: Root) {\n    let out = root.stdout\n" ^ body ^ "\n}\n") want in
+    order "order-interp" "    let mut k = 1\n    out.print(\"{k} {bump(mut k)}\")" "1 2\n";
+    order "order-list" "    let mut k = 1\n    out.print(\"{[k, bump(mut k)]}\")" "[1, 2]\n";
+    order "order-tuple" "    let mut k = 1\n    out.print(\"{(k, bump(mut k))}\")" "(1, 2)\n";
+    order "order-struct" "    let mut k = 1\n    let p = P { a: k, b: bump(mut k) }\n    out.print(\"{p.a} {p.b}\")" "1 2\n";
+    order "order-eq" "    let mut k = 1\n    let c = k == bump(mut k)\n    out.print(\"{c}\")" "false\n";
+    order "order-contains" "    let mut xs = [1]\n    out.print(\"{xs.contains(addget(mut xs))} {xs}\")" "false [1, 42]\n";
+    order "order-max" "    let mut k = 1\n    out.print(\"{k.max(bump(mut k) - 5)}\")" "1\n";
+    order "order-nested-list" "    let mut xs = [1]\n    out.print(\"{[xs, [pl(mut xs)]]}\")" "[[1], [0]]\n";
+    order "order-index" "    let xs = [10, 20, 30]\n    let mut j = 0\n    let ys = [[1, 2], [3, 4]]\n    let mut i = 0\n    out.print(\"{xs[j] + bump(mut j)} {ys[i][bump(mut i)]}\")" "11 2\n";
+    order "order-range" "    let mut k = 1\n    let mut c = 0\n    for _ in k..<bump(mut k) {\n        c = c + 1\n    }\n    out.print(\"{c}\")" "1\n";
+    order "order-assign-binop" "    let mut i = 1\n    let n = i + {\n        i = 3\n        1\n    }\n    out.print(\"{n} {i}\")" "2 3\n";
+    order "order-assign-list" "    let mut k = 1\n    let xs = [k, {\n        k = 5\n        2\n    }]\n    out.print(\"{xs} {k}\")" "[1, 2] 5\n");
 
   drain ();
   Printf.printf "%d/%d passed\n" (!total - !failed) !total;

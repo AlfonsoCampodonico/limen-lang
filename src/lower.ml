@@ -259,19 +259,18 @@ let rec lower f (e : expr) : I.atom =
     | EStr [] -> I.AStr ""
     | EStr [ SPLit s ] -> I.AStr s
     | EStr parts ->
-      let ps =
-        List.map
-          (function
-            | SPLit s -> I.IStr s
-            | SPExpr x ->
-              let a = lower f x in
-              I.IVal (a, tyof f x))
-          parts
+      let rec go = function
+        | [] -> []
+        | SPLit s :: rest -> I.IStr s :: go rest
+        | SPExpr x :: rest ->
+          let a = lower_arg f x (List.filter_map (function SPExpr y -> Some y | SPLit _ -> None) rest) in
+          let p = I.IVal (a, tyof f x) in
+          p :: go rest
       in
-      tmp f TStr (I.Interp ps)
+      tmp f TStr (I.Interp (go parts))
     | EVar n -> ( match lookup f n with Some v -> I.V v | None -> global_value f e n ty)
     | EList es ->
-      let xs = List.map (lower f) es in
+      let xs = lower_args f es in
       tmp f ty (I.MkList (ty, xs))
     | EBin (((And | Or) as op), a, b) ->
       let x = lower f a in
@@ -297,11 +296,11 @@ let rec lower f (e : expr) : I.atom =
       emit f (I.If (has, some_b, none_b));
       I.V r
     | EBin (Range, a, b) ->
-      let x = lower f a in
+      let x = lower_arg f a [ b ] in
       let y = lower f b in
       tmp f ty (I.Prim ("int_range", TInt, [ x; y ], e.espan))
     | EBin (op, a, b) ->
-      let x = lower f a in
+      let x = lower_arg f a [ b ] in
       let y = lower f b in
       tmp f ty (I.Bin (op, tyof f a, x, y, e.espan))
     | EUn (Neg, a) ->
@@ -320,7 +319,7 @@ let rec lower f (e : expr) : I.atom =
     | ENamed _ -> failwith "internal: the checker puts named arguments in order"
     | EMut _ -> failwith "internal: a mut argument outside a call"
     | EMethod ({ edesc = EVar en; _ }, name, _, args) when is_enum_name f en ->
-      let xs = List.map (lower f) args in
+      let xs = lower_args f args in
       tmp f ty (I.MkEnum (ty, tag_of f.g ty name, xs))
     | EMethod (recv, "remove", _, [ k ]) when (match tyof f recv with TMap _ -> true | _ -> false) ->
       let v, steps = lower_place f recv in
@@ -340,14 +339,14 @@ let rec lower f (e : expr) : I.atom =
       ignore (tmp f TUnit (I.Spawn (g, c, t, keep)));
       I.AUnit
     | EMethod (recv, "send", _, [ v ]) when (match tyof f recv with TChan _ -> true | _ -> false) ->
-      let c = lower f recv in
+      let c = lower_arg f recv [ v ] in
       let x = lower f v in
       ignore (tmp f TUnit (I.ChanSend (c, x, e.espan)));
       I.AUnit
     | EMethod (recv, name, _, args) -> lower_method f e recv name args ty
     | EField ({ edesc = EVar en; _ }, name, _) when is_enum_name f en -> ctor_value f name ty
     | EField _ | EIndex _ -> (
-      let root, rty, steps = access f e in
+      let root, rty, steps = access f e [] in
       match steps with [] -> root | _ -> tmp f ty (I.Get (root, rty, steps)))
     | ETry (x, c) -> lower_try f x c
     | EIf (c, b, els) ->
@@ -401,17 +400,19 @@ let rec lower f (e : expr) : I.atom =
          not used afterwards it is moved, so its storage is reused and the
          unchanged fields are not touched; otherwise the ownership pass
          retains it (a copy) first. A plain variable is read after the new
-         values, so `p = { p with x: p.x + 1 }` still moves `p`. *)
+         values, so `p = { p with x: p.x + 1 }` still moves `p`, as the
+         specification says. *)
       let bt = tyof f base in
+      let xs = List.map (fun (_, _, x) -> x) fields in
       let early = match base.edesc with EVar _ -> None | _ -> Some (lower f base) in
-      let vals = List.map (fun (fname, _, x) -> (field_index f.g bt fname, lower f x)) fields in
+      let vals = List.combine (List.map (fun (fname, _, _) -> field_index f.g bt fname) fields) (lower_args f xs) in
       let b = match early with Some a -> a | None -> lower f base in
       let v = fresh_var "with" bt in
       emit f (I.Let (v, I.Atom b));
       List.iter (fun (k, a) -> emit f (I.Mutate (v, [ I.PField k ], I.MSet a))) vals;
       I.V v
     | EStruct (name, _, fields) ->
-      let vals = List.map (fun (fname, _, x) -> (fname, lower f x)) fields in
+      let vals = List.combine (List.map (fun (fname, _, _) -> fname) fields) (lower_args f (List.map (fun (_, _, x) -> x) fields)) in
       let decl = Hashtbl.find f.g.structs name in
       tmp f ty (I.MkStruct (ty, List.map (fun (fn, _, _) -> List.assoc fn vals) decl.st_fields))
     | EDyn (x, i) ->
@@ -456,8 +457,7 @@ and lower_call f e callee args ty =
     emit f (I.If (c, [], fail));
     I.AUnit
   | EVar "assert_eq" when not_local f "assert_eq" && not (Hashtbl.mem f.g.fns "assert_eq") ->
-    let x = lower f (List.nth args 0) in
-    let y = lower f (List.nth args 1) in
+    let x, y = match lower_args f args with [ x; y ] -> (x, y) | _ -> failwith "assert_eq" in
     let t = tyof f (List.nth args 0) in
     let same = tmp f TBool (I.Bin (Eq, t, x, y, e.espan)) in
     let fail, _, _ =
@@ -485,10 +485,10 @@ and lower_call f e callee args ty =
     let x = lower f (List.hd args) in
     tmp f TUnit (I.Prim ("keep", tyof f (List.hd args), [ x ], e.espan))
   | EVar "bytes" when not_local f "bytes" && not (Hashtbl.mem f.g.fns "bytes") ->
-    let xs = List.map (lower f) args in
+    let xs = lower_args f args in
     tmp f ty (I.Prim ("bytes_new", TBytes, xs, e.espan))
   | EVar "map" when not_local f "map" && not (Hashtbl.mem f.g.fns "map") ->
-    let xs = List.map (lower f) args in
+    let xs = lower_args f args in
     tmp f ty (I.Prim ((if xs = [] then "map_new" else "map_from"), ty, xs, e.espan))
   | EVar "panic" when not_local f "panic" && not (Hashtbl.mem f.g.fns "panic") ->
     let m = lower f (List.hd args) in
@@ -504,15 +504,16 @@ and lower_call f e callee args ty =
     (* a callback is a top-level function (the checker made sure): C calls
        its compiled code through a wrapper, so it is not lowered as a value *)
     let kinds = (if cs.trusted then [] else [ Ffi.Unit ]) @ List.filter_map (fun (p : Ffi.param) -> if p.out then None else Some p.cty) cs.params in
-    let xs, cbs =
+    let xs, cbs, _ =
       List.fold_left2
-        (fun (xs, cbs) (a : expr) k ->
+        (fun (xs, cbs, rest) (a : expr) k ->
+          let rest = List.tl rest in
           match (k, a.edesc) with
           | Ffi.Fn (ps, _), EVar m ->
             let d = Hashtbl.find f.g.fns m in
-            (xs, cbs @ [ (instance f.g m [], m, d.fn_span, List.length d.fn_params > List.length ps) ])
-          | _ -> (xs @ [ lower f a ], cbs))
-        ([], []) args kinds
+            (xs, cbs @ [ (instance f.g m [], m, d.fn_span, List.length d.fn_params > List.length ps) ], rest)
+          | _ -> (xs @ [ lower_arg f a rest ], cbs, rest))
+        ([], [], args) args kinds
     in
     tmp f ty (I.CallC (cs, xs, cbs, e.espan))
   | EVar n when not_local f n && Hashtbl.mem f.g.fns n ->
@@ -529,9 +530,11 @@ and lower_call f e callee args ty =
     let xs = lower_args f args in
     tmp f ty (I.CallClo (c, xs))
 
-(* The arguments of a call, left to right. A variable argument that a
-   later argument changes is copied where it is written, so the call is
-   given the value it had there. *)
+(* Sibling expressions whose values are used together (the arguments of a
+   call, the operands of an operator, the parts of a literal or of a string
+   with interpolations, a receiver and its arguments), left to right. A
+   variable that a later sibling changes is copied where it is written, so
+   it is used with the value it had there; any other is read in place. *)
 and lower_args f args =
   let rec go = function
     | [] -> []
@@ -586,30 +589,32 @@ and mut_arg f p =
    | None -> ());
   I.ByPlace (v, steps)
 
-(* A chain of field and index reads, so `a[i].x` is one Get, not two copies. *)
-and access f e : I.atom * ty * I.step list =
+(* A chain of field and index reads, so `a[i].x` is one Get, not two
+   copies. [later] are the indexes after [e] in the chain: a variable they
+   change is copied where it is read, as for siblings. *)
+and access f e later : I.atom * ty * I.step list =
   match e.edesc with
   | EField (r, name, _) when is_struct f.g (tyof f r) ->
-    let a, rt, steps = access f r in
+    let a, rt, steps = access f r later in
     (a, rt, steps @ [ I.PField (field_index f.g (tyof f r) name) ])
   | EIndex (r, i) when tyof f r = TBytes ->
-    let b = lower f r in
-    let ia = lower f i in
+    let b = lower_arg f r (i :: later) in
+    let ia = lower_arg f i later in
     (tmp f TInt (I.Prim ("bytes_at", TBytes, [ b; ia ], e.espan)), TInt, [])
   | EIndex (r, k) when (match tyof f r with TMap _ -> true | _ -> false) ->
     (* a map lookup starts a new path: the value it finds *)
-    let m = lower f r in
-    let ka = lower f k in
+    let m = lower_arg f r (k :: later) in
+    let ka = lower_arg f k later in
     let vt = tyof f e in
     (tmp f vt (I.Prim ("map_at", tyof f r, [ m; ka ], e.espan)), vt, [])
   | EIndex (r, i) ->
-    let a, rt, steps = access f r in
-    let ia = lower f i in
+    let a, rt, steps = access f r (i :: later) in
+    let ia = lower_arg f i later in
     (a, rt, steps @ [ I.PIndex (ia, e.espan) ])
   | EField (r, name, _) when tyof f r = TCap Root ->
     let a = lower f r in
     (tmp f (tyof f e) (I.RootField (a, name)), tyof f e, [])
-  | _ -> (lower f e, tyof f e, [])
+  | _ -> (lower_arg f e later, tyof f e, [])
 
 and lower_place f e : I.var * I.step list =
   match e.edesc with
@@ -947,8 +952,7 @@ and lower_method f e recv name args ty =
     let ms = Check.iface_methods (i, targs) in
     let rec index k = function [] -> failwith "dyn method" | (m, sg) :: rest -> if m = name then (k, sg) else index (k + 1) rest in
     let k, (ps, r) = index 0 ms in
-    let ra = lower f recv in
-    let xs = List.map (lower f) args in
+    let ra, xs = match lower_args f (recv :: args) with ra :: xs -> (ra, xs) | [] -> failwith "dyn method" in
     tmp f ty (I.CallDyn (k, ps, r, ra, xs))
   | (TStr | TNamed ("IoError", _)) when name = "message" ->
     let c = method_fn f rt name [] in
@@ -986,7 +990,7 @@ and lower_method f e recv name args ty =
   | TNamed ("Result", _), "is_ok", [] -> tmp f TBool (I.IsTag (lower f recv, rt, 0))
   | TNamed ("Result", _), "is_err", [] -> tmp f TBool (I.IsTag (lower f recv, rt, 1))
   | TNamed ("Option", [ _ ]), "map", [ fn ] ->
-    let ra = lower f recv in
+    let ra = lower_arg f recv [ fn ] in
     let ca = lower f fn in
     let c = tmp f TBool (I.IsTag (ra, rt, 0)) in
     let r = fresh_var "u" ty in
@@ -1000,7 +1004,7 @@ and lower_method f e recv name args ty =
         I.MkEnum (ty, 0, [ y ]))
       (fun () -> I.MkEnum (ty, 1, []))
   | TNamed ("Result", [ at; et ]), "map_error", [ fn ] ->
-    let ra = lower f recv in
+    let ra = lower_arg f recv [ fn ] in
     let ca = lower f fn in
     let c = tmp f TBool (I.IsTag (ra, rt, 1)) in
     let r = fresh_var "u" ty in
@@ -1020,7 +1024,7 @@ and lower_method f e recv name args ty =
        capability and no function, so running them interleaved instead of
        stage by stage cannot be observed (except which panic comes first). *)
     let src_e, stages = stages_of f recv in
-    let src = lower f src_e in
+    let src = lower_arg f src_e args in
     let stages = List.map (fun (k, fn, t) -> (k, prepare f fn, t)) stages in
     let elem = function TList t -> t | _ -> TUnit in
     let run_stages x terminal =
@@ -1065,8 +1069,7 @@ and lower_method f e recv name args ty =
        I.V out
      | _ -> failwith "list method arity")
   | _ ->
-    let ra = lower f recv in
-    let xs = List.map (lower f) args in
+    let ra, xs = match lower_args f (recv :: args) with ra :: xs -> (ra, xs) | [] -> failwith "method" in
     let prefix =
       match rt with
       | TStr -> "str_"
@@ -1289,7 +1292,7 @@ and lower_stmt f s =
       emit f (I.Loop body)
     | SFor (n, _, { edesc = EBin (Range, lo, hi); espan; _ }, b) ->
       (* count from lo while below hi; the list is never built *)
-      let la = lower f lo in
+      let la = lower_arg f lo [ hi ] in
       let ha = lower f hi in
       let i = fresh_var "i" TInt in
       emit f (I.Let (i, I.Atom la));

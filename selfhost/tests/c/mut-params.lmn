@@ -1,9 +1,17 @@
 // `mut` parameters and arguments: a variable root, path places through
 // fields, list elements and map entries, a plain argument naming the list
 // a `mut` element comes from, a panic through a variable root and a path,
-// and a callee that keeps a copy of the list it changes in a loop
+// and a callee that keeps a copy of the list it changes in a loop; and
+// operands, literal parts, interpolations, receivers, indexes and range
+// bounds read as written when a later one changes them, through a `mut`
+// argument or an assignment
 struct Buf {
     items: List[Int],
+}
+
+struct Pair {
+    a: Int,
+    b: Int,
 }
 
 fn add(mut self: Buf, x: Int) {
@@ -29,6 +37,53 @@ fn fill(out: Stdout, mut xs: List[Int]) {
 fn stash(mut xs: List[Int], mut kept: List[List[Int]]) {
     kept.push(xs)
     xs.push(1)
+}
+
+fn next(mut n: Int) -> Int {
+    n = n + 1
+    n
+}
+
+fn addget(mut xs: List[Int]) -> Int {
+    xs.push(42)
+    42
+}
+
+fn order(out: Stdout) {
+    let mut k = 1
+    out.print("{k} {next(mut k)}")
+    k = 1
+    out.print("{[k, next(mut k)]} {k}")
+    k = 1
+    out.print("{(k, next(mut k))}")
+    k = 1
+    let p = Pair { a: k, b: next(mut k) }
+    out.print("{p.a} {p.b}")
+    k = 1
+    let c = k == next(mut k)
+    k = 1
+    out.print("{c} {k.max(next(mut k) - 5)}")
+    let mut xs = [1]
+    out.print("{xs.contains(addget(mut xs))} {[xs, [addget(mut xs)]]}")
+    let ys = [[1, 2], [3, 4]]
+    let mut i = 0
+    out.print("{ys[i][next(mut i)]}")
+    k = 1
+    let mut n = 0
+    for _ in k..<next(mut k) {
+        n = n + 1
+    }
+    i = 1
+    let s = i + {
+        i = 3
+        1
+    }
+    k = 1
+    let zs = [k, {
+        k = 5
+        2
+    }]
+    out.print("{n} {s} {zs}")
 }
 
 fn basic(out: Stdout) {
@@ -82,4 +137,5 @@ fn main(root: Root) {
     snapshot(out)
     panics(out)
     hoist(out)
+    order(out)
 }

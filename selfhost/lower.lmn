@@ -6,8 +6,9 @@
 //
 // The OCaml lowering keeps a mutable context per function, with a pointer
 // to the enclosing one for closures. Here the whole context is one value,
-// `Lx`, threaded through every step: the function being lowered is `cur`,
-// the ones around it (for a closure) are `parents`, innermost first.
+// `Lx`, passed to every step as `mut self`: the function being lowered
+// is `cur`, the ones around it (for a closure) are `parents`, innermost
+// first.
 // Lowering a nested block, which OCaml does by running a callback between
 // saving and restoring the statement buffer, is `open` and `close` here.
 //
@@ -479,15 +480,6 @@ fn wrapper(mut self: Lx, ty: types.Ty, make: fn(List[ir.Atom]) -> ir.Rhs) -> Str
 
 // ---------- expressions ----------
 
-fn lower_all(mut self: Lx, es: List[ast.Expr]) -> List[ir.Atom] {
-    let mut xs: List[ir.Atom] = []
-    for e in es {
-        let a = self.lower(e)
-        xs.push(a)
-    }
-    xs
-}
-
 fn is_map(t: types.Ty) -> Bool {
     match t {
         TMap(..) => true,
@@ -516,12 +508,21 @@ pub fn lower(mut self: Lx, e: ast.Expr) -> ir.Atom {
         EStr([]) => AStr(""),
         EStr([SPLit(s)]) => AStr(s),
         EStr(parts) => {
+            let mut exprs: List[ast.Expr] = []
+            for p in parts {
+                match p {
+                    SPExpr(x) => exprs.push(x),
+                    SPLit(_) => {},
+                }
+            }
             let mut ps: List[ir.IPart] = []
+            let mut j = 0
             for p in parts {
                 match p {
                     SPLit(s) => ps.push(IStr(s)),
                     SPExpr(x) => {
-                        let a = self.lower(x)
+                        j = j + 1
+                        let a = self.lower_arg(x, exprs.skip(j))
                         ps.push(IVal(a, self.tyof(x)))
                     },
                 }
@@ -536,7 +537,7 @@ pub fn lower(mut self: Lx, e: ast.Expr) -> ir.Atom {
             }
         },
         EList(es) => {
-            let xs = self.lower_all(es)
+            let xs = self.lower_args(es)
             self.tmp(ty, MkList(ty, xs))
         },
         EBin(op, a, b) if op == And || op == Or => {
@@ -570,12 +571,12 @@ pub fn lower(mut self: Lx, e: ast.Expr) -> ir.Atom {
             V(r)
         },
         EBin(Range, a, b) => {
-            let x = self.lower(a)
+            let x = self.lower_arg(a, [b])
             let y = self.lower(b)
             self.tmp(ty, Prim("int_range", TInt, [x, y], sp))
         },
         EBin(op, a, b) => {
-            let x = self.lower(a)
+            let x = self.lower_arg(a, [b])
             let y = self.lower(b)
             self.tmp(ty, Bin(op, self.tyof(a), x, y, sp))
         },
@@ -670,7 +671,8 @@ pub fn lower(mut self: Lx, e: ast.Expr) -> ir.Atom {
             // base is not used afterwards it is moved, so its storage is
             // reused; otherwise the ownership pass retains it (a copy)
             // first. A plain variable is read after the new values, so
-            // `p = { p with x: p.x + 1 }` still moves `p`.
+            // `p = { p with x: p.x + 1 }` still moves `p`, as the
+            // specification says.
             let bt = self.tyof(base)
             let early = match base.desc {
                 EVar(_) => None,
@@ -679,9 +681,9 @@ pub fn lower(mut self: Lx, e: ast.Expr) -> ir.Atom {
                     Some(a)
                 },
             }
+            let xs = self.lower_args(fields.map(|f| f.value))
             let mut vals: List[(Int, ir.Atom)] = []
-            for f in fields {
-                let a = self.lower(f.value)
+            for (f, a) in fields.zip(xs) {
                 vals.push((field_index(self.ro, bt, f.name), a))
             }
             let b = match early {
@@ -699,9 +701,9 @@ pub fn lower(mut self: Lx, e: ast.Expr) -> ir.Atom {
             V(v)
         },
         EStruct(name, _, fields) => {
+            let xs = self.lower_args(fields.map(|f| f.value))
             let mut vals: List[(Str, ir.Atom)] = []
-            for f in fields {
-                let a = self.lower(f.value)
+            for (f, a) in fields.zip(xs) {
                 vals.push((f.name, a))
             }
             let decl = self.ro.structs[name]
@@ -753,7 +755,7 @@ pub fn lower(mut self: Lx, e: ast.Expr) -> ir.Atom {
 
 // `r.name` and `a[i]` chains read as one path.
 fn lower_access(mut self: Lx, e: ast.Expr, ty: types.Ty) -> ir.Atom {
-    let (root, rty, steps) = self.access(e)
+    let (root, rty, steps) = self.access(e, [])
     if steps.is_empty() {
         return root
     }
@@ -768,7 +770,7 @@ fn lower_method_expr(mut self: Lx, e: ast.Expr, recv: ast.Expr, name: Str, args:
     let rt = self.tyof(recv)
     let one = args.len() == 1
     if is_ctor {
-        let xs = self.lower_all(args)
+        let xs = self.lower_args(args)
         return self.tmp(ty, MkEnum(ty, tag_of(self.ro, ty, name), xs))
     }
     if name == "remove" && one && is_map(rt) {
@@ -803,7 +805,7 @@ fn lower_method_expr(mut self: Lx, e: ast.Expr, recv: ast.Expr, name: Str, args:
         _ => false,
     }
     if name == "send" && one && chan {
-        let c = self.lower(recv)
+        let c = self.lower_arg(recv, args)
         let x = self.lower(args[0])
         let _ = self.tmp(TUnit, ChanSend(c, x, e.span))
         return AUnit
@@ -855,8 +857,9 @@ fn lower_call(mut self: Lx, e: ast.Expr, callee: ast.Expr, args: List[ast.Expr],
                         return AUnit
                     },
                     "assert_eq" => {
-                        let x = self.lower(args[0])
-                        let y = self.lower(args[1])
+                        let xs = self.lower_args(args)
+                        let x = xs[0]
+                        let y = xs[1]
                         let t = self.tyof(args[0])
                         let same = self.tmp(TBool, Bin(Eq, t, x, y, sp))
                         let saved = self.open()
@@ -892,11 +895,11 @@ fn lower_call(mut self: Lx, e: ast.Expr, callee: ast.Expr, args: List[ast.Expr],
                         return self.tmp(TUnit, Prim("keep", self.tyof(args[0]), [x], sp))
                     },
                     "bytes" => {
-                        let xs = self.lower_all(args)
+                        let xs = self.lower_args(args)
                         return self.tmp(ty, Prim("bytes_new", TBytes, xs, sp))
                     },
                     "map" => {
-                        let xs = self.lower_all(args)
+                        let xs = self.lower_args(args)
                         return self.tmp(ty, Prim(if xs.is_empty() { "map_new" } else { "map_from" }, ty, xs, sp))
                     },
                     "panic" => {
@@ -1014,9 +1017,11 @@ fn place_depth(x: ast.Expr) -> Int {
     }
 }
 
-// The arguments of a call, left to right. A variable argument that a
-// later argument changes is copied where it is written, so the call is
-// given the value it had there.
+// Sibling expressions whose values are used together (the arguments of a
+// call, the operands of an operator, the parts of a literal or of a string
+// with interpolations, a receiver and its arguments), left to right. A
+// variable that a later sibling changes is copied where it is written, so
+// it is used with the value it had there; any other is read in place.
 fn lower_args(mut self: Lx, args: List[ast.Expr]) -> List[ir.Atom] {
     let mut xs: List[ir.Atom] = []
     for (k, a) in args.with_index() {
@@ -1087,7 +1092,9 @@ fn lower_foreign(mut self: Lx, d: ast.FnDecl, args: List[ast.Expr], ty: types.Ty
     let kinds = (if cs.trusted { [] } else { [Unit] }) + cs.params.filter(|p| !p.out).map(|p| p.cty)
     let mut xs: List[ir.Atom] = []
     let mut cbs: List[ir.Callback] = []
+    let mut j = 0
     for (a, k) in args.zip(kinds) {
+        j = j + 1
         match (k, a.desc) {
             (Fn(ps, _), EVar(m)) => {
                 let cd = self.ro.fns[m]
@@ -1095,7 +1102,7 @@ fn lower_foreign(mut self: Lx, d: ast.FnDecl, args: List[ast.Expr], ty: types.Ty
                 cbs.push(ir.Callback { cname: c, name: m, span: cd.span, takes_foreign: cd.params.len() > ps.len() })
             },
             _ => {
-                let x = self.lower(a)
+                let x = self.lower_arg(a, args.skip(j))
                 xs.push(x)
             },
         }
@@ -1104,30 +1111,32 @@ fn lower_foreign(mut self: Lx, d: ast.FnDecl, args: List[ast.Expr], ty: types.Ty
 }
 
 // A chain of field and index reads, so `a[i].x` is one Get, not two
-// copies: the value at its root, the root's type, and the steps.
-fn access(mut self: Lx, e: ast.Expr) -> (ir.Atom, types.Ty, List[ir.Step]) {
+// copies: the value at its root, the root's type, and the steps. `later`
+// are the indexes after `e` in the chain: a variable they change is copied
+// where it is read, as for siblings.
+fn access(mut self: Lx, e: ast.Expr, later: List[ast.Expr]) -> (ir.Atom, types.Ty, List[ir.Step]) {
     match e.desc {
         EField(r, name, _) if is_struct(self.ro, self.tyof(r)) => {
-            let (a, rt, steps) = self.access(r)
+            let (a, rt, steps) = self.access(r, later)
             (a, rt, steps + [PField(field_index(self.ro, self.tyof(r), name))])
         },
         EIndex(r, i) if self.tyof(r) == TBytes => {
-            let b = self.lower(r)
-            let ia = self.lower(i)
+            let b = self.lower_arg(r, [i] + later)
+            let ia = self.lower_arg(i, later)
             let x = self.tmp(TInt, Prim("bytes_at", TBytes, [b, ia], e.span))
             (x, TInt, [])
         },
         EIndex(r, k) if is_map(self.tyof(r)) => {
             // a map lookup starts a new path: the value it finds
-            let m = self.lower(r)
-            let ka = self.lower(k)
+            let m = self.lower_arg(r, [k] + later)
+            let ka = self.lower_arg(k, later)
             let vt = self.tyof(e)
             let x = self.tmp(vt, Prim("map_at", self.tyof(r), [m, ka], e.span))
             (x, vt, [])
         },
         EIndex(r, i) => {
-            let (a, rt, steps) = self.access(r)
-            let ia = self.lower(i)
+            let (a, rt, steps) = self.access(r, [i] + later)
+            let ia = self.lower_arg(i, later)
             (a, rt, steps + [PIndex(ia, e.span)])
         },
         EField(r, name, _) if self.tyof(r) == TCap("Root") => {
@@ -1136,7 +1145,7 @@ fn access(mut self: Lx, e: ast.Expr) -> (ir.Atom, types.Ty, List[ir.Step]) {
             (x, self.tyof(e), [])
         },
         _ => {
-            let a = self.lower(e)
+            let a = self.lower_arg(e, later)
             (a, self.tyof(e), [])
         },
     }
@@ -1654,9 +1663,8 @@ fn lower_method(mut self: Lx, e: ast.Expr, recv: ast.Expr, name: Str, args: List
             let ms = iface_methods(self.ro, i, targs)
             let k = index_of(name, ms.map(|m| m.name))
             let m = ms[k]
-            let ra = self.lower(recv)
-            let xs = self.lower_all(args)
-            return self.tmp(ty, CallDyn(k, m.params, m.ret, ra, xs))
+            let xs = self.lower_args([recv] + args)
+            return self.tmp(ty, CallDyn(k, m.params, m.ret, xs[0], xs.skip(1)))
         },
         _ => {},
     }
@@ -1702,7 +1710,7 @@ fn lower_method(mut self: Lx, e: ast.Expr, recv: ast.Expr, name: Str, args: List
             self.tmp(TBool, IsTag(x, rt, 1))
         },
         (TNamed("Option", [xt]), "map", [f]) => {
-            let ra = self.lower(recv)
+            let ra = self.lower_arg(recv, [f])
             let ca = self.lower(f)
             let c = self.tmp(TBool, IsTag(ra, rt, 0))
             let r = self.fresh_var("u", ty)
@@ -1723,7 +1731,7 @@ fn lower_method(mut self: Lx, e: ast.Expr, recv: ast.Expr, name: Str, args: List
             V(r)
         },
         (TNamed("Result", [at, et]), "map_error", [f]) => {
-            let ra = self.lower(recv)
+            let ra = self.lower_arg(recv, [f])
             let ca = self.lower(f)
             let c = self.tmp(TBool, IsTag(ra, rt, 1))
             let r = self.fresh_var("u", ty)
@@ -1746,8 +1754,7 @@ fn lower_method(mut self: Lx, e: ast.Expr, recv: ast.Expr, name: Str, args: List
         },
         (TList(_), "map", _) | (TList(_), "filter", _) | (TList(_), "fold", _) => self.lower_fused(recv, name, args, ty, sp),
         _ => {
-            let ra = self.lower(recv)
-            let xs = self.lower_all(args)
+            let xs = self.lower_args([recv] + args)
             let prefix = match rt {
                 TStr => "str_",
                 TBytes => "bytes_",
@@ -1764,7 +1771,7 @@ fn lower_method(mut self: Lx, e: ast.Expr, recv: ast.Expr, name: Str, args: List
                 TCap(_) => "cap_",
                 _ => panic("method on " + show(rt)),
             }
-            self.tmp(ty, Prim(prefix + name, rt, [ra] + xs, sp))
+            self.tmp(ty, Prim(prefix + name, rt, xs, sp))
         },
     }
 }
@@ -1782,7 +1789,7 @@ fn elem(t: types.Ty) -> types.Ty {
 // stage by stage cannot be observed (except which panic comes first).
 fn lower_fused(mut self: Lx, recv: ast.Expr, name: Str, args: List[ast.Expr], ty: types.Ty, sp: ast.Span) -> ir.Atom {
     let (src_e, stages) = self.stages_of(recv)
-    let src = self.lower(src_e)
+    let src = self.lower_arg(src_e, args)
     let mut prepared: List[(Str, Prep, types.Ty)] = []
     for s in stages {
         let p = self.prepare(s.1)
@@ -2163,7 +2170,7 @@ fn lower_stmt(mut self: Lx, s: ast.Stmt) {
                 _ => panic("range"),
             }
             let sp = range.span
-            let la = self.lower(lo)
+            let la = self.lower_arg(lo, [hi])
             let ha = self.lower(hi)
             let i = self.fresh_var("i", TInt)
             self.emit(Let(i, Use(la)))
