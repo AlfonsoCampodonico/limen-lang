@@ -139,6 +139,22 @@ compare_c() {
   same "$1/$2"
 }
 
+# compare_json DIR FILE: `check --json` and `caps --json` with both
+# compilers, in both argument orders: stdout and exit status (the
+# diagnostics a program prints without --json are on stderr, and are
+# compared with the other commands')
+compare_json() {
+  ok=0
+  for cmd in check caps; do
+    for order in "FILE --json" "--json FILE"; do
+      (cd "$1" && "$limen_abs" $cmd $(echo "$order" | sed "s|FILE|$2|")) > "$out/want" 2> "$out/want.err" && echo "exit 0" >> "$out/want" || echo "exit $?" >> "$out/want"
+      (cd "$1" && tsc $cmd $(echo "$order" | sed "s|FILE|$2|")) > "$out/got" 2> "$out/got.err" && echo "exit 0" >> "$out/got" || echo "exit $?" >> "$out/got"
+      same "$1/$2 ($cmd $order)" || ok=1
+    done
+  done
+  return $ok
+}
+
 # compare_dev_c DIR FILE: the C of a development build, with its `#line`
 # directives
 compare_dev_c() {
@@ -255,6 +271,8 @@ check "files lower the same" compare_ir -- $programs
 check "edge cases lower the same" compare_ir -- $ir_cases
 check "files compile to the same C" compare_c -- $programs
 check "edge cases compile to the same C" compare_c -- $c_cases
+check "files give the same JSON" compare_json -- $programs
+check "edge cases give the same JSON" compare_json -- $c_cases selfhost/tests/*.lmn
 check "edge cases compile to the same development C" compare_dev_c -- $c_cases
 check "examples compile to the same development C" compare_dev_c -- $(ls examples/*.lmn)
 check "edge cases compile to the same profiled C" compare_profile_c -- $c_cases
@@ -267,6 +285,7 @@ if [ -d "$book" ]; then
   check "book examples check the same" compare_check -- $examples
   check "book examples lower the same" compare_ir -- $examples
   check "book examples compile to the same C" compare_c -- $examples
+  check "book examples give the same JSON" compare_json -- $examples
   book_tests=$(grep -l '^test \|^bench ' $examples)
   check "book test binaries compile to the same C" compare_test_c -- $book_tests
   # programs built by both compilers, run: concurrency, HTTP, TLS, JSON,

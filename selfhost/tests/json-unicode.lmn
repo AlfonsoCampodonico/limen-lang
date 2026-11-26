@@ -1,0 +1,4 @@
+// A message that quotes non-ASCII text from the source.
+fn main(root: Root) {
+    root.stdout.print(embed("señor\t\"ñ\".txt"))
+}
