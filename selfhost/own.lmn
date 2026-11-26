@@ -130,7 +130,7 @@ fn drops(self: Fwd, set: List[Int]) -> List[ir.Stmt] {
 }
 
 // Rewrite the consumed atoms of a statement: move or retain.
-fn consume(atoms: List[ir.Atom], live_after: List[Int], borrowed: List[Int], owned: List[Int]) -> (List[ir.Atom], List[Int]) {
+fn consume(atoms: List[ir.Atom], live_after: List[Int], borrowed: List[Int], mut owned: List[Int]) -> List[ir.Atom] {
     let mut count: Map[Int, Int] = map()
     for a in atoms {
         match ir.atom_var(a) {
@@ -140,7 +140,6 @@ fn consume(atoms: List[ir.Atom], live_after: List[Int], borrowed: List[Int], own
             None => {},
         }
     }
-    let mut owned = owned
     let mut out: List[ir.Atom] = []
     for a in atoms {
         match a {
@@ -157,25 +156,24 @@ fn consume(atoms: List[ir.Atom], live_after: List[Int], borrowed: List[Int], own
             _ => out.push(a),
         }
     }
-    (out, owned)
+    out
 }
 
-fn rewrite_rhs(r: ir.Rhs, live_after: List[Int], owned: List[Int]) -> (ir.Rhs, List[Int]) {
+fn rewrite_rhs(r: ir.Rhs, live_after: List[Int], mut owned: List[Int]) -> ir.Rhs {
     let borrowed = ids(ir.borrowed(r))
-    let c = |atoms: List[ir.Atom]| consume(atoms, live_after, borrowed, owned)
     match r {
         Use(a) => {
-            let (xs, o) = c([a])
-            (Use(xs[0]), o)
+            let xs = consume([a], live_after, borrowed, mut owned)
+            Use(xs[0])
         },
         Call(n, args) => {
-            let (xs, o) = c(args)
-            (Call(n, xs), o)
+            let xs = consume(args, live_after, borrowed, mut owned)
+            Call(n, xs)
         },
         CallMut(n, args) => {
             // the values are consumed; each place's variable and step atoms
             // are borrowed, so a value that names one is retained
-            let (xs, o) = c(ir.consumed(r))
+            let xs = consume(ir.consumed(r), live_after, borrowed, mut owned)
             let mut k = 0
             let mut rebuilt: List[ir.Arg] = []
             for x in args {
@@ -187,42 +185,42 @@ fn rewrite_rhs(r: ir.Rhs, live_after: List[Int], owned: List[Int]) -> (ir.Rhs, L
                     ByPlace(..) => rebuilt.push(x),
                 }
             }
-            (CallMut(n, rebuilt), o)
+            CallMut(n, rebuilt)
         },
         CallClo(f, args) => {
-            let (xs, o) = c(args)
-            (CallClo(f, xs), o)
+            let xs = consume(args, live_after, borrowed, mut owned)
+            CallClo(f, xs)
         },
         MkStruct(t, args) => {
-            let (xs, o) = c(args)
-            (MkStruct(t, xs), o)
+            let xs = consume(args, live_after, borrowed, mut owned)
+            MkStruct(t, xs)
         },
         MkEnum(t, k, args) => {
-            let (xs, o) = c(args)
-            (MkEnum(t, k, xs), o)
+            let xs = consume(args, live_after, borrowed, mut owned)
+            MkEnum(t, k, xs)
         },
         MkList(t, args) => {
-            let (xs, o) = c(args)
-            (MkList(t, xs), o)
+            let xs = consume(args, live_after, borrowed, mut owned)
+            MkList(t, xs)
         },
         MkClosure(n, t, args) => {
-            let (xs, o) = c(args)
-            (MkClosure(n, t, xs), o)
+            let xs = consume(args, live_after, borrowed, mut owned)
+            MkClosure(n, t, xs)
         },
         Spawn(g, task, t, keep) => {
-            let (xs, o) = c([task])
-            (Spawn(g, xs[0], t, keep), o)
+            let xs = consume([task], live_after, borrowed, mut owned)
+            Spawn(g, xs[0], t, keep)
         },
         ChanSend(ch, v, sp) => {
-            let (xs, o) = c([v])
-            (ChanSend(ch, xs[0], sp), o)
+            let xs = consume([v], live_after, borrowed, mut owned)
+            ChanSend(ch, xs[0], sp)
         },
         Select(id, ops, d, sp) => {
             let sends = ops.flat_map(|op| match op {
                 SSend(_, v, _, _) => [v],
                 SRecv(..) | SAfter(..) => [],
             })
-            let (xs, o) = c(sends)
+            let xs = consume(sends, live_after, borrowed, mut owned)
             let mut k = 0
             let mut rebuilt: List[ir.Sel] = []
             for op in ops {
@@ -234,94 +232,119 @@ fn rewrite_rhs(r: ir.Rhs, live_after: List[Int], owned: List[Int]) -> (ir.Rhs, L
                     _ => rebuilt.push(op),
                 }
             }
-            (Select(id, rebuilt, d, sp), o)
+            Select(id, rebuilt, d, sp)
         },
         MkDyn(t, i, v, ms) => {
-            let (xs, o) = c([v])
-            (MkDyn(t, i, xs[0], ms), o)
+            let xs = consume([v], live_after, borrowed, mut owned)
+            MkDyn(t, i, xs[0], ms)
         },
         CallDyn(k, ps, rt, recv, args) => {
-            let (xs, o) = c(args)
-            (CallDyn(k, ps, rt, recv, xs), o)
+            let xs = consume(args, live_after, borrowed, mut owned)
+            CallDyn(k, ps, rt, recv, xs)
         },
-        _ => (r, owned),
+        _ => r,
     }
 }
 
-fn fwd_block(self: Fwd, b: ABlock, owned: List[Int], ex: Exits) -> (List[ir.Stmt], List[Int]) {
+fn fwd_block(self: Fwd, b: ABlock, mut owned: List[Int], ex: Exits) -> List[ir.Stmt] {
     let entry = intset.diff(owned, b.lin)
     let mut acc = self.drops(entry)
-    let mut owned = intset.diff(owned, entry)
+    owned = intset.diff(owned, entry)
     for a in b.stmts {
-        let (ss, o) = self.fwd_stmt(a, owned, ex)
+        let ss = self.fwd_stmt(a, mut owned, ex)
         for s in ss {
             acc.push(s)
         }
-        owned = o
     }
-    (acc, owned)
+    acc
 }
 
-fn fwd_stmt(self: Fwd, a: Ann, owned: List[Int], ex: Exits) -> (List[ir.Stmt], List[Int]) {
-    let after = |s: ir.Stmt, owned: List[Int]| {
-        let d = intset.diff(owned, a.out)
-        ([s] + self.drops(d), intset.diff(owned, d))
-    }
+// Statement `s` and the drops of what `owned` holds that is not live after
+// it (`out`).
+fn after(self: Fwd, s: ir.Stmt, out: List[Int], mut owned: List[Int]) -> List[ir.Stmt] {
+    let d = intset.diff(owned, out)
+    owned = intset.diff(owned, d)
+    [s] + self.drops(d)
+}
+
+fn fwd_stmt(self: Fwd, a: Ann, mut owned: List[Int], ex: Exits) -> List[ir.Stmt] {
     match (a.s, a.sub) {
         (Let(v, r), _) => {
-            let (r, o) = rewrite_rhs(r, a.out, owned)
-            after(Let(v, r), intset.add(o, v.id))
+            let r = rewrite_rhs(r, a.out, mut owned)
+            owned = intset.add(owned, v.id)
+            self.after(Let(v, r), a.out, mut owned)
         },
         (Init(v, r), _) => {
-            let (r, o) = rewrite_rhs(r, a.out, owned)
-            after(Init(v, r), intset.add(o, v.id))
+            let r = rewrite_rhs(r, a.out, mut owned)
+            owned = intset.add(owned, v.id)
+            self.after(Init(v, r), a.out, mut owned)
         },
         (Set(v, r, _), _) => {
-            let (r, o) = rewrite_rhs(r, intset.remove(a.out, v.id), owned)
-            after(Set(v, r, intset.mem(o, v.id)), intset.add(o, v.id))
+            let r = rewrite_rhs(r, intset.remove(a.out, v.id), mut owned)
+            let s = Set(v, r, intset.mem(owned, v.id))
+            owned = intset.add(owned, v.id)
+            self.after(s, a.out, mut owned)
         },
-        (Decl(v), _) => ([Decl(v)], owned),
+        (Decl(v), _) => [Decl(v)],
         (Mutate(v, steps, m), _) => {
             let borrowed = intset.add(ids(ir.step_atoms(steps)), v.id)
-            let (xs, o) = consume(ir.mut_atoms(m), a.out, borrowed, owned)
+            let xs = consume(ir.mut_atoms(m), a.out, borrowed, mut owned)
             let m = match m {
                 MSet(_) => MSet(xs[0]),
                 MPush(_) => MPush(xs[0]),
                 MRemove(_) => MRemove(xs[0]),
                 MPut(..) => MPut(xs[0], xs[1]),
             }
-            after(Mutate(v, steps, m), o)
+            self.after(Mutate(v, steps, m), a.out, mut owned)
         },
         (If(c, _, _), IfSub(ba, bb)) => {
-            let (sa, oa) = self.fwd_block(ba, owned, ex)
-            let (sb, ob) = self.fwd_block(bb, owned, ex)
-            ([If(c, sa, sb)], intset.inter(a.out, intset.union(oa, ob)))
+            // both branches start from what is owned before the `if`
+            let mut oa = owned
+            let sa = self.fwd_block(ba, mut oa, ex)
+            let mut ob = owned
+            let sb = self.fwd_block(bb, mut ob, ex)
+            owned = intset.inter(a.out, intset.union(oa, ob))
+            [If(c, sa, sb)]
         },
         (Loop(_), LoopSub(b)) => {
-            let (body, _) = self.fwd_block(b, owned, Exits { brk: a.out, cont: b.lin })
-            ([Loop(body)], intset.inter(owned, a.out))
+            let mut inside = owned
+            let body = self.fwd_block(b, mut inside, Exits { brk: a.out, cont: b.lin })
+            owned = intset.inter(owned, a.out)
+            [Loop(body)]
         },
         (Scope(g, _), ScopeSub(bb)) => {
-            let (sb, ob) = self.fwd_block(bb, owned, ex)
-            ([Scope(g, sb)], ob)
+            let sb = self.fwd_block(bb, mut owned, ex)
+            [Scope(g, sb)]
         },
         (Guard(n, _, _), GuardSub(hb, bb)) => {
             // the handler owns nothing from outside but the `mut` parameters:
             // its uses retain, and the frame's cleanups drop the variables as
             // the panic goes on
-            let (sh, _) = self.fwd_block(hb, self.refs, no_exits())
-            let (sb, ob) = self.fwd_block(bb, owned, ex)
+            let mut held = self.refs
+            let sh = self.fwd_block(hb, mut held, no_exits())
+            let sb = self.fwd_block(bb, mut owned, ex)
             // what the handler kept alive and nothing after needs
-            let left = intset.diff(ob, a.out)
-            ([Guard(n, sh, sb)] + self.drops(left), intset.inter(a.out, ob))
+            let left = intset.diff(owned, a.out)
+            owned = intset.inter(a.out, owned)
+            [Guard(n, sh, sb)] + self.drops(left)
         },
-        (Break, _) => (self.drops(intset.diff(owned, ex.brk)) + [Break], intset.empty()),
-        (Continue, _) => (self.drops(intset.diff(owned, ex.cont)) + [Continue], intset.empty()),
+        (Break, _) => {
+            let ss = self.drops(intset.diff(owned, ex.brk)) + [Break]
+            owned = intset.empty()
+            ss
+        },
+        (Continue, _) => {
+            let ss = self.drops(intset.diff(owned, ex.cont)) + [Continue]
+            owned = intset.empty()
+            ss
+        },
         (Return(x), _) => {
-            let (xs, o) = consume([x], intset.empty(), self.refs, owned)
-            (self.drops(intset.diff(o, self.refs)) + [Return(xs[0])], intset.empty())
+            let xs = consume([x], intset.empty(), self.refs, mut owned)
+            let ss = self.drops(intset.diff(owned, self.refs)) + [Return(xs[0])]
+            owned = intset.empty()
+            ss
         },
-        (s, _) => ([s], owned),
+        (s, _) => [s],
     }
 }
 
@@ -355,8 +378,8 @@ pub fn function(f: ir.Fn) -> ir.Fn {
     let refs = intset.of_list(f.params.filter(|v| v.by_ref).map(|v| v.id))
     let fwd = Fwd { vars: collect_vars(vars, f.body), refs }
     let b = live_block(refs, refs, f.body, intset.empty(), no_exits())
-    let owned = intset.of_list((f.params + f.captures).map(|v| v.id))
-    let (body, _) = fwd.fwd_block(b, owned, no_exits())
+    let mut owned = intset.of_list((f.params + f.captures).map(|v| v.id))
+    let body = fwd.fwd_block(b, mut owned, no_exits())
     { f with body }
 }
 
