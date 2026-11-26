@@ -341,4 +341,37 @@ LC_FN int64_t lc_mtime_ms(const struct stat *st) {
 #endif
 }
 
+/* Panic messages, written once for both backends; each backend raises the
+   panic and adds the location. snprintf-style: they write at most cap bytes
+   (a NUL included, so cap 0 and a NULL out are fine for measuring) and
+   return the full length. LC_MSG_MAX holds the numeric ones. */
+#define LC_MSG_MAX 128
+LC_FN size_t lc_msg_list_index(char *out, size_t cap, int64_t i, int64_t len) {
+  int k = snprintf(out, cap, "index %lld is out of range for a list of length %lld", (long long)i, (long long)len);
+  return k < 0 ? 0 : (size_t)k;
+}
+LC_FN size_t lc_msg_bytes_index(char *out, size_t cap, int64_t i, int64_t len) {
+  int k = snprintf(out, cap, "index %lld is out of range for bytes of length %lld", (long long)i, (long long)len);
+  return k < 0 ? 0 : (size_t)k;
+}
+LC_FN size_t lc_msg_byte_range(char *out, size_t cap, int64_t v) {
+  int k = snprintf(out, cap, "byte %lld is out of range 0 to 255", (long long)v);
+  return k < 0 ? 0 : (size_t)k;
+}
+/* A missing map key; key is the text the backend prints it as. */
+LC_FN size_t lc_msg_key(char *out, size_t cap, const char *key, size_t kn) {
+  static const char pre[] = "key ", post[] = " is not in the map";
+  size_t n = 0;
+  if (out && cap > 0) {
+    size_t room = cap - 1;
+    size_t a = sizeof pre - 1, b = kn, c = sizeof post - 1;
+    size_t t;
+    t = a < room ? a : room; memcpy(out, pre, t); n = t; room -= t;
+    t = b < room ? b : room; if (t) memcpy(out + n, key, t); n += t; room -= t;
+    t = c < room ? c : room; memcpy(out + n, post, t); n += t;
+    out[n] = 0;
+  }
+  return sizeof pre - 1 + kn + sizeof post - 1;
+}
+
 #endif

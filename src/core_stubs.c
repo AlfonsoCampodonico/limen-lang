@@ -171,3 +171,35 @@ value limen_core_escaped(value s) {
   lc_escape(String_val(s), n, (char *)Bytes_val(out));
   CAMLreturn(out);
 }
+
+/* Panic messages. The numeric ones fit a stack buffer; msg_key measures with
+   a NULL buffer, allocates, then writes into the result (the NUL lands in the
+   string's own padding byte). */
+value limen_core_msg_list_index(value i, value len) {
+  CAMLparam2(i, len);
+  char t[LC_MSG_MAX];
+  size_t k = lc_msg_list_index(t, sizeof t, Int64_val(i), Long_val(len));
+  CAMLreturn(caml_alloc_initialized_string(k, t));
+}
+value limen_core_msg_bytes_index(value i, value len) {
+  CAMLparam2(i, len);
+  char t[LC_MSG_MAX];
+  size_t k = lc_msg_bytes_index(t, sizeof t, Int64_val(i), Long_val(len));
+  CAMLreturn(caml_alloc_initialized_string(k, t));
+}
+value limen_core_msg_byte_range(value v) {
+  CAMLparam1(v);
+  char t[LC_MSG_MAX];
+  size_t k = lc_msg_byte_range(t, sizeof t, Int64_val(v));
+  CAMLreturn(caml_alloc_initialized_string(k, t));
+}
+value limen_core_msg_key(value key) {
+  CAMLparam1(key);
+  CAMLlocal1(out);
+  size_t kn = caml_string_length(key);
+  size_t n = lc_msg_key(NULL, 0, String_val(key), kn);
+  out = caml_alloc_string(n);
+  /* String_val read after the allocation, which may have moved key */
+  lc_msg_key((char *)Bytes_val(out), n + 1, String_val(key), kn);
+  CAMLreturn(out);
+}

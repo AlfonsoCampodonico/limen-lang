@@ -67,3 +67,11 @@ external rand_unit : (int64 [@unboxed]) -> (float [@unboxed]) = "limen_core_rand
 external rand_le : bytes -> (int [@untagged]) -> (int [@untagged]) -> (int64 [@unboxed]) -> unit
   = "limen_core_rand_le_byte" "limen_core_rand_le"
 [@@noalloc]
+
+(* Panic messages for both backends; each adds the location itself. *)
+external msg_list_index : int64 -> int -> string = "limen_core_msg_list_index"
+external msg_bytes_index : int64 -> int -> string = "limen_core_msg_bytes_index"
+external msg_byte_range : int64 -> string = "limen_core_msg_byte_range"
+
+(* "key <k> is not in the map", [k] being the key as the backend prints it. *)
+external msg_key : string -> string = "limen_core_msg_key"

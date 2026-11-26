@@ -2319,7 +2319,7 @@ let rec eval rt env e : value =
     match eval rt env i with
     | VInt k ->
       if k < 0L || k >= Int64.of_int b.len then
-        raise (Panic (sprintf "index %Ld is out of range for a list of length %d" k b.len, e.espan));
+        raise (Panic (Core.msg_list_index k b.len, e.espan));
       b.items.(Int64.to_int k)
     | _ -> failwith "internal: index")
   | EIndex (a, i) -> (
@@ -2327,14 +2327,14 @@ let rec eval rt env e : value =
     | VMap mv, k -> (
       match KM.find_opt (key_of k) mv.m with
       | Some (_, v) -> v
-      | None -> raise (Panic (sprintf "key %s is not in the map" (show ~top:false k), e.espan)))
+      | None -> raise (Panic (Core.msg_key (show ~top:false k), e.espan)))
     | VList arr, VInt k ->
       if k < 0L || k >= Int64.of_int (Array.length arr) then
-        raise (Panic (sprintf "index %Ld is out of range for a list of length %d" k (Array.length arr), e.espan));
+        raise (Panic (Core.msg_list_index k (Array.length arr), e.espan));
       arr.(Int64.to_int k)
     | VBytes b, VInt k ->
       if k < 0L || k >= Int64.of_int (String.length b) then
-        raise (Panic (sprintf "index %Ld is out of range for bytes of length %d" k (String.length b), e.espan));
+        raise (Panic (Core.msg_bytes_index k (String.length b), e.espan));
       vint (Char.code b.[Int64.to_int k])
     | _ -> failwith "internal: index")
   | ETry (x, ctx) -> (
@@ -2610,7 +2610,7 @@ and apply rt fv args sp =
         (String.init (Array.length xs) (fun i ->
              match xs.(i) with
              | VInt n when n >= 0L && n <= 255L -> Char.chr (Int64.to_int n)
-             | VInt n -> raise (Panic (sprintf "byte %Ld is out of range 0 to 255" n, sp))
+             | VInt n -> raise (Panic (Core.msg_byte_range n, sp))
              | _ -> failwith "internal: bytes"))
     | _ -> failwith "internal: bytes")
   | VBuiltin "map" -> (
@@ -2756,7 +2756,7 @@ and assign rt env lhs v =
     | VInt k ->
       let b = own (Option.get (find_var env n)) in
       if k < 0L || k >= Int64.of_int b.len then
-        raise (Panic (sprintf "index %Ld is out of range for a list of length %d" k b.len, lhs.espan));
+        raise (Panic (Core.msg_list_index k b.len, lhs.espan));
       b.items.(Int64.to_int k) <- v
     | _ -> failwith "internal: assign index")
   | EIndex (r, i) -> (
@@ -2764,7 +2764,7 @@ and assign rt env lhs v =
     | VMap mv, k -> assign rt env r (VMap (map_put mv k v))
     | VList arr, VInt k ->
       if k < 0L || k >= Int64.of_int (Array.length arr) then
-        raise (Panic (sprintf "index %Ld is out of range for a list of length %d" k (Array.length arr), lhs.espan));
+        raise (Panic (Core.msg_list_index k (Array.length arr), lhs.espan));
       let a = Array.copy arr in
       a.(Int64.to_int k) <- v;
       assign rt env r (VList a)

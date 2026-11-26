@@ -423,8 +423,8 @@ W_RT void Unit_show(WBuf *b, W_Unit x, bool top) { (void)x; (void)top; buf_puts(
 W_RT void Str_show(WBuf *b, WStr *s, bool top) { if (top) buf_putn(b, s->data, s->len); else buf_escaped(b, s); }
 
 __attribute__((noreturn)) W_RT void w_panic_index(int64_t i, int64_t len, const char *where) {
-  char m[128];
-  snprintf(m, sizeof m, "index %lld is out of range for a list of length %lld", (long long)i, (long long)len);
+  char m[LC_MSG_MAX];
+  lc_msg_list_index(m, sizeof m, i, len);
   w_panic_c(m, where);
 }
 uint64_t g_hash_k0, g_hash_k1;
@@ -465,10 +465,11 @@ W_RT uint64_t w_siphash13(const unsigned char *in, size_t len) {
   return v0 ^ v1 ^ v2 ^ v3;
 }
 __attribute__((noreturn)) W_RT void w_panic_key(WBuf *key, const char *where) {
-  WBuf m; buf_init(&m);
-  buf_puts(&m, "key "); buf_putn(&m, key->p, key->len); buf_puts(&m, " is not in the map");
-  buf_putn(&m, "", 1);
-  w_panic_c(m.p, where);
+  size_t n = lc_msg_key(NULL, 0, key->p, (size_t)key->len);
+  char *m = (char *)malloc(n + 1);
+  if (!m) w_panic_c("out of memory", where);
+  lc_msg_key(m, n + 1, key->p, (size_t)key->len);
+  w_panic_c(m, where);
 }
 
 W_RT int64_t L_Int_sum(L_Int *l) { int64_t s = 0; for (int64_t i = 0; i < l->len; i++) s += l->data[i]; return s; }
@@ -558,8 +559,8 @@ W_RT WStr *Bytes_from_list(L_Int *l, const char *where) {
   for (int64_t i = 0; i < l->len; i++) {
     int64_t v = l->data[i];
     if (v < 0 || v > 255) {
-      char m[96];
-      snprintf(m, sizeof m, "byte %lld is out of range 0 to 255", (long long)v);
+      char m[LC_MSG_MAX];
+      lc_msg_byte_range(m, sizeof m, v);
       Str_drop(s);
       w_panic_c(m, where);
     }
@@ -569,8 +570,8 @@ W_RT WStr *Bytes_from_list(L_Int *l, const char *where) {
 }
 W_RT int64_t Bytes_at(WStr *s, int64_t i, const char *where) {
   if (i < 0 || i >= s->len) {
-    char m[128];
-    snprintf(m, sizeof m, "index %lld is out of range for bytes of length %lld", (long long)i, (long long)s->len);
+    char m[LC_MSG_MAX];
+    lc_msg_bytes_index(m, sizeof m, i, s->len);
     w_panic_c(m, where);
   }
   return (int64_t)(unsigned char)s->data[i];
