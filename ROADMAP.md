@@ -178,10 +178,10 @@ yet: `mut` parameters in interface methods, foreign functions and function
 types (SPEC.md section 20).
 
 The self-hosted compiler threads its state through `mut` parameters, the
-proof that they are enough: in the checker, the lowering, renaming,
-expression numbering, ownership and C generation, the statements that took a
-changed state back out of a tuple, `let (x, st) = f(st, ...)`, went from 738
-to 62.
+proof that they are enough: the statements that take a result and a state
+back out of a tuple, `let (x, st) = f(st, ...)`, went from 738 to 62 across
+the checker, the lowering, renaming, numbering, ownership, C generation and
+the loader. The parser and lexer keep threading their state by design.
 
 ## 0.9: installing and sharing
 

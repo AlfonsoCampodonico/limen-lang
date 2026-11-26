@@ -508,7 +508,15 @@ let kept_def c i ps =
 
 (* A pointer to the place [v] and [steps], made unique on the way (the
    checks a loop hoisted are skipped): the C names [prefix]0_, [prefix]1_
-   and so on, one per step. Returns the last and the place's type. *)
+   and so on, one per step. Returns the last and the place's type.
+   The cast drops `volatile` from a variable a `defer` or guard needs
+   volatile (see ctx.vols). The callee, a `mut` parameter or a runtime
+   function such as List_push, takes a plain pointer, and giving it a
+   volatile one would change every such function. It is safe in practice:
+   the variable's address is taken, so it lives in memory; a write through
+   the pointer reaches memory before any call that can panic, since that
+   call might read it; and after a longjmp the caller reads the variable
+   through its volatile name, from memory. *)
 let place_ptr c line prefix (v : I.var) steps =
   line (sprintf "  %s* %s0_ = (%s*)&%s;" (ctype c v.ty) prefix (ctype c v.ty) (var v));
   List.fold_left

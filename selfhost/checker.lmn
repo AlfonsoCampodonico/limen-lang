@@ -2506,7 +2506,7 @@ fn mut_overlap(mut st: env.State, changed: Option[ast.Expr], parts: List[ast.Exp
     // is given, or what the caller reads back
     for a in inside_parts(st, whole).flat_map(|k| assigned_in(st, k)) {
         if own.any(|o| o.written && overlaps(a.1, o.path)) {
-            st.report(diag.error("E0214", a.0, "this assigns a value that the enclosing call takes as `mut`").note("assign it before the call, on its own line"))
+            st.report(diag.error("E0214", a.0, "this assigns a value that the enclosing call also takes as `mut`").note("assign it before the call, on its own line"))
         }
     }
     // an index of a `mut` place assigning a variable another index of it

@@ -2425,6 +2425,14 @@ fn pin_lines(text: Str) -> Str {
 // A pointer to the place `v` and `steps`, made unique on the way (the
 // checks a loop hoisted are skipped): the C names `prefix`0_, `prefix`1_
 // and so on, one per step. Returns the last and the place's type.
+// The cast drops `volatile` from a variable a `defer` or guard needs
+// volatile (see Cg.vols). The callee, a `mut` parameter or a runtime
+// function such as List_push, takes a plain pointer, and giving it a
+// volatile one would change every such function. It is safe in practice:
+// the variable's address is taken, so it lives in memory; a write through
+// the pointer reaches memory before any call that can panic, since that
+// call might read it; and after a longjmp the caller reads the variable
+// through its volatile name, from memory.
 fn place_ptr(mut self: Cg, ind: Str, prefix: Str, v: ir.Var, steps: List[ir.Step]) -> (Str, types.Ty) {
     let vt = self.ctype(v.ty)
     self.line(ind, "  {vt}* {prefix}0_ = ({vt}*)&{var(v)};")

@@ -2298,7 +2298,7 @@ and mut_overlap ctx ?changed parts =
   List.iter
     (fun (sp, p) ->
       if List.exists (fun (_, q, w) -> w && overlaps p q) own then
-        err ctx "E0214" sp "this assigns a value that the enclosing call takes as `mut`"
+        err ctx "E0214" sp "this assigns a value that the enclosing call also takes as `mut`"
           ~notes:[ "assign it before the call, on its own line" ])
     (List.concat_map assigned_in (inside_parts (Option.to_list changed @ parts)));
   (* an index of a `mut` place assigning a variable another index of it
