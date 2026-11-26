@@ -658,14 +658,15 @@ fn walk(t: Tree) -> List[Int] {
     (main_wrap {|    out.print("{"\r".lines()} {"a\n\r".lines()} {"a\r\nb\r\n".lines()} {"".lines()} {"\n".lines()} {"a\n\n".lines()} {"\r\n\r".lines()}")|})
     "[] [\"a\"] [\"a\", \"b\"] [] [\"\"] [\"a\", \"\"] [\"\"]\n";
   out "str-lines-gc"
-    (main_wrap {|    let mut parts: List[Str] = []
-    for i in 0..<1000 {
-        parts.push("x{i}")
-    }
-    let s = parts.join("\n")
-    let mut ok = 0
+    (main_wrap {|    let mut ok = 0
     for i in 0..<300 {
-        if s.lines().join("\n") == s && s.lines().len() == 1000 {
+        let mut parts: List[Str] = []
+        for j in 0..<1000 {
+            parts.push("x")
+        }
+        let s = parts.join("\n")
+        let ls = s.lines()
+        if s.len() == 1999 && ls.len() == 1000 && ls.join("\n") == s {
             ok = ok + 1
         }
     }
@@ -676,20 +677,26 @@ fn walk(t: Tree) -> List[Int] {
     out.print("{("1" + z).parse_int()} {z.trim().len()} {("a" + z + "b").split(z)} {(z + "x" + z).chars().len()} {(" 7" + z).trim().len()}")|})
     "None 1 [\"a\", \"b\"] 3 2\n";
   out "str-split-gc"
-    (main_wrap {|    let mut parts: List[Str] = []
-    for i in 0..<1000 {
-        parts.push("x{i}")
-    }
-    let s = parts.join(",")
-    let c = parts.join("")
-    let mut ok = 0
+    (main_wrap {|    let mut ok = 0
     for i in 0..<300 {
-        if s.split(",").join(",") == s && s.split(",").len() == 1000 && c.chars().join("") == c && c.split("").join("") == c {
+        let mut parts: List[Str] = []
+        for j in 0..<1000 {
+            parts.push("x")
+        }
+        let s = parts.join(",")
+        let c = parts.join("")
+        let sp = s.split(",")
+        let ch = c.chars()
+        let es = c.split("")
+        if s.len() == 1999 && sp.len() == 1000 && sp.join(",") == s && ch.len() == 1000 && ch.join("") == c && es.join("") == c {
             ok = ok + 1
         }
     }
     out.print("{ok}")|})
     "300\n";
+  out "float-nan-prints"
+    (main_wrap {|    out.print("{(0.0 / 0.0).to_str()} {0.0 / 0.0} {[0.0 / 0.0]} {-(0.0 / 0.0)}")|})
+    "nan nan [nan] nan\n";
   out "str-core-edges"
     (main_wrap {|    let long = "ab".split("abc")
     out.print("{"".split("")} {"aaa".split("aa")} {long}")

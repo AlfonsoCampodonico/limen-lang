@@ -6,10 +6,11 @@
    or extern declaration for everything else. limen_rt.c holds the rest of
    the definitions. Beside them: limen_sandbox.h (the sandbox), limen_sql.h
    (the SQL core) and limen_core.h (the built-ins written once, shared with
-   the interpreter). A native build compiles limen_sandbox.h, this file,
-   limen_sql.h, limen_core.h and limen_rt.c, in that order, as one object,
-   once per C compiler and set of flags, and keeps it in the build cache;
-   each piece of a program includes only this file. `limen build --emit-c`
+   the interpreter). A native build compiles limen_sandbox.h,
+   limen_core_inline.h, this file, limen_sql.h, limen_core.h and limen_rt.c,
+   in that order, as one object, once per C compiler and set of flags, and
+   keeps it in the build cache; each piece of a program includes
+   limen_core_inline.h and then this file. `limen build --emit-c`
    writes all of them ahead of the program, as one file that needs nothing
    else.
 

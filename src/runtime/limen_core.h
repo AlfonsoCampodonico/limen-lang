@@ -161,14 +161,16 @@ LC_FN size_t lc_written(int k, size_t cap) {
   return (size_t)k < cap ? (size_t)k : cap - 1;
 }
 
-/* Float.to_str and a Float in interpolation: one decimal for a whole number
+/* Float.to_str and a Float in interpolation: nan for any NaN (no sign),
+   inf or -inf, one decimal for a whole number
    under 1e16, else 15 significant digits. LC_FLOAT_MAX bytes always hold
    it (the longest, such as "-1.23456789012346e-308", is 22 bytes and the
    NUL). Returns the length written, which a smaller cap cuts short. */
 #define LC_FLOAT_MAX 32
 LC_FN size_t lc_fmt_float(char *out, size_t cap, double x) {
   int k;
-  if (x == floor(x) && fabs(x) < 1e16) k = snprintf(out, cap, "%.1f", x);
+  if (isnan(x)) k = snprintf(out, cap, "nan"); /* %.15g would print "-nan" for a sign-bit NaN on glibc */
+  else if (x == floor(x) && fabs(x) < 1e16) k = snprintf(out, cap, "%.1f", x);
   else k = snprintf(out, cap, "%.15g", x);
   return lc_written(k, cap);
 }

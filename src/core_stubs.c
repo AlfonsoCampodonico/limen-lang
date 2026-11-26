@@ -15,6 +15,16 @@
 #include <caml/memory.h>
 #include <caml/mlvalues.h>
 
+/* Copies s[start..start+len) into a new OCaml string. s is a root the
+   caller registered; it is read again after the allocation, which may move it. */
+static value core_sub(value s, size_t start, size_t len) {
+  CAMLparam1(s);
+  CAMLlocal1(piece);
+  piece = caml_alloc_string(len);
+  memcpy(Bytes_val(piece), String_val(s) + start, len);
+  CAMLreturn(piece);
+}
+
 value limen_core_lines(value s) {
   CAMLparam1(s);
   CAMLlocal2(out, piece);
@@ -24,24 +34,12 @@ value limen_core_lines(value s) {
   out = caml_alloc(count, 0);
   pos = 0;
   for (size_t i = 0; i < count; i++) {
+    /* String_val read afresh each time: the last piece may have moved s */
     lc_lines_next(String_val(s), n, &pos, &start, &len);
-    /* not caml_alloc_initialized_string: its source pointer would be read
-       before the allocation that may move s */
-    piece = caml_alloc_string(len);
-    memcpy(Bytes_val(piece), String_val(s) + start, len);
+    piece = core_sub(s, start, len);
     Store_field(out, i, piece);
   }
   CAMLreturn(out);
-}
-
-/* Copies s[start..start+len) into a new OCaml string. s is a root the
-   caller registered; it is read again after the allocation, which may move it. */
-static value core_sub(value s, size_t start, size_t len) {
-  CAMLparam1(s);
-  CAMLlocal1(piece);
-  piece = caml_alloc_string(len);
-  memcpy(Bytes_val(piece), String_val(s) + start, len);
-  CAMLreturn(piece);
 }
 
 value limen_core_split(value s, value sep) {
@@ -178,19 +176,19 @@ value limen_core_escaped(value s) {
 value limen_core_msg_list_index(value i, value len) {
   CAMLparam2(i, len);
   char t[LC_MSG_MAX];
-  size_t k = lc_msg_list_index(t, sizeof t, Int64_val(i), Long_val(len));
+  size_t k = lc_written((int)lc_msg_list_index(t, sizeof t, Int64_val(i), Long_val(len)), sizeof t);
   CAMLreturn(caml_alloc_initialized_string(k, t));
 }
 value limen_core_msg_bytes_index(value i, value len) {
   CAMLparam2(i, len);
   char t[LC_MSG_MAX];
-  size_t k = lc_msg_bytes_index(t, sizeof t, Int64_val(i), Long_val(len));
+  size_t k = lc_written((int)lc_msg_bytes_index(t, sizeof t, Int64_val(i), Long_val(len)), sizeof t);
   CAMLreturn(caml_alloc_initialized_string(k, t));
 }
 value limen_core_msg_byte_range(value v) {
   CAMLparam1(v);
   char t[LC_MSG_MAX];
-  size_t k = lc_msg_byte_range(t, sizeof t, Int64_val(v));
+  size_t k = lc_written((int)lc_msg_byte_range(t, sizeof t, Int64_val(v)), sizeof t);
   CAMLreturn(caml_alloc_initialized_string(k, t));
 }
 value limen_core_msg_key(value key) {

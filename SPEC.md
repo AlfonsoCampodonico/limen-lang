@@ -1535,12 +1535,12 @@ bench "sum to 100" {
 
 ## 13. How values print
 
-String interpolation and `to_str()` use these rules. At the top level a `Str` prints raw; inside a container it prints quoted, with `"`, `\`, newline, tab, `\r` and `\b` escaped and other non-printable bytes as `\ddd`.
+String interpolation and `to_str()` use these rules. At the top level a `Str` prints raw; inside a container it prints quoted, with `"`, `\`, newline, tab, `\r` and `\b` escaped and every other byte outside 32 to 126 as `\ddd`, three decimal digits.
 
 | Value | Prints as |
 | --- | --- |
 | `Int` | decimal |
-| `Float` | `2.0` if integral and below 10^16 in magnitude, else 15 significant digits (`0.333333333333333`) |
+| `Float` | `2.0` if integral and below 10^16 in magnitude, else 15 significant digits (`0.333333333333333`); NaN prints as `nan`, the infinities as `inf` and `-inf` |
 | `Bool` | `true` / `false` |
 | `()` | `()` |
 | `List`, `Array` | `[1, 2, 3]` |

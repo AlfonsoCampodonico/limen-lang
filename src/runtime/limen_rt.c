@@ -467,7 +467,7 @@ W_RT uint64_t w_siphash13(const unsigned char *in, size_t len) {
 __attribute__((noreturn)) W_RT void w_panic_key(WBuf *key, const char *where) {
   size_t n = lc_msg_key(NULL, 0, key->p, (size_t)key->len);
   char *m = (char *)malloc(n + 1);
-  if (!m) w_panic_c("out of memory", where);
+  if (!m) w_oom();
   lc_msg_key(m, n + 1, key->p, (size_t)key->len);
   w_panic_c(m, where);
 }
