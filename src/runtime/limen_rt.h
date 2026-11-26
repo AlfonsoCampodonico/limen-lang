@@ -492,23 +492,36 @@ static inline int64_t w_idx(int64_t i, int64_t n, const char *where) {
     return false;                                                                             \
   }
 
-/* Stable merge sort, by the element type's P##_cmp order. */
+/* Stable merge sort, by the element type's P##_cmp order. It merges
+   borrowed copies of the elements back and forth between two raw buffers
+   and builds the sorted list only once the last pass is done: a
+   cancellation at one of its checkpoints (one per pass, and one every 4096
+   merges) frees the two buffers on the way out and leaves the list as it
+   was. Instantiated for Int and Str after W_CHECK, below. */
+static inline void w_raw_drop(void *p) { free(*(void **)p); }
 #define LIMEN_LIST_SORT(L, T, P)                                                               \
   static L *L##_sort(L *l) {                                                                  \
-    L *c = L##_slice(l, 0, l->len);                                                           \
-    int64_t n = c->len;                                                                       \
-    T *tmp = (T *)w_raw(sizeof(T) * (size_t)(n ? n : 1));                                     \
+    int64_t n = l->len;                                                                       \
+    T *a __attribute__((cleanup(w_raw_drop))) = (T *)w_raw(sizeof(T) * (size_t)(n ? n : 1));  \
+    T *b __attribute__((cleanup(w_raw_drop))) = (T *)w_raw(sizeof(T) * (size_t)(n ? n : 1));  \
+    if (n) memcpy(a, l->data, sizeof(T) * (size_t)n);                                         \
     for (int64_t w = 1; w < n; w *= 2) {                                                      \
+      W_CHECK();                                                                              \
+      int64_t merges = 0;                                                                     \
       for (int64_t lo = 0; lo < n; lo += 2 * w) {                                             \
+        if ((++merges & 4095) == 0) W_CHECK();                                                \
         int64_t mid = lo + w < n ? lo + w : n, hi = lo + 2 * w < n ? lo + 2 * w : n;          \
         int64_t i = lo, j = mid, k = lo;                                                      \
-        while (i < mid && j < hi) tmp[k++] = P##_cmp(c->data[j], c->data[i]) < 0 ? c->data[j++] : c->data[i++]; \
-        while (i < mid) tmp[k++] = c->data[i++];                                              \
-        while (j < hi) tmp[k++] = c->data[j++];                                               \
+        while (i < mid && j < hi) b[k++] = P##_cmp(a[j], a[i]) < 0 ? a[j++] : a[i++];         \
+        while (i < mid) b[k++] = a[i++];                                                      \
+        while (j < hi) b[k++] = a[j++];                                                       \
       }                                                                                       \
-      memcpy(c->data, tmp, sizeof(T) * (size_t)n);                                            \
+      T *t = a; a = b; b = t;                                                                 \
     }                                                                                         \
-    free(tmp);                                                                                \
+    free(b);                                                                                  \
+    b = NULL;                                                                                 \
+    L *c = L##_new(n);                                                                        \
+    for (int64_t i = 0; i < n; i++) c->data[c->len++] = P##_dup(a[i]);                      \
     return c;                                                                                 \
   }
 
@@ -681,8 +694,6 @@ LIMEN_LIST_STRUCT(L_Int, int64_t)
 LIMEN_LIST_STRUCT(L_Str, WStr *)
 LIMEN_LIST_FUNCS(L_Int, int64_t, Int)
 LIMEN_LIST_FUNCS(L_Str, WStr *, Str)
-LIMEN_LIST_SORT(L_Int, int64_t, Int)
-LIMEN_LIST_SORT(L_Str, WStr *, Str)
 W_RT int64_t L_Int_sum(L_Int *l);
 W_RT WStr *L_Str_join(L_Str *l, WStr *sep);
 W_RT int64_t Str_find(WStr *s, WStr *sub, int64_t from);
@@ -1101,6 +1112,8 @@ W_RT void w_cancel_fiber(WFiber *f);
 extern int64_t w_stopping;
 __attribute__((noinline, cold)) W_RT void w_checkpoint(void);
 #define W_CHECK() do { if (__builtin_expect(__atomic_load_n(&w_stopping, __ATOMIC_RELAXED) != 0, 0)) w_checkpoint(); } while (0)
+LIMEN_LIST_SORT(L_Int, int64_t, Int)
+LIMEN_LIST_SORT(L_Str, WStr *, Str)
 static inline int w_tok_claim(WSel *tok, int idx) {
   int zero = 0;
   if (!__atomic_compare_exchange_n(&tok->done, &zero, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return 0;

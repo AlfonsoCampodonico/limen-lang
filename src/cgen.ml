@@ -1536,7 +1536,10 @@ and stmt c out ind (s : I.stmt) =
     c.uniq <- List.map (fun (v : I.var) -> v.id) hoisted @ c.uniq;
     (match Hoist.fill_loop body with
      | Some (i, inclusive, n, v, x) ->
-       (* Fill in one go: reserve once, then a plain store loop the C compiler vectorises. *)
+       (* Fill in one go: reserve once, then a plain store loop the C compiler
+          vectorises, in chunks of 65,536 with a checkpoint after each, so a
+          cancellation stops a long fill near its deadline. The list's length
+          and the counter are brought up to date before each checkpoint. *)
        let ln = cname c v.ty in
        line "{";
        line (sprintf "  int64_t cnt_;");
@@ -1546,9 +1549,13 @@ and stmt c out ind (s : I.stmt) =
        line (sprintf "    if (cnt_ > 0 && __builtin_add_overflow(%s->len, cnt_, &want_)) w_oom();" (var v));
        line "    if (cnt_ > 0) {";
        line (sprintf "      %s_reserve(&%s, want_);" ln (var v));
-       line (sprintf "      %s* d_ = %s->data + %s->len;" (ctype c (match v.ty with TList e -> e | _ -> TUnit)) (var v) (var v));
-       line (sprintf "      for (int64_t k_ = 0; k_ < cnt_; k_++) d_[k_] = %s;" (atom c x));
-       line (sprintf "      %s->len += cnt_; %s += cnt_;" (var v) (var i));
+       line "      for (int64_t o_ = 0; o_ < cnt_;) {";
+       line "        int64_t m_ = cnt_ - o_ < 65536 ? cnt_ - o_ : 65536;";
+       line (sprintf "        %s* d_ = %s->data + %s->len;" (ctype c (match v.ty with TList e -> e | _ -> TUnit)) (var v) (var v));
+       line (sprintf "        for (int64_t k_ = 0; k_ < m_; k_++) d_[k_] = %s;" (atom c x));
+       line (sprintf "        %s->len += m_; %s += m_; o_ += m_;" (var v) (var i));
+       line "        W_CHECK();";
+       line "      }";
        line "    }";
        line "  } else {";
        line "  for (;;) {";

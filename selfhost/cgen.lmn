@@ -2744,7 +2744,10 @@ fn plain_loop(mut self: Cg, ind: Str, idx: Int, body: List[ir.Stmt]) {
     match hoist.fill_loop(body) {
         Some(f) => {
             // Fill in one go: reserve once, then a plain store loop the C
-            // compiler vectorises.
+            // compiler vectorises, in chunks of 65,536 with a checkpoint
+            // after each, so a cancellation stops a long fill near its
+            // deadline. The list's length and the counter are brought up to
+            // date before each checkpoint.
             let ln = self.cname(f.v.ty)
             let el = match f.v.ty {
                 TList(e) => e,
@@ -2760,10 +2763,14 @@ fn plain_loop(mut self: Cg, ind: Str, idx: Int, body: List[ir.Stmt]) {
             self.line(ind, "    if (cnt_ > 0) \{")
             self.line(ind, "      {ln}_reserve(&{var(f.v)}, want_);")
             let ct = self.ctype(el)
-            self.line(ind, "      {ct}* d_ = {var(f.v)}->data + {var(f.v)}->len;")
+            self.line(ind, "      for (int64_t o_ = 0; o_ < cnt_;) \{")
+            self.line(ind, "        int64_t m_ = cnt_ - o_ < 65536 ? cnt_ - o_ : 65536;")
+            self.line(ind, "        {ct}* d_ = {var(f.v)}->data + {var(f.v)}->len;")
             let xa = self.atom(f.x)
-            self.line(ind, "      for (int64_t k_ = 0; k_ < cnt_; k_++) d_[k_] = {xa};")
-            self.line(ind, "      {var(f.v)}->len += cnt_; {var(f.i)} += cnt_;")
+            self.line(ind, "        for (int64_t k_ = 0; k_ < m_; k_++) d_[k_] = {xa};")
+            self.line(ind, "        {var(f.v)}->len += m_; {var(f.i)} += m_; o_ += m_;")
+            self.line(ind, "        W_CHECK();")
+            self.line(ind, "      }")
             self.line(ind, "    }")
             self.line(ind, "  } else \{")
             self.line(ind, "  for (;;) \{")

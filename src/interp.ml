@@ -797,6 +797,20 @@ let checkpoint () =
     end
   end
 
+(* A stable sort of a copy of [a], with a checkpoint every 4096 comparisons:
+   a cancellation stops it part way, and the list it was given, which it
+   never touches, stays as it was. *)
+let checked_sort cmp a =
+  let c = Array.copy a in
+  let n = ref 0 in
+  Array.stable_sort
+    (fun x y ->
+      incr n;
+      if !n land 4095 = 0 then checkpoint ();
+      cmp x y)
+    c;
+  c
+
 (* The POSIX number of an OCaml signal, for exit statuses (128 + n). OCaml
    numbers signals itself; Sys.signal_to_int only exists from 5.4. *)
 let signal_number s =
@@ -2943,8 +2957,7 @@ and limen_method rt n args sp =
   | "List::distinct_by", [ VList a; f ] -> distinct a (fun x -> call f [ x ])
   | "List::sort_by", [ VList a; f ] ->
     let keyed = Array.map (fun x -> (call f [ x ], x)) a in
-    Array.stable_sort (fun (k1, _) (k2, _) -> compare_v k1 k2) keyed;
-    VList (Array.map snd keyed)
+    VList (Array.map snd (checked_sort (fun (k1, _) (k2, _) -> compare_v k1 k2) keyed))
   | "List::partition", [ VList a; f ] ->
     let yes, no = List.partition (fun x -> as_bool (call f [ x ])) (Array.to_list a) in
     tup (lst yes) (lst no)
@@ -3089,10 +3102,7 @@ and call_method rt v name args sp =
   | VList a, "reverse", [] ->
     let n = Array.length a in
     VList (Array.init n (fun i -> a.(n - 1 - i)))
-  | VList a, "sort", [] ->
-    let c = Array.copy a in
-    Array.stable_sort compare_v c;
-    VList c
+  | VList a, "sort", [] -> VList (checked_sort compare_v a)
   | VList a, "take", [ VInt k ] -> VList (Array.sub a 0 (clamp k (Array.length a)))
   | VList a, "skip", [ VInt k ] ->
     let k = clamp k (Array.length a) in
