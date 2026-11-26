@@ -6345,6 +6345,32 @@ fn main(root: Root) -> Result[(), IoError] {
   out "chain-else-if-runs"
     (main_wrap ("    let k = 777\n    let x = " ^ String.concat "" (List.init 1000 (fun i -> sprintf "if k == %d { %d } else " i i)) ^ "{ 0 }\n    out.print(\"{x}\")"))
     "777\n";
+  (* natively too: an `else if` chain is emitted as `} else if (...) {`, so
+     its C nests no deeper with more links (older clangs stop at 256) *)
+  if selected "chain-else-if-flat-c" then begin
+    let src = main_wrap ("    let k = 777\n    let x = " ^ String.concat "" (List.init 1000 (fun i -> sprintf "if k == %d { %d } else " i i)) ^ "{ 0 }\n    out.print(\"{x}\")") in
+    let items, ds, _ = compile "chain-else-if-flat-c" src in
+    let c = if ds = [] then Native.c_source items else "" in
+    (* the deepest bracket nesting, past string and character literals and
+       comments *)
+    let n = String.length c in
+    let rec skip_quoted q i = if i >= n then i else if c.[i] = '\\' then skip_quoted q (i + 2) else if c.[i] = q then i + 1 else skip_quoted q (i + 1) in
+    let rec go i d best =
+      if i >= n then best
+      else
+        match c.[i] with
+        | '"' | '\'' -> go (skip_quoted c.[i] (i + 1)) d best
+        | '/' when i + 1 < n && c.[i + 1] = '/' -> go (match String.index_from_opt c i '\n' with Some j -> j | None -> n) d best
+        | '/' when i + 1 < n && c.[i + 1] = '*' ->
+          let rec close j = if j + 1 >= n then n else if c.[j] = '*' && c.[j + 1] = '/' then j + 2 else close (j + 1) in
+          go (close (i + 2)) d best
+        | '(' | '{' | '[' -> go (i + 1) (d + 1) (max best (d + 1))
+        | ')' | '}' | ']' -> go (i + 1) (d - 1) best
+        | _ -> go (i + 1) d best
+    in
+    let depth = go 0 0 0 in
+    ok "chain-else-if-flat-c" (c <> "" && depth < 256) (sprintf "the C nests %d deep" depth)
+  end;
   errs "deep-type" ("fn f(x: " ^ rep 300 "Option[" ^ "Int" ^ rep 300 "]" ^ ") {}\n\nfn main(root: Root) {}\n") [ "E0010" ];
   errs "deep-pattern" (main_wrap ("    match 1 {\n        " ^ rep 300 "Some(" ^ "y" ^ rep 300 ")" ^ " => (),\n        _ => (),\n    }")) [ "E0010" ];
   says "deep-says" (deep 100000 "(" ")") "E0010" "nested more than 256 deep";

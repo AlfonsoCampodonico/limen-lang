@@ -353,21 +353,7 @@ let rec lower f (e : expr) : I.atom =
       let ca = lower f c in
       let r = fresh_var "if" ty in
       emit f (I.Decl r);
-      let s1, _, d1 =
-        in_block f (fun () ->
-            let a = lower_block_inner f b in
-            emit f (I.Init (r, I.Atom a)))
-      in
-      let s2, _, d2 =
-        in_block f (fun () ->
-            match els with
-            | Some x ->
-              let a = lower f x in
-              emit f (I.Init (r, I.Atom a))
-            | None -> emit f (I.Init (r, I.Atom I.AUnit)))
-      in
-      emit f (I.If (ca, s1, s2));
-      if d1 && d2 then f.dead <- true;
+      lower_if f r ca b els;
       I.V r
     | EMatch (s, arms) -> lower_match f e s arms ty
     | ESelect arms -> lower_select f e arms ty
@@ -1196,6 +1182,30 @@ and lower_block f b =
   let a = lower_block_inner f b in
   f.scopes <- List.tl f.scopes;
   a
+
+(* The rest of an `if` whose test is [ca], into [r]. An `else if` of the
+   same type writes [r] too, rather than a variable of its own copied into
+   [r] after it, so its `else` ends with its `if` and the chain's C stays
+   flat (Cgen.else_chain). *)
+and lower_if f r ca b els =
+  let s1, _, d1 =
+    in_block f (fun () ->
+        let a = lower_block_inner f b in
+        emit f (I.Init (r, I.Atom a)))
+  in
+  let s2, _, d2 =
+    in_block f (fun () ->
+        match els with
+        | Some ({ edesc = EIf (c, b, els); _ } as x) when tyof f x = r.ty ->
+          let ca = lower f c in
+          lower_if f r ca b els
+        | Some x ->
+          let a = lower f x in
+          emit f (I.Init (r, I.Atom a))
+        | None -> emit f (I.Init (r, I.Atom I.AUnit)))
+  in
+  emit f (I.If (ca, s1, s2));
+  if d1 && d2 then f.dead <- true
 
 and lower_block_inner f b = lower_stmts f b.stmts b.tail
 

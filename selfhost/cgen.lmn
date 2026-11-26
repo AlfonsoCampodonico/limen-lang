@@ -2217,6 +2217,191 @@ fn switch_of(mut self: Cg, ind: Str, ch: IntChain) {
     self.line(ind, "}")
 }
 
+// An `else if` chain is written flat, `} else if (...) {` link after link,
+// so its C nests no deeper however long it is (older C compilers stop at
+// 256 brackets). A link's `else` holds the statements that work out its
+// test and then the `if` on it; those statements go into the test as a
+// statement expression, `} else if (({ ...; t; })) {`.
+struct ElseLink {
+    // the statements that work out the test
+    pre: List[ir.Stmt],
+    // its flag
+    test: ir.Atom,
+    // what runs when it holds
+    body: List[ir.Stmt],
+    // the whole `else` the link is
+    whole: List[ir.Stmt],
+}
+
+// Every variable `ss` writes C for, onto `acc`: the end of a scalar
+// writes none.
+fn push_uses(mut acc: List[Int], ss: List[ir.Stmt]) {
+    for s in ss {
+        match s {
+            Let(v, r) | Init(v, r) | Set(v, r, _) => {
+                acc.push(v.id)
+                for id in rhs_ids(r) {
+                    acc.push(id)
+                }
+            },
+            Decl(v) => acc.push(v.id),
+            Mutate(v, steps, m) => {
+                acc.push(v.id)
+                for id in atom_ids(ir.step_atoms(steps) + ir.mut_atoms(m)) {
+                    acc.push(id)
+                }
+            },
+            If(cnd, a, b) => {
+                for id in atom_ids([cnd]) {
+                    acc.push(id)
+                }
+                push_uses(mut acc, a)
+                push_uses(mut acc, b)
+            },
+            Loop(b) | Scope(_, b) => push_uses(mut acc, b),
+            Guard(_, h, b) => {
+                push_uses(mut acc, h)
+                push_uses(mut acc, b)
+            },
+            Return(a) => {
+                for id in atom_ids([a]) {
+                    acc.push(id)
+                }
+            },
+            Drop(v) => {
+                if !is_scalar(v.ty) {
+                    acc.push(v.id)
+                }
+            },
+            Break | Continue | GuardEnd(_) | Line(_) => {},
+        }
+    }
+}
+
+// No panic boundary (a `defer`, a deadline) in `ss`: those stay out of a
+// test's statement expression.
+fn unguarded(ss: List[ir.Stmt]) -> Bool {
+    for s in ss {
+        let ok = match s {
+            Guard(..) | GuardEnd(_) | Scope(..) => false,
+            If(_, a, b) => unguarded(a) && unguarded(b),
+            Loop(b) => unguarded(b),
+            _ => true,
+        }
+        if !ok {
+            return false
+        }
+    }
+    true
+}
+
+// The link an `else` is, when it is one: the statements before its `if`
+// (the end of a scalar after the `if` writes no C), unless a `switch`
+// takes that `if` (int_chain).
+fn else_link(ss: List[ir.Stmt]) -> Option[ElseLink] {
+    let mut n = ss.len()
+    while n > 0 {
+        let quiet = match ss[n - 1] {
+            Drop(v) => is_scalar(v.ty),
+            _ => false,
+        }
+        if !quiet {
+            break
+        }
+        n = n - 1
+    }
+    if n == 0 {
+        return None
+    }
+    let (test, body) = match ss[n - 1] {
+        If(t, a, _) => (t, a),
+        _ => {
+            return None
+        },
+    }
+    let pre = ss.take(n - 1)
+    if !unguarded(pre) {
+        return None
+    }
+    if n >= 2 && int_chain([ss[n - 2], ss[n - 1]], 0).is_some() {
+        return None
+    }
+    Some(ElseLink { pre, test, body, whole: ss })
+}
+
+// The `else` of an `if` that only tests and branches again: the links of
+// the chain, and the `else` after the last. A test declaring a variable
+// that is used past it ends the chain there, as a statement expression
+// would end the variable.
+fn else_chain(b: List[ir.Stmt]) -> (List[ElseLink], List[ir.Stmt]) {
+    let mut links: List[ElseLink] = []
+    let mut last = b
+    while true {
+        match else_link(last) {
+            Some(link) => {
+                last = match link.whole[link.pre.len()] {
+                    If(_, _, other) => other,
+                    _ => [],
+                }
+                links.push(link)
+            },
+            None => {
+                break
+            },
+        }
+    }
+    // where each test's variables are declared: link k
+    let mut decl: Map[Int, Int] = map()
+    for (k, link) in links.with_index() {
+        for s in link.pre {
+            match s {
+                Let(v, _) | Decl(v) => {
+                    decl[v.id] = k
+                },
+                _ => {},
+            }
+        }
+    }
+    let mut cut = links.len()
+    for (k, link) in links.with_index() {
+        let mut in_pre: List[Int] = []
+        push_uses(mut in_pre, [If(link.test, [], [])] + link.pre)
+        let mut in_body: List[Int] = []
+        push_uses(mut in_body, link.body)
+        for id in in_pre {
+            match decl.get(id) {
+                Some(j) if j < k && j < cut => {
+                    cut = j
+                },
+                _ => {},
+            }
+        }
+        for id in in_body {
+            match decl.get(id) {
+                Some(j) if j <= k && j < cut => {
+                    cut = j
+                },
+                _ => {},
+            }
+        }
+    }
+    let mut in_last: List[Int] = []
+    push_uses(mut in_last, last)
+    for id in in_last {
+        match decl.get(id) {
+            Some(j) if j < cut => {
+                cut = j
+            },
+            _ => {},
+        }
+    }
+    if cut == links.len() {
+        (links, last)
+    } else {
+        (links.take(cut), links[cut].whole)
+    }
+}
+
 // The loops in `ss`, as the planner counts them: through `if` and loops.
 fn count_loops(ss: List[ir.Stmt]) -> Int {
     ss.sum_by(|s| match s {
@@ -2273,9 +2458,22 @@ fn stmt(mut self: Cg, ind: Str, s: ir.Stmt) {
             let ca = self.atom(cond)
             self.line(ind, "if ({ca}) \{")
             self.stmts(ind + "  ", a)
-            if !b.is_empty() {
+            let (links, last) = else_chain(b)
+            for link in links {
+                if link.pre.is_empty() {
+                    let t = self.atom(link.test)
+                    self.line(ind, "} else if ({t}) \{")
+                } else {
+                    self.line(ind, "} else if ((\{")
+                    self.stmts(ind + "    ", link.pre)
+                    let t = self.atom(link.test)
+                    self.line(ind, "    {t}; })) \{")
+                }
+                self.stmts(ind + "  ", link.body)
+            }
+            if !last.is_empty() {
                 self.line(ind, "} else \{")
-                self.stmts(ind + "  ", b)
+                self.stmts(ind + "  ", last)
             }
             self.line(ind, "}")
         },

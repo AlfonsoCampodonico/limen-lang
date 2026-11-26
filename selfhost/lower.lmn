@@ -616,23 +616,7 @@ pub fn lower(mut self: Lx, e: ast.Expr) -> ir.Atom {
             let ca = self.lower(c)
             let r = self.fresh_var("if", ty)
             self.emit(Decl(r))
-            let saved = self.open()
-            let a = self.lower_block_inner(b)
-            self.emit(Init(r, Use(a)))
-            let (s1, d1) = self.close(saved)
-            let saved = self.open()
-            match other {
-                Some(x) => {
-                    let a = self.lower(x)
-                    self.emit(Init(r, Use(a)))
-                },
-                None => self.emit(Init(r, Use(AUnit))),
-            }
-            let (s2, d2) = self.close(saved)
-            self.emit(If(ca, s1, s2))
-            if d1 && d2 {
-                self.set_dead()
-            }
+            self.lower_if(r, ca, b, other)
             V(r)
         },
         EMatch(s, arms) => self.lower_match(e, s, arms, ty),
@@ -2018,6 +2002,42 @@ fn lower_block(mut self: Lx, b: ast.Block) -> ir.Atom {
     let a = self.lower_block_inner(b)
     self.pop_scope()
     a
+}
+
+// The rest of an `if` whose test is `ca`, into `r`. An `else if` of the
+// same type writes `r` too, rather than a variable of its own copied into
+// `r` after it, so its `else` ends with its `if` and the chain's C stays
+// flat (cgen's else_chain).
+fn lower_if(mut self: Lx, r: ir.Var, ca: ir.Atom, b: ast.Block, other: Option[ast.Expr]) {
+    let saved = self.open()
+    let a = self.lower_block_inner(b)
+    self.emit(Init(r, Use(a)))
+    let (s1, d1) = self.close(saved)
+    let saved = self.open()
+    match other {
+        Some(x) => {
+            let link = match x.desc {
+                EIf(c2, b2, other2) if self.tyof(x) == r.ty => Some((c2, b2, other2)),
+                _ => None,
+            }
+            match link {
+                Some((c2, b2, other2)) => {
+                    let ca2 = self.lower(c2)
+                    self.lower_if(r, ca2, b2, other2)
+                },
+                None => {
+                    let a = self.lower(x)
+                    self.emit(Init(r, Use(a)))
+                },
+            }
+        },
+        None => self.emit(Init(r, Use(AUnit))),
+    }
+    let (s2, d2) = self.close(saved)
+    self.emit(If(ca, s1, s2))
+    if d1 && d2 {
+        self.set_dead()
+    }
 }
 
 fn lower_block_inner(mut self: Lx, b: ast.Block) -> ir.Atom {

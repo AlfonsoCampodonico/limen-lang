@@ -1355,6 +1355,69 @@ let int_chain (ss : I.stmt list) =
     | _ -> None)
   | _ -> None
 
+(* An `else if` chain is written flat, `} else if (...) {` link after
+   link, so its C nests no deeper however long it is (older C compilers
+   stop at 256 brackets). A link's `else` holds the statements that work out
+   its test and then the `if` on it; those statements go into the test as
+   a statement expression, `} else if (({ ...; t; })) {`. *)
+
+(* Every variable [ss] writes C for, to [k]: the end of a scalar writes
+   none. *)
+let rec iter_uses k (ss : I.stmt list) =
+  let atoms xs = List.iter (fun a -> Option.iter (fun (v : I.var) -> k v.id) (I.atom_var a)) xs in
+  let rhs r = atoms (I.consumed r @ I.borrowed r) in
+  List.iter
+    (function
+      | I.Let (v, r) | I.Init (v, r) | I.Set (v, r, _) -> k v.id; rhs r
+      | I.Decl v -> k v.id
+      | I.Mutate (v, steps, m) -> k v.id; atoms (I.step_atoms steps @ I.mut_atoms m)
+      | I.If (cnd, a, b) -> atoms [ cnd ]; iter_uses k a; iter_uses k b
+      | I.Loop b | I.Scope (_, b) -> iter_uses k b
+      | I.Guard (_, h, b) -> iter_uses k h; iter_uses k b
+      | I.Return a -> atoms [ a ]
+      | I.Drop v -> if not (is_scalar v.ty) then k v.id
+      | I.Break | I.Continue | I.GuardEnd _ | I.Line _ -> ())
+    ss
+
+(* No panic boundary (a `defer`, a deadline) in [ss]: those stay out of a
+   test's statement expression. *)
+let rec unguarded (ss : I.stmt list) =
+  List.for_all
+    (function
+      | I.Guard _ | I.GuardEnd _ | I.Scope _ -> false
+      | I.If (_, a, b) -> unguarded a && unguarded b
+      | I.Loop b -> unguarded b
+      | _ -> true)
+    ss
+
+(* The links of the chain in an `else` [b]: each one's test statements,
+   flag and body, and the `else` after the last. A test that a `switch`
+   takes (int_chain) ends the chain, and so does one declaring a variable
+   that is used past the test, which a statement expression would end. *)
+let else_chain (b : I.stmt list) =
+  let split ss =
+    (* the end of a scalar after the `if` writes no C *)
+    let rec drop_quiet = function I.Drop v :: r when is_scalar v.ty -> drop_quiet r | r -> r in
+    match drop_quiet (List.rev ss) with
+    | (I.If (t, a, b) as s) :: pre when unguarded pre && int_chain (match pre with l :: _ -> [ l; s ] | [] -> []) = None ->
+      Some (List.rev pre, t, a, b)
+    | _ -> None
+  in
+  let rec peel acc ss = match split ss with Some (pre, t, a, b) -> peel ((pre, t, a, ss) :: acc) b | None -> (List.rev acc, ss) in
+  let links, last = peel [] b in
+  (* where each test's variables are declared: link k *)
+  let decl = Hashtbl.create 16 in
+  List.iteri (fun k (pre, _, _, _) -> List.iter (function I.Let (v, _) | I.Decl v -> Hashtbl.replace decl v.id k | _ -> ()) pre) links;
+  let cut = ref (List.length links) in
+  let past k = iter_uses (fun id -> match Hashtbl.find_opt decl id with Some j when j < k -> cut := min !cut j | _ -> ()) in
+  List.iteri (fun k (pre, t, a, _) -> past k (I.If (t, [], []) :: pre); past (k + 1) a) links;
+  past max_int last;
+  if !cut = List.length links then (List.map (fun (pre, t, a, _) -> (pre, t, a)) links, last)
+  else
+    let keep = List.filteri (fun k _ -> k < !cut) links in
+    let _, _, _, rest = List.nth links !cut in
+    (List.map (fun (pre, t, a, _) -> (pre, t, a)) keep, rest)
+
 let rec stmts c out ind (ss : I.stmt list) =
   match int_chain ss with
   | Some (x, arms, default, rest) ->
@@ -1425,9 +1488,20 @@ and stmt c out ind (s : I.stmt) =
   | I.If (cond, a, b) ->
     line (sprintf "if (%s) {" (atom c cond));
     stmts c out (ind ^ "  ") a;
-    if b <> [] then begin
+    let links, last = else_chain b in
+    List.iter
+      (fun (pre, t, a) ->
+        if pre = [] then line (sprintf "} else if (%s) {" (atom c t))
+        else begin
+          line "} else if (({";
+          stmts c out (ind ^ "    ") pre;
+          line (sprintf "    %s; })) {" (atom c t))
+        end;
+        stmts c out (ind ^ "  ") a)
+      links;
+    if last <> [] then begin
       line "} else {";
-      stmts c out (ind ^ "  ") b
+      stmts c out (ind ^ "  ") last
     end;
     line "}"
   | I.Loop body when List.exists (fun (b, _) -> b == body) c.plan.at_loop && not (List.memq body c.slotted) ->
