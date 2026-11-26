@@ -358,8 +358,9 @@ static int limen_pool_submit(limen_pjob *b) {
    heap may move meanwhile), queues the job and returns it with the read end
    of a pipe the pool thread writes to when the call has returned; the task
    waits on that descriptor as on a socket. A cancelled task abandons the
-   job (limen_ffi_job_abandon): the pool thread frees it when C returns, or
-   at once, without making the call, if it was still in the queue.
+   job (limen_ffi_job_abandon): the call still runs (in the background, even
+   if it was still in the queue) and the pool thread frees the job when C
+   returns.
    Blocking functions take no callbacks. */
 typedef struct {
   limen_pjob hd;
@@ -382,10 +383,6 @@ static void limen_job_free(limen_job *j) {
 
 static void limen_job_run(limen_pjob *p) {
   limen_job *j = (limen_job *)p;
-  pthread_mutex_lock(&j->mu);
-  int abandoned = j->state == 2;
-  pthread_mutex_unlock(&j->mu);
-  if (abandoned) { limen_job_free(j); return; }
   int64_t *iv = j->iv;
   double *fv = j->fv;
   void *f = j->f;
@@ -455,6 +452,8 @@ value limen_ffi_job_start(value fn, value flags, value ints, value floats, value
   j->hd.run = limen_job_run;
   int ok = pipe(j->fds) == 0;
   if (ok) {
+    fcntl(j->fds[0], F_SETFD, FD_CLOEXEC);
+    fcntl(j->fds[1], F_SETFD, FD_CLOEXEC);
     ok = limen_pool_submit(&j->hd);
     if (!ok) { close(j->fds[0]); close(j->fds[1]); }
   }
@@ -492,8 +491,8 @@ value limen_ffi_job_finish(value jv) {
 }
 
 /* limen_ffi_job_abandon : nativeint -> unit
-   Its task was cancelled: the pool thread frees the job once C returns, or
-   without making the call if it has not started it. */
+   Its task was cancelled: the call still runs, and the pool thread frees
+   the job once C returns. */
 value limen_ffi_job_abandon(value jv) {
   limen_job *j = (limen_job *)Nativeint_val(jv);
   pthread_mutex_lock(&j->mu);
@@ -1014,6 +1013,8 @@ value limen_sql_start(value api, value db, value text, value params, value mode)
   j->hd.run = limen_sql_job_run;
   int ok = pipe(j->fds) == 0;
   if (ok) {
+    fcntl(j->fds[0], F_SETFD, FD_CLOEXEC);
+    fcntl(j->fds[1], F_SETFD, FD_CLOEXEC);
     ok = limen_pool_submit(&j->hd);
     if (!ok) { close(j->fds[0]); close(j->fds[1]); }
   }

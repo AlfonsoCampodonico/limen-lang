@@ -1920,8 +1920,9 @@ fn main(root: Root) {
   out "ffi-blocking-cancel" ~grants:vt vt_blocking "[None, None, None, Some(5)]\n5 5 10 slow\n";
   check_tsan "ffi-blocking-cancel" ~grants:vt vt_blocking "[None, None, None, Some(5)]\n5 5 10 slow\n";
   (* Many blocking calls at once share the blocking-call pool (natively and,
-     since 0.8.1, in the interpreter): no more than 64 are in C at a time,
-     the rest wait in its queue, and 100 calls of 20 ms still take well
+     since 0.8.1, in the interpreter): the pool grows past the threads it
+     starts with (one per core, 16 or fewer here), no more than 64 calls are
+     in C at a time, the rest wait in its queue, and 100 calls of 20 ms still take well
      under the 2 s they would one after another. *)
   out "ffi-blocking-many" ~grants:vt {|foreign "limentest" {
     blocking fn vt_sleep_ms(ms: Int) -> Int
@@ -1939,7 +1940,7 @@ fn main(root: Root) {
         }
     }
     let peak = vt_sleepers_peak(f)
-    root.stdout.print("{r.len()} {r.sum()} {clock.now_ms() - start < 2000} {peak <= 64}")
+    root.stdout.print("{r.len()} {r.sum()} {clock.now_ms() - start < 2000} {peak > 16 && peak <= 64}")
 }
 |} "100 2000 true true\n";
   out "ffi-struct-shapes" ~grants:vt
