@@ -412,6 +412,46 @@ let rand_program =
     }
 |}
 
+let bytes_edges =
+  [ ""; "\000"; "a"; "\xff"; "\000\xff"; "\xc0\x80"; "\xed\xa0\x80"; "\xf4\x90\x80\x80"; "\xe2\x82"; "caf\xc3\xa9";
+    "\r\n"; String.init 300 (fun i -> Char.chr ((i * 7) land 255)) ]
+
+let bytes_random st =
+  String.init (Random.State.int st 41) (fun _ -> Char.chr (if Random.State.bool st then Random.State.int st 256 else Random.State.int st 3 * 127))
+
+let bytes_program st =
+  let inputs = bytes_edges @ List.init 100 (fun _ -> bytes_random st) in
+  let blit s = sprintf "bytes([%s])" (String.concat ", " (List.map (fun c -> string_of_int (Char.code c)) (List.of_seq (String.to_seq s)))) in
+  let defs, xs = chunked ~per:10 "inputs" "Bytes" (List.map blit inputs) in
+  defs
+  ^ {|fn bytes_one(out: Stdout, k: Int, b: Bytes, c: Bytes) {
+    let p = "bytes {k} {b.len()}"
+    let n = b.len()
+    out.print("{p} -> {b.len()} {b.is_empty()} {b.to_list()} {catch(|| b.to_str())}")
+    for i in [-1, 0, n - 1, n, n + 1, 9223372036854775807, -9223372036854775807 - 1] {
+        out.print("{p} index {i} -> {b.get(i)} {catch(|| b[i])}")
+    }
+    let ends = [-1, 0, 1, n / 2, n - 1, n, n + 1, -9223372036854775807 - 1, 9223372036854775807]
+    for lo in ends {
+        for hi in ends {
+            let x = b.slice(lo, hi)
+            out.print("{p} slice {lo} {hi} -> {x.len()} {x.to_list()}")
+        }
+    }
+    let s = b + c
+    out.print("{p} plus -> {s.len()} {s.to_list()} {s == b} {b < c} {b == c} {catch(|| b.slice(0, n).to_str())}")
+}
+
+|}
+  ^ main
+      (sprintf
+         {|    let xs = %s
+    for (k, b) in xs.with_index() {
+        bytes_one(out, k, b, xs[(k + 1) %% xs.len()])
+    }
+|}
+         xs)
+
 let panic_program =
   main
     {|    let r = root.rand
@@ -451,6 +491,7 @@ let programs ~seed =
   let uint = uint_program st in
   let float = float_program st in
   let order = order_program st in
+  let bytes = bytes_program st in
   [ ("xc-str", str, None);
     ("xc-long", long_program, None);
     ("xc-int", int, None);
@@ -458,4 +499,5 @@ let programs ~seed =
     ("xc-float", float, None);
     ("xc-order", order, None);
     ("xc-rand", rand_program, Some seed);
-    ("xc-panic", panic_program, None) ]
+    ("xc-panic", panic_program, None);
+    ("xc-bytes", bytes, None) ]
