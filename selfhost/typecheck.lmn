@@ -280,11 +280,20 @@ fn refuse_compared_params(cx: env.Cx, st: env.State) -> env.State {
                     let t = st.repr(t)
                     st = match st.subst.refused(env.equality(), t) {
                         Some(found) => match st.uncomparable(t, found) {
-                            Some(why) => st.report(diag.error("E0201", sp, "{what}, and {why}")),
-                            None => st.report(diag.error("E0201", sp, "{what}, and values of type `{st.show(t)}` cannot be compared")),
+                            Some(why) => {
+                                st.report(diag.error("E0201", sp, "{what}, and {why}"))
+                                st
+                            },
+                            None => {
+                                st.report(diag.error("E0201", sp, "{what}, and values of type `{st.show(t)}` cannot be compared"))
+                                st
+                            },
                         },
                         None => match st.held(t) {
-                            Some(h) => st.report(diag.error("E0201", sp, "{what}, and {h}").note("capabilities have no equality, so neither has a value holding one; compare something it holds that is not a capability, as in `xs.any(|x| x.name == name)`")),
+                            Some(h) => {
+                                st.report(diag.error("E0201", sp, "{what}, and {h}").note("capabilities have no equality, so neither has a value holding one; compare something it holds that is not a capability, as in `xs.any(|x| x.name == name)`"))
+                                st
+                            },
                             None => st,
                         },
                     }
@@ -468,7 +477,7 @@ fn register_types(cx: env.Cx, st: env.State, items: List[ast.Item]) -> (env.Cx, 
         }
         match clash {
             Some(d) => {
-                st = st.report(d)
+                st.report(d)
                 continue
             },
             None => {},
@@ -476,23 +485,23 @@ fn register_types(cx: env.Cx, st: env.State, items: List[ast.Item]) -> (env.Cx, 
         match i {
             IStruct(s) => {
                 if type_defined(cx, s.name) {
-                    st = st.report(diag.error("E0106", s.span, "type `{s.name}` is defined more than once"))
+                    st.report(diag.error("E0106", s.span, "type `{s.name}` is defined more than once"))
                 } else {
                     cx.structs[s.name] = s
                 }
             },
             IEnum(e) => {
                 if type_defined(cx, e.name) {
-                    st = st.report(diag.error("E0106", e.span, "type `{e.name}` is defined more than once"))
+                    st.report(diag.error("E0106", e.span, "type `{e.name}` is defined more than once"))
                 } else {
                     cx.enums[e.name] = e
                 }
             },
             IIface(f) => {
                 if builtins.bounds().contains(f.name) {
-                    st = st.report(diag.error("E0106", f.span, "`{f.name}` is a built-in bound; name the interface something else"))
+                    st.report(diag.error("E0106", f.span, "`{f.name}` is a built-in bound; name the interface something else"))
                 } else if type_defined(cx, f.name) || cx.ifaces.contains(f.name) {
-                    st = st.report(diag.error("E0106", f.span, "`{f.name}` is defined more than once"))
+                    st.report(diag.error("E0106", f.span, "`{f.name}` is defined more than once"))
                 } else {
                     cx.ifaces[f.name] = []
                     cx.iface_gen[f.name] = f.generics
@@ -525,8 +534,7 @@ fn resolve_bounds(cx: env.Cx, st: env.State, gen: List[Str], bounds: List[ast.Bo
     for b in bounds {
         let mut bs: List[env.Bound] = []
         for te in b.ifaces {
-            let (got, next) = st.resolve_bound(cx, generic_env(gen), te)
-            st = next
+            let got = st.resolve_bound(cx, generic_env(gen), te)
             match got {
                 Some(x) => bs.push(x),
                 None => {},
@@ -587,22 +595,20 @@ fn iface_methods(cx: env.Cx, st: env.State, ds: Decls, items: List[ast.Item]) ->
         let genv = generic_env(f.generics)
         for m in f.methods {
             if seen.contains(m.name) {
-                st = st.report(diag.error("E0106", m.span, "method `{m.name}` is declared twice in `{f.name}`"))
+                st.report(diag.error("E0106", m.span, "method `{m.name}` is declared twice in `{f.name}`"))
                 continue
             }
             seen.push(m.name)
             cx.param_names[f.name + "::" + m.name] = m.params.map(|p| p.name)
             // OCaml makes the pair (params, result) result first
-            let (ret, next) = match m.ret {
+            let ret = match m.ret {
                 Some(te) => st.resolve(cx, genv, te),
-                None => (TUnit, st),
+                None => TUnit,
             }
-            st = next
             let mut ps: List[types.Ty] = []
             for p in m.params {
-                let (t, next) = st.resolve(cx, genv, p.ty)
+                let t = st.resolve(cx, genv, p.ty)
                 ps.push(t)
-                st = next
             }
             ms.push(env.IfaceMethod { name: m.name, params: ps, ret })
         }
@@ -628,11 +634,15 @@ fn fields_and_variants(cx: env.Cx, st: env.State, ds: Decls, items: List[ast.Ite
             IType(a) => {
                 st.kinds = map()
                 let genv = generic_env(a.generics)
-                st = match a.body.desc {
+                match a.body.desc {
                     // another name for an interface with its arguments, used
                     // as a bound: `type Ints = Container[Int]`
-                    TyName(n, args) if cx.ifaces.contains(n) && !builtins.bounds().contains(n) => st.bound_args(cx, genv, n, args, a.body.span).1,
-                    _ => st.resolve(cx, genv, a.body).1,
+                    TyName(n, args) if cx.ifaces.contains(n) && !builtins.bounds().contains(n) => {
+                        let _ = st.bound_args(cx, genv, n, args, a.body.span)
+                    },
+                    _ => {
+                        let _ = st.resolve(cx, genv, a.body)
+                    },
                 }
                 // an alias is checked where it is used, with its arguments there
                 st.pending = []
@@ -643,7 +653,7 @@ fn fields_and_variants(cx: env.Cx, st: env.State, ds: Decls, items: List[ast.Ite
                     match ffi.struct_fields(s) {
                         Err(es) => {
                             for (sp, m) in es {
-                                st = st.report(diag.error("E0330", sp, m))
+                                st.report(diag.error("E0330", sp, m))
                             }
                         },
                         Ok(_) => {},
@@ -654,19 +664,19 @@ fn fields_and_variants(cx: env.Cx, st: env.State, ds: Decls, items: List[ast.Ite
                 let mut fs: List[(Str, types.Ty)] = []
                 for f in s.fields {
                     if seen.contains(f.name) {
-                        st = st.report(diag.error("E0106", f.span, "field `{f.name}` is declared twice"))
+                        st.report(diag.error("E0106", f.span, "field `{f.name}` is declared twice"))
                         continue
                     }
                     seen.push(f.name)
-                    let (t, next) = st.resolve(cx, genv, f.ty)
-                    st = next.check_storable(f.ty.span, t)
+                    let t = st.resolve(cx, genv, f.ty)
+                    st.check_storable(f.ty.span, t)
                     if s.embeds.contains(f.name) {
                         match st.repr(t) {
                             TNamed(n, _) if cx.structs.contains(n) && !ast.is_tuple_name(n) => {},
                             TErr => {},
                             other => {
                                 let d = diag.error("E0121", f.ty.span, "only a struct can be embedded, and `{st.show(other)}` is not one").note("give it a field name instead, as in `{f.name.to_lower()}: {st.show(other)}`")
-                                st = st.report(d)
+                                st.report(d)
                             },
                         }
                     }
@@ -682,14 +692,14 @@ fn fields_and_variants(cx: env.Cx, st: env.State, ds: Decls, items: List[ast.Ite
                 for v in e.variants {
                     let prev = cx.owners.get(v.name) ?? []
                     if prev.contains(e.name) {
-                        st = st.report(diag.error("E0106", v.span, "variant `{v.name}` is declared twice"))
+                        st.report(diag.error("E0106", v.span, "variant `{v.name}` is declared twice"))
                         continue
                     }
                     cx.owners[v.name] = prev + [e.name]
                     let mut ts: List[types.Ty] = []
                     for te in v.payload {
-                        let (t, next) = st.resolve(cx, genv, te)
-                        st = next.check_storable(te.span, t)
+                        let t = st.resolve(cx, genv, te)
+                        st.check_storable(te.span, t)
                         ts.push(t)
                     }
                     vs.push((v.name, ts))
@@ -719,7 +729,7 @@ fn no_self_containing(cx: env.Cx, st: env.State, items: List[ast.Item]) -> env.S
                 match reaches(cx, st, s.name, [], start, []).0 {
                     Some(path) => {
                         let d = diag.error("E0114", s.span, "struct `{s.name}` contains itself through `{path.join(".")}`, so it would be infinitely large").note("hold the inner value in an `Option`, an enum or a `List`, as in `next: Option[{s.name}]`; those store it indirectly")
-                        st = st.report(d)
+                        st.report(d)
                     },
                     None => {},
                 }
@@ -840,13 +850,12 @@ fn signatures(cx: env.Cx, st: env.State, ds: Decls, items: List[ast.Item]) -> (e
         match d.foreign {
             None => {
                 for p in d.params {
-                    let (t, next) = st.resolve(cx, genv, p.ty)
+                    let t = st.resolve(cx, genv, p.ty)
                     ps.push(t)
-                    st = next
                 }
                 match d.ret {
                     Some(te) => {
-                        (ret, st) = st.resolve(cx, genv, te)
+                        ret = st.resolve(cx, genv, te)
                     },
                     None => {},
                 }
@@ -862,7 +871,7 @@ fn signatures(cx: env.Cx, st: env.State, ds: Decls, items: List[ast.Item]) -> (e
                     None => {},
                 }
                 if d.name == "main" {
-                    st = st.report(diag.error("E0330", d.span, "`main` cannot be a foreign function"))
+                    st.report(diag.error("E0330", d.span, "`main` cannot be a foreign function"))
                 }
                 match ffi.of_decl(d, cx.structs) {
                     Ok(cs) => {
@@ -871,7 +880,7 @@ fn signatures(cx: env.Cx, st: env.State, ds: Decls, items: List[ast.Item]) -> (e
                     },
                     Err(es) => {
                         for (sp, m) in es {
-                            st = st.report(diag.error("E0330", sp, m))
+                            st.report(diag.error("E0330", sp, m))
                         }
                         ps = [TCap("Foreign")] + d.params.map(|_| TErr)
                         ret = TErr
@@ -899,7 +908,7 @@ fn signatures(cx: env.Cx, st: env.State, ds: Decls, items: List[ast.Item]) -> (e
         cx.fn_cur_bounds[d.name] = all
         cx.fn_kinds[d.name] = st.kinds.entries()
         (st, ds) = take_pending(st, ds, all)
-        st = st.check_stored(cx)
+        st.check_stored(cx)
         // a clash with a built-in method written in Limen is reported by check_self
         let builtin_clash = match cx.method_owner.get(d.name) {
             Some((_, f)) => f == cx.methods_file,
@@ -910,7 +919,7 @@ fn signatures(cx: env.Cx, st: env.State, ds: Decls, items: List[ast.Item]) -> (e
         }
         if cx.fns.contains(d.name) {
             if !builtin_clash {
-                st = st.report(diag.error("E0106", d.span, "function `{d.name}` is defined more than once"))
+                st.report(diag.error("E0106", d.span, "function `{d.name}` is defined more than once"))
             }
         } else {
             cx.fns[d.name] = s
@@ -940,7 +949,7 @@ fn check_self(cx: env.Cx, st: env.State, d: ast.FnDecl, ps: List[types.Ty]) -> e
     let mut st = st
     for (i, p) in d.params.with_index() {
         if p.name == "self" && i > 0 {
-            st = st.report(diag.error("E0110", p.span, "`self` can only be the first parameter, which makes the function a method"))
+            st.report(diag.error("E0110", p.span, "`self` can only be the first parameter, which makes the function a method"))
         }
     }
     let (p, t0) = match (d.params, ps) {
@@ -966,11 +975,13 @@ fn check_self(cx: env.Cx, st: env.State, d: ast.FnDecl, ps: List[types.Ty]) -> e
                 st.report(diag.error("E0106", d.span, "`{st.show(t)}` already has a built-in method `{name}`"))
             } else if d.public {
                 st.report(diag.error("E0110", d.span, "a method on built-in type `{st.show(t)}` cannot be `pub`: it is private to the file that defines it").note("export a plain function instead, as in `pub fn shout(s: Str) -> Str`"))
-            } else {
-                st
             }
+            st
         },
-        t => st.report(diag.error("E0110", p.span, "methods can only be defined on struct and enum types and on Int, Float, Bool, Str, List, Map, Option, Result and IoError, not on `{st.show(t)}`").note("write a plain function that takes the value instead, and rename the parameter")),
+        t => {
+            st.report(diag.error("E0110", p.span, "methods can only be defined on struct and enum types and on Int, Float, Bool, Str, List, Map, Option, Result and IoError, not on `{st.show(t)}`").note("write a plain function that takes the value instead, and rename the parameter"))
+            st
+        },
     }
 }
 
@@ -983,7 +994,7 @@ fn unique_tests(st: env.State, sigs: List[Fn]) -> env.State {
             Some(n) => {
                 let kind = if f.decl.bench { "bench" } else { "test" }
                 if seen.contains((kind, n)) {
-                    st = st.report(diag.error("E0106", f.decl.span, "{kind} \"{n}\" is defined more than once"))
+                    st.report(diag.error("E0106", f.decl.span, "{kind} \"{n}\" is defined more than once"))
                 } else {
                     seen.push((kind, n))
                 }
@@ -1008,14 +1019,14 @@ fn test_params(st: env.State, sigs: List[Fn]) -> env.State {
                     TErr => {},
                     _ => {
                         let message = if seen.contains(t) { "a test can take `{st.show(t)}` only once" } else { "a test cannot take `{st.show(t)}`" }
-                        st = st.report(diag.error("E0306", p.span, message).note("a test can take `fs: Fs` (a fresh temporary directory) and `clock: Clock`; pass anything else through an interface"))
+                        st.report(diag.error("E0306", p.span, message).note("a test can take `fs: Fs` (a fresh temporary directory) and `clock: Clock`; pass anything else through an interface"))
                     },
                 }
             }
         }
         // a bench measures real time
         if d.bench && d.virtual {
-            st = st.report(diag.error("E0306", d.span, "a bench cannot take a virtual clock").note("a bench is timed on the real clock; take `clock: Clock`"))
+            st.report(diag.error("E0306", d.span, "a bench cannot take a virtual clock").note("a bench is timed on the real clock; take `clock: Clock`"))
         }
     }
     st
@@ -1023,6 +1034,7 @@ fn test_params(st: env.State, sigs: List[Fn]) -> env.State {
 
 // 4. main
 fn check_main(st: env.State, d: ast.FnDecl, s: env.Sig) -> env.State {
+    let mut st = st
     let ok_params = match s.params {
         [] => true,
         [t] => st.repr(t) == TCap("Root"),
@@ -1038,7 +1050,8 @@ fn check_main(st: env.State, d: ast.FnDecl, s: env.Sig) -> env.State {
         _ => false,
     }
     if !s.gen.is_empty() || !(ok_params && ok_ret) || d.params.any(|p| p.mutable) {
-        return st.report(diag.error("E0303", d.span, "`main` has the wrong signature").note("write `fn main(root: Root)`, `fn main(root: Root) -> Int` (the exit code) or `fn main(root: Root) -> Result[(), E]`"))
+        st.report(diag.error("E0303", d.span, "`main` has the wrong signature").note("write `fn main(root: Root)`, `fn main(root: Root) -> Int` (the exit code) or `fn main(root: Root) -> Result[(), E]`"))
+        return st
     }
     st
 }
@@ -1129,7 +1142,7 @@ fn check_fn(cx: env.Cx, st: env.State, ds: Decls, d: ast.FnDecl, s: env.Sig) -> 
                     _ => false,
                 })
                 if generic {
-                    st = st.report(diag.error("E0123", dv.span, "`{p.name}` cannot have a default: its type `{st.show(t)}` uses a type parameter").note("a default is checked once, so its type must be the same at every call"))
+                    st.report(diag.error("E0123", dv.span, "`{p.name}` cannot have a default: its type `{st.show(t)}` uses a type parameter").note("a default is checked once, so its type must be the same at every call"))
                 } else {
                     st = checker.expect(st, cx, { fx with scopes: [] }, dv, t)
                 }
@@ -1159,8 +1172,8 @@ fn check_fn(cx: env.Cx, st: env.State, ds: Decls, d: ast.FnDecl, s: env.Sig) -> 
         return out_of_fn(check_pending(cx, st, ds))
     }
     let (bt, next) = checker.check_block(st, cx, fx, d.body)
-    let (ok, next) = next.unify(s.ret, bt)
     st = next
+    let ok = st.unify(s.ret, bt)
     if !ok {
         let b = d.body
         let sp = match b.tail {
@@ -1177,7 +1190,7 @@ fn check_fn(cx: env.Cx, st: env.State, ds: Decls, d: ast.FnDecl, s: env.Sig) -> 
             },
             _ => {},
         }
-        st = st.report(problem)
+        st.report(problem)
     }
     out_of_fn(check_pending(cx, st, ds))
 }
@@ -1212,7 +1225,7 @@ fn check_pending(cx: env.Cx, st: env.State, ds: Decls) -> (env.State, Decls) {
                     },
                     _ => {},
                 }
-                st = st.report(d)
+                st.report(d)
             },
             None => {},
         }
@@ -1242,7 +1255,7 @@ fn check_pending(cx: env.Cx, st: env.State, ds: Decls) -> (env.State, Decls) {
                 None => {},
             }
         }
-        st = st.check_stored(cx)
+        st.check_stored(cx)
         let mut ps: List[Str] = []
         for t in st.compared.reverse().map(|c| c.1) + st.eq_types.reverse() {
             ps = params_in(st, ps, t)
@@ -1296,7 +1309,7 @@ fn check_pending(cx: env.Cx, st: env.State, ds: Decls) -> (env.State, Decls) {
                     },
                     _ => {},
                 }
-                st = st.report(d)
+                st.report(d)
             },
             None => {},
         }

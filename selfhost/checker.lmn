@@ -25,11 +25,12 @@ use walk
 pub fn check_expr(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr) -> (types.Ty, env.State) {
     let (t, st) = inner(st, cx, fx, e)
     // a call can make the type of a generic interface bound known
-    let st = match st.desc(e) {
+    let mut st = match st.desc(e) {
         ECall(..) | EMethod(..) => infer_pending(st, cx),
         _ => st,
     }
-    (t, st.set_type(e, t))
+    st.set_type(e, t)
+    (t, st)
 }
 
 fn inner(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr) -> (types.Ty, env.State) {
@@ -45,10 +46,10 @@ fn inner(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr) -> (types.Ty, env.S
                     SPExpr(x) => {
                         let (t, next) = check_expr(st, cx, fx, x)
                         st = next
-                        st = match st.subst.refused(env.printing(), t) {
+                        match st.subst.refused(env.printing(), t) {
                             Some(Itself) => st.report(diag.error("E0201", x.span, "cannot interpolate a value of type `{st.show(t)}`")),
                             Some(Inside(u)) => st.report(diag.error("E0201", x.span, "cannot interpolate a value of type `{st.show(t)}`").note("`{st.show(t)}` holds `{st.show(u)}`, which cannot be interpolated")),
-                            None => st,
+                            None => {},
                         }
                     },
                     SPLit(_) => {},
@@ -58,8 +59,7 @@ fn inner(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr) -> (types.Ty, env.S
         },
         EVar(n) => check_var(st, cx, fx, e, n, e.span),
         EList(es) => {
-            let (el, next) = st.fresh()
-            st = next
+            let el = st.fresh()
             for x in es {
                 st = expect(st, cx, fx, x, el)
             }
@@ -67,27 +67,41 @@ fn inner(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr) -> (types.Ty, env.S
         },
         EBin(op, a, b) => check_bin(st, cx, fx, op, a, b, e.span),
         EUn(Neg, a) => {
-            let (t, st) = check_expr(st, cx, fx, a)
+            let (t, next) = check_expr(st, cx, fx, a)
+            st = next
             match st.repr(t) {
                 TInt | TFloat | TErr => (t, st),
-                TVar(_) => (TInt, st.unify_at(a.span, TInt, t)),
-                _ => (TErr, st.report(diag.error("E0201", a.span, "cannot negate a value of type `{st.show(t)}`"))),
+                TVar(_) => {
+                    st.unify_at(a.span, TInt, t)
+                    (TInt, st)
+                },
+                _ => {
+                    st.report(diag.error("E0201", a.span, "cannot negate a value of type `{st.show(t)}`"))
+                    (TErr, st)
+                },
             }
         },
         EUn(Not, a) => (TBool, expect(st, cx, fx, a, TBool)),
         EUn(BitNot, a) => {
-            let (t, st) = check_expr(st, cx, fx, a)
+            let (t, next) = check_expr(st, cx, fx, a)
+            st = next
             match st.repr(t) {
                 TInt | TUInt(_) | TErr => (t, st),
-                TVar(_) => (TInt, st.unify_at(a.span, TInt, t)),
-                _ => (TErr, st.report(diag.error("E0201", a.span, "operator `~` cannot be applied to `{st.show(t)}`"))),
+                TVar(_) => {
+                    st.unify_at(a.span, TInt, t)
+                    (TInt, st)
+                },
+                _ => {
+                    st.report(diag.error("E0201", a.span, "operator `~` cannot be applied to `{st.show(t)}`"))
+                    (TErr, st)
+                },
             }
         },
         ECall(callee, args) => check_call(st, cx, fx, e, callee, args, e.span, None),
         EMethod(recv, name, nsp, args) => match st.desc(recv) {
             // `Enum.Variant(args)` is a constructor call, not a method call
             EVar(en) if !fx.is_local(en) && cx.enums.contains(en) => {
-                let (callee, st) = st.node(EField(recv, name, nsp), ast.merge(recv.span, nsp))
+                let callee = st.node(EField(recv, name, nsp), ast.merge(recv.span, nsp))
                 check_call(st, cx, fx, e, callee, args, e.span, None)
             },
             _ => check_method(st, cx, fx, e, recv, name, nsp, args),
@@ -104,7 +118,10 @@ fn inner(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr) -> (types.Ty, env.S
                     match st.repr(t) {
                         TList(el) | TArray(el, _) => (el, st),
                         TErr => (TErr, st),
-                        _ => (TErr, st.report(diag.error("E0201", a.span, "only lists, arrays and maps can be indexed, found `{st.show(t)}`"))),
+                        _ => {
+                            st.report(diag.error("E0201", a.span, "only lists, arrays and maps can be indexed, found `{st.show(t)}`"))
+                            (TErr, st)
+                        },
                     }
                 },
             }
@@ -116,13 +133,13 @@ fn inner(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr) -> (types.Ty, env.S
             st = next
             match other {
                 None => {
-                    let (ok, next) = st.unify(TUnit, tt)
-                    st = next
+                    let ok = st.unify(TUnit, tt)
                     if ok {
                         return (TUnit, st)
                     }
                     let d = diag.error("E0203", b.span, "this `if` has no `else`, so its block must have type `()`, found `{st.show(tt)}`").note("add an `else` branch, or end the block with a statement")
-                    (TErr, st.report(d))
+                    st.report(d)
+                    (TErr, st)
                 },
                 Some(x) => (tt, expect(st, cx, fx, x, tt)),
             }
@@ -153,17 +170,18 @@ fn inner(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr) -> (types.Ty, env.S
             // a label the call did not take away: the callee has no
             // parameter names
             let d = diag.error("E0122", nsp, "`{n}:` names a parameter, but this call takes its arguments by position").fix("remove the label", { nsp with hi: x.span.lo }, "")
-            check_expr(st.report(d), cx, fx, x)
+            st.report(d)
+            check_expr(st, cx, fx, x)
         },
         // a call to a function or method declared with `fn` checks its
         // `mut` arguments itself; any other callee has no `mut` parameter
         EMut(x) => {
             let d = diag.error("E0213", e.span, "`mut` is only for an argument whose parameter is declared `mut`, and this callee has none").fix("remove `mut`", { e.span with hi: x.span.lo }, "")
-            check_expr(st.report(d), cx, fx, x)
+            st.report(d)
+            check_expr(st, cx, fx, x)
         },
         EGroup(name, _, until, b) => {
-            let (t, next) = st.fresh()
-            st = next
+            let t = st.fresh()
             if st.no_wait > 0 {
                 st = update_waits(st, e.span, "a `group` waits for its tasks")
             }
@@ -174,11 +192,11 @@ fn inner(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr) -> (types.Ty, env.S
                     match st.repr(ct) {
                         TCap("Clock") | TErr => {},
                         TVar(_) => {
-                            st = st.unify_at(dl.clock.span, TCap("Clock"), ct)
+                            st.unify_at(dl.clock.span, TCap("Clock"), ct)
                         },
                         _ => {
                             let d = diag.error("E0201", dl.clock.span, "`after` in a group deadline needs a `Clock`, found `{st.show(ct)}`").note("a group deadline is `group g until clock.after(ms) \{ ... }`, with the `Clock` from `root.clock`")
-                            st = st.report(d)
+                            st.report(d)
                         },
                     }
                     st = expect(st, cx, fx, dl.ms, TInt)
@@ -203,16 +221,22 @@ pub fn expect(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, want: types.Ty
         (EInt(v), TUInt(bits)) => {
             if v < 0 || (bits < 64 && v >= 1 << bits) {
                 let top = if bits == 64 { "18446744073709551615" } else { "{(1 << bits) - 1}" }
-                st = st.report(diag.error("E0201", e.span, "{v} does not fit in a `UInt{bits}`, which holds 0 to {top}"))
+                st.report(diag.error("E0201", e.span, "{v} does not fit in a `UInt{bits}`, which holds 0 to {top}"))
             }
             st.set_type(e, want)
+            st
         },
-        (EUn(Neg, x), TUInt(bits)) if is_int_literal(st, x) => st.report(diag.error("E0201", e.span, "a `UInt{bits}` cannot be negative")).set_type(e, want),
+        (EUn(Neg, x), TUInt(bits)) if is_int_literal(st, x) => {
+            st.report(diag.error("E0201", e.span, "a `UInt{bits}` cannot be negative"))
+            st.set_type(e, want)
+            st
+        },
         (EList(es), TList(el)) if is_uint(st, el) => {
             for x in es {
                 st = expect(st, cx, fx, x, el)
             }
             st.set_type(e, want)
+            st
         },
         (EList(es), TArray(el, n)) => {
             for x in es {
@@ -221,15 +245,16 @@ pub fn expect(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, want: types.Ty
             match st.repr(n) {
                 TLen(k) => {
                     if es.len() != k {
-                        st = st.report(diag.error("E0201", e.span, "expected {k} element{env.plural(k)} for `{st.show(want)}`, found {es.len()}"))
+                        st.report(diag.error("E0201", e.span, "expected {k} element{env.plural(k)} for `{st.show(want)}`, found {es.len()}"))
                     }
                 },
                 // a length still to infer, as at a call of `fn sum[N](xs: Array[Int, N])`
                 _ => {
-                    st = st.unify_at(e.span, n, TLen(es.len()))
+                    st.unify_at(e.span, n, TLen(es.len()))
                 },
             }
             st.set_type(e, want)
+            st
         },
         (EList(es), TList(el)) if is_dyn(st, el) => {
             // each element is boxed on its own, so a list can mix types
@@ -237,6 +262,7 @@ pub fn expect(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, want: types.Ty
                 st = expect(st, cx, fx, x, el)
             }
             st.set_type(e, want)
+            st
         },
         // the expected type reaches each branch, so `if` and `match` arms
         // can become `dyn` one by one, and closures in them get their types
@@ -245,18 +271,28 @@ pub fn expect(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, want: types.Ty
             st = expect_block(st, cx, fx, b, want)
             st = expect(st, cx, fx, other, want)
             st.set_type(e, want)
+            st
         },
         (EMatch(s, arms), _) => {
-            let (t, st) = check_match(st, cx, fx, s, arms, e.span, Some(want))
+            let (t, next) = check_match(st, cx, fx, s, arms, e.span, Some(want))
+            st = next
             st.set_type(e, t)
+            st
         },
         // `Err(x)` or `Some(x)` where a `dyn` payload is expected: the
         // expected type reaches the arguments, so `x` becomes `dyn`
         (ECall(callee, args), TNamed(_, targs)) if targs.any(|a| st.subst.has_dyn(a)) => {
-            let (t, st) = check_call(st, cx, fx, e, callee, args, e.span, Some(want))
-            st.set_type(e, t).unify_at(e.span, want, t)
+            let (t, next) = check_call(st, cx, fx, e, callee, args, e.span, Some(want))
+            st = next
+            st.set_type(e, t)
+            st.unify_at(e.span, want, t)
+            st
         },
-        (EBlock(b), _) => expect_block(st, cx, fx, b, want).set_type(e, want),
+        (EBlock(b), _) => {
+            st = expect_block(st, cx, fx, b, want)
+            st.set_type(e, want)
+            st
+        },
         // the expected type reaches into a list or tuple literal when an
         // item needs it: a closure whose parameters have no types, as in
         // `[("GET /", |r, p| ...)]`
@@ -265,12 +301,14 @@ pub fn expect(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, want: types.Ty
                 st = expect(st, cx, fx, x, el)
             }
             st.set_type(e, want)
+            st
         },
         (EStruct(n, _, fields), TNamed(tn, ts)) if ast.is_tuple_name(n) && n == tn && fields.len() == ts.len() && fields.any(|x| needs_type(st, x.value)) => {
             for (x, t) in fields.zip(ts) {
                 st = expect(st, cx, fx, x.value, t)
             }
             st.set_type(e, want)
+            st
         },
         (_, TDyn(i, a)) => {
             let (t, st) = check_expr(st, cx, fx, e)
@@ -314,11 +352,18 @@ fn is_dyn(st: env.State, t: types.Ty) -> Bool {
 
 // A value used where `dyn I` is expected: box it if its type satisfies I.
 fn coerce(st: env.State, cx: env.Cx, e: ast.Expr, t: types.Ty, b: env.Bound) -> env.State {
+    let mut st = st
     let boxed = TDyn(b.iface, b.args)
     let bn = st.show_bound(b)
     match st.repr(t) {
-        TDyn(j, _) if j == b.iface => st.unify_at(e.span, boxed, t),
-        TVar(_) => st.unify_at(e.span, boxed, t),
+        TDyn(j, _) if j == b.iface => {
+            st.unify_at(e.span, boxed, t)
+            st
+        },
+        TVar(_) => {
+            st.unify_at(e.span, boxed, t)
+            st
+        },
         TErr => st,
         // the built-in errors: a message, no cause
         TStr | TNamed("IoError", _) if b.iface == "Error" => box(st, e, b),
@@ -327,14 +372,16 @@ fn coerce(st: env.State, cx: env.Cx, e: ast.Expr, t: types.Ty, b: env.Bound) -> 
             match st.held(ct) {
                 Some(h) => {
                     let d = diag.error("E0112", e.span, "{h}, so it cannot become `dyn {bn}`").note("authority must stay visible in types; pass it with a type parameter, as in `[T: " + bn + "]`")
-                    return st.report(d)
+                    st.report(d)
+                    return st
                 },
                 None => {},
             }
             let kind = st.subst.chan_kind(ct)
             if st.subst.has_chan(ct) && !st.subst.has_fn(ct) && kind != Some("channel") {
                 let d = diag.error("E0112", e.span, "`{st.show(ct)}` holds an `Atomic` or `Shared` value, so it cannot become `dyn {bn}`").note("shared state must stay visible in types; pass it with a type parameter, as in `[T: " + bn + "]`")
-                return st.report(d)
+                st.report(d)
+                return st
             }
             if st.subst.has_fn(ct) || st.subst.has_chan(ct) {
                 let message = match st.holds_fn_through(ct) {
@@ -342,16 +389,23 @@ fn coerce(st: env.State, cx: env.Cx, e: ast.Expr, t: types.Ty, b: env.Bound) -> 
                     None => "`{st.show(ct)}` holds a function or channel, so it cannot become `dyn {bn}`",
                 }
                 let d = diag.error("E0112", e.span, message).note("a function or channel could carry authority out of sight; pass it with a type parameter, as in `[T: " + bn + "]`")
-                return st.report(d)
+                st.report(d)
+                return st
             }
-            match satisfies(st, cx, ct, b) {
-                (Some(why), st) => st.report(diag.error("E0111", e.span, "`{st.show(ct)}` does not satisfy interface `{bn}`").note(why)),
-                (None, st) => box(st, e, b),
+            let (why, next) = satisfies(st, cx, ct, b)
+            st = next
+            match why {
+                Some(why) => {
+                    st.report(diag.error("E0111", e.span, "`{st.show(ct)}` does not satisfy interface `{bn}`").note(why))
+                    st
+                },
+                None => box(st, e, b),
             }
         },
         other => {
             let d = diag.error("E0112", e.span, "only struct and enum values can become `dyn {bn}`, not `{st.show(other)}`").note("wrap the value in a struct that has the interface's methods")
             st.report(d)
+            st
         },
     }
 }
@@ -360,12 +414,16 @@ fn coerce(st: env.State, cx: env.Cx, e: ast.Expr, t: types.Ty, b: env.Bound) -> 
 // expression with what was known of `e` (its form, type and type
 // arguments), and `e` is the boxed value, of type `dyn I`.
 fn box(st: env.State, e: ast.Expr, b: env.Bound) -> env.State {
-    let (inner, st) = st.node(st.desc(e), e.span)
-    let mut st = st.set_type(inner, st.type_of(e)).set_inst(inner, st.inst_of(e))
+    let mut st = st
+    let inner = st.node(st.desc(e), e.span)
+    st.set_type(inner, st.type_of(e))
+    st.set_inst(inner, st.inst_of(e))
     if st.nested.contains(e.id) {
         st.nested[inner.id] = true
     }
-    st.rewrite(e, EDyn(inner, b.iface)).set_type(e, TDyn(b.iface, b.args))
+    st.rewrite(e, EDyn(inner, b.iface))
+    st.set_type(e, TDyn(b.iface, b.args))
+    st
 }
 
 // Does `t` have every method of bound `b`, with the same types? None if
@@ -383,8 +441,7 @@ pub fn satisfies(st: env.State, cx: env.Cx, t: types.Ty, b: env.Bound) -> (Optio
         }
         let mut st = st
         for (x, y) in b.args.zip(args) {
-            let (ok, next) = st.unify(x, y)
-            st = next
+            let ok = st.unify(x, y)
             if !ok {
                 return (false, st)
             }
@@ -434,9 +491,11 @@ pub fn satisfies(st: env.State, cx: env.Cx, t: types.Ty, b: env.Bound) -> (Optio
 // Whether `t` has method `m` of the interface called `name` (as shown),
 // with its type; why not if it does not.
 fn method_fits(st: env.State, cx: env.Cx, t: types.Ty, name: Str, m: env.IfaceMethod) -> (Option[Str], env.State) {
+    let mut st = st
     let want = TFn(m.params, m.ret)
     let trial = |st: env.State, got: types.Ty| {
-        let (ok, st) = st.unify(want, got)
+        let mut st = st
+        let ok = st.unify(want, got)
         if ok {
             return (None, st)
         }
@@ -463,9 +522,13 @@ fn method_fits(st: env.State, cx: env.Cx, t: types.Ty, name: Str, m: env.IfaceMe
         // a bound or `dyn` calls it as a value, with a plain receiver
         TNamed(n, _) if cx.has_mut(key(n)) => (Some("its `{m.name}` has a `mut` parameter, so it cannot implement `{name}`"), st),
         TNamed(n, _) if cx.fns.contains(key(n)) => {
-            let (_, ft, st) = instantiate(st, cx.fns.get(key(n)) ?? env.Sig { gen: [], params: [], ret: TErr })
+            let (_, ft, next) = instantiate(st, cx.fns.get(key(n)) ?? env.Sig { gen: [], params: [], ret: TErr })
+            st = next
             match ft {
-                TFn([p0, ..rest], r) => trial(st.unify(p0, t).1, TFn(rest, r)),
+                TFn([p0, ..rest], r) => {
+                    st.unify(p0, t)
+                    trial(st, TFn(rest, r))
+                },
                 _ => (Some("its `{m.name}` is not a method"), st),
             }
         },
@@ -474,7 +537,7 @@ fn method_fits(st: env.State, cx: env.Cx, t: types.Ty, name: Str, m: env.IfaceMe
             _ => (None, st),
         },
         _ => {
-            let (u, st) = st.fresh()
+            let u = st.fresh()
             match builtins.find(t, u, m.name) {
                 Some(x) => trial(st, TFn(x.params, x.result)),
                 None => (Some("`{st.show(t)}` has no method `{m.name}`"), st),
@@ -511,14 +574,20 @@ fn infer_pending(st: env.State, cx: env.Cx) -> env.State {
 }
 
 fn expect_plain(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, want: types.Ty) -> env.State {
+    let mut st = st
     match st.desc(e) {
         EClosure(ps, body) => {
-            let (t, st) = check_closure(st, cx, fx, ps, body, Some(want))
-            st.set_type(e, t).unify_at(e.span, want, t)
+            let (t, next) = check_closure(st, cx, fx, ps, body, Some(want))
+            st = next
+            st.set_type(e, t)
+            st.unify_at(e.span, want, t)
+            st
         },
         _ => {
-            let (t, st) = check_expr(st, cx, fx, e)
+            let (t, next) = check_expr(st, cx, fx, e)
+            st = next
             st.unify_at(e.span, want, t)
+            st
         },
     }
 }
@@ -527,7 +596,8 @@ fn check_var(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, n: Str, sp: ast
     let mut st = st
     match fx.find_var(n) {
         Some(v) if v.kind == KGroup => {
-            return (TErr, st.report(diag.error("E0310", sp, "`{n}` is a group handle; the only thing you can do with it is `{n}.go(...)`")))
+            st.report(diag.error("E0310", sp, "`{n}` is a group handle; the only thing you can do with it is `{n}.go(...)`"))
+            return (TErr, st)
         },
         Some(v) => {
             let pass = st.arg_of
@@ -552,15 +622,18 @@ fn check_var(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, n: Str, sp: ast
     match cx.fns.get(n) {
         Some(_) if cx.foreign_fns.contains(n) && !direct => {
             let d = diag.error("E0331", sp, "foreign function `{n}` can only be called, not used as a value").note("wrap it in a closure, as in `|x| {n}(foreign, x)`")
-            return (TErr, st.report(d))
+            st.report(d)
+            return (TErr, st)
         },
         Some(_) if cx.has_mut(n) && !direct => {
             let d = diag.error("E0215", sp, "`{n}` has a `mut` parameter, so it can only be called, not used as a value").note("a `mut` argument is a place, which only a direct call can pass: call `{n}(...)` by name")
-            return (TErr, st.report(d))
+            st.report(d)
+            return (TErr, st)
         },
         Some(s) => {
             let (inst, t, next) = instantiate(st, s)
-            st = next.set_inst(e, inst)
+            st = next
+            st.set_inst(e, inst)
             return (t, add_bounds(st, cx, n, inst, sp))
         },
         None => {},
@@ -571,21 +644,23 @@ fn check_var(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, n: Str, sp: ast
                 // name the enum when the variant name alone would be
                 // ambiguous to the backends
                 if (cx.owners.get(n) ?? []).len() > 1 {
-                    let (qual, next) = st.node(EVar(en), sp)
-                    st = next.rewrite(e, EField(qual, n, sp))
+                    let qual = st.node(EVar(en), sp)
+                    st.rewrite(e, EField(qual, n, sp))
                 }
                 return ctor_ty(st, cx, en, n, sp)
             },
             ens => {
                 let d = diag.error("E0104", sp, "`{n}` is a variant of several enums ({ens.join(", ")}); qualify it, for example `{ens[0]}.{n}`")
-                return (TErr, st.report(d))
+                st.report(d)
+                return (TErr, st)
             },
         }
     }
     match builtins.ambient(n) {
         Some(a) => {
             let d = diag.error("E0302", sp, "`{n}` does not exist: Limen has no ambient I/O").note("I/O goes through capabilities: take a `{a.cap}` parameter and call `{a.how}`").note("in `main`, the capabilities live on `root`, for example `root.stdout.print(\"hi\")`")
-            return (TErr, st.report(d))
+            st.report(d)
+            return (TErr, st)
         },
         None => {},
     }
@@ -600,7 +675,8 @@ fn check_var(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, n: Str, sp: ast
         },
         None => {},
     }
-    (TErr, st.did_you_mean(d, n, visible_names(cx, fx)))
+    st.did_you_mean(d, n, visible_names(cx, fx))
+    (TErr, st)
 }
 
 fn visible_names(cx: env.Cx, fx: env.Fx) -> List[Str] {
@@ -608,7 +684,8 @@ fn visible_names(cx: env.Cx, fx: env.Fx) -> List[Str] {
 }
 
 fn instantiate(st: env.State, s: env.Sig) -> (List[(Str, types.Ty)], types.Ty, env.State) {
-    let (vars, st) = st.fresh_list(s.gen.len())
+    let mut st = st
+    let vars = st.fresh_list(s.gen.len())
     let inst = s.gen.zip(vars)
     (inst, TFn(s.params.map(|p| st.subst(inst, p)), st.subst(inst, s.ret)), st)
 }
@@ -617,14 +694,24 @@ fn instantiate(st: env.State, s: env.Sig) -> (List[(Str, types.Ty)], types.Ty, e
 // equality: functions, channels, `dyn` values, capabilities, and values
 // holding one of them, as `==` refuses them.
 pub fn refuse_compare(st: env.State, sp: ast.Span, name: Str, t: types.Ty) -> env.State {
+    let mut st = st
     let t = st.repr(t)
     match st.subst.refused(env.equality(), t) {
         Some(found) => match st.uncomparable(t, found) {
-            Some(why) => st.report(diag.error("E0201", sp, "`{name}` compares values, and {why}")),
-            None => st.report(diag.error("E0201", sp, "`{name}` compares values, and values of type `{st.show(t)}` cannot be compared")),
+            Some(why) => {
+                st.report(diag.error("E0201", sp, "`{name}` compares values, and {why}"))
+                st
+            },
+            None => {
+                st.report(diag.error("E0201", sp, "`{name}` compares values, and values of type `{st.show(t)}` cannot be compared"))
+                st
+            },
         },
         None => match st.held(t) {
-            Some(h) => st.report(diag.error("E0201", sp, "`{name}` compares values, and {h}").note("capabilities have no equality, so neither has a value holding one; compare something it holds that is not a capability, as in `xs.any(|x| x.name == name)`")),
+            Some(h) => {
+                st.report(diag.error("E0201", sp, "`{name}` compares values, and {h}").note("capabilities have no equality, so neither has a value holding one; compare something it holds that is not a capability, as in `xs.any(|x| x.name == name)`"))
+                st
+            },
             None => st,
         },
     }
@@ -674,9 +761,10 @@ fn variant_scope(cx: env.Cx, v: Str, file: Int) -> List[Str] {
 // The type of variant `v` of enum `en` used as a value: the enum, or a
 // function from its payload to the enum.
 fn ctor_ty(st: env.State, cx: env.Cx, en: Str, v: Str, sp: ast.Span) -> (types.Ty, env.State) {
+    let mut st = st
     let gen = cx.enums.get(en).map(|e| e.generics) ?? []
-    let (targs, st) = st.fresh_list(gen.len())
-    let st = st.add_type_bounds(cx, en, targs, sp)
+    let targs = st.fresh_list(gen.len())
+    st.add_type_bounds(cx, en, targs, sp)
     let inst = gen.zip(targs)
     let payload = (cx.variants.get(en) ?? []).find(|x| x.0 == v).map(|x| x.1) ?? []
     let result = TNamed(en, targs)
@@ -701,7 +789,8 @@ fn check_args(st: env.State, cx: env.Cx, fx: env.Fx, args: List[ast.Expr]) -> en
         match st.desc(x) {
             EMut(p) => {
                 let (t, next) = check_expr(st, cx, fx, p)
-                st = next.set_type(x, t)
+                st = next
+                st.set_type(x, t)
             },
             _ => {
                 let (_, next) = check_expr(st, cx, fx, x)
@@ -746,7 +835,8 @@ fn order_args(st: env.State, what: Str, sp: ast.Span, names: Result[List[Str], S
                 match st.desc(a) {
                     ENamed(l, lsp, v) => {
                         let d = diag.error("E0122", lsp, "`{l}:` names a parameter, but {why}").fix("remove the label", { lsp with hi: v.span.lo }, "")
-                        return (None, st.report(d))
+                        st.report(d)
+                        return (None, st)
                     },
                     _ => {},
                 }
@@ -778,7 +868,7 @@ fn order_args(st: env.State, what: Str, sp: ast.Span, names: Result[List[Str], S
                             ok = false
                             dup = true
                             let d = diag.error("E0122", lsp, "parameter `{l}` is passed twice").note("positional arguments fill the parameters in order, before the named ones")
-                            st = st.report(d)
+                            st.report(d)
                         },
                         None => {
                             slots[j] = Some(v)
@@ -801,7 +891,7 @@ fn order_args(st: env.State, what: Str, sp: ast.Span, names: Result[List[Str], S
     }
     if extra > 0 {
         ok = false
-        st = st.report(diag.error("E0107", sp, "{what} takes {n} argument{env.plural(n)} but {total} {env.was_were(total)} supplied"))
+        st.report(diag.error("E0107", sp, "{what} takes {n} argument{env.plural(n)} but {total} {env.was_were(total)} supplied"))
     }
     // a parameter left out takes its default
     for (j, d) in defaults.with_index() {
@@ -816,14 +906,14 @@ fn order_args(st: env.State, what: Str, sp: ast.Span, names: Result[List[Str], S
         ([(l, lsp)], [m]) => {
             // one wrong label and one parameter left: that must be the one
             missing = []
-            st = st.report(with_notes(diag.error("E0122", lsp, "{what} has no parameter `{l}`")).fix("did you mean `{m}`?", lsp, m))
+            st.report(with_notes(diag.error("E0122", lsp, "{what} has no parameter `{l}`")).fix("did you mean `{m}`?", lsp, m))
         },
         (us, _) => {
             if !us.is_empty() {
                 missing = []
             }
             for (l, lsp) in us {
-                st = st.did_you_mean(with_notes(diag.error("E0122", lsp, "{what} has no parameter `{l}`")), l, names)
+                st.did_you_mean(with_notes(diag.error("E0122", lsp, "{what} has no parameter `{l}`")), l, names)
             }
         },
     }
@@ -837,12 +927,12 @@ fn order_args(st: env.State, what: Str, sp: ast.Span, names: Result[List[Str], S
             },
             [] => {},
         }
-        st = st.report(d)
+        st.report(d)
     }
     if misplaced.is_empty() && extra == 0 && !dup {
         for m in missing {
             ok = false
-            st = st.report(diag.error("E0107", sp, "{what} is missing the argument for parameter `{m}`").note("every parameter without a default value must be passed"))
+            st.report(diag.error("E0107", sp, "{what} is missing the argument for parameter `{m}`").note("every parameter without a default value must be passed"))
         }
     }
     if !ok {
@@ -887,8 +977,8 @@ fn keep_order(st: env.State, e: ast.Expr, written: List[ast.Expr], r: types.Ty) 
     let mut vars: List[(Int, ast.Expr)] = []
     for x in effects {
         let name = temps.find(|t| t.0 == x.id).map(|t| t.1) ?? ""
-        let (v, next) = st.node(EVar(name), x.span)
-        st = next.set_type(v, next.type_of(x))
+        let v = st.node(EVar(name), x.span)
+        st.set_type(v, st.type_of(x))
         vars.push((x.id, v))
     }
     let var = |x: ast.Expr| vars.find(|v| v.0 == x.id).map(|v| v.1) ?? x
@@ -906,11 +996,12 @@ fn keep_order(st: env.State, e: ast.Expr, written: List[ast.Expr], r: types.Ty) 
         EMethod(rv, m, nsp, xs) => EMethod(var(rv), m, nsp, xs.map(var)),
         d => d,
     }
-    let (call, next) = st.node(desc, e.span)
-    st = next.set_type(call, r)
-    st = st.set_inst(call, st.inst_of(e))
+    let call = st.node(desc, e.span)
+    st.set_type(call, r)
+    st.set_inst(call, st.inst_of(e))
     let lets = effects.map(|x| ast.Stmt { desc: SLet(false, temps.find(|t| t.0 == x.id).map(|t| t.1) ?? "", x.span, None, x), span: x.span })
     st.rewrite(e, EBlock(ast.Block { stmts: lets, tail: Some(call), span: e.span }))
+    st
 }
 
 // The indexes in a `mut` place that have an effect, in written order.
@@ -924,11 +1015,13 @@ fn place_effects(st: env.State, x: ast.Expr) -> List[ast.Expr] {
 
 // A `mut` place with its indexes reading their temporaries, `vars`.
 fn place_reads(st: env.State, x: ast.Expr, vars: List[(Int, ast.Expr)]) -> env.State {
+    let mut st = st
     match st.desc(x) {
         EField(a, _, _) => place_reads(st, a, vars),
         EIndex(a, i) => {
-            let st = place_reads(st, a, vars)
+            st = place_reads(st, a, vars)
             st.rewrite(x, EIndex(a, vars.find(|v| v.0 == i.id).map(|v| v.1) ?? i))
+            st
         },
         _ => st,
     }
@@ -970,7 +1063,11 @@ fn builtin_call(st: env.State, cx: env.Cx, fx: env.Fx, n: Str, args: List[ast.Ex
     }
     let mut st = st
     // the wrong number of arguments: reported, and each checked anyway
-    let wrong = |st: env.State, message: Str| check_args(st.report(diag.error("E0107", sp, message)), cx, fx, args)
+    let wrong = |st: env.State, message: Str| {
+        let mut st = st
+        st.report(diag.error("E0107", sp, message))
+        check_args(st, cx, fx, args)
+    }
     match n {
         "assert" => {
             st = match args {
@@ -985,7 +1082,11 @@ fn builtin_call(st: env.State, cx: env.Cx, fx: env.Fx, n: Str, args: List[ast.Ex
                     let (t, next) = check_expr(st, cx, fx, a)
                     let next = expect(next, cx, fx, b, t)
                     match next.subst.refused(env.equality(), t) {
-                        Some(Itself) if next.uncomparable(t, Itself).is_none() => next.report(diag.error("E0201", sp, "values of type `{next.show(t)}` cannot be compared")),
+                        Some(Itself) if next.uncomparable(t, Itself).is_none() => {
+                            let mut next = next
+                            next.report(diag.error("E0201", sp, "values of type `{next.show(t)}` cannot be compared"))
+                            next
+                        },
                         Some(_) | None => {
                             let mut next = next
                             next.eq_types = [t] + next.eq_types
@@ -1011,7 +1112,7 @@ fn builtin_call(st: env.State, cx: env.Cx, fx: env.Fx, n: Str, args: List[ast.Ex
                 [a] => expect(st, cx, fx, a, TInt),
                 _ => wrong(st, "`channel` takes 1 argument, its capacity"),
             }
-            let (t, st) = st.fresh()
+            let t = st.fresh()
             Some((TChan(t), st))
         },
         "atomic" => {
@@ -1027,14 +1128,14 @@ fn builtin_call(st: env.State, cx: env.Cx, fx: env.Fx, n: Str, args: List[ast.Ex
                 Some((TShared(t), st))
             },
             _ => {
-                let st = wrong(st, "`shared` takes 1 argument, its first value")
-                let (t, st) = st.fresh()
+                st = wrong(st, "`shared` takes 1 argument, its first value")
+                let t = st.fresh()
                 Some((TShared(t), st))
             },
         },
         // catch(|| ...): Ok(value), or Err(message) if anything inside panicked
         "catch" => {
-            let (t, st) = st.fresh()
+            let t = st.fresh()
             match args {
                 [a] => Some((types.res(t, TStr), expect(st, cx, fx, a, TFn([], t)))),
                 _ => Some((TErr, wrong(st, "`catch` takes 1 argument, a closure with no parameters, as in `catch(|| risky())`"))),
@@ -1049,8 +1150,8 @@ fn builtin_call(st: env.State, cx: env.Cx, fx: env.Fx, n: Str, args: List[ast.Ex
             Some((TBytes, st))
         },
         "map" => {
-            let (k, st) = st.fresh()
-            let (v, st) = st.fresh()
+            let k = st.fresh()
+            let v = st.fresh()
             let mut st = match args {
                 [] => st,
                 [a] => expect(st, cx, fx, a, TList(TNamed("#tuple2", [k, v]))),
@@ -1064,7 +1165,7 @@ fn builtin_call(st: env.State, cx: env.Cx, fx: env.Fx, n: Str, args: List[ast.Ex
                 [a] => expect(st, cx, fx, a, TStr),
                 _ => wrong(st, "`panic` takes 1 argument (a message)"),
             }
-            let (t, st) = st.fresh()
+            let t = st.fresh()
             Some((t, st))
         },
         _ => None,
@@ -1104,7 +1205,7 @@ fn check_call(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, callee: ast.Ex
             // a constructor's type parameters come from the expected type first
             match (want, st.desc(callee), st.repr(r)) {
                 (Some(w), EVar(_) | EField(..), TNamed(n, _)) if cx.enums.contains(n) => {
-                    st = st.unify(r, w).1
+                    let _ = st.unify(r, w)
                 },
                 _ => {},
             }
@@ -1124,7 +1225,7 @@ fn check_call(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, callee: ast.Ex
             let labelled = args.any(|a| is_named(st, a)) || args2.len() != args.len()
             let written = args.map(|a| unlabel(st, a))
             if ps.len() != args2.len() {
-                st = st.report(diag.error("E0107", sp, "this function takes {ps.len()} argument{env.plural(ps.len())} but {args2.len()} {env.was_were(args2.len())} supplied"))
+                st.report(diag.error("E0107", sp, "this function takes {ps.len()} argument{env.plural(ps.len())} but {args2.len()} {env.was_were(args2.len())} supplied"))
                 st = check_args(st, cx, fx, args2)
             } else {
                 let foreign = match st.desc(callee) {
@@ -1154,7 +1255,7 @@ fn check_call(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, callee: ast.Ex
                         ([TCap("Foreign"), ..], [a, ..], EVar(n)) => match (cx.foreign_libs.get(n), known_foreign(st, fx, a)) {
                             (Some(lib), Some(s)) if !s.contains(lib) && !s.contains("*") => {
                                 let grants = if s.is_empty() { "no library" } else { "only " + s.map(|l| "`" + l + "`").join(", ") }
-                                st = st.report(diag.error("E0333", a.span, "`{n}` calls C library `{lib}`, but this Foreign grants {grants}").note("it was narrowed with `only`, so the call would panic; narrow it to the library the function belongs to"))
+                                st.report(diag.error("E0333", a.span, "`{n}` calls C library `{lib}`, but this Foreign grants {grants}").note("it was narrowed with `only`, so the call would panic; narrow it to the library the function belongs to"))
                             },
                             _ => {},
                         },
@@ -1164,23 +1265,23 @@ fn check_call(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, callee: ast.Ex
             }
             st = mut_overlap(st, None, written)
             if labelled {
-                st = st.rewrite(e, ECall(callee, args2))
+                st.rewrite(e, ECall(callee, args2))
                 st = keep_order(st, e, written, r)
             }
             (r, st)
         },
         TErr => (TErr, check_args(st, cx, fx, args)),
         TVar(_) => {
-            let (ps, next) = st.fresh_list(args.len())
-            let (r, next) = next.fresh()
-            st = next.unify_at(callee.span, TFn(ps, r), ct)
+            let ps = st.fresh_list(args.len())
+            let r = st.fresh()
+            st.unify_at(callee.span, TFn(ps, r), ct)
             for (a, p) in args.zip(ps) {
                 st = expect(st, cx, fx, a, p)
             }
             (r, st)
         },
         t => {
-            st = st.report(diag.error("E0108", callee.span, "a value of type `{st.show(t)}` is not a function"))
+            st.report(diag.error("E0108", callee.span, "a value of type `{st.show(t)}` is not a function"))
             (TErr, check_args(st, cx, fx, args))
         },
     }
@@ -1243,7 +1344,7 @@ fn check_callbacks(st: env.State, cx: env.Cx, fx: env.Fx, args: List[ast.Expr], 
                 }
                 if !named {
                     let d = diag.error("E0332", a.span, "a callback to C is a top-level function, passed by its name").note("C calls it with its arguments alone, so it has nowhere to keep a closure's captured values; pass what it needs through C (most C functions that take a callback also take a pointer for it)")
-                    st = st.report(d)
+                    st.report(d)
                 }
             },
             _ => {},
@@ -1255,13 +1356,15 @@ fn check_callbacks(st: env.State, cx: env.Cx, fx: env.Fx, args: List[ast.Expr], 
 // ---------- fields and methods ----------
 
 fn check_field(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv: ast.Expr, name: Str, nsp: ast.Span) -> (types.Ty, env.State) {
+    let mut st = st
     match st.desc(recv) {
         EVar(en) if !fx.is_local(en) && cx.enums.contains(en) => {
             let vs = cx.variants.get(en) ?? []
             if vs.any(|v| v.0 == name) {
                 return ctor_ty(st, cx, en, name, nsp)
             }
-            (TErr, st.did_you_mean(diag.error("E0104", nsp, "enum `{en}` has no variant `{name}`"), name, vs.map(|v| v.0)))
+            st.did_you_mean(diag.error("E0104", nsp, "enum `{en}` has no variant `{name}`"), name, vs.map(|v| v.0))
+            (TErr, st)
         },
         _ => {
             let (t, st) = check_expr(st, cx, fx, recv)
@@ -1281,7 +1384,8 @@ fn field_of(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv: ast.Expr, 
                 // promoted from an embedded struct: `admin.name` is `admin.User.name`
                 Path(path, _) => {
                     let (r, rt2, next) = embed_path(st, cx, recv, rt, path)
-                    st = next.rewrite(e, EField(r, name, nsp))
+                    st = next
+                    st.rewrite(e, EField(r, name, nsp))
                     return field_of(st, cx, fx, e, r, rt2, name, nsp)
                 },
                 Ambiguous(paths) => {
@@ -1304,7 +1408,8 @@ fn field_of(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv: ast.Expr, 
                         if cx.fns.contains(n + "::" + name) {
                             d = d.note("`{name}` is a method; call it with parentheses: `.{name}()`")
                         }
-                        (TErr, st.did_you_mean(d, name, fs.map(|f| f.0)))
+                        st.did_you_mean(d, name, fs.map(|f| f.0))
+                        (TErr, st)
                     },
                 },
             }
@@ -1313,11 +1418,17 @@ fn field_of(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv: ast.Expr, 
             Some(f) => (f.1, st),
             None => match arity {
                 Some(k) => method_value(st, cx, fx, e, recv, t, name, nsp, k),
-                None => (TErr, st.did_you_mean(diag.error("E0103", nsp, "`Root` has no field `{name}`"), name, builtins.root_fields().map(|f| f.0))),
+                None => {
+                    st.did_you_mean(diag.error("E0103", nsp, "`Root` has no field `{name}`"), name, builtins.root_fields().map(|f| f.0))
+                    (TErr, st)
+                },
             },
         },
         TErr => (TErr, st),
-        TVar(_) => (TErr, st.report(diag.error("E0207", recv.span, "the type of this value is not known here; add a type annotation"))),
+        TVar(_) => {
+            st.report(diag.error("E0207", recv.span, "the type of this value is not known here; add a type annotation"))
+            (TErr, st)
+        },
         _ => match arity {
             Some(k) => method_value(st, cx, fx, e, recv, t, name, nsp, k),
             None => {
@@ -1330,7 +1441,8 @@ fn field_of(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv: ast.Expr, 
                 if builtins.names(rt).contains(name) {
                     d = d.note("`{name}` changes its receiver in place, so it cannot be a value; call it as `{name}(...)`")
                 }
-                (TErr, st.report(d))
+                st.report(d)
+                (TErr, st)
             },
         },
     }
@@ -1388,8 +1500,10 @@ fn mut_method(st: env.State, cx: env.Cx, file: Int, t: types.Ty, name: Str) -> (
 }
 
 fn mut_value(st: env.State, name: Str, nsp: ast.Span) -> (types.Ty, env.State) {
+    let mut st = st
     let d = diag.error("E0215", nsp, "`{name}` has a `mut` parameter, so it can only be called, not used as a value").note("a `mut` argument is a place, which only a direct call can pass: call `.{name}(...)` on the value")
-    (TErr, st.report(d))
+    st.report(d)
+    (TErr, st)
 }
 
 // `x.name` without a call, where `name` is a method: a closure that calls
@@ -1402,16 +1516,14 @@ fn method_value(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv: ast.Ex
     let params = (0..<arity).map(|i| ast.ClosureParam { name: "$a{i}", ty: None, span: sp })
     let mut args: List[ast.Expr] = []
     for p in params {
-        let (a, next) = st.node(EVar(p.name), sp)
+        let a = st.node(EVar(p.name), sp)
         args.push(a)
-        st = next
     }
-    let (self_var, next) = st.node(EVar("$recv"), sp)
-    let (call, next) = next.node(EMethod(self_var, name, nsp, args), sp)
-    let (clo, next) = next.node(EClosure(params, call), sp)
-    st = next
+    let self_var = st.node(EVar("$recv"), sp)
+    let call = st.node(EMethod(self_var, name, nsp, args), sp)
+    let clo = st.node(EClosure(params, call), sp)
     let bind_recv = ast.Stmt { desc: SLet(false, "$recv", recv.span, None, recv), span: sp }
-    st = st.rewrite(e, EBlock(ast.Block { stmts: [bind_recv], tail: Some(clo), span: sp }))
+    st.rewrite(e, EBlock(ast.Block { stmts: [bind_recv], tail: Some(clo), span: sp }))
     let inside = fx.push().bind("$recv", env.Var { ty: rt, mutable: false, span: recv.span, kind: KLet })
     check_expr(st, cx, inside, clo)
 }
@@ -1538,8 +1650,8 @@ fn embed_path(st: env.State, cx: env.Cx, recv: ast.Expr, rt: types.Ty, path: Lis
             TNamed(n, args) if cx.sfields.contains(n) => struct_fields(st, cx, n, args).find(|f| f.0 == fld).map(|f| f.1) ?? TErr,
             _ => TErr,
         }
-        let (next_x, next) = st.node(EField(x, fld, { x.span with lo: x.span.hi }), x.span)
-        st = next.set_type(next_x, ft)
+        let next_x = st.node(EField(x, fld, { x.span with lo: x.span.hi }), x.span)
+        st.set_type(next_x, ft)
         x = next_x
         t = ft
     }
@@ -1552,13 +1664,16 @@ fn ambiguity(n: Str, name: Str, paths: List[List[Str]]) -> Str {
 }
 
 fn ambiguous(st: env.State, sp: ast.Span, n: Str, name: Str, paths: List[List[Str]]) -> env.State {
+    let mut st = st
     let which = paths.map(|p| "`." + (p + [name]).join(".") + "`").join(" or ")
     st.report(diag.error("E0120", sp, ambiguity(n, name, paths)).note("name the embedded struct you mean: {which}"))
+    st
 }
 
 // ---------- method calls ----------
 
 fn check_method(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv: ast.Expr, name: Str, nsp: ast.Span, args: List[ast.Expr]) -> (types.Ty, env.State) {
+    let mut st = st
     let handle = match st.desc(recv) {
         EVar(g) => match fx.lookup(g) {
             Some((v, crossed)) if v.kind == KGroup => Some((g, v, crossed)),
@@ -1572,33 +1687,39 @@ fn check_method(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv: ast.Ex
             return check_method_value(st, cx, fx, e, recv, name, nsp, args, None)
         },
     }
-    let mut st = st.set_type(recv, v.ty)
+    st.set_type(recv, v.ty)
     let t = match st.repr(v.ty) {
         TGroup(t) => t,
         _ => TErr,
     }
     if crossed {
-        st = st.report(diag.error("E0310", recv.span, "cannot spawn into `{g}` from inside a closure").note("call `go` directly in the group's body"))
+        st.report(diag.error("E0310", recv.span, "cannot spawn into `{g}` from inside a closure").note("call `go` directly in the group's body"))
     }
     match (name, args) {
         ("go" | "#go", [a]) => {
             // a task that returns () runs for its effect and adds no item
             // to the group's list (the backends see it as `#go`); the
             // others share one type
-            let (r, next) = st.fresh()
-            st = expect(next, cx, fx, a, TFn([], r))
+            let r = st.fresh()
+            st = expect(st, cx, fx, a, TFn([], r))
             match st.repr(r) {
                 TUnit => {
-                    st = st.rewrite(e, EMethod(recv, "#go", nsp, args))
+                    st.rewrite(e, EMethod(recv, "#go", nsp, args))
                 },
                 _ => {
-                    st = st.unify_at(a.span, t, r)
+                    st.unify_at(a.span, t, r)
                 },
             }
             (TUnit, st)
         },
-        ("go" | "#go", _) => (TUnit, check_args(st.report(diag.error("E0107", nsp, "`go` takes 1 argument, a closure with no parameters")), cx, fx, args)),
-        _ => (TErr, check_args(st.report(diag.error("E0105", nsp, "a group handle only has `go`, not `{name}`")), cx, fx, args)),
+        ("go" | "#go", _) => {
+            st.report(diag.error("E0107", nsp, "`go` takes 1 argument, a closure with no parameters"))
+            (TUnit, check_args(st, cx, fx, args))
+        },
+        _ => {
+            st.report(diag.error("E0105", nsp, "a group handle only has `go`, not `{name}`"))
+            (TErr, check_args(st, cx, fx, args))
+        },
     }
 }
 
@@ -1617,7 +1738,7 @@ fn method_args(st: env.State, cx: env.Cx, fx: env.Fx, key: Str, name: Str, nsp: 
     let mut st = st
     if ps.len() != args2.len() {
         let k = ps.len()
-        st = st.report(diag.error("E0107", nsp, "method `{name}` takes {k} argument{env.plural(k)} besides `self`, but {args2.len()} {env.was_were(args2.len())} supplied"))
+        st.report(diag.error("E0107", nsp, "method `{name}` takes {k} argument{env.plural(k)} besides `self`, but {args2.len()} {env.was_were(args2.len())} supplied"))
         st = check_args(st, cx, fx, args2)
     } else if key == "" {
         for (a, p) in args2.zip(ps) {
@@ -1640,7 +1761,8 @@ fn check_method_value(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv: 
             // first check
             EMut(x) => {
                 let (t, next) = check_expr(st, cx, fx, x)
-                st = next.set_type(recv, t)
+                st = next
+                st.set_type(recv, t)
                 st.repr(t)
             },
             _ => {
@@ -1654,10 +1776,10 @@ fn check_method_value(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv: 
     match rt {
         TNamed("Result", _) if name == "map_err" => {
             // the old name still works, with a warning and a fix that renames it
-            st = st.report(diag.warning("W0001", nsp, "`map_err` is now called `map_error`").fix("rename it to `map_error`", nsp, "map_error"))
+            st.report(diag.warning("W0001", nsp, "`map_err` is now called `map_error`").fix("rename it to `map_error`", nsp, "map_error"))
             match st.desc(e) {
                 EMethod(r, _, msp, a) => {
-                    st = st.rewrite(e, EMethod(r, "map_error", msp, a))
+                    st.rewrite(e, EMethod(r, "map_error", msp, a))
                 },
                 _ => {},
             }
@@ -1672,7 +1794,7 @@ fn check_method_value(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv: 
             return (TErr, check_args(st, cx, fx, args))
         },
         TVar(_) => {
-            st = st.report(diag.error("E0207", recv.span, "the type of this value is not known here; add a type annotation"))
+            st.report(diag.error("E0207", recv.span, "the type of this value is not known here; add a type annotation"))
             return (TErr, check_args(st, cx, fx, args))
         },
         TDyn(..) | TParam(_) => {
@@ -1690,15 +1812,17 @@ fn check_method_value(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv: 
             st = add_bounds(next, cx, key, inst, nsp)
             match t {
                 TFn([p0, ..ps], r) => {
-                    st = mut_receiver(st.unify_at(recv.span, p0, rt), cx, fx, key, recv)
+                    st.unify_at(recv.span, p0, rt)
+                    st = mut_receiver(st, cx, fx, key, recv)
                     let (ordered, next) = method_args(st, cx, fx, key, name, nsp, method_params(cx, key), method_defaults(cx, key), args, ps)
                     st = next
                     match ordered {
                         Some(args2) => {
                             st = mut_overlap(st, None, written)
-                            let (f, next) = st.node(EVar(key), nsp)
-                            st = next.set_type(f, t).set_inst(f, inst)
-                            st = st.rewrite(e, ECall(f, [recv] + args2))
+                            let f = st.node(EVar(key), nsp)
+                            st.set_type(f, t)
+                            st.set_inst(f, inst)
+                            st.rewrite(e, ECall(f, [recv] + args2))
                             // reordered by labels, or with defaults filled in
                             if labelled || args2.len() != args.len() {
                                 st = keep_order(st, e, written, r)
@@ -1720,7 +1844,8 @@ fn check_method_value(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv: 
             // promoted from an embedded struct: `admin.greet()` is `admin.User.greet()`
             Path(path, _) => {
                 let (r, rt2, next) = embed_path(st, cx, recv, rt, path)
-                st = next.rewrite(e, EMethod(r, name, nsp, args))
+                st = next
+                st.rewrite(e, EMethod(r, name, nsp, args))
                 return check_method_value(st, cx, fx, e, r, name, nsp, args, Some(rt2))
             },
             Ambiguous(paths) => {
@@ -1735,23 +1860,26 @@ fn check_method_value(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv: 
             // a method: `fn name(self: T, ...)`, called with the receiver first
             let key = n + "::" + name
             let (inst, t, next) = instantiate(st, cx.fns.get(key) ?? env.Sig { gen: [], params: [], ret: TErr })
-            st = add_bounds(next.set_inst(e, inst), cx, key, inst, nsp)
+            st = next
+            st.set_inst(e, inst)
+            st = add_bounds(st, cx, key, inst, nsp)
             match cx.method_owner.get(key) {
                 Some((false, file)) if file != nsp.file => {
-                    st = st.report(diag.error("E0402", nsp, "method `{name}` is private to the module that defines `{n}`").note("mark it `pub fn` in {cx.path_of(file)} to use it here"))
+                    st.report(diag.error("E0402", nsp, "method `{name}` is private to the module that defines `{n}`").note("mark it `pub fn` in {cx.path_of(file)} to use it here"))
                 },
                 _ => {},
             }
             match t {
                 TFn([p0, ..ps], r) => {
-                    st = mut_receiver(st.unify_at(recv.span, p0, rt), cx, fx, key, recv)
+                    st.unify_at(recv.span, p0, rt)
+                    st = mut_receiver(st, cx, fx, key, recv)
                     let (ordered, next) = method_args(st, cx, fx, key, name, nsp, method_params(cx, key), method_defaults(cx, key), args, ps)
                     st = next
                     match ordered {
                         Some(args2) => {
                             st = mut_overlap(st, None, written)
                             if labelled || args2.len() != args.len() {
-                                st = st.rewrite(e, EMethod(recv, name, nsp, args2))
+                                st.rewrite(e, EMethod(recv, name, nsp, args2))
                                 st = keep_order(st, e, written, r)
                             }
                         },
@@ -1797,7 +1925,7 @@ fn bound_method(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv: ast.Ex
             st = next
             match ordered {
                 Some(args2) if labelled => {
-                    st = st.rewrite(e, EMethod(recv, name, nsp, args2))
+                    st.rewrite(e, EMethod(recv, name, nsp, args2))
                     st = keep_order(st, e, written, m.ret)
                 },
                 _ => {},
@@ -1812,7 +1940,7 @@ fn bound_method(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv: ast.Ex
                 let listed = if declared.is_empty() { "nothing" } else { declared.join(", ") }
                 "the bounds of `{g}` ({bs.map(|b| st.show_bound(b)).join(", ")}) declare: {listed}"
             }
-            st = st.did_you_mean(diag.error("E0105", nsp, "no method `{name}` on `{g}`").note(note), name, declared)
+            st.did_you_mean(diag.error("E0105", nsp, "no method `{name}` on `{g}`").note(note), name, declared)
             (TErr, check_args(st, cx, fx, args))
         },
     }
@@ -1821,8 +1949,7 @@ fn bound_method(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv: ast.Ex
 // A built-in method: `xs.len()`, `s.split(",")`, `net.get(url)`, ...
 fn builtin_method_call(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv: ast.Expr, rt: types.Ty, name: Str, nsp: ast.Span, args: List[ast.Expr]) -> (types.Ty, env.State) {
     let mut st = st
-    let (u, next) = st.fresh()
-    st = next
+    let u = st.fresh()
     let ms = builtins.methods(rt, u)
     let option_or_result = match rt {
         TNamed("Option" | "Result", _) => true,
@@ -1840,12 +1967,14 @@ fn builtin_method_call(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv:
                     },
                     _ => {},
                 }
-                return (TErr, check_args(st.report(d), cx, fx, args))
+                st.report(d)
+                return (TErr, check_args(st, cx, fx, args))
             }
             if name == "and_then" && option_or_result {
                 // the same operation is called `flat_map` here, as on lists
                 let d = diag.error("E0105", nsp, "there is no `and_then`; it is called `flat_map`, as on lists").note("`x.flat_map(f)` passes the value inside a `Some` or `Ok` to `f`, which returns an Option or Result itself").fix("rename it to `flat_map`", nsp, "flat_map")
-                return (TErr, check_args(st.report(d), cx, fx, args))
+                st.report(d)
+                return (TErr, check_args(st, cx, fx, args))
             }
             let names = ms.map(|x| x.name)
             let builtin_names = match builtins.type_name(rt) {
@@ -1894,9 +2023,9 @@ fn builtin_method_call(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv:
                 _ => [],
             }
             if held_field {
-                st = st.report(d.fix("call the field with brackets", ast.merge(recv.span, nsp), "({field_recv}.{name})"))
+                st.report(d.fix("call the field with brackets", ast.merge(recv.span, nsp), "({field_recv}.{name})"))
             } else {
-                st = st.did_you_mean(d, name, names + users + builtin_names)
+                st.did_you_mean(d, name, names + users + builtin_names)
             }
             return (TErr, check_args(st, cx, fx, args))
         },
@@ -1911,10 +2040,10 @@ fn builtin_method_call(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv:
     }
     match (name, rt) {
         ("join", TList(a)) => {
-            st = st.unify_at(recv.span, TStr, a)
+            st.unify_at(recv.span, TStr, a)
         },
         ("sum", TList(a)) => {
-            st = st.unify_at(recv.span, TInt, a)
+            st.unify_at(recv.span, TInt, a)
         },
         ("push", TList(_)) | ("remove", TMap(..)) => {
             st = check_place(st, cx, fx, recv)
@@ -1923,7 +2052,7 @@ fn builtin_method_call(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv:
     }
     if m.params.len() != args.len() {
         let k = m.params.len()
-        st = st.report(diag.error("E0107", nsp, "`{name}` takes {k} argument{env.plural(k)} but {args.len()} {env.was_were(args.len())} supplied"))
+        st.report(diag.error("E0107", nsp, "`{name}` takes {k} argument{env.plural(k)} but {args.len()} {env.was_were(args.len())} supplied"))
         st = check_args(st, cx, fx, args)
     } else {
         for (a, p) in args.zip(m.params) {
@@ -1956,7 +2085,7 @@ fn builtin_method_call(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, recv:
                     None => "`{st.show(t)}`",
                 }
                 let d = diag.error("E0201", nsp, "`List[{st.show(a)}]` cannot be sorted: {shown} has no order").note("numbers, strings, Bool, and lists, tuples, structs and enums of them are ordered; to sort by a key use `xs.sort_by(key)`, for another order `list.sort_by(xs, less)`")
-                st = st.report(d)
+                st.report(d)
             },
             None => {},
         },
@@ -1982,7 +2111,9 @@ fn waits(rt: types.Ty, name: Str) -> Option[Str] {
 }
 
 fn update_waits(st: env.State, sp: ast.Span, what: Str) -> env.State {
+    let mut st = st
     st.report(diag.error("E0312", sp, "the function given to `update` must not wait: {what}").note("`update` holds the Shared value's lock while its function runs; wait before or after it, and only compute the new value inside"))
+    st
 }
 
 fn sort_uniq(xs: List[Str]) -> List[Str] {
@@ -2084,31 +2215,58 @@ fn first_in_way(st: env.State, cx: env.Cx, t: types.Ty, keys: Bool, seen: List[S
 }
 
 fn check_place(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr) -> env.State {
+    let mut st = st
     match st.desc(e) {
         EVar(n) => match fx.lookup(n) {
-            Some((_, true)) => st.report(diag.error("E0205", e.span, "cannot modify `{n}` inside a closure").note("closures capture variables by value; return the new value from the closure instead")),
+            Some((_, true)) => {
+                st.report(diag.error("E0205", e.span, "cannot modify `{n}` inside a closure").note("closures capture variables by value; return the new value from the closure instead"))
+                st
+            },
             Some((v, false)) if !v.mutable => match v.kind {
-                KLet => st.report(diag.error("E0205", e.span, "cannot modify `{n}`, it is not declared `mut`").fix("declare it as `let mut {n}`", { v.span with hi: v.span.lo }, "mut ")),
-                KParam => st.report(diag.error("E0205", e.span, "cannot modify parameter `{n}`").note("parameters are immutable; declare it `mut {n}` to change the caller's value, or make a copy with `let mut {n} = {n}`")),
-                KPat => st.report(diag.error("E0205", e.span, "cannot modify `{n}`, pattern and loop bindings are immutable")),
-                KGroup => st.report(diag.error("E0310", e.span, "`{n}` is a group handle; the only thing you can do with it is `{n}.go(...)`")),
+                KLet => {
+                    st.report(diag.error("E0205", e.span, "cannot modify `{n}`, it is not declared `mut`").fix("declare it as `let mut {n}`", { v.span with hi: v.span.lo }, "mut "))
+                    st
+                },
+                KParam => {
+                    st.report(diag.error("E0205", e.span, "cannot modify parameter `{n}`").note("parameters are immutable; declare it `mut {n}` to change the caller's value, or make a copy with `let mut {n} = {n}`"))
+                    st
+                },
+                KPat => {
+                    st.report(diag.error("E0205", e.span, "cannot modify `{n}`, pattern and loop bindings are immutable"))
+                    st
+                },
+                KGroup => {
+                    st.report(diag.error("E0310", e.span, "`{n}` is a group handle; the only thing you can do with it is `{n}.go(...)`"))
+                    st
+                },
             },
             Some(_) => st,
-            None => st.report(diag.error("E0209", e.span, "this cannot be assigned to")),
+            None => {
+                st.report(diag.error("E0209", e.span, "this cannot be assigned to"))
+                st
+            },
         },
         EField(r, _, _) | EIndex(r, _) => check_place(st, cx, fx, r),
-        _ => st.report(diag.error("E0209", e.span, "only variables, fields and list elements can be assigned to")),
+        _ => {
+            st.report(diag.error("E0209", e.span, "only variables, fields and list elements can be assigned to"))
+            st
+        },
     }
 }
 
 // What cannot be changed in place even though it is a place: the target of
 // an assignment or a `mut` argument, after it is checked.
 fn check_target(st: env.State, lhs: ast.Expr) -> env.State {
+    let mut st = st
     match st.desc(lhs) {
-        EBlock(_) => st.report(diag.error("E0209", lhs.span, "a method cannot be assigned to")),
+        EBlock(_) => {
+            st.report(diag.error("E0209", lhs.span, "a method cannot be assigned to"))
+            st
+        },
         EIndex(b, _) if st.repr(st.type_of(b)) == TBytes => {
             let d = diag.error("E0209", lhs.span, "`Bytes` cannot be changed in place").note("build a new value: `b.slice(0, i) + bytes([x]) + b.slice(i + 1, b.len())`")
             st.report(d)
+            st
         },
         _ => st,
     }
@@ -2131,7 +2289,9 @@ fn check_fn_args(st: env.State, cx: env.Cx, fx: env.Fx, passed_to: Option[Str], 
                     st = check_mut_arg(st, cx, fx, a, x, p)
                 } else {
                     let d = diag.error("E0213", a.span, "`{who}` does not change its parameter `{pn}`, so the argument is written without `mut`").fix("remove `mut`", { a.span with hi: x.span.lo }, "")
-                    st = expect(st.report(d), cx, fx, x, p).set_type(a, p)
+                    st.report(d)
+                    st = expect(st, cx, fx, x, p)
+                    st.set_type(a, p)
                 }
             },
             desc => {
@@ -2149,7 +2309,7 @@ fn check_fn_args(st: env.State, cx: env.Cx, fx: env.Fx, passed_to: Option[Str], 
                     } else if place {
                         d = d.fix("add `mut`", { a.span with hi: a.span.lo }, "mut ")
                     }
-                    st = st.report(d)
+                    st.report(d)
                 }
                 // a function parameter passed on: pure if the callee is, there
                 match (passed_to, desc) {
@@ -2188,17 +2348,22 @@ fn check_method_args(st: env.State, cx: env.Cx, fx: env.Fx, key: Str, name: Str,
 // `mut x` for a `mut` parameter: `x` is a place the caller may change, of
 // exactly the parameter's type (no conversion makes a place).
 fn check_mut_arg(st: env.State, cx: env.Cx, fx: env.Fx, a: ast.Expr, x: ast.Expr, p: types.Ty) -> env.State {
-    let st = check_place(st, cx, fx, x)
-    let (t, st) = check_expr(st, cx, fx, x)
-    let st = check_target(st, x)
-    let (ok, st) = st.unify(p, t)
-    let st = if ok { st } else { st.report(diag.error("E0201", x.span, "a `mut` argument must have exactly the parameter's type: expected `{st.show(p)}`, found `{st.show(t)}`")) }
+    let mut st = check_place(st, cx, fx, x)
+    let (t, next) = check_expr(st, cx, fx, x)
+    st = next
+    st = check_target(st, x)
+    let ok = st.unify(p, t)
+    if !ok {
+        st.report(diag.error("E0201", x.span, "a `mut` argument must have exactly the parameter's type: expected `{st.show(p)}`, found `{st.show(t)}`"))
+    }
     st.set_type(a, p)
+    st
 }
 
 // The receiver of a call to method `key`: for `mut self`, a place the
 // caller may change, which the backends see as `mut recv`.
 fn mut_receiver(st: env.State, cx: env.Cx, fx: env.Fx, key: Str, recv: ast.Expr) -> env.State {
+    let mut st = st
     if !cx.mut_self(key) {
         return st
     }
@@ -2207,10 +2372,12 @@ fn mut_receiver(st: env.State, cx: env.Cx, fx: env.Fx, key: Str, recv: ast.Expr)
         // check already wrapped it
         EMut(x) => check_target(check_place(st, cx, fx, x), x),
         d => {
-            let st = check_target(check_place(st, cx, fx, recv), recv)
-            let (inner, st) = st.node(d, recv.span)
-            let st = st.set_type(inner, st.type_of(recv)).set_inst(inner, st.inst_of(recv))
+            st = check_target(check_place(st, cx, fx, recv), recv)
+            let inner = st.node(d, recv.span)
+            st.set_type(inner, st.type_of(recv))
+            st.set_inst(inner, st.inst_of(recv))
             st.rewrite(recv, EMut(inner))
+            st
         },
     }
 }
@@ -2386,7 +2553,7 @@ fn mut_overlap(st: env.State, changed: Option[ast.Expr], parts: List[ast.Expr]) 
     let mut seen: List[Changed] = []
     for c in own {
         if seen.any(|q| clash(c, q)) {
-            st = st.report(diag.error("E0214", c.at, "this `mut` argument overlaps another one of the same call").note("a call changes each value through one `mut` argument: `mut p.x, mut p.y` are separate, but two elements of one list or map are not (take them out and put them back)"))
+            st.report(diag.error("E0214", c.at, "this `mut` argument overlaps another one of the same call").note("a call changes each value through one `mut` argument: `mut p.x, mut p.y` are separate, but two elements of one list or map are not (take them out and put them back)"))
         }
         seen.push(c)
     }
@@ -2399,14 +2566,14 @@ fn mut_overlap(st: env.State, changed: Option[ast.Expr], parts: List[ast.Expr]) 
     }
     for c in inside_parts(st, whole).flat_map(|k| changed_in(st, [], k)) {
         if own.any(|o| clash(c, o)) {
-            st = st.report(diag.error("E0214", c.at, "this changes a value that the enclosing call also takes as `mut`").note("make that call first, on its own line, and pass its result"))
+            st.report(diag.error("E0214", c.at, "this changes a value that the enclosing call also takes as `mut`").note("make that call first, on its own line, and pass its result"))
         }
     }
     // an assignment in another argument would change the place the callee
     // is given, or what the caller reads back
     for a in inside_parts(st, whole).flat_map(|k| assigned_in(st, k)) {
         if own.any(|o| o.written && overlaps(a.1, o.path)) {
-            st = st.report(diag.error("E0214", a.0, "this assigns a value that the enclosing call takes as `mut`").note("assign it before the call, on its own line"))
+            st.report(diag.error("E0214", a.0, "this assigns a value that the enclosing call takes as `mut`").note("assign it before the call, on its own line"))
         }
     }
     // an index of a `mut` place assigning a variable another index of it
@@ -2420,7 +2587,7 @@ fn mut_overlap(st: env.State, changed: Option[ast.Expr], parts: List[ast.Expr]) 
                         let (sp, path) = a
                         let name = path.0
                         if ixs.with_index().any(|m| m.0 != k && reads(st, name, m.1)) {
-                            st = st.report(diag.error("E0214", sp, "this assigns a variable that another index of the same `mut` place reads").note("assign it before the call, on its own line"))
+                            st.report(diag.error("E0214", sp, "this assigns a variable that another index of the same `mut` place reads").note("assign it before the call, on its own line"))
                         }
                     }
                 }
@@ -2453,9 +2620,13 @@ fn reads(st: env.State, n: Str, e: ast.Expr) -> Bool {
 
 // Can errors of type `e` become `dyn Error`? None if so, else why not.
 fn error_conversion(st: env.State, cx: env.Cx, e: types.Ty) -> (Option[Str], env.State) {
+    let mut st = st
     match st.repr(e) {
         TDyn("Error", []) | TErr | TStr | TNamed("IoError", _) => (None, st),
-        TVar(_) => (None, st.unify(e, TDyn("Error", [])).1),
+        TVar(_) => {
+            let _ = st.unify(e, TDyn("Error", []))
+            (None, st)
+        },
         TNamed(n, _) if (cx.structs.contains(n) || cx.enums.contains(n)) && n != "Option" && n != "Result" => {
             let ct = st.repr(e)
             match st.held(ct) {
@@ -2485,8 +2656,9 @@ fn dyn_error_fix(d: diag.Diag, fx: env.Fx) -> diag.Diag {
 }
 
 fn check_try(st: env.State, cx: env.Cx, fx: env.Fx, x: ast.Expr, context: Option[ast.Expr], sp: ast.Span) -> (types.Ty, env.State) {
+    let mut st = st
     if fx.in_defer > 0 {
-        let st = st.report(diag.error("E0115", sp, "`?` cannot leave a `defer` body").note("handle the error inside it, for example with `??` or a `match`"))
+        st.report(diag.error("E0115", sp, "`?` cannot leave a `defer` body").note("handle the error inside it, for example with `??` or a `match`"))
         return (TErr, check_expr(st, cx, fx, x).1)
     }
     check_try_ok(st, cx, fx, x, context, sp)
@@ -2500,8 +2672,10 @@ fn is_dyn_error(st: env.State, t: types.Ty) -> Bool {
 }
 
 fn wrong_fn(st: env.State, sp: ast.Span, rt: types.Ty, kind: Str) -> env.State {
+    let mut st = st
     let d = diag.error("E0202", sp, "`?` can only be used in a function that returns `{kind}`, this one returns `{st.show(rt)}`").note("for main, write `fn main(root: Root) -> Result[(), IoError]`")
     st.report(d)
+    st
 }
 
 // `x? "context"` wraps the error, so the function must return `dyn Error`.
@@ -2518,11 +2692,11 @@ fn with_context(st: env.State, cx: env.Cx, fx: env.Fx, context: Option[ast.Expr]
         TNamed("Result", [_, fe]) if is_dyn_error(st, fe) => {},
         TNamed("Result", [_, fe]) => {
             let d = diag.error("E0202", sp, "`?` with context returns a `dyn Error`, but this function returns errors of type `{st.show(fe)}`")
-            st = st.report(dyn_error_fix(d, fx))
+            st.report(dyn_error_fix(d, fx))
         },
         TVar(_) => {
-            let (v, next) = st.fresh()
-            st = next.unify_at(sp, fx.ret, types.res(v, TDyn("Error", [])))
+            let v = st.fresh()
+            st.unify_at(sp, fx.ret, types.res(v, TDyn("Error", [])))
         },
         TErr => {},
         rt => {
@@ -2535,7 +2709,7 @@ fn with_context(st: env.State, cx: env.Cx, fx: env.Fx, context: Option[ast.Expr]
 fn check_try_ok(st: env.State, cx: env.Cx, fx: env.Fx, x: ast.Expr, context: Option[ast.Expr], sp: ast.Span) -> (types.Ty, env.State) {
     let mut st = st
     if fx.in_group > 0 {
-        st = st.report(diag.error("E0311", sp, "`?` cannot leave a `group` block early; every task must finish first").note("handle the error inside the task, or after the group returns its results"))
+        st.report(diag.error("E0311", sp, "`?` cannot leave a `group` block early; every task must finish first").note("handle the error inside the task, or after the group returns its results"))
     }
     let (t, next) = check_expr(st, cx, fx, x)
     st = next
@@ -2565,15 +2739,14 @@ fn check_try_ok(st: env.State, cx: env.Cx, fx: env.Fx, x: ast.Expr, context: Opt
                                     "give it a method `fn message(self: " + st.show(e) + ") -> Str`"
                                 }
                                 let d = diag.error("E0202", sp, "`?` cannot turn an error of type `{st.show(e)}` into `dyn Error`").note(why).note(hint)
-                                st = st.report(d)
+                                st.report(d)
                             },
                             None => {},
                         }
                     }
                 },
                 TNamed("Result", [_, fe]) => {
-                    let (ok, next) = st.unify(fe, e)
-                    st = next
+                    let ok = st.unify(fe, e)
                     if !ok {
                         let (we, next) = error_conversion(st, cx, e)
                         let (wf, next) = if we.is_none() { error_conversion(next, cx, fe) } else { (we, next) }
@@ -2582,13 +2755,13 @@ fn check_try_ok(st: env.State, cx: env.Cx, fx: env.Fx, x: ast.Expr, context: Opt
                         if we.is_none() && wf.is_none() {
                             d = dyn_error_fix(d, fx)
                         }
-                        st = st.report(d)
+                        st.report(d)
                     }
                 },
                 TVar(_) => {
                     if !ctxd {
-                        let (v, next) = st.fresh()
-                        st = next.unify_at(sp, fx.ret, types.res(v, e))
+                        let v = st.fresh()
+                        st.unify_at(sp, fx.ret, types.res(v, e))
                     }
                 },
                 TErr => {},
@@ -2608,8 +2781,8 @@ fn check_try_ok(st: env.State, cx: env.Cx, fx: env.Fx, x: ast.Expr, context: Opt
                 match st.repr(fx.ret) {
                     TNamed("Option", _) | TErr => {},
                     TVar(_) => {
-                        let (v, next) = st.fresh()
-                        st = next.unify_at(sp, fx.ret, types.opt(v))
+                        let v = st.fresh()
+                        st.unify_at(sp, fx.ret, types.opt(v))
                     },
                     rt => {
                         st = wrong_fn(st, sp, rt, "Option")
@@ -2618,8 +2791,14 @@ fn check_try_ok(st: env.State, cx: env.Cx, fx: env.Fx, x: ast.Expr, context: Opt
             }
             (a, st)
         },
-        TVar(_) => (TErr, st.report(diag.error("E0207", x.span, "the type of this value is not known here; add a type annotation"))),
-        other => (TErr, st.report(diag.error("E0202", x.span, "`?` needs a `Result` or `Option`, found `{st.show(other)}`"))),
+        TVar(_) => {
+            st.report(diag.error("E0207", x.span, "the type of this value is not known here; add a type annotation"))
+            (TErr, st)
+        },
+        other => {
+            st.report(diag.error("E0202", x.span, "`?` needs a `Result` or `Option`, found `{st.show(other)}`"))
+            (TErr, st)
+        },
     }
 }
 
@@ -2674,44 +2853,61 @@ fn check_bin(st: env.State, cx: env.Cx, fx: env.Fx, op: ast.BinOp, a: ast.Expr, 
         let (op2, a2, b2, node) = spine[k]
         let (t, next) = check_bin_rest(st, cx, fx, op2, a2, b2, node.span, ta)
         ta = t
-        st = next.set_type(node, t)
+        st = next
+        st.set_type(node, t)
     }
     check_bin_rest(st, cx, fx, op, a, b, sp, ta)
 }
 
 // `a op b` once `a` is checked and has type `ta`.
 fn check_bin_rest(st: env.State, cx: env.Cx, fx: env.Fx, op: ast.BinOp, a: ast.Expr, b: ast.Expr, sp: ast.Span, ta: types.Ty) -> (types.Ty, env.State) {
+    let mut st = st
     match op {
-        And | Or => (TBool, expect(st.unify_at(a.span, TBool, ta), cx, fx, b, TBool)),
+        And | Or => {
+            st.unify_at(a.span, TBool, ta)
+            (TBool, expect(st, cx, fx, b, TBool))
+        },
         // `lo..<hi`: the Ints from lo up to but not including hi
-        Range => (TList(TInt), expect(st.unify_at(a.span, TInt, ta), cx, fx, b, TInt)),
+        Range => {
+            st.unify_at(a.span, TInt, ta)
+            (TList(TInt), expect(st, cx, fx, b, TInt))
+        },
         // `opt ?? default`: the value inside, or the default when there is none
         Else => match st.repr(ta) {
             TNamed("Option", [t]) | TNamed("Result", [t, _]) => (t, expect(st, cx, fx, b, t)),
             TErr => (TErr, check_expr(st, cx, fx, b).1),
             TVar(_) => {
-                let st = st.report(diag.error("E0207", a.span, "the type of this value is not known here; add a type annotation"))
+                st.report(diag.error("E0207", a.span, "the type of this value is not known here; add a type annotation"))
                 (TErr, check_expr(st, cx, fx, b).1)
             },
             t => {
-                let st = st.report(diag.error("E0201", sp, "`??` needs an `Option` or `Result` on its left, found `{st.show(t)}`"))
+                st.report(diag.error("E0201", sp, "`??` needs an `Option` or `Result` on its left, found `{st.show(t)}`"))
                 (TErr, check_expr(st, cx, fx, b).1)
             },
         },
         _ => {
             // a literal on the left takes the right's type: `1 + x` with x a UInt8
-            let (ta, st) = match (st.desc(a), st.repr(ta)) {
+            let (ta, next) = match (st.desc(a), st.repr(ta)) {
                 (EInt(_), TInt) => {
                     let (tb, st2) = check_expr(st, cx, fx, b)
+                    let mut st2 = st2
                     match st2.repr(tb) {
                         TUInt(_) => (tb, expect(st2, cx, fx, a, tb)),
-                        _ => (ta, st2.unify_at(b.span, ta, tb)),
+                        _ => {
+                            st2.unify_at(b.span, ta, tb)
+                            (ta, st2)
+                        },
                     }
                 },
                 _ => (ta, expect(st, cx, fx, b, ta)),
             }
+            st = next
             let t = st.repr(ta)
-            let bad = |st: env.State| st.report(diag.error("E0201", sp, "operator `{op_name(op)}` cannot be applied to `{st.show(t)}`"))
+            let bad = |st: env.State| {
+                let mut st = st
+                st.report(diag.error("E0201", sp, "operator `{op_name(op)}` cannot be applied to `{st.show(t)}`"))
+                st
+            }
             match op {
                 Add => match t {
                     TInt | TFloat | TStr | TBytes | TUInt(_) | TList(_) | TErr | TVar(_) => (t, st),
@@ -2731,12 +2927,18 @@ fn check_bin_rest(st: env.State, cx: env.Cx, fx: env.Fx, op: ast.BinOp, a: ast.E
                     st.eq_types = [t] + st.eq_types
                     match st.subst.refused(env.equality(), t) {
                         Some(found) => match st.uncomparable(t, found) {
-                            Some(why) => (TBool, st.report(diag.error("E0201", sp, "operator `{op_name(op)}` cannot be applied to `{st.show(t)}`").note(why))),
+                            Some(why) => {
+                                st.report(diag.error("E0201", sp, "operator `{op_name(op)}` cannot be applied to `{st.show(t)}`").note(why))
+                                (TBool, st)
+                            },
                             None => (TBool, bad(st)),
                         },
                         // capabilities have no equality, so neither has a value holding one
                         None => match st.held(t) {
-                            Some(h) => (TBool, st.report(diag.error("E0201", sp, "operator `{op_name(op)}` cannot be applied to `{st.show(t)}`").note(h + ", and capabilities cannot be compared"))),
+                            Some(h) => {
+                                st.report(diag.error("E0201", sp, "operator `{op_name(op)}` cannot be applied to `{st.show(t)}`").note(h + ", and capabilities cannot be compared"))
+                                (TBool, st)
+                            },
                             None => (TBool, st),
                         },
                     }
@@ -2757,14 +2959,12 @@ fn check_closure(st: env.State, cx: env.Cx, fx: env.Fx, ps: List[ast.ClosurePara
     for (i, p) in ps.with_index() {
         let t = match (p.ty, want_ps) {
             (Some(te), _) => {
-                let (t, next) = st.resolve(cx, fx.genv, te)
-                st = next
+                let t = st.resolve(cx, fx.genv, te)
                 t
             },
             (None, Some(wp)) => wp[i],
             (None, None) => {
-                let (t, next) = st.fresh()
-                st = next
+                let t = st.fresh()
                 t
             },
         }
@@ -2774,14 +2974,15 @@ fn check_closure(st: env.State, cx: env.Cx, fx: env.Fx, ps: List[ast.ClosurePara
     let ret = match want_ret {
         Some(r) => r,
         None => {
-            let (r, next) = st.fresh()
-            st = next
+            let r = st.fresh()
             r
         },
     }
     let inside = env.Fx { ret, scopes: [scope] + fx.scopes, loops: 0, genv: fx.genv, in_group: 0, in_defer: 0, ret_te: None }
-    let (bt, st) = check_expr(st, cx, inside, body)
-    (TFn(pts, ret), st.unify_at(body.span, ret, bt))
+    let (bt, next) = check_expr(st, cx, inside, body)
+    st = next
+    st.unify_at(body.span, ret, bt)
+    (TFn(pts, ret), st)
 }
 
 // `field: value` pairs set once each, and every value checked: against the
@@ -2792,7 +2993,7 @@ fn check_field_inits(st: env.State, cx: env.Cx, fx: env.Fx, name: Str, decl: Lis
     let mut seen: List[Str] = []
     for f in fields {
         if seen.contains(f.name) {
-            st = st.report(diag.error("E0106", f.span, "field `{f.name}` is set twice"))
+            st.report(diag.error("E0106", f.span, "field `{f.name}` is set twice"))
         } else {
             seen.push(f.name)
         }
@@ -2802,7 +3003,7 @@ fn check_field_inits(st: env.State, cx: env.Cx, fx: env.Fx, name: Str, decl: Lis
             },
             None => {
                 let d = extra_notes(f.name).fold(diag.error("E0103", f.span, "struct `{name}` has no field `{f.name}`"), |d, n| d.note(n))
-                st = st.did_you_mean(d, f.name, decl.map(|x| x.0))
+                st.did_you_mean(d, f.name, decl.map(|x| x.0))
                 st = check_expr(st, cx, fx, f.value).1
             },
         }
@@ -2816,9 +3017,9 @@ fn check_struct_lit(st: env.State, cx: env.Cx, fx: env.Fx, name: Str, nsp: ast.S
         Some(d) => d,
         None => {
             if cx.enums.contains(name) {
-                st = st.report(diag.error("E0102", nsp, "`{name}` is an enum; build it with a variant, for example `{name}.Variant(...)`"))
+                st.report(diag.error("E0102", nsp, "`{name}` is an enum; build it with a variant, for example `{name}.Variant(...)`"))
             } else {
-                st = st.did_you_mean(diag.error("E0102", nsp, "unknown struct `{name}`"), name, env.keys_in_order(cx.sfields))
+                st.did_you_mean(diag.error("E0102", nsp, "unknown struct `{name}`"), name, env.keys_in_order(cx.sfields))
             }
             for f in fields {
                 st = check_expr(st, cx, fx, f.value).1
@@ -2827,8 +3028,8 @@ fn check_struct_lit(st: env.State, cx: env.Cx, fx: env.Fx, name: Str, nsp: ast.S
         },
     }
     let gen = cx.structs.get(name).map(|s| s.generics) ?? []
-    let (targs, next) = st.fresh_list(gen.len())
-    st = next.add_type_bounds(cx, name, targs, nsp)
+    let targs = st.fresh_list(gen.len())
+    st.add_type_bounds(cx, name, targs, nsp)
     let embedded = |fname: Str| match promote(cx, true, name, fname) {
         Path(p, _) => {
             let top = p[0]
@@ -2841,7 +3042,7 @@ fn check_struct_lit(st: env.State, cx: env.Cx, fx: env.Fx, name: Str, nsp: ast.S
     let missing = decl.filter(|f| !seen.contains(f.0))
     if !missing.is_empty() {
         let listed = missing.map(|f| "`" + f.0 + "`").join(", ")
-        st = st.report(diag.error("E0206", sp, "missing field{env.plural(missing.len())} {listed} in `{name}`"))
+        st.report(diag.error("E0206", sp, "missing field{env.plural(missing.len())} {listed} in `{name}`"))
     }
     (TNamed(name, targs), st)
 }
@@ -2856,16 +3057,16 @@ fn check_safe(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, base: ast.Expr
         TNamed("Option", [t]) => t,
         TErr => TErr,
         TVar(_) => {
-            st = st.report(diag.error("E0207", base.span, "the type of this value is not known here; add a type annotation"))
+            st.report(diag.error("E0207", base.span, "the type of this value is not known here; add a type annotation"))
             TErr
         },
         TNamed("Result", _) => {
             let d = diag.error("E0201", base.span, "`?.` works on an `Option`, but this is `{st.show(bt)}`").note("`?.` is safe navigation; to return early on `Err` and then use the value, write `(e?).name`")
-            st = st.report(d)
+            st.report(d)
             TErr
         },
         t => {
-            st = st.report(diag.error("E0201", base.span, "`?.` needs an `Option` on its left, found `{st.show(t)}`").note("a value that is always there takes a plain `.`"))
+            st.report(diag.error("E0201", base.span, "`?.` needs an `Option` on its left, found `{st.show(t)}`").note("a value that is always there takes a plain `.`"))
             TErr
         },
     }
@@ -2886,19 +3087,26 @@ fn check_safe(st: env.State, cx: env.Cx, fx: env.Fx, e: ast.Expr, base: ast.Expr
 // `{ base with x: 1, y }`: a copy of a struct value with some fields
 // replaced; the same field errors as a struct literal, minus "missing".
 fn check_with(st: env.State, cx: env.Cx, fx: env.Fx, base: ast.Expr, fields: List[ast.FieldInit], sp: ast.Span) -> (types.Ty, env.State) {
-    let (bt, st) = check_expr(st, cx, fx, base)
+    let mut st = st
+    let (bt, next) = check_expr(st, cx, fx, base)
+    st = next
     let others = |st: env.State| fields.fold(st, |st, f| check_expr(st, cx, fx, f.value).1)
     match st.repr(bt) {
         TNamed(name, targs) if cx.sfields.contains(name) && !ast.is_tuple_name(name) => {
             let gen = cx.structs.get(name).map(|s| s.generics) ?? []
-            let (_, st) = check_field_inits(st, cx, fx, name, cx.sfields.get(name) ?? [], gen.zip(targs), fields, |_| [])
+            let (_, next) = check_field_inits(st, cx, fx, name, cx.sfields.get(name) ?? [], gen.zip(targs), fields, |_| [])
+            st = next
             (bt, st)
         },
         TErr => (TErr, others(st)),
-        TVar(_) => (TErr, others(st.report(diag.error("E0207", base.span, "the type of this value is not known here; add a type annotation")))),
+        TVar(_) => {
+            st.report(diag.error("E0207", base.span, "the type of this value is not known here; add a type annotation"))
+            (TErr, others(st))
+        },
         t => {
             let d = diag.error("E0201", base.span, "`\{ ... with ... }` copies a struct, but this is `{st.show(t)}`").note("only struct values have named fields to replace")
-            (TErr, others(st.report(d)))
+            st.report(d)
+            (TErr, others(st))
         },
     }
 }
@@ -2908,11 +3116,11 @@ fn check_with(st: env.State, cx: env.Cx, fx: env.Fx, base: ast.Expr, fields: Lis
 fn check_match(st: env.State, cx: env.Cx, fx: env.Fx, s: ast.Expr, arms: List[ast.Arm], sp: ast.Span, want: Option[types.Ty]) -> (types.Ty, env.State) {
     let (scrutinee, st) = check_expr(st, cx, fx, s)
     let errors_before = st.error_count()
-    let (result, st) = match want {
-        Some(w) => (w, st),
+    let mut st = st
+    let result = match want {
+        Some(w) => w,
         None => st.fresh(),
     }
-    let mut st = st
     for arm in arms {
         let (inside, next) = check_pat(st, cx, fx.push(), scrutinee, arm.pat)
         st = next
@@ -2928,7 +3136,8 @@ fn check_match(st: env.State, cx: env.Cx, fx: env.Fx, s: ast.Expr, arms: List[as
             },
             None => {
                 let (bt, next) = check_expr(st, cx, inside, arm.body)
-                st = next.unify_at(arm.body.span, result, bt)
+                st = next
+                st.unify_at(arm.body.span, result, bt)
             },
         }
     }
@@ -2940,12 +3149,12 @@ fn check_match(st: env.State, cx: env.Cx, fx: env.Fx, s: ast.Expr, arms: List[as
         for arm in arms {
             let alts = exhaust.alternatives(arm.pat)
             if !exhaust.useful(cx, st.subst, true, before, [arm.pat], [scrutinee]) {
-                st = st.report(diag.warning("W0002", arm.pat.span, "this arm can never match: the arms before it cover every value it matches"))
+                st.report(diag.warning("W0002", arm.pat.span, "this arm can never match: the arms before it cover every value it matches"))
             } else if alts.len() > 1 {
                 let mut seen = before
                 for alt in alts {
                     if !exhaust.useful(cx, st.subst, true, seen, [alt], [scrutinee]) {
-                        st = st.report(diag.warning("W0002", alt.span, "this alternative can never match: the arms and alternatives before it cover every value it matches"))
+                        st.report(diag.warning("W0002", alt.span, "this alternative can never match: the arms and alternatives before it cover every value it matches"))
                     }
                     seen = [[alt]] + seen
                 }
@@ -2956,7 +3165,8 @@ fn check_match(st: env.State, cx: env.Cx, fx: env.Fx, s: ast.Expr, arms: List[as
         }
     }
     if arms.is_empty() {
-        return (result, st.report(diag.error("E0204", sp, "`match` needs at least one arm")))
+        st.report(diag.error("E0204", sp, "`match` needs at least one arm"))
+        return (result, st)
     }
     // a guarded arm may not apply, so it covers nothing
     let unguarded = arms.filter(|a| a.guard.is_none()).map(|a| a.pat)
@@ -2974,7 +3184,8 @@ fn check_match(st: env.State, cx: env.Cx, fx: env.Fx, s: ast.Expr, arms: List[as
     let arm_indent = (if own_line { indent } else { "" }) + "    "
     let text = (if own_line { "" } else { "\n" }) + missing.map(|m| "{arm_indent}{m} => panic(\"unhandled\"),\n").join("")
     let d = diag.error("E0204", sp, "`match` does not cover {missing.map(|m| "`" + m + "`").join(", ")}").fix("add the missing arms", { sp with lo: at, hi: at }, text)
-    (result, st.report(d))
+    st.report(d)
+    (result, st)
 }
 
 // Where the line holding byte `i` of `src` starts: after the last newline
@@ -3008,44 +3219,55 @@ fn check_pat(st: env.State, cx: env.Cx, fx: env.Fx, t: types.Ty, p: ast.Pat) -> 
             // an unsigned integer matches literals that fit in it
             TUInt(bits) => {
                 if v < 0 {
-                    (fx, st.report(diag.error("E0201", p.span, "a `UInt{bits}` cannot be negative")))
+                    st.report(diag.error("E0201", p.span, "a `UInt{bits}` cannot be negative"))
+                    (fx, st)
                 } else if bits < 64 && v >= 1 << bits {
-                    (fx, st.report(diag.error("E0201", p.span, "{v} does not fit in a `UInt{bits}`, which holds 0 to {(1 << bits) - 1}")))
+                    st.report(diag.error("E0201", p.span, "{v} does not fit in a `UInt{bits}`, which holds 0 to {(1 << bits) - 1}"))
+                    (fx, st)
                 } else {
                     (fx, st)
                 }
             },
-            _ => (fx, st.unify_at(p.span, t, TInt)),
+            _ => {
+                st.unify_at(p.span, t, TInt)
+                (fx, st)
+            },
         },
-        PStr(_) => (fx, st.unify_at(p.span, t, TStr)),
-        PBool(_) => (fx, st.unify_at(p.span, t, TBool)),
+        PStr(_) => {
+            st.unify_at(p.span, t, TStr)
+            (fx, st)
+        },
+        PBool(_) => {
+            st.unify_at(p.span, t, TBool)
+            (fx, st)
+        },
         PTuple(ps) if ps.any(exhaust.is_rest) => match st.repr(t) {
             // `(a, ..)`: the tuple's size comes from its type
             TNamed(n, ts) if ast.is_tuple_name(n) => {
                 if ps.len() - 1 > ts.len() {
-                    st = st.report(diag.error("E0107", p.span, "the tuple has {ts.len()} items, the pattern has at least {ps.len() - 1}"))
+                    st.report(diag.error("E0107", p.span, "the tuple has {ts.len()} items, the pattern has at least {ps.len() - 1}"))
                     return all_err(st, fx, ps)
                 }
                 check_pats(st, cx, fx, ts, exhaust.fill_rest(ps, ts.len()))
             },
             TErr => all_err(st, fx, ps),
             TVar(_) => {
-                st = st.report(diag.error("E0207", p.span, "the type of this value is not known here, so `..` cannot stand for its other items; add a type annotation"))
+                st.report(diag.error("E0207", p.span, "the type of this value is not known here, so `..` cannot stand for its other items; add a type annotation"))
                 all_err(st, fx, ps)
             },
             other => {
-                st = st.report(diag.error("E0201", p.span, "this pattern is a tuple, but the value is `{st.show(other)}`"))
+                st.report(diag.error("E0201", p.span, "this pattern is a tuple, but the value is `{st.show(other)}`"))
                 all_err(st, fx, ps)
             },
         },
         PTuple(ps) => {
-            let (ts, next) = st.fresh_list(ps.len())
-            st = next.unify_at(p.span, TNamed(ast.tuple_name(ps.len()), ts), t)
+            let ts = st.fresh_list(ps.len())
+            st.unify_at(p.span, TNamed(ast.tuple_name(ps.len()), ts), t)
             check_pats(st, cx, fx, ts, ps)
         },
         PList(ps) => {
-            let (el, next) = st.fresh()
-            st = next.unify_at(p.span, TList(el), t)
+            let el = st.fresh()
+            st.unify_at(p.span, TList(el), t)
             for q in ps {
                 match q.desc {
                     PRest(Some(n)) => {
@@ -3080,29 +3302,29 @@ fn check_struct_pat(st: env.State, cx: env.Cx, fx: env.Fx, t: types.Ty, p: ast.P
         Some(d) => d,
         None => {
             if cx.enums.contains(name) {
-                st = st.report(diag.error("E0102", nsp, "`{name}` is an enum; match it with its variants, for example `{name}.Variant(...)`"))
+                st.report(diag.error("E0102", nsp, "`{name}` is an enum; match it with its variants, for example `{name}.Variant(...)`"))
             } else {
-                st = st.did_you_mean(diag.error("E0102", nsp, "unknown struct `{name}`"), name, env.keys_in_order(cx.sfields))
+                st.did_you_mean(diag.error("E0102", nsp, "unknown struct `{name}`"), name, env.keys_in_order(cx.sfields))
             }
             return check_pats(st, cx, fx, fields.map(|_| TErr), fields.map(|f| f.pat))
         },
     }
     let gen = cx.structs.get(name).map(|s| s.generics) ?? []
-    let (targs, next) = st.fresh_list(gen.len())
-    st = next.unify_at(p.span, t, TNamed(name, targs))
+    let targs = st.fresh_list(gen.len())
+    st.unify_at(p.span, t, TNamed(name, targs))
     let inst = gen.zip(targs)
     let mut fx = fx
     let mut seen: List[Str] = []
     for f in fields {
         if seen.contains(f.name) {
-            st = st.report(diag.error("E0106", f.span, "field `{f.name}` is matched twice"))
+            st.report(diag.error("E0106", f.span, "field `{f.name}` is matched twice"))
         } else {
             seen.push(f.name)
         }
         let ft = match decl.find(|x| x.0 == f.name) {
             Some((_, ft)) => st.subst(inst, ft),
             None => {
-                st = st.did_you_mean(diag.error("E0103", f.span, "struct `{name}` has no field `{f.name}`"), f.name, decl.map(|x| x.0))
+                st.did_you_mean(diag.error("E0103", f.span, "struct `{name}` has no field `{f.name}`"), f.name, decl.map(|x| x.0))
                 TErr
             },
         }
@@ -3113,7 +3335,7 @@ fn check_struct_pat(st: env.State, cx: env.Cx, fx: env.Fx, t: types.Ty, p: ast.P
     let missing = decl.filter(|f| !seen.contains(f.0))
     if !missing.is_empty() && !rest {
         let listed = missing.map(|f| "`" + f.0 + "`").join(", ")
-        st = st.report(diag.error("E0206", p.span, "missing field{env.plural(missing.len())} {listed} in the pattern for `{name}`").note("name every field, or end the pattern with `..` to match any value of the others"))
+        st.report(diag.error("E0206", p.span, "missing field{env.plural(missing.len())} {listed} in the pattern for `{name}`").note("name every field, or end the pattern with `..` to match any value of the others"))
     }
     (fx, st)
 }
@@ -3148,18 +3370,17 @@ fn check_or(st: env.State, cx: env.Cx, fx: env.Fx, t: types.Ty, alts: List[ast.P
         let only_this = names(vs).filter(|n| !names(first).contains(n))
         match (only_first, only_this) {
             ([n, ..], _) => {
-                st = st.report(diag.error("E0210", alt.span, "`{n}` is bound in the first alternative but not in this one").note(same))
+                st.report(diag.error("E0210", alt.span, "`{n}` is bound in the first alternative but not in this one").note(same))
             },
             ([], [n, ..]) => {
-                st = st.report(diag.error("E0210", alt.span, "`{n}` is bound in this alternative but not in the first one").note(same))
+                st.report(diag.error("E0210", alt.span, "`{n}` is bound in this alternative but not in the first one").note(same))
             },
             ([], []) => {
                 for (n, v) in vs {
                     let v0 = first.find(|x| x.0 == n).map(|x| x.1) ?? v
-                    let (ok, next) = st.unify(v0.ty, v.ty)
-                    st = next
+                    let ok = st.unify(v0.ty, v.ty)
                     if !ok {
-                        st = st.report(diag.error("E0210", v.span, "`{n}` is `{st.show(v0.ty)}` in the first alternative and `{st.show(v.ty)}` in this one").note(same))
+                        st.report(diag.error("E0210", v.span, "`{n}` is `{st.show(v0.ty)}` in the first alternative and `{st.show(v.ty)}` in this one").note(same))
                     }
                 }
             },
@@ -3181,7 +3402,7 @@ fn check_variant_pat(st: env.State, cx: env.Cx, fx: env.Fx, t: types.Ty, p: ast.
             if cx.enums.contains(e) {
                 e
             } else {
-                st = st.did_you_mean(diag.error("E0102", p.span, "unknown enum `{e}`"), e, env.keys_in_order(cx.enums))
+                st.did_you_mean(diag.error("E0102", p.span, "unknown enum `{e}`"), e, env.keys_in_order(cx.enums))
                 return skip(st)
             }
         },
@@ -3192,7 +3413,7 @@ fn check_variant_pat(st: env.State, cx: env.Cx, fx: env.Fx, t: types.Ty, p: ast.
                 match scope {
                     [e] => e,
                     [e, ..] => {
-                        st = st.report(diag.error("E0104", p.span, "`{v}` is a variant of several enums ({scope.join(", ")}); qualify it, for example `{e}.{v}`"))
+                        st.report(diag.error("E0104", p.span, "`{v}` is a variant of several enums ({scope.join(", ")}); qualify it, for example `{e}.{v}`"))
                         return skip(st)
                     },
                     [] => {
@@ -3200,7 +3421,7 @@ fn check_variant_pat(st: env.State, cx: env.Cx, fx: env.Fx, t: types.Ty, p: ast.
                             TNamed(n, _) if cx.variants.contains(n) => (cx.variants.get(n) ?? []).map(|x| x.0),
                             _ => env.keys_in_order(cx.owners),
                         }
-                        st = st.did_you_mean(diag.error("E0104", p.span, "unknown variant `{v}`"), v, cands)
+                        st.did_you_mean(diag.error("E0104", p.span, "unknown variant `{v}`"), v, cands)
                         return skip(st)
                     },
                 }
@@ -3211,20 +3432,20 @@ fn check_variant_pat(st: env.State, cx: env.Cx, fx: env.Fx, t: types.Ty, p: ast.
     let payload = match vs.find(|x| x.0 == v) {
         Some(x) => x.1,
         None => {
-            st = st.did_you_mean(diag.error("E0104", p.span, "enum `{en}` has no variant `{v}`"), v, vs.map(|x| x.0))
+            st.did_you_mean(diag.error("E0104", p.span, "enum `{en}` has no variant `{v}`"), v, vs.map(|x| x.0))
             return skip(st)
         },
     }
     let gen = cx.enums.get(en).map(|e| e.generics) ?? []
-    let (targs, next) = st.fresh_list(gen.len())
-    st = next.unify_at(p.span, t, TNamed(en, targs))
+    let targs = st.fresh_list(gen.len())
+    st.unify_at(p.span, t, TNamed(en, targs))
     let inst = gen.zip(targs)
     let ptys = payload.map(|x| st.subst(inst, x))
     let rest = args.any(exhaust.is_rest)
     let given = args.len() - (if rest { 1 } else { 0 })
     if (rest && given > ptys.len()) || (!rest && given != ptys.len()) {
         let k = ptys.len()
-        st = st.report(diag.error("E0107", p.span, "variant `{v}` has {k} field{env.plural(k)}, the pattern has {if rest { "at least " } else { "" }}{given}"))
+        st.report(diag.error("E0107", p.span, "variant `{v}` has {k} field{env.plural(k)}, the pattern has {if rest { "at least " } else { "" }}{given}"))
         return skip(st)
     }
     check_pats(st, cx, fx, ptys, exhaust.fill_rest(args, ptys.len()))
@@ -3240,36 +3461,40 @@ fn check_select(st: env.State, cx: env.Cx, fx: env.Fx, arms: List[ast.SelArm], s
     }
     let defaults = arms.filter(is_default)
     if defaults.len() > 1 {
-        st = st.report(diag.error("E0106", sp, "`select` has more than one `_` arm"))
+        st.report(diag.error("E0106", sp, "`select` has more than one `_` arm"))
     }
     for a in arms {
         if is_default(a) && a.guard.is_some() {
-            st = st.report(diag.error("E0003", a.span, "the `_` arm of a `select` cannot have a guard"))
+            st.report(diag.error("E0003", a.span, "the `_` arm of a `select` cannot have a guard"))
         }
     }
     if defaults.len() == arms.len() {
-        st = st.report(diag.error("E0003", sp, "`select` needs at least one channel arm: `v = ch.recv() => ...` or `ch.send(x) => ...`"))
+        st.report(diag.error("E0003", sp, "`select` needs at least one channel arm: `v = ch.recv() => ...` or `ch.send(x) => ...`"))
     }
     let afters = arms.filter(|a| match a.op {
         SelAfter(..) => true,
         _ => false,
     })
     if !afters.is_empty() && !defaults.is_empty() {
-        st = st.report(diag.error("E0003", afters[0].span, "a `select` with a `_` arm never waits, so it cannot also have a `clock.after` timeout"))
+        st.report(diag.error("E0003", afters[0].span, "a `select` with a `_` arm never waits, so it cannot also have a `clock.after` timeout"))
     }
-    let (rt, next) = st.fresh()
-    st = next
+    let rt = st.fresh()
     // the element type of a channel
     let chan_el = |st: env.State, ch: ast.Expr| {
-        let (ct, st) = check_expr(st, cx, fx, ch)
+        let (ct, next) = check_expr(st, cx, fx, ch)
+        let mut st = next
         match st.repr(ct) {
             TChan(el) => (el, st),
             TErr => (TErr, st),
             TVar(_) => {
-                let (el, st) = st.fresh()
-                (el, st.unify_at(ch.span, TChan(el), ct))
+                let el = st.fresh()
+                st.unify_at(ch.span, TChan(el), ct)
+                (el, st)
             },
-            t => (TErr, st.report(diag.error("E0201", ch.span, "`select` works on channels, found `{st.show(t)}`"))),
+            t => {
+                st.report(diag.error("E0201", ch.span, "`select` works on channels, found `{st.show(t)}`"))
+                (TErr, st)
+            },
         }
     }
     for a in arms {
@@ -3301,11 +3526,11 @@ fn check_select(st: env.State, cx: env.Cx, fx: env.Fx, arms: List[ast.SelArm], s
                 match st.repr(ct) {
                     TCap("Clock") | TErr => {},
                     TVar(_) => {
-                        st = st.unify_at(clock.span, TCap("Clock"), ct)
+                        st.unify_at(clock.span, TCap("Clock"), ct)
                     },
                     t => {
                         let d = diag.error("E0201", clock.span, "`after` in a `select` needs a `Clock`, found `{st.show(t)}`").note("a timeout arm is `clock.after(ms) => ...`, with the `Clock` from `root.clock`")
-                        st = st.report(d)
+                        st.report(d)
                     },
                 }
                 st = expect(st, cx, fx, ms, TInt)
@@ -3333,19 +3558,33 @@ fn check_stmts(st: env.State, cx: env.Cx, fx: env.Fx, b: ast.Block) -> (Bool, en
 }
 
 pub fn check_block(st: env.State, cx: env.Cx, fx: env.Fx, b: ast.Block) -> (types.Ty, env.State) {
-    let (diverges, inside, st) = check_stmts(st, cx, fx, b)
+    let mut st = st
+    let (diverges, inside, next) = check_stmts(st, cx, fx, b)
+    st = next
     match b.tail {
         Some(e) => check_expr(st, cx, inside, e),
-        None => if diverges { st.fresh() } else { (TUnit, st) },
+        None => if diverges {
+            let t = st.fresh()
+            (t, st)
+        } else {
+            (TUnit, st)
+        },
     }
 }
 
 // A block checked against the type its value must have.
 pub fn expect_block(st: env.State, cx: env.Cx, fx: env.Fx, b: ast.Block, want: types.Ty) -> env.State {
-    let (diverges, inside, st) = check_stmts(st, cx, fx, b)
+    let mut st = st
+    let (diverges, inside, next) = check_stmts(st, cx, fx, b)
+    st = next
     match b.tail {
         Some(e) => expect(st, cx, inside, e, want),
-        None => if diverges { st } else { st.unify_at({ b.span with lo: b.span.lo.max(b.span.hi - 1) }, want, TUnit) },
+        None => {
+            if !diverges {
+                st.unify_at({ b.span with lo: b.span.lo.max(b.span.hi - 1) }, want, TUnit)
+            }
+            st
+        },
     }
 }
 
@@ -3371,14 +3610,14 @@ fn check_stmt(st: env.State, cx: env.Cx, fx: env.Fx, s: ast.Stmt) -> (Bool, env.
                 TNamed(tn2, ts) if ast.is_tuple_name(tn2) && ts.len() == k => t,
                 TErr => TErr,
                 TVar(_) => {
-                    let (parts, next) = st.fresh_list(k)
+                    let parts = st.fresh_list(k)
                     let u = TNamed(tn, parts)
-                    st = next.unify_at(e.span, u, t)
+                    st.unify_at(e.span, u, t)
                     u
                 },
                 other => {
                     let d = diag.error("E0211", e.span, "the left side assigns {k} values, but the right side is `{st.show(other)}`").note("the right side of `({(0..<k).map(|i| (97 + i % 26).to_char()).join(", ")}) = value` must be a tuple of {k} items")
-                    st = st.report(d)
+                    st.report(d)
                     TErr
                 },
             }
@@ -3387,8 +3626,8 @@ fn check_stmt(st: env.State, cx: env.Cx, fx: env.Fx, s: ast.Stmt) -> (Bool, env.
         SLet(m, n, nsp, ann, e) => {
             let t = match ann {
                 Some(te) => {
-                    let (at, next) = st.resolve(cx, fx.genv, te)
-                    st = expect(next, cx, fx, e, at)
+                    let at = st.resolve(cx, fx.genv, te)
+                    st = expect(st, cx, fx, e, at)
                     at
                 },
                 None => {
@@ -3430,13 +3669,17 @@ fn check_stmt(st: env.State, cx: env.Cx, fx: env.Fx, s: ast.Stmt) -> (Bool, env.
         SExpr(e) => (false, fx, check_expr(st, cx, fx, e).1),
         SReturn(value) => {
             if fx.in_defer > 0 {
-                st = st.report(diag.error("E0115", s.span, "`return` cannot leave a `defer` body"))
+                st.report(diag.error("E0115", s.span, "`return` cannot leave a `defer` body"))
             } else if fx.in_group > 0 {
-                st = st.report(diag.error("E0311", s.span, "`return` cannot leave a `group` block early; every task must finish first"))
+                st.report(diag.error("E0311", s.span, "`return` cannot leave a `group` block early; every task must finish first"))
             }
-            st = match value {
-                Some(e) => expect(st, cx, fx, e, fx.ret),
-                None => st.unify_at(s.span, fx.ret, TUnit),
+            match value {
+                Some(e) => {
+                    st = expect(st, cx, fx, e, fx.ret)
+                },
+                None => {
+                    st.unify_at(s.span, fx.ret, TUnit)
+                },
             }
             (true, fx, st)
         },
@@ -3452,8 +3695,8 @@ fn check_stmt(st: env.State, cx: env.Cx, fx: env.Fx, s: ast.Stmt) -> (Bool, env.
                 TList(a) | TArray(a, _) => a,
                 TErr => TErr,
                 TVar(_) => {
-                    let (a, next) = st.fresh()
-                    st = next.unify_at(e.span, TList(a), t)
+                    let a = st.fresh()
+                    st.unify_at(e.span, TList(a), t)
                     a
                 },
                 other => {
@@ -3461,7 +3704,7 @@ fn check_stmt(st: env.State, cx: env.Cx, fx: env.Fx, s: ast.Stmt) -> (Bool, env.
                     if other == TStr {
                         d = d.note("use `.lines()` or `.split(...)` to get a `List[Str]`")
                     }
-                    st = st.report(d)
+                    st.report(d)
                     TErr
                 },
             }
@@ -3471,9 +3714,9 @@ fn check_stmt(st: env.State, cx: env.Cx, fx: env.Fx, s: ast.Stmt) -> (Bool, env.
         SBreak | SContinue => {
             if fx.loops == 0 {
                 if fx.in_defer > 0 {
-                    st = st.report(diag.error("E0115", s.span, "`break` and `continue` cannot leave a `defer` body"))
+                    st.report(diag.error("E0115", s.span, "`break` and `continue` cannot leave a `defer` body"))
                 } else {
-                    st = st.report(diag.error("E0208", s.span, "`break` and `continue` can only be used inside a loop"))
+                    st.report(diag.error("E0208", s.span, "`break` and `continue` can only be used inside a loop"))
                 }
             }
             (true, fx, st)
