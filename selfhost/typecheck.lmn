@@ -1102,7 +1102,7 @@ fn check_fn(cx: env.Cx, mut st: env.State, mut ds: Decls, d: ast.FnDecl, s: env.
                 if generic {
                     st.report(diag.error("E0123", dv.span, "`{p.name}` cannot have a default: its type `{st.show(t)}` uses a type parameter").note("a default is checked once, so its type must be the same at every call"))
                 } else {
-                    st = checker.expect(st, cx, { fx with scopes: [] }, dv, t)
+                    checker.expect(mut st, cx, { fx with scopes: [] }, dv, t)
                 }
             },
             None => {},
@@ -1110,7 +1110,7 @@ fn check_fn(cx: env.Cx, mut st: env.State, mut ds: Decls, d: ast.FnDecl, s: env.
     }
     if st.subst.has_dyn(s.ret) {
         // the body's value becomes `dyn`, branch by branch
-        st = checker.expect_block(st, cx, fx, d.body, s.ret)
+        checker.expect_block(mut st, cx, fx, d.body, s.ret)
         check_pending(cx, mut st, mut ds)
         out_of_fn(mut st)
         return
@@ -1128,13 +1128,12 @@ fn check_fn(cx: env.Cx, mut st: env.State, mut ds: Decls, d: ast.FnDecl, s: env.
     }
     if tail_needs {
         // a closure in the body's value takes its types from the return type
-        st = checker.expect_block(st, cx, fx, d.body, s.ret)
+        checker.expect_block(mut st, cx, fx, d.body, s.ret)
         check_pending(cx, mut st, mut ds)
         out_of_fn(mut st)
         return
     }
-    let (bt, next) = checker.check_block(st, cx, fx, d.body)
-    st = next
+    let bt = checker.check_block(mut st, cx, fx, d.body)
     let ok = st.unify(s.ret, bt)
     if !ok {
         let b = d.body
@@ -1191,7 +1190,7 @@ fn check_pending(cx: env.Cx, mut st: env.State, mut ds: Decls) {
     }
     st.map_keys = []
     for (sp, t, name) in st.compared.reverse() {
-        st = checker.refuse_compare(st, sp, name, t)
+        checker.refuse_compare(mut st, sp, name, t)
     }
     if st.cur_fn != "" {
         // a generic function's result made with this use's type arguments:
@@ -1246,11 +1245,7 @@ fn check_pending(cx: env.Cx, mut st: env.State, mut ds: Decls) {
                 }
                 "{shown} cannot be a map key: keys are Int, Str, Bytes, Bool, and tuples, structs and enums of them"
             }),
-            _ => {
-                let (why, next) = checker.satisfies(st, cx, p.ty, p.bound)
-                st = next
-                why
-            },
+            _ => checker.satisfies(mut st, cx, p.ty, p.bound),
         }
         match why {
             Some(why) => {
