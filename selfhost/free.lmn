@@ -46,7 +46,7 @@ fn fv(bound: List[Str], acc: List[Str], e: ast.Expr) -> List[Str] {
         EUn(_, a) | ETry(a, None) | EField(a, _, _) => go(acc, a),
         ETry(a, Some(c)) => go(go(acc, a), c),
         ECall(c, args) => args.fold(go(acc, c), go),
-        ENamed(_, _, a) => go(acc, a),
+        ENamed(_, _, a) | EMut(a) => go(acc, a),
         EMethod(r, _, _, args) => args.fold(go(acc, r), go),
         EIf(c, b, other) => {
             let acc = fv_block(bound, go(acc, c), b)
@@ -146,7 +146,7 @@ pub fn has_escape(e: ast.Expr) -> Bool {
         EBin(_, a, b) | EIndex(a, b) | EPipe(a, b) => has_escape(a) || has_escape(b),
         EUn(_, a) | EField(a, _, _) => has_escape(a),
         ECall(c, args) => has_escape(c) || args.any(has_escape),
-        ENamed(_, _, a) => has_escape(a),
+        ENamed(_, _, a) | EMut(a) => has_escape(a),
         EMethod(r, _, _, args) => has_escape(r) || args.any(has_escape),
         EIf(c, b, other) => has_escape(c) || block_escape(b) || opt(other),
         EMatch(s, arms) => has_escape(s) || arms.any(|a| has_escape(a.body) || opt(a.guard)),

@@ -170,7 +170,7 @@ fn fn_item(g: Gen, name: Str, params: List[ast.Param], ret: ast.TyExpr, body: as
 }
 
 fn param(g: Gen, n: Str, t: ast.TyExpr) -> ast.Param {
-    ast.Param { name: n, span: g.sp, ty: t, default: None }
+    ast.Param { name: n, span: g.sp, ty: t, default: None, mutable: false }
 }
 
 fn value_ty(g: Gen) -> types.Ty {
@@ -1009,9 +1009,8 @@ pub fn expand(json: Option[Str], rows: List[Str], items: List[ast.Item], c: type
     let items = typecheck.rewrite_items({ c.state with rewrites }, items)
     let mut more: List[ast.Item] = []
     for i in g.out + rgs.flat_map(|x| x.out) {
-        let (i2, n2) = ids.item(i, next)
+        let i2 = ids.item(i, mut next)
         more.push(i2)
-        next = n2
     }
     Some(Expanded { items: items + more, diags: diags + rdiags.flat_map(|d| d), next_id: next })
 }

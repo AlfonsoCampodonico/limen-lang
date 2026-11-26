@@ -1,0 +1,1 @@
+fn main(mut root: Root) {}

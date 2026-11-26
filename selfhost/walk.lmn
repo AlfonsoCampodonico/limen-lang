@@ -48,7 +48,7 @@ fn from(roots: List[ast.Expr]) -> List[ast.Expr] {
 
 // The expressions directly in a block: those of its statements, with the
 // statements of the blocks those hold, and its tail.
-fn block_kids(b: ast.Block) -> List[ast.Expr] {
+pub fn block_kids(b: ast.Block) -> List[ast.Expr] {
     b.stmts.flat_map(stmt) + maybe(b.tail)
 }
 
@@ -71,7 +71,7 @@ fn maybe(e: Option[ast.Expr]) -> List[ast.Expr] {
 }
 
 // The expressions directly inside `e`, as written.
-fn below(e: ast.Expr) -> List[ast.Expr] {
+pub fn below(e: ast.Expr) -> List[ast.Expr] {
     match e.desc {
         EInt(_) | EFloat(_) | EBool(_) | EUnit | EVar(_) => [],
         EStr(parts) => parts.flat_map(|part| match part {
@@ -80,7 +80,7 @@ fn below(e: ast.Expr) -> List[ast.Expr] {
         }),
         EList(items) => items,
         EBin(_, a, b) | EPipe(a, b) | EIndex(a, b) | ESafe(a, _, b) => [a, b],
-        EUn(_, a) | EField(a, _, _) | ENamed(_, _, a) | EClosure(_, a) | EDyn(a, _) => [a],
+        EUn(_, a) | EField(a, _, _) | ENamed(_, _, a) | EMut(a) | EClosure(_, a) | EDyn(a, _) => [a],
         ECall(f, args) | EMethod(f, _, _, args) => [f] + args,
         ETry(a, context) => [a] + maybe(context),
         EIf(c, then, other) => [c] + block_kids(then) + maybe(other),
@@ -93,7 +93,7 @@ fn below(e: ast.Expr) -> List[ast.Expr] {
     }
 }
 
-fn sel_op(o: ast.SelOp) -> List[ast.Expr] {
+pub fn sel_op(o: ast.SelOp) -> List[ast.Expr] {
     match o {
         SelRecv(_, ch) => [ch],
         SelSend(ch, v) => [ch, v],

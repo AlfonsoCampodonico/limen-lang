@@ -139,13 +139,15 @@ let forwarder structs (s : struct_decl) path (d : fn_decl) : fn_decl option =
     let mk e = { edesc = e; espan = sp; ety = Types.TErr; einst = []; ecallee = None } in
     let params = List.tl d.fn_params in
     let recv = List.fold_left (fun r f -> mk (EField (r, f, sp))) (mk (EVar "self")) path in
-    let call = mk (EMethod (recv, method_name d.fn_name, sp, List.map (fun p -> mk (EVar p.prm_name)) params)) in
+    (* a `mut` parameter is passed on as `mut`; the receiver takes the method's own `self` *)
+    let arg p = if p.prm_mut then mk (EMut (mk (EVar p.prm_name))) else mk (EVar p.prm_name) in
+    let call = mk (EMethod (recv, method_name d.fn_name, sp, List.map arg params)) in
     Some
       { d with
         fn_name = s.st_name ^ "::" ^ method_name d.fn_name;
         fn_gen = s.st_gen @ List.map snd renamed;
         fn_params =
-          { prm_name = "self"; prm_span = sp; prm_ty = tyn s.st_name (List.map (fun g -> tyn g []) s.st_gen); prm_default = None }
+          { prm_name = "self"; prm_span = sp; prm_ty = tyn s.st_name (List.map (fun g -> tyn g []) s.st_gen); prm_default = None; prm_mut = (List.hd d.fn_params).prm_mut }
           :: List.map (fun p -> { p with prm_ty = subst env p.prm_ty }) params;
         fn_ret = Option.map (subst env) d.fn_ret;
         fn_body = { stmts = []; tail = Some call; bspan = sp };

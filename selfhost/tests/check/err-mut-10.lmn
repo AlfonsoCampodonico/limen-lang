@@ -1,0 +1,5 @@
+fn main(root: Root) {
+    let out = root.stdout
+    let mut k = 1
+    let ys = [1, 2].take(mut k)
+}

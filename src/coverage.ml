@@ -43,7 +43,7 @@ let coverable (items : item list) : (string * int) list =
     | EPipe (a, b) -> go a; go b
     | EWith (b, fs) -> go b; List.iter (fun (_, _, x) -> go x) fs
     | ESafe (b, _, rest, _) -> go b; go rest
-    | ENamed (_, _, x) -> go x
+    | ENamed (_, _, x) | EMut x -> go x
   and block (b : block) =
     List.iter
       (fun s ->

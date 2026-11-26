@@ -118,6 +118,15 @@ fn closures_of(f: ir.Fn) -> Map[Int, Str] {
             },
             _ => {},
         }
+        // a closure passed as a `mut` argument may be replaced
+        match rhs_of(s) {
+            Some(r) => {
+                for v in ir.place_roots(r) {
+                    set.push(v.id)
+                }
+            },
+            None => {},
+        }
     }
     let mut out: Map[Int, Str] = map()
     for (id, h) in made.entries() {
@@ -164,7 +173,9 @@ pub fn analyse(p: ir.Program) -> Map[Str, Info] {
     let mut calls: Map[Str, Calls] = map()
     let mut candidates: Map[Str, Info] = map()
     for f in p.fns {
-        let cbs = f.params.filter(|v| is_fn(v.ty)).map(|v| v.id)
+        // a `mut` parameter of function type is the caller's place, never a
+        // condition of purity: calling it makes the function impure
+        let cbs = f.params.filter(|v| is_fn(v.ty) && !v.by_ref).map(|v| v.id)
         let is_cb = |a: ir.Atom| match ir.atom_var(a) {
             Some(v) => cbs.contains(v.id),
             None => false,
@@ -193,7 +204,7 @@ pub fn analyse(p: ir.Program) -> Map[Str, Info] {
                 (Set(v, _, _), _) if cbs.contains(v.id) => true,
                 (_, Some(CallClo(c, args))) => !is_cb(c) || args.any(is_cb),
                 // where the callee takes a function: checked below
-                (_, Some(Call(..))) => false,
+                (_, Some(Call(..))) | (_, Some(CallMut(..))) => false,
                 _ => stmt_atoms(s).any(is_cb),
             }
             if escapes {
@@ -203,6 +214,18 @@ pub fn analyse(p: ir.Program) -> Map[Str, Info] {
                 Some(Call(g, args)) => {
                     straight = false
                     callees.push((g, args))
+                    if !names.contains(g) {
+                        ok = false
+                    }
+                },
+                Some(CallMut(g, args)) => {
+                    // as a Call: pure when the callee is; never kept or
+                    // reused itself
+                    straight = false
+                    callees.push((g, args.map(|a| match a {
+                        ByValue(x) => x,
+                        ByPlace(v, _) => V(v),
+                    })))
                     if !names.contains(g) {
                         ok = false
                     }
@@ -223,7 +246,7 @@ pub fn analyse(p: ir.Program) -> Map[Str, Info] {
             }
         }
         if ok {
-            let pos = f.params.with_index().flat_map(|x| if is_fn(x.1.ty) { [x.0] } else { [] })
+            let pos = f.params.with_index().flat_map(|x| if is_fn(x.1.ty) && !x.1.by_ref { [x.0] } else { [] })
             candidates[f.fname] = Info { heavy: !(scalar_only && straight), cbs: pos }
             calls[f.fname] = Calls { clos: closures_of(f), own_cbs: cbs, calls: callees }
         }
@@ -304,10 +327,17 @@ fn worth_keeping(pure: Map[Str, Info], clos: Map[Int, Str], r: ir.Rhs) -> Bool {
 }
 
 // Variables a statement list assigns other than by `let`.
+// Those a call changes through a `mut` argument count too.
 fn assigned(ss: List[ir.Stmt]) -> List[Int] {
-    intset.of_list(all_stmts(ss).flat_map(|s| match s {
-        Set(v, _, _) | Mutate(v, _, _) | Init(v, _) | Decl(v) => [v.id],
-        _ => [],
+    intset.of_list(all_stmts(ss).flat_map(|s| {
+        let roots = match rhs_of(s) {
+            Some(r) => ir.place_roots(r).map(|v| v.id),
+            None => [],
+        }
+        match s {
+            Set(v, _, _) | Mutate(v, _, _) | Init(v, _) | Decl(v) => [v.id] + roots,
+            _ => roots,
+        }
     }))
 }
 
@@ -386,9 +416,18 @@ fn cse_block(pure: Map[Str, Info], clos: Map[Int, Str], avail: List[(Key, ir.Var
                     },
                 }
             },
+            Let(_, r) if !ir.place_roots(r).is_empty() => {
+                // a call with `mut` arguments changes their variables
+                avail = kill(avail, intset.of_list(ir.place_roots(r).map(|w| w.id)))
+                out.push(s)
+            },
             Let(..) | Drop(_) | Break | Continue | Return(_) | GuardEnd(_) | Line(_) => out.push(s),
             Set(v, _, _) | Mutate(v, _, _) | Init(v, _) | Decl(v) => {
-                avail = kill(avail, [v.id])
+                let roots = match rhs_of(s) {
+                    Some(r) => ir.place_roots(r),
+                    None => [],
+                }
+                avail = kill(avail, intset.of_list(([v] + roots).map(|w| w.id)))
                 out.push(s)
             },
             If(c, a, b) => {

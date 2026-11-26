@@ -1,0 +1,4 @@
+fn main(root: Root) {
+    let xs = [1].map(|x| x)
+    xs.each { |mut x| x }
+}

@@ -1,0 +1,20 @@
+struct Buf {
+    items: List[Int],
+}
+
+fn add(mut self: Buf, x: Int) {
+    self.items.push(x)
+}
+
+fn bump(mut n: Int) {
+    n = n + 1
+}
+
+fn plain(n: Int) -> Int {
+    n
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let g = bump
+}

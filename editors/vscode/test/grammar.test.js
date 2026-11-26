@@ -145,6 +145,10 @@ pub type Pair[T] = (T, T)
     const got = scopeOf(t, text);
     check(`scope of ${JSON.stringify(text)}`, got === want, `got ${got}, want ${want}`);
   }
+  // `mut` before a parameter and before an argument
+  const mp = tokenize(grammar, "fn f(mut n: Int) { g(mut n) }\n");
+  check("mut parameter", scopeOf(mp, "mut") === "storage.modifier.limen", scopeOf(mp, "mut"));
+  check("mut argument", scopeOf(mp, "mut", 1) === "storage.modifier.limen", scopeOf(mp, "mut", 1));
   // a string inside an interpolation is a string; `-` before it was arithmetic
   check("string in interpolation", scopeOf(t, "-", 1) === "string.quoted.double.limen", scopeOf(t, "-", 1));
   // nested braces inside an interpolation close at the right place: the text after is a string again

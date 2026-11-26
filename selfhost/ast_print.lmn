@@ -128,6 +128,7 @@ pub fn expr(e: ast.Expr) -> Str {
         EUn(BitNot, a) => "(~" + expr(a) + ")",
         ECall(f, args) => expr(f) + "(" + commas(args, expr) + ")",
         ENamed(n, _, a) => n + ":" + expr(a),
+        EMut(a) => "mut " + expr(a),
         EDyn(x, _) => expr(x),
         EMethod(r, n, _, args) => expr(r) + "." + n + "(" + commas(args, expr) + ")",
         EField(r, n, _) => expr(r) + "." + n,
@@ -197,7 +198,7 @@ fn generics(gs: List[Str], bounds: List[ast.Bound]) -> Str {
 }
 
 fn params(ps: List[ast.Param]) -> Str {
-    commas(ps, |p| p.name + ":" + ty(p.ty) + (p.default.map(|e| "=" + expr(e)) ?? ""))
+    commas(ps, |p| (if p.mutable { "mut " } else { "" }) + p.name + ":" + ty(p.ty) + (p.default.map(|e| "=" + expr(e)) ?? ""))
 }
 
 fn ret(t: Option[ast.TyExpr]) -> Str {
@@ -334,6 +335,7 @@ fn expr_spans(w: Where, e: ast.Expr) -> Str {
         ESelect(arms) => all(arms, |a| sp(w, a.span) + sel_spans(w, a.op) + maybe(a.guard, |x| expr_spans(w, x)) + expr_spans(w, a.body)),
         ESafe(b, _, rest) => expr_spans(w, b) + expr_spans(w, rest),
         ENamed(_, name, x) => sp(w, name) + expr_spans(w, x),
+        EMut(x) => expr_spans(w, x),
         EDyn(x, _) => expr_spans(w, x),
         EInt(_) | EFloat(_) | EBool(_) | EUnit | EVar(_) => "",
     }

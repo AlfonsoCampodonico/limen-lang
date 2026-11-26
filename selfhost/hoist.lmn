@@ -57,13 +57,18 @@ fn mentions(v: ir.Var, atoms: List[ir.Atom]) -> Bool {
     })
 }
 
+fn is_root(v: ir.Var, r: ir.Rhs) -> Bool {
+    ir.place_roots(r).any(|w| same(w, v))
+}
+
 // Could the list's reference count rise inside the loop? Any retain or
 // move of the variable, or a reassignment, rules the hoist out; so does a
 // list declared inside the loop, which does not exist yet where the
-// hoisted check would go.
+// hoisted check would go, and a list passed as a `mut` argument, which
+// the callee may share.
 pub fn escapes(v: ir.Var, body: List[ir.Stmt]) -> Bool {
     body.any(|s| match s {
-        Let(w, r) | Init(w, r) | Set(w, r, _) => same(w, v) || mentions(v, ir.consumed(r)),
+        Let(w, r) | Init(w, r) | Set(w, r, _) => same(w, v) || mentions(v, ir.consumed(r)) || is_root(v, r),
         Decl(w) => same(w, v),
         Mutate(_, _, m) => mentions(v, ir.mut_atoms(m)),
         Return(a) => mentions(v, [a]),
@@ -159,8 +164,9 @@ pub fn versionable(body: List[ir.Stmt]) -> Option[Versioned] {
         },
     }
     let ss = pure.all_stmts(body)
+    // a `mut` argument counts as an assignment of its variable
     let assigns_of = |w: ir.Var| ss.filter(|s| match s {
-        Set(x, _, _) | Let(x, _) | Init(x, _) => same(x, w),
+        Set(x, r, _) | Let(x, r) | Init(x, r) => same(x, w) || is_root(w, r),
         _ => false,
     })
     let invariant = |a: ir.Atom| match a {

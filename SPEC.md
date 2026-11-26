@@ -156,6 +156,9 @@ fn swap[A, B](p: Pair[A, B]) -> Pair[B, A] {
 
 - A function without `-> T` returns `()`.
 - A parameter can have a default value, used when a call leaves the argument out: `fn join(xs: List[Str], sep: Str = ", ")` is called `join(xs)` or `join(xs, " | ")`. A default is a constant (a number, a plain string, `true`, `false`, `None` or `[]`), anything else is E0123. It is checked once, where the function is declared, so the parameter's type cannot use the function's type parameters (E0123). Parameters with defaults can come anywhere: the ones before a later required parameter are filled by name, `f(b: 2)`. Methods take defaults too; foreign functions and interface methods do not. A function used as a value (`let g = join`) has its full type, `fn(List[Str], Str) -> Str`, and every argument is passed.
+- A parameter can be `mut`, `self` included: `fn roll(mut seed: Int) -> Int`. Inside the function it is a `mut` variable for the length of the call, and it is the caller's place: each change the function makes to it lands there as it is made. The call writes the argument `mut place`, `roll(mut seed)`, where the place is anything an assignment can have on its left (section 6: a variable, a field, a list or array element, a map entry, or a path through them) and its root is `mut` (E0205). The place has exactly the parameter's type, with no conversion (E0201). The receiver of a `mut self` method is the place and takes no marker (Methods, below). The marker matches the parameter: `mut` on an argument whose parameter is not `mut`, or whose callee has no `mut` parameters (a closure, a function value, a variant, a built-in function or method), and a missing `mut` where the parameter is `mut`, are E0213, with a fix that removes or adds it; a value piped with `|>` cannot be passed as `mut`. When the callee returns, panics or is cancelled, the place holds what it has written so far, and a `defer` in the caller or the callee sees that. Storing the parameter, returning it, capturing it in a closure or sending it on a channel takes a copy, as for any variable (section 8), and a closure cannot assign it (E0205). A `mut` parameter cannot have a default (E0123), and `main` cannot have one (E0303). Only functions and methods declared with `fn` take `mut` parameters: not closures, tests, interface methods or foreign functions (E0003, section 20).
+- The `mut` places of one call may not overlap (E0214): `swap(mut a, mut a)` and `fill(mut s, mut s.items)` are refused, and so is `s.add(mut s.items)` for a `mut self` method. Distinct fields of one value do not overlap, `swap(mut p.x, mut p.y)`; two elements of one list or entries of one map count as overlapping, since their indexes are not known when checking: take them out, call, and put them back. The other arguments of the call, outside closures, may not change one of its `mut` places either, through a `mut` argument or `push` of their own (`f(mut a, g(mut a))`) or by assigning it (`f(mut a, { a = 1; 2 })`), and an index of a `mut` place may not assign a variable that another index of the same place reads; make that call or assignment first, on its own line. A plain argument may name a `mut` place: `f(mut xs, xs)` passes the plain one as it is before the call.
+- A function or method with a `mut` parameter can only be called by name, never used as a value (E0215), like `push` and `remove`: a `mut` argument is a place, which only a direct call can pass. `let g = roll`, `xs.map(roll)` and `let f = buf.add` are refused; wrap the call in a function that takes and returns the value.
 - The body's last expression, without `;`, is the return value. `return e` returns early.
 - Generic parameters go in `[...]` after the name. They are instantiated at each use and are never written at call sites: `swap(p)`.
 - A type parameter written as an array's size stands for a length, inferred at each call: `fn sum[N](xs: Array[Int, N]) -> Int` takes an array of any length, and `fn first[T, N](xs: Array[T, N]) -> T` any element type too. Inside, `xs.len()` is that length. The function is compiled once per length used, like the rest of generics. A parameter cannot be both a length and a type (E0102), and it is not a value: use `xs.len()`.
@@ -207,8 +210,8 @@ let p = a.add(b).add(c)
 - `self` must be the first parameter, and its type a struct or enum declared in the program, generic or not, or one of the built-in types below (E0110).
 - A file can add methods to `Int`, `Float`, `Bool`, `Str`, `Bytes`, `List[T]`, `Map[K, V]`, `Option[T]`, `Result[T, E]` and `IoError`: `fn shout(self: Str) -> Str { self.to_upper() + "!" }` makes `"hi".shout()` work **in that file only**. Built-in types belong to no module, so this keeps two modules' helpers from clashing; such a method cannot be `pub` (E0110), and it cannot reuse the name of a built-in method (E0106). Export a plain function to share it. Methods added this way do not count toward interfaces, and capabilities, channels and arrays cannot get methods.
 - A method is only called with a dot: `p.add(q)`, never `add(p, q)`. Its name does not clash with a plain function or with methods of other types, so `fn area(self: Circle)` and `fn area(self: Rect)` can both exist.
-- Methods take `self` by value like any parameter; to "change" a value, return the new one.
-- A method without the call is a value: `p.add` is a function that calls `add` on `p`, the same as `|q| p.add(q)`. Like a closure, it holds a copy of `p` taken when `p.add` is evaluated, so `[a, b].map(origin.add)` works and later changes to `p` do not reach it. This works for every method that can be called with a dot: user methods, `dyn` and interface-bounded methods, and built-in ones (`let say = out.print`), except `push` and `remove`, which change their receiver. (It is `p.add`, as in Go and Swift, and not `Point.add`: the value already knows its type, and `Name.x` is taken by enum variants and modules.)
+- Methods take `self` by value like any parameter; to "change" a value, return the new one, or declare it `mut self`. `fn add(mut self: Buf, x: Int) { self.items.push(x) }` changes the value it is called on, which must be a `mut` place, as for `push`: `buf.add(1)`, with no marker on the receiver. The receiver counts as a `mut` argument of the call (E0214). Such a method cannot satisfy an interface's method or a bound (E0111), since a bound or `dyn` value calls it as a value, with a plain receiver.
+- A method without the call is a value: `p.add` is a function that calls `add` on `p`, the same as `|q| p.add(q)`. Like a closure, it holds a copy of `p` taken when `p.add` is evaluated, so `[a, b].map(origin.add)` works and later changes to `p` do not reach it. This works for every method that can be called with a dot: user methods, `dyn` and interface-bounded methods, and built-in ones (`let say = out.print`), except `push` and `remove`, which change their receiver, and methods with a `mut` parameter, `mut self` included (E0215). (It is `p.add`, as in Go and Swift, and not `Point.add`: the value already knows its type, and `Name.x` is taken by enum variants and modules.)
 - In a module, only `pub fn` methods can be called from other modules (E0402).
 
 ### Interfaces
@@ -552,6 +555,8 @@ let report = read_orders(text)
 
 Evaluation order is left to right: the callee (or a method's receiver), then the arguments in the order they are written. For assignment, the right-hand side is evaluated before the target's indexes.
 
+**`mut` arguments.** `f(mut place)` passes a place to a `mut` parameter (section 4), and the callee changes that place. The place's indexes are evaluated where the argument is written, in the order above; a plain argument holds the value it had where it is written. A named argument can be `mut` too: `bump(n: mut k)`.
+
 **Named arguments.** An argument can name the parameter it is for, which reads better than a row of bare numbers and booleans:
 
 ```
@@ -594,7 +599,7 @@ defer { ... }
 expr
 ```
 
-- Parameters and pattern bindings are immutable. Use `let mut y = y` to get a mutable copy.
+- Parameters, unless declared `mut` (section 4), and pattern bindings are immutable. Use `let mut y = y` to get a mutable copy.
 - `for` iterates over a snapshot: changing the list inside the loop does not affect the iteration. Over a range, both bounds are evaluated once, before the first iteration.
 - `break` and `continue` only work inside loops, not across closures (E0208).
 - Only variables, fields, list or array elements and map entries, and paths through them such as `m[k].x` or `xs[i].tags[j]`, can be assigned (E0209).
@@ -714,6 +719,8 @@ let b = a
 a.push(2)      // a is [1, 2], b is still [1]
 ```
 
+A `mut` parameter (section 4) does not share a value. It lets one call change one place that the caller names with `mut`, `roll(mut seed)`, and nothing else can reach that place during the call: closures and tasks hold copies. Storing the parameter, returning it, capturing it or sending it takes a copy, as for any variable, so Limen has no stored references. Natively the callee writes to the caller's place directly, so a value held once, such as a list pushed to through a `mut` parameter, is changed in place without a copy.
+
 The native backend implements this with reference counting and copy-on-write. A value is copied only if it is shared at the moment it is mutated. A value's last use moves it rather than retaining it, so in-place updates are the normal case.
 
 Memory is managed by reference counting, natively, with no garbage collector: a value is freed as soon as the last reference to it goes, and freeing a long chain (a list of a million `Option[Node]`s, lists nested as deep, a chain of `dyn` values) takes constant stack. So do the other walks over a whole value: printing it, comparing it with `==`, ordering it (`<`, `sort`, `min`, `max`), hashing it as a map key and sharing it with another task (sending it on a channel, putting it in a `Shared`, capturing it in a task). Natively each recurses only a few dozen levels and keeps the rest on a list of its own, on the heap, so a value as deep as it is long, such as an enum list built a million `Cons`es deep, cannot overflow a task's stack; the output, the answers and the hashes are the same as a recursive walk's, and `==` and `<` still stop at the first difference. Because values are copied, not shared, a value cannot contain itself, so reference counting frees everything, with one exception: the only things that are shared rather than copied are a `Shared` and a channel (section 10), and through them a cycle can be built: a `Shared[List[fn() -> Int]]` holding a closure that captured that same `Shared`, or a channel whose buffer holds a value that captured the channel. Nothing collects such a cycle, so it stays allocated until the program exits. To avoid one, do not put into a `Shared` or a channel anything that holds that same `Shared` or channel; pass the `Shared` or channel to the code that needs it as a parameter instead of capturing it in a value stored inside it. The interpreter has a garbage collector and frees cycles too; that difference is invisible to a program, except in how much memory it uses.
@@ -747,9 +754,9 @@ The rules:
 1. Programs cannot create capabilities. They come only from `root`.
 2. Attenuation only narrows. `net.only(host)` returns a `Net` limited to that host, and it is empty if you didn't hold that host. `fs.under(dir)` limits to a subdirectory; `fs.read_only()` removes writing. `exec.only(program)` limits `Exec` to one program (keeping any argument prefixes it was limited to), and `exec.only_args(program, prefixes)` to that program with arguments starting with one of `prefixes` (below); `foreign.only(lib)` limits `Foreign` to one library.
 3. There is no ambient I/O. Using `print`, `open`, `fetch` and similar names is error E0302, which explains the capability to use instead.
-4. A function whose parameters hold no capability (not even through a struct or enum field, below), no function type (also not through a field) and no channel, `Atomic` or `Shared` is **pure**: it can only compute (and panic). What a channel carries counts like what a list holds: a function taking `Chan[Stdout]` takes `Stdout`. `limen caps FILE` lists each function's authority, and says `shares state` (`shares state, runs callbacks`; `"shares": true` in `--json`) for one that holds no capability but takes a channel, `Atomic` or `Shared`, even in a list, an option or a tuple. Section 14 says what the compiler does with pure calls. It never runs them in parallel on its own: concurrency stays visible and cancellable in a `group`, where you write it.
+4. A function whose parameters hold no capability (not even through a struct or enum field, below), no function type (also not through a field) and no channel, `Atomic` or `Shared` is **pure**: it can only compute (and panic). What a channel carries counts like what a list holds: a function taking `Chan[Stdout]` takes `Stdout`. `limen caps FILE` lists each function's authority, and says `shares state` (`shares state, runs callbacks`; `"shares": true` in `--json`) for one that holds no capability but takes a channel, `Atomic` or `Shared`, even in a list, an option or a tuple. Section 14 says what the compiler does with pure calls. It never runs them in parallel on its own: concurrency stays visible and cancellable in a `group`, where you write it. A `mut` parameter (section 4) does not by itself make a function impure: what it changes is the place the caller marked `mut`, as visible at the call as a returned value is.
 
-   A function that would be pure but for parameters of function type is **pure if they are**, when all it does with them is call them or pass them on, as they are, to a function that is itself pure if they are: `fn my_map(xs: List[Int], f: fn(Int) -> Int) -> List[Int]` that only calls `f(x)`. A call of it is then a pure call when the functions it is given are pure: `my_map(xs, |x| x * 2)` is, `my_map(xs, |x| { out.print("{x}"); x })` is not. Storing such a parameter (in a list, a struct, a map), returning it, capturing it in a closure, sending it on a channel or running it as a task makes the function only "pure itself": its calls are never treated as pure. `limen caps` says `pure if f is` (`pure if f and g are`; `"pure_if": ["f", "g"]` in `--json`), and `pure itself, runs callbacks` for the others. A parameter whose type holds a function through its fields, such as `Handlers { on_get: fn(Str) -> Str }`, is not a function parameter in this sense: a function taking one is only pure itself, and `limen caps` names the field, `pure itself, runs callbacks (via Handlers.on_get)`. A bound on a type parameter (`[T: Named]`) still counts as running callbacks, and the authority its methods reach counts as the function's own: in `fn f[T: Giver](x: T)`, where `interface Giver { fn give(self) -> Stdout }`, `x.give()` is a `Stdout`, so `f` takes `Stdout` (`limen caps` shows `Stdout (via Giver.give)`), and so does a capability a bound method passes to a callback, `fn take(self, f: fn(Fs))`. This goes through bounds of bounds: the interface of a `dyn` type written in a bound method's signature, anywhere in its parameter or result types (`fn get(self) -> dyn Inner`, `fn make(self) -> fn() -> dyn Taker`), bounds the value inside, so its methods count too, to any depth, and `limen caps` names each method on the way, `Stdout (via Outer.get, Inner.give)`. The outermost `dyn` is followed first, so in `fn get(self) -> dyn Box[dyn Leaf]` the path goes through `Box`'s methods, `Outer.get, Box.open, Leaf.dial`. Each interface's methods are walked once, whatever its arguments, so an interface that mentions itself, `interface Node { fn next(self) -> dyn Node }`, or grows its own arguments, `dyn Grow[Option[T]]`, does not make the walk endless; a capability in the arguments of a later mention (`dyn Grow[Stdout]`) still counts, through the method that mentions it. Only types written in a bound method's signature are followed: a `dyn` field of a struct such a method returns is not.
+   A function that would be pure but for parameters of function type is **pure if they are**, when all it does with them is call them or pass them on, as they are, to a function that is itself pure if they are: `fn my_map(xs: List[Int], f: fn(Int) -> Int) -> List[Int]` that only calls `f(x)`. A call of it is then a pure call when the functions it is given are pure: `my_map(xs, |x| x * 2)` is, `my_map(xs, |x| { out.print("{x}"); x })` is not. Storing such a parameter (in a list, a struct, a map), returning it, capturing it in a closure, sending it on a channel or running it as a task makes the function only "pure itself": its calls are never treated as pure. `limen caps` says `pure if f is` (`pure if f and g are`; `"pure_if": ["f", "g"]` in `--json`), and `pure itself, runs callbacks` for the others. So does a function with a `mut` parameter of function type, which may replace the caller's function. A parameter whose type holds a function through its fields, such as `Handlers { on_get: fn(Str) -> Str }`, is not a function parameter in this sense: a function taking one is only pure itself, and `limen caps` names the field, `pure itself, runs callbacks (via Handlers.on_get)`. A bound on a type parameter (`[T: Named]`) still counts as running callbacks, and the authority its methods reach counts as the function's own: in `fn f[T: Giver](x: T)`, where `interface Giver { fn give(self) -> Stdout }`, `x.give()` is a `Stdout`, so `f` takes `Stdout` (`limen caps` shows `Stdout (via Giver.give)`), and so does a capability a bound method passes to a callback, `fn take(self, f: fn(Fs))`. This goes through bounds of bounds: the interface of a `dyn` type written in a bound method's signature, anywhere in its parameter or result types (`fn get(self) -> dyn Inner`, `fn make(self) -> fn() -> dyn Taker`), bounds the value inside, so its methods count too, to any depth, and `limen caps` names each method on the way, `Stdout (via Outer.get, Inner.give)`. The outermost `dyn` is followed first, so in `fn get(self) -> dyn Box[dyn Leaf]` the path goes through `Box`'s methods, `Outer.get, Box.open, Leaf.dial`. Each interface's methods are walked once, whatever its arguments, so an interface that mentions itself, `interface Node { fn next(self) -> dyn Node }`, or grows its own arguments, `dyn Grow[Option[T]]`, does not make the walk endless; a capability in the arguments of a later mention (`dyn Grow[Stdout]`) still counts, through the method that mentions it. Only types written in a bound method's signature are followed: a `dyn` field of a struct such a method returns is not.
 5. Enforcement at runtime:
    - `Net`: http and https URLs only, host allowlist, redirects not followed. `Net.connect` and `Net.connect_tls` use the same allowlist. TLS certificates are always verified (section 10).
    - `Exec`: the program name must match a grant exactly (`git` and `/usr/bin/git` are different grants), or the grant is `*`. Arguments are passed as a list, never through a shell. The child gets `/dev/null` as stdin, the working directory, `PATH`, and only the environment variables granted with `--grant env=`. A program name without `/` is looked up in `PATH`, as a shell would. Granting a program grants everything that program can do with any arguments, so `exec=sh` is as good as every other grant, unless the grant limits the arguments.
@@ -1256,7 +1263,7 @@ Binary data, kept apart from text so a byte buffer is never printed or concatena
 | --- | --- |
 | `len()`, `is_empty()` | `Int`, `Bool` |
 | `get(i)`, `first()`, `last()` | `Option[T]` |
-| `push(x)` | `()`, appends in place (needs `mut`) |
+| `push(x)` | `()`, appends in place: a built-in `mut self` method, so the list must be a `mut` place (section 4) |
 | `contains(x)` | `Bool` |
 | `reverse()`, `take(n)`, `skip(n)` | `List[T]`; `take` and `skip` clamp out-of-range counts |
 | `sort()` | `List[T]`, stable, in the order of `<`; `T` must be ordered (section 5) |
@@ -1558,6 +1565,8 @@ Other uses of purity change nothing a program can observe. A pure call (to a pur
 - **In a loop**, a pure call whose arguments do not change in the loop is made the first time it is reached, and later iterations reuse its result. A loop that runs zero times never makes the call, a call under an `if` runs only once the condition holds, and a call that panics or never returns does so at the same point as before.
 - **In a block**, a second call with the same arguments, where nothing they name was reassigned or changed in between, reuses the first call's result.
 
+A call with a `mut` argument (section 4) writes to the caller's place, so it is never reused or kept, in a loop or a block, whatever the function, and it counts as a change of that place for the calls around it.
+
 The interpreter reuses a pure call's result in a loop when the same function is called again with the same values. Pure calls on constants are not evaluated at compile time, beyond what the C compiler does itself, and results are never remembered across calls: write a cache yourself, as a `Map` you pass along, where one is worth it.
 
 ## 15. Errors
@@ -1587,6 +1596,7 @@ Every diagnostic has a stable code. `limen explain CODE` prints its explanation,
 | E0120 | an ambiguous name promoted from two embedded structs at the same depth |
 | E0121 | embedding something that is not a struct |
 | E0122 | a named argument that names no parameter, names one twice, comes before a positional argument, or is given to a callee without parameter names |
+| E0123 | a parameter's default that is not a constant, uses the function's type parameters, or is on a `mut` parameter |
 | E0201 | type mismatch |
 | E0202 | misuse of `?` |
 | E0203 | `if` without `else` produces a value |
@@ -1598,6 +1608,10 @@ Every diagnostic has a stable code. `limen explain CODE` prints its explanation,
 | E0209 | invalid assignment target |
 | E0210 | the alternatives of an or-pattern bind different names, or a name with different types |
 | E0211 | a tuple assignment whose right side is not a tuple of as many items |
+| E0212 | a type `json` or `sql` converts that is not known where it is used, or has no JSON or row form |
+| E0213 | an argument whose `mut` marker does not match its parameter: `mut` where the parameter is not `mut` (or the callee has no `mut` parameters), or none where it is |
+| E0214 | `mut` places of one call that overlap, or another argument of the call changing one of them |
+| E0215 | a function or method with a `mut` parameter used as a value instead of called |
 | E0301 | no longer reported: capabilities can be stored in fields (section 9) |
 | E0302 | ambient I/O name such as `print` |
 | E0303 | bad `main` signature |
@@ -1649,12 +1663,14 @@ foreign    = "foreign" STRING "{" { [ "pub" ] [ "blocking" ] "fn" IDENT "(" [ pa
 interface  = "interface" IDENT [ generics ] "{" { "fn" IDENT "(" "self" { "," param } ")" [ "->" type ] ( "," | NL ) } "}" ;
 test       = "test" STRING [ "(" [ tparams ] ")" ] [ "for" ( IDENT | tuplepat ) "in" "[" expr { "," expr } [ "," ] "]" ] block ;
 bench      = "bench" STRING [ "(" [ params ] ")" ] block ;
-fn         = "fn" IDENT [ bgenerics ] "(" [ params ] ")" [ "->" type ] block ;
+fn         = "fn" IDENT [ bgenerics ] "(" [ fnparams ] ")" [ "->" type ] block ;
 bgenerics  = "[" IDENT [ ":" bound { "+" bound } ] { "," IDENT [ ":" bound { "+" bound } ] } "]" ;
 bound      = IDENT [ "." IDENT ] [ "[" typearg { "," typearg } "]" ] ;   (* an interface, with its arguments *)
 generics   = "[" IDENT { "," IDENT } "]" ;
 params     = param { sep param } [ "," ] ;
 param      = IDENT ":" type ;
+fnparams   = fnparam { sep fnparam } [ "," ] ;
+fnparam    = [ "mut" ] IDENT ":" type ;          (* `mut` only in a `fn` item's parameters *)
 tparams    = tparam { sep tparam } [ "," ] ;
 tparam     = param | IDENT ":" "virtual" "Clock" ;             (* a clock on virtual time *)
 struct     = "struct" IDENT [ bgenerics ] "{" [ field { sep field } [ "," ] ] "}" ;
@@ -1687,7 +1703,7 @@ postfix    = primary { "(" [ args ] ")" [ trailing ] | trailing | "[" expr "]" |
 trailing   = "{" [ "|" [ cparam { "," cparam } ] "|" ] { stmt ( NL | ";" ) } [ expr ] "}" ;
                                                 (* same line; not in expr_ns; bare only after a lowercase name or method *)
 args       = arg { sep arg } [ "," ] ;
-arg        = [ IDENT ":" ] expr ;                 (* a named argument *)
+arg        = [ IDENT ":" ] [ "mut" ] expr ;       (* a named argument; `mut` takes a place *)
 primary    = INT | FLOAT | STRING | "true" | "false"
            | [ IDENT "." ] IDENT [ "{" [ init { sep init } [ "," ] ] "}" ]   (* struct literal *)
            | "(" ")" | "(" expr ")" | "(" expr "," expr { "," expr } ")"   (* tuple *)
@@ -2471,7 +2487,7 @@ The core language is close to complete; what is missing is mostly around it.
 - Standard library: no compatibility normal forms (NFKC, NFKD) or locale-specific case rules in `unicode`.
 - Tooling: no incremental checking; test coverage only in the interpreter.
 - Distribution: releases for macOS on Apple silicon (Homebrew) and Linux on x86-64 and arm64 (`.deb` and tarballs), but no apt repository; the package index has no hosted default; no stability promise yet.
-- Language: no signed integer types other than `Int` outside FFI, and conversions the compiler writes only for JSON and SQL rows.
+- Language: no signed integer types other than `Int` outside FFI, and conversions the compiler writes only for JSON and SQL rows. No `mut` parameters in interface methods (and so on `dyn` values), foreign functions or function types; closures cannot take one either (E0003).
 - A native backend other than C: Cranelift was decided against, since native code is C compiled by the system's compiler.
 
 [ROADMAP.md](ROADMAP.md) has the details, in order.

@@ -208,7 +208,7 @@ let rec coders st t : string * string =
             fn_test = None; fn_bench = false; fn_virtual = false; fn_table = None; fn_pub = false; fn_bounds = [];
             fn_foreign = None }
       in
-      let prm n t = { prm_name = n; prm_span = st.sp; prm_ty = t; prm_default = None } in
+      let prm n t = { prm_name = n; prm_span = st.sp; prm_ty = t; prm_default = None; prm_mut = false } in
       let parts = te st (TyName ("List", [ te st (TyName (jf st "Part", [])) ])) in
       let result = written st (TNamed ("Result", [ t; TStr ])) in
       let dec_params = [ prm "v" (written st (value_ty st)); prm "at" (written st TStr) ] in
@@ -469,7 +469,7 @@ let row_coders st t : string * string =
             fn_test = None; fn_bench = false; fn_virtual = false; fn_table = None; fn_pub = false; fn_bounds = [];
             fn_foreign = None }
       in
-      let prm n t = { prm_name = n; prm_span = st.sp; prm_ty = t; prm_default = None } in
+      let prm n t = { prm_name = n; prm_span = st.sp; prm_ty = t; prm_default = None; prm_mut = false } in
       let value_list = TList (TNamed (jf st "Value", [])) in
       let made = ex st (EStruct (n, st.sp, List.map2 (fun (f, _) (r, _) -> (f, st.sp, r)) fs parts)) in
       st.out <-
@@ -517,7 +517,7 @@ let rec iter_expr f (e : expr) =
   | EPipe (a, b) -> go a; go b
   | EWith (b, fs) -> go b; List.iter (fun (_, _, x) -> go x) fs
   | ESafe (b, _, rest, _) -> go b; go rest
-  | ENamed (_, _, x) -> go x
+  | ENamed (_, _, x) | EMut x -> go x
 
 and iter_block f (b : block) =
   List.iter
@@ -614,7 +614,7 @@ let expand ?json ?(rows = []) (items : item list) : (item list * Diag.t list) op
             try
               let to_, from = coders st t in
               let w = jf st (sprintf "%s$%d" (if encode then "encode" else "decode") (Hashtbl.length wrappers + 1)) in
-              let prm n t = { prm_name = n; prm_span = e.espan; prm_ty = t; prm_default = None } in
+              let prm n t = { prm_name = n; prm_span = e.espan; prm_ty = t; prm_default = None; prm_mut = false } in
               let body, params, ret =
                 if encode then (block st [] (call st (jf st (if plain st t then "stringify" else "write")) [ call st to_ [ var st "x" ] ]), [ prm "x" (written st t) ], written st TStr)
                 else (block st [] (call st (jf st "from_text") [ var st "s"; var st from ]), [ prm "s" (written st TStr) ], written st (TNamed ("Result", [ t; TStr ])))
@@ -658,7 +658,7 @@ let expand ?json ?(rows = []) (items : item list) : (item list * Diag.t list) op
             try
               let reader, _ = row_coders st t in
               let w = jf st (sprintf "%s$%d" m (Hashtbl.length wrappers + 1)) in
-              let prm n t = { prm_name = n; prm_span = e.espan; prm_ty = t; prm_default = None } in
+              let prm n t = { prm_name = n; prm_span = e.espan; prm_ty = t; prm_default = None; prm_mut = false } in
               let db = TNamed (jf st "Db", []) and values = TList (TNamed (jf st "Value", [])) in
               let query = if m = "all" then "query" else "query_one" in
               let rows = try_ st (ex st (EMethod (var st "self", query, st.sp, [ var st "text"; var st "params" ]))) in

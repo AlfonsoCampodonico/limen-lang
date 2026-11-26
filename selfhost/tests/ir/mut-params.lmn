@@ -1,0 +1,85 @@
+// `mut` parameters and arguments: a variable root, path places through
+// fields, list elements and map entries, a plain argument naming the list
+// a `mut` element comes from, a panic through a variable root and a path,
+// and a callee that keeps a copy of the list it changes in a loop
+struct Buf {
+    items: List[Int],
+}
+
+fn add(mut self: Buf, x: Int) {
+    self.items.push(x)
+}
+
+fn bump(mut n: Int) {
+    n = n + 1
+}
+
+fn g(out: Stdout, mut x: Int, xs: List[Int]) {
+    x = 5
+    out.print("{xs}")
+}
+
+fn fill(out: Stdout, mut xs: List[Int]) {
+    defer out.print("callee {xs}")
+    xs.push(1)
+    xs.push(2)
+    panic("stop")
+}
+
+fn stash(mut xs: List[Int], mut kept: List[List[Int]]) {
+    kept.push(xs)
+    xs.push(1)
+}
+
+fn basic(out: Stdout) {
+    let mut k = 0
+    bump(mut k)
+    bump(mut k)
+    let mut b = Buf { items: [] }
+    b.add(1)
+    b.add(2)
+    let mut bs = [b, b]
+    bump(mut bs[1].items[0])
+    let mut m = map([("a", 1)])
+    bump(mut m["a"])
+    out.print("{k} {b.items} {bs[1].items} {m}")
+}
+
+fn snapshot(out: Stdout) {
+    let mut xs = [1, 2]
+    g(out, mut xs[0], xs)
+    out.print("{xs}")
+}
+
+fn panics(out: Stdout) {
+    let r = catch(|| {
+        let mut ys: List[Int] = []
+        defer out.print("caller {ys}")
+        fill(out, mut ys)
+        0
+    })
+    let s = catch(|| {
+        let mut b = Buf { items: [] }
+        defer out.print("path {b.items}")
+        fill(out, mut b.items)
+        0
+    })
+}
+
+fn hoist(out: Stdout) {
+    let mut xs: List[Int] = []
+    let mut kept: List[List[Int]] = []
+    for i in 0..<3 {
+        xs.push(i)
+        stash(mut xs, mut kept)
+    }
+    out.print("{kept}")
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    basic(out)
+    snapshot(out)
+    panics(out)
+    hoist(out)
+}

@@ -1,0 +1,6 @@
+fn main(root: Root) {
+    let out = root.stdout
+    let mut k = 0
+    let f = |n: Int| n
+    let j = f(mut k)
+}

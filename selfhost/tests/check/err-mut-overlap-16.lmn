@@ -1,0 +1,26 @@
+// E0214: an argument assigning the root of a `mut` place of the same call;
+// a field the place does not go through is fine
+struct Buf {
+    items: List[Int],
+    n: Int,
+}
+
+fn addn(mut xs: List[Int], n: Int) {
+    xs.push(n)
+}
+
+fn main(root: Root) {
+    let mut b = Buf { items: [], n: 0 }
+    addn(mut b.items, {
+        b = Buf { items: [9], n: 1 }
+        1
+    })
+    addn(mut b.items, {
+        while b.n < 3 {
+            b.items = []
+            b.n = b.n + 1
+        }
+        1
+    })
+    root.stdout.print("{b.items}")
+}

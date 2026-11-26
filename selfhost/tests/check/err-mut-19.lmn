@@ -1,0 +1,15 @@
+interface Named {
+    fn name(self) -> Str
+}
+struct P {
+    x: Int,
+}
+fn name(mut self: P) -> Str {
+    "p"
+}
+fn show[T: Named](x: T) -> Str {
+    x.name()
+}
+fn main(root: Root) {
+    let s = show(P { x: 1 })
+}

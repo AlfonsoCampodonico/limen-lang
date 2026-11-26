@@ -1,0 +1,26 @@
+// `push` and `remove` change their receiver, but without `mut` anywhere
+// nothing is refused, even when their arguments change the same list
+fn main(root: Root) {
+    let mut xs = [1, 2]
+    let mut mm = map([("a", 1)])
+    let c = true
+    xs.push({
+        xs.push(1)
+        2
+    })
+    xs.push(if c {
+        xs.push(0)
+        1
+    } else {
+        2
+    })
+    mm.remove({
+        mm.remove("a")
+        "b"
+    })
+    xs.push({
+        let mut xs = [0]
+        xs.push(1)
+        xs.len()
+    })
+}

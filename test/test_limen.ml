@@ -3701,6 +3701,10 @@ fn main(root: Root) {
     let parts = [1, 2].map(|x| x + 1)
     out.print(fetch(Client { net: root.net, name: "x" }, parts.len()))
 }
+
+fn bump(mut m: Int) {
+    m = m + 1
+}
 |}
   in
   ignore (Lsp.handle st (note "textDocument/didOpen" (J.Obj [ ("textDocument", J.Obj [ ("uri", J.String sem_uri); ("text", J.String sem_doc) ]) ])));
@@ -3756,6 +3760,9 @@ fn main(root: Root) {
   sem_case "print" "print:method";
   sem_case ~nth:2 "net" "net:property.capability";
   sem_case ~nth:3 "net" "net:property.capability";
+  (* a `mut` parameter may be assigned: mutable, not readonly *)
+  sem_case "m" "m:parameter.declaration.mutable";
+  sem_case ~nth:2 "m" "m:parameter.mutable";
   (* the range request gives the tokens of those lines only, positions from the document's start *)
   let range_toks =
     sem_request "textDocument/semanticTokens/range"
@@ -3763,6 +3770,38 @@ fn main(root: Root) {
   in
   ok "lsp-semantic-range" (List.map (fun (t, _, _) -> t) range_toks = [ "out"; "root"; "stdout" ])
     (String.concat " " (List.map show_tok range_toks));
+  (* mut parameters: the hover shows the marker, and the E0213 fix inserts it *)
+  let mut_uri = "file:///tmp/lsp-mut.lmn" in
+  let mut_doc = "fn bump(mut n: Int) {\n    n = n + 1\n}\n\nfn main(root: Root) {\n    let mut k = 0\n    bump(k)\n    root.stdout.print(\"{k}\")\n}\n" in
+  ignore (Lsp.handle st (note "textDocument/didOpen" (J.Obj [ ("textDocument", J.Obj [ ("uri", J.String mut_uri); ("text", J.String mut_doc) ]) ])));
+  let mut_pos needle k =
+    let l, c = at mut_doc needle k in
+    (l, c)
+  in
+  let hl, hc = mut_pos "bump(k)" 0 in
+  let mut_hover =
+    J.to_str
+      (J.path
+         (result (Lsp.handle st (req "textDocument/hover" (J.Obj [ ("textDocument", J.Obj [ ("uri", J.String mut_uri) ]); ("position", J.Obj [ ("line", J.Int hl); ("character", J.Int hc) ]) ]))))
+         [ "contents"; "value" ])
+  in
+  ok "lsp-hover-mut" (mut_hover = "```limen\nfn bump(mut n: Int)\n```") mut_hover;
+  let kl, kc = mut_pos "k)" 0 in
+  let mut_actions =
+    result
+      (Lsp.handle st
+         (req "textDocument/codeAction"
+            (J.Obj
+               [ ("textDocument", J.Obj [ ("uri", J.String mut_uri) ]);
+                 ("range", J.Obj [ ("start", J.Obj [ ("line", J.Int kl); ("character", J.Int kc) ]); ("end", J.Obj [ ("line", J.Int kl); ("character", J.Int (kc + 1)) ]) ]);
+                 ("context", J.Obj [ ("diagnostics", J.List []) ]) ])))
+  in
+  let mut_text =
+    match mut_actions with
+    | J.List [ a ] -> ( match J.path a [ "edit"; "changes"; mut_uri ] with J.List [ e ] -> J.to_str (J.member "newText" e) | _ -> "")
+    | _ -> ""
+  in
+  ok "lsp-quickfix-mut" (mut_text = "mut ") (J.to_string mut_actions);
   ok "lsp-unknown-method" (match Lsp.handle st (req "workspace/symbol" (J.Obj [])) with [ m ] -> J.member "error" m <> J.Null | _ -> false) "error";
   ok "lsp-shutdown" (Lsp.handle st (req "shutdown" J.Null) <> [] && st.Lsp.shutdown) "shutdown";
   ok "json-roundtrip"
@@ -10533,6 +10572,8 @@ fn main(root: Root) {
     "// Geometry helpers.\n//\n// Second paragraph.\n\n// A point.\npub struct Point {\n    // Distance from the left.\n    x: Float,\n    y: Float,\n}\n\n// not a doc: a blank line follows\n\n// How far from the origin.\npub fn norm(self: Point) -> Float {\n    self.x\n}\n\npub enum Shape {\n    // A round one.\n    Circle(Float),\n    Dot,\n}\n\n// Things with an area.\npub interface Area {\n    // The area, in square units.\n    fn area(self) -> Float\n}\n\n// Shouts.\npub fn loud(self: Str) -> Str {\n    self.upper()\n}\n\n// Private.\nfn hidden() -> Int {\n    1\n}\n\npub fn pick[T: Area](xs: List[T], i: Int) -> T {\n    xs[i]\n}\n"
   in
   let md = Doc.load_source "geom" "geom.lmn" doc_src in
+  let mutmd = Doc.markdown [ Doc.load_source "m" "m.lmn" "pub fn bump(mut n: Int) {\n    n = n + 1\n}\n" ] in
+  ok "doc-mut" (Interp_util.find_sub mutmd "fn bump(mut n: Int)" 0 <> None) mutmd;
   let mdtext = Doc.markdown [ md ] in
   let has s = Interp_util.find_sub mdtext s 0 <> None in
   ok "doc-markdown"
@@ -11867,6 +11908,177 @@ fn main(root: Root) {
       let grants = { Interp.no_grants with seed = rseed } in
       same name ~grants src)
     (Crosscheck.programs ~seed:Crosscheck.seed);
+
+  (* ---------- mut parameters ---------- *)
+  let mut_src = {|struct Buf {
+    items: List[Int],
+}
+
+fn add(mut self: Buf, x: Int) {
+    self.items.push(x)
+}
+
+fn bump(mut n: Int, by: Int) {
+    n = n + by
+}
+
+fn main(root: Root) {
+    let mut b = Buf { items: [] }
+    b.add(1)
+    let mut k = 0
+    bump(mut k, 2)
+    bump(by: 3, n: mut k)
+}
+|} in
+  ok "mut-fmt" (Fmt.format ~file:"mut-fmt.lmn" mut_src = mut_src) (Fmt.format ~file:"mut-fmt.lmn" mut_src);
+  ok "mut-fmt-spacing" (Fmt.format ~file:"mut-fmt2.lmn" "fn f(mut   n: Int) {}\nfn main(root: Root) { let mut k = 0\n f(mut    k) }\n"
+    = "fn f(mut n: Int) {}\n\nfn main(root: Root) {\n    let mut k = 0\n    f(mut k)\n}\n") "spacing";
+  errs "mut-parses" mut_src [];
+  says "mut-default" "fn f(mut n: Int = 0) {}\nfn main(root: Root) {}" "E0123" "`n` is `mut`, so it cannot have a default";
+  says "mut-interface" "interface I {\n    fn f(self, mut n: Int)\n}\nfn main(root: Root) {}" "E0003" "an interface method cannot take a `mut` parameter";
+  says "mut-foreign" "foreign \"c\" {\n    fn abs(mut n: Int) -> Int\n}\nfn main(root: Root) {}" "E0003" "a foreign function cannot take a `mut` parameter";
+  says "mut-fn-type" "fn f(g: fn(mut Int)) {}\nfn main(root: Root) {}" "E0003" "a function type cannot have a `mut` parameter";
+  says "mut-closure" (main_wrap "    let f = |mut x: Int| x") "E0003" "a closure cannot take a `mut` parameter";
+  says "mut-test-param" "test \"t\" (mut fs: Fs) {}\n" "E0003" "a test's parameters cannot be `mut`";
+  errs "mut-outside-call" (main_wrap "    let mut x = 1\n    let y = mut x") [ "E0003" ];
+  let mut_decls = "struct Buf {\n    items: List[Int],\n}\n\nfn add(mut self: Buf, x: Int) {\n    self.items.push(x)\n}\n\nfn bump(mut n: Int) {\n    n = n + 1\n}\n\nfn plain(n: Int) -> Int {\n    n\n}\n\n" in
+  errs "mut-call-ok" (mut_decls ^ main_wrap "    let mut k = 0\n    bump(mut k)\n    let mut b = Buf { items: [1] }\n    b.add(1)\n    let mut bs = [b]\n    bs[0].add(2)\n    bump(mut bs[0].items[0])\n    let mut m = map([(\"a\", b)])\n    m[\"a\"].add(3)\n    bump(mut m[\"a\"].items[0])") [];
+  errs "mut-param-assign" "fn f(mut xs: List[Int]) {\n    xs = [1]\n    xs[0] = 2\n    xs.push(3)\n}\nfn main(root: Root) {}" [];
+  errs "mut-root-let" (mut_decls ^ main_wrap "    let k = 0\n    bump(mut k)") [ "E0205" ];
+  errs "mut-root-param" (mut_decls ^ "fn g(n: Int) {\n    bump(mut n)\n}\nfn main(root: Root) {}") [ "E0205" ];
+  errs "mut-in-closure" (mut_decls ^ main_wrap "    let mut k = 0\n    let f = || bump(mut k)") [ "E0205" ];
+  errs "mut-self-not-mut" (mut_decls ^ main_wrap "    let b = Buf { items: [] }\n    b.add(1)") [ "E0205" ];
+  errs "mut-not-place" (mut_decls ^ main_wrap "    bump(mut plain(1))") [ "E0209" ];
+  errs "mut-bytes" (mut_decls ^ main_wrap "    let mut bs = bytes([1])\n    bump(mut bs[0])") [ "E0209" ];
+  says "mut-missing" (mut_decls ^ main_wrap "    let mut k = 0\n    bump(k)") "E0213" "`bump` changes its parameter `n`, so the argument must be written with `mut`";
+  says "mut-extra" (mut_decls ^ main_wrap "    let mut k = 0\n    let j = plain(mut k)") "E0213" "`plain` does not change its parameter `n`, so the argument is written without `mut`";
+  says "mut-to-closure" (main_wrap "    let mut k = 0\n    let f = |n: Int| n\n    let j = f(mut k)") "E0213" "`mut` is only for an argument whose parameter is declared `mut`";
+  errs "mut-to-builtin" (main_wrap "    let mut k = 1\n    let ys = [1, 2].take(mut k)") [ "E0213" ];
+  errs "mut-piped" (mut_decls ^ main_wrap "    let mut k = 0\n    k |> bump") [ "E0213" ];
+  says "mut-exact-type" "interface Named {\n    fn name(self) -> Str\n}\nstruct P {\n    x: Int,\n}\nfn name(self: P) -> Str {\n    \"p\"\n}\nfn rename(mut n: dyn Named) {}\nfn main(root: Root) {\n    let mut p = P { x: 1 }\n    rename(mut p)\n}\n" "E0201" "a `mut` argument must have exactly the parameter's type";
+  says "mut-fn-value" (mut_decls ^ main_wrap "    let g = bump") "E0215" "`bump` has a `mut` parameter, so it can only be called, not used as a value";
+  says "mut-method-value" (mut_decls ^ main_wrap "    let mut b = Buf { items: [] }\n    let g = b.add") "E0215" "`add` has a `mut` parameter, so it can only be called, not used as a value";
+  errs "mut-main" "fn main(mut root: Root) {}" [ "E0303" ];
+  errs "mut-forwarder" "struct Inner {\n    n: Int,\n}\nfn bump(mut self: Inner) {\n    self.n = self.n + 1\n}\nstruct Outer {\n    Inner,\n}\nfn main(root: Root) {\n    let mut o = Outer { Inner: Inner { n: 0 } }\n    o.bump()\n}\n" [];
+  errs "mut-builtin-type-method" "fn bump(mut self: Int) {\n    self = self + 1\n}\nfn main(root: Root) {\n    let mut k = 0\n    k.bump()\n}\n" [];
+  (* the fixes: missing marker added, extra one removed, and the result checks clean *)
+  List.iter
+    (fun (name, body) ->
+      if selected name then begin
+        let src = mut_decls ^ main_wrap body in
+        let _, ds, _ = compile name src in
+        let fixed = apply_fixes src ds in
+        let _, ds2, _ = compile (name ^ "-fixed") fixed in
+        ok name (codes ds = [ "E0213" ] && Diag.errors ds2 = []) fixed
+      end)
+    [ ("mut-fix-missing", "    let mut k = 0\n    bump(k)"); ("mut-fix-extra", "    let mut k = 0\n    let j = plain(mut k)") ];
+  if selected "mut-no-fix-piped" then
+    ok "mut-no-fix-piped"
+      (let _, ds, _ = compile "mut-piped2" (mut_decls ^ main_wrap "    let mut k = 0\n    k |> bump") in
+       List.for_all (fun (d : Diag.t) -> d.fix = None) ds)
+      "a piped value got a fix";
+  errs "mut-self-bytes" "fn bump(mut self: Int) {\n    self = self + 1\n}\nfn main(root: Root) {\n    let mut bs = bytes([1])\n    bs[0].bump()\n}\n" [ "E0209" ];
+  let named = "interface Named {\n    fn name(self) -> Str\n}\nstruct P {\n    x: Int,\n}\nfn name(mut self: P) -> Str {\n    \"p\"\n}\n" in
+  says "mut-iface-dyn" (named ^ "fn main(root: Root) {\n    let p: dyn Named = P { x: 1 }\n}\n") "E0111" "its `name` has a `mut` parameter, so it cannot implement `Named`";
+  says "mut-iface-bound" (named ^ "fn show[T: Named](x: T) -> Str {\n    x.name()\n}\nfn main(root: Root) {\n    let s = show(P { x: 1 })\n}\n") "E0111" "its `name` has a `mut` parameter, so it cannot implement `Named`";
+  says "mut-piped-not-place" (mut_decls ^ main_wrap "    plain(1) |> bump") "E0213" "call `bump(mut x)`";
+  says "mut-param-note" "fn f(n: Int) {\n    n = 1\n}\nfn main(root: Root) {}\n" "E0205" "declare it `mut n` to change the caller's value";
+  ok "mut-explained" (List.for_all (fun c -> List.mem_assoc c Diag.explanations) [ "E0213"; "E0214"; "E0215" ]) "no explanation";
+  let two = "struct P {\n    x: Int,\n    y: Int,\n}\n\nfn two(mut a: Int, mut b: Int) {}\n\nfn put(mut a: Int, b: Int) {}\n\nfn put2(mut a: Int, b: Int) -> Int {\n    0\n}\n\nfn pt(mut p: P, mut v: Int) {}\n\nfn next(mut n: Int) -> Int {\n    n\n}\n\nfn take(mut xs: List[Int]) -> Int {\n    0\n}\n\nfn both(mut xs: List[Int], ys: List[Int]) -> Int {\n    0\n}\n\nstruct Buf {\n    items: List[Int],\n}\n\nfn grab(mut self: Buf, mut more: List[Int]) {}\n\n" in
+  let m body = two ^ main_wrap ("    let mut k = 0\n    let mut j = 0\n    let mut p = P { x: 0, y: 0 }\n    let mut xs = [1, 2]\n    let mut mm = map([(\"a\", 1)])\n    let mut b = Buf { items: [] }\n" ^ body) in
+  says "mut-overlap-same" (m "    two(mut k, mut k)") "E0214" "this `mut` argument overlaps another one of the same call";
+  errs "mut-overlap-prefix" (m "    pt(mut p, mut p.x)") [ "E0214" ];
+  errs "mut-overlap-receiver" (m "    b.grab(mut b.items)") [ "E0214" ];
+  errs "mut-overlap-elements" (m "    two(mut xs[0], mut xs[1])") [ "E0214" ];
+  errs "mut-overlap-entries" (m "    two(mut mm[\"a\"], mut mm[\"b\"])") [ "E0214" ];
+  errs "mut-distinct-fields" (m "    two(mut p.x, mut p.y)") [];
+  errs "mut-and-plain" (m "    let n = both(mut xs, xs)") [];
+  says "mut-nested" (m "    put(mut k, next(mut k))") "E0214" "this changes a value that the enclosing call also takes as `mut`";
+  errs "mut-nested-push" (m "    xs.push(take(mut xs))") [ "E0214" ];
+  errs "mut-nested-other" (m "    put(mut k, next(mut j))") [];
+  errs "mut-overlap-labelled" (m "    two(b: mut k, a: mut k)") [ "E0214" ];
+  errs "mut-overlap-tuple" (m "    let mut t = (1, 2)\n    two(mut t.0, mut t.0)") [ "E0214" ];
+  errs "mut-distinct-tuple" (m "    let mut t = (1, 2)\n    two(mut t.0, mut t.1)") [];
+  errs "mut-nested-index" (m "    two(mut xs[next(mut k)], mut k)") [ "E0214" ];
+  errs "mut-nested-block" (m "    put(mut k, {\n        let n = next(mut k)\n        n\n    })") [ "E0214" ];
+  errs "mut-no-mut-push" (m "    xs.push({\n        xs.push(1)\n        2\n    })") [];
+  errs "mut-no-mut-push-if" (m "    let c = true\n    xs.push(if c {\n        xs.push(0)\n        1\n    } else {\n        2\n    })") [];
+  errs "mut-no-mut-remove" (m "    mm.remove({\n        mm.remove(\"a\")\n        \"b\"\n    })") [];
+  errs "mut-no-mut-shadowed" (m "    xs.push({\n        let mut xs = [0]\n        xs.push(1)\n        xs.len()\n    })") [];
+  errs "mut-nested-push-in-mut" (m "    let n = take(mut xs) + {\n        xs.push(1)\n        0\n    }") [];
+  errs "mut-nested-into-push" (m "    let n = both(mut xs, {\n        xs.push(1)\n        []\n    })") [ "E0214" ];
+  (* nesting three deep: each place is reported once *)
+  (let _, ds, _ = compile "mut-nested-once" (m "    two(mut k, mut j)\n    put(mut k, put2(mut k, next(mut k)))") in
+   ok "mut-nested-once" (List.length (List.filter (fun (d : Diag.t) -> d.code = "E0214") ds) = 2) (String.concat ", " (codes ds)));
+  errs "mut-overlap-promoted" "struct Inner {\n    n: Int,\n}\nstruct Outer {\n    Inner,\n}\nfn whole(mut o: Outer, mut v: Int) {}\nfn main(root: Root) {\n    let mut o = Outer { Inner: Inner { n: 0 } }\n    whole(mut o, mut o.n)\n}\n" [ "E0214" ];
+  (let _, ds, infos = compile "mut-pure" (two ^ "fn bump(mut n: Int) {\n    n = n + 1\n}\n\nfn swap_cb(mut f: fn() -> Int) {\n    f = || 1\n}\n\nfn main(root: Root) {}\n") in
+   let text n = Check.pure_text (List.find (fun (i : Check.fn_info) -> i.name = n) infos) in
+   ok "mut-pure" (ds = [] && text "bump" = "pure" && text "swap_cb" = "pure itself, runs callbacks") (text "bump" ^ "; " ^ text "swap_cb"));
+  (* a `mut` function parameter is the caller's place, never a condition of purity *)
+  (let _, ds, infos = compile "mut-pure-calls" "fn run(mut f: fn() -> Int, g: fn() -> Int) -> Int {\n    f() + g()\n}\n\nfn main(root: Root) {}\n" in
+   let text = Check.pure_text (List.find (fun (i : Check.fn_info) -> i.name = "run") infos) in
+   ok "mut-pure-calls" (ds = [] && text = "pure itself, runs callbacks") text);
+  (let _, ds, infos = compile "mut-pure-if" "fn apply(mut n: Int, f: fn(Int) -> Int) {\n    n = f(n)\n}\n\nfn main(root: Root) {}\n" in
+   let text = Check.pure_text (List.find (fun (i : Check.fn_info) -> i.name = "apply") infos) in
+   ok "mut-pure-if" (ds = [] && text = "pure if f is") text);
+  (* running `mut` arguments, in both backends *)
+  (
+   let decls = "struct Buf {\n    items: List[Int],\n}\n\nfn add(mut self: Buf, x: Int) {\n    self.items.push(x)\n}\n\nfn bump(mut n: Int) {\n    n = n + 1\n}\n\nfn keep(mut xs: List[Int]) -> List[Int] {\n    let ys = xs\n    xs.push(9)\n    ys\n}\n\nfn g(out: Stdout, mut x: Int, xs: List[Int]) {\n    x = 5\n    out.print(\"{xs}\")\n}\n\nfn fill(out: Stdout, mut xs: List[Int]) {\n    defer out.print(\"callee {xs}\")\n    xs.push(1)\n    xs.push(2)\n    panic(\"stop\")\n}\n\nfn countdown(mut n: Int, mut log: List[Int]) {\n    if n > 0 {\n        log.push(n)\n        n = n - 1\n        countdown(mut n, mut log)\n    }\n}\n\nfn len_of(xs: List[Int]) -> Int {\n    xs.len()\n}\n\nfn grow(mut xs: List[Int]) {\n    xs.push(0)\n}\n\nfn side(out: Stdout, s: Str, v: Int) -> Int {\n    out.print(s)\n    v\n}\n\nfn setp(mut x: Int, v: Int) {\n    x = v\n}\n\n" in
+   out "mut-run-basic" (decls ^ main_wrap "    let mut k = 0\n    bump(mut k)\n    bump(mut k)\n    let mut b = Buf { items: [] }\n    b.add(1)\n    b.add(2)\n    let mut bs = [b, b]\n    bump(mut bs[1].items[0])\n    let mut m = map([(\"a\", 1)])\n    bump(mut m[\"a\"])\n    out.print(\"{k} {b.items} {bs[1].items} {m}\")") "2 [1, 2] [2, 2] {\"a\": 2}\n";
+   out "mut-run-copies" (decls ^ main_wrap "    let mut xs = [1]\n    let ys = keep(mut xs)\n    out.print(\"{xs} {ys}\")") "[1, 9] [1]\n";
+   out "mut-run-snapshot" (decls ^ main_wrap "    let mut xs = [1, 2]\n    g(out, mut xs[0], xs)\n    out.print(\"{xs}\")") "[1, 2]\n[5, 2]\n";
+   out "mut-run-panic" (decls ^ main_wrap "    let r = catch(|| {\n        let mut ys: List[Int] = []\n        defer out.print(\"caller {ys}\")\n        fill(out, mut ys)\n        0\n    })\n    let s = catch(|| {\n        let mut b = Buf { items: [] }\n        defer out.print(\"path {b.items}\")\n        fill(out, mut b.items)\n        0\n    })") "callee [1, 2]\ncaller [1, 2]\ncallee [1, 2]\npath [1, 2]\n";
+   out "mut-run-recursion" (decls ^ main_wrap "    let mut n = 3\n    let mut log: List[Int] = []\n    countdown(mut n, mut log)\n    out.print(\"{n} {log}\")") "0 [3, 2, 1]\n";
+   out "mut-run-loop" (decls ^ main_wrap "    let mut k = 0\n    for _ in 0..<3 {\n        bump(mut k)\n    }\n    let mut xs = [1]\n    let a = len_of(xs)\n    grow(mut xs)\n    let b = len_of(xs)\n    out.print(\"{k} {a} {b}\")") "3 1 2\n";
+   out "mut-run-labels" (decls ^ main_wrap "    let mut xs = [0]\n    setp(v: side(out, \"v\", 7), x: mut xs[side(out, \"i\", 0)])\n    out.print(\"{xs}\")") "v\ni\n[7]\n";
+   out "mut-run-forwarder" "struct Inner {\n    n: Int,\n}\nfn bump(mut self: Inner) {\n    self.n = self.n + 1\n}\nstruct Outer {\n    Inner,\n}\nfn main(root: Root) {\n    let mut o = Outer { Inner: Inner { n: 0 } }\n    o.bump()\n    root.stdout.print(\"{o.n}\")\n}\n" "1\n";
+   panics "mut-run-missing-key" (decls ^ main_wrap "    let mut m = map([(\"a\", 1)])\n    bump(mut m[\"b\"])") "key \"b\" is not in the map";
+   out "mut-run-cancel" (decls ^ "fn slow(clock: Clock, mut xs: List[Int]) {\n    xs.push(1)\n    clock.sleep(1000)\n    xs.push(2)\n}\n\n" ^ main_wrap "    let clock = root.clock\n    let r = group g until clock.after(10) {\n        g.go(|| {\n            let mut xs: List[Int] = []\n            defer out.print(\"{xs}\")\n            slow(clock, mut xs)\n        })\n    }") "[1]\n";
+   (* natively: a pointer to the caller's slot, so `push` through it does not copy *)
+   out "mut-native-in-place" (decls ^ main_wrap "    let mut xs: List[Int] = []\n    let mut i = 0\n    while i < 100000 {\n        grow(mut xs)\n        i = i + 1\n    }\n    out.print(\"{xs.len()}\")") "100000\n";
+   out "mut-native-in-place-path" (decls ^ main_wrap "    let mut b = Buf { items: [] }\n    let mut i = 0\n    while i < 100000 {\n        grow(mut b.items)\n        i = i + 1\n    }\n    out.print(\"{b.items.len()}\")") "100000\n";
+   out "mut-native-move" (decls ^ "fn last(mut xs: List[Int]) -> List[Int] {\n    xs.push(3)\n    xs\n}\n\n" ^ main_wrap "    let mut xs = [1]\n    let ys = last(mut xs)\n    out.print(\"{xs} {ys}\")") "[1, 3] [1, 3]\n";
+   out "mut-native-hoist" (decls ^ "fn stash(mut xs: List[Int], mut kept: List[List[Int]]) {\n    kept.push(xs)\n    xs.push(1)\n}\n\n" ^ main_wrap "    let mut xs: List[Int] = []\n    let mut kept: List[List[Int]] = []\n    for i in 0..<3 {\n        xs.push(i)\n        stash(mut xs, mut kept)\n    }\n    out.print(\"{kept}\")") "[[0], [0, 1, 1], [0, 1, 1, 1, 2]]\n";
+   out "mut-native-cse" (decls ^ main_wrap "    let mut xs = [1]\n    let mut total = 0\n    for _ in 0..<3 {\n        total = total + len_of(xs)\n        grow(mut xs)\n    }\n    out.print(\"{total}\")") "6\n";
+   (* a pure call after `grow(mut xs)` in a loop body: never kept or reused *)
+   out "mut-native-cse-after" (decls ^ main_wrap "    let mut xs = [1]\n    let mut total = 0\n    for _ in 0..<3 {\n        let a = len_of(xs)\n        grow(mut xs)\n        total = total + a * 10 + len_of(xs)\n    }\n    out.print(\"{total}\")") "69\n";
+   (* the last use of a `mut` parameter copies: `return xs`, a closure, a task *)
+   out "mut-native-return" (decls ^ "fn give(mut xs: List[Int]) -> List[Int] {\n    xs.push(4)\n    return xs\n}\n\n" ^ main_wrap "    let mut xs = [1]\n    let mut ys = give(mut xs)\n    ys.push(5)\n    xs.push(6)\n    out.print(\"{xs} {ys}\")") "[1, 4, 6] [1, 4, 5]\n";
+   out "mut-native-closure" (decls ^ "fn later(mut xs: List[Int]) -> fn() -> List[Int] {\n    let f = || xs\n    xs.push(7)\n    f\n}\n\n" ^ main_wrap "    let mut xs = [1]\n    let f = later(mut xs)\n    xs.push(8)\n    out.print(\"{xs} {f()}\")") "[1, 7, 8] [1]\n";
+   out "mut-native-task" (decls ^ "fn spread(mut xs: List[Int]) -> List[List[Int]] {\n    let rs = group g {\n        g.go(|| xs)\n    }\n    xs.push(2)\n    rs\n}\n\n" ^ main_wrap "    let mut xs = [1]\n    let rs = spread(mut xs)\n    xs.push(3)\n    out.print(\"{xs} {rs}\")") "[1, 2, 3] [[1]]\n";
+   (* a cancellation through a path place: the defer sees what was written *)
+   out "mut-native-cancel-path" (decls ^ "fn slow(clock: Clock, mut xs: List[Int]) {\n    xs.push(1)\n    clock.sleep(1000)\n    xs.push(2)\n}\n\n" ^ main_wrap "    let clock = root.clock\n    let r = group g until clock.after(10) {\n        g.go(|| {\n            let mut b = Buf { items: [] }\n            defer out.print(\"{b.items}\")\n            slow(clock, mut b.items)\n        })\n    }") "[1]\n";
+   (* an argument assigning a `mut` place's root is refused: it would move the place *)
+   says "mut-assign-root" (decls ^ "fn addn(mut xs: List[Int], n: Int) {\n    xs.push(n)\n}\n\n" ^ main_wrap "    let mut b = Buf { items: [] }\n    addn(mut b.items, {\n        b = Buf { items: [9] }\n        1\n    })\n    out.print(\"{b.items}\")") "E0214" "this assigns a value that the enclosing call also takes as `mut`";
+   errs "mut-assign-root-var" (decls ^ "fn put(mut a: Int, b: Int) {\n    a = a * 10 + b\n}\n\n" ^ main_wrap "    let mut k = 1\n    put(mut k, {\n        k = 3\n        1\n    })\n    out.print(\"{k}\")") [ "E0214" ];
+   errs "mut-assign-other-field" (decls ^ "struct Two {\n    items: List[Int],\n    n: Int,\n}\n\nfn addn(mut xs: List[Int], n: Int) {\n    xs.push(n)\n}\n\n" ^ main_wrap "    let mut t = Two { items: [], n: 0 }\n    addn(mut t.items, {\n        t.n = 4\n        1\n    })\n    out.print(\"{t.items} {t.n}\")") [];
+   (* a `mut` place's index is taken where it is written, and checked there *)
+   says "mut-assign-index" (decls ^ main_wrap "    let mut ys = [[0, 0], [0, 0]]\n    let mut j = 1\n    setp(mut ys[j][{\n        j = 0\n        0\n    }], 5)\n    out.print(\"{ys} {j}\")") "E0214" "this assigns a variable that another index of the same `mut` place reads";
+   (* without `mut` it is accepted, and both backends agree *)
+   out "mut-assign-index-plain" (main_wrap "    let mut ys = [[0, 0], [0, 0]]\n    let mut j = 1\n    ys[j][{\n        j = 0\n        0\n    }] = 5\n    out.print(\"{ys} {j}\")") "[[5, 0], [0, 0]] 0\n";
+   out "mut-native-index-snapshot" (decls ^ "fn put(mut x: Int, v: Int) {\n    x = v\n}\n\n" ^ main_wrap "    let mut ys = [0, 0]\n    let mut j = 0\n    put(mut ys[j], {\n        j = 1\n        5\n    })\n    out.print(\"{ys} {j}\")") "[5, 0] 1\n";
+   panics "mut-native-check-first" (decls ^ "fn put(mut x: Int, v: Int) {\n    x = v\n}\n\n" ^ main_wrap "    let mut xs = [0]\n    put(mut xs[3], {\n        out.print(\"later arg ran\")\n        1\n    })") "index 3 is out of range for a list of length 1";
+   panics "mut-native-key-first" (decls ^ main_wrap "    let mut m = map([(\"a\", 1)])\n    setp(mut m[\"b\"], side(out, \"later\", 1))") "key \"b\" is not in the map";
+   (* native bug fix: a variable argument is the value it had where it is written *)
+   out "call-arg-snapshot" "fn pl(a: Int, b: Int) -> Int {\n    a * 10 + b\n}\n\nfn both(xs: List[Int], n: Int) -> Str {\n    \"{xs} {n}\"\n}\n\nfn main(root: Root) {\n    let out = root.stdout\n    let mut i = 1\n    let r = pl(i, {\n        i = 3\n        1\n    })\n    let mut xs = [1]\n    let s = both(xs, {\n        xs.push(2)\n        xs.len()\n    })\n    let f = |a: Int, b: Int| a * 10 + b\n    let mut k = 1\n    let t = f(k, {\n        k = 2\n        2\n    })\n    out.print(\"{r} {i} {s} {xs} {t}\")\n}\n" "11 3 [1] 2 [1, 2] 12\n");
+   (* natively too, an operand or a part of a literal is the value it had
+      where it is written when a later one changes it *)
+   (let decls = "struct P {\n    a: Int,\n    b: Int,\n}\n\nfn bump(mut n: Int) -> Int {\n    n = n + 1\n    n\n}\n\nfn addget(mut xs: List[Int]) -> Int {\n    xs.push(42)\n    42\n}\n\nfn pl(mut xs: List[Int]) -> Int {\n    xs.push(9)\n    0\n}\n\nfn setf(mut g: fn(Int) -> Int) -> Int {\n    g = |x: Int| x * 100\n    1\n}\n\n" in
+    let order name body want = out name (decls ^ "fn main(root: Root) {\n    let out = root.stdout\n" ^ body ^ "\n}\n") want in
+    order "order-interp" "    let mut k = 1\n    out.print(\"{k} {bump(mut k)}\")" "1 2\n";
+    order "order-list" "    let mut k = 1\n    out.print(\"{[k, bump(mut k)]}\")" "[1, 2]\n";
+    order "order-tuple" "    let mut k = 1\n    out.print(\"{(k, bump(mut k))}\")" "(1, 2)\n";
+    order "order-struct" "    let mut k = 1\n    let p = P { a: k, b: bump(mut k) }\n    out.print(\"{p.a} {p.b}\")" "1 2\n";
+    order "order-eq" "    let mut k = 1\n    let c = k == bump(mut k)\n    out.print(\"{c}\")" "false\n";
+    order "order-contains" "    let mut xs = [1]\n    out.print(\"{xs.contains(addget(mut xs))} {xs}\")" "false [1, 42]\n";
+    order "order-max" "    let mut k = 1\n    out.print(\"{k.max(bump(mut k) - 5)}\")" "1\n";
+    order "order-nested-list" "    let mut xs = [1]\n    out.print(\"{[xs, [pl(mut xs)]]}\")" "[[1], [0]]\n";
+    order "order-index" "    let xs = [10, 20, 30]\n    let mut j = 0\n    let ys = [[1, 2], [3, 4]]\n    let mut i = 0\n    out.print(\"{xs[j] + bump(mut j)} {ys[i][bump(mut i)]}\")" "11 2\n";
+    order "order-range" "    let mut k = 1\n    let mut c = 0\n    for _ in k..<bump(mut k) {\n        c = c + 1\n    }\n    out.print(\"{c}\")" "1\n";
+    order "order-assign-binop" "    let mut i = 1\n    let n = i + {\n        i = 3\n        1\n    }\n    out.print(\"{n} {i}\")" "2 3\n";
+    order "order-select-send" "    let c: Chan[Int] = channel(1)\n    let mut k = 1\n    let r = select {\n        c.send(k) => 1,\n        c.send(bump(mut k)) => 2,\n    }\n    out.print(\"{r} {c.recv()} {k}\")" "1 Some(1) 2\n";
+    order "order-closure-callee" "    let mut f = |x: Int| x + 1\n    out.print(\"{f(setf(mut f))} {f(1)}\")" "2 100\n";
+    order "order-assign-list" "    let mut k = 1\n    let xs = [k, {\n        k = 5\n        2\n    }]\n    out.print(\"{xs} {k}\")" "[1, 2] 5\n");
 
   drain ();
   Printf.printf "%d/%d passed\n" (!total - !failed) !total;

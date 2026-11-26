@@ -200,6 +200,11 @@ fn need_kw(self: Parser, s: Str) -> Result[Parser, ParseError] {
     if self.is_kw(s) { Ok(self.skip()) } else { Err(self.expected("`{s}`")) }
 }
 
+// Where a parameter cannot be `mut`: a `mut` ahead is reported with `msg`.
+fn refuse_mut(self: Parser, msg: Str) -> Result[Parser, ParseError] {
+    if self.is_kw("mut") { Err(error("E0003", self.span(), msg)) } else { Ok(self) }
+}
+
 // The symbol `s`, which must be next, when its position is needed.
 fn expect(self: Parser, s: Str) -> Parsed[lexer.Token] {
     if self.is_sym(s) { Ok((self.tok(), self.skip())) } else { Err(self.expected("`{s}`")) }
@@ -254,6 +259,11 @@ fn comma_list[T](p: Parser, close: Str, item: fn(Parser) -> Parsed[T]) -> Parsed
 
 // ---------- types ----------
 
+// A parameter's type in a function type: `Int` in `fn(Int)`.
+fn fn_type_param(p: Parser) -> Parsed[ast.TyExpr] {
+    parse_type(p.refuse_mut("a function type cannot have a `mut` parameter")?)
+}
+
 pub fn parse_type(p: Parser) -> Parsed[ast.TyExpr] {
     let (ty, next) = parse_type1(p.deeper()?)?
     Ok((ty, { next with depth: p.depth }))
@@ -293,7 +303,7 @@ fn parse_type1(p: Parser) -> Parsed[ast.TyExpr] {
         },
         Keyword("fn") => {
             let p = p.skip().need("(")?
-            let (params, p) = comma_list(p, ")", parse_type)?
+            let (params, p) = comma_list(p, ")", fn_type_param)?
             // `fn(A)` returns nothing, as a function declared without `->`
             // does: its result is `()`, with an empty span after the `)` so
             // the formatter writes it back the way it was written
@@ -532,16 +542,25 @@ fn call_args(p: Parser, ns: Bool) -> Parsed[List[ast.Expr]] {
 }
 
 // A call argument: an expression, or `name: expression` naming the
-// parameter it is for.
+// parameter it is for; either may be `mut place`, for a `mut` parameter.
 fn parse_arg(p: Parser) -> Parsed[ast.Expr] {
     match (p.kind(), p.next_kind()) {
         (Ident(name), Symbol(":")) => {
             let name_span = p.span()
-            let (value, p) = parse_expr(p.skip().skip())?
+            let (value, p) = parse_mut_arg(p.skip().skip())?
             Ok((mk(ENamed(name, name_span, value), merge(name_span, value.span)), p))
         },
-        _ => parse_expr(p),
+        _ => parse_mut_arg(p),
     }
+}
+
+fn parse_mut_arg(p: Parser) -> Parsed[ast.Expr] {
+    if !p.is_kw("mut") {
+        return parse_expr(p)
+    }
+    let start = p.span()
+    let (place, p) = parse_expr(p.skip())?
+    Ok((mk(EMut(place), merge(start, place.span)), p))
 }
 
 // Whether the `{` ahead starts a trailing closure. Not in the head of an
@@ -584,6 +603,7 @@ fn trailing_closure(p: Parser, ns: Bool) -> Parsed[List[ast.Expr]] {
 
 // `x` or `x: Int` between a closure's bars.
 fn closure_param(p: Parser) -> Parsed[ast.ClosureParam] {
+    let p = p.refuse_mut("a closure cannot take a `mut` parameter")?
     let (name, p) = p.expect_ident()?
     if p.is_sym(":") {
         let (ty, p) = parse_type(p.skip())?
@@ -1312,17 +1332,22 @@ fn parse_param(p: Parser) -> Parsed[ast.Param] {
         return Err(missing_type(name))
     }
     let (ty, p) = parse_type(p.skip())?
-    Ok((ast.Param { name: name.text, span: name.span, ty, default: None }, p))
+    Ok((ast.Param { name: name.text, span: name.span, ty, default: None, mutable: false }, p))
 }
 
 // A function's own parameter (not a foreign function's): `name: Type`, or
-// `name: Type = constant` with a default.
+// `name: Type = constant` with a default, or `mut name: Type`.
 fn parse_fn_param(p: Parser) -> Parsed[ast.Param] {
-    let (param, p) = parse_param(p)?
+    let mutable = p.is_kw("mut")
+    let (param, p) = parse_param(if mutable { p.skip() } else { p })?
+    let param = { param with mutable }
     if !p.is_sym("=") {
         return Ok((param, p))
     }
     let (e, p) = parse_expr(p.skip())?
+    if mutable {
+        return Err(error("E0123", e.span, "`{param.name}` is `mut`, so it cannot have a default: the caller always passes the place"))
+    }
     if !is_constant(e) {
         return Err(error("E0123", e.span, "the default for `{param.name}` must be a constant").note("a default is the same at every call: a number, a plain string, `true`, `false`, `None` or `[]`"))
     }
@@ -1423,6 +1448,7 @@ struct TestParam {
 }
 
 fn test_param(p: Parser) -> Parsed[TestParam] {
+    let p = p.refuse_mut("a test's parameters cannot be `mut`")?
     let (name, p) = p.expect_ident()?
     if !p.is_sym(":") {
         return Err(missing_type(name))
@@ -1438,7 +1464,7 @@ fn test_param(p: Parser) -> Parsed[TestParam] {
         }
     }
     let (ty, p) = parse_type(if virtual { p.skip() } else { p })?
-    Ok((TestParam { param: ast.Param { name: name.text, span: name.span, ty, default: None }, virtual }, p))
+    Ok((TestParam { param: ast.Param { name: name.text, span: name.span, ty, default: None, mutable: false }, virtual }, p))
 }
 
 // A table test: `for (a, b, want) in [(1, 2, 3), (2, 2, 4)]`, each case
@@ -1565,6 +1591,7 @@ fn parse_method(p: Parser) -> Parsed[ast.Method] {
     }
     let (name, p) = p.skip().expect_ident()?
     let p = p.need("(")?
+    let p = p.refuse_mut("an interface method cannot take a `mut` parameter")?
     if !p.is_word("self") {
         return Err(error("E0003", p.span(), "an interface method's first parameter is `self`, without a type"))
     }
@@ -1575,8 +1602,8 @@ fn parse_method(p: Parser) -> Parsed[ast.Method] {
 }
 
 fn method_param(p: Parser) -> Parsed[ast.Param] {
-    let (f, p) = typed_field(p)?
-    Ok((ast.Param { name: f.name, span: f.span, ty: f.ty, default: None }, p))
+    let (f, p) = typed_field(p.refuse_mut("an interface method cannot take a `mut` parameter")?)?
+    Ok((ast.Param { name: f.name, span: f.span, ty: f.ty, default: None, mutable: false }, p))
 }
 
 // ---------- foreign blocks ----------
@@ -1704,7 +1731,7 @@ fn foreign_params(p: Parser) -> Parsed[ForeignParams] {
             variadic = Some(params.len())
             p = p.skip()
         } else {
-            let (param, next) = parse_param(p)?
+            let (param, next) = parse_param(p.refuse_mut("a foreign function cannot take a `mut` parameter")?)?
             params.push(param)
             p = next
         }
@@ -1761,7 +1788,9 @@ pub fn parse(src: Str) -> Result[ast.File, ParseError] {
 // `first_id` on; returns the tree and the next free id.
 pub fn parse_file(src: Str, file: Int, first_id: Int) -> Result[(ast.File, Int), ParseError] {
     let f = parse_tokens(src, file)?
-    Ok(ids.file(f, first_id))
+    let mut next = first_id
+    let f = ids.file(f, mut next)
+    Ok((f, next))
 }
 
 fn parse_tokens(src: Str, file: Int) -> Result[ast.File, ParseError] {

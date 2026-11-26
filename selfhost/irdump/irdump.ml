@@ -79,6 +79,9 @@ let rhs = function
   | Neg (t, a) -> Printf.sprintf "neg %s %s" (show t) (atom a)
   | Not a -> "not " ^ atom a
   | Call (f, args) -> Printf.sprintf "call %s(%s)" f (atoms args)
+  | CallMut (f, args) ->
+    let arg = function ByValue a -> atom a | ByPlace (v, ss) -> "mut " ^ var v ^ steps ss in
+    Printf.sprintf "call %s(%s)" f (String.concat ", " (List.map arg args))
   | CallClo (c, args) -> Printf.sprintf "callclo %s(%s)" (atom c) (atoms args)
   | Prim (n, t, args, sp) -> Printf.sprintf "prim %s %s(%s) %s" n (show t) (atoms args) (span sp)
   | MkStruct (t, xs) -> Printf.sprintf "struct %s(%s)" (show t) (atoms xs)
@@ -200,7 +203,8 @@ let program (p : program) libs =
       plan := Pure.plan pure f;
       uniq := [];
       let caps = if f.captures = [] then "" else " captures(" ^ String.concat ", " (List.map var_decl f.captures) ^ ")" in
-      Printf.printf "fn %s(%s) -> %s%s%s\n" f.fname (String.concat ", " (List.map var_decl f.params)) (show f.ret)
+      let param (v : var) = (if v.by_ref then "mut " else "") ^ var_decl v in
+      Printf.printf "fn %s(%s) -> %s%s%s\n" f.fname (String.concat ", " (List.map param f.params)) (show f.ret)
         (if f.is_closure then " closure" else "") caps;
       block "  " f.body)
     p.fns;

@@ -40,7 +40,7 @@ tparams  ::= "(" ws (tparam (isep tparam)* (ws ",")?)? ws ")" sp
 tparam   ::= param | ident sp ":" sp "virtual" sp1 "Clock"
 fn       ::= "fn" sp1 ident sp bgenerics? sp "(" ws (dparam (isep dparam)* (ws ",")?)? ws ")" (sp "->" sp type)? sp block
 # a parameter with a default value, a constant: `sep: Str = ", "`
-dparam   ::= param (sp "=" ws dvalue)?
+dparam   ::= "mut" sp1 param | param (sp "=" ws dvalue)?
 dvalue   ::= "-"? (float | int) | plainstr | "true" | "false" | "None" | "(" ws ")" | "[" ws "]"
 # C functions from a library: signatures only, one per line, and C structs.
 # `...` makes a function variadic; `= "name"` names the C function;
@@ -92,7 +92,7 @@ suffix  ::= sp "(" ws args? ws ")" (sp tclosure)? | sp tclosure | sp "[" ws expr
 args    ::= arg (isep arg)* (ws ",")?
 exprs   ::= expr (isep expr)* (ws ",")?
 # a named argument: `retries: 3`
-arg     ::= (ident sp ":" ws)? expr
+arg     ::= (ident sp ":" ws)? ("mut" sp1)? expr
 
 primary ::= float | int | string | ident | structlit | withlit | "(" ws ")" | "(" ws expr ws ")" | "(" ws expr (isep expr)+ (ws ",")? ws ")" | "[" ws exprs? ws "]" | block | if | match | select | closure | group
 structlit ::= (ident ".")? upper sp "{" ws (init (isep init)* (ws ",")?)? ws "}"

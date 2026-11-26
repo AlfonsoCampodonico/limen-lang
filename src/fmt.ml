@@ -331,6 +331,9 @@ and expr_inner c ind e =
   | ENamed (n, _, x) ->
     add c (n ^ ": ");
     expr c ind x
+  | EMut x ->
+    add c "mut ";
+    expr c ind x
   | EMethod (r, name, nsp, args) ->
     receiver c ind r nsp;
     add c name;
@@ -755,7 +758,7 @@ let item c (it : item) =
     new_line c 0;
     let params =
       List.map
-        (fun p -> p.prm_name ^ ": " ^ ty p.prm_ty ^ match p.prm_default with Some e -> " = " ^ bare_slice c e.espan | None -> "")
+        (fun p -> (if p.prm_mut then "mut " else "") ^ p.prm_name ^ ": " ^ ty p.prm_ty ^ match p.prm_default with Some e -> " = " ^ bare_slice c e.espan | None -> "")
         d.fn_params
     in
     add c ((if d.fn_pub then "pub " else "") ^ "fn " ^ d.fn_name ^ bgens d.fn_gen d.fn_bounds);

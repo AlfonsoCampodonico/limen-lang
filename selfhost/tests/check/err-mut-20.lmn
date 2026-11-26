@@ -1,0 +1,11 @@
+fn bump(mut n: Int) {
+    n = n + 1
+}
+
+fn plain(n: Int) -> Int {
+    n
+}
+
+fn main(root: Root) {
+    plain(1) |> bump
+}

@@ -1,0 +1,32 @@
+struct Buf {
+    items: List[Int],
+}
+
+fn add(mut self: Buf, x: Int) {
+    self.items.push(x)
+}
+
+fn bump(mut n: Int) {
+    n = n + 1
+}
+
+fn plain(n: Int) -> Int {
+    n
+}
+
+fn put(a: Int, mut xs: List[Int]) {
+    xs.push(a)
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let mut k = 0
+    bump(mut k, 2)
+    let mut b = Buf { items: [] }
+    b.add(mut k)
+    let mut xs = [1]
+    put(xs: xs, a: mut k)
+    Some(mut k)
+    let h = |x: Int| x
+    [1].map(bump)
+}

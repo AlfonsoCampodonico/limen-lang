@@ -16,8 +16,8 @@
 //
 // Renaming is pure: the loader hands it everything it needs, files read
 // included. Its state (the problems found, a count for the temporaries'
-// names, the next expression id) goes in and comes out of every function,
-// `(expr, st) = expr(st, cx, locals, e)`.
+// names, the next expression id) is a `mut` parameter of every function,
+// `expr(mut st, cx, locals, e)`.
 //
 // The problems come out in the order the OCaml loader finds them, and that
 // order is OCaml's: it evaluates the arguments of a function or a
@@ -87,18 +87,21 @@ pub struct State {
     embedded: List[Embedded],
 }
 
-fn fail(self: State, d: diag.Diag) -> State {
-    { self with errors: self.errors + [d] }
+fn fail(mut self: State, d: diag.Diag) {
+    self.errors = self.errors + [d]
 }
 
 // A new expression, with the next id.
-fn node(self: State, desc: ast.ExprDesc, span: ast.Span) -> (ast.Expr, State) {
-    (ast.Expr { desc, span, id: self.next_id }, { self with next_id: self.next_id + 1 })
+fn node(mut self: State, desc: ast.ExprDesc, span: ast.Span) -> ast.Expr {
+    let e = ast.Expr { desc, span, id: self.next_id }
+    self.next_id = self.next_id + 1
+    e
 }
 
 // The next temporary's number.
-fn temp(self: State) -> (Int, State) {
-    (self.temps + 1, { self with temps: self.temps + 1 })
+fn temp(mut self: State) -> Int {
+    self.temps = self.temps + 1
+    self.temps
 }
 
 // ---------- items ----------
@@ -174,17 +177,16 @@ fn is_module(cx: Context, locals: List[Str], name: Str) -> Bool {
 }
 
 // Item `name` of module `m`, used from another module: it must be pub.
-fn member(st: State, m: Module, name: Str, span: ast.Span) -> (Option[ast.Item], State) {
+fn member(mut st: State, m: Module, name: Str, span: ast.Span) -> Option[ast.Item] {
     match m.items.find(|i| item_name(i) == name && !is_method(i)) {
         Some(i) => {
-            if is_public(i) {
-                (Some(i), st)
-            } else {
+            if !is_public(i) {
                 let d = diag.error("E0402", span, "`{name}` is private to module `{m.name}`").note("mark it `pub fn`, `pub struct` or `pub enum` in {m.path} to export it")
-                (Some(i), st.fail(d))
+                st.fail(d)
             }
+            Some(i)
         },
-        None => (None, st),
+        None => None,
     }
 }
 
@@ -201,13 +203,13 @@ fn variant_enum(m: Module, v: Str) -> Option[ast.EnumDecl] {
     None
 }
 
-fn no_member(st: State, m: Module, name: Str, span: ast.Span) -> State {
+fn no_member(mut st: State, m: Module, name: Str, span: ast.Span) {
     let exported = m.items.filter(|i| is_public(i) && !is_method(i)).map(item_name).sort()
     let d = diag.error("E0403", span, "module `{m.name}` has no `{name}`")
     st.fail(if exported.is_empty() { d } else { d.note("it exports: " + exported.join(", ")) })
 }
 
-fn unknown_module(st: State, name: Str, span: ast.Span) -> State {
+fn unknown_module(mut st: State, name: Str, span: ast.Span) {
     st.fail(diag.error("E0401", span, "unknown module `{name}`; add `use {name}` at the top of the file"))
 }
 
@@ -220,67 +222,76 @@ fn split_qualified(n: Str) -> Option[(Str, Str)] {
 
 // A type with module names resolved and aliases expanded. `seen`: the
 // aliases being expanded around this one, to catch `type A = List[A]`.
-pub fn ty(st: State, cx: Context, seen: List[Str], t: ast.TyExpr) -> (ast.TyExpr, State) {
+pub fn ty(mut st: State, cx: Context, seen: List[Str], t: ast.TyExpr) -> ast.TyExpr {
     match t.desc {
         TyName(n, args) => {
-            let (args, st) = each(st, args, |st, a| ty(st, cx, seen, a))
+            let args = tys(mut st, cx, seen, args)
             let named = |name: Str| { t with desc: TyName(name, args) }
             match split_qualified(n) {
                 Some((a, b)) => match module_of(cx, a) {
                     Some(m) => {
-                        let (found, st) = member(st, m, b, t.span)
+                        let found = member(mut st, m, b, t.span)
                         match found {
-                            Some(IType(alias)) => expand(st, cx, seen, m, alias, args, t),
-                            Some(IStruct(_) | IEnum(_) | IIface(_)) => (named(qual(m, b)), st),
-                            _ => (named(n), no_member(st, m, b, t.span)),
+                            Some(IType(alias)) => expand(mut st, cx, seen, m, alias, args, t),
+                            Some(IStruct(_) | IEnum(_) | IIface(_)) => named(qual(m, b)),
+                            _ => {
+                                no_member(mut st, m, b, t.span)
+                                named(n)
+                            },
                         }
                     },
-                    None => (named(n), unknown_module(st, a, t.span)),
+                    None => {
+                        unknown_module(mut st, a, t.span)
+                        named(n)
+                    },
                 },
                 None => {
                     if cx.gens.contains(n) {
-                        return (named(n), st)
+                        return named(n)
                     }
                     match cx.own.get(n) {
-                        Some(IType(alias)) => expand(st, cx, seen, cx.module, alias, args, t),
-                        Some(IStruct(_) | IEnum(_) | IIface(_)) => (named(qual(cx.module, n)), st),
-                        _ => (named(n), st),
+                        Some(IType(alias)) => expand(mut st, cx, seen, cx.module, alias, args, t),
+                        Some(IStruct(_) | IEnum(_) | IIface(_)) => named(qual(cx.module, n)),
+                        _ => named(n),
                     }
                 },
             }
         },
         TyFn(params, ret) => {
-            let (ret, st) = ty(st, cx, seen, ret)
-            let (params, st) = each(st, params, |st, p| ty(st, cx, seen, p))
-            ({ t with desc: TyFn(params, ret) }, st)
+            let ret = ty(mut st, cx, seen, ret)
+            let params = tys(mut st, cx, seen, params)
+            { t with desc: TyFn(params, ret) }
         },
-        TyUnit | TyInt(_) => (t, st),
+        TyUnit | TyInt(_) => t,
     }
 }
 
 // Alias `alias` of module `m`, used at `t` with `args` (already resolved):
 // its body, resolved in `m`, with the arguments put in for its parameters.
-fn expand(st: State, cx: Context, seen: List[Str], m: Module, alias: ast.AliasDecl, args: List[ast.TyExpr], t: ast.TyExpr) -> (ast.TyExpr, State) {
+fn expand(mut st: State, cx: Context, seen: List[Str], m: Module, alias: ast.AliasDecl, args: List[ast.TyExpr], t: ast.TyExpr) -> ast.TyExpr {
     let key = qual(m, alias.name)
     let bad = { t with desc: TyName(key, []) }
     if seen.contains(key) {
         if st.cyclic.contains(key) {
-            return (bad, st)
+            return bad
         }
         let d = diag.error("E0116", alias.span, "type alias `{alias.name}` refers to itself").note("an alias is only another name; for a type that contains itself, declare a struct or enum")
-        return (bad, { st.fail(d) with cyclic: st.cyclic + [key] })
+        st.fail(d)
+        st.cyclic = st.cyclic + [key]
+        return bad
     }
     let k = alias.generics.len()
     if args.len() != k {
         let s = if k == 1 { "" } else { "s" }
-        return (bad, st.fail(diag.error("E0109", t.span, "`{alias.name}` takes {k} type argument{s}, found {args.len()}")))
+        st.fail(diag.error("E0109", t.span, "`{alias.name}` takes {k} type argument{s}, found {args.len()}"))
+        return bad
     }
     let own = if m.name == cx.module.name { cx.own } else { own_items(m.items) }
     let alias_cx = { cx with module: m, own, gens: alias.generics }
-    let (body, st) = ty(st, alias_cx, [key] + seen, alias.body)
+    let body = ty(mut st, alias_cx, [key] + seen, alias.body)
     let pairs = alias.generics.zip(args)
     // errors about the expanded type point where the alias is used
-    ({ subst(pairs, body) with span: t.span }, st)
+    { subst(pairs, body) with span: t.span }
 }
 
 // `t` with the type parameters in `pairs` replaced by their arguments.
@@ -293,15 +304,32 @@ fn subst(pairs: List[(Str, ast.TyExpr)], t: ast.TyExpr) -> ast.TyExpr {
     }
 }
 
-fn types(st: State, cx: Context, ts: List[ast.TyExpr]) -> (List[ast.TyExpr], State) {
-    each(st, ts, |st, t| ty(st, cx, [], t))
+fn tys(mut st: State, cx: Context, seen: List[Str], ts: List[ast.TyExpr]) -> List[ast.TyExpr] {
+    let mut out: List[ast.TyExpr] = []
+    for t in ts {
+        out.push(ty(mut st, cx, seen, t))
+    }
+    out
 }
 
-fn bounds(st: State, cx: Context, bs: List[ast.Bound]) -> (List[ast.Bound], State) {
-    each(st, bs, |st, b| {
-        let (ifaces, st) = types(st, cx, b.ifaces)
-        ({ b with ifaces }, st)
-    })
+fn types(mut st: State, cx: Context, ts: List[ast.TyExpr]) -> List[ast.TyExpr] {
+    tys(mut st, cx, [], ts)
+}
+
+fn opt_ty(mut st: State, cx: Context, t: Option[ast.TyExpr]) -> Option[ast.TyExpr] {
+    match t {
+        Some(t) => Some(ty(mut st, cx, [], t)),
+        None => None,
+    }
+}
+
+fn bounds(mut st: State, cx: Context, bs: List[ast.Bound]) -> List[ast.Bound] {
+    let mut out: List[ast.Bound] = []
+    for b in bs {
+        let ifaces = types(mut st, cx, b.ifaces)
+        out.push({ b with ifaces })
+    }
+    out
 }
 
 // ---------- patterns ----------
@@ -317,265 +345,306 @@ fn binds(p: ast.Pat, locals: List[Str]) -> List[Str] {
     }
 }
 
-fn pat(st: State, cx: Context, locals: List[Str], p: ast.Pat) -> (ast.Pat, State) {
-    let sub = |st: State, ps: List[ast.Pat]| each(st, ps, |st, x| pat(st, cx, locals, x))
+fn pat(mut st: State, cx: Context, locals: List[Str], p: ast.Pat) -> ast.Pat {
     match p.desc {
         PVariant(Some(q), v, ps) => {
-            let (ps, st) = sub(st, ps)
-            let (q, st) = if is_module(cx, locals, q) {
+            let ps = pats(mut st, cx, locals, ps)
+            let q = if is_module(cx, locals, q) {
                 match cx.mods.get(q) {
                     Some(m) => match variant_enum(m, v) {
                         Some(e) => {
-                            let (_, st) = member(st, m, e.name, p.span)
-                            (qual(m, e.name), st)
+                            let _ = member(mut st, m, e.name, p.span)
+                            qual(m, e.name)
                         },
-                        None => (q, no_member(st, m, v, p.span)),
+                        None => {
+                            no_member(mut st, m, v, p.span)
+                            q
+                        },
                     },
-                    None => (q, st),
+                    None => q,
                 }
             } else {
                 match cx.own.get(q) {
-                    Some(IEnum(_)) => (qual(cx.module, q), st),
-                    _ => (q, st),
+                    Some(IEnum(_)) => qual(cx.module, q),
+                    _ => q,
                 }
             }
-            ({ p with desc: PVariant(Some(q), v, ps) }, st)
+            { p with desc: PVariant(Some(q), v, ps) }
         },
         PVariant(None, v, ps) => {
-            let (ps, st) = sub(st, ps)
-            ({ p with desc: PVariant(None, v, ps) }, st)
+            let ps = pats(mut st, cx, locals, ps)
+            { p with desc: PVariant(None, v, ps) }
         },
         PTuple(ps) => {
-            let (ps, st) = sub(st, ps)
-            ({ p with desc: PTuple(ps) }, st)
+            let ps = pats(mut st, cx, locals, ps)
+            { p with desc: PTuple(ps) }
         },
         PList(ps) => {
-            let (ps, st) = sub(st, ps)
-            ({ p with desc: PList(ps) }, st)
+            let ps = pats(mut st, cx, locals, ps)
+            { p with desc: PList(ps) }
         },
         POr(ps) => {
-            let (ps, st) = sub(st, ps)
-            ({ p with desc: POr(ps) }, st)
+            let ps = pats(mut st, cx, locals, ps)
+            { p with desc: POr(ps) }
         },
         PStruct(n, nsp, fields, rest) => {
-            let (n, st) = struct_name(st, cx, locals, n, nsp)
-            let (fields, st) = each(st, fields, |st, f| {
-                let (q, st) = pat(st, cx, locals, f.pat)
-                ({ f with pat: q }, st)
-            })
-            ({ p with desc: PStruct(n, nsp, fields, rest) }, st)
+            let n = struct_name(mut st, cx, locals, n, nsp)
+            let mut out: List[ast.FieldPat] = []
+            for f in fields {
+                let q = pat(mut st, cx, locals, f.pat)
+                out.push({ f with pat: q })
+            }
+            { p with desc: PStruct(n, nsp, out, rest) }
         },
         PAs(q, n, nsp) => {
-            let (q, st) = pat(st, cx, locals, q)
-            ({ p with desc: PAs(q, n, nsp) }, st)
+            let q = pat(mut st, cx, locals, q)
+            { p with desc: PAs(q, n, nsp) }
         },
-        _ => (p, st),
+        _ => p,
     }
+}
+
+fn pats(mut st: State, cx: Context, locals: List[Str], ps: List[ast.Pat]) -> List[ast.Pat] {
+    let mut out: List[ast.Pat] = []
+    for x in ps {
+        out.push(pat(mut st, cx, locals, x))
+    }
+    out
 }
 
 // ---------- expressions ----------
 
-fn set(e: ast.Expr, desc: ast.ExprDesc, st: State) -> (ast.Expr, State) {
-    ({ e with desc }, st)
+fn set(e: ast.Expr, desc: ast.ExprDesc) -> ast.Expr {
+    { e with desc }
 }
 
-pub fn expr(st: State, cx: Context, locals: List[Str], e: ast.Expr) -> (ast.Expr, State) {
-    let ex = |st: State, x: ast.Expr| expr(st, cx, locals, x)
-    let exs = |st: State, xs: List[ast.Expr]| each(st, xs, ex)
+pub fn expr(mut st: State, cx: Context, locals: List[Str], e: ast.Expr) -> ast.Expr {
     match e.desc {
-        EInt(_) | EFloat(_) | EBool(_) | EUnit => (e, st),
+        EInt(_) | EFloat(_) | EBool(_) | EUnit => e,
         EStr(parts) => {
-            let (parts, st) = each(st, parts, |st, part| match part {
-                SPLit(_) => (part, st),
-                SPExpr(x) => {
-                    let (x, st) = ex(st, x)
-                    (SPExpr(x), st)
-                },
-            })
-            set(e, EStr(parts), st)
+            let mut out: List[ast.StrPart] = []
+            for part in parts {
+                out.push(match part {
+                    SPLit(_) => part,
+                    SPExpr(x) => {
+                        let x = expr(mut st, cx, locals, x)
+                        SPExpr(x)
+                    },
+                })
+            }
+            set(e, EStr(out))
         },
         EVar(n) => {
             if locals.contains(n) {
-                return (e, st)
+                return e
             }
             match cx.own.get(n) {
-                Some(IFn(_)) => set(e, EVar(qual(cx.module, n)), st),
+                Some(IFn(_)) => set(e, EVar(qual(cx.module, n))),
                 _ => {
                     if !is_module(cx, locals, n) {
-                        return (e, st)
+                        return e
                     }
-                    (e, st.fail(diag.error("E0404", e.span, "module `{n}` is not a value; use one of its items, such as `{n}.name`")))
+                    st.fail(diag.error("E0404", e.span, "module `{n}` is not a value; use one of its items, such as `{n}.name`"))
+                    e
                 },
             }
         },
         EList(items) => {
-            let (items, st) = exs(st, items)
-            set(e, EList(items), st)
+            let items = exprs(mut st, cx, locals, items)
+            set(e, EList(items))
         },
         // `x |> f(a)` is `f(x, a)` from here on
-        EPipe(x, rhs) => match pipe_call(st, x, rhs) {
-            (Some(call), st) => ex(st, { e with desc: call }),
+        EPipe(x, rhs) => match pipe_call(mut st, x, rhs) {
+            Some(call) => expr(mut st, cx, locals, { e with desc: call }),
             // the parser rejects it
-            (None, st) => (e, st),
+            None => e,
         },
         EBin(o, a, b) => {
-            let (b, st) = ex(st, b)
-            let (a, st) = ex(st, a)
-            set(e, EBin(o, a, b), st)
+            let b = expr(mut st, cx, locals, b)
+            let a = expr(mut st, cx, locals, a)
+            set(e, EBin(o, a, b))
         },
         EUn(o, a) => {
-            let (a, st) = ex(st, a)
-            set(e, EUn(o, a), st)
+            let a = expr(mut st, cx, locals, a)
+            set(e, EUn(o, a))
         },
         ECall(callee, args) => match embed_name(cx, locals, callee) {
-            Some(name) => embed(st, cx, e, name, args),
+            Some(name) => embed(mut st, cx, e, name, args),
             None => {
-                let (args, st) = exs(st, args)
-                let (callee, st) = ex(st, callee)
-                set(e, ECall(callee, args), st)
+                let args = exprs(mut st, cx, locals, args)
+                let callee = expr(mut st, cx, locals, callee)
+                set(e, ECall(callee, args))
             },
         },
         ENamed(n, span, a) => {
-            let (a, st) = ex(st, a)
-            set(e, ENamed(n, span, a), st)
+            let a = expr(mut st, cx, locals, a)
+            set(e, ENamed(n, span, a))
+        },
+        EMut(a) => {
+            let a = expr(mut st, cx, locals, a)
+            set(e, EMut(a))
         },
         EDyn(a, iface) => {
-            let (a, st) = ex(st, a)
-            set(e, EDyn(a, iface), st)
+            let a = expr(mut st, cx, locals, a)
+            set(e, EDyn(a, iface))
         },
-        EMethod(r, name, nsp, args) => method(st, cx, locals, e, r, name, nsp, args),
-        EField(r, name, nsp) => field(st, cx, locals, e, r, name, nsp),
+        EMethod(r, name, nsp, args) => method(mut st, cx, locals, e, r, name, nsp, args),
+        EField(r, name, nsp) => field(mut st, cx, locals, e, r, name, nsp),
         EIndex(a, i) => {
-            let (i, st) = ex(st, i)
-            let (a, st) = ex(st, a)
-            set(e, EIndex(a, i), st)
+            let i = expr(mut st, cx, locals, i)
+            let a = expr(mut st, cx, locals, a)
+            set(e, EIndex(a, i))
         },
         ETry(a, context) => {
-            let (context, st) = maybe(st, context, ex)
-            let (a, st) = ex(st, a)
-            set(e, ETry(a, context), st)
+            let context = opt_expr(mut st, cx, locals, context)
+            let a = expr(mut st, cx, locals, a)
+            set(e, ETry(a, context))
         },
         EIf(c, then, other) => {
-            let (other, st) = maybe(st, other, ex)
-            let (then, st) = block(st, cx, locals, then)
-            let (c, st) = ex(st, c)
-            set(e, EIf(c, then, other), st)
+            let other = opt_expr(mut st, cx, locals, other)
+            let then = block(mut st, cx, locals, then)
+            let c = expr(mut st, cx, locals, c)
+            set(e, EIf(c, then, other))
         },
         EMatch(s, arms) => {
-            let (arms, st) = each(st, arms, |st, a| {
+            let mut out: List[ast.Arm] = []
+            for a in arms {
                 let inner = binds(a.pat, locals)
-                let (body, st) = expr(st, cx, inner, a.body)
-                let (guard, st) = maybe(st, a.guard, |st, g| expr(st, cx, inner, g))
-                let (p, st) = pat(st, cx, locals, a.pat)
-                (ast.Arm { pat: p, guard, body }, st)
-            })
-            let (s, st) = ex(st, s)
-            set(e, EMatch(s, arms), st)
+                let body = expr(mut st, cx, inner, a.body)
+                let guard = opt_expr(mut st, cx, inner, a.guard)
+                let p = pat(mut st, cx, locals, a.pat)
+                out.push(ast.Arm { pat: p, guard, body })
+            }
+            let s = expr(mut st, cx, locals, s)
+            set(e, EMatch(s, out))
         },
         EBlock(b) => {
-            let (b, st) = block(st, cx, locals, b)
-            set(e, EBlock(b), st)
+            let b = block(mut st, cx, locals, b)
+            set(e, EBlock(b))
         },
         EClosure(params, body) => {
             let inner = params.fold(locals, |acc, p| [p.name] + acc)
-            let (body, st) = expr(st, cx, inner, body)
-            let (params, st) = each(st, params, |st, p| {
-                let (t, st) = maybe(st, p.ty, |st, t| ty(st, cx, [], t))
-                ({ p with ty: t }, st)
-            })
-            set(e, EClosure(params, body), st)
+            let body = expr(mut st, cx, inner, body)
+            let mut out: List[ast.ClosureParam] = []
+            for p in params {
+                let t = opt_ty(mut st, cx, p.ty)
+                out.push({ p with ty: t })
+            }
+            set(e, EClosure(out, body))
         },
         EStruct(n, span, fields) => {
-            let (n, st) = struct_name(st, cx, locals, n, span)
-            let (fields, st) = inits(st, cx, locals, fields)
-            set(e, EStruct(n, span, fields), st)
+            let n = struct_name(mut st, cx, locals, n, span)
+            let fields = inits(mut st, cx, locals, fields)
+            set(e, EStruct(n, span, fields))
         },
         EGroup(g, interleaved, until, b) => {
-            let (b, st) = block(st, cx, [g] + locals, b)
-            let (until, st) = maybe(st, until, |st, d| {
-                let (ms, st) = ex(st, d.ms)
-                let (clock, st) = ex(st, d.clock)
-                (ast.Deadline { clock, ms }, st)
-            })
-            set(e, EGroup(g, interleaved, until, b), st)
+            let b = block(mut st, cx, [g] + locals, b)
+            let until = match until {
+                Some(d) => {
+                    let ms = expr(mut st, cx, locals, d.ms)
+                    let clock = expr(mut st, cx, locals, d.clock)
+                    Some(ast.Deadline { clock, ms })
+                },
+                None => None,
+            }
+            set(e, EGroup(g, interleaved, until, b))
         },
         EWith(base, fields) => {
-            let (fields, st) = inits(st, cx, locals, fields)
-            let (base, st) = ex(st, base)
-            set(e, EWith(base, fields), st)
+            let fields = inits(mut st, cx, locals, fields)
+            let base = expr(mut st, cx, locals, base)
+            set(e, EWith(base, fields))
         },
         ESafe(option, name, rest) => {
-            let (rest, st) = expr(st, cx, [name] + locals, rest)
-            let (option, st) = ex(st, option)
-            set(e, ESafe(option, name, rest), st)
+            let rest = expr(mut st, cx, [name] + locals, rest)
+            let option = expr(mut st, cx, locals, option)
+            set(e, ESafe(option, name, rest))
         },
         ESelect(arms) => {
-            let (arms, st) = each(st, arms, |st, a| sel_arm(st, cx, locals, a))
-            set(e, ESelect(arms), st)
+            let mut out: List[ast.SelArm] = []
+            for a in arms {
+                out.push(sel_arm(mut st, cx, locals, a))
+            }
+            set(e, ESelect(out))
         },
     }
 }
 
-fn inits(st: State, cx: Context, locals: List[Str], fields: List[ast.FieldInit]) -> (List[ast.FieldInit], State) {
-    each(st, fields, |st, f| {
-        let (value, st) = expr(st, cx, locals, f.value)
-        ({ f with value }, st)
-    })
+fn exprs(mut st: State, cx: Context, locals: List[Str], xs: List[ast.Expr]) -> List[ast.Expr] {
+    let mut out: List[ast.Expr] = []
+    for x in xs {
+        out.push(expr(mut st, cx, locals, x))
+    }
+    out
 }
 
-fn sel_arm(st: State, cx: Context, locals: List[Str], a: ast.SelArm) -> (ast.SelArm, State) {
-    let ex = |st: State, x: ast.Expr| expr(st, cx, locals, x)
-    let (guard, st) = maybe(st, a.guard, ex)
-    let (op, body, st) = match a.op {
+fn opt_expr(mut st: State, cx: Context, locals: List[Str], x: Option[ast.Expr]) -> Option[ast.Expr] {
+    match x {
+        Some(x) => Some(expr(mut st, cx, locals, x)),
+        None => None,
+    }
+}
+
+fn inits(mut st: State, cx: Context, locals: List[Str], fields: List[ast.FieldInit]) -> List[ast.FieldInit] {
+    let mut out: List[ast.FieldInit] = []
+    for f in fields {
+        let value = expr(mut st, cx, locals, f.value)
+        out.push({ f with value })
+    }
+    out
+}
+
+fn sel_arm(mut st: State, cx: Context, locals: List[Str], a: ast.SelArm) -> ast.SelArm {
+    let guard = opt_expr(mut st, cx, locals, a.guard)
+    let (op, body) = match a.op {
         SelRecv(bound, ch) => {
             let inner = match bound {
                 Some(b) => [b.text] + locals,
                 None => locals,
             }
-            let (body, st) = expr(st, cx, inner, a.body)
-            let (ch, st) = ex(st, ch)
-            (SelRecv(bound, ch), body, st)
+            let body = expr(mut st, cx, inner, a.body)
+            let ch = expr(mut st, cx, locals, ch)
+            (SelRecv(bound, ch), body)
         },
         SelSend(ch, v) => {
-            let (body, st) = ex(st, a.body)
-            let (v, st) = ex(st, v)
-            let (ch, st) = ex(st, ch)
-            (SelSend(ch, v), body, st)
+            let body = expr(mut st, cx, locals, a.body)
+            let v = expr(mut st, cx, locals, v)
+            let ch = expr(mut st, cx, locals, ch)
+            (SelSend(ch, v), body)
         },
         SelAfter(clock, ms) => {
-            let (body, st) = ex(st, a.body)
-            let (ms, st) = ex(st, ms)
-            let (clock, st) = ex(st, clock)
-            (SelAfter(clock, ms), body, st)
+            let body = expr(mut st, cx, locals, a.body)
+            let ms = expr(mut st, cx, locals, ms)
+            let clock = expr(mut st, cx, locals, clock)
+            (SelAfter(clock, ms), body)
         },
         SelDefault => {
-            let (body, st) = ex(st, a.body)
-            (SelDefault, body, st)
+            let body = expr(mut st, cx, locals, a.body)
+            (SelDefault, body)
         },
     }
-    ({ a with op, guard, body }, st)
+    { a with op, guard, body }
 }
 
 // `x |> rhs`: the call it stands for, with `x` as the first argument.
 // `f(a)` and `r.m(a)` get it in front of their arguments, `f` and `r.m`
 // become one-argument calls, and `rhs?` pipes into the call inside the
 // `?`. None: nothing can be piped into `rhs`.
-fn pipe_call(st: State, x: ast.Expr, rhs: ast.Expr) -> (Option[ast.ExprDesc], State) {
+fn pipe_call(mut st: State, x: ast.Expr, rhs: ast.Expr) -> Option[ast.ExprDesc] {
     match rhs.desc {
-        ECall(f, args) => (Some(ECall(f, [x] + args)), st),
-        EMethod(r, m, nsp, args) => (Some(EMethod(r, m, nsp, [x] + args)), st),
+        ECall(f, args) => Some(ECall(f, [x] + args)),
+        EMethod(r, m, nsp, args) => Some(EMethod(r, m, nsp, [x] + args)),
         // `r.m` is a method, but `t.0` is a tuple's field
-        EField(r, m, nsp) if !starts_with_digit(m) => (Some(EMethod(r, m, nsp, [x])), st),
-        EVar(_) | EClosure(..) => (Some(ECall(rhs, [x])), st),
-        ETry(inner, context) => match pipe_call(st, x, inner) {
+        EField(r, m, nsp) if !starts_with_digit(m) => Some(EMethod(r, m, nsp, [x])),
+        EVar(_) | EClosure(..) => Some(ECall(rhs, [x])),
+        ETry(inner, context) => match pipe_call(mut st, x, inner) {
             // the call is a new expression: `inner` may be its callee
-            (Some(call), st) => {
-                let (call, st) = st.node(call, ast.merge(x.span, inner.span))
-                (Some(ETry(call, context)), st)
+            Some(call) => {
+                let call = st.node(call, ast.merge(x.span, inner.span))
+                Some(ETry(call, context))
             },
-            (None, st) => (None, st),
+            None => None,
         },
-        _ => (None, st),
+        _ => None,
     }
 }
 
@@ -596,100 +665,117 @@ fn own_enum(cx: Context, locals: List[Str], name: Str) -> Bool {
 
 // `r.name(args)`: a function or a variant of a module when `r` names
 // one, a variant of an enum of this module when `r` names that.
-fn method(st: State, cx: Context, locals: List[Str], e: ast.Expr, r: ast.Expr, name: Str, nsp: ast.Span, args: List[ast.Expr]) -> (ast.Expr, State) {
-    let ex = |st: State, x: ast.Expr| expr(st, cx, locals, x)
+fn method(mut st: State, cx: Context, locals: List[Str], e: ast.Expr, r: ast.Expr, name: Str, nsp: ast.Span, args: List[ast.Expr]) -> ast.Expr {
     match r.desc {
         EVar(a) if is_module(cx, locals, a) => {
-            let (args, st) = each(st, args, ex)
+            let args = exprs(mut st, cx, locals, args)
             let m = match cx.mods.get(a) {
                 Some(m) => m,
                 None => {
-                    return (e, st)
+                    return e
                 },
             }
             let span = ast.merge(r.span, nsp)
-            let (found, st) = member(st, m, name, nsp)
+            let found = member(mut st, m, name, nsp)
             match found {
                 Some(IFn(_)) => {
-                    let (callee, st) = st.node(EVar(qual(m, name)), span)
-                    set(e, ECall(callee, args), st)
+                    let callee = st.node(EVar(qual(m, name)), span)
+                    set(e, ECall(callee, args))
                 },
-                Some(_) => (e, st.fail(diag.error("E0108", span, "`{a}.{name}` is a type, not a function"))),
+                Some(_) => {
+                    st.fail(diag.error("E0108", span, "`{a}.{name}` is a type, not a function"))
+                    e
+                },
                 None => match variant_enum(m, name) {
                     Some(en) => {
-                        let (_, st) = member(st, m, en.name, nsp)
-                        let (recv, st) = st.node(EVar(qual(m, en.name)), r.span)
-                        set(e, EMethod(recv, name, nsp, args), st)
+                        let _ = member(mut st, m, en.name, nsp)
+                        let recv = st.node(EVar(qual(m, en.name)), r.span)
+                        set(e, EMethod(recv, name, nsp, args))
                     },
-                    None => (e, no_member(st, m, name, nsp)),
+                    None => {
+                        no_member(mut st, m, name, nsp)
+                        e
+                    },
                 },
             }
         },
         EVar(en) if own_enum(cx, locals, en) => {
-            let (args, st) = each(st, args, ex)
-            set(e, EMethod({ r with desc: EVar(qual(cx.module, en)) }, name, nsp, args), st)
+            let args = exprs(mut st, cx, locals, args)
+            set(e, EMethod({ r with desc: EVar(qual(cx.module, en)) }, name, nsp, args))
         },
         _ => {
-            let (args, st) = each(st, args, ex)
-            let (r, st) = ex(st, r)
-            set(e, EMethod(r, name, nsp, args), st)
+            let args = exprs(mut st, cx, locals, args)
+            let r = expr(mut st, cx, locals, r)
+            set(e, EMethod(r, name, nsp, args))
         },
     }
 }
 
 // `r.name`: a function or a variant of a module, or a variant of an enum
 // of this module, as for `method`.
-fn field(st: State, cx: Context, locals: List[Str], e: ast.Expr, r: ast.Expr, name: Str, nsp: ast.Span) -> (ast.Expr, State) {
+fn field(mut st: State, cx: Context, locals: List[Str], e: ast.Expr, r: ast.Expr, name: Str, nsp: ast.Span) -> ast.Expr {
     match r.desc {
         EVar(a) if is_module(cx, locals, a) => {
             let m = match cx.mods.get(a) {
                 Some(m) => m,
                 None => {
-                    return (e, st)
+                    return e
                 },
             }
-            let (found, st) = member(st, m, name, nsp)
+            let found = member(mut st, m, name, nsp)
             match found {
-                Some(IFn(_)) => set(e, EVar(qual(m, name)), st),
-                Some(_) => (e, st.fail(diag.error("E0404", ast.merge(r.span, nsp), "`{a}.{name}` is a type, not a value"))),
+                Some(IFn(_)) => set(e, EVar(qual(m, name))),
+                Some(_) => {
+                    st.fail(diag.error("E0404", ast.merge(r.span, nsp), "`{a}.{name}` is a type, not a value"))
+                    e
+                },
                 None => match variant_enum(m, name) {
                     Some(en) => {
-                        let (_, st) = member(st, m, en.name, nsp)
-                        let (recv, st) = st.node(EVar(qual(m, en.name)), r.span)
-                        set(e, EField(recv, name, nsp), st)
+                        let _ = member(mut st, m, en.name, nsp)
+                        let recv = st.node(EVar(qual(m, en.name)), r.span)
+                        set(e, EField(recv, name, nsp))
                     },
-                    None => (e, no_member(st, m, name, nsp)),
+                    None => {
+                        no_member(mut st, m, name, nsp)
+                        e
+                    },
                 },
             }
         },
-        EVar(en) if own_enum(cx, locals, en) => set(e, EField({ r with desc: EVar(qual(cx.module, en)) }, name, nsp), st),
+        EVar(en) if own_enum(cx, locals, en) => set(e, EField({ r with desc: EVar(qual(cx.module, en)) }, name, nsp)),
         _ => {
-            let (r, st) = expr(st, cx, locals, r)
-            set(e, EField(r, name, nsp), st)
+            let r = expr(mut st, cx, locals, r)
+            set(e, EField(r, name, nsp))
         },
     }
 }
 
 // The name of a struct literal: `geo.Point` reaches module `geo`, and a
 // struct of this module gets its qualified name.
-fn struct_name(st: State, cx: Context, locals: List[Str], n: Str, span: ast.Span) -> (Str, State) {
+fn struct_name(mut st: State, cx: Context, locals: List[Str], n: Str, span: ast.Span) -> Str {
     match split_qualified(n) {
         Some((a, b)) => {
             let m = if locals.contains(a) { None } else { module_of(cx, a) }
             match m {
                 Some(m) => {
-                    let (found, st) = member(st, m, b, span)
+                    let found = member(mut st, m, b, span)
                     match found {
-                        Some(IStruct(_)) => (qual(m, b), st),
-                        _ => (n, no_member(st, m, b, span)),
+                        Some(IStruct(_)) => qual(m, b),
+                        _ => {
+                            no_member(mut st, m, b, span)
+                            n
+                        },
                     }
                 },
-                None => (n, unknown_module(st, a, span)),
+                None => {
+                    unknown_module(mut st, a, span)
+                    n
+                },
             }
         },
         None => match cx.own.get(n) {
-            Some(IStruct(_)) => (qual(cx.module, n), st),
-            _ => (n, st),
+            Some(IStruct(_)) => qual(cx.module, n),
+            _ => n,
         },
     }
 }
@@ -707,34 +793,34 @@ fn embed_name(cx: Context, locals: List[Str], callee: ast.Expr) -> Option[Str] {
 
 // A call of `embed`, `embed_bytes` or `embed_dir`, which becomes what the
 // loader read for it: the text, the bytes, or a map of the files.
-fn embed(st: State, cx: Context, e: ast.Expr, name: Str, args: List[ast.Expr]) -> (ast.Expr, State) {
+fn embed(mut st: State, cx: Context, e: ast.Expr, name: Str, args: List[ast.Expr]) -> ast.Expr {
     let sp = e.span
     if embeds.literal_path(args).is_none() {
         let d = diag.error("E0405", sp, "`{name}` takes one argument, a string literal with the path, as in `{name}(\"page.html\")`")
-        return set(e, EStr([]), st.fail(d))
+        st.fail(d)
+        return set(e, EStr([]))
     }
     let path = embeds.literal_path(args) ?? ""
     let found = cx.found.get(embeds.key(sp)) ?? Problem("`{name}` was not read")
     match found {
         Text(text) => {
-            let st = { st with embedded: st.embedded + [Embedded { module: cx.module.name, path, size: text.len() }] }
+            st = { st with embedded: st.embedded + [Embedded { module: cx.module.name, path, size: text.len() }] }
             if name == "embed" {
-                set(e, EStr([SPLit(text)]), st)
+                set(e, EStr([SPLit(text)]))
             } else {
-                let (text, st) = st.node(EStr([SPLit(text)]), sp)
-                set(e, EMethod(text, "to_bytes", sp, []), st)
+                let text = st.node(EStr([SPLit(text)]), sp)
+                set(e, EMethod(text, "to_bytes", sp, []))
             }
         },
         Files(files) => {
-            let mut st = st
             for f in files {
                 st = { st with embedded: st.embedded + [Embedded { module: cx.module.name, path: path + "/" + f.0, size: f.1.len() }] }
             }
-            file_map(st, e, files)
+            file_map(mut st, e, files)
         },
         Problem(message) => {
-            let st = st.fail(diag.error("E0405", sp, message))
-            if name == "embed_dir" { file_map(st, e, [("", "")]) } else { set(e, EStr([]), st) }
+            st.fail(diag.error("E0405", sp, message))
+            if name == "embed_dir" { file_map(mut st, e, [("", "")]) } else { set(e, EStr([])) }
         },
     }
 }
@@ -742,71 +828,69 @@ fn embed(st: State, cx: Context, e: ast.Expr, name: Str, args: List[ast.Expr]) -
 // `map([("css/site.css", "...".to_bytes()), ...])`, the value of
 // `embed_dir`. A failed one is a map of one empty file, so the checker
 // still sees a Map[Str, Bytes] there.
-fn file_map(st: State, e: ast.Expr, files: List[(Str, Str)]) -> (ast.Expr, State) {
+fn file_map(mut st: State, e: ast.Expr, files: List[(Str, Str)]) -> ast.Expr {
     let sp = e.span
-    let (pairs, st) = each(st, files, |st, f| {
-        let (key, st) = st.node(EStr([SPLit(f.0)]), sp)
-        let (text, st) = st.node(EStr([SPLit(f.1)]), sp)
-        let (bytes, st) = st.node(EMethod(text, "to_bytes", sp, []), sp)
+    let mut pairs: List[ast.Expr] = []
+    for f in files {
+        let key = st.node(EStr([SPLit(f.0)]), sp)
+        let text = st.node(EStr([SPLit(f.1)]), sp)
+        let bytes = st.node(EMethod(text, "to_bytes", sp, []), sp)
         let fields = [ast.FieldInit { name: "0", span: sp, value: key }, ast.FieldInit { name: "1", span: sp, value: bytes }]
-        st.node(EStruct(ast.tuple_name(2), sp, fields), sp)
-    })
-    let (list, st) = st.node(EList(pairs), sp)
-    let (callee, st) = st.node(EVar("map"), sp)
-    set(e, ECall(callee, [list]), st)
+        pairs.push(st.node(EStruct(ast.tuple_name(2), sp, fields), sp))
+    }
+    let list = st.node(EList(pairs), sp)
+    let callee = st.node(EVar("map"), sp)
+    set(e, ECall(callee, [list]))
 }
 
 // ---------- statements ----------
 
-pub fn block(st: State, cx: Context, locals: List[Str], b: ast.Block) -> (ast.Block, State) {
-    let (stmts, st) = expand_stmts(st, b.stmts)
-    let mut st = st
-    let mut locals = locals
+pub fn block(mut st: State, cx: Context, locals: List[Str], b: ast.Block) -> ast.Block {
+    let stmts = expand_stmts(mut st, b.stmts)
+    let mut inner = locals
     let mut out: List[ast.Stmt] = []
     for s in stmts {
-        let ex = |st: State, x: ast.Expr| expr(st, cx, locals, x)
-        let (desc, after) = match s.desc {
+        let desc = match s.desc {
             SLet(m, n, span, t, x) => {
-                let (x, st) = ex(st, x)
-                locals = [n] + locals
-                let (t, st) = maybe(st, t, |st, t| ty(st, cx, [], t))
-                (SLet(m, n, span, t, x), st)
+                let x = expr(mut st, cx, inner, x)
+                inner = [n] + inner
+                let t = opt_ty(mut st, cx, t)
+                SLet(m, n, span, t, x)
             },
             SAssign(a, b) => {
-                let (b, st) = ex(st, b)
-                let (a, st) = ex(st, a)
-                (SAssign(a, b), st)
+                let b = expr(mut st, cx, inner, b)
+                let a = expr(mut st, cx, inner, a)
+                SAssign(a, b)
             },
             SExpr(x) => {
-                let (x, st) = ex(st, x)
-                (SExpr(x), st)
+                let x = expr(mut st, cx, inner, x)
+                SExpr(x)
             },
             SReturn(x) => {
-                let (x, st) = maybe(st, x, ex)
-                (SReturn(x), st)
+                let x = opt_expr(mut st, cx, inner, x)
+                SReturn(x)
             },
             SWhile(c, body) => {
-                let (body, st) = block(st, cx, locals, body)
-                let (c, st) = ex(st, c)
-                (SWhile(c, body), st)
+                let body = block(mut st, cx, inner, body)
+                let c = expr(mut st, cx, inner, c)
+                SWhile(c, body)
             },
             SFor(n, span, items, body) => {
-                let (body, st) = block(st, cx, [n] + locals, body)
-                let (items, st) = ex(st, items)
-                (SFor(n, span, items, body), st)
+                let body = block(mut st, cx, [n] + inner, body)
+                let items = expr(mut st, cx, inner, items)
+                SFor(n, span, items, body)
             },
             SDefer(body) => {
-                let (body, st) = block(st, cx, locals, body)
-                (SDefer(body), st)
+                let body = block(mut st, cx, inner, body)
+                SDefer(body)
             },
             // SLetPat and SForPat are expanded already
-            SBreak | SContinue | SLetPat(..) | SForPat(..) => (s.desc, st),
+            SBreak | SContinue | SLetPat(..) | SForPat(..) => s.desc,
         }
         out.push({ s with desc })
-        st = after
     }
-    let (tail, st) = maybe(st, b.tail, |st, x| expr(st, cx, locals, x))
-    ({ b with stmts: out, tail }, st)
+    let tail = opt_expr(mut st, cx, inner, b.tail)
+    { b with stmts: out, tail }
 }
 
 fn is_tuple_assign(s: ast.Stmt) -> Bool {
@@ -828,30 +912,28 @@ fn needs_expanding(s: ast.Stmt) -> Bool {
 
 // The statements with `let (a, b) = e`, `for (k, v) in xs { ... }` and
 // `(a, b) = e` written out in plain statements.
-fn expand_stmts(st: State, stmts: List[ast.Stmt]) -> (List[ast.Stmt], State) {
+fn expand_stmts(mut st: State, stmts: List[ast.Stmt]) -> List[ast.Stmt] {
     if !stmts.any(needs_expanding) {
-        return (stmts, st)
+        return stmts
     }
-    let mut st = st
     let mut out: List[ast.Stmt] = []
     for s in stmts {
-        let (more, after) = match s.desc {
-            SAssign(lhs, e) if is_tuple_assign(s) => assign_parts(st, lhs, e, s.span),
-            SLetPat(p, e) => unpack(st, p, e),
+        let more = match s.desc {
+            SAssign(lhs, e) if is_tuple_assign(s) => assign_parts(mut st, lhs, e, s.span),
+            SLetPat(p, e) => unpack(mut st, p, e),
             // `for t in xs { let (k, v) = t; body }`
             SForPat(p, items, body) => {
-                let (n, st) = st.temp()
+                let n = st.temp()
                 let tmp = "item$" + n.to_str()
-                let (v, st) = st.node(EVar(tmp), p.span)
-                let (lets, st) = unpack(st, p, v)
-                ([{ s with desc: SFor(tmp, p.span, items, { body with stmts: lets + body.stmts }) }], st)
+                let v = st.node(EVar(tmp), p.span)
+                let lets = unpack(mut st, p, v)
+                [{ s with desc: SFor(tmp, p.span, items, { body with stmts: lets + body.stmts }) }]
             },
-            _ => ([s], st),
+            _ => [s],
         }
         out = out + more
-        st = after
     }
-    (out, st)
+    out
 }
 
 // `let (a, (b, _)) = e` as `let t = e; let a = t.0; let u = t.1;
@@ -860,54 +942,50 @@ fn expand_stmts(st: State, stmts: List[ast.Stmt]) -> (List[ast.Stmt], State) {
 // `let t = match e \{ Point \{ x: _, y: _ } as s => s }; let x = t.x; ...`,
 // so the checker reports a wrong type, an unknown field or a missing `..`
 // at the pattern, as it does in `match`.
-fn unpack(st: State, p: ast.Pat, e: ast.Expr) -> (List[ast.Stmt], State) {
-    let (n, st) = st.temp()
+fn unpack(mut st: State, p: ast.Pat, e: ast.Expr) -> List[ast.Stmt] {
+    let n = st.temp()
     let tmp = "tuple$" + n.to_str()
     match p.desc {
         PStruct(name, name_span, fields, rest) => {
             let whole = "struct$" + n.to_str()
             let wild = fields.map(|f| ast.FieldPat { name: f.name, span: f.span, pat: ast.Pat { desc: PWild, span: f.pat.span } })
             let shape = ast.Pat { desc: PStruct(name, name_span, wild, rest), span: p.span }
-            let (body, st) = st.node(EVar(whole), p.span)
+            let body = st.node(EVar(whole), p.span)
             let arm = ast.Arm { pat: ast.Pat { desc: PAs(shape, whole, p.span), span: p.span }, guard: None, body }
-            let (checked, st) = st.node(EMatch(e, [arm]), p.span)
-            let mut st = st
+            let checked = st.node(EMatch(e, [arm]), p.span)
             let mut out = [ast.Stmt { desc: SLet(false, tmp, p.span, None, checked), span: p.span }]
             for f in fields {
-                let (more, after) = unpack_part(st, tmp, f.name, f.pat, p.span)
+                let more = unpack_part(mut st, tmp, f.name, f.pat, p.span)
                 out = out + more
-                st = after
             }
-            (out, st)
+            out
         },
         PTuple(parts) => {
-            let mut st = st
             let mut out = [ast.Stmt { desc: SLet(false, tmp, p.span, None, e), span: p.span }]
             for (i, sub) in parts.with_index() {
-                let (more, after) = unpack_part(st, tmp, i.to_str(), sub, p.span)
+                let more = unpack_part(mut st, tmp, i.to_str(), sub, p.span)
                 out = out + more
-                st = after
             }
-            (out, st)
+            out
         },
         PBind(name) => {
             let first = ast.Stmt { desc: SLet(false, tmp, p.span, None, e), span: p.span }
-            let (var, st) = st.node(EVar(tmp), p.span)
-            ([first, ast.Stmt { desc: SLet(false, name, p.span, None, var), span: p.span }], st)
+            let var = st.node(EVar(tmp), p.span)
+            [first, ast.Stmt { desc: SLet(false, name, p.span, None, var), span: p.span }]
         },
-        _ => ([ast.Stmt { desc: SLet(false, tmp, p.span, None, e), span: p.span }], st),
+        _ => [ast.Stmt { desc: SLet(false, tmp, p.span, None, e), span: p.span }],
     }
 }
 
 // The statements for the part `field` of the temporary `tmp`, taken apart
 // by `sub`.
-fn unpack_part(st: State, tmp: Str, field: Str, sub: ast.Pat, span: ast.Span) -> (List[ast.Stmt], State) {
-    let (var, st) = st.node(EVar(tmp), span)
-    let (part, st) = st.node(EField(var, field, sub.span), span)
+fn unpack_part(mut st: State, tmp: Str, field: Str, sub: ast.Pat, span: ast.Span) -> List[ast.Stmt] {
+    let var = st.node(EVar(tmp), span)
+    let part = st.node(EField(var, field, sub.span), span)
     match sub.desc {
-        PBind(name) => ([ast.Stmt { desc: SLet(false, name, sub.span, None, part), span: sub.span }], st),
-        PWild => ([], st),
-        _ => unpack(st, sub, part),
+        PBind(name) => [ast.Stmt { desc: SLet(false, name, sub.span, None, part), span: sub.span }],
+        PWild => [],
+        _ => unpack(mut st, sub, part),
     }
 }
 
@@ -916,30 +994,28 @@ fn unpack_part(st: State, tmp: Str, field: Str, sub: ast.Pat, span: ast.Span) ->
 // each target, left to right. Each `let` is annotated with the tuple's
 // type name alone (`#tuple2`), which says how many parts the left side
 // takes; the checker checks the right side against it.
-fn assign_parts(st: State, lhs: ast.Expr, e: ast.Expr, span: ast.Span) -> (List[ast.Stmt], State) {
+fn assign_parts(mut st: State, lhs: ast.Expr, e: ast.Expr, span: ast.Span) -> List[ast.Stmt] {
     match lhs.desc {
         EStruct(n, _, targets) if ast.is_tuple_name(n) => {
-            let (k, st) = st.temp()
+            let k = st.temp()
             let tmp = "$assign" + k.to_str()
             let annotation = ast.TyExpr { desc: TyName(n, []), span: lhs.span }
-            let mut st = st
             let mut out = [ast.Stmt { desc: SLet(false, tmp, lhs.span, Some(annotation), e), span }]
             for (i, f) in targets.with_index() {
                 let target = f.value
                 match target.desc {
                     EVar("_") => {},
                     _ => {
-                        let (var, after) = st.node(EVar(tmp), target.span)
-                        let (part, after) = after.node(EField(var, i.to_str(), target.span), target.span)
-                        let (more, after) = assign_parts(after, target, part, target.span)
+                        let var = st.node(EVar(tmp), target.span)
+                        let part = st.node(EField(var, i.to_str(), target.span), target.span)
+                        let more = assign_parts(mut st, target, part, target.span)
                         out = out + more
-                        st = after
                     },
                 }
             }
-            (out, st)
+            out
         },
-        _ => ([ast.Stmt { desc: SAssign(lhs, e), span }], st),
+        _ => [ast.Stmt { desc: SAssign(lhs, e), span }],
     }
 }
 
@@ -954,14 +1030,15 @@ fn builtin_method_types() -> List[Str] {
 // Item `i` of the module in `cx`, renamed. Its parts are renamed in the
 // order the OCaml loader renames them, which decides the order of the
 // problems found.
-pub fn item(st: State, cx: Context, i: ast.Item) -> (ast.Item, State) {
+pub fn item(mut st: State, cx: Context, i: ast.Item) -> ast.Item {
     match i {
         IFn(d) => {
             let cx = { cx with gens: d.generics }
-            let (params, st) = each(st, d.params, |st, p| {
-                let (t, st) = ty(st, cx, [], p.ty)
-                ({ p with ty: t }, st)
-            })
+            let mut params: List[ast.Param] = []
+            for p in d.params {
+                let t = ty(mut st, cx, [], p.ty)
+                params.push({ p with ty: t })
+            }
             let name = if d.test.is_some() {
                 d.name
             } else if is_method(i) {
@@ -974,84 +1051,68 @@ pub fn item(st: State, cx: Context, i: ast.Item) -> (ast.Item, State) {
             } else {
                 qual(cx.module, d.name)
             }
-            let (bs, st) = bounds(st, cx, d.bounds)
-            let (body, st) = block(st, cx, d.params.map(|p| p.name), d.body)
-            let (ret, st) = maybe(st, d.ret, |st, t| ty(st, cx, [], t))
+            let bs = bounds(mut st, cx, d.bounds)
+            let body = block(mut st, cx, d.params.map(|p| p.name), d.body)
+            let ret = opt_ty(mut st, cx, d.ret)
             // a standard library module trusted with C (src/std/limen.toml [trust])
             let trusted = is_std(cx.module) && cx.trusted.contains(std_name(cx.module))
             let foreign = d.foreign.map(|f| { f with trusted })
-            (IFn({ d with name, params, bounds: bs, body, ret, foreign }), st)
+            IFn({ d with name, params, bounds: bs, body, ret, foreign })
         },
         IStruct(s) => {
             let cx = { cx with gens: s.generics }
-            let (foreign, st) = maybe(st, s.foreign, |st, f| {
-                let (ts, st) = types(st, cx, f.types)
-                ({ f with types: ts }, st)
-            })
-            let (bs, st) = bounds(st, cx, s.bounds)
+            let foreign = match s.foreign {
+                Some(f) => {
+                    let ts = types(mut st, cx, f.types)
+                    Some({ f with types: ts })
+                },
+                None => None,
+            }
+            let bs = bounds(mut st, cx, s.bounds)
             // a C struct's Int32 fields are Ints to the rest of Limen, as
             // Int32 parameters are; the types as written stay in `foreign`
             let int32_as_int = |t: ast.TyExpr| match t.desc {
                 TyName("Int32", []) if s.foreign.is_some() => { t with desc: TyName("Int", []) },
                 _ => t,
             }
-            let (fields, st) = each(st, s.fields, |st, f| {
-                let (t, st) = ty(st, cx, [], int32_as_int(f.ty))
-                ({ f with ty: t }, st)
-            })
-            (IStruct({ s with name: qual(cx.module, s.name), fields, foreign, bounds: bs }), st)
+            let mut fields: List[ast.Field] = []
+            for f in s.fields {
+                let t = ty(mut st, cx, [], int32_as_int(f.ty))
+                fields.push({ f with ty: t })
+            }
+            IStruct({ s with name: qual(cx.module, s.name), fields, foreign, bounds: bs })
         },
         IIface(f) => {
             let cx = { cx with gens: f.generics }
-            let (methods, st) = each(st, f.methods, |st, m| {
-                let (ret, st) = maybe(st, m.ret, |st, t| ty(st, cx, [], t))
-                let (params, st) = each(st, m.params, |st, p| {
-                    let (t, st) = ty(st, cx, [], p.ty)
-                    ({ p with ty: t }, st)
-                })
-                ({ m with params, ret }, st)
-            })
-            (IIface({ f with name: qual(cx.module, f.name), methods }), st)
+            let mut methods: List[ast.Method] = []
+            for m in f.methods {
+                let ret = opt_ty(mut st, cx, m.ret)
+                let mut params: List[ast.Param] = []
+                for p in m.params {
+                    let t = ty(mut st, cx, [], p.ty)
+                    params.push({ p with ty: t })
+                }
+                methods.push({ m with params, ret })
+            }
+            IIface({ f with name: qual(cx.module, f.name), methods })
         },
         IEnum(e) => {
             let cx = { cx with gens: e.generics }
-            let (bs, st) = bounds(st, cx, e.bounds)
-            let (variants, st) = each(st, e.variants, |st, v| {
-                let (payload, st) = types(st, cx, v.payload)
-                ({ v with payload }, st)
-            })
-            (IEnum({ e with name: qual(cx.module, e.name), variants, bounds: bs }), st)
+            let bs = bounds(mut st, cx, e.bounds)
+            let mut variants: List[ast.Variant] = []
+            for v in e.variants {
+                let payload = types(mut st, cx, v.payload)
+                variants.push({ v with payload })
+            }
+            IEnum({ e with name: qual(cx.module, e.name), variants, bounds: bs })
         },
         // expanded where it is used, and kept, expanded, so the checker
         // checks its body even if nothing uses it
         IType(a) => {
             let cx = { cx with gens: a.generics }
             let name = qual(cx.module, a.name)
-            let (body, st) = ty(st, cx, [name], a.body)
-            (IType({ a with name, body }), st)
+            let body = ty(mut st, cx, [name], a.body)
+            IType({ a with name, body })
         },
-    }
-}
-
-// ---------- lists and options with the state ----------
-
-pub fn each[T, U](st: State, xs: List[T], f: fn(State, T) -> (U, State)) -> (List[U], State) {
-    let mut st = st
-    let mut out: List[U] = []
-    for x in xs {
-        let (y, after) = f(st, x)
-        out.push(y)
-        st = after
-    }
-    (out, st)
-}
-
-fn maybe[T, U](st: State, x: Option[T], f: fn(State, T) -> (U, State)) -> (Option[U], State) {
-    match x {
-        Some(v) => {
-            let (v, st) = f(st, v)
-            (Some(v), st)
-        },
-        None => (None, st),
     }
 }

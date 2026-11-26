@@ -1,0 +1,12 @@
+interface Named {
+    fn name(self) -> Str
+}
+struct P {
+    x: Int,
+}
+fn name(mut self: P) -> Str {
+    "p"
+}
+fn main(root: Root) {
+    let p: dyn Named = P { x: 1 }
+}

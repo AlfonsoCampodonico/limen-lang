@@ -1,0 +1,7 @@
+fn bump(mut self: Int) {
+    self = self + 1
+}
+fn main(root: Root) {
+    let mut bs = bytes([1])
+    bs[0].bump()
+}

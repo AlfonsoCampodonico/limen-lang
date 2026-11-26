@@ -130,6 +130,10 @@ and expr_desc =
   | ENamed of string * span * expr
       (* `name: value`, a call argument naming its parameter; only between the
          parser and the checker, which puts arguments in parameter order *)
+  | EMut of expr
+      (* `mut place`, a call argument for a `mut` parameter: the callee
+         changes the caller's place. Its span runs from `mut` to the end of
+         the place. *)
 
 and str_part = SPLit of string | SPExpr of expr
 
@@ -143,8 +147,9 @@ and sel_op =
 and arm = { apat : pat; aguard : expr option (* `if cond`: the arm applies only when true *); abody : expr }
 
 (* A function's parameter; [prm_default] is its default value, a constant
-   (`sep: Str = ", "`), used when a call leaves the argument out. *)
-and param = { prm_name : string; prm_span : span; prm_ty : ty_expr; prm_default : expr option }
+   (`sep: Str = ", "`), used when a call leaves the argument out. [prm_mut]:
+   written `mut name: Type`, so the callee changes the caller's place. *)
+and param = { prm_name : string; prm_span : span; prm_ty : ty_expr; prm_default : expr option; prm_mut : bool }
 and block = { stmts : stmt list; tail : expr option; bspan : span }
 and stmt = { sdesc : stmt_desc; sspan : span }
 and stmt_desc =

@@ -166,9 +166,8 @@ pub fn load(fs: Fs, std: Map[Str, Str], place: disk.Place, path: Str) -> Program
             let (copies, after) = expand_table(st, src, i)
             st = after
             for copy in copies {
-                let (renamed, after) = rename.item(st, cx, copy)
+                let renamed = rename.item(mut st, cx, copy)
                 items.push(renamed)
-                st = after
             }
         }
     }
@@ -402,9 +401,8 @@ fn expand_table(st: rename.State, src: Str, i: ast.Item) -> (List[ast.Item], ren
                     let name = if base == "" { text } else { base + " " + text }
                     let unpack = ast.Stmt { desc: SLetPat(t.pat, c), span: c.span }
                     let copy = IFn({ d with name: "{d.name}/{k}", test: Some(name), table: Some({ t with cases: c }), body: { d.body with stmts: [unpack] + d.body.stmts } })
-                    let (copy, next_id) = ids.item(copy, st.next_id)
+                    let copy = ids.item(copy, mut st.next_id)
                     copies.push(copy)
-                    st = { st with next_id }
                 }
                 (copies, st)
             },

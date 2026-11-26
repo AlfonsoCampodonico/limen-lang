@@ -1,0 +1,4 @@
+fn main(root: Root) {
+    let mut x = 1
+    let y = mut x
+}

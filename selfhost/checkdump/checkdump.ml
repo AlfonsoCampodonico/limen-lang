@@ -31,7 +31,7 @@ and below (e : expr) =
   | EStr parts -> List.concat_map (function SPExpr x -> walk x | SPLit _ -> []) parts
   | EList es -> walk_all es
   | EBin (_, a, b) | EPipe (a, b) | EIndex (a, b) | ESafe (a, _, b, _) -> walk a @ walk b
-  | EUn (_, a) | EField (a, _, _) | ENamed (_, _, a) | EClosure (_, a) | EDyn (a, _) -> walk a
+  | EUn (_, a) | EField (a, _, _) | ENamed (_, _, a) | EMut a | EClosure (_, a) | EDyn (a, _) -> walk a
   | ECall (f, args) | EMethod (f, _, _, args) -> walk f @ walk_all args
   | ETry (a, c) -> walk a @ walk_opt c
   | EIf (c, b, e) -> walk c @ block b @ walk_opt e

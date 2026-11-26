@@ -102,7 +102,7 @@ let rec walk_expr (f : expr -> unit) e =
   | EUn (_, a) | ETry (a, None) | EField (a, _, _) -> w a
   | ETry (a, Some c) -> w a; w c
   | ECall (c, args) -> w c; List.iter w args
-  | ENamed (_, _, a) -> w a
+  | ENamed (_, _, a) | EMut a -> w a
   | EMethod (r, _, _, args) -> w r; List.iter w args
   | EIf (c, b, eo) -> w c; walk_block f b; Option.iter w eo
   | EMatch (s, arms) -> w s; List.iter (fun a -> Option.iter w a.aguard; w a.abody) arms
@@ -155,7 +155,7 @@ let fn_signature text (d : fn_decl) =
   let gens = Doc.generics ~text d.fn_gen d.fn_bounds in
   let ps =
     List.map
-      (fun p -> p.prm_name ^ ": " ^ slice text p.prm_ty.tspan ^ match p.prm_default with Some e -> " = " ^ slice text e.espan | None -> "")
+      (fun p -> (if p.prm_mut then "mut " else "") ^ p.prm_name ^ ": " ^ slice text p.prm_ty.tspan ^ match p.prm_default with Some e -> " = " ^ slice text e.espan | None -> "")
       d.fn_params
   in
   (* a variadic foreign function's `...` *)
@@ -589,6 +589,7 @@ let semantic_tokens path text (items : item list) (occs : Refs.occ list) =
         List.iter
           (fun p ->
             Hashtbl.replace params (local p.prm_span) ();
+            if p.prm_mut then Hashtbl.replace mutables (local p.prm_span) ();
             if te_holds p.prm_ty then Hashtbl.replace caps (local p.prm_span) ();
             tys p.prm_ty)
           d.fn_params;

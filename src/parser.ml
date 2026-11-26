@@ -95,6 +95,9 @@ let merge = Span.merge
 let is_upper s = s <> "" && s.[0] >= 'A' && s.[0] <= 'Z'
 let mk d sp = { edesc = d; espan = sp; ety = Types.TErr; einst = []; ecallee = None }
 
+(* Where a parameter cannot be `mut`: report a `mut` ahead with [msg]. *)
+let refuse_mut st msg = if is_kw st "mut" then raise (Diag.Fatal (Diag.make "E0003" (peek st).span msg))
+
 (* Comma-separated list up to [close]; a newline also separates items. *)
 
 (* names for the value inside an Option in `a?.b`; reset per file so a
@@ -178,7 +181,11 @@ and parse_type1 st : ty_expr =
   | KW "fn" ->
     skip st;
     need_sym st "(";
-    let ps = comma_list st ")" parse_type in
+    let ps =
+      comma_list st ")" (fun st ->
+          refuse_mut st "a function type cannot have a `mut` parameter";
+          parse_type st)
+    in
     (* `fn(A)` returns nothing, as a function declared without `->` does:
        its result is `()`, with an empty span after the `)` so the
        formatter writes it back the way it was written *)
@@ -372,15 +379,23 @@ and call_args st ns =
   match trailing_closure st ns with [] -> args | closure -> args @ closure
 
 (* A call argument: an expression, or `name: expression` naming the
-   parameter it is for. *)
+   parameter it is for; either may be `mut place`, for a `mut` parameter. *)
 and parse_arg st =
   match (cur st, next st) with
   | IDENT n, SYM ":" ->
     let t = advance st in
     skip st;
-    let v = parse_expr st in
+    let v = parse_mut_arg st in
     mk (ENamed (n, t.span, v)) (merge t.span v.espan)
-  | _ -> parse_expr st
+  | _ -> parse_mut_arg st
+
+and parse_mut_arg st =
+  if is_kw st "mut" then begin
+    let m = advance st in
+    let place = parse_expr st in
+    mk (EMut place) (merge m.span place.espan)
+  end
+  else parse_expr st
 
 (* Is the `{` ahead the start of a trailing closure? Not in the head of an
    `if`, `while`, `for`, `match` or group deadline, where `{` opens the body;
@@ -412,6 +427,7 @@ and trailing_closure st ns =
       | SYM "|" ->
         skip st;
         comma_list st "|" (fun st ->
+            refuse_mut st "a closure cannot take a `mut` parameter";
             let n, sp = expect_ident st in
             let ty = if accept_sym st ":" then Some (parse_type st) else None in
             (n, ty, sp))
@@ -476,6 +492,7 @@ and parse_primary st ns =
     skip st;
     let params =
       comma_list st "|" (fun st ->
+          refuse_mut st "a closure cannot take a `mut` parameter";
           let n, sp = expect_ident st in
           let ty = if accept_sym st ":" then Some (parse_type st) else None in
           (n, ty, sp))
@@ -926,8 +943,11 @@ let rec is_constant (e : expr) =
   | _ -> false
 
 (* A parameter: `name: Type`, and in a function's own parameters (not a
-   foreign function's) a default, `name: Type = constant`. *)
-let parse_param ?(defaults = false) st =
+   foreign function's) a default, `name: Type = constant`, and with
+   [mut_ok] `mut name: Type`. *)
+let parse_param ?(defaults = false) ~mut_ok st =
+  let m = mut_ok && is_kw st "mut" in
+  if m then skip st;
   let pn, psp = expect_ident st in
   if not (is_sym st ":") then
     raise (Diag.Fatal (Diag.make "E0008" psp (Printf.sprintf "parameter `%s` needs a type, for example `%s: Int`" pn pn)));
@@ -937,6 +957,11 @@ let parse_param ?(defaults = false) st =
     if defaults && is_sym st "=" then begin
       skip st;
       let e = parse_expr st in
+      if m then
+        raise
+          (Diag.Fatal
+             (Diag.make "E0123" e.espan
+                (Printf.sprintf "`%s` is `mut`, so it cannot have a default: the caller always passes the place" pn)));
       if not (is_constant e) then
         raise
           (Diag.Fatal
@@ -947,7 +972,7 @@ let parse_param ?(defaults = false) st =
     end
     else None
   in
-  { prm_name = pn; prm_span = psp; prm_ty = ty; prm_default = default }
+  { prm_name = pn; prm_span = psp; prm_ty = ty; prm_default = default; prm_mut = m }
 
 let parse_item st =
   let t = peek st in
@@ -965,6 +990,7 @@ let parse_item st =
        `clock: virtual Clock` asks for a clock on virtual time *)
     let virtual_clock = ref false in
     let test_param st =
+      refuse_mut st "a test's parameters cannot be `mut`";
       let pn, psp = expect_ident st in
       if not (is_sym st ":") then
         raise (Diag.Fatal (Diag.make "E0008" psp (Printf.sprintf "parameter `%s` needs a type, for example `%s: Int`" pn pn)));
@@ -974,7 +1000,7 @@ let parse_item st =
        | IDENT "virtual", _ ->
          raise (Diag.Fatal (Diag.make "E0003" (cur_span st) "only a test's clock can be virtual: `clock: virtual Clock`"))
        | _ -> ());
-      { prm_name = pn; prm_span = psp; prm_ty = parse_type st; prm_default = None }
+      { prm_name = pn; prm_span = psp; prm_ty = parse_type st; prm_default = None; prm_mut = false }
     in
     let params = if accept_sym st "(" then comma_list st ")" test_param else [] in
     (* a table test: `for (a, b, want) in [(1, 2, 3), (2, 2, 4)]`, each case run on its own *)
@@ -1010,7 +1036,7 @@ let parse_item st =
     let name, nsp = expect_ident st in
     let gen, bounds = split_generics (parse_bounded_generics st) in
     need_sym st "(";
-    let params = comma_list st ")" (parse_param ~defaults:true) in
+    let params = comma_list st ")" (fun st -> parse_param ~defaults:true ~mut_ok:true st) in
     let ret = if accept_sym st "->" then Some (parse_type st) else None in
     let body = parse_block st in
     IFn { fn_name = name; fn_span = nsp; fn_gen = gen; fn_params = params; fn_ret = ret; fn_body = body; fn_test = None; fn_bench = false; fn_virtual = false; fn_table = None; fn_pub = false; fn_bounds = bounds; fn_foreign = None }
@@ -1069,6 +1095,7 @@ let parse_item st =
           skip st;
           let m, msp = expect_ident st in
           need_sym st "(";
+          refuse_mut st "an interface method cannot take a `mut` parameter";
           let selft = peek st in
           (match selft.tok with
            | IDENT "self" -> skip st
@@ -1076,9 +1103,10 @@ let parse_item st =
           let params =
             if accept_sym st "," then
               comma_list st ")" (fun st ->
+                  refuse_mut st "an interface method cannot take a `mut` parameter";
                   let pn, psp = expect_ident st in
                   need_sym st ":";
-                  { prm_name = pn; prm_span = psp; prm_ty = parse_type st; prm_default = None })
+                  { prm_name = pn; prm_span = psp; prm_ty = parse_type st; prm_default = None; prm_mut = false })
             else (need_sym st ")"; [])
           in
           let ret = if accept_sym st "->" then Some (parse_type st) else None in
@@ -1150,7 +1178,11 @@ let parse_foreign st =
                  variadic := Some !count;
                  None
                end
-               else (incr count; Some (parse_param st))))
+               else begin
+                 incr count;
+                 refuse_mut st "a foreign function cannot take a `mut` parameter";
+                 Some (parse_param ~mut_ok:false st)
+               end))
       in
       List.iter
         (fun p -> if p.prm_name = "self" then raise (Diag.Fatal (Diag.make "E0003" p.prm_span "a foreign function is not a method: name the parameter something other than `self`")))
