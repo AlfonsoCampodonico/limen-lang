@@ -274,16 +274,95 @@ value limen_ffi_call_var(value fn, value flags, value ints, value floats, value 
   CAMLreturn(limen_result(status, w, status ? 0 : 1, slots, status ? 0 : no));
 }
 
+/* ---- the blocking-call pool ----
+   Blocking foreign calls and SQL statements run on a pool of threads, as
+   natively (limen_rt.c, w_bl_submit): the first job starts one thread per
+   core (at least 4), and a job that finds no thread idle starts another, up
+   to LIMEN_BLOCKING_THREADS (64 by default); past that, jobs wait in the
+   queue. A job starts with a limen_pjob header; its run function owns it
+   from then on (frees it, or hands it back through its pipe). Jobs are
+   submitted by the thread holding OCaml's runtime lock; pool threads never
+   touch an OCaml value. The threads stay for the life of the process. */
+typedef struct limen_pjob {
+  struct limen_pjob *next;
+  void (*run)(struct limen_pjob *);
+} limen_pjob;
+
+static pthread_mutex_t limen_pool_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t limen_pool_cv = PTHREAD_COND_INITIALIZER;
+static limen_pjob *limen_pool_head, *limen_pool_tail;
+static int limen_pool_threads, limen_pool_idle, limen_pool_queued, limen_pool_max;
+
+static void *limen_pool_thread(void *arg) {
+  (void)arg;
+  pthread_mutex_lock(&limen_pool_mu);
+  for (;;) {
+    while (!limen_pool_head) {
+      limen_pool_idle++;
+      pthread_cond_wait(&limen_pool_cv, &limen_pool_mu);
+      limen_pool_idle--;
+    }
+    limen_pjob *b = limen_pool_head;
+    limen_pool_head = b->next;
+    if (!limen_pool_head) limen_pool_tail = NULL;
+    limen_pool_queued--;
+    pthread_mutex_unlock(&limen_pool_mu);
+    b->run(b);
+    pthread_mutex_lock(&limen_pool_mu);
+  }
+  return NULL;
+}
+
+/* Start a pool thread (with limen_pool_mu held); 0 if none could start. */
+static int limen_pool_grow(void) {
+  pthread_t th;
+  pthread_attr_t at;
+  pthread_attr_init(&at);
+  pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+  pthread_attr_setstacksize(&at, (size_t)4 << 20); /* C libraries expect a thread's usual stack */
+  int ok = pthread_create(&th, &at, limen_pool_thread, NULL) == 0;
+  pthread_attr_destroy(&at);
+  if (ok) limen_pool_threads++;
+  return ok;
+}
+
+/* Queue a job; 0 (and the job not queued) if the pool has no thread and
+   none could start. */
+static int limen_pool_submit(limen_pjob *b) {
+  pthread_mutex_lock(&limen_pool_mu);
+  if (!limen_pool_max) {
+    const char *e = getenv("LIMEN_BLOCKING_THREADS");
+    limen_pool_max = e && atoi(e) > 0 ? atoi(e) : 64;
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    if (n < 4) n = 4;
+    if (n > limen_pool_max) n = limen_pool_max;
+    while (limen_pool_threads < n && limen_pool_grow()) {}
+  }
+  /* a thread signalled but not yet awake still counts as idle, so the
+     queue's length, not the signal, says whether another thread is needed */
+  if (limen_pool_queued + 1 > limen_pool_idle && limen_pool_threads < limen_pool_max) limen_pool_grow();
+  if (limen_pool_threads == 0) { pthread_mutex_unlock(&limen_pool_mu); return 0; }
+  b->next = NULL;
+  if (limen_pool_tail) limen_pool_tail->next = b; else limen_pool_head = b;
+  limen_pool_tail = b;
+  limen_pool_queued++;
+  if (limen_pool_idle > 0) pthread_cond_signal(&limen_pool_cv);
+  pthread_mutex_unlock(&limen_pool_mu);
+  return 1;
+}
+
 /* ---- blocking calls ----
-   A function declared `blocking fn` runs on a thread of its own, so the
-   interpreter's other tasks go on while C works (natively it runs on the
-   blocking-call pool). limen_ffi_job_start copies the arguments (strings
-   included: the OCaml heap may move meanwhile), starts the thread and
-   returns the job with the read end of a pipe the thread writes to when the
-   call has returned; the task waits on that descriptor as on a socket. A
-   cancelled task abandons the job (limen_ffi_job_abandon) and the thread
-   frees it when C returns. Blocking functions take no callbacks. */
+   A function declared `blocking fn` runs on the blocking-call pool, as
+   natively, so the interpreter's other tasks go on while C works.
+   limen_ffi_job_start copies the arguments (strings included: the OCaml
+   heap may move meanwhile), queues the job and returns it with the read end
+   of a pipe the pool thread writes to when the call has returned; the task
+   waits on that descriptor as on a socket. A cancelled task abandons the
+   job (limen_ffi_job_abandon): the pool thread frees it when C returns, or
+   at once, without making the call, if it was still in the queue.
+   Blocking functions take no callbacks. */
 typedef struct {
+  limen_pjob hd;
   void *f; int fixed; int var; int kind;
   int64_t iv[NI]; double fv[8]; int64_t slots[NI]; int no;
   void *owned[NI]; int nown;
@@ -301,8 +380,12 @@ static void limen_job_free(limen_job *j) {
   free(j);
 }
 
-static void *limen_job_thread(void *p) {
-  limen_job *j = p;
+static void limen_job_run(limen_pjob *p) {
+  limen_job *j = (limen_job *)p;
+  pthread_mutex_lock(&j->mu);
+  int abandoned = j->state == 2;
+  pthread_mutex_unlock(&j->mu);
+  if (abandoned) { limen_job_free(j); return; }
   int64_t *iv = j->iv;
   double *fv = j->fv;
   void *f = j->f;
@@ -340,7 +423,7 @@ static void *limen_job_thread(void *p) {
   if (j->state == 2) {
     pthread_mutex_unlock(&j->mu);
     limen_job_free(j);
-    return NULL;
+    return;
   }
   /* written before done shows and under the lock: once a cancelled task
      sees done it frees the job (closing the pipe), so the thread must not
@@ -349,12 +432,11 @@ static void *limen_job_thread(void *p) {
   do k = write(j->fds[1], "x", 1); while (k < 0 && errno == EINTR);
   j->state = 1;
   pthread_mutex_unlock(&j->mu);
-  return NULL;
 }
 
 /* limen_ffi_job_start : nativeint -> int -> arg array -> float array -> int -> nativeint * int
    (function, fixed + 256 * variadic, integer words, doubles, result kind)
-   -> (job, descriptor to wait on); a job of 0 if no thread could start. */
+   -> (job, descriptor to wait on); a job of 0 if the pool has no thread. */
 value limen_ffi_job_start(value fn, value flags, value ints, value floats, value kind) {
   CAMLparam5(fn, flags, ints, floats, kind);
   CAMLlocal2(r, jv);
@@ -370,15 +452,10 @@ value limen_ffi_job_start(value fn, value flags, value ints, value floats, value
   for (mlsize_t k = 0; k < nf && k < 8; k++) j->fv[k] = Double_flat_field(floats, k);
   /* out-parameters point at the job's slots, which outlive the call */
   pthread_mutex_init(&j->mu, NULL);
-  pthread_t th;
-  pthread_attr_t at;
+  j->hd.run = limen_job_run;
   int ok = pipe(j->fds) == 0;
   if (ok) {
-    pthread_attr_init(&at);
-    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
-    pthread_attr_setstacksize(&at, (size_t)4 << 20);
-    ok = pthread_create(&th, &at, limen_job_thread, j) == 0;
-    pthread_attr_destroy(&at);
+    ok = limen_pool_submit(&j->hd);
     if (!ok) { close(j->fds[0]); close(j->fds[1]); }
   }
   if (!ok) {
@@ -415,7 +492,8 @@ value limen_ffi_job_finish(value jv) {
 }
 
 /* limen_ffi_job_abandon : nativeint -> unit
-   Its task was cancelled: the thread frees the job once C returns. */
+   Its task was cancelled: the pool thread frees the job once C returns, or
+   without making the call if it has not started it. */
 value limen_ffi_job_abandon(value jv) {
   limen_job *j = (limen_job *)Nativeint_val(jv);
   pthread_mutex_lock(&j->mu);
@@ -867,15 +945,18 @@ value limen_fs_stat(value top, value root, value rel) {
 }
 
 /* ---- SQL statements (the std sql module's limen_sql_run) ----
-   One statement runs on a thread of its own, through w_sql_core
+   One statement runs on the blocking-call pool, through w_sql_core
    (runtime/limen_sql.h, shared with the native runtime), while its task
    waits on the pipe like a socket. The text and parameters are copied, so
    the OCaml heap can move. A cancelled task sets `stop`, which makes the
-   statement give up, and still waits for the thread (limen_sql_finish), so
-   the connection is never used after the task let it go. */
+   statement give up, and still waits for the pool thread (limen_sql_finish),
+   so the connection is never used after the task let it go. A statement
+   always runs, even one stopped while still in the queue: w_sql_core gives
+   up at once and reports it as it does any stopped statement. */
 #include "runtime/limen_sql.h"
 
 typedef struct {
+  limen_pjob hd;
   void *api[W_SQL_NAPI];
   void *db;
   char *text, *params;
@@ -887,15 +968,14 @@ typedef struct {
   pthread_mutex_t mu;
 } limen_sql_job;
 
-static void *limen_sql_thread(void *p) {
-  limen_sql_job *j = p;
+static void limen_sql_job_run(limen_pjob *p) {
+  limen_sql_job *j = (limen_sql_job *)p;
   w_sql_core(j->api, j->db, j->text, j->tlen, j->params, j->plen, j->mode, &j->stop, &j->out);
   pthread_mutex_lock(&j->mu);
   ssize_t k;
   do k = write(j->fds[1], "x", 1); while (k < 0 && errno == EINTR);
   j->state = 1;
   pthread_mutex_unlock(&j->mu);
-  return NULL;
 }
 
 static char *limen_sql_copy(value s) {
@@ -919,7 +999,7 @@ static void limen_sql_free(limen_sql_job *j) {
 /* limen_sql_start : nativeint array -> nativeint -> string -> string -> int -> nativeint * int
    (SQLite's functions in W_SQL_* order, the connection, the text, the
    encoded parameters, the mode) -> (job, descriptor to wait on); a job of 0
-   if no thread could start. */
+   if the pool has no thread. */
 value limen_sql_start(value api, value db, value text, value params, value mode) {
   CAMLparam5(api, db, text, params, mode);
   CAMLlocal2(r, jv);
@@ -931,15 +1011,10 @@ value limen_sql_start(value api, value db, value text, value params, value mode)
   j->params = limen_sql_copy(params); j->plen = (int64_t)caml_string_length(params);
   j->mode = Int_val(mode);
   pthread_mutex_init(&j->mu, NULL);
+  j->hd.run = limen_sql_job_run;
   int ok = pipe(j->fds) == 0;
   if (ok) {
-    pthread_t th;
-    pthread_attr_t at;
-    pthread_attr_init(&at);
-    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
-    pthread_attr_setstacksize(&at, (size_t)4 << 20);
-    ok = pthread_create(&th, &at, limen_sql_thread, j) == 0;
-    pthread_attr_destroy(&at);
+    ok = limen_pool_submit(&j->hd);
     if (!ok) { close(j->fds[0]); close(j->fds[1]); }
   }
   if (!ok) {

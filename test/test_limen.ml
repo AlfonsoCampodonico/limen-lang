@@ -1732,7 +1732,7 @@ fn main(root: Root) {
   out "ffi-callback-group" ~grants:libc qsort_group "[900, 901, 901, 901, 901, 901, 901, 900]\n";
   check_tsan "ffi-callback-group" ~grants:libc qsort_group "[900, 901, 901, 901, 901, 901, 901, 900]\n";
   (* `blocking fn`: the call runs off the task's thread (natively on the
-     blocking-call pool, in the interpreter on a thread of its own), so 40
+     blocking-call pool, in the interpreter on a pool of its own), so 40
      calls sleeping a second in C at once take about a second, and a task
      that only sleeps 20 ms meanwhile is not held up (inline, they would
      take every worker thread, natively, and run one after another in the
@@ -1919,6 +1919,29 @@ fn main(root: Root) {
 |} in
   out "ffi-blocking-cancel" ~grants:vt vt_blocking "[None, None, None, Some(5)]\n5 5 10 slow\n";
   check_tsan "ffi-blocking-cancel" ~grants:vt vt_blocking "[None, None, None, Some(5)]\n5 5 10 slow\n";
+  (* Many blocking calls at once share the blocking-call pool (natively and,
+     since 0.8.1, in the interpreter): no more than 64 are in C at a time,
+     the rest wait in its queue, and 100 calls of 20 ms still take well
+     under the 2 s they would one after another. *)
+  out "ffi-blocking-many" ~grants:vt {|foreign "limentest" {
+    blocking fn vt_sleep_ms(ms: Int) -> Int
+    fn vt_sleepers_peak() -> Int
+}
+
+fn main(root: Root) {
+    let f = root.foreign
+    let clock = root.clock
+    let start = clock.now_ms()
+    let _ = vt_sleepers_peak(f)
+    let r = group g {
+        for i in 0..<100 {
+            g.go(|| vt_sleep_ms(f, 20))
+        }
+    }
+    let peak = vt_sleepers_peak(f)
+    root.stdout.print("{r.len()} {r.sum()} {clock.now_ms() - start < 2000} {peak <= 64}")
+}
+|} "100 2000 true true\n";
   out "ffi-struct-shapes" ~grants:vt
     (vtdecls ^ {|
 fn main(root: Root) {

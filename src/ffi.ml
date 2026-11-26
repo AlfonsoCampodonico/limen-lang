@@ -51,7 +51,8 @@ type param = { name : string; cty : cty; out : bool }
    variadic function, how many parameters come before the `...`.
    [blocking]: declared `blocking fn`: natively the call runs on a thread of
    the blocking-call pool while the calling task waits (cgen.ml, "blocking
-   calls"); the interpreter runs it on a thread of its own. *)
+   calls"); the interpreter runs it on a pool of its own (ffi_stubs.c, "the
+   blocking-call pool"). *)
 type csig = { lib : string; sym : string; params : param list; ret : cty; trusted : bool; fixed : int option; blocking : bool }
 
 (* What the interpreter's call stubs (ffi_stubs.c) can pass, and so the

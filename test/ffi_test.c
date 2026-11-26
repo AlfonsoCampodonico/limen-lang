@@ -62,6 +62,18 @@ void vt_times(void (*f)(int64_t), int64_t n) { for (int64_t i = 1; i <= n; i++) 
 int64_t vt_slow_len(const char *s, int64_t ms) { usleep((useconds_t)(ms * 1000)); return (int64_t)strlen(s); }
 int64_t vt_slow_out(int64_t ms, int64_t *out) { usleep((useconds_t)(ms * 1000)); *out = ms * 2; return ms; }
 const char *vt_slow_name(int64_t ms) { usleep((useconds_t)(ms * 1000)); return "slow"; }
+/* sleeps like vt_slow_len, counting the calls in C at once: the most there
+   have been since the last vt_sleepers_peak, which resets it */
+static int vt_sleepers, vt_sleepers_max;
+int64_t vt_sleep_ms(int64_t ms) {
+  int n = __atomic_add_fetch(&vt_sleepers, 1, __ATOMIC_SEQ_CST);
+  int m = __atomic_load_n(&vt_sleepers_max, __ATOMIC_SEQ_CST);
+  while (n > m && !__atomic_compare_exchange_n(&vt_sleepers_max, &m, n, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {}
+  usleep((useconds_t)(ms * 1000));
+  __atomic_sub_fetch(&vt_sleepers, 1, __ATOMIC_SEQ_CST);
+  return ms;
+}
+int64_t vt_sleepers_peak(void) { return __atomic_exchange_n(&vt_sleepers_max, 0, __ATOMIC_SEQ_CST); }
 
 /* For the sql tests: whether a lock is held on byte `offset` of `path`, as
    another process sees it (a process never sees its own): 1, 0, or -1. */

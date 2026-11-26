@@ -1587,8 +1587,8 @@ module Foreign = struct
         if e.uses = 0 then (Hashtbl.remove handles id; handle e.ptr) else handle 0L
       | _ -> handle 0L)
     | "limen_sql_run", [ VStruct (_, [ (_, VInt db) ]); VStr text; VBytes params; VInt mode ] ->
-      (* one statement on a thread of its own (limen_sql_start); a cancelled
-         task stops it and still waits for it, as natively *)
+      (* one statement on the blocking-call pool (limen_sql_start); a
+         cancelled task stops it and still waits for it, as natively *)
       let job, fd = sql_start (sql_api ()) (Int64.to_nativeint db) text params (Int64.to_int mode) in
       if job = 0n then raise (Panic ("sql: cannot start a thread for a statement", sp));
       let s = { fd = (Obj.magic fd : Unix.file_descr); shut = false; reading = false; writing = false; tls = Tls.Plain } in
