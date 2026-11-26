@@ -177,8 +177,11 @@ storing, returning, capturing or sending a `mut` parameter takes a copy. Not
 yet: `mut` parameters in interface methods, foreign functions and function
 types (SPEC.md section 20).
 
-The self-hosted compiler is being rewritten to thread its state through `mut`
-parameters, the proof that they are enough.
+The self-hosted compiler threads its state through `mut` parameters, the
+proof that they are enough: in the checker, the lowering, renaming,
+expression numbering, ownership and C generation, the statements that took a
+changed state back out of a tuple, `let (x, st) = f(st, ...)`, went from 738
+to 62.
 
 ## 0.9: installing and sharing
 
