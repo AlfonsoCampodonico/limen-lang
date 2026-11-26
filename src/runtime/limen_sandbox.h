@@ -1095,11 +1095,6 @@ static int w_fs_rename(const char *top, const char *root, const char *from, size
   return rc == 0 ? 0 : -1;
 }
 
-static void w_fs_is_link(WFsErr *e, const char *rel, size_t len) {
-  e->kind = 2;
-  snprintf(e->msg, sizeof e->msg, "fs: `%.*s` is a symbolic link", (int)len, rel);
-}
-
 /* Copy `from` (following links) to `to`: the bytes, 64 KB at a time, and
    the permission bits, the executable ones with them. The copy is written
    under a temporary name beside `to` and renamed over it, so a copy that
@@ -1145,24 +1140,26 @@ static int w_fs_copy(const char *top, const char *root, const char *from, size_t
   return 0;
 }
 
-/* The entry `rel` names, open without following a final link (walked as
-   remove walks it), for changing its times or mode through the descriptor;
-   with `create`, an empty file is made when nothing is there. -1 with e
-   set; a final link is refused. */
+/* The file `rel` names, open for changing its times or mode through the
+   descriptor: walked as write walks it, so a final link inside the root is
+   followed and one leading out is refused; with `create`, an empty file is
+   made when nothing is there. -1 with e set. */
 static int w_fs_open_entry(const char *top, const char *root, const char *rel, size_t len, int create, WFsErr *e) {
-  WFsAt at;
-  if (w_fs_entry(top, root, rel, len, W_FS_FOLLOW | (create ? W_FS_CREATE : W_FS_EXIST), &at, e) != 0) return -1;
-  int base = O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC | O_NOCTTY;
-  int fd = openat(at.dfd, at.name, O_RDONLY | base);
-  if (fd < 0 && errno == EACCES) fd = openat(at.dfd, at.name, O_WRONLY | base);
-  if (fd < 0 && errno == ENOENT && create) fd = openat(at.dfd, at.name, O_WRONLY | O_CREAT | base, 0666);
-  int err = errno;
-  w_fs_at_free(&at);
-  if (fd >= 0) return fd;
-  if (err == ELOOP) w_fs_is_link(e, rel, len);
-  else if (err == ENOENT) w_fs_missing(e, 0, rel, len);
-  else w_fs_sys(e, rel, len, err);
-  return -1;
+  for (int tries = 0;; tries++) {
+    WFsAt at;
+    if (w_fs_at(top, root, rel, len, W_FS_FOLLOW | (create ? W_FS_CREATE : W_FS_EXIST), &at, e) != 0) return -1;
+    int base = O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC | O_NOCTTY;
+    int fd = openat(at.dfd, at.name, O_RDONLY | base);
+    if (fd < 0 && errno == EACCES) fd = openat(at.dfd, at.name, O_WRONLY | base);
+    if (fd < 0 && errno == ENOENT && create) fd = openat(at.dfd, at.name, O_WRONLY | O_CREAT | base, 0666);
+    int err = errno;
+    w_fs_at_free(&at);
+    if (fd >= 0) return fd;
+    if (err == ELOOP && tries < 8) continue; /* became a link: walk again */
+    if (err == ENOENT) w_fs_missing(e, 0, rel, len);
+    else w_fs_sys(e, rel, len, err);
+    return -1;
+  }
 }
 
 /* Set the modified (and accessed) time to now, making an empty file when

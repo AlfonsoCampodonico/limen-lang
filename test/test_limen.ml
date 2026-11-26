@@ -2339,19 +2339,34 @@ fn main(root: Root) {
   let touch_dir = fresh_dir "fstouch" in
   Unix.mkdir (Filename.concat touch_dir "sub") 0o755;
   put (Filename.concat touch_dir "old.txt") "old";
+  put (Filename.concat touch_dir "t.txt") "t";
+  Unix.symlink "t.txt" (Filename.concat touch_dir "tl");
+  Unix.mkdir (Filename.concat touch_dir "in") 0o755;
+  put (Filename.concat touch_dir "far.txt") "far";
+  Unix.utimes (Filename.concat touch_dir "far.txt") 1e9 1e9;
+  Unix.symlink "../far.txt" (Filename.concat touch_dir "in/out");
   out "fs-touch" ~grants:{ Interp.no_grants with fs = Some (touch_dir, false) }
     (main_wrap
        {v|    let fs = root.fs
     let _ = fs.remove("new.txt")
     out.print("{fs.touch("new.txt")} {fs.read("new.txt")} {fs.info("new.txt").map(|i| i.is_file)}")
-    let before = fs.info("old.txt").map(|i| i.modified_ms) ?? 0
+    let mtime = |p: Str| fs.info(p).map(|i| i.modified_ms) ?? 0
+    let before = mtime("old.txt")
+    let before_t = mtime("t.txt")
     root.clock.sleep(30)
     let t = fs.touch("old.txt")
-    let after = fs.info("old.txt").map(|i| i.modified_ms) ?? 0
-    out.print("{t} {after > before} {fs.read("old.txt")} {fs.touch("sub")}")
+    let tl = fs.touch("tl")
+    out.print("{t} {mtime("old.txt") > before} {fs.read("old.txt")} {fs.touch("sub")}")
+    out.print("{tl} {mtime("t.txt") > before_t} {fs.read_link("tl")}")
+    out.print("{fs.under("in").touch("out")} {mtime("far.txt")}")
     out.print("{fs.touch("../x")} {fs.touch("nodir/x")} {fs.touch("")}")|v})
-    "Ok(()) Ok(\"\") Ok(true)\nOk(()) true Ok(\"old\") Ok(())\nErr(Denied(\"fs: path escapes the granted directory\")) Err(Failed(\"fs: directory of `nodir/x` does not exist\")) Ok(())\n";
+    "Ok(()) Ok(\"\") Ok(true)\nOk(()) true Ok(\"old\") Ok(())\nOk(()) true Ok(\"t.txt\")\nErr(Denied(\"fs: path resolves outside the granted directory\")) 1000000000000\nErr(Denied(\"fs: path escapes the granted directory\")) Err(Failed(\"fs: directory of `nodir/x` does not exist\")) Ok(())\n";
   let exec_dir = fresh_dir "fsexec" in
+  Unix.symlink "s.sh" (Filename.concat exec_dir "sl");
+  Unix.mkdir (Filename.concat exec_dir "in") 0o755;
+  put (Filename.concat exec_dir "far.sh") "far";
+  Unix.chmod (Filename.concat exec_dir "far.sh") 0o644;
+  Unix.symlink "../far.sh" (Filename.concat exec_dir "in/out");
   out "fs-set-executable" ~grants:{ Interp.no_grants with fs = Some (exec_dir, false); exec = [ "ls" ] }
     (runs_fn
      ^ {v|fn main(root: Root) {
@@ -2361,10 +2376,12 @@ fn main(root: Root) {
     let _ = fs.write("s.sh", "echo hi")
     out.print("{runs(fs, ex, "s.sh")} {fs.set_executable("s.sh", true)} {runs(fs, ex, "s.sh")}")
     out.print("{fs.set_executable("s.sh", false)} {runs(fs, ex, "s.sh")} {fs.read("s.sh")}")
+    out.print("{fs.set_executable("sl", true)} {runs(fs, ex, "s.sh")} {fs.set_executable("sl", false)} {runs(fs, ex, "s.sh")} {fs.read_link("sl")}")
+    out.print("{fs.under("in").set_executable("out", true)} {runs(fs, ex, "far.sh")}")
     out.print("{fs.set_executable("nope", true)} {fs.set_executable("../s.sh", true)}")
 }
 |v})
-    "--- Ok(()) xxx\nOk(()) --- Ok(\"echo hi\")\nErr(Failed(\"fs: `nope` does not exist\")) Err(Denied(\"fs: path escapes the granted directory\"))\n";
+    "--- Ok(()) xxx\nOk(()) --- Ok(\"echo hi\")\nOk(()) xxx Ok(()) --- Ok(\"s.sh\")\nErr(Denied(\"fs: path resolves outside the granted directory\")) ---\nErr(Failed(\"fs: `nope` does not exist\")) Err(Denied(\"fs: path escapes the granted directory\"))\n";
   let rl_dir = fresh_dir "fsreadlink" in
   Unix.mkdir (Filename.concat rl_dir "sub") 0o755;
   put (Filename.concat rl_dir "a.txt") "alpha";
