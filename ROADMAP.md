@@ -117,7 +117,15 @@ happens here.
   return nothing and a channel (documented).
 - One definition of each built-in. Each is written twice, in the
   interpreter and the C runtime, and only the tests keep them in step: the
-  NUL-path difference came from this.
+  NUL-path difference came from this (done: the built-ins whose answer
+  depends on bytes, Unicode, parsing, float formatting, scalar order, random
+  numbers or a panic message are written once, in `src/runtime/limen_core.h`,
+  and called by both backends; the rest are checked against each other on
+  every test run by generated programs, `LIMEN_CROSSCHECK_SEED` for more
+  inputs. Behaviour changes for the release notes: natively `"\r".lines()` is
+  `[]` and `"a\n\r".lines()` is `["a"]`, as SPEC.md says; in the interpreter
+  `UInt64.to_float()` rounds once, so 2^63 + 1025 gives
+  9223372036854777856).
 - Bound authority through bounds of bounds, not just an interface's own
   methods (done: the `dyn` interfaces a bound's methods take or return are
   followed to any depth, outermost first, each interface entered once
