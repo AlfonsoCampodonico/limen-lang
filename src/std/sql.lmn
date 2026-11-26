@@ -38,6 +38,7 @@ foreign "sqlite3" {
     fn sqlite3_errstr(rc: Int32) -> Str
     fn sqlite3_limit(db: Handle, id: Int32, value: Int32) -> Int32
     fn sqlite3_busy_timeout(db: Handle, ms: Int32) -> Int32
+    fn sqlite3_file_control(db: Handle, name: Str, op: Int32, arg: Bytes) -> Int32
     blocking fn sqlite3_exec(db: Handle, sql: Str, callback: Int, arg: Int, err: Out[Handle]) -> Int32
     fn sqlite3_changes64(db: Handle) -> Int
     fn sqlite3_last_insert_rowid(db: Handle) -> Int
@@ -131,6 +132,11 @@ fn ready(rc: Int, h: Handle, shown: Str) -> Result[Db, IoError] {
     // (SQLITE_LIMIT_ATTACHED is 7; VACUUM INTO attaches too)
     sqlite3_limit(h, 7, 0)
     sqlite3_busy_timeout(h, 5000)
+    // the last close keeps the -wal and -shm files on every platform (macOS's
+    // SQLite always did), so a read-only connection can still open the
+    // database: SQLITE_FCNTL_PERSIST_WAL is 10, and the argument 1 turns it on
+    // (a 32-bit int, little-endian on every platform the runtime supports)
+    sqlite3_file_control(h, "main", 10, bytes([1, 0, 0, 0]))
     // no temporary files outside the grant: temp tables and sorts stay in memory
     sqlite3_exec(h, "PRAGMA temp_store = MEMORY", 0, 0)
     Ok(Db { id: limen_handle_new(h) })
