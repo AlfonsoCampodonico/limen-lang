@@ -6,7 +6,7 @@
 
 **Architecture:** The self-hosted compiler's C (`limen build selfhost/limen.lmn --emit-c`) is compiled with clang for `wasm32-wasip1` under a new `LIMEN_WASM` mode of the C runtime (one thread, no fibers, no OS services beyond WASI). A new `eval` command of the self-hosted compiler runs a program by interpreting its IR after the same passes C generation runs. One JavaScript WASI shim (`dev/wasm/wasi.mjs`) runs that `.wasm` in node (tests) and in a browser Web Worker (the page), where stdin blocks on `Atomics.wait`.
 
-**Tech Stack:** Limen (selfhost), C (runtime), clang + wasi-libc (Homebrew `llvm`, `wasi-libc`, `wasi-runtimes`) or wasi-sdk, node 22+ for tests, plain JavaScript ES modules in the page (no framework, no bundler).
+**Tech Stack:** Limen (selfhost), C (runtime), clang + wasi-libc (Homebrew `llvm`, `wasi-libc`, `wasi-runtimes`) or wasi-sdk, node 22+ for tests, plain JavaScript ES modules in the page (no framework, no bundler); Pierre's `@pierre/diffs` with Shiki for the editor's highlighting and the diagnostics view, vendored into limen-book (Task 7).
 
 **Spec:** `docs/superpowers/specs/2026-11-26-playground-design.md`
 
@@ -143,10 +143,20 @@ Standard library modules written in Limen need nothing here: they are ordinary I
 ### Task 7: The playground page and its workers (limen-book)
 
 **Files:**
-- Create: `tools/play.html` (page, in the book's layout and tokens), `tools/play.css`, `tools/play.js` (editor, panes, share, examples), `tools/play-worker.js` (one compiler instance per worker; protocol below), `tools/highlight.js` (a port of `highlight_limen` from `tools/make_book.py:222`)
-- Modify: `tools/make_book.py` (writes `dist/play/index.html`, `play.css`, `play.js`, `play-worker.js`, `highlight.js`, `examples.json`; copies `wasi.mjs` and `limen.wasm.gz` from `$LIMEN_WASM_DIR`, default `$LIMEN_REPO/_build/wasm`, gzipping the `.wasm`)
+- Create: `tools/play.html` (page, in the book's layout and tokens), `tools/play.css`, `tools/play.js` (editor, panes, share, examples), `tools/play-worker.js` (one compiler instance per worker; protocol below), `tools/play-highlight.js` (Pierre and Shiki set up for Limen: the grammar, the theme, the diagnostics as line annotations)
+- Create: `tools/vendor.sh` (fetches pinned versions of `@pierre/diffs`, `shiki` and the packages they import from the npm registry, checks each tarball against a SHA-256 recorded in the script, and writes them as ES modules to `tools/vendor/`, with each package's licence), and `tools/vendor/` (the result, committed)
+- Modify: `tools/make_book.py` (writes `dist/play/index.html`, `play.css`, `play.js`, `play-worker.js`, `play-highlight.js`, `examples.json`, `vendor/` (the vendored modules) and `limen.tmLanguage.json` (copied from `$LIMEN_REPO/editors/vscode/syntaxes/`); copies `wasi.mjs` and `limen.wasm.gz` from `$LIMEN_WASM_DIR`, default `$LIMEN_REPO/_build/wasm`, gzipping the `.wasm`)
 - Modify: `Makefile` (`play` target: `sh $(LIMEN_REPO)/dev/wasm/build.sh`, then the book; `book` depends on it)
-- Test: `tools/play.test.mjs` (`node --test`, the worker protocol against the real `.wasm`)
+- Test: `tools/play.test.mjs` (`node --test`, the worker protocol against the real `.wasm`), `tools/play-highlight.test.mjs` (`node --test`, the highlighting in node against the vendored modules)
+
+Highlighting, decided by the user on 2026-11-27: Pierre (`@pierre/diffs`) renders the code with Shiki, both vendored, nothing loaded from a CDN (COEP `require-corp` would refuse it, and the page must work with only the book's server).
+- Vendored, not bundled: `tools/vendor/` holds the packages' own ES module files, loaded through an import map in `play.html`, so the page stays plain modules with no build step beyond `tools/vendor.sh`. Pinned exact versions, recorded with their hashes in `vendor.sh`; upgrading is rerunning it with new pins.
+- Shiki with its JavaScript regular-expression engine (`createJavaScriptRegexEngine`), not the Oniguruma `.wasm`: one `.wasm` per page is enough. If the Limen grammar needs a feature that engine lacks, vendor the Oniguruma engine instead and record why in `vendor.sh`.
+- Only the Limen grammar (`editors/vscode/syntaxes/limen.tmLanguage.json`, the one the VS Code extension uses) and one theme are loaded, no bundled language or theme sets. The theme is a Shiki `css-variables` theme whose colours are the book's tokens, so light and dark follow the book's theme switch.
+- Pierre renders, a transparent `textarea` over it edits: the textarea holds the text and the caret, the rendered layer under it is redrawn on input (debounced to one frame), with the same font, size, line height, padding and tab width, so the two never drift. Scrolling is the textarea's, mirrored onto the layer.
+- Diagnostics from `check --json` show as Pierre line annotations under their lines (error or warning, the message, the fix if any), and the full list under the editor as before.
+- The book's own pages keep `highlight_limen` (`tools/make_book.py:222`). The two highlighters can colour a token differently; `play-highlight.test.mjs` highlights every book example with Shiki and fails if a keyword, string, comment or number token `highlight_limen` marks is left unmarked, so the grammar and the book stay in step. Switching the book to Shiki is not part of this plan.
+- Size: record the gzipped size of `tools/vendor/` and of the page's first load (without the `.wasm`) in the commit message; it loads after the editor is usable as a plain textarea, so a slow load shows plain text first, never an empty page.
 
 **Interfaces:**
 - Consumes: `dev/wasm/wasi.mjs` `createWasi`; the compiler's `check --json`, `caps --json`, `eval`.
@@ -161,10 +171,10 @@ Behaviour pinned:
 - Examples: `examples.json` is `[{ "name": "ch02-03-game", "title": "...", "code": "..." }]`, the book examples that Task 4's corpus marks as runnable (make_book.py runs `eval` through `dev/wasm/run.mjs`, or reads a list the limen repo's check writes; builder's call, one source of truth).
 - The header shows the version (`?v=` on the wasm URL is the same version).
 
-- [ ] **Step 1:** Write `play.test.mjs` driving `play-worker.js` in a node `worker_threads` Worker: check of a broken program returns its diagnostics JSON; eval of `ch01-01-hello` streams `Hello, world!`; eval of the guessing game with stdin lines fed through the buffer matches `examples/ch02-03-game/expected.txt`'s run part; end of input on `read_line` gives `None`; an endless loop is stopped by the 10 s limit while a program blocked 15 s on stdin is not; printing forever is stopped at 1 MiB; output containing `é`, CJK and an emoji is exact; the Fs example from chapter 14 gets the refusal.
+- [ ] **Step 1:** Write `play-highlight.test.mjs` (the book examples' tokens, as above, and a diagnostic rendered as an annotation on its line) and `play.test.mjs` driving `play-worker.js` in a node `worker_threads` Worker: check of a broken program returns its diagnostics JSON; eval of `ch01-01-hello` streams `Hello, world!`; eval of the guessing game with stdin lines fed through the buffer matches `examples/ch02-03-game/expected.txt`'s run part; end of input on `read_line` gives `None`; an endless loop is stopped by the 10 s limit while a program blocked 15 s on stdin is not; printing forever is stopped at 1 MiB; output containing `é`, CJK and an emoji is exact; the Fs example from chapter 14 gets the refusal.
 - [ ] **Step 2:** Run `node --test tools/`. Expected: fails (no worker).
-- [ ] **Step 3:** Implement the worker, page, highlighting and `make_book.py` changes.
-- [ ] **Step 4:** Run `node --test tools/` and `make book`. Expected: pass; `dist/play/` holds the page, scripts, `examples.json`, `wasi.mjs`, `limen.wasm.gz`.
+- [ ] **Step 3:** Run `sh tools/vendor.sh`; implement the worker, page, the Pierre and Shiki highlighting and the `make_book.py` changes.
+- [ ] **Step 4:** Run `node --test tools/` and `make book`. Expected: pass; `dist/play/` holds the page, scripts, `vendor/`, `limen.tmLanguage.json`, `examples.json`, `wasi.mjs`, `limen.wasm.gz`.
 - [ ] **Step 5:** Commit `play: the playground page` in limen-book (with `dist/`).
 
 ### Task 8: Serving `/play` (limen-book)
@@ -177,7 +187,7 @@ Behaviour pinned:
 **Interfaces:**
 - Consumes: `dist/play/*` from Task 7.
 
-Routing on the book host: `/play` and `/play/` serve `play/index.html`; `/play/limen.wasm` serves the embedded `play/limen.wasm.gz` with `Content-Type: application/wasm` and `Content-Encoding: gzip`; `.mjs` is `text/javascript; charset=utf-8`. Every response under `/play` also carries `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Embedder-Policy: require-corp`, `Cross-Origin-Resource-Policy: same-origin`; no other path does. The page and the shared assets it loads from outside `/play` (`tokens.css`, `book.css`, `fonts/`) carry `Cross-Origin-Resource-Policy: same-origin` too, so COEP accepts them. `limen-lang.org/play` reaches it through the landing host's existing redirect.
+Routing on the book host: `/play` and `/play/` serve `play/index.html`; `/play/limen.wasm` serves the embedded `play/limen.wasm.gz` with `Content-Type: application/wasm` and `Content-Encoding: gzip`; `.mjs` and the vendored `.js` are `text/javascript; charset=utf-8`, `.json` is `application/json`; `/play/vendor/` serves the vendored modules from `dist/play/vendor/`. Every response under `/play` also carries `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Embedder-Policy: require-corp`, `Cross-Origin-Resource-Policy: same-origin`; no other path does. The page and the shared assets it loads from outside `/play` (`tokens.css`, `book.css`, `fonts/`) carry `Cross-Origin-Resource-Policy: same-origin` too, so COEP accepts them. `limen-lang.org/play` reaches it through the landing host's existing redirect.
 
 - [ ] **Step 1:** Add server tests: `/play` is 200 with the three headers; `/play/limen.wasm` has the wasm type and gzip encoding and its body is the embedded bytes; `/ch01-getting-started.html` has no COOP/COEP; `limen-lang.org/play` is a 301 to `book.limen-lang.org/play`; the ETag/304 path still works for the wasm.
 - [ ] **Step 2:** Run `make test`. Expected: the new tests fail.

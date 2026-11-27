@@ -221,9 +221,11 @@ Three parts, each usable on its own.
   grant it, linking to the book's chapter on capabilities.
 - Examples: a dropdown of book programs that run in the playground.
 - Share: the code compressed into the URL fragment.
-- The editor: a plain textarea with the book's highlighting, or CodeMirror
-  if the highlighting cannot be kept in step otherwise; builder's call,
-  smallest that works.
+- The editor: a textarea over code rendered by Pierre (`@pierre/diffs`)
+  with Shiki and the Limen TextMate grammar the VS Code extension uses,
+  both vendored into limen-book and served by the book's own server
+  (decided by the user on 2026-11-27; the plan's Task 7 has the details).
+  The book's pages keep their own highlighting.
 
 ## Left to the builder
 
