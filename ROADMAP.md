@@ -195,6 +195,27 @@ back out of a tuple, `let (x, st) = f(st, ...)`, went from 738 to 62 across
 the checker, the lowering, renaming, numbering, ownership, C generation and
 the loader. The parser and lexer keep threading their state by design.
 
+## Kubernetes without a proxy (not started)
+
+`examples/site_operator.lmn` is a working operator, but it reaches the API
+server through `kubectl proxy`, which holds the credentials. An operator
+should run in a pod with a grant for the API server and nothing else, and
+`limen caps` should show that it can reach nothing more.
+
+- A `yaml` module, reading and writing the YAML that manifests are written
+  in, with `yaml.encode` and `yaml.decode` written by the compiler as
+  `json`'s are.
+- In-cluster authentication: the pod's service-account token and CA
+  certificate, and the kubeconfig outside a cluster, read through a granted
+  `Fs`; TLS with a custom CA and client certificates.
+- Typed Kubernetes objects (Deployment, Service, ConfigMap and the rest) as
+  a package, generated from the API's OpenAPI description, so manifests are
+  checked instead of built as JSON by hand.
+- gRPC and protobuf, for the APIs that speak them.
+
+Done when `site_operator.lmn` runs as a Deployment, with one grant for the
+API server, and no proxy.
+
 ## 0.9: installing and sharing
 
 - The outside security review of the sandbox and the capability checks,
@@ -236,6 +257,10 @@ book and SPEC.md describe 1.0 exactly.
 - Windows. Fibers, the poller and the sandbox are macOS and Linux only.
 - Cross-compilation and a WebAssembly target.
 - MySQL.
+- Lower-level code: integer types of a fixed size (`Int8` to `Int64`
+  beside the `UInt` types) outside C calls, and byte buffers that change in
+  place. Limen stays a reference-counted language without raw pointers:
+  calling C, under the `Foreign` capability, stays the way to go lower.
 
 ## Known and not planned
 
