@@ -22,6 +22,8 @@ use cgen
 use derive
 use diag
 use disk
+use eval
+use eval_value
 use ffi
 use loader
 use lower
@@ -41,6 +43,7 @@ usage:
   limen build FILE [-o OUT] [--dev] [--emit-c]
   limen check FILE [--json]
   limen caps FILE [--json]
+  limen eval FILE [-- ARGS...]  (run FILE by interpreting it, as the playground does; this compiler only)
   limen explain CODE
   limen test FILE [--native] [--run TEXT] [--bench] [--bench-time 1s|100x] [--json]
   limen fmt FILE... [--write | --check]
@@ -101,6 +104,8 @@ fn main(root: Root) -> Int {
         ["caps", file] => caps_of(cx, file),
         ["check", file, "--json"] | ["check", "--json", file] => check_json(cx, file),
         ["caps", file, "--json"] | ["caps", "--json", file] => caps_json(cx, file),
+        ["eval", file] => eval_cmd(cx, root, file, []),
+        ["eval", file, "--", ..xs] => eval_cmd(cx, root, file, xs),
         ["build", ..rest] => {
             let mut file: Option[Str] = None
             let mut target: Option[Str] = None
@@ -482,6 +487,52 @@ fn build(cx: Ctx, exec: Exec, env: Env, file: Str, target: Option[Str], dev: Boo
             1
         },
     }
+}
+
+// `eval`: check the program as `check` does (its errors, and the
+// warnings with them, end it with status 1, as `build` would), then run
+// it by interpreting its IR (selfhost/eval.lmn) after the passes C
+// generation runs, with Line marks for the places it reports. What the
+// evaluator cannot run exactly it refuses, with status 2, before
+// anything runs. Its stdout, stderr and status are the program's own.
+fn eval_cmd(cx: Ctx, root: Root, file: Str, args: List[Str]) -> Int {
+    let f = match load_with(cx.err, cx.fs, cx.place, file, true) {
+        Ok(f) => f,
+        Err(code) => {
+            return code
+        },
+    }
+    if !f.errors.is_empty() {
+        for d in f.warnings {
+            cx.err.write(d.render(f.files) + "\n")
+        }
+        report(cx.err, f)
+        return 1
+    }
+    let c = match f.checked {
+        Some(c) => c,
+        None => {
+            return 1
+        },
+    }
+    let has_main = f.loaded.items.any(|i| match i {
+        IFn(d) => d.name == "main",
+        _ => false,
+    })
+    if !has_main {
+        cx.err.print("error: no `main` function")
+        return 1
+    }
+    let (prog, ro) = lower.lower_program(c.prelude, c.items, c.cx, c.state, false, true, false)
+    let prog = own.program(pure.cse(prog))
+    match eval.refusal(prog, f.files) {
+        Some(m) => {
+            cx.err.print(m)
+            return 2
+        },
+        None => {},
+    }
+    eval.run(prog, ro, f.files, eval_value.Io { out: cx.out, err: cx.err, input: root.stdin, clock: root.clock, rand: root.rand, args })
 }
 
 // The program's C, as Native.c_source makes it: lowered (as the test

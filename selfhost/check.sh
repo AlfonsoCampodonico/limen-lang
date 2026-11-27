@@ -226,6 +226,32 @@ compare_tests() {
   same "$1/$2"
 }
 
+# compare_eval DIR FILE: the program run natively (built by the OCaml
+# compiler) and by `eval`, both with --seed $eval_seed (1 unless set),
+# FILE.in beside it (or $eval_input) on stdin and FILE.args (if any)
+# after `--`: same stdout, same stderr, same exit status. With
+# FILE.expected beside it, `eval`'s stderr and status are compared with
+# that instead (a refusal, or the playground's own limit). `eval` is
+# granted what the loaders are (the program's package may reach outside
+# DIR) and works in DIR.
+compare_eval() {
+  base=${2%.lmn}
+  input=${eval_input:-/dev/null}
+  [ -f "$1/$base.in" ] && input="$1/$base.in"
+  args=
+  [ -f "$1/$base.args" ] && args=$(cat "$1/$base.args")
+  (cd "$1" && PWD=$(pwd) "$out/tsc" --seed "${eval_seed:-1}" --grant "fs=$grant:ro" --grant env=PWD -- eval "$2" -- $args) < "$input" > "$out/got" 2> "$out/got.err" && echo "exit 0" >> "$out/got.err" || echo "exit $?" >> "$out/got.err"
+  if [ -f "$1/$base.expected" ]; then
+    cp "$1/$base.expected" "$out/want.err"
+    : > "$out/want"
+  else
+    rm -f "$out/ew"
+    (cd "$1" && "$limen_abs" build "$2" -o "$out/ew") > "$out/want" 2> "$out/want.err"
+    (cd "$1" && "$out/ew" --seed "${eval_seed:-1}" -- $args) < "$input" > "$out/want" 2> "$out/want.err" && echo "exit 0" >> "$out/want.err" || echo "exit $?" >> "$out/want.err"
+  fi
+  same "$1/$2 (eval)"
+}
+
 # same FILE: the outputs compared, and the compilers' stderr where a
 # comparison keeps it apart (both compilers write their diagnostics there);
 # then it is cleared for the next comparison
@@ -280,6 +306,7 @@ check "examples compile to the same development C" compare_dev_c -- $(ls example
 check "edge cases compile to the same profiled C" compare_profile_c -- $c_cases
 with_tests=$(grep -l '^test \|^bench ' $programs $c_cases)
 check "test binaries compile to the same C" compare_test_c -- $with_tests
+check "programs run the same through eval" compare_eval -- $(ls selfhost/tests/eval/*.lmn)
 if [ -d "$book" ]; then
   examples=$(find "$book" -name '*.lmn' | sort)
   check "book examples parse the same" compare "$astdump" parse -- $examples

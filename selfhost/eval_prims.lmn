@@ -1,0 +1,226 @@
+// The built-in methods for `limen eval` (selfhost/eval.lmn): one case per
+// `Prim` name that selfhost/cgen.lmn's `prim` turns into C, dispatched the
+// same way, on the name and the receiver's type. Each runs the
+// evaluator's own Limen operation on the same value (`s.split(t)` on the
+// Str, `rand.int(lo, hi)` on the Rand), so results, the printing of floats
+// and the messages of panics come from the same runtime code as natively.
+// A panic is `Err(message)`; eval.lmn adds where it happened.
+//
+// The ones not here are eval.lmn's (the map lookups that panic with the
+// key printed, Atomic, Shared and `keep`) or reach a capability or task
+// construct eval refuses before running (eval.refusal): `handled` lists
+// both, so selfhost/check.sh finds a Prim that cgen has and eval lacks.
+use eval_value
+use types
+
+// The prims eval.lmn implements itself.
+pub fn in_eval() -> List[Str] {
+    ["map_at", "atomic_new", "atomic_get", "atomic_set", "atomic_add", "atomic_swap", "atomic_compare_and_set", "shared_new", "shared_get", "shared_set", "shared_update", "keep"]
+}
+
+// The prims that only a refused program reaches: channels, and the
+// capabilities the playground does not grant.
+pub fn refused() -> List[Str] {
+    ["chan_recv", "chan_close", "cap_append", "cap_list", "cap_remove", "cap_make_dir", "cap_is_dir", "cap_rename", "cap_info", "cap_only", "cap_only_args", "cap_allows", "cap_copy", "cap_run", "cap_get", "cap_under", "cap_read_only", "cap_read", "cap_read_at", "cap_start_tls", "cap_read_within", "cap_write_within", "cap_on", "cap_accept", "cap_connect", "cap_connect_tls", "cap_on_tls", "cap_port", "cap_close", "cap_exists", "cap_full_path", "cap_is_read_only", "cap_revocable", "cap_revoke", "cap_is_revoked"]
+}
+
+// The prims `call` runs.
+pub fn here() -> List[Str] {
+    ["list_len", "array_len", "array_get", "array_contains", "array_to_list", "map_new", "map_from", "map_get", "map_contains", "map_len", "map_is_empty", "map_keys", "map_values", "map_entries", "str_len", "list_is_empty", "str_is_empty", "list_get", "list_first", "list_last", "list_contains", "list_reverse", "list_sort", "list_slice", "list_take", "list_skip", "list_join", "list_sum", "str_lines", "str_split", "str_trim", "str_contains", "str_starts_with", "str_ends_with", "str_to_upper", "str_to_lower", "str_replace", "str_parse_int", "str_parse_float", "str_slice", "str_index_of", "str_last_index_of", "str_bytes", "str_chars", "str_to_bytes", "bytes_to_str", "bytes_new", "bytes_at", "bytes_len", "bytes_is_empty", "bytes_get", "bytes_slice", "bytes_to_list", "int_range", "int_to_char", "int_min", "int_max", "int_to_str", "float_to_str", "bool_to_str", "int_to_float", "int_abs", "int_shift_right_unsigned", "int_to_uint8", "uint_to_uint8", "int_to_uint16", "uint_to_uint16", "int_to_uint32", "uint_to_uint32", "int_to_uint64", "uint_to_uint64", "uint_to_int", "uint_to_str", "uint_to_float", "uint_min", "uint_max", "uint_rotate_left", "uint_rotate_right", "float_to_int", "float_abs", "float_sqrt", "float_to_fixed", "cap_print", "cap_write", "cap_now_ms", "cap_sleep", "cap_int", "cap_float", "cap_bytes", "cap_args", "cap_read_line", "cap_read_all"]
+}
+
+// Every prim name eval knows, run or refused.
+pub fn handled() -> List[Str] {
+    here() + in_eval() + refused()
+}
+
+// UInt8 to UInt64 shown as the native UInt_show does: unsigned decimal.
+pub fn uint_text(n: Int, bits: Int) -> Str {
+    if bits >= 64 && n < 0 { "{eval_value.u64(n)}" } else { "{n}" }
+}
+
+fn bits_of(t: types.Ty) -> Int {
+    match t {
+        TUInt(n) => n,
+        _ => 64,
+    }
+}
+
+// `x.rotate_left(k)` or `rotate_right` on an n-bit unsigned value.
+fn rotate(x: Int, k: Int, bits: Int, left: Bool) -> Int {
+    match bits {
+        8 => if left { x.to_uint8().rotate_left(k).to_int() } else { x.to_uint8().rotate_right(k).to_int() },
+        16 => if left { x.to_uint16().rotate_left(k).to_int() } else { x.to_uint16().rotate_right(k).to_int() },
+        32 => if left { x.to_uint32().rotate_left(k).to_int() } else { x.to_uint32().rotate_right(k).to_int() },
+        _ => if left { x.to_uint64().rotate_left(k).to_int() } else { x.to_uint64().rotate_right(k).to_int() },
+    }
+}
+
+fn slice_list(xs: List[eval_value.Value], from: Int, to: Int) -> List[eval_value.Value] {
+    let lo = from.max(0)
+    let hi = to.min(xs.len()).max(lo)
+    let mut out: List[eval_value.Value] = []
+    let mut i = lo
+    while i < hi {
+        out.push(xs[i])
+        i = i + 1
+    }
+    out
+}
+
+// The built-in `name` on receiver type `rt`, with its arguments (the
+// receiver first).
+pub fn call(name: Str, rt: types.Ty, args: List[eval_value.Value], io: eval_value.Io) -> Result[eval_value.Value, Str] {
+    let a = |i: Int| args[i]
+    match name {
+        "list_len" | "array_len" => Ok(VInt(eval_value.list_of(a(0)).len())),
+        "array_get" | "list_get" => Ok(eval_value.opt(eval_value.list_of(a(0)).get(eval_value.int_of(a(1))))),
+        "array_contains" | "list_contains" => {
+            let x = a(1)
+            Ok(VBool(eval_value.list_of(a(0)).any(|y| eval_value.eq(y, x))))
+        },
+        "array_to_list" => Ok(a(0)),
+        "map_new" => {
+            let m: Map[Str, (eval_value.Value, eval_value.Value)] = map()
+            Ok(VMap(m))
+        },
+        "map_from" => {
+            let mut m: Map[Str, (eval_value.Value, eval_value.Value)] = map()
+            for e in eval_value.list_of(a(0)) {
+                match e {
+                    VRec([k, v]) => {
+                        m[eval_value.key(k)] = (k, v)
+                    },
+                    _ => panic("eval: map_from"),
+                }
+            }
+            Ok(VMap(m))
+        },
+        "map_get" => Ok(eval_value.opt(eval_value.map_of(a(0)).get(eval_value.key(a(1))).map(|e| e.1))),
+        "map_contains" => Ok(VBool(eval_value.map_of(a(0)).contains(eval_value.key(a(1))))),
+        "map_len" => Ok(VInt(eval_value.map_of(a(0)).len())),
+        "map_is_empty" => Ok(VBool(eval_value.map_of(a(0)).is_empty())),
+        "map_keys" => Ok(VList(eval_value.map_of(a(0)).values().map(|e| e.0))),
+        "map_values" => Ok(VList(eval_value.map_of(a(0)).values().map(|e| e.1))),
+        "map_entries" => Ok(VList(eval_value.map_of(a(0)).values().map(|e| VRec([e.0, e.1])))),
+        "str_len" => match a(0) {
+            VBytes(b) => Ok(VInt(b.len())),
+            v => Ok(VInt(eval_value.str_of(v).len())),
+        },
+        "list_is_empty" => Ok(VBool(eval_value.list_of(a(0)).is_empty())),
+        "str_is_empty" => Ok(VBool(eval_value.str_of(a(0)).is_empty())),
+        "list_first" => Ok(eval_value.opt(eval_value.list_of(a(0)).first())),
+        "list_last" => Ok(eval_value.opt(eval_value.list_of(a(0)).last())),
+        "list_reverse" => Ok(VList(eval_value.list_of(a(0)).reverse())),
+        "list_sort" => Ok(VList(eval_value.sort(eval_value.list_of(a(0))))),
+        "list_slice" => Ok(VList(slice_list(eval_value.list_of(a(0)), eval_value.int_of(a(1)), eval_value.int_of(a(2))))),
+        "list_take" => Ok(VList(slice_list(eval_value.list_of(a(0)), 0, eval_value.int_of(a(1))))),
+        "list_skip" => {
+            let xs = eval_value.list_of(a(0))
+            Ok(VList(slice_list(xs, eval_value.int_of(a(1)), xs.len())))
+        },
+        "list_join" => Ok(VText(eval_value.list_of(a(0)).map(eval_value.str_of).join(eval_value.str_of(a(1))))),
+        "list_sum" => Ok(VInt(eval_value.list_of(a(0)).fold(0, |s, x| s + eval_value.int_of(x)))),
+        "str_lines" => Ok(eval_value.strs(eval_value.str_of(a(0)).lines())),
+        "str_split" => Ok(eval_value.strs(eval_value.str_of(a(0)).split(eval_value.str_of(a(1))))),
+        "str_trim" => Ok(VText(eval_value.str_of(a(0)).trim())),
+        "str_contains" => Ok(VBool(eval_value.str_of(a(0)).contains(eval_value.str_of(a(1))))),
+        "str_starts_with" => Ok(VBool(eval_value.str_of(a(0)).starts_with(eval_value.str_of(a(1))))),
+        "str_ends_with" => Ok(VBool(eval_value.str_of(a(0)).ends_with(eval_value.str_of(a(1))))),
+        "str_to_upper" => Ok(VText(eval_value.str_of(a(0)).to_upper())),
+        "str_to_lower" => Ok(VText(eval_value.str_of(a(0)).to_lower())),
+        "str_replace" => Ok(VText(eval_value.str_of(a(0)).replace(eval_value.str_of(a(1)), eval_value.str_of(a(2))))),
+        "str_parse_int" => Ok(eval_value.opt(eval_value.str_of(a(0)).parse_int().map(|n| VInt(n)))),
+        "str_parse_float" => Ok(eval_value.opt(eval_value.str_of(a(0)).parse_float().map(|x| VFloat(x)))),
+        "str_slice" => {
+            let (s, lo, hi) = (eval_value.str_of(a(0)), eval_value.int_of(a(1)), eval_value.int_of(a(2)))
+            catch(|| VText(s.slice(lo, hi)))
+        },
+        "str_index_of" => Ok(eval_value.opt(eval_value.str_of(a(0)).index_of(eval_value.str_of(a(1))).map(|n| VInt(n)))),
+        "str_last_index_of" => Ok(eval_value.opt(eval_value.str_of(a(0)).last_index_of(eval_value.str_of(a(1))).map(|n| VInt(n)))),
+        "str_bytes" => Ok(eval_value.ints(eval_value.str_of(a(0)).bytes())),
+        "str_chars" => Ok(eval_value.strs(eval_value.str_of(a(0)).chars())),
+        "str_to_bytes" => Ok(VBytes(eval_value.str_of(a(0)).to_bytes())),
+        "bytes_to_str" => Ok(VText(eval_value.bytes_of(a(0)).to_str())),
+        "bytes_new" => {
+            let ns = eval_value.list_of(a(0)).map(eval_value.int_of)
+            catch(|| VBytes(bytes(ns)))
+        },
+        "bytes_at" => {
+            let (b, i) = (eval_value.bytes_of(a(0)), eval_value.int_of(a(1)))
+            catch(|| VInt(b[i]))
+        },
+        "bytes_len" => Ok(VInt(eval_value.bytes_of(a(0)).len())),
+        "bytes_is_empty" => Ok(VBool(eval_value.bytes_of(a(0)).is_empty())),
+        "bytes_get" => Ok(eval_value.opt(eval_value.bytes_of(a(0)).get(eval_value.int_of(a(1))).map(|n| VInt(n)))),
+        "bytes_slice" => {
+            let (b, lo, hi) = (eval_value.bytes_of(a(0)), eval_value.int_of(a(1)), eval_value.int_of(a(2)))
+            catch(|| VBytes(b.slice(lo, hi)))
+        },
+        "bytes_to_list" => Ok(eval_value.ints(eval_value.bytes_of(a(0)).to_list())),
+        "int_range" => {
+            let (lo, hi) = (eval_value.int_of(a(0)), eval_value.int_of(a(1)))
+            Ok(eval_value.ints(lo..<hi))
+        },
+        "int_to_char" => {
+            let n = eval_value.int_of(a(0))
+            catch(|| VText(n.to_char()))
+        },
+        "int_min" => Ok(VInt(eval_value.int_of(a(0)).min(eval_value.int_of(a(1))))),
+        "int_max" => Ok(VInt(eval_value.int_of(a(0)).max(eval_value.int_of(a(1))))),
+        "int_to_str" => Ok(VText("{eval_value.int_of(a(0))}")),
+        "float_to_str" => Ok(VText("{eval_value.float_of(a(0))}")),
+        "bool_to_str" => Ok(VText("{eval_value.bool_of(a(0))}")),
+        "int_to_float" => Ok(VFloat(eval_value.int_of(a(0)).to_float())),
+        "int_abs" => Ok(VInt(eval_value.int_of(a(0)).abs())),
+        "int_shift_right_unsigned" => {
+            let (x, n) = (eval_value.int_of(a(0)), eval_value.int_of(a(1)))
+            catch(|| VInt(x.shift_right_unsigned(n)))
+        },
+        "int_to_uint8" | "uint_to_uint8" => Ok(VUInt(eval_value.wrap(eval_value.int_of(a(0)), 8))),
+        "int_to_uint16" | "uint_to_uint16" => Ok(VUInt(eval_value.wrap(eval_value.int_of(a(0)), 16))),
+        "int_to_uint32" | "uint_to_uint32" => Ok(VUInt(eval_value.wrap(eval_value.int_of(a(0)), 32))),
+        "int_to_uint64" | "uint_to_uint64" => Ok(VUInt(eval_value.int_of(a(0)))),
+        "uint_to_int" => Ok(VInt(eval_value.int_of(a(0)))),
+        "uint_to_str" => Ok(VText(uint_text(eval_value.int_of(a(0)), bits_of(rt)))),
+        "uint_to_float" => Ok(VFloat(eval_value.u64(eval_value.int_of(a(0))).to_float())),
+        "uint_min" => Ok(if eval_value.cmp(a(0), a(1)) <= 0 { a(0) } else { a(1) }),
+        "uint_max" => Ok(if eval_value.cmp(a(0), a(1)) >= 0 { a(0) } else { a(1) }),
+        "uint_rotate_left" => Ok(VUInt(rotate(eval_value.int_of(a(0)), eval_value.int_of(a(1)), bits_of(rt), true))),
+        "uint_rotate_right" => Ok(VUInt(rotate(eval_value.int_of(a(0)), eval_value.int_of(a(1)), bits_of(rt), false))),
+        "float_to_int" => Ok(VInt(eval_value.float_of(a(0)).to_int())),
+        "float_abs" => Ok(VFloat(eval_value.float_of(a(0)).abs())),
+        "float_sqrt" => Ok(VFloat(eval_value.float_of(a(0)).sqrt())),
+        "float_to_fixed" => {
+            let (x, d) = (eval_value.float_of(a(0)), eval_value.int_of(a(1)))
+            catch(|| VText(x.to_fixed(d)))
+        },
+        "cap_print" | "cap_write" => {
+            let s = eval_value.str_of(a(1))
+            let nl = name == "cap_print"
+            match rt {
+                TCap("Stderr") => if nl { io.err.print(s) } else { io.err.write(s) },
+                _ => if nl { io.out.print(s) } else { io.out.write(s) },
+            }
+            Ok(VUnit)
+        },
+        "cap_now_ms" => Ok(VInt(io.clock.now_ms())),
+        "cap_sleep" => {
+            io.clock.sleep(eval_value.int_of(a(1)))
+            Ok(VUnit)
+        },
+        "cap_int" => {
+            let (lo, hi) = (eval_value.int_of(a(1)), eval_value.int_of(a(2)))
+            catch(|| VInt(io.rand.int(lo, hi)))
+        },
+        "cap_float" => Ok(VFloat(io.rand.float())),
+        "cap_bytes" => {
+            let n = eval_value.int_of(a(1))
+            catch(|| VBytes(io.rand.bytes(n)))
+        },
+        "cap_args" => Ok(eval_value.strs(io.args)),
+        "cap_read_line" => Ok(eval_value.opt(io.input.read_line().map(|s| VText(s)))),
+        "cap_read_all" => Ok(VText(io.input.read_all())),
+        _ => panic("eval: unknown primitive " + name),
+    }
+}

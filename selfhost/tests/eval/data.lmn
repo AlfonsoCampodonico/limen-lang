@@ -1,0 +1,95 @@
+// Structs, enums, nested patterns, lists and maps read and changed, and
+// `mut` parameters on a list element and a struct field.
+struct Point {
+    x: Int,
+    y: Int,
+}
+
+struct Shape {
+    name: Str,
+    corners: List[Point],
+}
+
+enum Tree {
+    Leaf,
+    Node(Tree, Int, Tree),
+}
+
+enum Msg {
+    Move(Point),
+    Say(Str, Int),
+    Quit,
+}
+
+fn insert(t: Tree, v: Int) -> Tree {
+    match t {
+        Leaf => Node(Leaf, v, Leaf),
+        Node(l, x, r) if v < x => Node(insert(l, v), x, r),
+        Node(l, x, r) => Node(l, x, insert(r, v)),
+    }
+}
+
+fn walk(t: Tree) -> List[Int] {
+    match t {
+        Leaf => [],
+        Node(l, x, r) => walk(l) + [x] + walk(r),
+    }
+}
+
+fn bump(mut n: Int) {
+    n = n + 100
+}
+
+fn shift(mut p: Point, by: Int) {
+    p.x = p.x + by
+    bump(mut p.y)
+}
+
+fn describe(m: Msg) -> Str {
+    match m {
+        Move(Point { x: 0, y }) => "up {y}",
+        Move(Point { x, .. }) => "across {x}",
+        Say(s, 1) | Say(s, 2) => "say {s} briefly",
+        Say(s, n) => "say {s} {n} times",
+        Quit => "quit",
+    }
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let mut sh = Shape { name: "tri", corners: [Point { x: 0, y: 0 }, Point { x: 4, y: 0 }, Point { x: 0, y: 3 }] }
+    let copy = sh
+    sh.corners[1].y = 9
+    shift(mut sh.corners[2], 5)
+    bump(mut sh.corners[0].x)
+    out.print("{sh}")
+    out.print("{copy}")
+    let mut t = Leaf
+    for v in [5, 2, 8, 1, 9, 3] {
+        t = insert(t, v)
+    }
+    out.print("{walk(t)}")
+    for m in [Move(Point { x: 0, y: 3 }), Move(Point { x: 2, y: 3 }), Say("hi", 2), Say("bye", 5), Quit] {
+        out.print(describe(m))
+    }
+    let mut m: Map[Str, List[Int]] = map()
+    m["a"] = [1]
+    m["b"] = [2, 3]
+    m["a"].push(4)
+    m["c"] = []
+    m.remove("b")
+    m["b"] = [7]
+    out.print("{m} {m.len()} {m.keys()} {m.get("a")} {m.get("z")}")
+    let mut xs = [[1, 2], [3]]
+    xs[0][1] = 20
+    xs[1].push(30)
+    xs.push([])
+    out.print("{xs}")
+    match xs {
+        [[a, ..], [_, b], ..rest] => out.print("{a} {b} {rest}"),
+        _ => out.print("no"),
+    }
+    let pair = (1, "one")
+    let (n, s) = pair
+    out.print("{pair} {n} {s}")
+}

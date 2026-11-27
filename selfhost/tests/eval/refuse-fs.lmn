@@ -1,0 +1,5 @@
+fn main(root: Root) {
+    root.stdout.print("hi")
+    let fs = root.fs
+    root.stdout.print("{fs.exists("x")}")
+}

@@ -1,0 +1,32 @@
+// Closures: captures, closures passed in and returned.
+fn adder(n: Int) -> fn(Int) -> Int {
+    |x| x + n
+}
+
+fn twice(f: fn(Int) -> Int, x: Int) -> Int {
+    f(f(x))
+}
+
+fn compose(f: fn(Int) -> Int, g: fn(Int) -> Int) -> fn(Int) -> Int {
+    |x| g(f(x))
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let add3 = adder(3)
+    let base = 10
+    let scale = |x: Int| x * base
+    out.print("{add3(1)} {twice(add3, 1)} {twice(scale, 2)} {compose(add3, scale)(1)}")
+    let xs = [1, 2, 3, 4, 5]
+    let evens = xs.filter(|x| x % 2 == 0)
+    let sum = xs.fold(0, |acc, x| acc + x)
+    let words = xs.map(|x| "w{x}")
+    out.print("{evens} {sum} {words}")
+    let mut fs: List[fn(Int) -> Int] = []
+    for k in 1..<4 {
+        fs.push(|x| x * k)
+    }
+    out.print("{fs.map(|f| f(10))}")
+    let say = out.print
+    say("method value")
+}

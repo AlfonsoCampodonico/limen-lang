@@ -1,0 +1,2 @@
+limen eval: refuse-fs.lmn:3:5: not available in the playground: the Fs capability
+exit 2

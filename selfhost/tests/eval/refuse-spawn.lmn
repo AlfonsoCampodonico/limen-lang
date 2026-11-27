@@ -1,0 +1,7 @@
+fn main(root: Root) {
+    let out = root.stdout
+    group g {
+        g.go(|| 1)
+    }
+    out.print("done")
+}

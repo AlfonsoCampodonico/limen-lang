@@ -1,0 +1,37 @@
+// Interpolation of every kind of value, and the quoted form inside
+// containers.
+struct P {
+    name: Str,
+    tags: List[Str],
+}
+
+struct Empty {}
+
+enum E {
+    A,
+    B(Str, Float),
+    C(P),
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let s = "quote \" tab \t nl \n back \\ é 日本 \u{1F600}"
+    out.print("{s}")
+    out.print("{[s]}")
+    out.print("{[1, 2]} {[1.0, 2.5]} {[true]} {["a", "b"]} {[()]}")
+    let p = P { name: "x\"y", tags: ["t1", ""] }
+    out.print("{p} {[p]}")
+    out.print("{Empty {}}")
+    out.print("{A} {B("s", 1.0)} {C(p)} {[A, B("q", -0.0)]}")
+    let mut m: Map[Str, Int] = map()
+    m["k\n"] = 1
+    m["z"] = 2
+    out.print("{m}")
+    let e: Map[Int, Str] = map()
+    out.print("{e}")
+    out.print("{(1, "two", 3.0)} {[(1, [2])]} {Some("x")}")
+    let o: Option[Str] = None
+    let r: Result[Int, Str] = Err("bad")
+    out.print("{o} {r} {[Ok(1), r]}")
+    out.print("{bytes([104, 105, 0, 255])} {1.0e-5} {123456789.0} {-0.0}")
+}

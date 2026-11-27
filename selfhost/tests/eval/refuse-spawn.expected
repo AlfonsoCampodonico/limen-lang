@@ -1,0 +1,2 @@
+limen eval: refuse-spawn.lmn:3:5: not available in the playground: tasks
+exit 2
