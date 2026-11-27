@@ -87,9 +87,30 @@ let find_module ~deps ~from dir name =
       | Some src -> Some ("<std>/" ^ name ^ ".lmn", Some src, false)
       | None -> None)
 
+(* Files parsed before, by path: the text each was parsed from and the
+   parse, marshalled, so each use gets its own copy (the checker changes
+   the tree it checks). The language server keeps one across checks, so a
+   change parses again only the files whose text changed. *)
+type parse_cache = (string, string * string) Hashtbl.t
+
+let parse_cache () : parse_cache = Hashtbl.create 64
+let cache : parse_cache option ref = ref None
+
+(* files actually parsed, for the tests *)
+let parse_count = ref 0
+
 let parse path src =
   Source.add path src;
-  Parser.parse_file path src
+  let fresh () = incr parse_count; Parser.parse_file path src in
+  match !cache with
+  | None -> fresh ()
+  | Some c -> (
+    match Hashtbl.find_opt c path with
+    | Some (t, m) when String.equal t src -> (Marshal.from_string m 0 : Ast.file)
+    | _ ->
+      let f = fresh () in
+      Hashtbl.replace c path (src, Marshal.to_string f []);
+      f)
 
 (* ---------- renaming ---------- *)
 
@@ -797,8 +818,9 @@ let check_aliases (m : modinfo) =
 
 (* Load the main file at [path] (whose text is [src]) and every module it uses.
    Returns the flat program, or the diagnostics. *)
-let load ?(deps = []) ?root ?roots path src : item list * Diag.t list =
+let load ?cache:c ?(deps = []) ?root ?roots path src : item list * Diag.t list =
   errors := [];
+  cache := c;
   (* without one (the editor, the agent server), the limen.toml around the
      file decides, as in a build; finding it fetches nothing *)
   main_root :=

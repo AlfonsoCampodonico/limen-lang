@@ -4058,6 +4058,52 @@ fn bump(mut m: Int) {
          [ "contents"; "value" ])
   in
   ok "lsp-hover-mut-param" (param_hover = "```limen\nmut n: Int\n```") param_hover;
+  (* a check parses again only the files whose text changed; a change to a
+     module rechecks the open files that use it and publishes theirs *)
+  (let dir = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "limen-lsp-cache-%d" (Unix.getpid ())) in
+   (try Unix.mkdir dir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+   let main_p = Filename.concat dir "main.lmn" and util_p = Filename.concat dir "util.lmn" in
+   let main_src = "use util\n\nfn main(root: Root) {\n    root.stdout.print(\"{util.twice(2)}\")\n}\n" in
+   let util_src = "pub fn twice(n: Int) -> Int {\n    n * 2\n}\n" in
+   Out_channel.with_open_bin main_p (fun oc -> output_string oc main_src);
+   Out_channel.with_open_bin util_p (fun oc -> output_string oc util_src);
+   let cst = Lsp.create () in
+   let muri = "file://" ^ main_p and uuri = "file://" ^ util_p in
+   let opn u t = Lsp.handle cst (note "textDocument/didOpen" (J.Obj [ ("textDocument", J.Obj [ ("uri", J.String u); ("text", J.String t) ]) ])) in
+   let chg u t =
+     Lsp.handle cst
+       (note "textDocument/didChange"
+          (J.Obj [ ("textDocument", J.Obj [ ("uri", J.String u) ]); ("contentChanges", J.List [ J.Obj [ ("text", J.String t) ] ]) ]))
+   in
+   (* uri -> diagnostic codes, for each publish *)
+   let published msgs =
+     List.filter_map
+       (fun m ->
+         if J.member "method" m = J.String "textDocument/publishDiagnostics" then
+           let p = J.member "params" m in
+           Some (J.to_str (J.member "uri" p), List.map (fun d -> J.to_str (J.member "code" d)) (match J.member "diagnostics" p with J.List ds -> ds | _ -> []))
+         else None)
+       msgs
+   in
+   let show ps = String.concat "; " (List.map (fun (u, cs) -> Filename.basename u ^ ": " ^ String.concat "," cs) ps) in
+   ignore (opn muri main_src);
+   let before = !Modules.parse_count in
+   ignore (chg muri (main_src ^ "\n"));
+   ignore (chg muri (main_src ^ "\n\n"));
+   ok "lsp-cache-hit" (!Modules.parse_count - before = 2) (sprintf "%d files parsed over two changes" (!Modules.parse_count - before));
+   (* util opened with an error: it is parsed again, once, for its own
+     check and main's (main uses it, so it is checked again) *)
+   let broken = "pub fn twice(n: Int) -> Int {\n    n * true\n}\n" in
+   let before = !Modules.parse_count in
+   let p1 = published (opn uuri broken) in
+   ok "lsp-cache-stale" (List.assoc_opt uuri p1 <> Some [] && List.mem_assoc muri p1 && !Modules.parse_count - before = 1)
+     (sprintf "%s, %d parsed" (show p1) (!Modules.parse_count - before));
+   (* util's twice takes two arguments now: main's call is wrong, and main hears of it *)
+   let p2 = published (chg uuri "pub fn twice(n: Int, m: Int) -> Int {\n    n * m\n}\n") in
+   let p3 = published (chg uuri util_src) in
+   ok "lsp-publish-dependents"
+     (List.assoc_opt uuri p2 = Some [] && (match List.assoc_opt muri p2 with Some (_ :: _) -> true | _ -> false) && List.assoc_opt muri p3 = Some [])
+     (show p2 ^ " | " ^ show p3));
   let kl, kc = mut_pos "k)" 0 in
   let mut_actions =
     result

@@ -17,7 +17,15 @@ type sem = { at : int; len : int; kind : string; mods : string list }
 (* A document as last checked. The reference index and the semantic tokens
    are built on first use (a hover, a rename, highlighting), not on every
    change: diagnostics go out as soon as the program is checked. *)
-type doc = { path : string; text : string; items : item list option; diags : Diag.t list; occs : Refs.occ list Lazy.t; sem : sem list Lazy.t }
+type doc = {
+  path : string;
+  text : string;
+  items : item list option;
+  diags : Diag.t list;
+  occs : Refs.occ list Lazy.t;
+  sem : sem list Lazy.t;
+  files : string list; (* the files its program is made of, its own included *)
+}
 type state = { docs : (string, doc) Hashtbl.t; mutable shutdown : bool; mutable exit : bool }
 
 let create () = { docs = Hashtbl.create 8; shutdown = false; exit = false }
@@ -64,8 +72,12 @@ let slice text (sp : Span.t) =
 (* ---------- analysis ---------- *)
 
 (* The program as loaded from [path], all diagnostics included. *)
+(* One for the server's lifetime: a check parses again only the files
+   whose text changed since the last. *)
+let parses = Modules.parse_cache ()
+
 let load_program path text =
-  match Modules.load path text with
+  match Modules.load ~cache:parses path text with
   | [], (_ :: _ as ds) -> ([], ds)
   | items, _ ->
     let ds, _ = Check.check_program items in
@@ -704,15 +716,31 @@ let capabilities =
 let set_overlay st path =
   Modules.overlay := Hashtbl.fold (fun _ d acc -> if d.path = path then acc else (d.path, d.text) :: acc) st.docs []
 
-let open_doc st uri text =
+(* Check the document and publish its diagnostics; then check again every
+   other open document whose program uses this file, since the change may
+   have broken (or fixed) what it calls, and publish theirs too (an empty
+   list clears what was shown). *)
+let rec open_doc ?(dependents = true) st uri text =
   let path = path_of_uri uri in
   set_overlay st path;
   let items, diags = analyze path text in
   let occs = lazy (match items with Some it -> Refs.index it | None -> []) in
   let sem = lazy (match items with Some it -> semantic_tokens path text it (Lazy.force occs) | None -> []) in
-  let d = { path; text; items; diags; occs; sem } in
+  let files =
+    match items with
+    | Some it -> List.sort_uniq compare (path :: List.map (fun i -> (Modules.item_span i).Span.file) it)
+    | None -> (match Hashtbl.find_opt st.docs uri with Some d -> d.files | None -> [ path ])
+  in
+  let d = { path; text; items; diags; occs; sem; files } in
   Hashtbl.replace st.docs uri d;
-  [ publish uri d ]
+  let others =
+    if not dependents then []
+    else
+      Hashtbl.fold (fun u (o : doc) acc -> if u <> uri && List.mem path o.files then (u, o.text) :: acc else acc) st.docs []
+      |> List.sort compare
+      |> List.concat_map (fun (u, t) -> open_doc ~dependents:false st u t)
+  in
+  publish uri d :: others
 
 let position st params =
   let uri = J.to_str (J.path params [ "textDocument"; "uri" ]) in
