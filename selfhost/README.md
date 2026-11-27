@@ -119,6 +119,28 @@ What each file does, in pipeline order:
 - `sources.lmn` is the standard library's sources and the C runtime,
   embedded from `src/std` and `src/runtime` when the compiler is built, as
   `src/dune` builds them into the OCaml compiler.
+- `eval.lmn` is the second way out of the compiler, beside `cgen.lmn`:
+  `limen eval FILE` runs the program by interpreting the IR C generation
+  would get (lowered with `Line` marks, `pure.cse`, `own.program`), for
+  the playground, where there is no C compiler. Only this compiler has
+  it. It runs with the native build's output, panics and exit status, or
+  refuses before running (`eval.refusal`: tasks, channels, select, C
+  calls, and the capabilities the playground does not grant).
+  `eval_value.lmn` has its values, with the native equality, order, sort
+  and map-key rules; `eval_prims.lmn` the built-in methods, one case per
+  `Prim` of `cgen.prim`, each run on the evaluator's own value so results
+  and panic messages come from the same runtime code. Nested blocks run
+  on a stack of `exec`'s own, so each call of the program costs two
+  frames of the evaluator's: in the WebAssembly build that stack is the
+  engine's (about 1 MB), and `eval.max_depth` (1200 calls) stops a
+  program before it. `check.sh` compares it with the native binary on
+  `tests/eval`, the repository's programs and the book's examples.
+- `../dev/wasm` builds this compiler to WebAssembly (`build.sh`: its C
+  from the OCaml compiler, clang for `wasm32-wasip1` with the runtime's
+  `LIMEN_WASM` mode), runs it in node through the WASI shim the
+  playground uses (`run.mjs`, `wasi.mjs`), and compares it with the
+  native one (`check.sh`, which `selfhost/check.sh` runs when a toolchain
+  is installed).
 - `limen.lmn` is the compiler: `check FILE`, `caps FILE` and `build FILE
   [-o OUT] [--emit-c]` as `bin/main.ml` has them, plus `build --tests` for
   the test binary of `limen test --native` (`cdump/` writes the OCaml

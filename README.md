@@ -55,6 +55,9 @@ programs through C, so you also need a C compiler.
 
 - [The Limen Book](https://book.limen-lang.org): the language, one chapter at a
   time, every example run by the real compiler.
+- The playground beside the book runs Limen in your browser: the
+  self-hosted compiler built to WebAssembly checks the program and
+  `limen eval` runs it, with nothing sent to a server.
 - [SPEC.md](SPEC.md): the full reference, written so that a person
   or a model can learn the whole language from it.
 
