@@ -719,6 +719,15 @@ fn walk(t: Tree) -> List[Int] {
   out "float-to-fixed-huge"
     (main_wrap {|    out.print("{1.7976931348623157e308.to_fixed(30).len()} {(-1.7976931348623157e308).to_fixed(30).len()} {(-1.7976931348623157e308).to_fixed(30).slice(0, 4)}")|})
     "340 341 -179\n";
+  (* Core.rand_le refuses bytes that don't fit; golden is the C constant *)
+  if selected "core-rand-le" then begin
+    let b = Bytes.make 8 '\000' in
+    let refused off k = match Core.rand_le b off k 0L with () -> false | exception Invalid_argument _ -> true in
+    Core.rand_le b 4 4 0x0403020100000000L;
+    ok "core-rand-le" (refused (-1) 1 && refused 0 9 && refused 5 4 && refused 0 (-1) && not (refused 0 8) && Bytes.get b 0 = '\000')
+      (sprintf "%S" (Bytes.to_string b));
+    ok "core-golden" (Core.golden = 0x9E3779B97F4A7C15L) (Int64.to_string Core.golden)
+  end;
   (* Core's order and escaping against OCaml's compare and String.escaped,
      which the interpreter used before they were written once in C *)
   if selected "core-order-escape" then begin
@@ -12398,6 +12407,9 @@ fn main(root: Root) {
   (* nesting three deep: each place is reported once *)
   (let _, ds, _ = compile "mut-nested-once" (m "    two(mut k, mut j)\n    put(mut k, put2(mut k, next(mut k)))") in
    ok "mut-nested-once" (List.length (List.filter (fun (d : Diag.t) -> d.code = "E0214") ds) = 2) (String.concat ", " (codes ds)));
+  (* the same through labels, which move the intermediate call into a let *)
+  (let _, ds, _ = compile "mut-nested-once-labelled" (m "    put(b: put2(b: next(mut k), a: mut k), a: mut k)") in
+   ok "mut-nested-once-labelled" (List.length (List.filter (fun (d : Diag.t) -> d.code = "E0214") ds) = 2) (String.concat ", " (codes ds)));
   errs "mut-overlap-promoted" "struct Inner {\n    n: Int,\n}\nstruct Outer {\n    Inner,\n}\nfn whole(mut o: Outer, mut v: Int) {}\nfn main(root: Root) {\n    let mut o = Outer { Inner: Inner { n: 0 } }\n    whole(mut o, mut o.n)\n}\n" [ "E0214" ];
   (let _, ds, infos = compile "mut-pure" (two ^ "fn bump(mut n: Int) {\n    n = n + 1\n}\n\nfn swap_cb(mut f: fn() -> Int) {\n    f = || 1\n}\n\nfn main(root: Root) {}\n") in
    let text n = Check.pure_text (List.find (fun (i : Check.fn_info) -> i.name = n) infos) in
@@ -12491,6 +12503,24 @@ fn main(root: Root) {
      ok (name ^ "-time") (secs < 2.) (sprintf "took %.1f s" secs)
    end);
 
+  (* `mut s.items` 40,000 times on a 40,000-item list: the list's buffer
+     stays in the struct between calls instead of being copied each time;
+     and the struct is an ordinary value wherever it is read *)
+  (let decls = "struct S {\n    items: List[Int],\n}\n\nfn inner(mut xs: List[Int], i: Int) {\n    xs[i % xs.len()] = xs[i % xs.len()] + 1\n}\n\nfn grow(mut xs: List[Int]) {\n    xs.push(9)\n}\n\nfn twice(mut s: S) {\n    inner(mut s.items, 0)\n    inner(mut s.items, 0)\n}\n\n" in
+   let name = "mut-path-fast" in
+   if selected name then begin
+     let src = decls ^ "fn main(root: Root) {\n    let mut xs: List[Int] = []\n    for k in 0..<40000 {\n        xs.push(k)\n    }\n    let mut s = S { items: xs }\n    for i in 0..<40000 {\n        inner(mut s.items, i)\n    }\n    root.stdout.print(\"{s.items[0]} {s.items[39999]} {xs[0]}\")\n}\n" in
+     let t0 = Unix.gettimeofday () in
+     let r = run name src in
+     let secs = Unix.gettimeofday () -. t0 in
+     let want = "1 40000 0\n" in
+     (match r with Ok (got, _) -> ok name (got = want) (sprintf "got %S, want %S" got want) | Error e -> ok name false e);
+     ok (name ^ "-time") (secs < 2.) (sprintf "took %.1f s" secs)
+   end;
+   out "mut-path-values"
+     (decls
+     ^ "fn main(root: Root) {\n    let out = root.stdout\n    let mut s = S { items: [1, 2, 3] }\n    inner(mut s.items, 0)\n    let t = s\n    inner(mut s.items, 0)\n    grow(mut s.items)\n    let f = || s.items.len()\n    inner(mut s.items, 1)\n    twice(mut s)\n    let u = s\n    grow(mut s.items)\n    out.print(\"{t.items} {u.items} {s.items} {f()} {s == u}\")\n    let mut rows = [[1], [2]]\n    rows.push([3])\n    grow(mut rows[2])\n    out.print(\"{rows}\")\n}\n")
+     "[2, 2, 3] [5, 3, 3, 9] [5, 3, 3, 9, 9] 4 false\n[[1], [2], [3, 9]]\n");
   drain ();
   Printf.printf "%d/%d passed\n" (!total - !failed) !total;
   if !failed > 0 then exit 1

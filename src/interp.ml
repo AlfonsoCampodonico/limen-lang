@@ -470,10 +470,31 @@ let rec find_var env n =
 (* A variable's value, ready to be used anywhere: a list it was building
    becomes an ordinary list (and stays one in the cell, so the next change
    copies it first: other holders of the value never see a change). *)
+let settle_buf b = VList (if Array.length b.items = b.len then b.items else Array.sub b.items 0 b.len)
+
+(* A `mut` argument that is a field of a struct variable (`mut s.items`)
+   leaves its list's buffer in the struct, so the next such call changes it
+   in place too. A struct holding a buffer is only ever in that variable's
+   cell: settle turns it back into an ordinary value before it is read.
+   Set once such a buffer is stored, so struct reads look for one only then. *)
+let nested_bufs = ref false
+
+let rec holds_buf = function VBuf _ -> true | VStruct (_, fs) -> List.exists (fun (_, x) -> holds_buf x) fs | _ -> false
+
+let rec settle_deep v =
+  match v with
+  | VBuf b -> settle_buf b
+  | VStruct (n, fs) when holds_buf v -> VStruct (n, List.map (fun (k, x) -> (k, settle_deep x)) fs)
+  | v -> v
+
 let settle r =
   match !r with
   | VBuf b ->
-    let v = VList (if Array.length b.items = b.len then b.items else Array.sub b.items 0 b.len) in
+    let v = settle_buf b in
+    r := v;
+    v
+  | VStruct _ as v when !nested_bufs && holds_buf v ->
+    let v = settle_deep v in
     r := v;
     v
   | v -> v
@@ -2714,10 +2735,27 @@ and arg_cell rt env (a : expr) =
   match a.edesc with
   | EMut { edesc = EVar n; _ } -> (
     match find_var env n with Some r -> (r, ignore) | None -> failwith "internal: a mut variable")
-  | EMut p ->
+  | EMut p -> (
     let root, path = place rt env p in
-    let cell = ref (List.fold_left (place_get rt) (settle root) path) in
-    (cell, fun () -> place_set rt root path (fun _ -> settle cell))
+    match (path, !root) with
+    | _ :: _, VStruct _ when List.for_all (function `Field _ -> true | `Index _ -> false) path ->
+      (* fields of a struct variable: the place's list buffer, if it has
+         one, passes as it is and stays in the struct afterwards *)
+      let cell = ref (List.fold_left (place_get rt) !root path) in
+      ( cell,
+        fun () ->
+          let v = !cell in
+          (match v with VBuf _ -> nested_bufs := true | _ -> ());
+          root := place_change rt !root path (fun _ -> v) )
+    | `Index (VInt k, sp) :: rest, VBuf b ->
+      (* a list variable's buffer is read as it is, not settled, so the
+         write-back changes it in place *)
+      if k < 0L || k >= Int64.of_int b.len then raise (Panic (Core.msg_list_index k b.len, sp));
+      let cell = ref (List.fold_left (place_get rt) b.items.(Int64.to_int k) rest) in
+      (cell, fun () -> place_set rt root path (fun _ -> settle cell))
+    | _ ->
+      let cell = ref (List.fold_left (place_get rt) (settle root) path) in
+      (cell, fun () -> place_set rt root path (fun _ -> settle cell)))
   | _ -> (ref (eval rt env a), ignore)
 
 (* A place: its root variable's cell and the steps to it, each index and

@@ -52,7 +52,9 @@ external escaped : string -> string = "limen_core_escaped"
 
 (* Rand with --seed: splitmix64. The state advances by [golden] in
    interp.ml; [mix64] turns it into the output (lc_mix64). *)
-let golden = 0x9E3779B97F4A7C15L
+external golden_c : unit -> (int64 [@unboxed]) = "limen_core_golden_byte" "limen_core_golden" [@@noalloc]
+
+let golden = golden_c ()
 
 external mix64 : (int64 [@unboxed]) -> (int64 [@unboxed]) = "limen_core_mix64_byte" "limen_core_mix64" [@@noalloc]
 
@@ -62,11 +64,15 @@ external rand_skip : (int64 [@unboxed]) -> (int64 [@unboxed]) = "limen_core_rand
 (* A draw's top 53 bits as a Float in [0, 1) (lc_rand_unit). *)
 external rand_unit : (int64 [@unboxed]) -> (float [@unboxed]) = "limen_core_rand_unit_byte" "limen_core_rand_unit" [@@noalloc]
 
-(* [rand_le b off k z]: z's low [k] <= 8 bytes, low first, into b at [off];
-   the caller checks they fit (lc_rand_le). *)
-external rand_le : bytes -> (int [@untagged]) -> (int [@untagged]) -> (int64 [@unboxed]) -> unit
+external rand_le_c : bytes -> (int [@untagged]) -> (int [@untagged]) -> (int64 [@unboxed]) -> unit
   = "limen_core_rand_le_byte" "limen_core_rand_le"
 [@@noalloc]
+
+(* [rand_le b off k z]: z's low [k] <= 8 bytes, low first, into b at [off]
+   (lc_rand_le); Invalid_argument when they don't fit. *)
+let rand_le b off k z =
+  if off < 0 || k < 0 || k > 8 || off + k > Bytes.length b then invalid_arg "Core.rand_le";
+  rand_le_c b off k z
 
 (* Panic messages for both backends; each adds the location itself. *)
 external msg_list_index : int64 -> int -> string = "limen_core_msg_list_index"

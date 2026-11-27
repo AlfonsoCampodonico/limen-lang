@@ -1,0 +1,14 @@
+fn put(mut a: Int, b: Int) {}
+
+fn put2(mut a: Int, b: Int) -> Int {
+    0
+}
+
+fn next(mut n: Int) -> Int {
+    n
+}
+
+fn main(root: Root) {
+    let mut k = 0
+    put(b: put2(b: next(mut k), a: mut k), a: mut k)
+}

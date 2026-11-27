@@ -109,7 +109,10 @@ value limen_core_f2i_byte(value x) { return caml_copy_int64(lc_f2i(Double_val(x)
 
 /* Rand: splitmix64's output, the skip below which a draw is rejected, a
    draw as a Float, and a seeded draw's low bytes written into a buffer
-   (the caller checks off + k fits). The state stays in interp.ml. */
+   (core.ml checks off + k fits). The state stays in interp.ml and
+   advances by LC_GOLDEN, which core.ml reads from here. */
+int64_t limen_core_golden(value unit) { (void)unit; return (int64_t)LC_GOLDEN; }
+value limen_core_golden_byte(value unit) { (void)unit; return caml_copy_int64((int64_t)LC_GOLDEN); }
 int64_t limen_core_mix64(int64_t z) { return (int64_t)lc_mix64((uint64_t)z); }
 value limen_core_mix64_byte(value z) { return caml_copy_int64((int64_t)lc_mix64((uint64_t)Int64_val(z))); }
 int64_t limen_core_rand_skip(int64_t span) { return (int64_t)lc_rand_skip((uint64_t)span); }
