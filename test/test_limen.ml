@@ -12771,6 +12771,110 @@ fn main(root: Root) -> Result[(), IoError] {
             | Some w -> ok (name ^ "/native") (o = w) "the native build's verdicts differ from the interpreter's"
             | None -> check "yaml-suite (native)" o))
    end);
+  (* yaml-events: the same cases through the parser alone. A case with an
+     `error` file passes when the events are Err; any other passes when the
+     events, written in the suite's format, equal its test.event. A case that
+     fails without being listed in yaml_event_known_failures (each with its
+     reason), or passes while listed, fails the test. *)
+  (let name = "yaml-events" in
+   if selected name then begin
+     let yaml_event_known_failures = [] in
+     let known = List.map fst yaml_event_known_failures in
+     let dir =
+       let d = Filename.concat (Sys.getcwd ()) "yaml-suite" in
+       Unix.realpath (if Sys.file_exists d then d else Filename.concat (Sys.getcwd ()) "test/yaml-suite")
+     in
+     let grants = { Interp.no_grants with fs = Some (dir, true) } in
+     let src = {|use yaml
+
+fn cases(fs: Fs) -> Result[List[Str], IoError] {
+    let mut out: List[Str] = []
+    for id in fs.list("")? {
+        if fs.is_dir(id) {
+            if fs.exists(id + "/in.yaml") {
+                out.push(id)
+            } else {
+                for sub in fs.list(id)? {
+                    if fs.is_dir(id + "/" + sub) {
+                        out.push(id + "/" + sub)
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn verdict(fs: Fs, dir: Str) -> Result[Str, IoError] {
+    let got = yaml.events_text(fs.read(dir + "/in.yaml")?)
+    if fs.exists(dir + "/error") {
+        return Ok(match got {
+            Err(_) => "pass",
+            Ok(_) => "fail",
+        })
+    }
+    let want = fs.read(dir + "/test.event")?
+    Ok(match got {
+        Ok(t) if t == want => "pass",
+        _ => "fail",
+    })
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let fs = root.fs
+    for c in cases(fs)? {
+        root.stdout.print("{c} {verdict(fs, c)?}")
+    }
+    Ok(())
+}
+|} in
+     let check label text =
+       let lines = List.filter (fun l -> l <> "") (String.split_on_char '\n' text) in
+       let verdicts = List.filter_map (fun l -> match String.split_on_char ' ' l with [ id; v ] -> Some (id, v) | _ -> None) lines in
+       let count v = List.length (List.filter (fun (_, x) -> x = v) verdicts) in
+       Printf.printf "%s: %d passed, %d failed of %d\n%!" label (count "pass") (count "fail") (List.length verdicts);
+       let unexpected = List.filter_map (fun (id, v) -> if v = "fail" && not (List.mem id known) then Some id else None) verdicts in
+       let stale = List.filter_map (fun (id, v) -> if v <> "fail" && List.mem id known then Some id else None) verdicts in
+       let missing = List.filter (fun id -> not (List.mem_assoc id verdicts)) known in
+       ok name (verdicts <> [] && List.length verdicts = List.length lines) "no verdicts, or a line that is not `id verdict`";
+       ok (name ^ "-unexpected") (unexpected = []) ("fail but are not in yaml_event_known_failures: " ^ String.concat " " unexpected);
+       ok (name ^ "-stale") (stale = [] && missing = [])
+         ("listed in yaml_event_known_failures but not failing: " ^ String.concat " " (stale @ missing));
+       ok (name ^ "-known") (List.length known * 20 < List.length verdicts) "known failures are 5 % of the suite or more"
+     in
+     let want = (match run ~grants name src with Ok (got, _) -> check "yaml-events" got; Some got | Error e -> ok name false e; None) in
+     if native_for name then
+       run_native ~grants name src (function
+         | Error m -> ok (name ^ "/native") false m
+         | Ok (code, o, e) ->
+           ok (name ^ "/native-clean") (code = 0 && e = "limen-leakcheck: 0 live\n") (sprintf "exit %d, stderr %S" code e);
+           (match want with
+            | Some w -> ok (name ^ "/native") (o = w) "the native build's verdicts differ from the interpreter's"
+            | None -> check "yaml-events (native)" o))
+   end);
+  (* The parser's errors and limits, through events_text. *)
+  (let show =
+     "use yaml\n\nfn show(out: Stdout, s: Str) {\n    match yaml.events_text(s) {\n        Ok(t) => out.print(t),\n        Err(e) => out.print(\"error: \" + e),\n    }\n}\n\n"
+   in
+   out "yaml-tab-indent"
+     (show ^ "fn main(root: Root) {\n    show(root.stdout, \"a:\\n\\tb: 1\\n\")\n    show(root.stdout, \"- a\\n\\t- b\\n\")\n    show(root.stdout, \"a:\\n \\tb\\n\")\n}\n")
+     "error: line 2, column 2: tabs are not allowed in indentation\n\
+      error: line 2, column 1: tabs are not allowed in indentation\n\
+      +STR\n+DOC\n+MAP\n=VAL :a\n=VAL :b\n-MAP\n-DOC\n-STR\n\n";
+   out "yaml-bom-crlf"
+     "use yaml\n\nfn main(root: Root) {\n    let crlf = yaml.events_text(\"\\u{feff}a: 1\\r\\nb:\\r\\n  - x\\r\\n  - \\\"y\\r\\n    z\\\"\\r\\n  - |\\r\\n    l1\\r\\n    l2\\r\\n\")\n    let lf = yaml.events_text(\"a: 1\\nb:\\n  - x\\n  - \\\"y\\n    z\\\"\\n  - |\\n    l1\\n    l2\\n\")\n    root.stdout.print(\"{crlf == lf}\")\n    match lf {\n        Ok(t) => root.stdout.print(t),\n        Err(e) => root.stdout.print(e),\n    }\n}\n"
+     "true\n+STR\n+DOC\n+MAP\n=VAL :a\n=VAL :1\n=VAL :b\n+SEQ\n=VAL :x\n=VAL \"y z\n=VAL |l1\\nl2\\n\n-SEQ\n-MAP\n-DOC\n-STR\n\n";
+   out "yaml-error-position"
+     (show ^ "fn main(root: Root) {\n    show(root.stdout, \"a: [1, 2\\n\")\n    show(root.stdout, \"a:\\n  b: [1,\\n     2\\nc: 3\\n\")\n    show(root.stdout, \"x: \\\"open\\n\")\n}\n")
+     "error: line 1, column 4: this flow sequence is never closed\n\
+      error: line 2, column 6: this flow sequence is not closed before line 4, which is not indented inside it\n\
+      error: line 1, column 4: this quoted scalar is never closed\n";
+   out "yaml-depth"
+     (show ^ "fn nest(open: Str, close: Str, n: Int) -> Str {\n    let mut xs: List[Str] = []\n    for _ in 0..<n {\n        xs.push(open)\n    }\n    for _ in 0..<n {\n        xs.push(close)\n    }\n    xs.join(\"\")\n}\n\nfn main(root: Root) {\n    root.stdout.print(\"{yaml.events_text(nest(\"[\", \"]\", 512)).is_ok()} {yaml.events_text(nest(\"- \", \"\", 512) + \"x\").is_ok()}\")\n    show(root.stdout, nest(\"[\", \"]\", 513))\n    show(root.stdout, nest(\"\\{\", \"\\}\", 513))\n    show(root.stdout, nest(\"- \", \"\", 513) + \"x\\n\")\n}\n")
+     "true true\n\
+      error: line 1, column 513: nested deeper than 512\n\
+      error: line 1, column 513: nested deeper than 512\n\
+      error: line 1, column 1025: nested deeper than 512\n");
   drain ();
   Printf.printf "%d/%d passed\n" (!total - !failed) !total;
   if !failed > 0 then exit 1

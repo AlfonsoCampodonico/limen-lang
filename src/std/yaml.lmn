@@ -1,5 +1,7 @@
-// YAML 1.2, core schema. Not yet written: every function is a stub, so the
-// yaml-test-suite runner (test/test_limen.ml) has something to compile.
+// YAML 1.2, core schema. The scanner and parser (text to the spec's event
+// stream) are written; the composer, stringify and the JSON conversions are
+// still stubs.
+use hex
 use json
 
 // A YAML node. `Map` keeps its pairs in source order and its keys may be
@@ -44,4 +46,1701 @@ pub fn to_json(n: Node) -> Result[json.Value, Str] {
 // `v` as a node.
 pub fn from_json(v: json.Value) -> Node {
     Null
+}
+
+// ---------- limits ----------
+
+// How many collections may be open inside each other.
+fn max_depth() -> Int {
+    512
+}
+
+// How many nodes the aliases of one stream may expand to, in all.
+fn max_alias_nodes() -> Int {
+    1000000
+}
+
+// How many aliases may be expanded inside each other.
+fn max_alias_depth() -> Int {
+    100
+}
+
+// ---------- events ----------
+
+// The parser's output, the event stream of the YAML spec. `SeqStart` and
+// `MapStart` carry the anchor, the tag (resolved, "" for none) and whether
+// the collection is written in flow style; `Scalar` the anchor, the tag,
+// the style (1 plain, 2 single-quoted, 3 double-quoted, 4 literal, 5
+// folded) and the text. `DocStart` and `DocEnd` say whether `---` and
+// `...` were written.
+enum Event {
+    StreamStart,
+    StreamEnd,
+    DocStart(Bool),
+    DocEnd(Bool),
+    SeqStart(Str, Str, Bool),
+    SeqEnd,
+    MapStart(Str, Str, Bool),
+    MapEnd,
+    Scalar(Str, Str, Int, Str),
+    Alias(Str),
+}
+
+// The events of a stream and, for each, the line and column (from 0) where
+// it starts.
+struct Events {
+    events: List[Event],
+    lines: List[Int],
+    cols: List[Int],
+}
+
+// The events of `s`, or the first error.
+fn events(s: Str) -> Result[List[Event], Str] {
+    Ok((parse_events(s)?).events)
+}
+
+fn parse_events(s: Str) -> Result[Events, Str] {
+    let toks = scan(s)?
+    let mut p = Ps {
+        toks,
+        p: 0,
+        out: Events { events: [], lines: [], cols: [] },
+        state: 0,
+        states: [],
+        sd: 0,
+        depth: 0,
+        handles: [],
+        prefixes: [],
+    }
+    while p.state != 23 {
+        p.step()?
+    }
+    Ok(p.out)
+}
+
+// Internal, for the yaml-test-suite runner: the events of `s` in the
+// suite's `test.event` format, one per line.
+pub fn events_text(s: Str) -> Result[Str, Str] {
+    let mut out: List[Str] = []
+    for e in events(s)? {
+        out.push(event_text(e))
+        out.push("\n")
+    }
+    Ok(out.join(""))
+}
+
+fn props(anchor: Str, tag: Str) -> Str {
+    let a = if anchor == "" { "" } else { " &" + anchor }
+    let t = if tag == "" { "" } else { " <" + tag + ">" }
+    a + t
+}
+
+fn event_text(e: Event) -> Str {
+    match e {
+        StreamStart => "+STR",
+        StreamEnd => "-STR",
+        DocStart(x) => if x { "+DOC ---" } else { "+DOC" },
+        DocEnd(x) => if x { "-DOC ..." } else { "-DOC" },
+        SeqStart(a, t, f) => "+SEQ" + (if f { " []" } else { "" }) + props(a, t),
+        SeqEnd => "-SEQ",
+        MapStart(a, t, f) => "+MAP" + (if f { " \{\}" } else { "" }) + props(a, t),
+        MapEnd => "-MAP",
+        Scalar(a, t, style, x) => {
+            let c = if style == 1 { ":" } else if style == 2 { "'" } else if style == 3 { "\"" } else if style == 4 { "|" } else { ">" }
+            "=VAL" + props(a, t) + " " + c + escape_text(x)
+        },
+        Alias(name) => "=ALI *" + name,
+    }
+}
+
+// `x` with backslashes and control characters escaped, as the suite writes
+// scalars.
+fn escape_text(x: Str) -> Str {
+    let bs = x.bytes()
+    let mut out: List[Str] = []
+    let mut start = 0
+    for i in 0..<bs.len() {
+        let b = bs[i]
+        let esc = if b == 92 {
+            "\\\\"
+        } else if b == 10 {
+            "\\n"
+        } else if b == 9 {
+            "\\t"
+        } else if b == 13 {
+            "\\r"
+        } else if b == 8 {
+            "\\b"
+        } else if b == 0 {
+            "\\0"
+        } else if b == 7 {
+            "\\a"
+        } else if b == 11 {
+            "\\v"
+        } else if b == 12 {
+            "\\f"
+        } else if b == 27 {
+            "\\e"
+        } else {
+            ""
+        }
+        if esc != "" {
+            out.push(x.slice(start, i))
+            out.push(esc)
+            start = i + 1
+        }
+    }
+    out.push(x.slice(start, bs.len()))
+    out.join("")
+}
+
+// "line L, column C: what", with L and C counted from 1.
+fn err_at(line: Int, col: Int, what: Str) -> Str {
+    "line {line + 1}, column {col + 1}: {what}"
+}
+
+// ---------- scanner ----------
+
+// A token. `k` is its kind (below); an alias or anchor has its name in `a`,
+// a tag its handle in `a` and suffix in `b`, a %TAG directive its handle
+// and prefix, %YAML its version in `a`, and a scalar its text in `a` and
+// its style in `style`. `pre` is 1 when a KEY token goes before it, 2 when
+// a BLOCK-MAPPING-START and a KEY do: a simple key is known to be one only
+// when its `:` is found, after the key's own tokens.
+//
+// Kinds: 0 stream start, 1 stream end, 2 %YAML, 3 %TAG, 4 `---`, 5 `...`,
+// 6 block sequence start, 7 block mapping start, 8 block end, 9 `[`,
+// 10 `]`, 11 `{`, 12 `}`, 13 `-`, 14 `,`, 15 key, 16 value, 17 alias,
+// 18 anchor, 19 tag, 20 scalar.
+struct Token {
+    k: Int,
+    a: Str,
+    b: Str,
+    style: Int,
+    line: Int,
+    col: Int,
+    pre: Int,
+}
+
+// A place where a simple (implicit) key may start, one per flow level.
+struct SKey {
+    possible: Bool,
+    required: Bool,
+    tok: Int,
+    pos: Int,
+    line: Int,
+    col: Int,
+}
+
+// The scanner: the text, where it is, the tokens so far, the indentation
+// of each block collection open (a stack, `ni` deep), the simple key of
+// each flow level and the `[` or `{` that opened each.
+struct Sc {
+    s: Str,
+    bs: List[Int],
+    n: Int,
+    i: Int,
+    line: Int,
+    col: Int,
+    toks: List[Token],
+    indent: Int,
+    indents: List[Int],
+    ni: Int,
+    flow: Int,
+    keys: List[SKey],
+    opens: List[Token],
+    allowed: Bool,
+    // the number of tokens when the last was a quoted scalar or the end of
+    // a flow collection, in flow context: a `:` straight after one is a
+    // value indicator even with no space after it (a JSON-like key)
+    adj: Int,
+}
+
+fn is_blank(b: Int) -> Bool {
+    b == 32 || b == 9
+}
+
+fn is_blankz(b: Int) -> Bool {
+    b == 32 || b == 9 || b == 10 || b == -1
+}
+
+fn is_flow_ind(b: Int) -> Bool {
+    b == 44 || b == 91 || b == 93 || b == 123 || b == 125
+}
+
+fn is_word(b: Int) -> Bool {
+    (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 45 || b == 95
+}
+
+// A character of a tag's suffix (ns-tag-char), `%` escapes included.
+fn is_tag_char(b: Int) -> Bool {
+    is_word(b) || b == 35 || b == 59 || b == 47 || b == 63 || b == 58 || b == 64 || b == 38 || b == 61 || b == 43 || b == 36 || b == 46 || b == 126 || b == 42 || b == 39 || b == 40 || b == 41 || b == 37
+}
+
+// A character of a URI (ns-uri-char), for verbatim tags and %TAG prefixes.
+fn is_uri_char(b: Int) -> Bool {
+    is_tag_char(b) || b == 33 || b == 44 || b == 91 || b == 93
+}
+
+// A character that cannot start a plain scalar on its own.
+fn is_indicator(b: Int) -> Bool {
+    b == 45 || b == 63 || b == 58 || b == 44 || b == 91 || b == 93 || b == 123 || b == 125 || b == 35 || b == 38 || b == 42 || b == 33 || b == 124 || b == 62 || b == 39 || b == 34 || b == 37 || b == 64 || b == 96
+}
+
+fn newlines(n: Int) -> Str {
+    let mut xs: List[Str] = []
+    for _ in 0..<n {
+        xs.push("\n")
+    }
+    xs.join("")
+}
+
+fn cur(self: Sc) -> Int {
+    if self.i < self.n { self.bs[self.i] } else { -1 }
+}
+
+fn at(self: Sc, k: Int) -> Int {
+    let j = self.i + k
+    if j < self.n { self.bs[j] } else { -1 }
+}
+
+fn here(self: Sc, what: Str) -> Str {
+    err_at(self.line, self.col, what)
+}
+
+// Past one byte, keeping the line and column (columns count characters).
+fn adv(mut self: Sc) {
+    let b = self.bs[self.i]
+    self.i = self.i + 1
+    if b == 10 {
+        self.line = self.line + 1
+        self.col = 0
+    } else if b < 128 || b >= 192 {
+        self.col = self.col + 1
+    }
+}
+
+// `---` or `...` (three of byte `c`) here, followed by a space or the end
+// of the line.
+fn marker(self: Sc, c: Int) -> Bool {
+    self.cur() == c && self.at(1) == c && self.at(2) == c && is_blankz(self.at(3))
+}
+
+fn tok(mut self: Sc, k: Int, line: Int, col: Int) {
+    self.toks.push(Token { k, a: "", b: "", style: 0, line, col, pre: 0 })
+}
+
+fn tok_text(mut self: Sc, k: Int, a: Str, b: Str, style: Int, line: Int, col: Int) {
+    self.toks.push(Token { k, a, b, style, line, col, pre: 0 })
+}
+
+// The spaces that start the current line, when everything before the
+// current position on it is spaces and tabs.
+fn line_spaces(self: Sc) -> Int {
+    let mut k = self.i - self.col
+    while k < self.n && self.bs[k] == 32 {
+        k = k + 1
+    }
+    k - (self.i - self.col)
+}
+
+// Whether the rest of the line is spaces and tabs.
+fn blank_rest(self: Sc) -> Bool {
+    let mut k = self.i
+    while k < self.n && is_blank(self.bs[k]) {
+        k = k + 1
+    }
+    k >= self.n || self.bs[k] == 10
+}
+
+// Whether the text before byte `p` on its line is only spaces and block
+// indicators (`-`, `?`, `:` with a space after) and holds a tab: then the
+// tab is part of the line's indentation, where YAML allows only spaces.
+fn tab_before(self: Sc, p: Int) -> Bool {
+    let mut k = p - 1
+    let mut tab = false
+    while k >= 0 && self.bs[k] != 10 {
+        let b = self.bs[k]
+        if b == 9 {
+            tab = true
+        } else if b == 45 || b == 63 || b == 58 {
+            if k + 1 >= p || !is_blank(self.bs[k + 1]) {
+                return false
+            }
+        } else if b != 32 {
+            return false
+        }
+        k = k - 1
+    }
+    tab
+}
+
+// The tokens of `s`, all of them, with the KEY and BLOCK-MAPPING-START
+// tokens of simple keys put in place.
+fn scan(text: Str) -> Result[List[Token], Str] {
+    let mut s = text
+    if s.starts_with("\u{feff}") {
+        s = s.slice(3, s.len())
+    }
+    if s.contains("\r") {
+        s = s.replace("\r\n", "\n").replace("\r", "\n")
+    }
+    let bs = s.bytes()
+    let mut sc = Sc {
+        s,
+        bs,
+        n: bs.len(),
+        i: 0,
+        line: 0,
+        col: 0,
+        toks: [],
+        indent: -1,
+        indents: [],
+        ni: 0,
+        flow: 0,
+        keys: [SKey { possible: false, required: false, tok: 0, pos: 0, line: 0, col: 0 }],
+        opens: [],
+        allowed: true,
+        adj: -1,
+    }
+    sc.tok(0, 0, 0)
+    let mut done = false
+    while !done {
+        done = sc.fetch()?
+    }
+    let mut out: List[Token] = []
+    for t in sc.toks {
+        if t.pre == 2 {
+            out.push(Token { k: 7, a: "", b: "", style: 0, line: t.line, col: t.col, pre: 0 })
+        }
+        if t.pre >= 1 {
+            out.push(Token { k: 15, a: "", b: "", style: 0, line: t.line, col: t.col, pre: 0 })
+        }
+        out.push(t)
+    }
+    Ok(out)
+}
+
+// The next token or tokens; true at the end of the stream.
+fn fetch(mut self: Sc) -> Result[Bool, Str] {
+    self.skip_to_token()?
+    self.stale_keys()?
+    self.unroll(self.col)
+    let b = self.cur()
+    if b == -1 {
+        self.stream_end()?
+        return Ok(true)
+    }
+    if self.col == 0 && b == 37 {
+        self.directive()?
+    } else if self.col == 0 && self.marker(45) {
+        self.doc_marker(4)?
+    } else if self.col == 0 && self.marker(46) {
+        self.doc_marker(5)?
+    } else if b == 91 {
+        self.flow_start(9)?
+    } else if b == 123 {
+        self.flow_start(11)?
+    } else if b == 93 {
+        self.flow_end(10)?
+    } else if b == 125 {
+        self.flow_end(12)?
+    } else if b == 44 {
+        self.remove_key()?
+        self.allowed = true
+        self.tok(14, self.line, self.col)
+        self.adv()
+    } else if b == 45 && is_blankz(self.at(1)) {
+        self.block_entry()?
+    } else if b == 63 && (is_blankz(self.at(1)) || (self.flow > 0 && is_flow_ind(self.at(1)))) {
+        self.key()?
+    } else if b == 58 && (is_blankz(self.at(1)) || (self.flow > 0 && (is_flow_ind(self.at(1)) || self.toks.len() == self.adj))) {
+        self.value()?
+    } else if b == 42 || b == 38 {
+        self.anchor(if b == 42 { 17 } else { 18 })?
+    } else if b == 33 {
+        self.save_key()?
+        self.allowed = false
+        self.tag()?
+    } else if (b == 124 || b == 62) && self.flow == 0 {
+        self.remove_key()?
+        self.allowed = true
+        self.block_scalar(b == 124)?
+    } else if b == 39 || b == 34 {
+        self.save_key()?
+        self.allowed = false
+        self.quoted(b == 39)?
+        if self.flow > 0 {
+            self.adj = self.toks.len()
+        }
+    } else if !is_indicator(b) || ((b == 45 || b == 63 || b == 58) && !is_blankz(self.at(1)) && (self.flow == 0 || !is_flow_ind(self.at(1)))) {
+        self.save_key()?
+        self.allowed = false
+        self.plain()?
+    } else {
+        return Err(self.here("found a character that cannot start any token"))
+    }
+    Ok(false)
+}
+
+// Past spaces, tabs, comments and line breaks to the next token.
+fn skip_to_token(mut self: Sc) -> Result[(), Str] {
+    let mut crossed = false
+    while true {
+        while is_blank(self.cur()) {
+            self.adv()
+        }
+        if self.cur() == 35 {
+            if self.i > 0 && !is_blankz(self.bs[self.i - 1]) {
+                return Err(self.here("a comment must be separated from what comes before it by a space"))
+            }
+            while self.cur() != 10 && self.cur() != -1 {
+                self.adv()
+            }
+        }
+        if self.cur() == 10 {
+            self.adv()
+            crossed = true
+            if self.flow == 0 {
+                self.allowed = true
+            }
+        } else {
+            break
+        }
+    }
+    if crossed && self.flow > 0 && self.cur() != -1 && self.line_spaces() <= self.indent {
+        return Err(self.unclosed())
+    }
+    Ok(())
+}
+
+// A line inside a flow collection that is not indented past the block the
+// collection is in: most likely the collection was never closed, so the
+// error points at its `[` or `\{`.
+fn unclosed(self: Sc) -> Str {
+    let o = self.opens[self.flow - 1]
+    let what = if o.k == 9 { "sequence" } else { "mapping" }
+    err_at(o.line, o.col, "this flow {what} is not closed before line {self.line + 1}, which is not indented inside it")
+}
+
+// A simple key must be on one line and at most 1024 bytes long.
+fn stale_keys(mut self: Sc) -> Result[(), Str] {
+    for l in 0..<self.flow + 1 {
+        let k = self.keys[l]
+        // a key in a flow mapping may take more than a line
+        let in_map = l > 0 && self.opens[l - 1].k == 11
+        if k.possible && !in_map && (k.line != self.line || self.i > k.pos + 1024) {
+            if k.required {
+                return Err(err_at(k.line, k.col, "could not find expected ':'"))
+            }
+            self.keys[l].possible = false
+        }
+    }
+    Ok(())
+}
+
+fn save_key(mut self: Sc) -> Result[(), Str] {
+    if self.allowed {
+        self.remove_key()?
+        let required = self.flow == 0 && self.indent == self.col
+        self.keys[self.flow] = SKey { possible: true, required, tok: self.toks.len(), pos: self.i, line: self.line, col: self.col }
+    }
+    Ok(())
+}
+
+fn remove_key(mut self: Sc) -> Result[(), Str] {
+    let k = self.keys[self.flow]
+    if k.possible && k.required {
+        return Err(err_at(k.line, k.col, "could not find expected ':'"))
+    }
+    self.keys[self.flow].possible = false
+    Ok(())
+}
+
+// A new block collection at column `col`, if that is deeper than the
+// current one; the caller writes its start token. True if one was opened.
+fn roll(mut self: Sc, col: Int) -> Result[Bool, Str] {
+    if self.flow > 0 || self.indent >= col {
+        return Ok(false)
+    }
+    if self.ni >= max_depth() {
+        return Err(self.here("nested deeper than {max_depth()}"))
+    }
+    if self.ni < self.indents.len() {
+        self.indents[self.ni] = self.indent
+    } else {
+        self.indents.push(self.indent)
+    }
+    self.ni = self.ni + 1
+    self.indent = col
+    Ok(true)
+}
+
+// Close the block collections deeper than column `col`.
+fn unroll(mut self: Sc, col: Int) {
+    if self.flow > 0 {
+        return
+    }
+    while self.indent > col {
+        self.tok(8, self.line, self.col)
+        self.ni = self.ni - 1
+        self.indent = self.indents[self.ni]
+    }
+}
+
+fn stream_end(mut self: Sc) -> Result[(), Str] {
+    if self.flow > 0 {
+        let o = self.opens[self.flow - 1]
+        let what = if o.k == 9 { "sequence" } else { "mapping" }
+        return Err(err_at(o.line, o.col, "this flow {what} is never closed"))
+    }
+    if self.col != 0 {
+        self.col = 0
+        self.line = self.line + 1
+    }
+    self.unroll(-1)
+    self.remove_key()?
+    self.allowed = false
+    self.tok(1, self.line, self.col)
+    Ok(())
+}
+
+fn doc_marker(mut self: Sc, k: Int) -> Result[(), Str] {
+    self.unroll(-1)
+    self.remove_key()?
+    self.allowed = false
+    let line = self.line
+    let col = self.col
+    self.adv()
+    self.adv()
+    self.adv()
+    self.tok(k, line, col)
+    if k == 5 {
+        while is_blank(self.cur()) {
+            self.adv()
+        }
+        if self.cur() != 35 && self.cur() != 10 && self.cur() != -1 {
+            return Err(self.here("nothing but a comment may follow `...` on its line"))
+        }
+    }
+    Ok(())
+}
+
+fn flow_start(mut self: Sc, k: Int) -> Result[(), Str] {
+    self.save_key()?
+    if self.flow >= max_depth() {
+        return Err(self.here("nested deeper than {max_depth()}"))
+    }
+    let t = Token { k, a: "", b: "", style: 0, line: self.line, col: self.col, pre: 0 }
+    if self.flow < self.opens.len() {
+        self.opens[self.flow] = t
+    } else {
+        self.opens.push(t)
+    }
+    self.flow = self.flow + 1
+    let none = SKey { possible: false, required: false, tok: 0, pos: 0, line: 0, col: 0 }
+    if self.flow < self.keys.len() {
+        self.keys[self.flow] = none
+    } else {
+        self.keys.push(none)
+    }
+    self.allowed = true
+    self.toks.push(t)
+    self.adv()
+    Ok(())
+}
+
+fn flow_end(mut self: Sc, k: Int) -> Result[(), Str] {
+    self.remove_key()?
+    if self.flow > 0 {
+        self.flow = self.flow - 1
+    }
+    self.allowed = false
+    self.tok(k, self.line, self.col)
+    self.adv()
+    if self.flow > 0 {
+        self.adj = self.toks.len()
+    }
+    Ok(())
+}
+
+fn block_entry(mut self: Sc) -> Result[(), Str] {
+    let line = self.line
+    let col = self.col
+    if self.flow == 0 {
+        if !self.allowed {
+            return Err(self.here("a block sequence entry is not allowed here"))
+        }
+        if self.tab_before(self.i) {
+            return Err(self.here("tabs are not allowed in indentation"))
+        }
+        if self.roll(col)? {
+            self.tok(6, line, col)
+        }
+    }
+    self.remove_key()?
+    self.allowed = true
+    self.tok(13, line, col)
+    self.adv()
+    Ok(())
+}
+
+fn key(mut self: Sc) -> Result[(), Str] {
+    let line = self.line
+    let col = self.col
+    if self.flow == 0 {
+        if !self.allowed {
+            return Err(self.here("a mapping key is not allowed here"))
+        }
+        if self.tab_before(self.i) {
+            return Err(self.here("tabs are not allowed in indentation"))
+        }
+        if self.roll(col)? {
+            self.tok(7, line, col)
+        }
+    }
+    self.remove_key()?
+    self.allowed = self.flow == 0
+    self.tok(15, line, col)
+    self.adv()
+    Ok(())
+}
+
+fn value(mut self: Sc) -> Result[(), Str] {
+    let line = self.line
+    let col = self.col
+    let k = self.keys[self.flow]
+    if k.possible {
+        if self.flow == 0 && self.tab_before(k.pos) {
+            return Err(err_at(k.line, k.col, "tabs are not allowed in indentation"))
+        }
+        let opened = self.roll(k.col)?
+        self.toks[k.tok].pre = if opened { 2 } else { 1 }
+        self.keys[self.flow].possible = false
+        self.allowed = false
+    } else {
+        if self.flow == 0 {
+            if !self.allowed {
+                return Err(self.here("a mapping value is not allowed here"))
+            }
+            if self.tab_before(self.i) {
+                return Err(self.here("tabs are not allowed in indentation"))
+            }
+            if self.roll(col)? {
+                self.tok(7, line, col)
+            }
+        }
+        self.allowed = self.flow == 0
+    }
+    self.tok(16, line, col)
+    self.adv()
+    Ok(())
+}
+
+fn anchor(mut self: Sc, k: Int) -> Result[(), Str] {
+    self.save_key()?
+    self.allowed = false
+    let line = self.line
+    let col = self.col
+    self.adv()
+    let start = self.i
+    while !is_blankz(self.cur()) && !is_flow_ind(self.cur()) {
+        self.adv()
+    }
+    if self.i == start {
+        return Err(err_at(line, col, if k == 17 { "an alias needs a name" } else { "an anchor needs a name" }))
+    }
+    self.tok_text(k, self.s.slice(start, self.i), "", 0, line, col)
+    Ok(())
+}
+
+// The tag characters from here (URI characters when `verbatim`), with
+// `%xx` escapes decoded.
+fn uri(mut self: Sc, verbatim: Bool) -> Result[Str, Str] {
+    let mut out: List[Str] = []
+    let mut start = self.i
+    while (verbatim && is_uri_char(self.cur())) || (!verbatim && is_tag_char(self.cur())) {
+        if self.cur() == 37 {
+            out.push(self.s.slice(start, self.i))
+            let mut got: List[Int] = []
+            while self.cur() == 37 {
+                let hi = hex.digit(self.at(1))
+                let lo = hex.digit(self.at(2))
+                if hi < 0 || lo < 0 {
+                    return Err(self.here("a `%` in a tag must be followed by two hex digits"))
+                }
+                got.push(hi * 16 + lo)
+                self.adv()
+                self.adv()
+                self.adv()
+            }
+            out.push(bytes(got).to_str())
+            start = self.i
+        } else {
+            self.adv()
+        }
+    }
+    out.push(self.s.slice(start, self.i))
+    Ok(out.join(""))
+}
+
+fn tag(mut self: Sc) -> Result[(), Str] {
+    let line = self.line
+    let col = self.col
+    let mut handle = ""
+    let mut suffix = ""
+    if self.at(1) == 60 {
+        self.adv()
+        self.adv()
+        suffix = self.uri(true)?
+        if self.cur() != 62 {
+            return Err(self.here("expected `>` closing a verbatim tag"))
+        }
+        self.adv()
+        if suffix == "" {
+            return Err(err_at(line, col, "a verbatim tag cannot be empty"))
+        }
+    } else {
+        self.adv()
+        let start = self.i
+        while is_word(self.cur()) {
+            self.adv()
+        }
+        let word_end = self.i
+        if self.cur() == 33 {
+            self.adv()
+            handle = self.s.slice(start - 1, self.i)
+            suffix = self.uri(false)?
+            if suffix == "" {
+                return Err(err_at(line, col, "a tag needs a name after its handle"))
+            }
+        } else {
+            let rest = self.uri(false)?
+            handle = "!"
+            suffix = self.s.slice(start, word_end) + rest
+            if suffix == "" {
+                handle = ""
+                suffix = "!"
+            }
+        }
+    }
+    let b = self.cur()
+    if !is_blankz(b) && !(self.flow > 0 && is_flow_ind(b)) {
+        return Err(self.here("expected a space after a tag"))
+    }
+    self.tok_text(19, handle, suffix, 0, line, col)
+    Ok(())
+}
+
+fn directive(mut self: Sc) -> Result[(), Str] {
+    self.unroll(-1)
+    self.remove_key()?
+    self.allowed = false
+    let line = self.line
+    let col = self.col
+    self.adv()
+    let start = self.i
+    while !is_blankz(self.cur()) {
+        self.adv()
+    }
+    let name = self.s.slice(start, self.i)
+    if name == "YAML" || name == "TAG" {
+        if !is_blank(self.cur()) {
+            return Err(self.here("expected a space after %{name}"))
+        }
+        while is_blank(self.cur()) {
+            self.adv()
+        }
+    }
+    if name == "YAML" {
+        let v0 = self.i
+        while self.cur() >= 48 && self.cur() <= 57 {
+            self.adv()
+        }
+        let major = self.s.slice(v0, self.i)
+        if major == "" || self.cur() != 46 {
+            return Err(self.here("expected a version such as 1.2 after %YAML"))
+        }
+        self.adv()
+        let m0 = self.i
+        while self.cur() >= 48 && self.cur() <= 57 {
+            self.adv()
+        }
+        if m0 == self.i || !is_blankz(self.cur()) {
+            return Err(self.here("expected a version such as 1.2 after %YAML"))
+        }
+        if major != "1" {
+            return Err(err_at(line, col, "YAML version {major} is not supported"))
+        }
+        self.tok_text(2, self.s.slice(v0, self.i), "", 0, line, col)
+    } else if name == "TAG" {
+        if self.cur() != 33 {
+            return Err(self.here("expected a tag handle after %TAG"))
+        }
+        let h0 = self.i
+        self.adv()
+        while is_word(self.cur()) {
+            self.adv()
+        }
+        if self.cur() == 33 {
+            self.adv()
+        } else if self.i != h0 + 1 {
+            return Err(self.here("a tag handle ends with `!`"))
+        }
+        let handle = self.s.slice(h0, self.i)
+        if !is_blank(self.cur()) {
+            return Err(self.here("expected a space after the tag handle"))
+        }
+        while is_blank(self.cur()) {
+            self.adv()
+        }
+        let prefix = self.uri(true)?
+        if prefix == "" || !is_blankz(self.cur()) {
+            return Err(self.here("expected a tag prefix"))
+        }
+        self.tok_text(3, handle, prefix, 0, line, col)
+    } else {
+        // a reserved directive: ignored
+        while self.cur() != 10 && self.cur() != -1 && !(self.cur() == 35 && is_blank(self.bs[self.i - 1])) {
+            self.adv()
+        }
+    }
+    while is_blank(self.cur()) {
+        self.adv()
+    }
+    if self.cur() == 35 {
+        while self.cur() != 10 && self.cur() != -1 {
+            self.adv()
+        }
+    }
+    if self.cur() != 10 && self.cur() != -1 {
+        return Err(self.here("expected a comment or a line break after a directive"))
+    }
+    Ok(())
+}
+
+// A plain scalar. It goes on over lines indented more than the block it is
+// in; each line break between lines folds to a space, and each empty line
+// to a line break.
+fn plain(mut self: Sc) -> Result[(), Str] {
+    let line = self.line
+    let col = self.col
+    let ind = self.indent + 1
+    let mut parts: List[Str] = []
+    let mut leading = false
+    let mut ws0 = 0
+    let mut ws1 = 0
+    let mut breaks = 0
+    while true {
+        if self.col == 0 && (self.marker(45) || self.marker(46)) {
+            break
+        }
+        if self.cur() == 35 {
+            break
+        }
+        let mut run = -1
+        while !is_blankz(self.cur()) {
+            let b = self.cur()
+            if b == 58 {
+                let c = self.at(1)
+                if is_blankz(c) || (self.flow > 0 && is_flow_ind(c)) {
+                    break
+                }
+            }
+            if self.flow > 0 && is_flow_ind(b) {
+                break
+            }
+            if run < 0 {
+                if leading {
+                    parts.push(if breaks == 0 { " " } else { newlines(breaks) })
+                    leading = false
+                    breaks = 0
+                } else if ws1 > ws0 {
+                    parts.push(self.s.slice(ws0, ws1))
+                }
+                ws0 = 0
+                ws1 = 0
+                run = self.i
+            }
+            self.adv()
+        }
+        if run >= 0 {
+            parts.push(self.s.slice(run, self.i))
+        }
+        if !is_blank(self.cur()) && self.cur() != 10 {
+            break
+        }
+        while is_blank(self.cur()) || self.cur() == 10 {
+            if is_blank(self.cur()) {
+                if leading && self.col < ind && self.cur() == 9 && !self.blank_rest() {
+                    return Err(self.here("tabs are not allowed in indentation"))
+                }
+                if !leading {
+                    if ws1 == ws0 {
+                        ws0 = self.i
+                    }
+                    ws1 = self.i + 1
+                }
+            } else {
+                if !leading {
+                    ws0 = 0
+                    ws1 = 0
+                    leading = true
+                } else {
+                    breaks = breaks + 1
+                }
+            }
+            self.adv()
+        }
+        if leading && self.flow > 0 && self.cur() != -1 && self.line_spaces() <= self.indent {
+            return Err(self.unclosed())
+        }
+        if self.flow == 0 && self.col < ind {
+            break
+        }
+    }
+    self.tok_text(20, parts.join(""), "", 1, line, col)
+    if leading {
+        self.allowed = true
+    }
+    Ok(())
+}
+
+// A single- or double-quoted scalar.
+fn quoted(mut self: Sc, single: Bool) -> Result[(), Str] {
+    let line = self.line
+    let col = self.col
+    let q = if single { 39 } else { 34 }
+    self.adv()
+    let mut parts: List[Str] = []
+    while true {
+        if self.col == 0 && (self.marker(45) || self.marker(46)) {
+            return Err(self.here("a document marker inside a quoted scalar"))
+        }
+        if self.cur() == -1 {
+            return Err(err_at(line, col, "this quoted scalar is never closed"))
+        }
+        let mut leading = false
+        let mut nl = false
+        let mut run = self.i
+        while !is_blankz(self.cur()) {
+            let b = self.cur()
+            if single && b == 39 && self.at(1) == 39 {
+                parts.push(self.s.slice(run, self.i))
+                parts.push("'")
+                self.adv()
+                self.adv()
+                run = self.i
+            } else if b == q {
+                break
+            } else if !single && b == 92 && self.at(1) == 10 {
+                parts.push(self.s.slice(run, self.i))
+                self.adv()
+                self.adv()
+                run = self.i
+                leading = true
+                break
+            } else if !single && b == 92 {
+                parts.push(self.s.slice(run, self.i))
+                parts.push(self.escape()?)
+                run = self.i
+            } else {
+                self.adv()
+            }
+        }
+        parts.push(self.s.slice(run, self.i))
+        if self.cur() == q {
+            break
+        }
+        let mut ws0 = 0
+        let mut ws1 = 0
+        let mut breaks = 0
+        // the spaces that start the current line, while only spaces
+        let mut sp = 0
+        let mut spaces = true
+        let mut crossed = leading
+        while is_blank(self.cur()) || self.cur() == 10 {
+            if is_blank(self.cur()) {
+                if !leading {
+                    if ws1 == ws0 {
+                        ws0 = self.i
+                    }
+                    ws1 = self.i + 1
+                }
+                if self.cur() == 32 && spaces {
+                    sp = sp + 1
+                } else {
+                    spaces = false
+                }
+            } else {
+                if !leading {
+                    ws0 = 0
+                    ws1 = 0
+                    leading = true
+                    nl = true
+                } else {
+                    breaks = breaks + 1
+                }
+                crossed = true
+                sp = 0
+                spaces = true
+            }
+            self.adv()
+        }
+        if crossed && self.cur() != -1 && sp <= self.indent && !(self.col == 0 && (self.marker(45) || self.marker(46))) {
+            return Err(self.here("a quoted scalar's lines must be indented more than the block it is in"))
+        }
+        if leading {
+            if nl && breaks == 0 {
+                parts.push(" ")
+            } else {
+                parts.push(newlines(breaks))
+            }
+        } else if ws1 > ws0 {
+            parts.push(self.s.slice(ws0, ws1))
+        }
+    }
+    self.adv()
+    self.tok_text(20, parts.join(""), "", if single { 2 } else { 3 }, line, col)
+    Ok(())
+}
+
+// The escape sequence at the `\` here, as text.
+fn escape(mut self: Sc) -> Result[Str, Str] {
+    let line = self.line
+    let col = self.col
+    let e = self.at(1)
+    if e == -1 {
+        return Err(err_at(line, col, "an escape at the end of the stream"))
+    }
+    self.adv()
+    self.adv()
+    let simple = match e {
+        48 => 0,
+        97 => 7,
+        98 => 8,
+        116 => 9,
+        9 => 9,
+        110 => 10,
+        118 => 11,
+        102 => 12,
+        114 => 13,
+        101 => 27,
+        32 => 32,
+        34 => 34,
+        47 => 47,
+        92 => 92,
+        78 => 133,
+        95 => 160,
+        76 => 8232,
+        80 => 8233,
+        _ => -1,
+    }
+    if simple >= 0 {
+        return Ok(simple.to_char())
+    }
+    let digits = if e == 120 { 2 } else if e == 117 { 4 } else if e == 85 { 8 } else { 0 }
+    if digits == 0 {
+        return Err(err_at(line, col, "unknown escape `\\{e.to_char()}`"))
+    }
+    let mut c = self.hex_digits(digits, line, col)?
+    if c >= 55296 && c <= 56319 && self.cur() == 92 && self.at(1) == 117 {
+        self.adv()
+        self.adv()
+        let lo = self.hex_digits(4, line, col)?
+        if lo < 56320 || lo > 57343 {
+            return Err(err_at(line, col, "half a surrogate pair"))
+        }
+        c = 65536 + (c - 55296) * 1024 + (lo - 56320)
+    }
+    if (c >= 55296 && c <= 57343) || c > 1114111 {
+        return Err(err_at(line, col, "an escape that is not a character"))
+    }
+    Ok(c.to_char())
+}
+
+fn hex_digits(mut self: Sc, n: Int, line: Int, col: Int) -> Result[Int, Str] {
+    let mut c = 0
+    for _ in 0..<n {
+        let d = hex.digit(self.cur())
+        if d < 0 {
+            return Err(err_at(line, col, "expected {n} hex digits in an escape"))
+        }
+        c = c * 16 + d
+        self.adv()
+    }
+    Ok(c)
+}
+
+// A literal (`|`) or folded (`>`) block scalar.
+fn block_scalar(mut self: Sc, literal: Bool) -> Result[(), Str] {
+    let line = self.line
+    let col = self.col
+    self.adv()
+    // chomping: -1 strip, 0 clip, 1 keep
+    let mut chomp = 0
+    let mut inc = 0
+    let mut header = 0
+    while header < 2 {
+        let b = self.cur()
+        if (b == 43 || b == 45) && chomp == 0 {
+            chomp = if b == 43 { 1 } else { -1 }
+            self.adv()
+            header = header + 1
+        } else if b >= 48 && b <= 57 && inc == 0 {
+            if b == 48 {
+                return Err(self.here("a block scalar's indentation indicator is 1 to 9"))
+            }
+            inc = b - 48
+            self.adv()
+            header = header + 1
+        } else {
+            header = 2
+        }
+    }
+    if !is_blankz(self.cur()) {
+        return Err(self.here("expected a comment or a line break after a block scalar's header"))
+    }
+    while is_blank(self.cur()) {
+        self.adv()
+    }
+    if self.cur() == 35 {
+        while self.cur() != 10 && self.cur() != -1 {
+            self.adv()
+        }
+    }
+    if self.cur() == -1 {
+        self.tok_text(20, "", "", if literal { 4 } else { 5 }, line, col)
+        return Ok(())
+    }
+    self.adv()
+    let min = self.indent + 1
+    let mut ind = -1
+    if inc > 0 {
+        ind = if self.indent >= 0 { self.indent + inc } else { inc }
+    }
+    let mut parts: List[Str] = []
+    let (i0, t0) = self.block_breaks(ind, min)?
+    ind = i0
+    let mut trailing = t0
+    let mut leading_nl = false
+    let mut leading_blank = false
+    while self.col == ind && self.cur() != -1 && !(self.col == 0 && (self.marker(45) || self.marker(46))) {
+        let trailing_blank = is_blank(self.cur())
+        if !literal && leading_nl && !leading_blank && !trailing_blank {
+            if trailing == 0 {
+                parts.push(" ")
+            }
+        } else if leading_nl {
+            parts.push("\n")
+        }
+        leading_nl = false
+        if trailing > 0 {
+            parts.push(newlines(trailing))
+        }
+        leading_blank = trailing_blank
+        let run = self.i
+        while self.cur() != 10 && self.cur() != -1 {
+            self.adv()
+        }
+        parts.push(self.s.slice(run, self.i))
+        // the end of the input ends the last line as a line break would
+        leading_nl = true
+        if self.cur() == -1 {
+            trailing = 0
+            break
+        }
+        self.adv()
+        let (i1, t1) = self.block_breaks(ind, min)?
+        ind = i1
+        trailing = t1
+    }
+    if chomp != -1 && leading_nl {
+        parts.push("\n")
+    }
+    if chomp == 1 && trailing > 0 {
+        parts.push(newlines(trailing))
+    }
+    self.tok_text(20, parts.join(""), "", if literal { 4 } else { 5 }, line, col)
+    Ok(())
+}
+
+// Past the empty lines of a block scalar and the indentation of the next
+// line: the indentation (found from the first line with content when `ind`
+// is -1) and how many line breaks were passed.
+fn block_breaks(mut self: Sc, ind: Int, min: Int) -> Result[(Int, Int), Str] {
+    let mut count = 0
+    let mut empty_max = 0
+    while true {
+        while (ind < 0 || self.col < ind) && self.cur() == 32 {
+            self.adv()
+        }
+        if (ind < 0 || self.col < ind) && self.cur() == 9 {
+            let need = if ind < 0 { min } else { ind }
+            if self.col < need {
+                return Err(self.here("a tab where indentation is expected"))
+            }
+            // the line's content starts with the tab
+            break
+        }
+        if self.cur() == -1 && self.col > 0 {
+            // a last line of only spaces, with no line break
+            count = count + 1
+            break
+        }
+        if self.cur() != 10 {
+            break
+        }
+        if self.col > empty_max {
+            empty_max = self.col
+        }
+        self.adv()
+        count = count + 1
+    }
+    if ind >= 0 {
+        return Ok((ind, count))
+    }
+    let content = self.cur() != -1 && self.col >= min && !(self.col == 0 && (self.marker(45) || self.marker(46)))
+    if content {
+        if empty_max > self.col {
+            return Err(self.here("a leading empty line of a block scalar is indented more than its first line"))
+        }
+        return Ok((self.col, count))
+    }
+    Ok((if empty_max > min { empty_max } else { min }, count))
+}
+
+// ---------- parser ----------
+
+// The parser: a state machine over the tokens, with a stack of the states
+// to go back to (`sd` deep), as libyaml's. States:
+// 0 stream start, 1 document start (a bare document may follow), 2
+// document start (only `---` or the end may follow), 3 document content,
+// 4 document end, 5 block node, 7 flow node, 8 first block sequence entry,
+// 9 block sequence entry, 10 indentless sequence entry, 11 first block
+// mapping key, 12 block mapping key, 13 block mapping value, 14 first flow
+// sequence entry, 15 flow sequence entry, 16 to 18 key, value and end of a
+// single pair in a flow sequence, 19 first flow mapping key, 20 flow
+// mapping key, 21 flow mapping value, 22 flow mapping empty value, 23 end.
+struct Ps {
+    toks: List[Token],
+    p: Int,
+    out: Events,
+    state: Int,
+    states: List[Int],
+    sd: Int,
+    depth: Int,
+    handles: List[Str],
+    prefixes: List[Str],
+}
+
+fn peek(self: Ps) -> Token {
+    self.toks[self.p]
+}
+
+fn kind(self: Ps) -> Int {
+    self.toks[self.p].k
+}
+
+fn next(mut self: Ps) {
+    if self.p < self.toks.len() - 1 {
+        self.p = self.p + 1
+    }
+}
+
+fn emit(mut self: Ps, e: Event, t: Token) {
+    self.out.events.push(e)
+    self.out.lines.push(t.line)
+    self.out.cols.push(t.col)
+}
+
+fn push_state(mut self: Ps, s: Int) {
+    if self.sd < self.states.len() {
+        self.states[self.sd] = s
+    } else {
+        self.states.push(s)
+    }
+    self.sd = self.sd + 1
+}
+
+fn pop_state(mut self: Ps) {
+    self.sd = self.sd - 1
+    self.state = self.states[self.sd]
+}
+
+fn empty(mut self: Ps) {
+    let t = self.peek()
+    self.emit(Scalar("", "", 1, ""), t)
+}
+
+fn open(mut self: Ps, t: Token) -> Result[(), Str] {
+    self.depth = self.depth + 1
+    if self.depth > max_depth() {
+        return Err(err_at(t.line, t.col, "nested deeper than {max_depth()}"))
+    }
+    Ok(())
+}
+
+fn close_seq(mut self: Ps) {
+    let t = self.peek()
+    self.depth = self.depth - 1
+    self.emit(SeqEnd, t)
+}
+
+fn close_map(mut self: Ps) {
+    let t = self.peek()
+    self.depth = self.depth - 1
+    self.emit(MapEnd, t)
+}
+
+fn fail(self: Ps, what: Str) -> Str {
+    let t = self.peek()
+    err_at(t.line, t.col, what)
+}
+
+fn step(mut self: Ps) -> Result[(), Str] {
+    let s = self.state
+    let k = self.kind()
+    if s == 0 {
+        if k != 0 {
+            return Err(self.fail("expected the start of the stream"))
+        }
+        self.emit(StreamStart, self.peek())
+        self.next()
+        self.state = 1
+    } else if s == 1 || s == 2 {
+        self.doc_start(s == 1)?
+    } else if s == 3 {
+        if k == 2 || k == 3 || k == 4 || k == 5 || k == 1 {
+            self.pop_state()
+            self.empty()
+        } else {
+            self.node(true, false)?
+        }
+    } else if s == 4 {
+        let t = self.peek()
+        let explicit = k == 5
+        if explicit {
+            self.next()
+        }
+        self.emit(DocEnd(explicit), t)
+        self.state = if explicit { 1 } else { 2 }
+    } else if s == 5 {
+        self.node(true, false)?
+    } else if s == 7 {
+        self.node(false, false)?
+    } else if s == 8 || s == 9 {
+        if s == 8 {
+            self.next()
+        }
+        let k2 = self.kind()
+        if k2 == 13 {
+            self.next()
+            let k3 = self.kind()
+            if k3 != 13 && k3 != 8 {
+                self.push_state(9)
+                self.node(true, false)?
+            } else {
+                self.state = 9
+                self.empty()
+            }
+        } else if k2 == 8 {
+            self.pop_state()
+            self.close_seq()
+            self.next()
+        } else {
+            return Err(self.fail("expected a `-` entry of the block sequence"))
+        }
+    } else if s == 10 {
+        if k == 13 {
+            self.next()
+            let k3 = self.kind()
+            if k3 != 13 && k3 != 15 && k3 != 16 && k3 != 8 {
+                self.push_state(10)
+                self.node(true, false)?
+            } else {
+                self.state = 10
+                self.empty()
+            }
+        } else {
+            self.pop_state()
+            self.close_seq()
+        }
+    } else if s == 11 || s == 12 {
+        if s == 11 {
+            self.next()
+        }
+        let k2 = self.kind()
+        if k2 == 15 {
+            self.next()
+            let k3 = self.kind()
+            if k3 != 15 && k3 != 16 && k3 != 8 {
+                self.push_state(13)
+                self.node(true, true)?
+            } else {
+                self.state = 13
+                self.empty()
+            }
+        } else if k2 == 8 {
+            self.pop_state()
+            self.close_map()
+            self.next()
+        } else if k2 == 16 {
+            self.state = 13
+            self.empty()
+        } else {
+            return Err(self.fail("expected a key of the block mapping"))
+        }
+    } else if s == 13 {
+        if k == 16 {
+            self.next()
+            let k3 = self.kind()
+            if k3 != 15 && k3 != 16 && k3 != 8 {
+                self.push_state(12)
+                self.node(true, true)?
+            } else {
+                self.state = 12
+                self.empty()
+            }
+        } else {
+            self.state = 12
+            self.empty()
+        }
+    } else if s == 14 || s == 15 {
+        if s == 14 {
+            self.next()
+        }
+        let mut k2 = self.kind()
+        if k2 != 10 {
+            if s == 15 {
+                if k2 == 14 {
+                    self.next()
+                    k2 = self.kind()
+                } else {
+                    return Err(self.fail("expected `,` or `]`"))
+                }
+            }
+            if k2 == 15 || k2 == 16 {
+                // a single pair; `: v` has an empty key
+                let t = self.peek()
+                self.open(t)?
+                self.emit(MapStart("", "", true), t)
+                self.state = 16
+                if k2 == 15 {
+                    self.next()
+                }
+                return Ok(())
+            } else if k2 != 10 {
+                self.push_state(15)
+                return self.node(false, false)
+            }
+        }
+        self.pop_state()
+        self.close_seq()
+        self.next()
+    } else if s == 16 {
+        if k != 16 && k != 14 && k != 10 {
+            self.push_state(17)
+            self.node(false, false)?
+        } else {
+            self.state = 17
+            self.empty()
+        }
+    } else if s == 17 {
+        if k == 16 {
+            self.next()
+            let k3 = self.kind()
+            if k3 != 14 && k3 != 10 {
+                self.push_state(18)
+                return self.node(false, false)
+            }
+        }
+        self.state = 18
+        self.empty()
+    } else if s == 18 {
+        self.state = 15
+        self.close_map()
+    } else if s == 19 || s == 20 {
+        if s == 19 {
+            self.next()
+        }
+        let mut k2 = self.kind()
+        if k2 != 12 {
+            if s == 20 {
+                if k2 == 14 {
+                    self.next()
+                    k2 = self.kind()
+                } else {
+                    return Err(self.fail("expected `,` or `\}`"))
+                }
+            }
+            if k2 == 15 {
+                self.next()
+                let k3 = self.kind()
+                if k3 != 16 && k3 != 14 && k3 != 12 {
+                    self.push_state(21)
+                    return self.node(false, false)
+                }
+                self.state = 21
+                self.empty()
+                return Ok(())
+            } else if k2 == 16 {
+                self.state = 21
+                self.empty()
+                return Ok(())
+            } else if k2 != 12 {
+                self.push_state(22)
+                return self.node(false, false)
+            }
+        }
+        self.pop_state()
+        self.close_map()
+        self.next()
+    } else if s == 21 {
+        if k == 16 {
+            self.next()
+            let k3 = self.kind()
+            if k3 != 14 && k3 != 12 {
+                self.push_state(20)
+                return self.node(false, false)
+            }
+        }
+        self.state = 20
+        self.empty()
+    } else if s == 22 {
+        self.state = 20
+        self.empty()
+    }
+    Ok(())
+}
+
+fn doc_start(mut self: Ps, bare: Bool) -> Result[(), Str] {
+    while self.kind() == 5 {
+        self.next()
+    }
+    let k = self.kind()
+    let t = self.peek()
+    if bare && k != 2 && k != 3 && k != 4 && k != 1 {
+        self.handles = []
+        self.prefixes = []
+        self.emit(DocStart(false), t)
+        self.push_state(4)
+        self.state = 5
+    } else if k != 1 {
+        if !bare && (k == 2 || k == 3) {
+            return Err(self.fail("a directive must come after `...` ending the document before it"))
+        }
+        self.handles = []
+        self.prefixes = []
+        let mut version = false
+        while self.kind() == 2 || self.kind() == 3 {
+            let d = self.peek()
+            if d.k == 2 {
+                if version {
+                    return Err(self.fail("a second %YAML directive"))
+                }
+                version = true
+            } else {
+                if self.handles.contains(d.a) {
+                    return Err(self.fail("a second %TAG directive for {d.a}"))
+                }
+                self.handles.push(d.a)
+                self.prefixes.push(d.b)
+            }
+            self.next()
+        }
+        if self.kind() != 4 {
+            return Err(self.fail("expected `---`"))
+        }
+        self.emit(DocStart(true), self.peek())
+        self.push_state(4)
+        self.state = 3
+        self.next()
+    } else {
+        self.emit(StreamEnd, t)
+        self.state = 23
+    }
+    Ok(())
+}
+
+// The full tag for a tag token's handle and suffix.
+fn resolve_tag(self: Ps, t: Token) -> Result[Str, Str] {
+    if t.a == "" {
+        return Ok(t.b)
+    }
+    for (i, h) in self.handles.with_index() {
+        if h == t.a {
+            return Ok(self.prefixes[i] + t.b)
+        }
+    }
+    if t.a == "!!" {
+        Ok("tag:yaml.org,2002:" + t.b)
+    } else if t.a == "!" {
+        Ok("!" + t.b)
+    } else {
+        Err(err_at(t.line, t.col, "the tag handle {t.a} is not declared"))
+    }
+}
+
+// A node: an alias, or properties and a scalar or collection start.
+fn node(mut self: Ps, block: Bool, indentless: Bool) -> Result[(), Str] {
+    let start = self.peek()
+    if start.k == 17 {
+        self.emit(Alias(start.a), start)
+        self.next()
+        self.pop_state()
+        return Ok(())
+    }
+    let mut anchor = ""
+    let mut tag = ""
+    let mut has_props = false
+    if start.k == 18 {
+        anchor = start.a
+        has_props = true
+        self.next()
+        if self.kind() == 19 {
+            tag = self.resolve_tag(self.peek())?
+            self.next()
+        }
+    } else if start.k == 19 {
+        tag = self.resolve_tag(start)?
+        has_props = true
+        self.next()
+        if self.kind() == 18 {
+            anchor = self.peek().a
+            self.next()
+        }
+    }
+    let t = self.peek()
+    if indentless && t.k == 13 {
+        self.open(t)?
+        self.emit(SeqStart(anchor, tag, false), start)
+        self.state = 10
+    } else if t.k == 20 {
+        self.emit(Scalar(anchor, tag, t.style, t.a), start)
+        self.next()
+        self.pop_state()
+    } else if t.k == 9 {
+        self.open(t)?
+        self.emit(SeqStart(anchor, tag, true), start)
+        self.state = 14
+    } else if t.k == 11 {
+        self.open(t)?
+        self.emit(MapStart(anchor, tag, true), start)
+        self.state = 19
+    } else if block && t.k == 6 {
+        self.open(t)?
+        self.emit(SeqStart(anchor, tag, false), start)
+        self.state = 8
+    } else if block && t.k == 7 {
+        self.open(t)?
+        self.emit(MapStart(anchor, tag, false), start)
+        self.state = 11
+    } else if has_props {
+        self.emit(Scalar(anchor, tag, 1, ""), start)
+        self.pop_state()
+    } else {
+        return Err(err_at(t.line, t.col, "expected a node"))
+    }
+    Ok(())
 }
