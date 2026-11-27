@@ -1,0 +1,25 @@
+// Option and Result methods, `??` and `?`.
+fn half(n: Int) -> Result[Int, Str] {
+    if n % 2 == 0 { Ok(n / 2) } else { Err("odd: {n}") }
+}
+
+fn quarter(n: Int) -> Result[Int, Str] {
+    let h = half(n)?
+    half(h)
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let a: Option[Int] = Some(3)
+    let b: Option[Int] = None
+    out.print("{a.is_some()} {a.is_none()} {b.is_some()} {b.is_none()} {a.map(|x| x + 1)} {b.map(|x| x + 1)} {a ?? 0} {b ?? 0}")
+    let r = half(4)
+    let s = half(3)
+    out.print("{r.is_ok()} {r.is_err()} {s.is_ok()} {s.is_err()} {s.map_error(|e| e.len())} {r.map_error(|e| e.len())}")
+    out.print("{quarter(8)} {quarter(6)} {quarter(5)}")
+    let p = Some((1, "x"))
+    match p {
+        Some((n, t)) if n > 0 => out.print("{n} {t}"),
+        _ => out.print("none"),
+    }
+}

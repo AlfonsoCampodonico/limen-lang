@@ -252,6 +252,22 @@ compare_eval() {
   same "$1/$2 (eval)"
 }
 
+# eval_corpus DIR FILE: a program of the corpus through compare_eval,
+# unless `eval` refuses it (counted in $refused) or it does not build
+# natively (not a program to run: an error case, a library)
+eval_corpus() {
+  (cd "$1" && PWD=$(pwd) "$out/tsc" --seed "${eval_seed:-1}" --grant "fs=$grant:ro" --grant env=PWD -- eval "$2") < "${eval_input:-/dev/null}" > /dev/null 2> "$out/refused" || true
+  if head -1 "$out/refused" | grep -q '^limen eval: .*: not available in the playground: '; then
+    refused=$((refused + 1))
+    return 0
+  fi
+  if ! (cd "$1" && "$limen_abs" build "$2" -o "$out/ew") > /dev/null 2>&1; then
+    return 0
+  fi
+  ran=$((ran + 1))
+  compare_eval "$1" "$2"
+}
+
 # same FILE: the outputs compared, and the compilers' stderr where a
 # comparison keeps it apart (both compilers write their diagnostics there);
 # then it is cleared for the next comparison
@@ -307,12 +323,44 @@ check "edge cases compile to the same profiled C" compare_profile_c -- $c_cases
 with_tests=$(grep -l '^test \|^bench ' $programs $c_cases)
 check "test binaries compile to the same C" compare_test_c -- $with_tests
 check "programs run the same through eval" compare_eval -- $(ls selfhost/tests/eval/*.lmn)
+# Every program of the repository with a `main` runs the same through
+# eval or is refused, but for those too slow to interpret in the time this
+# check has (the benchmarks and the long fuzzers; each finishes, slowly).
+slow="bench/fib.lmn bench/nbody.lmn bench/nbody_array.lmn bench/pipeline.lmn bench/sieve.lmn fuzz/formats.lmn fuzz/regexes.lmn"
+corpus=$(grep -l '^fn main' $programs | grep -v '^selfhost/tests/eval/' | grep -v '^bench/agent/' | grep -vxF "$(echo $slow | tr ' ' '\n')")
+ran=0 refused=0
+check "corpus programs run the same through eval or are refused" eval_corpus -- $corpus
+echo "eval: $ran programs, $refused refused"
+# every Prim C generation knows, eval runs or refuses (eval_prims.handled)
+cg_prims=$(sed -n '/^fn prim(/,/^}/p' selfhost/cgen.lmn | grep -o '"\(keep\|\(array\|chan\|atomic\|shared\|map\|list\|str\|bytes\|int\|uint\|float\|bool\|cap\)_[a-z0-9_]*\)"' | tr -d '"' | sort -u)
+ev_prims=$(awk '/^pub fn (in_eval|refused|here)\(\)/{on=1} on{print} on&&/^}/{on=0}' selfhost/eval_prims.lmn | grep -o '"[a-z][a-z0-9_]*"' | tr -d '"' | sort -u)
+missing=$(echo "$cg_prims" | grep -vxF "$ev_prims" || true)
+if [ -n "$missing" ]; then
+  echo "eval lacks these built-ins C generation has (add them to selfhost/eval_prims.lmn, or to its refused list):" $missing
+  failed=1
+else
+  echo "eval knows all $(echo "$cg_prims" | wc -l | tr -d ' ') built-ins of C generation"
+fi
 if [ -d "$book" ]; then
   examples=$(find "$book" -name '*.lmn' | sort)
   check "book examples parse the same" compare "$astdump" parse -- $examples
   check "book examples load the same" compare_load -- $examples
   check "book examples check the same" compare_check -- $examples
   check "book examples lower the same" compare_ir -- $examples
+  # the examples the book runs with `limen run main.lmn`, a seed and a
+  # file on stdin at most, through eval with that seed and file
+  ran=0 refused=0 n=0 bad=0
+  for d in "$book"/*/; do
+    line=$(grep -m1 -E '^\$ limen run main\.lmn( --seed [0-9]+)?( < input\.txt)?$' "$d/commands" 2> /dev/null) || continue
+    eval_seed=$(echo "$line" | sed -n 's/.*--seed \([0-9]*\).*/\1/p')
+    eval_input=
+    case "$line" in *input.txt) eval_input="$d/input.txt" ;; esac
+    n=$((n + 1))
+    eval_corpus "${d%/}" main.lmn || bad=$((bad + 1))
+  done
+  eval_seed= eval_input=
+  echo "$((n - bad))/$n book examples run the same through eval (eval: $ran programs, $refused refused)"
+  [ "$bad" -eq 0 ] || failed=1
   check "book examples compile to the same C" compare_c -- $examples
   check "book examples give the same JSON" compare_json -- $examples
   book_tests=$(grep -l '^test \|^bench ' $examples)

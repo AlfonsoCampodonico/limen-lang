@@ -1,0 +1,35 @@
+// Every built-in method of List and Array, and their panicking edges.
+fn main(root: Root) {
+    let out = root.stdout
+    let xs = [5, 3, 9, 1, 3]
+    let empty: List[Int] = []
+    out.print("{xs.len()} {xs.is_empty()} {empty.is_empty()} {xs.get(2)} {xs.get(9)} {xs.get(-1)}")
+    out.print("{xs.first()} {xs.last()} {empty.first()} {empty.last()} {xs.contains(9)} {xs.contains(4)}")
+    out.print("{xs.reverse()} {xs.sort()} {xs.take(2)} {xs.take(99)} {xs.skip(3)} {xs.skip(-2)} {xs.sum()}")
+    out.print("{xs.filter(|x| x > 3)} {xs.map(|x| x * 2)} {xs.fold(100, |a, x| a - x)}")
+    out.print("{["b", "a", "c"].sort()} {["b", "a"].join("-")} {[2.5, -1.0, 0.0].sort()}")
+    out.print("{[[2, 1], [1, 9], [1]].sort()} {[(2, "b"), (1, "z"), (2, "a")].sort()}")
+    let mut ys = xs
+    ys.push(7)
+    out.print("{xs} {ys} {xs == ys} {xs + ys}")
+    match xs {
+        [a, b, ..] => out.print("{a} {b}"),
+        _ => {},
+    }
+    let arr: Array[Int, 3] = [1, 2, 3]
+    out.print("{arr} {arr.len()} {arr.get(1)} {arr.get(3)} {arr.to_list()} {arr.contains(2)}")
+    for i in [4, -1] {
+        match catch(|| xs[i]) {
+            Ok(v) => out.print("ok {v}"),
+            Err(m) => out.print("panic: {m}"),
+        }
+    }
+    match catch(|| arr[3]) {
+        Ok(v) => out.print("ok {v}"),
+        Err(m) => out.print("panic: {m}"),
+    }
+    let mut zs = [1]
+    zs[0] = 2
+    out.print("{zs}")
+    zs[5] = 1
+}
