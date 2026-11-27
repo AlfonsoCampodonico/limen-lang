@@ -21,7 +21,7 @@ pub fn in_eval() -> List[Str] {
 // The prims that only a refused program reaches: channels, and the
 // capabilities the playground does not grant.
 pub fn refused() -> List[Str] {
-    ["chan_recv", "chan_close", "cap_append", "cap_list", "cap_remove", "cap_make_dir", "cap_is_dir", "cap_rename", "cap_info", "cap_only", "cap_only_args", "cap_allows", "cap_copy", "cap_run", "cap_get", "cap_under", "cap_read_only", "cap_read", "cap_read_at", "cap_start_tls", "cap_read_within", "cap_write_within", "cap_on", "cap_accept", "cap_connect", "cap_connect_tls", "cap_on_tls", "cap_port", "cap_close", "cap_exists", "cap_full_path", "cap_is_read_only", "cap_revocable", "cap_revoke", "cap_is_revoked"]
+    ["chan_recv", "chan_close", "cap_append", "cap_list", "cap_remove", "cap_make_dir", "cap_is_dir", "cap_rename", "cap_info", "cap_only", "cap_only_args", "cap_allows", "cap_copy", "cap_touch", "cap_set_executable", "cap_read_link", "cap_run", "cap_get", "cap_under", "cap_read_only", "cap_read", "cap_read_at", "cap_start_tls", "cap_read_within", "cap_write_within", "cap_on", "cap_accept", "cap_connect", "cap_connect_tls", "cap_on_tls", "cap_port", "cap_close", "cap_exists", "cap_full_path", "cap_is_read_only", "cap_revocable", "cap_revoke", "cap_is_revoked"]
 }
 
 // The prims `call` runs.
