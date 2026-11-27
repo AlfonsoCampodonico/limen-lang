@@ -102,4 +102,27 @@ while [ "$j" -lt "$i" ]; do
   if [ "$ok" = 0 ]; then bad=$((bad + 1)); elif [ "$limit" = 1 ]; then known=$((known + 1)); fi
 done
 echo "$((n - bad - known))/$n files give the same JSON from the wasm compiler ($known known limits: too deep for the engine's stack)"
+
+# eval in the wasm build against the engine's stack: recursion 1000 deep
+# runs as natively, and recursion with no end stops at eval's own limit
+# with its message (selfhost/tests/eval/too-deep.expected), never a trap
+ev=$root/selfhost/tests/eval
+for c in deep too-deep; do
+  (cd "$ev" && node "$root/dev/wasm/run.mjs" -- eval $c.lmn) > "$out/$c.got" 2> "$out/$c.got.err" && echo "exit 0" >> "$out/$c.got.err" || echo "exit $?" >> "$out/$c.got.err"
+done
+(cd "$ev" && "$LIMEN_TSC" --grant "fs=$ev" -- eval deep.lmn) > "$out/deep.want" 2> "$out/deep.want.err" && echo "exit 0" >> "$out/deep.want.err" || echo "exit $?" >> "$out/deep.want.err"
+if cmp -s "$out/deep.want" "$out/deep.got" && cmp -s "$out/deep.want.err" "$out/deep.got.err"; then
+  echo "wasm eval: deep.lmn runs as natively"
+else
+  echo "wasm eval: deep.lmn differs"
+  head -3 "$out/deep.got.err"
+  bad=$((bad + 1))
+fi
+if [ ! -s "$out/too-deep.got" ] && cmp -s "$ev/too-deep.expected" "$out/too-deep.got.err"; then
+  echo "wasm eval: too-deep.lmn stops at eval's limit"
+else
+  echo "wasm eval: too-deep.lmn does not stop at eval's limit"
+  head -3 "$out/too-deep.got.err"
+  bad=$((bad + 1))
+fi
 [ "$bad" -eq 0 ]

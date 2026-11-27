@@ -65,9 +65,13 @@ struct Ev {
 }
 
 // The call depth at which eval stops: past it, the program ran out of
-// the playground's stack.
+// the playground's stack. In the WebAssembly build each call of the
+// program takes the frames of `call` and `exec` on the engine's own stack
+// (about 1 MB in node and in browsers' workers), which held 1431 nested
+// calls in node 22 (dev/wasm/check.sh runs selfhost/tests/eval/deep.lmn
+// and too-deep.lmn there); this leaves room below that.
 pub fn max_depth() -> Int {
-    10000
+    1200
 }
 
 // `"file:line:col"`, the place a panic reports.
@@ -255,19 +259,120 @@ fn call(mut self: Ev, name: Str, args: List[eval_value.Value], caps: List[eval_v
     (r, outs)
 }
 
-fn exec(mut self: Ev, mut env: Map[Int, eval_value.Value], ss: List[ir.Stmt]) -> Flow {
-    for s in ss {
-        let f = self.stmt(mut env, s)
-        match f {
-            Next => {},
-            _ => {
-                return f
-            },
-        }
-    }
-    Next
+// A block being run by exec: plain (an `if` branch), a loop's body, which
+// starts again when it ends, or the statements a `defer` protects, with
+// the deferred body to run when a panic leaves them.
+enum Blk {
+    BPlain,
+    BLoop,
+    BGuard(List[ir.Stmt]),
 }
 
+// Run a function's body. Nested blocks (if, loop, defer) go on a stack
+// of exec's own rather than on the evaluator's, so each call of the
+// program costs only this frame and call's there: in the WebAssembly
+// build that stack is the engine's, about 1 MB.
+fn exec(mut self: Ev, mut env: Map[Int, eval_value.Value], ss: List[ir.Stmt]) -> Flow {
+    let mut lists: List[List[ir.Stmt]] = [ss]
+    let mut pos: List[Int] = [0]
+    let mut kinds: List[Blk] = [BPlain]
+    let mut d = 1
+    let mut flow = Next
+    while d > 0 {
+        let k = d - 1
+        match flow {
+            Next => {},
+            _ => {
+                // the flow leaves block k, or ends there
+                match (kinds[k], flow) {
+                    (BLoop, Brk) => {
+                        flow = Next
+                    },
+                    (BLoop, Cont) => {
+                        flow = Next
+                        pos[k] = 0
+                        continue
+                    },
+                    (BGuard(h), Panicked(..)) => match self.exec(mut env, h) {
+                        Panicked(m, w) => {
+                            flow = Panicked(m, w)
+                        },
+                        Out(m) => {
+                            flow = Out(m)
+                        },
+                        _ => {},
+                    },
+                    _ => {},
+                }
+                d = k
+                continue
+            },
+        }
+        let cur = lists[k]
+        let i = pos[k]
+        if i >= cur.len() {
+            match kinds[k] {
+                BLoop => {
+                    pos[k] = 0
+                },
+                _ => {
+                    d = k
+                },
+            }
+            continue
+        }
+        pos[k] = i + 1
+        let next: Option[(List[ir.Stmt], Blk)] = match cur[i] {
+            If(c, a, b) => Some((if eval_value.bool_of(atom(env, c)) { a } else { b }, BPlain)),
+            Loop(body) => Some((body, BLoop)),
+            Guard(_, h, body) => Some((body, BGuard(h))),
+            Break => {
+                flow = Brk
+                None
+            },
+            Continue => {
+                flow = Cont
+                None
+            },
+            Return(x) => {
+                return Ret(atom(env, x))
+            },
+            Let(v, Call(f, args)) | Init(v, Call(f, args)) | Set(v, Call(f, args), _) => {
+                match self.call(f, atoms(env, args), []).0 {
+                    Ok(x) => {
+                        env[v.id] = x
+                    },
+                    Err(e) => {
+                        flow = e
+                    },
+                }
+                None
+            },
+            st => {
+                flow = self.stmt(mut env, st)
+                None
+            },
+        }
+        match next {
+            Some((body, kind)) => {
+                if d == lists.len() {
+                    lists.push(body)
+                    pos.push(0)
+                    kinds.push(kind)
+                } else {
+                    lists[d] = body
+                    pos[d] = 0
+                    kinds[d] = kind
+                }
+                d = d + 1
+            },
+            None => {},
+        }
+    }
+    flow
+}
+
+// A statement that is not a block, a jump or a return.
 fn stmt(mut self: Ev, mut env: Map[Int, eval_value.Value], s: ir.Stmt) -> Flow {
     match s {
         Let(v, r) | Init(v, r) | Set(v, r, _) => match self.rhs(mut env, v.ty, r) {
@@ -277,7 +382,6 @@ fn stmt(mut self: Ev, mut env: Map[Int, eval_value.Value], s: ir.Stmt) -> Flow {
             },
             Err(f) => f,
         },
-        Decl(_) | Drop(_) | GuardEnd(_) | Line(_) => Next,
         Mutate(v, steps, m) => {
             let leaf = match m {
                 MSet(x) => LSet(atom(env, x)),
@@ -295,39 +399,8 @@ fn stmt(mut self: Ev, mut env: Map[Int, eval_value.Value], s: ir.Stmt) -> Flow {
                 Err(f) => f,
             }
         },
-        If(c, a, b) => if eval_value.bool_of(atom(env, c)) { self.exec(mut env, a) } else { self.exec(mut env, b) },
-        Loop(body) => {
-            while true {
-                let f = self.exec(mut env, body)
-                match f {
-                    Next | Cont => {},
-                    Brk => {
-                        return Next
-                    },
-                    _ => {
-                        return f
-                    },
-                }
-            }
-            Next
-        },
-        Break => Brk,
-        Continue => Cont,
-        Return(x) => Ret(atom(env, x)),
-        Guard(_, handler, body) => {
-            // a `defer`: normal exits run the deferred body themselves
-            // (lowering put it there); a panic runs it here and goes on
-            let f = self.exec(mut env, body)
-            match f {
-                Panicked(..) => match self.exec(mut env, handler) {
-                    Panicked(m, w) => Panicked(m, w),
-                    Out(m) => Out(m),
-                    _ => f,
-                },
-                _ => f,
-            }
-        },
         Scope(..) => panic("eval: a group body"),
+        _ => Next,
     }
 }
 
@@ -482,11 +555,11 @@ fn get(self: Ev, env: Map[Int, eval_value.Value], root: eval_value.Value, steps:
 fn rhs(mut self: Ev, mut env: Map[Int, eval_value.Value], t: types.Ty, r: ir.Rhs) -> Result[eval_value.Value, Flow] {
     match r {
         Use(x) => Ok(atom(env, x)),
+        Call(f, args) => self.call(f, atoms(env, args), []).0,
         Bin(op, ty, x, y, sp) => self.bin(op, ty, atom(env, x), atom(env, y), sp),
         Negate(TInt, x) => Ok(VInt(0 - eval_value.int_of(atom(env, x)))),
         Negate(_, x) => Ok(VFloat(-eval_value.float_of(atom(env, x)))),
         Flip(x) => Ok(VBool(!eval_value.bool_of(atom(env, x)))),
-        Call(f, args) => self.call(f, atoms(env, args), []).0,
         CallMut(f, args) => {
             // the values first, in order; then each place, found as the
             // native code finds it, its value passed in
