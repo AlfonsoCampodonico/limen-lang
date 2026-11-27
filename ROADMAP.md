@@ -12,7 +12,7 @@ then harden it, then promise not to break it.
 This file is the plan. The design doc keeps the reasons and the history of
 what was done; its older lists of what was missing point here.
 
-Updated 2026-11-26, after 0.8.0.
+Updated 2026-11-27, with the 0.8 leftovers.
 
 ## 0.4: a server you can leave running (done, 0.4.0)
 
@@ -63,10 +63,13 @@ parallel; development builds (`limen build --dev`, `limen run --native`,
   from Limen shows the Limen calls that led to it. Variables are named
   after their Limen names in the C (`total_15`), so a debugger shows them.
 - Incremental checking for the language server. Done in part: diagnostics
-  go out before the reference index is built (on demand now), and of
-  edits that arrive faster than a check, only the newest is checked. A
-  change still checks the whole program (0.1 s to 0.3 s for the largest
-  here); checking only what changed is left.
+  go out before the reference index is built (on demand now), of edits
+  that arrive faster than a check only the newest is checked, files whose
+  text didn't change aren't parsed again, and a change rechecks the other
+  open files that use it. A change still checks the whole program: 68 ms
+  for the self-hosted compiler (85 ms before the parse cache), 10 ms for
+  `todo_api.lmn`. Checking only the functions an edit touches is left, for
+  when a program is large enough to need it.
 - A profiler and test coverage. Done: `limen build --profile` (own CPU
   time and calls per function, sampled) and `limen test --coverage`.
 
@@ -234,15 +237,21 @@ book and SPEC.md describe 1.0 exactly.
 ## Smaller, whenever
 
 - The interpreter starts a thread per blocking C call instead of using a
-  pool.
+  pool (done: blocking calls share a pool of up to
+  `LIMEN_BLOCKING_THREADS` threads, as they do natively).
 - A program cut into pieces calls its own functions across pieces as
   ordinary external calls, so the C compiler can't change how they are
   called. One piece keeps everything static; a large program could keep
-  static what no other piece calls.
+  static what no other piece calls (done: a function no other piece, the
+  header or the variables name stays `static` in its piece).
 - No cancellation checkpoints inside a single built-in operation (a sort) or
-  in the fast path of fill loops.
+  in the fast path of fill loops (done: a cancelled sort leaves the list as
+  it was, in both backends).
 - `Fs` can't set the executable bit or file times, or read a link, so the
-  build cache still runs `cp`, `touch` and `readlink` through `Exec`.
+  build cache still runs `cp`, `touch` and `readlink` through `Exec` (done:
+  `Fs.copy`, `touch`, `set_executable` and `read_link`, and the build cache
+  no longer runs `cp` or `touch`; the self-hosted compiler still runs
+  `readlink` for Xcode's link, which is outside its `Fs` grant).
 
 ## Before any change
 
