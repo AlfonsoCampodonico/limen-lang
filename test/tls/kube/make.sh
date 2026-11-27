@@ -30,13 +30,13 @@ X
 ca() {
   key "$1-key.pem"
   openssl req -new -key "$1-key.pem" -subj "/CN=$2" -out "$tmp/$1.csr"
-  openssl x509 -req -in "$tmp/$1.csr" -signkey "$1-key.pem" -days $days -extfile "$tmp/ca.ext" -out "$1.pem"
+  openssl x509 -req -sha256 -in "$tmp/$1.csr" -signkey "$1-key.pem" -days $days -extfile "$tmp/ca.ext" -out "$1.pem"
 }
 # leaf NAME CN CA EXT
 leaf() {
   key "$1-key.pem"
   openssl req -new -key "$1-key.pem" -subj "/CN=$2" -out "$tmp/$1.csr"
-  openssl x509 -req -in "$tmp/$1.csr" -CA "$3.pem" -CAkey "$3-key.pem" -set_serial "0x$(openssl rand -hex 8)" \
+  openssl x509 -req -sha256 -in "$tmp/$1.csr" -CA "$3.pem" -CAkey "$3-key.pem" -set_serial "0x$(openssl rand -hex 8)" \
     -days $days -extfile "$tmp/$4.ext" -out "$1.pem"
 }
 
