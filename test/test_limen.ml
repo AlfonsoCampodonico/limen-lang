@@ -12567,6 +12567,210 @@ fn main(root: Root) {
      (decls
      ^ "fn main(root: Root) {\n    let out = root.stdout\n    let mut s = S { items: [1, 2, 3] }\n    inner(mut s.items, 0)\n    let t = s\n    inner(mut s.items, 0)\n    grow(mut s.items)\n    let f = || s.items.len()\n    inner(mut s.items, 1)\n    twice(mut s)\n    let u = s\n    grow(mut s.items)\n    out.print(\"{t.items} {u.items} {s.items} {f()} {s == u}\")\n    let mut rows = [[1], [2]]\n    rows.push([3])\n    grow(mut rows[2])\n    out.print(\"{rows}\")\n}\n")
      "[2, 2, 3] [5, 3, 3, 9] [5, 3, 3, 9, 9] 4 false\n[[1], [2], [3, 9]]\n");
+  (* ---------- yaml: the yaml-test-suite (test/yaml-suite), through std/yaml ----------
+     One Limen program walks every case through an Fs granted on the suite and
+     prints "id verdict" for each, verdict being pass, fail or skip: a valid
+     case passes when its documents equal the ones in in.json (compared as JSON
+     values, in.json holding one document per YAML document), is skipped when
+     it has no in.json or the documents have a key JSON cannot hold, and an
+     invalid case (it has an `error` file) passes when parse_all gives Err.
+     A case that fails without being listed below, or passes while listed,
+     fails the test. LIMEN_TEST_ONLY=yaml-suite runs only this. *)
+  (let name = "yaml-suite" in
+   if selected name then begin
+     let yaml_suite_known_failures =
+       "229Q 26DV 27NA 2AUY 2EBW 2G84/02 2G84/03 2LFX 2SXE 2XXW \
+       33X3 35KP 36F6 3ALJ 3GZX 3MYT 3R3P 3RLN/00 3RLN/01 3RLN/02 \
+       3RLN/03 3RLN/04 3RLN/05 3UYS 4CQQ 4GC6 4MUZ/00 4MUZ/01 4MUZ/02 4Q9F \
+       4QFQ 4RWC 4UYU 4V8U 4WA9 4ZYM 52DL 54T7 565N 57H4 \
+       58MP 5BVJ 5C5M 5GBF 5KJE 5MUD 5NYZ 5T43 5TYM 5WE3 \
+       652Z 65WH 6BCT 6CA3 6CK3 6FWR 6H3V 6HB6 6JQW 6JWB \
+       6KGN 6LVF 6SLA 6VJK 6WLZ 6WPF 6XDY 6ZKB 735Y 74H7 \
+       753E 7A4E 7BMT 7BUB 7FWL 7T8X 7TMG 7W2P 7Z25 7ZZ5 \
+       82AN 87E4 8CWC 8G76 8KB6 8MK2 8QBE 8UDB 8XYN 93JH \
+       93WF 96L6 96NN/00 96NN/01 98YD 9BXH 9DXL 9FMG 9J7A 9KAX \
+       9MQT/00 9SA2 9SHH 9TFX 9U5K 9WXW 9YRD A2M4 A6F9 A984 \
+       AB8U AVM7 AZ63 AZW3 B3HG BEC7 BU8L C2DT C4HZ CC74 \
+       CN3R CPZ3 CT4Q CUP7 D83L D88J D9TU DBG4 DC7X DE56/00 \
+       DE56/01 DE56/02 DE56/03 DE56/04 DE56/05 DHP8 DK3J DK95/00 DK95/02 DK95/03 \
+       DK95/04 DK95/05 DK95/07 DK95/08 DWX9 E76Z EHF6 EX5H EXG3 F2C7 \
+       F3CP F6MC F8F9 FBC9 FP8R FQ7F FTA2 FUP4 G4RS G992 \
+       GH63 H2RW H3Z8 HM87/00 HM87/01 HMK4 HMQ5 HS5T HWV9 J3BT \
+       J5UC J7PZ J7VC J9HZ JEF9/00 JEF9/01 JEF9/02 JHB9 JQ4R JR7V \
+       JS2J JTV5 K3WX K4SU K527 K54U K858 KH5V/00 KH5V/01 KH5V/02 \
+       KMK3 KSS4 L24T/00 L24T/01 L383 L94M L9U5 LE5A LP6E LQZ7 \
+       M29M M5C3 M6YH M7A3 M7NX M9B4 MJS9 MUS6/02 MUS6/03 MUS6/04 \
+       MUS6/05 MUS6/06 MXS3 MYW6 MZX3 NAT4 NB6Z NJ66 NP9H P2AD \
+       P76L P94K PBJ2 PRH3 PUW8 Q5MG Q88A Q8AD QF4Y QT73 \
+       R4YG R52L RLU9 RR7F RTP8 RZT7 S4JQ S4T7 S7BG S9E8 \
+       SKE5 SM9W/00 SSW6 SYW4 T26H T4YY T5N4 TE2A TL85 TS54 \
+       U3C3 U3XV U9NS UDM2 UDR7 UGM3 UKK6/01 UT92 UV7Q V55R \
+       VJP3/01 W42U W4TN W5VH WZ62 X8DW XLQ9 XV9V Y2GN Y79Y/001 \
+       Y79Y/002 Y79Y/010 YD5X Z67P Z9M4 ZF4X ZH7C ZK9H ZWK4"
+     in
+     let known = List.filter (fun s -> s <> "") (String.split_on_char ' ' yaml_suite_known_failures) in
+     let dir =
+       let d = Filename.concat (Sys.getcwd ()) "yaml-suite" in
+       Unix.realpath (if Sys.file_exists d then d else Filename.concat (Sys.getcwd ()) "test/yaml-suite")
+     in
+     let grants = { Interp.no_grants with fs = Some (dir, true) } in
+     let src = {|use json
+use yaml
+
+fn blank(b: Int) -> Bool {
+    b == 32 || b == 9 || b == 10 || b == 13
+}
+
+// The index after the string that opens at `i`.
+fn after_string(bs: List[Int], i: Int) -> Int {
+    let mut j = i + 1
+    while j < bs.len() && bs[j] != 34 {
+        if bs[j] == 92 {
+            j = j + 1
+        }
+        j = j + 1
+    }
+    j + 1
+}
+
+// The JSON documents of `s`, written one after another.
+fn split_docs(s: Str) -> List[Str] {
+    let bs = s.bytes()
+    let n = bs.len()
+    let mut docs: List[Str] = []
+    let mut i = 0
+    while i < n {
+        if blank(bs[i]) {
+            i = i + 1
+        } else {
+            let start = i
+            if bs[i] == 34 {
+                i = after_string(bs, i)
+            } else if bs[i] == 123 || bs[i] == 91 {
+                let mut depth = 0
+                let mut open = true
+                while open && i < n {
+                    let c = bs[i]
+                    if c == 34 {
+                        i = after_string(bs, i)
+                    } else {
+                        if c == 123 || c == 91 {
+                            depth = depth + 1
+                        }
+                        if c == 125 || c == 93 {
+                            depth = depth - 1
+                            if depth == 0 {
+                                open = false
+                            }
+                        }
+                        i = i + 1
+                    }
+                }
+            } else {
+                while i < n && !blank(bs[i]) {
+                    i = i + 1
+                }
+            }
+            docs.push(s.slice(start, i.min(n)))
+        }
+    }
+    docs
+}
+
+fn cases(fs: Fs) -> Result[List[Str], IoError] {
+    let mut out: List[Str] = []
+    for id in fs.list("")? {
+        if fs.is_dir(id) {
+            if fs.exists(id + "/in.yaml") {
+                out.push(id)
+            } else {
+                for sub in fs.list(id)? {
+                    if fs.is_dir(id + "/" + sub) {
+                        out.push(id + "/" + sub)
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn verdict(fs: Fs, dir: Str) -> Result[Str, IoError] {
+    let got = yaml.parse_all(fs.read(dir + "/in.yaml")?)
+    if fs.exists(dir + "/error") {
+        return Ok(match got {
+            Err(_) => "pass",
+            Ok(_) => "fail",
+        })
+    }
+    if !fs.exists(dir + "/in.json") {
+        return Ok("skip")
+    }
+    let want = split_docs(fs.read(dir + "/in.json")?)
+    match got {
+        Err(_) => Ok("fail"),
+        Ok(nodes) => {
+            if nodes.len() != want.len() {
+                return Ok("fail")
+            }
+            for (i, node) in nodes.with_index() {
+                match yaml.to_json(node) {
+                    Err(m) => {
+                        return Ok(if m.contains("key") { "skip" } else { "fail" })
+                    },
+                    Ok(v) => match json.parse(want[i]) {
+                        Err(_) => {
+                            return Ok("fail")
+                        },
+                        Ok(w) => {
+                            if v != w {
+                                return Ok("fail")
+                            }
+                        },
+                    },
+                }
+            }
+            Ok("pass")
+        },
+    }
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let fs = root.fs
+    for c in cases(fs)? {
+        root.stdout.print("{c} {verdict(fs, c)?}")
+    }
+    Ok(())
+}
+|} in
+     (* [text] is the program's output: check it against the known failures *)
+     let check label text =
+       let lines = List.filter (fun l -> l <> "") (String.split_on_char '\n' text) in
+       let verdicts = List.filter_map (fun l -> match String.split_on_char ' ' l with [ id; v ] -> Some (id, v) | _ -> None) lines in
+       let count v = List.length (List.filter (fun (_, x) -> x = v) verdicts) in
+       let p = count "pass" and f = count "fail" and s = count "skip" in
+       Printf.printf "%s: %d passed, %d failed, %d skipped of %d\n%!" label p f s (List.length verdicts);
+       let unexpected = List.filter_map (fun (id, v) -> if v = "fail" && not (List.mem id known) then Some id else None) verdicts in
+       let stale = List.filter_map (fun (id, v) -> if v <> "fail" && List.mem id known then Some id else None) verdicts in
+       let missing = List.filter (fun id -> not (List.mem_assoc id verdicts)) known in
+       ok name (verdicts <> [] && List.length verdicts = List.length lines) "no verdicts, or a line that is not `id verdict`";
+       ok (name ^ "-unexpected") (unexpected = []) ("fail but are not in yaml_suite_known_failures: " ^ String.concat " " unexpected);
+       ok (name ^ "-stale") (stale = [] && missing = [])
+         ("listed in yaml_suite_known_failures but not failing: " ^ String.concat " " (stale @ missing));
+       if Sys.getenv_opt "LIMEN_YAML_LIST" <> None then
+         Out_channel.with_open_bin (Sys.getenv "LIMEN_YAML_LIST") (fun oc ->
+             output_string oc (String.concat " " (List.filter_map (fun (id, v) -> if v = "fail" then Some id else None) verdicts)))
+     in
+     let want = (match run ~grants name src with Ok (got, _) -> check "yaml-suite" got; Some got | Error e -> ok name false e; None) in
+     if native_for name then
+       run_native ~grants name src (function
+         | Error m -> ok (name ^ "/native") false m
+         | Ok (code, o, e) ->
+           ok (name ^ "/native-clean") (code = 0 && e = "limen-leakcheck: 0 live\n") (sprintf "exit %d, stderr %S" code e);
+           (match want with
+            | Some w -> ok (name ^ "/native") (o = w) "the native build's verdicts differ from the interpreter's"
+            | None -> check "yaml-suite (native)" o))
+   end);
   drain ();
   Printf.printf "%d/%d passed\n" (!total - !failed) !total;
   if !failed > 0 then exit 1

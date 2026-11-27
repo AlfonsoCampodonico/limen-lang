@@ -31,6 +31,7 @@ stream = { path = ".", caps = ["fs"] }
 websocket = { path = ".", caps = ["net", "rand"] }
 crypto = { path = ".", caps = ["rand"] }
 unicode = { path = ".", caps = [] }
+yaml = { path = ".", caps = [] }
 
 # Modules whose foreign blocks are part of the standard library's trusted
 # base: their C calls need no Foreign capability, so a program using them

@@ -1,0 +1,47 @@
+// YAML 1.2, core schema. Not yet written: every function is a stub, so the
+// yaml-test-suite runner (test/test_limen.ml) has something to compile.
+use json
+
+// A YAML node. `Map` keeps its pairs in source order and its keys may be
+// any node. `Tagged` is a node with a tag the core schema does not resolve.
+pub enum Node {
+    Null,
+    Bool(Bool),
+    Int(Int),
+    Float(Float),
+    Str(Str),
+    Seq(List[Node]),
+    Map(List[Pair]),
+    Tagged(Str, Node),
+}
+
+// One entry of a mapping.
+pub struct Pair {
+    key: Node,
+    value: Node,
+}
+
+// The one document in `s`.
+pub fn parse(s: Str) -> Result[Node, Str] {
+    Err("not yet")
+}
+
+// Every document in `s`, in order.
+pub fn parse_all(s: Str) -> Result[List[Node], Str] {
+    Err("not yet")
+}
+
+// `n` as YAML text.
+pub fn stringify(n: Node) -> Str {
+    ""
+}
+
+// `n` as a JSON value, or why it has none (a key that is not a string).
+pub fn to_json(n: Node) -> Result[json.Value, Str] {
+    Err("not yet")
+}
+
+// `v` as a node.
+pub fn from_json(v: json.Value) -> Node {
+    Null
+}
