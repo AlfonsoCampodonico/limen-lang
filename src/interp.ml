@@ -6,7 +6,7 @@ let sprintf = Printf.sprintf
 
 type cap =
   | CRoot
-  | CNet of string list
+  | CNet of net
   | CFs of Caps.fs
   | CStdout
   | CStderr
@@ -27,12 +27,18 @@ type cap =
    too. *)
 and revoke = { mutable off : bool; parent : revoke option }
 
+(* A Net: its allowlist, and the client context `trusting` gave it (None:
+   the default trust). `only` keeps the context; `trusting` replaces it. *)
+and net = { hosts : string list; client : Tls.trust option }
+
 (* A socket that knows when it was closed, so a task waiting on it never
    touches a descriptor number that has been reused. *)
-and sock = { fd : Unix.file_descr; mutable shut : bool; mutable reading : bool; mutable writing : bool; mutable tls : Tls.side }
+and sock = { fd : Unix.file_descr; mutable shut : bool; mutable reading : bool; mutable writing : bool; mutable tls : Tls.side; client : Tls.trust option }
 (* reading / writing: a task is in a read (or accept) / a write that has had
    to wait; as natively, another that has to wait meanwhile fails. tls: a
-   TLS connection's session, or a TLS listener's context. *)
+   TLS connection's session, or a TLS listener's context. client: the
+   context of the Net a connection was opened through, which start_tls
+   uses. *)
 
 (* Map keys: Int, Str, Bool, and tuples, structs and enums of them. *)
 type mkey =
@@ -1199,7 +1205,7 @@ module Sock = struct
           Unix.listen fd 4096;
           Unix.set_nonblock fd;
           let p = match Unix.getsockname fd with Unix.ADDR_INET (_, p) -> p | _ -> port in
-          Ok ({ fd; shut = false; reading = false; writing = false; tls = Tls.Plain }, p)
+          Ok ({ fd; shut = false; reading = false; writing = false; tls = Tls.Plain; client = None }, p)
         with Unix.Unix_error (e, _, _) -> Unix.close fd; failed e)
       else (
         match resolve h with
@@ -1212,7 +1218,7 @@ module Sock = struct
             Unix.listen fd 4096;
             Unix.set_nonblock fd;
             let p = match Unix.getsockname fd with Unix.ADDR_INET (_, p) -> p | _ -> port in
-            Ok ({ fd; shut = false; reading = false; writing = false; tls = Tls.Plain }, p)
+            Ok ({ fd; shut = false; reading = false; writing = false; tls = Tls.Plain; client = None }, p)
           with Unix.Unix_error (e, _, _) -> Unix.close fd; failed e))
 
   let accept sk =
@@ -1223,7 +1229,7 @@ module Sock = struct
             match Unix.accept ~cloexec:true sk.fd with
             | c, _ -> (
               Unix.set_nonblock c;
-              let conn = { fd = c; shut = false; reading = false; writing = false; tls = Tls.Plain } in
+              let conn = { fd = c; shut = false; reading = false; writing = false; tls = Tls.Plain; client = None } in
               match sk.tls with
               | Tls.Server ctx -> (
                 match Tls.server ctx c with
@@ -1237,11 +1243,11 @@ module Sock = struct
         in
         go ())
 
-  let connect allowed addr =
+  let connect (n : net) addr =
     match parse_addr addr with
     | None -> Error (Caps.Failed "address must be HOST:PORT")
     | Some (h, port) -> (
-      if not (Caps.permits allowed ~host:h ~port) then Error (Caps.Denied (Printf.sprintf "net: %s:%d is not granted" h port))
+      if not (Caps.permits n.hosts ~host:h ~port) then Error (Caps.Denied (Printf.sprintf "net: %s:%d is not granted" h port))
       else
         match lookup h port with
         | [] -> Error (Caps.Failed ("cannot resolve " ^ h))
@@ -1250,7 +1256,7 @@ module Sock = struct
           let rec try_ = function
             | [] -> assert false
             | (dom, sa) :: rest -> (
-              let sk = { fd = Unix.socket dom Unix.SOCK_STREAM 0; shut = false; reading = false; writing = false; tls = Tls.Plain } in
+              let sk = { fd = Unix.socket dom Unix.SOCK_STREAM 0; shut = false; reading = false; writing = false; tls = Tls.Plain; client = n.client } in
               Unix.set_nonblock sk.fd;
               (* waits can be woken by any socket, so retry until this one says it is connected *)
               let rec go () =
@@ -1338,15 +1344,15 @@ module Sock = struct
 
   (* Net.connect_tls: connect, then run the client handshake, which checks
      the server's certificate against the host. *)
-  let connect_tls allowed addr =
+  let connect_tls (n : net) addr =
     match parse_addr addr with
     | None -> Error (Caps.Failed "address must be HOST:PORT")
     | Some (h, _) -> (
-      match connect allowed addr with
+      match connect n addr with
       | Error e -> Error e
       | Ok sk -> (
         let h = if h.[0] = '[' then String.sub h 1 (String.length h - 2) else h in
-        match Tls.client sk.fd h with
+        match Tls.client_with sk.client sk.fd h with
         | exception Failure m -> close sk; Error (Caps.Failed m)
         | s ->
           sk.tls <- Tls.Session s;
@@ -1371,7 +1377,7 @@ module Sock = struct
       sk.reading <- true;
       sk.writing <- true;
       let finish r = sk.reading <- false; sk.writing <- false; (match r with Error _ -> close sk | Ok _ -> ()); r in
-      match Tls.client sk.fd host with
+      match Tls.client_with sk.client sk.fd host with
       | exception Failure m -> finish (Error (Caps.Failed m))
       | s ->
         sk.tls <- Tls.Session s;
@@ -1396,14 +1402,14 @@ module Sock = struct
 
   (* Net.get: one plain HTTP/1.1 GET over a socket, read until the server
      closes. Redirects are returned, not followed. *)
-  let http_get allowed url =
+  let http_get (n : net) url =
     match Caps.parse_url url with
     | Error m -> Error (Caps.Failed m)
     | Ok u ->
-      if not (Caps.permits allowed ~host:u.host ~port:u.port) then
+      if not (Caps.permits n.hosts ~host:u.host ~port:u.port) then
         Error (Caps.Denied (Printf.sprintf "net: %s:%d is not granted" u.host u.port))
       else
-        match (if u.https then connect_tls else connect) allowed (Printf.sprintf "%s:%d" u.host u.port) with
+        match (if u.https then connect_tls else connect) n (Printf.sprintf "%s:%d" u.host u.port) with
         | Error e -> Error e
         | Ok sk ->
           let result =
@@ -1612,7 +1618,7 @@ module Foreign = struct
          cancelled task stops it and still waits for it, as natively *)
       let job, fd = sql_start (sql_api ()) (Int64.to_nativeint db) text params (Int64.to_int mode) in
       if job = 0n then raise (Panic ("sql: cannot start a thread for a statement", sp));
-      let s = { fd = (Obj.magic fd : Unix.file_descr); shut = false; reading = false; writing = false; tls = Tls.Plain } in
+      let s = { fd = (Obj.magic fd : Unix.file_descr); shut = false; reading = false; writing = false; tls = Tls.Plain; client = None } in
       (try wait_until ~io:(s, false) ~cancellable:(not !current.unwinding) (fun () -> sql_done job)
        with e ->
          sql_stop job;
@@ -1981,7 +1987,7 @@ module Foreign = struct
         in
         let job, fd = job_start fp flags ints floats kind in
         if job = 0n then raise (Panic ("foreign: cannot start a thread for a blocking call", sp));
-        let s = { fd = (Obj.magic fd : Unix.file_descr); shut = false; reading = false; writing = false; tls = Tls.Plain } in
+        let s = { fd = (Obj.magic fd : Unix.file_descr); shut = false; reading = false; writing = false; tls = Tls.Plain; client = None } in
         (try wait_until ~io:(s, false) ~cancellable:(not !current.unwinding) (fun () -> job_done job)
          with e -> job_abandon job; raise e);
         job_finish job
@@ -2113,7 +2119,7 @@ module Proc = struct
         | pid ->
           close_all [ wr; devnull ];
           Unix.set_nonblock rd;
-          let sk = { fd = rd; shut = false; reading = false; writing = false; tls = Tls.Plain } in
+          let sk = { fd = rd; shut = false; reading = false; writing = false; tls = Tls.Plain; client = None } in
           let b = Buffer.create 4096 and chunk = Bytes.create 65536 in
           let rec drain () =
             match Unix.read rd chunk 0 65536 with
@@ -2145,7 +2151,7 @@ module Stdin = struct
   let buf = Buffer.create 4096
   let eof = ref false
   let busy = ref false
-  let sk = { fd = Unix.stdin; shut = false; reading = false; writing = false; tls = Tls.Plain }
+  let sk = { fd = Unix.stdin; shut = false; reading = false; writing = false; tls = Tls.Plain; client = None }
   let direct = lazy (try (Unix.fstat Unix.stdin).Unix.st_kind = Unix.S_REG with Unix.Unix_error _ -> true)
 
   let reset () = Buffer.clear buf; eof := false; busy := false
@@ -2612,7 +2618,7 @@ and ctor_value rt en vn =
 and field rt v name =
   match (v, name) with
   | VStruct (_, fs), _ -> field_of name fs
-  | VCap CRoot, "net" -> VCap (CNet rt.grants.net)
+  | VCap CRoot, "net" -> VCap (CNet { hosts = rt.grants.net; client = None })
   | VCap CRoot, "fs" -> (
     match rt.grants.fs with
     | Some (root, ro) -> VCap (CFs { Caps.root = Some root; ro; top = root })
@@ -3268,13 +3274,14 @@ and cap_call rt c name args sp =
       (fun (size, ms, is_file, is_dir) ->
         VStruct ("FileInfo", [ ("size", vint size); ("modified_ms", vint ms); ("is_file", VBool is_file); ("is_dir", VBool is_dir) ]))
       (Caps.info fs p)
-  | CNet allowed, "only", [ VStr h ] -> VCap (CNet (Caps.attenuate allowed h))
-  | CNet allowed, "get", [ VStr url ] ->
+  | CNet n, "only", [ VStr h ] -> VCap (CNet { n with hosts = Caps.attenuate n.hosts h })
+  | CNet n, "trusting", [ VStr pem ] -> io_result (fun t -> VCap (CNet { n with client = Some t })) (Result.map_error (fun m -> Caps.Failed m) (Tls.trust pem))
+  | CNet n, "get", [ VStr url ] ->
     io_result
       (fun (status, hs, body) ->
         let headers = List.fold_left (fun m (k, v) -> map_put m (VStr k) (VStr v)) empty_map hs in
         VStruct ("HttpResponse", [ ("status", vint status); ("headers", VMap headers); ("body", VStr body) ]))
-      (Sock.http_get allowed url)
+      (Sock.http_get n url)
   | CFs fs, "under", [ VStr p ] -> VCap (CFs (Caps.under fs p))
   | CFs fs, "read_only", [] -> VCap (CFs { fs with ro = true })
   | CFs fs, "read", [ VStr p ] -> io_result (fun s -> VStr s) (Caps.read fs p)
@@ -3283,8 +3290,8 @@ and cap_call rt c name args sp =
   | CFs fs, "exists", [ VStr p ] -> VBool (Caps.exists fs p)
   | CFs fs, "full_path", [ VStr p ] -> io_result (fun s -> VStr s) (Caps.full_path fs p)
   | CFs fs, "is_read_only", [] -> VBool fs.ro
-  | CNet allowed, "connect", [ VStr addr ] -> sock_result (Sock.connect allowed addr) (fun fd -> VCap (CConn fd))
-  | CNet allowed, "connect_tls", [ VStr addr ] -> sock_result (Sock.connect_tls allowed addr) (fun fd -> VCap (CConn fd))
+  | CNet n, "connect", [ VStr addr ] -> sock_result (Sock.connect n addr) (fun fd -> VCap (CConn fd))
+  | CNet n, "connect_tls", [ VStr addr ] -> sock_result (Sock.connect_tls n addr) (fun fd -> VCap (CConn fd))
   | CListen allowed, "on_tls", [ VStr addr; VStr cert; VStr key ] ->
     sock_result (Sock.listen_tls allowed addr cert key) (fun (fd, port) -> VCap (CListener (fd, port)))
   | CListen allowed, "on", [ VStr addr ] -> sock_result (Sock.listen allowed addr) (fun (fd, port) -> VCap (CListener (fd, port)))

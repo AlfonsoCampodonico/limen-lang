@@ -12,7 +12,8 @@
    store (SSL_CERT_FILE / SSL_CERT_DIR when set, as for every OpenSSL
    program, else the store OpenSSL was built with, else the system's own
    bundle when that store isn't there: a statically linked limen on a Mac
-   without Homebrew) and its name or IP
+   without Homebrew), or, through a Net made with `trusting`, against the
+   certificates it was given only (a VTlsClient), and its name or IP
    address against the host that was dialled. Servers do not ask for client
    certificates. TLS 1.2 is the minimum both ways. */
 #include <limits.h>
@@ -70,11 +71,16 @@ static void vtls_common(SSL_CTX *c) {
   SSL_CTX_set_options(c, opts);
 }
 
+/* What every client context does: verify the server. */
+static void vtls_client_common(SSL_CTX *c) {
+  vtls_common(c);
+  SSL_CTX_set_verify(c, SSL_VERIFY_PEER, NULL);
+}
+
 static void vtls_client_init(void) {
   SSL_CTX *c = SSL_CTX_new(TLS_client_method());
   if (!c) { vtls_queue_err(vtls_client_err, sizeof vtls_client_err, "cannot set up TLS"); return; }
-  vtls_common(c);
-  SSL_CTX_set_verify(c, SSL_VERIFY_PEER, NULL);
+  vtls_client_common(c);
   if (SSL_CTX_set_default_verify_paths(c) != 1) {
     vtls_queue_err(vtls_client_err, sizeof vtls_client_err, "cannot load the trusted certificates");
     SSL_CTX_free(c);
@@ -112,6 +118,79 @@ static void vtls_client_init(void) {
   vtls_client_ctx = c;
 }
 
+/* A client context of a Net's own, in place of the default one: made by
+   `trusting` (its own trust store, nothing from the environment), and the
+   place a client identity joins later. Shared by reference count between
+   the Nets that hold it and the Conns opened through them (for start_tls);
+   a session keeps the SSL_CTX itself (SSL_new counts it), so dropping the
+   last holder never pulls it from under a live connection. */
+typedef struct VTlsClient {
+  int64_t rc;      /* holders, counted atomically */
+  SSL_CTX *ctx;    /* verifies against `trust` */
+  X509_STORE *trust;   /* the certificates given to `trusting` (ctx holds it too) */
+} VTlsClient;
+
+static inline VTlsClient *vtls_client_dup(VTlsClient *c) {
+  if (c) __atomic_fetch_add(&c->rc, 1, __ATOMIC_RELAXED);
+  return c;
+}
+/* 1 when that was the last holder and the context is gone */
+static int vtls_client_drop(VTlsClient *c) {
+  if (!c || __atomic_sub_fetch(&c->rc, 1, __ATOMIC_ACQ_REL) != 0) return 0;
+  X509_STORE_free(c->trust);
+  SSL_CTX_free(c->ctx);
+  free(c);
+  return 1;
+}
+
+/* PEM files are never encrypted here: no prompt for a passphrase */
+static int vtls_no_pass(char *buf, int size, int rw, void *u) { (void)buf; (void)size; (void)rw; (void)u; return 0; }
+
+/* `net.trusting(ca)`: a client context that trusts the CERTIFICATE blocks in
+   the PEM text ca and nothing else. Other blocks (a key, say) are passed
+   over; text with no certificate, or a certificate block that does not
+   parse, is an error here rather than at the first connection. NULL with
+   err set on failure. */
+static VTlsClient *vtls_trusting(const char *pem, size_t n, char *err, size_t en) {
+  ERR_clear_error();
+  if (n > INT32_MAX) { snprintf(err, en, "tls: the CA text is too large"); return NULL; }
+  X509_STORE *st = X509_STORE_new();
+  BIO *b = st ? BIO_new_mem_buf(pem, (int)n) : NULL;
+  if (!b) { X509_STORE_free(st); snprintf(err, en, "tls: out of memory"); return NULL; }
+  int count = 0, bad = 0;
+  X509 *x;
+  while ((x = PEM_read_bio_X509(b, NULL, vtls_no_pass, NULL)) != NULL) {
+    /* fill in the extensions now, as vtls_client_init does for its store */
+    (void)X509_check_purpose(x, -1, 0);
+    if (X509_STORE_add_cert(st, x) != 1) bad = 2;
+    X509_free(x);
+    count++;
+    if (bad) break;
+  }
+  /* the read past the last block ends with "no start line"; anything else
+     is a block that is cut short or does not decode */
+  unsigned long e = ERR_peek_last_error();
+  if (!bad && e && !(ERR_GET_LIB(e) == ERR_LIB_PEM && ERR_GET_REASON(e) == PEM_R_NO_START_LINE)) bad = 1;
+  BIO_free(b);
+  ERR_clear_error();
+  if (bad || count == 0) {
+    X509_STORE_free(st);
+    snprintf(err, en, bad == 2 ? "tls: cannot use a certificate in the CA text"
+                      : bad ? "tls: a PEM certificate in the CA text does not parse"
+                      : "tls: no PEM certificate in the CA text");
+    return NULL;
+  }
+  SSL_CTX *c = SSL_CTX_new(TLS_client_method());
+  VTlsClient *v = c ? (VTlsClient *)calloc(1, sizeof *v) : NULL;
+  if (!v) { if (c) SSL_CTX_free(c); X509_STORE_free(st); vtls_queue_err(err, en, "cannot set up TLS"); return NULL; }
+  vtls_client_common(c);
+  /* the context takes one reference to the store, the VTlsClient the other */
+  X509_STORE_up_ref(st);
+  SSL_CTX_set_cert_store(c, st);
+  v->rc = 1; v->ctx = c; v->trust = st;
+  return v;
+}
+
 static VTls *vtls_new(SSL_CTX *ctx, int fd, int server, char *err, size_t en) {
   SSL *s = SSL_new(ctx);
   if (!s) { vtls_queue_err(err, en, "cannot start a session"); return NULL; }
@@ -125,11 +204,17 @@ static VTls *vtls_new(SSL_CTX *ctx, int fd, int server, char *err, size_t en) {
 }
 
 /* A client session on connected socket fd that will check the certificate
-   against host: a DNS name (also sent as SNI) or an IP address. */
-static VTls *vtls_client(int fd, const char *host, char *err, size_t en) {
-  pthread_once(&vtls_once, vtls_client_init);
-  if (!vtls_client_ctx) { snprintf(err, en, "%s", vtls_client_err); return NULL; }
-  VTls *t = vtls_new(vtls_client_ctx, fd, 0, err, en);
+   against host: a DNS name (also sent as SNI) or an IP address. With a
+   VTlsClient (a trusting Net's), its context; else the default one. */
+static VTls *vtls_client(const VTlsClient *with, int fd, const char *host, char *err, size_t en) {
+  SSL_CTX *ctx;
+  if (with) ctx = with->ctx;
+  else {
+    pthread_once(&vtls_once, vtls_client_init);
+    if (!vtls_client_ctx) { snprintf(err, en, "%s", vtls_client_err); return NULL; }
+    ctx = vtls_client_ctx;
+  }
+  VTls *t = vtls_new(ctx, fd, 0, err, en);
   if (!t) return NULL;
   struct in_addr a4; struct in6_addr a6;
   int ok;
@@ -146,9 +231,6 @@ static VTls *vtls_client(int fd, const char *host, char *err, size_t en) {
   }
   return t;
 }
-
-/* PEM files are never encrypted here: no prompt for a passphrase */
-static int vtls_no_pass(char *buf, int size, int rw, void *u) { (void)buf; (void)size; (void)rw; (void)u; return 0; }
 
 /* A server context from PEM text: the certificate (then any intermediate
    certificates of its chain) and its private key. NULL with err set if they

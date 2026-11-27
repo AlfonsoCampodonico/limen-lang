@@ -631,7 +631,7 @@ static void w_dyn_show_k(WBuf *b, void *o, int64_t top) { WDyn *d = (WDyn *)o; d
 W_RT void Dyn_show(WBuf *b, WDyn *d, bool top) { w_show(b, w_dyn_show_k, d, top); }
 W_RT void w_dyn_kids(void *o) { WDyn *d = (WDyn *)o; d->vt->h.drop(d); }
 W_RT WCap *cap_new(int kind) { WCap *c = (WCap *)w_alloc_k(sizeof(WCap), WK_CAP); memset(c, 0, sizeof *c); c->rc = 1; c->kind = kind; c->fd = -1; return c; }
-W_RT void Cap_release(WCap *c) { if (c->rv) w_rv_release(c); for (int i = 0; i < c->nhosts; i++) free(c->hosts[i]); free(c->hosts); free(c->root); if (c->tls) w_tls_release(c); if (c->fd >= 0) w_sock_release_fd(c->fd); w_free(c); }
+W_RT void Cap_release(WCap *c) { if (c->rv) w_rv_release(c); for (int i = 0; i < c->nhosts; i++) free(c->hosts[i]); free(c->hosts); free(c->root); if (c->tls) w_tls_release(c); if (c->client) w_tls_client_drop(c->client); if (c->fd >= 0) w_sock_release_fd(c->fd); w_free(c); }
 W_RT void Cap_drop(WCap *c) { if (w_rc_dec(&c->rc)) Cap_release(c); }
 W_RT void Cap_show(WBuf *b, WCap *c, bool top) {
   (void)top;
@@ -684,6 +684,7 @@ W_RT WCap *Cap_copy_kind(WCap *x) {
   c->nhosts = x->nhosts;
   c->root = x->root ? w_strdup(x->root) : NULL;
   c->ro = x->ro;
+  if (x->client) c->client = w_tls_client_dup(x->client);
   return c;
 }
 /* `x.revocable()`: the copy, and through *revoker its switch */
@@ -992,6 +993,7 @@ W_RT WCap *Cap_net_only(WCap *n, WStr *req_s) {
   }
   WCap *c = cap_new(CAP_NET);
   w_rv_inherit(c, n);
+  if (n->client) c->client = w_tls_client_dup(n->client);   /* it keeps the trust */
   c->hosts = (char **)w_raw(sizeof(char *));
   if (covered) { c->hosts[0] = req; c->nhosts = 1; } else free(req);
   return c;
@@ -3016,6 +3018,7 @@ W_RT WIo Cap_net_connect(WCap *n, WStr *addr) {
   WCap *c = cap_new(CAP_CONN);
   c->fd = fd;
   w_rv_inherit(c, n);
+  if (n->client) c->client = w_tls_client_dup(n->client);   /* for connect_tls and start_tls */
   return io_ok_ptr(c);
 }
 W_RT ssize_t w_conn_step(WCap *c, int fd, int wr, char *buf, size_t n, int *dir, char *err, size_t en) {
@@ -3125,6 +3128,27 @@ W_RT void w_tls_release(WCap *c) {
   else vtls_free((VTls *)c->tls);
   c->tls = NULL;
 }
+/* A Net's client context, counted among the live objects so the leak check
+   sees one that is never dropped */
+W_RT void *w_tls_client_dup(void *v) { return vtls_client_dup((VTlsClient *)v); }
+W_RT void w_tls_client_drop(void *v) { if (vtls_client_drop((VTlsClient *)v)) __atomic_fetch_sub(&w_live, 1, __ATOMIC_RELAXED); }
+/* `net.trusting(ca)`: a Net with the same allowlist and switch whose TLS
+   clients trust the certificates in ca only (vtls_trusting). Calling it on
+   a trusting Net replaces the trust. */
+W_RT WIo Cap_net_trusting(WCap *n, WStr *pem) {
+  if (w_revoked(n)) return io_err(1, "net: revoked");
+  char err[300];
+  VTlsClient *v = vtls_trusting(pem->data, (size_t)pem->len, err, sizeof err);
+  if (!v) return io_err(2, err);
+  __atomic_fetch_add(&w_live, 1, __ATOMIC_RELAXED);
+  WCap *c = cap_new(CAP_NET);
+  c->hosts = (char **)w_raw(sizeof(char *) * (size_t)(n->nhosts + 1));
+  for (int i = 0; i < n->nhosts; i++) c->hosts[i] = w_strdup(n->hosts[i]);
+  c->nhosts = n->nhosts;
+  c->client = v;
+  w_rv_inherit(c, n);
+  return io_ok_ptr(c);
+}
 W_RT void w_tls_close_notify(WCap *c) { vtls_close_notify((VTls *)c->tls); }
 W_RT int w_tls_step(WCap *c, int wr, char *buf, size_t n, int *dir, char *err, size_t en) {
   int k = vtls_step((VTls *)c->tls, wr ? VTLS_WRITE : VTLS_READ, buf, n > (size_t)INT_MAX ? INT_MAX : (int)n, err, en);
@@ -3149,7 +3173,7 @@ W_RT WIo Cap_net_connect_tls(WCap *n, WStr *addr) {
   WCap *c = (WCap *)r.ptr;
   char err[300];
   if (h[0] == '[') { size_t l = strlen(h); memmove(h, h + 1, l); h[l - 2] = 0; }
-  VTls *t = vtls_client(c->fd, h, err, sizeof err);
+  VTls *t = vtls_client((VTlsClient *)c->client, c->fd, h, err, sizeof err);
   if (!t) { Cap_sock_close(c); Cap_drop(c); return io_err(2, err); }
   c->tls = t;
   for (;;) {
@@ -3196,7 +3220,7 @@ W_RT WIo Cap_conn_start_tls(WCap *c, WStr *host) {
   memcpy(h, host->data, (size_t)host->len); h[host->len] = 0;
   WIo r = io_ok(NULL);
   int cancelled = 0;
-  VTls *t = vtls_client(fd, h, err, sizeof err);
+  VTls *t = vtls_client((VTlsClient *)c->client, fd, h, err, sizeof err);
   if (!t) r = io_err(2, err);
   else {
     c->tls = t;
@@ -3229,6 +3253,14 @@ W_RT WIo Cap_listen_on_tls(WCap *l, WStr *addr, WStr *cert, WStr *key) {
 #else
 #define W_NO_TLS "tls: this program was built without TLS (OpenSSL was not found when it was compiled)"
 W_RT void w_tls_release(WCap *c) { c->tls = NULL; }
+/* without TLS no Net gets a client context */
+W_RT void *w_tls_client_dup(void *v) { return v; }
+W_RT void w_tls_client_drop(void *v) { (void)v; }
+W_RT WIo Cap_net_trusting(WCap *n, WStr *pem) {
+  (void)pem;
+  if (w_revoked(n)) return io_err(1, "net: revoked");
+  return io_err(2, W_NO_TLS);
+}
 W_RT void w_tls_close_notify(WCap *c) { (void)c; }
 W_RT int w_tls_step(WCap *c, int wr, char *buf, size_t n, int *dir, char *err, size_t en) {
   (void)c; (void)wr; (void)buf; (void)n; (void)dir; snprintf(err, en, W_NO_TLS); return -2;
@@ -4393,6 +4425,7 @@ W_WASM_REFUSE(WIo, Cap_listen_on_tls, (WCap *l, WStr *addr, WStr *cert, WStr *ke
 W_WASM_REFUSE(WIo, Cap_accept, (WCap *l))
 W_WASM_REFUSE(WIo, Cap_net_connect, (WCap *n, WStr *addr))
 W_WASM_REFUSE(WIo, Cap_net_connect_tls, (WCap *n, WStr *addr))
+W_WASM_REFUSE(WIo, Cap_net_trusting, (WCap *n, WStr *pem))
 W_WASM_REFUSE(WIo, Cap_conn_start_tls, (WCap *c, WStr *host))
 W_WASM_REFUSE(WIo, Cap_conn_read, (WCap *c))
 W_WASM_REFUSE(WIo, Cap_conn_write, (WCap *c, WStr *s))
@@ -4403,6 +4436,8 @@ W_WASM_REFUSE(WIo, Cap_conn_write_until, (WCap *c, WStr *s, int64_t at, int64_t 
 W_WASM_REFUSE(void, Cap_sock_close, (WCap *c))
 W_WASM_REFUSE(void, w_sock_release_fd, (int fd))
 W_WASM_REFUSE(void, w_tls_release, (WCap *c))
+W_WASM_REFUSE(void *, w_tls_client_dup, (void *v))
+W_WASM_REFUSE(void, w_tls_client_drop, (void *v))
 /* programs, blocking C calls, SQL */
 W_WASM_REFUSE(WIo, Cap_exec_run, (WCap *x, WStr *prog_s, L_Str *args))
 W_WASM_REFUSE(void, w_block_wait, (WBlock *b))

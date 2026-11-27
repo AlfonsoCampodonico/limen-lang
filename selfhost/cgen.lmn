@@ -26,8 +26,8 @@ use pure
 use types
 
 // The first line of the C of a program that may use TLS (Net.get,
-// Net.connect_tls, Listen.on_tls): the build then links OpenSSL and pastes
-// the TLS core in ahead of the runtime.
+// Net.connect_tls, Net.trusting, Listen.on_tls): the build then links
+// OpenSSL and pastes the TLS core in ahead of the runtime.
 pub fn tls_marker() -> Str {
     "/* limen: uses tls */\n"
 }
@@ -1924,6 +1924,10 @@ fn prim(mut self: Cg, ind: Str, dst: Str, t: types.Ty, name: Str, rt: types.Ty, 
             self.tls = true
             self.io_result(ind, dst, t, "Cap_net_connect_tls({arg(0)}, {arg(1)})", "(WCap*)r_.ptr")
         },
+        ("cap_trusting", _) => {
+            self.tls = true
+            self.io_result(ind, dst, t, "Cap_net_trusting({arg(0)}, {arg(1)})", "(WCap*)r_.ptr")
+        },
         ("cap_on_tls", _) => {
             self.tls = true
             self.io_result(ind, dst, t, "Cap_listen_on_tls({arg(0)}, {arg(1)}, {arg(2)}, {arg(3)})", "(WCap*)r_.ptr")
@@ -3491,7 +3495,6 @@ fn flat_in(self: Cg, t: types.Ty, seen: List[Str], mut memo: Map[Str, Bool]) -> 
         _ => true,
     }
 }
-
 
 // Order functions, item by item as the interpreter compares; and hash
 // functions for tuple, struct and enum map keys.

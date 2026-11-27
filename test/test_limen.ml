@@ -6518,6 +6518,244 @@ fn main(root: Root) -> Result[(), IoError] {
   let tls_http_want = "forever: Failed(\"listener is closed\")\nstream: Failed(\"listener is closed\")\n200 GET /x HTTP/1.1 body=\n200 POST /y HTTP/1.1 body=hello\n200 chunked one two three\n200 Some(\"text/plain; charset=utf-8\") GET /net?q=1 HTTP/1.1 body=\n3\nFailed(\"http: the URL must start with http:// or https://\")\n" in
   out "tls-http" ~grants:tls_grants tls_http_src tls_http_want;
   check_tsan "tls-http" ~grants:tls_grants tls_http_src tls_http_want;
+  (* ---------- Net.trusting ----------
+     test/tls/kube holds a CA that SSL_CERT_FILE does not name, a server
+     certificate it signs, and a second CA with a server of its own. The
+     system trust refuses the kube server; a Net that trusts the kube CA
+     takes it, and trusts nothing else. *)
+  let trust_prelude = {v|// Read until a "." arrives, or the peer closes or fails.
+fn read_msg(c: Conn) -> Result[Str, IoError] {
+    let mut got = ""
+    while !got.ends_with(".") {
+        let s = c.read()?
+        if s == "" {
+            return Ok(got)
+        }
+        got = got + s
+    }
+    Ok(got)
+}
+
+// Answer n connections with "kube." once each has said its line.
+fn serve(l: Listener, n: Int) -> Str {
+    let mut i = 0
+    while i < n {
+        match l.accept() {
+            Ok(c) => {
+                match read_msg(c) {
+                    Ok(_) => { let _ = c.write("kube.") },
+                    Err(_) => {},
+                }
+                c.close()
+            },
+            Err(_) => {},
+        }
+        i = i + 1
+    }
+    ""
+}
+
+fn call(net: Net, addr: Str) -> Str {
+    match net.connect_tls(addr) {
+        Ok(c) => {
+            let r = match c.write("hi.") {
+                Ok(_) => "{c.read()}",
+                Err(e) => "{e}",
+            }
+            c.close()
+            r
+        },
+        Err(e) => "{e}",
+    }
+}
+
+fn via(net: Net, ca: Str, addr: Str) -> Str {
+    match net.trusting(ca) {
+        Ok(t) => call(t, addr),
+        Err(e) => "{e}",
+    }
+}
+|v} in
+  let unknown_ca = "Failed(\"tls: certificate verify failed: unable to get local issuer certificate\")" in
+  out "net-trusting" ~grants:tls_grants (trust_prelude ^ {v|
+fn main(root: Root) -> Result[(), IoError] {
+    let fs = root.fs
+    let net = root.net
+    let ca = fs.read("kube/ca.pem")?
+    let other_ca = fs.read("kube/other-ca.pem")?
+    let l = root.listen.on_tls("127.0.0.1:0", fs.read("kube/server.pem")?, fs.read("kube/server-key.pem")?)?
+    let addr = "localhost:{l.port()}"
+    let got = group g {
+        g.go(|| serve(l, 4))
+        g.go(|| [call(net, addr), via(net, ca, addr), via(net, other_ca, addr), via(net, ca, "127.0.0.1:{l.port()}")].join("\n"))
+    }
+    root.stdout.print(got.join("\n"))
+    Ok(())
+}
+|v})
+    (sprintf "\n%s\nOk(\"kube.\")\n%s\nOk(\"kube.\")\n" unknown_ca unknown_ca);
+  out "net-trusting-pem-errors" ~grants:tls_grants {v|fn main(root: Root) -> Result[(), IoError] {
+    let out = root.stdout
+    let net = root.net
+    let ca = root.fs.read("kube/ca.pem")?
+    let cut = ca.slice(0, ca.len() / 2)
+    for text in ["", "not pem", cut, ca + cut, "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n", root.fs.read("kube/ca-key.pem")?] {
+        match net.trusting(text) {
+            Ok(_) => out.print("trusted"),
+            Err(e) => out.print("{e}"),
+        }
+    }
+    Ok(())
+}
+|v}
+    "Failed(\"tls: no PEM certificate in the CA text\")\nFailed(\"tls: no PEM certificate in the CA text\")\nFailed(\"tls: a PEM certificate in the CA text does not parse\")\nFailed(\"tls: a PEM certificate in the CA text does not parse\")\nFailed(\"tls: a PEM certificate in the CA text does not parse\")\nFailed(\"tls: no PEM certificate in the CA text\")\n";
+  out "net-trusting-isolated" ~grants:tls_grants (trust_prelude ^ {v|
+fn main(root: Root) -> Result[(), IoError] {
+    let fs = root.fs
+    let net = root.net
+    let l = root.listen.on_tls("127.0.0.1:0", fs.read("kube/server.pem")?, fs.read("kube/server-key.pem")?)?
+    let sys = root.listen.on_tls("127.0.0.1:0", fs.read("server.pem")?, fs.read("server-key.pem")?)?
+    let a = net.trusting(fs.read("kube/ca.pem")?)?
+    let got = group g {
+        g.go(|| serve(l, 3))
+        g.go(|| serve(sys, 2))
+        g.go(|| [call(net, "localhost:{l.port()}"), call(root.net, "localhost:{l.port()}"), call(a, "localhost:{sys.port()}"), call(net, "localhost:{sys.port()}"), call(a, "localhost:{l.port()}")].join("\n"))
+    }
+    root.stdout.print(got.join("\n"))
+    Ok(())
+}
+|v})
+    (sprintf "\n\n%s\n%s\n%s\nOk(\"kube.\")\nOk(\"kube.\")\n" unknown_ca unknown_ca unknown_ca);
+  out "net-trusting-only" ~grants:tls_grants (trust_prelude ^ {v|
+fn main(root: Root) -> Result[(), IoError] {
+    let fs = root.fs
+    let l = root.listen.on_tls("127.0.0.1:0", fs.read("kube/server.pem")?, fs.read("kube/server-key.pem")?)?
+    let port = l.port()
+    let t = root.net.trusting(fs.read("kube/ca.pem")?)?
+    let got = group g {
+        g.go(|| serve(l, 3))
+        g.go(|| [call(t.only("localhost:{port}"), "localhost:{port}"), call(t.only("localhost").only("localhost:{port}"), "localhost:{port}"), call(t.only("example.com"), "localhost:{port}"), call(root.net.only("localhost"), "localhost:{port}")].join("\n").replace("{port}", "PORT"))
+    }
+    root.stdout.print(got.join("\n"))
+    Ok(())
+}
+|v})
+    (sprintf "\nOk(\"kube.\")\nOk(\"kube.\")\nDenied(\"net: localhost:PORT is not granted\")\n%s\n" unknown_ca);
+  out "net-trusting-http" ~grants:tls_grants {v|use http
+
+fn main(root: Root) -> Result[(), IoError] {
+    let fs = root.fs
+    let l = root.listen.on_tls("127.0.0.1:0", fs.read("kube/server.pem")?, fs.read("kube/server-key.pem")?)?
+    let url = "https://localhost:{l.port()}/"
+    let t = root.net.trusting(fs.read("kube/ca.pem")?)?
+    let got = group g {
+        g.go(|| "served {http.serve(l, 3, |r| http.text(200, "{r.method} {r.path}"))}")
+        g.go(|| {
+            let a = match http.request(t, "GET", url) {
+                Ok(r) => "{r.status} {r.body}",
+                Err(e) => "{e}",
+            }
+            let b = match t.get(url) {
+                Ok(r) => "{r.status} {r.body}",
+                Err(e) => "{e}",
+            }
+            let c = match http.request(root.net, "GET", url) {
+                Ok(r) => "{r.status} {r.body}",
+                Err(e) => "{e}",
+            }
+            "{a}\n{b}\n{c}"
+        })
+    }
+    root.stdout.print(got.join("\n"))
+    Ok(())
+}
+|v}
+    (sprintf "served 2\n200 GET /\n200 GET /\n%s\n" unknown_ca);
+  out "net-trusting-revoked" ~grants:tls_grants (trust_prelude ^ {v|
+fn main(root: Root) -> Result[(), IoError] {
+    let fs = root.fs
+    let ca = fs.read("kube/ca.pem")?
+    let l = root.listen.on_tls("127.0.0.1:0", fs.read("kube/server.pem")?, fs.read("kube/server-key.pem")?)?
+    let addr = "localhost:{l.port()}"
+    let (r, k) = root.net.revocable()
+    let t = r.trusting(ca)?
+    let got = group g {
+        g.go(|| serve(l, 2))
+        g.go(|| {
+            let before = call(t.only(addr), addr)
+            let open = match t.connect_tls(addr) {
+                Ok(c) => {
+                    k.revoke()
+                    let s = "{c.read()}"
+                    c.close()
+                    s
+                },
+                Err(e) => "{e}",
+            }
+            [before, open, call(t, addr), call(t.only(addr), addr), via(r, ca, addr), "{k.is_revoked()}"].join("\n")
+        })
+    }
+    root.stdout.print(got.join("\n"))
+    Ok(())
+}
+|v})
+    "\nOk(\"kube.\")\nErr(Failed(\"connection is closed\"))\nDenied(\"net: revoked\")\nDenied(\"net: revoked\")\nDenied(\"net: revoked\")\ntrue\n";
+  out "net-trusting-bundle" ~grants:tls_grants (trust_prelude ^ {v|
+fn main(root: Root) -> Result[(), IoError] {
+    let fs = root.fs
+    let net = root.net
+    let ca = fs.read("kube/ca.pem")?
+    let other_ca = fs.read("kube/other-ca.pem")?
+    let a = root.listen.on_tls("127.0.0.1:0", fs.read("kube/server.pem")?, fs.read("kube/server-key.pem")?)?
+    let b = root.listen.on_tls("127.0.0.1:0", fs.read("kube/other-server.pem")?, fs.read("kube/other-server-key.pem")?)?
+    let both = net.trusting(ca + other_ca)?
+    let kube = net.trusting(ca)?
+    let replaced = both.trusting(other_ca)?
+    let got = group g {
+        g.go(|| serve(a, 2))
+        g.go(|| serve(b, 3))
+        g.go(|| [call(both, "localhost:{a.port()}"), call(both, "localhost:{b.port()}"), call(kube, "localhost:{b.port()}"), call(replaced, "localhost:{a.port()}"), call(replaced, "localhost:{b.port()}")].join("\n"))
+    }
+    root.stdout.print(got.join("\n"))
+    Ok(())
+}
+|v})
+    (sprintf "\n\nOk(\"kube.\")\nOk(\"kube.\")\n%s\n%s\nOk(\"kube.\")\n" unknown_ca unknown_ca);
+  out "net-trusting-crlf" ~grants:tls_grants (trust_prelude ^ {v|
+fn main(root: Root) -> Result[(), IoError] {
+    let fs = root.fs
+    let ca = (fs.read("kube/ca.pem")?).replace("\n", "\r\n")
+    let l = root.listen.on_tls("127.0.0.1:0", fs.read("kube/server.pem")?, fs.read("kube/server-key.pem")?)?
+    let got = group g {
+        g.go(|| serve(l, 1))
+        g.go(|| via(root.net, "\r\n" + ca, "localhost:{l.port()}"))
+    }
+    root.stdout.print(got.join("\n"))
+    Ok(())
+}
+|v})
+    "\nOk(\"kube.\")\n";
+  out "net-trusting-leak" ~grants:tls_grants {v|fn main(root: Root) -> Result[(), IoError] {
+    let ca = root.fs.read("kube/ca.pem")?
+    let net = root.net
+    let mut kept = net.trusting(ca)?
+    let mut i = 0
+    let mut failed = 0
+    while i < 2000 {
+        let t = net.trusting(ca)?
+        if i % 2 == 0 {
+            kept = t.only("localhost").trusting(ca)?
+        }
+        if net.trusting("x").is_err() {
+            failed = failed + 1
+        }
+        i = i + 1
+    }
+    root.stdout.print("{failed} {kept.only("localhost").connect("localhost:1").is_err()}")
+    Ok(())
+}
+|v}
+    "2000 true\n";
   (* A TLS stream that ends without the close message may have been cut
      short: Conn.read says so, and Net.get accepts it only when the response
      is framed (Content-Length or chunked) and complete. *)
@@ -10618,6 +10856,17 @@ fn main(root: Root) {
   ok "caps-grants" (code = 0 && o = "main  Root\ngrant exec=echo hi|-n\ngrant exec=sh -c\n") (sprintf "code %d, out %S, err %S" code o e);
   let code, o, _ = limen_cli [ "caps"; gexec; "--json" ] in
   ok "caps-grants-json" (code = 0 && Interp_util.find_sub o {|"grants":["exec=echo hi|-n","exec=sh -c"]|} 0 <> None) o;
+  (* trusting narrows a Net as only does: a function that calls it on the
+     Net it was given still needs Net *)
+  (if selected "net-trusting-caps" then begin
+    let f = Filename.temp_file "trusting" ".lmn" in
+    let oc = open_out f in
+    output_string oc "fn trust(net: Net, ca: Str) -> Result[Net, IoError] {\n    net.trusting(ca)\n}\n\nfn main(root: Root) {\n    let _ = trust(root.net, \"\")\n}\n";
+    close_out oc;
+    let code, o, e = limen_cli [ "caps"; f ] in
+    ok "net-trusting-caps" (code = 0 && o = "trust  Net\nmain   Root\n") (sprintf "code %d, out %S, err %S" code o e);
+    Sys.remove f
+  end);
   (if selected "fn-field-caps" then begin
     let f = Filename.temp_file "fnfield" ".lmn" in
     let oc = open_out f in
