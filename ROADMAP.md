@@ -12,7 +12,7 @@ then harden it, then promise not to break it.
 This file is the plan. The design doc keeps the reasons and the history of
 what was done; its older lists of what was missing point here.
 
-Updated 2026-11-27, with the 0.8 leftovers.
+Updated 2026-11-27, after 0.8.1.
 
 ## 0.4: a server you can leave running (done, 0.4.0)
 
@@ -209,8 +209,8 @@ the loader. The parser and lexer keep threading their state by design.
   shipped as one generated C file, so building Limen needs only a C
   compiler. Then decide whether the interpreter, formatter, language
   server, `doc` and the MCP server move to Limen or stay in OCaml.
-- A playground and short videos beside the book. Built so far for the
-  playground: the self-hosted compiler builds to WebAssembly
+- A playground and short videos beside the book. The playground is done
+  (shipped early, in 0.8.1, at book.limen-lang.org/play): the self-hosted compiler builds to WebAssembly
   (`dev/wasm/build.sh`, about 1.6 MB gzipped) and runs in node and in a
   browser through one WASI shim (`dev/wasm/wasi.mjs`), with the native
   compiler's `check --json` and `caps --json`; `limen eval` runs a program
@@ -219,8 +219,8 @@ the loader. The parser and lexer keep threading their state by design.
   Fs, Listen, Env, Exec and Foreign capabilities); `dev/release/wasm.sh`
   writes the two files a release adds. `eval` is only in the self-hosted
   compiler: the one deliberate exception to every change going into both
-  compilers. Left: the page and its workers, and serving `/play`, in
-  limen-book.
+  compilers. The book's `/play` page runs it in a worker. Left: the
+  short videos.
 
 Done when someone can install Limen, add a package and publish their own
 without reading anything but the book.
