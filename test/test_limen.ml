@@ -1371,6 +1371,7 @@ fn client(net: Net, port: Int, k: Int) -> Int {
   errs "chan-in-struct" "struct S { c: Chan[Int] }\nfn main(root: Root) {}" [ "E0305" ];
   panics "div-zero" (main_wrap "    let z = 0\n    out.print(\"{1 / z}\")") "division by zero";
   panics "index-oob" (main_wrap "    let xs = [1]\n    out.print(\"{xs[3]}\")") "index 3 is out of range for a list of length 1";
+  panics "bytes-index-panic" (main_wrap "    let b = bytes([1, 2])\n    out.print(\"{b[5]}\")") "index 5 is out of range for bytes of length 2";
   panics "panic-fn" (main_wrap "    panic(\"boom\")") "boom";
 
   (* ---------- exit codes ---------- *)
@@ -4040,6 +4041,14 @@ fn bump(mut m: Int) {
          [ "contents"; "value" ])
   in
   ok "lsp-hover-mut" (mut_hover = "```limen\nfn bump(mut n: Int)\n```") mut_hover;
+  let pl, pc = mut_pos "n: Int" 0 in
+  let param_hover =
+    J.to_str
+      (J.path
+         (result (Lsp.handle st (req "textDocument/hover" (J.Obj [ ("textDocument", J.Obj [ ("uri", J.String mut_uri) ]); ("position", J.Obj [ ("line", J.Int pl); ("character", J.Int pc) ]) ]))))
+         [ "contents"; "value" ])
+  in
+  ok "lsp-hover-mut-param" (param_hover = "```limen\nmut n: Int\n```") param_hover;
   let kl, kc = mut_pos "k)" 0 in
   let mut_actions =
     result

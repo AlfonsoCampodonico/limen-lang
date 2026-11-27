@@ -175,7 +175,7 @@ let hover_items text items =
     (function
       | IFn d ->
         add d.fn_span (match d.fn_test with Some n -> test_label d n | None -> fn_signature text d);
-        List.iter (fun p -> add p.prm_span (p.prm_name ^ ": " ^ slice text p.prm_ty.tspan)) d.fn_params;
+        List.iter (fun p -> add p.prm_span ((if p.prm_mut then "mut " else "") ^ p.prm_name ^ ": " ^ slice text p.prm_ty.tspan)) d.fn_params;
         walk_block
           (fun e ->
             (match e.ety with Types.TErr -> () | t -> add e.espan (show t));

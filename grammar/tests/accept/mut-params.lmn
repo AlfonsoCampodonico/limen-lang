@@ -1,0 +1,17 @@
+fn g(mut n: Int) {
+    n = n + 1
+}
+
+fn f(mut n: Int) {
+    g(mut n)
+}
+
+struct Buf {
+    n: Int,
+}
+
+fn grow(mut self: Buf) {
+    self.n = self.n + 1
+}
+
+fn main() {}
