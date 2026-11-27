@@ -20,6 +20,8 @@
 # book's examples when the book is checked out next to this repository
 # (or at $LIMEN_BOOK). With the book there, it also checks that the design
 # copied from it into src/design (dev/design_sync.py) is still the same.
+# Last, with a wasm32-wasip1 toolchain, the compiler built to WebAssembly
+# (dev/wasm/build.sh) gives the JSON this one does (dev/wasm/check.sh).
 set -e
 cd "$(dirname "$0")/.."
 dune build ./bin/main.exe ./selfhost/tokdump/tokdump.exe ./selfhost/astdump/astdump.exe ./selfhost/loaddump/loaddump.exe ./selfhost/checkdump/checkdump.exe ./selfhost/irdump/irdump.exe ./selfhost/cdump/cdump.exe
@@ -320,5 +322,11 @@ if [ -d "$book" ]; then
   [ "$bad_runs" -eq 0 ] || failed=1
 else
   echo "skipped the book's examples: no $book"
+fi
+# the compiler built to WebAssembly, for the playground, against this one
+if sh dev/wasm/build.sh --probe; then
+  if sh dev/wasm/build.sh && LIMEN_TSC="$out/tsc" sh dev/wasm/check.sh; then :; else failed=1; fi
+else
+  echo "wasm: skipped, no wasm32-wasip1 toolchain"
 fi
 [ "$failed" -eq 0 ]

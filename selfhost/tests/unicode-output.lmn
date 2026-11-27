@@ -1,0 +1,5 @@
+fn main(root: Root) -> Int {
+    let café = 1
+    root.stdout.print("{naïve}")
+    0
+}

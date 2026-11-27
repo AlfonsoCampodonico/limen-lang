@@ -349,7 +349,9 @@ __attribute__((noreturn)) W_RT void w_unwind_to(WCatch **slot, WCatch *c) {
   c->unwinding = 1;
   memset(&c->uexc, 0, sizeof c->uexc);
   c->uexc.exception_class = 0x56454c4150414e43ULL; /* "LIMENPANC" */
+#ifndef LIMEN_WASM   /* no unwinder in the WebAssembly build: the plain jump */
   _Unwind_ForcedUnwind(&c->uexc, w_unwind_stop, c);
+#endif
   _longjmp(c->jb, 1);
 }
 __attribute__((noreturn)) W_RT void w_panic_c(const char *msg, const char *where) {
@@ -762,8 +764,8 @@ W_RT void w_usage(const char *m) {
   exit(2);
 }
 W_RT void w_init(int argc, char **argv) {
+#ifndef LIMEN_WASM   /* WebAssembly has no sockets, no descriptor limit and no sandbox to enter */
   signal(SIGPIPE, SIG_IGN);   /* a peer closing a socket is an error value, not a crash */
-  w_seed_hash();
   {
     struct rlimit rl;
     if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
@@ -771,6 +773,8 @@ W_RT void w_init(int argc, char **argv) {
       if (rl.rlim_cur < want) { rl.rlim_cur = want; setrlimit(RLIMIT_NOFILE, &rl); }
     }
   }
+#endif
+  w_seed_hash();
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--") == 0) { g_args = argv + i + 1; g_nargs = argc - i - 1; break; }
     if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) { g_rand_state = (uint64_t)strtoll(argv[++i], NULL, 10); g_rand_seeded = true; continue; }
@@ -814,6 +818,7 @@ W_RT void w_init(int argc, char **argv) {
   }
   /* restrict the whole process to the grants (limen_sandbox.h), before any
      thread starts; --no-sandbox turns it off, for debugging */
+#ifndef LIMEN_WASM
   if (!g_no_sandbox) {
     /* the programs Exec may start, for the sandbox: each entry's name */
     WBuf pb; buf_init(&pb);
@@ -831,6 +836,7 @@ W_RT void w_init(int argc, char **argv) {
     }
     free(pb.p);
   }
+#endif
 }
 W_RT WCap *w_root(void) { return cap_new(CAP_ROOT); }
 W_RT WCap *Cap_root_field(WCap *root, const char *f) {
@@ -1280,6 +1286,7 @@ W_RT int32_t w_prof_enter(int32_t id) {
   return prev;
 }
 W_RT void w_prof_leave(int32_t *prev) { w_prof_cur = *prev; }
+#ifndef LIMEN_WASM /* the profiler's timer, fibers, the scheduler, its threads and stack-overflow handler: the WebAssembly build has its own (end of this file) */
 static void w_prof_tick(int sig) {
   (void)sig;
   int32_t c = w_prof_cur;
@@ -1670,6 +1677,7 @@ W_RT void w_main_finished(void) {
   pthread_cond_broadcast(&w_idle_cv);
   pthread_mutex_unlock(&w_idle_mu);
 }
+#endif /* !LIMEN_WASM */
 /* cancelled as a task, or inside a group body whose deadline passed */
 W_RT int w_scopes_stopped(WScope *sc) {
   for (; sc; sc = sc->prev) if (__atomic_load_n(sc->stop, __ATOMIC_ACQUIRE)) return 1;
@@ -1748,6 +1756,7 @@ W_RT int64_t w_deadline_ms(int64_t ms) {
   return w_mono_ns() + ms * 1000000;
 }
 
+#ifndef LIMEN_WASM /* the timer thread, and sleeping: the WebAssembly build has its own (end of this file) */
 W_RT void w_tm_swap(int64_t i, int64_t j) {
   WTimer *t = w_tm_heap[i]; w_tm_heap[i] = w_tm_heap[j]; w_tm_heap[j] = t;
   w_tm_heap[i]->pos = i; w_tm_heap[j]->pos = j;
@@ -1870,6 +1879,7 @@ W_RT int w_nap(int64_t ms) {
 
 /* Clock.sleep(ms): park until the time has passed. */
 W_RT void Cap_sleep(int64_t ms) { if (w_nap(ms) < 0) w_cancel_unwind(); }
+#endif /* !LIMEN_WASM */
 pthread_mutex_t w_out_mu = PTHREAD_MUTEX_INITIALIZER;
 __thread int w_out_locked;
 size_t w_held;
@@ -1971,6 +1981,7 @@ W_RT void w_out_unhold(void) {
   }
   w_out_unlock();
 }
+#ifndef LIMEN_WASM /* groups and channels: the WebAssembly build has its own (end of this file) */
 W_RT void w_group_deadline(void *p) { w_group_cancel((WGroup *)p); }
 /* ordered: 0 for `group g interleaved` */
 W_RT WGroup *w_group_new(int ordered) {
@@ -2354,6 +2365,7 @@ W_RT void w_chan_close(WChan *c, const char *where) {
   while (wake) { WChWait *n = wake->next; w_wake(wake->f); wake = n; }
 }
 
+#endif /* !LIMEN_WASM */
 W_RT void w_catch_release(WCatch *c) {
   WHdr *end = &c->objs;
   /* 1. nothing abandoned may be freed by the decrements below */
@@ -2402,6 +2414,7 @@ W_RT void w_catch_release(WCatch *c) {
   }
 }
 
+#ifndef LIMEN_WASM /* select, the poller, sockets, TLS and waiting for stdin: the WebAssembly build has its own (end of this file) */
 /* Try one operation with its channel locked. Returns 1 if done; *wake gets
    a fiber to wake after unlocking. A send on a closed channel returns -1. */
 W_RT int w_sel_try(WSelOp *op, WFiber **wake) {
@@ -3262,6 +3275,7 @@ W_RT int w_in_fill(void) {
     return 1;
   }
 }
+#endif /* !LIMEN_WASM */
 W_RT void w_in_consume(int64_t n) { memmove(w_in_buf, w_in_buf + n, (size_t)(w_in_len - n)); w_in_len -= n; }
 W_RT WStr *Cap_stdin_line(bool *ok) {
   w_out_unhold();
@@ -3450,6 +3464,7 @@ W_RT WStr *w_block_str(WBlock *b) {
   if (slot && *slot) w_hdr_link(&(*slot)->objs, (WHdr *)s - 1);
   return s;
 }
+#ifndef LIMEN_WASM /* the blocking-call pool and SQL statements: the WebAssembly build has its own (end of this file) */
 W_RT void *w_bl_thread(void *arg) {
   (void)arg;
   pthread_mutex_lock(&w_bl_mu);
@@ -3604,6 +3619,7 @@ W_RT WStr *w_sql_open(const void *const *api, WStr *root, WStr *name, int64_t fl
   free(o.p);
   return s;
 }
+#endif /* !LIMEN_WASM */
 /* The int64 or double at byte `at` of Bytes (the machine's order), and a
    Float's bits: for the sql module's results and parameters. */
 W_RT int64_t w_bytes_int(WStr *b, int64_t at, const char *where) {
@@ -3930,6 +3946,7 @@ W_RT WCap *Cap_exec_only_args(WCap *x, WStr *prog_s, L_Str *qs) {
   free(prog);
   return exec_with(x, entry);
 }
+#ifndef LIMEN_WASM /* running programs: the WebAssembly build has its own (end of this file) */
 W_RT WIo Cap_exec_run(WCap *x, WStr *prog_s, L_Str *args) {
   if (w_revoked(x)) return io_err(1, "exec: revoked");
   if (memchr(prog_s->data, 0, (size_t)prog_s->len)) return io_err(2, "exec: the program name contains a NUL byte");
@@ -4044,6 +4061,7 @@ done:
   return res;
 }
 
+#endif /* !LIMEN_WASM */
 W_RT int64_t w_find_bytes(const char *d, int64_t n, const char *pat, int64_t from) {
   int64_t m = (int64_t)strlen(pat);
   for (int64_t i = from; i + m <= n; i++) if (memcmp(d + i, pat, (size_t)m) == 0) return i;
@@ -4221,3 +4239,133 @@ W_RT WIo Cap_net_get(WCap *n, WStr *url_s) {
   Cap_drop(conn);
   return r;
 }
+
+#ifdef LIMEN_WASM
+/* ---------- the WebAssembly build ----------
+   With LIMEN_WASM (dev/wasm/build.sh) the runtime is built for wasm32-wasip1,
+   which has one thread and no way to switch stacks. main runs directly on
+   the wasm stack as the only fiber, so panics, `catch`, printing, files,
+   the clock and random numbers work as they do natively, with two
+   differences: a panic jumps to its boundary (longjmp, which the build turns
+   into a wasm exception) without running the cleanups of the frames it
+   leaves, so deferred code does not run then and the boundary's list frees
+   what those frames owned (w_catch_release); and stdin is a plain blocking
+   read. Whatever needs another fiber, a thread or more of the operating
+   system panics instead, naming the runtime function: tasks, groups,
+   channels, select, sockets, TLS, programs, blocking C calls and SQL. */
+
+__attribute__((noreturn)) static void w_wasm_refuse(const char *name) {
+  char m[128];
+  snprintf(m, sizeof m, "not in the WebAssembly build: %s", name);
+  w_panic_c(m, "?");
+}
+#define W_WASM_REFUSE(ret, name, params) W_RT ret name params { w_wasm_refuse(#name); }
+
+/* main, the one fiber */
+static WWorker w_wasm_worker;
+static WFiber w_wasm_main;
+WFiber *w_main_fiber;
+W_RT void w_run(void (*entry)(void *), void *arg) {
+  w_wasm_main.entry = entry; w_wasm_main.arg = arg;
+  w_main_fiber = &w_wasm_main;
+  w_wasm_worker.current = &w_wasm_main;
+  w_self_tls = &w_wasm_worker;
+  entry(arg);
+  w_wasm_worker.current = NULL;
+}
+W_RT void w_main_finished(void) { __atomic_store_n(&w_main_done, 1, __ATOMIC_RELEASE); }
+W_RT WFiber *w_current(void) { return w_self()->current; }
+__attribute__((noinline)) W_RT WCatch **w_catch_slot(void) {
+  WWorker *w = w_self();
+  if (!w || !w->current) return NULL;
+  return &w->current->catch_top;
+}
+W_RT void w_mark_unwinding(void) { w_self()->current->unwinding = 1; }
+W_RT void w_prof_start(const char *const *names, int64_t *calls, int64_t *samples, int32_t n) {
+  (void)names; (void)samples; (void)n;
+  w_prof_calls = calls;   /* counts calls; there is no timer to sample with */
+}
+
+/* Nothing can wake a fiber that waits: every wait is refused. */
+W_RT void w_prepare_park(void) { w_wasm_refuse("w_prepare_park"); }
+W_RT void w_park_now(void) { w_wasm_refuse("w_park_now"); }
+W_RT void w_park(void (*after)(void *), void *arg) { (void)after; (void)arg; w_wasm_refuse("w_park"); }
+W_RT void w_wake(WFiber *f) { (void)f; w_wasm_refuse("w_wake"); }
+
+/* Clock.sleep: the thread sleeps, as there is nothing else to run */
+W_RT void Cap_sleep(int64_t ms) {
+  if (ms <= 0) return;
+  struct timespec ts = { (time_t)(ms / 1000), (long)(ms % 1000) * 1000000 };
+  while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {}
+}
+
+/* stdin: one reader, so no lock, and a read that blocks */
+char *w_in_buf;
+int64_t w_in_len, w_in_cap;
+int w_in_eof, w_in_direct;
+W_RT void w_in_acquire(void) {}
+W_RT void w_in_release(void) {}
+W_RT int w_in_fill(void) {
+  fflush(stdout);   /* a prompt shows before the read */
+  if (w_in_cap - w_in_len < 65536) {
+    while (w_in_cap - w_in_len < 65536) w_in_cap = w_in_cap ? w_in_cap * 2 : 65536;
+    w_in_buf = (char *)w_realloc(w_in_buf, (size_t)w_in_cap);
+  }
+  ssize_t n;
+  do n = read(0, w_in_buf + w_in_len, 65536); while (n < 0 && errno == EINTR);
+  if (n <= 0) { w_in_eof = 1; return 0; }
+  w_in_len += n;
+  return 1;
+}
+
+/* crypto comes with OpenSSL, which this build does not have */
+W_RT WStr *w_crypto(int64_t op, WStr *a, WStr *b, WStr *c, WStr *d) {
+  (void)op; (void)a; (void)b; (void)c; (void)d;
+  const char *m = "crypto: this program was built without OpenSSL";
+  WStr *s = Str_new((int64_t)strlen(m) + 1); s->data[0] = 1; memcpy(s->data + 1, m, strlen(m)); return s;
+}
+
+/* tasks and groups */
+W_WASM_REFUSE(WGroup *, w_group_new, (int ordered))
+W_WASM_REFUSE(WGroup *, w_group_new_until, (int64_t ms, int ordered))
+W_WASM_REFUSE(void, w_group_cancel, (WGroup *g))
+W_WASM_REFUSE(void, w_scope_push, (WScope *sc, WGroup *g))
+W_WASM_REFUSE(void, w_scope_pop, (WScope *sc))
+W_WASM_REFUSE(void, w_scope_land, (WCatch *c, WScope *sc))
+W_WASM_REFUSE(void, w_spawn, (WGroup *g, WClo *fn, void (*run)(WTask *), size_t slot, bool keep))
+W_WASM_REFUSE(void, w_group_wait, (WGroup *g, int cancellable))
+W_WASM_REFUSE(void, w_group_cleanup, (WGroup *g))
+W_WASM_REFUSE(void, w_group_release_tasks, (WGroup *g))
+W_WASM_REFUSE(void, w_group_reraise, (WGroup *g))
+W_WASM_REFUSE(void, Group_drop, (WGroup *g))
+/* channels and select */
+W_WASM_REFUSE(WChan *, w_chan_new, (int64_t cap, size_t esz, void (*edrop)(void *), void (*eshare)(void *), const char *where))
+W_WASM_REFUSE(void, Chan_drop, (WChan *c))
+W_WASM_REFUSE(void, Chan_show, (WBuf *b, WChan *c, bool top))
+W_WASM_REFUSE(WChWait *, w_chq_pop_live, (WChWait **h, WChWait **t))
+W_WASM_REFUSE(void, w_chan_send, (WChan *c, void *v, const char *where))
+W_WASM_REFUSE(bool, w_chan_recv, (WChan *c, void *out))
+W_WASM_REFUSE(void, w_chan_close, (WChan *c, const char *where))
+W_WASM_REFUSE(int, w_select, (WSelOp *ops, int n, int has_default, const char *where))
+/* sockets and TLS */
+W_WASM_REFUSE(WIo, Cap_listen_on, (WCap *l, WStr *addr))
+W_WASM_REFUSE(WIo, Cap_listen_on_tls, (WCap *l, WStr *addr, WStr *cert, WStr *key))
+W_WASM_REFUSE(WIo, Cap_accept, (WCap *l))
+W_WASM_REFUSE(WIo, Cap_net_connect, (WCap *n, WStr *addr))
+W_WASM_REFUSE(WIo, Cap_net_connect_tls, (WCap *n, WStr *addr))
+W_WASM_REFUSE(WIo, Cap_conn_start_tls, (WCap *c, WStr *host))
+W_WASM_REFUSE(WIo, Cap_conn_read, (WCap *c))
+W_WASM_REFUSE(WIo, Cap_conn_write, (WCap *c, WStr *s))
+W_WASM_REFUSE(WIo, Cap_conn_read_within, (WCap *c, WCap *clock, int64_t ms))
+W_WASM_REFUSE(WIo, Cap_conn_write_within, (WCap *c, WCap *clock, int64_t ms, WStr *s))
+W_WASM_REFUSE(WIo, Cap_conn_read_until, (WCap *c, int64_t at, int64_t ms))
+W_WASM_REFUSE(WIo, Cap_conn_write_until, (WCap *c, WStr *s, int64_t at, int64_t ms))
+W_WASM_REFUSE(void, Cap_sock_close, (WCap *c))
+W_WASM_REFUSE(void, w_sock_release_fd, (int fd))
+W_WASM_REFUSE(void, w_tls_release, (WCap *c))
+/* programs, blocking C calls, SQL */
+W_WASM_REFUSE(WIo, Cap_exec_run, (WCap *x, WStr *prog_s, L_Str *args))
+W_WASM_REFUSE(void, w_block_wait, (WBlock *b))
+W_WASM_REFUSE(WStr *, w_sql_run, (const void *const *api, int64_t db, WStr *text, WStr *params, int64_t mode))
+W_WASM_REFUSE(WStr *, w_sql_open, (const void *const *api, WStr *root, WStr *name, int64_t flags))
+#endif /* LIMEN_WASM */
