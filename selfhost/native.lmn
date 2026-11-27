@@ -374,18 +374,32 @@ fn word_byte(c: Int) -> Bool {
     (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95
 }
 
+// One item of a split program's header, as split_program collects it.
+enum HeaderItem {
+    // text that stays in the header
+    HeaderText(Str),
+    // a prototype, `static`, of a function a piece or a macro defines
+    HeaderProto(Str),
+    // a definition's prototype, `static`: the function's name, and it
+    HeaderSig(Str, Str),
+}
+
 // The program's C (what follows the runtime) as the header its pieces
 // share and the pieces, as split_program in src/native.ml cuts it; None
 // for a shape it does not expect, and the program compiles as one file.
+// A function no other piece names, and the header and the variables don't
+// either, stays `static` and takes its prototypes to its own piece.
 pub fn split_program(text: Str) -> Option[(Str, List[Str])] {
     let lines = text.split("\n")
     let n = lines.len()
     // the header; a prototype waits to learn whether its function moves to
-    // a piece (a function a macro defines stays static): (text, prototype)
-    let mut shared: List[(Str, Bool)] = []
-    let mut moved: Map[Str, Bool] = map()
+    // a piece (a function a macro defines stays static), and a definition's
+    // prototype whether its function stays static
+    let mut shared: List[HeaderItem] = []
+    // a moved function's name, and the pieces that name it as a bit set
+    let mut moved: Map[Str, Int] = map()
     let mut vars: List[Str] = []
-    let mut defs: List[(Int, Str)] = []
+    let mut defs: List[(Int, Option[Str], Str)] = []
     let mut i = 0
     while i < n {
         let start = i
@@ -405,9 +419,9 @@ pub fn split_program(text: Str) -> Option[(Str, List[Str])] {
         i = i + 1
         let item = lines.skip(start).take(last - start + 1).join("\n")
         if first.starts_with("static inline ") || first.starts_with("static const ") {
-            shared.push((item, false))
+            shared.push(HeaderText(item))
         } else if first.starts_with("int main(") {
-            defs.push((last - start + 1, item))
+            defs.push((last - start + 1, None, item))
         } else if first.starts_with("static ") {
             let signature = match first.index_of(") \{") {
                 Some(k) if !first.slice(0, k).contains(" = ") => Some(k),
@@ -417,19 +431,20 @@ pub fn split_program(text: Str) -> Option[(Str, List[Str])] {
             match signature {
                 // a definition
                 Some(k) => {
-                    moved[name_of(first)] = true
-                    shared.push((unstatic(first.slice(0, k + 1)) + ";", false))
-                    defs.push((last - start + 1, unstatic(item)))
+                    let name = name_of(first)
+                    moved[name] = 0
+                    shared.push(HeaderSig(name, first.slice(0, k + 1) + ";"))
+                    defs.push((last - start + 1, Some(name), item))
                 },
                 // a prototype
-                None if assigns.is_none() && last == start && first.contains("(") && first.ends_with(");") => shared.push((first, true)),
+                None if assigns.is_none() && last == start && first.contains("(") && first.ends_with(");") => shared.push(HeaderProto(first)),
                 // a variable
                 None if lines[last].ends_with(";") && (assigns.is_some() || last == start) => {
                     let decl = match assigns {
                         Some(k) => first.slice(0, k),
                         None => first.slice(0, first.len() - 1),
                     }
-                    shared.push(("extern " + unstatic(decl) + ";", false))
+                    shared.push(HeaderText("extern " + unstatic(decl) + ";"))
                     vars.push(unstatic(item))
                 },
                 None => {
@@ -437,13 +452,9 @@ pub fn split_program(text: Str) -> Option[(Str, List[Str])] {
                 },
             }
         } else {
-            shared.push((item, false))
+            shared.push(HeaderText(item))
         }
     }
-    let header = shared.map(|e| {
-        let (t, proto) = e
-        if proto && moved.contains(name_of(t)) { unstatic(t) + "\n" } else { t + "\n" }
-    })
     let total = defs.fold(0, |a, p| a + p.0)
     let wanted = (total + piece_lines() - 1) / piece_lines()
     let count = if wanted < 1 { 1 } else if wanted > pieces_max() { pieces_max() } else { wanted }
@@ -452,19 +463,128 @@ pub fn split_program(text: Str) -> Option[(Str, List[Str])] {
     if count == 1 {
         return Some(("", [text]))
     }
+    // each definition's piece
+    let mut placed: List[(Int, Option[Str], Str)] = []
+    let mut acc = 0
+    for (k, name, t) in defs {
+        let share = acc * count / (if total < 1 { 1 } else { total })
+        placed.push((if share > count - 1 { count - 1 } else { share }, name, t))
+        acc = acc + k
+    }
+    // who names each moved function, a C identifier at a time: piece p is
+    // bit p, the header and the variables bit pieces_max(). The runtime's
+    // list and map macros, which the header invokes, paste names together:
+    // LIMEN_LIST_FUNCS(T3, T1*, T1) calls T1_dup. So in the header a word x
+    // names every moved function x_... as well.
+    let outside = 1 << pieces_max()
+    let mut pasted: Map[Str, List[Str]] = map()
+    for f in moved.keys() {
+        let b = f.bytes()
+        for k in 1..<b.len() {
+            if b[k] == 95 {
+                let x = f.slice(0, k)
+                if pasted.contains(x) {
+                    pasted[x].push(f)
+                } else {
+                    pasted[x] = [f]
+                }
+            }
+        }
+    }
+    for (p, _, t) in placed {
+        mark_names(mut moved, mut pasted, t, 1 << p, outside)
+    }
+    // a moved function's own prototypes don't count
+    for e in shared {
+        match e {
+            HeaderText(t) => mark_names(mut moved, mut pasted, t, outside, outside),
+            HeaderProto(t) if !moved.contains(name_of(t)) => mark_names(mut moved, mut pasted, t, outside, outside),
+            _ => {},
+        }
+    }
+    mark_names(mut moved, mut pasted, vars.join("\n"), outside, outside)
+    // the piece each function that stays static is in
+    let mut local: Map[Str, Int] = map()
+    for (p, name, _) in placed {
+        match name {
+            Some(f) if (moved[f] | (1 << p)) == 1 << p => {
+                local[f] = p
+            },
+            _ => {},
+        }
+    }
+    let mut header: List[Str] = []
     let mut pieces: List[List[Str]] = []
     while pieces.len() < count {
         pieces.push([])
     }
-    pieces[0] = vars.map(|v| v + "\n")
-    let mut acc = 0
-    for (k, t) in defs {
-        let share = acc * count / (if total < 1 { 1 } else { total })
-        let at = if share > count - 1 { count - 1 } else { share }
-        pieces[at].push(t + "\n")
-        acc = acc + k
+    for e in shared {
+        match e {
+            HeaderText(t) => header.push(t + "\n"),
+            HeaderProto(t) if !moved.contains(name_of(t)) => header.push(t + "\n"),
+            HeaderProto(t) => match local.get(name_of(t)) {
+                Some(p) => pieces[p].push(t + "\n"),
+                None => header.push(unstatic(t) + "\n"),
+            },
+            HeaderSig(f, t) => match local.get(f) {
+                Some(p) => pieces[p].push(t + "\n"),
+                None => header.push(unstatic(t) + "\n"),
+            },
+        }
+    }
+    for v in vars {
+        pieces[0].push(v + "\n")
+    }
+    for (p, name, t) in placed {
+        let keep = match name {
+            Some(f) => local.contains(f),
+            None => true,
+        }
+        pieces[p].push((if keep { t } else { unstatic(t) }) + "\n")
     }
     Some((header.join(""), pieces.map(|p| p.join(""))))
+}
+
+// Marks in `moved` the pieces that name each moved function: `t` is
+// piece code, or the header's when `bit` is `outside`, where a word also
+// names the functions `pasted` has for it.
+fn mark_names(mut moved: Map[Str, Int], mut pasted: Map[Str, List[Str]], t: Str, bit: Int, outside: Int) {
+    let b = t.bytes()
+    let m = b.len()
+    let mut j = 0
+    while j < m {
+        if !word_byte(b[j]) {
+            j = j + 1
+            continue
+        }
+        let s = j
+        while j < m && word_byte(b[j]) {
+            j = j + 1
+        }
+        // a number
+        if b[s] <= 57 {
+            continue
+        }
+        let w = t.slice(s, j)
+        match moved.get(w) {
+            Some(r) if (r & bit) == 0 => {
+                moved[w] = r | bit
+            },
+            _ => {},
+        }
+        if bit == outside {
+            match pasted.get(w) {
+                Some(fs) => {
+                    for f in fs {
+                        moved[f] = moved[f] | outside
+                    }
+                    // once is enough
+                    pasted.remove(w)
+                },
+                None => {},
+            }
+        }
+    }
 }
 
 // Run every command at once: Ok, or the output of the first that failed.

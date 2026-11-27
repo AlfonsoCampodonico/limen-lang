@@ -3250,6 +3250,111 @@ test "channels" {
       in
       ok "limen-test-native" (got = want) (String.concat "; " (List.map (fun (n, m) -> n ^ "=" ^ Option.value ~default:"ok" m) got))
   end;
+  (* split builds: a function no other piece names keeps `static`, its
+     prototypes in its own piece; one another piece reaches loses it. The
+     C defines functions in the order calls find them, so a chain of
+     steps, each calling the next, lands mostly within pieces. [step1] is a
+     prefix of [step10] and [step100], which call their own next steps. *)
+  (let steps = 400 in
+   let chain =
+     String.concat ""
+       (List.init (steps - 1) (fun i ->
+            let i = i + 1 in
+            sprintf "fn step%d(x: Int) -> Int {\n    let a = x * %d + 1\n    let b = a %% 1000\n    let c = if b > 500 { b - 500 } else { b + %d }\n    c + step%d(c %% 97)\n}\n" i i i (i + 1)))
+     ^ sprintf "fn step%d(x: Int) -> Int {\n    x\n}\n" steps
+   in
+   let want_chain =
+     let rec step i x =
+       if i = steps then x
+       else let b = (x * i + 1) mod 1000 in let c = if b > 500 then b - 500 else b + i in c + step (i + 1) (c mod 97)
+     in
+     step 1 1
+   in
+   let parts items =
+     let c = Native.c_source items and r = Runtime_text.text in
+     if String.starts_with ~prefix:r c then Native.split_program (String.sub c (String.length r) (String.length c - String.length r)) else None
+   in
+   let word c = match c with 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9' | '_' -> true | _ -> false in
+   (* where [name] occurs in [s] as a whole identifier, at or after [from] *)
+   let rec ident_at s name from =
+     match Native.find_sub s name from with
+     | None -> None
+     | Some k ->
+       let e = k + String.length name in
+       if (k = 0 || not (word s.[k - 1])) && (e >= String.length s || not (word s.[e])) then Some k else ident_at s name (k + 1)
+   in
+   (* what [name] is in the pieces: "static", "extern" (defined without
+      `static`), or "missing"; and whether the header names it *)
+   let linkage (header, pieces) name =
+     let def line =
+       line <> "" && line.[0] <> ' ' && String.ends_with ~suffix:") {" line
+       && match ident_at line name 0 with Some k -> k > 0 && k + String.length name < String.length line && line.[k + String.length name] = '(' | None -> false
+     in
+     let found =
+       List.find_map
+         (fun p -> List.find_map (fun l -> if def l then Some (if String.starts_with ~prefix:"static " l then "static" else "extern") else None) (String.split_on_char '\n' p))
+         pieces
+     in
+     (Option.value found ~default:"missing", ident_at header name 0 <> None)
+   in
+   let build_run name items want =
+     let exe = Filename.concat tmpdir name in
+     match Native.build ~flags:[ "-O1" ] items exe with
+     | Error m -> ok name false ("build failed:\n" ^ m)
+     | Ok () ->
+       let o = exe ^ ".out" in
+       let code = Sys.command (sprintf "%s > %s 2>&1" (Filename.quote exe) (Filename.quote o)) in
+       ok (name ^ "/runs") (code = 0 && read_file o = want) (sprintf "exit %d, output %S, want %S" code (read_file o) want)
+   in
+   if native_enabled && selected "split-static" then begin
+     let src = "fn main(root: Root) {\n    root.stdout.print(\"{step1(1)}\")\n}\n" ^ chain in
+     let items, ds, _ = compile "split-static" src in
+     if Diag.errors ds <> [] then ok "split-static" false "does not compile"
+     else
+       match parts items with
+       | None -> ok "split-static" false "not split"
+       | Some ((_, pieces) as split) ->
+         let all = List.map (fun i -> linkage split (sprintf "wf_step%d" i)) (List.init steps (fun i -> i + 1)) in
+         let statics = List.length (List.filter (fun l -> l = ("static", false)) all) in
+         let externs = List.length (List.filter (fun l -> l = ("extern", true)) all) in
+         let step1 = List.hd all in
+         ok "split-static"
+           (List.length pieces >= 2 && step1 = ("static", false) && statics > steps / 2 && externs >= 1 && statics + externs = steps)
+           (sprintf "%d pieces, wf_step1 %s (header %b), %d static and %d extern of %d steps" (List.length pieces) (fst step1) (snd step1) statics externs steps);
+         build_run "split-static" items (sprintf "%d\n" want_chain)
+   end;
+   if native_enabled && selected "split-static-vtable" then begin
+     (* main makes the dyn value and the closure after calling the leaves,
+        so [area] and [bump] come after them, in the last piece; the vtable
+        is in the header, and the closure's lifted body comes just before
+        main, in the first piece *)
+     let leaves = 400 in
+     let leaf i x = let b = (x * i + 1) mod 1000 in if b > 500 then b - 500 else b + i in
+     let src =
+       "interface Shape {\n    fn area(self) -> Int\n}\nstruct Sq { s: Int }\n"
+       ^ "fn twice(f: fn(Int) -> Int, x: Int) -> Int { f(f(x)) }\n"
+       ^ String.concat ""
+           (List.init leaves (fun i ->
+                let i = i + 1 in
+                sprintf "fn leaf%d(x: Int) -> Int {\n    let a = x * %d + 1\n    let b = a %% 1000\n    if b > 500 { b - 500 } else { b + %d }\n}\n" i i i))
+       ^ "fn main(root: Root) {\n    let mut t = 0\n"
+       ^ String.concat "" (List.init leaves (fun i -> sprintf "    t = t + leaf%d(%d)\n" (i + 1) (i + 1)))
+       ^ "    let shapes: List[dyn Shape] = [Sq { s: 3 }]\n    root.stdout.print(\"{t} {shapes[0].area()} {twice(bump, 1)}\")\n}\n"
+       ^ "fn area(self: Sq) -> Int { self.s * self.s }\nfn bump(x: Int) -> Int { x + 5 }\n"
+     in
+     let items, ds, _ = compile "split-static-vtable" src in
+     if Diag.errors ds <> [] then ok "split-static-vtable" false "does not compile"
+     else
+       match parts items with
+       | None -> ok "split-static-vtable" false "not split"
+       | Some ((_, pieces) as split) ->
+         let area = linkage split "wf_Sq__area" and bump = linkage split "wf_bump" in
+         ok "split-static-vtable"
+           (List.length pieces >= 2 && area = ("extern", true) && bump = ("extern", true))
+           (sprintf "%d pieces, wf_Sq__area %s (header %b), wf_bump %s (header %b)" (List.length pieces) (fst area) (snd area) (fst bump) (snd bump));
+         let t = List.fold_left (fun t i -> t + leaf i i) 0 (List.init leaves (fun i -> i + 1)) in
+         build_run "split-static-vtable" items (sprintf "%d 9 11\n" t)
+   end);
   errs "limen-test-duplicate" "test \"a\" {}\ntest \"a\" {}" [ "E0106" ];
 
   (* tests can ask for a fresh directory as `fs: Fs` and the real clock *)

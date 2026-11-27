@@ -207,8 +207,10 @@ let brace_delta line =
 (* The program's C (what follows the runtime) as the header its pieces
    share, and the pieces. Everything at the top level of generated C starts
    in the first column, and a function's signature is on its first line.
-   A definition moves to one piece, no longer `static`, and leaves its
-   prototype in the header; so does a variable, as an `extern` declaration.
+   A definition moves to one piece and leaves its prototype in the header,
+   no longer `static`; so does a variable, as an `extern` declaration. A
+   function no other piece names, and the header and the variables don't
+   either, stays `static` and takes its prototypes to its own piece.
    Types, `static inline` functions and constant tables stay in the header,
    so each piece has its own copy. None when the C has a shape this does
    not expect: then the program compiles as one file. *)
@@ -217,14 +219,17 @@ let split_program text =
   let lines = Array.of_list (String.split_on_char '\n' text) in
   let n = Array.length lines in
   (* the header, newest first; a prototype waits to learn whether its
-     function moves to a piece (a function a macro defines stays static) *)
+     function moves to a piece (a function a macro defines stays static),
+     and a definition's prototype whether its function stays static *)
   let shared = ref [] and vars = Buffer.create 4096 in
+  (* a moved function's name, and the pieces that name it as a bit set *)
   let defs = ref [] and moved = Hashtbl.create 1024 in
   let add b s = Buffer.add_string b s; Buffer.add_char b '\n' in
   let unstatic s = String.sub s 7 (String.length s - 7) in
+  let word c = match c with 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9' | '_' -> true | _ -> false in
   let name_of s =
     let p = String.index s '(' in
-    let rec back i = if i > 0 && (match s.[i - 1] with 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9' | '_' -> true | _ -> false) then back (i - 1) else i in
+    let rec back i = if i > 0 && word s.[i - 1] then back (i - 1) else i in
     let b = back p in
     String.sub s b (p - b)
   in
@@ -245,16 +250,17 @@ let split_program text =
       let item () = String.concat "\n" (Array.to_list (Array.sub lines start (last - start + 1))) in
       let starts p = String.starts_with ~prefix:p first in
       if starts "static inline " || starts "static const " then shared := `Text (item ()) :: !shared
-      else if starts "int main(" then defs := (last - start + 1, item ()) :: !defs
+      else if starts "int main(" then defs := (last - start + 1, None, item ()) :: !defs
       else if starts "static " then begin
         let signature = match find_sub first ") {" 0 with Some k when not (mentions (String.sub first 0 k) " = ") -> Some k | _ -> None in
         let assigns = find_sub first " = " 0 in
         match signature with
         | Some k ->
           (* a definition *)
-          Hashtbl.replace moved (name_of first) ();
-          shared := `Text (unstatic (String.sub first 0 (k + 1)) ^ ";") :: !shared;
-          defs := (last - start + 1, unstatic (item ())) :: !defs
+          let name = name_of first in
+          Hashtbl.replace moved name (ref 0);
+          shared := `Sig (name, String.sub first 0 (k + 1) ^ ";") :: !shared;
+          defs := (last - start + 1, Some name, item ()) :: !defs
         | None when assigns = None && last = start && String.contains first '(' && String.ends_with ~suffix:");" first ->
           (* a prototype *)
           shared := `Proto first :: !shared
@@ -267,27 +273,70 @@ let split_program text =
       end
       else shared := `Text (item ()) :: !shared
     done;
-    let header = Buffer.create (String.length text / 4) in
-    List.iter
-      (function
-        | `Text t -> add header t
-        | `Proto p -> add header (if Hashtbl.mem moved (name_of p) then unstatic p else p))
-      (List.rev !shared);
-    let defs = List.rev !defs in
-    let total = List.fold_left (fun a (k, _) -> a + k) 0 defs in
+    let shared = List.rev !shared and defs = List.rev !defs in
+    let total = List.fold_left (fun a (k, _, _) -> a + k) 0 defs in
     let count = max 1 (min pieces_max ((total + piece_lines - 1) / piece_lines)) in
     (* one piece: the program as it was generated, everything still static,
        so the C compiler may change how its functions are called (nbody
        runs twice as fast as with them external) *)
     if count = 1 then Some ("", [ text ]) else
+    (* each definition's piece *)
+    let defs =
+      List.rev
+        (snd
+           (List.fold_left (fun (acc, l) (k, name, t) -> (acc + k, (min (count - 1) (acc * count / max 1 total), name, t) :: l)) (0, []) defs))
+    in
+    (* who names each moved function, a C identifier at a time: piece [p]
+       is bit [p], the header and the variables bit [pieces_max] *)
+    let outside = 1 lsl pieces_max in
+    (* The runtime's list and map macros, which the header invokes, paste
+       names together: LIMEN_LIST_FUNCS(T3, T1*, T1) calls T1_dup. So in
+       the header a word [x] names every moved function [x_...] as well. *)
+    let pasted = Hashtbl.create 1024 in
+    Hashtbl.iter (fun f _ -> String.iteri (fun k c -> if c = '_' && k > 0 then Hashtbl.add pasted (String.sub f 0 k) f) f) moved;
+    let scan bit t =
+      let m = String.length t in
+      let j = ref 0 in
+      while !j < m do
+        if word t.[!j] then begin
+          let s = !j in
+          while !j < m && word t.[!j] do incr j done;
+          match t.[s] with
+          | '0' .. '9' -> ()
+          | _ ->
+            let w = String.sub t s (!j - s) in
+            (match Hashtbl.find_opt moved w with Some r -> r := !r lor bit | None -> ());
+            if bit = outside && Hashtbl.mem pasted w then begin
+              List.iter (fun f -> let r = Hashtbl.find moved f in r := !r lor outside) (Hashtbl.find_all pasted w);
+              (* once is enough *)
+              while Hashtbl.mem pasted w do Hashtbl.remove pasted w done
+            end
+        end
+        else incr j
+      done
+    in
+    List.iter (fun (p, _, t) -> scan (1 lsl p) t) defs;
+    (* a moved function's own prototypes don't count *)
+    List.iter (function `Text t -> scan outside t | `Proto p when not (Hashtbl.mem moved (name_of p)) -> scan outside p | _ -> ()) shared;
+    scan outside (Buffer.contents vars);
+    let home = Hashtbl.create 1024 in
+    List.iter (fun (p, name, _) -> Option.iter (fun f -> Hashtbl.replace home f p) name) defs;
+    (* the piece a function stays static in *)
+    let local f = match Hashtbl.find_opt home f with Some p when !(Hashtbl.find moved f) land lnot (1 lsl p) = 0 -> Some p | _ -> None in
+    let header = Buffer.create (String.length text / 4) in
     let pieces = Array.init count (fun _ -> Buffer.create (total * 40 / count)) in
+    let declare f s = match local f with Some p -> add pieces.(p) s | None -> add header (unstatic s) in
+    List.iter
+      (function
+        | `Text t -> add header t
+        | `Sig (f, s) -> declare f s
+        | `Proto p -> let f = name_of p in if Hashtbl.mem moved f then declare f p else add header p)
+      shared;
     Buffer.add_buffer pieces.(0) vars;
-    ignore
-      (List.fold_left
-         (fun acc (k, t) ->
-           add pieces.(min (count - 1) (acc * count / max 1 total)) t;
-           acc + k)
-         0 defs);
+    List.iter
+      (fun (p, name, t) ->
+        add pieces.(p) (match name with Some f when local f = None -> unstatic t | _ -> t))
+      defs;
     Some (Buffer.contents header, Array.to_list (Array.map Buffer.contents pieces))
   with Odd -> None
 
