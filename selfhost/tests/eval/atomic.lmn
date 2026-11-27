@@ -1,0 +1,12 @@
+// Atomic and Shared in one task.
+fn main(root: Root) {
+    let out = root.stdout
+    let a = atomic(5)
+    let b = a
+    out.print("{b.add(3)} {a.get()} {a.swap(1)} {b.get()} {a.compare_and_set(1, 9)} {a.compare_and_set(1, 2)} {a.get()}")
+    a.set(4)
+    let s = shared([1])
+    let t = s
+    t.set([2, 3])
+    out.print("{s.get()} {s.update(|xs| xs + [4])} {t.get()}")
+}

@@ -1,0 +1,14 @@
+// main returning a dyn Error.
+struct Oops {
+    what: Str,
+}
+
+fn message(self: Oops) -> Str {
+    "oops: {self.what}"
+}
+
+fn main(root: Root) -> Result[(), dyn Error] {
+    root.stdout.print("trying")
+    let e: dyn Error = Oops { what: "it broke" }
+    Err(e)
+}

@@ -1,0 +1,5 @@
+// main returning an Int status, past 255.
+fn main(root: Root) -> Int {
+    root.stdout.print("status")
+    300
+}

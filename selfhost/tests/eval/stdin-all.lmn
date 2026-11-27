@@ -1,0 +1,7 @@
+// read_all after a line.
+fn main(root: Root) {
+    let out = root.stdout
+    let first = root.stdin.read_line()
+    let rest = root.stdin.read_all()
+    out.print("{first} {rest.len()} {rest.lines()}")
+}

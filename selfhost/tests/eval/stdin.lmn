@@ -1,0 +1,18 @@
+// Reading lines, then end of input, then a read after it.
+fn main(root: Root) {
+    let out = root.stdout
+    let input = root.stdin
+    let mut n = 0
+    while true {
+        match input.read_line() {
+            Some(l) => {
+                n = n + 1
+                out.write("line {n}: [{l}]\n")
+            },
+            None => {
+                break
+            },
+        }
+    }
+    out.print("after: {input.read_line()} {input.read_all().len()}")
+}

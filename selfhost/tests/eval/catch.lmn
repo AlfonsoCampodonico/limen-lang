@@ -1,0 +1,27 @@
+// catch: a value, a panic, nested catches, a panic in a closure called
+// from deep inside.
+fn deep(n: Int) -> Int {
+    if n == 0 { panic("bottom") } else { deep(n - 1) + 1 }
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    out.print("{catch(|| 1 + 1)}")
+    out.print("{catch(|| deep(20))}")
+    let r = catch(|| {
+        let inner = catch(|| deep(3))
+        out.print("inner {inner}")
+        [1][4]
+    })
+    out.print("outer {r}")
+    let mut n = 0
+    for i in 0..<5 {
+        match catch(|| 10 / (i - 2)) {
+            Ok(v) => {
+                n = n + v
+            },
+            Err(m) => out.print("at {i}: {m}"),
+        }
+    }
+    out.print("{n}")
+}

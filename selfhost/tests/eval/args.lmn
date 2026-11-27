@@ -1,0 +1,5 @@
+// root.args().
+fn main(root: Root) {
+    let a = root.args()
+    root.stdout.print("{a.len()} {a}")
+}

@@ -1,0 +1,41 @@
+// dyn values: methods called through the interface, printed, kept in a
+// list, and dyn Error from main.
+interface Shape {
+    fn area(self) -> Float
+    fn name(self) -> Str
+}
+
+struct Square {
+    side: Float,
+}
+
+struct Circle {
+    r: Float,
+}
+
+fn area(self: Square) -> Float {
+    self.side * self.side
+}
+
+fn name(self: Square) -> Str {
+    "square"
+}
+
+fn area(self: Circle) -> Float {
+    3.0 * self.r * self.r
+}
+
+fn name(self: Circle) -> Str {
+    "circle"
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let shapes: List[dyn Shape] = [Square { side: 2.0 }, Circle { r: 1.0 }]
+    for s in shapes {
+        out.print("{s.name()} {s.area()}")
+    }
+    out.print("{shapes}")
+    let total = shapes.fold(0.0, |a, s| a + s.area())
+    out.print("{total}")
+}

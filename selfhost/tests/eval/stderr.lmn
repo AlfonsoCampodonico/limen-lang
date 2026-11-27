@@ -1,0 +1,7 @@
+// Stderr and stdout, written and printed.
+fn main(root: Root) {
+    root.stdout.print("to stdout")
+    root.stderr.print("to stderr")
+    root.stderr.write("no newline")
+    root.stdout.write("also none")
+}
