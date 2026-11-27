@@ -22,6 +22,8 @@ use cgen
 use derive
 use diag
 use disk
+use eval
+use eval_value
 use ffi
 use loader
 use lower
@@ -29,6 +31,7 @@ use native
 use own
 use prelude
 use pure
+use rename
 use sources
 use typecheck
 
@@ -40,6 +43,7 @@ usage:
   limen build FILE [-o OUT] [--dev] [--emit-c]
   limen check FILE [--json]
   limen caps FILE [--json]
+  limen eval FILE [-- ARGS...]  (run FILE by interpreting it, as the playground does; this compiler only)
   limen explain CODE
   limen test FILE [--native] [--run TEXT] [--bench] [--bench-time 1s|100x] [--json]
   limen fmt FILE... [--write | --check]
@@ -80,6 +84,8 @@ struct Front {
     files: List[diag.Source],
     errors: List[diag.Diag],
     warnings: List[diag.Diag],
+    // every diagnostic in the order the OCaml compiler lists them, for --json
+    all: List[diag.Diag],
 }
 
 fn main(root: Root) -> Int {
@@ -96,10 +102,10 @@ fn main(root: Root) -> Int {
     match args {
         ["check", file] => check(cx, file),
         ["caps", file] => caps_of(cx, file),
-        ["check", _, "--json"] | ["check", "--json", _] | ["caps", _, "--json"] | ["caps", "--json", _] => {
-            err.print("limen: --json is not in this compiler yet")
-            2
-        },
+        ["check", file, "--json"] | ["check", "--json", file] => check_json(cx, file),
+        ["caps", file, "--json"] | ["caps", "--json", file] => caps_json(cx, file),
+        ["eval", file] => eval_cmd(cx, root, file, []),
+        ["eval", file, "--", ..xs] => eval_cmd(cx, root, file, xs),
         ["build", ..rest] => {
             let mut file: Option[Str] = None
             let mut target: Option[Str] = None
@@ -171,7 +177,7 @@ fn front(fs: Fs, place: disk.Place, file: Str) -> Front {
     let methods = std.get("methods.lmn") ?? ""
     let p = loader.load(fs, std, place, file)
     if !p.diags.is_empty() {
-        return Front { loaded: p, checked: None, files: p.files, errors: p.diags.filter(|d| !d.warning), warnings: p.diags.filter(|d| d.warning) }
+        return Front { loaded: p, checked: None, files: p.files, errors: p.diags.filter(|d| !d.warning), warnings: p.diags.filter(|d| d.warning), all: p.diags }
     }
     let c = typecheck.check_program(p.items, p.files, p.next_id, methods, p.forwarders)
     let files = p.files + [diag.Source { path: prelude.file_name(), text: prelude.text() }, diag.Source { path: prelude.methods_name(), text: methods }, diag.Source { path: "<std>/limen.toml", text: std.get("limen.toml") ?? "" }]
@@ -187,7 +193,7 @@ fn front(fs: Fs, place: disk.Place, file: Str) -> Front {
             Some(x) if !x.diags.is_empty() => {
                 let diags = x.diags + c.diags.filter(|d| d.warning)
                 let p = { p with items: x.items }
-                return Front { loaded: p, checked: Some(c), files, errors: diags.filter(|d| !d.warning), warnings: diags.filter(|d| d.warning) }
+                return Front { loaded: p, checked: Some(c), files, errors: diags.filter(|d| !d.warning), warnings: diags.filter(|d| d.warning), all: diags }
             },
             Some(x) => {
                 let p = { p with items: x.items, next_id: x.next_id }
@@ -197,18 +203,27 @@ fn front(fs: Fs, place: disk.Place, file: Str) -> Front {
         _ => (p, c),
     }
     let diags = caps.check(fs, place, files, files.len() - 1, p.std_manifest, p.std_modules, p.manifest, p.packages, p.items, c)
-    Front { loaded: p, checked: Some(c), files, errors: diags.filter(|d| !d.warning), warnings: diags.filter(|d| d.warning) }
+    Front { loaded: p, checked: Some(c), files, errors: diags.filter(|d| !d.warning), warnings: diags.filter(|d| d.warning), all: diags }
 }
 
 // Load `file`, saying what is wrong with it: the warnings, then (when
 // there are errors) the errors and their count, as bin/main.ml's `load`
 // and `report` print them. None when it cannot go on, with the exit code.
 fn load(err: Stderr, fs: Fs, place: disk.Place, file: Str) -> Result[Front, Int] {
+    load_with(err, fs, place, file, false)
+}
+
+// `load`, or with `keep` (for --json) with the warnings left in the
+// diagnostics rather than printed.
+fn load_with(err: Stderr, fs: Fs, place: disk.Place, file: Str, keep: Bool) -> Result[Front, Int] {
     if !fs.exists(place.locate(file)) {
         err.print("limen: {file}: No such file or directory")
         return Err(2)
     }
     let f = front(fs, place, file)
+    if keep {
+        return Ok(f)
+    }
     for d in f.warnings {
         err.write(d.render(f.files) + "\n")
     }
@@ -253,6 +268,18 @@ fn check(cx: Ctx, file: Str) -> Int {
     0
 }
 
+// `check --json`: every diagnostic, warnings included, as JSON on stdout.
+fn check_json(cx: Ctx, file: Str) -> Int {
+    let f = match load_with(cx.err, cx.fs, cx.place, file, true) {
+        Ok(f) => f,
+        Err(code) => {
+            return code
+        },
+    }
+    cx.out.print(diag.list_to_json(f.all, f.files))
+    if f.errors.is_empty() { 0 } else { 1 }
+}
+
 // Every part of the program that calls C, so it can be reviewed: C code
 // is outside every capability check. One line each.
 fn c_callers(items: List[ast.Item], packages: List[(Str, Str)]) -> List[Str] {
@@ -292,6 +319,41 @@ fn c_callers(items: List[ast.Item], packages: List[(Str, Str)]) -> List[Str] {
         }
         "calls C: {who}: {libs.join(", ")}"
     })
+}
+
+// `caps --json`: what each function can do, the embedded files and the
+// grants, as bin/main.ml's cmd_caps writes them.
+fn caps_json(cx: Ctx, file: Str) -> Int {
+    let f = match load(cx.err, cx.fs, cx.place, file) {
+        Ok(f) => f,
+        Err(code) => {
+            return code
+        },
+    }
+    if !f.errors.is_empty() {
+        report(cx.err, f)
+        return 1
+    }
+    let infos = match f.checked {
+        Some(c) => c.infos,
+        None => [],
+    }
+    let strs = |xs: List[Str]| xs.map(diag.jstr).join(",")
+    let one = |i: typecheck.FnInfo| {
+        let via = i.via.map(|v| diag.jstr(v.0) + ":" + diag.jstr(v.1)).join(",")
+        let cb_via = match i.callbacks_via {
+            Some(p) => "\"callbacks_via\":{diag.jstr(p)},",
+            None => "",
+        }
+        let pure = i.caps.is_empty() && !i.callbacks && !i.shares
+        let libs = if i.caps.contains("Foreign") { i.libs } else { [] }
+        "\{\"name\":{diag.jstr(i.name)},\"caps\":[{strs(i.caps)}],\"via\":\{{via}},\"callbacks\":{i.callbacks},{cb_via}\"shares\":{i.shares},\"pure\":{pure},\"pure_if\":[{strs(i.pure_if)}],\"libs\":[{strs(libs)}]}"
+    }
+    let emb = |e: rename.Embedded| "\{\"module\":{diag.jstr(e.module)},\"path\":{diag.jstr(e.path)},\"bytes\":{e.size}}"
+    let roots = (f.loaded.manifest.map(|m| m.embed_roots) ?? []).map(|r| diag.jstr(r.0))
+    let grants = (f.loaded.manifest.map(|m| m.grants) ?? []).map(|g| g.0 + "=" + g.1)
+    cx.out.print("\{\"functions\":[" + infos.map(one).join(",") + "],\"embed_roots\":[" + roots.join(",") + "],\"embeds\":[" + f.loaded.embedded.map(emb).join(",") + "],\"grants\":[" + strs(grants) + "]}")
+    0
 }
 
 fn caps_of(cx: Ctx, file: Str) -> Int {
@@ -425,6 +487,52 @@ fn build(cx: Ctx, exec: Exec, env: Env, file: Str, target: Option[Str], dev: Boo
             1
         },
     }
+}
+
+// `eval`: check the program as `check` does (its errors, and the
+// warnings with them, end it with status 1, as `build` would), then run
+// it by interpreting its IR (selfhost/eval.lmn) after the passes C
+// generation runs, with Line marks for the places it reports. What the
+// evaluator cannot run exactly it refuses, with status 2, before
+// anything runs. Its stdout, stderr and status are the program's own.
+fn eval_cmd(cx: Ctx, root: Root, file: Str, args: List[Str]) -> Int {
+    let f = match load_with(cx.err, cx.fs, cx.place, file, true) {
+        Ok(f) => f,
+        Err(code) => {
+            return code
+        },
+    }
+    if !f.errors.is_empty() {
+        for d in f.warnings {
+            cx.err.write(d.render(f.files) + "\n")
+        }
+        report(cx.err, f)
+        return 1
+    }
+    let c = match f.checked {
+        Some(c) => c,
+        None => {
+            return 1
+        },
+    }
+    let has_main = f.loaded.items.any(|i| match i {
+        IFn(d) => d.name == "main",
+        _ => false,
+    })
+    if !has_main {
+        cx.err.print("error: no `main` function")
+        return 1
+    }
+    let (prog, ro) = lower.lower_program(c.prelude, c.items, c.cx, c.state, false, true, false)
+    let prog = own.program(pure.cse(prog))
+    match eval.refusal(prog, f.files) {
+        Some(m) => {
+            cx.err.print(m)
+            return 2
+        },
+        None => {},
+    }
+    eval.run(prog, ro, f.files, eval_value.Io { out: cx.out, err: cx.err, input: root.stdin, clock: root.clock, rand: root.rand, args })
 }
 
 // The program's C, as Native.c_source makes it: lowered (as the test

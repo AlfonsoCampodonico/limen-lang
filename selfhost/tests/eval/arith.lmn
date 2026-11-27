@@ -1,0 +1,25 @@
+// Int, Float and Bool operators and comparisons, Int wrapping, and
+// division by zero.
+fn main(root: Root) -> Int {
+    let out = root.stdout
+    let a = 17
+    let b = -5
+    out.print("{a + b} {a - b} {a * b} {a / b} {a % b} {b / 2} {b % 2}")
+    out.print("{a & 6} {a | 6} {a ^ 6} {a << 3} {b >> 1} {a << 70} {b >> 70}")
+    out.print("{a < b} {a <= 17} {a > b} {a >= 18} {a == 17} {a != 17}")
+    let max = 9223372036854775807
+    out.print("{max + 1} {(0 - max - 1) / -1} {(0 - max - 1) % -1} {-max * 3}")
+    let x = 1.5
+    let y = -0.25
+    out.print("{x + y} {x - y} {x * y} {x / y} {x / 0.0} {-x / 0.0} {0.0 / 0.0}")
+    out.print("{x < y} {x <= 1.5} {x > y} {x >= 2.0} {x == 1.5} {x != 1.5}")
+    out.print("{0.1 + 0.2} {1.0 / 3.0} {1e300 * 1e10} {2.0} {100.0} {1e21} {1.5e-7}")
+    let t = true
+    let f = false
+    out.print("{t && f} {t || f} {!t} {t == f} {t != f}")
+    let s = "abc"
+    out.print("{s < "abd"} {s > "ab"} {s == "abc"} {s + "def"}")
+    let zero = a - 17
+    out.print("{a / zero}")
+    0
+}

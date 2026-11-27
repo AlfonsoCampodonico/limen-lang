@@ -121,3 +121,68 @@ pub fn render(self: Diag, files: List[Source]) -> Str {
     }
     b
 }
+
+// `s` as a JSON string, as the OCaml compiler's Diag.jstr writes it: the
+// quote, the backslash, newline, return and tab escaped by name, any other
+// byte under 0x20 as `\u00XX` in lower case, every other byte as it is.
+pub fn jstr(s: Str) -> Str {
+    let hex = "0123456789abcdef"
+    let mut out: List[Str] = ["\""]
+    let mut start = 0
+    let bs = s.bytes()
+    let mut i = 0
+    while i < bs.len() {
+        let b = bs[i]
+        let esc = if b == 34 {
+            "\\\""
+        } else if b == 92 {
+            "\\\\"
+        } else if b == 10 {
+            "\\n"
+        } else if b == 13 {
+            "\\r"
+        } else if b == 9 {
+            "\\t"
+        } else if b < 32 {
+            "\\u00" + hex.slice(b / 16, b / 16 + 1) + hex.slice(b % 16, b % 16 + 1)
+        } else {
+            ""
+        }
+        if esc != "" {
+            out.push(s.slice(start, i))
+            out.push(esc)
+            start = i + 1
+        }
+        i = i + 1
+    }
+    out.push(s.slice(start, bs.len()))
+    out.push("\"")
+    out.join("")
+}
+
+fn jpos(files: List[Source], file: Int, off: Int) -> Str {
+    let (l, c) = line_col(files, file, off)
+    "\{\"line\":{l},\"col\":{c},\"offset\":{off}}"
+}
+
+fn jspan(files: List[Source], sp: ast.Span) -> Str {
+    let file = jstr(path_of(files, sp.file))
+    "\{\"file\":{file},\"start\":{jpos(files, sp.file, sp.lo)},\"end\":{jpos(files, sp.file, sp.hi)}}"
+}
+
+// The problem as `limen check --json` prints it, as Diag.to_json does.
+pub fn to_json(self: Diag, files: List[Source]) -> Str {
+    let fix = match self.fix {
+        None => "null",
+        Some(f) => {
+            let edits = f.edits.map(|e| "\{\"span\":{jspan(files, e.at)},\"replacement\":{jstr(e.replacement)}}").join(",")
+            "\{\"message\":{jstr(f.message)},\"edits\":[{edits}]}"
+        },
+    }
+    let severity = if self.warning { "warning" } else { "error" }
+    "\{\"code\":{jstr(self.code)},\"severity\":{jstr(severity)},\"message\":{jstr(self.message)},\"span\":{jspan(files, self.span)},\"notes\":[{self.notes.map(jstr).join(",")}],\"fix\":{fix},\"explain\":{jstr("limen explain " + self.code)}}"
+}
+
+pub fn list_to_json(ds: List[Diag], files: List[Source]) -> Str {
+    "\{\"diagnostics\":[" + ds.map(|d| d.to_json(files)).join(",") + "]}"
+}

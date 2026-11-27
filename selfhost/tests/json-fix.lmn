@@ -1,0 +1,9 @@
+// An error with a fix: a message, an edit with a span, and a replacement.
+fn total(xs: List[Int]) -> Int {
+    xs.fold(0, |a, b| a + b)
+}
+
+fn main(root: Root) {
+    let count = total([1, 2, 3])
+    root.stdout.print("{cuont}")
+}

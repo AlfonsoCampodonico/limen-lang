@@ -209,7 +209,18 @@ the loader. The parser and lexer keep threading their state by design.
   shipped as one generated C file, so building Limen needs only a C
   compiler. Then decide whether the interpreter, formatter, language
   server, `doc` and the MCP server move to Limen or stay in OCaml.
-- A playground and short videos beside the book.
+- A playground and short videos beside the book. Built so far for the
+  playground: the self-hosted compiler builds to WebAssembly
+  (`dev/wasm/build.sh`, about 1.6 MB gzipped) and runs in node and in a
+  browser through one WASI shim (`dev/wasm/wasi.mjs`), with the native
+  compiler's `check --json` and `caps --json`; `limen eval` runs a program
+  by interpreting its IR, with the native build's output, panics and
+  exit status, or refuses it (tasks, channels, select, C, and the Net,
+  Fs, Listen, Env, Exec and Foreign capabilities); `dev/release/wasm.sh`
+  writes the two files a release adds. `eval` is only in the self-hosted
+  compiler: the one deliberate exception to every change going into both
+  compilers. Left: the page and its workers, and serving `/play`, in
+  limen-book.
 
 Done when someone can install Limen, add a package and publish their own
 without reading anything but the book.

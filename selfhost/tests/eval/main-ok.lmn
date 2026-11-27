@@ -1,0 +1,5 @@
+// main returning Ok with a status.
+fn main(root: Root) -> Result[Int, Str] {
+    root.stdout.print("ok")
+    Ok(3)
+}

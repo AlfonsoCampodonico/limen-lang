@@ -1,0 +1,972 @@
+// `limen eval`: run a program by interpreting the self-hosted compiler's
+// IR (selfhost/ir.lmn) after the passes C generation runs (lowering,
+// pure.cse, own.program), for the playground, where there is no C
+// compiler. It is a second way out of the compiler beside
+// selfhost/cgen.lmn, and it exists only in this compiler.
+//
+// It runs exactly what native code runs, or refuses before running: the
+// program's output, its panics (message and place) and its exit status
+// are the native build's. What it cannot run exactly, it refuses
+// (`refusal`): tasks, channels, select, calls into C, and the
+// capabilities the playground does not grant.
+//
+// Values are eval_value.Value. Reference counts are not modelled: a
+// `VDup` reads like a `V`, and `Drop` does nothing. A `mut` parameter is
+// the caller's place copied in and copied back when the call ends,
+// however it ends, which is what the native pointer to the place shows,
+// since nothing else can reach the place during the call. A panic is a
+// `Flow`, so `catch` and `defer` see it; running out of the playground's
+// stack is one too, which neither stops.
+use ast
+use diag
+use eval_prims
+use eval_value
+use exhaust
+use ir
+use lower
+use types
+
+// How a statement ends: on to the next, a loop's break or continue, a
+// return, or a panic (its message and place). Out is past every `catch`
+// and `defer`: the playground's stack ran out.
+enum Flow {
+    Next,
+    Brk,
+    Cont,
+    Ret(eval_value.Value),
+    Panicked(Str, Str),
+    Out(Str),
+}
+
+// One step of a place, its index or key worked out: a struct field, a
+// list or array item, a map entry.
+enum Hop {
+    HField(Int),
+    HIndex(Int),
+    HKey(eval_value.Value),
+}
+
+// What happens at the end of a place.
+enum Leaf {
+    LSet(eval_value.Value),
+    LPush(eval_value.Value),
+    LPut(eval_value.Value, eval_value.Value),
+    LRemove(eval_value.Value),
+}
+
+struct Ev {
+    fns: Map[Str, ir.Fn],
+    ro: lower.Ro,
+    files: List[diag.Source],
+    io: eval_value.Io,
+    depth: Int,
+    // the Atomic and Shared values, by number
+    cells: Map[Int, eval_value.Value],
+}
+
+// The call depth at which eval stops: past it, the program ran out of
+// the playground's stack. In the WebAssembly build each call of the
+// program takes the frames of `call` and `exec` on the engine's own stack
+// (about 1 MB in node and in browsers' workers), which held 1431 nested
+// calls in node 22 (dev/wasm/check.sh runs selfhost/tests/eval/deep.lmn
+// and too-deep.lmn there); this leaves room below that.
+pub fn max_depth() -> Int {
+    1200
+}
+
+// `"file:line:col"`, the place a panic reports.
+fn where(self: Ev, sp: ast.Span) -> Str {
+    let (l, c) = diag.line_col(self.files, sp.file, sp.lo)
+    "{diag.path_of(self.files, sp.file)}:{l}:{c}"
+}
+
+fn panic_at(self: Ev, msg: Str, sp: ast.Span) -> Flow {
+    Panicked(msg, self.where(sp))
+}
+
+// ---------- refusal ----------
+
+struct Scan {
+    files: List[diag.Source],
+    // where the statement being looked at starts
+    at: Option[ast.Span],
+    found: Option[Str],
+}
+
+fn what_rhs(r: ir.Rhs) -> Option[Str] {
+    match r {
+        GroupNew(..) | Spawn(..) | GroupJoin(..) => Some("tasks"),
+        ChanNew(..) | ChanSend(..) => Some("channels"),
+        Select(..) | SelGot(..) => Some("select"),
+        CallC(..) => Some("calls into C"),
+        RootField(_, f) => match f {
+            "stdout" | "stderr" | "stdin" | "clock" | "rand" => None,
+            "fs" => Some("the Fs capability"),
+            "net" => Some("the Net capability"),
+            "listen" => Some("the Listen capability"),
+            "env" => Some("the Env capability"),
+            "exec" => Some("the Exec capability"),
+            "foreign" => Some("the Foreign capability"),
+            _ => Some("the {f} capability"),
+        },
+        Prim(name, _, _, _) if name == "chan_recv" || name == "chan_close" => Some("channels"),
+        _ => None,
+    }
+}
+
+fn scan_stmts(mut sc: Scan, ss: List[ir.Stmt]) {
+    for s in ss {
+        if sc.found.is_some() {
+            return
+        }
+        match s {
+            Line(sp) => {
+                sc.at = Some(sp)
+            },
+            Let(_, r) | Init(_, r) | Set(_, r, _) => match what_rhs(r) {
+                Some(w) => {
+                    let place = match sc.at {
+                        Some(sp) => {
+                            let (l, c) = diag.line_col(sc.files, sp.file, sp.lo)
+                            "{diag.path_of(sc.files, sp.file)}:{l}:{c}"
+                        },
+                        None => "?",
+                    }
+                    sc.found = Some("limen eval: {place}: not available in the playground: {w}")
+                },
+                None => {},
+            },
+            If(_, a, b) => {
+                scan_stmts(mut sc, a)
+                scan_stmts(mut sc, b)
+            },
+            Loop(body) => scan_stmts(mut sc, body),
+            Guard(_, h, body) => {
+                scan_stmts(mut sc, body)
+                scan_stmts(mut sc, h)
+            },
+            Scope(_, _) => {
+                let place = match sc.at {
+                    Some(sp) => {
+                        let (l, c) = diag.line_col(sc.files, sp.file, sp.lo)
+                        "{diag.path_of(sc.files, sp.file)}:{l}:{c}"
+                    },
+                    None => "?",
+                }
+                sc.found = Some("limen eval: {place}: not available in the playground: tasks")
+            },
+            _ => {},
+        }
+    }
+}
+
+// What the program uses that eval does not run, as the message that says
+// so, for the first such use: `limen eval: FILE:LINE:COL: not available in
+// the playground: WHAT`, at the Limen statement it is in.
+pub fn refusal(prog: ir.Program, files: List[diag.Source]) -> Option[Str] {
+    let mut sc = Scan { files, at: None, found: None }
+    for f in prog.fns {
+        sc.at = None
+        scan_stmts(mut sc, f.body)
+        if sc.found.is_some() {
+            return sc.found
+        }
+    }
+    None
+}
+
+// ---------- running ----------
+
+// Run the program: its exit status, with its output written through io
+// and a panic or an error from main reported on io.err as natively.
+pub fn run(prog: ir.Program, ro: lower.Ro, files: List[diag.Source], io: eval_value.Io) -> Int {
+    let mut fns: Map[Str, ir.Fn] = map()
+    for f in prog.fns {
+        fns[f.fname] = f
+    }
+    let mut ev = Ev { fns, ro, files, io, depth: 0, cells: map() }
+    let args = if prog.main_takes_root { [VCap("root")] } else { [] }
+    let r = ev.call(prog.main, args, [])
+    let v = match r.0 {
+        Ok(v) => v,
+        Err(Panicked(m, w)) => {
+            io.err.write("panic: {m}\n  --> {w}\n")
+            return 1
+        },
+        Err(Out(m)) => {
+            io.err.print(m)
+            return 1
+        },
+        Err(_) => {
+            return 1
+        },
+    }
+    let rt = prog.main_ret
+    match (rt, v) {
+        (TNamed("Result", [_, et]), VTag(1, [e])) => {
+            let text = match (et, e) {
+                (TDyn("Error", []), VDyn(_, ms, x)) => match ev.call(ms[0], [x], []).0 {
+                    Ok(VText(s)) => s,
+                    Ok(_) => "",
+                    Err(Panicked(m, w)) => {
+                        io.err.write("panic: {m}\n  --> {w}\n")
+                        return 1
+                    },
+                    Err(Out(m)) => {
+                        io.err.print(m)
+                        return 1
+                    },
+                    Err(_) => "",
+                },
+                _ => ev.show(e, et, true),
+            }
+            io.err.write("error: {text}\n")
+            1
+        },
+        (TInt, VInt(n)) => n & 255,
+        (TNamed("Result", [TInt, _]), VTag(0, [VInt(n)])) => n & 255,
+        _ => 0,
+    }
+}
+
+// Call function `name` with its arguments and, for a closure, its
+// captures: the result, and the values its `mut` parameters end with.
+fn call(mut self: Ev, name: Str, args: List[eval_value.Value], caps: List[eval_value.Value]) -> (Result[eval_value.Value, Flow], List[eval_value.Value]) {
+    let f = match self.fns.get(name) {
+        Some(f) => f,
+        None => panic("eval: no function " + name),
+    }
+    if self.depth >= max_depth() {
+        return (Err(Out("limen eval: the program ran out of stack in the playground (more than {max_depth()} nested calls)")), [])
+    }
+    let mut env: Map[Int, eval_value.Value] = map()
+    for (p, v) in f.params.zip(args) {
+        env[p.id] = v
+    }
+    for (p, v) in f.captures.zip(caps) {
+        env[p.id] = v
+    }
+    self.depth = self.depth + 1
+    let flow = self.exec(mut env, f.body)
+    self.depth = self.depth - 1
+    let outs = f.params.filter(|p| p.by_ref).map(|p| env.get(p.id) ?? VUnit)
+    let r = match flow {
+        Ret(v) => Ok(v),
+        Next => Ok(VUnit),
+        Panicked(..) | Out(_) => Err(flow),
+        _ => Ok(VUnit),
+    }
+    (r, outs)
+}
+
+// A block being run by exec: plain (an `if` branch), a loop's body, which
+// starts again when it ends, or the statements a `defer` protects, with
+// the deferred body to run when a panic leaves them.
+enum Blk {
+    BPlain,
+    BLoop,
+    BGuard(List[ir.Stmt]),
+}
+
+// Run a function's body. Nested blocks (if, loop, defer) go on a stack
+// of exec's own rather than on the evaluator's, so each call of the
+// program costs only this frame and call's there: in the WebAssembly
+// build that stack is the engine's, about 1 MB.
+fn exec(mut self: Ev, mut env: Map[Int, eval_value.Value], ss: List[ir.Stmt]) -> Flow {
+    let mut lists: List[List[ir.Stmt]] = [ss]
+    let mut pos: List[Int] = [0]
+    let mut kinds: List[Blk] = [BPlain]
+    let mut d = 1
+    let mut flow = Next
+    while d > 0 {
+        let k = d - 1
+        match flow {
+            Next => {},
+            _ => {
+                // the flow leaves block k, or ends there
+                match (kinds[k], flow) {
+                    (BLoop, Brk) => {
+                        flow = Next
+                    },
+                    (BLoop, Cont) => {
+                        flow = Next
+                        pos[k] = 0
+                        continue
+                    },
+                    (BGuard(h), Panicked(..)) => match self.exec(mut env, h) {
+                        Panicked(m, w) => {
+                            flow = Panicked(m, w)
+                        },
+                        Out(m) => {
+                            flow = Out(m)
+                        },
+                        _ => {},
+                    },
+                    _ => {},
+                }
+                d = k
+                continue
+            },
+        }
+        let cur = lists[k]
+        let i = pos[k]
+        if i >= cur.len() {
+            match kinds[k] {
+                BLoop => {
+                    pos[k] = 0
+                },
+                _ => {
+                    d = k
+                },
+            }
+            continue
+        }
+        pos[k] = i + 1
+        let next: Option[(List[ir.Stmt], Blk)] = match cur[i] {
+            If(c, a, b) => Some((if eval_value.bool_of(atom(env, c)) { a } else { b }, BPlain)),
+            Loop(body) => Some((body, BLoop)),
+            Guard(_, h, body) => Some((body, BGuard(h))),
+            Break => {
+                flow = Brk
+                None
+            },
+            Continue => {
+                flow = Cont
+                None
+            },
+            Return(x) => {
+                return Ret(atom(env, x))
+            },
+            Let(v, Call(f, args)) | Init(v, Call(f, args)) | Set(v, Call(f, args), _) => {
+                match self.call(f, atoms(env, args), []).0 {
+                    Ok(x) => {
+                        env[v.id] = x
+                    },
+                    Err(e) => {
+                        flow = e
+                    },
+                }
+                None
+            },
+            st => {
+                flow = self.stmt(mut env, st)
+                None
+            },
+        }
+        match next {
+            Some((body, kind)) => {
+                if d == lists.len() {
+                    lists.push(body)
+                    pos.push(0)
+                    kinds.push(kind)
+                } else {
+                    lists[d] = body
+                    pos[d] = 0
+                    kinds[d] = kind
+                }
+                d = d + 1
+            },
+            None => {},
+        }
+    }
+    flow
+}
+
+// A statement that is not a block, a jump or a return.
+fn stmt(mut self: Ev, mut env: Map[Int, eval_value.Value], s: ir.Stmt) -> Flow {
+    match s {
+        Let(v, r) | Init(v, r) | Set(v, r, _) => match self.rhs(mut env, v.ty, r) {
+            Ok(x) => {
+                env[v.id] = x
+                Next
+            },
+            Err(f) => f,
+        },
+        Mutate(v, steps, m) => {
+            let leaf = match m {
+                MSet(x) => LSet(atom(env, x)),
+                MPush(x) => LPush(atom(env, x)),
+                MPut(k, x) => LPut(atom(env, k), atom(env, x)),
+                MRemove(k) => LRemove(atom(env, k)),
+            }
+            match self.place(env, v, steps) {
+                Ok(hops) => {
+                    let root = env[v.id]
+                    env[v.id] = VUnit
+                    env[v.id] = set_at(root, hops, 0, leaf)
+                    Next
+                },
+                Err(f) => f,
+            }
+        },
+        Scope(..) => panic("eval: a group body"),
+        _ => Next,
+    }
+}
+
+fn atom(env: Map[Int, eval_value.Value], a: ir.Atom) -> eval_value.Value {
+    match a {
+        V(v) | VDup(v) => env[v.id],
+        AInt(n) => VInt(n),
+        AFloat(x) => VFloat(x),
+        ABool(b) => VBool(b),
+        AUnit => VUnit,
+        AStr(s) => VText(s),
+    }
+}
+
+fn atoms(env: Map[Int, eval_value.Value], xs: List[ir.Atom]) -> List[eval_value.Value] {
+    xs.map(|x| atom(env, x))
+}
+
+// The hops of place `v` and `steps`, its indexes worked out and checked
+// in order, as the native code finds the place: a missing item or key
+// panics there.
+fn place(self: Ev, env: Map[Int, eval_value.Value], v: ir.Var, steps: List[ir.Step]) -> Result[List[Hop], Flow] {
+    let mut cur = env[v.id]
+    let mut hops: List[Hop] = []
+    for st in steps {
+        match st {
+            PField(k) => {
+                cur = match cur {
+                    VRec(fs) => fs[k],
+                    _ => panic("eval: a field of a value that is not a struct"),
+                }
+                hops.push(HField(k))
+            },
+            PIndex(i, sp) => {
+                let n = eval_value.int_of(atom(env, i))
+                let xs = eval_value.list_of(cur)
+                if n < 0 || n >= xs.len() {
+                    return Err(self.panic_at("index {n} is out of range for a list of length {xs.len()}", sp))
+                }
+                cur = xs[n]
+                hops.push(HIndex(n))
+            },
+            PIndexU(i) => {
+                let n = eval_value.int_of(atom(env, i))
+                cur = eval_value.list_of(cur)[n]
+                hops.push(HIndex(n))
+            },
+            PKey(k, sp) => {
+                let kv = atom(env, k)
+                match eval_value.map_of(cur).get(eval_value.key(kv)) {
+                    Some(e) => {
+                        cur = e.1
+                    },
+                    None => {
+                        return Err(self.panic_at("key {self.show(kv, ir.atom_ty(k), false)} is not in the map", sp))
+                    },
+                }
+                hops.push(HKey(kv))
+            },
+        }
+    }
+    Ok(hops)
+}
+
+// `v` with the place at hops[i..] changed by `leaf`.
+fn set_at(v: eval_value.Value, hops: List[Hop], i: Int, leaf: Leaf) -> eval_value.Value {
+    if i == hops.len() {
+        return match leaf {
+            LSet(x) => x,
+            LPush(x) => {
+                let mut xs = eval_value.list_of(v)
+                xs.push(x)
+                VList(xs)
+            },
+            LPut(k, x) => {
+                let mut m = eval_value.map_of(v)
+                m[eval_value.key(k)] = (k, x)
+                VMap(m)
+            },
+            LRemove(k) => {
+                let mut m = eval_value.map_of(v)
+                m.remove(eval_value.key(k))
+                VMap(m)
+            },
+        }
+    }
+    match (hops[i], v) {
+        (HField(k), VRec(fs)) => {
+            let mut fs = fs
+            let inner = fs[k]
+            fs[k] = VUnit
+            fs[k] = set_at(inner, hops, i + 1, leaf)
+            VRec(fs)
+        },
+        (HIndex(n), VList(xs)) => {
+            let mut xs = xs
+            let inner = xs[n]
+            xs[n] = VUnit
+            xs[n] = set_at(inner, hops, i + 1, leaf)
+            VList(xs)
+        },
+        (HKey(k), VMap(m)) => {
+            let mut m = m
+            let kt = eval_value.key(k)
+            let (k0, inner) = m[kt]
+            m[kt] = (k0, VUnit)
+            m[kt] = (k0, set_at(inner, hops, i + 1, leaf))
+            VMap(m)
+        },
+        _ => panic("eval: a place that does not fit its value"),
+    }
+}
+
+// Read through steps from `root`.
+fn get(self: Ev, env: Map[Int, eval_value.Value], root: eval_value.Value, steps: List[ir.Step]) -> Result[eval_value.Value, Flow] {
+    let mut cur = root
+    for st in steps {
+        match st {
+            PField(k) => {
+                cur = match cur {
+                    VRec(fs) => fs[k],
+                    _ => panic("eval: a field of a value that is not a struct"),
+                }
+            },
+            PIndex(i, sp) => {
+                let n = eval_value.int_of(atom(env, i))
+                let xs = eval_value.list_of(cur)
+                if n < 0 || n >= xs.len() {
+                    return Err(self.panic_at("index {n} is out of range for a list of length {xs.len()}", sp))
+                }
+                cur = xs[n]
+            },
+            PIndexU(i) => {
+                cur = eval_value.list_of(cur)[eval_value.int_of(atom(env, i))]
+            },
+            PKey(k, sp) => {
+                let kv = atom(env, k)
+                match eval_value.map_of(cur).get(eval_value.key(kv)) {
+                    Some(e) => {
+                        cur = e.1
+                    },
+                    None => {
+                        return Err(self.panic_at("key {self.show(kv, ir.atom_ty(k), false)} is not in the map", sp))
+                    },
+                }
+            },
+        }
+    }
+    Ok(cur)
+}
+
+fn rhs(mut self: Ev, mut env: Map[Int, eval_value.Value], t: types.Ty, r: ir.Rhs) -> Result[eval_value.Value, Flow] {
+    match r {
+        Use(x) => Ok(atom(env, x)),
+        Call(f, args) => self.call(f, atoms(env, args), []).0,
+        Bin(op, ty, x, y, sp) => self.bin(op, ty, atom(env, x), atom(env, y), sp),
+        Negate(TInt, x) => Ok(VInt(0 - eval_value.int_of(atom(env, x)))),
+        Negate(_, x) => Ok(VFloat(-eval_value.float_of(atom(env, x)))),
+        Flip(x) => Ok(VBool(!eval_value.bool_of(atom(env, x)))),
+        CallMut(f, args) => {
+            // the values first, in order; then each place, found as the
+            // native code finds it, its value passed in
+            let mut vals: List[eval_value.Value] = []
+            for a in args {
+                match a {
+                    ByValue(x) => vals.push(atom(env, x)),
+                    ByPlace(..) => vals.push(VUnit),
+                }
+            }
+            let mut places: List[(ir.Var, List[Hop])] = []
+            for (k, a) in args.with_index() {
+                match a {
+                    ByValue(_) => {},
+                    ByPlace(v, steps) => {
+                        let hops = match self.place(env, v, steps) {
+                            Ok(h) => h,
+                            Err(f) => {
+                                return Err(f)
+                            },
+                        }
+                        vals[k] = match self.get(env, env[v.id], steps) {
+                            Ok(x) => x,
+                            Err(f) => {
+                                return Err(f)
+                            },
+                        }
+                        places.push((v, hops))
+                    },
+                }
+            }
+            let (res, outs) = self.call(f, vals, [])
+            // each place gets what the callee left in it, however the
+            // call ended
+            for (p, x) in places.zip(outs) {
+                let (v, hops) = p
+                let root = env[v.id]
+                env[v.id] = VUnit
+                env[v.id] = set_at(root, hops, 0, LSet(x))
+            }
+            res
+        },
+        CallClo(f, args) => match atom(env, f) {
+            VClo(name, caps) => self.call(name, atoms(env, args), caps).0,
+            _ => panic("eval: calling a value that is not a closure"),
+        },
+        Prim(name, rt, args, sp) => self.prim(name, rt, t, atoms(env, args), sp),
+        MkStruct(_, args) => Ok(VRec(atoms(env, args))),
+        MkEnum(_, k, args) => Ok(VTag(k, atoms(env, args))),
+        MkList(_, args) => Ok(VList(atoms(env, args))),
+        MkClosure(name, _, args) => Ok(VClo(name, atoms(env, args))),
+        Get(root, _, steps) => self.get(env, atom(env, root), steps),
+        Payload(x, _, _, i) => match atom(env, x) {
+            VTag(_, ps) => Ok(ps[i]),
+            _ => panic("eval: the payload of a value that is not an enum"),
+        },
+        IsTag(x, _, k) => match atom(env, x) {
+            VTag(j, _) => Ok(VBool(j == k)),
+            _ => panic("eval: the tag of a value that is not an enum"),
+        },
+        PatTest(x, ty, p) => Ok(VBool(self.matches(atom(env, x), ty, p))),
+        Format(parts) => {
+            let mut out: List[Str] = []
+            for p in parts {
+                match p {
+                    IStr(s) => out.push(s),
+                    IVal(x, ty) => out.push(self.show(atom(env, x), ty, true)),
+                    IValQ(x, ty) => out.push(self.show(atom(env, x), ty, false)),
+                }
+            }
+            Ok(VText(out.join("")))
+        },
+        RootField(_, f) => Ok(VCap(f)),
+        Panic(m, sp) => Err(self.panic_at(eval_value.str_of(atom(env, m)), sp)),
+        MkDyn(ty, _, x, ms) => Ok(VDyn(ty, ms.map(|m| m.fname), atom(env, x))),
+        CallDyn(k, _, _, recv, args) => match atom(env, recv) {
+            VDyn(_, ms, x) => self.call(ms[k], [x] + atoms(env, args), []).0,
+            _ => panic("eval: a method call on a value that is not dyn"),
+        },
+        Catch(clo, _) => match atom(env, clo) {
+            VClo(name, caps) => match self.call(name, [], caps).0 {
+                Ok(v) => Ok(VTag(0, [v])),
+                Err(Panicked(m, _)) => Ok(VTag(1, [VText(m)])),
+                Err(f) => Err(f),
+            },
+            _ => panic("eval: catch of a value that is not a closure"),
+        },
+        GroupNew(..) | Spawn(..) | GroupJoin(..) | ChanNew(..) | ChanSend(..) | Select(..) | SelGot(..) | CallC(..) => panic("eval: refused IR reached"),
+    }
+}
+
+fn bin(self: Ev, op: ast.BinOp, ty: types.Ty, a: eval_value.Value, b: eval_value.Value, sp: ast.Span) -> Result[eval_value.Value, Flow] {
+    match ty {
+        TInt => {
+            let (x, y) = (eval_value.int_of(a), eval_value.int_of(b))
+            match op {
+                Add => Ok(VInt(x + y)),
+                Sub => Ok(VInt(x - y)),
+                Mul => Ok(VInt(x * y)),
+                Div => if y == 0 { Err(self.panic_at("division by zero", sp)) } else { Ok(VInt(x / y)) },
+                Mod => if y == 0 { Err(self.panic_at("division by zero", sp)) } else { Ok(VInt(x % y)) },
+                BitAnd => Ok(VInt(x & y)),
+                BitOr => Ok(VInt(x | y)),
+                BitXor => Ok(VInt(x ^ y)),
+                Shl => if y < 0 { Err(self.panic_at("negative shift count", sp)) } else { Ok(VInt(x << y)) },
+                Shr => if y < 0 { Err(self.panic_at("negative shift count", sp)) } else { Ok(VInt(x >> y)) },
+                _ => Ok(VBool(compare(op, eval_value.cmp(a, b)))),
+            }
+        },
+        TFloat => {
+            let (x, y) = (eval_value.float_of(a), eval_value.float_of(b))
+            match op {
+                Add => Ok(VFloat(x + y)),
+                Sub => Ok(VFloat(x - y)),
+                Mul => Ok(VFloat(x * y)),
+                Div => Ok(VFloat(x / y)),
+                Lt => Ok(VBool(x < y)),
+                Le => Ok(VBool(x <= y)),
+                Gt => Ok(VBool(x > y)),
+                Ge => Ok(VBool(x >= y)),
+                Eq => Ok(VBool(x == y)),
+                Ne => Ok(VBool(x != y)),
+                _ => panic("eval: a Float operator"),
+            }
+        },
+        TUInt(bits) => {
+            let (x, y) = (eval_value.u64(eval_value.int_of(a)), eval_value.u64(eval_value.int_of(b)))
+            let w = |n: UInt64| Ok(VUInt(eval_value.wrap(n.to_int(), bits)))
+            match op {
+                Add => w(x + y),
+                Sub => w(x - y),
+                Mul => w(x * y),
+                BitAnd => w(x & y),
+                BitOr => w(x | y),
+                BitXor => w(x ^ y),
+                Div => if eval_value.int_of(b) == 0 { Err(self.panic_at("division by zero", sp)) } else { w(x / y) },
+                Mod => if eval_value.int_of(b) == 0 { Err(self.panic_at("division by zero", sp)) } else { w(x % y) },
+                Shl => if eval_value.int_of(b) < 0 || eval_value.int_of(b) >= bits { Ok(VUInt(0)) } else { w(x << y) },
+                Shr => if eval_value.int_of(b) < 0 || eval_value.int_of(b) >= bits { Ok(VUInt(0)) } else { w(x >> y) },
+                _ => Ok(VBool(compare(op, eval_value.cmp(a, b)))),
+            }
+        },
+        TStr => match op {
+            Add => Ok(VText(eval_value.str_of(a) + eval_value.str_of(b))),
+            _ => Ok(VBool(compare(op, eval_value.cmp(a, b)))),
+        },
+        TBytes => match op {
+            Add => Ok(VBytes(eval_value.bytes_of(a) + eval_value.bytes_of(b))),
+            _ => Ok(VBool(compare(op, eval_value.cmp(a, b)))),
+        },
+        TList(_) => match op {
+            Add => Ok(VList(eval_value.list_of(a) + eval_value.list_of(b))),
+            Eq => Ok(VBool(eval_value.eq(a, b))),
+            Ne => Ok(VBool(!eval_value.eq(a, b))),
+            _ => Ok(VBool(compare(op, eval_value.cmp(a, b)))),
+        },
+        _ => match op {
+            Eq => Ok(VBool(eval_value.eq(a, b))),
+            Ne => Ok(VBool(!eval_value.eq(a, b))),
+            _ => Ok(VBool(compare(op, eval_value.cmp(a, b)))),
+        },
+    }
+}
+
+// A comparison operator applied to an order: Eq and Ne on scalars, whose
+// order is total, and the others on any ordered type.
+fn compare(op: ast.BinOp, c: Int) -> Bool {
+    match op {
+        Lt => c < 0,
+        Le => c <= 0,
+        Gt => c > 0,
+        Ge => c >= 0,
+        Eq => c == 0,
+        Ne => c != 0,
+        _ => panic("eval: not a comparison"),
+    }
+}
+
+// Whether value `v` of type `t` matches pattern `p`, as cgen's pat_cond
+// tests it.
+fn matches(self: Ev, v: eval_value.Value, t: types.Ty, p: ast.Pat) -> Bool {
+    match p.desc {
+        PWild | PBind(_) | PRest(_) => true,
+        PInt(n) => eval_value.int_of(v) == n,
+        PBool(b) => eval_value.bool_of(v) == b,
+        PStr(s) => eval_value.str_of(v) == s,
+        PVariant(_, vn, args) => {
+            let k = lower.tag_of(self.ro, t, vn)
+            match v {
+                VTag(j, ps) if j == k => {
+                    let ptys = lower.variants(self.ro, t)[k].1
+                    let subs = exhaust.fill_rest(args, ptys.len())
+                    let mut i = 0
+                    while i < subs.len() && i < ptys.len() {
+                        if !self.matches(ps[i], ptys[i], subs[i]) {
+                            return false
+                        }
+                        i = i + 1
+                    }
+                    true
+                },
+                _ => false,
+            }
+        },
+        PTuple(ps) => {
+            let fts = lower.field_types(self.ro, t).map(|f| f.1)
+            self.all_match(v, fts, exhaust.fill_rest(ps, fts.len()))
+        },
+        PStruct(_, _, fields, _) => {
+            let fts = lower.field_types(self.ro, t)
+            self.all_match(v, fts.map(|f| f.1), exhaust.struct_items(fields, fts.map(|f| f.0), p.span))
+        },
+        PList(ps) => {
+            let el = match t {
+                TList(e) | TArray(e, _) => e,
+                _ => panic("eval: a list pattern on a value that is not a list"),
+            }
+            let xs = eval_value.list_of(v)
+            let (before, rest, after) = exhaust.list_parts(ps)
+            let (k, j) = (before.len(), after.len())
+            let fits = if rest.is_none() { xs.len() == k } else { xs.len() >= k + j }
+            if !fits {
+                return false
+            }
+            for (i, q) in after.with_index() {
+                if !self.matches(xs[xs.len() - j + i], el, q) {
+                    return false
+                }
+            }
+            for (i, q) in before.with_index() {
+                if !self.matches(xs[i], el, q) {
+                    return false
+                }
+            }
+            true
+        },
+        PAs(q, _, _) => self.matches(v, t, q),
+        POr(alts) => alts.any(|q| self.matches(v, t, q)),
+    }
+}
+
+fn all_match(self: Ev, v: eval_value.Value, tys: List[types.Ty], ps: List[ast.Pat]) -> Bool {
+    let fs = match v {
+        VRec(fs) => fs,
+        _ => panic("eval: a struct pattern on a value that is not a struct"),
+    }
+    let mut i = 0
+    while i < ps.len() && i < tys.len() {
+        if !self.matches(fs[i], tys[i], ps[i]) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+// ---------- printing ----------
+
+// eval_value.Value `v` of type `t` as `"{v}"` prints it (top) or as it prints inside
+// a container, where a string is quoted.
+fn show(self: Ev, v: eval_value.Value, t: types.Ty, top: Bool) -> Str {
+    let mut out: List[Str] = []
+    self.show_into(mut out, v, t, top)
+    out.join("")
+}
+
+fn show_into(self: Ev, mut out: List[Str], v: eval_value.Value, t: types.Ty, top: Bool) {
+    match (t, v) {
+        (TInt, VInt(n)) => out.push("{n}"),
+        (TUInt(bits), VUInt(n)) => out.push(eval_prims.uint_text(n, bits)),
+        (TFloat, VFloat(x)) => out.push("{x}"),
+        (TBool, VBool(b)) => out.push("{b}"),
+        (TUnit, _) => out.push("()"),
+        (TStr, VText(s)) => if top {
+            out.push(s)
+        } else {
+            let q = "{[s]}"
+            out.push(q.slice(1, q.len() - 1))
+        },
+        (TBytes, VBytes(b)) => out.push("{b}"),
+        (TList(e), VList(xs)) | (TArray(e, _), VList(xs)) => {
+            out.push("[")
+            for (i, x) in xs.with_index() {
+                if i > 0 {
+                    out.push(", ")
+                }
+                self.show_into(mut out, x, e, false)
+            }
+            out.push("]")
+        },
+        (TMap(kt, vt), VMap(m)) => {
+            out.push("\{")
+            for (i, e) in m.values().with_index() {
+                if i > 0 {
+                    out.push(", ")
+                }
+                self.show_into(mut out, e.0, kt, false)
+                out.push(": ")
+                self.show_into(mut out, e.1, vt, false)
+            }
+            out.push("}")
+        },
+        (TDyn(..), VDyn(ct, _, x)) => self.show_into(mut out, x, ct, top),
+        (TNamed(..), VTag(k, ps)) => {
+            let (vn, ptys) = lower.variants(self.ro, t)[k]
+            out.push(if ptys.is_empty() { vn } else { vn + "(" })
+            for (i, x) in ps.with_index() {
+                if i > 0 {
+                    out.push(", ")
+                }
+                self.show_into(mut out, x, ptys[i], false)
+            }
+            if !ptys.is_empty() {
+                out.push(")")
+            }
+        },
+        (TNamed(n, _), VRec(fs)) => {
+            let fts = lower.field_types(self.ro, t)
+            let tuple = ast.is_tuple_name(n)
+            out.push(if tuple { "(" } else { n + " \{ " })
+            for (i, x) in fs.with_index() {
+                out.push((if i > 0 { ", " } else { "" }) + if tuple { "" } else { fts[i].0 + ": " })
+                self.show_into(mut out, x, fts[i].1, false)
+            }
+            out.push(if tuple { ")" } else { " }" })
+        },
+        _ => out.push("<{lower.show(t)}>"),
+    }
+}
+
+// ---------- built-in methods ----------
+
+fn new_cell(mut self: Ev, v: eval_value.Value) -> eval_value.Value {
+    let n = self.cells.len()
+    self.cells[n] = v
+    VRef(n)
+}
+
+fn cell(self: Ev, r: eval_value.Value) -> (Int, eval_value.Value) {
+    match r {
+        VRef(n) => (n, self.cells[n]),
+        _ => panic("eval: not an Atomic or Shared"),
+    }
+}
+
+fn prim(mut self: Ev, name: Str, rt: types.Ty, t: types.Ty, args: List[eval_value.Value], sp: ast.Span) -> Result[eval_value.Value, Flow] {
+    match name {
+        "map_at" => {
+            let kv = args[1]
+            match eval_value.map_of(args[0]).get(eval_value.key(kv)) {
+                Some(e) => Ok(e.1),
+                None => {
+                    let kt = match rt {
+                        TMap(k, _) => k,
+                        _ => TStr,
+                    }
+                    Err(self.panic_at("key {self.show(kv, kt, false)} is not in the map", sp))
+                },
+            }
+        },
+        "keep" => Ok(VUnit),
+        "atomic_new" | "shared_new" => Ok(self.new_cell(args[0])),
+        "atomic_get" | "shared_get" => Ok(self.cell(args[0]).1),
+        "atomic_set" | "shared_set" => {
+            let (n, _) = self.cell(args[0])
+            self.cells[n] = args[1]
+            Ok(VUnit)
+        },
+        "atomic_add" => {
+            let (n, v) = self.cell(args[0])
+            let x = VInt(eval_value.int_of(v) + eval_value.int_of(args[1]))
+            self.cells[n] = x
+            Ok(x)
+        },
+        "atomic_swap" => {
+            let (n, v) = self.cell(args[0])
+            self.cells[n] = args[1]
+            Ok(v)
+        },
+        "atomic_compare_and_set" => {
+            let (n, v) = self.cell(args[0])
+            if eval_value.int_of(v) == eval_value.int_of(args[1]) {
+                self.cells[n] = args[2]
+                Ok(VBool(true))
+            } else {
+                Ok(VBool(false))
+            }
+        },
+        "shared_update" => {
+            let (n, v) = self.cell(args[0])
+            match args[1] {
+                VClo(f, caps) => {
+                    let r = self.call(f, [v], caps).0
+                    match r {
+                        Ok(x) => {
+                            self.cells[n] = x
+                            Ok(x)
+                        },
+                        Err(f) => Err(f),
+                    }
+                },
+                _ => panic("eval: update with a value that is not a closure"),
+            }
+        },
+        _ => match eval_prims.call(name, rt, args, self.io) {
+            Ok(v) => Ok(v),
+            Err(m) => Err(self.panic_at(m, sp)),
+        },
+    }
+}

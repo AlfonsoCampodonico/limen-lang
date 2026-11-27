@@ -1,0 +1,293 @@
+// The values `limen eval` works with (selfhost/eval.lmn), and what every
+// value of the language has natively whatever its type: equality, the
+// order `<` and `sort` use, and the text a map keys it by. A value here
+// is a Limen value of the evaluator's own; its type is in the IR, which
+// says how to print it.
+//
+// Lists, maps, structs and enums keep Limen's copy semantics because the
+// evaluator's own lists and maps have them. A map is the evaluator's own
+// map from each key's text (`key`) to the key and its value: the native
+// map keeps its entries in the order they were first put, and so does
+// this one, whatever the keys' text is, so the two iterate alike.
+
+// What a program run by `eval` can reach: its root's fields that the
+// playground grants, and `root.args()`.
+use types
+
+pub struct Io {
+    out: Stdout,
+    err: Stderr,
+    input: Stdin,
+    clock: Clock,
+    rand: Rand,
+    args: List[Str],
+}
+
+pub enum Value {
+    VInt(Int),
+    VFloat(Float),
+    VBool(Bool),
+    VUnit,
+    VText(Str),
+    VBytes(Bytes),
+    // UInt8 to UInt64: the bits, as an Int (the type says how many)
+    VUInt(Int),
+    // a list or an array
+    VList(List[Value]),
+    VMap(Map[Str, (Value, Value)]),
+    // a struct's fields or a tuple's parts, in declaration order
+    VRec(List[Value]),
+    // an enum value: the variant's number and its payload
+    VTag(Int, List[Value]),
+    // a closure: the lifted function and its captures
+    VClo(Str, List[Value]),
+    // a `dyn` value: its concrete type, its methods' functions, the value
+    VDyn(types.Ty, List[Str], Value),
+    // a capability, by root field name
+    VCap(Str),
+    // an Atomic or a Shared: a cell the evaluator keeps (eval.lmn)
+    VRef(Int),
+}
+
+pub fn int_of(v: Value) -> Int {
+    match v {
+        VInt(n) | VUInt(n) => n,
+        _ => panic("eval: not an Int"),
+    }
+}
+
+pub fn float_of(v: Value) -> Float {
+    match v {
+        VFloat(x) => x,
+        _ => panic("eval: not a Float"),
+    }
+}
+
+pub fn bool_of(v: Value) -> Bool {
+    match v {
+        VBool(b) => b,
+        _ => panic("eval: not a Bool"),
+    }
+}
+
+pub fn str_of(v: Value) -> Str {
+    match v {
+        VText(s) => s,
+        _ => panic("eval: not a Str"),
+    }
+}
+
+pub fn bytes_of(v: Value) -> Bytes {
+    match v {
+        VBytes(b) => b,
+        _ => panic("eval: not Bytes"),
+    }
+}
+
+pub fn list_of(v: Value) -> List[Value] {
+    match v {
+        VList(xs) => xs,
+        _ => panic("eval: not a list"),
+    }
+}
+
+pub fn map_of(v: Value) -> Map[Str, (Value, Value)] {
+    match v {
+        VMap(m) => m,
+        _ => panic("eval: not a map"),
+    }
+}
+
+pub fn some(v: Value) -> Value {
+    VTag(0, [v])
+}
+
+pub fn none() -> Value {
+    VTag(1, [])
+}
+
+pub fn opt(o: Option[Value]) -> Value {
+    match o {
+        Some(v) => VTag(0, [v]),
+        None => VTag(1, []),
+    }
+}
+
+pub fn strs(xs: List[Str]) -> Value {
+    VList(xs.map(|s| VText(s)))
+}
+
+pub fn ints(xs: List[Int]) -> Value {
+    VList(xs.map(|n| VInt(n)))
+}
+
+// ---------- unsigned integers ----------
+
+// The low `bits` bits of n.
+pub fn wrap(n: Int, bits: Int) -> Int {
+    if bits >= 64 { n } else { n & ((1 << bits) - 1) }
+}
+
+pub fn u64(n: Int) -> UInt64 {
+    n.to_uint64()
+}
+
+// ---------- equality, order, keys ----------
+
+// `==` on two values of the same type, as the native `_eq` functions
+// have it: floats by IEEE equality, maps by their entries in any order.
+pub fn eq(a: Value, b: Value) -> Bool {
+    match (a, b) {
+        (VInt(x), VInt(y)) | (VUInt(x), VUInt(y)) => x == y,
+        (VFloat(x), VFloat(y)) => x == y,
+        (VBool(x), VBool(y)) => x == y,
+        (VUnit, VUnit) => true,
+        (VText(x), VText(y)) => x == y,
+        (VBytes(x), VBytes(y)) => x == y,
+        (VList(xs), VList(ys)) => xs.len() == ys.len() && all_eq(xs, ys),
+        (VRec(xs), VRec(ys)) => all_eq(xs, ys),
+        (VTag(k, xs), VTag(j, ys)) => k == j && all_eq(xs, ys),
+        (VMap(m), VMap(n)) => m.len() == n.len() && m.entries().all(|e| match n.get(e.0) {
+            Some(w) => eq(e.1.1, w.1),
+            None => false,
+        }),
+        (VDyn(_, _, x), VDyn(_, _, y)) => eq(x, y),
+        (VRef(x), VRef(y)) => x == y,
+        (VCap(x), VCap(y)) => x == y,
+        _ => false,
+    }
+}
+
+fn all_eq(xs: List[Value], ys: List[Value]) -> Bool {
+    let mut i = 0
+    while i < xs.len() {
+        if !eq(xs[i], ys[i]) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+fn sign(x: Int, y: Int) -> Int {
+    if x < y { -1 } else if x > y { 1 } else { 0 }
+}
+
+// The order of two values of the same type, -1, 0 or 1, as the native
+// `_cmp` functions have it: floats in their total order (NaN first),
+// strings and bytes byte by byte, lists by their items then their length,
+// structs field by field, enums by variant then payload.
+pub fn cmp(a: Value, b: Value) -> Int {
+    match (a, b) {
+        (VInt(x), VInt(y)) => sign(x, y),
+        (VUInt(x), VUInt(y)) => {
+            let (p, q) = (u64(x), u64(y))
+            if p < q { -1 } else if p > q { 1 } else { 0 }
+        },
+        (VFloat(x), VFloat(y)) => {
+            if x != x {
+                if y != y { 0 } else { -1 }
+            } else if y != y {
+                1
+            } else if x < y {
+                -1
+            } else if x > y {
+                1
+            } else {
+                0
+            }
+        },
+        (VBool(x), VBool(y)) => sign(if x { 1 } else { 0 }, if y { 1 } else { 0 }),
+        (VUnit, VUnit) => 0,
+        (VText(x), VText(y)) => if x < y { -1 } else if x > y { 1 } else { 0 },
+        (VBytes(x), VBytes(y)) => {
+            let (p, q) = (x.to_str(), y.to_str())
+            if p < q { -1 } else if p > q { 1 } else { 0 }
+        },
+        (VList(xs), VList(ys)) => {
+            let n = xs.len().min(ys.len())
+            let mut i = 0
+            while i < n {
+                let r = cmp(xs[i], ys[i])
+                if r != 0 {
+                    return r
+                }
+                i = i + 1
+            }
+            sign(xs.len(), ys.len())
+        },
+        (VRec(xs), VRec(ys)) => cmp_all(xs, ys),
+        (VTag(k, xs), VTag(j, ys)) => if k != j { sign(k, j) } else { cmp_all(xs, ys) },
+        _ => 0,
+    }
+}
+
+fn cmp_all(xs: List[Value], ys: List[Value]) -> Int {
+    let mut i = 0
+    while i < xs.len() {
+        let r = cmp(xs[i], ys[i])
+        if r != 0 {
+            return r
+        }
+        i = i + 1
+    }
+    0
+}
+
+// The list sorted as the native `_sort` sorts it: a bottom-up merge sort,
+// taking from the right run only when its item is smaller, so items that
+// compare equal keep their order.
+pub fn sort(xs: List[Value]) -> List[Value] {
+    let n = xs.len()
+    let mut c = xs
+    let mut w = 1
+    while w < n {
+        let mut tmp: List[Value] = []
+        let mut lo = 0
+        while lo < n {
+            let mid = (lo + w).min(n)
+            let hi = (lo + 2 * w).min(n)
+            let mut i = lo
+            let mut j = mid
+            while i < mid && j < hi {
+                if cmp(c[j], c[i]) < 0 {
+                    tmp.push(c[j])
+                    j = j + 1
+                } else {
+                    tmp.push(c[i])
+                    i = i + 1
+                }
+            }
+            while i < mid {
+                tmp.push(c[i])
+                i = i + 1
+            }
+            while j < hi {
+                tmp.push(c[j])
+                j = j + 1
+            }
+            lo = lo + 2 * w
+        }
+        c = tmp
+        w = w * 2
+    }
+    c
+}
+
+// The text a map keys a value by: two keys are the same text exactly when
+// they are `==`. Only the types a map key can have.
+pub fn key(v: Value) -> Str {
+    match v {
+        VInt(n) => "i{n};",
+        VUInt(n) => "u{n};",
+        VBool(b) => if b { "T" } else { "F" },
+        VUnit => "U",
+        VText(s) => "s{s.len()}:" + s,
+        VBytes(b) => "b{b.len()}:" + b.to_str(),
+        VRec(xs) => "r{xs.len()}(" + xs.map(key).join("") + ")",
+        VTag(k, xs) => "e{k},{xs.len()}(" + xs.map(key).join("") + ")",
+        VList(xs) => "l{xs.len()}(" + xs.map(key).join("") + ")",
+        VFloat(x) => "f{x};",
+        _ => panic("eval: not a map key"),
+    }
+}

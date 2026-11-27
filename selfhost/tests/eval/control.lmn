@@ -1,0 +1,60 @@
+// if, while, for, loops with break and continue, early return.
+fn find(xs: List[Int], want: Int) -> Option[Int] {
+    for (i, x) in xs.with_index() {
+        if x == want {
+            return Some(i)
+        }
+    }
+    None
+}
+
+fn classify(n: Int) -> Str {
+    if n < 0 {
+        "negative"
+    } else if n == 0 {
+        "zero"
+    } else if n < 10 {
+        "small"
+    } else {
+        "large"
+    }
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let mut i = 0
+    let mut total = 0
+    while i < 100 {
+        i = i + 1
+        if i % 3 == 0 {
+            continue
+        }
+        if i > 20 {
+            break
+        }
+        total = total + i
+    }
+    out.print("total {total}, stopped at {i}")
+    for n in [-4, 0, 7, 12] {
+        out.print("{n}: {classify(n)}")
+    }
+    out.print("{find([5, 6, 7], 7)} {find([5, 6, 7], 8)}")
+    let mut grid: List[Str] = []
+    for r in 0..<3 {
+        let mut row = ""
+        for c in 0..<4 {
+            if c == r {
+                continue
+            }
+            row = row + "{r}{c} "
+        }
+        grid.push(row)
+    }
+    out.print(grid.join("|"))
+    let label = match total {
+        0 => "none",
+        n if n > 100 => "many",
+        _ => "some",
+    }
+    out.print(label)
+}

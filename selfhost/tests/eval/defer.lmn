@@ -1,0 +1,46 @@
+// defer on a normal exit, an early return, a loop's break, and a panic,
+// and a mut parameter seen by a defer after a panic.
+fn work(out: Stdout, early: Bool) -> Int {
+    defer {
+        out.print("work done")
+    }
+    if early {
+        return 1
+    }
+    out.print("working")
+    2
+}
+
+fn grow(mut xs: List[Int]) {
+    xs.push(1)
+    xs.push(2)
+    panic("grew too much")
+}
+
+fn risky(out: Stdout) {
+    let mut xs: List[Int] = []
+    defer {
+        out.print("xs after the panic: {xs}")
+    }
+    grow(mut xs)
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    out.print("{work(out, false)} {work(out, true)}")
+    for i in 0..<3 {
+        defer {
+            out.print("end of {i}")
+        }
+        if i == 1 {
+            break
+        }
+        out.print("body {i}")
+    }
+    out.print("{catch(|| risky(out))}")
+    defer {
+        out.print("main's defer runs before the panic is reported")
+    }
+    let empty: List[Int] = []
+    out.print("{empty[0]}")
+}

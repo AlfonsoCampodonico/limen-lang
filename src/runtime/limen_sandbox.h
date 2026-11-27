@@ -136,6 +136,7 @@ static int w_sb_within(const char *a, const char *dir) {
   return strncmp(a, dir, n) == 0 && (a[n] == 0 || a[n] == '/' || (n == 1 && dir[0] == '/'));
 }
 
+#ifndef LIMEN_WASM /* the WebAssembly build has no users, set-user-ID or other programs, and the empty sandbox below */
 /* System directories that start programs even inside a writable Fs
    directory (`fs=/`, say), since nothing this process does can change
    them: the OS's own, for a process that is not root and cannot write what
@@ -279,6 +280,7 @@ static char *w_sb_sealed(const char *dir, char *const rw[2]) {
   }
   return real;
 }
+#endif /* !LIMEN_WASM */
 
 #if defined(__APPLE__)
 

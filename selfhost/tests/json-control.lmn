@@ -1,0 +1,4 @@
+// A control character in the source: its message escapes it as \u0001.
+fn main(root: Root) {
+    let x = 1 
+}

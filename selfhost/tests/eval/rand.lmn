@@ -1,0 +1,13 @@
+// Rand with a fixed seed, and the Clock.
+fn main(root: Root) {
+    let r = root.rand
+    let xs = (0..<10).map(|_| r.int(1, 100))
+    root.stdout.print("{xs} {r.float()} {r.bytes(4)}")
+    let t0 = root.clock.now_ms()
+    root.clock.sleep(5)
+    root.stdout.print("{root.clock.now_ms() - t0 >= 5}")
+    match catch(|| r.int(5, 1)) {
+        Ok(v) => root.stdout.print("ok {v}"),
+        Err(m) => root.stdout.print("panic: {m}"),
+    }
+}

@@ -1,0 +1,52 @@
+// Every built-in method of Map, and a missing key.
+struct K {
+    a: Int,
+    b: Str,
+}
+
+enum Color {
+    Red,
+    Rgb(Int, Int, Int),
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let mut m: Map[Str, Int] = map()
+    out.print("{m.len()} {m.is_empty()} {m}")
+    for (i, w) in ["one", "two", "three", "two", "four"].with_index() {
+        m[w] = i
+    }
+    m.remove("one")
+    m.remove("nothing")
+    m["one"] = 10
+    out.print("{m} {m.len()} {m.get("two")} {m.get("six")} {m.contains("four")} {m.contains("x")}")
+    out.print("{m.keys()} {m.values()} {m.entries()}")
+    let mut big: Map[Int, Int] = map()
+    for i in 0..<50 {
+        big[i * 7 % 13] = i
+        if i % 3 == 0 {
+            big.remove(i % 13)
+        }
+    }
+    out.print("{big}")
+    let mut ks: Map[K, List[Int]] = map()
+    ks[K { a: 1, b: "x" }] = [1]
+    ks[K { a: 1, b: "y" }] = [2]
+    ks[K { a: 1, b: "x" }].push(3)
+    out.print("{ks}")
+    let mut cs: Map[Color, Bool] = map()
+    cs[Rgb(1, 2, 3)] = true
+    cs[Red] = false
+    cs[Rgb(1, 2, 3)] = false
+    out.print("{cs} {cs[Red]}")
+    let mut ts: Map[(Int, Bool), Str] = map()
+    ts[(1, true)] = "a"
+    out.print("{ts} {ts == ts} {m == m}")
+    let n = map([("a", 1), ("b", 2), ("a", 3)])
+    out.print("{n}")
+    match catch(|| m["zzz"]) {
+        Ok(v) => out.print("ok {v}"),
+        Err(e) => out.print("panic: {e}"),
+    }
+    out.print("{ks[K { a: 2, b: "q\"" }]}")
+}

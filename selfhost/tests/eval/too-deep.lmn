@@ -1,0 +1,8 @@
+// Recursion that never ends.
+fn forever(n: Int) -> Int {
+    1 + forever(n + 1)
+}
+
+fn main(root: Root) {
+    root.stdout.print("{forever(0)}")
+}

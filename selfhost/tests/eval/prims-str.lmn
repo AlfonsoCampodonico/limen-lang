@@ -1,0 +1,23 @@
+// Every built-in method of Str, and its panicking edges.
+fn main(root: Root) {
+    let out = root.stdout
+    let s = "  Hello, wörld 日本 "
+    out.print("{s.len()} {s.is_empty()} {"".is_empty()} {s.trim()} [{s.to_upper()}] [{s.to_lower()}]")
+    out.print("{"a\nb\r\nc\n".lines()} {"a,b,,c".split(",")} {"abc".split("")} {"".split(",")}")
+    out.print("{s.contains("wör")} {s.starts_with("  H")} {s.ends_with("本 ")} {s.replace("l", "L")} {"aaa".replace("a", "")}")
+    out.print("{"42".parse_int()} {"-7".parse_int()} {"4x".parse_int()} {" 1".parse_int()} {"99999999999999999999".parse_int()}")
+    out.print("{"1.5".parse_float()} {"-2e3".parse_float()} {"x".parse_float()} {"inf".parse_float()} {"1.".parse_float()}")
+    out.print("{"hello".slice(1, 3)} {"hello".index_of("l")} {"hello".last_index_of("l")} {"hello".index_of("z")}")
+    out.print("{"hé".bytes()} {"hé日".chars()} {"hi".to_bytes()} {"abc".message()}")
+    let bad = [(1, 9), (3, 1), (-1, 2)]
+    for (lo, hi) in bad {
+        match catch(|| "hello".slice(lo, hi)) {
+            Ok(t) => out.print("ok {t}"),
+            Err(m) => out.print("panic: {m}"),
+        }
+    }
+    match catch(|| "é".slice(0, 1)) {
+        Ok(t) => out.print("ok {t.len()}"),
+        Err(m) => out.print("panic: {m}"),
+    }
+}

@@ -1,0 +1,28 @@
+// A panic inside catch, then an index out of range, a missing key and
+// an explicit panic, chosen by the argument; each ends with status 1.
+fn pick(n: Int) -> Int {
+    let xs = [1, 2, 3]
+    let mut m: Map[Str, Int] = map()
+    m["a"] = 1
+    match n {
+        0 => xs[5],
+        1 => m["zz"],
+        _ => {
+            panic("chose {n}")
+        },
+    }
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    for i in 0..<3 {
+        match catch(|| pick(i)) {
+            Ok(v) => out.print("ok {v}"),
+            Err(m) => out.print("caught: {m}"),
+        }
+    }
+    let ys: List[Int] = []
+    out.print("before")
+    out.print("{ys[0]}")
+    out.print("not reached")
+}

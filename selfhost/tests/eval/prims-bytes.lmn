@@ -1,0 +1,20 @@
+// Every built-in method of Bytes, and its panicking edges.
+fn main(root: Root) {
+    let out = root.stdout
+    let b = bytes([104, 105, 0, 255, 233])
+    let e = bytes([])
+    out.print("{b} {b.len()} {b.is_empty()} {e.is_empty()} {b.get(3)} {b.get(9)} {b[1]}")
+    out.print("{b.slice(1, 3)} {b.to_list()} {"hé".to_bytes()} {bytes([104, 105]).to_str()} {b + e} {b == b}")
+    match catch(|| bytes([1, 256])) {
+        Ok(v) => out.print("ok {v}"),
+        Err(m) => out.print("panic: {m}"),
+    }
+    match catch(|| b[5]) {
+        Ok(v) => out.print("ok {v}"),
+        Err(m) => out.print("panic: {m}"),
+    }
+    match catch(|| b.slice(2, 9)) {
+        Ok(v) => out.print("ok {v}"),
+        Err(m) => out.print("panic: {m}"),
+    }
+}

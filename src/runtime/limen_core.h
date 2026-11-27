@@ -307,7 +307,8 @@ LC_FN void lc_rand_le(uint64_t z, unsigned char *p, size_t k) {
    arc4random_buf on macOS, getrandom on Linux, /dev/urandom where that is
    missing. 0, or -1 if the generators gave fewer bytes. */
 LC_FN int lc_os_random(unsigned char *p, size_t n) {
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(__wasi__)
+  /* WASI (the WebAssembly build): wasi-libc's arc4random_buf reads random_get */
   arc4random_buf(p, n);
   return 0;
 #else

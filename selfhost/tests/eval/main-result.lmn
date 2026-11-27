@@ -1,0 +1,10 @@
+// main returning a Result with an error.
+struct Bad {
+    code: Int,
+    why: Str,
+}
+
+fn main(root: Root) -> Result[Int, Bad] {
+    root.stdout.print("starting")
+    Err(Bad { code: 7, why: "no \"luck\"" })
+}

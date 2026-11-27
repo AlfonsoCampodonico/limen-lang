@@ -20,6 +20,8 @@
 # book's examples when the book is checked out next to this repository
 # (or at $LIMEN_BOOK). With the book there, it also checks that the design
 # copied from it into src/design (dev/design_sync.py) is still the same.
+# Last, with a wasm32-wasip1 toolchain, the compiler built to WebAssembly
+# (dev/wasm/build.sh) gives the JSON this one does (dev/wasm/check.sh).
 set -e
 cd "$(dirname "$0")/.."
 dune build ./bin/main.exe ./selfhost/tokdump/tokdump.exe ./selfhost/astdump/astdump.exe ./selfhost/loaddump/loaddump.exe ./selfhost/checkdump/checkdump.exe ./selfhost/irdump/irdump.exe ./selfhost/cdump/cdump.exe
@@ -139,6 +141,22 @@ compare_c() {
   same "$1/$2"
 }
 
+# compare_json DIR FILE: `check --json` and `caps --json` with both
+# compilers, in both argument orders: stdout and exit status (the
+# diagnostics a program prints without --json are on stderr, and are
+# compared with the other commands')
+compare_json() {
+  ok=0
+  for cmd in check caps; do
+    for order in "FILE --json" "--json FILE"; do
+      (cd "$1" && "$limen_abs" $cmd $(echo "$order" | sed "s|FILE|$2|")) > "$out/want" 2> "$out/want.err" && echo "exit 0" >> "$out/want" || echo "exit $?" >> "$out/want"
+      (cd "$1" && tsc $cmd $(echo "$order" | sed "s|FILE|$2|")) > "$out/got" 2> "$out/got.err" && echo "exit 0" >> "$out/got" || echo "exit $?" >> "$out/got"
+      same "$1/$2 ($cmd $order)" || ok=1
+    done
+  done
+  return $ok
+}
+
 # compare_dev_c DIR FILE: the C of a development build, with its `#line`
 # directives
 compare_dev_c() {
@@ -208,6 +226,48 @@ compare_tests() {
   same "$1/$2"
 }
 
+# compare_eval DIR FILE: the program run natively (built by the OCaml
+# compiler) and by `eval`, both with --seed $eval_seed (1 unless set),
+# FILE.in beside it (or $eval_input) on stdin and FILE.args (if any)
+# after `--`: same stdout, same stderr, same exit status. With
+# FILE.expected beside it, `eval`'s stderr and status are compared with
+# that instead (a refusal, or the playground's own limit). `eval` is
+# granted what the loaders are (the program's package may reach outside
+# DIR) and works in DIR.
+compare_eval() {
+  base=${2%.lmn}
+  input=${eval_input:-/dev/null}
+  [ -f "$1/$base.in" ] && input="$1/$base.in"
+  args=
+  [ -f "$1/$base.args" ] && args=$(cat "$1/$base.args")
+  (cd "$1" && PWD=$(pwd) "$out/tsc" --seed "${eval_seed:-1}" --grant "fs=$grant:ro" --grant env=PWD -- eval "$2" -- $args) < "$input" > "$out/got" 2> "$out/got.err" && echo "exit 0" >> "$out/got.err" || echo "exit $?" >> "$out/got.err"
+  if [ -f "$1/$base.expected" ]; then
+    cp "$1/$base.expected" "$out/want.err"
+    : > "$out/want"
+  else
+    rm -f "$out/ew"
+    (cd "$1" && "$limen_abs" build "$2" -o "$out/ew") > "$out/want" 2> "$out/want.err"
+    (cd "$1" && "$out/ew" --seed "${eval_seed:-1}" -- $args) < "$input" > "$out/want" 2> "$out/want.err" && echo "exit 0" >> "$out/want.err" || echo "exit $?" >> "$out/want.err"
+  fi
+  same "$1/$2 (eval)"
+}
+
+# eval_corpus DIR FILE: a program of the corpus through compare_eval,
+# unless `eval` refuses it (counted in $refused) or it does not build
+# natively (not a program to run: an error case, a library)
+eval_corpus() {
+  (cd "$1" && PWD=$(pwd) "$out/tsc" --seed "${eval_seed:-1}" --grant "fs=$grant:ro" --grant env=PWD -- eval "$2") < "${eval_input:-/dev/null}" > /dev/null 2> "$out/refused" || true
+  if head -1 "$out/refused" | grep -q '^limen eval: .*: not available in the playground: '; then
+    refused=$((refused + 1))
+    return 0
+  fi
+  if ! (cd "$1" && "$limen_abs" build "$2" -o "$out/ew") > /dev/null 2>&1; then
+    return 0
+  fi
+  ran=$((ran + 1))
+  compare_eval "$1" "$2"
+}
+
 # same FILE: the outputs compared, and the compilers' stderr where a
 # comparison keeps it apart (both compilers write their diagnostics there);
 # then it is cleared for the next comparison
@@ -255,18 +315,54 @@ check "files lower the same" compare_ir -- $programs
 check "edge cases lower the same" compare_ir -- $ir_cases
 check "files compile to the same C" compare_c -- $programs
 check "edge cases compile to the same C" compare_c -- $c_cases
+check "files give the same JSON" compare_json -- $programs
+check "edge cases give the same JSON" compare_json -- $c_cases selfhost/tests/*.lmn
 check "edge cases compile to the same development C" compare_dev_c -- $c_cases
 check "examples compile to the same development C" compare_dev_c -- $(ls examples/*.lmn)
 check "edge cases compile to the same profiled C" compare_profile_c -- $c_cases
 with_tests=$(grep -l '^test \|^bench ' $programs $c_cases)
 check "test binaries compile to the same C" compare_test_c -- $with_tests
+check "programs run the same through eval" compare_eval -- $(ls selfhost/tests/eval/*.lmn)
+# Every program of the repository with a `main` runs the same through
+# eval or is refused, but for those too slow to interpret in the time this
+# check has (the benchmarks and the long fuzzers; each finishes, slowly).
+slow="bench/fib.lmn bench/nbody.lmn bench/nbody_array.lmn bench/pipeline.lmn bench/sieve.lmn fuzz/formats.lmn fuzz/regexes.lmn"
+corpus=$(grep -l '^fn main' $programs | grep -v '^selfhost/tests/eval/' | grep -v '^bench/agent/' | grep -vxF "$(echo $slow | tr ' ' '\n')")
+ran=0 refused=0
+check "corpus programs run the same through eval or are refused" eval_corpus -- $corpus
+echo "eval: $ran programs, $refused refused"
+# every Prim C generation knows, eval runs or refuses (eval_prims.handled)
+cg_prims=$(sed -n '/^fn prim(/,/^}/p' selfhost/cgen.lmn | grep -o '"\(keep\|\(array\|chan\|atomic\|shared\|map\|list\|str\|bytes\|int\|uint\|float\|bool\|cap\)_[a-z0-9_]*\)"' | tr -d '"' | sort -u)
+ev_prims=$(awk '/^pub fn (in_eval|refused|here)\(\)/{on=1} on{print} on&&/^}/{on=0}' selfhost/eval_prims.lmn | grep -o '"[a-z][a-z0-9_]*"' | tr -d '"' | sort -u)
+missing=$(echo "$cg_prims" | grep -vxF "$ev_prims" || true)
+if [ -n "$missing" ]; then
+  echo "eval lacks these built-ins C generation has (add them to selfhost/eval_prims.lmn, or to its refused list):" $missing
+  failed=1
+else
+  echo "eval knows all $(echo "$cg_prims" | wc -l | tr -d ' ') built-ins of C generation"
+fi
 if [ -d "$book" ]; then
   examples=$(find "$book" -name '*.lmn' | sort)
   check "book examples parse the same" compare "$astdump" parse -- $examples
   check "book examples load the same" compare_load -- $examples
   check "book examples check the same" compare_check -- $examples
   check "book examples lower the same" compare_ir -- $examples
+  # the examples the book runs with `limen run main.lmn`, a seed and a
+  # file on stdin at most, through eval with that seed and file
+  ran=0 refused=0 n=0 bad=0
+  for d in "$book"/*/; do
+    line=$(grep -m1 -E '^\$ limen run main\.lmn( --seed [0-9]+)?( < input\.txt)?$' "$d/commands" 2> /dev/null) || continue
+    eval_seed=$(echo "$line" | sed -n 's/.*--seed \([0-9]*\).*/\1/p')
+    eval_input=
+    case "$line" in *input.txt) eval_input="$d/input.txt" ;; esac
+    n=$((n + 1))
+    eval_corpus "${d%/}" main.lmn || bad=$((bad + 1))
+  done
+  eval_seed= eval_input=
+  echo "$((n - bad))/$n book examples run the same through eval (eval: $ran programs, $refused refused)"
+  [ "$bad" -eq 0 ] || failed=1
   check "book examples compile to the same C" compare_c -- $examples
+  check "book examples give the same JSON" compare_json -- $examples
   book_tests=$(grep -l '^test \|^bench ' $examples)
   check "book test binaries compile to the same C" compare_test_c -- $book_tests
   # programs built by both compilers, run: concurrency, HTTP, TLS, JSON,
@@ -301,5 +397,11 @@ if [ -d "$book" ]; then
   [ "$bad_runs" -eq 0 ] || failed=1
 else
   echo "skipped the book's examples: no $book"
+fi
+# the compiler built to WebAssembly, for the playground, against this one
+if sh dev/wasm/build.sh --probe; then
+  if sh dev/wasm/build.sh && LIMEN_TSC="$out/tsc" sh dev/wasm/check.sh; then :; else failed=1; fi
+else
+  echo "wasm: skipped, no wasm32-wasip1 toolchain"
 fi
 [ "$failed" -eq 0 ]

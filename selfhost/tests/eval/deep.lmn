@@ -1,0 +1,8 @@
+// Recursion 1000 calls deep.
+fn depth(n: Int) -> Int {
+    if n == 0 { 0 } else { 1 + depth(n - 1) }
+}
+
+fn main(root: Root) {
+    root.stdout.print("{depth(1000)}")
+}
