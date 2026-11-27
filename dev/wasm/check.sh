@@ -125,4 +125,13 @@ else
   head -3 "$out/too-deep.got.err"
   bad=$((bad + 1))
 fi
+# Rand with no seed draws from the host's secure generator (WASI random_get)
+(cd "$ev" && node "$root/dev/wasm/run.mjs" -- eval rand.lmn) > "$out/rand.got" 2> "$out/rand.got.err" && rs=0 || rs=$?
+if [ "$rs" -eq 0 ] && [ ! -s "$out/rand.got.err" ]; then
+  echo "wasm eval: rand.lmn draws without a seed"
+else
+  echo "wasm eval: rand.lmn fails without a seed (exit $rs)"
+  head -3 "$out/rand.got.err"
+  bad=$((bad + 1))
+fi
 [ "$bad" -eq 0 ]
