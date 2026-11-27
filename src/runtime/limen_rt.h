@@ -37,8 +37,10 @@
 #include <limits.h>
 #include <math.h>
 #include <unistd.h>
+#ifndef LIMEN_WASM   /* WebAssembly (WASI) starts no programs and looks up no names */
 #include <spawn.h>
 #include <sys/wait.h>
+#endif
 #include <sys/stat.h>
 #include <dirent.h>
 #include <sys/time.h>
@@ -46,7 +48,9 @@
 #include <errno.h>
 #include <signal.h>
 #include <fcntl.h>
+#ifndef LIMEN_WASM
 #include <netdb.h>
+#endif
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
@@ -912,7 +916,9 @@ W_RT int64_t Cap_now_ms(void);
 #ifdef W_TSAN
 #include <sanitizer/tsan_interface.h>
 #endif
+#ifndef LIMEN_WASM
 #include <sys/mman.h>
+#endif
 #include <sched.h>
 
 typedef struct WFiber WFiber;
@@ -972,6 +978,9 @@ W_RT void w_frame_init(void **frame, WFiber *f);
    (with 8 it was 8 bytes off, and aligned SSE stores on the stack faulted) */
 #define W_FRAME_WORDS 7
 W_RT void w_frame_init(void **frame, WFiber *f);
+#elif defined(LIMEN_WASM)
+/* WebAssembly cannot switch stacks: main runs on the wasm stack, and there
+   are no other fibers (see "the WebAssembly build" in limen_rt.c) */
 #else
 #error "Limen fibers need arm64 or x86_64"
 #endif
@@ -1022,10 +1031,12 @@ W_RT void w_sched_loop(WWorker *w, int is_main);
    Any other fault goes to the handler that was there before (the default,
    or a sanitizer's). */
 extern WFiber *w_main_fiber;
+#ifndef LIMEN_WASM
 extern struct sigaction w_old_segv, w_old_bus;
+W_RT void w_stack_fault(int sig, siginfo_t *si, void *uc);
+#endif
 W_RT void w_sig_puts(const char *m);
 W_RT void w_sig_putu(uint64_t v);
-W_RT void w_stack_fault(int sig, siginfo_t *si, void *uc);
 #define W_ALTSTACK_BYTES (64 * 1024)
 W_RT void w_altstack(void);
 W_RT void w_stack_fault_install(void);
@@ -1286,7 +1297,9 @@ W_RT int w_select(WSelOp *ops, int n, int has_default, const char *where);
    when the socket is ready. One task at a time may wait on a given socket
    in a given direction. */
 
-#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+#if defined(LIMEN_WASM)
+struct addrinfo;   /* no sockets, so no poller */
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
 #include <sys/event.h>
 #define W_KQUEUE 1
 #else
