@@ -276,6 +276,13 @@ book and SPEC.md describe 1.0 exactly.
 
 ## Smaller, whenever
 
+- Grant ports are parsed differently by the two backends. Natively,
+  `--grant net=host:-1` (and `listen=`) reads `-1` as the any-port marker,
+  so it allows every port on the host, where the interpreter allows none;
+  and the interpreter also takes `0x1bb`, `0b...` and `1_000` as ports,
+  which the native runtime refuses, while the native runtime takes leading
+  spaces. Both should accept only a decimal port from 0 to 65535 and refuse
+  anything else, with a test of each form in both backends.
 - The interpreter starts a thread per blocking C call instead of using a
   pool (done: blocking calls share a pool of up to
   `LIMEN_BLOCKING_THREADS` threads, as they do natively).
