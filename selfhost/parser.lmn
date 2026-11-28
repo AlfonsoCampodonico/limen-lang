@@ -27,6 +27,8 @@ pub struct Parser {
     // how deep the expressions, types and patterns being parsed are (see
     // max_depth)
     depth: Int,
+    // the file's text, for a field's key
+    src: Str,
 }
 
 // How deep expressions, types and patterns may nest, as in src/parser.ml:
@@ -720,7 +722,7 @@ fn interpolation(p: Parser, code: Str, at: Int) -> Parsed[ast.Expr] {
         },
     }
     // its own tokens, but the file's count of `?.`
-    let (e, sub) = parse_expr(Parser { toks, pos: 0, safes: p.safes, file: p.file, depth: p.depth })?
+    let (e, sub) = parse_expr(Parser { toks, pos: 0, safes: p.safes, file: p.file, depth: p.depth, src: p.src })?
     if !sub.at_end() {
         return Err(sub.expected("`\}` to close the interpolation"))
     }
@@ -1565,7 +1567,10 @@ fn field_key(f: ast.Field, p: Parser) -> Parsed[ast.Field] {
     }
     let s = p.skip().tok()
     let p = p.skip().skip()
+    // a key is a name, never more than a line
+    let multiline = p.src.slice(s.lo, s.lo + 3) == "\"\"\""
     match s.kind {
+        StrLit(_) if multiline => Err(error("E0003", p.span_of(s), "a field's key is written on one line, as in `name: Str as \"key\"`")),
         StrLit([Lit(k)]) if k != "" => Ok(({ f with key: Some((k, p.span_of(s))) }, p)),
         StrLit([]) => Err(error("E0003", p.span_of(s), "a field's key cannot be empty")),
         StrLit(_) => Err(error("E0003", p.span_of(s), "a field's key must be a plain string, without interpolation")),
@@ -1825,7 +1830,7 @@ fn parse_tokens(src: Str, file: Int) -> Result[ast.File, ParseError] {
             return Err(lex_error(e, file))
         },
     }
-    let mut p = Parser { toks, pos: 0, safes: 0, file, depth: 0 }
+    let mut p = Parser { toks, pos: 0, safes: 0, file, depth: 0, src }
     let mut uses: List[ast.Name] = []
     let mut items: List[ast.Item] = []
     let mut tests = 0

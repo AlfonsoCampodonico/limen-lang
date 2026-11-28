@@ -57,9 +57,13 @@ bgen     ::= ident (sp ":" sp bound (sp "+" sp bound)*)?
 bound    ::= ident ("." ident)? (sp "[" ws typearg (isep typearg)* (ws ",")? ws "]")?
 param    ::= ident sp ":" sp type
 struct   ::= "struct" sp1 ident sp bgenerics? sp "{" ws (field (isep field)* (ws ",")?)? ws "}"
-field    ::= ident sp ":" sp type (sp1 "as" sp1 fkey)? | embed
-# a field's key outside Limen, for json, yaml and sql: a plain string that is not empty
-fkey     ::= "\"" (strchar | escape)+ "\"" | mlplain
+# `as "key"` on the field's line. The grammar wants a space before `as`; the
+# parser also takes none after a bracket (`List[Int]as "k"`), which this
+# grammar refuses on purpose: it is narrower there, never wider.
+field    ::= ident sp ":" sp type (sp1 "as" sp fkey)? | embed
+# a field's key outside Limen, for json, yaml and sql: a one-line plain
+# string that is not empty
+fkey     ::= "\"" (strchar | escape)+ "\""
 # an embedded struct: its type alone, starting with a capital (`User`, `auth.User`, `Box[Int]`)
 embed    ::= (ident ".")? upper (sp "[" ws typearg (isep typearg)* (ws ",")? ws "]")?
 enum     ::= "enum" sp1 ident sp bgenerics? sp "{" ws (variant (isep variant)* (ws ",")?)? ws "}"

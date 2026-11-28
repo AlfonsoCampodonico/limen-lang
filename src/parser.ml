@@ -5,7 +5,7 @@
 open Ast
 open Lexer
 
-type st = { toks : tokens; mutable pos : int; file : string; mutable depth : int }
+type st = { toks : tokens; mutable pos : int; file : string; mutable depth : int; src : string (* the file's text, for a field's key *) }
 
 (* How deep expressions, types and patterns may nest. [depth] counts the
    operands, types and patterns being parsed inside one another (brackets,
@@ -525,7 +525,7 @@ and str_part st = function
   | Lit s -> SPLit s
   | Interp (src, off) ->
     let toks = Lexer.lex ~base:off st.file src in
-    let sub = { toks; pos = 0; file = st.file; depth = st.depth } in
+    let sub = { toks; pos = 0; file = st.file; depth = st.depth; src = st.src } in
     let e = parse_expr sub in
     if cur sub <> EOF then fail (peek sub) "`}` to close the interpolation";
     SPExpr e
@@ -1058,7 +1058,11 @@ let parse_item st =
       if has_key st then begin
         skip st;
         let s = advance st in
+        (* a key is a name, never more than a line *)
+        let multiline = s.span.lo + 3 <= String.length st.src && String.sub st.src s.span.lo 3 = "\"\"\"" in
         match s.tok with
+        | STR _ when multiline ->
+          raise (Diag.Fatal (Diag.make "E0003" s.span "a field's key is written on one line, as in `name: Str as \"key\"`"))
         | STR [ Lit k ] when k <> "" -> keys := (f, (k, s.span)) :: !keys
         | STR [] -> raise (Diag.Fatal (Diag.make "E0003" s.span "a field's key cannot be empty"))
         | STR _ -> raise (Diag.Fatal (Diag.make "E0003" s.span "a field's key must be a plain string, without interpolation"))
@@ -1244,7 +1248,7 @@ let parse_file file src : file =
   test_count := 0;
   safe_count := 0;
   let toks = Lexer.lex file src in
-  let st = { toks; pos = 0; file; depth = 0 } in
+  let st = { toks; pos = 0; file; depth = 0; src } in
   let items = ref [] and uses = ref [] in
   while cur st <> EOF do
     if is_kw st "use" then begin
