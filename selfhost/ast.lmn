@@ -317,6 +317,17 @@ pub struct Field {
     name: Str,
     span: Span,
     ty: TyExpr,
+    // `name: T as "key"`: the field's key outside Limen, for the json, yaml
+    // and sql conversions, and where its string is written
+    key: Option[(Str, Span)],
+}
+
+// A field's key outside Limen: its `as "key"`, or its name.
+pub fn field_key(f: Field) -> Str {
+    match f.key {
+        Some((k, _)) => k,
+        None => f.name,
+    }
 }
 
 pub struct StructDecl {

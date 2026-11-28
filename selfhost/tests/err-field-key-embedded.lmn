@@ -1,0 +1,7 @@
+struct User {
+    name: Str,
+}
+
+struct Admin {
+    User as "user",
+}

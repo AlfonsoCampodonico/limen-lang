@@ -605,10 +605,12 @@ fn bodies(g: Gen, t: types.Ty) -> Result[((ast.Block, ast.Block, Option[ast.Bloc
             let fts = fields_of(g, env, sd.fields.map(|f| f.ty))?
             let fs = sd.fields.map(|f| f.name).zip(fts)
             let g = need(g, fts)?
+            // a field is read and written by its key, `as "key"` or its name
+            let key = |f: Str| text(g, key_of(sd, f))
             let enc = if pl {
-                call(g, jf(g, "of_fields"), [ex(g, EList(fs.map(|p| call(g, jf(g, "field"), [text(g, p.0), enc_of(g, p.1, ex(g, EField(x, p.0, g.sp)))]))))])
+                call(g, jf(g, "of_fields"), [ex(g, EList(fs.map(|p| call(g, jf(g, "field"), [key(p.0), enc_of(g, p.1, ex(g, EField(x, p.0, g.sp)))]))))])
             } else {
-                call(g, jf(g, "put_fields"), [ex(g, EList(fs.map(|p| text(g, p.0)))), ex(g, EList(fs.map(|p| put_of(g, p.1, ex(g, EField(x, p.0, g.sp))))))])
+                call(g, jf(g, "put_fields"), [ex(g, EList(fs.map(|p| key(p.0)))), ex(g, EList(fs.map(|p| put_of(g, p.1, ex(g, EField(x, p.0, g.sp))))))])
             }
             let check = ast.Stmt { desc: SExpr(try_(g, call(g, jf(g, "need_object"), [v, at]))), span: g.sp }
             let mut inits: List[ast.FieldInit] = []
@@ -616,9 +618,9 @@ fn bodies(g: Gen, t: types.Ty) -> Result[((ast.Block, ast.Block, Option[ast.Bloc
             let mut made: List[ast.FieldInit] = []
             for (i, p) in fs.with_index() {
                 let (f, ft) = p
-                let member = call(g, jf(g, "member"), [v, at, text(g, f), var(g, names_of(g, ft).1)])
+                let member = call(g, jf(g, "member"), [v, at, key(f), var(g, names_of(g, ft).1)])
                 inits.push(ast.FieldInit { name: f, span: g.sp, value: try_(g, member) })
-                parts.push(StepPart { ty: ft, direct: member, f: jf(g, "member_k"), args: [v, at, text(g, f), var(g, step_of(g, ft))] })
+                parts.push(StepPart { ty: ft, direct: member, f: jf(g, "member_k"), args: [v, at, key(f), var(g, step_of(g, ft))] })
                 made.push(ast.FieldInit { name: f, span: g.sp, value: var(g, "d{i}") })
             }
             let step = if self_ {
@@ -729,6 +731,17 @@ fn short(n: Str) -> Str {
     n.split(".").last() ?? n
 }
 
+// The key of the field `f` of `sd` outside Limen: its `as "key"`, or its
+// name.
+fn key_of(sd: ast.StructDecl, f: Str) -> Str {
+    for x in sd.fields {
+        if x.name == f {
+            return ast.field_key(x)
+        }
+    }
+    f
+}
+
 // The reader and writer of the struct `t` as rows, `sql.row$N` and
 // `sql.values$N`, written the first time `t` is asked for. `g.q` is the
 // sql module's name here.
@@ -768,11 +781,13 @@ fn row_coders(g: Gen, t: types.Ty) -> Result[((Str, Str), Gen), Fail] {
     let mut reads: List[ast.FieldInit] = []
     let mut writes: List[ast.Expr] = []
     for (f, ft) in fs {
-        let at = |k: Str| try_(g, call(g, jf(g, k + "_at"), [row, text(g, f), text(g, owner)]))
+        // the column of the field's key, `as "key"` or its name
+        let col = key_of(sd, f)
+        let at = |k: Str| try_(g, call(g, jf(g, k + "_at"), [row, text(g, col), text(g, owner)]))
         let value = ex(g, EField(x, f, g.sp))
         match (column(ft), ft) {
             (Some(k), _) => {
-                reads.push(ast.FieldInit { name: f, span: g.sp, value: try_(g, call(g, jf(g, "required"), [at(k), text(g, f), text(g, owner)])) })
+                reads.push(ast.FieldInit { name: f, span: g.sp, value: try_(g, call(g, jf(g, "required"), [at(k), text(g, col), text(g, owner)])) })
                 writes.push(call(g, jf(g, "of_" + k), [value]))
             },
             (None, TNamed("Option", [a])) if column(a).is_some() => {

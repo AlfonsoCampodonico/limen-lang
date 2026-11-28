@@ -1,0 +1,6 @@
+struct S {
+    a: Int as "a-key", b: Str as "q\"t\u{e9}"
+    c: Int
+    as: Int
+    d: Option[S] as "D"
+}

@@ -1,0 +1,9 @@
+struct S {
+    a: Int as "b",
+    b: Int,
+    x: Int as "k",
+    y: Str as "k",
+    z: Int as "z",
+}
+
+fn main(root: Root) {}

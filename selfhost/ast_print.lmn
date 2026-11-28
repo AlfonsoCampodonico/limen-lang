@@ -214,7 +214,7 @@ fn item(i: ast.Item) -> Str {
         IIface(f) => "interface " + f.name + "[" + f.generics.join(",") + "]\{" + f.methods.map(|m| m.name + "(" + params(m.params) + ")" + ret(m.ret)).join(";") + "\}",
         IStruct(s) => {
             let foreign = s.foreign.map(|f| "foreign " + escaped(f.lib) + " ") ?? ""
-            let fields = commas(s.fields, |f| if s.embeds.contains(f.name) { "embed " + ty(f.ty) } else { f.name + ":" + ty(f.ty) })
+            let fields = commas(s.fields, |f| if s.embeds.contains(f.name) { "embed " + ty(f.ty) } else { f.name + ":" + ty(f.ty) + maybe(f.key, |k| " as " + escaped(k.0)) })
             foreign + "struct " + s.name + "[" + generics(s.generics, s.bounds) + "]\{" + fields + "\}"
         },
         IEnum(e) => "enum " + e.name + "[" + generics(e.generics, e.bounds) + "]\{" + commas(e.variants, |v| v.name + "(" + commas(v.payload, ty) + ")") + "\}",
@@ -380,7 +380,7 @@ fn bound_spans(w: Where, bs: List[ast.Bound]) -> Str {
 fn item_spans(w: Where, i: ast.Item) -> Str {
     match i {
         IFn(d) => sp(w, d.span) + all(d.params, |x| param_spans(w, x)) + maybe(d.ret, |x| ty_spans(w, x)) + bound_spans(w, d.bounds) + maybe(d.table, |t| pat_spans(w, t.pat) + expr_spans(w, t.cases)) + block_spans(w, d.body),
-        IStruct(s) => sp(w, s.span) + bound_spans(w, s.bounds) + all(s.fields, |f| sp(w, f.span) + ty_spans(w, f.ty)),
+        IStruct(s) => sp(w, s.span) + bound_spans(w, s.bounds) + all(s.fields, |f| sp(w, f.span) + ty_spans(w, f.ty) + maybe(f.key, |k| sp(w, k.1))),
         IEnum(e) => sp(w, e.span) + bound_spans(w, e.bounds) + all(e.variants, |v| sp(w, v.span) + all(v.payload, |x| ty_spans(w, x))),
         IIface(f) => sp(w, f.span) + all(f.methods, |m| sp(w, m.span) + all(m.params, |x| param_spans(w, x)) + maybe(m.ret, |x| ty_spans(w, x))),
         IType(a) => sp(w, a.span) + ty_spans(w, a.body),

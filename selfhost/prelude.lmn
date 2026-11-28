@@ -87,7 +87,7 @@ fn tuples() -> List[ast.Item] {
     let nowhere = ast.Span { file: -1, lo: 0, hi: 0 }
     (2..<9).map(|n| {
         let gen = (0..<n).map(|i| "T{i}")
-        let fields = gen.with_index().map(|p| ast.Field { name: "{p.0}", span: nowhere, ty: ast.TyExpr { desc: TyName(p.1, []), span: nowhere } })
+        let fields = gen.with_index().map(|p| ast.Field { name: "{p.0}", span: nowhere, ty: ast.TyExpr { desc: TyName(p.1, []), span: nowhere }, key: None })
         IStruct(ast.StructDecl { name: ast.tuple_name(n), span: nowhere, generics: gen, fields, bounds: [], embeds: [], public: true, foreign: None })
     })
 }

@@ -1537,6 +1537,7 @@ struct StructField {
 fn struct_field(p: Parser) -> Parsed[StructField] {
     if is_symbol(p.next_kind(), ":") || !starts_embedded(p) {
         let (f, p) = typed_field(p)?
+        let (f, p) = field_key(f, p)?
         return Ok((StructField { field: f, embedded: false }, p))
     }
     let (ty, p) = parse_type(p)?
@@ -1545,7 +1546,31 @@ fn struct_field(p: Parser) -> Parsed[StructField] {
         TyName(n, _) => n.slice((n.last_index_of(".") ?? -1) + 1, n.len()),
         _ => "",
     }
-    Ok((StructField { field: ast.Field { name, span: ty.span, ty }, embedded: true }, p))
+    if has_key(p) {
+        let lower = name.to_lower()
+        return Err(error("E0003", p.span_of(p.tok()), "an embedded struct has no key: its fields are the outer struct's").note("give it a field name to key it, as in `{lower}: {name} as \"key\"`"))
+    }
+    Ok((StructField { field: ast.Field { name, span: ty.span, ty, key: None }, embedded: true }, p))
+}
+
+// `as "key"` on the field's line: the field's key outside Limen. On the
+// next line `as` is a field of that name.
+fn has_key(p: Parser) -> Bool {
+    p.is_word("as") && !p.nl() && !is_symbol(p.next_kind(), ":")
+}
+
+fn field_key(f: ast.Field, p: Parser) -> Parsed[ast.Field] {
+    if !has_key(p) {
+        return Ok((f, p))
+    }
+    let s = p.skip().tok()
+    let p = p.skip().skip()
+    match s.kind {
+        StrLit([Lit(k)]) if k != "" => Ok(({ f with key: Some((k, p.span_of(s))) }, p)),
+        StrLit([]) => Err(error("E0003", p.span_of(s), "a field's key cannot be empty")),
+        StrLit(_) => Err(error("E0003", p.span_of(s), "a field's key must be a plain string, without interpolation")),
+        _ => Err(error("E0003", p.span_of(s), "a field's key is a string, as in `name: Str as \"key\"`")),
+    }
 }
 
 // An uppercase name, or `module.Upper`.
@@ -1561,7 +1586,7 @@ fn starts_embedded(p: Parser) -> Bool {
 fn typed_field(p: Parser) -> Parsed[ast.Field] {
     let (f, p) = p.expect_ident()?
     let (ty, p) = parse_type(p.need(":")?)?
-    Ok((ast.Field { name: f.text, span: f.span, ty }, p))
+    Ok((ast.Field { name: f.text, span: f.span, ty, key: None }, p))
 }
 
 fn parse_enum(p: Parser) -> Parsed[ast.Item] {

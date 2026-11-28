@@ -658,6 +658,27 @@ fn fields_and_variants(mut cx: env.Cx, mut st: env.State, mut ds: Decls, items: 
                     }
                     fs.push((f.name, t))
                 }
+                // each field's key outside Limen, its `as "key"` or its
+                // name, is the field's alone
+                if s.fields.any(|f| f.key.is_some()) {
+                    let mut owners: Map[Str, Str] = map()
+                    for f in s.fields {
+                        let k = ast.field_key(f)
+                        match owners.get(k) {
+                            Some(g) if g != f.name => {
+                                let sp = match f.key {
+                                    Some((_, ksp)) => ksp,
+                                    None => f.span,
+                                }
+                                st.report(diag.error("E0124", sp, "fields `{g}` and `{f.name}` both have the key `{k}`").note("json, yaml and sql read and write each field by its key, so the keys must differ"))
+                            },
+                            Some(_) => {},
+                            None => {
+                                owners[k] = f.name
+                            },
+                        }
+                    }
+                }
                 cx.sfields[s.name] = fs
                 take_pending(mut st, mut ds, own_bounds(cx, s.name))
             },

@@ -1,0 +1,46 @@
+use json
+use sql
+use yaml
+
+// keys that are not Limen names, from a kubeconfig, a JSON API and a table
+struct Config {
+    current_context: Str as "current-context",
+    ca: Option[Str] as "certificate-authority-data",
+    name: Str,
+}
+
+struct Meta {
+    resource_version: Str as "resourceVersion",
+}
+
+// a type that holds itself is converted a step at a time
+struct Chain {
+    value: Int as "the-value",
+    next_one: Option[Chain] as "nextOne",
+}
+
+struct Person {
+    id: Int,
+    full_name: Str as "full-name",
+    note: Option[Str] as "Note Text",
+}
+
+fn people(db: sql.Db) -> Result[List[Person], IoError] {
+    db.exec("INSERT INTO people VALUES (?, ?, ?)", sql.values(Person { id: 1, full_name: "Ada", note: None }))?
+    db.all("SELECT * FROM people", [])
+}
+
+fn main(root: Root) {
+    let c: Result[Config, Str] = yaml.decode("current-context: prod\nname: x\n")
+    root.stdout.print("{c}")
+    match c {
+        Ok(c) => root.stdout.print(yaml.encode(c)),
+        Err(e) => root.stdout.print(e),
+    }
+    let m: Result[Meta, Str] = json.decode("\{\"resourceVersion\": \"7\"\}")
+    root.stdout.print("{m}")
+    let chain = Chain { value: 1, next_one: Some(Chain { value: 2, next_one: None }) }
+    root.stdout.print(json.encode(chain))
+    let back: Result[Chain, Str] = yaml.decode(yaml.encode(chain))
+    root.stdout.print("{back == Ok(chain)}")
+}

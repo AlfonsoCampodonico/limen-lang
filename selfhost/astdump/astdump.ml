@@ -98,7 +98,7 @@ let item = function
   | IStruct s ->
     sp s.st_span;
     bounds s.st_bounds;
-    List.iter (fun (_, fsp, t) -> sp fsp; ty t) s.st_fields
+    List.iter (fun (f, fsp, t) -> sp fsp; ty t; match List.assoc_opt f s.st_keys with Some (_, ksp) -> sp ksp | None -> ()) s.st_fields
   | IEnum e ->
     sp e.en_span;
     bounds e.en_bounds;
