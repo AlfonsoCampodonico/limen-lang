@@ -772,6 +772,7 @@ struct WCap {
   int64_t inflight; int closing; /* operations in progress; close requested */
   int reading, writing;          /* a task is in a read (or accept) / a write that has had to wait */
   void *tls;                     /* Listener: its SSL_CTX; Conn: its VTls (NULL for plain TCP) */
+  void *client;                  /* Net, and a Conn opened through it: the VTlsClient its TLS clients use (`trusting`, `presenting`), NULL for the default */
   WRevoke *rv;                   /* the switch that can withdraw it (Revoker: its own), or NULL */
   WCap *rnext, *rprev;           /* Listener, Conn with a switch: in w_revocable_socks, closed at revoke */
 };
@@ -1400,10 +1401,14 @@ W_RT WIo Cap_conn_write_within(WCap *c, WCap *clock, int64_t ms, WStr *s);
    does its handshake inside the first read or write, so accept() never
    waits for a slow client. */
 W_RT void w_tls_release(WCap *c);
+W_RT void *w_tls_client_dup(void *v);
+W_RT void w_tls_client_drop(void *v);
 W_RT void w_tls_close_notify(WCap *c);
 W_RT int w_tls_step(WCap *c, int wr, char *buf, size_t n, int *dir, char *err, size_t en);
 W_RT int w_tls_accept(WCap *l, WCap *conn, WIo *r);
 W_RT WIo Cap_net_connect_tls(WCap *n, WStr *addr);
+W_RT WIo Cap_net_trusting(WCap *n, WStr *pem);
+W_RT WIo Cap_net_presenting(WCap *n, WStr *cert, WStr *key);
 W_RT WIo Cap_conn_start_tls(WCap *c, WStr *host);
 W_RT WIo Cap_fs_read_at(WCap *fs, WStr *rel, int64_t off, int64_t n);
 W_RT WStr *w_crypto(int64_t op, WStr *a, WStr *b, WStr *c, WStr *d);

@@ -1,0 +1,74 @@
+// A fake Kubernetes API server for the kube tests, pasted in front of each
+// test program (it has no main of its own). It answers `n` requests, one per
+// connection, from a table of routes, and returns a line for each request it
+// saw: the method, the path, the headers the client is expected to send and
+// the body.
+use http
+
+// An answer: to the first route whose method matches and whose path the
+// request's path starts with. A route with `uses` above 0 is used up after
+// that many requests.
+struct Route {
+    method: Str,
+    path: Str,
+    status: Int,
+    body: Str,
+    uses: Int,
+}
+
+fn route(method: Str, path: Str, status: Int, body: Str) -> Route {
+    Route { method, path, status, body, uses: 0 }
+}
+
+// The Status object the API server answers an error with.
+fn status_body(code: Int, reason: Str, message: Str) -> Str {
+    "\{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"status\":\"Failure\",\"message\":\"{message}\",\"reason\":\"{reason}\",\"code\":{code}}"
+}
+
+fn seen(r: http.Request) -> Str {
+    let h = |name: Str| r.header(name) ?? "-"
+    "{r.method} {r.path} auth={h("Authorization")} accept={h("Accept")} type={h("Content-Type")} body={r.body}"
+}
+
+// Answer `n` requests on `l`. `before(i)` runs before the i-th answer (from
+// 0), so a test can change something the client will read next.
+fn fake(l: Listener, n: Int, routes: List[Route], before: fn(Int) -> ()) -> Str {
+    let mut table = routes
+    let mut log: List[Str] = []
+    let mut i = 0
+    while i < n {
+        match l.accept() {
+            Ok(c) => {
+                match http.read_request(c) {
+                    Ok(r) => {
+                        log.push(seen(r))
+                        before(i)
+                        let mut answer = http.json(404, status_body(404, "NotFound", "no route for {r.method} {r.path}"))
+                        let mut found = false
+                        let mut next: List[Route] = []
+                        for t in table {
+                            if !found && t.method == r.method && r.path.starts_with(t.path) {
+                                answer = http.json(t.status, t.body)
+                                found = true
+                                if t.uses != 1 {
+                                    next.push(if t.uses > 1 { { t with uses: t.uses - 1 } } else { t })
+                                }
+                            } else {
+                                next.push(t)
+                            }
+                        }
+                        table = next
+                        let _ = http.write_response(c, answer)
+                    },
+                    Err(e) => log.push("bad request: {e}"),
+                }
+                c.close()
+            },
+            Err(e) => log.push("accept: {e}"),
+        }
+        i = i + 1
+    }
+    log.join("\n")
+}
+
+fn none(_: Int) {}

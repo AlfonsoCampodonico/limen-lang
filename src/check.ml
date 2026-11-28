@@ -760,7 +760,7 @@ let build_methods (t : ty) : (string * (unit -> ty list * ty)) list =
   | TNamed ("Result", [ a; e ]) ->
     [ m "is_ok" [] TBool; m "is_err" [] TBool;
       ("map_error", fun () -> let u = fresh () in ([ TFn ([ e ], u) ], res a u)) ]
-  | TCap Net -> [ m "get" [ TStr ] (res (TNamed ("HttpResponse", [])) io_err); m "only" [ TStr ] (TCap Net); m "connect" [ TStr ] (res (TCap Conn) io_err); m "connect_tls" [ TStr ] (res (TCap Conn) io_err); revocable Net ]
+  | TCap Net -> [ m "get" [ TStr ] (res (TNamed ("HttpResponse", [])) io_err); m "only" [ TStr ] (TCap Net); m "connect" [ TStr ] (res (TCap Conn) io_err); m "connect_tls" [ TStr ] (res (TCap Conn) io_err); m "trusting" [ TStr ] (res (TCap Net) io_err); m "presenting" [ TStr; TStr ] (res (TCap Net) io_err); revocable Net ]
   | TCap Listen -> [ m "on" [ TStr ] (res (TCap Listener) io_err); m "on_tls" [ TStr; TStr; TStr ] (res (TCap Listener) io_err); revocable Listen ]
   | TCap Listener -> [ m "accept" [] (res (TCap Conn) io_err); m "port" [] TInt; m "close" [] TUnit ]
   | TCap Conn ->

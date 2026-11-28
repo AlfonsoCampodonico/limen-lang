@@ -19,9 +19,12 @@
    by close/free or else by the GC. */
 #define Tls_val(v) (*((VTls **)Data_custom_val(v)))
 #define Ctx_val(v) (*((SSL_CTX **)Data_custom_val(v)))
+/* a trusting or presenting Net's client context: one reference, dropped by the GC */
+#define Trust_val(v) (*((VTlsClient **)Data_custom_val(v)))
 
 static void tls_finalize(value v) { vtls_free(Tls_val(v)); Tls_val(v) = NULL; }
 static void ctx_finalize(value v) { if (Ctx_val(v)) SSL_CTX_free(Ctx_val(v)); Ctx_val(v) = NULL; }
+static void trust_finalize(value v) { vtls_client_drop(Trust_val(v)); Trust_val(v) = NULL; }
 static struct custom_operations tls_ops = { "limen.tls", tls_finalize, custom_compare_default, custom_hash_default,
                                             custom_serialize_default, custom_deserialize_default,
                                             custom_compare_ext_default, custom_fixed_length_default };
@@ -29,19 +32,57 @@ static struct custom_operations ctx_ops = { "limen.tls_ctx", ctx_finalize, custo
                                             custom_serialize_default, custom_deserialize_default,
                                             custom_compare_ext_default, custom_fixed_length_default };
 
+static struct custom_operations trust_ops = { "limen.tls_trust", trust_finalize, custom_compare_default, custom_hash_default,
+                                              custom_serialize_default, custom_deserialize_default,
+                                              custom_compare_ext_default, custom_fixed_length_default };
+
 static value wrap_tls(VTls *t) {
   value v = caml_alloc_custom(&tls_ops, sizeof(VTls *), 0, 1);
   Tls_val(v) = t;
   return v;
 }
 
-/* client : Unix.file_descr -> string -> t   (raises Failure msg) */
-value limen_tls_client(value fd, value host) {
-  CAMLparam2(fd, host);
+/* client_with : trust option -> Unix.file_descr -> string -> t   (raises Failure msg) */
+value limen_tls_client(value with, value fd, value host) {
+  CAMLparam3(with, fd, host);
   char err[300];
-  VTls *t = vtls_client(Int_val(fd), String_val(host), err, sizeof err);
+  VTlsClient *w = Is_block(with) ? Trust_val(Field(with, 0)) : NULL;
+  VTls *t = vtls_client(w, Int_val(fd), String_val(host), err, sizeof err);
   if (!t) caml_failwith(err);
   CAMLreturn(wrap_tls(t));
+}
+
+/* The C memory behind a context, for caml_alloc_custom_mem, so the GC runs
+   sooner when many are dropped: an SSL_CTX with its tables is some tens of
+   kilobytes, plus about the size of the PEM text it was made from. */
+#define VTLS_CTX_MEM 32768
+
+static value wrap_trust(VTlsClient *c, size_t text) {
+  value v = caml_alloc_custom_mem(&trust_ops, sizeof(VTlsClient *), VTLS_CTX_MEM + text);
+  Trust_val(v) = c;
+  return v;
+}
+
+/* trust_raw : trust option -> string -> trust   (raises Failure msg): the
+   context from's (None: the default) with the trust replaced */
+value limen_tls_trust(value from, value pem) {
+  CAMLparam2(from, pem);
+  char err[300];
+  VTlsClient *f = Is_block(from) ? Trust_val(Field(from, 0)) : NULL;
+  VTlsClient *c = vtls_trusting(f, String_val(pem), caml_string_length(pem), err, sizeof err);
+  if (!c) caml_failwith(err);
+  CAMLreturn(wrap_trust(c, caml_string_length(pem)));
+}
+
+/* present_raw : trust option -> string -> string -> trust   (raises
+   Failure msg): the context from's with a certificate and key to present */
+value limen_tls_present(value from, value cert, value key) {
+  CAMLparam3(from, cert, key);
+  char err[300];
+  VTlsClient *f = Is_block(from) ? Trust_val(Field(from, 0)) : NULL;
+  VTlsClient *c = vtls_presenting(f, String_val(cert), caml_string_length(cert), String_val(key), caml_string_length(key), err, sizeof err);
+  if (!c) caml_failwith(err);
+  CAMLreturn(wrap_trust(c, caml_string_length(cert) + caml_string_length(key)));
 }
 
 /* server_ctx : string -> string -> ctx   (raises Failure msg) */
@@ -51,7 +92,7 @@ value limen_tls_server_ctx(value cert, value key) {
   char err[300];
   SSL_CTX *c = vtls_server_ctx(String_val(cert), caml_string_length(cert), String_val(key), caml_string_length(key), err, sizeof err);
   if (!c) caml_failwith(err);
-  v = caml_alloc_custom(&ctx_ops, sizeof(SSL_CTX *), 0, 1);
+  v = caml_alloc_custom_mem(&ctx_ops, sizeof(SSL_CTX *), VTLS_CTX_MEM + caml_string_length(cert) + caml_string_length(key));
   Ctx_val(v) = c;
   CAMLreturn(v);
 }
@@ -122,7 +163,9 @@ value limen_crypto_op(value op, value a, value b, value c, value d) {
 
 #else
 
-value limen_tls_client(value fd, value host) { (void)fd; (void)host; caml_failwith(NO_TLS); }
+value limen_tls_client(value w, value fd, value host) { (void)w; (void)fd; (void)host; caml_failwith(NO_TLS); }
+value limen_tls_trust(value f, value pem) { (void)f; (void)pem; caml_failwith(NO_TLS); }
+value limen_tls_present(value f, value c, value k) { (void)f; (void)c; (void)k; caml_failwith(NO_TLS); }
 value limen_tls_server_ctx(value c, value k) { (void)c; (void)k; caml_failwith(NO_TLS); }
 value limen_tls_server(value c, value fd) { (void)c; (void)fd; caml_failwith(NO_TLS); }
 value limen_tls_step(value t, value op, value b, value o, value l) { (void)t; (void)op; (void)b; (void)o; (void)l; caml_failwith(NO_TLS); }

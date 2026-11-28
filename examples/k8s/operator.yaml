@@ -1,0 +1,98 @@
+# The site operator (examples/site_operator.lmn) running in the cluster, in
+# its own namespace, with a service account that may do only what it does:
+# read and watch StaticSites, patch their status, and read, watch, create
+# and patch their ConfigMaps, Deployments and Services (server-side apply is
+# a patch, and a create when the object is not there). It deletes nothing:
+# Kubernetes collects a site's objects through their owner references. The
+# image is examples/k8s/Dockerfile's.
+#
+# On an IPv6 cluster the net grant below expands to a bare address and port,
+# `fd00::1:443`, which Limen reads as `[fd00::1]:443`: it works as it is.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: limen-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: site-operator
+  namespace: limen-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: limen-site-operator
+rules:
+  - apiGroups: [limen.dev]
+    resources: [staticsites]
+    verbs: [get, list, watch]
+  - apiGroups: [limen.dev]
+    resources: [staticsites/status]
+    verbs: [patch]
+  # A ClusterRole, since sites may be in any namespace, so create and patch
+  # on these hold in every namespace: that comes with a cluster-wide operator.
+  - apiGroups: [""]
+    resources: [configmaps, services]
+    verbs: [get, list, watch, create, patch]
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [get, list, watch, create, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: limen-site-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: limen-site-operator
+subjects:
+  - kind: ServiceAccount
+    name: site-operator
+    namespace: limen-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: site-operator
+  namespace: limen-system
+  labels:
+    app.kubernetes.io/name: site-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: site-operator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: site-operator
+    spec:
+      serviceAccountName: site-operator
+      securityContext:
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: operator
+          image: limen-site-operator:dev
+          imagePullPolicy: IfNotPresent
+          # the API server's address, the service account directory and the
+          # two variables naming the address: nothing else
+          args:
+            - --grant
+            - net=$(KUBERNETES_SERVICE_HOST):$(KUBERNETES_SERVICE_PORT)
+            - --grant
+            - fs=/var/run/secrets/kubernetes.io/serviceaccount:ro
+            - --grant
+            - env=KUBERNETES_SERVICE_HOST
+            - --grant
+            - env=KUBERNETES_SERVICE_PORT
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { memory: 64Mi }

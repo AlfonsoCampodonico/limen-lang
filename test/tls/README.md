@@ -20,6 +20,8 @@ is used.
 - `server.pem`, `server-key.pem`: for `localhost` and `127.0.0.1`
   (serverAuth).
 - `client.pem`, `client-key.pem`: a client certificate (clientAuth).
+- `client-key-encrypted.pem`: the same key, encrypted (passphrase
+  `limen-test`), which `presenting` refuses.
 - `other-ca.pem`, `other-ca-key.pem`: an unrelated CA.
 - `other-server.pem`, `other-server-key.pem`: signed by `other-ca.pem`, same
   names as `server.pem`, for checking a bundle with several CAs.

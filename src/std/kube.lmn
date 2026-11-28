@@ -1,0 +1,197 @@
+// A client for the Kubernetes API, written in Limen over `http` and `json`.
+// From inside a pod it reads the service account the kubelet mounts and
+// speaks TLS to the API server, trusting only the cluster's CA:
+//
+//   // --grant fs=/var/run/secrets/kubernetes.io/serviceaccount:ro: root.fs
+//   // is that directory (an Fs takes no absolute paths)
+//   let sa = root.fs.read_only()
+//   let k = kube.in_cluster(sa, root.env, root.net)?
+//   let (code, sites) = k.list("/apis/limen.dev/v1/staticsites")?
+//
+// Outside a cluster, `kube.proxy(net, "http://127.0.0.1:8001")` goes through
+// `kubectl proxy`, which holds the credentials.
+//
+// Every answer from the API server is `Ok((status, value))`, an error status
+// included, its value the server's `kind: Status` object, so a caller can act
+// on a 404 or a 409. `Err` is for what got no answer (the connection, TLS) or
+// an answer whose body is not JSON.
+use http
+use json
+use url
+
+// A connection to one API server. The fields are the module's own.
+pub struct Client {
+    net: Net,
+    base: Str,
+    ns: Str,
+    // the service account directory, for the token; None through a proxy
+    account: Option[Fs],
+    token: Str,
+    // the token file's modified time when `token` was read
+    token_ms: Int,
+}
+
+fn failed(what: Str, e: IoError) -> IoError {
+    match e {
+        Denied(m) => Denied("kube: {what}: {m}"),
+        Failed(m) => Failed("kube: {what}: {m}"),
+    }
+}
+
+fn read_account(fs: Fs, name: Str) -> Result[Str, IoError] {
+    fs.read(name).map_error(|e| failed("the service account's {name}", e))
+}
+
+// The token as it is in the file now, and the file's modified time, taken
+// first so that a write in between is seen next time.
+fn read_token(fs: Fs) -> Result[(Str, Int), IoError] {
+    let ms = (fs.info("token").map_error(|e| failed("the service account's token", e))?).modified_ms
+    Ok(((read_account(fs, "token")?).trim(), ms))
+}
+
+fn setting(env: Env, name: Str) -> Result[Str, IoError] {
+    match env.get(name) {
+        Some(v) if v.trim() != "" => Ok(v.trim()),
+        _ => Err(Failed("kube: {name} is not set")),
+    }
+}
+
+// The client of a program running in a pod. `fs` is the service account
+// directory (/var/run/secrets/kubernetes.io/serviceaccount), from which it
+// reads `token`, `ca.crt` and `namespace`; `env` gives the API server's
+// address, KUBERNETES_SERVICE_HOST and KUBERNETES_SERVICE_PORT. The client
+// holds `net` narrowed to that address and trusting only `ca.crt`.
+pub fn in_cluster(fs: Fs, env: Env, net: Net) -> Result[Client, IoError] {
+    let host = setting(env, "KUBERNETES_SERVICE_HOST")?
+    let port = setting(env, "KUBERNETES_SERVICE_PORT")?
+    let (token, token_ms) = read_token(fs)?
+    let ca = read_account(fs, "ca.crt")?
+    let trusting = net.trusting(ca).map_error(|e| failed("the service account's ca.crt", e))?
+    let ns = (read_account(fs, "namespace")?).trim()
+    let addr = if host.contains(":") { "[{host}]:{port}" } else { "{host}:{port}" }
+    Ok(Client { net: trusting.only(addr), base: "https://{addr}", ns, account: Some(fs), token, token_ms })
+}
+
+// The client through `kubectl proxy` (or any API server that needs no
+// token) at `base`, such as "http://127.0.0.1:8001". Its namespace is
+// "default".
+pub fn proxy(net: Net, base: Str) -> Client {
+    let b = if base.ends_with("/") { base.slice(0, base.len() - 1) } else { base }
+    Client { net, base: b, ns: "default", account: None, token: "", token_ms: 0 }
+}
+
+// The namespace the program runs in, from the service account.
+pub fn namespace(self: Client) -> Str {
+    self.ns
+}
+
+// The token to send now: the one read before, unless the file has changed
+// since (the kubelet rewrites it as it rotates, about hourly).
+fn current_token(self: Client) -> Result[Str, IoError] {
+    match self.account {
+        None => Ok(""),
+        Some(fs) => {
+            let ms = (fs.info("token").map_error(|e| failed("the service account's token", e))?).modified_ms
+            if ms > self.token_ms {
+                Ok((read_token(fs)?).0)
+            } else {
+                Ok(self.token)
+            }
+        },
+    }
+}
+
+fn headers(token: Str, content_type: Str) -> List[http.Header] {
+    let mut h = [http.Header { name: "Accept", value: "application/json" }]
+    if token != "" {
+        h.push(http.Header { name: "Authorization", value: "Bearer {token}" })
+    }
+    if content_type != "" {
+        h.push(http.Header { name: "Content-Type", value: content_type })
+    }
+    h
+}
+
+// Send a request with the current token; after a 401, read the token again
+// and send it once more.
+fn send(self: Client, method: Str, path: Str, content_type: Str, body: Str) -> Result[(Int, json.Value), IoError] {
+    let token = self.current_token()?
+    let mut r = http.request(self.net, method, self.base + path, headers(token, content_type), body)?
+    if r.status == 401 {
+        match self.account {
+            Some(fs) => {
+                let (fresh, _) = read_token(fs)?
+                r = http.request(self.net, method, self.base + path, headers(fresh, content_type), body)?
+            },
+            None => (),
+        }
+    }
+    answer(method, path, r)
+}
+
+fn answer(method: Str, path: Str, r: http.Response) -> Result[(Int, json.Value), IoError] {
+    if r.body.trim() == "" {
+        return Ok((r.status, json.Null))
+    }
+    match json.parse(r.body) {
+        Ok(v) => Ok((r.status, v)),
+        Err(_) => {
+            let text = if r.body.len() > 200 { r.body.slice(0, 200) + "..." } else { r.body }
+            Err(Failed("kube: {method} {path}: the answer ({r.status}) is not JSON: {text}"))
+        },
+    }
+}
+
+// `path` with `query` added to its query string.
+fn with_query(path: Str, query: Str) -> Str {
+    if path.contains("?") { "{path}&{query}" } else { "{path}?{query}" }
+}
+
+// GET one object: `k.get("/api/v1/namespaces/default/configmaps/x")`.
+pub fn get(self: Client, path: Str) -> Result[(Int, json.Value), IoError] {
+    self.send("GET", path, "", "")
+}
+
+// GET a collection; the objects are the value's `items`.
+pub fn list(self: Client, path: Str) -> Result[(Int, json.Value), IoError] {
+    self.send("GET", path, "", "")
+}
+
+pub fn delete(self: Client, path: Str) -> Result[(Int, json.Value), IoError] {
+    self.send("DELETE", path, "", "")
+}
+
+// Server-side apply: `body` is the whole object as `manager` wants it. The
+// fields it sets become `manager`'s, taken from any other manager
+// (`force=true`), so a change made to them by hand is put back; fields it
+// does not set are left alone.
+pub fn apply(self: Client, path: Str, manager: Str, body: json.Value) -> Result[(Int, json.Value), IoError] {
+    let query = "fieldManager={url.encode(manager)}&force=true"
+    self.send("PATCH", with_query(path, query), "application/apply-patch+yaml", json.stringify(body))
+}
+
+// A merge patch of the object's status subresource, `PATH/status`.
+pub fn patch_status(self: Client, path: Str, body: json.Value) -> Result[(Int, json.Value), IoError] {
+    self.send("PATCH", path + "/status", "application/merge-patch+json", json.stringify(body))
+}
+
+// Watch `path` from `resource_version` (the latest when it is ""), with
+// bookmarks: each event line goes to `f` as it arrives, until `f` returns
+// false or the API server ends the watch. The status code comes back; an
+// error status (410 Gone for a version too old) sends nothing to `f`.
+pub fn watch(self: Client, path: Str, resource_version: Str, f: fn(Str) -> Bool) -> Result[Int, IoError] {
+    let version = if resource_version == "" { "" } else { "&resourceVersion={url.encode(resource_version)}" }
+    let target = self.base + with_query(path, "watch=1{version}&allowWatchBookmarks=true")
+    let token = self.current_token()?
+    let mut r = http.request_lines(self.net, "GET", target, headers(token, ""), "", f)?
+    if r.status == 401 {
+        match self.account {
+            Some(fs) => {
+                let (fresh, _) = read_token(fs)?
+                r = http.request_lines(self.net, "GET", target, headers(fresh, ""), "", f)?
+            },
+            None => (),
+        }
+    }
+    Ok(r.status)
+}

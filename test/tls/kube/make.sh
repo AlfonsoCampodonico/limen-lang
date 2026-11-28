@@ -30,18 +30,20 @@ X
 ca() {
   key "$1-key.pem"
   openssl req -new -key "$1-key.pem" -subj "/CN=$2" -out "$tmp/$1.csr"
-  openssl x509 -req -in "$tmp/$1.csr" -signkey "$1-key.pem" -days $days -extfile "$tmp/ca.ext" -out "$1.pem"
+  openssl x509 -req -sha256 -in "$tmp/$1.csr" -signkey "$1-key.pem" -days $days -extfile "$tmp/ca.ext" -out "$1.pem"
 }
 # leaf NAME CN CA EXT
 leaf() {
   key "$1-key.pem"
   openssl req -new -key "$1-key.pem" -subj "/CN=$2" -out "$tmp/$1.csr"
-  openssl x509 -req -in "$tmp/$1.csr" -CA "$3.pem" -CAkey "$3-key.pem" -set_serial "0x$(openssl rand -hex 8)" \
+  openssl x509 -req -sha256 -in "$tmp/$1.csr" -CA "$3.pem" -CAkey "$3-key.pem" -set_serial "0x$(openssl rand -hex 8)" \
     -days $days -extfile "$tmp/$4.ext" -out "$1.pem"
 }
 
 ca ca "Limen kube test CA"
 leaf server localhost ca server
 leaf client limen-test-client ca client
+# the client key again, encrypted, which presenting refuses
+openssl pkcs8 -topk8 -v2 aes-256-cbc -passout pass:limen-test -in client-key.pem -out client-key-encrypted.pem
 ca other-ca "Limen other test CA"
 leaf other-server localhost other-ca server

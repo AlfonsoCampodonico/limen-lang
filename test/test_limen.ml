@@ -6518,6 +6518,461 @@ fn main(root: Root) -> Result[(), IoError] {
   let tls_http_want = "forever: Failed(\"listener is closed\")\nstream: Failed(\"listener is closed\")\n200 GET /x HTTP/1.1 body=\n200 POST /y HTTP/1.1 body=hello\n200 chunked one two three\n200 Some(\"text/plain; charset=utf-8\") GET /net?q=1 HTTP/1.1 body=\n3\nFailed(\"http: the URL must start with http:// or https://\")\n" in
   out "tls-http" ~grants:tls_grants tls_http_src tls_http_want;
   check_tsan "tls-http" ~grants:tls_grants tls_http_src tls_http_want;
+  (* ---------- Net.trusting ----------
+     test/tls/kube holds a CA that SSL_CERT_FILE does not name, a server
+     certificate it signs, and a second CA with a server of its own. The
+     system trust refuses the kube server; a Net that trusts the kube CA
+     takes it, and trusts nothing else. *)
+  let trust_prelude = {v|// Read until a "." arrives, or the peer closes or fails.
+fn read_msg(c: Conn) -> Result[Str, IoError] {
+    let mut got = ""
+    while !got.ends_with(".") {
+        let s = c.read()?
+        if s == "" {
+            return Ok(got)
+        }
+        got = got + s
+    }
+    Ok(got)
+}
+
+// Answer n connections with "kube." once each has said its line.
+fn serve(l: Listener, n: Int) -> Str {
+    let mut i = 0
+    while i < n {
+        match l.accept() {
+            Ok(c) => {
+                match read_msg(c) {
+                    Ok(_) => { let _ = c.write("kube.") },
+                    Err(_) => {},
+                }
+                c.close()
+            },
+            Err(_) => {},
+        }
+        i = i + 1
+    }
+    ""
+}
+
+fn call(net: Net, addr: Str) -> Str {
+    match net.connect_tls(addr) {
+        Ok(c) => {
+            let r = match c.write("hi.") {
+                Ok(_) => "{c.read()}",
+                Err(e) => "{e}",
+            }
+            c.close()
+            r
+        },
+        Err(e) => "{e}",
+    }
+}
+
+fn via(net: Net, ca: Str, addr: Str) -> Str {
+    match net.trusting(ca) {
+        Ok(t) => call(t, addr),
+        Err(e) => "{e}",
+    }
+}
+|v} in
+  let unknown_ca = "Failed(\"tls: certificate verify failed: unable to get local issuer certificate\")" in
+  out "net-trusting" ~grants:tls_grants (trust_prelude ^ {v|
+fn main(root: Root) -> Result[(), IoError] {
+    let fs = root.fs
+    let net = root.net
+    let ca = fs.read("kube/ca.pem")?
+    let other_ca = fs.read("kube/other-ca.pem")?
+    let l = root.listen.on_tls("127.0.0.1:0", fs.read("kube/server.pem")?, fs.read("kube/server-key.pem")?)?
+    let addr = "localhost:{l.port()}"
+    let got = group g {
+        g.go(|| serve(l, 4))
+        g.go(|| [call(net, addr), via(net, ca, addr), via(net, other_ca, addr), via(net, ca, "127.0.0.1:{l.port()}")].join("\n"))
+    }
+    root.stdout.print(got.join("\n"))
+    Ok(())
+}
+|v})
+    (sprintf "\n%s\nOk(\"kube.\")\n%s\nOk(\"kube.\")\n" unknown_ca unknown_ca);
+  out "net-trusting-pem-errors" ~grants:tls_grants {v|fn main(root: Root) -> Result[(), IoError] {
+    let out = root.stdout
+    let net = root.net
+    let ca = root.fs.read("kube/ca.pem")?
+    let cut = ca.slice(0, ca.len() / 2)
+    for text in ["", "not pem", cut, ca + cut, "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n", root.fs.read("kube/ca-key.pem")?] {
+        match net.trusting(text) {
+            Ok(_) => out.print("trusted"),
+            Err(e) => out.print("{e}"),
+        }
+    }
+    Ok(())
+}
+|v}
+    "Failed(\"tls: no PEM certificate in the CA text\")\nFailed(\"tls: no PEM certificate in the CA text\")\nFailed(\"tls: a PEM certificate in the CA text does not parse\")\nFailed(\"tls: a PEM certificate in the CA text does not parse\")\nFailed(\"tls: a PEM certificate in the CA text does not parse\")\nFailed(\"tls: no PEM certificate in the CA text\")\n";
+  out "net-trusting-isolated" ~grants:tls_grants (trust_prelude ^ {v|
+fn main(root: Root) -> Result[(), IoError] {
+    let fs = root.fs
+    let net = root.net
+    let l = root.listen.on_tls("127.0.0.1:0", fs.read("kube/server.pem")?, fs.read("kube/server-key.pem")?)?
+    let sys = root.listen.on_tls("127.0.0.1:0", fs.read("server.pem")?, fs.read("server-key.pem")?)?
+    let a = net.trusting(fs.read("kube/ca.pem")?)?
+    let got = group g {
+        g.go(|| serve(l, 3))
+        g.go(|| serve(sys, 2))
+        g.go(|| [call(net, "localhost:{l.port()}"), call(root.net, "localhost:{l.port()}"), call(a, "localhost:{sys.port()}"), call(net, "localhost:{sys.port()}"), call(a, "localhost:{l.port()}")].join("\n"))
+    }
+    root.stdout.print(got.join("\n"))
+    Ok(())
+}
+|v})
+    (sprintf "\n\n%s\n%s\n%s\nOk(\"kube.\")\nOk(\"kube.\")\n" unknown_ca unknown_ca unknown_ca);
+  out "net-trusting-only" ~grants:tls_grants (trust_prelude ^ {v|
+fn main(root: Root) -> Result[(), IoError] {
+    let fs = root.fs
+    let l = root.listen.on_tls("127.0.0.1:0", fs.read("kube/server.pem")?, fs.read("kube/server-key.pem")?)?
+    let port = l.port()
+    let t = root.net.trusting(fs.read("kube/ca.pem")?)?
+    let got = group g {
+        g.go(|| serve(l, 3))
+        g.go(|| [call(t.only("localhost:{port}"), "localhost:{port}"), call(t.only("localhost").only("localhost:{port}"), "localhost:{port}"), call(t.only("example.com"), "localhost:{port}"), call(root.net.only("localhost"), "localhost:{port}")].join("\n").replace("{port}", "PORT"))
+    }
+    root.stdout.print(got.join("\n"))
+    Ok(())
+}
+|v})
+    (sprintf "\nOk(\"kube.\")\nOk(\"kube.\")\nDenied(\"net: localhost:PORT is not granted\")\n%s\n" unknown_ca);
+  out "net-trusting-http" ~grants:tls_grants {v|use http
+
+fn main(root: Root) -> Result[(), IoError] {
+    let fs = root.fs
+    let l = root.listen.on_tls("127.0.0.1:0", fs.read("kube/server.pem")?, fs.read("kube/server-key.pem")?)?
+    let url = "https://localhost:{l.port()}/"
+    let t = root.net.trusting(fs.read("kube/ca.pem")?)?
+    let got = group g {
+        g.go(|| "served {http.serve(l, 3, |r| http.text(200, "{r.method} {r.path}"))}")
+        g.go(|| {
+            let a = match http.request(t, "GET", url) {
+                Ok(r) => "{r.status} {r.body}",
+                Err(e) => "{e}",
+            }
+            let b = match t.get(url) {
+                Ok(r) => "{r.status} {r.body}",
+                Err(e) => "{e}",
+            }
+            let c = match http.request(root.net, "GET", url) {
+                Ok(r) => "{r.status} {r.body}",
+                Err(e) => "{e}",
+            }
+            "{a}\n{b}\n{c}"
+        })
+    }
+    root.stdout.print(got.join("\n"))
+    Ok(())
+}
+|v}
+    (sprintf "served 2\n200 GET /\n200 GET /\n%s\n" unknown_ca);
+  out "net-trusting-revoked" ~grants:tls_grants (trust_prelude ^ {v|
+fn main(root: Root) -> Result[(), IoError] {
+    let fs = root.fs
+    let ca = fs.read("kube/ca.pem")?
+    let l = root.listen.on_tls("127.0.0.1:0", fs.read("kube/server.pem")?, fs.read("kube/server-key.pem")?)?
+    let addr = "localhost:{l.port()}"
+    let (r, k) = root.net.revocable()
+    let t = r.trusting(ca)?
+    let got = group g {
+        g.go(|| serve(l, 2))
+        g.go(|| {
+            let before = call(t.only(addr), addr)
+            let open = match t.connect_tls(addr) {
+                Ok(c) => {
+                    k.revoke()
+                    let s = "{c.read()}"
+                    c.close()
+                    s
+                },
+                Err(e) => "{e}",
+            }
+            [before, open, call(t, addr), call(t.only(addr), addr), via(r, ca, addr), "{k.is_revoked()}"].join("\n")
+        })
+    }
+    root.stdout.print(got.join("\n"))
+    Ok(())
+}
+|v})
+    "\nOk(\"kube.\")\nErr(Failed(\"connection is closed\"))\nDenied(\"net: revoked\")\nDenied(\"net: revoked\")\nDenied(\"net: revoked\")\ntrue\n";
+  out "net-trusting-bundle" ~grants:tls_grants (trust_prelude ^ {v|
+fn main(root: Root) -> Result[(), IoError] {
+    let fs = root.fs
+    let net = root.net
+    let ca = fs.read("kube/ca.pem")?
+    let other_ca = fs.read("kube/other-ca.pem")?
+    let a = root.listen.on_tls("127.0.0.1:0", fs.read("kube/server.pem")?, fs.read("kube/server-key.pem")?)?
+    let b = root.listen.on_tls("127.0.0.1:0", fs.read("kube/other-server.pem")?, fs.read("kube/other-server-key.pem")?)?
+    let both = net.trusting(ca + other_ca)?
+    let kube = net.trusting(ca)?
+    let replaced = both.trusting(other_ca)?
+    let got = group g {
+        g.go(|| serve(a, 2))
+        g.go(|| serve(b, 3))
+        g.go(|| [call(both, "localhost:{a.port()}"), call(both, "localhost:{b.port()}"), call(kube, "localhost:{b.port()}"), call(replaced, "localhost:{a.port()}"), call(replaced, "localhost:{b.port()}")].join("\n"))
+    }
+    root.stdout.print(got.join("\n"))
+    Ok(())
+}
+|v})
+    (sprintf "\n\nOk(\"kube.\")\nOk(\"kube.\")\n%s\n%s\nOk(\"kube.\")\n" unknown_ca unknown_ca);
+  out "net-trusting-crlf" ~grants:tls_grants (trust_prelude ^ {v|
+fn main(root: Root) -> Result[(), IoError] {
+    let fs = root.fs
+    let ca = (fs.read("kube/ca.pem")?).replace("\n", "\r\n")
+    let l = root.listen.on_tls("127.0.0.1:0", fs.read("kube/server.pem")?, fs.read("kube/server-key.pem")?)?
+    let got = group g {
+        g.go(|| serve(l, 1))
+        g.go(|| via(root.net, "\r\n" + ca, "localhost:{l.port()}"))
+    }
+    root.stdout.print(got.join("\n"))
+    Ok(())
+}
+|v})
+    "\nOk(\"kube.\")\n";
+  out "net-trusting-leak" ~grants:tls_grants {v|fn main(root: Root) -> Result[(), IoError] {
+    let ca = root.fs.read("kube/ca.pem")?
+    let net = root.net
+    let mut kept = net.trusting(ca)?
+    let mut i = 0
+    let mut failed = 0
+    while i < 2000 {
+        let t = net.trusting(ca)?
+        if i % 2 == 0 {
+            kept = t.only("localhost").trusting(ca)?
+        }
+        if net.trusting("x").is_err() {
+            failed = failed + 1
+        }
+        i = i + 1
+    }
+    root.stdout.print("{failed} {kept.only("localhost").connect("localhost:1").is_err()}")
+    Ok(())
+}
+|v}
+    "2000 true\n";
+  (* start_tls on a Conn opened through a trusting Net uses its trust *)
+  out "net-trusting-start-tls" ~grants:tls_grants (trust_prelude ^ {v|
+fn upgrade(net: Net, addr: Str) -> Str {
+    match net.connect(addr) {
+        Ok(c) => {
+            let r = match c.start_tls("localhost") {
+                Ok(_) => match c.write("hi.") {
+                    Ok(_) => "{c.read()}",
+                    Err(e) => "{e}",
+                },
+                Err(e) => "{e}",
+            }
+            c.close()
+            r
+        },
+        Err(e) => "{e}",
+    }
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let fs = root.fs
+    let l = root.listen.on_tls("127.0.0.1:0", fs.read("kube/server.pem")?, fs.read("kube/server-key.pem")?)?
+    let addr = "localhost:{l.port()}"
+    let t = root.net.trusting(fs.read("kube/ca.pem")?)?
+    let got = group g {
+        g.go(|| serve(l, 2))
+        g.go(|| [upgrade(t, addr), upgrade(root.net, addr)].join("\n"))
+    }
+    root.stdout.print(got.join("\n"))
+    Ok(())
+}
+|v})
+    (sprintf "\nOk(\"kube.\")\n%s\n" unknown_ca);
+  (* ---------- Net.presenting ----------
+     An openssl s_server that asks for a client certificate signed by the
+     kube CA (-Verify 1) and answers with a status page (-www). It needs
+     OpenSSL's openssl, not LibreSSL's, which cannot listen on port 0. *)
+  let present_errors_src = {v|fn main(root: Root) -> Result[(), IoError] {
+    let out = root.stdout
+    let fs = root.fs
+    let cert = fs.read("kube/client.pem")?
+    let key = fs.read("kube/client-key.pem")?
+    let (r, k) = root.net.revocable()
+    k.revoke()
+    let cases = [
+        (cert, key),
+        (cert + fs.read("kube/ca.pem")?, key),
+        (cert, fs.read("kube/server-key.pem")?),
+        ("", key),
+        ("not pem", key),
+        (cert.slice(0, cert.len() / 2), key),
+        (cert, ""),
+        (cert, "not pem"),
+        (cert, key.slice(0, key.len() / 2)),
+        (cert, fs.read("kube/client-key-encrypted.pem")?),
+        (key, cert),
+    ]
+    for (c, kk) in cases {
+        match root.net.presenting(c, kk) {
+            Ok(_) => out.print("presented"),
+            Err(e) => out.print("{e}"),
+        }
+    }
+    match r.presenting(cert, key) {
+        Ok(_) => out.print("presented"),
+        Err(e) => out.print("{e}"),
+    }
+    Ok(())
+}
+|v} in
+  out "net-presenting-errors" ~grants:tls_grants present_errors_src
+    "presented\npresented\nFailed(\"tls: the private key does not match the certificate\")\nFailed(\"tls: no PEM certificate in the certificate text\")\nFailed(\"tls: no PEM certificate in the certificate text\")\nFailed(\"tls: a PEM certificate in the certificate text does not parse\")\nFailed(\"tls: no unencrypted PEM private key in the key text\")\nFailed(\"tls: no unencrypted PEM private key in the key text\")\nFailed(\"tls: no unencrypted PEM private key in the key text\")\nFailed(\"tls: no unencrypted PEM private key in the key text\")\nFailed(\"tls: no PEM certificate in the certificate text\")\nDenied(\"net: revoked\")\n";
+  out "net-presenting-leak" ~grants:tls_grants {v|fn main(root: Root) -> Result[(), IoError] {
+    let fs = root.fs
+    let ca = fs.read("kube/ca.pem")?
+    let cert = fs.read("kube/client.pem")?
+    let key = fs.read("kube/client-key.pem")?
+    let net = root.net
+    let mut kept = net.presenting(cert, key)?
+    let mut failed = 0
+    for i in 0..<500 {
+        let t = (net.trusting(ca)?).presenting(cert, key)?
+        if i % 2 == 0 {
+            kept = (t.trusting(ca)?).only("localhost")
+        }
+        if net.presenting(cert, "x").is_err() {
+            failed = failed + 1
+        }
+    }
+    root.stdout.print("{failed} {kept.connect("localhost:1").is_err()}")
+    Ok(())
+}
+|v}
+    "500 true\n";
+  let openssl_tool =
+    let dirs = String.split_on_char ':' (Option.value (Sys.getenv_opt "PATH") ~default:"") in
+    List.find_map
+      (fun d ->
+        let p = Filename.concat d "openssl" in
+        if d = "" || not (Sys.file_exists p) then None
+        else
+          let ic = Unix.open_process_args_in p [| p; "version" |] in
+          let v = try input_line ic with End_of_file -> "" in
+          ignore (Unix.close_process_in ic);
+          if String.starts_with ~prefix:"OpenSSL" v then Some p else None)
+      dirs
+  in
+  let present_prelude = {v|// GET / from s_server -www: "page" for its status page, else the error.
+fn page(net: Net, addr: Str) -> Str {
+    match net.connect_tls(addr) {
+        Ok(c) => {
+            let mut got = ""
+            let mut last = ""
+            match c.write("GET / HTTP/1.0\r\n\r\n") {
+                Ok(_) => {
+                    let mut open = true
+                    while open {
+                        match c.read() {
+                            Ok(s) => if s == "" { open = false } else { got = got + s },
+                            Err(e) => { last = "{e}"; open = false },
+                        }
+                    }
+                },
+                Err(e) => { last = "{e}" },
+            }
+            c.close()
+            if got.starts_with("HTTP/1.0 200 ok") {
+                "page"
+            } else if last.starts_with("Failed(\"tls: ") {
+                "refused"
+            } else {
+                "{got} {last}"
+            }
+        },
+        Err(e) => "{e}",
+    }
+}
+|v} in
+  let present_srcs =
+    [ ( "net-presenting",
+        present_prelude ^ {v|
+fn main(root: Root) -> Result[(), IoError] {
+    let fs = root.fs
+    let addr = "127.0.0.1:{root.args()[0]}"
+    let t = root.net.trusting(fs.read("kube/ca.pem")?)?
+    let p = t.presenting(fs.read("kube/client.pem")?, fs.read("kube/client-key.pem")?)?
+    root.stdout.print([page(t, addr), page(p, addr), page(t, addr)].join("\n"))
+    Ok(())
+}
+|v},
+        "refused\npage\nrefused\n" );
+      ( "net-presenting-keeps-trust",
+        present_prelude ^ {v|
+fn main(root: Root) -> Result[(), IoError] {
+    let fs = root.fs
+    let addr = "127.0.0.1:{root.args()[0]}"
+    let ca = fs.read("kube/ca.pem")?
+    let cert = fs.read("kube/client.pem")?
+    let key = fs.read("kube/client-key.pem")?
+    let net = root.net
+    let a = (net.presenting(cert, key)?).trusting(ca)?
+    let b = (net.trusting(ca)?).presenting(cert, key)?
+    let c = b.only("127.0.0.1")
+    let (r, _) = b.revocable()
+    let others = [net.presenting(cert, key)?, b.trusting(fs.read("kube/other-ca.pem")?)?]
+    root.stdout.print([page(a, addr), page(b, addr), page(c, addr), page(r, addr)].join("\n"))
+    for o in others {
+        root.stdout.print(page(o, addr))
+    }
+    Ok(())
+}
+|v},
+        (* s_server sends the kube CA after its certificate *)
+        let in_chain = "Failed(\"tls: certificate verify failed: self-signed certificate in certificate chain\")" in
+        sprintf "page\npage\npage\npage\n%s\n%s\n" in_chain in_chain ) ]
+  in
+  (if List.exists (fun (n, _, _) -> selected n) present_srcs then
+     match openssl_tool with
+     | None -> print_endline "skipped net-presenting, net-presenting-keeps-trust: no OpenSSL openssl on PATH"
+     | Some exe ->
+       let kube f = Filename.concat (Filename.concat tls_dir "kube") f in
+       let log = Filename.temp_file "limen-s-server" ".log" in
+       let lfd = Unix.openfile log [ Unix.O_WRONLY; Unix.O_TRUNC ] 0o600 in
+       let null = Unix.openfile "/dev/null" [ Unix.O_RDONLY ] 0 in
+       let pid =
+         Unix.create_process exe
+           [| exe; "s_server"; "-accept"; "127.0.0.1:0"; "-cert"; kube "server.pem"; "-key"; kube "server-key.pem";
+              "-CAfile"; kube "ca.pem"; "-Verify"; "1"; "-www" |]
+           null lfd lfd
+       in
+       Unix.close lfd;
+       Unix.close null;
+       (* its port, from the "ACCEPT 127.0.0.1:PORT" line *)
+       let rec port n =
+         let text = In_channel.with_open_bin log In_channel.input_all in
+         let found =
+           List.find_map
+             (fun l ->
+               if String.starts_with ~prefix:"ACCEPT" l then
+                 Some (String.trim (String.sub l (String.rindex l ':' + 1) (String.length l - String.rindex l ':' - 1)))
+               else None)
+             (String.split_on_char '\n' text)
+         in
+         match found with
+         | Some p -> Ok p
+         | None when n = 0 -> Error text
+         | None -> Unix.sleepf 0.05; port (n - 1)
+       in
+       (match port 200 with
+        | Error text -> List.iter (fun (n, _, _) -> if selected n then ok n false ("s_server did not start: " ^ text)) present_srcs
+        | Ok p ->
+          let grants = { tls_grants with args = [ p ] } in
+          List.iter (fun (n, src, want) -> out n ~grants src want) present_srcs);
+       (* the native builds run later, so the server stays up until the end *)
+       at_exit (fun () ->
+           (try Unix.kill pid Sys.sigterm; ignore (Unix.waitpid [] pid) with Unix.Unix_error _ -> ());
+           try Sys.remove log with Sys_error _ -> ()));
   (* A TLS stream that ends without the close message may have been cut
      short: Conn.read says so, and Net.get accepts it only when the response
      is framed (Content-Length or chunked) and complete. *)
@@ -6567,6 +7022,385 @@ fn main(root: Root) -> Result[(), IoError] {
      out "tls-cut" ~grants tls_cut_src tls_cut_want;
      check_tsan "tls-cut" ~grants tls_cut_src tls_cut_want;
      ignore (Unix.close_process_in ic));
+  (* ---------- kube ----------
+     The kube module against a fake API server (test/kube/fake_api.lmn,
+     pasted in front of each program), with no cluster. The in-cluster
+     tests serve TLS with test/tls/kube/server.pem on the port that
+     KUBERNETES_SERVICE_PORT names, a free one picked for each test before
+     it runs (the native build inherits it when it starts), and each
+     program writes its own service account directory: a token, a namespace
+     and the kube CA as ca.crt, which SSL_CERT_FILE does not name, so a
+     request that gets through proves the client trusts ca.crt. The other
+     tests go through kube.proxy over plain http. *)
+  let kube_test_dir =
+    let d = Filename.concat (Sys.getcwd ()) "kube" in
+    if Sys.file_exists (Filename.concat d "fake_api.lmn") then d else Filename.concat (Sys.getcwd ()) "test/kube"
+  in
+  let kube_src main =
+    "use kube\nuse json\n\n" ^ read_file (Filename.concat kube_test_dir "fake_api.lmn")
+    ^ {v|
+// The service account directory, as the kubelet mounts it, under sa/.
+fn account(fs: Fs, token: Str) -> Result[Fs, IoError] {
+    if !fs.is_dir("sa") {
+        fs.make_dir("sa")?
+    }
+    fs.write("sa/token", token + "\n")?
+    fs.write("sa/namespace", "limen-test\n")?
+    fs.write("sa/ca.crt", fs.read("ca.pem")?)?
+    Ok(fs.under("sa").read_only())
+}
+
+// The kubelet rotating the token: write it again until its modified time has moved on.
+fn rotate(fs: Fs, clock: Clock, token: Str) -> Result[(), IoError] {
+    let before = (fs.info("sa/token")?).modified_ms
+    fs.write("sa/token", token + "\n")?
+    while (fs.info("sa/token")?).modified_ms <= before {
+        clock.sleep(5)
+        fs.write("sa/token", token + "\n")?
+    }
+    Ok(())
+}
+
+fn show(r: Result[(Int, json.Value), IoError]) -> Str {
+    match r {
+        Ok((code, v)) => "{code} {json.stringify(v)}",
+        Err(e) => "{e}",
+    }
+}
+
+fn value(text: Str) -> json.Value {
+    json.parse(text) ?? json.Null
+}
+
+fn port(env: Env) -> Str {
+    env.get("KUBERNETES_SERVICE_PORT") ?? "0"
+}
+
+fn tls_on(root: Root) -> Result[Listener, IoError] {
+    root.listen.on_tls("127.0.0.1:{port(root.env)}", root.fs.read("server.pem")?, root.fs.read("server-key.pem")?)
+}
+|v}
+    ^ main
+  in
+  let kube_free_port () =
+    let s = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+    Unix.bind s (Unix.ADDR_INET (Unix.inet_addr_loopback, 0));
+    let p = match Unix.getsockname s with Unix.ADDR_INET (_, p) -> p | _ -> 0 in
+    Unix.close s;
+    p
+  in
+  let kube_env = [ "KUBERNETES_SERVICE_HOST"; "KUBERNETES_SERVICE_PORT" ] in
+  (* A directory with the kube certificates, and the grants of an in-cluster
+     test whose API server listens on a fresh port. *)
+  let kube_cluster tag =
+    let d = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "limen-kube-%s-%d" tag (Unix.getpid ())) in
+    ignore (Sys.command (Filename.quote_command "rm" [ "-rf"; d ]));
+    Unix.mkdir d 0o755;
+    let d = Unix.realpath d in
+    List.iter
+      (fun (from, to_) ->
+        Out_channel.with_open_bin (Filename.concat d to_) (fun oc ->
+            output_string oc (read_file (Filename.concat (Filename.concat tls_dir "kube") from))))
+      [ ("ca.pem", "ca.pem"); ("server.pem", "server.pem"); ("server-key.pem", "server-key.pem") ];
+    let p = kube_free_port () in
+    Unix.putenv "KUBERNETES_SERVICE_HOST" "127.0.0.1";
+    Unix.putenv "KUBERNETES_SERVICE_PORT" (string_of_int p);
+    { Interp.no_grants with fs = Some (d, false); env = kube_env; listen = [ sprintf "127.0.0.1:%d" p ]; net = [ "127.0.0.1" ] }
+  in
+  ok "std-manifest-kube"
+    (List.exists (fun (d : Package.dep) -> d.dname = "kube" && d.caps = [ "net"; "fs"; "env" ]) (Lazy.force Package.std_manifest).deps)
+    "kube: net, fs, env (the service account and the API server's address)";
+  let kube_proxy_grants = { Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] } in
+  let pod = {|{"kind":"Pod","metadata":{"name":"p"}}|} in
+  let pods = {|{"kind":"PodList","items":[]}|} in
+  out "kube-in-cluster" ~grants:(kube_cluster "in-cluster")
+    (kube_src {v|
+fn main(root: Root) -> Result[(), IoError] {
+    let sa = account(root.fs, "t1")?
+    let l = tls_on(root)?
+    let got = group g {
+        g.go(|| fake(l, 2, [
+            route("GET", "/api/v1/namespaces/limen-test/pods/p", 200, "\{\"kind\":\"Pod\",\"metadata\":\{\"name\":\"p\"}}"),
+            route("GET", "/api/v1/namespaces/limen-test/pods", 200, "\{\"kind\":\"PodList\",\"items\":[]}"),
+        ], none))
+        g.go(|| {
+            let r = match kube.in_cluster(sa, root.env, root.net) {
+                Ok(k) => [k.namespace(), show(k.get("/api/v1/namespaces/{k.namespace()}/pods/p")), show(k.list("/api/v1/namespaces/{k.namespace()}/pods"))].join("\n"),
+                Err(e) => "{e}",
+            }
+            l.close()
+            r
+        })
+    }
+    root.stdout.print(got.join("\n"))
+    Ok(())
+}
+|v})
+    (sprintf
+       "GET /api/v1/namespaces/limen-test/pods/p auth=Bearer t1 accept=application/json type=- body=\n\
+        GET /api/v1/namespaces/limen-test/pods auth=Bearer t1 accept=application/json type=- body=\n\
+        limen-test\n200 %s\n200 %s\n" pod pods);
+  out "kube-in-cluster-missing" ~grants:(kube_cluster "missing")
+    (kube_src {v|
+fn main(root: Root) -> Result[(), IoError] {
+    let out = root.stdout
+    let fs = root.fs
+    let sa = account(fs, "t1")?
+    let (env, off) = root.env.revocable()
+    off.revoke()
+    out.print("{kube.in_cluster(sa, env, root.net).map(|k| k.namespace())}")
+    if !fs.is_dir("empty") {
+        fs.make_dir("empty")?
+    }
+    out.print("{kube.in_cluster(fs.under("empty"), root.env, root.net).map(|k| k.namespace())}")
+    if fs.is_dir("token-only") {
+        for f in fs.list("token-only")? {
+            fs.remove("token-only/" + f)?
+        }
+    } else {
+        fs.make_dir("token-only")?
+    }
+    fs.write("token-only/token", "t")?
+    out.print("{kube.in_cluster(fs.under("token-only"), root.env, root.net).map(|k| k.namespace())}")
+    fs.write("token-only/ca.crt", "not a certificate")?
+    out.print("{kube.in_cluster(fs.under("token-only"), root.env, root.net).map(|k| k.namespace())}")
+    fs.write("token-only/ca.crt", fs.read("ca.pem")?)?
+    out.print("{kube.in_cluster(fs.under("token-only"), root.env, root.net).map(|k| k.namespace())}")
+    fs.write("token-only/namespace", " web \n")?
+    out.print("{kube.in_cluster(fs.under("token-only"), root.env, root.net).map(|k| k.namespace())}")
+    Ok(())
+}
+|v})
+    "Err(Failed(\"kube: KUBERNETES_SERVICE_HOST is not set\"))\n\
+     Err(Failed(\"kube: the service account's token: fs: `token` does not exist\"))\n\
+     Err(Failed(\"kube: the service account's ca.crt: fs: `ca.crt` does not exist\"))\n\
+     Err(Failed(\"kube: the service account's ca.crt: tls: no PEM certificate in the CA text\"))\n\
+     Err(Failed(\"kube: the service account's namespace: fs: `namespace` does not exist\"))\n\
+     Ok(\"web\")\n";
+  (let grants = kube_cluster "ipv6" in
+   Unix.putenv "KUBERNETES_SERVICE_HOST" "::1";
+   Unix.putenv "KUBERNETES_SERVICE_PORT" "6443";
+   out "kube-in-cluster-ipv6" ~grants
+     (kube_src {v|
+fn main(root: Root) -> Result[(), IoError] {
+    let sa = account(root.fs, "t1")?
+    let k = kube.in_cluster(sa, root.env, root.net)?
+    root.stdout.print(show(k.get("/version")))
+    Ok(())
+}
+|v})
+     "Denied(\"net: [::1]:6443 is not granted\")\n");
+  out "kube-proxy" ~grants:kube_proxy_grants
+    (kube_src {v|
+fn main(root: Root) -> Result[(), IoError] {
+    let l = root.listen.on("127.0.0.1:0")?
+    let k = kube.proxy(root.net, "http://127.0.0.1:{l.port()}")
+    let got = group g {
+        g.go(|| fake(l, 2, [
+            route("GET", "/api/v1/namespaces/default/configmaps/x", 200, "\{\"kind\":\"ConfigMap\"}"),
+            route("DELETE", "/api/v1/namespaces/default/configmaps/x", 200, "\{\"kind\":\"Status\",\"status\":\"Success\"}"),
+        ], none))
+        g.go(|| {
+            let r = [k.namespace(), show(k.get("/api/v1/namespaces/default/configmaps/x")), show(k.delete("/api/v1/namespaces/default/configmaps/x"))].join("\n")
+            l.close()
+            r
+        })
+    }
+    root.stdout.print(got.join("\n"))
+    Ok(())
+}
+|v})
+    "GET /api/v1/namespaces/default/configmaps/x auth=- accept=application/json type=- body=\n\
+     DELETE /api/v1/namespaces/default/configmaps/x auth=- accept=application/json type=- body=\n\
+     default\n200 {\"kind\":\"ConfigMap\"}\n200 {\"kind\":\"Status\",\"status\":\"Success\"}\n";
+  out "kube-apply" ~grants:kube_proxy_grants
+    (kube_src {v|
+fn main(root: Root) -> Result[(), IoError] {
+    let l = root.listen.on("127.0.0.1:0")?
+    let k = kube.proxy(root.net, "http://127.0.0.1:{l.port()}")
+    let body = value("\{\"apiVersion\":\"v1\",\"kind\":\"ConfigMap\",\"metadata\":\{\"name\":\"x\"},\"data\":\{\"a\":\"1\"}}")
+    let got = group g {
+        g.go(|| fake(l, 2, [route("PATCH", "/api/v1/namespaces/default/configmaps/x", 200, "\{\"kind\":\"ConfigMap\",\"metadata\":\{\"resourceVersion\":\"5\"}}")], none))
+        g.go(|| {
+            let r = [
+                show(k.apply("/api/v1/namespaces/default/configmaps/x", "limen-operator", body)),
+                show(k.apply("/api/v1/namespaces/default/configmaps/x?dryRun=All", "my op", json.Obj([]))),
+            ].join("\n")
+            l.close()
+            r
+        })
+    }
+    root.stdout.print(got.join("\n"))
+    Ok(())
+}
+|v})
+    "PATCH /api/v1/namespaces/default/configmaps/x?fieldManager=limen-operator&force=true auth=- accept=application/json type=application/apply-patch+yaml body={\"apiVersion\":\"v1\",\"kind\":\"ConfigMap\",\"metadata\":{\"name\":\"x\"},\"data\":{\"a\":\"1\"}}\n\
+     PATCH /api/v1/namespaces/default/configmaps/x?dryRun=All&fieldManager=my%20op&force=true auth=- accept=application/json type=application/apply-patch+yaml body={}\n\
+     200 {\"kind\":\"ConfigMap\",\"metadata\":{\"resourceVersion\":\"5\"}}\n\
+     200 {\"kind\":\"ConfigMap\",\"metadata\":{\"resourceVersion\":\"5\"}}\n";
+  out "kube-status" ~grants:kube_proxy_grants
+    (kube_src {v|
+fn main(root: Root) -> Result[(), IoError] {
+    let l = root.listen.on("127.0.0.1:0")?
+    let k = kube.proxy(root.net, "http://127.0.0.1:{l.port()}")
+    let path = "/apis/limen.dev/v1/namespaces/default/staticsites/hello"
+    let got = group g {
+        g.go(|| fake(l, 1, [route("PATCH", path + "/status", 200, "\{\"kind\":\"StaticSite\"}")], none))
+        g.go(|| {
+            let r = show(k.patch_status(path, value("\{\"status\":\{\"message\":\"ok\"}}")))
+            l.close()
+            r
+        })
+    }
+    root.stdout.print(got.join("\n"))
+    Ok(())
+}
+|v})
+    "PATCH /apis/limen.dev/v1/namespaces/default/staticsites/hello/status auth=- accept=application/json type=application/merge-patch+json body={\"status\":{\"message\":\"ok\"}}\n\
+     200 {\"kind\":\"StaticSite\"}\n";
+  out "kube-errors" ~grants:kube_proxy_grants
+    (kube_src {v|
+fn main(root: Root) -> Result[(), IoError] {
+    let l = root.listen.on("127.0.0.1:0")?
+    let k = kube.proxy(root.net, "http://127.0.0.1:{l.port()}")
+    let got = group g {
+        g.go(|| fake(l, 3, [
+            route("PATCH", "/api/v1/namespaces/default/configmaps/x", 409, status_body(409, "Conflict", "conflict")),
+            route("GET", "/broken", 502, "<html>bad gateway</html>"),
+        ], none))
+        g.go(|| {
+            let r = [
+                show(k.get("/api/v1/namespaces/default/configmaps/missing")),
+                show(k.apply("/api/v1/namespaces/default/configmaps/x", "m", json.Obj([]))),
+                show(k.get("/broken")),
+            ].join("\n")
+            l.close()
+            r
+        })
+    }
+    root.stdout.print(got.join("\n").split("\n").filter(|s| !s.starts_with("GET") && !s.starts_with("PATCH")).join("\n"))
+    Ok(())
+}
+|v})
+    "404 {\"kind\":\"Status\",\"apiVersion\":\"v1\",\"status\":\"Failure\",\"message\":\"no route for GET /api/v1/namespaces/default/configmaps/missing\",\"reason\":\"NotFound\",\"code\":404}\n\
+     409 {\"kind\":\"Status\",\"apiVersion\":\"v1\",\"status\":\"Failure\",\"message\":\"conflict\",\"reason\":\"Conflict\",\"code\":409}\n\
+     Failed(\"kube: GET /broken: the answer (502) is not JSON: <html>bad gateway</html>\")\n";
+  out "kube-watch" ~grants:kube_proxy_grants
+    (kube_src {v|
+fn event(kind: Str, name: Str) -> Str {
+    "\{\"type\":\"{kind}\",\"object\":\{\"kind\":\"StaticSite\",\"metadata\":\{\"name\":\"{name}\"}}}"
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let l = root.listen.on("127.0.0.1:0")?
+    let k = kube.proxy(root.net, "http://127.0.0.1:{l.port()}")
+    let lines = [event("ADDED", "a"), event("MODIFIED", "a"), event("ADDED", "b"), event("DELETED", "a"), event("ADDED", "c")]
+    let got = group g {
+        g.go(|| fake(l, 3, [
+            route("GET", "/apis/limen.dev/v1/staticsites?watch=1&resourceVersion=41&allowWatchBookmarks=true", 200, lines.join("\n") + "\n"),
+            route("GET", "/api/v1/configmaps?labelSelector=a%3Db&watch=1&resourceVersion=7&allowWatchBookmarks=true", 410, status_body(410, "Expired", "too old resource version")),
+            route("GET", "/api/v1/services?watch=1&allowWatchBookmarks=true", 200, event("ADDED", "s")),
+        ], none))
+        g.go(|| {
+            let seen = shared([])
+            let a = k.watch("/apis/limen.dev/v1/staticsites", "41", |line| {
+                let n = seen.update(|xs| xs + [line]).len()
+                n < 3
+            })
+            let b = k.watch("/api/v1/configmaps?labelSelector=a%3Db", "7", |line| {
+                let _ = seen.update(|xs| xs + ["not this: " + line])
+                true
+            })
+            let c = k.watch("/api/v1/services", "", |line| {
+                let _ = seen.update(|xs| xs + [line])
+                true
+            })
+            l.close()
+            (["{a} {b} {c}"] + seen.get()).join("\n")
+        })
+    }
+    root.stdout.print(got.join("\n"))
+    Ok(())
+}
+|v})
+    "GET /apis/limen.dev/v1/staticsites?watch=1&resourceVersion=41&allowWatchBookmarks=true auth=- accept=application/json type=- body=\n\
+     GET /api/v1/configmaps?labelSelector=a%3Db&watch=1&resourceVersion=7&allowWatchBookmarks=true auth=- accept=application/json type=- body=\n\
+     GET /api/v1/services?watch=1&allowWatchBookmarks=true auth=- accept=application/json type=- body=\n\
+     Ok(200) Ok(410) Ok(200)\n\
+     {\"type\":\"ADDED\",\"object\":{\"kind\":\"StaticSite\",\"metadata\":{\"name\":\"a\"}}}\n\
+     {\"type\":\"MODIFIED\",\"object\":{\"kind\":\"StaticSite\",\"metadata\":{\"name\":\"a\"}}}\n\
+     {\"type\":\"ADDED\",\"object\":{\"kind\":\"StaticSite\",\"metadata\":{\"name\":\"b\"}}}\n\
+     {\"type\":\"ADDED\",\"object\":{\"kind\":\"StaticSite\",\"metadata\":{\"name\":\"s\"}}}\n";
+  out "kube-401-retry" ~grants:(kube_cluster "retry")
+    (kube_src {v|
+fn main(root: Root) -> Result[(), IoError] {
+    let fs = root.fs
+    let sa = account(fs, "t1")?
+    let l = tls_on(root)?
+    let ns = "/api/v1/namespaces/limen-test"
+    let got = group g {
+        g.go(|| fake(l, 4, [
+            Route { method: "GET", path: ns, status: 401, body: status_body(401, "Unauthorized", "Unauthorized"), uses: 1 },
+            route("GET", ns, 200, "\{\"kind\":\"Namespace\"}"),
+            route("GET", "/forbidden", 401, status_body(401, "Unauthorized", "Unauthorized")),
+        ], |i| {
+            // the kubelet rotates the token while the first request is out,
+            // its modified time moving on, so the next request reads it
+            if i == 0 {
+                let _ = rotate(fs, root.clock, "t2")
+            }
+        }))
+        g.go(|| {
+            let r = match kube.in_cluster(sa, root.env, root.net) {
+                Ok(k) => [show(k.get(ns)), show(k.get("/forbidden"))].join("\n"),
+                Err(e) => "{e}",
+            }
+            l.close()
+            r
+        })
+    }
+    root.stdout.print(got.join("\n"))
+    Ok(())
+}
+|v})
+    "GET /api/v1/namespaces/limen-test auth=Bearer t1 accept=application/json type=- body=\n\
+     GET /api/v1/namespaces/limen-test auth=Bearer t2 accept=application/json type=- body=\n\
+     GET /forbidden auth=Bearer t2 accept=application/json type=- body=\n\
+     GET /forbidden auth=Bearer t2 accept=application/json type=- body=\n\
+     200 {\"kind\":\"Namespace\"}\n\
+     401 {\"kind\":\"Status\",\"apiVersion\":\"v1\",\"status\":\"Failure\",\"message\":\"Unauthorized\",\"reason\":\"Unauthorized\",\"code\":401}\n";
+  out "kube-token-rotates" ~grants:(kube_cluster "rotates")
+    (kube_src {v|
+fn main(root: Root) -> Result[(), IoError] {
+    let fs = root.fs
+    let sa = account(fs, "t1")?
+    let l = tls_on(root)?
+    let got = group g {
+        g.go(|| fake(l, 4, [route("GET", "/api", 200, "\{\"kind\":\"APIVersions\"}")], none))
+        g.go(|| {
+            let r = match kube.in_cluster(sa, root.env, root.net) {
+                Ok(k) => {
+                    let a = show(k.get("/api"))
+                    match rotate(fs, root.clock, "t2") {
+                        Ok(_) => [a, show(k.get("/api")), show(k.get("/api")), "{rotate(fs, root.clock, "t3")}", show(k.list("/api"))].join("\n"),
+                        Err(e) => "{e}",
+                    }
+                },
+                Err(e) => "{e}",
+            }
+            l.close()
+            r
+        })
+    }
+    root.stdout.print(got.join("\n"))
+    Ok(())
+}
+|v})
+    "GET /api auth=Bearer t1 accept=application/json type=- body=\n\
+     GET /api auth=Bearer t2 accept=application/json type=- body=\n\
+     GET /api auth=Bearer t2 accept=application/json type=- body=\n\
+     GET /api auth=Bearer t3 accept=application/json type=- body=\n\
+     200 {\"kind\":\"APIVersions\"}\n200 {\"kind\":\"APIVersions\"}\n200 {\"kind\":\"APIVersions\"}\nOk(())\n200 {\"kind\":\"APIVersions\"}\n";
   (* ---------- Rand, Env, args and the Fs additions ---------- *)
   let box = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "limen-box-%d" (Unix.getpid ())) in
   (try Unix.mkdir box 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
@@ -8023,6 +8857,63 @@ fn main(root: Root) -> Result[(), IoError] {
     Ok(())
 }
 |} "[204, 1]\n[1, 1]\nErr(Failed(\"malformed IPv6 address in URL\"))\nErr(Failed(\"malformed IPv6 address in URL\"))\nErr(Denied(\"net: [::2]:9 is not granted\"))\n";
+  (* A Net grant names an IPv6 host bare or in brackets, `::1:PORT` or
+     `[::1]:PORT`, as `$(KUBERNETES_SERVICE_HOST):$(KUBERNETES_SERVICE_PORT)`
+     expands to the first: either way it covers `only("[::1]:PORT")` (and
+     `only("::1:PORT")`), and the narrowed Net connects. *)
+  (let free_v6 () =
+     let s = Unix.socket Unix.PF_INET6 Unix.SOCK_STREAM 0 in
+     Unix.bind s (Unix.ADDR_INET (Unix.inet_addr_of_string "::1", 0));
+     let p = match Unix.getsockname s with Unix.ADDR_INET (_, p) -> p | _ -> 0 in
+     Unix.close s;
+     p
+   in
+   List.iter
+     (fun (tag, form) ->
+       let p = free_v6 () in
+       out ("net-ipv6-grant-" ^ tag)
+         ~grants:{ Interp.no_grants with listen = [ sprintf "[::1]:%d" p ]; net = [ form p ]; args = [ string_of_int p ] }
+         {|fn try(n: Net, addr: Str) -> Str {
+    match n.connect(addr) {
+        Ok(c) => {
+            c.close()
+            "connected"
+        },
+        Err(e) => "{e}",
+    }
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let port = root.args()[0]
+    let l = root.listen.on("[::1]:{port}")?
+    let narrow = root.net.only("[::1]:{port}")
+    let bare = root.net.only("::1:{port}")
+    let other = root.net.only("[::1]:1")
+    let r = group g {
+        g.go(|| {
+            let mut on = true
+            while on {
+                match l.accept() {
+                    Ok(c) => c.close(),
+                    Err(_) => {
+                        on = false
+                    },
+                }
+            }
+            ""
+        })
+        g.go(|| {
+            let got = [try(narrow, "[::1]:{port}"), try(bare, "[::1]:{port}"), try(root.net, "[::1]:{port}"), try(other, "[::1]:1")].join(" ")
+            l.close()
+            got
+        })
+    }
+    root.stdout.print(r[1])
+    Ok(())
+}
+|}
+         "connected connected connected Denied(\"net: [::1]:1 is not granted\")\n")
+     [ ("bare", sprintf "::1:%d"); ("bracketed", sprintf "[::1]:%d") ]);
   out "group-until-sockets" ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] } {|fn main(root: Root) -> Result[(), IoError] {
     let clock = root.clock
     let net = root.net
@@ -10260,8 +11151,8 @@ fn main(root: Root) {
     [
       ("example-todo-api-tests", "todo_api.lmn", "14 tests, 0 failed", []);
       ("example-todo-api-tests-native", "todo_api.lmn", "14 tests, 0 failed", [ "--native" ]);
-      ("example-site-operator-tests", "site_operator.lmn", "19 tests, 0 failed", []);
-      ("example-site-operator-tests-native", "site_operator.lmn", "19 tests, 0 failed", [ "--native" ]);
+      ("example-site-operator-tests", "site_operator.lmn", "25 tests, 0 failed", []);
+      ("example-site-operator-tests-native", "site_operator.lmn", "25 tests, 0 failed", [ "--native" ]);
     ];
   (* the foreign grant is announced as full access, and `limen check` lists who calls C *)
   put "capp/limen.toml" "[package]\nname = \"capp\"\n\n[dependencies]\ncdep = { path = \"../cdep\" }\n\n[trust]\nforeign = [\"cdep\"]\n\n[grants]\nforeign = \"c\"\n";
@@ -10618,6 +11509,17 @@ fn main(root: Root) {
   ok "caps-grants" (code = 0 && o = "main  Root\ngrant exec=echo hi|-n\ngrant exec=sh -c\n") (sprintf "code %d, out %S, err %S" code o e);
   let code, o, _ = limen_cli [ "caps"; gexec; "--json" ] in
   ok "caps-grants-json" (code = 0 && Interp_util.find_sub o {|"grants":["exec=echo hi|-n","exec=sh -c"]|} 0 <> None) o;
+  (* trusting narrows a Net as only does: a function that calls it on the
+     Net it was given still needs Net *)
+  (if selected "net-trusting-caps" then begin
+    let f = Filename.temp_file "trusting" ".lmn" in
+    let oc = open_out f in
+    output_string oc "fn trust(net: Net, ca: Str) -> Result[Net, IoError] {\n    net.trusting(ca)\n}\n\nfn main(root: Root) {\n    let _ = trust(root.net, \"\")\n}\n";
+    close_out oc;
+    let code, o, e = limen_cli [ "caps"; f ] in
+    ok "net-trusting-caps" (code = 0 && o = "trust  Net\nmain   Root\n") (sprintf "code %d, out %S, err %S" code o e);
+    Sys.remove f
+  end);
   (if selected "fn-field-caps" then begin
     let f = Filename.temp_file "fnfield" ".lmn" in
     let oc = open_out f in
@@ -10942,7 +11844,7 @@ fn main(root: Root) {
   ok "std-manifest-crypto" (List.exists (fun (d : Package.dep) -> d.dname = "crypto" && d.caps = [ "rand" ]) manifest.deps) "crypto: rand (keys and nonces), trusted with the runtime's OpenSSL helper";
   ok "std-manifest-redis" (List.exists (fun (d : Package.dep) -> d.dname = "redis" && d.caps = [ "net" ]) manifest.deps) "redis: net";
   ok "std-manifest-pure"
-    (List.for_all (fun (d : Package.dep) -> List.mem d.dname [ "http"; "sql"; "time"; "log"; "path"; "uuid"; "postgres"; "redis"; "stream"; "websocket"; "crypto" ] || d.caps = []) manifest.deps)
+    (List.for_all (fun (d : Package.dep) -> List.mem d.dname [ "http"; "sql"; "time"; "log"; "path"; "uuid"; "postgres"; "redis"; "stream"; "websocket"; "crypto"; "kube" ] || d.caps = []) manifest.deps)
     "the others are pure";
   let real_std = !Modules.std_modules in
   let std_errs name extra src =

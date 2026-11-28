@@ -67,18 +67,25 @@ let parse_url u : (url, string) result =
           | None -> Error "bad port in URL"
           | Some p -> Ok { host = String.lowercase_ascii host; port = p; https = scheme = "https"; path })
 
-(* A grant entry: "*", "host" (any port) or "host:port". *)
+(* A grant entry: "*", "host" (any port) or "host:port". The port is what
+   follows the last `:`, so `fd00::1:443` is host `fd00::1`, port 443. A
+   host with a `:` in it is an IPv6 address, and is kept in brackets, as the
+   requests' hosts are: `fd00::1:443` and `[fd00::1]:443` are the same
+   entry. The C runtime's parse_entry does the same. *)
 type entry = Any | Host of string * int option
+
+let bracket h = if String.contains h ':' && h.[0] <> '[' then "[" ^ h ^ "]" else h
 
 let parse_entry s =
   if s = "*" then Any
   else
+    let host h = bracket (String.lowercase_ascii h) in
     match String.rindex_opt s ':' with
     | Some k -> (
       match int_of_string_opt (String.sub s (k + 1) (String.length s - k - 1)) with
-      | Some p -> Host (String.lowercase_ascii (String.sub s 0 k), Some p)
-      | None -> Host (String.lowercase_ascii s, None))
-    | None -> Host (String.lowercase_ascii s, None)
+      | Some p -> Host (host (String.sub s 0 k), Some p)
+      | None -> Host (host s, None))
+    | None -> Host (host s, None)
 
 let permits allowed ~host ~port =
   List.exists

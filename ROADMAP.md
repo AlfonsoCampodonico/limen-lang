@@ -195,7 +195,7 @@ back out of a tuple, `let (x, st) = f(st, ...)`, went from 738 to 62 across
 the checker, the lowering, renaming, numbering, ownership, C generation and
 the loader. The parser and lexer keep threading their state by design.
 
-## Kubernetes without a proxy (not started)
+## Kubernetes without a proxy (in progress)
 
 `examples/site_operator.lmn` is a working operator, but it reaches the API
 server through `kubectl proxy`, which holds the credentials. An operator
@@ -209,9 +209,13 @@ should run in a pod with a grant for the API server and nothing else, and
     `certificate-authority-data`) cannot be decoded into struct fields,
     because Limen has no field renaming, so kubeconfig support reads
     `yaml.Node` directly.
-- In-cluster authentication: the pod's service-account token and CA
-  certificate, and the kubeconfig outside a cluster, read through a granted
-  `Fs`; TLS with a custom CA and client certificates.
+- TLS with a custom CA and client certificates (done): `Net.trusting(ca)`
+  and `Net.presenting(cert, key)`.
+- In-cluster authentication (done): the `kube` module reads the pod's
+  service-account token and CA certificate through a granted `Fs`, and
+  `examples/site_operator.lmn` runs in a kind cluster with no proxy
+  (`test/integration/kind.sh`). The kubeconfig outside a cluster is not
+  done; it can now be read with the `yaml` module.
 - Typed Kubernetes objects (Deployment, Service, ConfigMap and the rest) as
   a package, generated from the API's OpenAPI description, so manifests are
   checked instead of built as JSON by hand.
@@ -276,6 +280,13 @@ book and SPEC.md describe 1.0 exactly.
 
 ## Smaller, whenever
 
+- Grant ports are parsed differently by the two backends. Natively,
+  `--grant net=host:-1` (and `listen=`) reads `-1` as the any-port marker,
+  so it allows every port on the host, where the interpreter allows none;
+  and the interpreter also takes `0x1bb`, `0b...` and `1_000` as ports,
+  which the native runtime refuses, while the native runtime takes leading
+  spaces. Both should accept only a decimal port from 0 to 65535 and refuse
+  anything else, with a test of each form in both backends.
 - The interpreter starts a thread per blocking C call instead of using a
   pool (done: blocking calls share a pool of up to
   `LIMEN_BLOCKING_THREADS` threads, as they do natively).
