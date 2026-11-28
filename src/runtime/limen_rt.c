@@ -3132,14 +3132,8 @@ W_RT void w_tls_release(WCap *c) {
    sees one that is never dropped */
 W_RT void *w_tls_client_dup(void *v) { return vtls_client_dup((VTlsClient *)v); }
 W_RT void w_tls_client_drop(void *v) { if (vtls_client_drop((VTlsClient *)v)) __atomic_fetch_sub(&w_live, 1, __ATOMIC_RELAXED); }
-/* `net.trusting(ca)`: a Net with the same allowlist and switch whose TLS
-   clients trust the certificates in ca only (vtls_trusting). Calling it on
-   a trusting Net replaces the trust. */
-W_RT WIo Cap_net_trusting(WCap *n, WStr *pem) {
-  if (w_revoked(n)) return io_err(1, "net: revoked");
-  char err[300];
-  VTlsClient *v = vtls_trusting(pem->data, (size_t)pem->len, err, sizeof err);
-  if (!v) return io_err(2, err);
+/* A Net like n (allowlist, switch) whose TLS clients use the context v */
+static WIo w_net_with_client(WCap *n, VTlsClient *v) {
   __atomic_fetch_add(&w_live, 1, __ATOMIC_RELAXED);
   WCap *c = cap_new(CAP_NET);
   c->hosts = (char **)w_raw(sizeof(char *) * (size_t)(n->nhosts + 1));
@@ -3148,6 +3142,26 @@ W_RT WIo Cap_net_trusting(WCap *n, WStr *pem) {
   c->client = v;
   w_rv_inherit(c, n);
   return io_ok_ptr(c);
+}
+/* `net.trusting(ca)`: a Net with the same allowlist and switch whose TLS
+   clients trust the certificates in ca only (vtls_trusting), and present
+   n's certificate if it has one. Calling it on a trusting Net replaces the
+   trust. */
+W_RT WIo Cap_net_trusting(WCap *n, WStr *pem) {
+  if (w_revoked(n)) return io_err(1, "net: revoked");
+  char err[300];
+  VTlsClient *v = vtls_trusting((VTlsClient *)n->client, pem->data, (size_t)pem->len, err, sizeof err);
+  if (!v) return io_err(2, err);
+  return w_net_with_client(n, v);
+}
+/* `net.presenting(cert, key)`: the same, keeping n's trust, whose TLS
+   clients present cert with key when the server asks (vtls_presenting). */
+W_RT WIo Cap_net_presenting(WCap *n, WStr *cert, WStr *key) {
+  if (w_revoked(n)) return io_err(1, "net: revoked");
+  char err[300];
+  VTlsClient *v = vtls_presenting((VTlsClient *)n->client, cert->data, (size_t)cert->len, key->data, (size_t)key->len, err, sizeof err);
+  if (!v) return io_err(2, err);
+  return w_net_with_client(n, v);
 }
 W_RT void w_tls_close_notify(WCap *c) { vtls_close_notify((VTls *)c->tls); }
 W_RT int w_tls_step(WCap *c, int wr, char *buf, size_t n, int *dir, char *err, size_t en) {
@@ -3258,6 +3272,11 @@ W_RT void *w_tls_client_dup(void *v) { return v; }
 W_RT void w_tls_client_drop(void *v) { (void)v; }
 W_RT WIo Cap_net_trusting(WCap *n, WStr *pem) {
   (void)pem;
+  if (w_revoked(n)) return io_err(1, "net: revoked");
+  return io_err(2, W_NO_TLS);
+}
+W_RT WIo Cap_net_presenting(WCap *n, WStr *cert, WStr *key) {
+  (void)cert; (void)key;
   if (w_revoked(n)) return io_err(1, "net: revoked");
   return io_err(2, W_NO_TLS);
 }
@@ -4426,6 +4445,7 @@ W_WASM_REFUSE(WIo, Cap_accept, (WCap *l))
 W_WASM_REFUSE(WIo, Cap_net_connect, (WCap *n, WStr *addr))
 W_WASM_REFUSE(WIo, Cap_net_connect_tls, (WCap *n, WStr *addr))
 W_WASM_REFUSE(WIo, Cap_net_trusting, (WCap *n, WStr *pem))
+W_WASM_REFUSE(WIo, Cap_net_presenting, (WCap *n, WStr *cert, WStr *key))
 W_WASM_REFUSE(WIo, Cap_conn_start_tls, (WCap *c, WStr *host))
 W_WASM_REFUSE(WIo, Cap_conn_read, (WCap *c))
 W_WASM_REFUSE(WIo, Cap_conn_write, (WCap *c, WStr *s))

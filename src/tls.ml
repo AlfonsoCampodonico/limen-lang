@@ -5,18 +5,26 @@
 type session
 type ctx
 
-(* A trusting Net's client context: the certificates it verifies servers
-   against, in place of the system's (runtime/limen_tls.h, VTlsClient). *)
+(* A trusting or presenting Net's client context: the certificates it
+   verifies servers against (the system's, or those given to `trusting`),
+   and the certificate it presents, if any (runtime/limen_tls.h,
+   VTlsClient). *)
 type trust
 
 (* A client session on a connected socket, verifying the certificate
-   against [host], with a trusting Net's context or else the default one. *)
+   against [host], with a Net's own context or else the default one. *)
 external client_with : trust option -> Unix.file_descr -> string -> session = "limen_tls_client"
 
-(* A client context that trusts only the CERTIFICATE blocks in PEM text,
-   or the error, worded as natively. *)
-external trust_raw : string -> trust = "limen_tls_trust"
-let trust pem = match trust_raw pem with t -> Ok t | exception Failure m -> Error m
+(* The context of a Net (None: the default) with its trust replaced by the
+   CERTIFICATE blocks in PEM text, keeping any certificate it presents; or
+   the error, worded as natively. *)
+external trust_raw : trust option -> string -> trust = "limen_tls_trust"
+let trust from pem = match trust_raw from pem with t -> Ok t | exception Failure m -> Error m
+
+(* The context of a Net with a certificate (and chain) and key to present,
+   keeping its trust; or the error, worded as natively. *)
+external present_raw : trust option -> string -> string -> trust = "limen_tls_present"
+let present from cert key = match present_raw from cert key with t -> Ok t | exception Failure m -> Error m
 
 (* A server context from PEM text: certificate (and chain), then key. *)
 external server_ctx : string -> string -> ctx = "limen_tls_server_ctx"

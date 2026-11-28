@@ -6756,6 +6756,223 @@ fn main(root: Root) -> Result[(), IoError] {
 }
 |v}
     "2000 true\n";
+  (* start_tls on a Conn opened through a trusting Net uses its trust *)
+  out "net-trusting-start-tls" ~grants:tls_grants (trust_prelude ^ {v|
+fn upgrade(net: Net, addr: Str) -> Str {
+    match net.connect(addr) {
+        Ok(c) => {
+            let r = match c.start_tls("localhost") {
+                Ok(_) => match c.write("hi.") {
+                    Ok(_) => "{c.read()}",
+                    Err(e) => "{e}",
+                },
+                Err(e) => "{e}",
+            }
+            c.close()
+            r
+        },
+        Err(e) => "{e}",
+    }
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let fs = root.fs
+    let l = root.listen.on_tls("127.0.0.1:0", fs.read("kube/server.pem")?, fs.read("kube/server-key.pem")?)?
+    let addr = "localhost:{l.port()}"
+    let t = root.net.trusting(fs.read("kube/ca.pem")?)?
+    let got = group g {
+        g.go(|| serve(l, 2))
+        g.go(|| [upgrade(t, addr), upgrade(root.net, addr)].join("\n"))
+    }
+    root.stdout.print(got.join("\n"))
+    Ok(())
+}
+|v})
+    (sprintf "\nOk(\"kube.\")\n%s\n" unknown_ca);
+  (* ---------- Net.presenting ----------
+     An openssl s_server that asks for a client certificate signed by the
+     kube CA (-Verify 1) and answers with a status page (-www). It needs
+     OpenSSL's openssl, not LibreSSL's, which cannot listen on port 0. *)
+  let present_errors_src = {v|fn main(root: Root) -> Result[(), IoError] {
+    let out = root.stdout
+    let fs = root.fs
+    let cert = fs.read("kube/client.pem")?
+    let key = fs.read("kube/client-key.pem")?
+    let (r, k) = root.net.revocable()
+    k.revoke()
+    let cases = [
+        (cert, key),
+        (cert + fs.read("kube/ca.pem")?, key),
+        (cert, fs.read("kube/server-key.pem")?),
+        ("", key),
+        ("not pem", key),
+        (cert.slice(0, cert.len() / 2), key),
+        (cert, ""),
+        (cert, "not pem"),
+        (cert, key.slice(0, key.len() / 2)),
+        (cert, fs.read("kube/client-key-encrypted.pem")?),
+        (key, cert),
+    ]
+    for (c, kk) in cases {
+        match root.net.presenting(c, kk) {
+            Ok(_) => out.print("presented"),
+            Err(e) => out.print("{e}"),
+        }
+    }
+    match r.presenting(cert, key) {
+        Ok(_) => out.print("presented"),
+        Err(e) => out.print("{e}"),
+    }
+    Ok(())
+}
+|v} in
+  out "net-presenting-errors" ~grants:tls_grants present_errors_src
+    "presented\npresented\nFailed(\"tls: the private key does not match the certificate\")\nFailed(\"tls: no PEM certificate in the certificate text\")\nFailed(\"tls: no PEM certificate in the certificate text\")\nFailed(\"tls: a PEM certificate in the certificate text does not parse\")\nFailed(\"tls: no unencrypted PEM private key in the key text\")\nFailed(\"tls: no unencrypted PEM private key in the key text\")\nFailed(\"tls: no unencrypted PEM private key in the key text\")\nFailed(\"tls: no unencrypted PEM private key in the key text\")\nFailed(\"tls: no PEM certificate in the certificate text\")\nDenied(\"net: revoked\")\n";
+  out "net-presenting-leak" ~grants:tls_grants {v|fn main(root: Root) -> Result[(), IoError] {
+    let fs = root.fs
+    let ca = fs.read("kube/ca.pem")?
+    let cert = fs.read("kube/client.pem")?
+    let key = fs.read("kube/client-key.pem")?
+    let net = root.net
+    let mut kept = net.presenting(cert, key)?
+    let mut failed = 0
+    for i in 0..<500 {
+        let t = (net.trusting(ca)?).presenting(cert, key)?
+        if i % 2 == 0 {
+            kept = (t.trusting(ca)?).only("localhost")
+        }
+        if net.presenting(cert, "x").is_err() {
+            failed = failed + 1
+        }
+    }
+    root.stdout.print("{failed} {kept.connect("localhost:1").is_err()}")
+    Ok(())
+}
+|v}
+    "500 true\n";
+  let openssl_tool =
+    let dirs = String.split_on_char ':' (Option.value (Sys.getenv_opt "PATH") ~default:"") in
+    List.find_map
+      (fun d ->
+        let p = Filename.concat d "openssl" in
+        if d = "" || not (Sys.file_exists p) then None
+        else
+          let ic = Unix.open_process_args_in p [| p; "version" |] in
+          let v = try input_line ic with End_of_file -> "" in
+          ignore (Unix.close_process_in ic);
+          if String.starts_with ~prefix:"OpenSSL" v then Some p else None)
+      dirs
+  in
+  let present_prelude = {v|// GET / from s_server -www: "page" for its status page, else the error.
+fn page(net: Net, addr: Str) -> Str {
+    match net.connect_tls(addr) {
+        Ok(c) => {
+            let mut got = ""
+            let mut last = ""
+            match c.write("GET / HTTP/1.0\r\n\r\n") {
+                Ok(_) => {
+                    let mut open = true
+                    while open {
+                        match c.read() {
+                            Ok(s) => if s == "" { open = false } else { got = got + s },
+                            Err(e) => { last = "{e}"; open = false },
+                        }
+                    }
+                },
+                Err(e) => { last = "{e}" },
+            }
+            c.close()
+            if got.starts_with("HTTP/1.0 200 ok") {
+                "page"
+            } else if last.starts_with("Failed(\"tls: ") {
+                "refused"
+            } else {
+                "{got} {last}"
+            }
+        },
+        Err(e) => "{e}",
+    }
+}
+|v} in
+  let present_srcs =
+    [ ( "net-presenting",
+        present_prelude ^ {v|
+fn main(root: Root) -> Result[(), IoError] {
+    let fs = root.fs
+    let addr = "127.0.0.1:{root.args()[0]}"
+    let t = root.net.trusting(fs.read("kube/ca.pem")?)?
+    let p = t.presenting(fs.read("kube/client.pem")?, fs.read("kube/client-key.pem")?)?
+    root.stdout.print([page(t, addr), page(p, addr), page(t, addr)].join("\n"))
+    Ok(())
+}
+|v},
+        "refused\npage\nrefused\n" );
+      ( "net-presenting-keeps-trust",
+        present_prelude ^ {v|
+fn main(root: Root) -> Result[(), IoError] {
+    let fs = root.fs
+    let addr = "127.0.0.1:{root.args()[0]}"
+    let ca = fs.read("kube/ca.pem")?
+    let cert = fs.read("kube/client.pem")?
+    let key = fs.read("kube/client-key.pem")?
+    let net = root.net
+    let a = (net.presenting(cert, key)?).trusting(ca)?
+    let b = (net.trusting(ca)?).presenting(cert, key)?
+    let c = b.only("127.0.0.1")
+    let (r, _) = b.revocable()
+    let others = [net.presenting(cert, key)?, b.trusting(fs.read("kube/other-ca.pem")?)?]
+    root.stdout.print([page(a, addr), page(b, addr), page(c, addr), page(r, addr)].join("\n"))
+    for o in others {
+        root.stdout.print(page(o, addr))
+    }
+    Ok(())
+}
+|v},
+        (* s_server sends the kube CA after its certificate *)
+        let in_chain = "Failed(\"tls: certificate verify failed: self-signed certificate in certificate chain\")" in
+        sprintf "page\npage\npage\npage\n%s\n%s\n" in_chain in_chain ) ]
+  in
+  (if List.exists (fun (n, _, _) -> selected n) present_srcs then
+     match openssl_tool with
+     | None -> print_endline "skipped net-presenting, net-presenting-keeps-trust: no OpenSSL openssl on PATH"
+     | Some exe ->
+       let kube f = Filename.concat (Filename.concat tls_dir "kube") f in
+       let log = Filename.temp_file "limen-s-server" ".log" in
+       let lfd = Unix.openfile log [ Unix.O_WRONLY; Unix.O_TRUNC ] 0o600 in
+       let null = Unix.openfile "/dev/null" [ Unix.O_RDONLY ] 0 in
+       let pid =
+         Unix.create_process exe
+           [| exe; "s_server"; "-accept"; "127.0.0.1:0"; "-cert"; kube "server.pem"; "-key"; kube "server-key.pem";
+              "-CAfile"; kube "ca.pem"; "-Verify"; "1"; "-www" |]
+           null lfd lfd
+       in
+       Unix.close lfd;
+       Unix.close null;
+       (* its port, from the "ACCEPT 127.0.0.1:PORT" line *)
+       let rec port n =
+         let text = In_channel.with_open_bin log In_channel.input_all in
+         let found =
+           List.find_map
+             (fun l ->
+               if String.starts_with ~prefix:"ACCEPT" l then
+                 Some (String.trim (String.sub l (String.rindex l ':' + 1) (String.length l - String.rindex l ':' - 1)))
+               else None)
+             (String.split_on_char '\n' text)
+         in
+         match found with
+         | Some p -> Ok p
+         | None when n = 0 -> Error text
+         | None -> Unix.sleepf 0.05; port (n - 1)
+       in
+       (match port 200 with
+        | Error text -> List.iter (fun (n, _, _) -> if selected n then ok n false ("s_server did not start: " ^ text)) present_srcs
+        | Ok p ->
+          let grants = { tls_grants with args = [ p ] } in
+          List.iter (fun (n, src, want) -> out n ~grants src want) present_srcs);
+       (* the native builds run later, so the server stays up until the end *)
+       at_exit (fun () ->
+           (try Unix.kill pid Sys.sigterm; ignore (Unix.waitpid [] pid) with Unix.Unix_error _ -> ());
+           try Sys.remove log with Sys_error _ -> ()));
   (* A TLS stream that ends without the close message may have been cut
      short: Conn.read says so, and Net.get accepts it only when the response
      is framed (Content-Length or chunked) and complete. *)
