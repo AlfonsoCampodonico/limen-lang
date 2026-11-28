@@ -5,6 +5,7 @@ Fuzzers for what a program reads from strangers, and for the compiler, which mus
 The runtime's readers, written in Limen:
 
 - `json.lmn` mutates JSON and checks that `json.parse` never panics, and that whatever it accepts prints and reads back as the same value.
+- `yaml.lmn` mutates the yaml-test-suite's inputs and checks that `yaml.parse` never panics, that no input takes more than a second, and that whatever parses prints with `yaml.stringify` and parses back to the same nodes (a NaN equal to a NaN). Without the `fs` grant it uses only the seeds written in it.
 - `http.lmn` sends mutated requests to a real `http.Server` with short time limits, from 16 clients at once, and checks that the server never panics or hangs, and answers each connection with nothing or with well-formed 200, 400 or 408 responses.
 - `formats.lmn` mutates URLs, query strings, CSV, base64, hex, UUIDs, ISO 8601 times, Unicode text and numbers. Nothing may panic or take long; whatever a reader accepts must print back to text it reads as the same value (`url.parse(u.to_str()) == Ok(u)`, `csv.parse(csv.write(rows))`, base64 and hex that decode only from their one encoding), and values made at random must survive the trip through text.
 - `regexes.lmn` compiles mutated patterns and searches random text with them. Nothing may panic or take long, and the results must hold together: `matches` agrees with the pattern between `\A` and `\z`, a match's offsets name its text, `find_all` gives matches in order without overlaps, `split` and `replace` put the text back together, an escaped string matches itself, and `(?:p)`, `(p)` and `p|p` find what `p` finds.
@@ -13,6 +14,7 @@ The runtime's readers, written in Limen:
 
 ```bash
 limen build fuzz/json.lmn -o /tmp/fj && /tmp/fj --seed 1 -- 300000
+limen build fuzz/yaml.lmn -o /tmp/fy && /tmp/fy --grant fs=test/yaml-suite:ro --seed 1 -- 1000000
 limen build fuzz/http.lmn -o /tmp/fh && /tmp/fh --grant listen=127.0.0.1:0 --grant net=127.0.0.1 --seed 1 -- 20000
 limen build fuzz/formats.lmn -o /tmp/ff && /tmp/ff --seed 1 -- 1000000
 limen build fuzz/regexes.lmn -o /tmp/fr && /tmp/fr --seed 1 -- 20000

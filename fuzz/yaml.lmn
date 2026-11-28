@@ -1,0 +1,212 @@
+// Fuzz yaml.parse: mutate the yaml-test-suite's inputs (and a few of its
+// own) at random and check that parse never panics, that no input takes
+// more than a second, and that whatever parses prints with `stringify` and
+// parses back to the same nodes (a NaN equal to a NaN).
+//
+//   limen build fuzz/yaml.lmn -o /tmp/fy
+//   /tmp/fy --grant fs=test/yaml-suite:ro --seed 1 -- 200000
+//
+// Without the grant it mutates only the seeds written here.
+use yaml
+
+fn builtin() -> List[Str] {
+    [
+        "",
+        "a",
+        "- 1\n- 2\n",
+        "a: 1\nb: [x, y]\n",
+        "\{a: 1, b: \{c: d}}",
+        "[1, 2.5, .inf, -.inf, .nan, null, ~, true, 0x1f, 0o17, 1e3]",
+        "--- &a [1, 2]\n--- *a\n",
+        "a: &x 1\nb: *x\n",
+        "? [a, b]\n: c\n",
+        "k: |\n  one\n  two\n",
+        "k: >-\n  one\n  two\n",
+        "k: 'it''s'\nj: \"a\\tb\\u00e9\"\n",
+        "!!str 12\n",
+        "!t \{a: 1}\n",
+        "a: 1\na: 2\n",
+        "\t- a\n",
+        "- - - a\n    - b\n",
+        "%YAML 1.2\n---\nx\n...\n",
+        "\u{feff}a: b\r\nc: d\r\n",
+    ]
+}
+
+// An input as readable text: escapes for the bytes that are not plain.
+fn quote(s: Str) -> Str {
+    let mut out = "\""
+    for b in s.bytes() {
+        if b == 10 {
+            out = out + "\\n"
+        } else if b == 13 {
+            out = out + "\\r"
+        } else if b == 9 {
+            out = out + "\\t"
+        } else if b == 34 || b == 92 {
+            out = out + "\\" + b.to_char()
+        } else if b < 32 || b > 126 {
+            out = out + "\\<" + b.to_str() + ">"
+        } else {
+            out = out + b.to_char()
+        }
+    }
+    out + "\""
+}
+
+// The inputs of the yaml-test-suite, `in.yaml` of each case (a case with
+// several variants has a directory of them), up to 20 KB.
+fn suite(fs: Fs) -> List[Str] {
+    let mut out: List[Str] = []
+    let mut dirs = [""]
+    while !dirs.is_empty() {
+        let d = dirs[0]
+        dirs = dirs.skip(1)
+        for name in fs.list(d) ?? [] {
+            let p = if d == "" { name } else { d + "/" + name }
+            if fs.is_dir(p) {
+                dirs.push(p)
+            } else if name == "in.yaml" {
+                match fs.read_at(p, 0, 20000) {
+                    Ok(b) => out.push(b.to_str()),
+                    Err(_) => (),
+                }
+            }
+        }
+    }
+    out
+}
+
+// Pieces worth splicing in: the grammar's own punctuation and edges.
+fn pieces() -> List[Str] {
+    [
+        "- ", "? ", ": ", ":", "-", "---\n", "...\n", "\n", "\r\n", "\t", " ", "  ", "    ",
+        "[", "]", "\{", "}", ",", "\"", "'", "\\", "|", ">", "|-", ">+", "#", " #", "&a ", "*a",
+        "!", "!!str ", "!<x> ", "%", "@", "`", "<<", "<<: ", "\u{feff}", "~", "null", "true",
+        ".inf", ".nan", "0x", "0o", "1e999", "\\u", "\\x", 0.to_char(), 255.to_char(), "key: ",
+    ]
+}
+
+fn mutate(rand: Rand, s: Str, corpus: List[Str]) -> Str {
+    let mut t = s
+    let rounds = rand.int(1, 6)
+    for _ in 0..<rounds {
+        let n = t.len()
+        let at = if n == 0 { 0 } else { rand.int(0, n + 1) }
+        let what = rand.int(0, 8)
+        if what == 0 && n > 0 {
+            let k = rand.int(0, n)
+            t = t.slice(0, k) + t.slice(k + 1, n)
+        } else if what == 1 {
+            let p = pieces()
+            t = t.slice(0, at) + p[rand.int(0, p.len())] + t.slice(at, n)
+        } else if what == 2 && n > 0 {
+            let k = rand.int(0, n)
+            t = t.slice(0, k) + rand.int(0, 256).to_char() + t.slice(k + 1, n)
+        } else if what == 3 {
+            // nest it
+            let k = rand.int(0, 3)
+            if k == 0 {
+                t = "[" + t.replace("\n", " ") + "]"
+            } else if k == 1 {
+                t = "- " + t.replace("\n", "\n  ")
+            } else {
+                t = "k:\n  " + t.replace("\n", "\n  ")
+            }
+        } else if what == 4 && n > 0 {
+            t = t.slice(0, at)
+        } else if what == 5 && n > 0 {
+            // repeat a stretch
+            let k = rand.int(0, n)
+            let m = rand.int(k, n + 1)
+            t = t.slice(0, m) + t.slice(k, m) + t.slice(m, n)
+        } else if what == 6 {
+            // indent every line one more
+            t = "  " + t.replace("\n", "\n ")
+        } else {
+            t = t + corpus[rand.int(0, corpus.len())]
+        }
+    }
+    t
+}
+
+// Equal nodes, a NaN equal to a NaN. Recursive, but nesting is at most 512.
+fn same(a: yaml.Node, b: yaml.Node) -> Bool {
+    match (a, b) {
+        (yaml.Float(x), yaml.Float(y)) => (x != x && y != y) || x == y,
+        (yaml.Seq(xs), yaml.Seq(ys)) => {
+            if xs.len() != ys.len() {
+                return false
+            }
+            for i in 0..<xs.len() {
+                if !same(xs[i], ys[i]) {
+                    return false
+                }
+            }
+            true
+        },
+        (yaml.Map(xs), yaml.Map(ys)) => {
+            if xs.len() != ys.len() {
+                return false
+            }
+            for i in 0..<xs.len() {
+                if !same(xs[i].key, ys[i].key) || !same(xs[i].value, ys[i].value) {
+                    return false
+                }
+            }
+            true
+        },
+        (yaml.Tagged(t, x), yaml.Tagged(u, y)) => t == u && same(x, y),
+        (yaml.Float(_), _) => false,
+        (_, yaml.Float(_)) => false,
+        (yaml.Seq(_), _) => false,
+        (yaml.Map(_), _) => false,
+        (yaml.Tagged(_, _), _) => false,
+        _ => a == b,
+    }
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let out = root.stdout
+    let rand = root.rand
+    let clock = root.clock
+    let args = root.args()
+    let n = if args.is_empty() { 20000 } else { args[0].parse_int() ?? 20000 }
+    let corpus = builtin() + suite(root.fs)
+    let mut accepted = 0
+    let mut bad = 0
+    for i in 0..<n {
+        let input = mutate(rand, corpus[rand.int(0, corpus.len())], corpus)
+        let started = clock.now_ms()
+        match catch(|| yaml.parse(input)) {
+            Err(msg) => {
+                bad = bad + 1
+                out.print("PANIC on {quote(input)}: {msg}")
+            },
+            Ok(Ok(v)) => {
+                accepted = accepted + 1
+                let text = yaml.stringify(v)
+                match catch(|| yaml.parse(text)) {
+                    Ok(Ok(back)) => {
+                        if !same(back, v) {
+                            bad = bad + 1
+                            out.print("ROUND TRIP {quote(input)}: {v} printed {quote(text)} and became {back}")
+                        }
+                    },
+                    other => {
+                        bad = bad + 1
+                        out.print("REPARSE {quote(input)} printed {quote(text)}: {other}")
+                    },
+                }
+            },
+            Ok(Err(_)) => (),
+        }
+        let took = clock.now_ms() - started
+        if took > 1000 {
+            bad = bad + 1
+            out.print("SLOW {quote(input)}: {took} ms")
+        }
+    }
+    out.print("{n} inputs from {corpus.len()} seeds, {accepted} accepted, {bad} problems")
+    Ok(())
+}
