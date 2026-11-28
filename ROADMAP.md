@@ -195,7 +195,7 @@ back out of a tuple, `let (x, st) = f(st, ...)`, went from 738 to 62 across
 the checker, the lowering, renaming, numbering, ownership, C generation and
 the loader. The parser and lexer keep threading their state by design.
 
-## Kubernetes without a proxy (not started)
+## Kubernetes without a proxy (in progress)
 
 `examples/site_operator.lmn` is a working operator, but it reaches the API
 server through `kubectl proxy`, which holds the credentials. An operator
@@ -205,9 +205,13 @@ should run in a pod with a grant for the API server and nothing else, and
 - A `yaml` module, reading and writing the YAML that manifests are written
   in, with `yaml.encode` and `yaml.decode` written by the compiler as
   `json`'s are.
-- In-cluster authentication: the pod's service-account token and CA
-  certificate, and the kubeconfig outside a cluster, read through a granted
-  `Fs`; TLS with a custom CA and client certificates.
+- TLS with a custom CA and client certificates (done): `Net.trusting(ca)`
+  and `Net.presenting(cert, key)`.
+- In-cluster authentication (done): the `kube` module reads the pod's
+  service-account token and CA certificate through a granted `Fs`, and
+  `examples/site_operator.lmn` runs in a kind cluster with no proxy
+  (`test/integration/kind.sh`). The kubeconfig outside a cluster is not
+  done; it needs the `yaml` module.
 - Typed Kubernetes objects (Deployment, Service, ConfigMap and the rest) as
   a package, generated from the API's OpenAPI description, so manifests are
   checked instead of built as JSON by hand.
