@@ -15,6 +15,11 @@
 // the new functions. The functions come out in the order src/derive.ml
 // writes them, so both compilers emit the same C.
 //
+// `yaml.encode(x)` and `yaml.decode(s)` are written by the same walk, into
+// the yaml module, over `yaml.Node` in place of `json.Value`: yaml.lmn has
+// helpers of the same names and shapes as json.lmn's, so only the module
+// and its value type differ.
+//
 // The sql module's work the same way, for structs whose fields are Int,
 // Float, Str, Bool, Bytes or an Option of one: `sql.row$N(row: Row) ->
 // Result[T, IoError]` and `sql.values$N(x: T) -> List[Value]`, and a call
@@ -30,8 +35,10 @@ use walk
 
 // What has been written so far.
 struct Gen {
-    // the json module's name in this program: "json" or "std/json"
+    // the module's name in this program: "json" or "std/json", "yaml", "sql", ...
     q: Str,
+    // its value type, converted as it is: "Value" for json, "Node" for yaml
+    vt: Str,
     // the use being expanded, for every node written
     sp: ast.Span,
     structs: Map[Str, ast.StructDecl],
@@ -174,7 +181,7 @@ fn param(g: Gen, n: Str, t: ast.TyExpr) -> ast.Param {
 }
 
 fn value_ty(g: Gen) -> types.Ty {
-    TNamed(jf(g, "Value"), [])
+    TNamed(jf(g, g.vt), [])
 }
 
 fn fn_gen(g: Gen, name: Str, generics: List[Str], params: List[ast.Param], ret: ast.TyExpr, body: ast.Block) -> ast.Item {
@@ -186,7 +193,7 @@ fn fn_gen(g: Gen, name: Str, generics: List[Str], params: List[ast.Param], ret: 
 // its conversion is written).
 fn kids(g: Gen, t: types.Ty) -> List[types.Ty] {
     match t {
-        TNamed(n, []) if n == jf(g, "Value") => [],
+        TNamed(n, []) if n == jf(g, g.vt) => [],
         TNamed("Option", [a]) => [a],
         TList(a) => [a],
         TMap(_, a) => [a],
@@ -352,7 +359,7 @@ fn coders(g: Gen, t: types.Ty) -> Result[((Str, Str), Gen), Fail] {
     }
     match t {
         TInt | TFloat | TStr | TBool => { return Ok((names_of(g, t), g)) },
-        TNamed(n, []) if n == jf(g, "Value") => { return Ok((names_of(g, t), g)) },
+        TNamed(n, []) if n == jf(g, g.vt) => { return Ok((names_of(g, t), g)) },
         _ => {},
     }
     let key = show(g, t)
@@ -410,7 +417,7 @@ fn names_of(g: Gen, t: types.Ty) -> (Str, Str) {
         TFloat => (jf(g, "of_float"), jf(g, "from_float")),
         TStr => (jf(g, "of_str"), jf(g, "from_str")),
         TBool => (jf(g, "of_bool"), jf(g, "from_bool")),
-        TNamed(n, []) if n == jf(g, "Value") => (jf(g, "of_value"), jf(g, "from_value")),
+        TNamed(n, []) if n == jf(g, g.vt) => (jf(g, "of_value"), jf(g, "from_value")),
         _ => {
             let k = g.names.get(show(g, t)) ?? 0
             let kind = if plain(g, t) { "to" } else { "put" }
@@ -463,7 +470,7 @@ fn put_of(g: Gen, a: types.Ty, e: ast.Expr) -> ast.Expr {
         TFloat => "put_float",
         TStr => "put_str",
         TBool => "put_bool",
-        TNamed(n, []) if n == jf(g, "Value") => "put_value",
+        TNamed(n, []) if n == jf(g, g.vt) => "put_value",
         _ => "",
     }
     if simple != "" {
@@ -845,13 +852,14 @@ pub struct Expanded {
 }
 
 // The loaded program's `items`, which checked as `c`, with every
-// `json.encode` and `json.decode`, and every `sql.decode`, `sql.values`,
-// `db.all` and `db.one`, pointed at its conversion; None when it uses none
-// of them. `json` and `sql` are those modules' names in the program, when
-// loaded. The items are the loaded ones, not the checker's rewritten ones,
-// so checking the result is checking a new program; the uses keep their
-// ids, which `c` knows.
-pub fn expand(json: Option[Str], rows: List[Str], items: List[ast.Item], c: typecheck.Checked) -> Option[Expanded] {
+// `json.encode` and `json.decode`, every `yaml.encode` and `yaml.decode`,
+// and every `sql.decode`, `sql.values`, `db.all` and `db.one`, pointed at
+// its conversion; None when it uses none of them. `json`, `yaml` and
+// `rows` are those modules' names in the program, when loaded. The items
+// are the loaded ones, not the checker's rewritten ones, so checking the
+// result is checking a new program; the uses keep their ids, which `c`
+// knows.
+pub fn expand(json: Option[Str], yaml: Option[Str], rows: List[Str], items: List[ast.Item], c: typecheck.Checked) -> Option[Expanded] {
     let mut structs: Map[Str, ast.StructDecl] = map()
     let mut enums: Map[Str, ast.EnumDecl] = map()
     // the prelude's types too: Result is an enum like any other
@@ -867,10 +875,12 @@ pub fn expand(json: Option[Str], rows: List[Str], items: List[ast.Item], c: type
         }
     }
     let span0 = ast.Span { file: 0, lo: 0, hi: 0 }
-    let mut g = Gen { q: json ?? "", sp: span0, structs, enums, names: map(), cyc: map(), pln: map(), count: 0, out: [], subst: c.state.subst }
+    let mut g = Gen { q: json ?? "", vt: "Value", sp: span0, structs, enums, names: map(), cyc: map(), pln: map(), count: 0, out: [], subst: c.state.subst }
+    // yaml's conversions are json's, over yaml.Node, in the yaml module
+    let mut y = { g with q: yaml ?? "", vt: "Node" }
     // the modules that read rows into structs, each writing its own
     // conversions, and their problems
-    let mut rgs = rows.map(|q| Gen { q, sp: span0, structs, enums, names: map(), cyc: map(), pln: map(), count: 0, out: [], subst: c.state.subst })
+    let mut rgs = rows.map(|q| Gen { q, vt: "Value", sp: span0, structs, enums, names: map(), cyc: map(), pln: map(), count: 0, out: [], subst: c.state.subst })
     let mut rdiags: List[List[diag.Diag]] = rows.map(|_| [])
     let mut wrappers: Map[Str, Str] = map()
     let mut diags: List[diag.Diag] = []
@@ -880,54 +890,41 @@ pub fn expand(json: Option[Str], rows: List[Str], items: List[ast.Item], c: type
     let mut next = c.state.next_id
     let mut found = false
     let is_json = |n: Str| json.is_some() && (n == jf(g, "encode") || n == jf(g, "decode"))
+    let is_yaml = |n: Str| yaml.is_some() && (n == jf(y, "encode") || n == jf(y, "decode"))
     let row_module = |n: Str| rgs.with_index().find(|p| n == jf(p.1, "decode") || n == jf(p.1, "values")).map(|p| p.0)
     // a table test's case, then the body
     for e in items.flat_map(fn_exprs) {
         match e.desc {
             EVar(n) if is_json(n) => {
                 found = true
-                g.sp = e.span
-                let encode = n == jf(g, "encode")
-                let what = if encode { "json.encode" } else { "json.decode" }
-                let note = if encode { "convert where the type is known, and pass the text" } else { "say the type: `let t: Todo = json.decode(s)?`" }
-                match known(c, e, what, note) {
-                    Err(d) => diags.push(d),
-                    Ok(t) => {
-                        let key = what + " " + show(g, t)
-                        match wrappers.get(key) {
-                            Some(w) => {
-                                rewrites[e.id] = EVar(w)
-                            },
-                            None => match coders(g, t) {
-                                Ok(((to, from), g2)) => {
-                                    g = g2
-                                    let kind = if encode { "encode" } else { "decode" }
-                                    let w = jf(g, "{kind}${wrappers.len() + 1}")
-                                    // the types here have a JSON form, so they can be written
-                                    let written_t = written(g, t) ?? te(g, TyUnit)
-                                    let str_t = te(g, TyName("Str", []))
-                                    let item = if encode {
-                                        fn_item(g, w, [param(g, "x", written_t)], str_t, only(g, call(g, jf(g, if plain(g, t) { "stringify" } else { "write" }), [call(g, to, [var(g, "x")])])))
-                                    } else {
-                                        let rt = written(g, TNamed("Result", [t, TStr])) ?? te(g, TyUnit)
-                                        fn_item(g, w, [param(g, "s", str_t)], rt, only(g, call(g, jf(g, "from_text"), [var(g, "s"), var(g, from)])))
-                                    }
-                                    g.out = g.out + [item]
-                                    wrappers[key] = w
-                                    rewrites[e.id] = EVar(w)
-                                },
-                                Err(f) => {
-                                    g = f.g
-                                    // a function held through a struct's fields is named by its path
-                                    let inner = match g.subst.fn_via(t) {
-                                        Some(p) if f.what == "a function" => "a function through `{p}`",
-                                        _ => f.what,
-                                    }
-                                    diags.push(no_form(g, e, what, t, inner, "JSON"))
-                                },
-                            },
-                        }
+                let x = convert(g, "json", "JSON", n, e, c, wrappers)
+                g = x.g
+                wrappers = x.wrappers
+                match x.rewrite {
+                    Some(r) => {
+                        rewrites[e.id] = r
                     },
+                    None => {},
+                }
+                match x.diag {
+                    Some(d) => diags.push(d),
+                    None => {},
+                }
+            },
+            EVar(n) if is_yaml(n) => {
+                found = true
+                let x = convert(y, "yaml", "YAML", n, e, c, wrappers)
+                y = x.g
+                wrappers = x.wrappers
+                match x.rewrite {
+                    Some(r) => {
+                        rewrites[e.id] = r
+                    },
+                    None => {},
+                }
+                match x.diag {
+                    Some(d) => diags.push(d),
+                    None => {},
                 }
             },
             EVar(n) if row_module(n).is_some() => {
@@ -1008,11 +1005,67 @@ pub fn expand(json: Option[Str], rows: List[Str], items: List[ast.Item], c: type
     }
     let items = typecheck.rewrite_items({ c.state with rewrites }, items)
     let mut more: List[ast.Item] = []
-    for i in g.out + rgs.flat_map(|x| x.out) {
+    for i in g.out + y.out + rgs.flat_map(|x| x.out) {
         let i2 = ids.item(i, mut next)
         more.push(i2)
     }
     Some(Expanded { items: items + more, diags: diags + rdiags.flat_map(|d| d), next_id: next })
+}
+
+// What a use of `encode` or `decode` becomes, and the state after it.
+struct Converted {
+    g: Gen,
+    wrappers: Map[Str, Str],
+    rewrite: Option[ast.ExprDesc],
+    diag: Option[diag.Diag],
+}
+
+// A use `e` of `encode` or `decode` (`n`) of json, or of yaml: `m` is the
+// module as the messages name it, `holds` its format.
+fn convert(g0: Gen, m: Str, holds: Str, n: Str, e: ast.Expr, c: typecheck.Checked, wrappers0: Map[Str, Str]) -> Converted {
+    let mut g = g0
+    let mut wrappers = wrappers0
+    g.sp = e.span
+    let encode = n == jf(g, "encode")
+    let what = m + (if encode { ".encode" } else { ".decode" })
+    let note = if encode { "convert where the type is known, and pass the text" } else { "say the type: `let t: Todo = {m}.decode(s)?`" }
+    let t = match known(c, e, what, note) {
+        Err(d) => { return Converted { g, wrappers, rewrite: None, diag: Some(d) } },
+        Ok(t) => t,
+    }
+    let key = what + " " + show(g, t)
+    match wrappers.get(key) {
+        Some(w) => { return Converted { g, wrappers, rewrite: Some(EVar(w)), diag: None } },
+        None => {},
+    }
+    match coders(g, t) {
+        Ok(((to, from), g2)) => {
+            g = g2
+            let kind = if encode { "encode" } else { "decode" }
+            let w = jf(g, "{kind}${wrappers.len() + 1}")
+            // the types here have a form in `holds`, so they can be written
+            let written_t = written(g, t) ?? te(g, TyUnit)
+            let str_t = te(g, TyName("Str", []))
+            let item = if encode {
+                fn_item(g, w, [param(g, "x", written_t)], str_t, only(g, call(g, jf(g, if plain(g, t) { "stringify" } else { "write" }), [call(g, to, [var(g, "x")])])))
+            } else {
+                let rt = written(g, TNamed("Result", [t, TStr])) ?? te(g, TyUnit)
+                fn_item(g, w, [param(g, "s", str_t)], rt, only(g, call(g, jf(g, "from_text"), [var(g, "s"), var(g, from)])))
+            }
+            g.out = g.out + [item]
+            wrappers[key] = w
+            Converted { g, wrappers, rewrite: Some(EVar(w)), diag: None }
+        },
+        Err(f) => {
+            g = f.g
+            // a function held through a struct's fields is named by its path
+            let inner = match g.subst.fn_via(t) {
+                Some(p) if f.what == "a function" => "a function through `{p}`",
+                _ => f.what,
+            }
+            Converted { g, wrappers, rewrite: None, diag: Some(no_form(g, e, what, t, inner, holds)) }
+        },
+    }
 }
 
 // The type a use converts, or an E0212 when it is not known.
@@ -1032,7 +1085,7 @@ fn known(c: typecheck.Checked, e: ast.Expr, what: Str, note: Str) -> Result[type
 }
 
 // The E0212 for a type `what` cannot convert: `inner` is what in it has no
-// form in `holds` (JSON or SQL).
+// form in `holds` (JSON, YAML or SQL).
 fn no_form(g: Gen, e: ast.Expr, what: Str, t: types.Ty, inner: Str, holds: Str) -> diag.Diag {
     let msg = if inner == quoted(g, t) {
         "`{what}` cannot convert {quoted(g, t)}: it has no {holds} form"
@@ -1043,6 +1096,8 @@ fn no_form(g: Gen, e: ast.Expr, what: Str, t: types.Ty, inner: Str, holds: Str) 
     }
     let note = if holds == "SQL" {
         "a row is read into a struct whose fields are Int, Float, Str, Bool, Bytes, or an Option of one of those"
+    } else if holds == "YAML" {
+        "YAML holds Int, Float, Str, Bool, yaml.Node, Option, List, Map with Str keys, tuples, and structs and enums of those"
     } else {
         "JSON holds Int, Float, Str, Bool, json.Value, Option, List, Map with Str keys, tuples, and structs and enums of those"
     }

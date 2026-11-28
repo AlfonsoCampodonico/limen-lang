@@ -13248,6 +13248,275 @@ Ok(Arr([Num(inf), Num(-0.0), Int(7), Str("x"), Arr([]), Obj([])]))
 Map([yaml.Pair { key: Str("a"), value: Seq([Int(1), Float(2.5), Null, Bool(true), Str("s")]) }, yaml.Pair { key: Str("b"), value: Map([]) }])
 true
 |};
+   (* yaml.encode and yaml.decode: the compiler writes the conversions over
+     yaml.Node per type, as for json. The encoded text is checked by
+     reading it back, so these lines hold whatever layout stringify picks. *)
+   out "yaml-encode-struct"
+     {|use json
+use yaml
+
+struct Todo {
+    id: Int,
+    title: Str,
+    done: Bool,
+}
+
+enum Shape {
+    Point,
+    Circle(Float),
+    Rect(Float, Float),
+}
+
+struct Box {
+    todos: List[Todo],
+    shapes: List[Shape],
+    counts: Map[Str, Int],
+    pair: (Int, Str),
+    note: Option[Str],
+    ratio: Float,
+    result: Result[Int, Str],
+}
+
+struct Chain {
+    value: Int,
+    next: Option[Chain],
+}
+
+fn shown(s: Str) -> Str {
+    match yaml.parse(s) {
+        Ok(n) => match yaml.to_json(n) {
+            Ok(v) => json.stringify(v),
+            Err(e) => e,
+        },
+        Err(e) => e,
+    }
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let t = Todo { id: 1, title: "no", done: false }
+    let s = yaml.encode(t)
+    let back: Result[Todo, Str] = yaml.decode(s)
+    out.print("{back == Ok(t)} {s.contains("title: \"no\"") || s.contains("title: 'no'")}")
+    out.print(shown(s))
+    let mut counts: Map[Str, Int] = map()
+    counts["a"] = 1
+    let titles = ["1e3", "null", "~", "- x", "a: b", "", "two\nlines", "0o17", "2024-01-01"]
+    let b = Box {
+        todos: [t] + titles.with_index().map(|p| Todo { id: p.0 + 2, title: p.1, done: true }),
+        shapes: [Shape.Point, Shape.Circle(1.5), Shape.Rect(2.0, 3.0)],
+        counts,
+        pair: (7, "x"),
+        note: None,
+        ratio: 0.5,
+        result: Err("no"),
+    }
+    let bs = yaml.encode(b)
+    let bb: Result[Box, Str] = yaml.decode(bs)
+    out.print("{bb == Ok(b)}")
+    out.print(shown(bs))
+    let mut c = Chain { value: 0, next: None }
+    for i in 1..<4 {
+        c = Chain { value: i, next: Some(c) }
+    }
+    let cs = yaml.encode(c)
+    let cb: Result[Chain, Str] = yaml.decode(cs)
+    out.print("{cb == Ok(c)}")
+    out.print(shown(cs))
+    out.print("{[1, 2].map(yaml.encode).map(|x| x.trim())}")
+}
+|}
+     {|true true
+{"id":1,"title":"no","done":false}
+true
+{"todos":[{"id":1,"title":"no","done":false},{"id":2,"title":"1e3","done":true},{"id":3,"title":"null","done":true},{"id":4,"title":"~","done":true},{"id":5,"title":"- x","done":true},{"id":6,"title":"a: b","done":true},{"id":7,"title":"","done":true},{"id":8,"title":"two\nlines","done":true},{"id":9,"title":"0o17","done":true},{"id":10,"title":"2024-01-01","done":true}],"shapes":["Point",{"Circle":1.5},{"Rect":[2,3]}],"counts":{"a":1},"pair":[7,"x"],"note":null,"ratio":0.5,"result":{"Err":"no"}}
+true
+{"value":3,"next":{"value":2,"next":{"value":1,"next":{"value":0,"next":null}}}}
+["1", "2"]
+|};
+   out "yaml-decode-errors"
+     {|use yaml
+
+struct Todo {
+    id: Int,
+    title: Str,
+    done: Bool,
+}
+
+struct Todos {
+    todos: List[Todo],
+}
+
+enum Shape {
+    Point,
+    Circle(Float),
+    Rect(Float, Float),
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let list = "todos:\n  - \{id: 1, title: a, done: true\}\n  - id: 2\n    title: b\n    done: false\n  - id: 3\n    title: 7\n    done: false\n"
+    let r: Result[Todos, Str] = yaml.decode(list)
+    out.print("{r}")
+    for bad in [
+        "- 1\n",
+        "id: \"2\"\n",
+        "id: 2\n",
+        "id: 2.5\ntitle: x\ndone: true\n",
+        "id: 2\ntitle: x\ndone: yes\n",
+        "id: !x 2\ntitle: x\ndone: true\n",
+        "id: 2\ntitle: [x\n",
+        "",
+    ] {
+        let t: Result[Todo, Str] = yaml.decode(bad)
+        out.print("{t}")
+    }
+    let ok: Result[Todo, Str] = yaml.decode("id: 0x10\ntitle: x\ndone: true\nextra: [1, 2]\n")
+    out.print("{ok}")
+    let shapes: Result[List[Shape], Str] = yaml.decode("- Point\n- Circle: 2\n- Rect: [1, 2]\n")
+    out.print("{shapes}")
+    for bad in ["- Square\n", "- Rect: [1]\n", "- [Point]\n"] {
+        let s: Result[List[Shape], Str] = yaml.decode(bad)
+        out.print("{s}")
+    }
+    let keys: Result[Map[Str, Int], Str] = yaml.decode("a: 1\n2: 3\n")
+    out.print("{keys}")
+    let pair: Result[(Int, Str), Str] = yaml.decode("[1, 2]")
+    out.print("{pair}")
+}
+|}
+     {|Err("`todos[2].title`: expected a string, found an integer")
+Err("expected a mapping, found a sequence")
+Err("`id`: expected an integer, found a string")
+Err("`title` is missing")
+Err("`id`: expected an integer, found a float")
+Err("`done`: expected true or false, found a string")
+Err("`id`: expected an integer, found a node tagged !x")
+Err("line 2, column 8: this flow sequence is never closed")
+Err("expected a mapping, found null")
+Ok(Todo { id: 16, title: "x", done: true })
+Ok([Point, Circle(2.0), Rect(1.0, 2.0)])
+Err("`[0]`: no variant `Square`; expected one of `Point`, `Circle`, `Rect`")
+Err("`[0].Rect`: expected a sequence of 2 items, found a sequence")
+Err("`[0]`: expected a variant's name or a mapping with one key, found a sequence")
+Err("expected a string key, found an integer")
+Err("`[1]`: expected a string, found an integer")
+|};
+   out "yaml-decode-option"
+     {|use yaml
+
+struct Item {
+    name: Str,
+    note: Option[Str],
+    count: Option[Int],
+    tags: Option[List[Str]],
+}
+
+fn main(root: Root) {
+    for s in ["name: a\n", "name: b\nnote: null\ncount: ~\ntags:\n", "name: c\nnote: hi\ncount: 3\ntags: [x, y]\n", "note: hi\n", "name: d\ncount: x\n"] {
+        let r: Result[Item, Str] = yaml.decode(s)
+        root.stdout.print("{r}")
+    }
+}
+|}
+     {|Ok(Item { name: "a", note: None, count: None, tags: None })
+Ok(Item { name: "b", note: None, count: None, tags: None })
+Ok(Item { name: "c", note: Some("hi"), count: Some(3), tags: Some(["x", "y"]) })
+Err("`name` is missing")
+Err("`count`: expected an integer, found a string")
+|};
+   errs "yaml-encode-e0212"
+     {|use yaml
+struct H { fs: Fs, n: Int }
+fn g[T](x: T) -> Str { yaml.encode(x) }
+fn main(root: Root) {
+    root.stdout.print(yaml.encode(H { fs: root.fs, n: 1 }))
+    root.stdout.print(g(1))
+    let r = yaml.decode("1")
+    let m: Map[Int, Str] = map()
+    root.stdout.print(yaml.encode(m))
+}
+|}
+     [ "E0212"; "E0212"; "E0212"; "E0212" ];
+   says "yaml-encode-e0212-says"
+     {|use yaml
+struct H { fs: Fs, n: Int }
+fn main(root: Root) {
+    root.stdout.print(yaml.encode(H { fs: root.fs, n: 1 }))
+}
+|}
+     "E0212" "`yaml.encode` cannot convert `H`: it holds `Fs`, which has no YAML form";
+   out "yaml-decode-kubeconfig"
+     {|use yaml
+
+struct Kubeconfig {
+    apiVersion: Str,
+    kind: Str,
+    clusters: List[NamedCluster],
+    users: List[NamedUser],
+    contexts: List[NamedContext],
+    preferences: yaml.Node,
+}
+
+struct NamedCluster {
+    name: Str,
+    cluster: Cluster,
+}
+
+struct Cluster {
+    server: Str,
+}
+
+struct NamedUser {
+    name: Str,
+    user: User,
+}
+
+struct User {
+    token: Option[Str],
+    username: Option[Str],
+    password: Option[Str],
+}
+
+struct NamedContext {
+    name: Str,
+    context: Context,
+}
+
+struct Context {
+    cluster: Str,
+    user: Str,
+    namespace: Option[Str],
+}
+
+fn main(root: Root) {
+    let text = "apiVersion: v1\nkind: Config\nclusters:\n- cluster:\n    certificate-authority-data: LS0tLS1CRUdJTg==\n    server: https://127.0.0.1:6443\n  name: kind-dev\n- name: prod\n  cluster:\n    server: \"https://k8s.example.com\"\ncontexts:\n- context: \{cluster: kind-dev, user: admin, namespace: default\}\n  name: kind-dev\n- name: prod\n  context:\n    cluster: prod\n    user: ops\ncurrent-context: kind-dev\npreferences: \{\}\nusers:\n- name: admin\n  user:\n    token: abc.def\n- name: ops\n  user:\n    username: ops\n    password: 'secret'\n"
+    let r: Result[Kubeconfig, Str] = yaml.decode(text)
+    match r {
+        Ok(k) => {
+            root.stdout.print("{k.apiVersion} {k.kind} {k.preferences}")
+            for c in k.clusters {
+                root.stdout.print("{c.name} {c.cluster.server}")
+            }
+            for u in k.users {
+                root.stdout.print("{u.name} {u.user.token} {u.user.username} {u.user.password}")
+            }
+            for c in k.contexts {
+                root.stdout.print("{c.name} {c.context.cluster} {c.context.user} {c.context.namespace}")
+            }
+        },
+        Err(e) => root.stdout.print(e),
+    }
+}
+|}
+     {|v1 Config Map([])
+kind-dev https://127.0.0.1:6443
+prod https://k8s.example.com
+admin Some("abc.def") None None
+ops None Some("ops") Some("secret")
+kind-dev kind-dev admin Some("default")
+prod prod ops None
+|};
    (* the Kubernetes files in examples/k8s, a kubeconfig, and a manifest of
      two documents *)
    let k8s =

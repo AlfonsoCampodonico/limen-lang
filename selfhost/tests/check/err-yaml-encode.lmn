@@ -1,0 +1,18 @@
+use yaml
+
+struct H {
+    fs: Fs,
+    n: Int,
+}
+
+fn g[T](x: T) -> Str {
+    yaml.encode(x)
+}
+
+fn main(root: Root) {
+    root.stdout.print(yaml.encode(H { fs: root.fs, n: 1 }))
+    root.stdout.print(g(1))
+    let r = yaml.decode("1")
+    let m: Map[Int, Str] = map()
+    root.stdout.print(yaml.encode(m))
+}
