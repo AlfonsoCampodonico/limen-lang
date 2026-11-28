@@ -181,14 +181,15 @@ fn front(fs: Fs, place: disk.Place, file: Str) -> Front {
     }
     let c = typecheck.check_program(p.items, p.files, p.next_id, methods, p.forwarders)
     let files = p.files + [diag.Source { path: prelude.file_name(), text: prelude.text() }, diag.Source { path: prelude.methods_name(), text: methods }, diag.Source { path: "<std>/limen.toml", text: std.get("limen.toml") ?? "" }]
-    // `json.encode`, `json.decode` and the sql module's row conversions get
-    // their conversions written once the types are known, and the program
-    // is checked again with them
+    // `json.encode`, `json.decode`, `yaml.encode`, `yaml.decode` and the
+    // sql module's row conversions get their conversions written once the
+    // types are known, and the program is checked again with them
     let json = p.std_modules.find(|m| m.1 == "json").map(|m| m.0)
+    let yaml = p.std_modules.find(|m| m.1 == "yaml").map(|m| m.0)
     // the modules that read rows into structs, in this order
     let rows = ["sql", "postgres"].flat_map(|name| p.std_modules.find(|m| m.1 == name).map(|m| [m.0]) ?? [])
     let (p, c) = match json {
-        _ if (json.is_some() || !rows.is_empty()) && c.diags.all(|d| d.warning) => match derive.expand(json, rows, p.items, c) {
+        _ if (json.is_some() || yaml.is_some() || !rows.is_empty()) && c.diags.all(|d| d.warning) => match derive.expand(json, yaml, rows, p.items, c) {
             None => (p, c),
             Some(x) if !x.diags.is_empty() => {
                 let diags = x.diags + c.diags.filter(|d| d.warning)

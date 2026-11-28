@@ -726,6 +726,528 @@ pub fn from_json(v: json.Value) -> Node {
     Null
 }
 
+// ---------- converting values ----------
+
+// `encode(x)` is the YAML text for `x`, and `decode(s)` reads one back:
+// `let c: Config = yaml.decode(text)?`. They take the types `json.encode`
+// and `json.decode` take, with `Node` in place of `json.Value`, and write
+// them as `json` does: a struct is a mapping with a key per field, an enum
+// value its variant's name or a mapping of the name to the payload, a
+// tuple a sequence. The compiler writes the conversion for each type they
+// are used with, from the functions below, as for `json`; these bodies
+// never run.
+pub fn encode[T](x: T) -> Str {
+    panic("yaml.encode: the compiler writes this for each type")
+}
+
+pub fn decode[T](s: Str) -> Result[T, Str] {
+    panic("yaml.decode: the compiler writes this for each type")
+}
+
+// What the compiler's conversions are made of, with the names and shapes
+// of json.lmn's. An encoder gives a Node; for a type that holds a type
+// that holds itself, the Node in pieces, a piece of a type that holds
+// itself left for later, so `write` builds it with lists rather than by
+// recursion. A decoder takes the node and where it sits in the document
+// (`todos[2].title`, "" at the top), for the error message.
+
+fn of_int(x: Int) -> Node {
+    Int(x)
+}
+
+fn of_float(x: Float) -> Node {
+    Float(x)
+}
+
+fn of_str(x: Str) -> Node {
+    Str(x)
+}
+
+fn of_bool(x: Bool) -> Node {
+    Bool(x)
+}
+
+fn of_value(x: Node) -> Node {
+    x
+}
+
+fn of_option[T](x: Option[T], f: fn(T) -> Node) -> Node {
+    match x {
+        Some(y) => f(y),
+        None => Null,
+    }
+}
+
+fn field(key: Str, value: Node) -> Pair {
+    Pair { key: Str(key), value }
+}
+
+fn of_map[V](m: Map[Str, V], f: fn(V) -> Node) -> Node {
+    Map(m.entries().map(|e| field(e.0, f(e.1))))
+}
+
+fn of_variant(name: Str, payload: Node) -> Node {
+    Map([field(name, payload)])
+}
+
+fn of_list(items: List[Node]) -> Node {
+    Seq(items)
+}
+
+fn of_fields(fields: List[Pair]) -> Node {
+    Map(fields)
+}
+
+// A node in pieces: a finished node, the start of a sequence or (true) a
+// mapping, a mapping's key, the end of the collection last started, or
+// pieces left for later.
+enum Part {
+    Leaf(Node),
+    Open(Bool),
+    Key(Str),
+    Close,
+    Later(fn() -> List[Part]),
+}
+
+// A list of pieces being read, and the position of the next.
+struct Pieces {
+    parts: List[Part],
+    at: Int,
+}
+
+fn write(parts: List[Part]) -> Str {
+    stringify(assemble(parts))
+}
+
+// The node the pieces make. The lists being read wait in `open`, the
+// collections being built in `maps` and `starts`, their finished items
+// (a mapping's keys and values in turn) in `items` from `starts[d]` to
+// `top`; slots past the depth in use are spare.
+fn assemble(parts: List[Part]) -> Node {
+    let mut open: List[Pieces] = [Pieces { parts, at: 0 }]
+    let mut depth = 1
+    let mut maps: List[Bool] = []
+    let mut starts: List[Int] = []
+    let mut cols = 0
+    let mut items: List[Node] = []
+    let mut top = 0
+    let mut result = Null
+    while depth > 0 {
+        let d = depth - 1
+        let at = open[d].at
+        if at == open[d].parts.len() {
+            open[d] = Pieces { parts: [], at: 0 }
+            depth = d
+        } else {
+            open[d].at = at + 1
+            let mut done: Option[Node] = None
+            match open[d].parts[at] {
+                Leaf(n) => {
+                    done = Some(n)
+                },
+                Key(k) => {
+                    put(mut items, top, Str(k))
+                    top = top + 1
+                },
+                Open(m) => {
+                    put(mut maps, cols, m)
+                    put(mut starts, cols, top)
+                    cols = cols + 1
+                },
+                Close => {
+                    cols = cols - 1
+                    let s = starts[cols]
+                    if maps[cols] {
+                        let mut ps: List[Pair] = []
+                        let mut j = s
+                        while j + 1 < top {
+                            ps.push(Pair { key: items[j], value: items[j + 1] })
+                            j = j + 2
+                        }
+                        done = Some(Map(ps))
+                    } else {
+                        let mut xs: List[Node] = []
+                        for j in s..<top {
+                            xs.push(items[j])
+                        }
+                        done = Some(Seq(xs))
+                    }
+                    for j in s..<top {
+                        items[j] = Null
+                    }
+                    top = s
+                },
+                Later(f) => {
+                    put(mut open, depth, Pieces { parts: f(), at: 0 })
+                    depth = depth + 1
+                },
+            }
+            match done {
+                Some(n) => if cols == 0 {
+                    result = n
+                } else {
+                    put(mut items, top, n)
+                    top = top + 1
+                },
+                None => {},
+            }
+        }
+    }
+    result
+}
+
+fn later(f: fn() -> List[Part]) -> List[Part] {
+    [Later(f)]
+}
+
+fn put_int(x: Int) -> List[Part] {
+    [Leaf(Int(x))]
+}
+
+fn put_float(x: Float) -> List[Part] {
+    [Leaf(Float(x))]
+}
+
+fn put_str(x: Str) -> List[Part] {
+    [Leaf(Str(x))]
+}
+
+fn put_bool(x: Bool) -> List[Part] {
+    [Leaf(Bool(x))]
+}
+
+fn put_value(x: Node) -> List[Part] {
+    [Leaf(x)]
+}
+
+fn put_option[T](x: Option[T], f: fn(T) -> List[Part]) -> List[Part] {
+    match x {
+        Some(y) => f(y),
+        None => [Leaf(Null)],
+    }
+}
+
+fn put_list[T](xs: List[T], f: fn(T) -> List[Part]) -> List[Part] {
+    let mut out = [Open(false)]
+    for x in xs {
+        for p in f(x) {
+            out.push(p)
+        }
+    }
+    out.push(Close)
+    out
+}
+
+fn put_items(items: List[List[Part]]) -> List[Part] {
+    let mut out = [Open(false)]
+    for ps in items {
+        for p in ps {
+            out.push(p)
+        }
+    }
+    out.push(Close)
+    out
+}
+
+fn put_map[V](m: Map[Str, V], f: fn(V) -> List[Part]) -> List[Part] {
+    put_fields(m.keys(), m.values().map(f))
+}
+
+fn put_fields(keys: List[Str], values: List[List[Part]]) -> List[Part] {
+    let mut out = [Open(true)]
+    for (i, k) in keys.with_index() {
+        out.push(Key(k))
+        for p in values[i] {
+            out.push(p)
+        }
+    }
+    out.push(Close)
+    out
+}
+
+fn put_variant(name: Str, payload: List[Part]) -> List[Part] {
+    let mut out = [Open(true), Key(name)]
+    for p in payload {
+        out.push(p)
+    }
+    out.push(Close)
+    out
+}
+
+// Decoding. A syntax error keeps its line and column; a node of the wrong
+// kind names where it is.
+fn from_text[T](s: Str, f: fn(Node, Str) -> Result[T, Str]) -> Result[T, Str] {
+    let n = parse(s)?
+    f(n, "")
+}
+
+fn node_kind(n: Node) -> Str {
+    match n {
+        Null => "null",
+        Bool(_) => "a boolean",
+        Int(_) => "an integer",
+        Float(_) => "a float",
+        Str(_) => "a string",
+        Seq(_) => "a sequence",
+        Map(_) => "a mapping",
+        Tagged(t, _) => "a node tagged {t}",
+    }
+}
+
+fn wrong(at: Str, want: Str, n: Node) -> Str {
+    let found = node_kind(n)
+    if at.is_empty() {
+        "expected {want}, found {found}"
+    } else {
+        "`{at}`: expected {want}, found {found}"
+    }
+}
+
+fn inside(at: Str, key: Str) -> Str {
+    if at.is_empty() { key } else { "{at}.{key}" }
+}
+
+fn from_int(n: Node, at: Str) -> Result[Int, Str] {
+    match n.as_int() {
+        Some(x) => Ok(x),
+        None => Err(wrong(at, "an integer", n)),
+    }
+}
+
+fn from_float(n: Node, at: Str) -> Result[Float, Str] {
+    match n.as_float() {
+        Some(x) => Ok(x),
+        None => Err(wrong(at, "a number", n)),
+    }
+}
+
+fn from_str(n: Node, at: Str) -> Result[Str, Str] {
+    match n {
+        Str(s) => Ok(s),
+        _ => Err(wrong(at, "a string", n)),
+    }
+}
+
+fn from_bool(n: Node, at: Str) -> Result[Bool, Str] {
+    match n {
+        Bool(b) => Ok(b),
+        _ => Err(wrong(at, "true or false", n)),
+    }
+}
+
+fn from_value(n: Node, at: Str) -> Result[Node, Str] {
+    Ok(n)
+}
+
+fn from_option[T](n: Node, at: Str, f: fn(Node, Str) -> Result[T, Str]) -> Result[Option[T], Str] {
+    match n {
+        Null => Ok(None),
+        _ => Ok(Some(f(n, at)?)),
+    }
+}
+
+fn from_list[T](n: Node, at: Str, f: fn(Node, Str) -> Result[T, Str]) -> Result[List[T], Str] {
+    match n {
+        Seq(items) => {
+            let mut out: List[T] = []
+            for x in items {
+                out.push(f(x, "{at}[{out.len()}]")?)
+            }
+            Ok(out)
+        },
+        _ => Err(wrong(at, "a sequence", n)),
+    }
+}
+
+// The key of a pair read into a `Map[Str, V]`, which must be a string.
+fn str_key(p: Pair, at: Str) -> Result[Str, Str] {
+    match p.key {
+        Str(k) => Ok(k),
+        _ => Err(wrong(at, "a string key", p.key)),
+    }
+}
+
+fn from_map[V](n: Node, at: Str, f: fn(Node, Str) -> Result[V, Str]) -> Result[Map[Str, V], Str] {
+    match n {
+        Map(pairs) => {
+            let mut out: Map[Str, V] = map()
+            for p in pairs {
+                let k = str_key(p, at)?
+                out[k] = f(p.value, inside(at, k))?
+            }
+            Ok(out)
+        },
+        _ => Err(wrong(at, "a mapping", n)),
+    }
+}
+
+// A sequence of exactly `count` items, for a tuple or a variant's payload.
+fn from_items(n: Node, at: Str, count: Int) -> Result[List[Node], Str] {
+    match n {
+        Seq(items) if items.len() == count => Ok(items),
+        _ => Err(wrong(at, "a sequence of {count} items", n)),
+    }
+}
+
+fn item_at(at: Str, i: Int) -> Str {
+    "{at}[{i}]"
+}
+
+fn need_object(n: Node, at: Str) -> Result[(), Str] {
+    match n {
+        Map(_) => Ok(()),
+        _ => Err(wrong(at, "a mapping", n)),
+    }
+}
+
+// Field `key` of mapping `n`. A missing field reads as null, so an
+// `Option` field may be left out; any other is reported missing.
+fn member[T](n: Node, at: Str, key: Str, f: fn(Node, Str) -> Result[T, Str]) -> Result[T, Str] {
+    let path = inside(at, key)
+    match n.get(key) {
+        Some(x) => f(x, path),
+        None => match f(Null, path) {
+            Ok(x) => Ok(x),
+            Err(_) => Err("`{path}` is missing"),
+        },
+    }
+}
+
+// An enum value: a unit variant is its name, `Point`; one with a payload
+// is a mapping with one key, `Circle: 1.5`, or for several items
+// `Rect: [2, 3]`. The variant's name and its payload (null for none).
+fn from_variant(n: Node, at: Str) -> Result[(Str, Node), Str] {
+    match n {
+        Str(name) => Ok((name, Null)),
+        Map([p]) => match p.key {
+            Str(name) => Ok((name, p.value)),
+            _ => Err(wrong(at, "a variant's name", p.key)),
+        },
+        _ => Err(wrong(at, "a variant's name or a mapping with one key", n)),
+    }
+}
+
+fn no_variant(at: Str, name: Str, names: Str) -> Str {
+    let place = if at.is_empty() { "" } else { "`{at}`: " }
+    "{place}no variant `{name}`; expected one of {names}"
+}
+
+// A decoder of a type that holds itself takes what to do with the result,
+// and gives back the next step rather than calling it, so `run` takes the
+// steps one by one, with a list rather than by recursion.
+enum Next[R] {
+    Stop(R),
+    Go(fn() -> Next[R]),
+}
+
+fn run[R](n: Next[R]) -> R {
+    let mut c = n
+    let mut more = true
+    while more {
+        match c {
+            Go(f) => { c = f() },
+            Stop(_) => { more = false },
+        }
+    }
+    match c {
+        Stop(r) => r,
+        Go(_) => panic("yaml: a decoding step left over"),
+    }
+}
+
+fn go[R](f: fn() -> Next[R]) -> Next[R] {
+    Go(f)
+}
+
+fn stop[R](r: R) -> Next[R] {
+    Stop(r)
+}
+
+// What a list or map decoded so far holds, newest first.
+enum Acc[T] {
+    More(T, Acc[T]),
+    Empty,
+}
+
+fn acc_list[T](acc: Acc[T]) -> List[T] {
+    let mut out: List[T] = []
+    let mut cur = acc
+    let mut going = true
+    while going {
+        match cur {
+            More(x, rest) => {
+                out.push(x)
+                cur = rest
+            },
+            Empty => { going = false },
+        }
+    }
+    out.reverse()
+}
+
+fn option_k[T, R](n: Node, at: Str, f: fn(Node, Str, fn(Result[T, Str]) -> Next[R]) -> Next[R], k: fn(Result[Option[T], Str]) -> Next[R]) -> Next[R] {
+    match n {
+        Null => Go(|| k(Ok(None))),
+        _ => Go(|| f(n, at, |r| match r {
+            Ok(x) => Go(|| k(Ok(Some(x)))),
+            Err(e) => Go(|| k(Err(e))),
+        })),
+    }
+}
+
+fn list_k[T, R](n: Node, at: Str, f: fn(Node, Str, fn(Result[T, Str]) -> Next[R]) -> Next[R], k: fn(Result[List[T], Str]) -> Next[R]) -> Next[R] {
+    match n {
+        Seq(items) => items_k(items, 0, at, Empty, f, k),
+        _ => Go(|| k(Err(wrong(at, "a sequence", n)))),
+    }
+}
+
+fn items_k[T, R](items: List[Node], i: Int, at: Str, acc: Acc[T], f: fn(Node, Str, fn(Result[T, Str]) -> Next[R]) -> Next[R], k: fn(Result[List[T], Str]) -> Next[R]) -> Next[R] {
+    if i == items.len() {
+        return Go(|| k(Ok(acc_list(acc))))
+    }
+    Go(|| f(items[i], "{at}[{i}]", |r| match r {
+        Ok(x) => items_k(items, i + 1, at, More(x, acc), f, k),
+        Err(e) => Go(|| k(Err(e))),
+    }))
+}
+
+fn map_k[V, R](n: Node, at: Str, f: fn(Node, Str, fn(Result[V, Str]) -> Next[R]) -> Next[R], k: fn(Result[Map[Str, V], Str]) -> Next[R]) -> Next[R] {
+    match n {
+        Map(pairs) => pairs_k(pairs, 0, at, Empty, f, k),
+        _ => Go(|| k(Err(wrong(at, "a mapping", n)))),
+    }
+}
+
+fn pairs_k[V, R](pairs: List[Pair], i: Int, at: Str, acc: Acc[(Str, V)], f: fn(Node, Str, fn(Result[V, Str]) -> Next[R]) -> Next[R], k: fn(Result[Map[Str, V], Str]) -> Next[R]) -> Next[R] {
+    if i == pairs.len() {
+        let mut out: Map[Str, V] = map()
+        for e in acc_list(acc) {
+            out[e.0] = e.1
+        }
+        return Go(|| k(Ok(out)))
+    }
+    match str_key(pairs[i], at) {
+        Ok(key) => Go(|| f(pairs[i].value, inside(at, key), |r| match r {
+            Ok(x) => pairs_k(pairs, i + 1, at, More((key, x), acc), f, k),
+            Err(e) => Go(|| k(Err(e))),
+        })),
+        Err(e) => Go(|| k(Err(e))),
+    }
+}
+
+// as `member`, a step at a time
+fn member_k[T, R](n: Node, at: Str, key: Str, f: fn(Node, Str, fn(Result[T, Str]) -> Next[R]) -> Next[R], k: fn(Result[T, Str]) -> Next[R]) -> Next[R] {
+    let path = inside(at, key)
+    match n.get(key) {
+        Some(x) => Go(|| f(x, path, k)),
+        None => Go(|| f(Null, path, |r| match r {
+            Ok(x) => Go(|| k(Ok(x))),
+            Err(_) => Go(|| k(Err("`{path}` is missing"))),
+        })),
+    }
+}
+
 // ---------- limits ----------
 
 // How many collections may be open inside each other, counting those an

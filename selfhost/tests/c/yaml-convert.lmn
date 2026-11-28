@@ -1,0 +1,26 @@
+// yaml.encode and yaml.decode of types that hold themselves (encoded in
+// pieces, decoded a step at a time) next to flat ones, with the errors.
+use yaml
+enum L { Cons(Int, L), Nil }
+enum E { Leaf(Str), Two(E, E), Many(List[E]), Named(Map[Str, E]), Tup((Int, E)), Opt(Option[E]), Raw(yaml.Node) }
+struct Node { value: Int, next: Option[Node] }
+struct Flat { a: Int, b: Str, c: List[Bool], d: Option[Float], m: Map[Str, Int], t: (Int, Str) }
+fn main(root: Root) {
+    let out = root.stdout
+    let l = Cons(1, Cons(2, Nil))
+    let e = E.Many([E.Leaf("a"), E.Two(E.Leaf("b"), E.Tup((3, E.Opt(None)))), E.Raw(yaml.Seq([yaml.Float(1.5), yaml.Null]))])
+    let n = Node { value: 1, next: Some(Node { value: 2, next: None }) }
+    let mut fm: Map[Str, Int] = map()
+    fm["z"] = 26
+    let f = Flat { a: -3, b: "é\n", c: [true, false], d: None, m: fm, t: (7, "s") }
+    let texts = [yaml.encode(l), yaml.encode(e), yaml.encode(n), yaml.encode(f)]
+    for s in texts { out.print(s) }
+    let rl: Result[L, Str] = yaml.decode("Cons: [1, \{Cons: [2, Nil]\}]")
+    let re: Result[E, Str] = yaml.decode("Many:\n- Leaf: a\n- Two: [\{Leaf: b\}, \{Tup: [3, \{Opt: null\}]\}]\n- Raw: [1.5, ~]\n")
+    let rn: Result[Node, Str] = yaml.decode("value: 1\nnext:\n  value: 2\n")
+    let rf: Result[Flat, Str] = yaml.decode("a: -3\nb: \"é\\n\"\nc: [true, false]\nm: \{z: 26\}\nt: [7, s]\n")
+    out.print("{rl == Ok(l)} {re == Ok(e)} {rn == Ok(n)} {rf == Ok(f)} {rf}")
+    for s in ["Cons: [1, \{Cons: [2, Nope]\}]", "Cons: [1]", "3", "Cons: [x, Nil]"] { let r: Result[L, Str] = yaml.decode(s); out.print("{r}") }
+    for s in ["value: 1\nnext: \{next: null\}\n", "value: 1\nnext: 5\n", "[]", "value: [1"] { let r: Result[Node, Str] = yaml.decode(s); out.print("{r}") }
+    for s in ["Named: \{1: \{Leaf: a\}\}", "Many: [\{Bad: 1\}]"] { let r: Result[E, Str] = yaml.decode(s); out.print("{r}") }
+}

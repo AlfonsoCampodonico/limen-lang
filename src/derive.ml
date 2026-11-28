@@ -22,6 +22,11 @@
    channels, `Bytes`, arrays, maps without `Str` keys, `dyn` values, `()`)
    are E0212 too, naming where in the type they are.
 
+   `yaml.encode(x)` and `yaml.decode(s)` are written by the same walk, into
+   the yaml module, over `yaml.Node` in place of `json.Value`: yaml.lmn has
+   helpers of the same names and shapes as json.lmn's, so only the module
+   and its value type differ.
+
    The sql and postgres modules' work the same way, for structs whose fields are Int,
    Float, Str, Bool, Bytes or an Option of one: `sql.row$N(row: Row) ->
    Result[T, IoError]` reads each field from the column of its name, and
@@ -34,7 +39,8 @@ open Types
 let sprintf = Printf.sprintf
 
 type st = {
-  q : string; (* the json module's name in this program: "json" or "std/json" *)
+  q : string; (* the module's name in this program: "json" or "std/json", "yaml", "sql", ... *)
+  vt : string; (* its value type, converted as it is: "Value" for json, "Node" for yaml *)
   mutable sp : span; (* the use being expanded, for every node written *)
   structs : (string, struct_decl) Hashtbl.t;
   enums : (string, enum_decl) Hashtbl.t;
@@ -92,7 +98,7 @@ let rec field_ty env (t : ty_expr) =
   | TyFn _ -> raise (Unsupported "a function")
   | TyInt _ -> raise (Unsupported "a number")
 
-let value_ty st = TNamed (jf st "Value", [])
+let value_ty st = TNamed (jf st st.vt, [])
 
 (* What a type holds, for [cyclic]: nothing for a type converted by a
    helper, and nothing when a part has no JSON form (that is reported when
@@ -100,7 +106,7 @@ let value_ty st = TNamed (jf st "Value", [])
 let kids st t =
   try
     match repr t with
-    | TNamed (n, []) when n = jf st "Value" -> []
+    | TNamed (n, []) when n = jf st st.vt -> []
     | TNamed ("Option", [ a ]) | TList a | TMap (_, a) -> [ a ]
     | TNamed (n, args) when is_tuple_name n -> args
     | TNamed (n, args) when Hashtbl.mem st.structs n ->
@@ -190,7 +196,7 @@ let rec coders st t : string * string =
   | TFloat -> (jf st "of_float", jf st "from_float")
   | TStr -> (jf st "of_str", jf st "from_str")
   | TBool -> (jf st "of_bool", jf st "from_bool")
-  | TNamed (n, []) when n = jf st "Value" -> (jf st "of_value", jf st "from_value")
+  | TNamed (n, []) when n = jf st st.vt -> (jf st "of_value", jf st "from_value")
   | t -> (
     let key = show t in
     let enc_name k = jf st (sprintf (if plain st t then "to$%d" else "put$%d") k) in
@@ -243,7 +249,7 @@ and bodies st t : block * block * block option =
      itself *)
   let put_of a e =
     let p, _ = coders st a in
-    let simple = match repr a with TInt -> Some "put_int" | TFloat -> Some "put_float" | TStr -> Some "put_str" | TBool -> Some "put_bool" | TNamed (n, []) when n = jf st "Value" -> Some "put_value" | _ -> None in
+    let simple = match repr a with TInt -> Some "put_int" | TFloat -> Some "put_float" | TStr -> Some "put_str" | TBool -> Some "put_bool" | TNamed (n, []) when n = jf st st.vt -> Some "put_value" | _ -> None in
     match simple with
     | Some h -> call st (jf st h) [ e ]
     | None ->
@@ -545,22 +551,26 @@ let rec concrete t =
   | TFn (ps, r) -> List.for_all concrete ps && concrete r
   | _ -> true
 
-(* The program with every `json.encode` and `json.decode`, and every
-   `sql.decode`, `sql.values`, `db.all` and `db.one`, pointed at its
-   conversion and those conversions added, or None when it uses none of
-   them. [json] and [sql] are those modules' names here, when loaded. *)
-let expand ?json ?(rows = []) (items : item list) : (item list * Diag.t list) option =
+(* The program with every `json.encode` and `json.decode`, every
+   `yaml.encode` and `yaml.decode`, and every `sql.decode`, `sql.values`,
+   `db.all` and `db.one`, pointed at its conversion and those conversions
+   added, or None when it uses none of them. [json], [yaml] and [rows] are
+   those modules' names here, when loaded. *)
+let expand ?json ?yaml ?(rows = []) (items : item list) : (item list * Diag.t list) option =
   begin
     let structs = Hashtbl.create 16 and enums = Hashtbl.create 16 in
     (* the prelude's types too: Result is an enum like any other *)
     List.iter (function IStruct s -> Hashtbl.replace structs s.st_name s | IEnum e -> Hashtbl.replace enums e.en_name e | _ -> ()) (Prelude.items () @ items);
-    let mk q = { q; sp = Span.dummy; structs; enums; names = Hashtbl.create 16; cyc = Hashtbl.create 16; pln = Hashtbl.create 16; count = 0; out = []; diags = [] } in
-    let js = mk (Option.value ~default:"" json) in
+    let mk vt q = { q; vt; sp = Span.dummy; structs; enums; names = Hashtbl.create 16; cyc = Hashtbl.create 16; pln = Hashtbl.create 16; count = 0; out = []; diags = [] } in
+    let js = mk "Value" (Option.value ~default:"" json) in
+    (* yaml's conversions are json's, over yaml.Node, in the yaml module *)
+    let ys = mk "Node" (Option.value ~default:"" yaml) in
     (* the modules that read rows into structs, each writing its own conversions *)
-    let rgs = List.map mk rows in
+    let rgs = List.map (mk "Value") rows in
     let wrappers = Hashtbl.create 16 in
     let found = ref false in
     let is_json n = json <> None && (n = jf js "encode" || n = jf js "decode") in
+    let is_yaml n = yaml <> None && (n = jf ys "encode" || n = jf ys "decode") in
     let row_module n = List.find_opt (fun st -> n = jf st "decode" || n = jf st "values") rgs in
     let db_module (recv : expr) =
       match repr recv.ety with TNamed (n, []) -> List.find_opt (fun st -> n = jf st "Db") rgs | _ -> None
@@ -594,39 +604,47 @@ let expand ?json ?(rows = []) (items : item list) : (item list * Diag.t list) op
            else sprintf "`%s` cannot convert `%s`: it holds %s, which has no %s form" what (show t) inner holds)
           ~notes:
             [ (if holds = "SQL" then "a row is read into a struct whose fields are Int, Float, Str, Bool, Bytes, or an Option of one of those"
+               else if holds = "YAML" then "YAML holds Int, Float, Str, Bool, yaml.Node, Option, List, Map with Str keys, tuples, and structs and enums of those"
                else "JSON holds Int, Float, Str, Bool, json.Value, Option, List, Map with Str keys, tuples, and structs and enums of those") ]
         :: st.diags
     in
+    (* a use of `encode` or `decode` of json (or yaml: [m], [holds]) *)
+    let convert st m holds n (e : expr) =
+      let encode = n = jf st "encode" in
+      let what = m ^ (if encode then ".encode" else ".decode") in
+      match known st e what (if encode then "convert where the type is known, and pass the text" else sprintf "say the type: `let t: Todo = %s.decode(s)?`" m) with
+      | None -> ()
+      | Some t -> (
+        let key = what ^ " " ^ show t in
+        match Hashtbl.find_opt wrappers key with
+        | Some w -> e.edesc <- EVar w; e.einst <- []
+        | None -> (
+          try
+            let to_, from = coders st t in
+            let w = jf st (sprintf "%s$%d" (if encode then "encode" else "decode") (Hashtbl.length wrappers + 1)) in
+            let prm n t = { prm_name = n; prm_span = e.espan; prm_ty = t; prm_default = None; prm_mut = false } in
+            let body, params, ret =
+              if encode then (block st [] (call st (jf st (if plain st t then "stringify" else "write")) [ call st to_ [ var st "x" ] ]), [ prm "x" (written st t) ], written st TStr)
+              else (block st [] (call st (jf st "from_text") [ var st "s"; var st from ]), [ prm "s" (written st TStr) ], written st (TNamed ("Result", [ t; TStr ])))
+            in
+            st.out <- fn_item w e.espan params ret body :: st.out;
+            Hashtbl.replace wrappers key w;
+            e.edesc <- EVar w;
+            e.einst <- []
+          with Unsupported inner ->
+            (* a function held through a struct's fields is named by its path *)
+            let inner = match fn_via t with Some p when inner = "a function" -> sprintf "a function through `%s`" p | _ -> inner in
+            no_form st e what t inner holds))
+    in
     let visit (e : expr) =
       match e.edesc with
-      | EVar n when is_json n -> (
+      | EVar n when is_json n -> found := true; convert js "json" "JSON" n e
+      | EVar n when is_yaml n ->
         found := true;
-        let st = js in
-        let encode = n = jf st "encode" in
-        let what = if encode then "json.encode" else "json.decode" in
-        match known st e what (if encode then "convert where the type is known, and pass the text" else "say the type: `let t: Todo = json.decode(s)?`") with
-        | None -> ()
-        | Some t -> (
-          let key = what ^ " " ^ show t in
-          match Hashtbl.find_opt wrappers key with
-          | Some w -> e.edesc <- EVar w; e.einst <- []
-          | None -> (
-            try
-              let to_, from = coders st t in
-              let w = jf st (sprintf "%s$%d" (if encode then "encode" else "decode") (Hashtbl.length wrappers + 1)) in
-              let prm n t = { prm_name = n; prm_span = e.espan; prm_ty = t; prm_default = None; prm_mut = false } in
-              let body, params, ret =
-                if encode then (block st [] (call st (jf st (if plain st t then "stringify" else "write")) [ call st to_ [ var st "x" ] ]), [ prm "x" (written st t) ], written st TStr)
-                else (block st [] (call st (jf st "from_text") [ var st "s"; var st from ]), [ prm "s" (written st TStr) ], written st (TNamed ("Result", [ t; TStr ])))
-              in
-              st.out <- fn_item w e.espan params ret body :: st.out;
-              Hashtbl.replace wrappers key w;
-              e.edesc <- EVar w;
-              e.einst <- []
-            with Unsupported inner ->
-              (* a function held through a struct's fields is named by its path *)
-              let inner = match fn_via t with Some p when inner = "a function" -> sprintf "a function through `%s`" p | _ -> inner in
-              no_form st e what t inner "JSON")))
+        convert ys "yaml" "YAML" n e;
+        (* one list of problems for both, in source order *)
+        js.diags <- ys.diags @ js.diags;
+        ys.diags <- []
       | EVar n when row_module n <> None -> (
         found := true;
         let st = Option.get (row_module n) in
@@ -681,6 +699,6 @@ let expand ?json ?(rows = []) (items : item list) : (item list * Diag.t list) op
     if not !found then None
     else
       Some
-        ( items @ List.rev js.out @ List.concat_map (fun st -> List.rev st.out) rgs,
+        ( items @ List.rev js.out @ List.rev ys.out @ List.concat_map (fun st -> List.rev st.out) rgs,
           List.rev js.diags @ List.concat_map (fun st -> List.rev st.diags) rgs )
   end
