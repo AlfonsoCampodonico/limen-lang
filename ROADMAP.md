@@ -204,7 +204,11 @@ should run in a pod with a grant for the API server and nothing else, and
 
 - A `yaml` module, reading and writing the YAML that manifests are written
   in, with `yaml.encode` and `yaml.decode` written by the compiler as
-  `json`'s are.
+  `json`'s are (done).
+  - Still to do: a kubeconfig's hyphenated keys (`current-context`,
+    `certificate-authority-data`) cannot be decoded into struct fields,
+    because Limen has no field renaming, so kubeconfig support reads
+    `yaml.Node` directly.
 - In-cluster authentication: the pod's service-account token and CA
   certificate, and the kubeconfig outside a cluster, read through a granted
   `Fs`; TLS with a custom CA and client certificates.
