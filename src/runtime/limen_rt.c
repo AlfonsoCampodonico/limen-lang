@@ -955,15 +955,22 @@ W_RT WIo io_err(int kind, const char *m) { WIo r = { kind, NULL, Str_from(m, (in
 
 W_RT void lower_ascii(char *s) { for (; *s; s++) if (*s >= 'A' && *s <= 'Z') *s = (char)(*s + 32); }
 
-/* Parse "host", "host:port" or "*". port -1 = any. */
+/* Parse "host", "host:port" or "*". port -1 = any. The port is what follows
+   the last `:`; a host with a `:` in it is an IPv6 address and is kept in
+   brackets, as the requests' hosts are, so `fd00::1:443` and
+   `[fd00::1]:443` are the same entry. Mirrors Caps.parse_entry. */
 W_RT void parse_entry(const char *e, char *host, size_t hn, int *port) {
   const char *c = strrchr(e, ':');
   char *end;
+  int hl = (int)strlen(e);
+  *port = -1;
   if (c && c[1]) {
     long p = strtol(c + 1, &end, 10);
-    if (*end == 0) { snprintf(host, hn, "%.*s", (int)(c - e), e); *port = (int)p; lower_ascii(host); return; }
+    if (*end == 0) { hl = (int)(c - e); *port = (int)p; }
   }
-  snprintf(host, hn, "%s", e); *port = -1; lower_ascii(host);
+  if (hl > 0 && e[0] != '[' && memchr(e, ':', (size_t)hl)) snprintf(host, hn, "[%.*s]", hl, e);
+  else snprintf(host, hn, "%.*s", hl, e);
+  lower_ascii(host);
 }
 W_RT bool net_permits(WCap *n, const char *host, int port) {
   for (int i = 0; i < n->nhosts; i++) {

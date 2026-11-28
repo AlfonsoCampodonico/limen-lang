@@ -8856,6 +8856,63 @@ fn main(root: Root) -> Result[(), IoError] {
     Ok(())
 }
 |} "[204, 1]\n[1, 1]\nErr(Failed(\"malformed IPv6 address in URL\"))\nErr(Failed(\"malformed IPv6 address in URL\"))\nErr(Denied(\"net: [::2]:9 is not granted\"))\n";
+  (* A Net grant names an IPv6 host bare or in brackets, `::1:PORT` or
+     `[::1]:PORT`, as `$(KUBERNETES_SERVICE_HOST):$(KUBERNETES_SERVICE_PORT)`
+     expands to the first: either way it covers `only("[::1]:PORT")` (and
+     `only("::1:PORT")`), and the narrowed Net connects. *)
+  (let free_v6 () =
+     let s = Unix.socket Unix.PF_INET6 Unix.SOCK_STREAM 0 in
+     Unix.bind s (Unix.ADDR_INET (Unix.inet_addr_of_string "::1", 0));
+     let p = match Unix.getsockname s with Unix.ADDR_INET (_, p) -> p | _ -> 0 in
+     Unix.close s;
+     p
+   in
+   List.iter
+     (fun (tag, form) ->
+       let p = free_v6 () in
+       out ("net-ipv6-grant-" ^ tag)
+         ~grants:{ Interp.no_grants with listen = [ sprintf "[::1]:%d" p ]; net = [ form p ]; args = [ string_of_int p ] }
+         {|fn try(n: Net, addr: Str) -> Str {
+    match n.connect(addr) {
+        Ok(c) => {
+            c.close()
+            "connected"
+        },
+        Err(e) => "{e}",
+    }
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let port = root.args()[0]
+    let l = root.listen.on("[::1]:{port}")?
+    let narrow = root.net.only("[::1]:{port}")
+    let bare = root.net.only("::1:{port}")
+    let other = root.net.only("[::1]:1")
+    let r = group g {
+        g.go(|| {
+            let mut on = true
+            while on {
+                match l.accept() {
+                    Ok(c) => c.close(),
+                    Err(_) => {
+                        on = false
+                    },
+                }
+            }
+            ""
+        })
+        g.go(|| {
+            let got = [try(narrow, "[::1]:{port}"), try(bare, "[::1]:{port}"), try(root.net, "[::1]:{port}"), try(other, "[::1]:1")].join(" ")
+            l.close()
+            got
+        })
+    }
+    root.stdout.print(r[1])
+    Ok(())
+}
+|}
+         "connected connected connected Denied(\"net: [::1]:1 is not granted\")\n")
+     [ ("bare", sprintf "::1:%d"); ("bracketed", sprintf "[::1]:%d") ]);
   out "group-until-sockets" ~grants:{ Interp.no_grants with listen = [ "127.0.0.1:0" ]; net = [ "127.0.0.1" ] } {|fn main(root: Root) -> Result[(), IoError] {
     let clock = root.clock
     let net = root.net
