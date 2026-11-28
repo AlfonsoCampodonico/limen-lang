@@ -411,10 +411,23 @@ fn parse_events(s: Str) -> Result[Events, Str] {
         handles: [],
         prefixes: [],
     }
+    // each step's events move to lists of this function's own, so the
+    // field lists stay short (see Sc on why)
+    let mut events: List[Event] = []
+    let mut lines: List[Int] = []
+    let mut cols: List[Int] = []
     while p.state != 23 {
         p.step()?
+        if !p.out.events.is_empty() {
+            for (i, e) in p.out.events.with_index() {
+                events.push(e)
+                lines.push(p.out.lines[i])
+                cols.push(p.out.cols[i])
+            }
+            p.out = Events { events: [], lines: [], cols: [] }
+        }
     }
-    Ok(p.out)
+    Ok(Events { events, lines, cols })
 }
 
 // Internal, for the yaml-test-suite runner: the events of `s` in the
@@ -531,28 +544,43 @@ struct SKey {
     col: Int,
 }
 
-// The scanner: the text, where it is, the tokens so far, the indentation
-// of each block collection open (a stack, `ni` deep), the simple key of
-// each flow level and the `[` or `{` that opened each.
+// The scanner: the text, where it is, the tokens of the current step, the
+// indentation of each block collection open (a stack, `ni` deep), the
+// simple key of each flow level and the `[` or `{` that opened each.
+//
+// `toks` and `marks` hold only what one `fetch` produced: `scan` moves them
+// to a list of its own after each step. The interpreter copies a list that
+// is pushed to through a field, so a field list that kept every token would
+// make scanning quadratic there.
 struct Sc {
-    s: Str,
+    // the hot fields first: the interpreter finds a field by name, in order
+    i: Int,
     bs: List[Int],
     n: Int,
-    i: Int,
-    line: Int,
     col: Int,
-    toks: List[Token],
-    indent: Int,
-    indents: List[Int],
-    ni: Int,
     flow: Int,
-    keys: List[SKey],
-    opens: List[Token],
+    line: Int,
+    indent: Int,
     allowed: Bool,
+    // the byte where the current line starts (after a byte order mark)
+    ls: Int,
+    toks: List[Token],
+    // the kind of the last token
+    last: Int,
     // the number of tokens when the last was a quoted scalar or the end of
     // a flow collection, in flow context: a `:` straight after one is a
     // value indicator even with no space after it (a JSON-like key)
     adj: Int,
+    keys: List[SKey],
+    // how many tokens earlier steps produced
+    base: Int,
+    // simple keys found this step: the index of the key's first token and
+    // its `pre` (see Token)
+    marks: List[(Int, Int)],
+    s: Str,
+    indents: List[Int],
+    ni: Int,
+    opens: List[Token],
 }
 
 fn is_blank(b: Int) -> Bool {
@@ -614,47 +642,82 @@ fn adv(mut self: Sc) {
     if b == 10 {
         self.line = self.line + 1
         self.col = 0
+        self.ls = self.i
     } else if b < 128 || b >= 192 {
         self.col = self.col + 1
     }
 }
 
+// Past the rest of the line, up to its line break. A byte at a time
+// through `adv` costs a method call per byte in the interpreter; the line
+// holds no break, so only the column moves.
+fn to_eol(mut self: Sc) {
+    let mut j = self.i
+    let mut chars = 0
+    while j < self.n && self.bs[j] != 10 {
+        let b = self.bs[j]
+        if b < 128 || b >= 192 {
+            chars = chars + 1
+        }
+        j = j + 1
+    }
+    self.i = j
+    self.col = self.col + chars
+}
+
+// Past spaces and tabs.
+fn skip_blanks(mut self: Sc) {
+    let mut j = self.i
+    while j < self.n && (self.bs[j] == 32 || self.bs[j] == 9) {
+        j = j + 1
+    }
+    self.col = self.col + j - self.i
+    self.i = j
+}
+
 // `---` or `...` (three of byte `c`) here, followed by a space or the end
 // of the line.
 fn marker(self: Sc, c: Int) -> Bool {
-    self.cur() == c && self.at(1) == c && self.at(2) == c && is_blankz(self.at(3))
+    marker_at(self.bs, self.i, c)
 }
 
 fn tok(mut self: Sc, k: Int, line: Int, col: Int) {
     self.toks.push(Token { k, a: "", b: "", style: 0, line, col, pre: 0 })
+    self.last = k
 }
 
 fn tok_text(mut self: Sc, k: Int, a: Str, b: Str, style: Int, line: Int, col: Int) {
     self.toks.push(Token { k, a, b, style, line, col, pre: 0 })
+    self.last = k
 }
 
-// The spaces that start the current line, when everything before the
-// current position on it is spaces and tabs.
+// How many tokens there are so far, this step's included.
+fn count(self: Sc) -> Int {
+    self.base + self.toks.len()
+}
+
+// A byte order mark here.
+fn bom(self: Sc) -> Bool {
+    let i = self.i
+    i + 2 < self.n && self.bs[i] == 239 && self.bs[i + 1] == 187 && self.bs[i + 2] == 191
+}
+
+// The spaces that start the current line.
 fn line_spaces(self: Sc) -> Int {
-    let mut k = self.i - self.col
-    while k < self.n && self.bs[k] == 32 {
-        k = k + 1
-    }
-    k - (self.i - self.col)
+    spaces_at(self.bs, self.ls)
 }
 
 // Whether the rest of the line is spaces and tabs.
 fn blank_rest(self: Sc) -> Bool {
-    let mut k = self.i
-    while k < self.n && is_blank(self.bs[k]) {
-        k = k + 1
-    }
-    k >= self.n || self.bs[k] == 10
+    blank_rest_at(self.bs, self.i)
 }
 
-// Whether the text before byte `p` on its line is only spaces and block
-// indicators (`-`, `?`, `:` with a space after) and holds a tab: then the
-// tab is part of the line's indentation, where YAML allows only spaces.
+// Whether the text before byte `p` on its line is only spaces, tabs and
+// block indicators (`-`, `?`, `:` with a blank after), with a tab after one
+// of the indicators: `-\t- x`, `?\tkey: v`. That tab stands for the
+// indentation of the compact collection that starts at `p`, where YAML
+// allows only spaces. (A tab before a line's first token is checked in
+// skip_to_token.)
 fn tab_before(self: Sc, p: Int) -> Bool {
     let mut k = p - 1
     let mut tab = false
@@ -666,12 +729,15 @@ fn tab_before(self: Sc, p: Int) -> Bool {
             if k + 1 >= p || !is_blank(self.bs[k + 1]) {
                 return false
             }
+            if tab {
+                return true
+            }
         } else if b != 32 {
             return false
         }
         k = k - 1
     }
-    tab
+    false
 }
 
 // The tokens of `s`, all of them, with the KEY and BLOCK-MAPPING-START
@@ -686,29 +752,45 @@ fn scan(text: Str) -> Result[List[Token], Str] {
     }
     let bs = s.bytes()
     let mut sc = Sc {
-        s,
+        i: 0,
         bs,
         n: bs.len(),
-        i: 0,
-        line: 0,
         col: 0,
-        toks: [],
+        flow: 0,
+        line: 0,
         indent: -1,
+        allowed: true,
+        ls: 0,
+        toks: [],
+        last: -1,
+        adj: -1,
+        keys: [SKey { possible: false, required: false, tok: 0, pos: 0, line: 0, col: 0 }],
+        base: 0,
+        marks: [],
+        s,
         indents: [],
         ni: 0,
-        flow: 0,
-        keys: [SKey { possible: false, required: false, tok: 0, pos: 0, line: 0, col: 0 }],
         opens: [],
-        allowed: true,
-        adj: -1,
     }
     sc.tok(0, 0, 0)
+    let mut all: List[Token] = []
     let mut done = false
     while !done {
         done = sc.fetch()?
+        for t in sc.toks {
+            all.push(t)
+        }
+        sc.base = all.len()
+        sc.toks = []
+        if !sc.marks.is_empty() {
+            for (k, pre) in sc.marks {
+                all[k].pre = pre
+            }
+            sc.marks = []
+        }
     }
     let mut out: List[Token] = []
-    for t in sc.toks {
+    for t in all {
         if t.pre == 2 {
             out.push(Token { k: 7, a: "", b: "", style: 0, line: t.line, col: t.col, pre: 0 })
         }
@@ -726,11 +808,17 @@ fn fetch(mut self: Sc) -> Result[Bool, Str] {
     self.stale_keys()?
     self.unroll(self.col)
     let b = self.cur()
+    let b1 = self.at(1)
     if b == -1 {
         self.stream_end()?
         return Ok(true)
     }
-    if self.col == 0 && b == 37 {
+    if (b > 96 && b < 123) || (b > 64 && b < 91) || (b > 47 && b < 58) {
+        // the usual start of a plain scalar, tested first
+        self.save_key()?
+        self.allowed = false
+        self.plain()?
+    } else if self.col == 0 && b == 37 {
         self.directive()?
     } else if self.col == 0 && self.marker(45) {
         self.doc_marker(4)?
@@ -749,11 +837,11 @@ fn fetch(mut self: Sc) -> Result[Bool, Str] {
         self.allowed = true
         self.tok(14, self.line, self.col)
         self.adv()
-    } else if b == 45 && is_blankz(self.at(1)) {
+    } else if b == 45 && is_blankz(b1) {
         self.block_entry()?
-    } else if b == 63 && (is_blankz(self.at(1)) || (self.flow > 0 && is_flow_ind(self.at(1)))) {
+    } else if b == 63 && (is_blankz(b1) || (self.flow > 0 && is_flow_ind(b1))) {
         self.key()?
-    } else if b == 58 && (is_blankz(self.at(1)) || (self.flow > 0 && (is_flow_ind(self.at(1)) || self.toks.len() == self.adj))) {
+    } else if b == 58 && (is_blankz(b1) || (self.flow > 0 && (is_flow_ind(b1) || self.count() == self.adj))) {
         self.value()?
     } else if b == 42 || b == 38 {
         self.anchor(if b == 42 { 17 } else { 18 })?
@@ -770,9 +858,9 @@ fn fetch(mut self: Sc) -> Result[Bool, Str] {
         self.allowed = false
         self.quoted(b == 39)?
         if self.flow > 0 {
-            self.adj = self.toks.len()
+            self.adj = self.count()
         }
-    } else if !is_indicator(b) || ((b == 45 || b == 63 || b == 58) && !is_blankz(self.at(1)) && (self.flow == 0 || !is_flow_ind(self.at(1)))) {
+    } else if !is_indicator(b) || ((b == 45 || b == 63 || b == 58) && !is_blankz(b1) && (self.flow == 0 || !is_flow_ind(b1))) {
         self.save_key()?
         self.allowed = false
         self.plain()?
@@ -782,20 +870,37 @@ fn fetch(mut self: Sc) -> Result[Bool, Str] {
     Ok(false)
 }
 
-// Past spaces, tabs, comments and line breaks to the next token.
+// Past spaces, tabs, comments and line breaks to the next token. In block
+// context a tab may not stand for indentation: one that comes before the
+// first token of a line, with no more spaces before it than the current
+// indentation, is an error (a line of only blanks or a comment is fine).
 fn skip_to_token(mut self: Sc) -> Result[(), Str] {
     let mut crossed = false
     while true {
-        while is_blank(self.cur()) {
-            self.adv()
+        if self.bom() {
+            self.skip_bom()?
+        }
+        // the spaces before the line's first tab, -1 for no tab
+        let mut tab_spaces = -1
+        let mut tab_col = 0
+        let mut j = self.i
+        while j < self.n && (self.bs[j] == 32 || self.bs[j] == 9) {
+            if self.bs[j] == 9 && tab_spaces < 0 {
+                tab_spaces = self.line_spaces()
+                tab_col = self.col + j - self.i
+            }
+            j = j + 1
+        }
+        self.col = self.col + j - self.i
+        self.i = j
+        if crossed && self.flow == 0 && tab_spaces >= 0 && tab_spaces <= self.indent && self.cur() != 35 && self.cur() != 10 && self.cur() != -1 {
+            return Err(err_at(self.line, tab_col, "tabs are not allowed in indentation"))
         }
         if self.cur() == 35 {
-            if self.i > 0 && !is_blankz(self.bs[self.i - 1]) {
+            if self.i > self.ls && !is_blankz(self.bs[self.i - 1]) {
                 return Err(self.here("a comment must be separated from what comes before it by a space"))
             }
-            while self.cur() != 10 && self.cur() != -1 {
-                self.adv()
-            }
+            self.to_eol()
         }
         if self.cur() == 10 {
             self.adv()
@@ -810,6 +915,22 @@ fn skip_to_token(mut self: Sc) -> Result[(), Str] {
     if crossed && self.flow > 0 && self.cur() != -1 && self.line_spaces() <= self.indent {
         return Err(self.unclosed())
     }
+    if self.bom() {
+        return Err(self.here("a byte order mark inside a document"))
+    }
+    Ok(())
+}
+
+// Past the byte order mark here. One may start a line before a document:
+// at the start of the stream, after `...`, or before `---`, `...` or a
+// directive on its own line; anywhere else it is an error.
+fn skip_bom(mut self: Sc) -> Result[(), Str] {
+    let between = self.last == 0 || self.last == 5
+    if self.col != 0 || self.flow > 0 || !(between || bom_line_at(self.bs, self.i)) {
+        return Err(self.here("a byte order mark inside a document"))
+    }
+    self.i = self.i + 3
+    self.ls = self.i
     Ok(())
 }
 
@@ -819,11 +940,14 @@ fn skip_to_token(mut self: Sc) -> Result[(), Str] {
 fn unclosed(self: Sc) -> Str {
     let o = self.opens[self.flow - 1]
     let what = if o.k == 9 { "sequence" } else { "mapping" }
-    err_at(o.line, o.col, "this flow {what} is not closed before line {self.line + 1}, which is not indented inside it")
+    err_at(o.line, o.col, "line {self.line + 1} is not indented enough to be inside the flow {what} that opens here")
 }
 
 // A simple key must be on one line and at most 1024 bytes long.
 fn stale_keys(mut self: Sc) -> Result[(), Str] {
+    if self.flow == 0 && !self.keys[0].possible {
+        return Ok(())
+    }
     for l in 0..<self.flow + 1 {
         let k = self.keys[l]
         // a key in a flow mapping may take more than a line
@@ -842,17 +966,19 @@ fn save_key(mut self: Sc) -> Result[(), Str] {
     if self.allowed {
         self.remove_key()?
         let required = self.flow == 0 && self.indent == self.col
-        self.keys[self.flow] = SKey { possible: true, required, tok: self.toks.len(), pos: self.i, line: self.line, col: self.col }
+        self.keys[self.flow] = SKey { possible: true, required, tok: self.count(), pos: self.i, line: self.line, col: self.col }
     }
     Ok(())
 }
 
 fn remove_key(mut self: Sc) -> Result[(), Str] {
     let k = self.keys[self.flow]
-    if k.possible && k.required {
-        return Err(err_at(k.line, k.col, "could not find expected ':'"))
+    if k.possible {
+        if k.required {
+            return Err(err_at(k.line, k.col, "could not find expected ':'"))
+        }
+        self.keys[self.flow].possible = false
     }
-    self.keys[self.flow].possible = false
     Ok(())
 }
 
@@ -915,9 +1041,7 @@ fn doc_marker(mut self: Sc, k: Int) -> Result[(), Str] {
     self.adv()
     self.tok(k, line, col)
     if k == 5 {
-        while is_blank(self.cur()) {
-            self.adv()
-        }
+        self.skip_blanks()
         if self.cur() != 35 && self.cur() != 10 && self.cur() != -1 {
             return Err(self.here("nothing but a comment may follow `...` on its line"))
         }
@@ -931,6 +1055,7 @@ fn flow_start(mut self: Sc, k: Int) -> Result[(), Str] {
         return Err(self.here("nested deeper than {max_depth()}"))
     }
     let t = Token { k, a: "", b: "", style: 0, line: self.line, col: self.col, pre: 0 }
+    self.last = k
     if self.flow < self.opens.len() {
         self.opens[self.flow] = t
     } else {
@@ -958,7 +1083,7 @@ fn flow_end(mut self: Sc, k: Int) -> Result[(), Str] {
     self.tok(k, self.line, self.col)
     self.adv()
     if self.flow > 0 {
-        self.adj = self.toks.len()
+        self.adj = self.count()
     }
     Ok(())
 }
@@ -1014,7 +1139,7 @@ fn value(mut self: Sc) -> Result[(), Str] {
             return Err(err_at(k.line, k.col, "tabs are not allowed in indentation"))
         }
         let opened = self.roll(k.col)?
-        self.toks[k.tok].pre = if opened { 2 } else { 1 }
+        self.marks.push((k.tok, if opened { 2 } else { 1 }))
         self.keys[self.flow].possible = false
         self.allowed = false
     } else {
@@ -1147,9 +1272,7 @@ fn directive(mut self: Sc) -> Result[(), Str] {
         if !is_blank(self.cur()) {
             return Err(self.here("expected a space after %{name}"))
         }
-        while is_blank(self.cur()) {
-            self.adv()
-        }
+        self.skip_blanks()
     }
     if name == "YAML" {
         let v0 = self.i
@@ -1190,9 +1313,7 @@ fn directive(mut self: Sc) -> Result[(), Str] {
         if !is_blank(self.cur()) {
             return Err(self.here("expected a space after the tag handle"))
         }
-        while is_blank(self.cur()) {
-            self.adv()
-        }
+        self.skip_blanks()
         let prefix = self.uri(true)?
         if prefix == "" || !is_blankz(self.cur()) {
             return Err(self.here("expected a tag prefix"))
@@ -1204,13 +1325,9 @@ fn directive(mut self: Sc) -> Result[(), Str] {
             self.adv()
         }
     }
-    while is_blank(self.cur()) {
-        self.adv()
-    }
+    self.skip_blanks()
     if self.cur() == 35 {
-        while self.cur() != 10 && self.cur() != -1 {
-            self.adv()
-        }
+        self.to_eol()
     }
     if self.cur() != 10 && self.cur() != -1 {
         return Err(self.here("expected a comment or a line break after a directive"))
@@ -1220,66 +1337,91 @@ fn directive(mut self: Sc) -> Result[(), Str] {
 
 // A plain scalar. It goes on over lines indented more than the block it is
 // in; each line break between lines folds to a space, and each empty line
-// to a line break.
+// to a line break. The position is kept in local variables and written back
+// at the end: field reads and writes cost more in the interpreter.
 fn plain(mut self: Sc) -> Result[(), Str] {
-    let line = self.line
-    let col = self.col
+    let line0 = self.line
+    let col0 = self.col
     let ind = self.indent + 1
+    let flow = self.flow > 0
+    let bs = self.bs
+    let n = self.n
+    let mut j = self.i
+    let mut col = self.col
+    let mut line = self.line
+    let mut ls = self.ls
     let mut parts: List[Str] = []
     let mut leading = false
     let mut ws0 = 0
     let mut ws1 = 0
     let mut breaks = 0
     while true {
-        if self.col == 0 && (self.marker(45) || self.marker(46)) {
+        if col == 0 && (marker_at(bs, j, 45) || marker_at(bs, j, 46) || bom_line_at(bs, j)) {
             break
         }
-        if self.cur() == 35 {
+        if j < n && bs[j] == 35 {
             break
         }
-        let mut run = -1
-        while !is_blankz(self.cur()) {
-            let b = self.cur()
+        // the run of content from here: it holds no line break
+        let run = j
+        // the bytes that continue a UTF-8 character, which take no column
+        let mut cont = 0
+        while j < n {
+            let b = bs[j]
+            // letters and digits first: they never end the run
+            if (b > 96 && b < 123) || (b > 64 && b < 91) || (b > 47 && b < 58) {
+                j = j + 1
+                continue
+            }
+            if b == 32 || b == 9 || b == 10 {
+                break
+            }
             if b == 58 {
-                let c = self.at(1)
-                if is_blankz(c) || (self.flow > 0 && is_flow_ind(c)) {
+                let c = if j + 1 < n { bs[j + 1] } else { -1 }
+                if is_blankz(c) || (flow && is_flow_ind(c)) {
                     break
                 }
             }
-            if self.flow > 0 && is_flow_ind(b) {
+            if flow && is_flow_ind(b) {
                 break
             }
-            if run < 0 {
-                if leading {
-                    parts.push(if breaks == 0 { " " } else { newlines(breaks) })
-                    leading = false
-                    breaks = 0
-                } else if ws1 > ws0 {
-                    parts.push(self.s.slice(ws0, ws1))
-                }
-                ws0 = 0
-                ws1 = 0
-                run = self.i
+            if b == 239 && j + 2 < n && bs[j + 1] == 187 && bs[j + 2] == 191 {
+                return Err(err_at(line, col + j - run - cont, "a byte order mark inside a document"))
             }
-            self.adv()
+            if b >= 128 && b < 192 {
+                cont = cont + 1
+            }
+            j = j + 1
         }
-        if run >= 0 {
-            parts.push(self.s.slice(run, self.i))
+        if j > run {
+            if leading {
+                parts.push(if breaks == 0 { " " } else { newlines(breaks) })
+                leading = false
+                breaks = 0
+            } else if ws1 > ws0 {
+                parts.push(self.s.slice(ws0, ws1))
+            }
+            ws0 = 0
+            ws1 = 0
+            col = col + j - run - cont
+            parts.push(self.s.slice(run, j))
         }
-        if !is_blank(self.cur()) && self.cur() != 10 {
+        if j >= n || (bs[j] != 32 && bs[j] != 9 && bs[j] != 10) {
             break
         }
-        while is_blank(self.cur()) || self.cur() == 10 {
-            if is_blank(self.cur()) {
-                if leading && self.col < ind && self.cur() == 9 && !self.blank_rest() {
-                    return Err(self.here("tabs are not allowed in indentation"))
+        while j < n && (bs[j] == 32 || bs[j] == 9 || bs[j] == 10) {
+            let c = bs[j]
+            if c != 10 {
+                if leading && col < ind && c == 9 && !blank_rest_at(bs, j) {
+                    return Err(err_at(line, col, "tabs are not allowed in indentation"))
                 }
                 if !leading {
                     if ws1 == ws0 {
-                        ws0 = self.i
+                        ws0 = j
                     }
-                    ws1 = self.i + 1
+                    ws1 = j + 1
                 }
+                col = col + 1
             } else {
                 if !leading {
                     ws0 = 0
@@ -1288,21 +1430,65 @@ fn plain(mut self: Sc) -> Result[(), Str] {
                 } else {
                     breaks = breaks + 1
                 }
+                line = line + 1
+                col = 0
+                ls = j + 1
             }
-            self.adv()
+            j = j + 1
         }
-        if leading && self.flow > 0 && self.cur() != -1 && self.line_spaces() <= self.indent {
+        if leading && flow && j < n && spaces_at(bs, ls) <= self.indent {
+            self.i = j
+            self.col = col
+            self.line = line
+            self.ls = ls
             return Err(self.unclosed())
         }
-        if self.flow == 0 && self.col < ind {
+        if !flow && col < ind {
             break
         }
     }
-    self.tok_text(20, parts.join(""), "", 1, line, col)
+    self.i = j
+    self.col = col
+    self.line = line
+    self.ls = ls
+    let text = if parts.len() == 1 { parts[0] } else { parts.join("") }
+    self.tok_text(20, text, "", 1, line0, col0)
     if leading {
         self.allowed = true
     }
     Ok(())
+}
+
+// `---` or `...` (three of byte `c`) at byte `j` of `bs`, followed by a
+// space or the end of the line.
+fn marker_at(bs: List[Int], j: Int, c: Int) -> Bool {
+    let n = bs.len()
+    j + 2 < n && bs[j] == c && bs[j + 1] == c && bs[j + 2] == c && (j + 3 >= n || is_blankz(bs[j + 3]))
+}
+
+// A byte order mark at byte `j` followed by `---`, `...` or a directive:
+// the start of a new document.
+fn bom_line_at(bs: List[Int], j: Int) -> Bool {
+    let n = bs.len()
+    j + 3 < n && bs[j] == 239 && bs[j + 1] == 187 && bs[j + 2] == 191 && (bs[j + 3] == 37 || marker_at(bs, j + 3, 45) || marker_at(bs, j + 3, 46))
+}
+
+// Whether the rest of the line from byte `j` is spaces and tabs.
+fn blank_rest_at(bs: List[Int], j: Int) -> Bool {
+    let mut k = j
+    while k < bs.len() && is_blank(bs[k]) {
+        k = k + 1
+    }
+    k >= bs.len() || bs[k] == 10
+}
+
+// The spaces from byte `j` on.
+fn spaces_at(bs: List[Int], j: Int) -> Int {
+    let mut k = j
+    while k < bs.len() && bs[k] == 32 {
+        k = k + 1
+    }
+    k - j
 }
 
 // A single- or double-quoted scalar.
@@ -1500,13 +1686,9 @@ fn block_scalar(mut self: Sc, literal: Bool) -> Result[(), Str] {
     if !is_blankz(self.cur()) {
         return Err(self.here("expected a comment or a line break after a block scalar's header"))
     }
-    while is_blank(self.cur()) {
-        self.adv()
-    }
+    self.skip_blanks()
     if self.cur() == 35 {
-        while self.cur() != 10 && self.cur() != -1 {
-            self.adv()
-        }
+        self.to_eol()
     }
     if self.cur() == -1 {
         self.tok_text(20, "", "", if literal { 4 } else { 5 }, line, col)
@@ -1539,9 +1721,7 @@ fn block_scalar(mut self: Sc, literal: Bool) -> Result[(), Str] {
         }
         leading_blank = trailing_blank
         let run = self.i
-        while self.cur() != 10 && self.cur() != -1 {
-            self.adv()
-        }
+        self.to_eol()
         parts.push(self.s.slice(run, self.i))
         // the end of the input ends the last line as a line break would
         leading_nl = true
@@ -1624,6 +1804,7 @@ fn block_breaks(mut self: Sc, ind: Int, min: Int) -> Result[(Int, Int), Str] {
 struct Ps {
     toks: List[Token],
     p: Int,
+    // the events of the current step
     out: Events,
     state: Int,
     states: List[Int],

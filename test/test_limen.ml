@@ -12884,18 +12884,65 @@ fn main(root: Root) -> Result[(), IoError] {
   (let show =
      "use yaml\n\nfn show(out: Stdout, s: Str) {\n    match yaml.events_text(s) {\n        Ok(t) => out.print(t),\n        Err(e) => out.print(\"error: \" + e),\n    }\n}\n\n"
    in
+   (* a tab before a line's first token, with no more spaces before it
+      than the current indentation, is indentation, which YAML allows only
+      spaces for; a tab after enough spaces, a line of only blanks and a tab
+      after a block indicator before a plain scalar are separation *)
+   let lines =
+     {|use yaml
+
+fn show(out: Stdout, s: Str) {
+    match yaml.events_text(s) {
+        Ok(t) => out.print(t.replace("\n", " ")),
+        Err(e) => out.print("error: " + e),
+    }
+}
+
+fn main(root: Root) {
+    for s in [|} in
    out "yaml-tab-indent"
-     (show ^ "fn main(root: Root) {\n    show(root.stdout, \"a:\\n\\tb: 1\\n\")\n    show(root.stdout, \"- a\\n\\t- b\\n\")\n    show(root.stdout, \"a:\\n \\tb\\n\")\n}\n")
-     "error: line 2, column 2: tabs are not allowed in indentation\n\
+     (lines
+     ^ {|"a:\n\tb: 1\n", "- a\n\t- b\n", "a:\n\tb\n", "a:\n\t\"b\"\n", "a: b\n\tc\n", "a:\n  b: 1\n \t c: 2\n", "-\t- a\n", "a:\n \tb\n", "a: 1\n\t\nb: 2\n", "\t[a]\n", "-\t-1\n"] {
+        show(root.stdout, s)
+    }
+}
+|})
+     "error: line 2, column 1: tabs are not allowed in indentation\n\
       error: line 2, column 1: tabs are not allowed in indentation\n\
-      +STR\n+DOC\n+MAP\n=VAL :a\n=VAL :b\n-MAP\n-DOC\n-STR\n\n";
+      error: line 2, column 1: tabs are not allowed in indentation\n\
+      error: line 2, column 1: tabs are not allowed in indentation\n\
+      error: line 2, column 1: tabs are not allowed in indentation\n\
+      error: line 3, column 2: tabs are not allowed in indentation\n\
+      error: line 1, column 3: tabs are not allowed in indentation\n\
+      +STR +DOC +MAP =VAL :a =VAL :b -MAP -DOC -STR \n\
+      +STR +DOC +MAP =VAL :a =VAL :1 =VAL :b =VAL :2 -MAP -DOC -STR \n\
+      +STR +DOC +SEQ [] =VAL :a -SEQ -DOC -STR \n\
+      +STR +DOC +SEQ =VAL :-1 -SEQ -DOC -STR \n";
+   (* a byte order mark may start the stream and each document after `...`,
+      or stand before `---`, `...` or a directive; inside a document it is
+      an error *)
+   out "yaml-bom-docs"
+     (lines
+     ^ {|"a\n...\n\u{feff}b\n", "a\n\u{feff}--- b\n", "\u{feff}%YAML 1.2\n--- a\n...\n\u{feff}%YAML 1.2\n--- b\n", "a: 1\n\u{feff}b: 2\n", "a: x\u{feff}y\n", "- \u{feff}a\n", "a\n...\n\u{feff}# c\nb\n"] {
+        show(root.stdout, s)
+    }
+}
+|})
+     "+STR +DOC =VAL :a -DOC ... +DOC =VAL :b -DOC -STR \n\
+      +STR +DOC =VAL :a -DOC +DOC --- =VAL :b -DOC -STR \n\
+      +STR +DOC --- =VAL :a -DOC ... +DOC --- =VAL :b -DOC -STR \n\
+      error: line 2, column 1: a byte order mark inside a document\n\
+      error: line 1, column 5: a byte order mark inside a document\n\
+      error: line 1, column 3: a byte order mark inside a document\n\
+      +STR +DOC =VAL :a -DOC ... +DOC =VAL :b -DOC -STR \n";
    out "yaml-bom-crlf"
      "use yaml\n\nfn main(root: Root) {\n    let crlf = yaml.events_text(\"\\u{feff}a: 1\\r\\nb:\\r\\n  - x\\r\\n  - \\\"y\\r\\n    z\\\"\\r\\n  - |\\r\\n    l1\\r\\n    l2\\r\\n\")\n    let lf = yaml.events_text(\"a: 1\\nb:\\n  - x\\n  - \\\"y\\n    z\\\"\\n  - |\\n    l1\\n    l2\\n\")\n    root.stdout.print(\"{crlf == lf}\")\n    match lf {\n        Ok(t) => root.stdout.print(t),\n        Err(e) => root.stdout.print(e),\n    }\n}\n"
      "true\n+STR\n+DOC\n+MAP\n=VAL :a\n=VAL :1\n=VAL :b\n+SEQ\n=VAL :x\n=VAL \"y z\n=VAL |l1\\nl2\\n\n-SEQ\n-MAP\n-DOC\n-STR\n\n";
    out "yaml-error-position"
-     (show ^ "fn main(root: Root) {\n    show(root.stdout, \"a: [1, 2\\n\")\n    show(root.stdout, \"a:\\n  b: [1,\\n     2\\nc: 3\\n\")\n    show(root.stdout, \"x: \\\"open\\n\")\n}\n")
+     (show ^ "fn main(root: Root) {\n    show(root.stdout, \"a: [1, 2\\n\")\n    show(root.stdout, \"a:\\n  b: [1,\\n     2\\nc: 3\\n\")\n    show(root.stdout, \"x:\\n  - a: [1,\\n    2]\\n\")\n    show(root.stdout, \"x: \\\"open\\n\")\n}\n")
      "error: line 1, column 4: this flow sequence is never closed\n\
-      error: line 2, column 6: this flow sequence is not closed before line 4, which is not indented inside it\n\
+      error: line 2, column 6: line 4 is not indented enough to be inside the flow sequence that opens here\n\
+      error: line 2, column 8: line 3 is not indented enough to be inside the flow sequence that opens here\n\
       error: line 1, column 4: this quoted scalar is never closed\n";
    out "yaml-depth"
      (show ^ "fn nest(open: Str, close: Str, n: Int) -> Str {\n    let mut xs: List[Str] = []\n    for _ in 0..<n {\n        xs.push(open)\n    }\n    for _ in 0..<n {\n        xs.push(close)\n    }\n    xs.join(\"\")\n}\n\nfn main(root: Root) {\n    root.stdout.print(\"{yaml.events_text(nest(\"[\", \"]\", 512)).is_ok()} {yaml.events_text(nest(\"- \", \"\", 512) + \"x\").is_ok()}\")\n    show(root.stdout, nest(\"[\", \"]\", 513))\n    show(root.stdout, nest(\"\\{\", \"\\}\", 513))\n    show(root.stdout, nest(\"- \", \"\", 513) + \"x\\n\")\n}\n")
