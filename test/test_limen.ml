@@ -14530,7 +14530,12 @@ fn main(root: Root) -> Result[(), IoError] {
 }
 |}
      {|hello-site.yaml: StaticSite hello
-staticsite-crd.yaml: CustomResourceDefinition staticsites.lmn.dev
+operator.yaml: Namespace limen-system
+operator.yaml: ServiceAccount site-operator
+operator.yaml: ClusterRole limen-site-operator
+operator.yaml: ClusterRoleBinding limen-site-operator
+operator.yaml: Deployment site-operator
+staticsite-crd.yaml: CustomResourceDefinition staticsites.limen.dev
 Int(1) Seq([Str("site")])
 ["<!doctype html>", "<title>hello</title>", "<h1>Served by a Limen operator</h1>"]
 Some("kind-dev") Some("https://127.0.0.1:6443") Some("admin") Some("abc.def")
