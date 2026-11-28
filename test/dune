@@ -5,6 +5,7 @@
   ../bin/main.exe
   ffi_test.c
   (glob_files %{project_root}/examples/*.lmn)
+  (glob_files %{project_root}/examples/k8s/*.yaml)
   (glob_files %{project_root}/bench/*.lmn)
   (glob_files %{project_root}/selfhost/*.lmn)
   (glob_files tls/*.pem)

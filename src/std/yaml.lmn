@@ -1,6 +1,7 @@
-// YAML 1.2, core schema. The scanner and parser (text to the spec's event
-// stream) are written; the composer, stringify and the JSON conversions are
-// still stubs.
+// YAML 1.2, core schema: text to nodes (`parse`, `parse_all`), the nodes'
+// accessors, and conversions to and from `json.Value`. A scanner and parser
+// turn the text into the spec's event stream, and a composer turns events
+// into nodes. None of them recurses once per level of nesting.
 use hex
 use json
 
@@ -23,14 +24,16 @@ pub struct Pair {
     value: Node,
 }
 
-// The one document in `s`.
+// The one document in `s`: `Null` for a stream with none, an error for
+// more than one (read those with `parse_all`).
 pub fn parse(s: Str) -> Result[Node, Str] {
-    Err("not yet")
+    let docs = compose(s, true)?
+    Ok(docs.get(0) ?? Null)
 }
 
 // Every document in `s`, in order.
 pub fn parse_all(s: Str) -> Result[List[Node], Str] {
-    Err("not yet")
+    compose(s, false)
 }
 
 // `n` as YAML text.
@@ -38,30 +41,326 @@ pub fn stringify(n: Node) -> Str {
     ""
 }
 
-// `n` as a JSON value, or why it has none (a key that is not a string).
-pub fn to_json(n: Node) -> Result[json.Value, Str] {
-    Err("not yet")
+// ---------- reading nodes (methods on Node) ----------
+
+// The value of the key that is the string `key` in a mapping: `n.get("kind")`.
+// `parse` refuses a mapping that repeats a key; in one built with a key
+// twice, the first wins.
+pub fn get(self: Node, key: Str) -> Option[Node] {
+    match self {
+        Map(pairs) => {
+            for p in pairs {
+                match p.key {
+                    Str(k) if k == key => {
+                        return Some(p.value)
+                    },
+                    _ => {},
+                }
+            }
+            None
+        },
+        _ => None,
+    }
 }
 
-// `v` as a node.
+// Item `i` of a sequence.
+pub fn at(self: Node, i: Int) -> Option[Node] {
+    match self {
+        Seq(items) => items.get(i),
+        _ => None,
+    }
+}
+
+pub fn as_str(self: Node) -> Option[Str] {
+    match self {
+        Str(s) => Some(s),
+        _ => None,
+    }
+}
+
+// An `Int`, or a `Float` that is a whole number.
+pub fn as_int(self: Node) -> Option[Int] {
+    match self {
+        Int(n) => Some(n),
+        Float(x) => if x.abs() < 9223372036854775807.0 && x == x.to_int().to_float() { Some(x.to_int()) } else { None },
+        _ => None,
+    }
+}
+
+// A `Float`, or an `Int` as one.
+pub fn as_float(self: Node) -> Option[Float] {
+    match self {
+        Float(x) => Some(x),
+        Int(n) => Some(n.to_float()),
+        _ => None,
+    }
+}
+
+pub fn as_bool(self: Node) -> Option[Bool] {
+    match self {
+        Bool(b) => Some(b),
+        _ => None,
+    }
+}
+
+pub fn as_seq(self: Node) -> Option[List[Node]] {
+    match self {
+        Seq(items) => Some(items),
+        _ => None,
+    }
+}
+
+// A mapping's pairs, in source order.
+pub fn pairs(self: Node) -> Option[List[Pair]] {
+    match self {
+        Map(pairs) => Some(pairs),
+        _ => None,
+    }
+}
+
+// ---------- JSON ----------
+
+// `xs[i] = x`, or a push when `i` is just past the end: for stacks whose
+// slots are reused.
+fn put[T](mut xs: List[T], i: Int, x: T) {
+    if i < xs.len() {
+        xs[i] = x
+    } else {
+        xs.push(x)
+    }
+}
+
+// `n` as a JSON value: a sequence is an array, a mapping an object, a
+// `Float` a `Num`. A mapping with a key that is not a string, and a
+// `Tagged` node, have none, and give an error with a fixed message.
+//
+// The sequences and mappings being converted are kept in lists rather than
+// by recursion: for each open one, its items, the next one, and where its
+// converted items start in one list of values that all of them share.
+pub fn to_json(n: Node) -> Result[json.Value, Str] {
+    let mut is_map: List[Bool] = []
+    let mut items: List[List[Node]] = []
+    let mut pairs: List[List[Pair]] = []
+    let mut ats: List[Int] = []
+    let mut starts: List[Int] = []
+    let mut depth = 0
+    let mut vals: List[json.Value] = []
+    let mut top = 0
+    let mut next = n
+    while true {
+        let mut v = json.Null
+        let mut opened = false
+        match next {
+            Null => {},
+            Bool(b) => {
+                v = json.Bool(b)
+            },
+            Int(k) => {
+                v = json.Int(k)
+            },
+            Float(x) => {
+                v = json.Num(x)
+            },
+            Str(s) => {
+                v = json.Str(s)
+            },
+            Tagged(_, _) => {
+                return Err("a tagged node has no JSON form")
+            },
+            Seq(xs) => if xs.is_empty() {
+                v = json.Arr([])
+            } else {
+                put(mut is_map, depth, false)
+                put(mut items, depth, xs)
+                put(mut pairs, depth, [])
+                put(mut ats, depth, 0)
+                put(mut starts, depth, top)
+                depth = depth + 1
+                opened = true
+            },
+            Map(ps) => if ps.is_empty() {
+                v = json.Obj([])
+            } else {
+                put(mut is_map, depth, true)
+                put(mut items, depth, [])
+                put(mut pairs, depth, ps)
+                put(mut ats, depth, 0)
+                put(mut starts, depth, top)
+                depth = depth + 1
+                opened = true
+            },
+        }
+        if !opened {
+            // `v` is whole: add it to the one it is in, closing each that
+            // has nothing left
+            while true {
+                if depth == 0 {
+                    return Ok(v)
+                }
+                let d = depth - 1
+                put(mut vals, top, v)
+                top = top + 1
+                ats[d] = ats[d] + 1
+                let len = if is_map[d] { pairs[d].len() } else { items[d].len() }
+                if ats[d] < len {
+                    break
+                }
+                let s = starts[d]
+                if is_map[d] {
+                    let mut fields: List[json.Field] = []
+                    for j in s..<top {
+                        fields.push(json.field(json_key(pairs[d][j - s].key) ?? "", vals[j]))
+                        vals[j] = json.Null
+                    }
+                    v = json.Obj(fields)
+                } else {
+                    let mut arr: List[json.Value] = []
+                    for j in s..<top {
+                        arr.push(vals[j])
+                        vals[j] = json.Null
+                    }
+                    v = json.Arr(arr)
+                }
+                top = s
+                items[d] = []
+                pairs[d] = []
+                depth = d
+            }
+        }
+        // the next item of the innermost open one
+        let d = depth - 1
+        let at = ats[d]
+        if is_map[d] {
+            if json_key(pairs[d][at].key) == None {
+                return Err("a map key that is not a string has no JSON form")
+            }
+            next = pairs[d][at].value
+        } else {
+            next = items[d][at]
+        }
+    }
+    // not reached: the loop ends only by returning
+    Err("a map key that is not a string has no JSON form")
+}
+
+fn json_key(k: Node) -> Option[Str] {
+    match k {
+        Str(s) => Some(s),
+        _ => None,
+    }
+}
+
+// `v` as a node: an array is a sequence, an object a mapping with string
+// keys, a `Num` a `Float`. Kept in lists as `to_json` is, so any depth is
+// fine.
 pub fn from_json(v: json.Value) -> Node {
+    let mut is_obj: List[Bool] = []
+    let mut items: List[List[json.Value]] = []
+    let mut fields: List[List[json.Field]] = []
+    let mut ats: List[Int] = []
+    let mut starts: List[Int] = []
+    let mut depth = 0
+    let mut nodes: List[Node] = []
+    let mut top = 0
+    let mut next = v
+    while true {
+        let mut n = Null
+        let mut opened = false
+        match next {
+            Null => {},
+            Bool(b) => {
+                n = Bool(b)
+            },
+            Int(k) => {
+                n = Int(k)
+            },
+            Num(x) => {
+                n = Float(x)
+            },
+            Str(s) => {
+                n = Str(s)
+            },
+            Arr(xs) => if xs.is_empty() {
+                n = Seq([])
+            } else {
+                put(mut is_obj, depth, false)
+                put(mut items, depth, xs)
+                put(mut fields, depth, [])
+                put(mut ats, depth, 0)
+                put(mut starts, depth, top)
+                depth = depth + 1
+                opened = true
+            },
+            Obj(fs) => if fs.is_empty() {
+                n = Map([])
+            } else {
+                put(mut is_obj, depth, true)
+                put(mut items, depth, [])
+                put(mut fields, depth, fs)
+                put(mut ats, depth, 0)
+                put(mut starts, depth, top)
+                depth = depth + 1
+                opened = true
+            },
+        }
+        if !opened {
+            while true {
+                if depth == 0 {
+                    return n
+                }
+                let d = depth - 1
+                put(mut nodes, top, n)
+                top = top + 1
+                ats[d] = ats[d] + 1
+                let len = if is_obj[d] { fields[d].len() } else { items[d].len() }
+                if ats[d] < len {
+                    break
+                }
+                let s = starts[d]
+                if is_obj[d] {
+                    let mut ps: List[Pair] = []
+                    for j in s..<top {
+                        ps.push(Pair { key: Str(fields[d][j - s].key), value: nodes[j] })
+                        nodes[j] = Null
+                    }
+                    n = Map(ps)
+                } else {
+                    let mut xs: List[Node] = []
+                    for j in s..<top {
+                        xs.push(nodes[j])
+                        nodes[j] = Null
+                    }
+                    n = Seq(xs)
+                }
+                top = s
+                items[d] = []
+                fields[d] = []
+                depth = d
+            }
+        }
+        let d = depth - 1
+        let at = ats[d]
+        next = if is_obj[d] { fields[d][at].value } else { items[d][at] }
+    }
+    // not reached
     Null
 }
 
 // ---------- limits ----------
 
-// How many collections may be open inside each other.
-fn max_depth() -> Int {
+// How many collections may be open inside each other, counting those an
+// alias brings in.
+pub fn max_depth() -> Int {
     512
 }
 
 // How many nodes the aliases of one stream may expand to, in all.
-fn max_alias_nodes() -> Int {
+pub fn max_alias_nodes() -> Int {
     1000000
 }
 
 // How many aliases may be expanded inside each other.
-fn max_alias_depth() -> Int {
+pub fn max_alias_depth() -> Int {
     100
 }
 
@@ -1743,4 +2042,536 @@ fn node(mut self: Ps, block: Bool, indentless: Bool) -> Result[(), Str] {
         return Err(err_at(t.line, t.col, "expected a node"))
     }
     Ok(())
+}
+
+// ---------- composer: events to nodes ----------
+
+// The node an anchor names, with its costs, so an alias is charged for it
+// without walking it.
+struct Named {
+    node: Node,
+    nodes: Int,
+    height: Int,
+    aliases: Int,
+}
+
+// The documents of `s`; with `one`, an error at the start of a second.
+//
+// Events are read in a loop, so nothing recurses. Each open sequence or
+// mapping has a slot in the lists below (slots from `depth` on are spare):
+// whether it is a mapping, its anchor, tag and position, the id that tells
+// its keys from other mappings' in the map of keys, and what its contents
+// cost so far: how many nodes they are (aliases expanded), how many levels
+// of collections they hold, and how many aliases deep they go. Their
+// finished items wait in one list, `kids`, from the collection's `starts`
+// slot to `top` (a mapping's keys and values one after the other), and
+// become the collection's list when it ends.
+//
+// An alias is the node its anchor names: Limen values are values, so the
+// alias shares it and nothing is copied, but it is charged as the nodes it
+// stands for, which each anchor records when its node is done. The charge
+// is checked against `max_alias_nodes` before the alias is used, so a stream
+// of aliases of aliases (billion laughs) fails at once rather than after
+// expanding. The levels an alias brings count towards `max_depth`, and how
+// many aliases it holds inside each other towards `max_alias_depth`.
+fn compose(s: Str, one: Bool) -> Result[List[Node], Str] {
+    let ev = parse_events(s)?
+    let mut docs: List[Node] = []
+    let mut is_map: List[Bool] = []
+    let mut anchors: List[Str] = []
+    let mut tags: List[Str] = []
+    let mut lines: List[Int] = []
+    let mut cols: List[Int] = []
+    let mut ids: List[Int] = []
+    let mut starts: List[Int] = []
+    let mut costs: List[Int] = []
+    let mut heights: List[Int] = []
+    let mut depths: List[Int] = []
+    let mut depth = 0
+    let mut kids: List[Node] = []
+    let mut top = 0
+    // the anchors of this document, and those on collections still open,
+    // which an alias may not name (it would be inside its own node)
+    let mut named: Map[Str, Named] = map()
+    let mut opening: Map[Str, Bool] = map()
+    // nodes the aliases of the stream have stood for, so far
+    let mut expanded = 0
+    // the keys of each mapping, by mapping id and key fingerprint
+    let mut seen: Map[(Int, Str), Bool] = map()
+    let mut last_id = 0
+    for i in 0..<ev.events.len() {
+        let line = ev.lines[i]
+        let col = ev.cols[i]
+        // a node that is done, with its costs and where it starts
+        let mut done = false
+        let mut node = Null
+        let mut nodes = 1
+        let mut height = 0
+        let mut aliases = 0
+        let mut anchor = ""
+        let mut nline = line
+        let mut ncol = col
+        let mut start = Event.StreamStart
+        let mut opens = false
+        let e = ev.events[i]
+        match e {
+            DocStart(_) => {
+                if one && docs.len() > 0 {
+                    return Err(err_at(line, col, "a second document; parse reads one, parse_all reads a stream of several"))
+                }
+                named = map()
+                opening = map()
+            },
+            SeqStart(a, t, _) => {
+                check_collection_tag(t, false, line, col)?
+                opens = true
+                start = e
+            },
+            MapStart(a, t, _) => {
+                check_collection_tag(t, true, line, col)?
+                opens = true
+                start = e
+            },
+            SeqEnd | MapEnd => {
+                let d = depth - 1
+                let st = starts[d]
+                let inner = if is_map[d] {
+                    let mut ps: List[Pair] = []
+                    let mut j = st
+                    while j + 1 < top {
+                        ps.push(Pair { key: kids[j], value: kids[j + 1] })
+                        j = j + 2
+                    }
+                    Map(ps)
+                } else {
+                    let mut xs: List[Node] = []
+                    for j in st..<top {
+                        xs.push(kids[j])
+                    }
+                    Seq(xs)
+                }
+                for j in st..<top {
+                    kids[j] = Null
+                }
+                top = st
+                depth = d
+                node = with_tag(tags[d], inner)
+                nodes = costs[d] + 1
+                height = heights[d] + 1
+                aliases = depths[d]
+                anchor = anchors[d]
+                nline = lines[d]
+                ncol = cols[d]
+                done = true
+            },
+            Scalar(a, t, style, x) => {
+                node = scalar_node(t, style, x, line, col)?
+                anchor = a
+                done = true
+            },
+            Alias(name) => {
+                match named.get(name) {
+                    None => {
+                        let why = if opening.contains(name) { "the alias *{name} is inside the node it names" } else { "no anchor `{name}` comes before this alias" }
+                        return Err(err_at(line, col, why))
+                    },
+                    Some(a) => {
+                        if a.aliases + 1 > max_alias_depth() {
+                            return Err(err_at(line, col, "aliases nested more than {max_alias_depth()} deep"))
+                        }
+                        if expanded + a.nodes > max_alias_nodes() {
+                            return Err(err_at(line, col, "these aliases expand past the limit of {max_alias_nodes()} nodes"))
+                        }
+                        if depth + a.height > max_depth() {
+                            return Err(err_at(line, col, "nested deeper than {max_depth()}"))
+                        }
+                        expanded = expanded + a.nodes
+                        node = a.node
+                        nodes = a.nodes
+                        height = a.height
+                        aliases = a.aliases + 1
+                        done = true
+                    },
+                }
+            },
+            _ => {},
+        }
+        if opens {
+            let (m, a, t) = match start {
+                MapStart(a, t, _) => (true, a, t),
+                SeqStart(a, t, _) => (false, a, t),
+                _ => (false, "", ""),
+            }
+            last_id = last_id + 1
+            put(mut is_map, depth, m)
+            put(mut anchors, depth, a)
+            put(mut tags, depth, t)
+            put(mut lines, depth, line)
+            put(mut cols, depth, col)
+            put(mut ids, depth, last_id)
+            put(mut starts, depth, top)
+            put(mut costs, depth, 0)
+            put(mut heights, depth, 0)
+            put(mut depths, depth, 0)
+            depth = depth + 1
+            if a != "" {
+                named.remove(a)
+                opening[a] = true
+            }
+        }
+        if done {
+            if anchor != "" {
+                named[anchor] = Named { node, nodes, height, aliases }
+                opening.remove(anchor)
+            }
+            if depth == 0 {
+                docs.push(node)
+            } else {
+                let d = depth - 1
+                costs[d] = costs[d] + nodes
+                heights[d] = heights[d].max(height)
+                depths[d] = depths[d].max(aliases)
+                // in a mapping, an even count before it makes this a key
+                if is_map[d] && (top - starts[d]) % 2 == 0 {
+                    let k = (ids[d], fingerprint(node))
+                    if seen.contains(k) {
+                        return Err(err_at(nline, ncol, "duplicate key" + key_name(node)))
+                    }
+                    seen[k] = true
+                }
+                put(mut kids, top, node)
+                top = top + 1
+            }
+        }
+    }
+    Ok(docs)
+}
+
+fn core_tag() -> Str {
+    "tag:yaml.org,2002:"
+}
+
+// `!!name` for a tag of the core schema, else the tag.
+fn tag_name(tag: Str) -> Str {
+    if tag.starts_with(core_tag()) { "!!" + tag.slice(core_tag().len(), tag.len()) } else { tag }
+}
+
+// A collection's tag must not be one of the core schema's scalar tags, nor
+// the other collection's.
+fn check_collection_tag(tag: Str, is_map: Bool, line: Int, col: Int) -> Result[(), Str] {
+    let t = tag_name(tag)
+    let wrong = t == "!!str" || t == "!!null" || t == "!!bool" || t == "!!int" || t == "!!float" || (is_map && t == "!!seq") || (!is_map && t == "!!map")
+    if wrong {
+        let what = if is_map { "a mapping" } else { "a sequence" }
+        return Err(err_at(line, col, "{what} cannot have the tag {t}"))
+    }
+    Ok(())
+}
+
+// A collection with its tag: none, `!`, `!!seq` and `!!map` leave it as it
+// is; any other is kept with `Tagged`.
+fn with_tag(tag: Str, n: Node) -> Node {
+    let t = tag_name(tag)
+    if t == "" || t == "!" || t == "!!seq" || t == "!!map" { n } else { Tagged(tag, n) }
+}
+
+// The node for a scalar: by the core schema when it is plain and has no
+// tag, a string when it is quoted or tagged `!` or `!!str`, the type a
+// core tag names (an error when the text is not one), and `Tagged` with
+// the text for any other tag.
+fn scalar_node(tag: Str, style: Int, x: Str, line: Int, col: Int) -> Result[Node, Str] {
+    if tag == "" {
+        return if style == 1 { plain(x, line, col) } else { Ok(Str(x)) }
+    }
+    let t = tag_name(tag)
+    if t == "!" || t == "!!str" {
+        return Ok(Str(x))
+    }
+    if t == "!!seq" || t == "!!map" {
+        return Err(err_at(line, col, "a scalar cannot have the tag {t}"))
+    }
+    let n = if t == "!!null" {
+        if is_null(x) { Some(Null) } else { None }
+    } else if t == "!!bool" {
+        bool_of(x).map(|b| Bool(b))
+    } else if t == "!!int" {
+        (int_of(x, line, col)?).map(|k| Int(k))
+    } else if t == "!!float" {
+        match float_of(x) {
+            Some(f) => Some(Float(f)),
+            None => (int_of(x, line, col)?).map(|k| Float(k.to_float())),
+        }
+    } else {
+        return Ok(Tagged(tag, Str(x)))
+    }
+    match n {
+        Some(v) => Ok(v),
+        None => Err(err_at(line, col, "`{x}` does not match its tag {t}")),
+    }
+}
+
+// A plain scalar by the core schema's table: null, a bool, an integer
+// (decimal, `0o` octal or `0x` hex; one past `Int`'s range is an error), a
+// float, else a string.
+fn plain(x: Str, line: Int, col: Int) -> Result[Node, Str] {
+    if is_null(x) {
+        return Ok(Null)
+    }
+    match bool_of(x) {
+        Some(b) => {
+            return Ok(Bool(b))
+        },
+        None => {},
+    }
+    match int_of(x, line, col)? {
+        Some(k) => {
+            return Ok(Int(k))
+        },
+        None => {},
+    }
+    Ok(match float_of(x) {
+        Some(f) => Float(f),
+        None => Str(x),
+    })
+}
+
+fn is_null(x: Str) -> Bool {
+    x == "" || x == "~" || x == "null" || x == "Null" || x == "NULL"
+}
+
+fn bool_of(x: Str) -> Option[Bool] {
+    if x == "true" || x == "True" || x == "TRUE" {
+        Some(true)
+    } else if x == "false" || x == "False" || x == "FALSE" {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+// The value of a digit in `base`, or -1.
+fn digit_value(b: Int, base: Int) -> Int {
+    let v = if b >= 48 && b <= 57 {
+        b - 48
+    } else if b >= 97 && b <= 102 {
+        b - 87
+    } else if b >= 65 && b <= 70 {
+        b - 55
+    } else {
+        99
+    }
+    if v < base { v } else { -1 }
+}
+
+// `x` as an integer of the core schema, `[-+]?[0-9]+`, `0o[0-7]+` or
+// `0x[0-9a-fA-F]+`; None when it is not one, an error when it is one too
+// large for an `Int`.
+fn int_of(x: Str, line: Int, col: Int) -> Result[Option[Int], Str] {
+    let bs = x.bytes()
+    let n = bs.len()
+    if n == 0 {
+        return Ok(None)
+    }
+    let mut base = 10
+    let mut i = 0
+    let mut neg = false
+    if n > 2 && bs[0] == 48 && bs[1] == 111 {
+        base = 8
+        i = 2
+    } else if n > 2 && bs[0] == 48 && bs[1] == 120 {
+        base = 16
+        i = 2
+    } else if bs[0] == 45 || bs[0] == 43 {
+        neg = bs[0] == 45
+        i = 1
+    }
+    if i >= n {
+        return Ok(None)
+    }
+    // the value, negated, so the most negative Int can be read; past the
+    // range, the digits are still checked, so "1e999..." is not called an
+    // integer
+    let least = -9223372036854775807 - 1
+    let mut v = 0
+    let mut over = false
+    while i < n {
+        let d = digit_value(bs[i], base)
+        if d < 0 {
+            return Ok(None)
+        }
+        if !over {
+            if v < (least + d) / base {
+                over = true
+            } else {
+                v = v * base - d
+            }
+        }
+        i = i + 1
+    }
+    if over || (!neg && v == least) {
+        let shown = if n > 40 { x.slice(0, 40) + "..." } else { x }
+        return Err(err_at(line, col, "the integer {shown} does not fit in an Int"))
+    }
+    Ok(Some(if neg { v } else { 0 - v }))
+}
+
+fn is_digit(b: Int) -> Bool {
+    b >= 48 && b <= 57
+}
+
+// `x` as a float of the core schema:
+// `[-+]?(\.[0-9]+|[0-9]+(\.[0-9]*)?)([eE][-+]?[0-9]+)?`, or `.inf`, `-.inf`
+// and `.nan` in their three spellings.
+fn float_of(x: Str) -> Option[Float] {
+    let bs = x.bytes()
+    let n = bs.len()
+    if n == 0 {
+        return None
+    }
+    let mut i = 0
+    let neg = bs[0] == 45
+    if bs[0] == 45 || bs[0] == 43 {
+        i = 1
+    }
+    let rest = x.slice(i, n)
+    if rest == ".inf" || rest == ".Inf" || rest == ".INF" {
+        let inf = 1.0 / 0.0
+        return Some(if neg { 0.0 - inf } else { inf })
+    }
+    if i == 0 && (x == ".nan" || x == ".NaN" || x == ".NAN") {
+        return Some(0.0 / 0.0)
+    }
+    let mut digits = 0
+    while i < n && is_digit(bs[i]) {
+        i = i + 1
+        digits = digits + 1
+    }
+    if i < n && bs[i] == 46 {
+        i = i + 1
+        while i < n && is_digit(bs[i]) {
+            i = i + 1
+            digits = digits + 1
+        }
+    }
+    if digits == 0 {
+        return None
+    }
+    if i < n && (bs[i] == 101 || bs[i] == 69) {
+        i = i + 1
+        if i < n && (bs[i] == 45 || bs[i] == 43) {
+            i = i + 1
+        }
+        let start = i
+        while i < n && is_digit(bs[i]) {
+            i = i + 1
+        }
+        if i == start {
+            return None
+        }
+    }
+    if i < n {
+        return None
+    }
+    x.parse_float()
+}
+
+// A float's text, distinct for every two floats that are not equal (and
+// one text for NaN): JSON's shortest form, which reads back as the same
+// Float, where Float's to_str keeps only 15 digits.
+fn float_text(f: Float) -> Str {
+    if f != f || f - f != 0.0 { f.to_str() } else if f == 0.0 { "0" } else { json.stringify(json.Num(f)) }
+}
+
+// " `k`" for a scalar key, to name it in an error; "" for any other.
+fn key_name(k: Node) -> Str {
+    match k {
+        Null => " `null`",
+        Bool(b) => " `{b}`",
+        Int(n) => " `{n}`",
+        Float(x) => " `{x}`",
+        Str(s) => " `{s}`",
+        _ => "",
+    }
+}
+
+// A text that two keys share exactly when they are the same node: each
+// node's kind, then its content, strings and tags with their lengths so no
+// two nodes run together. A mapping's pairs are taken in order. It is
+// written with a list of the nodes still to write, not by recursion.
+fn fingerprint(n: Node) -> Str {
+    match n {
+        Str(s) => {
+            return "s" + s
+        },
+        Int(k) => {
+            return "i{k}"
+        },
+        _ => {},
+    }
+    let mut out: List[Str] = []
+    // nodes still to write, last first; an item of `marks` that is not ""
+    // is written in place of its node
+    let mut todo: List[Node] = [n]
+    let mut marks: List[Str] = [""]
+    let mut sp = 1
+    while sp > 0 {
+        sp = sp - 1
+        let m = marks[sp]
+        let x = todo[sp]
+        todo[sp] = Null
+        if m != "" {
+            out.push(m)
+            continue
+        }
+        let mut more: List[Node] = []
+        match x {
+            Null => out.push("n;"),
+            Bool(b) => out.push("b{b};"),
+            Int(k) => out.push("i{k};"),
+            Float(f) => out.push("f" + float_text(f) + ";"),
+            Str(s) => out.push("s{s.len()}:{s}"),
+            Tagged(t, inner) => {
+                out.push("t{t.len()}:{t}")
+                more = [inner]
+            },
+            Seq(items) => {
+                out.push("[")
+                more = items
+            },
+            Map(pairs) => {
+                out.push("\{")
+                for p in pairs {
+                    more.push(p.key)
+                    more.push(p.value)
+                }
+            },
+        }
+        let close = match x {
+            Seq(_) => "]",
+            Map(_) => "\}",
+            _ => "",
+        }
+        let mut items = [(Null, close)]
+        if close == "" {
+            items = []
+        }
+        let mut j = more.len()
+        while j > 0 {
+            j = j - 1
+            items.push((more[j], ""))
+        }
+        // `items` holds the closer first, then the children last to first,
+        // so the first child is written next
+        for it in items {
+            if sp < todo.len() {
+                todo[sp] = it.0
+                marks[sp] = it.1
+            } else {
+                todo.push(it.0)
+                marks.push(it.1)
+            }
+            sp = sp + 1
+        }
+    }
+    out.join("")
 }

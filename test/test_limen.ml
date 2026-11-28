@@ -12571,44 +12571,23 @@ fn main(root: Root) {
      One Limen program walks every case through an Fs granted on the suite and
      prints "id verdict" for each, verdict being pass, fail or skip: a valid
      case passes when its documents equal the ones in in.json (compared as JSON
-     values, in.json holding one document per YAML document), is skipped when
-     it has no in.json or the documents have a key JSON cannot hold, and an
+     values, in.json holding one document per YAML document, with tags
+     dropped, numbers equal whether Int or Num, and object members in any
+     order), is skipped when it parses but has no in.json or the documents
+     have a key JSON cannot hold (to_json's fixed message for that), and an
      invalid case (it has an `error` file) passes when parse_all gives Err.
      A case that fails without being listed below, or passes while listed,
      fails the test. LIMEN_TEST_ONLY=yaml-suite runs only this. *)
   (let name = "yaml-suite" in
    if selected name then begin
+     (* each with the reason it fails: the suite checks the parser's events,
+        which these streams have, but composed they repeat a key in one
+        mapping, which yaml.parse refuses as the spec says *)
      let yaml_suite_known_failures =
-       "229Q 26DV 27NA 2AUY 2EBW 2G84/02 2G84/03 2LFX 2SXE 2XXW \
-       33X3 35KP 36F6 3ALJ 3GZX 3MYT 3R3P 3RLN/00 3RLN/01 3RLN/02 \
-       3RLN/03 3RLN/04 3RLN/05 3UYS 4CQQ 4GC6 4MUZ/00 4MUZ/01 4MUZ/02 4Q9F \
-       4QFQ 4RWC 4UYU 4V8U 4WA9 4ZYM 52DL 54T7 565N 57H4 \
-       58MP 5BVJ 5C5M 5GBF 5KJE 5MUD 5NYZ 5T43 5TYM 5WE3 \
-       652Z 65WH 6BCT 6CA3 6CK3 6FWR 6H3V 6HB6 6JQW 6JWB \
-       6KGN 6LVF 6SLA 6VJK 6WLZ 6WPF 6XDY 6ZKB 735Y 74H7 \
-       753E 7A4E 7BMT 7BUB 7FWL 7T8X 7TMG 7W2P 7Z25 7ZZ5 \
-       82AN 87E4 8CWC 8G76 8KB6 8MK2 8QBE 8UDB 8XYN 93JH \
-       93WF 96L6 96NN/00 96NN/01 98YD 9BXH 9DXL 9FMG 9J7A 9KAX \
-       9MQT/00 9SA2 9SHH 9TFX 9U5K 9WXW 9YRD A2M4 A6F9 A984 \
-       AB8U AVM7 AZ63 AZW3 B3HG BEC7 BU8L C2DT C4HZ CC74 \
-       CN3R CPZ3 CT4Q CUP7 D83L D88J D9TU DBG4 DC7X DE56/00 \
-       DE56/01 DE56/02 DE56/03 DE56/04 DE56/05 DHP8 DK3J DK95/00 DK95/02 DK95/03 \
-       DK95/04 DK95/05 DK95/07 DK95/08 DWX9 E76Z EHF6 EX5H EXG3 F2C7 \
-       F3CP F6MC F8F9 FBC9 FP8R FQ7F FTA2 FUP4 G4RS G992 \
-       GH63 H2RW H3Z8 HM87/00 HM87/01 HMK4 HMQ5 HS5T HWV9 J3BT \
-       J5UC J7PZ J7VC J9HZ JEF9/00 JEF9/01 JEF9/02 JHB9 JQ4R JR7V \
-       JS2J JTV5 K3WX K4SU K527 K54U K858 KH5V/00 KH5V/01 KH5V/02 \
-       KMK3 KSS4 L24T/00 L24T/01 L383 L94M L9U5 LE5A LP6E LQZ7 \
-       M29M M5C3 M6YH M7A3 M7NX M9B4 MJS9 MUS6/02 MUS6/03 MUS6/04 \
-       MUS6/05 MUS6/06 MXS3 MYW6 MZX3 NAT4 NB6Z NJ66 NP9H P2AD \
-       P76L P94K PBJ2 PRH3 PUW8 Q5MG Q88A Q8AD QF4Y QT73 \
-       R4YG R52L RLU9 RR7F RTP8 RZT7 S4JQ S4T7 S7BG S9E8 \
-       SKE5 SM9W/00 SSW6 SYW4 T26H T4YY T5N4 TE2A TL85 TS54 \
-       U3C3 U3XV U9NS UDM2 UDR7 UGM3 UKK6/01 UT92 UV7Q V55R \
-       VJP3/01 W42U W4TN W5VH WZ62 X8DW XLQ9 XV9V Y2GN Y79Y/001 \
-       Y79Y/002 Y79Y/010 YD5X Z67P Z9M4 ZF4X ZH7C ZK9H ZWK4"
+       [ ("2JQS", "two empty keys, both null: a duplicate key once composed");
+         ("X38W", "the key *a is the key [a, b] again: a duplicate key once composed") ]
      in
-     let known = List.filter (fun s -> s <> "") (String.split_on_char ' ' yaml_suite_known_failures) in
+     let known = List.map fst yaml_suite_known_failures in
      let dir =
        let d = Filename.concat (Sys.getcwd ()) "yaml-suite" in
        Unix.realpath (if Sys.file_exists d then d else Filename.concat (Sys.getcwd ()) "test/yaml-suite")
@@ -12703,8 +12682,9 @@ fn verdict(fs: Fs, dir: Str) -> Result[Str, IoError] {
             Ok(_) => "fail",
         })
     }
+    // a valid case must parse, even when there is no in.json to compare with
     if !fs.exists(dir + "/in.json") {
-        return Ok("skip")
+        return Ok(if got.is_ok() { "skip" } else { "fail" })
     }
     let want = split_docs(fs.read(dir + "/in.json")?)
     match got {
@@ -12714,16 +12694,16 @@ fn verdict(fs: Fs, dir: Str) -> Result[Str, IoError] {
                 return Ok("fail")
             }
             for (i, node) in nodes.with_index() {
-                match yaml.to_json(node) {
+                match yaml.to_json(untag(node)) {
                     Err(m) => {
-                        return Ok(if m.contains("key") { "skip" } else { "fail" })
+                        return Ok(if m == "a map key that is not a string has no JSON form" { "skip" } else { "fail" })
                     },
                     Ok(v) => match json.parse(want[i]) {
                         Err(_) => {
                             return Ok("fail")
                         },
                         Ok(w) => {
-                            if v != w {
+                            if !same(v, w) {
                                 return Ok("fail")
                             }
                         },
@@ -12732,6 +12712,53 @@ fn verdict(fs: Fs, dir: Str) -> Result[Str, IoError] {
             }
             Ok("pass")
         },
+    }
+}
+
+// `n` without its tags: in.json holds the content a tag is on.
+fn untag(n: yaml.Node) -> yaml.Node {
+    match n {
+        Tagged(_, x) => untag(x),
+        Seq(xs) => yaml.Seq(xs.map(untag)),
+        Map(ps) => yaml.Map(ps.map(|p| yaml.Pair { key: untag(p.key), value: untag(p.value) })),
+        _ => n,
+    }
+}
+
+fn number(v: json.Value) -> Option[Float] {
+    match v {
+        Int(n) => Some(n.to_float()),
+        Num(x) => Some(x),
+        _ => None,
+    }
+}
+
+// The same JSON, with a number equal to another whatever its kind (in.json
+// writes 1e3 as 1000, an Int, where the node is a Float) and an object's
+// members in any order.
+fn same(a: json.Value, b: json.Value) -> Bool {
+    match number(a) {
+        Some(x) => {
+            return match number(b) {
+                Some(y) => x == y,
+                None => false,
+            }
+        },
+        None => {},
+    }
+    match a {
+        Arr(xs) => match b {
+            Arr(ys) => xs.len() == ys.len() && xs.zip(ys).all(|p| same(p.0, p.1)),
+            _ => false,
+        },
+        Obj(fs) => match b {
+            Obj(gs) => fs.len() == gs.len() && fs.all(|f| match b.get(f.key) {
+                Some(y) => same(f.value, y),
+                None => false,
+            }),
+            _ => false,
+        },
+        _ => a == b,
     }
 }
 
@@ -12757,6 +12784,7 @@ fn main(root: Root) -> Result[(), IoError] {
        ok (name ^ "-unexpected") (unexpected = []) ("fail but are not in yaml_suite_known_failures: " ^ String.concat " " unexpected);
        ok (name ^ "-stale") (stale = [] && missing = [])
          ("listed in yaml_suite_known_failures but not failing: " ^ String.concat " " (stale @ missing));
+       ok (name ^ "-known") (List.length known * 20 < List.length verdicts) "known failures are 5 % of the suite or more";
        if Sys.getenv_opt "LIMEN_YAML_LIST" <> None then
          Out_channel.with_open_bin (Sys.getenv "LIMEN_YAML_LIST") (fun oc ->
              output_string oc (String.concat " " (List.filter_map (fun (id, v) -> if v = "fail" then Some id else None) verdicts)))
@@ -12875,6 +12903,508 @@ fn main(root: Root) -> Result[(), IoError] {
       error: line 1, column 513: nested deeper than 512\n\
       error: line 1, column 513: nested deeper than 512\n\
       error: line 1, column 1025: nested deeper than 512\n");
+  (* yaml's composer: the core schema, tags, anchors and aliases, the limits,
+     the accessors and the JSON conversions, through yaml.parse. *)
+  (let show =
+     {|use yaml
+
+fn show(out: Stdout, s: Str) {
+    let shown = s.replace("\n", "\\n")
+    match yaml.parse(s) {
+        Ok(n) => out.print("{shown} => {n}"),
+        Err(e) => out.print("{shown} error: {e}"),
+    }
+}
+
+|}
+   in
+   out "yaml-core-schema"
+     (show
+     ^ {|fn main(root: Root) {
+    let cases = ["null", "Null", "NULL", "~", "", "nULL", "true", "True", "TRUE", "false", "False", "FALSE", "tRUE", "0o17", "0x1F", "0x1f", "+12", "-0", "007", "1.5", ".5", "1e3", "1.", "-1.5e-3", "+.5E+2", ".inf", ".Inf", "+.INF", "-.inf", ".nan", ".NaN", ".NAN", "yes", "no", "on", "off", "2024-01-01", "0b1", "1_000", "0x", "0o8", "+0x1F", "-0o7", "e3", ".", "'null'", "\"12\"", "|\n  true\n", "[null, ~, 1]"]
+    for s in cases {
+        show(root.stdout, s)
+    }
+}
+|})
+     {|null => Null
+Null => Null
+NULL => Null
+~ => Null
+ => Null
+nULL => Str("nULL")
+true => Bool(true)
+True => Bool(true)
+TRUE => Bool(true)
+false => Bool(false)
+False => Bool(false)
+FALSE => Bool(false)
+tRUE => Str("tRUE")
+0o17 => Int(15)
+0x1F => Int(31)
+0x1f => Int(31)
++12 => Int(12)
+-0 => Int(0)
+007 => Int(7)
+1.5 => Float(1.5)
+.5 => Float(0.5)
+1e3 => Float(1000.0)
+1. => Float(1.0)
+-1.5e-3 => Float(-0.0015)
++.5E+2 => Float(50.0)
+.inf => Float(inf)
+.Inf => Float(inf)
++.INF => Float(inf)
+-.inf => Float(-inf)
+.nan => Float(nan)
+.NaN => Float(nan)
+.NAN => Float(nan)
+yes => Str("yes")
+no => Str("no")
+on => Str("on")
+off => Str("off")
+2024-01-01 => Str("2024-01-01")
+0b1 => Str("0b1")
+1_000 => Str("1_000")
+0x => Str("0x")
+0o8 => Str("0o8")
++0x1F => Str("+0x1F")
+-0o7 => Str("-0o7")
+e3 => Str("e3")
+. => Str(".")
+'null' => Str("null")
+"12" => Str("12")
+|\n  true\n => Str("true\n")
+[null, ~, 1] => Seq([Null, Null, Int(1)])
+|};
+   out "yaml-tags"
+     (show
+     ^ {|fn main(root: Root) {
+    let cases = ["!!str 12", "!custom x", "%TAG !e! tag:example.com,2000:app/\n---\n!e!foo bar\n", "! 12", "!!int '12'", "!!int 0x1F", "!!float 1", "!!float '.inf'", "!!bool True", "!!null ''", "!!null", "!!str", "!!seq [1]", "!!map \{a: 1\}", "!x [1]", "!!set \{a: \}", "!<tag:example.com:x> 1", "!!binary aGk=", "!!int x", "!!bool yes", "!!null 0", "!!str [1]", "!!map [1]", "!!seq x", "a: !!int b\n"]
+    for s in cases {
+        show(root.stdout, s)
+    }
+}
+|})
+     {|!!str 12 => Str("12")
+!custom x => Tagged("!custom", Str("x"))
+%TAG !e! tag:example.com,2000:app/\n---\n!e!foo bar\n => Tagged("tag:example.com,2000:app/foo", Str("bar"))
+! 12 => Str("12")
+!!int '12' => Int(12)
+!!int 0x1F => Int(31)
+!!float 1 => Float(1.0)
+!!float '.inf' => Float(inf)
+!!bool True => Bool(true)
+!!null '' => Null
+!!null => Null
+!!str => Str("")
+!!seq [1] => Seq([Int(1)])
+!!map {a: 1} => Map([yaml.Pair { key: Str("a"), value: Int(1) }])
+!x [1] => Tagged("!x", Seq([Int(1)]))
+!!set {a: } => Tagged("tag:yaml.org,2002:set", Map([yaml.Pair { key: Str("a"), value: Null }]))
+!<tag:example.com:x> 1 => Tagged("tag:example.com:x", Str("1"))
+!!binary aGk= => Tagged("tag:yaml.org,2002:binary", Str("aGk="))
+!!int x error: line 1, column 1: `x` does not match its tag !!int
+!!bool yes error: line 1, column 1: `yes` does not match its tag !!bool
+!!null 0 error: line 1, column 1: `0` does not match its tag !!null
+!!str [1] error: line 1, column 1: a sequence cannot have the tag !!str
+!!map [1] error: line 1, column 1: a sequence cannot have the tag !!map
+!!seq x error: line 1, column 1: a scalar cannot have the tag !!seq
+a: !!int b\n error: line 1, column 4: `b` does not match its tag !!int
+|};
+   out "yaml-aliases"
+     (show
+     ^ {|fn main(root: Root) {
+    let out = root.stdout
+    match yaml.parse("a: &x [1, 2]\nb: *x\n") {
+        Ok(n) => out.print("{n.get("b")}"),
+        Err(e) => out.print(e),
+    }
+    let cases = ["- &s hi\n- *s\n", "- &a 1\n- &a 2\n- *a\n", "[&a [1], &b [*a, *a], *b]", "x: &v !!str 12\ny: *v\n", "- &t !custom 1\n- *t\n", "&a [*a]", "- &a x\n- &a [*a]\n", "*nope", "- &a [&a x, *a]\n- *a\n"]
+    for s in cases {
+        show(out, s)
+    }
+    // anchors belong to their document
+    match yaml.parse_all("&a x\n--- \n*a\n") {
+        Ok(ns) => out.print("{ns}"),
+        Err(e) => out.print(e),
+    }
+}
+|})
+     {|Some(Seq([Int(1), Int(2)]))
+- &s hi\n- *s\n => Seq([Str("hi"), Str("hi")])
+- &a 1\n- &a 2\n- *a\n => Seq([Int(1), Int(2), Int(2)])
+[&a [1], &b [*a, *a], *b] => Seq([Seq([Int(1)]), Seq([Seq([Int(1)]), Seq([Int(1)])]), Seq([Seq([Int(1)]), Seq([Int(1)])])])
+x: &v !!str 12\ny: *v\n => Map([yaml.Pair { key: Str("x"), value: Str("12") }, yaml.Pair { key: Str("y"), value: Str("12") }])
+- &t !custom 1\n- *t\n => Seq([Tagged("!custom", Str("1")), Tagged("!custom", Str("1"))])
+&a [*a] error: line 1, column 5: the alias *a is inside the node it names
+- &a x\n- &a [*a]\n error: line 2, column 7: the alias *a is inside the node it names
+*nope error: line 1, column 1: no anchor `nope` comes before this alias
+- &a [&a x, *a]\n- *a\n => Seq([Seq([Str("x"), Str("x")]), Seq([Str("x"), Str("x")])])
+line 3, column 1: no anchor `a` comes before this alias
+|};
+   (* nine levels of ten aliases would expand to 10^9 nodes: the budget is
+     charged from each anchor's recorded size before anything is copied, so
+     the stream fails at once *)
+   out "yaml-billion-laughs"
+     {|use yaml
+
+fn laughs(levels: Int) -> Str {
+    let names = ["a", "b", "c", "d", "e", "f", "g", "h", "i"]
+    let mut lol: List[Str] = []
+    for _ in 0..<10 {
+        lol.push("lol")
+    }
+    let mut lines = ["a: &a [" + lol.join(", ") + "]"]
+    for k in 1..<levels {
+        let mut refs: List[Str] = []
+        for _ in 0..<10 {
+            refs.push("*" + names[k - 1])
+        }
+        lines.push(names[k] + ": &" + names[k] + " [" + refs.join(", ") + "]")
+    }
+    lines.join("\n") + "\n"
+}
+
+// a0 a scalar, and each a(k) a sequence holding an alias of a(k - 1)
+fn chain(n: Int) -> Str {
+    let mut lines = ["a0: &a0 x"]
+    for k in 1..<n + 1 {
+        lines.push("a{k}: &a{k} [*a{k - 1}]")
+    }
+    lines.join("\n") + "\n"
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let clock = root.clock
+    let t0 = clock.now_ms()
+    match yaml.parse(laughs(9)) {
+        Ok(_) => out.print("parsed"),
+        Err(e) => out.print(e),
+    }
+    out.print("{clock.now_ms() - t0 < 1000}")
+    match yaml.parse(laughs(5)) {
+        Ok(n) => out.print("{((n.get("e") ?? yaml.Null).as_seq() ?? []).len()}"),
+        Err(e) => out.print(e),
+    }
+    out.print("{yaml.parse(chain(100)).is_ok()}")
+    match yaml.parse(chain(101)) {
+        Ok(_) => out.print("parsed"),
+        Err(e) => out.print(e),
+    }
+}
+|}
+     "line 6, column 36: these aliases expand past the limit of 1000000 nodes\ntrue\n10\ntrue\nline 102, column 14: aliases nested more than 100 deep\n";
+   out "yaml-parse-depth"
+     {|use json
+use yaml
+
+fn nest(open: Str, close: Str, n: Int) -> Str {
+    let mut xs: List[Str] = []
+    for _ in 0..<n {
+        xs.push(open)
+    }
+    for _ in 0..<n {
+        xs.push(close)
+    }
+    xs.join("")
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    out.print("{yaml.parse(nest("[", "]", 512)).is_ok()} {yaml.parse(nest("- ", "", 512) + "x").is_ok()}")
+    match yaml.parse(nest("[", "]", 513)) {
+        Ok(_) => out.print("parsed"),
+        Err(e) => out.print(e),
+    }
+    // an alias counts the levels of the node it names
+    let a = "a: &a " + nest("[", "]", 500) + "\n"
+    out.print("{yaml.parse(a + "b: " + nest("[", "]", 11).replace("[]", "[*a]") + "\n").is_ok()}")
+    match yaml.parse(a + "b: " + nest("[", "]", 12).replace("[]", "[*a]") + "\n") {
+        Ok(_) => out.print("parsed"),
+        Err(e) => out.print(e),
+    }
+    // and a deep node converts to JSON and back, without recursion
+    match yaml.parse(nest("[", "]", 512)) {
+        Ok(n) => match yaml.to_json(n) {
+            Ok(v) => out.print("{yaml.from_json(v) == n} {json.stringify(v).len()}"),
+            Err(e) => out.print(e),
+        },
+        Err(e) => out.print(e),
+    }
+}
+|}
+     "true true\nline 1, column 513: nested deeper than 512\ntrue\nline 2, column 16: nested deeper than 512\ntrue 1024\n";
+   out "yaml-int-range"
+     (show
+     ^ {|fn main(root: Root) {
+    let cases = ["9223372036854775807", "-9223372036854775808", "9223372036854775808", "-9223372036854775809", "0x7FFFFFFFFFFFFFFF", "0x8000000000000000", "0o777777777777777777777", "0o1000000000000000000000", "- 1\n- 99999999999999999999999\n", "!!int 9223372036854775808", "'9223372036854775808'", "11111111111111111111111111111111111111111111111111"]
+    for s in cases {
+        show(root.stdout, s)
+    }
+}
+|})
+     {|9223372036854775807 => Int(9223372036854775807)
+-9223372036854775808 => Int(-9223372036854775808)
+9223372036854775808 error: line 1, column 1: the integer 9223372036854775808 does not fit in an Int
+-9223372036854775809 error: line 1, column 1: the integer -9223372036854775809 does not fit in an Int
+0x7FFFFFFFFFFFFFFF => Int(9223372036854775807)
+0x8000000000000000 error: line 1, column 1: the integer 0x8000000000000000 does not fit in an Int
+0o777777777777777777777 => Int(9223372036854775807)
+0o1000000000000000000000 error: line 1, column 1: the integer 0o1000000000000000000000 does not fit in an Int
+- 1\n- 99999999999999999999999\n error: line 2, column 3: the integer 99999999999999999999999 does not fit in an Int
+!!int 9223372036854775808 error: line 1, column 1: the integer 9223372036854775808 does not fit in an Int
+'9223372036854775808' => Str("9223372036854775808")
+11111111111111111111111111111111111111111111111111 error: line 1, column 1: the integer 1111111111111111111111111111111111111111... does not fit in an Int
+|};
+   (* a key repeated in one mapping, compared as nodes: through an alias, a
+     collection key, two spellings of one integer *)
+   out "yaml-duplicate-key"
+     {|use yaml
+
+fn main(root: Root) {
+    let cases = ["a: 1\na: 2\n", "&k a: 1\n*k : 2\n", "? [1, 2]\n: x\n? [1, 2]\n: y\n", "1: a\n0x1: b\n", "a: 1\n'a': 2\n", "\{a: 1, a: 2\}", "? &m \{x: 1\}\n: 1\n? *m\n: 2\n", "null: 1\n~: 2\n", "true: 1\nTrue: 2\n", "? !x a\n: 1\n? !x a\n: 2\n", "1: a\n'1': b\n", "a: \{a: 1\}\nb: \{a: 1\}\n", "? [1, 2]\n: x\n? [2, 1]\n: y\n", "? !x a\n: 1\n? !y a\n: 2\n", "1: a\n1.0: b\n", "1.0000000000000002: a\n1.0: b\n", "1.0: a\n1e0: b\n"]
+    for s in cases {
+        let shown = s.replace("\n", "\\n")
+        match yaml.parse(s) {
+            Ok(n) => root.stdout.print("{shown} => {(n.pairs() ?? []).len()} pairs"),
+            Err(e) => root.stdout.print("{shown} error: {e}"),
+        }
+    }
+}
+|}
+     {|a: 1\na: 2\n error: line 2, column 1: duplicate key `a`
+&k a: 1\n*k : 2\n error: line 2, column 1: duplicate key `a`
+? [1, 2]\n: x\n? [1, 2]\n: y\n error: line 3, column 3: duplicate key
+1: a\n0x1: b\n error: line 2, column 1: duplicate key `1`
+a: 1\n'a': 2\n error: line 2, column 1: duplicate key `a`
+{a: 1, a: 2} error: line 1, column 8: duplicate key `a`
+? &m {x: 1}\n: 1\n? *m\n: 2\n error: line 3, column 3: duplicate key
+null: 1\n~: 2\n error: line 2, column 1: duplicate key `null`
+true: 1\nTrue: 2\n error: line 2, column 1: duplicate key `true`
+? !x a\n: 1\n? !x a\n: 2\n error: line 3, column 3: duplicate key
+1: a\n'1': b\n => 2 pairs
+a: {a: 1}\nb: {a: 1}\n => 2 pairs
+? [1, 2]\n: x\n? [2, 1]\n: y\n => 2 pairs
+? !x a\n: 1\n? !y a\n: 2\n => 2 pairs
+1: a\n1.0: b\n => 2 pairs
+1.0000000000000002: a\n1.0: b\n => 2 pairs
+1.0: a\n1e0: b\n error: line 2, column 1: duplicate key `1.0`
+|};
+   out "yaml-accessors"
+     {|use json
+use yaml
+
+fn field(n: yaml.Node, k: Str) -> yaml.Node {
+    n.get(k) ?? yaml.Null
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    match yaml.parse("name: web\nreplicas: 3\nratio: 0.5\non: true\nports: [80, 443]\nmeta: ~\n") {
+        Ok(n) => {
+            out.print("{field(n, "name").as_str()} {field(n, "replicas").as_int()} {field(n, "replicas").as_float()}")
+            out.print("{field(n, "ratio").as_float()} {field(n, "ratio").as_int()} {field(n, "on").as_bool()} {field(n, "on").as_str()}")
+            out.print("{field(n, "ports").at(1)} {field(n, "ports").at(5)} {field(n, "ports").as_seq()}")
+            out.print("{n.get("missing")} {field(n, "meta")} {field(n, "meta").as_str()} {(n.pairs() ?? []).len()} {n.as_seq()} {n.at(0)}")
+            match yaml.to_json(n) {
+                Ok(v) => out.print(json.stringify(v)),
+                Err(e) => out.print(e),
+            }
+        },
+        Err(e) => out.print(e),
+    }
+    match yaml.parse("1: a\n2: b\n") {
+        Ok(n) => out.print("{n.get("1")} {yaml.to_json(n)}"),
+        Err(e) => out.print(e),
+    }
+    match yaml.parse("a: [!x 1]\n") {
+        Ok(n) => out.print("{yaml.to_json(n)}"),
+        Err(e) => out.print(e),
+    }
+    match yaml.parse("[.inf, -0.0, 7, \"x\", [], \{\}]") {
+        Ok(n) => out.print("{yaml.to_json(n)}"),
+        Err(e) => out.print(e),
+    }
+    match json.parse("\{\"a\": [1, 2.5, null, true, \"s\"], \"b\": \{\}\}") {
+        Ok(v) => {
+            let n = yaml.from_json(v)
+            out.print("{n}")
+            out.print("{yaml.to_json(n) == Ok(v)}")
+        },
+        Err(e) => out.print(e),
+    }
+}
+|}
+     {|Some("web") Some(3) Some(3.0)
+Some(0.5) None Some(true) None
+Some(Int(443)) None Some([Int(80), Int(443)])
+None Null None 6 None None
+{"name":"web","replicas":3,"ratio":0.5,"on":true,"ports":[80,443],"meta":null}
+None Err("a map key that is not a string has no JSON form")
+Err("a tagged node has no JSON form")
+Ok(Arr([Num(inf), Num(-0.0), Int(7), Str("x"), Arr([]), Obj([])]))
+Map([yaml.Pair { key: Str("a"), value: Seq([Int(1), Float(2.5), Null, Bool(true), Str("s")]) }, yaml.Pair { key: Str("b"), value: Map([]) }])
+true
+|};
+   (* the Kubernetes files in examples/k8s, a kubeconfig, and a manifest of
+     two documents *)
+   let k8s =
+     let d = Filename.concat (Sys.getcwd ()) "../examples/k8s" in
+     Unix.realpath (if Sys.file_exists d then d else Filename.concat (Sys.getcwd ()) "examples/k8s")
+   in
+   out "yaml-k8s"
+     ~grants:{ Interp.no_grants with fs = Some (k8s, true) }
+     {|use yaml
+
+// the node at a path of keys and indexes ("0" and so on for an index)
+fn dig(n: yaml.Node, path: List[Str]) -> yaml.Node {
+    let mut at = n
+    for p in path {
+        at = match p.parse_int() {
+            Some(i) => at.at(i) ?? yaml.Null,
+            None => at.get(p) ?? yaml.Null,
+        }
+    }
+    at
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let out = root.stdout
+    let fs = root.fs
+    for f in (fs.list("")?).sort() {
+        if f.ends_with(".yaml") {
+            match yaml.parse_all(fs.read(f)?) {
+                Ok(docs) => {
+                    for d in docs {
+                        out.print("{f}: {dig(d, ["kind"]).as_str() ?? "?"} {dig(d, ["metadata", "name"]).as_str() ?? "?"}")
+                    }
+                },
+                Err(e) => out.print("{f}: {e}"),
+            }
+        }
+    }
+    match yaml.parse_all(fs.read("staticsite-crd.yaml")?) {
+        Ok(docs) => out.print("{dig(docs[0], ["spec", "versions", "0", "schema", "openAPIV3Schema", "properties", "spec", "properties", "replicas", "default"])} {dig(docs[0], ["spec", "names", "shortNames"])}"),
+        Err(e) => out.print(e),
+    }
+    match yaml.parse(fs.read("hello-site.yaml")?) {
+        Ok(d) => out.print("{(dig(d, ["spec", "html"]).as_str() ?? "").lines()}"),
+        Err(e) => out.print(e),
+    }
+    let kubeconfig = "apiVersion: v1\nkind: Config\nclusters:\n- cluster:\n    certificate-authority-data: LS0tLS1CRUdJTg==\n    server: https://127.0.0.1:6443\n  name: kind-dev\ncontexts:\n- context: \{cluster: kind-dev, user: admin, namespace: default\}\n  name: kind-dev\ncurrent-context: kind-dev\npreferences: \{\}\nusers:\n- name: admin\n  user:\n    token: abc.def\n"
+    match yaml.parse(kubeconfig) {
+        Ok(c) => out.print("{dig(c, ["current-context"]).as_str()} {dig(c, ["clusters", "0", "cluster", "server"]).as_str()} {dig(c, ["contexts", "0", "context", "user"]).as_str()} {dig(c, ["users", "0", "user", "token"]).as_str()}"),
+        Err(e) => out.print(e),
+    }
+    let manifest = "apiVersion: v1\nkind: Service\nmetadata:\n  name: web\n---\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  replicas: 2\n"
+    match yaml.parse_all(manifest) {
+        Ok(docs) => out.print("{docs.len()} {docs.map(|d| dig(d, ["kind"]).as_str() ?? "?")} {dig(docs[1], ["spec", "replicas"]).as_int()}"),
+        Err(e) => out.print(e),
+    }
+    match yaml.parse(manifest) {
+        Ok(_) => out.print("parsed"),
+        Err(e) => out.print(e),
+    }
+    out.print("{yaml.parse("")} {yaml.parse_all("")} {yaml.parse("# only a comment\n")}")
+    Ok(())
+}
+|}
+     {|hello-site.yaml: StaticSite hello
+staticsite-crd.yaml: CustomResourceDefinition staticsites.lmn.dev
+Int(1) Seq([Str("site")])
+["<!doctype html>", "<title>hello</title>", "<h1>Served by a Limen operator</h1>"]
+Some("kind-dev") Some("https://127.0.0.1:6443") Some("admin") Some("abc.def")
+2 ["Service", "Deployment"] Some(2)
+line 5, column 1: a second document; parse reads one, parse_all reads a stream of several
+Ok(Null) Ok([]) Ok(Null)
+|};
+   (* A 1 MB plain scalar on one line, a 100,000-item sequence and a mapping
+     of 100,000 keys: linear, each under a second in a native build (-O2,
+     timed by the program). The interpreter runs a tenth of the sizes, for
+     the results only. *)
+   let name = "yaml-large" in
+   if selected name then begin
+     let src =
+       {|use yaml
+
+fn main(root: Root) {
+    let out = root.stdout
+    let clock = root.clock
+    let scale = (root.args().get(0) ?? "1").parse_int() ?? 1
+    let mut words: List[Str] = []
+    for _ in 0..<100000 / scale {
+        words.push("abcd efgh ")
+    }
+    let big = "x" + words.join("") + "z"
+    let mut items: List[Str] = []
+    let mut keys: List[Str] = []
+    for i in 0..<100000 / scale {
+        items.push("- {i}\n")
+        keys.push("k{i}: {i}\n")
+    }
+    let seq = items.join("")
+    let map = keys.join("")
+    let t0 = clock.now_ms()
+    let a = yaml.parse(big)
+    let t1 = clock.now_ms()
+    let b = yaml.parse(seq)
+    let t2 = clock.now_ms()
+    let c = yaml.parse(map)
+    let t3 = clock.now_ms()
+    match a {
+        Ok(n) => out.print("scalar {(n.as_str() ?? "").len()}"),
+        Err(e) => out.print(e),
+    }
+    match b {
+        Ok(n) => out.print("seq {(n.as_seq() ?? []).len()} {n.at(100000 / scale - 1)}"),
+        Err(e) => out.print(e),
+    }
+    match c {
+        Ok(n) => out.print("map {(n.pairs() ?? []).len()} {n.get("k7")}"),
+        Err(e) => out.print(e),
+    }
+    out.print("ms {t1 - t0} {t2 - t1} {t3 - t2}")
+}
+|}
+     in
+     (* the result lines, and the three times *)
+     let split text =
+       let lines = List.filter (fun l -> l <> "") (String.split_on_char '\n' text) in
+       let results = List.filter (fun l -> not (String.starts_with ~prefix:"ms " l)) lines in
+       let times =
+         match List.find_opt (String.starts_with ~prefix:"ms ") lines with
+         | Some l -> List.filter_map int_of_string_opt (List.tl (String.split_on_char ' ' l))
+         | None -> []
+       in
+       (String.concat "\n" results, times)
+     in
+     let want n = sprintf "scalar %d\nseq %d Some(Int(%d))\nmap %d Some(Int(7))" (n * 10 + 2) n (n - 1) n in
+     (match run ~grants:{ Interp.no_grants with args = [ "10" ] } name src with
+      | Ok (got, _) ->
+        let results, _ = split got in
+        ok name (results = want 10000) (sprintf "got %S" got)
+      | Error e -> ok name false e);
+     if native_for name then begin
+       let items, ds, _ = compile name src in
+       if Diag.errors ds <> [] then ok (name ^ "/native") false "does not compile"
+       else begin
+         let exe = exe_path name in
+         let o = exe ^ ".out" and e = exe ^ ".err" in
+         let cmd = sprintf "LIMEN_LEAKCHECK=1 %s -- 1 >%s 2>%s" (Filename.quote exe) (Filename.quote o) (Filename.quote e) in
+         native_job ~flags:[ "-O2" ] items exe cmd (function
+           | Error m -> ok (name ^ "/native") false m
+           | Ok code ->
+             let got = read_file o in
+             let results, times = split got in
+             Printf.printf "yaml-large (native, ms): %s\n%!" (String.concat " " (List.map string_of_int times));
+             ok (name ^ "/native") (code = 0 && results = want 100000) (sprintf "exit %d, got %S, stderr %S" code got (read_file e));
+             ok (name ^ "/native-time") (List.length times = 3 && List.for_all (fun t -> t < 1000) times)
+               (sprintf "took %s ms" (String.concat ", " (List.map string_of_int times))))
+       end
+     end
+   end);
   drain ();
   Printf.printf "%d/%d passed\n" (!total - !failed) !total;
   if !failed > 0 then exit 1

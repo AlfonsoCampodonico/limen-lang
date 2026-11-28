@@ -1919,6 +1919,43 @@ match start(root.fs) {
 
 The compiler writes the conversions for each type `encode` and `decode` are used with, as ordinary functions, so the type must be known where they are used: `let r = json.decode(s)` alone, or `json.encode(x)` inside a generic function where `x` has a type parameter's type, is E0212. So is a type with no JSON form, one holding a capability, a function, a channel, `Bytes`, an array or a `dyn` value, with the message saying which part. For a type that holds itself (a `Node` whose `next` is an `Option[Node]`, an enum list, a tree), they keep their place in a list rather than recursing once per level: `encode` writes such a value however deep it is, and `decode`, which reads at most 512 levels (`parse`), takes the same small stack at any depth, so both work inside a task.
 
+### yaml
+
+YAML 1.2 with the core schema only: no YAML 1.1 booleans (`yes`, `on`), sexagesimal numbers or `<<` merge keys. Written in Limen, so it is the same in both backends and the playground.
+
+| Item | Meaning |
+| --- | --- |
+| `enum Node { Null, Bool(Bool), Int(Int), Float(Float), Str(Str), Seq(List[Node]), Map(List[Pair]), Tagged(Str, Node) }`, `struct Pair { key: Node, value: Node }` | a node. A mapping keeps its pairs in source order, and a key may be any node. `Tagged` holds a node whose tag the core schema does not resolve, with the tag in full (`!custom`, `tag:example.com,2000:app/foo` through a `%TAG` handle, `tag:yaml.org,2002:binary` for `!!binary`) and the node underneath, a `Str` for a scalar |
+| `parse(s) -> Result[Node, Str]` | the one document of a stream; `Null` for a stream with none (`""`, only comments). A second document is an error: "line 5, column 1: a second document; parse reads one, parse_all reads a stream of several" |
+| `parse_all(s) -> Result[List[Node], Str]` | every document of a stream (`---` and `...`), in order |
+| `n.get(key)`, `n.at(i)` | methods: `Option[Node]`, the value of the key that is the string `key` in a mapping, or a sequence's item |
+| `n.as_str()`, `as_int()`, `as_float()`, `as_bool()`, `as_seq()`, `pairs()` | methods: `Option` of the payload, `None` for another kind; `as_int` reads a whole-number `Float` too, `as_float` an `Int`; `as_seq` gives `List[Node]`, `pairs` a mapping's `List[Pair]` |
+| `to_json(n) -> Result[json.Value, Str]` | a sequence is an array, a mapping an object, a `Float` a `Num` (an infinity or NaN stays a `Num`, which `json.stringify` writes as `null`). A mapping with a key that is not a string has no JSON form, `Err("a map key that is not a string has no JSON form")`, and nor does a `Tagged` node, `Err("a tagged node has no JSON form")` |
+| `from_json(v) -> Node` | an array is a `Seq`, an object a `Map` with `Str` keys, a `Num` a `Float` |
+| `max_depth()`, `max_alias_nodes()`, `max_alias_depth()` | the limits below: `512`, `1000000` and `100` |
+
+**Scalars.** A plain scalar with no tag resolves by the core schema's table; anything else is a `Str`:
+
+- `null`, `Null`, `NULL`, `~` and an empty node are `Null`.
+- `true`, `True`, `TRUE`, `false`, `False` and `FALSE` are `Bool`.
+- `[-+]?[0-9]+`, `0o[0-7]+` and `0x[0-9a-fA-F]+` are `Int` (`0o17` is 15, `-0` is 0). An integer outside `Int`'s range is an error, "line 1, column 1: the integer 9223372036854775808 does not fit in an Int".
+- `[-+]?(\.[0-9]+|[0-9]+(\.[0-9]*)?)([eE][-+]?[0-9]+)?` (`1.5`, `.5`, `1.`, `1e3`) is a `Float`, and so are `.inf`, `.Inf` and `.INF` with an optional sign, and `.nan`, `.NaN` and `.NAN`.
+- Anything else, `yes`, `0b1`, `1_000` and `2024-01-01` included, is a `Str`.
+
+A quoted or block scalar is always a `Str`. The tags `!` and `!!str` make any scalar a `Str`, and `!!null`, `!!bool`, `!!int` and `!!float` resolve the text as that type (quoted or not, `!!float` taking integers too); text that does not match is an error, "line 1, column 1: `x` does not match its tag !!int". `!!seq` and `!!map` are only for their own kind of collection, and a collection cannot have a scalar tag ("a sequence cannot have the tag !!str"). Any other tag, `!!set` and `!!omap` included, gives `Tagged`.
+
+**Anchors and aliases.** An alias is the node its anchor names, so `b: *x` after `a: &x [1, 2]` makes `b` the same `[1, 2]`. Anchors belong to their document, and a later anchor of the same name replaces an earlier one. An alias with no anchor before it is an error, and so is one inside the node it names (`&a [*a]`), which would be a cycle.
+
+**Keys.** A key that repeats in one mapping is an error, "line 2, column 1: duplicate key `a`". Keys are compared as nodes: `1` and `0x1`, and `a` and `'a'`, are the same key, and so is a key that comes through an alias, or a collection key written twice. A mapping's pairs are compared in order, so `{a: 1, b: 2}` and `{b: 2, a: 1}` count as different keys. `1` and `1.0` (an `Int` and a `Float`) are different keys.
+
+**Limits.** These make untrusted input safe, however it is written:
+
+- Nesting: at most `max_depth()`, 512, sequences and mappings inside each other ("nested deeper than 512"). The levels of the node an alias names count where the alias stands.
+- Alias expansion: the nodes that the aliases of one stream stand for count towards `max_alias_nodes()`, 1,000,000 ("these aliases expand past the limit of 1000000 nodes"). Each anchor records how many nodes its node is, so an alias is charged before it is used, and a stream of aliases of aliases (billion laughs) fails at once, without expanding.
+- Aliases inside aliases: at most `max_alias_depth()`, 100 ("aliases nested more than 100 deep").
+
+The parser, the composer, `to_json` and `from_json` keep their place in lists rather than recursing, so a document at the deepest nesting allowed fits a task's stack. An alias shares the node its anchor names rather than copying it. Every error starts with the line and column where it is found, both counted from 1: "line 4, column 3: ...".
+
 ### http
 
 HTTP/1.1, plain or over TLS. The server keeps connections alive between requests and reads pipelined requests in order; bodies can be streamed in pieces both ways. The client uses TLS for `https://` URLs; the server uses TLS when its listener came from `Listen.on_tls`, and nothing else changes.
