@@ -691,8 +691,11 @@ let closing_brace c from =
   in
   go from
 
+(* Where a field ends: after its `as "key"`, or its type. *)
+let field_end (s : struct_decl) f (t : ty_expr) = match List.assoc_opt f s.st_keys with Some (_, (ksp : Span.t)) -> ksp.hi | None -> t.tspan.hi
+
 let struct_close c (s : struct_decl) =
-  closing_brace c (match List.rev s.st_fields with (_, _, t) :: _ -> t.tspan.hi | [] -> s.st_span.hi)
+  closing_brace c (match List.rev s.st_fields with (f, _, t) :: _ -> field_end s f t | [] -> s.st_span.hi)
 
 let enum_close c (e : enum_decl) =
   closing_brace c
@@ -784,10 +787,12 @@ let item c (it : item) =
       (fun (f, (fsp : Span.t), t) ->
         ignore (leading c 4 ~prev:!prev fsp.lo);
         new_line c 4;
-        (* an embedded struct is written as its type alone *)
-        add c ((if List.mem f s.st_embeds then ty t else f ^ ": " ^ ty t) ^ ",");
-        if not single then trailing c t.tspan.hi;
-        prev := t.tspan.hi)
+        (* an embedded struct is written as its type alone; a key as it is written *)
+        let key = match List.assoc_opt f s.st_keys with Some (_, (ksp : Span.t)) -> " as " ^ String.sub c.src ksp.lo (ksp.hi - ksp.lo) | None -> "" in
+        add c ((if List.mem f s.st_embeds then ty t else f ^ ": " ^ ty t ^ key) ^ ",");
+        let hi = field_end s f t in
+        if not single then trailing c hi;
+        prev := hi)
       s.st_fields;
     if s.st_fields = [] then add c "}"
     else begin

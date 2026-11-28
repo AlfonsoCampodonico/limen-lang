@@ -203,6 +203,10 @@ type struct_decl = {
       (* the fields written as a bare type, `struct Admin { User, level: Int }`:
          an embedded struct, stored as a field named after its type (`User`),
          whose fields and methods the checker promotes onto the outer struct *)
+  st_keys : (string * (string * span)) list;
+      (* the fields written `name: T as "key"`: each field's key outside
+         Limen, for the json, yaml and sql conversions, and where the key's
+         string is written; a field not here is its own key *)
   st_pub : bool;
   st_foreign : (string * ty_expr list) option;
       (* declared in a `foreign "lib" { struct ... }` block: a C struct passed
@@ -235,6 +239,9 @@ type iface_decl = {
    type, the same type wherever it is written. Expanded when modules load,
    so the checker and both backends never see one. *)
 type alias_decl = { ty_name : string; ty_span : span; ty_gen : string list; ty_body : ty_expr; ty_pub : bool }
+
+(* A field's key outside Limen: its `as "key"`, or its name. *)
+let field_key (s : struct_decl) f = match List.assoc_opt f s.st_keys with Some (k, _) -> k | None -> f
 
 type item = IFn of fn_decl | IStruct of struct_decl | IEnum of enum_decl | IIface of iface_decl | IType of alias_decl
 

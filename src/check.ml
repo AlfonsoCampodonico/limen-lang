@@ -3718,6 +3718,21 @@ let check_program (user_items : item list) : Diag.t list * fn_info list =
               end)
             s.st_fields
         in
+        (* each field's key outside Limen, its `as "key"` or its name, is
+           the field's alone *)
+        (if s.st_keys <> [] then
+           let owners = Hashtbl.create 8 in
+           List.iter
+             (fun (f, fsp, _) ->
+               let k = field_key s f in
+               match Hashtbl.find_opt owners k with
+               | Some g when g <> f ->
+                 let sp = match List.assoc_opt f s.st_keys with Some (_, ksp) -> ksp | None -> fsp in
+                 err ctx "E0124" sp (sprintf "fields `%s` and `%s` both have the key `%s`" g f k)
+                   ~notes:[ "json, yaml and sql read and write each field by its key, so the keys must differ" ]
+               | Some _ -> ()
+               | None -> Hashtbl.replace owners k f)
+             s.st_fields);
         Hashtbl.replace ctx.sfields s.st_name fs;
         take_pending (own_bounds s.st_name)
       | IEnum e ->

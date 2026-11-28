@@ -128,7 +128,8 @@ let of_file ?(all = false) name text (f : file) =
           List.map
             (fun (f, (fsp : Span.t), te) ->
               (* an embedded struct is written as its type alone *)
-              let sg = if List.mem f s.st_embeds then slice text te.tspan else f ^ ": " ^ slice text te.tspan in
+              let key = match List.assoc_opt f s.st_keys with Some (_, ksp) -> " as " ^ slice text ksp | None -> "" in
+              let sg = if List.mem f s.st_embeds then slice text te.tspan else f ^ ": " ^ slice text te.tspan ^ key in
               { m_name = f; m_sig = sg; m_doc = doc_above text fsp.lo })
             s.st_fields
         in

@@ -1047,14 +1047,29 @@ let parse_item st =
     need_sym st "{";
     (* a field is `name: Type`, or a bare struct type that is embedded:
        `User`, `auth.User`, `Pair[Int]`, stored as a field named `User` *)
-    let embeds = ref [] in
+    let embeds = ref [] and keys = ref [] in
+    (* `as "key"` on the field's line: the field's key outside Limen. On
+       the next line `as` is a field of that name. *)
+    let has_key st = (match cur st with IDENT "as" -> true | _ -> false) && (not (cur_nl st)) && next st <> SYM ":" in
+    let typed st =
+      let f, fsp = expect_ident st in
+      need_sym st ":";
+      let te = parse_type st in
+      if has_key st then begin
+        skip st;
+        let s = advance st in
+        match s.tok with
+        | STR [ Lit k ] when k <> "" -> keys := (f, (k, s.span)) :: !keys
+        | STR [] -> raise (Diag.Fatal (Diag.make "E0003" s.span "a field's key cannot be empty"))
+        | STR _ -> raise (Diag.Fatal (Diag.make "E0003" s.span "a field's key must be a plain string, without interpolation"))
+        | _ -> raise (Diag.Fatal (Diag.make "E0003" s.span "a field's key is a string, as in `name: Str as \"key\"`"))
+      end;
+      (f, fsp, te)
+    in
     let fields =
       comma_list st "}" (fun st ->
           match (cur st, next st) with
-          | IDENT _, SYM ":" ->
-            let f, fsp = expect_ident st in
-            need_sym st ":";
-            (f, fsp, parse_type st)
+          | IDENT _, SYM ":" -> typed st
           | IDENT n, nxt
             when is_upper n
                  || (nxt = SYM "." && match tok_at st (st.pos + 2) with IDENT b -> is_upper b | _ -> false) ->
@@ -1064,14 +1079,19 @@ let parse_item st =
               | TyName (n, _) -> ( match String.rindex_opt n '.' with Some i -> String.sub n (i + 1) (String.length n - i - 1) | None -> n)
               | _ -> ""
             in
+            if has_key st then
+              raise
+                (Diag.Fatal
+                   (Diag.make "E0003" (peek st).span
+                      ~notes:[ Printf.sprintf "give it a field name to key it, as in `%s: %s as \"key\"`" (String.lowercase_ascii f) f ]
+                      "an embedded struct has no key: its fields are the outer struct's"));
             embeds := f :: !embeds;
             (f, te.tspan, te)
-          | _ ->
-            let f, fsp = expect_ident st in
-            need_sym st ":";
-            (f, fsp, parse_type st))
+          | _ -> typed st)
     in
-    IStruct { st_name = name; st_span = nsp; st_gen = gen; st_bounds = bounds; st_fields = fields; st_embeds = List.rev !embeds; st_pub = false; st_foreign = None }
+    IStruct
+      { st_name = name; st_span = nsp; st_gen = gen; st_bounds = bounds; st_fields = fields; st_embeds = List.rev !embeds; st_keys = List.rev !keys;
+        st_pub = false; st_foreign = None }
   | KW "enum" ->
     skip st;
     let name, nsp = expect_ident st in
@@ -1157,7 +1177,7 @@ let parse_foreign st =
       in
       items :=
         IStruct
-          { st_name = name; st_span = nsp; st_gen = []; st_bounds = []; st_fields = fields; st_embeds = []; st_pub = pub;
+          { st_name = name; st_span = nsp; st_gen = []; st_bounds = []; st_fields = fields; st_embeds = []; st_keys = []; st_pub = pub;
             st_foreign = Some (lib, List.map (fun (_, _, t) -> t) fields) }
         :: !items
     end

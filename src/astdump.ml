@@ -127,7 +127,7 @@ let item = function
     ^ "]("
     ^ String.concat "," (List.map (fun p -> (if p.prm_mut then "mut " else "") ^ p.prm_name ^ ":" ^ ty p.prm_ty ^ match p.prm_default with Some e -> "=" ^ expr e | None -> "") d.fn_params)
     ^ ")" ^ (match d.fn_ret with Some t -> ty t | None -> "") ^ block d.fn_body
-  | IStruct s -> (match s.st_foreign with Some (l, _) -> "foreign " ^ String.escaped l ^ " " | None -> "") ^ "struct " ^ s.st_name ^ "[" ^ gens s.st_gen s.st_bounds ^ "]{" ^ String.concat "," (List.map (fun (f, _, t) -> if List.mem f s.st_embeds then "embed " ^ ty t else f ^ ":" ^ ty t) s.st_fields) ^ "}"
+  | IStruct s -> (match s.st_foreign with Some (l, _) -> "foreign " ^ String.escaped l ^ " " | None -> "") ^ "struct " ^ s.st_name ^ "[" ^ gens s.st_gen s.st_bounds ^ "]{" ^ String.concat "," (List.map (fun (f, _, t) -> if List.mem f s.st_embeds then "embed " ^ ty t else f ^ ":" ^ ty t ^ match List.assoc_opt f s.st_keys with Some (k, _) -> " as " ^ String.escaped k | None -> "") s.st_fields) ^ "}"
   | IEnum e ->
     "enum " ^ e.en_name ^ "[" ^ gens e.en_gen e.en_bounds ^ "]{"
     ^ String.concat "," (List.map (fun (v, _, ts) -> v ^ "(" ^ String.concat "," (List.map ty ts) ^ ")") e.en_variants)

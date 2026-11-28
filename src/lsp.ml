@@ -232,7 +232,9 @@ let hover_items text items =
       | IStruct s ->
         add s.st_span ("struct " ^ s.st_name);
         List.iter
-          (fun (f, sp, te) -> add sp (if List.mem f s.st_embeds then "embedded " ^ slice text te.tspan else f ^ ": " ^ slice text te.tspan))
+          (fun (f, sp, te) ->
+            let key = match List.assoc_opt f s.st_keys with Some (_, ksp) -> " as " ^ slice text ksp | None -> "" in
+            add sp (if List.mem f s.st_embeds then "embedded " ^ slice text te.tspan else f ^ ": " ^ slice text te.tspan ^ key))
           s.st_fields
       | IEnum e ->
         add e.en_span ("enum " ^ e.en_name);

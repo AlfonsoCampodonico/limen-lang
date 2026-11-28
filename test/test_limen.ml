@@ -4058,6 +4058,18 @@ fn bump(mut m: Int) {
          [ "contents"; "value" ])
   in
   ok "lsp-hover-mut-param" (param_hover = "```limen\nmut n: Int\n```") param_hover;
+  (* a field with a key: the hover shows it *)
+  let key_uri = "file:///tmp/lsp-field-key.lmn" in
+  let key_doc = "struct Config {\n    current_context: Str as \"current-context\",\n}\n\nfn main(root: Root) {\n    let c = Config { current_context: \"a\" }\n    root.stdout.print(c.current_context)\n}\n" in
+  ignore (Lsp.handle st (note "textDocument/didOpen" (J.Obj [ ("textDocument", J.Obj [ ("uri", J.String key_uri); ("text", J.String key_doc) ]) ])));
+  let kl, kc = at key_doc "current_context: Str" 0 in
+  let key_hover =
+    J.to_str
+      (J.path
+         (result (Lsp.handle st (req "textDocument/hover" (J.Obj [ ("textDocument", J.Obj [ ("uri", J.String key_uri) ]); ("position", J.Obj [ ("line", J.Int kl); ("character", J.Int kc) ]) ]))))
+         [ "contents"; "value" ])
+  in
+  ok "lsp-hover-field-key" (key_hover = "```limen\ncurrent_context: Str as \"current-context\"\n```") key_hover;
   (* a check parses again only the files whose text changed; a change to a
      module rechecks the open files that use it and publishes theirs *)
   (let dir = Filename.concat (Filename.get_temp_dir_name ()) (sprintf "limen-lsp-cache-%d" (Unix.getpid ())) in
@@ -14197,6 +14209,161 @@ Ok(Arr([Num(inf), Num(-0.0), Int(7), Str("x"), Arr([]), Obj([])]))
 Map([yaml.Pair { key: Str("a"), value: Seq([Int(1), Float(2.5), Null, Bool(true), Str("s")]) }, yaml.Pair { key: Str("b"), value: Map([]) }])
 true
 |};
+   (* field keys: `name: T as "key"` names the field's key outside Limen, for
+     json, yaml and sql; inside Limen the field keeps its own name *)
+   out "field-key-yaml"
+     {|use json
+use yaml
+
+struct Config {
+    current_context: Str as "current-context",
+    ca: Option[Str] as "certificate-authority-data",
+    name: Str,
+}
+
+fn shown(s: Str) -> Str {
+    match yaml.parse(s) {
+        Ok(n) => match yaml.to_json(n) {
+            Ok(v) => json.stringify(v),
+            Err(e) => e,
+        },
+        Err(e) => e,
+    }
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let r: Result[Config, Str] = yaml.decode("current-context: prod\ncertificate-authority-data: abc\nname: x\n")
+    out.print("{r}")
+    match r {
+        Ok(c) => {
+            let s = yaml.encode(c)
+            out.print(shown(s))
+            let back: Result[Config, Str] = yaml.decode(s)
+            out.print("{back == Ok(c)} {c.current_context}")
+        },
+        Err(e) => out.print(e),
+    }
+    let none: Result[Config, Str] = yaml.decode("current-context: dev\nname: y\nca: ignored\n")
+    out.print("{none}")
+}
+|}
+     {|Ok(Config { current_context: "prod", ca: Some("abc"), name: "x" })
+{"current-context":"prod","certificate-authority-data":"abc","name":"x"}
+true prod
+Ok(Config { current_context: "dev", ca: None, name: "y" })
+|};
+   out "field-key-json"
+     {|use json
+
+struct Meta {
+    resource_version: Str as "resourceVersion",
+    name: Str,
+}
+
+struct Chain {
+    value: Int as "the-value",
+    next_one: Option[Chain] as "nextOne",
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let m = Meta { resource_version: "42", name: "a" }
+    let s = json.encode(m)
+    out.print(s)
+    let back: Result[Meta, Str] = json.decode(s)
+    out.print("{back}")
+    let c = Chain { value: 1, next_one: Some(Chain { value: 2, next_one: None }) }
+    let cs = json.encode(c)
+    out.print(cs)
+    let cb: Result[Chain, Str] = json.decode(cs)
+    out.print("{cb == Ok(c)}")
+    let wrong: Result[Meta, Str] = json.decode("\{\"resource_version\": \"1\", \"name\": \"b\"\}")
+    out.print("{wrong}")
+}
+|}
+     {|{"resourceVersion":"42","name":"a"}
+Ok(Meta { resource_version: "42", name: "a" })
+{"the-value":1,"nextOne":{"the-value":2,"nextOne":null}}
+true
+Err("`resourceVersion` is missing")
+|};
+   out "field-key-sql"
+     {|use sql
+
+struct Row {
+    id: Int,
+    full_name: Str as "full-name",
+    note: Option[Str] as "Note Text",
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let db = sql.memory()?
+    db.exec("CREATE TABLE t (id INTEGER, \"full-name\" TEXT, \"Note Text\" TEXT)", [])?
+    db.exec("INSERT INTO t VALUES (?, ?, ?)", sql.values(Row { id: 1, full_name: "Ada", note: Some("n") }))?
+    let all: List[Row] = db.all("SELECT * FROM t", [])?
+    for r in all {
+        root.stdout.print("{r.id} {r.full_name} {r.note ?? "-"}")
+    }
+    for row in db.query("SELECT * FROM t", [])? {
+        let r: Row = sql.decode(row)?
+        root.stdout.print(r.full_name)
+    }
+    let bad: Result[List[Row], IoError] = db.all("SELECT id FROM t", [])
+    root.stdout.print("{bad}")
+    Ok(())
+}
+|}
+     {|1 Ada n
+Ada
+Err(Failed("sql: no column `full-name` for `Row.full-name`; the row has id"))
+|};
+   out "field-key-errors"
+     {|use json
+use yaml
+
+struct Config {
+    current_context: Str as "current-context",
+}
+
+struct Meta {
+    resource_version: Str as "resourceVersion",
+}
+
+struct Obj {
+    spec: Meta,
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    let a: Result[Config, Str] = yaml.decode("current_context: x\n")
+    out.print("{a}")
+    let b: Result[Obj, Str] = json.decode("\{\"spec\": \{\"resourceVersion\": 5\}\}")
+    out.print("{b}")
+    let c: Result[Obj, Str] = yaml.decode("spec:\n  resourceVersion: [1]\n")
+    out.print("{c}")
+}
+|}
+     {|Err("`current-context` is missing")
+Err("`spec.resourceVersion`: expected a string, found a number")
+Err("`spec.resourceVersion`: expected a string, found a sequence")
+|};
+   errs "field-key-dup" "struct S {\n    a: Int as \"b\",\n    b: Int,\n}\n\nfn main(root: Root) {}\n" [ "E0124" ];
+   says "field-key-dup-says" "struct S {\n    a: Int as \"b\",\n    b: Int,\n}\n\nfn main(root: Root) {}\n" "E0124" "fields `a` and `b` both have the key `b`";
+   says "field-key-dup-same" "struct S {\n    x: Int as \"k\",\n    y: Str as \"k\",\n}\n\nfn main(root: Root) {}\n" "E0124" "fields `x` and `y` both have the key `k`";
+   errs "field-key-dup-own-name" "struct S {\n    a: Int as \"a\",\n    b: Int as \"c\",\n    c: Int as \"b\",\n}\n\nfn main(root: Root) {}\n" [];
+   says "field-key-parse-empty" "struct S {\n    x: Int as \"\",\n}\n\nfn main(root: Root) {}\n" "E0003" "a field's key cannot be empty";
+   says "field-key-parse-interp" "struct S {\n    x: Int as \"{y}\",\n}\n\nfn main(root: Root) {}\n" "E0003" "a field's key must be a plain string, without interpolation";
+   says "field-key-parse-not-string" "struct S {\n    x: Int as y,\n}\n\nfn main(root: Root) {}\n" "E0003" "a field's key is a string, as in `name: Str as \"key\"`";
+   says "field-key-parse-embedded" "struct User {\n    name: Str,\n}\n\nstruct Admin {\n    User as \"user\",\n}\n\nfn main(root: Root) {}\n" "E0003" "an embedded struct has no key";
+   (* `as` on the next line is a field named `as` *)
+   out "field-key-plain-as-field" "struct S {\n    x: Int\n    as: Int\n}\n\nfn main(root: Root) {\n    let s = S { x: 1, as: 2 }\n    root.stdout.print(\"{s.x} {s.as}\")\n}\n" "1 2\n";
+   (let src = "struct S {\n    current_context: Str   as   \"current-context\",\n    b: Int as \"a}b\" // after\n    c: Int as \"q\\\"t\", d: Int }\n" in
+    let want = "struct S {\n    current_context: Str as \"current-context\",\n    b: Int as \"a}b\",  // after\n    c: Int as \"q\\\"t\",\n    d: Int,\n}\n" in
+    let got = try Fmt.format ~file:"field-key-fmt.lmn" src with Diag.Fatal d -> "error: " ^ d.message in
+    ok "field-key-fmt" (got = want) (sprintf "got:\n%s\nwant:\n%s" got want);
+    ok "field-key-fmt-idempotent" (try Fmt.format ~file:"field-key-fmt2.lmn" got = got with Diag.Fatal _ -> false) "not idempotent";
+    check_fmt "field-key-fmt" src ());
    (* yaml.encode and yaml.decode: the compiler writes the conversions over
      yaml.Node per type, as for json. The encoded text is checked by
      reading it back, so these lines hold whatever layout stringify picks. *)

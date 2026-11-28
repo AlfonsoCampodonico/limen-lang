@@ -333,11 +333,13 @@ and bodies st t : block * block * block option =
     let env = List.combine sd.st_gen args in
     let fs = List.map (fun (f, _, fte) -> (f, field_ty env fte)) sd.st_fields in
     need (List.map snd fs);
+    (* a field is read and written by its key, `as "key"` or its name *)
+    let key f = str st (field_key sd f) in
     let enc =
-      if pl then fields_obj (List.map (fun (f, ft) -> (f, enc_of ft (ex st (EField (x, f, st.sp))))) fs)
+      if pl then fields_obj (List.map (fun (f, ft) -> (field_key sd f, enc_of ft (ex st (EField (x, f, st.sp))))) fs)
       else
       call st (jf st "put_fields")
-        [ ex st (EList (List.map (fun (f, _) -> str st f) fs)); ex st (EList (List.map (fun (f, ft) -> put_of ft (ex st (EField (x, f, st.sp)))) fs)) ]
+        [ ex st (EList (List.map (fun (f, _) -> key f) fs)); ex st (EList (List.map (fun (f, ft) -> put_of ft (ex st (EField (x, f, st.sp)))) fs)) ]
     in
     let check = { sdesc = SExpr (try_ st (call st (jf st "need_object") [ v; at ])); sspan = st.sp } in
     let dec =
@@ -345,7 +347,7 @@ and bodies st t : block * block * block option =
         (EStruct
            ( n, st.sp,
              List.map
-               (fun (f, ft) -> (f, st.sp, try_ st (call st (jf st "member") [ v; at; str st f; fnv (snd (coders st ft)) ])))
+               (fun (f, ft) -> (f, st.sp, try_ st (call st (jf st "member") [ v; at; key f; fnv (snd (coders st ft)) ])))
                fs ))
     in
     let step () =
@@ -353,8 +355,8 @@ and bodies st t : block * block * block option =
         List.map
           (fun (f, ft) ->
             ( ft,
-              (fun () -> call st (jf st "member") [ v; at; str st f; fnv (snd (coders st ft)) ]),
-              fun kk -> call st (jf st "member_k") [ v; at; str st f; fnv (step_name st ft); kk ] ))
+              (fun () -> call st (jf st "member") [ v; at; key f; fnv (snd (coders st ft)) ]),
+              fun kk -> call st (jf st "member_k") [ v; at; key f; fnv (step_name st ft); kk ] ))
           fs
       in
       let made = ok (ex st (EStruct (n, st.sp, List.mapi (fun i (f, _) -> (f, st.sp, var st (sprintf "d%d" i))) fs))) in
@@ -455,10 +457,12 @@ let row_coders st t : string * string =
       let parts =
         List.map
           (fun (f, ft) ->
-            let at k = try_ st (call st (jf st (k ^ "_at")) [ row; str st f; str st owner ]) in
+            (* the column of the field's key, `as "key"` or its name *)
+            let col = field_key sd f in
+            let at k = try_ st (call st (jf st (k ^ "_at")) [ row; str st col; str st owner ]) in
             let value = ex st (EField (x, f, st.sp)) in
             match (column ft, repr ft) with
-            | Some k, _ -> (try_ st (call st (jf st "required") [ at k; str st f; str st owner ]), call st (jf st ("of_" ^ k)) [ value ])
+            | Some k, _ -> (try_ st (call st (jf st "required") [ at k; str st col; str st owner ]), call st (jf st ("of_" ^ k)) [ value ])
             | None, TNamed ("Option", [ a ]) when column a <> None ->
               let k = Option.get (column a) in
               (at k, call st (jf st "of_option") [ value; var st (jf st ("of_" ^ k)) ])
