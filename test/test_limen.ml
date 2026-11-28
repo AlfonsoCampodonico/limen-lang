@@ -14311,12 +14311,102 @@ fn main(root: Root) -> Result[(), IoError] {
     }
     let bad: Result[List[Row], IoError] = db.all("SELECT id FROM t", [])
     root.stdout.print("{bad}")
+    let nul: Result[List[Row], IoError] = db.all("SELECT id, NULL AS \"full-name\", NULL AS \"Note Text\" FROM t", [])
+    root.stdout.print("{nul}")
+    let wrong: Result[List[Row], IoError] = db.all("SELECT id, 5 AS \"full-name\", 'x' AS \"Note Text\" FROM t", [])
+    root.stdout.print("{wrong}")
+    let one: Option[Row] = db.one("SELECT * FROM t WHERE id = ?", [sql.Int(1)])?
+    root.stdout.print("{one.map(|r| r.full_name) ?? "none"}")
+    let none: Option[Row] = db.one("SELECT * FROM t WHERE id = 9", [])?
+    root.stdout.print("{none.is_none()}")
     Ok(())
 }
 |}
      {|1 Ada n
 Ada
-Err(Failed("sql: no column `full-name` for `Row.full-name`; the row has id"))
+Err(Failed("sql: no column `full-name` for `Row.full_name`; the row has id"))
+Err(Failed("sql: column `full-name` is NULL, but `Row.full_name` is not an Option"))
+Err(Failed("sql: column `full-name` holds an integer, but `Row.full_name` is a `Str`"))
+Ada
+true
+|};
+   (* postgres reads rows by the same conversions: this only compiles, no server *)
+   errs "field-key-postgres"
+     "use postgres\n\nstruct Row {\n    id: Int,\n    full_name: Str as \"full-name\",\n}\n\nfn copy(pg: postgres.Db) -> Result[Int, IoError] {\n    let rows: List[Row] = pg.all(\"SELECT id, \\\"full-name\\\" FROM t\")?\n    let one: Option[Row] = pg.one(\"SELECT * FROM t WHERE id = $1\", [postgres.Int(1)])?\n    pg.exec(\"INSERT INTO t VALUES ($1, $2)\", postgres.values(Row { id: 2, full_name: \"b\" }))?\n    Ok(rows.len() + (one.map(|r| r.id) ?? 0))\n}\n\nfn main(root: Root) {}\n"
+     [];
+   out "field-key-module"
+     ~modules:[ ("kc", "pub struct Config {\n    current_context: Str as \"current-context\",\n    name: Str,\n}\n") ]
+     {|use json
+use kc
+use yaml
+
+fn main(root: Root) {
+    let c: Result[kc.Config, Str] = yaml.decode("current-context: prod\nname: x\n")
+    root.stdout.print("{c}")
+    let j: Result[kc.Config, Str] = json.decode("\{\"name\": \"y\"\}")
+    root.stdout.print("{j}")
+    root.stdout.print(json.encode(kc.Config { current_context: "a", name: "b" }))
+}
+|}
+     {|Ok(kc.Config { current_context: "prod", name: "x" })
+Err("`current-context` is missing")
+{"current-context":"a","name":"b"}
+|};
+   out "field-key-generic"
+     {|use json
+
+struct Tagged[T] {
+    the_value: T as "the-value",
+    tag_name: Str as "tag-name",
+}
+
+fn main(root: Root) {
+    let a = Tagged { the_value: 1, tag_name: "n" }
+    let b = Tagged { the_value: [true], tag_name: "l" }
+    root.stdout.print(json.encode(a))
+    root.stdout.print(json.encode(b))
+    let ra: Result[Tagged[Int], Str] = json.decode(json.encode(a))
+    let rb: Result[Tagged[List[Bool]], Str] = json.decode(json.encode(b))
+    root.stdout.print("{ra == Ok(a)} {rb == Ok(b)}")
+    let bad: Result[Tagged[Int], Str] = json.decode("\{\"the-value\": \"x\", \"tag-name\": \"t\"\}")
+    root.stdout.print("{bad}")
+}
+|}
+     {|{"the-value":1,"tag-name":"n"}
+{"the-value":[true],"tag-name":"l"}
+true true
+Err("`the-value`: expected a whole number, found a string")
+|};
+   out "field-key-enum"
+     {|use json
+use yaml
+
+struct Meta {
+    resource_version: Str as "resourceVersion",
+}
+
+enum Event {
+    Added(Meta),
+    Moved(Meta, Int),
+    Gone,
+}
+
+fn main(root: Root) {
+    let es = [Event.Added(Meta { resource_version: "1" }), Event.Moved(Meta { resource_version: "2" }, 3), Event.Gone]
+    let s = json.encode(es)
+    root.stdout.print(s)
+    let back: Result[List[Event], Str] = json.decode(s)
+    root.stdout.print("{back == Ok(es)}")
+    let y: Result[List[Event], Str] = yaml.decode(yaml.encode(es))
+    root.stdout.print("{y == Ok(es)}")
+    let bad: Result[List[Event], Str] = json.decode("[\{\"Added\": \{\"resource_version\": \"1\"\}\}]")
+    root.stdout.print("{bad}")
+}
+|}
+     {|[{"Added":{"resourceVersion":"1"}},{"Moved":[{"resourceVersion":"2"},3]},"Gone"]
+true
+true
+Err("`[0].Added.resourceVersion` is missing")
 |};
    out "field-key-errors"
      {|use json
@@ -14355,6 +14445,8 @@ Err("`spec.resourceVersion`: expected a string, found a sequence")
    says "field-key-parse-empty" "struct S {\n    x: Int as \"\",\n}\n\nfn main(root: Root) {}\n" "E0003" "a field's key cannot be empty";
    says "field-key-parse-interp" "struct S {\n    x: Int as \"{y}\",\n}\n\nfn main(root: Root) {}\n" "E0003" "a field's key must be a plain string, without interpolation";
    says "field-key-parse-not-string" "struct S {\n    x: Int as y,\n}\n\nfn main(root: Root) {}\n" "E0003" "a field's key is a string, as in `name: Str as \"key\"`";
+   says "field-key-parse-multiline" "struct S {\n    x: Int as \"\"\"\n        key\n        \"\"\",\n}\n\nfn main(root: Root) {}\n" "E0003" "a field's key is written on one line";
+   says "field-key-parse-multiline-empty" "struct S {\n    x: Int as \"\"\"\n        \"\"\",\n}\n\nfn main(root: Root) {}\n" "E0003" "a field's key is written on one line";
    says "field-key-parse-embedded" "struct User {\n    name: Str,\n}\n\nstruct Admin {\n    User as \"user\",\n}\n\nfn main(root: Root) {}\n" "E0003" "an embedded struct has no key";
    (* `as` on the next line is a field named `as` *)
    out "field-key-plain-as-field" "struct S {\n    x: Int\n    as: Int\n}\n\nfn main(root: Root) {\n    let s = S { x: 1, as: 2 }\n    root.stdout.print(\"{s.x} {s.as}\")\n}\n" "1 2\n";

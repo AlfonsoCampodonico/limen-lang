@@ -1,4 +1,5 @@
 use json
+use postgres
 use sql
 use yaml
 
@@ -30,7 +31,26 @@ fn people(db: sql.Db) -> Result[List[Person], IoError] {
     db.all("SELECT * FROM people", [])
 }
 
+// the same struct through postgres: its own conversions, with the same keys
+fn copy(pg: postgres.Db) -> Result[Int, IoError] {
+    let rows: List[Person] = pg.all("SELECT * FROM people")?
+    let one: Option[Person] = pg.one("SELECT * FROM people WHERE id = $1", [postgres.Int(1)])?
+    pg.exec("INSERT INTO people VALUES ($1, $2, $3)", postgres.values(Person { id: 2, full_name: "b", note: None }))?
+    Ok(rows.len() + (one.map(|p| p.id) ?? 0))
+}
+
+struct Tagged[T] {
+    the_value: T as "the-value",
+}
+
+enum Event {
+    Added(Meta),
+    Gone,
+}
+
 fn main(root: Root) {
+    root.stdout.print(json.encode(Tagged { the_value: [1] }))
+    root.stdout.print(yaml.encode([Event.Added(Meta { resource_version: "1" }), Event.Gone]))
     let c: Result[Config, Str] = yaml.decode("current-context: prod\nname: x\n")
     root.stdout.print("{c}")
     match c {
