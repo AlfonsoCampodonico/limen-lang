@@ -1,0 +1,88 @@
+# The site operator (examples/site_operator.lmn) running in the cluster, in
+# its own namespace, with a service account that may do only what it does:
+# read and watch StaticSites, write their status, and keep their ConfigMaps,
+# Deployments and Services. The image is examples/k8s/Dockerfile's.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: limen-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: site-operator
+  namespace: limen-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: limen-site-operator
+rules:
+  - apiGroups: [limen.dev]
+    resources: [staticsites]
+    verbs: [get, list, watch]
+  - apiGroups: [limen.dev]
+    resources: [staticsites/status]
+    verbs: [patch, update]
+  - apiGroups: [""]
+    resources: [configmaps, services]
+    verbs: [get, list, watch, create, patch, delete]
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [get, list, watch, create, patch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: limen-site-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: limen-site-operator
+subjects:
+  - kind: ServiceAccount
+    name: site-operator
+    namespace: limen-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: site-operator
+  namespace: limen-system
+  labels:
+    app.kubernetes.io/name: site-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: site-operator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: site-operator
+    spec:
+      serviceAccountName: site-operator
+      containers:
+        - name: operator
+          image: limen-site-operator:dev
+          imagePullPolicy: IfNotPresent
+          # the API server's address, the service account directory and the
+          # two variables naming the address: nothing else
+          args:
+            - --grant
+            - net=$(KUBERNETES_SERVICE_HOST):$(KUBERNETES_SERVICE_PORT)
+            - --grant
+            - fs=/var/run/secrets/kubernetes.io/serviceaccount:ro
+            - --grant
+            - env=KUBERNETES_SERVICE_HOST
+            - --grant
+            - env=KUBERNETES_SERVICE_PORT
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { memory: 64Mi }

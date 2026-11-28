@@ -10876,8 +10876,8 @@ fn main(root: Root) {
     [
       ("example-todo-api-tests", "todo_api.lmn", "14 tests, 0 failed", []);
       ("example-todo-api-tests-native", "todo_api.lmn", "14 tests, 0 failed", [ "--native" ]);
-      ("example-site-operator-tests", "site_operator.lmn", "19 tests, 0 failed", []);
-      ("example-site-operator-tests-native", "site_operator.lmn", "19 tests, 0 failed", [ "--native" ]);
+      ("example-site-operator-tests", "site_operator.lmn", "25 tests, 0 failed", []);
+      ("example-site-operator-tests-native", "site_operator.lmn", "25 tests, 0 failed", [ "--native" ]);
     ];
   (* the foreign grant is announced as full access, and `limen check` lists who calls C *)
   put "capp/limen.toml" "[package]\nname = \"capp\"\n\n[dependencies]\ncdep = { path = \"../cdep\" }\n\n[trust]\nforeign = [\"cdep\"]\n\n[grants]\nforeign = \"c\"\n";

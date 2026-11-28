@@ -15,10 +15,21 @@
 // site deletes its objects: they name the site as their owner, and
 // Kubernetes collects them.
 //
-// It reaches the API server through `kubectl proxy`, which holds the
-// credentials. That proxy is the only thing it can reach:
+// It runs in two ways. In the cluster, as a Deployment
+// (examples/k8s/operator.yaml), it reads its service account's token and
+// the cluster's CA, and the API server's address is all it can reach:
 //
-//   kind create cluster --name limen-demo                (kubectl now points at it)
+//   kind create cluster --name limen-demo
+//   docker build -f examples/k8s/Dockerfile -t limen-site-operator:dev .
+//   kind load docker-image limen-site-operator:dev --name limen-demo
+//   kubectl apply -f examples/k8s/staticsite-crd.yaml -f examples/k8s/operator.yaml
+//   kubectl apply -f examples/k8s/hello-site.yaml
+//
+// (test/integration/kind.sh does that and checks the result.) Outside the
+// cluster, with KUBERNETES_SERVICE_HOST not set, it goes through `kubectl
+// proxy`, which holds the credentials, and that proxy is the only thing it
+// can reach:
+//
 //   kubectl apply -f examples/k8s/staticsite-crd.yaml
 //   kubectl proxy --port 8001 &
 //   limen run examples/site_operator.lmn --grant net=127.0.0.1:8001
@@ -27,8 +38,8 @@
 // `-- once` makes one pass and exits. The tests need no cluster:
 //
 //   limen test examples/site_operator.lmn
-use http
 use json
+use kube
 use time
 
 // ---------- the resource ----------
@@ -267,40 +278,35 @@ fn version(v: json.Value) -> Str {
 
 // ---------- talking to the API server ----------
 
-fn call(net: Net, base: Str, method: Str, path: Str, content_type: Str, body: Str) -> Result[(Int, json.Value), Str] {
-    let mut headers = [http.Header { name: "Accept", value: "application/json" }]
-    if !content_type.is_empty() {
-        headers.push(http.Header { name: "Content-Type", value: content_type })
+// An answer from the API server as the operator takes it: a status of 300
+// or more is an error too, explained by the server's Status object.
+fn call(method: Str, path: Str, r: Result[(Int, json.Value), IoError]) -> Result[(Int, json.Value), Str] {
+    let (code, v) = match r {
+        Ok(a) => a,
+        Err(e) => { return Err("{method} {path}: {e.message()}") },
     }
-    let r = match http.request(net, method, base + path, headers, body) {
-        Ok(r) => r,
-        Err(e) => { return Err("{method} {path}: {e}") },
+    if code >= 300 {
+        let why = str_at(v, ["message"]) ?? json.stringify(v)
+        return Err("{method} {path}: {code} {why}")
     }
-    let v = json.parse(r.body) ?? json.Null
-    if r.status >= 300 {
-        // the API server explains itself in a Status object
-        let why = str_at(v, ["message"]) ?? r.body
-        return Err("{method} {path}: {r.status} {why}")
-    }
-    Ok((r.status, v))
+    Ok((code, v))
 }
 
 // Server-side apply: send the whole object as we want it. Fields we set are
-// ours, so a change made to them by hand is reverted (`force`); fields we
-// never set are left alone.
-fn apply(net: Net, base: Str, o: Object) -> Result[(Int, json.Value), Str] {
-    let query = "?fieldManager=limen-site-operator&force=true"
-    call(net, base, "PATCH", o.path + query, "application/apply-patch+yaml", json.stringify(o.body))
+// ours, so a change made to them by hand is reverted; fields we never set
+// are left alone.
+fn apply(k: kube.Client, o: Object) -> Result[(Int, json.Value), Str] {
+    call("PATCH", o.path, k.apply(o.path, "limen-site-operator", o.body))
 }
 
-fn set_status(net: Net, base: Str, s: Site, st: Status) -> Result[(), Str] {
-    let path = "/apis/limen.dev/v1/namespaces/{s.namespace}/staticsites/{s.name}/status"
+fn set_status(k: kube.Client, s: Site, st: Status) -> Result[(), Str] {
+    let path = "/apis/limen.dev/v1/namespaces/{s.namespace}/staticsites/{s.name}"
     let patch = obj([("status", obj([
         ("readyReplicas", num(st.ready)),
         ("url", str(st.url)),
         ("message", str(st.message)),
     ]))])
-    call(net, base, "PATCH", path, "application/merge-patch+json", json.stringify(patch))?
+    call("PATCH", path + "/status", k.patch_status(path, patch))?
     Ok(())
 }
 
@@ -311,7 +317,7 @@ fn set_status(net: Net, base: Str, s: Site, st: Status) -> Result[(), Str] {
 type Seen = Map[Str, Str]
 type Log = fn(Str) -> ()
 
-fn sync(log: Log, net: Net, base: Str, s: Site, seen: Seen) -> Result[Seen, Str] {
+fn sync(log: Log, k: kube.Client, s: Site, seen: Seen) -> Result[Seen, Str] {
     let mut now = map()
     let site = "{s.namespace}/{s.name}"
     let wanted = match problem(s) {
@@ -319,7 +325,7 @@ fn sync(log: Log, net: Net, base: Str, s: Site, seen: Seen) -> Result[Seen, Str]
         None => {
             let mut dep = json.Null
             for o in desired(s) {
-                let (code, got) = apply(net, base, o)?
+                let (code, got) = apply(k, o)?
                 let key = "{o.kind} {s.namespace}/{o.name}"
                 let v = version(got)
                 match outcome(code, seen.get(key), v) {
@@ -335,24 +341,25 @@ fn sync(log: Log, net: Net, base: Str, s: Site, seen: Seen) -> Result[Seen, Str]
         },
     }
     if wanted != s.status {
-        set_status(net, base, s, wanted)?
+        set_status(k, s, wanted)?
         log("{site}: {wanted.message}")
     }
     now["StaticSite {site}"] = ""
     Ok(now)
 }
 
-fn pass(log: Log, net: Net, base: Str, seen: Seen) -> Result[Seen, Str] {
-    let (_, list) = call(net, base, "GET", "/apis/limen.dev/v1/staticsites", "", "")?
+fn pass(log: Log, k: kube.Client, seen: Seen) -> Result[Seen, Str] {
+    let path = "/apis/limen.dev/v1/staticsites"
+    let (_, list) = call("GET", path, k.list(path))?
     let items = dig(list, ["items"]) ?? json.Arr([])
     let mut next = map()
     for item in items.as_list() ?? [] {
         match parse_site(item) {
             Err(e) => log("skipped: {e}"),
-            Ok(s) => match sync(log, net, base, s, seen) {
+            Ok(s) => match sync(log, k, s, seen) {
                 Ok(now) => {
-                    for (k, v) in now.entries() {
-                        next[k] = v
+                    for (key, v) in now.entries() {
+                        next[key] = v
                     }
                 },
                 // one broken site does not stop the others; it is tried again next pass
@@ -363,9 +370,9 @@ fn pass(log: Log, net: Net, base: Str, seen: Seen) -> Result[Seen, Str] {
             },
         }
     }
-    for k in seen.keys() {
-        if k.starts_with("StaticSite ") && !next.contains(k) {
-            log("{k.slice(11, k.len())}: deleted; Kubernetes removes its objects")
+    for key in seen.keys() {
+        if key.starts_with("StaticSite ") && !next.contains(key) {
+            log("{key.slice(11, key.len())}: deleted; Kubernetes removes its objects")
         }
     }
     Ok(next)
@@ -375,10 +382,14 @@ fn pass(log: Log, net: Net, base: Str, seen: Seen) -> Result[Seen, Str] {
 
 // One line of a watch stream, `{"type": "MODIFIED", "object": {...}}`, as
 // the log shows it: "MODIFIED Deployment default/hello". An ERROR event
-// (the API server ending the watch) gives "ERROR" and its message.
+// (the API server ending the watch) gives "ERROR" and its message. A
+// BOOKMARK only marks a version, so it gives nothing.
 fn event_text(line: Str) -> Option[Str] {
     let v = json.parse(line) ?? { return None }
     let kind = str_at(v, ["type"]) ?? { return None }
+    if kind == "BOOKMARK" {
+        return None
+    }
     if kind == "ERROR" {
         return Some("ERROR " + (str_at(v, ["object", "message"]) ?? "from the API server"))
     }
@@ -389,24 +400,23 @@ fn event_text(line: Str) -> Option[Str] {
 }
 
 // What to watch: the sites, and the objects made for them, by their label.
+// The API server ends each watch after five minutes.
 fn watched() -> List[Str] {
-    let mine = "labelSelector=app.kubernetes.io%2Fname%3Dstatic-site"
+    let mine = "labelSelector=app.kubernetes.io%2Fname%3Dstatic-site&timeoutSeconds=300"
     [
-        "/apis/limen.dev/v1/staticsites?",
-        "/apis/apps/v1/deployments?{mine}&",
-        "/api/v1/configmaps?{mine}&",
-        "/api/v1/services?{mine}&",
+        "/apis/limen.dev/v1/staticsites?timeoutSeconds=300",
+        "/apis/apps/v1/deployments?{mine}",
+        "/api/v1/configmaps?{mine}",
+        "/api/v1/services?{mine}",
     ]
 }
 
-// Watch `what` for good, sending each event to `events` as it arrives. The
-// API server ends a watch after `timeoutSeconds`; it is started again then,
-// and begins with an ADDED event for everything there, so nothing is missed.
-fn watch(log: Log, net: Net, base: Str, what: Str, events: Chan[Str], clock: Clock) {
-    let url = base + what + "watch=true&timeoutSeconds=300"
-    let accept = [http.Header { name: "Accept", value: "application/json" }]
+// Watch `what` for good, sending each event to `events` as it arrives. A
+// watch that ends is started again from now, and that begins with an ADDED
+// event for everything there, so nothing is missed.
+fn watch(log: Log, k: kube.Client, what: Str, events: Chan[Str], clock: Clock) {
     while true {
-        let r = http.request_lines(net, "GET", url, accept, "", |line| {
+        let r = k.watch(what, "", |line| {
             match event_text(line) {
                 Some(e) => {
                     events.send(e)
@@ -416,13 +426,13 @@ fn watch(log: Log, net: Net, base: Str, what: Str, events: Chan[Str], clock: Clo
             }
         })
         match r {
-            Ok(resp) if resp.status < 300 => (),
-            Ok(resp) => {
-                log("watch {what}: {resp.status} {resp.body.trim()}")
+            Ok(code) if code < 300 => (),
+            Ok(code) => {
+                log("watch {what}: {code}")
                 clock.sleep(2000)
             },
             Err(e) => {
-                log("watch {what}: {e}")
+                log("watch {what}: {e.message()}")
                 clock.sleep(2000)
             },
         }
@@ -433,7 +443,7 @@ fn watch(log: Log, net: Net, base: Str, what: Str, events: Chan[Str], clock: Clo
 // changes a Deployment several times), so it takes all that are waiting
 // and makes one pass for them. Most passes find nothing to do and say
 // nothing.
-fn reconcile(log: Log, net: Net, base: Str, events: Chan[Str], clock: Clock) {
+fn reconcile(log: Log, k: kube.Client, events: Chan[Str], clock: Clock) {
     let mut seen = map()
     while true {
         let first = select {
@@ -454,7 +464,7 @@ fn reconcile(log: Log, net: Net, base: Str, events: Chan[Str], clock: Clock) {
         // what the pass does is logged with the event that led to it
         let after = if more > 0 { "{first}, and {more} more" } else { first }
         let said = |line: Str| log("{line}  (after {after})")
-        match pass(said, net, base, seen) {
+        match pass(said, k, seen) {
             Ok(next) => { seen = next },
             Err(e) => log("pass failed, trying again: {e}"),
         }
@@ -462,23 +472,27 @@ fn reconcile(log: Log, net: Net, base: Str, events: Chan[Str], clock: Clock) {
 }
 
 fn main(root: Root) -> Result[(), IoError] {
-    let net = root.net
-    let base = "http://127.0.0.1:8001"
     let out = root.stdout
     let clock = root.clock
     let log = |line: Str| out.print("{time.format(clock.now_ms(), "%H:%M:%S")} {line}")
+    // in a pod, the service account and the API server's address; outside
+    // one, kubectl proxy
+    let (k, through) = match root.env.get("KUBERNETES_SERVICE_HOST") {
+        Some(host) => (kube.in_cluster(root.fs.read_only(), root.env, root.net)?, "the API server at {host}"),
+        None => (kube.proxy(root.net, "http://127.0.0.1:8001"), "kubectl proxy at 127.0.0.1:8001"),
+    }
     if root.args().contains("once") {
-        pass(log, net, base, map()).map_error(|e| Failed(e))?
+        pass(log, k, map()).map_error(|e| Failed(e))?
         return Ok(())
     }
-    log("watching StaticSites through {base}")
+    log("watching StaticSites through {through}")
     let events: Chan[Str] = channel(64)
     // the watchers run until stopped, so their logs go out as they happen
     let _ = group g interleaved {
         for what in watched() {
-            g.go(|| watch(log, net, base, what, events, clock))
+            g.go(|| watch(log, k, what, events, clock))
         }
-        g.go(|| reconcile(log, net, base, events, clock))
+        g.go(|| reconcile(log, k, events, clock))
     }
     Ok(())
 }
@@ -596,8 +610,20 @@ fn event(kind: Str, object: json.Value) -> Str {
 test "watch events" for (line, said) in [
     (event("ADDED", obj([("kind", str("StaticSite")), ("metadata", obj([("name", str("hello")), ("namespace", str("web"))]))])), Some("ADDED StaticSite web/hello")),
     (event("ERROR", obj([("kind", str("Status")), ("message", str("too old resource version"))])), Some("ERROR too old resource version")),
+    (event("BOOKMARK", obj([("kind", str("StaticSite")), ("metadata", obj([("resourceVersion", str("812"))]))])), None),
     ("not json", None),
     (json.stringify(obj([("object", obj([]))])), None),
 ] {
     assert_eq(event_text(line), said)
+}
+
+// the answers `call` gets from the client, faked
+test "an error status is an error" for (r, said) in [
+    (Ok((200, obj([("kind", str("ConfigMap"))]))), Ok(200)),
+    (Ok((201, json.Null)), Ok(201)),
+    (Ok((404, obj([("kind", str("Status")), ("message", str("configmaps \"x\" not found"))]))), Err("GET /x: 404 configmaps \"x\" not found")),
+    (Ok((409, json.Null)), Err("GET /x: 409 null")),
+    (Err(Failed("connection refused")), Err("GET /x: connection refused")),
+] {
+    assert_eq(call("GET", "/x", r).map(|a| a.0), said)
 }
