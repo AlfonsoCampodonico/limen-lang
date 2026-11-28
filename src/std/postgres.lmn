@@ -718,13 +718,13 @@ pub fn values[T](x: T) -> List[Value] {
     panic("postgres.values: the compiler writes this for each struct it is used with")
 }
 
-fn column_of(row: Row, field: Str, owner: Str) -> Result[Value, IoError] {
+fn column_of(row: Row, column: Str, field: Str) -> Result[Value, IoError] {
     for (i, c) in row.columns.with_index() {
-        if c == field {
+        if c == column {
             return Ok(row.values[i])
         }
     }
-    Err(Failed("postgres: no column `{field}` for `{owner}.{field}`; the row has {row.columns.join(", ")}"))
+    Err(Failed("postgres: no column `{column}` for `{field}`; the row has {row.columns.join(", ")}"))
 }
 
 fn holds(v: Value) -> Str {
@@ -737,55 +737,55 @@ fn holds(v: Value) -> Str {
     }
 }
 
-fn mismatch(v: Value, field: Str, owner: Str, want: Str) -> IoError {
-    Failed("postgres: column `{field}` holds {holds(v)}, but `{owner}.{field}` is {want}")
+fn mismatch(v: Value, column: Str, field: Str, want: Str) -> IoError {
+    Failed("postgres: column `{column}` holds {holds(v)}, but `{field}` is {want}")
 }
 
-fn required[T](v: Option[T], field: Str, owner: Str) -> Result[T, IoError] {
+fn required[T](v: Option[T], column: Str, field: Str) -> Result[T, IoError] {
     match v {
         Some(x) => Ok(x),
-        None => Err(Failed("postgres: column `{field}` is NULL, but `{owner}.{field}` is not an Option")),
+        None => Err(Failed("postgres: column `{column}` is NULL, but `{field}` is not an Option")),
     }
 }
 
-fn int_at(row: Row, field: Str, owner: Str) -> Result[Option[Int], IoError] {
-    match column_of(row, field, owner)? {
+fn int_at(row: Row, column: Str, field: Str) -> Result[Option[Int], IoError] {
+    match column_of(row, column, field)? {
         Int(n) => Ok(Some(n)),
         Null => Ok(None),
-        v => Err(mismatch(v, field, owner, "an `Int`")),
+        v => Err(mismatch(v, column, field, "an `Int`")),
     }
 }
 
-fn float_at(row: Row, field: Str, owner: Str) -> Result[Option[Float], IoError] {
-    match column_of(row, field, owner)? {
+fn float_at(row: Row, column: Str, field: Str) -> Result[Option[Float], IoError] {
+    match column_of(row, column, field)? {
         Float(x) => Ok(Some(x)),
         Int(n) => Ok(Some(n.to_float())),
         Null => Ok(None),
-        v => Err(mismatch(v, field, owner, "a `Float`")),
+        v => Err(mismatch(v, column, field, "a `Float`")),
     }
 }
 
-fn str_at(row: Row, field: Str, owner: Str) -> Result[Option[Str], IoError] {
-    match column_of(row, field, owner)? {
+fn str_at(row: Row, column: Str, field: Str) -> Result[Option[Str], IoError] {
+    match column_of(row, column, field)? {
         Text(s) => Ok(Some(s)),
         Null => Ok(None),
-        v => Err(mismatch(v, field, owner, "a `Str`")),
+        v => Err(mismatch(v, column, field, "a `Str`")),
     }
 }
 
-fn bool_at(row: Row, field: Str, owner: Str) -> Result[Option[Bool], IoError] {
-    match column_of(row, field, owner)? {
+fn bool_at(row: Row, column: Str, field: Str) -> Result[Option[Bool], IoError] {
+    match column_of(row, column, field)? {
         Int(n) => Ok(Some(n != 0)),
         Null => Ok(None),
-        v => Err(mismatch(v, field, owner, "a `Bool`")),
+        v => Err(mismatch(v, column, field, "a `Bool`")),
     }
 }
 
-fn bytes_at(row: Row, field: Str, owner: Str) -> Result[Option[Bytes], IoError] {
-    match column_of(row, field, owner)? {
+fn bytes_at(row: Row, column: Str, field: Str) -> Result[Option[Bytes], IoError] {
+    match column_of(row, column, field)? {
         Blob(b) => Ok(Some(b)),
         Null => Ok(None),
-        v => Err(mismatch(v, field, owner, "`Bytes`")),
+        v => Err(mismatch(v, column, field, "`Bytes`")),
     }
 }
 

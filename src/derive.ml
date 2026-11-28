@@ -29,7 +29,8 @@
 
    The sql and postgres modules' work the same way, for structs whose fields are Int,
    Float, Str, Bool, Bytes or an Option of one: `sql.row$N(row: Row) ->
-   Result[T, IoError]` reads each field from the column of its name, and
+   Result[T, IoError]` reads each field from the column of its key (its
+   name, or its `as "key"`), and
    `sql.values$N(x: T) -> List[Value]` writes the fields in order. A use of
    `decode` or `values` is pointed at them; a call `db.all(...)` or
    `db.one(...)` becomes a call of a wrapper, `sql.all$N(db, ...)`. *)
@@ -459,10 +460,11 @@ let row_coders st t : string * string =
           (fun (f, ft) ->
             (* the column of the field's key, `as "key"` or its name *)
             let col = field_key sd f in
-            let at k = try_ st (call st (jf st (k ^ "_at")) [ row; str st col; str st owner ]) in
+            let path = owner ^ "." ^ f in
+            let at k = try_ st (call st (jf st (k ^ "_at")) [ row; str st col; str st path ]) in
             let value = ex st (EField (x, f, st.sp)) in
             match (column ft, repr ft) with
-            | Some k, _ -> (try_ st (call st (jf st "required") [ at k; str st col; str st owner ]), call st (jf st ("of_" ^ k)) [ value ])
+            | Some k, _ -> (try_ st (call st (jf st "required") [ at k; str st col; str st path ]), call st (jf st ("of_" ^ k)) [ value ])
             | None, TNamed ("Option", [ a ]) when column a <> None ->
               let k = Option.get (column a) in
               (at k, call st (jf st "of_option") [ value; var st (jf st ("of_" ^ k)) ])

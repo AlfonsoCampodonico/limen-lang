@@ -783,11 +783,12 @@ fn row_coders(g: Gen, t: types.Ty) -> Result[((Str, Str), Gen), Fail] {
     for (f, ft) in fs {
         // the column of the field's key, `as "key"` or its name
         let col = key_of(sd, f)
-        let at = |k: Str| try_(g, call(g, jf(g, k + "_at"), [row, text(g, col), text(g, owner)]))
+        let path = owner + "." + f
+        let at = |k: Str| try_(g, call(g, jf(g, k + "_at"), [row, text(g, col), text(g, path)]))
         let value = ex(g, EField(x, f, g.sp))
         match (column(ft), ft) {
             (Some(k), _) => {
-                reads.push(ast.FieldInit { name: f, span: g.sp, value: try_(g, call(g, jf(g, "required"), [at(k), text(g, col), text(g, owner)])) })
+                reads.push(ast.FieldInit { name: f, span: g.sp, value: try_(g, call(g, jf(g, "required"), [at(k), text(g, col), text(g, path)])) })
                 writes.push(call(g, jf(g, "of_" + k), [value]))
             },
             (None, TNamed("Option", [a])) if column(a).is_some() => {
