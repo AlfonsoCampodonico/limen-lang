@@ -2168,7 +2168,8 @@ A client for the Kubernetes API, written in Limen over `http` and `json`, for an
 ```
 use kube
 
-let sa = root.fs.under("/var/run/secrets/kubernetes.io/serviceaccount").read_only()
+// --grant fs=/var/run/secrets/kubernetes.io/serviceaccount:ro: root.fs is that directory
+let sa = root.fs.read_only()
 let k = kube.in_cluster(sa, root.env, root.net)?
 let (code, sites) = k.list("/apis/limen.dev/v1/staticsites")?
 k.apply("/api/v1/namespaces/{k.namespace()}/configmaps/x", "limen-operator", body)?

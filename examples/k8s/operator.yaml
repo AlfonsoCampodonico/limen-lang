@@ -1,7 +1,13 @@
 # The site operator (examples/site_operator.lmn) running in the cluster, in
 # its own namespace, with a service account that may do only what it does:
-# read and watch StaticSites, write their status, and keep their ConfigMaps,
-# Deployments and Services. The image is examples/k8s/Dockerfile's.
+# read and watch StaticSites, patch their status, and read, watch, create
+# and patch their ConfigMaps, Deployments and Services (server-side apply is
+# a patch, and a create when the object is not there). It deletes nothing:
+# Kubernetes collects a site's objects through their owner references. The
+# image is examples/k8s/Dockerfile's.
+#
+# On an IPv6 cluster the net grant below expands to a bare address and port,
+# `fd00::1:443`, which Limen reads as `[fd00::1]:443`: it works as it is.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -23,13 +29,15 @@ rules:
     verbs: [get, list, watch]
   - apiGroups: [limen.dev]
     resources: [staticsites/status]
-    verbs: [patch, update]
+    verbs: [patch]
+  # A ClusterRole, since sites may be in any namespace, so create and patch
+  # on these hold in every namespace: that comes with a cluster-wide operator.
   - apiGroups: [""]
     resources: [configmaps, services]
-    verbs: [get, list, watch, create, patch, delete]
+    verbs: [get, list, watch, create, patch]
   - apiGroups: [apps]
     resources: [deployments]
-    verbs: [get, list, watch, create, patch, delete]
+    verbs: [get, list, watch, create, patch]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -62,6 +70,8 @@ spec:
         app.kubernetes.io/name: site-operator
     spec:
       serviceAccountName: site-operator
+      securityContext:
+        seccompProfile: { type: RuntimeDefault }
       containers:
         - name: operator
           image: limen-site-operator:dev

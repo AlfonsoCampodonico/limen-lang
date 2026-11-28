@@ -7050,6 +7050,17 @@ fn account(fs: Fs, token: Str) -> Result[Fs, IoError] {
     Ok(fs.under("sa").read_only())
 }
 
+// The kubelet rotating the token: write it again until its modified time has moved on.
+fn rotate(fs: Fs, clock: Clock, token: Str) -> Result[(), IoError] {
+    let before = (fs.info("sa/token")?).modified_ms
+    fs.write("sa/token", token + "\n")?
+    while (fs.info("sa/token")?).modified_ms <= before {
+        clock.sleep(5)
+        fs.write("sa/token", token + "\n")?
+    }
+    Ok(())
+}
+
 fn show(r: Result[(Int, json.Value), IoError]) -> Str {
     match r {
         Ok((code, v)) => "{code} {json.stringify(v)}",
@@ -7333,9 +7344,10 @@ fn main(root: Root) -> Result[(), IoError] {
             route("GET", ns, 200, "\{\"kind\":\"Namespace\"}"),
             route("GET", "/forbidden", 401, status_body(401, "Unauthorized", "Unauthorized")),
         ], |i| {
-            // the kubelet rotates the token while the first request is out
+            // the kubelet rotates the token while the first request is out,
+            // its modified time moving on, so the next request reads it
             if i == 0 {
-                let _ = fs.write("sa/token", "t2\n")
+                let _ = rotate(fs, root.clock, "t2")
             }
         }))
         g.go(|| {
@@ -7359,17 +7371,6 @@ fn main(root: Root) -> Result[(), IoError] {
      401 {\"kind\":\"Status\",\"apiVersion\":\"v1\",\"status\":\"Failure\",\"message\":\"Unauthorized\",\"reason\":\"Unauthorized\",\"code\":401}\n";
   out "kube-token-rotates" ~grants:(kube_cluster "rotates")
     (kube_src {v|
-// Write the token again until its modified time has moved on.
-fn rotate(fs: Fs, clock: Clock, token: Str) -> Result[(), IoError] {
-    let before = (fs.info("sa/token")?).modified_ms
-    fs.write("sa/token", token + "\n")?
-    while (fs.info("sa/token")?).modified_ms <= before {
-        clock.sleep(5)
-        fs.write("sa/token", token + "\n")?
-    }
-    Ok(())
-}
-
 fn main(root: Root) -> Result[(), IoError] {
     let fs = root.fs
     let sa = account(fs, "t1")?

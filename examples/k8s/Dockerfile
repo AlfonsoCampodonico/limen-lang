@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
-RUN dune build ./bin/main.exe 2>&1 | tail -20 && dune build ./bin/main.exe
+RUN dune build ./bin/main.exe
 RUN LIMEN_CACHE=off ./_build/default/bin/main.exe build examples/site_operator.lmn -o /site-operator
 
 FROM debian:trixie-slim

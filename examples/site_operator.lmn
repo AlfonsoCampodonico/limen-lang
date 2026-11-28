@@ -476,7 +476,10 @@ fn main(root: Root) -> Result[(), IoError] {
     let clock = root.clock
     let log = |line: Str| out.print("{time.format(clock.now_ms(), "%H:%M:%S")} {line}")
     // in a pod, the service account and the API server's address; outside
-    // one, kubectl proxy
+    // one, kubectl proxy. In the pod root.fs is the service account
+    // directory, the one directory examples/k8s/operator.yaml grants
+    // (--grant fs=/var/run/secrets/kubernetes.io/serviceaccount:ro), since
+    // an Fs takes no absolute paths
     let (k, through) = match root.env.get("KUBERNETES_SERVICE_HOST") {
         Some(host) => (kube.in_cluster(root.fs.read_only(), root.env, root.net)?, "the API server at {host}"),
         None => (kube.proxy(root.net, "http://127.0.0.1:8001"), "kubectl proxy at 127.0.0.1:8001"),

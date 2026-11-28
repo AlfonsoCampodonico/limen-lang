@@ -2,7 +2,9 @@
 // From inside a pod it reads the service account the kubelet mounts and
 // speaks TLS to the API server, trusting only the cluster's CA:
 //
-//   let sa = root.fs.under("/var/run/secrets/kubernetes.io/serviceaccount").read_only()
+//   // --grant fs=/var/run/secrets/kubernetes.io/serviceaccount:ro: root.fs
+//   // is that directory (an Fs takes no absolute paths)
+//   let sa = root.fs.read_only()
 //   let k = kube.in_cluster(sa, root.env, root.net)?
 //   let (code, sites) = k.list("/apis/limen.dev/v1/staticsites")?
 //

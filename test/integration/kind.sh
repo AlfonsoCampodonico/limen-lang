@@ -48,7 +48,20 @@ done
 if pgrep -f "kubectl.* proxy" >/dev/null 2>&1; then
   fail "a kubectl proxy is running"
 fi
+# a status alone could hide a refused request or a restart: the log must
+# show none, and the pod must not have restarted
+log=$(kc -n limen-system logs deployment/site-operator 2>&1) || fail "cannot read the operator's log"
+if printf '%s\n' "$log" | grep -q -e '403' -e 'pass failed'; then
+  fail "the operator's log shows a 403 or a failed pass"
+fi
+restarts=$(kc -n limen-system get pods -l app.kubernetes.io/name=site-operator \
+  -o jsonpath='{range .items[*]}{.status.containerStatuses[*].restartCount}{"\n"}{end}')
+[ -n "$restarts" ] || fail "no operator pod"
+for r in $restarts; do
+  [ "$r" -eq 0 ] || fail "the operator restarted ($r times)"
+done
 echo "--- the operator's log"
-kc -n limen-system logs deployment/site-operator
+printf '%s\n' "$log"
+echo "--- restarts: $restarts"
 echo "--- status: $(kc get staticsite hello -o jsonpath='{.status.message}')"
 echo "kind: the operator reconciled hello without a proxy"
