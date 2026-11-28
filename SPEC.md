@@ -1868,6 +1868,7 @@ The standard library is checked like a dependency. `src/std/limen.toml` lists th
 | `path` | `fs`, for `walk` alone |
 | `uuid` | `rand` and `clock`, for `v4` and `v7` alone |
 | `postgres` | `net` and `rand` (SCRAM's nonce) |
+| `kube` | `net`, `fs` (the service account directory) and `env` (the API server's address) |
 | `redis` | `net` |
 | `stream` | `fs` |
 | `websocket` | `net` and `rand` (a client's masking keys) |
@@ -2157,6 +2158,29 @@ fn main(root: Root) -> Result[(), IoError] {
 - `postgres.Value` has the same variants as `sql.Value`: `Null`, `Int`, `Float`, `Text`, `Blob`. A column reads by its type: `bool` as `Int(1)` or `Int(0)`, `smallint`, `integer`, `bigint` and `oid` as `Int`, `real` and `double precision` as `Float`, `bytea` as `Blob`, and everything else (`numeric`, `text`, dates, `json`) as `Text`, the server's text for it. A struct's `Bool` field goes as the text `true` or `false`.
 - `postgres.decode(row)`, `db.all(text, params)`, `db.one(text, params)` and `postgres.values(x)` convert rows and structs as `sql`'s do: the compiler writes the conversion for each struct, and a row that does not fit is an `Err` naming the column and the field.
 - A `Db` is one connection, used by one task at a time: a statement is a request and its whole answer. `postgres.pool(net, rand, address, size, weak_login = false)` opens `size` connections and returns them in a `Chan[Db]`; `postgres.using(pool, |db| ...)` takes one, waiting while all are in use, runs the closure, and puts the connection back however the closure ends. A server shares the pool with every request.
+
+### kube
+
+A client for the Kubernetes API, written in Limen over `http` and `json`, for an operator running in a pod or through `kubectl proxy`.
+
+```
+use kube
+
+let sa = root.fs.under("/var/run/secrets/kubernetes.io/serviceaccount").read_only()
+let k = kube.in_cluster(sa, root.env, root.net)?
+let (code, sites) = k.list("/apis/limen.dev/v1/staticsites")?
+k.apply("/api/v1/namespaces/{k.namespace()}/configmaps/x", "limen-operator", body)?
+k.watch("/apis/limen.dev/v1/staticsites", version, |line| ...)?
+```
+
+- `kube.in_cluster(fs, env, net) -> Result[Client, IoError]` is the client of a program in a pod. `fs` is the service account directory the kubelet mounts, from which it reads `token`, `ca.crt` and `namespace`; `env` gives the API server's address, `KUBERNETES_SERVICE_HOST` and `KUBERNETES_SERVICE_PORT` (an IPv6 host goes in brackets). The client holds `net` narrowed to that address with `only`, and trusting only `ca.crt` (`Net.trusting`), over `https://`. A variable that is not set or not granted is `Err(Failed("kube: KUBERNETES_SERVICE_HOST is not set"))`; a file that cannot be read, or a `ca.crt` that is not a certificate, is an `Err` naming it, its message starting `kube: the service account's token: ` and going on with the `Fs` or `Net.trusting` error. A pod needs `--grant fs=/var/run/secrets/kubernetes.io/serviceaccount:ro`, `--grant env=KUBERNETES_SERVICE_HOST`, `--grant env=KUBERNETES_SERVICE_PORT` and `--grant net=HOST:PORT`.
+- `kube.proxy(net, base) -> Client` is the same client over a plain URL that needs no token, such as `kubectl proxy`'s `http://127.0.0.1:8001`, for development and tests. It sends no `Authorization`, and its `namespace()` is `"default"`.
+- `k.namespace()` is the namespace from the service account, without surrounding whitespace.
+- `get(path)`, `list(path)` and `delete(path)` send `GET`, `GET` and `DELETE` to `path`, which starts with `/` and may have a query. `apply(path, manager, body)` is server-side apply: `PATCH` with `Content-Type: application/apply-patch+yaml`, `body` as JSON, and `fieldManager=MANAGER&force=true` added to the query (`MANAGER` percent-encoded), so the fields `body` sets become the manager's, a change made to them by hand is put back, and fields it does not set are left alone. `patch_status(path, body)` sends `body` as a merge patch (`application/merge-patch+json`) to `PATH/status`. Each returns `Result[(Int, json.Value), IoError]`.
+- Every request says `Accept: application/json` and, in a pod, `Authorization: Bearer TOKEN`. Every answer is `Ok((status, value))`, an error status included: a 404 or a 409 comes back as `Ok` with the server's `kind: Status` object as the value, for the caller to act on. An empty body is `json.Null`. `Err` is for what got no answer (the connection, TLS) and for a body that is not JSON, `Err(Failed("kube: GET /path: the answer (502) is not JSON: ..."))` with the first 200 bytes of it.
+- `watch(path, resource_version, f) -> Result[Int, IoError]` sends `GET` with `watch=1&resourceVersion=V&allowWatchBookmarks=true` added to the query (no `resourceVersion` when it is `""`: from now) and passes each event line, `{"type": "ADDED", "object": {...}}`, to `f: fn(Str) -> Bool` as it arrives, as `http.request_lines` does, until `f` returns `false` or the API server ends the watch. It returns the status code; an error status (410 Gone, for a version too old) sends nothing to `f`.
+- The token: the kubelet rewrites it as it rotates (about hourly). Before each request the client compares the token file's `modified_ms` (`Fs.info`) with the token it read and reads the file again when it is newer, so it needs no `Clock`; a `Client` is a value and is not changed by its methods, so once the token has rotated each request reads it, until a new client is made. After a `401` it reads the token again and sends the request once more, and returns that answer, a second `401` included.
+- A `Client` holds no connection: each request opens its own, so one client can be used by many tasks at once.
 
 ### redis
 

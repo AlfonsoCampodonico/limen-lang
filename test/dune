@@ -9,6 +9,7 @@
   (glob_files %{project_root}/selfhost/*.lmn)
   (glob_files tls/*.pem)
   (glob_files tls/kube/*.pem)
+  (glob_files kube/*.lmn)
   (glob_files tls/*.py)
   (glob_files compressed/*)
   (source_tree zoneinfo)))
