@@ -13405,6 +13405,387 @@ fn main(root: Root) {
        end
      end
    end);
+  (* yaml.stringify. Every valid case of the suite (test/yaml-suite) is
+     written and read back: each document must come back equal (a NaN
+     equal to a NaN). The two cases that repeat a key once composed are the
+     ones parse_all refuses, and have no node to write. *)
+  out "yaml-stringify-roundtrip"
+    ~grants:{ Interp.no_grants with fs = Some (
+      (let d = Filename.concat (Sys.getcwd ()) "yaml-suite" in
+       Unix.realpath (if Sys.file_exists d then d else Filename.concat (Sys.getcwd ()) "test/yaml-suite")), true) }
+    {|use yaml
+
+fn cases(fs: Fs) -> Result[List[Str], IoError] {
+    let mut out: List[Str] = []
+    for id in fs.list("")? {
+        if fs.is_dir(id) {
+            if fs.exists(id + "/in.yaml") {
+                out.push(id)
+            } else {
+                for sub in fs.list(id)? {
+                    if fs.is_dir(id + "/" + sub) {
+                        out.push(id + "/" + sub)
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+// equal, but a NaN is equal to a NaN
+fn same(a: yaml.Node, b: yaml.Node) -> Bool {
+    match a {
+        Float(x) => match b {
+            Float(y) => x == y || (x != x && y != y),
+            _ => false,
+        },
+        Seq(xs) => match b {
+            Seq(ys) => xs.len() == ys.len() && xs.zip(ys).all(|p| same(p.0, p.1)),
+            _ => false,
+        },
+        Map(ps) => match b {
+            Map(qs) => ps.len() == qs.len() && ps.zip(qs).all(|p| same(p.0.key, p.1.key) && same(p.0.value, p.1.value)),
+            _ => false,
+        },
+        Tagged(t, x) => match b {
+            Tagged(u, y) => t == u && same(x, y),
+            _ => false,
+        },
+        _ => a == b,
+    }
+}
+
+fn main(root: Root) -> Result[(), IoError] {
+    let fs = root.fs
+    let mut checked = 0
+    let mut docs_checked = 0
+    let mut bad: List[Str] = []
+    for c in cases(fs)? {
+        if !fs.exists(c + "/error") {
+            match yaml.parse_all(fs.read(c + "/in.yaml")?) {
+                Err(_) => {},
+                Ok(docs) => {
+                    checked = checked + 1
+                    for d in docs {
+                        docs_checked = docs_checked + 1
+                        let text = yaml.stringify(d)
+                        match yaml.parse(text) {
+                            Ok(back) => {
+                                if !same(d, back) {
+                                    bad.push(c)
+                                }
+                            },
+                            Err(e) => {
+                                bad.push(c + ": " + e)
+                            },
+                        }
+                    }
+                },
+            }
+        }
+    }
+    root.stdout.print("{checked} cases, {docs_checked} documents, {bad.len()} not read back")
+    for b in bad {
+        root.stdout.print(b)
+    }
+    Ok(())
+}
+|}
+    "306 cases, 332 documents, 0 not read back\n";
+  (* strings that plain style would read back as something else, or does
+     not allow, are quoted; the rest stay plain; each reads back as the
+     same string, alone and in a sequence *)
+  out "yaml-stringify-quotes"
+    {|use yaml
+
+fn main(root: Root) {
+    let out = root.stdout
+    let words = ["no", "1e3", "null", "0o17", "2024-01-01", "~", "-x", ":x", "yes", "true", "", " a", "a ",
+        "a: b", "a #b", "a#b", "- a", "a:", "a:b", "---", "...", "*a", "&a", "!t", "%x", "@x", "`x", "\{a", "[a",
+        "'a", "\"a", "|a", ">a", "plain text", "1_000", "0b1", "0x1F", ".5", ".inf", "1.", "+1", "tab\there",
+        "é ü", "3 apples", "1:30", "Off", "y", "<<", "yesterday", "nope", "null ", "Null", "NaN", "?x", "x, y", "a\\b",
+        "say \"hi\""]
+    for s in words {
+        let text = yaml.stringify(yaml.Str(s)).trim()
+        let alone = yaml.parse(text) == Ok(yaml.Str(s))
+        let listed = yaml.parse(yaml.stringify(yaml.Seq([yaml.Str(s)]))) == Ok(yaml.Seq([yaml.Str(s)]))
+        out.print("{text} {alone} {listed}")
+    }
+}
+|}
+    {|"no" true true
+"1e3" true true
+"null" true true
+"0o17" true true
+"2024-01-01" true true
+"~" true true
+"-x" true true
+":x" true true
+"yes" true true
+"true" true true
+"" true true
+" a" true true
+"a " true true
+"a: b" true true
+"a #b" true true
+a#b true true
+"- a" true true
+"a:" true true
+a:b true true
+"---" true true
+"..." true true
+"*a" true true
+"&a" true true
+"!t" true true
+"%x" true true
+"@x" true true
+"`x" true true
+"{a" true true
+"[a" true true
+"'a" true true
+"\"a" true true
+"|a" true true
+">a" true true
+plain text true true
+"1_000" true true
+"0b1" true true
+"0x1F" true true
+".5" true true
+".inf" true true
+"1." true true
+"+1" true true
+"tab\there" true true
+é ü true true
+3 apples true true
+"1:30" true true
+"Off" true true
+"y" true true
+"<<" true true
+yesterday true true
+nope true true
+"null " true true
+"Null" true true
+NaN true true
+"?x" true true
+x, y true true
+a\b true true
+say "hi" true true
+|};
+  (* a fixed document gives exactly this text *)
+  out "yaml-stringify-shape"
+    {|use yaml
+
+fn main(root: Root) {
+    let src = "\{\"name\": \"web\", \"replicas\": 3, \"ratio\": 0.5, \"on\": true, \"none\": null, \"empty\": [], \"map\": \{\},
+        \"ports\": [80, 443], \"spec\": \{\"containers\": [\{\"name\": \"app\", \"image\": \"nginx\", \"args\": [\"--v\", \"x\"]\}],
+        \"note\": \"two\\nlines\"\}, \"matrix\": [[1, 2], [3]], \"text\": \"a\\nb\\n\", \"keep\": \"a\\n\\n\", \"strip\": \"z\\ny\"\}"
+    match yaml.parse(src) {
+        Ok(n) => root.stdout.print("{yaml.stringify(n)}<end>"),
+        Err(e) => root.stdout.print(e),
+    }
+}
+|}
+    {|name: web
+replicas: 3
+ratio: 0.5
+"on": true
+none: null
+empty: []
+map: {}
+ports:
+  - 80
+  - 443
+spec:
+  containers:
+    - name: app
+      image: nginx
+      args:
+        - "--v"
+        - x
+  note: |-
+    two
+    lines
+matrix:
+  - - 1
+    - 2
+  - - 3
+text: |
+  a
+  b
+keep: |+
+  a
+
+strip: |-
+  z
+  y
+<end>
+|};
+  (* keys that are not short scalars, tags, floats, strings a block scalar
+     cannot hold, characters YAML does not print, and 512 levels *)
+  out "yaml-stringify-edge"
+    {|use yaml
+
+fn show(n: yaml.Node) -> Str {
+    let text = yaml.stringify(n)
+    "{text}<{yaml.parse(text) == Ok(n)}>"
+}
+
+fn entry(s: Str) -> yaml.Node {
+    yaml.Map([yaml.Pair { key: yaml.Str("k"), value: yaml.Str(s) }])
+}
+
+fn via(s: Str) -> Str {
+    match yaml.parse(s) {
+        Ok(n) => show(n),
+        Err(e) => e,
+    }
+}
+
+fn main(root: Root) {
+    let out = root.stdout
+    out.print(via("? [a, b]\n: 1\n? \{c: d\}\n: [x]\n? !t k\n: v\n"))
+    out.print(via("!!set \{a, b\}"))
+    out.print(via("- !local x\n- !!binary aGk=\n- !<tag:example.com,2000:x> v\n- !t [a]\n- !t2 \{\}\n- !t3 \{a: b\}\n"))
+    let floats: List[Float] = [1.0, 1000.0, 0.1, 1.0e21, 5.0e-324, 123456789.123, 1.0e-7, 0.0 - 2.5, (0.0 - 1.0) * 0.0, 1.0 / 0.0, 0.0 - 1.0 / 0.0, 9007199254740993.0, 1.7976931348623157e308]
+    for f in floats {
+        let text = yaml.stringify(yaml.Float(f)).trim()
+        out.print("{text} {yaml.parse(text) == Ok(yaml.Float(f))}")
+    }
+    let nan = yaml.stringify(yaml.Float(0.0 / 0.0)).trim()
+    out.print("{nan} {yaml.parse(nan).map(|n| n.as_float() ?? 0.0).map(|x| x != x)}")
+    out.print(show(entry(" lead\nb")))
+    out.print(show(entry("a \nb")))
+    out.print(show(entry("a\tb\nc")))
+    out.print(show(entry("\n")))
+    out.print(show(entry("\n\nab\n")))
+    out.print(show(entry("a\r\nb")))
+    out.print(show(entry("x\n\n\ny")))
+    out.print(show(entry("end\n\n\n")))
+    out.print(show(entry("# not a comment\n- nor a seq\n---\n")))
+    out.print(show(entry(bytes([194, 133]).to_str())))
+    out.print(show(entry(bytes([127]).to_str() + "a")))
+    out.print(show(entry("a" + bytes([226, 128, 168]).to_str() + "b")))
+    out.print(show(entry(bytes([239, 187, 191]).to_str() + "b")))
+    out.print(show(entry("é\nü")))
+    let mut long = ""
+    for _ in 0..<1001 {
+        long = long + "k"
+    }
+    let text = yaml.stringify(yaml.Map([yaml.Pair { key: yaml.Str(long), value: yaml.Int(1) }]))
+    out.print("{text.starts_with("? kkk")} {text.len()} {yaml.parse(text) == Ok(yaml.Map([yaml.Pair { key: yaml.Str(long), value: yaml.Int(1) }]))}")
+    out.print("{yaml.stringify(yaml.Seq([]))}{yaml.stringify(yaml.Map([]))}{yaml.stringify(yaml.Null)}{yaml.stringify(yaml.Int(0 - 5))}{yaml.stringify(yaml.Str("a\nb"))}<end>")
+    let mut s = ""
+    let mut e = ""
+    let mut m = ""
+    let mut me = ""
+    for _ in 0..<512 {
+        s = s + "["
+        e = e + "]"
+        m = m + "\{a: "
+        me = me + "\}"
+    }
+    for src in [s + e, m + "1" + me] {
+        match yaml.parse(src) {
+            Ok(n) => {
+                let text = yaml.stringify(n)
+                out.print("{text.len()} {yaml.parse(text) == Ok(n)}")
+            },
+            Err(err) => out.print(err),
+        }
+    }
+}
+|}
+    {|? - a
+  - b
+: 1
+? c: d
+: - x
+? !t k
+: v
+<true>
+!!set
+a: null
+b: null
+<true>
+- !local x
+- !!binary aGk=
+- !<tag:example.com,2000:x> v
+- !t
+  - a
+- !t2 {}
+- !t3
+  a: b
+<true>
+1.0 true
+1000.0 true
+0.1 true
+1e+21 true
+4.94065645841247e-324 true
+123456789.123 true
+1e-07 true
+-2.5 true
+-0.0 true
+.inf true
+-.inf true
+9007199254740992.0 true
+1.7976931348623157e+308 true
+.nan Ok(true)
+k: " lead\nb"
+<true>
+k: "a \nb"
+<true>
+k: "a\tb\nc"
+<true>
+k: "\n"
+<true>
+k: |
+
+
+  ab
+<true>
+k: "a\r\nb"
+<true>
+k: |-
+  x
+
+
+  y
+<true>
+k: |+
+  end
+
+
+<true>
+k: |
+  # not a comment
+  - nor a seq
+  ---
+<true>
+k: "\u0085"
+<true>
+k: "\u007fa"
+<true>
+k: "a\u2028b"
+<true>
+k: "\ufeffb"
+<true>
+k: |-
+  é
+  ü
+<true>
+true 1008 true
+[]
+{}
+null
+-5
+|-
+  a
+  b
+<end>
+1025 true
+263170 true
+|};
   drain ();
   Printf.printf "%d/%d passed\n" (!total - !failed) !total;
   if !failed > 0 then exit 1

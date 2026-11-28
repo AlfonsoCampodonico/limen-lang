@@ -36,9 +36,389 @@ pub fn parse_all(s: Str) -> Result[List[Node], Str] {
     compose(s, false)
 }
 
-// `n` as YAML text.
+// `n` as YAML text: block style, two-space indent, `- ` items and
+// `key: value` pairs, a mapping or sequence inside a sequence item on the
+// item's line, `[]` and `{}` for empty ones, and a tag before its node. A
+// string is plain unless that would read back as something else (see
+// `wr_plain_ok`); a string of several lines is a `|` block scalar when it
+// can be, else double-quoted. A key that is not a short scalar is written
+// with `? `. The text ends with a newline. Written with a list of the open
+// collections, as `json.stringify` does, not by recursion.
 pub fn stringify(n: Node) -> Str {
-    ""
+    let mut out: List[Str] = []
+    // the open ones, outermost first; slots from `depth` on are spare
+    let mut open: List[Wr] = []
+    let mut depth = 0
+    let mut next = n
+    // where `next` goes: 0 after an indicator (`- `, `? `, `: `) or at the
+    // start, 1 after `key:`; and the column a collection in it is indented
+    // to, and a block scalar's lines
+    let mut kind = 0
+    let mut ccol = 0
+    let mut bcol = 2
+    let mut going = true
+    while going {
+        let mut tags = ""
+        let mut x = next
+        let mut peeling = true
+        while peeling {
+            let here = x
+            match here {
+                Tagged(t, inner) => {
+                    tags = if tags == "" { wr_tag(t) } else { tags + " " + wr_tag(t) }
+                    x = inner
+                },
+                _ => {
+                    peeling = false
+                },
+            }
+        }
+        let sep = if kind == 1 { " " } else { "" }
+        let lead = if tags == "" { sep } else { sep + tags + " " }
+        match x {
+            Null => out.push(lead + "null\n"),
+            Bool(b) => out.push(lead + b.to_str() + "\n"),
+            Int(k) => out.push(lead + k.to_str() + "\n"),
+            Float(f) => out.push(lead + wr_float(f) + "\n"),
+            Str(s) => wr_str(mut out, s, lead, bcol),
+            Seq(items) => {
+                if items.len() == 0 {
+                    out.push(lead + "[]\n")
+                } else {
+                    if tags != "" {
+                        out.push(sep + tags + "\n")
+                    } else if kind == 1 {
+                        out.push("\n")
+                    }
+                    let w = Wr { is_map: false, seq: items, pairs: [], at: 0, col: ccol, inline: kind == 0 && tags == "", stage: 0 }
+                    put(mut open, depth, w)
+                    depth = depth + 1
+                }
+            },
+            Map(ps) => {
+                if ps.len() == 0 {
+                    out.push(lead + "\{\}\n")
+                } else {
+                    if tags != "" {
+                        out.push(sep + tags + "\n")
+                    } else if kind == 1 {
+                        out.push("\n")
+                    }
+                    let w = Wr { is_map: true, seq: [], pairs: ps, at: 0, col: ccol, inline: kind == 0 && tags == "", stage: 0 }
+                    put(mut open, depth, w)
+                    depth = depth + 1
+                }
+            },
+            Tagged(_, _) => {},
+        }
+        // the next node to write, closing each collection that has none left
+        going = false
+        while depth > 0 && !going {
+            let d = depth - 1
+            let col = open[d].col
+            let at = open[d].at
+            let pad = if at == 0 && open[d].inline && open[d].stage == 0 { "" } else { wr_pad(col) }
+            ccol = col + 2
+            bcol = col + 2
+            if open[d].is_map {
+                if open[d].stage == 1 {
+                    out.push(pad + ": ")
+                    next = open[d].pairs[at].value
+                    kind = 0
+                    open[d].stage = 0
+                    open[d].at = at + 1
+                    going = true
+                } else if at < open[d].pairs.len() {
+                    let p = open[d].pairs[at]
+                    match wr_key(p.key) {
+                        Some(k) => {
+                            out.push(pad + k + ":")
+                            next = p.value
+                            kind = 1
+                            open[d].at = at + 1
+                        },
+                        None => {
+                            out.push(pad + "? ")
+                            next = p.key
+                            kind = 0
+                            open[d].stage = 1
+                        },
+                    }
+                    going = true
+                }
+            } else if at < open[d].seq.len() {
+                out.push(pad + "- ")
+                next = open[d].seq[at]
+                kind = 0
+                open[d].at = at + 1
+                going = true
+            }
+            if !going {
+                // let go of the finished one's items now, not when its slot is reused
+                open[d] = Wr { is_map: false, seq: [], pairs: [], at: 0, col: 0, inline: false, stage: 0 }
+                depth = d
+            }
+        }
+    }
+    out.join("")
+}
+
+// An open collection while `stringify` writes it: its items, the next one,
+// the column its entries start at, whether its first entry goes on the line
+// of what came before, and for a mapping whether the entry at `at` has had
+// its `? ` key written (stage 1) and is waiting for its value.
+struct Wr {
+    is_map: Bool,
+    seq: List[Node],
+    pairs: List[Pair],
+    at: Int,
+    col: Int,
+    inline: Bool,
+    stage: Int,
+}
+
+fn wr_pad(n: Int) -> Str {
+    let mut xs: List[Str] = []
+    for _ in 0..<n {
+        xs.push(" ")
+    }
+    xs.join("")
+}
+
+// A float that reads back as the same `Float`: `.inf`, `-.inf`, `.nan`, and
+// a whole one keeps a `.0` so it does not turn into an `Int`.
+fn wr_float(f: Float) -> Str {
+    if f != f {
+        return ".nan"
+    }
+    if f - f != 0.0 {
+        return if f > 0.0 { ".inf" } else { "-.inf" }
+    }
+    if f == 0.0 {
+        return if 1.0 / f < 0.0 { "-0.0" } else { "0.0" }
+    }
+    let t = json.stringify(json.Num(f))
+    if t.contains(".") || t.contains("e") || t.contains("E") { t } else { t + ".0" }
+}
+
+// A key as text on one line, `None` when it is to be written with `? `: a
+// collection, a tagged node, and a string too long to be an implicit key.
+fn wr_key(k: Node) -> Option[Str] {
+    match k {
+        Null => Some("null"),
+        Bool(b) => Some(b.to_str()),
+        Int(n) => Some(n.to_str()),
+        Float(f) => Some(wr_float(f)),
+        Str(s) => {
+            let t = wr_inline(s)
+            if t.len() <= 1000 { Some(t) } else { None }
+        },
+        _ => None,
+    }
+}
+
+// `s` after `lead` and before the end of the line: a block scalar for a
+// string of several lines that can be one, else on one line.
+fn wr_str(mut out: List[Str], s: Str, lead: Str, bcol: Int) {
+    if !(s.contains("\n") && wr_block_ok(s)) {
+        out.push(lead + wr_inline(s) + "\n")
+        return
+    }
+    let bs = s.bytes()
+    let mut end = bs.len()
+    while end > 0 && bs[end - 1] == 10 {
+        end = end - 1
+    }
+    let kept = bs.len() - end
+    let chomp = if kept == 0 { "-" } else if kept == 1 { "" } else { "+" }
+    out.push(lead + "|" + chomp + "\n")
+    let pad = wr_pad(bcol)
+    for line in s.slice(0, end).split("\n") {
+        out.push(if line == "" { "\n" } else { pad + line + "\n" })
+    }
+    // a `+` keeps the blank lines that follow the last
+    for _ in 1..<kept {
+        out.push("\n")
+    }
+}
+
+// `s` on one line: plain when that reads back as the same string, else
+// double-quoted.
+fn wr_inline(s: Str) -> Str {
+    if wr_plain_ok(s) { s } else { wr_quote(s) }
+}
+
+// Whether `s` as a literal block scalar reads back as `s`: it holds only
+// printable characters and newlines (a tab counts as a control character),
+// no line ends in a space, and the first line that is not empty does not
+// start with a space, which would be taken for the indentation.
+fn wr_block_ok(s: Str) -> Bool {
+    let bs = s.bytes()
+    if wr_odd(bs, true) || s.contains(" \n") || bs[bs.len() - 1] == 32 {
+        return false
+    }
+    let mut i = 0
+    while i < bs.len() && bs[i] == 10 {
+        i = i + 1
+    }
+    i < bs.len() && bs[i] != 32
+}
+
+// Whether `bs` holds a character that does not belong in a plain scalar or
+// a block scalar: a control character (a newline too, unless `nl`), DEL, a
+// C1 control, a line or paragraph separator, a byte order mark, U+FFFE or
+// U+FFFF.
+fn wr_odd(bs: List[Int], nl: Bool) -> Bool {
+    let n = bs.len()
+    let mut i = 0
+    while i < n {
+        let b = bs[i]
+        if b < 32 {
+            if !(nl && b == 10) {
+                return true
+            }
+        } else if b == 127 {
+            return true
+        } else if b == 194 && i + 1 < n && bs[i + 1] >= 128 && bs[i + 1] <= 159 {
+            return true
+        } else if b == 226 && i + 2 < n && bs[i + 1] == 128 && (bs[i + 2] == 168 || bs[i + 2] == 169) {
+            return true
+        } else if b == 239 && i + 2 < n && ((bs[i + 1] == 187 && bs[i + 2] == 191) || (bs[i + 1] == 191 && (bs[i + 2] == 190 || bs[i + 2] == 191))) {
+            return true
+        }
+        i = i + 1
+    }
+    false
+}
+
+// Whether `s` is written plain: it reads back, plain, as the same `Str`
+// by the core schema (so not as null, a bool or a number), and the plain
+// style allows it: not empty, no space at either end, no indicator first,
+// no `: ` or ` #` inside, no `:` last, no control characters, no `---` or
+// `...` first. YAML 1.1 readers take more words for something else (`no`,
+// `0b1`, `1_000`, `2024-01-01`, `<<`), so those are quoted too.
+fn wr_plain_ok(s: Str) -> Bool {
+    let bs = s.bytes()
+    let n = bs.len()
+    if n == 0 || is_indicator(bs[0]) || bs[0] == 32 || bs[n - 1] == 32 || bs[n - 1] == 58 {
+        return false
+    }
+    if wr_odd(bs, false) || s.starts_with("---") || s.starts_with("...") || wr_legacy(s, bs) {
+        return false
+    }
+    let mut i = 1
+    while i < n {
+        if bs[i] == 58 && bs[i + 1] == 32 {
+            return false
+        }
+        if bs[i] == 35 && bs[i - 1] == 32 {
+            return false
+        }
+        i = i + 1
+    }
+    match plain(s, 0, 0) {
+        Ok(Str(_)) => true,
+        _ => false,
+    }
+}
+
+// A word or number that YAML 1.1 reads as a bool, a merge key, a number or
+// a date: `y`, `no`, `On`, `<<`, and text that starts with a digit (after
+// a sign or a point) and holds nothing but what such numbers and dates are
+// written with.
+fn wr_legacy(s: Str, bs: List[Int]) -> Bool {
+    let low = s.to_lower()
+    if low == "y" || low == "n" || low == "yes" || low == "no" || low == "on" || low == "off" || s == "<<" {
+        return true
+    }
+    let mut i = 0
+    if bs[0] == 45 || bs[0] == 43 {
+        i = 1
+    }
+    if i < bs.len() && bs[i] == 46 {
+        i = i + 1
+    }
+    if i >= bs.len() || !is_digit(bs[i]) {
+        return false
+    }
+    let dated = bs.len() > 4 && bs[4] == 45
+    for b in bs {
+        let ok = is_digit(b) || b == 46 || b == 95 || b == 44 || b == 58 || b == 43 || b == 45 || b == 101 || b == 69 || b == 120 || b == 88 || b == 111 || b == 79 || b == 98 || b == 66 || b == 84 || b == 90 || (b >= 97 && b <= 102) || (b >= 65 && b <= 70) || (dated && b == 32)
+        if !ok {
+            return false
+        }
+    }
+    true
+}
+
+// `s` in double quotes: `json.quote`'s escapes, and `\u` for the characters
+// `wr_odd` names that it leaves as they are.
+fn wr_quote(s: Str) -> Str {
+    let q = json.quote(s)
+    let bs = q.bytes()
+    let n = bs.len()
+    let mut out = ""
+    let mut start = 0
+    let mut i = 0
+    while i < n {
+        let b = bs[i]
+        let mut esc = ""
+        let mut len = 3
+        if b == 127 {
+            esc = "\\u007f"
+            len = 1
+        } else if b == 194 && i + 1 < n && bs[i + 1] >= 128 && bs[i + 1] <= 159 {
+            esc = "\\u00" + hex.encode(bytes([bs[i + 1]]))
+            len = 2
+        } else if b == 226 && i + 2 < n && bs[i + 1] == 128 && (bs[i + 2] == 168 || bs[i + 2] == 169) {
+            esc = if bs[i + 2] == 168 { "\\u2028" } else { "\\u2029" }
+        } else if b == 239 && i + 2 < n && bs[i + 1] == 187 && bs[i + 2] == 191 {
+            esc = "\\ufeff"
+        } else if b == 239 && i + 2 < n && bs[i + 1] == 191 && (bs[i + 2] == 190 || bs[i + 2] == 191) {
+            esc = if bs[i + 2] == 190 { "\\ufffe" } else { "\\uffff" }
+        }
+        if esc != "" {
+            out = out + q.slice(start, i) + esc
+            start = i + len
+            i = i + len
+        } else {
+            i = i + 1
+        }
+    }
+    out + q.slice(start, n)
+}
+
+// A tag as written before its node: `!!name` for the core schema's, `!name`
+// for a local one, else verbatim as `!<...>`, with a byte a tag cannot hold
+// as `%XX`.
+fn wr_tag(t: Str) -> Str {
+    let core = core_tag()
+    let bs = t.bytes()
+    let mut short = bs.len() > 1
+    let mut from = 0
+    if t.starts_with(core) {
+        from = core.len()
+        short = bs.len() > from
+    } else if t.starts_with("!") {
+        from = 1
+    } else {
+        short = false
+    }
+    let mut i = from
+    while short && i < bs.len() {
+        if !is_tag_char(bs[i]) || bs[i] == 37 {
+            short = false
+        }
+        i = i + 1
+    }
+    if short {
+        return if from == 1 { t } else { "!!" + t.slice(from, bs.len()) }
+    }
+    let mut v = "!<"
+    for b in bs {
+        v = v + if is_uri_char(b) && b != 37 { bytes([b]).to_str() } else { "%" + hex.encode(bytes([b])).to_upper() }
+    }
+    v + ">"
 }
 
 // ---------- reading nodes (methods on Node) ----------
