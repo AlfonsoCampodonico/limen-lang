@@ -205,17 +205,18 @@ should run in a pod with a grant for the API server and nothing else, and
 - A `yaml` module, reading and writing the YAML that manifests are written
   in, with `yaml.encode` and `yaml.decode` written by the compiler as
   `json`'s are (done).
-  - Still to do: a kubeconfig's hyphenated keys (`current-context`,
-    `certificate-authority-data`) cannot be decoded into struct fields,
-    because Limen has no field renaming, so kubeconfig support reads
-    `yaml.Node` directly.
+  - A kubeconfig's hyphenated keys (`current-context`,
+    `certificate-authority-data`) decode into struct fields with field
+    keys, `current_context: Str as "current-context"` (done, 0.8.4), so
+    kubeconfig support is no longer blocked on them.
 - TLS with a custom CA and client certificates (done): `Net.trusting(ca)`
   and `Net.presenting(cert, key)`.
 - In-cluster authentication (done): the `kube` module reads the pod's
   service-account token and CA certificate through a granted `Fs`, and
   `examples/site_operator.lmn` runs in a kind cluster with no proxy
   (`test/integration/kind.sh`). The kubeconfig outside a cluster is not
-  done; it can now be read with the `yaml` module.
+  done; it can now be read with the `yaml` module into structs, through
+  field keys.
 - Typed Kubernetes objects (Deployment, Service, ConfigMap and the rest) as
   a package, generated from the API's OpenAPI description, so manifests are
   checked instead of built as JSON by hand.
@@ -259,6 +260,9 @@ without reading anything but the book.
 A stability promise: code that builds on 1.0 builds on every 1.x, what
 counts as breaking, and how editions or deprecations work after it. The
 book and SPEC.md describe 1.0 exactly.
+
+- Attributes: decide before 1.0, once three needs exist (field keys are
+  `as "key"` for now).
 
 ## After 1.0
 
