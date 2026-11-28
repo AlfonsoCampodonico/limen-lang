@@ -43,5 +43,7 @@ leaf() {
 ca ca "Limen kube test CA"
 leaf server localhost ca server
 leaf client limen-test-client ca client
+# the client key again, encrypted, which presenting refuses
+openssl pkcs8 -topk8 -v2 aes-256-cbc -passout pass:limen-test -in client-key.pem -out client-key-encrypted.pem
 ca other-ca "Limen other test CA"
 leaf other-server localhost other-ca server

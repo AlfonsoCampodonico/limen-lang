@@ -27,8 +27,9 @@ type cap =
    too. *)
 and revoke = { mutable off : bool; parent : revoke option }
 
-(* A Net: its allowlist, and the client context `trusting` gave it (None:
-   the default trust). `only` keeps the context; `trusting` replaces it. *)
+(* A Net: its allowlist, and the client context `trusting` or `presenting`
+   gave it (None: the default trust, no certificate). `only` keeps the
+   context; `trusting` and `presenting` make a new one from it. *)
 and net = { hosts : string list; client : Tls.trust option }
 
 (* A socket that knows when it was closed, so a task waiting on it never
@@ -3275,7 +3276,9 @@ and cap_call rt c name args sp =
         VStruct ("FileInfo", [ ("size", vint size); ("modified_ms", vint ms); ("is_file", VBool is_file); ("is_dir", VBool is_dir) ]))
       (Caps.info fs p)
   | CNet n, "only", [ VStr h ] -> VCap (CNet { n with hosts = Caps.attenuate n.hosts h })
-  | CNet n, "trusting", [ VStr pem ] -> io_result (fun t -> VCap (CNet { n with client = Some t })) (Result.map_error (fun m -> Caps.Failed m) (Tls.trust pem))
+  | CNet n, "trusting", [ VStr pem ] -> io_result (fun t -> VCap (CNet { n with client = Some t })) (Result.map_error (fun m -> Caps.Failed m) (Tls.trust n.client pem))
+  | CNet n, "presenting", [ VStr cert; VStr key ] ->
+    io_result (fun t -> VCap (CNet { n with client = Some t })) (Result.map_error (fun m -> Caps.Failed m) (Tls.present n.client cert key))
   | CNet n, "get", [ VStr url ] ->
     io_result
       (fun (status, hs, body) ->

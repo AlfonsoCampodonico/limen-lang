@@ -125,7 +125,7 @@ fn cap_methods(c: Str, io: types.Ty) -> List[Method] {
     // `fs.revocable()`: the same authority, and a switch that withdraws it
     let revocable = m("revocable", [], TNamed("#tuple2", [TCap(c), TCap("Revoker")]))
     match c {
-        "Net" => [m("get", [TStr], res(TNamed("HttpResponse", []))), m("only", [TStr], TCap("Net")), m("connect", [TStr], res(TCap("Conn"))), m("connect_tls", [TStr], res(TCap("Conn"))), m("trusting", [TStr], res(TCap("Net"))), revocable],
+        "Net" => [m("get", [TStr], res(TNamed("HttpResponse", []))), m("only", [TStr], TCap("Net")), m("connect", [TStr], res(TCap("Conn"))), m("connect_tls", [TStr], res(TCap("Conn"))), m("trusting", [TStr], res(TCap("Net"))), m("presenting", [TStr, TStr], res(TCap("Net"))), revocable],
         "Listen" => [m("on", [TStr], res(TCap("Listener"))), m("on_tls", [TStr, TStr, TStr], res(TCap("Listener"))), revocable],
         "Listener" => [m("accept", [], res(TCap("Conn"))), m("port", [], TInt), m("close", [], TUnit)],
         "Conn" => [m("read", [], res(TStr)), m("write", [TStr], res(TUnit)), m("read_within", [TCap("Clock"), TInt], res(TStr)), m("write_within", [TCap("Clock"), TInt, TStr], res(TUnit)), m("start_tls", [TStr], res(TUnit)), m("close", [], TUnit)],

@@ -8,7 +8,8 @@ module I = Ir
 let sprintf = Printf.sprintf
 
 (* Set when the program calls something that may need TLS (Net.get,
-   Net.connect_tls, Net.trusting, Listen.on_tls). The output then starts with
+   Net.connect_tls, Net.trusting, Net.presenting, Listen.on_tls). The output
+   then starts with
    [tls_marker], and Native links OpenSSL and pastes in the TLS core. *)
 let uses_tls = ref false
 let tls_marker = "/* limen: uses tls */\n"
@@ -1180,6 +1181,7 @@ let rhs_into c (out : Buffer.t) ind dst t (rhs : I.rhs) =
     | "cap_connect", _ -> io_result (sprintf "Cap_net_connect(%s, %s)" (arg 0) (arg 1)) "(WCap*)r_.ptr"
     | "cap_connect_tls", _ -> uses_tls := true; io_result (sprintf "Cap_net_connect_tls(%s, %s)" (arg 0) (arg 1)) "(WCap*)r_.ptr"
     | "cap_trusting", _ -> uses_tls := true; io_result (sprintf "Cap_net_trusting(%s, %s)" (arg 0) (arg 1)) "(WCap*)r_.ptr"
+    | "cap_presenting", _ -> uses_tls := true; io_result (sprintf "Cap_net_presenting(%s, %s, %s)" (arg 0) (arg 1) (arg 2)) "(WCap*)r_.ptr"
     | "cap_on_tls", _ ->
       uses_tls := true;
       io_result (sprintf "Cap_listen_on_tls(%s, %s, %s, %s)" (arg 0) (arg 1) (arg 2) (arg 3)) "(WCap*)r_.ptr"

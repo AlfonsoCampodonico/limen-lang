@@ -772,7 +772,7 @@ struct WCap {
   int64_t inflight; int closing; /* operations in progress; close requested */
   int reading, writing;          /* a task is in a read (or accept) / a write that has had to wait */
   void *tls;                     /* Listener: its SSL_CTX; Conn: its VTls (NULL for plain TCP) */
-  void *client;                  /* Net, and a Conn opened through it: the VTlsClient its TLS clients use (`trusting`), NULL for the default */
+  void *client;                  /* Net, and a Conn opened through it: the VTlsClient its TLS clients use (`trusting`, `presenting`), NULL for the default */
   WRevoke *rv;                   /* the switch that can withdraw it (Revoker: its own), or NULL */
   WCap *rnext, *rprev;           /* Listener, Conn with a switch: in w_revocable_socks, closed at revoke */
 };
@@ -1408,6 +1408,7 @@ W_RT int w_tls_step(WCap *c, int wr, char *buf, size_t n, int *dir, char *err, s
 W_RT int w_tls_accept(WCap *l, WCap *conn, WIo *r);
 W_RT WIo Cap_net_connect_tls(WCap *n, WStr *addr);
 W_RT WIo Cap_net_trusting(WCap *n, WStr *pem);
+W_RT WIo Cap_net_presenting(WCap *n, WStr *cert, WStr *key);
 W_RT WIo Cap_conn_start_tls(WCap *c, WStr *host);
 W_RT WIo Cap_fs_read_at(WCap *fs, WStr *rel, int64_t off, int64_t n);
 W_RT WStr *w_crypto(int64_t op, WStr *a, WStr *b, WStr *c, WStr *d);
